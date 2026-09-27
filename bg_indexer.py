@@ -5,6 +5,7 @@ from src.indexer import Indexer
 from src.colors import red, yellow, reset
 from src.sab import start as start_sab, is_running as sab_running, wait_ready as sab_wait_ready, available as sab_available
 from src.paths import app_dir
+from src.atomic import atomic_replace
 from pathlib import Path
 import os
 import signal
@@ -21,22 +22,36 @@ HISTORY_LEN = 60
 
 
 def update_status(running, group, indexer, idle = False, status = "running", error = False, errors = 0):
+    data = {
+        "running": running,
+        "group": group,
+        "error": error,
+        "idle": idle,
+        "mode": indexer.mode,
+        "status": status,
+        "error_count": errors,
+        "pid": os.getpid()
+    }
+
+    tmp = STATUS_FILE.with_suffix(".json.tmp")
+
     try:
-        tmp = STATUS_FILE.with_suffix(".json.tmp")
-
         with open(tmp, "w") as f:
-            json.dump({
-                "running": running,
-                "group": group,
-                "error": error,
-                "idle": idle,
-                "mode": indexer.mode,
-                "status": status,
-                "error_count": errors,
-                "pid": os.getpid()
-            }, f)
+            json.dump(data, f)
 
-        os.replace(tmp, STATUS_FILE)
+    except OSError as e:
+        print(f"couldnt write status: {e}")
+        return
+
+    if atomic_replace(tmp, STATUS_FILE):
+        return
+
+
+    try:
+        with open(STATUS_FILE, "w") as f:
+            json.dump(data, f)
+
+        tmp.unlink(missing_ok = True)
 
     except OSError as e:
         print(f"couldnt write status: {e}")
@@ -142,7 +157,8 @@ class Stats:
             with open(tmp, "w") as f:
                 json.dump(data, f)
             
-            os.replace(tmp, STATS_FILE)
+            if not atomic_replace(tmp, STATS_FILE):
+                tmp.unlink(missing_ok = True)
         
         except OSError:
             pass
@@ -171,12 +187,20 @@ def main():
         sys.exit(1)
 
     if not config.get("password"):
-        print(f"{yellow}no password stored in keyring, run main.py to set it up{reset}")
+        print(f"{yellow}no password stored in keyring, run main.py to set it up first {reset}")
         sys.exit(1)
 
     tmp = PID_FILE.with_suffix(".pid.tmp")
-    tmp.write_text(str(os.getpid()))
-    os.replace(tmp, PID_FILE)
+
+    try:
+        tmp.write_text(str(os.getpid()))
+
+        if not atomic_replace(tmp, PID_FILE):
+            raise OSError(f"could not write {PID_FILE}")
+
+    except OSError as e:
+        print(f"{red}couldnt write pid file: {e}{reset}")
+        sys.exit(1)
 
     create_db()
 

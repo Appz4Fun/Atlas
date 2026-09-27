@@ -107,8 +107,48 @@ def get_status():
 
     return status
 
+def _win_indexer_pid(pid):
+    import ctypes
+
+    k32 = ctypes.WinDLL("kernel32")
+    void = ctypes.c_void_p
+
+    k32.OpenProcess.argtypes = (ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32)
+    k32.OpenProcess.restype = void
+    k32.WaitForSingleObject.argtypes = (void, ctypes.c_uint32)
+    k32.QueryFullProcessImageNameW.argtypes = (void, ctypes.c_uint32, void, ctypes.POINTER(ctypes.c_uint32))
+    k32.CloseHandle.argtypes = (void,)
+
+    handle = k32.OpenProcess(0x00101000, False, pid)
+
+    if not handle:
+        return False
+
+    try:
+        #0x102
+        if k32.WaitForSingleObject(handle, 0) != 0x102:
+            return False
+
+        buf = ctypes.create_unicode_buffer(260)
+        size = ctypes.c_uint32(len(buf))
+
+        if not k32.QueryFullProcessImageNameW(handle, 0, ctypes.addressof(buf), ctypes.byref(size)):
+            return True
+
+        return os.path.basename(buf.value).lower() == os.path.basename(sys.executable).lower()
+
+    finally:
+        k32.CloseHandle(handle)
+
 
 def _is_indexer_pid(pid):
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+
+    if os.name == "nt":
+        return _win_indexer_pid(pid)
+
+
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -207,9 +247,10 @@ def stop_background_indexer():
 
     try:
         os.kill(pid, signal.SIGTERM)
-    except ProcessLookupError:
+    except OSError:
         PID_FILE.unlink(missing_ok = True)
         return False
+
 
     #5 sec to comply or die
     for _ in range(50):
@@ -221,9 +262,9 @@ def stop_background_indexer():
 
     #didnt exit in time soo kill him
     try:
-        os.kill(pid, signal.SIGKILL)
+        os.kill(pid, getattr(signal, "SIGKILL", 9))
 
-    except (ProcessLookupError, PermissionError):
+    except OSError:
         pass
 
     PID_FILE.unlink(missing_ok = True)

@@ -1,6 +1,6 @@
 from src.search import get_release, get_articles
 from src.colors import red, green, reset
-import os
+from src.atomic import atomic_replace
 import time
 import xml.etree.ElementTree as et
 from datetime import datetime
@@ -58,9 +58,9 @@ def build_nzb(release_id):
         file = et.SubElement(
             nzb,
             "file",
-            poster=first[6] or "",
-            date=str(timestamp),
-            subject=first[5] or ""
+            poster = first[6] or "",
+            date = str(timestamp),
+            subject = first[5] or ""
         )
 
         groups = et.SubElement(file, "groups")
@@ -73,17 +73,17 @@ def build_nzb(release_id):
             segment = et.SubElement(
                 segments,
                 "segment",
-                bytes=str(article[4]),
-                number=str(article[2])
+                bytes = str(article[4]),
+                number = str(article[2])
             )
 
             #nzb doesnt want the <>
             segment.text = article[0].strip("<>")
 
-    et.indent(nzb, space="  ")
+    et.indent(nzb, space = "  ")
 
     #elementtree cant write doctype, so build the body ourselves
-    body = et.tostring(nzb, encoding="unicode")
+    body = et.tostring(nzb, encoding = "unicode")
 
     return (
         '<?xml version="1.0" encoding="utf-8"?>\n'
@@ -93,7 +93,7 @@ def build_nzb(release_id):
     )
 
 
-def generate_nzb(release_id, output_dir=None):
+def generate_nzb(release_id, output_dir = None):
     release = get_release(release_id)
 
     if release is None:
@@ -115,14 +115,15 @@ def generate_nzb(release_id, output_dir=None):
     tmp = target.with_suffix(target.suffix + ".tmp")
 
     try:
-        with open(tmp, "w", encoding="utf-8") as f:
+        with open(tmp, "w", encoding = "utf-8") as f:
             f.write(content)
 
-        os.replace(tmp, target)
+        if not atomic_replace(tmp, target):
+            raise OSError(f"could not write {target}")
 
     except OSError as e:
         print(f"{red}couldnt save nzb: {e}{reset}")
-        tmp.unlink(missing_ok=True)
+        tmp.unlink(missing_ok = True)
         return
 
     print(f"{green}Saved {filename}{reset}")
