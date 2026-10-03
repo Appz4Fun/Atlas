@@ -13,7 +13,7 @@ fn main() -> ExitCode {
 
     if has("--help") || has("-h") {
         println!(
-            "atlas {}\n\nusage: atlas [--selftest | --bg-indexer]\n\n  (no args)     interactive menu\n  --selftest    check the usenet server login and exit\n  --bg-indexer  run the indexing loop headless (the menu starts this for you)",
+            "atlas {}\n\nusage: atlas [--selftest | --bg-indexer]\n\n  (no args)     interactive menu\n  --selftest    check the login on every usenet server and exit\n  --bg-indexer  run the indexing loop headless (the menu starts this for you)",
             env!("CARGO_PKG_VERSION")
         );
         return ExitCode::SUCCESS;
