@@ -1,0 +1,581 @@
+//! The headless indexing loop, run as `atlas --bg-indexer`.
+
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fs;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use serde::Serialize;
+use serde_json::json;
+
+use crate::atomic::write_atomic;
+use crate::config::{Config, UsenetServer, load_config};
+use crate::db;
+use crate::indexer::{Db, PassContext, PassSettings, Progress, RunStates, run_pass, shared_db};
+use crate::nntp::Pool;
+use crate::paths;
+use crate::sab;
+use crate::ui;
+
+const HISTORY_LEN: f64 = 60.0;
+/// a group that failed 3 times in a row gets another go after this long
+const FAILED_RETRY: Duration = Duration::from_secs(300);
+/// an idle group (nothing new) is looked at again after this long
+const IDLE_RECHECK: Duration = Duration::from_secs(10);
+/// how often config.json is re-read while indexing
+const CONFIG_RELOAD: Duration = Duration::from_secs(5);
+
+/// servers with a host and password, in priority order
+fn usable_servers(config: &crate::config::Config) -> Vec<UsenetServer> {
+    config.servers.iter().filter(|s| !s.host.is_empty() && !s.password.is_empty()).cloned().collect()
+}
+
+fn now() -> f64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0)
+}
+
+fn write_status(running: bool, group: &str, mode: &str, idle: bool, status: &str, error: bool, errors: u32) {
+    let data = json!({
+        "running": running,
+        "group": group,
+        "error": error,
+        "idle": idle,
+        "mode": mode,
+        "status": status,
+        "error_count": errors,
+        "pid": std::process::id(),
+    });
+
+    if let Err(e) = write_atomic(&paths::status_file(), data.to_string()) {
+        // windows can refuse the rename while the menu reads it, write in place
+        if let Err(e2) = fs::write(paths::status_file(), data.to_string()) {
+            println!("couldnt write status: {e} / {e2}");
+        }
+    }
+}
+
+#[derive(Serialize, Clone)]
+struct HistoryPoint {
+    t: f64,
+    a: i64,
+    b: i64,
+}
+
+#[derive(Default)]
+struct GroupStats {
+    articles: i64,
+    releases: i64,
+    last_indexed: f64,
+}
+
+struct Stats {
+    history: Vec<HistoryPoint>,
+    total_articles: i64,
+    total_bytes: i64,
+    total_releases: i64,
+    start_time: f64,
+    groups_indexed: HashSet<String>,
+    error_count: u32,
+    group_stats: BTreeMap<String, GroupStats>,
+}
+
+impl Stats {
+    fn new() -> Self {
+        Stats {
+            history: Vec::new(),
+            total_articles: 0,
+            total_bytes: 0,
+            total_releases: 0,
+            start_time: now(),
+            groups_indexed: HashSet::new(),
+            error_count: 0,
+            group_stats: BTreeMap::new(),
+        }
+    }
+
+    fn tick(&mut self, articles: i64, bytes: i64, releases: i64, group: &str) {
+        let t = now();
+        self.total_articles += articles;
+        self.total_bytes += bytes;
+        self.total_releases += releases;
+        self.history.push(HistoryPoint { t, a: articles, b: bytes });
+
+        if !group.is_empty() {
+            self.groups_indexed.insert(group.to_string());
+            let gs = self.group_stats.entry(group.to_string()).or_default();
+            gs.articles += articles;
+            gs.releases += releases;
+            gs.last_indexed = t;
+        }
+
+        let cutoff = t - HISTORY_LEN;
+        self.history.retain(|h| h.t >= cutoff);
+    }
+
+    /// (peak articles/s, peak bytes/s, avg articles/s, avg bytes/s)
+    fn speeds(&self) -> (f64, f64, f64, f64) {
+        let mut a_speeds = Vec::new();
+        let mut b_speeds = Vec::new();
+
+        for w in self.history.windows(2) {
+            let dt = w[1].t - w[0].t;
+            if dt > 0.0 {
+                a_speeds.push(w[1].a as f64 / dt);
+                b_speeds.push(w[1].b as f64 / dt);
+            }
+        }
+
+        if a_speeds.is_empty() {
+            return (0.0, 0.0, 0.0, 0.0);
+        }
+
+        let max = |v: &[f64]| v.iter().cloned().fold(f64::MIN, f64::max);
+        let avg = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
+        (max(&a_speeds), max(&b_speeds), avg(&a_speeds), avg(&b_speeds))
+    }
+
+    fn write(&self, group: &str, mode: &str, running: bool, idle: bool) {
+        let (peak_a, peak_b, avg_a, avg_b) = self.speeds();
+        let db_size = fs::metadata(paths::database()).map(|m| m.len()).unwrap_or(0);
+
+        let groups: serde_json::Map<String, serde_json::Value> = self
+            .group_stats
+            .iter()
+            .map(|(name, g)| {
+                (name.clone(), json!({"articles": g.articles, "releases": g.releases, "last_indexed": g.last_indexed}))
+            })
+            .collect();
+
+        let data = json!({
+            "running": running,
+            "idle": idle,
+            "group": group,
+            "mode": mode,
+            "uptime": (now() - self.start_time) as i64,
+            "total_articles": self.total_articles,
+            "total_bytes": self.total_bytes,
+            "total_releases": self.total_releases,
+            "history": self.history,
+            "groups_indexed": self.groups_indexed.len(),
+            "error_count": self.error_count,
+            "peak_art_speed": peak_a,
+            "peak_byte_speed": peak_b,
+            "avg_art_speed": avg_a,
+            "avg_byte_speed": avg_b,
+            "db_size": db_size,
+            "groups": groups,
+        });
+
+        let _ = write_atomic(&paths::stats_file(), data.to_string());
+    }
+}
+
+fn backoff(errors: u32) -> Duration {
+    Duration::from_secs(2u64.saturating_pow(errors).min(30))
+}
+
+/// sleep up to `d`, waking early once `done` says so
+async fn nap(d: Duration, done: impl Fn() -> bool) {
+    let deadline = Instant::now() + d;
+    while !done() && Instant::now() < deadline {
+        tokio::time::sleep((deadline - Instant::now()).min(Duration::from_millis(250))).await;
+    }
+}
+
+fn settings_of(config: &Config) -> PassSettings {
+    PassSettings {
+        mode: config.index_mode.clone(),
+        batch_size: config.batch_size() as i64,
+        request_size: config.request_size(),
+    }
+}
+
+/// `alt.binaries.a, alt.binaries.b` or `3197 groups, 20 at once`
+/// Groups indexed at once on each indexing server, as (server index, workers),
+/// from config.json alone (pool indexes follow `usable_servers` order). Runtime
+/// changes, like a server found to be article only or a lowered connection
+/// limit, dont change the plan, soo they never trigger a rebuild.
+fn plan_workers(config: &Config) -> Vec<(usize, usize)> {
+    let servers = usable_servers(config);
+    let mut indexing: Vec<usize> = (0..servers.len()).filter(|&i| servers[i].indexes()).collect();
+    if indexing.is_empty() {
+        indexing = (0..servers.len()).collect();
+    }
+    let conns: Vec<usize> = indexing.iter().map(|&i| servers[i].connections() as usize).collect();
+    indexing.into_iter().zip(config.workers_per_server(&conns)).collect()
+}
+
+fn groups_label(groups: &[String], workers: usize) -> String {
+    if groups.len() <= 3 { groups.join(", ") } else { format!("{} groups, {workers} at once", groups.len()) }
+}
+
+/// State shared by the scheduler's workers for one set of servers.
+struct Scheduler {
+    ctx: PassContext,
+    settings: RwLock<PassSettings>,
+    groups: RwLock<Vec<String>>,
+    /// (server, groups at once) for every indexing server
+    plan: Vec<(usize, usize)>,
+    workers: usize,
+    /// round robin position in `groups`, per server
+    next: Mutex<HashMap<usize, usize>>,
+    /// groups a worker is on right now
+    busy: Mutex<HashSet<String>>,
+    /// groups resting after going idle or after an error
+    wait_until: Mutex<HashMap<String, Instant>>,
+    /// consecutive errors per group
+    errors: Mutex<HashMap<String, u32>>,
+    /// groups parked after 3 errors in a row, retried after FAILED_RETRY
+    failed: Mutex<HashMap<String, Instant>>,
+    stats: Arc<Mutex<Stats>>,
+    /// wind down (servers changed or stopping): finish current passes, start no new ones
+    wind_down: AtomicBool,
+    passes: AtomicUsize,
+}
+
+impl Scheduler {
+    fn stopping(&self) -> bool {
+        self.wind_down.load(Ordering::Relaxed) || self.ctx.stop.load(Ordering::Relaxed)
+    }
+
+    /// Next group due on `server`: one that maps to this server and isnt being
+    /// indexed, resting or parked. Each server pulls its own groups soo every
+    /// server's connections stay busy.
+    fn take_group(&self, server: usize) -> Option<String> {
+        let groups = self.groups.read().unwrap();
+        if groups.is_empty() {
+            return None;
+        }
+
+        let now = Instant::now();
+        let pool = &self.ctx.pool;
+        let tier = pool.indexing_tier();
+        if !tier.contains(&server) {
+            // this server is resting after a failure, its groups went elsewhere
+            return None;
+        }
+
+        let mut busy = self.busy.lock().unwrap();
+        let mut wait = self.wait_until.lock().unwrap();
+        let mut failed = self.failed.lock().unwrap();
+        let mut next = self.next.lock().unwrap();
+        let next = next.entry(server).or_insert(0);
+
+        failed.retain(|_, since| since.elapsed() < FAILED_RETRY);
+        wait.retain(|_, until| *until > now);
+
+        for step in 0..groups.len() {
+            let idx = (*next + step) % groups.len();
+            let g = &groups[idx];
+
+            if busy.contains(g)
+                || wait.contains_key(g)
+                || failed.contains_key(g)
+                || pool.pick_server_in(&tier, g) != server
+            {
+                continue;
+            }
+
+            *next = idx + 1;
+            busy.insert(g.clone());
+            return Some(g.clone());
+        }
+
+        None
+    }
+
+    fn finish(&self, group: &str, result: anyhow::Result<Progress>) {
+        let states = &self.ctx.states;
+
+        match result {
+            Ok(_) => {
+                self.errors.lock().unwrap().remove(group);
+                // caught up: give it a rest instead of hammering GROUP every loop
+                if states.is_idle(group) && !states.is_backfilling(group) {
+                    self.wait_until.lock().unwrap().insert(group.to_string(), Instant::now() + IDLE_RECHECK);
+                }
+            }
+            Err(_) if self.ctx.stop.load(Ordering::Relaxed) => {}
+            Err(e) => {
+                self.stats.lock().unwrap().error_count += 1;
+                let count = {
+                    let mut errors = self.errors.lock().unwrap();
+                    let c = errors.entry(group.to_string()).or_insert(0);
+                    *c += 1;
+                    *c
+                };
+
+                if count >= 3 {
+                    ui::error(&format!(
+                        "Too many errors on {group}, parking it for {}m: {e}",
+                        FAILED_RETRY.as_secs() / 60
+                    ));
+                    self.errors.lock().unwrap().remove(group);
+                    self.failed.lock().unwrap().insert(group.to_string(), Instant::now());
+                } else {
+                    ui::error(&format!("Indexing error ({group}): {e}"));
+                    self.wait_until.lock().unwrap().insert(group.to_string(), Instant::now() + backoff(count));
+                }
+            }
+        }
+
+        self.busy.lock().unwrap().remove(group);
+        self.passes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// groups not parked
+    fn active_groups(&self) -> Vec<String> {
+        let failed = self.failed.lock().unwrap();
+        self.groups.read().unwrap().iter().filter(|g| !failed.contains_key(*g)).cloned().collect()
+    }
+
+    fn idle(&self) -> bool {
+        let active = self.active_groups();
+        let states = &self.ctx.states;
+        states.all_idle(&active) && !active.iter().any(|g| states.is_backfilling(g))
+    }
+
+    fn write_status(&self) {
+        let groups = self.groups.read().unwrap().clone();
+        let mode = self.settings.read().unwrap().mode.clone();
+        let idle = self.idle();
+        let errors: u32 = self.errors.lock().unwrap().values().sum();
+        let status = if errors > 0 {
+            "warning"
+        } else if idle {
+            "idle"
+        } else {
+            "running"
+        };
+
+        write_status(true, &groups_label(&groups, self.workers), &mode, idle, status, false, errors);
+        self.stats.lock().unwrap().write("", &mode, true, idle);
+    }
+}
+
+/// One worker on `server`: index whichever of its groups is due next, again and again.
+/// All workers share one db connection, soo their writes queue up in order
+/// instead of racing for sqlite's write lock (and timing out on a busy db).
+async fn worker(sched: Arc<Scheduler>, server: usize, db: Db) {
+    while !sched.stopping() {
+        let Some(group) = sched.take_group(server) else {
+            nap(Duration::from_secs(1), || sched.stopping()).await;
+            continue;
+        };
+
+        let settings = sched.settings.read().unwrap().clone();
+        let stats = sched.stats.clone();
+        let mut progress = |p: &Progress| stats.lock().unwrap().tick(p.articles, p.bytes, p.releases, &group);
+
+        let result = run_pass(&sched.ctx, &settings, &db, &group, server, &mut progress).await;
+        sched.finish(&group, result);
+    }
+}
+
+/// Re-read config.json while indexing: new groups / mode / batch settings
+/// apply right away. Returns when servers or the parallelism changed (the
+/// caller rebuilds) or when stopping.
+async fn watch_config(sched: Arc<Scheduler>, servers: Vec<UsenetServer>) {
+    loop {
+        nap(CONFIG_RELOAD, || sched.stopping()).await;
+        if sched.stopping() {
+            return;
+        }
+
+        let Some(config) = load_config() else { continue };
+
+        if usable_servers(&config) != servers || plan_workers(&config) != sched.plan {
+            println!("config changed, restarting the indexer");
+            sched.wind_down.store(true, Ordering::Relaxed);
+            return;
+        }
+
+        let settings = settings_of(&config);
+        {
+            let mut current = sched.settings.write().unwrap();
+            if settings.mode != current.mode {
+                // switching modes starts every group over in the backfill phase
+                sched.ctx.states.reset();
+                println!("indexer mode set to {}", settings.mode);
+            }
+            *current = settings;
+        }
+
+        let groups = config.tracked_groups();
+        let mut current = sched.groups.write().unwrap();
+        if *current != groups {
+            println!("groups changed: {} -> {}", current.len(), groups.len());
+            *current = groups;
+        }
+    }
+}
+
+/// status.json / stats.json once a second for the menu and dashboard
+async fn report(sched: Arc<Scheduler>) {
+    while !sched.stopping() {
+        sched.write_status();
+        nap(Duration::from_secs(1), || sched.stopping()).await;
+    }
+}
+
+/// Index with this set of servers until stopping or the config needs a rebuild.
+async fn run_servers(
+    config: &Config,
+    pool: Arc<Pool>,
+    states: RunStates,
+    stats: Arc<Mutex<Stats>>,
+    stop: Arc<AtomicBool>,
+) {
+    let servers = usable_servers(config);
+    let groups = config.tracked_groups();
+    let plan = plan_workers(config);
+    let workers: usize = plan.iter().map(|(_, w)| w).sum();
+
+    let per_server: Vec<String> = plan
+        .iter()
+        .map(|&(i, w)| format!("{} ({} connections, {w} groups at once)", pool.host(i), pool.connections(i)))
+        .collect();
+    println!("indexing {} groups on {}", groups.len(), per_server.join(" + "));
+
+    let sched = Arc::new(Scheduler {
+        ctx: PassContext { pool, states, stop, verbose: false },
+        settings: RwLock::new(settings_of(config)),
+        groups: RwLock::new(groups),
+        plan: plan.clone(),
+        workers,
+        next: Mutex::new(HashMap::new()),
+        busy: Mutex::new(HashSet::new()),
+        wait_until: Mutex::new(HashMap::new()),
+        errors: Mutex::new(HashMap::new()),
+        failed: Mutex::new(HashMap::new()),
+        stats,
+        wind_down: AtomicBool::new(false),
+        passes: AtomicUsize::new(0),
+    });
+
+    let db = match db::open() {
+        Ok(conn) => shared_db(conn),
+        Err(e) => {
+            ui::error(&format!("couldnt open database: {e}"));
+            return;
+        }
+    };
+
+    let mut tasks = tokio::task::JoinSet::new();
+    for &(server, count) in &plan {
+        for _ in 0..count {
+            tasks.spawn(worker(sched.clone(), server, db.clone()));
+        }
+    }
+    tasks.spawn(watch_config(sched.clone(), servers));
+    tasks.spawn(report(sched.clone()));
+
+    // the workers and the config watcher all stop on `stopping()`
+    while tasks.join_next().await.is_some() {
+        if sched.stopping() {
+            sched.wind_down.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+async fn supervise(stop: Arc<AtomicBool>, stats: Arc<Mutex<Stats>>) {
+    let states = RunStates::default();
+    let stopping = || stop.load(Ordering::Relaxed);
+
+    while !stopping() {
+        let Some(config) = load_config() else {
+            ui::error("error with config, stopped");
+            break;
+        };
+
+        let servers = usable_servers(&config);
+        if servers.is_empty() {
+            ui::error("config missing required fields");
+            break;
+        }
+
+        let pool = Arc::new(Pool::new(&servers));
+
+        // at least one server has to answer before spinning everything up
+        if let Err(e) = pool.connect().await {
+            ui::error(&format!("couldnt reach any usenet server: {e}"));
+            stats.lock().unwrap().error_count += 1;
+            write_status(true, "", &config.index_mode, false, "warning", false, 1);
+            nap(Duration::from_secs(30), stopping).await;
+            continue;
+        }
+
+        run_servers(&config, pool.clone(), states.clone(), stats.clone(), stop.clone()).await;
+        pool.close().await;
+    }
+}
+
+pub fn run() -> i32 {
+    let Some(config) = load_config().filter(|c| !c.servers.is_empty()) else {
+        println!("no valid config");
+        return 1;
+    };
+
+    if usable_servers(&config).is_empty() {
+        ui::warn("no password stored for any server, run atlas to set it up first");
+        return 1;
+    }
+
+    if let Err(e) = write_atomic(&paths::pid_file(), std::process::id().to_string()) {
+        ui::error(&format!("couldnt write pid file: {e}"));
+        return 1;
+    }
+
+    if let Err(e) = db::create_db() {
+        ui::error(&format!("couldnt open database: {e}"));
+        return 1;
+    }
+
+    let stop = Arc::new(AtomicBool::new(false));
+
+    #[cfg(unix)]
+    {
+        let _ = signal_hook::flag::register(signal_hook::consts::SIGTERM, stop.clone());
+        let _ = signal_hook::flag::register(signal_hook::consts::SIGINT, stop.clone());
+    }
+
+    run_until(config, stop)
+}
+
+/// The indexing loop from `run`, stopping once `stop` is set (tests set it
+/// directly, `run` wires it to SIGTERM / SIGINT).
+pub fn run_until(config: Config, stop: Arc<AtomicBool>) -> i32 {
+    // start sabnzbd soo its ready when you wanna download. on its own thread
+    // soo indexing doesnt sit around for up to 90s waiting on it
+    if sab::available() && !sab::is_running() {
+        thread::spawn(|| {
+            if sab::start() {
+                sab::wait_ready(Duration::from_secs(90));
+            }
+        });
+    }
+
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .thread_name("atlas-indexer")
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            ui::error(&format!("couldnt start the indexer runtime: {e}"));
+            return 1;
+        }
+    };
+
+    let stats = Arc::new(Mutex::new(Stats::new()));
+    write_status(true, &groups_label(&config.tracked_groups(), 0), &config.index_mode, false, "running", false, 0);
+
+    runtime.block_on(supervise(stop, stats.clone()));
+
+    write_status(false, "", &config.index_mode, false, "stopped", false, 0);
+    stats.lock().unwrap().write("", "", false, false);
+    0
+}

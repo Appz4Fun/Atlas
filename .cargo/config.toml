@@ -1,0 +1,4 @@
+# `cargo run` keeps config.json, atlas.db and the logs in the repo root
+# (same place the old python version kept them) instead of target/.
+[env]
+ATLAS_HOME = { value = ".", relative = true }
