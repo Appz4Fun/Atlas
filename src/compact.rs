@@ -307,7 +307,7 @@ fn compact_shard(
              from segments s left join domains d on d.id = s.domain order by s.file_id",
         )?;
         let mut rows = rows_stmt.query([])?;
-        let mut pending = next_row(&mut rows, &shared)?;
+        let mut pending = next_row(shard, &mut rows, &shared)?;
 
         let mut tx = conn.transaction()?;
         let mut in_tx = 0;
@@ -322,13 +322,13 @@ fn compact_shard(
                 if (copied as usize).is_multiple_of(STOP_EVERY) {
                     halt(stop, shard)?;
                 }
-                pending = next_row(&mut rows, &shared)?;
+                pending = next_row(shard, &mut rows, &shared)?;
             }
             let (Some(f), Some(id)) = (file, id) else { break };
             let mut file_rows = Vec::new();
             while let Some(row) = pending.take_if(|r| r.file_id == id) {
                 file_rows.push(row);
-                pending = next_row(&mut rows, &shared)?;
+                pending = next_row(shard, &mut rows, &shared)?;
             }
 
             // its blob, with every message-id stored the way its rows are
@@ -340,7 +340,7 @@ fn compact_shard(
                 } else {
                     None
                 };
-                let (local, domain) = rewrite(seg.local, seg.domain, shared(seg.domain), suffix.as_deref());
+                let (local, domain) = rewrite(shard, id, seg.local, seg.domain, shared(seg.domain), suffix.as_deref())?;
                 segs.push(Seg { local, domain, ..seg });
             }
 
@@ -428,15 +428,43 @@ fn unseal(shard: usize, file_id: i64, blob: &[u8]) -> Result<Vec<Seg>> {
 
 /// A message-id as the copy stores it, (local, domain): kept whole, packed
 /// the current way under a shared domain, or made whole when its domain is
-/// dropped.
-fn rewrite(local: Vec<u8>, domain: i64, shared: bool, suffix: Option<&str>) -> (Vec<u8>, i64) {
-    if domain == 0 {
-        (local, 0)
+/// dropped. `suffix` is the domain's, needed for a dropped one. A rewrite
+/// that doesnt give back the same message-id stops the shard.
+fn rewrite(
+    shard: usize,
+    file_id: i64,
+    local: Vec<u8>,
+    domain: i64,
+    shared: bool,
+    suffix: Option<&str>,
+) -> Result<(Vec<u8>, i64)> {
+    let (new_local, new_domain) = if domain == 0 {
+        return Ok((local, 0));
     } else if shared {
         (store::repack(&local), domain)
     } else {
         (store::whole(&store::decode(&local, suffix)), 0)
+    };
+    if new_local != local {
+        let new_suffix = if new_domain == 0 { None } else { suffix };
+        check_same_id(shard, file_id, (&local, suffix), (&new_local, new_suffix))?;
     }
+    Ok((new_local, new_domain))
+}
+
+/// The message-id a rewritten (local, suffix) stands for is the original's:
+/// a packing bug would quietly change NZBs otherwise.
+fn check_same_id(
+    shard: usize,
+    file_id: i64,
+    (old_local, old_suffix): (&[u8], Option<&str>),
+    (new_local, new_suffix): (&[u8], Option<&str>),
+) -> Result<()> {
+    let (was, now) = (store::decode(old_local, old_suffix), store::decode(new_local, new_suffix));
+    if was != now {
+        bail!("shard {shard}: file {file_id}: message-id {was} came out as {now}; the original was kept");
+    }
+    Ok(())
 }
 
 /// one article row of the copy
@@ -449,11 +477,11 @@ struct Row {
 }
 
 /// the next row of `select file_id, local, domain, part, bytes, suffix`, rewritten
-fn next_row(rows: &mut rusqlite::Rows, shared: &dyn Fn(i64) -> bool) -> Result<Option<Row>> {
+fn next_row(shard: usize, rows: &mut rusqlite::Rows, shared: &dyn Fn(i64) -> bool) -> Result<Option<Row>> {
     let Some(r) = rows.next()? else { return Ok(None) };
-    let (domain, suffix): (i64, Option<String>) = (r.get(2)?, r.get(5)?);
-    let (local, domain) = rewrite(r.get(1)?, domain, shared(domain), suffix.as_deref());
-    Ok(Some(Row { file_id: r.get(0)?, local, domain, part: r.get(3)?, bytes: r.get(4)? }))
+    let (file_id, domain, suffix): (i64, i64, Option<String>) = (r.get(0)?, r.get(2)?, r.get(5)?);
+    let (local, domain) = rewrite(shard, file_id, r.get(1)?, domain, shared(domain), suffix.as_deref())?;
+    Ok(Some(Row { file_id, local, domain, part: r.get(3)?, bytes: r.get(4)? }))
 }
 
 fn insert_row(conn: &Connection, r: &Row) -> Result<()> {
@@ -520,6 +548,23 @@ mod tests {
 
     fn no_stop() -> Arc<AtomicBool> {
         Arc::new(AtomicBool::new(false))
+    }
+
+    #[test]
+    fn a_rewrite_that_changes_a_message_id_stops_the_shard() {
+        let local = store::pack_local("Nyu1Q2z");
+        // packed again the same way, kept whole: the same message-id
+        assert_eq!(rewrite(3, 9, local.clone(), 5, true, Some("@ngPost>")).unwrap(), (local.clone(), 5));
+        let (whole, domain) = rewrite(3, 9, local.clone(), 5, false, Some("@ngPost>")).unwrap();
+        assert_eq!((store::decode(&whole, None), domain), ("<Nyu1Q2z@ngPost>".to_string(), 0));
+        // a rewrite that came out different
+        let err = check_same_id(3, 9, (&local, Some("@ngPost>")), (&store::pack_local("Nyu1Q2y"), Some("@ngPost>")))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("shard 3") && err.contains("<Nyu1Q2z@ngPost>") && err.contains("original was kept"),
+            "{err}"
+        );
     }
 
     #[test]
