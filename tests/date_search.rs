@@ -331,3 +331,131 @@ fn a_day_older_than_the_server_keeps_is_given_back() {
     assert_eq!(state(first_day - 1), 0, "given back, still pending");
     assert_eq!(state(first_day + 1), 2, "an empty day it keeps is done");
 }
+
+/// (number, unix seconds) of a post
+type Slot = (u64, i64);
+
+fn jan_1() -> i64 {
+    chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00+00:00").unwrap().timestamp()
+}
+
+fn slot_posts(list: &[Slot]) -> Vec<common::Post> {
+    list.iter()
+        .map(|&(n, t)| {
+            let when = chrono::DateTime::from_timestamp(t, 0).unwrap();
+            post_at(n, &format!(r#""p{n}.bin" yEnc (1/1)"#), &when.to_rfc2822())
+        })
+        .collect()
+}
+
+/// numbers `gap` apart, somewhere in 100..=500 (a fixed pseudo random walk)
+fn sparse_step(state: &mut u64) -> u64 {
+    *state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    100 + (*state >> 33) % 401
+}
+
+/// `count` posts a minute apart from `(n, t)` on, `step` numbers apart
+fn run(list: &mut Vec<Slot>, (mut n, mut t): Slot, count: usize, mut step: impl FnMut() -> u64) -> Slot {
+    for _ in 0..count {
+        list.push((n, t));
+        n += step();
+        t += 60;
+    }
+    (n, t)
+}
+
+/// 1..=50 from Jan 1, a hole to 3,000,000, 3,000 posts with 100 to 500
+/// numbers between them from Jan 3, then 100,000 posts side by side
+fn hole_then_sparse_then_dense() -> Vec<Slot> {
+    let mut list = Vec::new();
+    let end = run(&mut list, (1, jan_1()), 50, || 1);
+    assert_eq!(end.0, 51);
+    let (mut seed, start) = (7, (3_000_001, jan_1() + 2 * 86_400));
+    let next = run(&mut list, start, 3_000, || sparse_step(&mut seed));
+    run(&mut list, next, 100_000, || 1);
+    list
+}
+
+/// 20,000 posts side by side from Jan 1, 3,000 with 100 to 500 numbers
+/// between them, a hole of 3,000,000, then 100,000 posts side by side
+fn dense_then_sparse_then_hole() -> Vec<Slot> {
+    let mut list = Vec::new();
+    let next = run(&mut list, (1, jan_1()), 20_000, || 1);
+    let mut seed = 11;
+    let (n, t) = run(&mut list, next, 3_000, || sparse_step(&mut seed));
+    run(&mut list, (n + 3_000_000, t), 100_000, || 1);
+    list
+}
+
+/// Every time in `whens` finds exactly the first post at or after it.
+fn finds_the_first_post_for_each(list: &[Slot], lows: &[u64], whens: &[i64]) {
+    let server = Server::new(slot_posts(list));
+    let port = spawn_server(server.clone());
+    let pool = BlockingPool::new(&[mock(port, "secret", 2, 1)]);
+    pool.connect().unwrap();
+    let high = list.last().unwrap().0;
+    for &low in lows {
+        for &when in whens {
+            let before = server.xovers.load(std::sync::atomic::Ordering::SeqCst);
+            let got = pool.block_on(pool.pool.article_at(0, GROUP, low, high, when)).unwrap();
+            let used = server.xovers.load(std::sync::atomic::Ordering::SeqCst) - before;
+            let want = list.iter().find(|&&(n, t)| n >= low && t >= when).map_or(high + 1, |&(n, _)| n);
+            assert_eq!(got, want, "low {low}, time {when}");
+            assert!(used <= 150, "{used} requests to find {got}");
+        }
+    }
+}
+
+/// Indexing each of `days` saves every post of the day and the hour around it.
+fn chunks_save_every_post_of(list: &[Slot], days: &[i64]) {
+    for &day in days {
+        let home = tempfile::tempdir().unwrap();
+        let main = home.path().join("atlas.db");
+        atlas::db::create_db_at(&main).unwrap();
+        let port = spawn_server(Server::new(slot_posts(list)));
+        let pool = BlockingPool::new(&[mock(port, "secret", 2, 1)]);
+        pool.connect().unwrap();
+        let main_conn = atlas::db::open_at(&main).unwrap();
+        atlas::chunks::add(&main_conn, GROUP, day, atlas::chunks::unix_day(list[0].1).min(day)).unwrap();
+        let ctx = atlas::indexer::PassContext {
+            pool: pool.pool.clone(),
+            states: Default::default(),
+            stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            verbose: false,
+        };
+        let db = atlas::indexer::shared_db(main_conn);
+        let saved = pool
+            .block_on(atlas::indexer::run_chunk(&ctx, &Default::default(), &db, GROUP, 0, day, &mut |_| {}))
+            .unwrap();
+        let (from, to) = (day * 86_400 - 3600, (day + 1) * 86_400 + 3600);
+        let want = list.iter().filter(|&&(_, t)| t >= from && t < to).count() as i64;
+        assert_eq!(saved.articles, want, "day {day}");
+    }
+}
+
+fn days_from(list: &[Slot], first: usize, count: usize) -> Vec<i64> {
+    let mut days: Vec<i64> = list[first..].iter().map(|&(_, t)| atlas::chunks::unix_day(t)).collect();
+    days.dedup();
+    days.truncate(count);
+    days
+}
+
+/// A hole, then articles hundreds of numbers apart, then a crowd: one empty
+/// window must not make the bisect skip the sparse articles after the hole.
+#[test]
+fn a_sparse_region_after_a_hole_is_not_skipped() {
+    let list = hole_then_sparse_then_dense();
+    let whens: Vec<i64> = list.iter().skip(50).take(3_200).step_by(7).map(|&(_, t)| t).collect();
+    finds_the_first_post_for_each(&list, &[1, 1_500_000], &whens);
+    chunks_save_every_post_of(&list, &days_from(&list, 50, 5));
+}
+
+/// A crowd, articles hundreds of numbers apart, then a hole: the last article
+/// before the hole is the sparse one, not one a window further back.
+#[test]
+fn a_sparse_region_before_a_hole_is_not_skipped() {
+    let list = dense_then_sparse_then_hole();
+    let whens: Vec<i64> = list.iter().skip(19_000).take(4_500).step_by(7).map(|&(_, t)| t).collect();
+    finds_the_first_post_for_each(&list, &[1], &whens);
+    chunks_save_every_post_of(&list, &days_from(&list, 19_000, 5));
+}

@@ -176,7 +176,7 @@ pub fn serve(stream: TcpStream, state: &Server, over_limit: bool) {
         let cmd = line.trim_end().to_string();
         line.clear();
         let (verb, arg) = cmd.split_once(' ').unwrap_or((&cmd, ""));
-        let posts = state.posts.lock().unwrap().clone();
+        let posts_lock = || state.posts.lock().unwrap();
 
         match verb.to_uppercase().as_str() {
             "AUTHINFO" if arg.starts_with("USER") => send(&mut out, b"381 more"),
@@ -192,6 +192,7 @@ pub fn serve(stream: TcpStream, state: &Server, over_limit: bool) {
             "GROUP" if state.no_group => send(&mut out, b"501 GROUP command error"),
             "GROUP" if arg == GROUP || (state.any_group && arg.starts_with("alt.binaries.")) => {
                 selected = Some(arg.to_string());
+                let posts = posts_lock();
                 let first = posts.iter().map(|p| p.number).min().unwrap_or(0);
                 let last = posts.iter().map(|p| p.number).max().unwrap_or(0);
                 send(&mut out, format!("211 {} {first} {last} {arg}", posts.len()).as_bytes());
@@ -199,7 +200,7 @@ pub fn serve(stream: TcpStream, state: &Server, over_limit: bool) {
             "GROUP" => send(&mut out, b"411 no such group"),
             "LIST" => {
                 send(&mut out, b"215 list follows");
-                let last = posts.iter().map(|p| p.number).max().unwrap_or(0);
+                let last = posts_lock().iter().map(|p| p.number).max().unwrap_or(0);
                 send(&mut out, format!("{GROUP} {last} 1 y").as_bytes());
                 send(&mut out, b"alt.binaries.empty 5 5 y");
                 send(&mut out, b"comp.lang.rust 900 1 y");
@@ -224,7 +225,9 @@ pub fn serve(stream: TcpStream, state: &Server, over_limit: bool) {
                 state.xovers_in_flight.fetch_sub(1, Ordering::SeqCst);
                 let (a, b) = arg.split_once('-').unwrap();
                 let (a, b): (u64, u64) = (a.parse().unwrap(), b.parse().unwrap());
-                let hits: Vec<&Post> = posts.iter().filter(|p| (a..=b).contains(&p.number)).collect();
+                let posts = posts_lock();
+                let lo = posts.partition_point(|p| p.number < a);
+                let hits: Vec<&Post> = posts[lo..].iter().take_while(|p| p.number <= b).collect();
                 if hits.is_empty() {
                     send(&mut out, b"423 no articles in that range");
                     continue;
@@ -255,7 +258,7 @@ pub fn serve(stream: TcpStream, state: &Server, over_limit: bool) {
                     let _ = out.write_all(&listing);
                 }
             }
-            "BODY" => match posts.iter().find(|p| p.message_id == arg).filter(|_| state.bodies) {
+            "BODY" => match posts_lock().iter().find(|p| p.message_id == arg).filter(|_| state.bodies) {
                 Some(p) => {
                     send(&mut out, format!("222 0 {arg}").as_bytes());
                     for l in &p.body {

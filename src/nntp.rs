@@ -1222,6 +1222,12 @@ impl Pool {
                         None => lo = mid + look,
                     }
                 }
+                // the bisect skipped what it took for empty: read it once
+                if best.0 > gap
+                    && let Some(f) = self.posted_at(i, group, gap, best.0 - gap).await?
+                {
+                    best = f;
+                }
                 return Ok(Some(best));
             }
             gap = at + look;
@@ -1253,6 +1259,12 @@ impl Pool {
                         Some((_, found)) => (best, lo) = (found, found.0 + 1),
                         None => hi = mid,
                     }
+                }
+                // the bisect skipped what it took for empty: read it once
+                if gap > best.0 + 1
+                    && let Some((_, l)) = self.window(i, group, best.0 + 1, gap - best.0 - 1).await?
+                {
+                    best = l;
                 }
                 return Ok(Some(best));
             }
