@@ -43,6 +43,12 @@ impl NntpError {
         }
     }
 
+    /// an XOVER range with no articles in it: 423, or 420 ("No Articles
+    /// Selected") from some providers
+    pub fn is_empty_range(&self) -> bool {
+        matches!(self.code(), Some(420 | 423))
+    }
+
     /// 4xx
     pub fn is_temporary(&self) -> bool {
         self.code().is_some_and(|c| (400..500).contains(&c))
@@ -1306,7 +1312,7 @@ impl Pool {
                         Some((if a.0 < first.0 { a } else { first }, if a.0 > last.0 { a } else { last }))
                     }
                 })),
-            Err(e) if e.code() == Some(423) => Ok(None),
+            Err(e) if e.is_empty_range() => Ok(None),
             Err(e) => Err(e),
         }
     }
@@ -1519,7 +1525,7 @@ impl Pool {
     /// up to `connections` requests in flight, sending each slice to the
     /// receiver the moment it arrives. A connection picks up the next slice as
     /// soon as it is free. No new slices are started once `stop` is set or a
-    /// slice fails with anything but 423 (empty) / 5xx (not available), and
+    /// slice fails with anything but 423/420 (empty) / 5xx (not available), and
     /// once `stop` is set the slices still in flight are dropped unsent.
     ///
     /// Every slice holds its room in the pool's unsaved budget (`Unsaved`)
@@ -1572,7 +1578,7 @@ impl Pool {
                     unsaved.keep(result.as_ref().map_or(0, Vec::len));
 
                     if let Err(e) = &result
-                        && e.code() != Some(423)
+                        && !e.is_empty_range()
                         && !e.is_permanent()
                     {
                         halt.store(true, Ordering::Relaxed);
@@ -1590,7 +1596,7 @@ impl Pool {
 
     /// XOVER `start..=end` of `group` on the active server, split into slices
     /// fetched in parallel over its connections. Slices with no articles
-    /// (423) come back empty; any other failure fails the whole range.
+    /// (423/420) come back empty; any other failure fails the whole range.
     pub async fn fetch_headers(self: &Arc<Self>, group: &str, start: u64, end: u64) -> Result<Vec<Overview>> {
         if end < start {
             return Ok(Vec::new());
@@ -1622,7 +1628,7 @@ impl Pool {
             let (idx, result) = joined.map_err(|e| NntpError::Protocol(format!("xover task failed: {e}")))?;
             match result {
                 Ok(rows) => parts[idx] = rows,
-                Err(e) if e.code() == Some(423) => {}
+                Err(e) if e.is_empty_range() => {}
                 Err(e) => {
                     failure.get_or_insert(e);
                 }

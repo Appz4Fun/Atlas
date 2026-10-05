@@ -870,8 +870,8 @@ impl Pass<'_> {
             let _unsaved = slice.unsaved;
             let headers: Vec<Overview> = match slice.result {
                 Ok(h) => h,
-                // 423 = no articles in that slice
-                Err(e) if e.code() == Some(423) => {
+                // 423 (or 420) = no articles in that slice
+                Err(e) if e.is_empty_range() => {
                     done += 1;
                     continue;
                 }

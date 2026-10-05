@@ -60,6 +60,8 @@ pub struct Server {
     /// BODYs answered with the article, and how long each takes
     pub bodies_sent: AtomicUsize,
     pub body_delay: Duration,
+    /// answer an empty XOVER range with 420 (some providers) instead of 423
+    pub empty_is_420: bool,
 }
 
 impl Server {
@@ -88,6 +90,7 @@ impl Server {
             accepted: AtomicUsize::new(0),
             bodies_sent: AtomicUsize::new(0),
             body_delay: Duration::ZERO,
+            empty_is_420: false,
         })
     }
 }
@@ -233,6 +236,10 @@ pub fn serve(stream: TcpStream, state: &Server, over_limit: bool) {
                 let posts = posts_lock();
                 let lo = posts.partition_point(|p| p.number < a);
                 let hits: Vec<&Post> = posts[lo..].iter().take_while(|p| p.number <= b).collect();
+                if hits.is_empty() && state.empty_is_420 {
+                    send(&mut out, b"420 No Articles Selected");
+                    continue;
+                }
                 if hits.is_empty() {
                     send(&mut out, b"423 no articles in that range");
                     continue;
