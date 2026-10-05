@@ -1,10 +1,15 @@
 //! With auto_run_compact on, the indexer stops for a compaction once the
 //! interval has passed, records it, and goes back to indexing.
 //!
+//! Unix only: it tells the rewrite by the shard files' inodes.
+//!
 //! One test, and the environment is set before any thread starts.
+
+#![cfg(unix)]
 
 mod common;
 
+use std::os::unix::fs::MetadataExt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -32,6 +37,12 @@ fn compacts_on_schedule_and_keeps_indexing() {
     std::fs::write(home.path().join("config.json"), config.to_string()).unwrap();
     atlas::db::create_db().unwrap();
 
+    let main = home.path().join("atlas.db");
+    let shards = atlas::store::shard_paths(&main);
+    assert!(shards.iter().all(|p| p.exists()), "create_db made the shards");
+    let inodes = || shards.iter().map(|p| std::fs::metadata(p).unwrap().ino()).collect::<Vec<_>>();
+    let before = inodes();
+
     let stop = Arc::new(AtomicBool::new(false));
     let cfg = atlas::config::load_config().unwrap();
     assert!(cfg.auto_run_compact);
@@ -40,7 +51,6 @@ fn compacts_on_schedule_and_keeps_indexing() {
         std::thread::spawn(move || atlas::bg_indexer::run_until(cfg, stop))
     };
 
-    let main = home.path().join("atlas.db");
     let deadline = Instant::now() + Duration::from_secs(60);
     let compacted = loop {
         let conn = atlas::db::open_at(&main).unwrap();
@@ -51,6 +61,16 @@ fn compacts_on_schedule_and_keeps_indexing() {
         std::thread::sleep(Duration::from_millis(200));
     };
     assert!(compacted > 0);
+    // last_compact is noted on failure too: the compaction really ran when
+    // every shard is a new file (compacting writes a copy and swaps it in),
+    // and none of the copying is left lying around
+    assert!(inodes().iter().zip(&before).all(|(now, was)| now != was), "every shard was rewritten");
+    for shard in &shards {
+        for suffix in ["compact", "precompact"] {
+            let stem = shard.file_stem().unwrap().to_string_lossy().into_owned();
+            assert!(!shard.with_file_name(format!("{stem}.{suffix}.db")).exists());
+        }
+    }
 
     // indexing goes on after it: everything gets indexed
     let deadline = Instant::now() + Duration::from_secs(60);

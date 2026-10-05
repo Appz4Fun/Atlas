@@ -100,7 +100,12 @@ pub fn create_main(conn: &Connection) -> Result<()> {
 
 /// A shard's tables, if missing.
 pub fn create_shard(path: &Path) -> Result<()> {
-    let conn = db::open_at(path)?;
+    build_shard(&db::open_at(path)?)
+}
+
+/// `create_shard` on a connection the caller opened (and may have set up to
+/// be interrupted).
+pub fn build_shard(conn: &Connection) -> Result<()> {
     conn.query_row("pragma journal_mode = wal", [], |_| Ok(()))?;
     conn.execute_batch(
         "
@@ -166,7 +171,7 @@ pub fn create_shard(path: &Path) -> Result<()> {
         insert or ignore into meta (key, value) values ('releases', 0), ('articles', 0);
         ",
     )?;
-    migrate_shard(&conn)
+    migrate_shard(conn)
 }
 
 /// Columns a shard made before sealing lacks: `files.touched_at` (when

@@ -541,9 +541,9 @@ async fn watch_config(sched: Arc<Scheduler>, servers: Vec<UsenetServer>) {
 async fn compact_timer(sched: Arc<Scheduler>) {
     let every = compact_every();
     let last = db::open_at(&paths::database()).ok().and_then(|conn| crate::store::get_meta(&conn, "last_compact").ok());
-    let last = last.flatten().unwrap_or_else(|| now() as i64);
+    // no stored time: count from when the indexer started (rebuilds dont reset it)
+    let last = last.flatten().unwrap_or_else(|| sched.stats.lock().unwrap().start_time as i64);
     let due = UNIX_EPOCH + Duration::from_secs(last.max(0) as u64) + every;
-    // the last compaction is in the past, soo a fresh start still waits out the rest
     while !sched.stopping() {
         if SystemTime::now() >= due {
             println!("compacting the database, indexing resumes after");
@@ -641,21 +641,27 @@ async fn run_servers(
 
     checkpoint_stop.store(true, Ordering::Relaxed);
     let _ = tokio::task::spawn_blocking(move || checkpointer.join()).await;
+    // the last clone of the db waits for the writers (one may be sealing)
+    let _ = tokio::task::spawn_blocking(move || drop(db)).await;
     sched.compact_due.load(Ordering::Relaxed)
 }
 
-/// Compact every shard in this process (the indexer is wound down, so nothing
-/// else writes), then note the time. Noted on failure too, soo a failing
-/// compaction is tried again in 24 hours, not every minute.
-async fn compact(config: &Config, stats: &Arc<Mutex<Stats>>) {
+/// Compact every shard in this process (the indexer is wound down and its
+/// writers are gone, soo nothing else writes), then note the time. Noted on
+/// failure too, soo a failing compaction is tried again in 24 hours, not every
+/// minute. Not noted when it was stopped: that wasnt a failure, and it runs
+/// again on the next start. False when a shard is missing afterwards.
+async fn compact(config: &Config, stats: &Arc<Mutex<Stats>>, stop: &Arc<AtomicBool>) -> bool {
     write_status(true, "compacting the database", &config.index_mode, false, "running", false, 0);
     let main = paths::database();
     let started = Instant::now();
-    let path = main.clone();
+    let (path, flag) = (main.clone(), stop.clone());
     let report = |msg: &str| println!("{msg}");
-    let result = tokio::task::spawn_blocking(move || crate::compact::run(&path, &report)).await;
+    let result = tokio::task::spawn_blocking(move || crate::compact::run(&path, &report, &flag)).await;
+    let stopped = stop.load(Ordering::Relaxed);
     match result {
         Ok(Ok(_)) => println!("compacted in {}", crate::dashboard::human_time(started.elapsed().as_secs() as i64)),
+        Ok(Err(e)) if stopped => println!("compaction stopped, the shards left are as they were: {e:#}"),
         Ok(Err(e)) => {
             ui::error(&format!("auto compaction failed, the originals were kept: {e:#}"));
             stats.lock().unwrap().error_count += 1;
@@ -665,9 +671,24 @@ async fn compact(config: &Config, stats: &Arc<Mutex<Stats>>) {
             stats.lock().unwrap().error_count += 1;
         }
     }
-    if let Ok(conn) = db::open_at(&main) {
+
+    // a swap that was cut half way leaves its shard missing, and a writer
+    // would make an empty one there
+    let missing: Vec<String> =
+        crate::store::shard_paths(&main).iter().filter(|p| !p.exists()).map(|p| p.display().to_string()).collect();
+    if !missing.is_empty() {
+        ui::error(&format!(
+            "shards missing after compacting, stopping the indexer. restore from the .precompact.db / .compact.db files next to them: {}",
+            missing.join(", ")
+        ));
+        stats.lock().unwrap().error_count += 1;
+        return false;
+    }
+
+    if !stopped && let Ok(conn) = db::open_at(&main) {
         let _ = crate::store::set_meta(&conn, "last_compact", chrono::Utc::now().timestamp());
     }
+    true
 }
 
 async fn supervise(stop: Arc<AtomicBool>, stats: Arc<Mutex<Stats>>) {
@@ -700,8 +721,8 @@ async fn supervise(stop: Arc<AtomicBool>, stats: Arc<Mutex<Stats>>) {
         let compact_due = run_servers(&config, pool.clone(), states.clone(), stats.clone(), stop.clone()).await;
         pool.close().await;
 
-        if compact_due && !stopping() {
-            compact(&config, &stats).await;
+        if compact_due && !stopping() && !compact(&config, &stats, &stop).await {
+            break;
         }
     }
 }

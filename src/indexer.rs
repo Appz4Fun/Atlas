@@ -119,6 +119,20 @@ const MAX_BATCH: usize = 8;
 pub struct Db {
     conn: Arc<Mutex<Connection>>,
     saves: Vec<std::sync::mpsc::Sender<SaveJob>>,
+    /// last field: dropping the final clone closes the queues above, then waits
+    /// for the writer threads to finish what they were doing
+    _writers: Arc<Writers>,
+}
+
+/// The writer threads, joined when dropped.
+struct Writers(Vec<std::thread::JoinHandle<()>>);
+
+impl Drop for Writers {
+    fn drop(&mut self) {
+        for writer in self.0.drain(..) {
+            let _ = writer.join();
+        }
+    }
 }
 
 struct SaveJob {
@@ -127,22 +141,22 @@ struct SaveJob {
 }
 
 /// `conn` is the main database. The writer threads end once every clone of
-/// the `Db` is gone.
+/// the `Db` is gone, and the last clone to go waits for them.
 pub fn shared_db(conn: Connection) -> Db {
     let main = conn.path().map(std::path::PathBuf::from).unwrap_or_else(crate::paths::database);
     let ids = Arc::new(crate::store::Ids::new(&main));
-    let saves = (0..crate::store::SHARDS)
+    let (saves, writers): (Vec<_>, Vec<_>) = (0..crate::store::SHARDS)
         .map(|shard| {
             let (saves, jobs) = std::sync::mpsc::channel();
             let (path, ids) = (crate::store::shard_path(&main, shard), ids.clone());
-            std::thread::Builder::new()
+            let handle = std::thread::Builder::new()
                 .name(format!("atlas-db-writer-{shard}"))
                 .spawn(move || writer(shard, &path, &ids, jobs))
                 .expect("couldnt start a db writer");
-            saves
+            (saves, handle)
         })
-        .collect();
-    Db { conn: Arc::new(Mutex::new(conn)), saves }
+        .unzip();
+    Db { conn: Arc::new(Mutex::new(conn)), saves, _writers: Arc::new(Writers(writers)) }
 }
 
 fn writer(shard: usize, path: &std::path::Path, ids: &crate::store::Ids, jobs: std::sync::mpsc::Receiver<SaveJob>) {

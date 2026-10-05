@@ -60,7 +60,9 @@ fn run_compact() -> i32 {
         println!("stop indexing first");
         return 1;
     }
-    match compact::run(&paths::database(), &|msg| println!("{msg}")) {
+    // nothing sets it: only the indexer stops a compaction early
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    match compact::run(&paths::database(), &|msg| println!("{msg}"), &stop) {
         Ok(_) => 0,
         Err(e) => {
             println!("couldnt compact: {e:#}");

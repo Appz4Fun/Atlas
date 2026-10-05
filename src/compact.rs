@@ -17,6 +17,8 @@
 //! on; `run` then returns an error naming each failed shard.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -58,8 +60,30 @@ pub struct Shrunk {
     pub domains_dropped: i64,
 }
 
-/// Compact every shard of `main`. Returns the total before and after.
-pub fn run(main: &Path, progress: &(dyn Fn(&str) + Sync)) -> Result<Shrunk> {
+/// the rows of a copying loop between looks at the stop flag
+const STOP_EVERY: usize = 65_536;
+
+/// Stop with an error once `stop` is set. Compacting only ever leaves the
+/// original shard alone until the swap, soo stopping anywhere before it loses
+/// nothing: the half made copy goes and the shard stays as it was.
+fn halt(stop: &AtomicBool, shard: usize) -> Result<()> {
+    if stop.load(Ordering::Relaxed) {
+        bail!("shard {shard}: stopped, the original was kept");
+    }
+    Ok(())
+}
+
+/// Have SQLite give up long statements (a bulk insert, an index build) once
+/// `stop` is set: they fail with an interrupt, like any other error.
+fn interruptible(conn: &Connection, stop: &Arc<AtomicBool>) -> Result<()> {
+    let stop = stop.clone();
+    conn.progress_handler(1000, Some(move || stop.load(Ordering::Relaxed)))?;
+    Ok(())
+}
+
+/// Compact every shard of `main`. Returns the total before and after. Once
+/// `stop` is set, shards not done are left as they were (and an error says so).
+pub fn run(main: &Path, progress: &(dyn Fn(&str) + Sync), stop: &Arc<AtomicBool>) -> Result<Shrunk> {
     if !store::exists(main) {
         bail!("{} has no shards (convert it first)", main.display());
     }
@@ -69,9 +93,13 @@ pub fn run(main: &Path, progress: &(dyn Fn(&str) + Sync)) -> Result<Shrunk> {
     // every shard gets its turn: one that fails keeps its original and doesnt
     // stop the others
     for chunk in (0..SHARDS).collect::<Vec<_>>().chunks(PARALLEL) {
+        if stop.load(Ordering::Relaxed) {
+            failed.extend(chunk.iter().map(|&shard| (shard, format!("shard {shard}: stopped"))));
+            continue;
+        }
         let results: Vec<Result<Shrunk>> = std::thread::scope(|s| {
             let jobs: Vec<_> =
-                chunk.iter().map(|&shard| s.spawn(move || compact_shard(main, shard, progress))).collect();
+                chunk.iter().map(|&shard| s.spawn(move || compact_shard(main, shard, progress, stop))).collect();
             jobs.into_iter().map(|j| j.join().unwrap_or_else(|_| Err(anyhow!("compacting a shard panicked")))).collect()
         });
         for (&shard, r) in chunk.iter().zip(results) {
@@ -97,6 +125,9 @@ pub fn run(main: &Path, progress: &(dyn Fn(&str) + Sync)) -> Result<Shrunk> {
             remove_db(&with_suffix(&path, "compact"));
         }
     }
+    if stop.load(Ordering::Relaxed) {
+        bail!("stopped, {} of {SHARDS} shards were left as they were", failed.len());
+    }
     if !failed.is_empty() {
         let each: Vec<String> = failed.into_iter().map(|(_, e)| e).collect();
         bail!("{} of {SHARDS} shards were not compacted, their originals were kept: {}", each.len(), each.join("; "));
@@ -112,10 +143,16 @@ pub fn run(main: &Path, progress: &(dyn Fn(&str) + Sync)) -> Result<Shrunk> {
     Ok(total)
 }
 
-fn compact_shard(main: &Path, shard: usize, progress: &(dyn Fn(&str) + Sync)) -> Result<Shrunk> {
+fn compact_shard(
+    main: &Path,
+    shard: usize,
+    progress: &(dyn Fn(&str) + Sync),
+    stop: &Arc<AtomicBool>,
+) -> Result<Shrunk> {
     let path = store::shard_path(main, shard);
     let copy = with_suffix(&path, "compact");
     let say = |msg: &str| progress(&format!("compacting shard {shard}: {msg}"));
+    halt(stop, shard)?;
 
     // fold the WAL in soo the original is whole on its own
     {
@@ -130,6 +167,7 @@ fn compact_shard(main: &Path, shard: usize, progress: &(dyn Fn(&str) + Sync)) ->
     remove_db(&copy);
     store::create_shard(&copy)?;
     let mut conn = db::open_at(&copy)?;
+    interruptible(&conn, stop)?;
     conn.query_row("pragma journal_mode = off", [], |_| Ok(()))?;
     conn.execute_batch(
         "pragma synchronous = off;
@@ -152,12 +190,18 @@ fn compact_shard(main: &Path, shard: usize, progress: &(dyn Fn(&str) + Sync)) ->
         };
         let mut stmt = conn.prepare("select domain from old.segments")?;
         let mut rows = stmt.query([])?;
+        let mut n = 0usize;
         while let Some(r) = rows.next()? {
             used(r.get(0)?);
+            n += 1;
+            if n.is_multiple_of(STOP_EVERY) {
+                halt(stop, shard)?;
+            }
         }
         let mut stmt = conn.prepare("select id, blob from old.files where blob is not null")?;
         let mut rows = stmt.query([])?;
         while let Some(r) = rows.next()? {
+            halt(stop, shard)?;
             for seg in unseal(shard, r.get(0)?, &r.get::<_, Vec<u8>>(1)?)? {
                 used(seg.domain);
             }
@@ -165,6 +209,7 @@ fn compact_shard(main: &Path, shard: usize, progress: &(dyn Fn(&str) + Sync)) ->
     }
     let shared = |d: i64| d != 0 && uses.get(d as usize).is_some_and(|n| *n >= SHARED_AFTER);
 
+    halt(stop, shard)?;
     say("copying releases");
     conn.execute_batch(
         "insert into releases select * from old.releases order by id;
@@ -196,6 +241,7 @@ fn compact_shard(main: &Path, shard: usize, progress: &(dyn Fn(&str) + Sync)) ->
     // stored whole, the rest packed the current way, and files that are due
     // sealed into one blob on the way (sealing afterwards would leave the
     // copy full of the deleted rows' free pages)
+    halt(stop, shard)?;
     say(&format!("copying files and articles ({kept} shared domains, dropping {dropped}), sealing those due"));
     let now = chrono::Utc::now().timestamp();
     let (mut copied, mut sealed) = (0i64, 0i64);
@@ -215,12 +261,16 @@ fn compact_shard(main: &Path, shard: usize, progress: &(dyn Fn(&str) + Sync)) ->
         let mut tx = conn.transaction()?;
         let mut in_tx = 0;
         loop {
+            halt(stop, shard)?;
             let file = files.next()?;
             let id: Option<i64> = file.map(|f| f.get(0)).transpose()?;
             // rows whose file isnt there (purged, or past the last file) stay rows
             while let Some(row) = pending.take_if(|r| id.is_none_or(|id| r.file_id < id)) {
                 insert_row(&tx, &row)?;
                 (copied, in_tx) = (copied + 1, in_tx + 1);
+                if (copied as usize).is_multiple_of(STOP_EVERY) {
+                    halt(stop, shard)?;
+                }
                 pending = next_row(&mut rows, &shared)?;
             }
             let (Some(f), Some(id)) = (file, id) else { break };
@@ -278,19 +328,26 @@ fn compact_shard(main: &Path, shard: usize, progress: &(dyn Fn(&str) + Sync)) ->
     }
     say(&format!("sealed {sealed} files"));
 
+    halt(stop, shard)?;
     say("building indexes and the search index");
     conn.execute_batch(
         "detach database old;
          insert into releases_fts(releases_fts) values('rebuild');",
     )?;
     drop(conn);
-    store::create_shard(&copy)?;
+    {
+        let conn = db::open_at(&copy)?;
+        interruptible(&conn, stop)?;
+        store::build_shard(&conn)?;
+    }
 
     // the check: same rows, same NZBs
+    halt(stop, shard)?;
     say("checking");
-    check(&path, &copy, shard, copied)?;
+    check(&path, &copy, shard, copied, stop)?;
 
-    // swap
+    // swap: the last point to stop at
+    halt(stop, shard)?;
     let conn = db::open_at(&copy)?;
     conn.query_row("pragma journal_mode = wal", [], |_| Ok(()))?;
     conn.query_row("pragma wal_checkpoint(truncate)", [], |_| Ok(()))?;
@@ -357,9 +414,10 @@ fn insert_row(conn: &Connection, r: &Row) -> Result<()> {
 /// The copy holds the same releases, files and articles (rows and inside
 /// blobs) as the original, and a sample of releases build the same NZBs from
 /// both.
-fn check(original: &Path, copy: &Path, shard: usize, copied: i64) -> Result<()> {
+fn check(original: &Path, copy: &Path, shard: usize, copied: i64, stop: &Arc<AtomicBool>) -> Result<()> {
     let attach = |path: &Path| -> Result<Connection> {
         let conn = Connection::open_in_memory()?;
+        interruptible(&conn, stop)?;
         conn.execute("attach database ? as ?", params![path.to_string_lossy(), format!("s{shard}")])?;
         Ok(conn)
     };
@@ -387,6 +445,7 @@ fn check(original: &Path, copy: &Path, shard: usize, copied: i64) -> Result<()> 
     let (Some(low), Some(high)) = (low, high) else { return Ok(()) };
     let step = ((high - low) / CHECK_SAMPLE).max(1);
     for n in 0..CHECK_SAMPLE {
+        halt(stop, shard)?;
         let found: Option<i64> = old
             .query_row(
                 &format!("select id from s{shard}.releases where id >= ? order by id limit 1"),
@@ -407,6 +466,10 @@ fn check(original: &Path, copy: &Path, shard: usize, copied: i64) -> Result<()> 
 mod tests {
     use super::*;
     use crate::parser::{Article, Release};
+
+    fn no_stop() -> Arc<AtomicBool> {
+        Arc::new(AtomicBool::new(false))
+    }
 
     /// every release's NZB rows, by id
     fn all_articles(main: &Path) -> Vec<(i64, Vec<crate::search::ArticleRow>)> {
@@ -556,7 +619,7 @@ mod tests {
         let count = article_total(&main);
         assert_eq!(count, 240);
 
-        let shrunk = run(&main, &|_| {}).unwrap();
+        let shrunk = run(&main, &|_| {}, &no_stop()).unwrap();
         assert_eq!(shrunk.domains_dropped, 120);
         assert_eq!(domains(&main), shrunk.domains_kept);
         assert!(shrunk.domains_kept <= 5);
@@ -612,7 +675,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let main = dir.path().join("atlas.db");
         legacy_fixture(&main);
-        run(&main, &|_| {}).unwrap();
+        run(&main, &|_| {}, &no_stop()).unwrap();
         assert_eq!(loose(&main), 0);
 
         // late articles for a sealed file, under a domain only one of them
@@ -670,7 +733,7 @@ mod tests {
         let count = article_total(&main);
         assert_eq!(count, 240 + 4);
 
-        let shrunk = run(&main, &|_| {}).unwrap();
+        let shrunk = run(&main, &|_| {}, &no_stop()).unwrap();
         assert_eq!(shrunk.domains_dropped, 2, "@Late> and @Lonely>");
         assert_eq!(all_articles(&main), before, "every NZB reads back the same");
         assert_eq!(article_total(&main), count);
@@ -683,11 +746,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let main = dir.path().join("atlas.db");
         legacy_fixture(&main);
-        run(&main, &|_| {}).unwrap();
+        run(&main, &|_| {}, &no_stop()).unwrap();
         let (path, file) = file_of(&main, "Rel.3", "alt.binaries.g3");
         db::open_at(&path).unwrap().execute("update files set blob = x'00' where id = ?", [file]).unwrap();
 
-        let err = run(&main, &|_| {}).unwrap_err();
+        let err = run(&main, &|_| {}, &no_stop()).unwrap_err();
         assert!(format!("{err:#}").contains("corrupt"), "{err:#}");
         let blob: Vec<u8> =
             db::open_at(&path).unwrap().query_row("select blob from files where id = ?", [file], |r| r.get(0)).unwrap();
@@ -719,7 +782,7 @@ mod tests {
         assert!(!before.is_empty());
         db::open_at(&path).unwrap().execute("update files set blob = x'00' where id = ?", [file]).unwrap();
 
-        let err = run(&main, &|_| {}).unwrap_err();
+        let err = run(&main, &|_| {}, &no_stop()).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains(&format!("shard {bad}:")) && msg.contains("corrupt"), "{msg}");
 
@@ -742,5 +805,52 @@ mod tests {
         let blob: Vec<u8> =
             db::open_at(&path).unwrap().query_row("select blob from files where id = ?", [file], |r| r.get(0)).unwrap();
         assert_eq!(blob, vec![0]);
+    }
+
+    /// no shard is half done: the files are all there, the NZBs read back the
+    /// same, and nothing from the copying is left lying around
+    fn assert_untouched_or_whole(main: &Path, before: &[(i64, Vec<crate::search::ArticleRow>)]) {
+        for shard in store::shard_paths(main) {
+            assert!(shard.exists(), "{} is still there", shard.display());
+            assert!(!with_suffix(&shard, "precompact").exists(), "no backup left over");
+            assert!(!with_suffix(&shard, "compact").exists(), "no half made copy left over");
+        }
+        assert_eq!(all_articles(main), before, "every NZB reads back the same");
+    }
+
+    #[test]
+    fn a_stop_before_the_start_leaves_every_shard_as_it_was() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        legacy_fixture(&main);
+        let before = all_articles(&main);
+        let (rows, count) = (loose(&main), article_total(&main));
+
+        let stop = Arc::new(AtomicBool::new(true));
+        let err = run(&main, &|_| {}, &stop).unwrap_err();
+        assert!(format!("{err:#}").contains("stopped"), "{err:#}");
+        assert_untouched_or_whole(&main, &before);
+        assert_eq!((loose(&main), article_total(&main)), (rows, count), "nothing was sealed or dropped");
+    }
+
+    #[test]
+    fn a_stop_while_copying_drops_the_copies_and_keeps_the_originals() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        legacy_fixture(&main);
+        let before = all_articles(&main);
+
+        // the flag goes up as the first shard reports the copy of its files
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = stop.clone();
+        let progress = move |msg: &str| {
+            if msg.contains("copying files and articles") {
+                flag.store(true, Ordering::Relaxed);
+            }
+        };
+        let err = run(&main, &progress, &stop).unwrap_err();
+        assert!(format!("{err:#}").contains("stopped"), "{err:#}");
+        assert!(stop.load(Ordering::Relaxed));
+        assert_untouched_or_whole(&main, &before);
     }
 }
