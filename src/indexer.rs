@@ -568,9 +568,53 @@ pub const CHUNK_OVERLAP: i64 = 3600;
 /// Index the day chunk `chunk` claimed (its day in unix days) on `server`,
 /// for a group whose backfill is split into day chunks (see chunks.rs). The
 /// chunk is marked done when the whole day is in, released again if stopped
-/// part way or failing. Either is skipped once another worker took the chunk
-/// over (this one ran past CLAIM_TIMEOUT): the chunk is that worker's.
+/// part way or failing, or dropped part way (stopping drops a pass stuck on
+/// the network). Either is skipped once another worker took the chunk over
+/// (this one ran past CLAIM_TIMEOUT): the chunk is that worker's.
 pub async fn run_chunk<P>(
+    ctx: &PassContext,
+    settings: &PassSettings,
+    db: &Db,
+    chunk: &crate::chunks::Claim,
+    server: usize,
+    progress: &mut P,
+) -> Result<Progress>
+where
+    P: FnMut(&Progress) + ?Sized,
+{
+    let mut unfinished = GiveBackOnDrop { db, chunk, armed: true };
+    let r = index_chunk(ctx, settings, db, chunk, server, progress).await;
+    unfinished.armed = false;
+    r
+}
+
+/// Gives a claimed chunk back when its run is dropped part way, instead of
+/// it staying claimed until CLAIM_TIMEOUT (a quick restart would find it
+/// taken). Every way the run ends on its own finishes or gives it back already.
+struct GiveBackOnDrop<'a> {
+    db: &'a Db,
+    chunk: &'a crate::chunks::Claim,
+    armed: bool,
+}
+
+impl Drop for GiveBackOnDrop<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // best effort and quick: one update, only while this claim still owns it
+        let r = match self.db.conn.lock() {
+            Ok(conn) => crate::chunks::release(&conn, self.chunk).map(|_| ()).map_err(anyhow::Error::from),
+            Err(_) => Err(anyhow!("the database connection is poisoned")),
+        };
+        if let Err(e) = r {
+            let (group, day) = (&self.chunk.group, self.chunk.day);
+            println!("[CHUNK] {group} day {day}: couldnt give the chunk back when stopped: {e:#}");
+        }
+    }
+}
+
+async fn index_chunk<P>(
     ctx: &PassContext,
     settings: &PassSettings,
     db: &Db,

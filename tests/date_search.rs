@@ -355,6 +355,55 @@ fn a_day_older_than_the_server_keeps_is_given_back() {
     assert_eq!(state(first_day + 1), 2, "an empty day it keeps is done");
 }
 
+/// Stopping drops a chunk part way (here on a request stuck on the network):
+/// the chunk goes back to pending right away, not after CLAIM_TIMEOUT, soo a
+/// quick restart doesnt find it taken.
+#[test]
+fn a_chunk_dropped_by_stopping_is_given_back() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let home = tempfile::tempdir().unwrap();
+    let main = home.path().join("atlas.db");
+    atlas::db::create_db_at(&main).unwrap();
+    let mut server = Server::new(hourly());
+    let s = std::sync::Arc::get_mut(&mut server).unwrap();
+    s.stall = std::time::Duration::from_secs(10);
+    s.stalls_left.store(1, Ordering::SeqCst);
+    let port = spawn_server(server.clone());
+    let pool = BlockingPool::new(&[mock(port, "secret", 2, 1)]);
+    pool.connect().unwrap();
+
+    let day =
+        atlas::chunks::unix_day(chrono::DateTime::parse_from_rfc3339("2026-01-02T00:00:00+00:00").unwrap().timestamp());
+    let main_conn = atlas::db::open_at(&main).unwrap();
+    atlas::chunks::add(&main_conn, GROUP, day, day).unwrap();
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let ctx = atlas::indexer::PassContext {
+        pool: pool.pool.clone(),
+        states: Default::default(),
+        stop: stop.clone(),
+        verbose: false,
+    };
+    let db = atlas::indexer::shared_db(main_conn);
+    let chunk = claimed(&main, GROUP, day);
+    let stuck = server.clone();
+    let stopper = std::thread::spawn(move || {
+        while stuck.stalled.load(Ordering::SeqCst) == 0 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        stop.store(true, Ordering::SeqCst);
+    });
+    let (settings, mut progress) = (Default::default(), |_: &atlas::indexer::Progress| {});
+    let run = atlas::indexer::run_chunk(&ctx, &settings, &db, &chunk, 0, &mut progress);
+    assert!(pool.block_on(atlas::nntp::unless_stopped(&ctx.stop, run)).is_none(), "dropped by stopping");
+    stopper.join().unwrap();
+
+    let state: i64 = atlas::db::open_at(&main)
+        .unwrap()
+        .query_row("select state from backfill_chunks where day = ?", [day], |r| r.get(0))
+        .unwrap();
+    assert_eq!(state, 0, "given back");
+}
+
 /// The split's oldest day, which no server keeps from its start: only the
 /// server that goes back furthest on it indexes it, from its first article.
 /// One whose retention starts later that day gives it back.
