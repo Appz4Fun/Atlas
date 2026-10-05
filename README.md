@@ -160,7 +160,7 @@ The old single-server layout, with `host`, `username`, `password`, and `port` at
 
 ### How Atlas uses the servers
 
-- **Indexing uses every server at once, whatever its priority.** Atlas spreads groups over the indexing servers in proportion to their `connections`, and each server runs its own groups, so all connections stay busy. Each group stays on one server, because article numbers, and therefore the indexing cursors, differ between providers.
+- **Indexing uses every server at once, whatever its priority.** Atlas spreads groups over the indexing servers in proportion to their `connections`, and each server runs its own groups, so all connections stay busy. Each group stays on one server, because article numbers, and therefore the indexing cursors, differ between providers. A server that stops answering hands only its own groups to the others for a while.
 - **A group that a server doesn't carry:** Atlas looks it up on the other servers.
 - **par2 and nfo articles:** Atlas asks the servers in priority order until one has them.
 - **A server that can't connect:** Atlas skips it for a minute and moves its groups to the other servers. When a group moves, its cursor on the new server starts from the top. Atlas re-scans those articles but de-duplicates them, so it doesn't store anything twice.

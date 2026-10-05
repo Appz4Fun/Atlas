@@ -887,6 +887,17 @@ impl Pool {
             return home;
         }
 
+        // a server that is down only moves its own groups: the others keep the
+        // server they get with every indexing server up
+        let first = self.spread_over(&self.indexing_servers(), group);
+        if tier.contains(&first) {
+            return first;
+        }
+        self.spread_over(tier, group)
+    }
+
+    /// `group`'s server among `tier`, by its hash weighted by connections.
+    fn spread_over(&self, tier: &[usize], group: &str) -> usize {
         let total: u64 = tier.iter().map(|&i| self.connections(i) as u64).sum();
         if total == 0 {
             return tier.first().copied().unwrap_or(0);
@@ -1972,6 +1983,33 @@ mod tests {
         // once found elsewhere, a group is picked there
         pool.homes.lock().unwrap().insert("alt.binaries.moved".into(), 1);
         assert_eq!(pool.pick_server("alt.binaries.moved"), 1);
+    }
+
+    #[test]
+    fn a_server_going_down_only_moves_its_own_groups() {
+        let server = |host: &str| {
+            let mut s = UsenetServer::new(host, "u", "p", 563);
+            s.connections = Some(4);
+            s
+        };
+        let pool = Pool::new(&[server("a"), server("b"), server("c")]);
+        let groups: Vec<String> = (0..300).map(|i| format!("alt.binaries.group{i}")).collect();
+        let before: Vec<usize> = groups.iter().map(|g| pool.pick_server(g)).collect();
+
+        *pool.servers[2].down_until.lock().unwrap() = Some(Instant::now() + DOWN_FOR);
+        assert_eq!(pool.indexing_tier(), vec![0, 1]);
+        for (g, &was) in groups.iter().zip(&before) {
+            let now = pool.pick_server(g);
+            if was == 2 {
+                assert_ne!(now, 2, "{g}: its server is down, it goes to another");
+            } else {
+                assert_eq!(now, was, "{g}: its server is up, it stays there");
+            }
+        }
+
+        // back up: every group is where it was
+        *pool.servers[2].down_until.lock().unwrap() = None;
+        assert_eq!(groups.iter().map(|g| pool.pick_server(g)).collect::<Vec<_>>(), before);
     }
 
     #[test]

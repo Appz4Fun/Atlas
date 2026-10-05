@@ -14,9 +14,11 @@ use std::time::{Duration, Instant};
 use common::{Server, post_at, spawn_server};
 
 /// the mock always carries common::GROUP, this one only with `any_group`.
-/// its home is localhost, and GROUP on 127.1 falling over would pick
-/// 127.0.0.1 (see Pool::pick_server_in and Pool::ranked), soo a probe that
-/// falls over moves the group and leaves a second set of cursors
+/// its home is localhost, and GROUP on the third server falling over would
+/// pick 127.0.0.1 (see Pool::pick_server_in and Pool::ranked), soo a probe
+/// that falls over moves the group and leaves a second set of cursors. The
+/// third server resting as down mustnt move it either (with all three up it
+/// hashes to localhost, over the other two alone to 127.0.0.1)
 const SPLIT_GROUP: &str = "alt.binaries.split";
 
 /// 40 posts a day for 30 days, numbered from `offset`
@@ -56,13 +58,16 @@ fn a_server_without_the_group_doesnt_move_it() {
     let (a, b) = (carrier(1), carrier(500_001));
     // answers 411 for SPLIT_GROUP
     let c = Server::new(posts(900_001));
-    let (pa, pb, pc) = (spawn_server(a), spawn_server(b), spawn_server(c));
-    // three host names for 127.0.0.1, soo cursors and chunk claims tell the servers apart
+    let (pa, pb, pc) = (spawn_server(a), spawn_server(b), spawn_server(c.clone()));
+    // three host names for the loopback, soo cursors and chunk claims tell the
+    // servers apart. the third has to reach its mock (and answer 411) on every
+    // os, and 127.1 isnt a name every resolver takes (Windows CI couldnt reach it)
+    let third = if common::has_ipv6_loopback() { "[::1]" } else { "127.1" };
     let config = serde_json::json!({
         "usenet_servers": [
             {"host": "127.0.0.1", "username": "bob", "password": "secret", "port": pa, "ssl": false, "connections": 4, "priority": 1},
             {"host": "localhost", "username": "bob", "password": "secret", "port": pb, "ssl": false, "connections": 4, "priority": 1},
-            {"host": "127.1", "username": "bob", "password": "secret", "port": pc, "ssl": false, "connections": 4, "priority": 1}
+            {"host": third, "username": "bob", "password": "secret", "port": pc, "ssl": false, "connections": 4, "priority": 1}
         ],
         "groups": [SPLIT_GROUP],
         "index_mode": "backfill",
@@ -114,5 +119,6 @@ fn a_server_without_the_group_doesnt_move_it() {
         .unwrap()
         .collect::<Result<_, _>>()
         .unwrap();
+    assert!(c.accepted.load(Ordering::SeqCst) > 0, "the third server was asked");
     assert_eq!(chunk_servers, vec!["127.0.0.1".to_string(), "localhost".to_string()], "only the carriers did chunks");
 }

@@ -282,16 +282,42 @@ pub fn serve(stream: TcpStream, state: &Server, over_limit: bool) {
     }
 }
 
+/// The mock listens on 127.0.0.1 and, where the machine has IPv6, on ::1 at
+/// the same port: "localhost" is ::1 first on Windows and macOS, and a
+/// refused ::1 costs Windows about 2s per connection before it tries 127.0.0.1.
 pub fn spawn_server(state: Arc<Server>) -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    thread::spawn(move || {
-        for stream in listener.incoming().flatten() {
-            let state = state.clone();
-            thread::spawn(move || handle(stream, state));
-        }
-    });
+    let (v4, v6) = loopback_listeners();
+    let port = v4.local_addr().unwrap().port();
+    for listener in std::iter::once(v4).chain(v6) {
+        let state = state.clone();
+        thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let state = state.clone();
+                thread::spawn(move || handle(stream, state));
+            }
+        });
+    }
     port
+}
+
+/// a port free on 127.0.0.1, and on ::1 too unless the machine has no IPv6
+fn loopback_listeners() -> (TcpListener, Option<TcpListener>) {
+    for _ in 0..20 {
+        let v4 = TcpListener::bind("127.0.0.1:0").unwrap();
+        if !has_ipv6_loopback() {
+            return (v4, None);
+        }
+        // the port can be taken on ::1 by something else: try another
+        if let Ok(v6) = TcpListener::bind(("::1", v4.local_addr().unwrap().port())) {
+            return (v4, Some(v6));
+        }
+    }
+    panic!("no port free on both 127.0.0.1 and ::1");
+}
+
+/// ::1 can be listened on (some containers have no IPv6)
+pub fn has_ipv6_loopback() -> bool {
+    TcpListener::bind("[::1]:0").is_ok()
 }
 
 pub fn index_until_idle(indexer: &mut Indexer) {
