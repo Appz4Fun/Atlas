@@ -83,6 +83,8 @@ struct Quick {
     releases_approx: i64,
     db_bytes: u64,
     wal_bytes: u64,
+    /// (group, done, total) for split groups' day chunks
+    chunks: Vec<(String, i64, i64)>,
 }
 
 fn load_quick() -> Quick {
@@ -101,6 +103,11 @@ fn load_quick() -> Quick {
     q.progress = db::group_progress(&conn).unwrap_or_default();
     // running totals the shards keep, instant
     (q.releases_approx, q.articles_approx) = crate::store::totals(&conn).unwrap_or_default();
+    q.chunks = crate::chunks::split_groups(&conn)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|g| crate::chunks::progress(&conn, &g).ok().map(|(d, t)| (g, d, t)))
+        .collect();
     q
 }
 
@@ -778,6 +785,10 @@ fn draw_backfill(f: &mut Frame, app: &App, area: Rect) {
         note("counts are article numbers, gaps on the server included"),
     ];
     let mut progress = progress;
+    if !quick.chunks.is_empty() {
+        let (done, total) = quick.chunks.iter().fold((0, 0), |(d, t), c| (d + c.1, t + c.2));
+        progress.push(kv("split groups", format!("{}, day chunks {done} of {total} done", quick.chunks.len())));
+    }
     if b.unmeasured > 0 {
         progress.push(note(&format!("{} groups get their range on their next pass", count(b.unmeasured as i64))));
     }
@@ -1378,7 +1389,10 @@ mod tests {
                              "limit": 10, "connections": 10, "headers": 900, "wire_bytes": 100, "text_bytes": 400}]
             }),
             status: serde_json::json!({"running": false}),
-            quick: Arc::new(Mutex::new(Quick::default())),
+            quick: Arc::new(Mutex::new(Quick {
+                chunks: vec![("alt.binaries.x".into(), 3, 10)],
+                ..Quick::default()
+            })),
             content: Arc::new(Mutex::new(ContentState {
                 data: Some(Content {
                     releases: 10,
@@ -1407,6 +1421,7 @@ mod tests {
             assert!(text.contains(name), "page {page}");
             match page {
                 0 => assert!(text.contains("headers/s")),
+                1 => assert!(text.contains("day chunks 3 of 10 done")),
                 2 => assert!(
                     text.contains(".mkv")
                         && text.contains("NZBs available    9 (90.0%)")
