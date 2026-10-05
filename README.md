@@ -153,7 +153,7 @@ Atlas keeps any other keys you add to the file when it saves it.
 | `port` | `563` | `563` is SSL and `119` is plain text. |
 | `ssl` | from the port | Forces SSL on or off. |
 | `connections` | `10` | Requests Atlas keeps in flight on this server at once. Set it to what your plan allows. See [Measure connection limits](#measure-connection-limits). |
-| `priority` | `99` | Atlas asks servers with lower values first when it looks up par2 and nfo articles. Servers with equal priority keep their order in the file. |
+| `priority` | `99` | Order of the servers for failover and for par2 and nfo lookups among equally busy servers. Lower values come first. Servers with equal priority keep their order in the file. |
 | `index` | `true` | Whether the server takes part in indexing. `false` keeps it for article lookups only, for example a block account whose data you don't want to spend on headers. |
 | `compress` | `true` | Requests gzip-compressed header listings. Servers without compression get plain requests, and Atlas turns compression off for a server that sends unreadable data. |
 
@@ -163,7 +163,7 @@ The old single-server layout, with `host`, `username`, `password`, and `port` at
 
 - **Indexing uses every server at once, whatever its priority.** Atlas spreads groups over the indexing servers in proportion to their `connections`, and each server runs its own groups, so all connections stay busy. Each group stays on one server, because article numbers, and therefore the indexing cursors, differ between providers. A server that stops answering hands only its own groups to the others for a while.
 - **A group that a server doesn't carry:** Atlas looks it up on the other servers.
-- **par2 and nfo articles:** Atlas asks the servers in priority order until one has them.
+- **par2 and nfo articles:** Atlas asks the least busy indexing server first, so lookups don't all queue on one server. If it doesn't have the article, Atlas asks the other indexing servers from least to most busy, and then the remaining servers, such as those with `index: false`, in priority order.
 - **A server that can't connect:** Atlas skips it for a minute and moves its groups to the other servers. When a group moves, its cursor on the new server starts from the top. Atlas re-scans those articles but de-duplicates them, so it doesn't store anything twice.
 
 Atlas also handles these provider quirks on its own:

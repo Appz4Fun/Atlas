@@ -677,10 +677,29 @@ struct Server {
     /// connections atlas currently allows itself (starts at `connections`,
     /// shrinks when the provider refuses more)
     limit: AtomicUsize,
+    /// requests waiting for a free connection right now
+    waiting: AtomicUsize,
     /// for the stats dashboard
     headers: AtomicU64,
     wire: AtomicU64,
     text: AtomicU64,
+}
+
+/// Counts a request waiting for a connection while it lives (a request
+/// dropped while it waits is counted out too).
+struct Waiting<'a>(&'a AtomicUsize);
+
+impl<'a> Waiting<'a> {
+    fn on(count: &'a AtomicUsize) -> Self {
+        count.fetch_add(1, Ordering::Relaxed);
+        Waiting(count)
+    }
+}
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 impl Server {
@@ -856,6 +875,7 @@ impl Pool {
                         warned_auth: AtomicBool::new(false),
                         warned_limit: AtomicBool::new(false),
                         limit: AtomicUsize::new(cfg.connections().max(1) as usize),
+                        waiting: AtomicUsize::new(0),
                         headers: AtomicU64::new(0),
                         wire: AtomicU64::new(0),
                         text: AtomicU64::new(0),
@@ -1061,7 +1081,10 @@ impl Pool {
 
         loop {
             let waited = Instant::now();
-            let permit = server.permits.clone().acquire_owned().await.expect("semaphore closed");
+            let permit = {
+                let _waiting = Waiting::on(&server.waiting);
+                server.permits.clone().acquire_owned().await.expect("semaphore closed")
+            };
             crate::profile::Load::add_since(&crate::profile::LOAD.lease_wait_ns, waited);
 
             let idle = {
@@ -1612,10 +1635,22 @@ impl Pool {
         }
     }
 
-    /// BODY from the active server, then every other server in priority order.
+    /// How busy server `i` is: requests on it and waiting for it, per connection.
+    fn busy(&self, i: usize) -> f64 {
+        let s = &self.servers[i];
+        let limit = s.limit.load(Ordering::Relaxed).max(1);
+        let in_use = limit.saturating_sub(s.permits.available_permits());
+        (in_use + s.waiting.load(Ordering::Relaxed)) as f64 / limit as f64
+    }
+
+    /// BODY from the least busy indexing server first, soo name lookups dont
+    /// all queue on one server (equally busy ones in priority order), then
+    /// from the others in priority order until one has it.
     pub async fn fetch_body(&self, message_id: &str) -> Result<Vec<u8>> {
-        let active = self.active_index();
-        let order = std::iter::once(active).chain((0..self.servers.len()).filter(|&i| i != active));
+        let mut order = self.indexing_tier();
+        order.sort_by(|&a, &b| self.busy(a).total_cmp(&self.busy(b)));
+        let rest: Vec<usize> = (0..self.servers.len()).filter(|i| !order.contains(i)).collect();
+        order.extend(rest);
         let mut last_err = Self::no_servers();
 
         for i in order {

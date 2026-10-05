@@ -104,3 +104,56 @@ fn broken_compression_falls_back_to_plain() {
     let (_, articles) = atlas::store::totals(&conn).unwrap();
     assert_eq!(articles, 40);
 }
+
+/// Name lookups spread over the servers instead of all queueing on the
+/// first one: two servers with the same articles share the BODYs.
+#[test]
+fn name_lookups_spread_over_servers() {
+    let posts: Vec<Post> = (1..=40)
+        .map(|n| {
+            post(n, &format!(r#""thing{n}.nfo" yEnc (1/1)"#), 10, vec![format!("Release Name: Thing {n}").into_bytes()])
+        })
+        .collect();
+    let servers: Vec<Arc<Server>> = (0..2)
+        .map(|_| {
+            let mut s = Server::new(posts.clone());
+            Arc::get_mut(&mut s).unwrap().body_delay = Duration::from_millis(20);
+            s
+        })
+        .collect();
+    let (p1, p2) = (spawn_server(servers[0].clone()), spawn_server(servers[1].clone()));
+
+    let pool = BlockingPool::new(&[mock(p1, "secret", 2, 1), mock(p2, "secret", 2, 2)]);
+    pool.connect().unwrap();
+
+    let extract: atlas::nntp::Extract = atlas::nfo::display_name;
+    let jobs = posts.iter().map(|p| vec![(p.message_id.clone(), extract)]).collect();
+    let names = pool.first_names(jobs);
+    assert!(names.iter().all(Option::is_some), "{names:?}");
+
+    let sent: Vec<usize> = servers.iter().map(|s| s.bodies_sent.load(Ordering::SeqCst)).collect();
+    assert_eq!(sent.iter().sum::<usize>(), 40);
+    assert!(sent.iter().all(|&n| n >= 10), "the lookups should be shared, got {sent:?}");
+}
+
+/// A server missing the article (430) hands the lookup to the next one.
+#[test]
+fn name_lookups_fall_back_on_a_missing_article() {
+    let posts: Vec<Post> = (1..=10)
+        .map(|n| {
+            post(n, &format!(r#""thing{n}.nfo" yEnc (1/1)"#), 10, vec![format!("Release Name: Thing {n}").into_bytes()])
+        })
+        .collect();
+    let mut missing = Server::new(posts.clone());
+    Arc::get_mut(&mut missing).unwrap().bodies = false;
+    let has = Server::new(posts.clone());
+    let (p1, p2) = (spawn_server(missing.clone()), spawn_server(has.clone()));
+
+    let pool = BlockingPool::new(&[mock(p1, "secret", 2, 1), mock(p2, "secret", 2, 2)]);
+    pool.connect().unwrap();
+
+    let extract: atlas::nntp::Extract = atlas::nfo::display_name;
+    let jobs = posts.iter().map(|p| vec![(p.message_id.clone(), extract)]).collect();
+    assert!(pool.first_names(jobs).iter().all(Option::is_some));
+    assert_eq!(has.bodies_sent.load(Ordering::SeqCst), 10);
+}

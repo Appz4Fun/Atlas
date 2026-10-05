@@ -57,6 +57,9 @@ pub struct Server {
     pub stalled: AtomicUsize,
     /// connections ever accepted
     pub accepted: AtomicUsize,
+    /// BODYs answered with the article, and how long each takes
+    pub bodies_sent: AtomicUsize,
+    pub body_delay: Duration,
 }
 
 impl Server {
@@ -83,6 +86,8 @@ impl Server {
             stalls_left: AtomicUsize::new(0),
             stalled: AtomicUsize::new(0),
             accepted: AtomicUsize::new(0),
+            bodies_sent: AtomicUsize::new(0),
+            body_delay: Duration::ZERO,
         })
     }
 }
@@ -260,6 +265,8 @@ pub fn serve(stream: TcpStream, state: &Server, over_limit: bool) {
             }
             "BODY" => match posts_lock().iter().find(|p| p.message_id == arg).filter(|_| state.bodies) {
                 Some(p) => {
+                    thread::sleep(state.body_delay);
+                    state.bodies_sent.fetch_add(1, Ordering::SeqCst);
                     send(&mut out, format!("222 0 {arg}").as_bytes());
                     for l in &p.body {
                         // dot stuffing
