@@ -16,7 +16,8 @@
 //! ordering by id is still newest first across shards, and an id says which
 //! shard holds it.
 
-use std::collections::HashMap;
+use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Instant;
@@ -144,7 +145,9 @@ pub fn create_shard(path: &Path) -> Result<()> {
             subject_mid TEXT,
             expected INTEGER,
             file_total INTEGER,
-            seen BLOB NOT NULL
+            seen BLOB NOT NULL,
+            blob BLOB,
+            touched_at INTEGER
         );
         create unique index if not exists files_key on files(release_id, filename);
 
@@ -162,7 +165,22 @@ pub fn create_shard(path: &Path) -> Result<()> {
         create table if not exists meta (key TEXT PRIMARY KEY, value INTEGER);
         insert or ignore into meta (key, value) values ('releases', 0), ('articles', 0);
         ",
-    )
+    )?;
+    migrate_shard(&conn)
+}
+
+/// Columns a shard made before sealing lacks: `files.blob` (a sealed file's
+/// articles) and `files.touched_at` (when articles were last added). Adding
+/// a nullable column doesnt rewrite the table.
+pub fn migrate_shard(conn: &Connection) -> Result<()> {
+    let cols: Vec<String> =
+        conn.prepare("pragma table_info(files)")?.query_map([], |r| r.get(1))?.collect::<Result<_>>()?;
+    for (col, kind) in [("blob", "BLOB"), ("touched_at", "INTEGER")] {
+        if !cols.iter().any(|c| c == col) {
+            conn.execute(&format!("alter table files add column {col} {kind}"), [])?;
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------- ids
@@ -441,6 +459,8 @@ pub(crate) struct FileState {
     pub expected: Option<i64>,
     pub file_total: Option<i64>,
     pub seen: Vec<u8>,
+    /// its articles are in `files.blob` (plus any rows that came later)
+    pub sealed: bool,
 }
 
 impl FileState {
@@ -471,7 +491,7 @@ impl FileState {
 pub(crate) fn file(conn: &Connection, release_id: i64, filename: &str) -> Result<FileState> {
     let found = conn
         .prepare_cached(
-            "select id, subject, subject_part, subject_mid, expected, file_total, seen from files
+            "select id, subject, subject_part, subject_mid, expected, file_total, seen, blob is not null from files
              where release_id = ? and filename = ?",
         )?
         .query_row(params![release_id, filename], |r| {
@@ -483,6 +503,7 @@ pub(crate) fn file(conn: &Connection, release_id: i64, filename: &str) -> Result
                 expected: r.get(4)?,
                 file_total: r.get(5)?,
                 seen: r.get(6)?,
+                sealed: r.get(7)?,
             })
         })
         .optional()?;
@@ -496,39 +517,47 @@ pub(crate) fn file(conn: &Connection, release_id: i64, filename: &str) -> Result
 
 pub(crate) fn put_file(conn: &Connection, f: &FileState) -> Result<()> {
     conn.prepare_cached(
-        "update files set subject = ?, subject_part = ?, subject_mid = ?, expected = ?, file_total = ?, seen = ?
-         where id = ?",
+        "update files set subject = ?, subject_part = ?, subject_mid = ?, expected = ?, file_total = ?, seen = ?,
+         touched_at = unixepoch() where id = ?",
     )?
     .execute(params![f.subject, f.subject_part, f.subject_mid, f.expected, f.file_total, f.seen, f.id])?;
     Ok(())
 }
 
-/// Add one article to a file; false when it was already there.
-pub(crate) fn add_segment(conn: &Connection, domains: &mut Domains, file_id: i64, a: &Article) -> Result<bool> {
+/// Add one article to a file; false when it was already there, as a row or
+/// in the file's sealed blob.
+pub(crate) fn add_segment(
+    conn: &Connection,
+    domains: &mut Domains,
+    f: &FileState,
+    a: &Article,
+    sealed: &mut SealedCache,
+) -> Result<bool> {
     let (local, domain) = domains.encode(conn, &a.message_id)?;
+    let stored = |sealed: &mut SealedCache, local: &[u8], domain: i64| -> Result<bool> {
+        let row = conn
+            .prepare_cached("select 1 from segments where file_id = ? and local = ? and domain = ?")?
+            .exists(params![f.id, local, domain])?;
+        Ok(row || (f.sealed && sealed.contains(conn, f.id, local, domain)?))
+    };
+    if f.sealed && sealed.contains(conn, f.id, &local, domain)? {
+        return Ok(false);
+    }
     // an article saved before its domain got a row is stored whole: dont save it twice
-    if domain != 0 {
-        let stored_whole = conn
-            .prepare_cached("select 1 from segments where file_id = ? and local = ? and domain = 0")?
-            .exists(params![file_id, whole(&a.message_id)])?;
-        if stored_whole {
-            return Ok(false);
-        }
+    if domain != 0 && stored(sealed, &whole(&a.message_id), 0)? {
+        return Ok(false);
     }
     // a row from before locals were packed by alphabet has the same local stored as text
     if (DIGITS..=BASE64_URL).contains(&local[0]) {
         let mut legacy = vec![TEXT];
         legacy.extend_from_slice(unpack_local(&local).as_bytes());
-        let stored_legacy = conn
-            .prepare_cached("select 1 from segments where file_id = ? and local = ? and domain = ?")?
-            .exists(params![file_id, legacy, domain])?;
-        if stored_legacy {
+        if stored(sealed, &legacy, domain)? {
             return Ok(false);
         }
     }
     let added = conn
         .prepare_cached("insert or ignore into segments (file_id, local, domain, part, bytes) values (?, ?, ?, ?, ?)")?
-        .execute(params![file_id, local, domain, a.part, a.bytes])?;
+        .execute(params![f.id, local, domain, a.part, a.bytes])?;
     Ok(added > 0)
 }
 
@@ -547,6 +576,117 @@ fn release_complete(conn: &Connection, release_id: i64, file_total: Option<i64>)
         }
     }
     Ok(files > 0 && file_total.is_none_or(|ft| files == ft))
+}
+
+// ---------------------------------------------------------------- sealing
+
+/// files untouched this long get sealed even when incomplete
+pub const SEAL_AGE: i64 = 3 * 86_400;
+
+fn blob_error(e: std::io::Error) -> rusqlite::Error {
+    rusqlite::Error::ToSqlConversionFailure(Box::new(e))
+}
+
+/// a sealed file's blob, decoded; none when the file isnt sealed
+fn sealed_segments(conn: &Connection, file_id: i64) -> Result<Option<Vec<crate::blob::Seg>>> {
+    conn.prepare_cached("select blob from files where id = ? and blob is not null")?
+        .query_row([file_id], |r| r.get::<_, Vec<u8>>(0))
+        .optional()?
+        .map(|b| crate::blob::decode(&b).map_err(blob_error))
+        .transpose()
+}
+
+/// Seal a file: its rows (and any blob it already has) become one blob, the
+/// rows go, all or nothing. Returns the segments in the blob, 0 when there
+/// is none (no rows, or rows that cant be sealed).
+// not called yet: the shard writer and compact seal with it
+#[allow(dead_code)]
+pub(crate) fn seal_file(conn: &Connection, file_id: i64) -> Result<usize> {
+    conn.execute_batch("savepoint seal")?;
+    let sealed = seal_rows(conn, file_id);
+    match sealed {
+        Ok(_) => conn.execute_batch("release seal")?,
+        Err(_) => conn.execute_batch("rollback to seal; release seal")?,
+    }
+    sealed
+}
+
+fn seal_rows(conn: &Connection, file_id: i64) -> Result<usize> {
+    let mut segs = sealed_segments(conn, file_id)?.unwrap_or_default();
+    let rows: Vec<crate::blob::Seg> = conn
+        .prepare_cached("select part, bytes, domain, local from segments where file_id = ?")?
+        .query_map([file_id], |r| {
+            Ok(crate::blob::Seg {
+                part: r.get(0)?,
+                bytes: r.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                domain: r.get(2)?,
+                local: r.get(3)?,
+            })
+        })?
+        .collect::<Result<_>>()?;
+    if rows.is_empty() {
+        return Ok(segs.len());
+    }
+    // the blob has no room for a negative part number: such a file stays rows
+    if rows.iter().any(|r| r.part.is_some_and(|p| p < 0)) {
+        return Ok(0);
+    }
+    segs.extend(rows);
+    conn.prepare_cached("update files set blob = ? where id = ?")?
+        .execute(params![crate::blob::encode(&segs), file_id])?;
+    conn.prepare_cached("delete from segments where file_id = ?")?.execute([file_id])?;
+    Ok(segs.len())
+}
+
+/// Files after `after_id` with rows to seal: complete, or untouched for
+/// `SEAL_AGE` (never touched since the upgrade counts as old). Returns the
+/// ids and the last id looked at.
+// not called yet: the shard writer and compact seal with it
+#[allow(dead_code)]
+pub(crate) fn sealable(conn: &Connection, after_id: i64, limit: usize, now: i64) -> Result<(Vec<i64>, i64)> {
+    let mut stmt = conn.prepare_cached(
+        "select f.id, f.expected, f.seen, f.touched_at from files f
+         where f.id > ? and exists (select 1 from segments s where s.file_id = f.id)
+         order by f.id limit ?",
+    )?;
+    let mut ids = Vec::new();
+    let mut last = after_id;
+    let mut rows = stmt.query(params![after_id, limit as i64])?;
+    while let Some(r) = rows.next()? {
+        let id: i64 = r.get(0)?;
+        let expected: Option<i64> = r.get(1)?;
+        let seen: Vec<u8> = r.get(2)?;
+        let touched: Option<i64> = r.get(3)?;
+        last = id;
+        let complete = expected.is_some_and(|e| is_exactly(&seen, e));
+        if complete || touched.is_none_or(|t| t < now - SEAL_AGE) {
+            ids.push(id);
+        }
+    }
+    Ok((ids, last))
+}
+
+/// Blobs of sealed files, decoded once each, for checking late articles.
+#[derive(Default)]
+pub(crate) struct SealedCache {
+    files: HashMap<i64, HashSet<(Vec<u8>, i64)>>,
+}
+
+impl SealedCache {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// the article (local, domain) is already in file `file_id`'s blob
+    pub(crate) fn contains(&mut self, conn: &Connection, file_id: i64, local: &[u8], domain: i64) -> Result<bool> {
+        let set = match self.files.entry(file_id) {
+            Entry::Occupied(e) => e.into_mut(),
+            Entry::Vacant(e) => e.insert(
+                sealed_segments(conn, file_id)?.unwrap_or_default().into_iter().map(|s| (s.local, s.domain)).collect(),
+            ),
+        };
+        Ok(set.contains(&(local.to_vec(), domain)))
+    }
 }
 
 // ---------------------------------------------------------------- saving
@@ -573,6 +713,8 @@ impl ShardWriter {
     ) -> Result<()> {
         let shard = self.shard;
         let domains = &mut self.domains;
+        // blobs of sealed files that get late articles, decoded once each
+        let mut sealed = SealedCache::new();
         let tx = conn.transaction()?;
         let (mut new_releases, mut new_articles) = (0i64, 0i64);
         {
@@ -632,7 +774,7 @@ impl ShardWriter {
                     let mut f = file(&tx, release_id, name)?;
                     let before = added.len();
                     for a in articles {
-                        if add_segment(&tx, domains, f.id, a)? {
+                        if add_segment(&tx, domains, &f, a, &mut sealed)? {
                             f.add(a);
                             added.push(a);
                         }
@@ -722,8 +864,56 @@ pub fn articles(conn: &Connection, release_id: i64) -> Result<Vec<ArticleRow>> {
         })
     })?;
     let mut rows: Vec<ArticleRow> = rows.collect::<Result<_>>()?;
+
+    // sealed files: their blobs, next to any rows that came after sealing
+    let mut sealed = conn.prepare(&format!(
+        "select f.blob, f.filename, f.expected, f.subject, r.poster, r.posted_date
+         from s{s}.files f join s{s}.releases r on r.id = f.release_id
+         where f.release_id = ? and f.blob is not null"
+    ))?;
+    let mut suffixes: HashMap<i64, Option<String>> = HashMap::new();
+    let mut blob_rows = sealed.query([release_id])?;
+    while let Some(r) = blob_rows.next()? {
+        let blob: Vec<u8> = r.get(0)?;
+        let filename: String = r.get(1)?;
+        for seg in crate::blob::decode(&blob).map_err(blob_error)? {
+            let suffix = match suffixes.entry(seg.domain) {
+                Entry::Occupied(e) => e.into_mut(),
+                Entry::Vacant(e) => e.insert(
+                    conn.query_row(&format!("select suffix from s{s}.domains where id = ?"), [seg.domain], |r| {
+                        r.get(0)
+                    })
+                    .optional()?,
+                ),
+            };
+            rows.push(ArticleRow {
+                message_id: decode(&seg.local, suffix.as_deref()),
+                filename: (!filename.is_empty()).then(|| filename.clone()),
+                part: seg.part,
+                total_parts: r.get(2)?,
+                bytes: Some(seg.bytes),
+                subject: r.get(3)?,
+                poster: r.get(4)?,
+                posted_date: r.get(5)?,
+            });
+        }
+    }
     rows.sort_by(|a, b| (&a.filename, a.part, &a.message_id).cmp(&(&b.filename, b.part, &b.message_id)));
     Ok(rows)
+}
+
+/// articles in shard `schema` (`s3`, or `main` for a shard opened on its
+/// own): loose rows plus every sealed blob's segments
+pub fn article_count(conn: &Connection, schema: &str) -> Result<i64> {
+    let loose: i64 = conn.query_row(&format!("select count(*) from {schema}.segments"), [], |r| r.get(0))?;
+    let mut sealed = 0i64;
+    let mut stmt = conn.prepare(&format!("select blob from {schema}.files where blob is not null"))?;
+    let mut rows = stmt.query([])?;
+    while let Some(r) = rows.next()? {
+        let b: Vec<u8> = r.get(0)?;
+        sealed += crate::blob::decode(&b).map_err(blob_error)?.len() as i64;
+    }
+    Ok(loose + sealed)
 }
 
 /// (releases, articles) over every shard, from the running totals. `conn` has
@@ -751,7 +941,7 @@ pub fn purge_incomplete(main: &Path) -> Result<()> {
              delete from releases where complete = 0;
              commit;",
         )?;
-        let articles: i64 = conn.query_row("select count(*) from segments", [], |r| r.get(0))?;
+        let articles = article_count(&conn, "main")?;
         conn.execute("update meta set value = max(value - ?, 0) where key = 'releases'", [removed])?;
         conn.execute("update meta set value = ? where key = 'articles'", [articles])?;
         let _ = conn.query_row("pragma wal_checkpoint(truncate)", [], |_| Ok(()));
@@ -865,12 +1055,18 @@ mod tests {
         let file = file(&conn, 8, "a.rar").unwrap();
         let article = Article { message_id: format!("<{:032x}@nyuu>", 7), part: Some(1), ..Default::default() };
         let mut fresh = Domains::default();
-        assert!(add_segment(&conn, &mut fresh, file.id, &article).unwrap(), "first time: stored whole");
+        assert!(
+            add_segment(&conn, &mut fresh, &file, &article, &mut SealedCache::new()).unwrap(),
+            "first time: stored whole"
+        );
         for n in 0..SHARED_AFTER {
             fresh.encode(&conn, &format!("<{n:032x}@nyuu>")).unwrap();
         }
         assert!(conn.prepare("select 1 from domains where suffix = '@nyuu>'").unwrap().exists([]).unwrap());
-        assert!(!add_segment(&conn, &mut fresh, file.id, &article).unwrap(), "same article again: not saved twice");
+        assert!(
+            !add_segment(&conn, &mut fresh, &file, &article, &mut SealedCache::new()).unwrap(),
+            "same article again: not saved twice"
+        );
         let segments: i64 = conn.query_row("select count(*) from segments", [], |r| r.get(0)).unwrap();
         assert_eq!(segments, 1);
 
@@ -896,7 +1092,10 @@ mod tests {
             params![file.id, stored, domain],
         )
         .unwrap();
-        assert!(!add_segment(&conn, &mut Domains::default(), file.id, &legacy).unwrap(), "legacy text row found");
+        assert!(
+            !add_segment(&conn, &mut Domains::default(), &file, &legacy, &mut SealedCache::new()).unwrap(),
+            "legacy text row found"
+        );
         let segments: i64 = conn.query_row("select count(*) from segments", [], |r| r.get(0)).unwrap();
         assert_eq!(segments, 2);
     }
@@ -928,5 +1127,224 @@ mod tests {
         let mut huge = Vec::new();
         insert_part(&mut huge, 5_000_000_000);
         assert!(huge.is_empty());
+    }
+
+    /// a shard with one release: file a.rar (3 parts) and b.rar (2 parts)
+    fn sealed_fixture() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        db::create_db_at(&main).unwrap();
+        let art = |file: &str, part: i64, total: i64, id: &str| Article {
+            message_id: id.into(),
+            subject: format!("\"{file}\" yEnc ({part}/{total})"),
+            filename: Some(file.into()),
+            part: Some(part),
+            total_parts: Some(total),
+            bytes: 100 + part,
+            ..Default::default()
+        };
+        let release = Release {
+            name: "Rel".into(),
+            group: "alt.binaries.t".into(),
+            articles: vec![
+                art("a.rar", 1, 3, "<a1@x>"),
+                art("a.rar", 2, 3, "<0abc12def34@ngPost>"),
+                art("a.rar", 3, 3, "<a3@x>"),
+                art("b.rar", 1, 2, "<b1@x>"),
+            ],
+            ..Default::default()
+        };
+        save(&main, &[release]).unwrap();
+        (dir, main)
+    }
+
+    #[test]
+    fn sealing_keeps_every_nzb_and_late_articles_merge() {
+        let (_dir, main) = sealed_fixture();
+        let shard = shard_path(&main, shard_of("alt.binaries.t"));
+        let read = || {
+            let conn = db::open_with_shards(&main).unwrap();
+            let id: i64 = conn.query_row("select id from releases", [], |r| r.get(0)).unwrap();
+            articles(&conn, id).unwrap()
+        };
+        let before = read();
+
+        let conn = db::open_at(&shard).unwrap();
+        let ids: Vec<i64> = conn
+            .prepare("select id from files")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        for id in &ids {
+            seal_file(&conn, *id).unwrap();
+        }
+        let loose: i64 = conn.query_row("select count(*) from segments", [], |r| r.get(0)).unwrap();
+        assert_eq!(loose, 0, "sealed files have no rows left");
+        assert_eq!(read(), before, "same articles back from the blobs");
+        assert_eq!(
+            article_count(&db::open_with_shards(&main).unwrap(), &format!("s{}", shard_of("alt.binaries.t"))).unwrap(),
+            4
+        );
+
+        // a late article for a sealed file is saved once, one already sealed isnt
+        let late = Release {
+            name: "Rel".into(),
+            group: "alt.binaries.t".into(),
+            articles: vec![
+                Article {
+                    message_id: "<b2@x>".into(),
+                    filename: Some("b.rar".into()),
+                    part: Some(2),
+                    total_parts: Some(2),
+                    bytes: 102,
+                    ..Default::default()
+                },
+                Article {
+                    message_id: "<a1@x>".into(),
+                    filename: Some("a.rar".into()),
+                    part: Some(1),
+                    total_parts: Some(3),
+                    bytes: 101,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        save(&main, &[late]).unwrap();
+        let after = read();
+        assert_eq!(after.len(), 5);
+        assert_eq!(after.iter().filter(|a| a.message_id == "<a1@x>").count(), 1);
+
+        // resealing folds the late row in
+        let b: i64 = conn.query_row("select id from files where filename = 'b.rar'", [], |r| r.get(0)).unwrap();
+        assert_eq!(seal_file(&conn, b).unwrap(), 2);
+        assert_eq!(read(), after);
+    }
+
+    #[test]
+    fn sealed_nzb_is_byte_for_byte_the_same() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        db::create_db_at(&main).unwrap();
+        let art = |file: &str, part: Option<i64>, id: &str, bytes: i64| Article {
+            message_id: id.into(),
+            subject: format!("\"{file}\" yEnc"),
+            filename: Some(file.into()),
+            part,
+            total_parts: Some(2),
+            bytes,
+            ..Default::default()
+        };
+        let release = Release {
+            name: "Nzb".into(),
+            group: "alt.binaries.t".into(),
+            poster: "me <me@x>".into(),
+            date: "2026-10-01 12:00:00".into(),
+            articles: vec![
+                art("a.rar", Some(2), "<00ff00ff@ngPost>", 700_000),
+                art("a.rar", Some(1), "<made-up@one-off.domain>", 750_000), // stored whole
+                art("a.rar", None, "<no-part@x>", 5),
+                art("a.rar", Some(1), "<ABCD1234@ngPost>", 750_000), // a repost of part 1
+                art("", Some(1), "<00aa@ngPost>", 9),                // no filename
+            ],
+            ..Default::default()
+        };
+        save(&main, &[release]).unwrap();
+        let nzb = || {
+            let conn = db::open_with_shards(&main).unwrap();
+            let id: i64 = conn.query_row("select id from releases", [], |r| r.get(0)).unwrap();
+            let r = crate::search::get_release_with(&conn, id).unwrap().unwrap();
+            crate::nzb::render_nzb(&r, &articles(&conn, id).unwrap())
+        };
+        let before = nzb();
+        let conn = db::open_at(&shard_path(&main, shard_of("alt.binaries.t"))).unwrap();
+        let ids: Vec<i64> = conn
+            .prepare("select id from files")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        for id in ids {
+            assert!(seal_file(&conn, id).unwrap() > 0);
+        }
+        assert_eq!(nzb(), before);
+    }
+
+    #[test]
+    fn a_legacy_text_local_in_a_blob_is_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("atlas.s0.db");
+        create_shard(&path).unwrap();
+        let conn = db::open_at(&path).unwrap();
+        let mut domains = Domains::default();
+        let mut domain = 0;
+        for n in 0..SHARED_AFTER {
+            domain = domains.encode(&conn, &format!("<{n:032x}@JBinUp.local>")).unwrap().1;
+        }
+        assert!(domain > 0);
+        let f = file(&conn, 8, "a.rar").unwrap();
+        let mut stored = vec![TEXT];
+        stored.extend_from_slice(b"hotfTpetaZRIbOYuTuQ31");
+        conn.execute(
+            "insert into segments (file_id, local, domain, part, bytes) values (?, ?, ?, 1, 0)",
+            params![f.id, stored, domain],
+        )
+        .unwrap();
+        assert_eq!(seal_file(&conn, f.id).unwrap(), 1);
+        let f = file(&conn, 8, "a.rar").unwrap();
+        assert!(f.sealed);
+        let article =
+            Article { message_id: "<hotfTpetaZRIbOYuTuQ31@JBinUp.local>".into(), part: Some(1), ..Default::default() };
+        assert!(!add_segment(&conn, &mut domains, &f, &article, &mut SealedCache::new()).unwrap());
+        let other = Article { message_id: "<other1@JBinUp.local>".into(), part: Some(2), ..Default::default() };
+        assert!(add_segment(&conn, &mut domains, &f, &other, &mut SealedCache::new()).unwrap(), "a new one is a row");
+        let loose: i64 = conn.query_row("select count(*) from segments", [], |r| r.get(0)).unwrap();
+        assert_eq!(loose, 1);
+    }
+
+    #[test]
+    fn old_shards_get_the_seal_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("atlas.s0.db");
+        {
+            let conn = db::open_at(&path).unwrap();
+            conn.execute_batch(
+                "create table files (id INTEGER PRIMARY KEY, release_id INTEGER NOT NULL, filename TEXT NOT NULL,
+                    subject TEXT, subject_part INTEGER, subject_mid TEXT, expected INTEGER, file_total INTEGER,
+                    seen BLOB NOT NULL);
+                 insert into files (release_id, filename, seen) values (8, 'a.rar', x'02');",
+            )
+            .unwrap();
+        }
+        create_shard(&path).unwrap();
+        create_shard(&path).unwrap(); // again: nothing to add
+        let conn = db::open_at(&path).unwrap();
+        let f = file(&conn, 8, "a.rar").unwrap();
+        assert!(!f.sealed);
+        assert_eq!(f.seen, vec![2]);
+        let touched: Option<i64> = conn.query_row("select touched_at from files", [], |r| r.get(0)).unwrap();
+        assert_eq!(touched, None, "untouched since the upgrade");
+        put_file(&conn, &f).unwrap();
+        let touched: Option<i64> = conn.query_row("select touched_at from files", [], |r| r.get(0)).unwrap();
+        assert!(touched.is_some());
+    }
+
+    #[test]
+    fn complete_or_stale_files_are_sealable() {
+        let (_dir, main) = sealed_fixture();
+        let conn = db::open_at(&shard_path(&main, shard_of("alt.binaries.t"))).unwrap();
+        // the clock put_file stamped touched_at with
+        let now: i64 = conn.query_row("select unixepoch()", [], |r| r.get(0)).unwrap();
+        // a.rar is complete (1..=3), b.rar has 1 of 2 and was just touched
+        let (ids, _) = sealable(&conn, 0, 100, now).unwrap();
+        let name = |id: i64| -> String {
+            conn.query_row("select filename from files where id = ?", [id], |r| r.get(0)).unwrap()
+        };
+        assert_eq!(ids.iter().map(|&i| name(i)).collect::<Vec<_>>(), vec!["a.rar".to_string()]);
+        conn.execute("update files set touched_at = ? where filename = 'b.rar'", [now - SEAL_AGE - 1]).unwrap();
+        assert_eq!(sealable(&conn, 0, 100, now).unwrap().0.len(), 2, "b.rar went stale");
     }
 }
