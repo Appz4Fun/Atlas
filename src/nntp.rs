@@ -1155,6 +1155,50 @@ impl Pool {
         Err(first_err)
     }
 
+    /// The first article at or after `number` within the next `look` numbers on
+    /// server `i`, with its post time: (number, unix seconds). None when there is
+    /// none (a gap in the numbering).
+    async fn posted_at(&self, i: usize, group: &str, number: u64, look: u64) -> Result<Option<(u64, i64)>> {
+        match self.xover_on(i, group, number, number + look - 1).await {
+            Ok(rows) => Ok(rows
+                .iter()
+                .filter_map(|r| crate::dates::posted_timestamp(&r.date).map(|t| (r.number, t)))
+                .min_by_key(|(n, _)| *n)),
+            Err(e) if e.code() == Some(423) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The first article number in `low..=high` on server `i` posted at or after
+    /// `when` (unix seconds), `high + 1` when there is none. A binary search over
+    /// small article requests (about 35 for a billion numbers, plus one to settle). Post dates are
+    /// only roughly in order, so the answer is approximate near the edges:
+    /// callers overlap their ranges.
+    pub async fn article_at(&self, i: usize, group: &str, low: u64, high: u64, when: i64) -> Result<u64> {
+        const LOOK: u64 = 100;
+        let (mut lo, mut hi) = (low, high + 1);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            match self.posted_at(i, group, mid, LOOK).await? {
+                Some((n, t)) if t < when => lo = n + 1,
+                Some(_) => hi = mid,
+                // a gap: nothing to compare, keep searching to the left of it
+                None => hi = mid,
+            }
+        }
+        if lo > high {
+            return Ok(lo);
+        }
+        // lo may be a number missing from the group: settle on the article that exists
+        let look = LOOK.min(high + 1 - lo);
+        Ok(match self.posted_at(i, group, lo, look).await? {
+            Some((n, _)) => n,
+            // nothing up to the end of the range
+            None if look == high + 1 - lo => high + 1,
+            None => lo,
+        })
+    }
+
     async fn xover_on(&self, i: usize, group: &str, start: u64, end: u64) -> Result<Vec<Overview>> {
         match self.xover_once(i, group, start, end).await {
             Err(NntpError::Decompress(e)) => {

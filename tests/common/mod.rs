@@ -20,6 +20,8 @@ pub struct Post {
     pub message_id: String,
     pub bytes: u64,
     pub body: Vec<Vec<u8>>,
+    /// the Date header, rfc 2822
+    pub date: String,
 }
 
 pub struct Server {
@@ -131,7 +133,19 @@ pub fn par2_file_desc(name: &str, size: u64) -> Vec<u8> {
 }
 
 pub fn post(number: u64, subject: &str, bytes: u64, body: Vec<Vec<u8>>) -> Post {
-    Post { number, subject: subject.into(), message_id: format!("<msg{number}@mock>"), bytes, body }
+    Post {
+        number,
+        subject: subject.into(),
+        message_id: format!("<msg{number}@mock>"),
+        bytes,
+        body,
+        date: "Fri, 02 Oct 2026 10:11:12 +0000".into(),
+    }
+}
+
+/// A post with its own date (rfc 2822), for date based tests.
+pub fn post_at(number: u64, subject: &str, date: &str) -> Post {
+    Post { date: date.into(), ..post(number, subject, 10, vec![]) }
 }
 
 pub fn handle(stream: TcpStream, state: Arc<Server>) {
@@ -218,8 +232,8 @@ pub fn serve(stream: TcpStream, state: &Server, over_limit: bool) {
                 let mut listing = Vec::new();
                 for p in hits {
                     let row = format!(
-                        "{}\t{}\tposter <p@mock>\tFri, 02 Oct 2026 10:11:12 +0000\t{}\t\t{}\t10\r\n",
-                        p.number, p.subject, p.message_id, p.bytes
+                        "{}\t{}\tposter <p@mock>\t{}\t{}\t\t{}\t10\r\n",
+                        p.number, p.subject, p.date, p.message_id, p.bytes
                     );
                     listing.extend_from_slice(row.as_bytes());
                 }
