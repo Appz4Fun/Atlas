@@ -50,10 +50,21 @@ pub fn is_split(conn: &Connection, group: &str) -> Result<bool> {
     conn.prepare_cached("select 1 from backfill_chunks where grp = ? limit 1")?.exists([group])
 }
 
+/// A claimed chunk. Its server and claim time tell this claim from a later
+/// one of the same chunk: a chunk that ran past CLAIM_TIMEOUT and was taken
+/// over is the new owner's, finishing or giving back the old claim does nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Claim {
+    pub group: String,
+    pub day: i64,
+    pub server: String,
+    pub claimed_at: i64,
+}
+
 /// Atomically claim the newest chunk that is pending or whose claim went
 /// stale, of `groups`: (group, oldest day the server keeps), `i64::MIN` when
 /// any day will do.
-pub fn claim(conn: &Connection, groups: &[(String, i64)], host: &str, now: i64) -> Result<Option<(String, i64)>> {
+pub fn claim(conn: &Connection, groups: &[(String, i64)], host: &str, now: i64) -> Result<Option<Claim>> {
     if groups.is_empty() {
         return Ok(None);
     }
@@ -76,22 +87,31 @@ pub fn claim(conn: &Connection, groups: &[(String, i64)], host: &str, now: i64) 
     values.push((now - CLAIM_TIMEOUT).into());
     let found: Option<(String, i64)> =
         conn.prepare(&sql)?.query_row(rusqlite::params_from_iter(values), |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
-    Ok(found)
+    Ok(found.map(|(group, day)| Claim { group, day, server: host.to_string(), claimed_at: now }))
 }
 
-/// Mark a chunk as done.
-pub fn finish(conn: &Connection, group: &str, day: i64) -> Result<()> {
-    conn.execute("update backfill_chunks set state = ? where grp = ? and day = ?", params![DONE, group, day])?;
-    Ok(())
-}
-
-/// Return a claimed chunk to pending state.
-pub fn release(conn: &Connection, group: &str, day: i64) -> Result<()> {
-    conn.execute(
-        "update backfill_chunks set state = ?, server = null, claimed_at = null where grp = ? and day = ?",
-        params![PENDING, group, day],
+/// Mark a claimed chunk as done. False when the claim was taken over.
+pub fn finish(conn: &Connection, claim: &Claim) -> Result<bool> {
+    let n = conn.execute(
+        &format!(
+            "update backfill_chunks set state = ?
+             where grp = ? and day = ? and state = {CLAIMED} and server = ? and claimed_at = ?"
+        ),
+        params![DONE, claim.group, claim.day, claim.server, claim.claimed_at],
     )?;
-    Ok(())
+    Ok(n > 0)
+}
+
+/// Return a claimed chunk to pending state. False when the claim was taken over.
+pub fn release(conn: &Connection, claim: &Claim) -> Result<bool> {
+    let n = conn.execute(
+        &format!(
+            "update backfill_chunks set state = ?, server = null, claimed_at = null
+             where grp = ? and day = ? and state = {CLAIMED} and server = ? and claimed_at = ?"
+        ),
+        params![PENDING, claim.group, claim.day, claim.server, claim.claimed_at],
+    )?;
+    Ok(n > 0)
 }
 
 /// (done, total) chunks of a group
@@ -123,6 +143,11 @@ mod tests {
         c
     }
 
+    /// the day of a claim
+    fn day(claimed: Result<Option<Claim>>) -> Option<i64> {
+        claimed.unwrap().map(|c| c.day)
+    }
+
     #[test]
     fn days_are_claimed_newest_first_and_once() {
         let c = conn();
@@ -131,12 +156,14 @@ mod tests {
         assert!(is_split(&c, "g").unwrap());
         let groups = vec![("g".to_string(), i64::MIN)];
 
-        assert_eq!(claim(&c, &groups, "a", 1000).unwrap(), Some(("g".into(), 20_000)));
-        assert_eq!(claim(&c, &groups, "b", 1000).unwrap(), Some(("g".into(), 19_999)));
-        finish(&c, "g", 20_000).unwrap();
-        release(&c, "g", 19_999).unwrap();
-        assert_eq!(claim(&c, &groups, "b", 1000).unwrap(), Some(("g".into(), 19_999)), "released goes back");
-        assert_eq!(claim(&c, &groups, "a", 1000).unwrap(), Some(("g".into(), 19_998)));
+        let a = claim(&c, &groups, "a", 1000).unwrap().unwrap();
+        assert_eq!(a, Claim { group: "g".into(), day: 20_000, server: "a".into(), claimed_at: 1000 });
+        let b = claim(&c, &groups, "b", 1000).unwrap().unwrap();
+        assert_eq!(b.day, 19_999);
+        assert!(finish(&c, &a).unwrap());
+        assert!(release(&c, &b).unwrap());
+        assert_eq!(day(claim(&c, &groups, "b", 1000)), Some(19_999), "released goes back");
+        assert_eq!(day(claim(&c, &groups, "a", 1000)), Some(19_998));
         assert_eq!(claim(&c, &groups, "a", 1000).unwrap(), None);
         assert_eq!(progress(&c, "g").unwrap(), (1, 3));
     }
@@ -148,7 +175,29 @@ mod tests {
         let groups = vec![("g".to_string(), i64::MIN)];
         assert!(claim(&c, &groups, "a", 1000).unwrap().is_some());
         assert_eq!(claim(&c, &groups, "b", 1000 + CLAIM_TIMEOUT - 1).unwrap(), None);
-        assert_eq!(claim(&c, &groups, "b", 1000 + CLAIM_TIMEOUT + 1).unwrap(), Some(("g".into(), 5)));
+        assert_eq!(day(claim(&c, &groups, "b", 1000 + CLAIM_TIMEOUT + 1)), Some(5));
+    }
+
+    #[test]
+    fn a_claim_taken_over_cant_be_finished_or_given_back() {
+        let c = conn();
+        add(&c, "g", 5, 5).unwrap();
+        let groups = vec![("g".to_string(), i64::MIN)];
+        // a's chunk runs past CLAIM_TIMEOUT, b takes it over and finishes it
+        let a = claim(&c, &groups, "a", 1000).unwrap().unwrap();
+        let b = claim(&c, &groups, "b", 1000 + CLAIM_TIMEOUT + 1).unwrap().unwrap();
+        assert!(finish(&c, &b).unwrap());
+
+        // a's late release and finish change nothing: done, and b's
+        assert!(!release(&c, &a).unwrap());
+        assert!(!finish(&c, &a).unwrap());
+        let row = |c: &Connection| {
+            c.query_row("select state, server from backfill_chunks where grp = 'g' and day = 5", [], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?))
+            })
+            .unwrap()
+        };
+        assert_eq!(row(&c), (DONE, Some("b".to_string())));
     }
 
     #[test]
@@ -166,10 +215,10 @@ mod tests {
         let c = conn();
         add(&c, "g", 12, 10).unwrap();
         let from_11 = [("g".to_string(), 11)];
-        assert_eq!(claim(&c, &from_11, "short", 0).unwrap(), Some(("g".into(), 12)));
-        assert_eq!(claim(&c, &from_11, "short", 0).unwrap(), Some(("g".into(), 11)));
-        assert_eq!(claim(&c, &from_11, "short", 0).unwrap(), None, "day 10 is older than it keeps");
-        assert_eq!(claim(&c, &[("g".to_string(), i64::MIN)], "long", 0).unwrap(), Some(("g".into(), 10)));
+        assert_eq!(day(claim(&c, &from_11, "short", 0)), Some(12));
+        assert_eq!(day(claim(&c, &from_11, "short", 0)), Some(11));
+        assert_eq!(day(claim(&c, &from_11, "short", 0)), None, "day 10 is older than it keeps");
+        assert_eq!(day(claim(&c, &[("g".to_string(), i64::MIN)], "long", 0)), Some(10));
     }
 
     #[test]
@@ -193,9 +242,9 @@ mod tests {
 
         // they should get different days (newest first, then next)
         assert!(a_claim.is_some() && b_claim.is_some());
-        assert_ne!(a_claim.as_ref().map(|(_, d)| d), b_claim.as_ref().map(|(_, d)| d));
-        assert_eq!(a_claim.as_ref().map(|(_, d)| d), Some(&20));
-        assert_eq!(b_claim.as_ref().map(|(_, d)| d), Some(&19));
+        assert_ne!(a_claim.as_ref().map(|c| c.day), b_claim.as_ref().map(|c| c.day));
+        assert_eq!(a_claim.as_ref().map(|c| c.day), Some(20));
+        assert_eq!(b_claim.as_ref().map(|c| c.day), Some(19));
 
         // third claim should get None
         let c_c = Connection::open(&db_path).unwrap();

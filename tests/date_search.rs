@@ -6,6 +6,20 @@ mod common;
 use atlas::nntp::BlockingPool;
 use common::{GROUP, Server, mock, post_at, spawn_server};
 
+/// `day` of `group` claimed by the mock's server, the way a worker claims it
+/// (only the claim's owner finishes or gives back a chunk)
+fn claimed(main: &std::path::Path, group: &str, day: i64) -> atlas::chunks::Claim {
+    let chunk = atlas::chunks::Claim { group: group.into(), day, server: "127.0.0.1".into(), claimed_at: 1 };
+    atlas::db::open_at(main)
+        .unwrap()
+        .execute(
+            "update backfill_chunks set state = 1, server = ?, claimed_at = ? where grp = ? and day = ?",
+            rusqlite::params![chunk.server, chunk.claimed_at, group, day],
+        )
+        .unwrap();
+    chunk
+}
+
 /// posts 1..=1000, one per hour from 2026-01-01 00:00 UTC, with every 10th
 /// number missing and number 500 dated an hour too early
 fn hourly() -> Vec<common::Post> {
@@ -59,8 +73,9 @@ fn a_day_chunk_indexes_that_day() {
         verbose: false,
     };
     let db = atlas::indexer::shared_db(main_conn);
+    let chunk = claimed(&main, GROUP, day);
     let saved =
-        pool.block_on(atlas::indexer::run_chunk(&ctx, &Default::default(), &db, GROUP, 0, day, &mut |_| {})).unwrap();
+        pool.block_on(atlas::indexer::run_chunk(&ctx, &Default::default(), &db, &chunk, 0, &mut |_| {})).unwrap();
 
     // hours 24..47 are articles 25..48, plus an hour of overlap each side
     // (24 and 49); 30 and 40 don't exist. 24..=49 minus 2 = 24 articles
@@ -192,8 +207,9 @@ fn a_day_chunk_right_after_a_hole_of_millions_gets_every_article() {
         verbose: false,
     };
     let db = atlas::indexer::shared_db(main_conn);
+    let chunk = claimed(&main, GROUP, day);
     let saved =
-        pool.block_on(atlas::indexer::run_chunk(&ctx, &Default::default(), &db, GROUP, 0, day, &mut |_| {})).unwrap();
+        pool.block_on(atlas::indexer::run_chunk(&ctx, &Default::default(), &db, &chunk, 0, &mut |_| {})).unwrap();
 
     // the day's 1,440 posts and the hour after it; the hour before is the hole
     assert_eq!(saved.articles, 1_440 + 60);
@@ -236,8 +252,9 @@ fn a_day_chunk_skips_a_gap_inside_the_day() {
         verbose: false,
     };
     let db = atlas::indexer::shared_db(main_conn);
+    let chunk = claimed(&main, GROUP, day);
     let saved =
-        pool.block_on(atlas::indexer::run_chunk(&ctx, &Default::default(), &db, GROUP, 0, day, &mut |_| {})).unwrap();
+        pool.block_on(atlas::indexer::run_chunk(&ctx, &Default::default(), &db, &chunk, 0, &mut |_| {})).unwrap();
 
     // day 2 is 720 numbers minus the 150 missing, plus the hour before it
     // (691..=720, 30 posts); nothing comes after 1440
@@ -273,9 +290,13 @@ fn a_failing_chunk_reports_its_own_error() {
             &ctx,
             &Default::default(),
             &db,
-            "alt.binaries.other",
+            &atlas::chunks::Claim {
+                group: "alt.binaries.other".into(),
+                day: 20_455,
+                server: "127.0.0.1".into(),
+                claimed_at: 1,
+            },
             0,
-            20_455,
             &mut |_| {},
         ))
         .unwrap_err();
@@ -315,8 +336,10 @@ fn a_day_older_than_the_server_keeps_is_given_back() {
         verbose: false,
     };
     let db = atlas::indexer::shared_db(main_conn);
-    let run =
-        |day: i64| pool.block_on(atlas::indexer::run_chunk(&ctx, &Default::default(), &db, GROUP, 0, day, &mut |_| {}));
+    let run = |day: i64| {
+        let chunk = claimed(&main, GROUP, day);
+        pool.block_on(atlas::indexer::run_chunk(&ctx, &Default::default(), &db, &chunk, 0, &mut |_| {}))
+    };
 
     let err = run(first_day - 1).unwrap_err();
     let too_old = err.downcast_ref::<atlas::indexer::TooOld>().expect("a TooOld");
@@ -424,9 +447,9 @@ fn chunks_save_every_post_of(list: &[Slot], days: &[i64]) {
             verbose: false,
         };
         let db = atlas::indexer::shared_db(main_conn);
-        let saved = pool
-            .block_on(atlas::indexer::run_chunk(&ctx, &Default::default(), &db, GROUP, 0, day, &mut |_| {}))
-            .unwrap();
+        let chunk = claimed(&main, GROUP, day);
+        let saved =
+            pool.block_on(atlas::indexer::run_chunk(&ctx, &Default::default(), &db, &chunk, 0, &mut |_| {})).unwrap();
         let (from, to) = (day * 86_400 - 3600, (day + 1) * 86_400 + 3600);
         let want = list.iter().filter(|&&(_, t)| t >= from && t < to).count() as i64;
         assert_eq!(saved.articles, want, "day {day}");

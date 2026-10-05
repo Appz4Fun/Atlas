@@ -382,7 +382,7 @@ where
                 .await?;
         let r = match claimed {
             // a day this server doesnt keep is left to the others, it isnt an error
-            Some((_, day)) => match run_chunk(ctx, settings, db, group, server, day, progress).await {
+            Some(chunk) => match run_chunk(ctx, settings, db, &chunk, server, progress).await {
                 Err(e) if e.downcast_ref::<TooOld>().is_some() => Ok(Progress::default()),
                 r => r,
             },
@@ -546,7 +546,7 @@ pub async fn claim_chunk(
     host: String,
     groups: std::collections::HashSet<String>,
     oldest: HashMap<String, i64>,
-) -> Result<Option<(String, i64)>> {
+) -> Result<Option<crate::chunks::Claim>> {
     on_db(db, move |conn| {
         let split: Vec<(String, i64)> = crate::chunks::split_groups(conn)?
             .into_iter()
@@ -565,24 +565,33 @@ pub async fn claim_chunk(
 /// roughly in article number order, duplicates are dropped when saved
 pub const CHUNK_OVERLAP: i64 = 3600;
 
-/// Index one day (`day`, unix days) of `group` on `server`, for a group whose
-/// backfill is split into day chunks (see chunks.rs). The chunk is marked done
-/// when the whole day is in, released again if stopped part way or failing.
+/// Index the day chunk `chunk` claimed (its day in unix days) on `server`,
+/// for a group whose backfill is split into day chunks (see chunks.rs). The
+/// chunk is marked done when the whole day is in, released again if stopped
+/// part way or failing. Either is skipped once another worker took the chunk
+/// over (this one ran past CLAIM_TIMEOUT): the chunk is that worker's.
 pub async fn run_chunk<P>(
     ctx: &PassContext,
     settings: &PassSettings,
     db: &Db,
-    group: &str,
+    chunk: &crate::chunks::Claim,
     server: usize,
-    day: i64,
     progress: &mut P,
 ) -> Result<Progress>
 where
     P: FnMut(&Progress) + ?Sized,
 {
+    let (group, day) = (chunk.group.as_str(), chunk.day);
     let release = || {
-        let g = group.to_string();
-        on_db(db, move |conn| Ok(crate::chunks::release(conn, &g, day)?))
+        let c = chunk.clone();
+        on_db(db, move |conn| Ok(crate::chunks::release(conn, &c)?))
+    };
+    let finish = async || {
+        let c = chunk.clone();
+        if !on_db(db, move |conn| Ok(crate::chunks::finish(conn, &c)?)).await? {
+            println!("[CHUNK] {group} day {day}: taken over by another worker, leaving it to that one");
+        }
+        anyhow::Ok(())
     };
     // give the chunk back after `e`, and return `e`: failing to give it back
     // is only logged (the claim goes stale and gets taken over)
@@ -644,16 +653,14 @@ where
         Err(e) => return failed(e.into()).await,
     };
     if start > end {
-        let g = group.to_string();
-        on_db(db, move |conn| Ok(crate::chunks::finish(conn, &g, day)?)).await?;
+        finish().await?;
         return Ok(Progress::default());
     }
 
     let pass = Pass { ctx, settings, db, group, server, key: cursor_key(&ctx.pool, server, group) };
     match pass.process_range(start as i64, end as i64, "CHUNK", progress).await {
         Ok((saved, true)) => {
-            let g = group.to_string();
-            on_db(db, move |conn| Ok(crate::chunks::finish(conn, &g, day)?)).await?;
+            finish().await?;
             Ok(saved)
         }
         Ok((saved, false)) => {

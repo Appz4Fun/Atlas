@@ -451,7 +451,7 @@ fn chunk_groups(mode: &str, groups: &[String], skip: &HashSet<String>) -> HashSe
 
 /// A day chunk of a split group for an idle worker on `server`: the newest
 /// one pending, among the tracked groups this server hasnt said it lacks.
-async fn take_chunk(sched: &Scheduler, server: usize, db: &Db) -> Option<(String, i64)> {
+async fn take_chunk(sched: &Scheduler, server: usize, db: &Db) -> Option<crate::chunks::Claim> {
     // a server resting after a failure takes no chunks either
     if !sched.ctx.pool.indexing_tier().contains(&server) {
         return None;
@@ -488,13 +488,14 @@ async fn worker(sched: Arc<Scheduler>, server: usize, db: Db) {
         let Some(group) = sched.take_group(server) else {
             // nothing of its own: help with a split group's day chunks. not
             // marked busy, a group's chunks run on several servers at once
-            if let Some((group, day)) = take_chunk(&sched, server, &db).await {
+            if let Some(chunk) = take_chunk(&sched, server, &db).await {
                 let settings = sched.settings.read().unwrap().clone();
                 let stats = sched.stats.clone();
+                let group = chunk.group.clone();
                 let mut progress = |p: &Progress| stats.lock().unwrap().tick(p.articles, p.bytes, p.releases, &group);
-                let chunk = crate::indexer::run_chunk(&sched.ctx, &settings, &db, &group, server, day, &mut progress);
-                let Some(result) = unless_stopped(&sched.ctx.stop, chunk).await else { break };
-                sched.finish_chunk(group, server, result);
+                let run = crate::indexer::run_chunk(&sched.ctx, &settings, &db, &chunk, server, &mut progress);
+                let Some(result) = unless_stopped(&sched.ctx.stop, run).await else { break };
+                sched.finish_chunk(chunk.group, server, result);
                 continue;
             }
             nap(Duration::from_secs(1), || sched.stopping()).await;
