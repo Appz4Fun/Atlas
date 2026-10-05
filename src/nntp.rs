@@ -1,6 +1,7 @@
 //! Async NNTP client (tokio): just what atlas needs (GROUP, XOVER, BODY, LIST),
 //! with a connection pool per usenet server soo many requests are in flight at once.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
 use std::io;
@@ -155,6 +156,8 @@ fn refusal(e: &NntpError) -> Refusal {
 const STREAM_END_WAIT: Duration = Duration::from_secs(2);
 /// after a failed connect a server is skipped for this long (connect() still tries it)
 const DOWN_FOR: Duration = Duration::from_secs(60);
+/// GROUPs refused with 500/501 in a row before a server counts as article only
+const GROUP_REFUSALS: usize = 3;
 /// how often a request in flight looks at the stop flag
 const STOP_POLL: Duration = Duration::from_millis(50);
 
@@ -662,6 +665,8 @@ struct Server {
     /// server answered GROUP with 500/501: an article only server (fill / bonus),
     /// used for article lookups but not for indexing
     no_index: AtomicBool,
+    /// GROUPs answered 500/501 in a row; a real server can reject one odd group name
+    group_refusals: AtomicUsize,
     /// login rejected or limit shrunk messages already printed
     warned_auth: AtomicBool,
     warned_limit: AtomicBool,
@@ -767,6 +772,8 @@ pub struct Pool {
     ready: AtomicBool,
     failed_over_at: Mutex<Option<Instant>>,
     timeout: Duration,
+    /// groups their first choice server doesnt carry: the server that does
+    homes: Mutex<HashMap<String, usize>>,
 }
 
 impl Pool {
@@ -782,6 +789,7 @@ impl Pool {
                         down_until: Mutex::new(None),
                         no_compress: AtomicBool::new(false),
                         no_index: AtomicBool::new(false),
+                        group_refusals: AtomicUsize::new(0),
                         warned_auth: AtomicBool::new(false),
                         warned_limit: AtomicBool::new(false),
                         limit: AtomicUsize::new(cfg.connections().max(1) as usize),
@@ -795,6 +803,7 @@ impl Pool {
             ready: AtomicBool::new(false),
             failed_over_at: Mutex::new(None),
             timeout: DEFAULT_TIMEOUT,
+            homes: Mutex::new(HashMap::new()),
         }
     }
 
@@ -864,6 +873,13 @@ impl Pool {
     /// in proportion to each server's connections, and a group keeps its
     /// server (its cursors are per server) as long as that server is healthy.
     pub fn pick_server_in(&self, tier: &[usize], group: &str) -> usize {
+        // a group its first choice doesnt carry lives where it was found
+        if let Some(&home) = self.homes.lock().unwrap().get(group)
+            && tier.contains(&home)
+        {
+            return home;
+        }
+
         let total: u64 = tier.iter().map(|&i| self.connections(i) as u64).sum();
         if total == 0 {
             return tier.first().copied().unwrap_or(0);
@@ -882,6 +898,33 @@ impl Pool {
             point -= c;
         }
         tier[0]
+    }
+
+    /// `candidates` in the order a group should try them: rendezvous hashing
+    /// weighted by connections, soo groups that need another server spread
+    /// over all of them in proportion (not all onto the first in the list),
+    /// and the same group always gets the same order.
+    fn ranked(&self, candidates: &[usize], group: &str) -> Vec<usize> {
+        let fnv = |bytes: &[u8]| {
+            bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3))
+        };
+        let mut scored: Vec<(f64, usize)> = candidates
+            .iter()
+            .map(|&i| {
+                let key = format!("{group}\0{}", self.servers[i].cfg.host);
+                // splitmix64's finalizer: fnv alone barely changes between hosts
+                let mut z = fnv(key.as_bytes());
+                z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+                z ^= z >> 31;
+                // a well mixed number in (0, 1]
+                let h = ((z >> 11) + 1) as f64 / (1u64 << 53) as f64;
+                let weight = self.connections(i).max(1) as f64;
+                (-(h.max(f64::MIN_POSITIVE)).ln() / weight, i)
+            })
+            .collect();
+        scored.sort_by(|a, b| a.0.total_cmp(&b.0));
+        scored.into_iter().map(|(_, i)| i).collect()
     }
 
     /// requests the active server takes at once
@@ -1055,14 +1098,19 @@ impl Pool {
         let mut lease = self.lease_for(i, Some(group), false).await?;
         let r = lease.begin().select_group(group).await;
 
-        // GROUP not supported at all: an article only (fill / bonus) server
-        if let Err(e) = &r
-            && matches!(e.code(), Some(500 | 501))
-        {
-            let server = &self.servers[i];
-            if !server.no_index.swap(true, Ordering::Relaxed) {
-                println!("{}: doesnt support GROUP ({e}), using it for article lookups only", server.cfg.host);
+        // GROUP not supported at all: an article only (fill / bonus) server. one
+        // refusal can be a group name the server doesnt like, soo it takes
+        // GROUP_REFUSALS in a row with no GROUP working in between
+        let server = &self.servers[i];
+        match &r {
+            Err(e) if matches!(e.code(), Some(500 | 501)) => {
+                let refusals = server.group_refusals.fetch_add(1, Ordering::Relaxed) + 1;
+                if refusals >= GROUP_REFUSALS && !server.no_index.swap(true, Ordering::Relaxed) {
+                    println!("{}: doesnt support GROUP ({e}), using it for article lookups only", server.cfg.host);
+                }
             }
+            Ok(_) => server.group_refusals.store(0, Ordering::Relaxed),
+            Err(_) => {}
         }
 
         lease.check(r)
@@ -1088,21 +1136,18 @@ impl Pool {
             Err(e) => return Err(e),
         };
 
+        let usable = |i: &usize| *i != prefer && !self.servers[*i].no_index.load(Ordering::Relaxed);
+        let indexing: Vec<usize> = self.indexing_servers().into_iter().filter(usable).collect();
         let candidates: Vec<usize> = self
-            .indexing_servers()
+            .ranked(&indexing, group)
             .into_iter()
-            .chain(0..self.servers.len())
-            .filter(|&i| i != prefer && !self.servers[i].no_index.load(Ordering::Relaxed))
-            .fold(Vec::new(), |mut v, i| {
-                if !v.contains(&i) {
-                    v.push(i);
-                }
-                v
-            });
+            .chain((0..self.servers.len()).filter(|i| usable(i) && !indexing.contains(i)))
+            .collect();
 
         for i in candidates {
             if let Ok(r) = self.select_on(i, group).await {
                 println!("{group} not on {}, using {}", self.servers[prefer].cfg.host, self.servers[i].cfg.host);
+                self.homes.lock().unwrap().insert(group.to_string(), i);
                 return Ok((i, r));
             }
         }
@@ -1746,6 +1791,20 @@ mod tests {
 
         // stable: same group, same server
         assert_eq!(pool.pick_server("alt.binaries.x"), pool.pick_server("alt.binaries.x"));
+
+        // groups that need another server spread over the others by connections,
+        // not all onto the first in the list
+        let mut first = [0usize; 4];
+        for i in 0..5000 {
+            first[pool.ranked(&[1, 2], &format!("alt.binaries.group{i}"))[0]] += 1;
+        }
+        let share_c = first[2] as f64 / 5000.0;
+        assert!((share_c - 0.75).abs() < 0.05, "10:30 connections -> about 25% / 75%: {first:?}");
+        assert_eq!(pool.ranked(&[1, 2], "alt.binaries.x"), pool.ranked(&[1, 2], "alt.binaries.x"), "stable order");
+
+        // once found elsewhere, a group is picked there
+        pool.homes.lock().unwrap().insert("alt.binaries.moved".into(), 1);
+        assert_eq!(pool.pick_server("alt.binaries.moved"), 1);
     }
 
     #[test]

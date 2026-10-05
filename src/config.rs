@@ -14,14 +14,17 @@ pub const DEFAULT_API_HOST: &str = "127.0.0.1";
 pub const DEFAULT_CONNECTIONS: u32 = 10;
 /// servers without a priority go after the ones that have one
 pub const DEFAULT_PRIORITY: i64 = 99;
-/// article numbers the indexer takes on per pass over a group
-pub const DEFAULT_BATCH_SIZE: u64 = 50_000;
+/// article numbers the indexer takes on per pass over a group (50 requests)
+pub const DEFAULT_BATCH_SIZE: u64 = 500_000;
 /// with `parallel_groups` unset, one group runs per this many connections
 pub const CONNECTIONS_PER_GROUP: usize = 5;
 /// sanity cap on groups indexed at once
 pub const MAX_PARALLEL_GROUPS: usize = 256;
-/// article numbers per XOVER request (one connection's slice of a batch)
-pub const DEFAULT_REQUEST_SIZE: u64 = 1_000;
+/// article numbers per XOVER request (one connection's slice of a batch).
+/// providers spend most of a request's time on their side, not the network:
+/// measured on old articles, 10k per request got 3-6x the headers/s of 1k on
+/// one connection, and 50k was no better on most servers and erratic
+pub const DEFAULT_REQUEST_SIZE: u64 = 10_000;
 
 /// One usenet provider. Lower `priority` is tried first.
 #[derive(Clone, Debug, PartialEq, Eq)]

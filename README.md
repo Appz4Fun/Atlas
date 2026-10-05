@@ -115,8 +115,8 @@ On first run, Atlas asks for one server (host, username, password, and port) and
     "group": "alt.binaries.example",
     "groups": ["alt.binaries.example", "alt.binaries.another"],
     "index_mode": "dynamic",
-    "batch_size": 50000,
-    "request_size": 1000,
+    "batch_size": 500000,
+    "request_size": 10000,
     "parallel_groups": 20,
     "api_host": "0.0.0.0",
     "api_port": 9090,
@@ -132,8 +132,8 @@ On first run, Atlas asks for one server (host, username, password, and port) and
 | `groups` | `[]` | Newsgroups to index. Add them from the Groups menu or edit the list. |
 | `group` | | The current group, used by the menu's current-group search. |
 | `index_mode` | `dynamic` | `dynamic` alternates backfill and live passes, `backfill` indexes older posts only, and `live` indexes new posts only. |
-| `batch_size` | `50000` | Article numbers per indexing pass over a group. The cursor moves only after a whole pass finishes. |
-| `request_size` | `1000` | Article numbers per header request, which is one connection's slice of a pass. |
+| `batch_size` | `500000` | Article numbers per indexing pass over a group. The cursor moves only after a whole pass finishes. |
+| `request_size` | `10000` | Article numbers per header request, which is one connection's slice of a pass. Providers spend most of a request's time on their side, so on old articles 10,000 per request is 3–6 times faster per connection than 1,000. |
 | `parallel_groups` | 1 per 5 connections | Total groups indexed at the same time, shared between servers by their `connections`. Every server gets at least one. |
 | `api_host` | `127.0.0.1` | Address the Newznab API listens on. Use `0.0.0.0` to reach it from other machines. |
 | `api_port` | `9090` | Newznab API port. |

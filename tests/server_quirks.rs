@@ -61,6 +61,28 @@ fn article_only_servers_stop_indexing() {
     let (server, info) = pool.block_on(pool.pool.select_group_on(0, GROUP)).unwrap();
     assert_eq!(server, 1, "the group should move to the server that has GROUP");
     assert_eq!(info.2, 50);
+    // one refusal can be a group name a real server doesnt like
+    assert_eq!(pool.pool.indexing_servers(), vec![0, 1], "one refusal isnt enough");
+
+    // refused again and again: an article only server
+    for _ in 0..2 {
+        pool.block_on(pool.pool.select_group_on(0, GROUP)).unwrap();
+    }
     assert_eq!(pool.pool.indexing_servers(), vec![1], "the fill server is out of indexing");
     assert_eq!(pool.pool.pick_server("alt.binaries.anything"), 1);
+}
+
+/// A real server that rejects one odd group name keeps indexing the others.
+#[test]
+fn one_rejected_group_doesnt_take_a_server_out() {
+    let normal = Server::new(posts(50));
+    let port = spawn_server(normal.clone());
+    let pool = BlockingPool::new(&[mock(port, "secret", 4, 1)]);
+
+    // the mock answers 411 for unknown groups; a 501 for one name, then GROUP works
+    for _ in 0..2 {
+        let _ = pool.block_on(pool.pool.select_group_on(0, "alt.binaries.missing"));
+    }
+    assert!(pool.block_on(pool.pool.select_group_on(0, GROUP)).is_ok());
+    assert_eq!(pool.pool.indexing_servers(), vec![0]);
 }
