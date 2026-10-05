@@ -12,7 +12,8 @@ const CLAIMED: i64 = 1;
 const DONE: i64 = 2;
 
 /// Initialize the backfill_chunks table if it doesn't exist, and give one
-/// made before chunks kept their finish time its done_at column.
+/// made before chunks kept their finish time its done_at column. Also the
+/// server that goes back furthest, by split group (see `deepest`).
 pub fn create(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "create table if not exists backfill_chunks (
@@ -23,7 +24,8 @@ pub fn create(conn: &Connection) -> Result<()> {
             claimed_at INTEGER,
             done_at INTEGER,
             primary key (grp, day)
-        ) without rowid;",
+        ) without rowid;
+        create table if not exists backfill_deepest (grp TEXT PRIMARY KEY, server TEXT NOT NULL) without rowid;",
     )?;
     if has_done_at(conn)? {
         return Ok(());
@@ -138,6 +140,18 @@ pub fn progress(conn: &Connection, group: &str) -> Result<(i64, i64)> {
 /// the oldest day of a group's chunks
 pub fn oldest_day(conn: &Connection, group: &str) -> Result<Option<i64>> {
     conn.query_row("select min(day) from backfill_chunks where grp = ?", [group], |r| r.get(0))
+}
+
+/// The server whose first article of a split group is the oldest: the one
+/// to index the split's oldest day, which no server keeps whole.
+pub fn deepest(conn: &Connection, group: &str) -> Result<Option<String>> {
+    conn.query_row("select server from backfill_deepest where grp = ?", [group], |r| r.get(0)).optional()
+}
+
+/// Note `server` as the one going back furthest on `group`.
+pub fn set_deepest(conn: &Connection, group: &str, server: &str) -> Result<()> {
+    conn.execute("insert or replace into backfill_deepest (grp, server) values (?, ?)", [group, server])?;
+    Ok(())
 }
 
 /// groups with chunks still to do

@@ -620,8 +620,8 @@ where
     // a day this server doesnt keep from its start would come out empty or
     // cut short, though another server may have all of it: give it back, and
     // the server takes no day that old for a while. the split's oldest day is
-    // the exception: no server goes back further, the one whose oldest
-    // article is on it does what there is
+    // the exception: no server keeps it whole, the one that goes back
+    // furthest on it does what there is
     let oldest = match ctx.pool.first_post(server, group, first, last).await {
         Ok(oldest) => oldest,
         Err(e) => return failed(e.into()).await,
@@ -630,9 +630,17 @@ where
         Some(t) if t <= day * 86_400 => true,
         Some(t) if crate::chunks::unix_day(t) == day => {
             let g = group.to_string();
-            match on_db(db, move |conn| Ok(crate::chunks::oldest_day(conn, &g)?)).await {
-                Ok(split_oldest) => split_oldest == Some(day),
+            let split_oldest = match on_db(db, move |conn| Ok(crate::chunks::oldest_day(conn, &g)?)).await {
+                Ok(d) => d,
                 Err(e) => return failed(e).await,
+            };
+            if split_oldest != Some(day) {
+                false
+            } else {
+                match goes_back_furthest(ctx, db, group, server, t).await {
+                    Ok(furthest) => furthest,
+                    Err(e) => return failed(e).await,
+                }
             }
         }
         _ => false,
@@ -670,6 +678,40 @@ where
         }
         Err(e) => failed(e).await,
     }
+}
+
+/// Whether `server`, whose first article of split `group` was posted at
+/// `oldest`, goes back furthest of the indexing servers: the one to index the
+/// split's oldest day. Found by asking each server for its first article the
+/// first time, then kept, soo it doesnt move as retention rolls on (asked
+/// again once that server is no longer an indexing one). A server that
+/// cant be asked fails it: the chunk goes back and is tried again later.
+async fn goes_back_furthest(ctx: &PassContext, db: &Db, group: &str, server: usize, oldest: i64) -> Result<bool> {
+    let host = ctx.pool.host(server);
+    let servers = ctx.pool.indexing_servers();
+    let g = group.to_string();
+    let known = on_db(db, move |conn| Ok(crate::chunks::deepest(conn, &g)?)).await?;
+    if let Some(deepest) = known.filter(|h| servers.iter().any(|&i| ctx.pool.host(i) == *h)) {
+        return Ok(deepest == host);
+    }
+
+    let mut deepest = (oldest, host.clone());
+    for other in servers.into_iter().filter(|&i| i != server) {
+        let (_, low, high, _) = match ctx.pool.group_on(other, group).await {
+            Ok(info) => info,
+            Err(e) if e.code() == Some(411) => continue,
+            Err(e) => return Err(e.into()),
+        };
+        if let Some(t) = ctx.pool.first_post(other, group, low, high).await?
+            && t < deepest.0
+        {
+            deepest = (t, ctx.pool.host(other));
+        }
+    }
+    let (g, d) = (group.to_string(), deepest.1.clone());
+    on_db(db, move |conn| Ok(crate::chunks::set_deepest(conn, &g, &d)?)).await?;
+    println!("[CHUNK] {group}: {} goes back furthest, it does the oldest day", deepest.1);
+    Ok(deepest.1 == host)
 }
 
 struct Pass<'a> {
