@@ -27,6 +27,9 @@ const IDLE_RECHECK: Duration = Duration::from_secs(10);
 /// how often config.json is re-read while indexing
 const CONFIG_RELOAD: Duration = Duration::from_secs(5);
 
+/// how often auto_run_compact compacts the database
+pub const COMPACT_EVERY: Duration = Duration::from_secs(24 * 3600);
+
 /// servers with a host and password, in priority order
 fn usable_servers(config: &crate::config::Config) -> Vec<UsenetServer> {
     config.servers.iter().filter(|s| !s.host.is_empty() && !s.password.is_empty()).cloned().collect()
@@ -214,6 +217,15 @@ async fn nap(d: Duration, done: impl Fn() -> bool) {
     }
 }
 
+/// how often auto_run_compact compacts (ATLAS_COMPACT_EVERY_SECS for tests)
+fn compact_every() -> Duration {
+    std::env::var("ATLAS_COMPACT_EVERY_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(COMPACT_EVERY)
+}
+
 fn settings_of(config: &Config) -> PassSettings {
     PassSettings {
         mode: config.index_mode.clone(),
@@ -268,6 +280,8 @@ struct Scheduler {
     stats: Arc<Mutex<Stats>>,
     /// wind down (servers changed or stopping): finish current passes, start no new ones
     wind_down: AtomicBool,
+    /// the compaction interval passed (set together with `wind_down`)
+    compact_due: AtomicBool,
     passes: AtomicUsize,
 }
 
@@ -521,6 +535,26 @@ async fn watch_config(sched: Arc<Scheduler>, servers: Vec<UsenetServer>) {
     }
 }
 
+/// With auto_run_compact: once the interval has passed since the last
+/// compaction (or since the indexer started, when there was none), wind down so
+/// `supervise` can compact.
+async fn compact_timer(sched: Arc<Scheduler>) {
+    let every = compact_every();
+    let last = db::open_at(&paths::database()).ok().and_then(|conn| crate::store::get_meta(&conn, "last_compact").ok());
+    let last = last.flatten().unwrap_or_else(|| now() as i64);
+    let due = UNIX_EPOCH + Duration::from_secs(last.max(0) as u64) + every;
+    // the last compaction is in the past, soo a fresh start still waits out the rest
+    while !sched.stopping() {
+        if SystemTime::now() >= due {
+            println!("compacting the database, indexing resumes after");
+            sched.compact_due.store(true, Ordering::Relaxed);
+            sched.wind_down.store(true, Ordering::Relaxed);
+            return;
+        }
+        nap(Duration::from_secs(1), || sched.stopping()).await;
+    }
+}
+
 /// status.json / stats.json once a second for the menu and dashboard
 /// (plus a timing breakdown every 30s with ATLAS_PROFILE)
 async fn report(sched: Arc<Scheduler>) {
@@ -535,14 +569,15 @@ async fn report(sched: Arc<Scheduler>) {
     }
 }
 
-/// Index with this set of servers until stopping or the config needs a rebuild.
+/// Index with this set of servers until stopping, the config needs a rebuild
+/// or a compaction is due (true).
 async fn run_servers(
     config: &Config,
     pool: Arc<Pool>,
     states: RunStates,
     stats: Arc<Mutex<Stats>>,
     stop: Arc<AtomicBool>,
-) {
+) -> bool {
     let servers = usable_servers(config);
     let groups = config.tracked_groups();
     let plan = plan_workers(config);
@@ -569,6 +604,7 @@ async fn run_servers(
         failed: Mutex::new(HashMap::new()),
         stats,
         wind_down: AtomicBool::new(false),
+        compact_due: AtomicBool::new(false),
         passes: AtomicUsize::new(0),
     });
 
@@ -576,7 +612,7 @@ async fn run_servers(
         Ok(conn) => shared_db(conn),
         Err(e) => {
             ui::error(&format!("couldnt open database: {e}"));
-            return;
+            return false;
         }
     };
 
@@ -592,6 +628,9 @@ async fn run_servers(
     }
     tasks.spawn(watch_config(sched.clone(), servers));
     tasks.spawn(report(sched.clone()));
+    if config.auto_run_compact {
+        tasks.spawn(compact_timer(sched.clone()));
+    }
 
     // the workers and the config watcher all stop on `stopping()`
     while tasks.join_next().await.is_some() {
@@ -602,6 +641,33 @@ async fn run_servers(
 
     checkpoint_stop.store(true, Ordering::Relaxed);
     let _ = tokio::task::spawn_blocking(move || checkpointer.join()).await;
+    sched.compact_due.load(Ordering::Relaxed)
+}
+
+/// Compact every shard in this process (the indexer is wound down, so nothing
+/// else writes), then note the time. Noted on failure too, soo a failing
+/// compaction is tried again in 24 hours, not every minute.
+async fn compact(config: &Config, stats: &Arc<Mutex<Stats>>) {
+    write_status(true, "compacting the database", &config.index_mode, false, "running", false, 0);
+    let main = paths::database();
+    let started = Instant::now();
+    let path = main.clone();
+    let report = |msg: &str| println!("{msg}");
+    let result = tokio::task::spawn_blocking(move || crate::compact::run(&path, &report)).await;
+    match result {
+        Ok(Ok(_)) => println!("compacted in {}", crate::dashboard::human_time(started.elapsed().as_secs() as i64)),
+        Ok(Err(e)) => {
+            ui::error(&format!("auto compaction failed, the originals were kept: {e:#}"));
+            stats.lock().unwrap().error_count += 1;
+        }
+        Err(e) => {
+            ui::error(&format!("auto compaction stopped: {e}"));
+            stats.lock().unwrap().error_count += 1;
+        }
+    }
+    if let Ok(conn) = db::open_at(&main) {
+        let _ = crate::store::set_meta(&conn, "last_compact", chrono::Utc::now().timestamp());
+    }
 }
 
 async fn supervise(stop: Arc<AtomicBool>, stats: Arc<Mutex<Stats>>) {
@@ -631,8 +697,12 @@ async fn supervise(stop: Arc<AtomicBool>, stats: Arc<Mutex<Stats>>) {
             continue;
         }
 
-        run_servers(&config, pool.clone(), states.clone(), stats.clone(), stop.clone()).await;
+        let compact_due = run_servers(&config, pool.clone(), states.clone(), stats.clone(), stop.clone()).await;
         pool.close().await;
+
+        if compact_due && !stopping() {
+            compact(&config, &stats).await;
+        }
     }
 }
 

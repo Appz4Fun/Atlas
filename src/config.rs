@@ -134,6 +134,8 @@ pub struct Config {
     pub split_min_backlog: Option<i64>,
     /// groups indexed at the same time, None = worked out from the connections
     pub parallel_groups: Option<usize>,
+    /// compact the database every 24 hours from the indexer
+    pub auto_run_compact: bool,
 }
 
 impl Default for Config {
@@ -150,6 +152,7 @@ impl Default for Config {
             request_size: None,
             split_min_backlog: None,
             parallel_groups: None,
+            auto_run_compact: false,
         }
     }
 }
@@ -274,6 +277,7 @@ impl Config {
                 .and_then(as_int)
                 .and_then(|n| usize::try_from(n).ok())
                 .filter(|n| *n > 0),
+            auto_run_compact: v.get("auto_run_compact").and_then(Value::as_bool).unwrap_or(false),
         };
 
         cfg.sort_servers();
@@ -453,6 +457,10 @@ pub fn save_config(cfg: &Config) -> io::Result<()> {
 
     if let Some(n) = cfg.split_min_backlog {
         out.insert("split_min_backlog".into(), json!(n));
+    }
+
+    if cfg.auto_run_compact {
+        out.insert("auto_run_compact".into(), json!(true));
     }
 
     write_json(&Value::Object(out), private)

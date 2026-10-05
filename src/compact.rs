@@ -12,7 +12,9 @@
 //!
 //! Each shard's copy is checked (row counts, and a sample of NZBs against the
 //! original) before it replaces the original. The originals stay next to it
-//! as `atlas.sN.precompact.db` until every shard is done, then they go.
+//! as `atlas.sN.precompact.db` until every shard has had its turn, then they
+//! go. A shard that fails keeps its original in place and the others carry
+//! on; `run` then returns an error naming each failed shard.
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -63,23 +65,41 @@ pub fn run(main: &Path, progress: &(dyn Fn(&str) + Sync)) -> Result<Shrunk> {
     }
     let started = Instant::now();
     let mut total = Shrunk::default();
+    let mut failed: Vec<(usize, String)> = Vec::new();
+    // every shard gets its turn: one that fails keeps its original and doesnt
+    // stop the others
     for chunk in (0..SHARDS).collect::<Vec<_>>().chunks(PARALLEL) {
         let results: Vec<Result<Shrunk>> = std::thread::scope(|s| {
             let jobs: Vec<_> =
                 chunk.iter().map(|&shard| s.spawn(move || compact_shard(main, shard, progress))).collect();
             jobs.into_iter().map(|j| j.join().unwrap_or_else(|_| Err(anyhow!("compacting a shard panicked")))).collect()
         });
-        for r in results {
-            let r = r?;
-            total.before += r.before;
-            total.after += r.after;
-            total.domains_kept += r.domains_kept;
-            total.domains_dropped += r.domains_dropped;
+        for (&shard, r) in chunk.iter().zip(results) {
+            match r {
+                Ok(r) => {
+                    total.before += r.before;
+                    total.after += r.after;
+                    total.domains_kept += r.domains_kept;
+                    total.domains_dropped += r.domains_dropped;
+                }
+                Err(e) => failed.push((shard, format!("shard {shard}: {e:#}"))),
+            }
         }
     }
-    // every shard is done and checked: the originals can go
-    for shard in store::shard_paths(main) {
-        remove_db(&with_suffix(&shard, "precompact"));
+    // the originals of the shards that were swapped can go. a failed shard
+    // keeps its original in place, and loses its half made copy (unless the
+    // shard isnt in place: the copy or the aside original may be all there is)
+    for shard in 0..SHARDS {
+        let path = store::shard_path(main, shard);
+        if !failed.iter().any(|(f, _)| *f == shard) {
+            remove_db(&with_suffix(&path, "precompact"));
+        } else if path.exists() {
+            remove_db(&with_suffix(&path, "compact"));
+        }
+    }
+    if !failed.is_empty() {
+        let each: Vec<String> = failed.into_iter().map(|(_, e)| e).collect();
+        bail!("{} of {SHARDS} shards were not compacted, their originals were kept: {}", each.len(), each.join("; "));
     }
     progress(&format!(
         "compacted {:.1}GB into {:.1}GB in {}: kept {} shared domains, dropped {} single use ones",
@@ -672,5 +692,55 @@ mod tests {
         let blob: Vec<u8> =
             db::open_at(&path).unwrap().query_row("select blob from files where id = ?", [file], |r| r.get(0)).unwrap();
         assert_eq!(blob, vec![0], "the original is still in place");
+    }
+
+    /// NZB rows of every release outside shard `skip`, by id
+    fn articles_outside(main: &Path, skip: usize) -> Vec<(i64, Vec<crate::search::ArticleRow>)> {
+        let conn = db::open_with_shards(main).unwrap();
+        let sql = (0..SHARDS)
+            .filter(|i| *i != skip)
+            .map(|i| format!("select id from s{i}.releases"))
+            .collect::<Vec<_>>()
+            .join(" union all ");
+        let mut ids: Vec<i64> =
+            conn.prepare(&sql).unwrap().query_map([], |r| r.get(0)).unwrap().map(|r| r.unwrap()).collect();
+        ids.sort();
+        ids.into_iter().map(|id| (id, store::articles(&conn, id).unwrap())).collect()
+    }
+
+    #[test]
+    fn a_failed_shard_doesnt_stop_the_others() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        legacy_fixture(&main);
+        let (path, file) = file_of(&main, "Rel.3", "alt.binaries.g3");
+        let bad = store::shard_of("alt.binaries.g3");
+        let before = articles_outside(&main, bad);
+        assert!(!before.is_empty());
+        db::open_at(&path).unwrap().execute("update files set blob = x'00' where id = ?", [file]).unwrap();
+
+        let err = run(&main, &|_| {}).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains(&format!("shard {bad}:")) && msg.contains("corrupt"), "{msg}");
+
+        // the others were compacted (sealed) and their backups removed
+        let loose_in = |p: &Path| -> i64 {
+            db::open_at(p).unwrap().query_row("select count(*) from segments", [], |r| r.get(0)).unwrap()
+        };
+        for (i, shard) in store::shard_paths(&main).iter().enumerate() {
+            assert!(!with_suffix(shard, "precompact").exists(), "no backup left over for shard {i}");
+            assert!(!with_suffix(shard, "compact").exists(), "no half made copy left over for shard {i}");
+            if i == bad {
+                assert!(loose_in(shard) > 0, "the failed shard still has its loose rows");
+            } else {
+                assert_eq!(loose_in(shard), 0, "shard {i} was compacted and sealed");
+            }
+        }
+        assert_eq!(articles_outside(&main, bad), before, "the others read back the same");
+
+        // the failed one is untouched
+        let blob: Vec<u8> =
+            db::open_at(&path).unwrap().query_row("select blob from files where id = ?", [file], |r| r.get(0)).unwrap();
+        assert_eq!(blob, vec![0]);
     }
 }

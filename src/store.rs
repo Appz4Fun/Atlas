@@ -223,6 +223,17 @@ pub fn set_next_seq(main: &Connection, seq: i64) -> Result<()> {
     Ok(())
 }
 
+/// A number kept in the main database's `meta` table, if it's there.
+pub fn get_meta(conn: &Connection, key: &str) -> Result<Option<i64>> {
+    conn.query_row("select value from main.meta where key = ?", [key], |r| r.get(0)).optional()
+}
+
+/// Keep a number in the main database's `meta` table.
+pub fn set_meta(conn: &Connection, key: &str, value: i64) -> Result<()> {
+    conn.execute("insert or replace into main.meta (key, value) values (?, ?)", params![key, value])?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------- message-ids
 
 const TEXT: u8 = 0;
