@@ -438,8 +438,17 @@ impl Scheduler {
     }
 }
 
-/// A day chunk of any split group for an idle worker on `server`: the newest
-/// one pending, among the groups this server hasnt said it lacks.
+/// The groups whose day chunks a worker may take: ones still in config.json,
+/// except `skip`, and none when the mode never backfills.
+fn chunk_groups(mode: &str, groups: &[String], skip: &HashSet<String>) -> HashSet<String> {
+    if mode == "live" {
+        return HashSet::new();
+    }
+    groups.iter().filter(|g| !skip.contains(*g)).cloned().collect()
+}
+
+/// A day chunk of a split group for an idle worker on `server`: the newest
+/// one pending, among the tracked groups this server hasnt said it lacks.
 async fn take_chunk(sched: &Scheduler, server: usize, db: &Db) -> Option<(String, i64)> {
     // a server resting after a failure takes no chunks either
     if !sched.ctx.pool.indexing_tier().contains(&server) {
@@ -447,14 +456,19 @@ async fn take_chunk(sched: &Scheduler, server: usize, db: &Db) -> Option<(String
     }
 
     let host = sched.ctx.pool.host(server);
-    let skip: Vec<String> = {
+    let skip: HashSet<String> = {
         let now = Instant::now();
         let mut skip = sched.skip.lock().unwrap();
         skip.retain(|_, until| until.is_none_or(|t| t > now));
         skip.keys().filter(|(_, s)| *s == server).map(|(g, _)| g.clone()).collect()
     };
+    let mode = sched.settings.read().unwrap().mode.clone();
+    let groups = chunk_groups(&mode, &sched.groups.read().unwrap(), &skip);
+    if groups.is_empty() {
+        return None;
+    }
 
-    match crate::indexer::claim_chunk(db, host, skip).await {
+    match crate::indexer::claim_chunk(db, host, groups).await {
         Ok(chunk) => chunk,
         Err(e) => {
             ui::error(&format!("couldnt claim a day chunk: {e}"));
@@ -815,4 +829,18 @@ pub fn run_until(config: Config, stop: Arc<AtomicBool>) -> i32 {
     write_status(false, "", &config.index_mode, false, "stopped", false, 0);
     stats.lock().unwrap().write("", "", false, false);
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chunks_only_for_tracked_groups_in_a_backfilling_mode() {
+        let groups = vec!["a".to_string(), "b".to_string()];
+        let skip = HashSet::from(["b".to_string()]);
+        assert_eq!(chunk_groups("backfill", &groups, &skip), HashSet::from(["a".to_string()]));
+        assert_eq!(chunk_groups("dynamic", &groups, &HashSet::new()).len(), 2);
+        assert!(chunk_groups("live", &groups, &HashSet::new()).is_empty(), "live never backfills");
+    }
 }

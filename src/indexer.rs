@@ -473,12 +473,16 @@ impl std::fmt::Display for NotCarried {
 
 impl std::error::Error for NotCarried {}
 
-/// Claim the newest chunk of any split group for `host`, except `skip`.
-pub async fn claim_chunk(db: &Db, host: String, skip: Vec<String>) -> Result<Option<(String, i64)>> {
+/// Claim the newest chunk for `host` of the split groups among `groups`.
+pub async fn claim_chunk(
+    db: &Db,
+    host: String,
+    groups: std::collections::HashSet<String>,
+) -> Result<Option<(String, i64)>> {
     on_db(db, move |conn| {
-        let groups: Vec<String> =
-            crate::chunks::split_groups(conn)?.into_iter().filter(|g| !skip.contains(g)).collect();
-        Ok(crate::chunks::claim(conn, &groups, &host, chrono::Utc::now().timestamp())?)
+        let split: Vec<String> =
+            crate::chunks::split_groups(conn)?.into_iter().filter(|g| groups.contains(g)).collect();
+        Ok(crate::chunks::claim(conn, &split, &host, chrono::Utc::now().timestamp())?)
     })
     .await
 }
