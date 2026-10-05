@@ -146,8 +146,8 @@ pub fn create_shard(path: &Path) -> Result<()> {
             expected INTEGER,
             file_total INTEGER,
             seen BLOB NOT NULL,
-            blob BLOB,
-            touched_at INTEGER
+            touched_at INTEGER,
+            blob BLOB
         );
         create unique index if not exists files_key on files(release_id, filename);
 
@@ -169,13 +169,14 @@ pub fn create_shard(path: &Path) -> Result<()> {
     migrate_shard(&conn)
 }
 
-/// Columns a shard made before sealing lacks: `files.blob` (a sealed file's
-/// articles) and `files.touched_at` (when articles were last added). Adding
-/// a nullable column doesnt rewrite the table.
+/// Columns a shard made before sealing lacks: `files.touched_at` (when
+/// articles were last added) and `files.blob` (a sealed file's articles), in
+/// the same order `create_shard` has them. Adding a nullable column doesnt
+/// rewrite the table.
 pub fn migrate_shard(conn: &Connection) -> Result<()> {
     let cols: Vec<String> =
         conn.prepare("pragma table_info(files)")?.query_map([], |r| r.get(1))?.collect::<Result<_>>()?;
-    for (col, kind) in [("blob", "BLOB"), ("touched_at", "INTEGER")] {
+    for (col, kind) in [("touched_at", "INTEGER"), ("blob", "BLOB")] {
         if !cols.iter().any(|c| c == col) {
             conn.execute(&format!("alter table files add column {col} {kind}"), [])?;
         }
@@ -638,27 +639,36 @@ fn seal_rows(conn: &Connection, file_id: i64) -> Result<usize> {
     Ok(segs.len())
 }
 
-/// Files after `after_id` with rows to seal: complete, or untouched for
-/// `SEAL_AGE` (never touched since the upgrade counts as old). Returns the
-/// ids and the last id looked at.
+/// The next `limit` files after `after_id`, and which of them to seal: ones
+/// with rows that are complete and not sealed yet, or untouched for
+/// `SEAL_AGE` (never touched since the upgrade counts as old; a sealed file
+/// with late rows waits for this too). Files with a negative part number
+/// never seal. Returns the ids and the last id looked at, for walking the
+/// table `limit` files at a time: `last == after_id` means the end.
 // not called yet: the shard writer and compact seal with it
 #[allow(dead_code)]
 pub(crate) fn sealable(conn: &Connection, after_id: i64, limit: usize, now: i64) -> Result<(Vec<i64>, i64)> {
     let mut stmt = conn.prepare_cached(
-        "select f.id, f.expected, f.seen, f.touched_at from files f
-         where f.id > ? and exists (select 1 from segments s where s.file_id = f.id)
-         order by f.id limit ?",
+        "select f.id, f.expected, f.seen, f.touched_at, f.blob is not null,
+                exists (select 1 from segments s where s.file_id = f.id),
+                exists (select 1 from segments s where s.file_id = f.id and s.part < 0)
+         from files f where f.id > ? order by f.id limit ?",
     )?;
     let mut ids = Vec::new();
     let mut last = after_id;
     let mut rows = stmt.query(params![after_id, limit as i64])?;
     while let Some(r) = rows.next()? {
         let id: i64 = r.get(0)?;
+        last = id;
+        let (has_rows, negative): (bool, bool) = (r.get(5)?, r.get(6)?);
+        if !has_rows || negative {
+            continue;
+        }
         let expected: Option<i64> = r.get(1)?;
         let seen: Vec<u8> = r.get(2)?;
         let touched: Option<i64> = r.get(3)?;
-        last = id;
-        let complete = expected.is_some_and(|e| is_exactly(&seen, e));
+        let sealed: bool = r.get(4)?;
+        let complete = !sealed && expected.is_some_and(|e| is_exactly(&seen, e));
         if complete || touched.is_none_or(|t| t < now - SEAL_AGE) {
             ids.push(id);
         }
@@ -844,6 +854,10 @@ pub fn save(main: &Path, releases: &[Release]) -> Result<()> {
 /// for building its NZB. `conn` has the shards attached.
 pub fn articles(conn: &Connection, release_id: i64) -> Result<Vec<ArticleRow>> {
     let s = shard_of_id(release_id);
+    // rows and blobs from one snapshot: a file sealed between two separate
+    // reads would show its articles twice (or not at all). a caller already
+    // in a transaction has one
+    let _snapshot = if conn.is_autocommit() { Some(conn.unchecked_transaction()?) } else { None };
     let mut stmt = conn.prepare(&format!(
         "select s.local, d.suffix, f.filename, s.part, f.expected, s.bytes, f.subject, r.poster, r.posted_date
          from s{s}.files f join s{s}.segments s on s.file_id = f.id join s{s}.releases r on r.id = f.release_id
@@ -1330,6 +1344,82 @@ mod tests {
         put_file(&conn, &f).unwrap();
         let touched: Option<i64> = conn.query_row("select touched_at from files", [], |r| r.get(0)).unwrap();
         assert!(touched.is_some());
+    }
+
+    #[test]
+    fn sealable_walks_the_table_a_step_at_a_time() {
+        let (_dir, main) = sealed_fixture();
+        let conn = db::open_at(&shard_path(&main, shard_of("alt.binaries.t"))).unwrap();
+        let now: i64 = conn.query_row("select unixepoch()", [], |r| r.get(0)).unwrap();
+        let ids: Vec<i64> = conn
+            .prepare("select id from files order by id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        for id in &ids {
+            seal_file(&conn, *id).unwrap();
+        }
+
+        // all sealed: nothing to do, but every call moves on by `limit` files
+        assert_eq!(sealable(&conn, 0, 1, now).unwrap(), (vec![], ids[0]));
+        assert_eq!(sealable(&conn, ids[0], 1, now).unwrap(), (vec![], ids[1]));
+        assert_eq!(sealable(&conn, ids[1], 1, now).unwrap(), (vec![], ids[1]), "the end: last == after_id");
+
+        // a late row makes sealed b.rar complete, it still waits until it's stale
+        let late = Release {
+            name: "Rel".into(),
+            group: "alt.binaries.t".into(),
+            articles: vec![Article {
+                message_id: "<b2@x>".into(),
+                filename: Some("b.rar".into()),
+                part: Some(2),
+                total_parts: Some(2),
+                bytes: 102,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        save(&main, &[late]).unwrap();
+        assert!(sealable(&conn, 0, 100, now).unwrap().0.is_empty());
+        conn.execute("update files set touched_at = ? where filename = 'b.rar'", [now - SEAL_AGE - 1]).unwrap();
+        assert_eq!(sealable(&conn, 0, 100, now).unwrap().0, vec![ids[1]]);
+
+        // a negative part number cant go in a blob: never listed
+        conn.execute(
+            "insert into segments (file_id, local, domain, part, bytes) values (?, x'00', 0, -1, 0)",
+            [ids[1]],
+        )
+        .unwrap();
+        assert!(sealable(&conn, 0, 100, now).unwrap().0.is_empty());
+        assert_eq!(seal_file(&conn, ids[1]).unwrap(), 0);
+    }
+
+    #[test]
+    fn articles_reads_inside_a_callers_transaction() {
+        let (_dir, main) = sealed_fixture();
+        let reader = db::open_with_shards(&main).unwrap();
+        let id: i64 = reader.query_row("select id from releases", [], |r| r.get(0)).unwrap();
+        let before = articles(&reader, id).unwrap();
+        reader.execute_batch("begin").unwrap();
+        assert_eq!(articles(&reader, id).unwrap(), before);
+        // sealed by another connection meanwhile: the reader's snapshot doesnt change
+        let shard = db::open_at(&shard_path(&main, shard_of("alt.binaries.t"))).unwrap();
+        let files: Vec<i64> = shard
+            .prepare("select id from files")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        for f in files {
+            seal_file(&shard, f).unwrap();
+        }
+        assert_eq!(articles(&reader, id).unwrap(), before);
+        reader.execute_batch("commit").unwrap();
+        assert_eq!(articles(&reader, id).unwrap(), before, "and the same from the blobs");
+        assert!(reader.is_autocommit(), "no transaction left open");
     }
 
     #[test]
