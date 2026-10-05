@@ -42,6 +42,7 @@
         "alt.binaries.boneless"
     ],
     "index_mode": "backfill",
+    "auto_run_compact": false,
     "api_port": 9090,
     "api_host": "0.0.0.0"
 }

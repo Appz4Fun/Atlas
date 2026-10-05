@@ -138,6 +138,8 @@ On first run, Atlas asks for one server (host, username, password, and port) and
 | `api_host` | `127.0.0.1` | Address the Newznab API listens on. Use `0.0.0.0` to reach it from other machines. |
 | `api_port` | `9090` | Newznab API port. |
 | `api_key` | generated | Newznab API key. Atlas creates it on first start and stores it here. |
+| `split_min_backlog` | `10000000` | Article numbers of backfill left before a group's backfill is split into day chunks that every server carrying the group can take. |
+| `auto_run_compact` | `false` | Compact the database every 24 hours; indexing pauses while it runs. |
 
 Atlas keeps any other keys you add to the file when it saves it.
 
@@ -235,11 +237,17 @@ Start the indexer from the main menu with option 1. The indexer runs as a backgr
 | `backfill` | Indexes backward from the newest article only. |
 | `live` | Indexes forward from the newest article only and ignores older posts. |
 
+### Splitting big groups
+
+When a group's backfill exceeds `split_min_backlog` article numbers and the group is carried by two or more indexing servers, Atlas splits its backfill into day-sized chunks. Chunks are stored in the main database as tasks that any server carrying the group can claim. Idle workers on any server take the newest chunk, while live indexing stays on the group's home server. The stats dashboard shows split group progress on the backfill page.
+
 ### How the database is stored
 
 Atlas splits releases and their articles over 8 database files next to `atlas.db`, named `atlas.s0.db` to `atlas.s7.db`, by group. Each file has its own writer thread, so the 8 save in parallel, and slices that arrive while a writer is busy are saved together in one transaction. `atlas.db` keeps the per-group cursors.
 
-Articles are stored compactly, at about a quarter of the space of the old layout: each file of a release is stored once with the subject its NZB uses, and each article is a short row with its message ID, part number, and size. Message IDs share their domain and store hex IDs as bytes. NZBs come out exactly as before.
+Articles are stored compactly, at about a quarter of the space of the old layout: each file of a release is stored once with the subject its NZB uses, and each article is a short row with its message ID, part number, and size. Message ID locals are packed by alphabet using specialized encodings (hex at half the size for hexadecimal locals, base-N encoding for other alphabets), and domains are shared. NZBs come out exactly as before.
+
+Files that are complete, or untouched for three days, are sealed into one compressed zstd blob. Sealed files reduce storage further and improve query performance on old articles. Shard writers seal files online, processing up to 2,000 files per 100 milliseconds. The `--compact` command seals every file due in its pass and re-encodes message-IDs across the whole database.
 
 A release ID tells Atlas which file holds the release, and IDs keep counting up across all 8 files in the order releases are added, so the newest releases still come first.
 
@@ -255,6 +263,12 @@ The first time the new indexer starts on a database from an older version, it co
 The menu shows the progress meanwhile, and searches don't work until the conversion finishes. On a 488 GB database it takes about 1.5 hours. If anything fails, Atlas leaves the old database as it was and tries again on the next start. To convert in the foreground instead, stop indexing and run `atlas --convert`.
 
 Release IDs change in the conversion, so NZB links that Prowlarr or your apps saved before it no longer work. Search again to get the new ones.
+
+### Compacting a database
+
+The `--compact` command rewrites every shard into a fresh database file while the indexer is stopped. It re-encodes message-IDs using the current packing scheme and seals every file due to be sealed. The copy has no free space in it, which reduces the total database size. Expect the database to shrink substantially after compacting for the first time (rough estimate from the spec: 138 GB to 60 GB). Each shard's copy is verified before replacing the original; if any shard fails, its original is kept and the operation is retried in 24 hours.
+
+With `auto_run_compact` enabled, Atlas compacts the database automatically every 24 hours: indexing pauses while the operation runs, and resumes when done. Stop or quit commands are honored mid-compaction. If a shard fails, it is retried in 24 hours.
 
 A group that has caught up rests for 10 seconds before Atlas checks it again. Atlas parks a group that fails 3 times in a row for 5 minutes.
 
