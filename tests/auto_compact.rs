@@ -83,6 +83,17 @@ fn compacts_on_schedule_and_keeps_indexing() {
         assert!(Instant::now() < deadline, "indexing didnt resume");
         std::thread::sleep(Duration::from_millis(200));
     }
+    // and holds the lock again (shared: not a compaction of its own, which
+    // holds it exclusively)
+    let indexer_holds_it = || {
+        let lock = std::fs::File::open(atlas::compact::lock_path(&main)).unwrap();
+        lock.try_lock().is_err() && lock.try_lock_shared().is_ok()
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !indexer_holds_it() {
+        assert!(Instant::now() < deadline, "the indexer didnt take the lock back after compacting");
+        std::thread::sleep(Duration::from_millis(20));
+    }
     stop.store(true, Ordering::Relaxed);
     assert_eq!(runner.join().unwrap(), 0);
 }

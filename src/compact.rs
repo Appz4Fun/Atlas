@@ -52,10 +52,10 @@ fn size(path: &Path) -> u64 {
 }
 
 /// `atlas.compacting` next to `main`: a compaction holds it locked
-/// exclusively for its whole run, and a write from outside the indexer holds
-/// it shared for its own. The OS lets go of a lock when its process ends, soo
-/// a crash leaves nothing to clean up. The file itself stays (removing a file
-/// someone may be locking races them).
+/// exclusively for its whole run, the indexer holds it shared while it
+/// indexes, and a write from outside the indexer for its own. The OS lets go
+/// of a lock when its process ends, soo a crash leaves nothing to clean up.
+/// The file itself stays (removing a file someone may be locking races them).
 pub fn lock_path(main: &Path) -> PathBuf {
     main.with_extension("compacting")
 }
@@ -71,27 +71,27 @@ fn open_lock(main: &Path) -> Result<std::fs::File> {
         .with_context(|| format!("opening {}", path.display()))
 }
 
-/// A compaction couldnt start: another one, or a write from outside the
-/// indexer, holds the lock.
+/// A compaction couldnt start: another one, the indexer or a write from
+/// outside it holds the lock.
 #[derive(Debug)]
 pub struct Busy;
 
 impl std::fmt::Display for Busy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "another compaction or a database write holds the lock")
+        write!(f, "the indexer, another compaction or a database write holds the lock")
     }
 }
 
 impl std::error::Error for Busy {}
 
-/// Writes from outside the indexer (AI search saves, purging) hold this for
-/// their whole run: they would land in the original after a compaction took
-/// its copy, and be lost when the copy replaces it. Refused while a
-/// compaction runs; a compaction cant start while one is held.
+/// The indexer while it indexes, and writes from outside it (AI search saves,
+/// purging) for their whole run, hold this: they would land in the original
+/// after a compaction took its copy, and be lost when the copy replaces it.
+/// Refused while a compaction runs; a compaction cant start while one is held.
 #[must_use = "the write is only safe while the guard is held"]
 pub struct WriteGuard(std::fs::File);
 
-/// Hold off compaction for a write from outside the indexer, see `WriteGuard`.
+/// Hold off compaction while writing the shards, see `WriteGuard`.
 pub fn hold_off_compaction(main: &Path) -> Result<WriteGuard> {
     let file = open_lock(main)?;
     match file.try_lock_shared() {

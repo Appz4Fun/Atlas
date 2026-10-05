@@ -732,11 +732,19 @@ async fn compact(config: &Config, stats: &Arc<Mutex<Stats>>, stop: &Arc<AtomicBo
     Compacted::Ran
 }
 
-async fn supervise(stop: Arc<AtomicBool>, stats: Arc<Mutex<Stats>>) {
+/// Index until stopping. Returns the exit code: not 0 when a compaction held
+/// the database at the start.
+async fn supervise(stop: Arc<AtomicBool>, stats: Arc<Mutex<Stats>>) -> i32 {
     let states = RunStates::default();
     let stopping = || stop.load(Ordering::Relaxed);
+    let main = paths::database();
     // a compaction that couldnt take the lock waits till then
     let mut compact_after = None;
+    // indexing writes the shards: no compaction from elsewhere while it runs
+    // (its copy would miss what's written meanwhile). let go only for this
+    // indexer's own compaction, taken again after it
+    let mut writing = None;
+    let mut started = false;
 
     while !stopping() {
         let Some(config) = load_config() else {
@@ -749,6 +757,23 @@ async fn supervise(stop: Arc<AtomicBool>, stats: Arc<Mutex<Stats>>) {
             ui::error("config missing required fields");
             break;
         }
+
+        if writing.is_none() {
+            match crate::compact::hold_off_compaction(&main) {
+                Ok(guard) => writing = Some(guard),
+                Err(e) if !started => {
+                    ui::error(&format!("not indexing: {e:#}"));
+                    write_status(false, "", &config.index_mode, false, "stopped", true, 1);
+                    return 1;
+                }
+                Err(e) => {
+                    ui::warn(&format!("cant index yet: {e:#}"));
+                    nap(Duration::from_secs(30), stopping).await;
+                    continue;
+                }
+            }
+        }
+        started = true;
 
         let pool = Arc::new(Pool::new(&servers));
 
@@ -766,6 +791,7 @@ async fn supervise(stop: Arc<AtomicBool>, stats: Arc<Mutex<Stats>>) {
         pool.close().await;
 
         if compact_due && !stopping() {
+            writing = None;
             match compact(&config, &stats, &stop).await {
                 Compacted::Ran => compact_after = None,
                 Compacted::Busy => compact_after = Some(SystemTime::now() + COMPACT_RETRY),
@@ -773,6 +799,7 @@ async fn supervise(stop: Arc<AtomicBool>, stats: Arc<Mutex<Stats>>) {
             }
         }
     }
+    0
 }
 
 pub fn run() -> i32 {
@@ -858,7 +885,10 @@ pub fn run_until(config: Config, stop: Arc<AtomicBool>) -> i32 {
     let stats = Arc::new(Mutex::new(Stats::new()));
     write_status(true, &groups_label(&config.tracked_groups(), 0), &config.index_mode, false, "running", false, 0);
 
-    runtime.block_on(supervise(stop, stats.clone()));
+    let code = runtime.block_on(supervise(stop, stats.clone()));
+    if code != 0 {
+        return code;
+    }
 
     write_status(false, "", &config.index_mode, false, "stopped", false, 0);
     stats.lock().unwrap().write("", "", false, false);
