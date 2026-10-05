@@ -16,6 +16,7 @@ use crate::search::{
     ArticleRow, ReleaseRow, count_all_releases, count_obfuscated, count_releases, get_articles, search_all_releases,
     search_obfuscated, search_releases,
 };
+use crate::stats_dashboard;
 use crate::ui::{self, Column, Line, Table, ask, fmt_date, fmt_size, prompt};
 
 const LOGO: &str = r"
@@ -761,7 +762,13 @@ pub fn main_menu() -> i32 {
         if config.groups.len() > 1 {
             items.push(("4.", "Remove group"));
         }
-        items.extend([("5.", "Live Dashboard"), ("6.", "AI Search"), ("7.", "Settings"), ("0.", "Exit")]);
+        items.extend([
+            ("5.", "Live Dashboard"),
+            ("6.", "AI Search"),
+            ("7.", "Settings"),
+            ("8.", "Stats Dashboard"),
+            ("0.", "Exit"),
+        ]);
 
         let mut menu = Table::menu(&items);
         menu.indent = 0;
@@ -797,6 +804,12 @@ pub fn main_menu() -> i32 {
             "7" => {
                 do_settings();
                 config = load_config().unwrap_or(config);
+            }
+            "8" => {
+                if let Err(e) = stats_dashboard::run() {
+                    ui::error(&format!("stats dashboard failed: {e}"));
+                    ui::pause();
+                }
             }
             "0" => {
                 ui::print("\n[bold cyan]byee.[/bold cyan]");

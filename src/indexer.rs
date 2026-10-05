@@ -101,17 +101,109 @@ impl Default for PassSettings {
     }
 }
 
-/// A db connection shared between a pass and the blocking threads it hands
-/// sqlite work to (sqlite calls must not block the async runtime).
-pub type Db = Arc<Mutex<Connection>>;
+/// slices saved together in one transaction at most. bigger batches measured
+/// no faster on a 98GB database and risk spilling the page cache mid transaction
+const MAX_BATCH: usize = 8;
 
+/// The indexer's database, shared by every pass. Small writes (cursors) run on
+/// the main database's connection directly. Slices go to the writer thread of
+/// their group's shard (see store.rs); each saves whatever queued up for it
+/// while it was busy in one transaction, and the shards save in parallel.
+#[derive(Clone)]
+pub struct Db {
+    conn: Arc<Mutex<Connection>>,
+    saves: Vec<std::sync::mpsc::Sender<SaveJob>>,
+}
+
+struct SaveJob {
+    releases: Vec<Release>,
+    done: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
+}
+
+/// `conn` is the main database. The writer threads end once every clone of
+/// the `Db` is gone.
 pub fn shared_db(conn: Connection) -> Db {
-    Arc::new(Mutex::new(conn))
+    let main = conn.path().map(std::path::PathBuf::from).unwrap_or_else(crate::paths::database);
+    let ids = Arc::new(crate::store::Ids::new(&main));
+    let saves = (0..crate::store::SHARDS)
+        .map(|shard| {
+            let (saves, jobs) = std::sync::mpsc::channel();
+            let (path, ids) = (crate::store::shard_path(&main, shard), ids.clone());
+            std::thread::Builder::new()
+                .name(format!("atlas-db-writer-{shard}"))
+                .spawn(move || writer(shard, &path, &ids, jobs))
+                .expect("couldnt start a db writer");
+            saves
+        })
+        .collect();
+    Db { conn: Arc::new(Mutex::new(conn)), saves }
+}
+
+fn writer(shard: usize, path: &std::path::Path, ids: &crate::store::Ids, jobs: std::sync::mpsc::Receiver<SaveJob>) {
+    use crate::profile::{LOAD, Load};
+    use std::sync::atomic::Ordering::Relaxed;
+
+    let mut opened = db::open_at(path).and_then(|conn| db::tune_for_writing(&conn).map(|_| conn));
+    let mut store = crate::store::ShardWriter::new(shard);
+
+    while let Ok(first) = jobs.recv() {
+        let mut batch = vec![first];
+        while batch.len() < MAX_BATCH {
+            match jobs.try_recv() {
+                Ok(job) => batch.push(job),
+                Err(_) => break,
+            }
+        }
+        LOAD.writer_queued.fetch_sub(batch.len() as u64, Relaxed);
+
+        let t = std::time::Instant::now();
+        let result = match &mut opened {
+            Ok(conn) => {
+                let saved = store.save(conn, ids, batch.iter().map(|job| job.releases.as_slice()));
+                let t = std::time::Instant::now();
+                let _ = db::finish_checkpoint(conn);
+                Load::add_since(&LOAD.writer_checkpoint_ns, t);
+                saved.map_err(|e| e.to_string())
+            }
+            Err(e) => Err(format!("couldnt open {}: {e}", path.display())),
+        };
+        Load::add_since(&LOAD.writer_busy_ns, t);
+        LOAD.writer_batches.fetch_add(1, Relaxed);
+        LOAD.writer_slices.fetch_add(batch.len() as u64, Relaxed);
+
+        // the whole batch rolled back on an error, every slice in it failed
+        for job in batch {
+            let _ = job.done.send(result.clone());
+        }
+    }
+}
+
+impl Db {
+    /// Save one slice's releases. Returns once they are committed. Dropping
+    /// the future early leaves the slice queued: it still gets saved.
+    async fn save(&self, releases: Vec<Release>) -> Result<()> {
+        // a slice is one group, soo one shard
+        let Some(shard) = releases.first().map(|r| crate::store::shard_of(&r.group)) else { return Ok(()) };
+        let (done, saved) = tokio::sync::oneshot::channel();
+        crate::profile::LOAD.writer_queued.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if self.saves[shard].send(SaveJob { releases, done }).is_err() {
+            crate::profile::LOAD.writer_queued.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            return Err(anyhow!("db writer stopped"));
+        }
+        saved.await.map_err(|_| anyhow!("db writer stopped"))?.map_err(|e| anyhow!("saving releases: {e}"))
+    }
 }
 
 async fn on_db<T: Send + 'static>(db: &Db, f: impl FnOnce(&mut Connection) -> Result<T> + Send + 'static) -> Result<T> {
-    let db = db.clone();
-    tokio::task::spawn_blocking(move || f(&mut db.lock().unwrap())).await.map_err(|e| anyhow!("db task failed: {e}"))?
+    let conn = db.conn.clone();
+    tokio::task::spawn_blocking(move || {
+        let t = std::time::Instant::now();
+        let mut conn = conn.lock().unwrap();
+        crate::profile::DB_WAIT.add_since(t);
+        f(&mut conn)
+    })
+    .await
+    .map_err(|e| anyhow!("db task failed: {e}"))?
 }
 
 /// Everything a pass needs, cheap to clone into tasks.
@@ -182,6 +274,10 @@ where
             db::GroupState { live_cursor: last, backfill_cursor: last }
         }
     };
+
+    // for the stats dashboard's progress and ETA
+    let k = key.clone();
+    on_db(db, move |conn| Ok(db::save_group_bounds(conn, &k, first, last)?)).await?;
 
     let pass = Pass { ctx, settings, db, group, server, key };
     let phase = ctx.states.with(group, |st| st.phase);
@@ -305,6 +401,8 @@ impl Pass<'_> {
         let mut saved = Progress::default();
         let mut done = 0;
         let mut error: Option<anyhow::Error> = None;
+        // dated ends of what this pass saved, for the stats dashboard's history numbers
+        let (mut low, mut high): (Option<db::Dated>, Option<db::Dated>) = (None, None);
 
         while let Some(slice) = rx.recv().await {
             let headers: Vec<Overview> = match slice.result {
@@ -331,8 +429,13 @@ impl Pass<'_> {
                 continue;
             }
 
+            let dated = slice_date(&headers);
             match save_slice(pool, self.db, group, headers).await {
                 Ok(p) => {
+                    if let Some(d) = dated {
+                        low = low.filter(|l| l.0 <= d.0).or(Some(d));
+                        high = high.filter(|h| h.0 >= d.0).or(Some(d));
+                    }
                     saved.add(&p);
                     done += 1;
                     progress(&p);
@@ -341,6 +444,11 @@ impl Pass<'_> {
                     error.get_or_insert(e);
                 }
             }
+        }
+
+        if let (Some(low), Some(high)) = (low, high) {
+            let key = self.key.clone();
+            on_db(self.db, move |conn| Ok(db::save_group_dates(conn, &key, low, high)?)).await?;
         }
 
         if let Some(e) = error {
@@ -364,19 +472,42 @@ impl Pass<'_> {
     }
 }
 
+/// The middle article number of a slice and when its articles were posted: the
+/// median of a sample of their dates, soo a few forged or odd dates dont count.
+fn slice_date(headers: &[Overview]) -> Option<db::Dated> {
+    let first = headers.iter().map(|h| h.number).min()?;
+    let last = headers.iter().map(|h| h.number).max()?;
+    let step = (headers.len() / 64).max(1);
+    let mut posted: Vec<i64> =
+        headers.iter().step_by(step).filter_map(|h| crate::dates::posted_timestamp(&h.date)).collect();
+    if posted.is_empty() {
+        return None;
+    }
+    let mid = posted.len() / 2;
+    let (_, median, _) = posted.select_nth_unstable(mid);
+    Some((((first + last) / 2) as i64, *median))
+}
+
 /// Parse one slice into releases, look up real names, save.
 async fn save_slice(pool: &Arc<Pool>, db: &Db, group: &str, headers: Vec<Overview>) -> Result<Progress> {
     let articles = headers.len() as i64;
+    crate::profile::SLICES.add(1);
+    crate::profile::HEADERS.add(articles as u64);
 
     // parsing is cpu work, keep it off the async threads
+    let t = std::time::Instant::now();
     let mut releases: Vec<Release> =
         tokio::task::spawn_blocking(move || group_articles(headers_to_articles(headers)).into_values().collect())
             .await
             .map_err(|e| anyhow!("parse task failed: {e}"))?;
+    crate::profile::PARSE.add_since(t);
+    crate::profile::Load::add_since(&crate::profile::LOAD.parse_ns, t);
 
     // real names from par2/nfo bodies, every release looked up concurrently
+    let t = std::time::Instant::now();
     let jobs = releases.iter().map(name_sources).collect();
     let names = first_names(pool.clone(), jobs).await;
+    crate::profile::NAMES.add_since(t);
 
     let mut bytes = 0;
     for (i, release) in releases.iter_mut().enumerate() {
@@ -390,7 +521,7 @@ async fn save_slice(pool: &Arc<Pool>, db: &Db, group: &str, headers: Vec<Overvie
     }
 
     let count = releases.len() as i64;
-    on_db(db, move |conn| Ok(db::save_releases_bulk_with(conn, &releases)?)).await?;
+    db.save(releases).await?;
 
     Ok(Progress { articles, bytes, releases: count })
 }

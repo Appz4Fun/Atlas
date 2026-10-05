@@ -14,7 +14,7 @@ use crate::atomic::write_atomic;
 use crate::config::{Config, UsenetServer, load_config};
 use crate::db;
 use crate::indexer::{Db, PassContext, PassSettings, Progress, RunStates, run_pass, shared_db};
-use crate::nntp::Pool;
+use crate::nntp::{Pool, unless_stopped};
 use crate::paths;
 use crate::sab;
 use crate::ui;
@@ -79,7 +79,16 @@ struct Stats {
     groups_indexed: HashSet<String>,
     error_count: u32,
     group_stats: BTreeMap<String, GroupStats>,
+    /// headers and post bytes per RATE_BIN seconds, oldest first, RATE_KEEP long
+    rate: std::collections::VecDeque<(i64, i64, i64)>,
+    /// extra fields for stats.json (servers, groups configured, workers)
+    extra: serde_json::Map<String, serde_json::Value>,
 }
+
+/// headers/s is kept in buckets this many seconds wide...
+pub const RATE_BIN: i64 = 10;
+/// ...for this long
+const RATE_KEEP: i64 = 6 * 3600;
 
 impl Stats {
     fn new() -> Self {
@@ -92,11 +101,26 @@ impl Stats {
             groups_indexed: HashSet::new(),
             error_count: 0,
             group_stats: BTreeMap::new(),
+            rate: std::collections::VecDeque::new(),
+            extra: serde_json::Map::new(),
         }
     }
 
     fn tick(&mut self, articles: i64, bytes: i64, releases: i64, group: &str) {
         let t = now();
+
+        let bin = t as i64 / RATE_BIN * RATE_BIN;
+        match self.rate.back_mut() {
+            Some(last) if last.0 == bin => {
+                last.1 += articles;
+                last.2 += bytes;
+            }
+            _ => self.rate.push_back((bin, articles, bytes)),
+        }
+        while self.rate.front().is_some_and(|f| f.0 < bin - RATE_KEEP) {
+            self.rate.pop_front();
+        }
+
         self.total_articles += articles;
         self.total_bytes += bytes;
         self.total_releases += releases;
@@ -166,7 +190,13 @@ impl Stats {
             "avg_byte_speed": avg_b,
             "db_size": db_size,
             "groups": groups,
+            "rate_bin": RATE_BIN,
+            "rate": self.rate.iter().map(|(t, a, b)| [*t, *a, *b]).collect::<Vec<_>>(),
         });
+        let mut data = data;
+        if let Some(map) = data.as_object_mut() {
+            map.extend(self.extra.clone());
+        }
 
         let _ = write_atomic(&paths::stats_file(), data.to_string());
     }
@@ -351,7 +381,13 @@ impl Scheduler {
         };
 
         write_status(true, &groups_label(&groups, self.workers), &mode, idle, status, false, errors);
-        self.stats.lock().unwrap().write("", &mode, true, idle);
+        let mut stats = self.stats.lock().unwrap();
+        stats.extra.insert("servers".into(), json!(self.ctx.pool.server_stats()));
+        stats.extra.insert("groups_configured".into(), json!(groups.len()));
+        stats.extra.insert("workers".into(), json!(self.workers));
+        stats.extra.insert("pid".into(), json!(std::process::id()));
+        stats.extra.insert("load".into(), crate::profile::LOAD.snapshot());
+        stats.write("", &mode, true, idle);
     }
 }
 
@@ -369,7 +405,11 @@ async fn worker(sched: Arc<Scheduler>, server: usize, db: Db) {
         let stats = sched.stats.clone();
         let mut progress = |p: &Progress| stats.lock().unwrap().tick(p.articles, p.bytes, p.releases, &group);
 
-        let result = run_pass(&sched.ctx, &settings, &db, &group, server, &mut progress).await;
+        // stopping drops a pass stuck on the network too (GROUP, a login, a name
+        // lookup). safe: db writes run whole on their own thread and the cursor
+        // only moves once a range is complete
+        let pass = run_pass(&sched.ctx, &settings, &db, &group, server, &mut progress);
+        let Some(result) = unless_stopped(&sched.ctx.stop, pass).await else { break };
         sched.finish(&group, result);
     }
 }
@@ -413,9 +453,15 @@ async fn watch_config(sched: Arc<Scheduler>, servers: Vec<UsenetServer>) {
 }
 
 /// status.json / stats.json once a second for the menu and dashboard
+/// (plus a timing breakdown every 30s with ATLAS_PROFILE)
 async fn report(sched: Arc<Scheduler>) {
+    let mut last_profile = Instant::now();
     while !sched.stopping() {
         sched.write_status();
+        if crate::profile::enabled() && last_profile.elapsed() >= Duration::from_secs(30) {
+            println!("{}", crate::profile::report(last_profile.elapsed().as_secs_f64()));
+            last_profile = Instant::now();
+        }
         nap(Duration::from_secs(1), || sched.stopping()).await;
     }
 }
@@ -455,13 +501,17 @@ async fn run_servers(
         passes: AtomicUsize::new(0),
     });
 
-    let db = match db::open() {
+    let db = match db::open().and_then(|conn| db::tune_for_writing(&conn).map(|_| conn)) {
         Ok(conn) => shared_db(conn),
         Err(e) => {
             ui::error(&format!("couldnt open database: {e}"));
             return;
         }
     };
+
+    // checkpoints off the writer's path, see db::checkpointer
+    let checkpoint_stop = Arc::new(AtomicBool::new(false));
+    let checkpointer = db::checkpointer(checkpoint_stop.clone());
 
     let mut tasks = tokio::task::JoinSet::new();
     for &(server, count) in &plan {
@@ -478,6 +528,9 @@ async fn run_servers(
             sched.wind_down.store(true, Ordering::Relaxed);
         }
     }
+
+    checkpoint_stop.store(true, Ordering::Relaxed);
+    let _ = tokio::task::spawn_blocking(move || checkpointer.join()).await;
 }
 
 async fn supervise(stop: Arc<AtomicBool>, stats: Arc<Mutex<Stats>>) {
@@ -531,6 +584,28 @@ pub fn run() -> i32 {
     if let Err(e) = db::create_db() {
         ui::error(&format!("couldnt open database: {e}"));
         return 1;
+    }
+
+    // one time move of an older database into the shards, here and not in the
+    // menu because it takes a while on a big one. the menu shows the progress
+    let main = paths::database();
+    if crate::convert::needed(&main) {
+        let report = |msg: &str| {
+            println!("{msg}");
+            write_status(true, msg, &config.index_mode, false, "running", false, 0);
+        };
+        match crate::convert::run(&main, &report) {
+            Ok(_) => {}
+            Err(e) => {
+                ui::error(&format!("couldnt convert the database, nothing was changed: {e:#}"));
+                write_status(false, "", &config.index_mode, false, "stopped", true, 1);
+                return 1;
+            }
+        }
+        if let Err(e) = db::create_db() {
+            ui::error(&format!("couldnt open the converted database: {e}"));
+            return 1;
+        }
     }
 
     let stop = Arc::new(AtomicBool::new(false));

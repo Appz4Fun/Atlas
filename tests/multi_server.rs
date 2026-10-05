@@ -60,7 +60,7 @@ fn failover_and_parallel_requests() {
     assert_eq!(reported, 3000, "progress hears about every slice");
     assert_eq!(busy.compressed_sent.load(Ordering::SeqCst), 12, "every XOVER should come back compressed");
 
-    let conn = db::open_at(&db_path).unwrap();
+    let conn = db::open_with_shards(&db_path).unwrap();
     let releases: i64 = conn.query_row("select count(*) from releases", [], |r| r.get(0)).unwrap();
     assert_eq!(releases, 3000);
 
@@ -100,7 +100,7 @@ fn broken_compression_falls_back_to_plain() {
     indexer.request_size = 10;
     index_until_idle(&mut indexer);
 
-    let conn = db::open_at(&db_path).unwrap();
-    let n: i64 = conn.query_row("select count(*) from articles", [], |r| r.get(0)).unwrap();
-    assert_eq!(n, 40);
+    let conn = db::open_with_shards(&db_path).unwrap();
+    let (_, articles) = atlas::store::totals(&conn).unwrap();
+    assert_eq!(articles, 40);
 }

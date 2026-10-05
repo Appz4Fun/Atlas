@@ -1,4 +1,9 @@
-use std::collections::{BTreeSet, HashMap};
+//! The main database (`atlas.db`): per group cursors and the release id
+//! counter. Releases and their articles live in the shards next to it, see
+//! store.rs. A database from before the shards still holds everything in
+//! `atlas.db` until convert.rs moves it over.
+
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
 use std::time::Duration;
@@ -7,11 +12,20 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::parser::Release;
 use crate::paths;
+use crate::store;
 
 pub type Result<T> = rusqlite::Result<T>;
 
+/// The main database with every shard attached (s0 .. s7), for reads across them.
 pub fn open() -> Result<Connection> {
-    open_at(&paths::database())
+    open_with_shards(&paths::database())
+}
+
+/// The main database at `path` with its shards attached, see `open`.
+pub fn open_with_shards(path: &Path) -> Result<Connection> {
+    let conn = open_at(path)?;
+    store::attach(&conn, path)?;
+    Ok(conn)
 }
 
 pub fn open_at(path: &Path) -> Result<Connection> {
@@ -26,6 +40,73 @@ pub fn open_at(path: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
+/// Tune a connection for heavy indexing writes: a big page cache, no
+/// checkpointing on commit (`checkpointer` copies the WAL into the main file on
+/// its own thread, `finish_checkpoint` lets the WAL start over), and a WAL file
+/// cut back to 256MB whenever it starts over.
+pub fn tune_for_writing(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "pragma cache_size = -262144;
+         pragma temp_store = memory;
+         pragma wal_autocheckpoint = 0;
+         pragma journal_size_limit = 268435456;",
+    )
+}
+
+/// For the writer, between transactions: copy what `checkpointer` hasnt yet
+/// into the main file. With no write in progress it can copy everything, soo
+/// the next transaction starts the WAL over instead of growing it. Mostly
+/// quick, the background checkpointer has done the bulk of it already.
+pub fn finish_checkpoint(conn: &Connection) -> Result<()> {
+    conn.query_row("pragma wal_checkpoint(passive)", [], |_| Ok(()))
+}
+
+/// Background WAL checkpoints for a writer tuned with `tune_for_writing`.
+/// Passive checkpoints never block readers or the writer, soo copying the WAL
+/// into the main file happens alongside the writes. They never let the WAL
+/// start over on their own (the writer keeps adding to it); the writer does
+/// that with `finish_checkpoint`. A blocking checkpoint stalls the writer for
+/// as long as it copies (20s for a 1.5GB WAL), soo it is only a last resort
+/// when the WAL got huge anyway. Runs until `stop` is set.
+pub fn checkpointer(stop: std::sync::Arc<std::sync::atomic::AtomicBool>) -> std::thread::JoinHandle<()> {
+    use std::sync::atomic::Ordering;
+
+    std::thread::spawn(move || {
+        // the main database and every shard
+        let main = paths::database();
+        let files: Vec<std::path::PathBuf> = std::iter::once(main.clone()).chain(store::shard_paths(&main)).collect();
+        let conns: Vec<(Connection, std::path::PathBuf)> =
+            files.iter().filter(|p| p.exists()).filter_map(|p| open_at(p).ok().map(|c| (c, wal_path(p)))).collect();
+
+        let stopping = || stop.load(Ordering::Relaxed);
+        while !stopping() {
+            // twice a second, looking at `stop` in between soo stopping doesnt wait out the nap
+            for _ in 0..5 {
+                if stopping() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            for (conn, wal) in &conns {
+                let big = fs::metadata(wal).is_ok_and(|m| m.len() > 8 << 30);
+                let mode = if big { "truncate" } else { "passive" };
+                let _ = conn.query_row(&format!("pragma wal_checkpoint({mode})"), [], |_| Ok(()));
+            }
+        }
+
+        // leave small wals behind
+        for (conn, _) in &conns {
+            let _ = conn.query_row("pragma wal_checkpoint(truncate)", [], |_| Ok(()));
+        }
+    })
+}
+
+fn wal_path(db: &Path) -> std::path::PathBuf {
+    let mut p = db.as_os_str().to_owned();
+    p.push("-wal");
+    std::path::PathBuf::from(p)
+}
+
 pub fn create_db() -> Result<()> {
     let path = paths::database();
     if let Some(parent) = path.parent() {
@@ -34,6 +115,9 @@ pub fn create_db() -> Result<()> {
     create_db_at(&path)
 }
 
+/// The main database and its shards, or brings an older one up to date. A
+/// database from before the shards is left as it is (apart from missing
+/// columns) for convert.rs; until then there are no shards.
 pub fn create_db_at(path: &Path) -> Result<()> {
     let conn = open_at(path)?;
 
@@ -41,22 +125,49 @@ pub fn create_db_at(path: &Path) -> Result<()> {
     conn.query_row("pragma journal_mode = wal", [], |_| Ok(()))?;
 
     conn.execute_batch(
-        "
-        create table if not exists releases (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT,
-            group_name TEXT,
-            poster TEXT,
-            posted_date TEXT,
-            size INTEGER,
-            complete INTEGER,
-            parts INTEGER,
-            file_total INTEGER,
-            display_name TEXT,
-            is_obfuscated INTEGER default 0
-        );
+        "create table if not exists groups(
+            name TEXT PRIMARY KEY,
+            live_cursor INTEGER,
+            backfill_cursor INTEGER
+        );",
+    )?;
 
-        create table if not exists articles (
+    // the server's first/last article numbers per group, for progress and ETA, and
+    // the post date at both ends of what has been indexed (article number + unix time)
+    let group_columns = columns(&conn, "groups")?;
+    for col in ["first_article", "last_article", "low_article", "low_posted", "high_article", "high_posted"] {
+        if !group_columns.contains(col) {
+            conn.execute(&format!("alter table groups add column {col} INTEGER"), [])?;
+        }
+    }
+
+    if has_old_layout(&conn)? {
+        return migrate_old(&conn);
+    }
+
+    store::create_main(&conn)?;
+    for shard in store::shard_paths(path) {
+        store::create_shard(&shard)?;
+    }
+    Ok(())
+}
+
+/// releases still in the main database, from before the shards
+pub fn has_old_layout(conn: &Connection) -> Result<bool> {
+    conn.prepare("select 1 from main.sqlite_master where type = 'table' and name = 'releases'")?.exists([])
+}
+
+fn columns(conn: &Connection, table: &str) -> Result<BTreeSet<String>> {
+    let mut stmt = conn.prepare(&format!("pragma table_info({table})"))?;
+    let cols = stmt.query_map([], |r| r.get::<_, String>(1))?.collect::<Result<_>>()?;
+    Ok(cols)
+}
+
+/// Old layout: columns its tables gained over time, soo the conversion can
+/// read every database the same way.
+fn migrate_old(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "create table if not exists articles (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             release_id INTEGER,
             message_id TEXT,
@@ -66,94 +177,10 @@ pub fn create_db_at(path: &Path) -> Result<()> {
             total_parts INTEGER,
             bytes INTEGER,
             file_total INTEGER,
-            foreign key (release_id) references releases(id),
             unique(release_id, message_id)
-        );
-
-        create table if not exists groups(
-            name TEXT PRIMARY KEY,
-            live_cursor INTEGER,
-            backfill_cursor INTEGER
-        );
-        ",
+        );",
     )?;
 
-    // old db files are missing columns, add em before indexing them
-    migrate(&conn)?;
-
-    conn.execute_batch(
-        "
-        create unique index if not exists idx_release_unique on releases(name, group_name);
-        create index if not exists idx_release_name on releases(name);
-        create index if not exists idx_release_group on releases(group_name);
-        create index if not exists idx_release_date on releases(posted_date);
-        create index if not exists idx_articles_release on articles(release_id);
-        ",
-    )?;
-
-    // external content fts over the posted name and the real name (from par2/nfo),
-    // the release data itself stays in releases
-    let fts_sql: Option<String> = conn
-        .query_row("select sql from sqlite_master where type = 'table' and name = 'releases_fts'", [], |r| r.get(0))
-        .optional()?;
-
-    // older dbs only indexed `name`, searching the real name then meant a full
-    // table scan (seconds on a big db). rebuild the index with both columns
-    let stale = fts_sql.as_deref().is_some_and(|sql| !sql.contains("display_name"));
-    if stale {
-        println!("updating the search index (one time, can take a minute on a big database)...");
-        conn.execute_batch(
-            "
-            drop trigger if exists releases_ai;
-            drop trigger if exists releases_ad;
-            drop trigger if exists releases_au;
-            drop table releases_fts;
-            ",
-        )?;
-    }
-
-    let fresh = fts_sql.is_none() || stale;
-    if fresh {
-        conn.execute_batch(
-            "create virtual table releases_fts using fts5(name, display_name, content='releases', content_rowid='id')",
-        )?;
-    }
-
-    // keep fts in sync with releases
-    conn.execute_batch(
-        "
-        create trigger if not exists releases_ai after insert on releases begin
-            insert into releases_fts(rowid, name, display_name) values (new.id, new.name, new.display_name);
-        end;
-
-        create trigger if not exists releases_ad after delete on releases begin
-            insert into releases_fts(releases_fts, rowid, name, display_name)
-                values ('delete', old.id, old.name, old.display_name);
-        end;
-
-        create trigger if not exists releases_au after update on releases begin
-            insert into releases_fts(releases_fts, rowid, name, display_name)
-                values ('delete', old.id, old.name, old.display_name);
-            insert into releases_fts(rowid, name, display_name) values (new.id, new.name, new.display_name);
-        end;
-        ",
-    )?;
-
-    if fresh {
-        // fill fts with whatever rows already exist
-        conn.execute("insert into releases_fts(releases_fts) values ('rebuild')", [])?;
-    }
-
-    Ok(())
-}
-
-fn columns(conn: &Connection, table: &str) -> Result<BTreeSet<String>> {
-    let mut stmt = conn.prepare(&format!("pragma table_info({table})"))?;
-    let cols = stmt.query_map([], |r| r.get::<_, String>(1))?.collect::<Result<_>>()?;
-    Ok(cols)
-}
-
-fn migrate(conn: &Connection) -> Result<()> {
     let release_columns = columns(conn, "releases")?;
     let add = |col: &str, ty: &str| -> Result<()> {
         if !release_columns.contains(col) {
@@ -229,7 +256,6 @@ fn rebuild_articles_unique(conn: &Connection) -> Result<()> {
             select id, release_id, message_id, subject, filename, part, total_parts, bytes, file_total from articles;
         drop table articles;
         alter table articles_new rename to articles;
-        create index if not exists idx_articles_release on articles(release_id);
         commit;
         ",
     )
@@ -238,165 +264,22 @@ fn rebuild_articles_unique(conn: &Connection) -> Result<()> {
     })
 }
 
-pub struct ReleaseStats {
-    pub size: i64,
-    pub complete: bool,
-    pub parts: i64,
-    pub file_total: Option<i64>,
-}
-
-fn release_stats(conn: &Connection, release_id: i64) -> Result<ReleaseStats> {
-    let mut stmt =
-        conn.prepare("select filename, part, total_parts, bytes, file_total from articles where release_id = ?")?;
-    let mut rows = stmt.query([release_id])?;
-
-    // filename -> [(part, total_parts)]
-    type Parts = Vec<(Option<i64>, Option<i64>)>;
-    let mut files: HashMap<Option<String>, Parts> = HashMap::new();
-    let mut size = 0;
-    let mut file_total: Option<i64> = None;
-
-    while let Some(row) = rows.next()? {
-        let filename: Option<String> = row.get(0)?;
-        let part: Option<i64> = row.get(1)?;
-        let total: Option<i64> = row.get(2)?;
-        let bytes: Option<i64> = row.get(3)?;
-        let ft: Option<i64> = row.get(4)?;
-
-        files.entry(filename).or_default().push((part, total));
-        size += bytes.unwrap_or(0);
-
-        if let Some(ft) = ft
-            && file_total.is_none_or(|cur| ft > cur)
-        {
-            file_total = Some(ft);
-        }
-    }
-
-    let parts = files.values().map(|f| f.len() as i64).sum();
-    let mut complete = true;
-
-    for file_parts in files.values() {
-        let Some(expected) = file_parts.iter().filter_map(|(_, t)| *t).max() else {
-            complete = false;
-            break;
-        };
-
-        let have: BTreeSet<i64> = file_parts.iter().filter_map(|(p, _)| *p).collect();
-        let want: BTreeSet<i64> = (1..=expected).collect();
-
-        if have != want {
-            complete = false;
-            break;
-        }
-    }
-
-    if complete
-        && let Some(ft) = file_total
-        && files.len() as i64 != ft
-    {
-        complete = false;
-    }
-
-    Ok(ReleaseStats { size, complete, parts, file_total })
-}
-
+/// Save releases from outside the indexer (AI search), each into its group's shard.
 pub fn save_releases_bulk(releases: &[Release]) -> Result<()> {
     if releases.is_empty() {
         return Ok(());
     }
-
-    let mut conn = open()?;
-    save_releases_bulk_with(&mut conn, releases)
-}
-
-/// Upsert releases + their articles in one transaction soo a half written
-/// batch rolls back.
-pub fn save_releases_bulk_with(conn: &mut Connection, releases: &[Release]) -> Result<()> {
-    let tx = conn.transaction()?;
-
-    {
-        let mut upsert = tx.prepare(
-            "insert into releases
-                (name, size, complete, group_name, poster, posted_date, display_name, is_obfuscated)
-                values (?, ?, ?, ?, ?, ?, ?, ?)
-                on conflict(name, group_name) do update set
-                poster = excluded.poster,
-                posted_date = excluded.posted_date,
-                display_name = coalesce(excluded.display_name, releases.display_name),
-                is_obfuscated = excluded.is_obfuscated
-                returning id",
-        )?;
-
-        let mut insert_article = tx.prepare(
-            "insert or ignore into articles
-                (release_id, message_id, subject, filename, part, total_parts, bytes, file_total)
-                values (?, ?, ?, ?, ?, ?, ?, ?)",
-        )?;
-
-        let mut update_stats =
-            tx.prepare("update releases set size = ?, complete = ?, parts = ?, file_total = ? where id = ?")?;
-
-        for release in releases {
-            let release_id: Option<i64> = upsert
-                .query_row(
-                    params![
-                        release.name,
-                        release.size,
-                        release.complete as i64,
-                        release.group,
-                        release.poster,
-                        release.date,
-                        release.display_name,
-                        release.is_obfuscated as i64,
-                    ],
-                    |r| r.get(0),
-                )
-                .optional()?;
-
-            let Some(release_id) = release_id else { continue };
-
-            let mut inserted = 0;
-            for a in release.articles.iter().filter(|a| !a.message_id.is_empty()) {
-                inserted += insert_article.execute(params![
-                    release_id,
-                    a.message_id,
-                    a.subject,
-                    a.filename,
-                    a.part,
-                    a.total_parts,
-                    a.bytes,
-                    a.file_total,
-                ])?;
-            }
-
-            if inserted == 0 {
-                continue;
-            }
-
-            let s = release_stats(&tx, release_id)?;
-            update_stats.execute(params![s.size, s.complete as i64, s.parts, s.file_total, release_id])?;
-        }
-    }
-
-    tx.commit()
+    store::save(&paths::database(), releases)
 }
 
 /// delete incomplete releases, returns bytes freed on disk
 pub fn purge_broken() -> Result<i64> {
-    let path = paths::database();
-    let before = fs::metadata(&path).map(|m| m.len() as i64).unwrap_or(0);
-
-    let conn = open()?;
-    conn.execute("delete from releases where complete = 0", [])?;
-    conn.execute("delete from articles where release_id not in (select id from releases)", [])?;
-
-    let _ = conn.query_row("pragma wal_checkpoint(truncate)", [], |_| Ok(()));
-    let _ = conn.execute_batch("vacuum");
-    drop(conn);
-
-    let after = fs::metadata(&path).map(|m| m.len() as i64).unwrap_or(0);
-    Ok(before - after)
+    let main = paths::database();
+    let size =
+        || store::shard_paths(&main).iter().map(|p| fs::metadata(p).map(|m| m.len() as i64).unwrap_or(0)).sum::<i64>();
+    let before = size();
+    store::purge_incomplete(&main)?;
+    Ok(before - size())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -427,6 +310,66 @@ pub fn init_group_state(conn: &Connection, group: &str, cursor: i64) -> Result<(
         params![group, cursor, cursor],
     )?;
     Ok(())
+}
+
+/// Remember the article numbers the server reported for a group (cursor key).
+pub fn save_group_bounds(conn: &Connection, group: &str, first: i64, last: i64) -> Result<()> {
+    conn.execute("update groups set first_article = ?, last_article = ? where name = ?", params![first, last, group])?;
+    Ok(())
+}
+
+/// An article number and when the articles around it were posted (unix time).
+pub type Dated = (i64, i64);
+
+/// Widen the dated ends of what has been indexed on a group (cursor key): `low`
+/// replaces the stored low end when it is further back, `high` the high end
+/// when it is further ahead.
+pub fn save_group_dates(conn: &Connection, group: &str, low: Dated, high: Dated) -> Result<()> {
+    // every right hand side sees the row as it was, soo each pair moves together
+    conn.execute(
+        "update groups set
+         low_article = case when low_article is null or ?1 < low_article then ?1 else low_article end,
+         low_posted = case when low_article is null or ?1 < low_article then ?2 else low_posted end,
+         high_article = case when high_article is null or ?3 > high_article then ?3 else high_article end,
+         high_posted = case when high_article is null or ?3 > high_article then ?4 else high_posted end
+         where name = ?5",
+        params![low.0, low.1, high.0, high.1, group],
+    )?;
+    Ok(())
+}
+
+/// One row of indexing progress: cursors, the server's article range and the
+/// dated ends of what has been indexed.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GroupProgress {
+    pub key: String,
+    pub live_cursor: i64,
+    pub backfill_cursor: i64,
+    pub first: Option<i64>,
+    pub last: Option<i64>,
+    pub low: Option<Dated>,
+    pub high: Option<Dated>,
+}
+
+pub fn group_progress(conn: &Connection) -> Result<Vec<GroupProgress>> {
+    let mut stmt = conn.prepare(
+        "select name, live_cursor, backfill_cursor, first_article, last_article,
+                low_article, low_posted, high_article, high_posted from groups
+         where live_cursor is not null and backfill_cursor is not null",
+    )?;
+    let pair = |a: Option<i64>, b: Option<i64>| a.zip(b);
+    stmt.query_map([], |r| {
+        Ok(GroupProgress {
+            key: r.get(0)?,
+            live_cursor: r.get(1)?,
+            backfill_cursor: r.get(2)?,
+            first: r.get(3)?,
+            last: r.get(4)?,
+            low: pair(r.get(5)?, r.get(6)?),
+            high: pair(r.get(7)?, r.get(8)?),
+        })
+    })?
+    .collect()
 }
 
 pub fn save_group_state(conn: &Connection, group: &str, state: GroupState) -> Result<()> {
@@ -461,47 +404,143 @@ pub fn update_backfill_cursor(conn: &Connection, group: &str, article: i64) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
-    fn old_name_only_index_gets_rebuilt_with_real_names() {
+    fn group_dates_only_ever_widen() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("atlas.db");
-
-        // a db from before display_name was indexed
-        {
-            let conn = open_at(&path).unwrap();
-            conn.execute_batch(
-                "
-                create table releases (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, group_name TEXT, poster TEXT,
-                    posted_date TEXT, size INTEGER, complete INTEGER, parts INTEGER, file_total INTEGER,
-                    display_name TEXT, is_obfuscated INTEGER default 0);
-                create virtual table releases_fts using fts5(name, content='releases', content_rowid='id');
-                create trigger releases_ai after insert on releases begin
-                    insert into releases_fts(rowid, name) values (new.id, new.name);
-                end;
-                insert into releases(name, display_name) values ('a1B2c3D4e5F6g7H8', 'Real.Movie.Name.2024');
-                ",
-            )
-            .unwrap();
-        }
-
         create_db_at(&path).unwrap();
+        let conn = open_at(&path).unwrap();
+        init_group_state(&conn, "g@news.x", 1000).unwrap();
+        save_group_bounds(&conn, "g@news.x", 1, 1000).unwrap();
+        let ends = || {
+            let p = group_progress(&conn).unwrap().remove(0);
+            (p.low, p.high)
+        };
+        assert_eq!(ends(), (None, None));
+
+        // first pass: the newest slice
+        save_group_dates(&conn, "g@news.x", (900, 9_000), (990, 9_900)).unwrap();
+        assert_eq!(ends(), (Some((900, 9_000)), Some((990, 9_900))));
+
+        // backfill reaches further back: only the low end moves, with its date
+        save_group_dates(&conn, "g@news.x", (500, 5_000), (800, 8_000)).unwrap();
+        assert_eq!(ends(), (Some((500, 5_000)), Some((990, 9_900))));
+
+        // a live pass: only the high end moves
+        save_group_dates(&conn, "g@news.x", (995, 9_950), (1000, 10_000)).unwrap();
+        assert_eq!(ends(), (Some((500, 5_000)), Some((1000, 10_000))));
+    }
+
+    fn art(file: &str, part: i64, total: i64, file_total: Option<i64>, id: &str) -> crate::parser::Article {
+        crate::parser::Article {
+            message_id: format!("<{id}@x>"),
+            subject: format!("\"{file}\" yEnc ({part}/{total})"),
+            filename: Some(file.into()),
+            part: Some(part),
+            total_parts: Some(total),
+            file_total,
+            bytes: 100,
+            ..Default::default()
+        }
+    }
+
+    fn slice(name: &str, articles: Vec<crate::parser::Article>) -> Vec<Release> {
+        vec![Release { name: name.into(), group: "alt.binaries.t".into(), articles, ..Default::default() }]
+    }
+
+    /// (size, complete, parts) of a release, from its shard
+    fn stats(main: &Path, name: &str) -> (i64, bool, i64) {
+        let conn = open_at(&store::shard_path(main, store::shard_of("alt.binaries.t"))).unwrap();
+        conn.query_row("select size, complete, parts from releases where name = ?", [name], |r| {
+            Ok((r.get(0)?, r.get::<_, i64>(1)? == 1, r.get(2)?))
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn stats_build_up_over_slices() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        create_db_at(&main).unwrap();
+        let save = |releases: &[Release]| store::save(&main, releases).unwrap();
+
+        // a.rar has 3 parts, b.rar 2, the post says 2 files
+        save(&slice("Rel", vec![art("a.rar", 1, 3, Some(2), "a1"), art("a.rar", 2, 3, Some(2), "a2")]));
+        assert_eq!(stats(&main, "Rel"), (200, false, 2));
+
+        let second = slice(
+            "Rel",
+            vec![
+                art("a.rar", 3, 3, Some(2), "a3"),
+                art("b.rar", 1, 2, Some(2), "b1"),
+                art("b.rar", 2, 2, Some(2), "b2"),
+            ],
+        );
+        save(&second);
+        assert_eq!(stats(&main, "Rel"), (500, true, 5));
+
+        // the same articles again change nothing
+        save(&second);
+        assert_eq!(stats(&main, "Rel"), (500, true, 5));
+
+        // a repost of a part under a new message id doesnt break completeness
+        save(&slice("Rel", vec![art("b.rar", 2, 2, Some(2), "b2-repost")]));
+        assert_eq!(stats(&main, "Rel"), (600, true, 6));
+
+        // a third file when the post said 2 makes it incomplete
+        save(&slice("Rel", vec![art("c.rar", 1, 1, Some(2), "c1")]));
+        assert!(!stats(&main, "Rel").1);
+
+        // the running totals and the nzb
+        let conn = open_at(&main).unwrap();
+        store::attach(&conn, &main).unwrap();
+        assert_eq!(store::totals(&conn).unwrap(), (1, 7));
+        let id: i64 = conn
+            .query_row(&format!("select id from s{}.releases", store::shard_of("alt.binaries.t")), [], |r| r.get(0))
+            .unwrap();
+        let rows = store::articles(&conn, id).unwrap();
+        let order: Vec<(String, i64, String)> =
+            rows.iter().map(|r| (r.filename.clone().unwrap(), r.part.unwrap(), r.message_id.clone())).collect();
+        assert_eq!(order[0], ("a.rar".into(), 1, "<a1@x>".into()));
+        assert_eq!(order[4], ("b.rar".into(), 2, "<b2-repost@x>".into()), "ties in message-id order");
+        assert_eq!(rows.iter().map(|r| r.bytes.unwrap()).sum::<i64>(), 700);
+    }
+
+    #[test]
+    fn stats_updates_leave_the_search_index_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("atlas.s0.db");
+        store::create_shard(&path).unwrap();
         let conn = open_at(&path).unwrap();
         let hits = |q: &str| -> i64 {
             conn.query_row("select count(*) from releases_fts where releases_fts match ?", [q], |r| r.get(0)).unwrap()
         };
 
-        assert_eq!(hits("\"Real\"* AND \"Movie\"*"), 1, "real name searchable after the rebuild");
-        assert_eq!(hits("\"a1B2c3D4e5F6g7H8\""), 1, "posted name still searchable");
+        conn.execute("insert into releases (id, name, group_name) values (8, 'Some.Thing', 'g')", []).unwrap();
+        let changes =
+            |conn: &Connection| -> i64 { conn.query_row("select total_changes()", [], |r| r.get(0)).unwrap() };
 
-        // new rows and updates keep both columns in sync
-        conn.execute("insert into releases(name, display_name) values ('xyz', 'Another.Show.S01E01')", []).unwrap();
-        assert_eq!(hits("\"S01E01\"*"), 1);
-        conn.execute("update releases set display_name = 'Renamed.Thing' where name = 'xyz'", []).unwrap();
-        assert_eq!(hits("\"S01E01\"*"), 0);
-        assert_eq!(hits("\"Renamed\"*"), 1);
+        let before = changes(&conn);
+        conn.execute("update releases set size = 5, parts = 1, complete = 1 where name = 'Some.Thing'", []).unwrap();
+        assert_eq!(changes(&conn) - before, 1, "only the release row changes, no fts rows");
 
-        // running it again leaves a current index alone
-        create_db_at(&path).unwrap();
+        conn.execute("update releases set display_name = 'Real.Name' where name = 'Some.Thing'", []).unwrap();
+        assert_eq!(hits("\"Real\"*"), 1);
+        assert_eq!(hits("\"Some\"*"), 1);
+    }
+
+    #[test]
+    fn new_databases_get_shards_old_ones_wait_for_the_conversion() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        create_db_at(&main).unwrap();
+        assert!(store::exists(&main));
+        assert!(!has_old_layout(&open_at(&main).unwrap()).unwrap());
+
+        let old = dir.path().join("old.db");
+        open_at(&old).unwrap().execute_batch("create table releases (id INTEGER PRIMARY KEY, name TEXT)").unwrap();
+        create_db_at(&old).unwrap();
+        assert!(has_old_layout(&open_at(&old).unwrap()).unwrap());
+        assert!(!store::shard_path(&old, 0).exists(), "no shards until it is converted");
     }
 }

@@ -95,42 +95,49 @@ fn draw(f: &mut Frame, s: &Value) {
 }
 
 fn draw_speed(f: &mut Frame, s: &Value, area: Rect) {
-    // bytes indexed per second between consecutive history points
-    let points: Vec<(f64, f64)> = s["history"]
+    // headers per second in fixed time bins over the last 30 minutes, gaps are zero
+    let bin = s["rate_bin"].as_i64().unwrap_or(10).max(1);
+    let window = 30 * 60;
+    let bins: std::collections::HashMap<i64, f64> = s["rate"]
         .as_array()
-        .map(|h| h.iter().map(|x| (x["t"].as_f64().unwrap_or(0.0), x["b"].as_f64().unwrap_or(0.0))).collect())
+        .map(|a| a.iter().filter_map(|r| Some((r.get(0)?.as_i64()?, r.get(1)?.as_f64()?))).collect())
         .unwrap_or_default();
-
-    let mut rate: Vec<(f64, f64)> = points
-        .windows(2)
-        .enumerate()
-        .map(|(i, w)| {
-            let dt = w[1].0 - w[0].0;
-            (i as f64, if dt > 0.0 { w[1].1 / dt } else { 0.0 })
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0) / bin * bin;
+    let rate: Vec<(f64, f64)> = (0..=window / bin)
+        .map(|i| {
+            let t = now - window + i * bin;
+            ((t - now) as f64 / 60.0, bins.get(&t).copied().unwrap_or(0.0) / bin as f64)
         })
         .collect();
-    if rate.len() < 2 {
-        rate = vec![(0.0, 0.0), (1.0, 0.0)];
-    }
 
     let max_y = rate.iter().map(|p| p.1).fold(1.0, f64::max);
-    let max_x = (rate.len() - 1) as f64;
+    let uptime = s["uptime"].as_f64().unwrap_or(0.0).max(1.0);
+    let avg = s["total_articles"].as_f64().unwrap_or(0.0) / uptime;
+    let peak = bins.values().fold(0.0, |m: f64, h| m.max(h / bin as f64));
 
-    let block = panel("throughput").title_bottom(
+    let block = panel("headers/s, last 30 minutes").title_bottom(
         Line::from(format!(
-            " avg {}/s   peak {}/s ",
-            human_bytes(s["avg_byte_speed"].as_f64().unwrap_or(0.0)),
-            human_bytes(s["peak_byte_speed"].as_f64().unwrap_or(0.0))
+            " avg {}/s   peak {}/s   data {}/s ",
+            crate::stats_dashboard::count(avg as i64),
+            crate::stats_dashboard::count(peak as i64),
+            human_bytes(s["avg_byte_speed"].as_f64().unwrap_or(0.0))
         ))
         .dim(),
     );
 
     let dataset = Dataset::default().marker(Marker::Braille).graph_type(GraphType::Line).cyan().data(&rate);
-    let chart = Chart::new(vec![dataset]).block(block).x_axis(Axis::default().bounds([0.0, max_x.max(1.0)])).y_axis(
-        Axis::default()
-            .bounds([0.0, max_y])
-            .labels(vec![Span::raw("0").dim(), Span::raw(format!("{}/s", human_bytes(max_y))).dim()]),
-    );
+    let chart = Chart::new(vec![dataset])
+        .block(block)
+        .x_axis(
+            Axis::default()
+                .bounds([-(window as f64) / 60.0, 0.0])
+                .labels(vec![Span::raw("-30m").dim(), Span::raw("now").dim()]),
+        )
+        .y_axis(
+            Axis::default()
+                .bounds([0.0, max_y])
+                .labels(vec![Span::raw("0").dim(), Span::raw(crate::stats_dashboard::count(max_y as i64)).dim()]),
+        );
 
     f.render_widget(chart, area);
 }
@@ -229,9 +236,14 @@ mod tests {
         assert!(text.contains("alt.binaries.test"));
         assert!(text.contains("running"));
 
-        let fast = serde_json::json!({"avg_byte_speed": 1382195856.6, "peak_byte_speed": 4682519700.9});
+        // headers/s from the 10s rate bins, not bytes between history points
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64 / 10 * 10;
+        let fast = serde_json::json!({
+            "uptime": 100, "total_articles": 3_700_000, "avg_byte_speed": 1382195856.6, "rate_bin": 10,
+            "rate": [[now - 10, 400_000, 0], [now - 20, 300_000, 0]]
+        });
         term.draw(|f| draw(f, &fast)).unwrap();
         let text: String = term.backend().buffer().content().iter().map(|c| c.symbol()).collect();
-        assert!(text.contains("avg 1.3GB/s   peak 4.4GB/s"), "{text}");
+        assert!(text.contains("avg 37,000/s   peak 40,000/s   data 1.3GB/s"), "{text}");
     }
 }

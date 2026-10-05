@@ -48,6 +48,13 @@ pub struct Server {
     pub refused: AtomicUsize,
     /// answer GROUP with 501, like an article only (fill / bonus) server
     pub no_group: bool,
+    /// the next `stalls_left` XOVERs sit on their reply for `stall`, like a
+    /// provider that stops answering mid request; `stalled` counts the ones waiting
+    pub stall: Duration,
+    pub stalls_left: AtomicUsize,
+    pub stalled: AtomicUsize,
+    /// connections ever accepted
+    pub accepted: AtomicUsize,
 }
 
 impl Server {
@@ -70,6 +77,10 @@ impl Server {
             max_conns: 0,
             refused: AtomicUsize::new(0),
             no_group: false,
+            stall: Duration::ZERO,
+            stalls_left: AtomicUsize::new(0),
+            stalled: AtomicUsize::new(0),
+            accepted: AtomicUsize::new(0),
         })
     }
 }
@@ -124,6 +135,7 @@ pub fn post(number: u64, subject: &str, bytes: u64, body: Vec<Vec<u8>>) -> Post 
 }
 
 pub fn handle(stream: TcpStream, state: Arc<Server>) {
+    state.accepted.fetch_add(1, Ordering::SeqCst);
     let now_open = state.open.fetch_add(1, Ordering::SeqCst) + 1;
     state.peak.fetch_max(now_open, Ordering::SeqCst);
 
@@ -190,6 +202,11 @@ pub fn serve(stream: TcpStream, state: &Server, over_limit: bool) {
                 state.xovers.fetch_add(1, Ordering::SeqCst);
                 state.groups_seen.lock().unwrap().insert(selected.clone().unwrap_or_default());
                 thread::sleep(state.xover_delay);
+                if state.stalls_left.try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok() {
+                    state.stalled.fetch_add(1, Ordering::SeqCst);
+                    thread::sleep(state.stall);
+                    state.stalled.fetch_sub(1, Ordering::SeqCst);
+                }
                 state.xovers_in_flight.fetch_sub(1, Ordering::SeqCst);
                 let (a, b) = arg.split_once('-').unwrap();
                 let (a, b): (u64, u64) = (a.parse().unwrap(), b.parse().unwrap());

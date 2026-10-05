@@ -102,6 +102,15 @@ fn every_server_indexes_groups_in_parallel() {
     let keys: i64 = db.query_row("select count(*) from groups", [], |r| r.get(0)).unwrap();
     assert_eq!(keys, GROUPS as i64);
 
+    // every row knows its article range and the dated ends of what was indexed
+    // (the stats dashboard's progress and history numbers)
+    for row in atlas::db::group_progress(&db).unwrap() {
+        assert_eq!((row.first, row.last), (Some(1), Some(300)), "{row:?}");
+        let (low, high) = (row.low.expect("low end"), row.high.expect("high end"));
+        assert!(low.0 <= high.0 && (1..=300).contains(&low.0) && (1..=300).contains(&high.0), "{row:?}");
+        assert!(low.1 > 0 && low.1 == high.1, "the mock posts everything at one moment: {row:?}");
+    }
+
     // several groups at once per server, never more connections than allowed
     let overlap = servers.iter().take(3).map(|s| s.xover_peak.load(Ordering::SeqCst)).max().unwrap();
     assert!(overlap >= 2, "groups never overlapped on a server (peak {overlap})");

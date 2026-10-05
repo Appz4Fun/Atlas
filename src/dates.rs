@@ -162,26 +162,26 @@ pub fn pub_date(value: &str) -> String {
     format_rfc2822(&Utc::now().fixed_offset(), false)
 }
 
-/// Stored release date -> unix timestamp for the nzb `date` attribute.
-/// Naive dates are local time, same as python's datetime.timestamp().
+/// Stored release date -> unix timestamp for the nzb `date` attribute, now
+/// when it cant be read.
 pub fn article_timestamp(value: &str) -> i64 {
+    posted_timestamp(value).unwrap_or_else(|| Utc::now().timestamp())
+}
+
+/// A header or stored date -> unix timestamp, None when it cant be read.
+/// Naive dates are local time, same as python's datetime.timestamp().
+pub fn posted_timestamp(value: &str) -> Option<i64> {
     if let Some((dt, offset)) = parse_rfc2822(value) {
         let ts = match offset.and_then(FixedOffset::east_opt) {
             Some(tz) => tz.from_local_datetime(&dt).single().map(|d| d.timestamp()),
             None => Local.from_local_datetime(&dt).earliest().map(|d| d.timestamp()),
         };
-        if let Some(ts) = ts {
+        if ts.is_some() {
             return ts;
         }
     }
 
-    if let Some(dt) = parse_iso(value)
-        && let Some(local) = Local.from_local_datetime(&dt).earliest()
-    {
-        return local.timestamp();
-    }
-
-    Utc::now().timestamp()
+    parse_iso(value).and_then(|dt| Local.from_local_datetime(&dt).earliest()).map(|d| d.timestamp())
 }
 
 #[cfg(test)]

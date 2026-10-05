@@ -35,6 +35,7 @@ Thumbs.db
 /config.json.bak*
 # usenet logins to merge into config.json
 /news.txt
+/stats_cache.json
 
 # --- docker stack (docker/docker_compose.yml) ---
 # docker/config.json gets your usenet logins, docker/config.example.json is the template
@@ -45,6 +46,9 @@ docker/prowlarr-config/
 docker/sabnzbd-config/
 atlas.db
 atlas.db-*
+# the shards, and files the conversion and compaction leave while they run
+atlas.*.db
+atlas.*.db-*
 status.json
 stats.json
 *.json.tmp
@@ -54,6 +58,7 @@ bg_index.log.old
 sabnzbd.log
 sabnzbd.log.old
 atlas.log
+compact.log
 profile.json
 
 # --- leftovers from the python version ---

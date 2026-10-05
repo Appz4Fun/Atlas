@@ -4,8 +4,9 @@
 use std::fmt;
 use std::future::Future;
 use std::io;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
+use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
@@ -154,6 +155,29 @@ fn refusal(e: &NntpError) -> Refusal {
 const STREAM_END_WAIT: Duration = Duration::from_secs(2);
 /// after a failed connect a server is skipped for this long (connect() still tries it)
 const DOWN_FOR: Duration = Duration::from_secs(60);
+/// how often a request in flight looks at the stop flag
+const STOP_POLL: Duration = Duration::from_millis(50);
+
+/// `fut`'s output, or None as soon as `stop` is set: stopping doesnt wait on
+/// a provider that went quiet mid reply. Dropping a request part way is safe,
+/// its lease throws the connection away instead of reusing it.
+pub async fn unless_stopped<F: Future>(stop: &AtomicBool, fut: F) -> Option<F::Output> {
+    let mut fut = std::pin::pin!(fut);
+    let mut tick = tokio::time::interval(STOP_POLL);
+
+    std::future::poll_fn(|cx| {
+        // a reply that made it is kept even when stop came in at the same time
+        if let Poll::Ready(out) = fut.as_mut().poll(cx) {
+            return Poll::Ready(Some(out));
+        }
+        if stop.load(Ordering::Relaxed) {
+            return Poll::Ready(None);
+        }
+        while tick.poll_tick(cx).is_ready() {}
+        Poll::Pending
+    })
+    .await
+}
 
 fn timed_out() -> NntpError {
     NntpError::Io(io::Error::new(io::ErrorKind::TimedOut, "timed out"))
@@ -177,6 +201,10 @@ pub struct Conn {
     pub group: Option<String>,
     /// server agreed to XFEATURE COMPRESS GZIP on this connection
     pub compressed: bool,
+    /// bytes received off the socket, and the same after decompression,
+    /// since the pool last collected them
+    wire: u64,
+    text: u64,
 }
 
 impl Conn {
@@ -224,7 +252,14 @@ impl Conn {
     }
 
     fn over(stream: Box<dyn AsyncStream>, timeout: Duration) -> Conn {
-        Conn { io: BufReader::with_capacity(64 * 1024, stream), timeout, group: None, compressed: false }
+        Conn {
+            io: BufReader::with_capacity(64 * 1024, stream),
+            timeout,
+            group: None,
+            compressed: false,
+            wire: 0,
+            text: 0,
+        }
     }
 
     /// Next chunk of raw bytes from the socket.
@@ -237,6 +272,7 @@ impl Conn {
         }
 
         self.io.consume(chunk.len());
+        self.wire += chunk.len() as u64;
         Ok(chunk)
     }
 
@@ -268,6 +304,7 @@ impl Conn {
                         line.remove(0);
                     }
 
+                    self.text += line.len() as u64 + 2;
                     lines.push(line);
                 }
             }
@@ -317,6 +354,8 @@ impl Conn {
     async fn read_raw_line(&mut self) -> Result<Vec<u8>> {
         let mut buf = Vec::new();
         let n = with_timeout(self.timeout, self.io.read_until(b'\n', &mut buf)).await?;
+        self.wire += n as u64;
+        self.text += n as u64;
 
         if n == 0 {
             return Err(NntpError::Io(io::Error::new(io::ErrorKind::UnexpectedEof, "connection closed")));
@@ -629,6 +668,10 @@ struct Server {
     /// connections atlas currently allows itself (starts at `connections`,
     /// shrinks when the provider refuses more)
     limit: AtomicUsize,
+    /// for the stats dashboard
+    headers: AtomicU64,
+    wire: AtomicU64,
+    text: AtomicU64,
 }
 
 impl Server {
@@ -638,33 +681,76 @@ impl Server {
 }
 
 /// A connection borrowed from a server. Goes back to the idle list on drop
-/// unless an error left it unusable.
+/// unless an error left it unusable, or a request on it never finished.
 struct Lease {
     conn: Option<Conn>,
     server: Arc<Server>,
     _permit: OwnedSemaphorePermit,
+    /// a request was sent and its reply not fully read yet
+    busy: bool,
 }
 
 impl Lease {
-    fn conn(&mut self) -> &mut Conn {
+    fn new(conn: Conn, server: Arc<Server>, permit: OwnedSemaphorePermit) -> Lease {
+        Lease { conn: Some(conn), server, _permit: permit, busy: false }
+    }
+
+    /// The connection, for one request: `check` its result to end it. A
+    /// request dropped part way (stopping) never reaches `check`, soo the
+    /// lease knows the reply is still on the wire and throws the connection away.
+    fn begin(&mut self) -> &mut Conn {
+        self.busy = true;
         self.conn.as_mut().expect("lease without a connection")
     }
 
-    /// drop the connection when `r` broke it
+    fn group(&self) -> Option<&str> {
+        self.conn.as_ref().and_then(|c| c.group.as_deref())
+    }
+
+    /// end the request: drop the connection when `r` broke it
     fn check<T>(&mut self, r: Result<T>) -> Result<T> {
+        self.busy = false;
         if r.as_ref().err().is_some_and(NntpError::breaks_connection) {
+            self.collect_traffic();
             self.conn = None;
         }
         r
+    }
+
+    /// move the connection's byte counts onto its server
+    fn collect_traffic(&mut self) {
+        if let Some(c) = self.conn.as_mut() {
+            self.server.wire.fetch_add(std::mem::take(&mut c.wire), Ordering::Relaxed);
+            self.server.text.fetch_add(std::mem::take(&mut c.text), Ordering::Relaxed);
+        }
     }
 }
 
 impl Drop for Lease {
     fn drop(&mut self) {
-        if let Some(conn) = self.conn.take() {
+        self.collect_traffic();
+        // half a reply left unread would be the next request's answer
+        if let Some(conn) = self.conn.take().filter(|_| !self.busy) {
             self.server.idle.lock().unwrap().push(conn);
         }
     }
+}
+
+/// One server's numbers for the stats dashboard.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct ServerStat {
+    pub host: String,
+    pub priority: i64,
+    pub connections: u32,
+    /// what atlas allows itself now (lower than `connections` when the provider refused more)
+    pub limit: usize,
+    pub in_use: usize,
+    pub open: usize,
+    pub indexing: bool,
+    pub state: &'static str,
+    pub headers: u64,
+    pub wire_bytes: u64,
+    pub text_bytes: u64,
 }
 
 /// Several providers tried in priority order, each with up to `connections`
@@ -699,6 +785,9 @@ impl Pool {
                         warned_auth: AtomicBool::new(false),
                         warned_limit: AtomicBool::new(false),
                         limit: AtomicUsize::new(cfg.connections().max(1) as usize),
+                        headers: AtomicU64::new(0),
+                        wire: AtomicU64::new(0),
+                        text: AtomicU64::new(0),
                     })
                 })
                 .collect(),
@@ -820,7 +909,9 @@ impl Pool {
         let server = self.servers.get(i).cloned().ok_or_else(Self::no_servers)?;
 
         loop {
+            let waited = Instant::now();
             let permit = server.permits.clone().acquire_owned().await.expect("semaphore closed");
+            crate::profile::Load::add_since(&crate::profile::LOAD.lease_wait_ns, waited);
 
             let idle = {
                 let mut idle = server.idle.lock().unwrap();
@@ -831,7 +922,7 @@ impl Pool {
                 }
             };
             if let Some(conn) = idle {
-                return Ok(Lease { conn: Some(conn), server, _permit: permit });
+                return Ok(Lease::new(conn, server, permit));
             }
 
             if !force && server.down_until.lock().unwrap().is_some_and(|t| Instant::now() < t) {
@@ -844,7 +935,7 @@ impl Pool {
             let e = match Conn::open(&server.cfg, self.timeout, server.compress()).await {
                 Ok(conn) => {
                     *server.down_until.lock().unwrap() = None;
-                    return Ok(Lease { conn: Some(conn), server, _permit: permit });
+                    return Ok(Lease::new(conn, server, permit));
                 }
                 Err(e) => e,
             };
@@ -962,7 +1053,7 @@ impl Pool {
 
     async fn select_on(&self, i: usize, group: &str) -> Result<(u64, u64, u64, String)> {
         let mut lease = self.lease_for(i, Some(group), false).await?;
-        let r = lease.conn().select_group(group).await;
+        let r = lease.begin().select_group(group).await;
 
         // GROUP not supported at all: an article only (fill / bonus) server
         if let Err(e) = &r
@@ -1037,20 +1128,63 @@ impl Pool {
     async fn xover_once(&self, i: usize, group: &str, start: u64, end: u64) -> Result<Vec<Overview>> {
         let mut lease = self.lease_for(i, Some(group), false).await?;
 
-        if lease.conn().group.as_deref() != Some(group) {
-            let r = lease.conn().select_group(group).await;
+        if lease.group() != Some(group) {
+            let r = lease.begin().select_group(group).await;
             lease.check(r)?;
         }
 
-        let r = lease.conn().xover(start, end).await;
+        let sent = Instant::now();
+        let r = lease.begin().xover(start, end).await;
+        crate::profile::Load::add_since(&crate::profile::LOAD.xover_ns, sent);
+        crate::profile::LOAD.xovers.fetch_add(1, Ordering::Relaxed);
+        if let Ok(rows) = &r {
+            lease.server.headers.fetch_add(rows.len() as u64, Ordering::Relaxed);
+        }
         lease.check(r)
+    }
+
+    /// Per server numbers for the stats dashboard.
+    pub fn server_stats(&self) -> Vec<ServerStat> {
+        let indexing = self.indexing_servers();
+        self.servers
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let limit = s.limit.load(Ordering::Relaxed);
+                let in_use = limit.saturating_sub(s.permits.available_permits());
+                let down = s.down_until.lock().unwrap().is_some_and(|t| Instant::now() < t);
+                let state = if s.no_index.load(Ordering::Relaxed) {
+                    "article only"
+                } else if down && s.warned_auth.load(Ordering::Relaxed) {
+                    "login rejected"
+                } else if down {
+                    "resting"
+                } else {
+                    "ok"
+                };
+                ServerStat {
+                    host: s.cfg.host.clone(),
+                    priority: s.cfg.priority,
+                    connections: s.cfg.connections(),
+                    limit,
+                    in_use,
+                    open: in_use + s.idle.lock().unwrap().len(),
+                    indexing: indexing.contains(&i),
+                    state,
+                    headers: s.headers.load(Ordering::Relaxed),
+                    wire_bytes: s.wire.load(Ordering::Relaxed),
+                    text_bytes: s.text.load(Ordering::Relaxed),
+                }
+            })
+            .collect()
     }
 
     /// Fetch every `(start, end)` slice of `group` on `server` with
     /// up to `connections` requests in flight, sending each slice to the
     /// receiver the moment it arrives. A connection picks up the next slice as
     /// soon as it is free. No new slices are started once `stop` is set or a
-    /// slice fails with anything but 423 (empty) / 5xx (not available).
+    /// slice fails with anything but 423 (empty) / 5xx (not available), and
+    /// once `stop` is set the slices still in flight are dropped unsent.
     pub fn stream_headers(
         self: &Arc<Self>,
         group: &str,
@@ -1077,7 +1211,9 @@ impl Pool {
                     }
 
                     let Some((start, end)) = queue.lock().unwrap().pop_front() else { return };
-                    let result = pool.xover_on(i, &group, start, end).await;
+                    let Some(result) = unless_stopped(&stop, pool.xover_on(i, &group, start, end)).await else {
+                        return;
+                    };
 
                     if let Err(e) = &result
                         && e.code() != Some(423)
@@ -1158,7 +1294,7 @@ impl Pool {
                 }
             };
 
-            let r = lease.conn().body(message_id).await;
+            let r = lease.begin().body(message_id).await;
             match lease.check(r) {
                 Ok(body) => return Ok(body),
                 Err(e) => last_err = e,
@@ -1170,7 +1306,7 @@ impl Pool {
 
     pub async fn list_groups(&self, pattern: Option<&str>) -> Result<Vec<(String, u64)>> {
         let mut lease = self.lease(self.active_index(), false).await?;
-        let r = lease.conn().list_groups(pattern).await;
+        let r = lease.begin().list_groups(pattern).await;
         lease.check(r)
     }
 }
