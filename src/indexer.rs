@@ -455,7 +455,18 @@ async fn split_days(
         }
     }
 
+    let (newest_day, oldest_day) = clamp_days(newest_day, oldest_day, unix_day(chrono::Utc::now().timestamp()));
     Ok((carriers >= 2).then_some((newest_day, oldest_day, carriers)))
+}
+
+/// 2000-01-01: binary retention doesnt reach further back than this
+const SPLIT_OLDEST_DAY: i64 = 10_957;
+
+/// A split's (newest, oldest) days kept between 2000-01-01 and `today`, soo a
+/// forged Date header cant make thousands of empty chunks.
+fn clamp_days(newest_day: i64, oldest_day: i64, today: i64) -> (i64, i64) {
+    let newest = newest_day.clamp(SPLIT_OLDEST_DAY, today);
+    (newest, oldest_day.clamp(SPLIT_OLDEST_DAY, newest))
 }
 
 /// A day chunk's server doesnt carry its group (GROUP answered 411).
@@ -932,6 +943,15 @@ mod tests {
         assert_eq!(make_slices(5, 5, 100, false), vec![(5, 5)]);
         assert!(make_slices(6, 5, 100, false).is_empty());
         assert_eq!(make_slices(u64::MAX - 1, u64::MAX, 10, false), vec![(u64::MAX - 1, u64::MAX)]);
+    }
+
+    #[test]
+    fn split_days_stay_between_2000_and_today() {
+        let today = 20_400;
+        assert_eq!(clamp_days(20_000, 19_000, today), (20_000, 19_000), "sane dates stay");
+        assert_eq!(clamp_days(30_000, 19_000, today), (today, 19_000), "a date in the future");
+        assert_eq!(clamp_days(20_000, 0, today), (20_000, SPLIT_OLDEST_DAY), "a date from 1970");
+        assert_eq!(clamp_days(-5, -10, today), (SPLIT_OLDEST_DAY, SPLIT_OLDEST_DAY));
     }
 
     #[test]
