@@ -165,14 +165,7 @@ fn writer(shard: usize, path: &std::path::Path, ids: &crate::store::Ids, jobs: s
         let t = std::time::Instant::now();
         let result = match &mut opened {
             Ok(conn) => {
-                let saved = store.save(conn, ids, batch.iter().map(|job| job.releases.as_slice()));
-                let t = std::time::Instant::now();
-                let _ = store.seal_some(conn, chrono::Utc::now().timestamp());
-                Load::add_since(&LOAD.writer_seal_ns, t);
-                let t = std::time::Instant::now();
-                let _ = db::finish_checkpoint(conn);
-                Load::add_since(&LOAD.writer_checkpoint_ns, t);
-                saved.map_err(|e| e.to_string())
+                store.save(conn, ids, batch.iter().map(|job| job.releases.as_slice())).map_err(|e| e.to_string())
             }
             Err(e) => Err(format!("couldnt open {}: {e}", path.display())),
         };
@@ -180,9 +173,27 @@ fn writer(shard: usize, path: &std::path::Path, ids: &crate::store::Ids, jobs: s
         LOAD.writer_batches.fetch_add(1, Relaxed);
         LOAD.writer_slices.fetch_add(batch.len() as u64, Relaxed);
 
-        // the whole batch rolled back on an error, every slice in it failed
+        // the whole batch rolled back on an error, every slice in it failed.
+        // the save is committed by now: the slices dont wait for the housekeeping
+        let saved = result.is_ok();
         for job in batch {
             let _ = job.done.send(result.clone());
+        }
+
+        // housekeeping between transactions
+        if let Ok(conn) = &mut opened {
+            let t = std::time::Instant::now();
+            if saved {
+                let sealing = std::time::Instant::now();
+                if store.seal_some(conn, chrono::Utc::now().timestamp()).is_err() {
+                    LOAD.writer_seal_errors.fetch_add(1, Relaxed);
+                }
+                Load::add_since(&LOAD.writer_seal_ns, sealing);
+            }
+            let checkpointing = std::time::Instant::now();
+            let _ = db::finish_checkpoint(conn);
+            Load::add_since(&LOAD.writer_checkpoint_ns, checkpointing);
+            Load::add_since(&LOAD.writer_busy_ns, t);
         }
     }
 }

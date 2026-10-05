@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Instant;
 
-use rusqlite::{Connection, OptionalExtension, Result, params};
+use rusqlite::{Connection, OptionalExtension, Result, TransactionBehavior, params};
 
 use crate::db;
 use crate::parser::{Article, Release};
@@ -709,16 +709,22 @@ pub struct ShardWriter {
 /// files sealed per writer tick at most
 pub const SEAL_PER_TICK: usize = 2_000;
 
+/// a seal tick stops after this long, so the writer gets back to saving
+pub const SEAL_BUDGET: std::time::Duration = std::time::Duration::from_millis(100);
+
 impl ShardWriter {
     pub fn new(shard: usize) -> ShardWriter {
         ShardWriter { shard, domains: Domains::default(), seal_after: 0 }
     }
 
-    /// Seal up to SEAL_PER_TICK files that are due, walking the files table by
-    /// id from where the last tick stopped. At the end of the table it goes
-    /// back to the start. Not for use inside a save transaction.
+    /// Seal up to SEAL_PER_TICK files that are due, for at most SEAL_BUDGET,
+    /// walking the files table by id from where the last tick stopped. At the
+    /// end of the table it goes back to the start. A file that fails to seal
+    /// is counted and skipped. Not for use inside a save transaction.
+    /// Returns the files sealed.
     pub fn seal_some(&mut self, conn: &mut Connection, now: i64) -> Result<usize> {
-        let tx = conn.transaction()?;
+        let started = Instant::now();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let scan = SEAL_PER_TICK * 4;
         let (mut ids, mut last) = sealable(&tx, self.seal_after, scan, now)?;
         // nothing left after the cursor: start over from the first file
@@ -726,18 +732,27 @@ impl ShardWriter {
             (ids, last) = sealable(&tx, 0, scan, now)?;
         }
         // past the cap, the next tick picks up after the last one sealed
-        let next = if ids.len() > SEAL_PER_TICK {
+        if ids.len() > SEAL_PER_TICK {
             ids.truncate(SEAL_PER_TICK);
-            ids[SEAL_PER_TICK - 1]
-        } else {
-            last
-        };
-        for id in &ids {
-            seal_file(&tx, *id)?;
+            last = ids[SEAL_PER_TICK - 1];
+        }
+        let mut sealed = 0;
+        for (i, id) in ids.iter().enumerate() {
+            // out of time: the next tick picks up after the last one done
+            if i > 0 && started.elapsed() >= SEAL_BUDGET {
+                last = ids[i - 1];
+                break;
+            }
+            match seal_file(&tx, *id) {
+                Ok(segs) => sealed += usize::from(segs > 0),
+                Err(_) => {
+                    profile::LOAD.writer_seal_errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
         }
         tx.commit()?;
-        self.seal_after = next;
-        Ok(ids.len())
+        self.seal_after = last;
+        Ok(sealed)
     }
 
     /// Releases of this shard's groups, in one transaction. The same release
@@ -1477,5 +1492,30 @@ mod tests {
         conn.execute("update files set touched_at = ?", [now - SEAL_AGE - 1]).unwrap();
         assert_eq!(writer.seal_some(&mut conn, now).unwrap(), 1, "the stale one, after wrapping around");
         assert_eq!(writer.seal_some(&mut conn, now).unwrap(), 0);
+    }
+
+    #[test]
+    fn a_file_that_wont_seal_does_not_stop_the_tick() {
+        let (_dir, main) = sealed_fixture();
+        let shard = shard_of("alt.binaries.t");
+        let mut conn = db::open_at(&shard_path(&main, shard)).unwrap();
+        let mut writer = ShardWriter::new(shard);
+        let now = 2_000_000_000;
+        conn.execute("update files set touched_at = ?", [now - SEAL_AGE - 1]).unwrap();
+        // a.rar has rows and a blob nobody can decode
+        conn.execute("update files set blob = x'ff00ff' where filename = 'a.rar'", []).unwrap();
+        let rows = |c: &Connection, name: &str| -> i64 {
+            c.query_row(
+                "select count(*) from segments where file_id = (select id from files where filename = ?)",
+                [name],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(writer.seal_some(&mut conn, now).unwrap(), 1, "b.rar sealed, a.rar skipped");
+        assert_eq!(rows(&conn, "a.rar"), 3, "a.rar keeps its rows");
+        assert_eq!(rows(&conn, "b.rar"), 0);
+        let b: i64 = conn.query_row("select id from files where filename = 'b.rar'", [], |r| r.get(0)).unwrap();
+        assert_eq!(writer.seal_after, b, "the cursor went past the bad file");
     }
 }
