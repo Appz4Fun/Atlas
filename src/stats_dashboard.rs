@@ -83,8 +83,19 @@ struct Quick {
     releases_approx: i64,
     db_bytes: u64,
     wal_bytes: u64,
-    /// (group, done, total) for split groups' day chunks
-    chunks: Vec<(String, i64, i64)>,
+    /// split group stats: (groups, splitting, done, total, done_last_hour)
+    chunks: (i64, i64, i64, i64, i64),
+}
+
+fn load_chunks_stats(conn: &rusqlite::Connection) -> (i64, i64, i64, i64, i64) {
+    let now =
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+    let hour_ago = now - 3600;
+    let sql = "select count(*), coalesce(sum(pending > 0), 0), coalesce(sum(done), 0), coalesce(sum(total), 0), \
+               coalesce(sum(recent), 0)
+               from (select grp, sum(state != 2) as pending, sum(state = 2) as done, count(*) as total, \
+                     sum(state = 2 and claimed_at > ?) as recent from backfill_chunks group by grp)";
+    conn.query_row(sql, [hour_ago], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))).unwrap_or_default()
 }
 
 fn load_quick() -> Quick {
@@ -103,11 +114,7 @@ fn load_quick() -> Quick {
     q.progress = db::group_progress(&conn).unwrap_or_default();
     // running totals the shards keep, instant
     (q.releases_approx, q.articles_approx) = crate::store::totals(&conn).unwrap_or_default();
-    q.chunks = crate::chunks::split_groups(&conn)
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|g| crate::chunks::progress(&conn, &g).ok().map(|(d, t)| (g, d, t)))
-        .collect();
+    q.chunks = load_chunks_stats(&conn);
     q
 }
 
@@ -785,9 +792,19 @@ fn draw_backfill(f: &mut Frame, app: &App, area: Rect) {
         note("counts are article numbers, gaps on the server included"),
     ];
     let mut progress = progress;
-    if !quick.chunks.is_empty() {
-        let (done, total) = quick.chunks.iter().fold((0, 0), |(d, t), c| (d + c.1, t + c.2));
-        progress.push(kv("split groups", format!("{}, day chunks {done} of {total} done", quick.chunks.len())));
+    let (groups, splitting, done, total, done_last_hour) = quick.chunks;
+    if groups > 0 {
+        progress.push(kv(
+            "split groups",
+            format!(
+                "{} ({} in progress), day chunks {} of {} done, {} in the last hour",
+                groups,
+                splitting,
+                count(done),
+                count(total),
+                count(done_last_hour)
+            ),
+        ));
     }
     if b.unmeasured > 0 {
         progress.push(note(&format!("{} groups get their range on their next pass", count(b.unmeasured as i64))));
@@ -1389,10 +1406,7 @@ mod tests {
                              "limit": 10, "connections": 10, "headers": 900, "wire_bytes": 100, "text_bytes": 400}]
             }),
             status: serde_json::json!({"running": false}),
-            quick: Arc::new(Mutex::new(Quick {
-                chunks: vec![("alt.binaries.x".into(), 3, 10)],
-                ..Quick::default()
-            })),
+            quick: Arc::new(Mutex::new(Quick { chunks: (1, 0, 3, 10, 0), ..Quick::default() })),
             content: Arc::new(Mutex::new(ContentState {
                 data: Some(Content {
                     releases: 10,
@@ -1431,5 +1445,32 @@ mod tests {
                 _ => {}
             }
         }
+    }
+
+    #[test]
+    fn chunks_stats_aggregation() {
+        use rusqlite::Connection;
+        let conn = Connection::open_in_memory().unwrap();
+        crate::chunks::create(&conn).unwrap();
+        let now =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+
+        // g1: finish 3 chunks (all done)
+        crate::chunks::add(&conn, "g1", 100, 98).unwrap();
+        conn.execute("update backfill_chunks set state = 2 where grp = 'g1'", []).unwrap();
+        // g2: finish 1 recently (with recent claimed_at), claim 1 recently (2 chunks total, 1 done, 1 in progress)
+        crate::chunks::add(&conn, "g2", 200, 199).unwrap();
+        conn.execute("update backfill_chunks set state = 2, claimed_at = ? where grp = 'g2' and day = 200", [now])
+            .unwrap();
+        conn.execute("update backfill_chunks set state = 1, claimed_at = ? where grp = 'g2' and day = 199", [now])
+            .unwrap();
+
+        // 2 groups, 1 in progress (g2 has pending), 4 done total, 5 total, 1 done in last hour
+        let (groups, splitting, done, total, done_last_hour) = load_chunks_stats(&conn);
+        assert_eq!(groups, 2);
+        assert_eq!(splitting, 1); // 1 group with pending > 0 (g2)
+        assert_eq!(done, 4); // g1 has 3 done, g2 has 1 done
+        assert_eq!(total, 5); // 3 chunks for g1, 2 chunks for g2
+        assert_eq!(done_last_hour, 1); // 1 chunk in g2 finished recently (claimed_at is recent)
     }
 }
