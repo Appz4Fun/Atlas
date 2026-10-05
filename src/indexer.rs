@@ -167,6 +167,9 @@ fn writer(shard: usize, path: &std::path::Path, ids: &crate::store::Ids, jobs: s
             Ok(conn) => {
                 let saved = store.save(conn, ids, batch.iter().map(|job| job.releases.as_slice()));
                 let t = std::time::Instant::now();
+                let _ = store.seal_some(conn, chrono::Utc::now().timestamp());
+                Load::add_since(&LOAD.writer_seal_ns, t);
+                let t = std::time::Instant::now();
                 let _ = db::finish_checkpoint(conn);
                 Load::add_since(&LOAD.writer_checkpoint_ns, t);
                 saved.map_err(|e| e.to_string())

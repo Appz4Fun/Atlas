@@ -600,8 +600,6 @@ fn sealed_segments(conn: &Connection, file_id: i64) -> Result<Option<Vec<crate::
 /// Seal a file: its rows (and any blob it already has) become one blob, the
 /// rows go, all or nothing. Returns the segments in the blob, 0 when there
 /// is none (no rows, or rows that cant be sealed).
-// not called yet: the shard writer and compact seal with it
-#[allow(dead_code)]
 pub(crate) fn seal_file(conn: &Connection, file_id: i64) -> Result<usize> {
     conn.execute_batch("savepoint seal")?;
     let sealed = seal_rows(conn, file_id);
@@ -645,8 +643,6 @@ fn seal_rows(conn: &Connection, file_id: i64) -> Result<usize> {
 /// with late rows waits for this too). Files with a negative part number
 /// never seal. Returns the ids and the last id looked at, for walking the
 /// table `limit` files at a time: `last == after_id` means the end.
-// not called yet: the shard writer and compact seal with it
-#[allow(dead_code)]
 pub(crate) fn sealable(conn: &Connection, after_id: i64, limit: usize, now: i64) -> Result<(Vec<i64>, i64)> {
     let mut stmt = conn.prepare_cached(
         "select f.id, f.expected, f.seen, f.touched_at, f.blob is not null,
@@ -706,11 +702,42 @@ impl SealedCache {
 pub struct ShardWriter {
     pub shard: usize,
     domains: Domains,
+    /// where the last seal tick stopped in the files table
+    seal_after: i64,
 }
+
+/// files sealed per writer tick at most
+pub const SEAL_PER_TICK: usize = 2_000;
 
 impl ShardWriter {
     pub fn new(shard: usize) -> ShardWriter {
-        ShardWriter { shard, domains: Domains::default() }
+        ShardWriter { shard, domains: Domains::default(), seal_after: 0 }
+    }
+
+    /// Seal up to SEAL_PER_TICK files that are due, walking the files table by
+    /// id from where the last tick stopped. At the end of the table it goes
+    /// back to the start. Not for use inside a save transaction.
+    pub fn seal_some(&mut self, conn: &mut Connection, now: i64) -> Result<usize> {
+        let tx = conn.transaction()?;
+        let scan = SEAL_PER_TICK * 4;
+        let (mut ids, mut last) = sealable(&tx, self.seal_after, scan, now)?;
+        // nothing left after the cursor: start over from the first file
+        if last == self.seal_after && self.seal_after != 0 {
+            (ids, last) = sealable(&tx, 0, scan, now)?;
+        }
+        // past the cap, the next tick picks up after the last one sealed
+        let next = if ids.len() > SEAL_PER_TICK {
+            ids.truncate(SEAL_PER_TICK);
+            ids[SEAL_PER_TICK - 1]
+        } else {
+            last
+        };
+        for id in &ids {
+            seal_file(&tx, *id)?;
+        }
+        tx.commit()?;
+        self.seal_after = next;
+        Ok(ids.len())
     }
 
     /// Releases of this shard's groups, in one transaction. The same release
@@ -1436,5 +1463,19 @@ mod tests {
         assert_eq!(ids.iter().map(|&i| name(i)).collect::<Vec<_>>(), vec!["a.rar".to_string()]);
         conn.execute("update files set touched_at = ? where filename = 'b.rar'", [now - SEAL_AGE - 1]).unwrap();
         assert_eq!(sealable(&conn, 0, 100, now).unwrap().0.len(), 2, "b.rar went stale");
+    }
+
+    #[test]
+    fn a_writer_seals_what_is_due_a_tick_at_a_time() {
+        let (_dir, main) = sealed_fixture();
+        let shard = shard_of("alt.binaries.t");
+        let mut conn = db::open_at(&shard_path(&main, shard)).unwrap();
+        let mut writer = ShardWriter::new(shard);
+        let now = 2_000_000_000;
+        conn.execute("update files set touched_at = ?", [now]).unwrap();
+        assert_eq!(writer.seal_some(&mut conn, now).unwrap(), 1, "only the complete file");
+        conn.execute("update files set touched_at = ?", [now - SEAL_AGE - 1]).unwrap();
+        assert_eq!(writer.seal_some(&mut conn, now).unwrap(), 1, "the stale one, after wrapping around");
+        assert_eq!(writer.seal_some(&mut conn, now).unwrap(), 0);
     }
 }
