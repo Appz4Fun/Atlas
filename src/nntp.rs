@@ -1180,33 +1180,63 @@ impl Pool {
         Ok(self.posted_at(i, group, number, 100).await?.map(|(_, t)| t))
     }
 
+    /// The first article in `from..end` on server `i` with its post time, and
+    /// whether every number between `from` and it was looked at. Missing
+    /// numbers are skipped forward in windows that double from 100 numbers up
+    /// to `SCAN_MAX`; past that the windows stay that size and spread out (each
+    /// starts twice as far from `from` as the last ended), soo a hole of
+    /// millions costs a few dozen small requests, at the price of maybe missing
+    /// an article between two windows.
+    async fn first_in(&self, i: usize, group: &str, from: u64, end: u64) -> Result<Option<(u64, i64, bool)>> {
+        const LOOK: u64 = 100;
+        const SCAN_MAX: u64 = LOOK << 6;
+        let (mut at, mut size, mut whole) = (from, LOOK, true);
+        while at < end {
+            let look = size.min(end - at);
+            if let Some((n, t)) = self.posted_at(i, group, at, look).await? {
+                return Ok(Some((n, t, whole)));
+            }
+            let covered = at + look;
+            if size < SCAN_MAX {
+                at = covered;
+                size *= 2;
+                continue;
+            }
+            // the last window always ends at `end`
+            let next = (covered + (covered - from)).min(end.saturating_sub(SCAN_MAX)).max(covered);
+            whole &= next == covered;
+            at = next;
+        }
+        Ok(None)
+    }
+
     /// The first article number in `low..=high` on server `i` posted at or after
     /// `when` (unix seconds), `high + 1` when there is none. A binary search over
-    /// small article requests (about 35 for a billion numbers, plus one to settle). Post dates are
-    /// only roughly in order, so the answer is approximate near the edges:
-    /// callers overlap their ranges.
+    /// small article requests (about 35 for a billion numbers, plus one to
+    /// settle); a probe that lands on missing numbers skips forward to the next
+    /// article. Post dates are only roughly in order, soo the answer is
+    /// approximate near the edges: callers overlap their ranges.
     pub async fn article_at(&self, i: usize, group: &str, low: u64, high: u64, when: i64) -> Result<u64> {
-        const LOOK: u64 = 100;
         let (mut lo, mut hi) = (low, high + 1);
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
-            match self.posted_at(i, group, mid, LOOK).await? {
-                Some((n, t)) if t < when => lo = n + 1,
-                Some(_) => hi = mid,
-                // a gap: nothing to compare, keep searching to the left of it
+            match self.first_in(i, group, mid, hi).await? {
+                Some((n, t, _)) if t < when => lo = n + 1,
+                // every number from mid up to n is missing
+                Some((_, _, true)) => hi = mid,
+                // some numbers between mid and n werent looked at, n is an upper bound
+                Some((n, _, false)) => hi = n,
+                // nothing from mid on
                 None => hi = mid,
             }
         }
         if lo > high {
-            return Ok(lo);
+            return Ok(high + 1);
         }
         // lo may be a number missing from the group: settle on the article that exists
-        let look = LOOK.min(high + 1 - lo);
-        Ok(match self.posted_at(i, group, lo, look).await? {
-            Some((n, _)) => n,
-            // nothing up to the end of the range
-            None if look == high + 1 - lo => high + 1,
-            None => lo,
+        Ok(match self.first_in(i, group, lo, high + 1).await? {
+            Some((n, _, _)) => n,
+            None => high + 1,
         })
     }
 
