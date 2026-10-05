@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
 use rusqlite::Connection;
@@ -43,11 +44,13 @@ pub struct GroupRunState {
     pub phase: Phase,
     pub idle: bool,
     pub backfilling: bool,
+    /// a big group found unsplittable isnt probed again until then
+    pub no_split_until: Option<Instant>,
 }
 
 impl Default for GroupRunState {
     fn default() -> Self {
-        GroupRunState { phase: Phase::Backfill, idle: false, backfilling: false }
+        GroupRunState { phase: Phase::Backfill, idle: false, backfilling: false, no_split_until: None }
     }
 }
 
@@ -329,6 +332,9 @@ where
     }
 }
 
+/// how long a big group that couldnt be split waits before it is probed again
+const SPLIT_RECHECK: Duration = Duration::from_secs(3600);
+
 /// Split `group`'s backfill into day chunks when its home server still has
 /// more than `split_min_backlog` article numbers to go and another indexing
 /// server carries it too. Chunks run from the day at the home cursor back to
@@ -349,38 +355,68 @@ async fn maybe_split(
     if (cursor.saturating_sub(first) as i64) < settings.split_min_backlog {
         return Ok(false);
     }
-
-    // the newest day still to do: the post date at the home cursor
-    let newest_day = match ctx.pool.posted_date(home, group, cursor).await? {
-        Some(t) => crate::chunks::unix_day(t),
-        None => return Ok(false),
-    };
-
-    // the oldest day any other carrying server has
-    let mut oldest_day = newest_day;
-    let mut carriers = 1;
-    for other in ctx.pool.indexing_servers().into_iter().filter(|&s| s != home) {
-        let Ok((s, (_, low, _, _))) = ctx.pool.select_group_on(other, group).await else { continue };
-        if s != other {
-            continue;
-        }
-        if let Some(t) = ctx.pool.posted_date(other, group, low).await? {
-            carriers += 1;
-            oldest_day = oldest_day.min(crate::chunks::unix_day(t));
-        }
-    }
-    if let Some(t) = ctx.pool.posted_date(home, group, first).await? {
-        oldest_day = oldest_day.min(crate::chunks::unix_day(t));
-    }
-    if carriers < 2 {
+    if ctx.states.with(group, |st| st.no_split_until.is_some_and(|t| Instant::now() < t)) {
         return Ok(false);
     }
+
+    let Some((newest_day, oldest_day, carriers)) = split_days(ctx, group, home, first, cursor).await? else {
+        ctx.states.with(group, |st| st.no_split_until = Some(Instant::now() + SPLIT_RECHECK));
+        return Ok(false);
+    };
 
     let g = group.to_string();
     let added = on_db(db, move |conn| Ok(crate::chunks::add(conn, &g, newest_day, oldest_day)?)).await?;
     println!("[SPLIT] {group}: backfill split into {added} day chunks over {carriers} servers");
     Ok(true)
 }
+
+/// The days a split of `group` covers, (newest, oldest), and how many servers
+/// carry it. None when it cant split: home's dates at either end are unknown
+/// or no other indexing server carries the group.
+async fn split_days(
+    ctx: &PassContext,
+    group: &str,
+    home: usize,
+    first: u64,
+    cursor: u64,
+) -> Result<Option<(i64, i64, usize)>> {
+    use crate::chunks::unix_day;
+
+    // the newest day still to do is the post date at the home cursor, the
+    // oldest at least home's first article
+    let Some(newest) = ctx.pool.posted_date(home, group, cursor).await? else { return Ok(None) };
+    let Some(oldest) = ctx.pool.posted_date(home, group, first).await? else { return Ok(None) };
+    let newest_day = unix_day(newest);
+    let mut oldest_day = unix_day(oldest).min(newest_day);
+
+    // other servers are best effort: one that fails is left out. one that
+    // carries the group counts, its oldest date only if it has one
+    let mut carriers = 1;
+    for other in ctx.pool.indexing_servers().into_iter().filter(|&s| s != home) {
+        let Ok((_, low, _, _)) = ctx.pool.group_on(other, group).await else { continue };
+        carriers += 1;
+        if let Ok(Some(t)) = ctx.pool.posted_date(other, group, low).await {
+            oldest_day = oldest_day.min(unix_day(t));
+        }
+    }
+
+    Ok((carriers >= 2).then_some((newest_day, oldest_day, carriers)))
+}
+
+/// A day chunk's server doesnt carry its group (GROUP answered 411).
+#[derive(Debug)]
+pub struct NotCarried {
+    pub group: String,
+    pub host: String,
+}
+
+impl std::fmt::Display for NotCarried {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} isnt on {}", self.group, self.host)
+    }
+}
+
+impl std::error::Error for NotCarried {}
 
 /// Claim the newest chunk of any split group for `host`, except `skip`.
 pub async fn claim_chunk(db: &Db, host: String, skip: Vec<String>) -> Result<Option<(String, i64)>> {
@@ -416,11 +452,15 @@ where
         on_db(db, move |conn| Ok(crate::chunks::release(conn, &g, day)?))
     };
 
-    let found = match ctx.pool.select_group_on(server, group).await {
-        Ok((s, info)) if s == server => info,
-        Ok(_) | Err(_) => {
+    // GROUP on this server alone: falling over would move where the group lives
+    let found = match ctx.pool.group_on(server, group).await {
+        Ok(info) => info,
+        Err(e) => {
             release().await?;
-            return Err(anyhow!("{group} isnt on {}", ctx.pool.host(server)));
+            if e.code() == Some(411) {
+                return Err(NotCarried { group: group.to_string(), host: ctx.pool.host(server) }.into());
+            }
+            return Err(e.into());
         }
     };
     let (_count, first, last, _name) = found;

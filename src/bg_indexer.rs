@@ -13,7 +13,7 @@ use serde_json::json;
 use crate::atomic::write_atomic;
 use crate::config::{Config, UsenetServer, load_config};
 use crate::db;
-use crate::indexer::{Db, PassContext, PassSettings, Progress, RunStates, run_pass, shared_db};
+use crate::indexer::{Db, NotCarried, PassContext, PassSettings, Progress, RunStates, run_pass, shared_db};
 use crate::nntp::{Pool, unless_stopped};
 use crate::paths;
 use crate::sab;
@@ -254,9 +254,11 @@ struct Scheduler {
     next: Mutex<HashMap<usize, usize>>,
     /// groups a worker is on right now
     busy: Mutex<HashSet<String>>,
-    /// (group, server) pairs where the server said it doesnt carry the group,
-    /// soo its idle workers dont take that group's chunks
-    skip: Mutex<HashSet<(String, usize)>>,
+    /// (group, server) pairs whose day chunks the server leaves alone: for
+    /// good (None) when it doesnt carry the group, until then after chunk errors
+    skip: Mutex<HashMap<(String, usize), Option<Instant>>>,
+    /// consecutive day chunk errors per (group, server)
+    chunk_errors: Mutex<HashMap<(String, usize), u32>>,
     /// groups resting after going idle or after an error
     wait_until: Mutex<HashMap<String, Instant>>,
     /// consecutive errors per group
@@ -359,6 +361,33 @@ impl Scheduler {
         self.passes.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// After a day chunk of `group` on `server`. Errors count like a pass error
+    /// and rest the pair; a server that doesnt carry the group skips its chunks for good.
+    fn finish_chunk(&self, group: String, server: usize, result: anyhow::Result<Progress>) {
+        let key = (group, server);
+        match result {
+            Ok(_) => {
+                self.chunk_errors.lock().unwrap().remove(&key);
+            }
+            Err(_) if self.ctx.stop.load(Ordering::Relaxed) => {}
+            Err(e) if e.downcast_ref::<NotCarried>().is_some() => {
+                println!("{e}, leaving its day chunks to the other servers");
+                self.skip.lock().unwrap().insert(key, None);
+            }
+            Err(e) => {
+                self.stats.lock().unwrap().error_count += 1;
+                let count = {
+                    let mut errors = self.chunk_errors.lock().unwrap();
+                    let c = errors.entry(key.clone()).or_insert(0);
+                    *c += 1;
+                    *c
+                };
+                ui::error(&format!("Indexing error ({}, day chunk on {}): {e}", key.0, self.ctx.pool.host(server)));
+                self.skip.lock().unwrap().insert(key, Some(Instant::now() + backoff(count)));
+            }
+        }
+    }
+
     /// groups not parked
     fn active_groups(&self) -> Vec<String> {
         let failed = self.failed.lock().unwrap();
@@ -398,10 +427,26 @@ impl Scheduler {
 /// A day chunk of any split group for an idle worker on `server`: the newest
 /// one pending, among the groups this server hasnt said it lacks.
 async fn take_chunk(sched: &Scheduler, server: usize, db: &Db) -> Option<(String, i64)> {
+    // a server resting after a failure takes no chunks either
+    if !sched.ctx.pool.indexing_tier().contains(&server) {
+        return None;
+    }
+
     let host = sched.ctx.pool.host(server);
-    let skip: Vec<String> =
-        sched.skip.lock().unwrap().iter().filter(|(_, s)| *s == server).map(|(g, _)| g.clone()).collect();
-    crate::indexer::claim_chunk(db, host, skip).await.ok().flatten()
+    let skip: Vec<String> = {
+        let now = Instant::now();
+        let mut skip = sched.skip.lock().unwrap();
+        skip.retain(|_, until| until.is_none_or(|t| t > now));
+        skip.keys().filter(|(_, s)| *s == server).map(|(g, _)| g.clone()).collect()
+    };
+
+    match crate::indexer::claim_chunk(db, host, skip).await {
+        Ok(chunk) => chunk,
+        Err(e) => {
+            ui::error(&format!("couldnt claim a day chunk: {e}"));
+            None
+        }
+    }
 }
 
 /// One worker on `server`: index whichever of its groups is due next, again and again.
@@ -417,18 +462,8 @@ async fn worker(sched: Arc<Scheduler>, server: usize, db: Db) {
                 let stats = sched.stats.clone();
                 let mut progress = |p: &Progress| stats.lock().unwrap().tick(p.articles, p.bytes, p.releases, &group);
                 let chunk = crate::indexer::run_chunk(&sched.ctx, &settings, &db, &group, server, day, &mut progress);
-                match unless_stopped(&sched.ctx.stop, chunk).await {
-                    None => break,
-                    Some(Err(e)) if e.to_string().contains("isnt on") => {
-                        sched.skip.lock().unwrap().insert((group, server));
-                    }
-                    Some(Err(e)) => {
-                        ui::error(&format!("Indexing error ({group}, day chunk): {e}"));
-                        // the chunk went back, dont grab it again right away
-                        nap(Duration::from_secs(1), || sched.stopping()).await;
-                    }
-                    Some(Ok(_)) => {}
-                }
+                let Some(result) = unless_stopped(&sched.ctx.stop, chunk).await else { break };
+                sched.finish_chunk(group, server, result);
                 continue;
             }
             nap(Duration::from_secs(1), || sched.stopping()).await;
@@ -527,7 +562,8 @@ async fn run_servers(
         workers,
         next: Mutex::new(HashMap::new()),
         busy: Mutex::new(HashSet::new()),
-        skip: Mutex::new(HashSet::new()),
+        skip: Mutex::new(HashMap::new()),
+        chunk_errors: Mutex::new(HashMap::new()),
         wait_until: Mutex::new(HashMap::new()),
         errors: Mutex::new(HashMap::new()),
         failed: Mutex::new(HashMap::new()),

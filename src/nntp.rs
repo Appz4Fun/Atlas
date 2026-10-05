@@ -1116,6 +1116,12 @@ impl Pool {
         lease.check(r)
     }
 
+    /// GROUP on server `i` alone, for probing a server: no falling over to
+    /// another server, soo where the group lives stays as it is.
+    pub async fn group_on(&self, i: usize, group: &str) -> Result<(u64, u64, u64, String)> {
+        self.select_on(i, group).await
+    }
+
     /// GROUP on the active server, falling over to the next server that carries it
     /// (which then becomes the active one).
     pub async fn select_group(&self, group: &str) -> Result<(u64, u64, u64, String)> {

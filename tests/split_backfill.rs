@@ -39,8 +39,14 @@ fn a_split_group_is_shared_by_both_servers() {
         std::env::set_var("ATLAS_SAB_DIR", home.path().join("no-sabnzbd"));
     }
 
-    let a = Server::new(posts(1));
-    let b = Server::new(posts(500_001));
+    // a little delay per request soo a chunk takes long enough for the other
+    // server's idle worker to wake up and take some
+    let slow = |mut s: Arc<Server>| {
+        Arc::get_mut(&mut s).unwrap().xover_delay = Duration::from_millis(10);
+        s
+    };
+    let a = slow(Server::new(posts(1)));
+    let b = slow(Server::new(posts(500_001)));
     let (pa, pb) = (spawn_server(a.clone()), spawn_server(b.clone()));
     let config = serde_json::json!({
         "usenet_servers": [
@@ -81,5 +87,7 @@ fn a_split_group_is_shared_by_both_servers() {
 
     let conn = atlas::db::open_with_shards(&main).unwrap();
     assert_eq!(atlas::store::totals(&conn).unwrap().1, 1200, "every post once, overlaps deduplicated");
-    assert!(a.xovers.load(Ordering::SeqCst) > 0 && b.xovers.load(Ordering::SeqCst) > 0, "both servers worked");
+    let servers: i64 =
+        conn.query_row("select count(distinct server) from backfill_chunks where state = 2", [], |r| r.get(0)).unwrap();
+    assert_eq!(servers, 2, "both servers indexed day chunks");
 }
