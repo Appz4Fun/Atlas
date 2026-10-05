@@ -521,17 +521,23 @@ where
         let g = group.to_string();
         on_db(db, move |conn| Ok(crate::chunks::release(conn, &g, day)?))
     };
+    // give the chunk back after `e`, and return `e`: failing to give it back
+    // is only logged (the claim goes stale and gets taken over)
+    let failed = async |e: anyhow::Error| {
+        if let Err(r) = release().await {
+            println!("[CHUNK] {group} day {day}: couldnt give the chunk back: {r:#}");
+        }
+        Err(e)
+    };
 
-    // GROUP on this server alone: falling over would move where the group lives
+    // GROUP on this server alone: falling over would move where the group
+    // lives, and only a 411 means the server doesnt carry it
     let found = match ctx.pool.group_on(server, group).await {
         Ok(info) => info,
-        Err(e) => {
-            release().await?;
-            if e.code() == Some(411) {
-                return Err(NotCarried { group: group.to_string(), host: ctx.pool.host(server) }.into());
-            }
-            return Err(e.into());
+        Err(e) if e.code() == Some(411) => {
+            return failed(NotCarried { group: group.to_string(), host: ctx.pool.host(server) }.into()).await;
         }
+        Err(e) => return failed(e.into()).await,
     };
     let (_count, first, last, _name) = found;
 
@@ -539,17 +545,11 @@ where
     let to = (day + 1) * 86_400 + CHUNK_OVERLAP;
     let start = match ctx.pool.article_at(server, group, first, last, from).await {
         Ok(n) => n,
-        Err(e) => {
-            release().await?;
-            return Err(e.into());
-        }
+        Err(e) => return failed(e.into()).await,
     };
     let end = match ctx.pool.article_at(server, group, start.max(first), last, to).await {
         Ok(n) => n.saturating_sub(1),
-        Err(e) => {
-            release().await?;
-            return Err(e.into());
-        }
+        Err(e) => return failed(e.into()).await,
     };
     if start > end {
         let g = group.to_string();
@@ -568,10 +568,7 @@ where
             release().await?;
             Ok(saved)
         }
-        Err(e) => {
-            release().await?;
-            Err(e)
-        }
+        Err(e) => failed(e).await,
     }
 }
 

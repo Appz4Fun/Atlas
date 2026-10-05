@@ -179,3 +179,39 @@ fn a_day_chunk_skips_a_gap_inside_the_day() {
     let conn = atlas::db::open_at(&main).unwrap();
     assert_eq!(atlas::chunks::progress(&conn, GROUP).unwrap(), (1, 1));
 }
+
+/// A chunk that fails and then cant be given back still reports why it
+/// failed, not the failure to give it back.
+#[test]
+fn a_failing_chunk_reports_its_own_error() {
+    let home = tempfile::tempdir().unwrap();
+    let main = home.path().join("atlas.db");
+    atlas::db::create_db_at(&main).unwrap();
+    let port = spawn_server(Server::new(hourly()));
+    let pool = BlockingPool::new(&[mock(port, "secret", 2, 1)]);
+    pool.connect().unwrap();
+
+    // giving the chunk back fails: there is no chunk table
+    let main_conn = atlas::db::open_at(&main).unwrap();
+    main_conn.execute_batch("drop table backfill_chunks").unwrap();
+    let ctx = atlas::indexer::PassContext {
+        pool: pool.pool.clone(),
+        states: Default::default(),
+        stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        verbose: false,
+    };
+    let db = atlas::indexer::shared_db(main_conn);
+    // the mock doesnt carry this group: GROUP answers 411
+    let err = pool
+        .block_on(atlas::indexer::run_chunk(
+            &ctx,
+            &Default::default(),
+            &db,
+            "alt.binaries.other",
+            0,
+            20_455,
+            &mut |_| {},
+        ))
+        .unwrap_err();
+    assert!(err.downcast_ref::<atlas::indexer::NotCarried>().is_some(), "{err:#}");
+}
