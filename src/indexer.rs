@@ -588,7 +588,8 @@ where
     };
     let finish = async || {
         let c = chunk.clone();
-        if !on_db(db, move |conn| Ok(crate::chunks::finish(conn, &c)?)).await? {
+        let now = chrono::Utc::now().timestamp();
+        if !on_db(db, move |conn| Ok(crate::chunks::finish(conn, &c, now)?)).await? {
             println!("[CHUNK] {group} day {day}: taken over by another worker, leaving it to that one");
         }
         anyhow::Ok(())

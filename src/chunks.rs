@@ -11,7 +11,8 @@ const PENDING: i64 = 0;
 const CLAIMED: i64 = 1;
 const DONE: i64 = 2;
 
-/// Initialize the backfill_chunks table if it doesn't exist.
+/// Initialize the backfill_chunks table if it doesn't exist, and give one
+/// made before chunks kept their finish time its done_at column.
 pub fn create(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "create table if not exists backfill_chunks (
@@ -20,9 +21,22 @@ pub fn create(conn: &Connection) -> Result<()> {
             state INTEGER NOT NULL,
             server TEXT,
             claimed_at INTEGER,
+            done_at INTEGER,
             primary key (grp, day)
         ) without rowid;",
-    )
+    )?;
+    if has_done_at(conn)? {
+        return Ok(());
+    }
+    match conn.execute_batch("alter table backfill_chunks add column done_at INTEGER") {
+        // the indexer and the menu can both add it at once
+        Err(_) if has_done_at(conn)? => Ok(()),
+        r => r,
+    }
+}
+
+fn has_done_at(conn: &Connection) -> Result<bool> {
+    conn.prepare("select 1 from pragma_table_info('backfill_chunks') where name = 'done_at'")?.exists([])
 }
 
 /// days since 1970-01-01 UTC
@@ -90,14 +104,14 @@ pub fn claim(conn: &Connection, groups: &[(String, i64)], host: &str, now: i64) 
     Ok(found.map(|(group, day)| Claim { group, day, server: host.to_string(), claimed_at: now }))
 }
 
-/// Mark a claimed chunk as done. False when the claim was taken over.
-pub fn finish(conn: &Connection, claim: &Claim) -> Result<bool> {
+/// Mark a claimed chunk as done at `now`. False when the claim was taken over.
+pub fn finish(conn: &Connection, claim: &Claim, now: i64) -> Result<bool> {
     let n = conn.execute(
         &format!(
-            "update backfill_chunks set state = ?
+            "update backfill_chunks set state = ?, done_at = ?
              where grp = ? and day = ? and state = {CLAIMED} and server = ? and claimed_at = ?"
         ),
-        params![DONE, claim.group, claim.day, claim.server, claim.claimed_at],
+        params![DONE, now, claim.group, claim.day, claim.server, claim.claimed_at],
     )?;
     Ok(n > 0)
 }
@@ -160,7 +174,7 @@ mod tests {
         assert_eq!(a, Claim { group: "g".into(), day: 20_000, server: "a".into(), claimed_at: 1000 });
         let b = claim(&c, &groups, "b", 1000).unwrap().unwrap();
         assert_eq!(b.day, 19_999);
-        assert!(finish(&c, &a).unwrap());
+        assert!(finish(&c, &a, 1100).unwrap());
         assert!(release(&c, &b).unwrap());
         assert_eq!(day(claim(&c, &groups, "b", 1000)), Some(19_999), "released goes back");
         assert_eq!(day(claim(&c, &groups, "a", 1000)), Some(19_998));
@@ -186,18 +200,36 @@ mod tests {
         // a's chunk runs past CLAIM_TIMEOUT, b takes it over and finishes it
         let a = claim(&c, &groups, "a", 1000).unwrap().unwrap();
         let b = claim(&c, &groups, "b", 1000 + CLAIM_TIMEOUT + 1).unwrap().unwrap();
-        assert!(finish(&c, &b).unwrap());
+        let done_at = 1000 + CLAIM_TIMEOUT + 60;
+        assert!(finish(&c, &b, done_at).unwrap());
 
         // a's late release and finish change nothing: done, and b's
         assert!(!release(&c, &a).unwrap());
-        assert!(!finish(&c, &a).unwrap());
+        assert!(!finish(&c, &a, done_at + 60).unwrap());
         let row = |c: &Connection| {
-            c.query_row("select state, server from backfill_chunks where grp = 'g' and day = 5", [], |r| {
-                Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?))
+            c.query_row("select state, server, done_at from backfill_chunks where grp = 'g' and day = 5", [], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, Option<i64>>(2)?))
             })
             .unwrap()
         };
-        assert_eq!(row(&c), (DONE, Some("b".to_string())));
+        assert_eq!(row(&c), (DONE, Some("b".to_string()), Some(done_at)));
+    }
+
+    #[test]
+    fn a_table_from_before_done_at_gets_the_column() {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(
+            "create table backfill_chunks (grp TEXT NOT NULL, day INTEGER NOT NULL, state INTEGER NOT NULL,
+                 server TEXT, claimed_at INTEGER, primary key (grp, day)) without rowid;
+             insert into backfill_chunks values ('g', 5, 1, 'a', 1000);",
+        )
+        .unwrap();
+        create(&c).unwrap();
+        create(&c).unwrap();
+        let a = Claim { group: "g".into(), day: 5, server: "a".into(), claimed_at: 1000 };
+        assert!(finish(&c, &a, 1100).unwrap(), "the chunk claimed before is still there");
+        let done_at: Option<i64> = c.query_row("select done_at from backfill_chunks", [], |r| r.get(0)).unwrap();
+        assert_eq!(done_at, Some(1100));
     }
 
     #[test]

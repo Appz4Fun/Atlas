@@ -94,7 +94,7 @@ fn load_chunks_stats(conn: &rusqlite::Connection) -> (i64, i64, i64, i64, i64) {
     let sql = "select count(*), coalesce(sum(pending > 0), 0), coalesce(sum(done), 0), coalesce(sum(total), 0), \
                coalesce(sum(recent), 0)
                from (select grp, sum(state != 2) as pending, sum(state = 2) as done, count(*) as total, \
-                     sum(state = 2 and claimed_at > ?) as recent from backfill_chunks group by grp)";
+                     sum(state = 2 and done_at > ?) as recent from backfill_chunks group by grp)";
     conn.query_row(sql, [hour_ago], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))).unwrap_or_default()
 }
 
@@ -1455,15 +1455,20 @@ mod tests {
         let now =
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
 
-        // g1: finish 3 chunks (all done)
+        let claim = |group: &str, at: i64| {
+            crate::chunks::claim(&conn, &[(group.to_string(), i64::MIN)], "s", at).unwrap().unwrap()
+        };
+
+        // g1: 3 chunks, all finished two hours ago
         crate::chunks::add(&conn, "g1", 100, 98).unwrap();
-        conn.execute("update backfill_chunks set state = 2 where grp = 'g1'", []).unwrap();
-        // g2: finish 1 recently (with recent claimed_at), claim 1 recently (2 chunks total, 1 done, 1 in progress)
+        for _ in 0..3 {
+            assert!(crate::chunks::finish(&conn, &claim("g1", now - 7300), now - 7200).unwrap());
+        }
+        // g2: 1 chunk claimed two hours ago and finished just now, 1 claimed just now
+        // (2 chunks total, 1 done, 1 in progress)
         crate::chunks::add(&conn, "g2", 200, 199).unwrap();
-        conn.execute("update backfill_chunks set state = 2, claimed_at = ? where grp = 'g2' and day = 200", [now])
-            .unwrap();
-        conn.execute("update backfill_chunks set state = 1, claimed_at = ? where grp = 'g2' and day = 199", [now])
-            .unwrap();
+        assert!(crate::chunks::finish(&conn, &claim("g2", now - 7200), now).unwrap());
+        claim("g2", now);
 
         // 2 groups, 1 in progress (g2 has pending), 4 done total, 5 total, 1 done in last hour
         let (groups, splitting, done, total, done_last_hour) = load_chunks_stats(&conn);
@@ -1471,6 +1476,6 @@ mod tests {
         assert_eq!(splitting, 1); // 1 group with pending > 0 (g2)
         assert_eq!(done, 4); // g1 has 3 done, g2 has 1 done
         assert_eq!(total, 5); // 3 chunks for g1, 2 chunks for g2
-        assert_eq!(done_last_hour, 1); // 1 chunk in g2 finished recently (claimed_at is recent)
+        assert_eq!(done_last_hour, 1, "finished in the last hour, though claimed before it");
     }
 }
