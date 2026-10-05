@@ -165,8 +165,17 @@ fn writer(shard: usize, path: &std::path::Path, ids: &crate::store::Ids, jobs: s
 
     let mut opened = db::open_at(path).and_then(|conn| db::tune_for_writing(&conn).map(|_| conn));
     let mut store = crate::store::ShardWriter::new(shard);
+    // a job taken off the queue to see if more were waiting
+    let mut next: Option<SaveJob> = None;
 
-    while let Ok(first) = jobs.recv() {
+    loop {
+        let first = match next.take() {
+            Some(job) => job,
+            None => match jobs.recv() {
+                Ok(job) => job,
+                Err(_) => break,
+            },
+        };
         let mut batch = vec![first];
         while batch.len() < MAX_BATCH {
             match jobs.try_recv() {
@@ -197,7 +206,15 @@ fn writer(shard: usize, path: &std::path::Path, ids: &crate::store::Ids, jobs: s
         // housekeeping between transactions
         if let Ok(conn) = &mut opened {
             let t = std::time::Instant::now();
-            if saved {
+            // more slices waiting: saving them comes first
+            let waiting = match jobs.try_recv() {
+                Ok(job) => {
+                    next = Some(job);
+                    true
+                }
+                Err(_) => false,
+            };
+            if saved && !waiting {
                 let sealing = std::time::Instant::now();
                 if store.seal_some(conn, chrono::Utc::now().timestamp()).is_err() {
                     LOAD.writer_seal_errors.fetch_add(1, Relaxed);

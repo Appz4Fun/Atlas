@@ -17,7 +17,7 @@
 //! shard holds it.
 
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Instant;
@@ -651,12 +651,13 @@ fn seal_rows(conn: &Connection, file_id: i64) -> Result<usize> {
     Ok(segs.len())
 }
 
-/// The next `limit` files after `after_id`, and which of them to seal: ones
-/// with rows that are complete and not sealed yet, or untouched for
-/// `SEAL_AGE` (never touched since the upgrade counts as old; a sealed file
-/// with late rows waits for this too). Files with a negative part number
-/// never seal. Returns the ids and the last id looked at, for walking the
-/// table `limit` files at a time: `last == after_id` means the end.
+/// The next `limit` files after `after_id`, and which of them a writer
+/// seals: ones with rows that are complete and not sealed yet, or untouched
+/// for `SEAL_AGE` (a sealed file with late rows waits for this). Files never
+/// touched since the upgrade are left to compaction, and files with a
+/// negative part number never seal. Returns the ids and the last id looked
+/// at, for walking the table `limit` files at a time: `last == after_id`
+/// means the end.
 pub(crate) fn sealable(conn: &Connection, after_id: i64, limit: usize, now: i64) -> Result<(Vec<i64>, i64)> {
     let mut stmt = conn.prepare_cached(
         "select f.id, f.expected, f.seen, f.touched_at, f.blob is not null,
@@ -675,11 +676,30 @@ pub(crate) fn sealable(conn: &Connection, after_id: i64, limit: usize, now: i64)
             continue;
         }
         let seen: Vec<u8> = r.get(2)?;
-        if due(r.get(1)?, &seen, r.get(3)?, r.get(4)?, now) {
+        let touched: Option<i64> = r.get(3)?;
+        if touched.is_some() && due(r.get(1)?, &seen, touched, r.get(4)?, now) {
             ids.push(id);
         }
     }
     Ok((ids, last))
+}
+
+/// A file a save just completed is still complete, not sealed and has rows
+/// that can go in a blob.
+fn still_due(conn: &Connection, file_id: i64, now: i64) -> Result<bool> {
+    conn.prepare_cached(
+        "select f.expected, f.seen, f.touched_at, f.blob is not null,
+                exists (select 1 from segments s where s.file_id = f.id),
+                exists (select 1 from segments s where s.file_id = f.id and s.part < 0)
+         from files f where f.id = ?",
+    )?
+    .query_row([file_id], |r| {
+        let (has_rows, negative): (bool, bool) = (r.get(4)?, r.get(5)?);
+        let seen: Vec<u8> = r.get(1)?;
+        Ok(has_rows && !negative && due(r.get(0)?, &seen, r.get(2)?, r.get(3)?, now))
+    })
+    .optional()
+    .map(|due| due.unwrap_or(false))
 }
 
 /// A file with rows is due to seal when it's complete and not sealed yet, or
@@ -719,8 +739,13 @@ impl SealedCache {
 pub struct ShardWriter {
     pub shard: usize,
     domains: Domains,
-    /// where the last seal tick stopped in the files table
+    /// files this writer's saves completed, oldest first, waiting to be sealed
+    completed: VecDeque<i64>,
+    completed_ids: HashSet<i64>,
+    /// where the last walk stopped in the files table
     seal_after: i64,
+    /// when the last walk ran (unix seconds)
+    walked_at: Option<i64>,
 }
 
 /// files sealed per writer tick at most
@@ -729,46 +754,96 @@ pub const SEAL_PER_TICK: usize = 2_000;
 /// a seal tick stops after this long, so the writer gets back to saving
 pub const SEAL_BUDGET: std::time::Duration = std::time::Duration::from_millis(100);
 
+/// a writer walks the files table for stale files at most this often (seconds)
+pub const SEAL_WALK_EVERY: i64 = 60;
+
+/// completed files a writer keeps for sealing at most, the oldest go first
+const COMPLETED_CAP: usize = 50_000;
+
 impl ShardWriter {
     pub fn new(shard: usize) -> ShardWriter {
-        ShardWriter { shard, domains: Domains::default(), seal_after: 0 }
+        ShardWriter {
+            shard,
+            domains: Domains::default(),
+            completed: VecDeque::new(),
+            completed_ids: HashSet::new(),
+            seal_after: 0,
+            walked_at: None,
+        }
     }
 
-    /// Seal up to SEAL_PER_TICK files that are due, for at most SEAL_BUDGET,
-    /// walking the files table by id from where the last tick stopped. At the
-    /// end of the table it goes back to the start. A file that fails to seal
-    /// is counted and skipped. Not for use inside a save transaction.
-    /// Returns the files sealed.
+    fn remember_completed(&mut self, file_id: i64) {
+        if !self.completed_ids.insert(file_id) {
+            return;
+        }
+        if self.completed.len() >= COMPLETED_CAP
+            && let Some(oldest) = self.completed.pop_front()
+        {
+            self.completed_ids.remove(&oldest);
+        }
+        self.completed.push_back(file_id);
+    }
+
+    /// Seal up to SEAL_PER_TICK files, for at most SEAL_BUDGET: first the
+    /// files this writer's saves completed, then, at most every
+    /// SEAL_WALK_EVERY seconds, the due files of a step through the files
+    /// table by id from where the last walk stopped (back to the start at the
+    /// end of the table). A file that fails to seal is counted and skipped.
+    /// Not for use inside a save transaction. Returns the files sealed.
     pub fn seal_some(&mut self, conn: &mut Connection, now: i64) -> Result<usize> {
         let started = Instant::now();
+        let out_of_time = |done: usize| done > 0 && started.elapsed() >= SEAL_BUDGET;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let scan = SEAL_PER_TICK * 4;
-        let (mut ids, mut last) = sealable(&tx, self.seal_after, scan, now)?;
-        // nothing left after the cursor: start over from the first file
-        if last == self.seal_after && self.seal_after != 0 {
-            (ids, last) = sealable(&tx, 0, scan, now)?;
-        }
-        // past the cap, the next tick picks up after the last one sealed
-        if ids.len() > SEAL_PER_TICK {
-            ids.truncate(SEAL_PER_TICK);
-            last = ids[SEAL_PER_TICK - 1];
-        }
-        let mut sealed = 0;
-        for (i, id) in ids.iter().enumerate() {
-            // out of time: the next tick picks up after the last one done
-            if i > 0 && started.elapsed() >= SEAL_BUDGET {
-                last = ids[i - 1];
-                break;
+        let seal = |id: i64| match seal_file(&tx, id) {
+            Ok(segs) => Ok(usize::from(segs > 0)),
+            Err(e) => {
+                profile::LOAD.writer_seal_errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Err(e)
             }
-            match seal_file(&tx, *id) {
-                Ok(segs) => sealed += usize::from(segs > 0),
-                Err(_) => {
-                    profile::LOAD.writer_seal_errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        };
+        let (mut sealed, mut done) = (0, 0);
+
+        // what the last saves completed: oldest first, what doesnt fit waits for the next tick
+        while done < SEAL_PER_TICK && !out_of_time(done) {
+            let Some(id) = self.completed.pop_front() else { break };
+            self.completed_ids.remove(&id);
+            done += 1;
+            if still_due(&tx, id, now)? {
+                sealed += seal(id).unwrap_or(0);
+            }
+        }
+
+        let walk = self.walked_at.is_none_or(|t| now - t >= SEAL_WALK_EVERY);
+        if walk && done < SEAL_PER_TICK && !out_of_time(done) {
+            self.walked_at = Some(now);
+            let scan = SEAL_PER_TICK * 4;
+            let (mut ids, mut last) = sealable(&tx, self.seal_after, scan, now)?;
+            // nothing left after the cursor: start over from the first file
+            if last == self.seal_after && self.seal_after != 0 {
+                (ids, last) = sealable(&tx, 0, scan, now)?;
+            }
+            // past the cap, the next walk picks up after the last one sealed
+            let room = SEAL_PER_TICK - done;
+            if ids.len() > room {
+                ids.truncate(room);
+                last = ids[room - 1];
+            }
+            for (i, id) in ids.iter().enumerate() {
+                // out of time: the next walk picks up after the last one done
+                if out_of_time(done) {
+                    if i > 0 {
+                        last = ids[i - 1];
+                    } else {
+                        last = self.seal_after;
+                    }
+                    break;
                 }
+                done += 1;
+                sealed += seal(*id).unwrap_or(0);
             }
+            self.seal_after = last;
         }
         tx.commit()?;
-        self.seal_after = last;
         Ok(sealed)
     }
 
@@ -784,6 +859,8 @@ impl ShardWriter {
         let domains = &mut self.domains;
         // blobs of sealed files that get late articles, decoded once each
         let mut sealed = SealedCache::new();
+        // files this save completed, for sealing once it's committed
+        let mut completed = Vec::new();
         let tx = conn.transaction()?;
         let (mut new_releases, mut new_articles) = (0i64, 0i64);
         {
@@ -850,6 +927,9 @@ impl ShardWriter {
                     }
                     if added.len() > before {
                         put_file(&tx, &f)?;
+                        if !f.sealed && f.expected.is_some_and(|e| is_exactly(&f.seen, e)) {
+                            completed.push(f.id);
+                        }
                     }
                 }
                 profile::ARTICLES.add_since(t);
@@ -879,6 +959,11 @@ impl ShardWriter {
         let t = Instant::now();
         let r = tx.commit();
         profile::COMMIT.add_since(t);
+        if r.is_ok() {
+            for id in completed {
+                self.remember_completed(id);
+            }
+        }
         r
     }
 }
@@ -1507,8 +1592,81 @@ mod tests {
         conn.execute("update files set touched_at = ?", [now]).unwrap();
         assert_eq!(writer.seal_some(&mut conn, now).unwrap(), 1, "only the complete file");
         conn.execute("update files set touched_at = ?", [now - SEAL_AGE - 1]).unwrap();
-        assert_eq!(writer.seal_some(&mut conn, now).unwrap(), 1, "the stale one, after wrapping around");
-        assert_eq!(writer.seal_some(&mut conn, now).unwrap(), 0);
+        assert_eq!(writer.seal_some(&mut conn, now + 1).unwrap(), 0, "no walk until SEAL_WALK_EVERY is up");
+        let later = now + SEAL_WALK_EVERY;
+        assert_eq!(writer.seal_some(&mut conn, later).unwrap(), 1, "the stale one, after wrapping around");
+        assert_eq!(writer.seal_some(&mut conn, later + SEAL_WALK_EVERY).unwrap(), 0);
+    }
+
+    /// the fixture's release, saved by `writer`
+    fn save_with(writer: &mut ShardWriter, main: &Path, release: Release) {
+        let mut conn = db::open_at(&shard_path(main, writer.shard)).unwrap();
+        writer.save(&mut conn, &Ids::new(main), [std::slice::from_ref(&release)]).unwrap();
+    }
+
+    #[test]
+    fn between_walks_a_writer_seals_the_files_its_saves_completed() {
+        let (_dir, main) = sealed_fixture();
+        let shard = shard_of("alt.binaries.t");
+        let mut conn = db::open_at(&shard_path(&main, shard)).unwrap();
+        let mut writer = ShardWriter::new(shard);
+        let now: i64 = conn.query_row("select unixepoch()", [], |r| r.get(0)).unwrap();
+        // the walk seals a.rar (complete), b.rar has 1 of 2
+        assert_eq!(writer.seal_some(&mut conn, now).unwrap(), 1);
+
+        // another writer completes b.rar: not this writer's, and no walk yet
+        let b2 = |id: &str| Release {
+            name: "Rel".into(),
+            group: "alt.binaries.t".into(),
+            articles: vec![Article {
+                message_id: id.into(),
+                filename: Some("b.rar".into()),
+                part: Some(2),
+                total_parts: Some(2),
+                bytes: 102,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        save(&main, &[b2("<b2@x>")]).unwrap();
+        assert_eq!(writer.seal_some(&mut conn, now + 1).unwrap(), 0, "not from this writer's saves");
+
+        // a file this writer's save completes seals on the next tick
+        let mut other = ShardWriter::new(shard);
+        let c = Release {
+            name: "Rel".into(),
+            group: "alt.binaries.t".into(),
+            articles: vec![Article {
+                message_id: "<c1@x>".into(),
+                filename: Some("c.rar".into()),
+                part: Some(1),
+                total_parts: Some(1),
+                bytes: 5,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        save_with(&mut other, &main, c);
+        assert_eq!(other.seal_some(&mut conn, now + 1).unwrap(), 2, "c.rar from its save, b.rar from its first walk");
+        save_with(&mut writer, &main, b2("<b2-again@x>"));
+        let rows: i64 = conn.query_row("select count(*) from segments", [], |r| r.get(0)).unwrap();
+        assert_eq!(rows, 1, "b.rar got a row, it's sealed and complete: waits to be stale");
+        assert_eq!(writer.seal_some(&mut conn, now + 2).unwrap(), 0);
+    }
+
+    #[test]
+    fn writers_leave_files_untouched_since_the_upgrade_to_compaction() {
+        let (_dir, main) = sealed_fixture();
+        let shard = shard_of("alt.binaries.t");
+        let mut conn = db::open_at(&shard_path(&main, shard)).unwrap();
+        conn.execute("update files set touched_at = null", []).unwrap();
+        let now: i64 = conn.query_row("select unixepoch()", [], |r| r.get(0)).unwrap();
+        let mut writer = ShardWriter::new(shard);
+        assert_eq!(writer.seal_some(&mut conn, now).unwrap(), 0, "complete or not, a legacy file waits");
+        assert_eq!(writer.seal_some(&mut conn, now + SEAL_WALK_EVERY).unwrap(), 0);
+        // compaction still takes them
+        assert!(due(Some(3), &[0b1110], None, false, now));
+        assert!(due(Some(2), &[0b0010], None, false, now));
     }
 
     #[test]
