@@ -49,6 +49,7 @@ atlas.db-*
 # the shards, and files the conversion and compaction leave while they run
 atlas.*.db
 atlas.*.db-*
+atlas.compacting
 status.json
 stats.json
 *.json.tmp

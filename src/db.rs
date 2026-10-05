@@ -264,17 +264,22 @@ fn rebuild_articles_unique(conn: &Connection) -> Result<()> {
     })
 }
 
-/// Save releases from outside the indexer (AI search), each into its group's shard.
-pub fn save_releases_bulk(releases: &[Release]) -> Result<()> {
+/// Save releases from outside the indexer (AI search), each into its group's
+/// shard. Refused while the database is being compacted.
+pub fn save_releases_bulk(releases: &[Release]) -> anyhow::Result<()> {
     if releases.is_empty() {
         return Ok(());
     }
-    store::save(&paths::database(), releases)
+    let main = paths::database();
+    crate::compact::refuse_while_compacting(&main)?;
+    Ok(store::save(&main, releases)?)
 }
 
-/// delete incomplete releases, returns bytes freed on disk
-pub fn purge_broken() -> Result<i64> {
+/// delete incomplete releases, returns bytes freed on disk. Refused while the
+/// database is being compacted.
+pub fn purge_broken() -> anyhow::Result<i64> {
     let main = paths::database();
+    crate::compact::refuse_while_compacting(&main)?;
     let size =
         || store::shard_paths(&main).iter().map(|p| fs::metadata(p).map(|m| m.len() as i64).unwrap_or(0)).sum::<i64>();
     let before = size();

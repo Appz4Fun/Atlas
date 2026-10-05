@@ -51,6 +51,56 @@ fn size(path: &Path) -> u64 {
     std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
 }
 
+/// `atlas.compacting` next to `main`: there while a compaction runs, holding
+/// the pid and start time of the process running it.
+pub fn lock_path(main: &Path) -> PathBuf {
+    main.with_extension("compacting")
+}
+
+/// A compaction of `main` is running. A lock left by a process that is gone
+/// (or whose pid now belongs to another process) doesnt count.
+pub fn in_progress(main: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(lock_path(main)) else { return false };
+    let mut fields = text.split_whitespace().map(|f| f.parse::<u64>().ok());
+    let (Some(Some(pid)), Some(Some(started))) = (fields.next(), fields.next()) else { return false };
+    let Ok(pid) = u32::try_from(pid) else { return false };
+    // 0: the process couldnt see its own start time, the pid alone counts
+    crate::procs::started_at(pid).is_some_and(|t| started == 0 || t == started)
+}
+
+/// Writes from outside the indexer (AI search saves, purging) wait while
+/// `main` is being compacted: they would land in the original after its copy
+/// was taken and be lost when the copy replaces it.
+pub fn refuse_while_compacting(main: &Path) -> Result<()> {
+    if in_progress(main) {
+        bail!("the database is being compacted; try again later");
+    }
+    Ok(())
+}
+
+/// The lock file of a running compaction, removed when dropped (done,
+/// failed or stopped).
+struct Lock(PathBuf);
+
+impl Lock {
+    fn take(main: &Path) -> Result<Lock> {
+        if in_progress(main) {
+            bail!("another compaction of {} is running", main.display());
+        }
+        let pid = std::process::id();
+        let started = crate::procs::started_at(pid).unwrap_or(0);
+        let path = lock_path(main);
+        std::fs::write(&path, format!("{pid} {started}")).with_context(|| format!("writing {}", path.display()))?;
+        Ok(Lock(path))
+    }
+}
+
+impl Drop for Lock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 /// What compacting one shard did.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Shrunk {
@@ -87,6 +137,7 @@ pub fn run(main: &Path, progress: &(dyn Fn(&str) + Sync), stop: &Arc<AtomicBool>
     if !store::exists(main) {
         bail!("{} has no shards (convert it first)", main.display());
     }
+    let _lock = Lock::take(main)?;
     let started = Instant::now();
     let mut total = Shrunk::default();
     let mut failed: Vec<(usize, String)> = Vec::new();
@@ -469,6 +520,44 @@ mod tests {
 
     fn no_stop() -> Arc<AtomicBool> {
         Arc::new(AtomicBool::new(false))
+    }
+
+    #[test]
+    fn writes_from_outside_are_refused_while_compacting() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        db::create_db_at(&main).unwrap();
+        assert!(refuse_while_compacting(&main).is_ok());
+
+        // seen from the progress messages, while the run is going
+        let refused = std::sync::Mutex::new(Vec::new());
+        let progress = |_: &str| refused.lock().unwrap().push(refuse_while_compacting(&main).is_err());
+        run(&main, &progress, &no_stop()).unwrap();
+        let refused = refused.into_inner().unwrap();
+        assert!(!refused.is_empty() && refused.iter().all(|r| *r), "refused all through the run: {refused:?}");
+        assert!(refuse_while_compacting(&main).is_ok(), "and not after it");
+        assert!(!lock_path(&main).exists());
+
+        // stopped or failing: the lock goes too
+        let stop = Arc::new(AtomicBool::new(true));
+        assert!(run(&main, &|_| {}, &stop).is_err());
+        assert!(!lock_path(&main).exists());
+    }
+
+    #[test]
+    fn a_lock_left_by_a_dead_process_doesnt_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        let pid = std::process::id();
+        let started = crate::procs::started_at(pid).unwrap();
+        std::fs::write(lock_path(&main), format!("{pid} {started}")).unwrap();
+        let err = refuse_while_compacting(&main).unwrap_err().to_string();
+        assert_eq!(err, "the database is being compacted; try again later");
+        // the same pid but a different start: the pid was reused
+        std::fs::write(lock_path(&main), format!("{pid} {}", started + 1)).unwrap();
+        assert!(refuse_while_compacting(&main).is_ok());
+        std::fs::write(lock_path(&main), "junk").unwrap();
+        assert!(refuse_while_compacting(&main).is_ok());
     }
 
     /// every release's NZB rows, by id

@@ -65,6 +65,7 @@ fn compacts_on_schedule_and_keeps_indexing() {
     // every shard is a new file (compacting writes a copy and swaps it in),
     // and none of the copying is left lying around
     assert!(inodes().iter().zip(&before).all(|(now, was)| now != was), "every shard was rewritten");
+    assert!(!home.path().join("atlas.compacting").exists(), "the compaction lock is gone");
     for shard in &shards {
         for suffix in ["compact", "precompact"] {
             let stem = shard.file_stem().unwrap().to_string_lossy().into_owned();

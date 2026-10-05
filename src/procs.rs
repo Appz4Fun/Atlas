@@ -62,6 +62,13 @@ pub fn is_indexer_pid(pid: i64) -> bool {
     .unwrap_or(false)
 }
 
+/// When process `pid` started (seconds since the epoch), None when it isnt running.
+pub fn started_at(pid: u32) -> Option<u64> {
+    reap();
+    with_process(pid, |p| (!matches!(p.status(), ProcessStatus::Zombie | ProcessStatus::Dead)).then(|| p.start_time()))
+        .flatten()
+}
+
 fn read_pid() -> Option<i64> {
     let text = fs::read_to_string(paths::pid_file()).ok()?;
     match text.trim().parse() {

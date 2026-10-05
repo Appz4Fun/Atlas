@@ -128,6 +128,11 @@ pub fn fetch_group_candidates(config: &Config, limit: usize) -> Vec<String> {
 
 /// Pull the newest headers from each group, keep keyword matches, save em.
 pub fn fetch_and_store(config: &Config, groups: &[String], keywords: &[String], max_per_group: i64) -> usize {
+    // nothing could be saved: dont fetch either
+    if let Err(e) = crate::compact::refuse_while_compacting(&crate::paths::database()) {
+        println!("{e}");
+        return 0;
+    }
     let client = client_for(config);
     let mut saved = 0;
 
