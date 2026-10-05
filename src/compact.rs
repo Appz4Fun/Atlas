@@ -51,53 +51,80 @@ fn size(path: &Path) -> u64 {
     std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
 }
 
-/// `atlas.compacting` next to `main`: there while a compaction runs, holding
-/// the pid and start time of the process running it.
+/// `atlas.compacting` next to `main`: a compaction holds it locked
+/// exclusively for its whole run, and a write from outside the indexer holds
+/// it shared for its own. The OS lets go of a lock when its process ends, soo
+/// a crash leaves nothing to clean up. The file itself stays (removing a file
+/// someone may be locking races them).
 pub fn lock_path(main: &Path) -> PathBuf {
     main.with_extension("compacting")
 }
 
-/// A compaction of `main` is running. A lock left by a process that is gone
-/// (or whose pid now belongs to another process) doesnt count.
-pub fn in_progress(main: &Path) -> bool {
-    let Ok(text) = std::fs::read_to_string(lock_path(main)) else { return false };
-    let mut fields = text.split_whitespace().map(|f| f.parse::<u64>().ok());
-    let (Some(Some(pid)), Some(Some(started))) = (fields.next(), fields.next()) else { return false };
-    let Ok(pid) = u32::try_from(pid) else { return false };
-    // 0: the process couldnt see its own start time, the pid alone counts
-    crate::procs::started_at(pid).is_some_and(|t| started == 0 || t == started)
+fn open_lock(main: &Path) -> Result<std::fs::File> {
+    let path = lock_path(main);
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .with_context(|| format!("opening {}", path.display()))
 }
 
-/// Writes from outside the indexer (AI search saves, purging) wait while
-/// `main` is being compacted: they would land in the original after its copy
-/// was taken and be lost when the copy replaces it.
-pub fn refuse_while_compacting(main: &Path) -> Result<()> {
-    if in_progress(main) {
-        bail!("the database is being compacted; try again later");
+/// A compaction couldnt start: another one, or a write from outside the
+/// indexer, holds the lock.
+#[derive(Debug)]
+pub struct Busy;
+
+impl std::fmt::Display for Busy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "another compaction or a database write holds the lock")
     }
-    Ok(())
 }
 
-/// The lock file of a running compaction, removed when dropped (done,
-/// failed or stopped).
-struct Lock(PathBuf);
+impl std::error::Error for Busy {}
+
+/// Writes from outside the indexer (AI search saves, purging) hold this for
+/// their whole run: they would land in the original after a compaction took
+/// its copy, and be lost when the copy replaces it. Refused while a
+/// compaction runs; a compaction cant start while one is held.
+#[must_use = "the write is only safe while the guard is held"]
+pub struct WriteGuard(std::fs::File);
+
+/// Hold off compaction for a write from outside the indexer, see `WriteGuard`.
+pub fn hold_off_compaction(main: &Path) -> Result<WriteGuard> {
+    let file = open_lock(main)?;
+    match file.try_lock_shared() {
+        Ok(()) => Ok(WriteGuard(file)),
+        Err(std::fs::TryLockError::WouldBlock) => bail!("the database is being compacted; try again later"),
+        Err(std::fs::TryLockError::Error(e)) => Err(e).context("locking the database for a write"),
+    }
+}
+
+impl Drop for WriteGuard {
+    fn drop(&mut self) {
+        // closing the file lets go too, but Windows may take a while to
+        let _ = self.0.unlock();
+    }
+}
+
+/// The lock of a running compaction, let go when dropped (done, failed or stopped).
+struct Lock(std::fs::File);
 
 impl Lock {
     fn take(main: &Path) -> Result<Lock> {
-        if in_progress(main) {
-            bail!("another compaction of {} is running", main.display());
+        let file = open_lock(main)?;
+        match file.try_lock() {
+            Ok(()) => Ok(Lock(file)),
+            Err(std::fs::TryLockError::WouldBlock) => Err(Busy.into()),
+            Err(std::fs::TryLockError::Error(e)) => Err(e).context("locking the database for compacting"),
         }
-        let pid = std::process::id();
-        let started = crate::procs::started_at(pid).unwrap_or(0);
-        let path = lock_path(main);
-        std::fs::write(&path, format!("{pid} {started}")).with_context(|| format!("writing {}", path.display()))?;
-        Ok(Lock(path))
     }
 }
 
 impl Drop for Lock {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+        let _ = self.0.unlock();
     }
 }
 
@@ -567,42 +594,68 @@ mod tests {
         );
     }
 
+    fn busy(r: Result<Shrunk>) -> bool {
+        r.is_err_and(|e| e.downcast_ref::<Busy>().is_some())
+    }
+
     #[test]
     fn writes_from_outside_are_refused_while_compacting() {
         let dir = tempfile::tempdir().unwrap();
         let main = dir.path().join("atlas.db");
         db::create_db_at(&main).unwrap();
-        assert!(refuse_while_compacting(&main).is_ok());
+        drop(hold_off_compaction(&main).unwrap());
 
         // seen from the progress messages, while the run is going
         let refused = std::sync::Mutex::new(Vec::new());
-        let progress = |_: &str| refused.lock().unwrap().push(refuse_while_compacting(&main).is_err());
+        let progress = |_: &str| refused.lock().unwrap().push(hold_off_compaction(&main).err().map(|e| e.to_string()));
         run(&main, &progress, &no_stop()).unwrap();
         let refused = refused.into_inner().unwrap();
-        assert!(!refused.is_empty() && refused.iter().all(|r| *r), "refused all through the run: {refused:?}");
-        assert!(refuse_while_compacting(&main).is_ok(), "and not after it");
-        assert!(!lock_path(&main).exists());
+        assert!(
+            !refused.is_empty()
+                && refused.iter().all(|r| r.as_deref() == Some("the database is being compacted; try again later")),
+            "refused all through the run: {refused:?}"
+        );
+        assert!(hold_off_compaction(&main).is_ok(), "and not after it");
 
         // stopped or failing: the lock goes too
         let stop = Arc::new(AtomicBool::new(true));
         assert!(run(&main, &|_| {}, &stop).is_err());
-        assert!(!lock_path(&main).exists());
+        assert!(hold_off_compaction(&main).is_ok());
     }
 
     #[test]
-    fn a_lock_left_by_a_dead_process_doesnt_count() {
+    fn a_second_compaction_at_once_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let main = dir.path().join("atlas.db");
-        let pid = std::process::id();
-        let started = crate::procs::started_at(pid).unwrap();
-        std::fs::write(lock_path(&main), format!("{pid} {started}")).unwrap();
-        let err = refuse_while_compacting(&main).unwrap_err().to_string();
-        assert_eq!(err, "the database is being compacted; try again later");
-        // the same pid but a different start: the pid was reused
-        std::fs::write(lock_path(&main), format!("{pid} {}", started + 1)).unwrap();
-        assert!(refuse_while_compacting(&main).is_ok());
-        std::fs::write(lock_path(&main), "junk").unwrap();
-        assert!(refuse_while_compacting(&main).is_ok());
+        db::create_db_at(&main).unwrap();
+
+        let second = std::sync::Mutex::new(Vec::new());
+        let progress = |_: &str| {
+            let mut second = second.lock().unwrap();
+            if second.is_empty() {
+                second.push(run(&main, &|_| {}, &no_stop()));
+            }
+        };
+        run(&main, &progress, &no_stop()).unwrap();
+        let second = second.into_inner().unwrap().pop().expect("the second ran during the first");
+        assert!(busy(second), "the second was refused, the first finished");
+    }
+
+    #[test]
+    fn a_write_from_outside_holds_off_compaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        db::create_db_at(&main).unwrap();
+
+        let write = hold_off_compaction(&main).unwrap();
+        // writes dont hold each other off
+        let other = hold_off_compaction(&main).unwrap();
+        assert!(busy(run(&main, &|_| {}, &no_stop())));
+        assert!(!store::shard_paths(&main).iter().any(|p| with_suffix(p, "compact").exists()), "nothing was started");
+        drop((write, other));
+        run(&main, &|_| {}, &no_stop()).unwrap();
+        assert!(lock_path(&main).exists(), "the lock file stays, unlocked");
+        assert!(hold_off_compaction(&main).is_ok());
     }
 
     /// every release's NZB rows, by id
