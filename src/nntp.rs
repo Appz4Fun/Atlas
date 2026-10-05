@@ -160,6 +160,10 @@ const DOWN_FOR: Duration = Duration::from_secs(60);
 const GROUP_REFUSALS: usize = 3;
 /// how often a request in flight looks at the stop flag
 const STOP_POLL: Duration = Duration::from_millis(50);
+/// fetched slices a pass lets wait for it to save them, besides the ones its
+/// connections hold (the unsaved budget bounds them all, this keeps one pass
+/// from taking a big share of it)
+const SLICES_BUFFERED: usize = 4;
 
 /// `fut`'s output, or None as soon as `stop` is set: stopping doesnt wait on
 /// a provider that went quiet mid reply. Dropping a request part way is safe,
@@ -781,6 +785,58 @@ pub struct Pool {
     timeout: Duration,
     /// groups their first choice server doesnt carry: the server that does
     homes: Mutex<HashMap<String, usize>>,
+    unsaved: Arc<UnsavedBudget>,
+}
+
+/// Headers fetched (or on their way) and not saved yet, over every pass on a
+/// pool: what bounds the indexer's memory. A slice takes its article numbers
+/// from it before its XOVER goes out, gives back what didnt come (gaps, an
+/// empty or failed slice) once the reply is in, and the rest once it's saved.
+struct UnsavedBudget {
+    permits: Arc<Semaphore>,
+    cap: usize,
+    /// held right now, and the most ever held at once
+    now: AtomicUsize,
+    peak: AtomicUsize,
+}
+
+impl UnsavedBudget {
+    fn new(cap: usize) -> Arc<Self> {
+        let cap = cap.clamp(1, Semaphore::MAX_PERMITS.min(u32::MAX as usize));
+        Arc::new(UnsavedBudget {
+            permits: Arc::new(Semaphore::new(cap)),
+            cap,
+            now: AtomicUsize::new(0),
+            peak: AtomicUsize::new(0),
+        })
+    }
+}
+
+/// A slice's room in the unsaved budget, given back when dropped.
+pub struct Unsaved {
+    permit: OwnedSemaphorePermit,
+    budget: Arc<UnsavedBudget>,
+}
+
+impl Unsaved {
+    /// give back all but `headers`
+    fn keep(&mut self, headers: usize) {
+        let extra = self.permit.num_permits().saturating_sub(headers);
+        if extra > 0
+            && let Some(back) = self.permit.split(extra)
+        {
+            self.budget.now.fetch_sub(extra, Ordering::Relaxed);
+            drop(back);
+        }
+    }
+}
+
+impl Drop for Unsaved {
+    fn drop(&mut self) {
+        // counted down before the permit goes back (right after this), soo
+        // `now` never shows more than the cap
+        self.budget.now.fetch_sub(self.permit.num_permits(), Ordering::Relaxed);
+    }
 }
 
 impl Pool {
@@ -811,12 +867,46 @@ impl Pool {
             failed_over_at: Mutex::new(None),
             timeout: DEFAULT_TIMEOUT,
             homes: Mutex::new(HashMap::new()),
+            unsaved: UnsavedBudget::new(crate::config::DEFAULT_MAX_UNSAVED_HEADERS as usize),
         }
     }
 
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
+    }
+
+    /// At most `headers` fetched and not saved yet, over every pass at once.
+    pub fn with_max_unsaved(mut self, headers: usize) -> Self {
+        self.unsaved = UnsavedBudget::new(headers);
+        self
+    }
+
+    /// the cap on headers fetched and not saved yet
+    pub fn max_unsaved(&self) -> usize {
+        self.unsaved.cap
+    }
+
+    /// headers fetched (or being fetched) and not saved yet, right now
+    pub fn unsaved_headers(&self) -> usize {
+        self.unsaved.now.load(Ordering::Relaxed)
+    }
+
+    /// the most headers that were ever unsaved at once
+    pub fn unsaved_peak(&self) -> usize {
+        self.unsaved.peak.load(Ordering::Relaxed)
+    }
+
+    /// Room for a slice of `numbers` article numbers in the unsaved budget,
+    /// waiting until there is. A slice bigger than the whole budget waits for
+    /// all of it.
+    async fn reserve_unsaved(&self, numbers: u64) -> Unsaved {
+        let budget = self.unsaved.clone();
+        let n = usize::try_from(numbers).unwrap_or(usize::MAX).clamp(1, budget.cap);
+        let permit = budget.permits.clone().acquire_many_owned(n as u32).await.expect("semaphore closed");
+        let now = budget.now.fetch_add(n, Ordering::Relaxed) + n;
+        budget.peak.fetch_max(now, Ordering::Relaxed);
+        Unsaved { permit, budget }
     }
 
     pub fn len(&self) -> usize {
@@ -1408,6 +1498,14 @@ impl Pool {
     /// soon as it is free. No new slices are started once `stop` is set or a
     /// slice fails with anything but 423 (empty) / 5xx (not available), and
     /// once `stop` is set the slices still in flight are dropped unsent.
+    ///
+    /// Every slice holds its room in the pool's unsaved budget (`Unsaved`)
+    /// until the receiver drops it, soo a receiver keeps it until the slice is
+    /// saved. The room is taken before a connection, and the slices of one
+    /// stream take it in order, one waiting at a time. Nothing that holds room
+    /// waits for more: a slice holding some is fetching (and needs only a
+    /// connection, which no one waiting for room holds), waiting in the
+    /// channel for its receiver, or being saved, soo room always comes free.
     pub fn stream_headers(
         self: &Arc<Self>,
         group: &str,
@@ -1419,8 +1517,8 @@ impl Pool {
         // several groups can stream from one server at once, the server's
         // semaphore keeps the total at its `connections`
         let workers = self.connections(i).max(1).min(slices.len().max(1));
-        let (tx, rx) = tokio::sync::mpsc::channel(workers * 2);
-        let queue = Arc::new(Mutex::new(std::collections::VecDeque::from(slices)));
+        let (tx, rx) = tokio::sync::mpsc::channel(SLICES_BUFFERED);
+        let queue = Arc::new(tokio::sync::Mutex::new(std::collections::VecDeque::from(slices)));
         let halt = Arc::new(AtomicBool::new(false));
 
         for _ in 0..workers {
@@ -1433,10 +1531,22 @@ impl Pool {
                         return;
                     }
 
-                    let Some((start, end)) = queue.lock().unwrap().pop_front() else { return };
+                    // the next slice and its room, the queue held meanwhile
+                    let ((start, end), mut unsaved) = {
+                        let mut queue = queue.lock().await;
+                        let Some((start, end)) = queue.pop_front() else { return };
+                        let room = pool.reserve_unsaved(end.saturating_sub(start).saturating_add(1));
+                        let Some(unsaved) = unless_stopped(&stop, room).await else { return };
+                        ((start, end), unsaved)
+                    };
+                    if halt.load(Ordering::Relaxed) {
+                        return;
+                    }
+
                     let Some(result) = unless_stopped(&stop, pool.xover_on(i, &group, start, end)).await else {
                         return;
                     };
+                    unsaved.keep(result.as_ref().map_or(0, Vec::len));
 
                     if let Err(e) = &result
                         && e.code() != Some(423)
@@ -1445,7 +1555,7 @@ impl Pool {
                         halt.store(true, Ordering::Relaxed);
                     }
 
-                    if tx.send(HeaderSlice { start, end, result }).await.is_err() {
+                    if tx.send(HeaderSlice { start, end, result, unsaved }).await.is_err() {
                         return;
                     }
                 }
@@ -1542,6 +1652,8 @@ pub struct HeaderSlice {
     pub start: u64,
     pub end: u64,
     pub result: Result<Vec<Overview>>,
+    /// the slice's room in the unsaved budget: keep it until the slice is saved
+    pub unsaved: Unsaved,
 }
 
 /// For each job, fetch its message-ids in order until `extract` gives a
@@ -1585,7 +1697,7 @@ impl BlockingPool {
     }
 
     pub fn from_config(cfg: &crate::config::Config) -> Self {
-        Self::new(&cfg.servers)
+        Self::from_pool(Pool::new(&cfg.servers).with_max_unsaved(cfg.max_unsaved_headers()))
     }
 
     pub fn from_pool(pool: Pool) -> Self {

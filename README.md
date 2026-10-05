@@ -140,6 +140,7 @@ On first run, Atlas asks for one server (host, username, password, and port) and
 | `api_key` | generated | Newznab API key. Atlas creates it on first start and stores it here. |
 | `split_min_backlog` | `10000000` | Article numbers of backfill left before a group's backfill is split into day chunks that every server carrying the group can take. |
 | `auto_run_compact` | `false` | Compact the database every 24 hours; indexing pauses while it runs. |
+| `max_unsaved_headers` | `500000` | Headers the indexer fetches ahead of saving them, over all groups at once. This bounds its memory: 500,000 headers take about 0.3 GB. A header request waits for room before it goes out, and its room comes back once its slice is saved. Raise it if the Bottleneck page shows it full while the database writers and connections have time to spare. |
 
 Atlas keeps any other keys you add to the file when it saves it.
 
@@ -176,7 +177,7 @@ Atlas also handles these provider quirks on its own:
 The background indexer reads `config.json` again every 5 seconds:
 
 - New groups, `index_mode`, `batch_size`, `request_size`, and `auto_run_compact` apply immediately.
-- Changes to servers, logins, `connections`, or `parallel_groups` rebuild the connection pool. A login you fix in the file, or in **Settings > Usenet servers**, takes effect within a few seconds.
+- Changes to servers, logins, `connections`, `parallel_groups`, or `max_unsaved_headers` rebuild the connection pool. A login you fix in the file, or in **Settings > Usenet servers**, takes effect within a few seconds.
 - `api_host` and `api_port` apply when the API restarts. Restart Atlas, or use **Settings > Change API port**.
 
 ### Measure connection limits
@@ -356,7 +357,7 @@ Names what limits indexing right now, and shows how busy each resource has been 
 | Database writer | Share of the time the writer thread spends saving slices, how many slices wait for it, and how many slices go into each transaction. |
 | Usenet connections | Connections in use against what the providers allow, and requests waiting for a free connection. |
 | CPU | Cores the indexer uses, and how many of them parse headers. |
-| Memory | System memory in use. |
+| Memory | System memory in use, and headers fetched but not saved yet against `max_unsaved_headers`. |
 | Provider latency | How long a header request takes, and how many requests are in flight. |
 | Network | Data received from the servers per second. |
 | Disk | Data the indexer reads from and writes to disk per second. |

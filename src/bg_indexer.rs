@@ -442,7 +442,10 @@ impl Scheduler {
         stats.extra.insert("groups_configured".into(), json!(groups.len()));
         stats.extra.insert("workers".into(), json!(self.workers));
         stats.extra.insert("pid".into(), json!(std::process::id()));
-        stats.extra.insert("load".into(), crate::profile::LOAD.snapshot());
+        let mut load = crate::profile::LOAD.snapshot();
+        load["unsaved_headers"] = json!(self.ctx.pool.unsaved_headers());
+        load["max_unsaved_headers"] = json!(self.ctx.pool.max_unsaved());
+        stats.extra.insert("load".into(), load);
         stats.write("", &mode, true, idle);
     }
 }
@@ -523,8 +526,8 @@ async fn worker(sched: Arc<Scheduler>, server: usize, db: Db) {
 }
 
 /// Re-read config.json while indexing: new groups / mode / batch settings /
-/// auto compaction apply right away. Returns when servers or the parallelism
-/// changed (the caller rebuilds) or when stopping.
+/// auto compaction apply right away. Returns when servers, the parallelism or
+/// the unsaved headers cap changed (the caller rebuilds) or when stopping.
 async fn watch_config(sched: Arc<Scheduler>, servers: Vec<UsenetServer>) {
     loop {
         nap(CONFIG_RELOAD, || sched.stopping()).await;
@@ -534,7 +537,10 @@ async fn watch_config(sched: Arc<Scheduler>, servers: Vec<UsenetServer>) {
 
         let Some(config) = load_config() else { continue };
 
-        if usable_servers(&config) != servers || plan_workers(&config) != sched.plan {
+        if usable_servers(&config) != servers
+            || plan_workers(&config) != sched.plan
+            || config.max_unsaved_headers() != sched.ctx.pool.max_unsaved()
+        {
             println!("config changed, restarting the indexer");
             sched.wind_down.store(true, Ordering::Relaxed);
             return;
@@ -782,7 +788,7 @@ async fn supervise(stop: Arc<AtomicBool>, stats: Arc<Mutex<Stats>>) -> i32 {
         }
         started = true;
 
-        let pool = Arc::new(Pool::new(&servers));
+        let pool = Arc::new(Pool::new(&servers).with_max_unsaved(config.max_unsaved_headers()));
 
         // at least one server has to answer before spinning everything up
         if let Err(e) = pool.connect().await {

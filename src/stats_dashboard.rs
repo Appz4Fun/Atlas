@@ -342,6 +342,9 @@ struct LoadRates {
     writer_busy: f64,
     /// slices waiting for the writer now
     queued: u64,
+    /// headers fetched and not saved yet now, and the cap on them
+    unsaved: u64,
+    max_unsaved: u64,
     /// slices saved per transaction
     per_batch: f64,
     /// share of the time the writer spent finishing checkpoints (part of writer_busy)
@@ -379,6 +382,8 @@ fn load_rates(old: &Reading, new: &Reading) -> Option<LoadRates> {
     Some(LoadRates {
         writer_busy: (ns("writer_busy_ns") / dt / writers).min(1.0),
         queued: new.load["writer_queued"].as_u64().unwrap_or(0),
+        unsaved: new.load["unsaved_headers"].as_u64().unwrap_or(0),
+        max_unsaved: new.load["max_unsaved_headers"].as_u64().unwrap_or(0),
         per_batch: if batches > 0.0 { delta("writer_slices") / batches } else { 0.0 },
         writer_checkpoint: (ns("writer_checkpoint_ns") / dt / writers).min(1.0),
         latency: if xovers > 0.0 { ns("xover_ns") / xovers } else { 0.0 },
@@ -1064,7 +1069,13 @@ fn draw_bottleneck(f: &mut Frame, app: &App, area: Rect) {
         (
             "memory",
             Some(mem_share),
-            format!("{} of {} used", human_bytes(app.mem_used as f64), human_bytes(app.mem_total as f64)),
+            format!(
+                "{} of {} used, {} of {} headers fetched and not saved yet",
+                human_bytes(app.mem_used as f64),
+                human_bytes(app.mem_total as f64),
+                r.unsaved,
+                r.max_unsaved
+            ),
         ),
         (
             "provider latency",
@@ -1327,6 +1338,7 @@ mod tests {
                 load: serde_json::json!({
                     "at": at, "writer_busy_ns": (busy_s * 1e9) as u64, "writer_slices": slices, "writer_batches": batches,
                     "writer_queued": 7, "xover_ns": (xover_s * 1e9) as u64, "xovers": xovers,
+                    "unsaved_headers": 120_000, "max_unsaved_headers": 500_000,
                     "lease_wait_ns": (wait_s * 1e9) as u64, "parse_ns": 0
                 }),
                 disk: Some((at, disk, 0)),
@@ -1341,6 +1353,7 @@ mod tests {
         .unwrap();
         assert!((r.writer_busy - 0.95).abs() < 1e-9);
         assert_eq!((r.queued, r.per_batch), (7, 8.0));
+        assert_eq!((r.unsaved, r.max_unsaved), (120_000, 500_000));
         assert!((r.latency - 2.0).abs() < 1e-9 && (r.in_flight - 40.0).abs() < 1e-9);
         assert!((r.disk_read - 1e6).abs() < 1e-3);
 

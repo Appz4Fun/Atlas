@@ -865,6 +865,9 @@ impl Pass<'_> {
         let (mut low, mut high): (Option<db::Dated>, Option<db::Dated>) = (None, None);
 
         while let Some(slice) = rx.recv().await {
+            // the slice's room in the unsaved budget goes back once it's saved
+            // (or skipped), at the end of this loop
+            let _unsaved = slice.unsaved;
             let headers: Vec<Overview> = match slice.result {
                 Ok(h) => h,
                 // 423 = no articles in that slice

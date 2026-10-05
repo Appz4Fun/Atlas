@@ -25,6 +25,9 @@ pub const MAX_PARALLEL_GROUPS: usize = 256;
 /// measured on old articles, 10k per request got 3-6x the headers/s of 1k on
 /// one connection, and 50k was no better on most servers and erratic
 pub const DEFAULT_REQUEST_SIZE: u64 = 10_000;
+/// headers fetched and not saved yet, over every group at once, when
+/// config.json doesnt say (about 0.3GB of headers)
+pub const DEFAULT_MAX_UNSAVED_HEADERS: u64 = 500_000;
 /// article numbers of backfill left on a group's home server before its
 /// backfill is split into day chunks over every server that carries it
 pub const SPLIT_MIN_BACKLOG: i64 = 10_000_000;
@@ -136,6 +139,8 @@ pub struct Config {
     pub parallel_groups: Option<usize>,
     /// compact the database every 24 hours from the indexer
     pub auto_run_compact: bool,
+    /// None = DEFAULT_MAX_UNSAVED_HEADERS
+    pub max_unsaved_headers: Option<u64>,
 }
 
 impl Default for Config {
@@ -153,6 +158,7 @@ impl Default for Config {
             split_min_backlog: None,
             parallel_groups: None,
             auto_run_compact: false,
+            max_unsaved_headers: None,
         }
     }
 }
@@ -201,6 +207,12 @@ impl Config {
 
     pub fn request_size(&self) -> u64 {
         self.request_size.unwrap_or(DEFAULT_REQUEST_SIZE).max(1)
+    }
+
+    /// headers the indexer fetches ahead of saving them, over every group at once
+    pub fn max_unsaved_headers(&self) -> usize {
+        let n = self.max_unsaved_headers.unwrap_or(DEFAULT_MAX_UNSAVED_HEADERS).max(1);
+        usize::try_from(n).unwrap_or(usize::MAX)
     }
 
     /// article numbers of backfill left before a group's backfill is split
@@ -278,6 +290,11 @@ impl Config {
                 .and_then(|n| usize::try_from(n).ok())
                 .filter(|n| *n > 0),
             auto_run_compact: v.get("auto_run_compact").and_then(Value::as_bool).unwrap_or(false),
+            max_unsaved_headers: v
+                .get("max_unsaved_headers")
+                .and_then(as_int)
+                .and_then(|n| u64::try_from(n).ok())
+                .filter(|n| *n > 0),
         };
 
         cfg.sort_servers();
@@ -579,6 +596,17 @@ mod tests {
         assert_eq!(cfg.api_port(), 8000);
         assert_eq!(cfg.api_host, "127.0.0.1");
         assert_eq!(cfg.index_mode, "dynamic");
+        assert_eq!(cfg.max_unsaved_headers(), DEFAULT_MAX_UNSAVED_HEADERS as usize);
+    }
+
+    #[test]
+    fn max_unsaved_headers_from_the_file() {
+        let cfg = |v: Value| Config::from_value(&v).max_unsaved_headers();
+        assert_eq!(cfg(json!({"max_unsaved_headers": 2_000_000})), 2_000_000);
+        assert_eq!(cfg(json!({"max_unsaved_headers": "40000"})), 40_000);
+        // nonsense falls back to the default
+        assert_eq!(cfg(json!({"max_unsaved_headers": 0})), DEFAULT_MAX_UNSAVED_HEADERS as usize);
+        assert_eq!(cfg(json!({"max_unsaved_headers": -5})), DEFAULT_MAX_UNSAVED_HEADERS as usize);
     }
 
     #[test]
