@@ -1169,6 +1169,11 @@ impl Pool {
         }
     }
 
+    /// When the first article at or after `number` on server `i` was posted (unix seconds).
+    pub async fn posted_date(&self, i: usize, group: &str, number: u64) -> Result<Option<i64>> {
+        Ok(self.posted_at(i, group, number, 100).await?.map(|(_, t)| t))
+    }
+
     /// The first article number in `low..=high` on server `i` posted at or after
     /// `when` (unix seconds), `high + 1` when there is none. A binary search over
     /// small article requests (about 35 for a billion numbers, plus one to settle). Post dates are

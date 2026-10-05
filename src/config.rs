@@ -25,6 +25,9 @@ pub const MAX_PARALLEL_GROUPS: usize = 256;
 /// measured on old articles, 10k per request got 3-6x the headers/s of 1k on
 /// one connection, and 50k was no better on most servers and erratic
 pub const DEFAULT_REQUEST_SIZE: u64 = 10_000;
+/// article numbers of backfill left on a group's home server before its
+/// backfill is split into day chunks over every server that carries it
+pub const SPLIT_MIN_BACKLOG: i64 = 10_000_000;
 
 /// One usenet provider. Lower `priority` is tried first.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -127,6 +130,8 @@ pub struct Config {
     pub api_key: Option<String>,
     pub batch_size: Option<u64>,
     pub request_size: Option<u64>,
+    /// None = SPLIT_MIN_BACKLOG
+    pub split_min_backlog: Option<i64>,
     /// groups indexed at the same time, None = worked out from the connections
     pub parallel_groups: Option<usize>,
 }
@@ -143,6 +148,7 @@ impl Default for Config {
             api_key: None,
             batch_size: None,
             request_size: None,
+            split_min_backlog: None,
             parallel_groups: None,
         }
     }
@@ -192,6 +198,12 @@ impl Config {
 
     pub fn request_size(&self) -> u64 {
         self.request_size.unwrap_or(DEFAULT_REQUEST_SIZE).max(1)
+    }
+
+    /// article numbers of backfill left before a group's backfill is split
+    /// over every server that carries it
+    pub fn split_min_backlog(&self) -> i64 {
+        self.split_min_backlog.unwrap_or(SPLIT_MIN_BACKLOG).max(1)
     }
 
     /// the highest priority server
@@ -256,6 +268,7 @@ impl Config {
             api_key: v.get("api_key").and_then(Value::as_str).filter(|k| !k.is_empty()).map(String::from),
             batch_size: v.get("batch_size").and_then(as_int).and_then(|n| u64::try_from(n).ok()).filter(|n| *n > 0),
             request_size: v.get("request_size").and_then(as_int).and_then(|n| u64::try_from(n).ok()).filter(|n| *n > 0),
+            split_min_backlog: v.get("split_min_backlog").and_then(as_int).filter(|n| *n > 0),
             parallel_groups: v
                 .get("parallel_groups")
                 .and_then(as_int)
@@ -436,6 +449,10 @@ pub fn save_config(cfg: &Config) -> io::Result<()> {
 
     if let Some(key) = api_key {
         out.insert("api_key".into(), json!(key));
+    }
+
+    if let Some(n) = cfg.split_min_backlog {
+        out.insert("split_min_backlog".into(), json!(n));
     }
 
     write_json(&Value::Object(out), private)

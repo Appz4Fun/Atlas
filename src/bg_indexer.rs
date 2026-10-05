@@ -219,6 +219,7 @@ fn settings_of(config: &Config) -> PassSettings {
         mode: config.index_mode.clone(),
         batch_size: config.batch_size() as i64,
         request_size: config.request_size(),
+        split_min_backlog: config.split_min_backlog(),
     }
 }
 
@@ -253,6 +254,9 @@ struct Scheduler {
     next: Mutex<HashMap<usize, usize>>,
     /// groups a worker is on right now
     busy: Mutex<HashSet<String>>,
+    /// (group, server) pairs where the server said it doesnt carry the group,
+    /// soo its idle workers dont take that group's chunks
+    skip: Mutex<HashSet<(String, usize)>>,
     /// groups resting after going idle or after an error
     wait_until: Mutex<HashMap<String, Instant>>,
     /// consecutive errors per group
@@ -391,12 +395,42 @@ impl Scheduler {
     }
 }
 
+/// A day chunk of any split group for an idle worker on `server`: the newest
+/// one pending, among the groups this server hasnt said it lacks.
+async fn take_chunk(sched: &Scheduler, server: usize, db: &Db) -> Option<(String, i64)> {
+    let host = sched.ctx.pool.host(server);
+    let skip: Vec<String> =
+        sched.skip.lock().unwrap().iter().filter(|(_, s)| *s == server).map(|(g, _)| g.clone()).collect();
+    crate::indexer::claim_chunk(db, host, skip).await.ok().flatten()
+}
+
 /// One worker on `server`: index whichever of its groups is due next, again and again.
 /// All workers share one db connection, soo their writes queue up in order
 /// instead of racing for sqlite's write lock (and timing out on a busy db).
 async fn worker(sched: Arc<Scheduler>, server: usize, db: Db) {
     while !sched.stopping() {
         let Some(group) = sched.take_group(server) else {
+            // nothing of its own: help with a split group's day chunks. not
+            // marked busy, a group's chunks run on several servers at once
+            if let Some((group, day)) = take_chunk(&sched, server, &db).await {
+                let settings = sched.settings.read().unwrap().clone();
+                let stats = sched.stats.clone();
+                let mut progress = |p: &Progress| stats.lock().unwrap().tick(p.articles, p.bytes, p.releases, &group);
+                let chunk = crate::indexer::run_chunk(&sched.ctx, &settings, &db, &group, server, day, &mut progress);
+                match unless_stopped(&sched.ctx.stop, chunk).await {
+                    None => break,
+                    Some(Err(e)) if e.to_string().contains("isnt on") => {
+                        sched.skip.lock().unwrap().insert((group, server));
+                    }
+                    Some(Err(e)) => {
+                        ui::error(&format!("Indexing error ({group}, day chunk): {e}"));
+                        // the chunk went back, dont grab it again right away
+                        nap(Duration::from_secs(1), || sched.stopping()).await;
+                    }
+                    Some(Ok(_)) => {}
+                }
+                continue;
+            }
             nap(Duration::from_secs(1), || sched.stopping()).await;
             continue;
         };
@@ -493,6 +527,7 @@ async fn run_servers(
         workers,
         next: Mutex::new(HashMap::new()),
         busy: Mutex::new(HashSet::new()),
+        skip: Mutex::new(HashSet::new()),
         wait_until: Mutex::new(HashMap::new()),
         errors: Mutex::new(HashMap::new()),
         failed: Mutex::new(HashMap::new()),

@@ -89,6 +89,8 @@ pub struct PassSettings {
     pub batch_size: i64,
     /// article numbers per XOVER request
     pub request_size: u64,
+    /// backfill left on a group's home server before it is split into day chunks
+    pub split_min_backlog: i64,
 }
 
 impl Default for PassSettings {
@@ -97,6 +99,7 @@ impl Default for PassSettings {
             mode: "dynamic".into(),
             batch_size: DEFAULT_BATCH_SIZE as i64,
             request_size: DEFAULT_REQUEST_SIZE,
+            split_min_backlog: crate::config::SPLIT_MIN_BACKLOG,
         }
     }
 }
@@ -279,8 +282,36 @@ where
     let k = key.clone();
     on_db(db, move |conn| Ok(db::save_group_bounds(conn, &k, first, last)?)).await?;
 
-    let pass = Pass { ctx, settings, db, group, server, key };
     let phase = ctx.states.with(group, |st| st.phase);
+    let backfilling = settings.mode == "backfill" || (settings.mode != "live" && phase == Phase::Backfill);
+    if backfilling
+        && maybe_split(ctx, settings, db, group, server, first as u64, state.backfill_cursor.max(0) as u64).await?
+    {
+        // a split group's backfill is day chunks, this server takes the next one
+        let host = ctx.pool.host(server);
+        let g = group.to_string();
+        let claimed = on_db(db, move |conn| {
+            Ok(crate::chunks::claim(conn, std::slice::from_ref(&g), &host, chrono::Utc::now().timestamp())?)
+        })
+        .await?;
+        let r = match claimed {
+            Some((_, day)) => run_chunk(ctx, settings, db, group, server, day, progress).await,
+            None => {
+                // nothing pending: in backfill mode the group rests like a finished backfill
+                let idle = settings.mode == "backfill";
+                ctx.states.with(group, |st| {
+                    st.backfilling = false;
+                    st.idle |= idle;
+                });
+                Ok(Progress::default())
+            }
+        };
+        // dynamic mode takes turns, the next pass is live
+        ctx.states.with(group, |st| st.phase = Phase::Live);
+        return r;
+    }
+
+    let pass = Pass { ctx, settings, db, group, server, key };
 
     match settings.mode.as_str() {
         "live" => pass.live(state, last, progress).await,
@@ -296,6 +327,69 @@ where
             r
         }
     }
+}
+
+/// Split `group`'s backfill into day chunks when its home server still has
+/// more than `split_min_backlog` article numbers to go and another indexing
+/// server carries it too. Chunks run from the day at the home cursor back to
+/// the oldest day any carrying server has. True when the group is split.
+async fn maybe_split(
+    ctx: &PassContext,
+    settings: &PassSettings,
+    db: &Db,
+    group: &str,
+    home: usize,
+    first: u64,
+    cursor: u64,
+) -> Result<bool> {
+    let g = group.to_string();
+    if on_db(db, move |conn| Ok(crate::chunks::is_split(conn, &g)?)).await? {
+        return Ok(true);
+    }
+    if (cursor.saturating_sub(first) as i64) < settings.split_min_backlog {
+        return Ok(false);
+    }
+
+    // the newest day still to do: the post date at the home cursor
+    let newest_day = match ctx.pool.posted_date(home, group, cursor).await? {
+        Some(t) => crate::chunks::unix_day(t),
+        None => return Ok(false),
+    };
+
+    // the oldest day any other carrying server has
+    let mut oldest_day = newest_day;
+    let mut carriers = 1;
+    for other in ctx.pool.indexing_servers().into_iter().filter(|&s| s != home) {
+        let Ok((s, (_, low, _, _))) = ctx.pool.select_group_on(other, group).await else { continue };
+        if s != other {
+            continue;
+        }
+        if let Some(t) = ctx.pool.posted_date(other, group, low).await? {
+            carriers += 1;
+            oldest_day = oldest_day.min(crate::chunks::unix_day(t));
+        }
+    }
+    if let Some(t) = ctx.pool.posted_date(home, group, first).await? {
+        oldest_day = oldest_day.min(crate::chunks::unix_day(t));
+    }
+    if carriers < 2 {
+        return Ok(false);
+    }
+
+    let g = group.to_string();
+    let added = on_db(db, move |conn| Ok(crate::chunks::add(conn, &g, newest_day, oldest_day)?)).await?;
+    println!("[SPLIT] {group}: backfill split into {added} day chunks over {carriers} servers");
+    Ok(true)
+}
+
+/// Claim the newest chunk of any split group for `host`, except `skip`.
+pub async fn claim_chunk(db: &Db, host: String, skip: Vec<String>) -> Result<Option<(String, i64)>> {
+    on_db(db, move |conn| {
+        let groups: Vec<String> =
+            crate::chunks::split_groups(conn)?.into_iter().filter(|g| !skip.contains(g)).collect();
+        Ok(crate::chunks::claim(conn, &groups, &host, chrono::Utc::now().timestamp())?)
+    })
+    .await
 }
 
 /// a day chunk also takes this much on each side: post dates are only
@@ -706,8 +800,12 @@ impl Indexer {
             stop: self.stop.clone(),
             verbose: self.verbose,
         };
-        let settings =
-            PassSettings { mode: self.mode.clone(), batch_size: self.batch_size, request_size: self.request_size };
+        let settings = PassSettings {
+            mode: self.mode.clone(),
+            batch_size: self.batch_size,
+            request_size: self.request_size,
+            ..PassSettings::default()
+        };
         let db = self.db.clone();
 
         let saved = self.client.block_on(async {
