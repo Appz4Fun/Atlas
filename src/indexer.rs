@@ -184,6 +184,12 @@ fn writer(shard: usize, path: &std::path::Path, ids: &crate::store::Ids, jobs: s
             }
         }
         LOAD.writer_queued.fetch_sub(batch.len() as u64, Relaxed);
+        // nobody waits for a slice whose pass was dropped (stopping): its
+        // cursor didnt move and its headers get fetched again, soo skip it
+        batch.retain(|job| !job.done.is_closed());
+        if batch.is_empty() {
+            continue;
+        }
 
         let t = std::time::Instant::now();
         let result = match &mut opened {
@@ -206,15 +212,17 @@ fn writer(shard: usize, path: &std::path::Path, ids: &crate::store::Ids, jobs: s
         // housekeeping between transactions
         if let Ok(conn) = &mut opened {
             let t = std::time::Instant::now();
-            // more slices waiting: saving them comes first
-            let waiting = match jobs.try_recv() {
+            // more slices waiting: saving them comes first. a closed queue
+            // means the indexer is stopping, it waits for this thread
+            let seal = match jobs.try_recv() {
                 Ok(job) => {
                     next = Some(job);
-                    true
+                    false
                 }
-                Err(_) => false,
+                Err(std::sync::mpsc::TryRecvError::Empty) => saved,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => false,
             };
-            if saved && !waiting {
+            if seal {
                 let sealing = std::time::Instant::now();
                 if store.seal_some(conn, chrono::Utc::now().timestamp()).is_err() {
                     LOAD.writer_seal_errors.fetch_add(1, Relaxed);
@@ -231,7 +239,9 @@ fn writer(shard: usize, path: &std::path::Path, ids: &crate::store::Ids, jobs: s
 
 impl Db {
     /// Save one slice's releases. Returns once they are committed. Dropping
-    /// the future early leaves the slice queued: it still gets saved.
+    /// the future before the writer gets to the slice drops the slice too
+    /// (its pass didnt finish, soo the cursor didnt move past it); once the
+    /// writer has it, it gets saved.
     async fn save(&self, releases: Vec<Release>) -> Result<()> {
         // a slice is one group, soo one shard
         let Some(shard) = releases.first().map(|r| crate::store::shard_of(&r.group)) else { return Ok(()) };
@@ -918,5 +928,39 @@ mod tests {
         assert_eq!(make_slices(5, 5, 100, false), vec![(5, 5)]);
         assert!(make_slices(6, 5, 100, false).is_empty());
         assert_eq!(make_slices(u64::MAX - 1, u64::MAX, 10, false), vec![(u64::MAX - 1, u64::MAX)]);
+    }
+
+    #[test]
+    fn a_slice_nobody_waits_for_isnt_saved() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        db::create_db_at(&main).unwrap();
+        let shared = shared_db(db::open_at(&main).unwrap());
+        let release = |name: &str| Release {
+            name: name.into(),
+            group: "alt.binaries.t".into(),
+            articles: vec![crate::parser::Article { message_id: format!("<{name}@x>"), ..Default::default() }],
+            ..Default::default()
+        };
+
+        // a pass that was dropped while stopping: nobody waits for its slice
+        let (done, gone) = tokio::sync::oneshot::channel();
+        drop(gone);
+        crate::profile::LOAD.writer_queued.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let shard = crate::store::shard_of("alt.binaries.t");
+        shared.saves[shard].send(SaveJob { releases: vec![release("dropped")], done }).unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        rt.block_on(shared.save(vec![release("kept")])).unwrap();
+        drop(shared);
+
+        let conn = db::open_with_shards(&main).unwrap();
+        let names: Vec<String> = conn
+            .prepare("select name from releases")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(names, vec!["kept".to_string()]);
     }
 }
