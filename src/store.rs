@@ -92,7 +92,9 @@ pub fn create_main(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "create table if not exists meta (key TEXT PRIMARY KEY, value INTEGER);
          insert or ignore into meta (key, value) values ('next_seq', 1);",
-    )
+    )?;
+    crate::chunks::create(conn)?;
+    Ok(())
 }
 
 /// A shard's tables, if missing.

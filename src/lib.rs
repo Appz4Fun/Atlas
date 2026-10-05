@@ -5,6 +5,7 @@ pub mod api;
 pub mod app;
 pub mod atomic;
 pub mod bg_indexer;
+pub mod chunks;
 pub mod compact;
 pub mod config;
 pub mod convert;
