@@ -11,6 +11,7 @@ const PENDING: i64 = 0;
 const CLAIMED: i64 = 1;
 const DONE: i64 = 2;
 
+/// Initialize the backfill_chunks table if it doesn't exist.
 pub fn create(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "create table if not exists backfill_chunks (
@@ -31,48 +32,52 @@ pub fn unix_day(t: i64) -> i64 {
 
 /// Pending chunks for `newest_day` down to `oldest_day`, keeping any that exist.
 pub fn add(conn: &Connection, group: &str, newest_day: i64, oldest_day: i64) -> Result<usize> {
-    let mut insert = conn.prepare_cached("insert or ignore into backfill_chunks (grp, day, state) values (?, ?, ?)")?;
+    let tx = conn.unchecked_transaction()?;
     let mut added = 0;
-    for day in (oldest_day..=newest_day).rev() {
-        added += insert.execute(params![group, day, PENDING])?;
+    {
+        let mut insert =
+            tx.prepare_cached("insert or ignore into backfill_chunks (grp, day, state) values (?, ?, ?)")?;
+        for day in (oldest_day..=newest_day).rev() {
+            added += insert.execute(params![group, day, PENDING])?;
+        }
     }
+    tx.commit()?;
     Ok(added)
 }
 
+/// Check if a group has any chunks in backfill.
 pub fn is_split(conn: &Connection, group: &str) -> Result<bool> {
     conn.prepare_cached("select 1 from backfill_chunks where grp = ? limit 1")?.exists([group])
 }
 
-/// The newest chunk of `groups` that is pending or whose claim went stale,
-/// claimed for `host`. The indexer's main connection is the only writer, so select then update is safe.
+/// Atomically claim the newest chunk of `groups` that is pending or whose claim went stale.
 pub fn claim(conn: &Connection, groups: &[String], host: &str, now: i64) -> Result<Option<(String, i64)>> {
     if groups.is_empty() {
         return Ok(None);
     }
     let marks = vec!["?"; groups.len()].join(",");
     let sql = format!(
-        "select grp, day from backfill_chunks
-         where grp in ({marks}) and (state = {PENDING} or (state = {CLAIMED} and claimed_at < ?))
-         order by day desc limit 1"
+        "update backfill_chunks set state = ?, server = ?, claimed_at = ?
+         where (grp, day) = (select grp, day from backfill_chunks
+                             where grp in ({marks}) and (state = {PENDING} or (state = {CLAIMED} and claimed_at < ?))
+                             order by day desc limit 1)
+         returning grp, day"
     );
-    let mut values: Vec<rusqlite::types::Value> = groups.iter().map(|g| g.clone().into()).collect();
+    let mut values: Vec<rusqlite::types::Value> = vec![CLAIMED.into(), host.to_string().into(), now.into()];
+    values.extend(groups.iter().map(|g| g.clone().into()));
     values.push((now - CLAIM_TIMEOUT).into());
     let found: Option<(String, i64)> =
         conn.prepare(&sql)?.query_row(rusqlite::params_from_iter(values), |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
-    if let Some((group, day)) = &found {
-        conn.execute(
-            "update backfill_chunks set state = ?, server = ?, claimed_at = ? where grp = ? and day = ?",
-            params![CLAIMED, host, now, group, day],
-        )?;
-    }
     Ok(found)
 }
 
+/// Mark a chunk as done.
 pub fn finish(conn: &Connection, group: &str, day: i64) -> Result<()> {
     conn.execute("update backfill_chunks set state = ? where grp = ? and day = ?", params![DONE, group, day])?;
     Ok(())
 }
 
+/// Return a claimed chunk to pending state.
 pub fn release(conn: &Connection, group: &str, day: i64) -> Result<()> {
     conn.execute(
         "update backfill_chunks set state = ?, server = null, claimed_at = null where grp = ? and day = ?",
@@ -141,5 +146,35 @@ mod tests {
         assert!(!is_split(&c, "other").unwrap());
         assert_eq!(split_groups(&c).unwrap(), vec!["g".to_string()]);
         assert_eq!(unix_day(86_400 * 3 + 5), 3);
+    }
+
+    #[test]
+    fn claim_is_atomic_with_concurrent_connections() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+
+        // create db and add chunks
+        let c1 = Connection::open(&db_path).unwrap();
+        create(&c1).unwrap();
+        add(&c1, "g", 20, 19).unwrap();
+        c1.close().ok();
+
+        // open two connections and claim
+        let c_a = Connection::open(&db_path).unwrap();
+        let c_b = Connection::open(&db_path).unwrap();
+
+        let groups = vec!["g".to_string()];
+        let a_claim = claim(&c_a, &groups, "a", 1000).unwrap();
+        let b_claim = claim(&c_b, &groups, "b", 1000).unwrap();
+
+        // they should get different days (newest first, then next)
+        assert!(a_claim.is_some() && b_claim.is_some());
+        assert_ne!(a_claim.as_ref().map(|(_, d)| d), b_claim.as_ref().map(|(_, d)| d));
+        assert_eq!(a_claim.as_ref().map(|(_, d)| d), Some(&20));
+        assert_eq!(b_claim.as_ref().map(|(_, d)| d), Some(&19));
+
+        // third claim should get None
+        let c_c = Connection::open(&db_path).unwrap();
+        assert_eq!(claim(&c_c, &groups, "c", 1000).unwrap(), None);
     }
 }
