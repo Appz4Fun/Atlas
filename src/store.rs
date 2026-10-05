@@ -210,6 +210,64 @@ const TEXT: u8 = 0;
 const HEX_LOWER: u8 = 1;
 const HEX_UPPER: u8 = 2;
 
+const DIGITS: u8 = 3;
+const BASE36_LOWER: u8 = 4;
+const BASE36_UPPER: u8 = 5;
+const BASE62: u8 = 6;
+const BASE64_URL: u8 = 7;
+
+/// the alphabet of each packed tag, by digit value
+fn alphabet(tag: u8) -> &'static [u8] {
+    match tag {
+        DIGITS => b"0123456789",
+        BASE36_LOWER => b"0123456789abcdefghijklmnopqrstuvwxyz",
+        BASE36_UPPER => b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+        BASE62 => b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz",
+        BASE64_URL => b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-_",
+        _ => b"",
+    }
+}
+
+/// big-endian base-256 bytes of a base-`n` number given as digit values
+fn to_bytes(digits: &[u8], n: u32) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::new(); // little endian while building
+    for &d in digits {
+        let mut carry = u32::from(d);
+        for b in out.iter_mut() {
+            let v = u32::from(*b) * n + carry;
+            *b = (v & 0xff) as u8;
+            carry = v >> 8;
+        }
+        while carry > 0 {
+            out.push((carry & 0xff) as u8);
+            carry >>= 8;
+        }
+    }
+    out.reverse();
+    out
+}
+
+/// `len` base-`n` digit values of a big-endian base-256 number
+fn from_bytes(bytes: &[u8], n: u32, len: usize) -> Vec<u8> {
+    let mut num: Vec<u8> = bytes.to_vec();
+    let mut digits = Vec::with_capacity(len);
+    for _ in 0..len {
+        let mut rem = 0u32;
+        for b in num.iter_mut() {
+            let v = (rem << 8) | u32::from(*b);
+            *b = (v / n) as u8;
+            rem = v % n;
+        }
+        digits.push(rem as u8);
+    }
+    digits.reverse();
+    digits
+}
+
+/// Packs a message-id's local part by its shape: hex at half the size
+/// (tags 1, 2), other single-alphabet ids as a base-N number (tags 3-7,
+/// then `[len]`), anything else as text (tag 0). Deterministic, and
+/// `unpack_local` gives back exactly the same string.
 pub(crate) fn pack_local(local: &str) -> Vec<u8> {
     let bytes = local.as_bytes();
     let even = !bytes.is_empty() && bytes.len().is_multiple_of(2);
@@ -220,21 +278,47 @@ pub(crate) fn pack_local(local: &str) -> Vec<u8> {
         let mut out = Vec::with_capacity(1 + bytes.len() / 2);
         out.push(if lower { HEX_LOWER } else { HEX_UPPER });
         out.extend(bytes.chunks(2).map(|p| (nibble(p[0]) << 4) | nibble(p[1])));
-        out
-    } else {
-        let mut out = Vec::with_capacity(1 + bytes.len());
-        out.push(TEXT);
-        out.extend_from_slice(bytes);
-        out
+        return out;
     }
+    if (1..=255).contains(&bytes.len()) {
+        for tag in [DIGITS, BASE36_LOWER, BASE36_UPPER, BASE62, BASE64_URL] {
+            let abc = alphabet(tag);
+            let values: Option<Vec<u8>> =
+                bytes.iter().map(|b| abc.iter().position(|a| a == b).map(|p| p as u8)).collect();
+            if let Some(values) = values {
+                let mut out = vec![tag, bytes.len() as u8];
+                out.extend(to_bytes(&values, abc.len() as u32));
+                return out;
+            }
+        }
+    }
+    let mut out = Vec::with_capacity(1 + bytes.len());
+    out.push(TEXT);
+    out.extend_from_slice(bytes);
+    out
 }
 
-fn unpack_local(blob: &[u8]) -> String {
+/// A local part back from any of the packings (tags 0-7).
+pub(crate) fn unpack_local(blob: &[u8]) -> String {
     match blob.first() {
         Some(&HEX_LOWER) => blob[1..].iter().map(|b| format!("{b:02x}")).collect(),
         Some(&HEX_UPPER) => blob[1..].iter().map(|b| format!("{b:02X}")).collect(),
+        Some(&tag) if (DIGITS..=BASE64_URL).contains(&tag) && blob.len() >= 2 => {
+            let abc = alphabet(tag);
+            from_bytes(&blob[2..], abc.len() as u32, blob[1] as usize)
+                .iter()
+                .map(|&d| abc[d as usize] as char)
+                .collect()
+        }
         _ => String::from_utf8_lossy(blob.get(1..).unwrap_or_default()).into_owned(),
     }
+}
+
+/// a local packed the current way, whatever way it was packed before
+// not called yet: compact uses it to rewrite old rows
+#[allow(dead_code)]
+pub(crate) fn repack(local: &[u8]) -> Vec<u8> {
+    pack_local(&unpack_local(local))
 }
 
 /// `<local@domain>` -> (local, "@domain>"); anything else stays whole
@@ -428,6 +512,17 @@ pub(crate) fn add_segment(conn: &Connection, domains: &mut Domains, file_id: i64
             .prepare_cached("select 1 from segments where file_id = ? and local = ? and domain = 0")?
             .exists(params![file_id, whole(&a.message_id)])?;
         if stored_whole {
+            return Ok(false);
+        }
+    }
+    // a row from before locals were packed by alphabet has the same local stored as text
+    if (DIGITS..=BASE64_URL).contains(&local[0]) {
+        let mut legacy = vec![TEXT];
+        legacy.extend_from_slice(unpack_local(&local).as_bytes());
+        let stored_legacy = conn
+            .prepare_cached("select 1 from segments where file_id = ? and local = ? and domain = ?")?
+            .exists(params![file_id, legacy, domain])?;
+        if stored_legacy {
             return Ok(false);
         }
     }
@@ -701,6 +796,51 @@ mod tests {
     }
 
     #[test]
+    fn locals_pack_by_shape_and_come_back_exactly() {
+        let cases = [
+            ("1064b678f3f54e28a5afd48a3a986076", 1u8), // ngPost hex
+            ("ABCDEF0123", 2),
+            ("0001234", 3), // digits (odd length, so not hex), leading zeros kept
+            ("0abc9xyz", 4),
+            ("0ABC9XYZ", 5),
+            ("hotfTpetaZRIbOYuTuQ31", 6), // JBinUp
+            ("DR59tDkIGMDKQS1YflogRq2MTqVgoHslO", 6),
+            ("ZjPsQyLgOjNtQvXbHeKaXyCm1730295651235", 6), // Nyuu: letters + ms timestamp
+            ("a-b_c-9", 7),
+            ("abc", 4),                   // odd length hex-looking goes base36
+            ("nnd$009a5634$43be2fd7", 0), // anything else stays text
+            ("", 0),
+        ];
+        for (local, tag) in cases {
+            let packed = pack_local(local);
+            assert_eq!(packed[0], tag, "{local}");
+            assert_eq!(unpack_local(&packed), local, "{local}");
+            assert_eq!(pack_local(local), packed, "deterministic: {local}");
+        }
+        let long = "z".repeat(300); // not "a": that would be hex
+        assert_eq!(pack_local(&long)[0], 0, "longer than 255 stays text");
+        assert_eq!(pack_local("ZjPsQyLgOjNtQvXbHeKaXyCm1730295651235").len(), 30, "base62 is smaller than text (38)");
+    }
+
+    #[test]
+    fn old_packings_still_decode_and_repack_to_the_current_one() {
+        // text and hex from before tags 3-7 keep their meaning
+        assert_eq!(unpack_local(&[TEXT, b'h', b'i']), "hi");
+        assert_eq!(unpack_local(&[HEX_LOWER, 0xab, 0x01]), "ab01");
+        assert_eq!(unpack_local(&[HEX_UPPER, 0xab, 0x01]), "AB01");
+        let old_text = [&[TEXT][..], b"hotfTpetaZRIbOYuTuQ31"].concat();
+        let current = pack_local("hotfTpetaZRIbOYuTuQ31");
+        assert_eq!(repack(&old_text), current);
+        assert_eq!(repack(&current), current, "repacking is stable");
+        assert_eq!(repack(&[HEX_LOWER, 0xab]), vec![HEX_LOWER, 0xab]);
+        // the longest ids still round-trip
+        let max = "z".repeat(255);
+        assert_eq!(unpack_local(&pack_local(&max)), max);
+        let max64 = format!("{}-", "Z".repeat(254));
+        assert_eq!(unpack_local(&pack_local(&max64)), max64);
+    }
+
+    #[test]
     fn only_shared_domains_get_rows_and_nothing_is_saved_twice() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("atlas.s0.db");
@@ -733,6 +873,32 @@ mod tests {
         assert!(!add_segment(&conn, &mut fresh, file.id, &article).unwrap(), "same article again: not saved twice");
         let segments: i64 = conn.query_row("select count(*) from segments", [], |r| r.get(0)).unwrap();
         assert_eq!(segments, 1);
+
+        // the same for a row saved as text before locals were packed by alphabet
+        let legacy = Article {
+            message_id: "<hotfTpetaZRIbOYuTuQ31@JBinUp.local>".to_string(),
+            part: Some(1),
+            ..Default::default()
+        };
+        let (_, domain) = {
+            let mut shared = Domains::default();
+            let mut last = (Vec::new(), 0);
+            for n in 0..SHARED_AFTER {
+                last = shared.encode(&conn, &format!("<{n:032x}@JBinUp.local>")).unwrap();
+            }
+            last
+        };
+        assert!(domain > 0);
+        let mut stored = vec![0u8];
+        stored.extend_from_slice(b"hotfTpetaZRIbOYuTuQ31");
+        conn.execute(
+            "insert into segments (file_id, local, domain, part, bytes) values (?, ?, ?, 1, 0)",
+            params![file.id, stored, domain],
+        )
+        .unwrap();
+        assert!(!add_segment(&conn, &mut Domains::default(), file.id, &legacy).unwrap(), "legacy text row found");
+        let segments: i64 = conn.query_row("select count(*) from segments", [], |r| r.get(0)).unwrap();
+        assert_eq!(segments, 2);
     }
 
     #[test]
