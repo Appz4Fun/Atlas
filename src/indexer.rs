@@ -465,7 +465,8 @@ const SPLIT_OLDEST_DAY: i64 = 10_957;
 /// A split's (newest, oldest) days kept between 2000-01-01 and `today`, soo a
 /// forged Date header cant make thousands of empty chunks.
 fn clamp_days(newest_day: i64, oldest_day: i64, today: i64) -> (i64, i64) {
-    let newest = newest_day.clamp(SPLIT_OLDEST_DAY, today);
+    // a clock set before 2000 mustnt panic the clamp
+    let newest = newest_day.clamp(SPLIT_OLDEST_DAY, today.max(SPLIT_OLDEST_DAY));
     (newest, oldest_day.clamp(SPLIT_OLDEST_DAY, newest))
 }
 
@@ -949,6 +950,7 @@ mod tests {
         assert_eq!(clamp_days(30_000, 19_000, today), (today, 19_000), "a date in the future");
         assert_eq!(clamp_days(20_000, 0, today), (20_000, SPLIT_OLDEST_DAY), "a date from 1970");
         assert_eq!(clamp_days(-5, -10, today), (SPLIT_OLDEST_DAY, SPLIT_OLDEST_DAY));
+        assert_eq!(clamp_days(20_000, 19_000, 0), (SPLIT_OLDEST_DAY, SPLIT_OLDEST_DAY), "a clock from 1970");
     }
 
     #[test]

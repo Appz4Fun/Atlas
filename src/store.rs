@@ -695,8 +695,8 @@ fn still_due(conn: &Connection, file_id: i64, now: i64) -> Result<bool> {
     )?
     .query_row([file_id], |r| {
         let (has_rows, negative): (bool, bool) = (r.get(4)?, r.get(5)?);
-        let seen: Vec<u8> = r.get(1)?;
-        Ok(has_rows && !negative && due(r.get(0)?, &seen, r.get(2)?, r.get(3)?, now))
+        let (seen, touched): (Vec<u8>, Option<i64>) = (r.get(1)?, r.get(2)?);
+        Ok(has_rows && !negative && touched.is_some() && due(r.get(0)?, &seen, touched, r.get(3)?, now))
     })
     .optional()
     .map(|due| due.unwrap_or(false))
