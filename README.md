@@ -239,7 +239,7 @@ Start the indexer from the main menu with option 1. The indexer runs as a backgr
 
 ### Splitting big groups
 
-When two or more indexing servers carry a group and its backfill has more than `split_min_backlog` article numbers left, Atlas splits the rest of its history into UTC day chunks. A worker with nothing of its own to do claims the newest pending chunk on any server that carries the group, so idle connections help with big groups. Live indexing stays on the group's home server. The Backfill page of the stats dashboard shows split groups and their day chunks.
+When two or more indexing servers carry a group and its backfill has more than `split_min_backlog` article numbers left, Atlas splits the rest of its history into UTC day chunks. A worker with nothing of its own to do claims the newest pending chunk on any server that carries the group, so idle connections help with big groups. A server that doesn't keep a day from its start, because its retention is shorter, gives the chunk back for a server that does. Live indexing stays on the group's home server. The Backfill page of the stats dashboard shows split groups and their day chunks.
 
 ### How the database is stored
 
