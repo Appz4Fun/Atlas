@@ -298,6 +298,79 @@ where
     }
 }
 
+/// a day chunk also takes this much on each side: post dates are only
+/// roughly in article number order, duplicates are dropped when saved
+pub const CHUNK_OVERLAP: i64 = 3600;
+
+/// Index one day (`day`, unix days) of `group` on `server`, for a group whose
+/// backfill is split into day chunks (see chunks.rs). The chunk is marked done
+/// when the whole day is in, released again if stopped part way or failing.
+pub async fn run_chunk<P>(
+    ctx: &PassContext,
+    settings: &PassSettings,
+    db: &Db,
+    group: &str,
+    server: usize,
+    day: i64,
+    progress: &mut P,
+) -> Result<Progress>
+where
+    P: FnMut(&Progress) + ?Sized,
+{
+    let release = || {
+        let g = group.to_string();
+        on_db(db, move |conn| Ok(crate::chunks::release(conn, &g, day)?))
+    };
+
+    let found = match ctx.pool.select_group_on(server, group).await {
+        Ok((s, info)) if s == server => info,
+        Ok(_) | Err(_) => {
+            release().await?;
+            return Err(anyhow!("{group} isnt on {}", ctx.pool.host(server)));
+        }
+    };
+    let (_count, first, last, _name) = found;
+
+    let from = day * 86_400 - CHUNK_OVERLAP;
+    let to = (day + 1) * 86_400 + CHUNK_OVERLAP;
+    let start = match ctx.pool.article_at(server, group, first, last, from).await {
+        Ok(n) => n,
+        Err(e) => {
+            release().await?;
+            return Err(e.into());
+        }
+    };
+    let end = match ctx.pool.article_at(server, group, start.max(first), last, to).await {
+        Ok(n) => n.saturating_sub(1),
+        Err(e) => {
+            release().await?;
+            return Err(e.into());
+        }
+    };
+    if start > end {
+        let g = group.to_string();
+        on_db(db, move |conn| Ok(crate::chunks::finish(conn, &g, day)?)).await?;
+        return Ok(Progress::default());
+    }
+
+    let pass = Pass { ctx, settings, db, group, server, key: cursor_key(&ctx.pool, server, group) };
+    match pass.process_range(start as i64, end as i64, "CHUNK", progress).await {
+        Ok((saved, true)) => {
+            let g = group.to_string();
+            on_db(db, move |conn| Ok(crate::chunks::finish(conn, &g, day)?)).await?;
+            Ok(saved)
+        }
+        Ok((saved, false)) => {
+            release().await?;
+            Ok(saved)
+        }
+        Err(e) => {
+            release().await?;
+            Err(e)
+        }
+    }
+}
+
 struct Pass<'a> {
     ctx: &'a PassContext,
     settings: &'a PassSettings,
