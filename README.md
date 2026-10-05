@@ -239,7 +239,7 @@ Start the indexer from the main menu with option 1. The indexer runs as a backgr
 
 ### Splitting big groups
 
-When a group's backfill exceeds `split_min_backlog` article numbers and the group is carried by two or more indexing servers, Atlas splits its backfill into day-sized chunks. Chunks are stored in the main database as tasks that any server carrying the group can claim. Idle workers on any server take the newest chunk, while live indexing stays on the group's home server. The stats dashboard shows split group progress on the backfill page.
+When two or more indexing servers carry a group and its backfill has more than `split_min_backlog` article numbers left, Atlas splits the rest of its history into UTC day chunks. A worker with nothing of its own to do claims the newest pending chunk on any server that carries the group, so idle connections help with big groups. Live indexing stays on the group's home server. The Backfill page of the stats dashboard shows split groups and their day chunks.
 
 ### How the database is stored
 
@@ -247,7 +247,7 @@ Atlas splits releases and their articles over 8 database files next to `atlas.db
 
 Articles are stored compactly, at about a quarter of the space of the old layout: each file of a release is stored once with the subject its NZB uses, and each article is a short row with its message ID, part number, and size. Message ID locals are packed by alphabet using specialized encodings (hex at half the size for hexadecimal locals, base-N encoding for other alphabets), and domains are shared. NZBs come out exactly as before.
 
-Files that are complete, or untouched for three days, are sealed into one compressed zstd blob. Sealed files reduce storage further and improve query performance on old articles. Shard writers seal files online, processing up to 2,000 files per 100 milliseconds. The `--compact` command seals every file due in its pass and re-encodes message-IDs across the whole database.
+Atlas seals each file that is complete, or untouched for three days, into one zstd-compressed blob, which takes far less space than its article rows. Each shard writer seals files between saves, up to 2,000 files or 100 milliseconds at a time. Articles that arrive after a file is sealed are stored as rows and merged into its NZB. The `--compact` command seals every file that's due and re-encodes message IDs across the whole database.
 
 A release ID tells Atlas which file holds the release, and IDs keep counting up across all 8 files in the order releases are added, so the newest releases still come first.
 
@@ -266,9 +266,9 @@ Release IDs change in the conversion, so NZB links that Prowlarr or your apps sa
 
 ### Compacting a database
 
-The `--compact` command rewrites every shard into a fresh database file while the indexer is stopped. It re-encodes message-IDs using the current packing scheme and seals every file due to be sealed. The copy has no free space in it, which reduces the total database size. Expect the database to shrink substantially after compacting for the first time (rough estimate from the spec: 138 GB to 60 GB). Each shard's copy is verified before replacing the original; if any shard fails, its original is kept and the operation is retried in 24 hours.
+The `--compact` command rewrites every shard into a fresh database file while the indexer is stopped. It re-encodes message IDs with the current packing and seals every file that's due. The copy has no free space in it. Expect the first compaction to shrink the database a lot, roughly from 138 GB to 60 GB on a full database. Atlas checks each shard's copy before it replaces the original. If a shard fails, Atlas keeps its original and reports the error; the other shards are still compacted.
 
-With `auto_run_compact` enabled, Atlas compacts the database automatically every 24 hours: indexing pauses while the operation runs, and resumes when done. Stop or quit commands are honored mid-compaction. If a shard fails, it is retried in 24 hours.
+With `auto_run_compact` set to `true`, the indexer compacts the database every 24 hours. Indexing pauses while it runs and resumes afterward. Stopping the indexer during a compaction stops it within seconds and keeps the originals of unfinished shards. A failed shard is tried again 24 hours later.
 
 A group that has caught up rests for 10 seconds before Atlas checks it again. Atlas parks a group that fails 3 times in a row for 5 minutes.
 
