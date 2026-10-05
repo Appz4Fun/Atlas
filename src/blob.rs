@@ -52,7 +52,7 @@ fn unzigzag(v: u64) -> i64 {
 }
 
 /// Packs segments into a blob. Order is not kept, a copy is sorted by part
-/// (whole file articles last) so neighbours compress well.
+/// (whole file articles first) so neighbours compress well.
 pub fn encode(segs: &[Seg]) -> Vec<u8> {
     let mut sorted: Vec<&Seg> = segs.iter().collect();
     sorted.sort_by(|a, b| (a.part.is_some(), a.part, &a.local).cmp(&(b.part.is_some(), b.part, &b.local)));
