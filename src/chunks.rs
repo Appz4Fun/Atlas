@@ -50,21 +50,29 @@ pub fn is_split(conn: &Connection, group: &str) -> Result<bool> {
     conn.prepare_cached("select 1 from backfill_chunks where grp = ? limit 1")?.exists([group])
 }
 
-/// Atomically claim the newest chunk of `groups` that is pending or whose claim went stale.
-pub fn claim(conn: &Connection, groups: &[String], host: &str, now: i64) -> Result<Option<(String, i64)>> {
+/// Atomically claim the newest chunk that is pending or whose claim went
+/// stale, of `groups`: (group, oldest day the server keeps), `i64::MIN` when
+/// any day will do.
+pub fn claim(conn: &Connection, groups: &[(String, i64)], host: &str, now: i64) -> Result<Option<(String, i64)>> {
     if groups.is_empty() {
         return Ok(None);
     }
-    let marks = vec!["?"; groups.len()].join(",");
+    let rows = vec!["(?, ?)"; groups.len()].join(", ");
     let sql = format!(
-        "update backfill_chunks set state = ?, server = ?, claimed_at = ?
-         where (grp, day) = (select grp, day from backfill_chunks
-                             where grp in ({marks}) and (state = {PENDING} or (state = {CLAIMED} and claimed_at < ?))
-                             order by day desc limit 1)
+        "with wanted (g, oldest) as (values {rows})
+         update backfill_chunks set state = ?, server = ?, claimed_at = ?
+         where (grp, day) = (select c.grp, c.day from backfill_chunks c join wanted w on w.g = c.grp
+                             where c.day >= w.oldest
+                               and (c.state = {PENDING} or (c.state = {CLAIMED} and c.claimed_at < ?))
+                             order by c.day desc limit 1)
          returning grp, day"
     );
-    let mut values: Vec<rusqlite::types::Value> = vec![CLAIMED.into(), host.to_string().into(), now.into()];
-    values.extend(groups.iter().map(|g| g.clone().into()));
+    let mut values: Vec<rusqlite::types::Value> = Vec::new();
+    for (g, oldest) in groups {
+        values.push(g.clone().into());
+        values.push((*oldest).into());
+    }
+    values.extend([CLAIMED.into(), host.to_string().into(), now.into()]);
     values.push((now - CLAIM_TIMEOUT).into());
     let found: Option<(String, i64)> =
         conn.prepare(&sql)?.query_row(rusqlite::params_from_iter(values), |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
@@ -93,6 +101,11 @@ pub fn progress(conn: &Connection, group: &str) -> Result<(i64, i64)> {
     })
 }
 
+/// the oldest day of a group's chunks
+pub fn oldest_day(conn: &Connection, group: &str) -> Result<Option<i64>> {
+    conn.query_row("select min(day) from backfill_chunks where grp = ?", [group], |r| r.get(0))
+}
+
 /// groups with chunks still to do
 pub fn split_groups(conn: &Connection) -> Result<Vec<String>> {
     conn.prepare("select distinct grp from backfill_chunks where state != 2 order by grp")?
@@ -116,7 +129,7 @@ mod tests {
         assert_eq!(add(&c, "g", 20_000, 19_998).unwrap(), 3);
         assert_eq!(add(&c, "g", 20_000, 19_998).unwrap(), 0, "adding again adds nothing");
         assert!(is_split(&c, "g").unwrap());
-        let groups = vec!["g".to_string()];
+        let groups = vec![("g".to_string(), i64::MIN)];
 
         assert_eq!(claim(&c, &groups, "a", 1000).unwrap(), Some(("g".into(), 20_000)));
         assert_eq!(claim(&c, &groups, "b", 1000).unwrap(), Some(("g".into(), 19_999)));
@@ -132,7 +145,7 @@ mod tests {
     fn stale_claims_are_taken_over() {
         let c = conn();
         add(&c, "g", 5, 5).unwrap();
-        let groups = vec!["g".to_string()];
+        let groups = vec![("g".to_string(), i64::MIN)];
         assert!(claim(&c, &groups, "a", 1000).unwrap().is_some());
         assert_eq!(claim(&c, &groups, "b", 1000 + CLAIM_TIMEOUT - 1).unwrap(), None);
         assert_eq!(claim(&c, &groups, "b", 1000 + CLAIM_TIMEOUT + 1).unwrap(), Some(("g".into(), 5)));
@@ -142,10 +155,21 @@ mod tests {
     fn only_listed_groups_and_unsplit_groups() {
         let c = conn();
         add(&c, "g", 5, 5).unwrap();
-        assert_eq!(claim(&c, &["other".to_string()], "a", 0).unwrap(), None);
+        assert_eq!(claim(&c, &[("other".to_string(), i64::MIN)], "a", 0).unwrap(), None);
         assert!(!is_split(&c, "other").unwrap());
         assert_eq!(split_groups(&c).unwrap(), vec!["g".to_string()]);
         assert_eq!(unix_day(86_400 * 3 + 5), 3);
+    }
+
+    #[test]
+    fn days_older_than_a_servers_oldest_are_left_to_others() {
+        let c = conn();
+        add(&c, "g", 12, 10).unwrap();
+        let from_11 = [("g".to_string(), 11)];
+        assert_eq!(claim(&c, &from_11, "short", 0).unwrap(), Some(("g".into(), 12)));
+        assert_eq!(claim(&c, &from_11, "short", 0).unwrap(), Some(("g".into(), 11)));
+        assert_eq!(claim(&c, &from_11, "short", 0).unwrap(), None, "day 10 is older than it keeps");
+        assert_eq!(claim(&c, &[("g".to_string(), i64::MIN)], "long", 0).unwrap(), Some(("g".into(), 10)));
     }
 
     #[test]
@@ -163,7 +187,7 @@ mod tests {
         let c_a = Connection::open(&db_path).unwrap();
         let c_b = Connection::open(&db_path).unwrap();
 
-        let groups = vec!["g".to_string()];
+        let groups = vec![("g".to_string(), i64::MIN)];
         let a_claim = claim(&c_a, &groups, "a", 1000).unwrap();
         let b_claim = claim(&c_b, &groups, "b", 1000).unwrap();
 

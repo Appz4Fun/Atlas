@@ -1267,6 +1267,12 @@ impl Pool {
         Ok(None)
     }
 
+    /// When the first article in `low..=high` on server `i` was posted (unix
+    /// seconds): how far back the server keeps the group. None when it has none.
+    pub async fn first_post(&self, i: usize, group: &str, low: u64, high: u64) -> Result<Option<i64>> {
+        Ok(self.first_in(i, group, low, high + 1).await?.map(|(_, t)| t))
+    }
+
     /// The first article number in `low..=high` on server `i` posted at or after
     /// `when` (unix seconds), `high + 1` when there is none. A binary search over
     /// small article requests (about 35 for a billion numbers); a probe that

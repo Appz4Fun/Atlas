@@ -13,7 +13,7 @@ use serde_json::json;
 use crate::atomic::write_atomic;
 use crate::config::{Config, UsenetServer, load_config};
 use crate::db;
-use crate::indexer::{Db, NotCarried, PassContext, PassSettings, Progress, RunStates, run_pass, shared_db};
+use crate::indexer::{Db, NotCarried, PassContext, PassSettings, Progress, RunStates, TooOld, run_pass, shared_db};
 use crate::nntp::{Pool, unless_stopped};
 use crate::paths;
 use crate::sab;
@@ -384,6 +384,8 @@ impl Scheduler {
                 self.chunk_errors.lock().unwrap().remove(&key);
             }
             Err(_) if self.ctx.stop.load(Ordering::Relaxed) => {}
+            // the day went back for another server, and this one wont take one that old again soon
+            Err(e) if e.downcast_ref::<TooOld>().is_some() => {}
             Err(e) if e.downcast_ref::<NotCarried>().is_some() => {
                 println!("{e}, leaving its day chunks to the other servers");
                 self.skip.lock().unwrap().insert(key, None);
@@ -468,7 +470,8 @@ async fn take_chunk(sched: &Scheduler, server: usize, db: &Db) -> Option<(String
         return None;
     }
 
-    match crate::indexer::claim_chunk(db, host, groups).await {
+    let oldest = sched.ctx.states.kept_days(server);
+    match crate::indexer::claim_chunk(db, host, groups, oldest).await {
         Ok(chunk) => chunk,
         Err(e) => {
             ui::error(&format!("couldnt claim a day chunk: {e}"));

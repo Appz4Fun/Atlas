@@ -46,11 +46,20 @@ pub struct GroupRunState {
     pub backfilling: bool,
     /// a big group found unsplittable isnt probed again until then
     pub no_split_until: Option<Instant>,
+    /// per server, the oldest day it keeps of the group (as found by a day
+    /// chunk too old for it), until it's looked at again
+    pub keeps_from: HashMap<usize, (i64, Instant)>,
 }
 
 impl Default for GroupRunState {
     fn default() -> Self {
-        GroupRunState { phase: Phase::Backfill, idle: false, backfilling: false, no_split_until: None }
+        GroupRunState {
+            phase: Phase::Backfill,
+            idle: false,
+            backfilling: false,
+            no_split_until: None,
+            keeps_from: HashMap::new(),
+        }
     }
 }
 
@@ -74,6 +83,26 @@ impl RunStates {
     pub fn all_idle(&self, groups: &[String]) -> bool {
         let states = self.0.lock().unwrap();
         groups.iter().all(|g| states.get(g).is_some_and(|s| s.idle))
+    }
+
+    /// The oldest day `server` keeps of `group`, `i64::MIN` when not known.
+    pub fn keeps_from(&self, group: &str, server: usize) -> i64 {
+        let now = Instant::now();
+        let states = self.0.lock().unwrap();
+        let found = states.get(group).and_then(|s| s.keeps_from.get(&server));
+        found.filter(|(_, until)| *until > now).map_or(i64::MIN, |(day, _)| *day)
+    }
+
+    /// The groups whose oldest day on `server` is known, with that day.
+    pub fn kept_days(&self, server: usize) -> HashMap<String, i64> {
+        let now = Instant::now();
+        let states = self.0.lock().unwrap();
+        states
+            .iter()
+            .filter_map(|(g, s)| {
+                s.keeps_from.get(&server).filter(|(_, until)| *until > now).map(|(d, _)| (g.clone(), *d))
+            })
+            .collect()
     }
 
     /// switching modes starts every group over in the backfill phase
@@ -347,13 +376,16 @@ where
     {
         // a split group's backfill is day chunks, this server takes the next one
         let host = ctx.pool.host(server);
-        let g = group.to_string();
-        let claimed = on_db(db, move |conn| {
-            Ok(crate::chunks::claim(conn, std::slice::from_ref(&g), &host, chrono::Utc::now().timestamp())?)
-        })
-        .await?;
+        let wanted = [(group.to_string(), ctx.states.keeps_from(group, server))];
+        let claimed =
+            on_db(db, move |conn| Ok(crate::chunks::claim(conn, &wanted, &host, chrono::Utc::now().timestamp())?))
+                .await?;
         let r = match claimed {
-            Some((_, day)) => run_chunk(ctx, settings, db, group, server, day, progress).await,
+            // a day this server doesnt keep is left to the others, it isnt an error
+            Some((_, day)) => match run_chunk(ctx, settings, db, group, server, day, progress).await {
+                Err(e) if e.downcast_ref::<TooOld>().is_some() => Ok(Progress::default()),
+                r => r,
+            },
             None => {
                 // nothing pending: in backfill mode the group rests like a finished backfill
                 let idle = settings.mode == "backfill";
@@ -485,15 +517,45 @@ impl std::fmt::Display for NotCarried {
 
 impl std::error::Error for NotCarried {}
 
-/// Claim the newest chunk for `host` of the split groups among `groups`.
+/// A day chunk older than anything its server keeps of the group: the chunk
+/// goes back for a server that has the day.
+#[derive(Debug)]
+pub struct TooOld {
+    pub group: String,
+    pub host: String,
+    /// the oldest day the server keeps (unix days), `i64::MAX` when it has nothing
+    pub oldest_day: i64,
+}
+
+impl std::fmt::Display for TooOld {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} on {} doesnt go back that far", self.group, self.host)
+    }
+}
+
+impl std::error::Error for TooOld {}
+
+/// how long a server's oldest day of a group is trusted before a chunk older
+/// than it is tried there again
+const KEEPS_RECHECK: Duration = Duration::from_secs(3600);
+
+/// Claim the newest chunk for `host` of the split groups among `groups`,
+/// none older than the server's oldest day in `oldest` (by group).
 pub async fn claim_chunk(
     db: &Db,
     host: String,
     groups: std::collections::HashSet<String>,
+    oldest: HashMap<String, i64>,
 ) -> Result<Option<(String, i64)>> {
     on_db(db, move |conn| {
-        let split: Vec<String> =
-            crate::chunks::split_groups(conn)?.into_iter().filter(|g| groups.contains(g)).collect();
+        let split: Vec<(String, i64)> = crate::chunks::split_groups(conn)?
+            .into_iter()
+            .filter(|g| groups.contains(g))
+            .map(|g| {
+                let day = oldest.get(&g).copied().unwrap_or(i64::MIN);
+                (g, day)
+            })
+            .collect();
         Ok(crate::chunks::claim(conn, &split, &host, chrono::Utc::now().timestamp())?)
     })
     .await
@@ -544,6 +606,35 @@ where
 
     let from = day * 86_400 - CHUNK_OVERLAP;
     let to = (day + 1) * 86_400 + CHUNK_OVERLAP;
+
+    // a day this server doesnt keep from its start would come out empty or
+    // cut short, though another server may have all of it: give it back, and
+    // the server takes no day that old for a while. the split's oldest day is
+    // the exception: no server goes back further, the one whose oldest
+    // article is on it does what there is
+    let oldest = match ctx.pool.first_post(server, group, first, last).await {
+        Ok(oldest) => oldest,
+        Err(e) => return failed(e.into()).await,
+    };
+    let keeps_day = match oldest {
+        Some(t) if t <= day * 86_400 => true,
+        Some(t) if crate::chunks::unix_day(t) == day => {
+            let g = group.to_string();
+            match on_db(db, move |conn| Ok(crate::chunks::oldest_day(conn, &g)?)).await {
+                Ok(split_oldest) => split_oldest == Some(day),
+                Err(e) => return failed(e).await,
+            }
+        }
+        _ => false,
+    };
+    if !keeps_day {
+        // the first day it keeps whole
+        let oldest_day = oldest.map_or(i64::MAX, |t| crate::chunks::unix_day(t - 1) + 1);
+        ctx.states.with(group, |st| st.keeps_from.insert(server, (oldest_day, Instant::now() + KEEPS_RECHECK)));
+        let host = ctx.pool.host(server);
+        println!("[CHUNK] {group} day {day} is older than {host} keeps, leaving it to the other servers");
+        return failed(TooOld { group: group.to_string(), host, oldest_day }.into()).await;
+    }
     let start = match ctx.pool.article_at(server, group, first, last, from).await {
         Ok(n) => n,
         Err(e) => return failed(e.into()).await,

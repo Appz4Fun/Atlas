@@ -281,3 +281,53 @@ fn a_failing_chunk_reports_its_own_error() {
         .unwrap_err();
     assert!(err.downcast_ref::<atlas::indexer::NotCarried>().is_some(), "{err:#}");
 }
+
+/// A day before anything the server keeps goes back unfinished (another
+/// server may have it); an empty day the server does keep is finished.
+#[test]
+fn a_day_older_than_the_server_keeps_is_given_back() {
+    let home = tempfile::tempdir().unwrap();
+    let main = home.path().join("atlas.db");
+    atlas::db::create_db_at(&main).unwrap();
+    // posts every hour of 2026-01-01 and of 2026-01-03, none on 2026-01-02
+    let start = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00+00:00").unwrap();
+    let posts = (0..72u64)
+        .filter(|h| !(24..48).contains(h))
+        .map(|h| {
+            post_at(
+                h + 1,
+                &format!(r#""p{h}.bin" yEnc (1/1)"#),
+                &(start + chrono::Duration::hours(h as i64)).to_rfc2822(),
+            )
+        })
+        .collect();
+    let port = spawn_server(Server::new(posts));
+    let pool = BlockingPool::new(&[mock(port, "secret", 2, 1)]);
+    pool.connect().unwrap();
+
+    let first_day = atlas::chunks::unix_day(start.timestamp());
+    let main_conn = atlas::db::open_at(&main).unwrap();
+    atlas::chunks::add(&main_conn, GROUP, first_day + 2, first_day - 1).unwrap();
+    let ctx = atlas::indexer::PassContext {
+        pool: pool.pool.clone(),
+        states: Default::default(),
+        stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        verbose: false,
+    };
+    let db = atlas::indexer::shared_db(main_conn);
+    let run =
+        |day: i64| pool.block_on(atlas::indexer::run_chunk(&ctx, &Default::default(), &db, GROUP, 0, day, &mut |_| {}));
+
+    let err = run(first_day - 1).unwrap_err();
+    let too_old = err.downcast_ref::<atlas::indexer::TooOld>().expect("a TooOld");
+    assert_eq!(too_old.oldest_day, first_day);
+    assert_eq!(ctx.states.keeps_from(GROUP, 0), first_day, "remembered for the next claims");
+    let empty = run(first_day + 1).unwrap();
+    assert_eq!(empty.articles, 2, "only the overlap hours");
+    let conn = atlas::db::open_at(&main).unwrap();
+    let state = |day: i64| -> i64 {
+        conn.query_row("select state from backfill_chunks where day = ?", [day], |r| r.get(0)).unwrap()
+    };
+    assert_eq!(state(first_day - 1), 0, "given back, still pending");
+    assert_eq!(state(first_day + 1), 2, "an empty day it keeps is done");
+}
