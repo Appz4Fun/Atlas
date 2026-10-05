@@ -66,3 +66,6 @@ __pycache__/
 *.pyc
 mock_nntp_server.py
 dev_nntp_server.py
+
+# git worktrees for isolated work
+/.worktrees/
