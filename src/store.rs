@@ -334,8 +334,6 @@ pub(crate) fn unpack_local(blob: &[u8]) -> String {
 }
 
 /// a local packed the current way, whatever way it was packed before
-// not called yet: compact uses it to rewrite old rows
-#[allow(dead_code)]
 pub(crate) fn repack(local: &[u8]) -> Vec<u8> {
     pack_local(&unpack_local(local))
 }
@@ -660,16 +658,19 @@ pub(crate) fn sealable(conn: &Connection, after_id: i64, limit: usize, now: i64)
         if !has_rows || negative {
             continue;
         }
-        let expected: Option<i64> = r.get(1)?;
         let seen: Vec<u8> = r.get(2)?;
-        let touched: Option<i64> = r.get(3)?;
-        let sealed: bool = r.get(4)?;
-        let complete = !sealed && expected.is_some_and(|e| is_exactly(&seen, e));
-        if complete || touched.is_none_or(|t| t < now - SEAL_AGE) {
+        if due(r.get(1)?, &seen, r.get(3)?, r.get(4)?, now) {
             ids.push(id);
         }
     }
     Ok((ids, last))
+}
+
+/// A file with rows is due to seal when it's complete and not sealed yet, or
+/// untouched for `SEAL_AGE` (never touched since the upgrade counts as old).
+pub(crate) fn due(expected: Option<i64>, seen: &[u8], touched: Option<i64>, sealed: bool, now: i64) -> bool {
+    let complete = !sealed && expected.is_some_and(|e| is_exactly(seen, e));
+    complete || touched.is_none_or(|t| t < now - SEAL_AGE)
 }
 
 /// Blobs of sealed files, decoded once each, for checking late articles.
