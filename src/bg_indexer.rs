@@ -287,6 +287,8 @@ struct Scheduler {
     compact_due: AtomicBool,
     /// no compaction before this (one couldnt take the lock)
     compact_after: Option<SystemTime>,
+    /// auto_run_compact as config.json has it now
+    auto_compact: AtomicBool,
     passes: AtomicUsize,
 }
 
@@ -520,9 +522,9 @@ async fn worker(sched: Arc<Scheduler>, server: usize, db: Db) {
     }
 }
 
-/// Re-read config.json while indexing: new groups / mode / batch settings
-/// apply right away. Returns when servers or the parallelism changed (the
-/// caller rebuilds) or when stopping.
+/// Re-read config.json while indexing: new groups / mode / batch settings /
+/// auto compaction apply right away. Returns when servers or the parallelism
+/// changed (the caller rebuilds) or when stopping.
 async fn watch_config(sched: Arc<Scheduler>, servers: Vec<UsenetServer>) {
     loop {
         nap(CONFIG_RELOAD, || sched.stopping()).await;
@@ -536,6 +538,11 @@ async fn watch_config(sched: Arc<Scheduler>, servers: Vec<UsenetServer>) {
             println!("config changed, restarting the indexer");
             sched.wind_down.store(true, Ordering::Relaxed);
             return;
+        }
+
+        let auto = config.auto_run_compact;
+        if sched.auto_compact.swap(auto, Ordering::Relaxed) != auto {
+            println!("auto compaction turned {}", if auto { "on" } else { "off" });
         }
 
         let settings = settings_of(&config);
@@ -558,9 +565,10 @@ async fn watch_config(sched: Arc<Scheduler>, servers: Vec<UsenetServer>) {
     }
 }
 
-/// With auto_run_compact: once the interval has passed since the last
-/// compaction (or since the indexer started, when there was none), wind down so
-/// `supervise` can compact.
+/// While auto_run_compact is on (looked at every second, config.json can
+/// change it): once the interval has passed since the last compaction (or
+/// since the indexer started, when there was none), wind down so `supervise`
+/// can compact.
 async fn compact_timer(sched: Arc<Scheduler>) {
     let every = compact_every();
     let last = db::open_at(&paths::database()).ok().and_then(|conn| crate::store::get_meta(&conn, "last_compact").ok());
@@ -569,7 +577,7 @@ async fn compact_timer(sched: Arc<Scheduler>) {
     let due =
         (UNIX_EPOCH + Duration::from_secs(last.max(0) as u64) + every).max(sched.compact_after.unwrap_or(UNIX_EPOCH));
     while !sched.stopping() {
-        if SystemTime::now() >= due {
+        if sched.auto_compact.load(Ordering::Relaxed) && SystemTime::now() >= due {
             println!("compacting the database, indexing resumes after");
             sched.compact_due.store(true, Ordering::Relaxed);
             sched.wind_down.store(true, Ordering::Relaxed);
@@ -631,6 +639,7 @@ async fn run_servers(
         wind_down: AtomicBool::new(false),
         compact_due: AtomicBool::new(false),
         compact_after,
+        auto_compact: AtomicBool::new(config.auto_run_compact),
         passes: AtomicUsize::new(0),
     });
 
@@ -654,9 +663,7 @@ async fn run_servers(
     }
     tasks.spawn(watch_config(sched.clone(), servers));
     tasks.spawn(report(sched.clone()));
-    if config.auto_run_compact {
-        tasks.spawn(compact_timer(sched.clone()));
-    }
+    tasks.spawn(compact_timer(sched.clone()));
 
     // the workers and the config watcher all stop on `stopping()`
     while tasks.join_next().await.is_some() {

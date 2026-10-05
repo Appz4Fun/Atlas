@@ -175,7 +175,7 @@ Atlas also handles these provider quirks on its own:
 
 The background indexer reads `config.json` again every 5 seconds:
 
-- New groups, `index_mode`, `batch_size`, and `request_size` apply immediately.
+- New groups, `index_mode`, `batch_size`, `request_size`, and `auto_run_compact` apply immediately.
 - Changes to servers, logins, `connections`, or `parallel_groups` rebuild the connection pool. A login you fix in the file, or in **Settings > Usenet servers**, takes effect within a few seconds.
 - `api_host` and `api_port` apply when the API restarts. Restart Atlas, or use **Settings > Change API port**.
 
