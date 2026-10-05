@@ -120,19 +120,85 @@ fn a_long_gap_at_the_end_is_high_plus_one() {
     assert_eq!(search(posts(), 1, 2000, hour_of(1650)), 1650);
 }
 
+/// one post a minute: 1..=50 from 2026-01-01 00:00 UTC, nothing from 51 to
+/// 3,000,000, then 3,000,001..=3,100,000 from 2026-01-03 00:00
+fn holed() -> Vec<common::Post> {
+    let at = |rfc3339: &str| chrono::DateTime::parse_from_rfc3339(rfc3339).unwrap();
+    let (before, after) = (at("2026-01-01T00:00:00+00:00"), at("2026-01-03T00:00:00+00:00"));
+    let post = |n: u64, when: chrono::DateTime<chrono::FixedOffset>| {
+        post_at(n, &format!(r#""p{n}.bin" yEnc (1/1)"#), &when.to_rfc2822())
+    };
+    let early = (1..=50u64).map(|n| post(n, before + chrono::Duration::minutes(n as i64 - 1)));
+    let late = (3_000_001..=3_100_000u64).map(|n| post(n, after + chrono::Duration::minutes((n - 3_000_001) as i64)));
+    early.chain(late).collect()
+}
+
+/// unix seconds article `n` of `holed` is posted at
+fn minute_of(n: u64) -> i64 {
+    let at = |rfc3339: &str| chrono::DateTime::parse_from_rfc3339(rfc3339).unwrap().timestamp();
+    if n <= 50 {
+        at("2026-01-01T00:00:00+00:00") + (n as i64 - 1) * 60
+    } else {
+        at("2026-01-03T00:00:00+00:00") + (n - 3_000_001) as i64 * 60
+    }
+}
+
 #[test]
-fn a_hole_of_millions_is_crossed_in_few_requests() {
-    let server = Server::new(with_gap(1, 3_000_050, 51..=3_000_000));
+fn a_hole_of_millions_is_crossed_to_its_first_article_in_few_requests() {
+    let server = Server::new(holed());
     let port = spawn_server(server.clone());
     let pool = BlockingPool::new(&[mock(port, "secret", 2, 1)]);
     pool.connect().unwrap();
-    let at = |n: u64| pool.block_on(pool.pool.article_at(0, GROUP, 1, 3_000_050, hour_of(n))).unwrap();
+    let xovers = || server.xovers.load(std::sync::atomic::Ordering::SeqCst);
+    let at = |low: u64, when: i64| {
+        let before = xovers();
+        let n = pool.block_on(pool.pool.article_at(0, GROUP, low, 3_100_000, when)).unwrap();
+        let used = xovers() - before;
+        assert!(used <= 150, "{used} requests to find {n}");
+        n
+    };
+    let in_the_hole = minute_of(50) + 86_400;
 
-    assert_eq!(at(40), 40);
-    assert_eq!(at(60), 3_000_001, "inside the hole: the first article after it");
-    assert_eq!(at(3_000_020), 3_000_020);
-    let xovers = server.xovers.load(std::sync::atomic::Ordering::SeqCst);
-    assert!(xovers < 400, "{xovers} requests for three searches");
+    assert_eq!(at(1, minute_of(40)), 40);
+    assert_eq!(at(1, in_the_hole), 3_000_001, "inside the hole: the first article after it");
+    assert_eq!(at(1, minute_of(3_000_001)), 3_000_001, "the first article after the hole");
+    assert_eq!(at(1, minute_of(3_000_002)), 3_000_002);
+    assert_eq!(at(1, minute_of(3_050_000)), 3_050_000);
+    assert_eq!(at(1, minute_of(3_100_000) + 60), 3_100_001, "after everything: high + 1");
+
+    // a low watermark that still says 1,500,000 though nothing is there
+    assert_eq!(at(1_500_000, minute_of(40)), 3_000_001, "everything from low on is newer");
+    assert_eq!(at(1_500_000, in_the_hole), 3_000_001);
+    assert_eq!(at(1_500_000, minute_of(3_000_001)), 3_000_001);
+}
+
+/// The first day after a hole of millions is indexed whole.
+#[test]
+fn a_day_chunk_right_after_a_hole_of_millions_gets_every_article() {
+    let home = tempfile::tempdir().unwrap();
+    let main = home.path().join("atlas.db");
+    atlas::db::create_db_at(&main).unwrap();
+    let port = spawn_server(Server::new(holed()));
+    let pool = BlockingPool::new(&[mock(port, "secret", 2, 1)]);
+    pool.connect().unwrap();
+
+    let day = atlas::chunks::unix_day(minute_of(3_000_001));
+    let main_conn = atlas::db::open_at(&main).unwrap();
+    atlas::chunks::add(&main_conn, GROUP, day, day).unwrap();
+    let ctx = atlas::indexer::PassContext {
+        pool: pool.pool.clone(),
+        states: Default::default(),
+        stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        verbose: false,
+    };
+    let db = atlas::indexer::shared_db(main_conn);
+    let saved =
+        pool.block_on(atlas::indexer::run_chunk(&ctx, &Default::default(), &db, GROUP, 0, day, &mut |_| {})).unwrap();
+
+    // the day's 1,440 posts and the hour after it; the hour before is the hole
+    assert_eq!(saved.articles, 1_440 + 60);
+    let conn = atlas::db::open_at(&main).unwrap();
+    assert_eq!(atlas::chunks::progress(&conn, GROUP).unwrap(), (1, 1));
 }
 
 /// A day chunk whose day has 150 numbers missing in the middle still fetches

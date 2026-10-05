@@ -758,6 +758,13 @@ pub struct ServerStat {
     pub text_bytes: u64,
 }
 
+/// an article number and when it was posted (unix seconds)
+type Dated = (u64, i64);
+
+/// numbers per date search request at first, and at most
+const DATE_LOOK: u64 = 100;
+const DATE_SCAN_MAX: u64 = DATE_LOOK << 6;
+
 /// Several providers tried in priority order, each with up to `connections`
 /// requests in flight.
 ///
@@ -1161,83 +1168,140 @@ impl Pool {
         Err(first_err)
     }
 
-    /// The first article at or after `number` within the next `look` numbers on
-    /// server `i`, with its post time: (number, unix seconds). None when there is
-    /// none (a gap in the numbering).
-    async fn posted_at(&self, i: usize, group: &str, number: u64, look: u64) -> Result<Option<(u64, i64)>> {
-        match self.xover_on(i, group, number, number + look - 1).await {
+    /// The first and the last article in `start..start + look` on server `i`,
+    /// with their post times: (number, unix seconds). None when there is none
+    /// (a gap in the numbering).
+    async fn window(&self, i: usize, group: &str, start: u64, look: u64) -> Result<Option<(Dated, Dated)>> {
+        match self.xover_on(i, group, start, start + look - 1).await {
             Ok(rows) => Ok(rows
                 .iter()
                 .filter_map(|r| crate::dates::posted_timestamp(&r.date).map(|t| (r.number, t)))
-                .min_by_key(|(n, _)| *n)),
+                .fold(None, |ends, a| match ends {
+                    None => Some((a, a)),
+                    Some((first, last)) => {
+                        Some((if a.0 < first.0 { a } else { first }, if a.0 > last.0 { a } else { last }))
+                    }
+                })),
             Err(e) if e.code() == Some(423) => Ok(None),
             Err(e) => Err(e),
         }
     }
 
-    /// When the first article at or after `number` on server `i` was posted (unix seconds).
-    pub async fn posted_date(&self, i: usize, group: &str, number: u64) -> Result<Option<i64>> {
-        Ok(self.posted_at(i, group, number, 100).await?.map(|(_, t)| t))
+    /// The first article at or after `number` within the next `look` numbers on
+    /// server `i`, with its post time. None when there is none.
+    async fn posted_at(&self, i: usize, group: &str, number: u64, look: u64) -> Result<Option<Dated>> {
+        Ok(self.window(i, group, number, look).await?.map(|(first, _)| first))
     }
 
-    /// The first article in `from..end` on server `i` with its post time, and
-    /// whether every number between `from` and it was looked at. Missing
-    /// numbers are skipped forward in windows that double from 100 numbers up
-    /// to `SCAN_MAX`; past that the windows stay that size and spread out (each
-    /// starts twice as far from `from` as the last ended), soo a hole of
-    /// millions costs a few dozen small requests, at the price of maybe missing
-    /// an article between two windows.
-    async fn first_in(&self, i: usize, group: &str, from: u64, end: u64) -> Result<Option<(u64, i64, bool)>> {
-        const LOOK: u64 = 100;
-        const SCAN_MAX: u64 = LOOK << 6;
-        let (mut at, mut size, mut whole) = (from, LOOK, true);
+    /// When the first article at or after `number` on server `i` was posted (unix seconds).
+    pub async fn posted_date(&self, i: usize, group: &str, number: u64) -> Result<Option<i64>> {
+        Ok(self.posted_at(i, group, number, DATE_LOOK).await?.map(|(_, t)| t))
+    }
+
+    /// The first article in `from..end` on server `i`, with its post time.
+    /// Missing numbers are skipped in windows that double from `DATE_LOOK` up
+    /// to `DATE_SCAN_MAX` numbers; past that the windows spread out (each
+    /// starts twice as far from `from` as the last ended, the last ends at
+    /// `end`), soo a hole of millions takes a few dozen small requests. A hit
+    /// after spread out windows is narrowed down by bisecting the numbers in
+    /// between, taking the hole as one run of missing numbers followed by
+    /// articles.
+    async fn first_in(&self, i: usize, group: &str, from: u64, end: u64) -> Result<Option<Dated>> {
+        // numbers before `gap` are all missing
+        let (mut at, mut size, mut gap) = (from, DATE_LOOK, from);
         while at < end {
             let look = size.min(end - at);
-            if let Some((n, t)) = self.posted_at(i, group, at, look).await? {
-                return Ok(Some((n, t, whole)));
+            if let Some(hit) = self.posted_at(i, group, at, look).await? {
+                // the first article is between the last empty window and this one
+                let (mut lo, mut hi, mut best) = (gap, at, hit);
+                while lo < hi {
+                    let mid = lo + (hi - lo) / 2;
+                    let look = DATE_LOOK.min(hi - mid);
+                    match self.posted_at(i, group, mid, look).await? {
+                        Some(found) => (best, hi) = (found, found.0),
+                        None => lo = mid + look,
+                    }
+                }
+                return Ok(Some(best));
             }
-            let covered = at + look;
-            if size < SCAN_MAX {
-                at = covered;
+            gap = at + look;
+            if size < DATE_SCAN_MAX {
+                at = gap;
                 size *= 2;
-                continue;
+            } else {
+                at = (gap + (gap - from)).min(end.saturating_sub(DATE_SCAN_MAX)).max(gap);
             }
-            // the last window always ends at `end`
-            let next = (covered + (covered - from)).min(end.saturating_sub(SCAN_MAX)).max(covered);
-            whole &= next == covered;
-            at = next;
+        }
+        Ok(None)
+    }
+
+    /// The last article in `from..end` on server `i`, with its post time: like
+    /// `first_in`, going backwards from `end`, the hole taken as articles
+    /// followed by one run of missing numbers.
+    async fn last_in(&self, i: usize, group: &str, from: u64, end: u64) -> Result<Option<Dated>> {
+        // numbers from `gap` on are all missing
+        let (mut to, mut size, mut gap) = (end, DATE_LOOK, end);
+        while to > from {
+            let look = size.min(to - from);
+            if let Some((_, hit)) = self.window(i, group, to - look, look).await? {
+                // the last article is between this window and the last empty one
+                let (mut lo, mut hi, mut best) = (to, gap, hit);
+                while lo < hi {
+                    let mid = lo + (hi - lo) / 2;
+                    let look = DATE_LOOK.min(hi - mid);
+                    match self.window(i, group, mid, look).await? {
+                        Some((_, found)) => (best, lo) = (found, found.0 + 1),
+                        None => hi = mid,
+                    }
+                }
+                return Ok(Some(best));
+            }
+            gap = to - look;
+            if size < DATE_SCAN_MAX {
+                to = gap;
+                size *= 2;
+            } else {
+                to = end.saturating_sub(2 * (end - gap)).max(from.saturating_add(DATE_SCAN_MAX)).min(gap);
+            }
         }
         Ok(None)
     }
 
     /// The first article number in `low..=high` on server `i` posted at or after
     /// `when` (unix seconds), `high + 1` when there is none. A binary search over
-    /// small article requests (about 35 for a billion numbers, plus one to
-    /// settle); a probe that lands on missing numbers skips forward to the next
-    /// article. Post dates are only roughly in order, soo the answer is
-    /// approximate near the edges: callers overlap their ranges.
+    /// small article requests (about 35 for a billion numbers); a probe that
+    /// lands in a hole in the numbering finds the articles on both sides of it,
+    /// soo the hole is crossed once. Post dates are only roughly in order, soo
+    /// the answer is approximate near the edges: callers overlap their ranges.
     pub async fn article_at(&self, i: usize, group: &str, low: u64, high: u64, when: i64) -> Result<u64> {
-        let (mut lo, mut hi) = (low, high + 1);
+        // every article before lo is older than `when`, none from hi on is;
+        // first is the first article from hi on (high + 1 when there is none)
+        let (mut lo, mut hi, mut first) = (low, high + 1, high + 1);
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
-            match self.first_in(i, group, mid, hi).await? {
-                Some((n, t, _)) if t < when => lo = n + 1,
-                // every number from mid up to n is missing
-                Some((_, _, true)) => hi = mid,
-                // some numbers between mid and n werent looked at, n is an upper bound
-                Some((n, _, false)) => hi = n,
-                // nothing from mid on
-                None => hi = mid,
+            let found = self.first_in(i, group, mid, hi).await?;
+            if let Some((n, t)) = found
+                && t < when
+            {
+                lo = n + 1;
+                continue;
+            }
+            // nothing from mid up to the article found (or up to hi)
+            let gap_end = found.map_or(hi, |(n, _)| n);
+            if let Some((n, _)) = found {
+                first = n;
+            }
+            hi = mid;
+            // mid is in a hole: the article before it decides which side
+            // the answer is on, instead of halving through the hole
+            if gap_end - mid > DATE_LOOK {
+                match self.last_in(i, group, lo, mid).await? {
+                    Some((m, t)) if t >= when => (hi, first) = (m, m),
+                    _ => lo = mid,
+                }
             }
         }
-        if lo > high {
-            return Ok(high + 1);
-        }
-        // lo may be a number missing from the group: settle on the article that exists
-        Ok(match self.first_in(i, group, lo, high + 1).await? {
-            Some((n, _, _)) => n,
-            None => high + 1,
-        })
+        Ok(first)
     }
 
     async fn xover_on(&self, i: usize, group: &str, start: u64, end: u64) -> Result<Vec<Overview>> {
