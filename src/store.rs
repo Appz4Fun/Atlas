@@ -374,6 +374,9 @@ pub struct Domains {
     ids: HashMap<String, i64>,
     /// domains not in the table yet: how often they came up, bounded
     seen: HashMap<String, u32>,
+    /// rows this writer inserted in its open transaction: they move to `ids`
+    /// once it commits, and are gone if it rolls back
+    staged: HashMap<String, i64>,
 }
 
 /// domains a writer keeps in memory at most, known and not yet known
@@ -393,7 +396,7 @@ impl Domains {
     /// (local blob, domain id) for a message-id; domain 0 = stored whole
     pub(crate) fn encode(&mut self, conn: &Connection, id: &str) -> Result<(Vec<u8>, i64)> {
         let Some((local, suffix)) = split_message_id(id) else { return Ok((whole(id), 0)) };
-        if let Some(d) = self.ids.get(suffix) {
+        if let Some(d) = self.ids.get(suffix).or_else(|| self.staged.get(suffix)) {
             return Ok((pack_local(local), *d));
         }
         let found: Option<i64> = conn
@@ -413,14 +416,32 @@ impl Domains {
                 }
                 self.seen.remove(suffix);
                 conn.prepare_cached("insert into domains (suffix) values (?)")?.execute([suffix])?;
-                conn.last_insert_rowid()
+                let domain = conn.last_insert_rowid();
+                self.staged.insert(suffix.to_string(), domain);
+                return Ok((pack_local(local), domain));
             }
         };
+        self.remember(suffix.to_string(), domain);
+        Ok((pack_local(local), domain))
+    }
+
+    fn remember(&mut self, suffix: String, domain: i64) {
         if self.ids.len() >= DOMAIN_CACHE {
             self.ids.clear();
         }
-        self.ids.insert(suffix.to_string(), domain);
-        Ok((pack_local(local), domain))
+        self.ids.insert(suffix, domain);
+    }
+
+    /// The transaction `encode` was used in committed: its new rows are known.
+    pub(crate) fn committed(&mut self) {
+        for (suffix, domain) in std::mem::take(&mut self.staged) {
+            self.remember(suffix, domain);
+        }
+    }
+
+    /// The transaction `encode` was used in rolled back: its new rows are gone.
+    pub(crate) fn rolled_back(&mut self) {
+        self.staged.clear();
     }
 }
 
@@ -850,6 +871,22 @@ impl ShardWriter {
     /// Releases of this shard's groups, in one transaction. The same release
     /// may come up in more than one batch.
     pub fn save<'a>(
+        &mut self,
+        conn: &mut Connection,
+        ids: &Ids,
+        batches: impl IntoIterator<Item = &'a [Release]>,
+    ) -> Result<()> {
+        let r = self.save_in_transaction(conn, ids, batches);
+        // domains inserted by a save that rolled back have no row: a later
+        // save must not use their ids
+        match r {
+            Ok(()) => self.domains.committed(),
+            Err(_) => self.domains.rolled_back(),
+        }
+        r
+    }
+
+    fn save_in_transaction<'a>(
         &mut self,
         conn: &mut Connection,
         ids: &Ids,
@@ -1652,6 +1689,60 @@ mod tests {
         let rows: i64 = conn.query_row("select count(*) from segments", [], |r| r.get(0)).unwrap();
         assert_eq!(rows, 1, "b.rar got a row, it's sealed and complete: waits to be stale");
         assert_eq!(writer.seal_some(&mut conn, now + 2).unwrap(), 0);
+    }
+
+    #[test]
+    fn a_failed_save_leaves_no_domain_behind_in_the_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        db::create_db_at(&main).unwrap();
+        let shard = shard_of("alt.binaries.t");
+        let mut conn = db::open_at(&shard_path(&main, shard)).unwrap();
+        let mut writer = ShardWriter::new(shard);
+        // enough articles on one new domain for it to get a row
+        let release = |name: &str, first: u32| Release {
+            name: name.into(),
+            group: "alt.binaries.t".into(),
+            articles: (first..first + SHARED_AFTER + 1)
+                .map(|n| Article {
+                    message_id: format!("<{n:032x}@fresh>"),
+                    filename: Some("a.rar".into()),
+                    part: Some(n as i64 + 1),
+                    bytes: 10,
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+
+        // the save fails at its last write, after the domain's row went in
+        conn.execute_batch(
+            "create temp trigger no_totals before update on meta begin select raise(abort, 'forced'); end",
+        )
+        .unwrap();
+        assert!(writer.save(&mut conn, &Ids::new(&main), [std::slice::from_ref(&release("One", 0))]).is_err());
+        conn.execute_batch("drop trigger no_totals").unwrap();
+        let rows: i64 = conn.query_row("select count(*) from domains", [], |r| r.get(0)).unwrap();
+        assert_eq!(rows, 0, "rolled back with the save");
+
+        let two = release("Two", 100);
+        writer.save(&mut conn, &Ids::new(&main), [std::slice::from_ref(&two)]).unwrap();
+        let orphans: i64 = conn
+            .query_row(
+                "select count(*) from segments s where s.domain != 0
+                 and not exists (select 1 from domains d where d.id = s.domain)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(orphans, 0, "every segment's domain has a row");
+        let shards = db::open_with_shards(&main).unwrap();
+        let id: i64 = shards.query_row("select id from releases where name = 'Two'", [], |r| r.get(0)).unwrap();
+        let mut got: Vec<String> = articles(&shards, id).unwrap().into_iter().map(|a| a.message_id).collect();
+        let mut want: Vec<String> = two.articles.iter().map(|a| a.message_id.clone()).collect();
+        got.sort();
+        want.sort();
+        assert_eq!(got, want, "the NZB's message-ids are whole");
     }
 
     #[test]

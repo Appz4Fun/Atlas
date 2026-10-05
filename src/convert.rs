@@ -324,6 +324,7 @@ fn move_articles(
                         }
                     }
                     tx.commit()?;
+                    domains.committed();
                 }
 
                 // into place in key order: an append, sorted on disk
