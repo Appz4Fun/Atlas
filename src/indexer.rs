@@ -130,6 +130,8 @@ pub struct PassSettings {
     pub request_size: u64,
     /// backfill left on a group's home server before it is split into day chunks
     pub split_min_backlog: i64,
+    /// article numbers a day chunk reaches past its ends (`CHUNK_SAFETY`)
+    pub chunk_safety: u64,
 }
 
 impl Default for PassSettings {
@@ -139,6 +141,7 @@ impl Default for PassSettings {
             batch_size: DEFAULT_BATCH_SIZE as i64,
             request_size: DEFAULT_REQUEST_SIZE,
             split_min_backlog: crate::config::SPLIT_MIN_BACKLOG,
+            chunk_safety: CHUNK_SAFETY,
         }
     }
 }
@@ -713,6 +716,10 @@ pub async fn claim_chunk(
 /// roughly in article number order, duplicates are dropped when saved
 pub const CHUNK_OVERLAP: i64 = 3600;
 
+/// article numbers a day chunk reaches past each end its date searches put
+/// it at, for neighbouring days done on other servers (see `chunk_range`)
+pub const CHUNK_SAFETY: u64 = 5_000;
+
 /// Index the day chunk `chunk` claimed (its day in unix days) on `server`,
 /// for a group whose backfill is split into day chunks (see chunks.rs). The
 /// chunk is marked done when the whole day is in, released again if stopped
@@ -882,10 +889,11 @@ where
         Ok((None, _)) => return failed(anyhow!("{group} has no day chunks")).await,
         Err(e) => return failed(e).await,
     };
-    let (start, end) = match chunk_range(&ctx.pool, server, group, (first, last), day, days, cursor).await {
-        Ok(range) => range,
-        Err(e) => return failed(e.into()).await,
-    };
+    let (start, end) =
+        match chunk_range(&ctx.pool, server, group, (first, last), day, days, (cursor, settings.chunk_safety)).await {
+            Ok(range) => range,
+            Err(e) => return failed(e.into()).await,
+        };
     if start > end {
         finish().await?;
         return Ok(Progress::default());
@@ -915,6 +923,14 @@ where
 /// however forged Dates move the searches: a forged Date only moves an
 /// article into another chunk. Empty (start past end) when the day's posts
 /// are all in its neighbours.
+///
+/// That holds on one server; neighbouring days done on different servers
+/// search their own numbering, and around a hole a run of forged Dates can
+/// move the two searches differently, leaving articles in neither. Each end
+/// also reaches `safety` (`CHUNK_SAFETY`) numbers past where its search put it (the
+/// articles a neighbour has too are dropped as duplicates when saved): a
+/// shift up to that many articles is covered, a forged run moving a search
+/// further can still leave a gap.
 pub async fn chunk_range(
     pool: &Pool,
     server: usize,
@@ -922,7 +938,7 @@ pub async fn chunk_range(
     (first, last): (u64, u64),
     day: i64,
     (oldest_day, newest_day): (i64, i64),
-    cursor: u64,
+    (cursor, safety): (u64, u64),
 ) -> crate::nntp::Result<(u64, u64)> {
     let starts = |day: i64| pool.article_at(server, group, first, last, day * 86_400 - CHUNK_OVERLAP);
     if day <= oldest_day && day >= newest_day {
@@ -930,12 +946,12 @@ pub async fn chunk_range(
     }
     let next = starts(day + 1).await?;
     // a start past the next day's (forged Dates) is moved down to it
-    let start = if day <= oldest_day { first } else { starts(day).await?.min(next) };
+    let start = if day <= oldest_day { first } else { starts(day).await?.min(next).saturating_sub(safety).max(first) };
     let end = if day >= newest_day {
         cursor
     } else {
         let past = pool.article_at(server, group, first, last, (day + 1) * 86_400 + CHUNK_OVERLAP).await?;
-        next.max(past).saturating_sub(1)
+        next.max(past).saturating_sub(1).saturating_add(safety).min(cursor)
     };
     Ok((start, end))
 }

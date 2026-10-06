@@ -6,6 +6,12 @@ mod common;
 use atlas::nntp::BlockingPool;
 use common::{GROUP, Server, mock, post_at, spawn_server};
 
+/// Pass settings whose day chunks are exactly what their date searches
+/// find, without the reach for neighbouring days on other servers
+fn exact() -> atlas::indexer::PassSettings {
+    atlas::indexer::PassSettings { chunk_safety: 0, ..Default::default() }
+}
+
 /// `day` of `group` claimed by the mock's server, the way a worker claims it
 /// (only the claim's owner finishes or gives back a chunk)
 fn claimed(main: &std::path::Path, group: &str, day: i64) -> atlas::chunks::Claim {
@@ -75,8 +81,7 @@ fn a_day_chunk_indexes_that_day() {
     };
     let db = atlas::indexer::shared_db(main_conn);
     let chunk = claimed(&main, GROUP, day);
-    let saved =
-        pool.block_on(atlas::indexer::run_chunk(&ctx, &Default::default(), &db, &chunk, 0, &mut |_| {})).unwrap();
+    let saved = pool.block_on(atlas::indexer::run_chunk(&ctx, &exact(), &db, &chunk, 0, &mut |_| {})).unwrap();
 
     // hours 24..47 are articles 25..48, plus an hour of overlap each side
     // (24 and 49); 30 and 40 don't exist. 24..=49 minus 2 = 24 articles
@@ -287,8 +292,7 @@ fn a_day_chunk_right_after_a_hole_of_millions_gets_every_article() {
     };
     let db = atlas::indexer::shared_db(main_conn);
     let chunk = claimed(&main, GROUP, day);
-    let saved =
-        pool.block_on(atlas::indexer::run_chunk(&ctx, &Default::default(), &db, &chunk, 0, &mut |_| {})).unwrap();
+    let saved = pool.block_on(atlas::indexer::run_chunk(&ctx, &exact(), &db, &chunk, 0, &mut |_| {})).unwrap();
 
     // the day's 1,440 posts and the hour after it; the hour before is the hole
     assert_eq!(saved.articles, 1_440 + 60);
@@ -333,8 +337,7 @@ fn a_day_chunk_skips_a_gap_inside_the_day() {
     };
     let db = atlas::indexer::shared_db(main_conn);
     let chunk = claimed(&main, GROUP, day);
-    let saved =
-        pool.block_on(atlas::indexer::run_chunk(&ctx, &Default::default(), &db, &chunk, 0, &mut |_| {})).unwrap();
+    let saved = pool.block_on(atlas::indexer::run_chunk(&ctx, &exact(), &db, &chunk, 0, &mut |_| {})).unwrap();
 
     // day 2 is 720 numbers minus the 150 missing, plus the hour before it
     // (691..=720, 30 posts); nothing comes after 1440
@@ -368,7 +371,7 @@ fn a_failing_chunk_reports_its_own_error() {
     let err = pool
         .block_on(atlas::indexer::run_chunk(
             &ctx,
-            &Default::default(),
+            &exact(),
             &db,
             &atlas::chunks::Claim {
                 group: "alt.binaries.other".into(),
@@ -418,7 +421,7 @@ fn a_day_older_than_the_server_keeps_is_given_back() {
     let db = atlas::indexer::shared_db(main_conn);
     let run = |day: i64| {
         let chunk = claimed(&main, GROUP, day);
-        pool.block_on(atlas::indexer::run_chunk(&ctx, &Default::default(), &db, &chunk, 0, &mut |_| {}))
+        pool.block_on(atlas::indexer::run_chunk(&ctx, &exact(), &db, &chunk, 0, &mut |_| {}))
     };
 
     let err = run(first_day - 1).unwrap_err();
@@ -528,7 +531,7 @@ fn only_the_server_going_back_furthest_does_the_oldest_day() {
             rusqlite::params![chunk.server, GROUP, day],
         )
         .unwrap();
-        pool.block_on(atlas::indexer::run_chunk(&ctx, &Default::default(), &db, &chunk, server, &mut |_| {}))
+        pool.block_on(atlas::indexer::run_chunk(&ctx, &exact(), &db, &chunk, server, &mut |_| {}))
     };
     let state =
         || -> i64 { conn.query_row("select state from backfill_chunks where day = ?", [day], |r| r.get(0)).unwrap() };
@@ -590,7 +593,7 @@ fn the_oldest_day_moves_on_when_the_deepest_server_drops_the_group() {
             rusqlite::params![chunk.server, GROUP, day],
         )
         .unwrap();
-        pool.block_on(atlas::indexer::run_chunk(&ctx, &Default::default(), &db, &chunk, server, &mut |_| {}))
+        pool.block_on(atlas::indexer::run_chunk(&ctx, &exact(), &db, &chunk, server, &mut |_| {}))
     };
     let state =
         || -> i64 { conn.query_row("select state from backfill_chunks where day = ?", [day], |r| r.get(0)).unwrap() };
@@ -657,7 +660,7 @@ fn the_oldest_day_moves_on_when_the_deepest_server_no_longer_keeps_it() {
             rusqlite::params![chunk.server, GROUP, day],
         )
         .unwrap();
-        pool.block_on(atlas::indexer::run_chunk(&ctx, &Default::default(), &db, &chunk, server, &mut |_| {}))
+        pool.block_on(atlas::indexer::run_chunk(&ctx, &exact(), &db, &chunk, server, &mut |_| {}))
     };
     let state =
         || -> i64 { conn.query_row("select state from backfill_chunks where day = ?", [day], |r| r.get(0)).unwrap() };
@@ -724,6 +727,7 @@ fn a_split_reaches_back_when_a_deeper_server_joins() {
         batch_size: 10,
         request_size: 10,
         split_min_backlog: 10,
+        chunk_safety: 0,
     };
     pool.block_on(atlas::indexer::run_pass(&ctx, &settings, &db, GROUP, 0, &mut |_| {})).unwrap();
 
@@ -751,8 +755,7 @@ fn a_split_reaches_back_when_a_deeper_server_joins() {
             rusqlite::params![GROUP, day],
         )
         .unwrap();
-        let saved =
-            pool.block_on(atlas::indexer::run_chunk(&ctx, &Default::default(), &db, &chunk, 1, &mut |_| {})).unwrap();
+        let saved = pool.block_on(atlas::indexer::run_chunk(&ctx, &exact(), &db, &chunk, 1, &mut |_| {})).unwrap();
         assert!(saved.articles >= 24, "day {day}: {} articles", saved.articles);
         assert_eq!(state(day), 2);
     }
@@ -802,6 +805,7 @@ fn a_split_reaches_back_when_home_no_longer_keeps_its_cursor() {
         batch_size: 10,
         request_size: 10,
         split_min_backlog: 10,
+        chunk_safety: 0,
     };
     pool.block_on(atlas::indexer::run_pass(&ctx, &settings, &db, GROUP, 0, &mut |_| {})).unwrap();
 
@@ -851,6 +855,7 @@ fn a_split_reaches_a_carrier_whose_low_mark_lags() {
         batch_size: 10,
         request_size: 10,
         split_min_backlog: 10,
+        chunk_safety: 0,
     };
     pool.block_on(atlas::indexer::run_pass(&ctx, &settings, &db, GROUP, 0, &mut |_| {})).unwrap();
 
@@ -901,6 +906,7 @@ fn a_forged_old_date_at_the_cursor_doesnt_split() {
         batch_size: 10,
         request_size: 10,
         split_min_backlog: 10,
+        chunk_safety: 0,
     };
     let saved = pool.block_on(atlas::indexer::run_pass(&ctx, &settings, &db, GROUP, 0, &mut |_| {})).unwrap();
 
@@ -947,6 +953,7 @@ fn a_split_redoes_its_oldest_day_when_a_server_goes_back_further_in_it() {
         batch_size: 10,
         request_size: 10,
         split_min_backlog: 10,
+        chunk_safety: 0,
     };
     let conn = atlas::db::open_at(&main).unwrap();
     let day0 = atlas::chunks::unix_day(start.timestamp());
@@ -961,7 +968,7 @@ fn a_split_redoes_its_oldest_day_when_a_server_goes_back_further_in_it() {
             rusqlite::params![host, GROUP, day],
         )
         .unwrap();
-        pool.block_on(atlas::indexer::run_chunk(&ctx(), &Default::default(), &db, &chunk, server, &mut |_| {})).unwrap()
+        pool.block_on(atlas::indexer::run_chunk(&ctx(), &exact(), &db, &chunk, server, &mut |_| {})).unwrap()
     };
 
     // the split, and its oldest day done from 18:00 by the home server
@@ -1082,8 +1089,7 @@ fn chunks_save_every_post_of(list: &[Slot], days: &[i64]) {
         };
         let db = atlas::indexer::shared_db(main_conn);
         let chunk = claimed(&main, GROUP, day);
-        let saved =
-            pool.block_on(atlas::indexer::run_chunk(&ctx, &Default::default(), &db, &chunk, 0, &mut |_| {})).unwrap();
+        let saved = pool.block_on(atlas::indexer::run_chunk(&ctx, &exact(), &db, &chunk, 0, &mut |_| {})).unwrap();
         let (from, to) = (day * 86_400 - 3600, (day + 1) * 86_400 + 3600);
         let want = list.iter().filter(|&&(_, t)| t >= from && t < to).count() as i64;
         assert_eq!(saved.articles, want, "day {day}");
@@ -1168,7 +1174,7 @@ fn chunk_of_jan_10(posts: Vec<common::Post>) -> Vec<u64> {
     };
     let db = atlas::indexer::shared_db(main_conn);
     let chunk = claimed(&main, GROUP, day);
-    pool.block_on(atlas::indexer::run_chunk(&ctx, &Default::default(), &db, &chunk, 0, &mut |_| {})).unwrap();
+    pool.block_on(atlas::indexer::run_chunk(&ctx, &exact(), &db, &chunk, 0, &mut |_| {})).unwrap();
 
     let conn = atlas::db::open_with_shards(&main).unwrap();
     assert_eq!(atlas::chunks::progress(&conn, GROUP).unwrap(), (1, 1));
@@ -1230,7 +1236,7 @@ fn saved_by_every_chunk(list: &[Slot], days: std::ops::RangeInclusive<i64>) -> V
     let db = atlas::indexer::shared_db(main_conn);
     for day in days.clone() {
         let chunk = claimed(&main, GROUP, day);
-        pool.block_on(atlas::indexer::run_chunk(&ctx, &Default::default(), &db, &chunk, 0, &mut |_| {})).unwrap();
+        pool.block_on(atlas::indexer::run_chunk(&ctx, &exact(), &db, &chunk, 0, &mut |_| {})).unwrap();
     }
     let conn = atlas::db::open_with_shards(&main).unwrap();
     let total = days.end() - days.start() + 1;
@@ -1296,8 +1302,15 @@ fn day_chunk_ranges_cover_every_number_whatever_the_forged_runs() {
         let (low, high) = (list[0].0, list.last().unwrap().0);
         let mut ranges: Vec<(u64, u64)> = (oldest_day..=newest_day)
             .map(|day| {
-                let range =
-                    atlas::indexer::chunk_range(&pool.pool, 0, GROUP, (low, high), day, (oldest_day, newest_day), high);
+                let range = atlas::indexer::chunk_range(
+                    &pool.pool,
+                    0,
+                    GROUP,
+                    (low, high),
+                    day,
+                    (oldest_day, newest_day),
+                    (high, 0),
+                );
                 pool.block_on(range).unwrap()
             })
             .filter(|(start, end)| start <= end)
@@ -1310,4 +1323,61 @@ fn day_chunk_ranges_cover_every_number_whatever_the_forged_runs() {
         }
         assert_eq!(covered, high, "case {case}: the chunks stop short of the high mark");
     }
+}
+
+/// Adjacent day chunks done on two servers whose numbering differs (one has
+/// a hole near the day boundary) with a run of forged Dates across the
+/// boundary: every article between them is in one or the other.
+#[test]
+fn adjacent_days_on_two_servers_leave_no_article_between_them() {
+    let start = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00+00:00").unwrap();
+    // a post a minute for three days; a run before the day 1 / day 2
+    // boundary dated a day after the last
+    let boundary = 2 * 1440u64;
+    let forged = (boundary - 400)..(boundary - 250);
+    let date = |i: u64| {
+        let when = if forged.contains(&i) {
+            start + chrono::Duration::hours(3 * 24 + 12)
+        } else {
+            start + chrono::Duration::minutes(i as i64)
+        };
+        when.to_rfc2822()
+    };
+    // "127.0.0.1" numbers them from 1, "localhost" from 50_001 with a hole
+    // of a billion numbers before the run
+    let number_b = |i: u64| if i < boundary - 500 { 50_001 + i } else { 1_000_050_001 + i };
+    let posts = |number: &dyn Fn(u64) -> u64| -> Vec<common::Post> {
+        (0..3 * 1440u64)
+            .map(|i| {
+                let mut p = post_at(number(i), &format!(r#""p{i}.bin" yEnc (1/1)"#), &date(i));
+                p.message_id = format!("<m{i}@x>");
+                p
+            })
+            .collect()
+    };
+    let (pa, pb) = (spawn_server(Server::new(posts(&|i| i + 1))), spawn_server(Server::new(posts(&number_b))));
+    let mut b = mock(pb, "secret", 2, 2);
+    b.host = "localhost".into();
+    let pool = BlockingPool::new(&[mock(pa, "secret", 2, 1), b]);
+    pool.connect().unwrap();
+
+    let day0 = atlas::chunks::unix_day(start.timestamp());
+    let days = (day0, day0 + 2);
+    let (a_marks, b_marks) = ((1, 3 * 1440), (50_001, number_b(3 * 1440 - 1)));
+    let range = |server: usize, marks: (u64, u64), day: i64, safety: u64| {
+        pool.block_on(atlas::indexer::chunk_range(&pool.pool, server, GROUP, marks, day, days, (marks.1, safety)))
+            .unwrap()
+    };
+    // day 1 on "localhost", day 2 on "127.0.0.1"
+    let lost = |safety: u64| -> Vec<u64> {
+        let (b_start, b_end) = range(1, b_marks, day0 + 1, safety);
+        let (a_start, a_end) = range(0, a_marks, day0 + 2, safety);
+        (1440 + 120..3 * 1440)
+            .filter(|&i| !(b_start..=b_end).contains(&number_b(i)) && !(a_start..=a_end).contains(&(i + 1)))
+            .collect()
+    };
+    // the date searches alone leave a gap: the forged run moves them differently
+    assert!(!lost(0).is_empty());
+    let lost = lost(atlas::indexer::CHUNK_SAFETY);
+    assert!(lost.is_empty(), "{} lost, from {:?}", lost.len(), lost.first());
 }

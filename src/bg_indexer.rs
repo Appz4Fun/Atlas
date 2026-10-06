@@ -236,6 +236,7 @@ fn settings_of(config: &Config) -> PassSettings {
         batch_size: config.batch_size() as i64,
         request_size: config.request_size(),
         split_min_backlog: config.split_min_backlog(),
+        chunk_safety: crate::indexer::CHUNK_SAFETY,
     }
 }
 

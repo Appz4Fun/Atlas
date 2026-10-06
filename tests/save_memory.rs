@@ -70,8 +70,13 @@ fn the_heap_doesnt_grow_with_headers_saved() {
         stop: Arc::new(AtomicBool::new(false)),
         verbose: false,
     };
-    let settings =
-        PassSettings { mode: "backfill".into(), batch_size: 20_000, request_size: 2_000, split_min_backlog: i64::MAX };
+    let settings = PassSettings {
+        mode: "backfill".into(),
+        batch_size: 20_000,
+        request_size: 2_000,
+        split_min_backlog: i64::MAX,
+        ..Default::default()
+    };
     let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().unwrap();
     rt.block_on(pool.connect()).unwrap();
 

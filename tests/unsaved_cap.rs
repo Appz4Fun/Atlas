@@ -62,6 +62,7 @@ fn index_everything(cap: usize, groups: usize) {
         batch_size: BATCH as i64,
         request_size: REQUEST,
         split_min_backlog: i64::MAX,
+        ..Default::default()
     });
 
     let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().unwrap();
