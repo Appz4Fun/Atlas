@@ -22,8 +22,10 @@ use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow, bail};
+use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 
+use crate::compact::{checkpoint, rename_db};
 use crate::db;
 use crate::parser::Article;
 use crate::search::{ArticleRow, ReleaseRow};
@@ -34,12 +36,60 @@ use crate::store::{self, SHARDS};
 const BATCH: usize = 25_000;
 /// releases whose NZBs are compared before the swap
 const CHECK_SAMPLE: i64 = 2_000;
+/// and the newest releases on top
+const CHECK_TAIL: i64 = 200;
 /// threads reading the old articles at once
 const READERS: usize = 8;
 
 /// The database at `main` is from before the shards.
 pub fn needed(main: &Path) -> bool {
     main.exists() && db::open_at(main).and_then(|c| db::has_old_layout(&c)).unwrap_or(false)
+}
+
+/// Whether `--convert` has anything to do: a conversion `needed`, or a swap
+/// cut short (atlas.db missing next to atlas.new.db or atlas.old.db) for
+/// `run_alone` to finish or undo first.
+pub fn to_do(main: &Path) -> bool {
+    needed(main)
+        || ((!main.exists() || is_empty_interloper(main))
+            && (sibling(main, "atlas.new.db").exists() || sibling(main, "atlas.old.db").exists()))
+}
+
+/// An atlas.db with nothing in it: no bytes, or not a single table. What a
+/// read made (a build that still made one on opening) in the moment a
+/// conversion's swap had no main database. Looked at read only, and closed
+/// again before this returns (it may be removed next, which Windows refuses
+/// for a file still open).
+pub fn is_empty_interloper(main: &Path) -> bool {
+    match std::fs::metadata(main) {
+        Ok(m) if m.len() == 0 => return true,
+        Ok(m) if m.is_file() => {}
+        _ => return false,
+    }
+    Connection::open_with_flags(main, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)
+        .and_then(|c| c.query_row("select not exists(select 1 from sqlite_master)", [], |r| r.get::<_, bool>(0)))
+        .unwrap_or(false)
+}
+
+/// Removes an empty interloper (see `is_empty_interloper`) at `main`, with
+/// its sidecars. Whoever made it may still have it open: then it stays, and
+/// that is the error.
+fn remove_interloper(main: &Path) -> std::io::Result<()> {
+    std::fs::remove_file(main)?;
+    remove_db(main);
+    Ok(())
+}
+
+/// `rename_db(from, main)`, through an empty interloper at `main` (made in
+/// the moment there was no main database): taken out, and tried again.
+fn rename_into_place(from: &Path, main: &Path) -> std::io::Result<()> {
+    match rename_db(from, main) {
+        Err(e) if is_empty_interloper(main) => {
+            remove_interloper(main).map_err(|_| e)?;
+            rename_db(from, main)
+        }
+        done => done,
+    }
 }
 
 fn sibling(main: &Path, name: &str) -> PathBuf {
@@ -57,7 +107,7 @@ fn remove_db(path: &Path) {
 /// the file) and no syncing. A crash only means converting again from the
 /// old database; the shards go back to WAL before the swap.
 fn open_for_conversion(path: &Path) -> rusqlite::Result<Connection> {
-    let conn = db::open_at(path)?;
+    let conn = db::create_at(path)?;
     conn.query_row("pragma journal_mode = off", [], |_| Ok(()))?;
     conn.execute_batch(
         "pragma synchronous = off;
@@ -65,6 +115,39 @@ fn open_for_conversion(path: &Path) -> rusqlite::Result<Connection> {
          pragma temp_store = memory;",
     )?;
     Ok(conn)
+}
+
+/// Mark a shard filled by `open_for_conversion` as completely copied (a
+/// stopped conversion resumes after it, trusting the mark). Its pages were
+/// written unsynced and unjournaled, soo the shard goes durable first (WAL,
+/// full sync, every page folded into the file and synced) and the mark is
+/// written after: it can never be on disk ahead of the pages it vouches for.
+fn mark_copied(conn: &Connection) -> Result<()> {
+    conn.execute_batch("pragma synchronous = full")?;
+    conn.query_row("pragma journal_mode = wal", [], |_| Ok(()))?;
+    conn.execute("insert or replace into meta (key, value) values ('copied', 0)", [])?;
+    checkpoint(conn).context("making a copied shard durable")?;
+    conn.execute("insert or replace into meta (key, value) values ('copied', 1)", [])?;
+    Ok(())
+}
+
+/// `--convert`: `run` under the exclusive database lock for its whole run,
+/// refused while the indexer, a write, a compaction or another conversion
+/// holds it (two at once would write the same shards and `atlas.new.db`).
+/// None when there was nothing to convert.
+pub fn run_alone(main: &Path, progress: &dyn Fn(&str)) -> Result<Option<(i64, i64)>> {
+    let _alone = crate::compact::Lock::take(main).map_err(|e| match e.downcast_ref::<crate::compact::Busy>() {
+        Some(_) => anyhow!("the database is in use (indexing, a compaction or another conversion); try again later"),
+        None => e,
+    })?;
+    if let Some(said) = recover_cut_swap(main)? {
+        progress(&said);
+    }
+    if !needed(main) {
+        return Ok(None);
+    }
+    crate::compact::refuse_unresolved_backups(main)?;
+    run(main, progress).map(Some)
 }
 
 /// Convert, reporting progress through `progress`. Returns how many releases
@@ -79,15 +162,16 @@ pub fn run(main: &Path, progress: &dyn Fn(&str)) -> Result<(i64, i64)> {
 
     // a run that got through the copy and was stopped during the check
     // picks up there instead of copying everything again
-    let (max_id, shard_of_old, moved_releases, moved_articles, orphans) = if copy_finished(main) {
+    let source = Source::of(&old, main)?;
+    let (max_id, shard_of_old, moved_releases, moved_articles, orphans) = if copy_finished(main, &source) {
         progress("converting the database: the copy finished earlier, checking it");
         let max_id: i64 = old.query_row("select coalesce(max(id), 0) from releases", [], |r| r.get(0))?;
-        let mut shard_of_old = vec![u8::MAX; max_id as usize + 1];
-        let mut stmt = old.prepare("select id, group_name from releases")?;
+        let mut shard_of_old = ShardOf::default();
+        let mut stmt = old.prepare("select id, group_name from releases order by id")?;
         let mut rows = stmt.query([])?;
         while let Some(r) = rows.next()? {
             let (id, group): (i64, Option<String>) = (r.get(0)?, r.get(1)?);
-            shard_of_old[id as usize] = store::shard_of(group.as_deref().unwrap_or("")) as u8;
+            shard_of_old.push(id, store::shard_of(group.as_deref().unwrap_or("")));
         }
         drop(rows);
         drop(stmt);
@@ -96,39 +180,48 @@ pub fn run(main: &Path, progress: &dyn Fn(&str)) -> Result<(i64, i64)> {
         let (releases, articles) = store::totals(&conn)?;
         (max_id, shard_of_old, releases, articles, 0)
     } else {
-        copy(main, &old, started, progress)?
+        copy(main, &old, &source, started, progress)?
     };
 
     // 4. the check
     progress("converting the database: checking NZBs against the old database");
     check(main, &old, max_id, &shard_of_old)?;
 
-    // 5. the swap
+    // 5. the swap. every checkpoint has to fold its whole WAL in: one held
+    // back (a reader, a writer) leaves committed pages only in the WAL
     {
         let conn = db::open_at(&new_main)?;
         store::set_next_seq(&conn, max_id + 1)?;
-        conn.query_row("pragma wal_checkpoint(truncate)", [], |_| Ok(()))?;
+        checkpoint(&conn).context("folding the new main database's WAL in")?;
     }
     for path in store::shard_paths(main) {
         let conn = db::open_at(&path)?;
         conn.query_row("pragma journal_mode = wal", [], |_| Ok(()))?;
-        conn.query_row("pragma wal_checkpoint(truncate)", [], |_| Ok(()))?;
+        checkpoint(&conn).with_context(|| format!("folding {}'s WAL in", path.display()))?;
+    }
+    {
+        // from here atlas.new.db is whole: a swap cut short finishes at the next start
+        let conn = db::open_at(&new_main)?;
+        conn.execute("insert or replace into meta (key, value) values ('swap_ready', 1)", [])?;
+        checkpoint(&conn).context("folding the new main database's WAL in")?;
     }
     drop(old);
     let backup = sibling(main, "atlas.old.db");
     remove_db(&backup);
     {
-        // fold the old wal in soo atlas.old.db is whole on its own
+        // fold the old wal in soo atlas.old.db is whole on its own. nothing
+        // else should have it open (the conversion runs alone), soo a short
+        // wait: whoever does keeps the old database in place
         let conn = db::open_at(main)?;
-        conn.query_row("pragma wal_checkpoint(truncate)", [], |_| Ok(()))?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        checkpoint(&conn).context("folding the old database's WAL in")?;
     }
-    std::fs::rename(main, &backup).context("moving the old database aside")?;
-    for suffix in ["-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{}{suffix}", main.display()));
-    }
-    std::fs::rename(&new_main, main).context("putting the new main database in place")?;
-    for suffix in ["-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{}{suffix}", new_main.display()));
+    // its -wal and -shm go aside with it, whatever they still hold
+    rename_db(main, &backup).context("moving the old database aside")?;
+    if let Err(e) = rename_into_place(&new_main, main) {
+        // the old one back, soo there is a main database to start from
+        let _ = rename_into_place(&backup, main);
+        return Err(e).context("putting the new main database in place");
     }
 
     progress(&format!(
@@ -138,6 +231,87 @@ pub fn run(main: &Path, progress: &dyn Fn(&str)) -> Result<(i64, i64)> {
         backup.display()
     ));
     Ok((moved_releases, moved_articles))
+}
+
+/// A swap that was cut short between moving the old database aside and
+/// putting the new one in place leaves no main database. Finishes it when
+/// `atlas.new.db` got through everything before the swap, else puts
+/// `atlas.old.db` back (and the next start converts again). Run under the
+/// exclusive lock. What it did, if anything.
+pub fn recover_cut_swap(main: &Path) -> Result<Option<String>> {
+    let (new_main, backup) = (sibling(main, "atlas.new.db"), sibling(main, "atlas.old.db"));
+    if main.try_exists()? {
+        // an empty one made in the swap's moment is in the way: out with it
+        let cut = (new_main.try_exists()? && swap_ready(&new_main)) || backup.try_exists()?;
+        if !(cut && is_empty_interloper(main)) {
+            return Ok(None);
+        }
+        remove_interloper(main).with_context(|| format!("removing the empty {} in the way", main.display()))?;
+    }
+    if new_main.try_exists()? && swap_ready(&new_main) {
+        rename_db(&new_main, main).context("putting the converted main database in place")?;
+        return Ok(Some(format!(
+            "a conversion was cut short putting {} in place; it's in place now (the old database is {})",
+            main.display(),
+            backup.display()
+        )));
+    }
+    if backup.try_exists()? {
+        // no conversion under way (it would have left atlas.new.db) yet shards
+        // with releases: a conversion finished long ago and atlas.db went
+        // missing since. the old database back would be converted again, and
+        // that fresh copy would wipe the shards and all indexed since
+        if !new_main.try_exists()? && shards_hold_releases(main) {
+            bail!(
+                "{} is missing, but the shards next to it hold releases from a finished conversion; \
+                 not putting {} back (converting it again would wipe the shards). \
+                 restore {} from a backup, or move the shards (atlas.s*.db) aside to start over from {}",
+                main.display(),
+                backup.display(),
+                main.display(),
+                backup.display()
+            );
+        }
+        rename_db(&backup, main).context("putting the old database back")?;
+        return Ok(Some(format!(
+            "a conversion was cut short after moving {} aside; it's back in place",
+            main.display()
+        )));
+    }
+    Ok(None)
+}
+
+/// Any shard next to `main` has a release (read only: nothing is created)
+fn shards_hold_releases(main: &Path) -> bool {
+    store::shard_paths(main).iter().any(|p| {
+        p.exists()
+            && Connection::open_with_flags(p, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)
+                .and_then(|c| c.query_row("select exists(select 1 from releases)", [], |r| r.get::<_, bool>(0)))
+                .unwrap_or(false)
+    })
+}
+
+fn swap_ready(new_main: &Path) -> bool {
+    db::open_at(new_main)
+        .and_then(|c| c.query_row("select value from meta where key = 'swap_ready'", [], |r| r.get(0)).optional())
+        .is_ok_and(|v: Option<i64>| v == Some(1))
+}
+
+/// Old release id -> the shard it went to, one entry per release (ids can
+/// have gaps of any size, soo not a slot per id up to the highest). Filled
+/// in id order, looked up by binary search.
+#[derive(Default)]
+struct ShardOf(Vec<(i64, u8)>);
+
+impl ShardOf {
+    fn push(&mut self, id: i64, shard: usize) {
+        debug_assert!(self.0.last().is_none_or(|&(last, _)| last < id), "releases come in id order");
+        self.0.push((id, shard as u8));
+    }
+
+    fn get(&self, id: i64) -> Option<usize> {
+        self.0.binary_search_by_key(&id, |&(id, _)| id).ok().map(|i| self.0[i].1 as usize)
+    }
 }
 
 type OldRelease = (i64, ReleaseFields);
@@ -158,7 +332,7 @@ fn move_releases(
     main: &Path,
     old: &Connection,
     total: i64,
-    shard_of_old: &mut [u8],
+    shard_of_old: &mut ShardOf,
     progress: &dyn Fn(&str),
 ) -> Result<i64> {
     std::thread::scope(|s| -> Result<i64> {
@@ -206,7 +380,7 @@ fn move_releases(
 
         let mut stmt = old.prepare(
             "select id, name, group_name, poster, posted_date, size, complete, parts, file_total, display_name,
-                is_obfuscated from releases",
+                is_obfuscated from releases order by id",
         )?;
         let mut rows = stmt.query([])?;
         let mut buffers: Vec<Vec<OldRelease>> = vec![Vec::new(); SHARDS];
@@ -216,7 +390,7 @@ fn move_releases(
             let id: i64 = r.get(0)?;
             let group: Option<String> = r.get(2)?;
             let shard = store::shard_of(group.as_deref().unwrap_or(""));
-            shard_of_old[id as usize] = shard as u8;
+            shard_of_old.push(id, shard);
             buffers[shard].push((
                 id,
                 (
@@ -269,7 +443,7 @@ type OldArticle = (i64, Article);
 fn move_articles(
     main: &Path,
     total: i64,
-    shard_of_old: &[u8],
+    shard_of_old: &ShardOf,
     started: Instant,
     progress: &dyn Fn(&str),
 ) -> Result<(i64, i64)> {
@@ -324,6 +498,7 @@ fn move_articles(
                         }
                     }
                     tx.commit()?;
+                    domains.committed();
                 }
 
                 // into place in key order: an append, sorted on disk
@@ -335,8 +510,7 @@ fn move_articles(
                 )? as i64;
                 conn.execute_batch("drop table segments_load")?;
                 store::add_totals(&conn, 0, added)?;
-                // this shard's copy is complete (a stopped conversion resumes after it)
-                conn.execute("insert or replace into meta (key, value) values ('copied', 1)", [])?;
+                mark_copied(&conn)?;
                 Ok((*read_total, added))
             }));
         }
@@ -364,16 +538,16 @@ fn move_articles(
                         read.fetch_add(1, Ordering::Relaxed);
                         let release_id: Option<i64> = r.get(0)?;
                         let message_id: Option<String> = r.get(1)?;
-                        let shard = release_id.and_then(|id| shard_of_old.get(id as usize)).copied().unwrap_or(u8::MAX);
+                        let shard = release_id.and_then(|id| shard_of_old.get(id));
                         let (Some(old_id), Some(message_id)) = (release_id, message_id.filter(|m| !m.is_empty()))
                         else {
                             orphans.fetch_add(1, Ordering::Relaxed);
                             continue;
                         };
-                        if shard == u8::MAX {
+                        let Some(shard) = shard else {
                             orphans.fetch_add(1, Ordering::Relaxed);
                             continue;
-                        }
+                        };
                         let article = Article {
                             message_id,
                             subject: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
@@ -384,7 +558,6 @@ fn move_articles(
                             file_total: r.get(7)?,
                             ..Article::default()
                         };
-                        let shard = shard as usize;
                         buffers[shard].push((store::global_id(old_id, shard), article));
                         if buffers[shard].len() >= BATCH {
                             sent.fetch_add(BATCH as i64, Ordering::Relaxed);
@@ -447,9 +620,9 @@ fn move_articles(
     })
 }
 
-/// Compare `CHECK_SAMPLE` releases, spread over the whole database, between
-/// the old database and the shards.
-fn check(main: &Path, old: &Connection, max_id: i64, shard_of_old: &[u8]) -> Result<()> {
+/// Compare `CHECK_SAMPLE` releases, spread over the whole database, and the
+/// newest `CHECK_TAIL` between the old database and the shards.
+fn check(main: &Path, old: &Connection, max_id: i64, shard_of_old: &ShardOf) -> Result<()> {
     let new = Connection::open_in_memory()?;
     store::attach(&new, main)?;
 
@@ -477,14 +650,22 @@ fn check(main: &Path, old: &Connection, max_id: i64, shard_of_old: &[u8]) -> Res
         })
     };
 
+    // spread over the ids, and the newest ones: the last written are the
+    // likeliest to be missing from a copy
+    let tail: Vec<i64> = old
+        .prepare("select id from releases order by id desc limit ?")?
+        .query_map([CHECK_TAIL], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    let starts = (0..CHECK_SAMPLE).map(|i| i * step).chain(tail);
+
     let (mut checked, mut bad) = (0, Vec::new());
     let mut seen = std::collections::HashSet::new();
-    for i in 0..CHECK_SAMPLE {
-        let Ok(was) = old_release.query_row([i * step], row) else { continue };
+    for start in starts {
+        let Ok(was) = old_release.query_row([start], row) else { continue };
         if !seen.insert(was.id) {
             continue;
         }
-        let shard = shard_of_old[was.id as usize] as usize;
+        let shard = shard_of_old.get(was.id).ok_or_else(|| anyhow!("release {} has no shard", was.id))?;
         let id = store::global_id(was.id, shard);
         let now = new.query_row(
             &format!(
@@ -543,14 +724,15 @@ fn check(main: &Path, old: &Connection, max_id: i64, shard_of_old: &[u8]) -> Res
 fn copy(
     main: &Path,
     old: &Connection,
+    source: &Source,
     started: Instant,
     progress: &dyn Fn(&str),
-) -> Result<(i64, Vec<u8>, i64, i64, i64)> {
+) -> Result<(i64, ShardOf, i64, i64, i64)> {
     let new_main = sibling(main, "atlas.new.db");
     // 1. the new main database with the cursors
     remove_db(&new_main);
     {
-        let conn = db::open_at(&new_main)?;
+        let conn = db::create_at(&new_main)?;
         conn.query_row("pragma journal_mode = wal", [], |_| Ok(()))?;
         conn.execute_batch("create table groups(name TEXT PRIMARY KEY, live_cursor INTEGER, backfill_cursor INTEGER)")?;
         let cols: Vec<String> = old
@@ -565,6 +747,7 @@ fn copy(
         let list = cols.join(", ");
         conn.execute(&format!("insert into groups ({list}) select {list} from old.groups"), [])?;
         conn.execute("detach database old", [])?;
+        source.save(&conn)?;
     }
 
     // fresh shards (a failed run leaves its own behind). releases go in without
@@ -583,8 +766,7 @@ fn copy(
     let max_id: i64 = old.query_row("select coalesce(max(id), 0) from releases", [], |r| r.get(0))?;
     let total_releases: i64 = old.query_row("select count(*) from releases", [], |r| r.get(0))?;
     progress(&format!("converting the database: {} releases", total_releases));
-    // old id -> shard (255 = no such release)
-    let mut shard_of_old = vec![u8::MAX; max_id as usize + 1];
+    let mut shard_of_old = ShardOf::default();
     let moved_releases = move_releases(main, old, total_releases, &mut shard_of_old, progress)?;
 
     progress("converting the database: building the release indexes and search index");
@@ -612,13 +794,149 @@ fn copy(
     let total_articles: i64 = old.query_row("select coalesce(max(id), 0) from articles", [], |r| r.get(0))?;
     let (moved_articles, orphans) = move_articles(main, total_articles, &shard_of_old, started, progress)?;
 
+    // the copy's own connections to the old database have closed (the last one
+    // folds its -wal in), soo its files are as a stopped run will find them
+    let conn = db::open_at(&new_main)?;
+    Source::of(old, main)?.save(&conn)?;
+
     Ok((max_id, shard_of_old, moved_releases, moved_articles, orphans))
 }
 
-/// The shards are complete from an earlier run: every shard writer marks its
-/// shard once its articles are sorted into place.
-fn copy_finished(main: &Path) -> bool {
-    sibling(main, "atlas.new.db").exists()
+/// What the old database was when a copy started: its release and article
+/// counts and highest ids, a digest of its `groups` rows (the cursors: scans
+/// of empty ranges move them without adding anything), an identity written
+/// into its own meta on the first attempt, and the size and modification time
+/// of its file and its -wal (a change that keeps every count, an edit to one
+/// release, still moves those). A copy is only picked up again from the same
+/// old database; one written to or put back from another backup since differs.
+#[derive(Debug, PartialEq)]
+struct Source(Vec<(&'static str, String)>);
+
+impl Source {
+    fn of(old: &Connection, main: &Path) -> Result<Source> {
+        let (releases, max_release): (i64, i64) =
+            old.query_row("select count(*), coalesce(max(id), 0) from releases", [], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        let (articles, max_article): (i64, i64) =
+            old.query_row("select count(*), coalesce(max(id), 0) from articles", [], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        // the identity first: writing it is a change to the files stat'd below
+        let uuid = source_identity(main)?;
+        let stat = |path: PathBuf| -> String {
+            // an empty -wal is as good as none: opening a database touches it
+            let Ok(m) = std::fs::metadata(&path) else { return "none".into() };
+            if m.len() == 0 && path.to_string_lossy().ends_with("-wal") {
+                return "none".into();
+            }
+            let nanos =
+                m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_nanos());
+            format!("{}:{}", m.len(), nanos.unwrap_or(0))
+        };
+        let wal = PathBuf::from(format!("{}-wal", main.display()));
+        Ok(Source(vec![
+            ("source_releases", releases.to_string()),
+            ("source_max_release", max_release.to_string()),
+            ("source_articles", articles.to_string()),
+            ("source_max_article", max_article.to_string()),
+            ("source_groups", groups_digest(old)?.to_string()),
+            ("source_uuid", uuid),
+            ("source_db_file", stat(main.to_path_buf())),
+            ("source_wal_file", stat(wal)),
+        ]))
+    }
+
+    /// into the new main database's meta, as the copy starts
+    fn save(&self, conn: &Connection) -> Result<()> {
+        for (key, value) in &self.0 {
+            conn.execute("insert or replace into meta (key, value) values (?, ?)", params![key, value])?;
+        }
+        Ok(())
+    }
+
+    fn saved(conn: &Connection, like: &Source) -> Result<Option<Source>> {
+        let mut values = Vec::new();
+        for (key, _) in &like.0 {
+            let Some(v) =
+                conn.query_row("select cast(value as text) from meta where key = ?", [key], |r| r.get(0)).optional()?
+            else {
+                return Ok(None);
+            };
+            values.push((*key, v));
+        }
+        Ok(Some(Source(values)))
+    }
+}
+
+/// The old database's random identity, written into its meta the first time
+/// a conversion is tried on it and read back after that. Its -wal is folded
+/// in here too: whichever connection closes last does that anyway, and it
+/// would change the files a stopped run is checked against, soo it's done
+/// first, before they are looked at.
+fn source_identity(main: &Path) -> Result<String> {
+    let conn = Connection::open(main).context("opening the old database to identify it")?;
+    conn.busy_timeout(std::time::Duration::from_secs(30))?;
+    let read = |conn: &Connection| -> Option<String> {
+        conn.query_row("select cast(value as text) from meta where key = 'source_uuid'", [], |r| r.get(0)).ok()
+    };
+    let uuid = match read(&conn) {
+        Some(uuid) => uuid,
+        None => {
+            let mut bytes = [0u8; 16];
+            getrandom::fill(&mut bytes).map_err(|e| anyhow!("no random bytes for the source identity: {e}"))?;
+            let uuid: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+            conn.execute_batch("create table if not exists meta (key text primary key, value)")?;
+            conn.execute("insert or ignore into meta (key, value) values ('source_uuid', ?)", [&uuid])?;
+            read(&conn).ok_or_else(|| anyhow!("the source identity was not written"))?
+        }
+    };
+    // best effort, never waited for: a reader holding it back only means a
+    // stopped run is copied again
+    conn.busy_timeout(std::time::Duration::ZERO)?;
+    let _ = conn.query_row("pragma wal_checkpoint(truncate)", [], |_| Ok(()));
+    Ok(uuid)
+}
+
+/// FNV-1a over every column of every `groups` row in name order, stable
+/// across builds (it's kept in the new database's meta between runs)
+fn groups_digest(old: &Connection) -> Result<i64> {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut eat = |bytes: &[u8]| {
+        for b in bytes {
+            hash = (hash ^ *b as u64).wrapping_mul(0x0100_0000_01b3);
+        }
+    };
+    let mut stmt = old.prepare("select * from groups order by name")?;
+    let columns = stmt.column_count();
+    let mut rows = stmt.query([])?;
+    while let Some(r) = rows.next()? {
+        for i in 0..columns {
+            // the type too, soo null and '' and 0 differ
+            match r.get_ref(i)? {
+                ValueRef::Null => eat(b"n"),
+                ValueRef::Integer(v) => {
+                    eat(b"i");
+                    eat(&v.to_le_bytes());
+                }
+                ValueRef::Real(v) => {
+                    eat(b"r");
+                    eat(&v.to_le_bytes());
+                }
+                ValueRef::Text(v) | ValueRef::Blob(v) => {
+                    eat(b"t");
+                    eat(&(v.len() as u64).to_le_bytes());
+                    eat(v);
+                }
+            }
+        }
+    }
+    Ok(hash as i64)
+}
+
+/// The shards are complete from an earlier run, copied from the old database
+/// as it is now (`source`): every shard writer marks its shard once its
+/// articles are sorted into place.
+fn copy_finished(main: &Path, source: &Source) -> bool {
+    let new_main = sibling(main, "atlas.new.db");
+    new_main.exists()
+        && db::open_at(&new_main).ok().and_then(|c| Source::saved(&c, source).ok().flatten()).as_ref() == Some(source)
         && store::shard_paths(main).iter().all(|p| {
             p.exists()
                 && db::open_at(p)
@@ -629,4 +947,35 @@ fn copy_finished(main: &Path) -> bool {
                     })
                     .unwrap_or(false)
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_copied_shard_is_durable_before_it_is_marked() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shard.db");
+        let conn = open_for_conversion(&path).unwrap();
+        conn.execute_batch("create table meta(key text primary key, value); create table t(x)").unwrap();
+        conn.execute("insert into t values (1)", []).unwrap();
+        let mode = |c: &Connection| c.query_row("pragma journal_mode", [], |r| r.get::<_, String>(0)).unwrap();
+        assert_eq!(mode(&conn), "off");
+        mark_copied(&conn).unwrap();
+        // fully synced, journaled, and the data is in the file itself
+        assert_eq!(mode(&conn), "wal");
+        assert_eq!(conn.query_row("pragma synchronous", [], |r| r.get::<_, i64>(0)).unwrap(), 2);
+        let mark: i64 = conn.query_row("select value from meta where key = 'copied'", [], |r| r.get(0)).unwrap();
+        assert_eq!(mark, 1);
+        // the file alone (without the WAL, as after a crash that lost the
+        // unsynced tail) has the rows, and not yet the mark written last
+        let alone = dir.path().join("alone.db");
+        std::fs::copy(&path, &alone).unwrap();
+        let alone = Connection::open(&alone).unwrap();
+        assert_eq!(alone.query_row("select count(*) from t", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+        let marked: Option<i64> =
+            alone.query_row("select value from meta where key = 'copied'", [], |r| r.get(0)).optional().unwrap();
+        assert_ne!(marked, Some(1));
+    }
 }

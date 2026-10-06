@@ -74,6 +74,10 @@ pub struct Load {
     pub writer_queued: AtomicU64,
     /// part of writer_busy spent finishing checkpoints between transactions
     pub writer_checkpoint_ns: AtomicU64,
+    /// part of writer_busy spent sealing files between transactions
+    pub writer_seal_ns: AtomicU64,
+    /// files (or whole seal ticks) that failed to seal
+    pub writer_seal_errors: AtomicU64,
     /// time header requests spent on the wire, and how many there were
     pub xover_ns: AtomicU64,
     pub xovers: AtomicU64,
@@ -89,6 +93,8 @@ pub static LOAD: Load = Load {
     writer_slices: AtomicU64::new(0),
     writer_queued: AtomicU64::new(0),
     writer_checkpoint_ns: AtomicU64::new(0),
+    writer_seal_ns: AtomicU64::new(0),
+    writer_seal_errors: AtomicU64::new(0),
     xover_ns: AtomicU64::new(0),
     xovers: AtomicU64::new(0),
     lease_wait_ns: AtomicU64::new(0),
@@ -114,6 +120,8 @@ impl Load {
             "writer_slices": get(&self.writer_slices),
             "writer_queued": get(&self.writer_queued),
             "writer_checkpoint_ns": get(&self.writer_checkpoint_ns),
+            "writer_seal_ns": get(&self.writer_seal_ns),
+            "writer_seal_errors": get(&self.writer_seal_errors),
             "xover_ns": get(&self.xover_ns),
             "xovers": get(&self.xovers),
             "lease_wait_ns": get(&self.lease_wait_ns),

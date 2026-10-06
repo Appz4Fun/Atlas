@@ -20,6 +20,8 @@ pub struct Post {
     pub message_id: String,
     pub bytes: u64,
     pub body: Vec<Vec<u8>>,
+    /// the Date header, rfc 2822
+    pub date: String,
 }
 
 pub struct Server {
@@ -55,6 +57,16 @@ pub struct Server {
     pub stalled: AtomicUsize,
     /// connections ever accepted
     pub accepted: AtomicUsize,
+    /// BODYs answered with the article, and how long each takes
+    pub bodies_sent: AtomicUsize,
+    pub body_delay: Duration,
+    /// answer an empty XOVER range with 420 (some providers) instead of 423
+    pub empty_is_420: bool,
+    /// GROUP reports this as the low water mark instead of the first post's
+    /// number, like a provider whose low mark lags behind its retention
+    pub reported_low: Option<u64>,
+    /// once set, GROUP answers 411, like a provider that dropped the group
+    pub dropped: std::sync::atomic::AtomicBool,
 }
 
 impl Server {
@@ -81,6 +93,11 @@ impl Server {
             stalls_left: AtomicUsize::new(0),
             stalled: AtomicUsize::new(0),
             accepted: AtomicUsize::new(0),
+            bodies_sent: AtomicUsize::new(0),
+            body_delay: Duration::ZERO,
+            empty_is_420: false,
+            reported_low: None,
+            dropped: Default::default(),
         })
     }
 }
@@ -131,7 +148,19 @@ pub fn par2_file_desc(name: &str, size: u64) -> Vec<u8> {
 }
 
 pub fn post(number: u64, subject: &str, bytes: u64, body: Vec<Vec<u8>>) -> Post {
-    Post { number, subject: subject.into(), message_id: format!("<msg{number}@mock>"), bytes, body }
+    Post {
+        number,
+        subject: subject.into(),
+        message_id: format!("<msg{number}@mock>"),
+        bytes,
+        body,
+        date: "Fri, 02 Oct 2026 10:11:12 +0000".into(),
+    }
+}
+
+/// A post with its own date (rfc 2822), for date based tests.
+pub fn post_at(number: u64, subject: &str, date: &str) -> Post {
+    Post { date: date.into(), ..post(number, subject, 10, vec![]) }
 }
 
 pub fn handle(stream: TcpStream, state: Arc<Server>) {
@@ -162,7 +191,7 @@ pub fn serve(stream: TcpStream, state: &Server, over_limit: bool) {
         let cmd = line.trim_end().to_string();
         line.clear();
         let (verb, arg) = cmd.split_once(' ').unwrap_or((&cmd, ""));
-        let posts = state.posts.lock().unwrap().clone();
+        let posts_lock = || state.posts.lock().unwrap();
 
         match verb.to_uppercase().as_str() {
             "AUTHINFO" if arg.starts_with("USER") => send(&mut out, b"381 more"),
@@ -176,16 +205,18 @@ pub fn serve(stream: TcpStream, state: &Server, over_limit: bool) {
                 send(&mut out, if ok { b"281 ok".as_slice() } else { b"481 nope" })
             }
             "GROUP" if state.no_group => send(&mut out, b"501 GROUP command error"),
+            "GROUP" if state.dropped.load(Ordering::SeqCst) => send(&mut out, b"411 no such group"),
             "GROUP" if arg == GROUP || (state.any_group && arg.starts_with("alt.binaries.")) => {
                 selected = Some(arg.to_string());
-                let first = posts.iter().map(|p| p.number).min().unwrap_or(0);
+                let posts = posts_lock();
+                let first = state.reported_low.unwrap_or_else(|| posts.iter().map(|p| p.number).min().unwrap_or(0));
                 let last = posts.iter().map(|p| p.number).max().unwrap_or(0);
                 send(&mut out, format!("211 {} {first} {last} {arg}", posts.len()).as_bytes());
             }
             "GROUP" => send(&mut out, b"411 no such group"),
             "LIST" => {
                 send(&mut out, b"215 list follows");
-                let last = posts.iter().map(|p| p.number).max().unwrap_or(0);
+                let last = posts_lock().iter().map(|p| p.number).max().unwrap_or(0);
                 send(&mut out, format!("{GROUP} {last} 1 y").as_bytes());
                 send(&mut out, b"alt.binaries.empty 5 5 y");
                 send(&mut out, b"comp.lang.rust 900 1 y");
@@ -210,20 +241,23 @@ pub fn serve(stream: TcpStream, state: &Server, over_limit: bool) {
                 state.xovers_in_flight.fetch_sub(1, Ordering::SeqCst);
                 let (a, b) = arg.split_once('-').unwrap();
                 let (a, b): (u64, u64) = (a.parse().unwrap(), b.parse().unwrap());
-                let hits: Vec<&Post> = posts.iter().filter(|p| (a..=b).contains(&p.number)).collect();
-                if hits.is_empty() {
+                let posts = posts_lock();
+                let lo = posts.partition_point(|p| p.number < a);
+                let hits = || posts[lo..].iter().take_while(|p| p.number <= b);
+                let row = |p: &Post| {
+                    format!(
+                        "{}\t{}\tposter <p@mock>\t{}\t{}\t\t{}\t10\r\n",
+                        p.number, p.subject, p.date, p.message_id, p.bytes
+                    )
+                };
+                if hits().next().is_none() && state.empty_is_420 {
+                    send(&mut out, b"420 No Articles Selected");
+                    continue;
+                }
+                if hits().next().is_none() {
                     send(&mut out, b"423 no articles in that range");
                     continue;
                 }
-                let mut listing = Vec::new();
-                for p in hits {
-                    let row = format!(
-                        "{}\t{}\tposter <p@mock>\tFri, 02 Oct 2026 10:11:12 +0000\t{}\t\t{}\t10\r\n",
-                        p.number, p.subject, p.message_id, p.bytes
-                    );
-                    listing.extend_from_slice(row.as_bytes());
-                }
-                listing.extend_from_slice(b".\r\n");
 
                 if compressed && state.compress_broken {
                     send(&mut out, b"224 overview follows [COMPRESS=GZIP]");
@@ -231,18 +265,32 @@ pub fn serve(stream: TcpStream, state: &Server, over_limit: bool) {
                     // and hang up, like a confused server would
                     return;
                 } else if compressed {
+                    let mut listing = Vec::new();
+                    for p in hits() {
+                        listing.extend_from_slice(row(p).as_bytes());
+                    }
+                    listing.extend_from_slice(b".\r\n");
                     let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
                     z.write_all(&listing).unwrap();
                     send(&mut out, b"224 overview follows [COMPRESS=GZIP]");
                     let _ = out.write_all(&z.finish().unwrap());
                     state.compressed_sent.fetch_add(1, Ordering::SeqCst);
                 } else {
+                    // row by row, soo a huge listing isnt built in memory first
+                    // (a client that hangs up part way just stops it)
                     send(&mut out, b"224 overview follows");
-                    let _ = out.write_all(&listing);
+                    let mut w = std::io::BufWriter::new(&mut out);
+                    let sent =
+                        hits().try_for_each(|p| w.write_all(row(p).as_bytes())).and_then(|_| w.write_all(b".\r\n"));
+                    if sent.and_then(|_| w.flush()).is_err() {
+                        return;
+                    }
                 }
             }
-            "BODY" => match posts.iter().find(|p| p.message_id == arg).filter(|_| state.bodies) {
+            "BODY" => match posts_lock().iter().find(|p| p.message_id == arg).filter(|_| state.bodies) {
                 Some(p) => {
+                    thread::sleep(state.body_delay);
+                    state.bodies_sent.fetch_add(1, Ordering::SeqCst);
                     send(&mut out, format!("222 0 {arg}").as_bytes());
                     for l in &p.body {
                         // dot stuffing
@@ -265,16 +313,42 @@ pub fn serve(stream: TcpStream, state: &Server, over_limit: bool) {
     }
 }
 
+/// The mock listens on 127.0.0.1 and, where the machine has IPv6, on ::1 at
+/// the same port: "localhost" is ::1 first on Windows and macOS, and a
+/// refused ::1 costs Windows about 2s per connection before it tries 127.0.0.1.
 pub fn spawn_server(state: Arc<Server>) -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    thread::spawn(move || {
-        for stream in listener.incoming().flatten() {
-            let state = state.clone();
-            thread::spawn(move || handle(stream, state));
-        }
-    });
+    let (v4, v6) = loopback_listeners();
+    let port = v4.local_addr().unwrap().port();
+    for listener in std::iter::once(v4).chain(v6) {
+        let state = state.clone();
+        thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let state = state.clone();
+                thread::spawn(move || handle(stream, state));
+            }
+        });
+    }
     port
+}
+
+/// a port free on 127.0.0.1, and on ::1 too unless the machine has no IPv6
+fn loopback_listeners() -> (TcpListener, Option<TcpListener>) {
+    for _ in 0..20 {
+        let v4 = TcpListener::bind("127.0.0.1:0").unwrap();
+        if !has_ipv6_loopback() {
+            return (v4, None);
+        }
+        // the port can be taken on ::1 by something else: try another
+        if let Ok(v6) = TcpListener::bind(("::1", v4.local_addr().unwrap().port())) {
+            return (v4, Some(v6));
+        }
+    }
+    panic!("no port free on both 127.0.0.1 and ::1");
+}
+
+/// ::1 can be listened on (some containers have no IPv6)
+pub fn has_ipv6_loopback() -> bool {
+    TcpListener::bind("[::1]:0").is_ok()
 }
 
 pub fn index_until_idle(indexer: &mut Indexer) {

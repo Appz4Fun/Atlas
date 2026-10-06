@@ -83,17 +83,39 @@ struct Quick {
     releases_approx: i64,
     db_bytes: u64,
     wal_bytes: u64,
+    /// split group stats: (groups, splitting, done, total, done_last_hour)
+    chunks: (i64, i64, i64, i64, i64),
+    /// split group -> (chunks done, chunks): their cursors stand still, the chunks move
+    group_chunks: BTreeMap<String, (i64, i64)>,
+}
+
+fn load_group_chunks(conn: &rusqlite::Connection) -> BTreeMap<String, (i64, i64)> {
+    let Ok(mut stmt) =
+        conn.prepare("select grp, coalesce(sum(state = 2), 0), count(*) from backfill_chunks group by grp")
+    else {
+        return BTreeMap::new();
+    };
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, (r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))));
+    rows.map(|rows| rows.flatten().collect()).unwrap_or_default()
+}
+
+fn load_chunks_stats(conn: &rusqlite::Connection) -> (i64, i64, i64, i64, i64) {
+    let now =
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+    let hour_ago = now - 3600;
+    let sql = "select count(*), coalesce(sum(pending > 0), 0), coalesce(sum(done), 0), coalesce(sum(total), 0), \
+               coalesce(sum(recent), 0)
+               from (select grp, sum(state != 2) as pending, sum(state = 2) as done, count(*) as total, \
+                     sum(state = 2 and done_at > ?) as recent from backfill_chunks group by grp)";
+    conn.query_row(sql, [hour_ago], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))).unwrap_or_default()
 }
 
 fn load_quick() -> Quick {
     // the main database and its shards
     let main = paths::database();
-    let files: Vec<std::path::PathBuf> =
-        std::iter::once(main.clone()).chain(crate::store::shard_paths(&main)).collect();
-    let size = |p: &std::path::Path| fs::metadata(p).map(|m| m.len()).unwrap_or(0);
     let mut q = Quick {
-        db_bytes: files.iter().map(|p| size(p)).sum(),
-        wal_bytes: files.iter().map(|p| size(std::path::Path::new(&format!("{}-wal", p.display())))).sum(),
+        db_bytes: crate::store::database_bytes(&main),
+        wal_bytes: crate::store::wal_bytes(&main),
         ..Quick::default()
     };
 
@@ -101,6 +123,8 @@ fn load_quick() -> Quick {
     q.progress = db::group_progress(&conn).unwrap_or_default();
     // running totals the shards keep, instant
     (q.releases_approx, q.articles_approx) = crate::store::totals(&conn).unwrap_or_default();
+    q.chunks = load_chunks_stats(&conn);
+    q.group_chunks = load_group_chunks(&conn);
     q
 }
 
@@ -328,6 +352,9 @@ struct LoadRates {
     writer_busy: f64,
     /// slices waiting for the writer now
     queued: u64,
+    /// headers fetched and not saved yet now, and the cap on them
+    unsaved: u64,
+    max_unsaved: u64,
     /// slices saved per transaction
     per_batch: f64,
     /// share of the time the writer spent finishing checkpoints (part of writer_busy)
@@ -365,6 +392,8 @@ fn load_rates(old: &Reading, new: &Reading) -> Option<LoadRates> {
     Some(LoadRates {
         writer_busy: (ns("writer_busy_ns") / dt / writers).min(1.0),
         queued: new.load["writer_queued"].as_u64().unwrap_or(0),
+        unsaved: new.load["unsaved_headers"].as_u64().unwrap_or(0),
+        max_unsaved: new.load["max_unsaved_headers"].as_u64().unwrap_or(0),
         per_batch: if batches > 0.0 { delta("writer_slices") / batches } else { 0.0 },
         writer_checkpoint: (ns("writer_checkpoint_ns") / dt / writers).min(1.0),
         latency: if xovers > 0.0 { ns("xover_ns") / xovers } else { 0.0 },
@@ -706,6 +735,15 @@ fn backfill_at(quick: &Quick, now: i64) -> Backfill {
     }
     b.unmeasured = seen.iter().filter(|g| !best.contains_key(*g)).count();
 
+    // a split group's cursors stand still: its day chunks say how far it is,
+    // as that share of its article numbers. once they are all done its home
+    // cursor sweeps on for what they missed, and the cursor says it again
+    for (group, (total, covered, _)) in best.iter_mut() {
+        if let Some(&(done, chunks)) = quick.group_chunks.get(group).filter(|c| c.1 > 0 && c.0 < c.1) {
+            *covered = (*total as i128 * done.clamp(0, chunks) as i128 / chunks as i128) as i64;
+        }
+    }
+
     let mut rows: Vec<(String, i64, f64)> = Vec::new();
     let (mut rate_dated, mut total_dated, mut reached) = (0.0, 0i64, Vec::new());
     for (group, (total, covered, row)) in best {
@@ -778,6 +816,20 @@ fn draw_backfill(f: &mut Frame, app: &App, area: Rect) {
         note("counts are article numbers, gaps on the server included"),
     ];
     let mut progress = progress;
+    let (groups, splitting, done, total, done_last_hour) = quick.chunks;
+    if groups > 0 {
+        progress.push(kv(
+            "split groups",
+            format!(
+                "{} ({} in progress), day chunks {} of {} done, {} in the last hour",
+                groups,
+                splitting,
+                count(done),
+                count(total),
+                count(done_last_hour)
+            ),
+        ));
+    }
     if b.unmeasured > 0 {
         progress.push(note(&format!("{} groups get their range on their next pass", count(b.unmeasured as i64))));
     }
@@ -1036,7 +1088,13 @@ fn draw_bottleneck(f: &mut Frame, app: &App, area: Rect) {
         (
             "memory",
             Some(mem_share),
-            format!("{} of {} used", human_bytes(app.mem_used as f64), human_bytes(app.mem_total as f64)),
+            format!(
+                "{} of {} used, {} of {} headers fetched and not saved yet",
+                human_bytes(app.mem_used as f64),
+                human_bytes(app.mem_total as f64),
+                r.unsaved,
+                r.max_unsaved
+            ),
         ),
         (
             "provider latency",
@@ -1260,6 +1318,49 @@ mod tests {
     }
 
     #[test]
+    fn split_groups_progress_follows_their_chunks_then_their_sweep() {
+        let row = |key: &str| db::GroupProgress {
+            key: key.into(),
+            live_cursor: 1000,
+            backfill_cursor: 1000, // the cursor stands still on a split group
+            first: Some(1),
+            last: Some(1000),
+            ..Default::default()
+        };
+        let mut quick = Quick {
+            progress: vec![row("alt.binaries.s"), row("alt.binaries.t"), row("alt.binaries.u")],
+            ..Quick::default()
+        };
+        let b = backfill_at(&quick, 1_780_000_000);
+        assert_eq!((b.total, b.covered, b.remaining, b.done), (3000, 0, 3000, 0), "no chunks: the cursors");
+
+        // s: 1 of 4 days done, t: all 6 (its sweep from the cursor to go), u is not split
+        quick.group_chunks = BTreeMap::from([("alt.binaries.s".into(), (1, 4)), ("alt.binaries.t".into(), (6, 6))]);
+        let b = backfill_at(&quick, 1_780_000_000);
+        assert_eq!((b.total, b.covered, b.remaining, b.done), (3000, 250, 2750, 0));
+        assert!(b.behind.contains(&("alt.binaries.t".into(), 1000, 0.0)));
+
+        // t's sweep halfway down
+        quick.progress[1].backfill_cursor = 500;
+        let b = backfill_at(&quick, 1_780_000_000);
+        assert_eq!((b.covered, b.remaining), (250 + 500, 2250));
+        assert_eq!(b.behind[0], ("alt.binaries.u".into(), 1000, 0.0));
+        assert!(b.behind.contains(&("alt.binaries.s".into(), 750, 25.0)));
+    }
+
+    #[test]
+    fn group_chunks_are_loaded_per_group() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        assert!(load_group_chunks(&conn).is_empty(), "no table: nothing");
+        crate::chunks::create(&conn).unwrap();
+        crate::chunks::add(&conn, "g1", 100, 98).unwrap();
+        crate::chunks::add(&conn, "g2", 200, 199).unwrap();
+        let claim = crate::chunks::claim(&conn, &[("g2".to_string(), i64::MIN)], "s", 1000).unwrap().unwrap();
+        assert!(crate::chunks::finish(&conn, &claim, 1100).unwrap());
+        assert_eq!(load_group_chunks(&conn), BTreeMap::from([("g1".into(), (0, 3)), ("g2".into(), (1, 2))]));
+    }
+
+    #[test]
     fn implausible_dates_give_no_rate() {
         let (day, now) = (86_400, 1_780_000_000);
         let row = |low: db::Dated, high: db::Dated| db::GroupProgress {
@@ -1299,6 +1400,7 @@ mod tests {
                 load: serde_json::json!({
                     "at": at, "writer_busy_ns": (busy_s * 1e9) as u64, "writer_slices": slices, "writer_batches": batches,
                     "writer_queued": 7, "xover_ns": (xover_s * 1e9) as u64, "xovers": xovers,
+                    "unsaved_headers": 120_000, "max_unsaved_headers": 500_000,
                     "lease_wait_ns": (wait_s * 1e9) as u64, "parse_ns": 0
                 }),
                 disk: Some((at, disk, 0)),
@@ -1313,6 +1415,7 @@ mod tests {
         .unwrap();
         assert!((r.writer_busy - 0.95).abs() < 1e-9);
         assert_eq!((r.queued, r.per_batch), (7, 8.0));
+        assert_eq!((r.unsaved, r.max_unsaved), (120_000, 500_000));
         assert!((r.latency - 2.0).abs() < 1e-9 && (r.in_flight - 40.0).abs() < 1e-9);
         assert!((r.disk_read - 1e6).abs() < 1e-3);
 
@@ -1378,7 +1481,7 @@ mod tests {
                              "limit": 10, "connections": 10, "headers": 900, "wire_bytes": 100, "text_bytes": 400}]
             }),
             status: serde_json::json!({"running": false}),
-            quick: Arc::new(Mutex::new(Quick::default())),
+            quick: Arc::new(Mutex::new(Quick { chunks: (1, 0, 3, 10, 0), ..Quick::default() })),
             content: Arc::new(Mutex::new(ContentState {
                 data: Some(Content {
                     releases: 10,
@@ -1407,6 +1510,7 @@ mod tests {
             assert!(text.contains(name), "page {page}");
             match page {
                 0 => assert!(text.contains("headers/s")),
+                1 => assert!(text.contains("day chunks 3 of 10 done")),
                 2 => assert!(
                     text.contains(".mkv")
                         && text.contains("NZBs available    9 (90.0%)")
@@ -1416,5 +1520,37 @@ mod tests {
                 _ => {}
             }
         }
+    }
+
+    #[test]
+    fn chunks_stats_aggregation() {
+        use rusqlite::Connection;
+        let conn = Connection::open_in_memory().unwrap();
+        crate::chunks::create(&conn).unwrap();
+        let now =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+
+        let claim = |group: &str, at: i64| {
+            crate::chunks::claim(&conn, &[(group.to_string(), i64::MIN)], "s", at).unwrap().unwrap()
+        };
+
+        // g1: 3 chunks, all finished two hours ago
+        crate::chunks::add(&conn, "g1", 100, 98).unwrap();
+        for _ in 0..3 {
+            assert!(crate::chunks::finish(&conn, &claim("g1", now - 7300), now - 7200).unwrap());
+        }
+        // g2: 1 chunk claimed two hours ago and finished just now, 1 claimed just now
+        // (2 chunks total, 1 done, 1 in progress)
+        crate::chunks::add(&conn, "g2", 200, 199).unwrap();
+        assert!(crate::chunks::finish(&conn, &claim("g2", now - 7200), now).unwrap());
+        claim("g2", now);
+
+        // 2 groups, 1 in progress (g2 has pending), 4 done total, 5 total, 1 done in last hour
+        let (groups, splitting, done, total, done_last_hour) = load_chunks_stats(&conn);
+        assert_eq!(groups, 2);
+        assert_eq!(splitting, 1); // 1 group with pending > 0 (g2)
+        assert_eq!(done, 4); // g1 has 3 done, g2 has 1 done
+        assert_eq!(total, 5); // 3 chunks for g1, 2 chunks for g2
+        assert_eq!(done_last_hour, 1, "finished in the last hour, though claimed before it");
     }
 }

@@ -14,14 +14,23 @@ pub const DEFAULT_API_HOST: &str = "127.0.0.1";
 pub const DEFAULT_CONNECTIONS: u32 = 10;
 /// servers without a priority go after the ones that have one
 pub const DEFAULT_PRIORITY: i64 = 99;
-/// article numbers the indexer takes on per pass over a group
-pub const DEFAULT_BATCH_SIZE: u64 = 50_000;
+/// article numbers the indexer takes on per pass over a group (50 requests)
+pub const DEFAULT_BATCH_SIZE: u64 = 500_000;
 /// with `parallel_groups` unset, one group runs per this many connections
 pub const CONNECTIONS_PER_GROUP: usize = 5;
 /// sanity cap on groups indexed at once
 pub const MAX_PARALLEL_GROUPS: usize = 256;
-/// article numbers per XOVER request (one connection's slice of a batch)
-pub const DEFAULT_REQUEST_SIZE: u64 = 1_000;
+/// article numbers per XOVER request (one connection's slice of a batch).
+/// providers spend most of a request's time on their side, not the network:
+/// measured on old articles, 10k per request got 3-6x the headers/s of 1k on
+/// one connection, and 50k was no better on most servers and erratic
+pub const DEFAULT_REQUEST_SIZE: u64 = 10_000;
+/// headers fetched and not saved yet, over every group at once, when
+/// config.json doesnt say (about 0.3GB of headers)
+pub const DEFAULT_MAX_UNSAVED_HEADERS: u64 = 500_000;
+/// article numbers of backfill left on a group's home server before its
+/// backfill is split into day chunks over every server that carries it
+pub const SPLIT_MIN_BACKLOG: i64 = 10_000_000;
 
 /// One usenet provider. Lower `priority` is tried first.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -39,6 +48,10 @@ pub struct UsenetServer {
     /// take part in indexing (header downloads), default on. off keeps e.g. a
     /// block account for downloads and article lookups only
     pub index: Option<bool>,
+    /// set apart in stored state (cursors, chunk claims, sweeps) from other
+    /// accounts on the same host and port, see `nntp::server_keys`. Only
+    /// for a second account on a provider that numbers articles differently
+    pub key: Option<String>,
 }
 
 impl UsenetServer {
@@ -53,6 +66,7 @@ impl UsenetServer {
             priority: 1,
             compress: None,
             index: None,
+            key: None,
         }
     }
 
@@ -86,6 +100,7 @@ impl UsenetServer {
             priority: v.get("priority").and_then(as_int).unwrap_or(DEFAULT_PRIORITY),
             compress: v.get("compress").and_then(as_bool),
             index: v.get("index").and_then(as_bool),
+            key: v.get("key").and_then(Value::as_str).map(str::trim).filter(|k| !k.is_empty()).map(String::from),
         })
     }
 
@@ -108,6 +123,9 @@ impl UsenetServer {
         if let Some(i) = self.index {
             m.insert("index".into(), json!(i));
         }
+        if let Some(k) = &self.key {
+            m.insert("key".into(), json!(k));
+        }
         Value::Object(m)
     }
 }
@@ -124,8 +142,14 @@ pub struct Config {
     pub api_key: Option<String>,
     pub batch_size: Option<u64>,
     pub request_size: Option<u64>,
+    /// None = SPLIT_MIN_BACKLOG
+    pub split_min_backlog: Option<i64>,
     /// groups indexed at the same time, None = worked out from the connections
     pub parallel_groups: Option<usize>,
+    /// compact the database every 24 hours from the indexer
+    pub auto_run_compact: bool,
+    /// None = DEFAULT_MAX_UNSAVED_HEADERS
+    pub max_unsaved_headers: Option<u64>,
 }
 
 impl Default for Config {
@@ -140,7 +164,10 @@ impl Default for Config {
             api_key: None,
             batch_size: None,
             request_size: None,
+            split_min_backlog: None,
             parallel_groups: None,
+            auto_run_compact: false,
+            max_unsaved_headers: None,
         }
     }
 }
@@ -189,6 +216,19 @@ impl Config {
 
     pub fn request_size(&self) -> u64 {
         self.request_size.unwrap_or(DEFAULT_REQUEST_SIZE).max(1)
+    }
+
+    /// headers the indexer fetches ahead of saving them, over every group at
+    /// once: what the pool takes of the setting (`nntp::unsaved_cap`)
+    pub fn max_unsaved_headers(&self) -> usize {
+        let n = self.max_unsaved_headers.unwrap_or(DEFAULT_MAX_UNSAVED_HEADERS);
+        crate::nntp::unsaved_cap(usize::try_from(n).unwrap_or(usize::MAX))
+    }
+
+    /// article numbers of backfill left before a group's backfill is split
+    /// over every server that carries it
+    pub fn split_min_backlog(&self) -> i64 {
+        self.split_min_backlog.unwrap_or(SPLIT_MIN_BACKLOG).max(1)
     }
 
     /// the highest priority server
@@ -253,10 +293,17 @@ impl Config {
             api_key: v.get("api_key").and_then(Value::as_str).filter(|k| !k.is_empty()).map(String::from),
             batch_size: v.get("batch_size").and_then(as_int).and_then(|n| u64::try_from(n).ok()).filter(|n| *n > 0),
             request_size: v.get("request_size").and_then(as_int).and_then(|n| u64::try_from(n).ok()).filter(|n| *n > 0),
+            split_min_backlog: v.get("split_min_backlog").and_then(as_int).filter(|n| *n > 0),
             parallel_groups: v
                 .get("parallel_groups")
                 .and_then(as_int)
                 .and_then(|n| usize::try_from(n).ok())
+                .filter(|n| *n > 0),
+            auto_run_compact: v.get("auto_run_compact").and_then(Value::as_bool).unwrap_or(false),
+            max_unsaved_headers: v
+                .get("max_unsaved_headers")
+                .and_then(as_int)
+                .and_then(|n| u64::try_from(n).ok())
                 .filter(|n| *n > 0),
         };
 
@@ -304,9 +351,41 @@ fn env_creds_active() -> bool {
     ["ATLAS_NNTP_HOST", "ATLAS_NNTP_USER", "ATLAS_NNTP_PASS"].iter().all(|k| env_nonempty(k).is_some())
 }
 
+/// Why config.json cant be used though it's there, see `file_problem_at`.
+pub fn file_problem() -> Option<String> {
+    file_problem_at(&config_file())
+}
+
+/// Why the config file at `path` cant be used though it's there: it cant be
+/// read, or isnt valid JSON (where, as serde_json says, never the text: it
+/// holds passwords), or is JSON that isnt an object (`null`, a list...: it
+/// would load as an empty config, and setup would save over it). None when
+/// it's fine, or isnt there at all.
+pub fn file_problem_at(path: &std::path::Path) -> Option<String> {
+    let text = match fs::read_to_string(path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return None,
+        Err(e) => return Some(format!("couldnt read {}: {e}", path.display())),
+        Ok(text) => text,
+    };
+    match serde_json::from_str::<Value>(&text) {
+        Err(e) => Some(format!("{} isnt valid JSON: {e}", path.display())),
+        Ok(Value::Object(_)) => None,
+        Ok(other) => {
+            let kind = match other {
+                Value::Null => "null",
+                Value::Bool(_) => "a boolean",
+                Value::Number(_) => "a number",
+                Value::String(_) => "a string",
+                _ => "an array",
+            };
+            Some(format!("{} holds {kind}, not an object", path.display()))
+        }
+    }
+}
+
 fn read_file() -> Option<Value> {
     let text = fs::read_to_string(config_file()).ok()?;
-    serde_json::from_str(&text).ok()
+    serde_json::from_str(&text).ok().filter(Value::is_object)
 }
 
 /// Load config. Servers come from `usenet_servers` (or the old top level
@@ -435,6 +514,14 @@ pub fn save_config(cfg: &Config) -> io::Result<()> {
         out.insert("api_key".into(), json!(key));
     }
 
+    if let Some(n) = cfg.split_min_backlog {
+        out.insert("split_min_backlog".into(), json!(n));
+    }
+
+    if cfg.auto_run_compact {
+        out.insert("auto_run_compact".into(), json!(true));
+    }
+
     write_json(&Value::Object(out), private)
 }
 
@@ -551,6 +638,61 @@ mod tests {
         assert_eq!(cfg.api_port(), 8000);
         assert_eq!(cfg.api_host, "127.0.0.1");
         assert_eq!(cfg.index_mode, "dynamic");
+        assert_eq!(cfg.max_unsaved_headers(), DEFAULT_MAX_UNSAVED_HEADERS as usize);
+    }
+
+    #[test]
+    fn an_invalid_config_says_where_without_its_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        assert_eq!(file_problem_at(&path), None, "missing isnt a problem: setup offers to make one");
+
+        // a trailing comma after the last server
+        std::fs::write(&path, "{\n  \"usenet_servers\": [{\"host\": \"news.x\", \"password\": \"hunter2\"},]\n}\n")
+            .unwrap();
+        let problem = file_problem_at(&path).expect("a trailing comma is a problem");
+        assert!(problem.contains(&path.display().to_string()), "{problem}");
+        assert!(problem.contains("trailing comma at line 2 column"), "{problem}");
+        assert!(!problem.contains("hunter2") && !problem.contains("news.x"), "no file contents: {problem}");
+
+        std::fs::write(&path, "{\"groups\": []}").unwrap();
+        assert_eq!(file_problem_at(&path), None);
+    }
+
+    #[test]
+    fn valid_json_that_isnt_an_object_is_a_problem_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        // setup would save over any of these, as if there were no config
+        for (text, kind) in [("null", "null"), ("[]", "an array"), ("\"hunter2\"", "a string"), ("42", "a number")] {
+            std::fs::write(&path, text).unwrap();
+            let problem = file_problem_at(&path).unwrap_or_else(|| panic!("{text} isnt a config"));
+            assert!(problem.contains(&path.display().to_string()), "{problem}");
+            assert!(problem.contains(&format!("{kind}, not an object")), "{problem}");
+            assert!(!problem.contains("hunter2"), "no file contents: {problem}");
+        }
+        std::fs::write(&path, "{}").unwrap();
+        assert_eq!(file_problem_at(&path), None, "an empty object is still a config");
+    }
+
+    #[test]
+    fn max_unsaved_headers_from_the_file() {
+        let cfg = |v: Value| Config::from_value(&v).max_unsaved_headers();
+        assert_eq!(cfg(json!({"max_unsaved_headers": 2_000_000})), 2_000_000);
+        assert_eq!(cfg(json!({"max_unsaved_headers": "40000"})), 40_000);
+        // nonsense falls back to the default
+        assert_eq!(cfg(json!({"max_unsaved_headers": 0})), DEFAULT_MAX_UNSAVED_HEADERS as usize);
+        assert_eq!(cfg(json!({"max_unsaved_headers": -5})), DEFAULT_MAX_UNSAVED_HEADERS as usize);
+    }
+
+    /// A cap past what the pool can hold reads as what the pool holds, soo
+    /// the config reload (which compares the two) doesnt see a change every
+    /// time it looks.
+    #[test]
+    fn a_max_unsaved_headers_past_the_pools_limit_reads_as_the_pools_cap() {
+        let cfg = Config::from_value(&json!({"max_unsaved_headers": 1u64 << 62}));
+        let pool = crate::nntp::Pool::new(&[]).with_max_unsaved(cfg.max_unsaved_headers());
+        assert_eq!(cfg.max_unsaved_headers(), pool.max_unsaved());
     }
 
     #[test]

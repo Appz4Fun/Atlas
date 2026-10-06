@@ -1,6 +1,6 @@
 use std::process::ExitCode;
 
-use atlas::{app, bg_indexer, compact, convert, paths, procs};
+use atlas::{app, bg_indexer, compact, convert, db, paths, procs, store};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -37,7 +37,8 @@ fn main() -> ExitCode {
 /// `--convert`: the one time move into the shards, in the foreground.
 fn run_convert() -> i32 {
     let main = paths::database();
-    if !convert::needed(&main) {
+    // a swap cut short is finished (or undone) by `run_alone`, not skipped
+    if !convert::to_do(&main) {
         println!("{} is already converted (or doesnt exist)", main.display());
         return 0;
     }
@@ -45,8 +46,13 @@ fn run_convert() -> i32 {
         println!("stop indexing first");
         return 1;
     }
-    match convert::run(&main, &|msg| println!("{msg}")) {
-        Ok(_) => 0,
+    // alone: not alongside the indexer, a compaction or another conversion
+    match convert::run_alone(&main, &|msg| println!("{msg}")) {
+        Ok(Some(_)) => 0,
+        Ok(None) => {
+            println!("{} is already converted (or doesnt exist)", main.display());
+            0
+        }
         Err(e) => {
             println!("couldnt convert, nothing was changed: {e:#}");
             1
@@ -60,8 +66,17 @@ fn run_compact() -> i32 {
         println!("stop indexing first");
         return 1;
     }
-    match compact::run(&paths::database(), &|msg| println!("{msg}")) {
-        Ok(_) => 0,
+    // nothing sets it: only the indexer stops a compaction early
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    match compact::run(&paths::database(), &|msg| println!("{msg}"), &stop) {
+        Ok(_) => {
+            // noted like the indexer's own compaction does, soo the auto one waits its interval
+            // never made here: an empty main database would pass for the real one
+            if let Ok(conn) = db::open_shard(&paths::database()) {
+                let _ = store::set_meta(&conn, "last_compact", chrono::Utc::now().timestamp());
+            }
+            0
+        }
         Err(e) => {
             println!("couldnt compact: {e:#}");
             1

@@ -251,3 +251,394 @@ fn a_conversion_stopped_during_the_check_picks_up_there() {
         assert_eq!(&nzb::render_nzb(&now, &store::articles(&conn, id).unwrap()), nzb_before, "{name}");
     }
 }
+
+/// `--convert` has the database to itself for its whole run: refused while
+/// the indexer (or a save) holds it, and a second conversion is refused
+/// while one runs, each without touching anything.
+#[test]
+fn a_conversion_runs_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = dir.path().join("atlas.db");
+    old_database(&main);
+    db::create_db_at(&main).unwrap();
+    let new_main = dir.path().join("atlas.new.db");
+
+    let writing = atlas::compact::try_hold_off_compaction(&main).unwrap().unwrap();
+    let err = convert::run_alone(&main, &|_| {}).expect_err("converted while the indexer held the database");
+    assert!(format!("{err:#}").contains("in use"), "{err:#}");
+    assert!(convert::needed(&main) && !new_main.exists(), "nothing was done");
+    drop(writing);
+
+    let second = std::cell::RefCell::new(None);
+    let converted = convert::run_alone(&main, &|_| {
+        if second.borrow().is_none() {
+            *second.borrow_mut() = Some(convert::run_alone(&main, &|_| {}).map(|_| ()));
+        }
+    })
+    .unwrap();
+    assert_eq!(converted.map(|(releases, _)| releases), Some(40));
+    let err = second.into_inner().unwrap().expect_err("a second conversion ran alongside");
+    assert!(format!("{err:#}").contains("in use"), "{err:#}");
+    assert!(!convert::needed(&main), "the first one finished");
+    assert_eq!(convert::run_alone(&main, &|_| {}).unwrap(), None, "nothing left to convert");
+}
+
+/// The indexer converting at start has the database to itself for the
+/// conversion too: refused while another indexer or a `--convert` holds it,
+/// and once converted it holds off compaction for indexing.
+#[test]
+fn an_indexer_converting_at_start_runs_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = dir.path().join("atlas.db");
+    old_database(&main);
+    let setup = || db::create_db_holding(&main).unwrap().unwrap();
+    let new_main = dir.path().join("atlas.new.db");
+
+    // another indexer that set up at the same time
+    let other = atlas::compact::try_hold_off_compaction(&main).unwrap().unwrap();
+    let err = atlas::bg_indexer::convert_at_start(&main, setup(), &|_| {}).err().expect("converted alongside another");
+    assert!(format!("{err:#}").contains("in use"), "{err:#}");
+    assert!(convert::needed(&main) && !new_main.exists(), "nothing was done");
+    drop(other);
+
+    // a `--convert` running
+    let converting = std::cell::RefCell::new(None);
+    let indexing = atlas::bg_indexer::convert_at_start(&main, setup(), &|_| {
+        if converting.borrow().is_none() {
+            *converting.borrow_mut() = Some(convert::run_alone(&main, &|_| {}).map(|_| ()));
+        }
+    })
+    .expect("the indexer converted");
+    let err = converting.into_inner().unwrap().expect_err("--convert ran alongside the indexer's conversion");
+    assert!(format!("{err:#}").contains("in use"), "{err:#}");
+    assert!(!convert::needed(&main));
+
+    // indexing holds off a compaction, and nothing more is converted
+    assert!(convert::run_alone(&main, &|_| {}).is_err(), "the indexing hold is held");
+    drop(indexing);
+    assert_eq!(convert::run_alone(&main, &|_| {}).unwrap(), None);
+}
+
+/// The swap folds the old database's WAL in before moving it aside as
+/// atlas.old.db; a checkpoint a reader holds back (committed pages left only
+/// in the WAL) refuses the swap instead of leaving a backup missing them.
+#[test]
+fn a_swap_whose_checkpoint_is_held_back_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = dir.path().join("atlas.db");
+    old_database(&main);
+    db::create_db_at(&main).unwrap();
+
+    // a reader's snapshot keeps the write after it in the WAL
+    let writer = Connection::open(&main).unwrap();
+    writer.execute_batch("pragma wal_autocheckpoint = 0").unwrap();
+    let reader = Connection::open(&main).unwrap();
+    reader.execute_batch("begin; select count(*) from releases").unwrap();
+    writer.execute_batch("create table late (x); insert into late values (7)").unwrap();
+
+    let err = convert::run(&main, &|_| {}).unwrap_err();
+    assert!(format!("{err:#}").contains("checkpoint"), "{err:#}");
+    assert!(convert::needed(&main), "the old database is still in place");
+    assert!(!dir.path().join("atlas.old.db").exists());
+
+    // once the reader is gone the swap goes through, and the backup has the late write
+    reader.execute_batch("commit").unwrap();
+    drop((reader, writer));
+    convert::run(&main, &|_| {}).unwrap();
+    let late: i64 = Connection::open(dir.path().join("atlas.old.db"))
+        .unwrap()
+        .query_row("select x from late", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(late, 7);
+}
+
+/// A conversion that finished copying and was stopped before the swap only
+/// picks up from that copy while the old database is the one it copied: one
+/// written to (or put back from another backup) since is copied again, soo
+/// nothing added to it is left out.
+#[test]
+fn a_stopped_conversion_copies_again_when_the_old_database_changed() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = dir.path().join("atlas.db");
+    old_database(&main);
+    db::create_db_at(&main).unwrap();
+
+    let stopped = std::panic::catch_unwind(|| {
+        convert::run(&main, &|m| assert!(!m.contains("checking NZBs"), "stop here")).unwrap();
+    });
+    assert!(stopped.is_err());
+
+    // the old database gets a newer release after the copy
+    {
+        let conn = Connection::open(&main).unwrap();
+        conn.execute(
+            "insert into releases (id, name, group_name, poster, posted_date, size, complete, parts, file_total)
+             values (500, 'Late.Release', 'alt.binaries.a', 'p', '2026-10-03 10:00:00', 9, 1, 1, 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "insert into articles (release_id, message_id, subject, filename, part, total_parts, bytes, file_total)
+             values (500, '<late@x>', 's', 'late.bin', 1, 1, 9, 1)",
+            [],
+        )
+        .unwrap();
+    }
+
+    let messages = std::cell::RefCell::new(Vec::new());
+    let (releases, articles) = convert::run(&main, &|m| messages.borrow_mut().push(m.to_string())).unwrap();
+    assert!(!messages.borrow().iter().any(|m| m.contains("copy finished earlier")), "{messages:?}");
+    assert_eq!(releases, 41);
+    assert_eq!(articles, (1..=40).map(|r| r % 7 + 1).sum::<i64>() + 1);
+    let conn = db::open_with_shards(&main).unwrap();
+    let id: i64 = conn.query_row("select id from releases where name = 'Late.Release'", [], |r| r.get(0)).unwrap();
+    assert_eq!(store::articles(&conn, id).unwrap().len(), 1);
+}
+
+/// A change that keeps every count, id and cursor (here a rename) is still a
+/// change to the old database: the stopped copy is thrown away, not trusted.
+#[test]
+fn a_stopped_conversion_copies_again_when_a_release_changed_under_the_same_counts() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = dir.path().join("atlas.db");
+    old_database(&main);
+    db::create_db_at(&main).unwrap();
+
+    let stopped = std::panic::catch_unwind(|| {
+        convert::run(&main, &|m| assert!(!m.contains("checking NZBs"), "stop here")).unwrap();
+    });
+    assert!(stopped.is_err());
+
+    Connection::open(&main)
+        .unwrap()
+        .execute("update releases set name = name || '.v2' where name = 'Release.17'", [])
+        .unwrap();
+
+    let messages = std::cell::RefCell::new(Vec::new());
+    convert::run(&main, &|m| messages.borrow_mut().push(m.to_string())).unwrap();
+    assert!(!messages.borrow().iter().any(|m| m.contains("copy finished earlier")), "{messages:?}");
+    let conn = db::open_with_shards(&main).unwrap();
+    let renamed: i64 =
+        conn.query_row("select count(*) from releases where name like '%.v2'", [], |r| r.get(0)).unwrap();
+    assert_eq!(renamed, 1);
+}
+
+/// Scans of empty ranges move an old database's cursors without adding a
+/// release or article: a stopped conversion copies again then too, soo the
+/// swap doesnt put back the cursors from before and redo those scans.
+#[test]
+fn a_stopped_conversion_copies_again_when_only_the_cursors_moved() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = dir.path().join("atlas.db");
+    old_database(&main);
+    db::create_db_at(&main).unwrap();
+
+    let stopped = std::panic::catch_unwind(|| {
+        convert::run(&main, &|m| assert!(!m.contains("checking NZBs"), "stop here")).unwrap();
+    });
+    assert!(stopped.is_err());
+
+    Connection::open(&main)
+        .unwrap()
+        .execute("update groups set backfill_cursor = 7 where name = 'alt.binaries.b'", [])
+        .unwrap();
+
+    let messages = std::cell::RefCell::new(Vec::new());
+    convert::run(&main, &|m| messages.borrow_mut().push(m.to_string())).unwrap();
+    assert!(!messages.borrow().iter().any(|m| m.contains("copy finished earlier")), "{messages:?}");
+    let conn = db::open_at(&main).unwrap();
+    let cursor: i64 =
+        conn.query_row("select backfill_cursor from groups where name = 'alt.binaries.b'", [], |r| r.get(0)).unwrap();
+    assert_eq!(cursor, 7);
+}
+
+/// Stopped between moving the old database aside and putting the new one in
+/// place: the next start finishes the swap.
+#[test]
+fn a_swap_cut_after_the_old_database_moved_aside_is_finished_at_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = dir.path().join("atlas.db");
+    old_database(&main);
+    let before = old_nzbs(&main);
+    db::create_db_at(&main).unwrap();
+    convert::run(&main, &|_| {}).unwrap();
+    // as it was before the second rename
+    std::fs::rename(&main, dir.path().join("atlas.new.db")).unwrap();
+
+    drop(db::create_db_holding(&main).unwrap().expect("set up"));
+    assert!(!dir.path().join("atlas.new.db").exists());
+    assert!(dir.path().join("atlas.old.db").exists());
+    assert!(!convert::needed(&main));
+    let conn = db::open_with_shards(&main).unwrap();
+    assert_eq!(store::totals(&conn).unwrap().0, before.len() as i64);
+}
+
+/// A search or the dashboard during the swap, with no main database for a
+/// moment, doesnt make one: opening is not setting up.
+#[test]
+fn a_read_during_the_swap_makes_no_main_database() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = dir.path().join("atlas.db");
+    assert!(db::open_with_shards(&main).is_err());
+    assert!(db::open_at(&main).is_err());
+    assert!(!main.exists(), "nothing made in the way of the new one");
+}
+
+/// An empty atlas.db made in the swap's window (by a build that still made
+/// one on a read) is in the way of the swap: taken out, and the swap is
+/// finished (atlas.new.db ready) or the old database put back.
+#[test]
+fn an_empty_main_database_made_during_the_swap_is_taken_out() {
+    for (made_by_open, ready) in [(false, true), (true, true), (false, false), (true, false)] {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        old_database(&main);
+        let before = old_nzbs(&main);
+        db::create_db_at(&main).unwrap();
+        if ready {
+            convert::run(&main, &|_| {}).unwrap();
+            std::fs::rename(&main, dir.path().join("atlas.new.db")).unwrap();
+        } else {
+            std::fs::rename(&main, dir.path().join("atlas.old.db")).unwrap();
+        }
+        // the interloper: zero bytes, or a database with nothing in it
+        if made_by_open {
+            rusqlite::Connection::open(&main).unwrap().query_row("pragma journal_mode = wal", [], |_| Ok(())).unwrap();
+        } else {
+            std::fs::write(&main, b"").unwrap();
+        }
+
+        drop(db::create_db_holding(&main).unwrap().expect("set up"));
+        assert!(!dir.path().join("atlas.new.db").exists());
+        if ready {
+            assert!(!convert::needed(&main));
+            let conn = db::open_with_shards(&main).unwrap();
+            assert_eq!(store::totals(&conn).unwrap().0, before.len() as i64);
+        } else {
+            assert!(!dir.path().join("atlas.old.db").exists());
+            assert!(convert::needed(&main), "the old database is back");
+        }
+    }
+}
+
+/// A main database with something in it is never taken for an interloper.
+#[test]
+fn a_main_database_with_tables_is_left_alone_beside_a_cut_swap() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = dir.path().join("atlas.db");
+    old_database(&main);
+    std::fs::copy(&main, dir.path().join("atlas.old.db")).unwrap();
+    assert_eq!(convert::recover_cut_swap(&main).unwrap(), None);
+    assert!(dir.path().join("atlas.old.db").exists());
+    assert!(convert::needed(&main), "still the same one");
+}
+
+/// `--convert` after a swap cut short: atlas.db is missing, soo it isnt
+/// `needed`, yet there is work: the swap is finished, not "nothing to convert".
+#[test]
+fn a_convert_after_a_cut_swap_finishes_the_swap() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = dir.path().join("atlas.db");
+    old_database(&main);
+    let before = old_nzbs(&main);
+    db::create_db_at(&main).unwrap();
+    convert::run(&main, &|_| {}).unwrap();
+    std::fs::rename(&main, dir.path().join("atlas.new.db")).unwrap();
+
+    assert!(!convert::needed(&main));
+    assert!(convert::to_do(&main), "the cut swap is something to do");
+    assert_eq!(convert::run_alone(&main, &|_| {}).unwrap(), None);
+    assert!(!dir.path().join("atlas.new.db").exists());
+    assert!(!convert::to_do(&main), "and done");
+    let conn = db::open_with_shards(&main).unwrap();
+    assert_eq!(store::totals(&conn).unwrap().0, before.len() as i64);
+}
+
+/// Moved aside with a new main database that never got to the swap: the
+/// next start puts the old database back, and converting goes on from it.
+#[test]
+fn an_old_database_moved_aside_without_a_finished_new_one_is_put_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = dir.path().join("atlas.db");
+    old_database(&main);
+    db::create_db_at(&main).unwrap();
+    let stopped = std::panic::catch_unwind(|| {
+        convert::run(&main, &|m| assert!(!m.contains("checking NZBs"), "stop here")).unwrap();
+    });
+    assert!(stopped.is_err());
+    std::fs::rename(&main, dir.path().join("atlas.old.db")).unwrap();
+
+    drop(db::create_db_holding(&main).unwrap().expect("set up"));
+    assert!(!dir.path().join("atlas.old.db").exists());
+    assert!(convert::needed(&main), "the old database is back");
+    assert_eq!(convert::run_alone(&main, &|_| {}).unwrap().map(|(r, _)| r), Some(40));
+}
+
+/// Long after a finished conversion, atlas.db lost while atlas.old.db and
+/// the shards (with everything indexed since) are still there: putting the
+/// old database back would convert again and the fresh copy would wipe the
+/// shards. Refused, saying what to do, and nothing is touched.
+#[test]
+fn a_lost_main_database_after_a_conversion_does_not_bring_the_old_one_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = dir.path().join("atlas.db");
+    old_database(&main);
+    db::create_db_at(&main).unwrap();
+    convert::run(&main, &|_| {}).unwrap();
+    let releases = store::totals(&db::open_with_shards(&main).unwrap()).unwrap().0;
+    assert!(releases > 0);
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", main.display()));
+    }
+
+    let refused = convert::recover_cut_swap(&main).unwrap_err().to_string();
+    assert!(refused.contains("atlas.old.db") && refused.contains("shards"), "{refused}");
+    assert!(dir.path().join("atlas.old.db").exists());
+    assert!(!main.exists());
+    for path in store::shard_paths(&main) {
+        assert!(path.exists());
+    }
+}
+
+/// Release ids with a huge gap (AUTOINCREMENT after a reset, a hand-set id):
+/// the conversion keeps per release what shard it went to, not a slot for
+/// every id up to the highest, also when it picks up a stopped run.
+#[test]
+fn a_huge_sparse_release_id_converts_without_a_slot_per_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = dir.path().join("atlas.db");
+    old_database(&main);
+    let far = 1i64 << 56;
+    {
+        let conn = Connection::open(&main).unwrap();
+        conn.execute(
+            "insert into releases (id, name, group_name, poster, posted_date, size, complete, parts, file_total)
+             values (?, 'Far.Away', 'alt.binaries.a', 'p <p@x>', '2026-10-02 10:11:12', 100, 1, 1, 1)",
+            [far],
+        )
+        .unwrap();
+        conn.execute(
+            "insert into articles (release_id, message_id, subject, filename, part, total_parts, bytes, file_total)
+             values (?, '<far@x>', '\"far.rar\" yEnc (1/1)', 'far.rar', 1, 1, 100, 1)",
+            [far],
+        )
+        .unwrap();
+    }
+    let before = old_nzbs(&main);
+    db::create_db_at(&main).unwrap();
+
+    // stopped as the check starts, then picked up
+    let stopped = std::panic::catch_unwind(|| {
+        convert::run(&main, &|m| assert!(!m.contains("checking NZBs"), "stop here")).unwrap();
+    });
+    assert!(stopped.is_err());
+    convert::run(&main, &|_| {}).unwrap();
+
+    let conn = db::open_with_shards(&main).unwrap();
+    assert_eq!(store::totals(&conn).unwrap().0, before.len() as i64);
+    for (name, nzb_before, _) in &before {
+        let id: i64 = conn.query_row("select id from releases where name = ?", [name], |r| r.get(0)).unwrap();
+        let now = atlas::search::get_release_with(&conn, id).unwrap().unwrap();
+        assert_eq!(&nzb::render_nzb(&now, &store::articles(&conn, id).unwrap()), nzb_before, "{name}");
+    }
+}

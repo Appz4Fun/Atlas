@@ -42,6 +42,8 @@
         "alt.binaries.boneless"
     ],
     "index_mode": "backfill",
+    "auto_run_compact": false,
+    "max_unsaved_headers": 500000,
     "api_port": 9090,
     "api_host": "0.0.0.0"
 }

@@ -535,16 +535,19 @@ fn do_settings() {
                 return;
             }
 
-            let dir = paths::app_dir();
-            for f in [
-                dir.join("atlas.db"),
-                dir.join("atlas.db-wal"),
-                dir.join("atlas.db-shm"),
-                paths::pid_file(),
-                paths::indexer_log(),
-                paths::status_file(),
-                paths::stats_file(),
-            ] {
+            // every shard goes with it, under the exclusive lock: leaving them
+            // would give the new main database cursors and ids over old shards
+            if let Err(e) = crate::db::wipe(&paths::database()) {
+                if e.downcast_ref::<crate::compact::Busy>().is_some() {
+                    ui::warn("the database is in use (indexing, a compaction or a save); nothing was wiped");
+                } else {
+                    ui::error(&format!("couldnt wipe the database: {e:#}"));
+                }
+                ui::pause();
+                return;
+            }
+
+            for f in [paths::pid_file(), paths::indexer_log(), paths::status_file(), paths::stats_file()] {
                 let _ = fs::remove_file(f);
             }
 
@@ -707,11 +710,24 @@ fn status_line(config: &Config, indexing: bool) -> Line {
 }
 
 pub fn main_menu() -> i32 {
-    if let Err(e) = create_db() {
-        ui::error(&format!("couldnt open database {}: {e}", paths::database().display()));
-        return 1;
+    // compaction is held off only while setting up: the menu itself doesnt
+    // write (its saves hold it off for themselves)
+    match create_db() {
+        Ok(Some(_setup)) => {}
+        Ok(None) => ui::warn(
+            "the database is being compacted; indexing, AI search saves and purging are refused till it's done",
+        ),
+        Err(e) => {
+            ui::error(&format!("couldnt open database {}: {e:#}", paths::database().display()));
+            return 1;
+        }
     }
 
+    // a config.json that's there but broken isnt missing: setup would write over it
+    if let Some(problem) = crate::config::file_problem() {
+        ui::error(&format!("{problem}. fix it and start atlas again"));
+        return 1;
+    }
     let mut config = match load_config() {
         Some(c) if !c.servers.is_empty() => c,
         other => {
@@ -824,6 +840,10 @@ pub fn main_menu() -> i32 {
 }
 
 pub fn selftest() -> i32 {
+    if let Some(problem) = crate::config::file_problem() {
+        println!("selftest: {problem}");
+        return 1;
+    }
     let Some(cfg) = load_config() else {
         println!("selftest: no config found (run Settings or set ATLAS_NNTP_* env)");
         return 1;

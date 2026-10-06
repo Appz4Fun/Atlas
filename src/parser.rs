@@ -4,6 +4,10 @@ use std::sync::LazyLock;
 use indexmap::IndexMap;
 use regex::Regex;
 
+/// most parts a file can claim. a subject claiming more is forged: the part
+/// bitmap grows with the part number, so it would cost storage per header
+pub const MAX_PARTS: i64 = 100_000;
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Article {
     pub number: u64,
@@ -99,6 +103,10 @@ pub fn parse_subject(subject: &str) -> Option<ParsedSubject> {
         (Some(p), Some(t)) => (p.as_str().parse().ok()?, t.as_str().parse().ok()?),
         _ => (1, 1),
     };
+    // a part past the file's own total, or past any real file, is forged
+    if part > MAX_PARTS || total_parts > MAX_PARTS || (total_parts != 0 && part > total_parts) {
+        return None;
+    }
 
     let (mut file_index, mut file_total) = (None, None);
 
@@ -138,12 +146,20 @@ fn remap_bracket_parts(articles: &mut [Article]) {
             continue;
         }
 
+        // a bracket counter past any real file is forged, not a part number
+        if idxs.iter().any(|&i| articles[i].file_index.is_some_and(|n| n > MAX_PARTS)) {
+            continue;
+        }
+
         let total = idxs
             .iter()
             .map(|&i| articles[i].file_total.unwrap_or(0))
             .chain(std::iter::once(idxs.len() as i64))
             .max()
             .unwrap_or(0);
+        if total > MAX_PARTS {
+            continue;
+        }
 
         for &i in idxs {
             let a = &mut articles[i];
@@ -250,6 +266,26 @@ mod tests {
         assert_eq!(p.release_name, "Movie.2024.1080p");
         assert_eq!((p.part, p.total_parts), (1, 50));
         assert_eq!((p.file_index, p.file_total), (Some(1), Some(10)));
+    }
+
+    #[test]
+    fn forged_part_numbers_are_unparsable() {
+        assert!(parse_subject(r#""a.rar" yEnc (1000000/1)"#).is_none());
+        assert!(parse_subject(r#""a.rar" yEnc (2/1)"#).is_none());
+        assert!(parse_subject(r#""a.rar" yEnc (1/1000000)"#).is_none());
+        assert!(parse_subject(r#""a.rar" yEnc (1/1)"#).is_some());
+    }
+
+    #[test]
+    fn forged_headers_dont_grow_seen_blobs() {
+        let mut f = crate::store::FileState::default();
+        for i in 0..1000 {
+            let subject = format!(r#""a.rar" yEnc (1000000/1) {i}"#);
+            if let Some(p) = parse_subject(&subject) {
+                f.add(&Article { part: Some(p.part), total_parts: Some(p.total_parts), ..Default::default() });
+            }
+        }
+        assert!(f.seen.is_empty());
     }
 
     #[test]

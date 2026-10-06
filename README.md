@@ -115,8 +115,8 @@ On first run, Atlas asks for one server (host, username, password, and port) and
     "group": "alt.binaries.example",
     "groups": ["alt.binaries.example", "alt.binaries.another"],
     "index_mode": "dynamic",
-    "batch_size": 50000,
-    "request_size": 1000,
+    "batch_size": 500000,
+    "request_size": 10000,
     "parallel_groups": 20,
     "api_host": "0.0.0.0",
     "api_port": 9090,
@@ -132,12 +132,15 @@ On first run, Atlas asks for one server (host, username, password, and port) and
 | `groups` | `[]` | Newsgroups to index. Add them from the Groups menu or edit the list. |
 | `group` | | The current group, used by the menu's current-group search. |
 | `index_mode` | `dynamic` | `dynamic` alternates backfill and live passes, `backfill` indexes older posts only, and `live` indexes new posts only. |
-| `batch_size` | `50000` | Article numbers per indexing pass over a group. The cursor moves only after a whole pass finishes. |
-| `request_size` | `1000` | Article numbers per header request, which is one connection's slice of a pass. |
+| `batch_size` | `500000` | Article numbers per indexing pass over a group. The cursor moves only after a whole pass finishes. |
+| `request_size` | `10000` | Article numbers per header request, which is one connection's slice of a pass. Providers spend most of a request's time on their side, so on old articles 10,000 per request is 3–6 times faster per connection than 1,000. |
 | `parallel_groups` | 1 per 5 connections | Total groups indexed at the same time, shared between servers by their `connections`. Every server gets at least one. |
 | `api_host` | `127.0.0.1` | Address the Newznab API listens on. Use `0.0.0.0` to reach it from other machines. |
 | `api_port` | `9090` | Newznab API port. |
 | `api_key` | generated | Newznab API key. Atlas creates it on first start and stores it here. |
+| `split_min_backlog` | `10000000` | Article numbers of backfill left before a group's backfill is split into day chunks that every server carrying the group can take. |
+| `auto_run_compact` | `false` | Compact the database every 24 hours; indexing pauses while it runs. |
+| `max_unsaved_headers` | `500000` | Headers the indexer fetches ahead of saving them, over all groups at once. This bounds its memory: 500,000 headers take about 0.3 GB. A header request waits for room before it goes out, and its room comes back once its slice is saved. Raise it if the Bottleneck page shows it full while the database writers and connections have time to spare. Set below `request_size`, header requests are cut down to it, which makes them small and slow. |
 
 Atlas keeps any other keys you add to the file when it saves it.
 
@@ -150,17 +153,18 @@ Atlas keeps any other keys you add to the file when it saves it.
 | `port` | `563` | `563` is SSL and `119` is plain text. |
 | `ssl` | from the port | Forces SSL on or off. |
 | `connections` | `10` | Requests Atlas keeps in flight on this server at once. Set it to what your plan allows. See [Measure connection limits](#measure-connection-limits). |
-| `priority` | `99` | Atlas asks servers with lower values first when it looks up par2 and nfo articles. Servers with equal priority keep their order in the file. |
+| `priority` | `99` | Order of the servers for failover and for par2 and nfo lookups among equally busy servers. Lower values come first. Servers with equal priority keep their order in the file. |
 | `index` | `true` | Whether the server takes part in indexing. `false` keeps it for article lookups only, for example a block account whose data you don't want to spend on headers. |
 | `compress` | `true` | Requests gzip-compressed header listings. Servers without compression get plain requests, and Atlas turns compression off for a server that sends unreadable data. |
+| `key` | | Sets the server apart in Atlas's stored progress (cursors, day chunks, sweeps). Atlas names a server by its host, plus `:port` when the port isn't the default for its SSL setting, and adds `#key` when this is set. Adding or removing other servers never changes the name. Set it only for a second account on the same host and port whose provider numbers articles differently; otherwise both share one progress. |
 
 The old single-server layout, with `host`, `username`, `password`, and `port` at the top level, still works and becomes a one-server list.
 
 ### How Atlas uses the servers
 
-- **Indexing uses every server at once, whatever its priority.** Atlas spreads groups over the indexing servers in proportion to their `connections`, and each server runs its own groups, so all connections stay busy. Each group stays on one server, because article numbers, and therefore the indexing cursors, differ between providers.
+- **Indexing uses every server at once, whatever its priority.** Atlas spreads groups over the indexing servers in proportion to their `connections`, and each server runs its own groups, so all connections stay busy. Each group stays on one server, because article numbers, and therefore the indexing cursors, differ between providers. A server that stops answering hands only its own groups to the others for a while.
 - **A group that a server doesn't carry:** Atlas looks it up on the other servers.
-- **par2 and nfo articles:** Atlas asks the servers in priority order until one has them.
+- **par2 and nfo articles:** Atlas asks the least busy indexing server first, so lookups don't all queue on one server. If it doesn't have the article, Atlas asks the other indexing servers from least to most busy, and then the remaining servers, such as those with `index: false`, in priority order.
 - **A server that can't connect:** Atlas skips it for a minute and moves its groups to the other servers. When a group moves, its cursor on the new server starts from the top. Atlas re-scans those articles but de-duplicates them, so it doesn't store anything twice.
 
 Atlas also handles these provider quirks on its own:
@@ -173,8 +177,8 @@ Atlas also handles these provider quirks on its own:
 
 The background indexer reads `config.json` again every 5 seconds:
 
-- New groups, `index_mode`, `batch_size`, and `request_size` apply immediately.
-- Changes to servers, logins, `connections`, or `parallel_groups` rebuild the connection pool. A login you fix in the file, or in **Settings > Usenet servers**, takes effect within a few seconds.
+- New groups, `index_mode`, `batch_size`, `request_size`, and `auto_run_compact` apply immediately.
+- Changes to servers, logins, `connections`, `parallel_groups`, or `max_unsaved_headers` rebuild the connection pool. A login you fix in the file, or in **Settings > Usenet servers**, takes effect within a few seconds.
 - `api_host` and `api_port` apply when the API restarts. Restart Atlas, or use **Settings > Change API port**.
 
 ### Measure connection limits
@@ -235,11 +239,17 @@ Start the indexer from the main menu with option 1. The indexer runs as a backgr
 | `backfill` | Indexes backward from the newest article only. |
 | `live` | Indexes forward from the newest article only and ignores older posts. |
 
+### Splitting big groups
+
+When two or more indexing servers carry a group and its backfill has more than `split_min_backlog` article numbers left, Atlas splits the rest of its history into UTC day chunks. A worker with nothing of its own to do claims the newest pending chunk on any server that carries the group, so idle connections help with big groups. A server that doesn't keep a day from its start, because its retention is shorter, gives the chunk back for a server that does. No server keeps the oldest day of the split from its start; the server that goes back furthest on it indexes what there is. Every hour, and when the indexer starts, Atlas checks whether a server now goes back further, for example one you added. If one does, the older days get chunks too, and the old oldest day is done again in full. Live indexing stays on the group's home server. The Backfill page of the stats dashboard shows split groups and their day chunks.
+
 ### How the database is stored
 
 Atlas splits releases and their articles over 8 database files next to `atlas.db`, named `atlas.s0.db` to `atlas.s7.db`, by group. Each file has its own writer thread, so the 8 save in parallel, and slices that arrive while a writer is busy are saved together in one transaction. `atlas.db` keeps the per-group cursors.
 
-Articles are stored compactly, at about a quarter of the space of the old layout: each file of a release is stored once with the subject its NZB uses, and each article is a short row with its message ID, part number, and size. Message IDs share their domain and store hex IDs as bytes. NZBs come out exactly as before.
+Articles are stored compactly, at about a quarter of the space of the old layout: each file of a release is stored once with the subject its NZB uses, and each article is a short row with its message ID, part number, and size. Message ID locals are packed by alphabet using specialized encodings (hex at half the size for hexadecimal locals, base-N encoding for other alphabets), and domains are shared. NZBs come out exactly as before.
+
+Atlas seals each file that is complete, or untouched for three days, into one zstd-compressed blob, which takes far less space than its article rows. Each shard writer seals the files its own saves completed between saves, up to 2,000 files or 100 milliseconds at a time, and looks through its shard for files untouched for three days once a minute. Writers leave files from before the upgrade alone; the first `--compact` seals those. Articles that arrive after a file is sealed are stored as rows and merged into its NZB. The `--compact` command seals every file that's due and re-encodes message IDs across the whole database.
 
 A release ID tells Atlas which file holds the release, and IDs keep counting up across all 8 files in the order releases are added, so the newest releases still come first.
 
@@ -252,9 +262,15 @@ The first time the new indexer starts on a database from an older version, it co
 3. It checks a sample of releases: their NZBs, sizes, part counts, and completeness must come out the same as from the old database.
 4. Only then does it swap the files. The old database stays as `atlas.old.db`; delete it once you're happy.
 
-The menu shows the progress meanwhile, and searches don't work until the conversion finishes. On a 488 GB database it takes about 1.5 hours. If anything fails, Atlas leaves the old database as it was and tries again on the next start. To convert in the foreground instead, stop indexing and run `atlas --convert`.
+The menu shows the progress meanwhile, and searches don't work until the conversion finishes. On a 488 GB database it takes about 1.5 hours. If anything fails, Atlas leaves the old database as it was and tries again on the next start. To convert in the foreground instead, stop indexing and run `atlas --convert`. It refuses to start while the indexer, a compaction or another `--convert` is using the database.
 
 Release IDs change in the conversion, so NZB links that Prowlarr or your apps saved before it no longer work. Search again to get the new ones.
+
+### Compacting a database
+
+The `--compact` command rewrites every shard into a fresh database file while the indexer is stopped. It re-encodes message IDs with the current packing and seals every file that's due. The copy has no free space in it. Expect the first compaction to shrink the database a lot, roughly from 138 GB to 60 GB on a full database. Atlas checks each shard's copy before it replaces the original. If a shard fails, Atlas keeps its original and reports the error; the other shards are still compacted.
+
+With `auto_run_compact` set to `true`, the indexer compacts the database every 24 hours. Indexing pauses while it runs and resumes afterward. Stopping the indexer during a compaction stops it within seconds and keeps the originals of unfinished shards. A failed shard is tried again 24 hours later. While a compaction runs, it holds a lock on the `atlas.compacting` file next to `atlas.db`, and the indexer, the menu's AI search saves and the broken release purge refuse to run until it's done. A compaction doesn't start while the indexer runs (outside its own auto compaction), while one of those is saving, or while another compaction runs; auto compaction then tries again 10 minutes later. The lock goes away with the process that holds it, so a crash leaves nothing to clean up (the file itself stays). A crash in the middle of swapping a shard can leave its original moved aside as `atlas.sN.precompact.db` with nothing in its place. The next start of atlas, the indexer or a compaction puts it back (and removes the half swapped copy), taking the lock first. A shard that is missing with no backup next to it, while the other shards are there, stops atlas from starting instead of being made again empty; put it back first. A shard with an `atlas.sN.precompact.db` next to it, when it isn't known which of the two is whole (the crash may have come after the copy went in, or an older atlas made an empty shard beside the backup), is not touched: the menu still opens, but the indexer, AI search saves and purging refuse to write, and the message names both files and how to go on (keep the shard and delete the backup, or the other way round).
 
 A group that has caught up rests for 10 seconds before Atlas checks it again. Atlas parks a group that fails 3 times in a row for 5 minutes.
 
@@ -279,7 +295,7 @@ AI search lets you describe what you want in plain language, for example `find m
 - **Usenet servers:** list, add, edit, and remove servers, including host, login, port, SSL, connections, and priority.
 - **Change indexer mode:** switch between dynamic, live, and backfill.
 - **Purge broken releases:** delete incomplete releases to free up space.
-- **Wipe DB and cache:** clear the database, logs, status, and stats. Stop the indexer first.
+- **Wipe DB and cache:** clear the database (`atlas.db` and every `atlas.sN.db` shard, with leftovers of a compaction), logs, status, and stats. Stop the indexer first; it is refused while the indexer, a compaction or a save has the database.
 - **Change API port:** move the Newznab API and restart it with the current `api_host`.
 
 ## Stats dashboard
@@ -342,7 +358,7 @@ Names what limits indexing right now, and shows how busy each resource has been 
 | Database writer | Share of the time the writer thread spends saving slices, how many slices wait for it, and how many slices go into each transaction. |
 | Usenet connections | Connections in use against what the providers allow, and requests waiting for a free connection. |
 | CPU | Cores the indexer uses, and how many of them parse headers. |
-| Memory | System memory in use. |
+| Memory | System memory in use, and headers fetched but not saved yet against `max_unsaved_headers`. |
 | Provider latency | How long a header request takes, and how many requests are in flight. |
 | Network | Data received from the servers per second. |
 | Disk | Data the indexer reads from and writes to disk per second. |
