@@ -1026,9 +1026,9 @@ impl Drop for Unsaved {
 
 /// What names each server in stored state (cursors, chunk claims, sweeps),
 /// from its own settings alone: adding or removing another server never
-/// changes it (that would orphan its cursors). The host on the default port
-/// for its ssl setting (563 with ssl, 119 without; what it always was), else
-/// `host:port`, and `#key` after either when the server sets `key`. Two
+/// changes it (that would orphan its cursors). The plain host on 563 with ssl
+/// (what it always was for the usual server), else `host:port` (so a plain
+/// 119 and an ssl 563 on one host are two servers), and `#key` after either when the server sets `key`. Two
 /// accounts on the same host and port share it (the same provider numbers
 /// articles the same) unless one sets a `key`. Never the user or password.
 pub fn server_keys(servers: &[UsenetServer]) -> Vec<String> {
@@ -1036,8 +1036,7 @@ pub fn server_keys(servers: &[UsenetServer]) -> Vec<String> {
 }
 
 fn server_key(s: &UsenetServer) -> String {
-    let default_port = if s.use_ssl() { 563 } else { 119 };
-    let base = if s.port == default_port { s.host.clone() } else { format!("{}:{}", s.host, s.port) };
+    let base = if s.port == 563 && s.use_ssl() { s.host.clone() } else { format!("{}:{}", s.host, s.port) };
     match &s.key {
         Some(k) => format!("{base}#{k}"),
         None => base,
@@ -2326,14 +2325,19 @@ mod tests {
     fn a_servers_key_is_its_own_and_doesnt_change_with_the_others() {
         let s = |h: &str, user: &str, port: u16| UsenetServer::new(h, user, "secret", port);
         let first = s("A.example", "x", 563);
-        // the default port for its ssl setting: the plain host, like always
+        // 563 with ssl: the plain host, like always
         assert_eq!(server_keys(std::slice::from_ref(&first)), ["A.example"]);
         // a second account on the same host and port, another on another
         // port, and one with an explicit key: the first one's key stays
         let mut keyed = s("a.example", "y", 563);
         keyed.key = Some("block".into());
         let all = [first.clone(), s("a.example", "y", 563), s("a.example", "z", 119), s("a.example", "w", 443), keyed];
-        assert_eq!(server_keys(&all), ["A.example", "a.example", "a.example", "a.example:443", "a.example#block"]);
+        assert_eq!(server_keys(&all), ["A.example", "a.example", "a.example:119", "a.example:443", "a.example#block"]);
+        // a plain 119 and an ssl 563 on one host never share a key
+        let mut plain119 = s("a.example", "u", 119);
+        plain119.ssl = Some(false);
+        let keys = server_keys(&[first.clone(), plain119]);
+        assert_eq!(keys, ["A.example", "a.example:119"]);
         let mut plain = s("a.example", "v", 563);
         plain.ssl = Some(false);
         assert_eq!(server_keys(&[plain]), ["a.example:563"], "563 isnt the default without ssl");
