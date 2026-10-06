@@ -973,7 +973,11 @@ async fn reach_further(db: &Db, group: &str, (day, floor, oldest): (i64, i64, Op
         s.articles += dated;
         let further = day == floor && s.articles >= SPECULATIVE_YIELD * s.days && first < floor;
         if further {
+            // each extension has to hold enough a day on its own: a dense
+            // first window doesnt pay for the sparse ones after it
             s.reach += SPECULATIVE_WINDOW;
+            s.days = 0;
+            s.articles = 0;
         }
         crate::chunks::set_speculative(conn, &g, &s)?;
         if !further {
@@ -1688,6 +1692,32 @@ impl Indexer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn each_speculative_window_has_to_hold_enough_on_its_own() {
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        rt.block_on(each_speculative_window());
+    }
+
+    async fn each_speculative_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        db::create_db_at(&main).unwrap();
+        let db = shared_db(db::open_at(&main).unwrap());
+        let (r, g) = (20_000, "g");
+        let start = crate::chunks::Speculative { runner_up_day: r, reach: SPECULATIVE_WINDOW, days: 0, articles: 0 };
+        on_db(&db, move |c| Ok(crate::chunks::set_speculative(c, g, &start)?)).await.unwrap();
+        let floor = r - SPECULATIVE_WINDOW;
+        // a dense window: its oldest day is done with plenty of articles
+        reach_further(&db, g, (floor, floor, Some(0)), 100_000).await;
+        let s = on_db(&db, move |c| Ok(crate::chunks::speculative(c, g)?)).await.unwrap().unwrap();
+        assert_eq!((s.reach, s.days, s.articles), (2 * SPECULATIVE_WINDOW, 0, 0));
+        // the next, sparse one doesnt ride on that: no further chunks
+        let floor = r - s.reach;
+        reach_further(&db, g, (floor, floor, Some(0)), 1).await;
+        let s = on_db(&db, move |c| Ok(crate::chunks::speculative(c, g)?)).await.unwrap().unwrap();
+        assert_eq!(s.reach, 2 * SPECULATIVE_WINDOW);
+    }
 
     #[test]
     fn cursors_saved_under_a_servers_old_key_are_adopted_once() {
