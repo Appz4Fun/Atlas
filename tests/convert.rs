@@ -490,3 +490,46 @@ fn a_lost_main_database_after_a_conversion_does_not_bring_the_old_one_back() {
         assert!(path.exists());
     }
 }
+
+/// Release ids with a huge gap (AUTOINCREMENT after a reset, a hand-set id):
+/// the conversion keeps per release what shard it went to, not a slot for
+/// every id up to the highest, also when it picks up a stopped run.
+#[test]
+fn a_huge_sparse_release_id_converts_without_a_slot_per_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = dir.path().join("atlas.db");
+    old_database(&main);
+    let far = 1i64 << 56;
+    {
+        let conn = Connection::open(&main).unwrap();
+        conn.execute(
+            "insert into releases (id, name, group_name, poster, posted_date, size, complete, parts, file_total)
+             values (?, 'Far.Away', 'alt.binaries.a', 'p <p@x>', '2026-10-02 10:11:12', 100, 1, 1, 1)",
+            [far],
+        )
+        .unwrap();
+        conn.execute(
+            "insert into articles (release_id, message_id, subject, filename, part, total_parts, bytes, file_total)
+             values (?, '<far@x>', '\"far.rar\" yEnc (1/1)', 'far.rar', 1, 1, 100, 1)",
+            [far],
+        )
+        .unwrap();
+    }
+    let before = old_nzbs(&main);
+    db::create_db_at(&main).unwrap();
+
+    // stopped as the check starts, then picked up
+    let stopped = std::panic::catch_unwind(|| {
+        convert::run(&main, &|m| assert!(!m.contains("checking NZBs"), "stop here")).unwrap();
+    });
+    assert!(stopped.is_err());
+    convert::run(&main, &|_| {}).unwrap();
+
+    let conn = db::open_with_shards(&main).unwrap();
+    assert_eq!(store::totals(&conn).unwrap().0, before.len() as i64);
+    for (name, nzb_before, _) in &before {
+        let id: i64 = conn.query_row("select id from releases where name = ?", [name], |r| r.get(0)).unwrap();
+        let now = atlas::search::get_release_with(&conn, id).unwrap().unwrap();
+        assert_eq!(&nzb::render_nzb(&now, &store::articles(&conn, id).unwrap()), nzb_before, "{name}");
+    }
+}

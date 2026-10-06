@@ -120,12 +120,12 @@ pub fn run(main: &Path, progress: &dyn Fn(&str)) -> Result<(i64, i64)> {
     let (max_id, shard_of_old, moved_releases, moved_articles, orphans) = if copy_finished(main, &source) {
         progress("converting the database: the copy finished earlier, checking it");
         let max_id: i64 = old.query_row("select coalesce(max(id), 0) from releases", [], |r| r.get(0))?;
-        let mut shard_of_old = vec![u8::MAX; max_id as usize + 1];
-        let mut stmt = old.prepare("select id, group_name from releases")?;
+        let mut shard_of_old = ShardOf::default();
+        let mut stmt = old.prepare("select id, group_name from releases order by id")?;
         let mut rows = stmt.query([])?;
         while let Some(r) = rows.next()? {
             let (id, group): (i64, Option<String>) = (r.get(0)?, r.get(1)?);
-            shard_of_old[id as usize] = store::shard_of(group.as_deref().unwrap_or("")) as u8;
+            shard_of_old.push(id, store::shard_of(group.as_deref().unwrap_or("")));
         }
         drop(rows);
         drop(stmt);
@@ -246,6 +246,23 @@ fn swap_ready(new_main: &Path) -> bool {
         .is_ok_and(|v: Option<i64>| v == Some(1))
 }
 
+/// Old release id -> the shard it went to, one entry per release (ids can
+/// have gaps of any size, soo not a slot per id up to the highest). Filled
+/// in id order, looked up by binary search.
+#[derive(Default)]
+struct ShardOf(Vec<(i64, u8)>);
+
+impl ShardOf {
+    fn push(&mut self, id: i64, shard: usize) {
+        debug_assert!(self.0.last().is_none_or(|&(last, _)| last < id), "releases come in id order");
+        self.0.push((id, shard as u8));
+    }
+
+    fn get(&self, id: i64) -> Option<usize> {
+        self.0.binary_search_by_key(&id, |&(id, _)| id).ok().map(|i| self.0[i].1 as usize)
+    }
+}
+
 type OldRelease = (i64, ReleaseFields);
 type ReleaseFields = (
     Option<String>,
@@ -264,7 +281,7 @@ fn move_releases(
     main: &Path,
     old: &Connection,
     total: i64,
-    shard_of_old: &mut [u8],
+    shard_of_old: &mut ShardOf,
     progress: &dyn Fn(&str),
 ) -> Result<i64> {
     std::thread::scope(|s| -> Result<i64> {
@@ -312,7 +329,7 @@ fn move_releases(
 
         let mut stmt = old.prepare(
             "select id, name, group_name, poster, posted_date, size, complete, parts, file_total, display_name,
-                is_obfuscated from releases",
+                is_obfuscated from releases order by id",
         )?;
         let mut rows = stmt.query([])?;
         let mut buffers: Vec<Vec<OldRelease>> = vec![Vec::new(); SHARDS];
@@ -322,7 +339,7 @@ fn move_releases(
             let id: i64 = r.get(0)?;
             let group: Option<String> = r.get(2)?;
             let shard = store::shard_of(group.as_deref().unwrap_or(""));
-            shard_of_old[id as usize] = shard as u8;
+            shard_of_old.push(id, shard);
             buffers[shard].push((
                 id,
                 (
@@ -375,7 +392,7 @@ type OldArticle = (i64, Article);
 fn move_articles(
     main: &Path,
     total: i64,
-    shard_of_old: &[u8],
+    shard_of_old: &ShardOf,
     started: Instant,
     progress: &dyn Fn(&str),
 ) -> Result<(i64, i64)> {
@@ -470,16 +487,16 @@ fn move_articles(
                         read.fetch_add(1, Ordering::Relaxed);
                         let release_id: Option<i64> = r.get(0)?;
                         let message_id: Option<String> = r.get(1)?;
-                        let shard = release_id.and_then(|id| shard_of_old.get(id as usize)).copied().unwrap_or(u8::MAX);
+                        let shard = release_id.and_then(|id| shard_of_old.get(id));
                         let (Some(old_id), Some(message_id)) = (release_id, message_id.filter(|m| !m.is_empty()))
                         else {
                             orphans.fetch_add(1, Ordering::Relaxed);
                             continue;
                         };
-                        if shard == u8::MAX {
+                        let Some(shard) = shard else {
                             orphans.fetch_add(1, Ordering::Relaxed);
                             continue;
-                        }
+                        };
                         let article = Article {
                             message_id,
                             subject: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
@@ -490,7 +507,6 @@ fn move_articles(
                             file_total: r.get(7)?,
                             ..Article::default()
                         };
-                        let shard = shard as usize;
                         buffers[shard].push((store::global_id(old_id, shard), article));
                         if buffers[shard].len() >= BATCH {
                             sent.fetch_add(BATCH as i64, Ordering::Relaxed);
@@ -555,7 +571,7 @@ fn move_articles(
 
 /// Compare `CHECK_SAMPLE` releases, spread over the whole database, and the
 /// newest `CHECK_TAIL` between the old database and the shards.
-fn check(main: &Path, old: &Connection, max_id: i64, shard_of_old: &[u8]) -> Result<()> {
+fn check(main: &Path, old: &Connection, max_id: i64, shard_of_old: &ShardOf) -> Result<()> {
     let new = Connection::open_in_memory()?;
     store::attach(&new, main)?;
 
@@ -598,7 +614,7 @@ fn check(main: &Path, old: &Connection, max_id: i64, shard_of_old: &[u8]) -> Res
         if !seen.insert(was.id) {
             continue;
         }
-        let shard = shard_of_old[was.id as usize] as usize;
+        let shard = shard_of_old.get(was.id).ok_or_else(|| anyhow!("release {} has no shard", was.id))?;
         let id = store::global_id(was.id, shard);
         let now = new.query_row(
             &format!(
@@ -660,7 +676,7 @@ fn copy(
     source: &Source,
     started: Instant,
     progress: &dyn Fn(&str),
-) -> Result<(i64, Vec<u8>, i64, i64, i64)> {
+) -> Result<(i64, ShardOf, i64, i64, i64)> {
     let new_main = sibling(main, "atlas.new.db");
     // 1. the new main database with the cursors
     remove_db(&new_main);
@@ -699,8 +715,7 @@ fn copy(
     let max_id: i64 = old.query_row("select coalesce(max(id), 0) from releases", [], |r| r.get(0))?;
     let total_releases: i64 = old.query_row("select count(*) from releases", [], |r| r.get(0))?;
     progress(&format!("converting the database: {} releases", total_releases));
-    // old id -> shard (255 = no such release)
-    let mut shard_of_old = vec![u8::MAX; max_id as usize + 1];
+    let mut shard_of_old = ShardOf::default();
     let moved_releases = move_releases(main, old, total_releases, &mut shard_of_old, progress)?;
 
     progress("converting the database: building the release indexes and search index");
