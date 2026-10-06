@@ -682,6 +682,60 @@ fn a_split_reaches_back_when_a_deeper_server_joins() {
     }
 }
 
+/// A split whose home cursor stayed where the split was made, and home's
+/// retention has since moved past it (nothing is left at the cursor): a
+/// deeper server joining still gets the older days chunks.
+#[test]
+fn a_split_reaches_back_when_home_no_longer_keeps_its_cursor() {
+    let home = tempfile::tempdir().unwrap();
+    let main = home.path().join("atlas.db");
+    atlas::db::create_db_at(&main).unwrap();
+    // posts every hour for 10 days from 2026-01-01, from `from_hour` on
+    let start = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00+00:00").unwrap();
+    let posts = |from_hour: u64, offset: u64| -> Vec<common::Post> {
+        (from_hour..240)
+            .map(|h| {
+                let when = start + chrono::Duration::hours(h as i64);
+                post_at(offset + h, &format!(r#""p{h}.bin" yEnc (1/1)"#), &when.to_rfc2822())
+            })
+            .collect()
+    };
+    // home keeps 1122.. now, its backfill cursor stayed at 5
+    let short = spawn_server(Server::new(posts(121, 1001)));
+    let mut deep = mock(spawn_server(Server::new(posts(0, 10_001))), "secret", 2, 2);
+    deep.host = "localhost".into();
+    let pool = BlockingPool::new(&[mock(short, "secret", 2, 1), deep]);
+    pool.connect().unwrap();
+
+    let day0 = atlas::chunks::unix_day(start.timestamp());
+    let conn = atlas::db::open_at(&main).unwrap();
+    atlas::chunks::add(&conn, GROUP, day0 + 9, day0 + 5).unwrap();
+    atlas::chunks::set_deepest(&conn, GROUP, "127.0.0.1", start.timestamp() + 121 * 3600).unwrap();
+    let state = atlas::db::GroupState { live_cursor: 1240, backfill_cursor: 5 };
+    atlas::db::save_group_state(&conn, &format!("{GROUP}@127.0.0.1"), state).unwrap();
+
+    let ctx = atlas::indexer::PassContext {
+        pool: pool.pool.clone(),
+        states: Default::default(),
+        stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        verbose: false,
+    };
+    let db = atlas::indexer::shared_db(atlas::db::open_at(&main).unwrap());
+    let settings = atlas::indexer::PassSettings {
+        mode: "backfill".into(),
+        batch_size: 10,
+        request_size: 10,
+        split_min_backlog: 10,
+    };
+    pool.block_on(atlas::indexer::run_pass(&ctx, &settings, &db, GROUP, 0, &mut |_| {})).unwrap();
+
+    assert_eq!(
+        atlas::chunks::oldest_day(&conn, GROUP).unwrap(),
+        Some(day0),
+        "chunks back to the new server's first day"
+    );
+}
+
 /// A split reaches back to the oldest day of every carrier, also one whose
 /// GROUP low mark sits 5,000 numbers before its first article (retention
 /// has moved on, the mark hasnt): its older days get chunks.

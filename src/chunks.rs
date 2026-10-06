@@ -193,6 +193,11 @@ pub fn oldest_day(conn: &Connection, group: &str) -> Result<Option<i64>> {
     conn.query_row("select min(day) from backfill_chunks where grp = ?", [group], |r| r.get(0))
 }
 
+/// the newest day of a group's chunks
+pub fn newest_day(conn: &Connection, group: &str) -> Result<Option<i64>> {
+    conn.query_row("select max(day) from backfill_chunks where grp = ?", [group], |r| r.get(0))
+}
+
 /// The server whose first article of a split group is the oldest: the one
 /// to index the split's oldest day, which no server keeps whole.
 pub fn deepest(conn: &Connection, group: &str) -> Result<Option<String>> {

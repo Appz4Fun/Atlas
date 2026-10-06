@@ -494,7 +494,7 @@ async fn maybe_split(
             }
             due
         });
-        if due && let Err(e) = reach_back(ctx, db, group, home, (first, last), cursor).await {
+        if due && let Err(e) = reach_back(ctx, db, group, home, (first, last)).await {
             println!("[SPLIT] {group}: couldnt look for servers going back further: {e:#}");
         }
         return Ok(true);
@@ -506,9 +506,12 @@ async fn maybe_split(
         return Ok(false);
     }
 
-    let Some(Split { newest_day, oldest_day, carriers, .. }) =
-        split_days(ctx, group, home, (first, last), cursor).await?
-    else {
+    // the newest day still to do is the post date at the home cursor
+    let split = match ctx.pool.posted_date(home, group, cursor).await? {
+        Some(t) => split_days(ctx, group, home, (first, last), crate::chunks::unix_day(t)).await?,
+        None => None,
+    };
+    let Some(Split { newest_day, oldest_day, carriers, .. }) = split else {
         ctx.states.with(group, |st| st.no_split_until = Some(Instant::now() + SPLIT_RECHECK));
         return Ok(false);
     };
@@ -521,16 +524,15 @@ async fn maybe_split(
 }
 
 /// Days older than split `group`'s oldest that a carrier keeps now: chunks
-/// for them, see `chunks::reach_back`.
-async fn reach_back(
-    ctx: &PassContext,
-    db: &Db,
-    group: &str,
-    home: usize,
-    bounds: (u64, u64),
-    cursor: u64,
-) -> Result<()> {
-    let Some(Split { oldest_day, oldest_at, .. }) = split_days(ctx, group, home, bounds, cursor).await? else {
+/// for them, see `chunks::reach_back`. The split's newest day is its newest
+/// chunk's, not the date at the home cursor: the cursor stays where the
+/// split was made, and home's retention moves past it.
+async fn reach_back(ctx: &PassContext, db: &Db, group: &str, home: usize, bounds: (u64, u64)) -> Result<()> {
+    let g = group.to_string();
+    let Some(newest_day) = on_db(db, move |conn| Ok(crate::chunks::newest_day(conn, &g)?)).await? else {
+        return Ok(());
+    };
+    let Some(Split { oldest_day, oldest_at, .. }) = split_days(ctx, group, home, bounds, newest_day).await? else {
         return Ok(());
     };
     let g = group.to_string();
@@ -551,25 +553,23 @@ struct Split {
     carriers: usize,
 }
 
-/// The days a split of `group` covers and how many servers carry it. None
-/// when it cant split: home's dates at either end are unknown or no other
-/// indexing server carries the group. `first` and `last` are home's low and
-/// high marks.
+/// The days a split of `group` from `newest_day` covers and how many
+/// servers carry it. None when it cant split: home's first date is unknown
+/// or no other indexing server carries the group. `first` and `last` are
+/// home's low and high marks.
 async fn split_days(
     ctx: &PassContext,
     group: &str,
     home: usize,
     (first, last): (u64, u64),
-    cursor: u64,
+    newest_day: i64,
 ) -> Result<Option<Split>> {
     use crate::chunks::unix_day;
 
-    // the newest day still to do is the post date at the home cursor, the
-    // oldest at least home's first article. first articles are searched for
-    // from the low marks, which can lag far behind what a server still keeps
-    let Some(newest) = ctx.pool.posted_date(home, group, cursor).await? else { return Ok(None) };
+    // the oldest day is at least home's first article. first articles are
+    // searched for from the low marks, which can lag far behind what a
+    // server still keeps
     let Some(oldest) = ctx.pool.first_post(home, group, first, last).await? else { return Ok(None) };
-    let newest_day = unix_day(newest);
     let mut oldest_at = oldest;
 
     // other servers are best effort: one that fails is left out. one that
