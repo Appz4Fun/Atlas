@@ -150,7 +150,8 @@ pub fn create_db_holding(path: &Path) -> anyhow::Result<Option<WriteGuard>> {
 }
 
 /// Settings > wipe: every shard, with their sidecars and what a compaction
-/// leaves (`.compact.db`, `.precompact.db`), then the main database. Under
+/// leaves (`.compact.db`, `.precompact.db`), a conversion's `atlas.old.db`
+/// and `atlas.new.db`, then the main database. Under
 /// the exclusive compaction lock, soo refused (`Busy`) while the indexer, a
 /// write from outside it or a compaction has the database. Leaves nothing to
 /// set up again from: the next `create_db` makes a new one. The main
@@ -165,6 +166,10 @@ pub fn wipe(main: &Path) -> anyhow::Result<()> {
         dbs.push(crate::compact::with_suffix(&shard, "precompact"));
         dbs.push(shard);
     }
+    // a conversion's backup or undone new main database would be put back
+    // as the main database at the next start (see `convert::recover_cut_swap`)
+    dbs.push(main.with_file_name("atlas.old.db"));
+    dbs.push(main.with_file_name("atlas.new.db"));
     dbs.push(main.to_path_buf());
     for db in dbs {
         for suffix in ["", "-wal", "-shm", "-journal"] {
@@ -749,6 +754,34 @@ mod tests {
         create_db_at(&main).unwrap();
         assert_eq!(held(&main), (0, Some(1)), "no releases, ids from the start");
         assert!(group_progress(&open_at(&main).unwrap()).unwrap().is_empty(), "no cursors");
+    }
+
+    /// a conversion's atlas.old.db (kept after it) or atlas.new.db (a swap
+    /// undone) would be put back as the main database at the next start
+    #[test]
+    fn a_wipe_takes_a_conversions_leftovers_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        create_db_at(&main).unwrap();
+        init_group_state(&open_at(&main).unwrap(), "alt.binaries.a@news.x", 500).unwrap();
+        let mut leftovers = Vec::new();
+        for name in ["atlas.old.db", "atlas.new.db"] {
+            let db = dir.path().join(name);
+            std::fs::copy(&main, &db).unwrap();
+            for suffix in ["-wal", "-shm", "-journal"] {
+                let sidecar = PathBuf::from(format!("{}{suffix}", db.display()));
+                std::fs::write(&sidecar, b"").unwrap();
+                leftovers.push(sidecar);
+            }
+            leftovers.push(db);
+        }
+
+        wipe(&main).unwrap();
+        for f in &leftovers {
+            assert!(!f.exists(), "{} is gone", f.display());
+        }
+        create_db_holding(&main).unwrap();
+        assert!(group_progress(&open_at(&main).unwrap()).unwrap().is_empty(), "nothing came back");
     }
 
     #[test]
