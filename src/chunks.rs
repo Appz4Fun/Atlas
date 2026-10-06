@@ -25,20 +25,28 @@ pub fn create(conn: &Connection) -> Result<()> {
             done_at INTEGER,
             primary key (grp, day)
         ) without rowid;
-        create table if not exists backfill_deepest (grp TEXT PRIMARY KEY, server TEXT NOT NULL) without rowid;",
+        create table if not exists backfill_deepest (
+            grp TEXT PRIMARY KEY,
+            server TEXT NOT NULL,
+            oldest_at INTEGER
+        ) without rowid;",
     )?;
-    if has_done_at(conn)? {
-        return Ok(());
-    }
-    match conn.execute_batch("alter table backfill_chunks add column done_at INTEGER") {
-        // the indexer and the menu can both add it at once
-        Err(_) if has_done_at(conn)? => Ok(()),
-        r => r,
-    }
+    add_column(conn, "backfill_chunks", "done_at")?;
+    add_column(conn, "backfill_deepest", "oldest_at")
 }
 
-fn has_done_at(conn: &Connection) -> Result<bool> {
-    conn.prepare("select 1 from pragma_table_info('backfill_chunks') where name = 'done_at'")?.exists([])
+/// Give `table` the INTEGER column `column` if a table made before it lacks it.
+fn add_column(conn: &Connection, table: &str, column: &str) -> Result<()> {
+    let has =
+        || conn.prepare(&format!("select 1 from pragma_table_info('{table}') where name = '{column}'"))?.exists([]);
+    if has()? {
+        return Ok(());
+    }
+    match conn.execute_batch(&format!("alter table {table} add column {column} INTEGER")) {
+        // the indexer and the menu can both add it at once
+        Err(_) if has()? => Ok(()),
+        r => r,
+    }
 }
 
 /// days since 1970-01-01 UTC
@@ -61,16 +69,27 @@ pub fn add(conn: &Connection, group: &str, newest_day: i64, oldest_day: i64) -> 
     Ok(added)
 }
 
-/// Chunks for the days of split `group` from before its oldest one back to
-/// `oldest_day`, when a server goes back further than any did at the split.
-/// The old oldest day was done (if it was) only from where the server going
-/// back furthest then started: it is to do again, and that server is
-/// forgotten (see `deepest`). Returns the days added.
-pub fn reach_back(conn: &Connection, group: &str, oldest_day: i64) -> Result<usize> {
+/// When a server goes back further than any did on split `group`, to
+/// `oldest_at` (unix seconds) in `oldest_day`: chunks for the days from
+/// before the split's oldest one back to `oldest_day`. The old oldest day
+/// was done (if it was) only from where the server going back furthest then
+/// started: it is to do again, and that server is forgotten (see `deepest`).
+/// Also when `oldest_day` is the oldest day but `oldest_at` is before where
+/// that server started in it. Returns the chunks added or to do again.
+pub fn reach_back(conn: &Connection, group: &str, oldest_day: i64, oldest_at: i64) -> Result<usize> {
     let tx = conn.unchecked_transaction()?;
     let Some(old) = self::oldest_day(&tx, group)? else { return Ok(0) };
-    if oldest_day >= old {
+    if oldest_day > old {
         return Ok(0);
+    }
+    if oldest_day == old {
+        let since: Option<i64> = tx
+            .query_row("select oldest_at from backfill_deepest where grp = ?", [group], |r| r.get(0))
+            .optional()?
+            .flatten();
+        if since.is_none_or(|since| oldest_at >= since) {
+            return Ok(0);
+        }
     }
     let mut added = 0;
     {
@@ -80,7 +99,7 @@ pub fn reach_back(conn: &Connection, group: &str, oldest_day: i64) -> Result<usi
             added += insert.execute(params![group, day, PENDING])?;
         }
     }
-    tx.execute(
+    let redo = tx.execute(
         &format!(
             "update backfill_chunks set state = {PENDING}, server = null, claimed_at = null, done_at = null
              where grp = ? and day = ? and state = {DONE}"
@@ -89,7 +108,7 @@ pub fn reach_back(conn: &Connection, group: &str, oldest_day: i64) -> Result<usi
     )?;
     tx.execute("delete from backfill_deepest where grp = ?", [group])?;
     tx.commit()?;
-    Ok(added)
+    Ok(added + redo)
 }
 
 /// Check if a group has any chunks in backfill.
@@ -179,9 +198,13 @@ pub fn deepest(conn: &Connection, group: &str) -> Result<Option<String>> {
     conn.query_row("select server from backfill_deepest where grp = ?", [group], |r| r.get(0)).optional()
 }
 
-/// Note `server` as the one going back furthest on `group`.
-pub fn set_deepest(conn: &Connection, group: &str, server: &str) -> Result<()> {
-    conn.execute("insert or replace into backfill_deepest (grp, server) values (?, ?)", [group, server])?;
+/// Note `server` as the one going back furthest on `group`, from `oldest_at`
+/// (when its first article was posted, unix seconds).
+pub fn set_deepest(conn: &Connection, group: &str, server: &str, oldest_at: i64) -> Result<()> {
+    conn.execute(
+        "insert or replace into backfill_deepest (grp, server, oldest_at) values (?, ?, ?)",
+        params![group, server, oldest_at],
+    )?;
     Ok(())
 }
 
@@ -232,6 +255,36 @@ mod tests {
         assert_eq!(day(claim(&c, &groups, "a", 1000)), Some(19_998));
         assert_eq!(claim(&c, &groups, "a", 1000).unwrap(), None);
         assert_eq!(progress(&c, "g").unwrap(), (1, 3));
+    }
+
+    #[test]
+    fn the_oldest_day_is_redone_when_retention_reaches_further_into_it() {
+        let c = conn();
+        let done = |c: &Connection| {
+            c.execute("update backfill_chunks set state = 2, server = 'a', done_at = 1 where day = 10", []).unwrap()
+        };
+        let state = |c: &Connection| -> i64 {
+            c.query_row("select state from backfill_chunks where day = 10", [], |r| r.get(0)).unwrap()
+        };
+        add(&c, "g", 12, 10).unwrap();
+        done(&c);
+        // "a" went back furthest, to 18:00 on day 10
+        set_deepest(&c, "g", "a", 10 * 86_400 + 18 * 3600).unwrap();
+
+        assert_eq!(reach_back(&c, "g", 10, 10 * 86_400 + 18 * 3600).unwrap(), 0, "no further");
+        assert_eq!(reach_back(&c, "g", 10, 10 * 86_400 + 20 * 3600).unwrap(), 0, "less far");
+        assert_eq!((state(&c), deepest(&c, "g").unwrap().as_deref()), (2, Some("a")));
+
+        assert_eq!(reach_back(&c, "g", 10, 10 * 86_400 + 3600).unwrap(), 1, "01:00 the same day");
+        assert_eq!((state(&c), deepest(&c, "g").unwrap()), (0, None), "to do again, deepest asked again");
+
+        // a deepest noted before its time was: nothing to compare, left alone
+        done(&c);
+        c.execute("insert into backfill_deepest (grp, server) values ('g', 'a')", []).unwrap();
+        assert_eq!(reach_back(&c, "g", 10, 10 * 86_400).unwrap(), 0);
+        assert_eq!(state(&c), 2);
+        // a day before it still reaches back
+        assert_eq!(reach_back(&c, "g", 9, 9 * 86_400).unwrap(), 2, "day 9 added, day 10 to do again");
     }
 
     #[test]

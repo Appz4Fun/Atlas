@@ -502,7 +502,9 @@ async fn maybe_split(
         return Ok(false);
     }
 
-    let Some((newest_day, oldest_day, carriers)) = split_days(ctx, group, home, (first, last), cursor).await? else {
+    let Some(Split { newest_day, oldest_day, carriers, .. }) =
+        split_days(ctx, group, home, (first, last), cursor).await?
+    else {
         ctx.states.with(group, |st| st.no_split_until = Some(Instant::now() + SPLIT_RECHECK));
         return Ok(false);
     };
@@ -524,26 +526,38 @@ async fn reach_back(
     bounds: (u64, u64),
     cursor: u64,
 ) -> Result<()> {
-    let Some((_, oldest_day, _)) = split_days(ctx, group, home, bounds, cursor).await? else { return Ok(()) };
+    let Some(Split { oldest_day, oldest_at, .. }) = split_days(ctx, group, home, bounds, cursor).await? else {
+        return Ok(());
+    };
     let g = group.to_string();
-    let added = on_db(db, move |conn| Ok(crate::chunks::reach_back(conn, &g, oldest_day)?)).await?;
-    if added > 0 {
-        println!("[SPLIT] {group}: a server goes back further, {added} older day chunks");
+    let todo = on_db(db, move |conn| Ok(crate::chunks::reach_back(conn, &g, oldest_day, oldest_at)?)).await?;
+    if todo > 0 {
+        println!("[SPLIT] {group}: a server goes back further, {todo} day chunks to do");
     }
     Ok(())
 }
 
-/// The days a split of `group` covers, (newest, oldest), and how many servers
-/// carry it. None when it cant split: home's dates at either end are unknown
-/// or no other indexing server carries the group. `first` and `last` are
-/// home's low and high marks.
+/// What a split of a group covers.
+struct Split {
+    newest_day: i64,
+    oldest_day: i64,
+    /// when the oldest article any carrier keeps was posted (unix seconds)
+    oldest_at: i64,
+    /// servers carrying the group
+    carriers: usize,
+}
+
+/// The days a split of `group` covers and how many servers carry it. None
+/// when it cant split: home's dates at either end are unknown or no other
+/// indexing server carries the group. `first` and `last` are home's low and
+/// high marks.
 async fn split_days(
     ctx: &PassContext,
     group: &str,
     home: usize,
     (first, last): (u64, u64),
     cursor: u64,
-) -> Result<Option<(i64, i64, usize)>> {
+) -> Result<Option<Split>> {
     use crate::chunks::unix_day;
 
     // the newest day still to do is the post date at the home cursor, the
@@ -552,7 +566,7 @@ async fn split_days(
     let Some(newest) = ctx.pool.posted_date(home, group, cursor).await? else { return Ok(None) };
     let Some(oldest) = ctx.pool.first_post(home, group, first, last).await? else { return Ok(None) };
     let newest_day = unix_day(newest);
-    let mut oldest_day = unix_day(oldest).min(newest_day);
+    let mut oldest_at = oldest;
 
     // other servers are best effort: one that fails is left out. one that
     // carries the group counts, its oldest date only if it has one
@@ -561,12 +575,15 @@ async fn split_days(
         let Ok((_, low, high, _)) = ctx.pool.group_on(other, group).await else { continue };
         carriers += 1;
         if let Ok(Some(t)) = ctx.pool.first_post(other, group, low, high).await {
-            oldest_day = oldest_day.min(unix_day(t));
+            oldest_at = oldest_at.min(t);
         }
     }
 
+    let oldest_day = unix_day(oldest_at).min(newest_day);
     let (newest_day, oldest_day) = clamp_days(newest_day, oldest_day, unix_day(chrono::Utc::now().timestamp()));
-    Ok((carriers >= 2).then_some((newest_day, oldest_day, carriers)))
+    // a time clamped out of its day starts the day it was clamped to
+    let oldest_at = oldest_at.clamp(oldest_day * 86_400, (oldest_day + 1) * 86_400 - 1);
+    Ok((carriers >= 2).then_some(Split { newest_day, oldest_day, oldest_at, carriers }))
 }
 
 /// 2000-01-01: binary retention doesnt reach further back than this
@@ -836,8 +853,8 @@ async fn goes_back_furthest(ctx: &PassContext, db: &Db, group: &str, server: usi
             deepest = (t, ctx.pool.host(other));
         }
     }
-    let (g, d) = (group.to_string(), deepest.1.clone());
-    on_db(db, move |conn| Ok(crate::chunks::set_deepest(conn, &g, &d)?)).await?;
+    let (g, (since, d)) = (group.to_string(), deepest.clone());
+    on_db(db, move |conn| Ok(crate::chunks::set_deepest(conn, &g, &d, since)?)).await?;
     println!("[CHUNK] {group}: {} goes back furthest, it does the oldest day", deepest.1);
     Ok(deepest.1 == host)
 }

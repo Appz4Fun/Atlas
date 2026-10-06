@@ -206,6 +206,45 @@ where
     }
 }
 
+/// What a date search keeps of an XOVER listing: its first and its last
+/// article with a post date, as (number, post time).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Ends {
+    pub first: Option<Dated>,
+    pub last: Option<Dated>,
+    /// rows read, and the highest number among them
+    pub rows: usize,
+    pub read_to: Option<u64>,
+    /// every row was read (not cut short at the row limit)
+    pub whole: bool,
+}
+
+impl Ends {
+    /// nothing in the range
+    fn empty() -> Ends {
+        Ends { whole: true, ..Ends::default() }
+    }
+
+    /// fold in one overview row
+    fn add(&mut self, row: &[u8]) {
+        self.rows += 1;
+        let mut fields = row.split(|b| *b == b'\t');
+        let Some(number) = fields.next().and_then(|f| std::str::from_utf8(f).ok()?.trim().parse::<u64>().ok()) else {
+            return;
+        };
+        self.read_to = self.read_to.max(Some(number));
+        let Some(t) = fields.nth(2).and_then(|d| crate::dates::posted_timestamp(&String::from_utf8_lossy(d))) else {
+            return;
+        };
+        if self.first.is_none_or(|f| number < f.0) {
+            self.first = Some((number, t));
+        }
+        if self.last.is_none_or(|l| number > l.0) {
+            self.last = Some((number, t));
+        }
+    }
+}
+
 /// One logged in connection to one server.
 pub struct Conn {
     io: BufReader<Box<dyn AsyncStream>>,
@@ -290,49 +329,54 @@ impl Conn {
     }
 
     /// Body of a `[COMPRESS=GZIP]` multi-line response: a zlib (or gzip)
-    /// stream holding the usual dot terminated, dot stuffed lines.
-    async fn read_compressed_multiline(&mut self) -> Result<Vec<Vec<u8>>> {
+    /// stream holding the usual dot terminated, dot stuffed lines, handed to
+    /// `line` one at a time (see `each_line`).
+    async fn each_compressed_line(&mut self, mut line: impl FnMut(Vec<u8>) -> bool) -> Result<bool> {
         let mut inflater = Inflater::default();
-        let mut lines = Vec::new();
+        // inflated text not handed out yet: lines go as soon as they are
+        // whole, soo it holds about one read's worth
         let mut text = Vec::new();
-        let mut scanned = 0;
         let mut terminated = false;
 
         loop {
             if !terminated {
+                let mut scanned = 0;
                 while let Some(nl) = text[scanned..].iter().position(|b| *b == b'\n') {
-                    let mut line = text[scanned..scanned + nl].to_vec();
+                    let mut l = text[scanned..scanned + nl].to_vec();
                     scanned += nl + 1;
 
-                    if line.last() == Some(&b'\r') {
-                        line.pop();
+                    if l.last() == Some(&b'\r') {
+                        l.pop();
                     }
 
-                    if line == b"." {
+                    if l == b"." {
                         terminated = true;
                         break;
                     }
 
-                    if line.starts_with(b"..") {
-                        line.remove(0);
+                    if l.starts_with(b"..") {
+                        l.remove(0);
                     }
 
-                    self.text += line.len() as u64 + 2;
-                    lines.push(line);
+                    self.text += l.len() as u64 + 2;
+                    if !line(l) {
+                        return Ok(false);
+                    }
                 }
+                text.drain(..scanned);
             }
 
             // done once the terminator showed up and the compressed stream is fully read,
             // soo no stray trailer bytes are left for the next command to trip over
             if terminated && inflater.finished() {
-                return Ok(lines);
+                return Ok(true);
             }
 
             let chunk = if terminated {
                 // all lines are in, only the end of the compressed stream is missing.
                 // a server that never closes the stream properly sends nothing more
                 match self.read_chunk(STREAM_END_WAIT).await {
-                    Err(NntpError::Io(e)) if e.kind() == io::ErrorKind::TimedOut => return Ok(lines),
+                    Err(NntpError::Io(e)) if e.kind() == io::ErrorKind::TimedOut => return Ok(true),
                     r => r?,
                 }
             } else {
@@ -391,22 +435,23 @@ impl Conn {
         Ok((code, message.to_string()))
     }
 
-    /// Lines of a multi-line response with dot-stuffing removed.
-    async fn read_multiline(&mut self) -> Result<Vec<Vec<u8>>> {
-        let mut lines = Vec::new();
-
+    /// A plain multi-line response, handed to `line` one at a time with
+    /// dot-stuffing removed (see `each_line`).
+    async fn each_plain_line(&mut self, mut line: impl FnMut(Vec<u8>) -> bool) -> Result<bool> {
         loop {
-            let mut line = self.read_raw_line().await?;
+            let mut l = self.read_raw_line().await?;
 
-            if line == b"." {
-                return Ok(lines);
+            if l == b"." {
+                return Ok(true);
             }
 
-            if line.starts_with(b"..") {
-                line.remove(0);
+            if l.starts_with(b"..") {
+                l.remove(0);
             }
 
-            lines.push(line);
+            if !line(l) {
+                return Ok(false);
+            }
         }
     }
 
@@ -473,11 +518,51 @@ impl Conn {
     /// mark any listing they compressed (XOVER, LIST, ...) with `[COMPRESS=GZIP]`
     /// on the status line.
     async fn read_response_body(&mut self, status_message: &str) -> Result<Vec<Vec<u8>>> {
+        let mut lines = Vec::new();
+        self.each_line(status_message, |l| {
+            lines.push(l);
+            true
+        })
+        .await?;
+        Ok(lines)
+    }
+
+    /// The lines of a multi-line response handed to `line` one at a time
+    /// until it returns false. True when the response was read to its end;
+    /// false when `line` stopped it: the rest is left unread, soo the
+    /// connection cant take another request.
+    async fn each_line(&mut self, status_message: &str, line: impl FnMut(Vec<u8>) -> bool) -> Result<bool> {
         if status_message.to_ascii_uppercase().contains("COMPRESS=GZIP") {
-            self.read_compressed_multiline().await
+            self.each_compressed_line(line).await
         } else {
-            self.read_multiline().await
+            self.each_plain_line(line).await
         }
+    }
+
+    /// XOVER `start..=end` read for its first and last article with a post
+    /// date, `rows` rows at most: a listing longer than that is left unread
+    /// past them (`Ends::whole` is false) and the connection cant take
+    /// another request. Listings come sorted by number (RFC 3977), soo
+    /// `first` is the range's first even then.
+    pub async fn xover_ends(&mut self, start: u64, end: u64, rows: usize) -> Result<Ends> {
+        let (code, message) = self.command("XOVER", Some(&format!("{start}-{end}"))).await?;
+
+        if code != 224 {
+            return Err(NntpError::Reply { code, message });
+        }
+
+        let mut ends = Ends::default();
+        let whole = self
+            .each_line(&message, |line| {
+                if ends.rows == rows {
+                    return false;
+                }
+                ends.add(&line);
+                true
+            })
+            .await?;
+        ends.whole = whole;
+        Ok(ends)
     }
 
     async fn list_active(&mut self, pattern: Option<&str>) -> Result<Vec<Vec<u8>>> {
@@ -793,6 +878,10 @@ type Dated = (u64, i64);
 /// numbers per date search request at first, and at most
 const DATE_LOOK: u64 = 100;
 const DATE_SCAN_MAX: u64 = DATE_LOOK << 6;
+/// rows a date search reads of one listing at most: whatever span it asks
+/// for (stepped over numbers can hide a crowd), it holds no more. A window
+/// of `DATE_SCAN_MAX` numbers is always read whole
+const DATE_ROWS: usize = DATE_SCAN_MAX as usize;
 
 /// Several providers tried in priority order, each with up to `connections`
 /// requests in flight.
@@ -1306,29 +1395,103 @@ impl Pool {
         Err(first_err)
     }
 
-    /// The first and the last article in `start..start + look` on server `i`,
-    /// with their post times: (number, unix seconds). None when there is none
-    /// (a gap in the numbering).
-    async fn window(&self, i: usize, group: &str, start: u64, look: u64) -> Result<Option<(Dated, Dated)>> {
-        match self.xover_on(i, group, start, start + look - 1).await {
-            Ok(rows) => Ok(rows
-                .iter()
-                .filter_map(|r| crate::dates::posted_timestamp(&r.date).map(|t| (r.number, t)))
-                .fold(None, |ends, a| match ends {
-                    None => Some((a, a)),
-                    Some((first, last)) => {
-                        Some((if a.0 < first.0 { a } else { first }, if a.0 > last.0 { a } else { last }))
-                    }
-                })),
-            Err(e) if e.is_empty_range() => Ok(None),
-            Err(e) => Err(e),
+    /// The first and the last dated article of `start..=end` on server `i`,
+    /// from an XOVER read `DATE_ROWS` rows at most (see `Conn::xover_ends`):
+    /// a date search never holds a listing, however many numbers it asks
+    /// for. A listing cut short costs its connection, which still has the
+    /// rest of it on the wire.
+    async fn ends(&self, i: usize, group: &str, start: u64, end: u64) -> Result<Ends> {
+        let r = match self.ends_once(i, group, start, end).await {
+            Err(NntpError::Decompress(e)) => {
+                self.no_compression(i, &e);
+                self.ends_once(i, group, start, end).await
+            }
+            r => r,
+        };
+        match r {
+            Err(e) if e.is_empty_range() => Ok(Ends::empty()),
+            r => r,
+        }
+    }
+
+    async fn ends_once(&self, i: usize, group: &str, start: u64, end: u64) -> Result<Ends> {
+        let mut lease = self.lease_for(i, Some(group), false).await?;
+
+        if lease.group() != Some(group) {
+            let r = lease.begin().select_group(group).await;
+            lease.check(r)?;
+        }
+
+        let sent = Instant::now();
+        let r = lease.begin().xover_ends(start, end, DATE_ROWS).await;
+        crate::profile::Load::add_since(&crate::profile::LOAD.xover_ns, sent);
+        crate::profile::LOAD.xovers.fetch_add(1, Ordering::Relaxed);
+        match r {
+            Ok(ends) => {
+                lease.server.headers.fetch_add(ends.rows as u64, Ordering::Relaxed);
+                // the rest of a listing cut short is still coming: the lease
+                // stays busy, soo the connection is thrown away
+                if ends.whole { lease.check(Ok(ends)) } else { Ok(ends) }
+            }
+            r => lease.check(r),
         }
     }
 
     /// The first article at or after `number` within the next `look` numbers on
-    /// server `i`, with its post time. None when there is none.
+    /// server `i`, with its post time. None when there is none. One request:
+    /// listings are sorted, the first rows say.
     async fn posted_at(&self, i: usize, group: &str, number: u64, look: u64) -> Result<Option<Dated>> {
-        Ok(self.window(i, group, number, look).await?.map(|(first, _)| first))
+        let end = number.saturating_add(look - 1);
+        let mut from = number;
+        loop {
+            let ends = self.ends(i, group, from, end).await?;
+            match (ends.first, ends.read_to) {
+                (Some(first), _) => return Ok(Some(first)),
+                // a cut short listing whose rows had no date: on past them
+                (None, Some(n)) if !ends.whole && n < end => from = n + 1,
+                _ => return Ok(None),
+            }
+        }
+    }
+
+    /// The last article in `start..start + look` on server `i`, with its post
+    /// time. None when there is none. A listing too long to read whole is
+    /// halved, the upper half first, until the halves are: what was read of
+    /// it answers when nothing above it is found.
+    async fn last_at(&self, i: usize, group: &str, start: u64, look: u64) -> Result<Option<Dated>> {
+        enum Todo {
+            /// numbers still to read
+            Span(u64, u64),
+            /// the last article below the spans above it in the stack
+            Found(Dated),
+        }
+        let mut todo = vec![Todo::Span(start, start.saturating_add(look))];
+        while let Some(next) = todo.pop() {
+            let (a, b) = match next {
+                Todo::Found(d) => return Ok(Some(d)),
+                Todo::Span(a, b) => (a, b),
+            };
+            let ends = self.ends(i, group, a, b - 1).await?;
+            if ends.whole {
+                if ends.last.is_some() {
+                    return Ok(ends.last);
+                }
+                continue;
+            }
+            // everything up to `read_to` was read: the rest of the span, in halves
+            if let Some(last) = ends.last {
+                todo.push(Todo::Found(last));
+            }
+            let from = ends.read_to.map_or(a, |n| n + 1);
+            if from < b {
+                let mid = from + (b - from) / 2;
+                if from < mid {
+                    todo.push(Todo::Span(from, mid));
+                }
+                todo.push(Todo::Span(mid, b));
+            }
+        }
+        Ok(None)
     }
 
     /// When the first article at or after `number` on server `i` was posted (unix seconds).
@@ -1341,8 +1504,8 @@ impl Pool {
     /// to `DATE_SCAN_MAX` numbers; past that the windows spread out (each
     /// starts twice as far from `from` as the last ended, the last ends at
     /// `end`), soo a hole of millions takes a few dozen small requests. The
-    /// numbers stepped over are read before a hit is taken as the first, see
-    /// `first_before`.
+    /// numbers stepped over are read before a hit is taken as the first (see
+    /// `first_before`), and before the range is taken for empty.
     async fn first_in(&self, i: usize, group: &str, from: u64, end: u64) -> Result<Option<Dated>> {
         // the numbers between windows that weren't read, lowest first
         let mut skipped = Vec::new();
@@ -1362,6 +1525,12 @@ impl Pool {
                 size *= 2;
             } else {
                 at = (read_to + (read_to - from)).min(end.saturating_sub(DATE_SCAN_MAX)).max(read_to);
+            }
+        }
+        // no window found one: the first article, if any, was stepped over
+        for &(from, to) in &skipped {
+            if let Some(found) = self.posted_at(i, group, from, to - from).await? {
+                return Ok(Some(found));
             }
         }
         Ok(None)
@@ -1410,7 +1579,7 @@ impl Pool {
                 skipped.push((to, read_from));
             }
             let look = size.min(to - from);
-            if let Some((_, hit)) = self.window(i, group, to - look, look).await? {
+            if let Some(hit) = self.last_at(i, group, to - look, look).await? {
                 return self.last_after(i, group, &skipped, hit).await.map(Some);
             }
             read_from = to - look;
@@ -1419,6 +1588,12 @@ impl Pool {
                 size *= 2;
             } else {
                 to = end.saturating_sub(2 * (end - read_from)).max(from.saturating_add(DATE_SCAN_MAX)).min(read_from);
+            }
+        }
+        // no window found one: the last article, if any, was stepped over
+        for &(from, to) in &skipped {
+            if let Some(found) = self.last_at(i, group, from, to - from).await? {
+                return Ok(Some(found));
             }
         }
         Ok(None)
@@ -1431,7 +1606,7 @@ impl Pool {
     async fn last_after(&self, i: usize, group: &str, skipped: &[(u64, u64)], hit: Dated) -> Result<Dated> {
         let Some((&(start, end), between)) = skipped.split_last() else { return Ok(hit) };
         for &(from, to) in between {
-            if let Some((_, found)) = self.window(i, group, from, to - from).await? {
+            if let Some(found) = self.last_at(i, group, from, to - from).await? {
                 return Ok(found);
             }
         }
@@ -1439,13 +1614,13 @@ impl Pool {
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
             let look = DATE_LOOK.min(hi - mid);
-            match self.window(i, group, mid, look).await? {
-                Some((_, found)) => (best, lo) = (found, found.0 + 1),
+            match self.last_at(i, group, mid, look).await? {
+                Some(found) => (best, lo) = (found, found.0 + 1),
                 None => hi = mid,
             }
         }
         if end > best.0 + 1
-            && let Some((_, l)) = self.window(i, group, best.0 + 1, end - best.0 - 1).await?
+            && let Some(l) = self.last_at(i, group, best.0 + 1, end - best.0 - 1).await?
         {
             best = l;
         }
@@ -1495,15 +1670,20 @@ impl Pool {
         Ok(first)
     }
 
+    /// Compressed listings from server `i` couldnt be read: it gets plain ones from now on.
+    fn no_compression(&self, i: usize, e: &str) {
+        let server = &self.servers[i];
+        if !server.no_compress.swap(true, Ordering::Relaxed) {
+            println!("{}: couldnt read compressed headers ({e}), turning compression off", server.cfg.host);
+        }
+        server.idle.lock().unwrap().retain(|c| !c.compressed);
+    }
+
     async fn xover_on(&self, i: usize, group: &str, start: u64, end: u64) -> Result<Vec<Overview>> {
         match self.xover_once(i, group, start, end).await {
             Err(NntpError::Decompress(e)) => {
                 // turn compression off for this server and redo the slice uncompressed
-                let server = &self.servers[i];
-                if !server.no_compress.swap(true, Ordering::Relaxed) {
-                    println!("{}: couldnt read compressed headers ({e}), turning compression off", server.cfg.host);
-                }
-                server.idle.lock().unwrap().retain(|c| !c.compressed);
+                self.no_compression(i, &e);
                 self.xover_once(i, group, start, end).await
             }
             r => r,
@@ -2068,7 +2248,7 @@ mod tests {
                 server.write_all(b"205 next\r\n").await.unwrap();
                 tokio::time::sleep(Duration::from_secs(10)).await;
             });
-            let lines = conn.read_compressed_multiline().await.unwrap();
+            let lines = conn.read_response_body("[COMPRESS=GZIP]").await.unwrap();
             assert_eq!(conn.read_status().await.unwrap().0, 205, "read past the end of the response");
             lines
         })
@@ -2114,13 +2294,62 @@ mod tests {
         }
     }
 
+    /// A date search reads a listing's first rows and no more: plain or
+    /// compressed, a listing longer than its rows is left unread.
+    #[test]
+    fn a_long_listing_is_read_only_as_far_as_the_row_limit() {
+        let dated = |n: usize| {
+            let mut text = Vec::new();
+            for i in 1..=n {
+                let row = format!("{i}\ts{i}\tme\tFri, 02 Oct 2026 10:{:02}:00 +0000\t<{i}@x>\t\t100\t1\r\n", i % 60);
+                text.extend_from_slice(row.as_bytes());
+            }
+            text.extend_from_slice(b".\r\n");
+            text
+        };
+        let read = |status: &'static str, wire: Vec<u8>, rows: usize| {
+            run(async move {
+                let (client, mut server) = tokio::io::duplex(1 << 16);
+                let mut conn = Conn::over(Box::new(client), Duration::from_secs(5));
+                tokio::spawn(async move {
+                    let mut cmd = [0u8; 64];
+                    let _ = tokio::io::AsyncReadExt::read(&mut server, &mut cmd).await;
+                    let _ = server.write_all(status.as_bytes()).await;
+                    let _ = server.write_all(&wire).await;
+                });
+                conn.xover_ends(1, 50_000, rows).await.unwrap()
+            })
+        };
+        let posted = |n: u64| {
+            (
+                n,
+                chrono::DateTime::parse_from_rfc2822(&format!("Fri, 02 Oct 2026 10:{:02}:00 +0000", n % 60))
+                    .unwrap()
+                    .timestamp(),
+            )
+        };
+
+        for (name, status, wire) in [
+            ("plain", "224 overview follows\r\n", dated(50_000)),
+            ("compressed", "224 overview follows [COMPRESS=GZIP]\r\n", zlib(&dated(50_000))),
+        ] {
+            let cut = read(status, wire.clone(), 100);
+            assert_eq!((cut.whole, cut.rows, cut.read_to), (false, 100, Some(100)), "{name}");
+            assert_eq!((cut.first, cut.last), (Some(posted(1)), Some(posted(100))), "{name}");
+
+            let whole = read(status, wire, 50_000);
+            assert_eq!((whole.whole, whole.rows), (true, 50_000), "{name}");
+            assert_eq!((whole.first, whole.last), (Some(posted(1)), Some(posted(50_000))), "{name}");
+        }
+    }
+
     #[test]
     fn garbage_is_a_decompress_error() {
         run(async {
             let (client, mut server) = tokio::io::duplex(1 << 16);
             let mut conn = Conn::over(Box::new(client), Duration::from_secs(2));
             server.write_all(&[0x78, 0x9c, 0xff, 0xff, 0xff, 0xff, 0x00, 0x01]).await.unwrap();
-            let err = conn.read_compressed_multiline().await.unwrap_err();
+            let err = conn.read_response_body("[COMPRESS=GZIP]").await.unwrap_err();
             assert!(matches!(err, NntpError::Decompress(_)), "{err}");
         });
     }

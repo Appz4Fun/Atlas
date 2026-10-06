@@ -243,24 +243,21 @@ pub fn serve(stream: TcpStream, state: &Server, over_limit: bool) {
                 let (a, b): (u64, u64) = (a.parse().unwrap(), b.parse().unwrap());
                 let posts = posts_lock();
                 let lo = posts.partition_point(|p| p.number < a);
-                let hits: Vec<&Post> = posts[lo..].iter().take_while(|p| p.number <= b).collect();
-                if hits.is_empty() && state.empty_is_420 {
+                let hits = || posts[lo..].iter().take_while(|p| p.number <= b);
+                let row = |p: &Post| {
+                    format!(
+                        "{}\t{}\tposter <p@mock>\t{}\t{}\t\t{}\t10\r\n",
+                        p.number, p.subject, p.date, p.message_id, p.bytes
+                    )
+                };
+                if hits().next().is_none() && state.empty_is_420 {
                     send(&mut out, b"420 No Articles Selected");
                     continue;
                 }
-                if hits.is_empty() {
+                if hits().next().is_none() {
                     send(&mut out, b"423 no articles in that range");
                     continue;
                 }
-                let mut listing = Vec::new();
-                for p in hits {
-                    let row = format!(
-                        "{}\t{}\tposter <p@mock>\t{}\t{}\t\t{}\t10\r\n",
-                        p.number, p.subject, p.date, p.message_id, p.bytes
-                    );
-                    listing.extend_from_slice(row.as_bytes());
-                }
-                listing.extend_from_slice(b".\r\n");
 
                 if compressed && state.compress_broken {
                     send(&mut out, b"224 overview follows [COMPRESS=GZIP]");
@@ -268,14 +265,26 @@ pub fn serve(stream: TcpStream, state: &Server, over_limit: bool) {
                     // and hang up, like a confused server would
                     return;
                 } else if compressed {
+                    let mut listing = Vec::new();
+                    for p in hits() {
+                        listing.extend_from_slice(row(p).as_bytes());
+                    }
+                    listing.extend_from_slice(b".\r\n");
                     let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
                     z.write_all(&listing).unwrap();
                     send(&mut out, b"224 overview follows [COMPRESS=GZIP]");
                     let _ = out.write_all(&z.finish().unwrap());
                     state.compressed_sent.fetch_add(1, Ordering::SeqCst);
                 } else {
+                    // row by row, soo a huge listing isnt built in memory first
+                    // (a client that hangs up part way just stops it)
                     send(&mut out, b"224 overview follows");
-                    let _ = out.write_all(&listing);
+                    let mut w = std::io::BufWriter::new(&mut out);
+                    let sent =
+                        hits().try_for_each(|p| w.write_all(row(p).as_bytes())).and_then(|_| w.write_all(b".\r\n"));
+                    if sent.and_then(|_| w.flush()).is_err() {
+                        return;
+                    }
                 }
             }
             "BODY" => match posts_lock().iter().find(|p| p.message_id == arg).filter(|_| state.bodies) {
