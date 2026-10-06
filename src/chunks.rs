@@ -74,6 +74,7 @@ pub fn add(conn: &Connection, group: &str, newest_day: i64, oldest_day: i64) -> 
 /// before the split's oldest one back to `oldest_day`. The old oldest day
 /// was done (if it was) only from where the server going back furthest then
 /// started: it is to do again, and that server is forgotten (see `deepest`).
+/// A claim on it is cleared too, so its worker's finish does nothing.
 /// Also when `oldest_day` is the oldest day but `oldest_at` is before where
 /// that server started in it. Returns the chunks added or to do again.
 pub fn reach_back(conn: &Connection, group: &str, oldest_day: i64, oldest_at: i64) -> Result<usize> {
@@ -102,7 +103,7 @@ pub fn reach_back(conn: &Connection, group: &str, oldest_day: i64, oldest_at: i6
     let redo = tx.execute(
         &format!(
             "update backfill_chunks set state = {PENDING}, server = null, claimed_at = null, done_at = null
-             where grp = ? and day = ? and state = {DONE}"
+             where grp = ? and day = ? and state in ({DONE}, {CLAIMED})"
         ),
         params![group, old],
     )?;
@@ -285,6 +286,37 @@ mod tests {
         assert_eq!(state(&c), 2);
         // a day before it still reaches back
         assert_eq!(reach_back(&c, "g", 9, 9 * 86_400).unwrap(), 2, "day 9 added, day 10 to do again");
+    }
+
+    #[test]
+    fn a_claimed_oldest_day_is_reset_when_retention_reaches_further_into_it() {
+        let c = conn();
+        add(&c, "g", 12, 10).unwrap();
+        let groups = vec![("g".to_string(), i64::MIN)];
+        // a takes day 12, then day 11, then day 10 (the split's oldest), as the deepest
+        for _ in 0..2 {
+            claim(&c, &groups, "a", 1000).unwrap().unwrap();
+        }
+        let a = claim(&c, &groups, "a", 1000).unwrap().unwrap();
+        assert_eq!(a.day, 10);
+        set_deepest(&c, "g", "a", 10 * 86_400 + 18 * 3600).unwrap();
+
+        // b goes back further into day 10 while a is still on it
+        assert_eq!(reach_back(&c, "g", 10, 10 * 86_400 + 3600).unwrap(), 1);
+        assert_eq!(deepest(&c, "g").unwrap(), None);
+        let row: (i64, Option<String>, Option<i64>) = c
+            .query_row("select state, server, claimed_at from backfill_chunks where day = 10", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .unwrap();
+        assert_eq!(row, (PENDING, None, None), "pending again, a's claim gone");
+
+        // a's late finish and release do nothing
+        assert!(!finish(&c, &a, 2000).unwrap());
+        assert!(!release(&c, &a).unwrap());
+        assert_eq!(progress(&c, "g").unwrap(), (0, 3));
+        // and the next to claim it is not a stale claim's
+        assert_eq!(day(claim(&c, &groups, "b", 1001)), Some(10));
     }
 
     #[test]
