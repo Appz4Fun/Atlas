@@ -1261,21 +1261,38 @@ pub fn totals(conn: &Connection) -> Result<(i64, i64)> {
 }
 
 /// Delete incomplete releases (and their files and articles) from every shard.
+/// What goes is counted inside the transaction that deletes it and taken off
+/// the shard's totals there, soo the writers saving to the shard at the same
+/// time (purge holds only the shared guard) never leave them wrong.
 pub fn purge_incomplete(main: &Path) -> Result<()> {
     for path in shard_paths(main) {
         let conn = db::open_shard(&path)?;
-        let removed: i64 = conn.query_row("select count(*) from releases where complete = 0", [], |r| r.get(0))?;
-        conn.execute_batch(
-            "begin;
-             delete from segments where file_id in
-                (select f.id from files f join releases r on r.id = f.release_id where r.complete = 0);
+        // the write lock from the start: the counts are of what is deleted
+        let tx = rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
+        let removed: i64 = tx.query_row("select count(*) from releases where complete = 0", [], |r| r.get(0))?;
+        let doomed = "select f.id from files f join releases r on r.id = f.release_id where r.complete = 0";
+        let loose: i64 =
+            tx.query_row(&format!("select count(*) from segments where file_id in ({doomed})"), [], |r| r.get(0))?;
+        let mut sealed = 0i64;
+        {
+            let mut stmt =
+                tx.prepare(&format!("select blob from files where blob is not null and id in ({doomed})"))?;
+            let mut rows = stmt.query([])?;
+            while let Some(r) = rows.next()? {
+                let b: Vec<u8> = r.get(0)?;
+                sealed += crate::blob::decode(&b).map_err(blob_error)?.len() as i64;
+            }
+        }
+        tx.execute_batch(&format!(
+            "delete from segments where file_id in ({doomed});
              delete from files where release_id in (select id from releases where complete = 0);
-             delete from releases where complete = 0;
-             commit;",
-        )?;
-        let articles = article_count(&conn, "main")?;
-        conn.execute("update meta set value = max(value - ?, 0) where key = 'releases'", [removed])?;
-        conn.execute("update meta set value = ? where key = 'articles'", [articles])?;
+             delete from releases where complete = 0;"
+        ))?;
+        let mut stmt = tx.prepare("update meta set value = max(value - ?, 0) where key = ?")?;
+        stmt.execute(params![removed, "releases"])?;
+        stmt.execute(params![loose + sealed, "articles"])?;
+        drop(stmt);
+        tx.commit()?;
         let _ = conn.query_row("pragma wal_checkpoint(truncate)", [], |_| Ok(()));
         conn.execute_batch("vacuum")?;
     }
@@ -2104,6 +2121,51 @@ mod tests {
         let rows: i64 = conn.query_row("select count(*) from segments", [], |r| r.get(0)).unwrap();
         assert_eq!(rows, 1, "b.rar got a row, it's sealed and complete: waits to be stale");
         assert_eq!(writer.seal_some(&mut conn, now + 2).unwrap(), 0);
+    }
+
+    /// what purging takes off the totals is what it deleted, counted in its
+    /// own transaction: the rest of the totals, including what writers added
+    /// in between, stays as it is
+    #[test]
+    fn purging_takes_only_what_it_deleted_off_the_totals() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        db::create_db_at(&main).unwrap();
+        let group = "alt.binaries.t";
+        let release = |name: &str, parts: i64, have: i64| Release {
+            name: name.into(),
+            group: group.into(),
+            articles: (1..=have)
+                .map(|p| Article {
+                    message_id: format!("<{name}-{p}@x>"),
+                    filename: Some("a.rar".into()),
+                    part: Some(p),
+                    total_parts: Some(parts),
+                    bytes: 10,
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+        // two broken releases (3 + 2 articles) and a whole one
+        save(&main, &[release("Broken1", 5, 3), release("Broken2", 4, 2), release("Whole1", 2, 2)]).unwrap();
+        let shard = shard_path(&main, shard_of(group));
+        let conn = db::open_at(&shard).unwrap();
+        let totals = |c: &Connection| -> (i64, i64) {
+            let get = |k: &str| c.query_row("select value from meta where key = ?", [k], |r| r.get(0)).unwrap();
+            (get("releases"), get("articles"))
+        };
+        assert_eq!(totals(&conn), (3, 7));
+        // a writer in another connection added a release and its count, and
+        // another's not yet seen in the rows (3 more in the total)
+        save(&main, &[release("Whole2", 3, 3)]).unwrap();
+        conn.execute("update meta set value = value + 3 where key = 'articles'", []).unwrap();
+        assert_eq!(totals(&conn), (4, 13));
+
+        purge_incomplete(&main).unwrap();
+        assert_eq!(totals(&conn), (2, 8), "only the 2 releases and 5 articles that were deleted went");
+        let left: i64 = conn.query_row("select count(*) from releases", [], |r| r.get(0)).unwrap();
+        assert_eq!(left, 2);
     }
 
     #[test]
