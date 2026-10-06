@@ -733,7 +733,13 @@ async fn run_servers(
     });
 
     let db = match db::open().and_then(|conn| db::tune_for_writing(&conn).map(|_| conn)) {
-        Ok(conn) => shared_db(conn),
+        Ok(conn) => {
+            // before any pass: whose the plain cursors are (see claim_plain_cursors)
+            if let Err(e) = crate::indexer::claim_plain_cursors(&conn, &sched.ctx.pool) {
+                ui::warn(&format!("couldnt record whose the group cursors are: {e:#}"));
+            }
+            shared_db(conn)
+        }
         Err(e) => {
             ui::error(&format!("couldnt open database: {e}"));
             return false;

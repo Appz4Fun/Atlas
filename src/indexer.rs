@@ -394,6 +394,41 @@ fn cursor_key(pool: &Pool, server: usize, group: &str) -> String {
     }
 }
 
+/// Whose the plain (identity-less) cursors are, in the main database's
+/// meta: they hold article numbers of one provider, and the order of the
+/// servers says nothing about which.
+const PLAIN_CURSORS_OF: &str = "plain_cursors_of";
+
+/// With one indexing server the plain cursors are its own: recorded, soo
+/// once more servers are added only it adopts them. A lone server under the
+/// plain name is the one writing them, soo it takes them over from whoever
+/// had them before. With several servers and nothing recorded (cursors kept
+/// by a build from before) they are no one's: each server starts fresh.
+pub fn claim_plain_cursors(conn: &Connection, pool: &Pool) -> Result<()> {
+    let indexing = pool.indexing_servers();
+    let [only] = indexing.as_slice() else { return Ok(()) };
+    let writes_plain = cursor_key(pool, *only, "g") == "g";
+    if writes_plain || plain_cursors_owner(conn)?.is_none() {
+        conn.execute(
+            "insert or replace into main.meta (key, value) values (?, ?)",
+            rusqlite::params![PLAIN_CURSORS_OF, pool.host(*only)],
+        )?;
+    }
+    Ok(())
+}
+
+fn plain_cursors_owner(conn: &Connection) -> Result<Option<String>> {
+    use rusqlite::OptionalExtension;
+    Ok(conn
+        .query_row("select cast(value as text) from main.meta where key = ?", [PLAIN_CURSORS_OF], |r| r.get(0))
+        .optional()?)
+}
+
+/// whether the server named `host` (`Pool::host`) kept the plain cursors
+fn owns_plain_cursors(conn: &Connection, host: &str) -> Result<bool> {
+    Ok(plain_cursors_owner(conn)?.as_deref() == Some(host))
+}
+
 async fn load_cursors(
     ctx: &PassContext,
     db: &Db,
@@ -403,19 +438,24 @@ async fn load_cursors(
 ) -> Result<Option<db::GroupState>> {
     let (key, group) = (key.to_string(), group.to_string());
     let legacy = if key == group { Vec::new() } else { ctx.pool.legacy_keys(server) };
-    on_db(db, move |conn| cursors_or_adopted(conn, &key, &group, server == 0, &legacy)).await
+    let host = ctx.pool.host(server);
+    on_db(db, move |conn| {
+        let owns_plain = key != group && owns_plain_cursors(conn, &host)?;
+        cursors_or_adopted(conn, &key, &group, owns_plain, &legacy)
+    })
+    .await
 }
 
 /// The cursors saved under `key`, else adopted: saved under one of the
 /// server's `legacy` keys (what an earlier build named it, see
 /// `nntp::legacy_server_keys`) they move to `key`, once; saved under the
-/// plain group name (before a second server was added) they belong to the
-/// first server
+/// plain group name (before a second server was added) only by the server
+/// that kept them (`owns_plain`, see `claim_plain_cursors`)
 fn cursors_or_adopted(
     conn: &Connection,
     key: &str,
     group: &str,
-    first_server: bool,
+    owns_plain: bool,
     legacy: &[String],
 ) -> Result<Option<db::GroupState>> {
     if let Some(state) = db::get_group_state(conn, key)? {
@@ -430,7 +470,7 @@ fn cursors_or_adopted(
         }
     }
 
-    if first_server
+    if owns_plain
         && key != group
         && let Some(state) = db::get_group_state(conn, group)?
     {
@@ -1886,9 +1926,48 @@ mod tests {
         assert_eq!(db::get_group_state(&conn, "g@a.example").unwrap(), Some(state));
         // nothing to adopt: nothing made up
         assert_eq!(cursors_or_adopted(&conn, "g@b.example", "g", false, &[]).unwrap(), None);
-        // the plain group name still goes to the first server
+        // the plain group name goes to the server that kept it
         db::save_group_state(&conn, "h", state).unwrap();
         assert_eq!(cursors_or_adopted(&conn, "h@a.example", "h", true, &legacy).unwrap(), Some(state));
+    }
+
+    /// a lone server's plain cursors are its own: adding a server that sorts
+    /// before it doesnt hand them to the new one
+    #[test]
+    fn plain_cursors_stay_with_the_server_that_kept_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        db::create_db_at(&main).unwrap();
+        let conn = db::open_at(&main).unwrap();
+        let state = db::GroupState { live_cursor: 900, backfill_cursor: 500 };
+        db::save_group_state(&conn, "g", state).unwrap();
+
+        let old = crate::config::UsenetServer::new("old.example", "u", "p", 563);
+        let lone = Pool::new(std::slice::from_ref(&old));
+        claim_plain_cursors(&conn, &lone).unwrap();
+        assert_eq!(cursor_key(&lone, 0, "g"), "g", "still the plain name on its own");
+
+        // a new server, ahead of it by priority
+        let mut new = crate::config::UsenetServer::new("new.example", "u", "p", 563);
+        new.priority = 0;
+        let both = Pool::new(&[new, old]);
+        claim_plain_cursors(&conn, &both).unwrap();
+        assert_eq!(both.host(0), "new.example", "the new one sorts first");
+        let adopted = |i: usize| {
+            let key = cursor_key(&both, i, "g");
+            cursors_or_adopted(&conn, &key, "g", owns_plain_cursors(&conn, &both.host(i)).unwrap(), &[]).unwrap()
+        };
+        assert_eq!(adopted(0), None, "the new server starts fresh");
+        assert_eq!(adopted(1), Some(state), "the old one keeps its place");
+
+        // plain cursors from before anyone was recorded, with two servers: no one's
+        db::create_db_at(&dir.path().join("other.db")).unwrap();
+        let conn2 = db::open_at(&dir.path().join("other.db")).unwrap();
+        db::save_group_state(&conn2, "g", state).unwrap();
+        claim_plain_cursors(&conn2, &both).unwrap();
+        for i in 0..2 {
+            assert!(!owns_plain_cursors(&conn2, &both.host(i)).unwrap(), "ambiguous, left alone");
+        }
     }
 
     #[test]
