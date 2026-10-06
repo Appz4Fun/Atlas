@@ -707,6 +707,11 @@ fn seal_rows(conn: &Connection, file_id: i64) -> Result<usize> {
     if rows.iter().any(|r| r.part.is_some_and(|p| p < 0)) {
         return Ok(0);
     }
+    // a row the blob already has (saved past a save's decode budget, see
+    // `SealedCache`) isnt added twice
+    let held: HashSet<(&[u8], i64)> = segs.iter().map(|s| (s.local.as_slice(), s.domain)).collect();
+    let rows: Vec<crate::blob::Seg> =
+        rows.into_iter().filter(|r| !held.contains(&(r.local.as_slice(), r.domain))).collect();
     segs.extend(rows);
     conn.prepare_cached("update files set blob = ? where id = ?")?
         .execute(params![crate::blob::encode(&segs), file_id])?;
@@ -779,38 +784,82 @@ pub(crate) fn due(expected: Option<i64>, seen: &[u8], touched: Option<i64>, seal
 /// sealed file per article, and each is up to SEAL_MAX_SEGMENTS
 const SEALED_CACHE_MAX_SEGMENTS: usize = 200_000;
 
-/// Blobs of sealed files, decoded once each, for checking late articles. Holds
-/// at most `SEALED_CACHE_MAX_SEGMENTS` decoded segments: past that it starts
-/// over, the cache only saves decoding a blob again.
+/// the segments one `SealedCache` (one save) decodes at most, over all its
+/// blobs: 20 of the biggest. Late articles cycling over more sealed files
+/// than the cache holds would decode a blob each otherwise
+const SEALED_DECODE_BUDGET: usize = 20 * SEAL_MAX_SEGMENTS as usize;
+
+/// a sealed file's articles as (local, domain)
+type SegmentSet = HashSet<(Vec<u8>, i64)>;
+
+/// Blobs of sealed files, decoded once each, for checking late articles.
+/// Holds at most `SEALED_CACHE_MAX_SEGMENTS` decoded segments, letting the
+/// least recently used files go past that, and decodes at most
+/// `SEALED_DECODE_BUDGET` segments in all. Past the budget a sealed file not
+/// held is taken not to have the article: it's saved as a row, and sealing
+/// the file again drops a row its blob already has (till then a repost of
+/// an article could show twice in the NZB).
 pub(crate) struct SealedCache {
-    files: HashMap<i64, HashSet<(Vec<u8>, i64)>>,
+    /// each file's segments, and when it was last used
+    files: HashMap<i64, (u64, SegmentSet)>,
+    /// the files by when they were last used
+    by_use: std::collections::BTreeMap<u64, i64>,
+    uses: u64,
     /// segments in `files`
     segments: usize,
     max_segments: usize,
+    /// segments decoded so far
+    decoded: usize,
+    max_decoded: usize,
 }
 
 impl SealedCache {
     pub(crate) fn new() -> Self {
-        Self::with_max(SEALED_CACHE_MAX_SEGMENTS)
+        Self::with_limits(SEALED_CACHE_MAX_SEGMENTS, SEALED_DECODE_BUDGET)
     }
 
-    fn with_max(max_segments: usize) -> Self {
-        SealedCache { files: HashMap::new(), segments: 0, max_segments }
+    fn with_limits(max_segments: usize, max_decoded: usize) -> Self {
+        SealedCache {
+            files: HashMap::new(),
+            by_use: Default::default(),
+            uses: 0,
+            segments: 0,
+            max_segments,
+            decoded: 0,
+            max_decoded,
+        }
     }
 
     /// the article (local, domain) is already in file `file_id`'s blob
     pub(crate) fn contains(&mut self, conn: &Connection, file_id: i64, local: &[u8], domain: i64) -> Result<bool> {
-        if !self.files.contains_key(&file_id) {
-            let set: HashSet<(Vec<u8>, i64)> =
-                sealed_segments(conn, file_id)?.unwrap_or_default().into_iter().map(|s| (s.local, s.domain)).collect();
-            if self.segments + set.len() > self.max_segments {
-                self.files.clear();
-                self.segments = 0;
-            }
-            self.segments += set.len();
-            self.files.insert(file_id, set);
+        self.uses += 1;
+        let key = (local.to_vec(), domain);
+        if let Some((used, set)) = self.files.get_mut(&file_id) {
+            self.by_use.remove(used);
+            *used = self.uses;
+            self.by_use.insert(self.uses, file_id);
+            return Ok(set.contains(&key));
         }
-        Ok(self.files[&file_id].contains(&(local.to_vec(), domain)))
+        if self.decoded >= self.max_decoded {
+            return Ok(false);
+        }
+        let set: SegmentSet =
+            sealed_segments(conn, file_id)?.unwrap_or_default().into_iter().map(|s| (s.local, s.domain)).collect();
+        self.decoded += set.len();
+        let found = set.contains(&key);
+        if set.len() > self.max_segments {
+            return Ok(found);
+        }
+        while self.segments + set.len() > self.max_segments
+            && let Some((_, oldest)) = self.by_use.pop_first()
+            && let Some((_, gone)) = self.files.remove(&oldest)
+        {
+            self.segments -= gone.len();
+        }
+        self.segments += set.len();
+        self.by_use.insert(self.uses, file_id);
+        self.files.insert(file_id, (self.uses, set));
+        Ok(found)
     }
 }
 
@@ -1232,16 +1281,44 @@ mod tests {
     #[test]
     fn the_sealed_cache_stays_within_its_bound_and_still_finds_every_duplicate() {
         let conn = sealed_files(40, 3);
-        let mut cache = SealedCache::with_max(10);
+        let mut cache = SealedCache::with_limits(10, usize::MAX);
         // one late article per sealed file, twice around
         for _ in 0..2 {
             for id in 1..=40 {
                 assert!(cache.contains(&conn, id, format!("{id}-1").as_bytes(), id).unwrap(), "file {id}");
                 assert!(!cache.contains(&conn, id, b"new", id).unwrap());
                 assert!(cache.segments <= 10, "{} segments kept", cache.segments);
-                assert_eq!(cache.segments, cache.files.values().map(|s| s.len()).sum::<usize>());
+                assert_eq!(cache.segments, cache.files.values().map(|(_, s)| s.len()).sum::<usize>());
             }
         }
+    }
+
+    /// The least recently used file goes when the cache is full, not all of
+    /// them: a file checked over and over stays decoded.
+    #[test]
+    fn the_sealed_cache_lets_the_least_recently_used_file_go() {
+        let conn = sealed_files(5, 4);
+        let mut cache = SealedCache::with_limits(12, usize::MAX);
+        for id in [1, 2, 3, 1, 4, 1, 5, 1] {
+            assert!(cache.contains(&conn, id, format!("{id}-1").as_bytes(), id).unwrap(), "file {id}");
+        }
+        assert_eq!(cache.decoded, 5 * 4, "file 1 was decoded once");
+        assert!(cache.segments <= 12);
+    }
+
+    /// Late articles cycling over more sealed files than the cache holds
+    /// decode no more than the budget in one save.
+    #[test]
+    fn cycling_sealed_files_decodes_no_more_than_the_budget() {
+        let conn = sealed_files(5, 4);
+        let mut cache = SealedCache::with_limits(16, 40);
+        for _ in 0..3 {
+            for id in 1..=5 {
+                cache.contains(&conn, id, b"late", id).unwrap();
+            }
+        }
+        assert!(cache.decoded <= 40, "{} segments decoded", cache.decoded);
+        assert!(cache.segments <= 16);
     }
 
     #[test]
@@ -1537,6 +1614,23 @@ mod tests {
         let b: i64 = conn.query_row("select id from files where filename = 'b.rar'", [], |r| r.get(0)).unwrap();
         assert_eq!(seal_file(&conn, b).unwrap(), 2);
         assert_eq!(read(), after);
+    }
+
+    /// A row its blob already has (saved past a save's decode budget) is
+    /// dropped when the file is sealed again, not kept twice.
+    #[test]
+    fn resealing_drops_a_row_the_blob_already_has() {
+        let (_dir, main) = sealed_fixture();
+        let conn = db::open_at(&shard_path(&main, shard_of("alt.binaries.t"))).unwrap();
+        let a: i64 = conn.query_row("select id from files where filename = 'a.rar'", [], |r| r.get(0)).unwrap();
+        assert_eq!(seal_file(&conn, a).unwrap(), 3);
+        let first = sealed_segments(&conn, a).unwrap().unwrap().remove(0);
+        conn.execute(
+            "insert into segments (file_id, local, domain, part, bytes) values (?, ?, ?, ?, ?)",
+            params![a, first.local, first.domain, first.part, first.bytes],
+        )
+        .unwrap();
+        assert_eq!(seal_file(&conn, a).unwrap(), 3, "the copy isnt added");
     }
 
     #[test]
