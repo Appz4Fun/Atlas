@@ -53,8 +53,10 @@ pub struct GroupRunState {
     /// day chunk too old for it), until it's looked at again
     pub keeps_from: HashMap<String, (i64, Instant)>,
     /// likewise the day of its first post, `i64::MAX` when it has none or
-    /// doesnt carry the group (see `drop_unkept_days`)
-    pub first_post_days: HashMap<String, (i64, Instant)>,
+    /// doesnt carry the group (see `drop_unkept_days`); a server not carrying
+    /// the group is noted for good (no expiry): the scheduler skips it for
+    /// good too
+    pub first_post_days: HashMap<String, (i64, Option<Instant>)>,
 }
 
 impl Default for GroupRunState {
@@ -109,7 +111,12 @@ impl RunStates {
     /// Note `day` as the day of the server `host`'s first post of `group`,
     /// until it's looked at again.
     fn first_post_on(&self, group: &str, host: &str, day: i64) {
-        self.with(group, |st| st.first_post_days.insert(host.to_string(), (day, Instant::now() + KEEPS_RECHECK)));
+        self.with(group, |st| st.first_post_days.insert(host.to_string(), (day, Some(Instant::now() + KEEPS_RECHECK))));
+    }
+
+    /// Note the server `host` as not carrying `group`, with no expiry.
+    fn not_carrying(&self, group: &str, host: &str) {
+        self.with(group, |st| st.first_post_days.insert(host.to_string(), (i64::MAX, None)));
     }
 
     /// The day of the server `host`'s first post of `group`, `i64::MIN` when not known.
@@ -117,7 +124,7 @@ impl RunStates {
         let now = Instant::now();
         let states = self.0.lock().unwrap();
         let found = states.get(group).and_then(|s| s.first_post_days.get(host));
-        found.filter(|(_, until)| *until > now).map_or(i64::MIN, |(day, _)| *day)
+        found.filter(|(_, until)| until.is_none_or(|u| u > now)).map_or(i64::MIN, |(day, _)| *day)
     }
 
     /// The groups whose oldest day on the server `host` is known, with that day.
@@ -943,7 +950,7 @@ where
         Ok(info) => info,
         Err(e) if e.code() == Some(411) => {
             // it has no post of it (see `drop_unkept_days`)
-            ctx.states.first_post_on(group, &ctx.pool.host(server), i64::MAX);
+            ctx.states.not_carrying(group, &ctx.pool.host(server));
             // if it was noted as going back furthest, the oldest day goes to the next one
             let (g, host) = (group.to_string(), ctx.pool.host(server));
             if let Err(e) = on_db(db, move |conn| Ok(crate::chunks::forget_deepest(conn, &g, &host)?)).await {
@@ -1533,6 +1540,24 @@ mod tests {
         assert_eq!(states.kept_days("a.example"), HashMap::from([("alt.binaries.g".to_string(), 20_000)]));
         assert_eq!(states.keeps_from("alt.binaries.g", "b.example"), i64::MIN, "b is not restricted");
         assert!(states.kept_days("b.example").is_empty());
+    }
+
+    #[test]
+    fn a_server_not_carrying_a_group_stays_noted_but_other_first_posts_expire() {
+        let states = RunStates::default();
+        states.not_carrying("g", "a.example");
+        states.first_post_on("g", "b.example", 20_000);
+        assert_eq!(states.first_post_day("g", "b.example"), 20_000);
+        let past = Instant::now() - Duration::from_secs(1);
+        states.with("g", |st| {
+            for (_, until) in st.first_post_days.values_mut() {
+                if until.is_some() {
+                    *until = Some(past);
+                }
+            }
+        });
+        assert_eq!(states.first_post_day("g", "a.example"), i64::MAX, "no expiry for a non-carrier");
+        assert_eq!(states.first_post_day("g", "b.example"), i64::MIN, "an ordinary first post expires");
     }
 
     #[test]
