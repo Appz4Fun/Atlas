@@ -1332,81 +1332,116 @@ impl Pool {
     /// Missing numbers are skipped in windows that double from `DATE_LOOK` up
     /// to `DATE_SCAN_MAX` numbers; past that the windows spread out (each
     /// starts twice as far from `from` as the last ended, the last ends at
-    /// `end`), soo a hole of millions takes a few dozen small requests. A hit
-    /// after spread out windows is narrowed down by bisecting the numbers in
-    /// between, taking the hole as one run of missing numbers followed by
-    /// articles.
+    /// `end`), soo a hole of millions takes a few dozen small requests. The
+    /// numbers stepped over are read before a hit is taken as the first, see
+    /// `first_before`.
     async fn first_in(&self, i: usize, group: &str, from: u64, end: u64) -> Result<Option<Dated>> {
-        // numbers before `gap` are all missing
-        let (mut at, mut size, mut gap) = (from, DATE_LOOK, from);
+        // the numbers between windows that weren't read, lowest first
+        let mut skipped = Vec::new();
+        // every number from `from` up to here was read or stepped over
+        let (mut at, mut size, mut read_to) = (from, DATE_LOOK, from);
         while at < end {
+            if at > read_to {
+                skipped.push((read_to, at));
+            }
             let look = size.min(end - at);
             if let Some(hit) = self.posted_at(i, group, at, look).await? {
-                // the first article is between the last empty window and this one
-                let (mut lo, mut hi, mut best) = (gap, at, hit);
-                while lo < hi {
-                    let mid = lo + (hi - lo) / 2;
-                    let look = DATE_LOOK.min(hi - mid);
-                    match self.posted_at(i, group, mid, look).await? {
-                        Some(found) => (best, hi) = (found, found.0),
-                        None => lo = mid + look,
-                    }
-                }
-                // the bisect skipped what it took for empty: read it once
-                if best.0 > gap
-                    && let Some(f) = self.posted_at(i, group, gap, best.0 - gap).await?
-                {
-                    best = f;
-                }
-                return Ok(Some(best));
+                return self.first_before(i, group, &skipped, hit).await.map(Some);
             }
-            gap = at + look;
+            read_to = at + look;
             if size < DATE_SCAN_MAX {
-                at = gap;
+                at = read_to;
                 size *= 2;
             } else {
-                at = (gap + (gap - from)).min(end.saturating_sub(DATE_SCAN_MAX)).max(gap);
+                at = (read_to + (read_to - from)).min(end.saturating_sub(DATE_SCAN_MAX)).max(read_to);
             }
         }
         Ok(None)
     }
 
+    /// The first article on server `i`, given the first one a window found
+    /// (`hit`) and the numbers stepped over before it (`skipped`, lowest
+    /// first): an article stepped over comes first. Those between two empty
+    /// windows are read in one request each (quick when there's nothing, as
+    /// in a hole). The run up to the hit is narrowed down by bisecting,
+    /// taking it as one run of missing numbers followed by articles, and what
+    /// the bisect took for missing is read once.
+    async fn first_before(&self, i: usize, group: &str, skipped: &[(u64, u64)], hit: Dated) -> Result<Dated> {
+        let Some((&(start, end), between)) = skipped.split_last() else { return Ok(hit) };
+        for &(from, to) in between {
+            if let Some(found) = self.posted_at(i, group, from, to - from).await? {
+                return Ok(found);
+            }
+        }
+        let (mut lo, mut hi, mut best) = (start, end, hit);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let look = DATE_LOOK.min(hi - mid);
+            match self.posted_at(i, group, mid, look).await? {
+                Some(found) => (best, hi) = (found, found.0),
+                None => lo = mid + look,
+            }
+        }
+        if best.0 > start
+            && let Some(f) = self.posted_at(i, group, start, best.0 - start).await?
+        {
+            best = f;
+        }
+        Ok(best)
+    }
+
     /// The last article in `from..end` on server `i`, with its post time: like
-    /// `first_in`, going backwards from `end`, the hole taken as articles
-    /// followed by one run of missing numbers.
+    /// `first_in`, going backwards from `end`.
     async fn last_in(&self, i: usize, group: &str, from: u64, end: u64) -> Result<Option<Dated>> {
-        // numbers from `gap` on are all missing
-        let (mut to, mut size, mut gap) = (end, DATE_LOOK, end);
+        // the numbers between windows that weren't read, highest first
+        let mut skipped = Vec::new();
+        // every number from here up to `end` was read or stepped over
+        let (mut to, mut size, mut read_from) = (end, DATE_LOOK, end);
         while to > from {
+            if to < read_from {
+                skipped.push((to, read_from));
+            }
             let look = size.min(to - from);
             if let Some((_, hit)) = self.window(i, group, to - look, look).await? {
-                // the last article is between this window and the last empty one
-                let (mut lo, mut hi, mut best) = (to, gap, hit);
-                while lo < hi {
-                    let mid = lo + (hi - lo) / 2;
-                    let look = DATE_LOOK.min(hi - mid);
-                    match self.window(i, group, mid, look).await? {
-                        Some((_, found)) => (best, lo) = (found, found.0 + 1),
-                        None => hi = mid,
-                    }
-                }
-                // the bisect skipped what it took for empty: read it once
-                if gap > best.0 + 1
-                    && let Some((_, l)) = self.window(i, group, best.0 + 1, gap - best.0 - 1).await?
-                {
-                    best = l;
-                }
-                return Ok(Some(best));
+                return self.last_after(i, group, &skipped, hit).await.map(Some);
             }
-            gap = to - look;
+            read_from = to - look;
             if size < DATE_SCAN_MAX {
-                to = gap;
+                to = read_from;
                 size *= 2;
             } else {
-                to = end.saturating_sub(2 * (end - gap)).max(from.saturating_add(DATE_SCAN_MAX)).min(gap);
+                to = end.saturating_sub(2 * (end - read_from)).max(from.saturating_add(DATE_SCAN_MAX)).min(read_from);
             }
         }
         Ok(None)
+    }
+
+    /// `first_before` going backwards: the last article, given the last one
+    /// a window found and the numbers stepped over after it (highest first).
+    /// The run from the hit up is taken as articles followed by one run of
+    /// missing numbers.
+    async fn last_after(&self, i: usize, group: &str, skipped: &[(u64, u64)], hit: Dated) -> Result<Dated> {
+        let Some((&(start, end), between)) = skipped.split_last() else { return Ok(hit) };
+        for &(from, to) in between {
+            if let Some((_, found)) = self.window(i, group, from, to - from).await? {
+                return Ok(found);
+            }
+        }
+        let (mut lo, mut hi, mut best) = (start, end, hit);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let look = DATE_LOOK.min(hi - mid);
+            match self.window(i, group, mid, look).await? {
+                Some((_, found)) => (best, lo) = (found, found.0 + 1),
+                None => hi = mid,
+            }
+        }
+        if end > best.0 + 1
+            && let Some((_, l)) = self.window(i, group, best.0 + 1, end - best.0 - 1).await?
+        {
+            best = l;
+        }
+        Ok(best)
     }
 
     /// When the first article in `low..=high` on server `i` was posted (unix

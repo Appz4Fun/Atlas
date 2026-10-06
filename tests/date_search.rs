@@ -187,6 +187,60 @@ fn a_hole_of_millions_is_crossed_to_its_first_article_in_few_requests() {
     assert_eq!(at(1_500_000, minute_of(3_000_001)), 3_000_001);
 }
 
+/// one post a minute from `when` on, numbered `numbers`
+fn minutely(numbers: std::ops::RangeInclusive<u64>, when: &str) -> Vec<common::Post> {
+    let start = chrono::DateTime::parse_from_rfc3339(when).unwrap();
+    let first = *numbers.start();
+    numbers
+        .map(|n| {
+            let at = start + chrono::Duration::minutes((n - first) as i64);
+            post_at(n, &format!(r#""p{n}.bin" yEnc (1/1)"#), &at.to_rfc2822())
+        })
+        .collect()
+}
+
+fn unix(rfc3339: &str) -> i64 {
+    chrono::DateTime::parse_from_rfc3339(rfc3339).unwrap().timestamp()
+}
+
+/// A few articles in the numbers the spread out windows step over, before
+/// the articles they land on: going forward, they are still the first.
+#[test]
+fn a_small_cluster_between_spread_out_windows_is_found_going_forward() {
+    // nothing below 40,000, five posts there, nothing again till 100,000
+    let mut posts = minutely(40_000..=40_004, "2026-01-01T00:00:00+00:00");
+    posts.extend(minutely(100_000..=103_000, "2026-01-03T00:00:00+00:00"));
+    let port = spawn_server(Server::new(posts));
+    let pool = BlockingPool::new(&[mock(port, "secret", 2, 1)]);
+    pool.connect().unwrap();
+
+    let first = pool.block_on(pool.pool.first_post(0, GROUP, 1, 103_000)).unwrap();
+    assert_eq!(first, Some(unix("2026-01-01T00:00:00+00:00")), "the cluster's first post");
+    let at = |when: &str| pool.block_on(pool.pool.article_at(0, GROUP, 1, 103_000, unix(when))).unwrap();
+    assert_eq!(at("2025-12-31T00:00:00+00:00"), 40_000);
+    assert_eq!(at("2026-01-01T00:02:00+00:00"), 40_002);
+    assert_eq!(at("2026-01-02T00:00:00+00:00"), 100_000);
+}
+
+/// The same going backwards: a few articles in the numbers the spread out
+/// windows step over, after the articles they land on, are still the last
+/// before the hole.
+#[test]
+fn a_small_cluster_between_spread_out_windows_is_found_going_backward() {
+    // 1..=600 (ten hours), five posts at 25,000, nothing again till 90,000
+    let mut posts = minutely(1..=600, "2026-01-01T00:00:00+00:00");
+    posts.extend(minutely(25_000..=25_004, "2026-01-02T00:00:00+00:00"));
+    posts.extend(minutely(90_000..=93_000, "2026-01-03T00:00:00+00:00"));
+    let port = spawn_server(Server::new(posts));
+    let pool = BlockingPool::new(&[mock(port, "secret", 2, 1)]);
+    pool.connect().unwrap();
+
+    let at = |when: &str| pool.block_on(pool.pool.article_at(0, GROUP, 1, 93_000, unix(when))).unwrap();
+    assert_eq!(at("2026-01-02T00:00:00+00:00"), 25_000);
+    assert_eq!(at("2026-01-01T12:00:00+00:00"), 25_000, "between the first run and the cluster");
+    assert_eq!(at("2026-01-02T12:00:00+00:00"), 90_000);
+}
+
 /// The first day after a hole of millions is indexed whole.
 #[test]
 fn a_day_chunk_right_after_a_hole_of_millions_gets_every_article() {
