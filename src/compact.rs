@@ -515,8 +515,10 @@ fn compact_shard(
                 }
             }
 
-            // rows a blob cant hold exactly (a negative part, no size) stay rows
-            let fits = file_rows.iter().all(|r| r.part.is_none_or(|p| p >= 0) && r.bytes.is_some());
+            // rows a blob cant hold exactly (a negative part, no size, a long message-id) stay rows
+            let fits = file_rows
+                .iter()
+                .all(|r| r.part.is_none_or(|p| p >= 0) && r.bytes.is_some() && r.local.len() <= blob::MAX_LOCAL);
             let seen: Vec<u8> = f.get(8)?;
             // and files with more segments than a blob takes stay rows
             let small = (segs.len() + file_rows.len()) as i64 <= store::SEAL_MAX_SEGMENTS;

@@ -75,8 +75,17 @@ pub fn decode(blob: &[u8]) -> Result<Vec<Seg>> {
     parse(&zstd::stream::decode_all(blob)?, usize::MAX)
 }
 
-/// the most a segment takes unpacked, for bounding what a blob may expand to
+/// the most local bytes a segment may have to be sealed: a file with a longer
+/// one stays rows (a message-id is 250 bytes at most, a stored one a domain
+/// suffix less)
+pub const MAX_LOCAL: usize = 512;
+
+/// the most a segment takes unpacked, for bounding what a blob may expand to:
+/// its local bytes (`MAX_LOCAL`, and up to 253 more when a compaction stores
+/// the message-id with its domain suffix again) and four varints of 10 bytes
+/// at most, 32 with the length's
 const MAX_SEG_RAW: usize = 1024;
+const _: () = assert!(MAX_LOCAL + 253 + 32 <= MAX_SEG_RAW);
 
 /// `decode` for a blob of at most `max` segments: one that says it has more,
 /// or unpacks to more than `max` segments could take, is an error and is
@@ -141,6 +150,16 @@ mod tests {
         raw.resize(10_000, 0);
         assert!(decode_capped(&zstd::bulk::compress(&raw, 1).unwrap(), 1).is_err());
         assert!(decode_capped(b"garbage", 10).is_err());
+    }
+
+    #[test]
+    fn the_longest_sealable_segment_decodes_under_the_cap() {
+        let segs =
+            vec![
+                Seg { part: Some(i64::MAX - 1), bytes: i64::MIN, domain: i64::MAX, local: vec![7; MAX_LOCAL + 253] };
+                3
+            ];
+        assert_eq!(decode_capped(&encode(&segs), 3).unwrap(), segs);
     }
 
     #[test]

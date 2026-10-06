@@ -704,7 +704,8 @@ fn seal_rows(conn: &Connection, file_id: i64) -> Result<usize> {
         return Ok(segs.len());
     }
     // the blob has no room for a negative part number: such a file stays rows
-    if rows.iter().any(|r| r.part.is_some_and(|p| p < 0)) {
+    // nor one whose message-id is longer than a blob decodes
+    if rows.iter().any(|r| r.part.is_some_and(|p| p < 0) || r.local.len() > crate::blob::MAX_LOCAL) {
         return Ok(0);
     }
     // a row the blob already has (saved past a save's decode budget, see
@@ -745,8 +746,9 @@ pub(crate) fn sealable(conn: &Connection, after_id: i64, limit: usize, now: i64)
     let mut stmt = conn.prepare_cached(&format!(
         "select f.id, f.expected, f.seen, f.touched_at, f.blob is not null,
                 exists (select 1 from segments s where s.file_id = f.id),
-                exists (select 1 from segments s where s.file_id = f.id and s.part < 0) or {}
+                exists (select 1 from segments s where s.file_id = f.id and (s.part < 0 or length(s.local) > {})) or {}
          from files f where f.id > ? order by f.id limit ?",
+        crate::blob::MAX_LOCAL,
         too_many_rows()
     ))?;
     let mut ids = Vec::new();
@@ -774,8 +776,9 @@ fn still_due(conn: &Connection, file_id: i64, now: i64) -> Result<bool> {
     conn.prepare_cached(&format!(
         "select f.expected, f.seen, f.touched_at, f.blob is not null,
                 exists (select 1 from segments s where s.file_id = f.id),
-                exists (select 1 from segments s where s.file_id = f.id and s.part < 0) or {}
+                exists (select 1 from segments s where s.file_id = f.id and (s.part < 0 or length(s.local) > {})) or {}
          from files f where f.id = ?",
+        crate::blob::MAX_LOCAL,
         too_many_rows()
     ))?
     .query_row([file_id], |r| {
@@ -1894,6 +1897,38 @@ mod tests {
         .unwrap();
         assert!(sealable(&conn, 0, 100, now).unwrap().0.is_empty());
         assert_eq!(seal_file(&conn, ids[1]).unwrap(), 0);
+    }
+
+    #[test]
+    fn a_file_with_an_oversized_message_id_stays_rows_and_saves_succeed() {
+        let (_dir, main) = sealed_fixture();
+        let conn = db::open_at(&shard_path(&main, shard_of("alt.binaries.t"))).unwrap();
+        let now: i64 = conn.query_row("select unixepoch()", [], |r| r.get(0)).unwrap();
+        let b: i64 = conn.query_row("select id from files where filename = 'b.rar'", [], |r| r.get(0)).unwrap();
+        conn.execute(
+            "insert into segments (file_id, local, domain, part, bytes) values (?, zeroblob(5000), 0, 9, 1)",
+            [b],
+        )
+        .unwrap();
+        conn.execute("update files set touched_at = ?", [now - SEAL_AGE - 1]).unwrap();
+        assert!(!sealable(&conn, 0, 100, now).unwrap().0.contains(&b));
+        assert_eq!(seal_file(&conn, b).unwrap(), 0);
+        let blob: Option<Vec<u8>> = conn.query_row("select blob from files where id = ?", [b], |r| r.get(0)).unwrap();
+        assert!(blob.is_none() || crate::blob::decode_capped(&blob.unwrap(), SEAL_MAX_SEGMENTS as usize).is_ok());
+        let again = Release {
+            name: "r".into(),
+            group: "alt.binaries.t".into(),
+            articles: vec![Article {
+                message_id: "<b9@x>".into(),
+                filename: Some("b.rar".into()),
+                part: Some(10),
+                total_parts: Some(3),
+                bytes: 5,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        save(&main, &[again]).unwrap();
     }
 
     /// `n` more rows under a file, as a poster could add them
