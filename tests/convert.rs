@@ -251,3 +251,34 @@ fn a_conversion_stopped_during_the_check_picks_up_there() {
         assert_eq!(&nzb::render_nzb(&now, &store::articles(&conn, id).unwrap()), nzb_before, "{name}");
     }
 }
+
+/// `--convert` has the database to itself for its whole run: refused while
+/// the indexer (or a save) holds it, and a second conversion is refused
+/// while one runs, each without touching anything.
+#[test]
+fn a_conversion_runs_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = dir.path().join("atlas.db");
+    old_database(&main);
+    db::create_db_at(&main).unwrap();
+    let new_main = dir.path().join("atlas.new.db");
+
+    let writing = atlas::compact::try_hold_off_compaction(&main).unwrap().unwrap();
+    let err = convert::run_alone(&main, &|_| {}).expect_err("converted while the indexer held the database");
+    assert!(format!("{err:#}").contains("in use"), "{err:#}");
+    assert!(convert::needed(&main) && !new_main.exists(), "nothing was done");
+    drop(writing);
+
+    let second = std::cell::RefCell::new(None);
+    let converted = convert::run_alone(&main, &|_| {
+        if second.borrow().is_none() {
+            *second.borrow_mut() = Some(convert::run_alone(&main, &|_| {}).map(|_| ()));
+        }
+    })
+    .unwrap();
+    assert_eq!(converted.map(|(releases, _)| releases), Some(40));
+    let err = second.into_inner().unwrap().expect_err("a second conversion ran alongside");
+    assert!(format!("{err:#}").contains("in use"), "{err:#}");
+    assert!(!convert::needed(&main), "the first one finished");
+    assert_eq!(convert::run_alone(&main, &|_| {}).unwrap(), None, "nothing left to convert");
+}

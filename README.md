@@ -261,7 +261,7 @@ The first time the new indexer starts on a database from an older version, it co
 3. It checks a sample of releases: their NZBs, sizes, part counts, and completeness must come out the same as from the old database.
 4. Only then does it swap the files. The old database stays as `atlas.old.db`; delete it once you're happy.
 
-The menu shows the progress meanwhile, and searches don't work until the conversion finishes. On a 488 GB database it takes about 1.5 hours. If anything fails, Atlas leaves the old database as it was and tries again on the next start. To convert in the foreground instead, stop indexing and run `atlas --convert`.
+The menu shows the progress meanwhile, and searches don't work until the conversion finishes. On a 488 GB database it takes about 1.5 hours. If anything fails, Atlas leaves the old database as it was and tries again on the next start. To convert in the foreground instead, stop indexing and run `atlas --convert`. It refuses to start while the indexer, a compaction or another `--convert` is using the database.
 
 Release IDs change in the conversion, so NZB links that Prowlarr or your apps saved before it no longer work. Search again to get the new ones.
 

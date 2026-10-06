@@ -67,6 +67,22 @@ fn open_for_conversion(path: &Path) -> rusqlite::Result<Connection> {
     Ok(conn)
 }
 
+/// `--convert`: `run` under the exclusive database lock for its whole run,
+/// refused while the indexer, a write, a compaction or another conversion
+/// holds it (two at once would write the same shards and `atlas.new.db`).
+/// None when there was nothing to convert.
+pub fn run_alone(main: &Path, progress: &dyn Fn(&str)) -> Result<Option<(i64, i64)>> {
+    let _alone = crate::compact::Lock::take(main).map_err(|e| match e.downcast_ref::<crate::compact::Busy>() {
+        Some(_) => anyhow!("the database is in use (indexing, a compaction or another conversion); try again later"),
+        None => e,
+    })?;
+    if !needed(main) {
+        return Ok(None);
+    }
+    crate::compact::refuse_unresolved_backups(main)?;
+    run(main, progress).map(Some)
+}
+
 /// Convert, reporting progress through `progress`. Returns how many releases
 /// and articles moved.
 pub fn run(main: &Path, progress: &dyn Fn(&str)) -> Result<(i64, i64)> {
