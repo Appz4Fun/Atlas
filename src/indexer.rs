@@ -57,34 +57,11 @@ pub struct GroupRunState {
     /// the group is noted for good (no expiry): the scheduler skips it for
     /// good too
     pub first_post_days: HashMap<String, (i64, Option<Instant>)>,
-    /// the split's days only one server has, see `Speculative`
-    pub speculative: Speculative,
 }
 
-/// Days of a split older than the next deepest server goes back are only
-/// the deepest one's, on the word of its own Date headers: forged, one
-/// article a day can make thousands of them look real, each a chunk of
-/// date searches. At most `reach` of them (counted back from the first day
-/// the next deepest keeps) are chunks at once, the older ones are left to
-/// the deep server's sweep (see `run_sweep`). Reaching the oldest of them
-/// reaches `SPECULATIVE_WINDOW` days further only when the ones done held
-/// `SPECULATIVE_YIELD` articles a day on average. Kept in memory: after a
-/// restart the window starts over (what was dropped is the sweep's).
-#[derive(Clone, Debug)]
-pub struct Speculative {
-    pub reach: i64,
-    /// days done, and the articles dated in them
-    pub days: i64,
-    pub articles: i64,
-}
-
-impl Default for Speculative {
-    fn default() -> Self {
-        Speculative { reach: SPECULATIVE_WINDOW, days: 0, articles: 0 }
-    }
-}
-
-/// see `Speculative`
+/// the days of a split only its deepest server has that are chunks at once
+/// (see `chunks::Speculative`), and the articles a day those done have to
+/// hold on average to reach this many further
 const SPECULATIVE_WINDOW: i64 = 60;
 const SPECULATIVE_YIELD: i64 = 100;
 
@@ -98,7 +75,6 @@ impl Default for GroupRunState {
             reach_back_after: None,
             keeps_from: HashMap::new(),
             first_post_days: HashMap::new(),
-            speculative: Speculative::default(),
         }
     }
 }
@@ -984,35 +960,32 @@ async fn drop_older_days(db: &Db, group: &str, day: i64) {
 }
 
 /// A day only this server has (`day`, of the window from `floor`, see
-/// `Speculative`) is done with `dated` articles in it. When it was the
+/// `chunks::Speculative`) is done with `dated` articles in it. When it was the
 /// window's oldest and the window's days held enough a day, chunks for the
 /// days before it, back to the server's first post (`oldest`). Best effort:
 /// a failure is only logged.
-async fn reach_further(
-    ctx: &PassContext,
-    db: &Db,
-    group: &str,
-    (day, floor, oldest): (i64, i64, Option<i64>),
-    dated: i64,
-) {
-    let further = ctx.states.with(group, |st| {
-        let s = &mut st.speculative;
+async fn reach_further(db: &Db, group: &str, (day, floor, oldest): (i64, i64, Option<i64>), dated: i64) {
+    let first = oldest.map_or(floor, crate::chunks::unix_day);
+    let g = group.to_string();
+    let added = on_db(db, move |conn| {
+        let Some(mut s) = crate::chunks::speculative(conn, &g)? else { return Ok(0) };
         s.days += 1;
         s.articles += dated;
-        let worth = s.articles >= SPECULATIVE_YIELD * s.days;
-        if day == floor && worth {
+        let further = day == floor && s.articles >= SPECULATIVE_YIELD * s.days && first < floor;
+        if further {
             s.reach += SPECULATIVE_WINDOW;
         }
-        day == floor && worth
-    });
-    let first = oldest.map_or(floor, crate::chunks::unix_day);
-    if !further || first >= floor {
-        return;
-    }
-    let (g, from) = (group.to_string(), (floor - SPECULATIVE_WINDOW).max(first));
-    match on_db(db, move |conn| Ok(crate::chunks::add(conn, &g, floor - 1, from)?)).await {
+        crate::chunks::set_speculative(conn, &g, &s)?;
+        if !further {
+            return Ok(0);
+        }
+        Ok(crate::chunks::add(conn, &g, floor - 1, (floor - SPECULATIVE_WINDOW).max(first))?)
+    })
+    .await;
+    match added {
+        Ok(0) => {}
         Ok(n) => println!("[CHUNK] {group}: the days only one server has hold articles, {n} more day chunks"),
-        Err(e) => println!("[CHUNK] {group}: couldnt add the days further back: {e:#}"),
+        Err(e) => println!("[CHUNK] {group}: couldnt note the days only one server has: {e:#}"),
     }
 }
 
@@ -1157,20 +1130,33 @@ where
             Ok(range) => range,
             Err(e) => return failed(e.into()).await,
         };
-    // days only this server has are bounded all together, see `Speculative`
+    // days only this server has are bounded all together, see `chunks::Speculative`
     let floor = match runner_up_day {
         Some(r) => {
-            let floor = r - ctx.states.with(group, |st| st.speculative.reach);
             let g = group.to_string();
-            let dropped = on_db(db, move |conn| Ok(crate::chunks::drop_before(conn, &g, floor)?)).await;
-            match dropped {
-                Ok(0) => {}
-                Ok(n) => println!(
-                    "[CHUNK] {group}: {n} days further back than {} days before the other servers go back are left to the sweeps",
-                    r - floor
-                ),
+            let dropped = on_db(db, move |conn| {
+                let s = match crate::chunks::speculative(conn, &g)? {
+                    Some(s) => crate::chunks::Speculative { runner_up_day: r, ..s },
+                    None => {
+                        crate::chunks::Speculative { runner_up_day: r, reach: SPECULATIVE_WINDOW, days: 0, articles: 0 }
+                    }
+                };
+                crate::chunks::set_speculative(conn, &g, &s)?;
+                let floor = r - s.reach;
+                Ok((floor, crate::chunks::drop_before(conn, &g, floor)?))
+            })
+            .await;
+            let floor = match dropped {
+                Ok((floor, 0)) => floor,
+                Ok((floor, n)) => {
+                    println!(
+                        "[CHUNK] {group}: {n} days further back than {} days before the other servers go back are left to the sweeps",
+                        r - floor
+                    );
+                    floor
+                }
                 Err(e) => return failed(e).await,
-            }
+            };
             // this one was among them (claimed, not done): nothing to do
             if day < floor {
                 return Ok(Progress::default());
@@ -1195,7 +1181,7 @@ where
             if alone && dated_in_day == 0 {
                 drop_older_days(db, group, day).await;
             } else if let Some(floor) = floor {
-                reach_further(ctx, db, group, (day, floor, oldest), dated_in_day).await;
+                reach_further(db, group, (day, floor, oldest), dated_in_day).await;
             }
             Ok(saved)
         }

@@ -36,6 +36,13 @@ pub fn create(conn: &Connection) -> Result<()> {
             grp TEXT NOT NULL,
             server TEXT NOT NULL,
             primary key (grp, server)
+        ) without rowid;
+        create table if not exists backfill_speculative (
+            grp TEXT PRIMARY KEY,
+            runner_up_day INTEGER NOT NULL,
+            reach INTEGER NOT NULL,
+            days INTEGER NOT NULL,
+            articles INTEGER NOT NULL
         ) without rowid;",
     )?;
     add_column(conn, "backfill_chunks", "done_at")?;
@@ -89,8 +96,21 @@ pub fn add(conn: &Connection, group: &str, newest_day: i64, oldest_day: i64) -> 
 pub fn reach_back(conn: &Connection, group: &str, oldest_day: i64, oldest_at: i64) -> Result<usize> {
     let tx = conn.unchecked_transaction()?;
     let Some(old) = self::oldest_day(&tx, group)? else { return Ok(0) };
+    // never past the window of days only the deepest server has
+    let spec = speculative(&tx, group)?;
+    let floor = spec.as_ref().map_or(i64::MIN, |s| s.runner_up_day - s.reach);
+    if oldest_day < floor {
+        if floor >= old {
+            return Ok(0);
+        }
+        return add_speculative(&tx, group, old, floor).and_then(|n| tx.commit().map(|_| n));
+    }
     if oldest_day > old {
         return Ok(0);
+    }
+    if spec.as_ref().is_some_and(|s| old <= s.runner_up_day) && oldest_day < old {
+        // only days the deepest server alone has: added, nothing redone
+        return add_speculative(&tx, group, old, oldest_day).and_then(|n| tx.commit().map(|_| n));
     }
     if oldest_day == old {
         let since: Option<i64> = tx
@@ -121,6 +141,48 @@ pub fn reach_back(conn: &Connection, group: &str, oldest_day: i64, oldest_at: i6
     tx.execute("delete from backfill_sweeps where grp = ?", [group])?;
     tx.commit()?;
     Ok(added + redo)
+}
+
+/// Chunks for the days before `old` back to `from`, all of them days only
+/// the deepest server has: they dont change what any sweep covers.
+fn add_speculative(tx: &Connection, group: &str, old: i64, from: i64) -> Result<usize> {
+    let mut insert = tx.prepare_cached("insert or ignore into backfill_chunks (grp, day, state) values (?, ?, ?)")?;
+    let mut added = 0;
+    for day in (from..old).rev() {
+        added += insert.execute(params![group, day, PENDING])?;
+    }
+    Ok(added)
+}
+
+/// A split's days older than the next deepest server goes back stand on the
+/// deepest one's own (forgeable) Date headers. At most `reach` of them,
+/// counted back from `runner_up_day` (the first day the next deepest
+/// keeps), are chunks at once; the older ones are left to the deep server's
+/// sweep. `days` of them were done holding `articles` dated in them. Kept
+/// per group in the database, soo a restart or `reach_back` doesnt undo it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Speculative {
+    pub runner_up_day: i64,
+    pub reach: i64,
+    pub days: i64,
+    pub articles: i64,
+}
+
+pub fn speculative(conn: &Connection, group: &str) -> Result<Option<Speculative>> {
+    conn.query_row(
+        "select runner_up_day, reach, days, articles from backfill_speculative where grp = ?",
+        [group],
+        |r| Ok(Speculative { runner_up_day: r.get(0)?, reach: r.get(1)?, days: r.get(2)?, articles: r.get(3)? }),
+    )
+    .optional()
+}
+
+pub fn set_speculative(conn: &Connection, group: &str, s: &Speculative) -> Result<()> {
+    conn.execute(
+        "insert or replace into backfill_speculative (grp, runner_up_day, reach, days, articles) values (?, ?, ?, ?, ?)",
+        params![group, s.runner_up_day, s.reach, s.days, s.articles],
+    )?;
+    Ok(())
 }
 
 /// Drop split `group`'s chunks older than `day` that arent done: days no
@@ -332,6 +394,26 @@ mod tests {
         assert_eq!(runner_up(&c, "g").unwrap(), Some(200));
         forget_deepest(&c, "g", "a").unwrap();
         assert_eq!(runner_up(&c, "g").unwrap(), None);
+    }
+
+    #[test]
+    fn reaching_back_keeps_to_the_speculative_window() {
+        let c = conn();
+        // days 100.. the next deepest keeps, 40..99 the window, older pruned
+        add(&c, "g", 120, 40).unwrap();
+        set_speculative(&c, "g", &Speculative { runner_up_day: 100, reach: 60, days: 3, articles: 7 }).unwrap();
+        set_swept(&c, "g", "a").unwrap();
+        // the hourly look finds the deep server back in 2000 again: nothing
+        assert_eq!(reach_back(&c, "g", 10, 10 * 86_400).unwrap(), 0);
+        assert_eq!(oldest_day(&c, "g").unwrap(), Some(40));
+        assert!(swept(&c, "g", "a").unwrap(), "the sweep isnt to do again");
+        // the window kept across a restart
+        assert_eq!(speculative(&c, "g").unwrap().map(|s| (s.reach, s.days, s.articles)), Some((60, 3, 7)));
+        // a wider window: the days in it, sweeps left alone
+        set_speculative(&c, "g", &Speculative { runner_up_day: 100, reach: 70, days: 3, articles: 7 }).unwrap();
+        assert_eq!(reach_back(&c, "g", 5, 5 * 86_400).unwrap(), 10);
+        assert_eq!(oldest_day(&c, "g").unwrap(), Some(30));
+        assert!(swept(&c, "g", "a").unwrap());
     }
 
     /// the day of a claim
