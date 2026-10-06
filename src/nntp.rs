@@ -925,9 +925,16 @@ struct UnsavedBudget {
     peak: AtomicUsize,
 }
 
+/// The unsaved headers cap a pool takes for `headers`: at least one, at
+/// most what its semaphore holds. Config reads through this too, soo what it
+/// asks for compares equal to what the pool has.
+pub fn unsaved_cap(headers: usize) -> usize {
+    headers.clamp(1, Semaphore::MAX_PERMITS.min(u32::MAX as usize))
+}
+
 impl UnsavedBudget {
     fn new(cap: usize) -> Arc<Self> {
-        let cap = cap.clamp(1, Semaphore::MAX_PERMITS.min(u32::MAX as usize));
+        let cap = unsaved_cap(cap);
         Arc::new(UnsavedBudget {
             permits: Arc::new(Semaphore::new(cap)),
             cap,

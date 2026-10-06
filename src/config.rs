@@ -209,10 +209,11 @@ impl Config {
         self.request_size.unwrap_or(DEFAULT_REQUEST_SIZE).max(1)
     }
 
-    /// headers the indexer fetches ahead of saving them, over every group at once
+    /// headers the indexer fetches ahead of saving them, over every group at
+    /// once: what the pool takes of the setting (`nntp::unsaved_cap`)
     pub fn max_unsaved_headers(&self) -> usize {
-        let n = self.max_unsaved_headers.unwrap_or(DEFAULT_MAX_UNSAVED_HEADERS).max(1);
-        usize::try_from(n).unwrap_or(usize::MAX)
+        let n = self.max_unsaved_headers.unwrap_or(DEFAULT_MAX_UNSAVED_HEADERS);
+        crate::nntp::unsaved_cap(usize::try_from(n).unwrap_or(usize::MAX))
     }
 
     /// article numbers of backfill left before a group's backfill is split
@@ -673,6 +674,16 @@ mod tests {
         // nonsense falls back to the default
         assert_eq!(cfg(json!({"max_unsaved_headers": 0})), DEFAULT_MAX_UNSAVED_HEADERS as usize);
         assert_eq!(cfg(json!({"max_unsaved_headers": -5})), DEFAULT_MAX_UNSAVED_HEADERS as usize);
+    }
+
+    /// A cap past what the pool can hold reads as what the pool holds, soo
+    /// the config reload (which compares the two) doesnt see a change every
+    /// time it looks.
+    #[test]
+    fn a_max_unsaved_headers_past_the_pools_limit_reads_as_the_pools_cap() {
+        let cfg = Config::from_value(&json!({"max_unsaved_headers": 1u64 << 62}));
+        let pool = crate::nntp::Pool::new(&[]).with_max_unsaved(cfg.max_unsaved_headers());
+        assert_eq!(cfg.max_unsaved_headers(), pool.max_unsaved());
     }
 
     #[test]
