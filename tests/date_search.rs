@@ -855,6 +855,52 @@ fn a_split_reaches_a_carrier_whose_low_mark_lags() {
     );
 }
 
+/// The article at the home cursor has a forged Date from 1990: no split is
+/// made of it (it would be one chunk for 2000-01-01 that no server keeps,
+/// and the group's history would never be indexed), the normal backfill goes on.
+#[test]
+fn a_forged_old_date_at_the_cursor_doesnt_split() {
+    let home = tempfile::tempdir().unwrap();
+    let main = home.path().join("atlas.db");
+    atlas::db::create_db_at(&main).unwrap();
+    // posts every hour for 10 days from 2026-01-01, the newest dated 1990
+    let start = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00+00:00").unwrap();
+    let posts = |offset: u64| -> Vec<common::Post> {
+        (0..240u64)
+            .map(|h| {
+                let when = match h {
+                    239 => "Mon, 01 Jan 1990 00:00:00 +0000".to_string(),
+                    _ => (start + chrono::Duration::hours(h as i64)).to_rfc2822(),
+                };
+                post_at(offset + h, &format!(r#""p{h}.bin" yEnc (1/1)"#), &when)
+            })
+            .collect()
+    };
+    let mut other = mock(spawn_server(Server::new(posts(10_001))), "secret", 2, 2);
+    other.host = "localhost".into();
+    let pool = BlockingPool::new(&[mock(spawn_server(Server::new(posts(1))), "secret", 2, 1), other]);
+    pool.connect().unwrap();
+
+    let ctx = atlas::indexer::PassContext {
+        pool: pool.pool.clone(),
+        states: Default::default(),
+        stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        verbose: false,
+    };
+    let db = atlas::indexer::shared_db(atlas::db::open_at(&main).unwrap());
+    let settings = atlas::indexer::PassSettings {
+        mode: "backfill".into(),
+        batch_size: 10,
+        request_size: 10,
+        split_min_backlog: 10,
+    };
+    let saved = pool.block_on(atlas::indexer::run_pass(&ctx, &settings, &db, GROUP, 0, &mut |_| {})).unwrap();
+
+    let conn = atlas::db::open_at(&main).unwrap();
+    assert!(!atlas::chunks::is_split(&conn, GROUP).unwrap(), "split from a forged date");
+    assert!(saved.articles > 0, "the normal backfill goes on");
+}
+
 /// A carrier that comes to keep more of the split's oldest day (from 01:00
 /// where the day was done from 18:00): the day isnt older, but it is to do
 /// again, by that carrier, soo 01:00 to 18:00 gets indexed.

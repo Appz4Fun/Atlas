@@ -1494,9 +1494,12 @@ impl Pool {
         Ok(None)
     }
 
-    /// When the first article at or after `number` on server `i` was posted (unix seconds).
-    pub async fn posted_date(&self, i: usize, group: &str, number: u64) -> Result<Option<i64>> {
-        Ok(self.posted_at(i, group, number, DATE_LOOK).await?.map(|(_, t)| t))
+    /// When the first and the last article in the `DATE_LOOK` numbers from
+    /// `number` on server `i` were posted (unix seconds), in one request.
+    /// Empty when there is none.
+    pub async fn posted_dates(&self, i: usize, group: &str, number: u64) -> Result<Vec<i64>> {
+        let ends = self.ends(i, group, number, number.saturating_add(DATE_LOOK - 1)).await?;
+        Ok(ends.first.into_iter().chain(ends.last).map(|(_, t)| t).collect())
     }
 
     /// The first article in `from..end` on server `i`, with its post time.

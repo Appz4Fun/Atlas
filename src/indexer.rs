@@ -506,10 +506,13 @@ async fn maybe_split(
         return Ok(false);
     }
 
-    // the newest day still to do is the post date at the home cursor
-    let split = match ctx.pool.posted_date(home, group, cursor).await? {
-        Some(t) => split_days(ctx, group, home, (first, last), crate::chunks::unix_day(t)).await?,
-        None => None,
+    // the newest day still to do is when the articles at the home cursor
+    // were posted
+    let at_cursor = ctx.pool.posted_dates(home, group, cursor).await?;
+    let split = if at_cursor.is_empty() {
+        None
+    } else {
+        split_days(ctx, group, home, (first, last), Newest::AtCursor(at_cursor)).await?
     };
     let Some(Split { newest_day, oldest_day, carriers, .. }) = split else {
         ctx.states.with(group, |st| st.no_split_until = Some(Instant::now() + SPLIT_RECHECK));
@@ -532,7 +535,9 @@ async fn reach_back(ctx: &PassContext, db: &Db, group: &str, home: usize, bounds
     let Some(newest_day) = on_db(db, move |conn| Ok(crate::chunks::newest_day(conn, &g)?)).await? else {
         return Ok(());
     };
-    let Some(Split { oldest_day, oldest_at, .. }) = split_days(ctx, group, home, bounds, newest_day).await? else {
+    let Some(Split { oldest_day, oldest_at, .. }) =
+        split_days(ctx, group, home, bounds, Newest::Day(newest_day)).await?
+    else {
         return Ok(());
     };
     let g = group.to_string();
@@ -553,24 +558,30 @@ struct Split {
     carriers: usize,
 }
 
-/// The days a split of `group` from `newest_day` covers and how many
-/// servers carry it. None when it cant split: home's first date is unknown
-/// or no other indexing server carries the group. `first` and `last` are
-/// home's low and high marks.
+/// Where a split of a group starts.
+enum Newest {
+    /// when the articles at the home cursor were posted (unix seconds), for a new split
+    AtCursor(Vec<i64>),
+    /// the newest day of a split there is (unix days)
+    Day(i64),
+}
+
+/// The days a split of `group` from `newest` covers and how many servers
+/// carry it. None when it cant split: home's first date is unknown, no
+/// other indexing server carries the group, or the dates make no sense (see
+/// `split_bounds`). `first` and `last` are home's low and high marks.
 async fn split_days(
     ctx: &PassContext,
     group: &str,
     home: usize,
     (first, last): (u64, u64),
-    newest_day: i64,
+    newest: Newest,
 ) -> Result<Option<Split>> {
-    use crate::chunks::unix_day;
-
     // the oldest day is at least home's first article. first articles are
     // searched for from the low marks, which can lag far behind what a
     // server still keeps
-    let Some(oldest) = ctx.pool.first_post(home, group, first, last).await? else { return Ok(None) };
-    let mut oldest_at = oldest;
+    let Some(home_oldest) = ctx.pool.first_post(home, group, first, last).await? else { return Ok(None) };
+    let mut oldest_at = home_oldest;
 
     // other servers are best effort: one that fails is left out. one that
     // carries the group counts, its oldest date only if it has one
@@ -582,23 +593,45 @@ async fn split_days(
             oldest_at = oldest_at.min(t);
         }
     }
+    if carriers < 2 {
+        return Ok(None);
+    }
 
-    let oldest_day = unix_day(oldest_at).min(newest_day);
-    let (newest_day, oldest_day) = clamp_days(newest_day, oldest_day, unix_day(chrono::Utc::now().timestamp()));
-    // a time clamped out of its day starts the day it was clamped to
+    let today = crate::chunks::unix_day(chrono::Utc::now().timestamp());
+    let Some((newest_day, oldest_day)) = split_bounds(&newest, home_oldest, oldest_at, today) else {
+        println!("[SPLIT] {group}: post dates that make no sense (forged Date headers?), the split is left as it is");
+        return Ok(None);
+    };
+    // a time from before its day (the split doesnt go further back than its
+    // newest day) starts the day
     let oldest_at = oldest_at.clamp(oldest_day * 86_400, (oldest_day + 1) * 86_400 - 1);
-    Ok((carriers >= 2).then_some(Split { newest_day, oldest_day, oldest_at, carriers }))
+    Ok(Some(Split { newest_day, oldest_day, oldest_at, carriers }))
 }
 
 /// 2000-01-01: binary retention doesnt reach further back than this
 const SPLIT_OLDEST_DAY: i64 = 10_957;
 
-/// A split's (newest, oldest) days kept between 2000-01-01 and `today`, soo a
-/// forged Date header cant make thousands of empty chunks.
-fn clamp_days(newest_day: i64, oldest_day: i64, today: i64) -> (i64, i64) {
-    // a clock set before 2000 mustnt panic the clamp
-    let newest = newest_day.clamp(SPLIT_OLDEST_DAY, today.max(SPLIT_OLDEST_DAY));
-    (newest, oldest_day.clamp(SPLIT_OLDEST_DAY, newest))
+/// A split's (newest, oldest) days from `newest`, home's first article
+/// (`home_oldest`) and the first of any carrier (`oldest_at`, unix seconds).
+/// Date headers are the posters' to forge, and a split made from a forged
+/// one would leave the group's history unindexed for good: a date at the
+/// cursor before 2000-01-01, after `today`, or more than a day before home's
+/// first article is left out (the latest left answers), and None when none
+/// is left or the oldest is before 2000-01-01. Clamping such a date into
+/// range would still make a bogus split.
+fn split_bounds(newest: &Newest, home_oldest: i64, oldest_at: i64, today: i64) -> Option<(i64, i64)> {
+    use crate::chunks::unix_day;
+    let newest_day = match newest {
+        Newest::AtCursor(times) => times
+            .iter()
+            .filter(|&&t| t >= home_oldest - 86_400)
+            .map(|&t| unix_day(t))
+            .filter(|day| (SPLIT_OLDEST_DAY..=today).contains(day))
+            .max()?,
+        Newest::Day(day) => *day,
+    };
+    let oldest_day = unix_day(oldest_at);
+    (oldest_day >= SPLIT_OLDEST_DAY).then_some((newest_day, oldest_day.min(newest_day)))
 }
 
 /// A day chunk's server doesnt carry its group (GROUP answered 411).
@@ -1258,13 +1291,24 @@ mod tests {
     }
 
     #[test]
-    fn split_days_stay_between_2000_and_today() {
-        let today = 20_400;
-        assert_eq!(clamp_days(20_000, 19_000, today), (20_000, 19_000), "sane dates stay");
-        assert_eq!(clamp_days(30_000, 19_000, today), (today, 19_000), "a date in the future");
-        assert_eq!(clamp_days(20_000, 0, today), (20_000, SPLIT_OLDEST_DAY), "a date from 1970");
-        assert_eq!(clamp_days(-5, -10, today), (SPLIT_OLDEST_DAY, SPLIT_OLDEST_DAY));
-        assert_eq!(clamp_days(20_000, 19_000, 0), (SPLIT_OLDEST_DAY, SPLIT_OLDEST_DAY), "a clock from 1970");
+    fn a_split_is_made_only_from_dates_that_make_sense() {
+        let (today, day) = (20_400, 86_400);
+        let home = 19_500 * day;
+        let at = |times: &[i64]| Newest::AtCursor(times.to_vec());
+        assert_eq!(split_bounds(&at(&[20_000 * day]), home, 19_000 * day, today), Some((20_000, 19_000)), "sane");
+        assert_eq!(split_bounds(&at(&[0]), home, 19_000 * day, today), None, "a date from 1970 at the cursor");
+        assert_eq!(split_bounds(&at(&[30_000 * day]), home, 19_000 * day, today), None, "one in the future");
+        assert_eq!(split_bounds(&at(&[19_000 * day]), home, 19_000 * day, today), None, "before home's first");
+        assert_eq!(split_bounds(&at(&[home - 3600]), home, home, today), Some((19_499, 19_499)), "roughly in order");
+        assert_eq!(
+            split_bounds(&at(&[0, 20_000 * day]), home, 19_000 * day, today),
+            Some((20_000, 19_000)),
+            "one forged date of two is left out"
+        );
+        assert_eq!(split_bounds(&at(&[20_000 * day]), home, 5 * day, today), None, "a carrier's first from 1970");
+        assert_eq!(split_bounds(&Newest::Day(20_000), home, 19_000 * day, today), Some((20_000, 19_000)));
+        assert_eq!(split_bounds(&Newest::Day(20_000), home, 5 * day, today), None);
+        assert_eq!(split_bounds(&at(&[20_000 * day]), home, 19_000 * day, 0), None, "a clock from 1970");
     }
 
     #[test]
