@@ -981,14 +981,22 @@ async fn drop_older_days(db: &Db, group: &str, day: i64) {
 /// window's oldest and the window's days held enough a day, chunks for the
 /// days before it, back to the server's first post (`oldest`). Best effort:
 /// a failure is only logged.
-async fn reach_further(db: &Db, group: &str, (day, floor, oldest): (i64, i64, Option<i64>), dated: i64) {
+async fn reach_further(db: &Db, group: &str, (_day, floor, oldest): (i64, i64, Option<i64>), dated: i64) {
     let first = oldest.map_or(floor, crate::chunks::unix_day);
     let g = group.to_string();
     let added = on_db(db, move |conn| {
         let Some(mut s) = crate::chunks::speculative(conn, &g)? else { return Ok(0) };
+        // a day of a window the reach has moved past is not the current one's
+        if floor != s.runner_up_day - s.reach {
+            return Ok(0);
+        }
         s.days += 1;
         s.articles += dated;
-        let further = day == floor && s.articles >= SPECULATIVE_YIELD * s.days && first < floor;
+        // the window is judged when its last day is done, not when its oldest is
+        let running = conn
+            .prepare_cached("select 1 from backfill_chunks where grp = ? and day >= ? and day < ? and state != 2")?
+            .exists(rusqlite::params![g, floor, floor + SPECULATIVE_WINDOW])?;
+        let further = !running && s.articles >= SPECULATIVE_YIELD * s.days && first < floor;
         if further {
             // each extension has to hold enough a day on its own: a dense
             // first window doesnt pay for the sparse ones after it
@@ -1759,6 +1767,51 @@ mod tests {
         reach_further(&db, g, (floor, floor, Some(0)), 1).await;
         let s = on_db(&db, move |c| Ok(crate::chunks::speculative(c, g)?)).await.unwrap().unwrap();
         assert_eq!(s.reach, 2 * SPECULATIVE_WINDOW);
+    }
+
+    #[test]
+    fn a_speculative_window_is_judged_once_every_day_of_it_is_done() {
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        rt.block_on(a_window_judged_when_done());
+    }
+
+    async fn a_window_judged_when_done() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        db::create_db_at(&main).unwrap();
+        let db = shared_db(db::open_at(&main).unwrap());
+        let (r, g) = (20_000, "g");
+        let floor = r - SPECULATIVE_WINDOW;
+        let start = crate::chunks::Speculative { runner_up_day: r, reach: SPECULATIVE_WINDOW, days: 0, articles: 0 };
+        on_db(&db, move |c| {
+            // three days of the window, one older
+            crate::chunks::add(c, g, floor + 2, floor)?;
+            Ok(crate::chunks::set_speculative(c, g, &start)?)
+        })
+        .await
+        .unwrap();
+        let window = || on_db(&db, move |c| Ok(crate::chunks::speculative(c, g)?.unwrap()));
+        let done =
+            |day: i64| on_db(&db, move |c| Ok(c.execute("update backfill_chunks set state = 2 where day = ?", [day])?));
+
+        // the floor day is done and dense, the rest of the window is still running
+        done(floor).await.unwrap();
+        reach_further(&db, g, (floor, floor, Some(0)), 100_000).await;
+        let s = window().await.unwrap();
+        assert_eq!((s.reach, s.days, s.articles), (SPECULATIVE_WINDOW, 1, 100_000), "counted, not judged yet");
+
+        // the last one in judges the window on all of them
+        done(floor + 1).await.unwrap();
+        reach_further(&db, g, (floor + 1, floor, Some(0)), 1).await;
+        done(floor + 2).await.unwrap();
+        reach_further(&db, g, (floor + 2, floor, Some(0)), 1).await;
+        let s = window().await.unwrap();
+        assert_eq!((s.reach, s.days, s.articles), (2 * SPECULATIVE_WINDOW, 0, 0));
+
+        // a day of the window before it, finishing late, is not the new window's
+        reach_further(&db, g, (floor + 2, floor, Some(0)), 100_000).await;
+        let s = window().await.unwrap();
+        assert_eq!((s.reach, s.days, s.articles), (2 * SPECULATIVE_WINDOW, 0, 0), "ignored");
     }
 
     #[test]
