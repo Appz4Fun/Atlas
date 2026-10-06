@@ -24,6 +24,7 @@ use std::time::Instant;
 use anyhow::{Context, Result, anyhow, bail};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 
+use crate::compact::{checkpoint, rename_db};
 use crate::db;
 use crate::parser::Article;
 use crate::search::{ArticleRow, ReleaseRow};
@@ -119,33 +120,32 @@ pub fn run(main: &Path, progress: &dyn Fn(&str)) -> Result<(i64, i64)> {
     progress("converting the database: checking NZBs against the old database");
     check(main, &old, max_id, &shard_of_old)?;
 
-    // 5. the swap
+    // 5. the swap. every checkpoint has to fold its whole WAL in: one held
+    // back (a reader, a writer) leaves committed pages only in the WAL
     {
         let conn = db::open_at(&new_main)?;
         store::set_next_seq(&conn, max_id + 1)?;
-        conn.query_row("pragma wal_checkpoint(truncate)", [], |_| Ok(()))?;
+        checkpoint(&conn).context("folding the new main database's WAL in")?;
     }
     for path in store::shard_paths(main) {
         let conn = db::open_at(&path)?;
         conn.query_row("pragma journal_mode = wal", [], |_| Ok(()))?;
-        conn.query_row("pragma wal_checkpoint(truncate)", [], |_| Ok(()))?;
+        checkpoint(&conn).with_context(|| format!("folding {}'s WAL in", path.display()))?;
     }
     drop(old);
     let backup = sibling(main, "atlas.old.db");
     remove_db(&backup);
     {
-        // fold the old wal in soo atlas.old.db is whole on its own
+        // fold the old wal in soo atlas.old.db is whole on its own. nothing
+        // else should have it open (the conversion runs alone), soo a short
+        // wait: whoever does keeps the old database in place
         let conn = db::open_at(main)?;
-        conn.query_row("pragma wal_checkpoint(truncate)", [], |_| Ok(()))?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        checkpoint(&conn).context("folding the old database's WAL in")?;
     }
-    std::fs::rename(main, &backup).context("moving the old database aside")?;
-    for suffix in ["-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{}{suffix}", main.display()));
-    }
-    std::fs::rename(&new_main, main).context("putting the new main database in place")?;
-    for suffix in ["-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{}{suffix}", new_main.display()));
-    }
+    // its -wal and -shm go aside with it, whatever they still hold
+    rename_db(main, &backup).context("moving the old database aside")?;
+    rename_db(&new_main, main).context("putting the new main database in place")?;
 
     progress(&format!(
         "converted {moved_releases} releases and {moved_articles} articles in {} ({orphans} articles without a release left out). \

@@ -53,7 +53,7 @@ fn remove_db(path: &Path) {
 /// Fold the WAL of `conn`'s database into it, all of it: a checkpoint held
 /// back (a reader, a writer) leaves committed pages only in the WAL, soo it
 /// is an error rather than taken for done.
-fn checkpoint(conn: &Connection) -> Result<()> {
+pub(crate) fn checkpoint(conn: &Connection) -> Result<()> {
     let (busy, log, done): (i64, i64, i64) =
         conn.query_row("pragma wal_checkpoint(truncate)", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
     if busy != 0 || log != done {
@@ -64,7 +64,7 @@ fn checkpoint(conn: &Connection) -> Result<()> {
 
 /// Rename the database `from` to `to`, its -wal and -shm with it (those
 /// there are): the WAL can hold committed pages of it.
-fn rename_db(from: &Path, to: &Path) -> std::io::Result<()> {
+pub(crate) fn rename_db(from: &Path, to: &Path) -> std::io::Result<()> {
     std::fs::rename(from, to)?;
     for suffix in ["-wal", "-shm"] {
         let (a, b) = (format!("{}{suffix}", from.display()), format!("{}{suffix}", to.display()));

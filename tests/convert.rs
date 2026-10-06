@@ -318,3 +318,36 @@ fn an_indexer_converting_at_start_runs_alone() {
     drop(indexing);
     assert_eq!(convert::run_alone(&main, &|_| {}).unwrap(), None);
 }
+
+/// The swap folds the old database's WAL in before moving it aside as
+/// atlas.old.db; a checkpoint a reader holds back (committed pages left only
+/// in the WAL) refuses the swap instead of leaving a backup missing them.
+#[test]
+fn a_swap_whose_checkpoint_is_held_back_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = dir.path().join("atlas.db");
+    old_database(&main);
+    db::create_db_at(&main).unwrap();
+
+    // a reader's snapshot keeps the write after it in the WAL
+    let writer = Connection::open(&main).unwrap();
+    writer.execute_batch("pragma wal_autocheckpoint = 0").unwrap();
+    let reader = Connection::open(&main).unwrap();
+    reader.execute_batch("begin; select count(*) from releases").unwrap();
+    writer.execute_batch("create table late (x); insert into late values (7)").unwrap();
+
+    let err = convert::run(&main, &|_| {}).unwrap_err();
+    assert!(format!("{err:#}").contains("checkpoint"), "{err:#}");
+    assert!(convert::needed(&main), "the old database is still in place");
+    assert!(!dir.path().join("atlas.old.db").exists());
+
+    // once the reader is gone the swap goes through, and the backup has the late write
+    reader.execute_batch("commit").unwrap();
+    drop((reader, writer));
+    convert::run(&main, &|_| {}).unwrap();
+    let late: i64 = Connection::open(dir.path().join("atlas.old.db"))
+        .unwrap()
+        .query_row("select x from late", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(late, 7);
+}
