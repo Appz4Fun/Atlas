@@ -382,7 +382,15 @@ pub struct PassContext {
 /// `server_keys`). One server keeps the plain
 /// group name like before.
 fn cursor_key(pool: &Pool, server: usize, group: &str) -> String {
-    if pool.len() <= 1 { group.to_string() } else { format!("{group}@{}", pool.host(server).to_lowercase()) }
+    if pool.len() <= 1 {
+        return group.to_string();
+    }
+    // only the host (and port) is case-insensitive, an explicit `#key` isnt
+    let host = pool.host(server);
+    match host.split_once('#') {
+        Some((h, k)) => format!("{group}@{}#{k}", h.to_lowercase()),
+        None => format!("{group}@{}", host.to_lowercase()),
+    }
 }
 
 async fn load_cursors(
@@ -1702,6 +1710,21 @@ impl Indexer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `#key`s that differ by case are two servers, and the host in a key is
+    /// lowercased as before
+    #[test]
+    fn cursor_keys_keep_the_case_of_a_servers_key() {
+        let mut upper = crate::config::UsenetServer::new("A.Example", "u", "p", 563);
+        upper.key = Some("Block".into());
+        let mut lower = upper.clone();
+        lower.key = Some("block".into());
+        let plain = crate::config::UsenetServer::new("B.Example", "u", "p", 563);
+        let pool = Pool::new(&[upper, lower, plain]);
+        assert_eq!(cursor_key(&pool, 0, "g"), "g@a.example#Block");
+        assert_eq!(cursor_key(&pool, 1, "g"), "g@a.example#block");
+        assert_eq!(cursor_key(&pool, 2, "g"), "g@b.example");
+    }
 
     #[test]
     fn each_speculative_window_has_to_hold_enough_on_its_own() {
