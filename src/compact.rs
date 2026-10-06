@@ -601,9 +601,14 @@ fn compact_shard(
             // the rest of a file too big to buffer, a row at a time, a copy of
             // a row before it dropped the same way
             let (mut tail_bytes, mut tail_copies) = (0i64, 0i64);
+            #[cfg(test)]
+            let held_before_tail = held.len();
+            // `held` (the blob and the buffered rows, bounded) isnt added to:
+            // a tail copy of a tail row is found in the copy database instead
             while let Some(row) = pending.take_if(|r| r.file_id == id) {
-                if held.insert(dedup_key(&mut suffix_of, &row.local, row.domain)?) {
-                    copied += insert_row(&tx, &row)?;
+                let key = dedup_key(&mut suffix_of, &row.local, row.domain)?;
+                if !held.contains(&key) && !has_other_form(&tx, &row, &key)? && insert_row(&tx, &row)? == 1 {
+                    copied += 1;
                 } else {
                     (tail_bytes, tail_copies) = (tail_bytes + row.bytes.unwrap_or(0), tail_copies + 1);
                 }
@@ -618,6 +623,8 @@ fn compact_shard(
                 }
                 pending = next_row(shard, &mut rows, &shared)?;
             }
+            #[cfg(test)]
+            TAIL_HELD_GROWTH.fetch_max(held.len() - held_before_tail, Ordering::Relaxed);
             if tail_copies > 0 {
                 store::uncount_copies(&tx, f.get(1)?, tail_bytes, tail_copies)?;
                 copies += tail_copies;
@@ -748,6 +755,32 @@ fn dedup_key(suffix_of: &mut rusqlite::Statement, local: &[u8], domain: i64) -> 
         if domain == 0 { None } else { suffix_of.query_row([domain], |r| r.get(0)).optional()? };
     Ok(store::dedup_key(local, domain, suffix.as_deref()))
 }
+
+/// The copy already has `r`'s file's article `key` stored the other way: whole
+/// when `r` is packed under a domain, or packed under its domain (one the copy
+/// kept) when `r` is whole. The same way is the segments key's to catch.
+fn has_other_form(conn: &Connection, r: &Row, key: &str) -> Result<bool> {
+    let other = if r.domain != 0 {
+        Some((store::whole(key), 0))
+    } else if let Some((local, suffix)) = store::split_message_id(key) {
+        conn.prepare_cached("select id from domains where suffix = ?")?
+            .query_row([suffix], |x| x.get::<_, i64>(0))
+            .optional()?
+            .map(|d| (store::pack_local(local), d))
+    } else {
+        None
+    };
+    let Some((local, domain)) = other else { return Ok(false) };
+    Ok(conn
+        .prepare_cached("select 1 from segments where file_id = ? and local = ? and domain = ?")?
+        .query_row(params![r.file_id, local, domain], |_| Ok(()))
+        .optional()?
+        .is_some())
+}
+
+/// the most ids `compact_shard` added to `held` while streaming a file's tail
+#[cfg(test)]
+static TAIL_HELD_GROWTH: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// 1 when the row went in, 0 when the copy already had it
 fn insert_row(conn: &Connection, r: &Row) -> Result<i64> {
@@ -1562,6 +1595,60 @@ mod tests {
         let rows: i64 =
             conn.query_row("select count(*) from segments where file_id = ?", [file], |r| r.get(0)).unwrap();
         assert_eq!(rows, store::SEAL_MAX_SEGMENTS + 2, "the padding and one long row");
+    }
+
+    /// A file a poster padded with millions of rows: the streamed tail is
+    /// deduplicated against the copy itself, not a set of every id it has,
+    /// and an article stored both whole and packed in the tail is one row.
+    #[test]
+    fn a_huge_files_tail_is_deduplicated_without_holding_its_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        legacy_fixture(&main);
+        run(&main, &|_| {}, &no_stop()).unwrap();
+        let (path, file) = file_of(&main, "Rel.1", "alt.binaries.g1");
+        let tail = store::SEAL_MAX_SEGMENTS + 100;
+        {
+            let conn = db::open_at(&path).unwrap();
+            let d: i64 = conn.query_row("select id from domains where suffix = '@ngPost>'", [], |r| r.get(0)).unwrap();
+            // whole ids sorting before the two copies below, well past what a blob takes
+            conn.execute(
+                "with recursive n(i) as (select 1 union all select i + 1 from n where i < ?2)
+                 insert into segments (file_id, local, domain, part, bytes)
+                 select ?1, cast(x'00' || cast('!' || i as blob) as blob), 0, 100 + i, 1 from n",
+                params![file, tail],
+            )
+            .unwrap();
+            // one article twice: whole, and packed under its shared domain
+            conn.execute(
+                "insert into segments (file_id, local, domain, part, bytes) values (?, ?, 0, 99, 5)",
+                params![file, store::whole("<zzz9@ngPost>")],
+            )
+            .unwrap();
+            conn.execute(
+                "insert into segments (file_id, local, domain, part, bytes) values (?, ?, ?, 99, 5)",
+                params![file, store::pack_local("zzz9"), d],
+            )
+            .unwrap();
+            conn.execute(
+                "update releases set size = size + 10 + ?2, parts = parts + 2 + ?2
+                 where id = (select release_id from files where id = ?1)",
+                params![file, tail],
+            )
+            .unwrap();
+            store::add_totals(&conn, 0, 2 + tail).unwrap();
+        }
+        let count = article_total(&main);
+        let totals = release_totals(&path, file);
+
+        run(&main, &|_| {}, &no_stop()).unwrap();
+        assert_eq!(TAIL_HELD_GROWTH.load(Ordering::Relaxed), 0, "no id of the tail was held");
+        assert_eq!(article_total(&main), count - 1, "the copy went out of the shard's total");
+        assert_eq!(release_totals(&path, file), (totals.0 - 5, totals.1 - 1, totals.2 - 1), "and the release's");
+        let conn = db::open_at(&path).unwrap();
+        let rows: i64 =
+            conn.query_row("select count(*) from segments where file_id = ?", [file], |r| r.get(0)).unwrap();
+        assert_eq!(rows, tail + 1, "the padding and the article once");
     }
 
     #[test]
