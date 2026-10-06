@@ -82,7 +82,8 @@ pub fn add(conn: &Connection, group: &str, newest_day: i64, oldest_day: i64) -> 
 /// before the split's oldest one back to `oldest_day`. The old oldest day
 /// was done (if it was) only from where the server going back furthest then
 /// started: it is to do again, and that server is forgotten (see `deepest`).
-/// A claim on it is cleared too, so its worker's finish does nothing.
+/// A claim on it is cleared too, so its worker's finish does nothing, and
+/// the carriers' sweeps are to do again.
 /// Also when `oldest_day` is the oldest day but `oldest_at` is before where
 /// that server started in it. Returns the chunks added or to do again.
 pub fn reach_back(conn: &Connection, group: &str, oldest_day: i64, oldest_at: i64) -> Result<usize> {
@@ -116,6 +117,8 @@ pub fn reach_back(conn: &Connection, group: &str, oldest_day: i64, oldest_at: i6
         params![group, old],
     )?;
     tx.execute("delete from backfill_deepest where grp = ?", [group])?;
+    // a carrier's sweep stopped at its first article then: it may keep older ones now
+    tx.execute("delete from backfill_sweeps where grp = ?", [group])?;
     tx.commit()?;
     Ok(added + redo)
 }
@@ -404,6 +407,25 @@ mod tests {
         assert_eq!(progress(&c, "g").unwrap(), (0, 3));
         // and the next to claim it is not a stale claim's
         assert_eq!(day(claim(&c, &groups, "b", 1001)), Some(10));
+    }
+
+    /// a carrier swept down to its first article before the split reached
+    /// back sweeps again: its first article may be older now
+    #[test]
+    fn reaching_back_undoes_the_sweeps() {
+        let c = conn();
+        add(&c, "g", 12, 10).unwrap();
+        c.execute("update backfill_chunks set state = 2", []).unwrap();
+        set_deepest(&c, "g", "a", 10 * 86_400 + 18 * 3600).unwrap();
+        set_swept(&c, "g", "b").unwrap();
+        set_swept(&c, "other", "b").unwrap();
+
+        assert_eq!(reach_back(&c, "g", 10, 10 * 86_400 + 20 * 3600).unwrap(), 0, "not further");
+        assert!(swept(&c, "g", "b").unwrap(), "kept when nothing changed");
+
+        assert_eq!(reach_back(&c, "g", 9, 9 * 86_400).unwrap(), 2);
+        assert!(!swept(&c, "g", "b").unwrap(), "to sweep again");
+        assert!(swept(&c, "other", "b").unwrap(), "other groups' sweeps stay");
     }
 
     #[test]
