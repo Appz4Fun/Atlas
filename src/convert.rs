@@ -35,6 +35,8 @@ use crate::store::{self, SHARDS};
 const BATCH: usize = 25_000;
 /// releases whose NZBs are compared before the swap
 const CHECK_SAMPLE: i64 = 2_000;
+/// and the newest releases on top
+const CHECK_TAIL: i64 = 200;
 /// threads reading the old articles at once
 const READERS: usize = 8;
 
@@ -96,7 +98,8 @@ pub fn run(main: &Path, progress: &dyn Fn(&str)) -> Result<(i64, i64)> {
 
     // a run that got through the copy and was stopped during the check
     // picks up there instead of copying everything again
-    let (max_id, shard_of_old, moved_releases, moved_articles, orphans) = if copy_finished(main) {
+    let source = Source::of(&old)?;
+    let (max_id, shard_of_old, moved_releases, moved_articles, orphans) = if copy_finished(main, &source) {
         progress("converting the database: the copy finished earlier, checking it");
         let max_id: i64 = old.query_row("select coalesce(max(id), 0) from releases", [], |r| r.get(0))?;
         let mut shard_of_old = vec![u8::MAX; max_id as usize + 1];
@@ -113,7 +116,7 @@ pub fn run(main: &Path, progress: &dyn Fn(&str)) -> Result<(i64, i64)> {
         let (releases, articles) = store::totals(&conn)?;
         (max_id, shard_of_old, releases, articles, 0)
     } else {
-        copy(main, &old, started, progress)?
+        copy(main, &old, &source, started, progress)?
     };
 
     // 4. the check
@@ -464,8 +467,8 @@ fn move_articles(
     })
 }
 
-/// Compare `CHECK_SAMPLE` releases, spread over the whole database, between
-/// the old database and the shards.
+/// Compare `CHECK_SAMPLE` releases, spread over the whole database, and the
+/// newest `CHECK_TAIL` between the old database and the shards.
 fn check(main: &Path, old: &Connection, max_id: i64, shard_of_old: &[u8]) -> Result<()> {
     let new = Connection::open_in_memory()?;
     store::attach(&new, main)?;
@@ -494,10 +497,18 @@ fn check(main: &Path, old: &Connection, max_id: i64, shard_of_old: &[u8]) -> Res
         })
     };
 
+    // spread over the ids, and the newest ones: the last written are the
+    // likeliest to be missing from a copy
+    let tail: Vec<i64> = old
+        .prepare("select id from releases order by id desc limit ?")?
+        .query_map([CHECK_TAIL], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    let starts = (0..CHECK_SAMPLE).map(|i| i * step).chain(tail);
+
     let (mut checked, mut bad) = (0, Vec::new());
     let mut seen = std::collections::HashSet::new();
-    for i in 0..CHECK_SAMPLE {
-        let Ok(was) = old_release.query_row([i * step], row) else { continue };
+    for start in starts {
+        let Ok(was) = old_release.query_row([start], row) else { continue };
         if !seen.insert(was.id) {
             continue;
         }
@@ -560,6 +571,7 @@ fn check(main: &Path, old: &Connection, max_id: i64, shard_of_old: &[u8]) -> Res
 fn copy(
     main: &Path,
     old: &Connection,
+    source: &Source,
     started: Instant,
     progress: &dyn Fn(&str),
 ) -> Result<(i64, Vec<u8>, i64, i64, i64)> {
@@ -582,6 +594,7 @@ fn copy(
         let list = cols.join(", ");
         conn.execute(&format!("insert into groups ({list}) select {list} from old.groups"), [])?;
         conn.execute("detach database old", [])?;
+        source.save(&conn)?;
     }
 
     // fresh shards (a failed run leaves its own behind). releases go in without
@@ -632,10 +645,51 @@ fn copy(
     Ok((max_id, shard_of_old, moved_releases, moved_articles, orphans))
 }
 
-/// The shards are complete from an earlier run: every shard writer marks its
-/// shard once its articles are sorted into place.
-fn copy_finished(main: &Path) -> bool {
-    sibling(main, "atlas.new.db").exists()
+/// What the old database held when a copy started: its release and article
+/// counts and highest ids. A copy is only picked up again from the same old
+/// database; one written to or put back from another backup since differs.
+#[derive(Debug, PartialEq)]
+struct Source([i64; 4]);
+
+const SOURCE_KEYS: [&str; 4] = ["source_releases", "source_max_release", "source_articles", "source_max_article"];
+
+impl Source {
+    fn of(old: &Connection) -> Result<Source> {
+        let (releases, max_release) =
+            old.query_row("select count(*), coalesce(max(id), 0) from releases", [], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        let (articles, max_article) =
+            old.query_row("select count(*), coalesce(max(id), 0) from articles", [], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(Source([releases, max_release, articles, max_article]))
+    }
+
+    /// into the new main database's meta, as the copy starts
+    fn save(&self, conn: &Connection) -> Result<()> {
+        for (key, value) in SOURCE_KEYS.iter().zip(self.0) {
+            conn.execute("insert or replace into meta (key, value) values (?, ?)", params![key, value])?;
+        }
+        Ok(())
+    }
+
+    fn saved(conn: &Connection) -> Result<Option<Source>> {
+        let mut values = [0; 4];
+        for (key, value) in SOURCE_KEYS.iter().zip(values.iter_mut()) {
+            let Some(v) = conn.query_row("select value from meta where key = ?", [key], |r| r.get(0)).optional()?
+            else {
+                return Ok(None);
+            };
+            *value = v;
+        }
+        Ok(Some(Source(values)))
+    }
+}
+
+/// The shards are complete from an earlier run, copied from the old database
+/// as it is now (`source`): every shard writer marks its shard once its
+/// articles are sorted into place.
+fn copy_finished(main: &Path, source: &Source) -> bool {
+    let new_main = sibling(main, "atlas.new.db");
+    new_main.exists()
+        && db::open_at(&new_main).ok().and_then(|c| Source::saved(&c).ok().flatten()).as_ref() == Some(source)
         && store::shard_paths(main).iter().all(|p| {
             p.exists()
                 && db::open_at(p)

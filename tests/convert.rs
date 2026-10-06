@@ -351,3 +351,46 @@ fn a_swap_whose_checkpoint_is_held_back_is_refused() {
         .unwrap();
     assert_eq!(late, 7);
 }
+
+/// A conversion that finished copying and was stopped before the swap only
+/// picks up from that copy while the old database is the one it copied: one
+/// written to (or put back from another backup) since is copied again, soo
+/// nothing added to it is left out.
+#[test]
+fn a_stopped_conversion_copies_again_when_the_old_database_changed() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = dir.path().join("atlas.db");
+    old_database(&main);
+    db::create_db_at(&main).unwrap();
+
+    let stopped = std::panic::catch_unwind(|| {
+        convert::run(&main, &|m| assert!(!m.contains("checking NZBs"), "stop here")).unwrap();
+    });
+    assert!(stopped.is_err());
+
+    // the old database gets a newer release after the copy
+    {
+        let conn = Connection::open(&main).unwrap();
+        conn.execute(
+            "insert into releases (id, name, group_name, poster, posted_date, size, complete, parts, file_total)
+             values (500, 'Late.Release', 'alt.binaries.a', 'p', '2026-10-03 10:00:00', 9, 1, 1, 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "insert into articles (release_id, message_id, subject, filename, part, total_parts, bytes, file_total)
+             values (500, '<late@x>', 's', 'late.bin', 1, 1, 9, 1)",
+            [],
+        )
+        .unwrap();
+    }
+
+    let messages = std::cell::RefCell::new(Vec::new());
+    let (releases, articles) = convert::run(&main, &|m| messages.borrow_mut().push(m.to_string())).unwrap();
+    assert!(!messages.borrow().iter().any(|m| m.contains("copy finished earlier")), "{messages:?}");
+    assert_eq!(releases, 41);
+    assert_eq!(articles, (1..=40).map(|r| r % 7 + 1).sum::<i64>() + 1);
+    let conn = db::open_with_shards(&main).unwrap();
+    let id: i64 = conn.query_row("select id from releases where name = 'Late.Release'", [], |r| r.get(0)).unwrap();
+    assert_eq!(store::articles(&conn, id).unwrap().len(), 1);
+}
