@@ -15,7 +15,6 @@ use common::{Server, mock, par2_file_desc, post, spawn_server, yenc_body};
 
 const POSTS: u64 = 400;
 const REQUEST: u64 = 20;
-const GROUPS: usize = 16;
 const BATCH: u64 = 100;
 
 /// `POSTS` articles in releases of one slice each, every release with a par2,
@@ -39,9 +38,9 @@ fn busy_server() -> Arc<Server> {
     s
 }
 
-/// Every group indexed to the end at once, on two servers of two
+/// `groups` groups indexed to the end at once, on two servers of two
 /// connections each, with room for `cap` unsaved headers.
-fn index_everything(cap: usize) {
+fn index_everything(cap: usize, groups: usize) {
     let servers = [busy_server(), busy_server()];
     let ports: Vec<u16> = servers.iter().map(|s| spawn_server(s.clone())).collect();
     let pool =
@@ -69,7 +68,7 @@ fn index_everything(cap: usize) {
     let saved: Vec<i64> = rt.block_on(async {
         pool.connect().await.unwrap();
         let mut passes = tokio::task::JoinSet::new();
-        for g in 0..GROUPS {
+        for g in 0..groups {
             let (ctx, settings, db) = (ctx.clone(), settings.clone(), db.clone());
             passes.spawn(async move {
                 let group = format!("alt.binaries.cap{g}");
@@ -94,11 +93,11 @@ fn index_everything(cap: usize) {
         tokio::time::timeout(Duration::from_secs(60), all).await.expect("the passes are stuck")
     });
 
-    assert_eq!(saved, vec![POSTS as i64; GROUPS], "every article saved once, per group");
+    assert_eq!(saved, vec![POSTS as i64; groups], "every article saved once, per group");
     // slices no bigger than the budget, in passes of BATCH
     let slice = REQUEST.min(cap as u64);
     let xovers: usize = servers.iter().map(|s| s.xovers.load(Ordering::SeqCst)).sum();
-    assert_eq!(xovers, GROUPS * (POSTS / BATCH * BATCH.div_ceil(slice)) as usize, "every slice fetched once");
+    assert_eq!(xovers, groups * (POSTS / BATCH * BATCH.div_ceil(slice)) as usize, "every slice fetched once");
 
     let peak = pool.unsaved_peak();
     assert!(peak <= cap, "{peak} headers unsaved at once, the cap is {cap}");
@@ -110,17 +109,20 @@ fn index_everything(cap: usize) {
     let (releases, named): (i64, i64) = conn
         .query_row("select count(*), count(display_name) from releases", [], |r| Ok((r.get(0)?, r.get(1)?)))
         .unwrap();
-    assert_eq!((releases, named), ((GROUPS as u64 * POSTS / REQUEST) as i64, releases));
+    assert_eq!((releases, named), ((groups as u64 * POSTS / REQUEST) as i64, releases));
 }
 
 /// Two slices' worth for 16 passes of up to two connections each.
 #[test]
 fn many_passes_share_a_budget_of_two_slices() {
-    index_everything(2 * REQUEST as usize);
+    index_everything(2 * REQUEST as usize, 16);
 }
 
-/// A budget smaller than one slice: the slices are cut down to it.
+/// A budget smaller than one slice: the slices are cut down to it. Only one
+/// slice fits at a time, soo every slice of every pass goes one after another
+/// (fetch, then save): four passes, still more than the four connections and
+/// both servers, keep it to a few hundred slices.
 #[test]
 fn a_budget_smaller_than_a_slice_still_gets_through() {
-    index_everything(7);
+    index_everything(7, 4);
 }
