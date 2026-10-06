@@ -617,8 +617,9 @@ const SPLIT_OLDEST_DAY: i64 = 10_957;
 /// one would leave the group's history unindexed for good: a date at the
 /// cursor before 2000-01-01, after `today`, or more than a day before home's
 /// first article is left out (the latest left answers), and None when none
-/// is left or the oldest is before 2000-01-01. Clamping such a date into
-/// range would still make a bogus split.
+/// is left, the oldest is before 2000-01-01 or the newest day is before the
+/// oldest. Clamping such a date into range would still make a bogus split
+/// (a too old chunk every carrier gives back).
 fn split_bounds(newest: &Newest, home_oldest: i64, oldest_at: i64, today: i64) -> Option<(i64, i64)> {
     use crate::chunks::unix_day;
     let newest_day = match newest {
@@ -631,7 +632,7 @@ fn split_bounds(newest: &Newest, home_oldest: i64, oldest_at: i64, today: i64) -
         Newest::Day(day) => *day,
     };
     let oldest_day = unix_day(oldest_at);
-    (oldest_day >= SPLIT_OLDEST_DAY).then_some((newest_day, oldest_day.min(newest_day)))
+    (oldest_day >= SPLIT_OLDEST_DAY && newest_day >= oldest_day).then_some((newest_day, oldest_day))
 }
 
 /// A day chunk's server doesnt carry its group (GROUP answered 411).
@@ -1299,7 +1300,14 @@ mod tests {
         assert_eq!(split_bounds(&at(&[0]), home, 19_000 * day, today), None, "a date from 1970 at the cursor");
         assert_eq!(split_bounds(&at(&[30_000 * day]), home, 19_000 * day, today), None, "one in the future");
         assert_eq!(split_bounds(&at(&[19_000 * day]), home, 19_000 * day, today), None, "before home's first");
-        assert_eq!(split_bounds(&at(&[home - 3600]), home, home, today), Some((19_499, 19_499)), "roughly in order");
+        assert_eq!(split_bounds(&at(&[home - 3600]), home, home, today), None, "newest day before the oldest");
+        assert_eq!(split_bounds(&at(&[home - 3600]), home, home - 7200, today), Some((19_499, 19_499)), "same day");
+        assert_eq!(
+            split_bounds(&at(&[19_499 * day]), home - day, 19_500 * day, today),
+            None,
+            "a day before the oldest"
+        );
+        assert_eq!(split_bounds(&Newest::Day(19_000), home, 19_100 * day, today), None, "a split's newest day too");
         assert_eq!(
             split_bounds(&at(&[0, 20_000 * day]), home, 19_000 * day, today),
             Some((20_000, 19_000)),
