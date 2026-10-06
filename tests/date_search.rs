@@ -222,6 +222,29 @@ fn a_small_cluster_between_spread_out_windows_is_found_going_forward() {
     assert_eq!(at("2026-01-02T00:00:00+00:00"), 100_000);
 }
 
+/// Articles only in numbers the spread out windows step over, none where
+/// any window lands: the search finds them instead of taking the range for
+/// empty (a server whose history is all there would look like it has none).
+#[test]
+fn articles_only_between_spread_out_windows_are_found() {
+    // five posts at 20,000, then nothing till a run at 190,000
+    let mut posts = minutely(20_000..=20_004, "2026-01-02T00:00:00+00:00");
+    posts.extend(minutely(190_000..=190_100, "2026-01-03T00:00:00+00:00"));
+    let port = spawn_server(Server::new(posts));
+    let pool = BlockingPool::new(&[mock(port, "secret", 2, 1)]);
+    pool.connect().unwrap();
+
+    // going forward: every window in 1..=100,000 is empty
+    let first = pool.block_on(pool.pool.first_post(0, GROUP, 1, 100_000)).unwrap();
+    assert_eq!(first, Some(unix("2026-01-02T00:00:00+00:00")), "the cluster's first post");
+    // going backward from the middle (a hole up to the run): the cluster is
+    // the last article before it, every window short of it is empty
+    let at = |when: &str| pool.block_on(pool.pool.article_at(0, GROUP, 1, 190_100, unix(when))).unwrap();
+    assert_eq!(at("2026-01-01T00:00:00+00:00"), 20_000);
+    assert_eq!(at("2026-01-02T00:03:00+00:00"), 20_003);
+    assert_eq!(at("2026-01-02T12:00:00+00:00"), 190_000);
+}
+
 /// The same going backwards: a few articles in the numbers the spread out
 /// windows step over, after the articles they land on, are still the last
 /// before the hole.
