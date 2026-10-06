@@ -473,6 +473,27 @@ fn a_swap_cut_after_the_old_database_moved_aside_is_finished_at_start() {
     assert_eq!(store::totals(&conn).unwrap().0, before.len() as i64);
 }
 
+/// `--convert` after a swap cut short: atlas.db is missing, soo it isnt
+/// `needed`, yet there is work: the swap is finished, not "nothing to convert".
+#[test]
+fn a_convert_after_a_cut_swap_finishes_the_swap() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = dir.path().join("atlas.db");
+    old_database(&main);
+    let before = old_nzbs(&main);
+    db::create_db_at(&main).unwrap();
+    convert::run(&main, &|_| {}).unwrap();
+    std::fs::rename(&main, dir.path().join("atlas.new.db")).unwrap();
+
+    assert!(!convert::needed(&main));
+    assert!(convert::to_do(&main), "the cut swap is something to do");
+    assert_eq!(convert::run_alone(&main, &|_| {}).unwrap(), None);
+    assert!(!dir.path().join("atlas.new.db").exists());
+    assert!(!convert::to_do(&main), "and done");
+    let conn = db::open_with_shards(&main).unwrap();
+    assert_eq!(store::totals(&conn).unwrap().0, before.len() as i64);
+}
+
 /// Moved aside with a new main database that never got to the swap: the
 /// next start puts the old database back, and converting goes on from it.
 #[test]

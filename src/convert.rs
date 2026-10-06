@@ -46,6 +46,14 @@ pub fn needed(main: &Path) -> bool {
     main.exists() && db::open_at(main).and_then(|c| db::has_old_layout(&c)).unwrap_or(false)
 }
 
+/// Whether `--convert` has anything to do: a conversion `needed`, or a swap
+/// cut short (atlas.db missing next to atlas.new.db or atlas.old.db) for
+/// `run_alone` to finish or undo first.
+pub fn to_do(main: &Path) -> bool {
+    needed(main)
+        || (!main.exists() && (sibling(main, "atlas.new.db").exists() || sibling(main, "atlas.old.db").exists()))
+}
+
 fn sibling(main: &Path, name: &str) -> PathBuf {
     main.with_file_name(name)
 }

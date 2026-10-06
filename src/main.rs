@@ -37,7 +37,8 @@ fn main() -> ExitCode {
 /// `--convert`: the one time move into the shards, in the foreground.
 fn run_convert() -> i32 {
     let main = paths::database();
-    if !convert::needed(&main) {
+    // a swap cut short is finished (or undone) by `run_alone`, not skipped
+    if !convert::to_do(&main) {
         println!("{} is already converted (or doesnt exist)", main.display());
         return 0;
     }
