@@ -71,6 +71,20 @@ fn open_for_conversion(path: &Path) -> rusqlite::Result<Connection> {
     Ok(conn)
 }
 
+/// Mark a shard filled by `open_for_conversion` as completely copied (a
+/// stopped conversion resumes after it, trusting the mark). Its pages were
+/// written unsynced and unjournaled, soo the shard goes durable first (WAL,
+/// full sync, every page folded into the file and synced) and the mark is
+/// written after: it can never be on disk ahead of the pages it vouches for.
+fn mark_copied(conn: &Connection) -> Result<()> {
+    conn.execute_batch("pragma synchronous = full")?;
+    conn.query_row("pragma journal_mode = wal", [], |_| Ok(()))?;
+    conn.execute("insert or replace into meta (key, value) values ('copied', 0)", [])?;
+    checkpoint(conn).context("making a copied shard durable")?;
+    conn.execute("insert or replace into meta (key, value) values ('copied', 1)", [])?;
+    Ok(())
+}
+
 /// `--convert`: `run` under the exclusive database lock for its whole run,
 /// refused while the indexer, a write, a compaction or another conversion
 /// holds it (two at once would write the same shards and `atlas.new.db`).
@@ -403,8 +417,7 @@ fn move_articles(
                 )? as i64;
                 conn.execute_batch("drop table segments_load")?;
                 store::add_totals(&conn, 0, added)?;
-                // this shard's copy is complete (a stopped conversion resumes after it)
-                conn.execute("insert or replace into meta (key, value) values ('copied', 1)", [])?;
+                mark_copied(&conn)?;
                 Ok((*read_total, added))
             }));
         }
@@ -787,4 +800,35 @@ fn copy_finished(main: &Path, source: &Source) -> bool {
                     })
                     .unwrap_or(false)
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_copied_shard_is_durable_before_it_is_marked() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shard.db");
+        let conn = open_for_conversion(&path).unwrap();
+        conn.execute_batch("create table meta(key text primary key, value); create table t(x)").unwrap();
+        conn.execute("insert into t values (1)", []).unwrap();
+        let mode = |c: &Connection| c.query_row("pragma journal_mode", [], |r| r.get::<_, String>(0)).unwrap();
+        assert_eq!(mode(&conn), "off");
+        mark_copied(&conn).unwrap();
+        // fully synced, journaled, and the data is in the file itself
+        assert_eq!(mode(&conn), "wal");
+        assert_eq!(conn.query_row("pragma synchronous", [], |r| r.get::<_, i64>(0)).unwrap(), 2);
+        let mark: i64 = conn.query_row("select value from meta where key = 'copied'", [], |r| r.get(0)).unwrap();
+        assert_eq!(mark, 1);
+        // the file alone (without the WAL, as after a crash that lost the
+        // unsynced tail) has the rows, and not yet the mark written last
+        let alone = dir.path().join("alone.db");
+        std::fs::copy(&path, &alone).unwrap();
+        let alone = Connection::open(&alone).unwrap();
+        assert_eq!(alone.query_row("select count(*) from t", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+        let marked: Option<i64> =
+            alone.query_row("select value from meta where key = 'copied'", [], |r| r.get(0)).optional().unwrap();
+        assert_ne!(marked, Some(1));
+    }
 }
