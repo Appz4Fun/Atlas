@@ -436,14 +436,14 @@ where
                 Err(e) if e.downcast_ref::<TooOld>().is_some() => Ok(Progress::default()),
                 r => r,
             },
-            // nothing for this server: once no chunk it could take is left in
-            // any split group, its own backfill sweeps on from where the split
+            // nothing for this server: once no chunk of this group it could
+            // take is left, its own backfill sweeps on from where the split
             // froze the cursor down to its first article. date searches go by
             // Date headers posters can forge, and neighbouring days done on
             // other servers can leave numbers between them; the sweep picks up
             // whatever the chunks missed (what they got is dropped as a duplicate)
             // the other carriers sweep their own numbers the same way (see `run_sweep`)
-            None if sweep_due(ctx, db, &ctx.pool.host(server)).await? => {
+            None if sweep_due(ctx, db, group, &ctx.pool.host(server)).await? => {
                 if state.backfill_cursor.min(last) < first {
                     let (g, host) = (group.to_string(), ctx.pool.host(server));
                     on_db(db, move |conn| Ok(crate::chunks::set_swept(conn, &g, &host)?)).await?;
@@ -484,18 +484,13 @@ where
     }
 }
 
-/// Whether a split group's cursor backfill on `host` may sweep: no day chunk
-/// of any split group is left that it could take or that is still running.
-/// Chunks come first, the sweep only checks after them.
-async fn sweep_due(ctx: &PassContext, db: &Db, host: &str) -> Result<bool> {
-    let host = host.to_string();
-    let states = ctx.states.clone();
-    on_db(db, move |conn| {
-        let groups: Vec<(String, i64)> =
-            crate::chunks::split_groups(conn)?.into_iter().map(|g| (g.clone(), states.keeps_from(&g, &host))).collect();
-        Ok(!crate::chunks::waiting(conn, &groups)?)
-    })
-    .await
+/// Whether split `group`'s cursor backfill on `host` may sweep: no day
+/// chunk of it is left that the server could take or that is still running.
+/// Its chunks come first; other groups' chunks dont hold its sweep back
+/// (idle workers take those anyway), their retention wont wait for them.
+async fn sweep_due(ctx: &PassContext, db: &Db, group: &str, host: &str) -> Result<bool> {
+    let wanted = [(group.to_string(), ctx.states.keeps_from(group, host))];
+    on_db(db, move |conn| Ok(!crate::chunks::waiting(conn, &wanted)?)).await
 }
 
 /// how long a big group that couldnt be split waits before it is probed again
