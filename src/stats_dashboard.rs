@@ -736,9 +736,10 @@ fn backfill_at(quick: &Quick, now: i64) -> Backfill {
     b.unmeasured = seen.iter().filter(|g| !best.contains_key(*g)).count();
 
     // a split group's cursors stand still: its day chunks say how far it is,
-    // as that share of its article numbers
+    // as that share of its article numbers. once they are all done its home
+    // cursor sweeps on for what they missed, and the cursor says it again
     for (group, (total, covered, _)) in best.iter_mut() {
-        if let Some(&(done, chunks)) = quick.group_chunks.get(group).filter(|c| c.1 > 0) {
+        if let Some(&(done, chunks)) = quick.group_chunks.get(group).filter(|c| c.1 > 0 && c.0 < c.1) {
             *covered = (*total as i128 * done.clamp(0, chunks) as i128 / chunks as i128) as i64;
         }
     }
@@ -1317,7 +1318,7 @@ mod tests {
     }
 
     #[test]
-    fn split_groups_progress_follows_their_chunks_not_their_cursors() {
+    fn split_groups_progress_follows_their_chunks_then_their_sweep() {
         let row = |key: &str| db::GroupProgress {
             key: key.into(),
             live_cursor: 1000,
@@ -1333,10 +1334,16 @@ mod tests {
         let b = backfill_at(&quick, 1_780_000_000);
         assert_eq!((b.total, b.covered, b.remaining, b.done), (3000, 0, 3000, 0), "no chunks: the cursors");
 
-        // s: 1 of 4 days done, t: all 6, u is not split
+        // s: 1 of 4 days done, t: all 6 (its sweep from the cursor to go), u is not split
         quick.group_chunks = BTreeMap::from([("alt.binaries.s".into(), (1, 4)), ("alt.binaries.t".into(), (6, 6))]);
         let b = backfill_at(&quick, 1_780_000_000);
-        assert_eq!((b.total, b.covered, b.remaining, b.done), (3000, 1250, 1750, 1));
+        assert_eq!((b.total, b.covered, b.remaining, b.done), (3000, 250, 2750, 0));
+        assert!(b.behind.contains(&("alt.binaries.t".into(), 1000, 0.0)));
+
+        // t's sweep halfway down
+        quick.progress[1].backfill_cursor = 500;
+        let b = backfill_at(&quick, 1_780_000_000);
+        assert_eq!((b.covered, b.remaining), (250 + 500, 2250));
         assert_eq!(b.behind[0], ("alt.binaries.u".into(), 1000, 0.0));
         assert!(b.behind.contains(&("alt.binaries.s".into(), 750, 25.0)));
     }

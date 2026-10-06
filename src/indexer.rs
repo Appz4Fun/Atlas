@@ -436,6 +436,16 @@ where
                 Err(e) if e.downcast_ref::<TooOld>().is_some() => Ok(Progress::default()),
                 r => r,
             },
+            // nothing for this server: once no chunk it could take is left in
+            // any split group, its own backfill sweeps on from where the split
+            // froze the cursor down to its first article. date searches go by
+            // Date headers posters can forge, and neighbouring days done on
+            // other servers can leave numbers between them; the sweep picks up
+            // whatever the chunks missed (what they got is dropped as a duplicate)
+            None if sweep_due(ctx, db, &ctx.pool.host(server)).await? => {
+                let pass = Pass { ctx, settings, db, group, server, key };
+                pass.backfill(state, first, last, progress).await
+            }
             None => {
                 // nothing pending: in backfill mode the group rests like a finished backfill
                 let idle = settings.mode == "backfill";
@@ -467,6 +477,20 @@ where
             r
         }
     }
+}
+
+/// Whether a split group's cursor backfill on `host` may sweep: no day chunk
+/// of any split group is left that it could take or that is still running.
+/// Chunks come first, the sweep only checks after them.
+async fn sweep_due(ctx: &PassContext, db: &Db, host: &str) -> Result<bool> {
+    let host = host.to_string();
+    let states = ctx.states.clone();
+    on_db(db, move |conn| {
+        let groups: Vec<(String, i64)> =
+            crate::chunks::split_groups(conn)?.into_iter().map(|g| (g.clone(), states.keeps_from(&g, &host))).collect();
+        Ok(!crate::chunks::waiting(conn, &groups)?)
+    })
+    .await
 }
 
 /// how long a big group that couldnt be split waits before it is probed again
@@ -930,7 +954,8 @@ where
 /// also reaches `safety` (`CHUNK_SAFETY`) numbers past where its search put it (the
 /// articles a neighbour has too are dropped as duplicates when saved): a
 /// shift up to that many articles is covered, a forged run moving a search
-/// further can still leave a gap.
+/// further can still leave a gap, for the home server's sweep once the
+/// chunks are done (see `run_pass`).
 pub async fn chunk_range(
     pool: &Pool,
     server: usize,

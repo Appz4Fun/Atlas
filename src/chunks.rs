@@ -240,6 +240,18 @@ pub fn forget_deepest(conn: &Connection, group: &str, server: &str) -> Result<()
     Ok(())
 }
 
+/// Whether any chunk of `groups`: (group, oldest day the server keeps) is
+/// still to do (pending or claimed) on a day the server keeps.
+pub fn waiting(conn: &Connection, groups: &[(String, i64)]) -> Result<bool> {
+    let mut stmt = conn.prepare_cached("select 1 from backfill_chunks where grp = ? and day >= ? and state != 2")?;
+    for (g, oldest) in groups {
+        if stmt.exists(params![g, oldest])? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// groups with chunks still to do
 pub fn split_groups(conn: &Connection) -> Result<Vec<String>> {
     conn.prepare("select distinct grp from backfill_chunks where state != 2 order by grp")?
