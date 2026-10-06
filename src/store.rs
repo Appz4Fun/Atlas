@@ -749,6 +749,19 @@ fn seal_rows(conn: &Connection, file_id: i64) -> Result<usize> {
         let release_id: i64 =
             conn.prepare_cached("select release_id from files where id = ?")?.query_row([file_id], |r| r.get(0))?;
         uncount_copies(conn, release_id, copies.iter().map(|c| c.bytes).sum(), copies.len() as i64)?;
+        // a copy's part was counted in the file's parts when it was saved: they
+        // are what the blob and the rows left have, and so is the release's
+        // completeness
+        let mut seen = Vec::new();
+        for p in segs.iter().chain(&rows).filter_map(|s| s.part) {
+            insert_part(&mut seen, p);
+        }
+        conn.prepare_cached("update files set seen = ? where id = ?")?.execute(params![seen, file_id])?;
+        let file_total: Option<i64> = conn
+            .prepare_cached("select file_total from releases where id = ?")?
+            .query_row([release_id], |r| r.get(0))?;
+        conn.prepare_cached("update releases set complete = ? where id = ?")?
+            .execute(params![release_complete(conn, release_id, file_total)? as i64, release_id])?;
     }
     // too much for one blob in memory: the rest stays rows, the blob as it is
     if segs.len() + rows.len() > SEAL_MAX_SEGMENTS as usize {
@@ -855,9 +868,12 @@ pub(crate) struct SealedCache {
     /// segments decoded so far
     decoded: usize,
     max_decoded: usize,
+    /// the last `contains` was past the budget: its false only means not known
+    pub(crate) guessed: bool,
 }
 
 impl SealedCache {
+    #[cfg(test)]
     pub(crate) fn new() -> Self {
         Self::with_limits(SEALED_CACHE_MAX_SEGMENTS, SEALED_DECODE_BUDGET)
     }
@@ -871,12 +887,14 @@ impl SealedCache {
             max_segments,
             decoded: 0,
             max_decoded,
+            guessed: false,
         }
     }
 
     /// the article (local, domain) is already in file `file_id`'s blob
     pub(crate) fn contains(&mut self, conn: &Connection, file_id: i64, local: &[u8], domain: i64) -> Result<bool> {
         self.uses += 1;
+        self.guessed = false;
         let key = (local.to_vec(), domain);
         if let Some((used, set)) = self.files.get_mut(&file_id) {
             self.by_use.remove(used);
@@ -885,6 +903,7 @@ impl SealedCache {
             return Ok(set.contains(&key));
         }
         if self.decoded >= self.max_decoded {
+            self.guessed = true;
             return Ok(false);
         }
         let set: SegmentSet =
@@ -921,6 +940,8 @@ pub struct ShardWriter {
     seal_after: i64,
     /// when the last walk ran (unix seconds)
     walked_at: Option<i64>,
+    /// segments of sealed files a save decodes at most (see `SealedCache`)
+    decode_budget: usize,
 }
 
 /// files sealed per writer tick at most
@@ -944,6 +965,7 @@ impl ShardWriter {
             completed_ids: HashSet::new(),
             seal_after: 0,
             walked_at: None,
+            decode_budget: SEALED_DECODE_BUDGET,
         }
     }
 
@@ -1049,7 +1071,7 @@ impl ShardWriter {
         let shard = self.shard;
         let domains = &mut self.domains;
         // blobs of sealed files that get late articles, decoded once each
-        let mut sealed = SealedCache::new();
+        let mut sealed = SealedCache::with_limits(SEALED_CACHE_MAX_SEGMENTS, self.decode_budget);
         // files this save completed, for sealing once it's committed
         let mut completed = Vec::new();
         let tx = conn.transaction()?;
@@ -1113,7 +1135,16 @@ impl ShardWriter {
                     let before = added.len();
                     for a in articles {
                         if add_segment(&tx, domains, &f, a, &mut sealed)? {
-                            f.add(a);
+                            if f.sealed && sealed.guessed {
+                                // maybe a copy of what the blob has: only its part
+                                // counts, till sealing the file again tells (`seal_rows`
+                                // works the parts out again from what is left)
+                                if let Some(p) = a.part {
+                                    insert_part(&mut f.seen, p);
+                                }
+                            } else {
+                                f.add(a);
+                            }
                             added.push(a);
                         }
                     }
@@ -2195,6 +2226,59 @@ mod tests {
         let rows: i64 = conn.query_row("select count(*) from segments", [], |r| r.get(0)).unwrap();
         assert_eq!(rows, 1, "b.rar got a row, it's sealed and complete: waits to be stale");
         assert_eq!(writer.seal_some(&mut conn, now + 2).unwrap(), 0);
+    }
+
+    /// A save past its decode budget keeps a repost of a sealed article as a
+    /// row, not knowing it's one: a part or total it carries that the
+    /// original didnt must not make its file falsely complete or incomplete,
+    /// neither while it's a row nor once sealing drops it.
+    #[test]
+    fn a_fallback_copy_with_another_part_or_total_leaves_completeness_as_it_was() {
+        let (_dir, main) = sealed_fixture();
+        let shard = shard_of("alt.binaries.t");
+        let mut conn = db::open_at(&shard_path(&main, shard)).unwrap();
+        for id in conn.prepare("select id from files").unwrap().query_map([], |r| r.get(0)).unwrap() {
+            seal_file(&conn, id.unwrap()).unwrap();
+        }
+        let file = |conn: &Connection, name: &str| -> (Option<i64>, Vec<u8>) {
+            conn.query_row("select expected, seen from files where filename = ?", [name], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap()
+        };
+        let complete =
+            |conn: &Connection| -> bool { conn.query_row("select complete from releases", [], |r| r.get(0)).unwrap() };
+        let (a, b) = (file(&conn, "a.rar"), file(&conn, "b.rar"));
+        assert!(!complete(&conn), "b.rar has 1 of 2");
+
+        // reposts of a1 claiming 4 parts, and of b1 claiming to be part 2
+        let copy = |id: &str, name: &str, part: i64, total: i64| Article {
+            message_id: id.into(),
+            subject: format!("\"{name}\" yEnc ({part}/{total})"),
+            filename: Some(name.into()),
+            part: Some(part),
+            total_parts: Some(total),
+            bytes: 100 + part,
+            ..Default::default()
+        };
+        let mut writer = ShardWriter::new(shard);
+        writer.decode_budget = 0;
+        let release = Release {
+            name: "Rel".into(),
+            group: "alt.binaries.t".into(),
+            articles: vec![copy("<a1@x>", "a.rar", 1, 4), copy("<b1@x>", "b.rar", 2, 2)],
+            ..Default::default()
+        };
+        writer.save(&mut conn, &Ids::new(&main), [std::slice::from_ref(&release)]).unwrap();
+        let rows: i64 = conn.query_row("select count(*) from segments", [], |r| r.get(0)).unwrap();
+        assert_eq!(rows, 2, "both kept as rows, past the budget");
+        assert_eq!(file(&conn, "a.rar").0, a.0, "a.rar still takes 3 parts");
+
+        for id in conn.prepare("select id from files").unwrap().query_map([], |r| r.get(0)).unwrap() {
+            seal_file(&conn, id.unwrap()).unwrap();
+        }
+        assert_eq!((file(&conn, "a.rar"), file(&conn, "b.rar")), (a, b), "the copies went, and what they said");
+        assert!(!complete(&conn), "b.rar still has 1 of 2");
     }
 
     /// what purging takes off the totals is what it deleted, counted in its
