@@ -72,9 +72,10 @@ fn failover_and_parallel_requests() {
     assert!((2..=4).contains(&peak), "expected 2-4 parallel connections to the busy server, saw {peak}");
     assert!(backup.peak.load(Ordering::SeqCst) <= 2);
 
-    // cursors are kept per server once there are several
+    // cursors are kept per server once there are several, by host:port as
+    // these share a host
     let key: String = conn.query_row("select name from groups", [], |r| r.get(0)).unwrap();
-    assert_eq!(key, format!("{GROUP}@127.0.0.1"));
+    assert_eq!(key, format!("{GROUP}@127.0.0.1:{p2}"));
 }
 
 /// A server that agrees to compression but sends junk gets it turned off,

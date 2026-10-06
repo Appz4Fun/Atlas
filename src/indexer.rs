@@ -372,7 +372,8 @@ pub struct PassContext {
 }
 
 /// Article numbers differ between providers, soo with several servers the
-/// cursors are kept per server as `group@host`. One server keeps the plain
+/// cursors are kept per server as `group@host` (`Pool::host`, see
+/// `server_keys`). One server keeps the plain
 /// group name like before.
 fn cursor_key(pool: &Pool, server: usize, group: &str) -> String {
     if pool.len() <= 1 { group.to_string() } else { format!("{group}@{}", pool.host(server).to_lowercase()) }

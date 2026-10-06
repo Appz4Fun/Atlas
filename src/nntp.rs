@@ -752,6 +752,8 @@ fn gzip_header_len(b: &[u8]) -> Option<Result<usize>> {
 /// One server's connections, capped at its `connections` setting.
 struct Server {
     cfg: UsenetServer,
+    /// what names this server in stored state, see `server_keys`
+    key: String,
     idle: Mutex<Vec<Conn>>,
     permits: Arc<Semaphore>,
     down_until: Mutex<Option<Instant>>,
@@ -1020,14 +1022,36 @@ impl Drop for Unsaved {
     }
 }
 
+/// What names each server in stored state (cursors, chunk claims, sweeps):
+/// its host when no other server has it (what it always was), else
+/// `host:port`, and `user@host:port` when another has the same host and port
+/// too. Never the password.
+pub fn server_keys(servers: &[UsenetServer]) -> Vec<String> {
+    let same = |a: &UsenetServer, b: &UsenetServer| a.host.eq_ignore_ascii_case(&b.host);
+    servers
+        .iter()
+        .map(|s| {
+            if servers.iter().filter(|o| same(s, o)).count() < 2 {
+                return s.host.clone();
+            }
+            let hp = format!("{}:{}", s.host, s.port);
+            let shared = servers.iter().filter(|o| same(s, o) && o.port == s.port).count() > 1;
+            if shared { format!("{}@{hp}", s.username) } else { hp }
+        })
+        .collect()
+}
+
 impl Pool {
     pub fn new(servers: &[UsenetServer]) -> Pool {
+        let keys = server_keys(servers);
         Pool {
             servers: servers
                 .iter()
-                .map(|cfg| {
+                .zip(keys)
+                .map(|(cfg, key)| {
                     Arc::new(Server {
                         cfg: cfg.clone(),
+                        key,
                         idle: Mutex::new(Vec::new()),
                         permits: Arc::new(Semaphore::new(cfg.connections().max(1) as usize)),
                         down_until: Mutex::new(None),
@@ -1107,8 +1131,9 @@ impl Pool {
         self.servers.get(self.active_index()).map(|s| s.cfg.host.clone()).unwrap_or_default()
     }
 
+    /// server `i`'s name in stored state (see `server_keys`)
     pub fn host(&self, i: usize) -> String {
-        self.servers.get(i).map(|s| s.cfg.host.clone()).unwrap_or_default()
+        self.servers.get(i).map(|s| s.key.clone()).unwrap_or_default()
     }
 
     /// requests server `i` takes at once
@@ -1201,7 +1226,7 @@ impl Pool {
         let mut scored: Vec<(f64, usize)> = candidates
             .iter()
             .map(|&i| {
-                let key = format!("{group}\0{}", self.servers[i].cfg.host);
+                let key = format!("{group}\0{}", self.servers[i].key);
                 // splitmix64's finalizer: fnv alone barely changes between hosts
                 let mut z = fnv(key.as_bytes());
                 z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
@@ -2259,6 +2284,18 @@ pub fn yenc_decode(lines: &[Vec<u8>]) -> Option<Vec<u8>> {
 mod tests {
     /// the dates the first windows count by judge a server's retention: the earliest
     /// answers, and one more than a day older than an earlier one is unsure
+    #[test]
+    fn servers_sharing_a_host_are_told_apart_in_stored_state() {
+        let s = |h: &str, user: &str, port: u16| UsenetServer::new(h, user, "secret", port);
+        let alone = [s("A.example", "u", 563), s("b.example", "u", 563)];
+        assert_eq!(server_keys(&alone), ["A.example", "b.example"], "a unique host stays as it was");
+        let ports = [s("a.example", "u", 563), s("A.example", "u", 119), s("b.example", "u", 563)];
+        assert_eq!(server_keys(&ports), ["a.example:563", "A.example:119", "b.example"]);
+        let users = [s("a.example", "x", 563), s("a.example", "y", 563)];
+        assert_eq!(server_keys(&users), ["x@a.example:563", "y@a.example:563"]);
+        assert_eq!(Pool::new(&users).host(1), "y@a.example:563");
+    }
+
     #[test]
     fn retention_from_the_first_windows() {
         use super::{Retention, retention_of};
