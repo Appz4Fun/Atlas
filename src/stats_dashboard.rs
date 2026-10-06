@@ -85,6 +85,18 @@ struct Quick {
     wal_bytes: u64,
     /// split group stats: (groups, splitting, done, total, done_last_hour)
     chunks: (i64, i64, i64, i64, i64),
+    /// split group -> (chunks done, chunks): their cursors stand still, the chunks move
+    group_chunks: BTreeMap<String, (i64, i64)>,
+}
+
+fn load_group_chunks(conn: &rusqlite::Connection) -> BTreeMap<String, (i64, i64)> {
+    let Ok(mut stmt) =
+        conn.prepare("select grp, coalesce(sum(state = 2), 0), count(*) from backfill_chunks group by grp")
+    else {
+        return BTreeMap::new();
+    };
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, (r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))));
+    rows.map(|rows| rows.flatten().collect()).unwrap_or_default()
 }
 
 fn load_chunks_stats(conn: &rusqlite::Connection) -> (i64, i64, i64, i64, i64) {
@@ -115,6 +127,7 @@ fn load_quick() -> Quick {
     // running totals the shards keep, instant
     (q.releases_approx, q.articles_approx) = crate::store::totals(&conn).unwrap_or_default();
     q.chunks = load_chunks_stats(&conn);
+    q.group_chunks = load_group_chunks(&conn);
     q
 }
 
@@ -725,6 +738,14 @@ fn backfill_at(quick: &Quick, now: i64) -> Backfill {
     }
     b.unmeasured = seen.iter().filter(|g| !best.contains_key(*g)).count();
 
+    // a split group's cursors stand still: its day chunks say how far it is,
+    // as that share of its article numbers
+    for (group, (total, covered, _)) in best.iter_mut() {
+        if let Some(&(done, chunks)) = quick.group_chunks.get(group).filter(|c| c.1 > 0) {
+            *covered = (*total as i128 * done.clamp(0, chunks) as i128 / chunks as i128) as i64;
+        }
+    }
+
     let mut rows: Vec<(String, i64, f64)> = Vec::new();
     let (mut rate_dated, mut total_dated, mut reached) = (0.0, 0i64, Vec::new());
     for (group, (total, covered, row)) in best {
@@ -1296,6 +1317,43 @@ mod tests {
         let per_day = b.per_day.unwrap();
         assert!((per_day - 480.0).abs() < 1e-9, "{per_day}");
         assert_eq!(b.reached, Some(base + 10 * day));
+    }
+
+    #[test]
+    fn split_groups_progress_follows_their_chunks_not_their_cursors() {
+        let row = |key: &str| db::GroupProgress {
+            key: key.into(),
+            live_cursor: 1000,
+            backfill_cursor: 1000, // the cursor stands still on a split group
+            first: Some(1),
+            last: Some(1000),
+            ..Default::default()
+        };
+        let mut quick = Quick {
+            progress: vec![row("alt.binaries.s"), row("alt.binaries.t"), row("alt.binaries.u")],
+            ..Quick::default()
+        };
+        let b = backfill_at(&quick, 1_780_000_000);
+        assert_eq!((b.total, b.covered, b.remaining, b.done), (3000, 0, 3000, 0), "no chunks: the cursors");
+
+        // s: 1 of 4 days done, t: all 6, u is not split
+        quick.group_chunks = BTreeMap::from([("alt.binaries.s".into(), (1, 4)), ("alt.binaries.t".into(), (6, 6))]);
+        let b = backfill_at(&quick, 1_780_000_000);
+        assert_eq!((b.total, b.covered, b.remaining, b.done), (3000, 1250, 1750, 1));
+        assert_eq!(b.behind[0], ("alt.binaries.u".into(), 1000, 0.0));
+        assert!(b.behind.contains(&("alt.binaries.s".into(), 750, 25.0)));
+    }
+
+    #[test]
+    fn group_chunks_are_loaded_per_group() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        assert!(load_group_chunks(&conn).is_empty(), "no table: nothing");
+        crate::chunks::create(&conn).unwrap();
+        crate::chunks::add(&conn, "g1", 100, 98).unwrap();
+        crate::chunks::add(&conn, "g2", 200, 199).unwrap();
+        let claim = crate::chunks::claim(&conn, &[("g2".to_string(), i64::MIN)], "s", 1000).unwrap().unwrap();
+        assert!(crate::chunks::finish(&conn, &claim, 1100).unwrap());
+        assert_eq!(load_group_chunks(&conn), BTreeMap::from([("g1".into(), (0, 3)), ("g2".into(), (1, 2))]));
     }
 
     #[test]
