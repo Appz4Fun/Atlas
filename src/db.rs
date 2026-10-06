@@ -176,6 +176,9 @@ pub fn wipe(main: &Path) -> anyhow::Result<()> {
 /// columns) for convert.rs; until then there are no shards. Run with
 /// compaction held off, see `create_db_holding`.
 pub fn create_db_at(path: &Path) -> anyhow::Result<()> {
+    if !path.try_exists()? {
+        refuse_orphaned_shards(path)?;
+    }
     let conn = open_at(path)?;
 
     // wal soo the indexer can write while search reads
@@ -207,6 +210,26 @@ pub fn create_db_at(path: &Path) -> anyhow::Result<()> {
     let used = has_progress(&conn)?;
     store::create_main(&conn)?;
     create_shards(path, used)
+}
+
+/// Refuses shards with something in them when their main database `main`
+/// isnt there: a new one would hand out their release ids again and start
+/// the cursors and day chunks over.
+fn refuse_orphaned_shards(main: &Path) -> anyhow::Result<()> {
+    let mut found = Vec::new();
+    for shard in store::shard_paths(main) {
+        if fs::metadata(&shard).is_ok_and(|m| m.len() > 0) {
+            found.push(shard.display().to_string());
+        }
+    }
+    if !found.is_empty() {
+        anyhow::bail!(
+            "{} is missing but its shards are there: {}. put the main database back from a backup, or delete these shard files to start over",
+            main.display(),
+            found.join(", ")
+        );
+    }
+    Ok(())
 }
 
 /// Whether the main database holds indexing progress: cursors or ids handed
@@ -766,6 +789,25 @@ mod tests {
             std::fs::remove_file(shard).unwrap();
         }
         create_db_at(&main).expect_err("ids were handed out");
+    }
+
+    #[test]
+    fn shards_without_their_main_database_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        create_db_at(&main).unwrap();
+        let release =
+            crate::parser::Release { name: "Kept".into(), group: "alt.binaries.a".into(), ..Default::default() };
+        store::save(&main, &[release]).unwrap();
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", main.display()));
+        }
+
+        // a new main database would hand the shards' ids out again
+        let err = format!("{:#}", create_db_at(&main).expect_err("the shards are in use"));
+        let shard = store::shard_path(&main, store::shard_of("alt.binaries.a"));
+        assert!(err.contains(&main.display().to_string()) && err.contains(&shard.display().to_string()), "{err}");
+        assert!(!main.exists(), "no new main database made");
     }
 
     #[test]
