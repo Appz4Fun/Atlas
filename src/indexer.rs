@@ -172,6 +172,12 @@ struct SaveJob {
 /// `conn` is the main database. The writer threads end once every clone of
 /// the `Db` is gone, and the last clone to go waits for them.
 pub fn shared_db(conn: Connection) -> Db {
+    shared_db_idling(conn, Duration::from_secs(crate::store::SEAL_WALK_EVERY as u64))
+}
+
+/// `shared_db` whose writers, with nothing to save for `every`, look for
+/// files due to be sealed.
+fn shared_db_idling(conn: Connection, every: Duration) -> Db {
     let main = conn.path().map(std::path::PathBuf::from).unwrap_or_else(crate::paths::database);
     let ids = Arc::new(crate::store::Ids::new(&main));
     let (saves, writers): (Vec<_>, Vec<_>) = (0..crate::store::SHARDS)
@@ -180,7 +186,7 @@ pub fn shared_db(conn: Connection) -> Db {
             let (path, ids) = (crate::store::shard_path(&main, shard), ids.clone());
             let handle = std::thread::Builder::new()
                 .name(format!("atlas-db-writer-{shard}"))
-                .spawn(move || writer(shard, &path, &ids, jobs))
+                .spawn(move || writer(shard, &path, &ids, jobs, every))
                 .expect("couldnt start a db writer");
             (saves, handle)
         })
@@ -188,9 +194,18 @@ pub fn shared_db(conn: Connection) -> Db {
     Db { conn: Arc::new(Mutex::new(conn)), saves, _writers: Arc::new(Writers(writers)) }
 }
 
-fn writer(shard: usize, path: &std::path::Path, ids: &crate::store::Ids, jobs: std::sync::mpsc::Receiver<SaveJob>) {
+/// A shard's writer: saves what comes in, and between saves (or after
+/// `idle` with nothing to save) seals what is due and checkpoints.
+fn writer(
+    shard: usize,
+    path: &std::path::Path,
+    ids: &crate::store::Ids,
+    jobs: std::sync::mpsc::Receiver<SaveJob>,
+    idle: Duration,
+) {
     use crate::profile::{LOAD, Load};
     use std::sync::atomic::Ordering::Relaxed;
+    use std::sync::mpsc::{RecvTimeoutError, TryRecvError};
 
     let mut opened = db::open_shard(path).and_then(|conn| db::tune_for_writing(&conn).map(|_| conn));
     let mut store = crate::store::ShardWriter::new(shard);
@@ -200,9 +215,16 @@ fn writer(shard: usize, path: &std::path::Path, ids: &crate::store::Ids, jobs: s
     loop {
         let first = match next.take() {
             Some(job) => job,
-            None => match jobs.recv() {
+            None => match jobs.recv_timeout(idle) {
                 Ok(job) => job,
-                Err(_) => break,
+                // nothing to save: files still come due as they go stale
+                Err(RecvTimeoutError::Timeout) => {
+                    if let Ok(conn) = &mut opened {
+                        housekeeping(conn, &mut store, true);
+                    }
+                    continue;
+                }
+                Err(RecvTimeoutError::Disconnected) => break,
             },
         };
         let mut batch = vec![first];
@@ -240,7 +262,6 @@ fn writer(shard: usize, path: &std::path::Path, ids: &crate::store::Ids, jobs: s
 
         // housekeeping between transactions
         if let Ok(conn) = &mut opened {
-            let t = std::time::Instant::now();
             // more slices waiting: saving them comes first. a closed queue
             // means the indexer is stopping, it waits for this thread
             let seal = match jobs.try_recv() {
@@ -248,22 +269,32 @@ fn writer(shard: usize, path: &std::path::Path, ids: &crate::store::Ids, jobs: s
                     next = Some(job);
                     false
                 }
-                Err(std::sync::mpsc::TryRecvError::Empty) => saved,
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => false,
+                Err(TryRecvError::Empty) => saved,
+                Err(TryRecvError::Disconnected) => false,
             };
-            if seal {
-                let sealing = std::time::Instant::now();
-                if store.seal_some(conn, chrono::Utc::now().timestamp()).is_err() {
-                    LOAD.writer_seal_errors.fetch_add(1, Relaxed);
-                }
-                Load::add_since(&LOAD.writer_seal_ns, sealing);
-            }
-            let checkpointing = std::time::Instant::now();
-            let _ = db::finish_checkpoint(conn);
-            Load::add_since(&LOAD.writer_checkpoint_ns, checkpointing);
-            Load::add_since(&LOAD.writer_busy_ns, t);
+            housekeeping(conn, &mut store, seal);
         }
     }
+}
+
+/// A writer's work between saves: seal some of what is due (when `seal`),
+/// and copy the WAL into the shard.
+fn housekeeping(conn: &mut Connection, store: &mut crate::store::ShardWriter, seal: bool) {
+    use crate::profile::{LOAD, Load};
+    use std::sync::atomic::Ordering::Relaxed;
+
+    let t = std::time::Instant::now();
+    if seal {
+        let sealing = std::time::Instant::now();
+        if store.seal_some(conn, chrono::Utc::now().timestamp()).is_err() {
+            LOAD.writer_seal_errors.fetch_add(1, Relaxed);
+        }
+        Load::add_since(&LOAD.writer_seal_ns, sealing);
+    }
+    let checkpointing = std::time::Instant::now();
+    let _ = db::finish_checkpoint(conn);
+    Load::add_since(&LOAD.writer_checkpoint_ns, checkpointing);
+    Load::add_since(&LOAD.writer_busy_ns, t);
 }
 
 impl Db {
@@ -1192,5 +1223,40 @@ mod tests {
             .map(|r| r.unwrap())
             .collect();
         assert_eq!(names, vec!["kept".to_string()]);
+    }
+
+    #[test]
+    fn an_idle_writer_still_seals_what_is_due() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        db::create_db_at(&main).unwrap();
+        // one part of two, untouched for long: due though never completed
+        let part = crate::parser::Article {
+            message_id: "<a1@x>".into(),
+            subject: "\"a.rar\" yEnc (1/2)".into(),
+            filename: Some("a.rar".into()),
+            part: Some(1),
+            total_parts: Some(2),
+            bytes: 10,
+            ..Default::default()
+        };
+        let release =
+            Release { name: "Rel".into(), group: "alt.binaries.t".into(), articles: vec![part], ..Default::default() };
+        crate::store::save(&main, &[release]).unwrap();
+        let shard = db::open_at(&crate::store::shard_path(&main, crate::store::shard_of("alt.binaries.t"))).unwrap();
+        shard.execute("update files set touched_at = 0", []).unwrap();
+        let sealed = || -> i64 {
+            shard.query_row("select count(*) from files where blob is not null", [], |r| r.get(0)).unwrap()
+        };
+        assert_eq!(sealed(), 0);
+
+        // no save ever comes
+        let shared = shared_db_idling(db::open_at(&main).unwrap(), Duration::from_millis(50));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while sealed() == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(sealed(), 1, "the idle writer sealed the stale file");
+        drop(shared);
     }
 }
