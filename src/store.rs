@@ -720,6 +720,7 @@ fn seal_rows(conn: &Connection, file_id: i64) -> Result<usize> {
         .prepare_cached("select count(*) from (select 1 from segments where file_id = ? limit ?)")?
         .query_row(params![file_id, SEAL_MAX_SEGMENTS + 1], |r| r.get(0))?;
     if counted > SEAL_MAX_SEGMENTS {
+        settle_held_back(conn, file_id, &segs)?;
         return Ok(0);
     }
     let rows: Vec<crate::blob::Seg> = conn
@@ -739,6 +740,7 @@ fn seal_rows(conn: &Connection, file_id: i64) -> Result<usize> {
     // the blob has no room for a negative part number: such a file stays rows
     // nor one whose message-id is longer than a blob decodes
     if rows.iter().any(|r| r.part.is_some_and(|p| p < 0) || r.local.len() > crate::blob::MAX_LOCAL) {
+        settle_held_back(conn, file_id, &segs)?;
         return Ok(0);
     }
     // a row the blob already has (saved past a save's decode budget, see
@@ -747,16 +749,7 @@ fn seal_rows(conn: &Connection, file_id: i64) -> Result<usize> {
     // (the same message-id, even stored whole in the blob and packed in the
     // row, or the other way round, when a domain got shared in between)
     let mut suffixes: HashMap<i64, Option<String>> = HashMap::new();
-    let mut key = |s: &crate::blob::Seg| -> Result<String> {
-        if s.domain != 0 && !suffixes.contains_key(&s.domain) {
-            let suffix = conn
-                .prepare_cached("select suffix from domains where id = ?")?
-                .query_row([s.domain], |r| r.get(0))
-                .optional()?;
-            suffixes.insert(s.domain, suffix);
-        }
-        Ok(dedup_key(&s.local, s.domain, suffixes.get(&s.domain).and_then(|x| x.as_deref())))
-    };
+    let mut key = |s: &crate::blob::Seg| seg_key(conn, &mut suffixes, s);
     let held: HashSet<String> = segs.iter().map(&mut key).collect::<Result<_>>()?;
     let (mut copies, mut fresh) = (Vec::new(), Vec::new());
     for r in rows {
@@ -765,20 +758,8 @@ fn seal_rows(conn: &Connection, file_id: i64) -> Result<usize> {
     let rows = fresh;
     // what the rows a save couldnt tell from copies said: the copies' goes,
     // the rest's is folded into the file now it's known to be new
-    let mut held: HashMap<String, Article> = conn
-        .prepare_cached("select message_id, subject, part, total_parts, file_total from held_back where file_id = ?")?
-        .query_map([file_id], |r| {
-            Ok(Article {
-                message_id: r.get(0)?,
-                subject: r.get::<_, Option<String>>(1)?.unwrap_or_default(),
-                part: r.get(2)?,
-                total_parts: r.get(3)?,
-                file_total: r.get(4)?,
-                ..Default::default()
-            })
-        })?
-        .map(|a| a.map(|a| (a.message_id.clone(), a)))
-        .collect::<Result<_>>()?;
+    let mut held: HashMap<String, Article> =
+        held_back(conn, file_id, -1)?.into_iter().map(|a| (a.message_id.clone(), a)).collect();
     let mut news = Vec::new();
     if !held.is_empty() {
         conn.prepare_cached("delete from held_back where file_id = ?")?.execute([file_id])?;
@@ -805,31 +786,9 @@ fn seal_rows(conn: &Connection, file_id: i64) -> Result<usize> {
         }
         conn.prepare_cached("update files set seen = ? where id = ?")?.execute(params![seen, file_id])?;
     }
-    if !news.is_empty() {
-        let (release_id, filename): (i64, String) = conn
-            .prepare_cached("select release_id, filename from files where id = ?")?
-            .query_row([file_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
-        let mut f = file(conn, release_id, &filename)?;
-        for a in &news {
-            f.add(a);
-        }
-        conn.prepare_cached(
-            "update files set subject = ?, subject_part = ?, subject_mid = ?, expected = ?, file_total = ? where id = ?",
-        )?
-        .execute(params![f.subject, f.subject_part, f.subject_mid, f.expected, f.file_total, file_id])?;
-        if let Some(ft) = news.iter().filter_map(|a| a.file_total).max() {
-            conn.prepare_cached("update releases set file_total = max(coalesce(file_total, ?), ?) where id = ?")?
-                .execute(params![ft, ft, release_id])?;
-        }
-    }
+    fold_in(conn, file_id, &news)?;
     if !copies.is_empty() || !news.is_empty() {
-        let release_id: i64 =
-            conn.prepare_cached("select release_id from files where id = ?")?.query_row([file_id], |r| r.get(0))?;
-        let file_total: Option<i64> = conn
-            .prepare_cached("select file_total from releases where id = ?")?
-            .query_row([release_id], |r| r.get(0))?;
-        conn.prepare_cached("update releases set complete = ? where id = ?")?
-            .execute(params![release_complete(conn, release_id, file_total)? as i64, release_id])?;
+        update_complete(conn, file_id)?;
     }
     // too much for one blob in memory: the rest stays rows, the blob as it is
     if segs.len() + rows.len() > SEAL_MAX_SEGMENTS as usize {
@@ -842,22 +801,62 @@ fn seal_rows(conn: &Connection, file_id: i64) -> Result<usize> {
     Ok(segs.len())
 }
 
-/// File `file_id`'s parts worked out again from its blob and rows, and its
-/// release's completeness with them: after dropping copies whose parts were
-/// counted (see `SealedCache`).
-pub(crate) fn recount_parts(conn: &Connection, file_id: i64) -> Result<()> {
-    let mut seen = Vec::new();
-    for p in sealed_segments(conn, file_id)?.unwrap_or_default().iter().filter_map(|s| s.part) {
-        insert_part(&mut seen, p);
+/// the message-id a stored segment stands for (`dedup_key`), its domain's
+/// suffix looked up once per domain
+fn seg_key(conn: &Connection, suffixes: &mut HashMap<i64, Option<String>>, s: &crate::blob::Seg) -> Result<String> {
+    if s.domain != 0 && !suffixes.contains_key(&s.domain) {
+        let suffix = conn
+            .prepare_cached("select suffix from domains where id = ?")?
+            .query_row([s.domain], |r| r.get(0))
+            .optional()?;
+        suffixes.insert(s.domain, suffix);
     }
-    let parts: Vec<Option<i64>> = conn
-        .prepare_cached("select part from segments where file_id = ?")?
-        .query_map([file_id], |r| r.get(0))?
-        .collect::<Result<_>>()?;
-    for p in parts.into_iter().flatten() {
-        insert_part(&mut seen, p);
+    Ok(dedup_key(&s.local, s.domain, suffixes.get(&s.domain).and_then(|x| x.as_deref())))
+}
+
+/// what file `file_id`'s rows held back, `limit` at most (-1: all)
+fn held_back(conn: &Connection, file_id: i64, limit: i64) -> Result<Vec<Article>> {
+    conn.prepare_cached(
+        "select message_id, subject, part, total_parts, file_total from held_back where file_id = ? limit ?",
+    )?
+    .query_map(params![file_id, limit], |r| {
+        Ok(Article {
+            message_id: r.get(0)?,
+            subject: r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+            part: r.get(2)?,
+            total_parts: r.get(3)?,
+            file_total: r.get(4)?,
+            ..Default::default()
+        })
+    })?
+    .collect()
+}
+
+/// What new articles held back said about file `file_id`, folded in
+fn fold_in(conn: &Connection, file_id: i64, news: &[Article]) -> Result<()> {
+    if news.is_empty() {
+        return Ok(());
     }
-    conn.prepare_cached("update files set seen = ? where id = ?")?.execute(params![seen, file_id])?;
+    let (release_id, filename): (i64, String) = conn
+        .prepare_cached("select release_id, filename from files where id = ?")?
+        .query_row([file_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    let mut f = file(conn, release_id, &filename)?;
+    for a in news {
+        f.add(a);
+    }
+    conn.prepare_cached(
+        "update files set subject = ?, subject_part = ?, subject_mid = ?, expected = ?, file_total = ? where id = ?",
+    )?
+    .execute(params![f.subject, f.subject_part, f.subject_mid, f.expected, f.file_total, file_id])?;
+    if let Some(ft) = news.iter().filter_map(|a| a.file_total).max() {
+        conn.prepare_cached("update releases set file_total = max(coalesce(file_total, ?), ?) where id = ?")?
+            .execute(params![ft, ft, release_id])?;
+    }
+    Ok(())
+}
+
+/// file `file_id`'s release's completeness worked out again
+fn update_complete(conn: &Connection, file_id: i64) -> Result<()> {
     let (release_id, file_total): (i64, Option<i64>) = conn
         .prepare_cached("select r.id, r.file_total from files f join releases r on r.id = f.release_id where f.id = ?")?
         .query_row([file_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
@@ -866,11 +865,96 @@ pub(crate) fn recount_parts(conn: &Connection, file_id: i64) -> Result<()> {
     Ok(())
 }
 
+/// The ways message-id `id` can be stored as a row: whole, packed under its
+/// domain (if it has a row), and packed as text the way before locals were
+/// packed by alphabet.
+fn stored_forms(conn: &Connection, id: &str) -> Result<Vec<(Vec<u8>, i64)>> {
+    let mut forms = vec![(whole(id), 0)];
+    if let Some((local, suffix)) = split_message_id(id)
+        && let Some(d) = conn
+            .prepare_cached("select id from domains where suffix = ?")?
+            .query_row([suffix], |r| r.get::<_, i64>(0))
+            .optional()?
+    {
+        forms.push((pack_local(local), d));
+        let mut text = vec![TEXT];
+        text.extend_from_slice(local.as_bytes());
+        forms.push((text, d));
+    }
+    Ok(forms)
+}
+
+/// What a file that wont seal (too many rows, or rows a blob cant hold) held
+/// back, settled without sealing it: the rows that are copies of an article
+/// in its blob `segs` go, out of the totals with what they said, and the new
+/// ones' totals and subject are folded in. `SEAL_MAX_SEGMENTS` entries a
+/// time at most, the rest on the next walk.
+fn settle_held_back(conn: &Connection, file_id: i64, segs: &[crate::blob::Seg]) -> Result<()> {
+    let entries = held_back(conn, file_id, SEAL_MAX_SEGMENTS)?;
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let mut suffixes = HashMap::new();
+    let in_blob: HashSet<String> = segs.iter().map(|s| seg_key(conn, &mut suffixes, s)).collect::<Result<_>>()?;
+    let (mut bytes, mut copies, mut news) = (0i64, 0i64, Vec::new());
+    for a in entries {
+        conn.prepare_cached("delete from held_back where file_id = ? and message_id = ?")?
+            .execute(params![file_id, a.message_id])?;
+        if !in_blob.contains(&a.message_id) {
+            news.push(a);
+            continue;
+        }
+        for (local, domain) in stored_forms(conn, &a.message_id)? {
+            let gone: Option<Option<i64>> = conn
+                .prepare_cached("delete from segments where file_id = ? and local = ? and domain = ? returning bytes")?
+                .query_row(params![file_id, local, domain], |r| r.get(0))
+                .optional()?;
+            if let Some(b) = gone {
+                (bytes, copies) = (bytes + b.unwrap_or(0), copies + 1);
+            }
+        }
+    }
+    if copies > 0 {
+        let release_id: i64 =
+            conn.prepare_cached("select release_id from files where id = ?")?.query_row([file_id], |r| r.get(0))?;
+        uncount_copies(conn, release_id, bytes, copies)?;
+    }
+    fold_in(conn, file_id, &news)?;
+    if copies > 0 {
+        // the parts are what the blob and the rows left have
+        recount_parts(conn, file_id)
+    } else if !news.is_empty() {
+        update_complete(conn, file_id)
+    } else {
+        Ok(())
+    }
+}
+
+/// File `file_id`'s parts worked out again from its blob and rows, and its
+/// release's completeness with them: after dropping copies whose parts were
+/// counted (see `SealedCache`).
+pub(crate) fn recount_parts(conn: &Connection, file_id: i64) -> Result<()> {
+    let mut seen = Vec::new();
+    for p in sealed_segments(conn, file_id)?.unwrap_or_default().iter().filter_map(|s| s.part) {
+        insert_part(&mut seen, p);
+    }
+    {
+        let mut stmt = conn.prepare_cached("select part from segments where file_id = ? and part is not null")?;
+        let mut parts = stmt.query([file_id])?;
+        while let Some(r) = parts.next()? {
+            insert_part(&mut seen, r.get(0)?);
+        }
+    }
+    conn.prepare_cached("update files set seen = ? where id = ?")?.execute(params![seen, file_id])?;
+    update_complete(conn, file_id)
+}
+
 /// The next `limit` files after `after_id`, and which of them a writer
 /// seals: ones with rows that are complete and not sealed yet, or untouched
 /// for `SEAL_AGE` (a sealed file with late rows waits for this). Files never
 /// touched since the upgrade are left to compaction, and files with a
-/// negative part number, or more than `SEAL_MAX_SEGMENTS` rows, never seal.
+/// negative part number, or more than `SEAL_MAX_SEGMENTS` rows, never seal
+/// (they are taken only to settle what they held back, `settle_held_back`).
 /// Returns the ids and the last id looked
 /// at, for walking the table `limit` files at a time: `last == after_id`
 /// means the end.
@@ -878,7 +962,8 @@ pub(crate) fn sealable(conn: &Connection, after_id: i64, limit: usize, now: i64)
     let mut stmt = conn.prepare_cached(&format!(
         "select f.id, f.expected, f.seen, f.touched_at, f.blob is not null,
                 exists (select 1 from segments s where s.file_id = f.id),
-                exists (select 1 from segments s where s.file_id = f.id and (s.part < 0 or length(s.local) > {})) or {}
+                exists (select 1 from segments s where s.file_id = f.id and (s.part < 0 or length(s.local) > {})) or {},
+                exists (select 1 from held_back h where h.file_id = f.id)
          from files f where f.id > ? order by f.id limit ?",
         crate::blob::MAX_LOCAL,
         too_many_rows()
@@ -889,7 +974,11 @@ pub(crate) fn sealable(conn: &Connection, after_id: i64, limit: usize, now: i64)
     while let Some(r) = rows.next()? {
         let id: i64 = r.get(0)?;
         last = id;
-        let (has_rows, never): (bool, bool) = (r.get(5)?, r.get(6)?);
+        let (has_rows, never, held): (bool, bool, bool) = (r.get(5)?, r.get(6)?, r.get(7)?);
+        // one that never seals still gets what it held back settled
+        if has_rows && never && held {
+            ids.push(id);
+        }
         if !has_rows || never {
             continue;
         }
@@ -2432,6 +2521,63 @@ mod tests {
         assert_eq!(release(&conn), (true, Some(2)), "every file has its parts, and the file total");
         let held: i64 = conn.query_row("select count(*) from held_back", [], |r| r.get(0)).unwrap();
         assert_eq!(held, 0);
+    }
+
+    /// A file past the most a blob takes never seals, but what a save past
+    /// its decode budget held back for it is still settled: a copy of a
+    /// sealed article goes with what it said, a new one's totals count.
+    #[test]
+    fn what_a_file_too_big_to_seal_held_back_is_settled_anyway() {
+        let (_dir, main) = sealed_fixture();
+        let shard = shard_of("alt.binaries.t");
+        let mut conn = db::open_at(&shard_path(&main, shard)).unwrap();
+        for id in conn.prepare("select id from files").unwrap().query_map([], |r| r.get(0)).unwrap() {
+            seal_file(&conn, id.unwrap()).unwrap();
+        }
+        let a: i64 = conn.query_row("select id from files where filename = 'a.rar'", [], |r| r.get(0)).unwrap();
+        let state = |conn: &Connection| -> (Option<i64>, Vec<u8>) {
+            conn.query_row("select expected, seen from files where id = ?", [a], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+        };
+        let before = state(&conn);
+        let article = |id: &str, part: i64, total: i64| Article {
+            message_id: id.into(),
+            subject: format!("\"a.rar\" yEnc ({part}/{total})"),
+            filename: Some("a.rar".into()),
+            part: Some(part),
+            total_parts: Some(total),
+            bytes: 100 + part,
+            ..Default::default()
+        };
+        let mut writer = ShardWriter::new(shard);
+        writer.decode_budget = 0;
+        // a repost of a1 claiming 5 parts, and a genuinely new 4th of 4
+        let rel = Release {
+            name: "Rel".into(),
+            group: "alt.binaries.t".into(),
+            articles: vec![article("<a1@x>", 1, 5), article("<a4@x>", 4, 4)],
+            ..Default::default()
+        };
+        writer.save(&mut conn, &Ids::new(&main), [std::slice::from_ref(&rel)]).unwrap();
+        let held =
+            |conn: &Connection| -> i64 { conn.query_row("select count(*) from held_back", [], |r| r.get(0)).unwrap() };
+        assert_eq!(held(&conn), 2);
+        let rows = |conn: &Connection| -> i64 {
+            conn.query_row("select count(*) from segments where file_id = ?", [a], |r| r.get(0)).unwrap()
+        };
+        add_rows(&conn, a, SEAL_MAX_SEGMENTS);
+        let articles: i64 = conn.query_row("select value from meta where key = 'articles'", [], |r| r.get(0)).unwrap();
+
+        let now: i64 = conn.query_row("select unixepoch()", [], |r| r.get(0)).unwrap();
+        assert!(sealable(&conn, 0, 100, now).unwrap().0.contains(&a), "walked to for what it held back");
+        assert_eq!(seal_file(&conn, a).unwrap(), 0, "still too big to seal");
+        assert_eq!(held(&conn), 0, "settled");
+        assert_eq!(rows(&conn), SEAL_MAX_SEGMENTS + 1, "the copy went, the new one and the padding stay");
+        let after: i64 = conn.query_row("select value from meta where key = 'articles'", [], |r| r.get(0)).unwrap();
+        assert_eq!(after, articles - 1, "the copy out of the shard's total");
+        assert_eq!(state(&conn).0, Some(4), "the new one's total counts, not the copy's");
+        assert_ne!(state(&conn).1, before.1);
+        assert!(!sealable(&conn, 0, 100, now).unwrap().0.contains(&a), "and it's skipped again");
     }
 
     /// what purging takes off the totals is what it deleted, counted in its
