@@ -1,6 +1,6 @@
 use std::process::ExitCode;
 
-use atlas::{app, bg_indexer, compact, convert, paths, procs};
+use atlas::{app, bg_indexer, compact, convert, db, paths, procs, store};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -68,7 +68,13 @@ fn run_compact() -> i32 {
     // nothing sets it: only the indexer stops a compaction early
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     match compact::run(&paths::database(), &|msg| println!("{msg}"), &stop) {
-        Ok(_) => 0,
+        Ok(_) => {
+            // noted like the indexer's own compaction does, soo the auto one waits its interval
+            if let Ok(conn) = db::open_at(&paths::database()) {
+                let _ = store::set_meta(&conn, "last_compact", chrono::Utc::now().timestamp());
+            }
+            0
+        }
         Err(e) => {
             println!("couldnt compact: {e:#}");
             1
