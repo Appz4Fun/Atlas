@@ -993,6 +993,32 @@ async fn reach_further(db: &Db, group: &str, (day, floor, oldest): (i64, i64, Op
     }
 }
 
+/// `chunk` is done with `dated` articles dated in its day. Only when this
+/// claim is what made it done does what the day showed count: a claim taken
+/// over (gone stale while it ran) leaves the speculative window and the older
+/// days to the worker that has it now. `alone`, `floor` and `oldest` are as
+/// `index_chunk` found them.
+async fn finish_chunk(
+    db: &Db,
+    chunk: &crate::chunks::Claim,
+    (alone, floor, oldest): (bool, Option<i64>, Option<i64>),
+    dated: i64,
+) -> Result<()> {
+    let (group, day) = (chunk.group.as_str(), chunk.day);
+    let c = chunk.clone();
+    let now = chrono::Utc::now().timestamp();
+    if !on_db(db, move |conn| Ok(crate::chunks::finish(conn, &c, now)?)).await? {
+        println!("[CHUNK] {group} day {day}: taken over by another worker, leaving it to that one");
+        return Ok(());
+    }
+    if alone && dated == 0 {
+        drop_older_days(db, group, day).await;
+    } else if let Some(floor) = floor {
+        reach_further(db, group, (day, floor, oldest), dated).await;
+    }
+    Ok(())
+}
+
 async fn index_chunk<P>(
     ctx: &PassContext,
     settings: &PassSettings,
@@ -1008,14 +1034,6 @@ where
     let release = || {
         let c = chunk.clone();
         on_db(db, move |conn| Ok(crate::chunks::release(conn, &c)?))
-    };
-    let finish = async || {
-        let c = chunk.clone();
-        let now = chrono::Utc::now().timestamp();
-        if !on_db(db, move |conn| Ok(crate::chunks::finish(conn, &c, now)?)).await? {
-            println!("[CHUNK] {group} day {day}: taken over by another worker, leaving it to that one");
-        }
-        anyhow::Ok(())
     };
     // give the chunk back after `e`, and return `e`: failing to give it back
     // is only logged (the claim goes stale and gets taken over)
@@ -1170,10 +1188,7 @@ where
         None => None,
     };
     if start > end {
-        finish().await?;
-        if alone {
-            drop_older_days(db, group, day).await;
-        }
+        finish_chunk(db, chunk, (alone, floor, oldest), 0).await?;
         return Ok(Progress::default());
     }
 
@@ -1181,12 +1196,7 @@ where
     let window = alone.then_some((day * 86_400, (day + 1) * 86_400));
     match pass.process_range_dated(start as i64, end as i64, "CHUNK", window, progress).await {
         Ok((saved, true, dated_in_day)) => {
-            finish().await?;
-            if alone && dated_in_day == 0 {
-                drop_older_days(db, group, day).await;
-            } else if let Some(floor) = floor {
-                reach_further(db, group, (day, floor, oldest), dated_in_day).await;
-            }
+            finish_chunk(db, chunk, (alone, floor, oldest), dated_in_day).await?;
             Ok(saved)
         }
         Ok((saved, false, _)) => {
@@ -1717,6 +1727,53 @@ mod tests {
         reach_further(&db, g, (floor, floor, Some(0)), 1).await;
         let s = on_db(&db, move |c| Ok(crate::chunks::speculative(c, g)?)).await.unwrap().unwrap();
         assert_eq!(s.reach, 2 * SPECULATIVE_WINDOW);
+    }
+
+    #[test]
+    fn a_chunk_taken_over_leaves_the_older_days_and_the_window_alone() {
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        rt.block_on(a_chunk_taken_over());
+    }
+
+    async fn a_chunk_taken_over() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        db::create_db_at(&main).unwrap();
+        let db = shared_db(db::open_at(&main).unwrap());
+        let (r, g) = (20_000, "g");
+        let floor = r - SPECULATIVE_WINDOW;
+        let start = crate::chunks::Speculative { runner_up_day: r, reach: SPECULATIVE_WINDOW, days: 0, articles: 0 };
+        let claim = on_db(&db, move |c| {
+            crate::chunks::add(c, g, floor, floor - 5)?;
+            crate::chunks::set_speculative(c, g, &start)?;
+            Ok(crate::chunks::claim(c, &[(g.to_string(), i64::MIN)], "a", 0)?.unwrap())
+        })
+        .await
+        .unwrap();
+        assert_eq!(claim.day, floor);
+        let days = || {
+            on_db(&db, move |c| Ok(c.query_row("select count(*) from backfill_chunks", [], |r| r.get::<_, i64>(0))?))
+        };
+        let window = || on_db(&db, move |c| Ok(crate::chunks::speculative(c, g)?.unwrap()));
+
+        // its claim went stale and another worker has it now
+        on_db(&db, move |c| Ok(c.execute("update backfill_chunks set claimed_at = 99 where day = ?", [floor])?))
+            .await
+            .unwrap();
+        // no dated article in the day: the older days stay
+        finish_chunk(&db, &claim, (true, None, Some(0)), 0).await.unwrap();
+        assert_eq!(days().await.unwrap(), 6);
+        // a dense day: the window doesnt count it, nor reach further
+        finish_chunk(&db, &claim, (true, Some(floor), Some(0)), 100_000).await.unwrap();
+        let s = window().await.unwrap();
+        assert_eq!((s.reach, s.days, s.articles), (SPECULATIVE_WINDOW, 0, 0));
+        assert_eq!(days().await.unwrap(), 6);
+
+        // the claim that has it does both
+        let mut now = claim.clone();
+        now.claimed_at = 99;
+        finish_chunk(&db, &now, (true, None, Some(0)), 0).await.unwrap();
+        assert_eq!(days().await.unwrap(), 1, "the older days went to the sweeps");
     }
 
     #[test]
