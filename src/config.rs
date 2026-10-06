@@ -348,20 +348,34 @@ pub fn file_problem() -> Option<String> {
 
 /// Why the config file at `path` cant be used though it's there: it cant be
 /// read, or isnt valid JSON (where, as serde_json says, never the text: it
-/// holds passwords). None when it's fine, or isnt there at all.
+/// holds passwords), or is JSON that isnt an object (`null`, a list...: it
+/// would load as an empty config, and setup would save over it). None when
+/// it's fine, or isnt there at all.
 pub fn file_problem_at(path: &std::path::Path) -> Option<String> {
-    match fs::read_to_string(path) {
-        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
-        Err(e) => Some(format!("couldnt read {}: {e}", path.display())),
-        Ok(text) => {
-            serde_json::from_str::<Value>(&text).err().map(|e| format!("{} isnt valid JSON: {e}", path.display()))
+    let text = match fs::read_to_string(path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return None,
+        Err(e) => return Some(format!("couldnt read {}: {e}", path.display())),
+        Ok(text) => text,
+    };
+    match serde_json::from_str::<Value>(&text) {
+        Err(e) => Some(format!("{} isnt valid JSON: {e}", path.display())),
+        Ok(Value::Object(_)) => None,
+        Ok(other) => {
+            let kind = match other {
+                Value::Null => "null",
+                Value::Bool(_) => "a boolean",
+                Value::Number(_) => "a number",
+                Value::String(_) => "a string",
+                _ => "an array",
+            };
+            Some(format!("{} holds {kind}, not an object", path.display()))
         }
     }
 }
 
 fn read_file() -> Option<Value> {
     let text = fs::read_to_string(config_file()).ok()?;
-    serde_json::from_str(&text).ok()
+    serde_json::from_str(&text).ok().filter(Value::is_object)
 }
 
 /// Load config. Servers come from `usenet_servers` (or the old top level
@@ -633,6 +647,22 @@ mod tests {
 
         std::fs::write(&path, "{\"groups\": []}").unwrap();
         assert_eq!(file_problem_at(&path), None);
+    }
+
+    #[test]
+    fn valid_json_that_isnt_an_object_is_a_problem_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        // setup would save over any of these, as if there were no config
+        for (text, kind) in [("null", "null"), ("[]", "an array"), ("\"hunter2\"", "a string"), ("42", "a number")] {
+            std::fs::write(&path, text).unwrap();
+            let problem = file_problem_at(&path).unwrap_or_else(|| panic!("{text} isnt a config"));
+            assert!(problem.contains(&path.display().to_string()), "{problem}");
+            assert!(problem.contains(&format!("{kind}, not an object")), "{problem}");
+            assert!(!problem.contains("hunter2"), "no file contents: {problem}");
+        }
+        std::fs::write(&path, "{}").unwrap();
+        assert_eq!(file_problem_at(&path), None, "an empty object is still a config");
     }
 
     #[test]
