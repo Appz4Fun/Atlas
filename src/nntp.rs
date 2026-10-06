@@ -233,7 +233,7 @@ impl Ends {
             return;
         };
         self.read_to = self.read_to.max(Some(number));
-        let Some(t) = fields.nth(2).and_then(|d| crate::dates::posted_timestamp(&String::from_utf8_lossy(d))) else {
+        let Some(t) = fields.nth(2).and_then(|d| plausible_post_time(&String::from_utf8_lossy(d))) else {
             return;
         };
         if self.first.is_none_or(|f| number < f.0) {
@@ -874,6 +874,21 @@ pub struct ServerStat {
 
 /// an article number and when it was posted (unix seconds)
 type Dated = (u64, i64);
+
+/// A Date header as unix seconds when it could be true: from 2000 on and not
+/// later than a little past now. Posters set their own Dates, soo a date search
+/// passes over the others as undated rather than be thrown off by them.
+fn plausible_post_time(date: &str) -> Option<i64> {
+    /// 2000-01-01, and the slack for clocks running ahead
+    const EARLIEST: i64 = 946_684_800;
+    const AHEAD: i64 = 2 * 86_400;
+    let t = crate::dates::posted_timestamp(date)?;
+    (EARLIEST..=chrono::Utc::now().timestamp() + AHEAD).contains(&t).then_some(t)
+}
+
+/// windows of `DATE_LOOK` numbers a day chunk reads on each side of the range
+/// the date search found for it, for posts of that day the search missed
+pub const DAY_CHECK_WINDOWS: u64 = 8;
 
 /// numbers per date search request at first, and at most
 const DATE_LOOK: u64 = 100;
@@ -1649,15 +1664,24 @@ impl Pool {
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
             let found = self.first_in(i, group, mid, hi).await?;
+            // the first article found older: the window from it says whether
+            // all of it is (a single forged Date doesnt move lo past the
+            // articles below mid), else its first one that isnt answers
+            let mut newer = found.map(|(n, _)| n);
             if let Some((n, t)) = found
                 && t < when
             {
-                lo = n + 1;
-                continue;
+                match self.first_dated_from(i, group, n, hi, when).await? {
+                    None => {
+                        lo = n + 1;
+                        continue;
+                    }
+                    Some(m) => newer = Some(m),
+                }
             }
             // nothing from mid up to the article found (or up to hi)
             let gap_end = found.map_or(hi, |(n, _)| n);
-            if let Some((n, _)) = found {
+            if let Some(n) = newer {
                 first = n;
             }
             hi = mid;
@@ -1671,6 +1695,69 @@ impl Pool {
             }
         }
         Ok(first)
+    }
+
+    /// The articles of `start..=end` on server `i`, empty when there are none.
+    async fn listing(&self, i: usize, group: &str, start: u64, end: u64) -> Result<Vec<Overview>> {
+        match self.xover_on(i, group, start, end).await {
+            Err(e) if e.is_empty_range() => Ok(Vec::new()),
+            r => r,
+        }
+    }
+
+    /// The first article in the `DATE_LOOK` numbers from `n` (below `hi`) on
+    /// server `i` posted at or after `when`, by its plausible Date. None when
+    /// every one of them was posted before.
+    async fn first_dated_from(&self, i: usize, group: &str, n: u64, hi: u64, when: i64) -> Result<Option<u64>> {
+        let end = n.saturating_add(DATE_LOOK - 1).min(hi.saturating_sub(1)).max(n);
+        let rows = self.listing(i, group, n, end).await?;
+        Ok(rows.iter().find(|o| plausible_post_time(&o.date).is_some_and(|t| t >= when)).map(|o| o.number))
+    }
+
+    /// `start..=end` of `group` on server `i` (`low..=high` on the server)
+    /// widened to the articles posted in `from..to` among the
+    /// `DAY_CHECK_WINDOWS` windows of `DATE_LOOK` numbers before `start` and
+    /// after `end`. The date search takes post dates for ordered, which a run
+    /// of forged Dates can make it miss a day's posts by, even all of them:
+    /// this bounded look around the range finds those near it.
+    pub async fn widen_to_day(
+        &self,
+        i: usize,
+        group: &str,
+        (low, high): (u64, u64),
+        (start, end): (u64, u64),
+        (from, to): (i64, i64),
+    ) -> Result<(u64, u64)> {
+        let in_day = |rows: &[Overview]| -> Vec<u64> {
+            rows.iter()
+                .filter(|o| plausible_post_time(&o.date).is_some_and(|t| (from..to).contains(&t)))
+                .map(|o| o.number)
+                .collect()
+        };
+        let (mut first, mut last) = (start, end);
+        let mut at = start;
+        for _ in 0..DAY_CHECK_WINDOWS {
+            if at <= low {
+                break;
+            }
+            let a = at.saturating_sub(DATE_LOOK).max(low);
+            if let Some(&n) = in_day(&self.listing(i, group, a, at - 1).await?).iter().min() {
+                first = first.min(n);
+            }
+            at = a;
+        }
+        let mut at = end.saturating_add(1).max(low);
+        for _ in 0..DAY_CHECK_WINDOWS {
+            if at > high {
+                break;
+            }
+            let b = at.saturating_add(DATE_LOOK - 1).min(high);
+            if let Some(&n) = in_day(&self.listing(i, group, at, b).await?).iter().max() {
+                last = last.max(n);
+            }
+            at = b + 1;
+        }
+        Ok((first, last))
     }
 
     /// Compressed listings from server `i` couldnt be read: it gets plain ones from now on.

@@ -1102,3 +1102,86 @@ fn a_sparse_region_before_a_hole_is_not_skipped() {
     finds_the_first_post_for_each(&list, &[1], &whens);
     chunks_save_every_post_of(&list, &days_from(&list, 19_000, 5));
 }
+
+/// One article above the first midpoint dated far too early (a forged Date)
+/// doesnt move the search past the articles below it.
+#[test]
+fn a_forged_early_date_at_a_midpoint_doesnt_skip_the_articles_below_it() {
+    // the search for hour 700 probes 501 (older), then 751: forged to the start
+    let posts: Vec<common::Post> = with_gap(1, 1000, 0..=0)
+        .into_iter()
+        .map(|mut p| {
+            if p.number == 751 {
+                p.date = "Thu, 01 Jan 2026 00:00:00 +0000".into();
+            }
+            p
+        })
+        .collect();
+    assert_eq!(search(posts, 1, 1000, hour_of(700)), 700);
+}
+
+/// posts 1..=240 one an hour from 2026-01-01, 100..=200 forged to `forged`;
+/// day 2026-01-10 is 217..=240
+fn forged_run(forged: &str) -> Vec<common::Post> {
+    with_gap(1, 240, 0..=0)
+        .into_iter()
+        .map(|mut p| {
+            if (100..=200).contains(&p.number) {
+                p.date = forged.into();
+            }
+            p
+        })
+        .collect()
+}
+
+/// The day chunk for 2026-01-10 over `posts`: the numbers of it that were saved
+fn chunk_of_jan_10(posts: Vec<common::Post>) -> Vec<u64> {
+    let home = tempfile::tempdir().unwrap();
+    let main = home.path().join("atlas.db");
+    atlas::db::create_db_at(&main).unwrap();
+    let port = spawn_server(Server::new(posts));
+    let pool = BlockingPool::new(&[mock(port, "secret", 2, 1)]);
+    pool.connect().unwrap();
+
+    let day = atlas::chunks::unix_day(hour_of(217));
+    let main_conn = atlas::db::open_at(&main).unwrap();
+    atlas::chunks::add(&main_conn, GROUP, day, day).unwrap();
+    let ctx = atlas::indexer::PassContext {
+        pool: pool.pool.clone(),
+        states: Default::default(),
+        stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        verbose: false,
+    };
+    let db = atlas::indexer::shared_db(main_conn);
+    let chunk = claimed(&main, GROUP, day);
+    pool.block_on(atlas::indexer::run_chunk(&ctx, &Default::default(), &db, &chunk, 0, &mut |_| {})).unwrap();
+
+    let conn = atlas::db::open_with_shards(&main).unwrap();
+    assert_eq!(atlas::chunks::progress(&conn, GROUP).unwrap(), (1, 1));
+    let shard = atlas::store::shard_of(GROUP);
+    let mut q = conn.prepare(&format!("select subject from s{shard}.files")).unwrap();
+    // subjects are "pN.bin" yEnc (1/1)
+    let mut saved: Vec<u64> = q
+        .query_map([], |r| r.get::<_, String>(0))
+        .unwrap()
+        .map(|s| s.unwrap().trim_start_matches("\"p").split('.').next().unwrap().parse().unwrap())
+        .collect();
+    saved.sort();
+    saved
+}
+
+/// A run of posts with Dates from the future (later than now) is passed over
+/// by the search: the day's posts after it are all fetched.
+#[test]
+fn a_run_of_future_dates_doesnt_empty_the_day() {
+    let saved = chunk_of_jan_10(forged_run("Mon, 01 Jan 2035 00:00:00 +0000"));
+    assert!((216..=240).all(|n| saved.contains(&n)), "the day's posts are missing: {saved:?}");
+}
+
+/// A run of posts with Dates after the day but not in the future: the search
+/// finds the day empty, the check around it still finds the day's posts.
+#[test]
+fn a_run_of_later_dates_doesnt_empty_the_day() {
+    let saved = chunk_of_jan_10(forged_run("Mon, 01 Jun 2026 00:00:00 +0000"));
+    assert!((216..=240).all(|n| saved.contains(&n)), "the day's posts are missing: {saved:?}");
+}

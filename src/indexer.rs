@@ -850,6 +850,11 @@ where
         Ok(n) => n.saturating_sub(1),
         Err(e) => return failed(e.into()).await,
     };
+    // posts of the day the search missed, near what it found
+    let (start, end) = match ctx.pool.widen_to_day(server, group, (first, last), (start, end), (from, to)).await {
+        Ok(range) => range,
+        Err(e) => return failed(e.into()).await,
+    };
     if start > end {
         finish().await?;
         return Ok(Progress::default());
