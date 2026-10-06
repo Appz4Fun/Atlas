@@ -1449,11 +1449,20 @@ impl ShardWriter {
                         }
                     } else {
                         // a file just made whose articles all were in other files
-                        tx.prepare_cached(
-                            "delete from files where id = ? and touched_at is null and blob is null
-                             and not exists (select 1 from segments where file_id = ?)",
-                        )?
-                        .execute(params![f.id, f.id])?;
+                        let gone = tx
+                            .prepare_cached(
+                                "delete from files where id = ? and touched_at is null and blob is null
+                                 and not exists (select 1 from segments where file_id = ?)",
+                            )?
+                            .execute(params![f.id, f.id])?;
+                        // down to one file its index is no longer kept up (see
+                        // `others` above): dropped, to be made again by the next file
+                        let others = tx
+                            .prepare_cached("select 1 from files where release_id = ? limit 1 offset 1")?
+                            .exists([release_id])?;
+                        if gone > 0 && !others {
+                            tx.prepare_cached("delete from release_ids where release_id = ?")?.execute([release_id])?;
+                        }
                     }
                 }
                 profile::ARTICLES.add_since(t);
@@ -2778,6 +2787,30 @@ mod tests {
         assert_eq!(count(), before);
         let loose: i64 = conn.query_row("select count(*) from segments", [], |r| r.get(0)).unwrap();
         assert_eq!(loose, 0);
+    }
+
+    /// A second file made only of copies goes again, and with it the index it
+    /// started: left behind, the sole file's later articles would never be put
+    /// in it, and a copy of one of them in a new file would go unnoticed.
+    #[test]
+    fn a_copies_only_file_leaves_no_stale_index_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        db::create_db_at(&main).unwrap();
+        let shard = shard_path(&main, shard_of("alt.binaries.t"));
+        let conn = db::open_at(&shard).unwrap();
+        let count = || -> i64 { conn.query_row("select count(*) from segments", [], |r| r.get(0)).unwrap() };
+        save(&main, &[one_file_release("a.rar", &["<a1@x>", "<a2@x>"])]).unwrap();
+        save(&main, &[one_file_release("b.rar", &["<a1@x>"])]).unwrap();
+        let files: i64 = conn.query_row("select count(*) from files", [], |r| r.get(0)).unwrap();
+        assert_eq!(files, 1, "b.rar was only a copy");
+        let indexed: i64 = conn.query_row("select count(*) from release_ids", [], |r| r.get(0)).unwrap();
+        assert_eq!(indexed, 0, "and its index went with it");
+
+        save(&main, &[one_file_release("a.rar", &["<a3@x>"])]).unwrap();
+        let before = count();
+        save(&main, &[one_file_release("b.rar", &["<a3@x>"])]).unwrap();
+        assert_eq!(count(), before, "a copy of a later article is still found");
     }
 
     /// A release saved before the index (an upgraded shard) gets it the
