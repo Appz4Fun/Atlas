@@ -18,6 +18,7 @@
 //! between moving the original aside and the copy in (a crash) is undone by
 //! the next start or compaction, see `recover_cut_swaps`.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -445,7 +446,8 @@ fn compact_shard(
     halt(stop, shard)?;
     say(&format!("copying files and articles ({kept} shared domains, dropping {dropped}), sealing those due"));
     let now = chrono::Utc::now().timestamp();
-    let (mut copied, mut sealed) = (0i64, 0i64);
+    // rows dropped as copies of what their file's blob already has
+    let (mut copied, mut sealed, mut copies) = (0i64, 0i64, 0i64);
     {
         let open = || Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY);
         let (files_read, rows_read) = (open()?, open()?);
@@ -496,6 +498,15 @@ fn compact_shard(
                 };
                 let (local, domain) = rewrite(shard, id, seg.local, seg.domain, shared(seg.domain), suffix.as_deref())?;
                 segs.push(Seg { local, domain, ..seg });
+            }
+
+            // a row the blob already has (the same message-id) isnt copied:
+            // it goes before the blob is counted, the way `seal_rows` drops it
+            if !segs.is_empty() {
+                let held: HashSet<(&[u8], i64)> = segs.iter().map(|s| (s.local.as_slice(), s.domain)).collect();
+                let had = file_rows.len();
+                file_rows.retain(|r| !held.contains(&(r.local.as_slice(), r.domain)));
+                copies += (had - file_rows.len()) as i64;
             }
 
             // rows a blob cant hold exactly (a negative part, no size) stay rows
@@ -567,7 +578,7 @@ fn compact_shard(
     // the check: same rows, same NZBs
     halt(stop, shard)?;
     say("checking");
-    check(&path, &copy, shard, copied, stop)?;
+    check(&path, &copy, shard, copied, copies, stop)?;
 
     // swap: the last point to stop at
     halt(stop, shard)?;
@@ -661,9 +672,10 @@ fn insert_row(conn: &Connection, r: &Row) -> Result<()> {
 }
 
 /// The copy holds the same releases, files and articles (rows and inside
-/// blobs) as the original, and a sample of releases build the same NZBs from
+/// blobs) as the original, less the `copies` rows that were copies of what
+/// their blob already had, and a sample of releases build the same NZBs from
 /// both.
-fn check(original: &Path, copy: &Path, shard: usize, copied: i64, stop: &Arc<AtomicBool>) -> Result<()> {
+fn check(original: &Path, copy: &Path, shard: usize, copied: i64, copies: i64, stop: &Arc<AtomicBool>) -> Result<()> {
     let attach = |path: &Path| -> Result<Connection> {
         let conn = Connection::open_in_memory()?;
         interruptible(&conn, stop)?;
@@ -682,8 +694,10 @@ fn check(original: &Path, copy: &Path, shard: usize, copied: i64, stop: &Arc<Ato
     }
     let schema = format!("s{shard}");
     let (a, b) = (store::article_count(&old, &schema)?, store::article_count(&new, &schema)?);
-    if a != b {
-        bail!("shard {shard}: {b} articles in the copy, {a} in the original; the original was kept");
+    if a - copies != b {
+        bail!(
+            "shard {shard}: {b} articles in the copy, {a} in the original ({copies} copies dropped); the original was kept"
+        );
     }
     if copied != b {
         bail!("shard {shard}: some articles came out as duplicates; the original was kept");
@@ -704,11 +718,21 @@ fn check(original: &Path, copy: &Path, shard: usize, copied: i64, stop: &Arc<Ato
             .ok();
         let Some(id) = found else { continue };
         let (a, b) = (store::articles(&old, id)?, store::articles(&new, id)?);
-        if a != b {
+        if a != b && !(copies > 0 && same_but_copies(&a, &b)) {
             bail!("shard {shard}: release {id} reads back differently from the copy; the original was kept");
         }
     }
     Ok(())
+}
+
+/// `copy` is `original` with only rows dropped that were a second copy of a
+/// message-id (the one kept is one of the original's).
+fn same_but_copies(original: &[crate::search::ArticleRow], copy: &[crate::search::ArticleRow]) -> bool {
+    fn ids(rows: &[crate::search::ArticleRow]) -> HashSet<&str> {
+        rows.iter().map(|r| r.message_id.as_str()).collect()
+    }
+    let kept = ids(copy);
+    kept.len() == copy.len() && kept == ids(original) && copy.iter().all(|r| original.contains(r))
 }
 
 #[cfg(test)]
@@ -1069,6 +1093,38 @@ mod tests {
         assert_eq!(article_total(&main), count);
         assert_eq!(loose(&main), 0, "the late rows are sealed in with the blob");
         assert_eq!(blob_segs_with_known_domains(&main).len() as i64, count);
+    }
+
+    /// A loose row a sealed file's blob already has (same message-id) goes
+    /// when compaction seals the file, instead of becoming a second copy in
+    /// the blob for good.
+    #[test]
+    fn compacting_drops_a_loose_row_its_blob_already_has() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        legacy_fixture(&main);
+        run(&main, &|_| {}, &no_stop()).unwrap();
+        let before = all_articles(&main);
+        let count = article_total(&main);
+
+        let (path, file) = file_of(&main, "Rel.1", "alt.binaries.g1");
+        {
+            let conn = db::open_at(&path).unwrap();
+            let blob: Vec<u8> = conn.query_row("select blob from files where id = ?", [file], |r| r.get(0)).unwrap();
+            let seg = crate::blob::decode(&blob).unwrap().remove(0);
+            conn.execute(
+                "insert into segments (file_id, local, domain, part, bytes) values (?, ?, ?, ?, ?)",
+                params![file, seg.local, seg.domain, seg.part, seg.bytes],
+            )
+            .unwrap();
+            conn.execute("update files set touched_at = 0 where id = ?", [file]).unwrap();
+        }
+        assert_eq!(article_total(&main), count + 1);
+
+        run(&main, &|_| {}, &no_stop()).unwrap();
+        assert_eq!(article_total(&main), count, "the copy went, not into the blob");
+        assert_eq!(loose(&main), 0);
+        assert_eq!(all_articles(&main), before, "every NZB reads back the same");
     }
 
     #[test]
