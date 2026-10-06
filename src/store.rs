@@ -463,6 +463,17 @@ impl Domains {
     }
 }
 
+/// What decides two stored segments are the same article: the message-id as
+/// text, however it is stored (whole, packed, or packed the old way under a
+/// domain). A domain with no suffix row can't be told apart from another
+/// id, soo it keeps its own (domain, local) as the key.
+pub(crate) fn dedup_key(local: &[u8], domain: i64, suffix: Option<&str>) -> String {
+    match (domain, suffix) {
+        (0, _) | (_, Some(_)) => decode(local, suffix),
+        _ => format!("\0{domain}\0{}", local.iter().map(|b| format!("{b:02x}")).collect::<String>()),
+    }
+}
+
 /// A message-id back from its packed local part and its domain's suffix
 /// (none for domain 0, kept whole).
 pub(crate) fn decode(local: &[u8], suffix: Option<&str>) -> String {
@@ -711,9 +722,25 @@ fn seal_rows(conn: &Connection, file_id: i64) -> Result<usize> {
     // a row the blob already has (saved past a save's decode budget, see
     // `SealedCache`) isnt added twice: it goes, before the blob is counted,
     // soo a full blob doesnt keep it a row
-    let held: HashSet<(&[u8], i64)> = segs.iter().map(|s| (s.local.as_slice(), s.domain)).collect();
-    let (copies, rows): (Vec<crate::blob::Seg>, Vec<crate::blob::Seg>) =
-        rows.into_iter().partition(|r| held.contains(&(r.local.as_slice(), r.domain)));
+    // (the same message-id, even stored whole in the blob and packed in the
+    // row, or the other way round, when a domain got shared in between)
+    let mut suffixes: HashMap<i64, Option<String>> = HashMap::new();
+    let mut key = |s: &crate::blob::Seg| -> Result<String> {
+        if s.domain != 0 && !suffixes.contains_key(&s.domain) {
+            let suffix = conn
+                .prepare_cached("select suffix from domains where id = ?")?
+                .query_row([s.domain], |r| r.get(0))
+                .optional()?;
+            suffixes.insert(s.domain, suffix);
+        }
+        Ok(dedup_key(&s.local, s.domain, suffixes.get(&s.domain).and_then(|x| x.as_deref())))
+    };
+    let held: HashSet<String> = segs.iter().map(&mut key).collect::<Result<_>>()?;
+    let (mut copies, mut fresh) = (Vec::new(), Vec::new());
+    for r in rows {
+        if held.contains(&key(&r)?) { copies.push(r) } else { fresh.push(r) }
+    }
+    let rows = fresh;
     for copy in &copies {
         conn.prepare_cached("delete from segments where file_id = ? and local = ? and domain = ?")?
             .execute(params![file_id, copy.local, copy.domain])?;
@@ -1676,6 +1703,32 @@ mod tests {
         )
         .unwrap();
         assert_eq!(seal_file(&conn, a).unwrap(), 3, "the copy isnt added");
+    }
+
+    /// An article saved whole before its domain was shared, and again packed
+    /// after: the same message-id, so sealing drops the row and its counts.
+    #[test]
+    fn resealing_drops_a_packed_row_whose_blob_has_the_same_id_whole() {
+        let (_dir, main) = sealed_fixture();
+        let conn = db::open_at(&shard_path(&main, shard_of("alt.binaries.t"))).unwrap();
+        let a: i64 = conn.query_row("select id from files where filename = 'a.rar'", [], |r| r.get(0)).unwrap();
+        assert_eq!(seal_file(&conn, a).unwrap(), 3);
+        let held = sealed_segments(&conn, a).unwrap().unwrap();
+        let a1 = held.iter().find(|s| s.local == whole("<a1@x>")).expect("<a1@x> stored whole");
+        let d: i64 = conn.query_row("select id from domains where suffix = '@x>'", [], |r| r.get(0)).unwrap();
+        let articles_before: i64 =
+            conn.query_row("select value from meta where key = 'articles'", [], |r| r.get(0)).unwrap();
+        conn.execute(
+            "insert into segments (file_id, local, domain, part, bytes) values (?, ?, ?, ?, ?)",
+            params![a, pack_local("a1"), d, a1.part, a1.bytes],
+        )
+        .unwrap();
+        add_totals(&conn, 0, 1).unwrap();
+        assert_eq!(seal_file(&conn, a).unwrap(), 3, "the packed copy isnt added");
+        let loose: i64 = conn.query_row("select count(*) from segments", [], |r| r.get(0)).unwrap();
+        assert_eq!(loose, 1, "only the other file's row is left");
+        let articles: i64 = conn.query_row("select value from meta where key = 'articles'", [], |r| r.get(0)).unwrap();
+        assert_eq!(articles, articles_before);
     }
 
     /// A release saved again with no articles of its own (its `parts` still

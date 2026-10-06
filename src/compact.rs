@@ -510,9 +510,17 @@ fn compact_shard(
             // a row the blob already has (the same message-id) isnt copied:
             // it goes before the blob is counted, the way `seal_rows` drops it
             if !segs.is_empty() {
-                let held: HashSet<(&[u8], i64)> = segs.iter().map(|s| (s.local.as_slice(), s.domain)).collect();
-                let (dropped, kept): (Vec<Row>, Vec<Row>) =
-                    file_rows.into_iter().partition(|r| held.contains(&(r.local.as_slice(), r.domain)));
+                // (the same message-id, whichever way each is stored now)
+                let mut key = |local: &[u8], domain: i64| -> Result<String> {
+                    let suffix: Option<String> =
+                        if domain == 0 { None } else { suffix_of.query_row([domain], |r| r.get(0)).optional()? };
+                    Ok(store::dedup_key(local, domain, suffix.as_deref()))
+                };
+                let held: HashSet<String> = segs.iter().map(|s| key(&s.local, s.domain)).collect::<Result<_>>()?;
+                let (mut dropped, mut kept) = (Vec::new(), Vec::new());
+                for r in file_rows {
+                    if held.contains(&key(&r.local, r.domain)?) { dropped.push(r) } else { kept.push(r) }
+                }
                 file_rows = kept;
                 if !dropped.is_empty() {
                     // out of the release's and the shard's totals too, copied as they were
@@ -1183,6 +1191,55 @@ mod tests {
         assert_eq!(release_totals(&path, file), once, "and out of its release's and the shard's totals");
         assert_eq!(loose(&main), 0);
         assert_eq!(all_articles(&main), before, "every NZB reads back the same");
+    }
+
+    /// A segment stored whole in a blob (before its domain became shared) and
+    /// the same message-id posted again, packed under the shared domain, are
+    /// one article: compaction drops the row.
+    #[test]
+    fn compacting_drops_a_packed_row_whose_blob_has_the_same_id_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        legacy_fixture(&main);
+        run(&main, &|_| {}, &no_stop()).unwrap();
+        let before = all_articles(&main);
+        let count = article_total(&main);
+
+        let (path, file) = file_of(&main, "Rel.1", "alt.binaries.g1");
+        let once = release_totals(&path, file);
+        {
+            let conn = db::open_at(&path).unwrap();
+            let blob: Vec<u8> = conn.query_row("select blob from files where id = ?", [file], |r| r.get(0)).unwrap();
+            let mut segs = crate::blob::decode(&blob).unwrap();
+            let at = segs.iter().position(|s| s.domain != 0).expect("a packed segment");
+            let seg = segs[at].clone();
+            let suffix: String =
+                conn.query_row("select suffix from domains where id = ?", [seg.domain], |r| r.get(0)).unwrap();
+            // the blob has it whole, the late row packed
+            segs[at].local = store::whole(&store::decode(&seg.local, Some(&suffix)));
+            segs[at].domain = 0;
+            conn.execute("update files set blob = ? where id = ?", params![crate::blob::encode(&segs), file]).unwrap();
+            conn.execute(
+                "insert into segments (file_id, local, domain, part, bytes) values (?, ?, ?, ?, ?)",
+                params![file, seg.local, seg.domain, seg.part, seg.bytes],
+            )
+            .unwrap();
+            conn.execute("update files set touched_at = 0 where id = ?", [file]).unwrap();
+            conn.execute(
+                "update releases set size = size + ?, parts = parts + 1
+                 where id = (select release_id from files where id = ?)",
+                params![seg.bytes, file],
+            )
+            .unwrap();
+            store::add_totals(&conn, 0, 1).unwrap();
+        }
+        assert_eq!(article_total(&main), count + 1);
+
+        run(&main, &|_| {}, &no_stop()).unwrap();
+        assert_eq!(article_total(&main), count, "the late copy went");
+        assert_eq!(release_totals(&path, file), once);
+        assert_eq!(loose(&main), 0);
+        assert_eq!(all_articles(&main), before);
     }
 
     /// A sealed segment whose message-id grows past what a blob takes when its
