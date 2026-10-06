@@ -18,7 +18,7 @@
 //! between moving the original aside and the copy in (a crash) is undone by
 //! the next start or compaction, see `recover_cut_swaps`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -436,33 +436,8 @@ fn compact_shard(
 
     // how many articles use each domain, as rows and inside sealed blobs
     say("counting domains");
-    // only the ids in use: earlier compactions leave the ids sparse
-    let mut uses: HashMap<i64, u32> = HashMap::new();
-    {
-        let mut used = |d: i64| {
-            let n = uses.entry(d).or_insert(0);
-            *n = n.saturating_add(1);
-        };
-        let mut stmt = conn.prepare("select domain from old.segments")?;
-        let mut rows = stmt.query([])?;
-        let mut n = 0usize;
-        while let Some(r) = rows.next()? {
-            used(r.get(0)?);
-            n += 1;
-            if n.is_multiple_of(STOP_EVERY) {
-                halt(stop, shard)?;
-            }
-        }
-        let mut stmt = conn.prepare("select id, blob from old.files where blob is not null")?;
-        let mut rows = stmt.query([])?;
-        while let Some(r) = rows.next()? {
-            halt(stop, shard)?;
-            for seg in unseal(shard, r.get(0)?, &r.get::<_, Vec<u8>>(1)?)? {
-                used(seg.domain);
-            }
-        }
-    }
-    let shared = |d: i64| d != 0 && uses.get(&d).is_some_and(|n| *n >= SHARED_AFTER);
+    let uses = DomainUses::count(&path, shard, stop)?;
+    let shared = |d: i64| -> Result<bool> { Ok(d != 0 && uses.shared(d)?) };
 
     halt(stop, shard)?;
     say("copying releases");
@@ -481,7 +456,7 @@ fn compact_shard(
             let mut rows = stmt.query([])?;
             while let Some(r) = rows.next()? {
                 let (id, suffix): (i64, String) = (r.get(0)?, r.get(1)?);
-                if shared(id) {
+                if shared(id)? {
                     insert.execute(params![id, suffix])?;
                     kept += 1;
                 } else {
@@ -551,12 +526,13 @@ fn compact_shard(
             // takes (a dropped domain's suffix made whole again) become rows
             let mut spilled = Vec::new();
             for seg in old_blob.as_deref().map(|b| unseal(shard, id, b)).transpose()?.unwrap_or_default() {
-                let suffix: Option<String> = if seg.domain != 0 && !shared(seg.domain) {
+                let suffix: Option<String> = if seg.domain != 0 && !shared(seg.domain)? {
                     suffix_of.query_row([seg.domain], |r| r.get(0)).optional()?
                 } else {
                     None
                 };
-                let (local, domain) = rewrite(shard, id, seg.local, seg.domain, shared(seg.domain), suffix.as_deref())?;
+                let (local, domain) =
+                    rewrite(shard, id, seg.local, seg.domain, shared(seg.domain)?, suffix.as_deref())?;
                 if local.len() > blob::MAX_LOCAL {
                     spilled.push(Row { file_id: id, local, domain, part: seg.part, bytes: Some(seg.bytes) });
                 } else {
@@ -766,6 +742,68 @@ fn compact_shard(
     Ok(Shrunk { before, after, domains_kept: kept, domains_dropped: dropped })
 }
 
+/// How many articles of a shard use each domain, as rows and inside sealed
+/// blobs, counted in a database file of its own next to the shard: a shard
+/// can have as many domains as a poster cares to make up, three articles
+/// each, and four shards are compacted at once, soo they arent held in
+/// memory. The file goes when this does.
+struct DomainUses {
+    conn: Option<Connection>,
+    path: PathBuf,
+}
+
+impl DomainUses {
+    fn count(shard_path: &Path, shard: usize, stop: &Arc<AtomicBool>) -> Result<DomainUses> {
+        let path = with_suffix(shard_path, "domains");
+        remove_db(&path);
+        let uses = DomainUses { conn: Some(Connection::open(&path)?), path };
+        let conn = uses.conn.as_ref().expect("open till dropped");
+        interruptible(conn, stop)?;
+        conn.query_row("pragma journal_mode = off", [], |_| Ok(()))?;
+        conn.execute_batch(
+            "pragma synchronous = off;
+             create table uses (id integer primary key, n integer not null);",
+        )?;
+        conn.execute("attach database ? as old", [shard_path.to_string_lossy()])?;
+        conn.execute("insert into uses select domain, count(*) from old.segments group by domain", [])?;
+        halt(stop, shard)?;
+        let read = Connection::open_with_flags(shard_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let mut stmt = read.prepare("select id, blob from files where blob is not null")?;
+        let mut rows = stmt.query([])?;
+        let mut used = conn.prepare("insert into uses values (?, 1) on conflict (id) do update set n = n + 1")?;
+        conn.execute_batch("begin")?;
+        while let Some(r) = rows.next()? {
+            halt(stop, shard)?;
+            for seg in unseal(shard, r.get(0)?, &r.get::<_, Vec<u8>>(1)?)? {
+                used.execute([seg.domain])?;
+            }
+        }
+        conn.execute_batch("commit")?;
+        drop(used);
+        Ok(uses)
+    }
+
+    /// whether enough articles use `domain` for it to stay
+    fn shared(&self, domain: i64) -> Result<bool> {
+        let n: Option<i64> = self
+            .conn
+            .as_ref()
+            .expect("open till dropped")
+            .prepare_cached("select n from uses where id = ?")?
+            .query_row([domain], |r| r.get(0))
+            .optional()?;
+        Ok(n.is_some_and(|n| n >= SHARED_AFTER as i64))
+    }
+}
+
+impl Drop for DomainUses {
+    fn drop(&mut self) {
+        // closed first: an open file cant be removed everywhere
+        drop(self.conn.take());
+        remove_db(&self.path);
+    }
+}
+
 /// the files table's columns, blob last
 const FILE_COLUMNS: &str =
     "id, release_id, filename, subject, subject_part, subject_mid, expected, file_total, seen, touched_at, blob";
@@ -828,10 +866,10 @@ struct Row {
 }
 
 /// the next row of `select file_id, local, domain, part, bytes, suffix`, rewritten
-fn next_row(shard: usize, rows: &mut rusqlite::Rows, shared: &dyn Fn(i64) -> bool) -> Result<Option<Row>> {
+fn next_row(shard: usize, rows: &mut rusqlite::Rows, shared: &dyn Fn(i64) -> Result<bool>) -> Result<Option<Row>> {
     let Some(r) = rows.next()? else { return Ok(None) };
     let (file_id, domain, suffix): (i64, i64, Option<String>) = (r.get(0)?, r.get(2)?, r.get(5)?);
-    let (local, domain) = rewrite(shard, file_id, r.get(1)?, domain, shared(domain), suffix.as_deref())?;
+    let (local, domain) = rewrite(shard, file_id, r.get(1)?, domain, shared(domain)?, suffix.as_deref())?;
     Ok(Some(Row { file_id, local, domain, part: r.get(3)?, bytes: r.get(4)? }))
 }
 
@@ -1170,6 +1208,34 @@ mod tests {
     }
 
     #[test]
+    fn domain_uses_are_counted_on_disk_and_the_file_goes_with_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        legacy_fixture(&main);
+        for path in store::shard_paths(&main) {
+            let conn = db::open_at(&path).unwrap();
+            checkpoint(&conn).unwrap();
+            let rows: Vec<(i64, i64)> = conn
+                .prepare("select domain, count(*) from segments group by domain")
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            drop(conn);
+            let file = with_suffix(&path, "domains");
+            let uses = DomainUses::count(&path, 0, &no_stop()).unwrap();
+            assert!(file.exists(), "counted in a file, not in memory");
+            for (d, n) in rows {
+                assert_eq!(uses.shared(d).unwrap(), n >= SHARED_AFTER as i64, "domain {d} used {n} times");
+            }
+            assert!(!uses.shared(i64::MAX).unwrap(), "an unused domain isnt shared");
+            drop(uses);
+            assert!(!file.exists(), "removed once done with");
+        }
+    }
+
+    #[test]
     fn compacting_drops_single_use_domains_repacks_seals_and_keeps_every_nzb() {
         let dir = tempfile::tempdir().unwrap();
         let main = dir.path().join("atlas.db");
@@ -1193,6 +1259,7 @@ mod tests {
         }
         for path in store::shard_paths(&main) {
             assert!(!with_suffix(&path, "precompact").exists(), "originals removed once all are done");
+            assert!(!with_suffix(&path, "domains").exists(), "the domain counts removed");
             let mode: String = db::open_at(&path).unwrap().query_row("pragma journal_mode", [], |r| r.get(0)).unwrap();
             assert_eq!(mode, "wal");
         }
