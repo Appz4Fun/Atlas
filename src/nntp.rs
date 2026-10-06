@@ -1504,8 +1504,8 @@ impl Pool {
     /// to `DATE_SCAN_MAX` numbers; past that the windows spread out (each
     /// starts twice as far from `from` as the last ended, the last ends at
     /// `end`), soo a hole of millions takes a few dozen small requests. The
-    /// numbers stepped over are read before a hit is taken as the first, see
-    /// `first_before`.
+    /// numbers stepped over are read before a hit is taken as the first (see
+    /// `first_before`), and before the range is taken for empty.
     async fn first_in(&self, i: usize, group: &str, from: u64, end: u64) -> Result<Option<Dated>> {
         // the numbers between windows that weren't read, lowest first
         let mut skipped = Vec::new();
@@ -1525,6 +1525,12 @@ impl Pool {
                 size *= 2;
             } else {
                 at = (read_to + (read_to - from)).min(end.saturating_sub(DATE_SCAN_MAX)).max(read_to);
+            }
+        }
+        // no window found one: the first article, if any, was stepped over
+        for &(from, to) in &skipped {
+            if let Some(found) = self.posted_at(i, group, from, to - from).await? {
+                return Ok(Some(found));
             }
         }
         Ok(None)
@@ -1582,6 +1588,12 @@ impl Pool {
                 size *= 2;
             } else {
                 to = end.saturating_sub(2 * (end - read_from)).max(from.saturating_add(DATE_SCAN_MAX)).min(read_from);
+            }
+        }
+        // no window found one: the last article, if any, was stepped over
+        for &(from, to) in &skipped {
+            if let Some(found) = self.last_at(i, group, from, to - from).await? {
+                return Ok(Some(found));
             }
         }
         Ok(None)
