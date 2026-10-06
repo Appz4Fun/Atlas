@@ -729,17 +729,18 @@ pub(crate) fn index_release(conn: &Connection, key: &IdKey, release_id: i64) -> 
         .collect::<Result<_>>()?;
     let mut suffixes = HashMap::new();
     for file_id in ids {
-        let mut segs = sealed_segments(conn, file_id)?.unwrap_or_default();
-        let mut rows = conn.prepare_cached("select local, domain from segments where file_id = ?")?;
-        let more = rows.query_map([file_id], |r| {
-            Ok(crate::blob::Seg { local: r.get(0)?, domain: r.get(1)?, part: None, bytes: 0 })
-        })?;
-        for s in more {
-            segs.push(s?);
+        let mut insert =
+            conn.prepare_cached("insert or ignore into release_ids (release_id, id_hash, file_id) values (?, ?, ?)")?;
+        // the blob is bounded by SEAL_MAX_SEGMENTS; the rows are not, so they
+        // stream from the cursor one at a time
+        for s in sealed_segments(conn, file_id)?.unwrap_or_default() {
+            insert.execute(params![release_id, key.hash(&seg_key(conn, &mut suffixes, &s)?), file_id])?;
         }
-        for s in &segs {
-            conn.prepare_cached("insert or ignore into release_ids (release_id, id_hash, file_id) values (?, ?, ?)")?
-                .execute(params![release_id, key.hash(&seg_key(conn, &mut suffixes, s)?), file_id])?;
+        let mut rows = conn.prepare_cached("select local, domain from segments where file_id = ?")?;
+        let mut cursor = rows.query([file_id])?;
+        while let Some(r) = cursor.next()? {
+            let s = crate::blob::Seg { local: r.get(0)?, domain: r.get(1)?, part: None, bytes: 0 };
+            insert.execute(params![release_id, key.hash(&seg_key(conn, &mut suffixes, &s)?), file_id])?;
         }
     }
     conn.prepare_cached("insert or ignore into release_ids (release_id, id_hash, file_id) values (?, 0, 0)")?
@@ -2783,6 +2784,30 @@ mod tests {
         assert_eq!(files, 2, "no c.rar: all of it was in a.rar and b.rar");
         let indexed: i64 = conn.query_row("select count(*) from release_ids", [], |r| r.get(0)).unwrap();
         assert_eq!(indexed, 5, "4 ids and the release's own row");
+    }
+
+    /// A file past the seal cap stays loose rows; indexing its release
+    /// hashes them one by one from the cursor and indexes every one.
+    #[test]
+    fn indexing_a_release_with_a_huge_loose_file_indexes_every_row() {
+        let (_dir, main) = sealed_fixture();
+        let shard = shard_path(&main, shard_of("alt.binaries.t"));
+        let conn = db::open_at(&shard).unwrap();
+        conn.execute("delete from release_ids", []).unwrap();
+        let id: i64 = conn.query_row("select id from files where filename = 'a.rar'", [], |r| r.get(0)).unwrap();
+        let rows = SEAL_MAX_SEGMENTS + 10;
+        conn.execute(
+            "with recursive n(i) as (select 1 union all select i + 1 from n where i < ?)
+             insert or ignore into segments (file_id, local, domain, part, bytes)
+             select ?, cast('big' || i as blob), 0, i, 1 from n",
+            params![rows, id],
+        )
+        .unwrap();
+        let release_id: i64 = conn.query_row("select release_id from files where id = ?", [id], |r| r.get(0)).unwrap();
+        index_release(&conn, &IdKey::of(&conn).unwrap(), release_id).unwrap();
+        let indexed: i64 =
+            conn.query_row("select count(*) from release_ids where file_id = ?", [id], |r| r.get(0)).unwrap();
+        assert_eq!(indexed, rows + 3, "every row, and the blob's 3 ids");
     }
 
     /// release Rel with one file `name` of the given message-ids
