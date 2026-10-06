@@ -841,6 +841,9 @@ impl UnsavedBudget {
 pub struct Unsaved {
     permit: OwnedSemaphorePermit,
     budget: Arc<UnsavedBudget>,
+    /// headers held past the room (a slice bigger than the whole budget),
+    /// counted soo `now` and `peak` show what is really held
+    over: usize,
 }
 
 impl Unsaved {
@@ -853,14 +856,19 @@ impl Unsaved {
             self.budget.now.fetch_sub(extra, Ordering::Relaxed);
             drop(back);
         }
+        self.over = headers.saturating_sub(self.permit.num_permits());
+        if self.over > 0 {
+            let now = self.budget.now.fetch_add(self.over, Ordering::Relaxed) + self.over;
+            self.budget.peak.fetch_max(now, Ordering::Relaxed);
+        }
     }
 }
 
 impl Drop for Unsaved {
     fn drop(&mut self) {
         // counted down before the permit goes back (right after this), soo
-        // `now` never shows more than the cap
-        self.budget.now.fetch_sub(self.permit.num_permits(), Ordering::Relaxed);
+        // `now` never shows more than is held
+        self.budget.now.fetch_sub(self.permit.num_permits() + self.over, Ordering::Relaxed);
     }
 }
 
@@ -932,7 +940,7 @@ impl Pool {
         let permit = budget.permits.clone().acquire_many_owned(n as u32).await.expect("semaphore closed");
         let now = budget.now.fetch_add(n, Ordering::Relaxed) + n;
         budget.peak.fetch_max(now, Ordering::Relaxed);
-        Unsaved { permit, budget }
+        Unsaved { permit, budget, over: 0 }
     }
 
     pub fn len(&self) -> usize {

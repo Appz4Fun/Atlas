@@ -16,6 +16,7 @@ use common::{Server, mock, par2_file_desc, post, spawn_server, yenc_body};
 const POSTS: u64 = 400;
 const REQUEST: u64 = 20;
 const GROUPS: usize = 16;
+const BATCH: u64 = 100;
 
 /// `POSTS` articles in releases of one slice each, every release with a par2,
 /// soo saving a slice needs BODY lookups on the connections the XOVERs use
@@ -59,7 +60,7 @@ fn index_everything(cap: usize) {
     });
     let settings = Arc::new(PassSettings {
         mode: "backfill".into(),
-        batch_size: 100,
+        batch_size: BATCH as i64,
         request_size: REQUEST,
         split_min_backlog: i64::MAX,
     });
@@ -94,12 +95,14 @@ fn index_everything(cap: usize) {
     });
 
     assert_eq!(saved, vec![POSTS as i64; GROUPS], "every article saved once, per group");
+    // slices no bigger than the budget, in passes of BATCH
+    let slice = REQUEST.min(cap as u64);
     let xovers: usize = servers.iter().map(|s| s.xovers.load(Ordering::SeqCst)).sum();
-    assert_eq!(xovers, GROUPS * (POSTS / REQUEST) as usize, "every slice fetched once");
+    assert_eq!(xovers, GROUPS * (POSTS / BATCH * BATCH.div_ceil(slice)) as usize, "every slice fetched once");
 
     let peak = pool.unsaved_peak();
     assert!(peak <= cap, "{peak} headers unsaved at once, the cap is {cap}");
-    assert!(peak >= cap.min(REQUEST as usize), "the cap was never reached ({peak}), the test proves nothing");
+    assert!(peak >= slice as usize, "the cap was never reached ({peak}), the test proves nothing");
     assert_eq!(pool.unsaved_headers(), 0, "budget left held after every pass ended");
 
     // the names came from the bodies: saving did its lookups
@@ -116,7 +119,7 @@ fn many_passes_share_a_budget_of_two_slices() {
     index_everything(2 * REQUEST as usize);
 }
 
-/// A budget smaller than one slice: a slice waits for all of it.
+/// A budget smaller than one slice: the slices are cut down to it.
 #[test]
 fn a_budget_smaller_than_a_slice_still_gets_through() {
     index_everything(7);

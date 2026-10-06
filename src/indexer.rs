@@ -870,8 +870,10 @@ impl Pass<'_> {
         P: FnMut(&Progress) + ?Sized,
     {
         let (pool, group) = (&self.ctx.pool, self.group);
-        let slices =
-            make_slices(start.max(0) as u64, end.max(0) as u64, self.settings.request_size, kind == "BACKFILL");
+        // no slice bigger than the whole unsaved budget: it would hold more
+        // headers than the cap allows
+        let size = self.settings.request_size.min(pool.max_unsaved() as u64);
+        let slices = make_slices(start.max(0) as u64, end.max(0) as u64, size, kind == "BACKFILL");
         let total = slices.len();
 
         let mut rx = pool.stream_headers(group, self.server, slices, self.ctx.stop.clone());
