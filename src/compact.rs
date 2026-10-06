@@ -520,20 +520,50 @@ fn compact_shard(
             }
             // what rows a save couldnt tell from copies said (see `store::seal_rows`):
             // kept for the rows that are new, dropped for copies of the blob's
-            let mut held_back: Vec<(String, Value, Value, Value, Value)> = held_of
-                .query_map([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?
-                .collect::<rusqlite::Result<_>>()?;
-            if !held_back.is_empty() {
-                let mut key = |local: &[u8], domain: i64| dedup_key(&mut suffix_of, local, domain);
-                let mut in_blob = HashSet::new();
-                for s in &segs {
-                    in_blob.insert(key(&s.local, s.domain)?);
+            // streamed, never held: only the blob's ids (bounded) are
+            let mut held_back = 0usize;
+            let mut in_blob: Option<HashSet<String>> = None;
+            let mut held = held_of.query([id])?;
+            while let Some(h) = held.next()? {
+                let in_blob = match &mut in_blob {
+                    Some(set) => set,
+                    None => {
+                        let mut key = |local: &[u8], domain: i64| dedup_key(&mut suffix_of, local, domain);
+                        let mut set = HashSet::new();
+                        for s in &segs {
+                            set.insert(key(&s.local, s.domain)?);
+                        }
+                        for r in &spilled {
+                            set.insert(key(&r.local, r.domain)?);
+                        }
+                        in_blob.insert(set)
+                    }
+                };
+                let message_id: String = h.get(0)?;
+                if in_blob.contains(&message_id) {
+                    continue;
                 }
-                for r in &spilled {
-                    in_blob.insert(key(&r.local, r.domain)?);
+                tx.prepare_cached(
+                    "insert into held_back (file_id, message_id, subject, part, total_parts, file_total)
+                     values (?, ?, ?, ?, ?, ?)",
+                )?
+                .execute(params![
+                    id,
+                    message_id,
+                    h.get::<_, Value>(1)?,
+                    h.get::<_, Value>(2)?,
+                    h.get::<_, Value>(3)?,
+                    h.get::<_, Value>(4)?
+                ])?;
+                held_back += 1;
+                in_tx += 1;
+                if in_tx >= BATCH {
+                    tx.commit()?;
+                    tx = conn.transaction()?;
+                    in_tx = 0;
                 }
-                held_back.retain(|h| !in_blob.contains(&h.0));
             }
+            drop(held);
             file_rows.extend(spilled);
 
             // a row the blob already has (the same message-id) isnt copied, nor
@@ -567,7 +597,7 @@ fn compact_shard(
             let small = (segs.len() + file_rows.len()) as i64 <= store::SEAL_MAX_SEGMENTS;
             // nor files with something held back: sealing them folds it in
             let seal = !file_rows.is_empty()
-                && held_back.is_empty()
+                && held_back == 0
                 && fits
                 && small
                 && store::due(f.get(6)?, &seen, f.get(9)?, old_blob.is_some(), now);
@@ -586,13 +616,6 @@ fn compact_shard(
             values.push(blob.map_or(Value::Null, Value::Blob));
             tx.prepare_cached(&format!("insert into files ({FILE_COLUMNS}) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"))?
                 .execute(params_from_iter(values))?;
-            for h in held_back {
-                tx.prepare_cached(
-                    "insert into held_back (file_id, message_id, subject, part, total_parts, file_total)
-                     values (?, ?, ?, ?, ?, ?)",
-                )?
-                .execute(params![id, h.0, h.1, h.2, h.3, h.4])?;
-            }
             copied += segs.len() as i64;
             for row in &file_rows {
                 copied += insert_row(&tx, row)?;
@@ -642,6 +665,11 @@ fn compact_shard(
         for id in recount {
             store::recount_parts(&tx, id)?;
         }
+        // the releases' message-id index: its files and their ids are the same
+        tx.execute_batch(
+            "insert into release_ids select * from old.release_ids
+             where file_id = 0 or file_id in (select id from files)",
+        )?;
         tx.commit()?;
     }
     say(&format!("sealed {sealed} files"));
@@ -1243,6 +1271,36 @@ mod tests {
         store::seal_file(&conn, file).unwrap();
         let expected: i64 = conn.query_row("select expected from files where id = ?", [file], |r| r.get(0)).unwrap();
         assert_eq!(expected, 3);
+    }
+
+    /// More held back entries than a batch take are streamed across: the new
+    /// ones kept, the blob's copies dropped, and the releases' message-id
+    /// index comes along.
+    #[test]
+    fn compacting_streams_many_held_back_entries_and_keeps_the_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        let (path, file, _) = held_back_fixture(&main, ("<b1@x>", 2, 2));
+        let many = BATCH as i64 + 7;
+        {
+            let conn = db::open_at(&path).unwrap();
+            let mut insert = conn
+                .prepare("insert into held_back (file_id, message_id, part, total_parts) values (?, ?, ?, 2)")
+                .unwrap();
+            for n in 0..many {
+                insert.execute(params![file, format!("<new{n}@x>"), n + 3]).unwrap();
+            }
+        }
+        let ids = |path: &Path| -> i64 {
+            db::open_at(path).unwrap().query_row("select count(*) from release_ids", [], |r| r.get(0)).unwrap()
+        };
+        let indexed = ids(&path);
+        assert!(indexed > 0, "two files: the release is indexed");
+        run(&main, &|_| {}, &no_stop()).unwrap();
+        let conn = db::open_at(&path).unwrap();
+        let held: i64 = conn.query_row("select count(*) from held_back", [], |r| r.get(0)).unwrap();
+        assert_eq!(held, many, "the copy's entry dropped, every new one kept");
+        assert_eq!(ids(&path), indexed);
     }
 
     /// Compaction drops a row that copies b.rar's part 1 but claimed part 2:
