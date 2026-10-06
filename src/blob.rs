@@ -72,24 +72,47 @@ pub fn encode(segs: &[Seg]) -> Vec<u8> {
 
 /// Unpacks a blob made by `encode`. Truncated or corrupt input is an error.
 pub fn decode(blob: &[u8]) -> Result<Vec<Seg>> {
-    let raw = zstd::stream::decode_all(blob)?;
+    parse(&zstd::stream::decode_all(blob)?, usize::MAX)
+}
+
+/// the most a segment takes unpacked, for bounding what a blob may expand to
+const MAX_SEG_RAW: usize = 1024;
+
+/// `decode` for a blob of at most `max` segments: one that says it has more,
+/// or unpacks to more than `max` segments could take, is an error and is
+/// never held in memory.
+pub fn decode_capped(blob: &[u8], max: usize) -> Result<Vec<Seg>> {
+    use std::io::Read;
+    let limit = (max as u64).saturating_mul(MAX_SEG_RAW as u64).saturating_add(16);
+    let mut raw = Vec::new();
+    zstd::stream::read::Decoder::new(blob)?.take(limit).read_to_end(&mut raw)?;
+    if raw.len() as u64 >= limit {
+        return Err(Error::new(ErrorKind::InvalidData, "blob unpacks to more than its cap"));
+    }
+    parse(&raw, max)
+}
+
+fn parse(raw: &[u8], max: usize) -> Result<Vec<Seg>> {
     if raw.first() != Some(&VERSION) {
         return Err(Error::new(ErrorKind::InvalidData, "unknown blob version"));
     }
     let mut pos = 1;
-    let count = get_varint(&raw, &mut pos)? as usize;
+    let count = get_varint(raw, &mut pos)? as usize;
+    if count > max {
+        return Err(Error::new(ErrorKind::InvalidData, "blob has more segments than its cap"));
+    }
     // every segment takes at least 4 bytes, so a bigger count is corrupt
     let mut segs = Vec::with_capacity(count.min(raw.len() / 4));
     let mut prev_bytes = 0i64;
     for _ in 0..count {
-        let part = match get_varint(&raw, &mut pos)? {
+        let part = match get_varint(raw, &mut pos)? {
             0 => None,
             p => Some((p - 1) as i64),
         };
-        let bytes = prev_bytes.wrapping_add(unzigzag(get_varint(&raw, &mut pos)?));
+        let bytes = prev_bytes.wrapping_add(unzigzag(get_varint(raw, &mut pos)?));
         prev_bytes = bytes;
-        let domain = get_varint(&raw, &mut pos)? as i64;
-        let len = usize::try_from(get_varint(&raw, &mut pos)?).map_err(|_| cut_short())?;
+        let domain = get_varint(raw, &mut pos)? as i64;
+        let len = usize::try_from(get_varint(raw, &mut pos)?).map_err(|_| cut_short())?;
         let end = pos.checked_add(len).ok_or_else(cut_short)?;
         let local = raw.get(pos..end).ok_or_else(cut_short)?.to_vec();
         pos = end;
@@ -104,6 +127,20 @@ mod tests {
 
     fn seg(part: Option<i64>, bytes: i64, domain: i64, local: &[u8]) -> Seg {
         Seg { part, bytes, domain, local: local.to_vec() }
+    }
+
+    #[test]
+    fn a_blob_past_its_cap_is_an_error() {
+        let segs: Vec<Seg> = (0..10).map(|i| seg(Some(i), 5, 0, b"\x00<a@b>")).collect();
+        let blob = encode(&segs);
+        assert_eq!(decode_capped(&blob, 10).unwrap().len(), 10);
+        assert!(decode_capped(&blob, 9).is_err(), "more segments than the cap");
+        // a count that fits the cap, with more unpacked than that many take
+        let mut raw = vec![VERSION];
+        put_varint(&mut raw, 1);
+        raw.resize(10_000, 0);
+        assert!(decode_capped(&zstd::bulk::compress(&raw, 1).unwrap(), 1).is_err());
+        assert!(decode_capped(b"garbage", 10).is_err());
     }
 
     #[test]

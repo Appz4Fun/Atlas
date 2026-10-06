@@ -655,12 +655,14 @@ fn blob_error(e: std::io::Error) -> rusqlite::Error {
     rusqlite::Error::ToSqlConversionFailure(Box::new(e))
 }
 
-/// a sealed file's blob, decoded; none when the file isnt sealed
+/// a sealed file's blob, decoded; none when the file isnt sealed. A blob
+/// holds SEAL_MAX_SEGMENTS at most (sealing sees to that): one with more is
+/// an error, not something to decode into memory.
 fn sealed_segments(conn: &Connection, file_id: i64) -> Result<Option<Vec<crate::blob::Seg>>> {
     conn.prepare_cached("select blob from files where id = ? and blob is not null")?
         .query_row([file_id], |r| r.get::<_, Vec<u8>>(0))
         .optional()?
-        .map(|b| crate::blob::decode(&b).map_err(blob_error))
+        .map(|b| crate::blob::decode_capped(&b, SEAL_MAX_SEGMENTS as usize).map_err(blob_error))
         .transpose()
 }
 
@@ -773,26 +775,42 @@ pub(crate) fn due(expected: Option<i64>, seen: &[u8], touched: Option<i64>, seal
     complete || touched.is_none_or(|t| t < now - SEAL_AGE)
 }
 
-/// Blobs of sealed files, decoded once each, for checking late articles.
-#[derive(Default)]
+/// the segments a `SealedCache` keeps decoded at most: a save can touch a
+/// sealed file per article, and each is up to SEAL_MAX_SEGMENTS
+const SEALED_CACHE_MAX_SEGMENTS: usize = 200_000;
+
+/// Blobs of sealed files, decoded once each, for checking late articles. Holds
+/// at most `SEALED_CACHE_MAX_SEGMENTS` decoded segments: past that it starts
+/// over, the cache only saves decoding a blob again.
 pub(crate) struct SealedCache {
     files: HashMap<i64, HashSet<(Vec<u8>, i64)>>,
+    /// segments in `files`
+    segments: usize,
+    max_segments: usize,
 }
 
 impl SealedCache {
     pub(crate) fn new() -> Self {
-        Self::default()
+        Self::with_max(SEALED_CACHE_MAX_SEGMENTS)
+    }
+
+    fn with_max(max_segments: usize) -> Self {
+        SealedCache { files: HashMap::new(), segments: 0, max_segments }
     }
 
     /// the article (local, domain) is already in file `file_id`'s blob
     pub(crate) fn contains(&mut self, conn: &Connection, file_id: i64, local: &[u8], domain: i64) -> Result<bool> {
-        let set = match self.files.entry(file_id) {
-            Entry::Occupied(e) => e.into_mut(),
-            Entry::Vacant(e) => e.insert(
-                sealed_segments(conn, file_id)?.unwrap_or_default().into_iter().map(|s| (s.local, s.domain)).collect(),
-            ),
-        };
-        Ok(set.contains(&(local.to_vec(), domain)))
+        if !self.files.contains_key(&file_id) {
+            let set: HashSet<(Vec<u8>, i64)> =
+                sealed_segments(conn, file_id)?.unwrap_or_default().into_iter().map(|s| (s.local, s.domain)).collect();
+            if self.segments + set.len() > self.max_segments {
+                self.files.clear();
+                self.segments = 0;
+            }
+            self.segments += set.len();
+            self.files.insert(file_id, set);
+        }
+        Ok(self.files[&file_id].contains(&(local.to_vec(), domain)))
     }
 }
 
@@ -1191,6 +1209,50 @@ pub fn purge_incomplete(main: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// a table of sealed files for a `SealedCache`: file i holds `per` segments
+    fn sealed_files(files: i64, per: i64) -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("create table files (id INTEGER PRIMARY KEY, blob BLOB)").unwrap();
+        for id in 1..=files {
+            let segs: Vec<crate::blob::Seg> = (0..per)
+                .map(|p| crate::blob::Seg {
+                    part: Some(p),
+                    bytes: 1,
+                    domain: id,
+                    local: format!("{id}-{p}").into_bytes(),
+                })
+                .collect();
+            conn.execute("insert into files (id, blob) values (?, ?)", params![id, crate::blob::encode(&segs)])
+                .unwrap();
+        }
+        conn
+    }
+
+    #[test]
+    fn the_sealed_cache_stays_within_its_bound_and_still_finds_every_duplicate() {
+        let conn = sealed_files(40, 3);
+        let mut cache = SealedCache::with_max(10);
+        // one late article per sealed file, twice around
+        for _ in 0..2 {
+            for id in 1..=40 {
+                assert!(cache.contains(&conn, id, format!("{id}-1").as_bytes(), id).unwrap(), "file {id}");
+                assert!(!cache.contains(&conn, id, b"new", id).unwrap());
+                assert!(cache.segments <= 10, "{} segments kept", cache.segments);
+                assert_eq!(cache.segments, cache.files.values().map(|s| s.len()).sum::<usize>());
+            }
+        }
+    }
+
+    #[test]
+    fn a_sealed_blob_past_the_cap_is_an_error_not_a_decode() {
+        let conn = sealed_files(1, SEAL_MAX_SEGMENTS + 1);
+        let mut cache = SealedCache::new();
+        assert!(cache.contains(&conn, 1, b"1-1", 1).is_err());
+        assert!(cache.files.is_empty());
+        let conn = sealed_files(1, SEAL_MAX_SEGMENTS);
+        assert!(cache.contains(&conn, 1, b"1-1", 1).unwrap(), "the cap itself is fine");
+    }
 
     #[test]
     fn the_database_size_is_the_main_database_and_every_shard() {
