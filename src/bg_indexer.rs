@@ -538,8 +538,14 @@ enum Work {
 /// chunks are done (see `take_sweep`) comes first, before its normal groups,
 /// soo home groups that keep every worker busy dont hold it off until what
 /// it would find ages out. One worker per server sweeps at a time, the
-/// others index their groups or take day chunks.
-async fn next_work(sched: &Scheduler, server: usize, db: &Db) -> Option<Work> {
+/// others index their groups or take day chunks. `after_sweep`: the worker's
+/// last pick was a sweep, soo a due group of its own goes before the next.
+async fn next_work(sched: &Scheduler, server: usize, db: &Db, after_sweep: bool) -> Option<Work> {
+    // right after a sweep a due normal group goes first, soo a worker that
+    // is alone on its server alternates instead of sweeping forever
+    if after_sweep && let Some(group) = sched.take_group(server) {
+        return Some(Work::Group(group));
+    }
     if let Some(group) = take_sweep(sched, server, db).await {
         return Some(Work::Sweep(group));
     }
@@ -553,8 +559,11 @@ async fn next_work(sched: &Scheduler, server: usize, db: &Db) -> Option<Work> {
 /// All workers share one db connection, soo their writes queue up in order
 /// instead of racing for sqlite's write lock (and timing out on a busy db).
 async fn worker(sched: Arc<Scheduler>, server: usize, db: Db) {
+    let mut after_sweep = false;
     while !sched.stopping() {
-        let group = match next_work(&sched, server, &db).await {
+        let work = next_work(&sched, server, &db, after_sweep).await;
+        after_sweep = matches!(work, Some(Work::Sweep(_)));
+        let group = match work {
             Some(Work::Group(group)) => group,
             // help with a split group's day chunks. not marked busy, a
             // group's chunks run on several servers at once
@@ -1109,10 +1118,36 @@ mod tests {
         let db = shared_db(conn);
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         rt.block_on(async {
-            assert!(matches!(next_work(&sched, server, &db).await, Some(Work::Sweep(g)) if g == "done"));
+            assert!(matches!(next_work(&sched, server, &db, false).await, Some(Work::Sweep(g)) if g == "done"));
             // one sweeper per server: the others keep to their groups
-            assert!(matches!(next_work(&sched, server, &db).await, Some(Work::Group(_))));
-            assert!(matches!(next_work(&sched, server, &db).await, Some(Work::Group(_))));
+            assert!(matches!(next_work(&sched, server, &db, false).await, Some(Work::Group(_))));
+            assert!(matches!(next_work(&sched, server, &db, false).await, Some(Work::Group(_))));
+        });
+    }
+
+    /// a worker alone on its server alternates a due sweep with its home group
+    #[test]
+    fn a_lone_worker_alternates_a_due_sweep_with_its_home_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        db::create_db_at(&main).unwrap();
+        let pool = Pool::new(&[UsenetServer::new("a.test", "u", "p", 119), UsenetServer::new("b.test", "u", "p", 119)]);
+        let conn = db::open_at(&main).unwrap();
+        crate::chunks::add(&conn, "done", 20_000, 19_990).unwrap();
+        conn.execute("update backfill_chunks set state = 2 where grp = 'done'", []).unwrap();
+        let server = 1 - pool.pick_server("done");
+        let home = (0..).map(|i| format!("home{i}")).find(|g| pool.pick_server(g) == server).unwrap();
+        let sched = scheduler(pool, vec![home.clone(), "done".into()]);
+        let db = shared_db(conn);
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            // the sweep first, as before
+            assert!(matches!(next_work(&sched, server, &db, false).await, Some(Work::Sweep(g)) if g == "done"));
+            sched.sweeping.lock().unwrap().remove(&server);
+            // then the due home group, though the sweep is still due
+            assert!(matches!(next_work(&sched, server, &db, true).await, Some(Work::Group(g)) if g == home));
+            // and the sweep again after the group
+            assert!(matches!(next_work(&sched, server, &db, false).await, Some(Work::Sweep(g)) if g == "done"));
         });
     }
 }
