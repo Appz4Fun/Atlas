@@ -619,6 +619,20 @@ fn release_complete(conn: &Connection, release_id: i64, file_total: Option<i64>)
 /// files untouched this long get sealed even when incomplete
 pub const SEAL_AGE: i64 = 3 * 86_400;
 
+/// A file with more segments than this never seals: a blob is built in
+/// memory, and a poster can put any number of rows under one file. Real files
+/// have a few thousand parts at most.
+pub const SEAL_MAX_SEGMENTS: i64 = 50_000;
+
+/// sql: file `f` has more than SEAL_MAX_SEGMENTS rows, counting no further
+/// than one past
+fn too_many_rows() -> String {
+    format!(
+        "(select count(*) from (select 1 from segments s where s.file_id = f.id limit {}) ) > {SEAL_MAX_SEGMENTS}",
+        SEAL_MAX_SEGMENTS + 1
+    )
+}
+
 fn blob_error(e: std::io::Error) -> rusqlite::Error {
     rusqlite::Error::ToSqlConversionFailure(Box::new(e))
 }
@@ -647,6 +661,14 @@ pub(crate) fn seal_file(conn: &Connection, file_id: i64) -> Result<usize> {
 
 fn seal_rows(conn: &Connection, file_id: i64) -> Result<usize> {
     let mut segs = sealed_segments(conn, file_id)?.unwrap_or_default();
+    // too much for one blob in memory: stays rows, and a blob stays as it is
+    // (counted before any row is read)
+    let counted: i64 = conn
+        .prepare_cached("select count(*) from (select 1 from segments where file_id = ? limit ?)")?
+        .query_row(params![file_id, SEAL_MAX_SEGMENTS + 1], |r| r.get(0))?;
+    if counted > 0 && counted + segs.len() as i64 > SEAL_MAX_SEGMENTS {
+        return Ok(0);
+    }
     let rows: Vec<crate::blob::Seg> = conn
         .prepare_cached("select part, bytes, domain, local from segments where file_id = ?")?
         .query_map([file_id], |r| {
@@ -676,24 +698,26 @@ fn seal_rows(conn: &Connection, file_id: i64) -> Result<usize> {
 /// seals: ones with rows that are complete and not sealed yet, or untouched
 /// for `SEAL_AGE` (a sealed file with late rows waits for this). Files never
 /// touched since the upgrade are left to compaction, and files with a
-/// negative part number never seal. Returns the ids and the last id looked
+/// negative part number, or more than `SEAL_MAX_SEGMENTS` rows, never seal.
+/// Returns the ids and the last id looked
 /// at, for walking the table `limit` files at a time: `last == after_id`
 /// means the end.
 pub(crate) fn sealable(conn: &Connection, after_id: i64, limit: usize, now: i64) -> Result<(Vec<i64>, i64)> {
-    let mut stmt = conn.prepare_cached(
+    let mut stmt = conn.prepare_cached(&format!(
         "select f.id, f.expected, f.seen, f.touched_at, f.blob is not null,
                 exists (select 1 from segments s where s.file_id = f.id),
-                exists (select 1 from segments s where s.file_id = f.id and s.part < 0)
+                exists (select 1 from segments s where s.file_id = f.id and s.part < 0) or {}
          from files f where f.id > ? order by f.id limit ?",
-    )?;
+        too_many_rows()
+    ))?;
     let mut ids = Vec::new();
     let mut last = after_id;
     let mut rows = stmt.query(params![after_id, limit as i64])?;
     while let Some(r) = rows.next()? {
         let id: i64 = r.get(0)?;
         last = id;
-        let (has_rows, negative): (bool, bool) = (r.get(5)?, r.get(6)?);
-        if !has_rows || negative {
+        let (has_rows, never): (bool, bool) = (r.get(5)?, r.get(6)?);
+        if !has_rows || never {
             continue;
         }
         let seen: Vec<u8> = r.get(2)?;
@@ -708,16 +732,17 @@ pub(crate) fn sealable(conn: &Connection, after_id: i64, limit: usize, now: i64)
 /// A file a save just completed is still complete, not sealed and has rows
 /// that can go in a blob.
 fn still_due(conn: &Connection, file_id: i64, now: i64) -> Result<bool> {
-    conn.prepare_cached(
+    conn.prepare_cached(&format!(
         "select f.expected, f.seen, f.touched_at, f.blob is not null,
                 exists (select 1 from segments s where s.file_id = f.id),
-                exists (select 1 from segments s where s.file_id = f.id and s.part < 0)
+                exists (select 1 from segments s where s.file_id = f.id and s.part < 0) or {}
          from files f where f.id = ?",
-    )?
+        too_many_rows()
+    ))?
     .query_row([file_id], |r| {
-        let (has_rows, negative): (bool, bool) = (r.get(4)?, r.get(5)?);
+        let (has_rows, never): (bool, bool) = (r.get(4)?, r.get(5)?);
         let (seen, touched): (Vec<u8>, Option<i64>) = (r.get(1)?, r.get(2)?);
-        Ok(has_rows && !negative && touched.is_some() && due(r.get(0)?, &seen, touched, r.get(3)?, now))
+        Ok(has_rows && !never && touched.is_some() && due(r.get(0)?, &seen, touched, r.get(3)?, now))
     })
     .optional()
     .map(|due| due.unwrap_or(false))
@@ -1575,6 +1600,67 @@ mod tests {
         .unwrap();
         assert!(sealable(&conn, 0, 100, now).unwrap().0.is_empty());
         assert_eq!(seal_file(&conn, ids[1]).unwrap(), 0);
+    }
+
+    /// `n` more rows under a file, as a poster could add them
+    fn add_rows(conn: &Connection, file_id: i64, n: i64) {
+        conn.execute(
+            "with recursive n(i) as (select 1 union all select i + 1 from n where i < ?2)
+             insert into segments (file_id, local, domain, part, bytes)
+             select ?1, cast('big' || i as blob), 0, 100 + i, 1 from n",
+            params![file_id, n],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_file_with_more_than_the_cap_of_rows_never_seals() {
+        let (_dir, main) = sealed_fixture();
+        let conn = db::open_at(&shard_path(&main, shard_of("alt.binaries.t"))).unwrap();
+        let now: i64 = conn.query_row("select unixepoch()", [], |r| r.get(0)).unwrap();
+        let id = |name: &str| -> i64 {
+            conn.query_row("select id from files where filename = ?", [name], |r| r.get(0)).unwrap()
+        };
+        let rows = |id: i64| -> i64 {
+            conn.query_row("select count(*) from segments where file_id = ?", [id], |r| r.get(0)).unwrap()
+        };
+        let (a, b) = (id("a.rar"), id("b.rar"));
+        // b.rar is stale (a.rar is complete): both are due, a.rar with the cap + 1 rows is not
+        conn.execute("update files set touched_at = ?", [now - SEAL_AGE - 1]).unwrap();
+        assert_eq!(sealable(&conn, 0, 100, now).unwrap().0, vec![a, b]);
+        add_rows(&conn, a, SEAL_MAX_SEGMENTS + 1 - rows(a));
+        assert_eq!(rows(a), SEAL_MAX_SEGMENTS + 1);
+        assert_eq!(sealable(&conn, 0, 100, now).unwrap().0, vec![b], "the big one is skipped");
+        assert!(!still_due(&conn, a, now).unwrap());
+        assert!(still_due(&conn, b, now).unwrap());
+
+        assert_eq!(seal_file(&conn, a).unwrap(), 0);
+        assert_eq!(rows(a), SEAL_MAX_SEGMENTS + 1, "still rows");
+        let blob: Option<Vec<u8>> = conn.query_row("select blob from files where id = ?", [a], |r| r.get(0)).unwrap();
+        assert_eq!(blob, None);
+
+        // exactly the cap seals
+        conn.execute("delete from segments where file_id = ? and local = cast('big1' as blob)", [a]).unwrap();
+        assert_eq!(rows(a), SEAL_MAX_SEGMENTS);
+        assert_eq!(sealable(&conn, 0, 100, now).unwrap().0, vec![a, b]);
+        assert_eq!(seal_file(&conn, a).unwrap() as i64, SEAL_MAX_SEGMENTS);
+    }
+
+    #[test]
+    fn late_rows_that_would_take_a_blob_past_the_cap_stay_rows() {
+        let (_dir, main) = sealed_fixture();
+        let conn = db::open_at(&shard_path(&main, shard_of("alt.binaries.t"))).unwrap();
+        let now: i64 = conn.query_row("select unixepoch()", [], |r| r.get(0)).unwrap();
+        let b: i64 = conn.query_row("select id from files where filename = 'b.rar'", [], |r| r.get(0)).unwrap();
+        assert_eq!(seal_file(&conn, b).unwrap(), 1);
+        add_rows(&conn, b, SEAL_MAX_SEGMENTS);
+        conn.execute("update files set touched_at = ?", [now - SEAL_AGE - 1]).unwrap();
+
+        assert_eq!(seal_file(&conn, b).unwrap(), 0);
+        let rows: i64 = conn.query_row("select count(*) from segments where file_id = ?", [b], |r| r.get(0)).unwrap();
+        assert_eq!(rows, SEAL_MAX_SEGMENTS, "the late rows were left");
+        let blob: Vec<u8> = conn.query_row("select blob from files where id = ?", [b], |r| r.get(0)).unwrap();
+        assert_eq!(crate::blob::decode(&blob).unwrap().len(), 1, "and the blob is as it was");
     }
 
     #[test]

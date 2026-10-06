@@ -450,8 +450,12 @@ fn compact_shard(
                 pending = next_row(shard, &mut rows, &shared)?;
             }
             let (Some(f), Some(id)) = (file, id) else { break };
+            // at most one past the most a blob takes; the rest of a bigger file
+            // is streamed below, never held
             let mut file_rows = Vec::new();
-            while let Some(row) = pending.take_if(|r| r.file_id == id) {
+            while file_rows.len() as i64 <= store::SEAL_MAX_SEGMENTS
+                && let Some(row) = pending.take_if(|r| r.file_id == id)
+            {
                 file_rows.push(row);
                 pending = next_row(shard, &mut rows, &shared)?;
             }
@@ -472,8 +476,12 @@ fn compact_shard(
             // rows a blob cant hold exactly (a negative part, no size) stay rows
             let fits = file_rows.iter().all(|r| r.part.is_none_or(|p| p >= 0) && r.bytes.is_some());
             let seen: Vec<u8> = f.get(8)?;
-            let seal =
-                !file_rows.is_empty() && fits && store::due(f.get(6)?, &seen, f.get(9)?, old_blob.is_some(), now);
+            // and files with more segments than a blob takes stay rows
+            let small = (segs.len() + file_rows.len()) as i64 <= store::SEAL_MAX_SEGMENTS;
+            let seal = !file_rows.is_empty()
+                && fits
+                && small
+                && store::due(f.get(6)?, &seen, f.get(9)?, old_blob.is_some(), now);
             if seal {
                 segs.extend(file_rows.drain(..).map(|r| Seg {
                     part: r.part,
@@ -494,6 +502,20 @@ fn compact_shard(
             }
             copied += (segs.len() + file_rows.len()) as i64;
             in_tx += 1 + segs.len() + file_rows.len();
+            // the rest of a file too big to buffer, a row at a time
+            while let Some(row) = pending.take_if(|r| r.file_id == id) {
+                insert_row(&tx, &row)?;
+                (copied, in_tx) = (copied + 1, in_tx + 1);
+                if (copied as usize).is_multiple_of(STOP_EVERY) {
+                    halt(stop, shard)?;
+                }
+                if in_tx >= BATCH {
+                    tx.commit()?;
+                    tx = conn.transaction()?;
+                    in_tx = 0;
+                }
+                pending = next_row(shard, &mut rows, &shared)?;
+            }
             if in_tx >= BATCH {
                 tx.commit()?;
                 tx = conn.transaction()?;
@@ -1023,6 +1045,49 @@ mod tests {
         assert_eq!(article_total(&main), count);
         assert_eq!(loose(&main), 0, "the late rows are sealed in with the blob");
         assert_eq!(blob_segs_with_known_domains(&main).len() as i64, count);
+    }
+
+    #[test]
+    fn a_file_over_the_cap_is_copied_as_rows_and_its_nzb_is_the_same() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        legacy_fixture(&main);
+        // a complete file (so due) whose rows a poster padded past what a blob takes
+        let (path, big) = file_of(&main, "Rel.1", "alt.binaries.g1");
+        let conn = db::open_at(&path).unwrap();
+        let before_rows: i64 =
+            conn.query_row("select count(*) from segments where file_id = ?", [big], |r| r.get(0)).unwrap();
+        let extra = store::SEAL_MAX_SEGMENTS + 1 - before_rows;
+        conn.execute(
+            "with recursive n(i) as (select 1 union all select i + 1 from n where i < ?2)
+             insert into segments (file_id, local, domain, part, bytes)
+             select ?1, cast('big' || i as blob), 0, 100 + i, 1 from n",
+            params![big, extra],
+        )
+        .unwrap();
+        drop(conn);
+        let before = all_articles(&main);
+        let count = article_total(&main);
+
+        run(&main, &|_| {}, &no_stop()).unwrap();
+        assert_eq!(all_articles(&main), before, "every NZB reads back the same");
+        assert_eq!(article_total(&main), count);
+        assert_eq!(loose(&main), store::SEAL_MAX_SEGMENTS + 1, "only the big file stays rows");
+        let conn = db::open_at(&path).unwrap();
+        let (rows, blob): (i64, Option<Vec<u8>>) = conn
+            .query_row(
+                "select (select count(*) from segments where file_id = f.id), f.blob from files f where id = ?",
+                [big],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((rows, blob), (store::SEAL_MAX_SEGMENTS + 1, None));
+
+        // and without the extra row it seals again
+        conn.execute("delete from segments where file_id = ? and local = cast('big1' as blob)", [big]).unwrap();
+        drop(conn);
+        run(&main, &|_| {}, &no_stop()).unwrap();
+        assert_eq!(loose(&main), 0, "at the cap a file seals");
     }
 
     #[test]
