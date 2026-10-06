@@ -64,7 +64,8 @@ fn a_day_chunk_indexes_that_day() {
     let day =
         atlas::chunks::unix_day(chrono::DateTime::parse_from_rfc3339("2026-01-02T00:00:00+00:00").unwrap().timestamp());
     let main_conn = atlas::db::open_at(&main).unwrap();
-    atlas::chunks::add(&main_conn, GROUP, day, day).unwrap();
+    // a day between two others: the oldest and newest reach the marks
+    atlas::chunks::add(&main_conn, GROUP, day + 1, day - 1).unwrap();
 
     let ctx = atlas::indexer::PassContext {
         pool: pool.pool.clone(),
@@ -81,7 +82,7 @@ fn a_day_chunk_indexes_that_day() {
     // (24 and 49); 30 and 40 don't exist. 24..=49 minus 2 = 24 articles
     assert_eq!(saved.articles, 24);
     let conn = atlas::db::open_at(&main).unwrap();
-    assert_eq!(atlas::chunks::progress(&conn, GROUP).unwrap(), (1, 1));
+    assert_eq!(atlas::chunks::progress(&conn, GROUP).unwrap(), (1, 3));
 }
 
 /// posts `low..=high`, number n posted n - 1 hours after 2026-01-01 00:00 UTC,
@@ -276,7 +277,8 @@ fn a_day_chunk_right_after_a_hole_of_millions_gets_every_article() {
 
     let day = atlas::chunks::unix_day(minute_of(3_000_001));
     let main_conn = atlas::db::open_at(&main).unwrap();
-    atlas::chunks::add(&main_conn, GROUP, day, day).unwrap();
+    // a day between two others: the oldest and newest reach the marks
+    atlas::chunks::add(&main_conn, GROUP, day + 1, day - 1).unwrap();
     let ctx = atlas::indexer::PassContext {
         pool: pool.pool.clone(),
         states: Default::default(),
@@ -291,7 +293,7 @@ fn a_day_chunk_right_after_a_hole_of_millions_gets_every_article() {
     // the day's 1,440 posts and the hour after it; the hour before is the hole
     assert_eq!(saved.articles, 1_440 + 60);
     let conn = atlas::db::open_at(&main).unwrap();
-    assert_eq!(atlas::chunks::progress(&conn, GROUP).unwrap(), (1, 1));
+    assert_eq!(atlas::chunks::progress(&conn, GROUP).unwrap(), (1, 3));
 }
 
 /// A day chunk whose day has 150 numbers missing in the middle still fetches
@@ -320,7 +322,8 @@ fn a_day_chunk_skips_a_gap_inside_the_day() {
     let day =
         atlas::chunks::unix_day(chrono::DateTime::parse_from_rfc3339("2026-01-02T00:00:00+00:00").unwrap().timestamp());
     let main_conn = atlas::db::open_at(&main).unwrap();
-    atlas::chunks::add(&main_conn, GROUP, day, day).unwrap();
+    // a day between two others: the oldest and newest reach the marks
+    atlas::chunks::add(&main_conn, GROUP, day + 1, day - 1).unwrap();
 
     let ctx = atlas::indexer::PassContext {
         pool: pool.pool.clone(),
@@ -337,7 +340,7 @@ fn a_day_chunk_skips_a_gap_inside_the_day() {
     // (691..=720, 30 posts); nothing comes after 1440
     assert_eq!(saved.articles, 720 - 150 + 30);
     let conn = atlas::db::open_at(&main).unwrap();
-    assert_eq!(atlas::chunks::progress(&conn, GROUP).unwrap(), (1, 1));
+    assert_eq!(atlas::chunks::progress(&conn, GROUP).unwrap(), (1, 3));
 }
 
 /// A chunk that fails and then cant be given back still reports why it
@@ -1059,7 +1062,8 @@ fn chunks_save_every_post_of(list: &[Slot], days: &[i64]) {
         let pool = BlockingPool::new(&[mock(port, "secret", 2, 1)]);
         pool.connect().unwrap();
         let main_conn = atlas::db::open_at(&main).unwrap();
-        atlas::chunks::add(&main_conn, GROUP, day, atlas::chunks::unix_day(list[0].1).min(day)).unwrap();
+        // between two other days: the oldest and newest reach the marks
+        atlas::chunks::add(&main_conn, GROUP, day + 1, atlas::chunks::unix_day(list[0].1).min(day - 1)).unwrap();
         let ctx = atlas::indexer::PassContext {
             pool: pool.pool.clone(),
             states: Default::default(),
@@ -1179,9 +1183,121 @@ fn a_run_of_future_dates_doesnt_empty_the_day() {
 }
 
 /// A run of posts with Dates after the day but not in the future: the search
-/// finds the day empty, the check around it still finds the day's posts.
+/// finds the day empty, its posts are in the chunk next to it.
 #[test]
 fn a_run_of_later_dates_doesnt_empty_the_day() {
     let saved = chunk_of_jan_10(forged_run("Mon, 01 Jun 2026 00:00:00 +0000"));
     assert!((216..=240).all(|n| saved.contains(&n)), "the day's posts are missing: {saved:?}");
+}
+
+/// posts 1..=23 hourly on 2026-01-01, 24..=2023 forged to 2026-06-01, then
+/// 2024..=2047 hourly on 2026-01-02 and 2048..=2071 on 2026-01-03: the date
+/// search for 2026-01-02 and 2026-01-03 both land on 24
+fn long_forged_run() -> Vec<Slot> {
+    let mut list: Vec<Slot> = (1..=23).map(|n| (n, jan_1() + n as i64 * 3600)).collect();
+    list.extend((24..=2023).map(|n| (n, unix("2026-06-01T00:00:00+00:00"))));
+    list.extend((2024..=2071).map(|n| (n, jan_1() + 86_400 + (n as i64 - 2024) * 3600)));
+    list
+}
+
+/// The numbers saved by indexing every day chunk of a split of `days`
+/// (oldest first) over `list` on one server.
+fn saved_by_every_chunk(list: &[Slot], days: std::ops::RangeInclusive<i64>) -> Vec<u64> {
+    let home = tempfile::tempdir().unwrap();
+    let main = home.path().join("atlas.db");
+    atlas::db::create_db_at(&main).unwrap();
+    let port = spawn_server(Server::new(slot_posts(list)));
+    let pool = BlockingPool::new(&[mock(port, "secret", 2, 1)]);
+    pool.connect().unwrap();
+    let main_conn = atlas::db::open_at(&main).unwrap();
+    atlas::chunks::add(&main_conn, GROUP, *days.end(), *days.start()).unwrap();
+    let ctx = atlas::indexer::PassContext {
+        pool: pool.pool.clone(),
+        states: Default::default(),
+        stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        verbose: false,
+    };
+    let db = atlas::indexer::shared_db(main_conn);
+    for day in days.clone() {
+        let chunk = claimed(&main, GROUP, day);
+        pool.block_on(atlas::indexer::run_chunk(&ctx, &Default::default(), &db, &chunk, 0, &mut |_| {})).unwrap();
+    }
+    let conn = atlas::db::open_with_shards(&main).unwrap();
+    let total = days.end() - days.start() + 1;
+    assert_eq!(atlas::chunks::progress(&conn, GROUP).unwrap(), (total, total));
+    let shard = atlas::store::shard_of(GROUP);
+    let mut q = conn.prepare(&format!("select subject from s{shard}.files")).unwrap();
+    let mut saved: Vec<u64> = q
+        .query_map([], |r| r.get::<_, String>(0))
+        .unwrap()
+        .map(|s| s.unwrap().trim_start_matches("\"p").split('.').next().unwrap().parse().unwrap())
+        .collect();
+    saved.sort();
+    saved
+}
+
+/// 2,000 forged later Dates in a row, more than any look around a day's
+/// range reaches: every post of the split is still fetched by some chunk.
+#[test]
+fn a_long_run_of_later_dates_doesnt_lose_the_days_after_it() {
+    let list = long_forged_run();
+    let day = atlas::chunks::unix_day(jan_1());
+    let saved = saved_by_every_chunk(&list, day..=day + 2);
+    let missing: Vec<u64> = list.iter().map(|&(n, _)| n).filter(|n| !saved.contains(n)).collect();
+    assert!(missing.is_empty(), "{} posts missing, from {:?}", missing.len(), missing.first());
+}
+
+/// Over posts with runs of forged Dates at random (earlier, later, and
+/// future), the ranges of a split's day chunks leave no number from the
+/// low mark to the high mark out.
+#[test]
+fn day_chunk_ranges_cover_every_number_whatever_the_forged_runs() {
+    let mut seed = 0x5eed_u64;
+    let mut next = |below: u64| {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (seed >> 33) % below
+    };
+    for case in 0..60 {
+        // six days of posts 20 minutes apart, numbers 1 to 3 apart
+        let mut list: Vec<Slot> = Vec::new();
+        let (mut n, mut t) = (1 + next(50), jan_1());
+        while t < jan_1() + 6 * 86_400 {
+            list.push((n, t));
+            n += 1 + next(3);
+            t += 1200;
+        }
+        let (oldest_day, newest_day) = (atlas::chunks::unix_day(list[0].1), atlas::chunks::unix_day(t - 1));
+        // up to four runs of forged Dates, up to 1,500 posts long
+        for _ in 0..=next(4) {
+            let (at, len) = (next(list.len() as u64) as usize, 1 + next(1500) as usize);
+            let forged = match next(3) {
+                0 => unix("2025-03-01T00:00:00+00:00"),
+                1 => jan_1() + next(6 * 86_400) as i64,
+                _ => unix("2035-01-01T00:00:00+00:00"),
+            };
+            for slot in list.iter_mut().skip(at).take(len) {
+                slot.1 = forged;
+            }
+        }
+
+        let port = spawn_server(Server::new(slot_posts(&list)));
+        let pool = BlockingPool::new(&[mock(port, "secret", 2, 1)]);
+        pool.connect().unwrap();
+        let (low, high) = (list[0].0, list.last().unwrap().0);
+        let mut ranges: Vec<(u64, u64)> = (oldest_day..=newest_day)
+            .map(|day| {
+                let range =
+                    atlas::indexer::chunk_range(&pool.pool, 0, GROUP, (low, high), day, (oldest_day, newest_day), high);
+                pool.block_on(range).unwrap()
+            })
+            .filter(|(start, end)| start <= end)
+            .collect();
+        ranges.sort();
+        let mut covered = low - 1;
+        for (start, end) in ranges {
+            assert!(start <= covered + 1, "case {case}: {} to {} in no chunk", covered + 1, start - 1);
+            covered = covered.max(end);
+        }
+        assert_eq!(covered, high, "case {case}: the chunks stop short of the high mark");
+    }
 }

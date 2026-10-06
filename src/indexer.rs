@@ -796,9 +796,6 @@ where
     };
     let (_count, first, last, _name) = found;
 
-    let from = day * 86_400 - CHUNK_OVERLAP;
-    let to = (day + 1) * 86_400 + CHUNK_OVERLAP;
-
     // a day this server doesnt keep from its start would come out empty or
     // cut short, though another server may have all of it: give it back, and
     // the server takes no day that old for a while. the split's oldest day is
@@ -842,16 +839,20 @@ where
         }
         return failed(TooOld { group: group.to_string(), host, oldest_day }.into()).await;
     }
-    let start = match ctx.pool.article_at(server, group, first, last, from).await {
-        Ok(n) => n,
-        Err(e) => return failed(e.into()).await,
+    // the split's days and, for its newest, how far down this server's
+    // backfill got before the split (its high mark when it has no cursor)
+    let (g, key) = (group.to_string(), cursor_key(&ctx.pool, server, group));
+    let bounds = on_db(db, move |conn| {
+        let days = crate::chunks::oldest_day(conn, &g)?.zip(crate::chunks::newest_day(conn, &g)?);
+        Ok((days, db::get_group_state(conn, &key)?))
+    })
+    .await;
+    let (days, cursor) = match bounds {
+        Ok((Some(days), state)) => (days, state.map_or(last, |s| (s.backfill_cursor.max(0) as u64).min(last))),
+        Ok((None, _)) => return failed(anyhow!("{group} has no day chunks")).await,
+        Err(e) => return failed(e).await,
     };
-    let end = match ctx.pool.article_at(server, group, start.max(first), last, to).await {
-        Ok(n) => n.saturating_sub(1),
-        Err(e) => return failed(e.into()).await,
-    };
-    // posts of the day the search missed, near what it found
-    let (start, end) = match ctx.pool.widen_to_day(server, group, (first, last), (start, end), (from, to)).await {
+    let (start, end) = match chunk_range(&ctx.pool, server, group, (first, last), day, days, cursor).await {
         Ok(range) => range,
         Err(e) => return failed(e.into()).await,
     };
@@ -872,6 +873,41 @@ where
         }
         Err(e) => failed(e).await,
     }
+}
+
+/// The article numbers day chunk `day` of a split over `days` (oldest,
+/// newest) covers on `server`, whose low and high marks are `first` and
+/// `last`: from where the day starts to where the next one does, each found
+/// by the same date search an hour early (`CHUNK_OVERLAP`), and to an hour
+/// past the day when that is further. The oldest day starts at `first`, the
+/// newest ends at `cursor`. Neighbouring days share where one ends and the
+/// next starts, soo every number from `first` to `cursor` is some chunk's
+/// however forged Dates move the searches: a forged Date only moves an
+/// article into another chunk. Empty (start past end) when the day's posts
+/// are all in its neighbours.
+pub async fn chunk_range(
+    pool: &Pool,
+    server: usize,
+    group: &str,
+    (first, last): (u64, u64),
+    day: i64,
+    (oldest_day, newest_day): (i64, i64),
+    cursor: u64,
+) -> crate::nntp::Result<(u64, u64)> {
+    let starts = |day: i64| pool.article_at(server, group, first, last, day * 86_400 - CHUNK_OVERLAP);
+    if day <= oldest_day && day >= newest_day {
+        return Ok((first, cursor));
+    }
+    let next = starts(day + 1).await?;
+    // a start past the next day's (forged Dates) is moved down to it
+    let start = if day <= oldest_day { first } else { starts(day).await?.min(next) };
+    let end = if day >= newest_day {
+        cursor
+    } else {
+        let past = pool.article_at(server, group, first, last, (day + 1) * 86_400 + CHUNK_OVERLAP).await?;
+        next.max(past).saturating_sub(1)
+    };
+    Ok((start, end))
 }
 
 /// Whether `server`, whose first article of split `group` was posted at

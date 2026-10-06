@@ -886,10 +886,6 @@ fn plausible_post_time(date: &str) -> Option<i64> {
     (EARLIEST..=chrono::Utc::now().timestamp() + AHEAD).contains(&t).then_some(t)
 }
 
-/// windows of `DATE_LOOK` numbers a day chunk reads on each side of the range
-/// the date search found for it, for posts of that day the search missed
-pub const DAY_CHECK_WINDOWS: u64 = 8;
-
 /// numbers per date search request at first, and at most
 const DATE_LOOK: u64 = 100;
 const DATE_SCAN_MAX: u64 = DATE_LOOK << 6;
@@ -1712,52 +1708,6 @@ impl Pool {
         let end = n.saturating_add(DATE_LOOK - 1).min(hi.saturating_sub(1)).max(n);
         let rows = self.listing(i, group, n, end).await?;
         Ok(rows.iter().find(|o| plausible_post_time(&o.date).is_some_and(|t| t >= when)).map(|o| o.number))
-    }
-
-    /// `start..=end` of `group` on server `i` (`low..=high` on the server)
-    /// widened to the articles posted in `from..to` among the
-    /// `DAY_CHECK_WINDOWS` windows of `DATE_LOOK` numbers before `start` and
-    /// after `end`. The date search takes post dates for ordered, which a run
-    /// of forged Dates can make it miss a day's posts by, even all of them:
-    /// this bounded look around the range finds those near it.
-    pub async fn widen_to_day(
-        &self,
-        i: usize,
-        group: &str,
-        (low, high): (u64, u64),
-        (start, end): (u64, u64),
-        (from, to): (i64, i64),
-    ) -> Result<(u64, u64)> {
-        let in_day = |rows: &[Overview]| -> Vec<u64> {
-            rows.iter()
-                .filter(|o| plausible_post_time(&o.date).is_some_and(|t| (from..to).contains(&t)))
-                .map(|o| o.number)
-                .collect()
-        };
-        let (mut first, mut last) = (start, end);
-        let mut at = start;
-        for _ in 0..DAY_CHECK_WINDOWS {
-            if at <= low {
-                break;
-            }
-            let a = at.saturating_sub(DATE_LOOK).max(low);
-            if let Some(&n) = in_day(&self.listing(i, group, a, at - 1).await?).iter().min() {
-                first = first.min(n);
-            }
-            at = a;
-        }
-        let mut at = end.saturating_add(1).max(low);
-        for _ in 0..DAY_CHECK_WINDOWS {
-            if at > high {
-                break;
-            }
-            let b = at.saturating_add(DATE_LOOK - 1).min(high);
-            if let Some(&n) = in_day(&self.listing(i, group, at, b).await?).iter().max() {
-                last = last.max(n);
-            }
-            at = b + 1;
-        }
-        Ok((first, last))
     }
 
     /// Compressed listings from server `i` couldnt be read: it gets plain ones from now on.
