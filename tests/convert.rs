@@ -395,6 +395,35 @@ fn a_stopped_conversion_copies_again_when_the_old_database_changed() {
     assert_eq!(store::articles(&conn, id).unwrap().len(), 1);
 }
 
+/// Scans of empty ranges move an old database's cursors without adding a
+/// release or article: a stopped conversion copies again then too, soo the
+/// swap doesnt put back the cursors from before and redo those scans.
+#[test]
+fn a_stopped_conversion_copies_again_when_only_the_cursors_moved() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = dir.path().join("atlas.db");
+    old_database(&main);
+    db::create_db_at(&main).unwrap();
+
+    let stopped = std::panic::catch_unwind(|| {
+        convert::run(&main, &|m| assert!(!m.contains("checking NZBs"), "stop here")).unwrap();
+    });
+    assert!(stopped.is_err());
+
+    Connection::open(&main)
+        .unwrap()
+        .execute("update groups set backfill_cursor = 7 where name = 'alt.binaries.b'", [])
+        .unwrap();
+
+    let messages = std::cell::RefCell::new(Vec::new());
+    convert::run(&main, &|m| messages.borrow_mut().push(m.to_string())).unwrap();
+    assert!(!messages.borrow().iter().any(|m| m.contains("copy finished earlier")), "{messages:?}");
+    let conn = db::open_at(&main).unwrap();
+    let cursor: i64 =
+        conn.query_row("select backfill_cursor from groups where name = 'alt.binaries.b'", [], |r| r.get(0)).unwrap();
+    assert_eq!(cursor, 7);
+}
+
 /// Stopped between moving the old database aside and putting the new one in
 /// place: the next start finishes the swap.
 #[test]

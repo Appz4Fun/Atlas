@@ -22,6 +22,7 @@ use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow, bail};
+use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 
 use crate::compact::{checkpoint, rename_db};
@@ -693,12 +694,15 @@ fn copy(
 }
 
 /// What the old database held when a copy started: its release and article
-/// counts and highest ids. A copy is only picked up again from the same old
-/// database; one written to or put back from another backup since differs.
+/// counts and highest ids, and a digest of its `groups` rows (the cursors:
+/// scans of empty ranges move them without adding anything). A copy is only
+/// picked up again from the same old database; one written to or put back
+/// from another backup since differs.
 #[derive(Debug, PartialEq)]
-struct Source([i64; 4]);
+struct Source([i64; 5]);
 
-const SOURCE_KEYS: [&str; 4] = ["source_releases", "source_max_release", "source_articles", "source_max_article"];
+const SOURCE_KEYS: [&str; 5] =
+    ["source_releases", "source_max_release", "source_articles", "source_max_article", "source_groups"];
 
 impl Source {
     fn of(old: &Connection) -> Result<Source> {
@@ -706,7 +710,7 @@ impl Source {
             old.query_row("select count(*), coalesce(max(id), 0) from releases", [], |r| Ok((r.get(0)?, r.get(1)?)))?;
         let (articles, max_article) =
             old.query_row("select count(*), coalesce(max(id), 0) from articles", [], |r| Ok((r.get(0)?, r.get(1)?)))?;
-        Ok(Source([releases, max_release, articles, max_article]))
+        Ok(Source([releases, max_release, articles, max_article, groups_digest(old)?]))
     }
 
     /// into the new main database's meta, as the copy starts
@@ -718,7 +722,7 @@ impl Source {
     }
 
     fn saved(conn: &Connection) -> Result<Option<Source>> {
-        let mut values = [0; 4];
+        let mut values = [0; 5];
         for (key, value) in SOURCE_KEYS.iter().zip(values.iter_mut()) {
             let Some(v) = conn.query_row("select value from meta where key = ?", [key], |r| r.get(0)).optional()?
             else {
@@ -728,6 +732,42 @@ impl Source {
         }
         Ok(Some(Source(values)))
     }
+}
+
+/// FNV-1a over every column of every `groups` row in name order, stable
+/// across builds (it's kept in the new database's meta between runs)
+fn groups_digest(old: &Connection) -> Result<i64> {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut eat = |bytes: &[u8]| {
+        for b in bytes {
+            hash = (hash ^ *b as u64).wrapping_mul(0x0100_0000_01b3);
+        }
+    };
+    let mut stmt = old.prepare("select * from groups order by name")?;
+    let columns = stmt.column_count();
+    let mut rows = stmt.query([])?;
+    while let Some(r) = rows.next()? {
+        for i in 0..columns {
+            // the type too, soo null and '' and 0 differ
+            match r.get_ref(i)? {
+                ValueRef::Null => eat(b"n"),
+                ValueRef::Integer(v) => {
+                    eat(b"i");
+                    eat(&v.to_le_bytes());
+                }
+                ValueRef::Real(v) => {
+                    eat(b"r");
+                    eat(&v.to_le_bytes());
+                }
+                ValueRef::Text(v) | ValueRef::Blob(v) => {
+                    eat(b"t");
+                    eat(&(v.len() as u64).to_le_bytes());
+                    eat(v);
+                }
+            }
+        }
+    }
+    Ok(hash as i64)
 }
 
 /// The shards are complete from an earlier run, copied from the old database
