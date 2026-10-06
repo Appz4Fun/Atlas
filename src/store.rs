@@ -839,6 +839,30 @@ fn seal_rows(conn: &Connection, file_id: i64) -> Result<usize> {
     Ok(segs.len())
 }
 
+/// File `file_id`'s parts worked out again from its blob and rows, and its
+/// release's completeness with them: after dropping copies whose parts were
+/// counted (see `SealedCache`).
+pub(crate) fn recount_parts(conn: &Connection, file_id: i64) -> Result<()> {
+    let mut seen = Vec::new();
+    for p in sealed_segments(conn, file_id)?.unwrap_or_default().iter().filter_map(|s| s.part) {
+        insert_part(&mut seen, p);
+    }
+    let parts: Vec<Option<i64>> = conn
+        .prepare_cached("select part from segments where file_id = ?")?
+        .query_map([file_id], |r| r.get(0))?
+        .collect::<Result<_>>()?;
+    for p in parts.into_iter().flatten() {
+        insert_part(&mut seen, p);
+    }
+    conn.prepare_cached("update files set seen = ? where id = ?")?.execute(params![seen, file_id])?;
+    let (release_id, file_total): (i64, Option<i64>) = conn
+        .prepare_cached("select r.id, r.file_total from files f join releases r on r.id = f.release_id where f.id = ?")?
+        .query_row([file_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    conn.prepare_cached("update releases set complete = ? where id = ?")?
+        .execute(params![release_complete(conn, release_id, file_total)? as i64, release_id])?;
+    Ok(())
+}
+
 /// The next `limit` files after `after_id`, and which of them a writer
 /// seals: ones with rows that are complete and not sealed yet, or untouched
 /// for `SEAL_AGE` (a sealed file with late rows waits for this). Files never

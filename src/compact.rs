@@ -456,6 +456,8 @@ fn compact_shard(
     let now = chrono::Utc::now().timestamp();
     // rows dropped as copies of what their file's blob already has
     let (mut copied, mut sealed, mut copies) = (0i64, 0i64, 0i64);
+    // files that lost copies: their parts are worked out again once copied
+    let mut recount = Vec::new();
     {
         let open = || Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY);
         let (files_read, rows_read) = (open()?, open()?);
@@ -552,6 +554,7 @@ fn compact_shard(
                     let bytes = dropped.iter().map(|r| r.bytes.unwrap_or(0)).sum();
                     store::uncount_copies(&tx, f.get(1)?, bytes, dropped.len() as i64)?;
                     copies += dropped.len() as i64;
+                    recount.push(id);
                 }
             }
 
@@ -618,12 +621,19 @@ fn compact_shard(
             if tail_copies > 0 {
                 store::uncount_copies(&tx, f.get(1)?, tail_bytes, tail_copies)?;
                 copies += tail_copies;
+                recount.push(id);
             }
             if in_tx >= BATCH {
                 tx.commit()?;
                 tx = conn.transaction()?;
                 in_tx = 0;
             }
+        }
+        // the parts the dropped copies were counted in are what is left, and
+        // so is their release's completeness (once all its files are in)
+        recount.dedup();
+        for id in recount {
+            store::recount_parts(&tx, id)?;
         }
         tx.commit()?;
     }
@@ -1175,6 +1185,32 @@ mod tests {
         store::seal_file(&conn, file).unwrap();
         let expected: i64 = conn.query_row("select expected from files where id = ?", [file], |r| r.get(0)).unwrap();
         assert_eq!(expected, 3);
+    }
+
+    /// Compaction drops a row that copies b.rar's part 1 but claimed part 2:
+    /// the file's parts and its release's completeness go back to what the
+    /// blob has (1 of 2), and what the copy held back goes with it.
+    #[test]
+    fn compacting_a_copy_away_takes_its_part_out_of_completeness() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        let (path, file, release) = held_back_fixture(&main, ("<b1@x>", 2, 2));
+        let complete = |path: &Path| -> bool {
+            db::open_at(path)
+                .unwrap()
+                .query_row("select complete from releases where id = ?", [release], |r| r.get(0))
+                .unwrap()
+        };
+        assert!(complete(&path), "the copy's part 2 made it look complete");
+        run(&main, &|_| {}, &no_stop()).unwrap();
+        assert!(!complete(&path), "b.rar has 1 of 2");
+        let conn = db::open_at(&path).unwrap();
+        let seen: Vec<u8> = conn.query_row("select seen from files where id = ?", [file], |r| r.get(0)).unwrap();
+        let mut one = Vec::new();
+        store::insert_part(&mut one, 1);
+        assert_eq!(seen, one);
+        let held: i64 = conn.query_row("select count(*) from held_back", [], |r| r.get(0)).unwrap();
+        assert_eq!(held, 0);
     }
 
     fn file_of(main: &Path, name: &str, group: &str) -> (PathBuf, i64) {
