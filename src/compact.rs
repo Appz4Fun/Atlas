@@ -50,6 +50,31 @@ fn remove_db(path: &Path) {
     }
 }
 
+/// Fold the WAL of `conn`'s database into it, all of it: a checkpoint held
+/// back (a reader, a writer) leaves committed pages only in the WAL, soo it
+/// is an error rather than taken for done.
+fn checkpoint(conn: &Connection) -> Result<()> {
+    let (busy, log, done): (i64, i64, i64) =
+        conn.query_row("pragma wal_checkpoint(truncate)", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+    if busy != 0 || log != done {
+        bail!("the WAL checkpoint didnt complete ({done} of {log} pages, busy {busy})");
+    }
+    Ok(())
+}
+
+/// Rename the database `from` to `to`, its -wal and -shm with it (those
+/// there are): the WAL can hold committed pages of it.
+fn rename_db(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::rename(from, to)?;
+    for suffix in ["-wal", "-shm"] {
+        let (a, b) = (format!("{}{suffix}", from.display()), format!("{}{suffix}", to.display()));
+        if Path::new(&a).exists() {
+            std::fs::rename(a, b)?;
+        }
+    }
+    Ok(())
+}
+
 fn size(path: &Path) -> u64 {
     std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
 }
@@ -204,7 +229,7 @@ pub fn recover_cut_swaps(main: &Path) -> Result<Vec<String>> {
             said.push(unresolved_message(&path, &original));
             continue;
         }
-        std::fs::rename(&original, &path)
+        rename_db(&original, &path)
             .with_context(|| format!("putting {} back as {}", original.display(), path.display()))?;
         remove_db(&with_suffix(&path, "compact"));
         said.push(format!("{} was moved aside by a compaction that was cut short; it's back in place", path.display()));
@@ -333,7 +358,7 @@ fn compact_shard(
     // fold the WAL in soo the original is whole on its own
     {
         let conn = db::open_at(&path)?;
-        conn.query_row("pragma wal_checkpoint(truncate)", [], |_| Ok(()))?;
+        checkpoint(&conn).context("folding the original's WAL in")?;
         // a shard from before sealing gets its (empty) seal columns
         store::migrate_shard(&conn)?;
     }
@@ -548,13 +573,12 @@ fn compact_shard(
     halt(stop, shard)?;
     let conn = db::open_at(&copy)?;
     conn.query_row("pragma journal_mode = wal", [], |_| Ok(()))?;
-    conn.query_row("pragma wal_checkpoint(truncate)", [], |_| Ok(()))?;
+    checkpoint(&conn).context("folding the copy's WAL in")?;
     drop(conn);
+    // the original's -wal and -shm go aside with it: whatever they hold
+    // comes back with it if the swap is cut short (`recover_cut_swaps`)
     let original = with_suffix(&path, "precompact");
-    std::fs::rename(&path, &original).context("moving the original shard aside")?;
-    for suffix in ["-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
-    }
+    rename_db(&path, &original).context("moving the original shard aside")?;
     std::fs::rename(&copy, &path).context("putting the compacted shard in place")?;
     let after = size(&path);
     say(&format!("{:.1}GB -> {:.1}GB", before as f64 / 1e9, after as f64 / 1e9));
@@ -1341,5 +1365,50 @@ mod tests {
         // resolved: the shard is kept, the backup removed
         std::fs::remove_file(&backup).unwrap();
         drop(hold_off_compaction(&main).unwrap());
+    }
+
+    /// A checkpoint held back by a reader (its snapshot keeps WAL frames from
+    /// being folded in) is an error, not taken for done.
+    #[test]
+    fn a_checkpoint_a_reader_holds_back_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.db");
+        let writer = db::open_at(&path).unwrap();
+        writer.execute_batch("pragma journal_mode = wal; pragma wal_autocheckpoint = 0; create table t (x)").unwrap();
+        let reader = db::open_at(&path).unwrap();
+        reader.execute_batch("begin; select count(*) from t").unwrap();
+        writer.execute("insert into t values (1)", []).unwrap();
+
+        writer.busy_timeout(std::time::Duration::ZERO).unwrap();
+        let err = checkpoint(&writer).unwrap_err();
+        assert!(format!("{err:#}").contains("checkpoint"), "{err:#}");
+        reader.execute_batch("commit").unwrap();
+        checkpoint(&writer).unwrap();
+    }
+
+    /// A shard moved aside with pages still in its WAL (committed, not
+    /// folded in) gets them back with it when the swap was cut short.
+    #[test]
+    fn a_cut_swap_puts_the_originals_wal_back_with_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        legacy_fixture(&main);
+        let path = store::shard_path(&main, store::shard_of("alt.binaries.g3"));
+        let backup = with_suffix(&path, "precompact");
+        {
+            // the moved aside original: its file and its WAL, taken while a
+            // connection keeps a write in the WAL
+            let conn = db::open_at(&path).unwrap();
+            conn.execute_batch("pragma wal_autocheckpoint = 0; create table late (x); insert into late values (7)")
+                .unwrap();
+            std::fs::copy(&path, &backup).unwrap();
+            std::fs::copy(format!("{}-wal", path.display()), format!("{}-wal", backup.display())).unwrap();
+        }
+        remove_db(&path);
+
+        recover_cut_swaps(&main).unwrap();
+        let late: i64 = db::open_at(&path).unwrap().query_row("select x from late", [], |r| r.get(0)).unwrap();
+        assert_eq!(late, 7, "the write in the WAL came back too");
+        assert!(!Path::new(&format!("{}-wal", backup.display())).exists());
     }
 }
