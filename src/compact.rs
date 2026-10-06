@@ -2328,7 +2328,7 @@ mod tests {
     fn a_checkpoint_a_reader_holds_back_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("x.db");
-        let writer = db::open_at(&path).unwrap();
+        let writer = db::create_at(&path).unwrap();
         writer.execute_batch("pragma journal_mode = wal; pragma wal_autocheckpoint = 0; create table t (x)").unwrap();
         let reader = db::open_at(&path).unwrap();
         reader.execute_batch("begin; select count(*) from t").unwrap();

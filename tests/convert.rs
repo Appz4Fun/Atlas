@@ -473,6 +473,66 @@ fn a_swap_cut_after_the_old_database_moved_aside_is_finished_at_start() {
     assert_eq!(store::totals(&conn).unwrap().0, before.len() as i64);
 }
 
+/// A search or the dashboard during the swap, with no main database for a
+/// moment, doesnt make one: opening is not setting up.
+#[test]
+fn a_read_during_the_swap_makes_no_main_database() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = dir.path().join("atlas.db");
+    assert!(db::open_with_shards(&main).is_err());
+    assert!(db::open_at(&main).is_err());
+    assert!(!main.exists(), "nothing made in the way of the new one");
+}
+
+/// An empty atlas.db made in the swap's window (by a build that still made
+/// one on a read) is in the way of the swap: taken out, and the swap is
+/// finished (atlas.new.db ready) or the old database put back.
+#[test]
+fn an_empty_main_database_made_during_the_swap_is_taken_out() {
+    for (made_by_open, ready) in [(false, true), (true, true), (false, false), (true, false)] {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        old_database(&main);
+        let before = old_nzbs(&main);
+        db::create_db_at(&main).unwrap();
+        if ready {
+            convert::run(&main, &|_| {}).unwrap();
+            std::fs::rename(&main, dir.path().join("atlas.new.db")).unwrap();
+        } else {
+            std::fs::rename(&main, dir.path().join("atlas.old.db")).unwrap();
+        }
+        // the interloper: zero bytes, or a database with nothing in it
+        if made_by_open {
+            rusqlite::Connection::open(&main).unwrap().query_row("pragma journal_mode = wal", [], |_| Ok(())).unwrap();
+        } else {
+            std::fs::write(&main, b"").unwrap();
+        }
+
+        drop(db::create_db_holding(&main).unwrap().expect("set up"));
+        assert!(!dir.path().join("atlas.new.db").exists());
+        if ready {
+            assert!(!convert::needed(&main));
+            let conn = db::open_with_shards(&main).unwrap();
+            assert_eq!(store::totals(&conn).unwrap().0, before.len() as i64);
+        } else {
+            assert!(!dir.path().join("atlas.old.db").exists());
+            assert!(convert::needed(&main), "the old database is back");
+        }
+    }
+}
+
+/// A main database with something in it is never taken for an interloper.
+#[test]
+fn a_main_database_with_tables_is_left_alone_beside_a_cut_swap() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = dir.path().join("atlas.db");
+    old_database(&main);
+    std::fs::copy(&main, dir.path().join("atlas.old.db")).unwrap();
+    assert_eq!(convert::recover_cut_swap(&main).unwrap(), None);
+    assert!(dir.path().join("atlas.old.db").exists());
+    assert!(convert::needed(&main), "still the same one");
+}
+
 /// `--convert` after a swap cut short: atlas.db is missing, soo it isnt
 /// `needed`, yet there is work: the swap is finished, not "nothing to convert".
 #[test]

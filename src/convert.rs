@@ -51,7 +51,45 @@ pub fn needed(main: &Path) -> bool {
 /// `run_alone` to finish or undo first.
 pub fn to_do(main: &Path) -> bool {
     needed(main)
-        || (!main.exists() && (sibling(main, "atlas.new.db").exists() || sibling(main, "atlas.old.db").exists()))
+        || ((!main.exists() || is_empty_interloper(main))
+            && (sibling(main, "atlas.new.db").exists() || sibling(main, "atlas.old.db").exists()))
+}
+
+/// An atlas.db with nothing in it: no bytes, or not a single table. What a
+/// read made (a build that still made one on opening) in the moment a
+/// conversion's swap had no main database. Looked at read only, and closed
+/// again before this returns (it may be removed next, which Windows refuses
+/// for a file still open).
+pub fn is_empty_interloper(main: &Path) -> bool {
+    match std::fs::metadata(main) {
+        Ok(m) if m.len() == 0 => return true,
+        Ok(m) if m.is_file() => {}
+        _ => return false,
+    }
+    Connection::open_with_flags(main, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)
+        .and_then(|c| c.query_row("select not exists(select 1 from sqlite_master)", [], |r| r.get::<_, bool>(0)))
+        .unwrap_or(false)
+}
+
+/// Removes an empty interloper (see `is_empty_interloper`) at `main`, with
+/// its sidecars. Whoever made it may still have it open: then it stays, and
+/// that is the error.
+fn remove_interloper(main: &Path) -> std::io::Result<()> {
+    std::fs::remove_file(main)?;
+    remove_db(main);
+    Ok(())
+}
+
+/// `rename_db(from, main)`, through an empty interloper at `main` (made in
+/// the moment there was no main database): taken out, and tried again.
+fn rename_into_place(from: &Path, main: &Path) -> std::io::Result<()> {
+    match rename_db(from, main) {
+        Err(e) if is_empty_interloper(main) => {
+            remove_interloper(main).map_err(|_| e)?;
+            rename_db(from, main)
+        }
+        done => done,
+    }
 }
 
 fn sibling(main: &Path, name: &str) -> PathBuf {
@@ -69,7 +107,7 @@ fn remove_db(path: &Path) {
 /// the file) and no syncing. A crash only means converting again from the
 /// old database; the shards go back to WAL before the swap.
 fn open_for_conversion(path: &Path) -> rusqlite::Result<Connection> {
-    let conn = db::open_at(path)?;
+    let conn = db::create_at(path)?;
     conn.query_row("pragma journal_mode = off", [], |_| Ok(()))?;
     conn.execute_batch(
         "pragma synchronous = off;
@@ -180,9 +218,9 @@ pub fn run(main: &Path, progress: &dyn Fn(&str)) -> Result<(i64, i64)> {
     }
     // its -wal and -shm go aside with it, whatever they still hold
     rename_db(main, &backup).context("moving the old database aside")?;
-    if let Err(e) = rename_db(&new_main, main) {
+    if let Err(e) = rename_into_place(&new_main, main) {
         // the old one back, soo there is a main database to start from
-        let _ = rename_db(&backup, main);
+        let _ = rename_into_place(&backup, main);
         return Err(e).context("putting the new main database in place");
     }
 
@@ -201,10 +239,15 @@ pub fn run(main: &Path, progress: &dyn Fn(&str)) -> Result<(i64, i64)> {
 /// `atlas.old.db` back (and the next start converts again). Run under the
 /// exclusive lock. What it did, if anything.
 pub fn recover_cut_swap(main: &Path) -> Result<Option<String>> {
-    if main.try_exists()? {
-        return Ok(None);
-    }
     let (new_main, backup) = (sibling(main, "atlas.new.db"), sibling(main, "atlas.old.db"));
+    if main.try_exists()? {
+        // an empty one made in the swap's moment is in the way: out with it
+        let cut = (new_main.try_exists()? && swap_ready(&new_main)) || backup.try_exists()?;
+        if !(cut && is_empty_interloper(main)) {
+            return Ok(None);
+        }
+        remove_interloper(main).with_context(|| format!("removing the empty {} in the way", main.display()))?;
+    }
     if new_main.try_exists()? && swap_ready(&new_main) {
         rename_db(&new_main, main).context("putting the converted main database in place")?;
         return Ok(Some(format!(
@@ -689,7 +732,7 @@ fn copy(
     // 1. the new main database with the cursors
     remove_db(&new_main);
     {
-        let conn = db::open_at(&new_main)?;
+        let conn = db::create_at(&new_main)?;
         conn.query_row("pragma journal_mode = wal", [], |_| Ok(()))?;
         conn.execute_batch("create table groups(name TEXT PRIMARY KEY, live_cursor INTEGER, backfill_cursor INTEGER)")?;
         let cols: Vec<String> = old

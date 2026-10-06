@@ -118,7 +118,7 @@ pub fn create_main(conn: &Connection) -> Result<()> {
 
 /// A shard's tables, if missing.
 pub fn create_shard(path: &Path) -> Result<()> {
-    build_shard(&db::open_at(path)?)
+    build_shard(&db::create_at(path)?)
 }
 
 /// `create_shard` on a connection the caller opened (and may have set up to
@@ -2280,7 +2280,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("atlas.s0.db");
         {
-            let conn = db::open_at(&path).unwrap();
+            let conn = db::create_at(&path).unwrap();
             conn.execute_batch(
                 "create table files (id INTEGER PRIMARY KEY, release_id INTEGER NOT NULL, filename TEXT NOT NULL,
                     subject TEXT, subject_part INTEGER, subject_mid TEXT, expected INTEGER, file_total INTEGER,

@@ -30,7 +30,19 @@ pub fn open_with_shards(path: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
+/// The database at `path`, which has to be there already: opening never
+/// makes one. A read (search, the dashboard) during a conversion's swap,
+/// with no main database for a moment, would otherwise leave an empty one
+/// in the way of the new one. Only setting up makes one, see `create_at`.
 pub fn open_at(path: &Path) -> Result<Connection> {
+    use rusqlite::OpenFlags;
+    let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_URI | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    set_up(Connection::open_with_flags(path, flags)?)
+}
+
+/// The database at `path`, made (empty) when missing: for setting up
+/// (`create_db_at`, a new shard), not for reads.
+pub fn create_at(path: &Path) -> Result<Connection> {
     set_up(Connection::open(path)?)
 }
 
@@ -138,7 +150,7 @@ pub fn create_db() -> anyhow::Result<Option<WriteGuard>> {
 pub fn create_db_holding(path: &Path) -> anyhow::Result<Option<WriteGuard>> {
     // a conversion's swap cut short leaves no main database: finished or
     // undone first, alone (busy means someone is using the database, soo it's there)
-    if !path.try_exists()?
+    if (!path.try_exists()? || crate::convert::is_empty_interloper(path))
         && let Ok(_alone) = crate::compact::Lock::take(path)
         && let Some(said) = crate::convert::recover_cut_swap(path)?
     {
@@ -196,7 +208,7 @@ pub fn create_db_at(path: &Path) -> anyhow::Result<()> {
     if !path.try_exists()? {
         refuse_orphaned_shards(path)?;
     }
-    let conn = open_at(path)?;
+    let conn = create_at(path)?;
 
     // wal soo the indexer can write while search reads
     conn.query_row("pragma journal_mode = wal", [], |_| Ok(()))?;
@@ -698,7 +710,7 @@ mod tests {
         assert!(!has_old_layout(&open_at(&main).unwrap()).unwrap());
 
         let old = dir.path().join("old.db");
-        open_at(&old).unwrap().execute_batch("create table releases (id INTEGER PRIMARY KEY, name TEXT)").unwrap();
+        create_at(&old).unwrap().execute_batch("create table releases (id INTEGER PRIMARY KEY, name TEXT)").unwrap();
         create_db_at(&old).unwrap();
         assert!(has_old_layout(&open_at(&old).unwrap()).unwrap());
         assert!(!store::shard_path(&old, 0).exists(), "no shards until it is converted");
