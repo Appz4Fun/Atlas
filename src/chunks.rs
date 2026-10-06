@@ -61,6 +61,37 @@ pub fn add(conn: &Connection, group: &str, newest_day: i64, oldest_day: i64) -> 
     Ok(added)
 }
 
+/// Chunks for the days of split `group` from before its oldest one back to
+/// `oldest_day`, when a server goes back further than any did at the split.
+/// The old oldest day was done (if it was) only from where the server going
+/// back furthest then started: it is to do again, and that server is
+/// forgotten (see `deepest`). Returns the days added.
+pub fn reach_back(conn: &Connection, group: &str, oldest_day: i64) -> Result<usize> {
+    let tx = conn.unchecked_transaction()?;
+    let Some(old) = self::oldest_day(&tx, group)? else { return Ok(0) };
+    if oldest_day >= old {
+        return Ok(0);
+    }
+    let mut added = 0;
+    {
+        let mut insert =
+            tx.prepare_cached("insert or ignore into backfill_chunks (grp, day, state) values (?, ?, ?)")?;
+        for day in (oldest_day..old).rev() {
+            added += insert.execute(params![group, day, PENDING])?;
+        }
+    }
+    tx.execute(
+        &format!(
+            "update backfill_chunks set state = {PENDING}, server = null, claimed_at = null, done_at = null
+             where grp = ? and day = ? and state = {DONE}"
+        ),
+        params![group, old],
+    )?;
+    tx.execute("delete from backfill_deepest where grp = ?", [group])?;
+    tx.commit()?;
+    Ok(added)
+}
+
 /// Check if a group has any chunks in backfill.
 pub fn is_split(conn: &Connection, group: &str) -> Result<bool> {
     conn.prepare_cached("select 1 from backfill_chunks where grp = ? limit 1")?.exists([group])

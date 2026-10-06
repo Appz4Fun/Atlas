@@ -585,6 +585,80 @@ fn the_oldest_day_moves_on_when_the_deepest_server_drops_the_group() {
     assert_eq!(atlas::chunks::deepest(&conn, GROUP).unwrap().as_deref(), Some("localhost"));
 }
 
+/// A split made while the servers kept 5 days, then a server that keeps 10
+/// joins: the older days get chunks, the old oldest day (done only from
+/// where the deepest server then started) is pending again, and the new
+/// deepest server does the new oldest day.
+#[test]
+fn a_split_reaches_back_when_a_deeper_server_joins() {
+    let home = tempfile::tempdir().unwrap();
+    let main = home.path().join("atlas.db");
+    atlas::db::create_db_at(&main).unwrap();
+    // posts every hour for 10 days from 2026-01-01, from `from_hour` on
+    let start = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00+00:00").unwrap();
+    let posts = |from_hour: u64, offset: u64| -> Vec<common::Post> {
+        (from_hour..240)
+            .map(|h| {
+                let when = start + chrono::Duration::hours(h as i64);
+                post_at(offset + h, &format!(r#""p{h}.bin" yEnc (1/1)"#), &when.to_rfc2822())
+            })
+            .collect()
+    };
+    let short = spawn_server(Server::new(posts(121, 1)));
+    let mut deep = mock(spawn_server(Server::new(posts(0, 10_001))), "secret", 2, 2);
+    deep.host = "localhost".into();
+    let pool = BlockingPool::new(&[mock(short, "secret", 2, 1), deep]);
+    pool.connect().unwrap();
+
+    // the split from before: days 5 to 9, the oldest done by the home server
+    let day0 = atlas::chunks::unix_day(start.timestamp());
+    let conn = atlas::db::open_at(&main).unwrap();
+    atlas::chunks::add(&conn, GROUP, day0 + 9, day0 + 5).unwrap();
+    conn.execute("update backfill_chunks set state = 2, server = '127.0.0.1', done_at = 1 where day = ?", [day0 + 5])
+        .unwrap();
+    atlas::chunks::set_deepest(&conn, GROUP, "127.0.0.1").unwrap();
+
+    let ctx = atlas::indexer::PassContext {
+        pool: pool.pool.clone(),
+        states: Default::default(),
+        stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        verbose: false,
+    };
+    let db = atlas::indexer::shared_db(atlas::db::open_at(&main).unwrap());
+    let settings = atlas::indexer::PassSettings {
+        mode: "backfill".into(),
+        batch_size: 10,
+        request_size: 10,
+        split_min_backlog: 10,
+    };
+    pool.block_on(atlas::indexer::run_pass(&ctx, &settings, &db, GROUP, 0, &mut |_| {})).unwrap();
+
+    assert_eq!(
+        atlas::chunks::oldest_day(&conn, GROUP).unwrap(),
+        Some(day0),
+        "chunks back to the new server's first day"
+    );
+    let state = |day: i64| -> i64 {
+        conn.query_row("select state from backfill_chunks where day = ?", [day], |r| r.get(0)).unwrap()
+    };
+    assert_eq!(state(day0 + 5), 0, "the old oldest day is to do again");
+    assert_eq!(atlas::chunks::deepest(&conn, GROUP).unwrap(), None, "the deepest server is asked again");
+
+    // and the new days get indexed: the new oldest by the server that has it
+    for day in [day0 + 4, day0] {
+        let chunk = atlas::chunks::Claim { group: GROUP.into(), day, server: "localhost".into(), claimed_at: 1 };
+        conn.execute(
+            "update backfill_chunks set state = 1, server = 'localhost', claimed_at = 1 where grp = ? and day = ?",
+            rusqlite::params![GROUP, day],
+        )
+        .unwrap();
+        let saved =
+            pool.block_on(atlas::indexer::run_chunk(&ctx, &Default::default(), &db, &chunk, 1, &mut |_| {})).unwrap();
+        assert!(saved.articles >= 24, "day {day}: {} articles", saved.articles);
+        assert_eq!(state(day), 2);
+    }
+}
+
 /// A split reaches back to the oldest day of every carrier, also one whose
 /// GROUP low mark sits 5,000 numbers before its first article (retention
 /// has moved on, the mark hasnt): its older days get chunks.

@@ -46,6 +46,8 @@ pub struct GroupRunState {
     pub backfilling: bool,
     /// a big group found unsplittable isnt probed again until then
     pub no_split_until: Option<Instant>,
+    /// a split group's servers are looked at for older days again then
+    pub reach_back_after: Option<Instant>,
     /// per server, the oldest day it keeps of the group (as found by a day
     /// chunk too old for it), until it's looked at again
     pub keeps_from: HashMap<usize, (i64, Instant)>,
@@ -58,6 +60,7 @@ impl Default for GroupRunState {
             idle: false,
             backfilling: false,
             no_split_until: None,
+            reach_back_after: None,
             keeps_from: HashMap::new(),
         }
     }
@@ -477,6 +480,19 @@ async fn maybe_split(
 ) -> Result<bool> {
     let g = group.to_string();
     if on_db(db, move |conn| Ok(crate::chunks::is_split(conn, &g)?)).await? {
+        // a server that goes back further (one added, or keeping more now)
+        // is looked for every SPLIT_RECHECK: normal backfill never gets to
+        // the days older than the split's
+        let due = ctx.states.with(group, |st| {
+            let due = st.reach_back_after.is_none_or(|t| Instant::now() >= t);
+            if due {
+                st.reach_back_after = Some(Instant::now() + SPLIT_RECHECK);
+            }
+            due
+        });
+        if due && let Err(e) = reach_back(ctx, db, group, home, (first, last), cursor).await {
+            println!("[SPLIT] {group}: couldnt look for servers going back further: {e:#}");
+        }
         return Ok(true);
     }
     if (cursor.saturating_sub(first) as i64) < settings.split_min_backlog {
@@ -494,7 +510,27 @@ async fn maybe_split(
     let g = group.to_string();
     let added = on_db(db, move |conn| Ok(crate::chunks::add(conn, &g, newest_day, oldest_day)?)).await?;
     println!("[SPLIT] {group}: backfill split into {added} day chunks over {carriers} servers");
+    ctx.states.with(group, |st| st.reach_back_after = Some(Instant::now() + SPLIT_RECHECK));
     Ok(true)
+}
+
+/// Days older than split `group`'s oldest that a carrier keeps now: chunks
+/// for them, see `chunks::reach_back`.
+async fn reach_back(
+    ctx: &PassContext,
+    db: &Db,
+    group: &str,
+    home: usize,
+    bounds: (u64, u64),
+    cursor: u64,
+) -> Result<()> {
+    let Some((_, oldest_day, _)) = split_days(ctx, group, home, bounds, cursor).await? else { return Ok(()) };
+    let g = group.to_string();
+    let added = on_db(db, move |conn| Ok(crate::chunks::reach_back(conn, &g, oldest_day)?)).await?;
+    if added > 0 {
+        println!("[SPLIT] {group}: a server goes back further, {added} older day chunks");
+    }
+    Ok(())
 }
 
 /// The days a split of `group` covers, (newest, oldest), and how many servers
