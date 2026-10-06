@@ -28,11 +28,13 @@ pub fn create(conn: &Connection) -> Result<()> {
         create table if not exists backfill_deepest (
             grp TEXT PRIMARY KEY,
             server TEXT NOT NULL,
-            oldest_at INTEGER
+            oldest_at INTEGER,
+            runner_up_at INTEGER
         ) without rowid;",
     )?;
     add_column(conn, "backfill_chunks", "done_at")?;
-    add_column(conn, "backfill_deepest", "oldest_at")
+    add_column(conn, "backfill_deepest", "oldest_at")?;
+    add_column(conn, "backfill_deepest", "runner_up_at")
 }
 
 /// Give `table` the INTEGER column `column` if a table made before it lacks it.
@@ -214,6 +216,22 @@ pub fn set_deepest(conn: &Connection, group: &str, server: &str, oldest_at: i64)
     Ok(())
 }
 
+/// Note how far back the server going back second furthest on `group`
+/// goes (unix seconds): days before it are the furthest one's alone.
+pub fn set_runner_up(conn: &Connection, group: &str, runner_up_at: i64) -> Result<()> {
+    conn.execute("update backfill_deepest set runner_up_at = ? where grp = ?", params![runner_up_at, group])?;
+    Ok(())
+}
+
+/// How far back the server going back second furthest on `group` goes
+/// (unix seconds), when noted with the furthest one.
+pub fn runner_up(conn: &Connection, group: &str) -> Result<Option<i64>> {
+    Ok(conn
+        .query_row("select runner_up_at from backfill_deepest where grp = ?", [group], |r| r.get(0))
+        .optional()?
+        .flatten())
+}
+
 /// Forget `server` as the one going back furthest on `group`, when it no
 /// longer carries it or no longer keeps the oldest day: the next to reach
 /// the oldest day asks again.
@@ -237,6 +255,19 @@ mod tests {
         let c = Connection::open_in_memory().unwrap();
         create(&c).unwrap();
         c
+    }
+
+    /// the second furthest server's retention is kept with the furthest,
+    /// and goes with it
+    #[test]
+    fn the_runner_up_is_kept_with_the_deepest() {
+        let c = conn();
+        set_deepest(&c, "g", "a", 100).unwrap();
+        assert_eq!(runner_up(&c, "g").unwrap(), None);
+        set_runner_up(&c, "g", 200).unwrap();
+        assert_eq!(runner_up(&c, "g").unwrap(), Some(200));
+        forget_deepest(&c, "g", "a").unwrap();
+        assert_eq!(runner_up(&c, "g").unwrap(), None);
     }
 
     /// the day of a claim

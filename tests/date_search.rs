@@ -736,7 +736,12 @@ fn a_split_reaches_back_when_a_deeper_server_joins() {
         conn.query_row("select state from backfill_chunks where day = ?", [day], |r| r.get(0)).unwrap()
     };
     assert_eq!(state(day0 + 5), 0, "the old oldest day is to do again");
-    assert_eq!(atlas::chunks::deepest(&conn, GROUP).unwrap(), None, "the deepest server is asked again");
+    // asked again (a chunk the pass ran asks who keeps the day): the new one
+    assert_eq!(
+        atlas::chunks::deepest(&conn, GROUP).unwrap().as_deref(),
+        Some("localhost"),
+        "the deepest server is asked again"
+    );
 
     // and the new days get indexed: the new oldest by the server that has it
     for day in [day0 + 4, day0] {
@@ -973,7 +978,12 @@ fn a_split_redoes_its_oldest_day_when_a_server_goes_back_further_in_it() {
     pool.block_on(atlas::indexer::run_pass(&ctx(), &settings, &db, GROUP, 0, &mut |_| {})).unwrap();
     assert_eq!(atlas::chunks::oldest_day(&conn, GROUP).unwrap(), Some(day0), "no older day");
     assert_eq!(state(day0), 0, "the oldest day is to do again");
-    assert_eq!(atlas::chunks::deepest(&conn, GROUP).unwrap(), None, "the deepest server is asked again");
+    // asked again (a chunk the pass ran asks who keeps the day): the new one
+    assert_eq!(
+        atlas::chunks::deepest(&conn, GROUP).unwrap().as_deref(),
+        Some("localhost"),
+        "the deepest server is asked again"
+    );
     assert_eq!(run_day(day0, 1).articles, 24, "01:00 to midnight and the hour after");
     assert_eq!(state(day0), 2);
 }

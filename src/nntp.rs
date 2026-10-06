@@ -886,6 +886,47 @@ fn plausible_post_time(date: &str) -> Option<i64> {
     (EARLIEST..=chrono::Utc::now().timestamp() + AHEAD).contains(&t).then_some(t)
 }
 
+/// windows of `DATE_LOOK` numbers from a server's first article that judge
+/// how far back it keeps a group (`Pool::retention`)
+const RETENTION_WINDOWS: u64 = 3;
+/// Dates of a window passed over as forged before its earliest counts
+const RETENTION_OUTLIERS: usize = 3;
+
+/// How far back a server keeps a group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Retention {
+    /// it has no articles of it
+    Empty,
+    /// from about this time (unix seconds)
+    Since(i64),
+    /// its first articles' dates disagree too much to tell (a forged run, or
+    /// dates far out of order): from about this time, if they can be trusted
+    Unsure(i64),
+}
+
+/// When a window of articles (`dates` sorted) starts: its earliest date not
+/// more than a day before the one `RETENTION_OUTLIERS` places in, soo that
+/// many forged far older Dates dont move it, nor does one forged later.
+fn window_start(dates: &[i64]) -> i64 {
+    let floor = dates[RETENTION_OUTLIERS.min(dates.len() - 1)] - 86_400;
+    dates.iter().copied().find(|&d| d >= floor).unwrap_or(floor + 86_400)
+}
+
+/// A server's retention from the date each of its first windows counts by,
+/// in number order, and the date of its first article (`first`,
+/// when no window had a date to go by).
+fn retention_of(windows: &[i64], first: i64) -> Retention {
+    let since = windows.iter().copied().min().unwrap_or(first);
+    let mut newest = i64::MIN;
+    for &q in windows {
+        if q < newest.saturating_sub(86_400) {
+            return Retention::Unsure(since);
+        }
+        newest = newest.max(q);
+    }
+    Retention::Since(since)
+}
+
 /// numbers per date search request at first, and at most
 const DATE_LOOK: u64 = 100;
 const DATE_SCAN_MAX: u64 = DATE_LOOK << 6;
@@ -1654,6 +1695,34 @@ impl Pool {
         Ok(self.first_in(i, group, low, high + 1).await?.map(|(_, t)| t))
     }
 
+    /// How far back server `i` keeps the group (unix seconds), judged from
+    /// the dates of its first `RETENTION_WINDOWS` windows of `DATE_LOOK`
+    /// numbers rather than from its first Date alone: posters set their own,
+    /// and one forged on the first article (later or earlier than the truth)
+    /// would make the server look shallower or deeper than it is. Each
+    /// window counts from its earliest date that isnt an outlier (see
+    /// `window_start`), the earliest of those answers. Unsure when the windows disagree (one
+    /// more than a day older than an earlier one): a forged run, or dates too
+    /// far out of order to judge by. `low` and `high` are the server's marks.
+    pub async fn retention(&self, i: usize, group: &str, low: u64, high: u64) -> Result<Retention> {
+        let Some((first, t)) = self.first_in(i, group, low, high + 1).await? else { return Ok(Retention::Empty) };
+        let mut earliest = Vec::new();
+        for w in 0..RETENTION_WINDOWS {
+            let from = first + w * DATE_LOOK;
+            if from > high {
+                break;
+            }
+            let rows = self.listing(i, group, from, (from + DATE_LOOK - 1).min(high)).await?;
+            let mut dates: Vec<i64> = rows.iter().filter_map(|o| plausible_post_time(&o.date)).collect();
+            if dates.is_empty() {
+                continue;
+            }
+            dates.sort_unstable();
+            earliest.push(window_start(&dates));
+        }
+        Ok(retention_of(&earliest, t))
+    }
+
     /// The first article number in `low..=high` on server `i` posted at or after
     /// `when` (unix seconds), `high + 1` when there is none. A binary search over
     /// small article requests (about 35 for a billion numbers); a probe that
@@ -2193,6 +2262,27 @@ pub fn yenc_decode(lines: &[Vec<u8>]) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+    /// the dates the first windows count by judge a server's retention: the earliest
+    /// answers, and one more than a day older than an earlier one is unsure
+    #[test]
+    fn retention_from_the_first_windows() {
+        use super::{Retention, retention_of};
+        assert_eq!(retention_of(&[], 50), Retention::Since(50), "no dates: the first article's");
+        assert_eq!(retention_of(&[1_000, 2_000, 90_000], 7), Retention::Since(1_000));
+        assert_eq!(retention_of(&[1_000, 500, 2_000], 7), Retention::Since(500), "within a day out of order");
+        assert_eq!(retention_of(&[200_000, 300_000, 100_000], 7), Retention::Unsure(100_000));
+        assert_eq!(retention_of(&[200_000, 100_000], 7), Retention::Unsure(100_000));
+    }
+
+    /// a window starts at its earliest date, unless a few are far before the rest
+    #[test]
+    fn a_window_starts_at_its_earliest_date_but_a_forged_one() {
+        use super::window_start;
+        assert_eq!(window_start(&[10, 3_600, 7_200, 10_800, 14_400]), 10);
+        assert_eq!(window_start(&[10, 900_000, 900_100, 900_200, 900_300]), 900_000, "one forged far back");
+        assert_eq!(window_start(&[5]), 5);
+    }
+
     use super::*;
     use tokio::io::AsyncWriteExt;
 
