@@ -260,6 +260,20 @@ fn halt(stop: &AtomicBool, shard: usize) -> Result<()> {
     Ok(())
 }
 
+/// test hook: the stop flags (by address) to set the first time the held
+/// back stream looks at them, with how many times it has
+#[cfg(test)]
+static HELD_CHECKS: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn held_check(stop: &AtomicBool) {
+    let at = stop as *const AtomicBool as usize;
+    if let Some(e) = HELD_CHECKS.lock().unwrap().iter_mut().find(|e| e.0 == at) {
+        e.1 += 1;
+        stop.store(true, Ordering::Relaxed);
+    }
+}
+
 /// Have SQLite give up long statements (a bulk insert, an index build) once
 /// `stop` is set: they fail with an interrupt, like any other error.
 fn interruptible(conn: &Connection, stop: &Arc<AtomicBool>) -> Result<()> {
@@ -524,7 +538,15 @@ fn compact_shard(
             let mut held_back = 0usize;
             let mut in_blob: Option<HashSet<String>> = None;
             let mut held = held_of.query([id])?;
+            let mut streamed = 0usize;
             while let Some(h) = held.next()? {
+                // copies and kept entries alike: a huge file has millions
+                streamed += 1;
+                if streamed.is_multiple_of(STOP_EVERY) {
+                    #[cfg(test)]
+                    held_check(stop);
+                    halt(stop, shard)?;
+                }
                 let in_blob = match &mut in_blob {
                     Some(set) => set,
                     None => {
@@ -1271,6 +1293,34 @@ mod tests {
         store::seal_file(&conn, file).unwrap();
         let expected: i64 = conn.query_row("select expected from files where id = ?", [file], |r| r.get(0)).unwrap();
         assert_eq!(expected, 3);
+    }
+
+    /// A stop during a huge held back stream ends it at the next look, not
+    /// after the whole file's entries.
+    #[test]
+    fn a_stop_during_a_large_held_back_stream_ends_it_promptly() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        let (path, file, _) = held_back_fixture(&main, ("<b1@x>", 2, 2));
+        {
+            let mut conn = db::open_at(&path).unwrap();
+            let tx = conn.transaction().unwrap();
+            {
+                let mut insert = tx
+                    .prepare("insert into held_back (file_id, message_id, part, total_parts) values (?, ?, ?, 2)")
+                    .unwrap();
+                for n in 0..(STOP_EVERY as i64 * 3) {
+                    insert.execute(params![file, format!("<new{n}@x>"), n + 3]).unwrap();
+                }
+            }
+            tx.commit().unwrap();
+        }
+        let stop = no_stop();
+        HELD_CHECKS.lock().unwrap().push((Arc::as_ptr(&stop) as usize, 0));
+        let err = run(&main, &|_| {}, &stop).unwrap_err();
+        assert!(format!("{err:#}").contains("stopped"), "{err:#}");
+        let looks = HELD_CHECKS.lock().unwrap().iter().find(|e| e.0 == Arc::as_ptr(&stop) as usize).unwrap().1;
+        assert_eq!(looks, 1, "stopped at the first look, not after 3 of them");
     }
 
     /// More held back entries than a batch take are streamed across: the new
