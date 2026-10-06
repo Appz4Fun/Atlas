@@ -733,6 +733,80 @@ fn a_split_reaches_a_carrier_whose_low_mark_lags() {
     );
 }
 
+/// A carrier that comes to keep more of the split's oldest day (from 01:00
+/// where the day was done from 18:00): the day isnt older, but it is to do
+/// again, by that carrier, soo 01:00 to 18:00 gets indexed.
+#[test]
+fn a_split_redoes_its_oldest_day_when_a_server_goes_back_further_in_it() {
+    let home = tempfile::tempdir().unwrap();
+    let main = home.path().join("atlas.db");
+    atlas::db::create_db_at(&main).unwrap();
+    // posts every hour from 2026-01-01 00:00, the hours in `hours`
+    let start = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00+00:00").unwrap();
+    let posts = |hours: std::ops::Range<u64>, offset: u64| -> Vec<common::Post> {
+        hours
+            .map(|h| {
+                let when = start + chrono::Duration::hours(h as i64);
+                post_at(offset + h, &format!(r#""p{h}.bin" yEnc (1/1)"#), &when.to_rfc2822())
+            })
+            .collect()
+    };
+    // both keep the group from Jan 1 18:00 at first
+    let deep = Server::new(posts(18..240, 10_001));
+    let short = spawn_server(Server::new(posts(18..240, 1)));
+    let mut later = mock(spawn_server(deep.clone()), "secret", 2, 2);
+    later.host = "localhost".into();
+    let pool = BlockingPool::new(&[mock(short, "secret", 2, 1), later]);
+    pool.connect().unwrap();
+
+    let ctx = || atlas::indexer::PassContext {
+        pool: pool.pool.clone(),
+        states: Default::default(),
+        stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        verbose: false,
+    };
+    let db = atlas::indexer::shared_db(atlas::db::open_at(&main).unwrap());
+    let settings = atlas::indexer::PassSettings {
+        mode: "backfill".into(),
+        batch_size: 10,
+        request_size: 10,
+        split_min_backlog: 10,
+    };
+    let conn = atlas::db::open_at(&main).unwrap();
+    let day0 = atlas::chunks::unix_day(start.timestamp());
+    let state = |day: i64| -> i64 {
+        conn.query_row("select state from backfill_chunks where day = ?", [day], |r| r.get(0)).unwrap()
+    };
+    let run_day = |day: i64, server: usize| {
+        let host = if server == 0 { "127.0.0.1" } else { "localhost" };
+        let chunk = atlas::chunks::Claim { group: GROUP.into(), day, server: host.into(), claimed_at: 1 };
+        conn.execute(
+            "update backfill_chunks set state = 1, server = ?, claimed_at = 1 where grp = ? and day = ?",
+            rusqlite::params![host, GROUP, day],
+        )
+        .unwrap();
+        pool.block_on(atlas::indexer::run_chunk(&ctx(), &Default::default(), &db, &chunk, server, &mut |_| {})).unwrap()
+    };
+
+    // the split, and its oldest day done from 18:00 by the home server
+    pool.block_on(atlas::indexer::run_pass(&ctx(), &settings, &db, GROUP, 0, &mut |_| {})).unwrap();
+    assert_eq!(atlas::chunks::oldest_day(&conn, GROUP).unwrap(), Some(day0));
+    assert_eq!(run_day(day0, 0).articles, 7, "18:00 to midnight and the hour after");
+    assert_eq!(state(day0), 2);
+
+    // "localhost" keeps the day from 01:00 now
+    let mut older = posts(1..18, 10_001);
+    older.extend(deep.posts.lock().unwrap().drain(..));
+    *deep.posts.lock().unwrap() = older;
+
+    pool.block_on(atlas::indexer::run_pass(&ctx(), &settings, &db, GROUP, 0, &mut |_| {})).unwrap();
+    assert_eq!(atlas::chunks::oldest_day(&conn, GROUP).unwrap(), Some(day0), "no older day");
+    assert_eq!(state(day0), 0, "the oldest day is to do again");
+    assert_eq!(atlas::chunks::deepest(&conn, GROUP).unwrap(), None, "the deepest server is asked again");
+    assert_eq!(run_day(day0, 1).articles, 24, "01:00 to midnight and the hour after");
+    assert_eq!(state(day0), 2);
+}
+
 /// (number, unix seconds) of a post
 type Slot = (u64, i64);
 
