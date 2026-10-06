@@ -215,7 +215,8 @@ pub fn set_deepest(conn: &Connection, group: &str, server: &str, oldest_at: i64)
 }
 
 /// Forget `server` as the one going back furthest on `group`, when it no
-/// longer carries it: the next to reach the oldest day asks again.
+/// longer carries it or no longer keeps the oldest day: the next to reach
+/// the oldest day asks again.
 pub fn forget_deepest(conn: &Connection, group: &str, server: &str) -> Result<()> {
     conn.execute("delete from backfill_deepest where grp = ? and server = ?", [group, server])?;
     Ok(())

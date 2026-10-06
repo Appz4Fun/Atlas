@@ -799,6 +799,13 @@ where
         let host = ctx.pool.host(server);
         ctx.states.keep_from(group, &host, oldest_day);
         println!("[CHUNK] {group} day {day} is older than {host} keeps, leaving it to the other servers");
+        // a server that doesnt keep this day keeps none of the split's oldest
+        // either: if it was noted as going back furthest, its retention moved
+        // on, and the oldest day goes to the next one
+        let (g, h) = (group.to_string(), host.clone());
+        if let Err(e) = on_db(db, move |conn| Ok(crate::chunks::forget_deepest(conn, &g, &h)?)).await {
+            println!("[CHUNK] {group}: couldnt forget the server going back furthest: {e:#}");
+        }
         return failed(TooOld { group: group.to_string(), host, oldest_day }.into()).await;
     }
     let start = match ctx.pool.article_at(server, group, first, last, from).await {
@@ -832,8 +839,9 @@ where
 /// `oldest`, goes back furthest of the indexing servers: the one to index the
 /// split's oldest day. Found by asking each server for its first article the
 /// first time, then kept, soo it doesnt move as retention rolls on (asked
-/// again once that server is no longer an indexing one, or no longer
-/// carries the group: `index_chunk` forgets it on a 411). A server that
+/// again once that server is no longer an indexing one, no longer carries
+/// the group, or no longer keeps the day: `index_chunk` forgets it on a 411
+/// or a day older than it keeps). A server that
 /// cant be asked fails it: the chunk goes back and is tried again later.
 async fn goes_back_furthest(ctx: &PassContext, db: &Db, group: &str, server: usize, oldest: i64) -> Result<bool> {
     let host = ctx.pool.host(server);

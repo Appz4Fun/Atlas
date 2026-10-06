@@ -608,6 +608,74 @@ fn the_oldest_day_moves_on_when_the_deepest_server_drops_the_group() {
     assert_eq!(atlas::chunks::deepest(&conn, GROUP).unwrap().as_deref(), Some("localhost"));
 }
 
+/// The server noted as going back furthest still carries the group, but its
+/// retention moved past the oldest day: it gives the day back, the note goes,
+/// and the next deepest carrier does the oldest day instead of being turned
+/// away by the stale note for good.
+#[test]
+fn the_oldest_day_moves_on_when_the_deepest_server_no_longer_keeps_it() {
+    let home = tempfile::tempdir().unwrap();
+    let main = home.path().join("atlas.db");
+    atlas::db::create_db_at(&main).unwrap();
+    // posts every hour for 3 days from 2026-01-01, from `from_hour` on
+    let start = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00+00:00").unwrap();
+    let posts = |from_hour: u64, offset: u64| -> Vec<common::Post> {
+        (from_hour..72)
+            .map(|h| {
+                let when = start + chrono::Duration::hours(h as i64);
+                post_at(offset + h, &format!(r#""p{h}.bin" yEnc (1/1)"#), &when.to_rfc2822())
+            })
+            .collect()
+    };
+    // "127.0.0.1" keeps the first day from 01:00, "localhost" from 18:00
+    let deep_server = Server::new(posts(1, 1));
+    let deep = spawn_server(deep_server.clone());
+    let shallow = spawn_server(Server::new(posts(18, 1001)));
+    let mut later = mock(shallow, "secret", 2, 1);
+    later.host = "localhost".into();
+    let pool = BlockingPool::new(&[mock(deep, "secret", 2, 1), later]);
+    pool.connect().unwrap();
+
+    let day = atlas::chunks::unix_day(start.timestamp());
+    let main_conn = atlas::db::open_at(&main).unwrap();
+    atlas::chunks::add(&main_conn, GROUP, day + 2, day).unwrap();
+    let ctx = atlas::indexer::PassContext {
+        pool: pool.pool.clone(),
+        states: Default::default(),
+        stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        verbose: false,
+    };
+    let db = atlas::indexer::shared_db(main_conn);
+    let conn = atlas::db::open_at(&main).unwrap();
+    let run = |server: usize| {
+        let chunk = atlas::chunks::Claim { group: GROUP.into(), day, server: pool.pool.host(server), claimed_at: 1 };
+        conn.execute(
+            "update backfill_chunks set state = 1, server = ?, claimed_at = 1 where grp = ? and day = ?",
+            rusqlite::params![chunk.server, GROUP, day],
+        )
+        .unwrap();
+        pool.block_on(atlas::indexer::run_chunk(&ctx, &Default::default(), &db, &chunk, server, &mut |_| {}))
+    };
+    let state =
+        || -> i64 { conn.query_row("select state from backfill_chunks where day = ?", [day], |r| r.get(0)).unwrap() };
+
+    // the 01:00 server is noted as the deepest
+    assert!(run(1).unwrap_err().downcast_ref::<atlas::indexer::TooOld>().is_some());
+    assert_eq!(atlas::chunks::deepest(&conn, GROUP).unwrap().as_deref(), Some("127.0.0.1"));
+
+    // then keeps only from the next day on, and finds out on its next chunk
+    deep_server.posts.lock().unwrap().retain(|p| p.number > 25);
+    assert!(run(0).unwrap_err().downcast_ref::<atlas::indexer::TooOld>().is_some());
+    assert_eq!(state(), 0);
+    assert_eq!(atlas::chunks::deepest(&conn, GROUP).unwrap(), None, "the stale note is forgotten");
+
+    // the 18:00 one goes back furthest now: 18:00 to midnight, plus the hour after
+    let saved = run(1).expect("the next deepest carrier does the oldest day");
+    assert_eq!(saved.articles, 7);
+    assert_eq!(state(), 2);
+    assert_eq!(atlas::chunks::deepest(&conn, GROUP).unwrap().as_deref(), Some("localhost"));
+}
+
 /// A split made while the servers kept 5 days, then a server that keeps 10
 /// joins: the older days get chunks, the old oldest day (done only from
 /// where the deepest server then started) is pending again, and the new
