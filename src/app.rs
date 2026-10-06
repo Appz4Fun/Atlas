@@ -535,16 +535,19 @@ fn do_settings() {
                 return;
             }
 
-            let dir = paths::app_dir();
-            for f in [
-                dir.join("atlas.db"),
-                dir.join("atlas.db-wal"),
-                dir.join("atlas.db-shm"),
-                paths::pid_file(),
-                paths::indexer_log(),
-                paths::status_file(),
-                paths::stats_file(),
-            ] {
+            // every shard goes with it, under the exclusive lock: leaving them
+            // would give the new main database cursors and ids over old shards
+            if let Err(e) = crate::db::wipe(&paths::database()) {
+                if e.downcast_ref::<crate::compact::Busy>().is_some() {
+                    ui::warn("the database is in use (indexing, a compaction or a save); nothing was wiped");
+                } else {
+                    ui::error(&format!("couldnt wipe the database: {e:#}"));
+                }
+                ui::pause();
+                return;
+            }
+
+            for f in [paths::pid_file(), paths::indexer_log(), paths::status_file(), paths::stats_file()] {
                 let _ = fs::remove_file(f);
             }
 

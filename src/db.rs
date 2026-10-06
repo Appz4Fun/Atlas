@@ -8,6 +8,7 @@ use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
+use anyhow::Context;
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::compact::WriteGuard;
@@ -138,6 +139,32 @@ pub fn create_db_holding(path: &Path) -> anyhow::Result<Option<WriteGuard>> {
     let Some(held) = crate::compact::try_hold_off_compaction(path)? else { return Ok(None) };
     create_db_at(path)?;
     Ok(Some(held))
+}
+
+/// Settings > wipe: the main database and every shard, with their sidecars
+/// and what a compaction leaves (`.compact.db`, `.precompact.db`). Under the
+/// exclusive compaction lock, soo refused (`Busy`) while the indexer, a write
+/// from outside it or a compaction has the database. Leaves nothing to set
+/// up again from: the next `create_db` makes a new one.
+pub fn wipe(main: &Path) -> anyhow::Result<()> {
+    let _exclusive = crate::compact::Lock::take(main)?;
+    let mut dbs = vec![main.to_path_buf()];
+    for shard in store::shard_paths(main) {
+        dbs.push(crate::compact::with_suffix(&shard, "compact"));
+        dbs.push(crate::compact::with_suffix(&shard, "precompact"));
+        dbs.push(shard);
+    }
+    for db in dbs {
+        for suffix in ["", "-wal", "-shm", "-journal"] {
+            let file = format!("{}{suffix}", db.display());
+            match fs::remove_file(&file) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e).with_context(|| format!("removing {file}")),
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The main database and its shards, or brings an older one up to date. A
@@ -471,6 +498,7 @@ pub fn update_backfill_cursor(conn: &Connection, group: &str, article: i64) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     #[test]
     fn group_dates_only_ever_widen() {
         let dir = tempfile::tempdir().unwrap();
@@ -609,5 +637,61 @@ mod tests {
         create_db_at(&old).unwrap();
         assert!(has_old_layout(&open_at(&old).unwrap()).unwrap());
         assert!(!store::shard_path(&old, 0).exists(), "no shards until it is converted");
+    }
+
+    /// releases in every shard, and the id counter
+    fn held(main: &Path) -> (i64, Option<i64>) {
+        let releases = store::shard_paths(main)
+            .iter()
+            .map(|p| {
+                open_at(p).unwrap().query_row("select count(*) from releases", [], |r| r.get::<_, i64>(0)).unwrap()
+            })
+            .sum();
+        (releases, store::get_meta(&open_at(main).unwrap(), "next_seq").unwrap())
+    }
+
+    #[test]
+    fn a_wipe_clears_every_shard_and_restarts_the_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        create_db_at(&main).unwrap();
+        let releases: Vec<Release> = ["alt.binaries.a", "alt.binaries.b", "alt.binaries.c"]
+            .iter()
+            .map(|g| Release { name: format!("Old {g}"), group: g.to_string(), ..Default::default() })
+            .collect();
+        store::save(&main, &releases).unwrap();
+        init_group_state(&open_at(&main).unwrap(), "alt.binaries.a@news.x", 500).unwrap();
+        let (before, next) = held(&main);
+        assert_eq!(before, 3);
+        assert!(next.unwrap() > 1);
+
+        // what a compaction leaves behind, and the sidecars of a shard
+        let shard = store::shard_path(&main, 2);
+        let leftovers = [
+            crate::compact::with_suffix(&shard, "compact"),
+            crate::compact::with_suffix(&shard, "precompact"),
+            PathBuf::from(format!("{}-wal", shard.display())),
+            PathBuf::from(format!("{}-shm", shard.display())),
+        ];
+        for f in &leftovers {
+            std::fs::write(f, b"old").unwrap();
+        }
+
+        // the indexer, or a compaction, using the database: nothing is wiped
+        let writing = crate::compact::hold_off_compaction(&main).unwrap();
+        let err = wipe(&main).unwrap_err();
+        assert!(err.downcast_ref::<crate::compact::Busy>().is_some(), "{err:#}");
+        assert_eq!(held(&main).0, 3, "refused, all still there");
+        drop(writing);
+
+        wipe(&main).unwrap();
+        for f in leftovers.iter().chain(&store::shard_paths(&main)) {
+            assert!(!f.exists(), "{} is gone", f.display());
+        }
+        assert!(!main.exists());
+
+        create_db_at(&main).unwrap();
+        assert_eq!(held(&main), (0, Some(1)), "no releases, ids from the start");
+        assert!(group_progress(&open_at(&main).unwrap()).unwrap().is_empty(), "no cursors");
     }
 }

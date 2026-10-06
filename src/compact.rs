@@ -117,10 +117,10 @@ impl Drop for WriteGuard {
 }
 
 /// The lock of a running compaction, let go when dropped (done, failed or stopped).
-struct Lock(std::fs::File);
+pub(crate) struct Lock(std::fs::File);
 
 impl Lock {
-    fn take(main: &Path) -> Result<Lock> {
+    pub(crate) fn take(main: &Path) -> Result<Lock> {
         let file = open_lock(main)?;
         match file.try_lock() {
             Ok(()) => Ok(Lock(file)),
