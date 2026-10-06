@@ -116,7 +116,7 @@ pub fn run(main: &Path, progress: &dyn Fn(&str)) -> Result<(i64, i64)> {
 
     // a run that got through the copy and was stopped during the check
     // picks up there instead of copying everything again
-    let source = Source::of(&old)?;
+    let source = Source::of(&old, main)?;
     let (max_id, shard_of_old, moved_releases, moved_articles, orphans) = if copy_finished(main, &source) {
         progress("converting the database: the copy finished earlier, checking it");
         let max_id: i64 = old.query_row("select coalesce(max(id), 0) from releases", [], |r| r.get(0))?;
@@ -743,48 +743,104 @@ fn copy(
     let total_articles: i64 = old.query_row("select coalesce(max(id), 0) from articles", [], |r| r.get(0))?;
     let (moved_articles, orphans) = move_articles(main, total_articles, &shard_of_old, started, progress)?;
 
+    // the copy's own connections to the old database have closed (the last one
+    // folds its -wal in), soo its files are as a stopped run will find them
+    let conn = db::open_at(&new_main)?;
+    Source::of(old, main)?.save(&conn)?;
+
     Ok((max_id, shard_of_old, moved_releases, moved_articles, orphans))
 }
 
-/// What the old database held when a copy started: its release and article
-/// counts and highest ids, and a digest of its `groups` rows (the cursors:
-/// scans of empty ranges move them without adding anything). A copy is only
-/// picked up again from the same old database; one written to or put back
-/// from another backup since differs.
+/// What the old database was when a copy started: its release and article
+/// counts and highest ids, a digest of its `groups` rows (the cursors: scans
+/// of empty ranges move them without adding anything), an identity written
+/// into its own meta on the first attempt, and the size and modification time
+/// of its file and its -wal (a change that keeps every count, an edit to one
+/// release, still moves those). A copy is only picked up again from the same
+/// old database; one written to or put back from another backup since differs.
 #[derive(Debug, PartialEq)]
-struct Source([i64; 5]);
-
-const SOURCE_KEYS: [&str; 5] =
-    ["source_releases", "source_max_release", "source_articles", "source_max_article", "source_groups"];
+struct Source(Vec<(&'static str, String)>);
 
 impl Source {
-    fn of(old: &Connection) -> Result<Source> {
-        let (releases, max_release) =
+    fn of(old: &Connection, main: &Path) -> Result<Source> {
+        let (releases, max_release): (i64, i64) =
             old.query_row("select count(*), coalesce(max(id), 0) from releases", [], |r| Ok((r.get(0)?, r.get(1)?)))?;
-        let (articles, max_article) =
+        let (articles, max_article): (i64, i64) =
             old.query_row("select count(*), coalesce(max(id), 0) from articles", [], |r| Ok((r.get(0)?, r.get(1)?)))?;
-        Ok(Source([releases, max_release, articles, max_article, groups_digest(old)?]))
+        // the identity first: writing it is a change to the files stat'd below
+        let uuid = source_identity(main)?;
+        let stat = |path: PathBuf| -> String {
+            // an empty -wal is as good as none: opening a database touches it
+            let Ok(m) = std::fs::metadata(&path) else { return "none".into() };
+            if m.len() == 0 && path.to_string_lossy().ends_with("-wal") {
+                return "none".into();
+            }
+            let nanos =
+                m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_nanos());
+            format!("{}:{}", m.len(), nanos.unwrap_or(0))
+        };
+        let wal = PathBuf::from(format!("{}-wal", main.display()));
+        Ok(Source(vec![
+            ("source_releases", releases.to_string()),
+            ("source_max_release", max_release.to_string()),
+            ("source_articles", articles.to_string()),
+            ("source_max_article", max_article.to_string()),
+            ("source_groups", groups_digest(old)?.to_string()),
+            ("source_uuid", uuid),
+            ("source_db_file", stat(main.to_path_buf())),
+            ("source_wal_file", stat(wal)),
+        ]))
     }
 
     /// into the new main database's meta, as the copy starts
     fn save(&self, conn: &Connection) -> Result<()> {
-        for (key, value) in SOURCE_KEYS.iter().zip(self.0) {
+        for (key, value) in &self.0 {
             conn.execute("insert or replace into meta (key, value) values (?, ?)", params![key, value])?;
         }
         Ok(())
     }
 
-    fn saved(conn: &Connection) -> Result<Option<Source>> {
-        let mut values = [0; 5];
-        for (key, value) in SOURCE_KEYS.iter().zip(values.iter_mut()) {
-            let Some(v) = conn.query_row("select value from meta where key = ?", [key], |r| r.get(0)).optional()?
+    fn saved(conn: &Connection, like: &Source) -> Result<Option<Source>> {
+        let mut values = Vec::new();
+        for (key, _) in &like.0 {
+            let Some(v) =
+                conn.query_row("select cast(value as text) from meta where key = ?", [key], |r| r.get(0)).optional()?
             else {
                 return Ok(None);
             };
-            *value = v;
+            values.push((*key, v));
         }
         Ok(Some(Source(values)))
     }
+}
+
+/// The old database's random identity, written into its meta the first time
+/// a conversion is tried on it and read back after that. Its -wal is folded
+/// in here too: whichever connection closes last does that anyway, and it
+/// would change the files a stopped run is checked against, soo it's done
+/// first, before they are looked at.
+fn source_identity(main: &Path) -> Result<String> {
+    let conn = Connection::open(main).context("opening the old database to identify it")?;
+    conn.busy_timeout(std::time::Duration::from_secs(30))?;
+    let read = |conn: &Connection| -> Option<String> {
+        conn.query_row("select cast(value as text) from meta where key = 'source_uuid'", [], |r| r.get(0)).ok()
+    };
+    let uuid = match read(&conn) {
+        Some(uuid) => uuid,
+        None => {
+            let mut bytes = [0u8; 16];
+            getrandom::fill(&mut bytes).map_err(|e| anyhow!("no random bytes for the source identity: {e}"))?;
+            let uuid: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+            conn.execute_batch("create table if not exists meta (key text primary key, value)")?;
+            conn.execute("insert or ignore into meta (key, value) values ('source_uuid', ?)", [&uuid])?;
+            read(&conn).ok_or_else(|| anyhow!("the source identity was not written"))?
+        }
+    };
+    // best effort, never waited for: a reader holding it back only means a
+    // stopped run is copied again
+    conn.busy_timeout(std::time::Duration::ZERO)?;
+    let _ = conn.query_row("pragma wal_checkpoint(truncate)", [], |_| Ok(()));
+    Ok(uuid)
 }
 
 /// FNV-1a over every column of every `groups` row in name order, stable
@@ -829,7 +885,7 @@ fn groups_digest(old: &Connection) -> Result<i64> {
 fn copy_finished(main: &Path, source: &Source) -> bool {
     let new_main = sibling(main, "atlas.new.db");
     new_main.exists()
-        && db::open_at(&new_main).ok().and_then(|c| Source::saved(&c).ok().flatten()).as_ref() == Some(source)
+        && db::open_at(&new_main).ok().and_then(|c| Source::saved(&c, source).ok().flatten()).as_ref() == Some(source)
         && store::shard_paths(main).iter().all(|p| {
             p.exists()
                 && db::open_at(p)

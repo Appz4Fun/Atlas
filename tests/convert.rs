@@ -395,6 +395,34 @@ fn a_stopped_conversion_copies_again_when_the_old_database_changed() {
     assert_eq!(store::articles(&conn, id).unwrap().len(), 1);
 }
 
+/// A change that keeps every count, id and cursor (here a rename) is still a
+/// change to the old database: the stopped copy is thrown away, not trusted.
+#[test]
+fn a_stopped_conversion_copies_again_when_a_release_changed_under_the_same_counts() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = dir.path().join("atlas.db");
+    old_database(&main);
+    db::create_db_at(&main).unwrap();
+
+    let stopped = std::panic::catch_unwind(|| {
+        convert::run(&main, &|m| assert!(!m.contains("checking NZBs"), "stop here")).unwrap();
+    });
+    assert!(stopped.is_err());
+
+    Connection::open(&main)
+        .unwrap()
+        .execute("update releases set name = name || '.v2' where name = 'Release.17'", [])
+        .unwrap();
+
+    let messages = std::cell::RefCell::new(Vec::new());
+    convert::run(&main, &|m| messages.borrow_mut().push(m.to_string())).unwrap();
+    assert!(!messages.borrow().iter().any(|m| m.contains("copy finished earlier")), "{messages:?}");
+    let conn = db::open_with_shards(&main).unwrap();
+    let renamed: i64 =
+        conn.query_row("select count(*) from releases where name like '%.v2'", [], |r| r.get(0)).unwrap();
+    assert_eq!(renamed, 1);
+}
+
 /// Scans of empty ranges move an old database's cursors without adding a
 /// release or article: a stopped conversion copies again then too, soo the
 /// swap doesnt put back the cursors from before and redo those scans.
