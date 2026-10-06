@@ -113,12 +113,9 @@ fn load_chunks_stats(conn: &rusqlite::Connection) -> (i64, i64, i64, i64, i64) {
 fn load_quick() -> Quick {
     // the main database and its shards
     let main = paths::database();
-    let files: Vec<std::path::PathBuf> =
-        std::iter::once(main.clone()).chain(crate::store::shard_paths(&main)).collect();
-    let size = |p: &std::path::Path| fs::metadata(p).map(|m| m.len()).unwrap_or(0);
     let mut q = Quick {
-        db_bytes: files.iter().map(|p| size(p)).sum(),
-        wal_bytes: files.iter().map(|p| size(std::path::Path::new(&format!("{}-wal", p.display())))).sum(),
+        db_bytes: crate::store::database_bytes(&main),
+        wal_bytes: crate::store::wal_bytes(&main),
         ..Quick::default()
     };
 

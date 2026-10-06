@@ -169,7 +169,7 @@ impl Stats {
 
     fn write(&self, group: &str, mode: &str, running: bool, idle: bool) {
         let (peak_a, peak_b, avg_a, avg_b) = self.speeds();
-        let db_size = fs::metadata(paths::database()).map(|m| m.len()).unwrap_or(0);
+        let db_size = crate::store::database_bytes(&paths::database());
 
         let groups: serde_json::Map<String, serde_json::Value> = self
             .group_stats

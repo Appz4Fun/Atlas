@@ -56,6 +56,24 @@ pub fn shard_paths(main: &Path) -> Vec<PathBuf> {
     (0..SHARDS).map(|i| shard_path(main, i)).collect()
 }
 
+/// the size of the main database and its shards, in bytes (not their -wal
+/// files, see `wal_bytes`)
+pub fn database_bytes(main: &Path) -> u64 {
+    files_bytes(main, "")
+}
+
+/// the size of the -wal files of the main database and its shards, in bytes
+pub fn wal_bytes(main: &Path) -> u64 {
+    files_bytes(main, "-wal")
+}
+
+fn files_bytes(main: &Path, suffix: &str) -> u64 {
+    std::iter::once(main.to_path_buf())
+        .chain(shard_paths(main))
+        .map(|p| std::fs::metadata(format!("{}{suffix}", p.display())).map(|m| m.len()).unwrap_or(0))
+        .sum()
+}
+
 /// every shard of `main` is there
 pub fn exists(main: &Path) -> bool {
     shard_paths(main).iter().all(|p| p.exists())
@@ -1173,6 +1191,22 @@ pub fn purge_incomplete(main: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_database_size_is_the_main_database_and_every_shard() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        assert_eq!(database_bytes(&main), 0, "nothing yet");
+        std::fs::write(&main, [0; 10]).unwrap();
+        for (i, shard) in shard_paths(&main).iter().enumerate() {
+            std::fs::write(shard, vec![0; 100 * (i + 1)]).unwrap();
+        }
+        std::fs::write(format!("{}-wal", main.display()), [0; 7]).unwrap();
+        std::fs::write(format!("{}-wal", shard_path(&main, 0).display()), [0; 3]).unwrap();
+        let shards: usize = (1..=SHARDS).map(|i| 100 * i).sum();
+        assert_eq!(database_bytes(&main), 10 + shards as u64);
+        assert_eq!(wal_bytes(&main), 10);
+    }
 
     #[test]
     fn message_ids_come_back_exactly() {
