@@ -379,14 +379,15 @@ pub struct PassContext {
 
 /// Article numbers differ between providers, soo with several servers the
 /// cursors are kept per server as `group@host` (`Pool::host`, see
-/// `server_keys`). One server keeps the plain
-/// group name like before.
+/// `server_keys`). One server keeps the plain group name like before, unless
+/// it has an explicit `#key`: that names it wherever it is in the list, and a
+/// plain cursor may be another server's left from before.
 fn cursor_key(pool: &Pool, server: usize, group: &str) -> String {
-    if pool.len() <= 1 {
-        return group.to_string();
-    }
     // only the host (and port) is case-insensitive, an explicit `#key` isnt
     let host = pool.host(server);
+    if pool.len() <= 1 && !host.contains('#') {
+        return group.to_string();
+    }
     match host.split_once('#') {
         Some((h, k)) => format!("{group}@{}#{k}", h.to_lowercase()),
         None => format!("{group}@{}", host.to_lowercase()),
@@ -401,7 +402,7 @@ async fn load_cursors(
     server: usize,
 ) -> Result<Option<db::GroupState>> {
     let (key, group) = (key.to_string(), group.to_string());
-    let legacy = if ctx.pool.len() <= 1 { Vec::new() } else { ctx.pool.legacy_keys(server) };
+    let legacy = if key == group { Vec::new() } else { ctx.pool.legacy_keys(server) };
     on_db(db, move |conn| cursors_or_adopted(conn, &key, &group, server == 0, &legacy)).await
 }
 
@@ -1741,6 +1742,16 @@ mod tests {
         assert_eq!(cursor_key(&pool, 0, "g"), "g@a.example#Block");
         assert_eq!(cursor_key(&pool, 1, "g"), "g@a.example#block");
         assert_eq!(cursor_key(&pool, 2, "g"), "g@b.example");
+    }
+
+    /// a lone server keeps the plain group name, unless it has a `#key`
+    #[test]
+    fn a_lone_keyed_server_keeps_its_keyed_cursor() {
+        let plain = crate::config::UsenetServer::new("A.Example", "u", "p", 563);
+        let mut keyed = crate::config::UsenetServer::new("B.Example", "u", "p", 563);
+        keyed.key = Some("Block".into());
+        assert_eq!(cursor_key(&Pool::new(&[plain]), 0, "g"), "g");
+        assert_eq!(cursor_key(&Pool::new(&[keyed]), 0, "g"), "g@b.example#Block");
     }
 
     #[test]
