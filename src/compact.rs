@@ -263,7 +263,7 @@ fn halt(stop: &AtomicBool, shard: usize) -> Result<()> {
 /// test hook: the stop flags (by address) to set the first time the held
 /// back stream looks at them, with how many times it has
 #[cfg(test)]
-static HELD_CHECKS: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
+static HELD_CHECKS: std::sync::Mutex<Vec<(usize, usize, usize)>> = std::sync::Mutex::new(Vec::new());
 
 #[cfg(test)]
 struct HeldCheck(usize);
@@ -274,12 +274,17 @@ struct HeldCheck(usize);
 impl HeldCheck {
     fn on(stop: &Arc<AtomicBool>) -> HeldCheck {
         let at = Arc::as_ptr(stop) as usize;
-        HELD_CHECKS.lock().unwrap().push((at, 0));
+        HELD_CHECKS.lock().unwrap().push((at, 0, 0));
         HeldCheck(at)
     }
 
     fn looks(&self) -> usize {
         HELD_CHECKS.lock().unwrap().iter().find(|e| e.0 == self.0).unwrap().1
+    }
+
+    /// the rows the loop had looked at when it last looked
+    fn examined(&self) -> usize {
+        HELD_CHECKS.lock().unwrap().iter().find(|e| e.0 == self.0).unwrap().2
     }
 }
 
@@ -291,10 +296,11 @@ impl Drop for HeldCheck {
 }
 
 #[cfg(test)]
-fn held_check(stop: &AtomicBool) {
+fn held_check(stop: &AtomicBool, examined: usize) {
     let at = stop as *const AtomicBool as usize;
     if let Some(e) = HELD_CHECKS.lock().unwrap().iter_mut().find(|e| e.0 == at) {
         e.1 += 1;
+        e.2 = examined;
         stop.store(true, Ordering::Relaxed);
     }
 }
@@ -569,7 +575,7 @@ fn compact_shard(
                 streamed += 1;
                 if streamed.is_multiple_of(STOP_EVERY) {
                     #[cfg(test)]
-                    held_check(stop);
+                    held_check(stop, streamed);
                     halt(stop, shard)?;
                 }
                 let in_blob = match &mut in_blob {
@@ -675,6 +681,7 @@ fn compact_shard(
             let held_before_tail = held.len();
             // `held` (the blob and the buffered rows, bounded) isnt added to:
             // a tail copy of a tail row is found in the copy database instead
+            let mut examined = 0usize;
             while let Some(row) = pending.take_if(|r| r.file_id == id) {
                 let key = dedup_key(&mut suffix_of, &row.local, row.domain)?;
                 if !held.contains(&key) && !has_other_form(&tx, &row, &key)? && insert_row(&tx, &row)? == 1 {
@@ -683,7 +690,11 @@ fn compact_shard(
                     (tail_bytes, tail_copies) = (tail_bytes + row.bytes.unwrap_or(0), tail_copies + 1);
                 }
                 in_tx += 1;
-                if (copied as usize).is_multiple_of(STOP_EVERY) {
+                // rows looked at, not copied: a tail of copies doesnt advance `copied`
+                examined += 1;
+                if examined.is_multiple_of(STOP_EVERY) {
+                    #[cfg(test)]
+                    held_check(stop, examined);
                     halt(stop, shard)?;
                 }
                 if in_tx >= BATCH {
@@ -1357,6 +1368,43 @@ mod tests {
         let err = run(&main, &|_| {}, &stop).unwrap_err();
         assert!(format!("{err:#}").contains("stopped"), "{err:#}");
         assert_eq!(check.looks(), 1, "stopped at the first look, not after 3 of them");
+    }
+
+    /// A stop during a huge tail of copies (rows `copied` doesnt count) is
+    /// looked at every STOP_EVERY rows examined.
+    #[test]
+    fn a_stop_during_a_tail_of_copies_ends_it_by_rows_examined() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        legacy_fixture(&main);
+        run(&main, &|_| {}, &no_stop()).unwrap();
+        let (path, file) = file_of(&main, "Rel.1", "alt.binaries.g1");
+        {
+            let conn = db::open_at(&path).unwrap();
+            let d: i64 = conn.query_row("select id from domains where suffix = '@ngPost>'", [], |r| r.get(0)).unwrap();
+            // past what a blob takes, then as many whole ids as a stop look is
+            // apart; each one again packed after it, a copy of the one before
+            let n = store::SEAL_MAX_SEGMENTS + 1 + STOP_EVERY as i64;
+            conn.execute(
+                "with recursive n(i) as (select 1 union all select i + 1 from n where i < ?2)
+                 insert into segments (file_id, local, domain, part, bytes)
+                 select ?1, cast(x'00' || cast('!' || i as blob) as blob), 0, 100 + i, 1 from n",
+                params![file, n],
+            )
+            .unwrap();
+            let mut insert = conn
+                .prepare("insert into segments (file_id, local, domain, part, bytes) values (?, ?, ?, 1, 1)")
+                .unwrap();
+            for i in 1..=STOP_EVERY as i64 * 2 {
+                insert.execute(params![file, store::pack_local(&format!("!{i}")), d]).unwrap();
+            }
+        }
+        let stop = no_stop();
+        let check = HeldCheck::on(&stop);
+        let err = run(&main, &|_| {}, &stop).unwrap_err();
+        assert!(format!("{err:#}").contains("stopped"), "{err:#}");
+        assert_eq!(check.looks(), 1);
+        assert_eq!(check.examined(), STOP_EVERY, "the first look is after STOP_EVERY rows of the tail");
     }
 
     /// More held back entries than a batch take are streamed across: the new
