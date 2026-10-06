@@ -489,6 +489,9 @@ fn compact_shard(
             // its blob, with every message-id stored the way its rows are
             let old_blob: Option<Vec<u8>> = f.get(10)?;
             let mut segs = Vec::new();
+            // old blob segments whose rewritten message-id is past what a blob
+            // takes (a dropped domain's suffix made whole again) become rows
+            let mut spilled = Vec::new();
             for seg in old_blob.as_deref().map(|b| unseal(shard, id, b)).transpose()?.unwrap_or_default() {
                 let suffix: Option<String> = if seg.domain != 0 && !shared(seg.domain) {
                     suffix_of.query_row([seg.domain], |r| r.get(0)).optional()?
@@ -496,8 +499,13 @@ fn compact_shard(
                     None
                 };
                 let (local, domain) = rewrite(shard, id, seg.local, seg.domain, shared(seg.domain), suffix.as_deref())?;
-                segs.push(Seg { local, domain, ..seg });
+                if local.len() > blob::MAX_LOCAL {
+                    spilled.push(Row { file_id: id, local, domain, part: seg.part, bytes: Some(seg.bytes) });
+                } else {
+                    segs.push(Seg { local, domain, ..seg });
+                }
             }
+            file_rows.extend(spilled);
 
             // a row the blob already has (the same message-id) isnt copied:
             // it goes before the blob is counted, the way `seal_rows` drops it
@@ -1175,6 +1183,38 @@ mod tests {
         assert_eq!(release_totals(&path, file), once, "and out of its release's and the shard's totals");
         assert_eq!(loose(&main), 0);
         assert_eq!(all_articles(&main), before, "every NZB reads back the same");
+    }
+
+    /// A sealed segment whose message-id grows past what a blob takes when its
+    /// domain is dropped stays a row, so no blob outgrows `decode_capped`.
+    #[test]
+    fn a_dropped_domains_long_message_id_leaves_the_blob_as_a_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        legacy_fixture(&main);
+        run(&main, &|_| {}, &no_stop()).unwrap();
+        let (path, file) = file_of(&main, "Rel.1", "alt.binaries.g1");
+        {
+            let conn = db::open_at(&path).unwrap();
+            let suffix = format!("@{}>", "d".repeat(240));
+            conn.execute("insert into domains (suffix) values (?)", [&suffix]).unwrap();
+            let d: i64 = conn.query_row("select id from domains where suffix = ?", [&suffix], |r| r.get(0)).unwrap();
+            let blob: Vec<u8> = conn.query_row("select blob from files where id = ?", [file], |r| r.get(0)).unwrap();
+            let mut segs = crate::blob::decode(&blob).unwrap();
+            let mut local = vec![0u8];
+            local.extend(std::iter::repeat_n(b'a', 300));
+            segs.push(Seg { part: Some(99), bytes: 5, domain: d, local });
+            conn.execute("update files set blob = ? where id = ?", params![crate::blob::encode(&segs), file]).unwrap();
+        }
+        let before = all_articles(&main);
+        run(&main, &|_| {}, &no_stop()).unwrap();
+        assert_eq!(all_articles(&main), before, "every NZB reads back the same");
+        let conn = db::open_at(&path).unwrap();
+        let blob: Vec<u8> = conn.query_row("select blob from files where id = ?", [file], |r| r.get(0)).unwrap();
+        assert!(crate::blob::decode(&blob).unwrap().iter().all(|s| s.local.len() <= crate::blob::MAX_LOCAL));
+        let rows: i64 =
+            conn.query_row("select count(*) from segments where file_id = ?", [file], |r| r.get(0)).unwrap();
+        assert_eq!(rows, 1, "the long one is a row");
     }
 
     #[test]
