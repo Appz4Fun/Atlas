@@ -605,11 +605,14 @@ pub(crate) fn put_file(conn: &Connection, f: &FileState) -> Result<()> {
 }
 
 /// Add one article to a file; false when it was already there, as a row or
-/// in the file's sealed blob.
+/// in the file's sealed blob, or in another file of its release (`others`,
+/// the ids of those and whether each is sealed: one message-id saved under
+/// two parsed file names is one article).
 pub(crate) fn add_segment(
     conn: &Connection,
     domains: &mut Domains,
     f: &FileState,
+    others: &[(i64, bool)],
     a: &Article,
     sealed: &mut SealedCache,
 ) -> Result<bool> {
@@ -635,6 +638,13 @@ pub(crate) fn add_segment(
             return Ok(false);
         }
     }
+    // `guessed` stays about this file's blob, which the caller asks about
+    let guessed = sealed.guessed;
+    let elsewhere = !others.is_empty() && in_other_file(conn, others, &a.message_id, sealed)?;
+    sealed.guessed = guessed;
+    if elsewhere {
+        return Ok(false);
+    }
     let added = conn
         .prepare_cached("insert or ignore into segments (file_id, local, domain, part, bytes) values (?, ?, ?, ?, ?)")?
         .execute(params![f.id, local, domain, a.part, a.bytes])?;
@@ -646,6 +656,23 @@ pub(crate) fn add_segment(
         .execute(params![f.id, a.message_id, a.subject, a.part, a.total_parts, a.file_total])?;
     }
     Ok(added > 0)
+}
+
+/// Message-id `id` is in one of `others` (file ids of a release, and whether
+/// each is sealed): as a row stored any way, or in a sealed blob (past the
+/// decode budget a blob not held is taken not to have it, see `SealedCache`).
+fn in_other_file(conn: &Connection, others: &[(i64, bool)], id: &str, sealed: &mut SealedCache) -> Result<bool> {
+    for (local, domain) in stored_forms(conn, id)? {
+        for &(file_id, is_sealed) in others {
+            let row = conn
+                .prepare_cached("select 1 from segments where file_id = ? and local = ? and domain = ?")?
+                .exists(params![file_id, local, domain])?;
+            if row || (is_sealed && sealed.contains(conn, file_id, &local, domain)?) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 /// a release is complete when every file has exactly its parts, and there are
@@ -1314,9 +1341,14 @@ impl ShardWriter {
                 let mut added: Vec<(&Article, bool)> = Vec::new();
                 for (name, articles) in by_file {
                     let mut f = file(&tx, release_id, name)?;
+                    // the release's other files, checked for the same message-id
+                    let others: Vec<(i64, bool)> = tx
+                        .prepare_cached("select id, blob is not null from files where release_id = ? and id != ?")?
+                        .query_map(params![release_id, f.id], |r| Ok((r.get(0)?, r.get(1)?)))?
+                        .collect::<Result<_>>()?;
                     let before = added.len();
                     for a in articles {
-                        if add_segment(&tx, domains, &f, a, &mut sealed)? {
+                        if add_segment(&tx, domains, &f, &others, a, &mut sealed)? {
                             let unsure = f.sealed && sealed.guessed;
                             if unsure {
                                 // maybe a copy of what the blob has: only its part
@@ -1337,6 +1369,13 @@ impl ShardWriter {
                         if !f.sealed && f.expected.is_some_and(|e| is_exactly(&f.seen, e)) {
                             completed.push(f.id);
                         }
+                    } else {
+                        // a file just made whose articles all were in other files
+                        tx.prepare_cached(
+                            "delete from files where id = ? and touched_at is null and blob is null
+                             and not exists (select 1 from segments where file_id = ?)",
+                        )?
+                        .execute(params![f.id, f.id])?;
                     }
                 }
                 profile::ARTICLES.add_since(t);
@@ -1742,7 +1781,7 @@ mod tests {
         let article = Article { message_id: format!("<{:032x}@nyuu>", 7), part: Some(1), ..Default::default() };
         let mut fresh = Domains::default();
         assert!(
-            add_segment(&conn, &mut fresh, &file, &article, &mut SealedCache::new()).unwrap(),
+            add_segment(&conn, &mut fresh, &file, &[], &article, &mut SealedCache::new()).unwrap(),
             "first time: stored whole"
         );
         for n in 0..SHARED_AFTER {
@@ -1750,7 +1789,7 @@ mod tests {
         }
         assert!(conn.prepare("select 1 from domains where suffix = '@nyuu>'").unwrap().exists([]).unwrap());
         assert!(
-            !add_segment(&conn, &mut fresh, &file, &article, &mut SealedCache::new()).unwrap(),
+            !add_segment(&conn, &mut fresh, &file, &[], &article, &mut SealedCache::new()).unwrap(),
             "same article again: not saved twice"
         );
         let segments: i64 = conn.query_row("select count(*) from segments", [], |r| r.get(0)).unwrap();
@@ -1779,7 +1818,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            !add_segment(&conn, &mut Domains::default(), &file, &legacy, &mut SealedCache::new()).unwrap(),
+            !add_segment(&conn, &mut Domains::default(), &file, &[], &legacy, &mut SealedCache::new()).unwrap(),
             "legacy text row found"
         );
         let segments: i64 = conn.query_row("select count(*) from segments", [], |r| r.get(0)).unwrap();
@@ -2127,9 +2166,12 @@ mod tests {
         assert!(f.sealed);
         let article =
             Article { message_id: "<hotfTpetaZRIbOYuTuQ31@JBinUp.local>".into(), part: Some(1), ..Default::default() };
-        assert!(!add_segment(&conn, &mut domains, &f, &article, &mut SealedCache::new()).unwrap());
+        assert!(!add_segment(&conn, &mut domains, &f, &[], &article, &mut SealedCache::new()).unwrap());
         let other = Article { message_id: "<other1@JBinUp.local>".into(), part: Some(2), ..Default::default() };
-        assert!(add_segment(&conn, &mut domains, &f, &other, &mut SealedCache::new()).unwrap(), "a new one is a row");
+        assert!(
+            add_segment(&conn, &mut domains, &f, &[], &other, &mut SealedCache::new()).unwrap(),
+            "a new one is a row"
+        );
         let loose: i64 = conn.query_row("select count(*) from segments", [], |r| r.get(0)).unwrap();
         assert_eq!(loose, 1);
     }
@@ -2578,6 +2620,53 @@ mod tests {
         assert_eq!(state(&conn).0, Some(4), "the new one's total counts, not the copy's");
         assert_ne!(state(&conn).1, before.1);
         assert!(!sealable(&conn, 0, 100, now).unwrap().0.contains(&a), "and it's skipped again");
+    }
+
+    /// One message-id under another file name of its release (another
+    /// carrier's subject) is the same article: not saved again, neither
+    /// beside a row nor beside a sealed blob, and no empty file is left.
+    #[test]
+    fn an_article_under_another_file_of_its_release_isnt_saved_twice() {
+        let (_dir, main) = sealed_fixture();
+        let shard = shard_path(&main, shard_of("alt.binaries.t"));
+        let state = || {
+            let conn = db::open_with_shards(&main).unwrap();
+            let id: i64 = conn.query_row("select id from releases", [], |r| r.get(0)).unwrap();
+            let totals: (i64, i64, bool) = conn
+                .query_row("select size, parts, complete from releases", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap();
+            let shard = db::open_at(&shard).unwrap();
+            let files: i64 = shard.query_row("select count(*) from files", [], |r| r.get(0)).unwrap();
+            let total: i64 =
+                shard.query_row("select value from meta where key = 'articles'", [], |r| r.get(0)).unwrap();
+            (articles(&conn, id).unwrap(), totals, files, total)
+        };
+        let again = |id: &str| Release {
+            name: "Rel".into(),
+            group: "alt.binaries.t".into(),
+            articles: vec![Article {
+                message_id: id.into(),
+                subject: "\"c.rar\" yEnc (1/3)".into(),
+                filename: Some("c.rar".into()),
+                part: Some(1),
+                total_parts: Some(3),
+                bytes: 101,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let before = state();
+        // a row of a.rar, and one stored packed under its domain
+        save(&main, &[again("<a1@x>"), again("<0abc12def34@ngPost>")]).unwrap();
+        assert_eq!(state(), before, "beside a row");
+
+        let conn = db::open_at(&shard).unwrap();
+        for id in conn.prepare("select id from files").unwrap().query_map([], |r| r.get(0)).unwrap() {
+            seal_file(&conn, id.unwrap()).unwrap();
+        }
+        let before = state();
+        save(&main, &[again("<a3@x>"), again("<b1@x>")]).unwrap();
+        assert_eq!(state(), before, "beside a blob");
     }
 
     /// what purging takes off the totals is what it deleted, counted in its
