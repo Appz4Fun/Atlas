@@ -94,9 +94,17 @@ impl std::error::Error for Busy {}
 #[must_use = "the write is only safe while the guard is held"]
 pub struct WriteGuard(std::fs::File);
 
-/// Hold off compaction while writing the shards, see `WriteGuard`.
+/// Hold off compaction while writing the shards, see `WriteGuard`. Also
+/// refused while a shard and its `.precompact.db` are both there and which
+/// one is whole isnt known (`unresolved_backups`): a write would go into
+/// whichever is wrong. Whoever holds this is about to write; setting up the
+/// database and reading go through `try_hold_off_compaction` and aren't held
+/// back.
 pub fn hold_off_compaction(main: &Path) -> Result<WriteGuard> {
-    try_hold_off_compaction(main)?.ok_or_else(|| anyhow!("the database is being compacted; try again later"))
+    let held =
+        try_hold_off_compaction(main)?.ok_or_else(|| anyhow!("the database is being compacted; try again later"))?;
+    refuse_unresolved_backups(main)?;
+    Ok(held)
 }
 
 /// `hold_off_compaction`, None while a compaction runs.
@@ -136,13 +144,52 @@ impl Drop for Lock {
     }
 }
 
+/// Shards with a `.precompact.db` next to them, as (shard, backup). With the
+/// lock held a backup next to a shard is not a compaction at work: it was
+/// cut short, or an older atlas made an empty shard beside it.
+pub fn unresolved_backups(main: &Path) -> Result<Vec<(PathBuf, PathBuf)>> {
+    let mut found = Vec::new();
+    for path in store::shard_paths(main) {
+        let backup = with_suffix(&path, "precompact");
+        if backup.try_exists()? && path.try_exists()? {
+            found.push((path, backup));
+        }
+    }
+    Ok(found)
+}
+
+/// What to tell the user about one `unresolved_backups` pair: both files, and
+/// how to go on with either.
+fn unresolved_message(shard: &Path, backup: &Path) -> String {
+    let bytes = |p: &Path| crate::ui::fmt_size(Some(size(p) as i64));
+    format!(
+        "{shard} ({}) and {backup} ({}) both exist, and which one is whole isnt known: a compaction was cut short, \
+         or an older atlas made an empty shard next to the backup. Not writing the shards till this is resolved. \
+         Stop atlas, then either keep {shard} and delete {backup}, or keep {backup}: delete {shard} (and its -wal and \
+         -shm files) and rename {backup} to {shard}. The bigger one usually has the releases",
+        bytes(shard),
+        bytes(backup),
+        shard = shard.display(),
+        backup = backup.display(),
+    )
+}
+
+/// Err for the first of `unresolved_backups`, see `unresolved_message`.
+pub fn refuse_unresolved_backups(main: &Path) -> Result<()> {
+    match unresolved_backups(main)?.first() {
+        Some((shard, backup)) => bail!("{}", unresolved_message(shard, backup)),
+        None => Ok(()),
+    }
+}
+
 /// Put back the original of every shard whose swap was cut short (a crash,
 /// or its copy failing to move in): the original moved aside as
 /// `.precompact.db` and nothing in its place. Nothing writes a shard while
 /// it's compacted, soo the original is whole: it goes back, and the copy
 /// goes. A backup next to a shard that is in place is kept (the copy may have
 /// gone in, or a shard made empty in its place by an older atlas; which one
-/// is whole isnt known). Returns a line for each, to show.
+/// is whole isnt known) and said so: the indexer and saves refuse till the
+/// user removes one (`hold_off_compaction`). Returns a line for each, to show.
 ///
 /// Only with the lock held (either kind): a running compaction has a shard
 /// moved aside on purpose for a moment.
@@ -154,11 +201,7 @@ pub fn recover_cut_swaps(main: &Path) -> Result<Vec<String>> {
             continue;
         }
         if path.try_exists()? {
-            said.push(format!(
-                "{} is left from a compaction that was cut short, and kept: once {} reads back fine, remove it",
-                original.display(),
-                path.display()
-            ));
+            said.push(unresolved_message(&path, &original));
             continue;
         }
         std::fs::rename(&original, &path)
@@ -1201,5 +1244,37 @@ mod tests {
         assert!(err.contains(&backup.display().to_string()), "{err}");
         assert!(backup.exists(), "kept by a compaction too");
         assert_eq!(all_articles(&main), before);
+    }
+
+    #[test]
+    fn a_shard_and_its_backup_together_refuse_writes_but_not_the_menu() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        legacy_fixture(&main);
+        let before = all_articles(&main);
+
+        // a normal database, no backups: untouched
+        drop(hold_off_compaction(&main).unwrap());
+        drop(db::create_db_holding(&main).unwrap().unwrap());
+
+        // an older atlas made an empty shard next to the backup: which to keep isnt known
+        let path = store::shard_path(&main, store::shard_of("alt.binaries.g3"));
+        let backup = with_suffix(&path, "precompact");
+        std::fs::copy(&path, &backup).unwrap();
+
+        // writes are refused, with both files named and how to go on
+        let err = format!("{:#}", hold_off_compaction(&main).err().expect("refused"));
+        assert!(err.contains(&path.display().to_string()) && err.contains(&backup.display().to_string()), "{err}");
+        assert!(err.contains("keep") && err.contains("delete"), "says how to resolve it: {err}");
+        // the lock isnt kept by a refused hold: a compaction gets its own refusal, not Busy
+        assert!(!busy(run(&main, &|_| {}, &no_stop())));
+
+        // the menu still starts and reads
+        drop(db::create_db_holding(&main).unwrap().expect("set up"));
+        assert_eq!(all_articles(&main), before);
+
+        // resolved: the shard is kept, the backup removed
+        std::fs::remove_file(&backup).unwrap();
+        drop(hold_off_compaction(&main).unwrap());
     }
 }

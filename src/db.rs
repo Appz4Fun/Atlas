@@ -678,7 +678,7 @@ mod tests {
         }
 
         // the indexer, or a compaction, using the database: nothing is wiped
-        let writing = crate::compact::hold_off_compaction(&main).unwrap();
+        let writing = crate::compact::try_hold_off_compaction(&main).unwrap().unwrap();
         let err = wipe(&main).unwrap_err();
         assert!(err.downcast_ref::<crate::compact::Busy>().is_some(), "{err:#}");
         assert_eq!(held(&main).0, 3, "refused, all still there");

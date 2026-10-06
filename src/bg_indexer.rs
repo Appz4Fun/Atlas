@@ -840,7 +840,14 @@ pub fn run() -> i32 {
     // compaction held off from before setting up: a shard it's swapping
     // would look missing. kept for indexing
     let writing = match db::create_db() {
-        Ok(Some(held)) => held,
+        Ok(Some(held)) => match crate::compact::refuse_unresolved_backups(&paths::database()) {
+            Ok(()) => held,
+            Err(e) => {
+                ui::error(&format!("not indexing: {e:#}"));
+                write_status(false, "", &config.index_mode, false, "stopped", true, 1);
+                return 1;
+            }
+        },
         Ok(None) => {
             ui::error("not indexing: the database is being compacted; try again later");
             write_status(false, "", &config.index_mode, false, "stopped", true, 1);

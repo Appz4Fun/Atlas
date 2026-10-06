@@ -64,6 +64,24 @@ fn the_indexer_and_a_compaction_lock_each_other_out() {
     compacting.unlock().unwrap();
     drop(compacting);
 
+    // a backup next to a shard that is in place, roles unknown (an older atlas
+    // made an empty shard beside it): the indexer refuses, and writes nothing
+    let backup = home.path().join("atlas.s0.precompact.db");
+    std::fs::copy(atlas::store::shard_path(&main, 0), &backup).unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let runner = index(&stop);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !runner.is_finished() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let refused = runner.is_finished();
+    stop.store(true, Ordering::Relaxed);
+    let code = runner.join().unwrap();
+    assert!(refused, "the indexer started with a backup next to a shard");
+    assert_ne!(code, 0, "refusing is an error");
+    assert_eq!(articles(), 0, "nothing was written");
+    std::fs::remove_file(&backup).unwrap();
+
     // the indexer runs: a compaction is refused, and touches nothing
     let stop = Arc::new(AtomicBool::new(false));
     let runner = index(&stop);
