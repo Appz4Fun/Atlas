@@ -715,6 +715,9 @@ fn compact_shard(
          insert into releases_fts(releases_fts) values('rebuild');",
     )?;
     drop(conn);
+    // nothing holds the original open past here: the swap renames it, and
+    // Windows wont rename an open file
+    drop(uses);
     {
         let conn = db::open_at(&copy)?;
         interruptible(&conn, stop)?;
@@ -766,6 +769,10 @@ impl DomainUses {
         )?;
         conn.execute("attach database ? as old", [shard_path.to_string_lossy()])?;
         conn.execute("insert into uses select domain, count(*) from old.segments group by domain", [])?;
+        // the shard isnt kept open by this file's connection: the swap renames
+        // it, and Windows wont rename an open file
+        conn.execute_batch("detach database old")?;
+        debug_assert_eq!(attached(conn), ["main"]);
         halt(stop, shard)?;
         let read = Connection::open_with_flags(shard_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         let mut stmt = read.prepare("select id, blob from files where blob is not null")?;
@@ -802,6 +809,11 @@ impl Drop for DomainUses {
         drop(self.conn.take());
         remove_db(&self.path);
     }
+}
+
+/// the schemas attached to `conn`, `main` first
+fn attached(conn: &Connection) -> Vec<String> {
+    conn.prepare("pragma database_list").and_then(|mut s| s.query_map([], |r| r.get(1))?.collect()).unwrap_or_default()
 }
 
 /// the files table's columns, blob last
