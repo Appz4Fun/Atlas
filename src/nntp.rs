@@ -1425,8 +1425,8 @@ impl Pool {
         Ok(info)
     }
 
-    /// GROUP on server `prefer`, falling over (in priority order) to a server
-    /// that carries it. Returns the server used.
+    /// GROUP on server `prefer`, falling over to an indexing server that
+    /// carries it. Returns the server used.
     pub async fn select_group_on(&self, prefer: usize, group: &str) -> Result<(usize, (u64, u64, u64, String))> {
         let first_err = match self.select_on(prefer, group).await {
             Ok(r) => return Ok((prefer, r)),
@@ -1435,15 +1435,10 @@ impl Pool {
             Err(e) => return Err(e),
         };
 
-        let usable = |i: &usize| *i != prefer && !self.servers[*i].no_index.load(Ordering::Relaxed);
-        let indexing: Vec<usize> = self.indexing_servers().into_iter().filter(usable).collect();
-        let candidates: Vec<usize> = self
-            .ranked(&indexing, group)
-            .into_iter()
-            .chain((0..self.servers.len()).filter(|i| usable(i) && !indexing.contains(i)))
-            .collect();
-
-        for i in candidates {
+        // indexing servers only: one with `index: false` (a metered block
+        // account) is for article lookups, never a group's home
+        let indexing: Vec<usize> = self.indexing_servers().into_iter().filter(|&i| i != prefer).collect();
+        for i in self.ranked(&indexing, group) {
             if let Ok(r) = self.select_on(i, group).await {
                 println!("{group} not on {}, using {}", self.servers[prefer].cfg.host, self.servers[i].cfg.host);
                 self.homes.lock().unwrap().insert(group.to_string(), i);

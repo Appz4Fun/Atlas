@@ -157,3 +157,23 @@ fn name_lookups_fall_back_on_a_missing_article() {
     assert!(pool.first_names(jobs).iter().all(Option::is_some));
     assert_eq!(has.bodies_sent.load(Ordering::SeqCst), 10);
 }
+
+/// A group the indexing servers dont carry isnt indexed on a server with
+/// `index: false` (a metered block account kept for article lookups) that does.
+#[test]
+fn a_group_never_falls_over_to_a_server_kept_out_of_indexing() {
+    let posts: Vec<Post> = (1..=10).map(|n| post(n, &format!(r#""thing{n}.rar" yEnc (1/1)"#), 10, vec![])).collect();
+    let indexing = Server::new(posts.clone());
+    indexing.dropped.store(true, Ordering::SeqCst);
+    let block = Server::new(posts);
+    let (p1, p2) = (spawn_server(indexing), spawn_server(block));
+
+    let mut kept_out = mock(p2, "secret", 2, 2);
+    kept_out.index = Some(false);
+    let pool = BlockingPool::new(&[mock(p1, "secret", 2, 1), kept_out]);
+    pool.connect().unwrap();
+
+    let err = pool.select_group(GROUP).expect_err("only the block account carries it");
+    assert_eq!(err.code(), Some(411), "{err}");
+    assert_eq!(pool.active_index(), 0, "still on the indexing server");
+}
