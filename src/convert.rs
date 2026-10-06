@@ -206,6 +206,21 @@ pub fn recover_cut_swap(main: &Path) -> Result<Option<String>> {
         )));
     }
     if backup.try_exists()? {
+        // no conversion under way (it would have left atlas.new.db) yet shards
+        // with releases: a conversion finished long ago and atlas.db went
+        // missing since. the old database back would be converted again, and
+        // that fresh copy would wipe the shards and all indexed since
+        if !new_main.try_exists()? && shards_hold_releases(main) {
+            bail!(
+                "{} is missing, but the shards next to it hold releases from a finished conversion; \
+                 not putting {} back (converting it again would wipe the shards). \
+                 restore {} from a backup, or move the shards (atlas.s*.db) aside to start over from {}",
+                main.display(),
+                backup.display(),
+                main.display(),
+                backup.display()
+            );
+        }
         rename_db(&backup, main).context("putting the old database back")?;
         return Ok(Some(format!(
             "a conversion was cut short after moving {} aside; it's back in place",
@@ -213,6 +228,16 @@ pub fn recover_cut_swap(main: &Path) -> Result<Option<String>> {
         )));
     }
     Ok(None)
+}
+
+/// Any shard next to `main` has a release (read only: nothing is created)
+fn shards_hold_releases(main: &Path) -> bool {
+    store::shard_paths(main).iter().any(|p| {
+        p.exists()
+            && Connection::open_with_flags(p, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)
+                .and_then(|c| c.query_row("select exists(select 1 from releases)", [], |r| r.get::<_, bool>(0)))
+                .unwrap_or(false)
+    })
 }
 
 fn swap_ready(new_main: &Path) -> bool {

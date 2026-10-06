@@ -464,3 +464,29 @@ fn an_old_database_moved_aside_without_a_finished_new_one_is_put_back() {
     assert!(convert::needed(&main), "the old database is back");
     assert_eq!(convert::run_alone(&main, &|_| {}).unwrap().map(|(r, _)| r), Some(40));
 }
+
+/// Long after a finished conversion, atlas.db lost while atlas.old.db and
+/// the shards (with everything indexed since) are still there: putting the
+/// old database back would convert again and the fresh copy would wipe the
+/// shards. Refused, saying what to do, and nothing is touched.
+#[test]
+fn a_lost_main_database_after_a_conversion_does_not_bring_the_old_one_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = dir.path().join("atlas.db");
+    old_database(&main);
+    db::create_db_at(&main).unwrap();
+    convert::run(&main, &|_| {}).unwrap();
+    let releases = store::totals(&db::open_with_shards(&main).unwrap()).unwrap().0;
+    assert!(releases > 0);
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", main.display()));
+    }
+
+    let refused = convert::recover_cut_swap(&main).unwrap_err().to_string();
+    assert!(refused.contains("atlas.old.db") && refused.contains("shards"), "{refused}");
+    assert!(dir.path().join("atlas.old.db").exists());
+    assert!(!main.exists());
+    for path in store::shard_paths(&main) {
+        assert!(path.exists());
+    }
+}
