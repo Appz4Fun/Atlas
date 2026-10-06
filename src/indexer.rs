@@ -57,7 +57,36 @@ pub struct GroupRunState {
     /// the group is noted for good (no expiry): the scheduler skips it for
     /// good too
     pub first_post_days: HashMap<String, (i64, Option<Instant>)>,
+    /// the split's days only one server has, see `Speculative`
+    pub speculative: Speculative,
 }
+
+/// Days of a split older than the next deepest server goes back are only
+/// the deepest one's, on the word of its own Date headers: forged, one
+/// article a day can make thousands of them look real, each a chunk of
+/// date searches. At most `reach` of them (counted back from the first day
+/// the next deepest keeps) are chunks at once, the older ones are left to
+/// the deep server's sweep (see `run_sweep`). Reaching the oldest of them
+/// reaches `SPECULATIVE_WINDOW` days further only when the ones done held
+/// `SPECULATIVE_YIELD` articles a day on average. Kept in memory: after a
+/// restart the window starts over (what was dropped is the sweep's).
+#[derive(Clone, Debug)]
+pub struct Speculative {
+    pub reach: i64,
+    /// days done, and the articles dated in them
+    pub days: i64,
+    pub articles: i64,
+}
+
+impl Default for Speculative {
+    fn default() -> Self {
+        Speculative { reach: SPECULATIVE_WINDOW, days: 0, articles: 0 }
+    }
+}
+
+/// see `Speculative`
+const SPECULATIVE_WINDOW: i64 = 60;
+const SPECULATIVE_YIELD: i64 = 100;
 
 impl Default for GroupRunState {
     fn default() -> Self {
@@ -69,6 +98,7 @@ impl Default for GroupRunState {
             reach_back_after: None,
             keeps_from: HashMap::new(),
             first_post_days: HashMap::new(),
+            speculative: Speculative::default(),
         }
     }
 }
@@ -953,6 +983,39 @@ async fn drop_older_days(db: &Db, group: &str, day: i64) {
     }
 }
 
+/// A day only this server has (`day`, of the window from `floor`, see
+/// `Speculative`) is done with `dated` articles in it. When it was the
+/// window's oldest and the window's days held enough a day, chunks for the
+/// days before it, back to the server's first post (`oldest`). Best effort:
+/// a failure is only logged.
+async fn reach_further(
+    ctx: &PassContext,
+    db: &Db,
+    group: &str,
+    (day, floor, oldest): (i64, i64, Option<i64>),
+    dated: i64,
+) {
+    let further = ctx.states.with(group, |st| {
+        let s = &mut st.speculative;
+        s.days += 1;
+        s.articles += dated;
+        let worth = s.articles >= SPECULATIVE_YIELD * s.days;
+        if day == floor && worth {
+            s.reach += SPECULATIVE_WINDOW;
+        }
+        day == floor && worth
+    });
+    let first = oldest.map_or(floor, crate::chunks::unix_day);
+    if !further || first >= floor {
+        return;
+    }
+    let (g, from) = (group.to_string(), (floor - SPECULATIVE_WINDOW).max(first));
+    match on_db(db, move |conn| Ok(crate::chunks::add(conn, &g, floor - 1, from)?)).await {
+        Ok(n) => println!("[CHUNK] {group}: the days only one server has hold articles, {n} more day chunks"),
+        Err(e) => println!("[CHUNK] {group}: couldnt add the days further back: {e:#}"),
+    }
+}
+
 async fn index_chunk<P>(
     ctx: &PassContext,
     settings: &PassSettings,
@@ -1024,6 +1087,8 @@ where
     // this day is older than any other server goes back: only this server
     // may have it, on the word of its own (forgeable) dates
     let mut alone = false;
+    // and then the first day the next deepest server keeps
+    let mut runner_up_day = None;
     let keeps_day = match oldest {
         // a day older than the second furthest server goes back is the
         // furthest one's alone: a server only looks deep enough by the dates
@@ -1031,6 +1096,7 @@ where
         Some(t) if t <= day * 86_400 => match goes_back_furthest(ctx, db, group, server, (t, sure)).await {
             Ok((true, runner_up)) => {
                 alone = runner_up.is_none_or(|r| r >= (day + 1) * 86_400);
+                runner_up_day = runner_up.filter(|_| alone).map(crate::chunks::unix_day);
                 true
             }
             Ok((false, runner_up)) => {
@@ -1091,6 +1157,28 @@ where
             Ok(range) => range,
             Err(e) => return failed(e.into()).await,
         };
+    // days only this server has are bounded all together, see `Speculative`
+    let floor = match runner_up_day {
+        Some(r) => {
+            let floor = r - ctx.states.with(group, |st| st.speculative.reach);
+            let g = group.to_string();
+            let dropped = on_db(db, move |conn| Ok(crate::chunks::drop_before(conn, &g, floor)?)).await;
+            match dropped {
+                Ok(0) => {}
+                Ok(n) => println!(
+                    "[CHUNK] {group}: {n} days further back than {} days before the other servers go back are left to the sweeps",
+                    r - floor
+                ),
+                Err(e) => return failed(e).await,
+            }
+            // this one was among them (claimed, not done): nothing to do
+            if day < floor {
+                return Ok(Progress::default());
+            }
+            Some(floor)
+        }
+        None => None,
+    };
     if start > end {
         finish().await?;
         if alone {
@@ -1102,10 +1190,12 @@ where
     let pass = Pass { ctx, settings, db, group, server, key: cursor_key(&ctx.pool, server, group) };
     let window = alone.then_some((day * 86_400, (day + 1) * 86_400));
     match pass.process_range_dated(start as i64, end as i64, "CHUNK", window, progress).await {
-        Ok((saved, true, corroborated)) => {
+        Ok((saved, true, dated_in_day)) => {
             finish().await?;
-            if alone && !corroborated {
+            if alone && dated_in_day == 0 {
                 drop_older_days(db, group, day).await;
+            } else if let Some(floor) = floor {
+                reach_further(ctx, db, group, (day, floor, oldest), dated_in_day).await;
             }
             Ok(saved)
         }
@@ -1321,8 +1411,8 @@ impl Pass<'_> {
         Ok((saved, complete))
     }
 
-    /// `process_range`, also whether any article retrieved is dated within
-    /// `window` (unix seconds, from up to before), false when there is none.
+    /// `process_range`, also how many articles retrieved are dated within
+    /// `window` (unix seconds, from up to before), 0 when there is none.
     async fn process_range_dated<P>(
         &self,
         start: i64,
@@ -1330,11 +1420,11 @@ impl Pass<'_> {
         kind: &str,
         window: Option<(i64, i64)>,
         progress: &mut P,
-    ) -> Result<(Progress, bool, bool)>
+    ) -> Result<(Progress, bool, i64)>
     where
         P: FnMut(&Progress) + ?Sized,
     {
-        let mut in_window = false;
+        let mut in_window = 0i64;
         let (pool, group) = (&self.ctx.pool, self.group);
         // no slice bigger than the whole unsaved budget: it would hold more
         // headers than the cap allows
@@ -1377,10 +1467,11 @@ impl Pass<'_> {
                 continue;
             }
 
-            if let Some((from, to)) = window.filter(|_| !in_window) {
-                in_window = headers
+            if let Some((from, to)) = window {
+                in_window += headers
                     .iter()
-                    .any(|h| crate::dates::posted_timestamp(&h.date).is_some_and(|t| (from..to).contains(&t)));
+                    .filter(|h| crate::dates::posted_timestamp(&h.date).is_some_and(|t| (from..to).contains(&t)))
+                    .count() as i64;
             }
             let dated = slice_date(&headers);
             match save_slice(pool, self.db, group, headers).await {
