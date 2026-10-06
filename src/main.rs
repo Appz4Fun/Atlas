@@ -45,6 +45,14 @@ fn run_convert() -> i32 {
         println!("stop indexing first");
         return 1;
     }
+    // the shards it makes arent compacted till they're filled
+    let _converting = match compact::hold_off_compaction(&main) {
+        Ok(held) => held,
+        Err(e) => {
+            println!("couldnt convert: {e:#}");
+            return 1;
+        }
+    };
     match convert::run(&main, &|msg| println!("{msg}")) {
         Ok(_) => 0,
         Err(e) => {

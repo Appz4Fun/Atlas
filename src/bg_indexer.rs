@@ -11,6 +11,7 @@ use serde::Serialize;
 use serde_json::json;
 
 use crate::atomic::write_atomic;
+use crate::compact::WriteGuard;
 use crate::config::{Config, UsenetServer, load_config};
 use crate::db;
 use crate::indexer::{Db, NotCarried, PassContext, PassSettings, Progress, RunStates, TooOld, run_pass, shared_db};
@@ -746,8 +747,9 @@ async fn compact(config: &Config, stats: &Arc<Mutex<Stats>>, stop: &Arc<AtomicBo
 }
 
 /// Index until stopping. Returns the exit code: not 0 when a compaction held
-/// the database at the start.
-async fn supervise(stop: Arc<AtomicBool>, stats: Arc<Mutex<Stats>>) -> i32 {
+/// the database at the start. `writing` is the hold on compaction taken
+/// before setting up the database, if there was one.
+async fn supervise(stop: Arc<AtomicBool>, stats: Arc<Mutex<Stats>>, writing: Option<WriteGuard>) -> i32 {
     let states = RunStates::default();
     let stopping = || stop.load(Ordering::Relaxed);
     let main = paths::database();
@@ -756,7 +758,7 @@ async fn supervise(stop: Arc<AtomicBool>, stats: Arc<Mutex<Stats>>) -> i32 {
     // indexing writes the shards: no compaction from elsewhere while it runs
     // (its copy would miss what's written meanwhile). let go only for this
     // indexer's own compaction, taken again after it
-    let mut writing = None;
+    let mut writing = writing;
     let mut started = false;
 
     while !stopping() {
@@ -831,10 +833,20 @@ pub fn run() -> i32 {
         return 1;
     }
 
-    if let Err(e) = db::create_db() {
-        ui::error(&format!("couldnt open database: {e}"));
-        return 1;
-    }
+    // compaction held off from before setting up: a shard it's swapping
+    // would look missing. kept for indexing
+    let writing = match db::create_db() {
+        Ok(Some(held)) => held,
+        Ok(None) => {
+            ui::error("not indexing: the database is being compacted; try again later");
+            write_status(false, "", &config.index_mode, false, "stopped", true, 1);
+            return 1;
+        }
+        Err(e) => {
+            ui::error(&format!("couldnt open database: {e:#}"));
+            return 1;
+        }
+    };
 
     // one time move of an older database into the shards, here and not in the
     // menu because it takes a while on a big one. the menu shows the progress
@@ -852,8 +864,8 @@ pub fn run() -> i32 {
                 return 1;
             }
         }
-        if let Err(e) = db::create_db() {
-            ui::error(&format!("couldnt open the converted database: {e}"));
+        if let Err(e) = db::create_db_at(&main) {
+            ui::error(&format!("couldnt open the converted database: {e:#}"));
             return 1;
         }
     }
@@ -866,12 +878,16 @@ pub fn run() -> i32 {
         let _ = signal_hook::flag::register(signal_hook::consts::SIGINT, stop.clone());
     }
 
-    run_until(config, stop)
+    index(config, stop, Some(writing))
 }
 
 /// The indexing loop from `run`, stopping once `stop` is set (tests set it
 /// directly, `run` wires it to SIGTERM / SIGINT).
 pub fn run_until(config: Config, stop: Arc<AtomicBool>) -> i32 {
+    index(config, stop, None)
+}
+
+fn index(config: Config, stop: Arc<AtomicBool>, writing: Option<WriteGuard>) -> i32 {
     // start sabnzbd soo its ready when you wanna download. on its own thread
     // soo indexing doesnt sit around for up to 90s waiting on it
     if sab::available() && !sab::is_running() {
@@ -898,7 +914,7 @@ pub fn run_until(config: Config, stop: Arc<AtomicBool>) -> i32 {
     let stats = Arc::new(Mutex::new(Stats::new()));
     write_status(true, &groups_label(&config.tracked_groups(), 0), &config.index_mode, false, "running", false, 0);
 
-    let code = runtime.block_on(supervise(stop, stats.clone()));
+    let code = runtime.block_on(supervise(stop, stats.clone(), writing));
     if code != 0 {
         return code;
     }

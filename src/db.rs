@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use rusqlite::{Connection, OptionalExtension, params};
 
+use crate::compact::WriteGuard;
 use crate::parser::Release;
 use crate::paths;
 use crate::store;
@@ -29,7 +30,19 @@ pub fn open_with_shards(path: &Path) -> Result<Connection> {
 }
 
 pub fn open_at(path: &Path) -> Result<Connection> {
-    let conn = Connection::open(path)?;
+    set_up(Connection::open(path)?)
+}
+
+/// A shard to write, which has to be there already: `open_at` would make a
+/// missing one (empty) on the spot, and a shard a compaction was cut short
+/// swapping would then look in place with nothing in it.
+pub fn open_shard(path: &Path) -> Result<Connection> {
+    use rusqlite::OpenFlags;
+    let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_URI | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    set_up(Connection::open_with_flags(path, flags)?)
+}
+
+fn set_up(conn: Connection) -> Result<Connection> {
     conn.busy_timeout(Duration::from_secs(30))?;
     // bundled sqlite turns these on by default, python's didnt. purge deletes
     // releases before their articles and old dbs can hold orphans.
@@ -107,18 +120,31 @@ fn wal_path(db: &Path) -> std::path::PathBuf {
     std::path::PathBuf::from(p)
 }
 
-pub fn create_db() -> Result<()> {
+/// `create_db_holding` for the database in its usual place.
+pub fn create_db() -> anyhow::Result<Option<WriteGuard>> {
     let path = paths::database();
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    create_db_at(&path)
+    create_db_holding(&path)
+}
+
+/// `create_db_at` with compaction held off first: a compaction moves each
+/// shard aside for a moment, and setting up then would take it for missing.
+/// Returns the hold, for the caller to keep while it writes or drop. None
+/// while a compaction runs, and nothing was set up (a compaction only runs
+/// on a database that is).
+pub fn create_db_holding(path: &Path) -> anyhow::Result<Option<WriteGuard>> {
+    let Some(held) = crate::compact::try_hold_off_compaction(path)? else { return Ok(None) };
+    create_db_at(path)?;
+    Ok(Some(held))
 }
 
 /// The main database and its shards, or brings an older one up to date. A
 /// database from before the shards is left as it is (apart from missing
-/// columns) for convert.rs; until then there are no shards.
-pub fn create_db_at(path: &Path) -> Result<()> {
+/// columns) for convert.rs; until then there are no shards. Run with
+/// compaction held off, see `create_db_holding`.
+pub fn create_db_at(path: &Path) -> anyhow::Result<()> {
     let conn = open_at(path)?;
 
     // wal soo the indexer can write while search reads
@@ -142,11 +168,46 @@ pub fn create_db_at(path: &Path) -> Result<()> {
     }
 
     if has_old_layout(&conn)? {
-        return migrate_old(&conn);
+        return Ok(migrate_old(&conn)?);
     }
 
     store::create_main(&conn)?;
-    for shard in store::shard_paths(path) {
+    create_shards(path)
+}
+
+/// Every shard of `main`, made if new, once the ones a compaction was cut
+/// short swapping are back. One missing while others are there is refused
+/// rather than made empty: searches would miss what it held, and new
+/// releases would go into the empty one.
+fn create_shards(main: &Path) -> anyhow::Result<()> {
+    for line in crate::compact::recover_cut_swaps(main)? {
+        crate::ui::warn(&line);
+    }
+    let shards = store::shard_paths(main);
+    let mut missing = Vec::new();
+    for path in &shards {
+        if !path.try_exists()? {
+            missing.push(path);
+        }
+    }
+    if !missing.is_empty() && missing.len() < shards.len() {
+        let each: Vec<String> = missing
+            .iter()
+            .map(|p| {
+                let copy = crate::compact::with_suffix(p, "compact");
+                if copy.exists() {
+                    format!("{} (a compacted copy of it, maybe not checked, is {})", p.display(), copy.display())
+                } else {
+                    p.display().to_string()
+                }
+            })
+            .collect();
+        anyhow::bail!(
+            "shards missing while the others are there: {}. not making empty ones in their place; put them back first",
+            each.join(", ")
+        );
+    }
+    for shard in shards {
         store::create_shard(&shard)?;
     }
     Ok(())

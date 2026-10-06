@@ -192,7 +192,7 @@ fn writer(shard: usize, path: &std::path::Path, ids: &crate::store::Ids, jobs: s
     use crate::profile::{LOAD, Load};
     use std::sync::atomic::Ordering::Relaxed;
 
-    let mut opened = db::open_at(path).and_then(|conn| db::tune_for_writing(&conn).map(|_| conn));
+    let mut opened = db::open_shard(path).and_then(|conn| db::tune_for_writing(&conn).map(|_| conn));
     let mut store = crate::store::ShardWriter::new(shard);
     // a job taken off the queue to see if more were waiting
     let mut next: Option<SaveJob> = None;

@@ -707,9 +707,17 @@ fn status_line(config: &Config, indexing: bool) -> Line {
 }
 
 pub fn main_menu() -> i32 {
-    if let Err(e) = create_db() {
-        ui::error(&format!("couldnt open database {}: {e}", paths::database().display()));
-        return 1;
+    // compaction is held off only while setting up: the menu itself doesnt
+    // write (its saves hold it off for themselves)
+    match create_db() {
+        Ok(Some(_setup)) => {}
+        Ok(None) => ui::warn(
+            "the database is being compacted; indexing, AI search saves and purging are refused till it's done",
+        ),
+        Err(e) => {
+            ui::error(&format!("couldnt open database {}: {e:#}", paths::database().display()));
+            return 1;
+        }
     }
 
     let mut config = match load_config() {

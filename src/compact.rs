@@ -14,7 +14,9 @@
 //! original) before it replaces the original. The originals stay next to it
 //! as `atlas.sN.precompact.db` until every shard has had its turn, then they
 //! go. A shard that fails keeps its original in place and the others carry
-//! on; `run` then returns an error naming each failed shard.
+//! on; `run` then returns an error naming each failed shard. A swap cut short
+//! between moving the original aside and the copy in (a crash) is undone by
+//! the next start or compaction, see `recover_cut_swaps`.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -36,7 +38,8 @@ const CHECK_SAMPLE: i64 = 300;
 /// rows per transaction
 const BATCH: usize = 500_000;
 
-fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
+/// `atlas.s3.db` -> `atlas.s3.{suffix}.db`
+pub(crate) fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
     let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
     path.with_file_name(format!("{stem}.{suffix}.db"))
 }
@@ -93,10 +96,15 @@ pub struct WriteGuard(std::fs::File);
 
 /// Hold off compaction while writing the shards, see `WriteGuard`.
 pub fn hold_off_compaction(main: &Path) -> Result<WriteGuard> {
+    try_hold_off_compaction(main)?.ok_or_else(|| anyhow!("the database is being compacted; try again later"))
+}
+
+/// `hold_off_compaction`, None while a compaction runs.
+pub fn try_hold_off_compaction(main: &Path) -> Result<Option<WriteGuard>> {
     let file = open_lock(main)?;
     match file.try_lock_shared() {
-        Ok(()) => Ok(WriteGuard(file)),
-        Err(std::fs::TryLockError::WouldBlock) => bail!("the database is being compacted; try again later"),
+        Ok(()) => Ok(Some(WriteGuard(file))),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
         Err(std::fs::TryLockError::Error(e)) => Err(e).context("locking the database for a write"),
     }
 }
@@ -126,6 +134,39 @@ impl Drop for Lock {
     fn drop(&mut self) {
         let _ = self.0.unlock();
     }
+}
+
+/// Put back the original of every shard whose swap was cut short (a crash,
+/// or its copy failing to move in): the original moved aside as
+/// `.precompact.db` and nothing in its place. Nothing writes a shard while
+/// it's compacted, soo the original is whole: it goes back, and the copy
+/// goes. A backup next to a shard that is in place is kept (the copy may have
+/// gone in, or a shard made empty in its place by an older atlas; which one
+/// is whole isnt known). Returns a line for each, to show.
+///
+/// Only with the lock held (either kind): a running compaction has a shard
+/// moved aside on purpose for a moment.
+pub fn recover_cut_swaps(main: &Path) -> Result<Vec<String>> {
+    let mut said = Vec::new();
+    for path in store::shard_paths(main) {
+        let original = with_suffix(&path, "precompact");
+        if !original.try_exists()? {
+            continue;
+        }
+        if path.try_exists()? {
+            said.push(format!(
+                "{} is left from a compaction that was cut short, and kept: once {} reads back fine, remove it",
+                original.display(),
+                path.display()
+            ));
+            continue;
+        }
+        std::fs::rename(&original, &path)
+            .with_context(|| format!("putting {} back as {}", original.display(), path.display()))?;
+        remove_db(&with_suffix(&path, "compact"));
+        said.push(format!("{} was moved aside by a compaction that was cut short; it's back in place", path.display()));
+    }
+    Ok(said)
 }
 
 /// What compacting one shard did.
@@ -161,10 +202,13 @@ fn interruptible(conn: &Connection, stop: &Arc<AtomicBool>) -> Result<()> {
 /// Compact every shard of `main`. Returns the total before and after. Once
 /// `stop` is set, shards not done are left as they were (and an error says so).
 pub fn run(main: &Path, progress: &(dyn Fn(&str) + Sync), stop: &Arc<AtomicBool>) -> Result<Shrunk> {
+    let _lock = Lock::take(main)?;
+    for line in recover_cut_swaps(main)? {
+        progress(&line);
+    }
     if !store::exists(main) {
         bail!("{} has no shards (convert it first)", main.display());
     }
-    let _lock = Lock::take(main)?;
     let started = Instant::now();
     let mut total = Shrunk::default();
     let mut failed: Vec<(usize, String)> = Vec::new();
@@ -193,14 +237,19 @@ pub fn run(main: &Path, progress: &(dyn Fn(&str) + Sync), stop: &Arc<AtomicBool>
         }
     }
     // the originals of the shards that were swapped can go. a failed shard
-    // keeps its original in place, and loses its half made copy (unless the
-    // shard isnt in place: the copy or the aside original may be all there is)
+    // keeps its original in place, and loses its half made copy; one whose
+    // copy didnt move in gets its original back
     for shard in 0..SHARDS {
         let path = store::shard_path(main, shard);
         if !failed.iter().any(|(f, _)| *f == shard) {
             remove_db(&with_suffix(&path, "precompact"));
         } else if path.exists() {
             remove_db(&with_suffix(&path, "compact"));
+        }
+    }
+    if failed.iter().any(|(shard, _)| !store::shard_path(main, *shard).exists()) {
+        for line in recover_cut_swaps(main)? {
+            progress(&line);
         }
     }
     if stop.load(Ordering::Relaxed) {
@@ -231,6 +280,12 @@ fn compact_shard(
     let copy = with_suffix(&path, "compact");
     let say = |msg: &str| progress(&format!("compacting shard {shard}: {msg}"));
     halt(stop, shard)?;
+    // a backup left by a compaction cut short isnt known to be redundant, and
+    // the swap would need its name
+    let backup = with_suffix(&path, "precompact");
+    if backup.try_exists()? {
+        bail!("{} is left from an earlier compaction; the original was kept", backup.display());
+    }
 
     // fold the WAL in soo the original is whole on its own
     {
@@ -431,7 +486,6 @@ fn compact_shard(
     conn.query_row("pragma wal_checkpoint(truncate)", [], |_| Ok(()))?;
     drop(conn);
     let original = with_suffix(&path, "precompact");
-    remove_db(&original);
     std::fs::rename(&path, &original).context("moving the original shard aside")?;
     for suffix in ["-wal", "-shm"] {
         let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
@@ -1039,5 +1093,113 @@ mod tests {
         assert!(format!("{err:#}").contains("stopped"), "{err:#}");
         assert!(stop.load(Ordering::Relaxed));
         assert_untouched_or_whole(&main, &before);
+    }
+
+    /// what a swap cut short after its first rename leaves: the shard of
+    /// `group` moved aside as `.precompact.db`, its checked copy still next
+    /// to it as `.compact.db`, nothing at the shard's own path
+    fn cut_swap(main: &Path, group: &str) -> PathBuf {
+        let path = store::shard_path(main, store::shard_of(group));
+        let copy = with_suffix(&path, "compact");
+        std::fs::copy(&path, &copy).unwrap();
+        std::fs::rename(&path, with_suffix(&path, "precompact")).unwrap();
+        for suffix in ["-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+        assert!(!path.exists() && copy.exists());
+        path
+    }
+
+    #[test]
+    fn a_swap_cut_short_gets_its_original_back_on_the_next_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        legacy_fixture(&main);
+        let before = all_articles(&main);
+        let path = cut_swap(&main, "alt.binaries.g3");
+
+        db::create_db_at(&main).unwrap();
+        assert!(path.exists(), "the original is back in place");
+        assert!(!with_suffix(&path, "precompact").exists(), "moved back, not copied");
+        assert!(!with_suffix(&path, "compact").exists(), "the copy went");
+        assert_eq!(all_articles(&main), before, "every NZB reads back the same");
+    }
+
+    #[test]
+    fn a_missing_shard_with_others_there_is_refused_not_made_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        legacy_fixture(&main);
+        let group = "alt.binaries.g3";
+        let path = store::shard_path(&main, store::shard_of(group));
+
+        // no backup at all
+        remove_db(&path);
+        let err = format!("{:#}", db::create_db_at(&main).unwrap_err());
+        assert!(err.contains(&path.display().to_string()) && err.contains("missing"), "{err}");
+        assert!(!path.exists(), "no empty shard in its place");
+
+        // only a compacted copy, which may not have been checked: kept, still refused
+        let copy = with_suffix(&path, "compact");
+        std::fs::copy(store::shard_path(&main, (store::shard_of(group) + 1) % SHARDS), &copy).unwrap();
+        let err = format!("{:#}", db::create_db_at(&main).unwrap_err());
+        assert!(err.contains(&copy.display().to_string()), "{err}");
+        assert!(!path.exists() && copy.exists(), "the copy is left for whoever puts it back");
+
+        // writers dont make it either
+        let release = Release { name: "Late".into(), group: group.into(), ..Default::default() };
+        assert!(store::save(&main, &[release]).is_err());
+        assert!(!path.exists(), "a save made no empty shard");
+    }
+
+    #[test]
+    fn a_shard_is_left_alone_while_a_compaction_holds_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        legacy_fixture(&main);
+        let before = all_articles(&main);
+        let path = cut_swap(&main, "alt.binaries.g3");
+
+        // mid swap of a running compaction: nothing set up, nothing put back
+        let compacting = Lock::take(&main).unwrap();
+        assert!(db::create_db_holding(&main).unwrap().is_none());
+        assert!(!path.exists() && with_suffix(&path, "precompact").exists(), "the swap is left to the compaction");
+        drop(compacting);
+
+        let held = db::create_db_holding(&main).unwrap().expect("set up once the compaction is gone");
+        assert!(busy(run(&main, &|_| {}, &no_stop())), "and compaction held off while held");
+        drop(held);
+        assert_eq!(all_articles(&main), before);
+    }
+
+    #[test]
+    fn a_compaction_puts_back_what_a_cut_swap_left_before_starting() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        legacy_fixture(&main);
+        let before = all_articles(&main);
+        cut_swap(&main, "alt.binaries.g3");
+
+        run(&main, &|_| {}, &no_stop()).unwrap();
+        assert_untouched_or_whole(&main, &before);
+    }
+
+    #[test]
+    fn a_backup_left_next_to_a_shard_in_place_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        legacy_fixture(&main);
+        let before = all_articles(&main);
+        // cut after the copy went in: both there, and which is whole isnt known
+        let path = store::shard_path(&main, store::shard_of("alt.binaries.g3"));
+        let backup = with_suffix(&path, "precompact");
+        std::fs::copy(&path, &backup).unwrap();
+
+        db::create_db_at(&main).unwrap();
+        assert!(backup.exists(), "kept on start");
+        let err = format!("{:#}", run(&main, &|_| {}, &no_stop()).unwrap_err());
+        assert!(err.contains(&backup.display().to_string()), "{err}");
+        assert!(backup.exists(), "kept by a compaction too");
+        assert_eq!(all_articles(&main), before);
     }
 }

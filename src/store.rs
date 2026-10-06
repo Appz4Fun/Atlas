@@ -1023,7 +1023,7 @@ pub fn save(main: &Path, releases: &[Release]) -> Result<()> {
         by_shard[shard_of(&r.group)].push(r.clone());
     }
     for (shard, list) in by_shard.iter().enumerate().filter(|(_, l)| !l.is_empty()) {
-        let mut conn = db::open_at(&shard_path(main, shard))?;
+        let mut conn = db::open_shard(&shard_path(main, shard))?;
         ShardWriter::new(shard).save(&mut conn, &ids, [list.as_slice()])?;
     }
     Ok(())
@@ -1126,7 +1126,7 @@ pub fn totals(conn: &Connection) -> Result<(i64, i64)> {
 /// Delete incomplete releases (and their files and articles) from every shard.
 pub fn purge_incomplete(main: &Path) -> Result<()> {
     for path in shard_paths(main) {
-        let conn = db::open_at(&path)?;
+        let conn = db::open_shard(&path)?;
         let removed: i64 = conn.query_row("select count(*) from releases where complete = 0", [], |r| r.get(0))?;
         conn.execute_batch(
             "begin;
