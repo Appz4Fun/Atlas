@@ -71,7 +71,8 @@ fn run_compact() -> i32 {
     match compact::run(&paths::database(), &|msg| println!("{msg}"), &stop) {
         Ok(_) => {
             // noted like the indexer's own compaction does, soo the auto one waits its interval
-            if let Ok(conn) = db::open_at(&paths::database()) {
+            // never made here: an empty main database would pass for the real one
+            if let Ok(conn) = db::open_shard(&paths::database()) {
                 let _ = store::set_meta(&conn, "last_compact", chrono::Utc::now().timestamp());
             }
             0

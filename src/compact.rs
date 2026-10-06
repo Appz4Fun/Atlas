@@ -272,6 +272,15 @@ fn interruptible(conn: &Connection, stop: &Arc<AtomicBool>) -> Result<()> {
 /// `stop` is set, shards not done are left as they were (and an error says so).
 pub fn run(main: &Path, progress: &(dyn Fn(&str) + Sync), stop: &Arc<AtomicBool>) -> Result<Shrunk> {
     let _lock = Lock::take(main)?;
+    // a conversion's swap cut short is finished (or undone) like at a start;
+    // shards with no main database at all are refused: the main database
+    // the next start made would hand out their ids again
+    if let Some(said) = crate::convert::recover_cut_swap(main)? {
+        progress(&said);
+    }
+    if !main.try_exists()? && store::exists(main) {
+        bail!("{} is missing but its shards are there; put it back from a backup first", main.display());
+    }
     for line in recover_cut_swaps(main)? {
         progress(&line);
     }
