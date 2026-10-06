@@ -48,9 +48,10 @@ pub struct GroupRunState {
     pub no_split_until: Option<Instant>,
     /// a split group's servers are looked at for older days again then
     pub reach_back_after: Option<Instant>,
-    /// per server, the oldest day it keeps of the group (as found by a day
-    /// chunk too old for it), until it's looked at again
-    pub keeps_from: HashMap<usize, (i64, Instant)>,
+    /// per server host (not its place in the pool, which a config reload can
+    /// give to another), the oldest day it keeps of the group (as found by a
+    /// day chunk too old for it), until it's looked at again
+    pub keeps_from: HashMap<String, (i64, Instant)>,
 }
 
 impl Default for GroupRunState {
@@ -88,23 +89,26 @@ impl RunStates {
         groups.iter().all(|g| states.get(g).is_some_and(|s| s.idle))
     }
 
-    /// The oldest day `server` keeps of `group`, `i64::MIN` when not known.
-    pub fn keeps_from(&self, group: &str, server: usize) -> i64 {
+    /// The oldest day the server `host` keeps of `group`, `i64::MIN` when not known.
+    pub fn keeps_from(&self, group: &str, host: &str) -> i64 {
         let now = Instant::now();
         let states = self.0.lock().unwrap();
-        let found = states.get(group).and_then(|s| s.keeps_from.get(&server));
+        let found = states.get(group).and_then(|s| s.keeps_from.get(host));
         found.filter(|(_, until)| *until > now).map_or(i64::MIN, |(day, _)| *day)
     }
 
-    /// The groups whose oldest day on `server` is known, with that day.
-    pub fn kept_days(&self, server: usize) -> HashMap<String, i64> {
+    /// Note `day` as the oldest the server `host` keeps of `group`, until it's looked at again.
+    fn keep_from(&self, group: &str, host: &str, day: i64) {
+        self.with(group, |st| st.keeps_from.insert(host.to_string(), (day, Instant::now() + KEEPS_RECHECK)));
+    }
+
+    /// The groups whose oldest day on the server `host` is known, with that day.
+    pub fn kept_days(&self, host: &str) -> HashMap<String, i64> {
         let now = Instant::now();
         let states = self.0.lock().unwrap();
         states
             .iter()
-            .filter_map(|(g, s)| {
-                s.keeps_from.get(&server).filter(|(_, until)| *until > now).map(|(d, _)| (g.clone(), *d))
-            })
+            .filter_map(|(g, s)| s.keeps_from.get(host).filter(|(_, until)| *until > now).map(|(d, _)| (g.clone(), *d)))
             .collect()
     }
 
@@ -419,7 +423,7 @@ where
     {
         // a split group's backfill is day chunks, this server takes the next one
         let host = ctx.pool.host(server);
-        let wanted = [(group.to_string(), ctx.states.keeps_from(group, server))];
+        let wanted = [(group.to_string(), ctx.states.keeps_from(group, &host))];
         let claimed =
             on_db(db, move |conn| Ok(crate::chunks::claim(conn, &wanted, &host, chrono::Utc::now().timestamp())?))
                 .await?;
@@ -792,8 +796,8 @@ where
     if !keeps_day {
         // the first day it keeps whole
         let oldest_day = oldest.map_or(i64::MAX, |t| crate::chunks::unix_day(t - 1) + 1);
-        ctx.states.with(group, |st| st.keeps_from.insert(server, (oldest_day, Instant::now() + KEEPS_RECHECK)));
         let host = ctx.pool.host(server);
+        ctx.states.keep_from(group, &host, oldest_day);
         println!("[CHUNK] {group} day {day} is older than {host} keeps, leaving it to the other servers");
         return failed(TooOld { group: group.to_string(), host, oldest_day }.into()).await;
     }
@@ -1224,6 +1228,17 @@ impl Indexer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn what_a_server_keeps_is_remembered_by_its_host_not_its_place_in_the_pool() {
+        let states = RunStates::default();
+        // index 0 was a.example when this was learned; a config reload put b.example there
+        states.keep_from("alt.binaries.g", "a.example", 20_000);
+        assert_eq!(states.keeps_from("alt.binaries.g", "a.example"), 20_000);
+        assert_eq!(states.kept_days("a.example"), HashMap::from([("alt.binaries.g".to_string(), 20_000)]));
+        assert_eq!(states.keeps_from("alt.binaries.g", "b.example"), i64::MIN, "b is not restricted");
+        assert!(states.kept_days("b.example").is_empty());
+    }
 
     #[test]
     fn slices_cover_the_range() {

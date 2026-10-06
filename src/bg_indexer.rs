@@ -481,7 +481,7 @@ async fn take_chunk(sched: &Scheduler, server: usize, db: &Db) -> Option<crate::
         return None;
     }
 
-    let oldest = sched.ctx.states.kept_days(server);
+    let oldest = sched.ctx.states.kept_days(&host);
     match crate::indexer::claim_chunk(db, host, groups, oldest).await {
         Ok(chunk) => chunk,
         Err(e) => {

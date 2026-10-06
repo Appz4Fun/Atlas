@@ -421,7 +421,7 @@ fn a_day_older_than_the_server_keeps_is_given_back() {
     let err = run(first_day - 1).unwrap_err();
     let too_old = err.downcast_ref::<atlas::indexer::TooOld>().expect("a TooOld");
     assert_eq!(too_old.oldest_day, first_day);
-    assert_eq!(ctx.states.keeps_from(GROUP, 0), first_day, "remembered for the next claims");
+    assert_eq!(ctx.states.keeps_from(GROUP, &pool.pool.host(0)), first_day, "remembered for the next claims");
     let empty = run(first_day + 1).unwrap();
     assert_eq!(empty.articles, 2, "only the overlap hours");
     let conn = atlas::db::open_at(&main).unwrap();
