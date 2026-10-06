@@ -431,11 +431,12 @@ fn a_day_older_than_the_server_keeps_is_given_back() {
     let empty = run(first_day + 1).unwrap();
     assert_eq!(empty.articles, 2, "only the overlap hours");
     let conn = atlas::db::open_at(&main).unwrap();
-    let state = |day: i64| -> i64 {
-        conn.query_row("select state from backfill_chunks where day = ?", [day], |r| r.get(0)).unwrap()
+    let state = |day: i64| -> Option<i64> {
+        conn.query_row("select state from backfill_chunks where day = ?", [day], |r| r.get(0)).ok()
     };
-    assert_eq!(state(first_day - 1), 0, "given back, still pending");
-    assert_eq!(state(first_day + 1), 2, "an empty day it keeps is done");
+    // the only server: no server has a post that old, the day is dropped
+    assert_eq!(state(first_day - 1), None, "before every server's first post, dropped");
+    assert_eq!(state(first_day + 1), Some(2), "an empty day it keeps is done");
 }
 
 /// Stopping drops a chunk part way (here on a request stuck on the network):

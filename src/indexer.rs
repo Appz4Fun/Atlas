@@ -52,6 +52,9 @@ pub struct GroupRunState {
     /// give to another), the oldest day it keeps of the group (as found by a
     /// day chunk too old for it), until it's looked at again
     pub keeps_from: HashMap<String, (i64, Instant)>,
+    /// likewise the day of its first post, `i64::MAX` when it has none or
+    /// doesnt carry the group (see `drop_unkept_days`)
+    pub first_post_days: HashMap<String, (i64, Instant)>,
 }
 
 impl Default for GroupRunState {
@@ -63,6 +66,7 @@ impl Default for GroupRunState {
             no_split_until: None,
             reach_back_after: None,
             keeps_from: HashMap::new(),
+            first_post_days: HashMap::new(),
         }
     }
 }
@@ -100,6 +104,20 @@ impl RunStates {
     /// Note `day` as the oldest the server `host` keeps of `group`, until it's looked at again.
     fn keep_from(&self, group: &str, host: &str, day: i64) {
         self.with(group, |st| st.keeps_from.insert(host.to_string(), (day, Instant::now() + KEEPS_RECHECK)));
+    }
+
+    /// Note `day` as the day of the server `host`'s first post of `group`,
+    /// until it's looked at again.
+    fn first_post_on(&self, group: &str, host: &str, day: i64) {
+        self.with(group, |st| st.first_post_days.insert(host.to_string(), (day, Instant::now() + KEEPS_RECHECK)));
+    }
+
+    /// The day of the server `host`'s first post of `group`, `i64::MIN` when not known.
+    fn first_post_day(&self, group: &str, host: &str) -> i64 {
+        let now = Instant::now();
+        let states = self.0.lock().unwrap();
+        let found = states.get(group).and_then(|s| s.first_post_days.get(host));
+        found.filter(|(_, until)| *until > now).map_or(i64::MIN, |(day, _)| *day)
     }
 
     /// The groups whose oldest day on the server `host` is known, with that day.
@@ -677,6 +695,25 @@ fn split_bounds(newest: &Newest, home_oldest: i64, oldest_at: i64, today: i64) -
     (oldest_day >= SPLIT_OLDEST_DAY && newest_day >= oldest_day).then_some((newest_day, oldest_day))
 }
 
+/// Once every indexing server turned a day chunk of `group` down as too old
+/// for it, drop its chunks of days before the first post of all of them:
+/// no server has anything from those, and a split made from forged first
+/// dates can reach back years. Left alone, those chunks wait for a server
+/// forever and the split never completes (its sweeps never run). Best
+/// effort: a failure is only logged.
+async fn drop_unkept_days(ctx: &PassContext, db: &Db, group: &str) {
+    let first =
+        ctx.pool.indexing_servers().into_iter().map(|i| ctx.states.first_post_day(group, &ctx.pool.host(i))).min();
+    // i64::MIN: a server not asked yet (or a while ago)
+    let Some(first) = first.filter(|&d| d != i64::MIN) else { return };
+    let g = group.to_string();
+    match on_db(db, move |conn| Ok(crate::chunks::drop_before(conn, &g, first)?)).await {
+        Ok(0) => {}
+        Ok(n) => println!("[CHUNK] {group}: {n} days older than any server keeps, dropped (forged Date headers?)"),
+        Err(e) => println!("[CHUNK] {group}: couldnt drop the days no server keeps: {e:#}"),
+    }
+}
+
 /// A day chunk's server doesnt carry its group (GROUP answered 411).
 #[derive(Debug)]
 pub struct NotCarried {
@@ -905,6 +942,8 @@ where
     let found = match ctx.pool.group_on(server, group).await {
         Ok(info) => info,
         Err(e) if e.code() == Some(411) => {
+            // it has no post of it (see `drop_unkept_days`)
+            ctx.states.first_post_on(group, &ctx.pool.host(server), i64::MAX);
             // if it was noted as going back furthest, the oldest day goes to the next one
             let (g, host) = (group.to_string(), ctx.pool.host(server));
             if let Err(e) = on_db(db, move |conn| Ok(crate::chunks::forget_deepest(conn, &g, &host)?)).await {
@@ -964,6 +1003,7 @@ where
         let oldest_day = keeps_from.map_or(i64::MAX, |t| crate::chunks::unix_day(t - 1) + 1);
         let host = ctx.pool.host(server);
         ctx.states.keep_from(group, &host, oldest_day);
+        ctx.states.first_post_on(group, &host, oldest.map_or(i64::MAX, crate::chunks::unix_day));
         println!("[CHUNK] {group} day {day} is older than {host} keeps, leaving it to the other servers");
         // a server that doesnt keep this day keeps none of the split's oldest
         // either: if it was noted as going back furthest, its retention moved
@@ -972,6 +1012,7 @@ where
         if let Err(e) = on_db(db, move |conn| Ok(crate::chunks::forget_deepest(conn, &g, &h)?)).await {
             println!("[CHUNK] {group}: couldnt forget the server going back furthest: {e:#}");
         }
+        drop_unkept_days(ctx, db, group).await;
         return failed(TooOld { group: group.to_string(), host, oldest_day }.into()).await;
     }
     // the split's days and, for its newest, how far down this server's

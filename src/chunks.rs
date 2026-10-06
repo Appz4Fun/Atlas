@@ -123,6 +123,17 @@ pub fn reach_back(conn: &Connection, group: &str, oldest_day: i64, oldest_at: i6
     Ok(added + redo)
 }
 
+/// Drop split `group`'s chunks older than `day` that arent done: days no
+/// carrier keeps (a split reaching back that far was made from forged
+/// dates), which would wait for a server forever and keep the split from
+/// completing. Returns the chunks dropped.
+pub fn drop_before(conn: &Connection, group: &str, day: i64) -> Result<usize> {
+    conn.execute(
+        &format!("delete from backfill_chunks where grp = ? and day < ? and state != {DONE}"),
+        params![group, day],
+    )
+}
+
 /// Check if a group has any chunks in backfill.
 pub fn is_split(conn: &Connection, group: &str) -> Result<bool> {
     conn.prepare_cached("select 1 from backfill_chunks where grp = ? limit 1")?.exists([group])
@@ -426,6 +437,18 @@ mod tests {
         assert_eq!(reach_back(&c, "g", 9, 9 * 86_400).unwrap(), 2);
         assert!(!swept(&c, "g", "b").unwrap(), "to sweep again");
         assert!(swept(&c, "other", "b").unwrap(), "other groups' sweeps stay");
+    }
+
+    #[test]
+    fn days_before_are_dropped_unless_done() {
+        let c = conn();
+        add(&c, "g", 12, 5).unwrap();
+        add(&c, "h", 12, 5).unwrap();
+        c.execute("update backfill_chunks set state = 2 where grp = 'g' and day = 6", []).unwrap();
+        claim(&c, &[("g".to_string(), i64::MIN)], "a", 1000).unwrap();
+        assert_eq!(drop_before(&c, "g", 8).unwrap(), 2, "days 5 and 7");
+        assert_eq!(oldest_day(&c, "g").unwrap(), Some(6), "a done day stays");
+        assert_eq!(progress(&c, "h").unwrap(), (0, 8), "other groups untouched");
     }
 
     #[test]
