@@ -862,24 +862,18 @@ pub fn run() -> i32 {
     // one time move of an older database into the shards, here and not in the
     // menu because it takes a while on a big one. the menu shows the progress
     let main = paths::database();
-    if crate::convert::needed(&main) {
-        let report = |msg: &str| {
-            println!("{msg}");
-            write_status(true, msg, &config.index_mode, false, "running", false, 0);
-        };
-        match crate::convert::run(&main, &report) {
-            Ok(_) => {}
-            Err(e) => {
-                ui::error(&format!("couldnt convert the database, nothing was changed: {e:#}"));
-                write_status(false, "", &config.index_mode, false, "stopped", true, 1);
-                return 1;
-            }
-        }
-        if let Err(e) = db::create_db_at(&main) {
-            ui::error(&format!("couldnt open the converted database: {e:#}"));
+    let report = |msg: &str| {
+        println!("{msg}");
+        write_status(true, msg, &config.index_mode, false, "running", false, 0);
+    };
+    let writing = match convert_at_start(&main, writing, &report) {
+        Ok(held) => held,
+        Err(e) => {
+            ui::error(&format!("not indexing: {e:#}"));
+            write_status(false, "", &config.index_mode, false, "stopped", true, 1);
             return 1;
         }
-    }
+    };
 
     let stop = Arc::new(AtomicBool::new(false));
 
@@ -890,6 +884,26 @@ pub fn run() -> i32 {
     }
 
     index(config, stop, Some(writing))
+}
+
+/// The one time move into the shards at start, if `main` needs it, with
+/// `setup` the hold taken for setting up. Returns the hold to index under.
+/// The conversion runs alone, under the exclusive lock (`convert::run_alone`):
+/// another indexer starting, or a `--convert`, mustnt convert alongside it.
+/// The setup hold is let go for it, and taken again after, setting up the
+/// converted database: refused if a compaction got in between.
+pub fn convert_at_start(
+    main: &std::path::Path,
+    setup: WriteGuard,
+    report: &dyn Fn(&str),
+) -> anyhow::Result<WriteGuard> {
+    use anyhow::Context as _;
+    if !crate::convert::needed(main) {
+        return Ok(setup);
+    }
+    drop(setup);
+    crate::convert::run_alone(main, report).context("couldnt convert the database, nothing was changed")?;
+    db::create_db_holding(main)?.ok_or_else(|| anyhow::anyhow!("the database is being compacted; try again later"))
 }
 
 /// The indexing loop from `run`, stopping once `stop` is set (tests set it

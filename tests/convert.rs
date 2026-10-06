@@ -282,3 +282,39 @@ fn a_conversion_runs_alone() {
     assert!(!convert::needed(&main), "the first one finished");
     assert_eq!(convert::run_alone(&main, &|_| {}).unwrap(), None, "nothing left to convert");
 }
+
+/// The indexer converting at start has the database to itself for the
+/// conversion too: refused while another indexer or a `--convert` holds it,
+/// and once converted it holds off compaction for indexing.
+#[test]
+fn an_indexer_converting_at_start_runs_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = dir.path().join("atlas.db");
+    old_database(&main);
+    let setup = || db::create_db_holding(&main).unwrap().unwrap();
+    let new_main = dir.path().join("atlas.new.db");
+
+    // another indexer that set up at the same time
+    let other = atlas::compact::try_hold_off_compaction(&main).unwrap().unwrap();
+    let err = atlas::bg_indexer::convert_at_start(&main, setup(), &|_| {}).err().expect("converted alongside another");
+    assert!(format!("{err:#}").contains("in use"), "{err:#}");
+    assert!(convert::needed(&main) && !new_main.exists(), "nothing was done");
+    drop(other);
+
+    // a `--convert` running
+    let converting = std::cell::RefCell::new(None);
+    let indexing = atlas::bg_indexer::convert_at_start(&main, setup(), &|_| {
+        if converting.borrow().is_none() {
+            *converting.borrow_mut() = Some(convert::run_alone(&main, &|_| {}).map(|_| ()));
+        }
+    })
+    .expect("the indexer converted");
+    let err = converting.into_inner().unwrap().expect_err("--convert ran alongside the indexer's conversion");
+    assert!(format!("{err:#}").contains("in use"), "{err:#}");
+    assert!(!convert::needed(&main));
+
+    // indexing holds off a compaction, and nothing more is converted
+    assert!(convert::run_alone(&main, &|_| {}).is_err(), "the indexing hold is held");
+    drop(indexing);
+    assert_eq!(convert::run_alone(&main, &|_| {}).unwrap(), None);
+}
