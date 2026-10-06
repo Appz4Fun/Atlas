@@ -150,7 +150,8 @@ pub fn create_db_holding(path: &Path) -> anyhow::Result<Option<WriteGuard>> {
 }
 
 /// Settings > wipe: every shard, with their sidecars and what a compaction
-/// leaves (`.compact.db`, `.precompact.db`), a conversion's `atlas.old.db`
+/// leaves (`.compact.db`, `.precompact.db`, and its scratch `.domains.db`
+/// and `.compact.check.db`), a conversion's `atlas.old.db`
 /// and `atlas.new.db`, then the main database. Under
 /// the exclusive compaction lock, soo refused (`Busy`) while the indexer, a
 /// write from outside it or a compaction has the database. Leaves nothing to
@@ -162,7 +163,10 @@ pub fn wipe(main: &Path) -> anyhow::Result<()> {
     let _exclusive = crate::compact::Lock::take(main)?;
     let mut dbs = Vec::new();
     for shard in store::shard_paths(main) {
-        dbs.push(crate::compact::with_suffix(&shard, "compact"));
+        let copy = crate::compact::with_suffix(&shard, "compact");
+        dbs.push(crate::compact::with_suffix(&copy, "check"));
+        dbs.push(copy);
+        dbs.push(crate::compact::with_suffix(&shard, "domains"));
         dbs.push(crate::compact::with_suffix(&shard, "precompact"));
         dbs.push(shard);
     }
@@ -731,6 +735,14 @@ mod tests {
         let leftovers = [
             crate::compact::with_suffix(&shard, "compact"),
             crate::compact::with_suffix(&shard, "precompact"),
+            // a compaction's scratch: the domain counts and a release check
+            crate::compact::with_suffix(&shard, "domains"),
+            PathBuf::from(format!("{}-wal", crate::compact::with_suffix(&shard, "domains").display())),
+            crate::compact::with_suffix(&crate::compact::with_suffix(&shard, "compact"), "check"),
+            PathBuf::from(format!(
+                "{}-journal",
+                crate::compact::with_suffix(&crate::compact::with_suffix(&shard, "compact"), "check").display()
+            )),
             PathBuf::from(format!("{}-wal", shard.display())),
             PathBuf::from(format!("{}-shm", shard.display())),
         ];
