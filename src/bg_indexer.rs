@@ -763,7 +763,8 @@ async fn supervise(stop: Arc<AtomicBool>, stats: Arc<Mutex<Stats>>, writing: Opt
 
     while !stopping() {
         let Some(config) = load_config() else {
-            ui::error("error with config, stopped");
+            let why = crate::config::file_problem().unwrap_or_else(|| "config.json not found".into());
+            ui::error(&format!("error with config, stopped: {why}"));
             break;
         };
 
@@ -819,7 +820,10 @@ async fn supervise(stop: Arc<AtomicBool>, stats: Arc<Mutex<Stats>>, writing: Opt
 
 pub fn run() -> i32 {
     let Some(config) = load_config().filter(|c| !c.servers.is_empty()) else {
-        println!("no valid config");
+        match crate::config::file_problem() {
+            Some(problem) => println!("{problem}"),
+            None => println!("no valid config"),
+        }
         return 1;
     };
 

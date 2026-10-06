@@ -720,6 +720,11 @@ pub fn main_menu() -> i32 {
         }
     }
 
+    // a config.json that's there but broken isnt missing: setup would write over it
+    if let Some(problem) = crate::config::file_problem() {
+        ui::error(&format!("{problem}. fix it and start atlas again"));
+        return 1;
+    }
     let mut config = match load_config() {
         Some(c) if !c.servers.is_empty() => c,
         other => {
@@ -832,6 +837,10 @@ pub fn main_menu() -> i32 {
 }
 
 pub fn selftest() -> i32 {
+    if let Some(problem) = crate::config::file_problem() {
+        println!("selftest: {problem}");
+        return 1;
+    }
     let Some(cfg) = load_config() else {
         println!("selftest: no config found (run Settings or set ATLAS_NNTP_* env)");
         return 1;

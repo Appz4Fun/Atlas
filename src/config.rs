@@ -341,6 +341,24 @@ fn env_creds_active() -> bool {
     ["ATLAS_NNTP_HOST", "ATLAS_NNTP_USER", "ATLAS_NNTP_PASS"].iter().all(|k| env_nonempty(k).is_some())
 }
 
+/// Why config.json cant be used though it's there, see `file_problem_at`.
+pub fn file_problem() -> Option<String> {
+    file_problem_at(&config_file())
+}
+
+/// Why the config file at `path` cant be used though it's there: it cant be
+/// read, or isnt valid JSON (where, as serde_json says, never the text: it
+/// holds passwords). None when it's fine, or isnt there at all.
+pub fn file_problem_at(path: &std::path::Path) -> Option<String> {
+    match fs::read_to_string(path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+        Err(e) => Some(format!("couldnt read {}: {e}", path.display())),
+        Ok(text) => {
+            serde_json::from_str::<Value>(&text).err().map(|e| format!("{} isnt valid JSON: {e}", path.display()))
+        }
+    }
+}
+
 fn read_file() -> Option<Value> {
     let text = fs::read_to_string(config_file()).ok()?;
     serde_json::from_str(&text).ok()
@@ -597,6 +615,24 @@ mod tests {
         assert_eq!(cfg.api_host, "127.0.0.1");
         assert_eq!(cfg.index_mode, "dynamic");
         assert_eq!(cfg.max_unsaved_headers(), DEFAULT_MAX_UNSAVED_HEADERS as usize);
+    }
+
+    #[test]
+    fn an_invalid_config_says_where_without_its_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        assert_eq!(file_problem_at(&path), None, "missing isnt a problem: setup offers to make one");
+
+        // a trailing comma after the last server
+        std::fs::write(&path, "{\n  \"usenet_servers\": [{\"host\": \"news.x\", \"password\": \"hunter2\"},]\n}\n")
+            .unwrap();
+        let problem = file_problem_at(&path).expect("a trailing comma is a problem");
+        assert!(problem.contains(&path.display().to_string()), "{problem}");
+        assert!(problem.contains("trailing comma at line 2 column"), "{problem}");
+        assert!(!problem.contains("hunter2") && !problem.contains("news.x"), "no file contents: {problem}");
+
+        std::fs::write(&path, "{\"groups\": []}").unwrap();
+        assert_eq!(file_problem_at(&path), None);
     }
 
     #[test]
