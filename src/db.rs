@@ -202,15 +202,36 @@ pub fn create_db_at(path: &Path) -> anyhow::Result<()> {
         return Ok(migrate_old(&conn)?);
     }
 
+    // a main database that has been used (cursors, ids handed out) is not a
+    // new install, whatever shards are there
+    let used = has_progress(&conn)?;
     store::create_main(&conn)?;
-    create_shards(path)
+    create_shards(path, used)
+}
+
+/// Whether the main database holds indexing progress: cursors or ids handed
+/// out for releases. The shards hold what those stand for.
+fn has_progress(conn: &Connection) -> Result<bool> {
+    if conn.prepare("select 1 from main.groups")?.exists([])? {
+        return Ok(true);
+    }
+    let has_meta =
+        conn.prepare("select 1 from main.sqlite_master where type = 'table' and name = 'meta'")?.exists([])?;
+    if !has_meta {
+        return Ok(false);
+    }
+    let next: Option<i64> =
+        conn.query_row("select value from main.meta where key = 'next_seq'", [], |r| r.get(0)).optional()?;
+    Ok(next.is_some_and(|n| n > 1))
 }
 
 /// Every shard of `main`, made if new, once the ones a compaction was cut
 /// short swapping are back. One missing while others are there is refused
 /// rather than made empty: searches would miss what it held, and new
-/// releases would go into the empty one.
-fn create_shards(main: &Path) -> anyhow::Result<()> {
+/// releases would go into the empty one. The same when all are missing from a
+/// main database that `used` (has progress): its cursors would skip what the
+/// shards held. Only a main database new to this setup gets all of them new.
+fn create_shards(main: &Path, used: bool) -> anyhow::Result<()> {
     for line in crate::compact::recover_cut_swaps(main)? {
         crate::ui::warn(&line);
     }
@@ -221,7 +242,7 @@ fn create_shards(main: &Path) -> anyhow::Result<()> {
             missing.push(path);
         }
     }
-    if !missing.is_empty() && missing.len() < shards.len() {
+    if !missing.is_empty() && (missing.len() < shards.len() || used) {
         let each: Vec<String> = missing
             .iter()
             .map(|p| {
@@ -234,7 +255,7 @@ fn create_shards(main: &Path) -> anyhow::Result<()> {
             })
             .collect();
         anyhow::bail!(
-            "shards missing while the others are there: {}. not making empty ones in their place; put them back first",
+            "shards missing from a database in use: {}. not making empty ones in their place; put them back first",
             each.join(", ")
         );
     }
@@ -718,5 +739,45 @@ mod tests {
         std::fs::remove_dir(&stuck).unwrap();
         wipe(&main).unwrap();
         assert!(!main.exists());
+    }
+
+    #[test]
+    fn a_used_main_database_without_any_shard_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        create_db_at(&main).unwrap();
+        init_group_state(&open_at(&main).unwrap(), "alt.binaries.a@news.x", 500).unwrap();
+        let shards = store::shard_paths(&main);
+        for shard in &shards {
+            std::fs::remove_file(shard).unwrap();
+        }
+
+        // its cursors are past what the empty shards would hold
+        let err = create_db_at(&main).expect_err("not a new install");
+        let err = format!("{err:#}");
+        assert!(shards.iter().all(|s| err.contains(&s.display().to_string())), "{err}");
+        assert!(shards.iter().all(|s| !s.exists()), "no empty shards made");
+
+        // the same when only the ids were handed out
+        std::fs::remove_file(&main).unwrap();
+        create_db_at(&main).unwrap();
+        store::set_next_seq(&open_at(&main).unwrap(), 50).unwrap();
+        for shard in &shards {
+            std::fs::remove_file(shard).unwrap();
+        }
+        create_db_at(&main).expect_err("ids were handed out");
+    }
+
+    #[test]
+    fn a_main_database_with_nothing_in_it_gets_its_shards() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        create_db_at(&main).unwrap();
+        for shard in store::shard_paths(&main) {
+            std::fs::remove_file(shard).unwrap();
+        }
+        // a setup cut short before the shards
+        create_db_at(&main).unwrap();
+        assert!(store::shard_paths(&main).iter().all(|s| s.exists()));
     }
 }
