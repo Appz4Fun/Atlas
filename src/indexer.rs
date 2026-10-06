@@ -912,6 +912,22 @@ impl Drop for GiveBackOnDrop<'_> {
     }
 }
 
+/// A day chunk of `group` that only one server claims to have (its dates
+/// reach back further than any other's) came out with no article dated in
+/// that day: its dates went back further than its articles do (forged), and
+/// each older day would take a chunk to find that out again. They are dropped; what those days hold is
+/// the sweeps' (see `run_sweep`). Best effort: a failure is only logged.
+async fn drop_older_days(db: &Db, group: &str, day: i64) {
+    let g = group.to_string();
+    match on_db(db, move |conn| Ok(crate::chunks::drop_before(conn, &g, day)?)).await {
+        Ok(0) => {}
+        Ok(n) => {
+            println!("[CHUNK] {group} day {day} has no article dated in it, the {n} older days are left to the sweeps")
+        }
+        Err(e) => println!("[CHUNK] {group}: couldnt drop the days older than an empty one: {e:#}"),
+    }
+}
+
 async fn index_chunk<P>(
     ctx: &PassContext,
     settings: &PassSettings,
@@ -977,12 +993,21 @@ where
     };
     // from when the server is taken to keep days whole
     let mut keeps_from = oldest;
+    // every carrier's first post is noted, a day it keeps or not: a forged
+    // run in the dates must not leave `drop_unkept_days` without evidence
+    ctx.states.first_post_on(group, &ctx.pool.host(server), oldest.map_or(i64::MAX, crate::chunks::unix_day));
+    // this day is older than any other server goes back: only this server
+    // may have it, on the word of its own (forgeable) dates
+    let mut alone = false;
     let keeps_day = match oldest {
         // a day older than the second furthest server goes back is the
         // furthest one's alone: a server only looks deep enough by the dates
         // its posters set
         Some(t) if t <= day * 86_400 => match goes_back_furthest(ctx, db, group, server, (t, sure)).await {
-            Ok((true, _)) => true,
+            Ok((true, runner_up)) => {
+                alone = runner_up.is_none_or(|r| r >= (day + 1) * 86_400);
+                true
+            }
             Ok((false, runner_up)) => {
                 keeps_from = keeps_from.max(runner_up);
                 runner_up.is_none_or(|r| r <= day * 86_400)
@@ -1043,16 +1068,23 @@ where
         };
     if start > end {
         finish().await?;
+        if alone {
+            drop_older_days(db, group, day).await;
+        }
         return Ok(Progress::default());
     }
 
     let pass = Pass { ctx, settings, db, group, server, key: cursor_key(&ctx.pool, server, group) };
-    match pass.process_range(start as i64, end as i64, "CHUNK", progress).await {
-        Ok((saved, true)) => {
+    let window = alone.then_some((day * 86_400, (day + 1) * 86_400));
+    match pass.process_range_dated(start as i64, end as i64, "CHUNK", window, progress).await {
+        Ok((saved, true, corroborated)) => {
             finish().await?;
+            if alone && !corroborated {
+                drop_older_days(db, group, day).await;
+            }
             Ok(saved)
         }
-        Ok((saved, false)) => {
+        Ok((saved, false, _)) => {
             release().await?;
             Ok(saved)
         }
@@ -1260,6 +1292,24 @@ impl Pass<'_> {
     where
         P: FnMut(&Progress) + ?Sized,
     {
+        let (saved, complete, _) = self.process_range_dated(start, end, kind, None, progress).await?;
+        Ok((saved, complete))
+    }
+
+    /// `process_range`, also whether any article retrieved is dated within
+    /// `window` (unix seconds, from up to before), false when there is none.
+    async fn process_range_dated<P>(
+        &self,
+        start: i64,
+        end: i64,
+        kind: &str,
+        window: Option<(i64, i64)>,
+        progress: &mut P,
+    ) -> Result<(Progress, bool, bool)>
+    where
+        P: FnMut(&Progress) + ?Sized,
+    {
+        let mut in_window = false;
         let (pool, group) = (&self.ctx.pool, self.group);
         // no slice bigger than the whole unsaved budget: it would hold more
         // headers than the cap allows
@@ -1302,6 +1352,11 @@ impl Pass<'_> {
                 continue;
             }
 
+            if let Some((from, to)) = window.filter(|_| !in_window) {
+                in_window = headers
+                    .iter()
+                    .any(|h| crate::dates::posted_timestamp(&h.date).is_some_and(|t| (from..to).contains(&t)));
+            }
             let dated = slice_date(&headers);
             match save_slice(pool, self.db, group, headers).await {
                 Ok(p) => {
@@ -1341,7 +1396,7 @@ impl Pass<'_> {
         }
 
         // stopped early: what got saved stays, the cursor waits for the rest
-        Ok((saved, done == total))
+        Ok((saved, done == total, in_window))
     }
 }
 
