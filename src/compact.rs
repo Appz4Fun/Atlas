@@ -504,9 +504,15 @@ fn compact_shard(
             // it goes before the blob is counted, the way `seal_rows` drops it
             if !segs.is_empty() {
                 let held: HashSet<(&[u8], i64)> = segs.iter().map(|s| (s.local.as_slice(), s.domain)).collect();
-                let had = file_rows.len();
-                file_rows.retain(|r| !held.contains(&(r.local.as_slice(), r.domain)));
-                copies += (had - file_rows.len()) as i64;
+                let (dropped, kept): (Vec<Row>, Vec<Row>) =
+                    file_rows.into_iter().partition(|r| held.contains(&(r.local.as_slice(), r.domain)));
+                file_rows = kept;
+                if !dropped.is_empty() {
+                    // out of the release's and the shard's totals too, copied as they were
+                    let bytes = dropped.iter().map(|r| r.bytes.unwrap_or(0)).sum();
+                    store::uncount_copies(&tx, f.get(1)?, bytes, dropped.len() as i64)?;
+                    copies += dropped.len() as i64;
+                }
             }
 
             // rows a blob cant hold exactly (a negative part, no size) stay rows
@@ -1095,6 +1101,19 @@ mod tests {
         assert_eq!(blob_segs_with_known_domains(&main).len() as i64, count);
     }
 
+    /// `file`'s release's size and parts, and its shard's article total
+    fn release_totals(shard: &Path, file: i64) -> (i64, i64, i64) {
+        db::open_at(shard)
+            .unwrap()
+            .query_row(
+                "select r.size, r.parts, (select value from meta where key = 'articles')
+                 from releases r join files f on f.release_id = r.id where f.id = ?",
+                [file],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap()
+    }
+
     /// A loose row a sealed file's blob already has (same message-id) goes
     /// when compaction seals the file, instead of becoming a second copy in
     /// the blob for good.
@@ -1108,6 +1127,7 @@ mod tests {
         let count = article_total(&main);
 
         let (path, file) = file_of(&main, "Rel.1", "alt.binaries.g1");
+        let once = release_totals(&path, file);
         {
             let conn = db::open_at(&path).unwrap();
             let blob: Vec<u8> = conn.query_row("select blob from files where id = ?", [file], |r| r.get(0)).unwrap();
@@ -1118,11 +1138,20 @@ mod tests {
             )
             .unwrap();
             conn.execute("update files set touched_at = 0 where id = ?", [file]).unwrap();
+            // counted the way a save past its decode budget counts it
+            conn.execute(
+                "update releases set size = size + ?, parts = parts + 1
+                 where id = (select release_id from files where id = ?)",
+                params![seg.bytes, file],
+            )
+            .unwrap();
+            store::add_totals(&conn, 0, 1).unwrap();
         }
         assert_eq!(article_total(&main), count + 1);
 
         run(&main, &|_| {}, &no_stop()).unwrap();
         assert_eq!(article_total(&main), count, "the copy went, not into the blob");
+        assert_eq!(release_totals(&path, file), once, "and out of its release's and the shard's totals");
         assert_eq!(loose(&main), 0);
         assert_eq!(all_articles(&main), before, "every NZB reads back the same");
     }

@@ -717,6 +717,11 @@ fn seal_rows(conn: &Connection, file_id: i64) -> Result<usize> {
         conn.prepare_cached("delete from segments where file_id = ? and local = ? and domain = ?")?
             .execute(params![file_id, copy.local, copy.domain])?;
     }
+    if !copies.is_empty() {
+        let release_id: i64 =
+            conn.prepare_cached("select release_id from files where id = ?")?.query_row([file_id], |r| r.get(0))?;
+        uncount_copies(conn, release_id, copies.iter().map(|c| c.bytes).sum(), copies.len() as i64)?;
+    }
     // too much for one blob in memory: the rest stays rows, the blob as it is
     if segs.len() + rows.len() > SEAL_MAX_SEGMENTS as usize {
         return Ok(0);
@@ -1130,6 +1135,16 @@ pub(crate) fn add_totals(conn: &Connection, releases: i64, articles: i64) -> Res
         stmt.execute(params![releases, "releases"])?;
         stmt.execute(params![articles, "articles"])?;
     }
+    Ok(())
+}
+
+/// Take `count` dropped copies of `bytes` in all out of release
+/// `release_id`'s size and parts and the shard's article total: the save
+/// that kept them as rows counted them (see `SealedCache`).
+pub(crate) fn uncount_copies(conn: &Connection, release_id: i64, bytes: i64, count: i64) -> Result<()> {
+    conn.prepare_cached("update releases set size = size - ?, parts = parts - ? where id = ?")?
+        .execute(params![bytes, count, release_id])?;
+    conn.prepare_cached("update meta set value = value - ? where key = 'articles'")?.execute([count])?;
     Ok(())
 }
 
@@ -1640,6 +1655,46 @@ mod tests {
         )
         .unwrap();
         assert_eq!(seal_file(&conn, a).unwrap(), 3, "the copy isnt added");
+    }
+
+    /// A copy saved as a row counted in its release's size and parts and the
+    /// shard's article total: dropping it when the file is sealed again
+    /// takes it out of them too, back to what one copy gives.
+    #[test]
+    fn dropping_a_copy_takes_it_out_of_the_release_and_shard_totals() {
+        let (_dir, main) = sealed_fixture();
+        let conn = db::open_at(&shard_path(&main, shard_of("alt.binaries.t"))).unwrap();
+        let a: i64 = conn.query_row("select id from files where filename = 'a.rar'", [], |r| r.get(0)).unwrap();
+        seal_file(&conn, a).unwrap();
+        let totals = || -> (i64, i64, i64) {
+            conn.query_row(
+                "select r.size, r.parts, (select value from meta where key = 'articles')
+                 from releases r join files f on f.release_id = r.id where f.id = ?",
+                [a],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap()
+        };
+        let once = totals();
+
+        // the copy as a save past its decode budget puts it in
+        let first = sealed_segments(&conn, a).unwrap().unwrap().remove(0);
+        conn.execute(
+            "insert into segments (file_id, local, domain, part, bytes) values (?, ?, ?, ?, ?)",
+            params![a, first.local, first.domain, first.part, first.bytes],
+        )
+        .unwrap();
+        conn.execute(
+            "update releases set size = size + ?, parts = parts + 1
+             where id = (select release_id from files where id = ?)",
+            params![first.bytes, a],
+        )
+        .unwrap();
+        add_totals(&conn, 0, 1).unwrap();
+        assert_ne!(totals(), once);
+
+        seal_file(&conn, a).unwrap();
+        assert_eq!(totals(), once);
     }
 
     /// A row a full blob already has is dropped, not left a row because
