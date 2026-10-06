@@ -527,36 +527,56 @@ async fn take_sweep(sched: &Scheduler, server: usize, db: &Db) -> Option<String>
     found
 }
 
+/// What a worker with no group of its own does.
+enum IdleWork {
+    Chunk(crate::chunks::Claim),
+    Sweep(String),
+}
+
+/// Work for an idle worker on `server`: a due sweep of a split group whose
+/// chunks are done (see `take_sweep`) before any day chunk, soo another
+/// group's endless chunks dont hold it off until what it would find ages
+/// out. One worker per server sweeps at a time, the others take chunks.
+async fn take_idle_work(sched: &Scheduler, server: usize, db: &Db) -> Option<IdleWork> {
+    if let Some(group) = take_sweep(sched, server, db).await {
+        return Some(IdleWork::Sweep(group));
+    }
+    take_chunk(sched, server, db).await.map(IdleWork::Chunk)
+}
+
 /// One worker on `server`: index whichever of its groups is due next, again and again.
 /// All workers share one db connection, soo their writes queue up in order
 /// instead of racing for sqlite's write lock (and timing out on a busy db).
 async fn worker(sched: Arc<Scheduler>, server: usize, db: Db) {
     while !sched.stopping() {
         let Some(group) = sched.take_group(server) else {
-            // nothing of its own: help with a split group's day chunks. not
-            // marked busy, a group's chunks run on several servers at once
-            if let Some(chunk) = take_chunk(&sched, server, &db).await {
-                let settings = sched.settings.read().unwrap().clone();
-                let stats = sched.stats.clone();
-                let group = chunk.group.clone();
-                let mut progress = |p: &Progress| stats.lock().unwrap().tick(p.articles, p.bytes, p.releases, &group);
-                let run = crate::indexer::run_chunk(&sched.ctx, &settings, &db, &chunk, server, &mut progress);
-                let Some(result) = unless_stopped(&sched.ctx.stop, run).await else { break };
-                sched.finish_chunk(chunk.group, server, result);
-                continue;
-            }
-            // or, once a split group's chunks are done, sweep this server's
-            // numbers of it for what they missed (one worker per server at a time)
-            if let Some(group) = take_sweep(&sched, server, &db).await {
-                let settings = sched.settings.read().unwrap().clone();
-                let stats = sched.stats.clone();
-                let mut progress = |p: &Progress| stats.lock().unwrap().tick(p.articles, p.bytes, p.releases, &group);
-                let run = crate::indexer::run_sweep(&sched.ctx, &settings, &db, &group, server, &mut progress);
-                let result = unless_stopped(&sched.ctx.stop, run).await;
-                sched.sweeping.lock().unwrap().remove(&server);
-                let Some(result) = result else { break };
-                sched.finish_chunk(group, server, result);
-                continue;
+            match take_idle_work(&sched, server, &db).await {
+                // help with a split group's day chunks. not marked busy, a
+                // group's chunks run on several servers at once
+                Some(IdleWork::Chunk(chunk)) => {
+                    let settings = sched.settings.read().unwrap().clone();
+                    let stats = sched.stats.clone();
+                    let group = chunk.group.clone();
+                    let mut progress =
+                        |p: &Progress| stats.lock().unwrap().tick(p.articles, p.bytes, p.releases, &group);
+                    let run = crate::indexer::run_chunk(&sched.ctx, &settings, &db, &chunk, server, &mut progress);
+                    let Some(result) = unless_stopped(&sched.ctx.stop, run).await else { break };
+                    sched.finish_chunk(chunk.group, server, result);
+                    continue;
+                }
+                Some(IdleWork::Sweep(group)) => {
+                    let settings = sched.settings.read().unwrap().clone();
+                    let stats = sched.stats.clone();
+                    let mut progress =
+                        |p: &Progress| stats.lock().unwrap().tick(p.articles, p.bytes, p.releases, &group);
+                    let run = crate::indexer::run_sweep(&sched.ctx, &settings, &db, &group, server, &mut progress);
+                    let result = unless_stopped(&sched.ctx.stop, run).await;
+                    sched.sweeping.lock().unwrap().remove(&server);
+                    let Some(result) = result else { break };
+                    sched.finish_chunk(group, server, result);
+                    continue;
+                }
+                None => {}
             }
             nap(Duration::from_secs(1), || sched.stopping()).await;
             continue;
@@ -1010,5 +1030,54 @@ mod tests {
         assert_eq!(chunk_groups("backfill", &groups, &skip), HashSet::from(["a".to_string()]));
         assert_eq!(chunk_groups("dynamic", &groups, &HashSet::new()).len(), 2);
         assert!(chunk_groups("live", &groups, &HashSet::new()).is_empty(), "live never backfills");
+    }
+
+    /// a sweep due on a server comes before another group's day chunks
+    #[test]
+    fn a_due_sweep_comes_before_other_groups_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        db::create_db_at(&main).unwrap();
+        let pool = Pool::new(&[UsenetServer::new("a.test", "u", "p", 119), UsenetServer::new("b.test", "u", "p", 119)]);
+        // "done" split with its chunks all done, "busy" with many to go
+        let conn = db::open_at(&main).unwrap();
+        crate::chunks::add(&conn, "done", 20_000, 19_990).unwrap();
+        conn.execute("update backfill_chunks set state = 2 where grp = 'done'", []).unwrap();
+        crate::chunks::add(&conn, "busy", 20_000, 10_000).unwrap();
+        // the server that isnt done's home sweeps it
+        let server = 1 - pool.pick_server("done");
+        let sched = Scheduler {
+            ctx: PassContext {
+                pool: Arc::new(pool),
+                states: RunStates::default(),
+                stop: Default::default(),
+                verbose: false,
+            },
+            settings: RwLock::new(PassSettings { mode: "backfill".into(), ..PassSettings::default() }),
+            groups: RwLock::new(vec!["busy".into(), "done".into()]),
+            plan: vec![],
+            workers: 2,
+            next: Default::default(),
+            busy: Default::default(),
+            skip: Default::default(),
+            chunk_errors: Default::default(),
+            sweeping: Default::default(),
+            wait_until: Default::default(),
+            errors: Default::default(),
+            failed: Default::default(),
+            stats: Arc::new(Mutex::new(Stats::new())),
+            wind_down: AtomicBool::new(false),
+            compact_due: AtomicBool::new(false),
+            compact_after: None,
+            auto_compact: AtomicBool::new(false),
+            passes: AtomicUsize::new(0),
+        };
+        let db = shared_db(conn);
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            assert!(matches!(take_idle_work(&sched, server, &db).await, Some(IdleWork::Sweep(g)) if g == "done"));
+            // one sweep per server at a time: the next worker takes a chunk
+            assert!(matches!(take_idle_work(&sched, server, &db).await, Some(IdleWork::Chunk(c)) if c.group == "busy"));
+        });
     }
 }
