@@ -154,6 +154,13 @@ pub fn set_deepest(conn: &Connection, group: &str, server: &str) -> Result<()> {
     Ok(())
 }
 
+/// Forget `server` as the one going back furthest on `group`, when it no
+/// longer carries it: the next to reach the oldest day asks again.
+pub fn forget_deepest(conn: &Connection, group: &str, server: &str) -> Result<()> {
+    conn.execute("delete from backfill_deepest where grp = ? and server = ?", [group, server])?;
+    Ok(())
+}
+
 /// groups with chunks still to do
 pub fn split_groups(conn: &Connection) -> Result<Vec<String>> {
     conn.prepare("select distinct grp from backfill_chunks where state != 2 order by grp")?

@@ -65,6 +65,8 @@ pub struct Server {
     /// GROUP reports this as the low water mark instead of the first post's
     /// number, like a provider whose low mark lags behind its retention
     pub reported_low: Option<u64>,
+    /// once set, GROUP answers 411, like a provider that dropped the group
+    pub dropped: std::sync::atomic::AtomicBool,
 }
 
 impl Server {
@@ -95,6 +97,7 @@ impl Server {
             body_delay: Duration::ZERO,
             empty_is_420: false,
             reported_low: None,
+            dropped: Default::default(),
         })
     }
 }
@@ -202,6 +205,7 @@ pub fn serve(stream: TcpStream, state: &Server, over_limit: bool) {
                 send(&mut out, if ok { b"281 ok".as_slice() } else { b"481 nope" })
             }
             "GROUP" if state.no_group => send(&mut out, b"501 GROUP command error"),
+            "GROUP" if state.dropped.load(Ordering::SeqCst) => send(&mut out, b"411 no such group"),
             "GROUP" if arg == GROUP || (state.any_group && arg.starts_with("alt.binaries.")) => {
                 selected = Some(arg.to_string());
                 let posts = posts_lock();
