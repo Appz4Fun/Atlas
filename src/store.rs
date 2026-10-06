@@ -520,7 +520,7 @@ pub(crate) fn decode(local: &[u8], suffix: Option<&str>) -> String {
 /// one bit per part number present
 pub(crate) fn insert_part(bits: &mut Vec<u8>, part: i64) {
     // a bad part number from a broken subject shouldnt allocate a huge bitmap
-    if !(0..=1_000_000).contains(&part) {
+    if !(0..=crate::parser::MAX_PARTS).contains(&part) {
         return;
     }
     let (byte, bit) = ((part / 8) as usize, part % 8);
