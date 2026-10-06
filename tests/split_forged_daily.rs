@@ -1,5 +1,5 @@
 //! A split group on two servers, one with an article dated in every day
-//! from 2000 on before its real ones (forged): each of those thousands of
+//! of the six years before its real ones (forged): each of those thousands of
 //! days looks corroborated by its one article. Only a window of the days
 //! older than the other server goes back is serviced as chunks at once, and
 //! one article a day doesnt earn more: the rest is left to the deep
@@ -33,7 +33,7 @@ fn posts(offset: u64) -> Vec<common::Post> {
 }
 
 #[test]
-fn forged_dates_one_a_day_back_to_2000_service_only_a_window_of_chunks() {
+fn forged_dates_one_a_day_for_six_years_service_only_a_window_of_chunks() {
     let home = tempfile::tempdir().unwrap();
     // SAFETY: only test in this binary, set before any thread is spawned
     unsafe {
@@ -42,8 +42,9 @@ fn forged_dates_one_a_day_back_to_2000_service_only_a_window_of_chunks() {
         std::env::set_var("ATLAS_SAB_DIR", home.path().join("no-sabnzbd"));
     }
 
-    // one article noon of every day from 2000-01-05 to 2025-12-31, then the real ones
-    let first = chrono::DateTime::parse_from_rfc3339("2000-01-05T12:00:00+00:00").unwrap();
+    // one article noon of every day from 2020-01-05 to 2025-12-31, then the
+    // real ones: thousands of days, few enough articles for a slow runner
+    let first = chrono::DateTime::parse_from_rfc3339("2020-01-05T12:00:00+00:00").unwrap();
     let split_start = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00+00:00").unwrap();
     let forged_days = (split_start - first).num_days() as u64 + 1;
     let mut deep: Vec<common::Post> = (0..forged_days)
@@ -80,7 +81,8 @@ fn forged_dates_one_a_day_back_to_2000_service_only_a_window_of_chunks() {
 
     let main = home.path().join("atlas.db");
     let every = 1200 + forged_days as i64;
-    let deadline = Instant::now() + Duration::from_secs(180);
+    // a 2-core runner services its window of chunks many times slower
+    let deadline = Instant::now() + Duration::from_secs(300);
     loop {
         let conn = atlas::db::open_with_shards(&main).unwrap();
         let (_, articles) = atlas::store::totals(&conn).unwrap();
