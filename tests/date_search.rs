@@ -639,7 +639,7 @@ fn a_split_reaches_back_when_a_deeper_server_joins() {
     atlas::chunks::add(&conn, GROUP, day0 + 9, day0 + 5).unwrap();
     conn.execute("update backfill_chunks set state = 2, server = '127.0.0.1', done_at = 1 where day = ?", [day0 + 5])
         .unwrap();
-    atlas::chunks::set_deepest(&conn, GROUP, "127.0.0.1").unwrap();
+    atlas::chunks::set_deepest(&conn, GROUP, "127.0.0.1", start.timestamp() + 121 * 3600).unwrap();
 
     let ctx = atlas::indexer::PassContext {
         pool: pool.pool.clone(),
