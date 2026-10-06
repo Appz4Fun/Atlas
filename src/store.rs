@@ -681,12 +681,12 @@ pub(crate) fn seal_file(conn: &Connection, file_id: i64) -> Result<usize> {
 
 fn seal_rows(conn: &Connection, file_id: i64) -> Result<usize> {
     let mut segs = sealed_segments(conn, file_id)?.unwrap_or_default();
-    // too much for one blob in memory: stays rows, and a blob stays as it is
-    // (counted before any row is read)
+    // more rows than one blob takes: they stay rows, and a blob stays as it
+    // is (counted before any row is read)
     let counted: i64 = conn
         .prepare_cached("select count(*) from (select 1 from segments where file_id = ? limit ?)")?
         .query_row(params![file_id, SEAL_MAX_SEGMENTS + 1], |r| r.get(0))?;
-    if counted > 0 && counted + segs.len() as i64 > SEAL_MAX_SEGMENTS {
+    if counted > SEAL_MAX_SEGMENTS {
         return Ok(0);
     }
     let rows: Vec<crate::blob::Seg> = conn
@@ -708,10 +708,19 @@ fn seal_rows(conn: &Connection, file_id: i64) -> Result<usize> {
         return Ok(0);
     }
     // a row the blob already has (saved past a save's decode budget, see
-    // `SealedCache`) isnt added twice
+    // `SealedCache`) isnt added twice: it goes, before the blob is counted,
+    // soo a full blob doesnt keep it a row
     let held: HashSet<(&[u8], i64)> = segs.iter().map(|s| (s.local.as_slice(), s.domain)).collect();
-    let rows: Vec<crate::blob::Seg> =
-        rows.into_iter().filter(|r| !held.contains(&(r.local.as_slice(), r.domain))).collect();
+    let (copies, rows): (Vec<crate::blob::Seg>, Vec<crate::blob::Seg>) =
+        rows.into_iter().partition(|r| held.contains(&(r.local.as_slice(), r.domain)));
+    for copy in &copies {
+        conn.prepare_cached("delete from segments where file_id = ? and local = ? and domain = ?")?
+            .execute(params![file_id, copy.local, copy.domain])?;
+    }
+    // too much for one blob in memory: the rest stays rows, the blob as it is
+    if segs.len() + rows.len() > SEAL_MAX_SEGMENTS as usize {
+        return Ok(0);
+    }
     segs.extend(rows);
     conn.prepare_cached("update files set blob = ? where id = ?")?
         .execute(params![crate::blob::encode(&segs), file_id])?;
@@ -1631,6 +1640,46 @@ mod tests {
         )
         .unwrap();
         assert_eq!(seal_file(&conn, a).unwrap(), 3, "the copy isnt added");
+    }
+
+    /// A row a full blob already has is dropped, not left a row because
+    /// adding it would go past the cap.
+    #[test]
+    fn a_row_a_full_blob_already_has_is_dropped() {
+        let (_dir, main) = sealed_fixture();
+        let conn = db::open_at(&shard_path(&main, shard_of("alt.binaries.t"))).unwrap();
+        let a: i64 = conn.query_row("select id from files where filename = 'a.rar'", [], |r| r.get(0)).unwrap();
+        seal_file(&conn, a).unwrap();
+        let mut segs = sealed_segments(&conn, a).unwrap().unwrap();
+        let first = segs[0].clone();
+        let pad = (segs.len() as i64..SEAL_MAX_SEGMENTS).map(|p| crate::blob::Seg {
+            part: Some(100 + p),
+            bytes: 1,
+            domain: 0,
+            local: format!("pad{p}").into_bytes(),
+        });
+        segs.extend(pad.collect::<Vec<_>>());
+        conn.execute("update files set blob = ? where id = ?", params![crate::blob::encode(&segs), a]).unwrap();
+        let insert = |local: &[u8], domain: i64| {
+            conn.execute(
+                "insert into segments (file_id, local, domain, part, bytes) values (?, ?, ?, ?, ?)",
+                params![a, local, domain, first.part, first.bytes],
+            )
+            .unwrap();
+        };
+        let rows =
+            || conn.query_row("select count(*) from segments where file_id = ?", [a], |r| r.get::<_, i64>(0)).unwrap();
+
+        insert(&first.local, first.domain);
+        assert_eq!(seal_file(&conn, a).unwrap(), SEAL_MAX_SEGMENTS as usize, "a full blob, the copy dropped");
+        assert_eq!(rows(), 0);
+
+        // with a new row too the blob is past the cap: the new one stays a row, the copy goes
+        insert(&first.local, first.domain);
+        insert(b"new", 0);
+        assert_eq!(seal_file(&conn, a).unwrap(), 0);
+        assert_eq!(rows(), 1);
+        assert_eq!(sealed_segments(&conn, a).unwrap().unwrap().len() as i64, SEAL_MAX_SEGMENTS);
     }
 
     #[test]
