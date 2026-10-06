@@ -601,7 +601,7 @@ fn the_oldest_day_moves_on_when_the_deepest_server_drops_the_group() {
 
     // the 01:00 server is noted as the deepest
     assert!(run(1).unwrap_err().downcast_ref::<atlas::indexer::TooOld>().is_some());
-    assert_eq!(atlas::chunks::deepest(&conn, GROUP).unwrap().as_deref(), Some("127.0.0.1"));
+    assert_eq!(atlas::chunks::deepest(&conn, GROUP).unwrap().as_deref(), Some(pool.pool.host(0).as_str()));
 
     // then drops the group, and finds out on its next chunk
     deep_server.dropped.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -612,7 +612,7 @@ fn the_oldest_day_moves_on_when_the_deepest_server_drops_the_group() {
     let saved = run(1).expect("the next deepest carrier does the oldest day");
     assert_eq!(saved.articles, 7);
     assert_eq!(state(), 2);
-    assert_eq!(atlas::chunks::deepest(&conn, GROUP).unwrap().as_deref(), Some("localhost"));
+    assert_eq!(atlas::chunks::deepest(&conn, GROUP).unwrap().as_deref(), Some(pool.pool.host(1).as_str()));
 }
 
 /// The server noted as going back furthest still carries the group, but its
@@ -668,7 +668,7 @@ fn the_oldest_day_moves_on_when_the_deepest_server_no_longer_keeps_it() {
 
     // the 01:00 server is noted as the deepest
     assert!(run(1).unwrap_err().downcast_ref::<atlas::indexer::TooOld>().is_some());
-    assert_eq!(atlas::chunks::deepest(&conn, GROUP).unwrap().as_deref(), Some("127.0.0.1"));
+    assert_eq!(atlas::chunks::deepest(&conn, GROUP).unwrap().as_deref(), Some(pool.pool.host(0).as_str()));
 
     // then keeps only from the next day on, and finds out on its next chunk
     deep_server.posts.lock().unwrap().retain(|p| p.number > 25);
@@ -680,7 +680,7 @@ fn the_oldest_day_moves_on_when_the_deepest_server_no_longer_keeps_it() {
     let saved = run(1).expect("the next deepest carrier does the oldest day");
     assert_eq!(saved.articles, 7);
     assert_eq!(state(), 2);
-    assert_eq!(atlas::chunks::deepest(&conn, GROUP).unwrap().as_deref(), Some("localhost"));
+    assert_eq!(atlas::chunks::deepest(&conn, GROUP).unwrap().as_deref(), Some(pool.pool.host(1).as_str()));
 }
 
 /// A split made while the servers kept 5 days, then a server that keeps 10
@@ -712,9 +712,12 @@ fn a_split_reaches_back_when_a_deeper_server_joins() {
     let day0 = atlas::chunks::unix_day(start.timestamp());
     let conn = atlas::db::open_at(&main).unwrap();
     atlas::chunks::add(&conn, GROUP, day0 + 9, day0 + 5).unwrap();
-    conn.execute("update backfill_chunks set state = 2, server = '127.0.0.1', done_at = 1 where day = ?", [day0 + 5])
-        .unwrap();
-    atlas::chunks::set_deepest(&conn, GROUP, "127.0.0.1", start.timestamp() + 121 * 3600).unwrap();
+    conn.execute(
+        "update backfill_chunks set state = 2, server = ?, done_at = 1 where day = ?",
+        rusqlite::params![pool.pool.host(0), day0 + 5],
+    )
+    .unwrap();
+    atlas::chunks::set_deepest(&conn, GROUP, &pool.pool.host(0), start.timestamp() + 121 * 3600).unwrap();
 
     let ctx = atlas::indexer::PassContext {
         pool: pool.pool.clone(),
@@ -744,16 +747,16 @@ fn a_split_reaches_back_when_a_deeper_server_joins() {
     // asked again (a chunk the pass ran asks who keeps the day): the new one
     assert_eq!(
         atlas::chunks::deepest(&conn, GROUP).unwrap().as_deref(),
-        Some("localhost"),
+        Some(pool.pool.host(1).as_str()),
         "the deepest server is asked again"
     );
 
     // and the new days get indexed: the new oldest by the server that has it
     for day in [day0 + 4, day0] {
-        let chunk = atlas::chunks::Claim { group: GROUP.into(), day, server: "localhost".into(), claimed_at: 1 };
+        let chunk = atlas::chunks::Claim { group: GROUP.into(), day, server: pool.pool.host(1), claimed_at: 1 };
         conn.execute(
-            "update backfill_chunks set state = 1, server = 'localhost', claimed_at = 1 where grp = ? and day = ?",
-            rusqlite::params![GROUP, day],
+            "update backfill_chunks set state = 1, server = ?, claimed_at = 1 where grp = ? and day = ?",
+            rusqlite::params![chunk.server, GROUP, day],
         )
         .unwrap();
         let saved = pool.block_on(atlas::indexer::run_chunk(&ctx, &exact(), &db, &chunk, 1, &mut |_| {})).unwrap();
@@ -790,9 +793,9 @@ fn a_split_reaches_back_when_home_no_longer_keeps_its_cursor() {
     let day0 = atlas::chunks::unix_day(start.timestamp());
     let conn = atlas::db::open_at(&main).unwrap();
     atlas::chunks::add(&conn, GROUP, day0 + 9, day0 + 5).unwrap();
-    atlas::chunks::set_deepest(&conn, GROUP, "127.0.0.1", start.timestamp() + 121 * 3600).unwrap();
+    atlas::chunks::set_deepest(&conn, GROUP, &pool.pool.host(0), start.timestamp() + 121 * 3600).unwrap();
     let state = atlas::db::GroupState { live_cursor: 1240, backfill_cursor: 5 };
-    atlas::db::save_group_state(&conn, &format!("{GROUP}@127.0.0.1"), state).unwrap();
+    atlas::db::save_group_state(&conn, &format!("{GROUP}@{}", pool.pool.host(0).to_lowercase()), state).unwrap();
 
     let ctx = atlas::indexer::PassContext {
         pool: pool.pool.clone(),
@@ -989,7 +992,7 @@ fn a_split_redoes_its_oldest_day_when_a_server_goes_back_further_in_it() {
     // asked again (a chunk the pass ran asks who keeps the day): the new one
     assert_eq!(
         atlas::chunks::deepest(&conn, GROUP).unwrap().as_deref(),
-        Some("localhost"),
+        Some(pool.pool.host(1).as_str()),
         "the deepest server is asked again"
     );
     assert_eq!(run_day(day0, 1).articles, 24, "01:00 to midnight and the hour after");

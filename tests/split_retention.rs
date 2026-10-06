@@ -90,8 +90,8 @@ fn days_older_than_a_servers_retention_go_to_the_server_that_has_them() {
         atlas::chunks::unix_day(chrono::DateTime::parse_from_rfc3339("2026-01-21T00:00:00+00:00").unwrap().timestamp());
     let old_by_short: i64 = conn
         .query_row(
-            "select count(*) from backfill_chunks where server = 'localhost' and day < ?",
-            [first_short_day],
+            "select count(*) from backfill_chunks where server = ? and day < ?",
+            rusqlite::params![format!("localhost:{ps}"), first_short_day],
             |r| r.get(0),
         )
         .unwrap();

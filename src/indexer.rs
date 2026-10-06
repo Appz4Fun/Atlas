@@ -379,26 +379,51 @@ fn cursor_key(pool: &Pool, server: usize, group: &str) -> String {
     if pool.len() <= 1 { group.to_string() } else { format!("{group}@{}", pool.host(server).to_lowercase()) }
 }
 
-async fn load_cursors(db: &Db, key: &str, group: &str, legacy: bool) -> Result<Option<db::GroupState>> {
+async fn load_cursors(
+    ctx: &PassContext,
+    db: &Db,
+    key: &str,
+    group: &str,
+    server: usize,
+) -> Result<Option<db::GroupState>> {
     let (key, group) = (key.to_string(), group.to_string());
+    let legacy = if ctx.pool.len() <= 1 { Vec::new() } else { ctx.pool.legacy_keys(server) };
+    on_db(db, move |conn| cursors_or_adopted(conn, &key, &group, server == 0, &legacy)).await
+}
 
-    on_db(db, move |conn| {
-        if let Some(state) = db::get_group_state(conn, &key)? {
-            return Ok(Some(state));
+/// The cursors saved under `key`, else adopted: saved under one of the
+/// server's `legacy` keys (what an earlier build named it, see
+/// `nntp::legacy_server_keys`) they move to `key`, once; saved under the
+/// plain group name (before a second server was added) they belong to the
+/// first server
+fn cursors_or_adopted(
+    conn: &Connection,
+    key: &str,
+    group: &str,
+    first_server: bool,
+    legacy: &[String],
+) -> Result<Option<db::GroupState>> {
+    if let Some(state) = db::get_group_state(conn, key)? {
+        return Ok(Some(state));
+    }
+
+    for old in legacy.iter().map(|k| format!("{group}@{k}")) {
+        if db::get_group_state(conn, &old)?.is_some() {
+            conn.execute("delete from groups where name = ?", [key])?;
+            conn.execute("update groups set name = ? where name = ?", [key, old.as_str()])?;
+            return Ok(db::get_group_state(conn, key)?);
         }
+    }
 
-        // cursors saved before a second server was added belong to the first server
-        if legacy
-            && key != group
-            && let Some(state) = db::get_group_state(conn, &group)?
-        {
-            db::save_group_state(conn, &key, state)?;
-            return Ok(Some(state));
-        }
+    if first_server
+        && key != group
+        && let Some(state) = db::get_group_state(conn, group)?
+    {
+        db::save_group_state(conn, key, state)?;
+        return Ok(Some(state));
+    }
 
-        Ok(None)
-    })
-    .await
+    Ok(None)
 }
 
 /// One pass over `group`: a batch of live or backfill articles depending on
@@ -420,7 +445,7 @@ where
     let (first, last) = (first as i64, last as i64);
     let key = cursor_key(&ctx.pool, server, group);
 
-    let state = match load_cursors(db, &key, group, server == 0).await? {
+    let state = match load_cursors(ctx, db, &key, group, server).await? {
         Some(s) if last >= s.live_cursor => s,
         // first time both cursors start at the top. if the server renumbered
         // (last went backwards) the group got reset soo start over the same way
@@ -830,7 +855,7 @@ where
     };
     let (first, last) = (first as i64, last as i64);
     let key = cursor_key(&ctx.pool, server, group);
-    let cursor = match load_cursors(db, &key, group, server == 0).await? {
+    let cursor = match load_cursors(ctx, db, &key, group, server).await? {
         Some(s) => s.backfill_cursor.min(last),
         None => {
             let k = key.clone();
@@ -1586,6 +1611,25 @@ impl Indexer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cursors_saved_under_a_servers_old_key_are_adopted_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        db::create_db_at(&main).unwrap();
+        let conn = db::open_at(&main).unwrap();
+        let state = db::GroupState { live_cursor: 900, backfill_cursor: 500 };
+        db::save_group_state(&conn, "g@x@a.example:563", state).unwrap();
+        let legacy = ["a.example:563".to_string(), "x@a.example:563".to_string()];
+        assert_eq!(cursors_or_adopted(&conn, "g@a.example", "g", false, &legacy).unwrap(), Some(state));
+        assert_eq!(db::get_group_state(&conn, "g@x@a.example:563").unwrap(), None, "moved, not copied");
+        assert_eq!(db::get_group_state(&conn, "g@a.example").unwrap(), Some(state));
+        // nothing to adopt: nothing made up
+        assert_eq!(cursors_or_adopted(&conn, "g@b.example", "g", false, &[]).unwrap(), None);
+        // the plain group name still goes to the first server
+        db::save_group_state(&conn, "h", state).unwrap();
+        assert_eq!(cursors_or_adopted(&conn, "h@a.example", "h", true, &legacy).unwrap(), Some(state));
+    }
 
     #[test]
     fn what_a_server_keeps_is_remembered_by_its_host_not_its_place_in_the_pool() {

@@ -77,7 +77,8 @@ fn deep_only_posts_a_shallow_home_missed_are_swept_by_the_deep_server() {
         let first_day = atlas::chunks::unix_day(1_767_225_600);
         atlas::chunks::add(&conn, GROUP, first_day + 29, first_day).unwrap();
         let now = chrono::Utc::now().timestamp();
-        while let Some(claim) = atlas::chunks::claim(&conn, &[(GROUP.to_string(), i64::MIN)], "localhost", now).unwrap()
+        while let Some(claim) =
+            atlas::chunks::claim(&conn, &[(GROUP.to_string(), i64::MIN)], &format!("localhost:{ps}"), now).unwrap()
         {
             assert!(atlas::chunks::finish(&conn, &claim, now).unwrap());
         }
@@ -85,6 +86,7 @@ fn deep_only_posts_a_shallow_home_missed_are_swept_by_the_deep_server() {
 
     let stop = Arc::new(AtomicBool::new(false));
     let cfg = atlas::config::load_config().unwrap();
+    let keys = atlas::nntp::server_keys(&cfg.servers);
     let runner = {
         let stop = stop.clone();
         std::thread::spawn(move || atlas::bg_indexer::run_until(cfg, stop))
@@ -95,8 +97,7 @@ fn deep_only_posts_a_shallow_home_missed_are_swept_by_the_deep_server() {
         let conn = atlas::db::open_with_shards(&main).unwrap();
         let (_, articles) = atlas::store::totals(&conn).unwrap();
         let (done, total) = atlas::chunks::progress(&conn, GROUP).unwrap_or((0, 0));
-        let hosts = ["127.0.0.1".to_string(), "localhost".to_string()];
-        let complete = atlas::chunks::complete(&conn, GROUP, &hosts).unwrap();
+        let complete = atlas::chunks::complete(&conn, GROUP, &keys).unwrap();
         if total > 0 && done == total && articles == 1200 && complete {
             break;
         }

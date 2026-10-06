@@ -89,8 +89,8 @@ fn a_forged_early_date_on_a_shallow_servers_first_article_loses_no_days() {
         atlas::chunks::unix_day(chrono::DateTime::parse_from_rfc3339("2026-01-21T00:00:00+00:00").unwrap().timestamp());
     let old_by_short: i64 = conn
         .query_row(
-            "select count(*) from backfill_chunks where server = 'localhost' and day < ?",
-            [first_short_day],
+            "select count(*) from backfill_chunks where server = ? and day < ?",
+            rusqlite::params![format!("localhost:{ps}"), first_short_day],
             |r| r.get(0),
         )
         .unwrap();

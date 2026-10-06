@@ -80,6 +80,7 @@ fn a_server_without_the_group_doesnt_move_it() {
 
     let stop = Arc::new(AtomicBool::new(false));
     let cfg = atlas::config::load_config().unwrap();
+    let keys = atlas::nntp::server_keys(&cfg.servers);
     let runner = {
         let stop = stop.clone();
         std::thread::spawn(move || atlas::bg_indexer::run_until(cfg, stop))
@@ -114,7 +115,7 @@ fn a_server_without_the_group_doesnt_move_it() {
         .unwrap();
     let homes = cursors.iter().filter(|(_, home)| *home).count();
     assert_eq!(homes, 1, "the group stayed on one home server: {cursors:?}");
-    let carriers = [format!("{SPLIT_GROUP}@127.0.0.1"), format!("{SPLIT_GROUP}@localhost")];
+    let carriers = [format!("{SPLIT_GROUP}@{}", keys[0]), format!("{SPLIT_GROUP}@{}", keys[1])];
     assert!(cursors.iter().all(|(name, _)| carriers.contains(name)), "only carriers have cursors: {cursors:?}");
 
     let chunk_servers: Vec<String> = conn
@@ -125,5 +126,5 @@ fn a_server_without_the_group_doesnt_move_it() {
         .collect::<Result<_, _>>()
         .unwrap();
     assert!(c.accepted.load(Ordering::SeqCst) > 0, "the third server was asked");
-    assert_eq!(chunk_servers, vec!["127.0.0.1".to_string(), "localhost".to_string()], "only the carriers did chunks");
+    assert_eq!(chunk_servers, keys[..2].to_vec(), "only the carriers did chunks");
 }

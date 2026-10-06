@@ -754,6 +754,8 @@ struct Server {
     cfg: UsenetServer,
     /// what names this server in stored state, see `server_keys`
     key: String,
+    /// what earlier builds named it, see `legacy_server_keys`
+    legacy_keys: Vec<String>,
     idle: Mutex<Vec<Conn>>,
     permits: Arc<Semaphore>,
     down_until: Mutex<Option<Instant>>,
@@ -1022,21 +1024,45 @@ impl Drop for Unsaved {
     }
 }
 
-/// What names each server in stored state (cursors, chunk claims, sweeps):
-/// its host when no other server has it (what it always was), else
-/// `host:port`, and `user@host:port` when another has the same host and port
-/// too. Never the password.
+/// What names each server in stored state (cursors, chunk claims, sweeps),
+/// from its own settings alone: adding or removing another server never
+/// changes it (that would orphan its cursors). The host on the default port
+/// for its ssl setting (563 with ssl, 119 without; what it always was), else
+/// `host:port`, and `#key` after either when the server sets `key`. Two
+/// accounts on the same host and port share it (the same provider numbers
+/// articles the same) unless one sets a `key`. Never the user or password.
 pub fn server_keys(servers: &[UsenetServer]) -> Vec<String> {
-    let same = |a: &UsenetServer, b: &UsenetServer| a.host.eq_ignore_ascii_case(&b.host);
+    servers.iter().map(server_key).collect()
+}
+
+fn server_key(s: &UsenetServer) -> String {
+    let default_port = if s.use_ssl() { 563 } else { 119 };
+    let base = if s.port == default_port { s.host.clone() } else { format!("{}:{}", s.host, s.port) };
+    match &s.key {
+        Some(k) => format!("{base}#{k}"),
+        None => base,
+    }
+}
+
+/// Per server, lowercased, what earlier builds named it in stored state
+/// (`host`, `host:port`, `user@host:port`, depending on the other servers
+/// then) and that no server is named now: cursors saved under one are its
+/// own, adopted when none are saved under its key (see `indexer`)
+pub fn legacy_server_keys(servers: &[UsenetServer]) -> Vec<Vec<String>> {
+    let now: Vec<String> = servers.iter().map(|s| server_key(s).to_lowercase()).collect();
     servers
         .iter()
         .map(|s| {
-            if servers.iter().filter(|o| same(s, o)).count() < 2 {
-                return s.host.clone();
+            let host = s.host.to_lowercase();
+            let hp = format!("{host}:{}", s.port);
+            let user = format!("{}@{hp}", s.username.to_lowercase());
+            let mut old = Vec::new();
+            for k in [host, hp, user] {
+                if !now.contains(&k) && !old.contains(&k) {
+                    old.push(k);
+                }
             }
-            let hp = format!("{}:{}", s.host, s.port);
-            let shared = servers.iter().filter(|o| same(s, o) && o.port == s.port).count() > 1;
-            if shared { format!("{}@{hp}", s.username) } else { hp }
+            old
         })
         .collect()
 }
@@ -1044,14 +1070,17 @@ pub fn server_keys(servers: &[UsenetServer]) -> Vec<String> {
 impl Pool {
     pub fn new(servers: &[UsenetServer]) -> Pool {
         let keys = server_keys(servers);
+        let legacy = legacy_server_keys(servers);
         Pool {
             servers: servers
                 .iter()
                 .zip(keys)
-                .map(|(cfg, key)| {
+                .zip(legacy)
+                .map(|((cfg, key), legacy_keys)| {
                     Arc::new(Server {
                         cfg: cfg.clone(),
                         key,
+                        legacy_keys,
                         idle: Mutex::new(Vec::new()),
                         permits: Arc::new(Semaphore::new(cfg.connections().max(1) as usize)),
                         down_until: Mutex::new(None),
@@ -1129,6 +1158,11 @@ impl Pool {
 
     pub fn active_host(&self) -> String {
         self.servers.get(self.active_index()).map(|s| s.cfg.host.clone()).unwrap_or_default()
+    }
+
+    /// what server `i` was named in stored state before (see `legacy_server_keys`)
+    pub fn legacy_keys(&self, i: usize) -> Vec<String> {
+        self.servers.get(i).map(|s| s.legacy_keys.clone()).unwrap_or_default()
     }
 
     /// server `i`'s name in stored state (see `server_keys`)
@@ -1226,7 +1260,11 @@ impl Pool {
         let mut scored: Vec<(f64, usize)> = candidates
             .iter()
             .map(|&i| {
-                let key = format!("{group}\0{}", self.servers[i].key);
+                // by host (and an explicit `key`), not port: a group's home
+                // stays where it was before ports were part of server keys
+                let cfg = &self.servers[i].cfg;
+                let key =
+                    format!("{group}\0{}{}", cfg.host, cfg.key.as_ref().map(|k| format!("#{k}")).unwrap_or_default());
                 // splitmix64's finalizer: fnv alone barely changes between hosts
                 let mut z = fnv(key.as_bytes());
                 z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
@@ -2285,15 +2323,26 @@ mod tests {
     /// the dates the first windows count by judge a server's retention: the earliest
     /// answers, and one more than a day older than an earlier one is unsure
     #[test]
-    fn servers_sharing_a_host_are_told_apart_in_stored_state() {
+    fn a_servers_key_is_its_own_and_doesnt_change_with_the_others() {
         let s = |h: &str, user: &str, port: u16| UsenetServer::new(h, user, "secret", port);
-        let alone = [s("A.example", "u", 563), s("b.example", "u", 563)];
-        assert_eq!(server_keys(&alone), ["A.example", "b.example"], "a unique host stays as it was");
-        let ports = [s("a.example", "u", 563), s("A.example", "u", 119), s("b.example", "u", 563)];
-        assert_eq!(server_keys(&ports), ["a.example:563", "A.example:119", "b.example"]);
-        let users = [s("a.example", "x", 563), s("a.example", "y", 563)];
-        assert_eq!(server_keys(&users), ["x@a.example:563", "y@a.example:563"]);
-        assert_eq!(Pool::new(&users).host(1), "y@a.example:563");
+        let first = s("A.example", "x", 563);
+        // the default port for its ssl setting: the plain host, like always
+        assert_eq!(server_keys(std::slice::from_ref(&first)), ["A.example"]);
+        // a second account on the same host and port, another on another
+        // port, and one with an explicit key: the first one's key stays
+        let mut keyed = s("a.example", "y", 563);
+        keyed.key = Some("block".into());
+        let all = [first.clone(), s("a.example", "y", 563), s("a.example", "z", 119), s("a.example", "w", 443), keyed];
+        assert_eq!(server_keys(&all), ["A.example", "a.example", "a.example", "a.example:443", "a.example#block"]);
+        let mut plain = s("a.example", "v", 563);
+        plain.ssl = Some(false);
+        assert_eq!(server_keys(&[plain]), ["a.example:563"], "563 isnt the default without ssl");
+        assert_eq!(Pool::new(&all).host(4), "a.example#block");
+        // what the keys used to be, for cursors saved under them: never
+        // another server's key now
+        let old = legacy_server_keys(&all);
+        assert_eq!(old[0], ["a.example:563", "x@a.example:563"]);
+        assert_eq!(old[3], ["w@a.example:443"]);
     }
 
     #[test]

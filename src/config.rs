@@ -48,6 +48,10 @@ pub struct UsenetServer {
     /// take part in indexing (header downloads), default on. off keeps e.g. a
     /// block account for downloads and article lookups only
     pub index: Option<bool>,
+    /// set apart in stored state (cursors, chunk claims, sweeps) from other
+    /// accounts on the same host and port, see `nntp::server_keys`. Only
+    /// for a second account on a provider that numbers articles differently
+    pub key: Option<String>,
 }
 
 impl UsenetServer {
@@ -62,6 +66,7 @@ impl UsenetServer {
             priority: 1,
             compress: None,
             index: None,
+            key: None,
         }
     }
 
@@ -95,6 +100,7 @@ impl UsenetServer {
             priority: v.get("priority").and_then(as_int).unwrap_or(DEFAULT_PRIORITY),
             compress: v.get("compress").and_then(as_bool),
             index: v.get("index").and_then(as_bool),
+            key: v.get("key").and_then(Value::as_str).map(str::trim).filter(|k| !k.is_empty()).map(String::from),
         })
     }
 
@@ -116,6 +122,9 @@ impl UsenetServer {
         }
         if let Some(i) = self.index {
             m.insert("index".into(), json!(i));
+        }
+        if let Some(k) = &self.key {
+            m.insert("key".into(), json!(k));
         }
         Value::Object(m)
     }

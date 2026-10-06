@@ -76,7 +76,8 @@ fn chunks_a_forged_shallow_server_missed_are_swept_up_after() {
         let first_day = atlas::chunks::unix_day(1_767_225_600);
         atlas::chunks::add(&conn, GROUP, first_day + 29, first_day).unwrap();
         let now = chrono::Utc::now().timestamp();
-        while let Some(claim) = atlas::chunks::claim(&conn, &[(GROUP.to_string(), i64::MIN)], "127.0.0.1", now).unwrap()
+        while let Some(claim) =
+            atlas::chunks::claim(&conn, &[(GROUP.to_string(), i64::MIN)], &format!("127.0.0.1:{ps}"), now).unwrap()
         {
             assert!(atlas::chunks::finish(&conn, &claim, now).unwrap());
         }

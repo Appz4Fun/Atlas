@@ -64,6 +64,7 @@ fn forged_dates_in_2000_make_only_a_few_chunks() {
 
     let stop = Arc::new(AtomicBool::new(false));
     let cfg = atlas::config::load_config().unwrap();
+    let keys = atlas::nntp::server_keys(&cfg.servers);
     let runner = {
         let stop = stop.clone();
         std::thread::spawn(move || atlas::bg_indexer::run_until(cfg, stop))
@@ -75,7 +76,7 @@ fn forged_dates_in_2000_make_only_a_few_chunks() {
         let conn = atlas::db::open_with_shards(&main).unwrap();
         let (_, articles) = atlas::store::totals(&conn).unwrap();
         let (done, total) = atlas::chunks::progress(&conn, GROUP).unwrap_or((0, 0));
-        let swept = ["127.0.0.1", "localhost"].iter().all(|h| atlas::chunks::swept(&conn, GROUP, h).unwrap());
+        let swept = keys.iter().all(|h| atlas::chunks::swept(&conn, GROUP, h).unwrap());
         if total > 0 && done == total && swept && articles >= 1200 {
             break;
         }

@@ -66,6 +66,7 @@ fn days_no_carrier_keeps_are_dropped() {
 
     let stop = Arc::new(AtomicBool::new(false));
     let cfg = atlas::config::load_config().unwrap();
+    let keys = atlas::nntp::server_keys(&cfg.servers);
     let runner = {
         let stop = stop.clone();
         std::thread::spawn(move || atlas::bg_indexer::run_until(cfg, stop))
@@ -76,7 +77,7 @@ fn days_no_carrier_keeps_are_dropped() {
         let conn = atlas::db::open_with_shards(&main).unwrap();
         let (_, articles) = atlas::store::totals(&conn).unwrap();
         let (done, total) = atlas::chunks::progress(&conn, GROUP).unwrap_or((0, 0));
-        let swept = ["127.0.0.1", "localhost"].iter().any(|h| atlas::chunks::swept(&conn, GROUP, h).unwrap());
+        let swept = keys.iter().any(|h| atlas::chunks::swept(&conn, GROUP, h).unwrap());
         if total > 0 && done == total && articles == 1200 && swept {
             break;
         }
