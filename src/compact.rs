@@ -460,6 +460,8 @@ fn compact_shard(
         let open = || Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY);
         let (files_read, rows_read) = (open()?, open()?);
         let mut suffix_of = files_read.prepare("select suffix from domains where id = ?")?;
+        let mut held_of = files_read
+            .prepare("select message_id, subject, part, total_parts, file_total from held_back where file_id = ?")?;
         let mut files_stmt = files_read.prepare(&format!("select {FILE_COLUMNS} from files order by id"))?;
         let mut files = files_stmt.query([])?;
         let mut rows_stmt = rows_read.prepare(
@@ -514,6 +516,22 @@ fn compact_shard(
                     segs.push(Seg { local, domain, ..seg });
                 }
             }
+            // what rows a save couldnt tell from copies said (see `store::seal_rows`):
+            // kept for the rows that are new, dropped for copies of the blob's
+            let mut held_back: Vec<(String, Value, Value, Value, Value)> = held_of
+                .query_map([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?
+                .collect::<rusqlite::Result<_>>()?;
+            if !held_back.is_empty() {
+                let mut key = |local: &[u8], domain: i64| dedup_key(&mut suffix_of, local, domain);
+                let mut in_blob = HashSet::new();
+                for s in &segs {
+                    in_blob.insert(key(&s.local, s.domain)?);
+                }
+                for r in &spilled {
+                    in_blob.insert(key(&r.local, r.domain)?);
+                }
+                held_back.retain(|h| !in_blob.contains(&h.0));
+            }
             file_rows.extend(spilled);
 
             // a row the blob already has (the same message-id) isnt copied, nor
@@ -544,7 +562,9 @@ fn compact_shard(
             let seen: Vec<u8> = f.get(8)?;
             // and files with more segments than a blob takes stay rows
             let small = (segs.len() + file_rows.len()) as i64 <= store::SEAL_MAX_SEGMENTS;
+            // nor files with something held back: sealing them folds it in
             let seal = !file_rows.is_empty()
+                && held_back.is_empty()
                 && fits
                 && small
                 && store::due(f.get(6)?, &seen, f.get(9)?, old_blob.is_some(), now);
@@ -563,6 +583,13 @@ fn compact_shard(
             values.push(blob.map_or(Value::Null, Value::Blob));
             tx.prepare_cached(&format!("insert into files ({FILE_COLUMNS}) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"))?
                 .execute(params_from_iter(values))?;
+            for h in held_back {
+                tx.prepare_cached(
+                    "insert into held_back (file_id, message_id, subject, part, total_parts, file_total)
+                     values (?, ?, ?, ?, ?, ?)",
+                )?
+                .execute(params![id, h.0, h.1, h.2, h.3, h.4])?;
+            }
             copied += segs.len() as i64;
             for row in &file_rows {
                 copied += insert_row(&tx, row)?;
@@ -1080,6 +1107,76 @@ mod tests {
     }
 
     /// the file of release `name` in its group's shard: (shard path, file id)
+    /// a shard with release Rel: a.rar sealed whole (1/1) and b.rar sealed
+    /// with 1 of 2, and a row added to b.rar the way a save past its decode
+    /// budget leaves one: (message-id, part, total) held back, its part
+    /// counted. The shard, b.rar's id and its release's id.
+    fn held_back_fixture(main: &Path, (id, part, total): (&str, i64, i64)) -> (PathBuf, i64, i64) {
+        db::create_db_at(main).unwrap();
+        let art = |file: &str, part: i64, total: i64, id: &str| Article {
+            message_id: id.into(),
+            subject: format!("\"{file}\" yEnc ({part}/{total})"),
+            filename: Some(file.into()),
+            part: Some(part),
+            total_parts: Some(total),
+            bytes: 100,
+            ..Default::default()
+        };
+        let release = Release {
+            name: "Rel".into(),
+            group: "alt.binaries.t".into(),
+            articles: vec![art("a.rar", 1, 1, "<a1@x>"), art("b.rar", 1, 2, "<b1@x>")],
+            ..Default::default()
+        };
+        store::save(main, &[release]).unwrap();
+        let path = store::shard_path(main, store::shard_of("alt.binaries.t"));
+        let conn = db::open_at(&path).unwrap();
+        let file: i64 = conn.query_row("select id from files where filename = 'b.rar'", [], |r| r.get(0)).unwrap();
+        for f in conn.prepare("select id from files").unwrap().query_map([], |r| r.get::<_, i64>(0)).unwrap() {
+            store::seal_file(&conn, f.unwrap()).unwrap();
+        }
+        let release: i64 = conn.query_row("select release_id from files where id = ?", [file], |r| r.get(0)).unwrap();
+        conn.execute(
+            "insert into segments (file_id, local, domain, part, bytes) values (?, ?, 0, ?, 100)",
+            params![file, store::whole(id), part],
+        )
+        .unwrap();
+        conn.execute(
+            "insert into held_back (file_id, message_id, subject, part, total_parts) values (?, ?, ?, ?, ?)",
+            params![file, id, format!("\"b.rar\" yEnc ({part}/{total})"), part, total],
+        )
+        .unwrap();
+        let mut seen = Vec::new();
+        for p in [1, part] {
+            store::insert_part(&mut seen, p);
+        }
+        conn.execute("update files set seen = ? where id = ?", params![seen, file]).unwrap();
+        let complete = part == 2;
+        conn.execute(
+            "update releases set complete = ?, size = size + 100, parts = parts + 1 where id = ?",
+            params![complete, release],
+        )
+        .unwrap();
+        store::add_totals(&conn, 0, 1).unwrap();
+        (path, file, release)
+    }
+
+    /// A new row's held back total survives compaction (which leaves its
+    /// file a row), and sealing the file afterwards folds it in.
+    #[test]
+    fn compacting_keeps_what_a_new_row_held_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        let (path, file, _) = held_back_fixture(&main, ("<b3@x>", 3, 3));
+        run(&main, &|_| {}, &no_stop()).unwrap();
+        let conn = db::open_at(&path).unwrap();
+        let held: i64 = conn.query_row("select count(*) from held_back", [], |r| r.get(0)).unwrap();
+        assert_eq!(held, 1);
+        store::seal_file(&conn, file).unwrap();
+        let expected: i64 = conn.query_row("select expected from files where id = ?", [file], |r| r.get(0)).unwrap();
+        assert_eq!(expected, 3);
+    }
+
     fn file_of(main: &Path, name: &str, group: &str) -> (PathBuf, i64) {
         let path = store::shard_path(main, store::shard_of(group));
         let id = db::open_at(&path)

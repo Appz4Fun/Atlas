@@ -184,6 +184,18 @@ pub fn build_shard(conn: &Connection) -> Result<()> {
             primary key (file_id, local, domain)
         ) without rowid;
 
+        -- what a row a save couldnt tell from a copy of its sealed file's
+        -- article said about the file, folded in when sealing tells (`seal_rows`)
+        create table if not exists held_back (
+            file_id INTEGER NOT NULL,
+            message_id TEXT NOT NULL,
+            subject TEXT,
+            part INTEGER,
+            total_parts INTEGER,
+            file_total INTEGER,
+            primary key (file_id, message_id)
+        ) without rowid;
+
         -- running totals for the stats pages: releases, articles
         create table if not exists meta (key TEXT PRIMARY KEY, value INTEGER);
         insert or ignore into meta (key, value) values ('releases', 0), ('articles', 0);
@@ -623,6 +635,13 @@ pub(crate) fn add_segment(
     let added = conn
         .prepare_cached("insert or ignore into segments (file_id, local, domain, part, bytes) values (?, ?, ?, ?, ?)")?
         .execute(params![f.id, local, domain, a.part, a.bytes])?;
+    if added > 0 && f.sealed && sealed.guessed {
+        conn.prepare_cached(
+            "insert or replace into held_back (file_id, message_id, subject, part, total_parts, file_total)
+             values (?, ?, ?, ?, ?, ?)",
+        )?
+        .execute(params![f.id, a.message_id, a.subject, a.part, a.total_parts, a.file_total])?;
+    }
     Ok(added > 0)
 }
 
@@ -741,6 +760,31 @@ fn seal_rows(conn: &Connection, file_id: i64) -> Result<usize> {
         if held.contains(&key(&r)?) { copies.push(r) } else { fresh.push(r) }
     }
     let rows = fresh;
+    // what the rows a save couldnt tell from copies said: the copies' goes,
+    // the rest's is folded into the file now it's known to be new
+    let mut held: HashMap<String, Article> = conn
+        .prepare_cached("select message_id, subject, part, total_parts, file_total from held_back where file_id = ?")?
+        .query_map([file_id], |r| {
+            Ok(Article {
+                message_id: r.get(0)?,
+                subject: r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                part: r.get(2)?,
+                total_parts: r.get(3)?,
+                file_total: r.get(4)?,
+                ..Default::default()
+            })
+        })?
+        .map(|a| a.map(|a| (a.message_id.clone(), a)))
+        .collect::<Result<_>>()?;
+    let mut news = Vec::new();
+    if !held.is_empty() {
+        conn.prepare_cached("delete from held_back where file_id = ?")?.execute([file_id])?;
+        for r in &rows {
+            if let Some(a) = held.remove(&key(r)?) {
+                news.push(a);
+            }
+        }
+    }
     for copy in &copies {
         conn.prepare_cached("delete from segments where file_id = ? and local = ? and domain = ?")?
             .execute(params![file_id, copy.local, copy.domain])?;
@@ -757,6 +801,27 @@ fn seal_rows(conn: &Connection, file_id: i64) -> Result<usize> {
             insert_part(&mut seen, p);
         }
         conn.prepare_cached("update files set seen = ? where id = ?")?.execute(params![seen, file_id])?;
+    }
+    if !news.is_empty() {
+        let (release_id, filename): (i64, String) = conn
+            .prepare_cached("select release_id, filename from files where id = ?")?
+            .query_row([file_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        let mut f = file(conn, release_id, &filename)?;
+        for a in &news {
+            f.add(a);
+        }
+        conn.prepare_cached(
+            "update files set subject = ?, subject_part = ?, subject_mid = ?, expected = ?, file_total = ? where id = ?",
+        )?
+        .execute(params![f.subject, f.subject_part, f.subject_mid, f.expected, f.file_total, file_id])?;
+        if let Some(ft) = news.iter().filter_map(|a| a.file_total).max() {
+            conn.prepare_cached("update releases set file_total = max(coalesce(file_total, ?), ?) where id = ?")?
+                .execute(params![ft, ft, release_id])?;
+        }
+    }
+    if !copies.is_empty() || !news.is_empty() {
+        let release_id: i64 =
+            conn.prepare_cached("select release_id from files where id = ?")?.query_row([file_id], |r| r.get(0))?;
         let file_total: Option<i64> = conn
             .prepare_cached("select file_total from releases where id = ?")?
             .query_row([release_id], |r| r.get(0))?;
@@ -1129,23 +1194,26 @@ impl ShardWriter {
                     }
                 }
 
-                let mut added: Vec<&Article> = Vec::new();
+                // and whether each might be a copy of a sealed article (see `SealedCache`)
+                let mut added: Vec<(&Article, bool)> = Vec::new();
                 for (name, articles) in by_file {
                     let mut f = file(&tx, release_id, name)?;
                     let before = added.len();
                     for a in articles {
                         if add_segment(&tx, domains, &f, a, &mut sealed)? {
-                            if f.sealed && sealed.guessed {
+                            let unsure = f.sealed && sealed.guessed;
+                            if unsure {
                                 // maybe a copy of what the blob has: only its part
-                                // counts, till sealing the file again tells (`seal_rows`
-                                // works the parts out again from what is left)
+                                // counts, the rest is held back till sealing the file
+                                // again tells (`seal_rows` works the parts out again
+                                // from what is left, and folds in what new rows said)
                                 if let Some(p) = a.part {
                                     insert_part(&mut f.seen, p);
                                 }
                             } else {
                                 f.add(a);
                             }
-                            added.push(a);
+                            added.push((a, unsure));
                         }
                     }
                     if added.len() > before {
@@ -1163,11 +1231,16 @@ impl ShardWriter {
                 new_articles += added.len() as i64;
 
                 let t = Instant::now();
-                let file_total = added.iter().filter_map(|a| a.file_total).chain(old_file_total).max();
+                let file_total = added
+                    .iter()
+                    .filter(|(_, unsure)| !unsure)
+                    .filter_map(|(a, _)| a.file_total)
+                    .chain(old_file_total)
+                    .max();
                 let old_parts = old_parts.unwrap_or(0);
                 let earlier_size = if old_parts > 0 { old_size.unwrap_or(0) } else { 0 };
                 update_stats.execute(params![
-                    earlier_size + added.iter().map(|a| a.bytes).sum::<i64>(),
+                    earlier_size + added.iter().map(|(a, _)| a.bytes).sum::<i64>(),
                     release_complete(&tx, release_id, file_total)? as i64,
                     old_parts + added.len() as i64,
                     file_total,
@@ -1344,6 +1417,7 @@ pub fn purge_incomplete(main: &Path) -> Result<()> {
         }
         tx.execute_batch(&format!(
             "delete from segments where file_id in ({doomed});
+             delete from held_back where file_id in ({doomed});
              delete from files where release_id in (select id from releases where complete = 0);
              delete from releases where complete = 0;"
         ))?;
@@ -2279,6 +2353,58 @@ mod tests {
         }
         assert_eq!((file(&conn, "a.rar"), file(&conn, "b.rar")), (a, b), "the copies went, and what they said");
         assert!(!complete(&conn), "b.rar still has 1 of 2");
+        let held: i64 = conn.query_row("select count(*) from held_back", [], |r| r.get(0)).unwrap();
+        assert_eq!(held, 0, "what the copies said is gone with them");
+    }
+
+    /// A genuinely new article a save past its decode budget keeps as a row
+    /// has its total, file total and subject held back, not lost: sealing
+    /// the file again, once it knows the row isnt a copy, folds them in.
+    #[test]
+    fn a_new_article_past_the_decode_budget_gets_its_totals_at_sealing() {
+        let (_dir, main) = sealed_fixture();
+        let shard = shard_of("alt.binaries.t");
+        let mut conn = db::open_at(&shard_path(&main, shard)).unwrap();
+        for id in conn.prepare("select id from files").unwrap().query_map([], |r| r.get(0)).unwrap() {
+            seal_file(&conn, id.unwrap()).unwrap();
+        }
+        let expected = |conn: &Connection, name: &str| -> Option<i64> {
+            conn.query_row("select expected from files where filename = ?", [name], |r| r.get(0)).unwrap()
+        };
+        let release = |conn: &Connection| -> (bool, Option<i64>) {
+            conn.query_row("select complete, file_total from releases", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap()
+        };
+
+        // a.rar turns out to have a 4th part, and b.rar gets its 2nd (of 2 files)
+        let new = |id: &str, name: &str, part: i64, total: i64| Article {
+            message_id: id.into(),
+            subject: format!("\"{name}\" yEnc ({part}/{total})"),
+            filename: Some(name.into()),
+            part: Some(part),
+            total_parts: Some(total),
+            file_total: Some(2),
+            bytes: 100 + part,
+            ..Default::default()
+        };
+        let mut writer = ShardWriter::new(shard);
+        writer.decode_budget = 0;
+        let rel = Release {
+            name: "Rel".into(),
+            group: "alt.binaries.t".into(),
+            articles: vec![new("<a4@x>", "a.rar", 4, 4), new("<b2@x>", "b.rar", 2, 2)],
+            ..Default::default()
+        };
+        writer.save(&mut conn, &Ids::new(&main), [std::slice::from_ref(&rel)]).unwrap();
+        assert_eq!(expected(&conn, "a.rar"), Some(3), "held back while it could be a copy");
+        assert_eq!(release(&conn).1, None);
+
+        for id in conn.prepare("select id from files").unwrap().query_map([], |r| r.get(0)).unwrap() {
+            seal_file(&conn, id.unwrap()).unwrap();
+        }
+        assert_eq!(expected(&conn, "a.rar"), Some(4), "not a copy: its total counts");
+        assert_eq!(release(&conn), (true, Some(2)), "every file has its parts, and the file total");
+        let held: i64 = conn.query_row("select count(*) from held_back", [], |r| r.get(0)).unwrap();
+        assert_eq!(held, 0);
     }
 
     /// what purging takes off the totals is what it deleted, counted in its
