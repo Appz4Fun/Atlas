@@ -394,3 +394,44 @@ fn a_stopped_conversion_copies_again_when_the_old_database_changed() {
     let id: i64 = conn.query_row("select id from releases where name = 'Late.Release'", [], |r| r.get(0)).unwrap();
     assert_eq!(store::articles(&conn, id).unwrap().len(), 1);
 }
+
+/// Stopped between moving the old database aside and putting the new one in
+/// place: the next start finishes the swap.
+#[test]
+fn a_swap_cut_after_the_old_database_moved_aside_is_finished_at_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = dir.path().join("atlas.db");
+    old_database(&main);
+    let before = old_nzbs(&main);
+    db::create_db_at(&main).unwrap();
+    convert::run(&main, &|_| {}).unwrap();
+    // as it was before the second rename
+    std::fs::rename(&main, dir.path().join("atlas.new.db")).unwrap();
+
+    drop(db::create_db_holding(&main).unwrap().expect("set up"));
+    assert!(!dir.path().join("atlas.new.db").exists());
+    assert!(dir.path().join("atlas.old.db").exists());
+    assert!(!convert::needed(&main));
+    let conn = db::open_with_shards(&main).unwrap();
+    assert_eq!(store::totals(&conn).unwrap().0, before.len() as i64);
+}
+
+/// Moved aside with a new main database that never got to the swap: the
+/// next start puts the old database back, and converting goes on from it.
+#[test]
+fn an_old_database_moved_aside_without_a_finished_new_one_is_put_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = dir.path().join("atlas.db");
+    old_database(&main);
+    db::create_db_at(&main).unwrap();
+    let stopped = std::panic::catch_unwind(|| {
+        convert::run(&main, &|m| assert!(!m.contains("checking NZBs"), "stop here")).unwrap();
+    });
+    assert!(stopped.is_err());
+    std::fs::rename(&main, dir.path().join("atlas.old.db")).unwrap();
+
+    drop(db::create_db_holding(&main).unwrap().expect("set up"));
+    assert!(!dir.path().join("atlas.old.db").exists());
+    assert!(convert::needed(&main), "the old database is back");
+    assert_eq!(convert::run_alone(&main, &|_| {}).unwrap().map(|(r, _)| r), Some(40));
+}

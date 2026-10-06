@@ -79,6 +79,9 @@ pub fn run_alone(main: &Path, progress: &dyn Fn(&str)) -> Result<Option<(i64, i6
         Some(_) => anyhow!("the database is in use (indexing, a compaction or another conversion); try again later"),
         None => e,
     })?;
+    if let Some(said) = recover_cut_swap(main)? {
+        progress(&said);
+    }
     if !needed(main) {
         return Ok(None);
     }
@@ -135,6 +138,12 @@ pub fn run(main: &Path, progress: &dyn Fn(&str)) -> Result<(i64, i64)> {
         conn.query_row("pragma journal_mode = wal", [], |_| Ok(()))?;
         checkpoint(&conn).with_context(|| format!("folding {}'s WAL in", path.display()))?;
     }
+    {
+        // from here atlas.new.db is whole: a swap cut short finishes at the next start
+        let conn = db::open_at(&new_main)?;
+        conn.execute("insert or replace into meta (key, value) values ('swap_ready', 1)", [])?;
+        checkpoint(&conn).context("folding the new main database's WAL in")?;
+    }
     drop(old);
     let backup = sibling(main, "atlas.old.db");
     remove_db(&backup);
@@ -148,7 +157,11 @@ pub fn run(main: &Path, progress: &dyn Fn(&str)) -> Result<(i64, i64)> {
     }
     // its -wal and -shm go aside with it, whatever they still hold
     rename_db(main, &backup).context("moving the old database aside")?;
-    rename_db(&new_main, main).context("putting the new main database in place")?;
+    if let Err(e) = rename_db(&new_main, main) {
+        // the old one back, soo there is a main database to start from
+        let _ = rename_db(&backup, main);
+        return Err(e).context("putting the new main database in place");
+    }
 
     progress(&format!(
         "converted {moved_releases} releases and {moved_articles} articles in {} ({orphans} articles without a release left out). \
@@ -157,6 +170,40 @@ pub fn run(main: &Path, progress: &dyn Fn(&str)) -> Result<(i64, i64)> {
         backup.display()
     ));
     Ok((moved_releases, moved_articles))
+}
+
+/// A swap that was cut short between moving the old database aside and
+/// putting the new one in place leaves no main database. Finishes it when
+/// `atlas.new.db` got through everything before the swap, else puts
+/// `atlas.old.db` back (and the next start converts again). Run under the
+/// exclusive lock. What it did, if anything.
+pub fn recover_cut_swap(main: &Path) -> Result<Option<String>> {
+    if main.try_exists()? {
+        return Ok(None);
+    }
+    let (new_main, backup) = (sibling(main, "atlas.new.db"), sibling(main, "atlas.old.db"));
+    if new_main.try_exists()? && swap_ready(&new_main) {
+        rename_db(&new_main, main).context("putting the converted main database in place")?;
+        return Ok(Some(format!(
+            "a conversion was cut short putting {} in place; it's in place now (the old database is {})",
+            main.display(),
+            backup.display()
+        )));
+    }
+    if backup.try_exists()? {
+        rename_db(&backup, main).context("putting the old database back")?;
+        return Ok(Some(format!(
+            "a conversion was cut short after moving {} aside; it's back in place",
+            main.display()
+        )));
+    }
+    Ok(None)
+}
+
+fn swap_ready(new_main: &Path) -> bool {
+    db::open_at(new_main)
+        .and_then(|c| c.query_row("select value from meta where key = 'swap_ready'", [], |r| r.get(0)).optional())
+        .is_ok_and(|v: Option<i64>| v == Some(1))
 }
 
 type OldRelease = (i64, ReleaseFields);

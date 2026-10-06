@@ -136,6 +136,14 @@ pub fn create_db() -> anyhow::Result<Option<WriteGuard>> {
 /// while a compaction runs, and nothing was set up (a compaction only runs
 /// on a database that is).
 pub fn create_db_holding(path: &Path) -> anyhow::Result<Option<WriteGuard>> {
+    // a conversion's swap cut short leaves no main database: finished or
+    // undone first, alone (busy means someone is using the database, soo it's there)
+    if !path.try_exists()?
+        && let Ok(_alone) = crate::compact::Lock::take(path)
+        && let Some(said) = crate::convert::recover_cut_swap(path)?
+    {
+        crate::ui::warn(&said);
+    }
     let Some(held) = crate::compact::try_hold_off_compaction(path)? else { return Ok(None) };
     create_db_at(path)?;
     Ok(Some(held))
