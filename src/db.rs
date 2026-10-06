@@ -141,19 +141,23 @@ pub fn create_db_holding(path: &Path) -> anyhow::Result<Option<WriteGuard>> {
     Ok(Some(held))
 }
 
-/// Settings > wipe: the main database and every shard, with their sidecars
-/// and what a compaction leaves (`.compact.db`, `.precompact.db`). Under the
-/// exclusive compaction lock, soo refused (`Busy`) while the indexer, a write
-/// from outside it or a compaction has the database. Leaves nothing to set
-/// up again from: the next `create_db` makes a new one.
+/// Settings > wipe: every shard, with their sidecars and what a compaction
+/// leaves (`.compact.db`, `.precompact.db`), then the main database. Under
+/// the exclusive compaction lock, soo refused (`Busy`) while the indexer, a
+/// write from outside it or a compaction has the database. Leaves nothing to
+/// set up again from: the next `create_db` makes a new one. The main
+/// database goes only once every shard has: a new main database next to old
+/// shards would hand out their ids again. A shard that cant be removed is an
+/// error, with the main database left in place.
 pub fn wipe(main: &Path) -> anyhow::Result<()> {
     let _exclusive = crate::compact::Lock::take(main)?;
-    let mut dbs = vec![main.to_path_buf()];
+    let mut dbs = Vec::new();
     for shard in store::shard_paths(main) {
         dbs.push(crate::compact::with_suffix(&shard, "compact"));
         dbs.push(crate::compact::with_suffix(&shard, "precompact"));
         dbs.push(shard);
     }
+    dbs.push(main.to_path_buf());
     for db in dbs {
         for suffix in ["", "-wal", "-shm", "-journal"] {
             let file = format!("{}{suffix}", db.display());
@@ -693,5 +697,26 @@ mod tests {
         create_db_at(&main).unwrap();
         assert_eq!(held(&main), (0, Some(1)), "no releases, ids from the start");
         assert!(group_progress(&open_at(&main).unwrap()).unwrap().is_empty(), "no cursors");
+    }
+
+    #[test]
+    fn a_wipe_that_cant_remove_a_shard_keeps_the_main_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        create_db_at(&main).unwrap();
+        init_group_state(&open_at(&main).unwrap(), "alt.binaries.a@news.x", 500).unwrap();
+
+        // a shard that cant be removed (on Windows one still open, here a folder)
+        let stuck = store::shard_paths(&main).pop().unwrap();
+        std::fs::remove_file(&stuck).unwrap();
+        std::fs::create_dir(&stuck).unwrap();
+        let err = wipe(&main).expect_err("a shard was left");
+        assert!(format!("{err:#}").contains(&stuck.display().to_string()), "{err:#}");
+        assert!(main.exists(), "the main database stays while a shard is left");
+        assert_eq!(group_progress(&open_at(&main).unwrap()).unwrap().len(), 1, "with its cursors");
+
+        std::fs::remove_dir(&stuck).unwrap();
+        wipe(&main).unwrap();
+        assert!(!main.exists());
     }
 }
