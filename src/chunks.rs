@@ -13,7 +13,8 @@ const DONE: i64 = 2;
 
 /// Initialize the backfill_chunks table if it doesn't exist, and give one
 /// made before chunks kept their finish time its done_at column. Also the
-/// server that goes back furthest, by split group (see `deepest`).
+/// server that goes back furthest, by split group (see `deepest`), and the
+/// servers whose sweep of a split group is done (see `swept`).
 pub fn create(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "create table if not exists backfill_chunks (
@@ -30,6 +31,11 @@ pub fn create(conn: &Connection) -> Result<()> {
             server TEXT NOT NULL,
             oldest_at INTEGER,
             runner_up_at INTEGER
+        ) without rowid;
+        create table if not exists backfill_sweeps (
+            grp TEXT NOT NULL,
+            server TEXT NOT NULL,
+            primary key (grp, server)
         ) without rowid;",
     )?;
     add_column(conn, "backfill_chunks", "done_at")?;
@@ -250,6 +256,38 @@ pub fn waiting(conn: &Connection, groups: &[(String, i64)]) -> Result<bool> {
         }
     }
     Ok(false)
+}
+
+/// Whether every day chunk of split `group` is done.
+pub fn chunks_done(conn: &Connection, group: &str) -> Result<bool> {
+    Ok(is_split(conn, group)?
+        && !conn.prepare_cached("select 1 from backfill_chunks where grp = ? and state != 2")?.exists([group])?)
+}
+
+/// Note `server`'s sweep of split `group` as done: its cursor backfill got
+/// down to its first article after the day chunks (see `indexer::run_sweep`).
+pub fn set_swept(conn: &Connection, group: &str, server: &str) -> Result<()> {
+    conn.execute("insert or ignore into backfill_sweeps (grp, server) values (?, ?)", [group, server])?;
+    Ok(())
+}
+
+/// Whether `server`'s sweep of split `group` is done.
+pub fn swept(conn: &Connection, group: &str, server: &str) -> Result<bool> {
+    conn.prepare_cached("select 1 from backfill_sweeps where grp = ? and server = ?")?.exists([group, server])
+}
+
+/// Whether split `group` is complete: every day chunk done and every one of
+/// `servers` (the ones carrying it) swept down to its first article.
+pub fn complete(conn: &Connection, group: &str, servers: &[String]) -> Result<bool> {
+    if !chunks_done(conn, group)? {
+        return Ok(false);
+    }
+    for s in servers {
+        if !swept(conn, group, s)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// groups with chunks still to do

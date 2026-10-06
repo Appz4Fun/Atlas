@@ -442,7 +442,12 @@ where
             // Date headers posters can forge, and neighbouring days done on
             // other servers can leave numbers between them; the sweep picks up
             // whatever the chunks missed (what they got is dropped as a duplicate)
+            // the other carriers sweep their own numbers the same way (see `run_sweep`)
             None if sweep_due(ctx, db, &ctx.pool.host(server)).await? => {
+                if state.backfill_cursor.min(last) < first {
+                    let (g, host) = (group.to_string(), ctx.pool.host(server));
+                    on_db(db, move |conn| Ok(crate::chunks::set_swept(conn, &g, &host)?)).await?;
+                }
                 let pass = Pass { ctx, settings, db, group, server, key };
                 pass.backfill(state, first, last, progress).await
             }
@@ -736,6 +741,80 @@ pub async fn claim_chunk(
     .await
 }
 
+/// A split group whose day chunks are all done that `host`, not its home,
+/// still has to sweep, among `groups`.
+pub async fn sweep_to_take(db: &Db, host: String, groups: Vec<String>) -> Result<Option<String>> {
+    on_db(db, move |conn| {
+        for g in groups {
+            if crate::chunks::chunks_done(conn, &g)? && !crate::chunks::swept(conn, &g, &host)? {
+                return Ok(Some(g));
+            }
+        }
+        Ok(None)
+    })
+    .await
+}
+
+/// One batch of the sweep of split `group` on `server`, a carrier that is
+/// not its home, once its day chunks are done: like the home's (see
+/// `run_pass`), the server's own cursor backfill from where its backfill
+/// got (its high mark when it has none, where its newest chunk ended) down
+/// to its first article. The chunks go by forgeable Date headers: when the
+/// home keeps less than this server, what they missed of the days only this
+/// one keeps is here. Noted as swept once at its first article (or when it
+/// doesnt carry the group); the split is complete when every carrier is.
+pub async fn run_sweep<P>(
+    ctx: &PassContext,
+    settings: &PassSettings,
+    db: &Db,
+    group: &str,
+    server: usize,
+    progress: &mut P,
+) -> Result<Progress>
+where
+    P: FnMut(&Progress) + ?Sized,
+{
+    let (g, host) = (group.to_string(), ctx.pool.host(server));
+    let swept = || {
+        let (g, host) = (g.clone(), host.clone());
+        on_db(db, move |conn| Ok(crate::chunks::set_swept(conn, &g, &host)?))
+    };
+    // this server alone, like a day chunk
+    let (_count, first, last, _name) = match ctx.pool.group_on(server, group).await {
+        Ok(info) => info,
+        Err(e) if e.code() == Some(411) => {
+            swept().await?;
+            return Err(NotCarried { group: g, host }.into());
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let (first, last) = (first as i64, last as i64);
+    let key = cursor_key(&ctx.pool, server, group);
+    let cursor = match load_cursors(db, &key, group, server == 0).await? {
+        Some(s) => s.backfill_cursor.min(last),
+        None => {
+            let k = key.clone();
+            on_db(db, move |conn| Ok(db::init_group_state(conn, &k, last)?)).await?;
+            last
+        }
+    };
+    if cursor < first {
+        swept().await?;
+        println!("[SWEEP] {group} on {host} done");
+        return Ok(Progress::default());
+    }
+
+    // the cursor backfill's batch, without touching the group's run state:
+    // that is the home's
+    let start = first.max(cursor - settings.batch_size.max(1) + 1);
+    let pass = Pass { ctx, settings, db, group, server, key: key.clone() };
+    let (saved, complete) = pass.process_range(start, cursor, "SWEEP", progress).await?;
+    if complete {
+        on_db(db, move |conn| Ok(db::update_backfill_cursor(conn, &key, start - 1)?)).await?;
+    }
+    Ok(saved)
+}
+
 /// a day chunk also takes this much on each side: post dates are only
 /// roughly in article number order, duplicates are dropped when saved
 pub const CHUNK_OVERLAP: i64 = 3600;
@@ -954,8 +1033,8 @@ where
 /// also reaches `safety` (`CHUNK_SAFETY`) numbers past where its search put it (the
 /// articles a neighbour has too are dropped as duplicates when saved): a
 /// shift up to that many articles is covered, a forged run moving a search
-/// further can still leave a gap, for the home server's sweep once the
-/// chunks are done (see `run_pass`).
+/// further can still leave a gap, for the carriers' sweeps once the
+/// chunks are done (see `run_pass` and `run_sweep`).
 pub async fn chunk_range(
     pool: &Pool,
     server: usize,

@@ -276,6 +276,8 @@ struct Scheduler {
     skip: Mutex<HashMap<(String, usize), Option<Instant>>>,
     /// consecutive day chunk errors per (group, server)
     chunk_errors: Mutex<HashMap<(String, usize), u32>>,
+    /// servers one of whose workers sweeps a split group (see `take_sweep`)
+    sweeping: Mutex<HashSet<usize>>,
     /// groups resting after going idle or after an error
     wait_until: Mutex<HashMap<String, Instant>>,
     /// consecutive errors per group
@@ -492,6 +494,39 @@ async fn take_chunk(sched: &Scheduler, server: usize, db: &Db) -> Option<crate::
     }
 }
 
+/// A split group whose day chunks are done for an idle worker on `server`
+/// to sweep (see `indexer::run_sweep`): one this server is not the home of
+/// and hasnt swept, none while another of its workers sweeps.
+async fn take_sweep(sched: &Scheduler, server: usize, db: &Db) -> Option<String> {
+    let tier = sched.ctx.pool.indexing_tier();
+    if !tier.contains(&server) || !sched.sweeping.lock().unwrap().insert(server) {
+        return None;
+    }
+
+    let skip: HashSet<String> = {
+        let now = Instant::now();
+        let mut skip = sched.skip.lock().unwrap();
+        skip.retain(|_, until| until.is_none_or(|t| t > now));
+        skip.keys().filter(|(_, s)| *s == server).map(|(g, _)| g.clone()).collect()
+    };
+    let mode = sched.settings.read().unwrap().mode.clone();
+    let groups: Vec<String> = chunk_groups(&mode, &sched.groups.read().unwrap(), &skip)
+        .into_iter()
+        .filter(|g| sched.ctx.pool.pick_server_in(&tier, g) != server)
+        .collect();
+    let found = match crate::indexer::sweep_to_take(db, sched.ctx.pool.host(server), groups).await {
+        Ok(found) => found,
+        Err(e) => {
+            ui::error(&format!("couldnt look for a split group to sweep: {e}"));
+            None
+        }
+    };
+    if found.is_none() {
+        sched.sweeping.lock().unwrap().remove(&server);
+    }
+    found
+}
+
 /// One worker on `server`: index whichever of its groups is due next, again and again.
 /// All workers share one db connection, soo their writes queue up in order
 /// instead of racing for sqlite's write lock (and timing out on a busy db).
@@ -508,6 +543,19 @@ async fn worker(sched: Arc<Scheduler>, server: usize, db: Db) {
                 let run = crate::indexer::run_chunk(&sched.ctx, &settings, &db, &chunk, server, &mut progress);
                 let Some(result) = unless_stopped(&sched.ctx.stop, run).await else { break };
                 sched.finish_chunk(chunk.group, server, result);
+                continue;
+            }
+            // or, once a split group's chunks are done, sweep this server's
+            // numbers of it for what they missed (one worker per server at a time)
+            if let Some(group) = take_sweep(&sched, server, &db).await {
+                let settings = sched.settings.read().unwrap().clone();
+                let stats = sched.stats.clone();
+                let mut progress = |p: &Progress| stats.lock().unwrap().tick(p.articles, p.bytes, p.releases, &group);
+                let run = crate::indexer::run_sweep(&sched.ctx, &settings, &db, &group, server, &mut progress);
+                let result = unless_stopped(&sched.ctx.stop, run).await;
+                sched.sweeping.lock().unwrap().remove(&server);
+                let Some(result) = result else { break };
+                sched.finish_chunk(group, server, result);
                 continue;
             }
             nap(Duration::from_secs(1), || sched.stopping()).await;
@@ -640,6 +688,7 @@ async fn run_servers(
         busy: Mutex::new(HashSet::new()),
         skip: Mutex::new(HashMap::new()),
         chunk_errors: Mutex::new(HashMap::new()),
+        sweeping: Mutex::new(HashSet::new()),
         wait_until: Mutex::new(HashMap::new()),
         errors: Mutex::new(HashMap::new()),
         failed: Mutex::new(HashMap::new()),
