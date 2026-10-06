@@ -468,8 +468,8 @@ fn compact_shard(
             let id: Option<i64> = file.map(|f| f.get(0)).transpose()?;
             // rows whose file isnt there (purged, or past the last file) stay rows
             while let Some(row) = pending.take_if(|r| id.is_none_or(|id| r.file_id < id)) {
-                insert_row(&tx, &row)?;
-                (copied, in_tx) = (copied + 1, in_tx + 1);
+                copied += insert_row(&tx, &row)?;
+                in_tx += 1;
                 if (copied as usize).is_multiple_of(STOP_EVERY) {
                     halt(stop, shard)?;
                 }
@@ -509,15 +509,12 @@ fn compact_shard(
 
             // a row the blob already has (the same message-id) isnt copied, nor
             // is a second row of one (a spilled segment and its loose copy):
-            // they go before the blob is counted, the way `seal_rows` drops them
+            // they go before the blob is counted, the way `seal_rows` drops them.
+            // `held` stays for the streamed tail below (there is none without rows here)
+            let mut held: HashSet<String> = HashSet::new();
             if !file_rows.is_empty() {
-                // (the same message-id, whichever way each is stored now)
-                let mut key = |local: &[u8], domain: i64| -> Result<String> {
-                    let suffix: Option<String> =
-                        if domain == 0 { None } else { suffix_of.query_row([domain], |r| r.get(0)).optional()? };
-                    Ok(store::dedup_key(local, domain, suffix.as_deref()))
-                };
-                let mut held: HashSet<String> = segs.iter().map(|s| key(&s.local, s.domain)).collect::<Result<_>>()?;
+                let mut key = |local: &[u8], domain: i64| dedup_key(&mut suffix_of, local, domain);
+                held = segs.iter().map(|s| key(&s.local, s.domain)).collect::<Result<_>>()?;
                 let (mut dropped, mut kept) = (Vec::new(), Vec::new());
                 for r in file_rows {
                     if held.insert(key(&r.local, r.domain)?) { kept.push(r) } else { dropped.push(r) }
@@ -557,15 +554,21 @@ fn compact_shard(
             values.push(blob.map_or(Value::Null, Value::Blob));
             tx.prepare_cached(&format!("insert into files ({FILE_COLUMNS}) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"))?
                 .execute(params_from_iter(values))?;
+            copied += segs.len() as i64;
             for row in &file_rows {
-                insert_row(&tx, row)?;
+                copied += insert_row(&tx, row)?;
             }
-            copied += (segs.len() + file_rows.len()) as i64;
             in_tx += 1 + segs.len() + file_rows.len();
-            // the rest of a file too big to buffer, a row at a time
+            // the rest of a file too big to buffer, a row at a time, a copy of
+            // a row before it dropped the same way
+            let (mut tail_bytes, mut tail_copies) = (0i64, 0i64);
             while let Some(row) = pending.take_if(|r| r.file_id == id) {
-                insert_row(&tx, &row)?;
-                (copied, in_tx) = (copied + 1, in_tx + 1);
+                if held.insert(dedup_key(&mut suffix_of, &row.local, row.domain)?) {
+                    copied += insert_row(&tx, &row)?;
+                } else {
+                    (tail_bytes, tail_copies) = (tail_bytes + row.bytes.unwrap_or(0), tail_copies + 1);
+                }
+                in_tx += 1;
                 if (copied as usize).is_multiple_of(STOP_EVERY) {
                     halt(stop, shard)?;
                 }
@@ -575,6 +578,10 @@ fn compact_shard(
                     in_tx = 0;
                 }
                 pending = next_row(shard, &mut rows, &shared)?;
+            }
+            if tail_copies > 0 {
+                store::uncount_copies(&tx, f.get(1)?, tail_bytes, tail_copies)?;
+                copies += tail_copies;
             }
             if in_tx >= BATCH {
                 tx.commit()?;
@@ -689,10 +696,19 @@ fn next_row(shard: usize, rows: &mut rusqlite::Rows, shared: &dyn Fn(i64) -> boo
     Ok(Some(Row { file_id, local, domain, part: r.get(3)?, bytes: r.get(4)? }))
 }
 
-fn insert_row(conn: &Connection, r: &Row) -> Result<()> {
-    conn.prepare_cached("insert or ignore into segments (file_id, local, domain, part, bytes) values (?, ?, ?, ?, ?)")?
+/// the message-id a copied (local, domain) stands for, whichever way it is stored now
+fn dedup_key(suffix_of: &mut rusqlite::Statement, local: &[u8], domain: i64) -> Result<String> {
+    let suffix: Option<String> =
+        if domain == 0 { None } else { suffix_of.query_row([domain], |r| r.get(0)).optional()? };
+    Ok(store::dedup_key(local, domain, suffix.as_deref()))
+}
+
+/// 1 when the row went in, 0 when the copy already had it
+fn insert_row(conn: &Connection, r: &Row) -> Result<i64> {
+    let n = conn
+        .prepare_cached("insert or ignore into segments (file_id, local, domain, part, bytes) values (?, ?, ?, ?, ?)")?
         .execute(params![r.file_id, r.local, r.domain, r.part, r.bytes])?;
-    Ok(())
+    Ok(n as i64)
 }
 
 /// The copy holds the same releases, files and articles (rows and inside
@@ -1325,6 +1341,60 @@ mod tests {
         assert_eq!(rows, 1, "one row");
         let blob: Vec<u8> = conn.query_row("select blob from files where id = ?", [file], |r| r.get(0)).unwrap();
         assert!(crate::blob::decode(&blob).unwrap().iter().all(|s| s.local.len() <= crate::blob::MAX_LOCAL));
+    }
+
+    /// The same, in a file with more rows than a blob takes: the loose copy
+    /// comes in the streamed tail, past the rows held to seal, and is still
+    /// one row with the copy out of the totals, not a failed check every retry.
+    #[test]
+    fn a_long_blob_segments_loose_copy_past_the_buffered_rows_is_one_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        legacy_fixture(&main);
+        run(&main, &|_| {}, &no_stop()).unwrap();
+        let (path, file) = file_of(&main, "Rel.1", "alt.binaries.g1");
+        {
+            let conn = db::open_at(&path).unwrap();
+            let suffix = format!("@{}>", "d".repeat(240));
+            conn.execute("insert into domains (suffix) values (?)", [&suffix]).unwrap();
+            let d: i64 = conn.query_row("select id from domains where suffix = ?", [&suffix], |r| r.get(0)).unwrap();
+            let blob: Vec<u8> = conn.query_row("select blob from files where id = ?", [file], |r| r.get(0)).unwrap();
+            let mut segs = crate::blob::decode(&blob).unwrap();
+            let mut local = vec![0u8];
+            local.extend(std::iter::repeat_n(b'a', 300));
+            segs.push(Seg { part: Some(99), bytes: 5, domain: d, local: local.clone() });
+            conn.execute("update files set blob = ? where id = ?", params![crate::blob::encode(&segs), file]).unwrap();
+            // rows past what a blob takes, sorting before the copy so it comes after them
+            conn.execute(
+                "with recursive n(i) as (select 1 union all select i + 1 from n where i < ?2)
+                 insert into segments (file_id, local, domain, part, bytes)
+                 select ?1, cast(x'00' || cast('A' || i as blob) as blob), 0, 100 + i, 1 from n",
+                params![file, store::SEAL_MAX_SEGMENTS + 1],
+            )
+            .unwrap();
+            conn.execute(
+                "insert into segments (file_id, local, domain, part, bytes) values (?, ?, ?, ?, ?)",
+                params![file, local, d, 99, 5],
+            )
+            .unwrap();
+            conn.execute(
+                "update releases set size = size + 10 + ?2, parts = parts + 2 + ?2
+                 where id = (select release_id from files where id = ?1)",
+                params![file, store::SEAL_MAX_SEGMENTS + 1],
+            )
+            .unwrap();
+            store::add_totals(&conn, 0, 2 + store::SEAL_MAX_SEGMENTS + 1).unwrap();
+        }
+        let count = article_total(&main);
+        let totals = release_totals(&path, file);
+
+        run(&main, &|_| {}, &no_stop()).unwrap();
+        assert_eq!(article_total(&main), count - 1, "the copy went out of the shard's total");
+        assert_eq!(release_totals(&path, file), (totals.0 - 5, totals.1 - 1, totals.2 - 1), "and the release's");
+        let conn = db::open_at(&path).unwrap();
+        let rows: i64 =
+            conn.query_row("select count(*) from segments where file_id = ?", [file], |r| r.get(0)).unwrap();
+        assert_eq!(rows, store::SEAL_MAX_SEGMENTS + 2, "the padding and one long row");
     }
 
     #[test]
