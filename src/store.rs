@@ -184,6 +184,21 @@ pub fn build_shard(conn: &Connection) -> Result<()> {
             primary key (file_id, local, domain)
         ) without rowid;
 
+        -- running totals for the stats pages: releases, articles
+        create table if not exists meta (key TEXT PRIMARY KEY, value INTEGER);
+        insert or ignore into meta (key, value) values ('releases', 0), ('articles', 0);
+        ",
+    )?;
+    migrate_shard(conn)
+}
+
+/// What a shard made before sealing lacks: `files.touched_at` (when
+/// articles were last added) and `files.blob` (a sealed file's articles), in
+/// the same order `create_shard` has them, and the `held_back` table. Adding
+/// a nullable column doesnt rewrite the table.
+pub fn migrate_shard(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "
         -- what a row a save couldnt tell from a copy of its sealed file's
         -- article said about the file, folded in when sealing tells (`seal_rows`)
         create table if not exists held_back (
@@ -195,20 +210,8 @@ pub fn build_shard(conn: &Connection) -> Result<()> {
             file_total INTEGER,
             primary key (file_id, message_id)
         ) without rowid;
-
-        -- running totals for the stats pages: releases, articles
-        create table if not exists meta (key TEXT PRIMARY KEY, value INTEGER);
-        insert or ignore into meta (key, value) values ('releases', 0), ('articles', 0);
         ",
     )?;
-    migrate_shard(conn)
-}
-
-/// Columns a shard made before sealing lacks: `files.touched_at` (when
-/// articles were last added) and `files.blob` (a sealed file's articles), in
-/// the same order `create_shard` has them. Adding a nullable column doesnt
-/// rewrite the table.
-pub fn migrate_shard(conn: &Connection) -> Result<()> {
     let cols: Vec<String> =
         conn.prepare("pragma table_info(files)")?.query_map([], |r| r.get(1))?.collect::<Result<_>>()?;
     for (col, kind) in [("touched_at", "INTEGER"), ("blob", "BLOB")] {

@@ -369,7 +369,7 @@ fn compact_shard(
     {
         let conn = db::open_at(&path)?;
         checkpoint(&conn).context("folding the original's WAL in")?;
-        // a shard from before sealing gets its (empty) seal columns
+        // a shard from before sealing gets its (empty) seal columns and tables
         store::migrate_shard(&conn)?;
     }
     let before = size(&path);
@@ -1094,6 +1094,31 @@ mod tests {
         };
         store::save(&main, &[more]).unwrap();
         assert_eq!(all_articles(&main), before, "an article already there isnt saved twice");
+    }
+
+    #[test]
+    fn compacting_shards_from_before_sealing_adds_what_they_lack_and_keeps_every_nzb() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        legacy_fixture(&main);
+        let before = all_articles(&main);
+        let count = article_total(&main);
+        // back to the shard schema before sealing: no held_back, no seal columns
+        for path in store::shard_paths(&main) {
+            db::open_at(&path)
+                .unwrap()
+                .execute_batch(
+                    "drop table held_back;
+                     alter table files drop column blob;
+                     alter table files drop column touched_at;",
+                )
+                .unwrap();
+        }
+
+        run(&main, &|_| {}, &no_stop()).unwrap();
+        assert_eq!(all_articles(&main), before, "every NZB reads back the same");
+        assert_eq!(article_total(&main), count);
+        assert_eq!(loose(&main), 0, "every file was due, so all are sealed");
     }
 
     #[test]
