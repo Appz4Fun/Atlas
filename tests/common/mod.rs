@@ -62,6 +62,9 @@ pub struct Server {
     pub body_delay: Duration,
     /// answer an empty XOVER range with 420 (some providers) instead of 423
     pub empty_is_420: bool,
+    /// GROUP reports this as the low water mark instead of the first post's
+    /// number, like a provider whose low mark lags behind its retention
+    pub reported_low: Option<u64>,
 }
 
 impl Server {
@@ -91,6 +94,7 @@ impl Server {
             bodies_sent: AtomicUsize::new(0),
             body_delay: Duration::ZERO,
             empty_is_420: false,
+            reported_low: None,
         })
     }
 }
@@ -201,7 +205,7 @@ pub fn serve(stream: TcpStream, state: &Server, over_limit: bool) {
             "GROUP" if arg == GROUP || (state.any_group && arg.starts_with("alt.binaries.")) => {
                 selected = Some(arg.to_string());
                 let posts = posts_lock();
-                let first = posts.iter().map(|p| p.number).min().unwrap_or(0);
+                let first = state.reported_low.unwrap_or_else(|| posts.iter().map(|p| p.number).min().unwrap_or(0));
                 let last = posts.iter().map(|p| p.number).max().unwrap_or(0);
                 send(&mut out, format!("211 {} {first} {last} {arg}", posts.len()).as_bytes());
             }

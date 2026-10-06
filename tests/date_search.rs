@@ -465,6 +465,57 @@ fn only_the_server_going_back_furthest_does_the_oldest_day() {
     assert_eq!(state(), 2);
 }
 
+/// A split reaches back to the oldest day of every carrier, also one whose
+/// GROUP low mark sits 5,000 numbers before its first article (retention
+/// has moved on, the mark hasnt): its older days get chunks.
+#[test]
+fn a_split_reaches_a_carrier_whose_low_mark_lags() {
+    let home = tempfile::tempdir().unwrap();
+    let main = home.path().join("atlas.db");
+    atlas::db::create_db_at(&main).unwrap();
+    // posts every hour for 10 days from 2026-01-01, from `from_hour` on
+    let start = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00+00:00").unwrap();
+    let posts = |from_hour: u64, offset: u64| -> Vec<common::Post> {
+        (from_hour..240)
+            .map(|h| {
+                let when = start + chrono::Duration::hours(h as i64);
+                post_at(offset + h, &format!(r#""p{h}.bin" yEnc (1/1)"#), &when.to_rfc2822())
+            })
+            .collect()
+    };
+    // home keeps the last 5 days, "localhost" all 10 with a low mark 5,000 behind
+    let short = spawn_server(Server::new(posts(120, 1)));
+    let mut deep = Server::new(posts(0, 10_001));
+    std::sync::Arc::get_mut(&mut deep).unwrap().reported_low = Some(5_001);
+    let mut lagging = mock(spawn_server(deep), "secret", 2, 2);
+    lagging.host = "localhost".into();
+    let pool = BlockingPool::new(&[mock(short, "secret", 2, 1), lagging]);
+    pool.connect().unwrap();
+
+    let ctx = atlas::indexer::PassContext {
+        pool: pool.pool.clone(),
+        states: Default::default(),
+        stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        verbose: false,
+    };
+    let db = atlas::indexer::shared_db(atlas::db::open_at(&main).unwrap());
+    let settings = atlas::indexer::PassSettings {
+        mode: "backfill".into(),
+        batch_size: 10,
+        request_size: 10,
+        split_min_backlog: 10,
+    };
+    pool.block_on(atlas::indexer::run_pass(&ctx, &settings, &db, GROUP, 0, &mut |_| {})).unwrap();
+
+    let conn = atlas::db::open_at(&main).unwrap();
+    let day = atlas::chunks::unix_day(start.timestamp());
+    assert_eq!(
+        atlas::chunks::oldest_day(&conn, GROUP).unwrap(),
+        Some(day),
+        "chunks back to the deep server's first day"
+    );
+}
+
 /// (number, unix seconds) of a post
 type Slot = (u64, i64);
 

@@ -372,7 +372,16 @@ where
     let phase = ctx.states.with(group, |st| st.phase);
     let backfilling = settings.mode == "backfill" || (settings.mode != "live" && phase == Phase::Backfill);
     if backfilling
-        && maybe_split(ctx, settings, db, group, server, first as u64, state.backfill_cursor.max(0) as u64).await?
+        && maybe_split(
+            ctx,
+            settings,
+            db,
+            group,
+            server,
+            (first as u64, last as u64),
+            state.backfill_cursor.max(0) as u64,
+        )
+        .await?
     {
         // a split group's backfill is day chunks, this server takes the next one
         let host = ctx.pool.host(server);
@@ -432,7 +441,7 @@ async fn maybe_split(
     db: &Db,
     group: &str,
     home: usize,
-    first: u64,
+    (first, last): (u64, u64),
     cursor: u64,
 ) -> Result<bool> {
     let g = group.to_string();
@@ -446,7 +455,7 @@ async fn maybe_split(
         return Ok(false);
     }
 
-    let Some((newest_day, oldest_day, carriers)) = split_days(ctx, group, home, first, cursor).await? else {
+    let Some((newest_day, oldest_day, carriers)) = split_days(ctx, group, home, (first, last), cursor).await? else {
         ctx.states.with(group, |st| st.no_split_until = Some(Instant::now() + SPLIT_RECHECK));
         return Ok(false);
     };
@@ -459,20 +468,22 @@ async fn maybe_split(
 
 /// The days a split of `group` covers, (newest, oldest), and how many servers
 /// carry it. None when it cant split: home's dates at either end are unknown
-/// or no other indexing server carries the group.
+/// or no other indexing server carries the group. `first` and `last` are
+/// home's low and high marks.
 async fn split_days(
     ctx: &PassContext,
     group: &str,
     home: usize,
-    first: u64,
+    (first, last): (u64, u64),
     cursor: u64,
 ) -> Result<Option<(i64, i64, usize)>> {
     use crate::chunks::unix_day;
 
     // the newest day still to do is the post date at the home cursor, the
-    // oldest at least home's first article
+    // oldest at least home's first article. first articles are searched for
+    // from the low marks, which can lag far behind what a server still keeps
     let Some(newest) = ctx.pool.posted_date(home, group, cursor).await? else { return Ok(None) };
-    let Some(oldest) = ctx.pool.posted_date(home, group, first).await? else { return Ok(None) };
+    let Some(oldest) = ctx.pool.first_post(home, group, first, last).await? else { return Ok(None) };
     let newest_day = unix_day(newest);
     let mut oldest_day = unix_day(oldest).min(newest_day);
 
@@ -480,9 +491,9 @@ async fn split_days(
     // carries the group counts, its oldest date only if it has one
     let mut carriers = 1;
     for other in ctx.pool.indexing_servers().into_iter().filter(|&s| s != home) {
-        let Ok((_, low, _, _)) = ctx.pool.group_on(other, group).await else { continue };
+        let Ok((_, low, high, _)) = ctx.pool.group_on(other, group).await else { continue };
         carriers += 1;
-        if let Ok(Some(t)) = ctx.pool.posted_date(other, group, low).await {
+        if let Ok(Some(t)) = ctx.pool.first_post(other, group, low, high).await {
             oldest_day = oldest_day.min(unix_day(t));
         }
     }
