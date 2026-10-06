@@ -1064,7 +1064,8 @@ impl ShardWriter {
                     .optional()?;
                 profile::UPSERT.add_since(t);
                 let Some((release_id, old_size, old_parts, old_file_total)) = row else { continue };
-                if old_parts.is_none() {
+                // inserted, not merged: the id that came back is the one proposed
+                if release_id == id {
                     new_releases += 1;
                 }
 
@@ -1675,6 +1676,26 @@ mod tests {
         )
         .unwrap();
         assert_eq!(seal_file(&conn, a).unwrap(), 3, "the copy isnt added");
+    }
+
+    /// A release saved again with no articles of its own (its `parts` still
+    /// NULL) is the same release: the shard's release total counts it once.
+    #[test]
+    fn upserting_a_release_with_null_parts_twice_counts_it_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        db::create_db_at(&main).unwrap();
+        let bare = || Release { name: "Bare".into(), group: "alt.binaries.t".into(), ..Default::default() };
+        let releases = || -> i64 {
+            let conn = db::open_at(&shard_path(&main, shard_of("alt.binaries.t"))).unwrap();
+            conn.query_row("select value from meta where key = 'releases'", [], |r| r.get(0)).unwrap()
+        };
+        save(&main, &[bare()]).unwrap();
+        let once = releases();
+        save(&main, &[bare()]).unwrap();
+        save(&main, &[bare()]).unwrap();
+        assert_eq!(once, 1);
+        assert_eq!(releases(), once);
     }
 
     /// A copy saved as a row counted in its release's size and parts and the
