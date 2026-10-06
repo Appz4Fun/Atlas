@@ -18,7 +18,7 @@
 //! between moving the original aside and the copy in (a crash) is undone by
 //! the next start or compaction, see `recover_cut_swaps`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -382,13 +382,12 @@ fn compact_shard(
 
     // how many articles use each domain, as rows and inside sealed blobs
     say("counting domains");
-    let max_domain: i64 = conn.query_row("select coalesce(max(id), 0) from old.domains", [], |r| r.get(0))?;
-    let mut uses = vec![0u32; max_domain as usize + 1];
+    // only the ids in use: earlier compactions leave the ids sparse
+    let mut uses: HashMap<i64, u32> = HashMap::new();
     {
         let mut used = |d: i64| {
-            if let Some(n) = uses.get_mut(d as usize) {
-                *n = n.saturating_add(1);
-            }
+            let n = uses.entry(d).or_insert(0);
+            *n = n.saturating_add(1);
         };
         let mut stmt = conn.prepare("select domain from old.segments")?;
         let mut rows = stmt.query([])?;
@@ -409,7 +408,7 @@ fn compact_shard(
             }
         }
     }
-    let shared = |d: i64| d != 0 && uses.get(d as usize).is_some_and(|n| *n >= SHARED_AFTER);
+    let shared = |d: i64| d != 0 && uses.get(&d).is_some_and(|n| *n >= SHARED_AFTER);
 
     halt(stop, shard)?;
     say("copying releases");
@@ -1016,6 +1015,26 @@ mod tests {
         };
         store::save(&main, &[more]).unwrap();
         assert_eq!(all_articles(&main), before, "an article already there isnt saved twice");
+    }
+
+    #[test]
+    fn a_huge_sparse_domain_id_costs_no_memory_to_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        legacy_fixture(&main);
+        let before = all_articles(&main);
+        // ids as sparse as earlier compactions can leave them
+        for path in store::shard_paths(&main) {
+            let conn = db::open_at(&path).unwrap();
+            conn.execute_batch(
+                "update segments set domain = domain + 4000000000000 where domain != 0;
+                 update domains set id = id + 4000000000000;",
+            )
+            .unwrap();
+        }
+        let shrunk = run(&main, &|_| {}, &no_stop()).unwrap();
+        assert_eq!(shrunk.domains_dropped, 120);
+        assert_eq!(all_articles(&main), before, "every NZB reads back the same");
     }
 
     /// the file of release `name` in its group's shard: (shard path, file id)
