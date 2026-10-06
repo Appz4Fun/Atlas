@@ -17,7 +17,7 @@ pub struct ReleaseRow {
 }
 
 /// One article of a release, joined with its release's poster/date.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ArticleRow {
     pub message_id: String,
     pub filename: Option<String>,

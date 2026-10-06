@@ -960,22 +960,69 @@ fn check(original: &Path, copy: &Path, shard: usize, copied: i64, copies: i64, s
             )
             .ok();
         let Some(id) = found else { continue };
-        let (a, b) = (store::articles(&old, id)?, store::articles(&new, id)?);
-        if a != b && !(copies > 0 && same_but_copies(&a, &b)) {
+        if digest(&old, id)? != digest(&new, id)? && !(copies > 0 && same_but_copies(&old, &new, id, copy)?) {
             bail!("shard {shard}: release {id} reads back differently from the copy; the original was kept");
         }
     }
     Ok(())
 }
 
-/// `copy` is `original` with only rows dropped that were a second copy of a
-/// message-id (the one kept is one of the original's).
-fn same_but_copies(original: &[crate::search::ArticleRow], copy: &[crate::search::ArticleRow]) -> bool {
-    fn ids(rows: &[crate::search::ArticleRow]) -> HashSet<&str> {
-        rows.iter().map(|r| r.message_id.as_str()).collect()
-    }
-    let kept = ids(copy);
-    kept.len() == copy.len() && kept == ids(original) && copy.iter().all(|r| original.contains(r))
+/// A 128 bit hash of an article
+fn row_hash(row: &crate::search::ArticleRow) -> u128 {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let half = |salt: u8| {
+        let mut h = DefaultHasher::new();
+        (salt, row).hash(&mut h);
+        h.finish() as u128
+    };
+    half(0) << 64 | half(1)
+}
+
+/// Release `id`'s articles as how many and the sum of their hashes: the
+/// same whatever order they come in, and none held (a loose file can have
+/// any number)
+fn digest(conn: &Connection, id: i64) -> Result<(i64, u128)> {
+    let (mut n, mut sum) = (0i64, 0u128);
+    store::each_article(conn, id, &mut |row| {
+        n += 1;
+        sum = sum.wrapping_add(row_hash(&row));
+        Ok(())
+    })?;
+    Ok((n, sum))
+}
+
+/// Release `id` reads back from `copy` the way it does from `original` with
+/// only rows dropped that were a second copy of a message-id (the one kept is
+/// one of the original's). Worked out in a database file next to `copy_path`
+/// rather than in memory, removed after.
+fn same_but_copies(original: &Connection, copy: &Connection, id: i64, copy_path: &Path) -> Result<bool> {
+    let path = with_suffix(copy_path, "check");
+    remove_db(&path);
+    let same = (|| -> Result<bool> {
+        let scratch = Connection::open(&path)?;
+        scratch.query_row("pragma journal_mode = off", [], |_| Ok(()))?;
+        scratch.execute_batch(
+            "pragma synchronous = off;
+             create table a (id text not null, h blob not null);
+             create table b (id text not null, h blob not null);
+             begin;",
+        )?;
+        for (conn, table) in [(original, "a"), (copy, "b")] {
+            let mut insert = scratch.prepare(&format!("insert into {table} values (?, ?)"))?;
+            store::each_article(conn, id, &mut |row| {
+                insert.execute(params![row.message_id, row_hash(&row).to_be_bytes()])?;
+                Ok(())
+            })?;
+        }
+        scratch.execute_batch("commit")?;
+        let none = |sql: &str| -> Result<bool> { Ok(!scratch.prepare(sql)?.exists([])?) };
+        Ok(none("select 1 from b group by id having count(*) > 1")?
+            && none("select id from a except select id from b")?
+            && none("select id from b except select id from a")?
+            && none("select h from b except select h from a")?)
+    })();
+    remove_db(&path);
+    same
 }
 
 #[cfg(test)]
@@ -1205,6 +1252,63 @@ mod tests {
             }
         }
         assert_eq!(domains(main), 120 + 5, "every made up domain has a row, ngPost one per shard used");
+    }
+
+    /// The sample is compared by digest, order aside; a copy that lost a
+    /// second copy of a message-id is told apart from one that reads back
+    /// differently in a file of its own, removed after.
+    #[test]
+    fn the_check_compares_digests_and_works_copies_out_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        legacy_fixture(&main);
+        let (shard, path) = store::shard_paths(&main)
+            .into_iter()
+            .enumerate()
+            .find(|(_, p)| store::article_count(&db::open_at(p).unwrap(), "main").unwrap() > 0)
+            .unwrap();
+        checkpoint(&db::open_at(&path).unwrap()).unwrap();
+        let copy = with_suffix(&path, "compact");
+        std::fs::copy(&path, &copy).unwrap();
+        let n = store::article_count(&db::open_at(&path).unwrap(), "main").unwrap();
+        let checks = |copies: i64| {
+            let r = check(&path, &copy, shard, n, copies, &no_stop());
+            assert!(!with_suffix(&copy, "check").exists(), "no scratch file left");
+            r
+        };
+        checks(0).unwrap();
+
+        // the original with a second copy of a message-id, stored whole next to its packed one
+        let conn = db::open_at(&path).unwrap();
+        let (file_id, local, domain, part, bytes, suffix): (i64, Vec<u8>, i64, Option<i64>, i64, String) = conn
+            .query_row(
+                "select s.file_id, s.local, s.domain, s.part, s.bytes, d.suffix
+                 from segments s join domains d on d.id = s.domain limit 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+            )
+            .unwrap();
+        let (whole, none) = rewrite(shard, file_id, local, domain, false, Some(&suffix)).unwrap();
+        assert_eq!(none, 0);
+        conn.execute(
+            "insert into segments (file_id, local, domain, part, bytes) values (?, ?, 0, ?, ?)",
+            params![file_id, whole, part, bytes],
+        )
+        .unwrap();
+        drop(conn);
+        checks(1).unwrap();
+
+        // a copy whose article reads back differently
+        let conn = db::open_at(&copy).unwrap();
+        conn.execute(
+            "update segments set bytes = bytes + 1
+             where (file_id, local, domain) = (select file_id, local, domain from segments limit 1)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let e = checks(1).unwrap_err().to_string();
+        assert!(e.contains("reads back differently"), "{e}");
     }
 
     #[test]

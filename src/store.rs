@@ -1536,6 +1536,18 @@ pub fn save(main: &Path, releases: &[Release]) -> Result<()> {
 /// A release's articles, ordered by filename then part (ties by message-id),
 /// for building its NZB. `conn` has the shards attached.
 pub fn articles(conn: &Connection, release_id: i64) -> Result<Vec<ArticleRow>> {
+    let mut rows = Vec::new();
+    each_article(conn, release_id, &mut |row| {
+        rows.push(row);
+        Ok(())
+    })?;
+    rows.sort_by(|a, b| (&a.filename, a.part, &a.message_id).cmp(&(&b.filename, b.part, &b.message_id)));
+    Ok(rows)
+}
+
+/// A release's articles one at a time, in no particular order, none held.
+/// `conn` has the shards attached.
+pub fn each_article(conn: &Connection, release_id: i64, each: &mut dyn FnMut(ArticleRow) -> Result<()>) -> Result<()> {
     let s = shard_of_id(release_id);
     // rows and blobs from one snapshot: a file sealed between two separate
     // reads would show its articles twice (or not at all). a caller already
@@ -1560,7 +1572,9 @@ pub fn articles(conn: &Connection, release_id: i64) -> Result<Vec<ArticleRow>> {
             posted_date: r.get(8)?,
         })
     })?;
-    let mut rows: Vec<ArticleRow> = rows.collect::<Result<_>>()?;
+    for row in rows {
+        each(row?)?;
+    }
 
     // sealed files: their blobs, next to any rows that came after sealing
     let mut sealed = conn.prepare(&format!(
@@ -1568,22 +1582,20 @@ pub fn articles(conn: &Connection, release_id: i64) -> Result<Vec<ArticleRow>> {
          from s{s}.files f join s{s}.releases r on r.id = f.release_id
          where f.release_id = ? and f.blob is not null"
     ))?;
+    let mut suffix_of = conn.prepare(&format!("select suffix from s{s}.domains where id = ?"))?;
+    // per blob, soo what is held stays within what one blob takes
     let mut suffixes: HashMap<i64, Option<String>> = HashMap::new();
     let mut blob_rows = sealed.query([release_id])?;
     while let Some(r) = blob_rows.next()? {
+        suffixes.clear();
         let blob: Vec<u8> = r.get(0)?;
         let filename: String = r.get(1)?;
         for seg in crate::blob::decode(&blob).map_err(blob_error)? {
             let suffix = match suffixes.entry(seg.domain) {
                 Entry::Occupied(e) => e.into_mut(),
-                Entry::Vacant(e) => e.insert(
-                    conn.query_row(&format!("select suffix from s{s}.domains where id = ?"), [seg.domain], |r| {
-                        r.get(0)
-                    })
-                    .optional()?,
-                ),
+                Entry::Vacant(e) => e.insert(suffix_of.query_row([seg.domain], |r| r.get(0)).optional()?),
             };
-            rows.push(ArticleRow {
+            each(ArticleRow {
                 message_id: decode(&seg.local, suffix.as_deref()),
                 filename: (!filename.is_empty()).then(|| filename.clone()),
                 part: seg.part,
@@ -1592,11 +1604,10 @@ pub fn articles(conn: &Connection, release_id: i64) -> Result<Vec<ArticleRow>> {
                 subject: r.get(3)?,
                 poster: r.get(4)?,
                 posted_date: r.get(5)?,
-            });
+            })?;
         }
     }
-    rows.sort_by(|a, b| (&a.filename, a.part, &a.message_id).cmp(&(&b.filename, b.part, &b.message_id)));
-    Ok(rows)
+    Ok(())
 }
 
 /// articles in shard `schema` (`s3`, or `main` for a shard opened on its
