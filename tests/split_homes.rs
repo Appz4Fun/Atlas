@@ -103,14 +103,19 @@ fn a_server_without_the_group_doesnt_move_it() {
     let conn = atlas::db::open_with_shards(&main).unwrap();
     assert_eq!(atlas::store::totals(&conn).unwrap().1, 1200, "every post once");
 
-    let cursors: Vec<String> = conn
-        .prepare("select name from groups where name like ? order by name")
+    // (cursor, whether a normal pass ran on it): the home's passes save the
+    // server's bounds, a carrier's sweep (its own cursor, see run_sweep) doesnt
+    let cursors: Vec<(String, bool)> = conn
+        .prepare("select name, last_article is not null from groups where name like ? order by name")
         .unwrap()
-        .query_map([format!("{SPLIT_GROUP}%")], |r| r.get(0))
+        .query_map([format!("{SPLIT_GROUP}%")], |r| Ok((r.get(0)?, r.get(1)?)))
         .unwrap()
         .collect::<Result<_, _>>()
         .unwrap();
-    assert_eq!(cursors.len(), 1, "the group stayed on one home server: {cursors:?}");
+    let homes = cursors.iter().filter(|(_, home)| *home).count();
+    assert_eq!(homes, 1, "the group stayed on one home server: {cursors:?}");
+    let carriers = [format!("{SPLIT_GROUP}@127.0.0.1"), format!("{SPLIT_GROUP}@localhost")];
+    assert!(cursors.iter().all(|(name, _)| carriers.contains(name)), "only carriers have cursors: {cursors:?}");
 
     let chunk_servers: Vec<String> = conn
         .prepare("select distinct server from backfill_chunks where state = 2 order by server")
