@@ -507,19 +507,20 @@ fn compact_shard(
             }
             file_rows.extend(spilled);
 
-            // a row the blob already has (the same message-id) isnt copied:
-            // it goes before the blob is counted, the way `seal_rows` drops it
-            if !segs.is_empty() {
+            // a row the blob already has (the same message-id) isnt copied, nor
+            // is a second row of one (a spilled segment and its loose copy):
+            // they go before the blob is counted, the way `seal_rows` drops them
+            if !file_rows.is_empty() {
                 // (the same message-id, whichever way each is stored now)
                 let mut key = |local: &[u8], domain: i64| -> Result<String> {
                     let suffix: Option<String> =
                         if domain == 0 { None } else { suffix_of.query_row([domain], |r| r.get(0)).optional()? };
                     Ok(store::dedup_key(local, domain, suffix.as_deref()))
                 };
-                let held: HashSet<String> = segs.iter().map(|s| key(&s.local, s.domain)).collect::<Result<_>>()?;
+                let mut held: HashSet<String> = segs.iter().map(|s| key(&s.local, s.domain)).collect::<Result<_>>()?;
                 let (mut dropped, mut kept) = (Vec::new(), Vec::new());
                 for r in file_rows {
-                    if held.contains(&key(&r.local, r.domain)?) { dropped.push(r) } else { kept.push(r) }
+                    if held.insert(key(&r.local, r.domain)?) { kept.push(r) } else { dropped.push(r) }
                 }
                 file_rows = kept;
                 if !dropped.is_empty() {
@@ -1272,6 +1273,58 @@ mod tests {
         let rows: i64 =
             conn.query_row("select count(*) from segments where file_id = ?", [file], |r| r.get(0)).unwrap();
         assert_eq!(rows, 1, "the long one is a row");
+    }
+
+    /// A sealed segment and its loose duplicate, the only users of a domain:
+    /// dropping it makes both too long for a blob, and the two are one article
+    /// stored once, not a clash on the segments key.
+    #[test]
+    fn a_dropped_domains_long_blob_segment_and_its_loose_copy_are_one_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        legacy_fixture(&main);
+        run(&main, &|_| {}, &no_stop()).unwrap();
+        let (path, file) = file_of(&main, "Rel.1", "alt.binaries.g1");
+        {
+            let conn = db::open_at(&path).unwrap();
+            let suffix = format!("@{}>", "d".repeat(240));
+            conn.execute("insert into domains (suffix) values (?)", [&suffix]).unwrap();
+            let d: i64 = conn.query_row("select id from domains where suffix = ?", [&suffix], |r| r.get(0)).unwrap();
+            let blob: Vec<u8> = conn.query_row("select blob from files where id = ?", [file], |r| r.get(0)).unwrap();
+            let mut segs = crate::blob::decode(&blob).unwrap();
+            let mut local = vec![0u8];
+            local.extend(std::iter::repeat_n(b'a', 300));
+            segs.push(Seg { part: Some(99), bytes: 5, domain: d, local: local.clone() });
+            conn.execute("update files set blob = ? where id = ?", params![crate::blob::encode(&segs), file]).unwrap();
+            // the same message-id again, loose, counted as the save that kept it counted it
+            conn.execute(
+                "insert into segments (file_id, local, domain, part, bytes) values (?, ?, ?, ?, ?)",
+                params![file, local, d, 99, 5],
+            )
+            .unwrap();
+            conn.execute(
+                "update releases set size = size + 10, parts = parts + 2
+                 where id = (select release_id from files where id = ?)",
+                [file],
+            )
+            .unwrap();
+            store::add_totals(&conn, 0, 2).unwrap();
+        }
+        let before = all_articles(&main);
+        let count = article_total(&main);
+        let totals = release_totals(&path, file);
+
+        run(&main, &|_| {}, &no_stop()).unwrap();
+        let count_in = |all: &[(i64, Vec<crate::search::ArticleRow>)]| all.iter().map(|(_, a)| a.len()).sum::<usize>();
+        assert_eq!(count_in(&all_articles(&main)), count_in(&before) - 1, "the NZBs lose only the copy");
+        assert_eq!(article_total(&main), count - 1, "the copy went out of the shard's total");
+        assert_eq!(release_totals(&path, file), (totals.0 - 5, totals.1 - 1, totals.2 - 1), "and the release's");
+        let conn = db::open_at(&path).unwrap();
+        let rows: i64 =
+            conn.query_row("select count(*) from segments where file_id = ?", [file], |r| r.get(0)).unwrap();
+        assert_eq!(rows, 1, "one row");
+        let blob: Vec<u8> = conn.query_row("select blob from files where id = ?", [file], |r| r.get(0)).unwrap();
+        assert!(crate::blob::decode(&blob).unwrap().iter().all(|s| s.local.len() <= crate::blob::MAX_LOCAL));
     }
 
     #[test]
