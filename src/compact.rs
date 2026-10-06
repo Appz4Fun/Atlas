@@ -266,6 +266,31 @@ fn halt(stop: &AtomicBool, shard: usize) -> Result<()> {
 static HELD_CHECKS: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
 
 #[cfg(test)]
+struct HeldCheck(usize);
+
+/// registers a stop flag with the hook above until the guard drops, soo a
+/// flag's address freed and reused by another test never finds it still there
+#[cfg(test)]
+impl HeldCheck {
+    fn on(stop: &Arc<AtomicBool>) -> HeldCheck {
+        let at = Arc::as_ptr(stop) as usize;
+        HELD_CHECKS.lock().unwrap().push((at, 0));
+        HeldCheck(at)
+    }
+
+    fn looks(&self) -> usize {
+        HELD_CHECKS.lock().unwrap().iter().find(|e| e.0 == self.0).unwrap().1
+    }
+}
+
+#[cfg(test)]
+impl Drop for HeldCheck {
+    fn drop(&mut self) {
+        HELD_CHECKS.lock().unwrap().retain(|e| e.0 != self.0);
+    }
+}
+
+#[cfg(test)]
 fn held_check(stop: &AtomicBool) {
     let at = stop as *const AtomicBool as usize;
     if let Some(e) = HELD_CHECKS.lock().unwrap().iter_mut().find(|e| e.0 == at) {
@@ -1295,6 +1320,18 @@ mod tests {
         assert_eq!(expected, 3);
     }
 
+    /// The stop hook goes with its guard: nothing is left in the registry for
+    /// another test's flag to meet.
+    #[test]
+    fn the_stop_hook_is_removed_when_its_guard_drops() {
+        let stop = no_stop();
+        let check = HeldCheck::on(&stop);
+        assert!(HELD_CHECKS.lock().unwrap().iter().any(|e| e.0 == check.0));
+        let at = check.0;
+        drop(check);
+        assert!(HELD_CHECKS.lock().unwrap().iter().all(|e| e.0 != at));
+    }
+
     /// A stop during a huge held back stream ends it at the next look, not
     /// after the whole file's entries.
     #[test]
@@ -1316,11 +1353,10 @@ mod tests {
             tx.commit().unwrap();
         }
         let stop = no_stop();
-        HELD_CHECKS.lock().unwrap().push((Arc::as_ptr(&stop) as usize, 0));
+        let check = HeldCheck::on(&stop);
         let err = run(&main, &|_| {}, &stop).unwrap_err();
         assert!(format!("{err:#}").contains("stopped"), "{err:#}");
-        let looks = HELD_CHECKS.lock().unwrap().iter().find(|e| e.0 == Arc::as_ptr(&stop) as usize).unwrap().1;
-        assert_eq!(looks, 1, "stopped at the first look, not after 3 of them");
+        assert_eq!(check.looks(), 1, "stopped at the first look, not after 3 of them");
     }
 
     /// More held back entries than a batch take are streamed across: the new
