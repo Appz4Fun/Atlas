@@ -492,9 +492,13 @@ where
         // a split group's backfill is day chunks, this server takes the next one
         let host = ctx.pool.host(server);
         let wanted = [(group.to_string(), ctx.states.keeps_from(group, &host))];
-        let claimed =
-            on_db(db, move |conn| Ok(crate::chunks::claim(conn, &wanted, &host, chrono::Utc::now().timestamp())?))
-                .await?;
+        // the split's generation as of the claim: a sweep noted after the split reached back isnt
+        let g = group.to_string();
+        let (claimed, generation) = on_db(db, move |conn| {
+            let generation = crate::chunks::sweep_generation(conn, &g)?;
+            Ok((crate::chunks::claim(conn, &wanted, &host, chrono::Utc::now().timestamp())?, generation))
+        })
+        .await?;
         let r = match claimed {
             // a day this server doesnt keep is left to the others, it isnt an error
             Some(chunk) => match run_chunk(ctx, settings, db, &chunk, server, progress).await {
@@ -511,7 +515,7 @@ where
             None if sweep_due(ctx, db, group, &ctx.pool.host(server)).await? => {
                 if state.backfill_cursor.min(last) < first {
                     let (g, host) = (group.to_string(), ctx.pool.host(server));
-                    on_db(db, move |conn| Ok(crate::chunks::set_swept(conn, &g, &host)?)).await?;
+                    on_db(db, move |conn| Ok(crate::chunks::set_swept(conn, &g, &host, generation)?)).await?;
                 }
                 let pass = Pass { ctx, settings, db, group, server, key };
                 pass.backfill(state, first, last, progress).await
@@ -854,9 +858,14 @@ where
     P: FnMut(&Progress) + ?Sized,
 {
     let (g, host) = (group.to_string(), ctx.pool.host(server));
+    // noted as swept only if the split hasnt reached back since (see `set_swept`)
+    let generation = {
+        let g = g.clone();
+        on_db(db, move |conn| Ok(crate::chunks::sweep_generation(conn, &g)?)).await?
+    };
     let swept = || {
         let (g, host) = (g.clone(), host.clone());
-        on_db(db, move |conn| Ok(crate::chunks::set_swept(conn, &g, &host)?))
+        on_db(db, move |conn| Ok(crate::chunks::set_swept(conn, &g, &host, generation)?))
     };
     // this server alone, like a day chunk
     let (_count, first, last, _name) = match ctx.pool.group_on(server, group).await {

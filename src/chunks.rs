@@ -37,6 +37,10 @@ pub fn create(conn: &Connection) -> Result<()> {
             server TEXT NOT NULL,
             primary key (grp, server)
         ) without rowid;
+        create table if not exists backfill_sweep_gen (
+            grp TEXT PRIMARY KEY,
+            gen INTEGER NOT NULL
+        ) without rowid;
         create table if not exists backfill_speculative (
             grp TEXT PRIMARY KEY,
             runner_up_day INTEGER NOT NULL,
@@ -139,6 +143,11 @@ pub fn reach_back(conn: &Connection, group: &str, oldest_day: i64, oldest_at: i6
     tx.execute("delete from backfill_deepest where grp = ?", [group])?;
     // a carrier's sweep stopped at its first article then: it may keep older ones now
     tx.execute("delete from backfill_sweeps where grp = ?", [group])?;
+    // and a sweep that started before this doesnt get to note itself done (see `set_swept`)
+    tx.execute(
+        "insert into backfill_sweep_gen (grp, gen) values (?, 1) on conflict (grp) do update set gen = gen + 1",
+        [group],
+    )?;
     tx.commit()?;
     Ok(added + redo)
 }
@@ -340,10 +349,25 @@ pub fn chunks_done(conn: &Connection, group: &str) -> Result<bool> {
         && !conn.prepare_cached("select 1 from backfill_chunks where grp = ? and state != 2")?.exists([group])?)
 }
 
+/// The split generation of `group`: counts the times its split reached back
+/// (see `reach_back`), which undoes what a sweep covered.
+pub fn sweep_generation(conn: &Connection, group: &str) -> Result<i64> {
+    Ok(conn
+        .query_row("select gen from backfill_sweep_gen where grp = ?", [group], |r| r.get(0))
+        .optional()?
+        .unwrap_or(0))
+}
+
 /// Note `server`'s sweep of split `group` as done: its cursor backfill got
 /// down to its first article after the day chunks (see `indexer::run_sweep`).
-pub fn set_swept(conn: &Connection, group: &str, server: &str) -> Result<()> {
-    conn.execute("insert or ignore into backfill_sweeps (grp, server) values (?, ?)", [group, server])?;
+/// `generation` is the group's (see `sweep_generation`) when the sweep was
+/// chosen: one from before the split reached back is stale and notes nothing.
+pub fn set_swept(conn: &Connection, group: &str, server: &str, generation: i64) -> Result<()> {
+    conn.execute(
+        "insert or ignore into backfill_sweeps (grp, server)
+         select ?1, ?2 where coalesce((select gen from backfill_sweep_gen where grp = ?1), 0) = ?3",
+        params![group, server, generation],
+    )?;
     Ok(())
 }
 
@@ -402,7 +426,7 @@ mod tests {
         // days 100.. the next deepest keeps, 40..99 the window, older pruned
         add(&c, "g", 120, 40).unwrap();
         set_speculative(&c, "g", &Speculative { runner_up_day: 100, reach: 60, days: 3, articles: 7 }).unwrap();
-        set_swept(&c, "g", "a").unwrap();
+        set_swept(&c, "g", "a", 0).unwrap();
         // the hourly look finds the deep server back in 2000 again: nothing
         assert_eq!(reach_back(&c, "g", 10, 10 * 86_400).unwrap(), 0);
         assert_eq!(oldest_day(&c, "g").unwrap(), Some(40));
@@ -510,8 +534,8 @@ mod tests {
         add(&c, "g", 12, 10).unwrap();
         c.execute("update backfill_chunks set state = 2", []).unwrap();
         set_deepest(&c, "g", "a", 10 * 86_400 + 18 * 3600).unwrap();
-        set_swept(&c, "g", "b").unwrap();
-        set_swept(&c, "other", "b").unwrap();
+        set_swept(&c, "g", "b", 0).unwrap();
+        set_swept(&c, "other", "b", 0).unwrap();
 
         assert_eq!(reach_back(&c, "g", 10, 10 * 86_400 + 20 * 3600).unwrap(), 0, "not further");
         assert!(swept(&c, "g", "b").unwrap(), "kept when nothing changed");
@@ -519,6 +543,26 @@ mod tests {
         assert_eq!(reach_back(&c, "g", 9, 9 * 86_400).unwrap(), 2);
         assert!(!swept(&c, "g", "b").unwrap(), "to sweep again");
         assert!(swept(&c, "other", "b").unwrap(), "other groups' sweeps stay");
+    }
+
+    /// a sweep chosen before the split reached back, finishing after, doesnt
+    /// note itself done: it covered what is older now only down to the old first article
+    #[test]
+    fn a_sweep_from_before_reaching_back_is_not_noted() {
+        let c = conn();
+        add(&c, "g", 12, 10).unwrap();
+        c.execute("update backfill_chunks set state = 2", []).unwrap();
+        set_deepest(&c, "g", "a", 10 * 86_400 + 18 * 3600).unwrap();
+        let started = sweep_generation(&c, "g").unwrap();
+
+        assert_eq!(reach_back(&c, "g", 9, 9 * 86_400).unwrap(), 2);
+        set_swept(&c, "g", "b", started).unwrap();
+        assert!(!swept(&c, "g", "b").unwrap(), "stale, left to do");
+
+        let now = sweep_generation(&c, "g").unwrap();
+        assert_ne!(now, started);
+        set_swept(&c, "g", "b", now).unwrap();
+        assert!(swept(&c, "g", "b").unwrap(), "one started since is noted");
     }
 
     #[test]
