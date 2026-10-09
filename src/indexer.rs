@@ -189,6 +189,7 @@ const MAX_BATCH: usize = 8;
 pub struct Db {
     conn: Arc<Mutex<Connection>>,
     saves: Vec<std::sync::mpsc::Sender<SaveJob>>,
+    naming: Arc<Naming>,
     /// last field: dropping the final clone closes the queues above, then waits
     /// for the writer threads to finish what they were doing
     _writers: Arc<Writers>,
@@ -207,6 +208,8 @@ impl Drop for Writers {
 
 struct SaveJob {
     releases: Vec<Release>,
+    /// `(name, group, display name)` of releases saved before
+    names: Vec<(String, String, String)>,
     done: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
 }
 
@@ -232,7 +235,7 @@ fn shared_db_idling(conn: Connection, every: Duration) -> Db {
             (saves, handle)
         })
         .unzip();
-    Db { conn: Arc::new(Mutex::new(conn)), saves, _writers: Arc::new(Writers(writers)) }
+    Db { conn: Arc::new(Mutex::new(conn)), saves, naming: Naming::new(), _writers: Arc::new(Writers(writers)) }
 }
 
 /// A shard's writer: saves what comes in, and between saves (or after
@@ -284,11 +287,19 @@ fn writer(
         }
 
         let t = std::time::Instant::now();
-        let result = match &mut opened {
+        let (result, named) = match &mut opened {
             Ok(conn) => {
-                store.save(conn, ids, batch.iter().map(|job| job.releases.as_slice())).map_err(|e| e.to_string())
+                let saved = store.save(conn, ids, batch.iter().map(|job| job.releases.as_slice()));
+                // names of releases saved before, in their own transaction: a
+                // failure there isnt the slices'
+                let names: Vec<_> = batch.iter().flat_map(|job| job.names.iter().cloned()).collect();
+                let named = if names.is_empty() { Ok(()) } else { store.set_names(conn, &names) };
+                (saved.map_err(|e| e.to_string()), named.map_err(|e| e.to_string()))
             }
-            Err(e) => Err(format!("couldnt open {}: {e}", path.display())),
+            Err(e) => {
+                let e = format!("couldnt open {}: {e}", path.display());
+                (Err(e.clone()), Err(e))
+            }
         };
         Load::add_since(&LOAD.writer_busy_ns, t);
         LOAD.writer_batches.fetch_add(1, Relaxed);
@@ -298,7 +309,7 @@ fn writer(
         // the save is committed by now: the slices dont wait for the housekeeping
         let saved = result.is_ok();
         for job in batch {
-            let _ = job.done.send(result.clone());
+            let _ = job.done.send(if job.names.is_empty() { result.clone() } else { named.clone() });
         }
 
         // housekeeping between transactions
@@ -346,13 +357,81 @@ impl Db {
     async fn save(&self, releases: Vec<Release>) -> Result<()> {
         // a slice is one group, soo one shard
         let Some(shard) = releases.first().map(|r| crate::store::shard_of(&r.group)) else { return Ok(()) };
+        self.send(shard, releases, Vec::new()).await
+    }
+
+    async fn send(&self, shard: usize, releases: Vec<Release>, names: Vec<(String, String, String)>) -> Result<()> {
         let (done, saved) = tokio::sync::oneshot::channel();
         crate::profile::LOAD.writer_queued.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if self.saves[shard].send(SaveJob { releases, done }).is_err() {
+        if self.saves[shard].send(SaveJob { releases, names, done }).is_err() {
             crate::profile::LOAD.writer_queued.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             return Err(anyhow!("db writer stopped"));
         }
         saved.await.map_err(|_| anyhow!("db writer stopped"))?.map_err(|e| anyhow!("saving releases: {e}"))
+    }
+
+    /// Look up real names for releases of `group` that are saved already, in
+    /// the background, and save the ones found. `jobs` are each release's
+    /// name and the bodies to try (see `name_sources`). Waits only while
+    /// `NAMING_SLICES` slices are being named already.
+    async fn name_later(&self, pool: Arc<Pool>, group: &str, jobs: Vec<(String, Vec<(String, Extract)>)>) {
+        let permit = self.naming.permits.clone().acquire_owned().await.expect("semaphore closed");
+        let (db, group) = (self.clone(), group.to_string());
+        self.naming.pending.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        tokio::spawn(async move {
+            let t = Instant::now();
+            let (releases, sources): (Vec<String>, Vec<_>) = jobs.into_iter().unzip();
+            let found = first_names(pool, sources).await;
+            crate::profile::NAMES.add_since(t);
+            let names: Vec<_> = releases
+                .into_iter()
+                .zip(found)
+                .filter_map(|(name, found)| Some((name, group.clone(), found?)))
+                .collect();
+            if !names.is_empty()
+                && let Err(e) = db.send(crate::store::shard_of(&group), Vec::new(), names).await
+            {
+                println!("[NAMES] {group}: {e}");
+            }
+            drop(permit);
+            if db.naming.pending.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+                db.naming.idle.notify_waiters();
+            }
+        });
+    }
+
+    /// Once every name lookup started so far is done (and saved).
+    pub async fn names_settled(&self) {
+        loop {
+            let idle = self.naming.idle.notified();
+            tokio::pin!(idle);
+            idle.as_mut().enable();
+            if self.naming.pending.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                return;
+            }
+            idle.await;
+        }
+    }
+}
+
+/// slices whose releases are being named in the background at most, over
+/// every pass: past it a pass waits before it saves another slice
+const NAMING_SLICES: usize = 256;
+
+/// The background name lookups (see `Db::name_later`).
+struct Naming {
+    permits: Arc<tokio::sync::Semaphore>,
+    pending: std::sync::atomic::AtomicUsize,
+    idle: tokio::sync::Notify,
+}
+
+impl Naming {
+    fn new() -> Arc<Naming> {
+        Arc::new(Naming {
+            permits: Arc::new(tokio::sync::Semaphore::new(NAMING_SLICES)),
+            pending: Default::default(),
+            idle: tokio::sync::Notify::new(),
+        })
     }
 }
 
@@ -1703,15 +1782,13 @@ async fn save_slice(
     crate::profile::Load::add_since(&crate::profile::LOAD.parse_ns, t);
     drop(unsaved);
 
-    // real names from par2/nfo bodies, every release looked up concurrently
-    let t = std::time::Instant::now();
-    let jobs = releases.iter().map(name_sources).collect();
-    let names = first_names(pool.clone(), jobs).await;
-    crate::profile::NAMES.add_since(t);
+    // real names from par2/nfo bodies come after the save, in the background:
+    // a slow body doesnt hold up the pass
+    let names: Vec<_> =
+        releases.iter().map(|r| (r.name.clone(), name_sources(r))).filter(|(_, sources)| !sources.is_empty()).collect();
 
     let mut bytes = 0;
-    for (i, release) in releases.iter_mut().enumerate() {
-        release.display_name = names.get(i).cloned().flatten();
+    for release in releases.iter_mut() {
         release.complete = is_complete(&release.articles);
         release.group = group.to_string();
         release.poster = release.articles[0].author.clone();
@@ -1722,6 +1799,9 @@ async fn save_slice(
 
     let count = releases.len() as i64;
     db.save(releases).await?;
+    if !names.is_empty() {
+        db.name_later(pool.clone(), group, names).await;
+    }
 
     Ok(Progress { articles, bytes, releases: count })
 }
@@ -1858,7 +1938,10 @@ impl Indexer {
             // the active server, which moves when another server has to carry the group
             ctx.pool.select_group(group).await?;
             let server = ctx.pool.active_index();
-            run_pass(&ctx, &settings, &db, group, server, progress).await
+            let pass = run_pass(&ctx, &settings, &db, group, server, progress).await;
+            // one group at a time here: its names are in when the pass returns
+            db.names_settled().await;
+            pass
         })?;
 
         self.last_batch_articles = saved.articles;
@@ -2205,7 +2288,7 @@ mod tests {
         drop(gone);
         crate::profile::LOAD.writer_queued.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let shard = crate::store::shard_of("alt.binaries.t");
-        shared.saves[shard].send(SaveJob { releases: vec![release("dropped")], done }).unwrap();
+        shared.saves[shard].send(SaveJob { releases: vec![release("dropped")], names: Vec::new(), done }).unwrap();
         let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
         rt.block_on(shared.save(vec![release("kept")])).unwrap();
         drop(shared);

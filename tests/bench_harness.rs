@@ -166,20 +166,35 @@ fn bench() {
         done
     });
     let elapsed = t.elapsed().as_secs_f64();
+    // names come in the background on builds that have `names_settled`
+    let named_secs = names_settled(&rt, &db, secs);
     let saved = saved.load(Ordering::Relaxed);
     let bodies: usize = servers.iter().map(|s| s.bodies_sent.load(Ordering::SeqCst)).sum();
     let xovers: usize = servers.iter().map(|s| s.xovers.load(Ordering::SeqCst)).sum();
     println!(
         "RESULT groups_done={done_groups}/{groups} headers={saved} of {} secs={elapsed:.1} headers_per_s={:.0} \
-         xovers={xovers} bodies={bodies} errors={} unsaved_peak={}",
+         xovers={xovers} bodies={bodies} errors={} unsaved_peak={} named_after_s={named_secs:.1} named={}",
         per_group * groups as u64,
         saved as f64 / elapsed,
         errors.load(Ordering::Relaxed),
-        pool.unsaved_peak()
+        pool.unsaved_peak(),
+        named(&main)
     );
     // with ATLAS_PROFILE=1: where the passes spent their time
     if atlas::profile::enabled() {
         println!("RESULT {}", atlas::profile::report(elapsed));
         println!("RESULT {}", atlas::profile::LOAD.snapshot());
     }
+}
+
+/// seconds until the background name lookups are saved, after the passes
+fn names_settled(rt: &tokio::runtime::Runtime, db: &atlas::indexer::Db, secs: u64) -> f64 {
+    let t = Instant::now();
+    rt.block_on(async { tokio::time::timeout(Duration::from_secs(secs), db.names_settled()).await.ok() });
+    t.elapsed().as_secs_f64()
+}
+
+fn named(main: &std::path::Path) -> i64 {
+    let conn = atlas::db::open_with_shards(main).unwrap();
+    conn.query_row("select count(display_name) from releases", [], |r| r.get(0)).unwrap()
 }

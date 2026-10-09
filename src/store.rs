@@ -1325,6 +1325,20 @@ impl ShardWriter {
         Ok(sealed)
     }
 
+    /// Names par2 / nfo bodies gave releases saved before, as
+    /// `(name, group, display name)`, in one transaction.
+    pub fn set_names(&mut self, conn: &mut Connection, names: &[(String, String, String)]) -> Result<()> {
+        let tx = conn.transaction()?;
+        {
+            let mut update =
+                tx.prepare_cached("update releases set display_name = ?3 where name = ?1 and group_name = ?2")?;
+            for (name, group, display) in names {
+                update.execute(params![name, group, display])?;
+            }
+        }
+        tx.commit()
+    }
+
     /// Releases of this shard's groups, in one transaction. The same release
     /// may come up in more than one batch.
     pub fn save<'a>(

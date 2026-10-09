@@ -91,7 +91,9 @@ fn index_everything(cap: usize, groups: usize) {
             }
             saved
         };
-        tokio::time::timeout(Duration::from_secs(60), all).await.expect("the passes are stuck")
+        let saved = tokio::time::timeout(Duration::from_secs(60), all).await.expect("the passes are stuck");
+        db.names_settled().await;
+        saved
     });
 
     assert_eq!(saved, vec![POSTS as i64; groups], "every article saved once, per group");
