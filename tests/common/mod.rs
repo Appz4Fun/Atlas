@@ -70,6 +70,9 @@ pub struct Server {
     /// the first XOVER starting at this number closes the connection instead
     /// of answering, like a provider dropping a request
     pub drop_xover_at: Mutex<Option<u64>>,
+    /// build each uncompressed listing before sending it, soo the posts
+    /// arent locked while a slow client reads (benchmarks with many connections)
+    pub buffer_listing: bool,
 }
 
 impl Server {
@@ -102,6 +105,7 @@ impl Server {
             reported_low: None,
             dropped: Default::default(),
             drop_xover_at: Mutex::new(None),
+            buffer_listing: false,
         })
     }
 }
@@ -286,6 +290,17 @@ pub fn serve(stream: TcpStream, state: &Server, over_limit: bool) {
                     send(&mut out, b"224 overview follows [COMPRESS=GZIP]");
                     let _ = out.write_all(&z.finish().unwrap());
                     state.compressed_sent.fetch_add(1, Ordering::SeqCst);
+                } else if state.buffer_listing {
+                    let mut listing = Vec::new();
+                    for p in hits() {
+                        listing.extend_from_slice(row(p).as_bytes());
+                    }
+                    listing.extend_from_slice(b".\r\n");
+                    drop(posts);
+                    send(&mut out, b"224 overview follows");
+                    if out.write_all(&listing).is_err() {
+                        return;
+                    }
                 } else {
                     // row by row, soo a huge listing isnt built in memory first
                     // (a client that hangs up part way just stops it)
@@ -298,23 +313,28 @@ pub fn serve(stream: TcpStream, state: &Server, over_limit: bool) {
                     }
                 }
             }
-            "BODY" => match posts_lock().iter().find(|p| p.message_id == arg).filter(|_| state.bodies) {
-                Some(p) => {
-                    thread::sleep(state.body_delay);
-                    state.bodies_sent.fetch_add(1, Ordering::SeqCst);
-                    send(&mut out, format!("222 0 {arg}").as_bytes());
-                    for l in &p.body {
-                        // dot stuffing
-                        let mut l = l.clone();
-                        if l.first() == Some(&b'.') {
-                            l.insert(0, b'.');
+            "BODY" => {
+                // the lock goes before the reply, not at the end of the match
+                let found =
+                    posts_lock().iter().find(|p| p.message_id == arg).filter(|_| state.bodies).map(|p| p.body.clone());
+                match found {
+                    Some(body) => {
+                        thread::sleep(state.body_delay);
+                        state.bodies_sent.fetch_add(1, Ordering::SeqCst);
+                        send(&mut out, format!("222 0 {arg}").as_bytes());
+                        for l in &body {
+                            // dot stuffing
+                            let mut l = l.clone();
+                            if l.first() == Some(&b'.') {
+                                l.insert(0, b'.');
+                            }
+                            send(&mut out, &l);
                         }
-                        send(&mut out, &l);
+                        send(&mut out, b".");
                     }
-                    send(&mut out, b".");
+                    None => send(&mut out, b"430 no such article"),
                 }
-                None => send(&mut out, b"430 no such article"),
-            },
+            }
             "QUIT" => {
                 send(&mut out, b"205 bye");
                 return;

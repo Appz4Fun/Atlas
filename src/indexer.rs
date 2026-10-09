@@ -4,7 +4,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
-use indexmap::IndexMap;
 use rusqlite::Connection;
 
 use crate::config::{DEFAULT_BATCH_SIZE, DEFAULT_REQUEST_SIZE};
@@ -12,7 +11,7 @@ use crate::db;
 use crate::nfo;
 use crate::nntp::{BlockingPool, Extract, Overview, Pool, Retention, first_names, headers_to_articles};
 use crate::par2;
-use crate::parser::{Article, Release, group_articles, is_complete};
+use crate::parser::{Release, group_articles, is_complete};
 
 /// What one finished XOVER slice added, reported as it lands.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1731,10 +1730,11 @@ async fn save_slice(
 const MAX_NAME_BODIES: usize = 3;
 
 /// Bodies worth fetching for a real name: base par2 files first, then nfos,
-/// one segment a file (its first one in the slice: where par2 and nfo files
-/// keep what names a release) and `MAX_NAME_BODIES` at most. A big
+/// only their first segment (where par2 and nfo files keep what names a
+/// release, and it comes once per file, soo a release is looked up once
+/// however many slices it spans) and `MAX_NAME_BODIES` at most. A big
 /// obfuscated par2 comes in thousands of segments of most of a MB each;
-/// trying them all one after another held its slice for minutes.
+/// trying them one after another held a slice for minutes.
 fn name_sources(release: &Release) -> Vec<(String, Extract)> {
     type Matches = fn(&str) -> bool;
     let sources: [(Matches, Extract); 2] = [(par2::is_base_par2, par2::display_name), (nfo::is_nfo, nfo::display_name)];
@@ -1742,15 +1742,11 @@ fn name_sources(release: &Release) -> Vec<(String, Extract)> {
     sources
         .iter()
         .flat_map(|(matches, extract)| {
-            // the lowest part of each file, in first seen order
-            let mut files: IndexMap<Option<&str>, &Article> = IndexMap::new();
-            for a in release.articles.iter().filter(|a| matches(&a.subject)) {
-                let first = files.entry(a.filename.as_deref()).or_insert(a);
-                if a.part.unwrap_or(1) < first.part.unwrap_or(1) {
-                    *first = a;
-                }
-            }
-            files.into_values().map(|a| (a.message_id.clone(), *extract)).collect::<Vec<_>>()
+            release
+                .articles
+                .iter()
+                .filter(|a| a.part.unwrap_or(1) == 1 && matches(&a.subject))
+                .map(|a| (a.message_id.clone(), *extract))
         })
         .take(MAX_NAME_BODIES)
         .collect()
@@ -1875,9 +1871,10 @@ impl Indexer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parser::Article;
 
     #[test]
-    fn a_name_lookup_tries_the_first_segment_of_each_file_and_a_few_bodies_at_most() {
+    fn a_name_lookup_tries_first_segments_only_and_a_few_bodies_at_most() {
         let article = |n: u64, file: &str, part: i64| Article {
             number: n,
             subject: format!(r#""{file}" yEnc ({part}/900)"#),
@@ -1888,15 +1885,20 @@ mod tests {
         };
         let ids = |r: &Release| name_sources(r).into_iter().map(|(id, _)| id).collect::<Vec<_>>();
 
-        // a big par2 seen part way, and an nfo
-        let mut big = Release::default();
-        big.articles = (0..900).map(|i| article(i, "x.par2", 900 - i as i64)).collect();
+        // a big par2 with its first segment, and an nfo
+        let mut big = Release {
+            articles: (0..900).map(|i| article(i, "x.par2", 900 - i as i64)).collect(),
+            ..Default::default()
+        };
         big.articles.push(article(1000, "x.nfo", 1));
         assert_eq!(ids(&big), ["<899>", "<1000>"]);
+        // seen part way, without its first segment: nothing worth a body
+        big.articles.retain(|a| a.part != Some(1));
+        assert!(ids(&big).is_empty());
 
         // many par2 files: no more than MAX_NAME_BODIES of them
-        let mut many = Release::default();
-        many.articles = (0..10).map(|i| article(i, &format!("f{i}.par2"), 1)).collect();
+        let many =
+            Release { articles: (0..10).map(|i| article(i, &format!("f{i}.par2"), 1)).collect(), ..Default::default() };
         assert_eq!(ids(&many).len(), MAX_NAME_BODIES);
     }
 
