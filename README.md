@@ -509,7 +509,7 @@ CI (`.github/workflows/ci.yml`) checks formatting, runs clippy, and runs the tes
 
 ## Limitations
 
-- Deobfuscation works only when a release has a par2 or nfo file with a usable name.
+- Deobfuscation works only when a release has a par2 or nfo file with a usable name in its first article. Names are looked up in the background after a release is saved, so a new release can show its posted name for a moment first.
 - Atlas reports every release as category `7000` (Other), so clients that only search TV or movie categories might skip it.
 - Search matches release names only, so searches by ID, such as TVDB or IMDb, return nothing.
 
