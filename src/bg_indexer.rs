@@ -600,7 +600,7 @@ async fn worker(sched: Arc<Scheduler>, server: usize, db: Db) {
 
         // stopping drops a pass stuck on the network too (GROUP, a login, a name
         // lookup). safe: db writes run whole on their own thread and the cursor
-        // only moves once a range is complete
+        // only moves past slices that are saved
         let pass = run_pass(&sched.ctx, &settings, &db, &group, server, &mut progress);
         let Some(result) = unless_stopped(&sched.ctx.stop, pass).await else { break };
         sched.finish(&group, result);

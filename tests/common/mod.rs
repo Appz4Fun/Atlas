@@ -67,6 +67,9 @@ pub struct Server {
     pub reported_low: Option<u64>,
     /// once set, GROUP answers 411, like a provider that dropped the group
     pub dropped: std::sync::atomic::AtomicBool,
+    /// the first XOVER starting at this number closes the connection instead
+    /// of answering, like a provider dropping a request
+    pub drop_xover_at: Mutex<Option<u64>>,
 }
 
 impl Server {
@@ -98,6 +101,7 @@ impl Server {
             empty_is_420: false,
             reported_low: None,
             dropped: Default::default(),
+            drop_xover_at: Mutex::new(None),
         })
     }
 }
@@ -241,6 +245,13 @@ pub fn serve(stream: TcpStream, state: &Server, over_limit: bool) {
                 state.xovers_in_flight.fetch_sub(1, Ordering::SeqCst);
                 let (a, b) = arg.split_once('-').unwrap();
                 let (a, b): (u64, u64) = (a.parse().unwrap(), b.parse().unwrap());
+                {
+                    let mut drop_at = state.drop_xover_at.lock().unwrap();
+                    if *drop_at == Some(a) {
+                        *drop_at = None;
+                        return;
+                    }
+                }
                 let posts = posts_lock();
                 let lo = posts.partition_point(|p| p.number < a);
                 let hits = || posts[lo..].iter().take_while(|p| p.number <= b);

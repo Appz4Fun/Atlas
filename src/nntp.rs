@@ -170,6 +170,11 @@ const STOP_POLL: Duration = Duration::from_millis(50);
 /// connections hold (the unsaved budget bounds them all, this keeps one pass
 /// from taking a big share of it)
 const SLICES_BUFFERED: usize = 4;
+/// slices one pass holds room for at once, fetching, waiting for it or being
+/// parsed: without it a pass on a server of many connections takes the whole
+/// unsaved budget in one burst and every other pass waits while it saves
+/// them one by one
+pub const STREAM_SLICES: usize = 2 * SLICES_BUFFERED;
 
 /// `fut`'s output, or None as soon as `stop` is set: stopping doesnt wait on
 /// a provider that went quiet mid reply. Dropping a request part way is safe,
@@ -996,6 +1001,8 @@ pub struct Unsaved {
     /// headers held past the room (a slice bigger than the whole budget),
     /// counted soo `now` and `peak` show what is really held
     over: usize,
+    /// the slice's place among its pass's `STREAM_SLICES`
+    _slot: Option<OwnedSemaphorePermit>,
 }
 
 impl Unsaved {
@@ -1140,7 +1147,7 @@ impl Pool {
         let permit = budget.permits.clone().acquire_many_owned(n as u32).await.expect("semaphore closed");
         let now = budget.now.fetch_add(n, Ordering::Relaxed) + n;
         budget.peak.fetch_max(now, Ordering::Relaxed);
-        Unsaved { permit, budget, over: 0 }
+        Unsaved { permit, budget, over: 0, _slot: None }
     }
 
     pub fn len(&self) -> usize {
@@ -1926,11 +1933,13 @@ impl Pool {
     ///
     /// Every slice holds its room in the pool's unsaved budget (`Unsaved`)
     /// until the receiver drops it, soo a receiver keeps it until the slice is
-    /// saved. The room is taken before a connection, and the slices of one
-    /// stream take it in order, one waiting at a time. Nothing that holds room
-    /// waits for more: a slice holding some is fetching (and needs only a
-    /// connection, which no one waiting for room holds), waiting in the
-    /// channel for its receiver, or being saved, soo room always comes free.
+    /// parsed. At most `STREAM_SLICES` of a stream hold room at once, soo one
+    /// stream cant take the whole budget while its receiver saves slice after
+    /// slice. A slice takes its slot, then its room, then a connection, and the
+    /// slices of one stream take room in order, one waiting at a time. Nothing
+    /// that holds room waits for more: a slice holding some is fetching (and
+    /// needs only a connection, which no one waiting for room holds), waiting
+    /// in the channel for its receiver, or being parsed, soo room always comes free.
     pub fn stream_headers(
         self: &Arc<Self>,
         group: &str,
@@ -1941,14 +1950,15 @@ impl Pool {
         let i = server;
         // several groups can stream from one server at once, the server's
         // semaphore keeps the total at its `connections`
-        let workers = self.connections(i).max(1).min(slices.len().max(1));
+        let workers = self.connections(i).max(1).min(slices.len().max(1)).min(STREAM_SLICES);
         let (tx, rx) = tokio::sync::mpsc::channel(SLICES_BUFFERED);
+        let slots = Arc::new(Semaphore::new(STREAM_SLICES));
         let queue = Arc::new(tokio::sync::Mutex::new(std::collections::VecDeque::from(slices)));
         let halt = Arc::new(AtomicBool::new(false));
 
         for _ in 0..workers {
-            let (pool, queue, halt, stop, tx, group) =
-                (self.clone(), queue.clone(), halt.clone(), stop.clone(), tx.clone(), group.to_string());
+            let (pool, queue, halt, stop, tx, group, slots) =
+                (self.clone(), queue.clone(), halt.clone(), stop.clone(), tx.clone(), group.to_string(), slots.clone());
 
             tokio::spawn(async move {
                 loop {
@@ -1956,12 +1966,17 @@ impl Pool {
                         return;
                     }
 
+                    // a slot first: room is only taken for slices the pass has a slot for
+                    let Some(slot) = unless_stopped(&stop, slots.clone().acquire_owned()).await else { return };
+                    let slot = slot.expect("semaphore closed");
+
                     // the next slice and its room, the queue held meanwhile
                     let ((start, end), mut unsaved) = {
                         let mut queue = queue.lock().await;
                         let Some((start, end)) = queue.pop_front() else { return };
                         let room = pool.reserve_unsaved(end.saturating_sub(start).saturating_add(1));
-                        let Some(unsaved) = unless_stopped(&stop, room).await else { return };
+                        let Some(mut unsaved) = unless_stopped(&stop, room).await else { return };
+                        unsaved._slot = Some(slot);
                         ((start, end), unsaved)
                     };
                     if halt.load(Ordering::Relaxed) {
