@@ -66,3 +66,55 @@ fn a_stopped_pass_keeps_its_names_for_the_next_one() {
 
     assert_eq!(named(), 1, "the next pass named the release");
 }
+
+/// Bodies far slower than headers: a pass doesnt run ahead of its name
+/// lookups, it waits once `STREAM_SLICES` of its slices are waiting on them.
+#[test]
+fn slow_names_hold_a_pass_back() {
+    const SLICES: u64 = 40;
+    let posts = (1..=SLICES)
+        .map(|n| {
+            let par2 = par2_file_desc(&format!("Real.{n}.mkv"), 9);
+            post(n, &format!(r#""rel{n}.par2" yEnc (1/1)"#), 10, yenc_body("rel.par2", &par2))
+        })
+        .collect();
+    let mut server = Server::new(posts);
+    let s = Arc::get_mut(&mut server).unwrap();
+    s.any_group = true;
+    s.body_delay = Duration::from_secs(3);
+    let port = spawn_server(server.clone());
+    let pool = Arc::new(Pool::new(&[mock(port, "secret", 60, 1)]));
+
+    let dir = tempfile::tempdir().unwrap();
+    let main = dir.path().join("atlas.db");
+    atlas::db::create_db_at(&main).unwrap();
+    let db = shared_db(atlas::db::open_at(&main).unwrap());
+    let stop = Arc::new(AtomicBool::new(false));
+    let ctx = PassContext { pool: pool.clone(), states: RunStates::default(), stop: stop.clone(), verbose: false };
+    // a slice an article
+    let settings = PassSettings {
+        mode: "backfill".into(),
+        request_size: 1,
+        batch_size: SLICES as i64,
+        split_min_backlog: i64::MAX,
+        ..Default::default()
+    };
+
+    let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+    rt.block_on(async {
+        pool.connect().await.unwrap();
+        let stopper = stop.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            stopper.store(true, Ordering::Relaxed);
+        });
+        let mut progress = |_: &atlas::indexer::Progress| {};
+        let pass = run_pass(&ctx, &settings, &db, "alt.binaries.slow", 0, &mut progress);
+        let _ = unless_stopped(&stop, pass).await;
+    });
+
+    // waiting on names, plus the slices fetched ahead of it
+    let most = 2 * atlas::nntp::STREAM_SLICES + 2;
+    let fetched = server.xovers.load(Ordering::SeqCst);
+    assert!(fetched <= most, "{fetched} slices fetched while the first names were still coming, at most {most}");
+}

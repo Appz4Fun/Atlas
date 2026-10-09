@@ -379,6 +379,33 @@ impl Db {
 
 /// slices whose releases are being named at once at most, over every pass
 const NAMING_SLICES: usize = 256;
+/// slices of one pass waiting on their names at most: past it the pass
+/// waits before it saves another, soo slow bodies dont pile up name lookups
+const PASS_NAMING: usize = crate::nntp::STREAM_SLICES;
+
+/// What a pass's name lookup came to: its slice, and whether the names were
+/// saved (see `name_releases`).
+type Named = std::result::Result<(u64, u64, Result<()>), tokio::task::JoinError>;
+
+/// Take a finished name lookup into its pass: names that couldnt be saved
+/// mean their slice isnt done, soo the cursor stays before it and the names
+/// are looked up again.
+fn settle_names(named: Named, finished: &mut Finished, done: &mut usize, error: &mut Option<anyhow::Error>) {
+    match named {
+        Ok((_, _, Ok(()))) => {}
+        Ok((start, end, Err(e))) => {
+            if finished.remove(start, end) {
+                *done -= 1;
+            }
+            error.get_or_insert(e);
+        }
+        // which slice it was is lost with it: the cursor moves past none
+        Err(e) => {
+            *finished = Finished::default();
+            error.get_or_insert(anyhow!("naming task failed: {e}"));
+        }
+    }
+}
 
 /// Releases of a slice and the bodies that may name them (see `name_sources`).
 type NameJobs = Vec<(String, Vec<(String, Extract)>)>;
@@ -388,8 +415,13 @@ type NameJobs = Vec<(String, Vec<(String, Extract)>)>;
 /// for them before its cursor moves: one cut short (stopping) or whose names
 /// couldnt be saved is redone with its slice. A body that names nothing is
 /// no failure.
-async fn name_releases(pool: Arc<Pool>, db: Db, group: String, jobs: NameJobs) -> Result<()> {
-    let _permit = db.naming.clone().acquire_owned().await.map_err(|e| anyhow!("naming: {e}"))?;
+async fn name_releases(
+    pool: Arc<Pool>,
+    db: Db,
+    group: String,
+    jobs: NameJobs,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+) -> Result<()> {
     let t = Instant::now();
     let (releases, sources): (Vec<String>, Vec<_>) = jobs.into_iter().unzip();
     let found = first_names(pool, sources).await;
@@ -1562,6 +1594,9 @@ impl Pass<'_> {
         let (mut low, mut high): (Option<db::Dated>, Option<db::Dated>) = (None, None);
 
         while let Some(slice) = rx.recv().await {
+            while let Some(named) = naming.try_join_next() {
+                settle_names(named, &mut finished, &mut done, &mut error);
+            }
             // the slice's room in the unsaved budget goes back once it's parsed
             // (or skipped)
             let unsaved = slice.unsaved;
@@ -1600,7 +1635,14 @@ impl Pass<'_> {
             match save_slice(self.db, group, headers, unsaved).await {
                 Ok((p, names)) => {
                     if !names.is_empty() {
-                        let naming_done = name_releases(pool.clone(), self.db.clone(), group.to_string(), names);
+                        while naming.len() >= PASS_NAMING
+                            && let Some(named) = naming.join_next().await
+                        {
+                            settle_names(named, &mut finished, &mut done, &mut error);
+                        }
+                        let permit = self.db.naming.clone().acquire_owned().await.expect("naming semaphore closed");
+                        let naming_done =
+                            name_releases(pool.clone(), self.db.clone(), group.to_string(), names, permit);
                         let (start, end) = (slice.start, slice.end);
                         naming.spawn(async move { (start, end, naming_done.await) });
                     }
@@ -1623,24 +1665,8 @@ impl Pass<'_> {
         // the names of what this pass saved are in before its cursor moves;
         // dropping the pass (stopping) drops them too, and they are redone
         // with their slices
-        while let Some(joined) = naming.join_next().await {
-            let (start, end, result) = match joined {
-                Ok(named) => named,
-                // which slice it was is lost with it: the cursor moves past none
-                Err(e) => {
-                    finished = Finished::default();
-                    error.get_or_insert(anyhow!("naming task failed: {e}"));
-                    continue;
-                }
-            };
-            // names that couldnt be saved: the slice isnt done, the cursor
-            // stays before it and its names are looked up again
-            if let Err(e) = result {
-                if finished.remove(start, end) {
-                    done -= 1;
-                }
-                error.get_or_insert(e);
-            }
+        while let Some(named) = naming.join_next().await {
+            settle_names(named, &mut finished, &mut done, &mut error);
         }
 
         if let (Some(low), Some(high)) = (low, high) {
