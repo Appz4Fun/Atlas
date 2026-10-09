@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
+use indexmap::IndexMap;
 use rusqlite::Connection;
 
 use crate::config::{DEFAULT_BATCH_SIZE, DEFAULT_REQUEST_SIZE};
@@ -11,7 +12,7 @@ use crate::db;
 use crate::nfo;
 use crate::nntp::{BlockingPool, Extract, Overview, Pool, Retention, first_names, headers_to_articles};
 use crate::par2;
-use crate::parser::{Release, group_articles, is_complete};
+use crate::parser::{Article, Release, group_articles, is_complete};
 
 /// What one finished XOVER slice added, reported as it lands.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1726,7 +1727,14 @@ async fn save_slice(
     Ok(Progress { articles, bytes, releases: count })
 }
 
-/// Bodies worth fetching for a real name: base par2 files first, then nfos.
+/// bodies a release's name lookup tries at most
+const MAX_NAME_BODIES: usize = 3;
+
+/// Bodies worth fetching for a real name: base par2 files first, then nfos,
+/// one segment a file (its first one in the slice: where par2 and nfo files
+/// keep what names a release) and `MAX_NAME_BODIES` at most. A big
+/// obfuscated par2 comes in thousands of segments of most of a MB each;
+/// trying them all one after another held its slice for minutes.
 fn name_sources(release: &Release) -> Vec<(String, Extract)> {
     type Matches = fn(&str) -> bool;
     let sources: [(Matches, Extract); 2] = [(par2::is_base_par2, par2::display_name), (nfo::is_nfo, nfo::display_name)];
@@ -1734,8 +1742,17 @@ fn name_sources(release: &Release) -> Vec<(String, Extract)> {
     sources
         .iter()
         .flat_map(|(matches, extract)| {
-            release.articles.iter().filter(|a| matches(&a.subject)).map(|a| (a.message_id.clone(), *extract))
+            // the lowest part of each file, in first seen order
+            let mut files: IndexMap<Option<&str>, &Article> = IndexMap::new();
+            for a in release.articles.iter().filter(|a| matches(&a.subject)) {
+                let first = files.entry(a.filename.as_deref()).or_insert(a);
+                if a.part.unwrap_or(1) < first.part.unwrap_or(1) {
+                    *first = a;
+                }
+            }
+            files.into_values().map(|a| (a.message_id.clone(), *extract)).collect::<Vec<_>>()
         })
+        .take(MAX_NAME_BODIES)
         .collect()
 }
 
@@ -1858,6 +1875,30 @@ impl Indexer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_name_lookup_tries_the_first_segment_of_each_file_and_a_few_bodies_at_most() {
+        let article = |n: u64, file: &str, part: i64| Article {
+            number: n,
+            subject: format!(r#""{file}" yEnc ({part}/900)"#),
+            message_id: format!("<{n}>"),
+            filename: Some(file.into()),
+            part: Some(part),
+            ..Default::default()
+        };
+        let ids = |r: &Release| name_sources(r).into_iter().map(|(id, _)| id).collect::<Vec<_>>();
+
+        // a big par2 seen part way, and an nfo
+        let mut big = Release::default();
+        big.articles = (0..900).map(|i| article(i, "x.par2", 900 - i as i64)).collect();
+        big.articles.push(article(1000, "x.nfo", 1));
+        assert_eq!(ids(&big), ["<899>", "<1000>"]);
+
+        // many par2 files: no more than MAX_NAME_BODIES of them
+        let mut many = Release::default();
+        many.articles = (0..10).map(|i| article(i, &format!("f{i}.par2"), 1)).collect();
+        assert_eq!(ids(&many).len(), MAX_NAME_BODIES);
+    }
 
     #[test]
     fn finished_slices_count_from_either_end_up_to_the_first_gap() {
