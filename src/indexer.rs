@@ -189,6 +189,8 @@ const MAX_BATCH: usize = 8;
 pub struct Db {
     conn: Arc<Mutex<Connection>>,
     saves: Vec<std::sync::mpsc::Sender<SaveJob>>,
+    /// slices being named at once, over every pass (see `name_releases`)
+    naming: Arc<tokio::sync::Semaphore>,
     /// last field: dropping the final clone closes the queues above, then waits
     /// for the writer threads to finish what they were doing
     _writers: Arc<Writers>,
@@ -207,6 +209,8 @@ impl Drop for Writers {
 
 struct SaveJob {
     releases: Vec<Release>,
+    /// `(name, group, display name)` of releases saved before
+    names: Vec<(String, String, String)>,
     done: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
 }
 
@@ -232,7 +236,12 @@ fn shared_db_idling(conn: Connection, every: Duration) -> Db {
             (saves, handle)
         })
         .unzip();
-    Db { conn: Arc::new(Mutex::new(conn)), saves, _writers: Arc::new(Writers(writers)) }
+    Db {
+        conn: Arc::new(Mutex::new(conn)),
+        saves,
+        naming: Arc::new(tokio::sync::Semaphore::new(NAMING_SLICES)),
+        _writers: Arc::new(Writers(writers)),
+    }
 }
 
 /// A shard's writer: saves what comes in, and between saves (or after
@@ -284,11 +293,19 @@ fn writer(
         }
 
         let t = std::time::Instant::now();
-        let result = match &mut opened {
+        let (result, named) = match &mut opened {
             Ok(conn) => {
-                store.save(conn, ids, batch.iter().map(|job| job.releases.as_slice())).map_err(|e| e.to_string())
+                let saved = store.save(conn, ids, batch.iter().map(|job| job.releases.as_slice()));
+                // names of releases saved before, in their own transaction: a
+                // failure there isnt the slices'
+                let names: Vec<_> = batch.iter().flat_map(|job| job.names.iter().cloned()).collect();
+                let named = if names.is_empty() { Ok(()) } else { store.set_names(conn, &names) };
+                (saved.map_err(|e| e.to_string()), named.map_err(|e| e.to_string()))
             }
-            Err(e) => Err(format!("couldnt open {}: {e}", path.display())),
+            Err(e) => {
+                let e = format!("couldnt open {}: {e}", path.display());
+                (Err(e.clone()), Err(e))
+            }
         };
         Load::add_since(&LOAD.writer_busy_ns, t);
         LOAD.writer_batches.fetch_add(1, Relaxed);
@@ -298,7 +315,7 @@ fn writer(
         // the save is committed by now: the slices dont wait for the housekeeping
         let saved = result.is_ok();
         for job in batch {
-            let _ = job.done.send(result.clone());
+            let _ = job.done.send(if job.names.is_empty() { result.clone() } else { named.clone() });
         }
 
         // housekeeping between transactions
@@ -346,14 +363,75 @@ impl Db {
     async fn save(&self, releases: Vec<Release>) -> Result<()> {
         // a slice is one group, soo one shard
         let Some(shard) = releases.first().map(|r| crate::store::shard_of(&r.group)) else { return Ok(()) };
+        self.send(shard, releases, Vec::new()).await
+    }
+
+    async fn send(&self, shard: usize, releases: Vec<Release>, names: Vec<(String, String, String)>) -> Result<()> {
         let (done, saved) = tokio::sync::oneshot::channel();
         crate::profile::LOAD.writer_queued.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if self.saves[shard].send(SaveJob { releases, done }).is_err() {
+        if self.saves[shard].send(SaveJob { releases, names, done }).is_err() {
             crate::profile::LOAD.writer_queued.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             return Err(anyhow!("db writer stopped"));
         }
         saved.await.map_err(|_| anyhow!("db writer stopped"))?.map_err(|e| anyhow!("saving releases: {e}"))
     }
+}
+
+/// slices whose releases are being named at once at most, over every pass
+const NAMING_SLICES: usize = 256;
+/// slices of one pass waiting on their names at most: past it the pass
+/// waits before it saves another, soo slow bodies dont pile up name lookups
+const PASS_NAMING: usize = crate::nntp::STREAM_SLICES;
+
+/// What a pass's name lookup came to: its slice, and whether the names were
+/// saved (see `name_releases`).
+type Named = std::result::Result<(u64, u64, Result<()>), tokio::task::JoinError>;
+
+/// Take a finished name lookup into its pass: names that couldnt be saved
+/// mean their slice isnt done, soo the cursor stays before it and the names
+/// are looked up again.
+fn settle_names(named: Named, finished: &mut Finished, done: &mut usize, error: &mut Option<anyhow::Error>) {
+    match named {
+        Ok((_, _, Ok(()))) => {}
+        Ok((start, end, Err(e))) => {
+            if finished.remove(start, end) {
+                *done -= 1;
+            }
+            error.get_or_insert(e);
+        }
+        // which slice it was is lost with it: the cursor moves past none
+        Err(e) => {
+            *finished = Finished::default();
+            error.get_or_insert(anyhow!("naming task failed: {e}"));
+        }
+    }
+}
+
+/// Releases of a slice and the bodies that may name them (see `name_sources`).
+type NameJobs = Vec<(String, Vec<(String, Extract)>)>;
+
+/// Look up real names for releases of `group` that are saved already, and
+/// save the ones found. A pass runs these alongside its next slices and waits
+/// for them before its cursor moves: one cut short (stopping) or whose names
+/// couldnt be saved is redone with its slice. A body that names nothing is
+/// no failure.
+async fn name_releases(
+    pool: Arc<Pool>,
+    db: Db,
+    group: String,
+    jobs: NameJobs,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+) -> Result<()> {
+    let t = Instant::now();
+    let (releases, sources): (Vec<String>, Vec<_>) = jobs.into_iter().unzip();
+    let found = first_names(pool, sources).await;
+    crate::profile::NAMES.add_since(t);
+    let names: Vec<_> =
+        releases.into_iter().zip(found).filter_map(|(name, found)| Some((name, group.clone(), found?))).collect();
+    if names.is_empty() {
+        return Ok(());
+    }
+    db.send(crate::store::shard_of(&group), Vec::new(), names).await.map_err(|e| anyhow!("saving names: {e}"))
 }
 
 async fn on_db<T: Send + 'static>(db: &Db, f: impl FnOnce(&mut Connection) -> Result<T> + Send + 'static) -> Result<T> {
@@ -937,11 +1015,12 @@ where
     // that is the home's
     let start = first.max(cursor - settings.batch_size.max(1) + 1);
     let pass = Pass { ctx, settings, db, group, server, key: key.clone() };
-    let (saved, complete) = pass.process_range(start, cursor, "SWEEP", progress).await?;
-    if complete {
-        on_db(db, move |conn| Ok(db::update_backfill_cursor(conn, &key, start - 1)?)).await?;
+    let ranged = pass.process_range(start, cursor, "SWEEP", progress).await;
+    // done down from the cursor: the cursor moves past it, failed or not
+    if let Some(high) = ranged.high_done {
+        on_db(db, move |conn| Ok(db::update_backfill_cursor(conn, &key, high as i64 - 1)?)).await?;
     }
-    Ok(saved)
+    ranged.into_result()
 }
 
 /// a day chunk also takes this much on each side: post dates are only
@@ -1260,16 +1339,17 @@ where
 
     let pass = Pass { ctx, settings, db, group, server, key: cursor_key(&ctx.pool, server, group) };
     let window = alone.then_some((day * 86_400, (day + 1) * 86_400));
-    match pass.process_range_dated(start as i64, end as i64, "CHUNK", window, progress).await {
-        Ok((saved, true, dated_in_day)) => {
-            finish_chunk(db, chunk, (alone, floor, oldest), dated_in_day).await?;
+    let ranged = pass.process_range_dated(start as i64, end as i64, "CHUNK", window, progress).await;
+    match ranged {
+        Ranged { error: Some(e), .. } => failed(e).await,
+        Ranged { saved, complete: true, in_window, .. } => {
+            finish_chunk(db, chunk, (alone, floor, oldest), in_window).await?;
             Ok(saved)
         }
-        Ok((saved, false, _)) => {
+        Ranged { saved, .. } => {
             release().await?;
             Ok(saved)
         }
-        Err(e) => failed(e).await,
     }
 }
 
@@ -1412,13 +1492,14 @@ impl Pass<'_> {
         }
 
         let end = last.min(start + self.settings.batch_size.max(1) - 1);
-        let (saved, complete) = self.process_range(start, end, "LIVE", progress).await?;
+        let ranged = self.process_range(start, end, "LIVE", progress).await;
 
-        if complete {
+        // done up from the cursor: the cursor moves past it, failed or not
+        if let Some(low) = ranged.low_done {
             let key = self.key.clone();
-            on_db(self.db, move |conn| Ok(db::update_live_cursor(conn, &key, end)?)).await?;
+            on_db(self.db, move |conn| Ok(db::update_live_cursor(conn, &key, low as i64)?)).await?;
         }
-        Ok(saved)
+        ranged.into_result()
     }
 
     async fn backfill<P>(&self, state: db::GroupState, first: i64, last: i64, progress: &mut P) -> Result<Progress>
@@ -1452,12 +1533,14 @@ impl Pass<'_> {
 
         // grab a chunk going backwards from the cursor
         let start = first.max(end - self.settings.batch_size.max(1) + 1);
-        let (saved, complete) = self.process_range(start, end, "BACKFILL", progress).await?;
+        let ranged = self.process_range(start, end, "BACKFILL", progress).await;
 
-        if complete {
+        // done down from the cursor: the cursor moves past it, failed or not
+        if let Some(high) = ranged.high_done {
             let key = self.key.clone();
-            on_db(self.db, move |conn| Ok(db::update_backfill_cursor(conn, &key, start - 1)?)).await?;
+            on_db(self.db, move |conn| Ok(db::update_backfill_cursor(conn, &key, high as i64 - 1)?)).await?;
         }
+        let saved = ranged.into_result()?;
         self.ctx.states.with(group, |st| st.backfilling = true);
         Ok(saved)
     }
@@ -1467,14 +1550,14 @@ impl Pass<'_> {
     /// saved as soon as it lands while the rest keep downloading. Backfill takes
     /// the newest slices first.
     ///
-    /// The bool is true when the whole range is done and its cursor can move,
-    /// false when `stop` cut it short (what was saved stays, the range gets redone).
-    async fn process_range<P>(&self, start: i64, end: i64, kind: &str, progress: &mut P) -> Result<(Progress, bool)>
+    /// A slice failing stops new ones from starting, but the ones that made it
+    /// are still saved, and `Ranged` says how far the range is done from
+    /// either end, soo a cursor can move past them and they arent fetched again.
+    async fn process_range<P>(&self, start: i64, end: i64, kind: &str, progress: &mut P) -> Ranged
     where
         P: FnMut(&Progress) + ?Sized,
     {
-        let (saved, complete, _) = self.process_range_dated(start, end, kind, None, progress).await?;
-        Ok((saved, complete))
+        self.process_range_dated(start, end, kind, None, progress).await
     }
 
     /// `process_range`, also how many articles retrieved are dated within
@@ -1486,7 +1569,7 @@ impl Pass<'_> {
         kind: &str,
         window: Option<(i64, i64)>,
         progress: &mut P,
-    ) -> Result<(Progress, bool, i64)>
+    ) -> Ranged
     where
         P: FnMut(&Progress) + ?Sized,
     {
@@ -1501,25 +1584,35 @@ impl Pass<'_> {
         let mut rx = pool.stream_headers(group, self.server, slices, self.ctx.stop.clone());
         let mut saved = Progress::default();
         let mut done = 0;
+        let mut finished = Finished::default();
         let mut error: Option<anyhow::Error> = None;
+        // a failed save stops the saving, a failed fetch only stops the fetching
+        let mut save_failed = false;
+        // name lookups of the slices saved so far (see `name_releases`)
+        let mut naming = tokio::task::JoinSet::new();
         // dated ends of what this pass saved, for the stats dashboard's history numbers
         let (mut low, mut high): (Option<db::Dated>, Option<db::Dated>) = (None, None);
 
         while let Some(slice) = rx.recv().await {
-            // the slice's room in the unsaved budget goes back once it's saved
-            // (or skipped), at the end of this loop
-            let _unsaved = slice.unsaved;
+            while let Some(named) = naming.try_join_next() {
+                settle_names(named, &mut finished, &mut done, &mut error);
+            }
+            // the slice's room in the unsaved budget goes back once it's parsed
+            // (or skipped)
+            let unsaved = slice.unsaved;
             let headers: Vec<Overview> = match slice.result {
                 Ok(h) => h,
                 // 423 (or 420) = no articles in that slice
                 Err(e) if e.is_empty_range() => {
                     done += 1;
+                    finished.add(slice.start, slice.end);
                     continue;
                 }
                 Err(e) if e.is_permanent() => {
                     let code = e.code().unwrap_or(0);
                     println!("[{kind}] {group} {}-{} not available ({code}), skipping", slice.start, slice.end);
                     done += 1;
+                    finished.add(slice.start, slice.end);
                     continue;
                 }
                 Err(e) => {
@@ -1528,8 +1621,7 @@ impl Pass<'_> {
                 }
             };
 
-            // the pass is failing anyway, dont save half of it
-            if error.is_some() {
+            if save_failed {
                 continue;
             }
 
@@ -1540,32 +1632,51 @@ impl Pass<'_> {
                     .count() as i64;
             }
             let dated = slice_date(&headers);
-            match save_slice(pool, self.db, group, headers).await {
-                Ok(p) => {
+            match save_slice(self.db, group, headers, unsaved).await {
+                Ok((p, names)) => {
+                    if !names.is_empty() {
+                        while naming.len() >= PASS_NAMING
+                            && let Some(named) = naming.join_next().await
+                        {
+                            settle_names(named, &mut finished, &mut done, &mut error);
+                        }
+                        let permit = self.db.naming.clone().acquire_owned().await.expect("naming semaphore closed");
+                        let naming_done =
+                            name_releases(pool.clone(), self.db.clone(), group.to_string(), names, permit);
+                        let (start, end) = (slice.start, slice.end);
+                        naming.spawn(async move { (start, end, naming_done.await) });
+                    }
                     if let Some(d) = dated {
                         low = low.filter(|l| l.0 <= d.0).or(Some(d));
                         high = high.filter(|h| h.0 >= d.0).or(Some(d));
                     }
                     saved.add(&p);
                     done += 1;
+                    finished.add(slice.start, slice.end);
                     progress(&p);
                 }
                 Err(e) => {
+                    save_failed = true;
                     error.get_or_insert(e);
                 }
             }
         }
 
+        // the names of what this pass saved are in before its cursor moves;
+        // dropping the pass (stopping) drops them too, and they are redone
+        // with their slices
+        while let Some(named) = naming.join_next().await {
+            settle_names(named, &mut finished, &mut done, &mut error);
+        }
+
         if let (Some(low), Some(high)) = (low, high) {
             let key = self.key.clone();
-            on_db(self.db, move |conn| Ok(db::save_group_dates(conn, &key, low, high)?)).await?;
+            if let Err(e) = on_db(self.db, move |conn| Ok(db::save_group_dates(conn, &key, low, high)?)).await {
+                error.get_or_insert(e);
+            }
         }
 
-        if let Some(e) = error {
-            return Err(e);
-        }
-
-        if saved.articles == 0 && done == total {
+        if error.is_none() && saved.articles == 0 && done == total {
             println!("[{kind}] {group} {start}-{end} empty, skipping");
         }
 
@@ -1577,8 +1688,86 @@ impl Pass<'_> {
             println!("[{kind}] {group} {} headers in {done}/{total} slices", saved.articles);
         }
 
-        // stopped early: what got saved stays, the cursor waits for the rest
-        Ok((saved, done == total, in_window))
+        // failed or stopped early: what got saved stays, the cursor moves past
+        // the done run next to it and waits for the rest
+        let (low_done, high_done) = finished.ends(start.max(0) as u64, end.max(0) as u64);
+        Ranged { saved, complete: done == total, in_window, low_done, high_done, error }
+    }
+}
+
+/// How a range pass went. `low_done` / `high_done`: the range is done from
+/// its start up to `low_done`, and from `high_done` up to its end (None when
+/// its first, or its last, slice isnt done): what a cursor going up, or going
+/// down, can move past even when the pass failed or was stopped.
+struct Ranged {
+    saved: Progress,
+    /// every slice done: the whole range, and its cursor can move
+    complete: bool,
+    in_window: i64,
+    low_done: Option<u64>,
+    high_done: Option<u64>,
+    /// the first failure; what got saved before and after it stays saved
+    error: Option<anyhow::Error>,
+}
+
+impl Ranged {
+    /// the progress, or the failure (once the caller moved its cursor)
+    fn into_result(self) -> Result<Progress> {
+        match self.error {
+            Some(e) => Err(e),
+            None => Ok(self.saved),
+        }
+    }
+}
+
+/// The slices of a range that are done (saved, empty or not available).
+#[derive(Default)]
+struct Finished(Vec<(u64, u64)>);
+
+impl Finished {
+    fn add(&mut self, start: u64, end: u64) {
+        self.0.push((start, end));
+    }
+
+    /// not done after all; false when it wasnt
+    fn remove(&mut self, start: u64, end: u64) -> bool {
+        let before = self.0.len();
+        self.0.retain(|&s| s != (start, end));
+        self.0.len() != before
+    }
+
+    /// How far `start..=end` is done from each end: the last number of the
+    /// done run starting at `start`, the first of the one ending at `end`.
+    fn ends(&self, start: u64, end: u64) -> (Option<u64>, Option<u64>) {
+        let mut done = self.0.clone();
+        done.sort_unstable();
+
+        let mut low = None;
+        let mut next = start;
+        for &(a, b) in &done {
+            if a != next {
+                break;
+            }
+            low = Some(b);
+            match b.checked_add(1) {
+                Some(n) => next = n,
+                None => break,
+            }
+        }
+
+        let mut high = None;
+        let mut prev = end;
+        for &(a, b) in done.iter().rev() {
+            if b != prev {
+                break;
+            }
+            high = Some(a);
+            match a.checked_sub(1) {
+                Some(n) => prev = n,
+                None => break,
+            }
+        }
+        (low, high)
     }
 }
 
@@ -1599,7 +1788,15 @@ fn slice_date(headers: &[Overview]) -> Option<db::Dated> {
 }
 
 /// Parse one slice into releases, look up real names, save.
-async fn save_slice(pool: &Arc<Pool>, db: &Db, group: &str, headers: Vec<Overview>) -> Result<Progress> {
+/// `unsaved` is the slice's room in the unsaved budget: it goes back once the
+/// headers are parsed, soo slow name lookups and saves dont hold the budget
+/// (a pass saves one slice at a time, soo what it holds past it is one slice).
+async fn save_slice(
+    db: &Db,
+    group: &str,
+    headers: Vec<Overview>,
+    unsaved: crate::nntp::Unsaved,
+) -> Result<(Progress, NameJobs)> {
     let articles = headers.len() as i64;
     crate::profile::SLICES.add(1);
     crate::profile::HEADERS.add(articles as u64);
@@ -1612,16 +1809,15 @@ async fn save_slice(pool: &Arc<Pool>, db: &Db, group: &str, headers: Vec<Overvie
             .map_err(|e| anyhow!("parse task failed: {e}"))?;
     crate::profile::PARSE.add_since(t);
     crate::profile::Load::add_since(&crate::profile::LOAD.parse_ns, t);
+    drop(unsaved);
 
-    // real names from par2/nfo bodies, every release looked up concurrently
-    let t = std::time::Instant::now();
-    let jobs = releases.iter().map(name_sources).collect();
-    let names = first_names(pool.clone(), jobs).await;
-    crate::profile::NAMES.add_since(t);
+    // real names from par2/nfo bodies come after the save, alongside the
+    // pass's next slices: a slow body doesnt hold up the pass
+    let names: Vec<_> =
+        releases.iter().map(|r| (r.name.clone(), name_sources(r))).filter(|(_, sources)| !sources.is_empty()).collect();
 
     let mut bytes = 0;
-    for (i, release) in releases.iter_mut().enumerate() {
-        release.display_name = names.get(i).cloned().flatten();
+    for release in releases.iter_mut() {
         release.complete = is_complete(&release.articles);
         release.group = group.to_string();
         release.poster = release.articles[0].author.clone();
@@ -1633,10 +1829,18 @@ async fn save_slice(pool: &Arc<Pool>, db: &Db, group: &str, headers: Vec<Overvie
     let count = releases.len() as i64;
     db.save(releases).await?;
 
-    Ok(Progress { articles, bytes, releases: count })
+    Ok((Progress { articles, bytes, releases: count }, names))
 }
 
-/// Bodies worth fetching for a real name: base par2 files first, then nfos.
+/// bodies a release's name lookup tries at most
+const MAX_NAME_BODIES: usize = 3;
+
+/// Bodies worth fetching for a real name: base par2 files first, then nfos,
+/// only their first segment (where par2 and nfo files keep what names a
+/// release, and it comes once per file, soo a release is looked up once
+/// however many slices it spans) and `MAX_NAME_BODIES` at most. A big
+/// obfuscated par2 comes in thousands of segments of most of a MB each;
+/// trying them one after another held a slice for minutes.
 fn name_sources(release: &Release) -> Vec<(String, Extract)> {
     type Matches = fn(&str) -> bool;
     let sources: [(Matches, Extract); 2] = [(par2::is_base_par2, par2::display_name), (nfo::is_nfo, nfo::display_name)];
@@ -1644,8 +1848,13 @@ fn name_sources(release: &Release) -> Vec<(String, Extract)> {
     sources
         .iter()
         .flat_map(|(matches, extract)| {
-            release.articles.iter().filter(|a| matches(&a.subject)).map(|a| (a.message_id.clone(), *extract))
+            release
+                .articles
+                .iter()
+                .filter(|a| a.part.unwrap_or(1) == 1 && matches(&a.subject))
+                .map(|a| (a.message_id.clone(), *extract))
         })
+        .take(MAX_NAME_BODIES)
         .collect()
 }
 
@@ -1768,6 +1977,58 @@ impl Indexer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parser::Article;
+
+    #[test]
+    fn a_name_lookup_tries_first_segments_only_and_a_few_bodies_at_most() {
+        let article = |n: u64, file: &str, part: i64| Article {
+            number: n,
+            subject: format!(r#""{file}" yEnc ({part}/900)"#),
+            message_id: format!("<{n}>"),
+            filename: Some(file.into()),
+            part: Some(part),
+            ..Default::default()
+        };
+        let ids = |r: &Release| name_sources(r).into_iter().map(|(id, _)| id).collect::<Vec<_>>();
+
+        // a big par2 with its first segment, and an nfo
+        let mut big = Release {
+            articles: (0..900).map(|i| article(i, "x.par2", 900 - i as i64)).collect(),
+            ..Default::default()
+        };
+        big.articles.push(article(1000, "x.nfo", 1));
+        assert_eq!(ids(&big), ["<899>", "<1000>"]);
+        // seen part way, without its first segment: nothing worth a body
+        big.articles.retain(|a| a.part != Some(1));
+        assert!(ids(&big).is_empty());
+
+        // many par2 files: no more than MAX_NAME_BODIES of them
+        let many =
+            Release { articles: (0..10).map(|i| article(i, &format!("f{i}.par2"), 1)).collect(), ..Default::default() };
+        assert_eq!(ids(&many).len(), MAX_NAME_BODIES);
+    }
+
+    #[test]
+    fn finished_slices_count_from_either_end_up_to_the_first_gap() {
+        let mut f = Finished::default();
+        assert_eq!(f.ends(1, 40), (None, None));
+        f.add(31, 40);
+        f.add(1, 10);
+        f.add(21, 30);
+        assert_eq!(f.ends(1, 40), (Some(10), Some(21)), "11-20 missing");
+        f.add(11, 20);
+        assert_eq!(f.ends(1, 40), (Some(40), Some(1)));
+        // a slice whose names couldnt be saved isnt done after all
+        assert!(f.remove(21, 30));
+        assert!(!f.remove(21, 30));
+        assert_eq!(f.ends(1, 40), (Some(20), Some(31)));
+        let mut top = Finished::default();
+        top.add(u64::MAX - 9, u64::MAX);
+        assert_eq!(top.ends(0, u64::MAX), (None, Some(u64::MAX - 9)));
+        let mut bottom = Finished::default();
+        bottom.add(0, 9);
+        assert_eq!(bottom.ends(0, u64::MAX), (Some(9), None));
+    }
 
     /// `#key`s that differ by case are two servers, and the host in a key is
     /// lowercased as before
@@ -2054,7 +2315,7 @@ mod tests {
         drop(gone);
         crate::profile::LOAD.writer_queued.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let shard = crate::store::shard_of("alt.binaries.t");
-        shared.saves[shard].send(SaveJob { releases: vec![release("dropped")], done }).unwrap();
+        shared.saves[shard].send(SaveJob { releases: vec![release("dropped")], names: Vec::new(), done }).unwrap();
         let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
         rt.block_on(shared.save(vec![release("kept")])).unwrap();
         drop(shared);
