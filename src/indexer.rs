@@ -385,21 +385,21 @@ type NameJobs = Vec<(String, Vec<(String, Extract)>)>;
 
 /// Look up real names for releases of `group` that are saved already, and
 /// save the ones found. A pass runs these alongside its next slices and waits
-/// for them before its cursor moves: one cut short (stopping) is redone with
-/// its slice.
-async fn name_releases(pool: Arc<Pool>, db: Db, group: String, jobs: NameJobs) {
-    let Ok(_permit) = db.naming.clone().acquire_owned().await else { return };
+/// for them before its cursor moves: one cut short (stopping) or whose names
+/// couldnt be saved is redone with its slice. A body that names nothing is
+/// no failure.
+async fn name_releases(pool: Arc<Pool>, db: Db, group: String, jobs: NameJobs) -> Result<()> {
+    let _permit = db.naming.clone().acquire_owned().await.map_err(|e| anyhow!("naming: {e}"))?;
     let t = Instant::now();
     let (releases, sources): (Vec<String>, Vec<_>) = jobs.into_iter().unzip();
     let found = first_names(pool, sources).await;
     crate::profile::NAMES.add_since(t);
     let names: Vec<_> =
         releases.into_iter().zip(found).filter_map(|(name, found)| Some((name, group.clone(), found?))).collect();
-    if !names.is_empty()
-        && let Err(e) = db.send(crate::store::shard_of(&group), Vec::new(), names).await
-    {
-        println!("[NAMES] {group}: {e}");
+    if names.is_empty() {
+        return Ok(());
     }
+    db.send(crate::store::shard_of(&group), Vec::new(), names).await.map_err(|e| anyhow!("saving names: {e}"))
 }
 
 async fn on_db<T: Send + 'static>(db: &Db, f: impl FnOnce(&mut Connection) -> Result<T> + Send + 'static) -> Result<T> {
@@ -1600,7 +1600,9 @@ impl Pass<'_> {
             match save_slice(self.db, group, headers, unsaved).await {
                 Ok((p, names)) => {
                     if !names.is_empty() {
-                        naming.spawn(name_releases(pool.clone(), self.db.clone(), group.to_string(), names));
+                        let naming_done = name_releases(pool.clone(), self.db.clone(), group.to_string(), names);
+                        let (start, end) = (slice.start, slice.end);
+                        naming.spawn(async move { (start, end, naming_done.await) });
                     }
                     if let Some(d) = dated {
                         low = low.filter(|l| l.0 <= d.0).or(Some(d));
@@ -1621,7 +1623,25 @@ impl Pass<'_> {
         // the names of what this pass saved are in before its cursor moves;
         // dropping the pass (stopping) drops them too, and they are redone
         // with their slices
-        while naming.join_next().await.is_some() {}
+        while let Some(joined) = naming.join_next().await {
+            let (start, end, result) = match joined {
+                Ok(named) => named,
+                // which slice it was is lost with it: the cursor moves past none
+                Err(e) => {
+                    finished = Finished::default();
+                    error.get_or_insert(anyhow!("naming task failed: {e}"));
+                    continue;
+                }
+            };
+            // names that couldnt be saved: the slice isnt done, the cursor
+            // stays before it and its names are looked up again
+            if let Err(e) = result {
+                if finished.remove(start, end) {
+                    done -= 1;
+                }
+                error.get_or_insert(e);
+            }
+        }
 
         if let (Some(low), Some(high)) = (low, high) {
             let key = self.key.clone();
@@ -1681,6 +1701,13 @@ struct Finished(Vec<(u64, u64)>);
 impl Finished {
     fn add(&mut self, start: u64, end: u64) {
         self.0.push((start, end));
+    }
+
+    /// not done after all; false when it wasnt
+    fn remove(&mut self, start: u64, end: u64) -> bool {
+        let before = self.0.len();
+        self.0.retain(|&s| s != (start, end));
+        self.0.len() != before
     }
 
     /// How far `start..=end` is done from each end: the last number of the
@@ -1965,6 +1992,10 @@ mod tests {
         assert_eq!(f.ends(1, 40), (Some(10), Some(21)), "11-20 missing");
         f.add(11, 20);
         assert_eq!(f.ends(1, 40), (Some(40), Some(1)));
+        // a slice whose names couldnt be saved isnt done after all
+        assert!(f.remove(21, 30));
+        assert!(!f.remove(21, 30));
+        assert_eq!(f.ends(1, 40), (Some(20), Some(31)));
         let mut top = Finished::default();
         top.add(u64::MAX - 9, u64::MAX);
         assert_eq!(top.ends(0, u64::MAX), (None, Some(u64::MAX - 9)));
