@@ -189,7 +189,8 @@ const MAX_BATCH: usize = 8;
 pub struct Db {
     conn: Arc<Mutex<Connection>>,
     saves: Vec<std::sync::mpsc::Sender<SaveJob>>,
-    naming: Arc<Naming>,
+    /// slices being named at once, over every pass (see `name_releases`)
+    naming: Arc<tokio::sync::Semaphore>,
     /// last field: dropping the final clone closes the queues above, then waits
     /// for the writer threads to finish what they were doing
     _writers: Arc<Writers>,
@@ -235,7 +236,12 @@ fn shared_db_idling(conn: Connection, every: Duration) -> Db {
             (saves, handle)
         })
         .unzip();
-    Db { conn: Arc::new(Mutex::new(conn)), saves, naming: Naming::new(), _writers: Arc::new(Writers(writers)) }
+    Db {
+        conn: Arc::new(Mutex::new(conn)),
+        saves,
+        naming: Arc::new(tokio::sync::Semaphore::new(NAMING_SLICES)),
+        _writers: Arc::new(Writers(writers)),
+    }
 }
 
 /// A shard's writer: saves what comes in, and between saves (or after
@@ -369,69 +375,30 @@ impl Db {
         }
         saved.await.map_err(|_| anyhow!("db writer stopped"))?.map_err(|e| anyhow!("saving releases: {e}"))
     }
-
-    /// Look up real names for releases of `group` that are saved already, in
-    /// the background, and save the ones found. `jobs` are each release's
-    /// name and the bodies to try (see `name_sources`). Waits only while
-    /// `NAMING_SLICES` slices are being named already.
-    async fn name_later(&self, pool: Arc<Pool>, group: &str, jobs: Vec<(String, Vec<(String, Extract)>)>) {
-        let permit = self.naming.permits.clone().acquire_owned().await.expect("semaphore closed");
-        let (db, group) = (self.clone(), group.to_string());
-        self.naming.pending.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        tokio::spawn(async move {
-            let t = Instant::now();
-            let (releases, sources): (Vec<String>, Vec<_>) = jobs.into_iter().unzip();
-            let found = first_names(pool, sources).await;
-            crate::profile::NAMES.add_since(t);
-            let names: Vec<_> = releases
-                .into_iter()
-                .zip(found)
-                .filter_map(|(name, found)| Some((name, group.clone(), found?)))
-                .collect();
-            if !names.is_empty()
-                && let Err(e) = db.send(crate::store::shard_of(&group), Vec::new(), names).await
-            {
-                println!("[NAMES] {group}: {e}");
-            }
-            drop(permit);
-            if db.naming.pending.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) == 1 {
-                db.naming.idle.notify_waiters();
-            }
-        });
-    }
-
-    /// Once every name lookup started so far is done (and saved).
-    pub async fn names_settled(&self) {
-        loop {
-            let idle = self.naming.idle.notified();
-            tokio::pin!(idle);
-            idle.as_mut().enable();
-            if self.naming.pending.load(std::sync::atomic::Ordering::SeqCst) == 0 {
-                return;
-            }
-            idle.await;
-        }
-    }
 }
 
-/// slices whose releases are being named in the background at most, over
-/// every pass: past it a pass waits before it saves another slice
+/// slices whose releases are being named at once at most, over every pass
 const NAMING_SLICES: usize = 256;
 
-/// The background name lookups (see `Db::name_later`).
-struct Naming {
-    permits: Arc<tokio::sync::Semaphore>,
-    pending: std::sync::atomic::AtomicUsize,
-    idle: tokio::sync::Notify,
-}
+/// Releases of a slice and the bodies that may name them (see `name_sources`).
+type NameJobs = Vec<(String, Vec<(String, Extract)>)>;
 
-impl Naming {
-    fn new() -> Arc<Naming> {
-        Arc::new(Naming {
-            permits: Arc::new(tokio::sync::Semaphore::new(NAMING_SLICES)),
-            pending: Default::default(),
-            idle: tokio::sync::Notify::new(),
-        })
+/// Look up real names for releases of `group` that are saved already, and
+/// save the ones found. A pass runs these alongside its next slices and waits
+/// for them before its cursor moves: one cut short (stopping) is redone with
+/// its slice.
+async fn name_releases(pool: Arc<Pool>, db: Db, group: String, jobs: NameJobs) {
+    let Ok(_permit) = db.naming.clone().acquire_owned().await else { return };
+    let t = Instant::now();
+    let (releases, sources): (Vec<String>, Vec<_>) = jobs.into_iter().unzip();
+    let found = first_names(pool, sources).await;
+    crate::profile::NAMES.add_since(t);
+    let names: Vec<_> =
+        releases.into_iter().zip(found).filter_map(|(name, found)| Some((name, group.clone(), found?))).collect();
+    if !names.is_empty()
+        && let Err(e) = db.send(crate::store::shard_of(&group), Vec::new(), names).await
+    {
+        println!("[NAMES] {group}: {e}");
     }
 }
 
@@ -1589,6 +1556,8 @@ impl Pass<'_> {
         let mut error: Option<anyhow::Error> = None;
         // a failed save stops the saving, a failed fetch only stops the fetching
         let mut save_failed = false;
+        // name lookups of the slices saved so far (see `name_releases`)
+        let mut naming = tokio::task::JoinSet::new();
         // dated ends of what this pass saved, for the stats dashboard's history numbers
         let (mut low, mut high): (Option<db::Dated>, Option<db::Dated>) = (None, None);
 
@@ -1628,8 +1597,11 @@ impl Pass<'_> {
                     .count() as i64;
             }
             let dated = slice_date(&headers);
-            match save_slice(pool, self.db, group, headers, unsaved).await {
-                Ok(p) => {
+            match save_slice(self.db, group, headers, unsaved).await {
+                Ok((p, names)) => {
+                    if !names.is_empty() {
+                        naming.spawn(name_releases(pool.clone(), self.db.clone(), group.to_string(), names));
+                    }
                     if let Some(d) = dated {
                         low = low.filter(|l| l.0 <= d.0).or(Some(d));
                         high = high.filter(|h| h.0 >= d.0).or(Some(d));
@@ -1645,6 +1617,11 @@ impl Pass<'_> {
                 }
             }
         }
+
+        // the names of what this pass saved are in before its cursor moves;
+        // dropping the pass (stopping) drops them too, and they are redone
+        // with their slices
+        while naming.join_next().await.is_some() {}
 
         if let (Some(low), Some(high)) = (low, high) {
             let key = self.key.clone();
@@ -1762,12 +1739,11 @@ fn slice_date(headers: &[Overview]) -> Option<db::Dated> {
 /// headers are parsed, soo slow name lookups and saves dont hold the budget
 /// (a pass saves one slice at a time, soo what it holds past it is one slice).
 async fn save_slice(
-    pool: &Arc<Pool>,
     db: &Db,
     group: &str,
     headers: Vec<Overview>,
     unsaved: crate::nntp::Unsaved,
-) -> Result<Progress> {
+) -> Result<(Progress, NameJobs)> {
     let articles = headers.len() as i64;
     crate::profile::SLICES.add(1);
     crate::profile::HEADERS.add(articles as u64);
@@ -1782,8 +1758,8 @@ async fn save_slice(
     crate::profile::Load::add_since(&crate::profile::LOAD.parse_ns, t);
     drop(unsaved);
 
-    // real names from par2/nfo bodies come after the save, in the background:
-    // a slow body doesnt hold up the pass
+    // real names from par2/nfo bodies come after the save, alongside the
+    // pass's next slices: a slow body doesnt hold up the pass
     let names: Vec<_> =
         releases.iter().map(|r| (r.name.clone(), name_sources(r))).filter(|(_, sources)| !sources.is_empty()).collect();
 
@@ -1799,11 +1775,8 @@ async fn save_slice(
 
     let count = releases.len() as i64;
     db.save(releases).await?;
-    if !names.is_empty() {
-        db.name_later(pool.clone(), group, names).await;
-    }
 
-    Ok(Progress { articles, bytes, releases: count })
+    Ok((Progress { articles, bytes, releases: count }, names))
 }
 
 /// bodies a release's name lookup tries at most
@@ -1938,10 +1911,7 @@ impl Indexer {
             // the active server, which moves when another server has to carry the group
             ctx.pool.select_group(group).await?;
             let server = ctx.pool.active_index();
-            let pass = run_pass(&ctx, &settings, &db, group, server, progress).await;
-            // one group at a time here: its names are in when the pass returns
-            db.names_settled().await;
-            pass
+            run_pass(&ctx, &settings, &db, group, server, progress).await
         })?;
 
         self.last_batch_articles = saved.articles;
