@@ -672,6 +672,7 @@ const CORE_TABLES: &[(&str, &str)] = &[
   - `masks_are_deltas`: a concurrent `Stage::rerun` between claim and apply keeps its cleared bit.
   - `a_rerun_of_the_running_step_survives_its_result`: claim with `claimed_gen` 0, `Stage::rerun` of that very step, then apply its `set_done`: the bit stays clear and the queue row stays, also when the rerun's `due_at` equals `claimed_due`. An unrelated bit in the same `set_done` is dropped only if it is in `rerun_mask`.
   - `a_stale_results_writes_and_name_are_dropped_too`: a step blocked in `run` with a write and a `NameChange`, a rerun of it meanwhile, then its apply: neither the write nor the name lands, and another step's write in the same `Applied` does. `a_stale_lookup_cant_attach_the_old_titles_ids` is its Part 8 form.
+  - `a_stale_net_result_leaves_the_net_step_wanted`: a net step, the last one left, blocked in `run`. A DB visit clears it, sets `net_wanted` and consumes the queue row. Then the old run applies with `net_mask` 0: `net_wanted` is still 1, `net_next_at` 0, and the net lane runs it again with no new queue row.
   - `a_rerun_of_a_release_with_no_state_is_remembered`: the same with no `pp_state` row at the claim. A rerun of an id with no release writes nothing.
   - `a_db_visit_leaves_the_net_columns_alone`: `net_attempts = 3`, `net_next_at = 999`; a DB-lane apply keeps both. The net lane's keeps `db_attempts`.
   - `net_wanted_follows_the_mask`: set while a `net_mask` bit is undone, NULL once done or failed, set again when `clear` takes it back.
@@ -699,7 +700,9 @@ select rerun_gen != ?2, rerun_mask from pp_state where release_id = ?1;
 -- when name.source >= that source, either field is Some, and its step wasn't dropped. A differing display_name adds rename_clears to clear
 update releases set display_name = coalesce(?2, display_name), is_obfuscated = coalesce(?3, is_obfuscated), name_source = ?4
  where id = ?1;
--- on a stale claim the queue row below is kept too, so a dropped step runs again.
+-- on a stale claim, so a dropped step runs again whichever lane holds it: the queue row below is kept, and a
+-- dropped Database step queues as a cleared one does. net_mask gains every net step's bit in rerun_mask, because the
+-- run's own idea of what is left predates the clear, and ?8 is 0, because Begin's 15 minutes were for this run.
 -- unless no_state. ?2 set_done, ?3 set_failed, each without rerun_mask on a stale claim, ?4 clear, ?5 net_mask,
 -- ?6 db_attempts, ?7 net_attempts, ?8 net_next_at
 insert into pp_state (release_id, done, failed, net_wanted, db_attempts, net_attempts, net_next_at, parts_seen, last_error,

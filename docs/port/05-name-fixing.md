@@ -206,7 +206,7 @@ impl NameSource { pub const fn value(self) -> u8 { self as u8 } }
 pub const NAMING: StepId = StepId(8);
 pub const NFO: StepId = StepId(9);
 pub use judge::{Grade, is_episode_name, is_season_pack, judge, renames_pack_to_episode, distinct_episodes};
-pub use clean::{basename, clean_candidate, has_collision_suffix, identity_key, parent_dir, strip_file_suffixes};
+pub use clean::{basename, clean_candidate, has_collision_suffix, without_collision_suffix, identity_key, parent_dir, strip_file_suffixes};
 pub use decide::{best_from_paths, current_name, decide, effective_source, grade_now, improves, is_image_name, worth_running};
 ```
 
@@ -422,6 +422,8 @@ pub fn parent_dir(path: &str) -> Option<String>;
 /// The same release, whatever the case and whichever of `.`, `_` and space separates its words.
 pub fn identity_key(s: &str) -> String { SEPARATORS.replace_all(s.trim().to_lowercase().as_str(), ".").into_owned() }
 pub fn has_collision_suffix(name: &str) -> bool { COLLISION_SUFFIX.is_match(name) }
+/// `name` without Part 2's collision suffix, which isnt part of what the name says
+pub fn without_collision_suffix(name: &str) -> &str { COLLISION_SUFFIX.find(name).map_or(name, |m| &name[..m.start()]) }
 pub fn rot13_subject(subject: &str) -> bool { ROT13_YENC.is_match(subject) }
 ```
 
@@ -1053,7 +1055,7 @@ Usage: `atlas --unname [--sample N] [--apply]`.
 - [ ] **Tests first:** rows with `name_source` 3, 5, 10, 15, 20 and 100, one with NULL and an inline `display_name`, and one with NULL and none.
   - `a_dry_run_changes_nothing_and_counts`: stdout gives a count per source, `2 would be cleared`, and `--sample 1` shows a name. Every row and `meta` unchanged. It works while another handle holds the shared guard.
   - `apply_clears_only_regex_and_posted_names`: 3 and 5 have `display_name` and `name_source` NULL. All others are untouched, including the inline name.
-  - `search_follows`: `releases_fts` no longer finds the cleared name's tokens, and still finds `name`. The `is_obfuscated` flag is `parser::is_obfuscated(name)` again, so a random `name` leaves search and a real one stays.
+  - `search_follows`: `releases_fts` no longer finds the cleared name's tokens, and still finds `name`. The `is_obfuscated` flag is `parser::is_obfuscated(name)` again, so a random `name` leaves search and a real one stays. A random `name` ending in Part 2's collision suffix leaves search too.
   - `later_steps_are_queued`: a registered test step at rank 400 with `on_rename` has its done bit cleared and a `pp_queue` row. `naming`'s own bit stays set, and a stage run leaves the row unnamed.
   - `it_removes_the_opt_in`: `meta.naming_rename_named` is gone afterward, and a dry run keeps it.
   - `a_stopped_run_resumes`: `ATLAS_UNNAME_STOP_AFTER=1`, then a second run finishes, and `unname_after` is gone.
@@ -1063,7 +1065,8 @@ Usage: `atlas --unname [--sample N] [--apply]`.
 ```sql
 -- read outside the transaction
 select id, name from releases where id > :cursor and name_source in (3, 5) order by id limit 2000;
--- per row, then the cursor, in one BEGIN IMMEDIATE. ?2 is parser::is_obfuscated(name). releases_au updates FTS
+-- per row, then the cursor, in one BEGIN IMMEDIATE. ?2 is parser::is_obfuscated(without_collision_suffix(name)), as
+-- Part 2 worked the flag out before adding it. releases_au updates FTS
 update releases set display_name = null, name_source = null, is_obfuscated = ?2 where id = ?1;
 update pp_state set done = done & ~:later where release_id = ?1;
 insert into pp_queue (release_id, due_at) values (?1, 0) on conflict(release_id) do nothing;  -- when :later != 0
