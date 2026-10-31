@@ -260,7 +260,11 @@ pub struct Counts {
     /// the lowest `titles.id` among these entries that were stored before this call
     pub min_known_id: Option<i64>,
 }
-/// One transaction. For each entry: trimmed; `valid_title` or skipped. Rows under `name_key` whose title is equal when
+/// Longest `category` kept, in bytes: longer is None.
+pub const MAX_CATEGORY: usize = 64;
+/// Longest `nuke_reason` kept, in bytes: longer is cut at a character boundary.
+pub const MAX_NUKE_REASON: usize = 256;
+/// One transaction. For each entry: trimmed; `valid_title` or skipped; `category` and `nuke_reason` bounded as above. Rows under `name_key` whose title is equal when
 /// lowercased are this title. None: insert it and its three keys. Found: empty `category`, `size_bytes`, `files` and `pre_at`
 /// are filled; a non-zero `nuked` replaces, with its reason when it has one; `source` and `title` never change.
 /// `meta.titles` grows by the number inserted.
@@ -298,7 +302,7 @@ pub fn page_url(spec: &FeedSpec, page: u32, page_size: u32) -> String;  // endpo
 
 xREL's 4,000 ms keeps it at 900 requests an hour.
 
-**Parsing.** A row with no usable title is skipped, not an error. Numbers may arrive as JSON strings. An empty string is `None`. A missing list is `ParseError::Shape`. `status: "error"` in the first two is `RateLimited` when the message contains "rate limit" in any case, otherwise `Shape`. For both xREL sources, before looking for the list: `pagination.total_pages` above 0 and `page` above it gives `Ok(vec![])`, whatever else the body holds. So a cursor past xREL's last page ends the source rather than failing for good.
+**Parsing.** A page of more than `MAX_PAGE_ROWS = 1000` rows is `ParseError::Shape`: no feed sends that many, and nothing of it is imported. A row with no usable title is skipped, not an error. Numbers may arrive as JSON strings. An empty string is `None`. A missing list is `ParseError::Shape`. `status: "error"` in the first two is `RateLimited` when the message contains "rate limit" in any case, otherwise `Shape`. For both xREL sources, before looking for the list: `pagination.total_pages` above 0 and `page` above it gives `Ok(vec![])`, whatever else the body holds. So a cursor past xREL's last page ends the source rather than failing for good.
 
 | Source | List at | Title | Category | Size | Files | Pre time | Nuke |
 |---|---|---|---|---|---|---|---|
@@ -327,7 +331,7 @@ pub fn wait_seconds(reply: &HttpReply, now: i64, default: i64) -> i64;
 
 `UreqFetch::new`: `ureq::Agent::config_builder().timeout_global(Some(timeout)).http_status_as_error(false).max_redirects(3).user_agent(concat!("Atlas/", env!("CARGO_PKG_VERSION"))).build().into()`. `get` reads the body with `resp.body_mut().with_config().limit(MAX_BODY).read_to_string()`, where `MAX_BODY = 8 << 20`. Over the limit is an `Err`.
 
-**A poll, exactly.** `budget = max_pages_per_poll`. Requests are `max(request_delay_ms, spec.min_delay_ms)` apart. Each page is imported in its own transaction, so a failure keeps what was read.
+**A poll, exactly.** First, when `page_count * page_size` is past `max_db_mb`: no request, `Failed("the PreDB file is over max_db_mb")`, with the usual backoff, so a feed can't fill the disk. `budget = max_pages_per_poll`. Requests are `max(request_delay_ms, spec.min_delay_ms)` apart. Each page is imported in its own transaction, so a failure keeps what was read.
 
 `floor = select coalesce(max(id), 0) from titles`, read before the first request.
 
@@ -634,6 +638,7 @@ A top-level `predb` object, parsed into `Config.predb: PredbConfig`. Absent keys
 | `poll_minutes` | `5` | Between polls of a source. Floor 1 |
 | `page_size` | `100` | Clamped to each source's range |
 | `max_pages_per_poll` | `3` | Requests per source per poll. Clamped to 1–20 |
+| `max_db_mb` | `8192` | Polling stops, with `last_error` on the dashboard, once `atlas.predb.db` passes this. At least 64 |
 | `request_delay_ms` | `1000` | Between requests to one source. Floor 250, and a source's own floor applies |
 | `timeout_secs` | `15` | Whole request. Clamped to 1–120 |
 | `history_pages` | `0` | Older pages to read in total per source, beyond catching up. 0: none |
@@ -680,6 +685,7 @@ impl Fetch for Scripted { fn get(&self, url: &str) -> Result<HttpReply, String>;
 - [ ] **Tests first:**
   - `keys_table`: `name_key` agrees for `Foo.Bar-GRP`, `foo bar-grp`, `FOO_BAR-GRP`. `md5_hex("abc")` is `900150983cd24fb0d6963f7d28e17f72`, `sha1_hex("abc")` is `a9993e364706816aba3e25717850c26c9cd0d89d`. `hash_key` of a 32 and a 40 digit hex name equals the matching element of `title_keys`, and is `None` for `zz` or 31 digits.
   - `valid_title_table`: `Good.Title-GRP` yes; `short`, `bad/slash.title-GRP`, `quo"te.title-GRP`, `12345678`, a control character, ` padded.title-GRP `, 256 characters: no.
+  - `import_bounds_what_a_feed_sends`: a 1 MB `category` is stored as NULL, a 1 MB `nuke_reason` as 256 bytes, cut within a multi-byte character without a panic.
   - `import_dedupes_and_skips`: an entry twice, plus `short` and `bad/slash.title-GRP`, plus another: `Counts { inserted: 2, updated: 0, skipped: 3, min_known_id: None }`. `meta.titles` is 2. Three `title_keys` rows each.
   - `only_empty_fields_fill`: the same title lowercased, source 2, with category and size: `updated: 1`. `source` and `title` keep their first values. A later different category changes nothing.
   - `a_nuke_updates`: `nuked: 1, reason`: both stored; category kept. A later `nuked: 0` does not clear it.
@@ -719,6 +725,7 @@ Hand-write each fixture from section 6's table, with invented titles such as `Al
   - `an_empty_page_ends_it`: `resume_page = 0`.
   - `an_xrel_cursor_past_its_last_page_ends_cleanly`: `resume_page = 9`, then `history_page = 9` with `history_pages: 20`, and `total_pages: 3` in a body with no list: `resume_page = 0`, `history_read = 20`, `failures = 0`, and no `last_error`.
   - `history_reads_older_pages_then_stops`: `history_pages: 4`, budget 3: first poll pages 1, 2, 3 by history; next poll goes on; stops at 4 pages read; survives a restart. `history_pages: 0`: never.
+  - `a_file_over_its_quota_stops_polling`: `max_db_mb` below the file's size: no request, `Failed`, backoff, `last_error` set. Raised again: polling carries on. `a_page_of_too_many_rows_imports_nothing`: 1,001 rows: `Failed`, no row.
   - `a_429_waits_as_told`: `Retry-After: 120`: `RateLimited(120)`, `next_poll_at = now + 120`, `failures` 0, nothing retried in this poll. An HTTP date, `X-RateLimit-Reset`, none (60), and 2 days (172,800, not shortened).
   - `a_rate_limit_envelope_is_the_same`: HTTP 200 with `rate_limited.json`.
   - `failures_back_off_to_six_hours`: 500s: `next_poll_at` is now + 600, 1,200, 2,400, and capped at 21,600. A success resets `failures` to 0 and clears `last_error`.
@@ -1027,3 +1034,4 @@ ATLAS_HOME=$HOME_DIR cargo run --quiet -- --help | grep -- --predb-import
 29. **`parse` takes the page number.** xREL's end-of-list is in the body but relative to the page asked for. The alternative, a special case in `poll_source`, would put one source's rule in the shared loop.
 30. **The import is capped on decompressed text, not on the file's size.** The compressed size says nothing: 198 KB expanded to 200 MB in the test. 16 GiB is about 50M lines at 300 B, far past any real title list, and the error says which cap it hit.
 31. **A gap ends at a title older than the gap, not at a known page.** New titles can push pages the last poll imported down onto the saved cursor, and those read as known, with the real gap still below them. `titles.id` only grows and no title is deleted, so `id <= gap_floor` is proof of "from before". A title another feed stored first can make a page look older than it is for this feed, which is the same accepted miss as a known page in the forward pass.
+32. **A feed is untrusted, so what it can store is bounded.** A title is already limited, but `category` and `nuke_reason` weren't, and 100 rows could have kept most of an 8 MB reply on every poll. 64 and 256 bytes hold every real value. `max_db_mb` defaults to well over the 2 GB of 10M titles, and stopping costs only new titles, with no write to the indexer's own data.
