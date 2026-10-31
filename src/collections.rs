@@ -299,7 +299,7 @@ impl<'g> Collections<'g> {
 
 /// A base's file total when its counter isnt the `[n/m]` that `parse_subject` reads.
 /// With one that left no total, `remap_bracket_parts` took it for the parts of one file.
-fn unread_file_total(base: &str) -> Option<i64> {
+pub(crate) fn unread_file_total(base: &str) -> Option<i64> {
     let c = COUNTER_RE.captures(base)?;
     if c.get(0)?.as_str().starts_with('[') {
         return None;
