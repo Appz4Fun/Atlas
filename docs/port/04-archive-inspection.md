@@ -500,8 +500,9 @@ pub const ARTICLE_CAP: usize = 4 * 1024 * 1024;
 pub const PROBE_PREFIX: usize = 64 * 1024;
 pub const PROBE_MIN_PARTS: i64 = 3;
 pub const NAME_SOURCE_NFO: u8 = 10; pub const NAME_SOURCE_INNER: u8 = 15; pub const NAME_SOURCE_PAR2: u8 = 20;
-/// step 8 is Part 5's naming step (Part 3's example). Unregistered bits are ignored until it exists
-pub const RERUN_ON_INNER_FILES: StepMask = mask(StepId(8));
+/// step 8 is Part 5's naming step (Part 3's example) and 16 is Part 6's predb_match, asked directly because naming
+/// may be off or skip a clean name. Unregistered bits are ignored until they exist
+pub const RERUN_ON_INNER_FILES: StepMask = StepMask(mask(StepId(8)).0 | mask(StepId(16)).0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)] pub enum Format { Rar4, Rar5, SevenZip, Zip, Par2, Image, Media, Unknown }
 pub fn identify(head: &[u8]) -> Format;
@@ -897,6 +898,7 @@ ffc3fd300017060c010980c900070b01000123030101055d000080000c83710a01be81fe670000
   - `both_tables_are_registered`: `SHARD_TABLES` has both names with `release_key: Some("release_id")`. Fails first: not registered.
   - `reads_come_back_in_seq_order`: rows inserted out of order through section 5's statements: `inner_files` in `seq` order, PAR2 first, NULL size is `None`; `password` is `None` with no row and each code with one.
   - `past_the_quota_no_names_are_stored`: `max_names_mb` at its minimum and `archive_name_bytes` over it: a RAR of 64 maximum-length names adds no rows, keeps its password, and counts on the dashboard. A release under quota adds to the counter by what it stored.
+  - `inner_files_ask_for_naming_and_predb`: `finish` storing files sets both step 8 and step 16 in `rerun`, with no name change.
   - `a_source_replaces_only_its_own_rows`: PAR2 and RAR rows; `DELETE_SOURCE` for RAR plus new rows: PAR2 untouched.
   - `passwords_read_across_shards`: `passwords_with` on `db::open_with_shards`, ids in shards 0 and 5 and one with no row: 2 entries. `view_with` gives rows and password.
   - `an_old_database_reads_as_nothing_known`: `archive_release` dropped from a shard: `passwords_with` gives an empty map, no panic.

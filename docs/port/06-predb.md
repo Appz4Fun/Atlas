@@ -537,7 +537,7 @@ select release_id from predb_inner_key where key = ?1 limit 17;
 
 1. **A short title under any form but an exact `name`.** Under 15 bytes, under 3 words or with no `-GROUP`, the phrase is skipped on purpose: `Foo.Bar-GRP.mkv` and `Foo.Bar-GRP [12345678]` aren't found. This trades recall for safety and bounded cost.
 2. **A title only in a file that isn't the row's `name`.** This is what Part 2 makes more of: a merged post named from `grp-t.mkv`, or from a shorter file in the first slice, with `T.nfo` beside it. FTS doesn't index `files` (Part 2 §2). If Part 5's posted-file tier adopted `T` as `display_name`, the phrase finds it. If `T` graded no better than the name shown, it didn't, and nothing here finds it.
-3. **An inner name past the first 4 kept, or a release Part 4 hasn't read.** The second is caught when Part 4 reads it, since `naming` then asks for this step again.
+3. **An inner name past the first 4 kept, or a release Part 4 hasn't read.** The second is caught when Part 4 reads it, since it asks for this step again directly.
 4. **More hits than the bounds allow.** A real match older than the 32 newest phrase hits on its shard; a title on more than 16 releases; a title out of its 2 s budget, which skips the phrase on its remaining shards. All are counted in `stats.json`.
 5. **Rows `worth_looking_up` skips, and rows Part 3 rejects.** By design.
 6. **Differences the rules don't fold.** Composed against decomposed Unicode (decision 9), or a title in a release's subject and nowhere else.
@@ -547,11 +547,11 @@ For 2, 3 and 4 the forward step still matches when the release next runs: a late
 `tick` reads, then advances the cursor, committing after each title:
 
 ```sql
-select id, title from titles where id > (select value from meta where key = 'late_after_id') and added_at <= ?1 order by id limit ?2;
+select id, title from titles where id > (select value from meta where key = 'late_after_id') and added_at <= ?1 and id <= ?3 order by id limit ?2;
 update meta set value = ?1 where key = 'late_after_id';
 ```
 
-`LATE_DELAY_SECS` closes a race. If the step read `titles` just before a title landed, then its `predb_inner_key` row commits shortly after, and a title probing at once would miss that row. The step's deadline is 120 s, so 600 s covers it. A failed `rerun`, or `stopped`, returns before moving the cursor.
+A race has to be closed exactly: if the step read `titles` just before a title landed, its `predb_inner_key` row commits later, for however long its batch takes, and a title probing before that would miss the row and move the cursor past it. So before reading `titles`, `PredbMatch::run` records `max(id)` in `IN_FLIGHT`, a process-wide map per main path, and returns a guard as `Outcome.hold` that removes the entry on drop, which Part 3 does only once the writer has answered. On any early return, the guard drops at once. `tick` adds `and id <= ?3` with the lowest value in `IN_FLIGHT`, when there is one, so a title newer than any uncommitted read waits. A crash empties the map, and the crashed run's queue row runs it again, reading the title itself. `LATE_DELAY_SECS` only spaces the work, and nothing relies on it. A failed `rerun`, or `stopped`, returns before moving the cursor.
 
 **Stopping.** The thread owns its 8 shard connections. No statement stays open between queries, so it holds no read snapshot while it naps. `stop` is checked before each title and each statement, so stopping waits for at most one FTS query, about 0.5 s at 15M rows a shard. The connections drop when the thread returns. `compact_shard` starts with a truncating checkpoint (`src/compact.rs:57-64,416`), which fails while a reader holds a snapshot, so `stop_and_join` has to finish first, and `run` calling it inside `tasks` is what guarantees that.
 
@@ -800,6 +800,7 @@ Titles: `Alpha.Beta.Gamma.2024.1080p.WEB-DL.H.264-TESTGRP` as T, and `Second.Tit
   - `the_first_match_of_a_title_reruns_later_parts`: a recording step `StepId(24)`, rank 400: runs again when T equals the name already shown; on a rerun of the same title it does not.
   - `off_means_no_step_and_no_file`: default config: no bit, no `atlas.predb.db`, and the walk doesn't start.
   - `a_missing_file_retries`: enabled with the file deleted: `db_attempts = 1`, `last_error` set, no panic. Restored, it finishes.
+  - `a_late_title_waits_for_an_uncommitted_read`: the step reads `titles` and its batch is held open, a new title arrives and passes the delay, `tick`: the cursor stays below it. The batch commits, `tick` again: the inner key is found and the release is asked for. A step that returned early holds nothing.
   - `a_deleted_release_goes_from_both_tables`: covered by `SHARD_TABLES`; assert it here for `predb_inner_key` too, by query plan that the delete is a seek.
 - [ ] **Implement** section 6, and both registry lines.
 - [ ] **Run:** `cargo test --test predb_stage && cargo test --test pp_schema && cargo test --lib steps_have_unique && cargo test --lib compact`. **Expected:** pass, including Part 3's registry-driven survival tests.

@@ -435,6 +435,7 @@ pub struct IdQuery { pub kind: Kind, pub ids: Vec<(IdColumn, i64)>, pub season: 
 pub fn from_args(t: &str, args: &HashMap<String, String>, on: &IdParams) -> Option<IdQuery>;
 pub fn find(q: &IdQuery, cats: Option<&CatFilter>, offset: i64, limit: i64) -> db::Result<Vec<ReleaseRow>>;
 pub const ID_ROWS: i64 = 20_000;
+pub const MAX_TITLE: usize = 255;
 pub const ID_SCAN: i64 = 200_000;
 pub struct IdPage { pub rows: Vec<ReleaseRow>, pub scanned: usize }
 pub fn find_with(conn: &Connection, q: &IdQuery, cats: Option<&CatFilter>, offset: i64, limit: i64, bounds: &Bounds, id_rows: i64) -> db::Result<IdPage>;
@@ -467,9 +468,11 @@ pub struct MediaNfo(pub Arc<Media>);     // StepId(34), "media_nfo", rank 520, N
 /// What Part 8 acts on. A group hint alone isn't evidence of a title (decision 29).
 pub fn media_target(category: i64, rule: &str, name: &str) -> Option<(Kind, Parsed)> {
     if rule.starts_with("group_name_") { return None; }
-    if category::is_tv(category) { parse_tv(name).map(|p| (Kind::Tv, p)) }
+    let parsed = if category::is_tv(category) { parse_tv(name).map(|p| (Kind::Tv, p)) }
     else if category::is_movie(category) { parse_movie(name).map(|p| (Kind::Movie, p)) }
-    else { None }
+    else { None };
+    // a poster chooses the name: nothing longer than this is a title, and none reaches a provider or the cache
+    parsed.filter(|(_, p)| p.title.len() <= MAX_TITLE)
 }
 ```
 
@@ -813,6 +816,7 @@ Fixtures: `tmdb_search_tv.json` `{"results":[{"id":401,"name":"Some Show","origi
   - `a_rename_gets_a_new_title`: `media_parse` rewrites, and `media_lookup` asks for the new title.
   - `a_provider_turning_on_starts_a_walk`: Part 3's `pp_steps_seen` adds a `'steps'` walk. Old releases then go through one request per title.
   - `a_deleted_cache_row_needs_a_restart`: the same with the first `Media` still running: no request, as documented in section 10.
+  - `an_oversized_title_is_no_target`: a TV-shaped name with a 1 MB show title: `media_target` is `None`, no row, no request, no cache row.
   - `titles_stop_at_their_cap`: `max_titles` at 1,000 with that many rows: a new title's `wants` is false and counted, no request and no row. A known title's answer still comes from the cache and fans out.
   - `claims_stop_at_their_cap`: through `#[doc(hidden)] with_max_claims(3)`: a fourth distinct title's `wants` is false and counted, the map stays at 3, and a claim over 7 days old makes room.
   - `a_second_provider_turning_on_starts_a_walk`: TVMaze on and a TV title and a movie looked up, then a TMDB key added: `media_lookup` stays enabled, its `config_stamp` gains a bit, one walk with its `redo_mask` runs, the movie and the TV title each make their TMDB requests and no TVMaze request, and the new IDs fan out.

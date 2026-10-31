@@ -273,6 +273,9 @@ pub struct Outcome {
     pub facts: Vec<(&'static str, String)>,
     /// Not finished, nothing wrong: look again then. Uses no attempt, sets no bit.
     pub wait_until: Option<i64>,
+    /// Kept by the stage until the writer has answered for this outcome's batch, then dropped, on any path. So a
+    /// step can hold something for exactly as long as its result isn't committed. Part 6 uses it.
+    pub hold: Option<Box<dyn std::any::Any + Send>>,
 }
 
 pub struct StepWrite {
@@ -682,6 +685,7 @@ const CORE_TABLES: &[(&str, &str)] = &[
   - `a_net_completion_doesnt_use_up_growth`: a release grows while a net step is pending, and that step finishes before the settled DB visit: `parts_seen` is unchanged, and the visit still clears the `on_growth` steps.
   - `growth_after_a_net_step_failed_tries_it_again`: an `on_growth` net step at `failed`, a late article, the settled visit: its failed bit is clear, `net_wanted` is 1, and it runs. The same through a walk's `redo_mask`.
   - `a_rename_retries_a_failed_later_step`: a higher-ranked `Database` step at `failed`, an earlier step renames: the failed step runs in the same visit, and on success its failed bit is clear and its done bit set. A net step at `failed` under the same rename is cleared and net wanted.
+  - `an_outcomes_hold_lasts_until_the_commit`: a step returns a `hold` that notes its drop. It is still alive while the batch's writer job is held open, and dropped once the writer has answered, including when the result was dropped as stale.
   - `a_rerun_of_a_release_with_no_state_is_remembered`: the same with no `pp_state` row at the claim. A rerun of an id with no release writes nothing.
   - `a_db_visit_leaves_the_net_columns_alone`: `net_attempts = 3`, `net_next_at = 999`; a DB-lane apply keeps both. The net lane's keeps `db_attempts`.
   - `net_wanted_follows_the_mask`: set while a `net_mask` bit is undone, NULL once done or failed, set again when `clear` takes it back.
