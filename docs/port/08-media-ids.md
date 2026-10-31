@@ -272,8 +272,9 @@ claims: Mutex<HashMap<i64, (i64 /*release id*/, u32 /*at*/)>>
 1. A `known` entry with no provider left to ask (`enabled & !checked == 0`), and found or `now < next_check`: false.
 2. A claim on `key` by this release: true.
 3. A claim by another release under 7 days old: false.
-4. `claims` at `MAX_CLAIMS = 4_000_000`: drop those over 7 days old, and if it is still full, false, counted in `media_claims_full`. About 150 MB at most, a cap above section 9's 2M titles, so only hostile names reach it. A release refused here gets no lookup until another visit asks again.
-5. Otherwise record the claim: true.
+4. A title with no `known` entry, with `media_titles` at `max_titles` rows (a count read when the file opens, kept up to date by `resolve`): false, counted in `media_titles_full`. So the map and the file stop growing, and titles already known keep their answers.
+5. `claims` at `MAX_CLAIMS = 4_000_000`: drop those over 7 days old, and if it is still full, false, counted in `media_claims_full`. About 150 MB at most, a cap above section 9's 2M titles, so only hostile names reach it. A release refused here gets no lookup until another visit asks again.
+6. Otherwise record the claim: true.
 
 So each title has one release in the net lane at a time. The others keep NULL IDs until the fan-out fills them. A restart empties `claims`. A title's old representative still has `net_wanted = 1`, and runs. A second one claimed meanwhile only finds the cache filled.
 
@@ -550,6 +551,7 @@ A `media` object in `config.json`, parsed leniently. An absent object means ever
 | `nfo` | `true` | Run `media_nfo`. It also needs `parse` and a non-zero `postprocess.body_fetches_per_minute`, so an existing config fetches nothing. |
 | `negative_ttl_days` | `30` | How long a title with no match isn't asked again. Doubles per repeat, at most 180 days, and is only acted on when a release of that title is visited. |
 | `tvmaze.enabled` | `false` | TVMaze needs no key, so this is its switch. |
+| `max_titles` | `10000000` | No new title is looked up past this many cached titles, about 300 MB of memory and 1.3 GB of disk. About 5 times section 9's estimate. At least 1,000 |
 | `tvmaze.requests_per_minute` | `90` | Clamped to 1..=120. Published: at least 20 per 10 s per IP. |
 | `tmdb.api_key` | `""` | Empty is off. |
 | `tmdb.requests_per_minute` | `240` | Clamped to 1..=3000. |
@@ -810,6 +812,7 @@ Fixtures: `tmdb_search_tv.json` `{"results":[{"id":401,"name":"Some Show","origi
   - `a_rename_gets_a_new_title`: `media_parse` rewrites, and `media_lookup` asks for the new title.
   - `a_provider_turning_on_starts_a_walk`: Part 3's `pp_steps_seen` adds a `'steps'` walk. Old releases then go through one request per title.
   - `a_deleted_cache_row_needs_a_restart`: the same with the first `Media` still running: no request, as documented in section 10.
+  - `titles_stop_at_their_cap`: `max_titles` at 1,000 with that many rows: a new title's `wants` is false and counted, no request and no row. A known title's answer still comes from the cache and fans out.
   - `claims_stop_at_their_cap`: through `#[doc(hidden)] with_max_claims(3)`: a fourth distinct title's `wants` is false and counted, the map stays at 3, and a claim over 7 days old makes room.
   - `a_second_provider_turning_on_starts_a_walk`: TVMaze on and a TV title and a movie looked up, then a TMDB key added: `media_lookup` stays enabled, its `config_stamp` gains a bit, one walk with its `redo_mask` runs, the movie and the TV title each make their TMDB requests and no TVMaze request, and the new IDs fan out.
 - [ ] **Implement** sections 4 and 6.
@@ -1109,3 +1112,4 @@ cargo test --lib db::tests::a_wipe_removes_the_media_cache
 31. **`imdb_from_nfo` records where an IMDb ID came from.** Keeping every existing IMDb ID meant a corrected provider answer changed the other IDs and left the wrong IMDb ID behind. Only an NFO's is kept.
 32. **A new provider redoes `media_lookup` through `config_stamp`.** The step stays enabled, so Part 3's step mask sees nothing. The stamp walks once, and `wants` keeps it to one request per title, for the new provider only.
 33. **Correcting a wrong match needs a restart, not cache invalidation.** Deleting a cache row by hand is a rare repair, and the `known` map is what keeps `applies` free of I/O. Polling for outside changes to `atlas.media.db` would add a moving part for that one case. The order is in section 10, and `a_deleted_cache_row_needs_a_restart` pins it.
+34. **Distinct titles are capped, not evicted.** A poster chooses release names, so a provider on makes title count an outside input. Evicting would re-ask providers for real titles and spend their budget, where stopping at a generous cap costs only IDs for later titles, shown on the dashboard. Provider rate limits mean reaching it takes months at the defaults.
