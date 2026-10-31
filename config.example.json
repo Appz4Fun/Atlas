@@ -45,5 +45,25 @@
     "auto_run_compact": false,
     "max_unsaved_headers": 500000,
     "api_port": 9090,
-    "api_host": "0.0.0.0"
+    "api_host": "0.0.0.0",
+    "postprocess": {
+        "enabled": true,
+        "workers": 2,
+        "settle_secs": 7200,
+        "complete_settle_secs": 900,
+        "min_size_bytes": 0,
+        "min_files": 1,
+        "reject_par2_only": true,
+        "group_rules": {},
+        "backlog_per_second": 2000,
+        "body_fetches_per_minute": 0,
+        "body_connections": 2,
+        "body_min_size_bytes": 1048576,
+        "body_max_size_bytes": 107374182400,
+        "body_max_bytes": 16777216,
+        "bodies_per_release": 8,
+        "min_completion_percent": 95,
+        "dead_after_secs": 172800,
+        "max_attempts": 5
+    }
 }

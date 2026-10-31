@@ -21,6 +21,7 @@ use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::Instant;
 
 use indexmap::IndexMap;
@@ -244,6 +245,16 @@ pub fn migrate_shard(conn: &Connection) -> Result<()> {
     }
     crate::postprocess::schema::migrate(conn)
 }
+
+/// How long a release has to be quiet before the stage looks at it, seconds.
+/// Saves have no config: the stage sets these from it. At least 1, soo a touch
+/// always moves `due_at`.
+pub static SETTLE_SECS: AtomicI64 = AtomicI64::new(7200);
+/// the same for a complete release
+pub static COMPLETE_SETTLE_SECS: AtomicI64 = AtomicI64::new(900);
+/// `tests/pp_enqueue_cost.rs` compares a save with and without the queue
+#[doc(hidden)]
+pub static SKIP_ENQUEUE_FOR_BENCH: AtomicBool = AtomicBool::new(false);
 
 // ---------------------------------------------------------------- ids
 
@@ -1367,6 +1378,7 @@ impl ShardWriter {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let key = IdKey::of(&tx)?;
         let grouping_from = grouping_from(&tx)?;
+        let now = chrono::Utc::now().timestamp();
         let (mut new_releases, mut new_articles) = (0i64, 0i64);
         {
             let mut upsert = tx.prepare_cached(
@@ -1376,8 +1388,12 @@ impl ShardWriter {
                     on conflict(name, group_name) do update set
                     poster = excluded.poster,
                     posted_date = excluded.posted_date,
-                    display_name = coalesce(excluded.display_name, releases.display_name),
-                    is_obfuscated = excluded.is_obfuscated
+                    display_name = case when releases.name_source is null
+                                        then coalesce(excluded.display_name, releases.display_name)
+                                        else releases.display_name end,
+                    is_obfuscated = case when releases.name_source is null
+                                         then excluded.is_obfuscated
+                                         else releases.is_obfuscated end
                     returning id, size, parts, file_total",
             )?;
             let mut update_stats = tx
@@ -1501,13 +1517,24 @@ impl ShardWriter {
                     .max();
                 let old_parts = old_parts.unwrap_or(0);
                 let earlier_size = if old_parts > 0 { old_size.unwrap_or(0) } else { 0 };
+                let complete = release_complete(&tx, release_id, file_total)?;
                 update_stats.execute(params![
                     earlier_size + added.iter().map(|(a, _)| a.bytes).sum::<i64>(),
-                    release_complete(&tx, release_id, file_total)? as i64,
+                    complete as i64,
                     old_parts + added.len() as i64,
                     file_total,
                     release_id
                 ])?;
+                // it wants a look once it has been quiet. a touch moves the time
+                // above any a run claimed, soo an article during a run isnt lost
+                if !SKIP_ENQUEUE_FOR_BENCH.load(Ordering::Relaxed) {
+                    let settle = if complete { &COMPLETE_SETTLE_SECS } else { &SETTLE_SECS };
+                    tx.prepare_cached(
+                        "insert into pp_queue (release_id, due_at) values (?1, ?2)
+                         on conflict(release_id) do update set due_at = excluded.due_at",
+                    )?
+                    .execute(params![release_id, now + settle.load(Ordering::Relaxed)])?;
+                }
                 profile::STATS.add_since(t);
             }
 
@@ -1680,6 +1707,140 @@ pub fn save(main: &Path, releases: &[Release]) -> Result<()> {
 }
 
 // ---------------------------------------------------------------- reading
+
+/// A release's file, for a processing step.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileInfo {
+    pub id: i64,
+    pub filename: String,
+    pub subject: Option<String>,
+    pub subject_part: Option<i64>,
+    pub expected: Option<i64>,
+    pub file_total: Option<i64>,
+    /// how many parts were seen
+    pub parts_seen: i64,
+    pub touched_at: Option<i64>,
+    pub sealed: bool,
+}
+
+/// One article of a file, for a processing step.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SegmentRef {
+    pub message_id: String,
+    pub part: Option<i64>,
+    pub bytes: i64,
+}
+
+/// Which of a file's articles a step wants.
+#[derive(Clone, Debug)]
+pub enum SegmentPick {
+    First(usize),
+    Last(usize),
+    Parts(Vec<i64>),
+}
+
+/// How many parts a `seen` bitmap has.
+pub(crate) fn seen_count(bits: &[u8]) -> i64 {
+    bits.iter().map(|b| i64::from(b.count_ones())).sum()
+}
+
+/// A release's files, `limit` at most. `conn` is one shard opened on its own.
+pub fn release_files(conn: &Connection, release_id: i64, limit: usize) -> Result<Vec<FileInfo>> {
+    conn.prepare_cached(
+        "select id, filename, subject, subject_part, expected, file_total, seen, touched_at, blob is not null
+         from files where release_id = ? order by id limit ?",
+    )?
+    .query_map(params![release_id, limit as i64], |r| {
+        Ok(FileInfo {
+            id: r.get(0)?,
+            filename: r.get(1)?,
+            subject: r.get(2)?,
+            subject_part: r.get(3)?,
+            expected: r.get(4)?,
+            file_total: r.get(5)?,
+            parts_seen: seen_count(&r.get::<_, Vec<u8>>(6)?),
+            touched_at: r.get(7)?,
+            sealed: r.get(8)?,
+        })
+    })?
+    .collect()
+}
+
+/// where a segment sorts: a missing part first
+type SegmentOrder = (Option<i64>, String);
+
+/// What a pick keeps of the segments going past: never more than it asks for.
+struct Picked {
+    pick: SegmentPick,
+    kept: std::collections::BTreeMap<SegmentOrder, i64>,
+}
+
+impl Picked {
+    /// how many one part of `Parts` keeps: a part can be reposted, not without end
+    const PER_PART: usize = 16;
+
+    fn offer(&mut self, seg: SegmentRef) {
+        let key = (seg.part, seg.message_id);
+        if let SegmentPick::Parts(parts) = &self.pick {
+            let Some(part) = key.0.filter(|p| parts.contains(p)) else { return };
+            let same = self.kept.keys().filter(|k| k.0 == Some(part)).count();
+            if same < Self::PER_PART {
+                self.kept.insert(key, seg.bytes);
+            }
+        } else {
+            self.kept.insert(key, seg.bytes);
+            match self.pick {
+                SegmentPick::First(n) if self.kept.len() > n => {
+                    self.kept.pop_last();
+                }
+                SegmentPick::Last(n) if self.kept.len() > n => {
+                    self.kept.pop_first();
+                }
+                _ => {}
+            }
+        }
+        #[cfg(test)]
+        HELD_ROWS.with(|h| h.set(h.get().max(self.kept.len())));
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static HELD_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// A file's articles: its sealed blob and any rows that came after sealing,
+/// from one snapshot, deduped by message-id, in (part, message-id) order with
+/// a missing part first. Holds no more than `pick` asks for beyond the blob,
+/// itself capped at `SEAL_MAX_SEGMENTS`. A corrupt blob is an error. `conn` is
+/// one shard opened on its own.
+pub fn file_segments(conn: &Connection, file_id: i64, pick: &SegmentPick) -> Result<Vec<SegmentRef>> {
+    // a file sealed between two separate reads would show its articles twice
+    // or not at all. a caller already in a transaction has its snapshot
+    let _snapshot = if conn.is_autocommit() { Some(conn.unchecked_transaction()?) } else { None };
+    let mut picked = Picked { pick: pick.clone(), kept: Default::default() };
+    let mut suffixes: HashMap<i64, Option<String>> = HashMap::new();
+    let mut sealed: HashSet<String> = HashSet::new();
+    for seg in sealed_segments(conn, file_id)?.unwrap_or_default() {
+        sealed.insert(seg_key(conn, &mut suffixes, &seg)?);
+        let suffix = suffixes.get(&seg.domain).and_then(|s| s.as_deref());
+        picked.offer(SegmentRef { message_id: decode(&seg.local, suffix), part: seg.part, bytes: seg.bytes });
+    }
+    let mut rows = conn.prepare_cached(
+        "select s.local, s.domain, d.suffix, s.part, s.bytes
+         from segments s left join domains d on d.id = s.domain where s.file_id = ?",
+    )?;
+    let mut rows = rows.query([file_id])?;
+    while let Some(r) = rows.next()? {
+        let (local, domain): (Vec<u8>, i64) = (r.get(0)?, r.get(1)?);
+        let suffix: Option<String> = r.get(2)?;
+        if !sealed.is_empty() && sealed.contains(&dedup_key(&local, domain, suffix.as_deref())) {
+            continue;
+        }
+        picked.offer(SegmentRef { message_id: decode(&local, suffix.as_deref()), part: r.get(3)?, bytes: r.get(4)? });
+    }
+    Ok(picked.kept.into_iter().map(|((part, message_id), bytes)| SegmentRef { message_id, part, bytes }).collect())
+}
 
 /// A release's articles, ordered by filename then part (ties by message-id),
 /// for building its NZB. `conn` has the shards attached.
@@ -3463,5 +3624,164 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(300));
         other.execute_batch("commit").unwrap();
         saver.join().unwrap().expect("waited for the other writer");
+    }
+
+    fn queued(conn: &Connection) -> Vec<(i64, i64)> {
+        conn.prepare("select release_id, due_at from pp_queue")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    }
+
+    fn part_of(name: &str, part: i64, total: i64, id: &str) -> Release {
+        let article = Article {
+            message_id: id.into(),
+            subject: format!("\"{name}\" yEnc ({part}/{total})"),
+            filename: Some(name.into()),
+            part: Some(part),
+            total_parts: Some(total),
+            bytes: 10,
+            ..Default::default()
+        };
+        Release { name: name.into(), group: "alt.binaries.t".into(), articles: vec![article], ..Default::default() }
+    }
+
+    #[test]
+    fn a_save_queues_each_touched_release_and_moves_its_due_time() {
+        let (_dir, main, conn) = fresh_shard_db();
+        let now = chrono::Utc::now().timestamp();
+        save(&main, &[part_of("a", 1, 3, "<1@x>")]).unwrap();
+        let rows = queued(&conn);
+        assert_eq!(rows.len(), 1);
+        assert!((rows[0].1 - (now + 7200)).abs() <= 2, "{rows:?}");
+        conn.execute("update pp_queue set due_at = 1", []).unwrap();
+        save(&main, &[part_of("a", 2, 3, "<2@x>")]).unwrap();
+        let rows = queued(&conn);
+        assert_eq!(rows.len(), 1);
+        assert!((rows[0].1 - (now + 7200)).abs() <= 2, "{rows:?}");
+    }
+
+    #[test]
+    fn a_complete_release_is_due_sooner() {
+        let (_dir, main, conn) = fresh_shard_db();
+        let now = chrono::Utc::now().timestamp();
+        save(&main, &[part_of("a", 1, 1, "<1@x>")]).unwrap();
+        assert!((queued(&conn)[0].1 - (now + 900)).abs() <= 2);
+    }
+
+    #[test]
+    fn a_duplicate_article_does_not_touch_the_queue() {
+        let (_dir, main, conn) = fresh_shard_db();
+        save(&main, &[part_of("a", 1, 3, "<1@x>")]).unwrap();
+        conn.execute("update pp_queue set due_at = 1", []).unwrap();
+        save(&main, &[part_of("a", 1, 3, "<1@x>")]).unwrap();
+        assert_eq!(queued(&conn)[0].1, 1);
+    }
+
+    #[test]
+    fn a_stage_name_survives_a_late_article() {
+        let (_dir, main, conn) = fresh_shard_db();
+        save(&main, &[part_of("a", 1, 3, "<1@x>")]).unwrap();
+        conn.execute("update releases set display_name = 'kept', is_obfuscated = 0, name_source = 40", []).unwrap();
+        let mut late = part_of("a", 2, 3, "<2@x>");
+        late.display_name = Some("other".into());
+        late.is_obfuscated = true;
+        save(&main, &[late]).unwrap();
+        let (name, flag): (String, i64) = conn
+            .query_row("select display_name, is_obfuscated from releases", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert_eq!((name.as_str(), flag), ("kept", 0));
+    }
+
+    #[test]
+    fn without_a_stage_name_a_save_still_sets_the_name() {
+        let (_dir, main, conn) = fresh_shard_db();
+        save(&main, &[part_of("a", 1, 3, "<1@x>")]).unwrap();
+        let mut late = part_of("a", 2, 3, "<2@x>");
+        late.display_name = Some("other".into());
+        late.is_obfuscated = true;
+        save(&main, &[late]).unwrap();
+        let (name, flag): (String, i64) = conn
+            .query_row("select display_name, is_obfuscated from releases", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert_eq!((name.as_str(), flag), ("other", 1));
+    }
+
+    fn ids_of(segs: &[SegmentRef]) -> Vec<&str> {
+        segs.iter().map(|s| s.message_id.as_str()).collect()
+    }
+
+    #[test]
+    fn file_segments_reads_a_sealed_file_and_late_rows_as_one_list() {
+        let (_dir, main) = sealed_fixture();
+        let conn = db::open_shard(&shard_path(&main, shard_of("alt.binaries.t"))).unwrap();
+        let file: i64 = conn.query_row("select id from files where filename = 'a.rar'", [], |r| r.get(0)).unwrap();
+        seal_file(&conn, file).unwrap();
+        let late = |part: i64, msg: &str| Release {
+            name: "Rel".into(),
+            group: "alt.binaries.t".into(),
+            articles: vec![Article {
+                message_id: msg.into(),
+                subject: "\"a.rar\" yEnc (1/3)".into(),
+                filename: Some("a.rar".into()),
+                part: Some(part),
+                total_parts: Some(3),
+                bytes: 7,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        save(&main, &[late(2, "<repost@x>"), late(9, "<nine@x>")]).unwrap();
+
+        let first = file_segments(&conn, file, &SegmentPick::First(2)).unwrap();
+        assert_eq!(ids_of(&first), vec!["<a1@x>", "<0abc12def34@ngPost>"]);
+        let nine = file_segments(&conn, file, &SegmentPick::Parts(vec![9])).unwrap();
+        assert_eq!(ids_of(&nine), vec!["<nine@x>"]);
+        let two = file_segments(&conn, file, &SegmentPick::Parts(vec![2])).unwrap();
+        assert_eq!(ids_of(&two), vec!["<0abc12def34@ngPost>", "<repost@x>"]);
+        let last = file_segments(&conn, file, &SegmentPick::Last(1)).unwrap();
+        assert_eq!(ids_of(&last), vec!["<nine@x>"]);
+    }
+
+    #[test]
+    fn file_segments_keeps_no_more_than_asked_of_a_huge_loose_file() {
+        let (_dir, main, conn) = fresh_shard_db();
+        let mut release = part_of("big", 1, 60_000, "<1@x>");
+        release.articles =
+            (1..=60_000).map(|p| part_of("big", p, 60_000, &format!("<{p}@x>")).articles.remove(0)).collect();
+        save(&main, &[release]).unwrap();
+        let file: i64 = conn.query_row("select id from files", [], |r| r.get(0)).unwrap();
+        HELD_ROWS.with(|h| h.set(0));
+        let first = file_segments(&conn, file, &SegmentPick::First(3)).unwrap();
+        assert_eq!(first.iter().map(|s| s.part).collect::<Vec<_>>(), vec![Some(1), Some(2), Some(3)]);
+        let last = file_segments(&conn, file, &SegmentPick::Last(3)).unwrap();
+        assert_eq!(last.iter().map(|s| s.part).collect::<Vec<_>>(), vec![Some(59_998), Some(59_999), Some(60_000)]);
+        assert!(HELD_ROWS.with(|h| h.get()) <= 8, "{}", HELD_ROWS.with(|h| h.get()));
+    }
+
+    #[test]
+    fn a_corrupt_blob_is_an_error_not_an_empty_list() {
+        let (_dir, main) = sealed_fixture();
+        let conn = db::open_shard(&shard_path(&main, shard_of("alt.binaries.t"))).unwrap();
+        let file: i64 = conn.query_row("select id from files where filename = 'a.rar'", [], |r| r.get(0)).unwrap();
+        seal_file(&conn, file).unwrap();
+        conn.execute("update files set blob = x'00112233' where id = ?", [file]).unwrap();
+        assert!(file_segments(&conn, file, &SegmentPick::First(1)).is_err());
+    }
+
+    #[test]
+    fn release_files_reports_parts_and_sealed() {
+        let (_dir, main) = sealed_fixture();
+        let conn = db::open_shard(&shard_path(&main, shard_of("alt.binaries.t"))).unwrap();
+        let id: i64 = conn.query_row("select id from releases", [], |r| r.get(0)).unwrap();
+        let file: i64 = conn.query_row("select id from files where filename = 'a.rar'", [], |r| r.get(0)).unwrap();
+        seal_file(&conn, file).unwrap();
+        let files = release_files(&conn, id, 10).unwrap();
+        assert_eq!(files.len(), 2);
+        assert_eq!((files[0].filename.as_str(), files[0].parts_seen, files[0].sealed), ("a.rar", 3, true));
+        assert_eq!((files[1].filename.as_str(), files[1].parts_seen, files[1].sealed), ("b.rar", 1, false));
+        assert_eq!(release_files(&conn, id, 1).unwrap().len(), 1);
     }
 }
