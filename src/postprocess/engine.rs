@@ -770,11 +770,17 @@ impl Inner {
             }
         };
         match verdict {
-            Verdict::Reject(reason) => self.stats.rejected(reason),
-            // not settled after all: a later visit asks again
-            Verdict::Wait(_) | Verdict::Pass => {}
+            Verdict::Reject(reason) => {
+                self.stats.rejected(reason);
+                a.net_mask = 0;
+            }
+            // not settled: it stays wanted, and its lane comes back then
+            Verdict::Wait(until) => {
+                a.net_mask = net_steps;
+                a.net_next_at = Some(until);
+            }
+            Verdict::Pass => {}
         }
-        a.net_mask = 0;
         self.send(db, shard, one(a), now, |_| Ok(()))
     }
 
