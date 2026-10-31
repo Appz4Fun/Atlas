@@ -702,7 +702,9 @@ fn compact_shard(
         // the releases' message-id index: its files and their ids are the same
         tx.execute_batch(
             "insert into release_ids select * from old.release_ids
-             where file_id = 0 or file_id in (select id from files)",
+             where file_id = 0 or file_id in (select id from files);
+             insert into collections select * from old.collections
+             where release_id in (select id from releases);",
         )?;
         tx.commit()?;
     }
@@ -2365,5 +2367,54 @@ mod tests {
         let late: i64 = db::open_at(&path).unwrap().query_row("select x from late", [], |r| r.get(0)).unwrap();
         assert_eq!(late, 7, "the write in the WAL came back too");
         assert!(!Path::new(&format!("{}-wal", backup.display())).exists());
+    }
+
+    #[test]
+    fn compacting_keeps_collections_and_where_they_started() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        db::create_db_at(&main).unwrap();
+        let group = "alt.binaries.g0";
+        let path = store::shard_path(&main, store::shard_of(group));
+        let release = |file: &str, id: &str| Release {
+            name: file.into(),
+            group: group.into(),
+            collection: Some("k".into()),
+            articles: vec![Article {
+                message_id: id.into(),
+                subject: format!("\"{file}\" yEnc (1/1)"),
+                filename: Some(file.into()),
+                release_name: Some(file.into()),
+                part: Some(1),
+                total_parts: Some(1),
+                bytes: 10,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        store::save(&main, &[release("a.jpg", "<a@x>")]).unwrap();
+        store::start_grouping(&main).unwrap();
+        // left behind by a purge: compaction drops it
+        db::open_at(&path)
+            .unwrap()
+            .execute("insert into collections (key, release_id) values (7, 999999)", [])
+            .unwrap();
+        let from = store::grouping_from(&db::open_at(&path).unwrap()).unwrap();
+        assert!(from > 1);
+
+        run(&main, &|_| {}, &Default::default()).unwrap();
+
+        let conn = db::open_at(&path).unwrap();
+        assert_eq!(store::grouping_from(&conn).unwrap(), from);
+        let rows: i64 = conn.query_row("select count(*) from collections", [], |r| r.get(0)).unwrap();
+        assert_eq!(rows, 1, "the row with a release, not the one left behind");
+        // the hash key came with meta: the collection finds its release
+        store::save(&main, &[release("b.jpg", "<b@x>")]).unwrap();
+        let (releases, files): (i64, i64) = conn
+            .query_row("select (select count(*) from releases), (select count(*) from files)", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!((releases, files), (1, 2));
     }
 }

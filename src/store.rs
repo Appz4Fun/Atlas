@@ -3415,4 +3415,15 @@ mod tests {
         println!("5,000 files {small:.2}s, 40,000 files {big:.2}s");
         assert!(big / small < 16.0, "8 times the files took {:.1} times as long", big / small);
     }
+
+    #[test]
+    fn the_menu_purge_clears_a_collections_row() {
+        let (_dir, main, conn) = fresh_shard_db();
+        let mut broken = in_collection("k", "a.jpg", "a.jpg", "<a@x>", "p");
+        broken.articles[0].total_parts = Some(2);
+        save(&main, &[broken]).unwrap();
+        assert_eq!(conn.query_row("select count(*) from collections", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+        purge_incomplete(&main).unwrap();
+        assert_eq!(conn.query_row("select count(*) from collections", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+    }
 }
