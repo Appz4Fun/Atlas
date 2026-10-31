@@ -3,6 +3,7 @@
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use rusqlite::params;
 use rusqlite::types::Value;
 
 use crate::config::{ArchiveConfig, Config};
@@ -81,16 +82,19 @@ fn name_may_change(release: &ReleaseInfo, source: u8) -> bool {
 fn finish(ctx: &StepCtx<'_>, source: i64, listing: Listing, limits: &ArchiveConfig) -> Result<Outcome, StepError> {
     let release = ctx.release();
     let id = release.id;
-    let mut writes = vec![StepWrite::new(archive_store::DELETE_SOURCE, vec![id.into(), source.into()])];
+    let mut writes = Vec::new();
     let rows = collapse_volumes(&listing.files);
+    let old: i64 = ctx
+        .conn()
+        .prepare_cached(archive_store::BYTES_OF_SOURCE)
+        .and_then(|mut stmt| stmt.query_row(params![id, source], |r| r.get(0)))
+        .map_err(retry)?;
     let used = store::get_meta(ctx.conn(), "archive_name_bytes").map_err(retry)?.unwrap_or(0);
     let quota = limits.max_names_mb.saturating_mul(1 << 20) / store::SHARDS as i64;
     let mut stored = false;
-    if used >= quota {
-        if !rows.is_empty() {
-            writes.push(StepWrite::new(archive_store::COUNT_OVER_QUOTA, vec![]));
-        }
-    } else {
+    // what this release already holds comes back when it's replaced
+    if rows.is_empty() || used.saturating_sub(old) < quota {
+        writes.push(StepWrite::new(archive_store::DELETE_SOURCE, vec![id.into(), source.into()]));
         let mut bytes = 0i64;
         for (i, row) in rows.iter().enumerate() {
             let size = row.size.and_then(|s| i64::try_from(s).ok());
@@ -105,9 +109,12 @@ fn finish(ctx: &StepCtx<'_>, source: i64, listing: Listing, limits: &ArchiveConf
             bytes += row.name.len() as i64 + 32;
             stored = true;
         }
-        if stored {
-            writes.push(StepWrite::new(archive_store::ADD_NAME_BYTES, vec![bytes.into()]));
+        if bytes != old {
+            writes.push(StepWrite::new(archive_store::ADD_NAME_BYTES, vec![(bytes - old).into()]));
         }
+    } else {
+        // past the total: what's there stays, and this list goes unstored
+        writes.push(StepWrite::new(archive_store::COUNT_OVER_QUOTA, vec![]));
     }
     if source != SOURCE_PAR2 {
         writes.push(StepWrite::new(archive_store::UPSERT_RELEASE, vec![id.into(), listing.password().code().into()]));

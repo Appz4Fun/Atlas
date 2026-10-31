@@ -46,6 +46,9 @@ pub const DELETE_SOURCE: &str = "delete from archive_inner_files where release_i
 pub const INSERT_FILE: &str =
     "insert or replace into archive_inner_files (release_id, seq, name, size, source) values (?1, ?2, ?3, ?4, ?5)";
 pub const UPSERT_RELEASE: &str = "insert or replace into archive_release (release_id, password) values (?1, ?2)";
+/// what a source's rows of a release count for in `archive_name_bytes`
+pub const BYTES_OF_SOURCE: &str = "select coalesce(sum(length(cast(name as blob)) + 32), 0)
+    from archive_inner_files where release_id = ?1 and source = ?2";
 /// the running totals behind `max_names_mb`
 pub const ADD_NAME_BYTES: &str = "insert into meta (key, value) values ('archive_name_bytes', ?1)
     on conflict(key) do update set value = value + excluded.value";

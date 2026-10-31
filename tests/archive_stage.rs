@@ -704,3 +704,37 @@ fn under_the_quota_the_total_grows_by_what_was_stored() {
     assert_eq!(meta(&h, "archive_name_bytes"), Some("Inner.mkv".len() as i64 + 32));
     assert_eq!(meta(&h, "archive_names_over_quota"), None);
 }
+
+#[test]
+fn a_rerun_doesnt_spend_the_quota() {
+    let mut h = fresh();
+    let s = shape("x").one("x.rar", &a_rar5("Inner.mkv"));
+    let state = serve(&mut h, &s, config());
+    settled(&h, "x");
+    let before = meta(&h, "archive_name_bytes");
+    assert!(before.is_some());
+    let id = h.id_of("x");
+    h.stage.as_ref().unwrap().rerun(id, LIST_DONE).unwrap();
+    wait_for("a second read", || bodies(&state) == 2);
+    settled(&h, "x");
+    assert_eq!(meta(&h, "archive_name_bytes"), before);
+}
+
+#[test]
+fn a_rerun_past_the_quota_keeps_what_was_stored() {
+    let mut h = fresh();
+    let mut small = config();
+    small.archive.max_names_mb = 64;
+    let s = shape("x").one("x.rar", &a_rar5("Inner.mkv"));
+    let state = serve(&mut h, &s, small);
+    settled(&h, "x");
+    let before = rows(&h, "x");
+    assert_eq!(before.len(), 1);
+    h.shard().execute("update meta set value = 99000000 where key = 'archive_name_bytes'", []).unwrap();
+    let id = h.id_of("x");
+    h.stage.as_ref().unwrap().rerun(id, LIST_DONE).unwrap();
+    wait_for("a second read", || bodies(&state) == 2);
+    settled(&h, "x");
+    assert_eq!(rows(&h, "x"), before);
+    assert_eq!(meta(&h, "archive_names_over_quota"), Some(1));
+}

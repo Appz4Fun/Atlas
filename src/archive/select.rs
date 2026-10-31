@@ -40,6 +40,8 @@ pub enum Kind {
     Unidentified,
 }
 
+static NUMBERED: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\.\d{2,3}$").unwrap());
+
 pub fn classify(filename: &str) -> Kind {
     let Some(c) = KIND.captures(filename) else { return Kind::Unidentified };
     let num = |name: &str| c.name(name).and_then(|m| m.as_str().parse::<u32>().ok());
@@ -102,7 +104,9 @@ pub fn plan(files: &[FileInfo], probe_files: usize) -> Vec<Head<'_>> {
             Kind::Numbered(n) => (3, n),
             _ => continue,
         };
-        sets.entry((family, strip_volume_suffix(&f.filename).to_lowercase())).or_default().push((volume, f));
+        // `.01`, as `classify` reads it. Only here: elsewhere two digits at the end of a name are part of the name
+        let set = if family == 3 { NUMBERED.replace(&f.filename, "") } else { strip_volume_suffix(&f.filename).into() };
+        sets.entry((family, set.to_lowercase())).or_default().push((volume, f));
     }
     let mut sets: Vec<VolumeSet<'_>> = sets.into_iter().collect();
     sets.sort_by_key(|(key, members)| {

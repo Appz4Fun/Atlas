@@ -7,6 +7,8 @@ use super::{Listing, MAX_ENTRIES, crc32};
 const MAX_NEXT: u64 = 16 * 1024 * 1024;
 const MAX_DECODED: usize = 16 * 1024 * 1024;
 const MAX_FOLDERS: u64 = 4_096;
+/// each byte of a header can claim one: these are what keeps a header from turning 8 MB into 64
+const MAX_PACK_STREAMS: u64 = 4_096;
 const MAX_CODERS: u64 = 32;
 const MAX_ROUNDS: usize = 4;
 const AES: &[u8] = &[0x06, 0xf1, 0x07, 0x01];
@@ -178,6 +180,9 @@ fn folder(r: &mut Reader<'_>) -> Option<Folder> {
         in_total += ins;
         out_total += outs;
     }
+    if in_total > MAX_CODERS || out_total > MAX_CODERS {
+        return None;
+    }
     let pairs = out_total.checked_sub(1)?;
     let packed = in_total.checked_sub(pairs)?;
     for _ in 0..pairs {
@@ -199,7 +204,7 @@ fn streams(r: &mut Reader<'_>) -> Option<Streams> {
     if id == 0x06 {
         s.pack_pos = r.number()?;
         let count = r.number()?;
-        if count > r.left() {
+        if count > r.left() || count > MAX_PACK_STREAMS {
             return None;
         }
         loop {
@@ -520,4 +525,28 @@ fn nested(head: &[u8], window: &[u8], at: u64, bytes: Vec<u8>, l: &mut Listing, 
         return None;
     }
     nested(head, window, at, out, l, round + 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::archive::testkit::sz_num;
+
+    /// pack info with `count` one-byte sizes, then the end of it and of the streams
+    fn pack_info(count: u64) -> Vec<u8> {
+        let mut b = vec![0x06, 0x00];
+        b.extend(sz_num(count));
+        b.push(0x09);
+        b.extend(vec![0u8; count as usize]);
+        b.extend([0x00, 0x00]);
+        b
+    }
+
+    #[test]
+    fn a_huge_pack_count_is_refused_before_its_sizes_are_kept() {
+        let ok = pack_info(MAX_PACK_STREAMS);
+        assert!(streams(&mut Reader { b: &ok, p: 0 }).is_some());
+        let over = pack_info(MAX_PACK_STREAMS + 1);
+        assert!(streams(&mut Reader { b: &over, p: 0 }).is_none());
+    }
 }

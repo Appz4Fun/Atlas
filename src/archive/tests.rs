@@ -703,4 +703,13 @@ mod select_tests {
         assert_ne!(RERUN_ON_INNER_FILES & mask(StepId(8)), 0);
         assert_ne!(RERUN_ON_INNER_FILES & mask(StepId(16)), 0);
     }
+
+    #[test]
+    fn two_digit_numbered_volumes_share_a_set() {
+        let f = [file("x.03", 3), file("x.01", 3), file("x.02", 3)];
+        let heads = plan(&f, 2);
+        assert_eq!(heads.len(), 1, "{heads:?}");
+        assert_eq!(heads[0].file.filename, "x.01");
+        assert_eq!(heads[0].tail.filename, "x.03");
+    }
 }
