@@ -153,6 +153,34 @@ pub struct Config {
     pub max_unsaved_headers: Option<u64>,
     pub postprocess: PostprocessConfig,
     pub archive: ArchiveConfig,
+    pub naming: NamingConfig,
+}
+
+/// The `naming` object of config.json, see the README.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NamingConfig {
+    pub enabled: bool,
+    pub nfo_step: bool,
+}
+
+impl Default for NamingConfig {
+    fn default() -> Self {
+        NamingConfig { enabled: true, nfo_step: true }
+    }
+}
+
+impl NamingConfig {
+    fn from_value(v: Option<&Value>) -> NamingConfig {
+        let mut c = NamingConfig::default();
+        let Some(v) = v else { return c };
+        if let Some(b) = v.get("enabled").and_then(as_bool) {
+            c.enabled = b;
+        }
+        if let Some(b) = v.get("nfo_step").and_then(as_bool) {
+            c.nfo_step = b;
+        }
+        c
+    }
 }
 
 /// The `archive` object of config.json, see the README.
@@ -322,6 +350,7 @@ impl Default for Config {
             max_unsaved_headers: None,
             postprocess: PostprocessConfig::default(),
             archive: ArchiveConfig::default(),
+            naming: NamingConfig::default(),
         }
     }
 }
@@ -466,6 +495,7 @@ impl Config {
             auto_run_compact: v.get("auto_run_compact").and_then(Value::as_bool).unwrap_or(false),
             postprocess: PostprocessConfig::from_value(v.get("postprocess")),
             archive: ArchiveConfig::from_value(v.get("archive")),
+            naming: NamingConfig::from_value(v.get("naming")),
             max_unsaved_headers: v
                 .get("max_unsaved_headers")
                 .and_then(as_int)
@@ -791,6 +821,25 @@ pub mod keyring {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn naming_defaults_when_absent() {
+        let c = Config::from_value(&json!({})).naming;
+        assert_eq!(c, NamingConfig { enabled: true, nfo_step: true });
+    }
+
+    #[test]
+    fn naming_keys_parse() {
+        let c = Config::from_value(&json!({"naming": {"enabled": false, "nfo_step": false}})).naming;
+        assert_eq!(c, NamingConfig { enabled: false, nfo_step: false });
+    }
+
+    #[test]
+    fn a_bad_naming_value_falls_back() {
+        let c = Config::from_value(&json!({"naming": {"enabled": "perhaps", "nfo_step": 7}})).naming;
+        assert_eq!(c, NamingConfig::default());
+        assert_eq!(Config::from_value(&json!({"naming": 7})).naming, NamingConfig::default());
+    }
 
     #[test]
     fn archive_defaults_when_absent() {

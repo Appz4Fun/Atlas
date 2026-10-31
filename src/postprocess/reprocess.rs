@@ -10,15 +10,19 @@ use super::step::{Step, StepMask, mask};
 use super::steps;
 
 /// One shard, in the caller's `BEGIN IMMEDIATE` transaction: a walk that clears
-/// `mask`. False: the same walk is already queued.
-pub fn apply(tx: &Connection, mask: StepMask, group: Option<&str>, now: i64) -> rusqlite::Result<bool> {
+/// `redo`. False: the same walk is already queued.
+pub fn apply(tx: &Connection, redo: StepMask, group: Option<&str>, now: i64) -> rusqlite::Result<bool> {
+    // asking for naming again is what lets it replace a name it left alone so far
+    if redo & mask(crate::naming::NAMING) != 0 {
+        tx.prepare_cached("insert or replace into meta (key, value) values ('naming_rename_named', 1)")?.execute([])?;
+    }
     let added = tx
         .prepare_cached(
             "insert into pp_walks (kind, top_id, before_id, redo_mask, group_name, created_at)
              select 'reprocess', t, t, ?1, ?2, ?3 from (select coalesce(max(id), -1) + 1 as t from releases)
              where not exists (select 1 from pp_walks where kind = 'reprocess' and redo_mask = ?1 and group_name is ?2)",
         )?
-        .execute(params![mask, group, now])?;
+        .execute(params![redo, group, now])?;
     Ok(added > 0)
 }
 

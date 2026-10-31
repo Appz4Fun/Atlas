@@ -10,7 +10,7 @@ use atlas::archive::Password;
 use atlas::archive::steps::next_probe_slot;
 use atlas::archive::store::{InnerFileRow, inner_files, password};
 use atlas::archive::testkit::*;
-use atlas::config::{ArchiveConfig, Config, PostprocessConfig};
+use atlas::config::{ArchiveConfig, Config, NamingConfig, PostprocessConfig};
 use atlas::indexer::shared_db;
 use atlas::nntp::Pool;
 use atlas::parser::{Article, Release};
@@ -23,7 +23,7 @@ use common::{Post, Server, mock, par2_file_desc, post, spawn_server, yenc_body, 
 const ARTICLE: i64 = 700_000;
 const PAR2_DONE: i64 = mask(StepId(1));
 const LIST_DONE: i64 = mask(StepId(2));
-const NFO_DONE: i64 = mask(StepId(3));
+const NFO_DONE: i64 = mask(StepId(9));
 
 /// A release and what the server holds for it, numbered in the order they're added.
 #[derive(Default)]
@@ -95,6 +95,8 @@ fn config() -> Config {
             min_completion_percent: 0,
             ..quick_config()
         },
+        // the fixtures' names are for these steps to judge, see tests/naming_stage.rs
+        naming: NamingConfig { enabled: false, ..Default::default() },
         ..Config::default()
     }
 }
@@ -531,7 +533,7 @@ fn inner_names_only_replace_junk() {
     assert_eq!(naming(&h, &s.name), (None, None));
 
     let mut h = fresh();
-    let s = shape("Good.Release.Name.2024").obfuscated().one("x.rar", &a_rar5("Inner.Movie.2024.mkv"));
+    let s = shape("Xk3Mz9PqL").obfuscated().one("x.rar", &a_rar5("Inner.Movie.2024.mkv"));
     serve(&mut h, &s, config());
     settled(&h, &s.name);
     assert_eq!(naming(&h, &s.name), (Some("Inner.Movie.2024.mkv".into()), Some(15)));

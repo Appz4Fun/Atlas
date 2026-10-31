@@ -7,7 +7,7 @@ use rusqlite::params;
 use rusqlite::types::Value;
 
 use crate::config::{ArchiveConfig, Config};
-use crate::nfo;
+use crate::naming::{self, NameSource};
 use crate::par2;
 use crate::postprocess::step::{
     BodyRequest, Got, NameChange, Needs, Outcome, ReleaseInfo, Reruns, Step, StepCtx, StepError, StepId, StepWrite,
@@ -18,8 +18,8 @@ use super::names::{best_name, collapse_volumes, looks_random, stem};
 use super::select::{self, Head, Kind};
 use super::store::{self as archive_store, SOURCE_7Z, SOURCE_PAR2, SOURCE_RAR, SOURCE_ZIP};
 use super::{
-    ARTICLE_CAP, Format, InnerFile, Listing, NAME_SOURCE_INNER, NAME_SOURCE_NFO, NAME_SOURCE_PAR2, PROBE_PREFIX,
-    RERUN_ON_INNER_FILES, identify, rar, sevenz, zip,
+    ARTICLE_CAP, Format, InnerFile, Listing, NAME_SOURCE_INNER, NAME_SOURCE_PAR2, PROBE_PREFIX, RERUN_ON_INNER_FILES,
+    identify, rar, sevenz, zip,
 };
 
 fn retry(e: impl std::fmt::Display) -> StepError {
@@ -32,7 +32,7 @@ fn named_as_an_image(release: &ReleaseInfo) -> bool {
 }
 
 /// A file's first article. None: it was never indexed, and a fetch would read the wrong bytes.
-fn first_article(ctx: &StepCtx<'_>, file: &FileInfo) -> Result<Option<SegmentRef>, StepError> {
+pub(crate) fn first_article(ctx: &StepCtx<'_>, file: &FileInfo) -> Result<Option<SegmentRef>, StepError> {
     let seg = ctx.segments(file.id, &SegmentPick::First(1)).map_err(retry)?.into_iter().next();
     Ok(seg.filter(|s| s.part.is_none_or(|p| p <= 1)))
 }
@@ -49,7 +49,7 @@ fn tail_articles(ctx: &StepCtx<'_>, file: &FileInfo) -> Result<Vec<SegmentRef>, 
 }
 
 /// One whole article, within every budget. None: skip this candidate.
-fn fetch_one(ctx: &mut StepCtx<'_>, seg: &SegmentRef, file: &str) -> Result<Option<Vec<u8>>, StepError> {
+pub(crate) fn fetch_one(ctx: &mut StepCtx<'_>, seg: &SegmentRef, file: &str) -> Result<Option<Vec<u8>>, StepError> {
     let wanted =
         [BodyRequest { message_id: seg.message_id.clone(), file: file.to_string(), max_bytes: Some(ARTICLE_CAP) }];
     Ok(ctx.fetch_bodies(&wanted)?.into_iter().next().and_then(|b| match b.got {
@@ -123,9 +123,12 @@ fn finish(ctx: &StepCtx<'_>, source: i64, listing: Listing, limits: &ArchiveConf
     let name_source = if source == SOURCE_PAR2 { NAME_SOURCE_PAR2 } else { NAME_SOURCE_INNER };
     let name_wanted = name_may_change(release, name_source)
         && (source == SOURCE_PAR2 || release.is_obfuscated || looks_random(stem(&release.name)));
+    let naming_source = if source == SOURCE_PAR2 { NameSource::Par2 } else { NameSource::ArchiveInner };
     let name = name_wanted
         .then(|| best_name(listing.files.iter().map(|f| (f.name.as_str(), f.size.unwrap_or(0)))))
         .flatten()
+        // a junk name at a high source would block every lower source for good
+        .filter(|n| naming::improves(release, n, naming_source))
         .map(|n| NameChange { display_name: Some(n), obfuscated: Some(release.is_obfuscated), source: name_source });
 
     Ok(Outcome {
@@ -355,47 +358,6 @@ impl Step for ListStep {
                 // images: stop, with at most a prefix read
                 Format::Image => return Ok(Outcome::default()),
                 Format::Media | Format::Unknown => continue,
-            }
-        }
-        Ok(Outcome::default())
-    }
-}
-
-/// Names a release from its NFO, when nothing else named it.
-#[derive(Default)]
-pub struct NfoStep {
-    limits: Mutex<ArchiveConfig>,
-}
-
-impl Step for NfoStep {
-    fn id(&self) -> StepId {
-        StepId(3)
-    }
-    fn name(&self) -> &'static str {
-        "archive_nfo"
-    }
-    fn rank(&self) -> u16 {
-        120
-    }
-    fn needs(&self) -> Needs {
-        Needs::Bodies
-    }
-    limits_from_enabled!();
-    fn applies(&self, release: &ReleaseInfo) -> bool {
-        !named_as_an_image(release) && release.display_name.is_none()
-    }
-    fn reruns(&self) -> Reruns {
-        Reruns { on_rename: false, on_growth: true }
-    }
-    fn run(&self, ctx: &mut StepCtx<'_>) -> Result<Outcome, StepError> {
-        let files = ctx.files().map_err(retry)?;
-        for file in select::nfo_sources(&files) {
-            let Some(seg) = first_article(ctx, file)? else { continue };
-            let Some(body) = fetch_one(ctx, &seg, &file.filename)? else { continue };
-            if let Some(name) = nfo::display_name(&body) {
-                let obfuscated = Some(ctx.release().is_obfuscated);
-                let change = NameChange { display_name: Some(name), obfuscated, source: NAME_SOURCE_NFO };
-                return Ok(Outcome { matched: true, name: Some(change), ..Default::default() });
             }
         }
         Ok(Outcome::default())

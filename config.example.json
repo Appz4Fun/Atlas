@@ -71,5 +71,9 @@
         "max_bodies_per_release": 4,
         "probe_files": 2,
         "probes_per_minute": 60
+    },
+    "naming": {
+        "enabled": true,
+        "nfo_step": true
     }
 }

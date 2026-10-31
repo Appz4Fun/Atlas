@@ -76,10 +76,8 @@ static FILE_COUNT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\[(\d+)\s*
 static RELEASE_SUFFIX_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\.(part\d+|r\d+|vol\d+\+\d+|par2|nfo|sfv|rar|0\d\d)$").unwrap());
 
-static OBFUSCATED_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[A-Za-z0-9]{16,}$").unwrap());
-
 pub fn is_obfuscated(name: &str) -> bool {
-    OBFUSCATED_RE.is_match(name)
+    crate::naming::obfuscation::is_obfuscated(name)
 }
 
 pub fn parse_subject(subject: &str) -> Option<ParsedSubject> {
@@ -344,7 +342,8 @@ mod tests {
     #[test]
     fn obfuscation() {
         assert!(is_obfuscated("a1B2c3D4e5F6g7H8"));
-        assert!(!is_obfuscated("a1B2c3D4e5F6g7H"));
+        assert!(is_obfuscated("a1B2c3D4e5F6g7H"));
+        assert!(!is_obfuscated("Some.Show.S01E01"));
         assert!(!is_obfuscated("Movie.2024.1080p.WEB"));
     }
 
