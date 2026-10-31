@@ -4,6 +4,7 @@ mod common;
 
 use std::process::{Command, Output};
 
+use atlas::config::PostprocessConfig;
 use atlas::postprocess::reprocess;
 use atlas::postprocess::step::{Needs, StepId, mask};
 use atlas::{db, store};
@@ -173,4 +174,26 @@ fn it_is_refused_during_a_compaction() {
     assert!(!run(dir.path(), &["--apply"]).status.success());
     assert_eq!(walks(&main), 0);
     drop(lock);
+}
+
+#[test]
+fn a_walks_request_waits_for_a_release_still_settling() {
+    let log: Log = Default::default();
+    let mut h = fresh();
+    h.save(&[complete("Rel.One")]);
+    let conn = h.shard();
+    let bit = mask(StepId(9));
+    let id = h.id_of("Rel.One");
+    conn.execute_batch(
+        "insert or replace into meta (key, value) values ('pp_walk_seeded', 1), ('pp_steps_seen', 512);",
+    )
+    .unwrap();
+    // done, not growing, and touched just now: the walk finds it before it settles
+    conn.execute("insert into pp_state (release_id, done, parts_seen) values (?, ?, 2)", rusqlite::params![id, bit])
+        .unwrap();
+    assert!(reprocess::apply(&conn, bit, None, 1).unwrap());
+    let step = TestStep::new(9, "db", 200, Needs::Database, &log);
+    h.start(vec![step.arc()], PostprocessConfig { settle_secs: 2, complete_settle_secs: 2, ..Default::default() });
+    wait_for("the step runs again", || runs_of(&log, "db") == 1);
+    assert_eq!(h.bits("Rel.One").unwrap().0, bit);
 }

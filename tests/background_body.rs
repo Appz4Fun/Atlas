@@ -144,3 +144,13 @@ fn a_small_article_comes_back_decoded_and_its_connection_stays() {
     }
     assert_eq!(state.accepted.load(Ordering::SeqCst), 1);
 }
+
+#[test]
+fn a_server_in_trouble_is_an_error_not_missing() {
+    let rt = runtime();
+    let mut state = Server::new(vec![post(1, r#""a.bin" yEnc (1/1)"#, 10, vec![])]);
+    Arc::get_mut(&mut state).unwrap().body_trouble = true;
+    let port = spawn_server(state);
+    let pool = Pool::new(&[mock(port, "secret", 2, 1)]);
+    assert!(rt.block_on(pool.background_body("<msg1@mock>", MIB)).is_err());
+}

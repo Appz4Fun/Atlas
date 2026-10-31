@@ -32,6 +32,8 @@ pub struct Server {
     pub password: &'static str,
     /// false = BODY always 430s, like a provider missing the article
     pub bodies: bool,
+    /// BODY answers 502, like a provider in trouble
+    pub body_trouble: bool,
     pub xover_delay: Duration,
     /// answer XFEATURE COMPRESS GZIP and send zlib compressed XOVER
     pub compress: bool,
@@ -78,6 +80,7 @@ impl Server {
             posts: Mutex::new(posts),
             password: "secret",
             bodies: true,
+            body_trouble: false,
             xover_delay: Duration::ZERO,
             compress: false,
             compress_broken: false,
@@ -291,6 +294,7 @@ pub fn serve(stream: TcpStream, state: &Server, over_limit: bool) {
                     }
                 }
             }
+            "BODY" if state.body_trouble => send(&mut out, b"502 try later"),
             "BODY" => match posts_lock().iter().find(|p| p.message_id == arg).filter(|_| state.bodies) {
                 Some(p) => {
                     thread::sleep(state.body_delay);

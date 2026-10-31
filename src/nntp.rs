@@ -1548,7 +1548,9 @@ impl Pool {
                     // the rest is unread: the lease stays busy, soo the connection is thrown away
                     Ok(None) => return Ok(BackgroundBody::TooBig),
                     Err(e) => match lease.check::<()>(Err(e)) {
-                        Err(NntpError::Reply { .. }) | Ok(()) => {}
+                        // this server doesnt have it
+                        Err(NntpError::Reply { code: 423 | 430, .. }) | Ok(()) => {}
+                        // anything else says nothing about the article
                         Err(e) => unreachable = Some(e),
                     },
                 }

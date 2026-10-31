@@ -463,3 +463,31 @@ fn enabled_sees_the_full_config_before_the_first_run() {
     wait_for("it ran", || seen.lock().unwrap().is_some());
     assert_eq!(*seen.lock().unwrap(), Some(7));
 }
+
+#[test]
+fn a_walk_stopped_by_a_step_doesnt_pass_the_rows_it_left() {
+    let log = log();
+    let mut h = fresh();
+    walkable(&h, 10);
+    let conn = h.shard();
+    let (top, stopped_at) = {
+        let ids: Vec<i64> = conn
+            .prepare("select id from releases order by id desc")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        (ids[0] + 1, ids[3])
+    };
+    let step = TestStep::new(9, "db", 200, Needs::Database, &log)
+        .runs(move |ctx| if ctx.release().id == stopped_at { Err(StepError::Stopped) } else { Ok(Outcome::default()) });
+    h.start(vec![step.arc()], PostprocessConfig { workers: 1, ..quick_config() });
+    wait_for("three rows", || {
+        conn.query_row("select before_id from pp_walks", [], |r| r.get::<_, i64>(0)).unwrap() < top
+    });
+    std::thread::sleep(Duration::from_millis(300));
+    let before: i64 = conn.query_row("select before_id from pp_walks", [], |r| r.get(0)).unwrap();
+    assert!(before > stopped_at, "the cursor stays above the row it didnt finish: {before}, {stopped_at}");
+    h.stop();
+}

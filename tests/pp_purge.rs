@@ -368,3 +368,19 @@ fn then_compact_shrinks_it() {
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
     assert!(shards_bytes(&h.main) < before);
 }
+
+#[test]
+fn another_size_limit_starts_over() {
+    let h = home();
+    let mut small: Vec<Release> =
+        (0..5_000).map(|i| whole(&format!("Small.{i}"), &format!("s{i}.bin"), 1, 1)).collect();
+    // a batch's worth under both limits, then rows only the larger one takes
+    small.iter_mut().take(2_500).for_each(|r| r.articles[0].bytes = 100);
+    small.iter_mut().skip(2_500).for_each(|r| r.articles[0].bytes = 5_000);
+    store::save(&h.main, &small).unwrap();
+    let args = ["--apply", "--too-small", "--below", "1000"];
+    assert!(h.run(&args, &[("ATLAS_PURGE_STOP_AFTER", "1")]).status.success());
+    let text = h.ok(&["--apply", "--too-small", "--below", "10000"]);
+    assert!(text.contains("starting over"), "{text}");
+    assert_eq!(h.names().len(), 0, "the rows passed under the smaller limit too");
+}

@@ -345,8 +345,10 @@ fn apply_shard(
         return Ok(());
     }
 
+    // what the scan takes is part of where it was: rows passed under other terms get looked at again
     let stored = store::get_meta(&conn, "purge_classes")?;
-    if stored != Some(o.classes) {
+    let below = if o.classes & Class::TooSmall as i64 != 0 { o.below } else { 0 };
+    if stored != Some(o.classes) || store::get_meta(&conn, "purge_below")?.unwrap_or(0) != below {
         if stored.is_some() {
             say(format!("{}: other classes than the stopped run: starting over", path.display()));
         }
@@ -354,6 +356,7 @@ fn apply_shard(
         let tx = conn.transaction()?;
         set_meta(&tx, "purge_top", top.unwrap_or(0))?;
         set_meta(&tx, "purge_classes", o.classes)?;
+        set_meta(&tx, "purge_below", below)?;
         set_meta(&tx, "purge_after", i64::MIN)?;
         tx.commit()?;
     }
@@ -416,7 +419,10 @@ fn apply_shard(
     }
 
     let tx = conn.transaction()?;
-    tx.execute("delete from meta where key in ('purge_top', 'purge_classes', 'purge_after', 'purge_victim')", [])?;
+    tx.execute(
+        "delete from meta where key in ('purge_top', 'purge_classes', 'purge_below', 'purge_after', 'purge_victim')",
+        [],
+    )?;
     tx.commit()?;
     let _ = conn.query_row("pragma wal_checkpoint(truncate)", [], |_| Ok(()));
     Ok(())

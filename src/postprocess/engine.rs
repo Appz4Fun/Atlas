@@ -151,6 +151,10 @@ impl Conns {
 struct Batch {
     applied: Vec<Applied>,
     holds: Vec<Box<dyn std::any::Any + Send>>,
+    /// the last release that got its visit: stopping can leave the rest of a batch
+    through: Option<i64>,
+    /// a step said it's stopping
+    stopped: bool,
 }
 
 /// How a step's run changed a visit.
@@ -408,11 +412,16 @@ impl Inner {
             })?;
             return Ok(true);
         }
-        let seen = rows.len() as i64;
-        let next = rows.last().map_or(before, |r| r.info.id);
         let mut batch = Batch::default();
-        let visits = rows.into_iter().map(|row| (row, None)).collect();
+        let visits: Vec<(Row, Option<i64>)> = rows.into_iter().map(|row| (row, None)).collect();
+        let order: Vec<i64> = visits.iter().map(|(row, _)| row.info.id).collect();
         self.visit_all(conn, visits, redo, now, &mut batch)?;
+        // the cursor goes no further than the visits did: nothing else brings a walked row back
+        let Some(next) = batch.through else {
+            self.send(db, shard, batch, now, |_| Ok(()))?;
+            return Ok(true);
+        };
+        let seen = order.iter().position(|id| *id == next).map_or(0, |at| at as i64 + 1);
         let ran = batch.applied.len() as i64;
         self.stats.rows_walked.fetch_add(seen as u64, Relaxed);
         self.send(db, shard, batch, now, move |tx| {
@@ -433,7 +442,7 @@ impl Inner {
         now: i64,
         also: impl FnOnce(&Connection) -> rusqlite::Result<()> + Send + 'static,
     ) -> anyhow::Result<()> {
-        let Batch { applied, holds } = batch;
+        let Batch { applied, holds, .. } = batch;
         let max_attempts = self.settings.read().unwrap().config.max_attempts;
         let answer = db.on_writer(
             shard,
@@ -470,10 +479,15 @@ impl Inner {
             if self.stopping() {
                 break;
             }
-            let summary = summaries.remove(&row.info.id);
+            let id = row.info.id;
+            let summary = summaries.remove(&id);
             if let Some(a) = self.visit(conn, row, summary, due, redo, now, &rules, batch) {
                 batch.applied.push(a);
             }
+            if batch.stopped {
+                break;
+            }
+            batch.through = Some(id);
         }
         Ok(())
     }
@@ -512,7 +526,11 @@ impl Inner {
         let summary = summary.unwrap_or_default();
         match rules::judge_files(rules, &facts(&row), &summary, now) {
             Verdict::Reject(reason) => return reject(reason),
-            Verdict::Wait(until) => return Some(Applied { queue_at: Some(until), no_state: true, ..base_copy(&base) }),
+            // a walk's request waits with it: the bits go now, soo the visit after settling runs them
+            Verdict::Wait(until) => {
+                let clear = if row.has_state { redo } else { 0 };
+                return Some(Applied { queue_at: Some(until), clear, no_state: clear == 0, ..base_copy(&base) });
+            }
             Verdict::Pass => {}
         }
 
@@ -588,7 +606,10 @@ impl Inner {
                         a.names.push((bit, name));
                     }
                 }
-                Ran::Error(StepError::Stopped) => return None,
+                Ran::Error(StepError::Stopped) => {
+                    batch.stopped = true;
+                    return None;
+                }
                 Ran::Error(StepError::Retry(e)) => {
                     self.stats.retries.fetch_add(1, Relaxed);
                     let attempt = row.db_attempts + 1;
@@ -938,7 +959,7 @@ impl Inner {
 }
 
 fn one(a: Applied) -> Batch {
-    Batch { applied: vec![a], holds: Vec::new() }
+    Batch { applied: vec![a], ..Default::default() }
 }
 
 /// a fresh `Applied` with what identifies the visit

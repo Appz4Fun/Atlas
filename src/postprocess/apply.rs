@@ -64,12 +64,13 @@ pub(crate) fn apply_one(
     };
     conn.execute_batch("rollback to one; release one")?;
     let column = if lane == Lane::Db { "db_attempts" } else { "net_attempts" };
-    let attempts: i64 = conn
+    let counted: i64 = conn
         .prepare_cached(&format!("select {column} from pp_state where release_id = ?"))?
         .query_row([id], |r| r.get(0))
         .optional()?
-        .unwrap_or(0)
-        + 1;
+        .unwrap_or(0);
+    // a net run's attempt was counted before it ran
+    let attempts = if lane == Lane::Db { counted + 1 } else { counted.max(1) };
     let (after, give_up) = retry(attempts);
     let failed = if give_up { set_done } else { 0 };
     let attempts = if give_up { 0 } else { attempts };
@@ -528,5 +529,17 @@ mod tests {
         assert_eq!(due(&conn), NOW + 500);
         run(&conn, Applied { release_id: id, claimed_due: Some(NOW), queue_at: Some(NOW + 60), ..Default::default() });
         assert_eq!(due(&conn), NOW + 500, "a retry doesnt overwrite its newer time");
+    }
+
+    #[test]
+    fn a_net_write_failure_uses_only_the_attempt_begin_counted() {
+        let (_dir, conn, id) = shard();
+        conn.execute("insert into pp_state (release_id, net_attempts) values (?, 2)", [id]).unwrap();
+        let bad = StepWrite::new("insert into no_such_table values (2)", vec![]);
+        assert!(!run(
+            &conn,
+            Applied { release_id: id, lane: Lane::Net, set_done: A, writes: vec![(A, bad)], ..Default::default() }
+        ));
+        assert_eq!(state(&conn, id).4, 2);
     }
 }
