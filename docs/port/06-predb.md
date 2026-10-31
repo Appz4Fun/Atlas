@@ -329,7 +329,7 @@ pub fn poll_source(conn: &mut Connection, fetch: &dyn Fetch, spec: &FeedSpec, cf
 pub fn wait_seconds(reply: &HttpReply, now: i64, default: i64) -> i64;
 ```
 
-`UreqFetch::new`: `ureq::Agent::config_builder().timeout_global(Some(timeout)).http_status_as_error(false).max_redirects(3).user_agent(concat!("Atlas/", env!("CARGO_PKG_VERSION"))).build().into()`. `get` reads the body with `resp.body_mut().with_config().limit(MAX_BODY).read_to_string()`, where `MAX_BODY = 8 << 20`. Over the limit is an `Err`.
+`UreqFetch::new`: `ureq::Agent::config_builder().timeout_global(Some(timeout)).http_status_as_error(false).max_redirects(0).user_agent(concat!("Atlas/", env!("CARGO_PKG_VERSION"))).build().into()`. `get` reads the body with `resp.body_mut().with_config().limit(MAX_BODY).read_to_string()`, where `MAX_BODY = 8 << 20`. Over the limit is an `Err`. No redirect is followed, because a feed could aim one at a local service: a 3xx is a `Failed` reply like any other non-200, and a source that moves needs a new `FeedSpec`.
 
 **A poll, exactly.** First, when `page_count * page_size` is past `max_db_mb`: no request, `Failed("the PreDB file is over max_db_mb")`, with the usual backoff, so a feed can't fill the disk. `budget = max_pages_per_poll`. Requests are `max(request_delay_ms, spec.min_delay_ms)` apart. Each page is imported in its own transaction, so a failure keeps what was read.
 
@@ -725,6 +725,7 @@ Hand-write each fixture from section 6's table, with invented titles such as `Al
   - `an_empty_page_ends_it`: `resume_page = 0`.
   - `an_xrel_cursor_past_its_last_page_ends_cleanly`: `resume_page = 9`, then `history_page = 9` with `history_pages: 20`, and `total_pages: 3` in a body with no list: `resume_page = 0`, `history_read = 20`, `failures = 0`, and no `last_error`.
   - `history_reads_older_pages_then_stops`: `history_pages: 4`, budget 3: first poll pages 1, 2, 3 by history; next poll goes on; stops at 4 pages read; survives a restart. `history_pages: 0`: never.
+  - `a_redirect_isnt_followed`, in `tests/predb_ureq.rs`: a loopback server answers 302 to a second loopback server: `get` returns status 302, and the second server saw nothing.
   - `a_file_over_its_quota_stops_polling`: `max_db_mb` below the file's size: no request, `Failed`, backoff, `last_error` set. Raised again: polling carries on. `a_page_of_too_many_rows_imports_nothing`: 1,001 rows: `Failed`, no row.
   - `a_429_waits_as_told`: `Retry-After: 120`: `RateLimited(120)`, `next_poll_at = now + 120`, `failures` 0, nothing retried in this poll. An HTTP date, `X-RateLimit-Reset`, none (60), and 2 days (172,800, not shortened).
   - `a_rate_limit_envelope_is_the_same`: HTTP 200 with `rate_limited.json`.

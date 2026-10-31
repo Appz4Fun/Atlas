@@ -673,6 +673,7 @@ const CORE_TABLES: &[(&str, &str)] = &[
   - `a_rerun_of_the_running_step_survives_its_result`: claim with `claimed_gen` 0, `Stage::rerun` of that very step, then apply its `set_done`: the bit stays clear and the queue row stays, also when the rerun's `due_at` equals `claimed_due`. An unrelated bit in the same `set_done` is dropped only if it is in `rerun_mask`.
   - `a_stale_results_writes_and_name_are_dropped_too`: a step blocked in `run` with a write and a `NameChange`, a rerun of it meanwhile, then its apply: neither the write nor the name lands, and another step's write in the same `Applied` does. `a_stale_lookup_cant_attach_the_old_titles_ids` is its Part 8 form.
   - `a_stale_net_result_leaves_the_net_step_wanted`: a net step, the last one left, blocked in `run`. A DB visit clears it, sets `net_wanted` and consumes the queue row. Then the old run applies with `net_mask` 0: `net_wanted` is still 1, `net_next_at` 0, and the net lane runs it again with no new queue row.
+  - `a_net_completion_doesnt_use_up_growth`: a release grows while a net step is pending, and that step finishes before the settled DB visit: `parts_seen` is unchanged, and the visit still clears the `on_growth` steps.
   - `a_rerun_of_a_release_with_no_state_is_remembered`: the same with no `pp_state` row at the claim. A rerun of an id with no release writes nothing.
   - `a_db_visit_leaves_the_net_columns_alone`: `net_attempts = 3`, `net_next_at = 999`; a DB-lane apply keeps both. The net lane's keeps `db_attempts`.
   - `net_wanted_follows_the_mask`: set while a `net_mask` bit is undone, NULL once done or failed, set again when `clear` takes it back.
@@ -689,7 +690,7 @@ impl Db { pub(crate) fn on_writer(&self, shard: usize, work: StageWork) -> anyho
 
   In `writer`: keep a `VecDeque<StageJob>`, and any `Stage` taken from the channel goes there, including while gathering a save batch. Wait `Duration::ZERO` instead of `idle` while it is non-empty. After a save's replies are sent, run jobs for at most `STAGE_BUDGET_BUSY`; with no save waiting, for at most `STAGE_BUDGET_IDLE`, then `housekeeping` at least once a second. Each job runs in one `BEGIN IMMEDIATE` transaction and adds to `writer_stage_ns`. When the channel closes, run all that remain. `LOAD.writer_queued` keeps counting saves only.
 
-  In `apply.rs`, for each release inside a savepoint (`savepoint one`; on error `rollback to one`, then record the failure as `Retry` would). `Applied` carries `release_id`, `claimed_due: Option<i64>`, `claimed_gen: i64` (the `rerun_gen` read with the row, 0 with no row), `set_done`, `set_failed`, `clear`, `rename_clears`, `net_mask`, `db_mask`, `writes` and `name`, each tagged with the `StepMask` of the step that made it, `db_attempts`, `net_attempts`, `net_next_at` (each `Option`: None leaves the column), `parts_seen`, `error`, `queue_at: Option<i64>`, `no_state: bool`.
+  In `apply.rs`, for each release inside a savepoint (`savepoint one`; on error `rollback to one`, then record the failure as `Retry` would). `Applied` carries `release_id`, `claimed_due: Option<i64>`, `claimed_gen: i64` (the `rerun_gen` read with the row, 0 with no row), `set_done`, `set_failed`, `clear`, `rename_clears`, `net_mask`, `db_mask`, `writes` and `name`, each tagged with the `StepMask` of the step that made it, `db_attempts`, `net_attempts`, `net_next_at`, `parts_seen` (each `Option`: None leaves the column; the net lane passes None for `parts_seen`), `error`, `queue_at: Option<i64>`, `no_state: bool`.
 
 ```sql
 select display_name, coalesce(name_source, 0) from releases where id = ?1;   -- none: skip this release
@@ -708,7 +709,7 @@ update releases set display_name = coalesce(?2, display_name), is_obfuscated = c
 insert into pp_state (release_id, done, failed, net_wanted, db_attempts, net_attempts, net_next_at, parts_seen, last_error,
                       rerun_gen, rerun_mask)
 values (?1, ?2 & ~?4, ?3 & ~?4, case when (?5 & ~(?2 & ~?4) & ~(?3 & ~?4)) != 0 then 1 end,
-        coalesce(?6, 0), coalesce(?7, 0), coalesce(?8, 0), ?9, ?10, ?4 != 0, ?4)
+        coalesce(?6, 0), coalesce(?7, 0), coalesce(?8, 0), coalesce(?9, 0), ?10, ?4 != 0, ?4)
 on conflict(release_id) do update set
     done = (done | ?2) & ~?4,
     failed = (failed | ?3) & ~?4,
@@ -716,7 +717,7 @@ on conflict(release_id) do update set
     db_attempts = coalesce(?6, db_attempts),
     net_attempts = coalesce(?7, net_attempts),
     net_next_at = coalesce(?8, net_next_at),
-    parts_seen = ?9,
+    parts_seen = coalesce(?9, parts_seen),   -- the DB lane's alone: it's what clears on_growth steps
     last_error = ?10,
     rerun_gen = rerun_gen + (?4 != 0),
     rerun_mask = rerun_mask | ?4;

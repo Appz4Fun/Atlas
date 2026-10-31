@@ -203,6 +203,7 @@ fn agent(base: &str) -> ureq::Agent {
     let mut b = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(15)))
         .http_status_as_error(false)
+        .max_redirects(0) // a reply's Location is untrusted: it could aim at a local service, or carry TMDB's key elsewhere
         .user_agent(concat!("atlas/", env!("CARGO_PKG_VERSION")));
     // a test's loopback server must not go through a proxy from the environment
     if base.starts_with("http://127.0.0.1") { b = b.proxy(None); }
@@ -210,7 +211,7 @@ fn agent(base: &str) -> ureq::Agent {
 }
 ```
 
-A response body is read with `.body_mut().with_config().limit(2 << 20).read_json::<Value>()`. A URL is never logged, because TMDB's key is in it. Log the provider and the status.
+A response body is read with `.body_mut().with_config().limit(2 << 20).read_json::<Value>()`. A provider's reply is untrusted: a title or alias over 255 bytes is no candidate, so nothing longer reaches `found_title`, and an array past 1,000 entries is cut there. `atlas.media.db` grows by one bounded row per title, so it needs no quota. A URL is never logged, because TMDB's key is in it. Log the provider and the status.
 
 | Status | Meaning | Effect |
 |---|---|---|
@@ -753,6 +754,7 @@ Fixtures, hand-written, `tvmaze_show.json`:
   - `bad_json_is_bad_not_a_miss`: `Trouble::Bad`.
   - `the_bucket_paces_requests`: `requests_per_minute` 120, 5 calls take at least 1.9 s, which only a broken bucket can miss. A bucket holds at most 1 token, so no burst passes the published limit.
   - `a_two_request_lookup_finishes_at_the_lowest_rate`: TMDB at 1 per minute, a bucket clock moved by hand. The search, `Paused`, then after a refill only `/external_ids`, and `Found`: 2 requests in all, with no second search. The same for TVMaze's `/singlesearch/shows` 404 followed by `/search/shows`.
+  - `an_oversized_name_is_no_candidate`: a TVMaze show whose `name` is 1 MB, with a short exact alias in `_embedded.akas`: not chosen, and `found_title` is never over 255 bytes. `a_redirect_isnt_followed`: a 302 to a second loopback server is `Bad`, and that server saw nothing.
   - `no_token_within_two_seconds_gives_paused`: 1 per minute, the second call returns `Paused`, in under 5 s, a bound no loaded machine should reach. In `src/media/http.rs`, `the_bucket_refills_by_the_clock`: `Bucket::wait_for(now: Instant) -> Duration` takes its clock as an argument, so its table runs with no sleep.
   - `a_huge_body_is_refused`: 3 MiB gives `Bad`.
 - [ ] **Implement** section 4.
