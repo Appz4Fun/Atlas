@@ -401,7 +401,9 @@ pub enum Trouble { Paused(i64), BadKey(i64), Bad(String) }
 pub trait Provider: Send + Sync {
     fn bit(&self) -> u8;
     fn asks(&self, kind: Kind) -> bool;
-    /// Waits at most 2 s for a token, then Paused(now + 1).
+    /// Waits at most 2 s for a token, then Paused(now + 1). A lookup of two requests keeps what its first
+    /// found when the second can't go yet, per query, so the next call for it goes on from there and a low
+    /// rate still finishes (at most 1,024 queries, the oldest forgotten; a rebuild forgets them all).
     fn find(&self, q: &TitleQuery<'_>) -> Result<Answer, Trouble>;
 }
 
@@ -750,6 +752,7 @@ Fixtures, hand-written, `tvmaze_show.json`:
   - `a_connection_refused_pauses`: a closed port.
   - `bad_json_is_bad_not_a_miss`: `Trouble::Bad`.
   - `the_bucket_paces_requests`: `requests_per_minute` 120, 5 calls take at least 1.9 s, which only a broken bucket can miss. A bucket holds at most 1 token, so no burst passes the published limit.
+  - `a_two_request_lookup_finishes_at_the_lowest_rate`: TMDB at 1 per minute, a bucket clock moved by hand. The search, `Paused`, then after a refill only `/external_ids`, and `Found`: 2 requests in all, with no second search. The same for TVMaze's `/singlesearch/shows` 404 followed by `/search/shows`.
   - `no_token_within_two_seconds_gives_paused`: 1 per minute, the second call returns `Paused`, in under 5 s, a bound no loaded machine should reach. In `src/media/http.rs`, `the_bucket_refills_by_the_clock`: `Bucket::wait_for(now: Instant) -> Duration` takes its clock as an argument, so its table runs with no sleep.
   - `a_huge_body_is_refused`: 3 MiB gives `Bad`.
 - [ ] **Implement** section 4.

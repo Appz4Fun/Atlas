@@ -407,7 +407,7 @@ pub fn find(conn: &Connection, e: &Evidence<'_>) -> rusqlite::Result<Option<Matc
         match unique(folded) { Ok(Some(t)) => return Ok(Some(Match { title: t, kind: Kind::Normalized })), Ok(None) => {} Err(()) => return Ok(None) }
     }
     // inner and posted files: all of them have to point at one title
-    let many_episodes = distinct_episodes(e.inner.iter().copied().map(basename)) >= 2;
+    let many_episodes = distinct_episodes(e.inner.iter().chain(e.files.iter()).copied().map(basename)) >= 2;
     let (mut found, mut tried) = (Vec::new(), HashSet::new());
     for path in e.inner.iter().chain(e.files.iter()).copied() {
         if tried.len() >= MAX_NAMES { break; }
@@ -761,6 +761,7 @@ Titles: `Alpha.Beta.Gamma.2024.1080p.WEB-DL.H.264-TESTGRP` as T, and `Second.Tit
 | `extra_text_after_the_title` | name `T.Extra` | none |
 | `missing_the_group` | name T without `-TESTGRP` | none |
 | `many_episodes_name_nothing` | inner `Show.Name.S02E03…` and `…S02E04…`, with the first a title | none |
+| `posted_files_of_many_episodes_name_nothing` | no inner files, a junk name, posted `Show.Name.S02E03…` and `…S02E04…`, with the first a title and sizes within a factor of 3 | none |
 | `one_episode_can` | inner `Show.Name.S02E03…` only | InnerFile |
 | `a_short_title_needs_exact` | title `Foo.Bar-GRP`, name `foo_bar-grp` | none. Name `foo.bar-grp`: Exact |
 | `too_many_rows_is_no_match` | 17 titles forced under one key | none |

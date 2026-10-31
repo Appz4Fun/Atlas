@@ -129,7 +129,7 @@ Stated plainly, for every later part:
 
 It's never updated afterward (Part 3's rule 4). It never holds upstream's key text: no `yEnc`, no quotes, no counters unless the file name had them. It's always some file's parsed name, which is what every row holds today. So `Title.mkv` is possible, as it is today, and `Title` beats it when both arrive in one slice.
 
-**The collision suffix, exactly:** a space, `[`, exactly 8 ASCII digits, `]`, at the end of the name, so the regex ` \[\d{8}\]$`. The digits are `key.hash(collection).rem_euclid(100_000_000)`, zero-padded. Nothing else in Atlas writes that form. `a [4]`, from `parse_subject`, has fewer digits, and a name like `Movie.Name [2019]` has 4.
+**The collision suffix, exactly:** a space, `[`, exactly 8 ASCII digits, `]`, at the end of the name, so the regex ` \[\d{8}\]$`. The digits are `key.hash(collection).rem_euclid(100_000_000)`, zero-padded, or the next free number when another row has that name. Nothing else in Atlas writes that form. `a [4]`, from `parse_subject`, has fewer digits, and a name like `Movie.Name [2019]` has 4.
 
 What that means for each consumer:
 
@@ -686,11 +686,14 @@ fn collection_row(tx: &Connection, key: &IdKey, collection: &str, release: &Rele
     if let Some(name) = known {
         return Ok(CollectionRow { key: hash, name, known: true });
     }
-    let taken = tx
-        .prepare_cached("select 1 from releases where name = ? and group_name = ?")?
-        .exists(params![release.name, release.group])?;
-    let name =
-        if taken { format!("{} [{:08}]", release.name, hash.rem_euclid(100_000_000)) } else { release.name.clone() };
+    let mut taken = tx.prepare_cached("select 1 from releases where name = ? and group_name = ?")?;
+    let mut name = release.name.clone();
+    // the next number when 8 digits of two hashes meet: the upsert would merge the posts
+    let mut digits = hash.rem_euclid(100_000_000);
+    while taken.exists(params![name, release.group])? {
+        name = format!("{} [{digits:08}]", release.name);
+        digits = (digits + 1) % 100_000_000;
+    }
     Ok(CollectionRow { key: hash, name, known: false })
 }
 ```
@@ -1434,6 +1437,18 @@ fn a_name_another_release_has_gets_a_part_of_the_hash() {
 }
 
 #[test]
+fn a_suffix_another_release_has_moves_to_the_next_number() {
+    let (_dir, main, conn) = fresh_shard_db();
+    save(&main, &[in_collection("one", "same.jpg", "same.jpg", "<a@x>", "p")]).unwrap();
+    let digits = IdKey::of(&conn).unwrap().hash("two").rem_euclid(100_000_000);
+    save(&main, &[in_collection("other", &format!("same.jpg [{digits:08}]"), "x.jpg", "<b@x>", "q")]).unwrap();
+    save(&main, &[in_collection("two", "same.jpg", "same.jpg", "<c@x>", "r")]).unwrap();
+    let rows = rows_of(&conn);
+    assert_eq!(rows.len(), 3, "the posts stay apart: {rows:?}");
+    assert_eq!(rows[2].0, format!("same.jpg [{:08}]", (digits + 1) % 100_000_000));
+}
+
+#[test]
 fn a_collection_whose_release_is_gone_gets_a_new_one() {
     let (_dir, main, conn) = fresh_shard_db();
     save(&main, &[in_collection("k", "a.jpg", "a.jpg", "<a@x>", "p")]).unwrap();
@@ -1913,7 +1928,7 @@ Measured on the user's Mac at `nice 15`, release profile without LTO, on a scrat
 - **Server error:** not involved. A failed slice saves nothing and is redone.
 - **Crash partway through a save:** the mapping and the row commit in one transaction. A `collections` row can't exist without its release from a crash.
 - **Re-run or second server:** the key is the same, the row is found, and articles dedupe by message-id, within a file and across a multi-file release (`add_segment`). Re-reading a range from before the upgrade routes into the old rows.
-- **Hash collision:** 64-bit keyed SipHash. Across 100M collections in one shard, about 3 in 10,000 of one collision ever, and the two posts would share a row with separate `files`. The key is secret, so a post can't aim for one. If 8 digits of a suffix collide too, the two posts share a row the same way.
+- **Hash collision:** 64-bit keyed SipHash. Across 100M collections in one shard, about 3 in 10,000 of one collision ever, and the two posts would share a row with separate `files`. The key is secret, so a post can't aim for one. When only 8 digits of a suffix collide, the second post takes the next free number and they stay apart.
 - **`meta.grouping_from` missing:** treated as 1, so no probes. It's missing until the first indexer of this build runs. A release an AI search saves before that falls below the mark once it's set, and counts as an old row, which is harmless: a later file of it goes in by name, as today. If `start_grouping` fails, the indexer warns and goes on without the probes, and the writer will be hitting the same fault.
 - **Downgrade to an older build:** it ignores `collections`, and its compaction would drop the table's rows. Those posts' next articles would then upsert by name. Nothing crashes.
 

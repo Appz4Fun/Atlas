@@ -275,7 +275,8 @@ pub async fn body_prefix(&mut self, message_id: &str, max_bytes: usize) -> Resul
     let (mut lines, mut read) = (Vec::new(), 0usize);
     let whole = self
         .each_line_capped(&message, max_bytes, |l| {
-            read += l.len();
+            // what came over the wire: empty lines must count, or they never reach the cap. So at most `max_bytes / 2` lines
+            read += l.len() + 2;
             lines.push(l);
             read < max_bytes
         })
@@ -286,7 +287,7 @@ pub async fn body_prefix(&mut self, message_id: &str, max_bytes: usize) -> Resul
 
 - `Pool::background_prefix(&self, message_id: &str, max_bytes: usize) -> Result<BackgroundBody>`: `background_body` with `body_prefix` in place of `body_capped`, sharing one private function. It never answers `TooBig`: a cut body is `Body(prefix)`. When `whole` is false, skip `lease.check`, so the lease stays busy and the connection is thrown away, as at `src/nntp.rs:1548-1550`.
 - `StepCtx::fetch_prefix(&mut self, wanted: &BodyRequest) -> Result<BodyResult, StepError>`: every check `fetch_bodies` makes, in its order, one body against the budget and the per-release count. `wanted.max_bytes` is the prefix size. `Got::Body` may hold only the article's start.
-- `max_bytes` is checked at line ends, and within a line by `read_line_capped`: a line past the cap comes back as `None`, which ends the read with `whole` false, as Part 3's `body_capped` does. Real posts have lines of 128–256 bytes. The mock's `yenc_body` sends one line and reads whole, so tests use a new `yenc_lined(name, data)` in `tests/common/mod.rs`: `=ybegin`, `yenc_encode` of each 100 bytes as its own line, `=yend`.
+- `max_bytes` is checked at line ends, counting each line's terminator so an article of empty lines stops at it too (`many_empty_lines_stop_a_prefix`: 1,000,000 empty lines and a 64 KiB cap: `whole` false, at most 32,768 lines kept, the connection dropped), and within a line by `read_line_capped`: a line past the cap comes back as `None`, which ends the read with `whole` false, as Part 3's `body_capped` does. Real posts have lines of 128–256 bytes. The mock's `yenc_body` sends one line and reads whole, so tests use a new `yenc_lined(name, data)` in `tests/common/mod.rs`: `=ybegin`, `yenc_encode` of each 100 bytes as its own line, `=yend`.
 
 ### Naming (`names.rs`)
 
