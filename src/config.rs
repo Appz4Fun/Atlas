@@ -152,6 +152,49 @@ pub struct Config {
     /// None = DEFAULT_MAX_UNSAVED_HEADERS
     pub max_unsaved_headers: Option<u64>,
     pub postprocess: PostprocessConfig,
+    pub archive: ArchiveConfig,
+}
+
+/// The `archive` object of config.json, see the README.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArchiveConfig {
+    pub enabled: bool,
+    pub max_bodies_per_release: i64,
+    pub probe_files: i64,
+    pub probes_per_minute: i64,
+    pub max_names_mb: i64,
+}
+
+impl Default for ArchiveConfig {
+    fn default() -> Self {
+        ArchiveConfig {
+            enabled: true,
+            max_bodies_per_release: 4,
+            probe_files: 2,
+            probes_per_minute: 60,
+            max_names_mb: 16_384,
+        }
+    }
+}
+
+impl ArchiveConfig {
+    fn from_value(v: Option<&Value>) -> ArchiveConfig {
+        let mut c = ArchiveConfig::default();
+        let Some(v) = v else { return c };
+        if let Some(b) = v.get("enabled").and_then(as_bool) {
+            c.enabled = b;
+        }
+        let int = |key: &str, min: i64, max: i64, slot: &mut i64| {
+            if let Some(n) = v.get(key).and_then(as_int) {
+                *slot = n.clamp(min, max);
+            }
+        };
+        int("max_bodies_per_release", 1, 16, &mut c.max_bodies_per_release);
+        int("probe_files", 0, 8, &mut c.probe_files);
+        int("probes_per_minute", 12, 600, &mut c.probes_per_minute);
+        int("max_names_mb", 64, i64::MAX, &mut c.max_names_mb);
+        c
+    }
 }
 
 /// A group's own floors, taken over the global ones when higher.
@@ -278,6 +321,7 @@ impl Default for Config {
             auto_run_compact: false,
             max_unsaved_headers: None,
             postprocess: PostprocessConfig::default(),
+            archive: ArchiveConfig::default(),
         }
     }
 }
@@ -421,6 +465,7 @@ impl Config {
                 .filter(|n| *n > 0),
             auto_run_compact: v.get("auto_run_compact").and_then(Value::as_bool).unwrap_or(false),
             postprocess: PostprocessConfig::from_value(v.get("postprocess")),
+            archive: ArchiveConfig::from_value(v.get("archive")),
             max_unsaved_headers: v
                 .get("max_unsaved_headers")
                 .and_then(as_int)

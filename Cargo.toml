@@ -20,6 +20,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 flate2 = "1"
 getrandom = "0.3"
 indexmap = "2"
+lzma-rs = "0.3"
 ratatui = "0.30"
 regex = "1"
 rusqlite = { version = "0.40", features = ["bundled", "functions", "hooks"] }

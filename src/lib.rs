@@ -3,6 +3,7 @@
 pub mod ai;
 pub mod api;
 pub mod app;
+pub mod archive;
 pub mod atomic;
 pub mod bg_indexer;
 pub mod blob;
