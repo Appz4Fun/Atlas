@@ -7,6 +7,7 @@ pub mod atomic;
 pub mod bg_indexer;
 pub mod blob;
 pub mod chunks;
+pub mod collections;
 pub mod compact;
 pub mod config;
 pub mod convert;
