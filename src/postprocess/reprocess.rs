@@ -95,6 +95,11 @@ fn dry_run(main: &std::path::Path, o: &Options, per_second: i64) -> anyhow::Resu
     for (shard, group) in targets(o) {
         let conn = db::open_shard(&store::shard_path(main, shard))?;
         conn.execute_batch("pragma query_only = on")?;
+        // a shard no build of the stage has opened yet has nothing to run again
+        let has_state: bool = conn.prepare("select 1 from sqlite_master where type = 'table' and name = 'pp_state'")?.exists([])?;
+        if !has_state {
+            continue;
+        }
         let n: i64 = conn.query_row(
             "select count(*) from pp_state s join releases r on r.id = s.release_id
              where (s.done & ?1 != 0 or (?3 and s.failed != 0)) and (?2 is null or r.group_name = ?2)",
@@ -115,6 +120,8 @@ fn apply_all(main: &std::path::Path, o: &Options, now: i64) -> anyhow::Result<()
     let _writing = compact::hold_off_compaction(main)?;
     for (shard, group) in targets(o) {
         let mut conn = db::open_shard(&store::shard_path(main, shard))?;
+        // this can be the first command after an upgrade
+        store::migrate_shard(&conn)?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         if apply(&tx, o.mask, group, now)? {
             println!("shard {shard}: queued");

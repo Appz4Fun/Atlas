@@ -112,9 +112,13 @@ fn insensitive(p: &str) -> Regex {
     RegexBuilder::new(p).case_insensitive(true).build().unwrap()
 }
 
+/// `EXTENSIONS` takes a number off a `.jpg` only: a file numbered within a post
+/// can be any image `numbered` goes by
+const NUMBERED_IMAGE: &str = r#"\d{1,5} ?\.(?:jpeg|png|gif|bmp|webp|tiff?)"?"#;
+
 /// upstream's generic cleaner, for files numbered within a post (`numbered`)
-static GENERIC_NUMBERED: LazyLock<[Regex; 5]> =
-    LazyLock::new(|| [FILE_SIZES, MARKERS, NUMBERING, EXTENSIONS, LEFTOVER_EXTENSION].map(insensitive));
+static GENERIC_NUMBERED: LazyLock<[Regex; 6]> =
+    LazyLock::new(|| [FILE_SIZES, MARKERS, NUMBERING, EXTENSIONS, NUMBERED_IMAGE, LEFTOVER_EXTENSION].map(insensitive));
 /// the same with a post's own digits left in
 static GENERIC: LazyLock<[Regex; 5]> =
     LazyLock::new(|| [FILE_SIZES, MARKERS, NUMBERING, EXTENSIONS_KEEPING_DIGITS, LEFTOVER_EXTENSION].map(insensitive));
@@ -293,12 +297,32 @@ impl<'g> Collections<'g> {
     }
 }
 
+/// A base's file total when its counter isnt the `[n/m]` that `parse_subject` reads.
+/// With one that left no total, `remap_bracket_parts` took it for the parts of one file.
+pub(crate) fn unread_file_total(base: &str) -> Option<i64> {
+    let c = COUNTER_RE.captures(base)?;
+    if c.get(0)?.as_str().starts_with('[') {
+        return None;
+    }
+    c[2].parse().ok()
+}
+
 /// Bucket a slice's articles of `group` into releases by their collection,
 /// or their parsed name when they have none (`Collections::of`), keeping
 /// first-seen order.
 pub fn group_articles(group: &str, articles: Vec<Article>) -> IndexMap<String, Release> {
     let mut collections = Collections::new(group);
-    group_articles_by(articles, |article, parsed| collections.of(article, parsed))
+    let mut releases = group_articles_by(articles, |article, parsed| collections.of(article, parsed));
+    // `parse_subject` reads `[n/m]` only: from a `(1 of 50)` it can't say the post has 50
+    // files, and the release would pass for complete with the first one
+    for release in releases.values_mut().filter(|r| r.collection.is_some()) {
+        for article in &mut release.articles {
+            if article.file_total.is_none() {
+                article.file_total = unread_file_total(&subject_base(&article.subject));
+            }
+        }
+    }
+    releases
 }
 
 #[cfg(test)]
@@ -704,5 +728,26 @@ mod tests {
         assert_eq!(key(G, 100, "p"), key(G, 99_000_000, "p"), "article numbers arent in it");
         assert_eq!(key(G, 100, "p"), key(G, 100, "q"), "a long name doesnt need the poster");
         assert_ne!(key(G, 100, "p"), key("alt.binaries.other", 100, "p"), "a collection doesnt cross groups");
+    }
+
+    #[test]
+    fn numbered_images_of_any_kind_are_one_release() {
+        for ext in ["jpg", "jpeg", "png", "gif", "bmp", "webp", "tif", "tiff", "PNG"] {
+            let got = group_articles(G, numbered_set(50, |n| format!(r#"[{n:02}/50] "IMG_{n:04}.{ext}" yEnc (1/1)"#)));
+            assert_eq!(got.len(), 1, "{ext}: {:?}", got.keys());
+        }
+    }
+
+    #[test]
+    fn a_counter_parse_subject_cant_read_still_says_how_many_files() {
+        let got = group_articles(G, vec![art(r#"(1 of 50) "IMG_0001.jpg" yEnc (1/1)"#, "p")]);
+        let release = got.values().next().unwrap();
+        assert_eq!(release.articles[0].file_total, Some(50));
+        assert!(!is_complete(&release.articles), "one of 50 files");
+        // a counter it can read is unchanged, and so is a post with no collection
+        let got = group_articles(G, vec![art(r#"[1/2] "Some.Long.Release.Name.mkv" yEnc (1/1)"#, "p")]);
+        assert_eq!(got.values().next().unwrap().articles[0].file_total, Some(2));
+        let got = group_articles(G, vec![art(r#""IMG_0001.jpg" yEnc (1/1)"#, "p")]);
+        assert_eq!(got.values().next().unwrap().articles[0].file_total, None);
     }
 }

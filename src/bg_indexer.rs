@@ -284,7 +284,8 @@ struct Scheduler {
     blocked: Mutex<Vec<String>>,
     /// the processing stage, when it's on
     stage: OnceLock<Arc<Stage>>,
-    stage_on: bool,
+    /// what the stage was started with: its threads and body permits are fixed then
+    stage_shape: StageShape,
     /// (server, groups at once) for every indexing server
     plan: Vec<(usize, usize)>,
     workers: usize,
@@ -632,12 +633,20 @@ async fn worker(sched: Arc<Scheduler>, server: usize, db: Db) {
     }
 }
 
+/// on, database threads, net threads
+type StageShape = (bool, usize, usize);
+
+fn stage_shape(config: &Config) -> StageShape {
+    let p = &config.postprocess;
+    (p.enabled, p.workers, p.body_connections)
+}
+
 /// a config the running indexer cant take on as it is
 fn needs_rebuild(sched: &Scheduler, config: &Config, servers: &[UsenetServer]) -> bool {
     usable_servers(config) != servers
         || plan_workers(config) != sched.plan
         || config.max_unsaved_headers() != sched.ctx.pool.max_unsaved()
-        || config.postprocess.enabled != sched.stage_on
+        || stage_shape(config) != sched.stage_shape
 }
 
 /// Re-read config.json while indexing: new groups / mode / batch settings /
@@ -759,7 +768,7 @@ async fn run_servers(
         groups: RwLock::new(groups),
         blocked: Mutex::new(config.blocked_groups()),
         stage: OnceLock::new(),
-        stage_on: config.postprocess.enabled,
+        stage_shape: stage_shape(config),
         plan: plan.clone(),
         workers,
         next: Mutex::new(HashMap::new()),
@@ -1135,7 +1144,7 @@ mod tests {
             groups: RwLock::new(groups),
             blocked: Mutex::new(Vec::new()),
             stage: OnceLock::new(),
-            stage_on: true,
+            stage_shape: stage_shape(&Config::default()),
             plan: vec![],
             workers: 2,
             next: Default::default(),
@@ -1243,6 +1252,12 @@ mod tests {
         assert!(plan_same);
         assert!(!needs_rebuild(&sched, &config, &servers));
         config.postprocess.enabled = false;
+        assert!(needs_rebuild(&sched, &config, &servers));
+        config.postprocess.enabled = true;
+        config.postprocess.workers += 1;
+        assert!(needs_rebuild(&sched, &config, &servers), "its thread counts are fixed when it starts");
+        config.postprocess.workers -= 1;
+        config.postprocess.body_connections += 1;
         assert!(needs_rebuild(&sched, &config, &servers));
     }
 }

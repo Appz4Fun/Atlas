@@ -207,3 +207,19 @@ fn the_dry_run_counts_failed_releases() {
     let text = String::from_utf8_lossy(&run(dir.path(), &["--failed", "--group", STAGE_GROUP]).stdout).into_owned();
     assert!(text.contains("1 releases"), "{text}");
 }
+
+#[test]
+fn it_can_be_the_first_command_after_an_upgrade() {
+    let (dir, main) = fixture();
+    for path in store::shard_paths(&main) {
+        let conn = db::open_shard(&path).unwrap();
+        for table in atlas::postprocess::schema::SHARD_TABLES {
+            conn.execute_batch(&format!("drop trigger if exists gc_{0}; drop table {0};", table.name)).unwrap();
+        }
+    }
+    let dry = run(dir.path(), &[]);
+    assert!(dry.status.success(), "{}", String::from_utf8_lossy(&dry.stdout));
+    assert!(String::from_utf8_lossy(&dry.stdout).contains("0 releases"));
+    assert!(run(dir.path(), &["--apply"]).status.success());
+    assert_eq!(walks(&main), store::SHARDS as i64);
+}

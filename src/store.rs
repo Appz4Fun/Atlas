@@ -1604,18 +1604,27 @@ fn split_old_rows<'a>(tx: &Connection, grouping_from: i64, release: &'a Release)
         size: articles.iter().map(|a| a.bytes).sum(),
         is_obfuscated: crate::parser::is_obfuscated(name),
         collection,
+        // its own, soo the next slice's probe still finds the row
+        poster: articles.first().map_or_else(|| release.poster.clone(), |a| a.author.clone()),
         articles,
         display_name: release.display_name.clone(),
         complete: false,
         group: release.group.clone(),
-        poster: release.poster.clone(),
         date: release.date.clone(),
     };
     let mut rest = Vec::new();
     let mut in_old: IndexMap<&str, Vec<Article>> = IndexMap::new();
     for a in &release.articles {
         match a.release_name.as_deref().filter(|name| known.get(name).copied().unwrap_or(false)) {
-            Some(name) => in_old.entry(name).or_default().push(a.clone()),
+            Some(name) => {
+                // an old row holds one file: a total read from the whole post's counter
+                // would leave it incomplete for good
+                let mut a = a.clone();
+                if crate::collections::unread_file_total(&crate::collections::subject_base(&a.subject)).is_some() {
+                    a.file_total = None;
+                }
+                in_old.entry(name).or_default().push(a);
+            }
             None => rest.push(a.clone()),
         }
     }
@@ -3632,6 +3641,7 @@ mod tests {
         assert_eq!(conn.query_row("select count(*) from collections", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
     }
 
+<<<<<<< HEAD
     /// another writer on the shard (purge, AI search, the stage's commands) makes a save wait,
     /// not fail: a deferred transaction that read first never gets the busy handler
     #[test]
@@ -3824,5 +3834,46 @@ mod tests {
         assert_eq!((files[0].filename.as_str(), files[0].parts_seen, files[0].sealed), ("a.rar", 3, true));
         assert_eq!((files[1].filename.as_str(), files[1].parts_seen, files[1].sealed), ("b.rar", 1, false));
         assert_eq!(release_files(&conn, id, 1).unwrap().len(), 1);
+=======
+    #[test]
+    fn old_rows_keep_their_own_posters() {
+        let (_dir, main, conn) = fresh_shard_db();
+        let mut a = in_collection("unused", "a.mkv", "a.mkv", "<a@x>", "p");
+        a.collection = None;
+        let mut b = in_collection("unused", "b.nfo", "b.nfo", "<b@x>", "q");
+        b.collection = None;
+        save(&main, &[a, b]).unwrap();
+        start_grouping(&main).unwrap();
+
+        // one collection holding both, its poster the first article's
+        let mut both = in_collection("k", "a.mkv", "a.mkv", "<a2@x>", "p");
+        both.articles.extend(in_collection("k", "b.nfo", "b.nfo", "<b2@x>", "q").articles);
+        save(&main, &[both]).unwrap();
+        let poster = |name: &str| -> String {
+            conn.query_row("select poster from releases where name = ?", [name], |r| r.get(0)).unwrap()
+        };
+        assert_eq!((poster("a.mkv"), poster("b.nfo")), ("p".to_string(), "q".to_string()));
+        // the next slice of the second file still finds its row
+        save(&main, &[in_collection("k", "b.nfo", "b.nfo", "<b3@x>", "q")]).unwrap();
+        assert_eq!(rows_of(&conn).len(), 2);
+    }
+
+    #[test]
+    fn an_old_row_doesnt_take_a_recovered_total() {
+        let (_dir, main, conn) = fresh_shard_db();
+        let mut old = in_collection("unused", "a.mkv", "a.mkv", "<a@x>", "p");
+        old.collection = None;
+        save(&main, &[old]).unwrap();
+        start_grouping(&main).unwrap();
+        let mut late = in_collection("k", "a.mkv", "a.mkv", "<a2@x>", "p");
+        late.articles[0].subject = "(1 of 50) \"a.mkv\" yEnc (2/2)".into();
+        late.articles[0].part = Some(2);
+        late.articles[0].total_parts = Some(2);
+        late.articles[0].file_total = Some(50);
+        save(&main, &[late]).unwrap();
+        let total: Option<i64> =
+            conn.query_row("select file_total from releases where name = 'a.mkv'", [], |r| r.get(0)).unwrap();
+        assert_eq!(total, None);
+>>>>>>> appz4fun/rust
     }
 }
