@@ -97,13 +97,13 @@ fn dry_run(main: &std::path::Path, o: &Options, per_second: i64) -> anyhow::Resu
         conn.execute_batch("pragma query_only = on")?;
         let n: i64 = conn.query_row(
             "select count(*) from pp_state s join releases r on r.id = s.release_id
-             where s.done & ?1 != 0 and (?2 is null or r.group_name = ?2)",
-            params![o.mask, group],
+             where (s.done & ?1 != 0 or (?3 and s.failed != 0)) and (?2 is null or r.group_name = ?2)",
+            params![o.mask, group, o.failed],
             |r| r.get(0),
         )?;
         total += n;
     }
-    println!("{total} releases have these steps done and would run them again");
+    println!("{total} releases would run these steps again");
     if per_second > 0 {
         println!("about {} s to walk them at backlog_per_second", total / per_second);
     }

@@ -36,7 +36,8 @@ pub struct Stats {
     pub queue_due: AtomicI64,
     pub net_wanted: AtomicI64,
     pub failed: AtomicI64,
-    pub walk_left: AtomicI64,
+    /// how far the walks have come, and how far they go, in release ids
+    pub walk_done: AtomicI64,
     pub walk_total: AtomicI64,
     pub errors: AtomicU64,
 }
@@ -61,7 +62,7 @@ impl Stats {
             "queue_due": i(&self.queue_due),
             "net_wanted": i(&self.net_wanted),
             "failed": i(&self.failed),
-            "walk": {"left": i(&self.walk_left), "total": i(&self.walk_total), "rows": n(&self.rows_walked)},
+            "walk": {"done": i(&self.walk_done), "total": i(&self.walk_total), "rows": n(&self.rows_walked)},
             "steps_done": n(&self.steps_done),
             "matched": n(&self.matched),
             "unmatched": n(&self.unmatched),

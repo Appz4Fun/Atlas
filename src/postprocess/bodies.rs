@@ -135,15 +135,27 @@ impl BodyFetcher {
             return Ok(Got::Refused(why));
         }
         self.wait_for_token(deadline)?;
+        let Some(left) = deadline.checked_duration_since(Instant::now()).filter(|d| !d.is_zero()) else {
+            return Err(StepError::OutOfBudget);
+        };
         *used += 1;
         let max_bytes = {
             let cap = self.config.read().unwrap().body_max_bytes as usize;
             request.max_bytes.map_or(cap, |m| m.min(cap))
         };
+        // the run's deadline holds for the whole read: a slow server's timeouts are per read
         let fetched = self.handle.block_on(unless_stopped(&self.stop, async {
-            let _permit = self.in_flight.acquire().await.expect("semaphore closed");
-            self.pool.background_body(&request.message_id, max_bytes).await
+            tokio::time::timeout(left, async {
+                let _permit = self.in_flight.acquire().await.expect("semaphore closed");
+                self.pool.background_body(&request.message_id, max_bytes).await
+            })
+            .await
         }));
+        let fetched = match fetched {
+            Some(Err(_elapsed)) => return Err(StepError::Transient("a body took past the run's deadline".into())),
+            Some(Ok(result)) => Some(result),
+            None => None,
+        };
         match fetched {
             None => Err(StepError::Stopped),
             Some(Ok(BackgroundBody::Body(body))) => {
@@ -172,5 +184,38 @@ mod tests {
         assert!(b.take(1.0, 1.0, start).unwrap() > Duration::from_millis(900));
         assert_eq!(b.take(1.0, 1.0, start + Duration::from_secs(2)), Some(Duration::ZERO));
         assert_eq!(b.take(0.0, 1.0, start), None, "no budget");
+    }
+
+    fn fetcher(port: u16, runtime: &tokio::runtime::Runtime) -> BodyFetcher {
+        let mut server = crate::config::UsenetServer::new("127.0.0.1", "u", "p", port);
+        server.ssl = Some(false);
+        let config = PostprocessConfig { body_fetches_per_minute: 6000, body_min_size_bytes: 0, ..Default::default() };
+        BodyFetcher::new(
+            Arc::new(Pool::new(&[server])),
+            runtime.handle().clone(),
+            Arc::new(AtomicBool::new(false)),
+            config,
+            Arc::new(Stats::default()),
+        )
+    }
+
+    #[test]
+    fn a_body_stops_at_the_runs_deadline() {
+        // a server that takes the connection and says nothing
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
+        let f = fetcher(port, &runtime);
+        let release = ReleaseInfo { group: "alt.binaries.t".into(), size: 10, ..Default::default() };
+        let ask = BodyRequest { message_id: "<a@x>".into(), file: "a.bin".into(), max_bytes: None };
+        let mut used = 0;
+        let start = Instant::now();
+        let got = f.fetch(&release, &ask, &mut used, start + Duration::from_millis(300));
+        assert!(matches!(got, Err(StepError::Transient(_))), "{got:?}");
+        assert!(start.elapsed() < Duration::from_secs(5), "{:?}", start.elapsed());
+        // nothing is started once it has passed
+        let got = f.fetch(&release, &ask, &mut used, Instant::now());
+        assert!(matches!(got, Err(StepError::OutOfBudget)), "{got:?}");
+        drop(listener);
     }
 }

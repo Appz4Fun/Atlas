@@ -1056,17 +1056,18 @@ fn draw_postprocess(f: &mut Frame, app: &App, area: Rect) {
     ];
     f.render_widget(Paragraph::new(backlog).block(panel("backlog")), a);
 
-    let (left, total) = (p["walk"]["left"].as_i64().unwrap_or(0), p["walk"]["total"].as_i64().unwrap_or(0));
+    let (walked, total) = (p["walk"]["done"].as_i64().unwrap_or(0), p["walk"]["total"].as_i64().unwrap_or(0));
     let per_second = n("backlog_per_second");
-    let walk_done =
-        if total > 0 { format!("{:.1}%", (total - left) as f64 * 100.0 / total as f64) } else { "-".into() };
+    let walk_done = if total > 0 { format!("{:.1}%", walked as f64 * 100.0 / total as f64) } else { "-".into() };
+    // ids run about a shard count apart
+    let rows_left = (total - walked).max(0) / crate::store::SHARDS as i64;
     let walks = vec![
         kv("walk", walk_done),
         kv("rows looked at", count(p["walk"]["rows"].as_i64().unwrap_or(0))),
         kv("rows/s allowed", count(per_second)),
         kv(
             "time left at that",
-            if per_second > 0 && total > 0 { human_time((total - left).max(0) / per_second) } else { "-".into() },
+            if per_second > 0 && total > 0 { human_time(rows_left / per_second) } else { "-".into() },
         ),
     ];
     f.render_widget(Paragraph::new(walks).block(panel("walks")), b);
@@ -1531,7 +1532,7 @@ mod tests {
             page: 0,
             long_graph: false,
             stats: serde_json::json!({
-                "postprocess": {"queue_due": 3, "net_wanted": 1, "failed": 0, "walk": {"left": 5, "total": 10, "rows": 2},
+                "postprocess": {"queue_due": 3, "net_wanted": 1, "failed": 0, "walk": {"done": 5, "total": 20, "rows": 2},
                     "rejected": {"fragment": 2}, "backlog_per_second": 2000},
                 "mode": "backfill", "uptime": 3600, "total_articles": 1_000_000, "rate_bin": 10,
                 "rate": [[now() as i64 / 10 * 10 - 10, 50_000, 0]],
@@ -1575,7 +1576,7 @@ mod tests {
                         && text.contains("complete NZBs     5 (50.0%)")
                 ),
                 3 => assert!(text.contains("news.x") && text.contains("75%")),
-                5 => assert!(text.contains("walk") && text.contains("due now")),
+                5 => assert!(text.contains("walk") && text.contains("due now") && text.contains("25.0%")),
                 _ => {}
             }
         }

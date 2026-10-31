@@ -491,3 +491,20 @@ fn a_walk_stopped_by_a_step_doesnt_pass_the_rows_it_left() {
     assert!(before > stopped_at, "the cursor stays above the row it didnt finish: {before}, {stopped_at}");
     h.stop();
 }
+
+#[test]
+fn a_walk_doesnt_run_a_release_ahead_of_its_retry() {
+    let log = log();
+    let mut h = fresh();
+    walkable(&h, 3);
+    let conn = h.shard();
+    let later = chrono::Utc::now().timestamp() + 900;
+    let waiting = h.id_of("Rel.0001");
+    conn.execute("insert into pp_queue (release_id, due_at) values (?, ?)", rusqlite::params![waiting, later]).unwrap();
+    h.start(vec![TestStep::new(9, "db", 200, Needs::Database, &log).arc()], quick_config());
+    wait_for("the walk ends", || {
+        conn.query_row("select count(*) from pp_walks", [], |r| r.get::<_, i64>(0)).unwrap() == 0
+    });
+    let names: Vec<String> = log.lock().unwrap().iter().map(|(_, n, _)| n.clone()).collect();
+    assert_eq!(names, vec!["Rel.0002".to_string(), "Rel.0000".to_string()], "the one waiting has the queue");
+}

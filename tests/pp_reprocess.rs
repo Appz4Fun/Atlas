@@ -197,3 +197,13 @@ fn a_walks_request_waits_for_a_release_still_settling() {
     wait_for("the step runs again", || runs_of(&log, "db") == 1);
     assert_eq!(h.bits("Rel.One").unwrap().0, bit);
 }
+
+#[test]
+fn the_dry_run_counts_failed_releases() {
+    let (dir, main) = fixture();
+    two_failed_groups(&main);
+    let text = String::from_utf8_lossy(&run(dir.path(), &["--failed"]).stdout).into_owned();
+    assert!(text.contains("2 releases"), "{text}");
+    let text = String::from_utf8_lossy(&run(dir.path(), &["--failed", "--group", STAGE_GROUP]).stdout).into_owned();
+    assert!(text.contains("1 releases"), "{text}");
+}

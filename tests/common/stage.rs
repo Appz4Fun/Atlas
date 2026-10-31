@@ -118,6 +118,9 @@ pub struct Harness {
 }
 
 pub fn fresh() -> Harness {
+    // what a save queues releases by: a stage sets these, and tests save before starting one
+    store::SETTLE_SECS.store(1, std::sync::atomic::Ordering::Relaxed);
+    store::COMPLETE_SETTLE_SECS.store(1, std::sync::atomic::Ordering::Relaxed);
     let dir = tempfile::tempdir().unwrap();
     let main = dir.path().join("atlas.db");
     db::create_db_at(&main).unwrap();

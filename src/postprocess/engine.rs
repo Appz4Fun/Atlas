@@ -272,7 +272,7 @@ impl Inner {
     /// Bounded counts, per shard: an exact count at this size stalls whatever asks.
     pub(crate) fn refresh_counts(&self) {
         let now = chrono::Utc::now().timestamp();
-        let (mut due, mut net, mut failed, mut left, mut total) = (0, 0, 0, 0, 0);
+        let (mut due, mut net, mut failed, mut walked, mut total) = (0, 0, 0, 0, 0);
         for path in store::shard_paths(&self.main) {
             let Ok(conn) = db::open_shard(&path) else { continue };
             let count =
@@ -280,14 +280,14 @@ impl Inner {
             due += count("select count(*) from (select 1 from pp_queue where due_at <= ?1 limit 100001)", &[&now]);
             net += count("select count(*) from (select 1 from pp_state where net_wanted = 1 limit 1000001)", &[]);
             failed += count("select count(*) from (select 1 from pp_state where failed != 0 limit 100001)", &[]);
-            left += count("select coalesce(sum(top_id - before_id), 0) from pp_walks", &[]);
+            walked += count("select coalesce(sum(top_id - before_id), 0) from pp_walks", &[]);
             total += count("select coalesce(sum(top_id), 0) from pp_walks", &[]);
         }
         let s = &self.stats;
         s.queue_due.store(due, Relaxed);
         s.net_wanted.store(net, Relaxed);
         s.failed.store(failed, Relaxed);
-        s.walk_left.store(left, Relaxed);
+        s.walk_done.store(walked, Relaxed);
         s.walk_total.store(total, Relaxed);
         stats::set_backlog(due + net);
     }
@@ -413,11 +413,21 @@ impl Inner {
             return Ok(true);
         }
         let mut batch = Batch::default();
-        let visits: Vec<(Row, Option<i64>)> = rows.into_iter().map(|row| (row, None)).collect();
-        let order: Vec<i64> = visits.iter().map(|(row, _)| row.info.id).collect();
+        let order: Vec<i64> = rows.iter().map(|row| row.info.id).collect();
+        // a row with a time of its own (a retry, settling) has the queue to bring it back. Only
+        // an explicit request runs it sooner: a walk mustnt use up attempts a backoff is spacing
+        let mut waiting = conn.prepare_cached("select 1 from pp_queue where release_id = ? and due_at > ?")?;
+        let mut visits: Vec<(Row, Option<i64>)> = Vec::with_capacity(rows.len());
+        for row in rows {
+            if redo != 0 || !waiting.exists(params![row.info.id, now])? {
+                visits.push((row, None));
+            }
+        }
+        drop(waiting);
         self.visit_all(conn, visits, redo, now, &mut batch)?;
         // the cursor goes no further than the visits did: nothing else brings a walked row back
-        let Some(next) = batch.through else {
+        let finished = !batch.stopped && !self.stopping();
+        let Some(next) = (if finished { order.last().copied() } else { batch.through }) else {
             self.send(db, shard, batch, now, |_| Ok(()))?;
             return Ok(true);
         };
