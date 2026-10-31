@@ -1056,7 +1056,7 @@ Usage: `atlas --unname [--sample N] [--apply]`.
   - `a_dry_run_changes_nothing_and_counts`: stdout gives a count per source, `2 would be cleared`, and `--sample 1` shows a name. Every row and `meta` unchanged. It works while another handle holds the shared guard.
   - `apply_clears_only_regex_and_posted_names`: 3 and 5 have `display_name` and `name_source` NULL. All others are untouched, including the inline name.
   - `search_follows`: `releases_fts` no longer finds the cleared name's tokens, and still finds `name`. The `is_obfuscated` flag is `parser::is_obfuscated(name)` again, so a random `name` leaves search and a real one stays. A random `name` ending in Part 2's collision suffix leaves search too.
-  - `later_steps_are_queued`: a registered test step at rank 400 with `on_rename` has its done bit cleared and a `pp_queue` row. `naming`'s own bit stays set, and a stage run leaves the row unnamed.
+  - `later_steps_are_queued`: a registered test step at rank 400 with `on_rename` has its done bit cleared and a `pp_queue` row; another at `failed` has that bit and its attempts cleared and runs again on the restored name. `naming`'s own bit stays set, and a stage run leaves the row unnamed.
   - `it_removes_the_opt_in`: `meta.naming_rename_named` is gone afterward, and a dry run keeps it.
   - `a_stopped_run_resumes`: `ATLAS_UNNAME_STOP_AFTER=1`, then a second run finishes, and `unname_after` is gone.
   - `apply_is_refused_while_anything_holds_the_lock`, `it_is_refused_with_an_indexer_alive`, as in Task 9. `a_second_run_finds_nothing`. `help_lists_it`.
@@ -1068,7 +1068,7 @@ select id, name from releases where id > :cursor and name_source in (3, 5) order
 -- per row, then the cursor, in one BEGIN IMMEDIATE. ?2 is parser::is_obfuscated(without_collision_suffix(name)), as
 -- Part 2 worked the flag out before adding it. releases_au updates FTS
 update releases set display_name = null, name_source = null, is_obfuscated = ?2 where id = ?1;
-update pp_state set done = done & ~:later where release_id = ?1;
+update pp_state set done = done & ~:later, failed = failed & ~:later, db_attempts = 0, net_attempts = 0, net_next_at = 0 where release_id = ?1;
 insert into pp_queue (release_id, due_at) values (?1, 0) on conflict(release_id) do nothing;  -- when :later != 0
 insert or replace into meta (key, value) values ('unname_after', ?);
 -- at the end

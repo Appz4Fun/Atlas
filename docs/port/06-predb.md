@@ -268,7 +268,8 @@ pub const MAX_NUKE_REASON: usize = 256;
 /// lowercased are this title. None: insert it and its three keys. Found: empty `category`, `size_bytes`, `files` and `pre_at`
 /// are filled; a non-zero `nuked` replaces, with its reason when it has one; `source` and `title` never change.
 /// `meta.titles` grows by the number inserted.
-pub fn import(conn: &mut Connection, source: i64, entries: &[Entry], now: i64) -> rusqlite::Result<Counts>;
+/// `cursor`, in the same transaction when any entry was inserted: `update feeds set resume_page = page, gap_floor = floor`.
+pub fn import(conn: &mut Connection, source: i64, entries: &[Entry], now: i64, cursor: Option<(i64, i64)>) -> rusqlite::Result<Counts>;
 ```
 
 ### Provided (`src/predb/feeds.rs`)
@@ -333,10 +334,10 @@ pub fn wait_seconds(reply: &HttpReply, now: i64, default: i64) -> i64;
 
 **A poll, exactly.** First, when `page_count * page_size` is past `max_db_mb`: no request, `Failed("the PreDB file is over max_db_mb")`, with the usual backoff, so a feed can't fill the disk. `budget = max_pages_per_poll`. Requests are `max(request_delay_ms, spec.min_delay_ms)` apart. Each page is imported in its own transaction, so a failure keeps what was read.
 
-`floor = select coalesce(max(id), 0) from titles`, read before the first request.
+`floor = select coalesce(max(id), 0) from titles`, read before the first request, or the open gap's `gap_floor` when there is one, whose older floor stays. `open = resume_page`.
 
-1. **Forward.** `page = 1`. While budget is left: fetch, parse, import, spend 1. An empty list, or `page > max_page`: the source has ended, so `ended = true` and stop. `inserted == 0`: `caught = true` and stop. Else `page += 1`.
-2. **The gap.** If it stopped on budget: `resume_page = page`, and end with `Gap`. The exception is a source that has never succeeded (`last_ok_at` NULL): older pages are history rather than a gap, so `resume_page = 0`, and end with `CaughtUp`. `gap_floor = floor`, unless a gap is already open, whose older floor stays. There is one cursor, so a new gap moves it up to `page`, and walking down from there passes through what the older gap had left, until a title from before the older floor.
+1. **Forward.** `page = 1`. While budget is left: fetch, parse, import, spend 1. For a source with `last_ok_at` set, each import carries `cursor = (page + 1, floor)`, so a failure or a crash after any page leaves a gap saying where to go on, however the poll ends. On `caught`, `resume_page = open` again, or 0, and `gap_floor` with it. An empty list, or `page > max_page`: the source has ended, so `ended = true` and stop. `inserted == 0`: `caught = true` and stop. Else `page += 1`.
+2. **The gap.** If it stopped on budget: the cursor already says `resume_page = page`, and end with `Gap`. The exception is a source that has never succeeded (`last_ok_at` NULL): older pages are history rather than a gap, so `resume_page = 0`, and end with `CaughtUp`. There is one cursor, so a new gap moves it up to `page`, and walking down from there passes through what the older gap had left, until a title from before the older floor.
 3. If `caught` and `resume_page > 0`: go on from `page = resume_page`, fetching, parsing, importing and spending 1 each. The gap is closed, `resume_page = 0`, only by an empty list, `page > max_page`, or a page with `inserted == 0` and `min_known_id <= gap_floor`, which is a title from before the gap. Any other page, including one holding only titles imported since the gap opened, is `page += 1`. Running out of budget saves the new page. Newer titles push old ones to higher page numbers, so resuming can re-read titles but never skips any, however far they were pushed.
 4. **History.** If not stopped on budget and `history_read < cfg.history_pages`: `page = max(history_page, 2)`. Fetch, parse, import, with no stopping on `inserted == 0`. Each page saves `history_page = page + 1` and `history_read + 1`. An empty list or `page > max_page` sets `history_read = cfg.history_pages`.
 5. **Success:** `failures = 0`, `last_ok_at = now`, `last_error = NULL`, `next_poll_at = now + poll_secs + id * 7`, so sources don't fire together. `CaughtUp`, or `Gap` as above.
@@ -731,7 +732,7 @@ Hand-write each fixture from section 6's table, with invented titles such as `Al
   - `a_rate_limit_envelope_is_the_same`: HTTP 200 with `rate_limited.json`.
   - `failures_back_off_to_six_hours`: 500s: `next_poll_at` is now + 600, 1,200, 2,400, and capped at 21,600. A success resets `failures` to 0 and clears `last_error`.
   - `bad_json_and_bad_shape_are_failures`: nothing imported, nothing panics.
-  - `pages_before_a_failure_are_kept`: page 1 fine, page 2 is a 500: page 1's titles stored.
+  - `pages_before_a_failure_are_kept`: page 1 fine, page 2 is a 500: page 1's titles stored, and `resume_page = 2` committed with them. The next poll, `history_pages: 0`: page 1 known, then page 2 onward imported, down to a title from before the gap. A new `Connection` between pages, as after a crash, gives the same result. `a_clean_forward_pass_leaves_no_gap`: after success, page 1 new and page 2 known: `resume_page = 0`, or back to an older gap's page when one was open.
   - `requests_are_spaced`: `pause` got `max(request_delay_ms, min_delay_ms)` between pages: 1,000 ms, and 4,000 ms for `xrel`.
   - `stopping_ends_a_poll`: `pause` returns false: `Stopped`, no more requests.
   - `ureq_fetch_reports_status_and_headers`, in `tests/predb_ureq.rs`: a `tiny_http` server on `127.0.0.1`: a 429 with `Retry-After` comes back as a reply and not an `Err`, and a body over 8 MiB is an `Err`.

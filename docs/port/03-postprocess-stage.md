@@ -850,6 +850,7 @@ insert or replace into meta (key, value) values ('pp_steps_seen', ?2);  -- ?2: t
   - `a_server_outage_uses_no_attempts`: unreachable server; `net_attempts` stays 0, `net_next_at` moves, the lane pauses; after the server returns the step finishes.
   - `wait_until_gives_back_the_attempt_begin_counted`: a step returning `wait_until` during a run: `net_attempts` is back to its old value, `net_next_at` is that time, no bit. Fails with `net_attempts` 1.
   - `a_missing_article_is_for_the_step_to_judge`: `Got::Missing`; the step returns done with `matched: false`.
+  - `a_step_that_keeps_killing_the_process_is_given_up_on`: the `Begin` write and a restart, `max_attempts` times: the next claim doesn't run the step, its failed bit is set, `net_wanted` follows the steps left, and `net_attempts` is 0.
   - `a_crash_mid_step_counts_one_attempt_and_retries_later`: run the `Begin` write, drop the stage without applying, restart with `net_next_at` forced past; `net_attempts` is 1, then the step finishes and it is 0. Fails without the write-ahead.
   - `a_db_visit_during_a_net_step_keeps_its_count`: `net_attempts` 2; a late article's DB visit: still 2.
   - `a_net_step_that_renames_requeues_later_database_steps`; `newest_goes_first_and_every_eighth_claim_takes_the_oldest`.
@@ -863,7 +864,7 @@ select release_id from pp_state where net_wanted = 1 and net_next_at <= ?1 order
 -- every 8th claim: order by release_id asc
 ```
 
-  For each, reading `rerun_gen` as its `claimed_gen` before anything else: `judge_row`, `file_summaries`, `judge_files` again, and `body_gate`. `Reject`, or no step left: `net_wanted` cleared. `Begin` through the writer: `update pp_state set net_attempts = net_attempts + 1, net_next_at = :now + 900 where release_id = :id`. Run the lowest-rank undone enabled applicable net step, whose lane's result follows section 6's table, then `Applied`, with `db_attempts` None. `net_mask` is the undone net steps left, plus any `clear` or `rename_clears` net bits.
+  For each, reading `rerun_gen` as its `claimed_gen` before anything else: `judge_row`, `file_summaries`, `judge_files` again, and `body_gate`. `Reject`, or no step left: `net_wanted` cleared. `net_attempts >= max_attempts`, which only unfinished runs can leave behind: the lowest-rank undone step isn't run, it gets its failed bit, `net_attempts = 0` and `last_error = 'interrupted'`. Otherwise `Begin` through the writer: `update pp_state set net_attempts = net_attempts + 1, net_next_at = :now + 900 where release_id = :id`. Run the lowest-rank undone enabled applicable net step, whose lane's result follows section 6's table, then `Applied`, with `db_attempts` None. `net_mask` is the undone net steps left, plus any `clear` or `rename_clears` net bits.
 - [ ] **Run:** `cargo test --test pp_bodies && just test`. **Expected:** pass.
 - [ ] **Commit:** `Run body and outside steps within a budget, without using up retries on an outage`
 
