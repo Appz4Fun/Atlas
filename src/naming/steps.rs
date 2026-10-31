@@ -44,14 +44,16 @@ impl Step for Naming {
         let inner = archive::store::inner_files(ctx.conn(), id).map_err(retry)?;
         // new inner files reach PreDB matching too, renamed or not. Bit 16 is its step: unregistered bits are ignored
         let rerun = if inner.is_empty() { 0 } else { mask(StepId(16)) };
-        // an inline name, or a name the user cleared, stays as it is until the user opts in with --reprocess
         let r = ctx.release();
-        let left_alone =
-            (r.display_name.is_some() && r.name_source.is_none()) || r.name_source == Some(NameSource::Cleared as i64);
-        if left_alone && !rename_named_is_on(ctx.conn(), &r.group).map_err(retry)? {
+        let cleared = r.name_source == Some(NameSource::Cleared as i64);
+        let inline = r.display_name.is_some() && r.name_source.is_none();
+        let opted_in = (cleared || inline) && rename_named_is_on(ctx.conn(), &r.group).map_err(retry)?;
+        // an inline name stays as it is until the user opts in with --reprocess
+        if inline && !opted_in {
             return Ok(Outcome { rerun, ..Outcome::default() });
         }
-        let files = ctx.files().map_err(retry)?;
+        // and a name the user cleared came from subject text, soo only what's inside the post can name it again
+        let files = if cleared && !opted_in { Vec::new() } else { ctx.files().map_err(retry)? };
         let passworded = archive::store::password(ctx.conn(), id).map_err(retry)? == Some(Password::Yes);
         let name = decide(ctx.release(), &files, &inner, passworded);
         Ok(Outcome { matched: name.is_some(), name, rerun, ..Outcome::default() })
@@ -93,7 +95,16 @@ impl Step for NfoName {
         Reruns { on_rename: false, on_growth: true }
     }
     fn run(&self, ctx: &mut StepCtx<'_>) -> Result<Outcome, StepError> {
-        let files = ctx.files().map_err(|e| StepError::Retry(e.to_string()))?;
+        let retry = |e: rusqlite::Error| StepError::Retry(e.to_string());
+        // an inline name stays as it is until the user opts in, as in the naming step. `applies` can't read this
+        let r = ctx.release();
+        if r.display_name.is_some()
+            && r.name_source.is_none()
+            && !rename_named_is_on(ctx.conn(), &r.group).map_err(retry)?
+        {
+            return Ok(Outcome::default());
+        }
+        let files = ctx.files().map_err(retry)?;
         for file in archive::select::nfo_sources(&files) {
             let Some(seg) = first_article(ctx, file)? else { continue };
             let Some(body) = fetch_one(ctx, &seg, &file.filename)? else { continue };

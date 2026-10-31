@@ -128,9 +128,12 @@ pub(crate) struct Walk<'a> {
     pub key: &'static str,
     pub limits: &'a WalkLimits,
     pub stop: &'a AtomicBool,
+    /// over all shards, for `stop_after`
     pub commits: &'a AtomicU64,
     pub rows: &'a AtomicU64,
     pub label: &'static str,
+    /// this shard's own: each shard's WAL needs its own checkpoints
+    pub shard_commits: u64,
 }
 
 impl Walk<'_> {
@@ -166,7 +169,8 @@ impl Walk<'_> {
         if self.limits.stop_after.is_some_and(|n| commits >= n) {
             anyhow::bail!("stopped: run it again to go on from here");
         }
-        if commits.is_multiple_of(u64::from(self.limits.check_every)) {
+        self.shard_commits += 1;
+        if self.shard_commits.is_multiple_of(u64::from(self.limits.check_every)) {
             batch::checkpoint_or_stop(self.conn, self.path, self.limits.wal_limit)?;
         }
         Ok(true)

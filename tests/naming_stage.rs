@@ -398,3 +398,41 @@ fn opting_in_a_group_leaves_the_rest_of_its_shard_alone() {
     assert_eq!(row(&h, &other, "Xk3Mz9PqB").1.as_deref(), Some("aB3dE9Xk.mkv"), "another group in its shard");
     assert_eq!(row(&h, &other, "Xk3Mz9PqB").2, None);
 }
+
+#[test]
+fn inner_files_can_still_name_a_cleared_release() {
+    let mut h = fresh();
+    h.save(&[complete("Xk3Mz9PqL")]);
+    let (id, ..) = row(&h, STAGE_GROUP, "Xk3Mz9PqL");
+    let conn = h.shard();
+    conn.execute("update releases set name_source = 1 where id = ?", [id]).unwrap();
+    add_inner(&h, STAGE_GROUP, id, &format!("{SCENE}/a1B2c3D4e5F6g7H8.mkv"), SOURCE_RAR);
+    start(&mut h, config(), steps::all(), None);
+    wait_for("the name", || row(&h, STAGE_GROUP, "Xk3Mz9PqL").2 == Some(15));
+    assert_eq!(row(&h, STAGE_GROUP, "Xk3Mz9PqL").1.as_deref(), Some(SCENE));
+}
+
+#[test]
+fn the_nfo_step_leaves_an_inline_name_until_asked() {
+    let inline = |h: &Harness| {
+        let state = nfo_shape(h);
+        h.shard().execute("update releases set display_name = 'Some Book Title'", []).unwrap();
+        state
+    };
+    let mut h = fresh();
+    let state = inline(&h);
+    let port = spawn_server(state.clone());
+    start(&mut h, with_bodies(), steps::all(), Some(port));
+    let (id, ..) = row(&h, STAGE_GROUP, "x");
+    wait_done(&h, STAGE_GROUP, id, mask(NFO));
+    assert_eq!(state.bodies_sent.load(Ordering::SeqCst), 0);
+    assert_eq!(row(&h, STAGE_GROUP, "x").1.as_deref(), Some("Some Book Title"));
+
+    let mut h = fresh();
+    let state = inline(&h);
+    h.shard().execute("insert into meta (key, value) values ('naming_rename_named', 1)", []).unwrap();
+    let port = spawn_server(state.clone());
+    start(&mut h, with_bodies(), steps::all(), Some(port));
+    wait_for("the NFO's name", || row(&h, STAGE_GROUP, "x").2 == Some(10));
+    assert_eq!(row(&h, STAGE_GROUP, "x").1.as_deref(), Some("Real Name 2024 1080p"));
+}

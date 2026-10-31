@@ -69,7 +69,17 @@ fn apply_shard(
     let mut conn = db::open_shard(path)?;
     store::migrate_shard(&conn)?;
     db::tune_for_writing(&conn)?;
-    let mut walk = walk::Walk { conn: &mut conn, path, key: CURSOR, limits, stop, commits, rows, label: "reflag" };
+    let mut walk = walk::Walk {
+        conn: &mut conn,
+        path,
+        key: CURSOR,
+        limits,
+        stop,
+        commits,
+        rows,
+        label: "reflag",
+        shard_commits: 0,
+    };
     let picked = |c: &Connection, after: i64| candidates(c, after);
     let write = |tx: &Connection, batch: &[(i64, String)]| -> rusqlite::Result<()> {
         let mut update = tx.prepare_cached("update releases set is_obfuscated = 1 where id = ?")?;
