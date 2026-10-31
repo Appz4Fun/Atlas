@@ -170,7 +170,7 @@ What stays split, accepted: a 50-file post with 20 files indexed before the upgr
 | `remap_bracket_parts` (`:129`) | None. It runs per release per slice, by filename. A file's articles stay in one release, since the counter's digits are stripped from the key. Test: `bracket_parts_still_become_parts_inside_a_collection` |
 | `is_complete` (`:216`) | None. It splits by filename and compares the file count to `file_total`. `m` is in the key, so one collection has one `m` |
 | `files`, `unique(release_id, filename)` (`src/store.rs:175`) | None. A merged release has more rows. Two uploads under one weak key with the same filename would share a row, which is why a weak key has poster and day |
-| `release_complete` (`:753`) | None. It scans all of a release's files per save. `MAX_COLLECTION_FILES` bounds that scan at 10,000 rows for a collection |
+| `release_complete` (`:753`) | None. It scans all of a release's files per save. `MAX_COLLECTION_FILES` bounds that scan at about 10,000 rows for a collection, in the advertised total and in the files actually stored |
 | Sealing (`src/store.rs:805-902`, `src/blob.rs`) | None. It's per file, and a merged release just has more files |
 | `release_ids` (`:218`) | None, but more of it. A release is indexed once it has a second file, so a newly merged post pays 1 lookup and 1 row per article, about 30 bytes. See section 9 |
 | `by_file` (`:1405-1412`) | **Fixed.** A list searched per article is quadratic in a release's files, and a collection makes that reachable. It becomes an `IndexMap` |
@@ -689,7 +689,16 @@ fn collection_row(tx: &Connection, key: &IdKey, collection: &str, release: &Rele
         .query_row([hash], |r| Ok((r.get(0)?, r.get(1)?)))
         .optional()?;
     if let Some((name, is_obfuscated)) = known {
-        return Ok(CollectionRow { key: hash, name, is_obfuscated, known: true });
+        // repeated posts under one key add up: past the cap it starts a new release, and the key points there
+        let files: i64 = tx
+            .prepare_cached(
+                "select count(*) from (select 1 from collections c join files f on f.release_id = c.release_id
+                 where c.key = ? limit ?)",
+            )?
+            .query_row(params![hash, MAX_COLLECTION_FILES + 1], |r| r.get(0))?;
+        if files <= MAX_COLLECTION_FILES {
+            return Ok(CollectionRow { key: hash, name, is_obfuscated, known: true });
+        }
     }
     let mut taken = tx.prepare_cached("select 1 from releases where name = ? and group_name = ?")?;
     let mut name = release.name.clone();
@@ -1462,6 +1471,22 @@ fn a_later_slices_file_name_doesnt_change_the_rows_flag() {
     save(&main, &[random]).unwrap();
     let flag: i64 = conn.query_row("select is_obfuscated from releases", [], |r| r.get(0)).unwrap();
     assert_eq!(flag, 0, "the row is still named Readable.Movie.2024.mkv");
+}
+
+#[test]
+fn a_full_collection_starts_a_new_release() {
+    let (_dir, main, conn) = fresh_shard_db();
+    let mut many = in_collection("k", "f0", "f0", "<0@x>", "p");
+    many.articles = (0..=crate::collections::MAX_COLLECTION_FILES)
+        .map(|i| in_collection("k", "f", &format!("f{i}"), &format!("<{i}@x>"), "p").articles.remove(0))
+        .collect();
+    save(&main, &[many]).unwrap();
+    save(&main, &[in_collection("k", "later.jpg", "later.jpg", "<later@x>", "p")]).unwrap();
+    let rows = rows_of(&conn);
+    assert_eq!(rows.len(), 2, "{:?}", rows.iter().map(|r| (&r.0, r.2)).collect::<Vec<_>>());
+    assert_eq!(rows[1].0, "later.jpg");
+    save(&main, &[in_collection("k", "more.jpg", "more.jpg", "<more@x>", "p")]).unwrap();
+    assert_eq!(rows_of(&conn)[1].2, 2, "the key points at the new one");
 }
 
 #[test]

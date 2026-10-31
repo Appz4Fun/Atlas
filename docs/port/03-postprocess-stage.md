@@ -275,7 +275,13 @@ pub struct Outcome {
     pub wait_until: Option<i64>,
 }
 
-pub struct StepWrite { pub sql: &'static str, pub params: Vec<rusqlite::types::Value> }
+pub struct StepWrite {
+    pub sql: &'static str,
+    pub params: Vec<rusqlite::types::Value>,
+    /// Called on the shard's writer just before this write, in place of `params`, for a value that must be
+    /// current then and not when the step ran. It must be quick. Everything else uses `StepWrite::new(sql, params)`.
+    pub late_params: Option<Box<dyn FnOnce() -> Vec<rusqlite::types::Value> + Send>>,
+}
 
 /// `source` 1..=127, owned by Part 5's table: higher wins, equal replaces.
 /// `display_name: None` leaves the name, `obfuscated: None` leaves the flag. A change of
@@ -699,7 +705,7 @@ select display_name, coalesce(name_source, 0) from releases where id = ?1;   -- 
 -- when a state row exists and claimed_gen differs: bits cleared since the claim may include a step that just ran, on
 -- input older than the request. All of such a step's result is dropped, in this order: its writes, its name, its bit.
 select rerun_gen != ?2, rerun_mask from pp_state where release_id = ?1;
--- each StepWrite of a step not dropped: prepare_cached(sql).execute(params)
+-- each StepWrite of a step not dropped: prepare_cached(sql).execute(late_params() or params)
 -- when name.source >= that source, either field is Some, and its step wasn't dropped. A differing display_name adds rename_clears to clear
 update releases set display_name = coalesce(?2, display_name), is_obfuscated = coalesce(?3, is_obfuscated), name_source = ?4
  where id = ?1;

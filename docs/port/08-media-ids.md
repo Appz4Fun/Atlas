@@ -280,7 +280,7 @@ So each title has one release in the net lane at a time. The others keep NULL ID
 
 ### Fan-out (`fanout.rs`)
 
-When `resolve` sets `fanout_done = 0` it pushes the key. `media::run` loops on a blocking thread until `stopping`. At start it loads every `fanout_done = 0` row, so a crash loses nothing. For each key it runs pass 1 on all 8 shards through `Db::on_writer`, one job per 1,000 rows, waiting for each answer. 60 s later it runs pass 2 the same way and sets `fanout_done = 1`. Pass 2 catches a release whose `media_parse` read the cache before the title resolved and committed after pass 1. A pass that finds its rows unchanged writes nothing.
+When `resolve` sets `fanout_done = 0` it pushes the key. `media::run` loops on a blocking thread until `stopping`. At start it loads every `fanout_done = 0` row, so a crash loses nothing. For each key it runs pass 1 on all 8 shards through `Db::on_writer`, one job per 1,000 rows, waiting for each answer. 60 s later it runs pass 2 the same way and sets `fanout_done = 1`. Pass 2 is a second look only: `media_parse` reads the cache at apply time, so nothing depends on it or on its delay. A pass that finds its rows unchanged writes nothing.
 
 ```sql
 select max(release_id), count(*) from (select release_id from media_release
@@ -478,7 +478,7 @@ pub fn media_target(category: i64, rule: &str, name: &str) -> Option<(Kind, Pars
 1. `category` and `rule` from the facts `category` and `category_rule`. When those are absent, because only this step was cleared or `category.enabled` is false, `category::classify_release(release, options)`. So this step doesn't depend on the category step being on.
 2. `media_target(category, rule, name)`, where `name` is `display_name` or `name`.
 3. `None`: if `select 1 from media_release where release_id = ?1` finds a row, a `delete` write. `matched: false`.
-4. `Some`: the statement in section 5, with IDs from `media.cached_ids(key)` when present. `matched: true`. No network.
+4. `Some`: the statement in section 5, with its parameters in `late_params`, so `media.cached_ids(key)` is read on the shard's writer as the row is written. Fan-out passes are writer jobs on the same shard and start after the cache has the title, so a parse written before a pass is fixed by it, and one written after reads the IDs itself, however long it was held. `matched: true`. No network.
 
 **`media_lookup`.** `enabled`: `set_config`, returns `cfg.media.any_provider()`. `config_stamp` (Part 3): the bits of the providers on, so adding one to a title's already looked-up releases starts one walk that clears this step, and `wants` then lets one release per title ask only the new provider. `reruns`: on rename and growth. `applies`, pure with no I/O:
 
@@ -705,6 +705,7 @@ Part 3's `an_old_shard_gets_the_new_tables_without_a_rewrite` bounds growth at `
   - `with_no_fact_it_classifies_for_itself`: clear only bit 32 with `Stage::rerun`. The row is rewritten.
   - `it_runs_with_the_category_step_off`: `"category": {"enabled": false}`. The TV release still gets its row, and no `release_category` row exists. Fails if the step reads the table.
   - `a_group_hint_alone_gets_no_row`: `Plain Name Nothing Else` in `alt.binaries.movies` is category 2999 with `group_name_movie`, and `parse_movie` would accept it. No `media_release` row.
+  - `a_parse_held_past_the_fan_out_gets_the_ids`: `media_parse` runs on a cache miss and its `Applied` is held, the title resolves and both fan-out passes finish, then it applies: the row has the IDs.
   - `a_late_article_keeps_ids`: a row with `imdb_id` set, a growth re-run with no provider on: `imdb_id` stays. A rename to a new title: it clears, along with `imdb_from_nfo`.
   - `a_corrected_provider_result_replaces_a_providers_imdb`: a title found with one IMDb ID and fanned out, its cache row deleted, a new `Media` as after a restart, `media_lookup` reprocessed with a corrected answer: every row of the title holds the new ID. `an_nfos_imdb_survives_the_correction`: the same with `imdb_from_nfo = 1` on one row: that row keeps its ID, through `media_parse`, the `Found` write and the fan-out.
   - `an_audio_release_gets_no_row`.

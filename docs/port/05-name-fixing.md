@@ -1018,7 +1018,7 @@ Usage: `atlas --reflag-obfuscated [--sample N] [--apply]`.
 
 - [ ] **Tests first:**
   - `a_dry_run_changes_nothing_and_counts`: rows `a1B2c3D4e5F6g7H8` (flagged), `kP93xQ7rL.ZMtwBfa`, `Xk3Mz9PqL` (not flagged, as an old build left them), `Good.Name.2024`. Stdout says `2 would be flagged` and, with `--sample 1`, shows a name. Every row and `meta` unchanged. It works while another handle holds the shared guard.
-  - `apply_sets_the_flag_and_search_follows`: both flagged. `search_all_releases` no longer finds them. `Good.Name.2024` is untouched.
+  - `apply_sets_the_flag_and_search_follows`: both flagged, one of them a short random name ending in Part 2's collision suffix. `search_all_releases` no longer finds them. `Good.Name.2024` is untouched.
   - `a_named_row_stays_visible`: the same shape with a `display_name` and NULL source: flagged, still in search.
   - `a_step_named_row_is_left_alone`: `name_source = 15`, `is_obfuscated = 0`: unchanged.
   - `a_second_run_finds_nothing`: `0 would be flagged`.
@@ -1035,7 +1035,7 @@ Usage: `atlas --reflag-obfuscated [--sample N] [--apply]`.
 ```sql
 -- read outside the transaction; rowid order, so it never revisits a page
 select id, name from releases where id > :cursor and name_source is null and is_obfuscated = 0 order by id limit 2000;
--- for the rows parser::is_obfuscated flags, then the cursor, in one BEGIN IMMEDIATE:
+-- for the rows parser::is_obfuscated(without_collision_suffix(name)) flags, then the cursor, in one BEGIN IMMEDIATE:
 update releases set is_obfuscated = 1 where id = ?;
 insert or replace into meta (key, value) values ('reflag_after', ?);   -- the highest id read
 ```

@@ -856,10 +856,11 @@ Titles: `Alpha.Beta.Gamma.2024.1080p.WEB-DL.H.264-TESTGRP` as T, and `Second.Tit
   - `a_line_with_no_newline_is_skipped_and_counted`: a `.gz` holding 8 MiB of one character, a newline and a good title: stdout has `1 too long`, the title is imported, and exit 0.
   - `exactly_the_line_cap_is_kept`: 1,023 bytes and a newline is read as a line, and is then rejected by `valid_title` as invalid, not as too long. 1,025 bytes is too long.
   - `a_gzip_bomb_stops_at_the_byte_cap`: `ATLAS_PREDB_IMPORT_MAX_BYTES=65536` and 8 MiB of text: exit 1, the message names the cap, and batches already committed stay. `too_many_lines_stops`: `ATLAS_PREDB_IMPORT_MAX_LINES=10` and 50 lines: the same.
+  - `a_big_import_keeps_its_wal_small`: 100,000 titles: `pragma wal_autocheckpoint` is above 0 on the import's connection, and the `-wal` file, read after each batch through `#[doc(hidden)] import_lines`, stays under 64 MiB.
   - `a_bad_utf8_line_is_invalid`: counted, and the run goes on.
   - `the_import_path_has_no_http`: `include_str!("../src/predb/file_import.rs")` mentions neither `ureq` nor `poll::`.
   - `help_lists_it`.
-- [ ] **Implement** section 6. 10,000 titles per transaction. `tune_for_writing` on this connection.
+- [ ] **Implement** section 6. 10,000 titles per transaction. No `tune_for_writing` on this connection: it turns off auto-checkpointing, and no checkpointer serves this file, so SQLite's default stays on and the WAL stays bounded.
 - [ ] **Run:** `cargo test --test predb_import`. **Expected:** pass.
 - [ ] **Commit:** `Add atlas --predb-import for a local title list, dry run by default`
 
