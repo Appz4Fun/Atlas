@@ -63,6 +63,7 @@ fn set_up(conn: Connection) -> Result<Connection> {
     // with WAL this cant corrupt the db, a crash only loses the last commit,
     // which the indexer redoes anyway since cursors move after the data
     conn.execute_batch("pragma synchronous = normal")?;
+    crate::filters::register_sql(&conn)?;
     Ok(conn)
 }
 

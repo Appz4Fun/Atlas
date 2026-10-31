@@ -36,7 +36,7 @@ const COLUMNS: &str =
 const VISIBLE_RELEASE: &str = "(
     r.display_name is not null
     or (r.is_obfuscated = 0 and (length(r.name) < 16 or r.name glob '*[^A-Za-z0-9]*'))
-)";
+) and not atlas_blocked(r.group_name)";
 
 fn release_row(r: &Row) -> rusqlite::Result<ReleaseRow> {
     Ok(ReleaseRow {
@@ -228,13 +228,15 @@ pub fn all_releases(page: i64, page_size: i64) -> Result<Vec<ReleaseRow>> {
 }
 
 pub fn search_obfuscated(page: i64, page_size: i64) -> Result<Vec<ReleaseRow>> {
-    newest(&shards(None), "r.is_obfuscated = 1", Vec::new(), page, page_size)
+    newest(&shards(None), "r.is_obfuscated = 1 and not atlas_blocked(r.group_name)", Vec::new(), page, page_size)
 }
 
 pub fn count_obfuscated() -> Result<i64> {
     let sql = format!(
         "select coalesce(sum(c), 0) from ({})",
-        union(&shards(None), |i| format!("select count(*) as c from s{i}.releases where is_obfuscated = 1"))
+        union(&shards(None), |i| format!(
+            "select count(*) as c from s{i}.releases where is_obfuscated = 1 and not atlas_blocked(group_name)"
+        ))
     );
     db::open()?.query_row(&sql, [], |r| r.get(0))
 }
@@ -246,7 +248,7 @@ pub fn get_release(id: i64) -> Result<Option<ReleaseRow>> {
 /// `get_release` on a connection with the shards attached.
 pub fn get_release_with(conn: &Connection, id: i64) -> Result<Option<ReleaseRow>> {
     let sql = format!("select {COLUMNS} from s{}.releases r where r.id = ?", store::shard_of_id(id));
-    conn.query_row(&sql, [id], release_row).optional()
+    Ok(conn.query_row(&sql, [id], release_row).optional()?.filter(|r| !crate::filters::group_blocked(&r.group_name)))
 }
 
 pub fn recent_in_groups(groups: &[String], page: i64, page_size: i64) -> Result<Vec<ReleaseRow>> {
@@ -254,15 +256,22 @@ pub fn recent_in_groups(groups: &[String], page: i64, page_size: i64) -> Result<
         return Ok(Vec::new());
     }
 
-    let names: Vec<&str> = groups.iter().map(String::as_str).collect();
-    let qs = (0..groups.len()).map(|n| format!("?{}", n + 3)).collect::<Vec<_>>().join(",");
-    let extra = groups.iter().map(|g| text(g.as_str())).collect();
+    let names: Vec<&str> = groups.iter().map(String::as_str).filter(|g| !crate::filters::group_blocked(g)).collect();
+    if names.is_empty() {
+        return Ok(Vec::new());
+    }
+    let qs = (0..names.len()).map(|n| format!("?{}", n + 3)).collect::<Vec<_>>().join(",");
+    let extra = names.iter().map(|g| text(*g)).collect();
     newest(&shards(Some(&names)), &format!("r.group_name in ({qs})"), extra, page, page_size)
 }
 
 /// Articles ordered by filename then part soo files can be reassembled.
 pub fn get_articles(release_id: i64) -> Result<Vec<ArticleRow>> {
-    store::articles(&db::open()?, release_id)
+    let conn = db::open()?;
+    if get_release_with(&conn, release_id)?.is_none() {
+        return Ok(Vec::new());
+    }
+    store::articles(&conn, release_id)
 }
 
 #[cfg(test)]

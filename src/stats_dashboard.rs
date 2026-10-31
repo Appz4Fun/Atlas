@@ -169,7 +169,7 @@ fn compute_content() -> rusqlite::Result<Content> {
             "select group_name, count(*), coalesce(sum(size), 0), coalesce(sum(complete), 0),
                 coalesce(sum(is_obfuscated), 0), count(display_name), coalesce(sum(parts), 0),
                 coalesce(sum(parts > 0), 0), coalesce(sum(parts > 0 and complete = 1), 0)
-             from s{i}.releases group by group_name"
+             from s{i}.releases group by group_name having not atlas_blocked(group_name)"
         )
     }))?;
     let mut groups: Vec<(String, i64, i64)> = Vec::new();
@@ -197,7 +197,8 @@ fn compute_content() -> rusqlite::Result<Content> {
     let biggest = format!(
         "select * from ({}) order by 1 desc limit 1",
         crate::store::each_shard(|i| format!(
-            "select * from (select max(size), coalesce(display_name, name), group_name from s{i}.releases)"
+            "select * from (select max(size), coalesce(display_name, name), group_name from s{i}.releases
+             where not atlas_blocked(group_name))"
         ))
     );
     c.biggest = conn
