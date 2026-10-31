@@ -76,6 +76,9 @@ pub struct Load {
     pub writer_checkpoint_ns: AtomicU64,
     /// part of writer_busy spent sealing files between transactions
     pub writer_seal_ns: AtomicU64,
+    /// time on the processing stage's writes, and how many
+    pub writer_stage_ns: AtomicU64,
+    pub writer_stage_jobs: AtomicU64,
     /// files (or whole seal ticks) that failed to seal
     pub writer_seal_errors: AtomicU64,
     /// time header requests spent on the wire, and how many there were
@@ -85,6 +88,9 @@ pub struct Load {
     pub lease_wait_ns: AtomicU64,
     /// time spent parsing headers into releases
     pub parse_ns: AtomicU64,
+    /// bodies background work fetched, and their bytes
+    pub bg_bodies: AtomicU64,
+    pub bg_body_bytes: AtomicU64,
 }
 
 pub static LOAD: Load = Load {
@@ -94,11 +100,15 @@ pub static LOAD: Load = Load {
     writer_queued: AtomicU64::new(0),
     writer_checkpoint_ns: AtomicU64::new(0),
     writer_seal_ns: AtomicU64::new(0),
+    writer_stage_ns: AtomicU64::new(0),
+    writer_stage_jobs: AtomicU64::new(0),
     writer_seal_errors: AtomicU64::new(0),
     xover_ns: AtomicU64::new(0),
     xovers: AtomicU64::new(0),
     lease_wait_ns: AtomicU64::new(0),
     parse_ns: AtomicU64::new(0),
+    bg_bodies: AtomicU64::new(0),
+    bg_body_bytes: AtomicU64::new(0),
 };
 
 impl Load {
@@ -121,11 +131,15 @@ impl Load {
             "writer_queued": get(&self.writer_queued),
             "writer_checkpoint_ns": get(&self.writer_checkpoint_ns),
             "writer_seal_ns": get(&self.writer_seal_ns),
+            "writer_stage_ns": get(&self.writer_stage_ns),
+            "writer_stage_jobs": get(&self.writer_stage_jobs),
             "writer_seal_errors": get(&self.writer_seal_errors),
             "xover_ns": get(&self.xover_ns),
             "xovers": get(&self.xovers),
             "lease_wait_ns": get(&self.lease_wait_ns),
             "parse_ns": get(&self.parse_ns),
+            "bg_bodies": get(&self.bg_bodies),
+            "bg_body_bytes": get(&self.bg_body_bytes),
         })
     }
 }

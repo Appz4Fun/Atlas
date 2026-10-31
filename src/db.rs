@@ -442,11 +442,18 @@ pub fn save_releases_bulk(releases: &[Release]) -> anyhow::Result<()> {
     Ok(store::save(&main, releases)?)
 }
 
+/// past this many incomplete releases in a shard the menu's purge would hold one
+/// transaction for hours, and refuses
+const PURGE_BROKEN_MAX: i64 = 1_000_000;
+
 /// delete incomplete releases, returns bytes freed on disk. Refused while the
 /// database is being compacted, and holds off a compaction until done.
 pub fn purge_broken() -> anyhow::Result<i64> {
     let main = paths::database();
     let _writing = crate::compact::hold_off_compaction(&main)?;
+    if store::too_many_incomplete(&main, PURGE_BROKEN_MAX)? {
+        anyhow::bail!("too many incomplete releases for one transaction: use atlas --purge --dead");
+    }
     let size =
         || store::shard_paths(&main).iter().map(|p| fs::metadata(p).map(|m| m.len() as i64).unwrap_or(0)).sum::<i64>();
     let before = size();

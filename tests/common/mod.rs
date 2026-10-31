@@ -11,6 +11,8 @@ use std::time::Duration;
 use atlas::config::UsenetServer;
 use atlas::indexer::Indexer;
 
+pub mod stage;
+
 pub const GROUP: &str = "alt.binaries.test";
 
 #[derive(Clone)]
@@ -30,6 +32,8 @@ pub struct Server {
     pub password: &'static str,
     /// false = BODY always 430s, like a provider missing the article
     pub bodies: bool,
+    /// BODY answers 502, like a provider in trouble
+    pub body_trouble: bool,
     pub xover_delay: Duration,
     /// answer XFEATURE COMPRESS GZIP and send zlib compressed XOVER
     pub compress: bool,
@@ -76,6 +80,7 @@ impl Server {
             posts: Mutex::new(posts),
             password: "secret",
             bodies: true,
+            body_trouble: false,
             xover_delay: Duration::ZERO,
             compress: false,
             compress_broken: false,
@@ -289,6 +294,7 @@ pub fn serve(stream: TcpStream, state: &Server, over_limit: bool) {
                     }
                 }
             }
+            "BODY" if state.body_trouble => send(&mut out, b"502 try later"),
             "BODY" => match posts_lock().iter().find(|p| p.message_id == arg).filter(|_| state.bodies) {
                 Some(p) => {
                     thread::sleep(state.body_delay);
@@ -361,4 +367,33 @@ pub fn index_until_idle(indexer: &mut Indexer) {
         }
     }
     panic!("indexer never went idle");
+}
+
+/// A process `procs::indexer_alive` takes for the indexer, with bg_indexer.pid written.
+/// Killed when dropped.
+#[cfg(unix)]
+pub struct FakeIndexer(std::process::Child);
+
+#[cfg(unix)]
+impl Drop for FakeIndexer {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// `sysinfo` must see `--bg-indexer` in its arguments. `sleep 60; true`, because
+/// `sh -c 'sleep 60'` execs straight into sleep and loses it.
+#[cfg(unix)]
+pub fn fake_indexer(home: &std::path::Path) -> FakeIndexer {
+    let child = std::process::Command::new("sh").args(["-c", "sleep 60; true", "--bg-indexer"]).spawn().unwrap();
+    std::fs::write(home.join("bg_indexer.pid"), child.id().to_string()).unwrap();
+    FakeIndexer(child)
+}
+
+/// Every shard's inode: a compaction rewrites them all.
+#[cfg(unix)]
+pub fn shard_inodes(main: &std::path::Path) -> Vec<u64> {
+    use std::os::unix::fs::MetadataExt;
+    atlas::store::shard_paths(main).iter().map(|p| std::fs::metadata(p).unwrap().ino()).collect()
 }

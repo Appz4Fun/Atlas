@@ -75,6 +75,18 @@ pub fn decode(blob: &[u8]) -> Result<Vec<Seg>> {
     parse(&zstd::stream::decode_all(blob)?, usize::MAX)
 }
 
+/// How many segments a blob holds, unpacking only its start.
+pub fn count(blob: &[u8]) -> Result<usize> {
+    use std::io::Read;
+    let mut start = Vec::with_capacity(16);
+    zstd::stream::read::Decoder::new(blob)?.take(16).read_to_end(&mut start)?;
+    if start.first() != Some(&VERSION) {
+        return Err(Error::new(ErrorKind::InvalidData, "unknown blob version"));
+    }
+    let mut pos = 1;
+    Ok(get_varint(&start, &mut pos)? as usize)
+}
+
 /// the most local bytes a segment may have to be sealed: a file with a longer
 /// one stays rows (a message-id is 250 bytes at most, a stored one a domain
 /// suffix less)
@@ -223,5 +235,15 @@ mod tests {
     fn extreme_values_survive() {
         let segs = vec![seg(Some(0), i64::MAX, i64::MAX, b"a"), seg(Some(1), 0, 0, b"b"), seg(Some(2), -5, 1, b"c")];
         assert_eq!(decode(&encode(&segs)).unwrap(), segs);
+    }
+
+    #[test]
+    fn count_matches_decode() {
+        for n in [0usize, 1, 50_000] {
+            let segs: Vec<Seg> =
+                (0..n).map(|i| Seg { part: Some(i as i64), bytes: 10, domain: 0, local: vec![1, 2, 3] }).collect();
+            let blob = encode(&segs);
+            assert_eq!(count(&blob).unwrap(), decode(&blob).unwrap().len());
+        }
     }
 }

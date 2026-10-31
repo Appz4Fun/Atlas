@@ -24,6 +24,7 @@ pub mod nzb;
 pub mod par2;
 pub mod parser;
 pub mod paths;
+pub mod postprocess;
 pub mod procs;
 pub mod profile;
 pub mod sab;

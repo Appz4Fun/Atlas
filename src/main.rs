@@ -1,6 +1,6 @@
 use std::process::ExitCode;
 
-use atlas::{app, bg_indexer, compact, convert, db, paths, procs, store};
+use atlas::{app, bg_indexer, compact, convert, db, paths, postprocess, procs, store};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -13,7 +13,7 @@ fn main() -> ExitCode {
 
     if has("--help") || has("-h") {
         println!(
-            "atlas {}\n\nusage: atlas [--selftest | --bg-indexer | --convert]\n\n  (no args)     interactive menu\n  --selftest    check the login on every usenet server and exit\n  --bg-indexer  run the indexing loop headless (the menu starts this for you)\n  --convert     move a database from before the shards into them, then exit\n                (the indexer does this on its own when it starts)\n  --compact     rewrite the shards smaller (stop indexing first), then exit",
+            "atlas {}\n\nusage: atlas [--selftest | --bg-indexer | --convert]\n\n  (no args)     interactive menu\n  --selftest    check the login on every usenet server and exit\n  --bg-indexer  run the indexing loop headless (the menu starts this for you)\n  --convert     move a database from before the shards into them, then exit\n                (the indexer does this on its own when it starts)\n  --compact     rewrite the shards smaller (stop indexing first), then exit\n  --purge       delete what no step can help, a dry run unless --apply. Alone it takes\n                fragments only: [--fragments] [--blocked] [--too-small [--below BYTES]]\n                [--image-only] [--rejected] [--dead] [--sample N] [--apply]\n  --reprocess   look at stored releases again, a dry run unless --apply:\n                [--step NAME]... [--group NAME]... [--failed] [--apply]",
             env!("CARGO_PKG_VERSION")
         );
         return ExitCode::SUCCESS;
@@ -23,6 +23,10 @@ fn main() -> ExitCode {
         run_convert()
     } else if has("--compact") {
         run_compact()
+    } else if has("--purge") {
+        postprocess::purge::main(&args)
+    } else if has("--reprocess") {
+        postprocess::reprocess::main(&args)
     } else if has("--selftest") {
         app::selftest()
     } else if has(procs::BG_FLAG) {

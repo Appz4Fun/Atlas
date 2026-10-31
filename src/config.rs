@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::io;
@@ -150,6 +151,114 @@ pub struct Config {
     pub auto_run_compact: bool,
     /// None = DEFAULT_MAX_UNSAVED_HEADERS
     pub max_unsaved_headers: Option<u64>,
+    pub postprocess: PostprocessConfig,
+}
+
+/// A group's own floors, taken over the global ones when higher.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GroupRule {
+    pub min_size_bytes: i64,
+    pub min_files: i64,
+}
+
+/// The `postprocess` object of config.json, see the README. Each key has a
+/// default, and a bad value reads as absent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PostprocessConfig {
+    pub enabled: bool,
+    pub workers: usize,
+    pub settle_secs: i64,
+    pub complete_settle_secs: i64,
+    pub min_size_bytes: i64,
+    pub min_files: i64,
+    pub reject_par2_only: bool,
+    pub group_rules: HashMap<String, GroupRule>,
+    pub backlog_per_second: i64,
+    pub body_fetches_per_minute: i64,
+    pub body_connections: usize,
+    pub body_min_size_bytes: i64,
+    pub body_max_size_bytes: i64,
+    pub body_max_bytes: i64,
+    pub bodies_per_release: i64,
+    pub min_completion_percent: i64,
+    pub dead_after_secs: i64,
+    pub max_attempts: i64,
+}
+
+impl Default for PostprocessConfig {
+    fn default() -> Self {
+        PostprocessConfig {
+            enabled: true,
+            workers: 2,
+            settle_secs: 7200,
+            complete_settle_secs: 900,
+            min_size_bytes: 0,
+            min_files: 1,
+            reject_par2_only: true,
+            group_rules: HashMap::new(),
+            backlog_per_second: 2000,
+            body_fetches_per_minute: 0,
+            body_connections: 2,
+            body_min_size_bytes: 1 << 20,
+            body_max_size_bytes: 100 << 30,
+            body_max_bytes: 16 << 20,
+            bodies_per_release: 8,
+            min_completion_percent: 95,
+            dead_after_secs: 172_800,
+            max_attempts: 5,
+        }
+    }
+}
+
+impl PostprocessConfig {
+    fn from_value(v: Option<&Value>) -> PostprocessConfig {
+        let mut c = PostprocessConfig::default();
+        let Some(v) = v else { return c };
+        let int = |key: &str, slot: &mut i64, min: i64| {
+            if let Some(n) = v.get(key).and_then(as_int).filter(|n| *n >= min) {
+                *slot = n;
+            }
+        };
+        int("settle_secs", &mut c.settle_secs, 0);
+        int("complete_settle_secs", &mut c.complete_settle_secs, 0);
+        int("min_size_bytes", &mut c.min_size_bytes, 0);
+        int("min_files", &mut c.min_files, 0);
+        int("backlog_per_second", &mut c.backlog_per_second, 0);
+        int("body_fetches_per_minute", &mut c.body_fetches_per_minute, 0);
+        int("body_min_size_bytes", &mut c.body_min_size_bytes, 0);
+        int("body_max_size_bytes", &mut c.body_max_size_bytes, 0);
+        int("body_max_bytes", &mut c.body_max_bytes, 1);
+        int("bodies_per_release", &mut c.bodies_per_release, 0);
+        int("min_completion_percent", &mut c.min_completion_percent, 0);
+        int("dead_after_secs", &mut c.dead_after_secs, 0);
+        int("max_attempts", &mut c.max_attempts, 1);
+        c.settle_secs = c.settle_secs.max(1);
+        c.complete_settle_secs = c.complete_settle_secs.max(1);
+        c.min_completion_percent = c.min_completion_percent.min(100);
+        let count = |key: &str, slot: &mut usize| {
+            if let Some(n) = v.get(key).and_then(as_int).filter(|n| *n > 0) {
+                *slot = n as usize;
+            }
+        };
+        count("workers", &mut c.workers);
+        count("body_connections", &mut c.body_connections);
+        if let Some(b) = v.get("enabled").and_then(as_bool) {
+            c.enabled = b;
+        }
+        if let Some(b) = v.get("reject_par2_only").and_then(as_bool) {
+            c.reject_par2_only = b;
+        }
+        if let Some(rules) = v.get("group_rules").and_then(Value::as_object) {
+            for (group, rule) in rules {
+                let field = |key: &str| rule.get(key).and_then(as_int).filter(|n| *n >= 0).unwrap_or(0);
+                c.group_rules.insert(
+                    group.clone(),
+                    GroupRule { min_size_bytes: field("min_size_bytes"), min_files: field("min_files") },
+                );
+            }
+        }
+        c
+    }
 }
 
 impl Default for Config {
@@ -168,6 +277,7 @@ impl Default for Config {
             parallel_groups: None,
             auto_run_compact: false,
             max_unsaved_headers: None,
+            postprocess: PostprocessConfig::default(),
         }
     }
 }
@@ -310,6 +420,7 @@ impl Config {
                 .and_then(|n| usize::try_from(n).ok())
                 .filter(|n| *n > 0),
             auto_run_compact: v.get("auto_run_compact").and_then(Value::as_bool).unwrap_or(false),
+            postprocess: PostprocessConfig::from_value(v.get("postprocess")),
             max_unsaved_headers: v
                 .get("max_unsaved_headers")
                 .and_then(as_int)
@@ -444,6 +555,12 @@ pub fn load_config() -> Option<Config> {
     }
 
     Some(cfg)
+}
+
+/// The settings in config.json, for a command that needs no password:
+/// `load_config` asks the keyring.
+pub fn load_settings() -> Config {
+    read_file().map_or_else(Config::default, |v| Config::from_value(&v))
 }
 
 /// Persist the config, keeping any keys in config.json atlas doesnt know about.
@@ -757,5 +874,50 @@ mod tests {
         assert!(!cfg.servers[1].indexes());
         assert!(cfg.servers[0].to_value(true).get("index").is_none());
         assert!(cfg.servers[1].to_value(true)["index"] == false);
+    }
+
+    #[test]
+    fn postprocess_defaults_when_absent() {
+        let c = Config::from_value(&json!({}));
+        assert_eq!(c.postprocess, PostprocessConfig::default());
+        assert!(c.postprocess.enabled);
+        assert_eq!(c.postprocess.body_fetches_per_minute, 0, "no bodies unless asked");
+    }
+
+    #[test]
+    fn postprocess_keys_parse() {
+        let c = Config::from_value(&json!({"postprocess": {
+            "enabled": false, "workers": 3, "settle_secs": 60, "complete_settle_secs": 30, "min_size_bytes": 5,
+            "min_files": 2, "reject_par2_only": false, "backlog_per_second": 10, "body_fetches_per_minute": 300,
+            "body_connections": 4, "body_min_size_bytes": 7, "body_max_size_bytes": 8, "body_max_bytes": 9,
+            "bodies_per_release": 2, "min_completion_percent": 90, "dead_after_secs": 11, "max_attempts": 3,
+            "group_rules": {"alt.binaries.x": {"min_size_bytes": 100, "min_files": 2}}
+        }}))
+        .postprocess;
+        assert!(!c.enabled && !c.reject_par2_only);
+        assert_eq!((c.workers, c.body_connections), (3, 4));
+        assert_eq!((c.settle_secs, c.complete_settle_secs, c.min_size_bytes, c.min_files), (60, 30, 5, 2));
+        assert_eq!((c.backlog_per_second, c.body_fetches_per_minute), (10, 300));
+        assert_eq!((c.body_min_size_bytes, c.body_max_size_bytes, c.body_max_bytes), (7, 8, 9));
+        assert_eq!((c.bodies_per_release, c.min_completion_percent, c.dead_after_secs, c.max_attempts), (2, 90, 11, 3));
+        assert_eq!(c.group_rules["alt.binaries.x"], GroupRule { min_size_bytes: 100, min_files: 2 });
+    }
+
+    #[test]
+    fn a_bad_value_falls_back() {
+        let c = Config::from_value(&json!({"postprocess": {
+            "enabled": "maybe", "workers": 0, "settle_secs": 0, "complete_settle_secs": -5, "body_fetches_per_minute": "lots",
+            "min_completion_percent": 500, "max_attempts": 0, "group_rules": 7
+        }}))
+        .postprocess;
+        assert!(c.enabled);
+        assert_eq!(c.workers, 2);
+        assert_eq!(c.settle_secs, 1, "floored");
+        assert_eq!(c.complete_settle_secs, 900);
+        assert_eq!(c.body_fetches_per_minute, 0);
+        assert_eq!(c.min_completion_percent, 100);
+        assert_eq!(c.max_attempts, 5);
+        assert!(c.group_rules.is_empty());
+        assert_eq!(Config::from_value(&json!({"postprocess": 3})).postprocess, PostprocessConfig::default());
     }
 }
