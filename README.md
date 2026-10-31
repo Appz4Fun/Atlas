@@ -245,6 +245,8 @@ Some uploads give every article its own random subject, so each article would be
 
 Rows already stored from a blocked group stop being served as soon as you run this build, with no purge needed. They stay on disk until you delete them.
 
+A multi-file post becomes one release, whatever its files are called, across slices, servers, and days. Atlas decides this from the post's file counter and from per-group collection regexes, and the subject alone settles it, so every server agrees. A post being indexed when you upgrade stays split by file for the files already started.
+
 ### Splitting big groups
 
 When two or more indexing servers carry a group and its backfill has more than `split_min_backlog` article numbers left, Atlas splits the rest of its history into UTC day chunks. A worker with nothing of its own to do claims the newest pending chunk on any server that carries the group, so idle connections help with big groups. A server that doesn't keep a day from its start, because its retention is shorter, gives the chunk back for a server that does. No server keeps the oldest day of the split from its start; the server that goes back furthest on it indexes what there is. Every hour, and when the indexer starts, Atlas checks whether a server now goes back further, for example one you added. If one does, the older days get chunks too, and the old oldest day is done again in full. Live indexing stays on the group's home server. The Backfill page of the stats dashboard shows split groups and their day chunks.
@@ -253,7 +255,7 @@ When two or more indexing servers carry a group and its backfill has more than `
 
 Atlas splits releases and their articles over 8 database files next to `atlas.db`, named `atlas.s0.db` to `atlas.s7.db`, by group. Each file has its own writer thread, so the 8 save in parallel, and slices that arrive while a writer is busy are saved together in one transaction. `atlas.db` keeps the per-group cursors.
 
-Articles are stored compactly, at about a quarter of the space of the old layout: each file of a release is stored once with the subject its NZB uses, and each article is a short row with its message ID, part number, and size. Message ID locals are packed by alphabet using specialized encodings (hex at half the size for hexadecimal locals, base-N encoding for other alphabets), and domains are shared. NZBs come out exactly as before.
+Articles are stored compactly, at about a quarter of the space of the old layout: a post's files share one release through the `collections` table, each file of a release is stored once with the subject its NZB uses, and each article is a short row with its message ID, part number, and size. Message ID locals are packed by alphabet using specialized encodings (hex at half the size for hexadecimal locals, base-N encoding for other alphabets), and domains are shared. NZBs come out exactly as before.
 
 Atlas seals each file that is complete, or untouched for three days, into one zstd-compressed blob, which takes far less space than its article rows. Each shard writer seals the files its own saves completed between saves, up to 2,000 files or 100 milliseconds at a time, and looks through its shard for files untouched for three days once a minute. Writers leave files from before the upgrade alone; the first `--compact` seals those. Articles that arrive after a file is sealed are stored as rows and merged into its NZB. The `--compact` command seals every file that's due and re-encodes message IDs across the whole database.
 
@@ -292,7 +294,7 @@ Menu option 5 shows the indexer status, totals, a graph of headers per second ov
 - **All groups:** searches everything you've indexed.
 - **Obfuscated posts:** lists releases that still only have a random name.
 
-Searches match both the posted name and the real name found in par2 and nfo files. Choose a result to see its files and save its NZB.
+Searches match both the posted name and the real name found in par2 and nfo files. A post of several files shows the name of one of its files until a better name is found. Choose a result to see its files and save its NZB.
 
 AI search lets you describe what you want in plain language, for example `find me 4k hdr movies`. The AI picks the groups and keywords, then fetches anything missing from your database. It needs [Ollama](https://ollama.com) running with the `qwen3:4b` model, or the model set in `ATLAS_AI_MODEL`. Speed depends on your hardware.
 
@@ -503,6 +505,7 @@ CI (`.github/workflows/ci.yml`) checks formatting, runs clippy, and runs the tes
 | `src/indexer.rs` | One indexing pass over a group: slices, parsing, naming, and saving. |
 | `src/bg_indexer.rs` | The background scheduler: workers per server, live config reload, and status and stats files. |
 | `src/parser.rs`, `src/par2.rs`, `src/nfo.rs` | Subjects to releases, and real names from par2 and nfo files. |
+| `src/collections.rs`, `data/collection_regexes.tsv` | Which articles belong to one post: per-group regexes and a generic cleaner. `scripts/collection_regexes_to_tsv.py` makes the data file from the upstream seeder. |
 | `src/filters.rs` | What Atlas refuses to index: posts obfuscated per article and blocked groups. |
 | `src/db.rs` | The main database: group cursors, connections, and checkpoints. |
 | `src/store.rs` | The 8 shard files: compact layout, release IDs, saving, and reading articles back. |
@@ -513,12 +516,17 @@ CI (`.github/workflows/ci.yml`) checks formatting, runs clippy, and runs the tes
 | `src/dashboard.rs`, `src/stats_dashboard.rs` | The live dashboard and the stats dashboard. |
 | `src/profile.rs` | Timing counters for `ATLAS_PROFILE`, and the load counters behind the Bottleneck page. |
 | `examples/probe_connections.rs` | Connection limit probe. |
+| `examples/bench_collections.rs` | What collection grouping costs against grouping by file name. |
 | `examples/bench_filters.rs` | What the ingest filters cost per article and per call. |
 | `examples/bench_writes.rs` | Database write benchmark. Run it on a copy of a real database, for example an APFS clone made with `cp -c`. |
 
 ## Limitations
 
 - An upload obfuscated per article is recognized only with 16 of its middle parts in one slice, so files under 18 parts and stragglers at a slice's edge become releases as before.
+- Files merge into one release only when a counter or a collection regex of the group says they belong together.
+- Two same-day posts by one poster with the same shape and file count merge, and that release stays incomplete.
+- A pack merges only when each file's `[n/m]` equals its own number, so a pack with an nfo first stays by file.
+- Album tracks named with the track number first stay by file.
 - Deobfuscation works only when a release has a par2 or nfo file with a usable name.
 - Atlas reports every release as category `7000` (Other), so clients that only search TV or movie categories might skip it.
 - Search matches release names only, so searches by ID, such as TVDB or IMDb, return nothing.
@@ -531,7 +539,7 @@ AI helped with bug fixes, refactoring, SABnzbd integration, the background index
 
 The Rust port, with multi-server parallel indexing, the async NNTP client, the stats dashboard, and the extended Newznab API, lives in the [Appz4Fun fork](https://github.com/Appz4Fun/Atlas).
 
-The rule for articles obfuscated per article is ported from [newznab-tmux](https://github.com/xbmc4lyfe/newznab-tmux), GPLv3.
+The rule for articles obfuscated per article, and the collection regexes and cleaner, are ported from [newznab-tmux](https://github.com/xbmc4lyfe/newznab-tmux), GPLv3.
 
 ## License
 
