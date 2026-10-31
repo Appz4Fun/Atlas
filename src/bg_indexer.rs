@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -17,6 +17,7 @@ use crate::db;
 use crate::indexer::{Db, NotCarried, PassContext, PassSettings, Progress, RunStates, TooOld, run_pass, shared_db};
 use crate::nntp::{Pool, unless_stopped};
 use crate::paths;
+use crate::postprocess::{Stage, StageParams};
 use crate::sab;
 use crate::ui;
 
@@ -53,6 +54,7 @@ fn write_status(running: bool, group: &str, mode: &str, idle: bool, status: &str
         "status": status,
         "error_count": errors,
         "pid": std::process::id(),
+        "postprocess_backlog": crate::postprocess::stats::backlog(),
     });
 
     if let Err(e) = write_atomic(&paths::status_file(), data.to_string()) {
@@ -280,6 +282,9 @@ struct Scheduler {
     groups: RwLock<Vec<String>>,
     /// configured groups left out of `groups`, see `filters::group_blocked`
     blocked: Mutex<Vec<String>>,
+    /// the processing stage, when it's on
+    stage: OnceLock<Arc<Stage>>,
+    stage_on: bool,
     /// (server, groups at once) for every indexing server
     plan: Vec<(usize, usize)>,
     workers: usize,
@@ -461,6 +466,9 @@ impl Scheduler {
         stats.extra.insert("servers".into(), json!(self.ctx.pool.server_stats()));
         stats.extra.insert("groups_configured".into(), json!(groups.len()));
         stats.extra.insert("groups_blocked".into(), json!(self.blocked.lock().unwrap().len()));
+        if let Some(stage) = self.stage.get() {
+            stats.extra.insert("postprocess".into(), stage.snapshot());
+        }
         stats.extra.insert("workers".into(), json!(self.workers));
         stats.extra.insert("pid".into(), json!(std::process::id()));
         let mut load = crate::profile::LOAD.snapshot();
@@ -624,6 +632,14 @@ async fn worker(sched: Arc<Scheduler>, server: usize, db: Db) {
     }
 }
 
+/// a config the running indexer cant take on as it is
+fn needs_rebuild(sched: &Scheduler, config: &Config, servers: &[UsenetServer]) -> bool {
+    usable_servers(config) != servers
+        || plan_workers(config) != sched.plan
+        || config.max_unsaved_headers() != sched.ctx.pool.max_unsaved()
+        || config.postprocess.enabled != sched.stage_on
+}
+
 /// Re-read config.json while indexing: new groups / mode / batch settings /
 /// auto compaction apply right away. Returns when servers, the parallelism or
 /// the unsaved headers cap changed (the caller rebuilds) or when stopping.
@@ -636,13 +652,14 @@ async fn watch_config(sched: Arc<Scheduler>, servers: Vec<UsenetServer>) {
 
         let Some(config) = load_config() else { continue };
 
-        if usable_servers(&config) != servers
-            || plan_workers(&config) != sched.plan
-            || config.max_unsaved_headers() != sched.ctx.pool.max_unsaved()
-        {
+        if needs_rebuild(&sched, &config, &servers) {
             println!("config changed, restarting the indexer");
             sched.wind_down.store(true, Ordering::Relaxed);
             return;
+        }
+        if let Some(stage) = sched.stage.get() {
+            let (stage, config) = (stage.clone(), config.clone());
+            let _ = tokio::task::spawn_blocking(move || stage.set_config(&config)).await;
         }
 
         let auto = config.auto_run_compact;
@@ -741,6 +758,8 @@ async fn run_servers(
         settings: RwLock::new(settings_of(config)),
         groups: RwLock::new(groups),
         blocked: Mutex::new(config.blocked_groups()),
+        stage: OnceLock::new(),
+        stage_on: config.postprocess.enabled,
         plan: plan.clone(),
         workers,
         next: Mutex::new(HashMap::new()),
@@ -782,6 +801,19 @@ async fn run_servers(
     let checkpointer = db::checkpointer(checkpoint_stop.clone());
 
     let mut tasks = tokio::task::JoinSet::new();
+    if config.postprocess.enabled {
+        let stage = Stage::start(StageParams {
+            main: paths::database(),
+            db: db.clone(),
+            pool: sched.ctx.pool.clone(),
+            config: config.clone(),
+            steps: crate::postprocess::steps_to_run(),
+            handle: tokio::runtime::Handle::current(),
+        });
+        let _ = sched.stage.set(stage.clone());
+        let s = sched.clone();
+        tasks.spawn(crate::postprocess::run(stage, move || s.stopping()));
+    }
     for &(server, count) in &plan {
         for _ in 0..count {
             tasks.spawn(worker(sched.clone(), server, db.clone()));
@@ -1102,6 +1134,8 @@ mod tests {
             settings: RwLock::new(PassSettings { mode: "backfill".into(), ..PassSettings::default() }),
             groups: RwLock::new(groups),
             blocked: Mutex::new(Vec::new()),
+            stage: OnceLock::new(),
+            stage_on: true,
             plan: vec![],
             workers: 2,
             next: Default::default(),
@@ -1197,5 +1231,18 @@ mod tests {
             // and the sweep again after the group
             assert!(matches!(next_work(&sched, server, &db, false).await, Some(Work::Sweep(g)) if g == "done"));
         });
+    }
+
+    #[test]
+    fn a_stage_turning_on_or_off_rebuilds() {
+        let sched = scheduler(Pool::new(&[]), vec![]);
+        let mut config = Config::default();
+        let servers = usable_servers(&config);
+        config.max_unsaved_headers = Some(sched.ctx.pool.max_unsaved() as u64);
+        let plan_same = plan_workers(&config) == sched.plan;
+        assert!(plan_same);
+        assert!(!needs_rebuild(&sched, &config, &servers));
+        config.postprocess.enabled = false;
+        assert!(needs_rebuild(&sched, &config, &servers));
     }
 }

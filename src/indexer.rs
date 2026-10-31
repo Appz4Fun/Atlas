@@ -2185,7 +2185,7 @@ mod tests {
         drop(gone);
         crate::profile::LOAD.writer_queued.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let shard = crate::store::shard_of("alt.binaries.t");
-        shared.saves[shard].send(SaveJob { releases: vec![release("dropped")], done }).unwrap();
+        shared.saves[shard].send(WriterJob::Save(SaveJob { releases: vec![release("dropped")], done })).unwrap();
         let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
         rt.block_on(shared.save(vec![release("kept")])).unwrap();
         drop(shared);

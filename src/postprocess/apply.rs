@@ -514,7 +514,7 @@ mod tests {
         assert_eq!(state(&conn, id).2, None, "done");
         run(&conn, Applied { release_id: id, net_mask: A, clear: A, ..Default::default() });
         assert_eq!(state(&conn, id).2, Some(1), "clear takes it back");
-        run(&conn, Applied { release_id: id, net_mask: A, set_failed: A, ..Default::default() });
+        run(&conn, Applied { release_id: id, claimed_gen: 1, net_mask: A, set_failed: A, ..Default::default() });
         assert_eq!(state(&conn, id).2, None, "failed");
     }
 

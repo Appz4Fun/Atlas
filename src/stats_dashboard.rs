@@ -24,7 +24,7 @@ use crate::dashboard::{human_bytes, human_time};
 use crate::db;
 use crate::paths;
 
-const PAGES: [&str; 5] = ["Overview", "Backfill", "Content", "Servers", "Bottleneck"];
+const PAGES: [&str; 6] = ["Overview", "Backfill", "Content", "Servers", "Bottleneck", "Post-processing"];
 /// file types counted on the content page
 const FILE_TYPES: [&str; 12] = ["mkv", "mp4", "avi", "m4v", "iso", "m4a", "flac", "mp3", "epub", "pdf", "exe", "nzb"];
 
@@ -554,13 +554,14 @@ fn draw(f: &mut Frame, app: &App) {
         1 => draw_backfill(f, app, body),
         2 => draw_content(f, app, body),
         3 => draw_servers(f, app, body),
-        _ => draw_bottleneck(f, app, body),
+        4 => draw_bottleneck(f, app, body),
+        _ => draw_postprocess(f, app, body),
     }
 
     let keys = match app.page {
-        0 => "  ←/→ or 1-5 pages   w 30m/6h graph   q back",
-        2 => "  ←/→ or 1-5 pages   r recount   q back",
-        _ => "  ←/→ or 1-5 pages   q back",
+        0 => "  ←/→ or 1-6 pages   w 30m/6h graph   q back",
+        2 => "  ←/→ or 1-6 pages   r recount   q back",
+        _ => "  ←/→ or 1-6 pages   q back",
     };
     f.render_widget(Paragraph::new(Line::raw(keys).dim()), foot);
 }
@@ -1034,6 +1035,58 @@ fn bar_text(share: f64, width: usize) -> String {
     format!("{}{}", "█".repeat(filled), "░".repeat(width - filled))
 }
 
+/// a bounded count: at its bound there may be more
+fn bounded(n: i64, bound: i64) -> String {
+    if n >= bound { format!("{}k+", bound / 1000) } else { count(n) }
+}
+
+/// The processing stage, from stats.json alone.
+fn draw_postprocess(f: &mut Frame, app: &App, area: Rect) {
+    let p = &app.stats["postprocess"];
+    let n = |key: &str| p[key].as_i64().unwrap_or(0);
+    let [top, bottom] = Layout::vertical([Constraint::Length(9), Constraint::Min(8)]).areas(area);
+    let [a, b] = Layout::horizontal([Constraint::Ratio(1, 2); 2]).areas(top);
+    let [c, d] = Layout::horizontal([Constraint::Ratio(1, 2); 2]).areas(bottom);
+
+    let backlog = vec![
+        kv("due now", bounded(n("queue_due"), 100_000)),
+        kv("waiting for network", bounded(n("net_wanted"), 1_000_000)),
+        kv("failed", bounded(n("failed"), 100_000)),
+        kv("errors", count(n("errors"))),
+    ];
+    f.render_widget(Paragraph::new(backlog).block(panel("backlog")), a);
+
+    let (left, total) = (p["walk"]["left"].as_i64().unwrap_or(0), p["walk"]["total"].as_i64().unwrap_or(0));
+    let per_second = n("backlog_per_second");
+    let walk_done =
+        if total > 0 { format!("{:.1}%", (total - left) as f64 * 100.0 / total as f64) } else { "-".into() };
+    let walks = vec![
+        kv("walk", walk_done),
+        kv("rows looked at", count(p["walk"]["rows"].as_i64().unwrap_or(0))),
+        kv("rows/s allowed", count(per_second)),
+        kv(
+            "time left at that",
+            if per_second > 0 && total > 0 { human_time((total - left).max(0) / per_second) } else { "-".into() },
+        ),
+    ];
+    f.render_widget(Paragraph::new(walks).block(panel("walks")), b);
+
+    let steps = vec![
+        kv("steps done", count(n("steps_done"))),
+        kv("matched", count(n("matched"))),
+        kv("no match", count(n("unmatched"))),
+        kv("retries", count(n("retries"))),
+        kv("bodies", count(n("bodies"))),
+        kv("body bytes", human_bytes(n("body_bytes") as f64)),
+        kv("budget per minute", count(n("budget_per_minute"))),
+    ];
+    f.render_widget(Paragraph::new(steps).block(panel("steps")), c);
+
+    let reasons = ["blocked", "empty", "too_small", "fragment", "too_few_files", "par2_only"];
+    let rejected: Vec<Line> = reasons.iter().map(|r| kv(r, count(p["rejected"][*r].as_i64().unwrap_or(0)))).collect();
+    f.render_widget(Paragraph::new(rejected).block(panel("rejected")), d);
+}
+
 fn draw_bottleneck(f: &mut Frame, app: &App, area: Rect) {
     let [verdict, table, help] =
         Layout::vertical([Constraint::Length(5), Constraint::Length(11), Constraint::Min(4)]).areas(area);
@@ -1233,7 +1286,7 @@ pub fn run() -> std::io::Result<()> {
                     KeyCode::Left | KeyCode::BackTab | KeyCode::Char('h') => {
                         app.page = (app.page + PAGES.len() - 1) % PAGES.len()
                     }
-                    KeyCode::Char(c @ '1'..='5') => app.page = c as usize - '1' as usize,
+                    KeyCode::Char(c @ '1'..='6') => app.page = c as usize - '1' as usize,
                     KeyCode::Char('w') => app.long_graph = !app.long_graph,
                     KeyCode::Char('r') if app.page == 2 => start_content(&app.content),
                     _ => {}
@@ -1478,6 +1531,8 @@ mod tests {
             page: 0,
             long_graph: false,
             stats: serde_json::json!({
+                "postprocess": {"queue_due": 3, "net_wanted": 1, "failed": 0, "walk": {"left": 5, "total": 10, "rows": 2},
+                    "rejected": {"fragment": 2}, "backlog_per_second": 2000},
                 "mode": "backfill", "uptime": 3600, "total_articles": 1_000_000, "rate_bin": 10,
                 "rate": [[now() as i64 / 10 * 10 - 10, 50_000, 0]],
                 "servers": [{"host": "news.x", "priority": 1, "state": "ok", "indexing": true, "in_use": 3,
@@ -1520,6 +1575,7 @@ mod tests {
                         && text.contains("complete NZBs     5 (50.0%)")
                 ),
                 3 => assert!(text.contains("news.x") && text.contains("75%")),
+                5 => assert!(text.contains("walk") && text.contains("due now")),
                 _ => {}
             }
         }

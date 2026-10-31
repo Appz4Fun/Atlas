@@ -56,7 +56,8 @@ pub(crate) struct Inner {
     stats: Arc<Stats>,
     /// no net claims before this
     net_paused_until: AtomicI64,
-    claims: AtomicI64,
+    /// per shard: every 8th claim of a shard takes its oldest
+    claims: [AtomicI64; SHARDS],
     tokens: Mutex<Vec<TokenBucket>>,
 }
 
@@ -177,7 +178,7 @@ impl Inner {
             fetcher,
             stats,
             net_paused_until: AtomicI64::new(0),
-            claims: AtomicI64::new(0),
+            claims: std::array::from_fn(|_| AtomicI64::new(0)),
             tokens: Mutex::new((0..SHARDS).map(|_| TokenBucket::new()).collect()),
         };
         inner.set_config(&p.config);
@@ -711,7 +712,7 @@ impl Inner {
     fn net_claim(&self, conn: &Connection, db: &Db, shard: usize) -> anyhow::Result<bool> {
         let now = chrono::Utc::now().timestamp();
         // new posts are worth most, and every 8th claim keeps history moving
-        let oldest = self.claims.fetch_add(1, Relaxed) % 8 == 7;
+        let oldest = self.claims[shard].load(Relaxed) % 8 == 7;
         let order = if oldest { "asc" } else { "desc" };
         let ids: Vec<i64> = conn
             .prepare_cached(&format!(
@@ -722,6 +723,7 @@ impl Inner {
         if ids.is_empty() {
             return Ok(false);
         }
+        self.claims[shard].fetch_add(1, Relaxed);
         for id in ids {
             if self.stopping() {
                 break;

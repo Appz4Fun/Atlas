@@ -1744,6 +1744,47 @@ pub(crate) fn seen_count(bits: &[u8]) -> i64 {
     bits.iter().map(|b| i64::from(b.count_ones())).sum()
 }
 
+/// What deleting a release took.
+pub(crate) struct Deleted {
+    pub articles: i64,
+}
+
+/// A release and everything of its, in the caller's transaction: triggers take
+/// its search entry and registered rows. Counts what `meta.articles` must lose.
+pub(crate) fn delete_release(tx: &Connection, release_id: i64) -> Result<Deleted> {
+    let mut articles = 0i64;
+    let files: Vec<(i64, Option<Vec<u8>>)> = tx
+        .prepare_cached("select id, blob from files where release_id = ?")?
+        .query_map([release_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<Result<_>>()?;
+    for (file, blob) in files {
+        if let Some(blob) = blob {
+            articles += crate::blob::count(&blob).map_err(blob_error)? as i64;
+        }
+        articles += tx.prepare_cached("delete from segments where file_id = ?")?.execute([file])? as i64;
+        tx.prepare_cached("delete from held_back where file_id = ?")?.execute([file])?;
+    }
+    tx.prepare_cached("delete from release_ids where release_id = ?")?.execute([release_id])?;
+    tx.prepare_cached("delete from files where release_id = ?")?.execute([release_id])?;
+    tx.prepare_cached("delete from releases where id = ?")?.execute([release_id])?;
+    Ok(Deleted { articles })
+}
+
+/// Whether a shard holds `limit` or more incomplete releases.
+pub fn too_many_incomplete(main: &Path, limit: i64) -> Result<bool> {
+    for path in shard_paths(main) {
+        let conn = db::open_shard(&path)?;
+        let n: i64 =
+            conn.query_row("select count(*) from (select 1 from releases where complete = 0 limit ?)", [limit], |r| {
+                r.get(0)
+            })?;
+        if n >= limit {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// A release's files, `limit` at most. `conn` is one shard opened on its own.
 pub fn release_files(conn: &Connection, release_id: i64, limit: usize) -> Result<Vec<FileInfo>> {
     conn.prepare_cached(

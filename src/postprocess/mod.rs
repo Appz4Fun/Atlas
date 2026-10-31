@@ -4,8 +4,11 @@
 //! `reprocess` work on the same tables. Rules ported from newznab-tmux, see `rules.rs`.
 
 pub(crate) mod apply;
+pub mod batch;
 pub mod bodies;
 pub(crate) mod engine;
+pub mod purge;
+pub mod reprocess;
 pub mod rules;
 pub mod schema;
 pub mod stats;

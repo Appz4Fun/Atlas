@@ -2540,6 +2540,7 @@ mod tests {
             let conn = db::open_at(&path).unwrap();
             conn.execute("update releases set name_source = 7 where id = ?", [id]).unwrap();
             for table in tables {
+                conn.execute(&format!("delete from {}", table.name), []).unwrap();
                 crate::postprocess::schema::sample_row(&conn, table, id).unwrap();
                 before.push((path.clone(), table.name, dump(&conn, table.name)));
             }
@@ -2667,7 +2668,7 @@ mod tests {
             .unwrap();
         let conn = db::open_at(&path).unwrap();
         let id: i64 = conn.query_row("select min(id) from releases", [], |r| r.get(0)).unwrap();
-        conn.execute("insert into pp_queue (release_id, due_at) values (?, 1)", [id]).unwrap();
+        conn.execute("insert or replace into pp_queue (release_id, due_at) values (?, 1)", [id]).unwrap();
         checkpoint(&conn).unwrap();
         let n = store::article_count(&conn, "main").unwrap();
         drop(conn);

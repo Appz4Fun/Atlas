@@ -379,6 +379,8 @@ fn newest_goes_first_and_every_eighth_claim_takes_the_oldest() {
         "insert into pp_state (release_id, net_wanted) select id, 1 from releases; delete from pp_queue;",
     )
     .unwrap();
+    // settled, soo every claim runs
+    std::thread::sleep(Duration::from_millis(1200));
     let step = TestStep::new(1, "net", 100, Needs::External, &log);
     h.start(vec![step.arc()], PostprocessConfig { body_connections: 1, backlog_per_second: 0, ..quick_config() });
     wait_for("all ran", || runs_of(&log, "net") == 30);

@@ -364,3 +364,32 @@ pub fn index_until_idle(indexer: &mut Indexer) {
     }
     panic!("indexer never went idle");
 }
+
+/// A process `procs::indexer_alive` takes for the indexer, with bg_indexer.pid written.
+/// Killed when dropped.
+#[cfg(unix)]
+pub struct FakeIndexer(std::process::Child);
+
+#[cfg(unix)]
+impl Drop for FakeIndexer {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// `sysinfo` must see `--bg-indexer` in its arguments. `sleep 60; true`, because
+/// `sh -c 'sleep 60'` execs straight into sleep and loses it.
+#[cfg(unix)]
+pub fn fake_indexer(home: &std::path::Path) -> FakeIndexer {
+    let child = std::process::Command::new("sh").args(["-c", "sleep 60; true", "--bg-indexer"]).spawn().unwrap();
+    std::fs::write(home.join("bg_indexer.pid"), child.id().to_string()).unwrap();
+    FakeIndexer(child)
+}
+
+/// Every shard's inode: a compaction rewrites them all.
+#[cfg(unix)]
+pub fn shard_inodes(main: &std::path::Path) -> Vec<u64> {
+    use std::os::unix::fs::MetadataExt;
+    atlas::store::shard_paths(main).iter().map(|p| std::fs::metadata(p).unwrap().ino()).collect()
+}

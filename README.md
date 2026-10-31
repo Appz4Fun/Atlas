@@ -140,9 +140,35 @@ On first run, Atlas asks for one server (host, username, password, and port) and
 | `api_key` | generated | Newznab API key. Atlas creates it on first start and stores it here. |
 | `split_min_backlog` | `10000000` | Article numbers of backfill left before a group's backfill is split into day chunks that every server carrying the group can take. |
 | `auto_run_compact` | `false` | Compact the database every 24 hours; indexing pauses while it runs. |
+| `postprocess` | see below | The stage releases go through after saving. See [Post-processing keys](#post-processing-keys). |
 | `max_unsaved_headers` | `500000` | Headers the indexer fetches ahead of saving them, over all groups at once. This bounds its memory: 500,000 headers take about 0.3 GB. A header request waits for room before it goes out, and its room comes back once its slice is saved. Raise it if the Bottleneck page shows it full while the database writers and connections have time to spare. Set below `request_size`, header requests are cut down to it, which makes them small and slow. |
 
 Atlas keeps any other keys you add to the file when it saves it.
+
+### Post-processing keys
+
+All of these go in a `postprocess` object, and each has a default. See [Post-processing](#post-processing).
+
+| Key | Default | Meaning |
+|---|---|---|
+| `enabled` | `true` | Run the stage. It uses no network on its own. While it's off, saves still queue releases for it. |
+| `workers` | `2` | Threads for database steps. |
+| `settle_secs` | `7200` | Quiet time before an incomplete release is looked at. |
+| `complete_settle_secs` | `900` | The same for a complete release. |
+| `min_size_bytes` | `0` | Reject anything smaller. `0` is off. |
+| `min_files` | `1` | Reject anything with fewer files. |
+| `reject_par2_only` | `true` | Reject a post whose files are all par2. |
+| `group_rules` | `{}` | `{"group": {"min_size_bytes": n, "min_files": n}}`. The larger of a group's value and the global one counts. |
+| `backlog_per_second` | `2000` | Existing releases looked at, over all shards. `0` stops it. |
+| `body_fetches_per_minute` | `0` | Body budget. At `0`, nothing fetches bodies. |
+| `body_connections` | `2` | Bodies in flight at once. |
+| `body_min_size_bytes` | `1048576` | A smaller release gets no body. |
+| `body_max_size_bytes` | `107374182400` | A larger release gets no body. `0` is no limit. |
+| `body_max_bytes` | `16777216` | Largest article read. |
+| `bodies_per_release` | `8` | Bodies per run of a step. |
+| `min_completion_percent` | `95` | Below this a release gets no body, and `--purge --dead` can take it. |
+| `dead_after_secs` | `172800` | Quiet time before purge may delete anything but a blocked group's rows. |
+| `max_attempts` | `5` | Failed attempts before a step gives up on a release. |
 
 ### Server fields (`usenet_servers`)
 
@@ -280,9 +306,42 @@ The `--compact` command rewrites every shard into a fresh database file while th
 
 With `auto_run_compact` set to `true`, the indexer compacts the database every 24 hours. Indexing pauses while it runs and resumes afterward. Stopping the indexer during a compaction stops it within seconds and keeps the originals of unfinished shards. A failed shard is tried again 24 hours later. While a compaction runs, it holds a lock on the `atlas.compacting` file next to `atlas.db`, and the indexer, the menu's AI search saves and the broken release purge refuse to run until it's done. A compaction doesn't start while the indexer runs (outside its own auto compaction), while one of those is saving, or while another compaction runs; auto compaction then tries again 10 minutes later. The lock goes away with the process that holds it, so a crash leaves nothing to clean up (the file itself stays). A crash in the middle of swapping a shard can leave its original moved aside as `atlas.sN.precompact.db` with nothing in its place. The next start of atlas, the indexer or a compaction puts it back (and removes the half swapped copy), taking the lock first. A shard that is missing with no backup next to it, while the other shards are there, stops atlas from starting instead of being made again empty; put it back first. A shard with an `atlas.sN.precompact.db` next to it, when it isn't known which of the two is whole (the crash may have come after the copy went in, or an older atlas made an empty shard beside the backup), is not touched: the menu still opens, but the indexer, AI search saves and purging refuse to write, and the message names both files and how to go on (keep the shard and delete the backup, or the other way round).
 
+A compaction stops a shard and keeps its original if the shard holds a table or column this build doesn't know, since a copy would lose it. It waits up to 10 seconds for a reader that is on its way out.
+
 A group that has caught up rests for 10 seconds before Atlas checks it again. Atlas parks a group that fails 3 times in a row for 5 minutes.
 
 Stopping the indexer takes about a second. Atlas drops any requests still in flight and closes their connections instead of reusing them. A pass that didn't finish leaves its cursor where it was, so Atlas indexes that range again on the next start.
+
+### Post-processing
+
+The indexer takes every saved release through a stage that survives restarts. Upgrading doesn't change network use: with an existing `config.json` the stage fetches nothing.
+
+- A release is **settled** when no article has arrived for `settle_secs` (2 hours), or `complete_settle_secs` (15 minutes) if it's complete.
+- It's **rejected** when no step can help it: a fragment of an upload obfuscated per article, a blocked group, an empty row, or a post of only par2 files. A rejection writes nothing, and a late article judges it again.
+- It's **done** when it's settled, passed, and every step that applies has finished or given up. A new article brings it back.
+
+Size, file type, and completeness never reject a release. They only decide whether it gets article bodies fetched.
+
+Steps run in two lanes. Database steps never wait on the network. Body and outside steps run within a budget, one per claim, and an outage costs them no attempts. To turn on bodies, set `postprocess.body_fetches_per_minute`. Your existing releases enter newest first at `backlog_per_second`, and the Post-processing page of the stats dashboard shows how far along that is.
+
+### Purging and reprocessing
+
+Both commands are dry runs until you add `--apply`.
+
+`atlas --purge` deletes what no step can help. On its own it takes only fragments. Each other class has its own flag, and a release counts once, in the first class that takes it:
+
+| Flag | Takes | Age needed |
+|---|---|---|
+| `--fragments` | Single middle parts of uploads obfuscated per article | `dead_after_secs` |
+| `--blocked` | Blocked groups. The dry run lists each group with its counts. | None |
+| `--too-small [--below BYTES]` | Releases under `--below`, by default `body_min_size_bytes`. The dry run shows a size histogram. | `dead_after_secs` |
+| `--image-only` | Releases whose every file is an image | `dead_after_secs` |
+| `--rejected` | Par2-only and empty posts, and posts under `min_files` | `dead_after_secs` |
+| `--dead` | Releases under `min_completion_percent` | `dead_after_secs` |
+
+Stop indexing first, review the dry run (`--sample N` prints names), run it with `--apply`, then run `atlas --compact`, which is what gives the space back. A stopped run carries on from where it was. As estimates, deleting up to 34 million fragments takes about 35 minutes to 2.4 hours, and the compaction after it 1 to 2 hours, with free disk equal to the new total.
+
+`atlas --reprocess` looks at stored releases again. `--step NAME` runs a step again, `--step all` runs every one, `--group NAME` limits it to a group, and `--failed` gives failed steps another try. It only queues the work, so it runs beside the indexer.
 
 ### Live dashboard
 
@@ -302,13 +361,13 @@ AI search lets you describe what you want in plain language, for example `find m
 
 - **Usenet servers:** list, add, edit, and remove servers, including host, login, port, SSL, connections, and priority.
 - **Change indexer mode:** switch between dynamic, live, and backfill.
-- **Purge broken releases:** delete incomplete releases to free up space.
+- **Purge broken releases:** delete incomplete releases to free up space. It's one big transaction, so it refuses past 1 million incomplete releases in a shard, and `atlas --purge --dead` is the batched way.
 - **Wipe DB and cache:** clear the database (`atlas.db` and every `atlas.sN.db` shard, with leftovers of a compaction), logs, status, and stats. Stop the indexer first; it is refused while the indexer, a compaction or a save has the database.
 - **Change API port:** move the Newznab API and restart it with the current `api_host`.
 
 ## Stats dashboard
 
-Menu option 8 opens a full-screen dashboard with five pages. Switch pages with the left and right arrow keys, `Tab`, or the number keys `1` to `5`. To go back, press `q`, `Esc`, or `Ctrl+C`.
+Menu option 8 opens a full-screen dashboard with six pages. Switch pages with the left and right arrow keys, `Tab`, or the number keys `1` to `6`. To go back, press `q`, `Esc`, or `Ctrl+C`.
 
 ### Overview
 
@@ -445,6 +504,10 @@ Each `<item>` contains:
 
 `t=get` answers with `application/x-nzb` and a `Content-Disposition` attachment that holds a valid NZB 1.1 file built from the indexed articles, so a downloader can fetch it directly from the URL.
 
+### Post-processing
+
+Shows releases due now, waiting for the network, and failed; how far the walks over existing releases have got; steps done, matched, and retried; rejections by reason; and bodies against their budget.
+
 ## Environment variables
 
 | Variable | Description |
@@ -511,6 +574,7 @@ CI (`.github/workflows/ci.yml`) checks formatting, runs clippy, and runs the tes
 | `src/store.rs` | The 8 shard files: compact layout, release IDs, saving, and reading articles back. |
 | `src/convert.rs` | The one-time conversion of an older database. |
 | `src/search.rs` | Search across the shards. |
+| `src/postprocess/` | The stage releases go through after saving: rules, steps, the two lanes, purge, and reprocess. |
 | `src/api.rs`, `src/nzb.rs` | Newznab API and NZB building. |
 | `src/app.rs`, `src/ui.rs`, `src/groups_menu.rs`, `src/ai.rs` | The terminal menus and AI search. |
 | `src/dashboard.rs`, `src/stats_dashboard.rs` | The live dashboard and the stats dashboard. |
@@ -539,7 +603,7 @@ AI helped with bug fixes, refactoring, SABnzbd integration, the background index
 
 The Rust port, with multi-server parallel indexing, the async NNTP client, the stats dashboard, and the extended Newznab API, lives in the [Appz4Fun fork](https://github.com/Appz4Fun/Atlas).
 
-The rule for articles obfuscated per article, and the collection regexes and cleaner, are ported from [newznab-tmux](https://github.com/xbmc4lyfe/newznab-tmux), GPLv3.
+The rule for articles obfuscated per article, the collection regexes and cleaner, and the release rules are ported from [newznab-tmux](https://github.com/xbmc4lyfe/newznab-tmux), GPLv3.
 
 ## License
 
