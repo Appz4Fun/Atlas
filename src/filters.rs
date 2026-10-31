@@ -89,6 +89,10 @@ const VIDEO_ROOTS: [&str; 6] = ["movie", "video", "vids", "clip", "film", "flix"
 const NOT_A_TITLE: [&str; 15] = [
     "hd", "sd", "dvd", "xvid", "divx", "x264", "x265", "hevc", "high", "res", "hot", "sweet", "cute", "little", "tiny",
 ];
+/// longer than this, a name isnt a real group: it counts as blocked, and costs nothing to judge
+const MAX_GROUP_NAME: usize = 512;
+/// no term that pieces can spell is longer than this
+const MAX_JOINED: usize = 32;
 /// tokens that say nothing about a group
 const HIERARCHY: [&str; 4] = ["alt", "binaries", "binary", "bin"];
 
@@ -104,6 +108,10 @@ const HIERARCHY: [&str; 4] = ["alt", "binaries", "binary", "bin"];
 /// `erotica` are matched within a small edit distance. A teen show in a group
 /// with no adult or picture label is not blocked.
 pub fn group_blocked(name: &str) -> bool {
+    // a provider's LIST can send anything, and no real group name is this long
+    if name.len() > MAX_GROUP_NAME {
+        return true;
+    }
     // asked once per row by sql and per release by a save, of a few thousand
     // names at most: each thread remembers its answers
     thread_local! {
@@ -143,7 +151,7 @@ impl Words {
             for (taken, piece) in raw[start..].iter().enumerate() {
                 let single = piece.chars().count() == 1;
                 // any run of single letters (`p.r.e.t.e.e.n`), up to 4 short pieces
-                if piece.chars().count() > 7 || (taken >= 4 && !single) {
+                if piece.chars().count() > 7 || (taken >= 4 && !single) || word.len() + piece.len() > MAX_JOINED {
                     break;
                 }
                 word.push_str(piece);
@@ -657,6 +665,16 @@ mod tests {
         ] {
             assert!(group_blocked(g), "{g}");
         }
+    }
+
+    #[test]
+    fn a_hostile_name_costs_nothing() {
+        // a provider's LIST ACTIVE has no length limit: this kept 1.2 GiB before the caps
+        let many = format!("alt.binaries.{}", "a.".repeat(249));
+        let t = std::time::Instant::now();
+        assert!(!group_blocked(&many), "under the limit, and spells nothing");
+        assert!(t.elapsed() < std::time::Duration::from_secs(1));
+        assert!(group_blocked(&"a.".repeat(2_000)), "past the limit");
     }
 
     #[test]
