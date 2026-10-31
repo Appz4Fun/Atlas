@@ -285,9 +285,10 @@ fn a_step_that_keeps_killing_the_process_is_given_up_on() {
     let second = TestStep::new(2, "next", 110, Needs::External, &log);
     h.start(vec![first.arc(), second.arc()], PostprocessConfig { max_attempts: 3, ..quick_config() });
     wait_for("the failed bit", || h.bits("Rel.One").is_some_and(|b| b.1 == BIT));
-    assert_eq!(h.field("Rel.One", "net_attempts"), 0);
     assert_eq!(runs_of(&log, "poison"), 0);
     wait_for("the next step", || runs_of(&log, "next") == 1);
+    // not read before this: the next step's own run counts an attempt ahead of it
+    wait_for("the count to clear", || h.field("Rel.One", "net_attempts") == 0);
 }
 
 #[test]
