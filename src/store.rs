@@ -3641,7 +3641,6 @@ mod tests {
         assert_eq!(conn.query_row("select count(*) from collections", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
     }
 
-<<<<<<< HEAD
     /// another writer on the shard (purge, AI search, the stage's commands) makes a save wait,
     /// not fail: a deferred transaction that read first never gets the busy handler
     #[test]
@@ -3834,7 +3833,8 @@ mod tests {
         assert_eq!((files[0].filename.as_str(), files[0].parts_seen, files[0].sealed), ("a.rar", 3, true));
         assert_eq!((files[1].filename.as_str(), files[1].parts_seen, files[1].sealed), ("b.rar", 1, false));
         assert_eq!(release_files(&conn, id, 1).unwrap().len(), 1);
-=======
+    }
+
     #[test]
     fn old_rows_keep_their_own_posters() {
         let (_dir, main, conn) = fresh_shard_db();
@@ -3874,6 +3874,5 @@ mod tests {
         let total: Option<i64> =
             conn.query_row("select file_total from releases where name = 'a.mkv'", [], |r| r.get(0)).unwrap();
         assert_eq!(total, None);
->>>>>>> appz4fun/rust
     }
 }

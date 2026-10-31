@@ -96,7 +96,8 @@ fn dry_run(main: &std::path::Path, o: &Options, per_second: i64) -> anyhow::Resu
         let conn = db::open_shard(&store::shard_path(main, shard))?;
         conn.execute_batch("pragma query_only = on")?;
         // a shard no build of the stage has opened yet has nothing to run again
-        let has_state: bool = conn.prepare("select 1 from sqlite_master where type = 'table' and name = 'pp_state'")?.exists([])?;
+        let has_state: bool =
+            conn.prepare("select 1 from sqlite_master where type = 'table' and name = 'pp_state'")?.exists([])?;
         if !has_state {
             continue;
         }
