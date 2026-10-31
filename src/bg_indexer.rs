@@ -761,6 +761,10 @@ async fn run_servers(
 
     let db = match db::open().and_then(|conn| db::tune_for_writing(&conn).map(|_| conn)) {
         Ok(conn) => {
+            // before any pass: what is there so far was saved by file name
+            if let Err(e) = crate::store::start_grouping(&paths::database()) {
+                ui::warn(&format!("couldnt note where collections start: {e:#}"));
+            }
             // before any pass: whose the plain cursors are (see claim_plain_cursors)
             if let Err(e) = crate::indexer::claim_plain_cursors(&conn, &sched.ctx.pool) {
                 ui::warn(&format!("couldnt record whose the group cursors are: {e:#}"));

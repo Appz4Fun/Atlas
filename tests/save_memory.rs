@@ -48,6 +48,7 @@ fn posts() -> Vec<Post> {
                 bytes: 700_000,
                 body: vec![],
                 date: "Fri, 02 Oct 2026 10:11:12 +0000".into(),
+                author: "poster <p@mock>".into(),
             }
         })
         .collect()

@@ -779,6 +779,16 @@ mod tests {
         create_db_at(&main).unwrap();
         assert_eq!(held(&main), (0, Some(1)), "no releases, ids from the start");
         assert!(group_progress(&open_at(&main).unwrap()).unwrap().is_empty(), "no cursors");
+
+        let conn = open_at(&shard).unwrap();
+        let (collections, from): (i64, Option<i64>) = conn
+            .query_row(
+                "select (select count(*) from collections), (select value from meta where key = 'grouping_from')",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((collections, from), (0, None), "a new shard has no collections, and no indexer has run on it");
     }
 
     /// a conversion's atlas.old.db (kept after it) or atlas.new.db (a swap

@@ -218,6 +218,19 @@ fn old_databases_convert_without_losing_anything() {
     let newest: String =
         conn.query_row("select name from releases order by id desc limit 1", [], |r| r.get(0)).unwrap();
     assert_eq!(newest, "Brand.New");
+
+    // no collections yet, and it's the first indexer's to say where they start
+    for path in store::shard_paths(&main) {
+        let conn = db::open_shard(&path).unwrap();
+        let (collections, from): (i64, Option<i64>) = conn
+            .query_row(
+                "select (select count(*) from collections), (select value from meta where key = 'grouping_from')",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((collections, from), (0, None));
+    }
 }
 
 #[test]

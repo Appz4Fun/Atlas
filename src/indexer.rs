@@ -11,7 +11,7 @@ use crate::db;
 use crate::nfo;
 use crate::nntp::{BlockingPool, Extract, Overview, Pool, Retention, first_names, headers_to_articles};
 use crate::par2;
-use crate::parser::{Release, group_articles, is_complete};
+use crate::parser::{Release, is_complete};
 
 /// What one finished XOVER slice added, reported as it lands.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1625,10 +1625,13 @@ async fn save_slice(pool: &Arc<Pool>, db: &Db, group: &str, headers: Vec<Overvie
 
     // parsing is cpu work, keep it off the async threads
     let t = std::time::Instant::now();
-    let parsing = move || {
-        let (articles, skipped) = crate::filters::drop_per_article_obfuscated(headers_to_articles(headers));
-        let releases: Vec<Release> = group_articles(articles).into_values().collect();
-        (releases, skipped)
+    let parsing = {
+        let group = group.to_string();
+        move || {
+            let (articles, skipped) = crate::filters::drop_per_article_obfuscated(headers_to_articles(headers));
+            let releases: Vec<Release> = crate::collections::group_articles(&group, articles).into_values().collect();
+            (releases, skipped)
+        }
     };
     let (mut releases, skipped) =
         tokio::task::spawn_blocking(parsing).await.map_err(|e| anyhow!("parse task failed: {e}"))?;
@@ -1658,6 +1661,10 @@ async fn save_slice(pool: &Arc<Pool>, db: &Db, group: &str, headers: Vec<Overvie
     Ok(Progress { articles, bytes, releases: count, skipped })
 }
 
+/// a release needs one name, and `first_names` tries a release's sources one
+/// after another: a post of thousands of nfos must not stall a slice
+const NAME_SOURCES_MAX: usize = 8;
+
 /// Bodies worth fetching for a real name: base par2 files first, then nfos.
 fn name_sources(release: &Release) -> Vec<(String, Extract)> {
     type Matches = fn(&str) -> bool;
@@ -1668,6 +1675,7 @@ fn name_sources(release: &Release) -> Vec<(String, Extract)> {
         .flat_map(|(matches, extract)| {
             release.articles.iter().filter(|a| matches(&a.subject)).map(|a| (a.message_id.clone(), *extract))
         })
+        .take(NAME_SOURCES_MAX)
         .collect()
 }
 
@@ -2128,5 +2136,19 @@ mod tests {
         }
         assert_eq!(sealed(), 1, "the idle writer sealed the stale file");
         drop(shared);
+    }
+
+    #[test]
+    fn a_release_looks_at_a_few_bodies_for_its_name() {
+        let article = |i: usize, name: &str| crate::parser::Article {
+            subject: format!(r#""{name}" yEnc (1/1)"#),
+            message_id: format!("<{i}@x>"),
+            ..Default::default()
+        };
+        let mut articles: Vec<_> = (0..40).map(|i| article(i, &format!("n{i}.nfo"))).collect();
+        articles.push(article(99, "base.par2"));
+        let sources = name_sources(&Release { articles, ..Default::default() });
+        assert_eq!(sources.len(), NAME_SOURCES_MAX);
+        assert_eq!(sources[0].0, "<99@x>", "the par2 first");
     }
 }

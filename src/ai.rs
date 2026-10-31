@@ -14,7 +14,7 @@ use crate::download::download_release;
 use crate::filters::{drop_per_article_obfuscated, group_blocked};
 use crate::nntp::{BlockingPool, headers_to_articles};
 use crate::nzb::generate_nzb;
-use crate::parser::{Release, group_articles, is_complete};
+use crate::parser::{Release, is_complete};
 use crate::search::{count_all_releases, recent_in_groups, search_all_releases};
 use crate::ui::{self, Column, Line, Table, fmt_size, prompt};
 
@@ -171,7 +171,7 @@ pub fn fetch_and_store(config: &Config, groups: &[String], keywords: &[String], 
         };
 
         let (articles, _skipped) = drop_per_article_obfuscated(headers_to_articles(headers));
-        let mut to_save: Vec<Release> = group_articles(articles)
+        let mut to_save: Vec<Release> = crate::collections::group_articles(grp, articles)
             .into_values()
             .map(|mut rel| {
                 rel.complete = is_complete(&rel.articles);

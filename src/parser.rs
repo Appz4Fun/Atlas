@@ -47,6 +47,8 @@ pub struct Release {
     pub group: String,
     pub poster: String,
     pub date: String,
+    /// the post it belongs to when that says more than its name (`collections.rs`)
+    pub collection: Option<String>,
 }
 
 // every client posts different subjects soo try all these patterns, in order
@@ -172,8 +174,17 @@ fn remap_bracket_parts(articles: &mut [Article]) {
 }
 
 /// Bucket articles into releases by their parsed release name, keeping
-/// first-seen order.
+/// first-seen order. What was there before collections, and what they fall back on.
 pub fn group_articles(articles: Vec<Article>) -> IndexMap<String, Release> {
+    group_articles_by(articles, |_, _| None)
+}
+
+/// Bucket articles into releases by what `collection_of` says, or their parsed
+/// release name when it says nothing, keeping first-seen order.
+pub fn group_articles_by(
+    articles: Vec<Article>,
+    mut collection_of: impl FnMut(&Article, &ParsedSubject) -> Option<String>,
+) -> IndexMap<String, Release> {
     let total = articles.len();
     let mut releases: IndexMap<String, Release> = IndexMap::new();
     let mut dropped = 0;
@@ -184,11 +195,20 @@ pub fn group_articles(articles: Vec<Article>) -> IndexMap<String, Release> {
             continue;
         };
 
-        let release = releases.entry(parsed.release_name.clone()).or_insert_with(|| Release {
+        let collection = collection_of(&article, &parsed);
+        let key = collection.clone().unwrap_or_else(|| parsed.release_name.clone());
+        let release = releases.entry(key).or_insert_with(|| Release {
             name: parsed.release_name.clone(),
             is_obfuscated: is_obfuscated(&parsed.release_name),
+            collection,
             ..Default::default()
         });
+
+        // a collection goes by its shortest name in the slice: `T` over `T.mkv` or `T.sample.mkv`
+        if release.collection.is_some() && parsed.release_name.len() < release.name.len() {
+            release.is_obfuscated = is_obfuscated(&parsed.release_name);
+            release.name = parsed.release_name.clone();
+        }
 
         // stash the parsed bits on the article soo the nzb builder can use em later
         article.filename = Some(parsed.filename);

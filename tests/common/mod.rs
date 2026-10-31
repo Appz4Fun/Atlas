@@ -22,6 +22,7 @@ pub struct Post {
     pub body: Vec<Vec<u8>>,
     /// the Date header, rfc 2822
     pub date: String,
+    pub author: String,
 }
 
 pub struct Server {
@@ -155,6 +156,7 @@ pub fn post(number: u64, subject: &str, bytes: u64, body: Vec<Vec<u8>>) -> Post 
         bytes,
         body,
         date: "Fri, 02 Oct 2026 10:11:12 +0000".into(),
+        author: "poster <p@mock>".into(),
     }
 }
 
@@ -246,8 +248,8 @@ pub fn serve(stream: TcpStream, state: &Server, over_limit: bool) {
                 let hits = || posts[lo..].iter().take_while(|p| p.number <= b);
                 let row = |p: &Post| {
                     format!(
-                        "{}\t{}\tposter <p@mock>\t{}\t{}\t\t{}\t10\r\n",
-                        p.number, p.subject, p.date, p.message_id, p.bytes
+                        "{}\t{}\t{}\t{}\t{}\t\t{}\t10\r\n",
+                        p.number, p.subject, p.author, p.date, p.message_id, p.bytes
                     )
                 };
                 if hits().next().is_none() && state.empty_is_420 {
