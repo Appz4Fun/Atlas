@@ -793,6 +793,52 @@ mod tests {
     use super::*;
 
     #[test]
+    fn archive_defaults_when_absent() {
+        let c = ArchiveConfig::from_value(None);
+        assert!(c.enabled);
+        assert_eq!((c.max_bodies_per_release, c.probe_files, c.probes_per_minute, c.max_names_mb), (4, 2, 60, 16_384));
+    }
+
+    #[test]
+    fn archive_keys_parse() {
+        let v = serde_json::json!({
+            "enabled": false, "max_bodies_per_release": 2, "probe_files": 1, "probes_per_minute": 30, "max_names_mb": 128
+        });
+        let c = ArchiveConfig::from_value(Some(&v));
+        assert!(!c.enabled);
+        assert_eq!((c.max_bodies_per_release, c.probe_files, c.probes_per_minute, c.max_names_mb), (2, 1, 30, 128));
+    }
+
+    #[test]
+    fn archive_values_clamp() {
+        let v = serde_json::json!({
+            "max_bodies_per_release": 500, "probe_files": 99, "probes_per_minute": 1, "max_names_mb": 1
+        });
+        let c = ArchiveConfig::from_value(Some(&v));
+        assert_eq!((c.max_bodies_per_release, c.probe_files, c.probes_per_minute, c.max_names_mb), (16, 8, 12, 64));
+        let c = ArchiveConfig::from_value(Some(
+            &serde_json::json!({"max_bodies_per_release": 0, "probes_per_minute": 9000}),
+        ));
+        assert_eq!((c.max_bodies_per_release, c.probes_per_minute), (1, 600));
+    }
+
+    #[test]
+    fn a_bad_archive_value_falls_back() {
+        let c = ArchiveConfig::from_value(Some(&serde_json::json!({"enabled": "maybe", "probe_files": "many"})));
+        assert!(c.enabled);
+        assert_eq!(c.probe_files, 2);
+        assert_eq!(ArchiveConfig::from_value(Some(&serde_json::json!(7))).probe_files, 2);
+    }
+
+    #[test]
+    fn readme_lists_every_archive_key() {
+        let readme = include_str!("../README.md");
+        for key in ["max_bodies_per_release", "probe_files", "probes_per_minute", "max_names_mb"] {
+            assert!(readme.contains(key), "{key}");
+        }
+    }
+
+    #[test]
     fn token_is_43_chars_urlsafe() {
         let t = token_urlsafe(32);
         assert_eq!(t.len(), 43);

@@ -502,7 +502,7 @@ pub const PROBE_MIN_PARTS: i64 = 3;
 pub const NAME_SOURCE_NFO: u8 = 10; pub const NAME_SOURCE_INNER: u8 = 15; pub const NAME_SOURCE_PAR2: u8 = 20;
 /// step 8 is Part 5's naming step (Part 3's example) and 16 is Part 6's predb_match, asked directly because naming
 /// may be off or skip a clean name. Unregistered bits are ignored until they exist
-pub const RERUN_ON_INNER_FILES: StepMask = StepMask(mask(StepId(8)).0 | mask(StepId(16)).0);
+pub const RERUN_ON_INNER_FILES: StepMask = mask(StepId(8)) | mask(StepId(16));
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)] pub enum Format { Rar4, Rar5, SevenZip, Zip, Par2, Image, Media, Unknown }
 pub fn identify(head: &[u8]) -> Format;

@@ -141,6 +141,7 @@ On first run, Atlas asks for one server (host, username, password, and port) and
 | `split_min_backlog` | `10000000` | Article numbers of backfill left before a group's backfill is split into day chunks that every server carrying the group can take. |
 | `auto_run_compact` | `false` | Compact the database every 24 hours; indexing pauses while it runs. |
 | `postprocess` | see below | The stage releases go through after saving. See [Post-processing keys](#post-processing-keys). |
+| `archive` | see below | Reading archives, PAR2 sets, and NFOs inside releases. See [Archive inspection](#archive-inspection). |
 | `max_unsaved_headers` | `500000` | Headers the indexer fetches ahead of saving them, over all groups at once. This bounds its memory: 500,000 headers take about 0.3 GB. A header request waits for room before it goes out, and its room comes back once its slice is saved. Raise it if the Bottleneck page shows it full while the database writers and connections have time to spare. Set below `request_size`, header requests are cut down to it, which makes them small and slow. |
 
 Atlas keeps any other keys you add to the file when it saves it.
@@ -324,6 +325,30 @@ Size, file type, and completeness never reject a release. They only decide wheth
 
 Steps run in two lanes. Database steps never wait on the network. Body and outside steps run within a budget, one per claim, and an outage costs them no attempts. To turn on bodies, set `postprocess.body_fetches_per_minute`. Your existing releases enter newest first at `backlog_per_second`, and the Post-processing page of the stats dashboard shows how far along that is.
 
+### Archive inspection
+
+Once Atlas may fetch bodies, it reads the releases it can afford to, one at a time and within the budget. It reads a release's PAR2 set, one article of its first archive volume (about 740 KB), plus the last article of a 7z or ZIP, and an NFO if nothing else named it. It doesn't unpack anything. It stores:
+
+- The files inside: their names and unpacked sizes, with the volumes of a set collapsed into one row.
+- Whether the archive is passworded: yes when the bytes prove it, maybe when an archive was found but its contents couldn't be seen, and no when names were read with no encryption flag.
+- A real name, when the release has none. A name from inside an archive replaces only an obfuscated or random-looking one.
+
+To turn it on, set `postprocess.body_fetches_per_minute`. All of these go in an `archive` object, and each has a default:
+
+| Key | Default | What it does |
+|---|---|---|
+| `enabled` | `true` | Read archives, PAR2 sets, and NFOs. It does nothing until there's a body budget. |
+| `max_bodies_per_release` | `4` | Articles the archive step may read per release, from 1 to 16. |
+| `probe_files` | `2` | Random-named files to probe per release, from 0 to 8. |
+| `probes_per_minute` | `60` | Probes per minute, from 12 to 600. |
+| `max_names_mb` | `16384` | Total MiB of stored file names, split between the shards. Past it, passwords and names still work, but no more inner files are stored. The stats dashboard counts what went unstored. |
+
+With a budget set and `archive.enabled` on, names stop being looked up while a release saves, so saving no longer waits on article bodies. A new release has no real name until its step runs, which takes 15 minutes to 2 hours of settling plus the queue. Until then, search hides it if it's obfuscated. A release outside `body_min_size_bytes` and `body_max_size_bytes` gets no body, so it gets no name from these steps, where the lookup while saving would have named it. If you take the budget away, or turn `archive.enabled` off, the lookups come back.
+
+A file with no extension Atlas knows gets probed, if it has at least 3 parts. A probe reads the article's first 64 KiB and hangs up. That's also what it reads of an image it couldn't recognize by name, and an image ends the release. Each hang-up means a new login for the next request, and a provider that refuses a burst of logins rests that server for 30 minutes, indexing included, so probes are spaced by `probes_per_minute`. Lower it if that happens.
+
+These are estimates, not measurements. A release typically costs 1 to 3 bodies, and at most 8. About 15 million of 118 million releases pass the body gates, which comes to about 78 days at 300 bodies a minute, or about 4 days at 6,000, and about 14 TB of traffic in all. Inner files add about 1% to the database. New posts go ahead of the backlog.
+
 ### Purging and reprocessing
 
 Both commands are dry runs until you add `--apply`.
@@ -353,7 +378,7 @@ Menu option 5 shows the indexer status, totals, a graph of headers per second ov
 - **All groups:** searches everything you've indexed.
 - **Obfuscated posts:** lists releases that still only have a random name.
 
-Searches match both the posted name and the real name found in par2 and nfo files. A post of several files shows the name of one of its files until a better name is found. Choose a result to see its files and save its NZB.
+Searches match both the posted name and the real name found in par2 and nfo files. A post of several files shows the name of one of its files until a better name is found. Choose a result to see its files, what's inside them if Atlas has read that, whether it's passworded, and save its NZB.
 
 AI search lets you describe what you want in plain language, for example `find me 4k hdr movies`. The AI picks the groups and keywords, then fetches anything missing from your database. It needs [Ollama](https://ollama.com) running with the `qwen3:4b` model, or the model set in `ATLAS_AI_MODEL`. Speed depends on your hardware.
 
@@ -501,6 +526,7 @@ Each `<item>` contains:
 - `<size>`: the size in bytes.
 - `<pubDate>`: the post date in RFC 2822 format.
 - `<newznab:attr name="category" value="7000"/>`.
+- `<newznab:attr name="password" value="N"/>`: 0 no, 1 yes, 2 maybe. It's left out when nothing is known.
 
 `t=get` answers with `application/x-nzb` and a `Content-Disposition` attachment that holds a valid NZB 1.1 file built from the indexed articles, so a downloader can fetch it directly from the URL.
 
@@ -567,7 +593,8 @@ CI (`.github/workflows/ci.yml`) checks formatting, runs clippy, and runs the tes
 | `src/nntp.rs` | Async NNTP client, per-server connection pools built on tokio and rustls, compression, and failover. |
 | `src/indexer.rs` | One indexing pass over a group: slices, parsing, naming, and saving. |
 | `src/bg_indexer.rs` | The background scheduler: workers per server, live config reload, and status and stats files. |
-| `src/parser.rs`, `src/par2.rs`, `src/nfo.rs` | Subjects to releases, and real names from par2 and nfo files. |
+| `src/parser.rs`, `src/par2.rs`, `src/nfo.rs` | Subjects to releases, and real names and full file lists from par2 files, and names from nfo files. |
+| `src/archive/` | Reading file lists from RAR, ZIP, 7z, and PAR2 headers, and the steps that store them. |
 | `src/collections.rs`, `data/collection_regexes.tsv` | Which articles belong to one post: per-group regexes and a generic cleaner. `scripts/collection_regexes_to_tsv.py` makes the data file from the upstream seeder. |
 | `src/filters.rs` | What Atlas refuses to index: posts obfuscated per article and blocked groups. |
 | `src/db.rs` | The main database: group cursors, connections, and checkpoints. |
@@ -591,7 +618,7 @@ CI (`.github/workflows/ci.yml`) checks formatting, runs clippy, and runs the tes
 - Two same-day posts by one poster with the same shape and file count merge, and that release stays incomplete.
 - A pack merges only when each file's `[n/m]` equals its own number, so a pack with an nfo first stays by file.
 - Album tracks named with the track number first stay by file.
-- Deobfuscation works only when a release has a par2 or nfo file with a usable name.
+- Deobfuscation works only when a release has a usable name in a par2 file, an nfo file, or the first article of an archive. A 7z or a ZIP needs its last article too.
 - Atlas reports every release as category `7000` (Other), so clients that only search TV or movie categories might skip it.
 - Search matches release names only, so searches by ID, such as TVDB or IMDb, return nothing.
 
@@ -603,7 +630,7 @@ AI helped with bug fixes, refactoring, SABnzbd integration, the background index
 
 The Rust port, with multi-server parallel indexing, the async NNTP client, the stats dashboard, and the extended Newznab API, lives in the [Appz4Fun fork](https://github.com/Appz4Fun/Atlas).
 
-The rule for articles obfuscated per article, the collection regexes and cleaner, and the release rules are ported from [newznab-tmux](https://github.com/xbmc4lyfe/newznab-tmux), GPLv3.
+The rule for articles obfuscated per article, the collection regexes and cleaner, the release rules, and the rules for choosing what to read in a release are ported from [newznab-tmux](https://github.com/xbmc4lyfe/newznab-tmux), GPLv3. 7z headers are decoded with [lzma-rs](https://github.com/gendx/lzma-rs), MIT.
 
 ## License
 

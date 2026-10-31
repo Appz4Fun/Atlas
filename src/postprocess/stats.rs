@@ -39,6 +39,8 @@ pub struct Stats {
     /// how far the walks have come, and how far they go, in release ids
     pub walk_done: AtomicI64,
     pub walk_total: AtomicI64,
+    /// releases whose inner files went unstored, past `archive.max_names_mb`
+    pub names_over_quota: AtomicI64,
     pub errors: AtomicU64,
 }
 
@@ -75,6 +77,7 @@ impl Stats {
                 Reason::TooFewFiles.name(): n(&self.too_few_files),
                 Reason::Par2Only.name(): n(&self.par2_only),
             },
+            "archive_names_over_quota": i(&self.names_over_quota),
             "bodies": n(&self.bodies),
             "body_bytes": n(&self.body_bytes),
             "budget_per_minute": budget_per_minute,

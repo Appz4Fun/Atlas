@@ -501,6 +501,33 @@ impl Conn {
         Ok(Some(yenc_decode(&lines).unwrap_or_else(|| lines.join(&b'\n'))))
     }
 
+    /// BODY's first `max_bytes` or so, decoded. False: the rest is left unread, soo the
+    /// connection cant take another request. Line ends count: an article of empty
+    /// lines stops at the cap too, with at most `max_bytes / 2` lines kept.
+    pub async fn body_prefix(&mut self, message_id: &str, max_bytes: usize) -> Result<(Vec<u8>, bool)> {
+        let (code, message) = self.command("BODY", Some(message_id)).await?;
+        if code != 222 {
+            return Err(NntpError::Reply { code, message });
+        }
+        if message.contains("[COMPRESS=GZIP]") {
+            return Ok((Vec::new(), false));
+        }
+        let (mut lines, mut read, mut whole) = (Vec::new(), 0usize, false);
+        while read < max_bytes {
+            let Some(mut l) = self.read_line_capped(max_bytes).await? else { break };
+            if l == b"." {
+                whole = true;
+                break;
+            }
+            if l.starts_with(b"..") {
+                l.remove(0);
+            }
+            read += l.len() + 2;
+            lines.push(l);
+        }
+        Ok((yenc_decode(&lines).unwrap_or_else(|| lines.join(&b'\n')), whole))
+    }
+
     /// A plain multi-line response, handed to `line` one at a time with
     /// dot-stuffing removed (see `each_line`).
     async fn each_plain_line(&mut self, mut line: impl FnMut(Vec<u8>) -> bool) -> Result<bool> {
@@ -857,6 +884,7 @@ pub enum BackgroundBody {
 #[derive(Clone, Copy)]
 enum BackgroundRead {
     Capped,
+    Prefix,
 }
 
 /// how long a background body waits for room before it queues like anything else
@@ -1501,6 +1529,12 @@ impl Pool {
         self.background_read(message_id, max_bytes, BackgroundRead::Capped).await
     }
 
+    /// `background_body` that stops at `max_bytes` rather than failing there, and hangs
+    /// up when it cut the article short. A cut body is `Body`, never `TooBig`.
+    pub async fn background_prefix(&self, message_id: &str, max_bytes: usize) -> Result<BackgroundBody> {
+        self.background_read(message_id, max_bytes, BackgroundRead::Prefix).await
+    }
+
     async fn background_read(
         &self,
         message_id: &str,
@@ -1535,18 +1569,26 @@ impl Pool {
                         continue;
                     }
                 };
+                // the body, and whether it was read to its end
                 let r = match read {
-                    BackgroundRead::Capped => lease.begin().body_capped(message_id, max_bytes).await,
+                    BackgroundRead::Capped => {
+                        lease.begin().body_capped(message_id, max_bytes).await.map(|b| (b.is_some(), b))
+                    }
+                    BackgroundRead::Prefix => {
+                        lease.begin().body_prefix(message_id, max_bytes).await.map(|(b, whole)| (whole, Some(b)))
+                    }
                 };
                 match r {
-                    Ok(Some(body)) => {
-                        lease.check::<()>(Ok(()))?;
+                    Ok((whole, Some(body))) => {
+                        if whole {
+                            lease.check::<()>(Ok(()))?;
+                        }
                         crate::profile::LOAD.bg_bodies.fetch_add(1, Ordering::Relaxed);
                         crate::profile::LOAD.bg_body_bytes.fetch_add(body.len() as u64, Ordering::Relaxed);
                         return Ok(BackgroundBody::Body(body));
                     }
                     // the rest is unread: the lease stays busy, soo the connection is thrown away
-                    Ok(None) => return Ok(BackgroundBody::TooBig),
+                    Ok((_, None)) => return Ok(BackgroundBody::TooBig),
                     Err(e) => match lease.check::<()>(Err(e)) {
                         // this server doesnt have it
                         Err(NntpError::Reply { code: 423 | 430, .. }) | Ok(()) => {}

@@ -65,5 +65,11 @@
         "min_completion_percent": 95,
         "dead_after_secs": 172800,
         "max_attempts": 5
+    },
+    "archive": {
+        "enabled": true,
+        "max_bodies_per_release": 4,
+        "probe_files": 2,
+        "probes_per_minute": 60
     }
 }

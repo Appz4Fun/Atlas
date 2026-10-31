@@ -76,10 +76,12 @@ fn looks_random_table() {
     }
 }
 
+type NameCase<'a> = (&'a [(&'a str, u64)], Option<&'a str>);
+
 #[test]
 fn best_name_table() {
     let hash = "0123456789abcdef0123456789abcdef.mkv";
-    let table: &[(&[(&str, u64)], Option<&str>)] = &[
+    let table: &[NameCase<'_>] = &[
         (&[("small.nfo", 10), ("Real.Movie.2024.mkv", 5_000_000)], Some("Real.Movie.2024.mkv")),
         (
             &[("Real.Name.2024.part01.rar", 100), ("Real.Name.2024.part02.rar", 100), ("Real.Name.2024.nfo", 5)],
@@ -678,5 +680,27 @@ mod select_tests {
         let f = [file("c.nfo", 3), file("a.nfo", 2), file("b.txt", 1)];
         let got: Vec<&str> = nfo_sources(&f).iter().map(|f| f.filename.as_str()).collect();
         assert_eq!(got, vec!["b.txt", "a.nfo"]);
+    }
+
+    #[test]
+    fn stage_owns_names_table() {
+        use crate::config::{ArchiveConfig, Config, PostprocessConfig};
+        let config = |enabled: bool, budget: i64, archive: bool| Config {
+            postprocess: PostprocessConfig { enabled, body_fetches_per_minute: budget, ..Default::default() },
+            archive: ArchiveConfig { enabled: archive, ..Default::default() },
+            ..Config::default()
+        };
+        assert!(!stage_owns_names(&Config::default()), "an existing config.json");
+        assert!(!stage_owns_names(&config(false, 300, true)), "the stage is off");
+        assert!(stage_owns_names(&config(true, 300, true)), "a body budget");
+        assert!(!stage_owns_names(&config(true, 300, false)), "the budget serves other parts");
+        assert!(!stage_owns_names(&config(true, 0, true)), "no budget");
+    }
+
+    #[test]
+    fn inner_files_ask_for_naming_and_predb() {
+        use crate::postprocess::step::{StepId, mask};
+        assert_ne!(RERUN_ON_INNER_FILES & mask(StepId(8)), 0);
+        assert_ne!(RERUN_ON_INNER_FILES & mask(StepId(16)), 0);
     }
 }

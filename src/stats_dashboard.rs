@@ -1053,6 +1053,7 @@ fn draw_postprocess(f: &mut Frame, app: &App, area: Rect) {
         kv("waiting for network", bounded(n("net_wanted"), 1_000_000)),
         kv("failed", bounded(n("failed"), 100_000)),
         kv("errors", count(n("errors"))),
+        kv("names over quota", count(n("archive_names_over_quota"))),
     ];
     f.render_widget(Paragraph::new(backlog).block(panel("backlog")), a);
 

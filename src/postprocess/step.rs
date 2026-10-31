@@ -124,10 +124,20 @@ impl StepCtx<'_> {
         }
         let mut results = Vec::with_capacity(wanted.len());
         for request in wanted {
-            let got = self.bodies.fetch(&self.release, request, &mut self.used_bodies, self.deadline)?;
+            let got = self.bodies.fetch(&self.release, request, &mut self.used_bodies, self.deadline, false)?;
             results.push(BodyResult { message_id: request.message_id.clone(), got });
         }
         Ok(results)
+    }
+
+    /// `fetch_bodies` for one article's start: `wanted.max_bytes` of it, and a hang-up
+    /// when that cut it short. For a probe that doesnt know what it's about to read.
+    pub fn fetch_prefix(&mut self, wanted: &BodyRequest) -> Result<BodyResult, StepError> {
+        if !self.lane_can_fetch {
+            return Err(StepError::Permanent("a database step cant fetch bodies".into()));
+        }
+        let got = self.bodies.fetch(&self.release, wanted, &mut self.used_bodies, self.deadline, true)?;
+        Ok(BodyResult { message_id: wanted.message_id.clone(), got })
     }
 
     pub fn stopping(&self) -> bool {

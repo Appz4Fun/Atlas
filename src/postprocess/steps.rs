@@ -2,10 +2,16 @@
 
 use std::sync::Arc;
 
+use crate::archive::steps as archive;
+
 use super::step::Step;
 
 pub fn all() -> Vec<Arc<dyn Step>> {
-    Vec::new()
+    vec![
+        Arc::new(archive::Par2Step::default()),
+        Arc::new(archive::ListStep::default()),
+        Arc::new(archive::NfoStep::default()),
+    ]
 }
 
 #[cfg(test)]

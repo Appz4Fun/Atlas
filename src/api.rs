@@ -149,7 +149,7 @@ pub fn handle(path: &str, query: &str, base: &str, api_key: &str) -> ApiResponse
         Some(kind @ ("search" | "tvsearch" | "movie" | "music" | "audio" | "book")) => match search_term(kind, &args) {
             Some(term) => search(&term, &args, base, api_key),
             // only an id (tvdbid, imdbid, ...): atlas has no metadata to match ids against
-            None => rss(base, api_key, 0, &[]),
+            None => rss(base, api_key, 0, &[], &HashMap::new()),
         },
         None => ApiResponse::error(200, "Missing parameter (t)"),
         Some(_) => ApiResponse::error(203, "Function not available"),
@@ -193,7 +193,10 @@ fn search(q: &str, args: &HashMap<String, String>, base: &str, api_key: &str) ->
     };
 
     match releases {
-        Ok(r) => rss(base, api_key, offset, &r),
+        Ok(r) => {
+            let ids: Vec<i64> = r.iter().map(|release| release.id).collect();
+            rss(base, api_key, offset, &r, &crate::archive::store::passwords(&ids))
+        }
         Err(e) => {
             eprintln!("api search failed: {e}");
             ApiResponse::error(900, "Search failed")
@@ -201,14 +204,23 @@ fn search(q: &str, args: &HashMap<String, String>, base: &str, api_key: &str) ->
     }
 }
 
-fn rss(base: &str, api_key: &str, offset: i64, releases: &[crate::search::ReleaseRow]) -> ApiResponse {
+fn rss(
+    base: &str,
+    api_key: &str,
+    offset: i64,
+    releases: &[crate::search::ReleaseRow],
+    passwords: &HashMap<i64, crate::archive::Password>,
+) -> ApiResponse {
     let items: String = releases
         .iter()
         .map(|r| {
             let nzb_url = format!("{base}/api?t=get&id={}&apikey={api_key}", r.id);
             let size = r.size.unwrap_or(0);
+            let password = passwords
+                .get(&r.id)
+                .map_or(String::new(), |p| format!("<newznab:attr name=\"password\" value=\"{}\"/>", p.code()));
             format!(
-                "    <item>      <title>{}</title>      <guid isPermaLink=\"false\">{}</guid>      <link>{}</link>      <size>{size}</size>      <pubDate>{}</pubDate>      <enclosure url=\"{}\" type=\"application/x-nzb\" length=\"{size}\"/>      <newznab:attr name=\"category\" value=\"7000\"/>    </item>",
+                "    <item>      <title>{}</title>      <guid isPermaLink=\"false\">{}</guid>      <link>{}</link>      <size>{size}</size>      <pubDate>{}</pubDate>      <enclosure url=\"{}\" type=\"application/x-nzb\" length=\"{size}\"/>      <newznab:attr name=\"category\" value=\"7000\"/>{password}    </item>",
                 escape(&r.name),
                 r.id,
                 escape(&nzb_url),
@@ -409,5 +421,26 @@ mod tests {
         for kind in ["<search ", "<tv-search ", "<movie-search ", "<audio-search ", "<book-search "] {
             assert!(caps.contains(&format!(r#"{kind}available="yes""#)), "{kind} in {caps}");
         }
+    }
+
+    #[test]
+    fn rss_reports_a_known_password_only() {
+        use crate::archive::Password;
+        let row = |id: i64| crate::search::ReleaseRow {
+            id,
+            name: format!("r{id}"),
+            group_name: "g".into(),
+            poster: None,
+            posted_date: None,
+            size: None,
+            complete: true,
+            parts: None,
+        };
+        let passwords = HashMap::from([(1, Password::Yes), (2, Password::Maybe)]);
+        let body = rss("http://x", "k", 0, &[row(1), row(2), row(3)], &passwords).body;
+        assert!(body.contains(r#"<newznab:attr name="password" value="1"/>"#), "{body}");
+        assert!(body.contains(r#"<newznab:attr name="password" value="2"/>"#), "{body}");
+        assert_eq!(body.matches("name=\"password\"").count(), 2);
+        assert_eq!(body.matches("name=\"category\"").count(), 3);
     }
 }

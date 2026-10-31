@@ -75,6 +75,9 @@ pub fn classify(filename: &str) -> Kind {
     }
 }
 
+/// a family and a name without its volume suffix, and that set's files by volume
+type VolumeSet<'a> = ((u8, String), Vec<(u32, &'a FileInfo)>);
+
 /// An article to read first, and where its set ends.
 #[derive(Clone, Copy, Debug)]
 pub struct Head<'a> {
@@ -101,7 +104,7 @@ pub fn plan(files: &[FileInfo], probe_files: usize) -> Vec<Head<'_>> {
         };
         sets.entry((family, strip_volume_suffix(&f.filename).to_lowercase())).or_default().push((volume, f));
     }
-    let mut sets: Vec<((u8, String), Vec<(u32, &FileInfo)>)> = sets.into_iter().collect();
+    let mut sets: Vec<VolumeSet<'_>> = sets.into_iter().collect();
     sets.sort_by_key(|(key, members)| {
         (std::cmp::Reverse(members.iter().map(|(_, f)| parts(f)).sum::<i64>()), key.1.clone())
     });
