@@ -242,7 +242,7 @@ pub fn migrate_shard(conn: &Connection) -> Result<()> {
             conn.execute(&format!("alter table files add column {col} {kind}"), [])?;
         }
     }
-    Ok(())
+    crate::postprocess::schema::migrate(conn)
 }
 
 // ---------------------------------------------------------------- ids
@@ -1361,7 +1361,10 @@ impl ShardWriter {
         let mut sealed = SealedCache::with_limits(SEALED_CACHE_MAX_SEGMENTS, self.decode_budget);
         // files this save completed, for sealing once it's committed
         let mut completed = Vec::new();
-        let tx = conn.transaction()?;
+        // the write lock up front: a transaction that read first never gets
+        // the busy handler when it comes to write, soo another writer on the
+        // shard would fail this save at once instead of making it wait
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let key = IdKey::of(&tx)?;
         let grouping_from = grouping_from(&tx)?;
         let (mut new_releases, mut new_articles) = (0i64, 0i64);
@@ -3425,5 +3428,40 @@ mod tests {
         assert_eq!(conn.query_row("select count(*) from collections", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
         purge_incomplete(&main).unwrap();
         assert_eq!(conn.query_row("select count(*) from collections", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+    }
+
+    /// another writer on the shard (purge, AI search, the stage's commands) makes a save wait,
+    /// not fail: a deferred transaction that read first never gets the busy handler
+    #[test]
+    fn a_save_waits_for_another_writer_instead_of_failing() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        db::create_db_at(&main).unwrap();
+        let other = db::open_at(&shard_path(&main, shard_of("alt.binaries.t"))).unwrap();
+        other.execute_batch("begin immediate; update meta set value = value where key = 'releases'").unwrap();
+        let saver = std::thread::spawn({
+            let main = main.clone();
+            move || {
+                let article = Article {
+                    message_id: "<a@x>".into(),
+                    filename: Some("a".into()),
+                    part: Some(1),
+                    total_parts: Some(1),
+                    ..Default::default()
+                };
+                save(
+                    &main,
+                    &[Release {
+                        name: "Rel".into(),
+                        group: "alt.binaries.t".into(),
+                        articles: vec![article],
+                        ..Default::default()
+                    }],
+                )
+            }
+        });
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        other.execute_batch("commit").unwrap();
+        saver.join().unwrap().expect("waited for the other writer");
     }
 }
