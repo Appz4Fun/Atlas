@@ -1,5 +1,6 @@
 //! `atlas --unname`: clear the names regexes and posted files gave, the two that come from subject
-//! text. A dry run unless `--apply`. It leaves `naming`'s done bit set, soo they stay cleared.
+//! text. A dry run unless `--apply`. `name_source` says `NameSource::Cleared` after it, soo a late
+//! article can't bring one back: the naming step leaves those until `--reprocess --step naming`.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -76,7 +77,7 @@ fn apply_shard(
     let write = |tx: &Connection, batch: &[(i64, String)]| -> rusqlite::Result<()> {
         // releases_au updates FTS
         let mut clear = tx.prepare_cached(
-            "update releases set display_name = null, name_source = null, is_obfuscated = ?2 where id = ?1",
+            "update releases set display_name = null, name_source = 1, is_obfuscated = ?2 where id = ?1",
         )?;
         let mut state = tx.prepare_cached(
             "update pp_state set done = done & ~?2, failed = failed & ~?2, db_attempts = 0, net_attempts = 0, net_next_at = 0
@@ -97,7 +98,7 @@ fn apply_shard(
         Ok(())
     };
     while walk.step(picked, write)? {}
-    walk::finish_shard(&conn, "'unname_after', 'naming_rename_named'")
+    walk::finish_shard(&conn, "key in ('unname_after', 'naming_rename_named') or key glob 'naming_rename_named:*'")
 }
 
 /// `atlas --unname [--sample N] [--apply]`. Exit 0 on success, 1 when refused or failed.

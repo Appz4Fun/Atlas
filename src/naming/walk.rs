@@ -173,9 +173,9 @@ impl Walk<'_> {
     }
 }
 
-/// a shard's cursor gone, and its WAL folded in
-pub(crate) fn finish_shard(conn: &Connection, keys: &str) -> anyhow::Result<()> {
-    conn.execute_batch(&format!("delete from meta where key in ({keys})"))?;
+/// a shard's cursor gone, and its WAL folded in. `gone` is a condition on `meta.key`
+pub(crate) fn finish_shard(conn: &Connection, gone: &str) -> anyhow::Result<()> {
+    conn.execute_batch(&format!("delete from meta where {gone}"))?;
     let _: i64 = conn.query_row("pragma wal_checkpoint(truncate)", [], |r| r.get(0)).unwrap_or(1);
     Ok(())
 }

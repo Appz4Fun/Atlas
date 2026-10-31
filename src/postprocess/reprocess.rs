@@ -9,12 +9,18 @@ use crate::{compact, db, paths};
 use super::step::{Step, StepMask, mask};
 use super::steps;
 
+/// The opt-in for one group: a shard holds other groups, and they weren't asked for.
+pub fn rename_named_key(group: &str) -> String {
+    format!("naming_rename_named:{group}")
+}
+
 /// One shard, in the caller's `BEGIN IMMEDIATE` transaction: a walk that clears
 /// `redo`. False: the same walk is already queued.
 pub fn apply(tx: &Connection, redo: StepMask, group: Option<&str>, now: i64) -> rusqlite::Result<bool> {
-    // asking for naming again is what lets it replace a name it left alone so far
+    // asking for naming again is what lets it replace a name it left alone so far, in what was asked for
     if redo & mask(crate::naming::NAMING) != 0 {
-        tx.prepare_cached("insert or replace into meta (key, value) values ('naming_rename_named', 1)")?.execute([])?;
+        let key = group.map_or_else(|| "naming_rename_named".to_string(), rename_named_key);
+        tx.prepare_cached("insert or replace into meta (key, value) values (?1, 1)")?.execute([key])?;
     }
     let added = tx
         .prepare_cached(

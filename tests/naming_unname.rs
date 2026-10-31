@@ -108,7 +108,7 @@ fn apply_clears_only_regex_and_posted_names() {
     assert!(h.ok(&["--apply"]).contains("2 cleared"));
     for name in ["src3", "src5"] {
         let (display, source, _) = h.name_of(name);
-        assert_eq!((display, source), (None, None), "{name}");
+        assert_eq!((display, source), (None, Some(1)), "{name}");
     }
     for (name, source) in [("src10", 10), ("src15", 15), ("src20", 20), ("src100", 100)] {
         assert_eq!(h.name_of(name).1, Some(source));
@@ -139,9 +139,11 @@ fn search_follows() {
 fn it_removes_the_opt_in() {
     let h = home();
     every_source(&h);
-    h.shard().execute("insert into meta (key, value) values ('naming_rename_named', 1)", []).unwrap();
+    let conn = h.shard();
+    conn.execute("insert into meta (key, value) values ('naming_rename_named', 1)", []).unwrap();
+    conn.execute("insert into meta (key, value) values ('naming_rename_named:alt.binaries.t', 1)", []).unwrap();
     h.ok(&["--apply"]);
-    assert!(!h.meta_keys().iter().any(|k| k == "naming_rename_named"));
+    assert!(!h.meta_keys().iter().any(|k| k.starts_with("naming_rename_named")));
 }
 
 #[test]

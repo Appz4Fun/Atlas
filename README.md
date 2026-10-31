@@ -367,7 +367,7 @@ Names only improve. A name replaces another only if its source is at least as go
 
 All of this is database work with no network, apart from the NFO step, which needs `postprocess.body_fetches_per_minute`.
 
-Upgrading names only releases that have no name, starting with a walk over your existing releases at `backlog_per_second`. To replace names the old lookup found too, run `atlas --reprocess --step naming --apply`, which only takes names that grade better. To undo names from regexes and posted files, run `atlas --unname --apply`.
+Upgrading names only releases that have no name, starting with a walk over your existing releases at `backlog_per_second`. To replace names the old lookup found too, run `atlas --reprocess --step naming --apply`, which only takes names that grade better. To undo names from regexes and posted files, run `atlas --unname --apply`. They stay cleared, even when a late article arrives, until you run `--reprocess --step naming --apply` again. A better source can still name them, such as an NFO, a PAR2 set, or PreDB.
 
 These go in a `naming` object:
 

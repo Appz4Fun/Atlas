@@ -28,6 +28,8 @@ use crate::postprocess::step::StepId;
 pub enum NameSource {
     /// the posted name. Never written: `name_source` stays NULL
     Ingest = 0,
+    /// not a name: `atlas --unname` took one away, and the naming step leaves it until asked again
+    Cleared = 1,
     PostedFile = 3,
     NamingRegex = 5,
     /// never written: what a good name with a NULL `name_source` counts as

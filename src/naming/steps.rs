@@ -44,9 +44,11 @@ impl Step for Naming {
         let inner = archive::store::inner_files(ctx.conn(), id).map_err(retry)?;
         // new inner files reach PreDB matching too, renamed or not. Bit 16 is its step: unregistered bits are ignored
         let rerun = if inner.is_empty() { 0 } else { mask(StepId(16)) };
-        // an inline name is left alone until the user opts in with --reprocess
+        // an inline name, or a name the user cleared, stays as it is until the user opts in with --reprocess
         let r = ctx.release();
-        if r.display_name.is_some() && r.name_source.is_none() && !rename_named_is_on(ctx.conn()).map_err(retry)? {
+        let left_alone =
+            (r.display_name.is_some() && r.name_source.is_none()) || r.name_source == Some(NameSource::Cleared as i64);
+        if left_alone && !rename_named_is_on(ctx.conn(), &r.group).map_err(retry)? {
             return Ok(Outcome { rerun, ..Outcome::default() });
         }
         let files = ctx.files().map_err(retry)?;
@@ -56,11 +58,11 @@ impl Step for Naming {
     }
 }
 
-/// A row means the user opted in, by `atlas --reprocess --step naming --apply`.
-fn rename_named_is_on(conn: &Connection) -> rusqlite::Result<bool> {
+/// A row means the user opted in, by `atlas --reprocess --step naming --apply`, for the whole shard or for this group.
+fn rename_named_is_on(conn: &Connection, group: &str) -> rusqlite::Result<bool> {
     let row: Option<i64> = conn
-        .prepare_cached("select value from meta where key = 'naming_rename_named'")?
-        .query_row([], |r| r.get(0))
+        .prepare_cached("select value from meta where key in ('naming_rename_named', ?1) limit 1")?
+        .query_row([crate::postprocess::reprocess::rename_named_key(group)], |r| r.get(0))
         .optional()?;
     Ok(row.is_some())
 }

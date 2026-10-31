@@ -82,7 +82,7 @@ fn apply_shard(
         Ok(())
     };
     while walk.step(picked, write)? {}
-    walk::finish_shard(&conn, "'reflag_after'")
+    walk::finish_shard(&conn, "key = 'reflag_after'")
 }
 
 /// `atlas --reflag-obfuscated [--sample N] [--apply]`. Exit 0 on success, 1 when refused or failed.

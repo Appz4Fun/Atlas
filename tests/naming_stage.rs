@@ -342,3 +342,59 @@ fn archive_nfo_is_gone() {
     assert!(all.iter().any(|s| s.name() == "nfo"));
     assert!(all.iter().all(|s| s.id() != StepId(3)), "id 3 is never reused");
 }
+
+#[test]
+fn a_late_article_doesnt_bring_back_a_cleared_name() {
+    let mut h = fresh();
+    h.save(&[complete("Xk3Mz9PqL")]);
+    let conn = h.shard();
+    let (id, ..) = row(&h, STAGE_GROUP, "Xk3Mz9PqL");
+    // what `atlas --unname --apply` leaves, with a posted file this step would otherwise take
+    let mut named = release_of("Xk3Mz9PqL", "Some.Show.S01E01.mkv", 2, 2);
+    named.articles.iter_mut().for_each(|a| a.message_id.push('2'));
+    h.save(&[named]);
+    conn.execute("update releases set name_source = 1, display_name = null where id = ?", [id]).unwrap();
+    start(&mut h, config(), steps::all(), None);
+    wait_done(&h, STAGE_GROUP, id, NAMED);
+    assert_eq!(row(&h, STAGE_GROUP, "Xk3Mz9PqL").1, None, "it stays cleared");
+    h.stop();
+
+    // asking again is what brings it back
+    conn.execute("insert into meta (key, value) values ('naming_rename_named', 1)", []).unwrap();
+    start(&mut h, config(), steps::all(), None);
+    h.stage.clone().unwrap().rerun(id, NAMED).unwrap();
+    wait_for("the name", || row(&h, STAGE_GROUP, "Xk3Mz9PqL").1.as_deref() == Some("Some.Show.S01E01"));
+}
+
+#[test]
+fn opting_in_a_group_leaves_the_rest_of_its_shard_alone() {
+    let mut h = fresh();
+    let other = (0..)
+        .map(|i| format!("alt.binaries.other{i}"))
+        .find(|g| store::shard_of(g) == store::shard_of(TEEVEE) && g != TEEVEE)
+        .unwrap();
+    let inline = |name: &str, group: &str| Release {
+        display_name: Some("aB3dE9Xk.mkv".into()),
+        ..release(name, group, "Real.Movie.2024.1080p.WEB-DL.x264-GRP.mkv", SUBJECT)
+    };
+    h.save(&[inline("Xk3Mz9PqA", TEEVEE), inline("Xk3Mz9PqB", &other)]);
+    let mut conn = conn_of(&h, TEEVEE);
+    // they count as many parts, soo the step applies to the group with no rules too
+    conn.execute("update releases set parts = 5", []).unwrap();
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
+    assert!(reprocess::apply(&tx, NAMED, Some(TEEVEE), chrono::Utc::now().timestamp()).unwrap());
+    tx.commit().unwrap();
+    let keys: Vec<String> = {
+        let mut stmt = conn.prepare("select key from meta where key like 'naming_rename_named%'").unwrap();
+        stmt.query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect()
+    };
+    assert_eq!(keys, [reprocess::rename_named_key(TEEVEE)]);
+
+    start(&mut h, config(), steps::all(), None);
+    let not_asked = row(&h, &other, "Xk3Mz9PqB").0;
+    wait_for("the asked-for group's name", || row(&h, TEEVEE, "Xk3Mz9PqA").2.is_some());
+    assert_ne!(row(&h, TEEVEE, "Xk3Mz9PqA").1.as_deref(), Some("aB3dE9Xk.mkv"));
+    wait_done(&h, &other, not_asked, NAMED);
+    assert_eq!(row(&h, &other, "Xk3Mz9PqB").1.as_deref(), Some("aB3dE9Xk.mkv"), "another group in its shard");
+    assert_eq!(row(&h, &other, "Xk3Mz9PqB").2, None);
+}
