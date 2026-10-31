@@ -571,8 +571,10 @@ for release in releases.iter().map(Cow::as_ref) {
     let t = Instant::now();
     let collection = release.collection.as_deref().map(|c| collection_row(&tx, &key, c, release)).transpose()?;
     let name = collection.as_ref().map_or(release.name.as_str(), |c| c.name.as_str());
+    // what the row's name is, not what this slice's files happen to be called
+    let is_obfuscated = collection.as_ref().map_or(release.is_obfuscated, |c| c.is_obfuscated);
     let id = global_id(ids.next()?, shard);
-    // the upsert as it was, with `name` where it had `release.name`. Move `type Saved` to module level.
+    // the upsert as it was, with `name` where it had `release.name` and `is_obfuscated` where it had `release.is_obfuscated`. Move `type Saved` to module level.
 
 // after `if release_id == id { new_releases += 1; }` (:1399-1401)
     if let Some(c) = collection.as_ref().filter(|c| !c.known) {
@@ -670,6 +672,7 @@ fn split_old_rows<'a>(tx: &Connection, grouping_from: i64, release: &'a Release)
 struct CollectionRow {
     key: i64,
     name: String,
+    is_obfuscated: bool,
     known: bool,
 }
 
@@ -679,12 +682,14 @@ struct CollectionRow {
 fn collection_row(tx: &Connection, key: &IdKey, collection: &str, release: &Release) -> Result<CollectionRow> {
     let hash = key.hash(collection);
     // a purge can leave a row here, whose release is gone: it finds nothing
-    let known: Option<String> = tx
-        .prepare_cached("select r.name from collections c join releases r on r.id = c.release_id where c.key = ?")?
-        .query_row([hash], |r| r.get(0))
+    let known: Option<(String, bool)> = tx
+        .prepare_cached(
+            "select r.name, r.is_obfuscated from collections c join releases r on r.id = c.release_id where c.key = ?",
+        )?
+        .query_row([hash], |r| Ok((r.get(0)?, r.get(1)?)))
         .optional()?;
-    if let Some(name) = known {
-        return Ok(CollectionRow { key: hash, name, known: true });
+    if let Some((name, is_obfuscated)) = known {
+        return Ok(CollectionRow { key: hash, name, is_obfuscated, known: true });
     }
     let mut taken = tx.prepare_cached("select 1 from releases where name = ? and group_name = ?")?;
     let mut name = release.name.clone();
@@ -694,7 +699,7 @@ fn collection_row(tx: &Connection, key: &IdKey, collection: &str, release: &Rele
         name = format!("{} [{digits:08}]", release.name);
         digits = (digits + 1) % 100_000_000;
     }
-    Ok(CollectionRow { key: hash, name, known: false })
+    Ok(CollectionRow { key: hash, name, is_obfuscated: release.is_obfuscated, known: false })
 }
 ```
 
@@ -1446,6 +1451,17 @@ fn a_suffix_another_release_has_moves_to_the_next_number() {
     let rows = rows_of(&conn);
     assert_eq!(rows.len(), 3, "the posts stay apart: {rows:?}");
     assert_eq!(rows[2].0, format!("same.jpg [{:08}]", (digits + 1) % 100_000_000));
+}
+
+#[test]
+fn a_later_slices_file_name_doesnt_change_the_rows_flag() {
+    let (_dir, main, conn) = fresh_shard_db();
+    save(&main, &[in_collection("k", "Readable.Movie.2024.mkv", "Readable.Movie.2024.mkv", "<a@x>", "p")]).unwrap();
+    let mut random = in_collection("k", "a1B2c3D4e5F6g7H8i9J0k1L2", "a1B2c3D4e5F6g7H8i9J0k1L2", "<b@x>", "p");
+    random.is_obfuscated = true;
+    save(&main, &[random]).unwrap();
+    let flag: i64 = conn.query_row("select is_obfuscated from releases", [], |r| r.get(0)).unwrap();
+    assert_eq!(flag, 0, "the row is still named Readable.Movie.2024.mkv");
 }
 
 #[test]

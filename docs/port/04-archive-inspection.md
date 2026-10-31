@@ -111,7 +111,7 @@ Walk from `pos = 7`, at most `MAX_BLOCKS = 65_536` blocks:
 5. `0x7B`: `complete = true`, return.
 6. `next = pos + HEAD_SIZE + (ADD_SIZE | HIGH_PACK_SIZE << 32)`, in `u64`. Past `len`: return. Inside one article this is the normal end.
 
-Name, flag `0x0200` set: no NUL in it means UTF-8 (lossy). Otherwise it is `name NUL enc`. `enc[0]` is `high`. Then until `enc` runs out or `MAX_NAME_CHARS`, take 2 bits at a time from a flag byte, high bits first, reading a new flag byte when none remain:
+Name, flag `0x0200` set: no NUL in it means UTF-8 (lossy). Otherwise it is `name NUL enc`. `enc[0]` is `high`. Then until `enc` runs out or `MAX_NAME_BYTES`, take 2 bits at a time from a flag byte, high bits first, reading a new flag byte when none remain:
 
 - `00`: next byte `b`: char `b`.
 - `01`: next byte `b`: char `b | high << 8`.
