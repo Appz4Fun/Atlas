@@ -284,13 +284,13 @@ select max(release_id), count(*) from (select release_id from media_release
  where title_key = ?1 and release_id > ?2 order by release_id limit 1000);
 
 update media_release indexed by media_release_title
-   set tvdb_id = ?4, tvmaze_id = ?5, trakt_id = ?6, tmdb_id = ?7, imdb_id = coalesce(imdb_id, ?8), tvrage_id = ?9
+   set tvdb_id = ?4, tvmaze_id = ?5, trakt_id = ?6, tmdb_id = ?7, imdb_id = iif(imdb_from_nfo = 1, imdb_id, ?8), tvrage_id = ?9
  where title_key = ?1 and release_id > ?2 and release_id <= ?3
    and (tvdb_id is not ?4 or tvmaze_id is not ?5 or trakt_id is not ?6 or tmdb_id is not ?7
-        or (imdb_id is null and ?8 is not null) or tvrage_id is not ?9);
+        or (imdb_from_nfo = 0 and imdb_id is not ?8) or tvrage_id is not ?9);
 ```
 
-`indexed by` is required: with a rowid range the planner could otherwise walk every release between two rows of the title. An `imdb_id` already on the row stays: it came from that release's own NFO, which can't name the wrong film (decision 28).
+`indexed by` is required: with a rowid range the planner could otherwise walk every release between two rows of the title. An `imdb_id` from that release's own NFO stays, since an NFO can't name the wrong film (decision 28). A provider's is replaced like the other IDs, so a corrected title corrects it too.
 
 ## 5. Schema and migration
 
@@ -312,15 +312,16 @@ create table if not exists media_release (
     trakt_id     INTEGER,
     tmdb_id      INTEGER,
     imdb_id      INTEGER,
-    tvrage_id    INTEGER
+    tvrage_id    INTEGER,
+    imdb_from_nfo INTEGER NOT NULL DEFAULT 0   -- 1: `imdb_id` is this release's own NFO, which a provider never overwrites
 );
 create index if not exists media_release_title  on media_release(title_key, release_id);
-create index if not exists media_release_tvdb   on media_release(tvdb_id,   season, episode, release_id) where tvdb_id   is not null;
-create index if not exists media_release_tvmaze on media_release(tvmaze_id, season, episode, release_id) where tvmaze_id is not null;
-create index if not exists media_release_trakt  on media_release(trakt_id,  season, episode, release_id) where trakt_id  is not null;
-create index if not exists media_release_tmdb   on media_release(tmdb_id,   season, episode, release_id) where tmdb_id   is not null;
-create index if not exists media_release_imdb   on media_release(imdb_id,   season, episode, release_id) where imdb_id   is not null;
-create index if not exists media_release_rage   on media_release(tvrage_id, season, episode, release_id) where tvrage_id is not null;
+create index if not exists media_release_tvdb   on media_release(tvdb_id,   release_id, season, episode, episode_last, kind) where tvdb_id   is not null;
+create index if not exists media_release_tvmaze on media_release(tvmaze_id, release_id, season, episode, episode_last, kind) where tvmaze_id is not null;
+create index if not exists media_release_trakt  on media_release(trakt_id,  release_id, season, episode, episode_last, kind) where trakt_id  is not null;
+create index if not exists media_release_tmdb   on media_release(tmdb_id,   release_id, season, episode, episode_last, kind) where tmdb_id   is not null;
+create index if not exists media_release_imdb   on media_release(imdb_id,   release_id, season, episode, episode_last, kind) where imdb_id   is not null;
+create index if not exists media_release_rage   on media_release(tvrage_id, release_id, season, episode, episode_last, kind) where tvrage_id is not null;
 ```
 
 The `ShardTable` const has `release_key: Some("release_id")` and these seven in `indexes`. `sample_row` fills `kind`, `title_key` and `quality` with 1.
@@ -337,7 +338,8 @@ on conflict(release_id) do update set
     trakt_id  = iif(media_release.title_key = excluded.title_key, coalesce(excluded.trakt_id,  media_release.trakt_id),  excluded.trakt_id),
     tmdb_id   = iif(media_release.title_key = excluded.title_key, coalesce(excluded.tmdb_id,   media_release.tmdb_id),   excluded.tmdb_id),
     tvrage_id = iif(media_release.title_key = excluded.title_key, coalesce(excluded.tvrage_id, media_release.tvrage_id), excluded.tvrage_id),
-    imdb_id   = iif(media_release.title_key = excluded.title_key, coalesce(media_release.imdb_id, excluded.imdb_id),     excluded.imdb_id),
+    imdb_id   = iif(media_release.title_key = excluded.title_key, iif(media_release.imdb_from_nfo = 1, media_release.imdb_id, coalesce(excluded.imdb_id, media_release.imdb_id)), excluded.imdb_id),
+    imdb_from_nfo = iif(media_release.title_key = excluded.title_key, media_release.imdb_from_nfo, 0),
     kind = excluded.kind, title_key = excluded.title_key, season = excluded.season, episode = excluded.episode,
     episode_last = excluded.episode_last, air_date = excluded.air_date, year = excluded.year, quality = excluded.quality
 ```
@@ -428,6 +430,7 @@ pub struct IdQuery { pub kind: Kind, pub ids: Vec<(IdColumn, i64)>, pub season: 
 pub fn from_args(t: &str, args: &HashMap<String, String>, on: &IdParams) -> Option<IdQuery>;
 pub fn find(q: &IdQuery, cats: Option<&CatFilter>, offset: i64, limit: i64) -> db::Result<Vec<ReleaseRow>>;
 pub const ID_ROWS: i64 = 20_000;
+pub const ID_SCAN: i64 = 200_000;
 pub struct IdPage { pub rows: Vec<ReleaseRow>, pub scanned: usize }
 pub fn find_with(conn: &Connection, q: &IdQuery, cats: Option<&CatFilter>, offset: i64, limit: i64, bounds: &Bounds, id_rows: i64) -> db::Result<IdPage>;
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -472,7 +475,7 @@ pub fn media_target(category: i64, rule: &str, name: &str) -> Option<(Kind, Pars
 3. `None`: if `select 1 from media_release where release_id = ?1` finds a row, a `delete` write. `matched: false`.
 4. `Some`: the statement in section 5, with IDs from `media.cached_ids(key)` when present. `matched: true`. No network.
 
-**`media_lookup`.** `enabled`: `set_config`, returns `cfg.media.any_provider()`. `reruns`: on rename and growth. `applies`, pure with no I/O:
+**`media_lookup`.** `enabled`: `set_config`, returns `cfg.media.any_provider()`. `config_stamp` (Part 3): the bits of the providers on, so adding one to a title's already looked-up releases starts one walk that clears this step, and `wants` then lets one release per title ask only the new provider. `reruns`: on rename and growth. `applies`, pure with no I/O:
 
 ```rust
 fn applies(&self, r: &ReleaseInfo) -> bool {
@@ -492,7 +495,7 @@ fn applies(&self, r: &ReleaseInfo) -> bool {
 | `Later(t)` | `wait_until: Some(t + release_id % 30)`, no attempt used, no lane pause |
 | `Err(e)` | `StepError::Retry(e)` |
 
-`ctx.stopping()` before each provider: `StepError::Stopped`. The `Found` write is the fan-out's `set` clause on this one row, so an NFO's `imdb_id` stays.
+`ctx.stopping()` before each provider: `StepError::Stopped`. The `Found` write is the fan-out's `set` clause on this one row, so an NFO's `imdb_id` stays and a provider's is replaced.
 
 **`media_nfo`.** The one movie ID source that needs no provider and can't mismatch. `enabled`: `cfg.media.nfo && cfg.media.parse && cfg.postprocess.body_fetches_per_minute > 0`, and Part 3 keeps a `Bodies` step off with no budget in any case. So it never runs on an unchanged config. `reruns`: on rename and growth, as an NFO can arrive late. `applies`, pure: `classify_release` and `media_target` give a movie, and `self.0.imdb_known(key)` is false, which reads the in-memory map and is false with no provider on. `run`:
 
@@ -501,7 +504,7 @@ fn applies(&self, r: &ReleaseInfo) -> bool {
 3. `ctx.segments(file.id, &SegmentPick::First(1))`. A row with `part > 1` means the first article was never indexed: done.
 4. `ctx.fetch_bodies(&[BodyRequest { message_id, file: file.filename.clone(), max_bytes: Some(65_536) }])`. One body. `Got::Missing`, `TooBig`, `Refused`: done, `matched: false`. A `StepError` propagates, and Part 3 gives the attempt back on an outage.
 5. On the bytes, `regex::bytes` with Unicode off: `(?i)(?:imdb\.com/title/)?\btt([0-9]{7,8})\b`, first match. None: done.
-6. `update media_release set imdb_id = ?2 where release_id = ?1 and imdb_id is null`. `matched: true`.
+6. `update media_release set imdb_id = ?2, imdb_from_nfo = 1 where release_id = ?1 and imdb_id is null`. `matched: true`.
 
 ### Consumed
 
@@ -509,18 +512,23 @@ fn applies(&self, r: &ReleaseInfo) -> bool {
 
 ### The ID queries
 
-Per `(shard, id)`, at most `ID_ROWS = 20_000` ids, then merged in Rust. `{col}` is one of the six columns, from a fixed list. Plan in every form: `SEARCH media_release USING [COVERING] INDEX media_release_{x} (...)`. No form has a temp b-tree, as no `order by` is used.
+Per `(shard, id)`, the newest `ID_SCAN = 200_000` rows of that ID are walked in descending `release_id`, and at most `ID_ROWS = 20_000` matching ids are kept, then merged in Rust. Newest first happens before either cap, so a heavily indexed title never loses its newest releases to a cap, and what the bounds can drop is the oldest. `{col}` is one of the six columns, from a fixed list. Plan in every form: `SEARCH media_release USING COVERING INDEX media_release_{x} ({col}=?)` in a co-routine. No form has a temp b-tree, since the index holds `release_id` right after the ID.
 
 ```sql
--- season and episode. Plan: (tvdb_id=? AND season=? AND episode<?). A multi-episode release matches each of its episodes.
-select release_id from s{i}.media_release
- where {col} = ?1 and kind = ?2 and season = ?3 and episode <= ?4 and coalesce(episode_last, episode) >= ?4 limit ?5
+-- season and episode. A multi-episode release matches each of its episodes.
+select release_id from (select release_id, kind, season, episode, episode_last from s{i}.media_release
+                         where {col} = ?1 order by release_id desc limit ?5)
+ where kind = ?2 and season = ?3 and episode <= ?4 and coalesce(episode_last, episode) >= ?4 limit ?6
 
 -- season: packs and episodes
-select release_id from s{i}.media_release where {col} = ?1 and kind = ?2 and season = ?3 limit ?4
+select release_id from (select release_id, kind, season from s{i}.media_release
+                         where {col} = ?1 order by release_id desc limit ?4)
+ where kind = ?2 and season = ?3 limit ?5
 
 -- the id alone
-select release_id from s{i}.media_release where {col} = ?1 and kind = ?2 limit ?3
+select release_id from (select release_id, kind from s{i}.media_release
+                         where {col} = ?1 order by release_id desc limit ?3)
+ where kind = ?2 limit ?4
 
 -- a category filter, per candidate that reaches the top
 select category from s{i}.release_category where release_id = ?1
@@ -691,7 +699,8 @@ Part 3's `an_old_shard_gets_the_new_tables_without_a_rewrite` bounds growth at `
   - `with_no_fact_it_classifies_for_itself`: clear only bit 32 with `Stage::rerun`. The row is rewritten.
   - `it_runs_with_the_category_step_off`: `"category": {"enabled": false}`. The TV release still gets its row, and no `release_category` row exists. Fails if the step reads the table.
   - `a_group_hint_alone_gets_no_row`: `Plain Name Nothing Else` in `alt.binaries.movies` is category 2999 with `group_name_movie`, and `parse_movie` would accept it. No `media_release` row.
-  - `a_late_article_keeps_ids`: a row with `imdb_id` set, a growth re-run with no provider on: `imdb_id` stays. A rename to a new title: it clears.
+  - `a_late_article_keeps_ids`: a row with `imdb_id` set, a growth re-run with no provider on: `imdb_id` stays. A rename to a new title: it clears, along with `imdb_from_nfo`.
+  - `a_corrected_provider_result_replaces_a_providers_imdb`: a title found with one IMDb ID and fanned out, its cache row deleted, `media_lookup` reprocessed with a corrected answer: every row of the title holds the new ID. `an_nfos_imdb_survives_the_correction`: the same with `imdb_from_nfo = 1` on one row: that row keeps its ID, through `media_parse`, the `Found` write and the fan-out.
   - `an_audio_release_gets_no_row`.
   - `a_rename_away_from_tv_drops_the_row`: a test step at rank 250 renames to `Artist-Album-WEB-2019-320kbps-MP3`; category becomes 3010; the row is gone.
   - `a_hidden_release_gets_no_row`: category 8020.
@@ -793,6 +802,7 @@ Fixtures: `tmdb_search_tv.json` `{"results":[{"id":401,"name":"Some Show","origi
   - `the_representative_gets_its_ids_through_the_step`: without the fan-out thread attached.
   - `a_rename_gets_a_new_title`: `media_parse` rewrites, and `media_lookup` asks for the new title.
   - `a_provider_turning_on_starts_a_walk`: Part 3's `pp_steps_seen` adds a `'steps'` walk. Old releases then go through one request per title.
+  - `a_second_provider_turning_on_starts_a_walk`: TVMaze on and a TV title and a movie looked up, then a TMDB key added: `media_lookup` stays enabled, its `config_stamp` gains a bit, one walk with its `redo_mask` runs, the movie and the TV title each make their TMDB requests and no TVMaze request, and the new IDs fan out.
 - [ ] **Implement** sections 4 and 6.
 - [ ] **Run:** `cargo test --test media_resolve && cargo test --test media_stage`. **Expected:** pass.
 - [ ] **Commit:** `Resolve each title once, cache misses, and look up within the net lane`
@@ -856,6 +866,7 @@ Fixtures: `tmdb_search_tv.json` `{"results":[{"id":401,"name":"Some Show","origi
 | `music` | `imdbid=1` | `None` |
 
   With nothing on, every row is `None`. With only TVMaze on, `tmdbid=401` alone is `None`.
+  - `a_big_id_keeps_its_newest_ids`, with `ID_SCAN` and `ID_ROWS` lowered through `#[doc(hidden)]` parameters of `find_with`: 50 matching rows and a cap of 5 return ids 46–50, in the episode, season and id-alone forms. `the_id_queries_use_their_covering_index`: `explain query plan` of each form has `USING COVERING INDEX` and no temp b-tree.
   - `attrs_xml`: a full TV row, all on, gives `season`, `episode`, `year`, `tvdbid`, `tvmazeid`, `traktid`, `tmdbid`, `rageid`, `tvrageid`, `imdb value="0100001"`, `imdbid value="0100001"`. A daily row gives `tvairdate value="2024-03-15"`, `season` 2024 and `episode` `03/15`. A pack gives `season` and no `episode`. IDs that are off in `IdParams` are left out; `season` stays.
   - In `src/api.rs`: `caps_reflects_what_is_on`, on `caps_body` with explicit `IdParams`, so no test here changes the environment. Part 4's and Part 7's `rss_*` tests gain the new arguments. Nothing on: `tv-search` is `q,season,ep,cat,limit,offset` with no ID. TVMaze on: adds `tvdbid`, `imdbid`, `rid`, `tvmazeid`. All on: every one, and `movie-search` has `imdbid,tmdbid,traktid`. `search_term_finds_a_daily_show`: `q=Some+Show&season=2025&ep=11/10` gives `Some Show 2025 11 10`.
 - [ ] **Test first:** `tests/media_api.rs`, `id_searches_end_to_end`. Set `ATLAS_HOME`, write `config.json`. Save hand-named releases across 3 groups in different shards, and set `release_category` and `media_release` by direct SQL. Through `api::handle`:
@@ -970,7 +981,7 @@ These are compacted sizes. The first-start walk fills `media_release` newest fir
 | Worst: 5 IDs, all at the cap | 40 | 800,000 ids, 6.4 MB | 60 ms | 500 ms |
 | `attrs_of`, 100 ids | up to 8 | 100 | 0.2 ms | 20 ms |
 
-Scans are bounded by `ID_ROWS` per shard and ID, by 2,000 rejected rows, and by `offset <= 10,000`. Without an ID parameter nothing changes, beyond one 100-id lookup for attributes.
+Scans are bounded by `ID_SCAN` index rows and `ID_ROWS` matches per shard and ID, by 2,000 rejected rows, and by `offset <= 10,000`. Without an ID parameter nothing changes, beyond one 100-id lookup for attributes.
 
 ## 10. Failure handling
 
@@ -1085,3 +1096,6 @@ cargo test --lib db::tests::a_wipe_removes_the_media_cache
 27. **Part 3 notes:** `facts` don't cross lanes (decision 1). There is no External budget (decision 10). `an_outage_waits_without_using_attempts` depends on Part 3's `wait_until` refund.
 28. **`media_nfo`, off until a body budget is set.** An NFO that states an IMDb id needs no provider and can't resolve to the wrong film, so its ID beats a title's. It's movie only because a TV NFO's id is often the series or another episode's, and it's one body at 64 KiB because that's enough for an NFO. Reading it adds a `Bodies` step to this part, so rule 8 is held by `no_budget_no_body`.
 29. **A group hint alone doesn't reach `media_release` or a provider.** Part 3's revision sends about 100M rows here, including small posts and anything in a hinted group. `parse_movie`'s fallback accepts a plain name, so `Plain Name Nothing Else` in `alt.binaries.movies` would otherwise become a title and a TMDB request, and a group of junk names would become thousands of them.
+30. **ID indexes put `release_id` right after the ID.** The first form, ordered by season and episode, made a cap keep the oldest rows of a popular title, and sorting afterwards can't bring back what was cut. Newest first needs the order in the index, with a season or episode filter read from it. The covering columns cost about 2 bytes a row over the old form. A season of a title with more than `ID_SCAN` rows in one shard can miss its oldest releases, the side a client minds least.
+31. **`imdb_from_nfo` records where an IMDb ID came from.** Keeping every existing IMDb ID meant a corrected provider answer changed the other IDs and left the wrong IMDb ID behind. Only an NFO's is kept.
+32. **A new provider redoes `media_lookup` through `config_stamp`.** The step stays enabled, so Part 3's step mask sees nothing. The stamp walks once, and `wants` keeps it to one request per title, for the new provider only.

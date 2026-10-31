@@ -105,7 +105,9 @@ create table if not exists pp_state (
     net_attempts INTEGER NOT NULL DEFAULT 0,  -- net lane: consecutive failed runs of its step
     net_next_at  INTEGER NOT NULL DEFAULT 0,  -- net lane: not before this
     parts_seen   INTEGER NOT NULL DEFAULT 0,  -- releases.parts when steps last ran
-    last_error   TEXT
+    last_error   TEXT,
+    rerun_gen    INTEGER NOT NULL DEFAULT 0,  -- bumped whenever bits are cleared, so a run in flight can tell
+    rerun_mask   INTEGER NOT NULL DEFAULT 0   -- every bit a bump ever cleared: a stale run's result for these is dropped
 );
 create index if not exists pp_state_net on pp_state(release_id, net_next_at) where net_wanted = 1;
 create index if not exists pp_state_failed on pp_state(release_id) where failed != 0;
@@ -223,6 +225,9 @@ pub trait Step: Send + Sync + 'static {
     /// below never sets the bit of a step whose `applies` is false.
     fn applies(&self, release: &ReleaseInfo) -> bool { let _ = release; true }
     fn reruns(&self) -> Reruns { Reruns::default() }
+    /// Inputs that can change while `enabled` stays true, one bit each. A bit that wasn't
+    /// there before redoes this step on existing releases, see Task 8. Cheap, no I/O.
+    fn config_stamp(&self) -> u64 { 0 }
     /// Synchronous, on a stage thread. Safe to block on `fetch_bodies` or a `ureq` call.
     fn run(&self, ctx: &mut StepCtx<'_>) -> Result<Outcome, StepError>;
 }
@@ -665,6 +670,8 @@ const CORE_TABLES: &[(&str, &str)] = &[
   - `a_release_deleted_meanwhile_records_nothing`: `writes` are skipped, no `pp_state` row.
   - `a_bad_write_fails_that_release_alone`: a batch of 3 with bad SQL in the second; 1 and 3 applied, 2 has `db_attempts = 1` and `last_error`, and its own earlier write is undone.
   - `masks_are_deltas`: a concurrent `Stage::rerun` between claim and apply keeps its cleared bit.
+  - `a_rerun_of_the_running_step_survives_its_result`: claim with `claimed_gen` 0, `Stage::rerun` of that very step, then apply its `set_done`: the bit stays clear and the queue row stays, also when the rerun's `due_at` equals `claimed_due`. An unrelated bit in the same `set_done` is dropped only if it is in `rerun_mask`.
+  - `a_rerun_of_a_release_with_no_state_is_remembered`: the same with no `pp_state` row at the claim. A rerun of an id with no release writes nothing.
   - `a_db_visit_leaves_the_net_columns_alone`: `net_attempts = 3`, `net_next_at = 999`; a DB-lane apply keeps both. The net lane's keeps `db_attempts`.
   - `net_wanted_follows_the_mask`: set while a `net_mask` bit is undone, NULL once done or failed, set again when `clear` takes it back.
   - `an_article_during_a_run_keeps_the_queue_row`: apply with an old `claimed_due` leaves the row, and a retry doesn't overwrite its newer `due_at`.
@@ -680,7 +687,7 @@ impl Db { pub(crate) fn on_writer(&self, shard: usize, work: StageWork) -> anyho
 
   In `writer`: keep a `VecDeque<StageJob>`, and any `Stage` taken from the channel goes there, including while gathering a save batch. Wait `Duration::ZERO` instead of `idle` while it is non-empty. After a save's replies are sent, run jobs for at most `STAGE_BUDGET_BUSY`; with no save waiting, for at most `STAGE_BUDGET_IDLE`, then `housekeeping` at least once a second. Each job runs in one `BEGIN IMMEDIATE` transaction and adds to `writer_stage_ns`. When the channel closes, run all that remain. `LOAD.writer_queued` keeps counting saves only.
 
-  In `apply.rs`, for each release inside a savepoint (`savepoint one`; on error `rollback to one`, then record the failure as `Retry` would). `Applied` carries `release_id`, `claimed_due: Option<i64>`, `set_done`, `set_failed`, `clear`, `rename_clears`, `net_mask`, `db_mask`, `writes`, `name`, `db_attempts`, `net_attempts`, `net_next_at` (each `Option`: None leaves the column), `parts_seen`, `error`, `queue_at: Option<i64>`, `no_state: bool`.
+  In `apply.rs`, for each release inside a savepoint (`savepoint one`; on error `rollback to one`, then record the failure as `Retry` would). `Applied` carries `release_id`, `claimed_due: Option<i64>`, `claimed_gen: i64` (the `rerun_gen` read with the row, 0 with no row), `set_done`, `set_failed`, `clear`, `rename_clears`, `net_mask`, `db_mask`, `writes`, `name`, `db_attempts`, `net_attempts`, `net_next_at` (each `Option`: None leaves the column), `parts_seen`, `error`, `queue_at: Option<i64>`, `no_state: bool`.
 
 ```sql
 select display_name, coalesce(name_source, 0) from releases where id = ?1;   -- none: skip this release
@@ -688,10 +695,15 @@ select display_name, coalesce(name_source, 0) from releases where id = ?1;   -- 
 -- when name.source >= that source and either field is Some. A differing display_name adds rename_clears to clear
 update releases set display_name = coalesce(?2, display_name), is_obfuscated = coalesce(?3, is_obfuscated), name_source = ?4
  where id = ?1;
--- unless no_state. ?2 set_done, ?3 set_failed, ?4 clear, ?5 net_mask, ?6 db_attempts, ?7 net_attempts, ?8 net_next_at
-insert into pp_state (release_id, done, failed, net_wanted, db_attempts, net_attempts, net_next_at, parts_seen, last_error)
+-- first, when a state row exists and claimed_gen differs: bits cleared since the claim may include the step that just
+-- ran, on input older than the request. Its result is dropped, and the queue row below is kept, so it runs again.
+select rerun_gen != ?2, rerun_mask from pp_state where release_id = ?1;
+-- unless no_state. ?2 set_done, ?3 set_failed, each without rerun_mask on a stale claim, ?4 clear, ?5 net_mask,
+-- ?6 db_attempts, ?7 net_attempts, ?8 net_next_at
+insert into pp_state (release_id, done, failed, net_wanted, db_attempts, net_attempts, net_next_at, parts_seen, last_error,
+                      rerun_gen, rerun_mask)
 values (?1, ?2 & ~?4, ?3 & ~?4, case when (?5 & ~(?2 & ~?4) & ~(?3 & ~?4)) != 0 then 1 end,
-        coalesce(?6, 0), coalesce(?7, 0), coalesce(?8, 0), ?9, ?10)
+        coalesce(?6, 0), coalesce(?7, 0), coalesce(?8, 0), ?9, ?10, ?4 != 0, ?4)
 on conflict(release_id) do update set
     done = (done | ?2) & ~?4,
     failed = (failed | ?3) & ~?4,
@@ -700,8 +712,10 @@ on conflict(release_id) do update set
     net_attempts = coalesce(?7, net_attempts),
     net_next_at = coalesce(?8, net_next_at),
     parts_seen = ?9,
-    last_error = ?10;
--- the claimed row, when nothing wants it back
+    last_error = ?10,
+    rerun_gen = rerun_gen + (?4 != 0),
+    rerun_mask = rerun_mask | ?4;
+-- the claimed row, when nothing wants it back and the claim wasn't stale
 delete from pp_queue where release_id = ?1 and due_at = ?2;
 -- queue_at: a wait or a retry. ?3 is claimed_due: an article since the claim keeps its later time
 insert into pp_queue (release_id, due_at) values (?1, ?2)
@@ -740,6 +754,7 @@ insert into pp_queue (release_id, due_at) values (?1, ?2) on conflict(release_id
   - `a_restart_resumes_the_walk`: stop mid-walk; `before_id` kept; restart continues below it. `a_new_rows_id_above_top_id_is_left_to_the_queue`.
   - `the_first_start_seeds_one_walk`: an existing database with two enabled steps: one `'backlog'` walk, `pp_steps_seen` holds both bits, and a second start adds none. Fails with a second `'steps'` walk.
   - `a_step_turning_on_starts_one_new_walk`: a reload with a new bit adds a `'steps'` walk; the same mask again adds none.
+  - `a_new_stamp_bit_redoes_that_step_once`: an enabled step's `config_stamp` goes from 1 to 3: one `'steps'` walk with its `redo_mask`; the same stamp again adds none, and 3 to 1 adds none.
   - `enabled_sees_the_full_config_before_the_first_run`: a step copies a limit in `enabled`; its first `run` sees it with no `set_config`.
 - [ ] **Implement:** threads `atlas-pp-db-{i}`; each loops over shards and takes `shard_busy[shard]` (`AtomicBool`), so one batch per shard is in flight and no claim state is written. In a pass over a shard it runs one queue batch, then one walk tick if tokens allow, so neither holds the other up. Per shard, one `db::open_shard` connection with `pragma query_only = on`, opened lazily; every read is a short statement.
 
@@ -748,7 +763,7 @@ insert into pp_queue (release_id, due_at) values (?1, ?2) on conflict(release_id
 ```sql
 select q.release_id, q.due_at, r.id is not null, r.name, r.display_name, r.group_name, coalesce(r.size, 0), coalesce(r.complete, 0),
        coalesce(r.parts, 0), r.file_total, s.release_id is not null, coalesce(s.done, 0), coalesce(s.failed, 0),
-       coalesce(s.db_attempts, 0), coalesce(s.parts_seen, 0)
+       coalesce(s.db_attempts, 0), coalesce(s.parts_seen, 0), coalesce(s.rerun_gen, 0)
 from (select release_id, due_at from pp_queue where due_at <= ?1 order by due_at limit ?2) q
 left join releases r on r.id = q.release_id
 left join pp_state s on s.release_id = q.release_id;
@@ -761,7 +776,8 @@ left join pp_state s on s.release_id = q.release_id;
 ```sql
 select id, before_id, redo_mask, group_name from pp_walks order by id desc limit 1;
 select r.id, r.name, r.display_name, r.group_name, coalesce(r.size, 0), coalesce(r.complete, 0), coalesce(r.parts, 0), r.file_total,
-       s.release_id is not null, coalesce(s.done, 0), coalesce(s.failed, 0), coalesce(s.db_attempts, 0), coalesce(s.parts_seen, 0)
+       s.release_id is not null, coalesce(s.done, 0), coalesce(s.failed, 0), coalesce(s.db_attempts, 0), coalesce(s.parts_seen, 0),
+       coalesce(s.rerun_gen, 0)
 from releases r left join pp_state s on s.release_id = r.id
 where r.id < ?1 order by r.id desc limit ?2;   -- with `and r.group_name = ?3` it uses idx_release_group
 ```
@@ -777,7 +793,7 @@ where r.id < ?1 order by r.id desc limit ?2;   -- with `and r.group_name = ?3` i
   6. For each enabled applicable net step, not done or failed: `Bodies` with `body_gate` `Outside`: set its bit, counted as `matched: false`. `NotYet`: nothing. Otherwise add it to `net_mask`.
   7. Build one `Applied`. Send the batch via `Db::on_writer`, wait for the answer, then take the next.
 
-  `Stage::rerun`: `update pp_state set done = done & ~:m, failed = failed & ~:m, db_attempts = 0, net_attempts = 0, net_next_at = 0 where release_id = :id`, then `insert into pp_queue ... on conflict(release_id) do update set due_at = excluded.due_at` with `due_at = now`, through the writer. A walk's `redo_mask` does the same through `clear`.
+  `Stage::rerun`: `insert into pp_state (release_id, rerun_gen, rerun_mask) select :id, 1, :m where exists (select 1 from releases where id = :id) on conflict(release_id) do update set done = done & ~:m, failed = failed & ~:m, db_attempts = 0, net_attempts = 0, net_next_at = 0, rerun_gen = rerun_gen + 1, rerun_mask = rerun_mask | :m`, then `insert into pp_queue ... on conflict(release_id) do update set due_at = excluded.due_at` with `due_at = now`, through the writer. A walk's `redo_mask` does the same through `clear`.
 
   At `Stage::start`, once per shard, through the writer. This is the only write when `pp_walk_seeded` is absent, because the backlog walk visits every row and needs no `'steps'` walk beside it:
 
@@ -790,6 +806,8 @@ insert or replace into meta (key, value) values ('pp_steps_seen', ?2);  -- ?2: t
 ```
 
   Later, compare the enabled mask (a `Bodies` step counts only with a budget) with `meta.pp_steps_seen` at start and on `set_config`: new bits insert a `'steps'` walk from `max(id) + 1`, and the mask is stored.
+
+  A step whose inputs change without its bit changing says so with `Step::config_stamp`. At start and on `set_config`, for each enabled step not new in that comparison: stamp bits missing from `meta.pp_stamp_{id}` insert a `'steps'` walk from `max(id) + 1` with `redo_mask = mask(step)`, and the stamp is stored. With no such meta key the stamp is stored with no walk when the step is new or the backlog walk is being seeded, since neither has finished results to redo.
 - [ ] **Run:** `cargo test --test pp_stage && just test`. **Expected:** pass.
 - [ ] **Commit:** `Run database steps with retries, and walk the backlog newest first`
 
@@ -837,7 +855,7 @@ select release_id from pp_state where net_wanted = 1 and net_next_at <= ?1 order
 -- every 8th claim: order by release_id asc
 ```
 
-  For each: `judge_row`, `file_summaries`, `judge_files` again, and `body_gate`. `Reject`, or no step left: `net_wanted` cleared. `Begin` through the writer: `update pp_state set net_attempts = net_attempts + 1, net_next_at = :now + 900 where release_id = :id`. Run the lowest-rank undone enabled applicable net step, whose lane's result follows section 6's table, then `Applied`, with `db_attempts` None. `net_mask` is the undone net steps left, plus any `clear` or `rename_clears` net bits.
+  For each, reading `rerun_gen` as its `claimed_gen` before anything else: `judge_row`, `file_summaries`, `judge_files` again, and `body_gate`. `Reject`, or no step left: `net_wanted` cleared. `Begin` through the writer: `update pp_state set net_attempts = net_attempts + 1, net_next_at = :now + 900 where release_id = :id`. Run the lowest-rank undone enabled applicable net step, whose lane's result follows section 6's table, then `Applied`, with `db_attempts` None. `net_mask` is the undone net steps left, plus any `clear` or `rename_clears` net bits.
 - [ ] **Run:** `cargo test --test pp_bodies && just test`. **Expected:** pass.
 - [ ] **Commit:** `Run body and outside steps within a budget, without using up retries on an outage`
 
@@ -1189,3 +1207,5 @@ cargo test --test pp_schema
 51. **Bounded counts on the dashboard.** `BUGS.md` #44: exact counts at this size stalled the monitor. `100k+` is enough to read.
 52. **The menu's purge stays, with a limit.** Replacing it is out of scope. Past 1M incomplete rows in a shard it would hold one transaction for hours with every trigger firing, so it refuses and names the batched command.
 53. **Benchmarks are reported, not gated.** The overview's rule: they measure a machine that may be busy with the live indexer.
+54. **A rerun beats a result computed before it.** Masks as deltas keep other bits, but not the bit of the step that's running, whose result may rest on input older than the request. `rerun_gen` tells the writer the claim is stale, and `rerun_mask` says which results to drop. The mask is never reset, because two lanes hold claims at once and either could reset it under the other. It can only over-drop, which costs one more run of a step on the rare stale claim, so it converges.
+55. **`config_stamp` is separate from `pp_steps_seen`.** That one tracks steps turning on, and a step that was on and gains an input, like a second metadata provider, needs its finished results redone, which a walk with no `redo_mask` wouldn't do.
