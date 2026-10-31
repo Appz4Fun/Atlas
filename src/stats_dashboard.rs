@@ -585,6 +585,7 @@ fn draw_overview(f: &mut Frame, app: &App, area: Rect) {
         kv("mode", s["mode"].as_str().unwrap_or("-")),
         kv("uptime", human_time(s["uptime"].as_i64().unwrap_or(0))),
         kv("groups", format!("{} configured", count(s["groups_configured"].as_i64().unwrap_or(0)))),
+        kv("groups blocked", count(s["groups_blocked"].as_i64().unwrap_or(0))),
         kv("indexing at once", count(s["workers"].as_i64().unwrap_or(0))),
         kv("errors this run", count(s["error_count"].as_i64().unwrap_or(0))),
     ];

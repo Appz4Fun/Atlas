@@ -259,11 +259,20 @@ fn groups_label(groups: &[String], workers: usize) -> String {
     if groups.len() <= 3 { groups.join(", ") } else { format!("{} groups, {workers} at once", groups.len()) }
 }
 
+/// Say which configured groups wont be indexed (`filters::group_blocked`).
+fn say_blocked(blocked: &[String]) {
+    if !blocked.is_empty() {
+        println!("blocked and not indexed, their names label them for minors: {}", blocked.join(", "));
+    }
+}
+
 /// State shared by the scheduler's workers for one set of servers.
 struct Scheduler {
     ctx: PassContext,
     settings: RwLock<PassSettings>,
     groups: RwLock<Vec<String>>,
+    /// configured groups left out of `groups`, see `filters::group_blocked`
+    blocked: Mutex<Vec<String>>,
     /// (server, groups at once) for every indexing server
     plan: Vec<(usize, usize)>,
     workers: usize,
@@ -444,6 +453,7 @@ impl Scheduler {
         let mut stats = self.stats.lock().unwrap();
         stats.extra.insert("servers".into(), json!(self.ctx.pool.server_stats()));
         stats.extra.insert("groups_configured".into(), json!(groups.len()));
+        stats.extra.insert("groups_blocked".into(), json!(self.blocked.lock().unwrap().len()));
         stats.extra.insert("workers".into(), json!(self.workers));
         stats.extra.insert("pid".into(), json!(std::process::id()));
         let mut load = crate::profile::LOAD.snapshot();
@@ -644,6 +654,14 @@ async fn watch_config(sched: Arc<Scheduler>, servers: Vec<UsenetServer>) {
             *current = settings;
         }
 
+        let blocked = config.blocked_groups();
+        let mut known = sched.blocked.lock().unwrap();
+        if *known != blocked {
+            say_blocked(&blocked);
+            *known = blocked;
+        }
+        drop(known);
+
         let groups = config.tracked_groups();
         let mut current = sched.groups.write().unwrap();
         if *current != groups {
@@ -701,6 +719,7 @@ async fn run_servers(
 ) -> bool {
     let servers = usable_servers(config);
     let groups = config.tracked_groups();
+    say_blocked(&config.blocked_groups());
     let plan = plan_workers(config);
     let workers: usize = plan.iter().map(|(_, w)| w).sum();
 
@@ -714,6 +733,7 @@ async fn run_servers(
         ctx: PassContext { pool, states, stop, verbose: false },
         settings: RwLock::new(settings_of(config)),
         groups: RwLock::new(groups),
+        blocked: Mutex::new(config.blocked_groups()),
         plan: plan.clone(),
         workers,
         next: Mutex::new(HashMap::new()),
@@ -1060,6 +1080,7 @@ mod tests {
             },
             settings: RwLock::new(PassSettings { mode: "backfill".into(), ..PassSettings::default() }),
             groups: RwLock::new(groups),
+            blocked: Mutex::new(Vec::new()),
             plan: vec![],
             workers: 2,
             next: Default::default(),

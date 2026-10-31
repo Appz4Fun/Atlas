@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 use crate::config::Config;
 use crate::db::save_releases_bulk;
 use crate::download::download_release;
+use crate::filters::group_blocked;
 use crate::nntp::{BlockingPool, headers_to_articles};
 use crate::nzb::generate_nzb;
 use crate::parser::{Release, group_articles, is_complete};
@@ -123,7 +124,7 @@ pub fn fetch_group_candidates(config: &Config, limit: usize) -> Vec<String> {
     let groups = client.list_groups(Some("alt.binaries*")).unwrap_or_default();
     client.disconnect();
 
-    groups.into_iter().take(limit).map(|(name, _)| name).collect()
+    groups.into_iter().map(|(name, _)| name).filter(|g| !group_blocked(g)).take(limit).collect()
 }
 
 /// Pull the newest headers from each group, keep keyword matches, save em.
@@ -144,7 +145,7 @@ pub fn fetch_and_store(config: &Config, groups: &[String], keywords: &[String], 
 
     let keywords: Vec<String> = keywords.iter().map(|k| k.to_lowercase()).collect();
 
-    for grp in groups {
+    for grp in groups.iter().filter(|g| !group_blocked(g)) {
         let (first, last) = match client.select_group(grp) {
             Ok((_, first, last, _)) => (first as i64, last as i64),
             Err(e) => {

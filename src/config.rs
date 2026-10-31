@@ -252,13 +252,23 @@ impl Config {
 
     /// groups the indexer should walk, falls back to the single `group` field
     pub fn tracked_groups(&self) -> Vec<String> {
-        let groups: Vec<String> = self.groups.iter().filter(|g| !g.is_empty()).cloned().collect();
+        let groups: Vec<String> =
+            self.groups.iter().filter(|g| !g.is_empty() && !crate::filters::group_blocked(g)).cloned().collect();
 
-        if groups.is_empty() && !self.group.is_empty() {
+        if groups.is_empty() && !self.group.is_empty() && !crate::filters::group_blocked(&self.group) {
             return vec![self.group.clone()];
         }
 
         groups
+    }
+
+    /// configured groups that are never indexed, see `filters::group_blocked`
+    pub fn blocked_groups(&self) -> Vec<String> {
+        let mut blocked: Vec<String> =
+            self.groups.iter().chain([&self.group]).filter(|g| crate::filters::group_blocked(g)).cloned().collect();
+        blocked.sort_unstable();
+        blocked.dedup();
+        blocked
     }
 
     fn from_value(v: &Value) -> Config {

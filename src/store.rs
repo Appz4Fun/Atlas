@@ -1373,7 +1373,7 @@ impl ShardWriter {
             let mut update_stats = tx
                 .prepare_cached("update releases set size = ?, complete = ?, parts = ?, file_total = ? where id = ?")?;
 
-            for release in batches.into_iter().flatten() {
+            for release in batches.into_iter().flatten().filter(|r| !crate::filters::group_blocked(&r.group)) {
                 let t = Instant::now();
                 let id = global_id(ids.next()?, shard);
                 type Saved = (i64, Option<i64>, Option<i64>, Option<i64>);

@@ -496,6 +496,9 @@ pub async fn run_pass<P>(
 where
     P: FnMut(&Progress) + ?Sized,
 {
+    if crate::filters::group_blocked(group) {
+        return Ok(Progress::default());
+    }
     let (server, (_count, first, last, _name)) = ctx.pool.select_group_on(prefer, group).await?;
     let (first, last) = (first as i64, last as i64);
     let key = cursor_key(&ctx.pool, server, group);
@@ -898,6 +901,9 @@ pub async fn run_sweep<P>(
 where
     P: FnMut(&Progress) + ?Sized,
 {
+    if crate::filters::group_blocked(group) {
+        return Ok(Progress::default());
+    }
     let (g, host) = (group.to_string(), ctx.pool.host(server));
     // noted as swept only if the split hasnt reached back since (see `set_swept`)
     let generation = {
@@ -1492,6 +1498,9 @@ impl Pass<'_> {
     {
         let mut in_window = 0i64;
         let (pool, group) = (&self.ctx.pool, self.group);
+        if crate::filters::group_blocked(group) {
+            return Ok((Progress::default(), true, 0));
+        }
         // no slice bigger than the whole unsaved budget: it would hold more
         // headers than the cap allows
         let size = self.settings.request_size.min(pool.max_unsaved() as u64);
@@ -1601,6 +1610,9 @@ fn slice_date(headers: &[Overview]) -> Option<db::Dated> {
 /// Parse one slice into releases, look up real names, save.
 async fn save_slice(pool: &Arc<Pool>, db: &Db, group: &str, headers: Vec<Overview>) -> Result<Progress> {
     let articles = headers.len() as i64;
+    if crate::filters::group_blocked(group) {
+        return Ok(Progress { articles, ..Progress::default() });
+    }
     crate::profile::SLICES.add(1);
     crate::profile::HEADERS.add(articles as u64);
 
@@ -1736,6 +1748,9 @@ impl Indexer {
         self.last_batch_articles = 0;
         self.last_batch_bytes = 0;
         self.last_batch_releases = 0;
+        if crate::filters::group_blocked(group) {
+            return Ok(());
+        }
 
         let ctx = PassContext {
             pool: self.client.pool.clone(),

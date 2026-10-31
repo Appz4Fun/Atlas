@@ -5,7 +5,11 @@
 
 mod common;
 
+use atlas::config::Config;
+use atlas::indexer::Indexer;
+use atlas::nntp::BlockingPool;
 use atlas::{api, db, nzb, search, store};
+use common::{GROUP, Server, mock, par2_file_desc, post, spawn_server, yenc_body};
 
 const BLOCKED: &str = "alt.binaries.pictures.erotica.teen";
 const OPEN: &str = "alt.binaries.open";
@@ -81,5 +85,38 @@ fn a_blocked_group_is_never_indexed_or_served() {
 
     // nothing is deleted before a purge
     let conn = db::open().unwrap();
+    assert_eq!(conn.query_row("select count(*) from releases", [], |r| r.get::<_, i64>(0)).unwrap(), 4);
+
+    let config = Config {
+        group: BLOCKED.into(),
+        groups: vec![BLOCKED.into(), GROUP.into(), "alt.binaries.yong.eroitca".into()],
+        ..Config::default()
+    };
+    assert_eq!(config.tracked_groups(), vec![GROUP.to_string()]);
+    assert_eq!(config.blocked_groups(), vec![BLOCKED.to_string(), "alt.binaries.yong.eroitca".to_string()]);
+    let only = Config { group: BLOCKED.into(), groups: vec![BLOCKED.into()], ..Config::default() };
+    assert_eq!(only.tracked_groups(), Vec::<String>::new());
+
+    // a pass over a blocked group: no header, no body, no cursor, no row
+    let par2 = par2_file_desc("Real.Name.mkv", 100);
+    let mut server = Server::new(vec![
+        post(1, r#""Unsafe.Thing.par2" yEnc (1/1)"#, 10, yenc_body("Unsafe.Thing.par2", &par2)),
+        post(2, r#""Other.Thing.bin" yEnc (1/1)"#, 10, vec![]),
+    ]);
+    std::sync::Arc::get_mut(&mut server).unwrap().any_group = true;
+    let port = spawn_server(server.clone());
+    let client = BlockingPool::new(&[mock(port, "secret", 2, 1)]);
+    client.connect().unwrap();
+    let mut indexer = Indexer::new(client, "backfill", db::open().unwrap());
+    indexer.index_group_with(BLOCKED, &mut |_| panic!("no slice of a blocked group")).unwrap();
+    assert_eq!(server.xovers.load(std::sync::atomic::Ordering::SeqCst), 0, "no headers");
+    assert_eq!(server.bodies_sent.load(std::sync::atomic::Ordering::SeqCst), 0, "no bodies");
+    let cursors: i64 =
+        conn.query_row("select count(*) from groups where name like ?", [format!("{BLOCKED}%")], |r| r.get(0)).unwrap();
+    assert_eq!(cursors, 0);
+
+    // the store takes nothing of it, whatever path it came by
+    let release = atlas::parser::Release { name: "Late".into(), group: BLOCKED.into(), ..Default::default() };
+    store::save(&main, &[release]).unwrap();
     assert_eq!(conn.query_row("select count(*) from releases", [], |r| r.get::<_, i64>(0)).unwrap(), 4);
 }
