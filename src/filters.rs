@@ -8,7 +8,7 @@ use std::sync::LazyLock;
 use regex::Regex;
 use rusqlite::{Connection, Result, functions::FunctionFlags};
 
-use crate::parser::Article;
+use crate::parser::{Article, parse_subject};
 
 // ---------------------------------------------------------------- blocked groups
 
@@ -500,10 +500,58 @@ pub fn drop_per_article_obfuscated(articles: Vec<Article>) -> (Vec<Article>, i64
     (kept, skipped)
 }
 
+// ---------------------------------------------------------------- stored fragments
+
+/// What a shard stores about a release and its file: `releases.name`,
+/// `releases.parts` (0 when NULL), the number of `files` rows, and that row's
+/// `subject_part`, `expected` and `subject`. None of it needs the file's
+/// `segments` rows or its `blob`: `segments` is empty for a sealed file, and
+/// `parts` counts what is in the blob too.
+#[derive(Clone, Debug)]
+pub struct StoredPost<'a> {
+    pub name: &'a str,
+    pub parts: i64,
+    pub files: usize,
+    pub part: Option<i64>,
+    pub expected: Option<i64>,
+    pub subject: Option<&'a str>,
+}
+
+/// a name that looks random with no neighbour to compare it to: a run of 16+
+/// letters and digits, or two or more runs before the extension, each 6+ long
+/// and mixing digits and letters
+fn looks_random(name: &str) -> bool {
+    let runs: Vec<&str> = name.split(|c: char| !c.is_ascii_alphanumeric()).filter(|r| !r.is_empty()).collect();
+    if runs.iter().any(|r| r.len() >= TOKEN_LEN) {
+        return true;
+    }
+    let mixed =
+        |r: &&str| r.len() >= 6 && r.bytes().any(|b| b.is_ascii_digit()) && r.bytes().any(|b| b.is_ascii_alphabetic());
+    let stems = if runs.last().is_some_and(|e| e.len() <= 4) { &runs[..runs.len() - 1] } else { &runs[..] };
+    stems.len() >= 2 && stems.iter().all(mixed)
+}
+
+/// A stored release is a per-article fragment: one article in one file, whose
+/// own subject claims a middle part of a bigger file (so never `(1/1)`, nor a
+/// first or last part), `part` and `expected` agreeing with it, under a name
+/// that looks random. The subject decides: `remap_bracket_parts` can leave
+/// `expected` 3 and `part` 2 on a `(1/1)` subject. Nothing here looks at time:
+/// the caller waits until nothing can still arrive for it.
+pub fn stored_fragment(post: &StoredPost<'_>) -> bool {
+    if post.parts != 1 || post.files != 1 {
+        return false;
+    }
+    let Some(claim) = post.subject.and_then(parse_subject) else { return false };
+    claim.part > 1
+        && claim.part < claim.total_parts
+        && post.part == Some(claim.part)
+        && post.expected == Some(claim.total_parts)
+        && looks_random(post.name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parser::parse_subject;
 
     #[test]
     fn unambiguous_terms_block_on_their_own() {
@@ -769,5 +817,103 @@ mod tests {
         let mut s: Vec<String> = (2..=20).map(|p| format!(r#""{}" yEnc ({p}/50)"#, random(p, 32))).collect();
         s.extend((21..=40).map(|p| format!(r#""a1B2c3D4e5F6g7H8i9J0" yEnc ({p}/50)"#)));
         assert_eq!(skipped(&s), 0);
+    }
+
+    fn post<'a>(name: &'a str, subject: &'a str, part: i64, expected: i64) -> StoredPost<'a> {
+        StoredPost { name, parts: 1, files: 1, part: Some(part), expected: Some(expected), subject: Some(subject) }
+    }
+
+    const TOKEN: &str = "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6";
+
+    #[test]
+    fn a_fragment_is_one_middle_part_under_a_random_name() {
+        let s = format!(r#"[41/62] "{TOKEN}" yEnc (316/375)"#);
+        assert!(stored_fragment(&post(TOKEN, &s, 316, 375)));
+        let s = format!(r#""{TOKEN}" yEnc (2441/5747)"#);
+        assert!(stored_fragment(&post(TOKEN, &s, 2441, 5747)));
+        let dotted = "x7Gh2kLq.p9Zt3vBn";
+        let s = format!(r#"[17/36] - "{dotted}" yEnc (40/59) 2088881050"#);
+        assert!(stored_fragment(&post(dotted, &s, 40, 59)));
+    }
+
+    #[test]
+    fn what_is_not_a_fragment() {
+        let middle = format!(r#""{TOKEN}" yEnc (7/9)"#);
+        let good = || post(TOKEN, &middle, 7, 9);
+        assert!(stored_fragment(&good()), "the rows below each change one thing");
+
+        // (1/1) never, whatever the columns say
+        let one = format!(r#"[2/3] "{TOKEN}" yEnc (1/1)"#);
+        assert!(!stored_fragment(&post(TOKEN, &one, 1, 1)));
+        assert!(!stored_fragment(&post(TOKEN, &one, 2, 3)), "remapped by its bracket counter");
+        // first and last parts
+        let first = format!(r#""{TOKEN}" yEnc (1/9)"#);
+        assert!(!stored_fragment(&post(TOKEN, &first, 1, 9)));
+        let last = format!(r#""{TOKEN}" yEnc (9/9)"#);
+        assert!(!stored_fragment(&post(TOKEN, &last, 9, 9)));
+        // a plain name
+        let plain = r#""Some.Movie.2024.1080p.mkv" yEnc (7/9)"#;
+        assert!(!stored_fragment(&post("Some.Movie.2024.1080p.mkv", plain, 7, 9)));
+        assert!(!stored_fragment(&post("S01E01.x264hd.1080p.mkv", plain, 7, 9)), "1080p is too short");
+        // more than one article or file, or none
+        assert!(!stored_fragment(&StoredPost { parts: 2, ..good() }));
+        assert!(!stored_fragment(&StoredPost { parts: 0, ..good() }));
+        assert!(!stored_fragment(&StoredPost { files: 2, ..good() }));
+        // the columns disagree with the subject
+        assert!(!stored_fragment(&post(TOKEN, &middle, 6, 9)));
+        assert!(!stored_fragment(&post(TOKEN, &middle, 7, 8)));
+        // nothing to go on (a save held it back)
+        assert!(!stored_fragment(&StoredPost { subject: None, ..good() }));
+        assert!(!stored_fragment(&StoredPost { part: None, ..good() }));
+        assert!(!stored_fragment(&StoredPost { expected: None, ..good() }));
+    }
+
+    #[test]
+    fn a_sealed_fragment_reads_the_same_as_a_loose_one() {
+        use crate::parser::Release;
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        crate::db::create_db_at(&main).unwrap();
+        let group = "alt.binaries.test";
+        let article = Article {
+            subject: format!(r#""{TOKEN}" yEnc (5/9)"#),
+            filename: Some(TOKEN.into()),
+            part: Some(5),
+            total_parts: Some(9),
+            message_id: "<a@x>".into(),
+            bytes: 700_000,
+            ..Default::default()
+        };
+        let release =
+            Release { name: TOKEN.into(), group: group.into(), articles: vec![article], ..Default::default() };
+        crate::store::save(&main, &[release]).unwrap();
+        let conn = crate::db::open_shard(&crate::store::shard_path(&main, crate::store::shard_of(group))).unwrap();
+
+        let read = || {
+            conn.query_row(
+                "select r.name, r.parts, f.subject_part, f.expected, f.subject,
+                     (select count(*) from files x where x.release_id = r.id)
+                 from releases r join files f on f.release_id = r.id",
+                [],
+                |r| {
+                    let (name, subject): (String, String) = (r.get(0)?, r.get(4)?);
+                    Ok(stored_fragment(&StoredPost {
+                        name: &name,
+                        parts: r.get(1)?,
+                        files: r.get::<_, i64>(5)? as usize,
+                        part: r.get(2)?,
+                        expected: r.get(3)?,
+                        subject: Some(&subject),
+                    }))
+                },
+            )
+            .unwrap()
+        };
+        assert!(read(), "loose");
+        let file: i64 = conn.query_row("select id from files", [], |r| r.get(0)).unwrap();
+        crate::store::seal_file(&conn, file).unwrap();
+        let rows: i64 = conn.query_row("select count(*) from segments", [], |r| r.get(0)).unwrap();
+        assert_eq!(rows, 0, "sealed: its article is only in the blob");
+        assert!(read(), "sealed");
     }
 }
