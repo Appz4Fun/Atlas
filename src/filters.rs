@@ -2,9 +2,13 @@
 //! labelled for minors. The per-article rule is ported from newznab-tmux
 //! (`HeaderParser::markPerArticleObfuscated`, `BUGS.md` #65), GPLv3.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::LazyLock;
 
+use regex::Regex;
 use rusqlite::{Connection, Result, functions::FunctionFlags};
+
+use crate::parser::Article;
 
 // ---------------------------------------------------------------- blocked groups
 
@@ -365,9 +369,141 @@ pub fn register_sql(conn: &Connection) -> Result<()> {
     conn.create_scalar_function("atlas_blocked", 1, flags, |ctx| Ok(ctx.get_raw(0).as_str().is_ok_and(group_blocked)))
 }
 
+// ---------------------------------------------------------------- articles obfuscated per article
+
+/// articles of one signature a slice has to hold before it can be judged, and
+/// part positions its once-seen names have to span
+pub const PER_ARTICLE_MIN: usize = 16;
+/// letters and digits a name needs before it could be random
+const TOKEN_LEN: usize = 16;
+
+/// base name, part and part total of a subject: `<base> (12/45)`
+static SUBJECT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\s*(.+?)\s+\((\d+)\s*/\s*(\d+)\)").unwrap());
+/// a file counter in a base name: `[03/62]`, `(3 of 62)`
+pub(crate) static COUNTER_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)[\[(\s](\d{1,5})(?:/|[\s_]of[\s_]|-)(\d{1,5})[\])\[\s$:]").unwrap());
+
+/// a run of letters and digits, with the separators random names carry: `<random>.<random>`
+fn is_name_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'+' | b'~')
+}
+
+/// some name in `base` has enough letters and digits to be random
+fn has_token(base: &str) -> bool {
+    base.as_bytes()
+        .split(|b| !is_name_byte(*b))
+        .any(|run| run.iter().filter(|b| b.is_ascii_alphanumeric()).count() >= TOKEN_LEN)
+}
+
+/// `base` with its names collapsed: what stays the same over one upload
+fn shape(base: &str) -> u64 {
+    let (mut hash, mut in_name) = (0xcbf2_9ce4_8422_2325u64, false);
+    for &b in base.as_bytes() {
+        let name = is_name_byte(b);
+        if !(name && in_name) {
+            hash = (hash ^ u64::from(if name { b'x' } else { b })).wrapping_mul(0x100_0000_01b3);
+        }
+        in_name = name;
+    }
+    hash
+}
+
+/// `base` for comparing names: digit runs go unless they are in a 16+
+/// character token, soo numbered volumes (`<hash>.part07.rar`) share a name
+/// and random tokens stay whole
+fn comparable(base: &str) -> String {
+    let mut out = String::with_capacity(base.len());
+    for (i, run) in base.split(|c: char| !c.is_ascii_alphanumeric()).enumerate() {
+        if i > 0 {
+            // what split on: the same width in every article of a signature
+            out.push('.');
+        }
+        if run.len() >= TOKEN_LEN {
+            out.push_str(run);
+        } else {
+            out.extend(run.chars().filter(|c| !c.is_ascii_digit()));
+        }
+    }
+    out
+}
+
+/// subject shape, part total, file counter
+type SignatureKey = (u64, i64, Option<(u32, u32)>);
+
+#[derive(Default)]
+struct Signature {
+    /// name -> how many articles have it, the first one's index and part
+    names: HashMap<String, (u32, usize, i64)>,
+    articles: usize,
+    total: i64,
+}
+
+/// Which of a slice's subjects are obfuscated per article: true = skip it.
+///
+/// nyuu's article obfuscation gives every article its own random subject
+/// token, soo every article would become a release of one article that can
+/// never complete. Multi-part subjects with a name of 16+ letters and digits
+/// are grouped by subject shape, part total and file counter. A group with at
+/// least `PER_ARTICLE_MIN` articles and at least 90% distinct names has its
+/// once-seen names skipped, keeping first and last parts, when they span at
+/// least `PER_ARTICLE_MIN` part positions.
+pub fn mark_per_article_obfuscated<'a>(subjects: impl Iterator<Item = &'a str>) -> Vec<bool> {
+    let mut signatures: HashMap<SignatureKey, Signature> = HashMap::new();
+    let mut count = 0;
+    for (i, subject) in subjects.enumerate() {
+        count = i + 1;
+        let Some(c) = SUBJECT_RE.captures(subject) else { continue };
+        let base = c.get(1).map_or("", |m| m.as_str());
+        let (Ok(part), Ok(total)) = (c[2].parse::<i64>(), c[3].parse::<i64>()) else { continue };
+        if total < 2 || !has_token(base) || base.starts_with("Usenet Index Post") {
+            continue;
+        }
+        let counter = COUNTER_RE.captures(base).and_then(|c| Some((c[1].parse().ok()?, c[2].parse().ok()?)));
+        let signature = signatures.entry((shape(base), total, counter)).or_default();
+        signature.total = total;
+        signature.articles += 1;
+        signature.names.entry(comparable(base)).and_modify(|n| n.0 += 1).or_insert((1, i, part));
+    }
+
+    let mut skip = vec![false; count];
+    for signature in signatures.values() {
+        // a stray duplicate must not shield the group; a real upload repeats on nearly every part
+        if signature.articles < PER_ARTICLE_MIN || signature.names.len() * 10 < signature.articles * 9 {
+            continue;
+        }
+        // repeated names are a real upload sharing the group. a first or last
+        // part is kept: a real upload cut by the slice's edge can show just that one
+        let once: Vec<(usize, i64)> = signature
+            .names
+            .values()
+            .filter(|(n, _, part)| *n == 1 && *part != 1 && *part != signature.total)
+            .map(|(_, i, part)| (*i, *part))
+            .collect();
+        // files posted round robin, each with its own random name, show one
+        // article per file at only one or two positions
+        if once.iter().map(|(_, part)| *part).collect::<HashSet<_>>().len() < PER_ARTICLE_MIN {
+            continue;
+        }
+        for (i, _) in once {
+            skip[i] = true;
+        }
+    }
+    skip
+}
+
+/// A slice's articles without the ones obfuscated per article, and how many went.
+pub fn drop_per_article_obfuscated(articles: Vec<Article>) -> (Vec<Article>, i64) {
+    let skip = mark_per_article_obfuscated(articles.iter().map(|a| a.subject.as_str()));
+    let before = articles.len();
+    let kept: Vec<Article> = articles.into_iter().zip(skip).filter(|(_, s)| !s).map(|(a, _)| a).collect();
+    let skipped = (before - kept.len()) as i64;
+    (kept, skipped)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parser::parse_subject;
 
     #[test]
     fn unambiguous_terms_block_on_their_own() {
@@ -547,5 +683,91 @@ mod tests {
         ] {
             assert!(!group_blocked(g), "{g}");
         }
+    }
+
+    fn random(i: usize, len: usize) -> String {
+        let mut x = (i as u64 + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        let abc = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+        (0..len)
+            .map(|_| {
+                x = x.wrapping_mul(0x100_0000_01b3) ^ (x >> 7);
+                abc[(x % 62) as usize] as char
+            })
+            .collect()
+    }
+
+    fn skipped(subjects: &[String]) -> usize {
+        mark_per_article_obfuscated(subjects.iter().map(String::as_str)).iter().filter(|s| **s).count()
+    }
+
+    #[test]
+    fn the_real_shapes_are_caught() {
+        let all = |s: Vec<String>, why: &str| assert_eq!(skipped(&s), s.len(), "{why}");
+        all(
+            (2..=40).map(|p| format!(r#"[41/62] "{}" yEnc ({p}/375)"#, random(p, 32))).collect(),
+            "counter, quoted token",
+        );
+        all((2..=40).map(|p| format!(r#""{}" yEnc ({p}/5747)"#, random(p, 24))).collect(), "no counter");
+        all(
+            (1000..1040)
+                .map(|p| format!(r#"[17/36] - "{}.{}" yEnc ({p}/59) 2088881050"#, random(p, 8), random(p + 9000, 8)))
+                .collect(),
+            "past the total, a dot and no 16 long run",
+        );
+        let dotted: Vec<String> = (2..=40)
+            .map(|p| format!(r#"[17/36] - "{}.{}" yEnc ({p}/59) 2088881050"#, random(p, 8), random(p + 9000, 8)))
+            .collect();
+        assert!(parse_subject(&dotted[0]).is_some(), "these do become releases today");
+        all(dotted, "within the total");
+        let bare: Vec<String> =
+            (2..=40).map(|p| format!("[{}] - {} yEnc ({p}/1250)", random(p, 2), random(p, 40))).collect();
+        assert!(parse_subject(&bare[0]).is_none());
+        all(bare, "no quotes");
+        all(
+            (2..=40)
+                .map(|p| {
+                    let sep = if p % 2 == 0 { "-" } else { "_" };
+                    format!(r#"[3/9] "{}{sep}{}" yEnc ({p}/200)"#, random(p, 9), random(p + 500, 9 + p % 3))
+                })
+                .collect(),
+            "a separator that varies",
+        );
+    }
+
+    #[test]
+    fn real_uploads_are_kept() {
+        let none = |s: Vec<String>, why: &str| assert_eq!(skipped(&s), 0, "{why}");
+        none(
+            (1..=100).map(|p| format!(r#"[1/5] "a1B2c3D4e5F6g7H8i9J0.bin" yEnc ({p}/100)"#)).collect(),
+            "one name on every part",
+        );
+        none(
+            (1..=40).map(|p| format!(r#""a1B2c3D4e5F6g7H8i9J0.part{p:02}.rar" yEnc ({p}/50)"#)).collect(),
+            "numbered volumes",
+        );
+        none(
+            (0..40).map(|f| format!(r#""{}" yEnc ({}/50)"#, random(f, 32), 7 + f % 2)).collect(),
+            "round robin, two positions",
+        );
+        none((2..=10).map(|p| format!(r#""{}" yEnc ({p}/5747)"#, random(p, 32))).collect(), "under the minimum");
+        none((0..50).map(|f| format!(r#""{}" yEnc (1/1)"#, random(f, 32))).collect(), "single part posts");
+    }
+
+    #[test]
+    fn repeats_and_first_and_last_parts_stay() {
+        let mut s: Vec<String> = (2..=40).map(|p| format!(r#""{}" yEnc ({p}/50)"#, random(p, 32))).collect();
+        let hits = s.len();
+        s.push(format!(r#""{}" yEnc (1/50)"#, random(1000, 32)));
+        s.push(format!(r#""{}" yEnc (50/50)"#, random(1001, 32)));
+        s.push(r#""a1B2c3D4e5F6g7H8i9J0" yEnc (5/50)"#.into());
+        s.push(r#""a1B2c3D4e5F6g7H8i9J0" yEnc (6/50)"#.into());
+        assert_eq!(skipped(&s), hits);
+    }
+
+    #[test]
+    fn a_share_under_90_percent_keeps_the_group() {
+        let mut s: Vec<String> = (2..=20).map(|p| format!(r#""{}" yEnc ({p}/50)"#, random(p, 32))).collect();
+        s.extend((21..=40).map(|p| format!(r#""a1B2c3D4e5F6g7H8i9J0" yEnc ({p}/50)"#)));
+        assert_eq!(skipped(&s), 0);
     }
 }
