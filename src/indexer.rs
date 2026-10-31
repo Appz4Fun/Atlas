@@ -191,7 +191,7 @@ const MAX_BATCH: usize = 8;
 #[derive(Clone)]
 pub struct Db {
     conn: Arc<Mutex<Connection>>,
-    saves: Vec<std::sync::mpsc::Sender<SaveJob>>,
+    saves: Vec<std::sync::mpsc::Sender<WriterJob>>,
     /// last field: dropping the final clone closes the queues above, then waits
     /// for the writer threads to finish what they were doing
     _writers: Arc<Writers>,
@@ -212,6 +212,23 @@ struct SaveJob {
     releases: Vec<Release>,
     done: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
 }
+
+/// a write of the processing stage's, in one transaction on the shard's writer
+pub(crate) type StageWork = Box<dyn FnOnce(&Connection) -> rusqlite::Result<()> + Send>;
+
+pub(crate) struct StageJob {
+    work: StageWork,
+    done: std::sync::mpsc::SyncSender<std::result::Result<(), String>>,
+}
+
+enum WriterJob {
+    Save(SaveJob),
+    Stage(StageJob),
+}
+
+/// time a writer spends on stage work after each save, and with no save waiting
+const STAGE_BUDGET_BUSY: Duration = Duration::from_millis(10);
+const STAGE_BUDGET_IDLE: Duration = Duration::from_millis(100);
 
 /// `conn` is the main database. The writer threads end once every clone of
 /// the `Db` is gone, and the last clone to go waits for them.
@@ -244,7 +261,7 @@ fn writer(
     shard: usize,
     path: &std::path::Path,
     ids: &crate::store::Ids,
-    jobs: std::sync::mpsc::Receiver<SaveJob>,
+    jobs: std::sync::mpsc::Receiver<WriterJob>,
     idle: Duration,
 ) {
     use crate::profile::{LOAD, Load};
@@ -255,16 +272,34 @@ fn writer(
     let mut store = crate::store::ShardWriter::new(shard);
     // a job taken off the queue to see if more were waiting
     let mut next: Option<SaveJob> = None;
+    // stage work waits here, between saves
+    let mut stage: std::collections::VecDeque<StageJob> = Default::default();
+    let mut last_housekeeping = std::time::Instant::now();
 
     loop {
         let first = match next.take() {
             Some(job) => job,
-            None => match jobs.recv_timeout(idle) {
-                Ok(job) => job,
+            None => match jobs.recv_timeout(if stage.is_empty() { idle } else { Duration::ZERO }) {
+                Ok(WriterJob::Save(job)) => job,
+                Ok(WriterJob::Stage(job)) => {
+                    stage.push_back(job);
+                    continue;
+                }
                 // nothing to save: files still come due as they go stale
-                Err(RecvTimeoutError::Timeout) => {
+                Err(RecvTimeoutError::Timeout) if stage.is_empty() => {
                     if let Ok(conn) = &mut opened {
                         housekeeping(conn, &mut store, true);
+                    }
+                    last_housekeeping = std::time::Instant::now();
+                    continue;
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    run_stage_jobs(&mut opened, path, &mut stage, Some(STAGE_BUDGET_IDLE));
+                    if last_housekeeping.elapsed() >= Duration::from_secs(1) {
+                        if let Ok(conn) = &mut opened {
+                            housekeeping(conn, &mut store, true);
+                        }
+                        last_housekeeping = std::time::Instant::now();
                     }
                     continue;
                 }
@@ -274,7 +309,8 @@ fn writer(
         let mut batch = vec![first];
         while batch.len() < MAX_BATCH {
             match jobs.try_recv() {
-                Ok(job) => batch.push(job),
+                Ok(WriterJob::Save(job)) => batch.push(job),
+                Ok(WriterJob::Stage(job)) => stage.push_back(job),
                 Err(_) => break,
             }
         }
@@ -303,20 +339,70 @@ fn writer(
         for job in batch {
             let _ = job.done.send(result.clone());
         }
+        run_stage_jobs(&mut opened, path, &mut stage, Some(STAGE_BUDGET_BUSY));
 
         // housekeeping between transactions
         if let Ok(conn) = &mut opened {
             // more slices waiting: saving them comes first. a closed queue
             // means the indexer is stopping, it waits for this thread
-            let seal = match jobs.try_recv() {
-                Ok(job) => {
-                    next = Some(job);
-                    false
+            let mut seal = saved;
+            loop {
+                match jobs.try_recv() {
+                    Ok(WriterJob::Save(job)) => {
+                        next = Some(job);
+                        seal = false;
+                        break;
+                    }
+                    Ok(WriterJob::Stage(job)) => stage.push_back(job),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        seal = false;
+                        break;
+                    }
                 }
-                Err(TryRecvError::Empty) => saved,
-                Err(TryRecvError::Disconnected) => false,
-            };
+            }
             housekeeping(conn, &mut store, seal);
+            last_housekeeping = std::time::Instant::now();
+        }
+    }
+    // stopping: whoever queued these is told
+    run_stage_jobs(&mut opened, path, &mut stage, None);
+}
+
+/// Stage jobs, each in one transaction, for at most `budget` (None: all of them).
+fn run_stage_jobs(
+    opened: &mut rusqlite::Result<Connection>,
+    path: &std::path::Path,
+    stage: &mut std::collections::VecDeque<StageJob>,
+    budget: Option<Duration>,
+) {
+    use crate::profile::{LOAD, Load};
+    use std::sync::atomic::Ordering::Relaxed;
+
+    let start = std::time::Instant::now();
+    while let Some(job) = stage.pop_front() {
+        let t = std::time::Instant::now();
+        let result = match opened {
+            Ok(conn) => stage_transaction(conn, job.work).map_err(|e| e.to_string()),
+            Err(e) => Err(format!("couldnt open {}: {e}", path.display())),
+        };
+        let _ = job.done.send(result);
+        Load::add_since(&LOAD.writer_stage_ns, t);
+        Load::add_since(&LOAD.writer_busy_ns, t);
+        LOAD.writer_stage_jobs.fetch_add(1, Relaxed);
+        if budget.is_some_and(|b| start.elapsed() >= b) {
+            break;
+        }
+    }
+}
+
+fn stage_transaction(conn: &Connection, work: StageWork) -> rusqlite::Result<()> {
+    conn.execute_batch("begin immediate")?;
+    match work(conn) {
+        Ok(()) => conn.execute_batch("commit"),
+        Err(e) => {
+            let _ = conn.execute_batch("rollback");
+            Err(e)
         }
     }
 }
@@ -342,6 +428,18 @@ fn housekeeping(conn: &mut Connection, store: &mut crate::store::ShardWriter, se
 }
 
 impl Db {
+    /// Run `work` in one transaction on `shard`'s writer, between saves. The
+    /// answer comes when it has committed; jobs queued when the writer stops still run.
+    pub(crate) fn on_writer(
+        &self,
+        shard: usize,
+        work: StageWork,
+    ) -> Result<std::sync::mpsc::Receiver<std::result::Result<(), String>>> {
+        let (done, answer) = std::sync::mpsc::sync_channel(1);
+        self.saves[shard].send(WriterJob::Stage(StageJob { work, done })).map_err(|_| anyhow!("db writer stopped"))?;
+        Ok(answer)
+    }
+
     /// Save one slice's releases. Returns once they are committed. Dropping
     /// the future before the writer gets to the slice drops the slice too
     /// (its pass didnt finish, soo the cursor didnt move past it); once the
@@ -351,7 +449,7 @@ impl Db {
         let Some(shard) = releases.first().map(|r| crate::store::shard_of(&r.group)) else { return Ok(()) };
         let (done, saved) = tokio::sync::oneshot::channel();
         crate::profile::LOAD.writer_queued.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if self.saves[shard].send(SaveJob { releases, done }).is_err() {
+        if self.saves[shard].send(WriterJob::Save(SaveJob { releases, done })).is_err() {
             crate::profile::LOAD.writer_queued.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             return Err(anyhow!("db writer stopped"));
         }
@@ -2150,5 +2248,78 @@ mod tests {
         let sources = name_sources(&Release { articles, ..Default::default() });
         assert_eq!(sources.len(), NAME_SOURCES_MAX);
         assert_eq!(sources[0].0, "<99@x>", "the par2 first");
+    }
+
+    fn stage_db() -> (tempfile::TempDir, Db, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        db::create_db_at(&main).unwrap();
+        let conn = db::open_at(&main).unwrap();
+        let shard = crate::store::shard_path(&main, 0);
+        (dir, shared_db(conn), shard)
+    }
+
+    #[test]
+    fn a_stage_job_runs_on_the_writer_and_answers() {
+        let (_dir, db, shard) = stage_db();
+        let answer = db
+            .on_writer(
+                0,
+                Box::new(|conn| {
+                    conn.execute("insert into pp_queue (release_id, due_at) values (1, 2)", [])?;
+                    Ok(())
+                }),
+            )
+            .unwrap();
+        answer.recv().unwrap().unwrap();
+        let rows: i64 =
+            db::open_shard(&shard).unwrap().query_row("select count(*) from pp_queue", [], |r| r.get(0)).unwrap();
+        assert_eq!(rows, 1);
+    }
+
+    #[test]
+    fn stage_jobs_dont_hold_up_saves() {
+        let (_dir, db, _shard) = stage_db();
+        let group = (0..).map(|i| format!("alt.binaries.g{i}")).find(|g| crate::store::shard_of(g) == 0).unwrap();
+        let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let answers: Vec<_> = (0..500)
+            .map(|_| {
+                let ran = ran.clone();
+                db.on_writer(
+                    0,
+                    Box::new(move |_| {
+                        std::thread::sleep(Duration::from_millis(2));
+                        ran.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        Ok(())
+                    }),
+                )
+                .unwrap()
+            })
+            .collect();
+        let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let article = crate::parser::Article {
+            message_id: "<a@x>".into(),
+            filename: Some("a".into()),
+            part: Some(1),
+            total_parts: Some(1),
+            ..Default::default()
+        };
+        runtime
+            .block_on(db.save(vec![Release { name: "a".into(), group, articles: vec![article], ..Default::default() }]))
+            .unwrap();
+        assert!(ran.load(std::sync::atomic::Ordering::SeqCst) < 250);
+        for answer in answers {
+            answer.recv().unwrap().unwrap();
+        }
+    }
+
+    #[test]
+    fn queued_stage_jobs_run_before_the_writer_stops() {
+        let (_dir, db, _shard) = stage_db();
+        let answers: Vec<_> = (0..50).map(|_| db.on_writer(0, Box::new(|_| Ok(()))).unwrap()).collect();
+        drop(db);
+        for answer in answers {
+            answer.recv().unwrap().unwrap();
+        }
     }
 }

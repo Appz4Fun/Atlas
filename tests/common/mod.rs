@@ -11,6 +11,8 @@ use std::time::Duration;
 use atlas::config::UsenetServer;
 use atlas::indexer::Indexer;
 
+pub mod stage;
+
 pub const GROUP: &str = "alt.binaries.test";
 
 #[derive(Clone)]

@@ -435,6 +435,72 @@ impl Conn {
         Ok((code, message.to_string()))
     }
 
+    /// One line of at most about `max` bytes. None: past that, with at most one
+    /// read's worth more off the socket and the rest left unread, soo the
+    /// connection cant take another request.
+    async fn read_line_capped(&mut self, max: usize) -> Result<Option<Vec<u8>>> {
+        let mut buf = Vec::new();
+        loop {
+            let (used, ended) = {
+                let chunk = with_timeout(self.timeout, self.io.fill_buf()).await?;
+                if chunk.is_empty() {
+                    return Err(NntpError::Io(io::Error::new(io::ErrorKind::UnexpectedEof, "connection closed")));
+                }
+                match chunk.iter().position(|b| *b == b'\n') {
+                    Some(at) => {
+                        buf.extend_from_slice(&chunk[..=at]);
+                        (at + 1, true)
+                    }
+                    None => {
+                        buf.extend_from_slice(chunk);
+                        (chunk.len(), false)
+                    }
+                }
+            };
+            self.io.consume(used);
+            self.wire += used as u64;
+            self.text += used as u64;
+            if ended {
+                while buf.last().is_some_and(|b| *b == b'\n' || *b == b'\r') {
+                    buf.pop();
+                }
+                return Ok(Some(buf));
+            }
+            if buf.len() > max {
+                return Ok(None);
+            }
+        }
+    }
+
+    /// `body` with a bound. None: over `max_bytes`, or more than one line per
+    /// 16 of them. At most `max_bytes` + 64 KiB off the wire, one long line included.
+    pub async fn body_capped(&mut self, message_id: &str, max_bytes: usize) -> Result<Option<Vec<u8>>> {
+        let (code, message) = self.command("BODY", Some(message_id)).await?;
+        if code != 222 {
+            return Err(NntpError::Reply { code, message });
+        }
+        // only listings get compressed, and a compressed one cant be bounded by its lines
+        if message.contains("[COMPRESS=GZIP]") {
+            return Ok(None);
+        }
+        let (mut lines, mut read) = (Vec::new(), 0usize);
+        loop {
+            let Some(mut l) = self.read_line_capped(max_bytes).await? else { return Ok(None) };
+            if l == b"." {
+                break;
+            }
+            if l.starts_with(b"..") {
+                l.remove(0);
+            }
+            read += l.len();
+            lines.push(l);
+            if read > max_bytes || lines.len() > max_bytes / 16 + 1 {
+                return Ok(None);
+            }
+        }
+        Ok(Some(yenc_decode(&lines).unwrap_or_else(|| lines.join(&b'\n'))))
+    }
+
     /// A plain multi-line response, handed to `line` one at a time with
     /// dot-stuffing removed (see `each_line`).
     async fn each_plain_line(&mut self, mut line: impl FnMut(Vec<u8>) -> bool) -> Result<bool> {
@@ -780,6 +846,22 @@ struct Server {
     text: AtomicU64,
 }
 
+/// A body read for background work, see `Pool::background_body`.
+#[derive(Debug, PartialEq, Eq)]
+pub enum BackgroundBody {
+    Body(Vec<u8>),
+    Missing,
+    TooBig,
+}
+
+#[derive(Clone, Copy)]
+enum BackgroundRead {
+    Capped,
+}
+
+/// how long a background body waits for room before it queues like anything else
+const BODY_PATIENCE: Duration = Duration::from_secs(20);
+
 /// Counts a request waiting for a connection while it lives (a request
 /// dropped while it waits is counted out too).
 struct Waiting<'a>(&'a AtomicUsize);
@@ -956,6 +1038,8 @@ pub struct Pool {
     /// groups their first choice server doesnt carry: the server that does
     homes: Mutex<HashMap<String, usize>>,
     unsaved: Arc<UnsavedBudget>,
+    /// how long a background body waits for room before queuing
+    body_patience: Duration,
 }
 
 /// Headers fetched (or on their way) and not saved yet, over every pass on a
@@ -1101,6 +1185,7 @@ impl Pool {
             failed_over_at: Mutex::new(None),
             timeout: DEFAULT_TIMEOUT,
             homes: Mutex::new(HashMap::new()),
+            body_patience: BODY_PATIENCE,
             unsaved: UnsavedBudget::new(crate::config::DEFAULT_MAX_UNSAVED_HEADERS as usize),
         }
     }
@@ -1111,6 +1196,11 @@ impl Pool {
     }
 
     /// At most `headers` fetched and not saved yet, over every pass at once.
+    pub fn with_body_patience(mut self, patience: Duration) -> Self {
+        self.body_patience = patience;
+        self
+    }
+
     pub fn with_max_unsaved(mut self, headers: usize) -> Self {
         self.unsaved = UnsavedBudget::new(headers);
         self
@@ -1311,66 +1401,166 @@ impl Pool {
             };
             crate::profile::Load::add_since(&crate::profile::LOAD.lease_wait_ns, waited);
 
-            let idle = {
-                let mut idle = server.idle.lock().unwrap();
-                let on_group = group.and_then(|g| idle.iter().rposition(|c| c.group.as_deref() == Some(g)));
-                match on_group {
-                    Some(pos) => Some(idle.swap_remove(pos)),
-                    None => idle.pop(),
-                }
-            };
-            if let Some(conn) = idle {
-                return Ok(Lease::new(conn, server, permit));
+            if let Some(lease) = self.connect_with_permit(&server, permit, group, force).await? {
+                return Ok(lease);
             }
+        }
+    }
 
-            if !force && server.down_until.lock().unwrap().is_some_and(|t| Instant::now() < t) {
-                return Err(NntpError::Io(io::Error::new(
-                    io::ErrorKind::ConnectionRefused,
-                    format!("{} failed recently, skipping it", server.cfg.host),
-                )));
+    /// A connection for a permit already held: an idle one, or a new one. None:
+    /// the provider allows fewer connections than thought, wait for another permit.
+    async fn connect_with_permit(
+        &self,
+        server: &Arc<Server>,
+        permit: OwnedSemaphorePermit,
+        group: Option<&str>,
+        force: bool,
+    ) -> Result<Option<Lease>> {
+        let idle = {
+            let mut idle = server.idle.lock().unwrap();
+            let on_group = group.and_then(|g| idle.iter().rposition(|c| c.group.as_deref() == Some(g)));
+            match on_group {
+                Some(pos) => Some(idle.swap_remove(pos)),
+                None => idle.pop(),
             }
+        };
+        if let Some(conn) = idle {
+            return Ok(Some(Lease::new(conn, server.clone(), permit)));
+        }
 
-            let e = match Conn::open(&server.cfg, self.timeout, server.compress()).await {
-                Ok(conn) => {
-                    *server.down_until.lock().unwrap() = None;
-                    return Ok(Lease::new(conn, server, permit));
-                }
-                Err(e) => e,
-            };
+        if !force && server.down_until.lock().unwrap().is_some_and(|t| Instant::now() < t) {
+            return Err(NntpError::Io(io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                format!("{} failed recently, skipping it", server.cfg.host),
+            )));
+        }
 
-            let limit = server.limit.load(Ordering::Relaxed);
-            let others_open = server.permits.available_permits() + 1 < limit;
+        let e = match Conn::open(&server.cfg, self.timeout, server.compress()).await {
+            Ok(conn) => {
+                *server.down_until.lock().unwrap() = None;
+                return Ok(Some(Lease::new(conn, server.clone(), permit)));
+            }
+            Err(e) => e,
+        };
 
-            match refusal(&e) {
-                // the provider allows fewer connections than configured (or another
-                // app on the same account uses some): use one less from now on and
-                // wait for a connection that is already open
-                Refusal::TooMany if others_open && limit > 1 => {
-                    permit.forget();
-                    let now = server.limit.fetch_sub(1, Ordering::Relaxed) - 1;
-                    if !server.warned_limit.swap(true, Ordering::Relaxed) {
-                        println!("{}: provider refused more connections ({e}), lowering to {now}", server.cfg.host);
-                    }
-                    continue;
+        let limit = server.limit.load(Ordering::Relaxed);
+        let others_open = server.permits.available_permits() + 1 < limit;
+
+        match refusal(&e) {
+            // the provider allows fewer connections than configured (or another
+            // app on the same account uses some): use one less from now on and
+            // wait for a connection that is already open
+            Refusal::TooMany if others_open && limit > 1 => {
+                permit.forget();
+                let now = server.limit.fetch_sub(1, Ordering::Relaxed) - 1;
+                if !server.warned_limit.swap(true, Ordering::Relaxed) {
+                    println!("{}: provider refused more connections ({e}), lowering to {now}", server.cfg.host);
                 }
-                Refusal::Auth => {
-                    *server.down_until.lock().unwrap() = Some(Instant::now() + AUTH_REST);
-                    if !server.warned_auth.swap(true, Ordering::Relaxed) {
-                        println!(
-                            "{}: login rejected ({e}). not using it for {}m, check the username/password",
-                            server.cfg.host,
-                            AUTH_REST.as_secs() / 60
-                        );
-                    }
-                    return Err(e);
+                Ok(None)
+            }
+            Refusal::Auth => {
+                *server.down_until.lock().unwrap() = Some(Instant::now() + AUTH_REST);
+                if !server.warned_auth.swap(true, Ordering::Relaxed) {
+                    println!(
+                        "{}: login rejected ({e}). not using it for {}m, check the username/password",
+                        server.cfg.host,
+                        AUTH_REST.as_secs() / 60
+                    );
                 }
-                _ => {
-                    if !others_open {
-                        *server.down_until.lock().unwrap() = Some(Instant::now() + DOWN_FOR);
+                Err(e)
+            }
+            _ => {
+                if !others_open {
+                    *server.down_until.lock().unwrap() = Some(Instant::now() + DOWN_FOR);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// A connection to server `i` for background work: only when nobody waits
+    /// for one and more than a quarter of its connections are free. None: no room.
+    async fn background_lease(&self, i: usize) -> Result<Option<Lease>> {
+        let server = self.servers[i].clone();
+        let limit = server.limit.load(Ordering::Relaxed);
+        if self.is_down(i)
+            || server.waiting.load(Ordering::Relaxed) > 0
+            || server.permits.available_permits() <= limit / 4
+        {
+            return Ok(None);
+        }
+        let Ok(permit) = server.permits.clone().try_acquire_owned() else { return Ok(None) };
+        self.connect_with_permit(&server, permit, None, false).await
+    }
+
+    /// A body for background work. Tries each server, least busy first, taking a
+    /// connection only when nobody waits for one and more than limit/4 are free.
+    /// Past its patience with none it queues normally, soo it cant starve either.
+    /// Missing: every server said so. Err: a server couldnt be asked.
+    pub async fn background_body(&self, message_id: &str, max_bytes: usize) -> Result<BackgroundBody> {
+        self.background_read(message_id, max_bytes, BackgroundRead::Capped).await
+    }
+
+    async fn background_read(
+        &self,
+        message_id: &str,
+        max_bytes: usize,
+        read: BackgroundRead,
+    ) -> Result<BackgroundBody> {
+        let mut left = self.indexing_tier();
+        left.sort_by(|&a, &b| self.busy(a).total_cmp(&self.busy(b)));
+        let others: Vec<usize> = (0..self.servers.len()).filter(|i| !left.contains(i)).collect();
+        left.extend(others);
+        if left.is_empty() {
+            return Err(Self::no_servers());
+        }
+        let start = Instant::now();
+        let mut unreachable = None;
+        while !left.is_empty() {
+            let mut no_room = Vec::new();
+            for i in left.drain(..) {
+                let lease = if start.elapsed() >= self.body_patience {
+                    self.lease(i, false).await.map(Some)
+                } else {
+                    self.background_lease(i).await
+                };
+                let mut lease = match lease {
+                    Ok(Some(lease)) => lease,
+                    Ok(None) => {
+                        no_room.push(i);
+                        continue;
                     }
-                    return Err(e);
+                    Err(e) => {
+                        unreachable = Some(e);
+                        continue;
+                    }
+                };
+                let r = match read {
+                    BackgroundRead::Capped => lease.begin().body_capped(message_id, max_bytes).await,
+                };
+                match r {
+                    Ok(Some(body)) => {
+                        lease.check::<()>(Ok(()))?;
+                        crate::profile::LOAD.bg_bodies.fetch_add(1, Ordering::Relaxed);
+                        crate::profile::LOAD.bg_body_bytes.fetch_add(body.len() as u64, Ordering::Relaxed);
+                        return Ok(BackgroundBody::Body(body));
+                    }
+                    // the rest is unread: the lease stays busy, soo the connection is thrown away
+                    Ok(None) => return Ok(BackgroundBody::TooBig),
+                    Err(e) => match lease.check::<()>(Err(e)) {
+                        Err(NntpError::Reply { .. }) | Ok(()) => {}
+                        Err(e) => unreachable = Some(e),
+                    },
                 }
             }
+            left = no_room;
+            if !left.is_empty() {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        }
+        match unreachable {
+            Some(e) => Err(e),
+            None => Ok(BackgroundBody::Missing),
         }
     }
 
