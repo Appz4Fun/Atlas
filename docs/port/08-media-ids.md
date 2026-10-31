@@ -366,7 +366,7 @@ create table if not exists media_titles (
 create index if not exists media_titles_fanout on media_titles(title_key) where fanout_done = 0;
 ```
 
-**It's a cache.** The API reads only the shards. Deleted, Atlas loses no IDs already written: the next release of each title asks again and rewrites the same values. `atlas --reprocess --step media_lookup` re-asks for all titles.
+**It's a cache.** The API reads only the shards. Deleted, Atlas loses no IDs already written: the next release of each title asks again and rewrites the same values. `atlas --reprocess --step media_lookup` asks again for titles with no `media_titles` row and a provider left to ask, and costs no request for the rest.
 
 ### Survival
 
@@ -700,7 +700,7 @@ Part 3's `an_old_shard_gets_the_new_tables_without_a_rewrite` bounds growth at `
   - `it_runs_with_the_category_step_off`: `"category": {"enabled": false}`. The TV release still gets its row, and no `release_category` row exists. Fails if the step reads the table.
   - `a_group_hint_alone_gets_no_row`: `Plain Name Nothing Else` in `alt.binaries.movies` is category 2999 with `group_name_movie`, and `parse_movie` would accept it. No `media_release` row.
   - `a_late_article_keeps_ids`: a row with `imdb_id` set, a growth re-run with no provider on: `imdb_id` stays. A rename to a new title: it clears, along with `imdb_from_nfo`.
-  - `a_corrected_provider_result_replaces_a_providers_imdb`: a title found with one IMDb ID and fanned out, its cache row deleted, `media_lookup` reprocessed with a corrected answer: every row of the title holds the new ID. `an_nfos_imdb_survives_the_correction`: the same with `imdb_from_nfo = 1` on one row: that row keeps its ID, through `media_parse`, the `Found` write and the fan-out.
+  - `a_corrected_provider_result_replaces_a_providers_imdb`: a title found with one IMDb ID and fanned out, its cache row deleted, a new `Media` as after a restart, `media_lookup` reprocessed with a corrected answer: every row of the title holds the new ID. `an_nfos_imdb_survives_the_correction`: the same with `imdb_from_nfo = 1` on one row: that row keeps its ID, through `media_parse`, the `Found` write and the fan-out.
   - `an_audio_release_gets_no_row`.
   - `a_rename_away_from_tv_drops_the_row`: a test step at rank 250 renames to `Artist-Album-WEB-2019-320kbps-MP3`; category becomes 3010; the row is gone.
   - `a_hidden_release_gets_no_row`: category 8020.
@@ -802,6 +802,7 @@ Fixtures: `tmdb_search_tv.json` `{"results":[{"id":401,"name":"Some Show","origi
   - `the_representative_gets_its_ids_through_the_step`: without the fan-out thread attached.
   - `a_rename_gets_a_new_title`: `media_parse` rewrites, and `media_lookup` asks for the new title.
   - `a_provider_turning_on_starts_a_walk`: Part 3's `pp_steps_seen` adds a `'steps'` walk. Old releases then go through one request per title.
+  - `a_deleted_cache_row_needs_a_restart`: the same with the first `Media` still running: no request, as documented in section 10.
   - `a_second_provider_turning_on_starts_a_walk`: TVMaze on and a TV title and a movie looked up, then a TMDB key added: `media_lookup` stays enabled, its `config_stamp` gains a bit, one walk with its `redo_mask` runs, the movie and the TV title each make their TMDB requests and no TVMaze request, and the new IDs fan out.
 - [ ] **Implement** sections 4 and 6.
 - [ ] **Run:** `cargo test --test media_resolve && cargo test --test media_stage`. **Expected:** pass.
@@ -989,7 +990,7 @@ Scans are bounded by `ID_SCAN` index rows and `ID_ROWS` matches per shard and ID
 |---|---|
 | Name won't parse | No row. `matched: false`. Normal for many names. |
 | Parse gives junk as a title | A clean miss, cached 30 days, doubling. One or two requests lost per junk title. |
-| Wrong match | Limited by the score floor and the year rules. Stays until `atlas --reprocess --step media_lookup` after the cache row is deleted. Sonarr parses the name too, so it can reject a wrong one. |
+| Wrong match | Limited by the score floor and the year rules. Stays until corrected by hand: stop the indexer, delete the title's `media_titles` row, start it, and run `atlas --reprocess --step media_lookup`. A running indexer's in-memory map still says the title is known, so the restart is required. Sonarr parses the name too, so it can reject a wrong one. |
 | Provider down | `Later`. No attempt, no lane pause, no miss recorded. The pause doubles to 1 h, so the queue isn't retried faster than that. Indexing, the DB lane and bodies carry on. |
 | 429 | Pause for `Retry-After`. The bucket should prevent it, and the limit is shared with anything else on that IP. |
 | Bad key | Pause 1 h, logged once per pause, no miss recorded. Fixing the key takes effect on the next config reload (`watch_config`, 5 s), which rebuilds providers and clears pauses. |
@@ -1099,3 +1100,4 @@ cargo test --lib db::tests::a_wipe_removes_the_media_cache
 30. **ID indexes put `release_id` right after the ID.** The first form, ordered by season and episode, made a cap keep the oldest rows of a popular title, and sorting afterwards can't bring back what was cut. Newest first needs the order in the index, with a season or episode filter read from it. The covering columns cost about 2 bytes a row over the old form. A season of a title with more than `ID_SCAN` rows in one shard can miss its oldest releases, the side a client minds least.
 31. **`imdb_from_nfo` records where an IMDb ID came from.** Keeping every existing IMDb ID meant a corrected provider answer changed the other IDs and left the wrong IMDb ID behind. Only an NFO's is kept.
 32. **A new provider redoes `media_lookup` through `config_stamp`.** The step stays enabled, so Part 3's step mask sees nothing. The stamp walks once, and `wants` keeps it to one request per title, for the new provider only.
+33. **Correcting a wrong match needs a restart, not cache invalidation.** Deleting a cache row by hand is a rare repair, and the `known` map is what keeps `applies` free of I/O. Polling for outside changes to `atlas.media.db` would add a moving part for that one case. The order is in section 10, and `a_deleted_cache_row_needs_a_restart` pins it.

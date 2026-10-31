@@ -979,7 +979,7 @@ Usage: `atlas --reprocess [--step NAME]... [--group NAME]... [--failed] [--apply
 - [ ] **Tests first:**
   - `a_dry_run_prints_counts_and_changes_nothing`; `an_unknown_step_is_refused_with_the_list`.
   - `apply_adds_one_walk_per_shard_and_no_more_on_a_second_run`: same `(kind, redo_mask, group_name)` is not added twice; it says "already queued".
-  - `the_walk_clears_the_mask_and_the_step_runs_again`: with a stage running a test step. `group_limits_it_to_that_groups_shard_and_rows`; `failed_clears_failed_bits_and_retries_now`.
+  - `the_walk_clears_the_mask_and_the_step_runs_again`: with a stage running a test step. `group_limits_it_to_that_groups_shard_and_rows`; `failed_clears_failed_bits_and_retries_now`; `failed_with_a_group_leaves_other_groups_failures_alone`: failed rows of two groups in one shard, `--failed --group A`: B's `failed` bits, attempts and `pp_queue` are untouched.
   - `it_runs_beside_a_writer` (shared guard held by another handle: succeeds); `it_is_refused_during_a_compaction` (exclusive lock held).
 - [ ] **Implement:**
   - Dry run: `select count(*) from pp_state where done & :m != 0` per shard (joined to `releases` for `--group`), printed with time at the current `backlog_per_second`.
@@ -989,8 +989,9 @@ Usage: `atlas --reprocess [--step NAME]... [--group NAME]... [--failed] [--apply
 insert into pp_walks (kind, top_id, before_id, redo_mask, group_name, created_at)
 select 'reprocess', t, t, ?1, ?2, ?3 from (select coalesce(max(id), -1) + 1 as t from releases)
 where not exists (select 1 from pp_walks where kind = 'reprocess' and redo_mask = ?1 and group_name is ?2);
--- --failed, by the partial index, 1,000 ids per transaction
--- (select release_id from pp_state where failed != 0 limit 1000), each:
+-- --failed, by the partial index, 1,000 ids per transaction. With --group, only that group's: a shard holds many
+-- (select s.release_id from pp_state s join releases r on r.id = s.release_id
+--   where s.failed != 0 and (?4 is null or r.group_name = ?4) limit 1000), each:
 update pp_state set failed = 0, db_attempts = 0, net_attempts = 0, net_next_at = 0, last_error = null where release_id = ?1;
 insert into pp_queue (release_id, due_at) values (?1, ?2) on conflict(release_id) do update set due_at = excluded.due_at;
 ```
