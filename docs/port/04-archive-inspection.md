@@ -291,7 +291,7 @@ pub async fn body_prefix(&mut self, message_id: &str, max_bytes: usize) -> Resul
 
 ### Naming (`names.rs`)
 
-`clean_name(raw) -> Option<String>`: drop `char::is_control`, `\` becomes `/`, at most `MAX_NAME_CHARS`, trim, strip a leading `./` and trailing `/`. Empty, `.` and `..` are `None`. Every parser uses it.
+`clean_name(raw) -> Option<String>`: drop `char::is_control`, `\` becomes `/`, at most `MAX_NAME_BYTES`, cut at a character boundary, trim, strip a leading `./` and trailing `/`. Empty, `.` and `..` are `None`. Every parser uses it.
 
 ```rust
 static VOLUME: &str = r"(?i)(?:\.part\d+\.rar|\.vol\d+[+-]\d+\.par2|\.par2|\.r\d{2,3}|\.s\d{2}|\.z\d{2,3}|\.rar|\.cbr|\.cbz|\.zipx?|\.7z(?:\.\d{3})?|\.\d{3})$";
@@ -375,7 +375,7 @@ All three: `needs: Bodies`; `applies` is false when `classify(&release.name)` is
 
 `finish(ctx, source, listing) -> Outcome`, `id` being the release id:
 
-- `writes`: `DELETE_SOURCE`; `INSERT_FILE` for each of `collapse_volumes(files)` with `seq = source * 65_536 + i` and `size` via `i64::try_from(..).ok()`; and, unless `source == SOURCE_PAR2`, `UPSERT_RELEASE` with `listing.password().code()`.
+- `writes`: `DELETE_SOURCE`; unless `meta.archive_name_bytes` on `ctx.conn()` has reached `max_names_mb * 1 MiB / SHARDS`, `INSERT_FILE` for each of `collapse_volumes(files)` with `seq = source * 65_536 + i` and `size` via `i64::try_from(..).ok()`; an `update` adding `len(name) + 32` over those rows to `archive_name_bytes` in `meta`; and, unless `source == SOURCE_PAR2`, `UPSERT_RELEASE` with `listing.password().code()`. Past the quota the step still reports the password and picks a name, stores no inner files, and counts them in `archive_names_over_quota` for the dashboard. The counter only grows, so a purge doesn't free quota until the user raises it, which errs toward storing less.
 - `matched`: files were stored or the password is yes. `rerun`: `RERUN_ON_INNER_FILES` when files were stored.
 - `name`, from `best_name` over the full list:
 
@@ -418,7 +418,7 @@ Names differ from the ones first proposed (`release_inner_files`, `release_archi
 create table if not exists archive_inner_files (
     release_id INTEGER NOT NULL,
     seq        INTEGER NOT NULL,   -- source * 65536 + index: PAR2 rows sort first, and a source replaces only its own
-    name       TEXT NOT NULL,      -- clean_name'd, at most 512 chars
+    name       TEXT NOT NULL,      -- clean_name'd, at most 512 bytes
     size       INTEGER,            -- unpacked bytes, NULL when unknown
     source     INTEGER NOT NULL,   -- 1 PAR2, 2 RAR, 3 7z, 4 ZIP
     primary key (release_id, seq)
@@ -494,7 +494,7 @@ pub fn nfo_sources(files: &[FileInfo]) -> Vec<&FileInfo>;      // at most 2, few
 ```rust
 pub mod names; pub mod rar; pub mod select; pub mod sevenz; pub mod steps; pub mod store; pub mod zip;
 pub const MAX_ENTRIES: usize = 4_096;
-pub const MAX_NAME_CHARS: usize = 512;
+pub const MAX_NAME_BYTES: usize = 512;
 pub const MAX_STORED: usize = 64;
 pub const ARTICLE_CAP: usize = 4 * 1024 * 1024;
 pub const PROBE_PREFIX: usize = 64 * 1024;
@@ -557,6 +557,7 @@ A top-level `archive` object, parsed into `Config.archive: ArchiveConfig`. Absen
 | `max_bodies_per_release` | `4` | Bodies one `archive_list` run may use, heads and tails together. Clamped to 1..=16; Part 3's `bodies_per_release` also applies |
 | `probe_files` | `2` | Files with no recognized name to try by magic bytes, reading 64 KiB of each. 0 turns probing off. Clamped to 0..=8 |
 | `probes_per_minute` | `60` | Probes over all threads. Each ends in a hang-up, and the next request logs in again. Clamped to 12..=600 |
+| `max_names_mb` | `16384` | Inner file names stored over all shards, a stored name counting its bytes plus 32. About 5 times the estimate in section 9, so a hostile poster can't fill the disk. At least 64 |
 
 To turn this on, set `postprocess.body_fetches_per_minute`. Inline lookups stop and the stage takes over.
 
@@ -570,7 +571,7 @@ Each task: write the test first and see it fail for the stated reason, implement
 
 - [ ] **Test first** in `src/archive/tests.rs`. Fails first: no module.
   - `identify_goes_by_magic_alone`: one row per line of the identify table, plus `Rar!\x1a\x07`, an empty slice and `PK\x07\x08` alone: `Unknown`.
-  - `clean_name_table`: `"a\x1b[31mb"` to `a[31mb`, `"..\\..\\x"` to `../../x`, `"./a/"` to `a`, `"  "`, `"."` and `".."` to `None`, and 2,000 `a` to 512 chars.
+  - `clean_name_table`: `"a\x1b[31mb"` to `a[31mb`, `"..\\..\\x"` to `../../x`, `"./a/"` to `a`, `"  "`, `"."` and `".."` to `None`, 2,000 `a` to 512 bytes, and 2,000 four-byte characters to at most 512 bytes with no cut character.
   - `looks_random_table`: true for `a1b2c3d4e5f6g7h8`, `1a2b3c4d`, `123456`, `8f14e45f-ceea-467f-a0e6-a33d1cdf2a10`; false for `Real.Name`, `movie`, `Example Movie`.
   - `best_name_table`, name and size pairs to result:
 
@@ -895,6 +896,7 @@ ffc3fd300017060c010980c900070b01000123030101055d000080000c83710a01be81fe670000
 - [ ] **Tests first.** On `tempfile::tempdir()` databases, with no environment change.
   - `both_tables_are_registered`: `SHARD_TABLES` has both names with `release_key: Some("release_id")`. Fails first: not registered.
   - `reads_come_back_in_seq_order`: rows inserted out of order through section 5's statements: `inner_files` in `seq` order, PAR2 first, NULL size is `None`; `password` is `None` with no row and each code with one.
+  - `past_the_quota_no_names_are_stored`: `max_names_mb` at its minimum and `archive_name_bytes` over it: a RAR of 64 maximum-length names adds no rows, keeps its password, and counts on the dashboard. A release under quota adds to the counter by what it stored.
   - `a_source_replaces_only_its_own_rows`: PAR2 and RAR rows; `DELETE_SOURCE` for RAR plus new rows: PAR2 untouched.
   - `passwords_read_across_shards`: `passwords_with` on `db::open_with_shards`, ids in shards 0 and 5 and one with no row: 2 entries. `view_with` gives rows and password.
   - `an_old_database_reads_as_nothing_known`: `archive_release` dropped from a shard: `passwords_with` gives an empty map, no panic.
@@ -1146,3 +1148,4 @@ grep -n 'lzma-rs' Cargo.toml Cargo.lock
 30. **A release named as an image runs no step, without reading its files.** `applies` gets no file list, and the name is right for a one-image post and an album. It keeps most of about 22M multi-article images out of the net lane, three runs each, where every run costs two writer round trips that compete with real work. The loss is an archive posted in one release under an image's name, which Part 5's database steps still see.
 31. **A PAR2 file's key includes its name.** The spec says one id means one file, so `(set id, file id)` should be enough, but keeping both names on a malformed set costs nothing, and it leaves the two constant-id test helpers that other parts' tests build on untouched.
 32. **Parsers are written from the formats, not from `unrar` source.** UnRAR's licence restricts reusing its source. These files read header fields only and contain no decompression, and libarchive and upstream's `formats.rs` were the independent checks.
+33. **Stored names have a byte limit and a total.** Article, body and row caps limit the rate, not the sum, and a name of 512 four-byte characters is 2 KB. A counter in `meta` is one small write in the transaction that stores the rows, where sizing the table would be a scan. Hitting the total loses inner file lists, never the password or indexing.

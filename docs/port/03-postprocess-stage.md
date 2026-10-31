@@ -674,6 +674,7 @@ const CORE_TABLES: &[(&str, &str)] = &[
   - `a_stale_results_writes_and_name_are_dropped_too`: a step blocked in `run` with a write and a `NameChange`, a rerun of it meanwhile, then its apply: neither the write nor the name lands, and another step's write in the same `Applied` does. `a_stale_lookup_cant_attach_the_old_titles_ids` is its Part 8 form.
   - `a_stale_net_result_leaves_the_net_step_wanted`: a net step, the last one left, blocked in `run`. A DB visit clears it, sets `net_wanted` and consumes the queue row. Then the old run applies with `net_mask` 0: `net_wanted` is still 1, `net_next_at` 0, and the net lane runs it again with no new queue row.
   - `a_net_completion_doesnt_use_up_growth`: a release grows while a net step is pending, and that step finishes before the settled DB visit: `parts_seen` is unchanged, and the visit still clears the `on_growth` steps.
+  - `growth_after_a_net_step_failed_tries_it_again`: an `on_growth` net step at `failed`, a late article, the settled visit: its failed bit is clear, `net_wanted` is 1, and it runs. The same through a walk's `redo_mask`.
   - `a_rerun_of_a_release_with_no_state_is_remembered`: the same with no `pp_state` row at the claim. A rerun of an id with no release writes nothing.
   - `a_db_visit_leaves_the_net_columns_alone`: `net_attempts = 3`, `net_next_at = 999`; a DB-lane apply keeps both. The net lane's keeps `db_attempts`.
   - `net_wanted_follows_the_mask`: set while a `net_mask` bit is undone, NULL once done or failed, set again when `clear` takes it back.
@@ -794,7 +795,7 @@ where r.id < ?1 order by r.id desc limit ?2;   -- with `and r.group_name = ?3` i
   1. `judge_row`, then `file_summaries` and `judge_files`.
   2. `Reject`: count it by reason. A queue row is deleted; a state row has `net_wanted` cleared; a walk row with no state writes nothing.
   3. `Wait(t)`: `queue_at = t`.
-  4. `Pass`: `clear = redo`, plus every `on_growth` step when `parts > parts_seen` on a row with state. In memory, `done = row.done & !clear`.
+  4. `Pass`: `clear = redo`, plus every `on_growth` step when `parts > parts_seen` on a row with state. In memory, `done = row.done & !clear` and `failed = row.failed & !clear`, so a failed step that's cleared by growth or a walk's `redo_mask` runs again or goes in `net_mask`.
   5. For each enabled applicable `Database` step by rank, not done or failed: run it under `catch_unwind(AssertUnwindSafe(..))`, and act on the result by section 6's table. On `Ok`: set its bit and keep its writes. `rerun` bits of higher-ranked `Database` steps come off `done` in memory, so they run now; `Bodies` and `External` ones go in `clear`. A name that differs from the current one: higher-ranked `on_rename` `Database` steps come off `done` likewise and later steps see the new name; net ones go in `rename_clears`. A bit cleared and run again in this visit is left out of the final `clear`.
   6. For each enabled applicable net step, not done or failed: `Bodies` with `body_gate` `Outside`: set its bit, counted as `matched: false`. `NotYet`: nothing. Otherwise add it to `net_mask`.
   7. Build one `Applied`. Send the batch via `Db::on_writer`, wait for the answer, then take the next.
