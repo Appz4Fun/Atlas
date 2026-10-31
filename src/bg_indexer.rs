@@ -74,6 +74,7 @@ struct HistoryPoint {
 struct GroupStats {
     articles: i64,
     releases: i64,
+    skipped: i64,
     last_indexed: f64,
 }
 
@@ -82,6 +83,7 @@ struct Stats {
     total_articles: i64,
     total_bytes: i64,
     total_releases: i64,
+    total_skipped: i64,
     start_time: f64,
     groups_indexed: HashSet<String>,
     error_count: u32,
@@ -104,6 +106,7 @@ impl Stats {
             total_articles: 0,
             total_bytes: 0,
             total_releases: 0,
+            total_skipped: 0,
             start_time: now(),
             groups_indexed: HashSet::new(),
             error_count: 0,
@@ -113,7 +116,8 @@ impl Stats {
         }
     }
 
-    fn tick(&mut self, articles: i64, bytes: i64, releases: i64, group: &str) {
+    fn tick(&mut self, p: &Progress, group: &str) {
+        let Progress { articles, bytes, releases, skipped } = *p;
         let t = now();
 
         let bin = t as i64 / RATE_BIN * RATE_BIN;
@@ -131,6 +135,7 @@ impl Stats {
         self.total_articles += articles;
         self.total_bytes += bytes;
         self.total_releases += releases;
+        self.total_skipped += skipped;
         self.history.push(HistoryPoint { t, a: articles, b: bytes });
 
         if !group.is_empty() {
@@ -138,6 +143,7 @@ impl Stats {
             let gs = self.group_stats.entry(group.to_string()).or_default();
             gs.articles += articles;
             gs.releases += releases;
+            gs.skipped += skipped;
             gs.last_indexed = t;
         }
 
@@ -175,7 +181,7 @@ impl Stats {
             .group_stats
             .iter()
             .map(|(name, g)| {
-                (name.clone(), json!({"articles": g.articles, "releases": g.releases, "last_indexed": g.last_indexed}))
+                (name.clone(), json!({"articles": g.articles, "releases": g.releases, "skipped": g.skipped, "last_indexed": g.last_indexed}))
             })
             .collect();
 
@@ -188,6 +194,7 @@ impl Stats {
             "total_articles": self.total_articles,
             "total_bytes": self.total_bytes,
             "total_releases": self.total_releases,
+            "total_skipped": self.total_skipped,
             "history": self.history,
             "groups_indexed": self.groups_indexed.len(),
             "error_count": self.error_count,
@@ -259,11 +266,20 @@ fn groups_label(groups: &[String], workers: usize) -> String {
     if groups.len() <= 3 { groups.join(", ") } else { format!("{} groups, {workers} at once", groups.len()) }
 }
 
+/// Say which configured groups wont be indexed (`filters::group_blocked`).
+fn say_blocked(blocked: &[String]) {
+    if !blocked.is_empty() {
+        println!("blocked and not indexed, their names label them for minors: {}", blocked.join(", "));
+    }
+}
+
 /// State shared by the scheduler's workers for one set of servers.
 struct Scheduler {
     ctx: PassContext,
     settings: RwLock<PassSettings>,
     groups: RwLock<Vec<String>>,
+    /// configured groups left out of `groups`, see `filters::group_blocked`
+    blocked: Mutex<Vec<String>>,
     /// (server, groups at once) for every indexing server
     plan: Vec<(usize, usize)>,
     workers: usize,
@@ -444,6 +460,7 @@ impl Scheduler {
         let mut stats = self.stats.lock().unwrap();
         stats.extra.insert("servers".into(), json!(self.ctx.pool.server_stats()));
         stats.extra.insert("groups_configured".into(), json!(groups.len()));
+        stats.extra.insert("groups_blocked".into(), json!(self.blocked.lock().unwrap().len()));
         stats.extra.insert("workers".into(), json!(self.workers));
         stats.extra.insert("pid".into(), json!(std::process::id()));
         let mut load = crate::profile::LOAD.snapshot();
@@ -571,7 +588,7 @@ async fn worker(sched: Arc<Scheduler>, server: usize, db: Db) {
                 let settings = sched.settings.read().unwrap().clone();
                 let stats = sched.stats.clone();
                 let group = chunk.group.clone();
-                let mut progress = |p: &Progress| stats.lock().unwrap().tick(p.articles, p.bytes, p.releases, &group);
+                let mut progress = |p: &Progress| stats.lock().unwrap().tick(p, &group);
                 let run = crate::indexer::run_chunk(&sched.ctx, &settings, &db, &chunk, server, &mut progress);
                 let Some(result) = unless_stopped(&sched.ctx.stop, run).await else { break };
                 sched.finish_chunk(chunk.group, server, result);
@@ -580,7 +597,7 @@ async fn worker(sched: Arc<Scheduler>, server: usize, db: Db) {
             Some(Work::Sweep(group)) => {
                 let settings = sched.settings.read().unwrap().clone();
                 let stats = sched.stats.clone();
-                let mut progress = |p: &Progress| stats.lock().unwrap().tick(p.articles, p.bytes, p.releases, &group);
+                let mut progress = |p: &Progress| stats.lock().unwrap().tick(p, &group);
                 let run = crate::indexer::run_sweep(&sched.ctx, &settings, &db, &group, server, &mut progress);
                 let result = unless_stopped(&sched.ctx.stop, run).await;
                 sched.sweeping.lock().unwrap().remove(&server);
@@ -596,7 +613,7 @@ async fn worker(sched: Arc<Scheduler>, server: usize, db: Db) {
 
         let settings = sched.settings.read().unwrap().clone();
         let stats = sched.stats.clone();
-        let mut progress = |p: &Progress| stats.lock().unwrap().tick(p.articles, p.bytes, p.releases, &group);
+        let mut progress = |p: &Progress| stats.lock().unwrap().tick(p, &group);
 
         // stopping drops a pass stuck on the network too (GROUP, a login, a name
         // lookup). safe: db writes run whole on their own thread and the cursor
@@ -643,6 +660,14 @@ async fn watch_config(sched: Arc<Scheduler>, servers: Vec<UsenetServer>) {
             }
             *current = settings;
         }
+
+        let blocked = config.blocked_groups();
+        let mut known = sched.blocked.lock().unwrap();
+        if *known != blocked {
+            say_blocked(&blocked);
+            *known = blocked;
+        }
+        drop(known);
 
         let groups = config.tracked_groups();
         let mut current = sched.groups.write().unwrap();
@@ -701,6 +726,7 @@ async fn run_servers(
 ) -> bool {
     let servers = usable_servers(config);
     let groups = config.tracked_groups();
+    say_blocked(&config.blocked_groups());
     let plan = plan_workers(config);
     let workers: usize = plan.iter().map(|(_, w)| w).sum();
 
@@ -714,6 +740,7 @@ async fn run_servers(
         ctx: PassContext { pool, states, stop, verbose: false },
         settings: RwLock::new(settings_of(config)),
         groups: RwLock::new(groups),
+        blocked: Mutex::new(config.blocked_groups()),
         plan: plan.clone(),
         workers,
         next: Mutex::new(HashMap::new()),
@@ -1042,6 +1069,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn skipped_articles_are_counted_per_group_and_in_all() {
+        let mut stats = Stats::new();
+        stats.tick(&Progress { articles: 10, bytes: 5, releases: 2, skipped: 4 }, "alt.binaries.a");
+        stats.tick(&Progress { articles: 10, bytes: 5, releases: 2, skipped: 1 }, "alt.binaries.a");
+        assert_eq!(stats.total_skipped, 5);
+        assert_eq!(stats.group_stats["alt.binaries.a"].skipped, 5);
+        assert_eq!(stats.total_articles, 20, "they still count as received");
+    }
+
+    #[test]
     fn chunks_only_for_tracked_groups_in_a_backfilling_mode() {
         let groups = vec!["a".to_string(), "b".to_string()];
         let skip = HashSet::from(["b".to_string()]);
@@ -1060,6 +1097,7 @@ mod tests {
             },
             settings: RwLock::new(PassSettings { mode: "backfill".into(), ..PassSettings::default() }),
             groups: RwLock::new(groups),
+            blocked: Mutex::new(Vec::new()),
             plan: vec![],
             workers: 2,
             next: Default::default(),

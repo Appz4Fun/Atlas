@@ -169,7 +169,7 @@ fn compute_content() -> rusqlite::Result<Content> {
             "select group_name, count(*), coalesce(sum(size), 0), coalesce(sum(complete), 0),
                 coalesce(sum(is_obfuscated), 0), count(display_name), coalesce(sum(parts), 0),
                 coalesce(sum(parts > 0), 0), coalesce(sum(parts > 0 and complete = 1), 0)
-             from s{i}.releases group by group_name"
+             from s{i}.releases group by group_name having not atlas_blocked(group_name)"
         )
     }))?;
     let mut groups: Vec<(String, i64, i64)> = Vec::new();
@@ -197,7 +197,8 @@ fn compute_content() -> rusqlite::Result<Content> {
     let biggest = format!(
         "select * from ({}) order by 1 desc limit 1",
         crate::store::each_shard(|i| format!(
-            "select * from (select max(size), coalesce(display_name, name), group_name from s{i}.releases)"
+            "select * from (select max(size), coalesce(display_name, name), group_name from s{i}.releases
+             where not atlas_blocked(group_name))"
         ))
     );
     c.biggest = conn
@@ -584,6 +585,7 @@ fn draw_overview(f: &mut Frame, app: &App, area: Rect) {
         kv("mode", s["mode"].as_str().unwrap_or("-")),
         kv("uptime", human_time(s["uptime"].as_i64().unwrap_or(0))),
         kv("groups", format!("{} configured", count(s["groups_configured"].as_i64().unwrap_or(0)))),
+        kv("groups blocked", count(s["groups_blocked"].as_i64().unwrap_or(0))),
         kv("indexing at once", count(s["workers"].as_i64().unwrap_or(0))),
         kv("errors this run", count(s["error_count"].as_i64().unwrap_or(0))),
     ];
@@ -598,6 +600,7 @@ fn draw_overview(f: &mut Frame, app: &App, area: Rect) {
         kv("average (graph)", format!("{} headers/s", count(avg as i64))),
         kv("peak (10s)", format!("{} headers/s", count(peak as i64))),
         kv("this run", count(s["total_articles"].as_i64().unwrap_or(0))),
+        kv("skipped, per article", count(s["total_skipped"].as_i64().unwrap_or(0))),
         kv("per day at this", count((run_avg * 86_400.0) as i64)),
         kv("all time ≈", count(quick.articles_approx)),
         kv("releases ≈", count(quick.releases_approx)),

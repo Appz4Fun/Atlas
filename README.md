@@ -226,6 +226,8 @@ To quit without writing anything, leave the host empty. This helps when your `co
 
 Open **Groups**, search with at least 3 letters, for example `movies`, and enter a number to add that group. The list shows only binary groups that have articles. To remove a group, use **Remove group** in the main menu.
 
+Atlas never indexes, fetches from, or serves a group whose name labels it for minors (`filters::group_blocked`). Blocked groups are left out of the list, and a blocked group already in your config gets a warning here and stays in **Remove group**.
+
 ### Index
 
 > [!NOTE]
@@ -238,6 +240,10 @@ Start the indexer from the main menu with option 1. The indexer runs as a backgr
 | `dynamic` | Alternates backfill and live passes, so Atlas keeps up with new posts while it builds history. |
 | `backfill` | Indexes backward from the newest article only. |
 | `live` | Indexes forward from the newest article only and ignores older posts. |
+
+Some uploads give every article its own random subject, so each article would become a release that can never complete. Articles obfuscated per article are skipped and counted. They still count as received, so the cursors move past them.
+
+Rows already stored from a blocked group stop being served as soon as you run this build, with no purge needed. They stay on disk until you delete them.
 
 ### Splitting big groups
 
@@ -278,7 +284,7 @@ Stopping the indexer takes about a second. Atlas drops any requests still in fli
 
 ### Live dashboard
 
-Menu option 5 shows the indexer status, totals, a graph of headers per second over the last 30 minutes, and progress for each group. To go back, press `q`, `Esc`, or `Ctrl+C`.
+Menu option 5 shows the indexer status, totals, a graph of headers per second over the last 30 minutes, and progress for each group. The totals include `skipped`, the articles left out as obfuscated per article. To go back, press `q`, `Esc`, or `Ctrl+C`.
 
 ### Search
 
@@ -307,7 +313,8 @@ Menu option 8 opens a full-screen dashboard with five pages. Switch pages with t
 Shows the indexer's state, CPU use, CPU time, memory use, and system memory. It also shows the following:
 
 - Headers per second now, on average, and at peak.
-- Articles indexed this run and in total.
+- Articles indexed this run and in total, and how many were skipped as obfuscated per article.
+- How many configured groups are blocked.
 - Database and WAL size.
 - Network speed and how much header compression saves. Press `w` to switch the graph between the last 30 minutes and the last 6 hours.
 
@@ -496,6 +503,7 @@ CI (`.github/workflows/ci.yml`) checks formatting, runs clippy, and runs the tes
 | `src/indexer.rs` | One indexing pass over a group: slices, parsing, naming, and saving. |
 | `src/bg_indexer.rs` | The background scheduler: workers per server, live config reload, and status and stats files. |
 | `src/parser.rs`, `src/par2.rs`, `src/nfo.rs` | Subjects to releases, and real names from par2 and nfo files. |
+| `src/filters.rs` | What Atlas refuses to index: posts obfuscated per article and blocked groups. |
 | `src/db.rs` | The main database: group cursors, connections, and checkpoints. |
 | `src/store.rs` | The 8 shard files: compact layout, release IDs, saving, and reading articles back. |
 | `src/convert.rs` | The one-time conversion of an older database. |
@@ -505,10 +513,12 @@ CI (`.github/workflows/ci.yml`) checks formatting, runs clippy, and runs the tes
 | `src/dashboard.rs`, `src/stats_dashboard.rs` | The live dashboard and the stats dashboard. |
 | `src/profile.rs` | Timing counters for `ATLAS_PROFILE`, and the load counters behind the Bottleneck page. |
 | `examples/probe_connections.rs` | Connection limit probe. |
+| `examples/bench_filters.rs` | What the ingest filters cost per article and per call. |
 | `examples/bench_writes.rs` | Database write benchmark. Run it on a copy of a real database, for example an APFS clone made with `cp -c`. |
 
 ## Limitations
 
+- An upload obfuscated per article is recognized only with 16 of its middle parts in one slice, so files under 18 parts and stragglers at a slice's edge become releases as before.
 - Deobfuscation works only when a release has a par2 or nfo file with a usable name.
 - Atlas reports every release as category `7000` (Other), so clients that only search TV or movie categories might skip it.
 - Search matches release names only, so searches by ID, such as TVDB or IMDb, return nothing.
@@ -520,6 +530,8 @@ CI (`.github/workflows/ci.yml`) checks formatting, runs clippy, and runs the tes
 AI helped with bug fixes, refactoring, SABnzbd integration, the background indexer, terminal UI polish, testing, and a few smaller tasks.
 
 The Rust port, with multi-server parallel indexing, the async NNTP client, the stats dashboard, and the extended Newznab API, lives in the [Appz4Fun fork](https://github.com/Appz4Fun/Atlas).
+
+The rule for articles obfuscated per article is ported from [newznab-tmux](https://github.com/xbmc4lyfe/newznab-tmux), GPLv3.
 
 ## License
 
