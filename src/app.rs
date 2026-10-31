@@ -74,7 +74,7 @@ fn show_results(releases: &[ReleaseRow], query: &str, page: i64, total_pages: i6
     ui::print("[cyan]g.[/cyan] Go to Page");
 }
 
-fn show_release(release: &ReleaseRow, articles: &[ArticleRow]) {
+fn show_release(release: &ReleaseRow, articles: &[ArticleRow], inner: &crate::archive::store::InnerView) {
     let mut info = vec![
         Line::styled(format!("Release: {}", release.name), "bold"),
         Line::styled(
@@ -96,6 +96,9 @@ fn show_release(release: &ReleaseRow, articles: &[ArticleRow]) {
         summary.push("complete", "green");
     } else {
         summary.push("incomplete", "red");
+    }
+    if let Some((text, style)) = password_text(inner.password) {
+        summary.push(text, style);
     }
     info.push(summary);
     ui::print_lines(&ui::panel(&info, "blue"));
@@ -126,6 +129,34 @@ fn show_release(release: &ReleaseRow, articles: &[ArticleRow]) {
     if files.len() > 30 {
         ui::print(&format!("  [dim]... and {} more[/dim]", files.len() - 30));
     }
+
+    if let Some(table) = inner_table(inner, width) {
+        table.print();
+    }
+}
+
+fn password_text(password: Option<crate::archive::Password>) -> Option<(&'static str, &'static str)> {
+    use crate::archive::Password;
+    match password {
+        Some(Password::Yes) => Some((" - passworded", "red")),
+        Some(Password::Maybe) => Some((" - maybe passworded", "yellow")),
+        Some(Password::No) | None => None,
+    }
+}
+
+/// What the release holds, as far as its archives say. `Line::plain`, soo a hostile name isnt read as markup.
+fn inner_table(inner: &crate::archive::store::InnerView, width: usize) -> Option<Table> {
+    if inner.files.is_empty() {
+        return None;
+    }
+    let mut table = Table::new(vec![Column::new("name").style("white").flex(), Column::new("size").style("dim")])
+        .title(format!("inner files ({})", inner.files.len()))
+        .no_header();
+    table.gap = 1;
+    for file in inner.files.iter().take(30) {
+        table.add_row(vec![Line::plain(ui::ellipsize(&file.name, width)), Line::plain(fmt_size(file.size))]);
+    }
+    Some(table)
 }
 
 /// First run: ask for a server. A blank host quits without writing anything.
@@ -168,11 +199,12 @@ fn setup(existing: Option<Config>) -> bool {
 
 fn release_actions(release: &ReleaseRow) {
     let articles = get_articles(release.id).unwrap_or_default();
+    let inner = crate::archive::store::view(release.id);
 
     loop {
         ui::clear();
         // actions for the picked release
-        show_release(release, &articles);
+        show_release(release, &articles, &inner);
         Table::menu(&[("1.", "Download"), ("2.", "Save NZB"), ("0.", "Back")]).print();
 
         match prompt("\nChoice: ").trim() {
@@ -885,4 +917,33 @@ pub fn selftest() -> i32 {
 
     println!("selftest: {ok}/{} servers OK", cfg.servers.len());
     if ok > 0 { 0 } else { 1 }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::archive::Password;
+    use crate::archive::store::{InnerFileRow, InnerView};
+
+    fn row(i: i64, name: &str) -> InnerFileRow {
+        InnerFileRow { seq: i, name: name.into(), size: Some(10), source: 2 }
+    }
+
+    #[test]
+    fn inner_table_lists_rows_and_marks_password() {
+        assert!(inner_table(&InnerView::default(), 80).is_none());
+
+        let files: Vec<InnerFileRow> = (0..40).map(|i| row(i, &format!("file{i}.mkv"))).collect();
+        let table = inner_table(&InnerView { password: None, files }, 80).unwrap();
+        assert_eq!(table.rows.len(), 30);
+        assert_eq!(table.title.as_deref(), Some("inner files (40)"));
+
+        let hostile = inner_table(&InnerView { password: None, files: vec![row(0, "[red]x.mkv")] }, 80).unwrap();
+        assert_eq!(hostile.rows[0][0].text(), "[red]x.mkv");
+
+        assert_eq!(password_text(Some(Password::Yes)), Some((" - passworded", "red")));
+        assert_eq!(password_text(Some(Password::Maybe)), Some((" - maybe passworded", "yellow")));
+        assert_eq!(password_text(Some(Password::No)), None);
+        assert_eq!(password_text(None), None);
+    }
 }

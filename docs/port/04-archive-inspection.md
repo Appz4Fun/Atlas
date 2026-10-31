@@ -375,7 +375,7 @@ All three: `needs: Bodies`; `applies` is false when `classify(&release.name)` is
 
 `finish(ctx, source, listing) -> Outcome`, `id` being the release id:
 
-- `writes`: `DELETE_SOURCE`; unless `meta.archive_name_bytes` on `ctx.conn()` has reached `max_names_mb * 1 MiB / SHARDS`, `INSERT_FILE` for each of `collapse_volumes(files)` with `seq = source * 65_536 + i` and `size` via `i64::try_from(..).ok()`; an `update` adding `len(name) + 32` over those rows to `archive_name_bytes` in `meta`; and, unless `source == SOURCE_PAR2`, `UPSERT_RELEASE` with `listing.password().code()`. Past the quota the step still reports the password and picks a name, stores no inner files, and counts them in `archive_names_over_quota` for the dashboard. The counter only grows, so a purge doesn't free quota until the user raises it, which errs toward storing less.
+- `writes`: `DELETE_SOURCE`; unless `meta.archive_name_bytes` on `ctx.conn()` has reached `max_names_mb * 1 MiB / SHARDS`, `INSERT_FILE` for each of `collapse_volumes(files)` with `seq = source * 65_536 + i` and `size` via `i64::try_from(..).ok()`; an `update` adding `len(name) + 32` over those rows to `archive_name_bytes` in `meta`; and, unless `source == SOURCE_PAR2`, `UPSERT_RELEASE` with `listing.password().code()`. Past the quota the step still reports the password and picks a name, stores no inner files, and counts them in `archive_names_over_quota` for the dashboard. A rerun moves the counter by the net change, and a deleted release gives its bytes back through the `archive_names_give_back` trigger.
 - `matched`: files were stored or the password is yes. `rerun`: `RERUN_ON_INNER_FILES` when files were stored.
 - `name`, from `best_name` over the full list:
 
@@ -502,7 +502,7 @@ pub const PROBE_MIN_PARTS: i64 = 3;
 pub const NAME_SOURCE_NFO: u8 = 10; pub const NAME_SOURCE_INNER: u8 = 15; pub const NAME_SOURCE_PAR2: u8 = 20;
 /// step 8 is Part 5's naming step (Part 3's example) and 16 is Part 6's predb_match, asked directly because naming
 /// may be off or skip a clean name. Unregistered bits are ignored until they exist
-pub const RERUN_ON_INNER_FILES: StepMask = StepMask(mask(StepId(8)).0 | mask(StepId(16)).0);
+pub const RERUN_ON_INNER_FILES: StepMask = mask(StepId(8)) | mask(StepId(16));
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)] pub enum Format { Rar4, Rar5, SevenZip, Zip, Par2, Image, Media, Unknown }
 pub fn identify(head: &[u8]) -> Format;

@@ -666,6 +666,7 @@ async fn watch_config(sched: Arc<Scheduler>, servers: Vec<UsenetServer>) {
             sched.wind_down.store(true, Ordering::Relaxed);
             return;
         }
+        crate::archive::sync_inline_lookups(&config);
         if let Some(stage) = sched.stage.get() {
             let (stage, config) = (stage.clone(), config.clone());
             let _ = tokio::task::spawn_blocking(move || stage.set_config(&config)).await;
@@ -809,6 +810,7 @@ async fn run_servers(
     let checkpoint_stop = Arc::new(AtomicBool::new(false));
     let checkpointer = db::checkpointer(checkpoint_stop.clone());
 
+    crate::archive::sync_inline_lookups(config);
     let mut tasks = tokio::task::JoinSet::new();
     if config.postprocess.enabled {
         let stage = Stage::start(StageParams {

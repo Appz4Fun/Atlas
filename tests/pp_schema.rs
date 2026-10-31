@@ -43,6 +43,7 @@ fn an_old_shard_gets_the_new_tables_without_a_rewrite() {
     let (_dir, main, shard) = fixture();
     store::save(&main, &[release("a", 1, 1), release("b", 1, 1), release("c", 1, 1)]).unwrap();
     let conn = db::open_shard(&shard).unwrap();
+    conn.execute_batch("drop trigger archive_names_give_back").unwrap();
     for table in SHARD_TABLES {
         conn.execute_batch(&format!("drop trigger if exists gc_{0}; drop table {0};", table.name)).unwrap();
     }

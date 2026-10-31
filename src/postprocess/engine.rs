@@ -272,7 +272,7 @@ impl Inner {
     /// Bounded counts, per shard: an exact count at this size stalls whatever asks.
     pub(crate) fn refresh_counts(&self) {
         let now = chrono::Utc::now().timestamp();
-        let (mut due, mut net, mut failed, mut walked, mut total) = (0, 0, 0, 0, 0);
+        let (mut due, mut net, mut failed, mut walked, mut total, mut over_quota) = (0, 0, 0, 0, 0, 0);
         for path in store::shard_paths(&self.main) {
             let Ok(conn) = db::open_shard(&path) else { continue };
             let count =
@@ -282,6 +282,7 @@ impl Inner {
             failed += count("select count(*) from (select 1 from pp_state where failed != 0 limit 100001)", &[]);
             walked += count("select coalesce(sum(top_id - before_id), 0) from pp_walks", &[]);
             total += count("select coalesce(sum(top_id), 0) from pp_walks", &[]);
+            over_quota += count("select coalesce(sum(value), 0) from meta where key = 'archive_names_over_quota'", &[]);
         }
         let s = &self.stats;
         s.queue_due.store(due, Relaxed);
@@ -289,6 +290,7 @@ impl Inner {
         s.failed.store(failed, Relaxed);
         s.walk_done.store(walked, Relaxed);
         s.walk_total.store(total, Relaxed);
+        s.names_over_quota.store(over_quota, Relaxed);
         stats::set_backlog(due + net);
     }
 

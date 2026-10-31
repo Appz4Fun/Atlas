@@ -1738,8 +1738,12 @@ async fn save_slice(pool: &Arc<Pool>, db: &Db, group: &str, headers: Vec<Overvie
 
     // real names from par2/nfo bodies, every release looked up concurrently
     let t = std::time::Instant::now();
-    let jobs = releases.iter().map(name_sources).collect();
-    let names = first_names(pool.clone(), jobs).await;
+    // once the stage has a body budget it reads them, not the save path
+    let names = if crate::archive::inline_lookups() {
+        first_names(pool.clone(), releases.iter().map(name_sources).collect()).await
+    } else {
+        Vec::new()
+    };
     crate::profile::NAMES.add_since(t);
 
     let mut bytes = 0;

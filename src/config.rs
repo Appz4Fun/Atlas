@@ -152,6 +152,49 @@ pub struct Config {
     /// None = DEFAULT_MAX_UNSAVED_HEADERS
     pub max_unsaved_headers: Option<u64>,
     pub postprocess: PostprocessConfig,
+    pub archive: ArchiveConfig,
+}
+
+/// The `archive` object of config.json, see the README.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArchiveConfig {
+    pub enabled: bool,
+    pub max_bodies_per_release: i64,
+    pub probe_files: i64,
+    pub probes_per_minute: i64,
+    pub max_names_mb: i64,
+}
+
+impl Default for ArchiveConfig {
+    fn default() -> Self {
+        ArchiveConfig {
+            enabled: true,
+            max_bodies_per_release: 4,
+            probe_files: 2,
+            probes_per_minute: 60,
+            max_names_mb: 16_384,
+        }
+    }
+}
+
+impl ArchiveConfig {
+    fn from_value(v: Option<&Value>) -> ArchiveConfig {
+        let mut c = ArchiveConfig::default();
+        let Some(v) = v else { return c };
+        if let Some(b) = v.get("enabled").and_then(as_bool) {
+            c.enabled = b;
+        }
+        let int = |key: &str, min: i64, max: i64, slot: &mut i64| {
+            if let Some(n) = v.get(key).and_then(as_int) {
+                *slot = n.clamp(min, max);
+            }
+        };
+        int("max_bodies_per_release", 1, 16, &mut c.max_bodies_per_release);
+        int("probe_files", 0, 8, &mut c.probe_files);
+        int("probes_per_minute", 12, 600, &mut c.probes_per_minute);
+        int("max_names_mb", 64, i64::MAX, &mut c.max_names_mb);
+        c
+    }
 }
 
 /// A group's own floors, taken over the global ones when higher.
@@ -278,6 +321,7 @@ impl Default for Config {
             auto_run_compact: false,
             max_unsaved_headers: None,
             postprocess: PostprocessConfig::default(),
+            archive: ArchiveConfig::default(),
         }
     }
 }
@@ -421,6 +465,7 @@ impl Config {
                 .filter(|n| *n > 0),
             auto_run_compact: v.get("auto_run_compact").and_then(Value::as_bool).unwrap_or(false),
             postprocess: PostprocessConfig::from_value(v.get("postprocess")),
+            archive: ArchiveConfig::from_value(v.get("archive")),
             max_unsaved_headers: v
                 .get("max_unsaved_headers")
                 .and_then(as_int)
@@ -746,6 +791,52 @@ pub mod keyring {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn archive_defaults_when_absent() {
+        let c = ArchiveConfig::from_value(None);
+        assert!(c.enabled);
+        assert_eq!((c.max_bodies_per_release, c.probe_files, c.probes_per_minute, c.max_names_mb), (4, 2, 60, 16_384));
+    }
+
+    #[test]
+    fn archive_keys_parse() {
+        let v = serde_json::json!({
+            "enabled": false, "max_bodies_per_release": 2, "probe_files": 1, "probes_per_minute": 30, "max_names_mb": 128
+        });
+        let c = ArchiveConfig::from_value(Some(&v));
+        assert!(!c.enabled);
+        assert_eq!((c.max_bodies_per_release, c.probe_files, c.probes_per_minute, c.max_names_mb), (2, 1, 30, 128));
+    }
+
+    #[test]
+    fn archive_values_clamp() {
+        let v = serde_json::json!({
+            "max_bodies_per_release": 500, "probe_files": 99, "probes_per_minute": 1, "max_names_mb": 1
+        });
+        let c = ArchiveConfig::from_value(Some(&v));
+        assert_eq!((c.max_bodies_per_release, c.probe_files, c.probes_per_minute, c.max_names_mb), (16, 8, 12, 64));
+        let c = ArchiveConfig::from_value(Some(
+            &serde_json::json!({"max_bodies_per_release": 0, "probes_per_minute": 9000}),
+        ));
+        assert_eq!((c.max_bodies_per_release, c.probes_per_minute), (1, 600));
+    }
+
+    #[test]
+    fn a_bad_archive_value_falls_back() {
+        let c = ArchiveConfig::from_value(Some(&serde_json::json!({"enabled": "maybe", "probe_files": "many"})));
+        assert!(c.enabled);
+        assert_eq!(c.probe_files, 2);
+        assert_eq!(ArchiveConfig::from_value(Some(&serde_json::json!(7))).probe_files, 2);
+    }
+
+    #[test]
+    fn readme_lists_every_archive_key() {
+        let readme = include_str!("../README.md");
+        for key in ["max_bodies_per_release", "probe_files", "probes_per_minute", "max_names_mb"] {
+            assert!(readme.contains(key), "{key}");
+        }
+    }
 
     #[test]
     fn token_is_43_chars_urlsafe() {

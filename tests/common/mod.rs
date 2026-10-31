@@ -137,6 +137,14 @@ pub fn yenc_body(name: &str, data: &[u8]) -> Vec<Vec<u8>> {
     ]
 }
 
+/// `yenc_body` as real posts send it: each 100 bytes its own line
+pub fn yenc_lined(name: &str, data: &[u8]) -> Vec<Vec<u8>> {
+    let mut lines = vec![format!("=ybegin line=128 size={} name={name}", data.len()).into_bytes()];
+    lines.extend(data.chunks(100).map(yenc_encode));
+    lines.push(format!("=yend size={}", data.len()).into_bytes());
+    lines
+}
+
 pub fn par2_file_desc(name: &str, size: u64) -> Vec<u8> {
     let mut name_bytes = name.as_bytes().to_vec();
     while !name_bytes.len().is_multiple_of(4) {

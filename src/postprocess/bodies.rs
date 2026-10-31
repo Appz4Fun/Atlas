@@ -127,6 +127,7 @@ impl BodyFetcher {
         request: &BodyRequest,
         used: &mut i64,
         deadline: Instant,
+        prefix: bool,
     ) -> Result<Got, StepError> {
         if self.stopping() {
             return Err(StepError::Stopped);
@@ -147,7 +148,11 @@ impl BodyFetcher {
         let fetched = self.handle.block_on(unless_stopped(&self.stop, async {
             tokio::time::timeout(left, async {
                 let _permit = self.in_flight.acquire().await.expect("semaphore closed");
-                self.pool.background_body(&request.message_id, max_bytes).await
+                if prefix {
+                    self.pool.background_prefix(&request.message_id, max_bytes).await
+                } else {
+                    self.pool.background_body(&request.message_id, max_bytes).await
+                }
             })
             .await
         }));
@@ -200,6 +205,19 @@ mod tests {
     }
 
     #[test]
+    fn a_prefix_read_refuses_a_blocked_group() {
+        let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
+        // no port answers, soo an attempt to fetch would come back as an error
+        let f = fetcher(1, &runtime);
+        // no real group name is this long, soo it counts as blocked
+        let group = "a".repeat(10_000);
+        let release = ReleaseInfo { group, size: 10, ..Default::default() };
+        let ask = BodyRequest { message_id: "<a@x>".into(), file: "a.bin".into(), max_bytes: Some(64) };
+        let got = f.fetch(&release, &ask, &mut 0, Instant::now() + Duration::from_secs(5), true);
+        assert_eq!(got.unwrap(), Got::Refused("blocked group"));
+    }
+
+    #[test]
     fn a_body_stops_at_the_runs_deadline() {
         // a server that takes the connection and says nothing
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -210,11 +228,11 @@ mod tests {
         let ask = BodyRequest { message_id: "<a@x>".into(), file: "a.bin".into(), max_bytes: None };
         let mut used = 0;
         let start = Instant::now();
-        let got = f.fetch(&release, &ask, &mut used, start + Duration::from_millis(300));
+        let got = f.fetch(&release, &ask, &mut used, start + Duration::from_millis(300), false);
         assert!(matches!(got, Err(StepError::Transient(_))), "{got:?}");
         assert!(start.elapsed() < Duration::from_secs(5), "{:?}", start.elapsed());
         // nothing is started once it has passed
-        let got = f.fetch(&release, &ask, &mut used, Instant::now());
+        let got = f.fetch(&release, &ask, &mut used, Instant::now(), false);
         assert!(matches!(got, Err(StepError::OutOfBudget)), "{got:?}");
         drop(listener);
     }
