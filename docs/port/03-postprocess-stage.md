@@ -671,6 +671,7 @@ const CORE_TABLES: &[(&str, &str)] = &[
   - `a_bad_write_fails_that_release_alone`: a batch of 3 with bad SQL in the second; 1 and 3 applied, 2 has `db_attempts = 1` and `last_error`, and its own earlier write is undone.
   - `masks_are_deltas`: a concurrent `Stage::rerun` between claim and apply keeps its cleared bit.
   - `a_rerun_of_the_running_step_survives_its_result`: claim with `claimed_gen` 0, `Stage::rerun` of that very step, then apply its `set_done`: the bit stays clear and the queue row stays, also when the rerun's `due_at` equals `claimed_due`. An unrelated bit in the same `set_done` is dropped only if it is in `rerun_mask`.
+  - `a_stale_results_writes_and_name_are_dropped_too`: a step blocked in `run` with a write and a `NameChange`, a rerun of it meanwhile, then its apply: neither the write nor the name lands, and another step's write in the same `Applied` does. `a_stale_lookup_cant_attach_the_old_titles_ids` is its Part 8 form.
   - `a_rerun_of_a_release_with_no_state_is_remembered`: the same with no `pp_state` row at the claim. A rerun of an id with no release writes nothing.
   - `a_db_visit_leaves_the_net_columns_alone`: `net_attempts = 3`, `net_next_at = 999`; a DB-lane apply keeps both. The net lane's keeps `db_attempts`.
   - `net_wanted_follows_the_mask`: set while a `net_mask` bit is undone, NULL once done or failed, set again when `clear` takes it back.
@@ -687,17 +688,18 @@ impl Db { pub(crate) fn on_writer(&self, shard: usize, work: StageWork) -> anyho
 
   In `writer`: keep a `VecDeque<StageJob>`, and any `Stage` taken from the channel goes there, including while gathering a save batch. Wait `Duration::ZERO` instead of `idle` while it is non-empty. After a save's replies are sent, run jobs for at most `STAGE_BUDGET_BUSY`; with no save waiting, for at most `STAGE_BUDGET_IDLE`, then `housekeeping` at least once a second. Each job runs in one `BEGIN IMMEDIATE` transaction and adds to `writer_stage_ns`. When the channel closes, run all that remain. `LOAD.writer_queued` keeps counting saves only.
 
-  In `apply.rs`, for each release inside a savepoint (`savepoint one`; on error `rollback to one`, then record the failure as `Retry` would). `Applied` carries `release_id`, `claimed_due: Option<i64>`, `claimed_gen: i64` (the `rerun_gen` read with the row, 0 with no row), `set_done`, `set_failed`, `clear`, `rename_clears`, `net_mask`, `db_mask`, `writes`, `name`, `db_attempts`, `net_attempts`, `net_next_at` (each `Option`: None leaves the column), `parts_seen`, `error`, `queue_at: Option<i64>`, `no_state: bool`.
+  In `apply.rs`, for each release inside a savepoint (`savepoint one`; on error `rollback to one`, then record the failure as `Retry` would). `Applied` carries `release_id`, `claimed_due: Option<i64>`, `claimed_gen: i64` (the `rerun_gen` read with the row, 0 with no row), `set_done`, `set_failed`, `clear`, `rename_clears`, `net_mask`, `db_mask`, `writes` and `name`, each tagged with the `StepMask` of the step that made it, `db_attempts`, `net_attempts`, `net_next_at` (each `Option`: None leaves the column), `parts_seen`, `error`, `queue_at: Option<i64>`, `no_state: bool`.
 
 ```sql
 select display_name, coalesce(name_source, 0) from releases where id = ?1;   -- none: skip this release
--- each StepWrite: prepare_cached(sql).execute(params)
--- when name.source >= that source and either field is Some. A differing display_name adds rename_clears to clear
+-- when a state row exists and claimed_gen differs: bits cleared since the claim may include a step that just ran, on
+-- input older than the request. All of such a step's result is dropped, in this order: its writes, its name, its bit.
+select rerun_gen != ?2, rerun_mask from pp_state where release_id = ?1;
+-- each StepWrite of a step not dropped: prepare_cached(sql).execute(params)
+-- when name.source >= that source, either field is Some, and its step wasn't dropped. A differing display_name adds rename_clears to clear
 update releases set display_name = coalesce(?2, display_name), is_obfuscated = coalesce(?3, is_obfuscated), name_source = ?4
  where id = ?1;
--- first, when a state row exists and claimed_gen differs: bits cleared since the claim may include the step that just
--- ran, on input older than the request. Its result is dropped, and the queue row below is kept, so it runs again.
-select rerun_gen != ?2, rerun_mask from pp_state where release_id = ?1;
+-- on a stale claim the queue row below is kept too, so a dropped step runs again.
 -- unless no_state. ?2 set_done, ?3 set_failed, each without rerun_mask on a stale claim, ?4 clear, ?5 net_mask,
 -- ?6 db_attempts, ?7 net_attempts, ?8 net_next_at
 insert into pp_state (release_id, done, failed, net_wanted, db_attempts, net_attempts, net_next_at, parts_seen, last_error,
@@ -1208,5 +1210,5 @@ cargo test --test pp_schema
 51. **Bounded counts on the dashboard.** `BUGS.md` #44: exact counts at this size stalled the monitor. `100k+` is enough to read.
 52. **The menu's purge stays, with a limit.** Replacing it is out of scope. Past 1M incomplete rows in a shard it would hold one transaction for hours with every trigger firing, so it refuses and names the batched command.
 53. **Benchmarks are reported, not gated.** The overview's rule: they measure a machine that may be busy with the live indexer.
-54. **A rerun beats a result computed before it.** Masks as deltas keep other bits, but not the bit of the step that's running, whose result may rest on input older than the request. `rerun_gen` tells the writer the claim is stale, and `rerun_mask` says which results to drop. The mask is never reset, because two lanes hold claims at once and either could reset it under the other. It can only over-drop, which costs one more run of a step on the rare stale claim, so it converges.
+54. **A rerun beats a result computed before it.** Masks as deltas keep other bits, but not the bit of the step that's running, whose result may rest on input older than the request. `rerun_gen` tells the writer the claim is stale, and `rerun_mask` says which results to drop: the step's writes and name as well as its bit, since a result on old input is wrong as data, and a later run that finds nothing wouldn't overwrite it. The mask is never reset, because two lanes hold claims at once and either could reset it under the other. It can only over-drop, which costs one more run of a step on the rare stale claim, so it converges.
 55. **`config_stamp` is separate from `pp_steps_seen`.** That one tracks steps turning on, and a step that was on and gains an input, like a second metadata provider, needs its finished results redone, which a walk with no `redo_mask` wouldn't do.

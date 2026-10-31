@@ -800,6 +800,7 @@ Fixtures: `tmdb_search_tv.json` `{"results":[{"id":401,"name":"Some Show","origi
   - `a_release_after_the_title_resolved_gets_ids_from_the_cache`: no new request, IDs in its row after `media_parse`.
   - `an_outage_waits_without_using_attempts`: `net_attempts` stays 0, `net_next_at` moves. This relies on Part 3's `wait_until` refund.
   - `the_representative_gets_its_ids_through_the_step`: without the fan-out thread attached.
+  - `a_stale_lookup_cant_attach_the_old_titles_ids`: `media_lookup` blocked on its provider, a rename makes `media_parse` write a new title and clear the step, then the old lookup returns `Found`: the row's IDs stay NULL. The next lookup's `NotFound` for the new title leaves them NULL.
   - `a_rename_gets_a_new_title`: `media_parse` rewrites, and `media_lookup` asks for the new title.
   - `a_provider_turning_on_starts_a_walk`: Part 3's `pp_steps_seen` adds a `'steps'` walk. Old releases then go through one request per title.
   - `a_deleted_cache_row_needs_a_restart`: the same with the first `Media` still running: no request, as documented in section 10.
