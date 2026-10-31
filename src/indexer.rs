@@ -19,6 +19,8 @@ pub struct Progress {
     pub articles: i64,
     pub bytes: i64,
     pub releases: i64,
+    /// articles left out as obfuscated per article, also in `articles`
+    pub skipped: i64,
 }
 
 impl Progress {
@@ -26,6 +28,7 @@ impl Progress {
         self.articles += other.articles;
         self.bytes += other.bytes;
         self.releases += other.releases;
+        self.skipped += other.skipped;
     }
 }
 
@@ -1578,6 +1581,10 @@ impl Pass<'_> {
             println!("[{kind}] {group} {start}-{end} empty, skipping");
         }
 
+        if saved.skipped > 0 {
+            println!("[{kind}] {group} {start}-{end} skipped {} articles obfuscated per article", saved.skipped);
+        }
+
         if saved.articles > 0 {
             self.ctx.states.with(group, |st| st.idle = false);
         }
@@ -1618,10 +1625,13 @@ async fn save_slice(pool: &Arc<Pool>, db: &Db, group: &str, headers: Vec<Overvie
 
     // parsing is cpu work, keep it off the async threads
     let t = std::time::Instant::now();
-    let mut releases: Vec<Release> =
-        tokio::task::spawn_blocking(move || group_articles(headers_to_articles(headers)).into_values().collect())
-            .await
-            .map_err(|e| anyhow!("parse task failed: {e}"))?;
+    let parsing = move || {
+        let (articles, skipped) = crate::filters::drop_per_article_obfuscated(headers_to_articles(headers));
+        let releases: Vec<Release> = group_articles(articles).into_values().collect();
+        (releases, skipped)
+    };
+    let (mut releases, skipped) =
+        tokio::task::spawn_blocking(parsing).await.map_err(|e| anyhow!("parse task failed: {e}"))?;
     crate::profile::PARSE.add_since(t);
     crate::profile::Load::add_since(&crate::profile::LOAD.parse_ns, t);
 
@@ -1645,7 +1655,7 @@ async fn save_slice(pool: &Arc<Pool>, db: &Db, group: &str, headers: Vec<Overvie
     let count = releases.len() as i64;
     db.save(releases).await?;
 
-    Ok(Progress { articles, bytes, releases: count })
+    Ok(Progress { articles, bytes, releases: count, skipped })
 }
 
 /// Bodies worth fetching for a real name: base par2 files first, then nfos.

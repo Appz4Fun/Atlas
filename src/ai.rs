@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use crate::config::Config;
 use crate::db::save_releases_bulk;
 use crate::download::download_release;
-use crate::filters::group_blocked;
+use crate::filters::{drop_per_article_obfuscated, group_blocked};
 use crate::nntp::{BlockingPool, headers_to_articles};
 use crate::nzb::generate_nzb;
 use crate::parser::{Release, group_articles, is_complete};
@@ -170,7 +170,8 @@ pub fn fetch_and_store(config: &Config, groups: &[String], keywords: &[String], 
             }
         };
 
-        let mut to_save: Vec<Release> = group_articles(headers_to_articles(headers))
+        let (articles, _skipped) = drop_per_article_obfuscated(headers_to_articles(headers));
+        let mut to_save: Vec<Release> = group_articles(articles)
             .into_values()
             .map(|mut rel| {
                 rel.complete = is_complete(&rel.articles);

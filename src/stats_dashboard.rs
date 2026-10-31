@@ -600,6 +600,7 @@ fn draw_overview(f: &mut Frame, app: &App, area: Rect) {
         kv("average (graph)", format!("{} headers/s", count(avg as i64))),
         kv("peak (10s)", format!("{} headers/s", count(peak as i64))),
         kv("this run", count(s["total_articles"].as_i64().unwrap_or(0))),
+        kv("skipped, per article", count(s["total_skipped"].as_i64().unwrap_or(0))),
         kv("per day at this", count((run_avg * 86_400.0) as i64)),
         kv("all time ≈", count(quick.articles_approx)),
         kv("releases ≈", count(quick.releases_approx)),
