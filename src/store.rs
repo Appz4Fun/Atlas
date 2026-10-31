@@ -1574,11 +1574,12 @@ fn split_old_rows<'a>(tx: &Connection, grouping_from: i64, release: &'a Release)
         size: articles.iter().map(|a| a.bytes).sum(),
         is_obfuscated: crate::parser::is_obfuscated(name),
         collection,
+        // its own, soo the next slice's probe still finds the row
+        poster: articles.first().map_or_else(|| release.poster.clone(), |a| a.author.clone()),
         articles,
         display_name: release.display_name.clone(),
         complete: false,
         group: release.group.clone(),
-        poster: release.poster.clone(),
         date: release.date.clone(),
     };
     let mut rest = Vec::new();
@@ -3425,5 +3426,28 @@ mod tests {
         assert_eq!(conn.query_row("select count(*) from collections", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
         purge_incomplete(&main).unwrap();
         assert_eq!(conn.query_row("select count(*) from collections", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+    }
+
+    #[test]
+    fn old_rows_keep_their_own_posters() {
+        let (_dir, main, conn) = fresh_shard_db();
+        let mut a = in_collection("unused", "a.mkv", "a.mkv", "<a@x>", "p");
+        a.collection = None;
+        let mut b = in_collection("unused", "b.nfo", "b.nfo", "<b@x>", "q");
+        b.collection = None;
+        save(&main, &[a, b]).unwrap();
+        start_grouping(&main).unwrap();
+
+        // one collection holding both, its poster the first article's
+        let mut both = in_collection("k", "a.mkv", "a.mkv", "<a2@x>", "p");
+        both.articles.extend(in_collection("k", "b.nfo", "b.nfo", "<b2@x>", "q").articles);
+        save(&main, &[both]).unwrap();
+        let poster = |name: &str| -> String {
+            conn.query_row("select poster from releases where name = ?", [name], |r| r.get(0)).unwrap()
+        };
+        assert_eq!((poster("a.mkv"), poster("b.nfo")), ("p".to_string(), "q".to_string()));
+        // the next slice of the second file still finds its row
+        save(&main, &[in_collection("k", "b.nfo", "b.nfo", "<b3@x>", "q")]).unwrap();
+        assert_eq!(rows_of(&conn).len(), 2);
     }
 }
