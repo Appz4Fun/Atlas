@@ -102,3 +102,46 @@ fn an_old_database_reads_as_nothing_known() {
     assert!(passwords_with(&conn, &[a]).is_empty());
     assert_eq!(view_with(&conn, a).password, None);
 }
+
+#[test]
+fn deleting_a_release_gives_its_names_back() {
+    let (_dir, main) = database();
+    let conn = shard(&main, 0);
+    conn.execute(
+        "insert into releases (id, name, group_name, size, complete, parts) values (8, 'x', 'g', 1, 1, 1), (16, 'y', 'g', 1, 1, 1)",
+        [],
+    )
+    .unwrap();
+    conn.execute("insert into meta (key, value) values ('archive_name_bytes', 1000)", []).unwrap();
+    file(&conn, 8, 131_072, "abc", None, SOURCE_RAR);
+    conn.execute("delete from releases where id = 16", []).unwrap();
+    assert_eq!(shards::get_meta(&conn, "archive_name_bytes").unwrap(), Some(1000), "it held nothing");
+    conn.execute("delete from releases where id = 8", []).unwrap();
+    assert_eq!(shards::get_meta(&conn, "archive_name_bytes").unwrap(), Some(1000 - 35));
+    assert!(inner_files(&conn, 8).unwrap().is_empty());
+}
+
+#[test]
+fn compacting_keeps_the_give_back() {
+    let (_dir, main) = database();
+    let exists = |main: &std::path::Path| -> bool {
+        shard(main, 0)
+            .prepare("select 1 from sqlite_master where type = 'trigger' and name = 'archive_names_give_back'")
+            .unwrap()
+            .exists([])
+            .unwrap()
+    };
+    assert!(exists(&main));
+    let dir = tempfile::tempdir().unwrap();
+    let copy = dir.path().join("copy.db");
+    shards::create_shard(&copy).unwrap();
+    assert!(
+        db::open_shard(&copy)
+            .unwrap()
+            .prepare("select 1 from sqlite_master where type = 'trigger' and name = 'archive_names_give_back'")
+            .unwrap()
+            .exists([])
+            .unwrap(),
+        "compaction and conversion build their copies with this"
+    );
+}

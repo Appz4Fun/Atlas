@@ -24,7 +24,15 @@ pub const INNER_FILES: ShardTable = ShardTable {
         size       INTEGER,
         source     INTEGER NOT NULL,
         primary key (release_id, seq)
-    ) without rowid",
+    ) without rowid;
+    -- a deleted release gives its names back to `max_names_mb`. Before: the gc trigger takes these rows after
+    create trigger if not exists archive_names_give_back before delete on releases
+    when exists (select 1 from archive_inner_files where release_id = old.id)
+    begin
+        update meta set value = max(0, value - (
+            select coalesce(sum(length(cast(name as blob)) + 32), 0) from archive_inner_files where release_id = old.id
+        )) where key = 'archive_name_bytes';
+    end",
     indexes: &[],
     release_key: Some("release_id"),
     added: &[],

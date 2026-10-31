@@ -10,6 +10,8 @@ const MAX_FOLDERS: u64 = 4_096;
 /// each byte of a header can claim one: these are what keeps a header from turning 8 MB into 64
 const MAX_PACK_STREAMS: u64 = 4_096;
 const MAX_CODERS: u64 = 32;
+/// AES has the longest a real coder uses, 34 bytes. A header's unused folder could otherwise claim most of its size
+const MAX_CODER_PROPS: u64 = 64;
 const MAX_ROUNDS: usize = 4;
 const AES: &[u8] = &[0x06, 0xf1, 0x07, 0x01];
 const LZMA: &[u8] = &[0x03, 0x01, 0x01];
@@ -169,6 +171,9 @@ fn folder(r: &mut Reader<'_>) -> Option<Folder> {
         }
         let props = if flags & 0x20 != 0 {
             let size = r.number()?;
+            if size > MAX_CODER_PROPS {
+                return None;
+            }
             r.take(size)?.to_vec()
         } else {
             Vec::new()
@@ -482,49 +487,54 @@ fn run(head: &[u8], tail: &[u8], l: &mut Listing) -> Option<()> {
         return None;
     }
 
-    nested(head, window, at, next.to_vec(), l, 0)
+    nested(head, window, at, next.to_vec(), l)
 }
 
-/// A decoded header, itself maybe packed again.
-fn nested(head: &[u8], window: &[u8], at: u64, bytes: Vec<u8>, l: &mut Listing, round: usize) -> Option<()> {
-    let mut r = Reader { b: &bytes, p: 0 };
-    match r.byte()? {
-        0x01 => return header(&mut r, l),
-        0x17 if round <= MAX_ROUNDS => {}
-        _ => return None,
+/// A decoded header, itself maybe packed again. Each round's bytes go before the next is kept.
+fn nested(head: &[u8], window: &[u8], at: u64, first: Vec<u8>, l: &mut Listing) -> Option<()> {
+    let mut bytes = first;
+    let mut round = 0;
+    loop {
+        let mut r = Reader { b: &bytes, p: 0 };
+        match r.byte()? {
+            0x01 => return header(&mut r, l),
+            0x17 if round <= MAX_ROUNDS => {}
+            _ => return None,
+        }
+        let encoded = streams(&mut r)?;
+        if encoded.folders.iter().any(|f| f.aes) {
+            l.encrypted = true;
+            l.headers_encrypted = true;
+            return Some(());
+        }
+        let folder = encoded.folders.first()?;
+        let [(id, props)] = folder.coders.as_slice() else { return None };
+        if id != LZMA || props.len() != 5 {
+            return None;
+        }
+        let unpacked = folder.size()?;
+        if unpacked > MAX_DECODED as u64 {
+            return None;
+        }
+        let pack_len = *encoded.pack_sizes.first()?;
+        let from = 32u64.checked_add(encoded.pack_pos)?;
+        let to = from.checked_add(pack_len)?;
+        let in_window = from
+            .checked_sub(at)
+            .zip(to.checked_sub(at))
+            .and_then(|(a, b)| window.get(usize::try_from(a).ok()?..usize::try_from(b).ok()?));
+        let packed = in_window.or_else(|| head.get(usize::try_from(from).ok()?..usize::try_from(to).ok()?));
+        let Some(packed) = packed else {
+            l.need_more_tail = true;
+            return Some(());
+        };
+        let out = decode(props, packed, unpacked)?;
+        if folder.crc.is_some_and(|c| c != crc32(&out)) {
+            return None;
+        }
+        bytes = out;
+        round += 1;
     }
-    let encoded = streams(&mut r)?;
-    if encoded.folders.iter().any(|f| f.aes) {
-        l.encrypted = true;
-        l.headers_encrypted = true;
-        return Some(());
-    }
-    let folder = encoded.folders.first()?;
-    let [(id, props)] = folder.coders.as_slice() else { return None };
-    if id != LZMA || props.len() != 5 {
-        return None;
-    }
-    let unpacked = folder.size()?;
-    if unpacked > MAX_DECODED as u64 {
-        return None;
-    }
-    let pack_len = *encoded.pack_sizes.first()?;
-    let from = 32u64.checked_add(encoded.pack_pos)?;
-    let to = from.checked_add(pack_len)?;
-    let in_window = from
-        .checked_sub(at)
-        .zip(to.checked_sub(at))
-        .and_then(|(a, b)| window.get(usize::try_from(a).ok()?..usize::try_from(b).ok()?));
-    let packed = in_window.or_else(|| head.get(usize::try_from(from).ok()?..usize::try_from(to).ok()?));
-    let Some(packed) = packed else {
-        l.need_more_tail = true;
-        return Some(());
-    };
-    let out = decode(props, packed, unpacked)?;
-    if folder.crc.is_some_and(|c| c != crc32(&out)) {
-        return None;
-    }
-    nested(head, window, at, out, l, round + 1)
 }
 
 #[cfg(test)]
@@ -548,5 +558,21 @@ mod tests {
         assert!(streams(&mut Reader { b: &ok, p: 0 }).is_some());
         let over = pack_info(MAX_PACK_STREAMS + 1);
         assert!(streams(&mut Reader { b: &over, p: 0 }).is_none());
+    }
+
+    /// one LZMA coder with a property of `size` bytes
+    fn coder_with_props(size: u64) -> Vec<u8> {
+        let mut b = vec![0x01, 0x23, 0x03, 0x01, 0x01];
+        b.extend(sz_num(size));
+        b.extend(vec![0u8; size as usize]);
+        b
+    }
+
+    #[test]
+    fn a_huge_coder_property_is_refused() {
+        let ok = coder_with_props(MAX_CODER_PROPS);
+        assert!(folder(&mut Reader { b: &ok, p: 0 }).is_some());
+        let over = coder_with_props(MAX_CODER_PROPS + 1);
+        assert!(folder(&mut Reader { b: &over, p: 0 }).is_none());
     }
 }
