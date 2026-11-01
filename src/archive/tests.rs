@@ -193,6 +193,22 @@ mod rar_tests {
     }
 
     #[test]
+    fn a_real_rar5_password_is_told_from_a_wrong_one() {
+        for sample in [
+            include_bytes!("../../tests/fixtures/rar5/rar5-psw.rar").as_slice(),
+            include_bytes!("../../tests/fixtures/rar5/rar5-hpsw.rar").as_slice(),
+        ] {
+            let l = rar::list(sample);
+            let check = l.password_check.expect("a check value");
+            assert_eq!(check.accepts("password"), Some(true));
+            assert_eq!(check.accepts("wrong"), Some(false));
+            assert_eq!(rar::PasswordCheck::from_bytes(&check.to_bytes()), Some(check));
+        }
+        let many = rar::PasswordCheck { kdf: 30, salt: [0; 16], check: [0; 8] };
+        assert_eq!(many.accepts("x"), None, "too slow to try");
+    }
+
+    #[test]
     fn rar_encryption() {
         let l = rar::list(&[rar4(&[r4_main(0x0080)]), vec![0xaa; 64]].concat());
         assert!(l.encrypted && l.headers_encrypted && l.files.is_empty());

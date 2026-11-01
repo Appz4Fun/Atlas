@@ -704,10 +704,12 @@ fn release_html(
     }
     fact("Encryption", encryption_fact(inner));
     if let Some(hint) = release_info::password_hint(r.id, names) {
-        fact(
-            "Password",
-            format!("<code>{}</code> found in {}, not tried", escape(&hint.password), escape(hint.source)),
-        );
+        let verdict = match inner.password_check.and_then(|check| check.accepts(&hint.password)) {
+            Some(true) => tag("tag-ok", "WORKS"),
+            Some(false) => tag("tag-bad", "WRONG"),
+            None => ", not tried".to_string(),
+        };
+        fact("Password", format!("<code>{}</code> found in {}{verdict}", escape(&hint.password), escape(hint.source)));
     }
     if contents.files > 0 {
         fact("Files", contents.files.to_string());

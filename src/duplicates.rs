@@ -334,6 +334,10 @@ const BACKFILL_BATCH: i64 = 2_000;
 /// One shard's releases that have inner files, from what's stored. Returns how many got a fingerprint.
 fn backfill_shard(path: &std::path::Path, apply: bool) -> anyhow::Result<u64> {
     let conn = db::open_shard(path)?;
+    if apply {
+        // this can be the first thing to open a shard since an upgrade
+        crate::postprocess::schema::migrate(&conn)?;
+    }
     let (mut after, mut set) = (0i64, 0u64);
     loop {
         let ids: Vec<i64> = conn
@@ -470,12 +474,19 @@ mod tests {
              insert into archive_inner_files values (1, 1, 'a.mkv', 5000000, 2), (2, 1, 'a.part1.rar', 5000000, 1), (3, 1, 'a.nfo', 10, 2);",
         )
         .unwrap();
-        conn.execute_batch(FINGERPRINT.create).unwrap();
+        conn.execute_batch(
+            "create table releases (id INTEGER PRIMARY KEY, name TEXT, group_name TEXT);
+             create table meta (key TEXT PRIMARY KEY, value INTEGER);",
+        )
+        .unwrap();
         assert_eq!(backfill_shard(&path, false).unwrap(), 1);
         let rows = |c: &Connection| -> i64 {
             c.query_row("select count(*) from release_fingerprint", [], |r| r.get(0)).unwrap()
         };
-        assert_eq!(rows(&conn), 0, "a dry run writes nothing");
+        let tables: i64 = conn
+            .query_row("select count(*) from sqlite_master where name = 'release_fingerprint'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(tables, 0, "a dry run writes nothing");
         assert_eq!(backfill_shard(&path, true).unwrap(), 1);
         assert_eq!(rows(&conn), 1);
     }

@@ -251,6 +251,8 @@ fn block5(l: &mut Listing, inner: &[u8]) -> Option<u64> {
             l.encrypted = true;
             l.encryption = Some(Encryption::Rar5Aes256);
             l.headers_encrypted = true;
+            // the header's own: version, flags, kdf, salt, check
+            l.password_check = password_check(inner.get(p..end)?, false).or(l.password_check);
         }
         5 => l.complete = true,
         2 | 3 => {
@@ -275,6 +277,7 @@ fn block5(l: &mut Listing, inner: &[u8]) -> Option<u64> {
                 if encrypted_record(inner.get(end..)?) {
                     l.encrypted = true;
                     l.encryption = Some(Encryption::Rar5Aes256);
+                    l.password_check = l.password_check.or_else(|| record_check(inner.get(end..)?));
                 }
                 if file_flags & 1 == 0 {
                     let size = (file_flags & 8 == 0).then_some(unpacked);
@@ -285,6 +288,103 @@ fn block5(l: &mut Listing, inner: &[u8]) -> Option<u64> {
         _ => {}
     }
     Some(data)
+}
+
+/// What RAR5 keeps to test a password: `2^kdf` rounds over `salt` have to fold down to `check`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PasswordCheck {
+    pub kdf: u8,
+    pub salt: [u8; 16],
+    pub check: [u8; 8],
+}
+
+/// More rounds than this take too long to run while a page waits.
+const MAX_KDF: u8 = 20;
+
+impl PasswordCheck {
+    /// Stored as kdf, salt, check.
+    pub fn to_bytes(self) -> Vec<u8> {
+        let mut out = vec![self.kdf];
+        out.extend(self.salt);
+        out.extend(self.check);
+        out
+    }
+
+    pub fn from_bytes(b: &[u8]) -> Option<PasswordCheck> {
+        Some(PasswordCheck {
+            kdf: *b.first()?,
+            salt: b.get(1..17)?.try_into().ok()?,
+            check: b.get(17..25)?.try_into().ok()?,
+        })
+    }
+
+    /// Whether this is the password. None: too many rounds to find out here.
+    pub fn accepts(&self, password: &str) -> Option<bool> {
+        if self.kdf > MAX_KDF {
+            return None;
+        }
+        let hash = pbkdf2_sha256(password.as_bytes(), &self.salt, (1u32 << self.kdf) + 32)?;
+        let mut folded = [0u8; 8];
+        for (i, b) in hash.iter().enumerate() {
+            if let Some(slot) = folded.get_mut(i % 8) {
+                *slot ^= b;
+            }
+        }
+        Some(folded == self.check)
+    }
+}
+
+/// PBKDF2's first block, which is all RAR asks of it.
+fn pbkdf2_sha256(password: &[u8], salt: &[u8], rounds: u32) -> Option<[u8; 32]> {
+    use hmac::{Hmac, Mac};
+    let keyed = Hmac::<sha2::Sha256>::new_from_slice(password).ok()?;
+    let mut mac = keyed.clone();
+    mac.update(salt);
+    mac.update(&1u32.to_be_bytes());
+    let mut u: [u8; 32] = mac.finalize().into_bytes().into();
+    let mut out = u;
+    for _ in 1..rounds {
+        let mut mac = keyed.clone();
+        mac.update(&u);
+        u = mac.finalize().into_bytes().into();
+        for (o, b) in out.iter_mut().zip(u) {
+            *o ^= b;
+        }
+    }
+    Some(out)
+}
+
+/// `version, flags, kdf, salt, [iv,] check`. A check is only there with flag 1, and its sum has to be right.
+fn password_check(body: &[u8], has_iv: bool) -> Option<PasswordCheck> {
+    use sha2::Digest;
+    let mut p = 0usize;
+    let _version = vint(body, &mut p)?;
+    let flags = vint(body, &mut p)?;
+    if flags & 1 == 0 {
+        return None;
+    }
+    let kdf = *body.get(p)?;
+    p += 1;
+    let salt: [u8; 16] = body.get(p..p + 16)?.try_into().ok()?;
+    p += if has_iv { 32 } else { 16 };
+    let check: [u8; 8] = body.get(p..p + 8)?.try_into().ok()?;
+    let sum = body.get(p + 8..p + 12)?;
+    (sha2::Sha256::digest(check).get(..4) == Some(sum)).then_some(PasswordCheck { kdf, salt, check })
+}
+
+/// The check in a file's encryption record.
+fn record_check(area: &[u8]) -> Option<PasswordCheck> {
+    let mut p = 0usize;
+    while p < area.len() {
+        let size = usize::try_from(vint(area, &mut p)?).ok().filter(|s| *s > 0)?;
+        let end = p.checked_add(size).filter(|e| *e <= area.len())?;
+        let mut at = p;
+        if vint(area, &mut at) == Some(1) {
+            return password_check(area.get(at..end)?, true);
+        }
+        p = end;
+    }
+    None
 }
 
 /// an extra area holding a file encryption record. A record of size 0 or past the area ends the walk

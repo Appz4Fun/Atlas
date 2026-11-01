@@ -173,6 +173,8 @@ pub struct Listing {
     pub headers_encrypted: bool,
     /// what kind, once `encrypted`
     pub encryption: Option<Encryption>,
+    /// RAR5: what a password can be tried against, with nothing downloaded
+    pub password_check: Option<rar::PasswordCheck>,
     /// the end of the list was seen
     pub complete: bool,
     /// a header failed its CRC or its structure

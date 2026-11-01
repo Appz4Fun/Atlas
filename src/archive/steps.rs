@@ -128,7 +128,12 @@ fn finish(ctx: &StepCtx<'_>, source: i64, listing: Listing, limits: &ArchiveConf
         if let Some(encryption) = listing.encryption {
             writes.push(StepWrite::new(
                 archive_store::SET_ENCRYPTION,
-                vec![id.into(), encryption.code().into(), i64::from(listing.headers_encrypted).into()],
+                vec![
+                    id.into(),
+                    encryption.code().into(),
+                    i64::from(listing.headers_encrypted).into(),
+                    listing.password_check.map(|check| check.to_bytes()).into(),
+                ],
             ));
         }
     }
