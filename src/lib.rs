@@ -18,6 +18,7 @@ pub mod dates;
 pub mod db;
 pub mod download;
 pub mod duplicates;
+pub mod field_search;
 pub mod filters;
 pub mod groups_menu;
 pub mod indexer;

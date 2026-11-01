@@ -12,6 +12,7 @@ use sha1::{Digest, Sha1};
 use crate::api::{ApiResponse, escape, find_releases, get_nzb, parse_query};
 use crate::archive::Password;
 use crate::category::{TABLE, UNCATEGORIZED, label, parse_filter};
+use crate::field_search::{self, Fields};
 use crate::media::query::MediaAttrs;
 use crate::media::title::Kind;
 use crate::search::{ReleaseRow, get_release};
@@ -186,6 +187,66 @@ struct Search {
     offset: i64,
     /// from `FILTERS`, nothing else
     filters: Vec<&'static str>,
+    fields: Fields,
+    sort: Option<SortBy>,
+    descending: bool,
+}
+
+/// Up to this many results get sorted: the newest or best matching ones.
+const SORT_WINDOW: i64 = 2_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SortBy {
+    Name,
+    Category,
+    Size,
+    Posted,
+    Group,
+}
+
+impl SortBy {
+    const ALL: [(SortBy, &'static str); 5] = [
+        (SortBy::Name, "name"),
+        (SortBy::Category, "category"),
+        (SortBy::Size, "size"),
+        (SortBy::Posted, "posted"),
+        (SortBy::Group, "group"),
+    ];
+
+    fn word(self) -> &'static str {
+        SortBy::ALL.iter().find(|(s, _)| *s == self).map_or("", |(_, w)| w)
+    }
+
+    fn from_word(word: &str) -> Option<SortBy> {
+        SortBy::ALL.iter().find(|(_, w)| *w == word).map(|(s, _)| *s)
+    }
+}
+
+/// Puts results in order, with those that have no value for the column last either way.
+fn sort_rows(rows: &mut [ReleaseRow], by: SortBy, descending: bool, categories: &HashMap<i64, i64>) {
+    let flip = |o: std::cmp::Ordering| if descending { o.reverse() } else { o };
+    rows.sort_by(|a, b| match by {
+        SortBy::Name => flip(a.name.to_lowercase().cmp(&b.name.to_lowercase())),
+        SortBy::Category => {
+            let of =
+                |r: &ReleaseRow| label(categories.get(&r.id).copied().unwrap_or(UNCATEGORIZED)).unwrap_or_default();
+            flip(of(a).cmp(&of(b)))
+        }
+        SortBy::Size => match (a.size, b.size) {
+            (Some(x), Some(y)) => flip(x.cmp(&y)),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        },
+        SortBy::Posted => {
+            let of = |r: &ReleaseRow| fmt_date(r.posted_date.as_deref());
+            match (of(a), of(b)) {
+                (x, y) if x.is_empty() || y.is_empty() => y.len().cmp(&x.len()),
+                (x, y) => flip(x.cmp(&y)),
+            }
+        }
+        SortBy::Group => flip(a.group_name.cmp(&b.group_name)),
+    });
 }
 
 /// The quick filters over results. Each is also searched for, except the last.
@@ -197,8 +258,8 @@ fn filter_matches(filter: &str, tags: &release_tags::Tags) -> bool {
     let quality = tags.quality.as_deref().unwrap_or_default();
     match filter {
         "2160p" | "1080p" => tags.resolution.as_deref() == Some(filter),
-        "DV" => tags.hdr.contains(&"DV"),
-        "HDR" => tags.hdr.iter().any(|hdr| *hdr == "HDR" || *hdr == "HDR10+"),
+        "DV" => tags.hdr.iter().any(|hdr| hdr == "DV"),
+        "HDR" => tags.hdr.iter().any(|hdr| hdr == "HDR" || hdr == "HDR10+"),
         "Remux" => quality.contains("REMUX"),
         "WEB-DL" => quality == "WEB-DL",
         "BluRay" => quality.starts_with("BluRay"),
@@ -213,7 +274,24 @@ impl Search {
         let offset = args.get("offset").and_then(|v| v.trim().parse::<i64>().ok()).unwrap_or(0).max(0);
         let asked = text("filters");
         let filters = FILTERS.iter().copied().filter(|f| asked.split(',').any(|a| a.trim() == *f)).collect();
-        Search { q: text("q"), cat: text("cat"), offset: offset - offset % PAGE_SIZE, filters }
+        let fields = Fields {
+            group: text("group"),
+            poster: text("poster"),
+            email: text("email"),
+            size: text("size").replace([',', ' '], ""),
+            team: text("team"),
+        };
+        let sort = SortBy::from_word(&text("sort"));
+        let descending = text("dir") != "asc";
+        Search {
+            q: text("q"),
+            cat: text("cat"),
+            offset: offset - offset % PAGE_SIZE,
+            filters,
+            fields,
+            sort,
+            descending,
+        }
     }
 
     /// `search_query`, with this search's filters, or `filters` in their place.
@@ -225,7 +303,45 @@ impl Search {
             }
             query.push_str(&format!("filters={}", url_encode(&filters.join(","))));
         }
+        let mut more = self.fields.query();
+        if let Some(sort) = self.sort {
+            more.push(format!("sort={}&dir={}", sort.word(), if self.descending { "desc" } else { "asc" }));
+        }
+        for part in more {
+            if !query.is_empty() {
+                query.push('&');
+            }
+            query.push_str(&part);
+        }
         query
+    }
+
+    /// A column heading: sorts by it, and flips when it's already the sort.
+    fn sort_link(&self, by: SortBy, heading: &str) -> String {
+        let (current, descending) = (self.sort == Some(by), self.descending);
+        let flipped = Search {
+            q: self.q.clone(),
+            cat: self.cat.clone(),
+            offset: 0,
+            filters: self.filters.clone(),
+            fields: self.fields.clone(),
+            sort: Some(by),
+            descending: if current { !descending } else { matches!(by, SortBy::Size | SortBy::Posted) },
+        };
+        let query = attr(&flipped.query(&self.cat, 0));
+        let arrow = match (current, descending) {
+            (false, _) => "",
+            (true, true) => " ▼",
+            (true, false) => " ▲",
+        };
+        let state = match (current, descending) {
+            (false, _) => "none",
+            (true, true) => "descending",
+            (true, false) => "ascending",
+        };
+        format!(
+            "<a class=\"sort-link\" href=\"/?{query}\" hx-get=\"/ui/results?{query}\" hx-target=\"#results\" hx-sync=\"#search:replace\" hx-indicator=\"#busy\" aria-sort=\"{state}\">{heading}{arrow}</a>"
+        )
     }
 
     fn query(&self, cat: &str, offset: i64) -> String {
@@ -268,7 +384,13 @@ impl Search {
     /// The table rows, or a full-width diagnostic when the first page has none.
     fn body(&self) -> String {
         let filter = parse_filter(&self.cat);
-        let found = match find_releases(&self.words(), filter.as_ref(), self.offset, PAGE_SIZE) {
+        let (from, count) = if self.sort.is_some() { (0, SORT_WINDOW) } else { (self.offset, PAGE_SIZE) };
+        let searched = if self.fields.any() {
+            field_search::find(&self.fields, &self.words(), filter.as_ref(), from, count)
+        } else {
+            find_releases(&self.words(), filter.as_ref(), from, count)
+        };
+        let found = match searched {
             Ok(found) => found,
             Err(e) => {
                 eprintln!("web search failed: {e}");
@@ -287,8 +409,19 @@ impl Search {
                 format!("<tr><td colspan=\"{COLUMNS}\" class=\"note dim\">That's all of them.</td></tr>")
             };
         }
-        let page_was_full = found.len() as i64 == PAGE_SIZE;
         let mut found = found;
+        let page_was_full = if let Some(sort) = self.sort {
+            let ids: Vec<i64> = found.iter().map(|r| r.id).collect();
+            let categories = crate::category::categories_of(&ids).unwrap_or_default();
+            sort_rows(&mut found, sort, self.descending, &categories);
+            let start = usize::try_from(self.offset).unwrap_or(0).min(found.len());
+            let end = (start + PAGE_SIZE as usize).min(found.len());
+            let more = end < found.len();
+            found = found.drain(start..end).collect();
+            more
+        } else {
+            found.len() as i64 == PAGE_SIZE
+        };
         found.retain(|r| {
             let tags = release_tags::parse(&r.name);
             self.filters.iter().all(|filter| filter_matches(filter, &tags))
@@ -355,8 +488,51 @@ impl Search {
                 let _ = write!(path, "::<b>{}</b>", escape(&part.to_lowercase().replace(' ', "_")));
             }
         }
-        let sort = if self.q.is_empty() { "Newest first" } else { "Best matches first" };
-        format!("<div class=\"summary\"><span class=\"path\">{path}</span><span class=\"sort\">{sort}</span></div>")
+        let sort = match self.sort {
+            Some(by) => format!(
+                "By {} {}, among the first {SORT_WINDOW}",
+                by.word(),
+                if self.descending { "descending" } else { "ascending" }
+            ),
+            None if self.q.is_empty() => "Newest first".to_string(),
+            None => "Best matches first".to_string(),
+        };
+        let mut scope = String::new();
+        for (name, value) in self.fields.chosen() {
+            let without = Search {
+                q: self.q.clone(),
+                cat: self.cat.clone(),
+                offset: 0,
+                filters: self.filters.clone(),
+                fields: self.fields.without(name),
+                sort: self.sort,
+                descending: self.descending,
+            };
+            let query = attr(&without.query(&self.cat, 0));
+            let _ = write!(
+                scope,
+                "<a class=\"chip\" aria-current=\"true\" href=\"/?{query}\" hx-get=\"/ui/results?{query}\" hx-target=\"#results\" title=\"Remove\">{}: {} ✕</a>",
+                escape(name),
+                escape(&value)
+            );
+        }
+        let total = if self.fields.any() {
+            let filter = parse_filter(&self.cat);
+            match field_search::count(&self.fields, &self.words(), filter.as_ref()) {
+                Ok(total) => format!("<strong class=\"total\">{}</strong>", escape(&total.describe())),
+                Err(e) => {
+                    eprintln!("web count failed: {e}");
+                    String::new()
+                }
+            }
+        } else {
+            String::new()
+        };
+        format!(
+            "<div class=\"summary\"><span class=\"path\">{path}</span>{total}<span class=\"sort\">{}</span></div>{}",
+            escape(&sort),
+            if scope.is_empty() { String::new() } else { format!("<div class=\"chips\">{scope}</div>") },
+        )
     }
 }
 
@@ -458,16 +634,41 @@ fn row(
         .collect::<Vec<_>>()
         .join(" · ");
     format!(
-        "<tr><td class=\"name\">{thumb}<a href=\"/ui/release?id={id}\">{name}</a>{tags}<div class=\"row-meta\">{meta}</div></td><td class=\"col-cat dim\">{category}</td><td class=\"num col-size\">{size}</td><td class=\"dim col-posted\">{posted}</td><td class=\"dim col-group\">{group}</td><td><a class=\"button small primary\" href=\"/ui/nzb?id={id}\">NZB</a></td></tr>",
+        "<tr><td class=\"name\">{thumb}<a href=\"/ui/release?id={id}\">{name}</a>{tags}<div class=\"row-meta\">{meta}</div></td><td class=\"col-cat dim\">{category}</td><td class=\"num col-size\" title=\"{bytes} bytes\">{size}</td><td class=\"dim col-posted\">{posted}</td><td class=\"dim col-group\"><a class=\"quiet\" href=\"/?group={group_link}\">{group}</a></td><td><a class=\"button small primary\" href=\"/ui/nzb?id={id}\">NZB</a></td></tr>",
         id = r.id,
         name = escape(&r.name),
         group = escape(&r.group_name),
+        group_link = attr(&url_encode(&r.group_name)),
+        bytes = thousands(r.size.unwrap_or(0)),
     )
 }
 
-fn table(rows: &str) -> String {
+/// A link to search on a value, showing other words than the value.
+fn search_link_to(param: &str, value: &str, shown: &str) -> String {
+    format!("<a href=\"/?{param}={}\">{}</a>", attr(&url_encode(value)), escape(shown))
+}
+
+/// 2684354560 as 2,684,354,560
+fn thousands(n: i64) -> String {
+    let digits = n.unsigned_abs().to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    if n < 0 { format!("-{out}") } else { out }
+}
+
+fn table(search: &Search, rows: &str) -> String {
     format!(
-        "<div class=\"table-wrap\"><table><thead><tr><th>Name</th><th class=\"col-cat\">Category</th><th class=\"num col-size\">Size</th><th class=\"col-posted\">Posted</th><th class=\"col-group\">Group</th><th><span class=\"sr-only\">Download</span></th></tr></thead><tbody>{rows}</tbody></table></div>"
+        "<div class=\"table-wrap\"><table><thead><tr><th>{}</th><th class=\"col-cat\">{}</th><th class=\"num col-size\">{}</th><th class=\"col-posted\">{}</th><th class=\"col-group\">{}</th><th><span class=\"sr-only\">Download</span></th></tr></thead><tbody>{rows}</tbody></table></div>",
+        search.sort_link(SortBy::Name, "Name"),
+        search.sort_link(SortBy::Category, "Category"),
+        search.sort_link(SortBy::Size, "Size"),
+        search.sort_link(SortBy::Posted, "Posted"),
+        search.sort_link(SortBy::Group, "Group"),
     )
 }
 
@@ -483,7 +684,7 @@ fn diag(level: &str, title: &str, body: &str) -> String {
 /// What goes in #results for a first page.
 fn results_html(search: &Search) -> String {
     let body = search.body();
-    let content = if body.starts_with("<tr") { table(&body) } else { body };
+    let content = if body.starts_with("<tr") { table(search, &body) } else { body };
     format!("{}{}{content}", search.filter_links(), search.summary())
 }
 
@@ -500,7 +701,7 @@ fn results(args: &HashMap<String, String>) -> ApiResponse {
         results_html(&search),
         category_nav(&search, oob),
         category_input(&search.cat, oob),
-        filters_input(&search, oob),
+        scope_inputs(&search, oob),
     );
     let mut resp = html(200, body);
     // the address bar follows the search, and reloads the full page
@@ -525,10 +726,35 @@ fn category_input(cat: &str, oob: &str) -> String {
     format!("<input id=\"cat\" type=\"hidden\" name=\"cat\" value=\"{}\"{oob}>", attr(cat))
 }
 
-fn filters_input(search: &Search, oob: &str) -> String {
+/// More things to search on, with the sort: part of the form, soo typing keeps them.
+fn scope_inputs(search: &Search, oob: &str) -> String {
+    let open = if search.fields.any() { " open" } else { "" };
+    let field = |name: &str, label: &str, value: &str| {
+        format!(
+            "<label>{label}<input name=\"{name}\" value=\"{}\" autocomplete=\"off\" spellcheck=\"false\"></label>",
+            attr(value)
+        )
+    };
+    let hidden = |name: &str, value: &str| format!("<input type=\"hidden\" name=\"{name}\" value=\"{}\">", attr(value));
     format!(
-        "<input id=\"filters\" type=\"hidden\" name=\"filters\" value=\"{}\"{oob}>",
-        attr(&search.filters.join(","))
+        "<details id=\"scope\" class=\"more-fields\"{open}{oob}><summary>More fields</summary><div class=\"field-grid\">{}{}{}{}{}</div>{}{}{}</details>",
+        field("group", "Usenet group", &search.fields.group),
+        field("poster", "Poster", &search.fields.poster),
+        field("email", "Email", &search.fields.email),
+        field("size", "Exact bytes", &search.fields.size),
+        field("team", "Release group", &search.fields.team),
+        hidden("filters", &search.filters.join(",")),
+        hidden("sort", search.sort.map_or("", SortBy::word)),
+        hidden(
+            "dir",
+            if search.sort.is_none() {
+                ""
+            } else if search.descending {
+                "desc"
+            } else {
+                "asc"
+            }
+        ),
     )
 }
 
@@ -541,7 +767,7 @@ fn category_nav(search: &Search, oob: &str) -> String {
         format!("<a{class} href=\"/?{page}\" hx-get=\"/ui/results{swap}\"{current}>{}</a>", escape(name))
     };
     let mut out = format!(
-        "<nav id=\"categories\" aria-label=\"Categories\" hx-target=\"#results\" hx-include=\"#q, #filters\" hx-sync=\"#search:replace\" hx-indicator=\"#busy\"{oob}><div class=\"nav-group\">{}</div>",
+        "<nav id=\"categories\" aria-label=\"Categories\" hx-target=\"#results\" hx-include=\"#q, #scope input\" hx-sync=\"#search:replace\" hx-indicator=\"#busy\"{oob}><div class=\"nav-group\">{}</div>",
         link("", "All categories", ""),
     );
     for root in TABLE {
@@ -585,10 +811,10 @@ fn search_page(args: &HashMap<String, String>, base: &str) -> String {
             r##"{masthead}
 <div class="layout"><aside class="sidebar"><details class="navigation" open><summary>Categories</summary>{nav}</details></aside>
 <main>
-<form id="search" class="searchbar" role="search" action="/" method="get" hx-get="/ui/results" hx-target="#results" hx-sync="this:replace" hx-indicator="#busy" hx-trigger="submit, input changed delay:300ms from:#q">
+<form id="search" class="searchbar" role="search" action="/" method="get" hx-get="/ui/results" hx-target="#results" hx-sync="this:replace" hx-indicator="#busy" hx-trigger="submit, input changed delay:300ms from:#q, change from:#scope">
 <div class="search-field"><input id="q" name="q" type="search" placeholder="Search releases" value="{q}" autocomplete="off" spellcheck="false" autofocus aria-label="Search releases"><kbd>/</kbd></div>
-{cat}{filters}<button class="button primary">Search</button><span id="busy" class="busy">searching…</span>
-</form>
+{cat}<button class="button primary">Search</button><span id="busy" class="busy">searching…</span>
+{scope}</form>
 <div id="failure"></div>
 <div id="results">{results}</div>
 <footer class="footer">Newznab API: <code>{base}/api</code></footer>
@@ -597,7 +823,7 @@ fn search_page(args: &HashMap<String, String>, base: &str) -> String {
             nav = category_nav(&search, ""),
             q = attr(&search.q),
             cat = category_input(&search.cat, ""),
-            filters = filters_input(&search, ""),
+            scope = scope_inputs(&search, ""),
             results = results_html(&search),
             base = escape(base),
         ),
@@ -661,15 +887,35 @@ fn release_html(
     let parsed = release_tags::parse(&r.name);
     tags.push_str(&name_tags(&parsed));
     fact("Category", format!("<a href=\"/?cat={category}\">{}</a>", escape(&label(category).unwrap_or_default())));
-    fact("Size", escape(&fmt_size(r.size)));
+    let search_link =
+        |param: &str, value: &str| format!("<a href=\"/?{param}={}\">{}</a>", attr(&url_encode(value)), escape(value));
+    if !parsed.title.is_empty() {
+        fact("Title", search_link("q", &parsed.title));
+    }
+    if let Some(size) = r.size {
+        fact(
+            "Size",
+            format!("{} · <a href=\"/?size={size}\">{} bytes</a>", escape(&fmt_size(r.size)), thousands(size)),
+        );
+    }
     fact("Posted", escape(&fmt_date(r.posted_date.as_deref())));
-    fact("Group", escape(&r.group_name));
-    if let Some(poster) = &r.poster {
-        let poster = release_info::parse_poster(poster);
-        fact("Poster", escape(&poster.name.unwrap_or_default()));
+    let posted_name = names.map_or(r.name.as_str(), |n| n.posted.as_str());
+    let groups = release_info::groups_of(posted_name).unwrap_or_default();
+    if groups.len() > 1 {
+        let list: Vec<String> = groups
+            .iter()
+            .map(|g| format!("{} ({} articles)", search_link("group", &g.group), thousands(g.articles)))
+            .collect();
+        fact("Groups", list.join("<br>"));
+    } else {
+        fact("Group", search_link("group", &r.group_name));
+    }
+    if let Some(raw) = &r.poster {
+        let poster = release_info::parse_poster(raw);
+        fact("Poster", poster.name.as_deref().map_or(String::new(), |name| search_link_to("poster", raw, name)));
         if let Some(email) = poster.email {
             let made_up = if release_info::looks_made_up(&email) { tag("tag-warn", "MADE UP") } else { String::new() };
-            fact("Email", format!("{}{made_up}", escape(&email)));
+            fact("Email", format!("{}{made_up}", search_link("email", &email)));
         }
     }
     if let Some(n) = names {
@@ -683,21 +929,29 @@ fn release_html(
     if let Some(year) = parsed.year {
         fact("Year", year.to_string());
     }
-    let words = |list: &[&str]| escape(&list.join(", "));
-    if let Some(network) = parsed.network {
-        fact("Ripped from", escape(network));
+    if let Some(network) = &parsed.network {
+        fact("Ripped from", search_link("q", network));
+    }
+    if let Some(site) = &parsed.site {
+        fact("Site", escape(site));
     }
     fact(
         "Video",
-        escape(&[parsed.codec, parsed.bit_depth.as_deref()].into_iter().flatten().collect::<Vec<_>>().join(", ")),
+        escape(
+            &[parsed.codec.as_deref(), parsed.bit_depth.as_deref(), parsed.container.as_deref()]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join(", "),
+        ),
     );
-    fact("Audio", escape(&parsed.audio.iter().chain(&parsed.channels).copied().collect::<Vec<_>>().join(", ")));
-    fact("Languages", words(&parsed.languages));
-    if let Some(edition) = parsed.edition {
+    fact("Audio", escape(&parsed.audio.iter().chain(&parsed.channels).cloned().collect::<Vec<_>>().join(", ")));
+    fact("Languages", escape(&parsed.languages.join(", ")));
+    if let Some(edition) = &parsed.edition {
         fact("Edition", escape(edition));
     }
     if let Some(group) = &parsed.group {
-        fact("Release group", escape(group));
+        fact("Release group", search_link("team", group));
     }
     if let Some(parts) = r.parts {
         fact("Parts", parts.to_string());
@@ -1083,37 +1337,88 @@ mod tests {
 
     #[test]
     fn the_sidebar_marks_the_category_and_keeps_the_search() {
-        let search = Search { q: "a b".into(), cat: "5040".into(), offset: 0, filters: Vec::new() };
+        let search = Search {
+            q: "a b".into(),
+            cat: "5040".into(),
+            offset: 0,
+            filters: Vec::new(),
+            fields: Fields::default(),
+            sort: None,
+            descending: true,
+        };
         let nav = category_nav(&search, "");
         assert_eq!(nav.matches("aria-current").count(), 1, "{nav}");
         assert!(
             nav.contains(r#"href="/?q=a%20b&amp;cat=5040" hx-get="/ui/results?cat=5040" aria-current="page""#),
             "{nav}"
         );
-        let unknown = Search { q: String::new(), cat: "<x>".into(), offset: 0, filters: Vec::new() };
+        let unknown = Search {
+            q: String::new(),
+            cat: "<x>".into(),
+            offset: 0,
+            filters: Vec::new(),
+            fields: Fields::default(),
+            sort: None,
+            descending: true,
+        };
         assert_eq!(category_nav(&unknown, "").matches("aria-current").count(), 0);
         assert!(!category_input("\"><x>", "").contains("<x>"));
     }
 
     #[test]
     fn an_empty_result_says_why_and_how_to_widen_it() {
-        let hd = Search { q: String::new(), cat: "2040".into(), offset: 0, filters: Vec::new() }.nothing_found();
+        let hd = Search {
+            q: String::new(),
+            cat: "2040".into(),
+            offset: 0,
+            filters: Vec::new(),
+            fields: Fields::default(),
+            sort: None,
+            descending: true,
+        }
+        .nothing_found();
         assert!(hd.contains("nothing is in Movies / HD yet"), "{hd}");
         assert!(hd.contains("Look in all categories"), "{hd}");
-        let word = Search { q: "<b>".into(), cat: String::new(), offset: 0, filters: Vec::new() }.nothing_found();
+        let word = Search {
+            q: "<b>".into(),
+            cat: String::new(),
+            offset: 0,
+            filters: Vec::new(),
+            fields: Fields::default(),
+            sort: None,
+            descending: true,
+        }
+        .nothing_found();
         assert!(word.contains("&lt;b&gt;") && !word.contains("<b>"), "{word}");
         assert!(!word.contains("Look in all categories"), "{word}");
     }
 
     #[test]
     fn the_path_names_the_category() {
-        let path = Search { q: String::new(), cat: "2040".into(), offset: 0, filters: Vec::new() }.summary();
+        let path = Search {
+            q: String::new(),
+            cat: "2040".into(),
+            offset: 0,
+            filters: Vec::new(),
+            fields: Fields::default(),
+            sort: None,
+            descending: true,
+        }
+        .summary();
         assert!(path.contains("atlas::releases::<b>movies</b>::<b>hd</b>"), "{path}");
         assert!(path.contains("Newest first"), "{path}");
         assert!(
-            Search { q: "x".into(), cat: "9999".into(), offset: 0, filters: Vec::new() }
-                .summary()
-                .contains("Best matches first")
+            Search {
+                q: "x".into(),
+                cat: "9999".into(),
+                offset: 0,
+                filters: Vec::new(),
+                fields: Fields::default(),
+                sort: None,
+                descending: true
+            }
+            .summary()
+            .contains("Best matches first")
         );
     }
 
@@ -1173,6 +1478,45 @@ mod tests {
         let old = InnerView { password: Some(Password::Yes), ..InnerView::default() };
         assert_eq!(encryption_fact(&old), "Encrypted, type not recorded");
         assert_eq!(encryption_fact(&InnerView::default()), "");
+    }
+
+    fn release(id: i64, name: &str, size: Option<i64>) -> ReleaseRow {
+        ReleaseRow {
+            id,
+            name: name.into(),
+            group_name: format!("g{id}"),
+            poster: None,
+            posted_date: None,
+            size,
+            complete: true,
+            parts: None,
+        }
+    }
+
+    #[test]
+    fn every_column_sorts_both_ways() {
+        let order = |by, descending| {
+            let mut rows = vec![release(1, "b", Some(5)), release(2, "A", None), release(3, "c", Some(9))];
+            sort_rows(&mut rows, by, descending, &HashMap::new());
+            rows.iter().map(|r| r.id).collect::<Vec<_>>()
+        };
+        assert_eq!(order(SortBy::Name, false), [2, 1, 3]);
+        assert_eq!(order(SortBy::Name, true), [3, 1, 2]);
+        assert_eq!(order(SortBy::Size, false), [1, 3, 2], "no size goes last");
+        assert_eq!(order(SortBy::Size, true), [3, 1, 2], "either way");
+        assert_eq!(order(SortBy::Group, true), [3, 2, 1]);
+    }
+
+    #[test]
+    fn sort_headings_flip_and_keep_the_search() {
+        let s = Search::from_args(&parse_query("q=x&sort=size&dir=desc&email=a%40b.c"));
+        assert_eq!(s.sort, Some(SortBy::Size));
+        let link = s.sort_link(SortBy::Size, "Size");
+        assert!(link.contains("sort=size&amp;dir=asc") && link.contains("▼"), "{link}");
+        assert!(link.contains("email=a%40b.c") && link.contains("q=x"), "{link}");
+        let other = s.sort_link(SortBy::Name, "Name");
+        assert!(other.contains("sort=name&amp;dir=asc") && !other.contains("▼"), "{other}");
+        assert_eq!(thousands(2_684_354_560), "2,684,354,560");
     }
 
     #[test]

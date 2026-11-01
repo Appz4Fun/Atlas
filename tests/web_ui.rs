@@ -131,6 +131,16 @@ fn the_web_ui_end_to_end() {
             .contains(r#"name="group" value="alt.binaries.g1""#)
     );
 
+    let sorted = fetch(port, "/ui/results?sort=name&dir=asc", &cookie);
+    assert!(sorted.body.find("&lt;script&gt;").unwrap() < sorted.body.find("Tv.Findword").unwrap(), "{}", sorted.body);
+    let sorted = fetch(port, "/ui/results?sort=name&dir=desc", &cookie);
+    assert!(sorted.body.find("&lt;script&gt;").unwrap() > sorted.body.find("Tv.Findword").unwrap(), "{}", sorted.body);
+    assert!(sorted.body.contains("sort=name&amp;dir=asc"), "the heading flips: {}", sorted.body);
+    let by_group = fetch(port, "/ui/results?group=alt.binaries.g1", &cookie);
+    assert!(by_group.body.contains("Findword") && by_group.body.contains("1 release"), "{}", by_group.body);
+    assert!(!by_group.body.contains("alert(1)"), "{}", by_group.body);
+    assert_eq!(by_group.header("HX-Push-Url").as_deref(), Some("/?group=alt.binaries.g1"));
+
     let by_cat = fetch(port, "/ui/results?cat=5000", &cookie);
     assert!(by_cat.body.contains("Findword") && !by_cat.body.contains("alert(1)"), "{}", by_cat.body);
     assert!(fetch(port, "/ui/results?q=nothinglikethis", &cookie).body.contains("nothing matches"));

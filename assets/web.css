@@ -146,6 +146,17 @@ input::placeholder { color: var(--muted); }
 .busy { display: none; font: .8rem var(--font-mono); color: var(--muted); }
 .htmx-request.busy { display: inline; }
 
+.more-fields { flex: 1 0 100%; font-size: .85rem; }
+.more-fields summary { color: var(--muted); cursor: pointer; }
+.field-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 8px; margin-top: 8px; }
+.field-grid label { display: flex; flex-direction: column; gap: 3px; font-weight: 600; color: var(--muted); }
+.field-grid input { height: 34px; padding: 0 8px; font: inherit; font-weight: 400; color: var(--ink); background: var(--surface); border: 1px solid var(--line-strong); border-radius: var(--radius-sm); }
+.total { font-size: .9rem; }
+.sort-link { color: inherit; text-decoration: none; }
+.sort-link:hover { color: var(--ink); text-decoration: underline; }
+.sort-link[aria-sort="ascending"], .sort-link[aria-sort="descending"] { color: var(--rust); }
+.quiet { color: inherit; text-decoration: none; }
+.quiet:hover { color: var(--rust); text-decoration: underline; }
 .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; }
 .chip { padding: 3px 10px; font: 600 .74rem/1.5 var(--font-mono); color: var(--muted); text-decoration: none; background: var(--surface); border: 1px solid var(--line-strong); border-radius: 999px; }
 .chip:hover { color: var(--ink); border-color: var(--ink); }

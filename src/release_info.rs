@@ -178,6 +178,40 @@ pub fn contents_with(conn: &Connection, id: i64) -> Result<Contents> {
     Ok(totals)
 }
 
+/// A posting of this name in one group. The same post in several groups is a release per group.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GroupPosting {
+    pub group: String,
+    pub articles: i64,
+    pub id: i64,
+}
+
+/// Every group with a release of exactly this posted name.
+pub fn groups_of(name: &str) -> Result<Vec<GroupPosting>> {
+    groups_of_with(&db::open()?, name)
+}
+
+pub fn groups_of_with(conn: &Connection, name: &str) -> Result<Vec<GroupPosting>> {
+    let mut out = Vec::new();
+    for s in 0..store::SHARDS {
+        let mut stmt = conn.prepare_cached(&format!(
+            "select group_name, coalesce(parts, 0), id from s{s}.releases where name = ?1 limit 64"
+        ))?;
+        let rows = stmt.query_map([name], |r| {
+            Ok(GroupPosting {
+                group: r.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                articles: r.get(1)?,
+                id: r.get(2)?,
+            })
+        })?;
+        for row in rows {
+            out.push(row?);
+        }
+    }
+    out.sort_by(|a, b| b.articles.cmp(&a.articles).then_with(|| a.group.cmp(&b.group)));
+    Ok(out)
+}
+
 /// A From header, split up.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Poster {

@@ -543,13 +543,12 @@ pub fn parse(name: &str) -> Parsed {
             }
         };
         let Some(step) = step else { continue };
-        if step.remove {
-            if let Some(end) = step.index.checked_add(step.raw.len())
-                && title.is_char_boundary(step.index)
-                && title.is_char_boundary(end.min(title.len()))
-            {
-                title.replace_range(step.index..end.min(title.len()), "");
-            }
+        if step.remove
+            && let Some(end) = step.index.checked_add(step.raw.len())
+            && title.is_char_boundary(step.index)
+            && title.is_char_boundary(end.min(title.len()))
+        {
+            title.replace_range(step.index..end.min(title.len()), "");
         }
         if !step.skip_from_title && step.index > 1 && step.index < end_of_title {
             end_of_title = step.index;
@@ -558,6 +557,7 @@ pub fn parse(name: &str) -> Parsed {
             end_of_title = end_of_title.saturating_sub(step.raw.len());
         }
     }
+    fields.remove("title");
     let mut cut = end_of_title.min(title.len());
     while !title.is_char_boundary(cut) {
         cut -= 1;
