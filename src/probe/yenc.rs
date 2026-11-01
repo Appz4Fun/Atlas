@@ -81,6 +81,8 @@ pub struct RawArticle {
 /// The most body lines kept from an article. A real one of 4 MiB has about 32,000, and one of only empty lines would
 /// otherwise cost far more memory than its size.
 const MAX_LINES: usize = 262_144;
+/// The most headers kept: a real article has a few dozen.
+const MAX_HEADERS: usize = 256;
 
 /// Splits what `article_raw` returned: lines ending in `\n`, a blank line between the two parts.
 pub fn split_article(raw: &[u8]) -> RawArticle {
@@ -100,6 +102,8 @@ pub fn split_article(raw: &[u8]) -> RawArticle {
                 value.push(' ');
                 value.push_str(String::from_utf8_lossy(line).trim());
             }
+        } else if headers.len() >= MAX_HEADERS {
+            // the rest of them still have to be read past, to find the body
         } else if let Some(at) = line.iter().position(|b| *b == b':') {
             let name = String::from_utf8_lossy(&line[..at]).trim().to_string();
             let value = String::from_utf8_lossy(&line[at + 1..]).trim().to_string();
@@ -141,6 +145,15 @@ mod tests {
         let y = parse(&lines(&["=ybegin size=3 name=a", "=yend size=3 pcrc32=00000001"])).unwrap();
         assert_eq!((y.pcrc32, y.crc32), (Some(1), None));
         assert_eq!(parse(&lines(&["plain text"])), None);
+    }
+
+    #[test]
+    fn headers_cant_fill_memory() {
+        let mut raw = b"X: y\n".repeat(MAX_HEADERS * 2);
+        raw.extend(b"\nbody\n");
+        let article = split_article(&raw);
+        assert_eq!(article.headers.len(), MAX_HEADERS);
+        assert_eq!(article.lines, [b"body".to_vec()]);
     }
 
     #[test]
