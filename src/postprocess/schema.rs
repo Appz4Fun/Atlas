@@ -83,6 +83,7 @@ pub const SHARD_TABLES: &[&ShardTable] = &[
     &crate::archive::store::RELEASE,
     &crate::predb::step::MATCH,
     &crate::predb::step::INNER_KEY,
+    &crate::category::RELEASE_CATEGORY,
 ];
 
 /// nullable columns on `releases`, append only. `name_source`: NULL, the name came from

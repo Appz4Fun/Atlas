@@ -9,7 +9,7 @@ use tiny_http::{Header, Request, Response, Server};
 use crate::config::{Config, get_api_key};
 use crate::dates::pub_date;
 use crate::nzb::{build_nzb, nzb_filename};
-use crate::search::{all_releases, get_release, search_all_releases};
+use crate::search::{all_releases, get_release, newest_in_categories, search_all_releases, search_in_categories};
 use crate::ui;
 
 const WORKERS: usize = 4;
@@ -21,15 +21,13 @@ const CAPS: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
   <retention days="0"/>
   <registration available="no" open="no"/>
   <searching>
-    <search available="yes" supportedParams="q"/>
-    <tv-search available="yes" supportedParams="q,season,ep"/>
-    <movie-search available="yes" supportedParams="q"/>
-    <audio-search available="yes" supportedParams="q"/>
-    <book-search available="yes" supportedParams="q"/>
+    <search available="yes" supportedParams="q,cat,limit,offset"/>
+    <tv-search available="yes" supportedParams="q,season,ep,cat,limit,offset"/>
+    <movie-search available="yes" supportedParams="q,cat,limit,offset"/>
+    <audio-search available="yes" supportedParams="q,cat,limit,offset"/>
+    <book-search available="yes" supportedParams="q,cat,limit,offset"/>
   </searching>
-  <categories>
-    <category id="7000" name="Other"/>
-  </categories>
+  <categories><!--categories--></categories>
 </caps>"#;
 
 const XML: &str = "application/xml; charset=utf-8";
@@ -134,7 +132,11 @@ pub fn handle(path: &str, query: &str, base: &str, api_key: &str) -> ApiResponse
 
     if t == Some("caps") {
         // advertise the address the client actually used
-        return ApiResponse::xml(200, CAPS.replace("http://127.0.0.1:9090", &escape(base)));
+        return ApiResponse::xml(
+            200,
+            CAPS.replace("http://127.0.0.1:9090", &escape(base))
+                .replace("<!--categories-->", &crate::category::caps_xml()),
+        );
     }
 
     if args.get("apikey").map(String::as_str) != Some(api_key) {
@@ -149,7 +151,7 @@ pub fn handle(path: &str, query: &str, base: &str, api_key: &str) -> ApiResponse
         Some(kind @ ("search" | "tvsearch" | "movie" | "music" | "audio" | "book")) => match search_term(kind, &args) {
             Some(term) => search(&term, &args, base, api_key),
             // only an id (tvdbid, imdbid, ...): atlas has no metadata to match ids against
-            None => rss(base, api_key, 0, &[], &HashMap::new()),
+            None => rss(base, api_key, 0, &[], &HashMap::new(), &HashMap::new()),
         },
         None => ApiResponse::error(200, "Missing parameter (t)"),
         Some(_) => ApiResponse::error(203, "Function not available"),
@@ -186,16 +188,22 @@ fn search(q: &str, args: &HashMap<String, String>, base: &str, api_key: &str) ->
     let limit = args.get("limit").and_then(|v| v.trim().parse::<i64>().ok()).unwrap_or(100).clamp(1, 100);
     let offset = args.get("offset").and_then(|v| v.trim().parse::<i64>().ok()).unwrap_or(0).max(0);
 
-    let releases = if q.trim().is_empty() {
-        all_releases(offset / limit, limit)
-    } else {
-        search_all_releases(q, offset / limit, limit)
+    let filter = args.get("cat").and_then(|c| crate::category::parse_filter(c));
+    let releases = match (&filter, q.trim().is_empty()) {
+        (None, true) => all_releases(offset / limit, limit),
+        (None, false) => search_all_releases(q, offset / limit, limit),
+        (Some(f), true) => newest_in_categories(f, offset, limit).map(|p| p.rows),
+        (Some(f), false) => search_in_categories(q, f, offset, limit),
     };
 
     match releases {
         Ok(r) => {
             let ids: Vec<i64> = r.iter().map(|release| release.id).collect();
-            rss(base, api_key, offset, &r, &crate::archive::store::passwords(&ids))
+            let categories = crate::category::categories_of(&ids).unwrap_or_else(|e| {
+                eprintln!("api categories failed: {e}");
+                HashMap::new()
+            });
+            rss(base, api_key, offset, &r, &crate::archive::store::passwords(&ids), &categories)
         }
         Err(e) => {
             eprintln!("api search failed: {e}");
@@ -210,6 +218,7 @@ fn rss(
     offset: i64,
     releases: &[crate::search::ReleaseRow],
     passwords: &HashMap<i64, crate::archive::Password>,
+    categories: &HashMap<i64, i64>,
 ) -> ApiResponse {
     let items: String = releases
         .iter()
@@ -219,8 +228,9 @@ fn rss(
             let password = passwords
                 .get(&r.id)
                 .map_or(String::new(), |p| format!("<newznab:attr name=\"password\" value=\"{}\"/>", p.code()));
+            let category = categories.get(&r.id).copied().unwrap_or(crate::category::UNCATEGORIZED);
             format!(
-                "    <item>      <title>{}</title>      <guid isPermaLink=\"false\">{}</guid>      <link>{}</link>      <size>{size}</size>      <pubDate>{}</pubDate>      <enclosure url=\"{}\" type=\"application/x-nzb\" length=\"{size}\"/>      <newznab:attr name=\"category\" value=\"7000\"/>{password}    </item>",
+                "    <item>      <title>{}</title>      <guid isPermaLink=\"false\">{}</guid>      <link>{}</link>      <size>{size}</size>      <pubDate>{}</pubDate>      <enclosure url=\"{}\" type=\"application/x-nzb\" length=\"{size}\"/>      <newznab:attr name=\"category\" value=\"{category}\"/>{password}    </item>",
                 escape(&r.name),
                 r.id,
                 escape(&nzb_url),
@@ -437,10 +447,46 @@ mod tests {
             parts: None,
         };
         let passwords = HashMap::from([(1, Password::Yes), (2, Password::Maybe)]);
-        let body = rss("http://x", "k", 0, &[row(1), row(2), row(3)], &passwords).body;
+        let body = rss("http://x", "k", 0, &[row(1), row(2), row(3)], &passwords, &HashMap::new()).body;
         assert!(body.contains(r#"<newznab:attr name="password" value="1"/>"#), "{body}");
         assert!(body.contains(r#"<newznab:attr name="password" value="2"/>"#), "{body}");
         assert_eq!(body.matches("name=\"password\"").count(), 2);
         assert_eq!(body.matches("name=\"category\"").count(), 3);
+    }
+
+    #[test]
+    fn rss_reports_the_category_and_defaults_to_8000() {
+        let row = |id: i64| crate::search::ReleaseRow {
+            id,
+            name: format!("r{id}"),
+            group_name: "g".into(),
+            poster: None,
+            posted_date: None,
+            size: None,
+            complete: true,
+            parts: None,
+        };
+        let categories = HashMap::from([(1, 5040)]);
+        let body = rss("http://x", "k", 0, &[row(1), row(2)], &HashMap::new(), &categories).body;
+        assert!(body.contains(r#"name="category" value="5040""#), "{body}");
+        assert!(body.contains(r#"name="category" value="8000""#), "{body}");
+    }
+
+    #[test]
+    fn caps_lists_real_categories() {
+        let body = handle("/api", "t=caps", "http://x", "k").body;
+        for want in [
+            r#"<category id="5000" name="TV">"#,
+            r#"<subcat id="5040" name="HD"/>"#,
+            r#"<category id="7000" name="Books">"#,
+            r#"<category id="8000" name="Other">"#,
+        ] {
+            assert!(body.contains(want), "{want}: {body}");
+        }
+        for (start, _) in body.match_indices("supportedParams=\"") {
+            let params = &body[start + 17..];
+            let params = &params[..params.find('"').unwrap()];
+            assert!(params.split(',').any(|p| p == "cat"), "{params}");
+        }
     }
 }

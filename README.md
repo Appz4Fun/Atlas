@@ -48,6 +48,7 @@ rustup installs the pinned toolchain the first time you build, and the `just` re
 - **Use all your Usenet servers at once.** List as many providers as you like in `config.json`. Every server indexes in parallel and keeps its connections busy. For example, 4 servers with 25 connections each keep 100 requests in flight.
 - **Index fast.** Atlas splits header requests into slices that stream over all connections, saves each slice the moment it arrives, and indexes many groups at the same time. When the server supports it, Atlas requests compressed header listings with `XFEATURE COMPRESS GZIP`.
 - **Handle real providers.** Atlas detects fill and bonus servers that only serve articles, lowers its own connection count when a provider refuses more, and pauses servers that reject the login instead of retrying them constantly.
+- **Real categories.** Atlas gives each release a Newznab category and honors `cat`, parents included.
 - **Group posts into releases.** Atlas parses subjects into releases, marks incomplete sets, and recovers the real names of obfuscated posts from their par2 or nfo files.
 - **Serve a Newznab API** for Prowlarr, NZBHydra2, Sonarr, and Radarr: `search`, `tvsearch`, `movie`, `music`, `book`, `caps`, and `get`, which downloads an NZB.
 - **Search from the terminal** in one group or all groups, or use **AI search**, which turns a request like `find me 4k hdr movies` into groups and keywords with a local [Ollama](https://ollama.com) model.
@@ -144,6 +145,7 @@ On first run, Atlas asks for one server (host, username, password, and port) and
 | `archive` | see below | Reading archives, PAR2 sets, and NFOs inside releases. See [Archive inspection](#archive-inspection). |
 | `naming` | see below | Giving releases with junk names better ones. See [Name fixing](#name-fixing). |
 | `predb` | see below | A catalogue of scene and P2P titles, off by default. See [PreDB](#predb). |
+| `category` | see below | How releases get a category. See [Categories](#categories). |
 | `max_unsaved_headers` | `500000` | Headers the indexer fetches ahead of saving them, over all groups at once. This bounds its memory: 500,000 headers take about 0.3 GB. A header request waits for room before it goes out, and its room comes back once its slice is saved. Raise it if the Bottleneck page shows it full while the database writers and connections have time to spare. Set below `request_size`, header requests are cut down to it, which makes them small and slow. |
 
 Atlas keeps any other keys you add to the file when it saves it.
@@ -461,7 +463,7 @@ Menu option 5 shows the indexer status, totals, a graph of headers per second ov
 - **All groups:** searches everything you've indexed.
 - **Obfuscated posts:** lists releases that still only have a random name, including dotted, hyphenated, and short random names. A flagged name with no real name stays out of search.
 
-Searches match both the posted name and the real name found in par2 and nfo files. A post of several files shows the name of one of its files until a better name is found. Choose a result to see its files, what's inside them if Atlas has read that, whether it's passworded, and save its NZB.
+Searches match both the posted name and the real name found in par2 and nfo files. A post of several files shows the name of one of its files until a better name is found. Results show each release's category, or `-` if it has none yet. Choose a result to see its files, what's inside them if Atlas has read that, whether it's passworded, and save its NZB.
 
 AI search lets you describe what you want in plain language, for example `find me 4k hdr movies`. The AI picks the groups and keywords, then fetches anything missing from your database. It needs [Ollama](https://ollama.com) running with the `qwen3:4b` model, or the model set in `ATLAS_AI_MODEL`. Speed depends on your hardware.
 
@@ -504,6 +506,7 @@ The **Usenet history** panel converts those articles into time. While indexing, 
 Shows release counts across the whole database:
 
 - Releases that are complete, obfuscated with no recovered real name, or have a recovered real name.
+- Releases per category, and how many have none yet, which the API reports as `8000`.
 - The NZBs you can build from what's indexed: every release with at least one saved article, and how many of those are complete.
 - The total size the articles represent.
 - The biggest release and the largest groups.
@@ -571,7 +574,7 @@ Atlas knows release names only. It doesn't know TVDB or IMDb IDs. A search with 
 | `apikey` | all except `caps` | Your API key. |
 | `q` | searches | Words matched against posted and real release names. |
 | `season`, `ep` | `tvsearch` | Season and episode, matched as `S01E02`. |
-| `cat` | searches | Accepted for compatibility. Every release is in category `7000`. |
+| `cat` | searches | A comma list of categories. A parent includes its subs, so `5000` includes `5040`. `-1` or text that isn't a number means no filter, and an id that doesn't exist matches nothing. See [Categories](#categories). |
 | `limit` | searches | Maximum results. The default and the maximum are both `100`. |
 | `offset` | searches | Result offset for paging. |
 | `id` | `get` | Release ID from a result's `<guid>`. |
@@ -597,7 +600,38 @@ curl -OJ "http://localhost:9090/api?t=get&id=1234&apikey=$KEY"
 - **URL:** `http://ATLAS_HOST:9090`
 - **API path:** `/api`
 - **API key:** `api_key` from `config.json`
-- **Category:** `Other (7000)`
+- **Categories:** the ones you want, for example `TV (5000)`, `Movies (2000)`, and `Other (8000)` to see everything else.
+
+### Categories
+
+Each settled release gets a real Newznab category from its final name, its group, and its poster. It re-runs when the name improves. No network, and no article bodies.
+
+| Root | Sub-categories |
+|---|---|
+| 1000 Console | 1010 NDS, 1020 PSP, 1030 Wii, 1040 Xbox, 1050 Xbox 360, 1060 WiiWare VC, 1070 Xbox 360 DLC, 1080 PS3, 1110 3DS, 1120 PS Vita, 1130 WiiU, 1140 Xbox One, 1180 PS4, 1999 Other |
+| 2000 Movies | 2010 Foreign, 2030 SD, 2040 HD, 2045 UHD, 2050 3D, 2060 BluRay, 2070 DVD, 2080 WEBDL, 2090 X265, 2999 Other |
+| 3000 Audio | 3010 MP3, 3020 Video, 3030 Audiobook, 3040 Lossless, 3050 Podcast, 3060 Foreign, 3999 Other |
+| 4000 PC | 4010 0day, 4020 ISO, 4030 Mac, 4040 Phone-Other, 4050 Games, 4060 Phone-IOS, 4070 Phone-Android |
+| 5000 TV | 5010 WEB-DL, 5020 Foreign, 5030 SD, 5040 HD, 5045 UHD, 5060 Sport, 5070 Anime, 5080 Documentary, 5090 X265, 5999 Other |
+| 6000 XXX | 6010 DVD, 6020 WMV, 6030 XviD, 6040 x264, 6041 HD Clips, 6042 SD Clips, 6045 UHD, 6046 VR, 6047 OnlyFans, 6050 Packs, 6060 Imageset, 6080 SD, 6090 WEBDL, 6999 Other |
+| 7000 Books | 7010 Magazines, 7020 Ebook, 7030 Comics, 7040 Technical, 7060 Foreign, 7999 Other |
+| 8000 Other | 8010 Misc, 8020 Hashed |
+
+A category arrives after a release settles: 15 minutes if it's complete, 2 hours otherwise. Your existing releases get theirs on the walk, newest first.
+
+A release with no stored category reports `8000` and matches `cat=8000`. That covers everything not reached yet, rejected, unrecognized, or hidden. `cat=8020` holds only visible names with a hash in them, because other hashed names are hidden or stay under `8000`.
+
+**`7000` is Books, not Other as Atlas reported it before.** If a client has Other (`7000`) saved, change it to `8000`.
+
+These go in a `category` object:
+
+| Key | Default | What it does |
+|---|---|---|
+| `enabled` | `true` | Run the step. Off: no new categories, and existing ones are still served. |
+| `foreign` | `true` | Foreign rules on. |
+| `web_dl` | `false` | WEB-DL goes to 5010 and 2080. Off: 5040 and 2040, the HD categories clients search by default. |
+
+`foreign` and `web_dl` change only what's processed next. `atlas --reprocess --step category --apply` applies them to old releases.
 
 ### Search results
 
@@ -608,7 +642,7 @@ Each `<item>` contains:
 - `<link>` and `<enclosure>`: the NZB URL.
 - `<size>`: the size in bytes.
 - `<pubDate>`: the post date in RFC 2822 format.
-- `<newznab:attr name="category" value="7000"/>`.
+- `<newznab:attr name="category" value="5040"/>`: its category, or `8000` when it has none yet.
 - `<newznab:attr name="password" value="N"/>`: 0 no, 1 yes, 2 maybe. It's left out when nothing is known.
 
 `t=get` answers with `application/x-nzb` and a `Content-Disposition` attachment that holds a valid NZB 1.1 file built from the indexed articles, so a downloader can fetch it directly from the URL.
@@ -680,6 +714,7 @@ CI (`.github/workflows/ci.yml`) checks formatting, runs clippy, and runs the tes
 | `src/naming/` | The obfuscation check, the judge of a name, cleaning, the naming regexes, the naming steps, and `--reflag-obfuscated` and `--unname`. |
 | `data/`, `scripts/` | The regex tables built into the binary, and the scripts that convert them from upstream. |
 | `src/predb/` | The PreDB file, its feeds and polling, matching, the late path, and `--predb-import`. |
+| `src/category/` | The category table, the rules, and the step that stores them. |
 | `src/archive/` | Reading file lists from RAR, ZIP, 7z, and PAR2 headers, and the steps that store them. |
 | `src/collections.rs`, `data/collection_regexes.tsv` | Which articles belong to one post: per-group regexes and a generic cleaner. `scripts/collection_regexes_to_tsv.py` makes the data file from the upstream seeder. |
 | `src/filters.rs` | What Atlas refuses to index: posts obfuscated per article and blocked groups. |
@@ -705,7 +740,6 @@ CI (`.github/workflows/ci.yml`) checks formatting, runs clippy, and runs the tes
 - A pack merges only when each file's `[n/m]` equals its own number, so a pack with an nfo first stays by file.
 - Album tracks named with the track number first stay by file.
 - Deobfuscation works only when a release has a usable name in a par2 file, an nfo file, or the first article of an archive. A 7z or a ZIP needs its last article too.
-- Atlas reports every release as category `7000` (Other), so clients that only search TV or movie categories might skip it.
 - Search matches release names only, so searches by ID, such as TVDB or IMDb, return nothing.
 
 ## Credits
@@ -716,7 +750,7 @@ AI helped with bug fixes, refactoring, SABnzbd integration, the background index
 
 The Rust port, with multi-server parallel indexing, the async NNTP client, the stats dashboard, and the extended Newznab API, lives in the [Appz4Fun fork](https://github.com/Appz4Fun/Atlas).
 
-The rule for articles obfuscated per article, the collection regexes and cleaner, the release rules, the rules for choosing what to read in a release, the naming regexes and name fixing, and the PreDB feeds and matching rules are ported from [newznab-tmux](https://github.com/xbmc4lyfe/newznab-tmux), GPLv3. 7z headers are decoded with [lzma-rs](https://github.com/gendx/lzma-rs), MIT.
+The rule for articles obfuscated per article, the collection regexes and cleaner, the release rules, the rules for choosing what to read in a release, the naming regexes and name fixing, the PreDB feeds and matching rules, and the category rules and lists are ported from [newznab-tmux](https://github.com/xbmc4lyfe/newznab-tmux), GPLv3. 7z headers are decoded with [lzma-rs](https://github.com/gendx/lzma-rs), MIT.
 
 ## License
 

@@ -7,7 +7,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use atlas::archive::store::{INSERT_FILE, SOURCE_PAR2, SOURCE_RAR};
-use atlas::config::{Config, NamingConfig, PostprocessConfig};
+use atlas::config::{CategoryConfig, Config, NamingConfig, PostprocessConfig};
 use atlas::indexer::shared_db;
 use atlas::naming::{NAMING, NFO};
 use atlas::nntp::Pool;
@@ -26,7 +26,11 @@ const SCENE: &str = "Real.Movie.2024.1080p.WEB-DL.x264-GRP";
 const NAMED: i64 = mask(NAMING);
 
 fn config() -> Config {
-    Config { postprocess: PostprocessConfig { min_size_bytes: 0, ..quick_config() }, ..Config::default() }
+    Config {
+        postprocess: PostprocessConfig { min_size_bytes: 0, ..quick_config() },
+        category: CategoryConfig { enabled: false, ..Default::default() },
+        ..Config::default()
+    }
 }
 
 fn with_bodies() -> Config {

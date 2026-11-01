@@ -7,7 +7,7 @@ use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use atlas::archive::store::{INSERT_FILE, SOURCE_PAR2, SOURCE_RAR};
-use atlas::config::{Config, PostprocessConfig, PredbConfig};
+use atlas::config::{CategoryConfig, Config, PostprocessConfig, PredbConfig};
 use atlas::indexer::shared_db;
 use atlas::naming::{NAMING, NameSource};
 use atlas::nntp::Pool;
@@ -30,6 +30,7 @@ fn config() -> Config {
     Config {
         postprocess: PostprocessConfig { min_size_bytes: 0, ..quick_config() },
         predb: PredbConfig { enabled: true, ..Default::default() },
+        category: CategoryConfig { enabled: false, ..Default::default() },
         ..Config::default()
     }
 }
@@ -278,7 +279,7 @@ fn the_first_match_of_a_title_reruns_later_parts() {
     titles(&h, &[T]);
     let file = format!("{T}.mkv");
     h.save(&[release_of(&file, &file, 2, 2)]);
-    let later = TestStep::new(24, "later", 400, Needs::Database, &log);
+    let later = TestStep::new(25, "later", 410, Needs::Database, &log);
     let mut all = steps::all();
     all.push(later.arc());
     start(&mut h, config(), all);

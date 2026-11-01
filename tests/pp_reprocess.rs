@@ -195,7 +195,8 @@ fn a_walks_request_waits_for_a_release_still_settling() {
     let step = TestStep::new(9, "db", 200, Needs::Database, &log);
     h.start(vec![step.arc()], PostprocessConfig { settle_secs: 2, complete_settle_secs: 2, ..Default::default() });
     wait_for("the step runs again", || runs_of(&log, "db") == 1);
-    assert_eq!(h.bits("Rel.One").unwrap().0, bit);
+    // a run is logged before its result is written
+    wait_for("its bit", || h.bits("Rel.One").is_some_and(|b| b.0 == bit));
 }
 
 #[test]

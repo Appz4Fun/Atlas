@@ -7,7 +7,7 @@ use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 use atlas::archive::store::{INSERT_FILE, SOURCE_RAR};
-use atlas::config::{Config, PostprocessConfig, PredbConfig};
+use atlas::config::{CategoryConfig, Config, PostprocessConfig, PredbConfig};
 use atlas::indexer::shared_db;
 use atlas::nntp::Pool;
 use atlas::parser::Release;
@@ -82,6 +82,7 @@ fn stage_on(h: &mut Harness) {
     let config = Config {
         postprocess: PostprocessConfig { min_size_bytes: 0, ..quick_config() },
         predb: PredbConfig { enabled: true, ..Default::default() },
+        category: CategoryConfig { enabled: false, ..Default::default() },
         ..Config::default()
     };
     h.stage = Some(Stage::start(StageParams {
