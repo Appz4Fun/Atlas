@@ -636,8 +636,12 @@ fn an_outage_costs_no_attempt() {
         listener.local_addr().unwrap().port()
     };
     start_with(&mut h, dead, config(), steps::all());
-    wait_for("it moved on", || h.bits("x").is_some() && h.field("x", "net_next_at") > chrono::Utc::now().timestamp());
-    assert_eq!(h.field("x", "net_attempts"), 0);
+    // a run counts an attempt ahead of itself, and the outage gives it back with the pause: read them together
+    wait_for("it moved on with no attempt used", || {
+        h.bits("x").is_some()
+            && h.field("x", "net_next_at") > chrono::Utc::now().timestamp()
+            && h.field("x", "net_attempts") == 0
+    });
     assert_eq!(h.bits("x").unwrap().0 & LIST_DONE, 0, "it isnt done");
     assert!(rows(&h, "x").is_empty());
 }
