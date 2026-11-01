@@ -748,7 +748,7 @@ pub(crate) fn index_release(conn: &Connection, key: &IdKey, release_id: i64) -> 
     for file_id in ids {
         let mut insert =
             conn.prepare_cached("insert or ignore into release_ids (release_id, id_hash, file_id) values (?, ?, ?)")?;
-        // the blob is bounded by SEAL_MAX_SEGMENTS; the rows are not, so they
+        // the blob is bounded by READ_MAX_SEGMENTS; the rows are not, so they
         // stream from the cursor one at a time
         for s in sealed_segments(conn, file_id)?.unwrap_or_default() {
             insert.execute(params![release_id, key.hash(&seg_key(conn, &mut suffixes, &s)?), file_id])?;
@@ -792,6 +792,11 @@ pub const SEAL_AGE: i64 = 3 * 86_400;
 /// have a few thousand parts at most.
 pub const SEAL_MAX_SEGMENTS: i64 = 50_000;
 
+/// The most a stored blob may hold when read. Older files can hold more than `SEAL_MAX_SEGMENTS`, and refusing them
+/// stops every save and NZB that touches them, so a late article could never join its release. This only guards
+/// against a corrupt count: nothing seals past `SEAL_MAX_SEGMENTS`.
+pub const READ_MAX_SEGMENTS: i64 = 1_000_000;
+
 /// sql: file `f` has more than SEAL_MAX_SEGMENTS rows, counting no further
 /// than one past
 fn too_many_rows() -> String {
@@ -805,14 +810,13 @@ fn blob_error(e: std::io::Error) -> rusqlite::Error {
     rusqlite::Error::ToSqlConversionFailure(Box::new(e))
 }
 
-/// a sealed file's blob, decoded; none when the file isnt sealed. A blob
-/// holds SEAL_MAX_SEGMENTS at most (sealing sees to that): one with more is
-/// an error, not something to decode into memory.
+/// a sealed file's blob, decoded; none when the file isnt sealed. One past
+/// `READ_MAX_SEGMENTS` is an error, not something to decode into memory.
 fn sealed_segments(conn: &Connection, file_id: i64) -> Result<Option<Vec<crate::blob::Seg>>> {
     conn.prepare_cached("select blob from files where id = ? and blob is not null")?
         .query_row([file_id], |r| r.get::<_, Vec<u8>>(0))
         .optional()?
-        .map(|b| crate::blob::decode_capped(&b, SEAL_MAX_SEGMENTS as usize).map_err(blob_error))
+        .map(|b| crate::blob::decode_capped(&b, READ_MAX_SEGMENTS as usize).map_err(blob_error))
         .transpose()
 }
 
@@ -2104,13 +2108,55 @@ mod tests {
     }
 
     #[test]
-    fn a_sealed_blob_past_the_cap_is_an_error_not_a_decode() {
-        let conn = sealed_files(1, SEAL_MAX_SEGMENTS + 1);
+    fn a_sealed_blob_past_the_read_cap_is_an_error_not_a_decode() {
+        let conn = sealed_files(1, READ_MAX_SEGMENTS + 1);
         let mut cache = SealedCache::new();
         assert!(cache.contains(&conn, 1, b"1-1", 1).is_err());
         assert!(cache.files.is_empty());
-        let conn = sealed_files(1, SEAL_MAX_SEGMENTS);
-        assert!(cache.contains(&conn, 1, b"1-1", 1).unwrap(), "the cap itself is fine");
+    }
+
+    /// Older builds left blobs past `SEAL_MAX_SEGMENTS`. They have to stay readable, or
+    /// no save or NZB touching one can work, and a late article never joins its release.
+    #[test]
+    fn a_blob_past_the_seal_cap_still_takes_late_articles() {
+        let (_dir, main) = sealed_fixture();
+        let conn = db::open_shard(&shard_path(&main, shard_of("alt.binaries.t"))).unwrap();
+        let (file, release_id): (i64, i64) = conn
+            .query_row("select id, release_id from files where filename = 'a.rar'", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        let oversized: Vec<crate::blob::Seg> = (0..SEAL_MAX_SEGMENTS + 5)
+            .map(|p| crate::blob::Seg {
+                part: Some(p + 10),
+                bytes: 1,
+                domain: 0,
+                local: format!("old{p}").into_bytes(),
+            })
+            .collect();
+        conn.execute("update files set blob = ? where id = ?", params![crate::blob::encode(&oversized), file]).unwrap();
+        conn.execute("delete from segments where file_id = ?", [file]).unwrap();
+
+        let late = Article {
+            message_id: "<late@x>".into(),
+            subject: "\"a.rar\" yEnc (9/9)".into(),
+            filename: Some("a.rar".into()),
+            part: Some(9),
+            total_parts: Some(9),
+            bytes: 7,
+            ..Default::default()
+        };
+        let release =
+            Release { name: "Rel".into(), group: "alt.binaries.t".into(), articles: vec![late], ..Default::default() };
+        save(&main, &[release]).unwrap();
+
+        let rows: i64 =
+            conn.query_row("select count(*) from segments where file_id = ?", [file], |r| r.get(0)).unwrap();
+        assert_eq!(rows, 1, "the late article stays a row: the blob isn't growing");
+        let read = articles(&db::open_with_shards(&main).unwrap(), release_id).unwrap();
+        assert_eq!(
+            read.iter().filter(|a| a.filename.as_deref() == Some("a.rar")).count() as i64,
+            SEAL_MAX_SEGMENTS + 6
+        );
+        assert_eq!(seal_file(&conn, file).unwrap(), 0, "it doesn't seal bigger");
     }
 
     #[test]
