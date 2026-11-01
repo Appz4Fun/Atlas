@@ -34,11 +34,13 @@ pub const FINGERPRINT: ShardTable = ShardTable {
         ),
     ],
     release_key: Some("release_id"),
-    added: &[("par2_block", "INTEGER"), ("par2_blocks", "INTEGER")],
+    added: &[("par2_block", "INTEGER"), ("par2_blocks", "INTEGER"), ("posted_names", "BLOB")],
 };
 
 pub const SET_POSTED: &str = "insert into release_fingerprint (release_id, posted) values (?1, ?2)
     on conflict(release_id) do update set posted = excluded.posted";
+pub const SET_POSTED_NAMES: &str = "insert into release_fingerprint (release_id, posted_names) values (?1, ?2)
+    on conflict(release_id) do update set posted_names = excluded.posted_names";
 pub const SET_PAR2_SIZES: &str =
     "insert into release_fingerprint (release_id, par2_block, par2_blocks) values (?1, ?2, ?3)
     on conflict(release_id) do update set par2_block = excluded.par2_block, par2_blocks = excluded.par2_blocks";
@@ -63,6 +65,31 @@ pub fn posted_fingerprint(files: &[Par2File]) -> Option<Vec<u8>> {
         sha.update(md5);
     }
     Some(sha.finalize().to_vec())
+}
+
+/// The same, with each file's name. Two equal ones have the same bytes under each name, which is what filling one's
+/// gaps from the other by file name takes: the same files under swapped names are still twins, but not this.
+pub fn posted_names_fingerprint(files: &[Par2File]) -> Option<Vec<u8>> {
+    if files.is_empty() {
+        return None;
+    }
+    let mut named: Vec<(&str, u64, [u8; 16])> = files.iter().map(|f| (f.name.as_str(), f.size, f.md5)).collect();
+    named.sort_unstable();
+    named.dedup();
+    let mut sha = Sha1::new();
+    for (name, size, md5) in named {
+        sha.update((name.len() as u64).to_le_bytes());
+        sha.update(name.as_bytes());
+        sha.update(size.to_le_bytes());
+        sha.update(md5);
+    }
+    Some(sha.finalize().to_vec())
+}
+
+fn posted_names(conn: &Connection, id: i64) -> Option<Vec<u8>> {
+    let s = store::shard_of_id(id);
+    let sql = format!("select posted_names from s{s}.release_fingerprint where release_id = ?");
+    conn.query_row(&sql, [id], |r| r.get(0)).ok().flatten()
 }
 
 fn is_archive(name: &str) -> bool {
@@ -420,6 +447,13 @@ pub fn fill_gaps(own: &mut Vec<ArticleRow>, twin: &[ArticleRow]) -> usize {
     added
 }
 
+/// Whether a twin of this release can lend it articles.
+pub fn can_fill(id: i64, copies: &[(Copy, ReleaseRow)]) -> bool {
+    let Ok(conn) = db::open() else { return false };
+    let names = posted_names(&conn, id);
+    names.is_some() && copies.iter().any(|(kind, r)| *kind == Copy::Twin && posted_names(&conn, r.id) == names)
+}
+
 /// A release's NZB, its gaps filled from its twins.
 pub fn filled_nzb(id: i64) -> db::Result<Option<String>> {
     let conn = db::open()?;
@@ -428,8 +462,9 @@ pub fn filled_nzb(id: i64) -> db::Result<Option<String>> {
     if articles.is_empty() {
         return Ok(None);
     }
+    let names = posted_names(&conn, id);
     for (kind, twin) in copies_with(&conn, id)? {
-        if kind == Copy::Twin {
+        if kind == Copy::Twin && names.is_some() && posted_names(&conn, twin.id) == names {
             fill_gaps(&mut articles, &store::articles(&conn, twin.id)?);
         }
     }
@@ -441,6 +476,15 @@ mod tests {
     use super::*;
 
     const GB: u64 = 1 << 30;
+
+    #[test]
+    fn swapped_names_are_twins_but_cant_lend_articles() {
+        let file = |name: &str, md5: u8| Par2File { name: name.into(), ..par2(GB, md5) };
+        let (one, swapped) = ([file("a.rar", 1), file("b.rar", 2)], [file("a.rar", 2), file("b.rar", 1)]);
+        assert_eq!(posted_fingerprint(&one), posted_fingerprint(&swapped));
+        assert_ne!(posted_names_fingerprint(&one), posted_names_fingerprint(&swapped));
+        assert_eq!(posted_names_fingerprint(&one), posted_names_fingerprint(&[file("b.rar", 2), file("a.rar", 1)]));
+    }
 
     fn par2(size: u64, md5: u8) -> Par2File {
         Par2File { set_id: [0; 16], file_id: [0; 16], md5: [md5; 16], md5_16k: [0; 16], size, name: "x".into() }

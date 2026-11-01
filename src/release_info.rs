@@ -288,7 +288,11 @@ static PASSWORD: LazyLock<Regex> = LazyLock::new(|| {
 /// A guess from text, soo nothing has tried it.
 pub fn find_password(text: &str) -> Option<String> {
     let hit = PASSWORD.captures(text)?;
-    let found = hit.get(1).or_else(|| hit.get(2))?.as_str().trim_matches(|c: char| c == '.' || c == ',');
+    // the braces say where it ends: only a bare password can have a sentence's punctuation after it
+    let found = match hit.get(1) {
+        Some(braced) => braced.as_str(),
+        None => hit.get(2)?.as_str().trim_matches(|c: char| c == '.' || c == ','),
+    };
     let none = ["none", "no", "n/a", "na", "nil", "-", "free", "not", "yes", ""];
     (!none.iter().any(|word| found.eq_ignore_ascii_case(word))).then(|| found.to_string())
 }
@@ -413,6 +417,8 @@ mod tests {
     fn passwords_are_found_where_posters_leave_them() {
         assert_eq!(find_password("Some.Movie.2024.{{s3cret!}}.rar").as_deref(), Some("s3cret!"));
         assert_eq!(find_password("Password: hunter2").as_deref(), Some("hunter2"));
+        assert_eq!(find_password("Password: hunter2.").as_deref(), Some("hunter2"), "the end of a sentence");
+        assert_eq!(find_password("Movie.{{.secret,}}.rar").as_deref(), Some(".secret,"), "the braces say where");
         assert_eq!(find_password("PW=abc123, enjoy").as_deref(), Some("abc123"));
         assert_eq!(find_password("password is: abc").as_deref(), Some("abc"));
         assert_eq!(find_password("Password: none"), None);
