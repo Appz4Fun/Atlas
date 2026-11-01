@@ -1044,7 +1044,13 @@ fn bounded(n: i64, bound: i64) -> String {
 fn draw_postprocess(f: &mut Frame, app: &App, area: Rect) {
     let p = &app.stats["postprocess"];
     let n = |key: &str| p[key].as_i64().unwrap_or(0);
-    let [top, bottom] = Layout::vertical([Constraint::Length(9), Constraint::Min(8)]).areas(area);
+    let predb = &app.stats["predb"];
+    let predb_height = if predb.is_object() { 6 + predb["sources"].as_array().map_or(0, Vec::len) as u16 } else { 0 };
+    let [top, bottom, predb_area] =
+        Layout::vertical([Constraint::Length(9), Constraint::Min(8), Constraint::Length(predb_height)]).areas(area);
+    if predb.is_object() {
+        draw_predb(f, predb, predb_area);
+    }
     let [a, b] = Layout::horizontal([Constraint::Ratio(1, 2); 2]).areas(top);
     let [c, d] = Layout::horizontal([Constraint::Ratio(1, 2); 2]).areas(bottom);
 
@@ -1087,6 +1093,26 @@ fn draw_postprocess(f: &mut Frame, app: &App, area: Rect) {
     let reasons = ["blocked", "empty", "too_small", "fragment", "too_few_files", "par2_only"];
     let rejected: Vec<Line> = reasons.iter().map(|r| kv(r, count(p["rejected"][*r].as_i64().unwrap_or(0)))).collect();
     f.render_widget(Paragraph::new(rejected).block(panel("rejected")), d);
+}
+
+/// The catalogue of titles, off unless `predb.enabled`. Only what stats.json says.
+fn draw_predb(f: &mut Frame, p: &Value, area: Rect) {
+    let n = |key: &str| p[key].as_i64().unwrap_or(0);
+    let now = chrono::Utc::now().timestamp();
+    let mut lines = vec![
+        kv("titles", count(n("titles"))),
+        kv("file", human_bytes(p["file_bytes"].as_f64().unwrap_or(0.0))),
+        kv("late queue behind", count(n("late_behind"))),
+        kv("late reruns", count(p["late"]["reruns"].as_i64().unwrap_or(0))),
+    ];
+    for source in p["sources"].as_array().map_or(&[][..], Vec::as_slice) {
+        let ago = source["last_ok_at"].as_i64().map_or("never".to_string(), |t| format!("{} ago", human_time(now - t)));
+        let next = human_time((source["next_poll_at"].as_i64().unwrap_or(now) - now).max(0));
+        let error = source["last_error"].as_str().map_or(String::new(), |e| format!(", {e}"));
+        let key = source["key"].as_str().unwrap_or("?");
+        lines.push(kv(key, format!("ok {ago}, next in {next}{error}")));
+    }
+    f.render_widget(Paragraph::new(lines).block(panel("PreDB")), area);
 }
 
 fn draw_bottleneck(f: &mut Frame, app: &App, area: Rect) {
@@ -1535,6 +1561,8 @@ mod tests {
             stats: serde_json::json!({
                 "postprocess": {"queue_due": 3, "net_wanted": 1, "failed": 0, "walk": {"done": 5, "total": 20, "rows": 2},
                     "rejected": {"fragment": 2}, "backlog_per_second": 2000},
+                "predb": {"titles": 1234, "file_bytes": 1000, "late_behind": 2, "late": {"reruns": 1},
+                    "sources": [{"key": "predb_club", "last_ok_at": 5, "next_poll_at": 9, "last_error": null}]},
                 "mode": "backfill", "uptime": 3600, "total_articles": 1_000_000, "rate_bin": 10,
                 "rate": [[now() as i64 / 10 * 10 - 10, 50_000, 0]],
                 "servers": [{"host": "news.x", "priority": 1, "state": "ok", "indexing": true, "in_use": 3,

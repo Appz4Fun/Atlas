@@ -154,6 +154,78 @@ pub struct Config {
     pub postprocess: PostprocessConfig,
     pub archive: ArchiveConfig,
     pub naming: NamingConfig,
+    pub predb: PredbConfig,
+}
+
+/// The `predb` object of config.json, see the README.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PredbConfig {
+    pub enabled: bool,
+    pub sources: Vec<String>,
+    pub poll_minutes: u32,
+    pub page_size: u32,
+    pub max_pages_per_poll: u32,
+    pub max_db_mb: i64,
+    pub request_delay_ms: u64,
+    pub timeout_secs: u64,
+    pub history_pages: u32,
+    pub late_per_second: i64,
+}
+
+impl Default for PredbConfig {
+    fn default() -> Self {
+        PredbConfig {
+            enabled: false,
+            sources: Vec::new(),
+            poll_minutes: 5,
+            page_size: 100,
+            max_pages_per_poll: 3,
+            max_db_mb: 8192,
+            request_delay_ms: 1000,
+            timeout_secs: 15,
+            history_pages: 0,
+            late_per_second: 1,
+        }
+    }
+}
+
+impl PredbConfig {
+    fn from_value(v: Option<&Value>) -> PredbConfig {
+        let mut c = PredbConfig::default();
+        let Some(v) = v else { return c };
+        if let Some(b) = v.get("enabled").and_then(as_bool) {
+            c.enabled = b;
+        }
+        if let Some(list) = v.get("sources").and_then(Value::as_array) {
+            c.sources = list.iter().filter_map(Value::as_str).map(String::from).collect();
+        }
+        let int = |key: &str, min: i64, max: i64| v.get(key).and_then(as_int).map(|n| n.clamp(min, max));
+        if let Some(n) = int("poll_minutes", 1, 1_440) {
+            c.poll_minutes = n as u32;
+        }
+        if let Some(n) = int("page_size", 1, 100) {
+            c.page_size = n as u32;
+        }
+        if let Some(n) = int("max_pages_per_poll", 1, 20) {
+            c.max_pages_per_poll = n as u32;
+        }
+        if let Some(n) = int("max_db_mb", 64, i64::MAX) {
+            c.max_db_mb = n;
+        }
+        if let Some(n) = int("request_delay_ms", 250, 60_000) {
+            c.request_delay_ms = n as u64;
+        }
+        if let Some(n) = int("timeout_secs", 1, 120) {
+            c.timeout_secs = n as u64;
+        }
+        if let Some(n) = int("history_pages", 0, 1_000_000) {
+            c.history_pages = n as u32;
+        }
+        if let Some(n) = int("late_per_second", 0, 1_000) {
+            c.late_per_second = n;
+        }
+        c
+    }
 }
 
 /// The `naming` object of config.json, see the README.
@@ -351,6 +423,7 @@ impl Default for Config {
             postprocess: PostprocessConfig::default(),
             archive: ArchiveConfig::default(),
             naming: NamingConfig::default(),
+            predb: PredbConfig::default(),
         }
     }
 }
@@ -496,6 +569,7 @@ impl Config {
             postprocess: PostprocessConfig::from_value(v.get("postprocess")),
             archive: ArchiveConfig::from_value(v.get("archive")),
             naming: NamingConfig::from_value(v.get("naming")),
+            predb: PredbConfig::from_value(v.get("predb")),
             max_unsaved_headers: v
                 .get("max_unsaved_headers")
                 .and_then(as_int)
@@ -821,6 +895,48 @@ pub mod keyring {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn predb_defaults_when_absent() {
+        let c = Config::from_value(&json!({})).predb;
+        assert_eq!(c, PredbConfig::default());
+        assert!(!c.enabled);
+        assert!(c.sources.is_empty());
+    }
+
+    #[test]
+    fn predb_keys_parse() {
+        let c = Config::from_value(&json!({"predb": {
+            "enabled": true, "sources": ["predb_club", "xrel"], "poll_minutes": 10, "page_size": 50,
+            "max_pages_per_poll": 2, "max_db_mb": 100, "request_delay_ms": 2000, "timeout_secs": 30,
+            "history_pages": 7, "late_per_second": 3
+        }}))
+        .predb;
+        assert!(c.enabled);
+        assert_eq!(c.sources, ["predb_club", "xrel"]);
+        assert_eq!((c.poll_minutes, c.page_size, c.max_pages_per_poll, c.history_pages), (10, 50, 2, 7));
+        assert_eq!((c.max_db_mb, c.request_delay_ms, c.timeout_secs, c.late_per_second), (100, 2000, 30, 3));
+    }
+
+    #[test]
+    fn a_bad_predb_value_falls_back() {
+        let c = Config::from_value(&json!({"predb": {"enabled": "yes please", "sources": 7, "poll_minutes": "soon"}}))
+            .predb;
+        assert_eq!(c, PredbConfig::default());
+        assert_eq!(Config::from_value(&json!({"predb": 3})).predb, PredbConfig::default());
+    }
+
+    #[test]
+    fn values_are_clamped() {
+        let c = Config::from_value(&json!({"predb": {
+            "poll_minutes": 0, "page_size": 9000, "max_pages_per_poll": 99, "max_db_mb": 1,
+            "request_delay_ms": 1, "timeout_secs": 999, "late_per_second": -4, "history_pages": -1
+        }}))
+        .predb;
+        assert_eq!((c.poll_minutes, c.page_size, c.max_pages_per_poll), (1, 100, 20));
+        assert_eq!((c.max_db_mb, c.request_delay_ms, c.timeout_secs), (64, 250, 120));
+        assert_eq!((c.late_per_second, c.history_pages), (0, 0));
+    }
 
     #[test]
     fn naming_defaults_when_absent() {

@@ -143,6 +143,7 @@ On first run, Atlas asks for one server (host, username, password, and port) and
 | `postprocess` | see below | The stage releases go through after saving. See [Post-processing keys](#post-processing-keys). |
 | `archive` | see below | Reading archives, PAR2 sets, and NFOs inside releases. See [Archive inspection](#archive-inspection). |
 | `naming` | see below | Giving releases with junk names better ones. See [Name fixing](#name-fixing). |
+| `predb` | see below | A catalogue of scene and P2P titles, off by default. See [PreDB](#predb). |
 | `max_unsaved_headers` | `500000` | Headers the indexer fetches ahead of saving them, over all groups at once. This bounds its memory: 500,000 headers take about 0.3 GB. A header request waits for room before it goes out, and its room comes back once its slice is saved. Raise it if the Bottleneck page shows it full while the database writers and connections have time to spare. Set below `request_size`, header requests are cut down to it, which makes them small and slow. |
 
 Atlas keeps any other keys you add to the file when it saves it.
@@ -289,6 +290,8 @@ Atlas seals each file that is complete, or untouched for three days, into one zs
 
 A release ID tells Atlas which file holds the release, and IDs keep counting up across all 8 files in the order releases are added, so the newest releases still come first.
 
+PreDB titles, if you turn them on, live apart in `atlas.predb.db`. Compaction and conversion never touch it. It takes about 153 MB per million titles, and grows by under 2 MB a day.
+
 ### Converting an older database
 
 The first time the new indexer starts on a database from an older version, it converts it once:
@@ -376,6 +379,55 @@ These go in a `naming` object:
 | `enabled` | `true` | Run the naming step. Set it to `false` before restarting to hold back the walk. |
 | `nfo_step` | `true` | Read NFOs, while `archive.enabled` is also on. It fetches nothing without a body budget. |
 
+### PreDB
+
+Atlas can keep a catalogue of scene and P2P release titles from public JSON feeds, in its own file, and use it to give a release its exact name. A release matches on its title, on the title with different separators, on an MD5 or SHA-1 of the title, or on an inner file. A title beats any other name. Nothing is ever matched fuzzily, and anything ambiguous is no match.
+
+It's off by default: with no `predb` key, nothing is fetched, no file is made, and no step runs. To turn it on:
+
+```json
+"predb": {"enabled": true, "sources": ["predb_club", "predb_net"]}
+```
+
+When you turn it on, Atlas contacts the third parties you list, and walks your existing releases once at `backlog_per_second`.
+
+| Source | Contacts | What it's for | Load |
+|---|---|---|---|
+| `predb_club` | `predb.club` | Recent scene titles | At the defaults, up to 3 requests per 5 minutes |
+| `predb_net` | `api.predb.net` | Recent scene titles, about 4 days back | The same |
+| `xrel` | `api.xrel.to` | Scene titles | The same, and never over 900 requests an hour |
+| `xrel_p2p` | `api.xrel.to` | P2P titles | The same |
+| `predb_org` | `predb.org` | History, through `history_pages` | The same |
+
+All of these go in the `predb` object:
+
+| Key | Default | What it does |
+|---|---|---|
+| `enabled` | `false` | Make the file and run the feeds and the match step. Off: no file, no network, no step. |
+| `sources` | `[]` | The feeds to poll. Empty with `enabled` on: matches against what's in the file, with no network. |
+| `poll_minutes` | `5` | Between polls of a source. At least 1. |
+| `page_size` | `100` | Clamped to each source's range. |
+| `max_pages_per_poll` | `3` | Requests per source per poll, from 1 to 20. A poll with a gap to finish or history to read takes at least 2. |
+| `max_db_mb` | `8192` | Polling stops, with an error on the dashboard, once `atlas.predb.db` passes this. At least 64. |
+| `request_delay_ms` | `1000` | Between requests to one source. At least 250, and a source's own floor applies. |
+| `timeout_secs` | `15` | For a whole request, from 1 to 120. |
+| `history_pages` | `0` | Older pages to read in total per source, beyond catching up. |
+| `late_per_second` | `1` | Titles the late path takes per second. 0 turns it off. |
+
+A title that arrives after its release still finds it, through the name index or the full-text index, with no scan. It misses a title that appears only in a file that isn't the release's name, or a short title under any form but an exact name. `atlas --reprocess --step predb_match --apply` catches those.
+
+A feed that fails backs off, up to every 6 hours, and only that feed. A server's rate limit is obeyed for as long as it asks. These feeds' shapes come from upstream's source and weren't checked against a live response, so on first turning this on, look at the PreDB block on the Post-processing page of the stats dashboard. A feed that has changed shows its error there, with nothing bad stored.
+
+To load a list you already have, one `title` or `title<TAB>category<TAB>pre_at` per line, optionally gzipped:
+
+```bash
+atlas --predb-import titles.txt.gz
+atlas --predb-import titles.txt.gz --apply
+atlas --reprocess --step predb_match --apply
+```
+
+The first is a dry run. Stop indexing before you `--apply`. The last matches your releases to what you imported, because a bulk import skips the late path.
+
 ### Purging and reprocessing
 
 Both commands are dry runs until you add `--apply`.
@@ -418,7 +470,7 @@ AI search lets you describe what you want in plain language, for example `find m
 - **Usenet servers:** list, add, edit, and remove servers, including host, login, port, SSL, connections, and priority.
 - **Change indexer mode:** switch between dynamic, live, and backfill.
 - **Purge broken releases:** delete incomplete releases to free up space. It's one big transaction, so it refuses past 1 million incomplete releases in a shard, and `atlas --purge --dead` is the batched way.
-- **Wipe DB and cache:** clear the database (`atlas.db` and every `atlas.sN.db` shard, with leftovers of a compaction), logs, status, and stats. Stop the indexer first; it is refused while the indexer, a compaction or a save has the database.
+- **Wipe DB and cache:** clear the database (`atlas.db` and every `atlas.sN.db` shard, with leftovers of a compaction), logs, status, and stats. Stop the indexer first; it is refused while the indexer, a compaction or a save has the database. It keeps `atlas.predb.db`, because feeds can't give back old titles, and says so. Delete that file by hand to drop them.
 - **Change API port:** move the Newznab API and restart it with the current `api_host`.
 
 ## Stats dashboard
@@ -592,7 +644,7 @@ Atlas is mainly a Newznab server now. The usual setup is a downloader, such as S
 Stop indexing, then copy `atlas.db` and its 8 shard files together:
 
 ```bash
-mkdir -p backup && cp atlas.db atlas.s*.db backup/
+mkdir -p backup && cp atlas.db atlas.s*.db atlas.predb.db backup/
 ```
 
 On APFS, `cp -c` makes the copy instantly and only uses space as the files change afterward. Atlas still opens databases from the Python version and converts them once, as described in [Converting an older database](#converting-an-older-database).
@@ -627,6 +679,7 @@ CI (`.github/workflows/ci.yml`) checks formatting, runs clippy, and runs the tes
 | `src/parser.rs`, `src/par2.rs`, `src/nfo.rs` | Subjects to releases, and real names and full file lists from par2 files, and names from nfo files. |
 | `src/naming/` | The obfuscation check, the judge of a name, cleaning, the naming regexes, the naming steps, and `--reflag-obfuscated` and `--unname`. |
 | `data/`, `scripts/` | The regex tables built into the binary, and the scripts that convert them from upstream. |
+| `src/predb/` | The PreDB file, its feeds and polling, matching, the late path, and `--predb-import`. |
 | `src/archive/` | Reading file lists from RAR, ZIP, 7z, and PAR2 headers, and the steps that store them. |
 | `src/collections.rs`, `data/collection_regexes.tsv` | Which articles belong to one post: per-group regexes and a generic cleaner. `scripts/collection_regexes_to_tsv.py` makes the data file from the upstream seeder. |
 | `src/filters.rs` | What Atlas refuses to index: posts obfuscated per article and blocked groups. |
@@ -663,7 +716,7 @@ AI helped with bug fixes, refactoring, SABnzbd integration, the background index
 
 The Rust port, with multi-server parallel indexing, the async NNTP client, the stats dashboard, and the extended Newznab API, lives in the [Appz4Fun fork](https://github.com/Appz4Fun/Atlas).
 
-The rule for articles obfuscated per article, the collection regexes and cleaner, the release rules, the rules for choosing what to read in a release, and the naming regexes and name fixing are ported from [newznab-tmux](https://github.com/xbmc4lyfe/newznab-tmux), GPLv3. 7z headers are decoded with [lzma-rs](https://github.com/gendx/lzma-rs), MIT.
+The rule for articles obfuscated per article, the collection regexes and cleaner, the release rules, the rules for choosing what to read in a release, the naming regexes and name fixing, and the PreDB feeds and matching rules are ported from [newznab-tmux](https://github.com/xbmc4lyfe/newznab-tmux), GPLv3. 7z headers are decoded with [lzma-rs](https://github.com/gendx/lzma-rs), MIT.
 
 ## License
 

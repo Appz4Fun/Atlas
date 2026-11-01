@@ -13,6 +13,7 @@ pub fn all() -> Vec<Arc<dyn Step>> {
         Arc::new(archive::ListStep::default()),
         Arc::new(naming::Naming),
         Arc::new(naming::NfoName),
+        Arc::new(crate::predb::step::PredbMatch),
     ]
 }
 

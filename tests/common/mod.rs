@@ -405,3 +405,46 @@ pub fn shard_inodes(main: &std::path::Path) -> Vec<u64> {
     use std::os::unix::fs::MetadataExt;
     atlas::store::shard_paths(main).iter().map(|p| std::fs::metadata(p).unwrap().ino()).collect()
 }
+
+/// A `Fetch` that opens no socket: replies are queued per URL, every URL is recorded, and a URL with no reply left is an `Err`.
+pub struct Scripted {
+    pub urls: Mutex<Vec<String>>,
+    replies: Mutex<std::collections::HashMap<String, std::collections::VecDeque<atlas::predb::poll::HttpReply>>>,
+    /// when every other URL has run out, answered to every request
+    pub always: Mutex<Option<String>>,
+}
+
+impl Scripted {
+    pub fn new() -> Arc<Scripted> {
+        Arc::new(Scripted { urls: Mutex::default(), replies: Mutex::default(), always: Mutex::default() })
+    }
+
+    pub fn reply(&self, url: &str, status: u16, body: &str) {
+        self.reply_with(
+            url,
+            atlas::predb::poll::HttpReply { status, retry_after: None, rate_reset: None, body: body.to_string() },
+        );
+    }
+
+    pub fn reply_with(&self, url: &str, reply: atlas::predb::poll::HttpReply) {
+        self.replies.lock().unwrap().entry(url.to_string()).or_default().push_back(reply);
+    }
+}
+
+impl atlas::predb::poll::Fetch for Scripted {
+    fn get(&self, url: &str) -> Result<atlas::predb::poll::HttpReply, String> {
+        self.urls.lock().unwrap().push(url.to_string());
+        if let Some(reply) = self.replies.lock().unwrap().get_mut(url).and_then(|q| q.pop_front()) {
+            return Ok(reply);
+        }
+        match &*self.always.lock().unwrap() {
+            Some(body) => Ok(atlas::predb::poll::HttpReply {
+                status: 200,
+                retry_after: None,
+                rate_reset: None,
+                body: body.clone(),
+            }),
+            None => Err(format!("no reply scripted for {url}")),
+        }
+    }
+}

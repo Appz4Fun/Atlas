@@ -75,5 +75,13 @@
     "naming": {
         "enabled": true,
         "nfo_step": true
+    },
+    "predb": {
+        "enabled": false,
+        "sources": [],
+        "poll_minutes": 5,
+        "max_pages_per_poll": 3,
+        "history_pages": 0,
+        "late_per_second": 1
     }
 }

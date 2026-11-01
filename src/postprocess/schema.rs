@@ -75,8 +75,15 @@ pub const PP_WALKS: ShardTable = ShardTable {
     added: &[],
 };
 
-pub const SHARD_TABLES: &[&ShardTable] =
-    &[&PP_QUEUE, &PP_STATE, &PP_WALKS, &crate::archive::store::INNER_FILES, &crate::archive::store::RELEASE];
+pub const SHARD_TABLES: &[&ShardTable] = &[
+    &PP_QUEUE,
+    &PP_STATE,
+    &PP_WALKS,
+    &crate::archive::store::INNER_FILES,
+    &crate::archive::store::RELEASE,
+    &crate::predb::step::MATCH,
+    &crate::predb::step::INNER_KEY,
+];
 
 /// nullable columns on `releases`, append only. `name_source`: NULL, the name came from
 /// ingest, otherwise the priority of the step source that set it, and saves leave the name alone

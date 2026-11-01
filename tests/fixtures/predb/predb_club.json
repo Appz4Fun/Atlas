@@ -1,0 +1,7 @@
+{"status": "success", "data": {"rows": [
+  {"name": "Alpha.Beta.Gamma.2024.1080p.WEB-DL.H.264-TESTGRP", "cat": "TV-HD", "size": 12.5, "files": 35, "preAt": 1700000000, "nuke": null},
+  {"name": "Second.Title.Name.2023.720p.WEB-OTHER", "cat": "", "size": null, "files": null, "preAt": "1700000001", "nuke": {"type": "modnuke", "reason": "bad.audio"}},
+  {"name": "", "cat": "TV"},
+  {"cat": "no title key"},
+  {"name": "Third.Title.Name.2022.BluRay.x264-THIRD", "cat": "X264", "size": "100", "files": "9", "preAt": 1700000002}
+]}}
