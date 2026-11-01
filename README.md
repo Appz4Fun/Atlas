@@ -309,6 +309,8 @@ Rows already stored from a blocked group stop being served as soon as you run th
 
 A multi-file post becomes one release, whatever its files are called, across slices, servers, and days. Atlas decides this from the post's file counter and from per-group collection regexes, and the subject alone settles it, so every server agrees. A post being indexed when you upgrade stays split by file for the files already started.
 
+An upload obfuscated per article gives every article its own random name, so nothing but its shape, poster, and day links them. Atlas gathers those articles into one release per upload, named `per-article-upload-...`, with each article in its position, so its NZB holds the upload as posted and later articles join it. Grouping by shape can put two uploads by one poster on one day together. See [docs/TODO.md](docs/TODO.md).
+
 ### Splitting big groups
 
 When two or more indexing servers carry a group and its backfill has more than `split_min_backlog` article numbers left, Atlas splits the rest of its history into UTC day chunks. A worker with nothing of its own to do claims the newest pending chunk on any server that carries the group, so idle connections help with big groups. A server that doesn't keep a day from its start, because its retention is shorter, gives the chunk back for a server that does. No server keeps the oldest day of the split from its start; the server that goes back furthest on it indexes what there is. Every hour, and when the indexer starts, Atlas checks whether a server now goes back further, for example one you added. If one does, the older days get chunks too, and the old oldest day is done again in full. Live indexing stays on the group's home server. The Backfill page of the stats dashboard shows split groups and their day chunks.
@@ -611,7 +613,7 @@ Atlas provides a Newznab-compatible API, the protocol that Prowlarr, NZBHydra2, 
 | `movie` | Movie search by `q`. It takes IDs when a provider is on. | Yes |
 | `music`, `audio` | Music search by `q`. | Yes |
 | `book` | Book search by `q`. | Yes |
-| `get` | The NZB for a release, by `id`. | Yes |
+| `get` | The NZB for a release, by `id`. Add `file=N` for one of its files alone, counting from 1 in the order the whole NZB lists them. | Yes |
 
 A search by an ID that's on (see [TV and movie IDs](#tv-and-movie-ids)) returns the releases with that ID, and when it finds nothing a `q` next to it searches by name. An ID that's off counts as not given: alone it returns an empty result rather than an error, and next to `q` it searches by `q`.
 
