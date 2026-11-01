@@ -151,10 +151,27 @@ struct Content {
     biggest: Option<(String, i64, String)>,
     file_types: Vec<(String, i64)>,
     framestor: i64,
+    /// (root, releases)
+    #[serde(default)]
+    categories: Vec<(i64, i64)>,
 }
 
 fn cache_path() -> std::path::PathBuf {
     paths::app_dir().join("stats_cache.json")
+}
+
+/// Releases per category root: one covering index scan per shard.
+fn content_categories(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<(i64, i64)>> {
+    let sql =
+        crate::store::each_shard(|i| format!("select category, count(*) from s{i}.release_category group by category"));
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?;
+    let mut by_root = std::collections::BTreeMap::new();
+    for row in rows {
+        let (category, n) = row?;
+        *by_root.entry(crate::category::root_of(category)).or_insert(0) += n;
+    }
+    Ok(by_root.into_iter().collect())
 }
 
 fn compute_content() -> rusqlite::Result<Content> {
@@ -221,6 +238,7 @@ fn compute_content() -> rusqlite::Result<Content> {
     let fts = |q: &str| -> i64 { conn.query_row(&fts_sql, [q], |r| r.get(0)).unwrap_or(0) };
     c.file_types = FILE_TYPES.iter().map(|t| (t.to_string(), fts(&format!("\"{t}\"")))).collect();
     c.framestor = fts("\"framestor\"*");
+    c.categories = content_categories(&conn)?;
 
     c.computed_at = now();
     c.took_secs = started.elapsed().as_secs_f64();
@@ -904,8 +922,20 @@ fn draw_content(f: &mut Frame, app: &App, area: Rect) {
     let Some(c) = state.data.clone() else { return };
     drop(state);
 
-    let [left, mid, right] = Layout::horizontal([Constraint::Ratio(1, 3); 3]).areas(body);
+    let [left, mid, cats, right] = Layout::horizontal([Constraint::Ratio(1, 4); 4]).areas(body);
     let r = c.releases as f64;
+    let mut categories: Vec<Line> = c
+        .categories
+        .iter()
+        .map(|(root, n)| {
+            let name = crate::category::label(*root).unwrap_or_else(|| root.to_string());
+            kv(&name, format!("{} ({:.1}%)", count(*n), pct(*n as f64, r)))
+        })
+        .collect();
+    let with_row: i64 = c.categories.iter().map(|(_, n)| n).sum();
+    categories.push(kv("no category yet", count((c.releases - with_row).max(0))));
+    categories.push(note("those show as 8000 in the API"));
+    f.render_widget(Paragraph::new(categories).block(panel("categories")), cats);
     let configured =
         app.stats["groups_configured"].as_i64().or_else(|| load_config().map(|c| c.tracked_groups().len() as i64));
     let releases = vec![
@@ -1552,6 +1582,19 @@ mod tests {
     }
 
     #[test]
+    fn content_categories_sums_by_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        db::create_db_at(&main).unwrap();
+        for (id, category) in [(8, 5030), (16, 5040), (24, 2040)] {
+            let shard = db::open_shard(&crate::store::shard_path(&main, crate::store::shard_of_id(id))).unwrap();
+            shard.execute("insert into release_category (release_id, category) values (?, ?)", [id, category]).unwrap();
+        }
+        let conn = db::open_with_shards(&main).unwrap();
+        assert_eq!(content_categories(&conn).unwrap(), [(2000, 1), (5000, 2)]);
+    }
+
+    #[test]
     fn pages_render() {
         let backend = ratatui::backend::TestBackend::new(160, 50);
         let mut term = ratatui::Terminal::new(backend).unwrap();
@@ -1577,6 +1620,7 @@ mod tests {
                     nzb_ready: 9,
                     nzb_complete: 5,
                     file_types: vec![("mkv".into(), 3)],
+                    categories: vec![(5000, 4)],
                     ..Content::default()
                 }),
                 ..ContentState::default()
@@ -1603,6 +1647,8 @@ mod tests {
                     text.contains(".mkv")
                         && text.contains("NZBs available    9 (90.0%)")
                         && text.contains("complete NZBs     5 (50.0%)")
+                        && text.contains("no category yet")
+                        && text.contains("TV")
                 ),
                 3 => assert!(text.contains("news.x") && text.contains("75%")),
                 5 => assert!(text.contains("walk") && text.contains("due now") && text.contains("25.0%")),

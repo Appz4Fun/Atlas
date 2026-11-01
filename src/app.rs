@@ -28,6 +28,11 @@ const LOGO: &str = r"
         ╚═╝  ╚═╝   ╚═╝    ╚══════╝ ╚═╝  ╚═╝ ╚══════╝
 ";
 
+/// The category it's known to be in. The terminal says what's known, and only the API reports the default number.
+fn category_cell(cats: &std::collections::HashMap<i64, i64>, id: i64) -> String {
+    cats.get(&id).and_then(|c| crate::category::label(*c)).unwrap_or_else(|| "-".into())
+}
+
 fn show_results(releases: &[ReleaseRow], query: &str, page: i64, total_pages: i64, total: i64, page_size: i64) {
     ui::clear();
 
@@ -44,18 +49,22 @@ fn show_results(releases: &[ReleaseRow], query: &str, page: i64, total_pages: i6
         Column::new("#").width(4).right(),
         Column::new("Name").flex(),
         Column::new("Size").width(10).right(),
+        Column::new("Category").width(20),
         Column::new("Parts").width(8).right(),
         Column::new("Date").width(12),
         Column::new("Status").width(10),
     ]);
 
-    let width = ui::term_size().0.saturating_sub(40).max(20);
+    let width = ui::term_size().0.saturating_sub(61).max(20);
+    let ids: Vec<i64> = releases.iter().map(|r| r.id).collect();
+    let cats = crate::category::categories_of(&ids).unwrap_or_default();
 
     for (i, r) in releases.iter().enumerate() {
         table.add_row(vec![
             Line::plain((i + 1).to_string()),
             Line::plain(ui::ellipsize(&r.name, width)),
             Line::plain(fmt_size(r.size)),
+            Line::plain(category_cell(&cats, r.id)),
             Line::plain(r.parts.map(|p| p.to_string()).unwrap_or_else(|| "None".into())),
             Line::plain(fmt_date(r.posted_date.as_deref())),
             if r.complete { Line::default() } else { Line::styled("[broken]", "red") },
@@ -930,6 +939,13 @@ mod tests {
 
     fn row(i: i64, name: &str) -> InnerFileRow {
         InnerFileRow { seq: i, name: name.into(), size: Some(10), source: 2 }
+    }
+
+    #[test]
+    fn category_cell_shows_a_label_or_a_dash() {
+        let cats = std::collections::HashMap::from([(1, 5040)]);
+        assert_eq!(category_cell(&cats, 1), "TV/HD");
+        assert_eq!(category_cell(&cats, 2), "-");
     }
 
     #[test]

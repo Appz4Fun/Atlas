@@ -155,6 +155,41 @@ pub struct Config {
     pub archive: ArchiveConfig,
     pub naming: NamingConfig,
     pub predb: PredbConfig,
+    pub category: CategoryConfig,
+}
+
+/// The `category` object of config.json, see the README.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CategoryConfig {
+    pub enabled: bool,
+    pub foreign: bool,
+    pub web_dl: bool,
+}
+
+impl Default for CategoryConfig {
+    fn default() -> Self {
+        CategoryConfig { enabled: true, foreign: true, web_dl: false }
+    }
+}
+
+impl CategoryConfig {
+    fn from_value(v: Option<&Value>) -> CategoryConfig {
+        let mut c = CategoryConfig::default();
+        let Some(v) = v else { return c };
+        let flag = |key: &str, slot: &mut bool| {
+            if let Some(b) = v.get(key).and_then(as_bool) {
+                *slot = b;
+            }
+        };
+        flag("enabled", &mut c.enabled);
+        flag("foreign", &mut c.foreign);
+        flag("web_dl", &mut c.web_dl);
+        c
+    }
+
+    pub fn options(&self) -> crate::category::Options {
+        crate::category::Options { foreign: self.foreign, web_dl: self.web_dl }
+    }
 }
 
 /// The `predb` object of config.json, see the README.
@@ -424,6 +459,7 @@ impl Default for Config {
             archive: ArchiveConfig::default(),
             naming: NamingConfig::default(),
             predb: PredbConfig::default(),
+            category: CategoryConfig::default(),
         }
     }
 }
@@ -570,6 +606,7 @@ impl Config {
             archive: ArchiveConfig::from_value(v.get("archive")),
             naming: NamingConfig::from_value(v.get("naming")),
             predb: PredbConfig::from_value(v.get("predb")),
+            category: CategoryConfig::from_value(v.get("category")),
             max_unsaved_headers: v
                 .get("max_unsaved_headers")
                 .and_then(as_int)
@@ -895,6 +932,39 @@ pub mod keyring {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn category_defaults_when_absent() {
+        assert_eq!(
+            Config::from_value(&json!({})).category,
+            CategoryConfig { enabled: true, foreign: true, web_dl: false }
+        );
+    }
+
+    #[test]
+    fn category_keys_parse() {
+        let c = Config::from_value(&json!({"category": {"enabled": false, "foreign": false, "web_dl": true}})).category;
+        assert_eq!(c, CategoryConfig { enabled: false, foreign: false, web_dl: true });
+    }
+
+    #[test]
+    fn a_bad_category_value_falls_back() {
+        let c = Config::from_value(&json!({"category": {"enabled": "perhaps", "web_dl": []}})).category;
+        assert_eq!(c, CategoryConfig::default());
+        assert_eq!(Config::from_value(&json!({"category": 1})).category, CategoryConfig::default());
+    }
+
+    #[test]
+    fn the_docs_describe_categories() {
+        let readme = include_str!("../README.md");
+        assert!(readme.contains("### Categories") && readme.contains("cat=8000"));
+        assert!(
+            !readme.contains("Every release is in category")
+                && !readme.contains("Atlas reports every release as category")
+        );
+        let example: Value = serde_json::from_str(include_str!("../config.example.json")).unwrap();
+        assert_eq!(Config::from_value(&example).category, CategoryConfig::default());
+    }
 
     #[test]
     fn predb_defaults_when_absent() {

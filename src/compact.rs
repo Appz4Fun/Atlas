@@ -1289,6 +1289,32 @@ mod tests {
     /// releases over several groups, 6 articles each, three with the shared
     /// ngPost domain (their locals stored as text) and three with a made up
     /// domain each, every domain in the table
+    #[test]
+    fn a_category_filter_works_after_a_compaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        legacy_fixture(&main);
+        let group = "alt.binaries.g0";
+        let shard = db::open_shard(&store::shard_path(&main, store::shard_of(group))).unwrap();
+        let id: i64 =
+            shard.query_row("select id from releases where group_name = ? limit 1", [group], |r| r.get(0)).unwrap();
+        shard.execute("insert into release_category (release_id, category) values (?, 5040)", [id]).unwrap();
+        drop(shard);
+        run(&main, &|_| {}, &no_stop()).unwrap();
+        let conn = db::open_with_shards(&main).unwrap();
+        let filter = crate::category::parse_filter("5040").unwrap();
+        let page =
+            crate::search::newest_in_categories_with(&conn, &filter, 0, 10, &crate::search::Bounds::DEFAULT).unwrap();
+        assert_eq!(page.rows.iter().map(|r| r.id).collect::<Vec<_>>(), [id]);
+        let shard = db::open_shard(&store::shard_path(&main, store::shard_of(group))).unwrap();
+        let indexed: bool = shard
+            .prepare("select 1 from sqlite_master where type = 'index' and name = 'category_release'")
+            .unwrap()
+            .exists([])
+            .unwrap();
+        assert!(indexed);
+    }
+
     fn legacy_fixture(main: &Path) {
         db::create_db_at(main).unwrap();
         let releases: Vec<Release> = (0..40)

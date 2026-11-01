@@ -10,7 +10,7 @@ use atlas::archive::Password;
 use atlas::archive::steps::next_probe_slot;
 use atlas::archive::store::{InnerFileRow, inner_files, password};
 use atlas::archive::testkit::*;
-use atlas::config::{ArchiveConfig, Config, NamingConfig, PostprocessConfig};
+use atlas::config::{ArchiveConfig, CategoryConfig, Config, NamingConfig, PostprocessConfig};
 use atlas::indexer::shared_db;
 use atlas::nntp::Pool;
 use atlas::parser::{Article, Release};
@@ -97,6 +97,7 @@ fn config() -> Config {
         },
         // the fixtures' names are for these steps to judge, see tests/naming_stage.rs
         naming: NamingConfig { enabled: false, ..Default::default() },
+        category: CategoryConfig { enabled: false, ..Default::default() },
         ..Config::default()
     }
 }
