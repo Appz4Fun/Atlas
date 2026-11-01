@@ -21,6 +21,7 @@ flate2 = "1"
 getrandom = "0.3"
 indexmap = "2"
 lzma-rs = "0.3"
+md-5 = "0.10"
 ratatui = "0.30"
 regex = "1"
 rusqlite = { version = "0.40", features = ["bundled", "functions", "hooks"] }
@@ -28,6 +29,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rustyline = "18"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
+sha1 = "0.10"
 sysinfo = { version = "0.39", default-features = false, features = ["system"] }
 tiny_http = "0.12"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "sync"] }

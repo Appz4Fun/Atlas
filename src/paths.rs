@@ -51,3 +51,8 @@ pub fn sab_log() -> PathBuf {
 pub fn home_dir() -> PathBuf {
     env::var_os("HOME").or_else(|| env::var_os("USERPROFILE")).map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."))
 }
+
+/// the PreDB titles, next to the shards
+pub fn predb_database() -> PathBuf {
+    crate::predb::db::path_for(&database())
+}

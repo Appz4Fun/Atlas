@@ -284,6 +284,7 @@ struct Scheduler {
     blocked: Mutex<Vec<String>>,
     /// the processing stage, when it's on
     stage: OnceLock<Arc<Stage>>,
+    predb: OnceLock<Arc<crate::predb::Service>>,
     /// what the stage was started with: its threads and body permits are fixed then
     stage_shape: StageShape,
     /// (server, groups at once) for every indexing server
@@ -470,6 +471,9 @@ impl Scheduler {
         if let Some(stage) = self.stage.get() {
             stats.extra.insert("postprocess".into(), stage.snapshot());
         }
+        if let Some(predb) = self.predb.get() {
+            stats.extra.insert("predb".into(), predb.snapshot());
+        }
         stats.extra.insert("workers".into(), json!(self.workers));
         stats.extra.insert("pid".into(), json!(std::process::id()));
         let mut load = crate::profile::LOAD.snapshot();
@@ -633,12 +637,12 @@ async fn worker(sched: Arc<Scheduler>, server: usize, db: Db) {
     }
 }
 
-/// on, database threads, net threads
-type StageShape = (bool, usize, usize);
+/// on, database threads, net threads, and whether PreDB's service runs
+type StageShape = (bool, usize, usize, bool);
 
 fn stage_shape(config: &Config) -> StageShape {
     let p = &config.postprocess;
-    (p.enabled, p.workers, p.body_connections)
+    (p.enabled, p.workers, p.body_connections, config.predb.enabled)
 }
 
 /// a config the running indexer cant take on as it is
@@ -670,6 +674,9 @@ async fn watch_config(sched: Arc<Scheduler>, servers: Vec<UsenetServer>) {
         if let Some(stage) = sched.stage.get() {
             let (stage, config) = (stage.clone(), config.clone());
             let _ = tokio::task::spawn_blocking(move || stage.set_config(&config)).await;
+        }
+        if let Some(predb) = sched.predb.get() {
+            predb.set_config(&config);
         }
 
         let auto = config.auto_run_compact;
@@ -769,6 +776,7 @@ async fn run_servers(
         groups: RwLock::new(groups),
         blocked: Mutex::new(config.blocked_groups()),
         stage: OnceLock::new(),
+        predb: OnceLock::new(),
         stage_shape: stage_shape(config),
         plan: plan.clone(),
         workers,
@@ -812,6 +820,12 @@ async fn run_servers(
 
     crate::archive::sync_inline_lookups(config);
     let mut tasks = tokio::task::JoinSet::new();
+    // before the stage: its step reads this file, and a missing one is an error it would spend attempts on
+    if config.predb.enabled
+        && let Err(e) = crate::predb::db::create(&paths::predb_database())
+    {
+        eprintln!("predb: {e}");
+    }
     if config.postprocess.enabled {
         let stage = Stage::start(StageParams {
             main: paths::database(),
@@ -824,6 +838,23 @@ async fn run_servers(
         let _ = sched.stage.set(stage.clone());
         let s = sched.clone();
         tasks.spawn(crate::postprocess::run(stage, move || s.stopping()));
+    }
+    if config.predb.enabled {
+        let started = crate::predb::Service::start(crate::predb::ServiceParams {
+            main: paths::database(),
+            config: config.predb.clone(),
+            stage: sched.stage.get().cloned(),
+            fetch: crate::predb::test_fetch(),
+        });
+        match started {
+            Ok(service) => {
+                let _ = sched.predb.set(service.clone());
+                let s = sched.clone();
+                // in `tasks`: no connection of its outlives this, soo a compaction's checkpoint never meets one
+                tasks.spawn(crate::predb::run(service, move || s.stopping()));
+            }
+            Err(e) => eprintln!("predb: {e:#}"),
+        }
     }
     for &(server, count) in &plan {
         for _ in 0..count {
@@ -1146,6 +1177,7 @@ mod tests {
             groups: RwLock::new(groups),
             blocked: Mutex::new(Vec::new()),
             stage: OnceLock::new(),
+            predb: OnceLock::new(),
             stage_shape: stage_shape(&Config::default()),
             plan: vec![],
             workers: 2,
@@ -1216,6 +1248,14 @@ mod tests {
             assert!(matches!(next_work(&sched, server, &db, false).await, Some(Work::Group(_))));
             assert!(matches!(next_work(&sched, server, &db, false).await, Some(Work::Group(_))));
         });
+    }
+
+    #[test]
+    fn predb_turning_on_or_off_rebuilds() {
+        let mut config = Config::default();
+        let before = stage_shape(&config);
+        config.predb.enabled = true;
+        assert_ne!(stage_shape(&config), before);
     }
 
     /// a worker alone on its server alternates a due sweep with its home group

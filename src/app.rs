@@ -587,6 +587,9 @@ fn do_settings() {
             let _ = create_db();
 
             ui::success("wiped db and cache");
+            if paths::predb_database().exists() {
+                ui::dim("kept atlas.predb.db, the PreDB titles. Delete it by hand to drop them");
+            }
             ui::pause();
         }
         5 => {

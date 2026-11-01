@@ -1,0 +1,6 @@
+{"total_count": 2, "pagination": {"current_page": 1, "per_page": 100, "total_pages": 1}, "list": [
+  {"dirname": "Nu.Xi.Omicron.2023.1080p.BluRay.x264-P2PGRP", "category": {"meta_cat": "movies", "sub_cat": "hd"}, "size_mb": 2, "pub_time": 1700000003},
+  {"dirname": "", "category": {"meta_cat": "movies"}},
+  {"category": {"meta_cat": "no title key"}},
+  {"dirname": "Pi.Rho.Sigma.2023.Game-P2PGRP", "category": {"meta_cat": "games", "sub_cat": ""}, "size_mb": null, "pub_time": "1700000004"}
+]}

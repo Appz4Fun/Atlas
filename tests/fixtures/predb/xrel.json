@@ -1,0 +1,7 @@
+{"total_count": 3, "pagination": {"current_page": 1, "per_page": 100, "total_pages": 3}, "list": [
+  {"dirname": "Kappa.Lambda.Mu.2024.German.1080p.WEB.x264-XGRP", "ext_info": {"type": "movie"}, "size": {"number": 700, "unit": "MB"}, "time": 1700000002, "flags": {"nuke_rls": false}},
+  {"dirname": "Nuked.Scene.Name.2024.German.WEB.x264-XGRP", "ext_info": {"type": "tv"}, "size": {"number": 1, "unit": "RAR"}, "time": "1700000003", "flags": {"nuke_rls": true}},
+  {"dirname": "", "ext_info": {"type": "tv"}},
+  {"ext_info": {"type": "no title key"}},
+  {"dirname": "Big.Scene.Name.2024.German.WEB.x264-XGRP", "ext_info": {"type": "tv"}, "size": {"number": 2, "unit": "GB"}, "time": 1700000004}
+]}
