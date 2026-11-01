@@ -750,7 +750,7 @@ fn release_html(
     };
 
     let copies = crate::duplicates::copies(r.id).unwrap_or_default();
-    let has_twin = copies.iter().any(|(kind, _)| *kind == crate::duplicates::Copy::Twin);
+    let has_twin = crate::duplicates::can_fill(r.id, &copies);
     let fill = if has_twin && contents.articles_seen < contents.articles_expected {
         format!("<a class=\"button\" href=\"/ui/nzb?id={}&amp;fill=1\">NZB, gaps filled from a twin</a>", r.id)
     } else {
