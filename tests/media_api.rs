@@ -82,7 +82,11 @@ fn id_searches_end_to_end() {
 
     // nothing on
     let config = home.path().join("config.json");
-    std::fs::write(&config, r#"{"media": {"tvmaze": {"enabled": false}}, "postprocess": {"body_fetches_per_minute": 0}}"#).unwrap();
+    std::fs::write(
+        &config,
+        r#"{"media": {"tvmaze": {"enabled": false}}, "postprocess": {"body_fetches_per_minute": 0}}"#,
+    )
+    .unwrap();
     assert!(!query("t=caps").contains("tvdbid"));
     assert!(titles(&query("t=tvsearch&tvdbid=3001")).is_empty());
     assert!(!titles(&query("t=tvsearch&tvdbid=3001&q=Some+Show")).is_empty(), "by name");
