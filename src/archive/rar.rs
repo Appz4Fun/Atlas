@@ -1,7 +1,7 @@
 //! Inner file names from RAR4 and RAR5 headers, in one article's bytes.
 #![cfg_attr(not(test), deny(clippy::indexing_slicing, clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
-use super::{Listing, MAX_NAME_BYTES, crc32};
+use super::{Encryption, Listing, MAX_NAME_BYTES, crc32};
 
 const MAX_BLOCKS: usize = 65_536;
 const MARK4: &[u8] = b"Rar!\x1a\x07\x00";
@@ -53,6 +53,7 @@ pub fn list4(data: &[u8]) -> Listing {
         if ty == 0x73 && flags & 0x0080 != 0 {
             // what follows is salt and AES data
             l.encrypted = true;
+            l.encryption = Some(Encryption::Rar4Aes128);
             l.headers_encrypted = true;
             return l;
         }
@@ -102,6 +103,7 @@ fn file4(l: &mut Listing, header: &[u8], flags: u16) -> Option<u64> {
     };
     if flags & 0x0004 != 0 {
         l.encrypted = true;
+        l.encryption = Some(Encryption::Rar4Aes128);
     }
     if flags & 0x00e0 != 0x00e0 {
         let size = u64::from(unp) | u64::from(high_unp) << 32;
@@ -247,6 +249,7 @@ fn block5(l: &mut Listing, inner: &[u8]) -> Option<u64> {
     match ty {
         4 => {
             l.encrypted = true;
+            l.encryption = Some(Encryption::Rar5Aes256);
             l.headers_encrypted = true;
         }
         5 => l.complete = true,
@@ -271,6 +274,7 @@ fn block5(l: &mut Listing, inner: &[u8]) -> Option<u64> {
             if ty == 2 {
                 if encrypted_record(inner.get(end..)?) {
                     l.encrypted = true;
+                    l.encryption = Some(Encryption::Rar5Aes256);
                 }
                 if file_flags & 1 == 0 {
                     let size = (file_flags & 8 == 0).then_some(unpacked);

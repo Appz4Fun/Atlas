@@ -196,12 +196,14 @@ mod rar_tests {
     fn rar_encryption() {
         let l = rar::list(&[rar4(&[r4_main(0x0080)]), vec![0xaa; 64]].concat());
         assert!(l.encrypted && l.headers_encrypted && l.files.is_empty());
+        assert!(l.encryption.is_some());
         assert_eq!(l.password(), Password::Yes);
         let l = rar::list(&rar4(&[r4_main(0), r4_file(0x0004, b"locked.mkv", b"x"), r4_end()]));
         assert!(l.encrypted && !l.headers_encrypted);
         assert_eq!(names(&l), vec!["locked.mkv"]);
         let l = rar::list(&[rar5(&[r5_crypt_header()]), vec![0xaa; 64]].concat());
         assert!(l.encrypted && l.headers_encrypted && l.files.is_empty());
+        assert!(l.encryption.is_some());
         let l = rar::list(&rar5(&[r5_main(), r5_file(2, 4, b"locked.mkv", &r5_crypt_record(), b"x"), r5_end()]));
         assert!(l.encrypted);
         assert_eq!(names(&l), vec!["locked.mkv"]);
@@ -358,7 +360,10 @@ mod zip_tests {
         assert!(zip::list_tail(&data).files.is_empty());
 
         for (flags, method) in [(1, 0), (0x40, 0), (0x2000, 0), (0, 99)] {
-            assert!(zip::list_head(&zip_local(flags, method, b"a", b"")).encrypted, "{flags} {method}");
+            let l = zip::list_head(&zip_local(flags, method, b"a", b""));
+            assert!(l.encrypted, "{flags} {method}");
+            let want = if method == 99 { Encryption::ZipAes } else { Encryption::ZipCrypto };
+            assert_eq!(l.encryption, Some(want), "{flags} {method}");
         }
         let data = [zip_local(8, 8, b"a", b""), zip_local(0, 0, b"b", b"")].concat();
         assert_eq!(names(&zip::list_head(&data)), vec!["a"]);
@@ -461,7 +466,9 @@ mod sevenz_tests {
     #[test]
     fn sevenz_encrypted() {
         let l = sevenz::list(&sz_wrap(&[0; 64], &sz_encrypted_header(0, 64)), &[]);
+        assert_eq!(l.encryption, Some(Encryption::SevenZipAes256));
         assert!(l.encrypted && l.headers_encrypted && l.files.is_empty());
+        assert!(l.encryption.is_some());
         assert_eq!(l.password(), Password::Yes);
         let next = [&[0x01][..], &sz_main_streams(5, &[5], SZ_AES_DATA), &sz_files(&["a.mkv"], None), &[0x00]].concat();
         let l = sevenz::list(&sz_wrap(b"xxxxx", &next), &[]);

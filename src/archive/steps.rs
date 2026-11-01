@@ -118,6 +118,12 @@ fn finish(ctx: &StepCtx<'_>, source: i64, listing: Listing, limits: &ArchiveConf
     }
     if source != SOURCE_PAR2 {
         writes.push(StepWrite::new(archive_store::UPSERT_RELEASE, vec![id.into(), listing.password().code().into()]));
+        if let Some(encryption) = listing.encryption {
+            writes.push(StepWrite::new(
+                archive_store::SET_ENCRYPTION,
+                vec![id.into(), encryption.code().into(), i64::from(listing.headers_encrypted).into()],
+            ));
+        }
     }
 
     let name_source = if source == SOURCE_PAR2 { NAME_SOURCE_PAR2 } else { NAME_SOURCE_INNER };

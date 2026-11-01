@@ -146,7 +146,8 @@ rule_table!(LANGUAGES,
 
 /// In PTT's order, which matters: the first that matches wins.
 fn quality(name: &str) -> Option<String> {
-    static RULES: LazyLock<(Regex, Regex, Regex, Vec<Rule>, Vec<Rule>)> = LazyLock::new(|| {
+    type QualityRules = (Regex, Regex, Regex, Vec<Rule>, Vec<Rule>);
+    static RULES: LazyLock<QualityRules> = LazyLock::new(|| {
         (
             insensitive(r"\bBlu[ .-]*Ray"),
             insensitive(r"\bremux\b"),

@@ -563,6 +563,7 @@ fn release_html(
     if let Some(parts) = r.parts {
         fact("Parts", parts.to_string());
     }
+    fact("Encryption", encryption_fact(inner));
     if contents.files > 0 {
         fact("Files", contents.files.to_string());
     }
@@ -614,6 +615,17 @@ fn release_html(
             name = escape(&r.name),
         ),
     )
+}
+
+/// What's known about a password protected release's encryption.
+fn encryption_fact(inner: &crate::archive::store::InnerView) -> String {
+    let hidden = if inner.names_hidden { ", file names hidden" } else { "" };
+    match (inner.encryption, inner.password) {
+        (Some(kind), _) => format!("{}{hidden}", escape(kind.label())),
+        (None, Some(Password::Yes)) => "Encrypted, type not recorded".into(),
+        (None, Some(Password::Maybe)) => "Maybe encrypted".into(),
+        _ => String::new(),
+    }
 }
 
 /// 30 as "3%", 25 as "2.5%"
@@ -840,6 +852,22 @@ mod tests {
         let thin = release_info::Contents { recovery_bytes: 10, ..holes };
         assert!(health(&thin, 30).contains("NOT ENOUGH RECOVERY"));
         assert_eq!(per_mille(25), "2.5%");
+    }
+
+    #[test]
+    fn encryption_says_what_is_known() {
+        use crate::archive::Encryption;
+        use crate::archive::store::InnerView;
+        let aes = InnerView {
+            password: Some(Password::Yes),
+            encryption: Some(Encryption::Rar5Aes256),
+            names_hidden: true,
+            ..InnerView::default()
+        };
+        assert_eq!(encryption_fact(&aes), "RAR5, AES-256, file names hidden");
+        let old = InnerView { password: Some(Password::Yes), ..InnerView::default() };
+        assert_eq!(encryption_fact(&old), "Encrypted, type not recorded");
+        assert_eq!(encryption_fact(&InnerView::default()), "");
     }
 
     #[test]

@@ -77,16 +77,15 @@ pub fn names_with(conn: &Connection, id: i64) -> Result<Option<Names>> {
         "select name, display_name, is_obfuscated, name_source from s{}.releases where id = ?",
         store::shard_of_id(id)
     );
-    Ok(conn
-        .query_row(&sql, [id], |r| {
-            Ok(Names {
-                posted: r.get::<_, Option<String>>(0)?.unwrap_or_default(),
-                display: r.get(1)?,
-                obfuscated: r.get::<_, Option<i64>>(2)?.unwrap_or(0) != 0,
-                source: r.get(3)?,
-            })
+    conn.query_row(&sql, [id], |r| {
+        Ok(Names {
+            posted: r.get::<_, Option<String>>(0)?.unwrap_or_default(),
+            display: r.get(1)?,
+            obfuscated: r.get::<_, Option<i64>>(2)?.unwrap_or(0) != 0,
+            source: r.get(3)?,
         })
-        .optional()?)
+    })
+    .optional()
 }
 
 pub fn contents(id: i64) -> Result<Contents> {

@@ -113,6 +113,49 @@ impl Password {
     }
 }
 
+/// How an archive is encrypted. Stored by code, soo the numbers stay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Encryption {
+    Rar4Aes128,
+    Rar5Aes256,
+    SevenZipAes256,
+    ZipCrypto,
+    ZipAes,
+}
+
+impl Encryption {
+    pub fn code(self) -> i64 {
+        match self {
+            Encryption::Rar4Aes128 => 1,
+            Encryption::Rar5Aes256 => 2,
+            Encryption::SevenZipAes256 => 3,
+            Encryption::ZipCrypto => 4,
+            Encryption::ZipAes => 5,
+        }
+    }
+
+    pub fn from_code(n: i64) -> Option<Encryption> {
+        match n {
+            1 => Some(Encryption::Rar4Aes128),
+            2 => Some(Encryption::Rar5Aes256),
+            3 => Some(Encryption::SevenZipAes256),
+            4 => Some(Encryption::ZipCrypto),
+            5 => Some(Encryption::ZipAes),
+            _ => None,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Encryption::Rar4Aes128 => "RAR4, AES-128",
+            Encryption::Rar5Aes256 => "RAR5, AES-256",
+            Encryption::SevenZipAes256 => "7z, AES-256",
+            Encryption::ZipCrypto => "ZIP, ZipCrypto",
+            Encryption::ZipAes => "ZIP, AES",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InnerFile {
     pub name: String,
@@ -128,6 +171,8 @@ pub struct Listing {
     pub encrypted: bool,
     /// and the names cannot be read
     pub headers_encrypted: bool,
+    /// what kind, once `encrypted`
+    pub encryption: Option<Encryption>,
     /// the end of the list was seen
     pub complete: bool,
     /// a header failed its CRC or its structure

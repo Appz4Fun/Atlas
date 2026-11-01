@@ -1,7 +1,7 @@
 //! Inner file names from ZIP local headers and the central directory.
 #![cfg_attr(not(test), deny(clippy::indexing_slicing, clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
-use super::Listing;
+use super::{Encryption, Listing};
 
 const LOCAL: &[u8] = b"PK\x03\x04";
 const CENTRAL: &[u8] = b"PK\x01\x02";
@@ -35,6 +35,10 @@ fn name_of(raw: &[u8], flags: usize) -> String {
 
 fn is_encrypted(flags: usize, method: usize) -> bool {
     flags & (0x0001 | 0x0040 | 0x2000) != 0 || method == 99
+}
+
+fn zip_encryption(method: usize) -> Encryption {
+    if method == 99 { Encryption::ZipAes } else { Encryption::ZipCrypto }
 }
 
 fn is_directory(name: &str) -> bool {
@@ -90,6 +94,7 @@ pub fn list_head(data: &[u8]) -> Listing {
         let extra = entry.get(30 + n..30 + n + e).unwrap_or(&[]);
         if is_encrypted(flags, method) {
             l.encrypted = true;
+            l.encryption = Some(zip_encryption(method));
         }
         let (unp, packed) = zip64_sizes(extra, unp, packed);
         let name = name_of(name, flags);
@@ -178,6 +183,7 @@ pub fn list_tail(tail: &[u8]) -> Listing {
         }
         if is_encrypted(flags, method) {
             l.encrypted = true;
+            l.encryption = Some(zip_encryption(method));
         }
         let (unp, _) = zip64_sizes(extra, unp, packed);
         let name = name_of(name, flags);
