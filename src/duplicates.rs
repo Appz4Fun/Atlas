@@ -128,8 +128,8 @@ pub fn copies_with(conn: &Connection, id: i64) -> db::Result<Vec<(Copy, ReleaseR
     let s = store::shard_of_id(id);
     let sql = format!("select posted, content from s{s}.release_fingerprint where release_id = ?");
     let Ok(mut stmt) = conn.prepare(&sql) else { return Ok(Vec::new()) };
-    let row: Option<(Option<Vec<u8>>, Option<Vec<u8>>)> =
-        stmt.query_row([id], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+    let row =
+        stmt.query_row([id], |r| Ok((r.get::<_, Option<Vec<u8>>>(0)?, r.get::<_, Option<Vec<u8>>>(1)?))).optional()?;
     let Some((posted, content)) = row else { return Ok(Vec::new()) };
     let twins = match &posted {
         Some(fingerprint) => matching(conn, "posted", fingerprint, id)?,

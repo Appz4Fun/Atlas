@@ -586,7 +586,7 @@ fn release_html(
     if let Some(missing) = contents.missing_per_mille() {
         fact("Articles", health(contents, missing));
     }
-    if let Some(repair) = contents.repair_per_mille().filter(|_| contents.recovery_volumes > 0) {
+    if let Some(repair) = contents.repair_per_mille().filter(|_| contents.recovery_bytes > 0) {
         fact("Repair", format!("about {} ({})", per_mille(repair), escape(&fmt_size(Some(contents.recovery_bytes)))));
     }
     let links = media.map(|m| id_links(m.kind, &m.ids)).unwrap_or_default();
