@@ -156,6 +156,111 @@ pub struct Config {
     pub naming: NamingConfig,
     pub predb: PredbConfig,
     pub category: CategoryConfig,
+    pub media: MediaConfig,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TvmazeConfig {
+    pub enabled: bool,
+    pub requests_per_minute: i64,
+    pub base_url: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TmdbConfig {
+    pub api_key: String,
+    pub requests_per_minute: i64,
+    pub base_url: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TraktConfig {
+    pub client_id: String,
+    pub requests_per_minute: i64,
+    pub base_url: Option<String>,
+}
+
+/// The `media` object of config.json, see the README. Every provider is off until set.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MediaConfig {
+    pub parse: bool,
+    pub nfo: bool,
+    pub negative_ttl_days: u32,
+    pub max_titles: i64,
+    pub tvmaze: TvmazeConfig,
+    pub tmdb: TmdbConfig,
+    pub trakt: TraktConfig,
+}
+
+impl Default for MediaConfig {
+    fn default() -> Self {
+        MediaConfig {
+            parse: true,
+            nfo: true,
+            negative_ttl_days: 30,
+            max_titles: 10_000_000,
+            tvmaze: TvmazeConfig { enabled: false, requests_per_minute: 90, base_url: None },
+            tmdb: TmdbConfig { api_key: String::new(), requests_per_minute: 240, base_url: None },
+            trakt: TraktConfig { client_id: String::new(), requests_per_minute: 120, base_url: None },
+        }
+    }
+}
+
+impl MediaConfig {
+    pub fn any_provider(&self) -> bool {
+        self.tvmaze.enabled || !self.tmdb.api_key.is_empty() || !self.trakt.client_id.is_empty()
+    }
+
+    pub fn from_value(v: Option<&Value>) -> MediaConfig {
+        let mut c = MediaConfig::default();
+        let Some(v) = v else { return c };
+        let flag = |key: &str, slot: &mut bool| {
+            if let Some(b) = v.get(key).and_then(as_bool) {
+                *slot = b;
+            }
+        };
+        flag("parse", &mut c.parse);
+        flag("nfo", &mut c.nfo);
+        if let Some(n) = v.get("negative_ttl_days").and_then(as_int) {
+            c.negative_ttl_days = n.clamp(1, 180) as u32;
+        }
+        if let Some(n) = v.get("max_titles").and_then(as_int) {
+            c.max_titles = n.max(1_000);
+        }
+        let rate = |o: Option<&Value>, max: i64, slot: &mut i64| {
+            if let Some(n) = o.and_then(|o| o.get("requests_per_minute")).and_then(as_int) {
+                *slot = n.clamp(1, max);
+            }
+        };
+        let text = |o: Option<&Value>, key: &str| {
+            o.and_then(|o| o.get(key)).and_then(Value::as_str).map(str::trim).map(String::from)
+        };
+        let tvmaze = v.get("tvmaze");
+        if let Some(b) = tvmaze.and_then(|o| o.get("enabled")).and_then(as_bool) {
+            c.tvmaze.enabled = b;
+        }
+        rate(tvmaze, 120, &mut c.tvmaze.requests_per_minute);
+        c.tvmaze.base_url = text(tvmaze, "base_url").filter(|u| !u.is_empty());
+        let tmdb = v.get("tmdb");
+        c.tmdb.api_key = text(tmdb, "api_key").unwrap_or_default();
+        rate(tmdb, 3_000, &mut c.tmdb.requests_per_minute);
+        c.tmdb.base_url = text(tmdb, "base_url").filter(|u| !u.is_empty());
+        let trakt = v.get("trakt");
+        c.trakt.client_id = text(trakt, "client_id").unwrap_or_default();
+        rate(trakt, 200, &mut c.trakt.requests_per_minute);
+        c.trakt.base_url = text(trakt, "base_url").filter(|u| !u.is_empty());
+        c
+    }
+}
+
+/// The file's `media` object, for the API: no keyring.
+pub fn media_config() -> MediaConfig {
+    read_file().map_or_else(MediaConfig::default, |v| MediaConfig::from_value(v.get("media")))
+}
+
+/// Whether the file sets a body budget, for the API: no keyring.
+pub fn body_budget_set() -> bool {
+    read_file().is_some_and(|v| PostprocessConfig::from_value(v.get("postprocess")).body_fetches_per_minute > 0)
 }
 
 /// The `category` object of config.json, see the README.
@@ -460,6 +565,7 @@ impl Default for Config {
             naming: NamingConfig::default(),
             predb: PredbConfig::default(),
             category: CategoryConfig::default(),
+            media: MediaConfig::default(),
         }
     }
 }
@@ -607,6 +713,7 @@ impl Config {
             naming: NamingConfig::from_value(v.get("naming")),
             predb: PredbConfig::from_value(v.get("predb")),
             category: CategoryConfig::from_value(v.get("category")),
+            media: MediaConfig::from_value(v.get("media")),
             max_unsaved_headers: v
                 .get("max_unsaved_headers")
                 .and_then(as_int)
@@ -932,6 +1039,55 @@ pub mod keyring {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn media_is_all_off_when_absent() {
+        let c = Config::from_value(&json!({})).media;
+        assert!(!c.any_provider());
+        assert!(c.parse);
+    }
+
+    #[test]
+    fn tvmaze_needs_its_switch() {
+        assert!(!MediaConfig::from_value(Some(&json!({"tvmaze": {}}))).any_provider());
+        assert!(MediaConfig::from_value(Some(&json!({"tvmaze": {"enabled": true}}))).any_provider());
+    }
+
+    #[test]
+    fn an_empty_key_is_off() {
+        assert!(!MediaConfig::from_value(Some(&json!({"tmdb": {"api_key": ""}}))).any_provider());
+    }
+
+    #[test]
+    fn a_key_turns_tmdb_on() {
+        assert!(MediaConfig::from_value(Some(&json!({"tmdb": {"api_key": "K"}}))).any_provider());
+    }
+
+    #[test]
+    fn a_client_id_turns_trakt_on() {
+        assert!(MediaConfig::from_value(Some(&json!({"trakt": {"client_id": "ID"}}))).any_provider());
+    }
+
+    #[test]
+    fn requests_per_minute_is_clamped() {
+        let high = MediaConfig::from_value(Some(&json!({"tvmaze": {"requests_per_minute": 5000}})));
+        assert_eq!(high.tvmaze.requests_per_minute, 120);
+        let low = MediaConfig::from_value(Some(&json!({"tvmaze": {"requests_per_minute": 0}})));
+        assert_eq!(low.tvmaze.requests_per_minute, 1);
+    }
+
+    #[test]
+    fn the_example_keeps_every_provider_off() {
+        let example: Value = serde_json::from_str(include_str!("../config.example.json")).unwrap();
+        assert!(!Config::from_value(&example).media.any_provider());
+    }
+
+    #[test]
+    fn the_docs_describe_ids() {
+        let readme = include_str!("../README.md");
+        assert!(readme.contains("### TV and movie IDs"));
+        assert!(!readme.contains("searches by ID, such as TVDB or IMDb, return nothing"));
+    }
 
     #[test]
     fn category_defaults_when_absent() {

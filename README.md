@@ -49,6 +49,7 @@ rustup installs the pinned toolchain the first time you build, and the `just` re
 - **Index fast.** Atlas splits header requests into slices that stream over all connections, saves each slice the moment it arrives, and indexes many groups at the same time. When the server supports it, Atlas requests compressed header listings with `XFEATURE COMPRESS GZIP`.
 - **Handle real providers.** Atlas detects fill and bonus servers that only serve articles, lowers its own connection count when a provider refuses more, and pauses servers that reject the login instead of retrying them constantly.
 - **Real categories.** Atlas gives each release a Newznab category and honors `cat`, parents included.
+- **TV and movie IDs.** Atlas stores each release's title, season, and episode, and answers searches by TVDB, IMDb, TMDB, TVMaze, and Trakt ID once you turn on a provider. Every provider is off by default.
 - **Group posts into releases.** Atlas parses subjects into releases, marks incomplete sets, and recovers the real names of obfuscated posts from their par2 or nfo files.
 - **Serve a Newznab API** for Prowlarr, NZBHydra2, Sonarr, and Radarr: `search`, `tvsearch`, `movie`, `music`, `book`, `caps`, and `get`, which downloads an NZB.
 - **Search from the terminal** in one group or all groups, or use **AI search**, which turns a request like `find me 4k hdr movies` into groups and keywords with a local [Ollama](https://ollama.com) model.
@@ -146,6 +147,7 @@ On first run, Atlas asks for one server (host, username, password, and port) and
 | `naming` | see below | Giving releases with junk names better ones. See [Name fixing](#name-fixing). |
 | `predb` | see below | A catalogue of scene and P2P titles, off by default. See [PreDB](#predb). |
 | `category` | see below | How releases get a category. See [Categories](#categories). |
+| `media` | see below | TV and movie IDs, with every provider off. See [TV and movie IDs](#tv-and-movie-ids). |
 | `max_unsaved_headers` | `500000` | Headers the indexer fetches ahead of saving them, over all groups at once. This bounds its memory: 500,000 headers take about 0.3 GB. A header request waits for room before it goes out, and its room comes back once its slice is saved. Raise it if the Bottleneck page shows it full while the database writers and connections have time to spare. Set below `request_size`, header requests are cut down to it, which makes them small and slow. |
 
 Atlas keeps any other keys you add to the file when it saves it.
@@ -472,7 +474,7 @@ AI search lets you describe what you want in plain language, for example `find m
 - **Usenet servers:** list, add, edit, and remove servers, including host, login, port, SSL, connections, and priority.
 - **Change indexer mode:** switch between dynamic, live, and backfill.
 - **Purge broken releases:** delete incomplete releases to free up space. It's one big transaction, so it refuses past 1 million incomplete releases in a shard, and `atlas --purge --dead` is the batched way.
-- **Wipe DB and cache:** clear the database (`atlas.db` and every `atlas.sN.db` shard, with leftovers of a compaction), logs, status, and stats. Stop the indexer first; it is refused while the indexer, a compaction or a save has the database. It keeps `atlas.predb.db`, because feeds can't give back old titles, and says so. Delete that file by hand to drop them.
+- **Wipe DB and cache:** clear the database (`atlas.db`, every `atlas.sN.db` shard and `atlas.media.db`, with leftovers of a compaction), logs, status, and stats. Stop the indexer first; it is refused while the indexer, a compaction or a save has the database. It keeps `atlas.predb.db`, because feeds can't give back old titles, and says so. Delete that file by hand to drop them.
 - **Change API port:** move the Newznab API and restart it with the current `api_host`.
 
 ## Stats dashboard
@@ -559,13 +561,13 @@ Atlas provides a Newznab-compatible API, the protocol that Prowlarr, NZBHydra2, 
 |---|---|---|
 | `caps` | Capabilities: server info, supported search types and parameters, and categories. | No |
 | `search` | Release search. `q` is optional, and an empty query returns recent releases. | Yes |
-| `tvsearch` | TV search. Atlas adds `season` and `ep` to the query as `S01E02`. | Yes |
-| `movie` | Movie search by `q`. | Yes |
+| `tvsearch` | TV search. Atlas adds `season` and `ep` to the query as `S01E02`. It takes IDs when a provider is on. | Yes |
+| `movie` | Movie search by `q`. It takes IDs when a provider is on. | Yes |
 | `music`, `audio` | Music search by `q`. | Yes |
 | `book` | Book search by `q`. | Yes |
 | `get` | The NZB for a release, by `id`. | Yes |
 
-Atlas knows release names only. It doesn't know TVDB or IMDb IDs. A search with only an ID, such as `tvdbid`, `imdbid`, `tmdbid`, `tvmazeid`, `rid`, or `traktid`, returns an empty result rather than an error. An ID next to `q` searches by `q`. Unknown `t=` values return a Newznab error (`203`) instead of a 404, so capability checks, such as NZBHydra2's, complete.
+A search by an ID that's on (see [TV and movie IDs](#tv-and-movie-ids)) returns the releases with that ID, and when it finds nothing a `q` next to it searches by name. An ID that's off counts as not given: alone it returns an empty result rather than an error, and next to `q` it searches by `q`.
 
 ### Parameters
 
@@ -573,7 +575,9 @@ Atlas knows release names only. It doesn't know TVDB or IMDb IDs. A search with 
 |---|---|---|
 | `apikey` | all except `caps` | Your API key. |
 | `q` | searches | Words matched against posted and real release names. |
-| `season`, `ep` | `tvsearch` | Season and episode, matched as `S01E02`. |
+| `season`, `ep` | `tvsearch` | Season and episode, matched as `S01E02`. A daily show is `season=2025&ep=11/10`, the year and `MM/DD`. |
+| `tvdbid`, `imdbid`, `rid`, `tvmazeid`, `tmdbid`, `traktid` | `tvsearch` | IDs, when on. `imdbid` takes `tt0100001` or `0100001`, and `tvrageid` is read as `rid`. Several IDs mean any of them. |
+| `imdbid`, `tmdbid`, `traktid` | `movie` | IDs, when on. |
 | `cat` | searches | A comma list of categories. A parent includes its subs, so `5000` includes `5040`. `-1` or text that isn't a number means no filter, and an id that doesn't exist matches nothing. See [Categories](#categories). |
 | `limit` | searches | Maximum results. The default and the maximum are both `100`. |
 | `offset` | searches | Result offset for paging. |
@@ -633,6 +637,54 @@ These go in a `category` object:
 
 `foreign` and `web_dl` change only what's processed next. `atlas --reprocess --step category --apply` applies them to old releases.
 
+### TV and movie IDs
+
+Atlas stores the title, season, episode, air date, and year of every release whose name gives a TV or movie category, with no network. A group's name alone isn't enough for that. With nothing else set, results have `season` and `episode`, and no ID search is offered.
+
+Turn a provider on to fill in IDs, with no restart. Each title is asked once, however many releases it has, and every release of the title gets its IDs. A new provider starts one walk of your releases, which asks that provider for each title.
+
+| Provider | How to turn it on | Fills | `tv-search` parameters | `movie-search` parameters |
+|---|---|---|---|---|
+| TVMaze | `media.tvmaze.enabled: true`. It needs no key. TV only. | TVMaze, TVDB, TVRage, IMDb | `tvdbid`, `imdbid`, `rid`, `tvmazeid` | none |
+| TMDB | `media.tmdb.api_key`, from your account's API settings on themoviedb.org. | TMDB, TVDB, TVRage, IMDb | `tvdbid`, `imdbid`, `rid`, `tmdbid` | `imdbid`, `tmdbid` |
+| Trakt | `media.trakt.client_id`, from an API app you create on trakt.tv. | Trakt, TVDB, TVRage, TMDB, IMDb | `tvdbid`, `imdbid`, `rid`, `tmdbid`, `traktid` | `imdbid`, `tmdbid`, `traktid` |
+
+**An NFO needs no provider.** Once `postprocess.body_fetches_per_minute` is set, `media.nfo` reads a movie's IMDb ID from its NFO: one body of at most 64 KiB, and only for a movie with no IMDb ID yet. That also adds `imdbid` to `movie-search`.
+
+**Sonarr and Radarr cache `caps` for 7 days**, so press Test on the indexer after turning a provider on.
+
+```json
+"media": {
+    "tvmaze": {"enabled": true},
+    "tmdb": {"api_key": "your-key"},
+    "trakt": {"client_id": "your-id"}
+}
+```
+
+| Key | Default | Meaning |
+|---|---|---|
+| `parse` | `true` | Store titles, seasons, and episodes. Off: no rows and no IDs. |
+| `nfo` | `true` | Read a movie's IMDb ID from its NFO, once a body budget is set. |
+| `negative_ttl_days` | `30` | How long a title with no match isn't asked again. It doubles each time, up to 180 days. |
+| `max_titles` | `10000000` | No new title is looked up past this many, about 300 MB of memory and 1.3 GB of disk. At least 1,000. |
+| `tvmaze.requests_per_minute` | `90` | At most 120. |
+| `tmdb.requests_per_minute` | `240` | At most 3,000. |
+| `trakt.requests_per_minute` | `120` | At most 200. |
+
+A provider that's down or over its limit pauses for its own wait, up to an hour. Nothing else stops, and no title is marked as missing. Its answers live in `atlas.media.db`, next to the shards, and the IDs live on the releases, so deleting that file loses no search. To correct a wrong match, stop the indexer, delete the title's row from `media_titles`, start it, and run `atlas --reprocess --step media_lookup`.
+
+These are estimates for 1M distinct titles, 300,000 TV and 700,000 movie, 60% found. They scale with the number of titles.
+
+| Providers on | Requests | At the defaults |
+|---|---:|---:|
+| TVMaze | 420,000 | 3.2 days |
+| TMDB | 1.6M | 4.6 days |
+| Trakt | 1M | 5.8 days |
+| TVMaze and TMDB | 2.02M | 4.6 days |
+| All three | 3.02M | 5.8 days |
+
+After that, a new release of a known title makes no request. Above about 8 requests a second in total, raise `postprocess.body_connections`.
+
 ### Search results
 
 Each `<item>` contains:
@@ -644,6 +696,8 @@ Each `<item>` contains:
 - `<pubDate>`: the post date in RFC 2822 format.
 - `<newznab:attr name="category" value="5040"/>`: its category, or `8000` when it has none yet.
 - `<newznab:attr name="password" value="N"/>`: 0 no, 1 yes, 2 maybe. It's left out when nothing is known.
+- `season`, `episode`, `year`, and `tvairdate` attributes, when the name gives them.
+- `tvdbid`, `tvmazeid`, `traktid`, `tmdbid`, `rageid`, `tvrageid`, `imdb`, and `imdbid` attributes, when the release has that ID and its parameter is on. IMDb IDs have at least 7 digits, with no `tt`.
 
 `t=get` answers with `application/x-nzb` and a `Content-Disposition` attachment that holds a valid NZB 1.1 file built from the indexed articles, so a downloader can fetch it directly from the URL.
 
@@ -715,6 +769,7 @@ CI (`.github/workflows/ci.yml`) checks formatting, runs clippy, and runs the tes
 | `data/`, `scripts/` | The regex tables built into the binary, and the scripts that convert them from upstream. |
 | `src/predb/` | The PreDB file, its feeds and polling, matching, the late path, and `--predb-import`. |
 | `src/category/` | The category table, the rules, and the step that stores them. |
+| `src/media/` | Titles from names, the ID providers, the title cache, the steps, and ID searches. |
 | `src/archive/` | Reading file lists from RAR, ZIP, 7z, and PAR2 headers, and the steps that store them. |
 | `src/collections.rs`, `data/collection_regexes.tsv` | Which articles belong to one post: per-group regexes and a generic cleaner. `scripts/collection_regexes_to_tsv.py` makes the data file from the upstream seeder. |
 | `src/filters.rs` | What Atlas refuses to index: posts obfuscated per article and blocked groups. |
@@ -740,7 +795,7 @@ CI (`.github/workflows/ci.yml`) checks formatting, runs clippy, and runs the tes
 - A pack merges only when each file's `[n/m]` equals its own number, so a pack with an nfo first stays by file.
 - Album tracks named with the track number first stay by file.
 - Deobfuscation works only when a release has a usable name in a par2 file, an nfo file, or the first article of an archive. A 7z or a ZIP needs its last article too.
-- Search matches release names only, so searches by ID, such as TVDB or IMDb, return nothing.
+- Searches by ID need a provider, or a body budget for a movie's IMDb ID. A title no provider knows has no IDs.
 
 ## Credits
 
@@ -751,6 +806,8 @@ AI helped with bug fixes, refactoring, SABnzbd integration, the background index
 The Rust port, with multi-server parallel indexing, the async NNTP client, the stats dashboard, and the extended Newznab API, lives in the [Appz4Fun fork](https://github.com/Appz4Fun/Atlas).
 
 The rule for articles obfuscated per article, the collection regexes and cleaner, the release rules, the rules for choosing what to read in a release, the naming regexes and name fixing, the PreDB feeds and matching rules, and the category rules and lists are ported from [newznab-tmux](https://github.com/xbmc4lyfe/newznab-tmux), GPLv3. 7z headers are decoded with [lzma-rs](https://github.com/gendx/lzma-rs), MIT.
+
+The title parsing, the candidate scoring, and the order of ID providers are ported from [newznab-tmux](https://github.com/NNTmux/newznab-tmux), GPLv3. This product uses the TMDB API but is not endorsed or certified by TMDB. TV data comes from [TVMaze](https://www.tvmaze.com), CC BY-SA, and from [Trakt](https://trakt.tv).
 
 ## License
 

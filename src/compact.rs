@@ -1315,6 +1315,52 @@ mod tests {
         assert!(indexed);
     }
 
+    #[test]
+    fn an_id_search_works_after_a_compaction() {
+        use crate::media::query::{IdColumn, IdQuery, find_with};
+        use crate::media::title::Kind;
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        legacy_fixture(&main);
+        let group = "alt.binaries.g0";
+        let shard = db::open_shard(&store::shard_path(&main, store::shard_of(group))).unwrap();
+        let id: i64 =
+            shard.query_row("select id from releases where group_name = ? limit 1", [group], |r| r.get(0)).unwrap();
+        shard
+            .execute(
+                "insert into media_release (release_id, kind, title_key, quality, tvdb_id) values (?, 1, 5, 0, 3001)",
+                [id],
+            )
+            .unwrap();
+        drop(shard);
+        run(&main, &|_| {}, &no_stop()).unwrap();
+        let conn = db::open_with_shards(&main).unwrap();
+        let q = IdQuery { kind: Kind::Tv, ids: vec![(IdColumn::Tvdb, 3001)], season: None, episode: None };
+        let page = find_with(&conn, &q, None, 0, 10, &crate::search::Bounds::DEFAULT, 100).unwrap();
+        assert_eq!(page.rows.iter().map(|r| r.id).collect::<Vec<_>>(), [id]);
+        let shard = db::open_shard(&store::shard_path(&main, store::shard_of(group))).unwrap();
+        for (name, _) in crate::media::MEDIA_RELEASE.indexes {
+            let found = shard
+                .prepare("select 1 from sqlite_master where type = 'index' and name = ?")
+                .unwrap()
+                .exists([name])
+                .unwrap();
+            assert!(found, "{name}");
+        }
+        assert_eq!(crate::media::MEDIA_RELEASE.indexes.len(), 7);
+    }
+
+    #[test]
+    fn a_compaction_leaves_the_media_cache_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        legacy_fixture(&main);
+        let cache = crate::media::store::path_for(&main);
+        std::fs::write(&cache, b"known bytes").unwrap();
+        run(&main, &|_| {}, &no_stop()).unwrap();
+        assert_eq!(std::fs::read(&cache).unwrap(), b"known bytes");
+    }
+
     fn legacy_fixture(main: &Path) {
         db::create_db_at(main).unwrap();
         let releases: Vec<Release> = (0..40)

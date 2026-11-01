@@ -187,6 +187,7 @@ pub fn wipe(main: &Path) -> anyhow::Result<()> {
     // as the main database at the next start (see `convert::recover_cut_swap`)
     dbs.push(main.with_file_name("atlas.old.db"));
     dbs.push(main.with_file_name("atlas.new.db"));
+    dbs.push(crate::media::store::path_for(main));
     dbs.push(main.to_path_buf());
     for db in dbs {
         for suffix in ["", "-wal", "-shm", "-journal"] {
@@ -904,5 +905,21 @@ mod tests {
         // a setup cut short before the shards
         create_db_at(&main).unwrap();
         assert!(store::shard_paths(&main).iter().all(|s| s.exists()));
+    }
+
+    #[test]
+    fn a_wipe_removes_the_media_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        create_db_at(&main).unwrap();
+        let cache = crate::media::store::path_for(&main);
+        assert_eq!(cache, dir.path().join("atlas.media.db"));
+        for suffix in ["", "-wal", "-shm"] {
+            std::fs::write(format!("{}{suffix}", cache.display()), b"x").unwrap();
+        }
+        wipe(&main).unwrap();
+        for suffix in ["", "-wal", "-shm"] {
+            assert!(!std::path::Path::new(&format!("{}{suffix}", cache.display())).exists(), "{suffix}");
+        }
     }
 }

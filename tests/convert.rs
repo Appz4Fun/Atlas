@@ -675,3 +675,15 @@ fn converted_shards_have_empty_stage_tables() {
         assert_eq!(rows, 0);
     }
 }
+
+#[test]
+fn a_convert_leaves_the_media_cache_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = dir.path().join("atlas.db");
+    old_database(&main);
+    db::create_db_at(&main).unwrap();
+    let cache = atlas::media::store::path_for(&main);
+    std::fs::write(&cache, b"known bytes").unwrap();
+    convert::run(&main, &|_| {}).unwrap();
+    assert_eq!(std::fs::read(&cache).unwrap(), b"known bytes");
+}

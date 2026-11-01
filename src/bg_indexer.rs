@@ -474,6 +474,9 @@ impl Scheduler {
         if let Some(predb) = self.predb.get() {
             stats.extra.insert("predb".into(), predb.snapshot());
         }
+        if self.stage_shape.4 {
+            stats.extra.insert("media".into(), crate::media::shared().snapshot());
+        }
         stats.extra.insert("workers".into(), json!(self.workers));
         stats.extra.insert("pid".into(), json!(std::process::id()));
         let mut load = crate::profile::LOAD.snapshot();
@@ -637,12 +640,12 @@ async fn worker(sched: Arc<Scheduler>, server: usize, db: Db) {
     }
 }
 
-/// on, database threads, net threads, and whether PreDB's service runs
-type StageShape = (bool, usize, usize, bool);
+/// on, database threads, net threads, and whether PreDB's service and the media fan-out run
+type StageShape = (bool, usize, usize, bool, bool);
 
 fn stage_shape(config: &Config) -> StageShape {
     let p = &config.postprocess;
-    (p.enabled, p.workers, p.body_connections, config.predb.enabled)
+    (p.enabled, p.workers, p.body_connections, config.predb.enabled, config.media.any_provider())
 }
 
 /// a config the running indexer cant take on as it is
@@ -855,6 +858,10 @@ async fn run_servers(
             }
             Err(e) => eprintln!("predb: {e:#}"),
         }
+    }
+    if config.postprocess.enabled && config.media.any_provider() {
+        let s = sched.clone();
+        tasks.spawn(crate::media::run(crate::media::shared(), db.clone(), move || s.stopping()));
     }
     for &(server, count) in &plan {
         for _ in 0..count {
@@ -1248,6 +1255,14 @@ mod tests {
             assert!(matches!(next_work(&sched, server, &db, false).await, Some(Work::Group(_))));
             assert!(matches!(next_work(&sched, server, &db, false).await, Some(Work::Group(_))));
         });
+    }
+
+    #[test]
+    fn a_provider_turning_on_or_off_rebuilds() {
+        let mut config = Config::default();
+        let before = stage_shape(&config);
+        config.media.tvmaze.enabled = true;
+        assert_ne!(stage_shape(&config), before);
     }
 
     #[test]
