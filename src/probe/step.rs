@@ -151,7 +151,7 @@ impl Step for ProbeStep {
             }
             let total = file.expected.unwrap_or(file.parts_seen);
             if total > 2 {
-                let middle = ctx.segments(file.id, &SegmentPick::Parts(vec![total / 2])).map_err(retry)?;
+                let middle = ctx.segments(file.id, &SegmentPick::Parts(vec![(total + 1) / 2])).map_err(retry)?;
                 if let Some(middle) = middle.into_iter().next()
                     && let Some(there) = ctx.article_exists(&middle.message_id, &file.filename)?
                 {
