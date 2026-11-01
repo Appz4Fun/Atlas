@@ -470,3 +470,40 @@ fn stopping_ends_a_poll() {
     assert_eq!(got, PollEnd::Stopped);
     assert_eq!(f.requests().len(), 1);
 }
+
+#[test]
+fn an_rss_feed_goes_through_a_poll() {
+    let mut f = fixture();
+    let source = spec("predb_me").unwrap();
+    let doc = r#"<rss><channel><item><title>Alpha.Beta.2024.1080p.WEB-DL.H.264-TESTGRP</title></item></channel></rss>"#;
+    f.script(source, 1, doc);
+    assert_eq!(f.poll(source, &cfg()), PollEnd::CaughtUp);
+    let count: i64 =
+        f.conn.query_row("select count(*) from titles where source = ?", [source.id], |r| r.get(0)).unwrap();
+    assert_eq!(count, 1);
+}
+
+#[test]
+fn a_catalogue_is_read_once_a_week() {
+    let mut f = fixture();
+    let source = spec("nswdb").unwrap();
+    let doc =
+        "<releases><release><id>1</id><releasename>Alpha.Beta.2024.NSW-TESTGRP</releasename></release></releases>";
+    f.script(source, 1, doc);
+    assert_eq!(f.poll(source, &cfg()), PollEnd::CaughtUp);
+    let asked = f.fetch.urls.lock().unwrap().len();
+    assert_eq!(f.poll(source, &cfg()), PollEnd::CaughtUp);
+    assert_eq!(f.fetch.urls.lock().unwrap().len(), asked, "no request inside the week");
+}
+
+#[test]
+fn one_answer_can_hold_only_so_many_titles() {
+    let mut f = fixture();
+    let source = spec("predb_me").unwrap();
+    let items: String =
+        (0..5_001).map(|n| format!("<item><title>Alpha.Beta.{n}.1080p-TESTGRP</title></item>")).collect();
+    f.script(source, 1, &format!("<rss><channel>{items}</channel></rss>"));
+    assert!(matches!(f.poll(source, &cfg()), PollEnd::Failed(_)));
+    let count: i64 = f.conn.query_row("select count(*) from titles", [], |r| r.get(0)).unwrap();
+    assert_eq!(count, 0);
+}

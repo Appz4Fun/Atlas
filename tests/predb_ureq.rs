@@ -44,3 +44,25 @@ fn a_redirect_isnt_followed() {
     thread.join().unwrap();
     assert!(second.recv_timeout(Duration::from_millis(200)).unwrap().is_none());
 }
+
+fn gzipped(text: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    gz.write_all(text).unwrap();
+    gz.finish().unwrap()
+}
+
+#[test]
+fn a_gzipped_body_arrives_as_text_within_the_limit() {
+    let (server, port) = server();
+    let fetch = UreqFetch::new(Duration::from_secs(5));
+    let thread = std::thread::spawn(move || {
+        let request = server.recv().unwrap();
+        request.respond(tiny_http::Response::from_data(gzipped(b"some text"))).unwrap();
+        let request = server.recv().unwrap();
+        request.respond(tiny_http::Response::from_data(gzipped(&vec![b'x'; 9 << 20]))).unwrap();
+    });
+    assert_eq!(fetch.get(&format!("http://127.0.0.1:{port}/a")).unwrap().body, "some text");
+    assert!(fetch.get(&format!("http://127.0.0.1:{port}/b")).is_err(), "a small body that expands past the cap");
+    thread.join().unwrap();
+}

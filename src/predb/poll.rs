@@ -2,6 +2,7 @@
 //!
 //! Ported from newznab-tmux `app/Console/Commands/PredbImportFeed.php` and `config/predb_feeds.php`, GPLv3.
 
+use std::io::Read;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
@@ -9,11 +10,12 @@ use rusqlite::{Connection, params};
 
 use crate::config::PredbConfig;
 
-use super::feeds::{FeedSpec, ParseError, page_url};
+use super::feeds::{FeedSpec, ParseError, Parser, page_url};
 use super::import::{Counts, Entry, import};
 
 const MAX_BODY: u64 = 8 << 20;
 const MAX_BACKOFF: i64 = 21_600;
+const MAX_ENTRIES: usize = 5_000;
 const RATE_LIMIT_DEFAULT: i64 = 60;
 
 pub struct HttpReply {
@@ -56,9 +58,26 @@ impl Fetch for UreqFetch {
         let header = |name: &str| resp.headers().get(name).and_then(|v| v.to_str().ok()).map(String::from);
         let (status, retry_after, rate_reset) =
             (resp.status().as_u16(), header("retry-after"), header("x-ratelimit-reset"));
-        let body = resp.body_mut().with_config().limit(MAX_BODY).read_to_string().map_err(|e| e.to_string())?;
+        let bytes = resp.body_mut().with_config().limit(MAX_BODY).read_to_vec().map_err(|e| e.to_string())?;
+        let body = String::from_utf8(unpack(bytes)?).map_err(|e| e.to_string())?;
         Ok(HttpReply { status, retry_after, rate_reset, body })
     }
+}
+
+/// A gzipped body as its text, no longer than any other: a small one can expand to anything.
+fn unpack(bytes: Vec<u8>) -> Result<Vec<u8>, String> {
+    if !bytes.starts_with(&[0x1f, 0x8b]) {
+        return Ok(bytes);
+    }
+    let mut text = Vec::new();
+    flate2::read::GzDecoder::new(bytes.as_slice())
+        .take(MAX_BODY + 1)
+        .read_to_end(&mut text)
+        .map_err(|e| e.to_string())?;
+    if text.len() as u64 > MAX_BODY {
+        return Err("a gzipped body over the limit".into());
+    }
+    Ok(text)
 }
 
 #[derive(Debug, PartialEq)]
@@ -122,17 +141,31 @@ impl Poller<'_> {
         if reply.status == 429 {
             return Err(Trouble::RateLimited(wait_seconds(&reply, self.now_after(), RATE_LIMIT_DEFAULT)));
         }
+        if reply.status == 403 && self.spec.key == "predatabase" {
+            return Err(Trouble::RateLimited(wait_seconds(&reply, self.now_after(), RATE_LIMIT_DEFAULT)));
+        }
         if reply.status != 200 {
             return Err(Trouble::Failed(format!("HTTP {}", reply.status)));
         }
-        let value: serde_json::Value =
-            serde_json::from_str(&reply.body).map_err(|e| Trouble::Failed(format!("bad JSON: {e}")))?;
-        (self.spec.parse)(&value, page).map_err(|e| match e {
+        let parsed = match self.spec.parse {
+            Parser::Json(parse) => {
+                let value: serde_json::Value =
+                    serde_json::from_str(&reply.body).map_err(|e| Trouble::Failed(format!("bad JSON: {e}")))?;
+                parse(&value, page)
+            }
+            Parser::Text(parse) => parse(&reply.body),
+        };
+        let entries = parsed.map_err(|e| match e {
             ParseError::RateLimited(_) => {
                 Trouble::RateLimited(wait_seconds(&reply, self.now_after(), RATE_LIMIT_DEFAULT))
             }
             ParseError::Shape(why) => Trouble::Failed(why),
-        })
+        });
+        // however a source reads its body, one answer is at most this much work for the writer
+        if entries.as_ref().is_ok_and(|e| e.len() > MAX_ENTRIES) {
+            return Err(Trouble::Failed("too many titles in one answer".into()));
+        }
+        entries
     }
 }
 
@@ -335,6 +368,14 @@ pub fn poll_source(
             })
         },
     )?;
+    if spec.refresh_secs > 0
+        && let Some(last) = row.last_ok_at
+        && now.saturating_sub(last) < spec.refresh_secs
+    {
+        let next = last.saturating_add(spec.refresh_secs);
+        conn.execute("update feeds set next_poll_at = ?1 where source = ?2", params![next, spec.id])?;
+        return Ok(PollEnd::CaughtUp);
+    }
     let poll_secs = i64::from(cfg.poll_minutes.max(1)) * 60;
     if file_bytes(conn)? > cfg.max_db_mb.saturating_mul(1 << 20) {
         return failed(conn, spec.id, "the PreDB file is over max_db_mb".into(), row.failures, poll_secs, now);
