@@ -84,4 +84,5 @@ fn copies_are_found_across_shards_and_go_with_their_release() {
     shard_b.execute("delete from releases where id = ?", [twin]).unwrap();
     let found: Vec<(Copy, i64)> = copies(first).unwrap().into_iter().map(|(kind, r)| (kind, r.id)).collect();
     assert_eq!(found, [(Copy::Pair, pair)]);
+    assert_eq!(cluster_count_with(&db::open().unwrap(), ClusterKind::Twins).unwrap(), 0, "its cluster goes too");
 }

@@ -209,7 +209,13 @@ impl ClusterKind {
 fn all_fingerprints(conn: &Connection) -> String {
     (0..store::SHARDS)
         .filter(|s| conn.prepare(&format!("select 1 from s{s}.release_fingerprint limit 0")).is_ok())
-        .map(|s| format!("select release_id, posted, content from s{s}.release_fingerprint"))
+        // a row can outlive its release, and a blocked group's are never shown
+        .map(|s| {
+            format!(
+                "select f.release_id, f.posted, f.content from s{s}.release_fingerprint f
+                 join s{s}.releases r on r.id = f.release_id where not atlas_blocked(r.group_name)"
+            )
+        })
         .collect::<Vec<_>>()
         .join(" union all ")
 }

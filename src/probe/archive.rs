@@ -196,10 +196,12 @@ fn zip(data: &[u8]) -> ArchiveHead {
         }
         .to_string(),
     );
-    head.crc32 = le32(data, 14);
+    // with this flag, the sizes and checksum come after the data, and here they're zeros
+    let later = flags & 0x0008 != 0;
+    head.crc32 = le32(data, 14).filter(|_| !later);
     let name_len = usize::from(le16(data, 26).unwrap_or(0));
     let extra_len = usize::from(le16(data, 28).unwrap_or(0));
-    if let (Some(packed), Some(unpacked)) = (le32(data, 18), le32(data, 22)) {
+    if let (Some(packed), Some(unpacked), false) = (le32(data, 18), le32(data, 22), later) {
         // past 4 GiB these are markers, and the extra field has the sizes. Without it they stay unknown.
         let extra = data.get(30 + name_len..30 + name_len + extra_len).unwrap_or_default();
         let (long_unpacked, long_packed) = crate::archive::zip::zip64_sizes(extra, unpacked, packed);
@@ -230,6 +232,17 @@ mod tests {
         data.extend([0, 0, 0x7a, 0x00, 0x80, 0x07, 0x00, 0xff, 0xff, 0xff, 0xff]);
         data.resize(64, 0);
         assert_eq!(parse(&data).unwrap().format, "RAR4");
+    }
+
+    #[test]
+    fn a_streamed_zip_has_no_sizes_up_front() {
+        let mut data = ZIP.to_vec();
+        data.resize(31, 0);
+        data[6..8].copy_from_slice(&8u16.to_le_bytes());
+        data[26..28].copy_from_slice(&1u16.to_le_bytes());
+        data[30] = b'a';
+        let head = parse(&data).unwrap();
+        assert_eq!((head.unpacked, head.packed, head.crc32), (None, None, None));
     }
 
     #[test]
