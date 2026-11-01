@@ -1749,7 +1749,7 @@ pub enum SegmentPick {
 }
 
 /// How many parts a `seen` bitmap has.
-pub(crate) fn seen_count(bits: &[u8]) -> i64 {
+pub fn seen_count(bits: &[u8]) -> i64 {
     bits.iter().map(|b| i64::from(b.count_ones())).sum()
 }
 

@@ -14,6 +14,7 @@ use crate::archive::Password;
 use crate::category::{TABLE, UNCATEGORIZED, label, parse_filter};
 use crate::media::query::MediaAttrs;
 use crate::media::title::Kind;
+use crate::release_info;
 use crate::search::{ReleaseRow, get_release};
 use crate::ui::{fmt_date, fmt_size};
 
@@ -463,7 +464,9 @@ fn release_page(args: &HashMap<String, String>) -> ApiResponse {
     let category = crate::category::categories_of(&ids).unwrap_or_default().get(&id).copied();
     let inner = crate::archive::store::view(id);
     let media = crate::media::query::attrs_of(&ids).unwrap_or_default().remove(&id);
-    html(200, release_html(&release, category, &inner, media.as_ref()))
+    let names = release_info::names(id).unwrap_or_default();
+    let contents = release_info::contents(id).unwrap_or_default();
+    html(200, release_html(&release, category, &inner, media.as_ref(), names.as_ref(), &contents))
 }
 
 fn release_problem(status: u16, level: &str, title: &str, body: &str) -> ApiResponse {
@@ -480,6 +483,8 @@ fn release_html(
     category: Option<i64>,
     inner: &crate::archive::store::InnerView,
     media: Option<&MediaAttrs>,
+    names: Option<&release_info::Names>,
+    contents: &release_info::Contents,
 ) -> String {
     let category = category.unwrap_or(UNCATEGORIZED);
     let mut tags = String::new();
@@ -488,6 +493,9 @@ fn release_html(
     }
     tags.push_str(&password_tag(inner.password.as_ref()));
     tags.push_str(&if r.complete { tag("tag-ok", "COMPLETE") } else { tag("tag-warn", "INCOMPLETE") });
+    if names.is_some_and(|n| n.obfuscated) {
+        tags.push_str(&tag("tag-warn", "OBFUSCATED"));
+    }
 
     let mut facts = String::new();
     let mut fact = |name: &str, value: String| {
@@ -500,10 +508,35 @@ fn release_html(
     fact("Posted", escape(&fmt_date(r.posted_date.as_deref())));
     fact("Group", escape(&r.group_name));
     if let Some(poster) = &r.poster {
-        fact("Poster", escape(poster));
+        let poster = release_info::parse_poster(poster);
+        fact("Poster", escape(&poster.name.unwrap_or_default()));
+        if let Some(email) = poster.email {
+            let made_up = if release_info::looks_made_up(&email) { tag("tag-warn", "MADE UP") } else { String::new() };
+            fact("Email", format!("{}{made_up}", escape(&email)));
+        }
+    }
+    if let Some(n) = names {
+        if n.posted != r.name {
+            fact("Posted as", escape(&n.posted));
+        }
+        if let Some(from) = n.source.and_then(release_info::name_source_label) {
+            fact("Name from", escape(from));
+        }
     }
     if let Some(parts) = r.parts {
         fact("Parts", parts.to_string());
+    }
+    if contents.files > 0 {
+        fact("Files", contents.files.to_string());
+    }
+    if contents.par2_files > 0 {
+        fact("PAR2 files", format!("{} ({} recovery)", contents.par2_files, contents.recovery_volumes));
+    }
+    if let Some(missing) = contents.missing_per_mille() {
+        fact("Articles", health(contents, missing));
+    }
+    if let Some(repair) = contents.repair_per_mille().filter(|_| contents.recovery_volumes > 0) {
+        fact("Repair", format!("about {} ({})", per_mille(repair), escape(&fmt_size(Some(contents.recovery_bytes)))));
     }
     let links = media.map(|m| id_links(m.kind, &m.ids)).unwrap_or_default();
     if !links.is_empty() {
@@ -546,6 +579,23 @@ fn release_html(
     )
 }
 
+/// 30 as "3%", 25 as "2.5%"
+fn per_mille(n: i64) -> String {
+    if n % 10 == 0 { format!("{}%", n / 10) } else { format!("{}.{}%", n / 10, n % 10) }
+}
+
+/// How much is there, and whether the recovery volumes would cover what isn't.
+fn health(contents: &release_info::Contents, missing: i64) -> String {
+    let counts = format!("{} of {}", contents.articles_seen, contents.articles_expected);
+    if missing == 0 && contents.articles_seen == contents.articles_expected {
+        return format!("{counts}{}", tag("tag-ok", "ALL THERE"));
+    }
+    let repairable =
+        contents.recovery_volumes > 0 && contents.repair_per_mille().is_some_and(|repair| repair >= missing);
+    let verdict = if repairable { tag("tag-warn", "REPAIRABLE") } else { tag("tag-bad", "NOT ENOUGH RECOVERY") };
+    format!("{counts}, {} missing{verdict}", per_mille(missing.max(1)))
+}
+
 /// Where the ids a release matched lead, on the sites that give them out.
 fn id_links(kind: i64, ids: &crate::media::resolve::Ids) -> String {
     let link = |name: &str, url: String| format!("<a href=\"{}\" rel=\"noreferrer\">{name}</a>", attr(&url));
@@ -562,6 +612,10 @@ fn id_links(kind: i64, ids: &crate::media::resolve::Ids) -> String {
     }
     if let Some(id) = ids.tvmaze {
         out.push(link("TVmaze", format!("https://www.tvmaze.com/shows/{id}")));
+    }
+    if let Some(id) = ids.trakt {
+        let id_type = if kind == Kind::Tv as i64 { "show" } else { "movie" };
+        out.push(link("Trakt", format!("https://trakt.tv/search/trakt/{id}?id_type={id_type}")));
     }
     out.join(" · ")
 }
@@ -733,6 +787,25 @@ mod tests {
     }
 
     #[test]
+    fn health_compares_what_is_missing_with_what_can_be_repaired() {
+        let whole = release_info::Contents { articles_seen: 100, articles_expected: 100, ..Default::default() };
+        assert!(health(&whole, 0).contains("ALL THERE"));
+        let holes = release_info::Contents {
+            articles_seen: 97,
+            articles_expected: 100,
+            recovery_volumes: 3,
+            data_bytes: 1000,
+            recovery_bytes: 100,
+            ..Default::default()
+        };
+        let text = health(&holes, holes.missing_per_mille().unwrap());
+        assert!(text.contains("3% missing") && text.contains("REPAIRABLE"), "{text}");
+        let thin = release_info::Contents { recovery_bytes: 10, ..holes };
+        assert!(health(&thin, 30).contains("NOT ENOUGH RECOVERY"));
+        assert_eq!(per_mille(25), "2.5%");
+    }
+
+    #[test]
     fn media_labels_and_id_links() {
         let episode = MediaAttrs { season: Some(1), episode: Some(2), ..MediaAttrs::default() };
         assert_eq!(media_label(&episode).as_deref(), Some("S01E02"));
@@ -743,5 +816,7 @@ mod tests {
         assert!(movie.contains("https://www.imdb.com/title/tt0133093/"), "{movie}");
         assert!(movie.contains("https://www.themoviedb.org/movie/603"), "{movie}");
         assert!(id_links(Kind::Tv as i64, &ids).contains("https://www.themoviedb.org/tv/603"));
+        let trakt = crate::media::resolve::Ids { trakt: Some(9), ..Default::default() };
+        assert!(id_links(Kind::Tv as i64, &trakt).contains("trakt.tv/search/trakt/9?id_type=show"));
     }
 }

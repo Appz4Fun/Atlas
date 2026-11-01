@@ -32,6 +32,7 @@ pub mod postprocess;
 pub mod predb;
 pub mod procs;
 pub mod profile;
+pub mod release_info;
 pub mod sab;
 pub mod search;
 pub mod stats_dashboard;
