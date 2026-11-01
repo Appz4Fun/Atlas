@@ -13,6 +13,7 @@ use crate::api::{ApiResponse, escape, find_releases, get_nzb, parse_query};
 use crate::archive::Password;
 use crate::category::{TABLE, UNCATEGORIZED, label, parse_filter};
 use crate::media::query::MediaAttrs;
+use crate::media::title::Kind;
 use crate::search::{ReleaseRow, get_release};
 use crate::ui::{fmt_date, fmt_size};
 
@@ -504,7 +505,7 @@ fn release_html(
     if let Some(parts) = r.parts {
         fact("Parts", parts.to_string());
     }
-    let links = media.map(|m| id_links(&m.ids)).unwrap_or_default();
+    let links = media.map(|m| id_links(m.kind, &m.ids)).unwrap_or_default();
     if !links.is_empty() {
         fact("Links", links);
     }
@@ -546,14 +547,15 @@ fn release_html(
 }
 
 /// Where the ids a release matched lead, on the sites that give them out.
-fn id_links(ids: &crate::media::resolve::Ids) -> String {
+fn id_links(kind: i64, ids: &crate::media::resolve::Ids) -> String {
     let link = |name: &str, url: String| format!("<a href=\"{}\" rel=\"noreferrer\">{name}</a>", attr(&url));
     let mut out = Vec::new();
     if let Some(id) = ids.imdb {
         out.push(link("IMDb", format!("https://www.imdb.com/title/tt{id:07}/")));
     }
     if let Some(id) = ids.tmdb {
-        out.push(link("TMDB", format!("https://www.themoviedb.org/movie/{id}")));
+        let section = if kind == Kind::Tv as i64 { "tv" } else { "movie" };
+        out.push(link("TMDB", format!("https://www.themoviedb.org/{section}/{id}")));
     }
     if let Some(id) = ids.tvdb {
         out.push(link("TheTVDB", format!("https://thetvdb.com/dereferrer/series/{id}")));
@@ -736,7 +738,10 @@ mod tests {
         assert_eq!(media_label(&episode).as_deref(), Some("S01E02"));
         assert_eq!(media_label(&MediaAttrs { year: Some(2024), ..MediaAttrs::default() }).as_deref(), Some("2024"));
         assert_eq!(media_label(&MediaAttrs::default()), None);
-        let links = id_links(&crate::media::resolve::Ids { imdb: Some(133093), ..Default::default() });
-        assert!(links.contains("https://www.imdb.com/title/tt0133093/"), "{links}");
+        let ids = crate::media::resolve::Ids { imdb: Some(133093), tmdb: Some(603), ..Default::default() };
+        let movie = id_links(Kind::Movie as i64, &ids);
+        assert!(movie.contains("https://www.imdb.com/title/tt0133093/"), "{movie}");
+        assert!(movie.contains("https://www.themoviedb.org/movie/603"), "{movie}");
+        assert!(id_links(Kind::Tv as i64, &ids).contains("https://www.themoviedb.org/tv/603"));
     }
 }
