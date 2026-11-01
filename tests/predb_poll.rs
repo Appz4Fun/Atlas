@@ -507,3 +507,30 @@ fn one_answer_can_hold_only_so_many_titles() {
     let count: i64 = f.conn.query_row("select count(*) from titles", [], |r| r.get(0)).unwrap();
     assert_eq!(count, 0);
 }
+
+#[test]
+fn a_feed_says_how_many_titles_its_answer_held() {
+    let mut f = fixture();
+    let source = spec("predb_me").unwrap();
+    let doc = r#"<rss><channel><item><title>Alpha.Beta.2024.1080p.WEB-DL.H.264-TESTGRP</title></item><item><title>Has Spaces</title></item></channel></rss>"#;
+    f.script(source, 1, doc);
+    f.poll(source, &cfg());
+    f.script(source, 1, doc);
+    let rows = |f: &Fixture| -> Option<i64> {
+        f.conn.query_row("select last_rows from feeds where source = ?", [source.id], |r| r.get(0)).unwrap()
+    };
+    assert_eq!(rows(&f), Some(1), "only what it could read");
+    f.poll(source, &cfg());
+    assert_eq!(rows(&f), Some(1), "nothing new, and still read");
+}
+
+#[test]
+fn an_older_file_gains_the_column() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("atlas.predb.db");
+    let conn = create(&path).unwrap();
+    conn.execute_batch("alter table feeds drop column last_rows").unwrap();
+    drop(conn);
+    let conn = create(&path).unwrap();
+    assert!(conn.prepare("select last_rows from feeds").is_ok());
+}

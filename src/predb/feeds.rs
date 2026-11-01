@@ -191,7 +191,7 @@ pub const SOURCES: &[FeedSpec] = &[
         ..ONE_PAGE
     },
     rss!(9, "predb_me", "https://predb.me/?rss=1"),
-    rss!(10, "scnsrc_me", "https://www.scnsrc.me/feed", spaced, map_category),
+    rss!(10, "scnsrc_me", "https://www.scnsrc.me/feed/", spaced, map_category),
     rss!(11, "eztv", "https://eztvx.to/ezrss.xml", spaced),
     rss!(12, "nfodb", "https://nfodb.net.ru/rss.xml", map_category, listed_only),
     rss!(13, "one_techno", "https://1techno.org/rss.xml", map_category, listed_only),

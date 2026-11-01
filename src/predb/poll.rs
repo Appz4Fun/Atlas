@@ -123,6 +123,8 @@ struct Poller<'a> {
     pause: &'a dyn Fn(Duration) -> bool,
     now: i64,
     first: bool,
+    /// titles in the first answer
+    rows: Option<i64>,
 }
 
 impl Poller<'_> {
@@ -164,6 +166,9 @@ impl Poller<'_> {
         // however a source reads its body, one answer is at most this much work for the writer
         if entries.as_ref().is_ok_and(|e| e.len() > MAX_ENTRIES) {
             return Err(Trouble::Failed("too many titles in one answer".into()));
+        }
+        if let (None, Ok(found)) = (self.rows, &entries) {
+            self.rows = Some(found.len() as i64);
         }
         entries
     }
@@ -389,9 +394,14 @@ pub fn poll_source(
         pause,
         now,
         first: true,
+        rows: None,
     };
     let walked = walk(conn, &mut poller, &row, cfg);
     let answered_at = poller.now_after();
+    conn.execute(
+        "update feeds set last_rows = coalesce(?1, last_rows) where source = ?2",
+        params![poller.rows, spec.id],
+    )?;
     match walked {
         Ok(gap) => {
             conn.execute(

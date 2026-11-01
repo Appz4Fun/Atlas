@@ -227,7 +227,7 @@ impl Service {
             let top: i64 = conn.query_row("select coalesce(max(id), 0) from titles", [], |r| r.get(0))?;
             let behind = (top - meta("late_after_id")?).max(0);
             let mut stmt = conn.prepare(
-                "select key, last_ok_at, last_error, next_poll_at, failures, inserted, updated from feeds order by source",
+                "select key, last_ok_at, last_error, next_poll_at, failures, inserted, updated, last_rows from feeds order by source",
             )?;
             let sources = stmt
                 .query_map([], |r| {
@@ -238,6 +238,7 @@ impl Service {
                         "next_poll_at": r.get::<_, i64>(3)?,
                         "failures": r.get::<_, i64>(4)?,
                         "inserted": r.get::<_, i64>(5)?,
+                        "last_rows": r.get::<_, Option<i64>>(7)?,
                         "updated": r.get::<_, i64>(6)?,
                     }))
                 })?
