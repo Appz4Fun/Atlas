@@ -27,87 +27,74 @@ A different encode of the same title is not the same content, so it's neither a 
 
 ## Work
 
-### 1. Store content hashes
+Built on the \`feat/release-details\` branch. Instead of cluster tables, each release keeps two fingerprints in its shard, and its copies are looked up in every shard when its page opens. There's nothing to keep in step, and a purged release takes its row with it.
 
-- [ ] Add a shard table for inner-file hashes: release, file name, size, PAR2 `md5`, `md5_16k`, and the CRC where the container gives one.
-- [ ] Write it from the archive stage, where the inventory is already parsed.
-- [ ] Backfill releases that were already inspected. Check the disk cost on real data first: `max_names_mb` already limits how much inner-file data is kept.
+### Done
 
-### 2. Fingerprints
+- [x] **Posted fingerprint:** sizes and MD5s from a complete PAR2 set. Equal ones are byte-identical, which makes a **twin**.
+- [x] **Content fingerprint:** exact sizes of the real files, at least 1 MiB, leaving out samples, with names ignored. Equal ones with different posted files make a **pair**.
+- [x] Written by the archive and PAR2 steps as releases are read.
+- [x] \`atlas --fingerprints --apply\` fills in content fingerprints from stored data. It finds pairs only, because PAR2 hashes were never stored.
+- [x] Web UI: "Other copies" on the release page, with TWIN and PAIR tags.
+- [x] Tests: same sizes with different hashes make no twin, another encode makes no pair, packed files make no content fingerprint, copies are found across shards, and a purged release is no one's copy.
 
-- [ ] **Content fingerprint:** a hash of the sorted (inner size, hash) list, leaving out PAR2 and sample files. This one finds clusters.
-- [ ] **Packaging fingerprint:** container type, file count, article count and each file's article sizes. This one separates twins from pairs.
-- [ ] Store both per release, in the shard, and index them.
-- [ ] Decide what to do when only sizes are known, with no hashes. See open questions.
+### Left
 
-### 3. Build clusters
-
-- [ ] Add `dup_cluster` and `dup_member` tables: release, cluster, and kind (`pair` or `twin`), plus what proved the link.
-- [ ] Clusters cross shards, because a release's shard follows its group, so matching can't stay inside one shard.
-- [ ] Add a post-process stage that matches new releases as they finish, and a one-off pass for the existing backlog.
-- [ ] Rerun when a release gains inner-file data or is renamed. Remove members when a release is purged.
-
-### 4. Twin rule
-
-- [ ] Same content fingerprint and same packaging fingerprint makes a **twin candidate**.
-- [ ] A candidate becomes a twin only when PAR2 hashes match, or article checks prove the bytes. Swapping in an article from a release that only looks the same would corrupt the download. RustyGet uses the same rule. The cost is fewer twins where a release has no PAR2.
-- [ ] Same content fingerprint with different packaging makes a **pair**.
-- [ ] Encrypted archives: the inner hashes may not be readable, and the same files encrypted twice differ on the wire. Never call these twins on size alone.
-
-### 5. Use it
-
-- [ ] Web UI: show "2 twins, 1 pair" on a result, and list the members on the release page.
-- [ ] Newznab API: add attributes for the cluster id and kind, without changing existing results.
-- [ ] Search: option to collapse a cluster into one row, off by default.
+- [ ] Run \`--fingerprints\` on the real data, then measure: how many copies, the share of each kind, a hand check of a sample for false matches, and how long it takes with the indexer running.
+- [ ] Twins for existing releases: their PAR2 sets have to be read again, which costs a body fetch per release. Decide whether that's worth a walk.
+- [ ] Web UI: show "2 twins, 1 pair" in results. It's about 400 lookups a page, so it needs measuring first.
+- [ ] Newznab API: add attributes for the kind of copy, without changing existing results.
+- [ ] Search: option to collapse copies into one row, off by default.
 - [ ] NZB download: when a twin has articles a release is missing, build the NZB from both.
-
-### 6. Check it
-
-- [ ] Tests: a RAR5 and 7z of the same files make a pair. Two identical 7z postings make a twin. Same sizes with different hashes make nothing. Purging a member keeps the cluster right.
-- [ ] Measure on a snapshot before turning it on: how many clusters, the share of each kind, and a hand check of a sample for false matches.
-- [ ] Measure how long the stage takes and how much disk it uses, with the indexer running.
+- [ ] Encrypted archives with hidden names have no listing, so they get no content fingerprint. They can still be twins through PAR2.
 
 ## Part 2: release details
 
-Everything below goes on the release page in the web UI, and into the Newznab API where a client can use it.
+Everything below goes on the release page in the web UI. None of it is in the Newznab API yet, which is still to do.
 
 ### About the NZB itself
 
-- [ ] **Poster and email.** `releases.poster` already holds the raw From header. Split it into a name and an email, and show both. Say plainly when the address is obviously made up, because posters rarely use a real one.
-- [ ] **PAR2 file count.** Count them from `files` for each release: the index file and the recovery volumes.
-- [ ] **Obfuscated or not.** `releases.is_obfuscated` exists. Show it, plus the original name next to the display name, and where the display name came from (NFO, PAR2 or an inner file).
-- [ ] **Repair capacity.** How much can be repaired if the download is bad: recovery blocks against total blocks, as a percentage and a size. `par2.rs` doesn't read block counts yet, so read the block size from the PAR2 main packet and count blocks from the `volNNN+MM` file names, or from the recovery packets.
-- [ ] **Health.** Articles seen against articles expected, from `files.seen` and `files.expected`, so missing articles can be compared with repair capacity: "3% missing, 10% repairable".
+- [x] **Poster and email.** `releases.poster` already holds the raw From header. Split it into a name and an email, and show both. Say plainly when the address is obviously made up, because posters rarely use a real one.
+- [x] **PAR2 file count.** Count them from `files` for each release: the index file and the recovery volumes.
+- [x] **Obfuscated or not.** `releases.is_obfuscated` exists. Show it, plus the original name next to the display name, and where the display name came from (NFO, PAR2 or an inner file).
+- [x] **Repair capacity,** as an estimate from the size of the recovery volumes against the size of the data.
+- [ ] Exact repair capacity from PAR2 block counts: read the block size from the main packet.
+- [x] **Health.** Articles seen against articles expected, from `files.seen` and `files.expected`, so missing articles can be compared with repair capacity: "3% missing, 10% repairable".
 
 ### Encryption
 
-- [ ] **Encrypted or not, and what type.** The listing already works out `encrypted` and `headers_encrypted`, but only a yes, maybe or no is stored. Store the type too: RAR5 or RAR4 AES, 7z AES-256, ZIP AES or ZipCrypto, and whether file names are hidden.
-- [ ] **The password.** Atlas only knows whether there is one, not what it is. Look for it where posters leave it: the NFO, the subject, the file name (`{{password}}` style) and the release name. Store where it came from, and show it as "found in the NFO", because it's unverified until something tries it.
+- [x] **Encrypted or not, and what type.** The listing already works out `encrypted` and `headers_encrypted`, but only a yes, maybe or no is stored. Store the type too: RAR5 or RAR4 AES, 7z AES-256, ZIP AES or ZipCrypto, and whether file names are hidden.
+- [x] **The password,** from the release name, file names and subjects when the page opens, and from an NFO when the NFO step reads one. Shown as "found in the NFO, not tried".
+- [ ] NFOs of well-named releases: the NFO step only reads an NFO when the release needs a name, so an encrypted release with a good name doesn't get its NFO read.
 - [ ] Try a found password against the archive header, which proves it without downloading the release. Show "verified" only then.
 
 ### Parsed release tags
 
-- [ ] Parse names the way the Kodi plugin does with PTT (parsett), so both read a name the same way. `media/parse.rs` only gets title, year, season, episode, air date and a quality score today. Either port PTT's rules to Rust or run the same test names through both and compare.
-- [ ] Tags to show: resolution, Dolby Vision, HDR10, HDR10+, source (BluRay, WEB-DL, Remux), video and audio codec, channels, release group, year, edition, languages.
-- [ ] **Where it was ripped from:** the streaming service tag, such as AMZN, NF, DSNP, HMAX or ATVP.
+- [x] Parse names the way the Kodi add-on does with PTT, in `release_tags.rs`. Compared with PTT on 1,990 real names: resolution, HDR and bit depth match on all of them, other tags on 96% to 99.9%. Some differences are PTT's mistakes, such as reading `READ.NFO` as Netflix.
+- [ ] Languages cover only the common names so far.
+- [x] Tags to show: resolution, Dolby Vision, HDR10, HDR10+, source (BluRay, WEB-DL, Remux), video and audio codec, channels, release group, year, edition, languages.
+- [x] **Where it was ripped from:** the streaming service tag, such as AMZN, NF, DSNP, HMAX or ATVP.
 - [ ] Filter and search by these tags, so "2160p DV Remux" works as filters instead of words in a name.
 
 ### TMDB and TVDB metadata
 
-- [ ] `media_titles` only keeps ids and a found title. Store the metadata as well: overview, genres, runtime, cast, network, status, and first air or release date.
-- [ ] **Blu-ray release date:** TMDB's release dates list has physical releases by country. Show it next to the theatrical date.
-- [ ] **Posters and backdrops.** Keep the image paths and show them on the release page and as thumbnails in results. The page's CSP needs `img-src` for the image host, or Atlas has to serve the images itself. Serving them keeps the UI working with no internet and stops viewers' browsers calling out, so prefer that, with a size-limited cache.
-- [ ] **Links:** IMDb, TMDB, TheTVDB, Trakt and TVmaze.
-- [ ] Keep requests inside each provider's rate limits, and refresh on a schedule through the existing `next_check`.
+- [x] Overview, genres, runtime, cast, network, status, and first air or release date, from TMDB when a release is opened, kept for 30 days in `atlas.details.db`. A title known only by IMDb or TheTVDB id is found through TMDB.
+- [ ] TheTVDB's own metadata, for shows TMDB doesn't have.
+- [x] **Blu-ray release date:** TMDB's release dates list has physical releases by country. Show it next to the theatrical date.
+- [x] **Posters** on the release page, served by Atlas from a cache of at most 512 MB, so browsers never call out.
+- [ ] Thumbnails in results, and backdrops.
+- [x] **Links:** IMDb, TMDB, TheTVDB, Trakt and TVmaze.
+- [x] Requests stay inside each provider's rate limit, and only titles someone opens are fetched.
 
 ### Ratings
 
-- [ ] Add OMDb as a provider, with its key in `config.toml`. It gives IMDb, Rotten Tomatoes and Metacritic scores from an IMDb id. Its free tier is limited to about 1,000 requests a day, so fetch per title rather than per release, and only for titles someone opens or that have recent releases.
-- [ ] Add TMDB's and Trakt's own ratings, which come with calls Atlas already makes.
-- [ ] Store ratings per title, with the time they were fetched. Show them on the release page and in results, and allow sorting and filtering by them.
+- [x] OMDb as a provider, with its key as `media.omdb.api_key`: IMDb, Rotten Tomatoes and Metacritic scores, for titles someone opens.
+- [x] TMDB's own rating.
+- [ ] Trakt's rating.
+- [x] Ratings stored per title with the time they were fetched, and shown on the release page.
+- [ ] Ratings in results, and sorting and filtering by them.
 
 ## Open questions on clusters
 
-1. **Do two postings with the same message-ids count as twins, or as one release listed twice?** They're the same articles, so nothing is gained by swapping between them.
-2. **Should near-matches count as a cluster,** such as the same files with an extra sample or NFO? This draft leaves samples and PAR2 out of the fingerprint and requires everything else to match.
-3. **Are size-only matches worth keeping** as "possible" members, kept apart from proven ones? Many releases may have no hashes at all.
+1. **Do two postings with the same message-ids count as twins, or as one release listed twice?** They're the same articles, so nothing is gained by swapping between them. Today they'd show as twins.
+2. **Is matching exact file sizes enough for a pair?** It's what's built, because archive headers don't reliably give a checksum for split files, and two encodes rarely match to the byte. The sample check on real data will say.
