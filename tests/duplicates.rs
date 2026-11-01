@@ -4,7 +4,7 @@
 
 mod common;
 
-use atlas::duplicates::{Copy, SET_CONTENT, SET_POSTED, copies};
+use atlas::duplicates::{Copy, CopyCount, SET_CONTENT, SET_POSTED, copies, counts, later_copies};
 use atlas::parser::Release;
 use atlas::{db, store};
 use common::stage::release_of;
@@ -47,6 +47,12 @@ fn copies_are_found_across_shards_and_go_with_their_release() {
     let found: Vec<(Copy, i64)> = copies(first).unwrap().into_iter().map(|(kind, r)| (kind, r.id)).collect();
     assert_eq!(found, [(Copy::Twin, twin), (Copy::Pair, pair)]);
     assert!(copies(other).unwrap().is_empty());
+
+    let tally = counts(&[first, pair, other]).unwrap();
+    assert_eq!(tally[&first], CopyCount { twins: 1, pairs: 1 });
+    assert_eq!(tally[&pair], CopyCount { twins: 0, pairs: 2 });
+    assert!(!tally.contains_key(&other));
+    assert_eq!(later_copies(&[first, other, twin, pair]).unwrap(), [twin, pair]);
 
     // a purged release is no one's copy
     shard_b.execute("delete from releases where id = ?", [twin]).unwrap();

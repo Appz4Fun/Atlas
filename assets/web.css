@@ -146,6 +146,11 @@ input::placeholder { color: var(--muted); }
 .busy { display: none; font: .8rem var(--font-mono); color: var(--muted); }
 .htmx-request.busy { display: inline; }
 
+.chips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; }
+.chip { padding: 3px 10px; font: 600 .74rem/1.5 var(--font-mono); color: var(--muted); text-decoration: none; background: var(--surface); border: 1px solid var(--line-strong); border-radius: 999px; }
+.chip:hover { color: var(--ink); border-color: var(--ink); }
+.chip[aria-current] { color: var(--rust); background: var(--rust-soft); border-color: transparent; }
+
 .summary { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 4px 16px; margin-bottom: 10px; }
 .path { font: 500 .82rem/1.5 var(--font-mono); color: var(--muted); overflow-wrap: anywhere; }
 .path b { color: var(--rust); font-weight: 600; }
@@ -164,6 +169,7 @@ td.name a:hover { color: var(--rust); text-decoration: underline; }
 td.note { padding: 14px; text-align: center; white-space: normal; }
 td.num, th.num { text-align: right; font-family: var(--font-mono); font-size: .82rem; }
 td.dim { color: var(--muted); font-size: .82rem; }
+.thumb { float: left; width: 32px; height: 48px; margin-right: 10px; object-fit: cover; background: var(--sunken); border-radius: 3px; }
 .row-meta { display: none; margin-top: 2px; font-size: .78rem; color: var(--muted); }
 
 .tag { display: inline-block; margin-left: 4px; padding: 1px 7px; font: 600 .68rem/1.5 var(--font-mono); letter-spacing: .03em; white-space: nowrap; vertical-align: .08em; color: var(--muted); background: var(--sunken); border: 1px solid var(--line); border-radius: 4px; }

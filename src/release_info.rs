@@ -45,6 +45,11 @@ pub struct Contents {
     pub recovery_bytes: i64,
     pub articles_seen: i64,
     pub articles_expected: i64,
+    /// from the `+MM` in recovery volume names
+    pub recovery_blocks: i64,
+    /// from the PAR2 set, once read
+    pub par2_block: Option<i64>,
+    pub par2_bytes: Option<i64>,
 }
 
 impl Contents {
@@ -52,6 +57,15 @@ impl Contents {
     pub fn missing_per_mille(&self) -> Option<i64> {
         (self.articles_expected > 0)
             .then(|| (self.articles_expected - self.articles_seen).max(0) * 1000 / self.articles_expected)
+    }
+
+    /// What the recovery blocks cover, in tenths of a percent, when the PAR2 set's been read.
+    pub fn exact_repair_per_mille(&self) -> Option<i64> {
+        let (block, bytes) = (self.par2_block?, self.par2_bytes?);
+        (block > 0 && bytes > 0 && self.recovery_blocks > 0).then(|| {
+            let blocks = (bytes + block - 1) / block;
+            self.recovery_blocks * 1000 / blocks
+        })
     }
 
     /// What the recovery volumes could rebuild, as a share of the data in tenths of a percent.
@@ -63,6 +77,15 @@ impl Contents {
 
 fn is_par2(filename: &str) -> bool {
     filename.to_ascii_lowercase().ends_with(".par2")
+}
+
+/// The `MM` of `name.vol000+MM.par2`.
+fn recovery_blocks(filename: &str) -> i64 {
+    static BLOCKS: LazyLock<Regex> = LazyLock::new(|| {
+        #[allow(clippy::unwrap_used)]
+        Regex::new(r"(?i)\.vol\d+[+-](\d+)\.par2$").unwrap()
+    });
+    BLOCKS.captures(filename).and_then(|hit| hit[1].parse().ok()).unwrap_or(0)
 }
 
 fn is_recovery_volume(filename: &str) -> bool {
@@ -109,6 +132,7 @@ pub fn contents_with(conn: &Connection, id: i64) -> Result<Contents> {
         if is_par2(&filename) {
             totals.par2_files += 1;
             totals.recovery_volumes += i64::from(is_recovery_volume(&filename));
+            totals.recovery_blocks += recovery_blocks(&filename);
         }
     }
     let mut bytes: HashMap<String, i64> = HashMap::new();
@@ -122,6 +146,10 @@ pub fn contents_with(conn: &Connection, id: i64) -> Result<Contents> {
         } else if !is_par2(&filename) {
             totals.data_bytes += size;
         }
+    }
+    if let Some((block, bytes)) = crate::duplicates::par2_sizes(conn, id) {
+        totals.par2_block = Some(block);
+        totals.par2_bytes = Some(bytes);
     }
     Ok(totals)
 }
@@ -287,6 +315,16 @@ mod tests {
         assert_eq!(c.repair_per_mille(), Some(100));
         assert_eq!(Contents::default().missing_per_mille(), None);
         assert_eq!(Contents::default().repair_per_mille(), None);
+    }
+
+    #[test]
+    fn exact_repair_counts_blocks() {
+        assert_eq!(recovery_blocks("a.vol003+04.par2"), 4);
+        assert_eq!(recovery_blocks("a.par2"), 0);
+        let c =
+            Contents { recovery_blocks: 10, par2_block: Some(1000), par2_bytes: Some(99_500), ..Contents::default() };
+        assert_eq!(c.exact_repair_per_mille(), Some(100), "10 of 100 blocks");
+        assert_eq!(Contents::default().exact_repair_per_mille(), None);
     }
 
     #[test]

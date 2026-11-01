@@ -216,10 +216,16 @@ impl Step for Par2Step {
         }
         let limits = self.limits.lock().unwrap().clone();
         let posted = inventory.complete.then(|| duplicates::posted_fingerprint(&inventory.files)).flatten();
+        let covered: u64 = inventory.files.iter().map(|f| f.size).sum();
+        let sizes = inventory.block_size.filter(|_| inventory.complete).map(|block| (block as i64, covered as i64));
         let mut outcome = finish(ctx, SOURCE_PAR2, listing_of(inventory), &limits)?;
         if let Some(posted) = posted {
             let params = vec![ctx.release().id.into(), posted.into()];
             outcome.writes.push(StepWrite::new(duplicates::SET_POSTED, params));
+        }
+        if let Some((block, covered)) = sizes {
+            let params = vec![ctx.release().id.into(), block.into(), covered.into()];
+            outcome.writes.push(StepWrite::new(duplicates::SET_PAR2_SIZES, params));
         }
         Ok(outcome)
     }

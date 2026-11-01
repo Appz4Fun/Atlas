@@ -59,6 +59,7 @@ pub fn get(path: &str, query: &str, cookies: Option<&str>, base: &str, api_key: 
         "/ui/release" if signed_in => release_page(&args),
         "/ui/details" if signed_in => details_panel(&args),
         "/ui/poster" if signed_in => poster(&args),
+        "/ui/nzb" if signed_in && args.get("fill").is_some_and(|v| v == "1") => filled_nzb(&args),
         "/ui/nzb" if signed_in => get_nzb(&args),
         "/ui/details" | "/ui/poster" => {
             ApiResponse { headers: vec![("HX-Redirect".into(), "/".into())], ..html(401, String::new()) }
@@ -183,6 +184,26 @@ struct Search {
     q: String,
     cat: String,
     offset: i64,
+    /// from `FILTERS`, nothing else
+    filters: Vec<&'static str>,
+}
+
+/// The quick filters over results. Each is also searched for, except the last.
+const FILTERS: &[&str] = &["2160p", "1080p", "DV", "HDR", "Remux", "WEB-DL", "BluRay", HIDE_COPIES];
+const HIDE_COPIES: &str = "Hide copies";
+
+/// Whether a name's tags say what a filter asks. The search itself goes by word prefix, soo "DV" finds DVDRip too.
+fn filter_matches(filter: &str, tags: &release_tags::Tags) -> bool {
+    let quality = tags.quality.as_deref().unwrap_or_default();
+    match filter {
+        "2160p" | "1080p" => tags.resolution.as_deref() == Some(filter),
+        "DV" => tags.hdr.contains(&"DV"),
+        "HDR" => tags.hdr.iter().any(|hdr| *hdr == "HDR" || *hdr == "HDR10+"),
+        "Remux" => quality.contains("REMUX"),
+        "WEB-DL" => quality == "WEB-DL",
+        "BluRay" => quality.starts_with("BluRay"),
+        _ => true,
+    }
 }
 
 impl Search {
@@ -190,13 +211,64 @@ impl Search {
         let text = |k: &str| args.get(k).map_or(String::new(), |v| v.trim().to_string());
         // the name search pages by offset / limit, soo a page starts on a multiple
         let offset = args.get("offset").and_then(|v| v.trim().parse::<i64>().ok()).unwrap_or(0).max(0);
-        Search { q: text("q"), cat: text("cat"), offset: offset - offset % PAGE_SIZE }
+        let asked = text("filters");
+        let filters = FILTERS.iter().copied().filter(|f| asked.split(',').any(|a| a.trim() == *f)).collect();
+        Search { q: text("q"), cat: text("cat"), offset: offset - offset % PAGE_SIZE, filters }
+    }
+
+    /// `search_query`, with this search's filters, or `filters` in their place.
+    fn query_with(&self, cat: &str, offset: i64, filters: &[&str]) -> String {
+        let mut query = search_query(&self.q, cat, offset);
+        if !filters.is_empty() {
+            if !query.is_empty() {
+                query.push('&');
+            }
+            query.push_str(&format!("filters={}", url_encode(&filters.join(","))));
+        }
+        query
+    }
+
+    fn query(&self, cat: &str, offset: i64) -> String {
+        self.query_with(cat, offset, &self.filters)
+    }
+
+    /// The words to look for: the box, and what the filters add to it.
+    fn words(&self) -> String {
+        let mut words = self.q.clone();
+        for filter in self.filters.iter().filter(|f| **f != HIDE_COPIES) {
+            words.push(' ');
+            words.push_str(filter);
+        }
+        words.trim().to_string()
+    }
+
+    fn filter_links(&self) -> String {
+        let mut out = String::from("<div class=\"chips\" role=\"group\" aria-label=\"Filters\">");
+        for filter in FILTERS {
+            let on = self.filters.contains(filter);
+            let toggled: Vec<&str> = if on {
+                self.filters.iter().copied().filter(|f| f != filter).collect()
+            } else {
+                let mut more = self.filters.clone();
+                more.push(filter);
+                more
+            };
+            let query = attr(&self.query_with(&self.cat, 0, &toggled));
+            let pressed = if on { " aria-current=\"true\"" } else { "" };
+            let _ = write!(
+                out,
+                "<a class=\"chip\" href=\"/?{query}\" hx-get=\"/ui/results?{query}\" hx-target=\"#results\" hx-sync=\"#search:replace\" hx-indicator=\"#busy\"{pressed}>{}</a>",
+                escape(filter)
+            );
+        }
+        out.push_str("</div>");
+        out
     }
 
     /// The table rows, or a full-width diagnostic when the first page has none.
     fn body(&self) -> String {
         let filter = parse_filter(&self.cat);
-        let found = match find_releases(&self.q, filter.as_ref(), self.offset, PAGE_SIZE) {
+        let found = match find_releases(&self.words(), filter.as_ref(), self.offset, PAGE_SIZE) {
             Ok(found) => found,
             Err(e) => {
                 eprintln!("web search failed: {e}");
@@ -215,14 +287,29 @@ impl Search {
                 format!("<tr><td colspan=\"{COLUMNS}\" class=\"note dim\">That's all of them.</td></tr>")
             };
         }
+        let page_was_full = found.len() as i64 == PAGE_SIZE;
+        let mut found = found;
+        found.retain(|r| {
+            let tags = release_tags::parse(&r.name);
+            self.filters.iter().all(|filter| filter_matches(filter, &tags))
+        });
+        if self.filters.contains(&HIDE_COPIES) {
+            let ids: Vec<i64> = found.iter().map(|r| r.id).collect();
+            let hidden = crate::duplicates::later_copies(&ids).unwrap_or_default();
+            found.retain(|r| !hidden.contains(&r.id));
+        }
         let ids: Vec<i64> = found.iter().map(|r| r.id).collect();
         let categories = crate::category::categories_of(&ids).unwrap_or_default();
         let passwords = crate::archive::store::passwords(&ids);
         let media = crate::media::query::attrs_of(&ids).unwrap_or_default();
+        let extras = RowExtras {
+            copies: crate::duplicates::counts(&ids).unwrap_or_default(),
+            details: crate::media::details::kept_for(media.values().map(|m| (m.kind, m.ids.tmdb))),
+        };
 
-        let mut out: String = found.iter().map(|r| row(r, &categories, &passwords, &media)).collect();
-        if found.len() as i64 == PAGE_SIZE {
-            let next = search_query(&self.q, &self.cat, self.offset + PAGE_SIZE);
+        let mut out: String = found.iter().map(|r| row(r, &categories, &passwords, &media, &extras)).collect();
+        if page_was_full {
+            let next = self.query(&self.cat, self.offset + PAGE_SIZE);
             let next = attr(&next);
             let _ = write!(
                 out,
@@ -235,6 +322,7 @@ impl Search {
     fn nothing_found(&self) -> String {
         let scope = category_name(&self.cat);
         let title = match (self.q.is_empty(), &scope) {
+            _ if !self.filters.is_empty() && self.q.is_empty() => "nothing matches these filters".to_string(),
             (true, Some(scope)) => format!("nothing is in {scope} yet"),
             (true, None) => "no releases yet".to_string(),
             (false, Some(scope)) => format!("nothing matches \u{201c}{}\u{201d} in {scope}", self.q),
@@ -242,7 +330,7 @@ impl Search {
         };
         let mut hint = String::new();
         if scope.is_some() {
-            let everywhere = attr(&search_query(&self.q, "", 0));
+            let everywhere = attr(&self.query("", 0));
             let _ = write!(
                 hint,
                 "<a href=\"/?{everywhere}\" hx-get=\"/ui/results?{everywhere}\" hx-target=\"#results\">Look in all categories</a>. "
@@ -272,6 +360,13 @@ impl Search {
     }
 }
 
+/// What a result shows beyond its own row.
+#[derive(Default)]
+struct RowExtras {
+    copies: HashMap<i64, crate::duplicates::CopyCount>,
+    details: HashMap<(i64, i64), crate::media::details::Details>,
+}
+
 /// Columns of the results table.
 const COLUMNS: usize = 6;
 
@@ -285,6 +380,14 @@ fn password_tag(password: Option<&Password>) -> String {
         Some(Password::Maybe) => tag("tag-warn", "PASSWORD?"),
         _ => String::new(),
     }
+}
+
+/// The one score a result has room for.
+fn best_score(d: &crate::media::details::Details) -> Option<String> {
+    d.imdb_score
+        .map(|s| format!("IMDB {s}"))
+        .or_else(|| d.tmdb_score.map(|s| format!("TMDB {s}")))
+        .or_else(|| d.trakt_score.map(|s| format!("TRAKT {s}")))
 }
 
 /// The tags worth a place in a list of results.
@@ -317,6 +420,7 @@ fn row(
     categories: &HashMap<i64, i64>,
     passwords: &HashMap<i64, Password>,
     media: &HashMap<i64, MediaAttrs>,
+    extras: &RowExtras,
 ) -> String {
     let category = escape(&label(categories.get(&r.id).copied().unwrap_or(UNCATEGORIZED)).unwrap_or_default());
     let size = fmt_size(r.size);
@@ -326,6 +430,24 @@ fn row(
         tags.push_str(&tag("tag-ref", &text));
     }
     tags.push_str(&name_tags(&release_tags::parse(&r.name)));
+    let details = media.get(&r.id).and_then(|m| Some((m.kind, m.ids.tmdb?))).and_then(|key| extras.details.get(&key));
+    if let Some(score) = details.and_then(best_score) {
+        tags.push_str(&tag("tag-ref", &score));
+    }
+    let thumb = details.filter(|d| crate::media::details::poster_kept(d)).map_or(String::new(), |d| {
+        format!(
+            "<img class=\"thumb\" src=\"/ui/poster?kind={}&amp;tmdb={}\" alt=\"\" loading=\"lazy\" width=\"32\" height=\"48\">",
+            d.kind, d.tmdb_id
+        )
+    });
+    if let Some(count) = extras.copies.get(&r.id) {
+        if count.twins > 0 {
+            tags.push_str(&tag("tag-ok", &format!("{} TWIN{}", count.twins, if count.twins == 1 { "" } else { "S" })));
+        }
+        if count.pairs > 0 {
+            tags.push_str(&tag("tag-ref", &format!("{} PAIR{}", count.pairs, if count.pairs == 1 { "" } else { "S" })));
+        }
+    }
     tags.push_str(&password_tag(passwords.get(&r.id)));
     if !r.complete {
         tags.push_str(&tag("tag-warn", "INCOMPLETE"));
@@ -336,7 +458,7 @@ fn row(
         .collect::<Vec<_>>()
         .join(" · ");
     format!(
-        "<tr><td class=\"name\"><a href=\"/ui/release?id={id}\">{name}</a>{tags}<div class=\"row-meta\">{meta}</div></td><td class=\"col-cat dim\">{category}</td><td class=\"num col-size\">{size}</td><td class=\"dim col-posted\">{posted}</td><td class=\"dim col-group\">{group}</td><td><a class=\"button small primary\" href=\"/ui/nzb?id={id}\">NZB</a></td></tr>",
+        "<tr><td class=\"name\">{thumb}<a href=\"/ui/release?id={id}\">{name}</a>{tags}<div class=\"row-meta\">{meta}</div></td><td class=\"col-cat dim\">{category}</td><td class=\"num col-size\">{size}</td><td class=\"dim col-posted\">{posted}</td><td class=\"dim col-group\">{group}</td><td><a class=\"button small primary\" href=\"/ui/nzb?id={id}\">NZB</a></td></tr>",
         id = r.id,
         name = escape(&r.name),
         group = escape(&r.group_name),
@@ -362,7 +484,7 @@ fn diag(level: &str, title: &str, body: &str) -> String {
 fn results_html(search: &Search) -> String {
     let body = search.body();
     let content = if body.starts_with("<tr") { table(&body) } else { body };
-    format!("{}{content}", search.summary())
+    format!("{}{}{content}", search.filter_links(), search.summary())
 }
 
 /// What htmx swaps in: the whole result area for a new search, more rows for "Load more".
@@ -372,15 +494,17 @@ fn results(args: &HashMap<String, String>) -> ApiResponse {
         return html(200, search.body());
     }
     // the sidebar and the form follow the search too
+    let oob = " hx-swap-oob=\"true\"";
     let body = format!(
-        "{}{}{}",
+        "{}{}{}{}",
         results_html(&search),
-        category_nav(&search, " hx-swap-oob=\"true\""),
-        category_input(&search.cat, " hx-swap-oob=\"true\""),
+        category_nav(&search, oob),
+        category_input(&search.cat, oob),
+        filters_input(&search, oob),
     );
     let mut resp = html(200, body);
     // the address bar follows the search, and reloads the full page
-    let query = search_query(&search.q, &search.cat, 0);
+    let query = search.query(&search.cat, 0);
     let url = if query.is_empty() { "/".to_string() } else { format!("/?{query}") };
     resp.headers.push(("HX-Push-Url".into(), url));
     resp
@@ -401,16 +525,23 @@ fn category_input(cat: &str, oob: &str) -> String {
     format!("<input id=\"cat\" type=\"hidden\" name=\"cat\" value=\"{}\"{oob}>", attr(cat))
 }
 
+fn filters_input(search: &Search, oob: &str) -> String {
+    format!(
+        "<input id=\"filters\" type=\"hidden\" name=\"filters\" value=\"{}\"{oob}>",
+        attr(&search.filters.join(","))
+    )
+}
+
 /// The sidebar. Its links keep whatever is in the search box, through `hx-include`.
 fn category_nav(search: &Search, oob: &str) -> String {
     let link = |id: &str, name: &str, class: &str| {
         let current = if id == search.cat { " aria-current=\"page\"" } else { "" };
-        let page = attr(&search_query(&search.q, id, 0));
+        let page = attr(&search.query(id, 0));
         let swap = if id.is_empty() { String::new() } else { format!("?cat={id}") };
         format!("<a{class} href=\"/?{page}\" hx-get=\"/ui/results{swap}\"{current}>{}</a>", escape(name))
     };
     let mut out = format!(
-        "<nav id=\"categories\" aria-label=\"Categories\" hx-target=\"#results\" hx-include=\"#q\" hx-sync=\"#search:replace\" hx-indicator=\"#busy\"{oob}><div class=\"nav-group\">{}</div>",
+        "<nav id=\"categories\" aria-label=\"Categories\" hx-target=\"#results\" hx-include=\"#q, #filters\" hx-sync=\"#search:replace\" hx-indicator=\"#busy\"{oob}><div class=\"nav-group\">{}</div>",
         link("", "All categories", ""),
     );
     for root in TABLE {
@@ -456,7 +587,7 @@ fn search_page(args: &HashMap<String, String>, base: &str) -> String {
 <main>
 <form id="search" class="searchbar" role="search" action="/" method="get" hx-get="/ui/results" hx-target="#results" hx-sync="this:replace" hx-indicator="#busy" hx-trigger="submit, input changed delay:300ms from:#q">
 <div class="search-field"><input id="q" name="q" type="search" placeholder="Search releases" value="{q}" autocomplete="off" spellcheck="false" autofocus aria-label="Search releases"><kbd>/</kbd></div>
-{cat}<button class="button primary">Search</button><span id="busy" class="busy">searching…</span>
+{cat}{filters}<button class="button primary">Search</button><span id="busy" class="busy">searching…</span>
 </form>
 <div id="failure"></div>
 <div id="results">{results}</div>
@@ -466,6 +597,7 @@ fn search_page(args: &HashMap<String, String>, base: &str) -> String {
             nav = category_nav(&search, ""),
             q = attr(&search.q),
             cat = category_input(&search.cat, ""),
+            filters = filters_input(&search, ""),
             results = results_html(&search),
             base = escape(base),
         ),
@@ -586,7 +718,9 @@ fn release_html(
     if let Some(missing) = contents.missing_per_mille() {
         fact("Articles", health(contents, missing));
     }
-    if let Some(repair) = contents.repair_per_mille().filter(|_| contents.recovery_bytes > 0) {
+    if let Some(repair) = contents.exact_repair_per_mille() {
+        fact("Repair", per_mille(repair));
+    } else if let Some(repair) = contents.repair_per_mille().filter(|_| contents.recovery_bytes > 0) {
         fact("Repair", format!("about {} ({})", per_mille(repair), escape(&fmt_size(Some(contents.recovery_bytes)))));
     }
     let links = media.map(|m| id_links(m.kind, &m.ids)).unwrap_or_default();
@@ -613,7 +747,14 @@ fn release_html(
         )
     };
 
-    let copies = copies_html(&crate::duplicates::copies(r.id).unwrap_or_default());
+    let copies = crate::duplicates::copies(r.id).unwrap_or_default();
+    let has_twin = copies.iter().any(|(kind, _)| *kind == crate::duplicates::Copy::Twin);
+    let fill = if has_twin && contents.articles_seen < contents.articles_expected {
+        format!("<a class=\"button\" href=\"/ui/nzb?id={}&amp;fill=1\">NZB, gaps filled from a twin</a>", r.id)
+    } else {
+        String::new()
+    };
+    let copies = copies_html(&copies);
 
     page(
         &format!("{} · Atlas", r.name),
@@ -621,7 +762,7 @@ fn release_html(
             r#"{masthead}<div class="detail"><main>
 <p class="path"><a href="/">atlas::releases</a>::<b>{id}</b></p>
 <h1>{name}</h1><p>{tags}</p>
-<div class="actions"><a class="button primary" href="/ui/nzb?id={id}">Download NZB</a><a class="button" href="/?cat={category}">More in this category</a></div>
+<div class="actions"><a class="button primary" href="/ui/nzb?id={id}">Download NZB</a>{fill}<a class="button" href="/?cat={category}">More in this category</a></div>
 <div id="title-details" hx-get="/ui/details?id={id}" hx-trigger="load" hx-swap="outerHTML"></div>
 <div class="panel"><dl class="facts">{facts}</dl></div>
 {copies}
@@ -632,6 +773,29 @@ fn release_html(
             name = escape(&r.name),
         ),
     )
+}
+
+/// A release's NZB with what it's missing taken from its twins, or as it is when they don't help.
+fn filled_nzb(args: &HashMap<String, String>) -> ApiResponse {
+    let id = args.get("id").and_then(|v| v.trim().parse::<i64>().ok()).unwrap_or(0);
+    match crate::duplicates::filled_nzb(id) {
+        Ok(Some(content)) => {
+            let name = get_release(id).ok().flatten().map(|r| r.name).unwrap_or_default();
+            let filename = crate::nzb::nzb_filename(&name, Some(id)).replace(['"', '\\'], "_");
+            ApiResponse {
+                status: 200,
+                content_type: Some("application/x-nzb"),
+                body: content,
+                headers: vec![("Content-Disposition".into(), format!("attachment; filename=\"{filename}\""))],
+                bytes: None,
+            }
+        }
+        Ok(None) => ApiResponse::not_found(),
+        Err(e) => {
+            eprintln!("web filled nzb {id} failed: {e}");
+            html(500, String::new())
+        }
+    }
 }
 
 /// Other postings of this release's content.
@@ -685,11 +849,16 @@ fn details_html(d: &crate::media::details::Details) -> String {
     line("Status", d.status.clone());
     line("Cast", d.cast.clone());
     let score = |name: &str, score: Option<i64>| score.map(|s| tag("tag-ref", &format!("{name} {s}")));
-    let scores: String =
-        [score("IMDB", d.imdb_score), score("RT", d.rotten), score("MC", d.metacritic), score("TMDB", d.tmdb_score)]
-            .into_iter()
-            .flatten()
-            .collect();
+    let scores: String = [
+        score("IMDB", d.imdb_score),
+        score("RT", d.rotten),
+        score("MC", d.metacritic),
+        score("TMDB", d.tmdb_score),
+        score("TRAKT", d.trakt_score),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
     let poster = if d.poster.is_some() {
         format!(
             "<img class=\"poster\" src=\"/ui/poster?kind={}&amp;tmdb={}\" alt=\"\" loading=\"lazy\" width=\"171\" height=\"256\">",
@@ -745,8 +914,8 @@ fn health(contents: &release_info::Contents, missing: i64) -> String {
     if missing == 0 && contents.articles_seen == contents.articles_expected {
         return format!("{counts}{}", tag("tag-ok", "ALL THERE"));
     }
-    let repairable =
-        contents.recovery_volumes > 0 && contents.repair_per_mille().is_some_and(|repair| repair >= missing);
+    let repairable = contents.recovery_volumes > 0
+        && contents.exact_repair_per_mille().or(contents.repair_per_mille()).is_some_and(|repair| repair >= missing);
     let verdict = if repairable { tag("tag-warn", "REPAIRABLE") } else { tag("tag-bad", "NOT ENOUGH RECOVERY") };
     format!("{counts}, {} missing{verdict}", per_mille(missing.max(1)))
 }
@@ -893,7 +1062,7 @@ mod tests {
             parts: None,
         };
         let passwords = HashMap::from([(7, Password::Maybe)]);
-        let html = row(&release, &HashMap::from([(7, 5040)]), &passwords, &HashMap::new());
+        let html = row(&release, &HashMap::from([(7, 5040)]), &passwords, &HashMap::new(), &RowExtras::default());
         assert!(!html.contains("<img") && !html.contains("<b>") && !html.contains("<i>"), "{html}");
         assert!(html.contains("TV/HD") && html.contains("2.0 KB"), "{html}");
         assert!(html.contains("PASSWORD?") && html.contains("INCOMPLETE"), "{html}");
@@ -913,34 +1082,38 @@ mod tests {
 
     #[test]
     fn the_sidebar_marks_the_category_and_keeps_the_search() {
-        let search = Search { q: "a b".into(), cat: "5040".into(), offset: 0 };
+        let search = Search { q: "a b".into(), cat: "5040".into(), offset: 0, filters: Vec::new() };
         let nav = category_nav(&search, "");
         assert_eq!(nav.matches("aria-current").count(), 1, "{nav}");
         assert!(
             nav.contains(r#"href="/?q=a%20b&amp;cat=5040" hx-get="/ui/results?cat=5040" aria-current="page""#),
             "{nav}"
         );
-        let unknown = Search { q: String::new(), cat: "<x>".into(), offset: 0 };
+        let unknown = Search { q: String::new(), cat: "<x>".into(), offset: 0, filters: Vec::new() };
         assert_eq!(category_nav(&unknown, "").matches("aria-current").count(), 0);
         assert!(!category_input("\"><x>", "").contains("<x>"));
     }
 
     #[test]
     fn an_empty_result_says_why_and_how_to_widen_it() {
-        let hd = Search { q: String::new(), cat: "2040".into(), offset: 0 }.nothing_found();
+        let hd = Search { q: String::new(), cat: "2040".into(), offset: 0, filters: Vec::new() }.nothing_found();
         assert!(hd.contains("nothing is in Movies / HD yet"), "{hd}");
         assert!(hd.contains("Look in all categories"), "{hd}");
-        let word = Search { q: "<b>".into(), cat: String::new(), offset: 0 }.nothing_found();
+        let word = Search { q: "<b>".into(), cat: String::new(), offset: 0, filters: Vec::new() }.nothing_found();
         assert!(word.contains("&lt;b&gt;") && !word.contains("<b>"), "{word}");
         assert!(!word.contains("Look in all categories"), "{word}");
     }
 
     #[test]
     fn the_path_names_the_category() {
-        let path = Search { q: String::new(), cat: "2040".into(), offset: 0 }.summary();
+        let path = Search { q: String::new(), cat: "2040".into(), offset: 0, filters: Vec::new() }.summary();
         assert!(path.contains("atlas::releases::<b>movies</b>::<b>hd</b>"), "{path}");
         assert!(path.contains("Newest first"), "{path}");
-        assert!(Search { q: "x".into(), cat: "9999".into(), offset: 0 }.summary().contains("Best matches first"));
+        assert!(
+            Search { q: "x".into(), cat: "9999".into(), offset: 0, filters: Vec::new() }
+                .summary()
+                .contains("Best matches first")
+        );
     }
 
     #[test]
@@ -995,6 +1168,22 @@ mod tests {
         let old = InnerView { password: Some(Password::Yes), ..InnerView::default() };
         assert_eq!(encryption_fact(&old), "Encrypted, type not recorded");
         assert_eq!(encryption_fact(&InnerView::default()), "");
+    }
+
+    #[test]
+    fn filters_come_from_the_list_and_stay_in_links() {
+        let s = Search::from_args(&parse_query("q=x&filters=DV,<b>,Remux"));
+        assert_eq!(s.filters, ["DV", "Remux"]);
+        assert_eq!(s.words(), "x DV Remux");
+        assert_eq!(s.query("2040", 0), "q=x&cat=2040&filters=DV%2CRemux");
+        let hide = Search::from_args(&parse_query("filters=Hide%20copies"));
+        assert_eq!(hide.words(), "", "not a word to look for");
+        let links = s.filter_links();
+        assert_eq!(links.matches("aria-current").count(), 2, "{links}");
+        assert!(!filter_matches("DV", &release_tags::parse("A.1999.DVDRip.XviD-X")), "not a DVD");
+        assert!(filter_matches("DV", &release_tags::parse("A.2024.2160p.DV.WEB-DL.H265-X")));
+        assert!(filter_matches("HDR", &release_tags::parse("A.2024.HDR10Plus.WEB-DL")));
+        assert!(filter_matches("Remux", &release_tags::parse("A.2024.BluRay.REMUX-X")));
     }
 
     #[test]

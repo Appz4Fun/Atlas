@@ -118,6 +118,19 @@ fn the_web_ui_end_to_end() {
     assert!(!found.body.contains("alert(1)"), "{}", found.body);
     assert_eq!(found.header("HX-Push-Url").as_deref(), Some("/?q=Findword"));
 
+    assert!(found.body.contains("class=\"chip\""), "{}", found.body);
+    let filtered = fetch(port, "/ui/results?q=Findword&filters=2160p", &cookie);
+    assert!(!filtered.body.contains("Tv.Findword"), "not 2160p: {}", filtered.body);
+    assert_eq!(
+        fetch(port, "/ui/results?q=Findword&filters=2160p", &cookie).header("HX-Push-Url").as_deref(),
+        Some("/?q=Findword&filters=2160p")
+    );
+    assert!(
+        fetch(port, &format!("/api?t=search&q=Findword&apikey={KEY}"), "")
+            .body
+            .contains(r#"name="group" value="alt.binaries.g1""#)
+    );
+
     let by_cat = fetch(port, "/ui/results?cat=5000", &cookie);
     assert!(by_cat.body.contains("Findword") && !by_cat.body.contains("alert(1)"), "{}", by_cat.body);
     assert!(fetch(port, "/ui/results?q=nothinglikethis", &cookie).body.contains("nothing matches"));

@@ -3,6 +3,7 @@
 //! Fetched from TMDB and OMDb when someone opens a release, and kept in `atlas.details.db`, soo a page
 //! costs a request only the first time, or once what's kept is old. Releases nobody opens cost nothing.
 
+use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
@@ -11,7 +12,7 @@ use std::time::Duration;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value;
 
-use crate::config::{MediaConfig, OmdbConfig, TmdbConfig};
+use crate::config::{MediaConfig, OmdbConfig, TmdbConfig, TraktConfig};
 
 use super::http::{Client, Reply, encode, now_secs};
 use super::resolve::Ids;
@@ -20,6 +21,7 @@ use super::title::Kind;
 const TMDB_BASE: &str = "https://api.themoviedb.org/3";
 const IMAGE_BASE: &str = "https://image.tmdb.org/t/p/w342";
 const OMDB_BASE: &str = "https://www.omdbapi.com";
+const TRAKT_BASE: &str = "https://api.trakt.tv";
 const KEEP_FOR: i64 = 30 * 86_400;
 /// A failed look is tried again this soon.
 const RETRY_AFTER: i64 = 3_600;
@@ -46,6 +48,7 @@ create table if not exists details (
     imdb_score INTEGER,
     rotten     INTEGER,
     metacritic INTEGER,
+    trakt_score INTEGER,
     fetched_at INTEGER NOT NULL,
     primary key (kind, tmdb_id)
 ) without rowid;
@@ -75,6 +78,7 @@ pub struct Details {
     pub imdb_score: Option<i64>,
     pub rotten: Option<i64>,
     pub metacritic: Option<i64>,
+    pub trakt_score: Option<i64>,
     pub fetched_at: i64,
 }
 
@@ -93,7 +97,7 @@ fn open() -> rusqlite::Result<Connection> {
 fn read(conn: &Connection, kind: i64, tmdb_id: i64) -> rusqlite::Result<Option<Details>> {
     conn.query_row(
         "select title, overview, genres, runtime, status, network, cast_names, released, bluray, poster,
-                tmdb_score, imdb_score, rotten, metacritic, fetched_at
+                tmdb_score, imdb_score, rotten, metacritic, trakt_score, fetched_at
          from details where kind = ? and tmdb_id = ?",
         [kind, tmdb_id],
         |r| {
@@ -114,7 +118,8 @@ fn read(conn: &Connection, kind: i64, tmdb_id: i64) -> rusqlite::Result<Option<D
                 imdb_score: r.get(11)?,
                 rotten: r.get(12)?,
                 metacritic: r.get(13)?,
-                fetched_at: r.get(14)?,
+                trakt_score: r.get(14)?,
+                fetched_at: r.get(15)?,
             })
         },
     )
@@ -124,8 +129,8 @@ fn read(conn: &Connection, kind: i64, tmdb_id: i64) -> rusqlite::Result<Option<D
 fn write(conn: &Connection, d: &Details) -> rusqlite::Result<()> {
     conn.execute(
         "insert or replace into details (kind, tmdb_id, title, overview, genres, runtime, status, network, cast_names,
-            released, bluray, poster, tmdb_score, imdb_score, rotten, metacritic, fetched_at)
-         values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            released, bluray, poster, tmdb_score, imdb_score, rotten, metacritic, trakt_score, fetched_at)
+         values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         params![
             d.kind,
             d.tmdb_id,
@@ -143,6 +148,7 @@ fn write(conn: &Connection, d: &Details) -> rusqlite::Result<()> {
             d.imdb_score,
             d.rotten,
             d.metacritic,
+            d.trakt_score,
             d.fetched_at
         ],
     )?;
@@ -234,6 +240,11 @@ fn add_omdb(d: &mut Details, v: &Value) {
     }
 }
 
+fn trakt_score(v: &Value) -> Option<i64> {
+    let votes = v.get("votes").and_then(Value::as_i64).unwrap_or(0);
+    v.get("rating").and_then(Value::as_f64).filter(|_| votes > 0).map(|score| (score * 10.0).round() as i64)
+}
+
 /// TMDB's image paths are one segment. Anything else doesn't go in a URL of ours.
 fn safe_image_path(path: &str) -> bool {
     let name = path.strip_prefix('/').unwrap_or_default();
@@ -243,8 +254,10 @@ fn safe_image_path(path: &str) -> bool {
 struct Sources {
     tmdb: TmdbConfig,
     omdb: OmdbConfig,
+    trakt: TraktConfig,
     tmdb_client: Client,
     omdb_client: Client,
+    trakt_client: Client,
 }
 
 /// One pace per process. Replaced if the config's keys or addresses change.
@@ -258,6 +271,7 @@ fn sources(cfg: &MediaConfig) -> Option<std::sync::Arc<Sources>> {
     if let Some(s) = held.as_ref()
         && s.tmdb == cfg.tmdb
         && s.omdb == cfg.omdb
+        && s.trakt == cfg.trakt
     {
         return Some(s.clone());
     }
@@ -268,6 +282,12 @@ fn sources(cfg: &MediaConfig) -> Option<std::sync::Arc<Sources>> {
         omdb_client: Client::new("omdb", omdb_base, cfg.omdb.requests_per_minute),
         tmdb: cfg.tmdb.clone(),
         omdb: cfg.omdb.clone(),
+        trakt: cfg.trakt.clone(),
+        trakt_client: Client::new(
+            "trakt",
+            cfg.trakt.base_url.as_deref().unwrap_or(TRAKT_BASE),
+            cfg.trakt.requests_per_minute,
+        ),
     });
     *held = Some(made.clone());
     Some(made)
@@ -295,7 +315,8 @@ impl Sources {
         body.get(list)?.as_array()?.first()?.get("id")?.as_i64()
     }
 
-    fn fetch(&self, kind: i64, tmdb_id: i64, imdb: Option<i64>, now: i64) -> Option<Details> {
+    fn fetch(&self, kind: i64, tmdb_id: i64, ids: &Ids, now: i64) -> Option<Details> {
+        let imdb = ids.imdb;
         let section = if kind == Kind::Tv as i64 { "tv" } else { "movie" };
         let extra = if kind == Kind::Tv as i64 { "credits" } else { "credits,release_dates" };
         let url = format!(
@@ -312,6 +333,17 @@ impl Sources {
             let url = format!("{base}/?i=tt{imdb:07}&apikey={}", encode(&self.omdb.api_key));
             if let Ok(Reply::Json(body)) = self.omdb_client.get(&url, &[]) {
                 add_omdb(&mut details, &body);
+            }
+        }
+        if let Some(trakt) = ids.trakt
+            && !self.trakt.client_id.is_empty()
+        {
+            let base = self.trakt.base_url.as_deref().unwrap_or(TRAKT_BASE);
+            let section = if kind == Kind::Tv as i64 { "shows" } else { "movies" };
+            let url = format!("{base}/{section}/{trakt}?extended=full");
+            let headers = [("trakt-api-version", "2"), ("trakt-api-key", self.trakt.client_id.as_str())];
+            if let Ok(Reply::Json(body)) = self.trakt_client.get(&url, &headers) {
+                details.trakt_score = trakt_score(&body);
             }
         }
         Some(details)
@@ -331,9 +363,22 @@ pub fn for_title(cfg: &MediaConfig, kind: i64, ids: &Ids) -> Option<Details> {
     if kept.as_ref().is_some_and(|d| now - d.fetched_at < KEEP_FOR) {
         return kept;
     }
-    let Some(fresh) = sources.and_then(|s| s.fetch(kind, tmdb_id, ids.imdb, now)) else { return kept };
+    let Some(fresh) = sources.and_then(|s| s.fetch(kind, tmdb_id, ids, now)) else { return kept };
     let _ = write(&conn, &fresh);
     Some(fresh)
+}
+
+/// What's already kept for these titles, with nothing fetched: for a page of results.
+pub fn kept_for(titles: impl Iterator<Item = (i64, Option<i64>)>) -> HashMap<(i64, i64), Details> {
+    let mut out = HashMap::new();
+    let Ok(conn) = open() else { return out };
+    for (kind, tmdb_id) in titles {
+        let Some(tmdb_id) = tmdb_id else { continue };
+        if let Ok(Some(details)) = read(&conn, kind, tmdb_id) {
+            out.insert((kind, tmdb_id), details);
+        }
+    }
+    out
 }
 
 /// `find_tmdb_id`, remembered, soo an id TMDB doesn't know isn't asked about on every open.
@@ -364,6 +409,11 @@ fn poster_dir() -> PathBuf {
 
 fn poster_file(path: &str) -> Option<PathBuf> {
     safe_image_path(path).then(|| poster_dir().join(path.trim_start_matches('/')))
+}
+
+/// Whether a poster can be shown with nothing fetched, for a page of results.
+pub fn poster_kept(d: &Details) -> bool {
+    d.poster.as_deref().and_then(poster_file).is_some_and(|file| file.exists())
 }
 
 /// A poster's bytes, kept on disk, soo browsers never call out and it works once TMDB doesn't.
@@ -476,6 +526,12 @@ mod tests {
             ]}),
         );
         assert_eq!((d.imdb_score, d.rotten, d.metacritic), (Some(87), Some(88), Some(73)));
+    }
+
+    #[test]
+    fn trakt_scores_need_votes() {
+        assert_eq!(trakt_score(&json!({"rating": 8.25, "votes": 3})), Some(83));
+        assert_eq!(trakt_score(&json!({"rating": 0.0, "votes": 0})), None);
     }
 
     #[test]
