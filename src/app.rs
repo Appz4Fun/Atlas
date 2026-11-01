@@ -175,7 +175,7 @@ fn setup(existing: Option<Config>) -> bool {
 
     ui::print_panel(
         &format!(
-            "[red]{} {why}[/red]\n[dim]already have a config.json somewhere else? quit and point ATLAS_HOME at its folder\nor enter a server below (blank host to quit)[/dim]",
+            "[red]{} {why}[/red]\n[dim]already have a config.toml somewhere else? quit and point ATLAS_HOME at its folder\nor enter a server below (blank host to quit)[/dim]",
             path.display()
         ),
         "red",
@@ -191,7 +191,7 @@ fn setup(existing: Option<Config>) -> bool {
     let password = prompt("Password: ");
     let port = ask("Port (563): ", Some(563)).clamp(1, 65535) as u16;
 
-    // keep groups / api key from a config.json that just lacked servers
+    // keep groups / api key from a config.toml that just lacked servers
     let mut cfg = existing.unwrap_or_default();
     cfg.servers = vec![UsenetServer::new(&host, &username, &password, port)];
 
@@ -767,7 +767,7 @@ pub fn main_menu() -> i32 {
         }
     }
 
-    // a config.json that's there but broken isnt missing: setup would write over it
+    // a config.toml that's there but broken isnt missing: setup would write over it
     if let Some(problem) = crate::config::file_problem() {
         ui::error(&format!("{problem}. fix it and start atlas again"));
         return 1;

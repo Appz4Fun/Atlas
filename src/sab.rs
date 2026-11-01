@@ -178,7 +178,7 @@ fn single_line(s: &str) -> String {
 
 static SERVER_HEADER_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?m)^\[\[s(\d+)\]\][ \t]*$").unwrap());
 
-/// Make sure SABnzbd has every usenet server from config.json, with the
+/// Make sure SABnzbd has every usenet server from config.toml, with the
 /// same priority order and connection counts, syncing ones it already has.
 pub fn configure_servers() {
     let Some(atlas) = load_atlas_config() else { return };
@@ -251,7 +251,7 @@ pub fn server_section_update(text: &str, server: &UsenetServer) -> String {
             ("ssl", ssl.to_string()),
             ("priority", priority.clone()),
         ];
-        // only override sab's connection count when config.json sets one
+        // only override sab's connection count when config.toml sets one
         if let Some(c) = server.connections {
             keys.push(("connections", c.to_string()));
         }

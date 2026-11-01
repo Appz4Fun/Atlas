@@ -76,10 +76,10 @@ _remote profile:
 
     echo "==> syncing source to $host:$dir"
     ssh "$host" "mkdir -p '$dir'"
-    # never ship local data or secrets (config.json holds usenet passwords)
+    # never ship local data or secrets (config.toml holds usenet passwords)
     rsync -az --delete \
         --exclude '/target/' --exclude '/.git/' --exclude '/SABnzbd-5.0.4/' --exclude '/img/' \
-        --exclude 'config.json*' --exclude 'atlas.db*' --exclude '*.log' --exclude '*.log.old' \
+        --exclude 'config.json*' --exclude '/config.toml' --exclude 'atlas.db*' --exclude '*.log' --exclude '*.log.old' \
         --exclude 'status.json' --exclude 'stats.json' --exclude '*.pid' --exclude '*.tmp' \
         ./ "$host:$dir/"
 

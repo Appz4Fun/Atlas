@@ -117,7 +117,7 @@ pub fn handle(path: &str, query: &str, base: &str, api_key: &str) -> ApiResponse
             status: 200,
             content_type: Some("text/plain; charset=utf-8"),
             body: format!(
-                "Atlas newznab api is running.\n\nAdd it to Prowlarr / Sonarr / Radarr as a Newznab indexer:\n  URL:      {base}\n  API path: /api\n  API key:  the api_key in config.json\n\nCheck it: {base}/api?t=caps\n"
+                "Atlas newznab api is running.\n\nAdd it to Prowlarr / Sonarr / Radarr as a Newznab indexer:\n  URL:      {base}\n  API path: /api\n  API key:  the api_key in config.toml\n\nCheck it: {base}/api?t=caps\n"
             ),
             headers: Vec::new(),
         };

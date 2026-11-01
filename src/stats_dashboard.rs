@@ -1054,7 +1054,7 @@ fn draw_servers(f: &mut Frame, app: &App, area: Rect) {
         note("conns: in use / allowed now / configured. allowed drops when a provider refuses more"),
         note("saved: traffic compression saved (XFEATURE COMPRESS GZIP)"),
         note("resting: couldnt connect, retried within a minute. article only: no GROUP support"),
-        note("login rejected: fix the username/password in config.json"),
+        note("login rejected: fix the username/password in config.toml"),
     ];
     f.render_widget(Paragraph::new(help_text).block(panel("key")), help);
 }

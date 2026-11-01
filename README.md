@@ -10,7 +10,7 @@ A self-hosted Usenet indexer and Newznab server that runs in your terminal
 ![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-informational)
 ![Hackatime](https://hackatime.hackclub.com/api/v1/badge/U09JP15EVQU/Eraxty/Atlas)
 
-[Features](#features) • [Rust](#built-with-rust) • [Install](#installation) • [config.json](#configure-atlas-configjson) • [Usage](#usage) • [Stats dashboard](#stats-dashboard) • [Newznab API](#newznab-api) • [Development](#development)
+[Features](#features) • [Rust](#built-with-rust) • [Install](#installation) • [config.toml](#configure-atlas-configtoml) • [Usage](#usage) • [Stats dashboard](#stats-dashboard) • [Newznab API](#newznab-api) • [Development](#development)
 
 ![Atlas main menu](img/main-menu.png)
 
@@ -29,7 +29,7 @@ Use Atlas from the terminal, or point Prowlarr, NZBHydra2, Sonarr, Radarr, or an
 > [!IMPORTANT]
 > Atlas is a single native binary written in **[Rust](https://www.rust-lang.org) 1.99.0**, edition 2024.
 
-The Rust version replaces the original Python version. It keeps the same menus and the same `config.json`, converts an existing `atlas.db` once into its own faster and smaller layout, and indexes many times faster.
+The Rust version replaces the original Python version. It keeps the same menus, converts an existing `atlas.db` once into its own faster and smaller layout, and indexes many times faster.
 
 | Component | Crate |
 |---|---|
@@ -45,7 +45,7 @@ rustup installs the pinned toolchain the first time you build, and the `just` re
 ## Features
 
 - **Index Usenet headers** from the groups you choose, over SSL, in live, backfill, or dynamic mode.
-- **Use all your Usenet servers at once.** List as many providers as you like in `config.json`. Every server indexes in parallel and keeps its connections busy. For example, 4 servers with 25 connections each keep 100 requests in flight.
+- **Use all your Usenet servers at once.** List as many providers as you like in `config.toml`. Every server indexes in parallel and keeps its connections busy. For example, 4 servers with 25 connections each keep 100 requests in flight.
 - **Index fast.** Atlas splits header requests into slices that stream over all connections, saves each slice the moment it arrives, and indexes many groups at the same time. When the server supports it, Atlas requests compressed header listings with `XFEATURE COMPRESS GZIP`.
 - **Handle real providers.** Atlas detects fill and bonus servers that only serve articles, lowers its own connection count when a provider refuses more, and pauses servers that reject the login instead of retrying them constantly.
 - **Real categories.** Atlas gives each release a Newznab category and honors `cat`, parents included.
@@ -72,16 +72,16 @@ cd Atlas
 just run            # or: cargo run --release
 ```
 
-`just run` and `cargo run` keep `config.json`, `atlas.db`, and the logs in the repository folder, as set in `.cargo/config.toml`. The Python version kept them in the same place, so an existing setup carries over. To see which Rust the recipes use, run `just toolchain`.
+`just run` and `cargo run` keep `config.toml`, `atlas.db`, and the logs in the repository folder, as set in `.cargo/config.toml`. The Python version kept them in the same place, so an existing setup carries over. To see which Rust the recipes use, run `just toolchain`.
 
 To install Atlas as a command instead:
 
 ```bash
 cargo install --path .
-ATLAS_HOME=~/.atlas atlas
+atlas
 ```
 
-An installed binary keeps its data next to itself unless `ATLAS_HOME` points somewhere else.
+Atlas keeps its data in `~/.atlas` unless `ATLAS_HOME` points somewhere else. A binary with a config or `atlas.db` already next to it keeps using that folder, so an older install carries on as it was. To move one, stop Atlas and move those files to `~/.atlas`.
 
 ```text
 usage: atlas [--selftest | --bg-indexer | --convert]
@@ -100,30 +100,59 @@ When you push a release tag (`v*`), the `build-executables` workflow builds `atl
 - **Linux and macOS:** `chmod +x atlas-linux && ./atlas-linux`
 - **Windows:** extract `atlas-windows.zip` and double-click `atlas.bat`, or run `.\atlas-windows.exe` from a terminal.
 
-## Configure Atlas (`config.json`)
+## Configure Atlas (`config.toml`)
 
-On first run, Atlas asks for one server (host, username, password, and port) and writes `config.json`. You can edit everything else in the menus or directly in the file. The repository includes a template without secrets, [`config.example.json`](config.example.json).
+An existing `config.json` converts itself at the next start. Atlas writes `config.toml` and keeps the old file as `config.json.bak-toml`, which you can delete once you are happy. Comments you add to `config.toml` stay when Atlas saves a change, except on a key it changes.
+
+On first run, Atlas asks for one server (host, username, password, and port) and writes `config.toml`. You can edit everything else in the menus or directly in the file. The repository includes a template without secrets, [`config.example.toml`](config.example.toml).
 
 ### Full example
 
-```json
-{
-    "usenet_servers": [
-        {"host": "news.provider-a.com", "username": "me", "password": "secret", "port": 563, "ssl": true, "connections": 50, "priority": 1},
-        {"host": "news.provider-b.com", "username": "me", "password": "secret", "port": 563, "ssl": true, "connections": 30, "priority": 2},
-        {"host": "fill.provider-c.com", "username": "me", "password": "secret", "port": 563, "connections": 20, "priority": 3, "index": false},
-        {"host": "news.local-test",     "username": "me", "password": "secret", "port": 119, "ssl": false, "compress": false}
-    ],
-    "group": "alt.binaries.example",
-    "groups": ["alt.binaries.example", "alt.binaries.another"],
-    "index_mode": "dynamic",
-    "batch_size": 500000,
-    "request_size": 10000,
-    "parallel_groups": 20,
-    "api_host": "0.0.0.0",
-    "api_port": 9090,
-    "api_key": "generated-on-first-start"
-}
+```toml
+group = "alt.binaries.example"
+groups = ["alt.binaries.example", "alt.binaries.another"]
+index_mode = "dynamic"
+batch_size = 500000
+request_size = 10000
+parallel_groups = 20
+api_host = "0.0.0.0"
+api_port = 9090
+api_key = "generated-on-first-start"
+
+[[usenet_servers]]
+host = "news.provider-a.com"
+username = "me"
+password = "secret"
+port = 563
+ssl = true
+connections = 50
+priority = 1
+
+[[usenet_servers]]
+host = "news.provider-b.com"
+username = "me"
+password = "secret"
+port = 563
+ssl = true
+connections = 30
+priority = 2
+
+[[usenet_servers]]
+host = "fill.provider-c.com"
+username = "me"
+password = "secret"
+port = 563
+connections = 20
+priority = 3
+index = false
+
+[[usenet_servers]]
+host = "news.local-test"
+username = "me"
+password = "secret"
+port = 119
+ssl = false
+compress = false
 ```
 
 ### Top-level keys
@@ -208,7 +237,7 @@ Atlas also handles these provider quirks on its own:
 
 ### Changes apply live
 
-The background indexer reads `config.json` again every 5 seconds:
+The background indexer reads `config.toml` again every 5 seconds:
 
 - New groups, `index_mode`, `batch_size`, `request_size`, and `auto_run_compact` apply immediately.
 - Changes to servers, logins, `connections`, `parallel_groups`, or `max_unsaved_headers` rebuild the connection pool. A login you fix in the file, or in **Settings > Usenet servers**, takes effect within a few seconds.
@@ -239,7 +268,7 @@ On first run, Atlas asks for your provider credentials:
 | Password | Your provider password. |
 | Port | `563` for SSL. Keep the default. |
 
-To quit without writing anything, leave the host empty. This helps when your `config.json` is in another folder: point `ATLAS_HOME` at that folder. The startup panel always shows which `config.json` Atlas loaded. To add more servers, use **Settings > Usenet servers** or edit `config.json`.
+To quit without writing anything, leave the host empty. This helps when your `config.toml` is in another folder: point `ATLAS_HOME` at that folder. The startup panel always shows which `config.toml` Atlas loaded. To add more servers, use **Settings > Usenet servers** or edit `config.toml`.
 
 ### Main menu
 
@@ -323,7 +352,7 @@ Stopping the indexer takes about a second. Atlas drops any requests still in fli
 
 ### Post-processing
 
-The indexer takes every saved release through a stage that survives restarts. Upgrading doesn't change network use: with an existing `config.json` the stage fetches nothing.
+The indexer takes every saved release through a stage that survives restarts. Upgrading doesn't change network use: with an existing `config.toml` the stage fetches nothing.
 
 - A release is **settled** when no article has arrived for `settle_secs` (2 hours), or `complete_settle_secs` (15 minutes) if it's complete.
 - It's **rejected** when no step can help it: a fragment of an upload obfuscated per article, a blocked group, an empty row, or a post of only par2 files. A rejection writes nothing, and a late article judges it again.
@@ -389,8 +418,10 @@ Atlas can keep a catalogue of scene and P2P release titles from public JSON feed
 
 It's off by default: with no `predb` key, nothing is fetched, no file is made, and no step runs. To turn it on:
 
-```json
-"predb": {"enabled": true, "sources": ["predb_club", "predb_net"]}
+```toml
+[predb]
+enabled = true
+sources = ["predb_club", "predb_net"]
 ```
 
 When you turn it on, Atlas contacts the third parties you list, and walks your existing releases once at `backlog_per_second`.
@@ -526,7 +557,7 @@ Shows one row per Usenet server for the current run: priority, state, whether it
 | `ok` | The server is working. |
 | `resting` | The server couldn't connect. Atlas tries again within a minute. |
 | `article only` | The server doesn't support `GROUP`, so Atlas uses it for article lookups only. |
-| `login rejected` | Fix the username or password in `config.json`. |
+| `login rejected` | Fix the username or password in `config.toml`. |
 
 ![Stats dashboard servers page](img/stats-servers.png)
 
@@ -552,7 +583,7 @@ The page names the database writer when it's busy at least 85% of the time, the 
 Atlas provides a Newznab-compatible API, the protocol that Prowlarr, NZBHydra2, Sonarr, and Radarr use. Any compatible client can search releases and download NZB files.
 
 - **Endpoint:** `http://HOST:PORT/api`, port `9090` by default. Open `http://HOST:PORT/` in a browser to see a short page with the settings to use.
-- **Binding:** `127.0.0.1` by default. To reach the API from other machines, set `"api_host": "0.0.0.0"` in `config.json` or set `ATLAS_API_HOST`, then restart Atlas.
+- **Binding:** `127.0.0.1` by default. To reach the API from other machines, set `api_host = "0.0.0.0"` in `config.toml` or set `ATLAS_API_HOST`, then restart Atlas.
 - **Authentication:** `t=caps` works without a key. Every other call needs `apikey`. A wrong key returns a `401` Newznab error.
 
 ### Operations
@@ -590,7 +621,7 @@ A search by an ID that's on (see [TV and movie IDs](#tv-and-movie-ids)) returns 
 curl "http://localhost:9090/api?t=caps"
 
 # search, key required
-KEY=$(jq -r .api_key config.json)
+KEY=$(sed -n 's/^api_key = "\(.*\)"/\1/p' config.toml)
 curl "http://localhost:9090/api?t=search&apikey=$KEY&q=matrix&limit=25"
 curl "http://localhost:9090/api?t=tvsearch&apikey=$KEY&q=Some+Show&season=1&ep=2"
 
@@ -603,7 +634,7 @@ curl -OJ "http://localhost:9090/api?t=get&id=1234&apikey=$KEY"
 - **Type:** Newznab (generic)
 - **URL:** `http://ATLAS_HOST:9090`
 - **API path:** `/api`
-- **API key:** `api_key` from `config.json`
+- **API key:** `api_key` from `config.toml`
 - **Categories:** the ones you want, for example `TV (5000)`, `Movies (2000)`, and `Other (8000)` to see everything else.
 
 ### Categories
@@ -653,12 +684,17 @@ Turn a provider on to fill in IDs, with no restart. Each title is asked once, ho
 
 **Sonarr and Radarr cache `caps` for 7 days**, so press Test on the indexer after turning a provider on.
 
-```json
-"media": {
-    "tvmaze": {"enabled": true},
-    "tmdb": {"api_key": "your-key"},
-    "trakt": {"client_id": "your-id"}
-}
+```toml
+[media]
+
+[media.tvmaze]
+enabled = true
+
+[media.tmdb]
+api_key = "your-key"
+
+[media.trakt]
+client_id = "your-id"
 ```
 
 | Key | Default | Meaning |
@@ -709,15 +745,15 @@ Shows releases due now, waiting for the network, and failed; how far the walks o
 
 | Variable | Description |
 |---|---|
-| `ATLAS_HOME` | Folder that holds `config.json`, `atlas.db` and its shard files, and logs. `cargo run` uses the repository folder, and an installed binary uses its own folder. |
-| `ATLAS_NNTP_HOST`, `ATLAS_NNTP_PORT`, `ATLAS_NNTP_USER`, `ATLAS_NNTP_PASS` | One server from the environment. It goes first, ahead of `usenet_servers`. Atlas still saves groups and the API key in `config.json`, but never writes these credentials to it. |
+| `ATLAS_HOME` | Folder that holds `config.toml`, `atlas.db` and its shard files, and logs. The default is `~/.atlas`, or the binary's own folder when it already holds a config or `atlas.db`. `just run` and `cargo run` use the repository folder. |
+| `ATLAS_NNTP_HOST`, `ATLAS_NNTP_PORT`, `ATLAS_NNTP_USER`, `ATLAS_NNTP_PASS` | One server from the environment. It goes first, ahead of `usenet_servers`. Atlas still saves groups and the API key in `config.toml`, but never writes these credentials to it. |
 | `ATLAS_NNTP_CONNECTIONS` | Connections for that server. Default: `10`. |
 | `ATLAS_INDEX_MODE` | `dynamic`, `live`, or `backfill`. |
 | `ATLAS_API_HOST` | Interface the API binds to. See `api_host`. |
 | `ATLAS_API_PORT` | API port. See `api_port`. |
 | `OLLAMA_HOST` | Ollama server for AI search. Default: `127.0.0.1:11434`. |
 | `ATLAS_AI_MODEL` | Ollama model for AI search. Default: `qwen3:4b`. |
-| `ATLAS_NO_KEYRING` | Skips the OS keyring and keeps passwords in `config.json`. |
+| `ATLAS_NO_KEYRING` | Skips the OS keyring and keeps passwords in `config.toml`. |
 | `ATLAS_PROFILE` | Set to `1` to log a timing breakdown of the indexer every 30 seconds. |
 | `ATLAS_SAB_HOST`, `ATLAS_SAB_PORT`, `ATLAS_SAB_DIR`, `ATLAS_PYTHON` | Optional SABnzbd handoff. See [Direct downloads](#direct-downloads-with-sabnzbd). |
 
@@ -753,7 +789,7 @@ Common tasks are [just](https://github.com/casey/just) recipes. Run `just` to li
 | `just build-remote-debug` | The same, as a debug build. |
 | `just toolchain` | Shows which Rust the recipes use. |
 
-The remote recipes need `ATLAS_REMOTE_HOST`, which can be any SSH destination with Rust installed, for example `ATLAS_REMOTE_HOST=me@linuxbox just build-remote`. The recipes sync the source with rsync into `~/atlas-build` on that machine. To change the folder, set `ATLAS_REMOTE_DIR`. The recipes never send `config.json`, `atlas.db`, or logs. You can keep per-machine settings like these in a `.env` file that git ignores, and `just` loads it automatically. See `.env.example`.
+The remote recipes need `ATLAS_REMOTE_HOST`, which can be any SSH destination with Rust installed, for example `ATLAS_REMOTE_HOST=me@linuxbox just build-remote`. The recipes sync the source with rsync into `~/atlas-build` on that machine. To change the folder, set `ATLAS_REMOTE_DIR`. The recipes never send `config.toml`, `atlas.db`, or logs. You can keep per-machine settings like these in a `.env` file that git ignores, and `just` loads it automatically. See `.env.example`.
 
 CI (`.github/workflows/ci.yml`) checks formatting, runs clippy, and runs the tests on Linux, macOS, and Windows.
 
