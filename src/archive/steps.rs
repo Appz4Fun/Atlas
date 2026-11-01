@@ -235,6 +235,10 @@ impl Step for Par2Step {
             (block as i64, blocks as i64)
         });
         let mut outcome = finish(ctx, SOURCE_PAR2, listing_of(inventory), &limits)?;
+        // one set's files are only some of the release's, soo they don't say what the release holds
+        if !covers_all {
+            outcome.writes.retain(|write| write.sql != duplicates::SET_CONTENT);
+        }
         if let Some(posted) = posted {
             let params = vec![ctx.release().id.into(), posted.into()];
             outcome.writes.push(StepWrite::new(duplicates::SET_POSTED, params));
