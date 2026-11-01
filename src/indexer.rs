@@ -1680,7 +1680,7 @@ impl Pass<'_> {
         }
 
         if saved.skipped > 0 {
-            println!("[{kind}] {group} {start}-{end} skipped {} articles obfuscated per article", saved.skipped);
+            println!("[{kind}] {group} {start}-{end} gathered {} articles obfuscated per article", saved.skipped);
         }
 
         if saved.articles > 0 {
@@ -1726,8 +1726,10 @@ async fn save_slice(pool: &Arc<Pool>, db: &Db, group: &str, headers: Vec<Overvie
     let parsing = {
         let group = group.to_string();
         move || {
-            let (articles, skipped) = crate::filters::drop_per_article_obfuscated(headers_to_articles(headers));
-            let releases: Vec<Release> = crate::collections::group_articles(&group, articles).into_values().collect();
+            let (articles, uploads, skipped) = crate::filters::gather_per_article(&group, headers_to_articles(headers));
+            let mut releases: Vec<Release> =
+                crate::collections::group_articles(&group, articles).into_values().collect();
+            releases.extend(uploads);
             (releases, skipped)
         }
     };

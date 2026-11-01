@@ -9,7 +9,7 @@ use tiny_http::{Header, Request, Response, Server};
 
 use crate::config::{Config, get_api_key};
 use crate::dates::pub_date;
-use crate::nzb::{build_nzb, nzb_filename};
+use crate::nzb::{build_nzb, build_nzb_file, nzb_filename};
 use crate::search::{all_releases, get_release, newest_in_categories, search_all_releases, search_in_categories};
 use crate::ui;
 
@@ -356,7 +356,12 @@ pub(crate) fn get_nzb(args: &HashMap<String, String>) -> ApiResponse {
         return ApiResponse::not_found();
     };
 
-    let Ok(Some(content)) = build_nzb(release_id) else {
+    // `file` isnt in the Newznab spec: one file of the release, and one that isnt there is a miss
+    let built = match args.get("file") {
+        Some(file) => file.trim().parse().ok().map_or(Ok(None), |file| build_nzb_file(release_id, file)),
+        None => build_nzb(release_id),
+    };
+    let Ok(Some(content)) = built else {
         return ApiResponse::not_found();
     };
 
