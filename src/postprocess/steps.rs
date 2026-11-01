@@ -8,6 +8,7 @@ use crate::naming::steps as naming;
 use super::step::Step;
 
 pub fn all() -> Vec<Arc<dyn Step>> {
+    let [parse, lookup, nfo] = crate::media::steps();
     vec![
         Arc::new(archive::Par2Step::default()),
         Arc::new(archive::ListStep::default()),
@@ -15,6 +16,9 @@ pub fn all() -> Vec<Arc<dyn Step>> {
         Arc::new(naming::NfoName),
         Arc::new(crate::predb::step::PredbMatch),
         Arc::new(crate::category::CategoryStep::new()),
+        parse,
+        lookup,
+        nfo,
     ]
 }
 

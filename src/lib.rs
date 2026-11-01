@@ -20,6 +20,7 @@ pub mod download;
 pub mod filters;
 pub mod groups_menu;
 pub mod indexer;
+pub mod media;
 pub mod naming;
 pub mod nfo;
 pub mod nntp;

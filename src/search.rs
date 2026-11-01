@@ -224,6 +224,11 @@ fn newest(in_shards: &[usize], filter: &str, extra: Vec<Value>, page: i64, page_
     query_rows(&conn, &sql, &vals)
 }
 
+/// A release by id, if it's one a client may see.
+pub(crate) fn visible_release(conn: &Connection, id: i64) -> Result<Option<ReleaseRow>> {
+    conn.prepare_cached(&probe_sql(store::shard_of_id(id)))?.query_row([id], release_row).optional()
+}
+
 /// What a filtered read may look at, at most.
 #[derive(Clone, Copy)]
 pub struct Bounds {

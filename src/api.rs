@@ -22,8 +22,8 @@ const CAPS: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
   <registration available="no" open="no"/>
   <searching>
     <search available="yes" supportedParams="q,cat,limit,offset"/>
-    <tv-search available="yes" supportedParams="q,season,ep,cat,limit,offset"/>
-    <movie-search available="yes" supportedParams="q,cat,limit,offset"/>
+    <tv-search available="yes" supportedParams="q,season,ep,cat,limit,offset<!--tv-ids-->"/>
+    <movie-search available="yes" supportedParams="q,cat,limit,offset<!--movie-ids-->"/>
     <audio-search available="yes" supportedParams="q,cat,limit,offset"/>
     <book-search available="yes" supportedParams="q,cat,limit,offset"/>
   </searching>
@@ -132,11 +132,7 @@ pub fn handle(path: &str, query: &str, base: &str, api_key: &str) -> ApiResponse
 
     if t == Some("caps") {
         // advertise the address the client actually used
-        return ApiResponse::xml(
-            200,
-            CAPS.replace("http://127.0.0.1:9090", &escape(base))
-                .replace("<!--categories-->", &crate::category::caps_xml()),
-        );
+        return ApiResponse::xml(200, caps_body(base, &crate::media::query::refreshed_id_params()));
     }
 
     if args.get("apikey").map(String::as_str) != Some(api_key) {
@@ -148,17 +144,23 @@ pub fn handle(path: &str, query: &str, base: &str, api_key: &str) -> ApiResponse
 
     match t {
         Some("get") => get(&args),
-        Some(kind @ ("search" | "tvsearch" | "movie" | "music" | "audio" | "book")) => match search_term(kind, &args) {
-            Some(term) => search(&term, &args, base, api_key),
-            // only an id (tvdbid, imdbid, ...): atlas has no metadata to match ids against
-            None => rss(base, api_key, 0, &[], &HashMap::new(), &HashMap::new()),
-        },
+        Some(kind @ ("search" | "tvsearch" | "movie" | "music" | "audio" | "book")) => {
+            let on = crate::media::query::cached_id_params();
+            if let Some(ids) = crate::media::query::from_args(kind, &args, &on) {
+                return id_search(kind, &ids, &args, base, api_key, &on);
+            }
+            match search_term(kind, &args) {
+                Some(term) => search(&term, &args, base, api_key),
+                // only ids, and none of them on: an empty answer, soo a client falls back to a name
+                None => rss(base, api_key, 0, &[], &HashMap::new(), &HashMap::new(), &HashMap::new(), &on),
+            }
+        }
         None => ApiResponse::error(200, "Missing parameter (t)"),
         Some(_) => ApiResponse::error(203, "Function not available"),
     }
 }
 
-/// id parameters atlas cant match (it only knows release names)
+/// id parameters that alone mean nothing to search by name
 const ID_PARAMS: [&str; 8] = ["tvdbid", "rid", "tvrageid", "tvmazeid", "imdbid", "tmdbid", "traktid", "doubanid"];
 
 /// What to search for. `tvsearch` adds `S01E02` style season/episode terms.
@@ -168,7 +170,14 @@ pub fn search_term(kind: &str, args: &HashMap<String, String>) -> Option<String>
 
     if kind == "tvsearch" {
         let num = |k: &str| args.get(k).and_then(|v| v.trim().parse::<u32>().ok());
-        match (num("season"), num("ep")) {
+        let daily = args.get("ep").and_then(|e| e.trim().split_once('/')).and_then(|(m, d)| {
+            let (m, d) = (m.parse::<u32>().ok()?, d.parse::<u32>().ok()?);
+            num("season").filter(|y| (1000..=9999).contains(y)).map(|y| (y, m, d))
+        });
+        if let Some((y, m, d)) = daily {
+            term = format!("{term} {y} {m:02} {d:02}");
+        }
+        match (num("season").filter(|_| daily.is_none()), num("ep")) {
             (Some(s), Some(e)) => term = format!("{term} S{s:02}E{e:02}"),
             (Some(s), None) => term = format!("{term} S{s:02}"),
             _ => {}
@@ -182,6 +191,48 @@ pub fn search_term(kind: &str, args: &HashMap<String, String>) -> Option<String>
     }
 
     Some(term)
+}
+
+/// `caps`, with the ID parameters that are on.
+pub fn caps_body(base: &str, on: &crate::media::query::IdParams) -> String {
+    CAPS.replace("http://127.0.0.1:9090", &escape(base))
+        .replace("<!--categories-->", &crate::category::caps_xml())
+        .replace("<!--tv-ids-->", &on.tv.caps())
+        .replace("<!--movie-ids-->", &on.movie.caps())
+}
+
+/// A search by ID. Nothing found and a `q`: by name, which keeps "an ID next to `q`" useful.
+fn id_search(
+    kind: &str,
+    ids: &crate::media::query::IdQuery,
+    args: &HashMap<String, String>,
+    base: &str,
+    api_key: &str,
+    on: &crate::media::query::IdParams,
+) -> ApiResponse {
+    let limit = args.get("limit").and_then(|v| v.trim().parse::<i64>().ok()).unwrap_or(100).clamp(1, 100);
+    let offset = args.get("offset").and_then(|v| v.trim().parse::<i64>().ok()).unwrap_or(0).max(0);
+    let filter = args.get("cat").and_then(|c| crate::category::parse_filter(c));
+    match crate::media::query::find(ids, filter.as_ref(), offset, limit) {
+        Ok(rows) if rows.is_empty() => {
+            if args.get("q").is_some_and(|q| !q.trim().is_empty())
+                && let Some(term) = search_term(kind, args)
+            {
+                return search(&term, args, base, api_key);
+            }
+            rss(base, api_key, offset, &[], &HashMap::new(), &HashMap::new(), &HashMap::new(), on)
+        }
+        Ok(rows) => {
+            let found: Vec<i64> = rows.iter().map(|r| r.id).collect();
+            let categories = crate::category::categories_of(&found).unwrap_or_default();
+            let media = crate::media::query::attrs_of(&found).unwrap_or_default();
+            rss(base, api_key, offset, &rows, &crate::archive::store::passwords(&found), &categories, &media, on)
+        }
+        Err(e) => {
+            eprintln!("api id search failed: {e}");
+            ApiResponse::error(900, "Search failed")
+        }
+    }
 }
 
 fn search(q: &str, args: &HashMap<String, String>, base: &str, api_key: &str) -> ApiResponse {
@@ -203,7 +254,9 @@ fn search(q: &str, args: &HashMap<String, String>, base: &str, api_key: &str) ->
                 eprintln!("api categories failed: {e}");
                 HashMap::new()
             });
-            rss(base, api_key, offset, &r, &crate::archive::store::passwords(&ids), &categories)
+            let on = crate::media::query::cached_id_params();
+            let media = crate::media::query::attrs_of(&ids).unwrap_or_default();
+            rss(base, api_key, offset, &r, &crate::archive::store::passwords(&ids), &categories, &media, &on)
         }
         Err(e) => {
             eprintln!("api search failed: {e}");
@@ -212,6 +265,7 @@ fn search(q: &str, args: &HashMap<String, String>, base: &str, api_key: &str) ->
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn rss(
     base: &str,
     api_key: &str,
@@ -219,6 +273,8 @@ fn rss(
     releases: &[crate::search::ReleaseRow],
     passwords: &HashMap<i64, crate::archive::Password>,
     categories: &HashMap<i64, i64>,
+    media: &HashMap<i64, crate::media::query::MediaAttrs>,
+    on: &crate::media::query::IdParams,
 ) -> ApiResponse {
     let items: String = releases
         .iter()
@@ -229,8 +285,9 @@ fn rss(
                 .get(&r.id)
                 .map_or(String::new(), |p| format!("<newznab:attr name=\"password\" value=\"{}\"/>", p.code()));
             let category = categories.get(&r.id).copied().unwrap_or(crate::category::UNCATEGORIZED);
+            let attrs = media.get(&r.id).map_or(String::new(), |a| a.xml(on));
             format!(
-                "    <item>      <title>{}</title>      <guid isPermaLink=\"false\">{}</guid>      <link>{}</link>      <size>{size}</size>      <pubDate>{}</pubDate>      <enclosure url=\"{}\" type=\"application/x-nzb\" length=\"{size}\"/>      <newznab:attr name=\"category\" value=\"{category}\"/>{password}    </item>",
+                "    <item>      <title>{}</title>      <guid isPermaLink=\"false\">{}</guid>      <link>{}</link>      <size>{size}</size>      <pubDate>{}</pubDate>      <enclosure url=\"{}\" type=\"application/x-nzb\" length=\"{size}\"/>      <newznab:attr name=\"category\" value=\"{category}\"/>{attrs}{password}    </item>",
                 escape(&r.name),
                 r.id,
                 escape(&nzb_url),
@@ -447,7 +504,17 @@ mod tests {
             parts: None,
         };
         let passwords = HashMap::from([(1, Password::Yes), (2, Password::Maybe)]);
-        let body = rss("http://x", "k", 0, &[row(1), row(2), row(3)], &passwords, &HashMap::new()).body;
+        let body = rss(
+            "http://x",
+            "k",
+            0,
+            &[row(1), row(2), row(3)],
+            &passwords,
+            &HashMap::new(),
+            &HashMap::new(),
+            &Default::default(),
+        )
+        .body;
         assert!(body.contains(r#"<newznab:attr name="password" value="1"/>"#), "{body}");
         assert!(body.contains(r#"<newznab:attr name="password" value="2"/>"#), "{body}");
         assert_eq!(body.matches("name=\"password\"").count(), 2);
@@ -467,7 +534,17 @@ mod tests {
             parts: None,
         };
         let categories = HashMap::from([(1, 5040)]);
-        let body = rss("http://x", "k", 0, &[row(1), row(2)], &HashMap::new(), &categories).body;
+        let body = rss(
+            "http://x",
+            "k",
+            0,
+            &[row(1), row(2)],
+            &HashMap::new(),
+            &categories,
+            &HashMap::new(),
+            &Default::default(),
+        )
+        .body;
         assert!(body.contains(r#"name="category" value="5040""#), "{body}");
         assert!(body.contains(r#"name="category" value="8000""#), "{body}");
     }
@@ -488,5 +565,31 @@ mod tests {
             let params = &params[..params.find('"').unwrap()];
             assert!(params.split(',').any(|p| p == "cat"), "{params}");
         }
+    }
+
+    #[test]
+    fn caps_reflects_what_is_on() {
+        use crate::media::query::{IdParams, IdSet};
+        let none = caps_body("http://x", &IdParams::default());
+        assert!(
+            none.contains(r#"<tv-search available="yes" supportedParams="q,season,ep,cat,limit,offset"/>"#),
+            "{none}"
+        );
+        let set = IdSet { tvdb: true, imdb: true, rid: true, tvmaze: true, ..IdSet::default() };
+        let tvmaze = caps_body("http://x", &IdParams { tv: set, movie: IdSet::default() });
+        assert!(tvmaze.contains("offset,tvdbid,imdbid,rid,tvmazeid"), "{tvmaze}");
+        let all = IdSet { tvdb: true, tvmaze: true, trakt: true, tmdb: true, imdb: true, rid: true };
+        let movie = IdSet { imdb: true, tmdb: true, trakt: true, ..IdSet::default() };
+        let every = caps_body("http://x", &IdParams { tv: all, movie });
+        assert!(every.contains("offset,imdbid,tmdbid,traktid"), "{every}");
+        for name in ["tvdbid", "imdbid", "rid", "tvmazeid", "tmdbid", "traktid"] {
+            assert!(every.contains(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn search_term_finds_a_daily_show() {
+        let term = search_term("tvsearch", &parse_query("q=Some+Show&season=2025&ep=11/10"));
+        assert_eq!(term.as_deref(), Some("Some Show 2025 11 10"));
     }
 }

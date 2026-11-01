@@ -1,0 +1,4 @@
+[{"score":0.9,"show":{"id":102,"name":"Some Other Show","premiered":"2011-01-01","network":{"country":{"code":"US"}},
+  "externals":{"tvrage":2002,"thetvdb":3002,"imdb":"tt0100002"}}},
+ {"score":0.8,"show":{"id":103,"name":"Some Show","premiered":"2014-01-01","network":{"country":{"code":"GB"}},
+  "externals":{"tvrage":2003,"thetvdb":3003,"imdb":"tt0100003"}}}]

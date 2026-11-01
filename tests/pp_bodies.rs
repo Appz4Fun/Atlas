@@ -253,6 +253,22 @@ fn wait_until_gives_back_the_attempt_begin_counted() {
 }
 
 #[test]
+fn a_wait_doesnt_hold_up_the_steps_after_it() {
+    let log = log();
+    let mut h = fresh();
+    let at = chrono::Utc::now().timestamp() + 500;
+    let waits = TestStep::new(1, "waits", 100, Needs::Bodies, &log)
+        .runs(move |_| Ok(Outcome { wait_until: Some(at), ..Default::default() }));
+    let after = TestStep::new(2, "after", 110, Needs::Bodies, &log);
+    with_server(&mut h, &[complete("Rel.One")], vec![waits.arc(), after.arc()], budget(6000));
+    wait_for("the one after", || h.bits("Rel.One").is_some_and(|b| b.0 & mask(StepId(2)) != 0));
+    wait_for("it still waits", || h.field("Rel.One", "net_next_at") == at);
+    assert_eq!(h.bits("Rel.One").unwrap().0 & BIT, 0, "the first is still owed");
+    assert_eq!(h.field("Rel.One", "net_attempts"), 0);
+    assert_eq!((runs_of(&log, "waits"), runs_of(&log, "after")), (1, 1));
+}
+
+#[test]
 fn a_missing_article_is_for_the_step_to_judge() {
     let log = log();
     let mut h = fresh();

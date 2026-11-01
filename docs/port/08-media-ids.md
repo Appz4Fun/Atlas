@@ -130,7 +130,7 @@ T1 and T2 set `episode_last` only when it exceeds `episode`. A date sets `season
 5. \b((?:[A-Za-z]\.){2,}[A-Za-z]?\.?) : drop the dots inside (S.W.A.T. to SWAT)
 6. \([^)]*\)|[._] : a space each
 7. the language tags of AbstractTvProvider.php:1449, except the `MULTi` duplicate: removed
-8. \s+-\s*$ and then \s+[0-9]{1,3}\s*$ : removed
+8. \s+-\s*$ : removed. A trailing number stays: it's part of the title in `The 100` and `Polizeiruf 110`
 9. collapse whitespace; trim " and -; under 2 alphanumerics means None
 10. alias: lowercase of the result found in data/tv_title_aliases.tsv gives its canonical title
 ```
@@ -251,7 +251,7 @@ impl Media { pub fn resolve(&self, q: &TitleQuery<'_>, key: i64, now: i64) -> Re
    - Any ID known: `state = 1`, `next_check` NULL, `misses = 0`. `fanout_done = 0` when the IDs changed.
    - No ID and no trouble: `state = 2`, `misses + 1`, `next_check = now + min(negative_ttl_days * 2^(misses), 180) days`.
    - No ID with trouble: `state = 0`, keeping the bits set. The next run asks only the rest.
-5. Update the in-memory `known` entry and clear the claim. Return `Found(ids)` for `state = 1`, even with a provider paused: its missing bit means a later release of the title retries it. Otherwise `Later(later)` if any was paused; `Err(e)` if any was bad; else `NotFound`.
+5. Update the in-memory `known` entry and clear the claim. Return `Later(later)` if any was paused, even with IDs from another, because no later release of the title may come along to retry it; those IDs reach the rows by the fan-out. Otherwise `Err(e)` if any was bad; `Found(ids)` for `state = 1`; else `NotFound`.
 
 **Consistent:** a later provider's `tvdb`, `imdb`, `tmdb` or `tvrage`, where both are known, must equal what's there. Otherwise its whole answer is dropped and its bit is set: the first provider's identity wins. Trakt adds only when it agrees.
 
@@ -1118,3 +1118,6 @@ cargo test --lib db::tests::a_wipe_removes_the_media_cache
 32. **A new provider redoes `media_lookup` through `config_stamp`.** The step stays enabled, so Part 3's step mask sees nothing. The stamp walks once, and `wants` keeps it to one request per title, for the new provider only.
 33. **Correcting a wrong match needs a restart, not cache invalidation.** Deleting a cache row by hand is a rare repair, and the `known` map is what keeps `applies` free of I/O. Polling for outside changes to `atlas.media.db` would add a moving part for that one case. The order is in section 10, and `a_deleted_cache_row_needs_a_restart` pins it.
 34. **Distinct titles are capped, not evicted.** A poster chooses release names, so a provider on makes title count an outside input. Evicting would re-ask providers for real titles and spend their budget, where stopping at a generous cap costs only IDs for later titles, shown on the dashboard. Provider rate limits mean reaching it takes months at the defaults.
+34. **A lookup waiting on a provider doesn't hold up `media_nfo`.** The net lane ran the first step a release had left, so a lookup parked behind a refused key kept the NFO from ever being read. A step that returns `wait_until` now lets the steps after it run in the same visit, and the release comes back at its time.
+35. **A miss clears what a deleted cache row left behind.** With a wrong match's row deleted and `media_lookup` reprocessed, a `NotFound` for a title whose rows hold IDs fans out with no IDs. An NFO's IMDb id stays. Every other miss costs no fan-out, because its rows have no IDs.
+36. **Titles compare as their keys do, with an acronym's letters together.** `S.W.A.T.` from a provider and `SWAT` from a name are the same show, and `title::normalize` alone would give `s w a t`.
