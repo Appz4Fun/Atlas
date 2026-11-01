@@ -55,7 +55,7 @@ pub struct Contents {
     pub recovery_blocks: i64,
     /// from the PAR2 set, once read
     pub par2_block: Option<i64>,
-    pub par2_bytes: Option<i64>,
+    pub par2_blocks: Option<i64>,
 }
 
 impl Contents {
@@ -80,11 +80,8 @@ impl Contents {
 
     /// What the recovery blocks cover, in tenths of a percent, when the PAR2 set's been read.
     pub fn exact_repair_per_mille(&self) -> Option<i64> {
-        let (block, bytes) = (self.par2_block?, self.par2_bytes?);
-        (block > 0 && bytes > 0 && self.recovery_blocks > 0).then(|| {
-            let blocks = (bytes + block - 1) / block;
-            self.recovery_blocks * 1000 / blocks
-        })
+        let blocks = self.par2_blocks?;
+        (self.par2_block? > 0 && blocks > 0 && self.recovery_blocks > 0).then(|| self.recovery_blocks * 1000 / blocks)
     }
 
     /// What the recovery volumes could rebuild, as a share of the data in tenths of a percent.
@@ -174,9 +171,9 @@ pub fn contents_with(conn: &Connection, id: i64) -> Result<Contents> {
             totals.data_bytes += size;
         }
     }
-    if let Some((block, bytes)) = crate::duplicates::par2_sizes(conn, id) {
+    if let Some((block, blocks)) = crate::duplicates::par2_sizes(conn, id) {
         totals.par2_block = Some(block);
-        totals.par2_bytes = Some(bytes);
+        totals.par2_blocks = Some(blocks);
     }
     Ok(totals)
 }
@@ -366,8 +363,7 @@ mod tests {
     fn exact_repair_counts_blocks() {
         assert_eq!(recovery_blocks("a.vol003+04.par2"), 4);
         assert_eq!(recovery_blocks("a.par2"), 0);
-        let c =
-            Contents { recovery_blocks: 10, par2_block: Some(1000), par2_bytes: Some(99_500), ..Contents::default() };
+        let c = Contents { recovery_blocks: 10, par2_block: Some(1000), par2_blocks: Some(100), ..Contents::default() };
         assert_eq!(c.exact_repair_per_mille(), Some(100), "10 of 100 blocks");
         assert_eq!(Contents::default().exact_repair_per_mille(), None);
     }

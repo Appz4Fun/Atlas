@@ -222,16 +222,24 @@ impl Step for Par2Step {
             return Ok(Outcome::default());
         }
         let limits = self.limits.lock().unwrap().clone();
-        let posted = inventory.complete.then(|| duplicates::posted_fingerprint(&inventory.files)).flatten();
-        let covered: u64 = inventory.files.iter().map(|f| f.size).sum();
-        let sizes = inventory.block_size.filter(|_| inventory.complete).map(|block| (block as i64, covered as i64));
+        // one set that covers every posted file. A release can hold several sets, and one proves only its own files
+        let posted_files = files.iter().filter(|f| !f.filename.to_ascii_lowercase().ends_with(".par2")).count();
+        let one_set =
+            inventory.files.first().is_some_and(|first| inventory.files.iter().all(|f| f.set_id == first.set_id));
+        let covers_all = inventory.complete && one_set && inventory.files.len() == posted_files;
+        let posted = covers_all.then(|| duplicates::posted_fingerprint(&inventory.files)).flatten();
+        let sizes = inventory.block_size.filter(|_| covers_all).map(|block| {
+            // each file's last block is padded on its own
+            let blocks: u64 = inventory.files.iter().map(|f| f.size.div_ceil(block)).sum();
+            (block as i64, blocks as i64)
+        });
         let mut outcome = finish(ctx, SOURCE_PAR2, listing_of(inventory), &limits)?;
         if let Some(posted) = posted {
             let params = vec![ctx.release().id.into(), posted.into()];
             outcome.writes.push(StepWrite::new(duplicates::SET_POSTED, params));
         }
-        if let Some((block, covered)) = sizes {
-            let params = vec![ctx.release().id.into(), block.into(), covered.into()];
+        if let Some((block, blocks)) = sizes {
+            let params = vec![ctx.release().id.into(), block.into(), blocks.into()];
             outcome.writes.push(StepWrite::new(duplicates::SET_PAR2_SIZES, params));
         }
         Ok(outcome)
