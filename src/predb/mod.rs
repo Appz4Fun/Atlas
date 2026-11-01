@@ -7,6 +7,7 @@ pub mod import;
 pub mod keys;
 pub mod late;
 pub mod matcher;
+pub mod more_feeds;
 pub mod poll;
 pub mod step;
 

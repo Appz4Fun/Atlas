@@ -433,6 +433,13 @@ When you turn it on, Atlas contacts the third parties you list, and walks your e
 | `xrel` | `api.xrel.to` | Scene titles | The same, and never over 900 requests an hour |
 | `xrel_p2p` | `api.xrel.to` | P2P titles | The same |
 | `predb_org` | `predb.org` | History, through `history_pages` | The same |
+| `predb_ovh` | `predb.ovh` | Scene titles | The same |
+| `srrdb` | `api.srrdb.com` | Scene titles, with no pre time | The same |
+| `predatabase` | `predataba.se` | The newest ten titles | One request a poll |
+| `predb_me`, `scnsrc_me`, `eztv`, `nfodb`, `one_techno`, `one_gabba`, `ddlvalley`, `hdencode`, `hdencode_tv`, `mp3scene`, `gload`, `hdworld`, `movieblog`, `scnlog` | Each one's RSS feed | Recent titles | One request a poll |
+| `apibay`, `knaben` | `apibay.org`, `api.knaben.org` | Recent movie and TV names | One request a poll |
+| `crowdnfo`, `nima4k`, `g4u`, `gabber`, `seriousaboutsound` | Each site's listing page | Recent titles | One request a poll. A site that changes its page reads as no rows, and backs off |
+| `nswdb`, `3dsdb`, `dats_pciso_1998`, `nzedb_archive` | Each one's whole catalogue | Older titles | One request a week |
 
 All of these go in the `predb` object:
 
