@@ -125,9 +125,11 @@ impl Step for ProbeStep {
         let mut last_lines = None;
         if let Some(file) = main_file(&files) {
             info.file = Some(file.filename.clone());
-            let first = ctx.segments(file.id, &SegmentPick::First(1)).map_err(retry)?.into_iter().next();
-            let last = ctx.segments(file.id, &SegmentPick::Last(1)).map_err(retry)?.into_iter().next();
-            if let Some(first) = first {
+            // only the real ends count: an incomplete file's earliest article isn't its first
+            let first = archive::steps::first_article(ctx, file)?;
+            let last = archive::steps::tail_articles(ctx, file)?.pop();
+            let wire_bytes = first.as_ref().map_or(0, |f| f.bytes);
+            if let Some(first) = &first {
                 let got = fetch_raw(ctx, &first.message_id, &file.filename)?;
                 if let Some(there) = there(&got) {
                     info.health.insert("first".into(), there);
@@ -146,26 +148,26 @@ impl Step for ProbeStep {
                         inspect(&body, &mut info);
                     }
                 }
-                let total = file.expected.unwrap_or(file.parts_seen);
-                if total > 2 {
-                    let middle = ctx.segments(file.id, &SegmentPick::Parts(vec![total / 2])).map_err(retry)?;
-                    if let Some(middle) = middle.into_iter().next()
-                        && let Some(there) = ctx.article_exists(&middle.message_id, &file.filename)?
-                    {
-                        info.health.insert("middle".into(), there);
-                    }
-                }
-                if let Some(last) = last.filter(|l| l.message_id != first.message_id) {
-                    let got = fetch_raw(ctx, &last.message_id, &file.filename)?;
-                    if let Some(there) = there(&got) {
-                        info.health.insert("last".into(), there);
-                    }
-                    if let Got::Body(raw) = got {
-                        last_lines = yenc::parse(&yenc::split_article(&raw).lines);
-                    }
+            }
+            let total = file.expected.unwrap_or(file.parts_seen);
+            if total > 2 {
+                let middle = ctx.segments(file.id, &SegmentPick::Parts(vec![total / 2])).map_err(retry)?;
+                if let Some(middle) = middle.into_iter().next()
+                    && let Some(there) = ctx.article_exists(&middle.message_id, &file.filename)?
+                {
+                    info.health.insert("middle".into(), there);
                 }
             }
-            derive(&mut info, ctx.release().size, file.expected, last_lines.as_ref());
+            if let Some(last) = last.filter(|l| first.as_ref().is_none_or(|f| l.message_id != f.message_id)) {
+                let got = fetch_raw(ctx, &last.message_id, &file.filename)?;
+                if let Some(there) = there(&got) {
+                    info.health.insert("last".into(), there);
+                }
+                if let Got::Body(raw) = got {
+                    last_lines = yenc::parse(&yenc::split_article(&raw).lines);
+                }
+            }
+            derive(&mut info, wire_bytes, file.expected, last_lines.as_ref());
         }
 
         let empty = info.yenc.is_none() && info.nfo.is_none() && info.sfv.is_empty() && info.health.is_empty();

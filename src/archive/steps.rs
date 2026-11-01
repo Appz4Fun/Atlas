@@ -40,7 +40,7 @@ pub(crate) fn first_article(ctx: &StepCtx<'_>, file: &FileInfo) -> Result<Option
 }
 
 /// A file's last articles, last one last. Empty when its last isnt indexed.
-fn tail_articles(ctx: &StepCtx<'_>, file: &FileInfo) -> Result<Vec<SegmentRef>, StepError> {
+pub(crate) fn tail_articles(ctx: &StepCtx<'_>, file: &FileInfo) -> Result<Vec<SegmentRef>, StepError> {
     let segs = ctx.segments(file.id, &SegmentPick::Last(2)).map_err(retry)?;
     let last_is_there = match (file.expected, segs.last().and_then(|s| s.part)) {
         (Some(expected), Some(part)) => part == expected,

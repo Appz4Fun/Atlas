@@ -1140,7 +1140,9 @@ fn probe_html(p: &crate::probe::ProbeInfo) -> String {
         let lock = match (a.headers_encrypted, a.encrypted) {
             (true, _) => tag("tag-bad", "NAMES AND FILES ENCRYPTED"),
             (false, true) => tag("tag-bad", "FILES ENCRYPTED"),
-            _ => tag("tag-ok", "NOT ENCRYPTED"),
+            // a 7z's first bytes, or a RAR cut off before its first file, say nothing either way
+            _ if a.name.is_some() => tag("tag-ok", "NOT ENCRYPTED"),
+            _ => String::new(),
         };
         dd(&mut packed, "Encryption", lock);
         dd(&mut packed, "First file", a.name.as_deref().map_or(String::new(), escape));

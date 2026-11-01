@@ -60,6 +60,8 @@ fn every_field_finds_its_releases_and_counts_them() {
 
         let team = Fields { team: "BBB".into(), ..Fields::default() };
         assert_eq!(names(&team, "").len(), 1);
+        let part = Fields { team: "BB".into(), ..Fields::default() };
+        assert!(names(&part, "").is_empty(), "the whole group, not the start of one");
 
         let size = find(&group, "", None, 0, 1).unwrap()[0].size.unwrap();
         let bytes = Fields { size: size.to_string(), ..Fields::default() };

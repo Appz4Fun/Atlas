@@ -136,12 +136,17 @@ fn digits(s: &str) -> Vec<i64> {
     out
 }
 
+/// The longest range read from a name: names come from Usenet, and `S01-999999999` isn't a season list.
+const MAX_RANGE: i64 = 10_000;
+
 fn range(input: &str) -> Option<Vec<i64>> {
     let numbers = digits(input);
     match numbers.len() {
         1 => Some(numbers),
-        2 if numbers[0] < numbers[1] => Some((numbers[0]..=numbers[1]).collect()),
-        n if n > 2 && numbers.windows(2).all(|w| w[0] + 1 == w[1]) => Some(numbers),
+        2 if numbers[0] < numbers[1] && numbers[1].checked_sub(numbers[0])? < MAX_RANGE => {
+            Some((numbers[0]..=numbers[1]).collect())
+        }
+        n if n > 2 && numbers.windows(2).all(|w| w[0].checked_add(1) == Some(w[1])) => Some(numbers),
         _ => None,
     }
 }
@@ -222,7 +227,7 @@ fn transform(t: T, input: &str, existing: Option<&Value>) -> Option<Value> {
         T::Range => Value::Ints(range(input)?),
         T::RangeXOfY => {
             let numbers = digits(input);
-            if numbers.len() != 1 {
+            if numbers.len() != 1 || numbers[0] > MAX_RANGE {
                 return None;
             }
             Value::Ints((1..=numbers[0]).collect())
@@ -568,6 +573,16 @@ pub fn parse(name: &str) -> Parsed {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_range_from_a_name_stays_small() {
+        assert_eq!(range("S01-03"), Some(vec![1, 2, 3]));
+        assert_eq!(range("1-999999999"), None);
+        assert_eq!(range("1-9223372036854775807"), None);
+        assert!(transform(T::RangeXOfY, "50000000", None).is_none());
+        parse("Show.S01-999999999.1080p");
+        parse("Movie [50000000 of 1].mkv");
+    }
 
     #[test]
     fn every_rule_compiles() {

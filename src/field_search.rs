@@ -180,7 +180,13 @@ fn plan(fields: &Fields, words: &str, filter: Option<&CatFilter>) -> Plan {
     }
     if !fields.team.is_empty() {
         let team = fields.team.replace('\\', r"\\").replace('%', r"\%").replace('_', r"\_");
-        add(&mut p, r"coalesce(r.display_name, r.name) like {} escape '\'", Value::Text(format!("%-{team}%")));
+        // at the end of the name, or before an extension or a tag, with PTT's space after the hyphen allowed
+        let shapes: Vec<String> = ["'%-'", "'%- '"]
+            .into_iter()
+            .flat_map(|head| ["''", "'.%'", "' %'", "'[%'"].map(|tail| (head, tail)))
+            .map(|(head, tail)| format!(r"coalesce(r.display_name, r.name) like {head} || {{}} || {tail} escape '\'"))
+            .collect();
+        add(&mut p, &format!("({})", shapes.join(" or ")), Value::Text(team));
     }
     if let Ok(crc) = u32::from_str_radix(fields.crc.trim_start_matches("0x"), 16) {
         add(&mut p, "@probe:crc32:{}", Value::Integer(i64::from(crc)));
@@ -236,6 +242,13 @@ impl Plan {
             .collect::<Vec<_>>()
             .join(" and ")
     }
+}
+
+/// How to build the optional indexes this shard has, for compaction to build them again.
+pub fn optional_indexes(conn: &Connection) -> rusqlite::Result<Vec<String>> {
+    let mut stmt =
+        conn.prepare("select sql from sqlite_master where type = 'index' and name in (?1, ?2) and sql is not null")?;
+    stmt.query_map([POSTER_INDEX, SIZE_INDEX], |r| r.get(0))?.collect()
 }
 
 /// Whether an index can answer this search in this shard.
