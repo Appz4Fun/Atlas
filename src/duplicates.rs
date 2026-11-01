@@ -34,14 +34,14 @@ pub const FINGERPRINT: ShardTable = ShardTable {
         ),
     ],
     release_key: Some("release_id"),
-    added: &[("par2_block", "INTEGER"), ("par2_bytes", "INTEGER")],
+    added: &[("par2_block", "INTEGER"), ("par2_blocks", "INTEGER")],
 };
 
 pub const SET_POSTED: &str = "insert into release_fingerprint (release_id, posted) values (?1, ?2)
     on conflict(release_id) do update set posted = excluded.posted";
 pub const SET_PAR2_SIZES: &str =
-    "insert into release_fingerprint (release_id, par2_block, par2_bytes) values (?1, ?2, ?3)
-    on conflict(release_id) do update set par2_block = excluded.par2_block, par2_bytes = excluded.par2_bytes";
+    "insert into release_fingerprint (release_id, par2_block, par2_blocks) values (?1, ?2, ?3)
+    on conflict(release_id) do update set par2_block = excluded.par2_block, par2_blocks = excluded.par2_blocks";
 pub const SET_CONTENT: &str = "insert into release_fingerprint (release_id, content) values (?1, ?2)
     on conflict(release_id) do update set content = excluded.content";
 
@@ -293,13 +293,13 @@ pub fn later_copies(ids: &[i64]) -> db::Result<Vec<i64>> {
     Ok(later)
 }
 
-/// A PAR2 set's block size and the bytes it covers, when a read has kept them.
+/// A PAR2 set's block size and how many data blocks it has, when a read has kept them.
 pub fn par2_sizes(conn: &Connection, id: i64) -> Option<(i64, i64)> {
     let s = store::shard_of_id(id);
-    let sql = format!("select par2_block, par2_bytes from s{s}.release_fingerprint where release_id = ?");
+    let sql = format!("select par2_block, par2_blocks from s{s}.release_fingerprint where release_id = ?");
     conn.query_row(&sql, [id], |r| Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, Option<i64>>(1)?)))
         .ok()
-        .and_then(|(block, bytes)| Some((block?, bytes?)))
+        .and_then(|(block, blocks)| Some((block?, blocks?)))
 }
 
 /// Adds what `own` is missing from a twin's articles, file by file. A twin's file counts only under the
