@@ -188,6 +188,9 @@ struct Search {
     filters: Vec<&'static str>,
 }
 
+/// How far back "Hide copies" looks for what a page's copies are copies of.
+const MAX_EARLIER_FOR_COPIES: i64 = 2_000;
+
 /// The quick filters over results. Each is also searched for, except the last.
 const FILTERS: &[&str] = &["2160p", "1080p", "DV", "HDR", "Remux", "WEB-DL", "BluRay", HIDE_COPIES];
 const HIDE_COPIES: &str = "Hide copies";
@@ -294,7 +297,19 @@ impl Search {
             self.filters.iter().all(|filter| filter_matches(filter, &tags))
         });
         if self.filters.contains(&HIDE_COPIES) {
-            let ids: Vec<i64> = found.iter().map(|r| r.id).collect();
+            // a copy of something on an earlier page is a copy too
+            let earlier = self.offset.min(MAX_EARLIER_FOR_COPIES);
+            let start = self.offset - earlier;
+            let before = if earlier > 0 {
+                find_releases(&self.words(), filter.as_ref(), start, earlier).unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            let shown = before.iter().filter(|r| {
+                let tags = release_tags::parse(&r.name);
+                self.filters.iter().all(|filter| filter_matches(filter, &tags))
+            });
+            let ids: Vec<i64> = shown.chain(found.iter()).map(|r| r.id).collect();
             let hidden = crate::duplicates::later_copies(&ids).unwrap_or_default();
             found.retain(|r| !hidden.contains(&r.id));
         }
@@ -752,7 +767,10 @@ fn release_html(
     let copies = crate::duplicates::copies(r.id).unwrap_or_default();
     let has_twin = crate::duplicates::can_fill(r.id, &copies);
     let fill = if has_twin && contents.articles_seen < contents.articles_expected {
-        format!("<a class=\"button\" href=\"/ui/nzb?id={}&amp;fill=1\">NZB, gaps filled from a twin</a>", r.id)
+        format!(
+            "<a class=\"button\" href=\"/ui/nzb?id={}&amp;fill=1\">NZB, gaps filled from a twin (check it with PAR2)</a>",
+            r.id
+        )
     } else {
         String::new()
     };

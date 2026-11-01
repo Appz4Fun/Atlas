@@ -107,16 +107,19 @@ fn is_sample(name: &str) -> bool {
 
 /// What's in a release, from what's inside its archives, or its PAR2 set when it isn't packed: the exact
 /// sizes of its real files. Names don't count, because obfuscation changes them. None: a file is packed,
-/// soo these aren't the real files, or there's nothing big enough to go by.
+/// soo these aren't the real files, a real file's size isn't known, or there's nothing big enough to go by.
 pub fn content_fingerprint<'a>(files: impl Iterator<Item = (&'a str, Option<u64>)>) -> Option<Vec<u8>> {
     let mut sizes = Vec::new();
     for (name, size) in files {
         if is_archive(name) {
             return None;
         }
-        if !is_sample(name)
-            && let Some(size) = size.filter(|s| *s >= MIN_CONTENT_FILE)
-        {
+        if is_sample(name) {
+            continue;
+        }
+        // leaving it out would make this the same as a release without that file
+        let size = size?;
+        if size >= MIN_CONTENT_FILE {
             sizes.push(size);
         }
     }
@@ -402,6 +405,12 @@ mod tests {
     use super::*;
 
     const GB: u64 = 1 << 30;
+
+    #[test]
+    fn a_file_of_unknown_size_makes_no_content_fingerprint() {
+        assert!(content_fingerprint([("a.mkv", Some(GB)), ("b.mkv", None)].into_iter()).is_none());
+        assert!(content_fingerprint([("a.mkv", Some(GB)), ("sample.mkv", None)].into_iter()).is_some());
+    }
 
     #[test]
     fn swapped_names_are_twins_but_cant_lend_articles() {
