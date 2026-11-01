@@ -175,11 +175,10 @@ fn late_thread(shared: Arc<Shared>, stage: Arc<Stage>) {
 }
 
 impl Service {
-    /// Makes the file. Threads `atlas-predb-feed`, and `atlas-predb-late` when there is a stage and `late_per_second > 0`.
+    /// Makes the file. Threads `atlas-predb-feed`, and `atlas-predb-late` when there is a stage.
     pub fn start(p: ServiceParams) -> anyhow::Result<Arc<Service>> {
         let path = db::path_for(&p.main);
         drop(db::create(&path)?);
-        let late_on = p.config.late_per_second > 0;
         let shared = Arc::new(Shared {
             path,
             main: p.main,
@@ -191,7 +190,8 @@ impl Service {
         let (feed, fetch) = (shared.clone(), p.fetch);
         threads
             .push(std::thread::Builder::new().name("atlas-predb-feed".into()).spawn(move || feed_thread(feed, fetch))?);
-        if let Some(stage) = p.stage.filter(|_| late_on) {
+        // whatever `late_per_second` says now: a reload can turn it on, and it waits while that's 0
+        if let Some(stage) = p.stage {
             let late = shared.clone();
             threads.push(
                 std::thread::Builder::new().name("atlas-predb-late".into()).spawn(move || late_thread(late, stage))?,

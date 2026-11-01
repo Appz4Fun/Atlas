@@ -100,21 +100,21 @@ fn unique(mut found: Vec<TitleRow>) -> Result<Option<TitleRow>, ()> {
     }
 }
 pub fn find(conn: &Connection, e: &Evidence<'_>) -> rusqlite::Result<Option<Match>> {
-    // hash-named posts: the full digest has to agree, a key only nominates
+    // hash-named posts: the full digest has to agree, a key only nominates, and all of them have to point at one title
+    let mut hashed = Vec::new();
     for raw in std::iter::once(e.name).chain(e.files.iter().copied()).take(MAX_NAMES) {
         // cleaned, so `<hash>.mkv` and Part 2's `<hash> [12345678]` count
         let Some(name) = clean_candidate(raw) else { continue };
         let Some(key) = hash_key(&name) else { continue };
         let want = name.to_ascii_lowercase();
-        let hits = rows_for_key(conn, key)?
-            .into_iter()
-            .filter(|t| md5_hex(&t.title) == want || sha1_hex(&t.title) == want)
-            .collect();
-        match unique(hits) {
-            Ok(Some(t)) => return Ok(Some(Match { title: t, kind: Kind::Hash })),
-            Ok(None) => {}
-            Err(()) => return Ok(None),
-        }
+        hashed.extend(
+            rows_for_key(conn, key)?.into_iter().filter(|t| md5_hex(&t.title) == want || sha1_hex(&t.title) == want),
+        );
+    }
+    match unique(hashed) {
+        Ok(Some(t)) => return Ok(Some(Match { title: t, kind: Kind::Hash })),
+        Ok(None) => {}
+        Err(()) => return Ok(None),
     }
     // the release's own names
     for name in e.display_name.into_iter().chain([e.name]) {
@@ -243,6 +243,17 @@ mod tests {
         let file = format!("{md5}.rar");
         let e = Evidence { files: vec![&file], ..evidence("Xk3Mz9PqL") };
         assert_eq!(found(&conn, &e), Some((Kind::Hash, T.to_string())));
+    }
+
+    #[test]
+    fn hash_files_of_two_titles_are_no_match() {
+        let (_dir, conn) = fixture(&[T, SECOND]);
+        let (one, two) = (format!("{}.rar", md5_hex(T)), format!("{}.rar", md5_hex(SECOND)));
+        let e = Evidence { files: vec![&one, &two], ..evidence("Xk3Mz9PqL") };
+        assert_eq!(found(&conn, &e), None);
+        let again = format!("{}.r00", sha1_hex(T));
+        let e = Evidence { files: vec![&one, &again], ..evidence("Xk3Mz9PqL") };
+        assert_eq!(found(&conn, &e), Some((Kind::Hash, T.to_string())), "two hashes of one title agree");
     }
 
     #[test]

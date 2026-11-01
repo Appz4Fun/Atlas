@@ -407,7 +407,7 @@ All of these go in the `predb` object:
 | `sources` | `[]` | The feeds to poll. Empty with `enabled` on: matches against what's in the file, with no network. |
 | `poll_minutes` | `5` | Between polls of a source. At least 1. |
 | `page_size` | `100` | Clamped to each source's range. |
-| `max_pages_per_poll` | `3` | Requests per source per poll, from 1 to 20. |
+| `max_pages_per_poll` | `3` | Requests per source per poll, from 1 to 20. A poll with a gap to finish or history to read takes at least 2. |
 | `max_db_mb` | `8192` | Polling stops, with an error on the dashboard, once `atlas.predb.db` passes this. At least 64. |
 | `request_delay_ms` | `1000` | Between requests to one source. At least 250, and a source's own floor applies. |
 | `timeout_secs` | `15` | For a whole request, from 1 to 120. |

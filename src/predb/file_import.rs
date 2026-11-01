@@ -110,6 +110,10 @@ pub fn import_lines(
         if (&mut input).take(MAX_IMPORT_LINE + 1).read_until(b'\n', &mut buf)? == 0 {
             break if input.limit() == 0 { Stop::TooManyBytes } else { Stop::End };
         }
+        // the cap fell inside this line: what was read of it is no title
+        if input.limit() == 0 && buf.last() != Some(&b'\n') {
+            break Stop::TooManyBytes;
+        }
         if lines == limits.max_lines {
             break Stop::TooManyLines;
         }

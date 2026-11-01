@@ -321,6 +321,47 @@ fn a_429_waits_as_told() {
 }
 
 #[test]
+fn a_servers_delay_counts_from_its_answer() {
+    let mut f = fixture();
+    f.script(club(), 1, &page(&titles(100, 5)));
+    f.fetch.reply_with(&page_url(club(), 2, 100), limited(Some("120"), None));
+    let pause = |d: Duration| {
+        assert!(d >= Duration::from_secs(1));
+        std::thread::sleep(Duration::from_millis(1_100));
+        true
+    };
+    let got = poll_source(&mut f.conn, f.fetch.as_ref(), club(), &cfg(), NOW, &pause).unwrap();
+    assert_eq!(got, PollEnd::RateLimited(120));
+    assert!(f.field(1, "next_poll_at") >= NOW + 121, "{}", f.field(1, "next_poll_at"));
+}
+
+#[test]
+fn a_one_page_budget_still_closes_a_gap_and_reads_history() {
+    let mut f = fixture();
+    let old = titles(900, 5);
+    f.import(club(), &old);
+    f.had_a_success(club());
+    f.conn.execute("update feeds set resume_page = 7, gap_floor = 5 where source = 1", []).unwrap();
+    f.script(club(), 1, &page(&old));
+    f.script(club(), 7, &page(&old));
+    let one = PredbConfig { max_pages_per_poll: 1, ..cfg() };
+    assert_eq!(f.poll(club(), &one), PollEnd::CaughtUp);
+    assert_eq!(f.field(1, "resume_page"), 0);
+
+    let history = PredbConfig { history_pages: 1, ..one };
+    f.script(club(), 1, &page(&old));
+    f.script(club(), 2, &page(&titles(100, 5)));
+    assert_eq!(f.poll(club(), &history), PollEnd::CaughtUp);
+    assert_eq!(f.field(1, "history_read"), 1);
+
+    // with nothing owed, the budget is as set
+    f.requests();
+    f.script(club(), 1, &page(&old));
+    assert_eq!(f.poll(club(), &history), PollEnd::CaughtUp);
+    assert_eq!(f.requests().len(), 1);
+}
+
+#[test]
 fn a_rate_limit_envelope_is_the_same() {
     let mut f = fixture();
     f.script(club(), 1, include_str!("fixtures/predb/rate_limited.json"));

@@ -3,7 +3,7 @@
 mod common;
 
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, Output};
 
 use atlas::predb::db::{create, path_for};
@@ -177,6 +177,20 @@ fn a_gzip_bomb_stops_at_the_byte_cap() {
 }
 
 #[test]
+fn the_byte_cap_inside_a_line_stores_no_part_of_it() {
+    let h = home();
+    let file = h.file("cut.txt", b"First.Whole.Title-GRP\nAlpha.Beta.Gamma-GRP\n");
+    let out = h.run(&[&file, "--apply"], &[("ATLAS_PREDB_IMPORT_MAX_BYTES", "32"), ("ATLAS_PREDB_IMPORT_BATCH", "1")]);
+    assert!(!out.status.success());
+    let stored: Vec<String> = {
+        let conn = h.predb();
+        let mut stmt = conn.prepare("select title from titles").unwrap();
+        stmt.query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect()
+    };
+    assert_eq!(stored, ["First.Whole.Title-GRP"]);
+}
+
+#[test]
 fn too_many_lines_stops() {
     let h = home();
     let lines: String = (0..50).map(|i| format!("Numbered.Title.N{i:03}-GRP\n")).collect();
@@ -224,5 +238,4 @@ fn the_import_path_has_no_http() {
 fn help_lists_it() {
     let out = Command::new(env!("CARGO_BIN_EXE_atlas")).arg("--help").output().unwrap();
     assert!(String::from_utf8_lossy(&out.stdout).contains("--predb-import"));
-    let _ = Path::new("");
 }

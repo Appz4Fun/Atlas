@@ -3,7 +3,7 @@
 //! Ported from newznab-tmux `app/Console/Commands/PredbImportFeed.php` and `config/predb_feeds.php`, GPLv3.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rusqlite::{Connection, params};
 
@@ -96,6 +96,7 @@ enum Trouble {
 }
 
 struct Poller<'a> {
+    started: Instant,
     fetch: &'a dyn Fetch,
     spec: &'a FeedSpec,
     page_size: u32,
@@ -106,6 +107,11 @@ struct Poller<'a> {
 }
 
 impl Poller<'_> {
+    /// `now` moved on by how long this poll has taken: a server's delay counts from its answer
+    fn now_after(&self) -> i64 {
+        self.now.saturating_add(i64::try_from(self.started.elapsed().as_secs()).unwrap_or(i64::MAX))
+    }
+
     fn page(&mut self, page: i64) -> Result<Vec<Entry>, Trouble> {
         if !self.first && !(self.pause)(self.delay) {
             return Err(Trouble::Stopped);
@@ -114,7 +120,7 @@ impl Poller<'_> {
         let page = u32::try_from(page).unwrap_or(u32::MAX);
         let reply = self.fetch.get(&page_url(self.spec, page, self.page_size)).map_err(Trouble::Failed)?;
         if reply.status == 429 {
-            return Err(Trouble::RateLimited(wait_seconds(&reply, self.now, RATE_LIMIT_DEFAULT)));
+            return Err(Trouble::RateLimited(wait_seconds(&reply, self.now_after(), RATE_LIMIT_DEFAULT)));
         }
         if reply.status != 200 {
             return Err(Trouble::Failed(format!("HTTP {}", reply.status)));
@@ -122,7 +128,9 @@ impl Poller<'_> {
         let value: serde_json::Value =
             serde_json::from_str(&reply.body).map_err(|e| Trouble::Failed(format!("bad JSON: {e}")))?;
         (self.spec.parse)(&value, page).map_err(|e| match e {
-            ParseError::RateLimited(_) => Trouble::RateLimited(wait_seconds(&reply, self.now, RATE_LIMIT_DEFAULT)),
+            ParseError::RateLimited(_) => {
+                Trouble::RateLimited(wait_seconds(&reply, self.now_after(), RATE_LIMIT_DEFAULT))
+            }
             ParseError::Shape(why) => Trouble::Failed(why),
         })
     }
@@ -158,9 +166,11 @@ struct Row {
 fn walk(conn: &mut Connection, p: &mut Poller<'_>, row: &Row, cfg: &PredbConfig) -> Result<bool, TroubleOrDb> {
     let spec = p.spec;
     let (source, now) = (spec.id, p.now);
-    let mut budget = i64::from(cfg.max_pages_per_poll.max(1));
     let fresh = row.last_ok_at.is_none();
     let open = row.resume_page;
+    // page 1 takes a request every poll, soo owed work needs a second one or it would never get its turn
+    let owed = open > 0 || row.history_read < i64::from(cfg.history_pages);
+    let mut budget = i64::from(cfg.max_pages_per_poll.max(if owed { 2 } else { 1 }));
     // the open gap's floor stays: walking down from a new cursor passes through what the old one left
     let floor = if open > 0 {
         row.gap_floor
@@ -330,6 +340,7 @@ pub fn poll_source(
         return failed(conn, spec.id, "the PreDB file is over max_db_mb".into(), row.failures, poll_secs, now);
     }
     let mut poller = Poller {
+        started: Instant::now(),
         fetch,
         spec,
         page_size: cfg.page_size,
@@ -338,7 +349,9 @@ pub fn poll_source(
         now,
         first: true,
     };
-    match walk(conn, &mut poller, &row, cfg) {
+    let walked = walk(conn, &mut poller, &row, cfg);
+    let answered_at = poller.now_after();
+    match walked {
         Ok(gap) => {
             conn.execute(
                 "update feeds set failures = 0, last_ok_at = ?1, last_error = null, next_poll_at = ?2 where source = ?3",
@@ -348,11 +361,13 @@ pub fn poll_source(
         }
         Err(TroubleOrDb::Db(e)) => Err(e),
         Err(TroubleOrDb::Trouble(Trouble::Stopped)) => Ok(PollEnd::Stopped),
-        Err(TroubleOrDb::Trouble(Trouble::Failed(why))) => failed(conn, spec.id, why, row.failures, poll_secs, now),
+        Err(TroubleOrDb::Trouble(Trouble::Failed(why))) => {
+            failed(conn, spec.id, why, row.failures, poll_secs, answered_at)
+        }
         Err(TroubleOrDb::Trouble(Trouble::RateLimited(wait))) => {
             conn.execute(
                 "update feeds set next_poll_at = ?1, last_error = 'rate limited' where source = ?2",
-                params![now + wait, spec.id],
+                params![answered_at + wait, spec.id],
             )?;
             Ok(PollEnd::RateLimited(wait))
         }
