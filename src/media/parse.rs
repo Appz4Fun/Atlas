@@ -57,7 +57,6 @@ re!(
     r"(?i)\b(German|French|Spanish|Italian|Dutch|Russian|Japanese|Korean|Chinese|Portuguese|Swedish|Norwegian|Danish|Finnish|Polish|Czech|Hungarian|Romanian|Greek|Turkish|Arabic|Hebrew|Hindi|Thai|Vietnamese|Indonesian|Malay|Tagalog|DL|Dubbed|Subbed|MULTI)\b"
 );
 re!(TRAILING_HYPHEN, r"\s+-\s*$");
-re!(TRAILING_NUMBER, r"\s+[0-9]{1,3}\s*$");
 re!(SPACES, r"\s+");
 
 const FOLLOW: &str = r"[^\w](?:(?:1080|480|720|2160)p|AC3D|Directors(?:[^\w]CUT)?|DD5\.1|(?:DVD|BD|BR|UHD)(?:Rip)?|BluRay|divx|HDTV|iNTERNAL|LiMiTED|(?:Real\.)?PROPER|RE(?:pack|Rip)|Sub\.?(?:fix|pack)|Unrated|WEB-?DL|WEBRip|(?:x|H|HEVC)[ ._-]?26[45]|xvid|AAC|REMUX)[^\w]";
@@ -129,7 +128,6 @@ fn clean_title(prefix: &str) -> Option<(String, Option<i32>)> {
     let s = PARENS_OR_SEPARATOR.replace_all(&s, " ");
     let s = LANGUAGE.replace_all(&s, "");
     let s = TRAILING_HYPHEN.replace(&s, "");
-    let s = TRAILING_NUMBER.replace(&s, "");
     let s = SPACES.replace_all(&s, " ");
     let s = s.trim().trim_matches(['"', '-']).trim();
     if s.chars().filter(|c| c.is_alphanumeric()).count() < 2 {
@@ -279,6 +277,9 @@ mod tests {
             ("Some.Show.S01E02-03.720p.WEB-GRP", "Some Show", None, 1, Some(2), Some(3), None, false, 34),
             ("Some.Show.S01E0203.720p.WEB-GRP", "Some Show", None, 1, Some(2), Some(3), None, false, 34),
             ("Some.Show.S01E02-720p.WEB-GRP", "Some Show", None, 1, Some(2), None, None, false, 34),
+            ("The.100.S01E02.720p.HDTV.x264-GRP", "The 100", None, 1, Some(2), None, None, false, 50),
+            ("Station.19.S01E02.720p.HDTV.x264-GRP", "Station 19", None, 1, Some(2), None, None, false, 50),
+            ("Polizeiruf.110.S01E02.720p.HDTV.x264-GRP", "Polizeiruf 110", None, 1, Some(2), None, None, false, 50),
             ("Some.Show.S01.1080p.BluRay.x264-GRP", "Some Show", None, 1, None, None, None, true, 19),
             ("Some.Show.S01.COMPLETE.720p.WEB-GRP", "Some Show", None, 1, None, None, None, true, 34),
             ("Some.Show.Season.3.1080p.WEB-GRP", "Some Show", None, 3, None, None, None, true, 35),

@@ -185,9 +185,8 @@ impl Media {
         self.with_store(|c| store::put(c, &row))?;
         self.remember(&row, existing.is_none());
         self.clear_claim(key);
-        if row.state == STATE_FOUND {
-            return Ok(Resolved::Found(row.ids));
-        }
+        // a provider still owed an answer keeps this release in the lane, even with IDs from another: no later
+        // release of the title may come along to ask it. What was found already reaches the rows by the fan-out.
         if stopped {
             return Ok(Resolved::Later(now));
         }
@@ -197,7 +196,7 @@ impl Media {
         if let Some(e) = bad {
             return Err(e);
         }
-        Ok(Resolved::NotFound)
+        Ok(if row.state == STATE_FOUND { Resolved::Found(row.ids) } else { Resolved::NotFound })
     }
 }
 

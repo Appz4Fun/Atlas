@@ -199,9 +199,11 @@ fn one_provider_down_keeps_the_others_answer() {
     let a = FixtureServer::start(vec![status("/singlesearch/shows", 500)]);
     let b = FixtureServer::start(tmdb_tv());
     let c = case(tmdb_on(maze_on(none(), &a), &b));
-    let Ok(Resolved::Found(ids)) = c.tv(NOW) else { panic!("not found") };
-    assert_eq!(ids.tmdb, Some(401));
-    assert_eq!(c.row().checked_mask, 2);
+    assert!(matches!(c.tv(NOW), Ok(Resolved::Later(_))), "TVMaze is still owed an answer");
+    let row = c.row();
+    assert_eq!((row.state, row.ids.tmdb, row.checked_mask), (store::STATE_FOUND, Some(401), 2));
+    assert!(!row.fanout_done, "what was found goes out meanwhile");
+    assert_eq!(c.media.cached_ids(K).and_then(|i| i.tmdb), Some(401));
     let tmdb_asked = b.requests().len();
     a.set_routes(vec![single()]);
     c.set(none());
@@ -210,6 +212,15 @@ fn one_provider_down_keeps_the_others_answer() {
     assert_eq!(ids.tvmaze, Some(101));
     assert_eq!(b.requests().len(), tmdb_asked, "only TVMaze was asked");
     assert_eq!(c.row().checked_mask, 3);
+}
+
+#[test]
+fn a_bad_answer_keeps_the_others_ids_and_is_an_attempt() {
+    let a = FixtureServer::start(vec![route("/singlesearch/shows", "<html>".into())]);
+    let b = FixtureServer::start(tmdb_tv());
+    let c = case(tmdb_on(maze_on(none(), &a), &b));
+    assert!(c.tv(NOW).is_err());
+    assert_eq!((c.row().ids.tmdb, c.row().checked_mask), (Some(401), 2));
 }
 
 #[test]

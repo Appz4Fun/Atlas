@@ -503,7 +503,8 @@ fn one_release_per_title_reaches_the_net_lane() {
     let s = FixtureServer::start(vec![single()]);
     start(&mut h, maze(&s));
     wait_for("the rows", || all_rows(&h) == 50);
-    wait_for("the one with IDs", || all_ids_set(&h) == 1);
+    // a release parsed after the title resolved takes its IDs from the cache, soo this can be more than one
+    wait_for("the one with IDs", || all_ids_set(&h) >= 1);
     wait_for("the lane to empty", || net_wanted(&h) == 0);
     assert_eq!(s.requests().len(), 1, "{:?}", s.requests());
 }
@@ -602,6 +603,32 @@ fn the_representative_gets_its_ids_through_the_step() {
     let s = FixtureServer::start(vec![single()]);
     start(&mut h, maze(&s));
     wait_for("the IDs", || row(&h, SHOW).is_some_and(|r| r.tvdb == Some(3001) && r.imdb == Some(100001)));
+}
+
+#[test]
+fn a_provider_still_owed_keeps_the_release_in_the_lane() {
+    let mut h = fresh();
+    h.save(&[complete(SHOW)]);
+    let limited = Route { headers: vec![("Retry-After", "1".into())], ..status("/singlesearch/shows", 429) };
+    let a = FixtureServer::start(vec![limited]);
+    let b = FixtureServer::start(vec![
+        route("/search/tv", fixture("tmdb_search_tv.json")),
+        route("/tv/401/external_ids", fixture("tmdb_tv_ids.json")),
+    ]);
+    let (media, db) = start(&mut h, with_tmdb(maze(&a), &b));
+    let _fan = fan_out(&media, &db);
+    wait_for("TMDB's IDs, by the fan-out", || row(&h, SHOW).is_some_and(|r| r.tmdb == Some(401)));
+    assert_eq!(done(&h, SHOW) & LOOKUP, 0, "TVMaze hasn't answered");
+    assert_eq!(h.field(SHOW, "net_attempts"), 0);
+    a.set_routes(vec![single()]);
+    // it waits out the pause and up to 30 s more, by its id
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while done(&h, SHOW) & LOOKUP == 0 {
+        assert!(std::time::Instant::now() < deadline, "never asked again");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let r = row(&h, SHOW).unwrap();
+    assert_eq!((r.tvmaze, r.tmdb), (Some(101), Some(401)));
 }
 
 #[test]
