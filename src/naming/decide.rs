@@ -10,6 +10,7 @@ use regex::Regex;
 
 use crate::archive::store::{InnerFileRow, SOURCE_PAR2};
 use crate::collections;
+use crate::nfo;
 use crate::postprocess::step::{NameChange, ReleaseInfo};
 use crate::store::FileInfo;
 
@@ -171,6 +172,22 @@ fn subjects(files: &[FileInfo]) -> Vec<&str> {
     picked
 }
 
+/// A scene name the subjects state outright, in a shape no group's regex knows: `Title.2019.720p.x264-GRP - [1/9] - "x.rar"`.
+/// Only full scene form counts, because a subject can be an advert, and only when the subjects agree:
+/// files of a season pack each name their own episode.
+fn scene_name_in_subjects(r: &ReleaseInfo, files: &[FileInfo]) -> Option<String> {
+    let mut found: Option<String> = None;
+    for subject in subjects(files) {
+        let Some(name) = nfo::scene_tokens(subject).find(|t| judge(t) == Grade::Scene) else { continue };
+        match &found {
+            Some(first) if identity_key(first) != identity_key(name) => return None,
+            Some(_) => {}
+            None => found = Some(name.to_string()),
+        }
+    }
+    found.filter(|name| improves(r, name, NameSource::NamingRegex))
+}
+
 pub fn decide(r: &ReleaseInfo, files: &[FileInfo], inner: &[InnerFileRow], passworded: bool) -> Option<NameChange> {
     let mut best: Option<(Grade, NameSource, String)> = None;
     let mut offer = |name: Option<String>, source: NameSource| -> bool {
@@ -197,6 +214,7 @@ pub fn decide(r: &ReleaseInfo, files: &[FileInfo], inner: &[InnerFileRow], passw
                 .filter_map(|n| clean_candidate(n))
                 .find(|n| judge(n) >= Grade::Good && improves(r, n, NameSource::NamingRegex))
         });
+        let from_subject = from_subject.or_else(|| scene_name_in_subjects(r, files));
         if !offer(from_subject, NameSource::NamingRegex) {
             let posted = files
                 .iter()
@@ -374,6 +392,71 @@ mod tests {
         let files = [file("kP93xQ7rL.ZMtwBfa.part01.rar", Some(subject))];
         let r = ReleaseInfo { group: "alt.binaries.boneless".into(), ..rel(JUNK) };
         assert_eq!(check(&r, &files, &[], false), None);
+    }
+
+    #[test]
+    fn a_scene_name_in_a_subject_replaces_junk() {
+        let subject = r#"Some.Film.1989.German.AC3.720p.BDRip.XviD-GRP - [10/25] - "SoFi.part08.rar" yEnc (84/262)"#;
+        let files = [file("SoFi.part08.rar", Some(subject))];
+        let r = ReleaseInfo { group: "alt.binaries.movies.divx".into(), ..rel("SoFi") };
+        assert_eq!(
+            check(&r, &files, &[], false),
+            got("Some.Film.1989.German.AC3.720p.BDRip.XviD-GRP", NameSource::NamingRegex)
+        );
+    }
+
+    #[test]
+    fn a_scene_name_in_a_subject_replaces_a_short_file_name() {
+        let subject = r#"Another.Film.2012.German.AC3.DVDRip.XViD.iNTERNAL-GRP [- some.site powered by other.news -] [1,51 GB] [14/89] "grp-another.xvid.nfo" yEnc"#;
+        let files = [file("grp-another.xvid.nfo", Some(subject))];
+        let r = rel("grp-another.xvid");
+        assert_eq!(
+            check(&r, &files, &[], false),
+            got("Another.Film.2012.German.AC3.DVDRip.XViD.iNTERNAL-GRP", NameSource::NamingRegex)
+        );
+    }
+
+    #[test]
+    fn subjects_naming_different_things_name_nothing() {
+        let files = [
+            file("a.rar", Some(r#"Show.Name.S02E03.1080p.WEB-DL.x264-GRP [1/9] "a.rar" yEnc (1/2)"#)),
+            file("b.rar", Some(r#"Show.Name.S02E04.1080p.WEB-DL.x264-GRP [2/9] "b.rar" yEnc (1/2)"#)),
+        ];
+        assert_eq!(check(&rel(JUNK), &files, &[], false), None);
+    }
+
+    #[test]
+    fn subjects_that_agree_are_one_name() {
+        let files = [
+            file("a.rar", Some(r#"Some.Film.2019.720p.WEB-DL.x264-GRP [1/9] "a.rar" yEnc (1/2)"#)),
+            file("b.rar", Some(r#"Some.Film.2019.720p.WEB-DL.x264-GRP [2/9] "b.rar" yEnc (1/2)"#)),
+        ];
+        assert_eq!(
+            check(&rel(JUNK), &files, &[], false),
+            got("Some.Film.2019.720p.WEB-DL.x264-GRP", NameSource::NamingRegex)
+        );
+    }
+
+    #[test]
+    fn a_subject_needs_full_scene_form() {
+        for subject in [
+            r#"Some Film 2019 720p [1/9] "a.rar" yEnc (1/2)"#,
+            r#"Brought-to-you-by-Uploader [1/9] "a.rar" yEnc (1/2)"#,
+            r#"Some-Random-Words-Here-GRP [1/9] "a.rar" yEnc (1/2)"#,
+        ] {
+            let files = [file("a.rar", Some(subject))];
+            assert_eq!(check(&rel(JUNK), &files, &[], false), None, "{subject}");
+        }
+    }
+
+    #[test]
+    fn a_subjects_scene_name_doesnt_beat_a_better_source() {
+        let files = [file("a.rar", Some(r#"Some.Film.2019.720p.WEB-DL.x264-GRP [1/9] "a.rar" yEnc (1/2)"#))];
+        assert_eq!(check(&named("Inline Film 2020 720p", None), &files, &[], false), None, "a good inline name");
+        assert_eq!(check(&named("Other Film Title", Some(NameSource::Nfo)), &files, &[], false), None);
+        let pack = rel("Show.Name.S02.1080p.WEB-DL.x264-GRP");
+        let episode = [file("a.rar", Some(r#"Show.Name.S02E03.1080p.WEB-DL.x264-GRP [1/9] "a.rar" yEnc (1/2)"#))];
+        assert_eq!(check(&pack, &episode, &[], false), None, "a season pack keeps its name");
     }
 
     #[test]

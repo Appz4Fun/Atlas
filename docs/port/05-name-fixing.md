@@ -127,6 +127,7 @@ Result, measured: 1,154 rules, all compile. Of the 1,045 subjects in the seeder'
 1. PAR2 file names (`archive_inner_files.source = 1`), `NameSource::Par2`.
 2. RAR, 7z and ZIP inner names (`source` 2–4), `NameSource::ArchiveInner`. From a passworded archive, only `Good` or better: names in passworded posts are where fakes live.
 3. The naming regexes over up to 4 subjects, `NameSource::NamingRegex`, only `Good` or better. Skipped when the current name is `Scene`.
+   Then a token of `nfo::scene_tokens` that is `Scene`, from those same subjects, when they all agree on one, at the same source. Added after Part 5 merged: on a production database, multi-article rows in groups with rules often held a release name in a subject shape no rule knew. `--unname` clears these names too.
 4. Posted filenames, `NameSource::PostedFile`, only `Good` or better. Skipped likewise.
 
 A `Weak` name needs evidence from inside the post. Subject text can be the poster's advert: rule 132 in `alt.binaries.boneless` turns `Brought to you by Uploader [01/35] - "…" yEnc` into `Brought to you by Uploader`, which is `Weak`, and upstream's plausibility rule rejects it too.

@@ -42,6 +42,11 @@ static TITLE_YEAR: LazyLock<Regex> =
 const NFO_MAX_TEXT: usize = 262_144;
 const MAX_TOKENS: usize = 100;
 
+/// What in `text` has the shape of a scene name, for the caller to judge.
+pub fn scene_tokens(text: &str) -> impl Iterator<Item = &str> {
+    SCENE_TOKEN.find_iter(text).take(MAX_TOKENS).map(|m| m.as_str())
+}
+
 pub fn is_nfo(subject: &str) -> bool {
     NFO_RE.is_match(subject)
 }
