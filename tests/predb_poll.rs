@@ -495,3 +495,15 @@ fn a_catalogue_is_read_once_a_week() {
     assert_eq!(f.poll(source, &cfg()), PollEnd::CaughtUp);
     assert_eq!(f.fetch.urls.lock().unwrap().len(), asked, "no request inside the week");
 }
+
+#[test]
+fn one_answer_can_hold_only_so_many_titles() {
+    let mut f = fixture();
+    let source = spec("predb_me").unwrap();
+    let items: String =
+        (0..5_001).map(|n| format!("<item><title>Alpha.Beta.{n}.1080p-TESTGRP</title></item>")).collect();
+    f.script(source, 1, &format!("<rss><channel>{items}</channel></rss>"));
+    assert!(matches!(f.poll(source, &cfg()), PollEnd::Failed(_)));
+    let count: i64 = f.conn.query_row("select count(*) from titles", [], |r| r.get(0)).unwrap();
+    assert_eq!(count, 0);
+}

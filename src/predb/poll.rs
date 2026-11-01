@@ -15,6 +15,7 @@ use super::import::{Counts, Entry, import};
 
 const MAX_BODY: u64 = 8 << 20;
 const MAX_BACKOFF: i64 = 21_600;
+const MAX_ENTRIES: usize = 5_000;
 const RATE_LIMIT_DEFAULT: i64 = 60;
 
 pub struct HttpReply {
@@ -154,12 +155,17 @@ impl Poller<'_> {
             }
             Parser::Text(parse) => parse(&reply.body),
         };
-        parsed.map_err(|e| match e {
+        let entries = parsed.map_err(|e| match e {
             ParseError::RateLimited(_) => {
                 Trouble::RateLimited(wait_seconds(&reply, self.now_after(), RATE_LIMIT_DEFAULT))
             }
             ParseError::Shape(why) => Trouble::Failed(why),
-        })
+        });
+        // however a source reads its body, one answer is at most this much work for the writer
+        if entries.as_ref().is_ok_and(|e| e.len() > MAX_ENTRIES) {
+            return Err(Trouble::Failed("too many titles in one answer".into()));
+        }
+        entries
     }
 }
 
