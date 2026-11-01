@@ -34,7 +34,9 @@ create table if not exists feeds (
     last_ok_at   INTEGER,
     last_error   TEXT,
     inserted     INTEGER NOT NULL DEFAULT 0,
-    updated      INTEGER NOT NULL DEFAULT 0
+    updated      INTEGER NOT NULL DEFAULT 0,
+    -- titles the newest answer held. Beside `inserted`, it tells a page the parser can't read from one with nothing new
+    last_rows    INTEGER
 );
 create table if not exists meta (key TEXT PRIMARY KEY, value INTEGER);
 insert or ignore into meta (key, value) values ('titles', 0), ('late_after_id', 0);
@@ -50,6 +52,11 @@ pub fn create(path: &Path) -> rusqlite::Result<Connection> {
     let conn = crate::db::create_at(path)?;
     conn.query_row("pragma journal_mode = wal", [], |_| Ok(()))?;
     conn.execute_batch(SCHEMA)?;
+    let has_rows: bool =
+        conn.prepare("select 1 from pragma_table_info('feeds') where name = 'last_rows'")?.exists([])?;
+    if !has_rows {
+        conn.execute_batch("alter table feeds add column last_rows INTEGER")?;
+    }
     Ok(conn)
 }
 
