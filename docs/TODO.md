@@ -24,3 +24,11 @@ A post with a weak name, such as numbered files, has its poster and day in its k
 - `predatabase` reads only the newest ten titles a poll. Its history needs a cursor and an API key.
 - The WebSocket streams and the IRC scraper. The streams carry predb.club and predb.net, which are polled. IRC needs its own login.
 - `predb.ovh`'s host no longer resolves. Its code stays in case it returns.
+
+## Tests
+
+- `tests/stop.rs` `stop_does_not_wait_for_a_stuck_request` fails now and then under heavy load, on "the slices that came back were saved": the stop can arrive before any slice is saved. It passes alone. Fix: wait for a saved slice before stopping.
+
+## Sealed files
+
+- Some sealed files hold more than `SEAL_MAX_SEGMENTS`, and how they got there isn't known. They're read up to `READ_MAX_SEGMENTS`, and a late article stays a row on them. Fix, if it matters: find them with `blob::count` and leave them, or split them.
