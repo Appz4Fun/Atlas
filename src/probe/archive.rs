@@ -64,8 +64,12 @@ fn rar4(data: &[u8]) -> ArchiveHead {
                 }
             }
             0x74 => {
-                head.packed = le32(data, at + 7).map(u64::from);
-                head.unpacked = le32(data, at + 11).map(u64::from);
+                // past 4 GiB, the high words sit before the name
+                let high_word = |offset: usize| {
+                    if flags & 0x0100 != 0 { u64::from(le32(data, at + offset).unwrap_or(0)) << 32 } else { 0 }
+                };
+                head.packed = le32(data, at + 7).map(|low| u64::from(low) | high_word(32));
+                head.unpacked = le32(data, at + 11).map(|low| u64::from(low) | high_word(36));
                 head.crc32 = le32(data, at + 16);
                 let method = data.get(at + 25).copied();
                 head.method = method.map(|m| format!("m{}", m.saturating_sub(0x30)));
@@ -84,6 +88,9 @@ fn rar4(data: &[u8]) -> ArchiveHead {
         }
         let add = if flags & 0x8000 != 0 { le32(data, at + 7).unwrap_or(0) as usize } else { 0 };
         at = at.saturating_add(size).saturating_add(add);
+        if at >= data.len() {
+            break;
+        }
     }
     head
 }
@@ -113,7 +120,8 @@ fn rar5(data: &[u8]) -> ArchiveHead {
         let Some(flags) = vint(data, &mut p) else { return head };
         let extra = if flags & 1 != 0 { vint(data, &mut p).unwrap_or(0) } else { 0 };
         let packed = if flags & 2 != 0 { vint(data, &mut p).unwrap_or(0) } else { 0 };
-        let end = body.saturating_add(size as usize);
+        // past what was read: a block this big can't be walked, and a made-up one mustn't wrap around
+        let Some(end) = body.checked_add(size as usize).filter(|end| *end <= data.len()) else { return head };
         match kind {
             4 => {
                 head.encrypted = true;
@@ -136,7 +144,8 @@ fn rar5(data: &[u8]) -> ArchiveHead {
                 let _host = vint(data, &mut p);
                 let Some(name_len) = vint(data, &mut p) else { return head };
                 head.unpacked = unpacked.filter(|_| file_flags & 8 == 0);
-                head.name = data.get(p..p + name_len as usize).map(|n| String::from_utf8_lossy(n).into_owned());
+                head.name =
+                    data.get(p..p.saturating_add(name_len as usize)).map(|n| String::from_utf8_lossy(n).into_owned());
                 let method = (info >> 7) & 7;
                 head.method = Some(format!("m{method}"));
                 let extra_area = end.checked_sub(extra as usize).and_then(|from| data.get(from..end));
@@ -150,6 +159,9 @@ fn rar5(data: &[u8]) -> ArchiveHead {
             _ => {}
         }
         at = end.saturating_add(packed as usize);
+        if at >= data.len() {
+            return head;
+        }
     }
 }
 
@@ -161,7 +173,7 @@ fn has_crypt_record(area: &[u8]) -> bool {
         if vint(area, &mut at) == Some(1) {
             return true;
         }
-        p += size as usize;
+        p = p.saturating_add(size as usize);
     }
     false
 }
@@ -199,6 +211,37 @@ fn zip(data: &[u8]) -> ArchiveHead {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn made_up_rar_lengths_end_the_walk() {
+        // a RAR5 block claiming nearly all of memory, for a walk that would wrap around
+        let mut data = RAR5.to_vec();
+        data.extend([0; 4]);
+        data.extend([0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01, 1, 2, 0xff, 0xff, 0xff, 0xff, 0x7f]);
+        data.resize(64, 0);
+        assert_eq!(parse(&data).unwrap().format, "RAR5");
+        // and a RAR4 one
+        let mut data = RAR4.to_vec();
+        data.extend([0, 0, 0x7a, 0x00, 0x80, 0x07, 0x00, 0xff, 0xff, 0xff, 0xff]);
+        data.resize(64, 0);
+        assert_eq!(parse(&data).unwrap().format, "RAR4");
+    }
+
+    #[test]
+    fn a_big_rar4_file_keeps_its_high_size_words() {
+        let mut data = RAR4.to_vec();
+        let at = data.len();
+        data.resize(at + 41, 0);
+        data[at + 2] = 0x74;
+        data[at + 3..at + 5].copy_from_slice(&0x0100u16.to_le_bytes());
+        data[at + 5..at + 7].copy_from_slice(&41u16.to_le_bytes());
+        data[at + 11..at + 15].copy_from_slice(&456u32.to_le_bytes());
+        data[at + 25] = 0x30;
+        data[at + 26..at + 28].copy_from_slice(&1u16.to_le_bytes());
+        data[at + 36..at + 40].copy_from_slice(&2u32.to_le_bytes());
+        data[at + 40] = b'a';
+        assert_eq!(parse(&data).unwrap().unpacked, Some((2u64 << 32) + 456));
+    }
 
     #[test]
     fn real_rar5_headers_read_as_encrypted() {

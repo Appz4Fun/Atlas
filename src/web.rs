@@ -936,7 +936,7 @@ fn release_html(
         fact("Year", year.to_string());
     }
     if let Some(network) = &parsed.network {
-        fact("Ripped from", search_link("q", network));
+        fact("Ripped from", escape(network));
     }
     if let Some(site) = &parsed.site {
         fact("Site", escape(site));
@@ -1318,7 +1318,7 @@ fn copy_card(conn: &rusqlite::Connection, badge: &str, r: &ReleaseRow) -> String
     fact("Audio", escape(&parsed.audio.iter().chain(&parsed.channels).cloned().collect::<Vec<_>>().join(", ")));
     fact("Languages", escape(&parsed.languages.join(", ")));
     if let Some(network) = &parsed.network {
-        fact("Ripped from", search_link_to("q", network, network));
+        fact("Ripped from", escape(network));
     }
     if let Some(group) = &parsed.group {
         fact("Release group", search_link_to("team", group, group));
