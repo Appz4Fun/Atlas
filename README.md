@@ -361,7 +361,7 @@ A release whose posted name is junk gets a release-like name from what Atlas alr
 
 1. The file names in the release's PAR2 set.
 2. The file names inside its RAR, 7z, and ZIP archives. From a passworded archive, only a good name counts, because that's where fakes live.
-3. Naming regexes, 1,154 of them per group, over up to 4 of its subjects.
+3. Naming regexes, 1,154 of them per group, over up to 4 of its subjects. Failing that, a name in full scene form that those subjects state outright and agree on.
 4. Its posted file names.
 
 If the release has an NFO and still no good name, a separate step reads the NFO.
