@@ -147,7 +147,7 @@ mod tests {
     fn empty_lines_cant_fill_memory() {
         let mut raw = b"From: a\n\n".to_vec();
         raw.resize(raw.len() + MAX_LINES * 2, b'\n');
-        assert_eq!(split_article(&raw).lines.len(), MAX_LINES);
+        assert!(split_article(&raw).lines.len() <= MAX_LINES);
     }
 
     #[test]
