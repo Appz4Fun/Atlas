@@ -564,6 +564,12 @@ fn release_html(
         fact("Parts", parts.to_string());
     }
     fact("Encryption", encryption_fact(inner));
+    if let Some(hint) = release_info::password_hint(r.id, names) {
+        fact(
+            "Password",
+            format!("<code>{}</code> found in {}, not tried", escape(&hint.password), escape(hint.source)),
+        );
+    }
     if contents.files > 0 {
         fact("Files", contents.files.to_string());
     }

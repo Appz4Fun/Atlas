@@ -50,6 +50,20 @@ pub const RELEASE: ShardTable = ShardTable {
     added: &[("encryption", "INTEGER"), ("names_hidden", "INTEGER")],
 };
 
+/// A password an NFO named. Unverified: nothing has tried it.
+pub const NFO_PASSWORD: ShardTable = ShardTable {
+    name: "release_nfo_password",
+    create: "create table if not exists release_nfo_password (
+        release_id INTEGER PRIMARY KEY,
+        password   TEXT NOT NULL
+    )",
+    indexes: &[],
+    release_key: Some("release_id"),
+    added: &[],
+};
+
+pub const SET_NFO_PASSWORD: &str = "insert or replace into release_nfo_password (release_id, password) values (?1, ?2)";
+
 pub const DELETE_SOURCE: &str = "delete from archive_inner_files where release_id = ?1 and source = ?2";
 pub const INSERT_FILE: &str =
     "insert or replace into archive_inner_files (release_id, seq, name, size, source) values (?1, ?2, ?3, ?4, ?5)";
@@ -130,6 +144,17 @@ pub struct InnerView {
     pub encryption: Option<Encryption>,
     pub names_hidden: bool,
     pub files: Vec<InnerFileRow>,
+}
+
+/// Any failure, such as a shard without the table yet, reads as nothing known.
+pub fn nfo_password(conn: &Connection, release_id: i64) -> Option<String> {
+    let schema = format!("s{}", store::shard_of_id(release_id));
+    conn.query_row(
+        &format!("select password from {schema}.release_nfo_password where release_id = ?"),
+        [release_id],
+        |r| r.get(0),
+    )
+    .ok()
 }
 
 pub fn view_with(conn: &Connection, release_id: i64) -> InnerView {

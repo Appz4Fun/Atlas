@@ -2,7 +2,9 @@
 //! and how much of it is there. Read when the page opens, soo nothing here is stored.
 
 use std::collections::HashMap;
+use std::sync::LazyLock;
 
+use regex::Regex;
 use rusqlite::{Connection, OptionalExtension};
 
 use crate::db::{self, Result};
@@ -191,6 +193,58 @@ pub fn looks_made_up(email: &str) -> bool {
         || MADE_UP_DOMAINS.iter().any(|known| known.eq_ignore_ascii_case(&domain))
 }
 
+static PASSWORD: LazyLock<Regex> = LazyLock::new(|| {
+    #[allow(clippy::unwrap_used)]
+    Regex::new(r"(?i)\{\{([^{}\s]{1,128})\}\}|\b(?:password|passwd|passwort|pass|pw)\b\s*(?:is\s*)?[:=]\s*([^\s\[\]\x22']{1,128})").unwrap()
+});
+
+/// A password a poster left in a name, subject or NFO: `{{secret}}` or `password: secret`.
+/// A guess from text, soo nothing has tried it.
+pub fn find_password(text: &str) -> Option<String> {
+    let hit = PASSWORD.captures(text)?;
+    let found = hit.get(1).or_else(|| hit.get(2))?.as_str().trim_matches(|c: char| c == '.' || c == ',');
+    let none = ["none", "no", "n/a", "na", "nil", "-", "free", "not", "yes", ""];
+    (!none.iter().any(|word| found.eq_ignore_ascii_case(word))).then(|| found.to_string())
+}
+
+/// What the page can say without reading any article.
+pub struct PasswordHint {
+    pub password: String,
+    pub source: &'static str,
+}
+
+pub fn password_hint(id: i64, names: Option<&Names>) -> Option<PasswordHint> {
+    let conn = db::open().ok()?;
+    password_hint_with(&conn, id, names)
+}
+
+pub fn password_hint_with(conn: &Connection, id: i64, names: Option<&Names>) -> Option<PasswordHint> {
+    let hint = |password: String, source| Some(PasswordHint { password, source });
+    if let Some(password) = crate::archive::store::nfo_password(conn, id) {
+        return hint(password, "the NFO");
+    }
+    for name in names.into_iter().flat_map(|n| [Some(&n.posted), n.display.as_ref()]).flatten() {
+        if let Some(password) = find_password(name) {
+            return hint(password, "the release name");
+        }
+    }
+    let s = store::shard_of_id(id);
+    let mut stmt = conn
+        .prepare(&format!("select filename, subject from s{s}.files where release_id = ? order by id limit 64"))
+        .ok()?;
+    let files: Vec<(String, Option<String>)> =
+        stmt.query_map([id], |r| Ok((r.get(0)?, r.get(1)?))).ok()?.filter_map(|row| row.ok()).collect();
+    for (filename, subject) in files {
+        if let Some(password) = find_password(&filename) {
+            return hint(password, "a file name");
+        }
+        if let Some(password) = subject.as_deref().and_then(find_password) {
+            return hint(password, "the subject");
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -240,6 +294,18 @@ mod tests {
         assert!(is_par2("A.PAR2") && !is_recovery_volume("a.par2"));
         assert!(is_recovery_volume("a.vol000+01.par2"));
         assert!(!is_par2("a.rar"));
+    }
+
+    #[test]
+    fn passwords_are_found_where_posters_leave_them() {
+        assert_eq!(find_password("Some.Movie.2024.{{s3cret!}}.rar").as_deref(), Some("s3cret!"));
+        assert_eq!(find_password("Password: hunter2").as_deref(), Some("hunter2"));
+        assert_eq!(find_password("PW=abc123, enjoy").as_deref(), Some("abc123"));
+        assert_eq!(find_password("password is: abc").as_deref(), Some("abc"));
+        assert_eq!(find_password("Password: none"), None);
+        assert_eq!(find_password("Passworded.Movie.2024"), None);
+        assert_eq!(find_password("Compass: north").as_deref(), None);
+        assert_eq!(find_password("nothing here"), None);
     }
 
     #[test]

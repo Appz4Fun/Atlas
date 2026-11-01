@@ -7,8 +7,9 @@ use crate::archive::{self, Password};
 use crate::config::Config;
 use crate::nfo;
 use crate::postprocess::step::{
-    NameChange, Needs, Outcome, ReleaseInfo, Reruns, Step, StepCtx, StepError, StepId, mask,
+    NameChange, Needs, Outcome, ReleaseInfo, Reruns, Step, StepCtx, StepError, StepId, StepWrite, mask,
 };
+use crate::release_info;
 
 use super::decide::{current_name, decide, effective_source, improves, worth_running};
 use super::judge::{Grade, judge};
@@ -105,16 +106,23 @@ impl Step for NfoName {
             return Ok(Outcome::default());
         }
         let files = ctx.files().map_err(retry)?;
+        let mut writes = Vec::new();
         for file in archive::select::nfo_sources(&files) {
             let Some(seg) = first_article(ctx, file)? else { continue };
             let Some(body) = fetch_one(ctx, &seg, &file.filename)? else { continue };
+            if writes.is_empty()
+                && let Some(password) = release_info::find_password(&String::from_utf8_lossy(&body))
+            {
+                let params = vec![ctx.release().id.into(), password.into()];
+                writes.push(StepWrite::new(archive::store::SET_NFO_PASSWORD, params));
+            }
             let found = nfo::name_candidates(&body).into_iter().find(|n| improves(ctx.release(), n, NameSource::Nfo));
             if let Some(name) = found {
                 let change =
                     NameChange { display_name: Some(name), obfuscated: Some(false), source: NameSource::Nfo.value() };
-                return Ok(Outcome { matched: true, name: Some(change), ..Outcome::default() });
+                return Ok(Outcome { matched: true, name: Some(change), writes, ..Outcome::default() });
             }
         }
-        Ok(Outcome::default())
+        Ok(Outcome { writes, ..Outcome::default() })
     }
 }

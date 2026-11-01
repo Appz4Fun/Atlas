@@ -81,6 +81,7 @@ pub const SHARD_TABLES: &[&ShardTable] = &[
     &PP_WALKS,
     &crate::archive::store::INNER_FILES,
     &crate::archive::store::RELEASE,
+    &crate::archive::store::NFO_PASSWORD,
     &crate::predb::step::MATCH,
     &crate::predb::step::INNER_KEY,
     &crate::category::RELEASE_CATEGORY,
