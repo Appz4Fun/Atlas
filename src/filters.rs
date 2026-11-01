@@ -525,30 +525,36 @@ pub fn gather_per_article(group: &str, articles: Vec<Article>) -> (Vec<Article>,
     }
     let count = gathered.len() as i64;
 
-    // a poster that changes with nearly every article says nothing about the upload
-    let mut posters: HashMap<u64, (HashSet<String>, usize)> = HashMap::new();
     let shapes: Vec<Option<UploadPiece>> = gathered
         .iter()
         .map(|a| {
             let c = SUBJECT_RE.captures(&a.subject)?;
             let base = c.get(1)?.as_str();
             let counter = COUNTER_RE.captures(base).and_then(|c| Some((c[1].parse().ok()?, c[2].parse().ok()?)));
-            Some((shape(base), c[2].parse().ok()?, c[3].parse().ok()?, counter))
+            let (part, total): (i64, i64) = (c[2].parse().ok()?, c[3].parse().ok()?);
+            // a subject says anything: nothing reads past what `parse_subject` would take
+            ((1..=total).contains(&part) && total <= crate::parser::MAX_PARTS).then_some((
+                shape(base),
+                part,
+                total,
+                counter,
+            ))
         })
         .collect();
+    // a poster seen once says nothing about the upload: random ones are, and one upload's mustn't depend on them
+    let mut posters: HashMap<(u64, &str), usize> = HashMap::new();
     for (article, found) in gathered.iter().zip(&shapes) {
         if let Some((shape, ..)) = found {
-            let seen = posters.entry(*shape).or_default();
-            seen.0.insert(article.author.clone());
-            seen.1 += 1;
+            *posters.entry((*shape, article.author.as_str())).or_default() += 1;
         }
     }
+    let lasting: HashSet<(u64, String)> =
+        posters.iter().filter(|(_, n)| **n >= 2).map(|((shape, poster), _)| (*shape, (*poster).to_string())).collect();
 
     let mut uploads: IndexMap<String, Release> = IndexMap::new();
     for (mut article, found) in gathered.into_iter().zip(shapes) {
         let Some((shape, part, total, counter)) = found else { continue };
-        let (names, seen) = &posters[&shape];
-        let poster = if names.len() * 2 > *seen { "" } else { article.author.as_str() };
+        let poster = if lasting.contains(&(shape, article.author.clone())) { article.author.as_str() } else { "" };
         let day = article.date.get(..10).unwrap_or(&article.date);
         let key = format!("{group}\0per-article\0{shape:x}\0{poster}\0{day}");
         let upload = uploads.entry(key.clone()).or_insert_with(|| Release {
@@ -1062,6 +1068,29 @@ mod tests {
         assert_eq!(uploads.len(), 1, "one upload");
         let files: HashSet<_> = uploads[0].articles.iter().map(|a| a.filename.clone().unwrap()).collect();
         assert_eq!(files.len(), 2, "{files:?}");
+    }
+
+    #[test]
+    fn a_fixed_posters_upload_doesnt_depend_on_its_neighbours() {
+        let name = |articles| gather_per_article("alt.binaries.t", articles).1;
+        let alone = name(upload(2, 42, "", |_| "p@x".into()))[0].name.clone();
+        let mut mixed = upload(2, 42, "", |_| "p@x".into());
+        mixed.extend(upload(100, 180, "", |p| format!("{p}@x")));
+        let uploads = name(mixed);
+        assert_eq!(uploads.len(), 2);
+        assert!(uploads.iter().any(|u| u.name == alone && u.articles.len() == 40));
+    }
+
+    #[test]
+    fn a_subject_cant_claim_any_size() {
+        let articles: Vec<Article> = (2..42)
+            .map(|p| {
+                let token = format!("{p:04}abcdefghijklmnopqrstuvwx");
+                Article { subject: format!(r#""{token}" yEnc ({p}/1000000000)"#), ..Article::default() }
+            })
+            .collect();
+        let (kept, uploads, count) = gather_per_article("alt.binaries.t", articles);
+        assert_eq!((kept.len(), uploads.len(), count), (0, 0, 40), "skipped, as before");
     }
 
     #[test]
