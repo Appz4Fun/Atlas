@@ -114,6 +114,21 @@ pub fn build_nzb(release_id: i64) -> Result<Option<String>> {
     Ok(Some(render_nzb(&release, &articles)))
 }
 
+/// One file of a release as its own NZB: `file` counts from 1, in the order the release's whole NZB lists them.
+pub fn build_nzb_file(release_id: i64, file: usize) -> Result<Option<String>> {
+    let Some(release) = get_release(release_id)? else { return Ok(None) };
+    let articles = get_articles(release_id)?;
+    let mut names: Vec<Option<&str>> = Vec::new();
+    for a in &articles {
+        if !names.contains(&a.filename.as_deref()) {
+            names.push(a.filename.as_deref());
+        }
+    }
+    let Some(name) = file.checked_sub(1).and_then(|at| names.get(at)).copied() else { return Ok(None) };
+    let one: Vec<ArticleRow> = articles.iter().filter(|a| a.filename.as_deref() == name).cloned().collect();
+    Ok(Some(render_nzb(&release, &one)))
+}
+
 /// Write the nzb for a release, into `output_dir` or the current dir.
 pub fn generate_nzb(release_id: i64, output_dir: Option<&Path>) -> Result<PathBuf> {
     let release = get_release(release_id)?.ok_or_else(|| {
