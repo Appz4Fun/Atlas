@@ -167,6 +167,8 @@ pub struct Tally {
     categories: BTreeMap<i64, (u64, u64)>,
     groups: HashMap<String, GroupTally>,
     release_groups: HashMap<String, u64>,
+    /// releases of the names dropped to stay under the limit
+    release_groups_evicted: u64,
     video_with_group: u64,
     video_without: u64,
     sizes: BTreeMap<i64, Sizes>,
@@ -247,19 +249,35 @@ impl Tally {
             match release_group(row.name) {
                 Some(found) => {
                     self.video_with_group += 1;
-                    match self.release_groups.get_mut(found) {
-                        Some(n) => *n += 1,
-                        None => {
-                            if self.release_groups.len() >= MAX_RELEASE_GROUPS {
-                                self.release_groups.retain(|_, n| *n > 1);
-                            }
-                            self.release_groups.insert(found.to_string(), 1);
-                        }
-                    }
+                    self.count_release_group(found, MAX_RELEASE_GROUPS);
                 }
                 None => self.video_without += 1,
             }
         }
+    }
+
+    /// One more release of `found`. At `limit` names the smaller half go into `(other)`: each pass frees
+    /// at least half the room, soo the passes stay rare, however even the counts are.
+    fn count_release_group(&mut self, found: &str, limit: usize) {
+        if let Some(n) = self.release_groups.get_mut(found) {
+            *n += 1;
+            return;
+        }
+        if self.release_groups.len() >= limit {
+            let mut counts: Vec<u64> = self.release_groups.values().copied().collect();
+            let middle = counts.len() / 2;
+            let keep_above = *counts.select_nth_unstable(middle).1;
+            let mut evicted = 0;
+            self.release_groups.retain(|_, n| {
+                let keep = *n > keep_above;
+                if !keep {
+                    evicted += *n;
+                }
+                keep
+            });
+            self.release_groups_evicted += evicted;
+        }
+        self.release_groups.insert(found.to_string(), 1);
     }
 
     /// Put the totals into their metrics.
@@ -297,11 +315,11 @@ impl Tally {
         let mut release_groups: Vec<(&String, &u64)> = self.release_groups.iter().collect();
         release_groups.sort_by_key(|(_, n)| std::cmp::Reverse(**n));
         let (top, rest) = release_groups.split_at(release_groups.len().min(TOP_RELEASE_GROUPS));
-        let rest_total: u64 = rest.iter().map(|(_, n)| **n).sum();
+        let rest_total: u64 = rest.iter().map(|(_, n)| **n).sum::<u64>() + self.release_groups_evicted;
         CATALOG_RELEASE_GROUP.replace(
             top.iter()
                 .map(|(g, n)| (one("release_group", g), **n as f64))
-                .chain((!rest.is_empty()).then(|| (one("release_group", OTHER), rest_total as f64))),
+                .chain((rest_total > 0).then(|| (one("release_group", OTHER), rest_total as f64))),
         );
         CATALOG_VIDEO.replace([
             (one("release_group", "found"), self.video_with_group as f64),
@@ -595,6 +613,22 @@ mod tests {
         ] {
             assert_eq!(release_group(name), want, "{name}");
         }
+    }
+
+    #[test]
+    fn release_groups_past_the_limit_add_up_under_other() {
+        let mut tally = Tally::default();
+        // every name seen twice, soo no count is smaller than another
+        for name in ["a", "b", "c", "d"] {
+            tally.count_release_group(name, 4);
+            tally.count_release_group(name, 4);
+        }
+        tally.count_release_group("e", 4);
+        assert!(tally.release_groups.len() <= 4, "{:?}", tally.release_groups);
+        assert_eq!(tally.release_groups["e"], 1);
+        let kept: u64 = tally.release_groups.values().sum();
+        assert_eq!(kept + tally.release_groups_evicted, 9, "nothing is lost");
+        assert!(tally.release_groups_evicted > 0);
     }
 
     #[test]

@@ -1339,7 +1339,7 @@
    },
    "targets": [
     {
-     "expr": "sum by (server) (increase(atlas_nntp_failures_total{server=~\"$server\",kind!~\"no_such_.*\"}[$__interval]))",
+     "expr": "sum by (server) (increase(atlas_nntp_failures_total{server=~\"$server\",kind!~\"no_such_.*\"}[$__rate_interval]))",
      "legendFormat": "{{server}}",
      "editorMode": "code",
      "instant": false,
@@ -1404,7 +1404,7 @@
    },
    "targets": [
     {
-     "expr": "sum by (kind) (increase(atlas_nntp_failures_total{server=~\"$server\",kind!~\"no_such_.*\"}[$__interval]))",
+     "expr": "sum by (kind) (increase(atlas_nntp_failures_total{server=~\"$server\",kind!~\"no_such_.*\"}[$__rate_interval]))",
      "legendFormat": "{{kind}}",
      "editorMode": "code",
      "instant": false,

@@ -369,8 +369,8 @@ def nntp():
     b.graph("Server state", [q(f'atlas_nntp_server_state{{{sel}}} == 1', "{{server}}: {{state}}")], description="Which state each server is in: ok, resting, login rejected or article only.")
     b.graph("Connection attempts per minute", [q(f"sum by (server, result) (rate(atlas_nntp_connects_total{{{sel}}}[5m])) * 60", "{{server}} {{result}}")])
     b.row("Failures")
-    b.graph("When failures hit, per server", [q(f"sum by (server) (increase(atlas_nntp_failures_total{{{sel},{REAL_FAILURES}}}[$__interval]))", "{{server}}")], bars=True, w=12, description="Each bar is the failures in that slice of time.")
-    b.graph("When failures hit, per kind", [q(f"sum by (kind) (increase(atlas_nntp_failures_total{{{sel},{REAL_FAILURES}}}[$__interval]))", "{{kind}}")], bars=True, w=12)
+    b.graph("When failures hit, per server", [q(f"sum by (server) (increase(atlas_nntp_failures_total{{{sel},{REAL_FAILURES}}}[$__rate_interval]))", "{{server}}")], bars=True, w=12, description="Each bar is the failures in that slice of time.")
+    b.graph("When failures hit, per kind", [q(f"sum by (kind) (increase(atlas_nntp_failures_total{{{sel},{REAL_FAILURES}}}[$__rate_interval]))", "{{kind}}")], bars=True, w=12)
     b.table("Failures in range, server and kind", [q(f"increase(atlas_nntp_failures_total{{{sel}}}[$__range])", "A"), q(f"atlas_nntp_failures_total{{{sel}}}", "B"), q(f"atlas_nntp_last_failure_timestamp_seconds{{{sel}}} * 1000", "C")],
             {"server": ("Server", None), "kind": ("Kind", None), "Value #A": ("In range", "short"), "Value #B": ("Since restart", "short"), "Value #C": ("Last hit", "dateTimeAsIso")}, w=24, h=10, sort="In range",
             description="no_such_article and no_such_group are ordinary answers; the panels above leave them out.")
