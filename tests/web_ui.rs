@@ -157,6 +157,25 @@ fn the_web_ui_end_to_end() {
     assert_eq!(fetch(port, "/ui/release?id=999999999", &cookie).status(), 404);
     assert_eq!(fetch(port, &format!("/ui/release?id={id}"), "").status(), 303);
 
+    // copies, listed together, with what tells them apart
+    assert_eq!(fetch(port, "/ui/duplicates", "").status(), 303);
+    assert!(fetch(port, "/ui/duplicates", &cookie).body.contains("no twins found yet"));
+    let script: i64 = {
+        let shard = db::open_shard(&store::shard_path(&main, store::shard_of("alt.binaries.g2"))).unwrap();
+        let script = shard.query_row("select id from releases where group_name = 'alt.binaries.g2'", [], |r| r.get(0));
+        let script: i64 = script.unwrap();
+        shard.execute(atlas::duplicates::SET_POSTED, rusqlite::params![script, b"same".as_slice()]).unwrap();
+        script
+    };
+    shard.execute(atlas::duplicates::SET_POSTED, rusqlite::params![id, b"same".as_slice()]).unwrap();
+    let twins = fetch(port, "/ui/duplicates?kind=twins", &cookie);
+    assert!(twins.body.contains("Twins 1") && twins.body.contains("Tv.Findword"), "{}", twins.body);
+    assert!(twins.body.contains("/ui/release?id=") && twins.body.contains("TWIN"), "{}", twins.body);
+    assert!(!twins.body.contains("<script>alert"), "{}", twins.body);
+    assert!(fetch(port, "/ui/duplicates?kind=pairs", &cookie).body.contains("no pairs found yet"));
+    let opened = fetch(port, &format!("/ui/release?id={script}"), &cookie);
+    assert!(opened.body.contains("Other copies") && opened.body.contains("Tv.Findword"), "{}", opened.body);
+
     let nzb = fetch(port, &format!("/ui/nzb?id={id}"), &cookie);
     assert_eq!(nzb.status(), 200);
     assert!(nzb.header("Content-Type").unwrap().contains("x-nzb"));

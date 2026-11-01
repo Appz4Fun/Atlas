@@ -25,6 +25,10 @@ pub struct Fields {
     pub email: String,
     pub size: String,
     pub team: String,
+    /// the file's CRC32 in hex, from a probe
+    pub crc: String,
+    /// the posting tool, from a probe
+    pub agent: String,
 }
 
 impl Fields {
@@ -38,8 +42,10 @@ impl Fields {
             ("Usenet group", &self.group),
             ("Poster", &self.poster),
             ("Email", &self.email),
-            ("Bytes", &self.size),
+            ("Size", &self.size),
             ("Release group", &self.team),
+            ("CRC32", &self.crc),
+            ("Posted with", &self.agent),
         ]
         .into_iter()
         .filter(|(_, value)| !value.is_empty())
@@ -53,8 +59,10 @@ impl Fields {
             "Usenet group" => out.group.clear(),
             "Poster" => out.poster.clear(),
             "Email" => out.email.clear(),
-            "Bytes" => out.size.clear(),
-            _ => out.team.clear(),
+            "Size" => out.size.clear(),
+            "Release group" => out.team.clear(),
+            "CRC32" => out.crc.clear(),
+            _ => out.agent.clear(),
         }
         out
     }
@@ -78,6 +86,8 @@ impl Fields {
             ("email", &self.email),
             ("size", &self.size),
             ("team", &self.team),
+            ("crc", &self.crc),
+            ("agent", &self.agent),
         ]
         .into_iter()
         .filter(|(_, value)| !value.is_empty())
@@ -117,6 +127,26 @@ fn has_index(conn: &Connection, shard: usize, name: &str) -> bool {
 }
 
 /// One shard's search: its `from` clause, and whether that covers the whole shard.
+/// `1.5 GB`, as the pages write sizes, in binary units: every size that would be written that way, soo a size read off
+/// a page finds its release. Spaces and commas are already gone.
+fn size_range(text: &str) -> Option<(i64, i64)> {
+    let lower = text.to_ascii_lowercase();
+    let digits = lower.find(|c: char| !c.is_ascii_digit() && c != '.')?;
+    let (number, unit) = lower.split_at(digits);
+    let scale: f64 = match unit.trim_end_matches("ib").trim_end_matches('b') {
+        "" => 1.0,
+        "k" => 1024.0,
+        "m" => 1024.0 * 1024.0,
+        "g" => 1024.0 * 1024.0 * 1024.0,
+        "t" => 1024.0 * 1024.0 * 1024.0 * 1024.0,
+        _ => return None,
+    };
+    let value: f64 = number.parse().ok()?;
+    let decimals = number.split_once('.').map_or(0, |(_, after)| after.len());
+    let half = 0.5 / 10f64.powi(decimals as i32);
+    Some((((value - half) * scale).ceil() as i64, ((value + half) * scale).floor() as i64))
+}
+
 struct Plan {
     conditions: Vec<String>,
     values: Vec<Value>,
@@ -139,12 +169,23 @@ fn plan(fields: &Fields, words: &str, filter: Option<&CatFilter>) -> Plan {
     }
     if let Ok(size) = fields.size.parse::<i64>() {
         add(&mut p, "r.size = {}", Value::Integer(size));
+    } else if let Some((low, high)) = size_range(&fields.size) {
+        add(&mut p, "r.size >= {}", Value::Integer(low));
+        add(&mut p, "r.size <= {}", Value::Integer(high));
     } else if !fields.size.is_empty() {
         p.conditions.push("0".into());
     }
     if !fields.team.is_empty() {
         let team = fields.team.replace('\\', r"\\").replace('%', r"\%").replace('_', r"\_");
         add(&mut p, r"coalesce(r.display_name, r.name) like {} escape '\'", Value::Text(format!("%-{team}%")));
+    }
+    if let Ok(crc) = u32::from_str_radix(fields.crc.trim_start_matches("0x"), 16) {
+        add(&mut p, "@probe:crc32:{}", Value::Integer(i64::from(crc)));
+    } else if !fields.crc.is_empty() {
+        p.conditions.push("0".into());
+    }
+    if !fields.agent.is_empty() {
+        add(&mut p, "@probe:agent:{}", Value::Text(fields.agent.clone()));
     }
     for word in words.split_whitespace() {
         add(&mut p, r"coalesce(r.display_name, r.name) like {} escape '\'", Value::Text(like_query(word)));
@@ -162,6 +203,9 @@ impl Plan {
         self.conditions
             .iter()
             .map(|c| {
+                if let Some((column, param)) = c.strip_prefix("@probe:").and_then(|rest| rest.split_once(':')) {
+                    return format!("r.id in (select release_id from s{s}.release_probe where {column} = {param})");
+                }
                 if let Some(param) = c.strip_prefix("@email:") {
                     // the whole index is read, which is far less than the table
                     return if has_poster_index {
@@ -194,6 +238,8 @@ impl Plan {
 /// Whether an index can answer this search in this shard.
 fn indexed(conn: &Connection, fields: &Fields, shard: usize) -> bool {
     !fields.group.is_empty()
+        || !fields.crc.is_empty()
+        || !fields.agent.is_empty()
         || ((!fields.poster.is_empty() || !fields.email.is_empty()) && has_index(conn, shard, POSTER_INDEX))
         || (!fields.size.is_empty() && has_index(conn, shard, SIZE_INDEX))
 }
@@ -323,6 +369,20 @@ mod tests {
         assert_eq!(Total { count: 1234, exact: true }.describe(), "1,234 releases");
         assert_eq!(Total { count: 1, exact: true }.describe(), "1 release");
         assert_eq!(Total { count: 2000, exact: false }.describe(), "At least 2,000 releases");
+    }
+
+    #[test]
+    fn a_written_size_finds_what_is_written_that_way() {
+        let gib = 1024 * 1024 * 1024_i64;
+        let (low, high) = size_range("1.5GB").unwrap();
+        assert!(low <= gib * 3 / 2 && gib * 3 / 2 <= high);
+        assert_eq!(crate::ui::fmt_size(Some(low)), "1.5 GB");
+        assert_eq!(crate::ui::fmt_size(Some(high)), "1.5 GB");
+        assert_eq!(crate::ui::fmt_size(Some(low - 1)), "1.4 GB");
+        assert_eq!(crate::ui::fmt_size(Some(high + 2)), "1.6 GB");
+        assert_eq!(size_range("700mib"), size_range("700M"));
+        assert_eq!(size_range("12x"), None);
+        assert_eq!(size_range("GB"), None);
     }
 
     #[test]

@@ -196,7 +196,7 @@ All of these go in a `postprocess` object, and each has a default. See [Post-pro
 | `reject_par2_only` | `true` | Reject a post whose files are all par2. |
 | `group_rules` | `{}` | `{"group": {"min_size_bytes": n, "min_files": n}}`. The larger of a group's value and the global one counts. |
 | `backlog_per_second` | `2000` | Existing releases looked at, over all shards. `0` stops it. |
-| `body_fetches_per_minute` | `0` | Body budget. At `0`, nothing fetches bodies. |
+| `body_fetches_per_minute` | `600` | Body budget. At `0`, nothing fetches bodies. |
 | `body_connections` | `2` | Bodies in flight at once. |
 | `body_min_size_bytes` | `1048576` | A smaller release gets no body. |
 | `body_max_size_bytes` | `107374182400` | A larger release gets no body. `0` is no limit. |
@@ -362,7 +362,19 @@ The indexer takes every saved release through a stage that survives restarts. Up
 
 Size, file type, and completeness never reject a release. They only decide whether it gets article bodies fetched.
 
-Steps run in two lanes. Database steps never wait on the network. Body and outside steps run within a budget, one per claim, and an outage costs them no attempts. To turn on bodies, set `postprocess.body_fetches_per_minute`. Your existing releases enter newest first at `backlog_per_second`, and the Post-processing page of the stats dashboard shows how far along that is.
+Steps run in two lanes. Database steps never wait on the network. Body and outside steps run within a budget, one per claim, and an outage costs them no attempts. Bodies are on by default, and `postprocess.body_fetches_per_minute = 0` turns them off. Your existing releases enter newest first at `backlog_per_second`, and the Post-processing page of the stats dashboard shows how far along that is.
+
+### Article probes
+
+Each release gets a look at a few of its articles, without being downloaded: `ARTICLE` on the first and last article of its main file, `STAT` on the middle one, and the first article of up to three NFO, SFV or text files. All of it counts against the body budget, and `archive.enabled = false` turns it off. The release page shows:
+
+- **yEnc:** the real file name and size, parts, line length, article size and the file's CRC32, from the `=ybegin`, `=ypart` and `=yend` lines.
+- **Checks:** whether the parts cover every byte, whether the first part's size and checksum are right, the share of overhead, and whether a server still has the first, middle and last articles.
+- **What's in it:** MKV and MP4 tracks, with resolution, codecs, bit depth, HDR, Dolby Vision, languages and subtitle flags, read through a RAR that only stores its files. For an archive, its format, method and encryption, and its first file's name, size and CRC32.
+- **How it was posted:** the posting tool, dates, path, organization, injection info and crossposted groups, from the article's headers.
+- **NFO and SFV:** the NFO's text, IMDb ids and any password in it, and the SFV's checksums.
+
+CRC32 and posting tool can be clicked or searched on, under More fields.
 
 ### Archive inspection
 
@@ -372,7 +384,7 @@ Once Atlas may fetch bodies, it reads the releases it can afford to, one at a ti
 - Whether the archive is passworded: yes when the bytes prove it, maybe when an archive was found but its contents couldn't be seen, and no when names were read with no encryption flag.
 - A real name, when the release has none. A name from inside an archive replaces only an obfuscated or random-looking one.
 
-To turn it on, set `postprocess.body_fetches_per_minute`. All of these go in an `archive` object, and each has a default:
+It runs on the body budget, `postprocess.body_fetches_per_minute`. All of these go in an `archive` object, and each has a default:
 
 | Key | Default | What it does |
 |---|---|---|
@@ -595,6 +607,10 @@ Sign in with the `api_key` from `config.toml`. The browser keeps a cookie for 30
 
 A release's page lists its other copies, once Atlas has read both: a **twin** has the same posted files, proven by PAR2 hashes, and a **pair** holds files of the same exact sizes packed differently, such as RAR5 and 7z. A release needs its archive or PAR2 set read to take part.
 
+Duplicates, at the top of each page, lists every set of copies at once. Each copy shows its poster, email, PAR2 files, repair, health, encryption, password, tags, scores and links, so you can choose between them. The scores and posters are the ones already fetched, when someone opened the title.
+
+The search box's More fields searches on Usenet group, poster, email, size (`1234567890`, or `1.5 GB` as the pages write it, which finds every size written that way), release group, CRC32 and posting tool. Clicking any of those on a release's page does the same, and the results show a total. Each column heading sorts, both ways.
+
 [htmx](https://htmx.org) (0BSD) is built into the binary from `assets/`, so the page needs no internet access. The look is [Oxide](https://appz4fun.github.io/RustyGet/design-system.html), the design system of RustyGet, in light and dark.
 
 ## Newznab API
@@ -695,7 +711,7 @@ Turn a provider on to fill in IDs, with no restart. Each title is asked once, ho
 
 | Provider | How to turn it on | Fills | `tv-search` parameters | `movie-search` parameters |
 |---|---|---|---|---|
-| TVMaze | `media.tvmaze.enabled: true`. It needs no key. TV only. | TVMaze, TVDB, TVRage, IMDb | `tvdbid`, `imdbid`, `rid`, `tvmazeid` | none |
+| TVMaze | On by default, as it needs no key. `media.tvmaze.enabled: false` turns it off. TV only. | TVMaze, TVDB, TVRage, IMDb | `tvdbid`, `imdbid`, `rid`, `tvmazeid` | none |
 | TMDB | `media.tmdb.api_key`, from your account's API settings on themoviedb.org. | TMDB, TVDB, TVRage, IMDb | `tvdbid`, `imdbid`, `rid`, `tmdbid` | `imdbid`, `tmdbid` |
 | Trakt | `media.trakt.client_id`, from an API app you create on trakt.tv. | Trakt, TVDB, TVRage, TMDB, IMDb | `tvdbid`, `imdbid`, `rid`, `tmdbid`, `traktid` | `imdbid`, `tmdbid`, `traktid` |
 | TheTVDB | `media.tvdb.api_key`, from your account on thetvdb.com, and `media.tvdb.pin` for a user-supported key. TV only. | TVDB, IMDb, TMDB, TVMaze | `tvdbid`, `imdbid`, `tvmazeid`, `tmdbid` | none |
@@ -704,7 +720,7 @@ Search results in the [web UI](#web-ui) have quick filters for resolution, HDR a
 
 Opening a release in the [web UI](#web-ui) also shows its overview, cast, dates and poster from TMDB, its ratings from OMDb when `media.omdb.api_key` is set (a free key from omdbapi.com), and its Trakt rating when Trakt is on. These are fetched when the page opens and kept for 30 days in `atlas.details.db`, with posters in `posters/`, at most 512 MB. Without a TMDB key, the page leaves them out.
 
-**An NFO needs no provider.** Once `postprocess.body_fetches_per_minute` is set, `media.nfo` reads a movie's IMDb ID from its NFO: one body of at most 64 KiB, and only for a movie with no IMDb ID yet. That also adds `imdbid` to `movie-search`.
+**An NFO needs no provider.** With a body budget, `media.nfo` reads a movie's IMDb ID from its NFO: one body of at most 64 KiB, and only for a movie with no IMDb ID yet. That also adds `imdbid` to `movie-search`.
 
 **Sonarr and Radarr cache `caps` for 7 days**, so press Test on the indexer after turning a provider on.
 

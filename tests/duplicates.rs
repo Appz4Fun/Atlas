@@ -4,7 +4,10 @@
 
 mod common;
 
-use atlas::duplicates::{Copy, CopyCount, SET_CONTENT, SET_POSTED, copies, counts, later_copies};
+use atlas::duplicates::{
+    ClusterKind, Copy, CopyCount, SET_CONTENT, SET_POSTED, cluster_count_with, clusters_with, copies, counts,
+    later_copies,
+};
 use atlas::parser::Release;
 use atlas::{db, store};
 use common::stage::release_of;
@@ -53,6 +56,29 @@ fn copies_are_found_across_shards_and_go_with_their_release() {
     assert_eq!(tally[&pair], CopyCount { twins: 0, pairs: 2 });
     assert!(!tally.contains_key(&other));
     assert_eq!(later_copies(&[first, other, twin, pair]).unwrap(), [twin, pair]);
+
+    let conn = db::open().unwrap();
+    let ids = |kind| -> Vec<Vec<i64>> {
+        clusters_with(&conn, kind, 0, 10)
+            .unwrap()
+            .into_iter()
+            .map(|members| {
+                let mut ids: Vec<i64> = members.iter().map(|r| r.id).collect();
+                ids.sort_unstable();
+                ids
+            })
+            .collect()
+    };
+    let sorted = |mut list: Vec<i64>| {
+        list.sort_unstable();
+        list
+    };
+    assert_eq!(cluster_count_with(&conn, ClusterKind::Twins).unwrap(), 1);
+    assert_eq!(ids(ClusterKind::Twins), [sorted(vec![first, twin])], "not the pair, and not the other");
+    assert_eq!(cluster_count_with(&conn, ClusterKind::Pairs).unwrap(), 1);
+    assert_eq!(ids(ClusterKind::Pairs), [sorted(vec![first, twin, pair])]);
+    assert!(clusters_with(&conn, ClusterKind::Twins, 1, 10).unwrap().is_empty(), "past the end");
+    drop(conn);
 
     // a purged release is no one's copy
     shard_b.execute("delete from releases where id = ?", [twin]).unwrap();

@@ -58,6 +58,7 @@ pub fn get(path: &str, query: &str, cookies: Option<&str>, base: &str, api_key: 
         "/ui/results" if signed_in => results(&args),
         "/ui/results" => ApiResponse { headers: vec![("HX-Redirect".into(), "/".into())], ..html(401, String::new()) },
         "/ui/release" if signed_in => release_page(&args),
+        "/ui/duplicates" if signed_in => duplicates_page(&args),
         "/ui/details" if signed_in => details_panel(&args),
         "/ui/poster" if signed_in => poster(&args),
         "/ui/nzb" if signed_in && args.get("fill").is_some_and(|v| v == "1") => filled_nzb(&args),
@@ -65,7 +66,7 @@ pub fn get(path: &str, query: &str, cookies: Option<&str>, base: &str, api_key: 
         "/ui/details" | "/ui/poster" => {
             ApiResponse { headers: vec![("HX-Redirect".into(), "/".into())], ..html(401, String::new()) }
         }
-        "/ui/nzb" | "/ui/release" => redirect(Vec::new()),
+        "/ui/nzb" | "/ui/release" | "/ui/duplicates" => redirect(Vec::new()),
         _ => return None,
     })
 }
@@ -280,6 +281,8 @@ impl Search {
             email: text("email"),
             size: text("size").replace([',', ' '], ""),
             team: text("team"),
+            crc: text("crc"),
+            agent: text("agent"),
         };
         let sort = SortBy::from_word(&text("sort"));
         let descending = text("dir") != "asc";
@@ -737,12 +740,14 @@ fn scope_inputs(search: &Search, oob: &str) -> String {
     };
     let hidden = |name: &str, value: &str| format!("<input type=\"hidden\" name=\"{name}\" value=\"{}\">", attr(value));
     format!(
-        "<details id=\"scope\" class=\"more-fields\"{open}{oob}><summary>More fields</summary><div class=\"field-grid\">{}{}{}{}{}</div>{}{}{}</details>",
+        "<details id=\"scope\" class=\"more-fields\"{open}{oob}><summary>More fields</summary><div class=\"field-grid\">{}{}{}{}{}{}{}</div>{}{}{}</details>",
         field("group", "Usenet group", &search.fields.group),
         field("poster", "Poster", &search.fields.poster),
         field("email", "Email", &search.fields.email),
-        field("size", "Exact bytes", &search.fields.size),
+        field("size", "Size, in bytes or as 1.5 GB", &search.fields.size),
         field("team", "Release group", &search.fields.team),
+        field("crc", "CRC32", &search.fields.crc),
+        field("agent", "Posted with", &search.fields.agent),
         hidden("filters", &search.filters.join(",")),
         hidden("sort", search.sort.map_or("", SortBy::word)),
         hidden(
@@ -793,7 +798,7 @@ fn page(title: &str, content: &str) -> String {
 
 fn masthead(signed_in: bool) -> String {
     let tools = if signed_in {
-        "<form method=\"post\" action=\"/logout\"><button class=\"button\">Sign out</button></form>"
+        "<a class=\"button\" href=\"/ui/duplicates\">Duplicates</a><form method=\"post\" action=\"/logout\"><button class=\"button\">Sign out</button></form>"
     } else {
         ""
     };
@@ -958,12 +963,7 @@ fn release_html(
     }
     fact("Encryption", encryption_fact(inner));
     if let Some(hint) = release_info::password_hint(r.id, names) {
-        let verdict = match inner.password_check.and_then(|check| check.accepts(&hint.password)) {
-            Some(true) => tag("tag-ok", "WORKS"),
-            Some(false) => tag("tag-bad", "WRONG"),
-            None => ", not tried".to_string(),
-        };
-        fact("Password", format!("<code>{}</code> found in {}{verdict}", escape(&hint.password), escape(hint.source)));
+        fact("Password", password_fact(inner, &hint));
     }
     if contents.files > 0 {
         fact("Files", contents.files.to_string());
@@ -974,11 +974,7 @@ fn release_html(
     if let Some(missing) = contents.missing_per_mille() {
         fact("Articles", health(contents, missing));
     }
-    if let Some(repair) = contents.exact_repair_per_mille() {
-        fact("Repair", per_mille(repair));
-    } else if let Some(repair) = contents.repair_per_mille().filter(|_| contents.recovery_bytes > 0) {
-        fact("Repair", format!("about {} ({})", per_mille(repair), escape(&fmt_size(Some(contents.recovery_bytes)))));
-    }
+    fact("Repair", repair_fact(contents));
     let links = media.map(|m| id_links(m.kind, &m.ids)).unwrap_or_default();
     if !links.is_empty() {
         fact("Links", links);
@@ -1003,6 +999,10 @@ fn release_html(
         )
     };
 
+    let probe = crate::db::open()
+        .ok()
+        .and_then(|conn| crate::probe::read(&conn, r.id))
+        .map_or(String::new(), |p| probe_html(&p));
     let copies = crate::duplicates::copies(r.id).unwrap_or_default();
     let has_twin = copies.iter().any(|(kind, _)| *kind == crate::duplicates::Copy::Twin);
     let fill = if has_twin && contents.articles_seen < contents.articles_expected {
@@ -1022,6 +1022,7 @@ fn release_html(
 <div id="title-details" hx-get="/ui/details?id={id}" hx-trigger="load" hx-swap="outerHTML"></div>
 <div class="panel"><dl class="facts">{facts}</dl></div>
 {copies}
+{probe}
 {files}
 </main></div>"#,
             masthead = masthead(true),
@@ -1054,31 +1055,391 @@ fn filled_nzb(args: &HashMap<String, String>) -> ApiResponse {
     }
 }
 
+fn verdict(ok: Option<bool>, good: &str, bad: &str) -> String {
+    match ok {
+        Some(true) => tag("tag-ok", good),
+        Some(false) => tag("tag-bad", bad),
+        None => String::new(),
+    }
+}
+
+fn panel(title: &str, facts: &str) -> String {
+    if facts.is_empty() {
+        return String::new();
+    }
+    format!("<h2>{title}</h2><div class=\"panel\"><dl class=\"facts\">{facts}</dl></div>")
+}
+
+/// What reading a release's articles found, without downloading it.
+fn probe_html(p: &crate::probe::ProbeInfo) -> String {
+    let dd = |out: &mut String, name: &str, value: String| {
+        if !value.is_empty() {
+            let _ = write!(out, "<dt>{name}</dt><dd>{value}</dd>");
+        }
+    };
+    let number = |n: Option<u64>| n.map_or(String::new(), |n| thousands(n as i64));
+    let mut yenc = String::new();
+    if let Some(y) = &p.yenc {
+        dd(&mut yenc, "File name", y.name.as_deref().map_or(String::new(), escape));
+        if let Some(size) = y.file_size {
+            dd(
+                &mut yenc,
+                "File size",
+                format!("{} · {} bytes", escape(&fmt_size(Some(size as i64))), thousands(size as i64)),
+            );
+        }
+        dd(&mut yenc, "Parts", y.total.map_or(String::new(), |n| thousands(i64::from(n))));
+        dd(&mut yenc, "Line length", y.line_len.map_or(String::new(), |n| n.to_string()));
+        dd(&mut yenc, "Article size", number(p.segment_size));
+        if let Some(crc) = p.file_crc32 {
+            dd(&mut yenc, "CRC32", search_link_to("crc", &format!("{crc:08x}"), &format!("{crc:08x}")));
+        }
+        if let Some(overhead) = p.overhead_percent {
+            dd(&mut yenc, "Overhead", format!("{overhead:.2}%"));
+        }
+    }
+    let checks = format!(
+        "{}{}{}",
+        verdict(p.continuity_ok, "ALL BYTES COVERED", "BYTES MISSING"),
+        verdict(p.part_size_ok, "PART SIZE OK", "PART SIZE WRONG"),
+        verdict(p.part_crc_ok, "PART CRC OK", "PART CRC WRONG"),
+    );
+    dd(&mut yenc, "Checks", checks);
+    let health: String = p
+        .health
+        .iter()
+        .map(|(part, there)| {
+            if *there {
+                tag("tag-ok", &format!("{} THERE", part.to_uppercase()))
+            } else {
+                tag("tag-bad", &format!("{} GONE", part.to_uppercase()))
+            }
+        })
+        .collect();
+    dd(&mut yenc, "On the server", health);
+
+    let mut posted = String::new();
+    if let Some(agent) = crate::probe::agent_of(&p.headers) {
+        dd(&mut posted, "Posted with", search_link_to("agent", agent, agent));
+    }
+    for (name, value) in &p.headers {
+        if !matches!(name.as_str(), "User-Agent" | "X-Newsreader" | "X-Newsposter" | "Xref") {
+            dd(&mut posted, &escape(name), escape(value));
+        }
+    }
+    if !p.crossposted_to.is_empty() {
+        let list: Vec<String> = p.crossposted_to.iter().map(|g| search_link_to("group", g, g)).collect();
+        dd(&mut posted, "Crossposted to", list.join("<br>"));
+    }
+
+    let mut packed = String::new();
+    if let Some(a) = &p.archive {
+        dd(&mut packed, "Format", escape(&a.format));
+        dd(&mut packed, "Method", a.method.as_deref().map_or(String::new(), escape));
+        let lock = match (a.headers_encrypted, a.encrypted) {
+            (true, _) => tag("tag-bad", "NAMES AND FILES ENCRYPTED"),
+            (false, true) => tag("tag-bad", "FILES ENCRYPTED"),
+            _ => tag("tag-ok", "NOT ENCRYPTED"),
+        };
+        dd(&mut packed, "Encryption", lock);
+        dd(&mut packed, "First file", a.name.as_deref().map_or(String::new(), escape));
+        if let Some(size) = a.unpacked {
+            dd(
+                &mut packed,
+                "Unpacked",
+                format!("{} · {} bytes", escape(&fmt_size(Some(size as i64))), thousands(size as i64)),
+            );
+        }
+        dd(&mut packed, "File CRC32", a.crc32.map_or(String::new(), |c| format!("{c:08x}")));
+    }
+
+    let mut tracks = String::new();
+    if let Some(m) = &p.media {
+        dd(&mut tracks, "Container", escape(&m.container));
+        dd(&mut tracks, "Written by", m.writing_app.as_deref().map_or(String::new(), escape));
+        dd(&mut tracks, "Muxed by", m.muxing_app.as_deref().map_or(String::new(), escape));
+        dd(
+            &mut tracks,
+            "Duration",
+            m.duration_secs.map_or(String::new(), |s| {
+                let s = s as u64;
+                format!("{}:{:02}:{:02}", s / 3600, s % 3600 / 60, s % 60)
+            }),
+        );
+        for v in &m.video {
+            let mut parts = vec![v.codec.clone()];
+            if let (Some(w), Some(h)) = (v.width, v.height) {
+                parts.push(format!("{w}×{h}"));
+            }
+            if let Some(rate) = v.frame_rate {
+                parts.push(format!("{rate:.3} fps"));
+            }
+            if let Some(depth) = v.bit_depth {
+                parts.push(format!("{depth}-bit"));
+            }
+            parts.extend(v.hdr.clone());
+            if let Some(profile) = v.dv_profile {
+                let layer = match v.dv_enhancement_layer {
+                    Some(true) => ", enhancement layer",
+                    _ => "",
+                };
+                parts.push(format!("Dolby Vision profile {profile}{layer}"));
+            }
+            dd(&mut tracks, "Video", escape(&parts.join(", ")));
+        }
+        for a in &m.audio {
+            let mut parts = vec![a.codec.clone()];
+            parts.extend(a.channels.map(|c| format!("{c} channels")));
+            parts.extend(a.sample_rate.map(|r| format!("{r:.0} Hz")));
+            parts.extend(a.language.clone());
+            if a.atmos {
+                parts.push("Atmos".into());
+            }
+            parts.extend(a.name.clone());
+            dd(&mut tracks, "Audio", escape(&parts.join(", ")));
+        }
+        for s in &m.subtitles {
+            let mut parts = vec![s.codec.clone()];
+            parts.extend(s.language.clone());
+            if s.forced {
+                parts.push("forced".into());
+            }
+            if s.hearing_impaired {
+                parts.push("SDH".into());
+            }
+            parts.extend(s.name.clone());
+            dd(&mut tracks, "Subtitles", escape(&parts.join(", ")));
+        }
+    }
+
+    let imdb: Vec<String> = p
+        .imdb_ids
+        .iter()
+        .map(|id| format!("<a href=\"https://www.imdb.com/title/{id}/\" rel=\"noreferrer\">{id}</a>", id = attr(id)))
+        .collect();
+    let nfo = p.nfo.as_deref().map_or(String::new(), |text| {
+        format!("<h2>NFO</h2><p>{}</p><pre class=\"nfo\">{}</pre>", imdb.join(" · "), escape(text))
+    });
+    let sfv = if p.sfv.is_empty() {
+        String::new()
+    } else {
+        let rows: String = p
+            .sfv
+            .iter()
+            .map(|(name, crc)| {
+                format!("<tr><td class=\"name\">{}</td><td class=\"num\">{crc:08x}</td></tr>", escape(name))
+            })
+            .collect();
+        format!("<h2>SFV</h2><div class=\"table-wrap\"><table><tbody>{rows}</tbody></table></div>")
+    };
+    format!(
+        "{}{}{}{}{nfo}{sfv}",
+        panel("Tracks", &tracks),
+        panel("yEnc", &yenc),
+        panel("Packing", &packed),
+        panel("How it was posted", &posted),
+    )
+}
+
+/// Copies read in full on one page: each reads its articles.
+const FULL_COPIES: usize = 12;
+const CLUSTERS_PER_PAGE: i64 = 10;
+/// Of one cluster, the most read in full. The rest are links.
+const FULL_MEMBERS: usize = 6;
+
+/// One copy, with everything that helps to choose between copies. Scores and posters are what's already kept, soo a
+/// list never calls out: they come once someone has opened the title.
+fn copy_card(conn: &rusqlite::Connection, badge: &str, r: &ReleaseRow) -> String {
+    let parsed = release_tags::parse(&r.name);
+    let media = crate::media::query::attrs_with(conn, &[r.id]).unwrap_or_default().remove(&r.id);
+    let details = media
+        .as_ref()
+        .and_then(|m| crate::media::details::kept_for(std::iter::once((r.id, m.kind, &m.ids))).remove(&r.id));
+    let names = release_info::names_with(conn, r.id).unwrap_or_default();
+    let contents = release_info::contents_with(conn, r.id).unwrap_or_default();
+    let inner = crate::archive::store::view_with(conn, r.id);
+    let hint = release_info::password_hint_with(conn, r.id, names.as_ref());
+
+    let mut tags = badge.to_string();
+    tags.push_str(&name_tags(&parsed));
+    if names.as_ref().is_some_and(|n| n.obfuscated) {
+        tags.push_str(&tag("tag-warn", "OBFUSCATED"));
+    }
+    tags.push_str(&password_tag(inner.password.as_ref()));
+    if !r.complete {
+        tags.push_str(&tag("tag-warn", "INCOMPLETE"));
+    }
+    if let Some(d) = &details {
+        tags.push_str(&scores_html(d));
+    }
+
+    let mut facts = String::new();
+    let mut fact = |name: &str, value: String| {
+        if !value.is_empty() {
+            let _ = write!(facts, "<dt>{name}</dt><dd>{value}</dd>");
+        }
+    };
+    if let Some(size) = r.size {
+        fact("Size", format!("{} · {} bytes", escape(&fmt_size(r.size)), thousands(size)));
+    }
+    fact("Group", search_link_to("group", &r.group_name, &r.group_name));
+    if let Some(raw) = &r.poster {
+        let poster = release_info::parse_poster(raw);
+        fact("Poster", poster.name.as_deref().map_or(String::new(), |name| search_link_to("poster", raw, name)));
+        if let Some(email) = poster.email {
+            let made_up = if release_info::looks_made_up(&email) { tag("tag-warn", "MADE UP") } else { String::new() };
+            fact("Email", format!("{}{made_up}", search_link_to("email", &email, &email)));
+        }
+    }
+    if contents.par2_files > 0 {
+        fact("PAR2 files", format!("{} ({} recovery)", contents.par2_files, contents.recovery_volumes));
+    }
+    fact("Repair", repair_fact(&contents));
+    if let Some(missing) = contents.missing_per_mille() {
+        fact("Articles", health(&contents, missing));
+    }
+    fact("Encryption", encryption_fact(&inner));
+    if let Some(hint) = &hint {
+        fact("Password", password_fact(&inner, hint));
+    }
+    fact(
+        "Video",
+        escape(
+            &[parsed.codec.as_deref(), parsed.bit_depth.as_deref(), parsed.container.as_deref()]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join(", "),
+        ),
+    );
+    fact("Audio", escape(&parsed.audio.iter().chain(&parsed.channels).cloned().collect::<Vec<_>>().join(", ")));
+    fact("Languages", escape(&parsed.languages.join(", ")));
+    if let Some(network) = &parsed.network {
+        fact("Ripped from", search_link_to("q", network, network));
+    }
+    if let Some(group) = &parsed.group {
+        fact("Release group", search_link_to("team", group, group));
+    }
+    if let Some(m) = &media {
+        fact("Links", id_links(m.kind, &m.ids));
+    }
+    let thumb = details.filter(crate::media::details::poster_kept).map_or(String::new(), |d| {
+        format!(
+            "<img class=\"copy-poster\" src=\"/ui/poster?kind={}&amp;tmdb={}\" alt=\"\" loading=\"lazy\" width=\"72\" height=\"108\">",
+            d.kind, d.tmdb_id
+        )
+    });
+    format!(
+        "<article class=\"panel copy\">{thumb}<div class=\"copy-body\"><div class=\"copy-head\"><div class=\"name\"><a href=\"/ui/release?id={id}\">{name}</a>{tags}</div><a class=\"button small primary\" href=\"/ui/nzb?id={id}\">NZB</a></div><dl class=\"facts facts-wide\">{facts}</dl></div></article>",
+        id = r.id,
+        name = escape(&r.name),
+    )
+}
+
+fn copy_link(badge: &str, r: &ReleaseRow) -> String {
+    format!("<li><a href=\"/ui/release?id={}\">{}</a>{badge} {}</li>", r.id, escape(&r.name), escape(&fmt_size(r.size)))
+}
+
 /// Other postings of this release's content.
 fn copies_html(copies: &[(crate::duplicates::Copy, ReleaseRow)]) -> String {
     use crate::duplicates::Copy;
     if copies.is_empty() {
         return String::new();
     }
-    let rows: String = copies
+    let badge = |kind: &Copy| match kind {
+        Copy::Twin => tag("tag-ok", "TWIN"),
+        Copy::Pair => tag("tag-ref", "PAIR"),
+    };
+    let Ok(conn) = crate::db::open() else { return String::new() };
+    let cards: String =
+        copies.iter().take(FULL_COPIES).map(|(kind, copy)| copy_card(&conn, &badge(kind), copy)).collect();
+    let rest: String = copies.iter().skip(FULL_COPIES).map(|(kind, copy)| copy_link(&badge(kind), copy)).collect();
+    let rest = if rest.is_empty() { rest } else { format!("<ul class=\"copy-rest\">{rest}</ul>") };
+    format!(
+        "<h2>Other copies</h2><div class=\"copies\">{cards}</div>{rest}<p class=\"sort\">A twin has the same files, proven by PAR2 hashes. A pair holds the same content packed differently.</p>"
+    )
+}
+
+/// Every cluster of copies, whichever release they're found from.
+fn duplicates_page(args: &HashMap<String, String>) -> ApiResponse {
+    use crate::duplicates::{ClusterKind, cluster_count_with, clusters_with};
+    let kind = if args.get("kind").is_some_and(|k| k == "pairs") { ClusterKind::Pairs } else { ClusterKind::Twins };
+    let number = args.get("page").and_then(|p| p.parse::<i64>().ok()).unwrap_or(1).max(1);
+    let read = crate::db::open().and_then(|conn| {
+        let twins = cluster_count_with(&conn, ClusterKind::Twins)?;
+        let pairs = cluster_count_with(&conn, ClusterKind::Pairs)?;
+        let page = clusters_with(&conn, kind, (number - 1) * CLUSTERS_PER_PAGE, CLUSTERS_PER_PAGE)?;
+        Ok((conn, twins, pairs, page))
+    });
+    let (conn, twins, pairs, page) = match read {
+        Ok(found) => found,
+        Err(e) => {
+            eprintln!("web duplicates failed: {e}");
+            return release_problem(500, "caution", "the copies could not be read", "The error is in Atlas's log.");
+        }
+    };
+    let chip = |word: &str, label: &str, count: i64, on: bool| {
+        let current = if on { " aria-current=\"true\"" } else { "" };
+        format!("<a class=\"chip\" href=\"/ui/duplicates?kind={word}\"{current}>{label} {}</a>", thousands(count))
+    };
+    let (total, word, badge, about) = match kind {
+        ClusterKind::Twins => (
+            twins,
+            "twins",
+            tag("tag-ok", "TWIN"),
+            "Twins are the same posted files, proven by PAR2 hashes, so one can fill the other's gaps.",
+        ),
+        ClusterKind::Pairs => (
+            pairs,
+            "pairs",
+            tag("tag-ref", "PAIR"),
+            "Pairs hold files of the same exact sizes, packed differently, so each is a separate download.",
+        ),
+    };
+    let clusters: String = page
         .iter()
-        .map(|(kind, copy)| {
-            let kind = match kind {
-                Copy::Twin => tag("tag-ok", "TWIN"),
-                Copy::Pair => tag("tag-ref", "PAIR"),
-            };
+        .map(|members| {
+            let title = release_tags::parse(&members[0].name).title;
+            let title = if title.is_empty() { members[0].name.clone() } else { title };
+            let cards: String = members.iter().take(FULL_MEMBERS).map(|r| copy_card(&conn, &badge, r)).collect();
+            let rest: String = members.iter().skip(FULL_MEMBERS).map(|r| copy_link(&badge, r)).collect();
+            let rest = if rest.is_empty() { rest } else { format!("<ul class=\"copy-rest\">{rest}</ul>") };
             format!(
-                "<tr><td class=\"name\"><a href=\"/ui/release?id={id}\">{name}</a>{kind}</td><td class=\"num\">{size}</td><td class=\"dim\">{group}</td><td><a class=\"button small primary\" href=\"/ui/nzb?id={id}\">NZB</a></td></tr>",
-                id = copy.id,
-                name = escape(&copy.name),
-                size = fmt_size(copy.size),
-                group = escape(&copy.group_name),
+                "<section class=\"cluster\"><h2>{} <span class=\"count\">{} copies</span></h2><div class=\"copies\">{cards}</div>{rest}</section>",
+                escape(&title),
+                members.len()
             )
         })
         .collect();
-    format!(
-        "<h2>Other copies</h2><div class=\"table-wrap\"><table><thead><tr><th>Name</th><th class=\"num\">Size</th><th>Group</th><th><span class=\"sr-only\">Download</span></th></tr></thead><tbody>{rows}</tbody></table></div><p class=\"sort\">A twin has the same files, proven by PAR2 hashes. A pair holds the same content packed differently.</p>"
-    )
+    let body = if clusters.is_empty() && number == 1 {
+        diag(
+            "note",
+            &format!("no {word} found yet"),
+            "Copies are found once archives and PAR2 sets have been read, and that needs a body budget.",
+        )
+    } else {
+        clusters
+    };
+    let pages = (total + CLUSTERS_PER_PAGE - 1) / CLUSTERS_PER_PAGE;
+    let pager = if pages > 1 {
+        let link = |to: i64, text: &str| {
+            format!("<a class=\"button\" href=\"/ui/duplicates?kind={word}&amp;page={to}\">{text}</a>")
+        };
+        format!(
+            "<nav class=\"actions\" aria-label=\"Pages\">{}<span class=\"sort\">Page {number} of {pages}</span>{}</nav>",
+            if number > 1 { link(number - 1, "Previous") } else { String::new() },
+            if number < pages { link(number + 1, "Next") } else { String::new() },
+        )
+    } else {
+        String::new()
+    };
+    let content = format!(
+        "{masthead}<div class=\"release\"><main><h1>Duplicates</h1><div class=\"chips\">{twins}{pairs}</div><p class=\"sort\">{about}</p>{body}{pager}</main></div>",
+        masthead = masthead(true),
+        twins = chip("twins", "Twins", twins, kind == ClusterKind::Twins),
+        pairs = chip("pairs", "Pairs", pairs, kind == ClusterKind::Pairs),
+    );
+    html(200, self::page("Duplicates · Atlas", &content))
 }
 
 /// Loaded after the page, soo a slow provider doesn't hold it up. Empty when the title isn't known.
@@ -1088,6 +1449,20 @@ fn details_panel(args: &HashMap<String, String>) -> ApiResponse {
     let details =
         media.as_ref().and_then(|m| crate::media::details::for_title(&crate::config::media_config(), m.kind, &m.ids));
     html(200, details.map(|d| details_html(&d)).unwrap_or_default())
+}
+
+fn scores_html(d: &crate::media::details::Details) -> String {
+    let score = |name: &str, score: Option<i64>| score.map(|s| tag("tag-ref", &format!("{name} {s}")));
+    [
+        score("IMDB", d.imdb_score),
+        score("RT", d.rotten),
+        score("MC", d.metacritic),
+        score("TMDB", d.tmdb_score),
+        score("TRAKT", d.trakt_score),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
 }
 
 fn details_html(d: &crate::media::details::Details) -> String {
@@ -1104,17 +1479,7 @@ fn details_html(d: &crate::media::details::Details) -> String {
     line("Network", d.network.clone());
     line("Status", d.status.clone());
     line("Cast", d.cast.clone());
-    let score = |name: &str, score: Option<i64>| score.map(|s| tag("tag-ref", &format!("{name} {s}")));
-    let scores: String = [
-        score("IMDB", d.imdb_score),
-        score("RT", d.rotten),
-        score("MC", d.metacritic),
-        score("TMDB", d.tmdb_score),
-        score("TRAKT", d.trakt_score),
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
+    let scores = scores_html(d);
     let poster = if d.poster.is_some() {
         format!(
             "<img class=\"poster\" src=\"/ui/poster?kind={}&amp;tmdb={}\" alt=\"\" loading=\"lazy\" width=\"171\" height=\"256\">",
@@ -1145,6 +1510,26 @@ fn poster(args: &HashMap<String, String>) -> ApiResponse {
             ("X-Content-Type-Options".into(), "nosniff".into()),
         ],
         bytes: Some(bytes),
+    }
+}
+
+fn password_fact(inner: &crate::archive::store::InnerView, hint: &release_info::PasswordHint) -> String {
+    let verdict = match inner.password_check.and_then(|check| check.accepts(&hint.password)) {
+        Some(true) => tag("tag-ok", "WORKS"),
+        Some(false) => tag("tag-bad", "WRONG"),
+        None => ", not tried".to_string(),
+    };
+    format!("<code>{}</code> found in {}{verdict}", escape(&hint.password), escape(hint.source))
+}
+
+/// How much of a release its recovery volumes can repair: exact from the PAR2 set, or else an estimate.
+fn repair_fact(contents: &release_info::Contents) -> String {
+    if let Some(repair) = contents.exact_repair_per_mille() {
+        per_mille(repair)
+    } else if let Some(repair) = contents.repair_per_mille().filter(|_| contents.recovery_bytes > 0) {
+        format!("about {} ({})", per_mille(repair), escape(&fmt_size(Some(contents.recovery_bytes))))
+    } else {
+        String::new()
     }
 }
 

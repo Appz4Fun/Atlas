@@ -6,6 +6,7 @@ use rusqlite::Connection;
 use rusqlite::types::Value;
 
 use crate::config::Config;
+use crate::nntp::BackgroundRead;
 use crate::store;
 
 use super::bodies::BodyFetcher;
@@ -124,7 +125,13 @@ impl StepCtx<'_> {
         }
         let mut results = Vec::with_capacity(wanted.len());
         for request in wanted {
-            let got = self.bodies.fetch(&self.release, request, &mut self.used_bodies, self.deadline, false)?;
+            let got = self.bodies.fetch(
+                &self.release,
+                request,
+                &mut self.used_bodies,
+                self.deadline,
+                BackgroundRead::Capped,
+            )?;
             results.push(BodyResult { message_id: request.message_id.clone(), got });
         }
         Ok(results)
@@ -136,8 +143,34 @@ impl StepCtx<'_> {
         if !self.lane_can_fetch {
             return Err(StepError::Permanent("a database step cant fetch bodies".into()));
         }
-        let got = self.bodies.fetch(&self.release, wanted, &mut self.used_bodies, self.deadline, true)?;
+        let got =
+            self.bodies.fetch(&self.release, wanted, &mut self.used_bodies, self.deadline, BackgroundRead::Prefix)?;
         Ok(BodyResult { message_id: wanted.message_id.clone(), got })
+    }
+
+    /// One article undecoded, with its headers, for what `BODY` leaves out.
+    pub fn fetch_article(&mut self, wanted: &BodyRequest) -> Result<BodyResult, StepError> {
+        if !self.lane_can_fetch {
+            return Err(StepError::Permanent("a database step cant fetch bodies".into()));
+        }
+        let got =
+            self.bodies.fetch(&self.release, wanted, &mut self.used_bodies, self.deadline, BackgroundRead::Raw)?;
+        Ok(BodyResult { message_id: wanted.message_id.clone(), got })
+    }
+
+    /// Whether a server still has an article, with nothing transferred. None: it wasn't asked.
+    pub fn article_exists(&mut self, message_id: &str, file: &str) -> Result<Option<bool>, StepError> {
+        if !self.lane_can_fetch {
+            return Err(StepError::Permanent("a database step cant fetch bodies".into()));
+        }
+        let wanted = BodyRequest { message_id: message_id.to_string(), file: file.to_string(), max_bytes: Some(1) };
+        let got =
+            self.bodies.fetch(&self.release, &wanted, &mut self.used_bodies, self.deadline, BackgroundRead::Stat)?;
+        Ok(match got {
+            Got::Body(_) | Got::TooBig => Some(true),
+            Got::Missing => Some(false),
+            Got::Refused(_) => None,
+        })
     }
 
     pub fn stopping(&self) -> bool {

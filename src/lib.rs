@@ -32,6 +32,7 @@ pub mod parser;
 pub mod paths;
 pub mod postprocess;
 pub mod predb;
+pub mod probe;
 pub mod procs;
 pub mod profile;
 pub mod ptt;
