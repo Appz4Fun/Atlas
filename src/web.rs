@@ -304,7 +304,7 @@ impl Search {
         let media = crate::media::query::attrs_of(&ids).unwrap_or_default();
         let extras = RowExtras {
             copies: crate::duplicates::counts(&ids).unwrap_or_default(),
-            details: crate::media::details::kept_for(media.values().map(|m| (m.kind, m.ids.tmdb))),
+            details: crate::media::details::kept_for(media.iter().map(|(id, m)| (*id, m.kind, &m.ids))),
         };
 
         let mut out: String = found.iter().map(|r| row(r, &categories, &passwords, &media, &extras)).collect();
@@ -364,7 +364,7 @@ impl Search {
 #[derive(Default)]
 struct RowExtras {
     copies: HashMap<i64, crate::duplicates::CopyCount>,
-    details: HashMap<(i64, i64), crate::media::details::Details>,
+    details: HashMap<i64, crate::media::details::Details>,
 }
 
 /// Columns of the results table.
@@ -430,7 +430,7 @@ fn row(
         tags.push_str(&tag("tag-ref", &text));
     }
     tags.push_str(&name_tags(&release_tags::parse(&r.name)));
-    let details = media.get(&r.id).and_then(|m| Some((m.kind, m.ids.tmdb?))).and_then(|key| extras.details.get(&key));
+    let details = extras.details.get(&r.id);
     if let Some(score) = details.and_then(best_score) {
         tags.push_str(&tag("tag-ref", &score));
     }
@@ -916,8 +916,7 @@ fn health(contents: &release_info::Contents, missing: i64) -> String {
     if missing == 0 && contents.articles_seen == contents.articles_expected {
         return format!("{counts}{}", tag("tag-ok", "ALL THERE"));
     }
-    let repairable = contents.recovery_volumes > 0
-        && contents.exact_repair_per_mille().or(contents.repair_per_mille()).is_some_and(|repair| repair >= missing);
+    let repairable = contents.repairable();
     let verdict = if repairable { tag("tag-warn", "REPAIRABLE") } else { tag("tag-bad", "NOT ENOUGH RECOVERY") };
     format!("{counts}, {} missing{verdict}", per_mille(missing.max(1)))
 }
@@ -1123,17 +1122,21 @@ mod tests {
         let whole = release_info::Contents { articles_seen: 100, articles_expected: 100, ..Default::default() };
         assert!(health(&whole, 0).contains("ALL THERE"));
         let holes = release_info::Contents {
-            articles_seen: 97,
-            articles_expected: 100,
+            articles_seen: 107,
+            articles_expected: 110,
+            data_articles_seen: 97,
+            data_articles_expected: 100,
+            recovery_articles_seen: 10,
+            recovery_articles_expected: 10,
             recovery_volumes: 3,
             data_bytes: 1000,
             recovery_bytes: 100,
             ..Default::default()
         };
         let text = health(&holes, holes.missing_per_mille().unwrap());
-        assert!(text.contains("3% missing") && text.contains("REPAIRABLE"), "{text}");
+        assert!(text.contains("2.7% missing") && text.contains("REPAIRABLE"), "{text}");
         let thin = release_info::Contents { recovery_bytes: 10, ..holes };
-        assert!(health(&thin, 30).contains("NOT ENOUGH RECOVERY"));
+        assert!(health(&thin, 27).contains("NOT ENOUGH RECOVERY"));
         assert_eq!(per_mille(25), "2.5%");
     }
 

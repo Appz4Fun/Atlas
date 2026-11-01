@@ -118,7 +118,9 @@ fn finish(ctx: &StepCtx<'_>, source: i64, listing: Listing, limits: &ArchiveConf
         // past the total: what's there stays, and this list goes unstored
         writes.push(StepWrite::new(archive_store::COUNT_OVER_QUOTA, vec![]));
     }
-    if !listing.damaged
+    // part of a list would call two releases the same when only their first files are
+    if listing.complete
+        && !listing.damaged
         && let Some(content) = duplicates::content_fingerprint(listing.files.iter().map(|f| (f.name.as_str(), f.size)))
     {
         writes.push(StepWrite::new(duplicates::SET_CONTENT, vec![id.into(), content.into()]));

@@ -240,6 +240,11 @@ fn add_omdb(d: &mut Details, v: &Value) {
     }
 }
 
+/// A ratings source failed: what's there is kept, and looked at again within the hour instead of in a month.
+fn try_again_soon(details: &mut Details, now: i64) {
+    details.fetched_at = now - KEEP_FOR + RETRY_AFTER;
+}
+
 fn trakt_score(v: &Value) -> Option<i64> {
     let votes = v.get("votes").and_then(Value::as_i64).unwrap_or(0);
     v.get("rating").and_then(Value::as_f64).filter(|_| votes > 0).map(|score| (score * 10.0).round() as i64)
@@ -331,8 +336,10 @@ impl Sources {
         {
             let base = self.omdb.base_url.as_deref().unwrap_or(OMDB_BASE);
             let url = format!("{base}/?i=tt{imdb:07}&apikey={}", encode(&self.omdb.api_key));
-            if let Ok(Reply::Json(body)) = self.omdb_client.get(&url, &[]) {
-                add_omdb(&mut details, &body);
+            match self.omdb_client.get(&url, &[]) {
+                Ok(Reply::Json(body)) => add_omdb(&mut details, &body),
+                Ok(Reply::NotFound) => {}
+                Err(_) => try_again_soon(&mut details, now),
             }
         }
         if let Some(trakt) = ids.trakt
@@ -342,8 +349,10 @@ impl Sources {
             let section = if kind == Kind::Tv as i64 { "shows" } else { "movies" };
             let url = format!("{base}/{section}/{trakt}?extended=full");
             let headers = [("trakt-api-version", "2"), ("trakt-api-key", self.trakt.client_id.as_str())];
-            if let Ok(Reply::Json(body)) = self.trakt_client.get(&url, &headers) {
-                details.trakt_score = trakt_score(&body);
+            match self.trakt_client.get(&url, &headers) {
+                Ok(Reply::Json(body)) => details.trakt_score = trakt_score(&body),
+                Ok(Reply::NotFound) => {}
+                Err(_) => try_again_soon(&mut details, now),
             }
         }
         Some(details)
@@ -368,22 +377,34 @@ pub fn for_title(cfg: &MediaConfig, kind: i64, ids: &Ids) -> Option<Details> {
     Some(fresh)
 }
 
-/// What's already kept for these titles, with nothing fetched: for a page of results.
-pub fn kept_for(titles: impl Iterator<Item = (i64, Option<i64>)>) -> HashMap<(i64, i64), Details> {
+/// What's already kept for these releases' titles, by release, with nothing fetched: for a page of results.
+pub fn kept_for<'a>(titles: impl Iterator<Item = (i64, i64, &'a Ids)>) -> HashMap<i64, Details> {
     let mut out = HashMap::new();
     let Ok(conn) = open() else { return out };
-    for (kind, tmdb_id) in titles {
-        let Some(tmdb_id) = tmdb_id else { continue };
-        if let Ok(Some(details)) = read(&conn, kind, tmdb_id) {
-            out.insert((kind, tmdb_id), details);
+    for (release, kind, ids) in titles {
+        let tmdb_id = ids.tmdb.or_else(|| {
+            conn.query_row("select tmdb_id from details_lookups where lookup = ?", [lookup_key(kind, ids)], |r| {
+                r.get(0)
+            })
+            .ok()
+            .flatten()
+        });
+        if let Some(tmdb_id) = tmdb_id
+            && let Ok(Some(details)) = read(&conn, kind, tmdb_id)
+        {
+            out.insert(release, details);
         }
     }
     out
 }
 
+fn lookup_key(kind: i64, ids: &Ids) -> String {
+    format!("{kind}:{:?}:{:?}", ids.imdb, ids.tvdb)
+}
+
 /// `find_tmdb_id`, remembered, soo an id TMDB doesn't know isn't asked about on every open.
 fn lookup(conn: &Connection, sources: Option<&Sources>, kind: i64, ids: &Ids, now: i64) -> Option<i64> {
-    let key = format!("{kind}:{:?}:{:?}", ids.imdb, ids.tvdb);
+    let key = lookup_key(kind, ids);
     let kept: Option<(Option<i64>, i64)> = conn
         .query_row("select tmdb_id, checked_at from details_lookups where lookup = ?", [&key], |r| {
             Ok((r.get(0)?, r.get(1)?))

@@ -9,7 +9,7 @@ pub mod reflag;
 pub mod regexes;
 pub mod steps;
 pub mod unname;
-pub(crate) mod walk;
+mod walk;
 
 pub use clean::{
     basename, clean_candidate, has_collision_suffix, identity_key, parent_dir, strip_file_suffixes,

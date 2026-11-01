@@ -216,17 +216,48 @@ fn tally(conn: &Connection, column: &str, prints: &[&Vec<u8>]) -> db::Result<Has
     Ok(out)
 }
 
+type PrintCounts = HashMap<(Vec<u8>, Vec<u8>), i64>;
+
+/// How many releases have each posted and content fingerprint together, for these content fingerprints.
+fn tally_both(conn: &Connection, prints: &[&Vec<u8>]) -> db::Result<PrintCounts> {
+    let mut out = PrintCounts::new();
+    if prints.is_empty() {
+        return Ok(out);
+    }
+    let marks = vec!["?"; prints.len()].join(",");
+    for s in 0..store::SHARDS {
+        let sql = format!(
+            "select posted, content, count(*) from s{s}.release_fingerprint
+             where content in ({marks}) and posted is not null group by posted, content"
+        );
+        let Ok(mut stmt) = conn.prepare(&sql) else { continue };
+        let rows = stmt.query_map(rusqlite::params_from_iter(prints.iter()), |r| {
+            Ok(((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?), r.get::<_, i64>(2)?))
+        })?;
+        for row in rows {
+            let (key, count) = row?;
+            *out.entry(key).or_default() += count;
+        }
+    }
+    Ok(out)
+}
+
 /// Copies per release, for a page of results.
 pub fn counts_with(conn: &Connection, ids: &[i64]) -> db::Result<HashMap<i64, CopyCount>> {
     let prints = fingerprints_of(conn, ids)?;
     let posted: Vec<&Vec<u8>> = prints.values().filter_map(|(p, _)| p.as_ref()).collect();
     let content: Vec<&Vec<u8>> = prints.values().filter_map(|(_, c)| c.as_ref()).collect();
+    let both = tally_both(conn, &content)?;
     let (posted, content) = (tally(conn, "posted", &posted)?, tally(conn, "content", &content)?);
     let mut out = HashMap::new();
     for (id, (p, c)) in &prints {
         let twins = p.as_ref().and_then(|p| posted.get(p)).map_or(0, |n| (n - 1).max(0));
-        // a twin holds the same files too, soo it's counted under content as well
-        let pairs = c.as_ref().and_then(|c| content.get(c)).map_or(0, |n| (n - 1 - twins).max(0));
+        // a twin with the same content is a twin, not a pair as well
+        let same_posting = match (p, c) {
+            (Some(p), Some(c)) => both.get(&(p.clone(), c.clone())).map_or(0, |n| (n - 1).max(0)),
+            _ => 0,
+        };
+        let pairs = c.as_ref().and_then(|c| content.get(c)).map_or(0, |n| (n - 1 - same_posting).max(0));
         if twins > 0 || pairs > 0 {
             out.insert(*id, CopyCount { twins, pairs });
         }
@@ -292,7 +323,9 @@ pub fn fill_gaps(own: &mut Vec<ArticleRow>, twin: &[ArticleRow]) -> usize {
         let same_total = articles.iter().all(|a| a.total_parts.is_some() && a.total_parts == template.total_parts);
         let same_sizes =
             articles.iter().all(|a| a.part.and_then(|part| parts.get(&part)).is_none_or(|bytes| *bytes == a.bytes));
-        if !same_total || !same_sizes {
+        // with no part in common, nothing says the two were cut up the same way
+        let shared = articles.iter().any(|a| a.part.is_some_and(|part| parts.contains_key(&part)));
+        if !same_total || !same_sizes || !shared {
             continue;
         }
         for article in articles {
@@ -327,77 +360,6 @@ pub fn filled_nzb(id: i64) -> db::Result<Option<String>> {
         }
     }
     Ok(Some(crate::nzb::render_nzb(&release, &articles)))
-}
-
-const BACKFILL_BATCH: i64 = 2_000;
-
-/// One shard's releases that have inner files, from what's stored. Returns how many got a fingerprint.
-fn backfill_shard(path: &std::path::Path, apply: bool) -> anyhow::Result<u64> {
-    let conn = db::open_shard(path)?;
-    if apply {
-        // this can be the first thing to open a shard since an upgrade
-        crate::postprocess::schema::migrate(&conn)?;
-    }
-    let (mut after, mut set) = (0i64, 0u64);
-    loop {
-        let ids: Vec<i64> = conn
-            .prepare_cached(
-                "select distinct release_id from archive_inner_files where release_id > ? order by release_id limit ?",
-            )?
-            .query_map(rusqlite::params![after, BACKFILL_BATCH], |r| r.get(0))?
-            .collect::<db::Result<_>>()?;
-        let Some(last) = ids.last() else { return Ok(set) };
-        after = *last;
-        let tx = conn.unchecked_transaction()?;
-        for id in ids {
-            let rows: Vec<(String, Option<i64>)> = conn
-                .prepare_cached("select name, size from archive_inner_files where release_id = ? order by seq")?
-                .query_map([id], |r| Ok((r.get(0)?, r.get(1)?)))?
-                .collect::<db::Result<_>>()?;
-            let files = rows.iter().map(|(name, size)| (name.as_str(), size.and_then(|s| u64::try_from(s).ok())));
-            if let Some(content) = content_fingerprint(files) {
-                set += 1;
-                if apply {
-                    conn.prepare_cached(SET_CONTENT)?.execute(rusqlite::params![id, content])?;
-                }
-            }
-        }
-        tx.commit()?;
-    }
-}
-
-/// `atlas --fingerprints [--apply]`: content fingerprints for releases inspected before they existed.
-/// Posted fingerprints need PAR2 hashes, which were never stored, soo those come as releases are read again.
-pub fn run(args: &[String]) -> i32 {
-    let apply = args.iter().any(|a| a == "--apply");
-    let main = crate::naming::walk::main_path();
-    let _lock = if apply {
-        match crate::naming::walk::take_lock(&main) {
-            Ok(lock) => Some(lock),
-            Err(e) => {
-                println!("{e}");
-                return 1;
-            }
-        }
-    } else {
-        if let Err(e) = crate::naming::walk::may_read(&main) {
-            println!("{e}");
-            return 1;
-        }
-        None
-    };
-    let mut total = 0u64;
-    for path in store::shard_paths(&main) {
-        match backfill_shard(&path, apply) {
-            Ok(set) => total += set,
-            Err(e) => {
-                println!("{}: {e:#}", path.display());
-                return 1;
-            }
-        }
-    }
-    println!("{total} releases {}", if apply { "fingerprinted" } else { "would be fingerprinted" });
-    0
 }
 
 #[cfg(test)]
@@ -462,33 +424,7 @@ mod tests {
         let mut own = vec![article("a.rar", 1, 3, 100, "own1")];
         assert_eq!(fill_gaps(&mut own, &[article("a.rar", 1, 3, 90, "t1"), article("a.rar", 2, 3, 90, "t2")]), 0);
         assert_eq!(fill_gaps(&mut own, &[article("a.rar", 2, 4, 100, "t2")]), 0, "another part count");
-    }
-
-    #[test]
-    fn a_backfill_fingerprints_what_is_stored_and_only_when_applied() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("shard.db");
-        let conn = Connection::open(&path).unwrap();
-        conn.execute_batch(
-            "create table archive_inner_files (release_id INTEGER, seq INTEGER, name TEXT, size INTEGER, source INTEGER);
-             insert into archive_inner_files values (1, 1, 'a.mkv', 5000000, 2), (2, 1, 'a.part1.rar', 5000000, 1), (3, 1, 'a.nfo', 10, 2);",
-        )
-        .unwrap();
-        conn.execute_batch(
-            "create table releases (id INTEGER PRIMARY KEY, name TEXT, group_name TEXT);
-             create table meta (key TEXT PRIMARY KEY, value INTEGER);",
-        )
-        .unwrap();
-        assert_eq!(backfill_shard(&path, false).unwrap(), 1);
-        let rows = |c: &Connection| -> i64 {
-            c.query_row("select count(*) from release_fingerprint", [], |r| r.get(0)).unwrap()
-        };
-        let tables: i64 = conn
-            .query_row("select count(*) from sqlite_master where name = 'release_fingerprint'", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(tables, 0, "a dry run writes nothing");
-        assert_eq!(backfill_shard(&path, true).unwrap(), 1);
-        assert_eq!(rows(&conn), 1);
+        assert_eq!(fill_gaps(&mut own, &[article("a.rar", 2, 3, 100, "t2")]), 0, "no part in common");
     }
 
     #[test]

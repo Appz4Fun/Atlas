@@ -45,6 +45,12 @@ pub struct Contents {
     pub recovery_bytes: i64,
     pub articles_seen: i64,
     pub articles_expected: i64,
+    /// the same, for the files that aren't PAR2
+    pub data_articles_seen: i64,
+    pub data_articles_expected: i64,
+    /// and for the recovery volumes
+    pub recovery_articles_seen: i64,
+    pub recovery_articles_expected: i64,
     /// from the `+MM` in recovery volume names
     pub recovery_blocks: i64,
     /// from the PAR2 set, once read
@@ -57,6 +63,19 @@ impl Contents {
     pub fn missing_per_mille(&self) -> Option<i64> {
         (self.articles_expected > 0)
             .then(|| (self.articles_expected - self.articles_seen).max(0) * 1000 / self.articles_expected)
+    }
+
+    /// Whether the recovery volumes that are there can make up for the data that isn't. Counts articles, soo
+    /// it's a good guess rather than a promise: a damaged article can cost a whole block.
+    pub fn repairable(&self) -> bool {
+        if self.data_articles_expected == 0 || self.recovery_articles_expected == 0 {
+            return false;
+        }
+        let missing =
+            (self.data_articles_expected - self.data_articles_seen).max(0) * 1000 / self.data_articles_expected;
+        let capacity = self.exact_repair_per_mille().or(self.repair_per_mille()).unwrap_or(0);
+        let left = capacity * self.recovery_articles_seen / self.recovery_articles_expected;
+        left >= missing
     }
 
     /// What the recovery blocks cover, in tenths of a percent, when the PAR2 set's been read.
@@ -128,7 +147,15 @@ pub fn contents_with(conn: &Connection, id: i64) -> Result<Contents> {
         let (filename, expected, seen) = file?;
         totals.files += 1;
         totals.articles_seen += seen;
-        totals.articles_expected += expected.unwrap_or(seen).max(seen);
+        let want = expected.unwrap_or(seen).max(seen);
+        totals.articles_expected += want;
+        if is_recovery_volume(&filename) {
+            totals.recovery_articles_seen += seen;
+            totals.recovery_articles_expected += want;
+        } else if !is_par2(&filename) {
+            totals.data_articles_seen += seen;
+            totals.data_articles_expected += want;
+        }
         if is_par2(&filename) {
             totals.par2_files += 1;
             totals.recovery_volumes += i64::from(is_recovery_volume(&filename));
@@ -315,6 +342,24 @@ mod tests {
         assert_eq!(c.repair_per_mille(), Some(100));
         assert_eq!(Contents::default().missing_per_mille(), None);
         assert_eq!(Contents::default().repair_per_mille(), None);
+    }
+
+    #[test]
+    fn repair_compares_missing_data_with_the_recovery_that_is_there() {
+        let holes = Contents {
+            data_articles_seen: 97,
+            data_articles_expected: 100,
+            recovery_articles_seen: 10,
+            recovery_articles_expected: 10,
+            data_bytes: 1000,
+            recovery_bytes: 100,
+            ..Contents::default()
+        };
+        assert!(holes.repairable(), "3% missing, 10% repairable");
+        let lost = Contents { recovery_articles_seen: 2, ..holes.clone() };
+        assert!(!lost.repairable(), "most of the recovery is gone too");
+        let none = Contents { recovery_articles_expected: 0, recovery_articles_seen: 0, ..holes };
+        assert!(!none.repairable());
     }
 
     #[test]
