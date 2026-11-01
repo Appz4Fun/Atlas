@@ -141,6 +141,16 @@ impl Stats {
         self.history.push(HistoryPoint { t, a: articles, b: bytes });
 
         if !group.is_empty() {
+            use crate::metrics::names::{ARTICLE_BYTES, ARTICLES, ARTICLES_SKIPPED, GROUP_LAST_INDEXED, RELEASES_SEEN};
+            // a blocked group's name never becomes a series
+            if !crate::filters::group_blocked(group) {
+                let labels = [("group", group)];
+                ARTICLES.inc(&labels, articles.max(0) as u64);
+                ARTICLE_BYTES.inc(&labels, bytes.max(0) as u64);
+                RELEASES_SEEN.inc(&labels, releases.max(0) as u64);
+                ARTICLES_SKIPPED.inc(&labels, skipped.max(0) as u64);
+                GROUP_LAST_INDEXED.set(&labels, t);
+            }
             self.groups_indexed.insert(group.to_string());
             let gs = self.group_stats.entry(group.to_string()).or_default();
             gs.articles += articles;
@@ -465,7 +475,9 @@ impl Scheduler {
 
         write_status(true, &groups_label(&groups, self.workers), &mode, idle, status, false, errors);
         let mut stats = self.stats.lock().unwrap();
-        stats.extra.insert("servers".into(), json!(self.ctx.pool.server_stats()));
+        let servers = self.ctx.pool.server_stats();
+        crate::metrics::report_servers(&servers);
+        stats.extra.insert("servers".into(), json!(servers));
         stats.extra.insert("groups_configured".into(), json!(groups.len()));
         stats.extra.insert("groups_blocked".into(), json!(self.blocked.lock().unwrap().len()));
         if let Some(stage) = self.stage.get() {
@@ -483,6 +495,7 @@ impl Scheduler {
         load["unsaved_headers"] = json!(self.ctx.pool.unsaved_headers());
         load["max_unsaved_headers"] = json!(self.ctx.pool.max_unsaved());
         stats.extra.insert("load".into(), load);
+        crate::metrics::report_indexer(&stats.extra, stats.error_count, idle);
         stats.write("", &mode, true, idle);
     }
 }
@@ -1081,6 +1094,11 @@ pub fn run() -> i32 {
     {
         let _ = signal_hook::flag::register(signal_hook::consts::SIGTERM, stop.clone());
         let _ = signal_hook::flag::register(signal_hook::consts::SIGINT, stop.clone());
+    }
+
+    crate::metrics::start(&config, crate::metrics::Role::Indexer);
+    if config.metrics.enabled {
+        crate::metrics::catalog::spawn(Duration::from_secs(config.metrics.catalog_every_secs), stop.clone());
     }
 
     index(config, stop, Some(writing))

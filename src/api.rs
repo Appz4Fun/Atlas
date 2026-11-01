@@ -344,6 +344,29 @@ fn get(args: &HashMap<String, String>) -> ApiResponse {
     }
 }
 
+/// What a request is called in metrics: only names from this list, soo no client can make new series.
+struct Endpoint {
+    label: &'static str,
+    function: &'static str,
+}
+
+fn endpoint_of(path: &str, query: &str) -> Endpoint {
+    let named = |label, function| Endpoint { label, function };
+    if path != "/api" {
+        return named("other", "api.other");
+    }
+    match parse_query(query).get("t").map(String::as_str) {
+        Some("caps") => named("caps", "api.caps"),
+        Some("get") => named("get", "api.get"),
+        Some("search") => named("search", "api.search"),
+        Some("tvsearch") => named("tvsearch", "api.tvsearch"),
+        Some("movie") => named("movie", "api.movie"),
+        Some("music" | "audio") => named("music", "api.music"),
+        Some("book") => named("book", "api.book"),
+        _ => named("other", "api.other"),
+    }
+}
+
 fn respond(request: Request, api_key: &str, fallback_host: &str) {
     let url = request.url().to_string();
     let (path, query) = url.split_once('?').unwrap_or((&url, ""));
@@ -357,11 +380,22 @@ fn respond(request: Request, api_key: &str, fallback_host: &str) {
     let base = format!("http://{host}");
 
     let is_get = matches!(request.method(), tiny_http::Method::Get | tiny_http::Method::Head);
+    let endpoint = endpoint_of(path, query);
+    let span = crate::metrics::span(endpoint.function);
     let resp = if is_get {
         handle(path, query, &base, api_key)
     } else {
         ApiResponse { status: 405, content_type: None, body: String::new(), headers: Vec::new() }
     };
+    if resp.status >= 500 {
+        span.failed();
+    }
+    drop(span);
+    let status = resp.status.to_string();
+    let labels = [("endpoint", endpoint.label), ("status", status.as_str())];
+    crate::metrics::names::API_REQUESTS.inc(&labels, 1);
+    crate::metrics::names::API_BYTES.inc(&[("endpoint", endpoint.label)], resp.body.len() as u64);
+    crate::metrics::function_bytes(endpoint.function, "sent", resp.body.len() as u64);
 
     let mut response = Response::from_string(resp.body).with_status_code(resp.status);
 
@@ -433,6 +467,14 @@ pub fn stop() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_client_cant_invent_an_endpoint_label() {
+        assert_eq!(endpoint_of("/api", "t=movie&q=x").label, "movie");
+        assert_eq!(endpoint_of("/api", "t=audio").label, "music");
+        assert_eq!(endpoint_of("/api", "t=whatever").label, "other");
+        assert_eq!(endpoint_of("/some/path", "t=movie").label, "other");
+    }
 
     #[test]
     fn query_parsing() {

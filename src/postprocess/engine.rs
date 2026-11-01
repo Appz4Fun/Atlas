@@ -157,6 +157,31 @@ struct Batch {
     stopped: bool,
 }
 
+/// One run of a step, a panic being an error like any other, with its numbers.
+fn run_step(step: &dyn Step, ctx: &mut StepCtx<'_>) -> Ran {
+    let span = crate::metrics::span(crate::metrics::step_function(step.name()));
+    let ran = match catch_unwind(AssertUnwindSafe(|| step.run(ctx))) {
+        Ok(Ok(outcome)) => Ran::Outcome(outcome),
+        Ok(Err(e)) => Ran::Error(e),
+        Err(panic) => Ran::Error(StepError::Retry(panic_text(panic))),
+    };
+    let result = match &ran {
+        Ran::Outcome(o) if o.wait_until.is_some() => "waiting",
+        Ran::Outcome(o) if o.matched => "matched",
+        Ran::Outcome(_) => "unmatched",
+        Ran::Error(StepError::Stopped) => "stopped",
+        Ran::Error(StepError::OutOfBudget) => "out_of_budget",
+        Ran::Error(StepError::Retry(_)) => "retry",
+        Ran::Error(StepError::Permanent(_)) => "permanent",
+        Ran::Error(StepError::Transient(_)) => "transient",
+    };
+    if matches!(result, "retry" | "permanent" | "transient") {
+        span.failed();
+    }
+    crate::metrics::names::STEP_RUNS.inc(&[("step", step.name()), ("result", result)], 1);
+    ran
+}
+
 /// How a step's run changed a visit.
 enum Ran {
     /// a result, or an error the lane acts on
@@ -576,11 +601,7 @@ impl Inner {
                 continue;
             }
             ctx.deadline = Instant::now() + STEP_DEADLINE;
-            let ran = match catch_unwind(AssertUnwindSafe(|| step.run(&mut ctx))) {
-                Ok(Ok(outcome)) => Ran::Outcome(outcome),
-                Ok(Err(e)) => Ran::Error(e),
-                Err(panic) => Ran::Error(StepError::Retry(panic_text(panic))),
-            };
+            let ran = run_step(step.as_ref(), &mut ctx);
             match ran {
                 Ran::Outcome(mut o) => {
                     batch.holds.extend(o.hold.take());
@@ -902,11 +923,7 @@ impl Inner {
                 deadline: Instant::now() + STEP_DEADLINE,
                 lane_can_fetch: step.needs() == Needs::Bodies,
             };
-            let ran = match catch_unwind(AssertUnwindSafe(|| step.run(&mut ctx))) {
-                Ok(Ok(outcome)) => Ran::Outcome(outcome),
-                Ok(Err(e)) => Ran::Error(e),
-                Err(panic) => Ran::Error(StepError::Retry(panic_text(panic))),
-            };
+            let ran = run_step(step.as_ref(), &mut ctx);
             let now = chrono::Utc::now().timestamp();
             let attempts_before = row.net_attempts;
             match ran {

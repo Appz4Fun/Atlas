@@ -177,6 +177,7 @@ compress = false
 | `predb` | see below | A catalogue of scene and P2P titles, off by default. See [PreDB](#predb). |
 | `category` | see below | How releases get a category. See [Categories](#categories). |
 | `media` | see below | TV and movie IDs, with every provider off. See [TV and movie IDs](#tv-and-movie-ids). |
+| `metrics` | see below | Prometheus metrics, off by default. See [Metrics](#metrics). |
 | `max_unsaved_headers` | `500000` | Headers the indexer fetches ahead of saving them, over all groups at once. This bounds its memory: 500,000 headers take about 0.3 GB. A header request waits for room before it goes out, and its room comes back once its slice is saved. Raise it if the Bottleneck page shows it full while the database writers and connections have time to spare. Set below `request_size`, header requests are cut down to it, which makes them small and slow. |
 
 Atlas keeps any other keys you add to the file when it saves it.
@@ -242,6 +243,7 @@ The background indexer reads `config.toml` again every 5 seconds:
 - New groups, `index_mode`, `batch_size`, `request_size`, and `auto_run_compact` apply immediately.
 - Changes to servers, logins, `connections`, `parallel_groups`, or `max_unsaved_headers` rebuild the connection pool. A login you fix in the file, or in **Settings > Usenet servers**, takes effect within a few seconds.
 - `api_host` and `api_port` apply when the API restarts. Restart Atlas, or use **Settings > Change API port**.
+- `metrics` applies when Atlas restarts.
 
 ### Measure connection limits
 
@@ -752,6 +754,35 @@ Each `<item>` contains:
 
 Shows releases due now, waiting for the network, and failed; how far the walks over existing releases have got; steps done, matched, and retried; rejections by reason; and bodies against their budget.
 
+## Metrics
+
+Atlas can serve Prometheus metrics. It's off by default. To turn it on:
+
+```toml
+[metrics]
+enabled = true
+host = "0.0.0.0"
+```
+
+| Key | Default | Meaning |
+|---|---|---|
+| `enabled` | `false` | Serve `/metrics` and `/healthz`, and walk the catalog. |
+| `host` | `127.0.0.1` | Address to listen on. The metrics have no login, and they name your groups and servers, so keep them off the internet. They never hold a password or API key. |
+| `indexer_port` | `9092` | Port of the background indexer's numbers. |
+| `api_port` | `9093` | Port of the menu and API process's numbers. |
+| `catalog_every_secs` | `1800` | Seconds between walks over every release, at least 60. |
+
+The indexer and the menu are separate processes, so each has its own port. A process's counters start over when it does, which Prometheus rate functions expect. If its port is still held when it starts, for example by the old process on its way out, it keeps trying every 5 seconds and indexing goes on meanwhile.
+
+Totals about what is stored, such as categories, sizes, groups, release groups, and PreDB matches, take a walk over every release. The walk runs in short reads that hold no WAL. Its last result is saved in `metrics_catalog.json` and read back at a start, so a restart doesnt blank them, and the next walk waits out the rest of its interval. Blocked groups are left out of every metric.
+
+`deploy/victoriametrics/atlas-scrape.yml` is the scrape config. `deploy/grafana/dashboards.py` holds six Grafana dashboards as code. To put them in an Atlas folder:
+
+```sh
+python3 deploy/grafana/dashboards.py build
+GRAFANA_USER=admin GRAFANA_PASSWORD=... python3 deploy/grafana/dashboards.py push http://grafana:3000
+```
+
 ## Environment variables
 
 | Variable | Description |
@@ -826,6 +857,8 @@ CI (`.github/workflows/ci.yml`) checks formatting, runs clippy, and runs the tes
 | `src/search.rs` | Search across the shards. |
 | `src/postprocess/` | The stage releases go through after saving: rules, steps, the two lanes, purge, and reprocess. |
 | `src/api.rs`, `src/nzb.rs` | Newznab API and NZB building. |
+| `src/metrics/` | The registry, every metric's name, the `/metrics` listener, and the catalog walk. |
+| `deploy/` | The scrape config and the Grafana dashboards. |
 | `src/app.rs`, `src/ui.rs`, `src/groups_menu.rs`, `src/ai.rs` | The terminal menus and AI search. |
 | `src/dashboard.rs`, `src/stats_dashboard.rs` | The live dashboard and the stats dashboard. |
 | `src/profile.rs` | Timing counters for `ATLAS_PROFILE`, and the load counters behind the Bottleneck page. |

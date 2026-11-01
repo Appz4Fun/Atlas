@@ -93,11 +93,13 @@ pub(crate) fn apply_one(
 }
 
 fn write(conn: &Connection, mut a: Applied, now: i64) -> rusqlite::Result<()> {
-    let row: Option<(Option<String>, i64)> = conn
-        .prepare_cached("select display_name, coalesce(name_source, 0) from releases where id = ?")?
-        .query_row([a.release_id], |r| Ok((r.get(0)?, r.get(1)?)))
+    let row: Option<(Option<String>, i64, bool)> = conn
+        .prepare_cached(
+            "select display_name, coalesce(name_source, 0), coalesce(is_obfuscated, 0) != 0 from releases where id = ?",
+        )?
+        .query_row([a.release_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
         .optional()?;
-    let Some((mut current, mut source)) = row else {
+    let Some((mut current, mut source, was_obfuscated)) = row else {
         // gone while it ran. the trigger took its rows
         return Ok(());
     };
@@ -131,6 +133,12 @@ fn write(conn: &Connection, mut a: Applied, now: i64) -> rusqlite::Result<()> {
         }
         if name.display_name.as_ref().is_some_and(|d| current.as_ref() != Some(d)) {
             a.clear |= a.rename_clears;
+            let from = crate::metrics::catalog::name_source_name(name.source);
+            crate::metrics::names::NAMES_APPLIED.inc(&[("source", from)], 1);
+            // the first real name an obfuscated post gets
+            if was_obfuscated && current.is_none() {
+                crate::metrics::names::DEOBFUSCATED.inc(&[("source", from)], 1);
+            }
             current = name.display_name.clone();
         }
         source = i64::from(name.source);

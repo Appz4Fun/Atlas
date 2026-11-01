@@ -59,6 +59,7 @@ impl Fetch for UreqFetch {
         let (status, retry_after, rate_reset) =
             (resp.status().as_u16(), header("retry-after"), header("x-ratelimit-reset"));
         let bytes = resp.body_mut().with_config().limit(MAX_BODY).read_to_vec().map_err(|e| e.to_string())?;
+        crate::metrics::function_bytes("predb.poll_feed", "received", bytes.len() as u64);
         let body = String::from_utf8(unpack(bytes)?).map_err(|e| e.to_string())?;
         Ok(HttpReply { status, retry_after, rate_reset, body })
     }
@@ -396,8 +397,21 @@ pub fn poll_source(
         first: true,
         rows: None,
     };
+    let span = crate::metrics::span("predb.poll_feed");
     let walked = walk(conn, &mut poller, &row, cfg);
     let answered_at = poller.now_after();
+    let polled = match &walked {
+        Ok(_) => "ok",
+        Err(TroubleOrDb::Db(_)) => "db_error",
+        Err(TroubleOrDb::Trouble(Trouble::Stopped)) => "stopped",
+        Err(TroubleOrDb::Trouble(Trouble::Failed(_))) => "failed",
+        Err(TroubleOrDb::Trouble(Trouble::RateLimited(_))) => "rate_limited",
+    };
+    if matches!(polled, "db_error" | "failed") {
+        span.failed();
+    }
+    drop(span);
+    crate::metrics::names::PREDB_FEED_POLLS.inc(&[("feed", spec.key), ("result", polled)], 1);
     conn.execute(
         "update feeds set last_rows = coalesce(?1, last_rows) where source = ?2",
         params![poller.rows, spec.id],
