@@ -27,6 +27,7 @@ type Seen = (String, Vec<(String, String)>);
 struct Shared {
     routes: Mutex<Vec<Route>>,
     requests: Mutex<Vec<Seen>>,
+    bodies: Mutex<Vec<String>>,
     stop: AtomicBool,
     /// answers wait while set
     held: AtomicBool,
@@ -48,7 +49,10 @@ impl FixtureServer {
         let on_thread = shared.clone();
         let thread = std::thread::spawn(move || {
             while !on_thread.stop.load(Relaxed) {
-                let Ok(Some(request)) = server.recv_timeout(Duration::from_millis(20)) else { continue };
+                let Ok(Some(mut request)) = server.recv_timeout(Duration::from_millis(20)) else { continue };
+                let mut body = String::new();
+                let _ = std::io::Read::read_to_string(request.as_reader(), &mut body);
+                on_thread.bodies.lock().unwrap().push(body);
                 let url = request.url().to_string();
                 let headers = request.headers().iter().map(|h| (h.field.to_string(), h.value.to_string())).collect();
                 on_thread.requests.lock().unwrap().push((url.clone(), headers));
@@ -73,6 +77,10 @@ impl FixtureServer {
     /// "path?query", in order.
     pub fn requests(&self) -> Vec<String> {
         self.shared.requests.lock().unwrap().iter().map(|(url, _)| url.clone()).collect()
+    }
+
+    pub fn body_of(&self, i: usize) -> String {
+        self.shared.bodies.lock().unwrap()[i].clone()
     }
 
     pub fn headers_of(&self, i: usize) -> Vec<(String, String)> {

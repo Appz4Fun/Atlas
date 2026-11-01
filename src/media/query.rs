@@ -59,11 +59,23 @@ impl IdSet {
 
 /// The IDs each provider can fill.
 pub fn id_params(cfg: &MediaConfig, body_budget_set: bool) -> IdParams {
-    let (tvmaze, tmdb, trakt) = (cfg.tvmaze.enabled, !cfg.tmdb.api_key.is_empty(), !cfg.trakt.client_id.is_empty());
+    let (maze_on, tmdb, trakt, tvdb) = (
+        cfg.tvmaze.enabled,
+        !cfg.tmdb.api_key.is_empty(),
+        !cfg.trakt.client_id.is_empty(),
+        !cfg.tvdb.api_key.is_empty(),
+    );
     let any = cfg.any_provider();
     let nfo = cfg.nfo && cfg.parse && body_budget_set;
     IdParams {
-        tv: IdSet { tvdb: any, rid: any, imdb: any, tvmaze, tmdb: tmdb || trakt, trakt },
+        tv: IdSet {
+            tvdb: any,
+            rid: maze_on || tmdb || trakt,
+            imdb: any,
+            tvmaze: maze_on || tvdb,
+            tmdb: tmdb || trakt || tvdb,
+            trakt,
+        },
         movie: IdSet { imdb: tmdb || trakt || nfo, tmdb: tmdb || trakt, trakt, ..IdSet::default() },
     }
 }
@@ -463,6 +475,15 @@ mod tests {
         only_tvmaze.tvmaze.enabled = true;
         let on = id_params(&only_tvmaze, false);
         assert_eq!(from_args("tvsearch", &args("tmdbid=401"), &on), None);
+    }
+
+    #[test]
+    fn tvdb_offers_only_what_it_fills() {
+        let mut cfg = MediaConfig::default();
+        cfg.tvdb.api_key = "K".into();
+        let on = id_params(&cfg, false);
+        let tv = IdSet { tvdb: true, imdb: true, tvmaze: true, tmdb: true, ..IdSet::default() };
+        assert_eq!(on, IdParams { tv, movie: IdSet::default() });
     }
 
     #[test]

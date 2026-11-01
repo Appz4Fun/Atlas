@@ -11,6 +11,7 @@ pub mod store;
 pub mod title;
 pub mod tmdb;
 pub mod trakt;
+pub mod tvdb;
 pub mod tvmaze;
 
 use std::collections::{HashMap, VecDeque};
@@ -72,6 +73,9 @@ fn build_providers(cfg: &MediaConfig) -> Vec<Arc<dyn Provider>> {
     }
     if !cfg.trakt.client_id.is_empty() {
         out.push(Arc::new(trakt::Trakt::new(&cfg.trakt)));
+    }
+    if !cfg.tvdb.api_key.is_empty() {
+        out.push(Arc::new(tvdb::Tvdb::new(&cfg.tvdb)));
     }
     out
 }

@@ -4,12 +4,13 @@ mod common;
 
 use std::time::{Duration, Instant};
 
-use atlas::config::{TmdbConfig, TraktConfig, TvmazeConfig};
+use atlas::config::{TmdbConfig, TraktConfig, TvdbConfig, TvmazeConfig};
 use atlas::media::http::Client;
 use atlas::media::resolve::{Answer, Ids, Provider, TitleQuery, Trouble};
 use atlas::media::title::Kind;
 use atlas::media::tmdb::Tmdb;
 use atlas::media::trakt::Trakt;
+use atlas::media::tvdb::Tvdb;
 use atlas::media::tvmaze::Tvmaze;
 use common::http::*;
 
@@ -339,4 +340,120 @@ fn trakt_miss_is_an_empty_list() {
 fn a_client_is_a_public_type() {
     // the two hooks a test needs are reachable, and nothing else about a client is
     let _ = Client::new("x", "http://127.0.0.1:1", 1);
+}
+
+fn tvdb(s: &FixtureServer) -> Tvdb {
+    Tvdb::new(&TvdbConfig {
+        api_key: "SECRETK".into(),
+        pin: String::new(),
+        requests_per_minute: FAST,
+        base_url: Some(s.base.clone()),
+    })
+}
+
+fn tvdb_routes() -> Vec<Route> {
+    vec![route("/login", fixture("tvdb_login.json")), route("/search", fixture("tvdb_search.json"))]
+}
+
+#[test]
+fn tvdb_logs_in_once_and_finds_its_ids() {
+    let s = FixtureServer::start(tvdb_routes());
+    let p = tvdb(&s);
+    let ids = found(p.find(&tv("Some Show")));
+    assert_eq!((ids.tvdb, ids.imdb, ids.tmdb, ids.tvmaze), (Some(3001), Some(100001), Some(401), Some(101)));
+    found(p.find(&tv("Some Show")));
+    let requests = s.requests();
+    assert_eq!(requests.iter().filter(|r| r.starts_with("/login")).count(), 1, "{requests:?}");
+    assert!(requests[1].contains("query=Some%20Show") && requests[1].contains("type=series"), "{requests:?}");
+    let headers = s.headers_of(1);
+    let auth = headers.iter().find(|(n, _)| n.eq_ignore_ascii_case("authorization")).map(|(_, v)| v.as_str());
+    assert_eq!(auth, Some("Bearer T0KEN"));
+}
+
+#[test]
+fn tvdb_matches_an_alias_a_country_and_a_year() {
+    let s = FixtureServer::start(tvdb_routes());
+    let p = tvdb(&s);
+    assert_eq!(found(p.find(&tv("Some Alias"))).tvdb, Some(3001));
+    let uk = TitleQuery { country: Some("UK"), ..tv("Some Show") };
+    assert_eq!(found(p.find(&uk)).tvdb, Some(3003), "gbr is UK");
+    let old = TitleQuery { year: Some(1990), ..tv("Some Show") };
+    assert_eq!(p.find(&old), Ok(Answer::NotFound));
+    assert_eq!(p.find(&tv("Another Thing")), Ok(Answer::NotFound));
+}
+
+#[test]
+fn tvdb_asks_only_for_tv() {
+    let s = FixtureServer::start(tvdb_routes());
+    assert!(tvdb(&s).asks(Kind::Tv) && !tvdb(&s).asks(Kind::Movie));
+}
+
+#[test]
+fn a_refused_tvdb_key_pauses_and_says_nothing_of_it() {
+    let s = FixtureServer::start(vec![status("/login", 401)]);
+    let answer = tvdb(&s).find(&tv("Some Show"));
+    let Err(Trouble::BadKey(t)) = &answer else { panic!("{answer:?}") };
+    near(*t, 3_600);
+    assert!(!format!("{answer:?}").contains("SECRETK"));
+}
+
+#[test]
+fn a_token_it_stops_taking_logs_in_again() {
+    let s = FixtureServer::start(tvdb_routes());
+    let p = tvdb(&s);
+    found(p.find(&tv("Some Show")));
+    s.set_routes(vec![route("/login", fixture("tvdb_login.json")), status("/search", 401)]);
+    assert!(matches!(p.find(&tv("Some Show")), Err(Trouble::BadKey(_))));
+    p.client().advance();
+    s.set_routes(tvdb_routes());
+    found(p.find(&tv("Some Show")));
+    assert_eq!(s.requests().iter().filter(|r| r.starts_with("/login")).count(), 2);
+}
+
+#[test]
+fn a_login_with_no_token_is_bad_not_a_miss() {
+    let s = FixtureServer::start(vec![route("/login", r#"{"status":"failure"}"#.into())]);
+    assert!(matches!(tvdb(&s).find(&tv("Some Show")), Err(Trouble::Bad(_))));
+}
+
+#[test]
+fn an_empty_tvdb_search_is_a_miss() {
+    let s = FixtureServer::start(vec![
+        route("/login", fixture("tvdb_login.json")),
+        route("/search", r#"{"data":[]}"#.into()),
+    ]);
+    assert_eq!(tvdb(&s).find(&tv("Some Show")), Ok(Answer::NotFound));
+}
+
+#[test]
+fn a_translated_name_matches() {
+    let item = serde_json::json!({"data": [{"name": "Originaltitel", "tvdb_id": "3001", "translations": {"eng": "Some Show", "fra": "Une Serie"}, "name_translated": "Another Name"}]});
+    let s = FixtureServer::start(vec![route("/login", fixture("tvdb_login.json")), route("/search", item.to_string())]);
+    let p = tvdb(&s);
+    assert_eq!(found(p.find(&tv("Some Show"))).tvdb, Some(3001));
+    assert_eq!(found(p.find(&tv("Une Serie"))).tvdb, Some(3001));
+    assert_eq!(found(p.find(&tv("Another Name"))).tvdb, Some(3001));
+}
+
+#[test]
+fn a_pin_goes_with_the_key_when_there_is_one() {
+    let s = FixtureServer::start(tvdb_routes());
+    found(tvdb(&s).find(&tv("Some Show")));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&s.body_of(0)).unwrap(),
+        serde_json::json!({"apikey": "SECRETK"})
+    );
+
+    let s = FixtureServer::start(tvdb_routes());
+    let p = Tvdb::new(&TvdbConfig {
+        api_key: "SECRETK".into(),
+        pin: "1234".into(),
+        requests_per_minute: FAST,
+        base_url: Some(s.base.clone()),
+    });
+    found(p.find(&tv("Some Show")));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&s.body_of(0)).unwrap(),
+        serde_json::json!({"apikey": "SECRETK", "pin": "1234"})
+    );
 }

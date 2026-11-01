@@ -679,6 +679,7 @@ Turn a provider on to fill in IDs, with no restart. Each title is asked once, ho
 | TVMaze | `media.tvmaze.enabled: true`. It needs no key. TV only. | TVMaze, TVDB, TVRage, IMDb | `tvdbid`, `imdbid`, `rid`, `tvmazeid` | none |
 | TMDB | `media.tmdb.api_key`, from your account's API settings on themoviedb.org. | TMDB, TVDB, TVRage, IMDb | `tvdbid`, `imdbid`, `rid`, `tmdbid` | `imdbid`, `tmdbid` |
 | Trakt | `media.trakt.client_id`, from an API app you create on trakt.tv. | Trakt, TVDB, TVRage, TMDB, IMDb | `tvdbid`, `imdbid`, `rid`, `tmdbid`, `traktid` | `imdbid`, `tmdbid`, `traktid` |
+| TheTVDB | `media.tvdb.api_key`, from your account on thetvdb.com, and `media.tvdb.pin` for a user-supported key. TV only. | TVDB, IMDb, TMDB, TVMaze | `tvdbid`, `imdbid`, `tvmazeid`, `tmdbid` | none |
 
 **An NFO needs no provider.** Once `postprocess.body_fetches_per_minute` is set, `media.nfo` reads a movie's IMDb ID from its NFO: one body of at most 64 KiB, and only for a movie with no IMDb ID yet. That also adds `imdbid` to `movie-search`.
 
@@ -706,6 +707,7 @@ client_id = "your-id"
 | `tvmaze.requests_per_minute` | `90` | At most 120. |
 | `tmdb.requests_per_minute` | `240` | At most 3,000. |
 | `trakt.requests_per_minute` | `120` | At most 200. |
+| `tvdb.requests_per_minute` | `120` | At most 600. |
 
 A provider that's down or over its limit pauses for its own wait, up to an hour. Nothing else stops, and no title is marked as missing. Its answers live in `atlas.media.db`, next to the shards, and the IDs live on the releases, so deleting that file loses no search. To correct a wrong match, stop the indexer, delete the title's row from `media_titles`, start it, and run `atlas --reprocess --step media_lookup`.
 
@@ -843,7 +845,7 @@ The Rust port, with multi-server parallel indexing, the async NNTP client, the s
 
 The rule for articles obfuscated per article, the collection regexes and cleaner, the release rules, the rules for choosing what to read in a release, the naming regexes and name fixing, the PreDB feeds and matching rules, and the category rules and lists are ported from [newznab-tmux](https://github.com/xbmc4lyfe/newznab-tmux), GPLv3. 7z headers are decoded with [lzma-rs](https://github.com/gendx/lzma-rs), MIT.
 
-The title parsing, the candidate scoring, and the order of ID providers are ported from [newznab-tmux](https://github.com/NNTmux/newznab-tmux), GPLv3. This product uses the TMDB API but is not endorsed or certified by TMDB. TV data comes from [TVMaze](https://www.tvmaze.com), CC BY-SA, and from [Trakt](https://trakt.tv).
+The title parsing, the candidate scoring, and the order of ID providers are ported from [newznab-tmux](https://github.com/NNTmux/newznab-tmux), GPLv3. This product uses the TMDB API but is not endorsed or certified by TMDB. TV data comes from [TVMaze](https://www.tvmaze.com), CC BY-SA, from [Trakt](https://trakt.tv), and from [TheTVDB](https://thetvdb.com): metadata provided by TheTVDB, please consider adding missing information or subscribing.
 
 ## License
 
