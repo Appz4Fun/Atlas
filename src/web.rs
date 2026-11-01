@@ -416,7 +416,7 @@ impl Search {
                 .collect();
             choices = next;
         }
-        choices
+        choices.iter().map(|words| words.trim().to_string()).collect()
     }
 
     /// Every spelling's results taken in turn, or the one search there is. Taking them in turn keeps a row's place as
@@ -2074,10 +2074,10 @@ mod tests {
     fn filters_come_from_the_list_and_stay_in_links() {
         let s = Search::from_args(&parse_query("q=x&filters=DV,<b>,Remux"));
         assert_eq!(s.filters, ["DV", "Remux"]);
-        assert_eq!(s.words(), "x DV Remux");
+        assert_eq!(s.word_choices()[0], "x DV Remux");
         assert_eq!(s.query("2040", 0), "q=x&cat=2040&filters=DV%2CRemux");
         let hide = Search::from_args(&parse_query("filters=Hide%20copies"));
-        assert_eq!(hide.words(), "", "not a word to look for");
+        assert_eq!(hide.word_choices(), [""], "not a word to look for");
         let links = s.filter_links();
         assert_eq!(links.matches("aria-current").count(), 2, "{links}");
         assert!(!filter_matches("DV", &release_tags::parse("A.1999.DVDRip.XviD-X")), "not a DVD");

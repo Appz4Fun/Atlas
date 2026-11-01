@@ -450,7 +450,10 @@ pub fn for_title(cfg: &MediaConfig, kind: i64, ids: &Ids) -> Option<Details> {
                     return Some(fresh);
                 }
                 // a failure says nothing about the title
-                Err(()) => return kept,
+                Err(()) => {
+                    let own = ids.tvdb.filter(|_| kind == Kind::Tv as i64);
+                    return kept.or_else(|| read(&conn, kind, -own?).ok().flatten());
+                }
                 // gone from TMDB: TheTVDB may still have it
                 Ok(None) => {}
             }
