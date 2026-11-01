@@ -97,7 +97,7 @@ Everything below goes on the release page in the web UI, and into the Newznab AP
 - [ ] `media_titles` only keeps ids and a found title. Store the metadata as well: overview, genres, runtime, cast, network, status, and first air or release date.
 - [ ] **Blu-ray release date:** TMDB's release dates list has physical releases by country. Show it next to the theatrical date.
 - [ ] **Posters and backdrops.** Keep the image paths and show them on the release page and as thumbnails in results. The page's CSP needs `img-src` for the image host, or Atlas has to serve the images itself. Serving them keeps the UI working with no internet and stops viewers' browsers calling out, so prefer that, with a size-limited cache.
-- [ ] **Links:** IMDb, TMDB, TheTVDB, Trakt and TVmaze. Fix the id formats and URL shapes per kind while here: the TMDB and TheTVDB links on the release page assume one kind.
+- [ ] **Links:** IMDb, TMDB, TheTVDB, Trakt and TVmaze.
 - [ ] Keep requests inside each provider's rate limits, and refresh on a schedule through the existing `next_check`.
 
 ### Ratings
