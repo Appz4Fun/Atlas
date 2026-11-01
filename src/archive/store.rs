@@ -111,14 +111,14 @@ fn read_encryption(
     conn: &Connection,
     schema: &str,
     release_id: i64,
-) -> (Option<Encryption>, bool, Option<super::rar::PasswordCheck>) {
+) -> (Option<Encryption>, bool, Option<super::PasswordTest>) {
     let sql =
         format!("select encryption, names_hidden, password_check from {schema}.archive_release where release_id = ?");
     conn.query_row(&sql, [release_id], |r| {
         Ok((
             r.get::<_, Option<i64>>(0)?.and_then(Encryption::from_code),
             r.get::<_, Option<i64>>(1)?.unwrap_or(0) != 0,
-            r.get::<_, Option<Vec<u8>>>(2)?.as_deref().and_then(super::rar::PasswordCheck::from_bytes),
+            r.get::<_, Option<Vec<u8>>>(2)?.as_deref().and_then(super::PasswordTest::from_bytes),
         ))
     })
     .unwrap_or((None, false, None))
@@ -153,7 +153,7 @@ pub struct InnerView {
     pub password: Option<Password>,
     pub encryption: Option<Encryption>,
     pub names_hidden: bool,
-    pub password_check: Option<super::rar::PasswordCheck>,
+    pub password_check: Option<super::PasswordTest>,
     pub files: Vec<InnerFileRow>,
 }
 

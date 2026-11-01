@@ -257,6 +257,23 @@ const MAX_EARLIER_FOR_COPIES: i64 = 2_000;
 const FILTERS: &[&str] = &["2160p", "1080p", "DV", "HDR", "Remux", "WEB-DL", "BluRay", HIDE_COPIES];
 const HIDE_COPIES: &str = "Hide copies";
 
+/// How many searches a set of filters can turn into.
+const MAX_WORD_CHOICES: usize = 12;
+
+/// How names write what a filter asks. The search goes by word prefix, soo `HDR` covers `HDR10`.
+fn filter_spellings(filter: &str) -> &'static [&'static str] {
+    match filter {
+        "2160p" => &["2160p", "4k", "UHD"],
+        "1080p" => &["1080p"],
+        "DV" => &["DV", "DoVi", "DolbyVision", "Dolby.Vision"],
+        "HDR" => &["HDR"],
+        "Remux" => &["Remux"],
+        "WEB-DL" => &["WEB-DL", "WEBDL", "WEB"],
+        "BluRay" => &["BluRay", "Blu-Ray", "BDRip", "BRRip"],
+        _ => &[],
+    }
+}
+
 /// Whether a name's tags say what a filter asks. The search itself goes by word prefix, soo "DV" finds DVDRip too.
 fn filter_matches(filter: &str, tags: &release_tags::Tags) -> bool {
     let quality = tags.quality.as_deref().unwrap_or_default();
@@ -354,6 +371,43 @@ impl Search {
         self.query_with(cat, offset, &self.filters)
     }
 
+    /// Each way of writing what the filters ask for, as words to search. `filter_matches` checks what comes back.
+    fn word_choices(&self) -> Vec<String> {
+        let mut choices = vec![self.q.clone()];
+        for filter in self.filters.iter().filter(|f| **f != HIDE_COPIES) {
+            let written = filter_spellings(filter);
+            let next: Vec<String> = choices
+                .iter()
+                .flat_map(|words| written.iter().map(move |spelling| format!("{words} {spelling}")))
+                .take(MAX_WORD_CHOICES)
+                .collect();
+            choices = next;
+        }
+        choices
+    }
+
+    /// Every spelling's results merged, newest first, or the one search there is.
+    fn search(&self, filter: Option<&crate::category::CatFilter>, from: i64, count: i64) -> Result<Vec<ReleaseRow>, String> {
+        let one = |words: &str, from: i64, count: i64| {
+            if self.fields.any() {
+                field_search::find(&self.fields, words, filter, from, count).map_err(|e| e.to_string())
+            } else {
+                find_releases(words, filter, from, count).map_err(|e| e.to_string())
+            }
+        };
+        let choices = self.word_choices();
+        if let [only] = choices.as_slice() {
+            return one(only, from, count);
+        }
+        let mut merged: HashMap<i64, ReleaseRow> = HashMap::new();
+        for words in &choices {
+            merged.extend(one(words, 0, from + count)?.into_iter().map(|r| (r.id, r)));
+        }
+        let mut rows: Vec<ReleaseRow> = merged.into_values().collect();
+        rows.sort_by_key(|r| std::cmp::Reverse(r.id));
+        Ok(rows.into_iter().skip(from as usize).take(count as usize).collect())
+    }
+
     /// The words to look for: the box, and what the filters add to it.
     fn words(&self) -> String {
         let mut words = self.q.clone();
@@ -391,11 +445,7 @@ impl Search {
     fn body(&self) -> String {
         let filter = parse_filter(&self.cat);
         let (from, count) = if self.sort.is_some() { (0, SORT_WINDOW) } else { (self.offset, PAGE_SIZE) };
-        let searched = if self.fields.any() {
-            field_search::find(&self.fields, &self.words(), filter.as_ref(), from, count)
-        } else {
-            find_releases(&self.words(), filter.as_ref(), from, count)
-        };
+        let searched = self.search(filter.as_ref(), from, count);
         let found = match searched {
             Ok(found) => found,
             Err(e) => {
@@ -443,12 +493,7 @@ impl Search {
             if self.sort.is_none() && self.offset > 0 {
                 let earlier = self.offset.min(MAX_EARLIER_FOR_COPIES);
                 let start = self.offset - earlier;
-                before = if self.fields.any() {
-                    field_search::find(&self.fields, &self.words(), filter.as_ref(), start, earlier)
-                } else {
-                    find_releases(&self.words(), filter.as_ref(), start, earlier)
-                }
-                .unwrap_or_default();
+                before = self.search(filter.as_ref(), start, earlier).unwrap_or_default();
             }
             let shown = before.iter().filter(|r| {
                 let tags = release_tags::parse(&r.name);
@@ -1545,6 +1590,7 @@ fn poster(args: &HashMap<String, String>) -> ApiResponse {
 
 fn password_fact(inner: &crate::archive::store::InnerView, hint: &release_info::PasswordHint) -> String {
     let verdict = match inner.password_check.and_then(|check| check.accepts(&hint.password)) {
+        Some(true) if inner.password_check.is_some_and(|check| !check.certain()) => tag("tag-ok", "PROBABLY WORKS"),
         Some(true) => tag("tag-ok", "WORKS"),
         Some(false) => tag("tag-bad", "WRONG"),
         None => ", not tried".to_string(),
