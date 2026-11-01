@@ -15,10 +15,10 @@ use std::time::{Duration, Instant};
 use rusqlite::{Connection, params};
 
 use super::names::*;
-use super::{Family, label_key};
+use super::{Family, OTHER, label_key};
 use crate::category::{self, UNCATEGORIZED};
 use crate::db;
-use crate::naming::NameSource;
+use crate::naming::{Grade, NameSource, judge};
 use crate::paths;
 use crate::store;
 
@@ -33,7 +33,9 @@ const RETRY: Duration = Duration::from_secs(5 * 60);
 /// series for groups and release groups: the rest are summed into `(other)`
 const TOP_GROUPS: usize = 100;
 const TOP_RELEASE_GROUPS: usize = 150;
-const OTHER: &str = "(other)";
+/// PreDB categories published, and kept during a walk: feeds and imports can bring any number
+const TOP_PREDB_CATEGORIES: usize = 200;
+const MAX_PREDB_CATEGORIES: usize = 10_000;
 /// titles held during a walk before asking the PreDB file for their feeds
 const MAX_TITLES: usize = 100_000;
 /// release group names kept during a walk; past this the ones seen once go
@@ -219,7 +221,12 @@ impl Tally {
         self.nzb_ready += u64::from(row.parts > 0);
         self.named += u64::from(row.named);
         self.still_obfuscated += u64::from(row.obfuscated && !row.named);
-        *self.name_sources.entry(name_source_label(row.name_source)).or_default() += 1;
+        // an inline name has no source on its row, see `naming::effective_source`
+        let source = match row.name_source {
+            None if row.named && judge(row.name) >= Grade::Weak => Some(NameSource::InlineBody as i64),
+            source => source,
+        };
+        *self.name_sources.entry(name_source_label(source)).or_default() += 1;
 
         let category = row.category.unwrap_or(UNCATEGORIZED);
         let root = category::root_of(category);
@@ -241,7 +248,11 @@ impl Tally {
             in_root.0 += 1;
             self.predb_matched += 1;
             *self.predb_kinds.entry(kind).or_default() += 1;
-            *self.predb_categories.entry(predb_category.unwrap_or("none").to_string()).or_default() += 1;
+            let predb_category = predb_category.unwrap_or("none");
+            let known = self.predb_categories.len() < MAX_PREDB_CATEGORIES
+                || self.predb_categories.contains_key(predb_category);
+            let predb_category = if known { predb_category } else { OTHER };
+            *self.predb_categories.entry(predb_category.to_string()).or_default() += 1;
             *self.predb_titles.entry(title).or_default() += 1;
         } else {
             in_root.1 += 1;
@@ -344,7 +355,11 @@ impl Tally {
 
         CATALOG_PREDB_KIND
             .replace(self.predb_kinds.iter().map(|(k, n)| (one("kind", predb_kind_label(*k)), *n as f64)));
-        CATALOG_PREDB_CATEGORY.replace(self.predb_categories.iter().map(|(c, n)| (one("category", c), *n as f64)));
+        CATALOG_PREDB_CATEGORY.replace(
+            top_with_other(&self.predb_categories, TOP_PREDB_CATEGORIES)
+                .iter()
+                .map(|(c, n)| (one("category", c), *n as f64)),
+        );
         CATALOG_PREDB_FEED.replace(self.feeds.iter().map(|(f, n)| (one("feed", f), *n as f64)));
         CATALOG_PREDB_ROOT.replace(self.predb_roots.iter().flat_map(|(root, (yes, no))| {
             let root = category_label(*root);
@@ -395,6 +410,19 @@ impl Tally {
             Err(e) => println!("metrics: couldnt read the predb feeds: {e}"),
         }
     }
+}
+
+/// The `limit` biggest, and the rest summed as `(other)`.
+fn top_with_other(counts: &BTreeMap<String, u64>, limit: usize) -> Vec<(String, u64)> {
+    let mut sorted: Vec<(&String, &u64)> = counts.iter().filter(|(name, _)| name.as_str() != OTHER).collect();
+    sorted.sort_by_key(|(_, n)| std::cmp::Reverse(**n));
+    let (top, rest) = sorted.split_at(sorted.len().min(limit));
+    let mut out: Vec<(String, u64)> = top.iter().map(|(name, n)| ((*name).clone(), **n)).collect();
+    let other = counts.get(OTHER).copied().unwrap_or(0) + rest.iter().map(|(_, n)| **n).sum::<u64>();
+    if other > 0 {
+        out.push((OTHER.to_string(), other));
+    }
+    out
 }
 
 fn has_table(conn: &Connection, table: &str) -> rusqlite::Result<bool> {
@@ -639,6 +667,34 @@ mod tests {
         let kept: u64 = tally.release_groups.values().sum();
         assert_eq!(kept + tally.release_groups_evicted, 9, "nothing is lost");
         assert!(tally.release_groups_evicted > 0);
+    }
+
+    #[test]
+    fn past_the_limit_categories_add_up_under_other() {
+        let counts =
+            BTreeMap::from([("a".to_string(), 5), ("b".to_string(), 3), ("c".to_string(), 1), (OTHER.to_string(), 2)]);
+        assert_eq!(top_with_other(&counts, 1), vec![("a".to_string(), 5), (OTHER.to_string(), 6)]);
+    }
+
+    #[test]
+    fn an_inline_name_is_told_from_the_posted_one() {
+        let row = |name, named| Row {
+            group: "alt.binaries.test",
+            size: 0,
+            complete: true,
+            parts: 1,
+            obfuscated: true,
+            named,
+            name_source: None,
+            name,
+            category: None,
+            predb: None,
+        };
+        let mut tally = Tally::default();
+        tally.add(&row("Some.Movie.2024.1080p.WEB-DL.x264-GROUP", true));
+        tally.add(&row("abcdef0123456789", false));
+        assert_eq!(tally.name_sources["inline_body"], 1);
+        assert_eq!(tally.name_sources["posted"], 1);
     }
 
     #[test]

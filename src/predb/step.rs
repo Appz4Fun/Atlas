@@ -227,8 +227,8 @@ impl Step for PredbMatch {
             super::matcher::Kind::Hash => "hash",
             super::matcher::Kind::InnerFile => "inner_file",
         };
-        let predb_category = t.category.as_deref().unwrap_or("none");
-        crate::metrics::names::PREDB_MATCHES.inc(&[("kind", how), ("category", predb_category)], 1);
+        let predb_category = crate::metrics::predb_category_label(t.category.as_deref().unwrap_or("none"));
+        crate::metrics::names::PREDB_MATCHES.inc(&[("kind", how), ("category", &predb_category)], 1);
         let known: Option<i64> = ctx
             .conn()
             .prepare_cached("select title_id from predb_match where release_id = ?1")

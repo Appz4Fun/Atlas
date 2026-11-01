@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use atlas::metrics::{self, Role, catalog};
 use atlas::nntp::Pool;
+use atlas::parser::{Article, Release};
 use atlas::{db, store};
 use common::{GROUP, Server, mock, post, spawn_server, yenc_body};
 use rusqlite::params;
@@ -243,6 +244,35 @@ fn a_shard_out_of_the_way_fails_the_walk_instead_of_undercounting() {
     assert!(catalog::scan(&main, &AtomicBool::new(false)).unwrap().is_some());
     std::fs::remove_file(store::shard_path(&main, 3)).unwrap();
     assert!(catalog::scan(&main, &AtomicBool::new(false)).is_err());
+}
+
+#[test]
+fn an_inline_name_counts_once_however_often_it_is_saved() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = dir.path().join("atlas.db");
+    db::create_db_at(&main).unwrap();
+    let release = |id: &str, display: &str| Release {
+        name: "abcdef0123456789".into(),
+        group: "alt.binaries.test".into(),
+        display_name: Some(display.into()),
+        is_obfuscated: true,
+        articles: vec![Article {
+            message_id: id.into(),
+            subject: "\"abcdef0123456789\" yEnc (1/1)".into(),
+            filename: Some("abcdef0123456789".into()),
+            part: Some(1),
+            total_parts: Some(1),
+            bytes: 10,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    store::save(&main, &[release("<a@x>", "Real.Name-GRP")]).unwrap();
+    store::save(&main, &[release("<b@x>", "Real.Name-GRP")]).unwrap();
+    store::save(&main, &[release("<c@x>", "Better.Name-GRP")]).unwrap();
+    let text = metrics::render();
+    assert_eq!(value(&text, "atlas_names_applied_total{source=\"inline_body\"}"), Some(2.0), "{text}");
+    assert_eq!(value(&text, "atlas_deobfuscated_total{source=\"inline_body\"}"), Some(1.0), "{text}");
 }
 
 #[test]

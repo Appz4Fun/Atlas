@@ -11,10 +11,10 @@ pub mod names;
 mod report;
 mod server;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering::Relaxed};
-use std::sync::{Arc, LazyLock, RwLock};
+use std::sync::{Arc, LazyLock, Mutex, RwLock};
 use std::time::Instant;
 
 pub use report::{Live, report_errors, report_indexer, report_servers};
@@ -241,6 +241,31 @@ pub fn timed<T, E>(function: &'static str, f: impl FnOnce() -> Result<T, E>) -> 
     result
 }
 
+/// The label for what's left past a limit on series.
+pub(crate) const OTHER: &str = "(other)";
+
+/// PreDB category labels kept: feeds and imports can bring any number of them.
+const MAX_PREDB_CATEGORIES: usize = 200;
+
+/// `value`, or `(other)` once `limit` others have taken their places.
+fn capped(seen: &Mutex<BTreeSet<String>>, limit: usize, value: &str) -> String {
+    let mut seen = seen.lock().unwrap();
+    if seen.contains(value) {
+        return value.to_string();
+    }
+    if seen.len() >= limit {
+        return OTHER.to_string();
+    }
+    seen.insert(value.to_string());
+    value.to_string()
+}
+
+/// The label for a PreDB category in `atlas_predb_matches_total`.
+pub fn predb_category_label(category: &str) -> String {
+    static SEEN: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+    capped(&SEEN, MAX_PREDB_CATEGORIES, category)
+}
+
 /// when this process's numbers began, for `atlas_process_start_time_seconds`
 pub(crate) static STARTED_AT: AtomicI64 = AtomicI64::new(0);
 
@@ -338,6 +363,15 @@ mod tests {
         let out = render();
         assert!(out.contains("atlas_function_errors_total{function=\"test.timed_ok\"} 0\n"), "{out}");
         assert!(out.contains("atlas_function_errors_total{function=\"test.timed_err\"} 1\n"), "{out}");
+    }
+
+    #[test]
+    fn a_label_from_outside_stops_at_its_limit() {
+        let seen = Mutex::new(BTreeSet::new());
+        assert_eq!(capped(&seen, 2, "a"), "a");
+        assert_eq!(capped(&seen, 2, "b"), "b");
+        assert_eq!(capped(&seen, 2, "c"), OTHER);
+        assert_eq!(capped(&seen, 2, "a"), "a");
     }
 
     #[test]
