@@ -83,5 +83,10 @@
         "max_pages_per_poll": 3,
         "history_pages": 0,
         "late_per_second": 1
+    },
+    "category": {
+        "enabled": true,
+        "foreign": true,
+        "web_dl": false
     }
 }

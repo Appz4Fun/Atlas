@@ -7,6 +7,7 @@ pub mod archive;
 pub mod atomic;
 pub mod bg_indexer;
 pub mod blob;
+pub mod category;
 pub mod chunks;
 pub mod collections;
 pub mod compact;
