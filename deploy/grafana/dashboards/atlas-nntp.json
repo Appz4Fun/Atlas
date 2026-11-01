@@ -1469,7 +1469,7 @@
    },
    "targets": [
     {
-     "expr": "increase(atlas_nntp_failures_total{server=~\"$server\"}[$__range])",
+     "expr": "increase(atlas_nntp_failures_total{server=~\"$server\"}[$__range]) > 0",
      "legendFormat": "A",
      "editorMode": "code",
      "instant": true,
@@ -1482,7 +1482,7 @@
      }
     },
     {
-     "expr": "atlas_nntp_failures_total{server=~\"$server\"}",
+     "expr": "atlas_nntp_failures_total{server=~\"$server\"} > 0",
      "legendFormat": "B",
      "editorMode": "code",
      "instant": true,

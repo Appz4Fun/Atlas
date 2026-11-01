@@ -371,7 +371,7 @@ def nntp():
     b.row("Failures")
     b.graph("When failures hit, per server", [q(f"sum by (server) (increase(atlas_nntp_failures_total{{{sel},{REAL_FAILURES}}}[$__rate_interval]))", "{{server}}")], bars=True, w=12, description="Each bar is the failures in that slice of time.")
     b.graph("When failures hit, per kind", [q(f"sum by (kind) (increase(atlas_nntp_failures_total{{{sel},{REAL_FAILURES}}}[$__rate_interval]))", "{{kind}}")], bars=True, w=12)
-    b.table("Failures in range, server and kind", [q(f"increase(atlas_nntp_failures_total{{{sel}}}[$__range])", "A"), q(f"atlas_nntp_failures_total{{{sel}}}", "B"), q(f"atlas_nntp_last_failure_timestamp_seconds{{{sel}}} * 1000", "C")],
+    b.table("Failures in range, server and kind", [q(f"increase(atlas_nntp_failures_total{{{sel}}}[$__range]) > 0", "A"), q(f"atlas_nntp_failures_total{{{sel}}} > 0", "B"), q(f"atlas_nntp_last_failure_timestamp_seconds{{{sel}}} * 1000", "C")],
             {"server": ("Server", None), "kind": ("Kind", None), "Value #A": ("In range", "short"), "Value #B": ("Since restart", "short"), "Value #C": ("Last hit", "dateTimeAsIso")}, w=24, h=10, sort="In range",
             description="no_such_article and no_such_group are ordinary answers; the panels above leave them out.")
     b.row("Commands")
@@ -410,7 +410,7 @@ def functions():
     b.graph("Calls per second", [q(f"topk(15, sum by (function) (rate(atlas_function_duration_seconds_count{{{sel}}}[5m])))", "{{function}}")])
     b.graph("95th percentile", [q(f"topk(15, histogram_quantile(0.95, sum by (function, le) (rate(atlas_function_duration_seconds_bucket{{{sel}}}[5m]))))", "{{function}}")], "s")
     b.graph("Running now", [q(f"topk(15, sum by (function) (atlas_function_in_progress{{{sel}}}))", "{{function}}")])
-    b.graph("Errors per second", [q(f"sum by (function) (rate(atlas_function_errors_total{{{sel}}}[5m]))", "{{function}}")])
+    b.graph("Errors per second", [q(f"sum by (function) (rate(atlas_function_errors_total{{{sel}}}[5m])) > 0", "{{function}}")])
     b.heatmap("Heat map: call lengths", f'sum by (le) (increase(atlas_function_duration_seconds_bucket{{{sel}}}[$__rate_interval]))', unit="s")
     b.row("What takes the most bandwidth")
     b.bars("Most bytes in range", [q(f"topk(20, sum by (function) (increase(atlas_function_bytes_total{{{sel}}}[$__range])))", "{{function}}", instant=True)], "bytes")

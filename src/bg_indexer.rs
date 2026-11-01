@@ -495,7 +495,12 @@ impl Scheduler {
         load["unsaved_headers"] = json!(self.ctx.pool.unsaved_headers());
         load["max_unsaved_headers"] = json!(self.ctx.pool.max_unsaved());
         stats.extra.insert("load".into(), load);
-        crate::metrics::report_indexer(&stats.extra, stats.error_count, idle);
+        let live = crate::metrics::Live {
+            pool: self.ctx.pool.id(),
+            stage: self.stage.get().is_some(),
+            predb: self.predb.get().is_some(),
+        };
+        crate::metrics::report_indexer(&stats.extra, stats.error_count, idle, live);
         stats.write("", &mode, true, idle);
     }
 }

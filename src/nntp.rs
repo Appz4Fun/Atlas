@@ -145,6 +145,23 @@ fn note_failure(server: &str, kind: &'static str) {
     NNTP_LAST_FAILURE.set(&labels, chrono::Utc::now().timestamp() as f64);
 }
 
+/// Every kind `atlas_nntp_failures_total` has, soo each series is there before its first failure.
+pub const FAILURE_KINDS: [&str; 13] = [
+    "timeout",
+    "connection_closed",
+    "io",
+    "protocol",
+    "decompress",
+    "no_such_article",
+    "no_such_group",
+    "too_many_connections",
+    "auth_rejected",
+    "reply_4xx",
+    "reply_5xx",
+    "reply_other",
+    "skipped_while_resting",
+];
+
 /// What kind of failure `e` is, for `atlas_nntp_failures_total`.
 fn failure_kind(e: &NntpError) -> &'static str {
     match e {
@@ -1324,6 +1341,10 @@ pub fn legacy_server_keys(servers: &[UsenetServer]) -> Vec<Vec<String>> {
 }
 
 impl Pool {
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
     pub fn new(servers: &[UsenetServer]) -> Pool {
         let keys = server_keys(servers);
         let legacy = legacy_server_keys(servers);

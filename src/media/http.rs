@@ -73,6 +73,11 @@ pub enum Reply {
     NotFound,
 }
 
+/// What `Client::outage` is for: no answer, or a 5xx.
+fn is_outage(sent: &Result<ureq::http::Response<ureq::Body>, ureq::Error>) -> bool {
+    sent.as_ref().map_or(true, |resp| resp.status().is_server_error())
+}
+
 impl Client {
     pub fn new(name: &'static str, base: &str, per_minute: i64) -> Client {
         Client {
@@ -128,21 +133,29 @@ impl Client {
         for (name, value) in headers {
             request = request.header(*name, *value);
         }
-        self.counted(&span, self.answer(request.call()))
+        let sent = request.call();
+        self.counted(&span, is_outage(&sent), self.answer(sent))
     }
 
     /// As `get`, with a body that can hold a key.
     pub fn post_json(&self, url: &str, body: &Value) -> Result<Reply, Trouble> {
         self.ready()?;
         let span = crate::metrics::span("media.request");
-        self.counted(&span, self.answer(self.agent.post(url).send_json(body)))
+        let sent = self.agent.post(url).send_json(body);
+        self.counted(&span, is_outage(&sent), self.answer(sent))
     }
 
-    fn counted(&self, span: &crate::metrics::Span, reply: Result<Reply, Trouble>) -> Result<Reply, Trouble> {
+    fn counted(
+        &self,
+        span: &crate::metrics::Span,
+        outage: bool,
+        reply: Result<Reply, Trouble>,
+    ) -> Result<Reply, Trouble> {
         let result = match &reply {
             Ok(Reply::Json(_)) => "ok",
             Ok(Reply::NotFound) => "not_found",
-            Err(Trouble::Paused(_)) => "paused",
+            // what it asked for, as opposed to a pause an outage brought on
+            Err(Trouble::Paused(_)) if !outage => "paused",
             Err(_) => {
                 span.failed();
                 "failed"

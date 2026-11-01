@@ -6,9 +6,9 @@ use std::sync::Mutex;
 
 use serde_json::{Map, Value};
 
-use super::label_key;
 use super::names::*;
-use crate::nntp::ServerStat;
+use super::{Family, label_key};
+use crate::nntp::{FAILURE_KINDS, ServerStat};
 
 const STATES: [&str; 4] = ["ok", "resting", "login rejected", "article only"];
 
@@ -41,7 +41,7 @@ fn total(v: &Value) -> u64 {
 }
 
 /// What each server's totals last read, and in which pool: a new pool starts them over, the counters go on.
-static SEEN: Mutex<BTreeMap<(String, &'static str), Seen>> = Mutex::new(BTreeMap::new());
+static SEEN: Mutex<BTreeMap<String, Seen>> = Mutex::new(BTreeMap::new());
 
 #[derive(Default)]
 struct Seen {
@@ -54,6 +54,13 @@ fn growth(seen: &mut Seen, pool: u64, now: u64) -> u64 {
     let before = if seen.pool == pool { seen.total } else { 0 };
     *seen = Seen { pool, total: now };
     now.saturating_sub(before)
+}
+
+/// Add what a total kept per pool has grown by to its counter.
+fn grow(family: &Family, labels: &[(&str, &str)], pool: u64, now: u64) {
+    let key = format!("{}{}", family.name, label_key(labels));
+    let by = growth(SEEN.lock().unwrap().entry(key).or_default(), pool, now);
+    family.inc(labels, by);
 }
 
 /// One `server` label's numbers: accounts on one host and port share a key.
@@ -104,12 +111,12 @@ pub fn report_servers(servers: &[ServerStat]) {
             states.push((labelled(state), f64::from(t.states.contains(&state))));
         }
         indexing.push((label_key(&[("server", server)]), f64::from(t.indexing)));
-        let mut seen = SEEN.lock().unwrap();
-        let mut grown =
-            |kind: &'static str, now: u64| growth(seen.entry((server.to_string(), kind)).or_default(), t.pool, now);
-        NNTP_HEADERS.inc(&[("server", server)], grown("headers", t.headers));
-        NNTP_TRAFFIC.inc(&[("server", server), ("kind", "wire")], grown("wire", t.wire));
-        NNTP_TRAFFIC.inc(&[("server", server), ("kind", "text")], grown("text", t.text));
+        grow(&NNTP_HEADERS, &[("server", server)], t.pool, t.headers);
+        grow(&NNTP_TRAFFIC, &[("server", server), ("kind", "wire")], t.pool, t.wire);
+        grow(&NNTP_TRAFFIC, &[("server", server), ("kind", "text")], t.pool, t.text);
+        for kind in FAILURE_KINDS {
+            NNTP_FAILURES.inc(&[("server", server), ("kind", kind)], 0);
+        }
     }
     NNTP_CONNECTIONS.replace(connections);
     NNTP_WAITING.replace(waiting);
@@ -122,8 +129,16 @@ pub fn report_errors(errors: u32) {
     INDEXER_ERRORS.set_total(&[], u64::from(errors));
 }
 
+/// Which of the readings in `extra` are of this pool's services: the last ones stay there until new ones
+/// replace them, and their totals start over with each pool.
+pub struct Live {
+    pub pool: u64,
+    pub stage: bool,
+    pub predb: bool,
+}
+
 /// `extra` is what the indexer puts in stats.json beside its own totals.
-pub fn report_indexer(extra: &Map<String, Value>, errors: u32, idle: bool) {
+pub fn report_indexer(extra: &Map<String, Value>, errors: u32, idle: bool, live: Live) {
     INDEXER_RUNNING.set(&[], 1.0);
     INDEXER_IDLE.set(&[], f64::from(idle));
     INDEXER_ERRORS.set_total(&[], u64::from(errors));
@@ -133,8 +148,12 @@ pub fn report_indexer(extra: &Map<String, Value>, errors: u32, idle: bool) {
     GROUPS_CONFIGURED.set(&[("state", "indexed")], int(get("groups_configured")) as f64);
     GROUPS_CONFIGURED.set(&[("state", "blocked")], int(get("groups_blocked")) as f64);
     report_load(get("load"));
-    report_stage(get("postprocess"));
-    report_predb(get("predb"));
+    if live.stage {
+        report_stage(get("postprocess"), live.pool);
+    }
+    if live.predb {
+        report_predb(get("predb"), live.pool);
+    }
     if let Some(titles) = get("media")["titles"].as_i64() {
         MEDIA_TITLES.set(&[], titles as f64);
     }
@@ -152,7 +171,7 @@ fn report_load(load: &Value) {
     UNSAVED_HEADERS.set(&[("state", "cap")], int(&load["max_unsaved_headers"]) as f64);
 }
 
-fn report_stage(stage: &Value) {
+fn report_stage(stage: &Value, pool: u64) {
     if !stage.is_object() {
         return;
     }
@@ -162,19 +181,19 @@ fn report_stage(stage: &Value) {
     STAGE_WALK.set(&[("state", "done")], int(&stage["walk"]["done"]) as f64);
     STAGE_WALK.set(&[("state", "total")], int(&stage["walk"]["total"]) as f64);
     for key in ["steps_done", "matched", "unmatched", "retries", "errors"] {
-        STAGE_EVENTS.set_total(&[("kind", key)], total(&stage[key]));
+        grow(&STAGE_EVENTS, &[("kind", key)], pool, total(&stage[key]));
     }
-    STAGE_EVENTS.set_total(&[("kind", "rows_walked")], total(&stage["walk"]["rows"]));
+    grow(&STAGE_EVENTS, &[("kind", "rows_walked")], pool, total(&stage["walk"]["rows"]));
     if let Some(rejected) = stage["rejected"].as_object() {
         for (reason, n) in rejected {
-            STAGE_REJECTED.set_total(&[("reason", reason)], total(n));
+            grow(&STAGE_REJECTED, &[("reason", reason)], pool, total(n));
         }
     }
-    STAGE_BODIES.set_total(&[], total(&stage["bodies"]));
-    STAGE_BODY_BYTES.set_total(&[], total(&stage["body_bytes"]));
+    grow(&STAGE_BODIES, &[], pool, total(&stage["bodies"]));
+    grow(&STAGE_BODY_BYTES, &[], pool, total(&stage["body_bytes"]));
 }
 
-fn report_predb(predb: &Value) {
+fn report_predb(predb: &Value, pool: u64) {
     if !predb.is_object() {
         return;
     }
@@ -182,7 +201,7 @@ fn report_predb(predb: &Value) {
     PREDB_FILE_BYTES.set(&[], int(&predb["file_bytes"]) as f64);
     PREDB_LATE_BEHIND.set(&[], int(&predb["late_behind"]) as f64);
     for key in ["titles", "reruns", "overflow", "out_of_budget", "errors"] {
-        PREDB_LATE.set_total(&[("kind", key)], total(&predb["late"][key]));
+        grow(&PREDB_LATE, &[("kind", key)], pool, total(&predb["late"][key]));
     }
     let Some(sources) = predb["sources"].as_array() else { return };
     for source in sources {

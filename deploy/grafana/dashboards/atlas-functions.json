@@ -764,7 +764,7 @@
    },
    "targets": [
     {
-     "expr": "sum by (function) (rate(atlas_function_errors_total{function=~\"$function\"}[5m]))",
+     "expr": "sum by (function) (rate(atlas_function_errors_total{function=~\"$function\"}[5m])) > 0",
      "legendFormat": "{{function}}",
      "editorMode": "code",
      "instant": false,

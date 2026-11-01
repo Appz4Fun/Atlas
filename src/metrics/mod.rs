@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, LazyLock, RwLock};
 use std::time::Instant;
 
-pub use report::{report_errors, report_indexer, report_servers};
+pub use report::{Live, report_errors, report_indexer, report_servers};
 pub use server::{Role, serve, serve_when_free, start};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -188,7 +188,10 @@ pub struct Span {
 }
 
 pub fn span(function: &'static str) -> Span {
-    names::FUNCTION_IN_PROGRESS.add(&[("function", function)], 1.0);
+    let labels = [("function", function)];
+    names::FUNCTION_IN_PROGRESS.add(&labels, 1.0);
+    // there from the first call: a series that starts at its first failure doesnt show it as an increase
+    names::FUNCTION_ERRORS.inc(&labels, 0);
     Span { function, started: Instant::now() }
 }
 
@@ -333,7 +336,7 @@ mod tests {
         assert_eq!(timed::<_, ()>("test.timed_ok", || Ok(1)), Ok(1));
         assert_eq!(timed::<i32, _>("test.timed_err", || Err("no")), Err("no"));
         let out = render();
-        assert!(!out.contains("atlas_function_errors_total{function=\"test.timed_ok\"}"), "{out}");
+        assert!(out.contains("atlas_function_errors_total{function=\"test.timed_ok\"} 0\n"), "{out}");
         assert!(out.contains("atlas_function_errors_total{function=\"test.timed_err\"} 1\n"), "{out}");
     }
 
