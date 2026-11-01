@@ -59,11 +59,16 @@ impl IdSet {
 
 /// The IDs each provider can fill.
 pub fn id_params(cfg: &MediaConfig, body_budget_set: bool) -> IdParams {
-    let (tvmaze, tmdb, trakt) = (cfg.tvmaze.enabled, !cfg.tmdb.api_key.is_empty(), !cfg.trakt.client_id.is_empty());
+    let (maze_on, tmdb, trakt, tvdb) = (
+        cfg.tvmaze.enabled,
+        !cfg.tmdb.api_key.is_empty(),
+        !cfg.trakt.client_id.is_empty(),
+        !cfg.tvdb.api_key.is_empty(),
+    );
     let any = cfg.any_provider();
     let nfo = cfg.nfo && cfg.parse && body_budget_set;
     IdParams {
-        tv: IdSet { tvdb: any, rid: any, imdb: any, tvmaze, tmdb: tmdb || trakt, trakt },
+        tv: IdSet { tvdb: any, rid: any, imdb: any, tvmaze: maze_on || tvdb, tmdb: tmdb || trakt || tvdb, trakt },
         movie: IdSet { imdb: tmdb || trakt || nfo, tmdb: tmdb || trakt, trakt, ..IdSet::default() },
     }
 }

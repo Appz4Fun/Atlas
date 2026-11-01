@@ -122,18 +122,32 @@ impl Client {
 
     /// `url` holds any key, soo it's never logged and never in a `Trouble`.
     pub fn get(&self, url: &str, headers: &[(&str, &str)]) -> Result<Reply, Trouble> {
+        self.ready()?;
+        let mut request = self.agent.get(url);
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        self.answer(request.call())
+    }
+
+    /// As `get`, with a body that can hold a key.
+    pub fn post_json(&self, url: &str, body: &Value) -> Result<Reply, Trouble> {
+        self.ready()?;
+        self.answer(self.agent.post(url).send_json(body))
+    }
+
+    fn ready(&self) -> Result<(), Trouble> {
         {
             let pause = self.pause.lock().unwrap();
             if pause.until > now_secs() {
                 return Err(Trouble::Paused(pause.until));
             }
         }
-        self.take_token()?;
-        let mut request = self.agent.get(url);
-        for (name, value) in headers {
-            request = request.header(*name, *value);
-        }
-        let Ok(mut resp) = request.call() else { return Err(self.outage()) };
+        self.take_token()
+    }
+
+    fn answer(&self, sent: Result<ureq::http::Response<ureq::Body>, ureq::Error>) -> Result<Reply, Trouble> {
+        let Ok(mut resp) = sent else { return Err(self.outage()) };
         match resp.status().as_u16() {
             200 => {
                 let body = resp.body_mut().with_config().limit(MAX_BODY).read_json::<Value>();

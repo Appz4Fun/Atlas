@@ -168,6 +168,13 @@ pub struct TvmazeConfig {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TvdbConfig {
+    pub api_key: String,
+    pub requests_per_minute: i64,
+    pub base_url: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TmdbConfig {
     pub api_key: String,
     pub requests_per_minute: i64,
@@ -181,7 +188,7 @@ pub struct TraktConfig {
     pub base_url: Option<String>,
 }
 
-/// The `media` object of config.json, see the README. Every provider is off until set.
+/// The `media` object of config.toml, see the README. Every provider is off until set.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MediaConfig {
     pub parse: bool,
@@ -191,6 +198,7 @@ pub struct MediaConfig {
     pub tvmaze: TvmazeConfig,
     pub tmdb: TmdbConfig,
     pub trakt: TraktConfig,
+    pub tvdb: TvdbConfig,
 }
 
 impl Default for MediaConfig {
@@ -203,13 +211,17 @@ impl Default for MediaConfig {
             tvmaze: TvmazeConfig { enabled: false, requests_per_minute: 90, base_url: None },
             tmdb: TmdbConfig { api_key: String::new(), requests_per_minute: 240, base_url: None },
             trakt: TraktConfig { client_id: String::new(), requests_per_minute: 120, base_url: None },
+            tvdb: TvdbConfig { api_key: String::new(), requests_per_minute: 120, base_url: None },
         }
     }
 }
 
 impl MediaConfig {
     pub fn any_provider(&self) -> bool {
-        self.tvmaze.enabled || !self.tmdb.api_key.is_empty() || !self.trakt.client_id.is_empty()
+        self.tvmaze.enabled
+            || !self.tmdb.api_key.is_empty()
+            || !self.trakt.client_id.is_empty()
+            || !self.tvdb.api_key.is_empty()
     }
 
     pub fn from_value(v: Option<&Value>) -> MediaConfig {
@@ -250,6 +262,10 @@ impl MediaConfig {
         c.trakt.client_id = text(trakt, "client_id").unwrap_or_default();
         rate(trakt, 200, &mut c.trakt.requests_per_minute);
         c.trakt.base_url = text(trakt, "base_url").filter(|u| !u.is_empty());
+        let tvdb = v.get("tvdb");
+        c.tvdb.api_key = text(tvdb, "api_key").unwrap_or_default();
+        rate(tvdb, 600, &mut c.tvdb.requests_per_minute);
+        c.tvdb.base_url = text(tvdb, "base_url").filter(|u| !u.is_empty());
         c
     }
 }
@@ -1152,6 +1168,12 @@ mod tests {
     #[test]
     fn a_client_id_turns_trakt_on() {
         assert!(MediaConfig::from_value(Some(&json!({"trakt": {"client_id": "ID"}}))).any_provider());
+    }
+
+    #[test]
+    fn a_key_turns_tvdb_on() {
+        assert!(MediaConfig::from_value(Some(&json!({"tvdb": {"api_key": "K"}}))).any_provider());
+        assert!(!MediaConfig::from_value(Some(&json!({"tvdb": {"api_key": " "}}))).any_provider());
     }
 
     #[test]

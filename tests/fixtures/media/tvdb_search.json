@@ -1,0 +1,5 @@
+{"status":"success","data":[
+ {"objectID":"series-9","name":"Some Other Show","tvdb_id":"3009","year":"2015","country":"usa","type":"series"},
+ {"objectID":"series-1","name":"Some Show","tvdb_id":"3001","year":"2015","country":"usa","type":"series","aliases":["Some Alias"],
+  "remote_ids":[{"id":"tt0100001","type":2,"sourceName":"IMDB"},{"id":"401","type":12,"sourceName":"TheMovieDB.com"},{"id":"101","type":19,"sourceName":"TV Maze"},{"id":"x","type":4,"sourceName":"Official Website"}]},
+ {"objectID":"series-3","name":"Some Show","tvdb_id":"3003","year":"2014","country":"gbr","type":"series"}]}
