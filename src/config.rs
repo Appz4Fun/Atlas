@@ -170,6 +170,8 @@ pub struct TvmazeConfig {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TvdbConfig {
     pub api_key: String,
+    /// a subscriber's, for a user-supported key
+    pub pin: String,
     pub requests_per_minute: i64,
     pub base_url: Option<String>,
 }
@@ -211,7 +213,7 @@ impl Default for MediaConfig {
             tvmaze: TvmazeConfig { enabled: false, requests_per_minute: 90, base_url: None },
             tmdb: TmdbConfig { api_key: String::new(), requests_per_minute: 240, base_url: None },
             trakt: TraktConfig { client_id: String::new(), requests_per_minute: 120, base_url: None },
-            tvdb: TvdbConfig { api_key: String::new(), requests_per_minute: 120, base_url: None },
+            tvdb: TvdbConfig { api_key: String::new(), pin: String::new(), requests_per_minute: 120, base_url: None },
         }
     }
 }
@@ -264,6 +266,7 @@ impl MediaConfig {
         c.trakt.base_url = text(trakt, "base_url").filter(|u| !u.is_empty());
         let tvdb = v.get("tvdb");
         c.tvdb.api_key = text(tvdb, "api_key").unwrap_or_default();
+        c.tvdb.pin = text(tvdb, "pin").unwrap_or_default();
         rate(tvdb, 600, &mut c.tvdb.requests_per_minute);
         c.tvdb.base_url = text(tvdb, "base_url").filter(|u| !u.is_empty());
         c

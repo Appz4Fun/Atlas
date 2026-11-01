@@ -22,6 +22,7 @@ const TOKEN_SECS: i64 = 25 * 86_400;
 pub struct Tvdb {
     base: String,
     key: String,
+    pin: String,
     client: Client,
     token: Mutex<Option<(String, i64)>>,
 }
@@ -33,6 +34,7 @@ impl Tvdb {
             client: Client::new("tvdb", &base, cfg.requests_per_minute),
             base,
             key: cfg.api_key.clone(),
+            pin: cfg.pin.clone(),
             token: Mutex::new(None),
         }
     }
@@ -50,7 +52,11 @@ impl Tvdb {
             return Ok(token.clone());
         }
         let url = format!("{}/login", self.base);
-        let Reply::Json(body) = self.client.post_json(&url, &json!({"apikey": self.key}))? else {
+        let mut login = json!({"apikey": self.key});
+        if !self.pin.is_empty() {
+            login["pin"] = json!(self.pin);
+        }
+        let Reply::Json(body) = self.client.post_json(&url, &login)? else {
             return Err(Trouble::Bad("tvdb: no login route".into()));
         };
         let Some(token) = body.pointer("/data/token").and_then(Value::as_str).filter(|t| !t.is_empty()) else {
@@ -79,10 +85,13 @@ fn candidate_score(q: &TitleQuery<'_>, item: &Value) -> f64 {
     let country = item.get("country").and_then(Value::as_str).filter(|c| !c.is_empty()).map(two_letters);
     let countries: Vec<&str> = country.as_deref().into_iter().collect();
     let aliases = item.get("aliases").and_then(Value::as_array);
+    let translations = item.get("translations").and_then(Value::as_object);
     item.get("name")
         .and_then(Value::as_str)
         .into_iter()
+        .chain(item.get("name_translated").and_then(Value::as_str))
         .chain(aliases.into_iter().flatten().take(MAX_ALIASES).filter_map(Value::as_str))
+        .chain(translations.into_iter().flat_map(|t| t.values()).take(MAX_ALIASES).filter_map(Value::as_str))
         .filter(|name| name.len() <= MAX_NAME)
         .map(|title| score(q.kind, q.title, q.year, q.country, &Candidate { title, year, countries: &countries }))
         .fold(0.0, f64::max)
