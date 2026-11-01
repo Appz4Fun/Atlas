@@ -1,0 +1,30 @@
+:root { color-scheme: light dark; --line: #8884; --muted: #888; }
+* { box-sizing: border-box; }
+body { margin: 0 auto; padding: 16px; max-width: 1200px; font: 14px/1.4 system-ui, sans-serif; }
+header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+h1 { margin: 0; font-size: 20px; }
+h2 { font-size: 15px; }
+input, select, button { padding: 6px 8px; font: inherit; }
+.search { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 12px; }
+.search input { flex: 1 1 240px; min-width: 0; }
+.search select { max-width: 100%; }
+.login { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.error { width: 100%; margin: 0; color: #c33; }
+.setup, footer { margin-top: 24px; color: var(--muted); }
+table { width: 100%; border-collapse: collapse; }
+th { text-align: left; }
+th, td { padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+td { white-space: nowrap; }
+td.name { width: 100%; white-space: normal; overflow-wrap: anywhere; }
+.num { text-align: right; }
+.flag { color: #c63; font-size: 12px; }
+.note { padding: 12px 8px; text-align: center; color: var(--muted); }
+.htmx-indicator { display: none; color: var(--muted); }
+.htmx-request.htmx-indicator { display: inline; }
+@media (max-width: 800px) {
+  .group { display: none; }
+  th, td { padding: 6px 4px; }
+}
+@media (max-width: 500px) {
+  .posted { display: none; }
+}

@@ -1,6 +1,7 @@
 //! Newznab compatible api for prowlarr / sonarr / radarr.
 
 use std::collections::HashMap;
+use std::io::Read;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
@@ -45,7 +46,7 @@ impl ApiResponse {
         ApiResponse { status, content_type: Some(XML), body, headers: Vec::new() }
     }
 
-    fn not_found() -> Self {
+    pub(crate) fn not_found() -> Self {
         ApiResponse { status: 404, content_type: None, body: String::new(), headers: Vec::new() }
     }
 
@@ -110,19 +111,6 @@ pub fn parse_query(query: &str) -> HashMap<String, String> {
 
 /// Handle `/api?{query}`. `base` is the url root without trailing slash.
 pub fn handle(path: &str, query: &str, base: &str, api_key: &str) -> ApiResponse {
-    // a browser pointed at the bare address gets told where the api is,
-    // instead of a blank 404 that looks like nothing is listening
-    if path == "/" || path.is_empty() {
-        return ApiResponse {
-            status: 200,
-            content_type: Some("text/plain; charset=utf-8"),
-            body: format!(
-                "Atlas newznab api is running.\n\nAdd it to Prowlarr / Sonarr / Radarr as a Newznab indexer:\n  URL:      {base}\n  API path: /api\n  API key:  the api_key in config.toml\n\nCheck it: {base}/api?t=caps\n"
-            ),
-            headers: Vec::new(),
-        };
-    }
-
     if path != "/api" {
         return ApiResponse::not_found();
     }
@@ -143,7 +131,7 @@ pub fn handle(path: &str, query: &str, base: &str, api_key: &str) -> ApiResponse
     }
 
     match t {
-        Some("get") => get(&args),
+        Some("get") => get_nzb(&args),
         Some(kind @ ("search" | "tvsearch" | "movie" | "music" | "audio" | "book")) => {
             let on = crate::media::query::cached_id_params();
             if let Some(ids) = crate::media::query::from_args(kind, &args, &on) {
@@ -235,19 +223,28 @@ fn id_search(
     }
 }
 
+/// By name, by category, by both, or the newest with neither.
+pub(crate) fn find_releases(
+    q: &str,
+    filter: Option<&crate::category::CatFilter>,
+    offset: i64,
+    limit: i64,
+) -> rusqlite::Result<Vec<crate::search::ReleaseRow>> {
+    match (filter, q.trim().is_empty()) {
+        (None, true) => all_releases(offset / limit, limit),
+        (None, false) => search_all_releases(q, offset / limit, limit),
+        (Some(f), true) => newest_in_categories(f, offset, limit).map(|p| p.rows),
+        (Some(f), false) => search_in_categories(q, f, offset, limit),
+    }
+}
+
 fn search(q: &str, args: &HashMap<String, String>, base: &str, api_key: &str) -> ApiResponse {
     let limit = args.get("limit").and_then(|v| v.trim().parse::<i64>().ok()).unwrap_or(100).clamp(1, 100);
     let offset = args.get("offset").and_then(|v| v.trim().parse::<i64>().ok()).unwrap_or(0).max(0);
 
     let filter = args.get("cat").and_then(|c| crate::category::parse_filter(c));
-    let releases = match (&filter, q.trim().is_empty()) {
-        (None, true) => all_releases(offset / limit, limit),
-        (None, false) => search_all_releases(q, offset / limit, limit),
-        (Some(f), true) => newest_in_categories(f, offset, limit).map(|p| p.rows),
-        (Some(f), false) => search_in_categories(q, f, offset, limit),
-    };
 
-    match releases {
+    match find_releases(q, filter.as_ref(), offset, limit) {
         Ok(r) => {
             let ids: Vec<i64> = r.iter().map(|release| release.id).collect();
             let categories = crate::category::categories_of(&ids).unwrap_or_else(|e| {
@@ -318,7 +315,7 @@ fn rss(
     ApiResponse::xml(200, xml)
 }
 
-fn get(args: &HashMap<String, String>) -> ApiResponse {
+pub(crate) fn get_nzb(args: &HashMap<String, String>) -> ApiResponse {
     let release_id = args.get("id").and_then(|v| v.trim().parse::<i64>().ok()).unwrap_or(0);
 
     let Ok(Some(release)) = get_release(release_id) else {
@@ -339,7 +336,10 @@ fn get(args: &HashMap<String, String>) -> ApiResponse {
     }
 }
 
-fn respond(request: Request, api_key: &str, fallback_host: &str) {
+/// A small form, not an upload: anything past this can't be a key.
+const MAX_FORM_BODY: u64 = 4096;
+
+fn respond(mut request: Request, api_key: &str, fallback_host: &str) {
     let url = request.url().to_string();
     let (path, query) = url.split_once('?').unwrap_or((&url, ""));
 
@@ -351,9 +351,16 @@ fn respond(request: Request, api_key: &str, fallback_host: &str) {
         .unwrap_or_else(|| fallback_host.to_string());
     let base = format!("http://{host}");
 
+    let cookies = request.headers().iter().find(|h| h.field.equiv("Cookie")).map(|h| h.value.as_str().to_string());
+
     let is_get = matches!(request.method(), tiny_http::Method::Get | tiny_http::Method::Head);
     let resp = if is_get {
-        handle(path, query, &base, api_key)
+        crate::web::get(path, query, cookies.as_deref(), &base, api_key)
+            .unwrap_or_else(|| handle(path, query, &base, api_key))
+    } else if *request.method() == tiny_http::Method::Post && crate::web::takes_post(path) {
+        let mut body = String::new();
+        let _ = request.as_reader().take(MAX_FORM_BODY).read_to_string(&mut body);
+        crate::web::post(path, &body, &base, api_key).unwrap_or_else(ApiResponse::not_found)
     } else {
         ApiResponse { status: 405, content_type: None, body: String::new(), headers: Vec::new() }
     };
@@ -448,11 +455,6 @@ mod tests {
         assert!(r.body.contains("Invalid API Key"));
 
         assert_eq!(handle("/nope", "t=caps", "http://x", "key").status, 404);
-
-        let root = handle("/", "", "http://192.168.1.172:9091", "key");
-        assert_eq!(root.status, 200);
-        assert!(root.body.contains("http://192.168.1.172:9091/api?t=caps"));
-        assert!(!root.body.contains("key\n"), "never print the api key");
         assert!(
             handle("/api", "t=caps", "http://192.168.1.172:9091", "key")
                 .body
