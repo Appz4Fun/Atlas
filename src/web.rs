@@ -203,15 +203,17 @@ enum SortBy {
     Size,
     Posted,
     Group,
+    Rating,
 }
 
 impl SortBy {
-    const ALL: [(SortBy, &'static str); 5] = [
+    const ALL: [(SortBy, &'static str); 6] = [
         (SortBy::Name, "name"),
         (SortBy::Category, "category"),
         (SortBy::Size, "size"),
         (SortBy::Posted, "posted"),
         (SortBy::Group, "group"),
+        (SortBy::Rating, "rating"),
     ];
 
     fn word(self) -> &'static str {
@@ -224,7 +226,13 @@ impl SortBy {
 }
 
 /// Puts results in order, with those that have no value for the column last either way.
-fn sort_rows(rows: &mut [ReleaseRow], by: SortBy, descending: bool, categories: &HashMap<i64, i64>) {
+fn sort_rows(
+    rows: &mut [ReleaseRow],
+    by: SortBy,
+    descending: bool,
+    categories: &HashMap<i64, i64>,
+    scores: &HashMap<i64, i64>,
+) {
     let flip = |o: std::cmp::Ordering| if descending { o.reverse() } else { o };
     rows.sort_by(|a, b| match by {
         SortBy::Name => flip(a.name.to_lowercase().cmp(&b.name.to_lowercase())),
@@ -247,6 +255,12 @@ fn sort_rows(rows: &mut [ReleaseRow], by: SortBy, descending: bool, categories: 
             }
         }
         SortBy::Group => flip(a.group_name.cmp(&b.group_name)),
+        SortBy::Rating => match (scores.get(&a.id), scores.get(&b.id)) {
+            (Some(x), Some(y)) => flip(x.cmp(y)),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        },
     });
 }
 
@@ -349,7 +363,11 @@ impl Search {
             filters: self.filters.clone(),
             fields: self.fields.clone(),
             sort: Some(by),
-            descending: if current { !descending } else { matches!(by, SortBy::Size | SortBy::Posted) },
+            descending: if current {
+                !descending
+            } else {
+                matches!(by, SortBy::Size | SortBy::Posted | SortBy::Rating)
+            },
         };
         let query = attr(&flipped.query(&self.cat, 0));
         let arrow = match (current, descending) {
@@ -387,7 +405,12 @@ impl Search {
     }
 
     /// Every spelling's results merged, newest first, or the one search there is.
-    fn search(&self, filter: Option<&crate::category::CatFilter>, from: i64, count: i64) -> Result<Vec<ReleaseRow>, String> {
+    fn search(
+        &self,
+        filter: Option<&crate::category::CatFilter>,
+        from: i64,
+        count: i64,
+    ) -> Result<Vec<ReleaseRow>, String> {
         let one = |words: &str, from: i64, count: i64| {
             if self.fields.any() {
                 field_search::find(&self.fields, words, filter, from, count).map_err(|e| e.to_string())
@@ -437,6 +460,7 @@ impl Search {
                 escape(filter)
             );
         }
+        out.push_str(&self.sort_link(SortBy::Rating, "Best rated"));
         out.push_str("</div>");
         out
     }
@@ -471,7 +495,17 @@ impl Search {
         let page_was_full = if let Some(sort) = self.sort {
             let ids: Vec<i64> = found.iter().map(|r| r.id).collect();
             let categories = crate::category::categories_of(&ids).unwrap_or_default();
-            sort_rows(&mut found, sort, self.descending, &categories);
+            // only the scores already kept: fetching them for a whole search would use up the providers' limits
+            let scores: HashMap<i64, i64> = if sort == SortBy::Rating {
+                let media = crate::media::query::attrs_of(&ids).unwrap_or_default();
+                crate::media::details::kept_for(media.iter().map(|(id, m)| (*id, m.kind, &m.ids)))
+                    .into_iter()
+                    .filter_map(|(id, d)| Some((id, score_value(&d)?)))
+                    .collect()
+            } else {
+                HashMap::new()
+            };
+            sort_rows(&mut found, sort, self.descending, &categories, &scores);
             let start = usize::try_from(self.offset).unwrap_or(0).min(found.len());
             let end = (start + PAGE_SIZE as usize).min(found.len());
             let more = end < found.len();
@@ -629,6 +663,11 @@ fn password_tag(password: Option<&Password>) -> String {
         Some(Password::Maybe) => tag("tag-warn", "PASSWORD?"),
         _ => String::new(),
     }
+}
+
+/// The score to sort by, out of 100, the same one a result shows.
+fn score_value(d: &crate::media::details::Details) -> Option<i64> {
+    d.imdb_score.or(d.tmdb_score).or(d.trakt_score)
 }
 
 /// The one score a result has room for.
@@ -1563,8 +1602,16 @@ fn details_html(d: &crate::media::details::Details) -> String {
     } else {
         String::new()
     };
+    let backdrop = if d.backdrop.is_some() {
+        format!(
+            "<img class=\"backdrop\" src=\"/ui/poster?kind={}&amp;tmdb={}&amp;art=backdrop\" alt=\"\" loading=\"lazy\">",
+            d.kind, d.tmdb_id
+        )
+    } else {
+        String::new()
+    };
     format!(
-        "<section class=\"panel title-details\">{poster}<div><h2>{}</h2><p>{scores}</p><p>{}</p><dl class=\"facts\">{lines}</dl></div></section>",
+        "{backdrop}<section class=\"panel title-details\">{poster}<div><h2>{}</h2><p>{scores}</p><p>{}</p><dl class=\"facts\">{lines}</dl></div></section>",
         escape(d.title.as_deref().unwrap_or_default()),
         escape(d.overview.as_deref().unwrap_or_default()),
     )
@@ -1572,8 +1619,13 @@ fn details_html(d: &crate::media::details::Details) -> String {
 
 fn poster(args: &HashMap<String, String>) -> ApiResponse {
     let number = |key: &str| args.get(key).and_then(|v| v.trim().parse::<i64>().ok()).unwrap_or(0);
-    let Some(bytes) = crate::media::details::poster(number("kind"), number("tmdb"), &crate::config::media_config())
-    else {
+    let cfg = crate::config::media_config();
+    let found = if args.get("art").is_some_and(|art| art == "backdrop") {
+        crate::media::details::backdrop(number("kind"), number("tmdb"), &cfg)
+    } else {
+        crate::media::details::poster(number("kind"), number("tmdb"), &cfg)
+    };
+    let Some(bytes) = found else {
         return ApiResponse::not_found();
     };
     ApiResponse {
@@ -1923,6 +1975,9 @@ mod tests {
         assert!(html.contains("IMDB 87") && !html.contains("Metacritic"), "{html}");
         assert!(html.contains("<dt>Blu-ray</dt><dd>1999-09-21</dd>"), "{html}");
         assert!(html.contains("/ui/poster?kind=2&amp;tmdb=603"), "{html}");
+        assert!(!html.contains("art=backdrop"), "{html}");
+        let wide = details_html(&crate::media::details::Details { backdrop: Some("/b.jpg".into()), ..d.clone() });
+        assert!(wide.contains("art=backdrop"), "{wide}");
     }
 
     #[test]
@@ -1958,7 +2013,7 @@ mod tests {
     fn every_column_sorts_both_ways() {
         let order = |by, descending| {
             let mut rows = vec![release(1, "b", Some(5)), release(2, "A", None), release(3, "c", Some(9))];
-            sort_rows(&mut rows, by, descending, &HashMap::new());
+            sort_rows(&mut rows, by, descending, &HashMap::new(), &HashMap::new());
             rows.iter().map(|r| r.id).collect::<Vec<_>>()
         };
         assert_eq!(order(SortBy::Name, false), [2, 1, 3]);
@@ -1966,6 +2021,29 @@ mod tests {
         assert_eq!(order(SortBy::Size, false), [1, 3, 2], "no size goes last");
         assert_eq!(order(SortBy::Size, true), [3, 1, 2], "either way");
         assert_eq!(order(SortBy::Group, true), [3, 2, 1]);
+    }
+
+    #[test]
+    fn a_filter_searches_each_way_it_is_written() {
+        let mut args = HashMap::new();
+        args.insert("q".to_string(), "film".to_string());
+        args.insert("filters".to_string(), "2160p,DV".to_string());
+        let choices = Search::from_args(&args).word_choices();
+        assert!(choices.contains(&"film 4k DoVi".to_string()), "{choices:?}");
+        assert!(choices.len() <= MAX_WORD_CHOICES);
+        args.remove("filters");
+        assert_eq!(Search::from_args(&args).word_choices(), ["film"]);
+    }
+
+    #[test]
+    fn rated_rows_come_first_either_way() {
+        let row = |id| ReleaseRow { id, ..Default::default() };
+        let scores = HashMap::from([(1, 50), (2, 90)]);
+        let mut rows = [row(3), row(1), row(2)];
+        sort_rows(&mut rows, SortBy::Rating, true, &HashMap::new(), &scores);
+        assert_eq!(rows.iter().map(|r| r.id).collect::<Vec<_>>(), [2, 1, 3]);
+        sort_rows(&mut rows, SortBy::Rating, false, &HashMap::new(), &scores);
+        assert_eq!(rows.iter().map(|r| r.id).collect::<Vec<_>>(), [1, 2, 3]);
     }
 
     #[test]

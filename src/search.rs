@@ -5,7 +5,7 @@ use crate::db::{self, Result};
 use crate::store;
 
 /// One search hit. `name` is the display name when we have one.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ReleaseRow {
     pub id: i64,
     pub name: String,

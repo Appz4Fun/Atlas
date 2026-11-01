@@ -12,14 +12,17 @@ use std::time::Duration;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value;
 
-use crate::config::{MediaConfig, OmdbConfig, TmdbConfig, TraktConfig};
+use crate::config::{MediaConfig, OmdbConfig, TmdbConfig, TraktConfig, TvdbConfig};
 
 use super::http::{Client, Reply, encode, now_secs};
 use super::resolve::Ids;
 use super::title::Kind;
+use super::tvdb::Tvdb;
 
 const TMDB_BASE: &str = "https://api.themoviedb.org/3";
 const IMAGE_BASE: &str = "https://image.tmdb.org/t/p/w342";
+const BACKDROP_BASE: &str = "https://image.tmdb.org/t/p/w780";
+const TVDB_IMAGES: &str = "https://artworks.thetvdb.com";
 const OMDB_BASE: &str = "https://www.omdbapi.com";
 const TRAKT_BASE: &str = "https://api.trakt.tv";
 const KEEP_FOR: i64 = 30 * 86_400;
@@ -74,6 +77,7 @@ pub struct Details {
     pub released: Option<String>,
     pub bluray: Option<String>,
     pub poster: Option<String>,
+    pub backdrop: Option<String>,
     pub tmdb_score: Option<i64>,
     pub imdb_score: Option<i64>,
     pub rotten: Option<i64>,
@@ -91,13 +95,18 @@ fn open() -> rusqlite::Result<Connection> {
     let conn = crate::db::create_at(&path_for(&crate::paths::database()))?;
     conn.query_row("pragma journal_mode = wal", [], |_| Ok(()))?;
     conn.execute_batch(SCHEMA)?;
+    let has_backdrop: bool =
+        conn.query_row("select count(*) from pragma_table_info('details') where name = 'backdrop'", [], |r| r.get(0))?;
+    if !has_backdrop {
+        conn.execute_batch("alter table details add column backdrop TEXT")?;
+    }
     Ok(conn)
 }
 
 fn read(conn: &Connection, kind: i64, tmdb_id: i64) -> rusqlite::Result<Option<Details>> {
     conn.query_row(
         "select title, overview, genres, runtime, status, network, cast_names, released, bluray, poster,
-                tmdb_score, imdb_score, rotten, metacritic, trakt_score, fetched_at
+                tmdb_score, imdb_score, rotten, metacritic, trakt_score, fetched_at, backdrop
          from details where kind = ? and tmdb_id = ?",
         [kind, tmdb_id],
         |r| {
@@ -120,6 +129,7 @@ fn read(conn: &Connection, kind: i64, tmdb_id: i64) -> rusqlite::Result<Option<D
                 metacritic: r.get(13)?,
                 trakt_score: r.get(14)?,
                 fetched_at: r.get(15)?,
+                backdrop: r.get(16)?,
             })
         },
     )
@@ -129,8 +139,8 @@ fn read(conn: &Connection, kind: i64, tmdb_id: i64) -> rusqlite::Result<Option<D
 fn write(conn: &Connection, d: &Details) -> rusqlite::Result<()> {
     conn.execute(
         "insert or replace into details (kind, tmdb_id, title, overview, genres, runtime, status, network, cast_names,
-            released, bluray, poster, tmdb_score, imdb_score, rotten, metacritic, trakt_score, fetched_at)
-         values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            released, bluray, poster, tmdb_score, imdb_score, rotten, metacritic, trakt_score, fetched_at, backdrop)
+         values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         params![
             d.kind,
             d.tmdb_id,
@@ -149,7 +159,8 @@ fn write(conn: &Connection, d: &Details) -> rusqlite::Result<()> {
             d.rotten,
             d.metacritic,
             d.trakt_score,
-            d.fetched_at
+            d.fetched_at,
+            d.backdrop
         ],
     )?;
     Ok(())
@@ -206,11 +217,40 @@ fn from_tmdb(kind: i64, tmdb_id: i64, v: &Value, now: i64) -> Details {
         released: text(v, if is_tv { "first_air_date" } else { "release_date" }),
         bluray: if is_tv { None } else { bluray_date(v) },
         poster: text(v, "poster_path").filter(|p| safe_image_path(p)),
+        backdrop: text(v, "backdrop_path").filter(|p| safe_image_path(p)),
         tmdb_score: v
             .get("vote_average")
             .and_then(Value::as_f64)
             .filter(|_| v.get("vote_count").and_then(Value::as_i64).unwrap_or(0) > 0)
             .map(|score| (score * 10.0).round() as i64),
+        fetched_at: now,
+        ..Details::default()
+    }
+}
+
+/// What TheTVDB says about a series, kept under its id made negative, as TMDB's ids are all above zero. TheTVDB's own
+/// `score` is how much people follow a show, not how good it is, soo it isn't a rating here.
+fn from_tvdb(tvdb_id: i64, v: &Value, images: &str, now: i64) -> Details {
+    let cast: Vec<String> = v
+        .get("characters")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|person| text(person, "personName"))
+        .take(MAX_CAST)
+        .collect();
+    Details {
+        kind: Kind::Tv as i64,
+        tmdb_id: -tvdb_id,
+        title: text(v, "name"),
+        overview: text(v, "overview"),
+        genres: names(v, "genres", MAX_CAST),
+        runtime: v.get("averageRuntime").and_then(Value::as_i64).filter(|minutes| *minutes > 0),
+        status: v.get("status").and_then(|status| text(status, "name")),
+        network: v.get("originalNetwork").and_then(|network| text(network, "name")),
+        cast: (!cast.is_empty()).then(|| cast.join(", ")),
+        released: text(v, "firstAired"),
+        poster: text(v, "image").filter(|url| safe_image_url(url, images)),
         fetched_at: now,
         ..Details::default()
     }
@@ -256,7 +296,18 @@ fn safe_image_path(path: &str) -> bool {
     !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
+/// TheTVDB gives whole addresses. Only its own image host goes in a request of ours.
+fn safe_image_url(url: &str, images: &str) -> bool {
+    url.strip_prefix(images).is_some_and(|rest| {
+        rest.starts_with('/')
+            && !rest.contains("..")
+            && rest.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'/'))
+    })
+}
+
 struct Sources {
+    tvdb_config: TvdbConfig,
+    tvdb: Option<Tvdb>,
     tmdb: TmdbConfig,
     omdb: OmdbConfig,
     trakt: TraktConfig,
@@ -269,7 +320,7 @@ struct Sources {
 static SOURCES: LazyLock<Mutex<Option<std::sync::Arc<Sources>>>> = LazyLock::new(|| Mutex::new(None));
 
 fn sources(cfg: &MediaConfig) -> Option<std::sync::Arc<Sources>> {
-    if cfg.tmdb.api_key.is_empty() {
+    if cfg.tmdb.api_key.is_empty() && cfg.tvdb.api_key.is_empty() {
         return None;
     }
     let mut held = SOURCES.lock().unwrap_or_else(|e| e.into_inner());
@@ -277,12 +328,15 @@ fn sources(cfg: &MediaConfig) -> Option<std::sync::Arc<Sources>> {
         && s.tmdb == cfg.tmdb
         && s.omdb == cfg.omdb
         && s.trakt == cfg.trakt
+        && s.tvdb_config == cfg.tvdb
     {
         return Some(s.clone());
     }
     let tmdb_base = cfg.tmdb.base_url.as_deref().unwrap_or(TMDB_BASE);
     let omdb_base = cfg.omdb.base_url.as_deref().unwrap_or(OMDB_BASE);
     let made = std::sync::Arc::new(Sources {
+        tvdb_config: cfg.tvdb.clone(),
+        tvdb: (!cfg.tvdb.api_key.is_empty()).then(|| Tvdb::new(&cfg.tvdb)),
         tmdb_client: Client::new("tmdb", tmdb_base, cfg.tmdb.requests_per_minute),
         omdb_client: Client::new("omdb", omdb_base, cfg.omdb.requests_per_minute),
         tmdb: cfg.tmdb.clone(),
@@ -321,7 +375,6 @@ impl Sources {
     }
 
     fn fetch(&self, kind: i64, tmdb_id: i64, ids: &Ids, now: i64) -> Option<Details> {
-        let imdb = ids.imdb;
         let section = if kind == Kind::Tv as i64 { "tv" } else { "movie" };
         let extra = if kind == Kind::Tv as i64 { "credits" } else { "credits,release_dates" };
         let url = format!(
@@ -331,15 +384,29 @@ impl Sources {
         );
         let Ok(Reply::Json(body)) = self.tmdb_client.get(&url, &[]) else { return None };
         let mut details = from_tmdb(kind, tmdb_id, &body, now);
-        if let Some(imdb) = imdb
+        self.add_ratings(&mut details, kind, ids, now);
+        Some(details)
+    }
+
+    /// What a show TMDB has no record of looks like to TheTVDB, with what else rates it.
+    fn fetch_tvdb(&self, tvdb_id: i64, ids: &Ids, now: i64) -> Option<Details> {
+        let body = self.tvdb.as_ref()?.series(tvdb_id).ok()??;
+        let images = self.tvdb_config.base_url.as_deref().unwrap_or(TVDB_IMAGES);
+        let mut details = from_tvdb(tvdb_id, &body, images, now);
+        self.add_ratings(&mut details, Kind::Tv as i64, ids, now);
+        Some(details)
+    }
+
+    fn add_ratings(&self, details: &mut Details, kind: i64, ids: &Ids, now: i64) {
+        if let Some(imdb) = ids.imdb
             && !self.omdb.api_key.is_empty()
         {
             let base = self.omdb.base_url.as_deref().unwrap_or(OMDB_BASE);
             let url = format!("{base}/?i=tt{imdb:07}&apikey={}", encode(&self.omdb.api_key));
             match self.omdb_client.get(&url, &[]) {
-                Ok(Reply::Json(body)) => add_omdb(&mut details, &body),
+                Ok(Reply::Json(body)) => add_omdb(details, &body),
                 Ok(Reply::NotFound) => {}
-                Err(_) => try_again_soon(&mut details, now),
+                Err(_) => try_again_soon(details, now),
             }
         }
         if let Some(trakt) = ids.trakt
@@ -352,10 +419,9 @@ impl Sources {
             match self.trakt_client.get(&url, &headers) {
                 Ok(Reply::Json(body)) => details.trakt_score = trakt_score(&body),
                 Ok(Reply::NotFound) => {}
-                Err(_) => try_again_soon(&mut details, now),
+                Err(_) => try_again_soon(details, now),
             }
         }
-        Some(details)
     }
 }
 
@@ -364,15 +430,30 @@ pub fn for_title(cfg: &MediaConfig, kind: i64, ids: &Ids) -> Option<Details> {
     let conn = open().ok()?;
     let now = now_secs();
     let sources = sources(cfg);
-    let tmdb_id = match ids.tmdb {
-        Some(id) => id,
-        None => lookup(&conn, sources.as_deref(), kind, ids, now)?,
-    };
-    let kept = read(&conn, kind, tmdb_id).ok().flatten();
+    let tmdb_on = !cfg.tmdb.api_key.is_empty();
+    let asked = sources.as_deref().filter(|_| tmdb_on);
+    let tmdb_id = ids.tmdb.or_else(|| lookup(&conn, asked, kind, ids, now));
+    if let Some(tmdb_id) = tmdb_id {
+        let kept = read(&conn, kind, tmdb_id).ok().flatten();
+        if kept.as_ref().is_some_and(|d| now - d.fetched_at < KEEP_FOR) {
+            return kept;
+        }
+        if tmdb_on {
+            let Some(fresh) = asked.and_then(|s| s.fetch(kind, tmdb_id, ids, now)) else { return kept };
+            let _ = write(&conn, &fresh);
+            return Some(fresh);
+        }
+        if kept.is_some() {
+            return kept;
+        }
+    }
+    // a show TMDB has no record of, or no TMDB key
+    let tvdb_id = ids.tvdb.filter(|_| kind == Kind::Tv as i64)?;
+    let kept = read(&conn, kind, -tvdb_id).ok().flatten();
     if kept.as_ref().is_some_and(|d| now - d.fetched_at < KEEP_FOR) {
         return kept;
     }
-    let Some(fresh) = sources.and_then(|s| s.fetch(kind, tmdb_id, ids, now)) else { return kept };
+    let Some(fresh) = sources.and_then(|s| s.fetch_tvdb(tvdb_id, ids, now)) else { return kept };
     let _ = write(&conn, &fresh);
     Some(fresh)
 }
@@ -389,8 +470,8 @@ pub fn kept_for<'a>(titles: impl Iterator<Item = (i64, i64, &'a Ids)>) -> HashMa
             .ok()
             .flatten()
         });
-        if let Some(tmdb_id) = tmdb_id
-            && let Ok(Some(details)) = read(&conn, kind, tmdb_id)
+        let own = ids.tvdb.filter(|_| kind == Kind::Tv as i64).map(|tvdb| -tvdb);
+        if let Some(details) = [tmdb_id, own].into_iter().flatten().find_map(|id| read(&conn, kind, id).ok().flatten())
         {
             out.insert(release, details);
         }
@@ -429,6 +510,11 @@ fn poster_dir() -> PathBuf {
 }
 
 fn poster_file(path: &str) -> Option<PathBuf> {
+    if path.starts_with("http") {
+        let name: String =
+            path.chars().map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' { c } else { '_' }).collect();
+        return Some(poster_dir().join(name));
+    }
     safe_image_path(path).then(|| poster_dir().join(path.trim_start_matches('/')))
 }
 
@@ -440,19 +526,29 @@ pub fn poster_kept(d: &Details) -> bool {
 /// A poster's bytes, kept on disk, soo browsers never call out and it works once TMDB doesn't.
 pub fn poster(kind: i64, tmdb_id: i64, cfg: &MediaConfig) -> Option<Vec<u8>> {
     let path = read(&open().ok()?, kind, tmdb_id).ok().flatten()?.poster?;
-    let file = poster_file(&path)?;
+    image(&path, cfg.tmdb.image_base_url.as_deref().unwrap_or(IMAGE_BASE))
+}
+
+/// A title's wide image, kept the same way.
+pub fn backdrop(kind: i64, tmdb_id: i64, cfg: &MediaConfig) -> Option<Vec<u8>> {
+    let path = read(&open().ok()?, kind, tmdb_id).ok().flatten()?.backdrop?;
+    image(&path, cfg.tmdb.image_base_url.as_deref().unwrap_or(BACKDROP_BASE))
+}
+
+fn image(path: &str, base: &str) -> Option<Vec<u8>> {
+    let file = poster_file(path)?;
     if let Ok(kept) = std::fs::read(&file) {
         return Some(kept);
     }
-    let base = cfg.tmdb.image_base_url.as_deref().unwrap_or(IMAGE_BASE);
+    let url = if path.starts_with("http") { path.to_string() } else { format!("{base}{path}") };
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(15)))
         .http_status_as_error(false)
         .max_redirects(0)
-        .proxy(if base.starts_with("http://127.0.0.1") { None } else { ureq::Proxy::try_from_env() })
+        .proxy(if url.starts_with("http://127.0.0.1") { None } else { ureq::Proxy::try_from_env() })
         .build()
         .into();
-    let mut reply = agent.get(&format!("{base}{path}")).call().ok()?;
+    let mut reply = agent.get(&url).call().ok()?;
     if reply.status().as_u16() != 200 {
         return None;
     }

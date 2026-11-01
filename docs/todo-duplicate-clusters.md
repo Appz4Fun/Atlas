@@ -46,7 +46,7 @@ Built on the `feat/release-details` branch. Instead of cluster tables, each rele
 - [ ] **Prod has no archive data yet.** Bodies are now on by default, at 600 fetches a minute, so a config without the key starts reading on the next start. Twins, pairs, encryption types and NFO passwords fill in from there.
 - [ ] Once there's data: how many copies, the share of each kind, a hand check of a sample for false matches, and how long lookups take with real fingerprints. Today's timings only cover an empty table: about 30 to 60 ms more per page.
 - [ ] Only complete lists make a content fingerprint, because a partial one could call two releases the same. Reading only a RAR's first article often gives a partial list, so pairs may be rare until more is read. Check this once there's data.
-- [ ] Collapse copies across a whole search. "Hide copies" only works within a page.
+- [x] Collapse copies across a whole search: "Hide copies" also looks back over the 2,000 results before a page.
 - [ ] Encrypted archives with hidden names have no listing, so they get no content fingerprint. They can still be twins through PAR2.
 
 ## Part 2: release details
@@ -67,7 +67,8 @@ Everything below goes on the release page in the web UI. The API has the tags an
 - [x] **The password,** from the release name, file names and subjects when the page opens, and from an NFO when the NFO step reads one. Shown as "found in the NFO, not tried".
 - [x] NFOs of well-named releases: the probe reads every release's NFO.
 - [x] Try a found password against RAR5 archives, which keep a check value in their headers, and show WORKS or WRONG. Tested on real sample archives.
-- [ ] RAR4, 7z and ZIP have no such check, so testing a password there means downloading and decrypting data.
+- [x] ZIP keeps a short check before each encrypted file's data, so a found password shows WORKS or WRONG for AES, and PROBABLY WORKS or WRONG for ZipCrypto, whose one-byte check passes one wrong password in 256.
+- [ ] RAR4 and 7z have no such check. Testing a password there means downloading and decrypting data, so they stay "not tried".
 
 ### Parsed release tags
 
@@ -76,17 +77,17 @@ Everything below goes on the release page in the web UI. The API has the tags an
 - [x] Tags to show: resolution, Dolby Vision, HDR10, HDR10+, source (BluRay, WEB-DL, Remux), video and audio codec, channels, release group, year, edition, languages.
 - [x] **Where it was ripped from:** the streaming service tag, such as AMZN, NF, DSNP, HMAX or ATVP.
 - [x] Quick filters in results: 2160p, 1080p, DV, HDR, Remux, WEB-DL, BluRay. They search the words, then check the parsed tags, so a page can come back short.
-- [ ] Filter aliases: a filter searches for its own word, so names that say `4k` or `DoVi` don't come up under 2160p or DV.
+- [x] Filter aliases: a filter searches each way its word is written, so names that say `4k` or `DoVi` come up under 2160p and DV.
 - [x] Tags in the Newznab API: `resolution`, `video`, `audio`, `hdr`, `source`, `language`, `team`, plus `poster` and `group`.
 
 ### TMDB and TVDB metadata
 
 - [x] Overview, genres, runtime, cast, network, status, and first air or release date, from TMDB when a release is opened, kept for 30 days in `atlas.details.db`. A title known only by IMDb or TheTVDB id is found through TMDB.
-- [ ] TheTVDB's own metadata, for shows TMDB doesn't have.
+- [x] TheTVDB's own metadata, for shows TMDB doesn't have, or with no TMDB key. TheTVDB's `score` measures how many follow a show, so it isn't shown as a rating.
 - [x] **Blu-ray release date:** TMDB's release dates list has physical releases by country. Show it next to the theatrical date.
 - [x] **Posters** on the release page, served by Atlas from a cache of at most 512 MB, so browsers never call out.
 - [x] Thumbnails in results, for posters already kept.
-- [ ] Backdrops.
+- [x] Backdrops, on the release page, from the same cache as posters.
 - [x] **Links:** IMDb, TMDB, TheTVDB, Trakt and TVmaze.
 - [x] Requests stay inside each provider's rate limit, and only titles someone opens are fetched.
 
@@ -97,7 +98,8 @@ Everything below goes on the release page in the web UI. The API has the tags an
 - [x] Trakt's rating.
 - [x] Ratings stored per title with the time they were fetched, and shown on the release page.
 - [x] The best kept score in results.
-- [ ] Sorting and filtering by ratings. Scores only exist for titles someone has opened, so this needs fetching ahead of time first.
+- [x] Sorting by ratings, among the scores already kept, with unrated releases last.
+- [ ] Filtering by ratings, and ratings for titles nobody has opened. This needs fetching ahead of time, which uses up the providers' limits.
 
 ## Open questions on clusters
 

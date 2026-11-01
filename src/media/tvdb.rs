@@ -39,6 +39,23 @@ impl Tvdb {
         }
     }
 
+    /// A series' own record, for a show TMDB doesn't have. None: TheTVDB doesn't either.
+    pub fn series(&self, id: i64) -> Result<Option<Value>, Trouble> {
+        let token = self.bearer()?;
+        let url = format!("{}/series/{id}/extended", self.base);
+        let header = format!("Bearer {token}");
+        match self.client.get(&url, &[("Authorization", header.as_str())]) {
+            Ok(Reply::Json(body)) => Ok(body.get("data").cloned()),
+            Ok(Reply::NotFound) => Ok(None),
+            Err(trouble) => {
+                if matches!(trouble, Trouble::BadKey(_)) {
+                    *self.token.lock().unwrap() = None;
+                }
+                Err(trouble)
+            }
+        }
+    }
+
     #[doc(hidden)]
     pub fn client(&self) -> &Client {
         &self.client

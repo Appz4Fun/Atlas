@@ -277,7 +277,8 @@ fn block5(l: &mut Listing, inner: &[u8]) -> Option<u64> {
                 if encrypted_record(inner.get(end..)?) {
                     l.encrypted = true;
                     l.encryption = Some(Encryption::Rar5Aes256);
-                    l.password_check = l.password_check.or_else(|| record_check(inner.get(end..)?).map(PasswordTest::Rar5));
+                    l.password_check =
+                        l.password_check.or_else(|| record_check(inner.get(end..)?).map(PasswordTest::Rar5));
                 }
                 if file_flags & 1 == 0 {
                     let size = (file_flags & 8 == 0).then_some(unpacked);

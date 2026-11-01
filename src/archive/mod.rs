@@ -206,7 +206,6 @@ impl PasswordTest {
     }
 }
 
-
 /// What a parser read. Total functions: bad bytes give a listing that says so.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Listing {
