@@ -46,7 +46,7 @@ fn is_directory(name: &str) -> bool {
 }
 
 /// the ZIP64 extra's sizes where a 32-bit field is saturated: uncompressed, compressed
-fn zip64_sizes(extra: &[u8], uncompressed: u32, compressed: u32) -> (u64, u64) {
+pub(crate) fn zip64_sizes(extra: &[u8], uncompressed: u32, compressed: u32) -> (u64, u64) {
     let (mut unp, mut packed) = (u64::from(uncompressed), u64::from(compressed));
     let mut p = 0usize;
     while let (Some(id), Some(size)) = (le16(extra, p), le16(extra, p + 2)) {

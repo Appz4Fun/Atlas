@@ -735,7 +735,7 @@ fn scope_inputs(search: &Search, oob: &str) -> String {
     let open = if search.fields.any() { " open" } else { "" };
     let field = |name: &str, label: &str, value: &str| {
         format!(
-            "<label>{label}<input name=\"{name}\" value=\"{}\" autocomplete=\"off\" spellcheck=\"false\"></label>",
+            "<label>{label}<input class=\"scope-field\" name=\"{name}\" value=\"{}\" autocomplete=\"off\" spellcheck=\"false\"></label>",
             attr(value)
         )
     };
@@ -817,7 +817,7 @@ fn search_page(args: &HashMap<String, String>, base: &str) -> String {
             r##"{masthead}
 <div class="layout"><aside class="sidebar"><details class="navigation" open><summary>Categories</summary>{nav}</details></aside>
 <main>
-<form id="search" class="searchbar" role="search" action="/" method="get" hx-get="/ui/results" hx-target="#results" hx-sync="this:replace" hx-indicator="#busy" hx-trigger="submit, input changed delay:300ms from:#q, change from:#scope">
+<form id="search" class="searchbar" role="search" action="/" method="get" hx-get="/ui/results" hx-target="#results" hx-sync="this:replace" hx-indicator="#busy" hx-trigger="submit, input changed delay:300ms from:#q, change target:.scope-field">
 <div class="search-field"><input id="q" name="q" type="search" placeholder="Search releases" value="{q}" autocomplete="off" spellcheck="false" autofocus aria-label="Search releases"><kbd>/</kbd></div>
 {cat}<button class="button primary">Search</button><span id="busy" class="busy">searching…</span>
 {scope}</form>

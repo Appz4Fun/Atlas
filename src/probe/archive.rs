@@ -197,10 +197,15 @@ fn zip(data: &[u8]) -> ArchiveHead {
         .to_string(),
     );
     head.crc32 = le32(data, 14);
-    head.packed = le32(data, 18).map(u64::from);
-    head.unpacked = le32(data, 22).map(u64::from);
     let name_len = usize::from(le16(data, 26).unwrap_or(0));
     let extra_len = usize::from(le16(data, 28).unwrap_or(0));
+    if let (Some(packed), Some(unpacked)) = (le32(data, 18), le32(data, 22)) {
+        // past 4 GiB these are markers, and the extra field has the sizes. Without it they stay unknown.
+        let extra = data.get(30 + name_len..30 + name_len + extra_len).unwrap_or_default();
+        let (long_unpacked, long_packed) = crate::archive::zip::zip64_sizes(extra, unpacked, packed);
+        head.unpacked = Some(long_unpacked).filter(|size| *size != u64::from(u32::MAX));
+        head.packed = Some(long_packed).filter(|size| *size != u64::from(u32::MAX));
+    }
     head.name = data.get(30..30 + name_len).map(|n| String::from_utf8_lossy(n).into_owned());
     if method == 0 && !head.encrypted {
         head.stored_at = Some(30 + name_len + extra_len);
@@ -225,6 +230,23 @@ mod tests {
         data.extend([0, 0, 0x7a, 0x00, 0x80, 0x07, 0x00, 0xff, 0xff, 0xff, 0xff]);
         data.resize(64, 0);
         assert_eq!(parse(&data).unwrap().format, "RAR4");
+    }
+
+    #[test]
+    fn a_zip64_file_reads_its_sizes_from_the_extra_field() {
+        let mut data = ZIP.to_vec();
+        data.resize(30, 0);
+        data[18..26].copy_from_slice(&[0xff; 8]);
+        data[26..28].copy_from_slice(&1u16.to_le_bytes());
+        data[28..30].copy_from_slice(&20u16.to_le_bytes());
+        data.push(b'a');
+        assert_eq!(parse(&data).unwrap().unpacked, None, "no extra field read");
+        data.extend(1u16.to_le_bytes());
+        data.extend(16u16.to_le_bytes());
+        data.extend(((8u64 << 30) + 456).to_le_bytes());
+        data.extend(7u64.to_le_bytes());
+        let head = parse(&data).unwrap();
+        assert_eq!((head.unpacked, head.packed), (Some((8 << 30) + 456), Some(7)));
     }
 
     #[test]

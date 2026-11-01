@@ -115,10 +115,12 @@ pub fn derive(info: &mut ProbeInfo, wire_bytes: i64, expected_parts: Option<i64>
         if let Some(segment) = info.segment_size.filter(|s| *s > 0 && wire_bytes > 0) {
             info.overhead_percent = Some((wire_bytes as f64 - segment as f64) / segment as f64 * 100.0);
         }
-        let last_size = last.and_then(|l| Some((l.end? + 1).saturating_sub(l.begin?)));
-        if let (Some(segment), Some(total), Some(last_size)) = (info.segment_size, y.total, last_size) {
+        if let (Some(segment), Some(total), Some(last)) = (info.segment_size, y.total, last) {
             let parts_agree = expected_parts.is_none_or(|e| e == i64::from(total));
-            info.continuity_ok = Some(parts_agree && u64::from(total.saturating_sub(1)) * segment + last_size == size);
+            // the first part starts the file, and the last starts where the parts before it end, and ends it
+            let last_begins = u64::from(total.saturating_sub(1)).saturating_mul(segment).saturating_add(1);
+            let ends_meet = y.begin == Some(1) && last.begin == Some(last_begins) && last.end == Some(size);
+            info.continuity_ok = Some(parts_agree && ends_meet);
         }
     }
     info.file_crc32 = last.and_then(|l| l.crc32).or(y.crc32);
@@ -145,11 +147,16 @@ fn cp437(b: u8) -> char {
     if b < 0x80 { char::from(b) } else { HIGH.chars().nth(usize::from(b - 0x80)).unwrap_or('?') }
 }
 
+/// IMDb ids kept from one NFO. An NFO comes from Usenet, and a few are all a real one has.
+const MAX_IMDB_IDS: usize = 16;
+
 pub fn imdb_ids(text: &str) -> Vec<String> {
     let bytes = text.as_bytes();
     let mut out: Vec<String> = Vec::new();
     let mut at = 0;
-    while let Some(found) = text.get(at..).and_then(|t| t.find("tt")) {
+    while out.len() < MAX_IMDB_IDS
+        && let Some(found) = text.get(at..).and_then(|t| t.find("tt"))
+    {
         let start = at + found;
         let digits = bytes[start + 2..].iter().take_while(|b| b.is_ascii_digit()).count();
         let before_ok = start == 0 || !bytes[start - 1].is_ascii_alphanumeric();
@@ -205,6 +212,11 @@ mod tests {
         assert_eq!(info.overhead_percent, Some(3.0));
         assert_eq!(info.file_crc32, Some(7));
 
+        let short = yenc::YencLines { begin: Some(1001), end: Some(1500), ..Default::default() };
+        let mut shifted = ProbeInfo { yenc: Some(first.clone()), ..ProbeInfo::default() };
+        derive(&mut shifted, 1030, Some(3), Some(&short));
+        assert_eq!(shifted.continuity_ok, Some(false), "the last part doesn't end the file");
+
         let mut wrong = ProbeInfo { yenc: Some(first), ..ProbeInfo::default() };
         derive(&mut wrong, 1030, Some(4), Some(&last));
         assert_eq!(wrong.continuity_ok, Some(false), "fewer parts than the subject says");
@@ -230,6 +242,8 @@ mod tests {
             imdb_ids("see https://imdb.com/title/tt0133093/ and tt1234567 xtt7654321 tt12"),
             ["tt0133093", "tt1234567"]
         );
+        let many: String = (0..100).map(|n| format!("tt{:07} ", 1_000_000 + n)).collect();
+        assert_eq!(imdb_ids(&many).len(), MAX_IMDB_IDS);
         let sfv = parse_sfv("; comment\nmovie.r00 0a1B2c3D\nbad line\n");
         assert_eq!(sfv["movie.r00"], 0x0a1b_2c3d);
         assert_eq!(sfv.len(), 1);
