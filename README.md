@@ -10,7 +10,7 @@ A self-hosted Usenet indexer and Newznab server that runs in your terminal
 ![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-informational)
 ![Hackatime](https://hackatime.hackclub.com/api/v1/badge/U09JP15EVQU/Eraxty/Atlas)
 
-[Features](#features) • [Rust](#built-with-rust) • [Install](#installation) • [config.toml](#configure-atlas-configtoml) • [Usage](#usage) • [Stats dashboard](#stats-dashboard) • [Newznab API](#newznab-api) • [Development](#development)
+[Features](#features) • [Rust](#built-with-rust) • [Install](#installation) • [config.toml](#configure-atlas-configtoml) • [Usage](#usage) • [Stats dashboard](#stats-dashboard) • [Web UI](#web-ui) • [Newznab API](#newznab-api) • [Development](#development)
 
 ![Atlas main menu](img/main-menu.png)
 
@@ -578,11 +578,19 @@ Names what limits indexing right now, and shows how busy each resource has been 
 
 The page names the database writer when it's busy at least 85% of the time, the connections when nearly all of them are in use or requests queue for one, and the CPU when it's nearly maxed out. When none of them is, more groups at once (`parallel_groups`) would keep them busier.
 
+## Web UI
+
+Open `http://HOST:PORT/` in a browser to search and browse releases, filter by category, and download NZB files. It's served on the API port, by the same process, with nothing extra to install.
+
+Sign in with the `api_key` from `config.toml`. The browser keeps a cookie for 30 days, derived from the key rather than the key itself, and changing the key signs everyone out. Traffic is plain HTTP, like the API, so keep it on a network you trust.
+
+[htmx](https://htmx.org) (0BSD) is built into the binary from `assets/`, so the page needs no internet access.
+
 ## Newznab API
 
 Atlas provides a Newznab-compatible API, the protocol that Prowlarr, NZBHydra2, Sonarr, and Radarr use. Any compatible client can search releases and download NZB files.
 
-- **Endpoint:** `http://HOST:PORT/api`, port `9090` by default. Open `http://HOST:PORT/` in a browser to see a short page with the settings to use.
+- **Endpoint:** `http://HOST:PORT/api`, port `9090` by default. `http://HOST:PORT/` is the [web UI](#web-ui), and shows the settings to use before you sign in.
 - **Binding:** `127.0.0.1` by default. To reach the API from other machines, set `api_host = "0.0.0.0"` in `config.toml` or set `ATLAS_API_HOST`, then restart Atlas.
 - **Authentication:** `t=caps` works without a key. Every other call needs `apikey`. A wrong key returns a `401` Newznab error.
 

@@ -37,3 +37,4 @@ pub mod search;
 pub mod stats_dashboard;
 pub mod store;
 pub mod ui;
+pub mod web;
