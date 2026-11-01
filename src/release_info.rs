@@ -71,11 +71,21 @@ impl Contents {
         if self.data_articles_expected == 0 || self.recovery_articles_expected == 0 {
             return false;
         }
-        let missing =
-            (self.data_articles_expected - self.data_articles_seen).max(0) * 1000 / self.data_articles_expected;
-        let capacity = self.exact_repair_per_mille().or(self.repair_per_mille()).unwrap_or(0);
-        let left = capacity * self.recovery_articles_seen / self.recovery_articles_expected;
-        left >= missing
+        let (covered, of) = self.repair_ratio();
+        let missing = i128::from((self.data_articles_expected - self.data_articles_seen).max(0));
+        // whole numbers: rounding each to tenths of a percent would call 2 missing of 10,000 repairable by 1 block
+        i128::from(covered) * i128::from(self.recovery_articles_seen) * i128::from(self.data_articles_expected)
+            >= missing * i128::from(of.max(1)) * i128::from(self.recovery_articles_expected)
+    }
+
+    /// What can be rebuilt, over what there is to rebuild: exact from the PAR2 set, or else by sizes.
+    fn repair_ratio(&self) -> (i64, i64) {
+        match self.par2_blocks {
+            Some(blocks) if self.par2_block.is_some_and(|b| b > 0) && blocks > 0 && self.recovery_blocks > 0 => {
+                (self.recovery_blocks, blocks)
+            }
+            _ => (self.recovery_bytes, self.data_bytes),
+        }
     }
 
     /// What the recovery blocks cover, in tenths of a percent, when the PAR2 set's been read.
@@ -304,6 +314,22 @@ pub fn password_hint_with(conn: &Connection, id: i64, names: Option<&Names>) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn one_block_cant_repair_two_of_ten_thousand() {
+        let contents = |seen| Contents {
+            data_articles_expected: 10_000,
+            data_articles_seen: seen,
+            recovery_articles_expected: 1,
+            recovery_articles_seen: 1,
+            recovery_blocks: 1,
+            par2_block: Some(1),
+            par2_blocks: Some(10_000),
+            ..Contents::default()
+        };
+        assert!(!contents(9_998).repairable());
+        assert!(contents(9_999).repairable());
+    }
 
     fn poster(name: Option<&str>, email: Option<&str>) -> Poster {
         Poster { name: name.map(Into::into), email: email.map(Into::into) }
