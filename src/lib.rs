@@ -33,6 +33,7 @@ pub mod predb;
 pub mod procs;
 pub mod profile;
 pub mod release_info;
+pub mod release_tags;
 pub mod sab;
 pub mod search;
 pub mod stats_dashboard;

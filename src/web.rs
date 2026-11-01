@@ -14,9 +14,9 @@ use crate::archive::Password;
 use crate::category::{TABLE, UNCATEGORIZED, label, parse_filter};
 use crate::media::query::MediaAttrs;
 use crate::media::title::Kind;
-use crate::release_info;
 use crate::search::{ReleaseRow, get_release};
 use crate::ui::{fmt_date, fmt_size};
+use crate::{release_info, release_tags};
 
 const HTMX: &str = include_str!("../assets/htmx-2.0.11.min.js");
 const CSS: &str = include_str!("../assets/web.css");
@@ -280,6 +280,21 @@ fn password_tag(password: Option<&Password>) -> String {
     }
 }
 
+/// The tags worth a place in a list of results.
+fn name_tags(parsed: &release_tags::Tags) -> String {
+    let mut out = String::new();
+    if let Some(resolution) = &parsed.resolution {
+        out.push_str(&tag("tag-ref", resolution));
+    }
+    for hdr in &parsed.hdr {
+        out.push_str(&tag("tag-ok", hdr));
+    }
+    if let Some(quality) = &parsed.quality {
+        out.push_str(&tag("", quality));
+    }
+    out
+}
+
 /// S01E02 for an episode, S01 for a season, else the year.
 fn media_label(media: &MediaAttrs) -> Option<String> {
     match (media.season, media.episode, media.year) {
@@ -303,6 +318,7 @@ fn row(
     if let Some(text) = media.get(&r.id).and_then(media_label) {
         tags.push_str(&tag("tag-ref", &text));
     }
+    tags.push_str(&name_tags(&release_tags::parse(&r.name)));
     tags.push_str(&password_tag(passwords.get(&r.id)));
     if !r.complete {
         tags.push_str(&tag("tag-warn", "INCOMPLETE"));
@@ -503,6 +519,8 @@ fn release_html(
             let _ = write!(facts, "<dt>{name}</dt><dd>{value}</dd>");
         }
     };
+    let parsed = release_tags::parse(&r.name);
+    tags.push_str(&name_tags(&parsed));
     fact("Category", format!("<a href=\"/?cat={category}\">{}</a>", escape(&label(category).unwrap_or_default())));
     fact("Size", escape(&fmt_size(r.size)));
     fact("Posted", escape(&fmt_date(r.posted_date.as_deref())));
@@ -522,6 +540,25 @@ fn release_html(
         if let Some(from) = n.source.and_then(release_info::name_source_label) {
             fact("Name from", escape(from));
         }
+    }
+    if let Some(year) = parsed.year {
+        fact("Year", year.to_string());
+    }
+    let words = |list: &[&str]| escape(&list.join(", "));
+    if let Some(network) = parsed.network {
+        fact("Ripped from", escape(network));
+    }
+    fact(
+        "Video",
+        escape(&[parsed.codec, parsed.bit_depth.as_deref()].into_iter().flatten().collect::<Vec<_>>().join(", ")),
+    );
+    fact("Audio", escape(&parsed.audio.iter().chain(&parsed.channels).copied().collect::<Vec<_>>().join(", ")));
+    fact("Languages", words(&parsed.languages));
+    if let Some(edition) = parsed.edition {
+        fact("Edition", escape(edition));
+    }
+    if let Some(group) = &parsed.group {
+        fact("Release group", escape(group));
     }
     if let Some(parts) = r.parts {
         fact("Parts", parts.to_string());
@@ -803,6 +840,14 @@ mod tests {
         let thin = release_info::Contents { recovery_bytes: 10, ..holes };
         assert!(health(&thin, 30).contains("NOT ENOUGH RECOVERY"));
         assert_eq!(per_mille(25), "2.5%");
+    }
+
+    #[test]
+    fn result_tags_show_resolution_hdr_and_source() {
+        let tags = name_tags(&release_tags::parse("A.2024.2160p.WEB-DL.DV.HDR10Plus.H265-X"));
+        for word in ["2160p", "DV", "HDR10+", "WEB-DL"] {
+            assert!(tags.contains(word), "{tags}");
+        }
     }
 
     #[test]
