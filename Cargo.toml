@@ -24,6 +24,7 @@ lzma-rs = "0.3"
 md-5 = "0.10"
 ratatui = "0.30"
 regex = "1"
+fancy-regex = "0.17"
 rusqlite = { version = "0.40", features = ["bundled", "functions", "hooks"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustyline = "18"
