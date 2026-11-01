@@ -1108,6 +1108,9 @@ impl Drop for Lease {
 /// One server's numbers for the stats dashboard.
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct ServerStat {
+    /// which pool these totals are of: a new one starts them over
+    #[serde(skip)]
+    pub pool: u64,
     pub host: String,
     /// what names it in stored state and in metrics, see `server_keys`
     pub key: String,
@@ -1198,6 +1201,8 @@ const DATE_ROWS: usize = DATE_SCAN_MAX as usize;
 /// message-id, which is the same everywhere, soo a missing article is asked
 /// of every server in priority order.
 pub struct Pool {
+    /// tells this pool from the one before it, see `ServerStat::pool`
+    id: u64,
     servers: Vec<Arc<Server>>,
     active: AtomicUsize,
     ready: AtomicBool,
@@ -1322,7 +1327,9 @@ impl Pool {
     pub fn new(servers: &[UsenetServer]) -> Pool {
         let keys = server_keys(servers);
         let legacy = legacy_server_keys(servers);
+        static POOLS: AtomicU64 = AtomicU64::new(1);
         Pool {
+            id: POOLS.fetch_add(1, Ordering::Relaxed),
             servers: servers
                 .iter()
                 .zip(keys)
@@ -2285,6 +2292,7 @@ impl Pool {
                     "ok"
                 };
                 ServerStat {
+                    pool: self.id,
                     host: s.cfg.host.clone(),
                     key: s.key.clone(),
                     waiting: s.waiting.load(Ordering::Relaxed),

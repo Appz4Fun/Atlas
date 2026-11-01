@@ -1009,7 +1009,14 @@ async fn supervise(stop: Arc<AtomicBool>, stats: Arc<Mutex<Stats>>, writing: Opt
         // at least one server has to answer before spinning everything up
         if let Err(e) = pool.connect().await {
             ui::error(&format!("couldnt reach any usenet server: {e}"));
-            stats.lock().unwrap().error_count += 1;
+            let errors = {
+                let mut stats = stats.lock().unwrap();
+                stats.error_count += 1;
+                stats.error_count
+            };
+            // no scheduler to report them: this is when they matter most
+            crate::metrics::report_servers(&pool.server_stats());
+            crate::metrics::report_errors(errors);
             write_status(true, "", &config.index_mode, false, "warning", false, 1);
             nap(Duration::from_secs(30), stopping).await;
             continue;
@@ -1018,6 +1025,8 @@ async fn supervise(stop: Arc<AtomicBool>, stats: Arc<Mutex<Stats>>, writing: Opt
         let compact_due =
             run_servers(&config, pool.clone(), states.clone(), stats.clone(), stop.clone(), compact_after).await;
         pool.close().await;
+        // its last totals, and no connections while there's no pool
+        crate::metrics::report_servers(&pool.server_stats());
 
         if compact_due && !stopping() {
             writing = None;

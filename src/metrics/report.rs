@@ -40,19 +40,26 @@ fn total(v: &Value) -> u64 {
     v.as_u64().unwrap_or(0)
 }
 
-/// What each server's totals last read: a new pool starts them over, the counters go on.
-static SEEN: Mutex<BTreeMap<(String, &'static str), u64>> = Mutex::new(BTreeMap::new());
+/// What each server's totals last read, and in which pool: a new pool starts them over, the counters go on.
+static SEEN: Mutex<BTreeMap<(String, &'static str), Seen>> = Mutex::new(BTreeMap::new());
 
-/// How much a total grew since it was `last` read.
-fn growth(last: &mut u64, now: u64) -> u64 {
-    let grew = if now >= *last { now - *last } else { now };
-    *last = now;
-    grew
+#[derive(Default)]
+struct Seen {
+    pool: u64,
+    total: u64,
+}
+
+/// How much a total of `pool` grew since it was last read.
+fn growth(seen: &mut Seen, pool: u64, now: u64) -> u64 {
+    let before = if seen.pool == pool { seen.total } else { 0 };
+    *seen = Seen { pool, total: now };
+    now.saturating_sub(before)
 }
 
 /// One `server` label's numbers: accounts on one host and port share a key.
 #[derive(Default)]
 struct ServerTotals<'a> {
+    pool: u64,
     open: usize,
     in_use: usize,
     limit: usize,
@@ -69,6 +76,7 @@ pub fn report_servers(servers: &[ServerStat]) {
     let mut totals: BTreeMap<&str, ServerTotals> = BTreeMap::new();
     for s in servers {
         let t = totals.entry(s.key.as_str()).or_default();
+        t.pool = s.pool;
         t.open += s.open;
         t.in_use += s.in_use;
         t.limit += s.limit;
@@ -97,7 +105,8 @@ pub fn report_servers(servers: &[ServerStat]) {
         }
         indexing.push((label_key(&[("server", server)]), f64::from(t.indexing)));
         let mut seen = SEEN.lock().unwrap();
-        let mut grown = |kind: &'static str, now: u64| growth(seen.entry((server.to_string(), kind)).or_default(), now);
+        let mut grown =
+            |kind: &'static str, now: u64| growth(seen.entry((server.to_string(), kind)).or_default(), t.pool, now);
         NNTP_HEADERS.inc(&[("server", server)], grown("headers", t.headers));
         NNTP_TRAFFIC.inc(&[("server", server), ("kind", "wire")], grown("wire", t.wire));
         NNTP_TRAFFIC.inc(&[("server", server), ("kind", "text")], grown("text", t.text));
@@ -106,6 +115,11 @@ pub fn report_servers(servers: &[ServerStat]) {
     NNTP_WAITING.replace(waiting);
     NNTP_SERVER_STATE.replace(states);
     NNTP_SERVER_INDEXING.replace(indexing);
+}
+
+/// The errors counted, when the status round that reports them isnt running.
+pub fn report_errors(errors: u32) {
+    INDEXER_ERRORS.set_total(&[], u64::from(errors));
 }
 
 /// `extra` is what the indexer puts in stats.json beside its own totals.
@@ -184,14 +198,15 @@ fn report_predb(predb: &Value) {
 
 #[cfg(test)]
 mod tests {
-    use super::growth;
+    use super::{Seen, growth};
 
     #[test]
-    fn a_pool_starting_over_doesnt_take_from_the_counters() {
-        let mut last = 0;
-        assert_eq!(growth(&mut last, 100), 100);
-        assert_eq!(growth(&mut last, 150), 50);
-        assert_eq!(growth(&mut last, 20), 20, "a new pool");
-        assert_eq!(growth(&mut last, 30), 10);
+    fn a_new_pool_adds_all_it_has_whatever_the_old_one_read() {
+        let mut seen = Seen::default();
+        assert_eq!(growth(&mut seen, 1, 100), 100);
+        assert_eq!(growth(&mut seen, 1, 150), 50);
+        assert_eq!(growth(&mut seen, 2, 200), 200, "more than the old pool's last");
+        assert_eq!(growth(&mut seen, 2, 210), 10);
+        assert_eq!(growth(&mut seen, 3, 20), 20, "less than the old pool's last");
     }
 }
