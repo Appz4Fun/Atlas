@@ -1,14 +1,15 @@
-//! What Atlas refuses to index: posts obfuscated per article, and groups
-//! labelled for minors. The per-article rule is ported from newznab-tmux
+//! What Atlas treats apart when indexing: posts obfuscated per article, gathered
+//! into one release per upload, and groups labelled for minors, refused. The per-article rule is ported from newznab-tmux
 //! (`HeaderParser::markPerArticleObfuscated`, `BUGS.md` #65), GPLv3.
 
+use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
 use regex::Regex;
 use rusqlite::{Connection, Result, functions::FunctionFlags};
 
-use crate::parser::{Article, parse_subject};
+use crate::parser::{Article, Release, parse_subject};
 
 // ---------------------------------------------------------------- blocked groups
 
@@ -508,6 +509,81 @@ pub fn drop_per_article_obfuscated(articles: Vec<Article>) -> (Vec<Article>, i64
     (kept, skipped)
 }
 
+/// subject shape, part, part total, file counter
+type UploadPiece = (u64, i64, i64, Option<(u32, u32)>);
+
+/// One slice's articles, with those obfuscated per article taken out and gathered into a release per upload.
+///
+/// No name links them, but what stays the same over an upload does: its subject shape, poster and day. Each keeps its
+/// position, and a file is its counter and part total, soo the release's NZB holds the upload as it was posted, and
+/// later slices add to it. Two files of one size with no counter share a file row: see docs/TODO.md.
+pub fn gather_per_article(group: &str, articles: Vec<Article>) -> (Vec<Article>, Vec<Release>, i64) {
+    let skip = mark_per_article_obfuscated(articles.iter().map(|a| a.subject.as_str()));
+    let (mut kept, mut gathered) = (Vec::with_capacity(articles.len()), Vec::new());
+    for (article, gather) in articles.into_iter().zip(skip) {
+        if gather { gathered.push(article) } else { kept.push(article) }
+    }
+    let count = gathered.len() as i64;
+
+    let shapes: Vec<Option<UploadPiece>> = gathered
+        .iter()
+        .map(|a| {
+            let c = SUBJECT_RE.captures(&a.subject)?;
+            let base = c.get(1)?.as_str();
+            let counter = COUNTER_RE.captures(base).and_then(|c| Some((c[1].parse().ok()?, c[2].parse().ok()?)));
+            let (part, total): (i64, i64) = (c[2].parse().ok()?, c[3].parse().ok()?);
+            // a subject says anything: nothing reads past what `parse_subject` would take
+            ((1..=total).contains(&part) && total <= crate::parser::MAX_PARTS).then_some((
+                shape(base),
+                part,
+                total,
+                counter,
+            ))
+        })
+        .collect();
+    // a poster seen once says nothing about the upload: random ones are, and one upload's mustn't depend on them
+    let mut posters: HashMap<(u64, &str), usize> = HashMap::new();
+    for (article, found) in gathered.iter().zip(&shapes) {
+        if let Some((shape, ..)) = found {
+            *posters.entry((*shape, article.author.as_str())).or_default() += 1;
+        }
+    }
+    let lasting: HashSet<(u64, String)> =
+        posters.iter().filter(|(_, n)| **n >= 2).map(|((shape, poster), _)| (*shape, (*poster).to_string())).collect();
+
+    let mut uploads: IndexMap<String, Release> = IndexMap::new();
+    for (mut article, found) in gathered.into_iter().zip(shapes) {
+        let Some((shape, part, total, counter)) = found else { continue };
+        let poster = if lasting.contains(&(shape, article.author.clone())) { article.author.as_str() } else { "" };
+        let day = article.date.get(..10).unwrap_or(&article.date);
+        let key = format!("{group}\0per-article\0{shape:x}\0{poster}\0{day}");
+        let upload = uploads.entry(key.clone()).or_insert_with(|| Release {
+            name: per_article_name(&key),
+            collection: Some(key),
+            ..Release::default()
+        });
+        let file = match counter {
+            Some((n, files)) => format!("per-article.{n:05}of{files:05}.p{total}"),
+            None => format!("per-article.p{total}"),
+        };
+        article.release_name = Some(upload.name.clone());
+        article.filename = Some(file);
+        article.part = Some(part);
+        article.total_parts = Some(total);
+        article.file_index = counter.map(|(n, _)| i64::from(n));
+        article.file_total = counter.map(|(_, files)| i64::from(files));
+        upload.size += article.bytes;
+        upload.articles.push(article);
+    }
+    (kept, uploads.into_values().collect(), count)
+}
+
+/// Stable, in decimal: a run of hex would read as a random name, and leave search.
+fn per_article_name(key: &str) -> String {
+    let hash = key.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3));
+    format!("per-article-upload-{}-{}", hash >> 32, hash & 0xffff_ffff)
+}
+
 // ---------------------------------------------------------------- stored fragments
 
 /// What a shard stores about a release and its file: `releases.name`,
@@ -933,5 +1009,99 @@ mod tests {
         let rows: i64 = conn.query_row("select count(*) from segments", [], |r| r.get(0)).unwrap();
         assert_eq!(rows, 0, "sealed: its article is only in the blob");
         assert!(read(), "sealed");
+    }
+
+    fn obfuscated_article(part: usize, token: &str, counter: &str, author: &str) -> Article {
+        Article {
+            subject: format!(r#"{counter}"{token}" yEnc ({part}/500)"#),
+            author: author.to_string(),
+            date: "2026-11-01 10:00:00".to_string(),
+            message_id: format!("<{token}@x>"),
+            bytes: 100,
+            ..Article::default()
+        }
+    }
+
+    fn upload(from: usize, to: usize, counter: &str, author: impl Fn(usize) -> String) -> Vec<Article> {
+        (from..to)
+            .map(|p| obfuscated_article(p, &format!("{p:04}abcdefghijklmnopqrstuvwx"), counter, &author(p)))
+            .collect()
+    }
+
+    #[test]
+    fn an_upload_is_gathered_with_its_positions() {
+        let (kept, uploads, count) = gather_per_article("alt.binaries.t", upload(2, 42, "", |_| "p@x".into()));
+        assert_eq!((kept.len(), uploads.len(), count), (0, 1, 40));
+        let release = &uploads[0];
+        assert_eq!(release.size, 4_000);
+        assert_eq!(release.articles[0].part, Some(2));
+        assert_eq!(release.articles[0].total_parts, Some(500));
+        assert_eq!(release.articles[0].filename.as_deref(), Some("per-article.p500"));
+        assert!(!crate::parser::is_obfuscated(&release.name), "{}", release.name);
+    }
+
+    #[test]
+    fn later_slices_of_an_upload_get_the_same_release() {
+        let name =
+            |from, to| gather_per_article("alt.binaries.t", upload(from, to, "", |_| "p@x".into())).1[0].name.clone();
+        assert_eq!(name(2, 42), name(50, 90));
+        let elsewhere = gather_per_article("alt.binaries.u", upload(2, 42, "", |_| "p@x".into())).1[0].name.clone();
+        assert_ne!(name(2, 42), elsewhere, "not across groups");
+        let other = gather_per_article("alt.binaries.t", upload(2, 42, "", |_| "q@x".into())).1[0].name.clone();
+        assert_ne!(name(2, 42), other, "not across posters");
+    }
+
+    #[test]
+    fn a_poster_that_changes_each_article_doesnt_split_it() {
+        let (_, uploads, _) = gather_per_article("alt.binaries.t", upload(2, 42, "", |p| format!("{p}@x")));
+        assert_eq!(uploads.len(), 1);
+    }
+
+    #[test]
+    fn a_counter_keeps_an_uploads_files_apart() {
+        let mut articles = upload(2, 42, "[1/2] ", |_| "p@x".into());
+        articles.extend(upload(2, 42, "[2/2] ", |_| "p@x".into()).into_iter().map(|mut a| {
+            a.message_id.push('2');
+            a
+        }));
+        let (_, uploads, _) = gather_per_article("alt.binaries.t", articles);
+        assert_eq!(uploads.len(), 1, "one upload");
+        let files: HashSet<_> = uploads[0].articles.iter().map(|a| a.filename.clone().unwrap()).collect();
+        assert_eq!(files.len(), 2, "{files:?}");
+    }
+
+    #[test]
+    fn a_fixed_posters_upload_doesnt_depend_on_its_neighbours() {
+        let name = |articles| gather_per_article("alt.binaries.t", articles).1;
+        let alone = name(upload(2, 42, "", |_| "p@x".into()))[0].name.clone();
+        let mut mixed = upload(2, 42, "", |_| "p@x".into());
+        mixed.extend(upload(100, 180, "", |p| format!("{p}@x")));
+        let uploads = name(mixed);
+        assert_eq!(uploads.len(), 2);
+        assert!(uploads.iter().any(|u| u.name == alone && u.articles.len() == 40));
+    }
+
+    #[test]
+    fn a_subject_cant_claim_any_size() {
+        let articles: Vec<Article> = (2..42)
+            .map(|p| {
+                let token = format!("{p:04}abcdefghijklmnopqrstuvwx");
+                Article { subject: format!(r#""{token}" yEnc ({p}/1000000000)"#), ..Article::default() }
+            })
+            .collect();
+        let (kept, uploads, count) = gather_per_article("alt.binaries.t", articles);
+        assert_eq!((kept.len(), uploads.len(), count), (0, 0, 40), "skipped, as before");
+    }
+
+    #[test]
+    fn a_real_upload_is_left_alone() {
+        let articles: Vec<Article> = (1..=30)
+            .map(|p| Article {
+                subject: format!(r#"[1/1] - "Real.Upload.2026.mkv" yEnc ({p}/30)"#),
+                ..Article::default()
+            })
+            .collect();
+        let (kept, uploads, count) = gather_per_article("alt.binaries.t", articles);
+        assert_eq!((kept.len(), uploads.len(), count), (30, 0, 0));
     }
 }

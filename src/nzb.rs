@@ -114,6 +114,16 @@ pub fn build_nzb(release_id: i64) -> Result<Option<String>> {
     Ok(Some(render_nzb(&release, &articles)))
 }
 
+/// One file of a release as its own NZB: `file` counts from 1, in the order the release's whole NZB lists them.
+pub fn build_nzb_file(release_id: i64, file: usize) -> Result<Option<String>> {
+    let Some(release) = get_release(release_id)? else { return Ok(None) };
+    let articles = get_articles(release_id)?;
+    // sorted by filename, soo each file's articles are one run
+    let mut runs = articles.chunk_by(|a, b| a.filename == b.filename);
+    let Some(one) = file.checked_sub(1).and_then(|at| runs.nth(at)) else { return Ok(None) };
+    Ok(Some(render_nzb(&release, one)))
+}
+
 /// Write the nzb for a release, into `output_dir` or the current dir.
 pub fn generate_nzb(release_id: i64, output_dir: Option<&Path>) -> Result<PathBuf> {
     let release = get_release(release_id)?.ok_or_else(|| {
