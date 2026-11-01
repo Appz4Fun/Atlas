@@ -19,10 +19,16 @@ fn a_rename_reaches_everything() {
     }
     db::create_db().unwrap();
     let main = home.path().join("atlas.db");
-    let obfuscated = |name: &str, display: Option<&str>| atlas::parser::Release {
-        is_obfuscated: true,
-        display_name: display.map(String::from),
-        ..release_of(name, "a.rar", 2, 2)
+    let obfuscated = |name: &str, display: Option<&str>| {
+        let mut r = atlas::parser::Release {
+            is_obfuscated: true,
+            display_name: display.map(String::from),
+            date: "2026-10-02 10:11:12".into(),
+            ..release_of(name, "a.rar", 2, 2)
+        };
+        // an NZB with no date says when it was built, and this compares two of them
+        r.articles.iter_mut().for_each(|a| a.date = "2026-10-02 10:11:12".into());
+        r
     };
     store::save(
         &main,

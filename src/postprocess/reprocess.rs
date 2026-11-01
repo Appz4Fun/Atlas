@@ -14,9 +14,16 @@ pub fn rename_named_key(group: &str) -> String {
     format!("naming_rename_named:{group}")
 }
 
+/// The NFO step marked as done the inline names it was told to leave alone: the opt-in that frees
+/// them has to send it back too, or an NFO could never replace one.
+fn with_what_opting_in_frees(redo: StepMask) -> StepMask {
+    if redo & mask(crate::naming::NAMING) != 0 { redo | mask(crate::naming::NFO) } else { redo }
+}
+
 /// One shard, in the caller's `BEGIN IMMEDIATE` transaction: a walk that clears
 /// `redo`. False: the same walk is already queued.
 pub fn apply(tx: &Connection, redo: StepMask, group: Option<&str>, now: i64) -> rusqlite::Result<bool> {
+    let redo = with_what_opting_in_frees(redo);
     // asking for naming again is what lets it replace a name it left alone so far, in what was asked for
     if redo & mask(crate::naming::NAMING) != 0 {
         let key = group.map_or_else(|| "naming_rename_named".to_string(), rename_named_key);
@@ -114,7 +121,7 @@ fn dry_run(main: &std::path::Path, o: &Options, per_second: i64) -> anyhow::Resu
         let n: i64 = conn.query_row(
             "select count(*) from pp_state s join releases r on r.id = s.release_id
              where (s.done & ?1 != 0 or (?3 and s.failed != 0)) and (?2 is null or r.group_name = ?2)",
-            params![o.mask, group, o.failed],
+            params![with_what_opting_in_frees(o.mask), group, o.failed],
             |r| r.get(0),
         )?;
         total += n;

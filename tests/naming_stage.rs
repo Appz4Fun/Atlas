@@ -427,11 +427,13 @@ fn the_nfo_step_leaves_an_inline_name_until_asked() {
     wait_done(&h, STAGE_GROUP, id, mask(NFO));
     assert_eq!(state.bodies_sent.load(Ordering::SeqCst), 0);
     assert_eq!(row(&h, STAGE_GROUP, "x").1.as_deref(), Some("Some Book Title"));
+    h.stop();
 
-    let mut h = fresh();
-    let state = inline(&h);
-    h.shard().execute("insert into meta (key, value) values ('naming_rename_named', 1)", []).unwrap();
-    let port = spawn_server(state.clone());
+    // opting in through --reprocess sends the NFO step back, though it had its done bit
+    let mut conn = h.shard();
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
+    assert!(reprocess::apply(&tx, NAMED, None, chrono::Utc::now().timestamp()).unwrap());
+    tx.commit().unwrap();
     start(&mut h, with_bodies(), steps::all(), Some(port));
     wait_for("the NFO's name", || row(&h, STAGE_GROUP, "x").2 == Some(10));
     assert_eq!(row(&h, STAGE_GROUP, "x").1.as_deref(), Some("Real Name 2024 1080p"));
