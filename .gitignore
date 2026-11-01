@@ -31,6 +31,7 @@ Thumbs.db
 # --- atlas runtime data (lives in ATLAS_HOME, the repo root for `cargo run`) ---
 # config.json holds usenet passwords, never commit it or its backups.
 # leading / = repo root only (the docker stack has its own rules below)
+/config.toml
 /config.json
 /config.json.bak*
 # usenet logins to merge into config.json

@@ -26,7 +26,7 @@ const HISTORY_LEN: f64 = 60.0;
 const FAILED_RETRY: Duration = Duration::from_secs(300);
 /// an idle group (nothing new) is looked at again after this long
 const IDLE_RECHECK: Duration = Duration::from_secs(10);
-/// how often config.json is re-read while indexing
+/// how often config.toml is re-read while indexing
 const CONFIG_RELOAD: Duration = Duration::from_secs(5);
 
 /// how often auto_run_compact compacts the database
@@ -251,7 +251,7 @@ fn settings_of(config: &Config) -> PassSettings {
 
 /// `alt.binaries.a, alt.binaries.b` or `3197 groups, 20 at once`
 /// Groups indexed at once on each indexing server, as (server index, workers),
-/// from config.json alone (pool indexes follow `usable_servers` order). Runtime
+/// from config.toml alone (pool indexes follow `usable_servers` order). Runtime
 /// changes, like a server found to be article only or a lowered connection
 /// limit, dont change the plan, soo they never trigger a rebuild.
 fn plan_workers(config: &Config) -> Vec<(usize, usize)> {
@@ -314,7 +314,7 @@ struct Scheduler {
     compact_due: AtomicBool,
     /// no compaction before this (one couldnt take the lock)
     compact_after: Option<SystemTime>,
-    /// auto_run_compact as config.json has it now
+    /// auto_run_compact as config.toml has it now
     auto_compact: AtomicBool,
     passes: AtomicUsize,
 }
@@ -487,7 +487,7 @@ impl Scheduler {
     }
 }
 
-/// The groups whose day chunks a worker may take: ones still in config.json,
+/// The groups whose day chunks a worker may take: ones still in config.toml,
 /// except `skip`, and none when the mode never backfills.
 fn chunk_groups(mode: &str, groups: &[String], skip: &HashSet<String>) -> HashSet<String> {
     if mode == "live" {
@@ -656,7 +656,7 @@ fn needs_rebuild(sched: &Scheduler, config: &Config, servers: &[UsenetServer]) -
         || stage_shape(config) != sched.stage_shape
 }
 
-/// Re-read config.json while indexing: new groups / mode / batch settings /
+/// Re-read config.toml while indexing: new groups / mode / batch settings /
 /// auto compaction apply right away. Returns when servers, the parallelism or
 /// the unsaved headers cap changed (the caller rebuilds) or when stopping.
 async fn watch_config(sched: Arc<Scheduler>, servers: Vec<UsenetServer>) {
@@ -715,7 +715,7 @@ async fn watch_config(sched: Arc<Scheduler>, servers: Vec<UsenetServer>) {
     }
 }
 
-/// While auto_run_compact is on (looked at every second, config.json can
+/// While auto_run_compact is on (looked at every second, config.toml can
 /// change it): once the interval has passed since the last compaction (or
 /// since the indexer started, when there was none), wind down so `supervise`
 /// can compact.
@@ -963,7 +963,7 @@ async fn supervise(stop: Arc<AtomicBool>, stats: Arc<Mutex<Stats>>, writing: Opt
 
     while !stopping() {
         let Some(config) = load_config() else {
-            let why = crate::config::file_problem().unwrap_or_else(|| "config.json not found".into());
+            let why = crate::config::file_problem().unwrap_or_else(|| "config.toml not found".into());
             ui::error(&format!("error with config, stopped: {why}"));
             break;
         };

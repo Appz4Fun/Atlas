@@ -19,6 +19,12 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
+    match atlas::config::migrate_to_toml() {
+        Ok(Some(path)) => eprintln!("config.json is now {}, and the old file is config.json.bak-toml", path.display()),
+        Ok(None) => {}
+        Err(e) => eprintln!("couldnt convert config.json to config.toml, still using it: {e}"),
+    }
+
     let code = if has("--convert") {
         run_convert()
     } else if has("--compact") {

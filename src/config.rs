@@ -7,6 +7,7 @@ use serde_json::{Map, Value, json};
 
 use crate::atomic::write_atomic;
 use crate::paths::config_file;
+use std::path::{Path, PathBuf};
 
 pub const SERVICE: &str = "atlas";
 pub const DEFAULT_API_PORT: u16 = 9090;
@@ -760,29 +761,28 @@ fn env_nonempty(key: &str) -> Option<String> {
     env::var(key).ok().filter(|v| !v.is_empty())
 }
 
-/// server creds come from ATLAS_NNTP_* (docker) instead of config.json
+/// server creds come from ATLAS_NNTP_* (docker) instead of config.toml
 fn env_creds_active() -> bool {
     ["ATLAS_NNTP_HOST", "ATLAS_NNTP_USER", "ATLAS_NNTP_PASS"].iter().all(|k| env_nonempty(k).is_some())
 }
 
-/// Why config.json cant be used though it's there, see `file_problem_at`.
+/// Why the config file cant be used though it's there, see `file_problem_at`.
 pub fn file_problem() -> Option<String> {
     file_problem_at(&config_file())
 }
 
 /// Why the config file at `path` cant be used though it's there: it cant be
-/// read, or isnt valid JSON (where, as serde_json says, never the text: it
-/// holds passwords), or is JSON that isnt an object (`null`, a list...: it
-/// would load as an empty config, and setup would save over it). None when
-/// it's fine, or isnt there at all.
-pub fn file_problem_at(path: &std::path::Path) -> Option<String> {
+/// read, or doesnt parse (where, never the text: it holds passwords), or is
+/// JSON that isnt an object (`null`, a list...: it would load as an empty
+/// config, and setup would save over it). None when it's fine, or isnt there at all.
+pub fn file_problem_at(path: &Path) -> Option<String> {
     let text = match fs::read_to_string(path) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return None,
         Err(e) => return Some(format!("couldnt read {}: {e}", path.display())),
         Ok(text) => text,
     };
-    match serde_json::from_str::<Value>(&text) {
-        Err(e) => Some(format!("{} isnt valid JSON: {e}", path.display())),
+    match parse_config(path, &text) {
+        Err(e) => Some(format!("{} isnt valid {e}", path.display())),
         Ok(Value::Object(_)) => None,
         Ok(other) => {
             let kind = match other {
@@ -797,9 +797,92 @@ pub fn file_problem_at(path: &std::path::Path) -> Option<String> {
     }
 }
 
+fn is_json(path: &Path) -> bool {
+    path.extension().is_some_and(|e| e == "json")
+}
+
+/// By its extension. An error names the format and where, never the text: toml's own display quotes the line.
+fn parse_config(path: &Path, text: &str) -> Result<Value, String> {
+    if is_json(path) {
+        return serde_json::from_str(text).map_err(|e| format!("JSON: {e}"));
+    }
+    toml_edit::de::from_str(text).map_err(|e| {
+        let at = e.span().map_or(0, |s| s.start).min(text.len());
+        let line = text.as_bytes()[..at].iter().filter(|b| **b == b'\n').count() + 1;
+        let first_line = e.message().lines().next().unwrap_or_default();
+        // a message can quote a value: say only what's safe
+        let what = if first_line.contains('`') || first_line.contains('"') { "syntax error" } else { first_line };
+        format!("TOML: {what} at line {line}")
+    })
+}
+
 fn read_file() -> Option<Value> {
-    let text = fs::read_to_string(config_file()).ok()?;
-    serde_json::from_str(&text).ok().filter(Value::is_object)
+    let path = config_file();
+    let text = fs::read_to_string(&path).ok()?;
+    parse_config(&path, &text).ok().filter(Value::is_object)
+}
+
+/// A config.json becomes config.toml, keeping the old one as `config.json.bak-toml` to go back with.
+/// Run once at start. One that doesnt parse stays, for `file_problem` to report.
+pub fn migrate_to_toml() -> io::Result<Option<PathBuf>> {
+    let dir = crate::paths::app_dir();
+    let (json, toml) = (dir.join("config.json"), dir.join("config.toml"));
+    if toml.exists() || !json.exists() {
+        return Ok(None);
+    }
+    let text = fs::read_to_string(&json)?;
+    let Ok(Value::Object(_)) = parse_config(&json, &text) else { return Ok(None) };
+    let value = parse_config(&json, &text).unwrap_or(Value::Null);
+    write_toml_at(&toml, &value)?;
+    let back = fs::read_to_string(&toml).ok().and_then(|t| parse_config(&toml, &t).ok());
+    if back.as_ref() != Some(&without_nulls(&value)) {
+        let _ = fs::remove_file(&toml);
+        return Err(io::Error::other("the converted config didnt read back the same"));
+    }
+    fs::rename(&json, dir.join("config.json.bak-toml"))?;
+    Ok(Some(toml))
+}
+
+/// TOML has no null, and an absent key means the same to every reader here.
+fn without_nulls(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => Value::Object(
+            map.iter().filter(|(_, v)| !v.is_null()).map(|(k, v)| (k.clone(), without_nulls(v))).collect(),
+        ),
+        Value::Array(list) => Value::Array(list.iter().filter(|v| !v.is_null()).map(without_nulls).collect()),
+        other => other.clone(),
+    }
+}
+
+/// Only the keys that changed are replaced, soo comments elsewhere in the file survive a save. Always private: it can hold passwords.
+fn write_toml_at(path: &Path, value: &Value) -> io::Result<()> {
+    let value = without_nulls(value);
+    // pretty: `[[usenet_servers]]` and `[media]`, not one long inline line
+    let pretty = toml_edit::ser::to_string_pretty(&value).map_err(io::Error::other)?;
+    let new = pretty.parse::<toml_edit::DocumentMut>().map_err(io::Error::other)?;
+    let old_text = fs::read_to_string(path).unwrap_or_default();
+    let text = match (old_text.parse::<toml_edit::DocumentMut>(), toml_edit::de::from_str::<Value>(&old_text)) {
+        (Ok(mut doc), Ok(old)) => {
+            let gone: Vec<String> = doc.iter().map(|(k, _)| k.to_string()).filter(|k| value.get(k).is_none()).collect();
+            for key in gone {
+                doc.remove(&key);
+            }
+            for (key, item) in new.iter() {
+                if old.get(key) != value.get(key) {
+                    doc[key] = item.clone();
+                }
+            }
+            doc.to_string()
+        }
+        _ => pretty,
+    };
+    write_atomic(path, text.as_bytes())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
 }
 
 /// Load config. Servers come from `usenet_servers` (or the old top level
@@ -942,7 +1025,7 @@ pub fn save_config(cfg: &Config) -> io::Result<()> {
         out.insert("auto_run_compact".into(), json!(true));
     }
 
-    write_json(&Value::Object(out), private)
+    write_config(&Value::Object(out), private)
 }
 
 /// Returns the api key, generating and persisting one the first time.
@@ -964,18 +1047,21 @@ pub fn get_api_key(cfg: &mut Config) -> (String, bool) {
 
     let has_password = saved.contains_key("password") || saved.contains_key("usenet_servers");
     saved.insert("api_key".into(), json!(key));
-    let _ = write_json(&Value::Object(saved), has_password);
+    let _ = write_config(&Value::Object(saved), has_password);
 
     (key, true)
 }
 
-fn write_json(value: &Value, private: bool) -> io::Result<()> {
+fn write_config(value: &Value, private: bool) -> io::Result<()> {
+    let path = config_file();
+    if !is_json(&path) {
+        return write_toml_at(&path, value);
+    }
     let mut buf = Vec::new();
     let fmt = serde_json::ser::PrettyFormatter::with_indent(b"    ");
     let mut ser = serde_json::Serializer::with_formatter(&mut buf, fmt);
     serde::Serialize::serialize(value, &mut ser).map_err(io::Error::other)?;
 
-    let path = config_file();
     write_atomic(&path, &buf)?;
 
     #[cfg(unix)]
@@ -1078,7 +1164,7 @@ mod tests {
 
     #[test]
     fn the_example_keeps_every_provider_off() {
-        let example: Value = serde_json::from_str(include_str!("../config.example.json")).unwrap();
+        let example = parse_config(Path::new("config.toml"), include_str!("../config.example.toml")).unwrap();
         assert!(!Config::from_value(&example).media.any_provider());
     }
 
@@ -1118,7 +1204,7 @@ mod tests {
             !readme.contains("Every release is in category")
                 && !readme.contains("Atlas reports every release as category")
         );
-        let example: Value = serde_json::from_str(include_str!("../config.example.json")).unwrap();
+        let example = parse_config(Path::new("config.toml"), include_str!("../config.example.toml")).unwrap();
         assert_eq!(Config::from_value(&example).category, CategoryConfig::default());
     }
 
@@ -1282,6 +1368,53 @@ mod tests {
         }
         std::fs::write(&path, "{}").unwrap();
         assert_eq!(file_problem_at(&path), None, "an empty object is still a config");
+    }
+
+    #[test]
+    fn invalid_toml_says_where_without_its_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "groups = []\npassword = \"hunter2\n").unwrap();
+        let problem = file_problem_at(&path).expect("an unclosed string");
+        assert!(problem.contains("TOML") && problem.contains("line 2"), "{problem}");
+        assert!(!problem.contains("hunter2"), "no file contents: {problem}");
+        std::fs::write(&path, "groups = []\n").unwrap();
+        assert_eq!(file_problem_at(&path), None);
+    }
+
+    #[test]
+    fn a_save_keeps_comments_on_what_didnt_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let text = "# my servers\napi_port = 9091 # the port\ngroups = [\"a\"]\n\n# mine\n[media]\nparse = true\n";
+        std::fs::write(&path, text).unwrap();
+        let value = json!({"api_port": 9091, "groups": ["a", "b"], "media": {"parse": true}});
+        write_toml_at(&path, &value).unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("# the port") && saved.contains("# mine"), "{saved}");
+        assert_eq!(parse_config(&path, &saved).unwrap(), value);
+    }
+
+    #[test]
+    fn every_shape_of_config_survives_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let value = json!({
+            "archive": {"enabled": true, "ratio": 0.5},
+            "group": "alt.binaries.x",
+            "groups": [],
+            "note": null,
+            "usenet_servers": [{"host": "a", "port": 563, "ssl": true}, {"host": "b"}],
+            "z_after_tables": 1,
+        });
+        write_toml_at(&path, &value).unwrap();
+        let back = parse_config(&path, &std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(back, without_nulls(&value));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        }
     }
 
     #[test]

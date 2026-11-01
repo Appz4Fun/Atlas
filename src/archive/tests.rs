@@ -690,7 +690,7 @@ mod select_tests {
             archive: ArchiveConfig { enabled: archive, ..Default::default() },
             ..Config::default()
         };
-        assert!(!stage_owns_names(&Config::default()), "an existing config.json");
+        assert!(!stage_owns_names(&Config::default()), "an existing config.toml");
         assert!(!stage_owns_names(&config(false, 300, true)), "the stage is off");
         assert!(stage_owns_names(&config(true, 300, true)), "a body budget");
         assert!(!stage_owns_names(&config(true, 300, false)), "the budget serves other parts");
