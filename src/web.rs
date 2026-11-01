@@ -271,6 +271,21 @@ const MAX_EARLIER_FOR_COPIES: i64 = 2_000;
 const FILTERS: &[&str] = &["2160p", "1080p", "DV", "HDR", "Remux", "WEB-DL", "BluRay", HIDE_COPIES];
 const HIDE_COPIES: &str = "Hide copies";
 
+/// The first of each list, then the second of each, and soo on, each row once.
+fn take_in_turn(lists: &[Vec<ReleaseRow>]) -> Vec<ReleaseRow> {
+    let longest = lists.iter().map(Vec::len).max().unwrap_or(0);
+    let mut seen = std::collections::HashSet::new();
+    let mut rows = Vec::new();
+    for at in 0..longest {
+        for row in lists.iter().filter_map(|list| list.get(at)) {
+            if seen.insert(row.id) {
+                rows.push(row.clone());
+            }
+        }
+    }
+    rows
+}
+
 /// How many searches a set of filters can turn into.
 const MAX_WORD_CHOICES: usize = 12;
 
@@ -404,7 +419,8 @@ impl Search {
         choices
     }
 
-    /// Every spelling's results merged, newest first, or the one search there is.
+    /// Every spelling's results taken in turn, or the one search there is. Taking them in turn keeps a row's place as
+    /// more are asked for, soo "Load more" neither repeats nor skips any.
     fn search(
         &self,
         filter: Option<&crate::category::CatFilter>,
@@ -422,23 +438,9 @@ impl Search {
         if let [only] = choices.as_slice() {
             return one(only, from, count);
         }
-        let mut merged: HashMap<i64, ReleaseRow> = HashMap::new();
-        for words in &choices {
-            merged.extend(one(words, 0, from + count)?.into_iter().map(|r| (r.id, r)));
-        }
-        let mut rows: Vec<ReleaseRow> = merged.into_values().collect();
-        rows.sort_by_key(|r| std::cmp::Reverse(r.id));
+        let lists = choices.iter().map(|words| one(words, 0, from + count)).collect::<Result<Vec<_>, _>>()?;
+        let rows = take_in_turn(&lists);
         Ok(rows.into_iter().skip(from as usize).take(count as usize).collect())
-    }
-
-    /// The words to look for: the box, and what the filters add to it.
-    fn words(&self) -> String {
-        let mut words = self.q.clone();
-        for filter in self.filters.iter().filter(|f| **f != HIDE_COPIES) {
-            words.push(' ');
-            words.push_str(filter);
-        }
-        words.trim().to_string()
     }
 
     fn filter_links(&self) -> String {
@@ -625,7 +627,7 @@ impl Search {
         }
         let total = if self.fields.any() {
             let filter = parse_filter(&self.cat);
-            match field_search::count(&self.fields, &self.words(), filter.as_ref()) {
+            match field_search::count_any(&self.fields, &self.word_choices(), filter.as_ref()) {
                 Ok(total) => format!("<strong class=\"total\">{}</strong>", escape(&total.describe())),
                 Err(e) => {
                     eprintln!("web count failed: {e}");
@@ -2033,6 +2035,16 @@ mod tests {
         assert!(choices.len() <= MAX_WORD_CHOICES);
         args.remove("filters");
         assert_eq!(Search::from_args(&args).word_choices(), ["film"]);
+    }
+
+    #[test]
+    fn asking_for_more_keeps_each_row_in_its_place() {
+        let rows = |ids: &[i64]| ids.iter().map(|id| ReleaseRow { id: *id, ..Default::default() }).collect::<Vec<_>>();
+        let ids = |rows: Vec<ReleaseRow>| rows.iter().map(|r| r.id).collect::<Vec<_>>();
+        let short = take_in_turn(&[rows(&[1, 2]), rows(&[9, 1])]);
+        let long = take_in_turn(&[rows(&[1, 2, 3, 4]), rows(&[9, 1, 8, 7])]);
+        assert_eq!(ids(short.clone()), [1, 9, 2]);
+        assert_eq!(ids(long)[..short.len()], ids(short));
     }
 
     #[test]

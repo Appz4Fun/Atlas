@@ -112,6 +112,26 @@ fn a_show_only_thetvdb_knows() {
         route("/login", r#"{"data":{"token":"t"}}"#.into()),
         route("/series/78/extended", series("https://elsewhere.example")),
     ]);
+    // gone from TMDB, with TheTVDB still having it
+    let gone = FixtureServer::start(vec![]);
+    gone.set_routes(vec![
+        route("/login", r#"{"data":{"token":"t"}}"#.into()),
+        route("/series/79/extended", series("https://elsewhere.example")),
+        common::http::status("/tv/5", 404),
+    ]);
+    let both = MediaConfig {
+        tvdb: TvdbConfig { base_url: Some(gone.base.clone()), ..cfg.tvdb.clone() },
+        tmdb: TmdbConfig {
+            api_key: "key".into(),
+            requests_per_minute: 3000,
+            base_url: Some(gone.base.clone()),
+            image_base_url: None,
+        },
+        ..cfg.clone()
+    };
+    let d = for_title(&both, TV, &Ids { tmdb: Some(5), tvdb: Some(79), ..Ids::default() }).unwrap();
+    assert_eq!(d.tmdb_id, -79);
+
     let other =
         MediaConfig { tvdb: TvdbConfig { base_url: Some(bad.base.clone()), ..cfg.tvdb.clone() }, ..cfg.clone() };
     let d = for_title(&other, TV, &Ids { tvdb: Some(78), ..Ids::default() }).unwrap();

@@ -302,7 +302,8 @@ fn budgeted(
 fn zip_list(ctx: &mut StepCtx<'_>, head: &Head<'_>, body: &[u8], left: &mut usize) -> Result<Listing, StepError> {
     let in_body = zip::list_tail(body);
     if !in_body.files.is_empty() {
-        return Ok(in_body);
+        // with the first entry's password check, which only the local header has
+        return Ok(zip::list(body, body));
     }
     let segs = tail_articles(ctx, head.tail)?;
     let Some(last) = segs.last() else { return Ok(zip::list(body, &[])) };

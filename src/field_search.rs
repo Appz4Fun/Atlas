@@ -312,8 +312,31 @@ pub fn count(fields: &Fields, words: &str, filter: Option<&CatFilter>) -> Result
     count_with(&db::open()?, fields, words, filter)
 }
 
+/// How many match any of these sets of words, each counted once.
+pub fn count_any(fields: &Fields, choices: &[String], filter: Option<&CatFilter>) -> Result<Total> {
+    let mut plan = plan(fields, "", filter);
+    let mut sets = Vec::new();
+    for words in choices {
+        let mut set = Vec::new();
+        for word in words.split_whitespace() {
+            plan.values.push(Value::Text(like_query(word)));
+            set.push(format!(r"coalesce(r.display_name, r.name) like ?{} escape '\'", plan.values.len() + 2));
+        }
+        if !set.is_empty() {
+            sets.push(format!("({})", set.join(" and ")));
+        }
+    }
+    if sets.len() == choices.len() && !sets.is_empty() {
+        plan.conditions.push(format!("({})", sets.join(" or ")));
+    }
+    count_plan(&db::open()?, fields, &plan)
+}
+
 pub fn count_with(conn: &Connection, fields: &Fields, words: &str, filter: Option<&CatFilter>) -> Result<Total> {
-    let plan = plan(fields, words, filter);
+    count_plan(conn, fields, &plan(fields, words, filter))
+}
+
+fn count_plan(conn: &Connection, fields: &Fields, plan: &Plan) -> Result<Total> {
     let mut total = Total { count: 0, exact: true };
     for s in shards_of(fields) {
         total.exact &= indexed(conn, fields, s);

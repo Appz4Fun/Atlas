@@ -374,7 +374,8 @@ impl Sources {
         body.get(list)?.as_array()?.first()?.get("id")?.as_i64()
     }
 
-    fn fetch(&self, kind: i64, tmdb_id: i64, ids: &Ids, now: i64) -> Option<Details> {
+    /// None: TMDB has no such title. An error: it couldn't say.
+    fn fetch(&self, kind: i64, tmdb_id: i64, ids: &Ids, now: i64) -> Result<Option<Details>, ()> {
         let section = if kind == Kind::Tv as i64 { "tv" } else { "movie" };
         let extra = if kind == Kind::Tv as i64 { "credits" } else { "credits,release_dates" };
         let url = format!(
@@ -382,10 +383,14 @@ impl Sources {
             self.tmdb_base(),
             encode(&self.tmdb.api_key)
         );
-        let Ok(Reply::Json(body)) = self.tmdb_client.get(&url, &[]) else { return None };
+        let body = match self.tmdb_client.get(&url, &[]) {
+            Ok(Reply::Json(body)) => body,
+            Ok(Reply::NotFound) => return Ok(None),
+            Err(_) => return Err(()),
+        };
         let mut details = from_tmdb(kind, tmdb_id, &body, now);
         self.add_ratings(&mut details, kind, ids, now);
-        Some(details)
+        Ok(Some(details))
     }
 
     /// What a show TMDB has no record of looks like to TheTVDB, with what else rates it.
@@ -439,9 +444,16 @@ pub fn for_title(cfg: &MediaConfig, kind: i64, ids: &Ids) -> Option<Details> {
             return kept;
         }
         if tmdb_on {
-            let Some(fresh) = asked.and_then(|s| s.fetch(kind, tmdb_id, ids, now)) else { return kept };
-            let _ = write(&conn, &fresh);
-            return Some(fresh);
+            match asked?.fetch(kind, tmdb_id, ids, now) {
+                Ok(Some(fresh)) => {
+                    let _ = write(&conn, &fresh);
+                    return Some(fresh);
+                }
+                // a failure says nothing about the title
+                Err(()) => return kept,
+                // gone from TMDB: TheTVDB may still have it
+                Ok(None) => {}
+            }
         }
         if kept.is_some() {
             return kept;

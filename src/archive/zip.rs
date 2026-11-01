@@ -344,6 +344,7 @@ pub fn list(head: &[u8], tail: &[u8]) -> Listing {
         return from_head;
     }
     from_tail.encrypted |= from_head.encrypted;
+    from_tail.password_check = from_tail.password_check.or(from_head.password_check);
     from_tail
 }
 
