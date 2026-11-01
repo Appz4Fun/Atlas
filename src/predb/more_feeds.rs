@@ -14,6 +14,7 @@ use super::feeds::{ParseError, int, megabytes, number, rows, text};
 use super::import::Entry;
 
 const MAX_TITLE_CHARS: usize = 255;
+/// the most rows of an RSS feed or a page of cards
 const MAX_RSS_ITEMS: usize = 5_000;
 const MAX_CATALOGUE: usize = 5_000;
 const NZEDB_FIELDS: usize = 12;
@@ -38,6 +39,7 @@ re!(DOTTED_NAME, r"^[^.]+\.[^.]+(?:\.[^.]+)*$");
 re!(CROWDNFO_LINK, r#"(?s)<a\s[^>]*href="/release/[1-9][0-9]*"[^>]*>(.*?)</a>"#);
 re!(H2, r"(?s)<h2(?:\s[^>]*)?>(.*?)</h2>");
 re!(NIMA4K_SUBTITLE, r#"(?s)<span\s[^>]*class="(?:[^"]*\s)?subtitle(?:\s[^"]*)?"[^>]*>([^<]*)</span>"#);
+re!(NIMA4K_ALT, r#"<img\s[^>]*alt="([^"]*)""#);
 re!(G4U_TODAY, r"(?s)<h1(?:\s[^>]*)?>\s*Updates from today,");
 re!(HEADING, r"(?i)<h[12][\s>]");
 re!(G4U_TITLE, r#"(?s)<div\s[^>]*class="(?:[^"]*\s)?w3-opacity-min(?:\s[^"]*)?"[^>]*>([^<]*)</div>"#);
@@ -271,13 +273,18 @@ pub fn parse_crowdnfo(body: &str) -> Result<Vec<Entry>, ParseError> {
 
 /// A card's subtitle, when its cover image says the same. Anything else named `subtitle` doesn't.
 pub fn parse_nima4k(body: &str) -> Result<Vec<Entry>, ParseError> {
-    let out: Vec<_> = NIMA4K_SUBTITLE
-        .captures_iter(body)
-        .filter(|c| body.contains(&format!("alt=\"{}\"", c[1].trim())))
-        .map(|c| unescape(&c[1]))
-        .filter(|t| literal(t))
-        .map(named)
-        .collect();
+    let covers: HashSet<&str> = NIMA4K_ALT.captures_iter(body).filter_map(|c| c.get(1)).map(|m| m.as_str()).collect();
+    let mut out = Vec::new();
+    for (count, card) in NIMA4K_SUBTITLE.captures_iter(body).enumerate() {
+        if count >= MAX_RSS_ITEMS {
+            return Err(shape("too many release cards"));
+        }
+        let raw = card[1].trim();
+        let title = unescape(raw);
+        if covers.contains(raw) && literal(&title) {
+            out.push(named(title));
+        }
+    }
     if out.is_empty() { Err(shape("no release cards")) } else { Ok(out) }
 }
 
