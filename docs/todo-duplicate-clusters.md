@@ -34,7 +34,6 @@ Built on the `feat/release-details` branch. Instead of cluster tables, each rele
 - [x] **Posted fingerprint:** sizes and MD5s from a complete PAR2 set. Equal ones are byte-identical, which makes a **twin**.
 - [x] **Content fingerprint:** exact sizes of the real files, at least 1 MiB, leaving out samples, with names ignored. Equal ones with different posted files make a **pair**.
 - [x] Written by the archive and PAR2 steps as releases are read.
-- [x] `atlas --fingerprints --apply` fills in content fingerprints from stored data. It finds pairs only, because PAR2 hashes were never stored.
 - [x] Web UI: "Other copies" on the release page, with TWIN and PAIR tags, and counts in results.
 - [x] Newznab API: `twins` and `pairs` attributes.
 - [x] "Hide copies" filter in search, off by default, within a page.
@@ -43,8 +42,9 @@ Built on the `feat/release-details` branch. Instead of cluster tables, each rele
 
 ### Left
 
-- [ ] **Prod has no archive data yet.** Its body budget is 0, so no archive or PAR2 set has been read, and `archive_inner_files` is empty. Until the budget is turned on, twins, pairs, encryption types and NFO passwords have nothing to show. On a snapshot at 09:46 on 2026-11-01, `--fingerprints` found 0 releases.
+- [ ] **Prod has no archive data yet.** Its body budget is 0, so no archive or PAR2 set has been read, and `archive_inner_files` is empty. Until the budget is turned on, twins, pairs, encryption types and NFO passwords have nothing to show. 
 - [ ] Once there's data: how many copies, the share of each kind, a hand check of a sample for false matches, and how long lookups take with real fingerprints. Today's timings only cover an empty table: about 30 to 60 ms more per page.
+- [ ] Only complete lists make a content fingerprint, because a partial one could call two releases the same. Reading only a RAR's first article often gives a partial list, so pairs may be rare until more is read. Check this once there's data.
 - [ ] Collapse copies across a whole search. "Hide copies" only works within a page.
 - [ ] Encrypted archives with hidden names have no listing, so they get no content fingerprint. They can still be twins through PAR2.
 
@@ -75,6 +75,7 @@ Everything below goes on the release page in the web UI. The API has the tags an
 - [x] Tags to show: resolution, Dolby Vision, HDR10, HDR10+, source (BluRay, WEB-DL, Remux), video and audio codec, channels, release group, year, edition, languages.
 - [x] **Where it was ripped from:** the streaming service tag, such as AMZN, NF, DSNP, HMAX or ATVP.
 - [x] Quick filters in results: 2160p, 1080p, DV, HDR, Remux, WEB-DL, BluRay. They search the words, then check the parsed tags, so a page can come back short.
+- [ ] Filter aliases: a filter searches for its own word, so names that say `4k` or `DoVi` don't come up under 2160p or DV.
 - [x] Tags in the Newznab API: `resolution`, `video`, `audio`, `hdr`, `source`, `language`, `team`, plus `poster` and `group`.
 
 ### TMDB and TVDB metadata
