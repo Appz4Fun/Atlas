@@ -214,6 +214,13 @@ impl Media {
         }
     }
 
+    /// A title that no longer has these IDs: the fan-out takes them off its rows too.
+    pub(crate) fn fan_out_again(&self, key: i64) -> Result<(), String> {
+        self.with_store(|c| store::fanout_owed_again(c, key))?;
+        self.fanout.lock().unwrap().push_back(key);
+        Ok(())
+    }
+
     pub(crate) fn next_fanout(&self) -> Option<i64> {
         self.fanout.lock().unwrap().pop_front()
     }

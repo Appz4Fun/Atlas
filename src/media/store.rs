@@ -132,6 +132,11 @@ pub fn fanout_owed(conn: &Connection) -> rusqlite::Result<Vec<i64>> {
     conn.prepare("select title_key from media_titles where fanout_done = 0")?.query_map([], |r| r.get(0))?.collect()
 }
 
+pub fn fanout_owed_again(conn: &Connection, key: i64) -> rusqlite::Result<()> {
+    conn.execute("update media_titles set fanout_done = 0 where title_key = ?1", [key])?;
+    Ok(())
+}
+
 pub fn fanout_finished(conn: &Connection, key: i64) -> rusqlite::Result<()> {
     conn.execute("update media_titles set fanout_done = 1 where title_key = ?1", [key])?;
     Ok(())

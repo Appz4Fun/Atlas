@@ -3,7 +3,7 @@
 //! Ported from newznab-tmux `app/Services/TvProcessing/Providers/AbstractTvProvider.php`, GPLv3,
 //! stricter on year and country: a scene name carries those because the title clashes.
 
-use super::title::Kind;
+use super::title::{Kind, normalize};
 
 const MAX_COMPARED: usize = 200;
 
@@ -49,12 +49,28 @@ pub fn country_code(c: &str) -> String {
     if upper == "UK" { "GB".into() } else { upper }
 }
 
-/// 0.0 is no match. Compared lowercased. Exact 100, else percent if >= 75.
+/// The title as a key has it, with the letters of an acronym back together: `S.W.A.T.` and `SWAT` are one name.
+fn comparable(title: &str) -> String {
+    let normalized = normalize(title);
+    let mut out = String::with_capacity(normalized.len());
+    let mut last_single = false;
+    for word in normalized.split(' ') {
+        let single = word.chars().count() == 1 && word.chars().all(char::is_alphabetic);
+        if !out.is_empty() && !(single && last_single) {
+            out.push(' ');
+        }
+        out.push_str(word);
+        last_single = single;
+    }
+    out
+}
+
+/// 0.0 is no match. Compared as `comparable` writes them. Exact 100, else percent if >= 75.
 /// A country on our side against known countries, none equal under `country_code`: 0. Equal adds 2.
 /// Both years known: within 1 adds 10, otherwise 0, even for an exact title.
 /// Movie only: with no year on our side, only an exact title counts.
 pub fn score(kind: Kind, ours: &str, our_year: Option<i32>, our_country: Option<&str>, c: &Candidate<'_>) -> f64 {
-    let (a, b) = (ours.to_lowercase(), c.title.to_lowercase());
+    let (a, b) = (comparable(ours), comparable(c.title));
     let mut score = if a == b {
         100.0
     } else {
@@ -105,6 +121,14 @@ mod tests {
     fn a_long_title_is_cut() {
         let (a, b) = ("ab".repeat(1 << 19), "ba".repeat(1 << 19));
         assert_eq!(percent(&a, &b), percent(&a[..200], &b[..200]));
+    }
+
+    #[test]
+    fn an_acronym_is_one_name() {
+        let c = Candidate { title: "S.W.A.T.", year: None, countries: &[] };
+        assert_eq!(score(Kind::Tv, "SWAT", None, None, &c), 100.0);
+        assert_eq!(comparable("Marvel's Agents & S.H.I.E.L.D."), "marvels agents and shield");
+        assert_eq!(comparable("Mr T Show"), "mr t show");
     }
 
     #[test]

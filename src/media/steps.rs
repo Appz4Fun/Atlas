@@ -217,6 +217,18 @@ impl Step for MediaParse {
     }
 }
 
+/// Whether rows of this title in this shard hold IDs. The newest few are enough: a fan-out reaches them all alike.
+fn stale_ids(conn: &Connection, key: i64) -> rusqlite::Result<bool> {
+    conn.prepare_cached(
+        "select 1 from (select tvdb_id, tvmaze_id, trakt_id, tmdb_id, imdb_id, tvrage_id, imdb_from_nfo
+           from media_release indexed by media_release_title where title_key = ?1 order by release_id desc limit 100)
+         where tvdb_id is not null or tvmaze_id is not null or trakt_id is not null or tmdb_id is not null
+            or tvrage_id is not null or (imdb_id is not null and imdb_from_nfo = 0)
+         limit 1",
+    )?
+    .exists([key])
+}
+
 fn found_write(id: i64, key: i64, ids: &Ids) -> StepWrite {
     StepWrite::new(
         FOUND,
@@ -278,7 +290,14 @@ impl Step for MediaLookup {
             Resolved::Found(ids) => {
                 Ok(Outcome { matched: true, writes: vec![found_write(id, key, &ids)], ..Outcome::default() })
             }
-            Resolved::NotFound => Ok(Outcome::default()),
+            Resolved::NotFound => {
+                // nothing asked a title with IDs in the cache, soo these are from a row deleted by hand: a wrong match
+                let conn = ctx.conn();
+                if stale_ids(conn, key).map_err(|e| StepError::Retry(e.to_string()))? {
+                    self.0.fan_out_again(key).map_err(StepError::Retry)?;
+                }
+                Ok(Outcome::default())
+            }
             Resolved::Later(_) if ctx.stopping() => Err(StepError::Stopped),
             Resolved::Later(t) => Ok(Outcome { wait_until: Some(t + id.rem_euclid(30)), ..Outcome::default() }),
         }

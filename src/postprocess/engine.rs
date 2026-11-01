@@ -875,95 +875,110 @@ impl Inner {
             return self.send(db, shard, one(a), now, |_| Ok(()));
         }
 
-        // Begin, before anything can go wrong
-        let begin_at = now + NET_CRASH_RETRY;
-        let answer = db.on_writer(
-            shard,
-            Box::new(move |tx| {
-                tx.prepare_cached(
-                    "update pp_state set net_attempts = net_attempts + 1, net_next_at = ? where release_id = ?",
-                )?
-                .execute(params![begin_at, id])?;
-                Ok(())
-            }),
-        )?;
-        answer.recv()?.map_err(anyhow::Error::msg)?;
-
-        let mut ctx = StepCtx {
-            release: row.info.clone(),
-            conn,
-            facts: Vec::new(),
-            bodies: &self.fetcher,
-            used_bodies: 0,
-            deadline: Instant::now() + STEP_DEADLINE,
-            lane_can_fetch: step.needs() == Needs::Bodies,
-        };
-        let ran = match catch_unwind(AssertUnwindSafe(|| step.run(&mut ctx))) {
-            Ok(Ok(outcome)) => Ran::Outcome(outcome),
-            Ok(Err(e)) => Ran::Error(e),
-            Err(panic) => Ran::Error(StepError::Retry(panic_text(panic))),
-        };
-        let now = chrono::Utc::now().timestamp();
-        let attempts_before = row.net_attempts;
         let mut batch = Batch::default();
-        match ran {
-            Ran::Outcome(mut o) => {
-                batch.holds.extend(o.hold.take());
-                if let Some(until) = o.wait_until {
-                    a.net_attempts = Some(attempts_before);
-                    a.net_next_at = Some(until);
-                } else {
-                    self.count_done(&o);
-                    a.set_done |= bit;
-                    a.net_mask &= !bit;
-                    a.net_attempts = Some(0);
-                    a.net_next_at = Some(0);
-                    a.writes.extend(std::mem::take(&mut o.writes).into_iter().map(|w| (bit, w)));
-                    // later steps run again: this lane's come back to it, the database's through the queue
-                    let later = self.steps.iter().filter(|s| s.rank() > step.rank()).fold(0, |m, s| m | mask(s.id()));
-                    a.clear |= o.rerun & later;
-                    a.net_mask |= o.rerun & later & a.net_steps;
-                    if let Some(name) = o.name.take() {
-                        let on_rename = self.step_mask(|s| s.rank() > step.rank() && s.reruns().on_rename);
-                        a.rename_clears |= on_rename;
-                        a.net_mask |= on_rename & a.net_steps;
-                        a.names.push((bit, name));
+        let mut waiting: Option<i64> = None;
+        for step in left {
+            let bit = mask(step.id());
+            // Begin, before anything can go wrong
+            let begin_at = now + NET_CRASH_RETRY;
+            let answer = db.on_writer(
+                shard,
+                Box::new(move |tx| {
+                    tx.prepare_cached(
+                        "update pp_state set net_attempts = net_attempts + 1, net_next_at = ? where release_id = ?",
+                    )?
+                    .execute(params![begin_at, id])?;
+                    Ok(())
+                }),
+            )?;
+            answer.recv()?.map_err(anyhow::Error::msg)?;
+
+            let mut ctx = StepCtx {
+                release: row.info.clone(),
+                conn,
+                facts: Vec::new(),
+                bodies: &self.fetcher,
+                used_bodies: 0,
+                deadline: Instant::now() + STEP_DEADLINE,
+                lane_can_fetch: step.needs() == Needs::Bodies,
+            };
+            let ran = match catch_unwind(AssertUnwindSafe(|| step.run(&mut ctx))) {
+                Ok(Ok(outcome)) => Ran::Outcome(outcome),
+                Ok(Err(e)) => Ran::Error(e),
+                Err(panic) => Ran::Error(StepError::Retry(panic_text(panic))),
+            };
+            let now = chrono::Utc::now().timestamp();
+            let attempts_before = row.net_attempts;
+            match ran {
+                Ran::Outcome(mut o) => {
+                    batch.holds.extend(o.hold.take());
+                    if let Some(until) = o.wait_until {
+                        // what it waits for needn't hold up the steps after it
+                        waiting = Some(waiting.map_or(until, |w: i64| w.min(until)));
+                        a.net_attempts = Some(attempts_before);
+                        a.net_next_at = Some(until);
+                        continue;
+                    } else {
+                        self.count_done(&o);
+                        a.set_done |= bit;
+                        a.net_mask &= !bit;
+                        a.net_attempts = Some(0);
+                        a.net_next_at = Some(0);
+                        a.writes.extend(std::mem::take(&mut o.writes).into_iter().map(|w| (bit, w)));
+                        // later steps run again: this lane's come back to it, the database's through the queue
+                        let later =
+                            self.steps.iter().filter(|s| s.rank() > step.rank()).fold(0, |m, s| m | mask(s.id()));
+                        a.clear |= o.rerun & later;
+                        a.net_mask |= o.rerun & later & a.net_steps;
+                        if let Some(name) = o.name.take() {
+                            let on_rename = self.step_mask(|s| s.rank() > step.rank() && s.reruns().on_rename);
+                            a.rename_clears |= on_rename;
+                            a.net_mask |= on_rename & a.net_steps;
+                            a.names.push((bit, name));
+                        }
                     }
                 }
-            }
-            Ran::Error(StepError::Stopped) => {
-                a.net_attempts = Some(attempts_before);
-                a.net_next_at = Some(now);
-            }
-            Ran::Error(StepError::Retry(e)) => {
-                self.stats.retries.fetch_add(1, Relaxed);
-                let attempt = attempts_before + 1;
-                if attempt >= max_attempts {
+                Ran::Error(StepError::Stopped) => {
+                    a.net_attempts = Some(attempts_before);
+                    a.net_next_at = Some(now);
+                }
+                Ran::Error(StepError::Retry(e)) => {
+                    self.stats.retries.fetch_add(1, Relaxed);
+                    let attempt = attempts_before + 1;
+                    if attempt >= max_attempts {
+                        a.set_failed |= bit;
+                        a.net_attempts = Some(0);
+                        a.net_next_at = Some(0);
+                    } else {
+                        a.net_attempts = Some(attempt);
+                        a.net_next_at = Some(now + backoff(attempt, id));
+                    }
+                    a.error = Some(e);
+                }
+                Ran::Error(StepError::Permanent(e)) => {
                     a.set_failed |= bit;
                     a.net_attempts = Some(0);
                     a.net_next_at = Some(0);
-                } else {
-                    a.net_attempts = Some(attempt);
-                    a.net_next_at = Some(now + backoff(attempt, id));
+                    a.error = Some(e);
                 }
-                a.error = Some(e);
+                Ran::Error(StepError::Transient(e)) => {
+                    a.net_attempts = Some(attempts_before);
+                    a.net_next_at = Some(now + 300);
+                    a.error = Some(e);
+                    self.net_paused_until.store(now + 60, Relaxed);
+                }
+                Ran::Error(StepError::OutOfBudget) => {
+                    a.net_attempts = Some(attempts_before);
+                    a.net_next_at = Some(now + 60);
+                }
             }
-            Ran::Error(StepError::Permanent(e)) => {
-                a.set_failed |= bit;
-                a.net_attempts = Some(0);
-                a.net_next_at = Some(0);
-                a.error = Some(e);
-            }
-            Ran::Error(StepError::Transient(e)) => {
-                a.net_attempts = Some(attempts_before);
-                a.net_next_at = Some(now + 300);
-                a.error = Some(e);
-                self.net_paused_until.store(now + 60, Relaxed);
-            }
-            Ran::Error(StepError::OutOfBudget) => {
-                a.net_attempts = Some(attempts_before);
-                a.net_next_at = Some(now + 60);
-            }
+            break;
+        }
+        if let Some(until) = waiting {
+            a.net_next_at = Some(match a.net_next_at {
+                Some(at) if at != 0 => at.min(until),
+                _ => until,
+            });
         }
         batch.applied.push(a);
         self.send(db, shard, batch, now, |_| Ok(()))

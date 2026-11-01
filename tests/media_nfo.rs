@@ -202,6 +202,25 @@ fn a_known_title_spends_no_body() {
 }
 
 #[test]
+fn a_paused_provider_doesnt_hold_up_the_nfo() {
+    let mut h = fresh();
+    let r = [with_nfo(FILM)];
+    h.save(&r);
+    let s = FixtureServer::start(vec![status("/search/movie", 401)]);
+    let mut cfg = MediaConfig::default();
+    cfg.tmdb.api_key = "K".into();
+    cfg.tmdb.base_url = Some(s.base.clone());
+    let state = Server::new(posts_of(&r, STATED));
+    run_with(&mut h, &state, budget(600), cfg);
+    wait_for("the id", || imdb(&h, FILM) == Some(200002));
+    assert_eq!(bodies(&state), 1);
+    assert_eq!(s.requests().len(), 1);
+    wait_for("the step's bit", || done(&h, FILM) & NFO != 0);
+    assert_eq!(done(&h, FILM) & mask(StepId(33)), 0, "the lookup is still owed");
+    assert!(h.field(FILM, "net_next_at") > chrono::Utc::now().timestamp() + 60, "it waits for the provider");
+}
+
+#[test]
 fn a_missing_article_is_done() {
     let mut h = fresh();
     let r = [with_nfo(FILM)];

@@ -380,6 +380,32 @@ fn an_nfos_imdb_survives_the_correction() {
     assert_eq!(row(&h, other).unwrap().imdb, Some(777), "through the parse too");
 }
 
+#[test]
+fn a_miss_after_a_deleted_cache_row_takes_the_old_ids_off() {
+    let mut h = fresh();
+    let s = FixtureServer::start(vec![single()]);
+    let (_media, _db, fan) = found_title(&mut h, &s);
+    drop(fan);
+    let (rep, other) = (h.id_of(SHOW), "Some.Show.S01E03.720p.HDTV.x264-GRP");
+    h.shard()
+        .execute("update media_release set imdb_id = 777, imdb_from_nfo = 1 where release_id = ?", [h.id_of(other)])
+        .unwrap();
+    let k = key(Kind::Tv, "Some Show", None);
+    h.stop();
+    let cache = media_store::open(&media_store::path_for(&h.main)).unwrap();
+    cache.execute("delete from media_titles where title_key = ?", [k]).unwrap();
+    s.set_routes(vec![]);
+    let (media, db) = start(&mut h, maze(&s));
+    let _fan = fan_out(&media, &db);
+    h.stage.clone().unwrap().rerun(rep, LOOKUP).unwrap();
+    wait_for("the IDs to go", || row(&h, SHOW).is_some_and(|r| r.tvdb.is_none() && r.imdb.is_none()));
+    wait_for("the other's too", || row(&h, other).is_some_and(|r| r.tvdb.is_none()));
+    assert_eq!(row(&h, other).unwrap().imdb, Some(777), "an NFO's stays");
+    let t = media_store::get(&cache, k).unwrap().unwrap();
+    assert_eq!(t.state, media_store::STATE_NOT_FOUND);
+    wait_for("both passes", || media_store::get(&cache, k).unwrap().unwrap().fanout_done);
+}
+
 fn assert_no_row(name: &str) {
     let mut h = fresh();
     h.save(&[complete(name)]);
