@@ -142,6 +142,7 @@ On first run, Atlas asks for one server (host, username, password, and port) and
 | `auto_run_compact` | `false` | Compact the database every 24 hours; indexing pauses while it runs. |
 | `postprocess` | see below | The stage releases go through after saving. See [Post-processing keys](#post-processing-keys). |
 | `archive` | see below | Reading archives, PAR2 sets, and NFOs inside releases. See [Archive inspection](#archive-inspection). |
+| `naming` | see below | Giving releases with junk names better ones. See [Name fixing](#name-fixing). |
 | `max_unsaved_headers` | `500000` | Headers the indexer fetches ahead of saving them, over all groups at once. This bounds its memory: 500,000 headers take about 0.3 GB. A header request waits for room before it goes out, and its room comes back once its slice is saved. Raise it if the Bottleneck page shows it full while the database writers and connections have time to spare. Set below `request_size`, header requests are cut down to it, which makes them small and slow. |
 
 Atlas keeps any other keys you add to the file when it saves it.
@@ -349,6 +350,32 @@ A file with no extension Atlas knows gets probed, if it has at least 3 parts. A 
 
 These are estimates, not measurements. A release typically costs 1 to 3 bodies, and at most 8. About 15 million of 118 million releases pass the body gates, which comes to about 78 days at 300 bodies a minute, or about 4 days at 6,000, and about 14 TB of traffic in all. Inner files add about 1% to the database. New posts go ahead of the backlog.
 
+### Name fixing
+
+A release whose posted name is junk gets a release-like name from what Atlas already knows. It looks at evidence in this order, and stops at a name in full scene form:
+
+1. The file names in the release's PAR2 set.
+2. The file names inside its RAR, 7z, and ZIP archives. From a passworded archive, only a good name counts, because that's where fakes live.
+3. Naming regexes, 1,154 of them per group, over up to 4 of its subjects.
+4. Its posted file names.
+
+If the release has an NFO and still no good name, a separate step reads the NFO.
+
+A good name looks like a release: words and a marker such as a year, an episode, a resolution, or a group. Numbers, sample files, installers, random strings, and bare words such as `Inception` don't count. Regexes and posted files need a good name. File names from inside the post may be plainer, because a book title has no marker. A name in full scene form has at least 4 words, a group, and a technical token.
+
+Names only improve. A name replaces another only if its source is at least as good and its grade is strictly better, so a well-named post keeps its name and a second run changes nothing. A season pack is never renamed to one of its episodes.
+
+All of this is database work with no network, apart from the NFO step, which needs `postprocess.body_fetches_per_minute`.
+
+Upgrading names only releases that have no name, starting with a walk over your existing releases at `backlog_per_second`. To replace names the old lookup found too, run `atlas --reprocess --step naming --apply`, which only takes names that grade better. To undo names from regexes and posted files, run `atlas --unname --apply`. They stay cleared, even when a late article arrives, until you run `--reprocess --step naming --apply` again. A better source can still name them, such as an NFO, a PAR2 set, or PreDB.
+
+These go in a `naming` object:
+
+| Key | Default | What it does |
+|---|---|---|
+| `enabled` | `true` | Run the naming step. Set it to `false` before restarting to hold back the walk. |
+| `nfo_step` | `true` | Read NFOs, while `archive.enabled` is also on. It fetches nothing without a body budget. |
+
 ### Purging and reprocessing
 
 Both commands are dry runs until you add `--apply`.
@@ -368,6 +395,10 @@ Stop indexing first, review the dry run (`--sample N` prints names), run it with
 
 `atlas --reprocess` looks at stored releases again. `--step NAME` runs a step again, `--step all` runs every one, `--group NAME` limits it to a group, and `--failed` gives failed steps another try. It only queues the work, so it runs beside the indexer.
 
+`atlas --reflag-obfuscated` flags old releases that the current check calls random, such as dotted, hyphenated, and short random names. They leave search and the API listing unless they have a real name. `atlas --unname` clears names taken from naming regexes and posted files, and brings later steps back to the release. Neither touches a name from an NFO, a PAR2 set, or an archive. Both are dry runs until you add `--apply`, take `--sample N` to show some names, and refuse to run with an indexer or a compaction going.
+
+These are estimates. Over 118 million releases, `--reflag-obfuscated` takes about 2 to 10 minutes and writes at most about 12 GB of WAL. `--unname` of 15 million names takes about 5 to 10 minutes and writes about 30 to 60 GB of WAL. If a reader such as the API or the menu holds the WAL past 4 GiB in a shard, the command stops and says so. Run it again to go on from where it stopped.
+
 ### Live dashboard
 
 Menu option 5 shows the indexer status, totals, a graph of headers per second over the last 30 minutes, and progress for each group. The totals include `skipped`, the articles left out as obfuscated per article. To go back, press `q`, `Esc`, or `Ctrl+C`.
@@ -376,7 +407,7 @@ Menu option 5 shows the indexer status, totals, a graph of headers per second ov
 
 - **Current group:** searches only the group you're in.
 - **All groups:** searches everything you've indexed.
-- **Obfuscated posts:** lists releases that still only have a random name.
+- **Obfuscated posts:** lists releases that still only have a random name, including dotted, hyphenated, and short random names. A flagged name with no real name stays out of search.
 
 Searches match both the posted name and the real name found in par2 and nfo files. A post of several files shows the name of one of its files until a better name is found. Choose a result to see its files, what's inside them if Atlas has read that, whether it's passworded, and save its NZB.
 
@@ -420,7 +451,7 @@ The **Usenet history** panel converts those articles into time. While indexing, 
 
 Shows release counts across the whole database:
 
-- Releases that are complete, obfuscated, or have a recovered real name.
+- Releases that are complete, obfuscated with no recovered real name, or have a recovered real name.
 - The NZBs you can build from what's indexed: every release with at least one saved article, and how many of those are complete.
 - The total size the articles represent.
 - The biggest release and the largest groups.
@@ -594,6 +625,8 @@ CI (`.github/workflows/ci.yml`) checks formatting, runs clippy, and runs the tes
 | `src/indexer.rs` | One indexing pass over a group: slices, parsing, naming, and saving. |
 | `src/bg_indexer.rs` | The background scheduler: workers per server, live config reload, and status and stats files. |
 | `src/parser.rs`, `src/par2.rs`, `src/nfo.rs` | Subjects to releases, and real names and full file lists from par2 files, and names from nfo files. |
+| `src/naming/` | The obfuscation check, the judge of a name, cleaning, the naming regexes, the naming steps, and `--reflag-obfuscated` and `--unname`. |
+| `data/`, `scripts/` | The regex tables built into the binary, and the scripts that convert them from upstream. |
 | `src/archive/` | Reading file lists from RAR, ZIP, 7z, and PAR2 headers, and the steps that store them. |
 | `src/collections.rs`, `data/collection_regexes.tsv` | Which articles belong to one post: per-group regexes and a generic cleaner. `scripts/collection_regexes_to_tsv.py` makes the data file from the upstream seeder. |
 | `src/filters.rs` | What Atlas refuses to index: posts obfuscated per article and blocked groups. |
@@ -630,7 +663,7 @@ AI helped with bug fixes, refactoring, SABnzbd integration, the background index
 
 The Rust port, with multi-server parallel indexing, the async NNTP client, the stats dashboard, and the extended Newznab API, lives in the [Appz4Fun fork](https://github.com/Appz4Fun/Atlas).
 
-The rule for articles obfuscated per article, the collection regexes and cleaner, the release rules, and the rules for choosing what to read in a release are ported from [newznab-tmux](https://github.com/xbmc4lyfe/newznab-tmux), GPLv3. 7z headers are decoded with [lzma-rs](https://github.com/gendx/lzma-rs), MIT.
+The rule for articles obfuscated per article, the collection regexes and cleaner, the release rules, the rules for choosing what to read in a release, and the naming regexes and name fixing are ported from [newznab-tmux](https://github.com/xbmc4lyfe/newznab-tmux), GPLv3. 7z headers are decoded with [lzma-rs](https://github.com/gendx/lzma-rs), MIT.
 
 ## License
 

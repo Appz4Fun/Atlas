@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use crate::archive::steps as archive;
+use crate::naming::steps as naming;
 
 use super::step::Step;
 
@@ -10,7 +11,8 @@ pub fn all() -> Vec<Arc<dyn Step>> {
     vec![
         Arc::new(archive::Par2Step::default()),
         Arc::new(archive::ListStep::default()),
-        Arc::new(archive::NfoStep::default()),
+        Arc::new(naming::Naming),
+        Arc::new(naming::NfoName),
     ]
 }
 

@@ -167,7 +167,7 @@ fn compute_content() -> rusqlite::Result<Content> {
     let mut stmt = conn.prepare(&crate::store::each_shard(|i| {
         format!(
             "select group_name, count(*), coalesce(sum(size), 0), coalesce(sum(complete), 0),
-                coalesce(sum(is_obfuscated), 0), count(display_name), coalesce(sum(parts), 0),
+                coalesce(sum(is_obfuscated = 1 and display_name is null), 0), count(display_name), coalesce(sum(parts), 0),
                 coalesce(sum(parts > 0), 0), coalesce(sum(parts > 0 and complete = 1), 0)
              from s{i}.releases group by group_name having not atlas_blocked(group_name)"
         )

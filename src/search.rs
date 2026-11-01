@@ -228,14 +228,20 @@ pub fn all_releases(page: i64, page_size: i64) -> Result<Vec<ReleaseRow>> {
 }
 
 pub fn search_obfuscated(page: i64, page_size: i64) -> Result<Vec<ReleaseRow>> {
-    newest(&shards(None), "r.is_obfuscated = 1 and not atlas_blocked(r.group_name)", Vec::new(), page, page_size)
+    newest(
+        &shards(None),
+        "r.is_obfuscated = 1 and r.display_name is null and not atlas_blocked(r.group_name)",
+        Vec::new(),
+        page,
+        page_size,
+    )
 }
 
 pub fn count_obfuscated() -> Result<i64> {
     let sql = format!(
         "select coalesce(sum(c), 0) from ({})",
         union(&shards(None), |i| format!(
-            "select count(*) as c from s{i}.releases where is_obfuscated = 1 and not atlas_blocked(group_name)"
+            "select count(*) as c from s{i}.releases where is_obfuscated = 1 and display_name is null and not atlas_blocked(group_name)"
         ))
     );
     db::open()?.query_row(&sql, [], |r| r.get(0))

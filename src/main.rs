@@ -13,7 +13,7 @@ fn main() -> ExitCode {
 
     if has("--help") || has("-h") {
         println!(
-            "atlas {}\n\nusage: atlas [--selftest | --bg-indexer | --convert]\n\n  (no args)     interactive menu\n  --selftest    check the login on every usenet server and exit\n  --bg-indexer  run the indexing loop headless (the menu starts this for you)\n  --convert     move a database from before the shards into them, then exit\n                (the indexer does this on its own when it starts)\n  --compact     rewrite the shards smaller (stop indexing first), then exit\n  --purge       delete what no step can help, a dry run unless --apply. Alone it takes\n                fragments only: [--fragments] [--blocked] [--too-small [--below BYTES]]\n                [--image-only] [--rejected] [--dead] [--sample N] [--apply]\n  --reprocess   look at stored releases again, a dry run unless --apply:\n                [--step NAME]... [--group NAME]... [--failed] [--apply]",
+            "atlas {}\n\nusage: atlas [--selftest | --bg-indexer | --convert]\n\n  (no args)     interactive menu\n  --selftest    check the login on every usenet server and exit\n  --bg-indexer  run the indexing loop headless (the menu starts this for you)\n  --convert     move a database from before the shards into them, then exit\n                (the indexer does this on its own when it starts)\n  --compact     rewrite the shards smaller (stop indexing first), then exit\n  --purge       delete what no step can help, a dry run unless --apply. Alone it takes\n                fragments only: [--fragments] [--blocked] [--too-small [--below BYTES]]\n                [--image-only] [--rejected] [--dead] [--sample N] [--apply]\n  --reprocess   look at stored releases again, a dry run unless --apply:\n                [--step NAME]... [--group NAME]... [--failed] [--apply]\n  --reflag-obfuscated  flag old rows the current check calls random, a dry run unless\n                --apply: [--sample N] [--apply]\n  --unname      clear names taken from subjects and posted files, a dry run unless\n                --apply: [--sample N] [--apply]",
             env!("CARGO_PKG_VERSION")
         );
         return ExitCode::SUCCESS;
@@ -27,6 +27,10 @@ fn main() -> ExitCode {
         postprocess::purge::main(&args)
     } else if has("--reprocess") {
         postprocess::reprocess::main(&args)
+    } else if has("--reflag-obfuscated") {
+        atlas::naming::reflag::run(&args)
+    } else if has("--unname") {
+        atlas::naming::unname::run(&args)
     } else if has("--selftest") {
         app::selftest()
     } else if has(procs::BG_FLAG) {
