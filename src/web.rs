@@ -57,7 +57,12 @@ pub fn get(path: &str, query: &str, cookies: Option<&str>, base: &str, api_key: 
         "/ui/results" if signed_in => results(&args),
         "/ui/results" => ApiResponse { headers: vec![("HX-Redirect".into(), "/".into())], ..html(401, String::new()) },
         "/ui/release" if signed_in => release_page(&args),
+        "/ui/details" if signed_in => details_panel(&args),
+        "/ui/poster" if signed_in => poster(&args),
         "/ui/nzb" if signed_in => get_nzb(&args),
+        "/ui/details" | "/ui/poster" => {
+            ApiResponse { headers: vec![("HX-Redirect".into(), "/".into())], ..html(401, String::new()) }
+        }
         "/ui/nzb" | "/ui/release" => redirect(Vec::new()),
         _ => return None,
     })
@@ -92,7 +97,7 @@ fn cookie_header(value: &str, max_age: i64) -> (String, String) {
 
 fn redirect(mut headers: Vec<(String, String)>) -> ApiResponse {
     headers.push(("Location".into(), "/".into()));
-    ApiResponse { status: 303, content_type: None, body: String::new(), headers }
+    ApiResponse { status: 303, content_type: None, body: String::new(), headers, bytes: None }
 }
 
 fn asset(content_type: &'static str, body: &str) -> ApiResponse {
@@ -105,6 +110,7 @@ fn asset(content_type: &'static str, body: &str) -> ApiResponse {
             ("Cache-Control".into(), "no-cache".into()),
             ("X-Content-Type-Options".into(), "nosniff".into()),
         ],
+        bytes: None,
     }
 }
 
@@ -118,6 +124,7 @@ fn html(status: u16, body: String) -> ApiResponse {
             ("Cache-Control".into(), "no-store".into()),
             ("X-Content-Type-Options".into(), "nosniff".into()),
         ],
+        bytes: None,
     }
 }
 
@@ -613,6 +620,7 @@ fn release_html(
 <p class="path"><a href="/">atlas::releases</a>::<b>{id}</b></p>
 <h1>{name}</h1><p>{tags}</p>
 <div class="actions"><a class="button primary" href="/ui/nzb?id={id}">Download NZB</a><a class="button" href="/?cat={category}">More in this category</a></div>
+<div id="title-details" hx-get="/ui/details?id={id}" hx-trigger="load" hx-swap="outerHTML"></div>
 <div class="panel"><dl class="facts">{facts}</dl></div>
 {files}
 </main></div>"#,
@@ -621,6 +629,68 @@ fn release_html(
             name = escape(&r.name),
         ),
     )
+}
+
+/// Loaded after the page, soo a slow provider doesn't hold it up. Empty when the title isn't known.
+fn details_panel(args: &HashMap<String, String>) -> ApiResponse {
+    let id = args.get("id").and_then(|v| v.trim().parse::<i64>().ok()).unwrap_or(0);
+    let media = crate::media::query::attrs_of(&[id]).unwrap_or_default().remove(&id);
+    let details =
+        media.as_ref().and_then(|m| crate::media::details::for_title(&crate::config::media_config(), m.kind, &m.ids));
+    html(200, details.map(|d| details_html(&d)).unwrap_or_default())
+}
+
+fn details_html(d: &crate::media::details::Details) -> String {
+    let mut lines = String::new();
+    let mut line = |name: &str, value: Option<String>| {
+        if let Some(value) = value {
+            let _ = write!(lines, "<dt>{name}</dt><dd>{}</dd>", escape(&value));
+        }
+    };
+    line("Released", d.released.clone());
+    line("Blu-ray", d.bluray.clone());
+    line("Genres", d.genres.clone());
+    line("Runtime", d.runtime.map(|minutes| format!("{minutes} min")));
+    line("Network", d.network.clone());
+    line("Status", d.status.clone());
+    line("Cast", d.cast.clone());
+    let score = |name: &str, score: Option<i64>| score.map(|s| tag("tag-ref", &format!("{name} {s}")));
+    let scores: String =
+        [score("IMDB", d.imdb_score), score("RT", d.rotten), score("MC", d.metacritic), score("TMDB", d.tmdb_score)]
+            .into_iter()
+            .flatten()
+            .collect();
+    let poster = if d.poster.is_some() {
+        format!(
+            "<img class=\"poster\" src=\"/ui/poster?kind={}&amp;tmdb={}\" alt=\"\" loading=\"lazy\" width=\"171\" height=\"256\">",
+            d.kind, d.tmdb_id
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        "<section class=\"panel title-details\">{poster}<div><h2>{}</h2><p>{scores}</p><p>{}</p><dl class=\"facts\">{lines}</dl></div></section>",
+        escape(d.title.as_deref().unwrap_or_default()),
+        escape(d.overview.as_deref().unwrap_or_default()),
+    )
+}
+
+fn poster(args: &HashMap<String, String>) -> ApiResponse {
+    let number = |key: &str| args.get(key).and_then(|v| v.trim().parse::<i64>().ok()).unwrap_or(0);
+    let Some(bytes) = crate::media::details::poster(number("kind"), number("tmdb"), &crate::config::media_config())
+    else {
+        return ApiResponse::not_found();
+    };
+    ApiResponse {
+        status: 200,
+        content_type: Some("image/jpeg"),
+        body: String::new(),
+        headers: vec![
+            ("Cache-Control".into(), "private, max-age=2592000".into()),
+            ("X-Content-Type-Options".into(), "nosniff".into()),
+        ],
+        bytes: Some(bytes),
+    }
 }
 
 /// What's known about a password protected release's encryption.
@@ -741,6 +811,8 @@ mod tests {
             let results = get("/ui/results", "", bad, "http://x", KEY).unwrap();
             assert_eq!(results.status, 401, "{bad:?}");
             assert_eq!(header(&results, "HX-Redirect"), Some("/"));
+            assert_eq!(get("/ui/details", "id=1", bad, "http://x", KEY).unwrap().status, 401, "{bad:?}");
+            assert_eq!(get("/ui/poster", "kind=2&tmdb=1", bad, "http://x", KEY).unwrap().status, 401, "{bad:?}");
             let nzb = get("/ui/nzb", "id=1", bad, "http://x", KEY).unwrap();
             assert_eq!(nzb.status, 303, "{bad:?}");
             assert_eq!(get("/ui/release", "id=1", bad, "http://x", KEY).unwrap().status, 303, "{bad:?}");
@@ -858,6 +930,25 @@ mod tests {
         let thin = release_info::Contents { recovery_bytes: 10, ..holes };
         assert!(health(&thin, 30).contains("NOT ENOUGH RECOVERY"));
         assert_eq!(per_mille(25), "2.5%");
+    }
+
+    #[test]
+    fn title_details_are_escaped_and_leave_out_what_is_missing() {
+        let d = crate::media::details::Details {
+            kind: 2,
+            tmdb_id: 603,
+            title: Some("<b>Film</b>".into()),
+            overview: Some("A <i>film</i>.".into()),
+            imdb_score: Some(87),
+            poster: Some("/a.jpg".into()),
+            bluray: Some("1999-09-21".into()),
+            ..Default::default()
+        };
+        let html = details_html(&d);
+        assert!(!html.contains("<b>") && !html.contains("<i>"), "{html}");
+        assert!(html.contains("IMDB 87") && !html.contains("Metacritic"), "{html}");
+        assert!(html.contains("<dt>Blu-ray</dt><dd>1999-09-21</dd>"), "{html}");
+        assert!(html.contains("/ui/poster?kind=2&amp;tmdb=603"), "{html}");
     }
 
     #[test]

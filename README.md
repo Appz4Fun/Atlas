@@ -696,6 +696,8 @@ Turn a provider on to fill in IDs, with no restart. Each title is asked once, ho
 | Trakt | `media.trakt.client_id`, from an API app you create on trakt.tv. | Trakt, TVDB, TVRage, TMDB, IMDb | `tvdbid`, `imdbid`, `rid`, `tmdbid`, `traktid` | `imdbid`, `tmdbid`, `traktid` |
 | TheTVDB | `media.tvdb.api_key`, from your account on thetvdb.com, and `media.tvdb.pin` for a user-supported key. TV only. | TVDB, IMDb, TMDB, TVMaze | `tvdbid`, `imdbid`, `tvmazeid`, `tmdbid` | none |
 
+Opening a release in the [web UI](#web-ui) also shows its overview, cast, dates and poster from TMDB, and its ratings from OMDb when `media.omdb.api_key` is set (a free key from omdbapi.com). These are fetched when the page opens and kept for 30 days in `atlas.details.db`, with posters in `posters/`, at most 512 MB. Without a TMDB key, the page leaves them out.
+
 **An NFO needs no provider.** Once `postprocess.body_fetches_per_minute` is set, `media.nfo` reads a movie's IMDb ID from its NFO: one body of at most 64 KiB, and only for a movie with no IMDb ID yet. That also adds `imdbid` to `movie-search`.
 
 **Sonarr and Radarr cache `caps` for 7 days**, so press Test on the indexer after turning a provider on.

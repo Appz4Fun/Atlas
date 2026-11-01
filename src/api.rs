@@ -39,15 +39,17 @@ pub struct ApiResponse {
     pub content_type: Option<&'static str>,
     pub body: String,
     pub headers: Vec<(String, String)>,
+    /// sent in place of `body`, for what isn't text
+    pub bytes: Option<Vec<u8>>,
 }
 
 impl ApiResponse {
     fn xml(status: u16, body: String) -> Self {
-        ApiResponse { status, content_type: Some(XML), body, headers: Vec::new() }
+        ApiResponse { status, content_type: Some(XML), body, headers: Vec::new(), bytes: None }
     }
 
     pub(crate) fn not_found() -> Self {
-        ApiResponse { status: 404, content_type: None, body: String::new(), headers: Vec::new() }
+        ApiResponse { status: 404, content_type: None, body: String::new(), headers: Vec::new(), bytes: None }
     }
 
     /// newznab error, sent with http 200 like real indexers do
@@ -333,6 +335,7 @@ pub(crate) fn get_nzb(args: &HashMap<String, String>) -> ApiResponse {
         content_type: Some("application/x-nzb"),
         body: content,
         headers: vec![("Content-Disposition".into(), format!("attachment; filename=\"{filename}\""))],
+        bytes: None,
     }
 }
 
@@ -362,10 +365,14 @@ fn respond(mut request: Request, api_key: &str, fallback_host: &str) {
         let _ = request.as_reader().take(MAX_FORM_BODY).read_to_string(&mut body);
         crate::web::post(path, &body, &base, api_key).unwrap_or_else(ApiResponse::not_found)
     } else {
-        ApiResponse { status: 405, content_type: None, body: String::new(), headers: Vec::new() }
+        ApiResponse { status: 405, content_type: None, body: String::new(), headers: Vec::new(), bytes: None }
     };
 
-    let mut response = Response::from_string(resp.body).with_status_code(resp.status);
+    let mut response = match resp.bytes {
+        Some(bytes) => Response::from_data(bytes),
+        None => Response::from_string(resp.body),
+    }
+    .with_status_code(resp.status);
 
     let mut headers = resp.headers;
     headers.push(("Content-Type".into(), resp.content_type.unwrap_or("text/html; charset=utf-8").into()));

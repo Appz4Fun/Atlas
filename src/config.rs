@@ -181,6 +181,15 @@ pub struct TmdbConfig {
     pub api_key: String,
     pub requests_per_minute: i64,
     pub base_url: Option<String>,
+    pub image_base_url: Option<String>,
+}
+
+/// Ratings for the release page. Only asked when someone opens a release.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OmdbConfig {
+    pub api_key: String,
+    pub requests_per_minute: i64,
+    pub base_url: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -199,6 +208,7 @@ pub struct MediaConfig {
     pub max_titles: i64,
     pub tvmaze: TvmazeConfig,
     pub tmdb: TmdbConfig,
+    pub omdb: OmdbConfig,
     pub trakt: TraktConfig,
     pub tvdb: TvdbConfig,
 }
@@ -211,7 +221,8 @@ impl Default for MediaConfig {
             negative_ttl_days: 30,
             max_titles: 10_000_000,
             tvmaze: TvmazeConfig { enabled: false, requests_per_minute: 90, base_url: None },
-            tmdb: TmdbConfig { api_key: String::new(), requests_per_minute: 240, base_url: None },
+            tmdb: TmdbConfig { api_key: String::new(), requests_per_minute: 240, base_url: None, image_base_url: None },
+            omdb: OmdbConfig { api_key: String::new(), requests_per_minute: 30, base_url: None },
             trakt: TraktConfig { client_id: String::new(), requests_per_minute: 120, base_url: None },
             tvdb: TvdbConfig { api_key: String::new(), pin: String::new(), requests_per_minute: 120, base_url: None },
         }
@@ -260,6 +271,11 @@ impl MediaConfig {
         c.tmdb.api_key = text(tmdb, "api_key").unwrap_or_default();
         rate(tmdb, 3_000, &mut c.tmdb.requests_per_minute);
         c.tmdb.base_url = text(tmdb, "base_url").filter(|u| !u.is_empty());
+        c.tmdb.image_base_url = text(tmdb, "image_base_url").filter(|u| !u.is_empty());
+        let omdb = v.get("omdb");
+        c.omdb.api_key = text(omdb, "api_key").unwrap_or_default();
+        rate(omdb, 600, &mut c.omdb.requests_per_minute);
+        c.omdb.base_url = text(omdb, "base_url").filter(|u| !u.is_empty());
         let trakt = v.get("trakt");
         c.trakt.client_id = text(trakt, "client_id").unwrap_or_default();
         rate(trakt, 200, &mut c.trakt.requests_per_minute);

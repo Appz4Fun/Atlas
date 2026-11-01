@@ -97,5 +97,8 @@ enabled = false
 [media.tmdb]
 api_key = ""
 
+[media.omdb]
+api_key = ""
+
 [media.trakt]
 client_id = ""
