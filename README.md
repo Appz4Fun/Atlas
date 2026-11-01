@@ -587,11 +587,11 @@ The page names the database writer when it's busy at least 85% of the time, the 
 
 ## Web UI
 
-Open `http://HOST:PORT/` in a browser to search and browse releases, filter by category, and download NZB files. It's served on the API port, by the same process, with nothing extra to install.
+Open `http://HOST:PORT/` in a browser to search and browse releases, filter by category, see a release's details and the files inside it, and download NZB files. It's served on the API port, by the same process, with nothing extra to install.
 
 Sign in with the `api_key` from `config.toml`. The browser keeps a cookie for 30 days, derived from the key rather than the key itself, and changing the key signs everyone out. Traffic is plain HTTP, like the API, so keep it on a network you trust.
 
-[htmx](https://htmx.org) (0BSD) is built into the binary from `assets/`, so the page needs no internet access.
+[htmx](https://htmx.org) (0BSD) is built into the binary from `assets/`, so the page needs no internet access. The look is [Oxide](https://appz4fun.github.io/RustyGet/design-system.html), the design system of RustyGet, in light and dark.
 
 ## Newznab API
 

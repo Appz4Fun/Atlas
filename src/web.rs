@@ -5,17 +5,30 @@
 
 use std::collections::HashMap;
 use std::fmt::Write;
+use std::sync::LazyLock;
 
 use sha1::{Digest, Sha1};
 
 use crate::api::{ApiResponse, escape, find_releases, get_nzb, parse_query};
 use crate::archive::Password;
 use crate::category::{TABLE, UNCATEGORIZED, label, parse_filter};
-use crate::search::ReleaseRow;
+use crate::media::query::MediaAttrs;
+use crate::search::{ReleaseRow, get_release};
 use crate::ui::{fmt_date, fmt_size};
 
 const HTMX: &str = include_str!("../assets/htmx-2.0.11.min.js");
 const CSS: &str = include_str!("../assets/web.css");
+const JS: &str = include_str!("../assets/web.js");
+const MARK: &str = include_str!("../assets/atlas.svg");
+
+/// On the asset links, soo a browser holding an older build's files fetches the new ones.
+static ASSET_VERSION: LazyLock<String> = LazyLock::new(|| {
+    let hash = [CSS, JS, HTMX, MARK]
+        .iter()
+        .flat_map(|asset| asset.bytes())
+        .fold(0xcbf29ce484222325u64, |hash, b| (hash ^ u64::from(b)).wrapping_mul(0x100000001b3));
+    format!("{hash:016x}")
+});
 
 const PAGE_SIZE: i64 = 50;
 const COOKIE: &str = "atlas_session";
@@ -35,12 +48,15 @@ pub fn get(path: &str, query: &str, cookies: Option<&str>, base: &str, api_key: 
     Some(match path {
         "/static/htmx.min.js" => asset("text/javascript; charset=utf-8", HTMX),
         "/static/atlas.css" => asset("text/css; charset=utf-8", CSS),
+        "/static/atlas.js" => asset("text/javascript; charset=utf-8", JS),
+        "/static/atlas.svg" => asset("image/svg+xml", MARK),
         "/" | "" if signed_in => html(200, search_page(&args, base)),
         "/" | "" => html(200, login_page(base, false)),
         "/ui/results" if signed_in => results(&args),
         "/ui/results" => ApiResponse { headers: vec![("HX-Redirect".into(), "/".into())], ..html(401, String::new()) },
+        "/ui/release" if signed_in => release_page(&args),
         "/ui/nzb" if signed_in => get_nzb(&args),
-        "/ui/nzb" => redirect(Vec::new()),
+        "/ui/nzb" | "/ui/release" => redirect(Vec::new()),
         _ => return None,
     })
 }
@@ -83,7 +99,8 @@ fn asset(content_type: &'static str, body: &str) -> ApiResponse {
         content_type: Some(content_type),
         body: body.into(),
         headers: vec![
-            ("Cache-Control".into(), "public, max-age=86400".into()),
+            // small files on a LAN: a new build's styles show on the next load
+            ("Cache-Control".into(), "no-cache".into()),
             ("X-Content-Type-Options".into(), "nosniff".into()),
         ],
     }
@@ -167,70 +184,171 @@ impl Search {
         Search { q: text("q"), cat: text("cat"), offset: offset - offset % PAGE_SIZE }
     }
 
-    fn rows(&self) -> String {
+    /// The table rows, or a full-width diagnostic when the first page has none.
+    fn body(&self) -> String {
         let filter = parse_filter(&self.cat);
         let found = match find_releases(&self.q, filter.as_ref(), self.offset, PAGE_SIZE) {
             Ok(found) => found,
             Err(e) => {
                 eprintln!("web search failed: {e}");
-                return "<tr><td colspan=\"6\" class=\"note\">Search failed.</td></tr>".into();
+                let message = "Atlas couldn't read its database. The error is in its log. Search again in a moment.";
+                return if self.offset == 0 {
+                    diag("caution", "the search failed", message)
+                } else {
+                    format!("<tr><td colspan=\"{COLUMNS}\" class=\"note\">{}</td></tr>", escape(message))
+                };
             }
         };
+        if found.is_empty() {
+            return if self.offset == 0 {
+                self.nothing_found()
+            } else {
+                format!("<tr><td colspan=\"{COLUMNS}\" class=\"note dim\">That's all of them.</td></tr>")
+            };
+        }
         let ids: Vec<i64> = found.iter().map(|r| r.id).collect();
         let categories = crate::category::categories_of(&ids).unwrap_or_default();
         let passwords = crate::archive::store::passwords(&ids);
+        let media = crate::media::query::attrs_of(&ids).unwrap_or_default();
 
-        let mut out: String = found.iter().map(|r| row(r, &categories, &passwords)).collect();
-        if found.is_empty() && self.offset == 0 {
-            out.push_str("<tr><td colspan=\"6\" class=\"note\">No releases found.</td></tr>");
-        }
+        let mut out: String = found.iter().map(|r| row(r, &categories, &passwords, &media)).collect();
         if found.len() as i64 == PAGE_SIZE {
             let next = search_query(&self.q, &self.cat, self.offset + PAGE_SIZE);
             let next = attr(&next);
             let _ = write!(
                 out,
-                "<tr><td colspan=\"6\" class=\"note\"><a href=\"/?{next}\" hx-get=\"/ui/results?{next}\" hx-target=\"closest tr\" hx-swap=\"outerHTML\">Load more</a></td></tr>"
+                "<tr><td colspan=\"{COLUMNS}\" class=\"note\"><a class=\"button\" href=\"/?{next}\" hx-get=\"/ui/results?{next}\" hx-target=\"closest tr\" hx-swap=\"outerHTML\">Load more</a></td></tr>"
             );
         }
         out
     }
+
+    fn nothing_found(&self) -> String {
+        let scope = category_name(&self.cat);
+        let title = match (self.q.is_empty(), &scope) {
+            (true, Some(scope)) => format!("nothing is in {scope} yet"),
+            (true, None) => "no releases yet".to_string(),
+            (false, Some(scope)) => format!("nothing matches \u{201c}{}\u{201d} in {scope}", self.q),
+            (false, None) => format!("nothing matches \u{201c}{}\u{201d}", self.q),
+        };
+        let mut hint = String::new();
+        if scope.is_some() {
+            let everywhere = attr(&search_query(&self.q, "", 0));
+            let _ = write!(
+                hint,
+                "<a href=\"/?{everywhere}\" hx-get=\"/ui/results?{everywhere}\" hx-target=\"#results\">Look in all categories</a>. "
+            );
+        }
+        if !self.q.is_empty() {
+            hint.push_str("A search matches every word you type, from the start of a word in the release name.");
+        } else {
+            hint.push_str("Releases get a category once Atlas has processed them.");
+        }
+        format!(
+            "<div class=\"diag\"><p class=\"diag-head\"><span class=\"diag-level\">note:</span> {}</p><div class=\"diag-body\"><p>{hint}</p></div></div>",
+            escape(&title)
+        )
+    }
+
+    /// Rust-style path of where this is, as on the RustyGet site.
+    fn summary(&self) -> String {
+        let mut path = String::from("atlas::releases");
+        if let Some(name) = category_name(&self.cat) {
+            for part in name.split(" / ") {
+                let _ = write!(path, "::<b>{}</b>", escape(&part.to_lowercase().replace(' ', "_")));
+            }
+        }
+        let sort = if self.q.is_empty() { "Newest first" } else { "Best matches first" };
+        format!("<div class=\"summary\"><span class=\"path\">{path}</span><span class=\"sort\">{sort}</span></div>")
+    }
 }
 
-fn row(r: &ReleaseRow, categories: &HashMap<i64, i64>, passwords: &HashMap<i64, Password>) -> String {
-    let category = categories.get(&r.id).copied().unwrap_or(UNCATEGORIZED);
-    let mut flags = String::new();
-    match passwords.get(&r.id) {
-        Some(Password::Yes) => flags.push_str(" <span class=\"flag\">password</span>"),
-        Some(Password::Maybe) => flags.push_str(" <span class=\"flag\">password?</span>"),
-        _ => {}
+/// Columns of the results table.
+const COLUMNS: usize = 6;
+
+fn tag(class: &str, text: &str) -> String {
+    format!(" <span class=\"tag {class}\">{}</span>", escape(text))
+}
+
+fn password_tag(password: Option<&Password>) -> String {
+    match password {
+        Some(Password::Yes) => tag("tag-bad", "PASSWORD"),
+        Some(Password::Maybe) => tag("tag-warn", "PASSWORD?"),
+        _ => String::new(),
     }
+}
+
+/// S01E02 for an episode, S01 for a season, else the year.
+fn media_label(media: &MediaAttrs) -> Option<String> {
+    match (media.season, media.episode, media.year) {
+        (Some(s), Some(e), _) => Some(format!("S{s:02}E{e:02}")),
+        (Some(s), None, _) => Some(format!("S{s:02}")),
+        (None, _, Some(year)) => Some(year.to_string()),
+        _ => None,
+    }
+}
+
+fn row(
+    r: &ReleaseRow,
+    categories: &HashMap<i64, i64>,
+    passwords: &HashMap<i64, Password>,
+    media: &HashMap<i64, MediaAttrs>,
+) -> String {
+    let category = escape(&label(categories.get(&r.id).copied().unwrap_or(UNCATEGORIZED)).unwrap_or_default());
+    let size = fmt_size(r.size);
+    let posted = escape(&fmt_date(r.posted_date.as_deref()));
+    let mut tags = String::new();
+    if let Some(text) = media.get(&r.id).and_then(media_label) {
+        tags.push_str(&tag("tag-ref", &text));
+    }
+    tags.push_str(&password_tag(passwords.get(&r.id)));
     if !r.complete {
-        flags.push_str(" <span class=\"flag\">incomplete</span>");
+        tags.push_str(&tag("tag-warn", "INCOMPLETE"));
     }
     format!(
-        "<tr><td class=\"name\">{}{flags}</td><td>{}</td><td class=\"num\">{}</td><td class=\"posted\">{}</td><td class=\"group\">{}</td><td><a href=\"/ui/nzb?id={}\">NZB</a></td></tr>",
-        escape(&r.name),
-        escape(&label(category).unwrap_or_default()),
-        fmt_size(r.size),
-        escape(&fmt_date(r.posted_date.as_deref())),
-        escape(&r.group_name),
-        r.id,
+        "<tr><td class=\"name\"><a href=\"/ui/release?id={id}\">{name}</a>{tags}<div class=\"row-meta\">{category} · {size} · {posted}</div></td><td class=\"col-cat dim\">{category}</td><td class=\"num col-size\">{size}</td><td class=\"dim col-posted\">{posted}</td><td class=\"dim col-group\">{group}</td><td><a class=\"button small primary\" href=\"/ui/nzb?id={id}\">NZB</a></td></tr>",
+        id = r.id,
+        name = escape(&r.name),
+        group = escape(&r.group_name),
     )
 }
 
 fn table(rows: &str) -> String {
     format!(
-        "<table><thead><tr><th>Name</th><th>Category</th><th class=\"num\">Size</th><th class=\"posted\">Posted</th><th class=\"group\">Group</th><th></th></tr></thead><tbody>{rows}</tbody></table>"
+        "<div class=\"table-wrap\"><table><thead><tr><th>Name</th><th class=\"col-cat\">Category</th><th class=\"num col-size\">Size</th><th class=\"col-posted\">Posted</th><th class=\"col-group\">Group</th><th><span class=\"sr-only\">Download</span></th></tr></thead><tbody>{rows}</tbody></table></div>"
     )
 }
 
-/// What htmx swaps in: the whole table for a new search, more rows for "Load more".
+/// A compiler-style callout, the way Oxide writes them.
+fn diag(level: &str, title: &str, body: &str) -> String {
+    format!(
+        "<div class=\"diag diag-{level}\" role=\"alert\"><p class=\"diag-head\"><span class=\"diag-level\">{level}:</span> {}</p><div class=\"diag-body\"><p>{}</p></div></div>",
+        escape(title),
+        escape(body),
+    )
+}
+
+/// What goes in #results for a first page.
+fn results_html(search: &Search) -> String {
+    let body = search.body();
+    let content = if body.starts_with("<tr") { table(&body) } else { body };
+    format!("{}{content}", search.summary())
+}
+
+/// What htmx swaps in: the whole result area for a new search, more rows for "Load more".
 fn results(args: &HashMap<String, String>) -> ApiResponse {
     let search = Search::from_args(args);
     if search.offset > 0 {
-        return html(200, search.rows());
+        return html(200, search.body());
     }
-    let mut resp = html(200, table(&search.rows()));
+    // the sidebar and the form follow the search too
+    let body = format!(
+        "{}{}{}",
+        results_html(&search),
+        category_nav(&search, " hx-swap-oob=\"true\""),
+        category_input(&search.cat, " hx-swap-oob=\"true\""),
+    );
+    let mut resp = html(200, body);
     // the address bar follows the search, and reloads the full page
     let query = search_query(&search.q, &search.cat, 0);
     let url = if query.is_empty() { "/".to_string() } else { format!("/?{query}") };
@@ -238,26 +356,63 @@ fn results(args: &HashMap<String, String>) -> ApiResponse {
     resp
 }
 
-fn category_options(selected: &str) -> String {
-    let mut out = String::from("<option value=\"\">All categories</option>");
-    let mut option = |id: i64, name: &str| {
-        let chosen = if id.to_string() == selected { " selected" } else { "" };
-        let _ = write!(out, "<option value=\"{id}\"{chosen}>{}</option>", escape(name));
-    };
-    for root in TABLE {
-        option(root.id, root.name);
-        for sub in root.subs {
-            option(sub.id, &format!("{} / {}", root.name, sub.name));
+/// "Movies / HD" for a category the table knows, whatever the url asked for.
+fn category_name(cat: &str) -> Option<String> {
+    let id: i64 = cat.trim().parse().ok()?;
+    TABLE.iter().find_map(|root| {
+        if root.id == id {
+            return Some(root.name.to_string());
         }
+        root.subs.iter().find(|s| s.id == id).map(|s| format!("{} / {}", root.name, s.name))
+    })
+}
+
+fn category_input(cat: &str, oob: &str) -> String {
+    format!("<input id=\"cat\" type=\"hidden\" name=\"cat\" value=\"{}\"{oob}>", attr(cat))
+}
+
+/// The sidebar. Its links keep whatever is in the search box, through `hx-include`.
+fn category_nav(search: &Search, oob: &str) -> String {
+    let link = |id: &str, name: &str, class: &str| {
+        let current = if id == search.cat { " aria-current=\"page\"" } else { "" };
+        let page = attr(&search_query(&search.q, id, 0));
+        let swap = if id.is_empty() { String::new() } else { format!("?cat={id}") };
+        format!("<a{class} href=\"/?{page}\" hx-get=\"/ui/results{swap}\"{current}>{}</a>", escape(name))
+    };
+    let mut out = format!(
+        "<nav id=\"categories\" aria-label=\"Categories\" hx-target=\"#results\" hx-include=\"#q\" hx-sync=\"#search:replace\" hx-indicator=\"#busy\"{oob}><div class=\"nav-group\">{}</div>",
+        link("", "All categories", ""),
+    );
+    for root in TABLE {
+        out.push_str("<div class=\"nav-group\">");
+        out.push_str(&link(&root.id.to_string(), root.name, " class=\"nav-root\""));
+        for sub in root.subs {
+            out.push_str(&link(&sub.id.to_string(), sub.name, ""));
+        }
+        out.push_str("</div>");
     }
+    out.push_str("</nav>");
     out
 }
 
 fn page(title: &str, content: &str) -> String {
     format!(
-        "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><meta name=\"htmx-config\" content=\"{}\"><title>{}</title><link rel=\"stylesheet\" href=\"/static/atlas.css\"><script src=\"/static/htmx.min.js\"></script></head><body>{content}</body></html>",
+        "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><meta name=\"color-scheme\" content=\"light dark\"><meta name=\"htmx-config\" content=\"{}\"><title>{}</title><link rel=\"icon\" href=\"/static/atlas.svg?v={v}\" type=\"image/svg+xml\"><link rel=\"stylesheet\" href=\"/static/atlas.css?v={v}\"><script src=\"/static/atlas.js?v={v}\"></script><script src=\"/static/htmx.min.js?v={v}\"></script></head><body>{content}</body></html>",
         attr(HTMX_CONFIG),
         escape(title),
+        v = *ASSET_VERSION,
+    )
+}
+
+fn masthead(signed_in: bool) -> String {
+    let tools = if signed_in {
+        "<form method=\"post\" action=\"/logout\"><button class=\"button\">Sign out</button></form>"
+    } else {
+        ""
+    };
+    format!(
+        r#"<header class="masthead"><a class="brand" href="/" aria-label="Atlas home">{}<span class="brand-name">At<span>las</span></span></a><span class="brand-tag">newznab indexer</span><div class="masthead-tools"><button class="button icon-button" type="button" data-theme-toggle aria-label="Switch between light and dark theme"><svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="6.5" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M8 1.5a6.5 6.5 0 0 1 0 13Z" fill="currentColor"/></svg></button>{tools}</div></header>"#,
+        MARK,
     )
 }
 
@@ -266,38 +421,164 @@ fn search_page(args: &HashMap<String, String>, base: &str) -> String {
     page(
         "Atlas",
         &format!(
-            r##"<header><h1>Atlas</h1><form method="post" action="/logout"><button>Sign out</button></form></header>
-<form class="search" action="/" method="get" hx-get="/ui/results" hx-target="#results" hx-sync="this:replace" hx-indicator="#busy" hx-trigger="submit, input changed delay:400ms from:#q, change from:#cat">
-<input id="q" name="q" type="search" placeholder="Search releases" value="{}" autofocus aria-label="Search releases">
-<select id="cat" name="cat" aria-label="Category">{}</select>
-<button>Search</button><span id="busy" class="htmx-indicator">Searching…</span>
+            r##"{masthead}
+<div class="layout"><aside class="sidebar"><details class="navigation" open><summary>Categories</summary>{nav}</details></aside>
+<main>
+<form id="search" class="searchbar" role="search" action="/" method="get" hx-get="/ui/results" hx-target="#results" hx-sync="this:replace" hx-indicator="#busy" hx-trigger="submit, input changed delay:300ms from:#q">
+<div class="search-field"><input id="q" name="q" type="search" placeholder="Search releases" value="{q}" autocomplete="off" spellcheck="false" autofocus aria-label="Search releases"><kbd>/</kbd></div>
+{cat}<button class="button primary">Search</button><span id="busy" class="busy">searching…</span>
 </form>
-<main id="results">{}</main>
-<footer>Newznab API: {}/api</footer>"##,
-            attr(&search.q),
-            category_options(&search.cat),
-            table(&search.rows()),
-            escape(base),
+<div id="failure"></div>
+<div id="results">{results}</div>
+<footer class="footer">Newznab API: <code>{base}/api</code></footer>
+</main></div>"##,
+            masthead = masthead(true),
+            nav = category_nav(&search, ""),
+            q = attr(&search.q),
+            cat = category_input(&search.cat, ""),
+            results = results_html(&search),
+            base = escape(base),
         ),
     )
 }
 
+/// One release: what's known about it, and its files where Atlas has looked inside.
+fn release_page(args: &HashMap<String, String>) -> ApiResponse {
+    let id = args.get("id").and_then(|v| v.trim().parse::<i64>().ok()).unwrap_or(0);
+    let release = match get_release(id) {
+        Ok(Some(release)) => release,
+        Ok(None) => return release_problem(404, "note", "there is no such release", "It may have been purged."),
+        Err(e) => {
+            eprintln!("web release {id} failed: {e}");
+            return release_problem(500, "caution", "the release could not be read", "The error is in Atlas's log.");
+        }
+    };
+    let ids = [id];
+    let category = crate::category::categories_of(&ids).unwrap_or_default().get(&id).copied();
+    let inner = crate::archive::store::view(id);
+    let media = crate::media::query::attrs_of(&ids).unwrap_or_default().remove(&id);
+    html(200, release_html(&release, category, &inner, media.as_ref()))
+}
+
+fn release_problem(status: u16, level: &str, title: &str, body: &str) -> ApiResponse {
+    let content = format!(
+        "{}<div class=\"signin\">{}<p><a href=\"/\">Back to the releases</a></p></div>",
+        masthead(true),
+        diag(level, title, body)
+    );
+    html(status, page("Atlas", &content))
+}
+
+fn release_html(
+    r: &ReleaseRow,
+    category: Option<i64>,
+    inner: &crate::archive::store::InnerView,
+    media: Option<&MediaAttrs>,
+) -> String {
+    let category = category.unwrap_or(UNCATEGORIZED);
+    let mut tags = String::new();
+    if let Some(text) = media.and_then(media_label) {
+        tags.push_str(&tag("tag-ref", &text));
+    }
+    tags.push_str(&password_tag(inner.password.as_ref()));
+    tags.push_str(&if r.complete { tag("tag-ok", "COMPLETE") } else { tag("tag-warn", "INCOMPLETE") });
+
+    let mut facts = String::new();
+    let mut fact = |name: &str, value: String| {
+        let _ = write!(facts, "<dt>{name}</dt><dd>{value}</dd>");
+    };
+    fact("Category", format!("<a href=\"/?cat={category}\">{}</a>", escape(&label(category).unwrap_or_default())));
+    fact("Size", escape(&fmt_size(r.size)));
+    fact("Posted", escape(&fmt_date(r.posted_date.as_deref())));
+    fact("Group", escape(&r.group_name));
+    if let Some(poster) = &r.poster {
+        fact("Poster", escape(poster));
+    }
+    if let Some(parts) = r.parts {
+        fact("Parts", parts.to_string());
+    }
+    let links = media.map(|m| id_links(&m.ids)).unwrap_or_default();
+    if !links.is_empty() {
+        fact("Links", links);
+    }
+
+    let files = if inner.files.is_empty() {
+        String::new()
+    } else {
+        let rows: String = inner
+            .files
+            .iter()
+            .map(|f| {
+                format!(
+                    "<tr><td class=\"name\">{}</td><td class=\"num\">{}</td></tr>",
+                    escape(&f.name),
+                    fmt_size(f.size)
+                )
+            })
+            .collect();
+        format!(
+            "<h2>Files inside</h2><div class=\"table-wrap\"><table><thead><tr><th>Name</th><th class=\"num\">Size</th></tr></thead><tbody>{rows}</tbody></table></div>"
+        )
+    };
+
+    page(
+        &format!("{} · Atlas", r.name),
+        &format!(
+            r#"{masthead}<div class="detail"><main>
+<p class="path"><a href="/">atlas::releases</a>::<b>{id}</b></p>
+<h1>{name}</h1><p>{tags}</p>
+<div class="actions"><a class="button primary" href="/ui/nzb?id={id}">Download NZB</a><a class="button" href="/?cat={category}">More in this category</a></div>
+<div class="panel"><dl class="facts">{facts}</dl></div>
+{files}
+</main></div>"#,
+            masthead = masthead(true),
+            id = r.id,
+            name = escape(&r.name),
+        ),
+    )
+}
+
+/// Where the ids a release matched lead, on the sites that give them out.
+fn id_links(ids: &crate::media::resolve::Ids) -> String {
+    let link = |name: &str, url: String| format!("<a href=\"{}\" rel=\"noreferrer\">{name}</a>", attr(&url));
+    let mut out = Vec::new();
+    if let Some(id) = ids.imdb {
+        out.push(link("IMDb", format!("https://www.imdb.com/title/tt{id:07}/")));
+    }
+    if let Some(id) = ids.tmdb {
+        out.push(link("TMDB", format!("https://www.themoviedb.org/movie/{id}")));
+    }
+    if let Some(id) = ids.tvdb {
+        out.push(link("TheTVDB", format!("https://thetvdb.com/dereferrer/series/{id}")));
+    }
+    if let Some(id) = ids.tvmaze {
+        out.push(link("TVmaze", format!("https://www.tvmaze.com/shows/{id}")));
+    }
+    out.join(" · ")
+}
+
 /// Also what someone pointing a browser at the bare address gets, soo it says how to set up a client.
 fn login_page(base: &str, wrong_key: bool) -> String {
-    let error = if wrong_key { "<p class=\"error\">That is not the API key.</p>" } else { "" };
+    let error = if wrong_key {
+        diag("caution", "that is not the API key", "Check api_key in config.toml.")
+    } else {
+        String::new()
+    };
     let base = escape(base);
     page(
         "Atlas sign in",
         &format!(
-            r#"<header><h1>Atlas</h1></header>
-<form class="login" method="post" action="/login">
+            r#"{masthead}<div class="signin">
+<div class="panel">{error}<form method="post" action="/login">
 <label for="key">API key</label>
 <input id="key" name="key" type="password" autocomplete="current-password" autofocus required>
-<button>Sign in</button>{error}
-</form>
-<section class="setup"><h2>Add Atlas to Prowlarr, Sonarr or Radarr</h2>
+<button class="button primary">Sign in</button>
+</form></div>
+<section class="panel setup"><h2>Add Atlas to Prowlarr, Sonarr or Radarr</h2>
 <p>Add it as a Newznab indexer, with the <code>api_key</code> in <code>config.toml</code>.</p>
-<ul><li>URL: <code>{base}</code></li><li>API path: <code>/api</code></li><li>Check it: <code>{base}/api?t=caps</code></li></ul></section>"#
+<ul><li>URL: <code>{base}</code></li><li>API path: <code>/api</code></li><li>Check it: <code>{base}/api?t=caps</code></li></ul></section>
+</div>"#,
+            masthead = masthead(false),
         ),
     )
 }
@@ -344,6 +625,7 @@ mod tests {
             assert_eq!(header(&results, "HX-Redirect"), Some("/"));
             let nzb = get("/ui/nzb", "id=1", bad, "http://x", KEY).unwrap();
             assert_eq!(nzb.status, 303, "{bad:?}");
+            assert_eq!(get("/ui/release", "id=1", bad, "http://x", KEY).unwrap().status, 303, "{bad:?}");
             let root = get("/", "", bad, "http://x", KEY).unwrap();
             assert!(root.body.contains("action=\"/login\""), "{bad:?}");
         }
@@ -372,6 +654,8 @@ mod tests {
         assert!(js.body.contains("htmx"));
         assert!(js.content_type.unwrap().starts_with("text/javascript"));
         assert_eq!(get("/static/atlas.css", "", None, "http://x", KEY).unwrap().status, 200);
+        assert_eq!(get("/static/atlas.js", "", None, "http://x", KEY).unwrap().status, 200);
+        assert_eq!(get("/static/atlas.svg", "", None, "http://x", KEY).unwrap().status, 200);
         assert!(get("/static/nope", "", None, "http://x", KEY).is_none());
         assert!(get("/api", "t=caps", None, "http://x", KEY).is_none());
     }
@@ -389,11 +673,11 @@ mod tests {
             parts: None,
         };
         let passwords = HashMap::from([(7, Password::Maybe)]);
-        let html = row(&release, &HashMap::from([(7, 5040)]), &passwords);
+        let html = row(&release, &HashMap::from([(7, 5040)]), &passwords, &HashMap::new());
         assert!(!html.contains("<img") && !html.contains("<b>") && !html.contains("<i>"), "{html}");
         assert!(html.contains("TV/HD") && html.contains("2.0 KB"), "{html}");
-        assert!(html.contains("password?") && html.contains("incomplete"), "{html}");
-        assert!(html.contains("/ui/nzb?id=7"), "{html}");
+        assert!(html.contains("PASSWORD?") && html.contains("INCOMPLETE"), "{html}");
+        assert!(html.contains("/ui/nzb?id=7") && html.contains("/ui/release?id=7"), "{html}");
     }
 
     #[test]
@@ -408,10 +692,44 @@ mod tests {
     }
 
     #[test]
-    fn the_category_list_keeps_the_choice() {
-        let options = category_options("5040");
-        assert!(options.contains(r#"<option value="5040" selected>TV / HD</option>"#), "{options}");
-        assert_eq!(options.matches(" selected").count(), 1);
-        assert_eq!(category_options("<x>").matches(" selected").count(), 0);
+    fn the_sidebar_marks_the_category_and_keeps_the_search() {
+        let search = Search { q: "a b".into(), cat: "5040".into(), offset: 0 };
+        let nav = category_nav(&search, "");
+        assert_eq!(nav.matches("aria-current").count(), 1, "{nav}");
+        assert!(
+            nav.contains(r#"href="/?q=a%20b&amp;cat=5040" hx-get="/ui/results?cat=5040" aria-current="page""#),
+            "{nav}"
+        );
+        let unknown = Search { q: String::new(), cat: "<x>".into(), offset: 0 };
+        assert_eq!(category_nav(&unknown, "").matches("aria-current").count(), 0);
+        assert!(!category_input("\"><x>", "").contains("<x>"));
+    }
+
+    #[test]
+    fn an_empty_result_says_why_and_how_to_widen_it() {
+        let hd = Search { q: String::new(), cat: "2040".into(), offset: 0 }.nothing_found();
+        assert!(hd.contains("nothing is in Movies / HD yet"), "{hd}");
+        assert!(hd.contains("Look in all categories"), "{hd}");
+        let word = Search { q: "<b>".into(), cat: String::new(), offset: 0 }.nothing_found();
+        assert!(word.contains("&lt;b&gt;") && !word.contains("<b>"), "{word}");
+        assert!(!word.contains("Look in all categories"), "{word}");
+    }
+
+    #[test]
+    fn the_path_names_the_category() {
+        let path = Search { q: String::new(), cat: "2040".into(), offset: 0 }.summary();
+        assert!(path.contains("atlas::releases::<b>movies</b>::<b>hd</b>"), "{path}");
+        assert!(path.contains("Newest first"), "{path}");
+        assert!(Search { q: "x".into(), cat: "9999".into(), offset: 0 }.summary().contains("Best matches first"));
+    }
+
+    #[test]
+    fn media_labels_and_id_links() {
+        let episode = MediaAttrs { season: Some(1), episode: Some(2), ..MediaAttrs::default() };
+        assert_eq!(media_label(&episode).as_deref(), Some("S01E02"));
+        assert_eq!(media_label(&MediaAttrs { year: Some(2024), ..MediaAttrs::default() }).as_deref(), Some("2024"));
+        assert_eq!(media_label(&MediaAttrs::default()), None);
+        let links = id_links(&crate::media::resolve::Ids { imdb: Some(133093), ..Default::default() });
+        assert!(links.contains("https://www.imdb.com/title/tt0133093/"), "{links}");
     }
 }

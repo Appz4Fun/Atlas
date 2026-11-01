@@ -113,14 +113,26 @@ fn the_web_ui_end_to_end() {
     // what htmx swaps in
     let found = fetch(port, "/ui/results?q=Findword&cat=", &cookie);
     assert_eq!(found.status(), 200);
-    assert!(found.body.starts_with("<table>") && found.body.contains("Findword"), "{}", found.body);
+    assert!(found.body.contains("<table>") && found.body.contains("Findword"), "{}", found.body);
+    assert!(found.body.contains(r#"id="categories""#) && found.body.contains("hx-swap-oob"), "{}", found.body);
     assert!(!found.body.contains("alert(1)"), "{}", found.body);
     assert_eq!(found.header("HX-Push-Url").as_deref(), Some("/?q=Findword"));
 
     let by_cat = fetch(port, "/ui/results?cat=5000", &cookie);
     assert!(by_cat.body.contains("Findword") && !by_cat.body.contains("alert(1)"), "{}", by_cat.body);
-    assert!(fetch(port, "/ui/results?q=nothinglikethis", &cookie).body.contains("No releases found"));
+    assert!(fetch(port, "/ui/results?q=nothinglikethis", &cookie).body.contains("nothing matches"));
+    assert!(fetch(port, "/ui/results?cat=2040", &cookie).body.contains("nothing is in Movies / HD yet"));
     assert!(fetch(port, "/?q=Findword", &cookie).body.contains(r#"value="Findword""#));
+
+    let release = fetch(port, &format!("/ui/release?id={id}"), &cookie);
+    assert_eq!(release.status(), 200);
+    assert!(
+        release.body.contains("Tv.Findword.S01E01-GRP") && release.body.contains("Download NZB"),
+        "{}",
+        release.body
+    );
+    assert_eq!(fetch(port, "/ui/release?id=999999999", &cookie).status(), 404);
+    assert_eq!(fetch(port, &format!("/ui/release?id={id}"), "").status(), 303);
 
     let nzb = fetch(port, &format!("/ui/nzb?id={id}"), &cookie);
     assert_eq!(nzb.status(), 200);
