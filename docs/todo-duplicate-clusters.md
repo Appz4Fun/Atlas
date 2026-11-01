@@ -27,20 +27,20 @@ A different encode of the same title is not the same content, so it's neither a 
 
 ## Work
 
-Built on the \`feat/release-details\` branch. Instead of cluster tables, each release keeps two fingerprints in its shard, and its copies are looked up in every shard when its page opens. There's nothing to keep in step, and a purged release takes its row with it.
+Built on the `feat/release-details` branch. Instead of cluster tables, each release keeps two fingerprints in its shard, and its copies are looked up in every shard when its page opens. There's nothing to keep in step, and a purged release takes its row with it.
 
 ### Done
 
 - [x] **Posted fingerprint:** sizes and MD5s from a complete PAR2 set. Equal ones are byte-identical, which makes a **twin**.
 - [x] **Content fingerprint:** exact sizes of the real files, at least 1 MiB, leaving out samples, with names ignored. Equal ones with different posted files make a **pair**.
 - [x] Written by the archive and PAR2 steps as releases are read.
-- [x] \`atlas --fingerprints --apply\` fills in content fingerprints from stored data. It finds pairs only, because PAR2 hashes were never stored.
+- [x] `atlas --fingerprints --apply` fills in content fingerprints from stored data. It finds pairs only, because PAR2 hashes were never stored.
 - [x] Web UI: "Other copies" on the release page, with TWIN and PAIR tags.
 - [x] Tests: same sizes with different hashes make no twin, another encode makes no pair, packed files make no content fingerprint, copies are found across shards, and a purged release is no one's copy.
 
 ### Left
 
-- [ ] Run \`--fingerprints\` on the real data, then measure: how many copies, the share of each kind, a hand check of a sample for false matches, and how long it takes with the indexer running.
+- [ ] Run `--fingerprints` on the real data, then measure: how many copies, the share of each kind, a hand check of a sample for false matches, and how long it takes with the indexer running.
 - [ ] Twins for existing releases: their PAR2 sets have to be read again, which costs a body fetch per release. Decide whether that's worth a walk.
 - [ ] Web UI: show "2 twins, 1 pair" in results. It's about 400 lookups a page, so it needs measuring first.
 - [ ] Newznab API: add attributes for the kind of copy, without changing existing results.
