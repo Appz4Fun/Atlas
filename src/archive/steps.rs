@@ -6,6 +6,8 @@ use std::time::{Duration, Instant};
 use rusqlite::params;
 use rusqlite::types::Value;
 
+use crate::duplicates;
+
 use crate::config::{ArchiveConfig, Config};
 use crate::naming::{self, NameSource};
 use crate::par2;
@@ -116,6 +118,11 @@ fn finish(ctx: &StepCtx<'_>, source: i64, listing: Listing, limits: &ArchiveConf
         // past the total: what's there stays, and this list goes unstored
         writes.push(StepWrite::new(archive_store::COUNT_OVER_QUOTA, vec![]));
     }
+    if !listing.damaged
+        && let Some(content) = duplicates::content_fingerprint(listing.files.iter().map(|f| (f.name.as_str(), f.size)))
+    {
+        writes.push(StepWrite::new(duplicates::SET_CONTENT, vec![id.into(), content.into()]));
+    }
     if source != SOURCE_PAR2 {
         writes.push(StepWrite::new(archive_store::UPSERT_RELEASE, vec![id.into(), listing.password().code().into()]));
         if let Some(encryption) = listing.encryption {
@@ -208,7 +215,13 @@ impl Step for Par2Step {
             return Ok(Outcome::default());
         }
         let limits = self.limits.lock().unwrap().clone();
-        finish(ctx, SOURCE_PAR2, listing_of(inventory), &limits)
+        let posted = inventory.complete.then(|| duplicates::posted_fingerprint(&inventory.files)).flatten();
+        let mut outcome = finish(ctx, SOURCE_PAR2, listing_of(inventory), &limits)?;
+        if let Some(posted) = posted {
+            let params = vec![ctx.release().id.into(), posted.into()];
+            outcome.writes.push(StepWrite::new(duplicates::SET_POSTED, params));
+        }
+        Ok(outcome)
     }
 }
 

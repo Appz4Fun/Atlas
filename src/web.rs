@@ -613,6 +613,8 @@ fn release_html(
         )
     };
 
+    let copies = copies_html(&crate::duplicates::copies(r.id).unwrap_or_default());
+
     page(
         &format!("{} · Atlas", r.name),
         &format!(
@@ -622,12 +624,40 @@ fn release_html(
 <div class="actions"><a class="button primary" href="/ui/nzb?id={id}">Download NZB</a><a class="button" href="/?cat={category}">More in this category</a></div>
 <div id="title-details" hx-get="/ui/details?id={id}" hx-trigger="load" hx-swap="outerHTML"></div>
 <div class="panel"><dl class="facts">{facts}</dl></div>
+{copies}
 {files}
 </main></div>"#,
             masthead = masthead(true),
             id = r.id,
             name = escape(&r.name),
         ),
+    )
+}
+
+/// Other postings of this release's content.
+fn copies_html(copies: &[(crate::duplicates::Copy, ReleaseRow)]) -> String {
+    use crate::duplicates::Copy;
+    if copies.is_empty() {
+        return String::new();
+    }
+    let rows: String = copies
+        .iter()
+        .map(|(kind, copy)| {
+            let kind = match kind {
+                Copy::Twin => tag("tag-ok", "TWIN"),
+                Copy::Pair => tag("tag-ref", "PAIR"),
+            };
+            format!(
+                "<tr><td class=\"name\"><a href=\"/ui/release?id={id}\">{name}</a>{kind}</td><td class=\"num\">{size}</td><td class=\"dim\">{group}</td><td><a class=\"button small primary\" href=\"/ui/nzb?id={id}\">NZB</a></td></tr>",
+                id = copy.id,
+                name = escape(&copy.name),
+                size = fmt_size(copy.size),
+                group = escape(&copy.group_name),
+            )
+        })
+        .collect();
+    format!(
+        "<h2>Other copies</h2><div class=\"table-wrap\"><table><thead><tr><th>Name</th><th class=\"num\">Size</th><th>Group</th><th><span class=\"sr-only\">Download</span></th></tr></thead><tbody>{rows}</tbody></table></div><p class=\"sort\">A twin has the same files, proven by PAR2 hashes. A pair holds the same content packed differently.</p>"
     )
 }
 
