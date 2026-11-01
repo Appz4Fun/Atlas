@@ -1,8 +1,11 @@
 //! What the indexer's once-a-second status round hands over: numbers that are
 //! already kept elsewhere, copied into their metrics.
 
+use std::collections::BTreeMap;
+
 use serde_json::{Map, Value};
 
+use super::label_key;
 use super::names::*;
 use crate::nntp::ServerStat;
 
@@ -36,24 +39,60 @@ fn total(v: &Value) -> u64 {
     v.as_u64().unwrap_or(0)
 }
 
+/// One `server` label's numbers: accounts on one host and port share a key.
+#[derive(Default)]
+struct ServerTotals<'a> {
+    open: usize,
+    in_use: usize,
+    limit: usize,
+    configured: u64,
+    waiting: usize,
+    states: Vec<&'a str>,
+    indexing: bool,
+    headers: u64,
+    wire: u64,
+    text: u64,
+}
+
 pub fn report_servers(servers: &[ServerStat]) {
+    let mut totals: BTreeMap<&str, ServerTotals> = BTreeMap::new();
     for s in servers {
-        let server = s.key.as_str();
-        let label = |state: &'static str| [("server", server), ("state", state)];
-        NNTP_CONNECTIONS.set(&label("open"), s.open as f64);
-        NNTP_CONNECTIONS.set(&label("in_use"), s.in_use as f64);
-        NNTP_CONNECTIONS.set(&label("idle"), s.open.saturating_sub(s.in_use) as f64);
-        NNTP_CONNECTIONS.set(&label("limit"), s.limit as f64);
-        NNTP_CONNECTIONS.set(&label("configured"), f64::from(s.connections));
-        NNTP_WAITING.set(&[("server", server)], s.waiting as f64);
-        for state in STATES {
-            NNTP_SERVER_STATE.set(&label(state), f64::from(s.state == state));
-        }
-        NNTP_SERVER_INDEXING.set(&[("server", server)], f64::from(s.indexing));
-        NNTP_HEADERS.set_total(&[("server", server)], s.headers);
-        NNTP_TRAFFIC.set_total(&[("server", server), ("kind", "wire")], s.wire_bytes);
-        NNTP_TRAFFIC.set_total(&[("server", server), ("kind", "text")], s.text_bytes);
+        let t = totals.entry(s.key.as_str()).or_default();
+        t.open += s.open;
+        t.in_use += s.in_use;
+        t.limit += s.limit;
+        t.configured += u64::from(s.connections);
+        t.waiting += s.waiting;
+        t.states.push(s.state);
+        t.indexing |= s.indexing;
+        t.headers += s.headers;
+        t.wire += s.wire_bytes;
+        t.text += s.text_bytes;
     }
+
+    // whole readings: a server gone from the config goes from the gauges too
+    let (mut connections, mut waiting, mut states, mut indexing) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for (server, t) in &totals {
+        let server = *server;
+        let labelled = |state: &str| label_key(&[("server", server), ("state", state)]);
+        connections.push((labelled("open"), t.open as f64));
+        connections.push((labelled("in_use"), t.in_use as f64));
+        connections.push((labelled("idle"), t.open.saturating_sub(t.in_use) as f64));
+        connections.push((labelled("limit"), t.limit as f64));
+        connections.push((labelled("configured"), t.configured as f64));
+        waiting.push((label_key(&[("server", server)]), t.waiting as f64));
+        for state in STATES {
+            states.push((labelled(state), f64::from(t.states.contains(&state))));
+        }
+        indexing.push((label_key(&[("server", server)]), f64::from(t.indexing)));
+        NNTP_HEADERS.set_total(&[("server", server)], t.headers);
+        NNTP_TRAFFIC.set_total(&[("server", server), ("kind", "wire")], t.wire);
+        NNTP_TRAFFIC.set_total(&[("server", server), ("kind", "text")], t.text);
+    }
+    NNTP_CONNECTIONS.replace(connections);
+    NNTP_WAITING.replace(waiting);
+    NNTP_SERVER_STATE.replace(states);
+    NNTP_SERVER_INDEXING.replace(indexing);
 }
 
 /// `extra` is what the indexer puts in stats.json beside its own totals.

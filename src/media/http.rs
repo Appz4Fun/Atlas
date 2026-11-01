@@ -123,27 +123,30 @@ impl Client {
     /// `url` holds any key, soo it's never logged and never in a `Trouble`.
     pub fn get(&self, url: &str, headers: &[(&str, &str)]) -> Result<Reply, Trouble> {
         self.ready()?;
-        let _span = crate::metrics::span("media.request");
+        let span = crate::metrics::span("media.request");
         let mut request = self.agent.get(url);
         for (name, value) in headers {
             request = request.header(*name, *value);
         }
-        self.counted(self.answer(request.call()))
+        self.counted(&span, self.answer(request.call()))
     }
 
     /// As `get`, with a body that can hold a key.
     pub fn post_json(&self, url: &str, body: &Value) -> Result<Reply, Trouble> {
         self.ready()?;
-        let _span = crate::metrics::span("media.request");
-        self.counted(self.answer(self.agent.post(url).send_json(body)))
+        let span = crate::metrics::span("media.request");
+        self.counted(&span, self.answer(self.agent.post(url).send_json(body)))
     }
 
-    fn counted(&self, reply: Result<Reply, Trouble>) -> Result<Reply, Trouble> {
+    fn counted(&self, span: &crate::metrics::Span, reply: Result<Reply, Trouble>) -> Result<Reply, Trouble> {
         let result = match &reply {
             Ok(Reply::Json(_)) => "ok",
             Ok(Reply::NotFound) => "not_found",
             Err(Trouble::Paused(_)) => "paused",
-            Err(_) => "failed",
+            Err(_) => {
+                span.failed();
+                "failed"
+            }
         };
         crate::metrics::names::MEDIA_REQUESTS.inc(&[("provider", self.name), ("result", result)], 1);
         reply

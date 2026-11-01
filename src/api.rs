@@ -38,25 +38,30 @@ pub struct ApiResponse {
     pub content_type: Option<&'static str>,
     pub body: String,
     pub headers: Vec<(String, String)>,
+    /// atlas itself failed, whatever the status says: Newznab errors go out as 200
+    pub failed: bool,
 }
 
 impl ApiResponse {
     fn xml(status: u16, body: String) -> Self {
-        ApiResponse { status, content_type: Some(XML), body, headers: Vec::new() }
+        ApiResponse { status, content_type: Some(XML), body, headers: Vec::new(), failed: false }
     }
 
     fn not_found() -> Self {
-        ApiResponse { status: 404, content_type: None, body: String::new(), headers: Vec::new() }
+        ApiResponse { status: 404, content_type: None, body: String::new(), headers: Vec::new(), failed: false }
     }
 
     /// newznab error, sent with http 200 like real indexers do
     fn error(code: u16, description: &str) -> Self {
-        ApiResponse::xml(
+        let mut response = ApiResponse::xml(
             200,
             format!(
                 "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<error code=\"{code}\" description=\"{description}\"/>"
             ),
-        )
+        );
+        // 1xx and 2xx are about the request; 900 is atlas's own
+        response.failed = code >= 900;
+        response
     }
 }
 
@@ -120,6 +125,7 @@ pub fn handle(path: &str, query: &str, base: &str, api_key: &str) -> ApiResponse
                 "Atlas newznab api is running.\n\nAdd it to Prowlarr / Sonarr / Radarr as a Newznab indexer:\n  URL:      {base}\n  API path: /api\n  API key:  the api_key in config.toml\n\nCheck it: {base}/api?t=caps\n"
             ),
             headers: Vec::new(),
+            failed: false,
         };
     }
 
@@ -341,6 +347,7 @@ fn get(args: &HashMap<String, String>) -> ApiResponse {
         content_type: Some("application/x-nzb"),
         body: content,
         headers: vec![("Content-Disposition".into(), format!("attachment; filename=\"{filename}\""))],
+        failed: false,
     }
 }
 
@@ -385,9 +392,9 @@ fn respond(request: Request, api_key: &str, fallback_host: &str) {
     let resp = if is_get {
         handle(path, query, &base, api_key)
     } else {
-        ApiResponse { status: 405, content_type: None, body: String::new(), headers: Vec::new() }
+        ApiResponse { status: 405, content_type: None, body: String::new(), headers: Vec::new(), failed: false }
     };
-    if resp.status >= 500 {
+    if resp.status >= 500 || resp.failed {
         span.failed();
     }
     drop(span);
@@ -467,6 +474,14 @@ pub fn stop() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_atlass_own_errors_count_as_failed() {
+        assert!(ApiResponse::error(900, "Search failed").failed);
+        assert_eq!(ApiResponse::error(900, "Search failed").status, 200);
+        assert!(!ApiResponse::error(200, "Missing parameter (t)").failed);
+        assert!(!ApiResponse::error(100, "Incorrect user credentials").failed);
+    }
 
     #[test]
     fn a_client_cant_invent_an_endpoint_label() {

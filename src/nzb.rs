@@ -104,7 +104,10 @@ pub fn render_nzb(release: &ReleaseRow, articles: &[ArticleRow]) -> String {
 }
 
 pub fn build_nzb(release_id: i64) -> Result<Option<String>> {
-    let _span = crate::metrics::span("nzb.build");
+    crate::metrics::timed("nzb.build", || whole_nzb(release_id))
+}
+
+fn whole_nzb(release_id: i64) -> Result<Option<String>> {
     let Some(release) = get_release(release_id)? else { return Ok(None) };
     let articles = get_articles(release_id)?;
 
@@ -117,7 +120,10 @@ pub fn build_nzb(release_id: i64) -> Result<Option<String>> {
 
 /// One file of a release as its own NZB: `file` counts from 1, in the order the release's whole NZB lists them.
 pub fn build_nzb_file(release_id: i64, file: usize) -> Result<Option<String>> {
-    let _span = crate::metrics::span("nzb.build_file");
+    crate::metrics::timed("nzb.build_file", || one_file_nzb(release_id, file))
+}
+
+fn one_file_nzb(release_id: i64, file: usize) -> Result<Option<String>> {
     let Some(release) = get_release(release_id)? else { return Ok(None) };
     let articles = get_articles(release_id)?;
     // sorted by filename, soo each file's articles are one run

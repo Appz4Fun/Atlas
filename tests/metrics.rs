@@ -120,6 +120,19 @@ fn the_pool_counts_commands_bytes_connections_and_failures_per_server() {
     assert_eq!(value(&text, &labelled("atlas_nntp_server_state", "state=\"ok\"")), Some(1.0));
     assert_eq!(value(&text, &labelled("atlas_nntp_server_state", "state=\"resting\"")), Some(0.0));
     assert_eq!(value(&text, &format!("atlas_nntp_waiting_requests{{server=\"{key}\"}}")), Some(0.0));
+
+    // after a config reload: two accounts on one host and port, and the old server is gone
+    let other = spawn_server(Server::new(Vec::new()));
+    let pool = Pool::new(&[mock(other, "secret", 3, 1), mock(other, "secret", 7, 1)]);
+    let stats = pool.server_stats();
+    assert_eq!(stats[0].key, stats[1].key);
+    metrics::report_servers(&stats);
+    let text = metrics::render();
+    let configured = format!("atlas_nntp_connections{{server=\"{}\",state=\"configured\"}}", stats[0].key);
+    assert_eq!(value(&text, &configured), Some(10.0), "{text}");
+    assert_eq!(value(&text, &labelled("atlas_nntp_connections", "state=\"configured\"")), None, "{text}");
+    assert_eq!(value(&text, &labelled("atlas_nntp_server_state", "state=\"ok\"")), None, "{text}");
+    assert!(value(&text, &format!("atlas_nntp_headers_total{{server=\"{key}\"}}")).is_some(), "counters stay: {text}");
 }
 
 #[test]
@@ -220,6 +233,16 @@ fn the_catalog_walk_counts_every_release_once() {
     assert_eq!(at("atlas_catalog_predb_root_releases{root=\"Movies\",matched=\"yes\"}"), 1.0);
     assert_eq!(at("atlas_catalog_predb_root_releases{root=\"Movies\",matched=\"no\"}"), 1.0);
     assert!(at("atlas_catalog_scan_timestamp_seconds") > 1e9);
+}
+
+#[test]
+fn a_shard_out_of_the_way_fails_the_walk_instead_of_undercounting() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = dir.path().join("atlas.db");
+    db::create_db_at(&main).unwrap();
+    assert!(catalog::scan(&main, &AtomicBool::new(false)).unwrap().is_some());
+    std::fs::remove_file(store::shard_path(&main, 3)).unwrap();
+    assert!(catalog::scan(&main, &AtomicBool::new(false)).is_err());
 }
 
 #[test]

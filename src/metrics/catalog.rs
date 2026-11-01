@@ -428,11 +428,15 @@ fn read_batch(conn: &Connection, after: i64, limit: i64, tally: &mut Tally) -> r
 /// One walk over every shard. None: stopped part way.
 pub fn scan(main: &Path, stop: &AtomicBool) -> rusqlite::Result<Option<Tally>> {
     let mut tally = Tally::default();
-    for path in store::shard_paths(main).iter().filter(|p| p.exists()) {
+    for path in &store::shard_paths(main) {
         let mut after = i64::MIN;
         loop {
             if stop.load(Relaxed) {
                 return Ok(None);
+            }
+            // a compaction has it out of the way for now: totals without it are wrong, soo no totals
+            if !path.exists() {
+                return Err(rusqlite::Error::InvalidPath(path.clone()));
             }
             // a connection per read holds nothing open for a compaction to wait out
             let conn = db::open_shard(path)?;

@@ -196,8 +196,7 @@ pub fn search_releases(query: &str, group: &str, page: i64, page_size: i64) -> R
 }
 
 pub fn search_all_releases(query: &str, page: i64, page_size: i64) -> Result<Vec<ReleaseRow>> {
-    let _span = crate::metrics::span("search.by_name");
-    search(query, None, page, page_size)
+    crate::metrics::timed("search.by_name", || search(query, None, page, page_size))
 }
 
 pub fn count_releases(query: &str, group: &str) -> Result<i64> {
@@ -273,8 +272,9 @@ fn probe_sql(s: usize) -> String {
 /// The newest releases in a category filter, newest first: one cursor per leaf per shard, plus one per
 /// shard for rows with no category when that's asked for, merged lazily. Only rows that reach the top are read.
 pub fn newest_in_categories(filter: &CatFilter, offset: i64, limit: i64) -> Result<CatPage> {
-    let _span = crate::metrics::span("search.newest_in_categories");
-    newest_in_categories_with(&db::open()?, filter, offset, limit, &Bounds::DEFAULT)
+    crate::metrics::timed("search.newest_in_categories", || {
+        newest_in_categories_with(&db::open()?, filter, offset, limit, &Bounds::DEFAULT)
+    })
 }
 
 pub fn newest_in_categories_with(
@@ -352,8 +352,9 @@ fn cat_clause(f: &CatFilter) -> String {
 
 /// A search within a category filter: ranked, over the newest matches of each shard.
 pub fn search_in_categories(query: &str, filter: &CatFilter, offset: i64, limit: i64) -> Result<Vec<ReleaseRow>> {
-    let _span = crate::metrics::span("search.by_name_in_categories");
-    search_in_categories_with(&db::open()?, query, filter, offset, limit, &Bounds::DEFAULT)
+    crate::metrics::timed("search.by_name_in_categories", || {
+        search_in_categories_with(&db::open()?, query, filter, offset, limit, &Bounds::DEFAULT)
+    })
 }
 
 pub fn search_in_categories_with(
@@ -398,8 +399,7 @@ pub fn search_in_categories_with(
 }
 
 pub fn all_releases(page: i64, page_size: i64) -> Result<Vec<ReleaseRow>> {
-    let _span = crate::metrics::span("search.newest");
-    newest(&shards(None), VISIBLE_RELEASE, Vec::new(), page, page_size)
+    crate::metrics::timed("search.newest", || newest(&shards(None), VISIBLE_RELEASE, Vec::new(), page, page_size))
 }
 
 pub fn search_obfuscated(page: i64, page_size: i64) -> Result<Vec<ReleaseRow>> {

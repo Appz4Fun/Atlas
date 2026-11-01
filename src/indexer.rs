@@ -1735,7 +1735,16 @@ async fn save_slice(pool: &Arc<Pool>, db: &Db, group: &str, headers: Vec<Overvie
     if crate::filters::group_blocked(group) {
         return Ok(Progress { articles, ..Progress::default() });
     }
-    let _span = crate::metrics::span("indexer.save_slice");
+    let span = crate::metrics::span("indexer.save_slice");
+    let saved = parse_and_save(pool, db, group, headers).await;
+    if saved.is_err() {
+        span.failed();
+    }
+    saved
+}
+
+async fn parse_and_save(pool: &Arc<Pool>, db: &Db, group: &str, headers: Vec<Overview>) -> Result<Progress> {
+    let articles = headers.len() as i64;
     crate::profile::SLICES.add(1);
     crate::profile::HEADERS.add(articles as u64);
 
@@ -1781,8 +1790,12 @@ async fn save_slice(pool: &Arc<Pool>, db: &Db, group: &str, headers: Vec<Overvie
 
     let count = releases.len() as i64;
     {
-        let _span = crate::metrics::span("indexer.wait_for_save");
-        db.save(releases).await?;
+        let span = crate::metrics::span("indexer.wait_for_save");
+        let saved = db.save(releases).await;
+        if saved.is_err() {
+            span.failed();
+        }
+        saved?;
     }
 
     Ok(Progress { articles, bytes, releases: count, skipped })
