@@ -105,7 +105,7 @@ families! {
 
     // predb
     PREDB_LOOKUPS "atlas_predb_lookups_total" Counter &[], "PreDB lookups, by result.";
-    PREDB_MATCHES "atlas_predb_matches_total" Counter &[], "Releases matched to a PreDB title, by how and by PreDB category.";
+    PREDB_MATCHES "atlas_predb_matches_total" Counter &[], "Releases matched to a PreDB title, by how and by PreDB category, reruns included.";
     PREDB_TITLES "atlas_predb_titles" Gauge &[], "Titles in the PreDB.";
     PREDB_FILE_BYTES "atlas_predb_file_bytes" Gauge &[], "Size of the PreDB file.";
     PREDB_LATE "atlas_predb_late_total" Counter &[], "Late title matching: titles, reruns, overflow, out_of_budget, errors.";

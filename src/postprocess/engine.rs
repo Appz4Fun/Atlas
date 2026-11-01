@@ -18,7 +18,7 @@ use crate::profile::LOAD;
 use crate::store::{self, SHARDS};
 
 use super::StageParams;
-use super::apply::{Applied, Lane, apply_one};
+use super::apply::{Applied, Lane, Renames, apply_one, count_names};
 use super::bodies::{BodyFetcher, TokenBucket};
 use super::rules::{self, BodyGate, FileSummary, RowFacts, Rules, Verdict};
 use super::stats::{self, Stats};
@@ -481,17 +481,24 @@ impl Inner {
     ) -> anyhow::Result<()> {
         let Batch { applied, holds, .. } = batch;
         let max_attempts = self.settings.read().unwrap().config.max_attempts;
+        let written = Arc::new(Mutex::new(Renames::new()));
+        let filling = written.clone();
         let answer = db.on_writer(
             shard,
             Box::new(move |conn| {
+                let mut renames = filling.lock().unwrap();
                 for a in applied {
                     let id = a.release_id;
-                    apply_one(conn, a, now, &|attempt| (backoff(attempt, id), attempt >= max_attempts))?;
+                    apply_one(conn, a, now, &|attempt| (backoff(attempt, id), attempt >= max_attempts), &mut renames)?;
                 }
                 also(conn)
             }),
         )?;
         let answered = answer.recv()?.map_err(anyhow::Error::msg);
+        // the answer comes after the commit: a rolled back name isnt counted, nor its retry twice
+        if answered.is_ok() {
+            count_names(&written.lock().unwrap());
+        }
         drop(holds);
         answered
     }

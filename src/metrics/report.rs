@@ -2,6 +2,7 @@
 //! already kept elsewhere, copied into their metrics.
 
 use std::collections::BTreeMap;
+use std::sync::Mutex;
 
 use serde_json::{Map, Value};
 
@@ -37,6 +38,16 @@ fn int(v: &Value) -> i64 {
 
 fn total(v: &Value) -> u64 {
     v.as_u64().unwrap_or(0)
+}
+
+/// What each server's totals last read: a new pool starts them over, the counters go on.
+static SEEN: Mutex<BTreeMap<(String, &'static str), u64>> = Mutex::new(BTreeMap::new());
+
+/// How much a total grew since it was `last` read.
+fn growth(last: &mut u64, now: u64) -> u64 {
+    let grew = if now >= *last { now - *last } else { now };
+    *last = now;
+    grew
 }
 
 /// One `server` label's numbers: accounts on one host and port share a key.
@@ -85,9 +96,11 @@ pub fn report_servers(servers: &[ServerStat]) {
             states.push((labelled(state), f64::from(t.states.contains(&state))));
         }
         indexing.push((label_key(&[("server", server)]), f64::from(t.indexing)));
-        NNTP_HEADERS.set_total(&[("server", server)], t.headers);
-        NNTP_TRAFFIC.set_total(&[("server", server), ("kind", "wire")], t.wire);
-        NNTP_TRAFFIC.set_total(&[("server", server), ("kind", "text")], t.text);
+        let mut seen = SEEN.lock().unwrap();
+        let mut grown = |kind: &'static str, now: u64| growth(seen.entry((server.to_string(), kind)).or_default(), now);
+        NNTP_HEADERS.inc(&[("server", server)], grown("headers", t.headers));
+        NNTP_TRAFFIC.inc(&[("server", server), ("kind", "wire")], grown("wire", t.wire));
+        NNTP_TRAFFIC.inc(&[("server", server), ("kind", "text")], grown("text", t.text));
     }
     NNTP_CONNECTIONS.replace(connections);
     NNTP_WAITING.replace(waiting);
@@ -166,5 +179,19 @@ fn report_predb(predb: &Value) {
         for (key, kind) in [("inserted", "inserted"), ("updated", "updated"), ("last_rows", "last")] {
             PREDB_FEED_ROWS.set(&[("feed", feed), ("kind", kind)], int(&source[key]) as f64);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::growth;
+
+    #[test]
+    fn a_pool_starting_over_doesnt_take_from_the_counters() {
+        let mut last = 0;
+        assert_eq!(growth(&mut last, 100), 100);
+        assert_eq!(growth(&mut last, 150), 50);
+        assert_eq!(growth(&mut last, 20), 20, "a new pool");
+        assert_eq!(growth(&mut last, 30), 10);
     }
 }

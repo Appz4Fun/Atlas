@@ -34,6 +34,8 @@ const RETRY: Duration = Duration::from_secs(5 * 60);
 const TOP_GROUPS: usize = 100;
 const TOP_RELEASE_GROUPS: usize = 150;
 const OTHER: &str = "(other)";
+/// titles held during a walk before asking the PreDB file for their feeds
+const MAX_TITLES: usize = 100_000;
 /// release group names kept during a walk; past this the ones seen once go
 const MAX_RELEASE_GROUPS: usize = 200_000;
 
@@ -362,7 +364,8 @@ impl Tally {
             "{}.predb.db",
             main.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "atlas".into())
         ));
-        if !path.exists() || self.predb_titles.is_empty() {
+        let titles = std::mem::take(&mut self.predb_titles);
+        if !path.exists() || titles.is_empty() {
             return;
         }
         let read = || -> rusqlite::Result<BTreeMap<String, u64>> {
@@ -371,7 +374,7 @@ impl Tally {
                 "select coalesce(f.key, t.source) from titles t left join feeds f on f.source = t.source where t.id = ?1",
             )?;
             let mut feeds = BTreeMap::new();
-            for (title, n) in &self.predb_titles {
+            for (title, n) in &titles {
                 let found: rusqlite::Result<String> = stmt.query_row([title], |r| {
                     r.get_ref(0).map(|v| match v.as_str() {
                         Ok(key) => key.to_string(),
@@ -384,7 +387,11 @@ impl Tally {
             Ok(feeds)
         };
         match read() {
-            Ok(feeds) => self.feeds = feeds,
+            Ok(feeds) => {
+                for (feed, n) in feeds {
+                    *self.feeds.entry(feed).or_default() += n;
+                }
+            }
             Err(e) => println!("metrics: couldnt read the predb feeds: {e}"),
         }
     }
@@ -461,6 +468,9 @@ pub fn scan(main: &Path, stop: &AtomicBool) -> rusqlite::Result<Option<Tally>> {
             conn.execute_batch("pragma query_only = on")?;
             let next = read_batch(&conn, after, BATCH, &mut tally)?;
             drop(conn);
+            if tally.predb_titles.len() >= MAX_TITLES {
+                tally.read_feeds(main);
+            }
             CATALOG_SCAN_ROWS.set(&[("state", "running")], tally.rows as f64);
             match next {
                 Some(last) => after = last,

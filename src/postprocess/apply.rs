@@ -45,6 +45,21 @@ pub(crate) struct Applied {
     pub no_state: bool,
 }
 
+/// Names a transaction wrote: each one's source, and whether it was the first
+/// real name of an obfuscated post. Counted once they are committed, see `count_names`.
+pub(crate) type Renames = Vec<(u8, bool)>;
+
+pub(crate) fn count_names(renames: &[(u8, bool)]) {
+    use crate::metrics::names::{DEOBFUSCATED, NAMES_APPLIED};
+    for (source, first) in renames {
+        let from = crate::metrics::catalog::name_source_name(*source);
+        NAMES_APPLIED.inc(&[("source", from)], 1);
+        if *first {
+            DEOBFUSCATED.inc(&[("source", from)], 1);
+        }
+    }
+}
+
 /// One release's visit in a savepoint: a write that fails undoes this release
 /// alone, which then counts as a failure of the lane that ran it.
 pub(crate) fn apply_one(
@@ -52,12 +67,15 @@ pub(crate) fn apply_one(
     applied: Applied,
     now: i64,
     retry: &dyn Fn(i64) -> (i64, bool),
+    renames: &mut Renames,
 ) -> rusqlite::Result<bool> {
     conn.execute_batch("savepoint one")?;
     let (id, lane, due, set_done) = (applied.release_id, applied.lane, applied.claimed_due, applied.set_done);
-    let err = match write(conn, applied, now) {
+    let mut written = Renames::new();
+    let err = match write(conn, applied, now, &mut written) {
         Ok(()) => {
             conn.execute_batch("release one")?;
+            renames.append(&mut written);
             return Ok(true);
         }
         Err(e) => e.to_string(),
@@ -92,7 +110,7 @@ pub(crate) fn apply_one(
     Ok(false)
 }
 
-fn write(conn: &Connection, mut a: Applied, now: i64) -> rusqlite::Result<()> {
+fn write(conn: &Connection, mut a: Applied, now: i64, renames: &mut Renames) -> rusqlite::Result<()> {
     let row: Option<(Option<String>, i64, bool)> = conn
         .prepare_cached(
             "select display_name, coalesce(name_source, 0), coalesce(is_obfuscated, 0) != 0 from releases where id = ?",
@@ -133,12 +151,7 @@ fn write(conn: &Connection, mut a: Applied, now: i64) -> rusqlite::Result<()> {
         }
         if name.display_name.as_ref().is_some_and(|d| current.as_ref() != Some(d)) {
             a.clear |= a.rename_clears;
-            let from = crate::metrics::catalog::name_source_name(name.source);
-            crate::metrics::names::NAMES_APPLIED.inc(&[("source", from)], 1);
-            // the first real name an obfuscated post gets
-            if was_obfuscated && current.is_none() {
-                crate::metrics::names::DEOBFUSCATED.inc(&[("source", from)], 1);
-            }
+            renames.push((name.source, was_obfuscated && current.is_none()));
             current = name.display_name.clone();
         }
         source = i64::from(name.source);
@@ -250,7 +263,7 @@ mod tests {
     }
 
     fn run(conn: &Connection, a: Applied) -> bool {
-        apply_one(conn, a, NOW, &|attempts| (900 * attempts, attempts >= 5)).unwrap()
+        apply_one(conn, a, NOW, &|attempts| (900 * attempts, attempts >= 5), &mut Renames::new()).unwrap()
     }
 
     fn state(conn: &Connection, id: i64) -> (i64, i64, Option<i64>, i64, i64, i64, Option<String>) {
@@ -362,6 +375,22 @@ mod tests {
         assert!(s.6.is_some(), "last_error");
         let side: i64 = conn.query_row("select count(*) from side", [], |r| r.get(0)).unwrap();
         assert_eq!(side, 0, "its own earlier write is undone");
+    }
+
+    #[test]
+    fn a_name_counts_only_when_its_write_held() {
+        let (_dir, conn, id) = shard();
+        let retry = |attempts| (900 * attempts, attempts >= 5);
+        let mut renames = Renames::new();
+        let names = vec![(A, rename("Real.Name", 100))];
+        let bad = vec![(A, StepWrite::new("insert into no_such_table values (2)", vec![]))];
+        let failing = Applied { release_id: id, set_done: A, names: names.clone(), writes: bad, ..Default::default() };
+        assert!(!apply_one(&conn, failing, NOW, &retry, &mut renames).unwrap());
+        assert!(renames.is_empty(), "{renames:?}");
+
+        let holding = Applied { release_id: id, set_done: A, names, ..Default::default() };
+        assert!(apply_one(&conn, holding, NOW, &retry, &mut renames).unwrap());
+        assert_eq!(renames, vec![(100, false)]);
     }
 
     /// what `Stage::rerun` does on the writer
