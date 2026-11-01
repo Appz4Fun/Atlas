@@ -348,6 +348,47 @@ fn cat_clause(f: &CatFilter) -> String {
     }
 }
 
+/// The newest matches of each shard that are in `f`, best first and newest first among equals, read in the order that costs least: the
+/// matches off the fts index, the category table for each, a score only for those in `f` (bm25 reads a row's
+/// size per call), and no `releases` row at all, which would be about a page read per match.
+/// A cross join soo the matches stay the outer loop, which a plain join would leave to the planner.
+/// Parameters: ?1 the query, ?2 matches per shard.
+fn ranked_ids_sql(f: &CatFilter) -> String {
+    let join = if f.uncategorized { "left join" } else { "cross join" };
+    let clause = cat_clause(f);
+    format!(
+        "select id from ({}) order by rank, id desc",
+        union(&shards(None), |i| format!(
+            "select releases_fts.rowid as id, bm25(releases_fts) as rank
+               from s{i}.releases_fts
+               {join} s{i}.release_category c on c.release_id = releases_fts.rowid
+              where releases_fts match ?1
+                and releases_fts.rowid >= (select min(rowid) from (select rowid from s{i}.releases_fts
+                                            where releases_fts match ?1 order by rowid desc limit ?2))
+                and {clause}"
+        ))
+    )
+}
+
+/// Reads `releases` only for ids that get as far as the page, skipping the ones a client may not see.
+fn page_of_ids(conn: &Connection, sql: &str, vals: &[Value], offset: i64, limit: i64) -> Result<Vec<ReleaseRow>> {
+    let mut probes = (0..store::SHARDS).map(|s| conn.prepare(&probe_sql(s))).collect::<Result<Vec<_>>>()?;
+    let mut stmt = conn.prepare(sql)?;
+    let mut ids = stmt.query(params_from_iter(vals.iter()))?;
+    let (mut rows, mut seen) = (Vec::new(), 0i64);
+    while (rows.len() as i64) < limit {
+        let Some(row) = ids.next()? else { break };
+        let id: i64 = row.get(0)?;
+        if let Some(hit) = probes[store::shard_of_id(id)].query_row([id], release_row).optional()? {
+            seen += 1;
+            if seen > offset {
+                rows.push(hit);
+            }
+        }
+    }
+    Ok(rows)
+}
+
 /// A search within a category filter: ranked, over the newest matches of each shard.
 pub fn search_in_categories(query: &str, filter: &CatFilter, offset: i64, limit: i64) -> Result<Vec<ReleaseRow>> {
     search_in_categories_with(&db::open()?, query, filter, offset, limit, &Bounds::DEFAULT)
@@ -365,21 +406,9 @@ pub fn search_in_categories_with(
         return Ok(Vec::new());
     }
     let clause = cat_clause(f);
-    let all = shards(None);
-    let fts = format!(
-        "select * from ({}) order by rank limit ?3 offset ?4",
-        union(&all, |i| format!(
-            "select {COLUMNS}, ranked.rank as rank
-               from (select rowid, bm25(releases_fts) as rank from s{i}.releases_fts
-                      where releases_fts match ?1 order by rowid desc limit ?2) ranked
-               cross join s{i}.releases r on r.id = ranked.rowid
-               left join s{i}.release_category c on c.release_id = r.id
-              where {VISIBLE_RELEASE} and {clause}"
-        ))
-    );
     let like = format!(
         "select * from ({}) order by sort_name limit ?3 offset ?4",
-        union(&all, |i| format!(
+        union(&shards(None), |i| format!(
             "select {COLUMNS}, r.name as sort_name
                from (select * from s{i}.releases order by id desc limit ?2) r
                left join s{i}.release_category c on c.release_id = r.id
@@ -387,11 +416,10 @@ pub fn search_in_categories_with(
                 and {VISIBLE_RELEASE} and {clause}"
         ))
     );
-    let vals = |first: String, per_shard: i64| {
-        vec![text(first), Value::Integer(per_shard), Value::Integer(limit), Value::Integer(offset)]
-    };
-    query_rows(conn, &fts, &vals(fts_query(query), bounds.fts))
-        .or_else(|_| query_rows(conn, &like, &vals(like_query(query), bounds.like)))
+    let fts_vals = [text(fts_query(query)), Value::Integer(bounds.fts)];
+    let like_vals =
+        [text(like_query(query)), Value::Integer(bounds.like), Value::Integer(limit), Value::Integer(offset)];
+    page_of_ids(conn, &ranked_ids_sql(f), &fts_vals, offset, limit).or_else(|_| query_rows(conn, &like, &like_vals))
 }
 
 pub fn all_releases(page: i64, page_size: i64) -> Result<Vec<ReleaseRow>> {
@@ -742,6 +770,69 @@ mod tests {
         let tight = Bounds { fts: 100, ..Bounds::DEFAULT };
         let got = search_in_categories_with(&conn, "Findme", &parse_filter("7020").unwrap(), 0, 10, &tight).unwrap();
         assert_eq!(names(&got), ["Findme.New"]);
+    }
+
+    #[test]
+    fn ranking_reads_no_release_rows_and_starts_from_the_matches() {
+        let f = cats_fixture();
+        let conn = f.conn();
+        for cat in ["5040", "8000", "5040,8000"] {
+            let sql = ranked_ids_sql(&parse_filter(cat).unwrap());
+            let mut stmt = conn.prepare(&format!("explain query plan {sql}")).unwrap();
+            let params = rusqlite::params!["Findme", 100];
+            let details: Vec<String> = stmt.query_map(params, |r| r.get(3)).unwrap().map(|r| r.unwrap()).collect();
+            assert!(!details.iter().any(|d| d.contains(" r ") || d.contains("releases ")), "{details:?}");
+            for d in details.iter().filter(|d| d.contains(" c ")) {
+                assert!(d.contains("SEARCH c USING INTEGER PRIMARY KEY"), "{details:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn equal_ranks_come_newest_first_across_shards() {
+        let f = cats_fixture();
+        let groups = groups_in_shards(4);
+        let added: Vec<i64> = (0..8).map(|i| f.add(&format!("Findme.{i}"), &groups[i % 4], Some(5040))).collect();
+        let conn = f.conn();
+        let got =
+            search_in_categories_with(&conn, "Findme", &parse_filter("5040").unwrap(), 0, 3, &Bounds::DEFAULT).unwrap();
+        let want: Vec<i64> = added.iter().rev().take(3).copied().collect();
+        assert_eq!(got.iter().map(|r| r.id).collect::<Vec<_>>(), want);
+    }
+
+    #[test]
+    fn search_in_categories_pages_past_hidden_rows() {
+        let f = cats_fixture();
+        let group = "alt.binaries.t0";
+        // the same text soo rank doesn't depend on length, hidden and visible in turn
+        let mut visible = Vec::new();
+        for i in 0..6 {
+            let hidden = crate::parser::Release { is_obfuscated: true, ..cat_release(&format!("Findme.H{i}"), group) };
+            store::save(&f.main, &[hidden]).unwrap();
+            let id = f.add(&format!("Findme.V{i}"), group, Some(5040));
+            visible.push(id);
+        }
+        for path in store::shard_paths(&f.main) {
+            db::open_shard(&path)
+                .unwrap()
+                .execute_batch(
+                    "insert into release_category (release_id, category)
+                     select id, 5040 from releases where is_obfuscated = 1",
+                )
+                .unwrap();
+        }
+        let conn = f.conn();
+        let filter = parse_filter("5040").unwrap();
+        let page = |offset, limit| search_in_categories_with(&conn, "Findme", &filter, offset, limit, &Bounds::DEFAULT);
+        let all: Vec<i64> = page(0, 100).unwrap().iter().map(|r| r.id).collect();
+        assert_eq!(all.len(), 6);
+        assert!(visible.iter().all(|id| all.contains(id)));
+        let first: Vec<i64> = page(0, 4).unwrap().iter().map(|r| r.id).collect();
+        let rest: Vec<i64> = page(4, 4).unwrap().iter().map(|r| r.id).collect();
+        assert_eq!(first, all[..4]);
+        assert_eq!(rest, all[4..]);
+        assert!(page(6, 4).unwrap().is_empty());
+        assert!(page(0, 0).unwrap().is_empty());
     }
 
     #[test]
