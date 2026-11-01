@@ -305,8 +305,13 @@ fn row(
     if !r.complete {
         tags.push_str(&tag("tag-warn", "INCOMPLETE"));
     }
+    let meta = [category.as_str(), size.as_str(), posted.as_str()]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" · ");
     format!(
-        "<tr><td class=\"name\"><a href=\"/ui/release?id={id}\">{name}</a>{tags}<div class=\"row-meta\">{category} · {size} · {posted}</div></td><td class=\"col-cat dim\">{category}</td><td class=\"num col-size\">{size}</td><td class=\"dim col-posted\">{posted}</td><td class=\"dim col-group\">{group}</td><td><a class=\"button small primary\" href=\"/ui/nzb?id={id}\">NZB</a></td></tr>",
+        "<tr><td class=\"name\"><a href=\"/ui/release?id={id}\">{name}</a>{tags}<div class=\"row-meta\">{meta}</div></td><td class=\"col-cat dim\">{category}</td><td class=\"num col-size\">{size}</td><td class=\"dim col-posted\">{posted}</td><td class=\"dim col-group\">{group}</td><td><a class=\"button small primary\" href=\"/ui/nzb?id={id}\">NZB</a></td></tr>",
         id = r.id,
         name = escape(&r.name),
         group = escape(&r.group_name),
@@ -485,7 +490,9 @@ fn release_html(
 
     let mut facts = String::new();
     let mut fact = |name: &str, value: String| {
-        let _ = write!(facts, "<dt>{name}</dt><dd>{value}</dd>");
+        if !value.is_empty() {
+            let _ = write!(facts, "<dt>{name}</dt><dd>{value}</dd>");
+        }
     };
     fact("Category", format!("<a href=\"/?cat={category}\">{}</a>", escape(&label(category).unwrap_or_default())));
     fact("Size", escape(&fmt_size(r.size)));
