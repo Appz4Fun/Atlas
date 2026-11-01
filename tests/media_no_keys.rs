@@ -31,6 +31,7 @@ fn everything_runs_with_no_provider() {
         "usenet_servers": [{"host": "127.0.0.1", "username": "bob", "password": "secret", "port": port, "ssl": false, "connections": 2}],
         "groups": [GROUP], "index_mode": "backfill", "request_size": 50,
         "postprocess": {"settle_secs": 1, "complete_settle_secs": 1, "min_size_bytes": 0},
+        "media": {"tvmaze": {"enabled": false}},
     });
     std::fs::write(home.path().join("config.json"), config.to_string()).unwrap();
     db::create_db().unwrap();

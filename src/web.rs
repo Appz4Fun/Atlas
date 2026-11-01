@@ -459,6 +459,7 @@ impl Search {
         let scope = category_name(&self.cat);
         let title = match (self.q.is_empty(), &scope) {
             _ if !self.filters.is_empty() && self.q.is_empty() => "nothing matches these filters".to_string(),
+            _ if self.fields.any() && self.q.is_empty() => "nothing matches these fields".to_string(),
             (true, Some(scope)) => format!("nothing is in {scope} yet"),
             (true, None) => "no releases yet".to_string(),
             (false, Some(scope)) => format!("nothing matches \u{201c}{}\u{201d} in {scope}", self.q),
@@ -1105,9 +1106,9 @@ fn probe_html(p: &crate::probe::ProbeInfo) -> String {
         verdict(p.part_crc_ok, "PART CRC OK", "PART CRC WRONG"),
     );
     dd(&mut yenc, "Checks", checks);
-    let health: String = p
-        .health
-        .iter()
+    let health: String = ["first", "middle", "last"]
+        .into_iter()
+        .filter_map(|part| p.health.get(part).map(|there| (part, there)))
         .map(|(part, there)| {
             if *there {
                 tag("tag-ok", &format!("{} THERE", part.to_uppercase()))

@@ -114,6 +114,9 @@ impl Total {
             }
             digits.push(c);
         }
+        if self.count == 0 && !self.exact {
+            return "None in the newest releases".into();
+        }
         let noun = if self.count == 1 { "release" } else { "releases" };
         if self.exact { format!("{digits} {noun}") } else { format!("At least {digits} {noun}") }
     }
@@ -369,6 +372,7 @@ mod tests {
         assert_eq!(Total { count: 1234, exact: true }.describe(), "1,234 releases");
         assert_eq!(Total { count: 1, exact: true }.describe(), "1 release");
         assert_eq!(Total { count: 2000, exact: false }.describe(), "At least 2,000 releases");
+        assert_eq!(Total { count: 0, exact: false }.describe(), "None in the newest releases");
     }
 
     #[test]
