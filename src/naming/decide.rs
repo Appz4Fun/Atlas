@@ -450,6 +450,15 @@ mod tests {
     }
 
     #[test]
+    fn a_piece_of_a_name_is_no_name() {
+        for name in ["Some.Show.S01E01.It's.Coming.Up.1080p.WEB-DL.x264-GRP", "Some&Show.2019.1080p.WEB-DL.x264-GRP"] {
+            let subject = format!(r#"{name} [1/9] "a.rar" yEnc (1/2)"#);
+            let files = [file("a.rar", Some(&subject))];
+            assert_eq!(check(&rel(JUNK), &files, &[], false), None, "{name}");
+        }
+    }
+
+    #[test]
     fn a_subjects_scene_name_doesnt_beat_a_better_source() {
         let files = [file("a.rar", Some(r#"Some.Film.2019.720p.WEB-DL.x264-GRP [1/9] "a.rar" yEnc (1/2)"#))];
         assert_eq!(check(&named("Inline Film 2020 720p", None), &files, &[], false), None, "a good inline name");

@@ -42,9 +42,21 @@ static TITLE_YEAR: LazyLock<Regex> =
 const NFO_MAX_TEXT: usize = 262_144;
 const MAX_TOKENS: usize = 100;
 
-/// What in `text` has the shape of a scene name, for the caller to judge.
+/// What in `text` has the shape of a scene name, for the caller to judge. A token touching more name text is
+/// only a piece of a name: what follows the apostrophe in `Show.S01E01.It's.Here.720p.x264-GRP` looks whole on its own.
 pub fn scene_tokens(text: &str) -> impl Iterator<Item = &str> {
-    SCENE_TOKEN.find_iter(text).take(MAX_TOKENS).map(|m| m.as_str())
+    const OPENS: &[u8] = b"\"[(<{|:,";
+    const CLOSES: &[u8] = b"\"])>}|:,";
+    SCENE_TOKEN
+        .find_iter(text)
+        .take(MAX_TOKENS)
+        .filter(move |m| {
+            let before = m.start().checked_sub(1).map(|at| text.as_bytes()[at]);
+            let after = text.as_bytes().get(m.end()).copied();
+            before.is_none_or(|b| b.is_ascii_whitespace() || OPENS.contains(&b))
+                && after.is_none_or(|b| b.is_ascii_whitespace() || CLOSES.contains(&b))
+        })
+        .map(|m| m.as_str())
 }
 
 pub fn is_nfo(subject: &str) -> bool {
