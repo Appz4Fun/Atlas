@@ -416,6 +416,8 @@ impl Search {
             };
         }
         let mut found = found;
+        let hide_copies = self.filters.contains(&HIDE_COPIES);
+        let mut before = Vec::new();
         let page_was_full = if let Some(sort) = self.sort {
             let ids: Vec<i64> = found.iter().map(|r| r.id).collect();
             let categories = crate::category::categories_of(&ids).unwrap_or_default();
@@ -423,6 +425,10 @@ impl Search {
             let start = usize::try_from(self.offset).unwrap_or(0).min(found.len());
             let end = (start + PAGE_SIZE as usize).min(found.len());
             let more = end < found.len();
+            if hide_copies {
+                let earlier = start.saturating_sub(MAX_EARLIER_FOR_COPIES as usize);
+                before = found[earlier..start].to_vec();
+            }
             found = found.drain(start..end).collect();
             more
         } else {
@@ -432,15 +438,18 @@ impl Search {
             let tags = release_tags::parse(&r.name);
             self.filters.iter().all(|filter| filter_matches(filter, &tags))
         });
-        if self.filters.contains(&HIDE_COPIES) {
+        if hide_copies {
             // a copy of something on an earlier page is a copy too
-            let earlier = self.offset.min(MAX_EARLIER_FOR_COPIES);
-            let start = self.offset - earlier;
-            let before = if earlier > 0 {
-                find_releases(&self.words(), filter.as_ref(), start, earlier).unwrap_or_default()
-            } else {
-                Vec::new()
-            };
+            if self.sort.is_none() && self.offset > 0 {
+                let earlier = self.offset.min(MAX_EARLIER_FOR_COPIES);
+                let start = self.offset - earlier;
+                before = if self.fields.any() {
+                    field_search::find(&self.fields, &self.words(), filter.as_ref(), start, earlier)
+                } else {
+                    find_releases(&self.words(), filter.as_ref(), start, earlier)
+                }
+                .unwrap_or_default();
+            }
             let shown = before.iter().filter(|r| {
                 let tags = release_tags::parse(&r.name);
                 self.filters.iter().all(|filter| filter_matches(filter, &tags))

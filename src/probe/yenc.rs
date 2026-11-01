@@ -78,12 +78,19 @@ pub struct RawArticle {
     pub lines: Vec<Vec<u8>>,
 }
 
+/// The most body lines kept from an article. A real one of 4 MiB has about 32,000, and one of only empty lines would
+/// otherwise cost far more memory than its size.
+const MAX_LINES: usize = 262_144;
+
 /// Splits what `article_raw` returned: lines ending in `\n`, a blank line between the two parts.
 pub fn split_article(raw: &[u8]) -> RawArticle {
     let mut headers: Vec<(String, String)> = Vec::new();
     let mut lines = Vec::new();
     let mut in_body = false;
     for line in raw.split(|b| *b == b'\n') {
+        if lines.len() >= MAX_LINES {
+            break;
+        }
         if in_body {
             lines.push(line.to_vec());
         } else if line.is_empty() {
@@ -134,6 +141,13 @@ mod tests {
         let y = parse(&lines(&["=ybegin size=3 name=a", "=yend size=3 pcrc32=00000001"])).unwrap();
         assert_eq!((y.pcrc32, y.crc32), (Some(1), None));
         assert_eq!(parse(&lines(&["plain text"])), None);
+    }
+
+    #[test]
+    fn empty_lines_cant_fill_memory() {
+        let mut raw = b"From: a\n\n".to_vec();
+        raw.resize(raw.len() + MAX_LINES * 2, b'\n');
+        assert_eq!(split_article(&raw).lines.len(), MAX_LINES);
     }
 
     #[test]
