@@ -114,6 +114,9 @@ struct State<'a> {
     ppm: Option<Box<Ppm>>,
     /// in PPM blocks, the byte that says what follows isn't a literal
     esc: u8,
+    /// new tables, or a PPM model's start, still allowed: each is work that makes no output, so a stream of
+    /// nothing else would run as long as its input
+    tables_left: usize,
 }
 
 /// Why decoding stopped short of the end.
@@ -139,6 +142,7 @@ pub fn rar29(data: &[u8], size: Option<u64>, limit: usize, complete: bool) -> (V
         filters: Filters::default(),
         ppm: None,
         esc: 2,
+        tables_left: 0,
     };
     let mut window = Vec::new();
     let end = match run(&mut st, size, limit, &mut window) {
@@ -158,6 +162,8 @@ fn run(st: &mut State<'_>, size: usize, limit: usize, out: &mut Vec<u8>) -> Resu
     let goal = size.min(limit);
     let target = size.min(limit.saturating_add(VM_MEM));
     st.filters.work = target.saturating_add(VM_MEM);
+    // real blocks run far longer than 4 KiB
+    st.tables_left = 1024 + target / 4096;
     let mut tables = read_tables(st)?;
     loop {
         if out.len() >= target {
@@ -330,6 +336,7 @@ fn copy(out: &mut Vec<u8>, dist: usize, len: usize, target: usize) -> Result<(),
 /// The tables for the next block: their code lengths, then each length as a change from the last tables'. None:
 /// a PPM block, its model ready.
 fn read_tables(st: &mut State<'_>) -> Result<Option<Tables>, Stop> {
+    st.tables_left = st.tables_left.checked_sub(1).ok_or(Stop::Cut)?;
     let bits = &mut st.bits;
     bits.align();
     let field = bits.peek16();

@@ -94,6 +94,7 @@ fn filter_programs_are_charged_to_the_work_budget() {
         filters: Filters { work: 1000, ..Filters::default() },
         ppm: None,
         esc: 2,
+        tables_left: 1,
     };
     assert!(matches!(read_vm_code(&mut st, 0), Err(Stop::Cut)));
     // with room for it, the program costs its length
@@ -101,4 +102,27 @@ fn filter_programs_are_charged_to_the_work_budget() {
     st.filters.work = 70_000;
     let _ = read_vm_code(&mut st, 0);
     assert_eq!(st.filters.work, 70_000 - 0xffff);
+}
+
+#[test]
+fn table_reads_and_ppm_starts_are_counted() {
+    // a PPM block header, again and again: each one starts the model over and makes nothing
+    let data = [0x80u8, 0x20, 0, 0, 0, 0, 0, 0].repeat(64);
+    let mut st = State {
+        bits: Bits { data: &data, addr: 0, bit: 0 },
+        safe: data.len(),
+        old_table: [0; TABLE],
+        reps: [0; 4],
+        last_len: 0,
+        low_dist: 0,
+        low_reps: 0,
+        filters: Filters::default(),
+        ppm: None,
+        esc: 2,
+        tables_left: 3,
+    };
+    for _ in 0..3 {
+        let _ = read_tables(&mut st);
+    }
+    assert!(matches!(read_tables(&mut st), Err(Stop::Cut)));
 }
