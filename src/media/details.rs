@@ -620,26 +620,41 @@ fn known_titles() -> rusqlite::Result<Vec<(i64, Ids)>> {
         .collect())
 }
 
-/// One pass over every title: what's missing or old is fetched, at most `details_per_minute`, and its poster kept.
-/// Returns how many titles had to go out for something.
-pub fn backfill_pass(cfg: &MediaConfig, stop: &AtomicBool) -> usize {
+/// Whether the job can fetch at all.
+fn backfill_on(cfg: &MediaConfig) -> bool {
+    cfg.details_per_minute > 0 && !(cfg.tmdb.api_key.is_empty() && cfg.tvdb.api_key.is_empty())
+}
+
+/// Whether there's nothing to go out for: details that aren't old, and their poster if they have one.
+fn title_is_kept(kind: i64, ids: &Ids) -> bool {
+    kept_for(std::iter::once((0, kind, ids)))
+        .remove(&0)
+        .is_some_and(|d| now_secs() - d.fetched_at < KEEP_FOR && (d.poster.is_none() || poster_kept(&d)))
+}
+
+/// One pass over every title: what's missing or old is fetched, and its poster kept, at most `details_per_minute` as
+/// `config` says each time, soo turning it off stops a pass. Returns how many titles went out for something.
+pub fn backfill_pass(config: &dyn Fn() -> MediaConfig, stop: &AtomicBool) -> usize {
     let Ok(titles) = known_titles() else { return 0 };
-    let pace = Duration::from_secs_f64(60.0 / cfg.details_per_minute.max(1) as f64);
     let mut fetched = 0;
     for (kind, ids) in titles {
         if stop.load(Ordering::Relaxed) {
             break;
         }
+        if title_is_kept(kind, &ids) {
+            continue;
+        }
+        let cfg = config();
+        if !backfill_on(&cfg) {
+            break;
+        }
         let started = std::time::Instant::now();
-        let details = for_title(cfg, kind, &ids);
-        if let Some(d) = details.filter(|d| !poster_kept(d)) {
-            let _ = poster(d.kind, d.tmdb_id, cfg);
+        if let Some(d) = for_title(&cfg, kind, &ids).filter(|d| !poster_kept(d)) {
+            let _ = poster(d.kind, d.tmdb_id, &cfg);
         }
-        // what was already kept takes no time, and costs no one anything
-        if started.elapsed() > Duration::from_millis(20) {
-            fetched += 1;
-            std::thread::sleep(pace.saturating_sub(started.elapsed()));
-        }
+        fetched += 1;
+        let pace = Duration::from_secs_f64(60.0 / cfg.details_per_minute.max(1) as f64);
+        std::thread::sleep(pace.saturating_sub(started.elapsed()));
     }
     fetched
 }
@@ -656,12 +671,13 @@ pub fn start_backfill(stop: Arc<AtomicBool>) {
     std::thread::spawn(move || {
         rest(BACKFILL_DELAY, &stop);
         while !stop.load(Ordering::Relaxed) {
-            let cfg = crate::config::media_config();
-            let on = cfg.details_per_minute > 0 && !(cfg.tmdb.api_key.is_empty() && cfg.tvdb.api_key.is_empty());
-            if on {
-                backfill_pass(&cfg, &stop);
+            // off, it looks again soon, as it may be turned on
+            if backfill_on(&crate::config::media_config()) {
+                backfill_pass(&crate::config::media_config, &stop);
+                rest(BACKFILL_REST, &stop);
+            } else {
+                rest(BACKFILL_DELAY, &stop);
             }
-            rest(BACKFILL_REST, &stop);
         }
     });
 }

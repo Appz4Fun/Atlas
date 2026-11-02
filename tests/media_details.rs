@@ -113,14 +113,16 @@ fn a_pass_fetches_what_nobody_opened(home: &std::path::Path) {
         ..MediaConfig::default()
     };
     let stop = std::sync::atomic::AtomicBool::new(false);
-    backfill_pass(&cfg, &stop);
+    let off = MediaConfig { details_per_minute: 0, ..cfg.clone() };
+    assert_eq!(backfill_pass(&|| off.clone(), &stop), 0, "turned off, it stops");
+    assert_eq!(backfill_pass(&|| cfg.clone(), &stop), 1);
     let ids = Ids { tmdb: Some(700), ..Ids::default() };
     let kept = atlas::media::details::kept_for(std::iter::once((id, MOVIE, &ids)));
     assert_eq!(kept[&id].tmdb_score, Some(70), "nobody opened it");
     assert!(atlas::media::details::poster_kept(&kept[&id]), "its poster too");
 
     let asked = server.requests().iter().filter(|r| r.contains("/movie/700")).count();
-    backfill_pass(&cfg, &stop);
+    assert_eq!(backfill_pass(&|| cfg.clone(), &stop), 0);
     assert_eq!(server.requests().iter().filter(|r| r.contains("/movie/700")).count(), asked, "kept, not asked again");
 }
 
