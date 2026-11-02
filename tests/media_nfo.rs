@@ -287,7 +287,9 @@ fn an_nfo_id_survives_a_fan_out_and_a_late_article() {
 
 #[test]
 fn caps_offers_imdbid_with_a_budget() {
-    let on = query::id_params(&MediaConfig::default(), true);
+    let mut cfg = MediaConfig::default();
+    cfg.tvmaze.enabled = false;
+    let on = query::id_params(&cfg, true);
     assert!(on.movie.imdb);
     assert!(!on.tv.imdb);
 }

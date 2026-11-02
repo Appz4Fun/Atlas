@@ -9,7 +9,7 @@ use tokio::sync::Semaphore;
 
 use crate::config::PostprocessConfig;
 use crate::filters;
-use crate::nntp::{BackgroundBody, NntpError, Pool, unless_stopped};
+use crate::nntp::{BackgroundBody, BackgroundRead, NntpError, Pool, unless_stopped};
 
 use super::rules::IMAGE;
 use super::stats::Stats;
@@ -127,7 +127,7 @@ impl BodyFetcher {
         request: &BodyRequest,
         used: &mut i64,
         deadline: Instant,
-        prefix: bool,
+        read: BackgroundRead,
     ) -> Result<Got, StepError> {
         if self.stopping() {
             return Err(StepError::Stopped);
@@ -149,11 +149,7 @@ impl BodyFetcher {
         let fetched = self.handle.block_on(unless_stopped(&self.stop, async {
             tokio::time::timeout(left, async {
                 let _permit = self.in_flight.acquire().await.expect("semaphore closed");
-                if prefix {
-                    self.pool.background_prefix(&request.message_id, max_bytes).await
-                } else {
-                    self.pool.background_body(&request.message_id, max_bytes).await
-                }
+                self.pool.background_read(&request.message_id, max_bytes, read).await
             })
             .await
         }));
@@ -218,7 +214,7 @@ mod tests {
         let group = "a".repeat(10_000);
         let release = ReleaseInfo { group, size: 10, ..Default::default() };
         let ask = BodyRequest { message_id: "<a@x>".into(), file: "a.bin".into(), max_bytes: Some(64) };
-        let got = f.fetch(&release, &ask, &mut 0, Instant::now() + Duration::from_secs(5), true);
+        let got = f.fetch(&release, &ask, &mut 0, Instant::now() + Duration::from_secs(5), BackgroundRead::Prefix);
         assert_eq!(got.unwrap(), Got::Refused("blocked group"));
     }
 
@@ -233,11 +229,11 @@ mod tests {
         let ask = BodyRequest { message_id: "<a@x>".into(), file: "a.bin".into(), max_bytes: None };
         let mut used = 0;
         let start = Instant::now();
-        let got = f.fetch(&release, &ask, &mut used, start + Duration::from_millis(300), false);
+        let got = f.fetch(&release, &ask, &mut used, start + Duration::from_millis(300), BackgroundRead::Capped);
         assert!(matches!(got, Err(StepError::Transient(_))), "{got:?}");
         assert!(start.elapsed() < Duration::from_secs(5), "{:?}", start.elapsed());
         // nothing is started once it has passed
-        let got = f.fetch(&release, &ask, &mut used, Instant::now(), false);
+        let got = f.fetch(&release, &ask, &mut used, Instant::now(), BackgroundRead::Capped);
         assert!(matches!(got, Err(StepError::OutOfBudget)), "{got:?}");
         drop(listener);
     }

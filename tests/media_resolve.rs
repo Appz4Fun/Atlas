@@ -19,6 +19,7 @@ const K: i64 = 77;
 
 fn none() -> MediaConfig {
     let mut c = MediaConfig::default();
+    c.tvmaze.enabled = false;
     c.tvmaze.requests_per_minute = FAST;
     c.tmdb.requests_per_minute = FAST;
     c.trakt.requests_per_minute = FAST;

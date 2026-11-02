@@ -193,15 +193,33 @@ mod rar_tests {
     }
 
     #[test]
+    fn a_real_rar5_password_is_told_from_a_wrong_one() {
+        for sample in [
+            include_bytes!("../../tests/fixtures/rar5/rar5-psw.rar").as_slice(),
+            include_bytes!("../../tests/fixtures/rar5/rar5-hpsw.rar").as_slice(),
+        ] {
+            let l = rar::list(sample);
+            let check = l.password_check.expect("a check value");
+            assert_eq!(check.accepts("password"), Some(true));
+            assert_eq!(check.accepts("wrong"), Some(false));
+            assert_eq!(PasswordTest::from_bytes(&check.to_bytes()), Some(check));
+        }
+        let many = rar::PasswordCheck { kdf: 30, salt: [0; 16], check: [0; 8] };
+        assert_eq!(many.accepts("x"), None, "too slow to try");
+    }
+
+    #[test]
     fn rar_encryption() {
         let l = rar::list(&[rar4(&[r4_main(0x0080)]), vec![0xaa; 64]].concat());
         assert!(l.encrypted && l.headers_encrypted && l.files.is_empty());
+        assert!(l.encryption.is_some());
         assert_eq!(l.password(), Password::Yes);
         let l = rar::list(&rar4(&[r4_main(0), r4_file(0x0004, b"locked.mkv", b"x"), r4_end()]));
         assert!(l.encrypted && !l.headers_encrypted);
         assert_eq!(names(&l), vec!["locked.mkv"]);
         let l = rar::list(&[rar5(&[r5_crypt_header()]), vec![0xaa; 64]].concat());
         assert!(l.encrypted && l.headers_encrypted && l.files.is_empty());
+        assert!(l.encryption.is_some());
         let l = rar::list(&rar5(&[r5_main(), r5_file(2, 4, b"locked.mkv", &r5_crypt_record(), b"x"), r5_end()]));
         assert!(l.encrypted);
         assert_eq!(names(&l), vec!["locked.mkv"]);
@@ -358,7 +376,10 @@ mod zip_tests {
         assert!(zip::list_tail(&data).files.is_empty());
 
         for (flags, method) in [(1, 0), (0x40, 0), (0x2000, 0), (0, 99)] {
-            assert!(zip::list_head(&zip_local(flags, method, b"a", b"")).encrypted, "{flags} {method}");
+            let l = zip::list_head(&zip_local(flags, method, b"a", b""));
+            assert!(l.encrypted, "{flags} {method}");
+            let want = if method == 99 { Encryption::ZipAes } else { Encryption::ZipCrypto };
+            assert_eq!(l.encryption, Some(want), "{flags} {method}");
         }
         let data = [zip_local(8, 8, b"a", b""), zip_local(0, 0, b"b", b"")].concat();
         assert_eq!(names(&zip::list_head(&data)), vec!["a"]);
@@ -461,7 +482,9 @@ mod sevenz_tests {
     #[test]
     fn sevenz_encrypted() {
         let l = sevenz::list(&sz_wrap(&[0; 64], &sz_encrypted_header(0, 64)), &[]);
+        assert_eq!(l.encryption, Some(Encryption::SevenZipAes256));
         assert!(l.encrypted && l.headers_encrypted && l.files.is_empty());
+        assert!(l.encryption.is_some());
         assert_eq!(l.password(), Password::Yes);
         let next = [&[0x01][..], &sz_main_streams(5, &[5], SZ_AES_DATA), &sz_files(&["a.mkv"], None), &[0x00]].concat();
         let l = sevenz::list(&sz_wrap(b"xxxxx", &next), &[]);
@@ -690,7 +713,7 @@ mod select_tests {
             archive: ArchiveConfig { enabled: archive, ..Default::default() },
             ..Config::default()
         };
-        assert!(!stage_owns_names(&Config::default()), "an existing config.toml");
+        assert!(stage_owns_names(&Config::default()), "an existing config.toml");
         assert!(!stage_owns_names(&config(false, 300, true)), "the stage is off");
         assert!(stage_owns_names(&config(true, 300, true)), "a body budget");
         assert!(!stage_owns_names(&config(true, 300, false)), "the budget serves other parts");

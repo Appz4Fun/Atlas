@@ -12,7 +12,7 @@ use atlas::{db, store};
 use common::*;
 
 #[test]
-fn no_new_config_names_inline_and_stores_nothing() {
+fn no_budget_names_inline_and_stores_nothing() {
     let home = tempfile::tempdir().unwrap();
     // SAFETY: only test in this binary, set before any thread is spawned
     unsafe {
@@ -30,7 +30,8 @@ fn no_new_config_names_inline_and_stores_nothing() {
     let port = spawn_server(Server::new(posts));
     let config = serde_json::json!({
         "usenet_servers": [{"host": "127.0.0.1", "username": "bob", "password": "secret", "port": port, "ssl": false, "connections": 2, "priority": 1}],
-        "groups": [GROUP], "index_mode": "backfill", "request_size": 50
+        "groups": [GROUP], "index_mode": "backfill", "request_size": 50,
+        "postprocess": {"body_fetches_per_minute": 0}
     });
     let path = home.path().join("config.json");
     std::fs::write(&path, config.to_string()).unwrap();

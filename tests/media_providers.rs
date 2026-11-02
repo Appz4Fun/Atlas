@@ -25,7 +25,12 @@ fn maze(s: &FixtureServer, rate: i64) -> Tvmaze {
 }
 
 fn tmdb(s: &FixtureServer, rate: i64) -> Tmdb {
-    Tmdb::new(&TmdbConfig { api_key: "SECRETK".into(), requests_per_minute: rate, base_url: Some(s.base.clone()) })
+    Tmdb::new(&TmdbConfig {
+        api_key: "SECRETK".into(),
+        requests_per_minute: rate,
+        base_url: Some(s.base.clone()),
+        image_base_url: None,
+    })
 }
 
 fn trakt(s: &FixtureServer) -> Trakt {

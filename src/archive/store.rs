@@ -8,7 +8,7 @@ use crate::db;
 use crate::postprocess::schema::ShardTable;
 use crate::store;
 
-use super::Password;
+use super::{Encryption, Password};
 
 pub const SOURCE_PAR2: i64 = 1;
 pub const SOURCE_RAR: i64 = 2;
@@ -47,13 +47,30 @@ pub const RELEASE: ShardTable = ShardTable {
     )",
     indexes: &[],
     release_key: Some("release_id"),
+    added: &[("encryption", "INTEGER"), ("names_hidden", "INTEGER"), ("password_check", "BLOB")],
+};
+
+/// A password an NFO named. Unverified: nothing has tried it.
+pub const NFO_PASSWORD: ShardTable = ShardTable {
+    name: "release_nfo_password",
+    create: "create table if not exists release_nfo_password (
+        release_id INTEGER PRIMARY KEY,
+        password   TEXT NOT NULL
+    )",
+    indexes: &[],
+    release_key: Some("release_id"),
     added: &[],
 };
+
+pub const SET_NFO_PASSWORD: &str = "insert or replace into release_nfo_password (release_id, password) values (?1, ?2)";
 
 pub const DELETE_SOURCE: &str = "delete from archive_inner_files where release_id = ?1 and source = ?2";
 pub const INSERT_FILE: &str =
     "insert or replace into archive_inner_files (release_id, seq, name, size, source) values (?1, ?2, ?3, ?4, ?5)";
-pub const UPSERT_RELEASE: &str = "insert or replace into archive_release (release_id, password) values (?1, ?2)";
+pub const UPSERT_RELEASE: &str = "insert into archive_release (release_id, password) values (?1, ?2)
+    on conflict(release_id) do update set password = excluded.password";
+pub const SET_ENCRYPTION: &str =
+    "update archive_release set encryption = ?2, names_hidden = ?3, password_check = ?4 where release_id = ?1";
 /// what a source's rows of a release count for in `archive_name_bytes`
 pub const BYTES_OF_SOURCE: &str = "select coalesce(sum(length(cast(name as blob)) + 32), 0)
     from archive_inner_files where release_id = ?1 and source = ?2";
@@ -89,6 +106,24 @@ fn read_password(conn: &Connection, schema: &str, release_id: i64) -> rusqlite::
     Ok(code.and_then(Password::from_code))
 }
 
+/// Any failure, such as a shard that hasn't got the columns yet, reads as nothing known.
+fn read_encryption(
+    conn: &Connection,
+    schema: &str,
+    release_id: i64,
+) -> (Option<Encryption>, bool, Option<super::PasswordTest>) {
+    let sql =
+        format!("select encryption, names_hidden, password_check from {schema}.archive_release where release_id = ?");
+    conn.query_row(&sql, [release_id], |r| {
+        Ok((
+            r.get::<_, Option<i64>>(0)?.and_then(Encryption::from_code),
+            r.get::<_, Option<i64>>(1)?.unwrap_or(0) != 0,
+            r.get::<_, Option<Vec<u8>>>(2)?.as_deref().and_then(super::PasswordTest::from_bytes),
+        ))
+    })
+    .unwrap_or((None, false, None))
+}
+
 /// In `seq` order: PAR2 rows first. `conn` is one shard with its tables in `main`.
 pub fn inner_files(conn: &Connection, release_id: i64) -> rusqlite::Result<Vec<InnerFileRow>> {
     rows(conn, "main", release_id)
@@ -116,13 +151,31 @@ pub fn passwords(ids: &[i64]) -> HashMap<i64, Password> {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct InnerView {
     pub password: Option<Password>,
+    pub encryption: Option<Encryption>,
+    pub names_hidden: bool,
+    pub password_check: Option<super::PasswordTest>,
     pub files: Vec<InnerFileRow>,
+}
+
+/// Any failure, such as a shard without the table yet, reads as nothing known.
+pub fn nfo_password(conn: &Connection, release_id: i64) -> Option<String> {
+    let schema = format!("s{}", store::shard_of_id(release_id));
+    conn.query_row(
+        &format!("select password from {schema}.release_nfo_password where release_id = ?"),
+        [release_id],
+        |r| r.get(0),
+    )
+    .ok()
 }
 
 pub fn view_with(conn: &Connection, release_id: i64) -> InnerView {
     let schema = format!("s{}", store::shard_of_id(release_id));
+    let (encryption, names_hidden, password_check) = read_encryption(conn, &schema, release_id);
     InnerView {
         password: read_password(conn, &schema, release_id).ok().flatten(),
+        encryption,
+        names_hidden,
+        password_check,
         files: rows(conn, &schema, release_id).unwrap_or_default(),
     }
 }

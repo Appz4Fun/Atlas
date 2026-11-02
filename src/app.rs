@@ -954,11 +954,13 @@ mod tests {
         assert!(inner_table(&InnerView::default(), 80).is_none());
 
         let files: Vec<InnerFileRow> = (0..40).map(|i| row(i, &format!("file{i}.mkv"))).collect();
-        let table = inner_table(&InnerView { password: None, files }, 80).unwrap();
+        let table = inner_table(&InnerView { password: None, files, ..InnerView::default() }, 80).unwrap();
         assert_eq!(table.rows.len(), 30);
         assert_eq!(table.title.as_deref(), Some("inner files (40)"));
 
-        let hostile = inner_table(&InnerView { password: None, files: vec![row(0, "[red]x.mkv")] }, 80).unwrap();
+        let hostile =
+            inner_table(&InnerView { password: None, files: vec![row(0, "[red]x.mkv")], ..InnerView::default() }, 80)
+                .unwrap();
         assert_eq!(hostile.rows[0][0].text(), "[red]x.mkv");
 
         assert_eq!(password_text(Some(Password::Yes)), Some((" - passworded", "red")));

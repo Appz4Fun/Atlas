@@ -10,7 +10,7 @@ A self-hosted Usenet indexer and Newznab server that runs in your terminal
 ![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-informational)
 ![Hackatime](https://hackatime.hackclub.com/api/v1/badge/U09JP15EVQU/Eraxty/Atlas)
 
-[Features](#features) • [Rust](#built-with-rust) • [Install](#installation) • [config.toml](#configure-atlas-configtoml) • [Usage](#usage) • [Stats dashboard](#stats-dashboard) • [Newznab API](#newznab-api) • [Development](#development)
+[Features](#features) • [Rust](#built-with-rust) • [Install](#installation) • [config.toml](#configure-atlas-configtoml) • [Usage](#usage) • [Stats dashboard](#stats-dashboard) • [Web UI](#web-ui) • [Newznab API](#newznab-api) • [Development](#development)
 
 ![Atlas main menu](img/main-menu.png)
 
@@ -197,7 +197,7 @@ All of these go in a `postprocess` object, and each has a default. See [Post-pro
 | `reject_par2_only` | `true` | Reject a post whose files are all par2. |
 | `group_rules` | `{}` | `{"group": {"min_size_bytes": n, "min_files": n}}`. The larger of a group's value and the global one counts. |
 | `backlog_per_second` | `2000` | Existing releases looked at, over all shards. `0` stops it. |
-| `body_fetches_per_minute` | `0` | Body budget. At `0`, nothing fetches bodies. |
+| `body_fetches_per_minute` | `600` | Body budget. At `0`, nothing fetches bodies. |
 | `body_connections` | `2` | Bodies in flight at once. |
 | `body_min_size_bytes` | `1048576` | A smaller release gets no body. |
 | `body_max_size_bytes` | `107374182400` | A larger release gets no body. `0` is no limit. |
@@ -364,7 +364,19 @@ The indexer takes every saved release through a stage that survives restarts. Up
 
 Size, file type, and completeness never reject a release. They only decide whether it gets article bodies fetched.
 
-Steps run in two lanes. Database steps never wait on the network. Body and outside steps run within a budget, one per claim, and an outage costs them no attempts. To turn on bodies, set `postprocess.body_fetches_per_minute`. Your existing releases enter newest first at `backlog_per_second`, and the Post-processing page of the stats dashboard shows how far along that is.
+Steps run in two lanes. Database steps never wait on the network. Body and outside steps run within a budget, one per claim, and an outage costs them no attempts. Bodies are on by default, and `postprocess.body_fetches_per_minute = 0` turns them off. Your existing releases enter newest first at `backlog_per_second`, and the Post-processing page of the stats dashboard shows how far along that is.
+
+### Article probes
+
+Each release gets a look at a few of its articles, without being downloaded: `ARTICLE` on the first and last article of its main file, `STAT` on the middle one, and the first article of up to three NFO, SFV or text files. All of it counts against the body budget, and `archive.enabled = false` turns it off. The release page shows:
+
+- **yEnc:** the real file name and size, parts, line length, article size and the file's CRC32, from the `=ybegin`, `=ypart` and `=yend` lines.
+- **Checks:** whether the parts cover every byte, whether the first part's size and checksum are right, the share of overhead, and whether a server still has the first, middle and last articles.
+- **What's in it:** MKV and MP4 tracks, with resolution, codecs, bit depth, HDR, Dolby Vision, languages and subtitle flags, read through a RAR that only stores its files. For an archive, its format, method and encryption, and its first file's name, size and CRC32.
+- **How it was posted:** the posting tool, dates, path, organization, injection info and crossposted groups, from the article's headers.
+- **NFO and SFV:** the NFO's text, IMDb ids and any password in it, and the SFV's checksums.
+
+CRC32 and posting tool can be clicked or searched on, under More fields.
 
 ### Archive inspection
 
@@ -374,7 +386,7 @@ Once Atlas may fetch bodies, it reads the releases it can afford to, one at a ti
 - Whether the archive is passworded: yes when the bytes prove it, maybe when an archive was found but its contents couldn't be seen, and no when names were read with no encryption flag.
 - A real name, when the release has none. A name from inside an archive replaces only an obfuscated or random-looking one.
 
-To turn it on, set `postprocess.body_fetches_per_minute`. All of these go in an `archive` object, and each has a default:
+It runs on the body budget, `postprocess.body_fetches_per_minute`. All of these go in an `archive` object, and each has a default:
 
 | Key | Default | What it does |
 |---|---|---|
@@ -589,11 +601,27 @@ Names what limits indexing right now, and shows how busy each resource has been 
 
 The page names the database writer when it's busy at least 85% of the time, the connections when nearly all of them are in use or requests queue for one, and the CPU when it's nearly maxed out. When none of them is, more groups at once (`parallel_groups`) would keep them busier.
 
+## Web UI
+
+Open `http://HOST:PORT/` in a browser to search and browse releases, filter by category, see a release's details and the files inside it, and download NZB files. It's served on the API port, by the same process, with nothing extra to install.
+
+Sign in with the `api_key` from `config.toml`. The browser keeps a cookie for 30 days, derived from the key rather than the key itself, and changing the key signs everyone out. Traffic is plain HTTP, like the API, so keep it on a network you trust.
+
+A release's page lists its other copies, once Atlas has read both: a **twin** has the same posted files, proven by PAR2 hashes, and a **pair** holds files of the same exact sizes packed differently, such as RAR5 and 7z. A release needs its archive or PAR2 set read to take part.
+
+Duplicates, at the top of each page, lists every set of copies at once. Each copy shows its poster, email, PAR2 files, repair, health, encryption, password, tags, scores and links, so you can choose between them. The scores and posters are the ones already fetched, when someone opened the title.
+
+A quick filter also finds the other ways its word is written, such as `4k` and `UHD` for 2160p, or `DoVi` for DV.
+
+The search box's More fields searches on Usenet group, poster, email, size (`1234567890`, or `1.5 GB` as the pages write it, which finds every size written that way), release group, CRC32 and posting tool. Clicking any of those on a release's page does the same, and the results show a total. Each column heading sorts, both ways.
+
+[htmx](https://htmx.org) (0BSD) is built into the binary from `assets/`, so the page needs no internet access. The look is [Oxide](https://appz4fun.github.io/RustyGet/design-system.html), the design system of RustyGet, in light and dark.
+
 ## Newznab API
 
 Atlas provides a Newznab-compatible API, the protocol that Prowlarr, NZBHydra2, Sonarr, and Radarr use. Any compatible client can search releases and download NZB files.
 
-- **Endpoint:** `http://HOST:PORT/api`, port `9090` by default. Open `http://HOST:PORT/` in a browser to see a short page with the settings to use.
+- **Endpoint:** `http://HOST:PORT/api`, port `9090` by default. `http://HOST:PORT/` is the [web UI](#web-ui), and shows the settings to use before you sign in.
 - **Binding:** `127.0.0.1` by default. To reach the API from other machines, set `api_host = "0.0.0.0"` in `config.toml` or set `ATLAS_API_HOST`, then restart Atlas.
 - **Authentication:** `t=caps` works without a key. Every other call needs `apikey`. A wrong key returns a `401` Newznab error.
 
@@ -687,12 +715,16 @@ Turn a provider on to fill in IDs, with no restart. Each title is asked once, ho
 
 | Provider | How to turn it on | Fills | `tv-search` parameters | `movie-search` parameters |
 |---|---|---|---|---|
-| TVMaze | `media.tvmaze.enabled: true`. It needs no key. TV only. | TVMaze, TVDB, TVRage, IMDb | `tvdbid`, `imdbid`, `rid`, `tvmazeid` | none |
+| TVMaze | On by default, as it needs no key. `media.tvmaze.enabled: false` turns it off. TV only. | TVMaze, TVDB, TVRage, IMDb | `tvdbid`, `imdbid`, `rid`, `tvmazeid` | none |
 | TMDB | `media.tmdb.api_key`, from your account's API settings on themoviedb.org. | TMDB, TVDB, TVRage, IMDb | `tvdbid`, `imdbid`, `rid`, `tmdbid` | `imdbid`, `tmdbid` |
 | Trakt | `media.trakt.client_id`, from an API app you create on trakt.tv. | Trakt, TVDB, TVRage, TMDB, IMDb | `tvdbid`, `imdbid`, `rid`, `tmdbid`, `traktid` | `imdbid`, `tmdbid`, `traktid` |
 | TheTVDB | `media.tvdb.api_key`, from your account on thetvdb.com, and `media.tvdb.pin` for a user-supported key. TV only. | TVDB, IMDb, TMDB, TVMaze | `tvdbid`, `imdbid`, `tvmazeid`, `tmdbid` | none |
 
-**An NFO needs no provider.** Once `postprocess.body_fetches_per_minute` is set, `media.nfo` reads a movie's IMDb ID from its NFO: one body of at most 64 KiB, and only for a movie with no IMDb ID yet. That also adds `imdbid` to `movie-search`.
+Search results in the [web UI](#web-ui) have quick filters for resolution, HDR and source, and tags for copies and any score already fetched. In the API, each item also carries `poster`, `group`, `resolution`, `video`, `audio`, `hdr`, `source`, `language` and `team` attributes read from its name, and `twins` and `pairs` when it has copies.
+
+Opening a release in the [web UI](#web-ui) also shows its overview, cast, dates and poster from TMDB, its ratings from OMDb when `media.omdb.api_key` is set (a free key from omdbapi.com), and its Trakt rating when Trakt is on. These are fetched when the page opens and kept for 30 days in `atlas.details.db`, with posters in `posters/`, at most 512 MB. A show TMDB has no record of comes from TheTVDB when `media.tvdb.api_key` is set, and the page has a backdrop where TMDB has one. With neither key, the page leaves all this out. In results, Best rated sorts by the scores already kept, with the rest last.
+
+**An NFO needs no provider.** With a body budget, `media.nfo` reads a movie's IMDb ID from its NFO: one body of at most 64 KiB, and only for a movie with no IMDb ID yet. That also adds `imdbid` to `movie-search`.
 
 **Sonarr and Radarr cache `caps` for 7 days**, so press Test on the indexer after turning a provider on.
 

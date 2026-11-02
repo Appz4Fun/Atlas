@@ -40,6 +40,8 @@ pub struct Par2File {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Inventory {
     pub files: Vec<Par2File>,
+    /// from the Main packet: how big a recovery block is
+    pub block_size: Option<u64>,
     /// a Main was seen, and each of its ids has a FileDesc
     pub complete: bool,
     /// a packet ran past the data
@@ -90,6 +92,7 @@ pub fn inventory(data: &[u8]) -> Inventory {
         };
         if &kind == MAIN {
             saw_main = true;
+            inv.block_size = inv.block_size.or(u64_at(body, 0).filter(|size| *size > 0));
             let ids = body.get(12..).unwrap_or(&[]);
             for id in ids.as_chunks::<16>().0.iter().take(MAX_FILES) {
                 if mains.len() < MAX_FILES && !mains.contains(&(set_id, *id)) {

@@ -441,6 +441,8 @@ fn compact_shard(
         store::migrate_shard(&conn)?;
     }
     let before = size(&path);
+    // built by hand, soo a fresh shard wouldn't have them
+    let optional_indexes = crate::field_search::optional_indexes(&db::open_at(&path)?)?;
 
     // a fresh shard, filled without its indexes and triggers (built at the end)
     remove_db(&copy);
@@ -758,6 +760,9 @@ fn compact_shard(
         let conn = db::open_at(&copy)?;
         interruptible(&conn, stop)?;
         store::build_shard(&conn)?;
+        for index in &optional_indexes {
+            conn.execute_batch(index)?;
+        }
     }
 
     // the check: same rows, same NZBs
@@ -1157,6 +1162,18 @@ mod tests {
             err.contains("shard 3") && err.contains("<Nyu1Q2z@ngPost>") && err.contains("original was kept"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn the_search_indexes_outlast_a_compact() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        db::create_db_at(&main).unwrap();
+        let shard = store::shard_path(&main, 0);
+        db::open_at(&shard).unwrap().execute_batch("create index idx_release_size on releases(size)").unwrap();
+        run(&main, &|_| {}, &no_stop()).unwrap();
+        let indexes = crate::field_search::optional_indexes(&db::open_at(&shard).unwrap()).unwrap();
+        assert_eq!(indexes.len(), 1, "{indexes:?}");
     }
 
     fn busy(r: Result<Shrunk>) -> bool {
