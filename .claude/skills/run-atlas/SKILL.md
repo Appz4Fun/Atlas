@@ -40,6 +40,7 @@ $D api 't=get&id=15' > x.nzb       # NZB for a release id (<guid> in search resu
 $D shot /tmp/home                  # sign in + full-page screenshot of / -> /tmp/home.png
 $D shot /tmp/rel '/ui/release?id=15'
 $D shot /tmp/phone / --dark --width 390
+$D shot /tmp/parts '/ui/release?id=15' --click 'details.meta-parts summary'   # open something first
 $D screen                # print the terminal menu (tmux capture-pane, trailing blank rows dropped)
 $D keys 2 Enter          # send keys: 2=Search, then 2=All Groups, then type a query
 $D down                  # Exit menu, SIGTERM the indexer via bg_indexer.pid, stop the mock

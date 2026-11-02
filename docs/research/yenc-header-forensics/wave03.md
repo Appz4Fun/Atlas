@@ -1,0 +1,5 @@
+# Wave 3 merged (07:50-07:55Z)
+1. Nyuu defaults settled from source (see raw/w03-a). Fingerprint: Message-ID `^<([A-Z][a-z]){12}-\d{13}@nyuu>$`, Date in toUTCString "GMT" form equal to the ID timestamp, User-Agent `Nyuu/x.y.z`, =ybegin always carrying part= and total=, crc32= on the last part only, lowercase pcrc32, 716,800-byte parts, 128-char lines, utf-8 NZB.
+2. NEW: server-assigned Message-IDs. SABnzbd's test NZB has `NzZUA.117908$rY1.16813@fx45.am4` then `OzZUA.117909$rY1.86560@fx45.am4`, a Highwinds-family injector (fxNN.<site>). The middle counter goes up by one per article and the leading token also steps (N->O). When a client sends no Message-ID, the overview ID itself names the injecting box and gives a per-session sequence. Wave 4 decodes this format.
+3. Takedowns: notices are per article and gated (Lumen is research-only). The UvA 2014-15 study shows a fileset is removed together and correlated across providers, so STAT co-removal timing is a same-release signal. It is low cost but takes ~1 day. rp.os3.nl/2014-2015/p82/report.pdf
+4. Test fixtures held few real articles. github tree pages are robots-blocked, but raw works.
