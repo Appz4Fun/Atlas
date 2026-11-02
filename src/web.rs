@@ -624,7 +624,8 @@ impl Search {
                 escape(&value)
             );
         }
-        let total = if self.fields.any() {
+        // the count goes by words and fields only, soo with tags filtering the page it would count rows it hides
+        let total = if self.fields.any() && !self.filters_by_tags() {
             let filter = parse_filter(&self.cat);
             match field_search::count_any(&self.fields, std::slice::from_ref(&self.q), filter.as_ref()) {
                 Ok(total) => format!("<strong class=\"total\">{}</strong>", escape(&total.describe())),

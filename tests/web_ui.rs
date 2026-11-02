@@ -147,6 +147,8 @@ fn the_web_ui_end_to_end() {
     assert!(sorted.body.contains("sort=name&amp;dir=asc"), "the heading flips: {}", sorted.body);
     let by_group = fetch(port, "/ui/results?group=alt.binaries.g1", &cookie);
     assert!(by_group.body.contains("Findword") && by_group.body.contains("1 release"), "{}", by_group.body);
+    let by_group_uhd = fetch(port, "/ui/results?group=alt.binaries.g1&filters=2160p", &cookie);
+    assert!(!by_group_uhd.body.contains("1 release"), "no total that counts hidden rows: {}", by_group_uhd.body);
     assert!(!by_group.body.contains("alert(1)"), "{}", by_group.body);
     assert_eq!(by_group.header("HX-Push-Url").as_deref(), Some("/?group=alt.binaries.g1"));
 
