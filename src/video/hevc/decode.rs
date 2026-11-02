@@ -615,9 +615,13 @@ impl SliceDecoder<'_> {
             if abs == 5 {
                 // k = 0 Exp-Golomb suffix
                 let mut k = 0;
-                while k < 32 && self.cabac.bypass() == 1 {
+                while self.cabac.bypass() == 1 {
                     abs += 1 << k;
                     k += 1;
+                    // past any delta the bit depth allows: damage, before the sum can overflow
+                    if k > 8 {
+                        return Err(DecodeError::Invalid("cu_qp_delta"));
+                    }
                 }
                 abs += self.cabac.bypass_bits(k) as i32;
             }
