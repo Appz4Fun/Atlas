@@ -29,18 +29,25 @@ static PLAIN_RAR: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)^(.*)\.rar
 /// The last volume of the set `first` starts: `.partNN.rar`, or `.rar` then `.r00`, `.r01` and on to `.s00`.
 /// The first volume itself when it has no others. None when `first` doesn't name a first volume.
 pub fn last_volume<'a>(first: &str, files: &'a [FileInfo]) -> Option<&'a FileInfo> {
+    volumes(first, files).pop()
+}
+
+/// The volumes of the set `first` starts, in order. Empty when `first` doesn't name a first volume.
+pub fn volumes<'a>(first: &str, files: &'a [FileInfo]) -> Vec<&'a FileInfo> {
     let lower = |f: &FileInfo| f.filename.to_ascii_lowercase();
     let first_lower = first.to_ascii_lowercase();
-    let first_file = files.iter().find(|f| lower(f) == first_lower)?;
+    let Some(first_file) = files.iter().find(|f| lower(f) == first_lower) else { return Vec::new() };
     if let Some(prefix) = PART_RAR.captures(first).map(|c| c[1].to_ascii_lowercase()) {
         let rank = |f: &FileInfo| -> Option<u64> {
             let name = lower(f);
             let rest = name.strip_prefix(&prefix)?.strip_prefix(".part")?.strip_suffix(".rar")?;
             rest.bytes().all(|b| b.is_ascii_digit()).then(|| rest.parse().ok()).flatten()
         };
-        return files.iter().filter_map(|f| rank(f).map(|r| (r, f))).max_by_key(|(r, _)| *r).map(|(_, f)| f);
+        let mut set: Vec<(u64, &FileInfo)> = files.iter().filter_map(|f| rank(f).map(|r| (r, f))).collect();
+        set.sort_by_key(|(r, _)| *r);
+        return set.into_iter().map(|(_, f)| f).collect();
     }
-    let prefix = PLAIN_RAR.captures(first).map(|c| c[1].to_ascii_lowercase())?;
+    let Some(prefix) = PLAIN_RAR.captures(first).map(|c| c[1].to_ascii_lowercase()) else { return Vec::new() };
     let rank = |f: &FileInfo| -> Option<(u8, u32)> {
         let name = lower(f);
         let ext = name.strip_prefix(&prefix)?.strip_prefix('.')?.as_bytes().to_vec();
@@ -51,8 +58,9 @@ pub fn last_volume<'a>(first: &str, files: &'a [FileInfo]) -> Option<&'a FileInf
             _ => None,
         }
     };
-    let later = files.iter().filter_map(|f| rank(f).map(|r| (r, f))).max_by_key(|(r, _)| *r).map(|(_, f)| f);
-    Some(later.unwrap_or(first_file))
+    let mut later: Vec<((u8, u32), &FileInfo)> = files.iter().filter_map(|f| rank(f).map(|r| (r, f))).collect();
+    later.sort_by_key(|(r, _)| *r);
+    std::iter::once(first_file).chain(later.into_iter().map(|(_, f)| f)).collect()
 }
 
 /// The 1-based parts of a file posted in `segment` byte parts that hold its bytes `from..to`.

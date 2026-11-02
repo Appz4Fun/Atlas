@@ -6,6 +6,7 @@ pub mod media;
 pub mod moviehash;
 pub mod opensubtitles;
 pub mod step;
+pub mod stills;
 pub mod yenc;
 
 use std::collections::BTreeMap;

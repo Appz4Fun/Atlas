@@ -37,7 +37,7 @@ fn is_small_text(name: &str) -> bool {
 
 /// The file the probe's about: the one with the most parts, and of those, the first by name, soo a set of RAR
 /// volumes gives its first volume.
-fn main_file(files: &[FileInfo]) -> Option<&FileInfo> {
+pub(super) fn main_file(files: &[FileInfo]) -> Option<&FileInfo> {
     let parts = |f: &FileInfo| f.expected.unwrap_or(f.parts_seen);
     let candidates: Vec<&FileInfo> =
         files.iter().filter(|f| !is_par2(&f.filename) && !is_small_text(&f.filename)).collect();
@@ -52,7 +52,7 @@ fn first_volume_key(name: &str) -> (u8, String) {
     (rank, lower)
 }
 
-fn fetch_raw(ctx: &mut StepCtx<'_>, message_id: &str, file: &str) -> Result<Got, StepError> {
+pub(super) fn fetch_raw(ctx: &mut StepCtx<'_>, message_id: &str, file: &str) -> Result<Got, StepError> {
     let wanted = BodyRequest {
         message_id: message_id.to_string(),
         file: file.to_string(),
@@ -232,7 +232,12 @@ fn read_more_front(
 }
 
 /// One part of a file, decoded, when it holds the file's bytes from `offset` (0 based) on.
-fn read_part(ctx: &mut StepCtx<'_>, file: &FileInfo, part: i64, offset: u64) -> Result<Option<Vec<u8>>, StepError> {
+pub(super) fn read_part(
+    ctx: &mut StepCtx<'_>,
+    file: &FileInfo,
+    part: i64,
+    offset: u64,
+) -> Result<Option<Vec<u8>>, StepError> {
     let segs = ctx.segments(file.id, &SegmentPick::Parts(vec![part])).map_err(|e| StepError::Retry(e.to_string()))?;
     let Some(seg) = segs.into_iter().next().filter(|s| s.part.is_none_or(|p| p == part)) else { return Ok(None) };
     let Got::Body(raw) = fetch_raw(ctx, &seg.message_id, &file.filename)? else { return Ok(None) };

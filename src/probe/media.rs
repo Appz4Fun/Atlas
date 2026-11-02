@@ -97,7 +97,7 @@ pub fn parse(data: &[u8]) -> Option<MediaInfo> {
 
 // ---- EBML
 
-fn element_id(b: &[u8]) -> Option<(u32, usize)> {
+pub(crate) fn element_id(b: &[u8]) -> Option<(u32, usize)> {
     let first = *b.first()?;
     let len = first.leading_zeros() as usize + 1;
     if len > 4 {
@@ -111,7 +111,7 @@ fn element_id(b: &[u8]) -> Option<(u32, usize)> {
 }
 
 /// The size, or None for "unknown", and its length.
-fn element_size(b: &[u8]) -> Option<(Option<u64>, usize)> {
+pub(crate) fn element_size(b: &[u8]) -> Option<(Option<u64>, usize)> {
     let first = *b.first()?;
     let len = first.leading_zeros() as usize + 1;
     if len > 8 {
