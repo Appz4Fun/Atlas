@@ -9,3 +9,11 @@ To import one, go to Dashboards, then New, then Import, upload its JSON and pick
 ## Screenshots
 
 The screenshots cover 50 minutes of a real instance, 03:25 to 04:15 UTC on 2 November 2026. Its address, host name and news server names have been replaced with placeholders, so `server-a` to `server-h` stand for eight servers and aren't their real names.
+
+## The page
+
+GitHub Pages serves this folder from the `gh-pages` branch. After changing anything here and merging it, publish it from an up-to-date `main`:
+
+```bash
+git push origin "$(git subtree split --prefix grafana main):refs/heads/gh-pages"
+```
