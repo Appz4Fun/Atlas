@@ -506,6 +506,16 @@ impl Search {
                 } else {
                     HashMap::new()
                 };
+                // by the size it shows: all of a post spread over several groups
+                if sort == SortBy::Size
+                    && let Ok(conn) = crate::db::open()
+                {
+                    for r in found.iter_mut().filter(|r| !r.complete) {
+                        if let Ok(Some(post)) = release_info::split_post_with(&conn, r) {
+                            r.size = Some(post.size);
+                        }
+                    }
+                }
                 sort_rows(&mut found, sort, self.descending, &categories, &scores);
             }
             let start = usize::try_from(self.offset).unwrap_or(0).min(found.len());

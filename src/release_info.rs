@@ -329,7 +329,9 @@ impl UnionFiles {
     fn one_upload(&self) -> bool {
         let mut totals = self.file_totals.iter();
         let total_fits = match (totals.next(), totals.next()) {
-            (Some(total), None) => total.is_none_or(|total| self.files.len() as i64 <= total),
+            (Some(Some(total)), None) => self.files.len() as i64 <= *total,
+            // no count to go by, soo every release has the same files
+            (Some(None), None) => self.rows.windows(2).all(|pair| pair[0] == pair[1]),
             _ => false,
         };
         !self.conflict && total_fits && self.linked()
@@ -359,8 +361,9 @@ fn subject_of_file(subject: &str) -> String {
     for (open, _) in subject.rmatch_indices('(') {
         let rest = &subject[open + 1..];
         let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
-        if digits > 0 && rest[digits..].starts_with('/') {
-            return format!("{}({}", &subject[..open], &rest[digits..]);
+        let counter = rest[digits..].trim_start();
+        if digits > 0 && counter.starts_with('/') {
+            return format!("{}({counter}", &subject[..open]);
         }
     }
     subject.to_string()

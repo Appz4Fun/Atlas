@@ -229,6 +229,33 @@ fn the_web_ui_end_to_end() {
         shard.execute("delete from release_fingerprint", []).unwrap();
     }
 
+    // it sorts by the size it shows
+    for (group, part) in [("alt.binaries.g1", 1), ("alt.binaries.g2", 2)] {
+        posted("Sized.Spread.S01E01-GRP", group, article("sized.bin", part, 2, &format!("<sized.{part}@x>")), DAY);
+    }
+    let mut bigger = article("alone.bin", 1, 2, "<alone@x>");
+    bigger.bytes = 1_000_000;
+    posted("Sized.Alone.S01E01-GRP", "alt.binaries.g1", bigger, DAY);
+    let sized = fetch(port, "/ui/results?q=Sized&sort=size", &cookie);
+    let spot = |name: &str| sized.body.find(name).unwrap();
+    assert!(spot("Sized.Spread.S01E01-GRP") < spot("Sized.Alone.S01E01-GRP"), "{}", sized.body);
+
+    // a space in the part counter is still the same subject
+    for (group, part) in [("alt.binaries.g1", 1), ("alt.binaries.g2", 2)] {
+        let mut one = article("spaced.bin", part, 2, &format!("<spaced.{part}@x>"));
+        one.subject = format!("\"spaced.bin\" yEnc ({part} /2)");
+        posted("Spaced.Post.S01E01-GRP", group, one, DAY);
+    }
+    let spaced = fetch(port, "/ui/results?q=Spaced", &cookie);
+    assert!(spaced.body.contains("2 GROUPS") && !spaced.body.contains("INCOMPLETE"), "{}", spaced.body);
+
+    // with no count of files, a file only one group has doesn't join
+    posted("Extra.File.S01E01-GRP", "alt.binaries.g1", article("x.bin", 1, 2, "<extra.1@x>"), DAY);
+    posted("Extra.File.S01E01-GRP", "alt.binaries.g2", article("x.bin", 2, 2, "<extra.2@x>"), DAY);
+    posted("Extra.File.S01E01-GRP", "alt.binaries.g2", article("y.bin", 1, 1, "<extra.y@evil>"), DAY);
+    let extra = fetch(port, "/ui/results?q=Extra.File", &cookie);
+    assert!(extra.body.contains("INCOMPLETE") && !extra.body.contains(" GROUPS"), "{}", extra.body);
+
     // it isn't whole until the missing part comes
     for (group, part) in [("alt.binaries.g1", 1), ("alt.binaries.g2", 2)] {
         posted("Gapped.Post.S01E01-GRP", group, article("gap.bin", part, 3, &format!("<gap.{part}@x>")), DAY);
