@@ -71,21 +71,20 @@ impl Contents {
         if self.data_articles_expected == 0 || self.recovery_articles_expected == 0 {
             return false;
         }
-        let (covered, of) = self.repair_ratio();
         let missing = i128::from((self.data_articles_expected - self.data_articles_seen).max(0));
         // whole numbers: rounding each to tenths of a percent would call 2 missing of 10,000 repairable by 1 block
-        i128::from(covered) * i128::from(self.recovery_articles_seen) * i128::from(self.data_articles_expected)
-            >= missing * i128::from(of.max(1)) * i128::from(self.recovery_articles_expected)
-    }
-
-    /// What can be rebuilt, over what there is to rebuild: exact from the PAR2 set, or else by sizes.
-    fn repair_ratio(&self) -> (i64, i64) {
-        match self.par2_blocks {
-            Some(blocks) if self.par2_block.is_some_and(|b| b > 0) && blocks > 0 && self.recovery_blocks > 0 => {
-                (self.recovery_blocks, blocks)
-            }
-            _ => (self.recovery_bytes, self.data_bytes),
+        if let Some(blocks) = self.par2_blocks.filter(|_| self.exact_repair_per_mille().is_some()) {
+            // the blocks are counted from file names, whether or not their articles are there
+            return i128::from(self.recovery_blocks)
+                * i128::from(self.recovery_articles_seen)
+                * i128::from(self.data_articles_expected)
+                >= missing * i128::from(blocks) * i128::from(self.recovery_articles_expected);
         }
+        // sizes are of the articles that are there. What's missing is taken to be as big as what isn't
+        missing == 0
+            || (self.data_articles_seen > 0
+                && i128::from(self.recovery_bytes) * i128::from(self.data_articles_seen)
+                    >= missing * i128::from(self.data_bytes))
     }
 
     /// What the recovery blocks cover, in tenths of a percent, when the PAR2 set's been read.
@@ -97,7 +96,16 @@ impl Contents {
     /// What the recovery volumes could rebuild, as a share of the data in tenths of a percent.
     /// From sizes on the wire, soo it's an estimate: real blocks are a little smaller than the volumes.
     pub fn repair_per_mille(&self) -> Option<i64> {
-        (self.data_bytes > 0).then(|| self.recovery_bytes * 1000 / self.data_bytes)
+        if self.data_bytes <= 0 {
+            return None;
+        }
+        // the data's whole size, from what's there of it
+        let whole = if self.data_articles_seen > 0 && self.data_articles_expected > self.data_articles_seen {
+            i128::from(self.data_bytes) * i128::from(self.data_articles_expected) / i128::from(self.data_articles_seen)
+        } else {
+            i128::from(self.data_bytes)
+        };
+        i64::try_from(i128::from(self.recovery_bytes) * 1000 / whole).ok()
     }
 }
 
@@ -350,6 +358,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn an_estimate_goes_by_the_whole_of_the_data() {
+        let half_there = Contents {
+            data_articles_expected: 10,
+            data_articles_seen: 5,
+            data_bytes: 5_000,
+            recovery_articles_expected: 3,
+            recovery_articles_seen: 3,
+            recovery_bytes: 3_000,
+            ..Contents::default()
+        };
+        assert!(!half_there.repairable(), "3 can't stand in for 5");
+        assert_eq!(half_there.repair_per_mille(), Some(300));
+        // what's gone of the recovery volumes is already out of their size
+        let thin = Contents {
+            data_articles_expected: 100,
+            data_articles_seen: 92,
+            data_bytes: 92_000,
+            recovery_articles_expected: 20,
+            recovery_articles_seen: 10,
+            recovery_bytes: 10_000,
+            ..Contents::default()
+        };
+        assert!(thin.repairable());
+    }
+
+    #[test]
     fn one_block_cant_repair_two_of_ten_thousand() {
         let contents = |seen| Contents {
             data_articles_expected: 10_000,
@@ -417,7 +451,7 @@ mod tests {
             ..Contents::default()
         };
         assert!(holes.repairable(), "3% missing, 10% repairable");
-        let lost = Contents { recovery_articles_seen: 2, ..holes.clone() };
+        let lost = Contents { recovery_articles_seen: 2, recovery_bytes: 20, ..holes.clone() };
         assert!(!lost.repairable(), "most of the recovery is gone too");
         let none = Contents { recovery_articles_expected: 0, recovery_articles_seen: 0, ..holes };
         assert!(!none.repairable());

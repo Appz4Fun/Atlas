@@ -119,12 +119,20 @@ fn finish(ctx: &StepCtx<'_>, source: i64, listing: Listing, limits: &ArchiveConf
         writes.push(StepWrite::new(archive_store::COUNT_OVER_QUOTA, vec![]));
     }
     // part of a list would call two releases the same when only their first files are
-    if listing.complete
-        && !listing.damaged
-        && let Some(content) = duplicates::content_fingerprint(listing.files.iter().map(|f| (f.name.as_str(), f.size)))
-    {
-        writes.push(StepWrite::new(duplicates::SET_CONTENT, vec![id.into(), content.into()]));
-    }
+    let files = ctx.files().map_err(retry)?;
+    let is_par2 = |name: &str| name.to_ascii_lowercase().ends_with(".par2");
+    let speaks_for_release = if source == SOURCE_PAR2 {
+        listing.files.len() == files.iter().filter(|f| !is_par2(&f.filename)).count()
+    } else {
+        duplicates::one_archive_set(files.iter().map(|f| f.filename.as_str()))
+    };
+    let content = (listing.complete && !listing.damaged && speaks_for_release)
+        .then(|| duplicates::content_fingerprint(listing.files.iter().map(|f| (f.name.as_str(), f.size))))
+        .flatten();
+    writes.push(match content {
+        Some(content) => StepWrite::new(duplicates::SET_CONTENT, vec![id.into(), content.into()]),
+        None => StepWrite::new(duplicates::CLEAR_CONTENT, vec![id.into()]),
+    });
     if source != SOURCE_PAR2 {
         writes.push(StepWrite::new(archive_store::UPSERT_RELEASE, vec![id.into(), listing.password().code().into()]));
         if let Some(encryption) = listing.encryption {
@@ -238,6 +246,9 @@ impl Step for Par2Step {
         // one set's files are only some of the release's, soo they don't say what the release holds
         if !covers_all {
             outcome.writes.retain(|write| write.sql != duplicates::SET_CONTENT);
+            let id = ctx.release().id;
+            outcome.writes.push(StepWrite::new(duplicates::CLEAR_POSTED, vec![id.into()]));
+            outcome.writes.push(StepWrite::new(duplicates::CLEAR_CONTENT, vec![id.into()]));
         }
         if let Some(posted) = posted {
             let params = vec![ctx.release().id.into(), posted.into()];

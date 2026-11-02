@@ -131,6 +131,10 @@ fn a_show_only_thetvdb_knows() {
     };
     let d = for_title(&both, TV, &Ids { tmdb: Some(5), tvdb: Some(79), ..Ids::default() }).unwrap();
     assert_eq!(d.tmdb_id, -79);
+    let asked = gone.requests().len();
+    let again = for_title(&both, TV, &Ids { tmdb: Some(5), tvdb: Some(79), ..Ids::default() }).unwrap();
+    assert_eq!(again.tmdb_id, -79);
+    assert_eq!(gone.requests().len(), asked, "TMDB isn't asked again about a title it hasn't got");
 
     let other =
         MediaConfig { tvdb: TvdbConfig { base_url: Some(bad.base.clone()), ..cfg.tvdb.clone() }, ..cfg.clone() };
