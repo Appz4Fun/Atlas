@@ -27,6 +27,19 @@ use super::step::{NameChange, Needs, Outcome, ReleaseInfo, Step, StepCtx, StepEr
 const DB_BATCH: i64 = 256;
 const WALK_BATCH: i64 = 256;
 const NET_BATCH: i64 = 4;
+/// The longest the net lane rests after transient failures.
+const NET_PAUSE_MAX: i64 = 60;
+/// Transient failures in a row that are just bad articles, not a server in trouble.
+const NET_PAUSE_AFTER: i64 = 20;
+
+/// Seconds of rest after `in_a_row` transient failures: none at first, then
+/// doubling.
+fn net_pause_secs(in_a_row: i64) -> i64 {
+    if in_a_row < NET_PAUSE_AFTER {
+        return 0;
+    }
+    1i64.checked_shl((in_a_row - NET_PAUSE_AFTER).min(6) as u32).unwrap_or(NET_PAUSE_MAX).min(NET_PAUSE_MAX)
+}
 const NET_CRASH_RETRY: i64 = 900;
 const STEP_DEADLINE: Duration = Duration::from_secs(120);
 
@@ -56,6 +69,8 @@ pub(crate) struct Inner {
     stats: Arc<Stats>,
     /// no net claims before this
     net_paused_until: AtomicI64,
+    /// transient failures since the last body that worked
+    net_troubles: AtomicI64,
     /// per shard: every 8th claim of a shard takes its oldest
     claims: [AtomicI64; SHARDS],
     tokens: Mutex<Vec<TokenBucket>>,
@@ -207,6 +222,7 @@ impl Inner {
             fetcher,
             stats,
             net_paused_until: AtomicI64::new(0),
+            net_troubles: AtomicI64::new(0),
             claims: std::array::from_fn(|_| AtomicI64::new(0)),
             tokens: Mutex::new((0..SHARDS).map(|_| TokenBucket::new()).collect()),
         };
@@ -734,6 +750,16 @@ impl Inner {
 
     // ------------------------------------------------------------ the net lane
 
+    /// A server in trouble gets a rest, but one article that failed shouldn't stop
+    /// every release: the rest grows with failures in a row, up to `NET_PAUSE_MAX`.
+    fn pause_net_after_trouble(&self, now: i64) {
+        let in_a_row = self.net_troubles.fetch_add(1, Relaxed) + 1;
+        let secs = net_pause_secs(in_a_row);
+        if secs > 0 {
+            self.net_paused_until.store(now + secs, Relaxed);
+        }
+    }
+
     pub(crate) fn net_lane(self: Arc<Self>, db: Db) {
         let mut conns = Conns::new(self.main.clone());
         while !self.stopping() {
@@ -989,7 +1015,7 @@ impl Inner {
                     a.net_attempts = Some(attempts_before);
                     a.net_next_at = Some(now + 300);
                     a.error = Some(e);
-                    self.net_paused_until.store(now + 60, Relaxed);
+                    self.pause_net_after_trouble(now);
                 }
                 Ran::Error(StepError::OutOfBudget) => {
                     a.net_attempts = Some(attempts_before);
