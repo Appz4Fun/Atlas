@@ -23,7 +23,7 @@ static ADDR: RwLock<String> = RwLock::new(String::new());
 
 /// Blobs up to this size stay where they are: a place takes about as much.
 const SMALL_BLOB: usize = 64;
-const BATCH_FILES: usize = 500;
+const BATCH_FILES: usize = 2000;
 const BATCH_BYTES: usize = 32 << 20;
 /// How long a finished sweep waits before looking for newly sealed files.
 const SWEEP_EVERY: Duration = Duration::from_secs(600);
