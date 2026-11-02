@@ -171,10 +171,12 @@ fn the_web_ui_end_to_end() {
         "video":[{"codec":"V_MPEGH/ISO/HEVC","width":1440,"height":1080,"display_width":1920,"display_height":1080,"primaries":9,"dv_profile":8,"dv_level":6}]}}"#;
     shard.execute("insert into release_probe (release_id, info) values (?, ?)", rusqlite::params![id, info]).unwrap();
     let jpeg = [0xff_u8, 0xd8, 0xff, 0xd9];
+    let sha256 = atlas::probe::keep_cover(&jpeg).unwrap();
+    assert!(home.path().join("covers").join(&sha256).exists());
     shard
         .execute(
-            "insert into release_cover (release_id, mime, image) values (?, 'image/jpeg', ?)",
-            rusqlite::params![id, jpeg],
+            "insert into release_cover (release_id, mime, sha256) values (?, 'image/jpeg', ?)",
+            rusqlite::params![id, sha256],
         )
         .unwrap();
     let release = fetch(port, &format!("/ui/release?id={id}"), &cookie);

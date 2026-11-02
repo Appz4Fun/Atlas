@@ -193,9 +193,10 @@ impl Step for ProbeStep {
             return Ok(Outcome { writes, ..Outcome::default() });
         }
         // a look that finds no cover drops one an earlier look kept
-        writes.push(match info.media.as_mut().and_then(|m| m.cover.take()) {
-            Some(cover) => {
-                StepWrite::new(SET_COVER, vec![release_id.into(), cover.mime.to_string().into(), cover.bytes.into()])
+        let cover = info.media.as_mut().and_then(|m| m.cover.take());
+        writes.push(match cover.and_then(|c| super::keep_cover(&c.bytes).map(|sha256| (c.mime, sha256))) {
+            Some((mime, sha256)) => {
+                StepWrite::new(SET_COVER, vec![release_id.into(), mime.to_string().into(), sha256.into()])
             }
             None => StepWrite::new(DROP_COVER, vec![release_id.into()]),
         });
