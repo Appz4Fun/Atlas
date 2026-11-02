@@ -1,0 +1,25 @@
+# Wave 9 merged (10:53-11:05Z)
+- REAL DATA (246 public NZBs, 202 distinct):
+  - End-to-start join holds for Nyuu uploads: files go out in series, never in parallel. Using the ms decoded from the Message-ID, the gap from one file's end to the next file's start has median 0.12 s and p90 0.67 s, and 98% of gaps are under 2 s (1,070 gaps).
+  - NZB dates in whole seconds are too coarse: only 38% of gaps fall under 2 s.
+  - NZB file order matches time order in only half the NZBs, so sort by time first.
+  - Re-linking time-shifted real NZBs by gap only: precision .93 at 2 concurrent uploads, .60 at 10 starting together, about .98 when 10 start spread over an hour. Adding a size-like feature lifts precision by .15-.25. With whole-second dates only, precision is about chance level.
+  - Highwinds: S is constant in every NZB, and N rises with article order in 861 of 862 steps. N steps of +2 or +4 are other traffic on the same front end, so N is a per-front-end counter.
+- NO-PAR2 FALLBACK:
+  - About 48% of public NZBs show PAR2, rising to 77% of NZBs with 3+ files. Estimate: 15-30% of multi-file uploads have no PAR2. Single-file posts usually have none.
+  - ngPost's --par2_pct defaults to 0, but its sample config sets 8. Nyuu needs a separate ParPar run. postie (10%) and NewsUP (15%) make PAR2 by default.
+  - Fallback order: the PAR2 index even when vol files are missing; yEnc headers; the first article of each run read as a container header (RAR volume number and flags, 7z .001); the last RAR volume's inner CRC; SFV, zip central directory or NFO; Nyuu's =yend crc32; X-Received-Body-CRC; a full pcrc32 fold, only for posts Atlas already downloads.
+  - About 1 body per volume. The weak case is RAR5 -hp with no PAR2 and equal volume sizes: 65-80% correct, flagged low confidence.
+- RUST PIPELINE SPEC (wave-09-A-pipeline-spec.md): 13 stages with read-cost tiers, struct sketches, thresholds from the simulations, online re-evaluation, 8 test cases including Batman Knightfall.
+  - Recommends our own veto-aware union-find (about 80 lines). Crates: only crc32fast, md-5 and smallvec.
+  - Biggest cost: with obfuscated subjects, file identity needs the yEnc header from every article body.
+- PEERS:
+  - INN assigns all Xref numbers of a crosspost in one call, so Xref pairs anchor group counters to each other exactly.
+  - Injection-Date is added only when the Message-ID or Date is missing, so ngPost posts get it and Nyuu and postie posts usually do not.
+  - Diablo $-IDs carry the time, a per-second counter, the PID and a hostname hash, which gives a (host, PID) session key.
+  - postie's PAR2 FileDesc keeps the real file name, a free label for validation.
+  - A std-only Rust CRC32 GF(2) toolkit exists in research/payload-fingerprints (opus-tools/w9b_crc32gf2/).
+Wave 10 plan (last):
+- (A) Red-team the pipeline spec against all 9 waves plus peer findings: contradictions, missing cases, wrong thresholds.
+- (B) Atlas-side measurement plan: which header-log fields and Grafana metrics would calibrate the thresholds on live data (gap distributions, concurrency per front end, PAR2 presence, the spray rate).
+- (C) Compile the signal table for the final report: each signal × what it proves × read cost × tool coverage, across all waves.

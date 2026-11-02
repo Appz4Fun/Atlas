@@ -527,7 +527,7 @@ pub fn can_fill(copies: &[(Copy, ReleaseRow)]) -> bool {
 pub fn filled_nzb(id: i64) -> db::Result<Option<String>> {
     let conn = db::open()?;
     let Some(release) = get_release_with(&conn, id)? else { return Ok(None) };
-    let mut articles = store::articles(&conn, id)?;
+    let (mut articles, groups) = crate::nzb::inventory(&release)?;
     if articles.is_empty() {
         return Ok(None);
     }
@@ -536,7 +536,7 @@ pub fn filled_nzb(id: i64) -> db::Result<Option<String>> {
             fill_gaps(&mut articles, &store::articles(&conn, twin.id)?);
         }
     }
-    Ok(Some(crate::nzb::render_nzb(&release, &articles)))
+    Ok(Some(crate::nzb::render_nzb_in(&release, &articles, &groups)))
 }
 
 #[cfg(test)]

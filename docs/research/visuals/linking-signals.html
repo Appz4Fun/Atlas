@@ -1,0 +1,435 @@
+<title>Linking Signals Map</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Azeret+Mono:wght@400;500;600&display=swap">
+<style>
+/* Layout: one reading column (max 1080px), summary tiles first, then the signal map, then cost and tool charts, then the full inventory table.
+   Tokens follow the RustyGet design system (dark first, orange accent). Atlas status uses one ordinal orange ramp. */
+:root {
+  color-scheme: dark;
+  --bg: #0a0a0e;
+  --surface: #14141a;
+  --elevated: #1a1a22;
+  --ink: #fafafa;
+  --ink-2: #9ca3af;
+  --ink-3: #6b7080;
+  --rule: rgba(255,255,255,0.08);
+  --grid: rgba(255,255,255,0.07);
+  --axis: rgba(255,255,255,0.16);
+  --accent: #f97316;
+  --accent-soft: rgba(234,88,12,0.16);
+  --mark: #f97316;
+  --st-collected: #fdba74; --on-collected: #0b0b0b;
+  --st-partial: #ea580c;   --on-partial: #ffffff;
+  --st-missing: #9a3412;   --on-missing: #ffffff;
+  --st-unknown: #5b5f6a;   --on-unknown: #ffffff;
+  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+  --font-mono: "Azeret Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  --shadow-card: 0 0 0 1px rgba(255,255,255,0.08);
+}
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    color-scheme: light;
+    --bg: #f7f7fa; --surface: #ffffff; --elevated: #ffffff;
+    --ink: #1a1522; --ink-2: #555a64; --ink-3: #868b95;
+    --rule: rgba(10,10,14,0.08); --grid: rgba(10,10,14,0.07); --axis: rgba(26,21,34,0.22);
+    --accent: #b93d0b; --accent-soft: rgba(234,88,12,0.10); --mark: #c2410c;
+    --st-collected: #9a3412; --on-collected: #ffffff;
+    --st-partial: #ea580c;   --on-partial: #ffffff;
+    --st-missing: #fb923c;   --on-missing: #0b0b0b;
+    --st-unknown: #9a9ea8;   --on-unknown: #0b0b0b;
+    --shadow-card: 0 1px 2px rgba(10,10,14,0.04), 0 0 0 1px rgba(10,10,14,0.08);
+  }
+}
+:root[data-theme="light"] {
+  color-scheme: light;
+  --bg: #f7f7fa; --surface: #ffffff; --elevated: #ffffff;
+  --ink: #1a1522; --ink-2: #555a64; --ink-3: #868b95;
+  --rule: rgba(10,10,14,0.08); --grid: rgba(10,10,14,0.07); --axis: rgba(26,21,34,0.22);
+  --accent: #b93d0b; --accent-soft: rgba(234,88,12,0.10); --mark: #c2410c;
+  --st-collected: #9a3412; --on-collected: #ffffff;
+  --st-partial: #ea580c;   --on-partial: #ffffff;
+  --st-missing: #fb923c;   --on-missing: #0b0b0b;
+  --st-unknown: #9a9ea8;   --on-unknown: #0b0b0b;
+  --shadow-card: 0 1px 2px rgba(10,10,14,0.04), 0 0 0 1px rgba(10,10,14,0.08);
+}
+* { box-sizing: border-box; }
+body { background: var(--bg); color: var(--ink); font: 15px/1.55 var(--font-sans); }
+.wrap { max-width: 1080px; margin: 0 auto; padding-block: 40px 64px;
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px));
+  display: grid; gap: 40px; }
+.eyebrow { font: 500 11px/1 var(--font-mono); letter-spacing: .08em; text-transform: uppercase; color: var(--accent); }
+h1 { font-size: clamp(28px, 4vw, 40px); line-height: 1.1; letter-spacing: -.03em; margin: 10px 0 12px; font-weight: 680; text-wrap: balance; }
+h2 { font-size: 20px; letter-spacing: -.02em; margin: 0 0 6px; font-weight: 650; text-wrap: balance; }
+p { margin: 0; max-width: 68ch; color: var(--ink-2); }
+.lede { font-size: 16px; }
+code, .mono { font-family: var(--font-mono); font-size: .86em; }
+.tiles { display: grid; grid-template-columns: repeat(4, minmax(0,1fr)); gap: 12px; }
+.tile { background: var(--surface); box-shadow: var(--shadow-card); border-radius: 8px; padding: 16px; display: grid; gap: 4px; align-content: start; }
+.tile .label { color: var(--ink-2); font-size: 13px; }
+.tile .value { font-size: 30px; font-weight: 650; letter-spacing: -.02em; line-height: 1.1; }
+.tile .value small { font-size: 15px; color: var(--ink-2); font-weight: 500; }
+.tile .sub { color: var(--ink-3); font-size: 12px; }
+@media (max-width: 760px) { .tiles { grid-template-columns: repeat(2, minmax(0,1fr)); } }
+section { display: grid; gap: 14px; min-width: 0; }
+.card { background: var(--surface); box-shadow: var(--shadow-card); border-radius: 8px; padding: 16px; min-width: 0; }
+.scroll { overflow-x: auto; }
+.legend { display: flex; flex-wrap: wrap; gap: 6px 18px; font-size: 13px; color: var(--ink-2); }
+.legend span { display: inline-flex; align-items: center; gap: 7px; }
+.sw { width: 10px; height: 10px; border-radius: 50%; display: inline-block; flex: none; }
+.src { font-size: 12px; color: var(--ink-3); }
+.src code { font-size: 11px; }
+svg text { font-family: var(--font-mono); }
+.matrix-wrap { min-width: 700px; }
+.matrix { display: grid; grid-template-columns: 190px repeat(5, minmax(0,1fr)); }
+.matrix .ch { font: 500 11px/1.3 var(--font-mono); letter-spacing: .04em; text-transform: uppercase; color: var(--ink-2); padding: 0 8px 10px; }
+.matrix .rh { padding: 12px 12px 12px 0; border-top: 1px solid var(--grid); }
+.matrix .rh b { display: block; font-size: 13px; font-weight: 600; color: var(--ink); }
+.matrix .rh span { font-size: 11px; color: var(--ink-3); font-family: var(--font-mono); }
+.matrix .cell { border-top: 1px solid var(--grid); border-left: 1px solid var(--grid); padding: 12px 8px; display: flex; flex-wrap: wrap; gap: 4px; align-content: flex-start; min-height: 52px; }
+.dot { width: 22px; height: 22px; padding: 0; border: 0; background: transparent; border-radius: 50%; display: grid; place-items: center; cursor: default; }
+.dot i { width: 14px; height: 14px; border-radius: 50%; box-shadow: 0 0 0 2px var(--surface); display: block; }
+.dot:hover i, .dot:focus-visible i { box-shadow: 0 0 0 2px var(--surface), 0 0 0 4px var(--ink); }
+.dot:focus-visible { outline: none; }
+.tip { position: fixed; z-index: 20; pointer-events: none; max-width: 300px; background: var(--elevated); color: var(--ink); border-radius: 6px; padding: 10px 12px; font-size: 13px; box-shadow: 0 12px 36px rgba(0,0,0,.35), 0 0 0 1px var(--rule); }
+.tip b { display: block; margin-bottom: 4px; }
+.tip .row { display: flex; gap: 6px; align-items: center; color: var(--ink-2); font-size: 12px; }
+.tip .note { margin-top: 6px; color: var(--ink-2); font-size: 12px; }
+.two { display: grid; grid-template-columns: minmax(0,1fr) minmax(0,1fr); gap: 16px; }
+@media (max-width: 860px) { .two { grid-template-columns: minmax(0,1fr); } }
+table { border-collapse: collapse; width: 100%; font-size: 13px; }
+th { text-align: left; font: 500 11px/1.3 var(--font-mono); letter-spacing: .04em; text-transform: uppercase; color: var(--ink-2); padding: 8px 10px; border-bottom: 1px solid var(--axis); white-space: nowrap; }
+td { padding: 8px 10px; border-bottom: 1px solid var(--rule); vertical-align: top; color: var(--ink); }
+td.muted { color: var(--ink-2); }
+td.num { font-variant-numeric: tabular-nums; font-family: var(--font-mono); white-space: nowrap; }
+tr.group td { font-weight: 600; color: var(--ink-2); background: var(--accent-soft); font-size: 12px; }
+.chip { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; color: var(--ink-2); }
+.filters { display: flex; flex-wrap: wrap; gap: 6px; }
+.filters button { font: 500 12px/1 var(--font-sans); color: var(--ink-2); background: transparent; border: 1px solid var(--axis); border-radius: 999px; padding: 7px 12px; cursor: pointer; display: inline-flex; gap: 6px; align-items: center; }
+.filters button[aria-pressed="true"] { color: var(--ink); background: var(--accent-soft); border-color: var(--accent); }
+.filters button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.found { display: grid; gap: 8px; }
+.found li { color: var(--ink-2); }
+ul.found { margin: 0; padding-left: 18px; max-width: 72ch; }
+</style>
+
+<div class="wrap">
+  <header>
+    <div class="eyebrow">Atlas research · 2 Nov 2026</div>
+    <h1>Linking signals map</h1>
+    <p class="lede">Every signal the research threads found for tying Usenet posts together, sorted by what it proves (twin, alt, same film, same uploader, posting tool) and by how much has to be downloaded to read it. The colour shows whether Atlas collects it today.</p>
+  </header>
+
+  <div class="tiles" id="tiles"></div>
+
+  <section>
+    <div>
+      <h2>What each signal proves, and what it costs to read</h2>
+      <p>One dot per signal. Rows go from free (already in the overview row) down to fetching every article. Hover or tab to a dot for details. Most of the cheap twin and alt keys are still uncollected.</p>
+    </div>
+    <div class="legend" id="legend1"></div>
+    <div class="card scroll"><div class="matrix-wrap"><div class="matrix" id="matrix" role="grid" aria-label="Signals by link type and download cost"></div></div></div>
+    <div class="src">Sources: <code>research/linking-findings.md</code> and each topic's <code>log.md</code>. Atlas status from the catalog thread's check against main at a29ee52 and the archive and stream threads' probe tests. Grey means the research did not check Atlas for that signal.</div>
+  </section>
+
+  <section>
+    <div>
+      <h2>Atlas coverage by download cost</h2>
+      <p>Signals per cost tier, split by what Atlas does with them now.</p>
+    </div>
+    <div class="legend" id="legend2"></div>
+    <div class="card"><svg id="stack" width="100%" role="img" aria-label="Stacked bars of signal counts per cost tier by Atlas status"></svg></div>
+  </section>
+
+  <div class="two">
+    <section>
+      <div>
+        <h2>Articles to fetch for media keys</h2>
+        <p>Frame and audio fingerprints need mid-file reads from a store-mode RAR, and audio is the expensive one because it is interleaved with video.</p>
+      </div>
+      <div class="card"><svg id="cost" width="100%" role="img" aria-label="Bar chart of articles needed per sampling job"></svg></div>
+      <div class="src">Source: stream-metadata wave 4 sampling plan. Tail is "3 to 5", drawn at 5.</div>
+    </section>
+    <section>
+      <div>
+        <h2>Default segment size by posting tool</h2>
+        <p>Nyuu and ngPost both default to 716,800 bytes, so size alone can't tell them apart. The Message-ID shape can.</p>
+      </div>
+      <div class="card"><svg id="tools" width="100%" role="img" aria-label="Dot plot of default article size per posting tool"></svg></div>
+      <div class="src">Source: posting-behavior waves 1 and 2. The axis starts at 700,000 bytes to show the gaps; it is a dot plot, not bars.</div>
+    </section>
+  </div>
+
+  <section>
+    <div><h2>Posting tool fingerprints</h2><p>What each tool leaves in headers by default. These classify a post's tool even when names and subjects are obfuscated.</p></div>
+    <div class="card scroll">
+      <table>
+        <thead><tr><th>Tool</th><th>Segment size</th><th>Message-ID shape</th><th>Other tells</th></tr></thead>
+        <tbody>
+          <tr><td>Nyuu</td><td class="num">716,800</td><td><code>rand24-{unix ms}@nyuu</code></td><td class="muted">Date is article build time, monotone in queue order. Default From leaks the local user@host. Post-check repost keeps the same Message-ID, 35 s or more later.</td></tr>
+          <tr><td>ngPost</td><td class="num">716,800</td><td><code>&lt;uuid v4&gt;@ngPost</code></td><td class="muted">Sends no Date, so the server sets it. "One group per file" policy splits a post across groups. A retry gets a new UUID. pcrc32 is printed without zero padding.</td></tr>
+          <tr><td>Postie</td><td class="num">750,000</td><td><code>32@8.3</code> random</td><td class="muted">Defaults to one group per file and full obfuscation of names, subjects, dates and poster. Reposts a missing article after 10 s to 5 min.</td></tr>
+          <tr><td>NewsUP</td><td class="num">768,000</td><td class="muted">not recorded</td><td class="muted">Fixed From <code>NewsUP &lt;NewsUP@somewhere.cbr&gt;</code>.</td></tr>
+          <tr><td>GoPostStuff</td><td class="muted">not recorded</td><td><code>UnixNano$gps@gopoststuff</code></td><td class="muted">pcrc32 in upper-case hex. Header order From, Newsgroups, Message-ID, X-Newsposter, Subject.</td></tr>
+          <tr><td>nxg-upper</td><td class="muted">not recorded</td><td><code>40hex@21hex.3hex</code></td><td class="muted">Message-ID is SHA-256 of the NxG header, so every data and PAR2 ID can be derived from it.</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section>
+    <div><h2>Tested in pure Rust</h2><p>Results from the stream thread's runs on generated samples, which back the "same film" keys without ffmpeg.</p></div>
+    <div class="tiles">
+      <div class="tile"><div class="label">Chromaprint score, FLAC vs AAC 128k</div><div class="value">0.992</div><div class="sub">Unrelated audio scores 0</div></div>
+      <div class="tile"><div class="label">Frame hash distance, 1080p to 360p</div><div class="value">0 to 3 <small>of 64 bits</small></div><div class="sub">Identical across 8 and 10-bit, 720p and 1080p</div></div>
+      <div class="tile"><div class="label">HEVC keyframe decode</div><div class="value">~10 <small>ms</small></div><div class="sub">rust_h265, bit-exact against ffmpeg</div></div>
+      <div class="tile"><div class="label">AC-3 crc2 sequence across remux</div><div class="value">Identical</div><div class="sub">Same audio in MKV and MP4</div></div>
+    </div>
+  </section>
+
+  <section>
+    <div>
+      <h2>Signal inventory</h2>
+      <p>The table behind the charts. Filter by Atlas status.</p>
+    </div>
+    <div class="filters" id="filters" role="group" aria-label="Filter by Atlas status"></div>
+    <div class="card scroll">
+      <table>
+        <thead><tr><th>Signal</th><th>Proves</th><th>Atlas</th><th>Notes</th></tr></thead>
+        <tbody id="inv"></tbody>
+      </table>
+    </div>
+  </section>
+</div>
+<div class="tip" id="tip" hidden></div>
+
+<script>
+const LINKS = ["Twin", "Alt", "Same film", "Uploader or session", "Posting tool"];
+const TIERS = [
+  ["xover", "Overview row", "XOVER, no body"],
+  ["head", "Headers", "one HEAD"],
+  ["first", "First article", "first body fetch"],
+  ["target", "Targeted article", "PAR2 index, file tail, disc files"],
+  ["mid", "Mid-file samples", "12 to 116 articles"],
+  ["all", "Every article", "headers of all parts"]
+];
+const STATUS = {
+  collected: "Collected and used",
+  partial: "Kept, not parsed or used",
+  missing: "Not collected",
+  unknown: "Not checked"
+};
+const ORDER = ["collected", "partial", "missing", "unknown"];
+const S = [
+  ["Xref crosspost set", "Twin", "xover", "missing", "Column 9 of XOVER when the server lists Xref:full. parse_overview reads 8 columns and drops it."],
+  ["Message-ID shape and domain", "Posting tool", "xover", "partial", "Domain is stored in the domains table but nothing searches or shows it."],
+  [":lines to :bytes ratio", "Posting tool", "xover", "missing", "Gives yEnc line width (128 vs 256) and spots non-yEnc bodies. :lines is dropped."],
+  ["References header", "Uploader or session", "xover", "missing", "A few posters point every part at part 1. Parsed from XOVER, then dropped."],
+  ["Poster (From)", "Uploader or session", "xover", "collected", "Nyuu's default From leaks the poster's local user@host."],
+  ["Name match to IMDb, TVDB, TVMaze", "Same film", "xover", "collected", "Atlas's current naming path. Fails on obfuscated subjects."],
+  ["Article-number arrival curve", "Uploader or session", "xover", "unknown", "Per group, per server. Usable only as one server's arrival clock."],
+  ["Injection-Info posting-account", "Uploader or session", "head", "partial", "Kept verbatim in release_probe headers. Parameters never parsed or indexed."],
+  ["Header set and order", "Posting tool", "head", "partial", "Survives a spoofed User-Agent. Atlas keeps 12 named headers and loses the order."],
+  ["Date vs Injection-Date skew", "Uploader or session", "head", "partial", "Poster clock fingerprint and fake-date detector. Both kept, never compared."],
+  ["X-Received-Body-CRC", "Twin", "head", "missing", "Body CRC32 from a HEAD alone on Highwinds-style backbones. Unconfirmed on Eweka and Omicron."],
+  ["yEnc pcrc32 and part size", "Twin", "first", "partial", "Part-level twin proof. Verified for the 1 to 3 probed articles, not stored."],
+  ["Main file CRC32", "Twin", "first", "collected", "release_probe.crc32, indexed. Main file only."],
+  ["yEnc encoder quirks", "Posting tool", "first", "missing", "Hex case and padding, escape set, line=, field order. ngPost is identifiable from body bytes alone."],
+  ["Archive inner CRC32 and unpacked size", "Alt", "first", "missing", "RAR4, RAR5 and 7z file headers. Store-mode archives give it with no payload."],
+  ["Encrypted archive salt", "Twin", "first", "missing", "RAR5 -hp and 7z -mhe leave salt and KDF count readable. One per archive creation."],
+  ["Packer build fields", "Posting tool", "first", "missing", "Dictionary size, method, thread count, host OS byte. UNP_VER is useless."],
+  ["Archive owner name and uid", "Uploader or session", "first", "missing", "RAR5 extra 0x06, RAR4 UOW, 7z high st_mode bits."],
+  ["Archive local time vs post Date", "Uploader or session", "first", "missing", "DOS local time minus Date gives the uploader's UTC offset."],
+  ["MKV SegmentUID and DateUTC", "Alt", "first", "unknown", "Same pair means the same mux run. DateUTC changes on every remux."],
+  ["x264 and x265 options SEI", "Alt", "first", "missing", "Full encoder options string in the first access unit. Same string and size means likely the same encode."],
+  ["First IDR frame hash", "Alt", "first", "missing", "Survives a remux to another container."],
+  ["FLAC STREAMINFO MD5", "Alt", "first", "missing", "MD5 of the decoded audio. Exact and container-independent."],
+  ["Embedded IMDb, TMDB or iTunes IDs", "Same film", "first", "missing", "Matroska tags and MP4 cnID skip name matching when present. Atlas reads no tags."],
+  ["PAR2 hash16k, length and MD5", "Twin", "target", "unknown", "Rename-proof. The Recovery Set ID changes on rename, so don't key on it."],
+  ["PAR2 slice CRCs to whole-file CRC32", "Twin", "target", "unknown", "One PAR2 index article gives every file's full CRC32."],
+  ["PAR2 creator string", "Posting tool", "target", "unknown", "par2cmdline version, or ParPar version with CPU arch."],
+  ["RAR5 .rev volume CRC list", "Twin", "target", "missing", "Size and CRC32 of every data volume without downloading them."],
+  ["MP4 moov box", "Alt", "target", "partial", "Muxer name, sample tables, HDR boxes. Atlas gets it only from faststart files."],
+  ["mkvmerge statistics tags", "Alt", "target", "missing", "BPS, frame count and byte count, written at the end of the file."],
+  ["Blu-ray or DVD disc ID", "Same film", "target", "missing", "id.bdmv disc_id or libdvdread IFO hash. Needs 1 or 2 targeted articles."],
+  ["Keyframe perceptual hash", "Same film", "mid", "missing", "32x32 luma hash. Matches across HDR and SDR, 8 and 10-bit."],
+  ["Audio fingerprint", "Same film", "mid", "missing", "rusty-chromaprint, pure Rust."],
+  ["AC-3 crc2 sequence", "Alt", "mid", "missing", "Last 2 bytes of each syncframe. Identical across MKV and MP4."],
+  ["Whole-file CRC32 from part CRCs", "Twin", "all", "missing", "crc32 combine over every pcrc32. No crc32= needed."],
+  ["Repost and fill detection", "Uploader or session", "all", "missing", "Same name, size, begin, end and pcrc32 under a later Date and new Message-ID."],
+  ["Posting-session timing", "Uploader or session", "all", "missing", "Nyuu's millisecond Message-IDs and monotone Dates form one tight run per file."]
+].map(([name, link, tier, status, note]) => ({ name, link, tier, status, note }));
+
+const css = v => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+const col = s => `var(--st-${s})`;
+const el = (tag, attrs = {}, html = "") => { const e = document.createElement(tag); for (const k in attrs) e.setAttribute(k, attrs[k]); e.innerHTML = html; return e; };
+const esc = s => s.replace(/&/g, "&amp;").replace(/</g, "&lt;");
+const tierName = id => TIERS.find(t => t[0] === id)[1];
+
+// Tiles
+const n = st => S.filter(s => s.status === st).length;
+const cheap = S.filter(s => s.tier === "xover" || s.tier === "head").length;
+document.getElementById("tiles").innerHTML = [
+  ["Signals catalogued", S.length, "From six research threads"],
+  ["Collected and used by Atlas", n("collected"), `Plus ${n("partial")} kept but not parsed`],
+  ["Not collected yet", n("missing"), `${n("unknown")} more not checked against Atlas`],
+  ["Readable with no body download", cheap, "From XOVER or one HEAD"]
+].map(([l, v, s]) => `<div class="tile"><div class="label">${l}</div><div class="value">${v}</div><div class="sub">${s}</div></div>`).join("");
+
+// Legends
+const legendHTML = ORDER.map(s => `<span><i class="sw" style="background:${col(s)}"></i>${STATUS[s]}</span>`).join("");
+document.getElementById("legend1").innerHTML = legendHTML;
+document.getElementById("legend2").innerHTML = legendHTML;
+
+// Tooltip
+const tip = document.getElementById("tip");
+function showTip(html, x, y) {
+  tip.innerHTML = html; tip.hidden = false;
+  const r = tip.getBoundingClientRect();
+  let left = x + 14, top = y + 14;
+  if (left + r.width > innerWidth - 8) left = x - r.width - 14;
+  if (top + r.height > innerHeight - 8) top = y - r.height - 14;
+  tip.style.left = Math.max(8, left) + "px"; tip.style.top = Math.max(8, top) + "px";
+}
+const hideTip = () => { tip.hidden = true; };
+function bindTip(node, html) {
+  node.addEventListener("mousemove", e => showTip(html, e.clientX, e.clientY));
+  node.addEventListener("mouseleave", hideTip);
+  node.addEventListener("focus", () => { const r = node.getBoundingClientRect(); showTip(html, r.right, r.bottom); });
+  node.addEventListener("blur", hideTip);
+}
+const sigTip = s => `<b>${esc(s.name)}</b><div class="row"><i class="sw" style="background:${col(s.status)}"></i>${STATUS[s.status]}</div><div class="row">${s.link} · ${tierName(s.tier)}</div><div class="note">${esc(s.note)}</div>`;
+
+// Matrix
+const M = document.getElementById("matrix");
+M.appendChild(el("div", { class: "ch" }, "Cost to read"));
+LINKS.forEach(l => M.appendChild(el("div", { class: "ch", role: "columnheader" }, l)));
+TIERS.forEach(([id, name, sub]) => {
+  M.appendChild(el("div", { class: "rh", role: "rowheader" }, `<b>${name}</b><span>${sub}</span>`));
+  LINKS.forEach(l => {
+    const c = el("div", { class: "cell", role: "gridcell" });
+    S.filter(s => s.tier === id && s.link === l)
+      .sort((a, b) => ORDER.indexOf(a.status) - ORDER.indexOf(b.status))
+      .forEach(s => {
+        const d = el("button", { class: "dot", type: "button", "aria-label": `${s.name}: ${STATUS[s.status]}, ${s.link}, ${name}` }, `<i style="background:${col(s.status)}"></i>`);
+        bindTip(d, sigTip(s)); c.appendChild(d);
+      });
+    M.appendChild(c);
+  });
+});
+
+// SVG helpers
+const NS = "http://www.w3.org/2000/svg";
+const sv = (tag, a, parent) => { const e = document.createElementNS(NS, tag); for (const k in a) e.setAttribute(k, a[k]); if (parent) parent.appendChild(e); return e; };
+// Bar with 4px rounded data-end, square at baseline (horizontal, grows right)
+const hbarPath = (x, y, w, h, r = 4) => { r = Math.min(r, w, h / 2); return `M${x},${y}H${x + w - r}Q${x + w},${y} ${x + w},${y + r}V${y + h - r}Q${x + w},${y + h} ${x + w - r},${y + h}H${x}Z`; };
+const textW = (t, size = 11) => t.length * size * 0.62;
+
+function drawStack() {
+  const svg = document.getElementById("stack"); svg.innerHTML = "";
+  const W = svg.clientWidth || 700, labW = Math.min(150, W * 0.32), right = 34, rowH = 34, barH = 20, top = 6;
+  const max = Math.max(...TIERS.map(t => S.filter(s => s.tier === t[0]).length));
+  const scale = (W - labW - right) / max;
+  const H = top + TIERS.length * rowH + 24;
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`); svg.setAttribute("height", H);
+  // grid
+  const step = 2;
+  for (let v = 0; v <= max; v += step) {
+    const x = labW + v * scale;
+    sv("line", { x1: x, x2: x, y1: top, y2: top + TIERS.length * rowH, stroke: v === 0 ? css("--axis") : css("--grid"), "stroke-width": 1 }, svg);
+    const t = sv("text", { x, y: H - 6, "text-anchor": "middle", "font-size": 10, fill: css("--ink-3") }, svg); t.textContent = v;
+  }
+  TIERS.forEach(([id, name], i) => {
+    const y = top + i * rowH + (rowH - barH) / 2;
+    const lab = sv("text", { x: labW - 10, y: y + barH / 2 + 4, "text-anchor": "end", "font-size": 11, fill: css("--ink-2") }, svg); lab.textContent = name;
+    let x = labW; const tot = S.filter(s => s.tier === id).length;
+    const segs = ORDER.map(st => [st, S.filter(s => s.tier === id && s.status === st).length]).filter(d => d[1] > 0);
+    segs.forEach(([st, c], j) => {
+      const last = j === segs.length - 1;
+      const w = c * scale - (last ? 0 : 2);
+      const p = last ? sv("path", { d: hbarPath(x, y, w, barH), fill: css(`--st-${st}`) }, svg)
+                     : sv("rect", { x, y, width: w, height: barH, fill: css(`--st-${st}`) }, svg);
+      p.setAttribute("tabindex", "0");
+      p.setAttribute("aria-label", `${name}: ${c} ${STATUS[st]}`);
+      const names = S.filter(s => s.tier === id && s.status === st).map(s => esc(s.name));
+      bindTip(p, `<b>${name}</b><div class="row"><i class="sw" style="background:${col(st)}"></i>${STATUS[st]}: ${c} of ${tot}</div><div class="note">${names.join("<br>")}</div>`);
+      if (textW(String(c)) + 10 < w) { const t = sv("text", { x: x + 6, y: y + barH / 2 + 4, "font-size": 11, fill: css(`--on-${st}`), "pointer-events": "none" }, svg); t.textContent = c; }
+      x += c * scale;
+    });
+    const tt = sv("text", { x: x + 6, y: y + barH / 2 + 4, "font-size": 11, fill: css("--ink"), "font-weight": 600 }, svg); tt.textContent = tot;
+  });
+}
+
+function drawCost() {
+  const svg = document.getElementById("cost"); svg.innerHTML = "";
+  const D = [["Front of the file", 6], ["File tail", 5], ["Frame plan, 1080p", 12], ["Frame plan, 2160p", 40], ["10 s audio, 2160p", 116]];
+  const W = svg.clientWidth || 480, labW = Math.min(140, W * 0.36), right = 40, rowH = 34, barH = 18, top = 6;
+  const max = 120, scale = (W - labW - right) / max;
+  const H = top + D.length * rowH + 24;
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`); svg.setAttribute("height", H);
+  [0, 40, 80, 120].forEach(v => {
+    const x = labW + v * scale;
+    sv("line", { x1: x, x2: x, y1: top, y2: top + D.length * rowH, stroke: v === 0 ? css("--axis") : css("--grid") }, svg);
+    const t = sv("text", { x, y: H - 6, "text-anchor": "middle", "font-size": 10, fill: css("--ink-3") }, svg); t.textContent = v;
+  });
+  D.forEach(([name, v], i) => {
+    const y = top + i * rowH + (rowH - barH) / 2;
+    const l = sv("text", { x: labW - 10, y: y + barH / 2 + 4, "text-anchor": "end", "font-size": 11, fill: css("--ink-2") }, svg); l.textContent = name;
+    const p = sv("path", { d: hbarPath(labW, y, v * scale, barH), fill: css("--mark"), tabindex: 0, "aria-label": `${name}: ${v} articles` }, svg);
+    bindTip(p, `<b>${name}</b><div class="row">${v} articles of ~700 KB</div>`);
+    const t = sv("text", { x: labW + v * scale + 6, y: y + barH / 2 + 4, "font-size": 11, fill: css("--ink") }, svg); t.textContent = v;
+  });
+}
+
+function drawTools() {
+  const svg = document.getElementById("tools"); svg.innerHTML = "";
+  const D = [["Nyuu", 716800], ["ngPost", 716800], ["Postie", 750000], ["NewsUP", 768000]];
+  const W = svg.clientWidth || 480, labW = 70, right = 24, rowH = 34, top = 6;
+  const lo = 700000, hi = 780000, scale = (W - labW - right) / (hi - lo);
+  const H = top + D.length * rowH + 24;
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`); svg.setAttribute("height", H);
+  const ticks = W < 380 ? [700000, 740000, 780000] : [700000, 720000, 740000, 760000, 780000];
+  ticks.forEach(v => {
+    const x = labW + (v - lo) * scale;
+    sv("line", { x1: x, x2: x, y1: top, y2: top + D.length * rowH, stroke: css("--grid") }, svg);
+    const t = sv("text", { x, y: H - 6, "text-anchor": "middle", "font-size": 10, fill: css("--ink-3") }, svg); t.textContent = (v / 1000) + "K";
+  });
+  D.forEach(([name, v], i) => {
+    const cy = top + i * rowH + rowH / 2, cx = labW + (v - lo) * scale;
+    sv("line", { x1: labW, x2: W - right, y1: cy, y2: cy, stroke: css("--grid") }, svg);
+    const l = sv("text", { x: labW - 10, y: cy + 4, "text-anchor": "end", "font-size": 11, fill: css("--ink-2") }, svg); l.textContent = name;
+    const hit = sv("circle", { cx, cy, r: 12, fill: "transparent", tabindex: 0, "aria-label": `${name}: ${v.toLocaleString()} bytes` }, svg);
+    sv("circle", { cx, cy, r: 5, fill: css("--mark"), stroke: css("--surface"), "stroke-width": 2, "pointer-events": "none" }, svg);
+    bindTip(hit, `<b>${name}</b><div class="row">${v.toLocaleString()} bytes per article</div>`);
+    const lab = v.toLocaleString();
+    const t = sv("text", { x: cx + 12, y: cy + 4, "font-size": 11, fill: css("--ink") }, svg); t.textContent = lab;
+    if (cx + 12 + textW(lab) > W - 2) { t.setAttribute("x", cx - 12); t.setAttribute("text-anchor", "end"); }
+  });
+}
+
+// Inventory table + filter
+let filter = "all";
+const F = document.getElementById("filters");
+[["all", "All", null]].concat(ORDER.map(s => [s, STATUS[s], s])).forEach(([k, label, st]) => {
+  const b = el("button", { type: "button", id: "f-" + k, "aria-pressed": String(k === filter) },
+    (st ? `<i class="sw" style="background:${col(st)}"></i>` : "") + `${label} <span class="mono">${k === "all" ? S.length : n(k)}</span>`);
+  b.onclick = () => { filter = k; F.querySelectorAll("button").forEach(x => x.setAttribute("aria-pressed", String(x === b))); drawTable(); };
+  F.appendChild(b);
+});
+function drawTable() {
+  const tb = document.getElementById("inv"); tb.innerHTML = "";
+  TIERS.forEach(([id, name, sub]) => {
+    const rows = S.filter(s => s.tier === id && (filter === "all" || s.status === filter));
+    if (!rows.length) return;
+    tb.appendChild(el("tr", { class: "group" }, `<td colspan="4">${name} · ${sub}</td>`));
+    rows.forEach(s => tb.appendChild(el("tr", {}, `<td>${esc(s.name)}</td><td class="muted">${s.link}</td><td><span class="chip"><i class="sw" style="background:${col(s.status)}"></i>${STATUS[s.status]}</span></td><td class="muted">${esc(s.note)}</td>`)));
+  });
+}
+
+function drawAll() { drawStack(); drawCost(); drawTools(); }
+drawTable(); drawAll();
+let rt; addEventListener("resize", () => { clearTimeout(rt); rt = setTimeout(drawAll, 120); });
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change", drawAll);
+new MutationObserver(drawAll).observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
+addEventListener("scroll", hideTip, { passive: true });
+</script>

@@ -1,0 +1,324 @@
+important-subdir.par2              n=  1 unique_files_with_subd|unique_files_with_subd sz=41316,41332 eq=0/1 diffs=[-15] sd_full=0.0 meanA=42752
+important-subdir.vol000+02.par2    n=  1 unique_files_with_subd|unique_files_with_subd sz=135096,135128 eq=0/1 diffs=[-27] sd_full=0.0 meanA=139469
+important-subdir.vol002+04.par2    n=  1 unique_files_with_subd|unique_files_with_subd sz=228876,228924 eq=0/1 diffs=[-42] sd_full=0.0 meanA=236161
+important-subdir.vol006+08.par2    n=  1 unique_files_with_subd|unique_files_with_subd sz=375224,375288 eq=0/1 diffs=[-65] sd_full=0.0 meanA=387287
+important-subdir.vol014+16.par2    n=  1 unique_files_with_subd|unique_files_with_subd sz=626708,626788 eq=0/1 diffs=[-85] sd_full=0.0 meanA=646455
+important-subdir.vol030+32.par2    n=  2 unique_files_with_subd|unique_files_with_subd sz=1088464,1088560 eq=0/2 diffs=[3, -107] sd_full=0.0 meanA=561638
+important-subdir.vol062+64.par2    n=  3 unique_files_with_subd|unique_files_with_subd sz=1970764,1970876 eq=0/3 diffs=[6, 5, -132] sd_full=0.5 meanA=677775
+important-subdir.vol126+74.par2    n=  4 unique_files_with_subd|unique_files_with_subd sz=2233604,2233716 eq=0/4 diffs=[-8, -11, -4, -118] sd_full=2.9 meanA=576110
+myfile1                            n= 15 unique_files_with_subd|unique_files_with_subd sz=10485760,10485760 eq=15/15 diffs=[0, 0, 0, 0, 0, 0, 0, 0]... sd_full=0.0 meanA=721260
+myfile2                            n= 15 unique_files_with_subd|unique_files_with_subd sz=10485760,10485760 eq=15/15 diffs=[0, 0, 0, 0, 0, 0, 0, 0]... sd_full=0.0 meanA=721357
+myfile3                            n= 15 unique_files_with_subd|unique_files_with_subd sz=10485760,10485760 eq=15/15 diffs=[0, 0, 0, 0, 0, 0, 0, 0]... sd_full=0.0 meanA=721311
+insub1                             n= 15 unique_files_with_subd|unique_files_with_subd sz=10485760,10485760 eq=15/15 diffs=[0, 0, 0, 0, 0, 0, 0, 0]... sd_full=0.0 meanA=721242
+insub2                             n= 15 unique_files_with_subd|unique_files_with_subd sz=10485760,10485760 eq=15/15 diffs=[0, 0, 0, 0, 0, 0, 0, 0]... sd_full=0.0 meanA=721307
+blabla.par2                        n=  1 reftestnzb_passworded-|reftestnzb-7z-instead- sz=41564,41588 eq=0/1 diffs=[-49] sd_full=0.0 meanA=43015
+blabla.par2                        n=  1 reftestnzb_passworded-|My Very Very Important sz=41564,41116 eq=0/1 diffs=[1094] sd_full=0.0 meanA=43015
+blabla.par2                        n=  1 reftestnzb_passworded-|ExclamationMarkInResul sz=41564,40872 eq=0/1 diffs=[1348] sd_full=0.0 meanA=43015
+blabla.par2                        n=  1 reftestnzb_passworded-|hidden_exe_ab71988b62c sz=41564,40652 eq=0/1 diffs=[1580] sd_full=0.0 meanA=43015
+blabla.par2                        n=  1 reftestnzb_passworded-|ecoji.nzb              sz=41564,40556 eq=0/1 diffs=[1678] sd_full=0.0 meanA=43015
+blabla.par2                        n=  1 reftestnzb_passworded-|Very Useful Subject (2 sz=41564,41492 eq=0/1 diffs=[117] sd_full=0.0 meanA=43015
+blabla.par2                        n=  1 reftestnzb_passworded-|reftestnzb-obfuscated- sz=41564,41816 eq=0/1 diffs=[-287] sd_full=0.0 meanA=43015
+blabla.par2                        n=  1 reftestnzb-7z-instead-|My Very Very Important sz=41588,41116 eq=0/1 diffs=[1143] sd_full=0.0 meanA=43064
+blabla.par2                        n=  1 reftestnzb-7z-instead-|ExclamationMarkInResul sz=41588,40872 eq=0/1 diffs=[1397] sd_full=0.0 meanA=43064
+blabla.par2                        n=  1 reftestnzb-7z-instead-|hidden_exe_ab71988b62c sz=41588,40652 eq=0/1 diffs=[1629] sd_full=0.0 meanA=43064
+blabla.par2                        n=  1 reftestnzb-7z-instead-|ecoji.nzb              sz=41588,40556 eq=0/1 diffs=[1727] sd_full=0.0 meanA=43064
+blabla.par2                        n=  1 reftestnzb-7z-instead-|Very Useful Subject (2 sz=41588,41492 eq=0/1 diffs=[166] sd_full=0.0 meanA=43064
+blabla.par2                        n=  1 reftestnzb-7z-instead-|reftestnzb-obfuscated- sz=41588,41816 eq=0/1 diffs=[-238] sd_full=0.0 meanA=43064
+blabla.par2                        n=  1 My Very Very Important|ExclamationMarkInResul sz=41116,40872 eq=0/1 diffs=[254] sd_full=0.0 meanA=41921
+blabla.par2                        n=  1 My Very Very Important|hidden_exe_ab71988b62c sz=41116,40652 eq=0/1 diffs=[486] sd_full=0.0 meanA=41921
+blabla.par2                        n=  1 My Very Very Important|ecoji.nzb              sz=41116,40556 eq=0/1 diffs=[584] sd_full=0.0 meanA=41921
+blabla.par2                        n=  1 My Very Very Important|Very Useful Subject (2 sz=41116,41492 eq=0/1 diffs=[-977] sd_full=0.0 meanA=41921
+blabla.par2                        n=  1 My Very Very Important|reftestnzb-obfuscated- sz=41116,41816 eq=0/1 diffs=[-1381] sd_full=0.0 meanA=41921
+blabla.par2                        n=  1 ExclamationMarkInResul|hidden_exe_ab71988b62c sz=40872,40652 eq=0/1 diffs=[232] sd_full=0.0 meanA=41667
+blabla.par2                        n=  1 ExclamationMarkInResul|ecoji.nzb              sz=40872,40556 eq=0/1 diffs=[330] sd_full=0.0 meanA=41667
+blabla.par2                        n=  1 ExclamationMarkInResul|Very Useful Subject (2 sz=40872,41492 eq=0/1 diffs=[-1231] sd_full=0.0 meanA=41667
+blabla.par2                        n=  1 ExclamationMarkInResul|reftestnzb-obfuscated- sz=40872,41816 eq=0/1 diffs=[-1635] sd_full=0.0 meanA=41667
+blabla.par2                        n=  1 hidden_exe_ab71988b62c|ecoji.nzb              sz=40652,40556 eq=0/1 diffs=[98] sd_full=0.0 meanA=41435
+blabla.par2                        n=  1 hidden_exe_ab71988b62c|Very Useful Subject (2 sz=40652,41492 eq=0/1 diffs=[-1463] sd_full=0.0 meanA=41435
+blabla.par2                        n=  1 hidden_exe_ab71988b62c|reftestnzb-obfuscated- sz=40652,41816 eq=0/1 diffs=[-1867] sd_full=0.0 meanA=41435
+blabla.par2                        n=  1 ecoji.nzb             |Very Useful Subject (2 sz=40556,41492 eq=0/1 diffs=[-1561] sd_full=0.0 meanA=41337
+blabla.par2                        n=  1 ecoji.nzb             |reftestnzb-obfuscated- sz=40556,41816 eq=0/1 diffs=[-1965] sd_full=0.0 meanA=41337
+blabla.par2                        n=  1 Very Useful Subject (2|reftestnzb-obfuscated- sz=41492,41816 eq=0/1 diffs=[-404] sd_full=0.0 meanA=42898
+blabla.vol000+02.par2              n=  1 reftestnzb_passworded-|reftestnzb-7z-instead- sz=98936,188228 eq=0/1 diffs=[-92159] sd_full=0.0 meanA=102185
+blabla.vol000+02.par2              n=  1 reftestnzb_passworded-|ExclamationMarkInResul sz=98936,108012 eq=0/1 diffs=[-7708] sd_full=0.0 meanA=102185
+blabla.vol000+02.par2              n=  1 reftestnzb_passworded-|hidden_exe_ab71988b62c sz=98936,107552 eq=0/1 diffs=[-7210] sd_full=0.0 meanA=102185
+blabla.vol000+02.par2              n=  1 reftestnzb_passworded-|ecoji.nzb              sz=98936,186008 eq=0/1 diffs=[-86893] sd_full=0.0 meanA=102185
+blabla.vol000+02.par2              n=  1 reftestnzb_passworded-|Very Useful Subject (2 sz=98936,135584 eq=0/1 diffs=[-37745] sd_full=0.0 meanA=102185
+blabla.vol000+02.par2              n=  1 reftestnzb_passworded-|reftestnzb-obfuscated- sz=98936,148556 eq=0/1 diffs=[-51249] sd_full=0.0 meanA=102185
+blabla.vol000+02.par2              n=  1 reftestnzb-7z-instead-|ExclamationMarkInResul sz=188228,108012 eq=0/1 diffs=[84451] sd_full=0.0 meanA=194344
+blabla.vol000+02.par2              n=  1 reftestnzb-7z-instead-|hidden_exe_ab71988b62c sz=188228,107552 eq=0/1 diffs=[84949] sd_full=0.0 meanA=194344
+blabla.vol000+02.par2              n=  1 reftestnzb-7z-instead-|ecoji.nzb              sz=188228,186008 eq=0/1 diffs=[5266] sd_full=0.0 meanA=194344
+blabla.vol000+02.par2              n=  1 reftestnzb-7z-instead-|Very Useful Subject (2 sz=188228,135584 eq=0/1 diffs=[54414] sd_full=0.0 meanA=194344
+blabla.vol000+02.par2              n=  1 reftestnzb-7z-instead-|reftestnzb-obfuscated- sz=188228,148556 eq=0/1 diffs=[40910] sd_full=0.0 meanA=194344
+blabla.vol000+02.par2              n=  1 ExclamationMarkInResul|hidden_exe_ab71988b62c sz=108012,107552 eq=0/1 diffs=[498] sd_full=0.0 meanA=109893
+blabla.vol000+02.par2              n=  1 ExclamationMarkInResul|ecoji.nzb              sz=108012,186008 eq=0/1 diffs=[-79185] sd_full=0.0 meanA=109893
+blabla.vol000+02.par2              n=  1 ExclamationMarkInResul|Very Useful Subject (2 sz=108012,135584 eq=0/1 diffs=[-30037] sd_full=0.0 meanA=109893
+blabla.vol000+02.par2              n=  1 ExclamationMarkInResul|reftestnzb-obfuscated- sz=108012,148556 eq=0/1 diffs=[-43541] sd_full=0.0 meanA=109893
+blabla.vol000+02.par2              n=  1 hidden_exe_ab71988b62c|ecoji.nzb              sz=107552,186008 eq=0/1 diffs=[-79683] sd_full=0.0 meanA=109395
+blabla.vol000+02.par2              n=  1 hidden_exe_ab71988b62c|Very Useful Subject (2 sz=107552,135584 eq=0/1 diffs=[-30535] sd_full=0.0 meanA=109395
+blabla.vol000+02.par2              n=  1 hidden_exe_ab71988b62c|reftestnzb-obfuscated- sz=107552,148556 eq=0/1 diffs=[-44039] sd_full=0.0 meanA=109395
+blabla.vol000+02.par2              n=  1 ecoji.nzb             |Very Useful Subject (2 sz=186008,135584 eq=0/1 diffs=[49148] sd_full=0.0 meanA=189078
+blabla.vol000+02.par2              n=  1 ecoji.nzb             |reftestnzb-obfuscated- sz=186008,148556 eq=0/1 diffs=[35644] sd_full=0.0 meanA=189078
+blabla.vol000+02.par2              n=  1 Very Useful Subject (2|reftestnzb-obfuscated- sz=135584,148556 eq=0/1 diffs=[-13504] sd_full=0.0 meanA=139930
+blabla.vol002+04.par2              n=  1 reftestnzb_passworded-|reftestnzb-7z-instead- sz=156308,334868 eq=0/1 diffs=[-184271] sd_full=0.0 meanA=161408
+blabla.vol002+04.par2              n=  1 reftestnzb_passworded-|ExclamationMarkInResul sz=156308,175152 eq=0/1 diffs=[-16680] sd_full=0.0 meanA=161408
+blabla.vol002+04.par2              n=  1 reftestnzb_passworded-|hidden_exe_ab71988b62c sz=156308,174452 eq=0/1 diffs=[-15932] sd_full=0.0 meanA=161408
+blabla.vol002+04.par2              n=  1 reftestnzb_passworded-|ecoji.nzb              sz=156308,331460 eq=0/1 diffs=[-175394] sd_full=0.0 meanA=161408
+blabla.vol002+04.par2              n=  1 reftestnzb_passworded-|Very Useful Subject (2 sz=156308,229676 eq=0/1 diffs=[-75579] sd_full=0.0 meanA=161408
+blabla.vol002+04.par2              n=  1 reftestnzb_passworded-|reftestnzb-obfuscated- sz=156308,255296 eq=0/1 diffs=[-102149] sd_full=0.0 meanA=161408
+blabla.vol002+04.par2              n=  1 reftestnzb-7z-instead-|ExclamationMarkInResul sz=334868,175152 eq=0/1 diffs=[167591] sd_full=0.0 meanA=345679
+blabla.vol002+04.par2              n=  1 reftestnzb-7z-instead-|hidden_exe_ab71988b62c sz=334868,174452 eq=0/1 diffs=[168339] sd_full=0.0 meanA=345679
+blabla.vol002+04.par2              n=  1 reftestnzb-7z-instead-|ecoji.nzb              sz=334868,331460 eq=0/1 diffs=[8877] sd_full=0.0 meanA=345679
+blabla.vol002+04.par2              n=  1 reftestnzb-7z-instead-|Very Useful Subject (2 sz=334868,229676 eq=0/1 diffs=[108692] sd_full=0.0 meanA=345679
+blabla.vol002+04.par2              n=  1 reftestnzb-7z-instead-|reftestnzb-obfuscated- sz=334868,255296 eq=0/1 diffs=[82122] sd_full=0.0 meanA=345679
+blabla.vol002+04.par2              n=  1 ExclamationMarkInResul|hidden_exe_ab71988b62c sz=175152,174452 eq=0/1 diffs=[748] sd_full=0.0 meanA=178088
+blabla.vol002+04.par2              n=  1 ExclamationMarkInResul|ecoji.nzb              sz=175152,331460 eq=0/1 diffs=[-158714] sd_full=0.0 meanA=178088
+blabla.vol002+04.par2              n=  1 ExclamationMarkInResul|Very Useful Subject (2 sz=175152,229676 eq=0/1 diffs=[-58899] sd_full=0.0 meanA=178088
+blabla.vol002+04.par2              n=  1 ExclamationMarkInResul|reftestnzb-obfuscated- sz=175152,255296 eq=0/1 diffs=[-85469] sd_full=0.0 meanA=178088
+blabla.vol002+04.par2              n=  1 hidden_exe_ab71988b62c|ecoji.nzb              sz=174452,331460 eq=0/1 diffs=[-159462] sd_full=0.0 meanA=177340
+blabla.vol002+04.par2              n=  1 hidden_exe_ab71988b62c|Very Useful Subject (2 sz=174452,229676 eq=0/1 diffs=[-59647] sd_full=0.0 meanA=177340
+blabla.vol002+04.par2              n=  1 hidden_exe_ab71988b62c|reftestnzb-obfuscated- sz=174452,255296 eq=0/1 diffs=[-86217] sd_full=0.0 meanA=177340
+blabla.vol002+04.par2              n=  1 ecoji.nzb             |Very Useful Subject (2 sz=331460,229676 eq=0/1 diffs=[99815] sd_full=0.0 meanA=336802
+blabla.vol002+04.par2              n=  1 ecoji.nzb             |reftestnzb-obfuscated- sz=331460,255296 eq=0/1 diffs=[73245] sd_full=0.0 meanA=336802
+blabla.vol002+04.par2              n=  1 Very Useful Subject (2|reftestnzb-obfuscated- sz=229676,255296 eq=0/1 diffs=[-26570] sd_full=0.0 meanA=236987
+blabla.vol006+08.par2              n=  1 reftestnzb_passworded-|reftestnzb-7z-instead- sz=229592,586660 eq=0/1 diffs=[-368316] sd_full=0.0 meanA=237076
+blabla.vol006+08.par2              n=  1 reftestnzb_passworded-|ExclamationMarkInResul sz=229592,268660 eq=0/1 diffs=[-36004] sd_full=0.0 meanA=237076
+blabla.vol006+08.par2              n=  1 reftestnzb_passworded-|hidden_exe_ab71988b62c sz=229592,267704 eq=0/1 diffs=[-34973] sd_full=0.0 meanA=237076
+blabla.vol006+08.par2              n=  1 reftestnzb_passworded-|ecoji.nzb              sz=229592,581912 eq=0/1 diffs=[-354095] sd_full=0.0 meanA=237076
+blabla.vol006+08.par2              n=  1 reftestnzb_passworded-|Very Useful Subject (2 sz=229592,376472 eq=0/1 diffs=[-151284] sd_full=0.0 meanA=237076
+blabla.vol006+08.par2              n=  1 reftestnzb_passworded-|reftestnzb-obfuscated- sz=229592,427060 eq=0/1 diffs=[-203723] sd_full=0.0 meanA=237076
+blabla.vol006+08.par2              n=  1 reftestnzb-7z-instead-|ExclamationMarkInResul sz=586660,268660 eq=0/1 diffs=[332312] sd_full=0.0 meanA=605392
+blabla.vol006+08.par2              n=  1 reftestnzb-7z-instead-|hidden_exe_ab71988b62c sz=586660,267704 eq=0/1 diffs=[333343] sd_full=0.0 meanA=605392
+blabla.vol006+08.par2              n=  1 reftestnzb-7z-instead-|ecoji.nzb              sz=586660,581912 eq=0/1 diffs=[14221] sd_full=0.0 meanA=605392
+blabla.vol006+08.par2              n=  1 reftestnzb-7z-instead-|Very Useful Subject (2 sz=586660,376472 eq=0/1 diffs=[217032] sd_full=0.0 meanA=605392
+blabla.vol006+08.par2              n=  1 reftestnzb-7z-instead-|reftestnzb-obfuscated- sz=586660,427060 eq=0/1 diffs=[164593] sd_full=0.0 meanA=605392
+blabla.vol006+08.par2              n=  1 ExclamationMarkInResul|hidden_exe_ab71988b62c sz=268660,267704 eq=0/1 diffs=[1031] sd_full=0.0 meanA=273080
+blabla.vol006+08.par2              n=  1 ExclamationMarkInResul|ecoji.nzb              sz=268660,581912 eq=0/1 diffs=[-318091] sd_full=0.0 meanA=273080
+blabla.vol006+08.par2              n=  1 ExclamationMarkInResul|Very Useful Subject (2 sz=268660,376472 eq=0/1 diffs=[-115280] sd_full=0.0 meanA=273080
+blabla.vol006+08.par2              n=  1 ExclamationMarkInResul|reftestnzb-obfuscated- sz=268660,427060 eq=0/1 diffs=[-167719] sd_full=0.0 meanA=273080
+blabla.vol006+08.par2              n=  1 hidden_exe_ab71988b62c|ecoji.nzb              sz=267704,581912 eq=0/1 diffs=[-319122] sd_full=0.0 meanA=272049
+blabla.vol006+08.par2              n=  1 hidden_exe_ab71988b62c|Very Useful Subject (2 sz=267704,376472 eq=0/1 diffs=[-116311] sd_full=0.0 meanA=272049
+blabla.vol006+08.par2              n=  1 hidden_exe_ab71988b62c|reftestnzb-obfuscated- sz=267704,427060 eq=0/1 diffs=[-168750] sd_full=0.0 meanA=272049
+blabla.vol006+08.par2              n=  1 ecoji.nzb             |Very Useful Subject (2 sz=581912,376472 eq=0/1 diffs=[202811] sd_full=0.0 meanA=591171
+blabla.vol006+08.par2              n=  1 ecoji.nzb             |reftestnzb-obfuscated- sz=581912,427060 eq=0/1 diffs=[150372] sd_full=0.0 meanA=591171
+blabla.vol006+08.par2              n=  1 Very Useful Subject (2|reftestnzb-obfuscated- sz=376472,427060 eq=0/1 diffs=[-52439] sd_full=0.0 meanA=388360
+blabla.vol014+16.par2              n=  1 reftestnzb_passworded-|ExclamationMarkInResul sz=334700,414904 eq=0/1 diffs=[-76208] sd_full=0.0 meanA=345466
+blabla.vol014+16.par2              n=  1 reftestnzb_passworded-|hidden_exe_ab71988b62c sz=334700,413660 eq=0/1 diffs=[-74820] sd_full=0.0 meanA=345466
+blabla.vol014+16.par2              n=  1 reftestnzb_passworded-|Very Useful Subject (2 sz=334700,628676 eq=0/1 diffs=[-303064] sd_full=0.0 meanA=345466
+blabla.vol014+16.par2              n=  1 ExclamationMarkInResul|hidden_exe_ab71988b62c sz=414904,413660 eq=0/1 diffs=[1388] sd_full=0.0 meanA=421674
+blabla.vol014+16.par2              n=  1 ExclamationMarkInResul|Very Useful Subject (2 sz=414904,628676 eq=0/1 diffs=[-226856] sd_full=0.0 meanA=421674
+blabla.vol014+16.par2              n=  1 hidden_exe_ab71988b62c|Very Useful Subject (2 sz=413660,628676 eq=0/1 diffs=[-228244] sd_full=0.0 meanA=420286
+blabla.vol030+32.par2              n=  1 reftestnzb_passworded-|ExclamationMarkInResul sz=503456,666620 eq=0/1 diffs=[-157915] sd_full=0.0 meanA=519497
+blabla.vol030+32.par2              n=  1 reftestnzb_passworded-|hidden_exe_ab71988b62c sz=503456,665024 eq=0/1 diffs=[-156095] sd_full=0.0 meanA=519497
+blabla.vol030+32.par2              n=  1 ExclamationMarkInResul|hidden_exe_ab71988b62c sz=666620,665024 eq=0/1 diffs=[1820] sd_full=0.0 meanA=677412
+blabla.vol062+64.par2              n=  2 reftestnzb_passworded-|ExclamationMarkInResul sz=799508,1129280 eq=0/2 diffs=[11132, -333740] sd_full=0.0 meanA=412488
+blabla.vol062+64.par2              n=  2 reftestnzb_passworded-|hidden_exe_ab71988b62c sz=799508,1127204 eq=0/2 diffs=[11318, -331495] sd_full=0.0 meanA=412488
+blabla.vol062+64.par2              n=  2 ExclamationMarkInResul|hidden_exe_ab71988b62c sz=1129280,1127204 eq=0/2 diffs=[186, 2245] sd_full=0.0 meanA=573792
+blabla.vol126+74.par2              n=  2 reftestnzb_passworded-|ExclamationMarkInResul sz=879068,1261120 eq=0/2 diffs=[11180, -385571] sd_full=0.0 meanA=453572
+blabla.vol126+74.par2              n=  2 reftestnzb_passworded-|hidden_exe_ab71988b62c sz=879068,1258964 eq=0/2 diffs=[11380, -383205] sd_full=0.0 meanA=453572
+blabla.vol126+74.par2              n=  2 ExclamationMarkInResul|hidden_exe_ab71988b62c sz=1261120,1258964 eq=0/2 diffs=[200, 2366] sd_full=0.0 meanA=640767
+sometestfile-100MB.par2            n=  1 hello world 你好世界 hello|all-missing.nzb        sz=42740,None eq=0/1 diffs=[754] sd_full=0.0 meanA=44186
+sometestfile-100MB.par2            n=  1 hello world 你好世界 hello|reftestnzb_small_post_ sz=42740,11916 eq=0/1 diffs=[31907] sd_full=0.0 meanA=44186
+sometestfile-100MB.par2            n=  1 hello world 你好世界 hello|reftestnzb-password-is sz=42740,None eq=0/1 diffs=[116] sd_full=0.0 meanA=44186
+sometestfile-100MB.par2            n=  1 hello world 你好世界 hello|aaaaaaaaaaaaaaaaaaaaaa sz=42740,None eq=0/1 diffs=[889] sd_full=0.0 meanA=44186
+sometestfile-100MB.par2            n=  1 hello world 你好世界 hello|aaaaaaaaaaaaaaaaaaaaaa sz=42740,41884 eq=0/1 diffs=[754] sd_full=0.0 meanA=44186
+sometestfile-100MB.par2            n=  1 all-missing.nzb       |reftestnzb_small_post_ sz=None,11916 eq=0/1 diffs=[31153] sd_full=0.0 meanA=43432
+sometestfile-100MB.par2            n=  1 all-missing.nzb       |reftestnzb-password-is sz=None,None eq=0/1 diffs=[-638] sd_full=0.0 meanA=43432
+sometestfile-100MB.par2            n=  1 all-missing.nzb       |aaaaaaaaaaaaaaaaaaaaaa sz=None,None eq=0/1 diffs=[135] sd_full=0.0 meanA=43432
+sometestfile-100MB.par2            n=  1 all-missing.nzb       |aaaaaaaaaaaaaaaaaaaaaa sz=None,41884 eq=1/1 diffs=[0] sd_full=0.0 meanA=43432
+sometestfile-100MB.par2            n=  1 reftestnzb_small_post_|reftestnzb-password-is sz=11916,None eq=0/1 diffs=[-31791] sd_full=0.0 meanA=12279
+sometestfile-100MB.par2            n=  1 reftestnzb_small_post_|aaaaaaaaaaaaaaaaaaaaaa sz=11916,None eq=0/1 diffs=[-31018] sd_full=0.0 meanA=12279
+sometestfile-100MB.par2            n=  1 reftestnzb_small_post_|aaaaaaaaaaaaaaaaaaaaaa sz=11916,41884 eq=0/1 diffs=[-31153] sd_full=0.0 meanA=12279
+sometestfile-100MB.par2            n=  1 reftestnzb-password-is|aaaaaaaaaaaaaaaaaaaaaa sz=None,None eq=0/1 diffs=[773] sd_full=0.0 meanA=44070
+sometestfile-100MB.par2            n=  1 reftestnzb-password-is|aaaaaaaaaaaaaaaaaaaaaa sz=None,41884 eq=0/1 diffs=[638] sd_full=0.0 meanA=44070
+sometestfile-100MB.par2            n=  1 aaaaaaaaaaaaaaaaaaaaaa|aaaaaaaaaaaaaaaaaaaaaa sz=None,41884 eq=0/1 diffs=[-135] sd_full=0.0 meanA=43297
+blabla.vol014+16.par2              n=  2 reftestnzb-7z-instead-|ecoji.nzb              sz=1048756,1042364 eq=0/2 diffs=[11456, 11769] sd_full=0.0 meanA=541100
+blabla.vol014+16.par2              n=  2 reftestnzb-7z-instead-|reftestnzb-obfuscated- sz=1048756,728872 eq=0/2 diffs=[-51, 329979] sd_full=0.0 meanA=541100
+blabla.vol014+16.par2              n=  2 ecoji.nzb             |reftestnzb-obfuscated- sz=1042364,728872 eq=0/2 diffs=[-11507, 318210] sd_full=0.0 meanA=529488
+blabla.vol030+32.par2              n=  3 reftestnzb-7z-instead-|ecoji.nzb              sz=1931460,1922816 eq=0/3 diffs=[11734, 11505, 16741] sd_full=114.5 meanA=664443
+blabla.vol062+64.par2              n=  6 reftestnzb-7z-instead-|ecoji.nzb              sz=3655380,3643268 eq=0/6 diffs=[11606, 11406, 11618, 11455, 11647, 13419] sd_full=96.8 meanA=628716
+blabla.vol126+74.par2              n=  6 reftestnzb-7z-instead-|ecoji.nzb              sz=4181140,4168268 eq=0/6 diffs=[11422, 11510, 11400, 11381, 11537, 22722] sd_full=62.0 meanA=719054
+par-files.par2                     n=  1 back_from_future_test_|testfile-10GB-no-rar.n sz=41120,40688 eq=0/1 diffs=[1078] sd_full=0.0 meanA=42560
+postfile.par2                      n=  1 rwx_all_on_777.nzb    |100MB_r__400.nzb       sz=42432,42432 eq=0/1 diffs=[4] sd_full=0.0 meanA=45277
+postfile.par2                      n=  1 rwx_all_on_777.nzb    |Reftestnzb_Some_Subtit sz=42432,40892 eq=0/1 diffs=[3586] sd_full=0.0 meanA=45277
+postfile.par2                      n=  1 100MB_r__400.nzb      |Reftestnzb_Some_Subtit sz=42432,40892 eq=0/1 diffs=[3582] sd_full=0.0 meanA=45273
+postfile.part01.rar                n= 15 rwx_all_on_777.nzb    |100MB_r__400.nzb       sz=10485760,10485760 eq=13/15 diffs=[-1, 0, 0, 0, 0, 0, 0, 0]... sd_full=0.3 meanA=710127
+postfile.part01.rar                n= 15 rwx_all_on_777.nzb    |reftestnzb 100MB vb QU sz=10485760,10485760 eq=0/15 diffs=[-11534, -11475, -11617, -11618, -11647, -11648, -11433, -11407]... sd_full=104.4 meanA=710127
+postfile.part01.rar                n= 15 100MB_r__400.nzb      |reftestnzb 100MB vb QU sz=10485760,10485760 eq=0/15 diffs=[-11533, -11475, -11617, -11618, -11647, -11648, -11433, -11407]... sd_full=104.4 meanA=710127
+postfile.part02.rar                n= 15 rwx_all_on_777.nzb    |100MB_r__400.nzb       sz=10485760,10485760 eq=15/15 diffs=[0, 0, 0, 0, 0, 0, 0, 0]... sd_full=0.0 meanA=710127
+postfile.part02.rar                n= 15 rwx_all_on_777.nzb    |reftestnzb 100MB vb QU sz=10485760,10485760 eq=0/15 diffs=[-11543, -11478, -11282, -11412, -11516, -11545, -11625, -11417]... sd_full=111.5 meanA=710127
+postfile.part02.rar                n= 15 100MB_r__400.nzb      |reftestnzb 100MB vb QU sz=10485760,10485760 eq=0/15 diffs=[-11543, -11478, -11282, -11412, -11516, -11545, -11625, -11417]... sd_full=111.5 meanA=710127
+postfile.part03.rar                n= 15 rwx_all_on_777.nzb    |100MB_r__400.nzb       sz=10485760,10485760 eq=15/15 diffs=[0, 0, 0, 0, 0, 0, 0, 0]... sd_full=0.0 meanA=710127
+postfile.part03.rar                n= 15 rwx_all_on_777.nzb    |reftestnzb 100MB vb QU sz=10485760,10485760 eq=0/15 diffs=[-11398, -11509, -11514, -11465, -11458, -11599, -11494, -11661]... sd_full=87.7 meanA=710127
+postfile.part03.rar                n= 15 100MB_r__400.nzb      |reftestnzb 100MB vb QU sz=10485760,10485760 eq=0/15 diffs=[-11398, -11509, -11514, -11465, -11458, -11599, -11494, -11661]... sd_full=87.7 meanA=710127
+postfile.part04.rar                n= 15 rwx_all_on_777.nzb    |100MB_r__400.nzb       sz=10485760,10485760 eq=15/15 diffs=[0, 0, 0, 0, 0, 0, 0, 0]... sd_full=0.0 meanA=710127
+postfile.part04.rar                n= 15 rwx_all_on_777.nzb    |reftestnzb 100MB vb QU sz=10485760,10485760 eq=0/15 diffs=[-11516, -11612, -11427, -11367, -11537, -11626, -11610, -11634]... sd_full=127.5 meanA=710127
+postfile.part04.rar                n= 15 100MB_r__400.nzb      |reftestnzb 100MB vb QU sz=10485760,10485760 eq=0/15 diffs=[-11516, -11612, -11427, -11367, -11537, -11626, -11610, -11634]... sd_full=127.5 meanA=710127
+postfile.part05.rar                n= 15 rwx_all_on_777.nzb    |100MB_r__400.nzb       sz=10485760,10485760 eq=15/15 diffs=[0, 0, 0, 0, 0, 0, 0, 0]... sd_full=0.0 meanA=710127
+postfile.part05.rar                n= 15 rwx_all_on_777.nzb    |reftestnzb 100MB vb QU sz=10485760,10485760 eq=0/15 diffs=[-11361, -11472, -11481, -11526, -11695, -11636, -11280, -11495]... sd_full=101.5 meanA=710127
+postfile.part05.rar                n= 15 100MB_r__400.nzb      |reftestnzb 100MB vb QU sz=10485760,10485760 eq=0/15 diffs=[-11361, -11472, -11481, -11526, -11695, -11636, -11280, -11495]... sd_full=101.5 meanA=710127
+postfile.part06.rar                n= 15 rwx_all_on_777.nzb    |100MB_r__400.nzb       sz=10485760,10485760 eq=15/15 diffs=[0, 0, 0, 0, 0, 0, 0, 0]... sd_full=0.0 meanA=710127
+postfile.part06.rar                n= 15 rwx_all_on_777.nzb    |reftestnzb 100MB vb QU sz=10485760,10485760 eq=0/15 diffs=[-11379, -11375, -11433, -11594, -11413, -11576, -11443, -11410]... sd_full=87.1 meanA=710127
+postfile.part06.rar                n= 15 100MB_r__400.nzb      |reftestnzb 100MB vb QU sz=10485760,10485760 eq=0/15 diffs=[-11379, -11375, -11433, -11594, -11413, -11576, -11443, -11410]... sd_full=87.1 meanA=710127
+postfile.part07.rar                n= 15 rwx_all_on_777.nzb    |100MB_r__400.nzb       sz=10485760,10485760 eq=15/15 diffs=[0, 0, 0, 0, 0, 0, 0, 0]... sd_full=0.0 meanA=710127
+postfile.part07.rar                n= 15 rwx_all_on_777.nzb    |reftestnzb 100MB vb QU sz=10485760,10485760 eq=0/15 diffs=[-11483, -11594, -11454, -11455, -11428, -11337, -11540, -11651]... sd_full=114.9 meanA=710127
+postfile.part07.rar                n= 15 100MB_r__400.nzb      |reftestnzb 100MB vb QU sz=10485760,10485760 eq=0/15 diffs=[-11483, -11594, -11454, -11455, -11428, -11337, -11540, -11651]... sd_full=114.9 meanA=710127
+postfile.part08.rar                n= 15 rwx_all_on_777.nzb    |100MB_r__400.nzb       sz=10485760,10485760 eq=15/15 diffs=[0, 0, 0, 0, 0, 0, 0, 0]... sd_full=0.0 meanA=710127
+postfile.part08.rar                n= 15 rwx_all_on_777.nzb    |reftestnzb 100MB vb QU sz=10485760,10485760 eq=0/15 diffs=[-11515, -11539, -11506, -11436, -11394, -11476, -11514, -11568]... sd_full=116.9 meanA=710127
+postfile.part08.rar                n= 15 100MB_r__400.nzb      |reftestnzb 100MB vb QU sz=10485760,10485760 eq=0/15 diffs=[-11515, -11539, -11506, -11436, -11394, -11476, -11514, -11568]... sd_full=116.9 meanA=710127
+postfile.part09.rar                n= 15 rwx_all_on_777.nzb    |100MB_r__400.nzb       sz=10485760,10485760 eq=15/15 diffs=[0, 0, 0, 0, 0, 0, 0, 0]... sd_full=0.0 meanA=710127
+postfile.part09.rar                n= 15 rwx_all_on_777.nzb    |reftestnzb 100MB vb QU sz=10485760,10485760 eq=0/15 diffs=[-11551, -11619, -11489, -11429, -11497, -11400, -11418, -11601]... sd_full=73.4 meanA=710127
+postfile.part09.rar                n= 15 100MB_r__400.nzb      |reftestnzb 100MB vb QU sz=10485760,10485760 eq=0/15 diffs=[-11551, -11619, -11489, -11429, -11497, -11400, -11418, -11601]... sd_full=73.4 meanA=710127
+postfile.part10.rar                n=  8 rwx_all_on_777.nzb    |100MB_r__400.nzb       sz=5630012,5651022 eq=7/8 diffs=[0, 0, 0, 0, 0, 0, 0, -21338] sd_full=0.0 meanA=714899
+postfile.vol000+001.par2           n=  1 rwx_all_on_777.nzb    |100MB_r__400.nzb       sz=92672,92672 eq=0/1 diffs=[1] sd_full=0.0 meanA=96320
+postfile.vol001+002.par2           n=  1 rwx_all_on_777.nzb    |100MB_r__400.nzb       sz=142912,142912 eq=0/1 diffs=[-580] sd_full=0.0 meanA=147356
+postfile.vol003+004.par2           n=  1 rwx_all_on_777.nzb    |100MB_r__400.nzb       sz=285708,285708 eq=0/1 diffs=[-1033] sd_full=0.0 meanA=294418
+postfile.vol007+008.par2           n=  1 rwx_all_on_777.nzb    |100MB_r__400.nzb       sz=528984,528984 eq=0/1 diffs=[-2964] sd_full=0.0 meanA=543540
+postfile.vol015+016.par2           n=  2 rwx_all_on_777.nzb    |100MB_r__400.nzb       sz=973220,973220 eq=0/2 diffs=[-4470, -1686] sd_full=0.0 meanA=498474
+postfile.vol031+032.par2           n=  3 rwx_all_on_777.nzb    |100MB_r__400.nzb       sz=1819376,1819376 eq=0/3 diffs=[-4505, -5064, -2777] sd_full=279.5 meanA=619527
+postfile.vol063+064.par2           n=  5 rwx_all_on_777.nzb    |100MB_r__400.nzb       sz=3469372,3469372 eq=0/5 diffs=[-4233, -5151, -4063, -4345, -3781] sd_full=418.1 meanA=707376
+postfile.vol127+073.par2           n=  6 rwx_all_on_777.nzb    |100MB_r__400.nzb       sz=3921532,3921532 eq=0/6 diffs=[-5126, -3976, -4459, -4258, -4729, -1780] sd_full=394.6 meanA=666044
+sometestfile-100MB.vol000+02.par2  n=  1 all-missing.nzb       |reftestnzb-password-is sz=None,None eq=0/1 diffs=[-2897] sd_full=0.0 meanA=192739
+sometestfile-100MB.vol000+02.par2  n=  1 all-missing.nzb       |aaaaaaaaaaaaaaaaaaaaaa sz=None,None eq=0/1 diffs=[5084] sd_full=0.0 meanA=192739
+sometestfile-100MB.vol000+02.par2  n=  1 all-missing.nzb       |aaaaaaaaaaaaaaaaaaaaaa sz=None,188844 eq=1/1 diffs=[0] sd_full=0.0 meanA=192739
+sometestfile-100MB.vol000+02.par2  n=  1 reftestnzb-password-is|aaaaaaaaaaaaaaaaaaaaaa sz=None,None eq=0/1 diffs=[7981] sd_full=0.0 meanA=195636
+sometestfile-100MB.vol000+02.par2  n=  1 reftestnzb-password-is|aaaaaaaaaaaaaaaaaaaaaa sz=None,188844 eq=0/1 diffs=[2897] sd_full=0.0 meanA=195636
+sometestfile-100MB.vol000+02.par2  n=  1 aaaaaaaaaaaaaaaaaaaaaa|aaaaaaaaaaaaaaaaaaaaaa sz=None,188844 eq=0/1 diffs=[-5084] sd_full=0.0 meanA=187655
+sometestfile-100MB.vol014+16.par2  n=  2 all-missing.nzb       |reftestnzb-password-is sz=None,None eq=0/2 diffs=[-11271, -5243] sd_full=0.0 meanA=534399
+sometestfile-100MB.vol014+16.par2  n=  2 all-missing.nzb       |aaaaaaaaaaaaaaaaaaaaaa sz=None,None eq=0/2 diffs=[109, 39688] sd_full=0.0 meanA=534399
+sometestfile-100MB.vol014+16.par2  n=  2 all-missing.nzb       |aaaaaaaaaaaaaaaaaaaaaa sz=None,1050428 eq=2/2 diffs=[0, 0] sd_full=0.0 meanA=534399
+sometestfile-100MB.vol014+16.par2  n=  2 reftestnzb-password-is|aaaaaaaaaaaaaaaaaaaaaa sz=None,None eq=0/2 diffs=[11380, 44931] sd_full=0.0 meanA=542656
+sometestfile-100MB.vol014+16.par2  n=  2 reftestnzb-password-is|aaaaaaaaaaaaaaaaaaaaaa sz=None,1050428 eq=0/2 diffs=[11271, 5243] sd_full=0.0 meanA=542656
+sometestfile-100MB.vol014+16.par2  n=  2 aaaaaaaaaaaaaaaaaaaaaa|aaaaaaaaaaaaaaaaaaaaaa sz=None,1050428 eq=0/2 diffs=[-109, -39688] sd_full=0.0 meanA=514500
+sometestfile-100MB.part5.rar       n= 22 all-missing.nzb       |reftestnzb-password-is sz=None,None eq=0/22 diffs=[-11658, -11716, -11327, -11399, -11582, -11510, -11315, -11655]... sd_full=121.1 meanA=726992
+sometestfile-100MB.part5.rar       n= 22 all-missing.nzb       |aaaaaaaaaaaaaaaaaaaaaa sz=None,None eq=0/22 diffs=[82, 82, 121, 121, 121, 121, 121, 121]... sd_full=17.6 meanA=726992
+sometestfile-100MB.part5.rar       n= 22 all-missing.nzb       |aaaaaaaaaaaaaaaaaaaaaa sz=None,15728640 eq=22/22 diffs=[0, 0, 0, 0, 0, 0, 0, 0]... sd_full=0.0 meanA=726992
+sometestfile-100MB.part5.rar       n= 22 reftestnzb-password-is|aaaaaaaaaaaaaaaaaaaaaa sz=None,None eq=0/22 diffs=[11740, 11798, 11448, 11520, 11703, 11631, 11436, 11776]... sd_full=115.0 meanA=738503
+sometestfile-100MB.part5.rar       n= 22 reftestnzb-password-is|aaaaaaaaaaaaaaaaaaaaaa sz=None,15728640 eq=0/22 diffs=[11658, 11716, 11327, 11399, 11582, 11510, 11315, 11655]... sd_full=121.1 meanA=738503
+sometestfile-100MB.part5.rar       n= 22 aaaaaaaaaaaaaaaaaaaaaa|aaaaaaaaaaaaaaaaaaaaaa sz=None,15728640 eq=0/22 diffs=[-82, -82, -121, -121, -121, -121, -121, -121]... sd_full=17.6 meanA=726882
+sometestfile-100MB.vol006+08.par2  n=  1 all-missing.nzb       |reftestnzb-password-is sz=None,None eq=0/1 diffs=[-9030] sd_full=0.0 meanA=598157
+sometestfile-100MB.vol006+08.par2  n=  1 all-missing.nzb       |aaaaaaaaaaaaaaaaaaaaaa sz=None,None eq=0/1 diffs=[19946] sd_full=0.0 meanA=598157
+sometestfile-100MB.vol006+08.par2  n=  1 all-missing.nzb       |aaaaaaaaaaaaaaaaaaaaaa sz=None,587940 eq=1/1 diffs=[0] sd_full=0.0 meanA=598157
+sometestfile-100MB.vol006+08.par2  n=  1 reftestnzb-password-is|aaaaaaaaaaaaaaaaaaaaaa sz=None,None eq=0/1 diffs=[28976] sd_full=0.0 meanA=607187
+sometestfile-100MB.vol006+08.par2  n=  1 reftestnzb-password-is|aaaaaaaaaaaaaaaaaaaaaa sz=None,587940 eq=0/1 diffs=[9030] sd_full=0.0 meanA=607187
+sometestfile-100MB.vol006+08.par2  n=  1 aaaaaaaaaaaaaaaaaaaaaa|aaaaaaaaaaaaaaaaaaaaaa sz=None,587940 eq=0/1 diffs=[-19946] sd_full=0.0 meanA=578211
+sometestfile-100MB.vol002+04.par2  n=  1 all-missing.nzb       |reftestnzb-password-is sz=None,None eq=0/1 diffs=[-5199] sd_full=0.0 meanA=341990
+sometestfile-100MB.vol002+04.par2  n=  1 all-missing.nzb       |aaaaaaaaaaaaaaaaaaaaaa sz=None,None eq=0/1 diffs=[10012] sd_full=0.0 meanA=341990
+sometestfile-100MB.vol002+04.par2  n=  1 all-missing.nzb       |aaaaaaaaaaaaaaaaaaaaaa sz=None,335804 eq=1/1 diffs=[0] sd_full=0.0 meanA=341990
+sometestfile-100MB.vol002+04.par2  n=  1 reftestnzb-password-is|aaaaaaaaaaaaaaaaaaaaaa sz=None,None eq=0/1 diffs=[15211] sd_full=0.0 meanA=347189
+sometestfile-100MB.vol002+04.par2  n=  1 reftestnzb-password-is|aaaaaaaaaaaaaaaaaaaaaa sz=None,335804 eq=0/1 diffs=[5199] sd_full=0.0 meanA=347189
+sometestfile-100MB.vol002+04.par2  n=  1 aaaaaaaaaaaaaaaaaaaaaa|aaaaaaaaaaaaaaaaaaaaaa sz=None,335804 eq=0/1 diffs=[-10012] sd_full=0.0 meanA=331978
+sometestfile-100MB.part7.rar       n= 15 all-missing.nzb       |reftestnzb-password-is sz=None,None eq=0/15 diffs=[-11582, -11644, -11789, -11537, -11597, -11688, -11466, -11517]... sd_full=139.8 meanA=710970
+sometestfile-100MB.part7.rar       n= 15 all-missing.nzb       |aaaaaaaaaaaaaaaaaaaaaa sz=None,10487096 eq=15/15 diffs=[0, 0, 0, 0, 0, 0, 0, 0]... sd_full=0.0 meanA=710970
+sometestfile-100MB.part7.rar       n= 15 reftestnzb-password-is|aaaaaaaaaaaaaaaaaaaaaa sz=None,10487096 eq=0/15 diffs=[11582, 11644, 11789, 11537, 11597, 11688, 11466, 11517]... sd_full=139.8 meanA=722262
+sometestfile-100MB.part6.rar       n= 22 all-missing.nzb       |reftestnzb-password-is sz=None,None eq=0/22 diffs=[-11622, -11354, -11369, -11491, -11602, -11394, -11676, -11229]... sd_full=117.5 meanA=727004
+sometestfile-100MB.part6.rar       n= 22 all-missing.nzb       |aaaaaaaaaaaaaaaaaaaaaa sz=None,None eq=0/22 diffs=[121, 121, 121, 121, 121, 82, 121, 231]... sd_full=38.9 meanA=727004
+sometestfile-100MB.part6.rar       n= 22 all-missing.nzb       |aaaaaaaaaaaaaaaaaaaaaa sz=None,15728640 eq=22/22 diffs=[0, 0, 0, 0, 0, 0, 0, 0]... sd_full=0.0 meanA=727004
+sometestfile-100MB.part6.rar       n= 22 reftestnzb-password-is|aaaaaaaaaaaaaaaaaaaaaa sz=None,None eq=0/22 diffs=[11743, 11475, 11490, 11612, 11723, 11476, 11797, 11460]... sd_full=107.1 meanA=738471
+sometestfile-100MB.part6.rar       n= 22 reftestnzb-password-is|aaaaaaaaaaaaaaaaaaaaaa sz=None,15728640 eq=0/22 diffs=[11622, 11354, 11369, 11491, 11602, 11394, 11676, 11229]... sd_full=117.5 meanA=738471
+sometestfile-100MB.part6.rar       n= 22 aaaaaaaaaaaaaaaaaaaaaa|aaaaaaaaaaaaaaaaaaaaaa sz=None,15728640 eq=0/22 diffs=[-121, -121, -121, -121, -121, -82, -121, -231]... sd_full=38.9 meanA=726882
+sometestfile-100MB.vol062+64.par2  n=  6 all-missing.nzb       |reftestnzb-password-is sz=None,None eq=0/6 diffs=[-11333, -11523, -11332, -11368, -11140, -1147] sd_full=122.0 meanA=620186
+sometestfile-100MB.vol062+64.par2  n=  6 all-missing.nzb       |aaaaaaaaaaaaaaaaaaaaaa sz=None,3658220 eq=6/6 diffs=[0, 0, 0, 0, 0, 0] sd_full=0.0 meanA=620186
+sometestfile-100MB.vol062+64.par2  n=  6 reftestnzb-password-is|aaaaaaaaaaaaaaaaaaaaaa sz=None,3658220 eq=0/6 diffs=[11333, 11523, 11332, 11368, 11140, 1147] sd_full=122.0 meanA=629826
+sometestfile-100MB.part4.rar       n= 22 all-missing.nzb       |reftestnzb-password-is sz=None,None eq=0/22 diffs=[-11416, -11508, -11453, -11490, -11422, -11545, -11480, -11514]... sd_full=75.3 meanA=726989
+sometestfile-100MB.part4.rar       n= 22 all-missing.nzb       |aaaaaaaaaaaaaaaaaaaaaa sz=None,None eq=0/22 diffs=[122, 82, 121, 121, 121, 121, 82, 121]... sd_full=19.0 meanA=726989
+sometestfile-100MB.part4.rar       n= 22 all-missing.nzb       |aaaaaaaaaaaaaaaaaaaaaa sz=None,15728640 eq=22/22 diffs=[0, 0, 0, 0, 0, 0, 0, 0]... sd_full=0.0 meanA=726989
+sometestfile-100MB.part4.rar       n= 22 reftestnzb-password-is|aaaaaaaaaaaaaaaaaaaaaa sz=None,None eq=0/22 diffs=[11538, 11590, 11574, 11611, 11543, 11666, 11562, 11635]... sd_full=75.8 meanA=738464
+sometestfile-100MB.part4.rar       n= 22 reftestnzb-password-is|aaaaaaaaaaaaaaaaaaaaaa sz=None,15728640 eq=0/22 diffs=[11416, 11508, 11453, 11490, 11422, 11545, 11480, 11514]... sd_full=75.3 meanA=738464
+sometestfile-100MB.part4.rar       n= 22 aaaaaaaaaaaaaaaaaaaaaa|aaaaaaaaaaaaaaaaaaaaaa sz=None,15728640 eq=0/22 diffs=[-122, -82, -121, -121, -121, -121, -82, -121]... sd_full=19.0 meanA=726882
+sometestfile-100MB.vol126+74.par2  n=  6 all-missing.nzb       |reftestnzb-password-is sz=None,None eq=0/6 diffs=[-11155, -11287, -11242, -11304, -11382, -9493] sd_full=74.7 meanA=709238
+sometestfile-100MB.vol126+74.par2  n=  6 all-missing.nzb       |aaaaaaaaaaaaaaaaaaaaaa sz=None,None eq=0/6 diffs=[240, 129, 122, 129, 125, 182730] sd_full=45.6 meanA=709238
+sometestfile-100MB.vol126+74.par2  n=  6 all-missing.nzb       |aaaaaaaaaaaaaaaaaaaaaa sz=None,4184100 eq=6/6 diffs=[0, 0, 0, 0, 0, 0] sd_full=0.0 meanA=709238
+sometestfile-100MB.vol126+74.par2  n=  6 reftestnzb-password-is|aaaaaaaaaaaaaaaaaaaaaa sz=None,None eq=0/6 diffs=[11395, 11416, 11364, 11433, 11507, 192223] sd_full=47.9 meanA=720216
+sometestfile-100MB.vol126+74.par2  n=  6 reftestnzb-password-is|aaaaaaaaaaaaaaaaaaaaaa sz=None,4184100 eq=0/6 diffs=[11155, 11287, 11242, 11304, 11382, 9493] sd_full=74.7 meanA=720216
+sometestfile-100MB.vol126+74.par2  n=  6 aaaaaaaaaaaaaaaaaaaaaa|aaaaaaaaaaaaaaaaaaaaaa sz=None,4184100 eq=0/6 diffs=[-240, -129, -122, -129, -125, -182730] sd_full=45.6 meanA=678659
+sometestfile-100MB.part1.rar       n= 22 all-missing.nzb       |reftestnzb-password-is sz=None,None eq=0/22 diffs=[-11569, -11559, -11576, -11316, -11368, -11481, -11503, -11476]... sd_full=123.9 meanA=726991
+sometestfile-100MB.part1.rar       n= 22 all-missing.nzb       |aaaaaaaaaaaaaaaaaaaaaa sz=None,None eq=0/22 diffs=[90, 82, 109, 82, 121, 138, 121, 82]... sd_full=26.2 meanA=726991
+sometestfile-100MB.part1.rar       n= 22 all-missing.nzb       |aaaaaaaaaaaaaaaaaaaaaa sz=None,15728640 eq=22/22 diffs=[0, 0, 0, 0, 0, 0, 0, 0]... sd_full=0.0 meanA=726991
+sometestfile-100MB.part1.rar       n= 22 reftestnzb-password-is|aaaaaaaaaaaaaaaaaaaaaa sz=None,None eq=0/22 diffs=[11659, 11641, 11685, 11398, 11489, 11619, 11624, 11558]... sd_full=121.8 meanA=738504
+sometestfile-100MB.part1.rar       n= 22 reftestnzb-password-is|aaaaaaaaaaaaaaaaaaaaaa sz=None,15728640 eq=0/22 diffs=[11569, 11559, 11576, 11316, 11368, 11481, 11503, 11476]... sd_full=123.9 meanA=738504
+sometestfile-100MB.part1.rar       n= 22 aaaaaaaaaaaaaaaaaaaaaa|aaaaaaaaaaaaaaaaaaaaaa sz=None,15728640 eq=0/22 diffs=[-90, -82, -109, -82, -121, -138, -121, -82]... sd_full=26.2 meanA=726882
+sometestfile-100MB.part2.rar       n= 22 all-missing.nzb       |reftestnzb-password-is sz=None,None eq=0/22 diffs=[-11517, -11524, -11484, -11559, -11589, -11557, -11418, -11645]... sd_full=106.7 meanA=726990
+sometestfile-100MB.part2.rar       n= 22 all-missing.nzb       |aaaaaaaaaaaaaaaaaaaaaa sz=None,None eq=0/22 diffs=[81, 82, 82, 121, 82, 90, 82, 121]... sd_full=36.3 meanA=726990
+sometestfile-100MB.part2.rar       n= 22 all-missing.nzb       |aaaaaaaaaaaaaaaaaaaaaa sz=None,15728640 eq=22/22 diffs=[0, 0, 0, 0, 0, 0, 0, 0]... sd_full=0.0 meanA=726990
+sometestfile-100MB.part2.rar       n= 22 reftestnzb-password-is|aaaaaaaaaaaaaaaaaaaaaa sz=None,None eq=0/22 diffs=[11598, 11606, 11566, 11680, 11671, 11647, 11500, 11766]... sd_full=111.5 meanA=738437
+sometestfile-100MB.part2.rar       n= 22 reftestnzb-password-is|aaaaaaaaaaaaaaaaaaaaaa sz=None,15728640 eq=0/22 diffs=[11517, 11524, 11484, 11559, 11589, 11557, 11418, 11645]... sd_full=106.7 meanA=738437
+sometestfile-100MB.part2.rar       n= 22 aaaaaaaaaaaaaaaaaaaaaa|aaaaaaaaaaaaaaaaaaaaaa sz=None,15728640 eq=0/22 diffs=[-81, -82, -82, -121, -82, -90, -82, -121]... sd_full=36.3 meanA=726882
+sometestfile-100MB.vol030+32.par2  n=  3 all-missing.nzb       |reftestnzb-password-is sz=None,None eq=0/3 diffs=[-11458, -11059, -7970] sd_full=199.5 meanA=655618
+sometestfile-100MB.vol030+32.par2  n=  3 all-missing.nzb       |aaaaaaaaaaaaaaaaaaaaaa sz=None,None eq=0/3 diffs=[119, 216, 79128] sd_full=48.5 meanA=655618
+sometestfile-100MB.vol030+32.par2  n=  3 all-missing.nzb       |aaaaaaaaaaaaaaaaaaaaaa sz=None,1933620 eq=3/3 diffs=[0, 0, 0] sd_full=0.0 meanA=655618
+sometestfile-100MB.vol030+32.par2  n=  3 reftestnzb-password-is|aaaaaaaaaaaaaaaaaaaaaa sz=None,None eq=0/3 diffs=[11577, 11275, 87098] sd_full=151.0 meanA=665780
+sometestfile-100MB.vol030+32.par2  n=  3 reftestnzb-password-is|aaaaaaaaaaaaaaaaaaaaaa sz=None,1933620 eq=0/3 diffs=[11458, 11059, 7970] sd_full=199.5 meanA=665780
+sometestfile-100MB.vol030+32.par2  n=  3 aaaaaaaaaaaaaaaaaaaaaa|aaaaaaaaaaaaaaaaaaaaaa sz=None,1933620 eq=0/3 diffs=[-119, -216, -79128] sd_full=48.5 meanA=629130
+sometestfile-100MB.part3.rar       n= 22 all-missing.nzb       |reftestnzb-password-is sz=None,None eq=0/22 diffs=[-11683, -11490, -11496, -11554, -11498, -11433, -11417, -11491]... sd_full=114.8 meanA=726996
+sometestfile-100MB.part3.rar       n= 22 all-missing.nzb       |aaaaaaaaaaaaaaaaaaaaaa sz=None,None eq=0/22 diffs=[82, 121, 121, 82, 121, 121, 121, 187]... sd_full=36.1 meanA=726996
+sometestfile-100MB.part3.rar       n= 22 all-missing.nzb       |aaaaaaaaaaaaaaaaaaaaaa sz=None,15728640 eq=22/22 diffs=[0, 0, 0, 0, 0, 0, 0, 0]... sd_full=0.0 meanA=726996
+sometestfile-100MB.part3.rar       n= 22 reftestnzb-password-is|aaaaaaaaaaaaaaaaaaaaaa sz=None,None eq=0/22 diffs=[11765, 11611, 11617, 11636, 11619, 11554, 11538, 11678]... sd_full=97.6 meanA=738440
+sometestfile-100MB.part3.rar       n= 22 reftestnzb-password-is|aaaaaaaaaaaaaaaaaaaaaa sz=None,15728640 eq=0/22 diffs=[11683, 11490, 11496, 11554, 11498, 11433, 11417, 11491]... sd_full=114.8 meanA=738440
+sometestfile-100MB.part3.rar       n= 22 aaaaaaaaaaaaaaaaaaaaaa|aaaaaaaaaaaaaaaaaaaaaa sz=None,15728640 eq=0/22 diffs=[-82, -121, -121, -82, -121, -121, -121, -187]... sd_full=36.1 meanA=726882
+par2files.par2                     n=  1 only-p-passworded.nzb |hp-passworded.nzb      sz=49700,44900 eq=0/1 diffs=[5114] sd_full=0.0 meanA=51504
+par2files.vol002+04.par2           n=  4 only-p-passworded.nzb |hp-passworded.nzb      sz=2289116,2274716 eq=0/4 diffs=[114, 148, -40, 14839] sd_full=81.8 meanA=590598
+par2files.vol006+08.par2           n=  7 only-p-passworded.nzb |hp-passworded.nzb      sz=4478936,4459736 eq=0/7 diffs=[267, 219, 129, 409, 118, 14, 19868] sd_full=125.5 meanA=660375
+par2files.vol000+02.par2           n=  2 only-p-passworded.nzb |hp-passworded.nzb      sz=1169408,1159808 eq=0/2 diffs=[342, 9902] sd_full=0.0 meanA=603469
+par2files.vol014+16.par2           n= 13 only-p-passworded.nzb |hp-passworded.nzb      sz=8808980,8784980 eq=0/13 diffs=[243, 148, -23, 23, 398, -83, 178, -92]... sd_full=157.9 meanA=699249
+par2files.vol030+32.par2           n= 25 only-p-passworded.nzb |hp-passworded.nzb      sz=17419472,17390672 eq=0/25 diffs=[-150, 69, 45, 138, -20, 88, 135, 33]... sd_full=133.3 meanA=718997
+par2files.vol062+64.par2           n= 49 only-p-passworded.nzb |hp-passworded.nzb      sz=34590860,34557260 eq=0/49 diffs=[-53, -230, -25, -19, -82, 14, 32, -239]... sd_full=156.4 meanA=728450
+par2files.vol126+72.par2           n= 55 only-p-passworded.nzb |hp-passworded.nzb      sz=38871308,38837708 eq=0/55 diffs=[-247, 11, 34, 57, -223, 158, -115, 163]... sd_full=162.9 meanA=729291
+mytestpost.vol126+73.par2          n=  6 你好世界.nzb              |test-negative-segment- sz=4149636,4149636 eq=0/6 diffs=[1457828, 1457870, 1457903, 1457864, 1457848, 1150810] sd_full=24.9 meanA=703339
+mytestpost.vol062+64.par2          n=  6 你好世界.nzb              |test-negative-segment- sz=3674760,3674760 eq=0/6 diffs=[1457854, 1457842, 1457882, 1457902, 1457870, 186388] sd_full=21.0 meanA=622978
+mytestpost.vol030+32.par2          n=  3 你好世界.nzb              |test-negative-segment- sz=1943776,1943776 eq=0/3 diffs=[1457894, 1457916, 1038198] sd_full=11.0 meanA=659001
+mytestpost.vol014+16.par2          n=  2 你好世界.nzb              |test-negative-segment- sz=1057016,1057016 eq=0/2 diffs=[1458115, 692950] sd_full=0.0 meanA=537726
+mytestpost.vol006+08.par2          n=  1 你好世界.nzb              |test-negative-segment- sz=592368,592368 eq=0/1 diffs=[1205274] sd_full=0.0 meanA=602637
+mytestpost.vol002+04.par2          n=  1 你好世界.nzb              |test-negative-segment- sz=338776,338776 eq=0/1 diffs=[690088] sd_full=0.0 meanA=345044
+mytestpost.vol000+02.par2          n=  1 你好世界.nzb              |test-negative-segment- sz=190712,190712 eq=0/1 diffs=[389248] sd_full=0.0 meanA=194624
+mytestpost.par2                    n=  1 你好世界.nzb              |test-negative-segment- sz=42648,42648 eq=0/1 diffs=[88429] sd_full=0.0 meanA=44181
+mytestpost.par2                    n=  1 你好世界.nzb              |reftestnzb 1GB - broke sz=42648,None eq=0/1 diffs=[-22354] sd_full=0.0 meanA=44181
+mytestpost.par2                    n=  1 test-negative-segment-|reftestnzb 1GB - broke sz=42648,None eq=0/1 diffs=[-110783] sd_full=0.0 meanA=-44248
+mytestpost.part11.rar              n=  1 你好世界.nzb              |test-negative-segment- sz=1867,1867 eq=0/1 diffs=[5722] sd_full=0.0 meanA=2856
+mytestpost.part10.rar              n= 15 你好世界.nzb              |test-negative-segment- sz=10485760,10485760 eq=0/15 diffs=[1457692, 1457698, 1457698, 1457743, 1457700, 1457700, 1457700, 1457700]... sd_full=11.5 meanA=710825
+mytestpost.part09.rar              n= 15 你好世界.nzb              |test-negative-segment- sz=10485760,10485760 eq=0/15 diffs=[1457692, 1457696, 1457698, 1457700, 1457898, 1457700, 1457700, 1457700]... sd_full=50.8 meanA=710825
+mytestpost.part08.rar              n= 15 你好世界.nzb              |test-negative-segment- sz=10485760,10485760 eq=0/15 diffs=[1457692, 1457698, 1457698, 1457700, 1457698, 1457700, 1457700, 1457700]... sd_full=4.3 meanA=710825
+mytestpost.part07.rar              n= 15 你好世界.nzb              |test-negative-segment- sz=10485760,10485760 eq=0/15 diffs=[1457692, 1457698, 1457698, 1457700, 1457698, 1457700, 1457700, 1457700]... sd_full=16.5 meanA=710825
+mytestpost.part06.rar              n= 15 你好世界.nzb              |test-negative-segment- sz=10485760,10485760 eq=0/15 diffs=[1457692, 1457698, 1457698, 1457700, 1457698, 1457700, 1457700, 1457700]... sd_full=4.2 meanA=710825
+mytestpost.part05.rar              n= 15 你好世界.nzb              |test-negative-segment- sz=10485760,10485760 eq=0/15 diffs=[1457751, 1457698, 1457698, 1457700, 1457698, 1457700, 1457700, 1457900]... sd_full=53.0 meanA=710839
+mytestpost.part04.rar              n= 15 你好世界.nzb              |test-negative-segment- sz=10485760,10485760 eq=0/15 diffs=[1457692, 1457696, 1457698, 1457700, 1457698, 1457700, 1457698, 1457700]... sd_full=4.0 meanA=710825
+mytestpost.part03.rar              n= 15 你好世界.nzb              |test-negative-segment- sz=10485760,10485760 eq=0/15 diffs=[1457765, 1457696, 1457698, 1457759, 1457698, 1457757, 1457700, 1457759]... sd_full=28.9 meanA=710825
+mytestpost.part02.rar              n= 15 你好世界.nzb              |test-negative-segment- sz=10485760,10485760 eq=0/15 diffs=[1457690, 1457698, 1457698, 1457700, 1457757, 1457700, 1457757, 1457700]... sd_full=29.2 meanA=710825
+mytestpost.part01.rar              n= 15 你好世界.nzb              |test-negative-segment- sz=10485760,10485760 eq=0/15 diffs=[1457692, 1457757, 1457698, 1457700, 1457755, 1457700, 1457700, 1457700]... sd_full=21.7 meanA=710825
+archive_name.part21.rar            n= 18 hp-passworded.nzb     |one-missing-article-pa sz=12496862,12496862 eq=18/18 diffs=[0, 0, 0, 0, 0, 0, 0, 0]... sd_full=0.0 meanA=716434
+german-umlauts-etc.vol000+02.par2  n=  1 german-umlauts-10MB.nz|reftestnzb-German-Umla sz=93852,194132 eq=0/1 diffs=[-101661] sd_full=0.0 meanA=99745
+german-umlauts-etc.par2            n=  1 german-umlauts-10MB.nz|reftestnzb-German-Umla sz=41660,44392 eq=0/1 diffs=[-2678] sd_full=0.0 meanA=44594
+german-umlauts-etc.vol002+04.par2  n=  1 german-umlauts-10MB.nz|reftestnzb-German-Umla sz=146044,343872 eq=0/1 diffs=[-200640] sd_full=0.0 meanA=154878
+german-umlauts-etc.vol006+08.par2  n=  1 german-umlauts-10MB.nz|reftestnzb-German-Umla sz=208868,599060 eq=0/1 diffs=[-395937] sd_full=0.0 meanA=220813
+Big.Buck.Bunny.2008.1080p.x264-60f n=497 no_rar_Big.Buck.Bunny.|no_rar__repair_needed_ sz=355856562,355856562 eq=497/497 diffs=[0, 0, 0, 0, 0, 0, 0, 0]... sd_full=0.0 meanA=738762
+somepar2files.par2                 n=  1 RefTestNZB_1234_Bracke|RefTestNZB_2023_Bracke sz=44840,44840 eq=0/1 diffs=[-11] sd_full=0.0 meanA=46380
+somepar2files.vol000+02.par2       n=  1 RefTestNZB_1234_Bracke|RefTestNZB_2023_Bracke sz=195632,195632 eq=0/1 diffs=[8] sd_full=0.0 meanA=201940
+somepar2files.vol002+04.par2       n=  1 RefTestNZB_1234_Bracke|RefTestNZB_2023_Bracke sz=346424,346424 eq=0/1 diffs=[43] sd_full=0.0 meanA=357535
+somepar2files.vol006+08.par2       n=  1 RefTestNZB_1234_Bracke|RefTestNZB_2023_Bracke sz=603272,603272 eq=0/1 diffs=[-146] sd_full=0.0 meanA=622379
+somepar2files.vol014+16.par2       n=  2 RefTestNZB_1234_Bracke|RefTestNZB_2023_Bracke sz=1072232,1072232 eq=0/2 diffs=[122, 9] sd_full=0.0 meanA=553191
+somepar2files.vol030+32.par2       n=  3 RefTestNZB_1234_Bracke|RefTestNZB_2023_Bracke sz=1965416,1965416 eq=0/3 diffs=[318, 77, 37] sd_full=120.5 meanA=676040
+somepar2files.vol062+64.par2       n=  6 RefTestNZB_1234_Bracke|RefTestNZB_2023_Bracke sz=3707048,3707048 eq=0/6 diffs=[-40, 113, 175, -86, -134, -64] sd_full=118.5 meanA=637485
+somepar2files.vol126+72.par2       n=  6 RefTestNZB_1234_Bracke|RefTestNZB_2023_Bracke sz=4131272,4131272 eq=0/6 diffs=[-379, 96, 115, 11, 213, 135] sd_full=205.4 meanA=710459
+blabla.part1.rar                   n= 15 ExclamationMarkInResul|Very Useful Subject (2 sz=10485760,10485760 eq=0/15 diffs=[-11478, -11439, -11380, -11494, -11459, -11506, -11498, -11589]... sd_full=90.4 meanA=710124
+blabla.part2.rar                   n= 15 ExclamationMarkInResul|Very Useful Subject (2 sz=10485760,10485760 eq=0/15 diffs=[-11324, -11689, -11582, -11440, -11398, -11248, -11452, -11276]... sd_full=142.0 meanA=710124
+postfile.part1.rar                 n=  9 Reftestnzb_Some_Subtit|reftestnzb_starrySTARn sz=6291456,6291456 eq=7/9 diffs=[3, 0, 0, 0, 0, 0, 0, 0]... sd_full=1.0 meanA=710125
+postfile.part2.rar                 n=  9 Reftestnzb_Some_Subtit|reftestnzb_starrySTARn sz=6291456,6291456 eq=8/9 diffs=[0, 0, 0, 0, 0, 0, 0, 0]... sd_full=0.0 meanA=710124
+postfile.part3.rar                 n=  5 Reftestnzb_Some_Subtit|reftestnzb_brokenrar_9 sz=3546174,3145728 eq=3/5 diffs=[-1, 0, 0, 0, 406703] sd_full=0.4 meanA=720468
+mypar2.par2                        n=  1 reftestnzb_brokenrar_9|reftestnzb 100MB vb QU sz=41128,45296 eq=0/1 diffs=[-2736] sd_full=0.0 meanA=44061
+windows_users_hate_this.rar        n=  1 windows_user_hate_this|windows_hate_but_unrar sz=4541,4523 eq=0/1 diffs=[19] sd_full=0.0 meanA=4913
+par_stuff.par2                     n=  1 windows_user_hate_this|windows_hate_but_unrar sz=23144,23044 eq=0/1 diffs=[106] sd_full=0.0 meanA=24033
+par_stuff.vol000+01.par2           n=  1 windows_user_hate_this|windows_hate_but_unrar sz=23216,23116 eq=0/1 diffs=[114] sd_full=0.0 meanA=24124
+par_stuff.vol003+04.par2           n=  1 windows_user_hate_this|windows_hate_but_unrar sz=69512,69212 eq=0/1 diffs=[332] sd_full=0.0 meanA=71899
+par_stuff.vol001+02.par2           n=  1 windows_user_hate_this|windows_hate_but_unrar sz=46328,46128 eq=0/1 diffs=[220] sd_full=0.0 meanA=47975
+par_stuff.vol007+08.par2           n=  1 windows_user_hate_this|windows_hate_but_unrar sz=92840,92440 eq=0/1 diffs=[443] sd_full=0.0 meanA=95981
+par_stuff.vol015+16.par2           n=  1 windows_user_hate_this|windows_hate_but_unrar sz=116456,115956 eq=0/1 diffs=[554] sd_full=0.0 meanA=120353
+par_stuff.vol031+32.par2           n=  1 windows_user_hate_this|windows_hate_but_unrar sz=140648,140048 eq=0/1 diffs=[690] sd_full=0.0 meanA=145321
+blabla.vol030+32.par2              n=  2 Very Useful Subject (2|reftestnzb-obfuscated- sz=1091696,1290780 eq=0/2 diffs=[-286, -205463] sd_full=0.0 meanA=563124
+blabla.vol126+74.par2              n=  4 Very Useful Subject (2|reftestnzb-obfuscated- sz=2239868,2698000 eq=0/4 diffs=[-4, -156, -258, -472642] sd_full=104.4 meanA=577703
+12bc4aaa-945c-4040-b886-360b313acc n=  3 reftestnzb-obfuscated-|reftestnzb-obfuscated- sz=1743900,1743900 eq=3/3 diffs=[0, 0, 0] sd_full=0.0 meanA=599258
+22f3d492-eb49-4726-b358-cd038352e9 n= 15 reftestnzb-obfuscated-|reftestnzb-obfuscated- sz=10485760,10485760 eq=15/15 diffs=[0, 0, 0, 0, 0, 0, 0, 0]... sd_full=0.0 meanA=721901
+2bca236f-76a8-49f5-a759-50f39006d1 n= 15 reftestnzb-obfuscated-|reftestnzb-obfuscated- sz=10485760,10485760 eq=15/15 diffs=[0, 0, 0, 0, 0, 0, 0, 0]... sd_full=0.0 meanA=722008
+37de9da2-3bb9-422f-81d1-5bcbd87e9b n= 15 reftestnzb-obfuscated-|reftestnzb-obfuscated- sz=10485760,10485760 eq=15/15 diffs=[0, 0, 0, 0, 0, 0, 0, 0]... sd_full=0.0 meanA=721854
+c02984a9-9f47-4e4a-947e-f0aae62c67 n= 15 reftestnzb-obfuscated-|reftestnzb-obfuscated- sz=10485760,10485760 eq=15/15 diffs=[0, 0, 0, 0, 0, 0, 0, 0]... sd_full=0.0 meanA=721740
+c8d06c81-4233-4327-9fd8-c0ee99a161 n= 15 reftestnzb-obfuscated-|reftestnzb-obfuscated- sz=10485760,10485760 eq=15/15 diffs=[0, 0, 0, 0, 0, 0, 0, 0]... sd_full=0.0 meanA=721777
+c9a09f90-d0fc-438d-af3a-52d48e21db n= 15 reftestnzb-obfuscated-|reftestnzb-obfuscated- sz=10485760,10485760 eq=15/15 diffs=[0, 0, 0, 0, 0, 0, 0, 0]... sd_full=0.0 meanA=721790
