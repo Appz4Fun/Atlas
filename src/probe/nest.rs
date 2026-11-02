@@ -10,7 +10,7 @@ use std::borrow::Cow;
 use serde::{Deserialize, Serialize};
 
 use super::archive::{self, ArchiveHead};
-use super::codec;
+use super::codec::{self, bcj::Filter};
 use super::lzma::{self, End, Props};
 
 /// Layers unwrapped at most. One more found past these is recorded and left shut.
@@ -79,6 +79,10 @@ enum Codec {
         size: Option<u64>,
     },
     Lzma2,
+    /// xz's LZMA2, then the filters in front of it, undone last first
+    Xz {
+        filters: [Option<Filter>; 3],
+    },
     Zstd,
     Bzip2,
     Deflate64,
@@ -180,6 +184,19 @@ fn decode(codec: Codec, input: &[u8], limit: usize) -> (Vec<u8>, End) {
         Codec::Gzip => gunzip(input, limit),
         Codec::Lzma { props, size } => lzma::lzma(input, props, size, limit),
         Codec::Lzma2 => lzma::lzma2(input, limit),
+        Codec::Xz { filters } => {
+            let (mut out, end) = lzma::lzma2(input, limit);
+            let mut last = out.len();
+            for f in filters.iter().rev().flatten() {
+                let done = f.undo(&mut out[..last]);
+                // a branch cut by where decoding stopped can't be undone yet
+                if end != End::Done {
+                    last = done;
+                }
+            }
+            out.truncate(last);
+            (out, end)
+        }
         Codec::Zstd => unzstd(input, limit),
         Codec::Bzip2 => codec::bzip2::bzip2(input, limit),
         Codec::Deflate64 => codec::inflate::deflate64(input, limit),
@@ -479,7 +496,7 @@ fn gunzip(input: &[u8], limit: usize) -> (Vec<u8>, End) {
     }
 }
 
-/// xz: its first block, when its one filter is LZMA2.
+/// xz: its first block, LZMA2 with up to three filters in front.
 fn xz(data: &[u8]) -> Opened {
     let mut layer = Layer { format: "XZ".into(), ..Layer::default() };
     let stop = |layer: Layer, why| Opened { layer, view: View::Stop(why) };
@@ -510,22 +527,40 @@ fn xz(data: &[u8]) -> Opened {
         layer.unpacked = vli(&mut p);
     }
     let mut ids = Vec::new();
+    let mut props = Vec::new();
     for _ in 0..=(flags & 3) {
         let (Some(id), Some(len)) = (vli(&mut p), vli(&mut p)) else { return stop(layer, "damaged") };
-        p += usize::try_from(len).unwrap_or(usize::MAX / 2);
+        let to = usize::try_from(len).ok().and_then(|l| p.checked_add(l));
+        let Some(prop) = to.and_then(|to| header.get(p..to)) else { return stop(layer, "damaged") };
+        p += prop.len();
         ids.push(id);
+        props.push(prop);
     }
     let name = |id: u64| match id {
         0x21 => "lzma2".to_string(),
         0x03 => "delta".to_string(),
-        0x04..=0x0b => "bcj".to_string(),
+        0x04 => "x86".to_string(),
+        0x05 => "powerpc".to_string(),
+        0x06 => "ia64".to_string(),
+        0x07 => "arm".to_string(),
+        0x08 => "armthumb".to_string(),
+        0x09 => "sparc".to_string(),
+        0x0a => "arm64".to_string(),
+        0x0b => "riscv".to_string(),
         _ => format!("filter {id:#x}"),
     };
     layer.method = Some(ids.iter().map(|id| name(*id)).collect::<Vec<_>>().join("+"));
-    if ids != [0x21] {
+    // up to three filters, then LZMA2 last
+    if ids.last() != Some(&0x21) {
         return stop(layer, "no decoder for this filter yet");
     }
-    Opened { layer, view: View::Decode { from: 12 + header_len, codec: Codec::Lzma2 } }
+    let mut filters = [None; 3];
+    for (i, (id, prop)) in ids.iter().zip(&props).take(ids.len() - 1).enumerate() {
+        let Some(f) = Filter::from_xz(*id, prop) else { return stop(layer, "no decoder for this filter yet") };
+        filters[i] = Some(f);
+    }
+    let codec = if ids.len() == 1 { Codec::Lzma2 } else { Codec::Xz { filters } };
+    Opened { layer, view: View::Decode { from: 12 + header_len, codec } }
 }
 
 /// `.lzma`: a properties byte, the dictionary size, the unpacked size, then the stream. No magic number, soo only
