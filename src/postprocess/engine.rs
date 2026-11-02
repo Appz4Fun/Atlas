@@ -961,6 +961,7 @@ impl Inner {
             let attempts_before = row.net_attempts;
             match ran {
                 Ran::Outcome(mut o) => {
+                    self.net_troubles.store(0, Relaxed);
                     batch.holds.extend(o.hold.take());
                     if let Some(until) = o.wait_until {
                         // what it waits for needn't hold up the steps after it
@@ -1110,4 +1111,18 @@ fn seed_shard(conn: &Connection, enabled: StepMask, stamps: &[(u8, StepMask, i64
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_few_bad_articles_dont_rest_the_net_lane_but_a_run_of_them_does() {
+        assert_eq!(net_pause_secs(1), 0);
+        assert_eq!(net_pause_secs(NET_PAUSE_AFTER - 1), 0);
+        assert_eq!(net_pause_secs(NET_PAUSE_AFTER), 1);
+        assert_eq!(net_pause_secs(NET_PAUSE_AFTER + 3), 8);
+        assert_eq!(net_pause_secs(10_000), NET_PAUSE_MAX);
+    }
 }
