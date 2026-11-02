@@ -10,6 +10,7 @@ use std::borrow::Cow;
 use serde::{Deserialize, Serialize};
 
 use super::archive::{self, ArchiveHead};
+use super::codec;
 use super::lzma::{self, End, Props};
 
 /// Layers unwrapped at most. One more found past these is recorded and left shut.
@@ -79,6 +80,10 @@ enum Codec {
     },
     Lzma2,
     Zstd,
+    Bzip2,
+    Deflate64,
+    Lzw,
+    Lz4,
 }
 
 /// A layer found: what to record, and how to go on.
@@ -171,6 +176,10 @@ fn decode(codec: Codec, input: &[u8], limit: usize) -> (Vec<u8>, End) {
         Codec::Lzma { props, size } => lzma::lzma(input, props, size, limit),
         Codec::Lzma2 => lzma::lzma2(input, limit),
         Codec::Zstd => unzstd(input, limit),
+        Codec::Bzip2 => codec::bzip2::bzip2(input, limit),
+        Codec::Deflate64 => codec::inflate::deflate64(input, limit),
+        Codec::Lzw => codec::lzw::uncompress(input, limit),
+        Codec::Lz4 => codec::lz4::lz4(input, limit),
     }
 }
 
@@ -195,7 +204,8 @@ fn open(data: &[u8]) -> Option<Opened> {
         let props = Props { lc: 3, lp: 0, pb: 2 };
         return Some(Opened { layer: l, view: View::Decode { from: 6, codec: Codec::Lzma { props, size: None } } });
     }
-    if data.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) || zstd_skippable(data) {
+    // skippable frames are both zstd's and LZ4's: what follows them says which
+    if data.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) || (zstd_skippable(data) && !lz4_after_skippable(data)) {
         let mut l = layer("ZSTD");
         l.method = Some("zstd".into());
         return Some(Opened { layer: l, view: View::Decode { from: 0, codec: Codec::Zstd } });
@@ -206,21 +216,24 @@ fn open(data: &[u8]) -> Option<Opened> {
     if let Some(opened) = tar(data) {
         return Some(opened);
     }
-    let not_yet = |format: &str| Some(Opened { layer: layer(format), view: View::Stop("no decoder for this yet") });
-    if data.starts_with(b"BZh")
-        && data.get(3).is_some_and(|b| (b'1'..=b'9').contains(b))
-        && data.get(4..10) == Some(b"1AY&SY")
-    {
-        return not_yet("BZIP2");
+    let decode = |format: &str, method: &str, codec| {
+        let layer = Layer { format: format.into(), method: Some(method.into()), ..Layer::default() };
+        Some(Opened { layer, view: View::Decode { from: 0, codec } })
+    };
+    if data.starts_with(b"BZh") && data.get(3).is_some_and(|b| (b'1'..=b'9').contains(b)) {
+        return decode("BZIP2", "bzip2", Codec::Bzip2);
     }
     if data.starts_with(&[0x1f, 0x9d]) {
-        return not_yet("COMPRESS");
+        return decode("COMPRESS", "lzw", Codec::Lzw);
     }
-    if data.starts_with(&[0x04, 0x22, 0x4d, 0x18]) {
-        return not_yet("LZ4");
+    if data.starts_with(&[0x04, 0x22, 0x4d, 0x18])
+        || data.starts_with(&[0x02, 0x21, 0x4c, 0x18])
+        || lz4_after_skippable(data)
+    {
+        return decode("LZ4", "lz4", Codec::Lz4);
     }
     if data.starts_with(b"\x89LZO\0\r\n\x1a\n") {
-        return not_yet("LZOP");
+        return Some(Opened { layer: layer("LZOP"), view: View::Stop("no decoder for this yet") });
     }
     None
 }
@@ -264,6 +277,8 @@ fn from_entries(data: &[u8]) -> Opened {
         let to = end(head.packed);
         match method {
             "deflate" => View::Decode { from: at, codec: Codec::Deflate },
+            "deflate64" => View::Decode { from: at, codec: Codec::Deflate64 },
+            "bzip2" => View::Decode { from: at, codec: Codec::Bzip2 },
             "zstd" => View::Decode { from: at, codec: Codec::Zstd },
             "lzma" => match zip_lzma(&data[at..to]) {
                 Some((skip, props)) => {
@@ -341,6 +356,22 @@ fn seven_z(data: &[u8]) -> Opened {
 /// A zstd skippable frame, which a stream can open with before its real one.
 fn zstd_skippable(data: &[u8]) -> bool {
     data.get(1..4) == Some(&[0x2a, 0x4d, 0x18][..]) && data[0] & 0xf0 == 0x50
+}
+
+/// Whether the first frame after a run of skippable frames is an LZ4 one.
+fn lz4_after_skippable(data: &[u8]) -> bool {
+    let mut p = 0usize;
+    for _ in 0..64 {
+        let Some(rest) = data.get(p..) else { return false };
+        if !zstd_skippable(rest) {
+            return rest.starts_with(&[0x04, 0x22, 0x4d, 0x18]) || rest.starts_with(&[0x02, 0x21, 0x4c, 0x18]);
+        }
+        let Some(size) = rest.get(4..8).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize) else {
+            return false;
+        };
+        p = p.saturating_add(8).saturating_add(size);
+    }
+    false
 }
 
 /// Whether `data` starts the way something [`open`] reads does, without opening it.

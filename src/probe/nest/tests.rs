@@ -239,14 +239,14 @@ fn methods_not_decoded_yet_say_so() {
     let n = unwrap(&r);
     assert_eq!(formats(&n), ["RAR5 m3"]);
     assert_eq!(n.layers[0].stop.as_deref(), Some("no decoder for this yet"));
-    let mut bz = b"BZh91AY&SY".to_vec();
-    bz.extend([0; 20]);
-    let n = unwrap(&bz);
-    assert_eq!(n.layers[0].format, "BZIP2");
+    let mut lzo = b"\x89LZO\0\r\n\x1a\n".to_vec();
+    lzo.extend([0; 20]);
+    let n = unwrap(&lzo);
+    assert_eq!(n.layers[0].format, "LZOP");
     assert_eq!(n.layers[0].stop.as_deref(), Some("no decoder for this yet"));
-    let z = zip_entry(12, "movie.mkv", &[1, 2, 3], 3);
+    let z = zip_entry(98, "movie.mkv", &[1, 2, 3], 3);
     let n = unwrap(&z);
-    assert_eq!(formats(&n), ["ZIP bzip2"]);
+    assert_eq!(formats(&n), ["ZIP ppmd"]);
     assert_eq!(n.layers[0].stop.as_deref(), Some("no decoder for this yet"));
 }
 
@@ -438,4 +438,32 @@ fn a_pax_size_stands_for_the_next_file() {
     t.extend(&v);
     let n = unwrap(&t);
     assert!(n.layers[0].name.as_ref().unwrap().len() <= 512 * 3);
+}
+
+#[test]
+fn bzip2_compress_lz4_and_deflate64() {
+    let want = include_bytes!("../../../tests/fixtures/nest/mixed.bin");
+    for (packed, format) in [
+        (&include_bytes!("../../../tests/fixtures/nest/mixed.bz2")[..], "BZIP2 bzip2"),
+        (include_bytes!("../../../tests/fixtures/nest/mixed.Z"), "COMPRESS lzw"),
+        (include_bytes!("../../../tests/fixtures/nest/mixed.lz4"), "LZ4 lz4"),
+    ] {
+        let n = unwrap(packed);
+        assert_eq!(formats(&n), [format]);
+        same(&n.inner, want);
+    }
+    let d64 = include_bytes!("../../../tests/fixtures/nest/mixed.deflate64");
+    let z = zip_entry(9, "mixed.bin", d64, want.len());
+    let n = unwrap(&z);
+    assert_eq!(formats(&n), ["ZIP deflate64"]);
+    same(&n.inner, want);
+    let bz = include_bytes!("../../../tests/fixtures/nest/mixed.bz2");
+    let z = zip_entry(12, "mixed.bin", bz, want.len());
+    same(&unwrap(&z).inner, want);
+    // LZ4 behind a skippable frame is still LZ4, not zstd
+    let mut skipped = vec![0x5a, 0x2a, 0x4d, 0x18, 3, 0, 0, 0, 1, 2, 3];
+    skipped.extend_from_slice(include_bytes!("../../../tests/fixtures/nest/mixed.lz4"));
+    let n = unwrap(&skipped);
+    assert_eq!(formats(&n), ["LZ4 lz4"]);
+    same(&n.inner, want);
 }
