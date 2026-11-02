@@ -461,9 +461,12 @@ impl Step for LinkStep {
                     more = true;
                     break;
                 };
-                match missing.iter().position(|want| seen.is(want)) {
-                    Some(at) => found.push((candidate, missing.remove(at))),
-                    None => tried.push(candidate.id),
+                let fits: Vec<usize> = (0..missing.len()).filter(|&at| seen.is(missing[at])).collect();
+                match fits[..] {
+                    [at] => found.push((candidate, missing.remove(at))),
+                    [] => tried.push(candidate.id),
+                    // by its size alone it could be any of them: it's left for a run that can read its first bytes
+                    _ => {}
                 }
             }
         }
@@ -474,9 +477,12 @@ impl Step for LinkStep {
         } else {
             None
         };
+        // a row that isn't one of the files read so far may be one of those not read yet
+        let tried = if unknown == 0 { tried } else { Vec::new() };
         let mut writes: Vec<StepWrite> =
             tried.iter().map(|other| StepWrite::new(TRIED, vec![id.into(), (*other).into()])).collect();
-        let looks_for = wanted.len() as i64 + unknown;
+        // every file of the set, the ones too small or too alike to look for too: the upload isn't whole without them
+        let looks_for = inventory.files.len() as i64 + unknown;
         if found.is_empty() {
             // what it looks for may be known better now
             if let Some(lead) = mine {
