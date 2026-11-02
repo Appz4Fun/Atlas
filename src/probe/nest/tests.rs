@@ -260,10 +260,9 @@ fn methods_not_decoded_yet_say_so() {
         rar4(&[r4_main(0), [r4_block(0x74, flags, &fields, Some(data.len() as u32)), data.to_vec()].concat()])
     };
     let zeros = [0u8; 64];
-    for (version, flags, data, why) in [
-        (40, 0, &zeros, "no decoder for this yet"),
-        (29, 1, &zeros, "starts in the volume before"),
-    ] {
+    for (version, flags, data, why) in
+        [(40, 0, &zeros, "no decoder for this yet"), (29, 1, &zeros, "starts in the volume before")]
+    {
         let r = rar4_m3(version, flags, data);
         let n = unwrap(&r);
         assert_eq!(formats(&n), ["RAR4 m3"]);
