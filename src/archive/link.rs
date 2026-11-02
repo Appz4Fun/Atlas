@@ -27,7 +27,8 @@ use super::{ARTICLE_CAP, NAME_SOURCE_PAR2, select};
 pub const LINK_STEP: StepId = StepId(7);
 
 /// Each row of a linked upload, the lead's own included, and the row it's linked to. A row of the files repaired keeps
-/// which of the set's files it is (its file id in the set), and a recovery row how many of them its set has to look for.
+/// which of the set's files it is (its file id in the set), and a recovery row how many of them its set has to look for,
+/// and its set's id when the set's list of files was sealed by it.
 pub const UPLOAD_LINK: ShardTable = ShardTable {
     name: "upload_link",
     create: "create table if not exists upload_link (
@@ -35,7 +36,8 @@ pub const UPLOAD_LINK: ShardTable = ShardTable {
         lead_id    INTEGER NOT NULL,
         recovery   INTEGER NOT NULL DEFAULT 0,
         par2_file  BLOB,
-        wanted     INTEGER
+        wanted     INTEGER,
+        set_id     BLOB
     )",
     indexes: &[("upload_link_lead", "create index if not exists upload_link_lead on upload_link(lead_id)")],
     release_key: Some("release_id"),
@@ -74,12 +76,13 @@ pub const LINK_DATA: &str = concat!(
     ", 0, ?3)
     on conflict(release_id) do update set lead_id = excluded.lead_id, recovery = 0, par2_file = excluded.par2_file"
 );
-/// ?1 a row of recovery data, ?2 its lead, ?3 how many files its set looks for
+/// ?1 a row of recovery data, ?2 its lead, ?3 how many files its set looks for, ?4 its sealed set's id
 pub const LINK_RECOVERY: &str = concat!(
-    "insert into upload_link (release_id, lead_id, recovery, wanted) values (?1, ",
+    "insert into upload_link (release_id, lead_id, recovery, wanted, set_id) values (?1, ",
     lead_now!("?2"),
-    ", 1, ?3)
-    on conflict(release_id) do update set lead_id = excluded.lead_id, recovery = 1, wanted = excluded.wanted"
+    ", 1, ?3, ?4)
+    on conflict(release_id) do update set lead_id = excluded.lead_id, recovery = 1, wanted = excluded.wanted,
+        set_id = excluded.set_id"
 );
 const TRIED: &str = "insert into upload_link_tried (release_id, candidate_id) values (?1, ?2) on conflict do nothing";
 /// A recovery volume isn't a copy of the files it repairs, whatever its set's list made it look like.
@@ -246,7 +249,12 @@ impl LinkStep {
     /// add its files to a release people download by its name. What the article count must be for those sizes is
     /// weighed here too, roughly, soo a busy group's other rows don't crowd the real one out of the limit; `parts_fit`
     /// then weighs each closely.
-    fn candidates(&self, ctx: &StepCtx<'_>, sizes: (u64, u64)) -> Result<Vec<Candidate>, StepError> {
+    fn candidates(
+        &self,
+        ctx: &StepCtx<'_>,
+        sizes: (u64, u64),
+        set: Option<[u8; 16]>,
+    ) -> Result<Vec<Candidate>, StepError> {
         let me = ctx.release();
         let Some(posted) = me.posted_date.clone() else { return Ok(Vec::new()) };
         let span = ID_WINDOW * crate::store::SHARDS as i64;
@@ -263,7 +271,8 @@ impl LinkStep {
                    and not exists (select 1 from upload_link_tried t where t.release_id = ?3 and t.candidate_id = r.id)
                    and r.size > 0 and r.parts > 0
                    and ((r.is_obfuscated = 1 and r.display_name is null)
-                        or exists (select 1 from upload_link l where l.release_id = r.id and l.lead_id = r.id))
+                        or exists (select 1 from upload_link m where m.lead_id = r.id and m.recovery = 1
+                                   and m.set_id = ?10))
                    and f.expected between ?8 * 1.005 * r.parts / r.size - 2 and ?9 * 1.08 * r.parts / r.size + 2
                  order by abs(julianday(r.posted_date) - julianday(?5))
                  limit ?7",
@@ -280,7 +289,8 @@ impl LinkStep {
                     DAY_WINDOW,
                     MAX_CANDIDATES as i64,
                     sizes.0 as f64,
-                    sizes.1 as f64
+                    sizes.1 as f64,
+                    set.map(|id| id.to_vec())
                 ],
                 |r| {
                     Ok(Candidate {
@@ -434,15 +444,27 @@ impl Step for LinkStep {
         // a set read only in part may have more files than it shows: the link can't call itself whole, and it looks
         // again for the rest of the list
         let unknown = i64::from(!inventory.complete);
+        let set = sealed_set(&inventory, &wanted);
         let mut missing: Vec<&Par2File> = wanted.iter().copied().filter(|f| !have.contains(&f.file_id[..])).collect();
         let (mut found, mut tried, mut more) = (Vec::new(), Vec::new(), false);
         if !missing.is_empty() {
             let sizes = missing.iter().fold((u64::MAX, 0), |(least, most), f| (least.min(f.size), most.max(f.size)));
-            let mut candidates = self.candidates(ctx, sizes)?;
-            candidates.retain(|c| !members.contains(&c.id));
-            candidates.sort_by(|a, b| a.apart.total_cmp(&b.apart));
-            let mut checks = 0;
+            let mut candidates = self.candidates(ctx, sizes, set)?;
+            candidates.retain(|c| {
+                !members.contains(&c.id)
+                    && c.file.expected.is_some_and(|expected| {
+                        missing.iter().any(|want| parts_fit(want.size, expected, c.bytes, c.parts))
+                    })
+            });
+            // rows whose first article is indexed go first: those can tell apart files of the same size, where a later
+            // article only gives the size
+            let mut ordered = Vec::with_capacity(candidates.len());
             for candidate in candidates {
+                ordered.push((first_article(ctx, &candidate.file)?.is_none(), candidate));
+            }
+            ordered.sort_by(|(a_later, a), (b_later, b)| a_later.cmp(b_later).then(a.apart.total_cmp(&b.apart)));
+            let mut checks = 0;
+            for (_, candidate) in ordered {
                 if missing.is_empty() {
                     break;
                 }
@@ -486,7 +508,10 @@ impl Step for LinkStep {
         if found.is_empty() {
             // what it looks for may be known better now
             if let Some(lead) = mine {
-                writes.push(StepWrite::new(LINK_RECOVERY, vec![id.into(), lead.into(), looks_for.into()]));
+                writes.push(StepWrite::new(
+                    LINK_RECOVERY,
+                    vec![id.into(), lead.into(), looks_for.into(), set.map(|id| id.to_vec()).into()],
+                ));
             }
             return Ok(Outcome { matched: mine.is_some(), writes, wait_until, ..Default::default() });
         }
@@ -518,11 +543,22 @@ impl Step for LinkStep {
             writes
                 .push(StepWrite::new(LINK_DATA, vec![candidate.id.into(), lead.into(), file.file_id.to_vec().into()]));
         }
-        writes.push(StepWrite::new(LINK_RECOVERY, vec![id.into(), lead.into(), looks_for.into()]));
+        writes.push(StepWrite::new(
+            LINK_RECOVERY,
+            vec![id.into(), lead.into(), looks_for.into(), set.map(|id| id.to_vec()).into()],
+        ));
         writes.push(StepWrite::new(CLEAR_CONTENT, vec![id.into()]));
         writes.extend(self.lead_writes(ctx, lead, &inventory.files));
         Ok(Outcome { matched: true, writes, wait_until, ..Default::default() })
     }
+}
+
+/// The set the files looked for all belong to, when its own id seals its list of them. Only a volume of that set can
+/// join an upload already linked: anyone can post a set that lists a file of someone else's upload, but not one with
+/// that upload's set id and a file of their own.
+fn sealed_set(inventory: &par2::Inventory, wanted: &[&Par2File]) -> Option<[u8; 16]> {
+    let set = wanted.first()?.set_id;
+    wanted.iter().all(|f| f.set_id == set && inventory.sealed.contains(&(set, f.file_id))).then_some(set)
 }
 
 /// The one value a query of one id gives, if it gives a row.
@@ -626,15 +662,15 @@ mod tests {
         let (sample, mkv, vol_a, vol_b) = (8i64, 16i64, 24i64, 32i64);
         // one volume finds only the sample, and it leads
         write(&conn, LINK_DATA, vec![sample.into(), sample.into(), vec![1u8; 16].into()]);
-        write(&conn, LINK_RECOVERY, vec![vol_a.into(), sample.into(), 2i64.into()]);
+        write(&conn, LINK_RECOVERY, vec![vol_a.into(), sample.into(), 2i64.into(), rusqlite::types::Value::Null]);
         // another finds both: the bigger file leads, and the sample's upload goes with it
         write(&conn, MOVE_UPLOAD, vec![sample.into(), mkv.into()]);
         write(&conn, LINK_DATA, vec![mkv.into(), mkv.into(), vec![2u8; 16].into()]);
-        write(&conn, LINK_RECOVERY, vec![vol_b.into(), mkv.into(), 2i64.into()]);
+        write(&conn, LINK_RECOVERY, vec![vol_b.into(), mkv.into(), 2i64.into(), rusqlite::types::Value::Null]);
         assert_eq!(links(&conn), [(sample, mkv), (mkv, mkv), (vol_a, mkv), (vol_b, mkv)]);
         // a run that still thinks the sample leads links to where its upload went
         write(&conn, LINK_DATA, vec![sample.into(), sample.into(), vec![1u8; 16].into()]);
-        write(&conn, LINK_RECOVERY, vec![vol_a.into(), sample.into(), 2i64.into()]);
+        write(&conn, LINK_RECOVERY, vec![vol_a.into(), sample.into(), 2i64.into(), rusqlite::types::Value::Null]);
         assert_eq!(links(&conn), [(sample, mkv), (mkv, mkv), (vol_a, mkv), (vol_b, mkv)]);
     }
 

@@ -3,6 +3,7 @@
 
 use std::sync::LazyLock;
 
+use md5::Digest;
 use regex::Regex;
 
 use crate::archive::names::{best_name, clean_name};
@@ -46,6 +47,9 @@ pub struct Inventory {
     pub complete: bool,
     /// a packet ran past the data
     pub truncated: bool,
+    /// (set id, file id) from each Main packet whose body hashes to its set id: a set whose list of files can't have
+    /// been added to without changing its id
+    pub sealed: Vec<([u8; 16], [u8; 16])>,
 }
 
 fn id_at(b: &[u8], at: usize) -> Option<[u8; 16]> {
@@ -94,7 +98,11 @@ pub fn inventory(data: &[u8]) -> Inventory {
             saw_main = true;
             inv.block_size = inv.block_size.or(u64_at(body, 0).filter(|size| *size > 0));
             let ids = body.get(12..).unwrap_or(&[]);
+            let sealed = <[u8; 16]>::from(md5::Md5::digest(body)) == set_id;
             for id in ids.as_chunks::<16>().0.iter().take(MAX_FILES) {
+                if sealed && inv.sealed.len() < MAX_FILES && !inv.sealed.contains(&(set_id, *id)) {
+                    inv.sealed.push((set_id, *id));
+                }
                 if mains.len() < MAX_FILES && !mains.contains(&(set_id, *id)) {
                     mains.push((set_id, *id));
                 }
@@ -236,6 +244,24 @@ mod tests {
             body.push(0);
         }
         packet(set, UNICODE, &body)
+    }
+
+    #[test]
+    fn a_main_whose_body_hashes_to_its_set_id_seals_its_list() {
+        let mut body = vec![0u8; 8];
+        body.extend(1u32.to_le_bytes());
+        body.extend([7u8; 16]);
+        let id: [u8; 16] = md5::Md5::digest(&body).into();
+        let mut real = Vec::new();
+        real.extend_from_slice(MAGIC);
+        real.extend_from_slice(&((HEADER_LEN + body.len()) as u64).to_le_bytes());
+        real.extend_from_slice(&[0u8; 16]);
+        real.extend_from_slice(&id);
+        real.extend_from_slice(MAIN);
+        real.extend_from_slice(&body);
+        assert_eq!(inventory(&real).sealed, [(id, [7u8; 16])]);
+        // a set id that isn't its Main's hash seals nothing
+        assert!(inventory(&main_packet(1, &[7])).sealed.is_empty());
     }
 
     #[test]
