@@ -591,6 +591,9 @@ fn image(path: &str, base: &str) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
+/// The most titles a pass looks at per shard, newest first: ids come from what's posted, soo there can be any number.
+const MAX_TITLES_PER_SHARD: i64 = 100_000;
+
 /// Every title with an id, newest first, once each.
 fn known_titles() -> rusqlite::Result<Vec<(i64, Ids)>> {
     let conn = crate::db::open()?;
@@ -599,7 +602,7 @@ fn known_titles() -> rusqlite::Result<Vec<(i64, Ids)>> {
         let sql = format!(
             "select max(release_id), kind, tmdb_id, imdb_id, tvdb_id, trakt_id from s{s}.media_release
              where tmdb_id is not null or imdb_id is not null or tvdb_id is not null
-             group by kind, tmdb_id, imdb_id, tvdb_id, trakt_id"
+             group by kind, tmdb_id, imdb_id, tvdb_id, trakt_id order by 1 desc limit {MAX_TITLES_PER_SHARD}"
         );
         // a shard from before media has none
         let Ok(mut stmt) = conn.prepare(&sql) else { continue };
