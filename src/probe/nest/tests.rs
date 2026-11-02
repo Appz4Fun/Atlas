@@ -1,7 +1,9 @@
 use std::io::Write;
 
 use super::*;
-use crate::archive::testkit::{r4_file, r4_main, r5_block, r5_end, r5_file, r5_main, rar4, rar5, sz_wrap, vint};
+use crate::archive::testkit::{
+    r4_block, r4_file, r4_file_fields, r4_main, r5_block, r5_end, r5_file, r5_main, rar4, rar5, sz_wrap, vint,
+};
 
 /// The start of a Matroska file, then filler: what sits at the bottom of the chain.
 fn video() -> Vec<u8> {
@@ -233,11 +235,19 @@ fn the_budget_covers_every_layer_together() {
 #[test]
 fn methods_not_decoded_yet_say_so() {
     let v = video();
+    // a RAR5 algorithm version past RAR 7's
     let fields =
-        [&vint(0)[..], &vint(v.len() as u64), &vint(0x20), &vint(3 << 7), &[0], &vint(9), b"movie.mkv"].concat();
+        [&vint(0)[..], &vint(v.len() as u64), &vint(0x20), &vint(3 << 7 | 2), &[0], &vint(9), b"movie.mkv"].concat();
     let r = rar5(&[r5_main(), r5_block(2, &fields, &[], Some(&v)), r5_end()]);
     let n = unwrap(&r);
     assert_eq!(formats(&n), ["RAR5 m3"]);
+    assert_eq!(n.layers[0].stop.as_deref(), Some("a RAR algorithm newer than this knows"));
+    // RAR4's own compression comes in a later change
+    let mut fields = r4_file_fields(b"movie.mkv", v.len() as u32);
+    fields[14] = 0x33;
+    let r = rar4(&[r4_main(0), [r4_block(0x74, 0, &fields, Some(v.len() as u32)), v.clone()].concat()]);
+    let n = unwrap(&r);
+    assert_eq!(formats(&n), ["RAR4 m3"]);
     assert_eq!(n.layers[0].stop.as_deref(), Some("no decoder for this yet"));
     let mut lzo = b"\x89LZO\0\r\n\x1a\n".to_vec();
     lzo.extend([0; 20]);
@@ -466,4 +476,16 @@ fn bzip2_compress_lz4_and_deflate64() {
     let n = unwrap(&skipped);
     assert_eq!(formats(&n), ["LZ4 lz4"]);
     same(&n.inner, want);
+}
+
+#[test]
+fn compressed_rar5_goes_on_down() {
+    let data = include_bytes!("../../../tests/fixtures/rar5/m3_default.rar");
+    let n = unwrap(data);
+    assert_eq!(formats(&n), ["RAR5 m3"]);
+    assert!(n.layers[0].stop.is_none());
+    assert_eq!(n.inner.len() as u64, n.layers[0].unpacked.unwrap());
+    // the same file at m5 decodes the same
+    let m5 = include_bytes!("../../../tests/fixtures/rar5/m5_max.rar");
+    same(&unwrap(m5).inner, &n.inner);
 }
