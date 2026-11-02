@@ -1,0 +1,20 @@
+1178649029 0 giganews.com                       sv3-Bf 0000021b 1ee150cf 4640c1c5 00000000 9d63c4d8 00000000 hp-dnVLNfINYXN3bnZ2dnUVZ_gCdnZ2d
+1178720012 0 giganews.com                       sv3-kD 00000cfe 1b8fb6f4 4641d70c 00000000 5163c4d8 00000033 Y5GdnWkrEoaRStzbnZ2dnUVZ_syunZ2d
+1178726710 0 giganews.com                       sv3-BV 00001ef7 0e1b10c5 4641f136 00000000 9163c4d8 00000000 aoOdnViNhpOrbNzbnZ2dnUVZ_gydnZ2d
+1178740178 0 giganews.com                       sv3-yo 0000183b 1c54f60f 464225d2 00000000 7363c4d8 00000036 poWdnZJryYFPuN_bnZ2dnUVZ_u6rnZ2d
+1178750559 0 giganews.com                       sv3-tV 000068bc 0750d790 46424e5f 00000000 4c63c4d8 00000032 IfWdnQ1KzZrC09_bnZ2dnUVZ_tGvnZ2d
+1178815955 1 giganews.com                       sv3-dc 00000548 4d1a8ebe 46434dd4 00000000 2263c4d8 00000035 1ZidnSMTh9BJ0N7bnZ2dnUVZ_r-onZ2d
+1178890140 0 giganews.com                       sv3-e2 00006ac7 27d813d1 46446f9c 00000000 8f63c4d8 00000000 WvednUyORboB8tnbnZ2dnUVZ_hKdnZ2d
+1178890412 0 giganews.com                       sv3-Mz 00001540 4085a5e8 464470ac 00000000 8063c4d8 00000034 3YidnXU4GN0x7dnbnZ2dnUVZ_h2pnZ2d
+1178924445 1 giganews.com                       sv3-Oc 00005b0b 679dbd08 4644f59e 00000000 9663c4d8 00000000 lsadnZUgAPoDaNnbnZ2dnUVZ_gudnZ2d
+1179464184 0 comcast.com        68.85.146.73    sv3-DY 00007292 7452190b 464d31f8 00000000 5063c4d8 00000032 D--dnZaEz-llrNDbnZ2dnUVZ_s2vnZ2d
+1179515250 0 comcast.com        68.85.146.73    sv3-v6 00000a94 6b328fab 464df972 00000000 a763c4d8 00000000 CZednTYSr_bvZNDbnZ2dnUVZ_jqdnZ2d
+1179618942 0 comcast.com        68.85.146.73    sv3-Vn 000058d7 1448efdc 464f8e7e 00000000 9f63c4d8 00000000 SsWdnUFy1YnjE9LbnZ2dnUVZ_gKdnZ2d
+1179944760 0 giganews.com                       sv3-0p 00007799 52c9bce1 46548738 00000000 5463c4d8 00000035 BOqdnXwhVM-lGsnbnZ2dnUVZ_smonZ2d
+1180021017 0 giganews.com                       sv3-vI 00000518 44cdc5e2 4655b119 00000000 4e63c4d8 0000003b hZidnX9YUNmELMjbnZ2dnUVZ_tOmnZ2d
+1180114106 0 giganews.com                       sv3-yo 0000236b 5e6594bb 46571cba 00000000 3a63c4d8 0000003b 9r6dnSYJ-MMngcrbnZ2dnUVZ_qemnZ2d
+1181762294 0 comcast.com        68.85.146.73    sv3-SK 00000539 13f53cca 467042f6 00000000 1f63c4d8 0000003a pJidnVehaI5r3-3bnZ2dnUVZ_oKnnZ2d
+1272759404 0 giganews.com                       sv3-eW 000020da 270c4fb8 4bdcc46c 00000000 3463c4d8 00000000 R72dnSXSkbrxWUHWnZ2dnUVZ_qmdnZ2d
+1272759819 0 giganews.com                       sv3-g8 000020da 270c4fb9 4bdcc60b 00000000 3463c4d8 9d9d9d9d R72dnSTSkbqWW0HWnZ2dnUVZ_qkAAAAA
+1274396980 0 giganews.com                       sv3-gz 00002989 3a1c70ca 4bf5c134 00000000 1c63c4d8 00000000 FLSdnVftgaepXGjWnZ2dnUVZ_oGdnZ2d
+1318897585 0 speakeasy.net      66.92.67.196    sv3-yf 000005cf 797ad62a 4e9cc7b1 00000000 9463c4d8 00000000 UpidnbdL5-QsWgHTnZ2dnUVZ_gmdnZ2d
