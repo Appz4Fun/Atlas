@@ -129,6 +129,15 @@ families! {
     BACKFILL_CHUNKS "atlas_backfill_chunks" Gauge &[], "Backfill day chunks: done, total, done_last_hour.";
     BACKFILL_GROUPS "atlas_backfill_groups" Gauge &[], "Groups with day chunks: all, splitting.";
 
+    // the sealed log, see `sealed_store`; calls are timed as functions sealed_log.*
+    SEALED_LOG_CONNECTS "atlas_sealed_log_connects_total" Counter &[], "Connections made to the sealed log service, by result.";
+    SEALED_LOG_OFFLOAD_FILES "atlas_sealed_log_offload_files_total" Counter &[], "Files whose blob went to the sealed log (moved), or changed meanwhile and stayed (changed).";
+    SEALED_LOG_OFFLOAD_BYTES "atlas_sealed_log_offload_bytes_total" Counter &[], "Blob bytes sent to the sealed log, and the bytes the swaps took out of the shards (freed).";
+    SEALED_LOG_OFFLOAD_FAILURES "atlas_sealed_log_offload_failures_total" Counter &[], "Offload batches that failed, and blobs that came back different (mismatch).";
+    SEALED_LOG_OFFLOAD_STATE "atlas_sealed_log_offload_state" Gauge &[], "1 for what the offload is doing now: moving, throttled, retrying, resting.";
+    SEALED_LOG_THROTTLED "atlas_sealed_log_offload_throttled_milliseconds_total" Counter &[], "Time the offload waited to stay under offload_mb_per_second.";
+    SEALED_LOG_SWEEP "atlas_sealed_log_sweep" Gauge &[], "The offload's sweeps: shards, shards_left, and the last one's bytes, seconds and timestamp.";
+
     // the catalog scan, see `catalog`
     CATALOG_RELEASES "atlas_catalog_releases" Gauge &[], "Releases in the catalog, by state.";
     CATALOG_BYTES "atlas_catalog_bytes" Gauge &[], "Total size of the catalog's releases.";

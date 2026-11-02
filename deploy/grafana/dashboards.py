@@ -501,7 +501,118 @@ def system():
     return b
 
 
-BOARDS = [overview, content, nntp, functions, pipeline, system]
+def sealed_log():
+    b = Board("atlas-sealed-log", "Atlas: Sealed log",
+              "The sealed log service and the offload feeding it: throughput, latency on both ends of the wire, and the disk. "
+              "Service numbers come from job sealed-log, Atlas's from job atlas.")
+    svc = 'job="sealed-log"'
+    client = 'function=~"sealed_log.(fetch|verify|append)"'
+
+    def mean(sum_, count):
+        return f"sum(rate({sum_}[5m])) / sum(rate({count}[5m]))"
+
+    b.row("At a glance")
+    b.stat("Service", f"up{{{svc}}}", w=2, thresholds=[{"color": "text", "value": None}], mappings=UP_MAP)
+    b.stat("Log size", f"sealed_log_bytes{{{svc}}}", "bytes", w=3)
+    b.stat("Disk free", f'sealed_log_filesystem_bytes{{{svc},kind="avail"}}', "bytes", w=3)
+    b.stat("Disk used", f'1 - sealed_log_filesystem_bytes{{{svc},kind="avail"}} / ignoring(kind) sealed_log_filesystem_bytes{{{svc},kind="size"}}',
+           "percentunit", w=3, thresholds=[{"color": "green", "value": None}, {"color": "orange", "value": 0.8}, {"color": "red", "value": 0.95}])
+    b.stat("Writing now", f"rate(sealed_log_bytes_appended_total{{{svc}}}[5m])", "Bps", w=3)
+    b.stat("Reading now", f"rate(sealed_log_bytes_read_total{{{svc}}}[5m])", "Bps", w=3)
+    b.stat("Freed from shards in range", 'sum(increase(atlas_sealed_log_offload_bytes_total{kind="freed"}[$__range]))', "bytes", w=4,
+           description="Blob bytes the swaps took out of the shards. SQLite gives the space back only after a VACUUM.")
+    b.stat("Errors in range",
+           f"(sum(increase(sealed_log_request_errors_total{{{svc}}}[$__range])) or vector(0))"
+           f" + (sum(increase(sealed_log_commit_failures_total{{{svc}}}[$__range])) or vector(0))"
+           " + (sum(increase(atlas_sealed_log_offload_failures_total[$__range])) or vector(0))", w=3, thresholds=GOOD_BAD,
+           description="Failed requests and commits in the service, and failed offload batches in Atlas.")
+
+    b.row("Throughput")
+    b.graph("Bytes per second in the service", [
+        q(f"rate(sealed_log_bytes_appended_total{{{svc}}}[5m])", "written"),
+        q(f"rate(sealed_log_bytes_read_total{{{svc}}}[5m])", "read"),
+    ], "Bps", w=8, description="Value bytes, without the 20-byte record headers.")
+    b.graph("Network bytes per second", [
+        q(f"rate(sealed_log_network_bytes_total{{{svc}}}[5m])", "service {{direction}}"),
+        q(f'sum by (function, direction) (rate(atlas_function_bytes_total{{{client}}}[5m]))', "atlas {{function}} {{direction}}"),
+    ], "Bps", w=8, description="What crosses the wire. Verify reads a whole batch back, so offloading costs twice its bytes on the network.")
+    b.graph("Offload per second", [
+        q('sum by (kind) (rate(atlas_sealed_log_offload_bytes_total[5m]))', "{{kind}}"),
+    ], "Bps", w=8, description="Sent: blob bytes appended. Freed: what left the shards (sent less changed blobs and the 21-byte places).")
+    b.graph("Values per second", [
+        q(f"rate(sealed_log_values_appended_total{{{svc}}}[5m])", "appended"),
+        q(f"rate(sealed_log_values_read_total{{{svc}}}[5m])", "read"),
+    ], w=8)
+    b.graph("Requests per second", [q(f"sum by (op) (rate(sealed_log_requests_total{{{svc}}}[5m]))", "{{op}}")], w=8)
+    b.graph("Group commits", [
+        q(f"rate(sealed_log_commits_total{{{svc}}}[5m])", "commits per second"),
+        q(f"rate(sealed_log_commit_appends_total{{{svc}}}[5m]) / rate(sealed_log_commits_total{{{svc}}}[5m])", "appends per commit"),
+    ], w=8, description="Appends that arrive together share one fdatasync. More per commit means the disk is the limit.")
+
+    b.row("Latency")
+    for op in ("append", "read"):
+        b.graph(f"{op.title()}: time in the service", [
+            q(f'histogram_quantile({p}, sum by (le) (rate(sealed_log_request_duration_seconds_bucket{{{svc},op="{op}"}}[5m])))', f"p{int(p * 100)}")
+            for p in (0.5, 0.95, 0.99)
+        ], "s", w=8)
+    b.graph("Time Atlas waits, per call", [
+        q(f'histogram_quantile(0.95, sum by (function, le) (rate(atlas_function_duration_seconds_bucket{{{client}}}[5m])))', "{{function}} p95"),
+        q(f'histogram_quantile(0.5, sum by (function, le) (rate(atlas_function_duration_seconds_bucket{{{client}}}[5m])))', "{{function}} p50"),
+    ], "s", w=8, description="Connecting, the network and the service together. fetch is a reader's one blob; append and verify are offload batches.")
+    def overhead(functions, op):
+        waits = mean(f'atlas_function_duration_seconds_sum{{function=~"{functions}"}}',
+                     f'atlas_function_duration_seconds_count{{function=~"{functions}"}}')
+        spends = mean(f'sealed_log_request_duration_seconds_sum{{{svc},op="{op}"}}',
+                      f'sealed_log_request_duration_seconds_count{{{svc},op="{op}"}}')
+        return q(f"({waits}) - ({spends})", op)
+
+    b.graph("Network overhead per call (mean)", [overhead("sealed_log.append", "append"), overhead("sealed_log.(fetch|verify)", "read")],
+            "s", w=8, description="What Atlas waits less what the service spends: the wire, both TCP stacks, and connecting. "
+                                  "The disk's own time is in the next panel.")
+    b.graph("Disk: fdatasync and reads", [
+        q(f'histogram_quantile({p}, sum by (le) (rate(sealed_log_fdatasync_duration_seconds_bucket{{{svc}}}[5m])))', f"fdatasync p{int(p * 100)}")
+        for p in (0.5, 0.95, 0.99)
+    ] + [
+        q(f'histogram_quantile(0.95, sum by (le) (rate(sealed_log_disk_read_duration_seconds_bucket{{{svc}}}[5m])))', "read one value p95"),
+    ], "s", w=8, description="The disk itself, with nothing of the network in it.")
+    b.graph("Waiting for the writer", [
+        q(f'histogram_quantile({p}, sum by (le) (rate(sealed_log_queue_duration_seconds_bucket{{{svc}}}[5m])))', f"p{int(p * 100)}")
+        for p in (0.5, 0.95, 0.99)
+    ], "s", w=8, description="An append queued behind the commit in progress. Growing waits mean writes come faster than the disk takes them.")
+
+    b.row("Disk")
+    b.graph("Log size", [q(f"sealed_log_bytes{{{svc}}}", "log")], "bytes", w=8)
+    b.graph("Data disk", [
+        q(f'sealed_log_filesystem_bytes{{{svc},kind="size"}} - ignoring(kind) sealed_log_filesystem_bytes{{{svc},kind="free"}}', "used"),
+        q(f'sealed_log_filesystem_bytes{{{svc},kind="avail"}}', "available"),
+    ], "bytes", stacked=True, w=8)
+    b.stat("Segments", f"sealed_log_segments{{{svc}}}", w=4)
+    b.stat("Days until the disk fills", f'sealed_log_filesystem_bytes{{{svc},kind="avail"}} / ignoring(kind) (deriv(sealed_log_bytes{{{svc}}}[6h]) * 86400) > 0',
+           "d", w=4, description="At the rate the log grew over the last 6 hours.")
+
+    b.row("Offload")
+    b.graph("What the offload is doing", [q("max by (state) (atlas_sealed_log_offload_state)", "{{state}}")], stacked=True, w=8)
+    b.graph("Files per minute", [q("sum by (result) (rate(atlas_sealed_log_offload_files_total[5m])) * 60", "{{result}}")], stacked=True, w=8,
+            description="Changed: more articles were sealed into the blob while it was on its way, so it stays local and its copy goes unused.")
+    b.graph("Share of time throttled", [q("rate(atlas_sealed_log_offload_throttled_milliseconds_total[5m]) / 1000", "throttled")], "percentunit", w=8,
+            description="Waiting to stay under offload_mb_per_second. Near 0 means the network or the service is the limit, not the setting.")
+    b.graph("Sweep", [q('atlas_sealed_log_sweep{kind=~"shards|shards_left"}', "{{kind}}")], w=8)
+    b.stat("Last sweep finished", 'atlas_sealed_log_sweep{kind="last_done_timestamp_seconds"} * 1000', "dateTimeFromNow", w=4)
+    b.stat("Last sweep moved", 'atlas_sealed_log_sweep{kind="last_bytes"}', "bytes", w=4)
+    b.graph("Failures", [
+        q("sum by (kind) (increase(atlas_sealed_log_offload_failures_total[5m]))", "offload {{kind}}"),
+        q(f"sum by (op) (increase(sealed_log_request_errors_total{{{svc}}}[5m]))", "service {{op}}"),
+        q(f"increase(sealed_log_checksum_failures_total{{{svc}}}[5m])", "checksum"),
+        q('sum by (result) (increase(atlas_sealed_log_connects_total{result="failed"}[5m]))', "connect failed"),
+    ], bars=True, w=12)
+    b.graph("Connections", [
+        q(f"sealed_log_connections{{{svc}}}", "open at the service"),
+        q('sum by (role) (increase(atlas_sealed_log_connects_total[5m]))', "new from {{role}}"),
+    ], w=12)
+    return b
+
+
+BOARDS = [overview, content, nntp, functions, pipeline, system, sealed_log]
 
 
 def build():

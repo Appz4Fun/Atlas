@@ -17,6 +17,7 @@ use rusqlite::params;
 use sealed_log::{Client, Locator};
 
 use crate::config::SealedLogConfig;
+use crate::metrics::{self, names};
 use crate::store;
 
 static ADDR: RwLock<String> = RwLock::new(String::new());
@@ -45,8 +46,18 @@ pub fn configure(addr: &str) {
     *ADDR.write().unwrap() = addr.to_string();
 }
 
-/// A connection-using call, with one retry on a new connection.
-fn with_client<T>(call: impl Fn(&mut Client) -> Result<T>) -> Result<T> {
+/// A connection-using call, with one retry on a new connection, timed as
+/// `function` (connecting included, which is what a caller waits for).
+fn with_client<T>(function: &'static str, call: impl Fn(&mut Client) -> Result<T>) -> Result<T> {
+    let span = metrics::span(function);
+    let result = with_client_unmeasured(call);
+    if result.is_err() {
+        span.failed();
+    }
+    result
+}
+
+fn with_client_unmeasured<T>(call: impl Fn(&mut Client) -> Result<T>) -> Result<T> {
     let addr = ADDR.read().unwrap().clone();
     if addr.is_empty() {
         return Err(Error::new(ErrorKind::NotConnected, "article is in the sealed log, and sealed_log.addr isn't set"));
@@ -54,7 +65,10 @@ fn with_client<T>(call: impl Fn(&mut Client) -> Result<T>) -> Result<T> {
     CLIENT.with_borrow_mut(|slot| {
         for attempt in 0..2 {
             if slot.as_ref().is_none_or(|(at, _)| *at != addr) {
-                *slot = Some((addr.clone(), Client::connect(&addr)?));
+                let connected = Client::connect(&addr);
+                let result = if connected.is_ok() { "ok" } else { "failed" };
+                names::SEALED_LOG_CONNECTS.inc(&[("result", result)], 1);
+                *slot = Some((addr.clone(), connected?));
             }
             match call(&mut slot.as_mut().expect("just set").1) {
                 // the service answered: it means this
@@ -72,7 +86,8 @@ fn with_client<T>(call: impl Fn(&mut Client) -> Result<T>) -> Result<T> {
 
 /// A blob from the sealed log.
 pub fn fetch(at: Locator) -> Result<Vec<u8>> {
-    let mut values = with_client(|c| c.read(&[at]))?;
+    let mut values = with_client("sealed_log.fetch", |c| c.read(&[at]))?;
+    metrics::function_bytes("sealed_log.fetch", "received", at.len as u64);
     values.pop().ok_or_else(|| Error::new(ErrorKind::InvalidData, "no value"))
 }
 
@@ -112,20 +127,35 @@ pub fn offload_batch(shard: &Path, after: i64) -> anyhow::Result<(Option<i64>, u
     let Some(last) = batch.last().map(|b| b.0) else { return Ok((None, 0)) };
 
     let values: Vec<(u64, &[u8])> = batch.iter().map(|(id, b)| (*id as u64, &b[..])).collect();
-    let places = with_client(|c| c.append(&values))?;
+    let places = with_client("sealed_log.append", |c| c.append(&values))?;
+    metrics::function_bytes("sealed_log.append", "sent", bytes as u64);
+    // in the log now, whatever happens next: a retry sends it again
+    names::SEALED_LOG_OFFLOAD_BYTES.inc(&[("kind", "sent")], bytes as u64);
     // only what comes back the same replaces anything
-    let back = with_client(|c| c.read(&places))?;
+    let back = with_client("sealed_log.verify", |c| c.read(&places))?;
+    metrics::function_bytes("sealed_log.verify", "received", bytes as u64);
     for ((id, blob), value) in batch.iter().zip(&back) {
+        if blob != value {
+            names::SEALED_LOG_OFFLOAD_FAILURES.inc(&[("kind", "mismatch")], 1);
+        }
         anyhow::ensure!(blob == value, "file {id} came back from the sealed log different");
     }
 
-    swap_in(&conn, &batch, &places)?;
+    let (swapped, changed, freed) = metrics::timed("sealed_log.swap", || swap_in(&conn, &batch, &places))?;
+    names::SEALED_LOG_OFFLOAD_FILES.inc(&[("result", "moved")], swapped);
+    names::SEALED_LOG_OFFLOAD_FILES.inc(&[("result", "changed")], changed);
+    names::SEALED_LOG_OFFLOAD_BYTES.inc(&[("kind", "freed")], freed);
     Ok((Some(last), bytes as u64))
 }
 
 /// Each blob replaced by its place. Taking the write lock up front, and waiting
 /// for it here, keeps a busy writer from wasting the appends already made.
-fn swap_in(conn: &rusqlite::Connection, batch: &[(i64, Vec<u8>)], places: &[Locator]) -> rusqlite::Result<()> {
+/// Returns the files swapped, the ones that changed meanwhile, and the bytes freed.
+fn swap_in(
+    conn: &rusqlite::Connection,
+    batch: &[(i64, Vec<u8>)],
+    places: &[Locator],
+) -> rusqlite::Result<(u64, u64, u64)> {
     let mut tries = 0;
     loop {
         match conn.execute_batch("begin immediate") {
@@ -139,16 +169,22 @@ fn swap_in(conn: &rusqlite::Connection, batch: &[(i64, Vec<u8>)], places: &[Loca
         }
     }
     let swapped = (|| {
+        let (mut swapped, mut changed, mut freed) = (0u64, 0u64, 0u64);
         // a blob that changed meanwhile (more articles sealed into it) keeps its
         // new self, and its copy in the log goes unused
         let mut swap = conn.prepare_cached("update files set blob = ? where id = ? and blob = ?")?;
         for ((id, blob), at) in batch.iter().zip(places) {
-            swap.execute(params![at.to_ref(), id, blob])?;
+            if swap.execute(params![at.to_ref(), id, blob])? > 0 {
+                swapped += 1;
+                freed += (blob.len() - sealed_log::REF_BYTES) as u64;
+            } else {
+                changed += 1;
+            }
         }
-        Ok(())
+        Ok((swapped, changed, freed))
     })();
     match swapped {
-        Ok(()) => conn.execute_batch("commit"),
+        Ok(counts) => conn.execute_batch("commit").map(|()| counts),
         Err(e) => {
             let _ = conn.execute_batch("rollback");
             Err(e)
@@ -204,14 +240,27 @@ fn sweep(main: &Path, mb_per_second: u64, stop: &AtomicBool, once: bool) -> u64 
     };
     let mut moved = 0u64;
     let mut reported = Instant::now();
+    let mut sweep_started = Instant::now();
+    // there from the start: a series that starts at its first failure doesnt show it as an increase
+    names::SEALED_LOG_OFFLOAD_FAILURES.inc(&[("kind", "batch")], 0);
+    names::SEALED_LOG_OFFLOAD_FAILURES.inc(&[("kind", "mismatch")], 0);
     while !stop.load(Ordering::Relaxed) {
-        if cursors.iter().all(Option::is_none) {
+        let left = cursors.iter().filter(|c| c.is_some()).count();
+        names::SEALED_LOG_SWEEP.set(&[("kind", "shards_left")], left as f64);
+        names::SEALED_LOG_SWEEP.set(&[("kind", "shards")], shards.len() as f64);
+        if left == 0 {
             if once {
                 return moved;
             }
             println!("sealed log: sweep done, {moved} bytes moved");
+            names::SEALED_LOG_SWEEP
+                .set(&[("kind", "last_done_timestamp_seconds")], chrono::Utc::now().timestamp() as f64);
+            names::SEALED_LOG_SWEEP.set(&[("kind", "last_bytes")], moved as f64);
+            names::SEALED_LOG_SWEEP.set(&[("kind", "last_seconds")], sweep_started.elapsed().as_secs_f64());
+            set_state("resting");
             moved = 0;
             nap(SWEEP_EVERY);
+            sweep_started = Instant::now();
             cursors = vec![Some(0); shards.len()];
             continue;
         }
@@ -221,7 +270,8 @@ fn sweep(main: &Path, mb_per_second: u64, stop: &AtomicBool, once: bool) -> u64 
                 return moved;
             }
             let started = Instant::now();
-            match offload_batch(shard, after) {
+            set_state("moving");
+            match metrics::timed("sealed_log.offload_batch", || offload_batch(shard, after)) {
                 Ok((last, bytes)) => {
                     moved += bytes;
                     *cursor = last;
@@ -230,17 +280,33 @@ fn sweep(main: &Path, mb_per_second: u64, stop: &AtomicBool, once: bool) -> u64 
                         println!("{moved} bytes moved");
                     }
                     let _ = std::fs::write(cursor_path(shard), last.unwrap_or(0).to_string());
-                    nap(Duration::from_secs_f64(bytes as f64 / budget).saturating_sub(started.elapsed()));
+                    let rest = Duration::from_secs_f64(bytes as f64 / budget).saturating_sub(started.elapsed());
+                    if !rest.is_zero() {
+                        set_state("throttled");
+                        names::SEALED_LOG_THROTTLED.inc(&[], rest.as_millis() as u64);
+                    }
+                    nap(rest);
                 }
                 Err(e) => {
                     // nothing was swapped, and the rows and blobs stay as they are
                     eprintln!("sealed log: {} not moved yet: {e:#}", shard.display());
+                    names::SEALED_LOG_OFFLOAD_FAILURES.inc(&[("kind", "batch")], 1);
+                    set_state("retrying");
                     nap(RETRY);
                 }
             }
         }
     }
     moved
+}
+
+/// What the move is doing now, as a 1 among its states.
+fn set_state(now: &str) {
+    names::SEALED_LOG_OFFLOAD_STATE.replace(
+        ["moving", "throttled", "retrying", "resting"]
+            .into_iter()
+            .map(|s| (format!("state=\"{s}\""), if s == now { 1.0 } else { 0.0 })),
+    );
 }
 
 /// Starts the move, when the config asks for it. The indexer doesn't wait on it.
@@ -340,6 +406,19 @@ mod tests {
 
         // the next sweep has nothing to do
         assert_eq!(offload_batch(&shard, 0).unwrap(), (None, 0));
+
+        // and what it did is on /metrics
+        let out = crate::metrics::render();
+        for line in [
+            "atlas_function_duration_seconds_count{function=\"sealed_log.append\"}",
+            "atlas_function_duration_seconds_count{function=\"sealed_log.verify\"}",
+            "atlas_function_duration_seconds_count{function=\"sealed_log.fetch\"}",
+            "atlas_sealed_log_offload_files_total{result=\"moved\"}",
+            "atlas_sealed_log_offload_bytes_total{kind=\"freed\"}",
+            "atlas_sealed_log_connects_total{result=\"ok\"}",
+        ] {
+            assert!(out.contains(line), "{line} in {out}");
+        }
 
         // the service gone: an error to report, not a wrong answer
         let place = read(1);
