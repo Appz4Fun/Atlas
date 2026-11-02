@@ -350,7 +350,9 @@ fn known_start(data: &[u8]) -> bool {
         &[0x02, 0x21, 0x4c, 0x18],
         b"\x89LZO\0\r\n\x1a\n",
     ];
-    MAGIC.iter().any(|m| data.starts_with(m)) || data.get(..512).is_some_and(tar_checksum_ok)
+    MAGIC.iter().any(|m| data.starts_with(m))
+        || data.get(..512).is_some_and(tar_checksum_ok)
+        || lzma_alone(data).is_some()
 }
 
 /// gzip's header, with the original file's name when it kept one, then raw deflate.

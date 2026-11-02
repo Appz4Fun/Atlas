@@ -355,3 +355,16 @@ fn a_rar5_name_stays_inside_its_header() {
     let heads = crate::probe::archive::entries(&r);
     assert!(heads.iter().all(|h| h.name.is_none()));
 }
+
+#[test]
+fn a_7z_copy_of_a_lzma_stream_goes_on_down() {
+    let inner = lzma_alone_of(&video());
+    let mut z = b"7z\xbc\xaf\x27\x1c\x00\x04".to_vec();
+    z.extend([0; 4]);
+    z.extend((inner.len() as u64).to_le_bytes());
+    z.extend([0; 12]);
+    z.extend(inner);
+    let n = unwrap(&z);
+    assert_eq!(formats(&n), ["7z copy", "LZMA lzma"]);
+    same(&n.inner, &video());
+}
