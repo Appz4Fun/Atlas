@@ -86,6 +86,9 @@ struct Filters {
     old_lengths: Vec<u32>,
     last: usize,
     pending: Vec<Pending>,
+    /// filter bytes still allowed: filters that don't overlap cover each byte once, so more than the output and
+    /// one filter's memory is work no real file asks for
+    work: usize,
 }
 
 struct Tables {
@@ -148,6 +151,7 @@ fn run(st: &mut State<'_>, size: usize, limit: usize, out: &mut Vec<u8>) -> Resu
     let (dbase, dbits) = distances();
     let goal = size.min(limit);
     let target = size.min(limit.saturating_add(VM_MEM));
+    st.filters.work = target.saturating_add(VM_MEM);
     let mut tables = read_tables(st)?;
     loop {
         if out.len() >= target {
@@ -502,6 +506,7 @@ fn add_vm_code(f: &mut Filters, first: u32, code: &[u8], at: usize) -> Result<()
         f.kinds[pos] = kind_of(&prg);
     }
     pos = pos.min(f.kinds.len() - 1);
+    f.work = f.work.checked_sub(len as usize).ok_or(Stop::Cut)?;
     f.pending.push(Pending { kind: f.kinds[pos], start: at + start, len: len as usize, regs });
     Ok(())
 }
