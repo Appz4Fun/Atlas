@@ -5,3 +5,4 @@ pub mod inflate;
 pub mod lz4;
 pub mod lzw;
 pub mod rar5;
+mod rarbits;
