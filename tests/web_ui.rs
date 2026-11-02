@@ -67,9 +67,11 @@ fn the_web_ui_end_to_end() {
     }
     db::create_db().unwrap();
     let main = home.path().join("atlas.db");
-    for (name, group) in
-        [("Tv.Findword.S01E01-GRP", "alt.binaries.g1"), ("<script>alert(1)</script>", "alt.binaries.g2")]
-    {
+    for (name, group) in [
+        ("Tv.Findword.S01E01-GRP", "alt.binaries.g1"),
+        ("<script>alert(1)</script>", "alt.binaries.g2"),
+        ("Film.Findword.2024.2160p.WEB-DL.DV.H265-GRP", "alt.binaries.g3"),
+    ] {
         store::save(&main, &[Release { group: group.into(), ..release_of(name, "x.bin", 2, 2) }]).unwrap();
     }
     let shard = db::open_shard(&store::shard_path(&main, store::shard_of("alt.binaries.g1"))).unwrap();
@@ -121,6 +123,13 @@ fn the_web_ui_end_to_end() {
     assert!(found.body.contains("class=\"chip\""), "{}", found.body);
     let filtered = fetch(port, "/ui/results?q=Findword&filters=2160p", &cookie);
     assert!(!filtered.body.contains("Tv.Findword"), "not 2160p: {}", filtered.body);
+    assert!(filtered.body.contains("Film.Findword"), "2160p: {}", filtered.body);
+    // with no words, the newest are filtered: no search for each way a tag is written
+    let newest = fetch(port, "/ui/results?filters=2160p,DV", &cookie);
+    assert!(newest.body.contains("Film.Findword") && !newest.body.contains("Tv.Findword"), "{}", newest.body);
+    assert!(newest.body.contains("aria-current=\"true\">DV<"), "the chip shows it's on: {}", newest.body);
+    let none = fetch(port, "/ui/results?q=Findword&filters=Remux", &cookie);
+    assert!(none.body.contains("nothing matches"), "{}", none.body);
     assert_eq!(
         fetch(port, "/ui/results?q=Findword&filters=2160p", &cookie).header("HX-Push-Url").as_deref(),
         Some("/?q=Findword&filters=2160p")
@@ -138,6 +147,8 @@ fn the_web_ui_end_to_end() {
     assert!(sorted.body.contains("sort=name&amp;dir=asc"), "the heading flips: {}", sorted.body);
     let by_group = fetch(port, "/ui/results?group=alt.binaries.g1", &cookie);
     assert!(by_group.body.contains("Findword") && by_group.body.contains("1 release"), "{}", by_group.body);
+    let by_group_uhd = fetch(port, "/ui/results?group=alt.binaries.g1&filters=2160p", &cookie);
+    assert!(!by_group_uhd.body.contains("1 release"), "no total that counts hidden rows: {}", by_group_uhd.body);
     assert!(!by_group.body.contains("alert(1)"), "{}", by_group.body);
     assert_eq!(by_group.header("HX-Push-Url").as_deref(), Some("/?group=alt.binaries.g1"));
 
@@ -172,7 +183,7 @@ fn the_web_ui_end_to_end() {
     assert!(twins.body.contains("Twins 1") && twins.body.contains("Tv.Findword"), "{}", twins.body);
     assert!(twins.body.contains("/ui/release?id=") && twins.body.contains("TWIN"), "{}", twins.body);
     assert!(!twins.body.contains("<script>alert"), "{}", twins.body);
-    assert!(fetch(port, "/ui/duplicates?kind=pairs", &cookie).body.contains("no pairs found yet"));
+    assert!(fetch(port, "/ui/duplicates?kind=alts", &cookie).body.contains("no alts found yet"));
     let opened = fetch(port, &format!("/ui/release?id={script}"), &cookie);
     assert!(opened.body.contains("Other copies") && opened.body.contains("Tv.Findword"), "{}", opened.body);
 

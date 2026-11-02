@@ -325,7 +325,7 @@ pub fn attrs_of(ids: &[i64]) -> db::Result<HashMap<i64, MediaAttrs>> {
     if ids.is_empty() {
         return Ok(HashMap::new());
     }
-    attrs_with(&db::open()?, ids)
+    db::with_reader(|conn| attrs_with(conn, ids))
 }
 
 pub fn attrs_with(conn: &Connection, ids: &[i64]) -> db::Result<HashMap<i64, MediaAttrs>> {

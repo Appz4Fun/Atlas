@@ -1,5 +1,5 @@
 //! Other postings of the same content. A **twin** has the same posted files, proven by PAR2 hashes, soo
-//! its articles can stand in for this one's. A **pair** holds the same files packed differently, soo
+//! its articles can stand in for this one's. An **alt** holds the same files packed differently, soo
 //! it's another whole download, not a source of articles.
 //!
 //! Each release keeps two fingerprints in its shard, and copies are found by looking them up in every
@@ -91,14 +91,28 @@ pub fn twin_fingerprint(files: &[Par2File], block_size: Option<u64>, posted: &[(
 /// Marks a fingerprint as this kind. Ones from before a twin meant all of this are as long as the hash alone.
 const TWIN_VERSION: u8 = 2;
 
-/// Those older ones proved less, soo they go when indexing starts: nothing may lend articles on their word.
+/// Those older ones proved less, soo they go when indexing starts: nothing may lend articles on their word. Their
+/// releases are read again for the new kind, including any whose old fingerprint went before this queued them: they
+/// have a PAR2 set's sizes and no fingerprint, which nothing else leaves behind.
 pub fn forget_old_twins(conn: &Connection) {
+    let bit = crate::postprocess::step::mask(crate::archive::steps::PAR2_STEP);
+    let now = crate::media::http::now_secs();
     for s in 0..store::SHARDS {
+        let old = "(posted is not null and length(posted) != 21) or (posted is null and par2_block is not null)";
         let sql = format!(
-            "update s{s}.release_fingerprint set posted = null where posted is not null and length(posted) != 21"
+            "begin immediate;
+             insert into s{s}.pp_queue (release_id, due_at)
+                 select release_id, {now} from s{s}.release_fingerprint where {old}
+                 on conflict(release_id) do update set due_at = excluded.due_at;
+             update s{s}.pp_state set done = done & ~{bit}, failed = failed & ~{bit}
+                 where release_id in (select release_id from s{s}.release_fingerprint where {old});
+             update s{s}.release_fingerprint set posted = null, par2_block = null, par2_blocks = null where {old};
+             commit;"
         );
-        // a shard that hasn't got the table yet has none
-        let _ = conn.execute(&sql, []);
+        // a shard that hasn't got the tables yet has none
+        if conn.execute_batch(&sql).is_err() {
+            let _ = conn.execute_batch("rollback");
+        }
     }
 }
 
@@ -133,6 +147,11 @@ fn volume_set(name: &str) -> &str {
     });
     let name = crate::archive::names::base_name(name);
     VOLUME_END.find(name).filter(|m| m.start() > 0).map_or(name, |m| &name[..m.start()])
+}
+
+/// Whether any of these is an archive, soo a list of them isn't a list of what's inside.
+pub fn lists_archives<'a>(mut names: impl Iterator<Item = &'a str>) -> bool {
+    names.any(is_archive)
 }
 
 fn is_archive(name: &str) -> bool {
@@ -180,7 +199,7 @@ pub fn content_fingerprint<'a>(files: impl Iterator<Item = (&'a str, Option<u64>
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Copy {
     Twin,
-    Pair,
+    Alt,
 }
 
 fn matching(conn: &Connection, column: &str, fingerprint: &[u8], id: i64) -> db::Result<Vec<i64>> {
@@ -213,7 +232,7 @@ pub fn copies_with(conn: &Connection, id: i64) -> db::Result<Vec<(Copy, ReleaseR
         Some(fingerprint) => matching(conn, "posted", fingerprint, id)?,
         None => Vec::new(),
     };
-    let pairs = match &content {
+    let alts = match &content {
         Some(fingerprint) => matching(conn, "content", fingerprint, id)?,
         None => Vec::new(),
     };
@@ -223,9 +242,9 @@ pub fn copies_with(conn: &Connection, id: i64) -> db::Result<Vec<(Copy, ReleaseR
             out.push((Copy::Twin, release));
         }
     }
-    for pair in pairs.iter().filter(|pair| !twins.contains(pair)) {
-        if let Some(release) = get_release_with(conn, *pair)? {
-            out.push((Copy::Pair, release));
+    for alt in alts.iter().filter(|alt| !twins.contains(alt)) {
+        if let Some(release) = get_release_with(conn, *alt)? {
+            out.push((Copy::Alt, release));
         }
     }
     Ok(out)
@@ -239,14 +258,14 @@ pub fn copies(id: i64) -> db::Result<Vec<(Copy, ReleaseRow)>> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ClusterKind {
     Twins,
-    Pairs,
+    Alts,
 }
 
 impl ClusterKind {
     pub fn column(self) -> &'static str {
         match self {
             ClusterKind::Twins => "posted",
-            ClusterKind::Pairs => "content",
+            ClusterKind::Alts => "content",
         }
     }
 }
@@ -266,7 +285,7 @@ fn all_fingerprints(conn: &Connection) -> String {
         .join(" union all ")
 }
 
-/// Which fingerprints make a cluster: twins are equal posted files, and a pair has to differ in them.
+/// Which fingerprints make a cluster: twins are equal posted files, and an alt has to differ in them.
 fn cluster_sql(conn: &Connection, kind: ClusterKind) -> Option<String> {
     let all = all_fingerprints(conn);
     if all.is_empty() {
@@ -275,7 +294,7 @@ fn cluster_sql(conn: &Connection, kind: ClusterKind) -> Option<String> {
     let column = kind.column();
     let copies = match kind {
         ClusterKind::Twins => "count(*)",
-        ClusterKind::Pairs => "count(distinct coalesce(posted, release_id))",
+        ClusterKind::Alts => "count(distinct coalesce(posted, release_id))",
     };
     Some(format!(
         "select {column} as fingerprint, count(*) as members from ({all}) where {column} is not null
@@ -319,7 +338,7 @@ pub fn clusters_with(
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CopyCount {
     pub twins: i64,
-    pub pairs: i64,
+    pub alts: i64,
 }
 
 type Fingerprints = HashMap<i64, (Option<Vec<u8>>, Option<Vec<u8>>)>;
@@ -405,14 +424,14 @@ pub fn counts_with(conn: &Connection, ids: &[i64]) -> db::Result<HashMap<i64, Co
     let mut out = HashMap::new();
     for (id, (p, c)) in &prints {
         let twins = p.as_ref().and_then(|p| posted.get(p)).map_or(0, |n| (n - 1).max(0));
-        // a twin with the same content is a twin, not a pair as well
+        // a twin with the same content is a twin, not an alt as well
         let same_posting = match (p, c) {
             (Some(p), Some(c)) => both.get(&(p.clone(), c.clone())).map_or(0, |n| (n - 1).max(0)),
             _ => 0,
         };
-        let pairs = c.as_ref().and_then(|c| content.get(c)).map_or(0, |n| (n - 1 - same_posting).max(0));
-        if twins > 0 || pairs > 0 {
-            out.insert(*id, CopyCount { twins, pairs });
+        let alts = c.as_ref().and_then(|c| content.get(c)).map_or(0, |n| (n - 1 - same_posting).max(0));
+        if twins > 0 || alts > 0 {
+            out.insert(*id, CopyCount { twins, alts });
         }
     }
     Ok(out)
@@ -532,6 +551,12 @@ mod tests {
 
     fn par2(size: u64, md5: u8) -> Par2File {
         Par2File { set_id: [0; 16], file_id: [0; 16], md5: [md5; 16], md5_16k: [0; 16], size, name: "x".into() }
+    }
+
+    #[test]
+    fn a_list_of_volumes_is_a_list_of_archives() {
+        assert!(lists_archives(["a.part01.rar", "a.nfo"].into_iter()));
+        assert!(!lists_archives(["a.mkv", "a.nfo"].into_iter()));
     }
 
     #[test]

@@ -13,6 +13,7 @@ pub fn all() -> Vec<Arc<dyn Step>> {
         Arc::new(archive::Par2Step::default()),
         Arc::new(archive::ListStep::default()),
         Arc::new(crate::probe::ProbeStep::default()),
+        Arc::new(crate::probe::opensubtitles::OpenSubtitlesStep::default()),
         Arc::new(naming::Naming),
         Arc::new(naming::NfoName),
         Arc::new(crate::predb::step::PredbMatch),
@@ -20,6 +21,7 @@ pub fn all() -> Vec<Arc<dyn Step>> {
         parse,
         lookup,
         nfo,
+        Arc::new(crate::probe::opensubtitles::OpenSubtitlesImdb),
     ]
 }
 

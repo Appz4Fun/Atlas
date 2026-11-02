@@ -327,7 +327,7 @@ Atlas seals each file that is complete, or untouched for three days, into one zs
 
 A release ID tells Atlas which file holds the release, and IDs keep counting up across all 8 files in the order releases are added, so the newest releases still come first.
 
-Sealed articles can live on another machine, on a big disk. Run the service in `sealed-log/` with `docker compose up -d --build` there, and set `sealed_log.addr` and `sealed_log.offload = true` in `config.toml`. The indexer then moves blobs of files untouched for a day: it appends them, reads each back and compares, and only then swaps the blob in `files.blob` for its place in the log. An NZB needs the service up to read those articles, and indexing goes on without it. A shard with articles there can't be compacted, because that would pull them all back, so turn `auto_run_compact` off and reclaim the freed pages with `VACUUM` while the indexer is stopped.
+Sealed articles can live on another machine, on a big disk. Run the service in `sealed-log/` with `docker compose up -d --build` there, and set `sealed_log.addr` and `sealed_log.offload = true` in `config.toml`. The indexer then moves blobs of 1 KB or more from files untouched for a day: it appends them, reads each back and compares, and only then swaps the blob in `files.blob` for its place in the log. With the indexer stopped, `atlas --sealed-log-move` does the same at full speed. An NZB needs the service up to read those articles, and indexing goes on without it. A shard with articles there can't be compacted, because that would pull them all back, so turn `auto_run_compact` off and reclaim the freed pages with `VACUUM` while the indexer is stopped.
 
 PreDB titles, if you turn them on, live apart in `atlas.predb.db`. Compaction and conversion never touch it. It takes about 153 MB per million titles, and grows by under 2 MB a day.
 
@@ -609,7 +609,7 @@ Open `http://HOST:PORT/` in a browser to search and browse releases, filter by c
 
 Sign in with the `api_key` from `config.toml`. The browser keeps a cookie for 30 days, derived from the key rather than the key itself, and changing the key signs everyone out. Traffic is plain HTTP, like the API, so keep it on a network you trust.
 
-A release's page lists its other copies, once Atlas has read both: a **twin** is the same posting, with the same files, PAR2 set, recovery volumes and article counts, and a **pair** holds files of the same exact sizes packed differently, such as RAR5 and 7z. A release needs its archive or PAR2 set read to take part.
+A release's page lists its other copies, once Atlas has read both: a **twin** is the same posting, with the same files, PAR2 set, recovery volumes and article counts, and an **alt** holds files of the same exact sizes packed differently, such as RAR5 and 7z. A release needs its archive or PAR2 set read to take part.
 
 Duplicates, at the top of each page, lists every set of copies at once. Each copy shows its poster, email, PAR2 files, repair, health, encryption, password, tags, scores and links, so you can choose between them. The scores and posters are the ones already fetched, when someone opened the title.
 
@@ -722,9 +722,9 @@ Turn a provider on to fill in IDs, with no restart. Each title is asked once, ho
 | Trakt | `media.trakt.client_id`, from an API app you create on trakt.tv. | Trakt, TVDB, TVRage, TMDB, IMDb | `tvdbid`, `imdbid`, `rid`, `tmdbid`, `traktid` | `imdbid`, `tmdbid`, `traktid` |
 | TheTVDB | `media.tvdb.api_key`, from your account on thetvdb.com, and `media.tvdb.pin` for a user-supported key. TV only. | TVDB, IMDb, TMDB, TVMaze | `tvdbid`, `imdbid`, `tvmazeid`, `tmdbid` | none |
 
-Search results in the [web UI](#web-ui) have quick filters for resolution, HDR and source, and tags for copies and any score already fetched. In the API, each item also carries `poster`, `group`, `resolution`, `video`, `audio`, `hdr`, `source`, `language` and `team` attributes read from its name, and `twins` and `pairs` when it has copies.
+Search results in the [web UI](#web-ui) have quick filters for resolution, HDR and source, and tags for copies and any score already fetched. In the API, each item also carries `poster`, `group`, `resolution`, `video`, `audio`, `hdr`, `source`, `language` and `team` attributes read from its name, and `twins` and `alts` when it has copies.
 
-Opening a release in the [web UI](#web-ui) also shows its overview, cast, dates and poster from TMDB, its ratings from OMDb when `media.omdb.api_key` is set (a free key from omdbapi.com), and its Trakt rating when Trakt is on. These are fetched when the page opens and kept for 30 days in `atlas.details.db`, with posters in `posters/`, at most 512 MB. A show TMDB has no record of comes from TheTVDB when `media.tvdb.api_key` is set, and the page has a backdrop where TMDB has one. With neither key, the page leaves all this out. In results, Best rated sorts by the scores already kept, with the rest last.
+Opening a release in the [web UI](#web-ui) also shows its overview, cast, dates and poster from TMDB, its ratings from OMDb when `media.omdb.api_key` is set (a free key from omdbapi.com), and its Trakt rating when Trakt is on. These are fetched when the page opens, and the indexer also fetches them in the background for every title with an id, at `media.details_per_minute` titles a minute (120 by default, 0 turns it off). So results show thumbnails and scores without anyone opening a release. They're kept for 30 days in `atlas.details.db`, with posters in `posters/`, at most 4 GB. A show TMDB has no record of comes from TheTVDB when `media.tvdb.api_key` is set, and the page has a backdrop where TMDB has one. With neither key, the page leaves all this out. In results, Best rated sorts by the scores already kept, with the rest last.
 
 **An NFO needs no provider.** With a body budget, `media.nfo` reads a movie's IMDb ID from its NFO: one body of at most 64 KiB, and only for a movie with no IMDb ID yet. That also adds `imdbid` to `movie-search`.
 
@@ -817,6 +817,49 @@ python3 deploy/grafana/dashboards.py build
 GRAFANA_USER=admin GRAFANA_PASSWORD=... python3 deploy/grafana/dashboards.py push http://grafana:3000
 ```
 
+You can also import them by hand from [`grafana/`](grafana/). The [dashboards page](https://appz4fun.github.io/Atlas/) shows all six.
+
+The screenshots come from a real instance, with its address, host name and news server names replaced by placeholders.
+
+**Overview**
+
+![Grafana overview dashboard](grafana/screenshots/atlas-overview.png)
+
+<details>
+<summary>Database and process</summary>
+
+![Grafana database and process dashboard](grafana/screenshots/atlas-system.png)
+
+</details>
+
+<details>
+<summary>Functions</summary>
+
+![Grafana functions dashboard](grafana/screenshots/atlas-functions.png)
+
+</details>
+
+<details>
+<summary>NNTP servers</summary>
+
+![Grafana NNTP servers dashboard](grafana/screenshots/atlas-nntp.png)
+
+</details>
+
+<details>
+<summary>Pipeline</summary>
+
+![Grafana pipeline dashboard](grafana/screenshots/atlas-pipeline.png)
+
+</details>
+
+<details>
+<summary>Releases and content</summary>
+
+![Grafana releases and content dashboard](grafana/screenshots/atlas-content.png)
+
+</details>
+
 ## Environment variables
 
 | Variable | Description |
@@ -893,6 +936,7 @@ CI (`.github/workflows/ci.yml`) checks formatting, runs clippy, and runs the tes
 | `src/api.rs`, `src/nzb.rs` | Newznab API and NZB building. |
 | `src/metrics/` | The registry, every metric's name, the `/metrics` listener, and the catalog walk. |
 | `deploy/` | The scrape config and the Grafana dashboards. |
+| `grafana/` | The dashboards exported for import, their screenshots and the GitHub Pages site. |
 | `src/app.rs`, `src/ui.rs`, `src/groups_menu.rs`, `src/ai.rs` | The terminal menus and AI search. |
 | `src/dashboard.rs`, `src/stats_dashboard.rs` | The live dashboard and the stats dashboard. |
 | `src/profile.rs` | Timing counters for `ATLAS_PROFILE`, and the load counters behind the Bottleneck page. |

@@ -4,17 +4,34 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct MediaInfo {
     pub container: String,
     pub muxing_app: Option<String>,
     pub writing_app: Option<String>,
+    /// the segment's own title, often the film's name or the release's
+    pub title: Option<String>,
     pub duration_secs: Option<f64>,
     pub video: Vec<VideoTrack>,
     pub audio: Vec<AudioTrack>,
     pub subtitles: Vec<SubtitleTrack>,
+    /// the first edition's chapters, in order
+    pub chapters: Vec<Chapter>,
+    /// Everything before the video was read: the first cluster, or an MP4's `moov`, was reached. False means
+    /// more of the file's start would say more.
+    #[serde(skip)]
+    pub header_complete: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Chapter {
+    pub start_secs: f64,
+    pub name: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct VideoTrack {
     pub codec: String,
     pub width: Option<u64>,
@@ -34,6 +51,7 @@ pub struct VideoTrack {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AudioTrack {
     pub codec: String,
     pub channels: Option<u64>,
@@ -42,15 +60,19 @@ pub struct AudioTrack {
     pub name: Option<String>,
     /// from the track's name: the bitstream's flag sits past what's read
     pub atmos: bool,
+    /// the commentary flag, or a name that says so
+    pub commentary: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SubtitleTrack {
     pub codec: String,
     pub language: Option<String>,
     pub name: Option<String>,
     pub forced: bool,
     pub hearing_impaired: bool,
+    pub commentary: bool,
 }
 
 const EBML_MAGIC: &[u8] = &[0x1a, 0x45, 0xdf, 0xa3];
@@ -145,6 +167,7 @@ struct Track {
     name: Option<String>,
     forced: bool,
     hearing_impaired: bool,
+    commentary: bool,
     default_duration: Option<u64>,
     width: Option<u64>,
     height: Option<u64>,
@@ -186,6 +209,7 @@ fn track_entry(b: &[u8]) -> Track {
             0x536E => t.name = Some(text(v)),
             0x55AA => t.forced = uint(v) != 0,
             0x55AB => t.hearing_impaired = uint(v) != 0,
+            0x55AF => t.commentary = uint(v) != 0,
             0x23E383 => t.default_duration = Some(uint(v)),
             0xE0 => walk(v, &mut |id, v| {
                 match id {
@@ -265,6 +289,7 @@ fn segment(body: &[u8], info: &mut MediaInfo) {
                 walk(v, &mut |id, v| {
                     match id {
                         0x4D80 => info.muxing_app = Some(text(v)),
+                        0x7BA9 => info.title = Some(text(v)).filter(|t| !t.is_empty()),
                         0x5741 => info.writing_app = Some(text(v)),
                         0x2AD7B1 => scale = uint(v),
                         0x4489 => duration = float(v),
@@ -280,12 +305,58 @@ fn segment(body: &[u8], info: &mut MediaInfo) {
                 }
                 true
             }),
+            0x1043_A770 if info.chapters.is_empty() => chapters(v, info),
             // what's after the first cluster is the video itself
-            0x1F43_B675 => return false,
+            0x1F43_B675 => {
+                info.header_complete = true;
+                return false;
+            }
             _ => {}
         }
         true
     });
+}
+
+/// The most chapters kept. A Blu-ray has a few dozen; these come from Usenet.
+const MAX_CHAPTERS: usize = 256;
+
+/// The first edition with any chapters: each top level atom that isn't hidden. Nested ones are a menu's.
+fn chapters(body: &[u8], info: &mut MediaInfo) {
+    walk(body, &mut |id, edition| {
+        if id != 0x45B9 {
+            return true;
+        }
+        walk(edition, &mut |id, atom| {
+            if id == 0xB6 && info.chapters.len() < MAX_CHAPTERS {
+                let (mut start, mut hidden, mut name) = (None, false, None);
+                walk(atom, &mut |id, v| {
+                    match id {
+                        0x91 => start = Some(uint(v)),
+                        0x98 => hidden = uint(v) != 0,
+                        // the first display is the chapter's main name
+                        0x80 if name.is_none() => walk(v, &mut |id, v| {
+                            if id == 0x85 {
+                                name = Some(text(v)).filter(|n| !n.is_empty());
+                            }
+                            true
+                        }),
+                        _ => {}
+                    }
+                    true
+                });
+                if let (Some(start), false) = (start, hidden) {
+                    info.chapters.push(Chapter { start_secs: start as f64 / 1e9, name });
+                }
+            }
+            true
+        });
+        // one edition is enough
+        info.chapters.is_empty()
+    });
+}
+
+fn says_commentary(name: Option<&str>) -> bool {
+    name.is_some_and(|n| n.to_ascii_lowercase().contains("commentary"))
 }
 
 /// The most tracks kept. Real files have a few dozen at most, and these come from Usenet.
@@ -320,6 +391,7 @@ fn add_track(t: Track, info: &mut MediaInfo) {
         }),
         2 => info.audio.push(AudioTrack {
             atmos: t.name.as_deref().is_some_and(|n| n.to_ascii_lowercase().contains("atmos")),
+            commentary: t.commentary || says_commentary(t.name.as_deref()),
             codec: t.codec,
             channels: t.channels,
             sample_rate: t.sample_rate,
@@ -328,6 +400,7 @@ fn add_track(t: Track, info: &mut MediaInfo) {
         }),
         17 => info.subtitles.push(SubtitleTrack {
             forced: t.forced,
+            commentary: t.commentary || says_commentary(t.name.as_deref()),
             hearing_impaired: t.hearing_impaired
                 || t.name.as_deref().is_some_and(|n| n.to_ascii_lowercase().contains("sdh")),
             codec: t.codec,
@@ -369,7 +442,31 @@ fn mp4(data: &[u8]) -> MediaInfo {
             moov(body, &mut info);
         }
     });
+    info.header_complete = has_whole_moov(data);
     info
+}
+
+/// Whether a top level `moov` is all there.
+fn has_whole_moov(data: &[u8]) -> bool {
+    let mut at = 0usize;
+    while let Some(head) = data.get(at..at + 8) {
+        let mut size = u64::from(u32::from_be_bytes([head[0], head[1], head[2], head[3]]));
+        if size == 1 {
+            let Some(long) = data.get(at + 8..at + 16) else { return false };
+            size = u64::from_be_bytes(long.try_into().unwrap_or([0; 8]));
+        } else if size == 0 {
+            size = (data.len() - at) as u64;
+        }
+        if size < 8 {
+            return false;
+        }
+        let Some(end) = usize::try_from(size).ok().and_then(|s| at.checked_add(s)) else { return false };
+        if &head[4..8] == b"moov" {
+            return end <= data.len();
+        }
+        at = end;
+    }
+    false
 }
 
 fn be32(b: &[u8], at: usize) -> Option<u32> {
@@ -510,8 +607,26 @@ mod tests {
         let t3 =
             [el(&[0x83], &[17]), el(&[0x86], b"S_HDMV/PGS"), el(&[0x22, 0xB5, 0x9C], b"kor"), el(&[0x55, 0xAA], &[1])]
                 .concat();
-        let tracks = [el(&[0xAE], &t1), el(&[0xAE], &t2), el(&[0xAE], &t3)].concat();
+        let t4 = [el(&[0x83], &[2]), el(&[0x86], b"A_AC3"), el(&[0x53, 0x6E], b"Director's Commentary")].concat();
+        let t5 = [el(&[0x83], &[17]), el(&[0x86], b"S_TEXT/UTF8"), el(&[0x55, 0xAF], &[1])].concat();
+        let tracks =
+            [el(&[0xAE], &t1), el(&[0xAE], &t2), el(&[0xAE], &t3), el(&[0xAE], &t4), el(&[0xAE], &t5)].concat();
+        let atom = |start_ns: u64, name: &[u8], hidden: bool| {
+            let display = [el(&[0x85], name), el(&[0x43, 0x7C], b"eng")].concat();
+            let mut body = [el(&[0x91], &start_ns.to_be_bytes()), el(&[0x80], &display)].concat();
+            if hidden {
+                body.extend(el(&[0x98], &[1]));
+            }
+            el(&[0xB6], &body)
+        };
+        let edition =
+            [atom(0, b"Opening", false), atom(5_000_000_000, b"menu", true), atom(90_500_000_000, b"", false)].concat();
+        let chapters = el(
+            &[0x10, 0x43, 0xA7, 0x70],
+            &[el(&[0x45, 0xB9], &edition), el(&[0x45, 0xB9], &atom(1, b"x", false))].concat(),
+        );
         let info = [
+            el(&[0x7B, 0xA9], b"The Film (2001)"),
             el(&[0x4D, 0x80], b"libebml"),
             el(&[0x57, 0x41], b"mkvmerge v80"),
             el(&[0x44, 0x89], &(7_200_000f64).to_be_bytes()),
@@ -520,6 +635,7 @@ mod tests {
         let segment = [
             el(&[0x15, 0x49, 0xA9, 0x66], &info),
             el(&[0x16, 0x54, 0xAE, 0x6B], &tracks),
+            chapters,
             el(&[0x1F, 0x43, 0xB6, 0x75], &[0; 32]),
         ]
         .concat();
@@ -553,8 +669,36 @@ mod tests {
         let a = &m.audio[0];
         assert_eq!((a.codec.as_str(), a.channels, a.sample_rate), ("A_EAC3", Some(6), Some(48000.0)));
         assert!(a.atmos);
+        assert!(!a.commentary);
         assert_eq!(a.language.as_deref(), Some("eng"));
+        assert!(m.audio[1].commentary, "named as one");
         assert!(m.subtitles[0].forced);
+        assert!(m.subtitles[1].commentary, "flagged as one");
+        assert_eq!(m.title.as_deref(), Some("The Film (2001)"));
+        assert_eq!(
+            m.chapters,
+            [Chapter { start_secs: 0.0, name: Some("Opening".into()) }, Chapter { start_secs: 90.5, name: None },],
+            "the hidden one and the second edition are left out"
+        );
+        assert!(m.header_complete);
+    }
+
+    #[test]
+    fn a_header_cut_short_says_so() {
+        let whole = sample_mkv();
+        let cut = parse(&whole[..whole.len() - 40]).unwrap();
+        assert!(!cut.header_complete);
+        assert!(parse(&whole).unwrap().header_complete);
+    }
+
+    #[test]
+    fn old_probe_json_still_reads() {
+        let old = r#"{"container":"matroska","muxing_app":null,"writing_app":null,"duration_secs":1.0,
+            "video":[],"audio":[{"codec":"A_AC3","channels":2,"sample_rate":null,"language":null,"name":null,"atmos":false}],
+            "subtitles":[]}"#;
+        let m: MediaInfo = serde_json::from_str(old).unwrap();
+        assert!(m.chapters.is_empty());
+        assert!(!m.audio[0].commentary);
     }
 
     #[test]
@@ -593,6 +737,8 @@ mod tests {
         let moov = [mp4_box(b"mvhd", &mvhd), mp4_box(b"trak", &mp4_box(b"mdia", &mdia))].concat();
         let file = [mp4_box(b"ftyp", b"isom"), mp4_box(b"moov", &moov)].concat();
         let m = parse(&file).unwrap();
+        assert!(m.header_complete);
+        assert!(!parse(&file[..file.len() - 4]).unwrap().header_complete);
         assert_eq!(m.container, "mp4");
         assert_eq!(m.duration_secs, Some(60.0));
         let v = &m.video[0];

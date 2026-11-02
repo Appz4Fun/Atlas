@@ -1169,6 +1169,8 @@ fn index(config: Config, stop: Arc<AtomicBool>, writing: Option<WriteGuard>) -> 
         }
     };
 
+    crate::media::details::start_backfill(stop.clone());
+
     if let Ok(conn) = crate::db::open() {
         crate::duplicates::forget_old_twins(&conn);
     }

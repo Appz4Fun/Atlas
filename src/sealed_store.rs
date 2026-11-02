@@ -22,8 +22,12 @@ use crate::store;
 
 static ADDR: RwLock<String> = RwLock::new(String::new());
 
-/// Blobs up to this size stay where they are: a place takes about as much.
-const SMALL_BLOB: usize = 64;
+/// Blobs under this size stay where they are. On a real shard the 12% of blobs
+/// past it hold 80% of the bytes, and each move costs the writers a lock.
+const SMALL_BLOB: usize = 1024;
+/// How many times a swap waits out the writers (`db::open_at`'s 30 seconds each)
+/// before its batch is tried again from the start.
+const SWAP_TRIES: usize = 20;
 const BATCH_FILES: usize = 2000;
 const BATCH_BYTES: usize = 32 << 20;
 /// How long a finished sweep waits before looking for newly sealed files.
@@ -137,28 +141,55 @@ pub fn offload_batch(shard: &Path, after: i64) -> anyhow::Result<(Option<i64>, u
         anyhow::ensure!(blob == value, "file {id} came back from the sealed log different");
     }
 
-    let (mut swapped, mut changed, mut freed) = (0u64, 0u64, 0u64);
-    metrics::timed("sealed_log.swap", || -> rusqlite::Result<()> {
-        let tx = conn.unchecked_transaction()?;
-        {
-            // a blob that changed meanwhile (more articles sealed into it) keeps its
-            // new self, and its copy in the log goes unused
-            let mut swap = tx.prepare_cached("update files set blob = ? where id = ? and blob = ?")?;
-            for ((id, blob), at) in batch.iter().zip(&places) {
-                if swap.execute(params![at.to_ref(), id, blob])? > 0 {
-                    swapped += 1;
-                    freed += (blob.len() - sealed_log::REF_BYTES) as u64;
-                } else {
-                    changed += 1;
-                }
-            }
-        }
-        tx.commit()
-    })?;
+    let (swapped, changed, freed) = metrics::timed("sealed_log.swap", || swap_in(&conn, &batch, &places))?;
     names::SEALED_LOG_OFFLOAD_FILES.inc(&[("result", "moved")], swapped);
     names::SEALED_LOG_OFFLOAD_FILES.inc(&[("result", "changed")], changed);
     names::SEALED_LOG_OFFLOAD_BYTES.inc(&[("kind", "freed")], freed);
     Ok((Some(last), bytes as u64))
+}
+
+/// Each blob replaced by its place. Taking the write lock up front, and waiting
+/// for it here, keeps a busy writer from wasting the appends already made.
+/// Returns the files swapped, the ones that changed meanwhile, and the bytes freed.
+fn swap_in(
+    conn: &rusqlite::Connection,
+    batch: &[(i64, Vec<u8>)],
+    places: &[Locator],
+) -> rusqlite::Result<(u64, u64, u64)> {
+    let mut tries = 0;
+    loop {
+        match conn.execute_batch("begin immediate") {
+            Ok(()) => break,
+            Err(rusqlite::Error::SqliteFailure(e, _))
+                if e.code == rusqlite::ErrorCode::DatabaseBusy && tries + 1 < SWAP_TRIES =>
+            {
+                tries += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    let swapped = (|| {
+        let (mut swapped, mut changed, mut freed) = (0u64, 0u64, 0u64);
+        // a blob that changed meanwhile (more articles sealed into it) keeps its
+        // new self, and its copy in the log goes unused
+        let mut swap = conn.prepare_cached("update files set blob = ? where id = ? and blob = ?")?;
+        for ((id, blob), at) in batch.iter().zip(places) {
+            if swap.execute(params![at.to_ref(), id, blob])? > 0 {
+                swapped += 1;
+                freed += (blob.len() - sealed_log::REF_BYTES) as u64;
+            } else {
+                changed += 1;
+            }
+        }
+        Ok((swapped, changed, freed))
+    })();
+    match swapped {
+        Ok(counts) => conn.execute_batch("commit").map(|()| counts),
+        Err(e) => {
+            let _ = conn.execute_batch("rollback");
+            Err(e)
+        }
+    }
 }
 
 fn cursor_path(shard: &Path) -> PathBuf {
@@ -171,11 +202,36 @@ fn read_cursor(shard: &Path) -> i64 {
     std::fs::read_to_string(cursor_path(shard)).ok().and_then(|t| t.trim().parse().ok()).unwrap_or(0)
 }
 
+/// `atlas --sealed-log-move`: one sweep at full speed with the indexer stopped,
+/// so nothing competes for the write locks. Stopping it anytime is safe.
+pub fn run_move() -> i32 {
+    let config = crate::config::sealed_log_config();
+    if config.addr.is_empty() {
+        println!("sealed_log.addr isn't set in config.toml");
+        return 1;
+    }
+    if crate::procs::indexer_alive() {
+        println!("stop the indexer first: it competes for the same locks, and it moves these anyway");
+        return 1;
+    }
+    configure(&config.addr);
+    let main = crate::paths::database();
+    let started = Instant::now();
+    let moved = sweep(&main, u64::MAX, &AtomicBool::new(false), true);
+    println!("moved {moved} bytes in {}s", started.elapsed().as_secs());
+    0
+}
+
 /// Moves sealed blobs from every shard, turn about, until `stop`.
 pub fn run_offload(main: &Path, mb_per_second: u64, stop: &AtomicBool) {
+    sweep(main, mb_per_second, stop, false);
+}
+
+/// The bytes moved. With `once` it returns when every shard has been through.
+fn sweep(main: &Path, mb_per_second: u64, stop: &AtomicBool, once: bool) -> u64 {
     let shards = store::shard_paths(main);
     let mut cursors: Vec<Option<i64>> = shards.iter().map(|s| Some(read_cursor(s))).collect();
-    let budget = (mb_per_second.max(1) * 1_000_000) as f64;
+    let budget = mb_per_second.max(1).saturating_mul(1_000_000) as f64;
     let nap = |d: Duration| {
         let until = Instant::now() + d;
         while Instant::now() < until && !stop.load(Ordering::Relaxed) {
@@ -183,6 +239,7 @@ pub fn run_offload(main: &Path, mb_per_second: u64, stop: &AtomicBool) {
         }
     };
     let mut moved = 0u64;
+    let mut reported = Instant::now();
     let mut sweep_started = Instant::now();
     // there from the start: a series that starts at its first failure doesnt show it as an increase
     names::SEALED_LOG_OFFLOAD_FAILURES.inc(&[("kind", "batch")], 0);
@@ -192,6 +249,9 @@ pub fn run_offload(main: &Path, mb_per_second: u64, stop: &AtomicBool) {
         names::SEALED_LOG_SWEEP.set(&[("kind", "shards_left")], left as f64);
         names::SEALED_LOG_SWEEP.set(&[("kind", "shards")], shards.len() as f64);
         if left == 0 {
+            if once {
+                return moved;
+            }
             println!("sealed log: sweep done, {moved} bytes moved");
             names::SEALED_LOG_SWEEP
                 .set(&[("kind", "last_done_timestamp_seconds")], chrono::Utc::now().timestamp() as f64);
@@ -207,7 +267,7 @@ pub fn run_offload(main: &Path, mb_per_second: u64, stop: &AtomicBool) {
         for (shard, cursor) in shards.iter().zip(cursors.iter_mut()) {
             let Some(after) = *cursor else { continue };
             if stop.load(Ordering::Relaxed) {
-                return;
+                return moved;
             }
             let started = Instant::now();
             set_state("moving");
@@ -215,6 +275,10 @@ pub fn run_offload(main: &Path, mb_per_second: u64, stop: &AtomicBool) {
                 Ok((last, bytes)) => {
                     moved += bytes;
                     *cursor = last;
+                    if once && reported.elapsed() > Duration::from_secs(30) {
+                        reported = Instant::now();
+                        println!("{moved} bytes moved");
+                    }
                     let _ = std::fs::write(cursor_path(shard), last.unwrap_or(0).to_string());
                     let rest = Duration::from_secs_f64(bytes as f64 / budget).saturating_sub(started.elapsed());
                     if !rest.is_zero() {
@@ -233,6 +297,7 @@ pub fn run_offload(main: &Path, mb_per_second: u64, stop: &AtomicBool) {
             }
         }
     }
+    moved
 }
 
 /// What the move is doing now, as a 1 among its states.
@@ -272,6 +337,20 @@ mod tests {
             .collect()
     }
 
+    /// A blob past `SMALL_BLOB`, whatever zstd makes of it.
+    fn incompressible() -> Vec<u8> {
+        let mut x = 88172645463325252u64;
+        let segs: Vec<Seg> = (0..400)
+            .map(|i| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                Seg { part: Some(i), bytes: 700_000, domain: 1, local: format!("{x:016x}{i}").into_bytes() }
+            })
+            .collect();
+        blob::encode(&segs)
+    }
+
     #[test]
     fn sealed_articles_move_and_read_the_same_and_a_lost_service_changes_nothing() {
         let dir = std::env::temp_dir().join(format!("atlas-sealed-store-{}", std::process::id()));
@@ -280,7 +359,7 @@ mod tests {
         let shard = dir.join("shard.db");
         let conn = crate::db::create_at(&shard).unwrap();
         conn.execute_batch("create table files (id integer primary key, touched_at integer, blob blob)").unwrap();
-        let (big, small, recent) = (blob::encode(&segs(400)), vec![1u8; 10], blob::encode(&segs(300)));
+        let (big, small, recent) = (incompressible(), vec![1u8; 10], incompressible());
         let insert = "insert into files (id, touched_at, blob) values (?, ?, ?)";
         conn.execute(insert, params![1, 100, big]).unwrap();
         conn.execute(insert, params![2, 100, small]).unwrap();
@@ -311,6 +390,19 @@ mod tests {
         assert_eq!(blob::decode_capped(&read(1), 400).unwrap().len(), 400);
         assert!(blob::decode_capped(&read(1), 399).is_err(), "the cap still holds");
         assert_eq!(blob::count(&read(1)).unwrap(), 400);
+
+        // a writer holding the lock is waited out, and the swap still lands
+        let writer = crate::db::create_at(&shard).unwrap();
+        conn.execute("update files set touched_at = 100 where id = 3", []).unwrap();
+        writer.execute_batch("begin immediate").unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            writer.execute_batch("commit").unwrap();
+        });
+        assert!(offload_batch(&shard, 2).unwrap().0.is_some());
+        release.join().unwrap();
+        assert!(blob::is_remote(&read(3)));
+        assert_eq!(blob::decode(&read(3)).unwrap(), blob::decode(&recent).unwrap());
 
         // the next sweep has nothing to do
         assert_eq!(offload_batch(&shard, 0).unwrap(), (None, 0));

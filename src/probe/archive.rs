@@ -23,6 +23,9 @@ pub struct ArchiveHead {
     /// where the first file's bytes start, when it's stored rather than compressed
     #[serde(skip)]
     pub stored_at: Option<usize>,
+    /// the first file goes on in the next volume: this volume doesn't hold its end
+    #[serde(skip)]
+    pub continues: bool,
 }
 
 pub fn parse(data: &[u8]) -> Option<ArchiveHead> {
@@ -79,6 +82,7 @@ fn rar4(data: &[u8]) -> ArchiveHead {
                     .get(at + 32 + high..at + 32 + high + name_len)
                     .map(|n| String::from_utf8_lossy(n.split(|b| *b == 0).next().unwrap_or(n)).into_owned());
                 head.encrypted |= flags & 0x0004 != 0;
+                head.continues = flags & 0x0002 != 0;
                 if method == Some(0x30) && !head.encrypted {
                     head.stored_at = Some(at + size);
                 }
@@ -130,6 +134,8 @@ fn rar5(data: &[u8]) -> ArchiveHead {
             }
             2 => {
                 head.packed = Some(packed);
+                // the block header's "data goes on in the next volume"
+                head.continues = flags & 0x10 != 0;
                 let Some(file_flags) = vint(data, &mut p) else { return head };
                 let unpacked = vint(data, &mut p);
                 let _attributes = vint(data, &mut p);
@@ -319,6 +325,8 @@ mod tests {
         assert_eq!(compressed.method.as_deref(), Some("m3"));
         assert_eq!(compressed.stored_at, None);
         assert!(parse(&rar4_stored(0x30, 4)).unwrap().encrypted);
+        assert!(!head.continues);
+        assert!(parse(&rar4_stored(0x30, 2)).unwrap().continues, "split after");
     }
 
     #[test]

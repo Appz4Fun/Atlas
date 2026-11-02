@@ -3,6 +3,8 @@
 
 pub mod archive;
 pub mod media;
+pub mod moviehash;
+pub mod opensubtitles;
 pub mod step;
 pub mod yenc;
 
@@ -33,13 +35,17 @@ pub const PROBE: ShardTable = ShardTable {
             "release_probe_agent",
             "create index if not exists release_probe_agent on release_probe(agent) where agent is not null",
         ),
+        (
+            "release_probe_moviehash",
+            "create index if not exists release_probe_moviehash on release_probe(moviehash) where moviehash is not null",
+        ),
     ],
     release_key: Some("release_id"),
-    added: &[],
+    added: &[("moviehash", "TEXT")],
 };
 
-pub const SET_PROBE: &str =
-    "insert or replace into release_probe (release_id, crc32, agent, info) values (?1, ?2, ?3, ?4)";
+pub const SET_PROBE: &str = "insert or replace into release_probe (release_id, crc32, agent, info, moviehash)
+    values (?1, ?2, ?3, ?4, ?5)";
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ProbeInfo {
@@ -62,6 +68,8 @@ pub struct ProbeInfo {
     pub nfo: Option<String>,
     pub imdb_ids: Vec<String>,
     pub sfv: BTreeMap<String, u32>,
+    /// the OpenSubtitles hash of the video, or of the one inside a stored RAR set
+    pub moviehash: Option<String>,
 }
 
 /// The headers worth keeping, under the names they arrive with.

@@ -75,14 +75,14 @@ fn query_rows(conn: &Connection, sql: &str, vals: &[Value]) -> Result<Vec<Releas
 
 /// try fts first, fall back to LIKE if fts chokes on the query
 fn fts_or_like_rows(fts: (&str, Vec<Value>), like: (&str, Vec<Value>)) -> Result<Vec<ReleaseRow>> {
-    let conn = db::open()?;
-    query_rows(&conn, fts.0, &fts.1).or_else(|_| query_rows(&conn, like.0, &like.1))
+    db::with_reader(|conn| query_rows(conn, fts.0, &fts.1).or_else(|_| query_rows(conn, like.0, &like.1)))
 }
 
 fn fts_or_like_count(fts: (&str, Vec<Value>), like: (&str, Vec<Value>)) -> Result<i64> {
-    let conn = db::open()?;
-    let count = |sql: &str, vals: &[Value]| conn.query_row(sql, params_from_iter(vals.iter()), |r| r.get(0));
-    count(fts.0, &fts.1).or_else(|_| count(like.0, &like.1))
+    db::with_reader(|conn| {
+        let count = |sql: &str, vals: &[Value]| conn.query_row(sql, params_from_iter(vals.iter()), |r| r.get(0));
+        count(fts.0, &fts.1).or_else(|_| count(like.0, &like.1))
+    })
 }
 
 fn text(s: impl Into<String>) -> Value {
@@ -342,7 +342,7 @@ fn probe_sql(s: usize) -> String {
 /// shard for rows with no category when that's asked for, merged lazily. Only rows that reach the top are read.
 pub fn newest_in_categories(filter: &CatFilter, offset: i64, limit: i64) -> Result<CatPage> {
     crate::metrics::timed("search.newest_in_categories", || {
-        newest_in_categories_with(&db::open()?, filter, offset, limit, &Bounds::DEFAULT)
+        db::with_reader(|conn| newest_in_categories_with(conn, filter, offset, limit, &Bounds::DEFAULT))
     })
 }
 
@@ -463,7 +463,7 @@ fn page_of_ids(conn: &Connection, sql: &str, vals: &[Value], offset: i64, limit:
 /// A search within a category filter: ranked, over the newest matches of each shard.
 pub fn search_in_categories(query: &str, filter: &CatFilter, offset: i64, limit: i64) -> Result<Vec<ReleaseRow>> {
     crate::metrics::timed("search.by_name_in_categories", || {
-        search_in_categories_with(&db::open()?, query, filter, offset, limit, &Bounds::DEFAULT)
+        db::with_reader(|conn| search_in_categories_with(conn, query, filter, offset, limit, &Bounds::DEFAULT))
     })
 }
 

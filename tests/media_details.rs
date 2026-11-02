@@ -5,10 +5,12 @@
 mod common;
 
 use atlas::config::{MediaConfig, OmdbConfig, TmdbConfig, TvdbConfig};
-use atlas::db;
-use atlas::media::details::{for_title, poster};
+use atlas::media::details::{backfill_pass, for_title, poster};
 use atlas::media::resolve::Ids;
+use atlas::parser::Release;
+use atlas::{db, store};
 use common::http::{FixtureServer, route};
+use common::stage::release_of;
 
 const MOVIE: i64 = 2;
 
@@ -64,6 +66,64 @@ fn a_title_is_fetched_once_and_kept() {
     assert!(!home.path().join("posters/p.jpg").exists());
 
     a_show_only_thetvdb_knows();
+    a_pass_fetches_what_nobody_opened(home.path());
+}
+
+/// A server of one image, in bytes that aren't text. Its address.
+fn serve_a_jpeg() -> String {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = format!("http://{}", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            let _ = stream.read(&mut [0; 4096]);
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\n\xff\xd8\xffx");
+        }
+    });
+    address
+}
+
+/// The background job: posters and ratings for titles with an id, once.
+fn a_pass_fetches_what_nobody_opened(home: &std::path::Path) {
+    let main = home.join("atlas.db");
+    let group = "alt.binaries.g1";
+    store::save(&main, &[Release { group: group.into(), ..release_of("Other.Film.2001-GRP", "x.bin", 2, 2) }]).unwrap();
+    let shard = db::open_shard(&store::shard_path(&main, store::shard_of(group))).unwrap();
+    let id: i64 =
+        shard.query_row("select id from releases where name = 'Other.Film.2001-GRP'", [], |r| r.get(0)).unwrap();
+    shard
+        .execute(
+            "insert into media_release (release_id, kind, title_key, quality, tmdb_id) values (?, ?, 9, 0, 700)",
+            rusqlite::params![id, MOVIE],
+        )
+        .unwrap();
+    let film = r#"{"title":"Other Film","poster_path":"/o.jpg","vote_average":7.0,"vote_count":3}"#;
+    let server = FixtureServer::start(vec![route("/movie/700", film.into())]);
+    let base = server.base.clone();
+    let images = serve_a_jpeg();
+    let cfg = MediaConfig {
+        tmdb: TmdbConfig {
+            api_key: "key".into(),
+            requests_per_minute: 3000,
+            base_url: Some(base),
+            image_base_url: Some(images),
+        },
+        details_per_minute: 600,
+        ..MediaConfig::default()
+    };
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let off = MediaConfig { details_per_minute: 0, ..cfg.clone() };
+    assert_eq!(backfill_pass(&|| off.clone(), &stop), 0, "turned off, it stops");
+    assert_eq!(backfill_pass(&|| cfg.clone(), &stop), 1);
+    let ids = Ids { tmdb: Some(700), ..Ids::default() };
+    let kept = atlas::media::details::kept_for(std::iter::once((id, MOVIE, &ids)));
+    assert_eq!(kept[&id].tmdb_score, Some(70), "nobody opened it");
+    assert!(atlas::media::details::poster_kept(&kept[&id]), "its poster too");
+
+    let asked = server.requests().iter().filter(|r| r.contains("/movie/700")).count();
+    assert_eq!(backfill_pass(&|| cfg.clone(), &stop), 0);
+    assert_eq!(server.requests().iter().filter(|r| r.contains("/movie/700")).count(), asked, "kept, not asked again");
 }
 
 /// With no TMDB key, or nothing there, TheTVDB's own record shows.
