@@ -149,6 +149,11 @@ fn volume_set(name: &str) -> &str {
     VOLUME_END.find(name).filter(|m| m.start() > 0).map_or(name, |m| &name[..m.start()])
 }
 
+/// Whether any of these is an archive, soo a list of them isn't a list of what's inside.
+pub fn lists_archives<'a>(mut names: impl Iterator<Item = &'a str>) -> bool {
+    names.any(is_archive)
+}
+
 fn is_archive(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     let ext = lower.rsplit('.').next().unwrap_or_default();
@@ -546,6 +551,12 @@ mod tests {
 
     fn par2(size: u64, md5: u8) -> Par2File {
         Par2File { set_id: [0; 16], file_id: [0; 16], md5: [md5; 16], md5_16k: [0; 16], size, name: "x".into() }
+    }
+
+    #[test]
+    fn a_list_of_volumes_is_a_list_of_archives() {
+        assert!(lists_archives(["a.part01.rar", "a.nfo"].into_iter()));
+        assert!(!lists_archives(["a.mkv", "a.nfo"].into_iter()));
     }
 
     #[test]
