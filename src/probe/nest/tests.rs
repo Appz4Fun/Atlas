@@ -325,3 +325,12 @@ fn headers_cut_before_their_data_stop_cleanly() {
         let _ = unwrap(&z[..cut]);
     }
 }
+
+#[test]
+fn long_names_are_cut() {
+    let name = "é".repeat(5000);
+    let gz = gzip_of(&name, b"hello");
+    let n = unwrap(&gz);
+    let kept = n.layers[0].name.as_deref().unwrap();
+    assert!(kept.len() <= crate::archive::MAX_NAME_BYTES && name.starts_with(kept));
+}

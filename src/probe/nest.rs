@@ -90,6 +90,8 @@ pub fn unwrap(data: &[u8]) -> Nest<'_> {
     let mut outer_at = Some(0usize);
     let mut budget = MAX_DECODED;
     while let Some(Opened { mut layer, view }) = open(&buf[lo..hi]) {
+        // a name comes from the poster's bytes: keep what a name needs
+        layer.name = layer.name.map(|n| cap_name(&n));
         if layers.len() == MAX_DEPTH {
             layer.stop = Some(format!("deeper than {MAX_DEPTH} layers"));
             layers.push(layer);
@@ -146,6 +148,15 @@ pub fn unwrap(data: &[u8]) -> Nest<'_> {
         }
     };
     Nest { layers, inner, outer_at }
+}
+
+/// At most [`crate::archive::MAX_NAME_BYTES`], cut on a character.
+fn cap_name(name: &str) -> String {
+    let mut end = name.len().min(crate::archive::MAX_NAME_BYTES);
+    while !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    name[..end].to_string()
 }
 
 fn decode(codec: Codec, input: &[u8], limit: usize) -> (Vec<u8>, End) {
