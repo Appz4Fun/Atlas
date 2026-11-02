@@ -9,7 +9,7 @@
 //! indexed raw. They appear as salted keys only, soo two releases from one account can be lined up without
 //! anyone reading the account.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write;
 use std::sync::LazyLock;
 
@@ -19,10 +19,10 @@ use rusqlite::{Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
 
 use crate::api::{ApiResponse, escape};
-use crate::archive::store::{InnerView, SOURCE_7Z, SOURCE_PAR2, SOURCE_RAR, SOURCE_ZIP};
+use crate::archive::store::{InnerFileRow, InnerView, SOURCE_7Z, SOURCE_PAR2, SOURCE_RAR, SOURCE_ZIP};
 use crate::naming::NameSource;
 use crate::release_info::{self, Contents, Names};
-use crate::search::ReleaseRow;
+use crate::search::{ArticleRow, ReleaseRow};
 use crate::store::{self, FileInfo, SegmentPick, SegmentRef};
 use crate::ui::{fmt_date, fmt_size};
 use crate::web::{COLUMNS, html, panel, tag, thousands, url_encode, verdict};
@@ -33,6 +33,8 @@ const FILES_CAP: usize = 5_000;
 const PARTS_ROWS: usize = 200;
 /// Cells in a part map.
 const MAP_CELLS: i64 = 64;
+/// Articles a fragment reads before it stops and says the release is too big to list.
+const ARTICLE_BUDGET: usize = 250_000;
 /// `label: value` pairs read from an NFO, at most.
 const NFO_FIELDS_MAX: usize = 8;
 /// Links read from an NFO, at most.
@@ -516,20 +518,22 @@ fn decode_base64(text: &str) -> Option<Vec<u8>> {
         .ok()
 }
 
-/// The Q encoding: `_` is a space, `=XX` a byte.
+/// The Q encoding: `_` is a space, `=XX` a byte. Read byte by byte, never by slicing the text: a stray `=`
+/// in front of a multibyte character would otherwise be cut through.
 fn decode_q(text: &str) -> Vec<u8> {
     let bytes = text.as_bytes();
+    let hex = |b: &u8| (*b as char).to_digit(16).map(|d| d as u8);
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
         match bytes[i] {
             b'_' => out.push(b' '),
-            b'=' if i + 2 < bytes.len() => match u8::from_str_radix(&text[i + 1..i + 3], 16) {
-                Ok(b) => {
-                    out.push(b);
+            b'=' => match (bytes.get(i + 1).and_then(hex), bytes.get(i + 2).and_then(hex)) {
+                (Some(hi), Some(lo)) => {
+                    out.push((hi << 4) | lo);
                     i += 2;
                 }
-                Err(_) => out.push(b'='),
+                _ => out.push(b'='),
             },
             b => out.push(b),
         }
@@ -1147,9 +1151,12 @@ fn inside_panel(i: &MetaInputs<'_>, l: &Looked, compact: bool) -> Facts {
     if let Some(bytes) = unpacked_estimate(&l.files, size, i.contents, i.inner, head) {
         f.add("Unpacks to about", Some(fmt_size(Some(bytes))));
     }
+    // the head's packed size is the first file's bytes in the volume read, its unpacked size the whole file's: a
+    // ratio between them means something only when one volume holds the whole archive
     if let Some(a) = head
         && let (Some(packed), Some(unpacked)) = (a.packed, a.unpacked)
         && unpacked > 0
+        && archive_volumes(&l.files) <= 1
     {
         let stored = if a.method.as_deref() == Some("m0") || packed == unpacked { ", stored" } else { "" };
         f.add(
@@ -1241,6 +1248,17 @@ fn counts(files: &[FileInfo]) -> BTreeMap<FileKind, usize> {
         *by_kind.entry(kind_of(&f.filename)).or_insert(0) += 1;
     }
     by_kind
+}
+
+/// How many archive volumes the posted files hold, whatever their scheme.
+fn archive_volumes(files: &[FileInfo]) -> usize {
+    counts(files)
+        .iter()
+        .filter(|(k, _)| {
+            matches!(k, FileKind::RarVolume | FileKind::SevenZVolume | FileKind::ZipVolume | FileKind::RawSplit)
+        })
+        .map(|(_, n)| *n)
+        .sum()
 }
 
 /// The bytes of the files that are not PAR2, from the counts when they are there, else the release's size.
@@ -1366,11 +1384,21 @@ fn unpacked_estimate(
     inner: &InnerView,
     head: Option<&crate::probe::archive::ArchiveHead>,
 ) -> Option<i64> {
-    if !inner.files.is_empty() && inner.files.iter().all(|r| r.size.is_some()) {
-        return Some(inner.files.iter().filter_map(|r| r.size).sum());
+    // the archive's own listing when there is one. A PAR2 inventory lists the posted files, which are the
+    // contents only when none of them is an archive; added to the archive's listing it would count the volumes
+    // and what is inside them both
+    let listed: Vec<&InnerFileRow> = inner.files.iter().filter(|r| r.source != SOURCE_PAR2).collect();
+    let rows = if listed.is_empty() {
+        let par2: Vec<&InnerFileRow> = inner.files.iter().filter(|r| r.source == SOURCE_PAR2).collect();
+        if crate::duplicates::lists_archives(par2.iter().map(|r| r.name.as_str())) { Vec::new() } else { par2 }
+    } else {
+        listed
+    };
+    if !rows.is_empty() && rows.iter().all(|r| r.size.is_some()) {
+        return Some(rows.iter().filter_map(|r| r.size).sum());
     }
     if let Some(unpacked) = head.and_then(|a| a.unpacked)
-        && inner.files.len() <= 1
+        && rows.len() <= 1
     {
         return Some(unpacked as i64);
     }
@@ -1785,19 +1813,47 @@ impl FileParts {
     }
 }
 
+/// Every article of the release through `each`, stopping after `budget` of them: false when it stopped or the
+/// read failed, soo the caller says the list is partial instead of showing it as whole.
+fn walk_articles(conn: &Connection, id: i64, budget: usize, each: &mut dyn FnMut(ArticleRow)) -> bool {
+    let mut seen = 0usize;
+    store::each_article(conn, id, &mut |a| {
+        seen += 1;
+        if seen > budget {
+            return Err(rusqlite::Error::ToSqlConversionFailure("over the article budget".into()));
+        }
+        each(a);
+        Ok(())
+    })
+    .is_ok()
+}
+
 /// One row per file: subject, part map, first and last id, id grammar, article sizes, reposted parts.
 fn parts_fragment(conn: &Connection, id: i64) -> String {
     let Some(shard) = shard_conn(id) else { return String::new() };
     let files = store::release_files(&shard, id, FILES_CAP).unwrap_or_default();
+    parts_fragment_of(conn, id, &files, ARTICLE_BUDGET)
+}
+
+/// The Parts table from one pass over the articles, which gathers only the files the table shows and stops at
+/// `budget` articles.
+fn parts_fragment_of(conn: &Connection, id: i64, files: &[FileInfo], budget: usize) -> String {
     if files.is_empty() {
         return "<p class=\"dim\">This release has no files on record.</p>".into();
     }
+    let shown: HashSet<&str> = files.iter().take(PARTS_ROWS).map(|f| f.filename.as_str()).collect();
     let mut by_file: HashMap<String, FileParts> = HashMap::new();
-    let walked = store::each_article(conn, id, &mut |a| {
-        by_file.entry(a.filename.unwrap_or_default()).or_default().offer(a.part, a.message_id, a.bytes);
-        Ok(())
+    let walked = walk_articles(conn, id, budget, &mut |a| {
+        let name = a.filename.unwrap_or_default();
+        if shown.contains(name.as_str()) {
+            by_file.entry(name).or_default().offer(a.part, a.message_id, a.bytes);
+        }
     });
-    parts_table(&files, &by_file, walked.is_ok())
+    // a pass cut short would show the files it never reached as holed: the maps stay blank and the note says why
+    if !walked {
+        by_file.clear();
+    }
+    parts_table(files, &by_file, walked)
 }
 
 /// The Parts table's heading: no Name, Posted size or Articles column, which the NZB file list shows.
@@ -1830,7 +1886,7 @@ fn parts_table(files: &[FileInfo], by_file: &HashMap<String, FileParts>, walked:
     let mut notes = String::new();
     if !walked {
         notes.push_str(
-            "<p class=\"dim\">Too many articles to list: the maps show the parts counted at ingest only.</p>",
+            "<p class=\"dim\">Too many articles to list: the maps are blank, and each map's title has the parts counted at ingest.</p>",
         );
     }
     if files.len() > PARTS_ROWS {
@@ -1860,14 +1916,16 @@ fn part_map(seen: &BTreeSet<i64>, expected: i64) -> String {
 
 /// The digests over the articles: the segment set, the first part's CRC.
 fn hashes_fragment(conn: &Connection, id: i64) -> String {
+    hashes_fragment_of(conn, id, ARTICLE_BUDGET)
+}
+
+/// `hashes_fragment` with the segment set read from at most `budget` articles.
+fn hashes_fragment_of(conn: &Connection, id: i64, budget: usize) -> String {
     let probe = crate::probe::read(conn, id);
     let mut ids: Vec<String> = Vec::new();
-    let walked = store::each_article(conn, id, &mut |a| {
-        ids.push(a.message_id);
-        Ok(())
-    });
+    let walked = walk_articles(conn, id, budget, &mut |a| ids.push(a.message_id));
     let mut f = Facts::new();
-    if walked.is_ok() && !ids.is_empty() {
+    if walked && !ids.is_empty() {
         ids.sort();
         ids.dedup();
         let mut h = Sha256::new();
@@ -1889,7 +1947,7 @@ fn hashes_fragment(conn: &Connection, id: i64) -> String {
         f.key("First part CRC", y.pcrc32.map(|c| format!("{c:08x}")));
         f.key("First part yEnc CRC32", y.crc32.map(|c| format!("{c:08x}")));
     }
-    if walked.is_err() {
+    if !walked {
         f.add("Segment set", Some("too many articles to list"));
     }
     if f.rows == 0 {
@@ -1955,7 +2013,6 @@ fn drawer_shell(id: i64, body: String, as_card: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::archive::store::InnerFileRow;
     use crate::archive::{PasswordTest, rar, zip};
     use crate::probe::ProbeInfo;
     use crate::probe::archive::ArchiveHead;
@@ -2273,6 +2330,11 @@ mod tests {
 
     #[test]
     fn subject_skeleton_and_encoded_words() {
+        // a stray `=` in front of a multibyte character is kept as it is, never sliced through
+        assert_eq!(decode_q("=€"), "=€".as_bytes());
+        assert_eq!(decode_q("a=4"), b"a=4");
+        assert_eq!(decode_q("=4=4a_b="), b"=4J b=");
+        assert_eq!(decode_encoded_words("[1/2] =?UTF-8?Q?=€_x?= yEnc").as_deref(), Some("[1/2] =€ x yEnc"));
         assert_eq!(
             subject_skeleton("Foo.S01E01 [01/23] - \"foo.r00\" yEnc (1/50)"),
             "Foo.S01E01 [##/##] - \"…\" yEnc (#/##)"
@@ -2622,8 +2684,9 @@ mod tests {
         let head = probe().archive.unwrap();
         let files = volumes(47);
         let size = Some(47 * 50 * MIB);
-        // the listed files when all are sized, else the archive's figure, else the data less yEnc's overhead
-        assert_eq!(unpacked_estimate(&files, size, &contents(), &inner(), Some(&head)), Some(2_400_004_000));
+        // the archive's listing when all of it is sized, else the archive's figure, else the data less yEnc's
+        // overhead; the PAR2 inventory's rows are not added to the archive's listing
+        assert_eq!(unpacked_estimate(&files, size, &contents(), &inner(), Some(&head)), Some(2_400_000_000));
         assert_eq!(
             unpacked_estimate(&files, size, &contents(), &InnerView::default(), Some(&head)),
             Some(2_400_000_000)
@@ -2636,6 +2699,32 @@ mod tests {
             unpacked_estimate(&[file("x.nfo", 1)], Some(4000), &Contents::default(), &InnerView::default(), None),
             None
         );
+        // a PAR2 inventory of archive volumes says nothing about what is inside them
+        let par2_of_volumes = InnerView {
+            files: (1..=47i64)
+                .map(|v| InnerFileRow {
+                    seq: v,
+                    name: format!("{NAME}.part{v:02}.rar"),
+                    size: Some(50 * MIB),
+                    source: SOURCE_PAR2,
+                })
+                .collect(),
+            ..Default::default()
+        };
+        assert_eq!(
+            unpacked_estimate(&files, size, &contents(), &par2_of_volumes, None),
+            Some(47 * 50 * MIB * 100 / 103)
+        );
+        // one of plain files is the contents
+        let par2_of_contents = InnerView {
+            files: vec![
+                InnerFileRow { seq: 0, name: format!("{NAME}.mkv"), size: Some(2_400_000_000), source: SOURCE_PAR2 },
+                InnerFileRow { seq: 1, name: format!("{NAME}.nfo"), size: Some(4_000), source: SOURCE_PAR2 },
+            ],
+            ..Default::default()
+        };
+        let plain = [file(&format!("{NAME}.mkv"), 3000), file(&format!("{NAME}.nfo"), 1)];
+        assert_eq!(unpacked_estimate(&plain, size, &contents(), &par2_of_contents, None), Some(2_400_004_000));
 
         let random: Vec<FileInfo> =
             (1..=47).map(|v| file(&format!("x7Qp2mZk9vL4nB8wT3rY.part{v:02}.rar"), 50)).collect();
@@ -2658,7 +2747,13 @@ mod tests {
         let html = full();
         assert!(html.contains("<dt>PAR2</dt><dd>slice 1.0 MB, up to 96 of 1,000 blocks (9.6%)</dd>"), "{html}");
         assert!(html.contains("<dt>Unpacks to about</dt><dd>2.2 GB</dd>"), "{html}");
-        assert!(html.contains("<dt>Packed</dt><dd>2.2 GB of 2.2 GB (100%), stored</dd>"), "{html}");
+        // 47 volumes: the head's packed size is one volume's slice of the first file, soo no ratio
+        assert!(!html.contains("<dt>Packed</dt>"), "{html}");
+        let f = Fixture::new();
+        let one = inside_panel(&f.inputs(), &looked(vec![file("x.rar", 50)]), false).html;
+        assert!(one.contains("<dt>Packed</dt><dd>2.2 GB of 2.2 GB (100%), stored</dd>"), "{one}");
+        assert_eq!(archive_volumes(&volumes(47)), 47);
+        assert_eq!(archive_volumes(&[file("x.7z.001", 1), file("x.7z.002", 1), file("x.par2", 1)]), 2);
         assert!(html.contains("<dt>Packed by</dt><dd>stored, not compressed (m0)</dd>"), "{html}");
     }
 
@@ -2924,6 +3019,68 @@ mod tests {
             assert!(!THEIRS.contains(label), "{label} is already on the release page");
             assert!(seen.insert(*label), "{label} appears twice in {html}");
         }
+    }
+
+    #[test]
+    fn fragments_stop_at_the_article_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        crate::db::create_db_at(&main).unwrap();
+        let poster = "poster <p@example.com>";
+        let date = "2026-10-03 17:41:49";
+        let articles: Vec<crate::parser::Article> = (1..=3)
+            .map(|part| {
+                let subject = format!("[01/52] - \"{VOLUME1}\" yEnc ({part}/3)");
+                let parsed = crate::parser::parse_subject(&subject).unwrap();
+                crate::parser::Article {
+                    subject,
+                    author: poster.into(),
+                    date: date.into(),
+                    message_id: format!("<part{part}@nyuu>"),
+                    bytes: 700_000 + part,
+                    filename: Some(parsed.filename.clone()),
+                    release_name: Some(parsed.release_name.clone()),
+                    part: Some(part),
+                    total_parts: Some(3),
+                    file_index: Some(1),
+                    file_total: Some(52),
+                    ..Default::default()
+                }
+            })
+            .collect();
+        let parsed = crate::parser::parse_subject(&articles[0].subject).unwrap();
+        let collection = crate::collections::Collections::new(GROUP).of(&articles[0], &parsed);
+        let release = crate::parser::Release {
+            name: parsed.release_name.clone(),
+            articles,
+            size: 2_100_006,
+            group: GROUP.into(),
+            poster: poster.into(),
+            date: date.into(),
+            collection,
+            ..Default::default()
+        };
+        store::save(&main, &[release]).unwrap();
+        let conn = crate::db::open_with_shards(&main).unwrap();
+        let shard = crate::db::open_shard(&store::shard_path(&main, store::shard_of(GROUP))).unwrap();
+        let id: i64 = shard.query_row("select id from releases", [], |r| r.get(0)).unwrap();
+        let files = store::release_files(&shard, id, FILES_CAP).unwrap();
+        assert_eq!(files.len(), 1);
+        // within the budget: the three parts are mapped and the ids read
+        let table = parts_fragment_of(&conn, id, &files, ARTICLE_BUDGET);
+        assert!(
+            table.contains("title=\"3 of 3 parts\"")
+                && table.contains("<td>&lt;part1@nyuu&gt;</td><td>&lt;part3@nyuu&gt;</td>")
+                && !table.contains("Too many articles"),
+            "{table}"
+        );
+        let hashes = hashes_fragment_of(&conn, id, ARTICLE_BUDGET);
+        assert!(hashes.contains("over 3 articles"), "{hashes}");
+        // past it: the pass stops, the maps stay blank and both fragments say so
+        let table = parts_fragment_of(&conn, id, &files, 2);
+        assert!(table.contains("Too many articles to list") && !table.contains("part1@nyuu"), "{table}");
+        let hashes = hashes_fragment_of(&conn, id, 2);
+        assert!(hashes.contains("too many articles to list") && !hashes.contains("over 3 articles"), "{hashes}");
     }
 
     #[test]
