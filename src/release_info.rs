@@ -356,17 +356,26 @@ impl UnionFiles {
     }
 }
 
-/// A subject without the number that changes from part to part, the N in `(N/M)`.
-fn subject_of_file(subject: &str) -> String {
+/// A subject without the number that changes from part to part: the N in `(N/M)`, and in `[N/M]` when M is how many
+/// parts the file has, for the posts whose bracket counter is the part number.
+fn subject_of_file(subject: &str, expected: Option<i64>) -> String {
+    let mut subject = subject.to_string();
     for (open, _) in subject.rmatch_indices('(') {
         let rest = &subject[open + 1..];
         let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
         let counter = rest[digits..].trim_start();
         if digits > 0 && counter.starts_with('/') {
-            return format!("{}({counter}", &subject[..open]);
+            subject = format!("{}({counter}", &subject[..open]);
+            break;
         }
     }
-    subject.to_string()
+    if let Some(end) = expected.and_then(|parts| subject.find(&format!("/{parts}]"))) {
+        let number = subject[..end].trim_end_matches(|c: char| c.is_ascii_digit());
+        if number.ends_with('[') && number.len() < end {
+            return format!("{number}{}", &subject[end..]);
+        }
+    }
+    subject
 }
 
 fn union_files(conn: &Connection, ids: &[i64]) -> Result<UnionFiles> {
@@ -390,7 +399,7 @@ fn union_files(conn: &Connection, ids: &[i64]) -> Result<UnionFiles> {
             let (filename, expected, seen, total, subject) = row?;
             union.file_totals.insert(total);
             filenames.insert(filename.clone());
-            let subject = subject.as_deref().map(subject_of_file);
+            let subject = subject.as_deref().map(|subject| subject_of_file(subject, expected));
             match union.files.entry(filename) {
                 Entry::Vacant(file) => {
                     file.insert(UnionFile { expected, seen, subject });
