@@ -69,6 +69,19 @@ fn a_cut_stream_gives_a_true_prefix() {
 }
 
 #[test]
+fn a_symbol_decided_past_the_end_is_dropped() {
+    // the review's case: cut by one byte, the last symbol came from a zero read in place of the missing byte
+    let hex = "041019a28e35965f3b326ab1b55cd5d0e88a3dbc02d743a1";
+    let data: Vec<u8> = (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap()).collect();
+    let (whole, _) = zip(&data, Some(24), usize::MAX);
+    for keep in 2..data.len() {
+        let (out, end) = zip(&data[..keep], Some(24), usize::MAX);
+        assert_eq!(end, End::Cut, "kept {keep}");
+        assert!(whole.starts_with(&out), "kept {keep}: {out:?} vs {whole:?}");
+    }
+}
+
+#[test]
 fn headers_it_cant_use_are_cut() {
     // order 1, and a restore method that doesn't exist
     for head in [0x00f0u16, 0x2015] {

@@ -1374,6 +1374,8 @@ fn run(data: &[u8], size: Option<u64>, limit: usize) -> (Vec<u8>, End, (u32, u32
             return (out, End::Cut, seen(&model));
         }
         match model.decode_symbol(&mut rc) {
+            // a symbol that needed a byte past the end was decided by the zeros read in its place
+            Some(_) if rc.overran() => return (out, End::Cut, seen(&model)),
             Some(b) => out.push(b),
             None => {
                 let end = if size.is_none() && !model.broken && !model.heap.over { End::Done } else { End::Cut };
