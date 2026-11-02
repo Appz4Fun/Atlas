@@ -121,14 +121,31 @@ pub fn build_nzb(release_id: i64) -> Result<Option<String>> {
 pub(crate) fn inventory(release: &ReleaseRow) -> crate::db::Result<(Vec<ArticleRow>, Vec<String>)> {
     let conn = crate::db::open()?;
     if let Some(post) = crate::release_info::whole_post_with(&conn, release)? {
-        let mut all = Vec::new();
+        let mut rows = Vec::new();
         for id in &post.ids {
-            all.extend(crate::store::articles(&conn, *id)?);
+            rows.push((*id, crate::store::articles(&conn, *id)?));
         }
+        // the rows of a linked upload are separate files, where a post cut across groups is one file under one name
+        if post.lead.is_some() {
+            keep_files_apart(&mut rows);
+        }
+        let mut all: Vec<ArticleRow> = rows.into_iter().flat_map(|(_, articles)| articles).collect();
         all.sort_by(|a, b| (&a.filename, a.part, &a.message_id).cmp(&(&b.filename, b.part, &b.message_id)));
         return Ok((all, post.groups));
     }
     Ok((get_articles(release.id)?, vec![release.group_name.clone()]))
+}
+
+/// A file whose name another row already has keeps its own <file>: the name the NZB groups it by gets its row's id.
+fn keep_files_apart(rows: &mut [(i64, Vec<ArticleRow>)]) {
+    let mut taken: std::collections::HashMap<Option<String>, i64> = std::collections::HashMap::new();
+    for (id, articles) in rows {
+        for a in articles {
+            if *taken.entry(a.filename.clone()).or_insert(*id) != *id {
+                a.filename = Some(format!("{} #{id}", a.filename.as_deref().unwrap_or("")));
+            }
+        }
+    }
 }
 
 fn whole_nzb(release_id: i64) -> Result<Option<String>> {
@@ -192,6 +209,30 @@ mod tests {
         assert_eq!(nzb_filename("a/b:c?.mkv", Some(7)), "a_b_c_.mkv.7.nzb");
         assert_eq!(nzb_filename(" .. ", None), "release.nzb");
         assert_eq!(nzb_filename("x\u{1}y", Some(0)), "x_y.nzb");
+    }
+
+    #[test]
+    fn same_named_files_of_a_linked_upload_stay_apart() {
+        let art = |file: &str, part: i64| ArticleRow {
+            message_id: format!("<{file}{part}@x>"),
+            filename: Some(file.into()),
+            part: Some(part),
+            total_parts: Some(2),
+            bytes: Some(1),
+            subject: None,
+            poster: None,
+            posted_date: None,
+        };
+        let mut rows = vec![
+            (8, vec![art("x.bin", 1), art("x.bin", 2)]),
+            (16, vec![art("x.bin", 1), art("x.bin", 2)]),
+            (24, vec![art("y.bin", 1)]),
+        ];
+        keep_files_apart(&mut rows);
+        let names = |row: usize| rows[row].1.iter().map(|a| a.filename.clone().unwrap()).collect::<Vec<_>>();
+        assert_eq!(names(0), ["x.bin", "x.bin"]);
+        assert_eq!(names(1), ["x.bin #16", "x.bin #16"]);
+        assert_eq!(names(2), ["y.bin"]);
     }
 
     #[test]
