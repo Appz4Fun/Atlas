@@ -1112,8 +1112,12 @@ fn release_html(
 
     let probe = crate::db::open()
         .ok()
-        .and_then(|conn| crate::probe::read(&conn, r.id))
-        .map_or(String::new(), |p| probe_html(&p));
+        .and_then(|conn| {
+            let found = crate::probe::read(&conn, r.id)?;
+            let matched = crate::probe::opensubtitles::read(&conn, r.id);
+            Some(probe_html(&found, matched.as_ref()))
+        })
+        .unwrap_or_default();
     let copies = crate::duplicates::copies(r.id).unwrap_or_default();
     let has_twin = crate::duplicates::can_fill(&copies);
     let fill = if has_twin && contents.articles_seen < contents.articles_expected {
@@ -1186,7 +1190,7 @@ fn panel(title: &str, facts: &str) -> String {
 }
 
 /// What reading a release's articles found, without downloading it.
-fn probe_html(p: &crate::probe::ProbeInfo) -> String {
+fn probe_html(p: &crate::probe::ProbeInfo, matched: Option<&crate::probe::opensubtitles::Stored>) -> String {
     let dd = |out: &mut String, name: &str, value: String| {
         if !value.is_empty() {
             let _ = write!(out, "<dt>{name}</dt><dd>{value}</dd>");
@@ -1275,6 +1279,7 @@ fn probe_html(p: &crate::probe::ProbeInfo) -> String {
         dd(&mut tracks, "Container", escape(&m.container));
         dd(&mut tracks, "Written by", m.writing_app.as_deref().map_or(String::new(), escape));
         dd(&mut tracks, "Muxed by", m.muxing_app.as_deref().map_or(String::new(), escape));
+        dd(&mut tracks, "Title", m.title.as_deref().map_or(String::new(), escape));
         dd(
             &mut tracks,
             "Duration",
@@ -1312,6 +1317,10 @@ fn probe_html(p: &crate::probe::ProbeInfo) -> String {
             if a.atmos {
                 parts.push("Atmos".into());
             }
+            // a name that says so already
+            if a.commentary && !a.name.as_deref().is_some_and(|n| n.to_ascii_lowercase().contains("commentary")) {
+                parts.push("commentary".into());
+            }
             parts.extend(a.name.clone());
             dd(&mut tracks, "Audio", escape(&parts.join(", ")));
         }
@@ -1324,8 +1333,39 @@ fn probe_html(p: &crate::probe::ProbeInfo) -> String {
             if s.hearing_impaired {
                 parts.push("SDH".into());
             }
+            // a name that says so already
+            if s.commentary && !s.name.as_deref().is_some_and(|n| n.to_ascii_lowercase().contains("commentary")) {
+                parts.push("commentary".into());
+            }
             parts.extend(s.name.clone());
             dd(&mut tracks, "Subtitles", escape(&parts.join(", ")));
+        }
+    }
+
+    if let Some(hash) = &p.moviehash {
+        dd(&mut tracks, "OpenSubtitles hash", escape(hash));
+    }
+    if let Some(f) = matched.and_then(|m| m.feature.as_ref()) {
+        let mut name = f.title.clone().unwrap_or_default();
+        if let (Some(season), Some(episode)) = (f.season, f.episode) {
+            let _ = write!(name, " S{season:02}E{episode:02}");
+        }
+        if let Some(year) = f.year {
+            let _ = write!(name, " ({year})");
+        }
+        let link = f.imdb_id.map_or(escape(&name), |id| {
+            format!("<a href=\"https://www.imdb.com/title/tt{id:07}/\" rel=\"noreferrer\">{}</a>", escape(&name))
+        });
+        let release = f.release_name.as_deref().map_or(String::new(), |r| format!(" · {}", escape(r)));
+        dd(&mut tracks, "OpenSubtitles match", format!("{link}{release}"));
+    }
+    let mut chapters = String::new();
+    if let Some(m) = &p.media {
+        for (n, c) in m.chapters.iter().enumerate() {
+            let s = c.start_secs.max(0.0) as u64;
+            let at = format!("{}:{:02}:{:02}", s / 3600, s % 3600 / 60, s % 60);
+            let name = c.name.as_deref().map_or_else(|| format!("Chapter {}", n + 1), str::to_string);
+            dd(&mut chapters, &at, escape(&name));
         }
     }
 
@@ -1350,8 +1390,9 @@ fn probe_html(p: &crate::probe::ProbeInfo) -> String {
         format!("<h2>SFV</h2><div class=\"table-wrap\"><table><tbody>{rows}</tbody></table></div>")
     };
     format!(
-        "{}{}{}{}{nfo}{sfv}",
+        "{}{}{}{}{}{nfo}{sfv}",
         panel("Tracks", &tracks),
+        panel("Chapters", &chapters),
         panel("yEnc", &yenc),
         panel("Packing", &packed),
         panel("How it was posted", &posted),

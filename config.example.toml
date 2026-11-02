@@ -104,6 +104,10 @@ api_key = ""
 [media.trakt]
 client_id = ""
 
+# names a probed video from its OpenSubtitles hash, see opensubtitles.com/consumers
+[media.opensubtitles]
+api_key = ""
+
 [metrics]
 enabled = false
 host = "127.0.0.1"
