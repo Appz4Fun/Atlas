@@ -112,4 +112,3 @@ impl Table {
         self.decode_num.get(pos).copied().unwrap_or(0)
     }
 }
-
