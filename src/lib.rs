@@ -46,5 +46,6 @@ pub mod search;
 pub mod stats_dashboard;
 pub mod store;
 pub mod ui;
+pub mod video;
 pub mod web;
 mod web_meta;
