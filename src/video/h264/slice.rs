@@ -99,7 +99,7 @@ pub fn parse(data: &[u8], nal: u8, lookup: impl Fn(u32) -> Option<(Sps, Pps)>) -
             }
         }
     }
-    let qp = pps.init_qp + r.se()?;
+    let qp = i64::from(pps.init_qp) + i64::from(r.se()?);
     if !(0..=51).contains(&qp) {
         return Err(DecodeError::Invalid("slice QP"));
     }
@@ -107,11 +107,11 @@ pub fn parse(data: &[u8], nal: u8, lookup: impl Fn(u32) -> Option<(Sps, Pps)>) -
     if pps.deblocking_control {
         deblocking = r.ue_max(2, "disable_deblocking_filter_idc")?;
         if deblocking != 1 {
-            alpha_offset = r.se()? * 2;
-            beta_offset = r.se()? * 2;
-            if !(-12..=12).contains(&alpha_offset) || !(-12..=12).contains(&beta_offset) {
+            let (alpha, beta) = (r.se()?, r.se()?);
+            if !(-6..=6).contains(&alpha) || !(-6..=6).contains(&beta) {
                 return Err(DecodeError::Invalid("deblocking offsets"));
             }
+            (alpha_offset, beta_offset) = (alpha * 2, beta * 2);
         }
     }
     let data_start = r.position().div_ceil(8);
@@ -121,7 +121,7 @@ pub fn parse(data: &[u8], nal: u8, lookup: impl Fn(u32) -> Option<(Sps, Pps)>) -
         frame_num,
         idr_pic_id,
         poc_lsb,
-        qp,
+        qp: qp as i32,
         deblocking,
         alpha_offset,
         beta_offset,

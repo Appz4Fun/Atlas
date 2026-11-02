@@ -271,7 +271,11 @@ pub fn parse_pps(nal: &[u8]) -> Result<Pps> {
     r.ue()?; // num_ref_idx_l0/l1_default_active_minus1
     r.flag()?; // weighted_pred_flag
     r.skip(2)?; // weighted_bipred_idc
-    let init_qp = 26 + r.se()?;
+    let init_qp = r.se()?;
+    if !(-26..=25).contains(&init_qp) {
+        return Err(DecodeError::Invalid("pic_init_qp_minus26"));
+    }
+    let init_qp = 26 + init_qp;
     r.se()?; // pic_init_qs_minus26
     let cb = r.se()?;
     if !(-12..=12).contains(&cb) {

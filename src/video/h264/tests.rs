@@ -220,3 +220,44 @@ fn a_picture_bigger_than_4k_is_refused() {
     units[at] = &sps;
     assert_eq!(decode_keyframe(&units).unwrap_err(), DecodeError::Unsupported("picture bigger than 4K"));
 }
+
+/// Exp-Golomb codes as a string of bits.
+fn ue(v: u64, bits: &mut String) {
+    let n = 64 - (v + 1).leading_zeros();
+    bits.push_str(&"0".repeat(n as usize - 1));
+    bits.push_str(&format!("{:b}", v + 1));
+}
+
+fn nal(head: u8, mut bits: String) -> Vec<u8> {
+    bits.push('1');
+    while !bits.len().is_multiple_of(8) {
+        bits.push('0');
+    }
+    let mut out = vec![head];
+    out.extend(bits.as_bytes().chunks(8).map(|c| u8::from_str_radix(std::str::from_utf8(c).unwrap(), 2).unwrap()));
+    out
+}
+
+#[test]
+fn signed_values_out_of_range_are_errors() {
+    // a PPS whose pic_init_qp_minus26 is i32::MAX
+    let mut bits = String::new();
+    for v in [0, 0] {
+        ue(v, &mut bits);
+    }
+    bits.push_str("10"); // CABAC, no bottom field order
+    for v in [0, 0, 0] {
+        ue(v, &mut bits);
+    }
+    bits.push_str("000"); // weighted prediction
+    ue(2 * i32::MAX as u64 - 1, &mut bits);
+    ue(0, &mut bits);
+    ue(0, &mut bits);
+    bits.push_str("000");
+    let pps = nal(0x68, bits);
+    let data = fixture("i8x8.h264");
+    let mut units = split_annex_b(&data);
+    let at = units.iter().position(|u| u[0] & 0x1F == 8).unwrap();
+    units[at] = &pps;
+    assert_eq!(decode_keyframe(&units).unwrap_err(), DecodeError::Invalid("pic_init_qp_minus26"));
+}
