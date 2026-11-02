@@ -359,20 +359,22 @@ impl UnionFiles {
     }
 }
 
-/// A subject without the number that changes from part to part: the N in `(N/M)`, and in `[N/M]` when M is how many
-/// parts the file has, for the posts whose bracket counter is the part number.
+/// A subject without the number that changes from part to part: the N in `(N/M)`, or in `[N/M]` for a post where
+/// `(1/1)` says each article is a whole file, soo the bracket counter is the part number (`parser::remap_bracket_parts`).
 fn subject_of_file(subject: &str, expected: Option<i64>) -> String {
     let mut subject = subject.to_string();
+    let mut one_article_files = false;
     for (open, _) in subject.rmatch_indices('(') {
         let rest = &subject[open + 1..];
         let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
         let counter = rest[digits..].trim_start();
         if digits > 0 && counter.starts_with('/') {
+            one_article_files = counter[1..].trim_start().starts_with("1)");
             subject = format!("{}({counter}", &subject[..open]);
             break;
         }
     }
-    if let Some(end) = expected.and_then(|parts| subject.find(&format!("/{parts}]"))) {
+    if one_article_files && let Some(end) = expected.and_then(|parts| subject.find(&format!("/{parts}]"))) {
         let number = subject[..end].trim_end_matches(|c: char| c.is_ascii_digit());
         if number.ends_with('[') && number.len() < end {
             return format!("{number}{}", &subject[end..]);

@@ -258,6 +258,15 @@ fn the_web_ui_end_to_end() {
     let bracket = fetch(port, "/ui/results?q=Bracket", &cookie);
     assert!(bracket.body.contains("2 GROUPS") && !bracket.body.contains("INCOMPLETE"), "{}", bracket.body);
 
+    // but not a bracket counter that counts files
+    for (group, part) in [("alt.binaries.g1", 1), ("alt.binaries.g2", 2)] {
+        let mut one = article("indexed.bin", part, 2, &format!("<indexed.{part}@x>"));
+        one.subject = format!("[{part}/2] \"indexed.bin\" yEnc ({part}/2)");
+        posted("Indexed.Post.S01E01-GRP", group, one, DAY);
+    }
+    let indexed = fetch(port, "/ui/results?q=Indexed", &cookie);
+    assert!(indexed.body.contains("INCOMPLETE") && !indexed.body.contains(" GROUPS"), "{}", indexed.body);
+
     // with no count of files, a file only one group has doesn't join
     posted("Extra.File.S01E01-GRP", "alt.binaries.g1", article("x.bin", 1, 2, "<extra.1@x>"), DAY);
     posted("Extra.File.S01E01-GRP", "alt.binaries.g2", article("x.bin", 2, 2, "<extra.2@x>"), DAY);
