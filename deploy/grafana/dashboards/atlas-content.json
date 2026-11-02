@@ -1,0 +1,3439 @@
+{
+ "uid": "atlas-content",
+ "title": "Atlas: Releases and content",
+ "description": "What Atlas has stored: categories, sizes, groups, release groups and the PreDB. Totals come from the catalog walk.",
+ "tags": [
+  "atlas"
+ ],
+ "schemaVersion": 39,
+ "editable": true,
+ "graphTooltip": 1,
+ "refresh": "30s",
+ "time": {
+  "from": "now-6h",
+  "to": "now"
+ },
+ "timezone": "browser",
+ "links": [
+  {
+   "title": "Atlas",
+   "type": "dashboards",
+   "tags": [
+    "atlas"
+   ],
+   "asDropdown": false,
+   "includeVars": false,
+   "keepTime": true,
+   "icon": "external link",
+   "targetBlank": false
+  }
+ ],
+ "templating": {
+  "list": [
+   {
+    "name": "root",
+    "label": "Category",
+    "type": "query",
+    "datasource": {
+     "type": "prometheus",
+     "uid": "victoriametrics"
+    },
+    "refresh": 2,
+    "sort": 1,
+    "query": {
+     "query": "label_values(atlas_catalog_release_size_count, root)",
+     "refId": "A"
+    },
+    "definition": "label_values(atlas_catalog_release_size_count, root)",
+    "multi": true,
+    "includeAll": true,
+    "allValue": ".*",
+    "current": {
+     "text": "All",
+     "value": "$__all"
+    }
+   }
+  ]
+ },
+ "annotations": {
+  "list": []
+ },
+ "panels": [
+  {
+   "id": 2,
+   "type": "row",
+   "title": "Releases",
+   "collapsed": false,
+   "panels": [],
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 0
+   }
+  },
+  {
+   "id": 3,
+   "type": "stat",
+   "title": "Releases",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 4,
+    "x": 0,
+    "y": 1
+   },
+   "targets": [
+    {
+     "expr": "atlas_catalog_releases{state=\"total\"}",
+     "legendFormat": "__auto",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "text",
+        "value": null
+       }
+      ]
+     },
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "options": {
+    "colorMode": "value",
+    "graphMode": "none",
+    "justifyMode": "auto",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "textMode": "auto"
+   },
+   "transformations": []
+  },
+  {
+   "id": 4,
+   "type": "stat",
+   "title": "Complete",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 4,
+    "x": 4,
+    "y": 1
+   },
+   "targets": [
+    {
+     "expr": "atlas_catalog_releases{state=\"complete\"} / ignoring(state) atlas_catalog_releases{state=\"total\"}",
+     "legendFormat": "__auto",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "text",
+        "value": null
+       }
+      ]
+     },
+     "unit": "percentunit"
+    },
+    "overrides": []
+   },
+   "options": {
+    "colorMode": "value",
+    "graphMode": "none",
+    "justifyMode": "auto",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "textMode": "auto"
+   },
+   "transformations": []
+  },
+  {
+   "id": 5,
+   "type": "stat",
+   "title": "NZB ready",
+   "description": "At least one article saved.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 4,
+    "x": 8,
+    "y": 1
+   },
+   "targets": [
+    {
+     "expr": "atlas_catalog_releases{state=\"nzb_ready\"}",
+     "legendFormat": "__auto",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "text",
+        "value": null
+       }
+      ]
+     },
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "options": {
+    "colorMode": "value",
+    "graphMode": "none",
+    "justifyMode": "auto",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "textMode": "auto"
+   },
+   "transformations": []
+  },
+  {
+   "id": 6,
+   "type": "stat",
+   "title": "Named",
+   "description": "Carry a name found by a processing step.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 4,
+    "x": 12,
+    "y": 1
+   },
+   "targets": [
+    {
+     "expr": "atlas_catalog_releases{state=\"named\"}",
+     "legendFormat": "__auto",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "text",
+        "value": null
+       }
+      ]
+     },
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "options": {
+    "colorMode": "value",
+    "graphMode": "none",
+    "justifyMode": "auto",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "textMode": "auto"
+   },
+   "transformations": []
+  },
+  {
+   "id": 7,
+   "type": "stat",
+   "title": "Still obfuscated",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 4,
+    "x": 16,
+    "y": 1
+   },
+   "targets": [
+    {
+     "expr": "atlas_catalog_releases{state=\"still_obfuscated\"}",
+     "legendFormat": "__auto",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "text",
+        "value": null
+       }
+      ]
+     },
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "options": {
+    "colorMode": "value",
+    "graphMode": "none",
+    "justifyMode": "auto",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "textMode": "auto"
+   },
+   "transformations": []
+  },
+  {
+   "id": 8,
+   "type": "stat",
+   "title": "Last walk",
+   "description": "Age of the catalog numbers.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 4,
+    "x": 20,
+    "y": 1
+   },
+   "targets": [
+    {
+     "expr": "time() - atlas_catalog_scan_timestamp_seconds",
+     "legendFormat": "__auto",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "text",
+        "value": null
+       }
+      ]
+     },
+     "unit": "s"
+    },
+    "overrides": []
+   },
+   "options": {
+    "colorMode": "value",
+    "graphMode": "none",
+    "justifyMode": "auto",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "textMode": "auto"
+   },
+   "transformations": []
+  },
+  {
+   "id": 9,
+   "type": "timeseries",
+   "title": "New releases per minute",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 0,
+    "y": 5
+   },
+   "targets": [
+    {
+     "expr": "sum(deriv(atlas_db_rows{kind=\"releases\"}[5m])) * 60",
+     "legendFormat": "new releases",
+     "editorMode": "code",
+     "instant": false,
+     "range": true,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "fillOpacity": 8,
+      "lineWidth": 1,
+      "showPoints": "never",
+      "spanNulls": false,
+      "drawStyle": "line",
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "bottom",
+     "calcs": [
+      "lastNotNull",
+      "max"
+     ],
+     "showLegend": true,
+     "sortBy": "Max",
+     "sortDesc": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "transformations": []
+  },
+  {
+   "id": 10,
+   "type": "timeseries",
+   "title": "Releases over time",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 12,
+    "y": 5
+   },
+   "targets": [
+    {
+     "expr": "atlas_catalog_releases{state=~\"total|complete|named\"}",
+     "legendFormat": "{{state}}",
+     "editorMode": "code",
+     "instant": false,
+     "range": true,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "fillOpacity": 8,
+      "lineWidth": 1,
+      "showPoints": "never",
+      "spanNulls": false,
+      "drawStyle": "line",
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "bottom",
+     "calcs": [
+      "lastNotNull",
+      "max"
+     ],
+     "showLegend": true,
+     "sortBy": "Max",
+     "sortDesc": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "transformations": []
+  },
+  {
+   "id": 11,
+   "type": "row",
+   "title": "Deobfuscation",
+   "collapsed": false,
+   "panels": [],
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 13
+   }
+  },
+  {
+   "id": 12,
+   "type": "stat",
+   "title": "Deobfuscated in range",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 6,
+    "x": 0,
+    "y": 14
+   },
+   "targets": [
+    {
+     "expr": "sum(increase(atlas_deobfuscated_total[$__range]))",
+     "legendFormat": "__auto",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "text",
+        "value": null
+       }
+      ]
+     },
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "options": {
+    "colorMode": "value",
+    "graphMode": "none",
+    "justifyMode": "auto",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "textMode": "auto"
+   },
+   "transformations": []
+  },
+  {
+   "id": 13,
+   "type": "stat",
+   "title": "Names written in range",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 6,
+    "x": 6,
+    "y": 14
+   },
+   "targets": [
+    {
+     "expr": "sum(increase(atlas_names_applied_total[$__range]))",
+     "legendFormat": "__auto",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "text",
+        "value": null
+       }
+      ]
+     },
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "options": {
+    "colorMode": "value",
+    "graphMode": "none",
+    "justifyMode": "auto",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "textMode": "auto"
+   },
+   "transformations": []
+  },
+  {
+   "id": 14,
+   "type": "stat",
+   "title": "Deobfuscated share of obfuscated",
+   "description": "Named by a step, out of those plus the ones still obfuscated.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 6,
+    "x": 12,
+    "y": 14
+   },
+   "targets": [
+    {
+     "expr": "sum(atlas_catalog_name_source_releases{source!~\"posted|cleared\"}) / (sum(atlas_catalog_name_source_releases{source!~\"posted|cleared\"}) + sum(atlas_catalog_releases{state=\"still_obfuscated\"}))",
+     "legendFormat": "__auto",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "text",
+        "value": null
+       }
+      ]
+     },
+     "unit": "percentunit"
+    },
+    "overrides": []
+   },
+   "options": {
+    "colorMode": "value",
+    "graphMode": "none",
+    "justifyMode": "auto",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "textMode": "auto"
+   },
+   "transformations": []
+  },
+  {
+   "id": 15,
+   "type": "stat",
+   "title": "Still obfuscated",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 6,
+    "x": 18,
+    "y": 14
+   },
+   "targets": [
+    {
+     "expr": "atlas_catalog_releases{state=\"still_obfuscated\"}",
+     "legendFormat": "__auto",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "text",
+        "value": null
+       }
+      ]
+     },
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "options": {
+    "colorMode": "value",
+    "graphMode": "none",
+    "justifyMode": "auto",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "textMode": "auto"
+   },
+   "transformations": []
+  },
+  {
+   "id": 16,
+   "type": "timeseries",
+   "title": "Deobfuscated per minute, by source",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 0,
+    "y": 18
+   },
+   "targets": [
+    {
+     "expr": "sum by (source) (rate(atlas_deobfuscated_total[5m])) * 60",
+     "legendFormat": "{{source}}",
+     "editorMode": "code",
+     "instant": false,
+     "range": true,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "fillOpacity": 25,
+      "lineWidth": 1,
+      "showPoints": "never",
+      "spanNulls": false,
+      "drawStyle": "line",
+      "stacking": {
+       "mode": "normal",
+       "group": "A"
+      }
+     },
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "bottom",
+     "calcs": [
+      "lastNotNull",
+      "max"
+     ],
+     "showLegend": true,
+     "sortBy": "Max",
+     "sortDesc": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "transformations": []
+  },
+  {
+   "id": 17,
+   "type": "piechart",
+   "title": "Where names came from",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 9,
+    "w": 12,
+    "x": 12,
+    "y": 18
+   },
+   "targets": [
+    {
+     "expr": "atlas_catalog_name_source_releases",
+     "legendFormat": "{{source}}",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "options": {
+    "pieType": "donut",
+    "displayLabels": [
+     "percent"
+    ],
+    "tooltip": {
+     "mode": "single"
+    },
+    "legend": {
+     "displayMode": "table",
+     "placement": "right",
+     "values": [
+      "value",
+      "percent"
+     ],
+     "showLegend": true
+    },
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    }
+   },
+   "transformations": []
+  },
+  {
+   "id": 18,
+   "type": "row",
+   "title": "Categories",
+   "collapsed": false,
+   "panels": [],
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 27
+   }
+  },
+  {
+   "id": 19,
+   "type": "piechart",
+   "title": "Releases by root category",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 9,
+    "w": 8,
+    "x": 0,
+    "y": 28
+   },
+   "targets": [
+    {
+     "expr": "sum by (root) (atlas_catalog_category_releases)",
+     "legendFormat": "{{root}}",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "options": {
+    "pieType": "donut",
+    "displayLabels": [
+     "percent"
+    ],
+    "tooltip": {
+     "mode": "single"
+    },
+    "legend": {
+     "displayMode": "table",
+     "placement": "right",
+     "values": [
+      "value",
+      "percent"
+     ],
+     "showLegend": true
+    },
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    }
+   },
+   "transformations": []
+  },
+  {
+   "id": 20,
+   "type": "piechart",
+   "title": "Size by root category",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 9,
+    "w": 8,
+    "x": 8,
+    "y": 28
+   },
+   "targets": [
+    {
+     "expr": "sum by (root) (atlas_catalog_category_bytes)",
+     "legendFormat": "{{root}}",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "bytes"
+    },
+    "overrides": []
+   },
+   "options": {
+    "pieType": "donut",
+    "displayLabels": [
+     "percent"
+    ],
+    "tooltip": {
+     "mode": "single"
+    },
+    "legend": {
+     "displayMode": "table",
+     "placement": "right",
+     "values": [
+      "value",
+      "percent"
+     ],
+     "showLegend": true
+    },
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    }
+   },
+   "transformations": []
+  },
+  {
+   "id": 21,
+   "type": "table",
+   "title": "Every category",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 9,
+    "w": 8,
+    "x": 16,
+    "y": 28
+   },
+   "targets": [
+    {
+     "expr": "atlas_catalog_category_releases",
+     "legendFormat": "A",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "format": "table",
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    },
+    {
+     "expr": "atlas_catalog_category_bytes",
+     "legendFormat": "B",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "format": "table",
+     "refId": "B",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "filterable": true
+     }
+    },
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Releases"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "short"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Size"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "bytes"
+       }
+      ]
+     }
+    ]
+   },
+   "options": {
+    "showHeader": true,
+    "cellHeight": "sm",
+    "sortBy": [
+     {
+      "displayName": "Releases",
+      "desc": true
+     }
+    ]
+   },
+   "transformations": [
+    {
+     "id": "joinByField",
+     "options": {
+      "byField": "category",
+      "mode": "outer"
+     }
+    },
+    {
+     "id": "filterFieldsByName",
+     "options": {
+      "include": {
+       "names": [
+        "category",
+        "Value #A",
+        "Value #B"
+       ]
+      }
+     }
+    },
+    {
+     "id": "organize",
+     "options": {
+      "renameByName": {
+       "category": "Category",
+       "Value #A": "Releases",
+       "Value #B": "Size"
+      },
+      "indexByName": {
+       "category": 0,
+       "Value #A": 1,
+       "Value #B": 2
+      }
+     }
+    }
+   ]
+  },
+  {
+   "id": 22,
+   "type": "timeseries",
+   "title": "Filed per minute, by root",
+   "description": "Releases the category step filed, including those looked at again after a rename or as they grow.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 0,
+    "y": 37
+   },
+   "targets": [
+    {
+     "expr": "sum by (root) (rate(atlas_releases_categorized_total[5m])) * 60",
+     "legendFormat": "{{root}}",
+     "editorMode": "code",
+     "instant": false,
+     "range": true,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "fillOpacity": 25,
+      "lineWidth": 1,
+      "showPoints": "never",
+      "spanNulls": false,
+      "drawStyle": "line",
+      "stacking": {
+       "mode": "normal",
+       "group": "A"
+      }
+     },
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "bottom",
+     "calcs": [
+      "lastNotNull",
+      "max"
+     ],
+     "showLegend": true,
+     "sortBy": "Max",
+     "sortDesc": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "transformations": []
+  },
+  {
+   "id": 23,
+   "type": "timeseries",
+   "title": "Filed per minute, by category",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 12,
+    "y": 37
+   },
+   "targets": [
+    {
+     "expr": "topk(15, sum by (category) (rate(atlas_releases_categorized_total[5m])) * 60)",
+     "legendFormat": "{{category}}",
+     "editorMode": "code",
+     "instant": false,
+     "range": true,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "fillOpacity": 25,
+      "lineWidth": 1,
+      "showPoints": "never",
+      "spanNulls": false,
+      "drawStyle": "line",
+      "stacking": {
+       "mode": "normal",
+       "group": "A"
+      }
+     },
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "bottom",
+     "calcs": [
+      "lastNotNull",
+      "max"
+     ],
+     "showLegend": true,
+     "sortBy": "Max",
+     "sortDesc": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "transformations": []
+  },
+  {
+   "id": 24,
+   "type": "row",
+   "title": "Sizes",
+   "collapsed": false,
+   "panels": [],
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 45
+   }
+  },
+  {
+   "id": 25,
+   "type": "table",
+   "title": "Average size per root",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 10,
+    "w": 8,
+    "x": 0,
+    "y": 46
+   },
+   "targets": [
+    {
+     "expr": "atlas_catalog_release_size_sum_bytes / atlas_catalog_release_size_count",
+     "legendFormat": "A",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "format": "table",
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    },
+    {
+     "expr": "atlas_catalog_release_size_count",
+     "legendFormat": "B",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "format": "table",
+     "refId": "B",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    },
+    {
+     "expr": "atlas_catalog_release_size_sum_bytes",
+     "legendFormat": "C",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "format": "table",
+     "refId": "C",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "filterable": true
+     }
+    },
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Average"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "bytes"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Releases"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "short"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Total"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "bytes"
+       }
+      ]
+     }
+    ]
+   },
+   "options": {
+    "showHeader": true,
+    "cellHeight": "sm",
+    "sortBy": [
+     {
+      "displayName": "Total",
+      "desc": true
+     }
+    ]
+   },
+   "transformations": [
+    {
+     "id": "joinByField",
+     "options": {
+      "byField": "root",
+      "mode": "outer"
+     }
+    },
+    {
+     "id": "filterFieldsByName",
+     "options": {
+      "include": {
+       "names": [
+        "root",
+        "Value #A",
+        "Value #B",
+        "Value #C"
+       ]
+      }
+     }
+    },
+    {
+     "id": "organize",
+     "options": {
+      "renameByName": {
+       "root": "Category",
+       "Value #A": "Average",
+       "Value #B": "Releases",
+       "Value #C": "Total"
+      },
+      "indexByName": {
+       "root": 0,
+       "Value #A": 1,
+       "Value #B": 2,
+       "Value #C": 3
+      }
+     }
+    }
+   ]
+  },
+  {
+   "id": 26,
+   "type": "bargauge",
+   "title": "How big releases are now",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 10,
+    "w": 8,
+    "x": 8,
+    "y": 46
+   },
+   "targets": [
+    {
+     "expr": "sum(atlas_catalog_release_size_bytes{root=~\"$root\",le=\"1048576\"})",
+     "legendFormat": "up to 1 MB",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    },
+    {
+     "expr": "sum(atlas_catalog_release_size_bytes{root=~\"$root\",le=\"2097152\"}) - sum(atlas_catalog_release_size_bytes{root=~\"$root\",le=\"1048576\"})",
+     "legendFormat": "1 MB to 2 MB",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "refId": "B",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    },
+    {
+     "expr": "sum(atlas_catalog_release_size_bytes{root=~\"$root\",le=\"4194304\"}) - sum(atlas_catalog_release_size_bytes{root=~\"$root\",le=\"2097152\"})",
+     "legendFormat": "2 MB to 4 MB",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "refId": "C",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    },
+    {
+     "expr": "sum(atlas_catalog_release_size_bytes{root=~\"$root\",le=\"8388608\"}) - sum(atlas_catalog_release_size_bytes{root=~\"$root\",le=\"4194304\"})",
+     "legendFormat": "4 MB to 8 MB",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "refId": "D",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    },
+    {
+     "expr": "sum(atlas_catalog_release_size_bytes{root=~\"$root\",le=\"16777216\"}) - sum(atlas_catalog_release_size_bytes{root=~\"$root\",le=\"8388608\"})",
+     "legendFormat": "8 MB to 16 MB",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "refId": "E",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    },
+    {
+     "expr": "sum(atlas_catalog_release_size_bytes{root=~\"$root\",le=\"33554432\"}) - sum(atlas_catalog_release_size_bytes{root=~\"$root\",le=\"16777216\"})",
+     "legendFormat": "16 MB to 32 MB",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "refId": "F",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    },
+    {
+     "expr": "sum(atlas_catalog_release_size_bytes{root=~\"$root\",le=\"67108864\"}) - sum(atlas_catalog_release_size_bytes{root=~\"$root\",le=\"33554432\"})",
+     "legendFormat": "32 MB to 64 MB",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "refId": "G",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    },
+    {
+     "expr": "sum(atlas_catalog_release_size_bytes{root=~\"$root\",le=\"134217728\"}) - sum(atlas_catalog_release_size_bytes{root=~\"$root\",le=\"67108864\"})",
+     "legendFormat": "64 MB to 128 MB",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "refId": "H",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    },
+    {
+     "expr": "sum(atlas_catalog_release_size_bytes{root=~\"$root\",le=\"268435456\"}) - sum(atlas_catalog_release_size_bytes{root=~\"$root\",le=\"134217728\"})",
+     "legendFormat": "128 MB to 256 MB",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "refId": "I",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    },
+    {
+     "expr": "sum(atlas_catalog_release_size_bytes{root=~\"$root\",le=\"536870912\"}) - sum(atlas_catalog_release_size_bytes{root=~\"$root\",le=\"268435456\"})",
+     "legendFormat": "256 MB to 512 MB",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "refId": "J",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    },
+    {
+     "expr": "sum(atlas_catalog_release_size_bytes{root=~\"$root\",le=\"1073741824\"}) - sum(atlas_catalog_release_size_bytes{root=~\"$root\",le=\"536870912\"})",
+     "legendFormat": "512 MB to 1 GB",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "refId": "K",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    },
+    {
+     "expr": "sum(atlas_catalog_release_size_bytes{root=~\"$root\",le=\"2147483648\"}) - sum(atlas_catalog_release_size_bytes{root=~\"$root\",le=\"1073741824\"})",
+     "legendFormat": "1 GB to 2 GB",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "refId": "L",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    },
+    {
+     "expr": "sum(atlas_catalog_release_size_bytes{root=~\"$root\",le=\"4294967296\"}) - sum(atlas_catalog_release_size_bytes{root=~\"$root\",le=\"2147483648\"})",
+     "legendFormat": "2 GB to 4 GB",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "refId": "M",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    },
+    {
+     "expr": "sum(atlas_catalog_release_size_bytes{root=~\"$root\",le=\"8589934592\"}) - sum(atlas_catalog_release_size_bytes{root=~\"$root\",le=\"4294967296\"})",
+     "legendFormat": "4 GB to 8 GB",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "refId": "N",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    },
+    {
+     "expr": "sum(atlas_catalog_release_size_bytes{root=~\"$root\",le=\"17179869184\"}) - sum(atlas_catalog_release_size_bytes{root=~\"$root\",le=\"8589934592\"})",
+     "legendFormat": "8 GB to 16 GB",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "refId": "O",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    },
+    {
+     "expr": "sum(atlas_catalog_release_size_bytes{root=~\"$root\",le=\"34359738368\"}) - sum(atlas_catalog_release_size_bytes{root=~\"$root\",le=\"17179869184\"})",
+     "legendFormat": "16 GB to 32 GB",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "refId": "P",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    },
+    {
+     "expr": "sum(atlas_catalog_release_size_bytes{root=~\"$root\",le=\"68719476736\"}) - sum(atlas_catalog_release_size_bytes{root=~\"$root\",le=\"34359738368\"})",
+     "legendFormat": "32 GB to 64 GB",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "refId": "Q",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    },
+    {
+     "expr": "sum(atlas_catalog_release_size_bytes{root=~\"$root\",le=\"137438953472\"}) - sum(atlas_catalog_release_size_bytes{root=~\"$root\",le=\"68719476736\"})",
+     "legendFormat": "64 GB to 128 GB",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "refId": "R",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    },
+    {
+     "expr": "sum(atlas_catalog_release_size_bytes{root=~\"$root\",le=\"274877906944\"}) - sum(atlas_catalog_release_size_bytes{root=~\"$root\",le=\"137438953472\"})",
+     "legendFormat": "128 GB to 256 GB",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "refId": "S",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    },
+    {
+     "expr": "sum(atlas_catalog_release_size_bytes{root=~\"$root\",le=\"549755813888\"}) - sum(atlas_catalog_release_size_bytes{root=~\"$root\",le=\"274877906944\"})",
+     "legendFormat": "256 GB to 512 GB",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "refId": "T",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    },
+    {
+     "expr": "sum(atlas_catalog_release_size_bytes{root=~\"$root\",le=\"1099511627776\"}) - sum(atlas_catalog_release_size_bytes{root=~\"$root\",le=\"549755813888\"})",
+     "legendFormat": "512 GB to 1024 GB",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "refId": "U",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "min": 0,
+     "color": {
+      "mode": "continuous-BlYlRd"
+     },
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "options": {
+    "displayMode": "gradient",
+    "orientation": "horizontal",
+    "showUnfilled": true,
+    "valueMode": "text",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    }
+   },
+   "transformations": []
+  },
+  {
+   "id": 27,
+   "type": "heatmap",
+   "title": "Heat map: catalog size distribution over time",
+   "description": "How many stored releases fall in each size band, at each walk.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 10,
+    "w": 8,
+    "x": 16,
+    "y": 46
+   },
+   "targets": [
+    {
+     "expr": "sum by (le) (atlas_catalog_release_size_bytes{root=~\"$root\"})",
+     "legendFormat": "{{le}}",
+     "editorMode": "code",
+     "instant": false,
+     "range": true,
+     "format": "heatmap",
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {},
+    "overrides": []
+   },
+   "options": {
+    "calculate": false,
+    "cellGap": 1,
+    "color": {
+     "mode": "scheme",
+     "scheme": "Spectral",
+     "steps": 64,
+     "exponent": 0.5,
+     "reverse": true,
+     "scale": "exponential",
+     "fill": "dark-orange"
+    },
+    "exemplars": {
+     "color": "rgba(255,0,255,0.7)"
+    },
+    "legend": {
+     "show": true
+    },
+    "rowsFrame": {
+     "layout": "auto"
+    },
+    "tooltip": {
+     "mode": "single",
+     "yHistogram": false
+    },
+    "yAxis": {
+     "axisPlacement": "left",
+     "reverse": false,
+     "unit": "bytes"
+    }
+   },
+   "transformations": []
+  },
+  {
+   "id": 28,
+   "type": "heatmap",
+   "title": "Heat map: size of releases as they settle",
+   "description": "Live: the size of each release as the category step files it.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 10,
+    "w": 24,
+    "x": 0,
+    "y": 56
+   },
+   "targets": [
+    {
+     "expr": "sum by (le) (increase(atlas_release_size_bytes_bucket{root=~\"$root\"}[$__rate_interval]))",
+     "legendFormat": "{{le}}",
+     "editorMode": "code",
+     "instant": false,
+     "range": true,
+     "format": "heatmap",
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {},
+    "overrides": []
+   },
+   "options": {
+    "calculate": false,
+    "cellGap": 1,
+    "color": {
+     "mode": "scheme",
+     "scheme": "Spectral",
+     "steps": 64,
+     "exponent": 0.5,
+     "reverse": true,
+     "scale": "exponential",
+     "fill": "dark-orange"
+    },
+    "exemplars": {
+     "color": "rgba(255,0,255,0.7)"
+    },
+    "legend": {
+     "show": true
+    },
+    "rowsFrame": {
+     "layout": "auto"
+    },
+    "tooltip": {
+     "mode": "single",
+     "yHistogram": false
+    },
+    "yAxis": {
+     "axisPlacement": "left",
+     "reverse": false,
+     "unit": "bytes"
+    }
+   },
+   "transformations": []
+  },
+  {
+   "id": 29,
+   "type": "row",
+   "title": "Biggest groups",
+   "collapsed": false,
+   "panels": [],
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 66
+   }
+  },
+  {
+   "id": 30,
+   "type": "bargauge",
+   "title": "Biggest groups by size",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 10,
+    "w": 12,
+    "x": 0,
+    "y": 67
+   },
+   "targets": [
+    {
+     "expr": "topk(20, atlas_catalog_group_bytes{group!=\"(other)\"})",
+     "legendFormat": "{{group}}",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "min": 0,
+     "color": {
+      "mode": "continuous-BlYlRd"
+     },
+     "unit": "bytes"
+    },
+    "overrides": []
+   },
+   "options": {
+    "displayMode": "gradient",
+    "orientation": "horizontal",
+    "showUnfilled": true,
+    "valueMode": "text",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    }
+   },
+   "transformations": []
+  },
+  {
+   "id": 31,
+   "type": "bargauge",
+   "title": "Biggest groups by releases",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 10,
+    "w": 12,
+    "x": 12,
+    "y": 67
+   },
+   "targets": [
+    {
+     "expr": "topk(20, atlas_catalog_group_releases{group!=\"(other)\"})",
+     "legendFormat": "{{group}}",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "min": 0,
+     "color": {
+      "mode": "continuous-BlYlRd"
+     },
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "options": {
+    "displayMode": "gradient",
+    "orientation": "horizontal",
+    "showUnfilled": true,
+    "valueMode": "text",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    }
+   },
+   "transformations": []
+  },
+  {
+   "id": 32,
+   "type": "table",
+   "title": "Top 100 groups",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 10,
+    "w": 12,
+    "x": 0,
+    "y": 77
+   },
+   "targets": [
+    {
+     "expr": "atlas_catalog_group_bytes",
+     "legendFormat": "A",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "format": "table",
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    },
+    {
+     "expr": "atlas_catalog_group_releases",
+     "legendFormat": "B",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "format": "table",
+     "refId": "B",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "filterable": true
+     }
+    },
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Group"
+      },
+      "properties": [
+       {
+        "id": "links",
+        "value": [
+         {
+          "title": "This group in the pipeline",
+          "url": "/d/atlas-pipeline?var-group=${__data.fields[\"Group\"]}&${__url_time_range}"
+         }
+        ]
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Size"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "bytes"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Releases"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "short"
+       }
+      ]
+     }
+    ]
+   },
+   "options": {
+    "showHeader": true,
+    "cellHeight": "sm",
+    "sortBy": [
+     {
+      "displayName": "Size",
+      "desc": true
+     }
+    ]
+   },
+   "transformations": [
+    {
+     "id": "joinByField",
+     "options": {
+      "byField": "group",
+      "mode": "outer"
+     }
+    },
+    {
+     "id": "filterFieldsByName",
+     "options": {
+      "include": {
+       "names": [
+        "group",
+        "Value #A",
+        "Value #B"
+       ]
+      }
+     }
+    },
+    {
+     "id": "organize",
+     "options": {
+      "renameByName": {
+       "group": "Group",
+       "Value #A": "Size",
+       "Value #B": "Releases"
+      },
+      "indexByName": {
+       "group": 0,
+       "Value #A": 1,
+       "Value #B": 2
+      }
+     }
+    }
+   ]
+  },
+  {
+   "id": 33,
+   "type": "timeseries",
+   "title": "Busiest groups now, articles per second",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 10,
+    "w": 12,
+    "x": 12,
+    "y": 77
+   },
+   "targets": [
+    {
+     "expr": "topk(15, sum by (group) (rate(atlas_articles_total[5m])))",
+     "legendFormat": "{{group}}",
+     "editorMode": "code",
+     "instant": false,
+     "range": true,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "fillOpacity": 8,
+      "lineWidth": 1,
+      "showPoints": "never",
+      "spanNulls": false,
+      "drawStyle": "line",
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "bottom",
+     "calcs": [
+      "lastNotNull",
+      "max"
+     ],
+     "showLegend": true,
+     "sortBy": "Max",
+     "sortDesc": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "transformations": []
+  },
+  {
+   "id": 34,
+   "type": "row",
+   "title": "Video release groups",
+   "collapsed": false,
+   "panels": [],
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 87
+   }
+  },
+  {
+   "id": 35,
+   "type": "stat",
+   "title": "Video releases",
+   "description": "Stored in Movies or TV, with a real name.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 6,
+    "x": 0,
+    "y": 88
+   },
+   "targets": [
+    {
+     "expr": "sum(atlas_catalog_video_releases)",
+     "legendFormat": "__auto",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "text",
+        "value": null
+       }
+      ]
+     },
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "options": {
+    "colorMode": "value",
+    "graphMode": "none",
+    "justifyMode": "auto",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "textMode": "auto"
+   },
+   "transformations": []
+  },
+  {
+   "id": 36,
+   "type": "stat",
+   "title": "With a release group",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 6,
+    "x": 6,
+    "y": 88
+   },
+   "targets": [
+    {
+     "expr": "sum(atlas_catalog_video_releases{release_group=\"found\"}) / sum(atlas_catalog_video_releases)",
+     "legendFormat": "__auto",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "text",
+        "value": null
+       }
+      ]
+     },
+     "unit": "percentunit"
+    },
+    "overrides": []
+   },
+   "options": {
+    "colorMode": "value",
+    "graphMode": "none",
+    "justifyMode": "auto",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "textMode": "auto"
+   },
+   "transformations": []
+  },
+  {
+   "id": 37,
+   "type": "stat",
+   "title": "Release groups seen",
+   "description": "Shown: the top 150, the rest summed as (other).",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 6,
+    "x": 12,
+    "y": 88
+   },
+   "targets": [
+    {
+     "expr": "count(atlas_catalog_release_group_releases{release_group!=\"(other)\"})",
+     "legendFormat": "__auto",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "text",
+        "value": null
+       }
+      ]
+     },
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "options": {
+    "colorMode": "value",
+    "graphMode": "none",
+    "justifyMode": "auto",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "textMode": "auto"
+   },
+   "transformations": []
+  },
+  {
+   "id": 38,
+   "type": "stat",
+   "title": "Biggest release group",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 6,
+    "x": 18,
+    "y": 88
+   },
+   "targets": [
+    {
+     "expr": "topk(1, atlas_catalog_release_group_releases{release_group!=\"(other)\"})",
+     "legendFormat": "__auto",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "text",
+        "value": null
+       }
+      ]
+     },
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "options": {
+    "colorMode": "value",
+    "graphMode": "none",
+    "justifyMode": "auto",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "textMode": "auto"
+   },
+   "transformations": []
+  },
+  {
+   "id": 39,
+   "type": "bargauge",
+   "title": "Top 25 release groups, video releases",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 14,
+    "w": 12,
+    "x": 0,
+    "y": 92
+   },
+   "targets": [
+    {
+     "expr": "topk(25, atlas_catalog_release_group_releases{release_group!=\"(other)\"})",
+     "legendFormat": "{{release_group}}",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "min": 0,
+     "color": {
+      "mode": "continuous-BlYlRd"
+     },
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "options": {
+    "displayMode": "gradient",
+    "orientation": "horizontal",
+    "showUnfilled": true,
+    "valueMode": "text",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    }
+   },
+   "transformations": []
+  },
+  {
+   "id": 40,
+   "type": "table",
+   "title": "Top 150 release groups",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 14,
+    "w": 12,
+    "x": 12,
+    "y": 92
+   },
+   "targets": [
+    {
+     "expr": "atlas_catalog_release_group_releases",
+     "legendFormat": "A",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "format": "table",
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    },
+    {
+     "expr": "atlas_catalog_release_group_releases / scalar(atlas_catalog_video_releases{release_group=\"found\"})",
+     "legendFormat": "B",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "format": "table",
+     "refId": "B",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "filterable": true
+     }
+    },
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Video releases"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "short"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Share"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "percentunit"
+       }
+      ]
+     }
+    ]
+   },
+   "options": {
+    "showHeader": true,
+    "cellHeight": "sm",
+    "sortBy": [
+     {
+      "displayName": "Video releases",
+      "desc": true
+     }
+    ]
+   },
+   "transformations": [
+    {
+     "id": "joinByField",
+     "options": {
+      "byField": "release_group",
+      "mode": "outer"
+     }
+    },
+    {
+     "id": "filterFieldsByName",
+     "options": {
+      "include": {
+       "names": [
+        "release_group",
+        "Value #A",
+        "Value #B"
+       ]
+      }
+     }
+    },
+    {
+     "id": "organize",
+     "options": {
+      "renameByName": {
+       "release_group": "Release group",
+       "Value #A": "Video releases",
+       "Value #B": "Share"
+      },
+      "indexByName": {
+       "release_group": 0,
+       "Value #A": 1,
+       "Value #B": 2
+      }
+     }
+    }
+   ]
+  },
+  {
+   "id": 41,
+   "type": "row",
+   "title": "PreDB",
+   "collapsed": false,
+   "panels": [],
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 106
+   }
+  },
+  {
+   "id": 42,
+   "type": "stat",
+   "title": "Match rate, all releases",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 4,
+    "x": 0,
+    "y": 107
+   },
+   "targets": [
+    {
+     "expr": "atlas_catalog_releases{state=\"predb_matched\"} / ignoring(state) atlas_catalog_releases{state=\"total\"}",
+     "legendFormat": "__auto",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "text",
+        "value": null
+       }
+      ]
+     },
+     "unit": "percentunit"
+    },
+    "overrides": []
+   },
+   "options": {
+    "colorMode": "value",
+    "graphMode": "none",
+    "justifyMode": "auto",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "textMode": "auto"
+   },
+   "transformations": []
+  },
+  {
+   "id": 43,
+   "type": "stat",
+   "title": "Match rate, video",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 4,
+    "x": 4,
+    "y": 107
+   },
+   "targets": [
+    {
+     "expr": "sum(atlas_catalog_predb_root_releases{root=~\"Movies|TV\",matched=\"yes\"}) / sum(atlas_catalog_predb_root_releases{root=~\"Movies|TV\"})",
+     "legendFormat": "__auto",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "text",
+        "value": null
+       }
+      ]
+     },
+     "unit": "percentunit"
+    },
+    "overrides": []
+   },
+   "options": {
+    "colorMode": "value",
+    "graphMode": "none",
+    "justifyMode": "auto",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "textMode": "auto"
+   },
+   "transformations": []
+  },
+  {
+   "id": 44,
+   "type": "stat",
+   "title": "Releases matched",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 4,
+    "x": 8,
+    "y": 107
+   },
+   "targets": [
+    {
+     "expr": "atlas_catalog_releases{state=\"predb_matched\"}",
+     "legendFormat": "__auto",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "text",
+        "value": null
+       }
+      ]
+     },
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "options": {
+    "colorMode": "value",
+    "graphMode": "none",
+    "justifyMode": "auto",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "textMode": "auto"
+   },
+   "transformations": []
+  },
+  {
+   "id": 45,
+   "type": "stat",
+   "title": "Titles in the PreDB",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 4,
+    "x": 12,
+    "y": 107
+   },
+   "targets": [
+    {
+     "expr": "atlas_predb_titles",
+     "legendFormat": "__auto",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "text",
+        "value": null
+       }
+      ]
+     },
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "options": {
+    "colorMode": "value",
+    "graphMode": "none",
+    "justifyMode": "auto",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "textMode": "auto"
+   },
+   "transformations": []
+  },
+  {
+   "id": 46,
+   "type": "stat",
+   "title": "Matched in range",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 4,
+    "x": 16,
+    "y": 107
+   },
+   "targets": [
+    {
+     "expr": "sum(increase(atlas_predb_matches_total[$__range]))",
+     "legendFormat": "__auto",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "text",
+        "value": null
+       }
+      ]
+     },
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "options": {
+    "colorMode": "value",
+    "graphMode": "none",
+    "justifyMode": "auto",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "textMode": "auto"
+   },
+   "transformations": []
+  },
+  {
+   "id": 47,
+   "type": "stat",
+   "title": "Title backlog",
+   "description": "Titles the late matcher has yet to compare with old releases.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 4,
+    "x": 20,
+    "y": 107
+   },
+   "targets": [
+    {
+     "expr": "atlas_predb_late_behind",
+     "legendFormat": "__auto",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "text",
+        "value": null
+       }
+      ]
+     },
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "options": {
+    "colorMode": "value",
+    "graphMode": "none",
+    "justifyMode": "auto",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "textMode": "auto"
+   },
+   "transformations": []
+  },
+  {
+   "id": 48,
+   "type": "piechart",
+   "title": "Prerelease map: matches by PreDB category",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 9,
+    "w": 8,
+    "x": 0,
+    "y": 111
+   },
+   "targets": [
+    {
+     "expr": "atlas_catalog_predb_category_releases",
+     "legendFormat": "{{category}}",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "options": {
+    "pieType": "donut",
+    "displayLabels": [
+     "percent"
+    ],
+    "tooltip": {
+     "mode": "single"
+    },
+    "legend": {
+     "displayMode": "table",
+     "placement": "right",
+     "values": [
+      "value",
+      "percent"
+     ],
+     "showLegend": true
+    },
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    }
+   },
+   "transformations": []
+  },
+  {
+   "id": 49,
+   "type": "piechart",
+   "title": "Matches by feed",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 9,
+    "w": 8,
+    "x": 8,
+    "y": 111
+   },
+   "targets": [
+    {
+     "expr": "atlas_catalog_predb_feed_releases",
+     "legendFormat": "{{feed}}",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "options": {
+    "pieType": "donut",
+    "displayLabels": [
+     "percent"
+    ],
+    "tooltip": {
+     "mode": "single"
+    },
+    "legend": {
+     "displayMode": "table",
+     "placement": "right",
+     "values": [
+      "value",
+      "percent"
+     ],
+     "showLegend": true
+    },
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    }
+   },
+   "transformations": []
+  },
+  {
+   "id": 50,
+   "type": "piechart",
+   "title": "Matches by how they matched",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 9,
+    "w": 8,
+    "x": 16,
+    "y": 111
+   },
+   "targets": [
+    {
+     "expr": "atlas_catalog_predb_kind_releases",
+     "legendFormat": "{{kind}}",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "options": {
+    "pieType": "donut",
+    "displayLabels": [
+     "percent"
+    ],
+    "tooltip": {
+     "mode": "single"
+    },
+    "legend": {
+     "displayMode": "table",
+     "placement": "right",
+     "values": [
+      "value",
+      "percent"
+     ],
+     "showLegend": true
+    },
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    }
+   },
+   "transformations": []
+  },
+  {
+   "id": 51,
+   "type": "table",
+   "title": "Match rate per category",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 10,
+    "w": 12,
+    "x": 0,
+    "y": 120
+   },
+   "targets": [
+    {
+     "expr": "sum by (root) (atlas_catalog_predb_root_releases{matched=\"yes\"})",
+     "legendFormat": "A",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "format": "table",
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    },
+    {
+     "expr": "sum by (root) (atlas_catalog_predb_root_releases)",
+     "legendFormat": "B",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "format": "table",
+     "refId": "B",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    },
+    {
+     "expr": "sum by (root) (atlas_catalog_predb_root_releases{matched=\"yes\"}) / sum by (root) (atlas_catalog_predb_root_releases)",
+     "legendFormat": "C",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "format": "table",
+     "refId": "C",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "filterable": true
+     }
+    },
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Matched"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "short"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Releases"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "short"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Rate"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "percentunit"
+       }
+      ]
+     }
+    ]
+   },
+   "options": {
+    "showHeader": true,
+    "cellHeight": "sm",
+    "sortBy": [
+     {
+      "displayName": "Matched",
+      "desc": true
+     }
+    ]
+   },
+   "transformations": [
+    {
+     "id": "joinByField",
+     "options": {
+      "byField": "root",
+      "mode": "outer"
+     }
+    },
+    {
+     "id": "filterFieldsByName",
+     "options": {
+      "include": {
+       "names": [
+        "root",
+        "Value #A",
+        "Value #B",
+        "Value #C"
+       ]
+      }
+     }
+    },
+    {
+     "id": "organize",
+     "options": {
+      "renameByName": {
+       "root": "Category",
+       "Value #A": "Matched",
+       "Value #B": "Releases",
+       "Value #C": "Rate"
+      },
+      "indexByName": {
+       "root": 0,
+       "Value #A": 1,
+       "Value #B": 2,
+       "Value #C": 3
+      }
+     }
+    }
+   ]
+  },
+  {
+   "id": 52,
+   "type": "timeseries",
+   "title": "Matches per hour, by category",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 12,
+    "y": 120
+   },
+   "targets": [
+    {
+     "expr": "sum by (category) (rate(atlas_predb_matches_total[15m])) * 3600",
+     "legendFormat": "{{category}}",
+     "editorMode": "code",
+     "instant": false,
+     "range": true,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "fillOpacity": 25,
+      "lineWidth": 1,
+      "showPoints": "never",
+      "spanNulls": false,
+      "drawStyle": "line",
+      "stacking": {
+       "mode": "normal",
+       "group": "A"
+      }
+     },
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "bottom",
+     "calcs": [
+      "lastNotNull",
+      "max"
+     ],
+     "showLegend": true,
+     "sortBy": "Max",
+     "sortDesc": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "transformations": []
+  }
+ ]
+}

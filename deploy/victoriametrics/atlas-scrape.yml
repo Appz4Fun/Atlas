@@ -1,0 +1,13 @@
+# Add under scrape_configs in the VictoriaMetrics or Prometheus scrape config.
+# Replace 192.168.1.172 with the machine Atlas runs on. The dashboards in
+# deploy/grafana expect job "atlas" and the role labels below.
+  - job_name: atlas
+    static_configs:
+      - targets: ['192.168.1.172:9092']
+        labels:
+          host: atlas
+          role: indexer
+      - targets: ['192.168.1.172:9093']
+        labels:
+          host: atlas
+          role: api

@@ -38,25 +38,30 @@ pub struct ApiResponse {
     pub content_type: Option<&'static str>,
     pub body: String,
     pub headers: Vec<(String, String)>,
+    /// atlas itself failed, whatever the status says: Newznab errors go out as 200
+    pub failed: bool,
 }
 
 impl ApiResponse {
     fn xml(status: u16, body: String) -> Self {
-        ApiResponse { status, content_type: Some(XML), body, headers: Vec::new() }
+        ApiResponse { status, content_type: Some(XML), body, headers: Vec::new(), failed: false }
     }
 
     fn not_found() -> Self {
-        ApiResponse { status: 404, content_type: None, body: String::new(), headers: Vec::new() }
+        ApiResponse { status: 404, content_type: None, body: String::new(), headers: Vec::new(), failed: false }
     }
 
     /// newznab error, sent with http 200 like real indexers do
     fn error(code: u16, description: &str) -> Self {
-        ApiResponse::xml(
+        let mut response = ApiResponse::xml(
             200,
             format!(
                 "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<error code=\"{code}\" description=\"{description}\"/>"
             ),
-        )
+        );
+        // 1xx and 2xx are about the request; 900 is atlas's own
+        response.failed = code >= 900;
+        response
     }
 }
 
@@ -120,6 +125,7 @@ pub fn handle(path: &str, query: &str, base: &str, api_key: &str) -> ApiResponse
                 "Atlas newznab api is running.\n\nAdd it to Prowlarr / Sonarr / Radarr as a Newznab indexer:\n  URL:      {base}\n  API path: /api\n  API key:  the api_key in config.toml\n\nCheck it: {base}/api?t=caps\n"
             ),
             headers: Vec::new(),
+            failed: false,
         };
     }
 
@@ -341,6 +347,30 @@ fn get(args: &HashMap<String, String>) -> ApiResponse {
         content_type: Some("application/x-nzb"),
         body: content,
         headers: vec![("Content-Disposition".into(), format!("attachment; filename=\"{filename}\""))],
+        failed: false,
+    }
+}
+
+/// What a request is called in metrics: only names from this list, soo no client can make new series.
+struct Endpoint {
+    label: &'static str,
+    function: &'static str,
+}
+
+fn endpoint_of(path: &str, query: &str) -> Endpoint {
+    let named = |label, function| Endpoint { label, function };
+    if path != "/api" {
+        return named("other", "api.other");
+    }
+    match parse_query(query).get("t").map(String::as_str) {
+        Some("caps") => named("caps", "api.caps"),
+        Some("get") => named("get", "api.get"),
+        Some("search") => named("search", "api.search"),
+        Some("tvsearch") => named("tvsearch", "api.tvsearch"),
+        Some("movie") => named("movie", "api.movie"),
+        Some("music" | "audio") => named("music", "api.music"),
+        Some("book") => named("book", "api.book"),
+        _ => named("other", "api.other"),
     }
 }
 
@@ -357,11 +387,22 @@ fn respond(request: Request, api_key: &str, fallback_host: &str) {
     let base = format!("http://{host}");
 
     let is_get = matches!(request.method(), tiny_http::Method::Get | tiny_http::Method::Head);
+    let endpoint = endpoint_of(path, query);
+    let span = crate::metrics::span(endpoint.function);
     let resp = if is_get {
         handle(path, query, &base, api_key)
     } else {
-        ApiResponse { status: 405, content_type: None, body: String::new(), headers: Vec::new() }
+        ApiResponse { status: 405, content_type: None, body: String::new(), headers: Vec::new(), failed: false }
     };
+    if resp.status >= 500 || resp.failed {
+        span.failed();
+    }
+    drop(span);
+    let status = resp.status.to_string();
+    let labels = [("endpoint", endpoint.label), ("status", status.as_str())];
+    crate::metrics::names::API_REQUESTS.inc(&labels, 1);
+    crate::metrics::names::API_BYTES.inc(&[("endpoint", endpoint.label)], resp.body.len() as u64);
+    crate::metrics::function_bytes(endpoint.function, "sent", resp.body.len() as u64);
 
     let mut response = Response::from_string(resp.body).with_status_code(resp.status);
 
@@ -433,6 +474,22 @@ pub fn stop() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_atlass_own_errors_count_as_failed() {
+        assert!(ApiResponse::error(900, "Search failed").failed);
+        assert_eq!(ApiResponse::error(900, "Search failed").status, 200);
+        assert!(!ApiResponse::error(200, "Missing parameter (t)").failed);
+        assert!(!ApiResponse::error(100, "Incorrect user credentials").failed);
+    }
+
+    #[test]
+    fn a_client_cant_invent_an_endpoint_label() {
+        assert_eq!(endpoint_of("/api", "t=movie&q=x").label, "movie");
+        assert_eq!(endpoint_of("/api", "t=audio").label, "music");
+        assert_eq!(endpoint_of("/api", "t=whatever").label, "other");
+        assert_eq!(endpoint_of("/some/path", "t=movie").label, "other");
+    }
 
     #[test]
     fn query_parsing() {
