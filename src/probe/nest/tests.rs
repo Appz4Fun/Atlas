@@ -252,17 +252,16 @@ fn methods_not_decoded_yet_say_so() {
     let n = unwrap(&r);
     assert_eq!(formats(&n), ["RAR5 m3"]);
     assert_eq!(n.layers[0].stop.as_deref(), Some("starts in the volume before"));
-    // a RAR4 version that was never made; a PPMd block; and a file whose front is in the volume before
+    // a RAR4 version that was never made, and a file whose front is in the volume before
     let rar4_m3 = |version: u8, flags: u16, data: &[u8]| {
         let mut fields = r4_file_fields(b"movie.mkv", data.len() as u32);
         fields[13] = version;
         fields[14] = 0x33;
         rar4(&[r4_main(0), [r4_block(0x74, flags, &fields, Some(data.len() as u32)), data.to_vec()].concat()])
     };
-    let (zeros, ppmd) = ([0u8; 64], [0x80u8; 64]);
+    let zeros = [0u8; 64];
     for (version, flags, data, why) in [
         (40, 0, &zeros, "no decoder for this yet"),
-        (29, 0, &ppmd, "PPMd: no decoder for this yet"),
         (29, 1, &zeros, "starts in the volume before"),
     ] {
         let r = rar4_m3(version, flags, data);

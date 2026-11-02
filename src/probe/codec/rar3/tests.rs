@@ -48,13 +48,17 @@ fn decodes_lz_and_every_standard_filter() {
 }
 
 #[test]
-fn a_ppmd_block_is_told_apart() {
-    let data = include_bytes!("../../../../tests/fixtures/rar3/ppmd_lz_match_rar300.rar");
-    let head = entries(data).into_iter().find(|h| !h.dir).unwrap();
-    let at = head.data_at.unwrap();
-    assert!(starts_with_ppmd(&data[at..]));
-    let (out, end) = rar29(&data[at..], head.unpacked, usize::MAX, true);
-    assert_eq!((out.len(), end), (0, End::Cut));
+fn decodes_ppm_blocks() {
+    for (name, data) in [
+        ("lz_match", &include_bytes!("../../../../tests/fixtures/rar3/ppmd_lz_match_rar300.rar")[..]),
+        ("lz_repeat", include_bytes!("../../../../tests/fixtures/rar3/ppmd_lz_repeat_rar3.rar")),
+        ("escape", include_bytes!("../../../../tests/fixtures/rar3/ppmd_escape_rar300.rar")),
+        ("lorem", include_bytes!("../../../../tests/fixtures/rar3/ppmd_lorem_rar300.rar")),
+        ("mixed", include_bytes!("../../../../tests/fixtures/rar3/ppmd_mixed_rar300.rar")),
+        ("solid", include_bytes!("../../../../tests/fixtures/rar3/ppmd_solid_rar300.rar")),
+    ] {
+        assert!(check(name, data, &[29], rar29) > 0, "{name}: nothing checked");
+    }
 }
 
 #[test]

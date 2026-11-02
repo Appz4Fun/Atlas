@@ -4,6 +4,7 @@ pub mod bzip2;
 pub mod inflate;
 pub mod lz4;
 pub mod lzw;
+mod ppmd_h;
 pub mod rar15;
 pub mod rar20;
 pub mod rar3;

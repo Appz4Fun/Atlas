@@ -324,8 +324,6 @@ fn from_entries(data: &[u8]) -> Opened {
         View::Decode { from: at, codec }
     } else if format == "RAR5" {
         View::Stop("a RAR algorithm newer than this knows")
-    } else if format == "RAR4" && matches!(head.rar_version, 29 | 36) && codec::rar3::starts_with_ppmd(&data[at..]) {
-        View::Stop("PPMd: no decoder for this yet")
     } else if format == "RAR4" && matches!(head.rar_version, 15 | 20 | 26 | 29 | 36) {
         let codec = Codec::Rar4 { version: head.rar_version, size: head.unpacked, packed: head.packed };
         View::Decode { from: at, codec }

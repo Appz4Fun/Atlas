@@ -1,9 +1,10 @@
 //! RAR 2.9's compression (RAR 3.x and 4.x, version 29), from the front of a file's packed data: LZ blocks with
 //! Huffman tables coded against the last ones, and the standard filters RAR's VM runs on the output. Written from
 //! the format as unrar describes it. Every byte decoded is kept, soo the whole output is the dictionary; the limit
-//! bounds it. A PPMd block isn't decoded yet: the output stops where one starts.
+//! bounds it. PPM blocks go through our PPMd variant H.
 
 use super::super::lzma::End;
+use super::ppmd_h::Ppm;
 use super::rarbits::{Bits, Table};
 use crate::archive::crc32;
 
@@ -104,13 +105,15 @@ struct State<'a> {
     low_dist: u32,
     low_reps: u32,
     filters: Filters,
+    /// the PPM model, once a PPM block has started one
+    ppm: Option<Box<Ppm>>,
+    /// in PPM blocks, the byte that says what follows isn't a literal
+    esc: u8,
 }
 
 /// Why decoding stopped short of the end.
 enum Stop {
     Cut,
-    /// a PPMd block, or a filter that needs the VM
-    Unsupported,
 }
 
 /// One file's packed data, from the front, to `limit` bytes. `complete`: `data` is all of it, not a cut front.
@@ -125,21 +128,18 @@ pub fn rar29(data: &[u8], size: Option<u64>, limit: usize, complete: bool) -> (V
         low_dist: 0,
         low_reps: 0,
         filters: Filters::default(),
+        ppm: None,
+        esc: 2,
     };
     let mut window = Vec::new();
     let end = match run(&mut st, size, limit, &mut window) {
         Ok(()) if window.len() >= limit => End::Limit,
         Ok(()) => End::Done,
-        Err(Stop::Cut | Stop::Unsupported) => End::Cut,
+        Err(Stop::Cut) => End::Cut,
     };
     let mut out = apply_filters(window, &st.filters.pending);
     out.truncate(limit);
     (out, end)
-}
-
-/// Whether a file's packed data opens with a PPMd block, which this can't decode yet.
-pub fn starts_with_ppmd(data: &[u8]) -> bool {
-    data.first().is_some_and(|b| b & 0x80 != 0)
 }
 
 /// Decodes to `size` or `limit`, and when the limit falls inside a filter's block, on to the block's end, soo
@@ -162,8 +162,16 @@ fn run(st: &mut State<'_>, size: usize, limit: usize, out: &mut Vec<u8>) -> Resu
         if st.bits.addr > st.safe || st.bits.past_end() {
             return Err(Stop::Cut);
         }
+        let Some(lz) = &tables else {
+            match ppm_step(st, out, target)? {
+                PpmStep::Next => {}
+                PpmStep::Tables => tables = read_tables(st)?,
+                PpmStep::FileEnd => return Ok(()),
+            }
+            continue;
+        };
         let bits = &mut st.bits;
-        let number = usize::from(tables.ld.decode(bits));
+        let number = usize::from(lz.ld.decode(bits));
         if number < 256 {
             out.push(number as u8);
             continue;
@@ -171,7 +179,7 @@ fn run(st: &mut State<'_>, size: usize, limit: usize, out: &mut Vec<u8>) -> Resu
         if number >= 271 {
             let n = number - 271;
             let mut len = usize::from(LDECODE[n]) + 3 + bits.take(u32::from(LBITS[n])) as usize;
-            let slot = usize::from(tables.dd.decode(bits)).min(DC - 1);
+            let slot = usize::from(lz.dd.decode(bits)).min(DC - 1);
             let mut dist = dbase[slot] + 1;
             let b = u32::from(dbits[slot]);
             if b > 0 {
@@ -184,7 +192,7 @@ fn run(st: &mut State<'_>, size: usize, limit: usize, out: &mut Vec<u8>) -> Resu
                         st.low_reps -= 1;
                         dist += st.low_dist;
                     } else {
-                        let low = u32::from(tables.ldd.decode(bits));
+                        let low = u32::from(lz.ldd.decode(bits));
                         if low == 16 {
                             st.low_reps = LOW_DIST_REP - 1;
                             dist += st.low_dist;
@@ -230,7 +238,7 @@ fn run(st: &mut State<'_>, size: usize, limit: usize, out: &mut Vec<u8>) -> Resu
                 let dist = st.reps[n];
                 st.reps.copy_within(0..n, 1);
                 st.reps[0] = dist;
-                let slot = usize::from(tables.rd.decode(bits)).min(RC - 1);
+                let slot = usize::from(lz.rd.decode(bits)).min(RC - 1);
                 let len = usize::from(LDECODE[slot]) + 2 + bits.take(u32::from(LBITS[slot])) as usize;
                 st.last_len = len;
                 copy(out, dist, len, target)?;
@@ -246,6 +254,57 @@ fn run(st: &mut State<'_>, size: usize, limit: usize, out: &mut Vec<u8>) -> Resu
     }
 }
 
+enum PpmStep {
+    Next,
+    /// the PPM block ended: new tables follow
+    Tables,
+    FileEnd,
+}
+
+/// One step of a PPM block: a byte, a match, or a filter, as the escape byte says.
+fn ppm_step(st: &mut State<'_>, out: &mut Vec<u8>, target: usize) -> Result<PpmStep, Stop> {
+    let ppm = st.ppm.as_mut().ok_or(Stop::Cut)?;
+    let bits = &mut st.bits;
+    let mut next = || ppm.decode_char(bits).ok_or(Stop::Cut);
+    let ch = next()?;
+    if ch != st.esc {
+        out.push(ch);
+        return Ok(PpmStep::Next);
+    }
+    match next()? {
+        0 => return Ok(PpmStep::Tables),
+        2 => return Ok(PpmStep::FileEnd),
+        3 => {
+            let first = next()?;
+            let len = match (first & 7) + 1 {
+                7 => usize::from(next()?) + 7,
+                8 => usize::from(next()?) * 256 + usize::from(next()?),
+                n => usize::from(n),
+            };
+            if len == 0 {
+                return Err(Stop::Cut);
+            }
+            let code = (0..len).map(|_| next()).collect::<Result<Vec<u8>, Stop>>()?;
+            add_vm_code(&mut st.filters, u32::from(first), &code, out.len())?;
+        }
+        4 => {
+            let mut dist = 0usize;
+            for _ in 0..3 {
+                dist = (dist << 8) | usize::from(next()?);
+            }
+            let len = usize::from(next()?);
+            copy(out, dist + 2, len + 32, target)?;
+        }
+        5 => {
+            let len = usize::from(next()?);
+            copy(out, 1, len + 4, target)?;
+        }
+        // 1: the escape byte itself
+        _ => out.push(ch),
+    }
+    Ok(PpmStep::Next)
+}
+
 fn copy(out: &mut Vec<u8>, dist: usize, len: usize, target: usize) -> Result<(), Stop> {
     if dist == 0 || dist > out.len() {
         return Err(Stop::Cut);
@@ -256,13 +315,15 @@ fn copy(out: &mut Vec<u8>, dist: usize, len: usize, target: usize) -> Result<(),
     Ok(())
 }
 
-/// The tables for the next block: their code lengths, then each length as a change from the last tables'.
-fn read_tables(st: &mut State<'_>) -> Result<Tables, Stop> {
+/// The tables for the next block: their code lengths, then each length as a change from the last tables'. None:
+/// a PPM block, its model ready.
+fn read_tables(st: &mut State<'_>) -> Result<Option<Tables>, Stop> {
     let bits = &mut st.bits;
     bits.align();
     let field = bits.peek16();
     if field & 0x8000 != 0 {
-        return Err(Stop::Unsupported);
+        let ppm = st.ppm.get_or_insert_with(Box::default);
+        return if ppm.init(bits, &mut st.esc) { Ok(None) } else { Err(Stop::Cut) };
     }
     st.low_dist = 0;
     st.low_reps = 0;
@@ -322,7 +383,12 @@ fn read_tables(st: &mut State<'_>) -> Result<Tables, Stop> {
     }
     st.old_table = table;
     let t = |r: std::ops::Range<usize>| Table::new(&table[r]).ok_or(Stop::Cut);
-    Ok(Tables { ld: t(0..NC)?, dd: t(NC..NC + DC)?, ldd: t(NC + DC..NC + DC + LDC)?, rd: t(NC + DC + LDC..TABLE)? })
+    Ok(Some(Tables {
+        ld: t(0..NC)?,
+        dd: t(NC..NC + DC)?,
+        ldd: t(NC + DC..NC + DC + LDC)?,
+        rd: t(NC + DC + LDC..TABLE)?,
+    }))
 }
 
 /// A number in the VM's code: 4, 8, 16 or 32 bits, or a negative byte.
