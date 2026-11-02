@@ -6,6 +6,9 @@ services:
     restart: unless-stopped
     # no NAT in the way of a lot of traffic, and the port is the host's
     network_mode: host
+    environment:
+      # Prometheus text at /metrics; deploy/victoriametrics/atlas-scrape.yml scrapes it. Empty turns it off.
+      SEALED_LOG_METRICS: 0.0.0.0:7712
     volumes:
       # a bind mount: nothing goes through the overlay filesystem
       - ${SEALED_LOG_DATA:-/mnt/20tb/atlas/data}:/data

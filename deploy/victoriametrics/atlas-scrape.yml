@@ -11,3 +11,12 @@
         labels:
           host: atlas
           role: api
+  # The sealed log service (sealed-log/compose.yml), on the machine with the
+  # big disk. deploy/grafana's "Atlas: Sealed log" dashboard expects job
+  # "sealed-log". 127.0.0.1 works when VictoriaMetrics runs on that machine
+  # with host networking; otherwise put the machine's address here.
+  - job_name: sealed-log
+    static_configs:
+      - targets: ['127.0.0.1:7712']
+        labels:
+          host: sealed-log

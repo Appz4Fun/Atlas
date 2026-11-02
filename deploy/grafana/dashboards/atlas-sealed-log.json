@@ -1,0 +1,2392 @@
+{
+ "uid": "atlas-sealed-log",
+ "title": "Atlas: Sealed log",
+ "description": "The sealed log service and the offload feeding it: throughput, latency on both ends of the wire, and the disk. Service numbers come from job sealed-log, Atlas's from job atlas.",
+ "tags": [
+  "atlas"
+ ],
+ "schemaVersion": 39,
+ "editable": true,
+ "graphTooltip": 1,
+ "refresh": "30s",
+ "time": {
+  "from": "now-6h",
+  "to": "now"
+ },
+ "timezone": "browser",
+ "links": [
+  {
+   "title": "Atlas",
+   "type": "dashboards",
+   "tags": [
+    "atlas"
+   ],
+   "asDropdown": false,
+   "includeVars": false,
+   "keepTime": true,
+   "icon": "external link",
+   "targetBlank": false
+  }
+ ],
+ "templating": {
+  "list": []
+ },
+ "annotations": {
+  "list": []
+ },
+ "panels": [
+  {
+   "id": 2,
+   "type": "row",
+   "title": "At a glance",
+   "collapsed": false,
+   "panels": [],
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 0
+   }
+  },
+  {
+   "id": 3,
+   "type": "stat",
+   "title": "Service",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 2,
+    "x": 0,
+    "y": 1
+   },
+   "targets": [
+    {
+     "expr": "up{job=\"sealed-log\"}",
+     "legendFormat": "__auto",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "text",
+        "value": null
+       }
+      ]
+     },
+     "mappings": [
+      {
+       "type": "value",
+       "options": {
+        "0": {
+         "text": "DOWN",
+         "color": "red",
+         "index": 0
+        },
+        "1": {
+         "text": "UP",
+         "color": "green",
+         "index": 1
+        }
+       }
+      },
+      {
+       "type": "special",
+       "options": {
+        "match": "null",
+        "result": {
+         "text": "DOWN",
+         "color": "red",
+         "index": 2
+        }
+       }
+      }
+     ],
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "options": {
+    "colorMode": "background",
+    "graphMode": "none",
+    "justifyMode": "auto",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "textMode": "auto"
+   },
+   "transformations": []
+  },
+  {
+   "id": 4,
+   "type": "stat",
+   "title": "Log size",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 3,
+    "x": 2,
+    "y": 1
+   },
+   "targets": [
+    {
+     "expr": "sealed_log_bytes{job=\"sealed-log\"}",
+     "legendFormat": "__auto",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "text",
+        "value": null
+       }
+      ]
+     },
+     "unit": "bytes"
+    },
+    "overrides": []
+   },
+   "options": {
+    "colorMode": "value",
+    "graphMode": "none",
+    "justifyMode": "auto",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "textMode": "auto"
+   },
+   "transformations": []
+  },
+  {
+   "id": 5,
+   "type": "stat",
+   "title": "Disk free",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 3,
+    "x": 5,
+    "y": 1
+   },
+   "targets": [
+    {
+     "expr": "sealed_log_filesystem_bytes{job=\"sealed-log\",kind=\"avail\"}",
+     "legendFormat": "__auto",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "text",
+        "value": null
+       }
+      ]
+     },
+     "unit": "bytes"
+    },
+    "overrides": []
+   },
+   "options": {
+    "colorMode": "value",
+    "graphMode": "none",
+    "justifyMode": "auto",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "textMode": "auto"
+   },
+   "transformations": []
+  },
+  {
+   "id": 6,
+   "type": "stat",
+   "title": "Disk used",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 3,
+    "x": 8,
+    "y": 1
+   },
+   "targets": [
+    {
+     "expr": "1 - sealed_log_filesystem_bytes{job=\"sealed-log\",kind=\"avail\"} / sealed_log_filesystem_bytes{job=\"sealed-log\",kind=\"size\"}",
+     "legendFormat": "__auto",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "green",
+        "value": null
+       },
+       {
+        "color": "orange",
+        "value": 0.8
+       },
+       {
+        "color": "red",
+        "value": 0.95
+       }
+      ]
+     },
+     "unit": "percentunit"
+    },
+    "overrides": []
+   },
+   "options": {
+    "colorMode": "background",
+    "graphMode": "none",
+    "justifyMode": "auto",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "textMode": "auto"
+   },
+   "transformations": []
+  },
+  {
+   "id": 7,
+   "type": "stat",
+   "title": "Writing now",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 3,
+    "x": 11,
+    "y": 1
+   },
+   "targets": [
+    {
+     "expr": "rate(sealed_log_bytes_appended_total{job=\"sealed-log\"}[5m])",
+     "legendFormat": "__auto",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "text",
+        "value": null
+       }
+      ]
+     },
+     "unit": "Bps"
+    },
+    "overrides": []
+   },
+   "options": {
+    "colorMode": "value",
+    "graphMode": "none",
+    "justifyMode": "auto",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "textMode": "auto"
+   },
+   "transformations": []
+  },
+  {
+   "id": 8,
+   "type": "stat",
+   "title": "Reading now",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 3,
+    "x": 14,
+    "y": 1
+   },
+   "targets": [
+    {
+     "expr": "rate(sealed_log_bytes_read_total{job=\"sealed-log\"}[5m])",
+     "legendFormat": "__auto",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "text",
+        "value": null
+       }
+      ]
+     },
+     "unit": "Bps"
+    },
+    "overrides": []
+   },
+   "options": {
+    "colorMode": "value",
+    "graphMode": "none",
+    "justifyMode": "auto",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "textMode": "auto"
+   },
+   "transformations": []
+  },
+  {
+   "id": 9,
+   "type": "stat",
+   "title": "Freed from shards in range",
+   "description": "Blob bytes the swaps took out of the shards. SQLite gives the space back only after a VACUUM.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 4,
+    "x": 17,
+    "y": 1
+   },
+   "targets": [
+    {
+     "expr": "sum(increase(atlas_sealed_log_offload_bytes_total{kind=\"freed\"}[$__range]))",
+     "legendFormat": "__auto",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "text",
+        "value": null
+       }
+      ]
+     },
+     "unit": "bytes"
+    },
+    "overrides": []
+   },
+   "options": {
+    "colorMode": "value",
+    "graphMode": "none",
+    "justifyMode": "auto",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "textMode": "auto"
+   },
+   "transformations": []
+  },
+  {
+   "id": 10,
+   "type": "stat",
+   "title": "Errors in range",
+   "description": "Failed requests and commits in the service, and failed offload batches in Atlas.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 3,
+    "x": 21,
+    "y": 1
+   },
+   "targets": [
+    {
+     "expr": "sum(increase(sealed_log_request_errors_total{job=\"sealed-log\"}[$__range])) + sum(increase(sealed_log_commit_failures_total{job=\"sealed-log\"}[$__range])) + sum(increase(atlas_sealed_log_offload_failures_total[$__range]))",
+     "legendFormat": "__auto",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "green",
+        "value": null
+       },
+       {
+        "color": "red",
+        "value": 1
+       }
+      ]
+     },
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "options": {
+    "colorMode": "background",
+    "graphMode": "none",
+    "justifyMode": "auto",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "textMode": "auto"
+   },
+   "transformations": []
+  },
+  {
+   "id": 11,
+   "type": "row",
+   "title": "Throughput",
+   "collapsed": false,
+   "panels": [],
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 5
+   }
+  },
+  {
+   "id": 12,
+   "type": "timeseries",
+   "title": "Bytes per second in the service",
+   "description": "Value bytes, without the 20-byte record headers.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 0,
+    "y": 6
+   },
+   "targets": [
+    {
+     "expr": "rate(sealed_log_bytes_appended_total{job=\"sealed-log\"}[5m])",
+     "legendFormat": "written",
+     "editorMode": "code",
+     "instant": false,
+     "range": true,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    },
+    {
+     "expr": "rate(sealed_log_bytes_read_total{job=\"sealed-log\"}[5m])",
+     "legendFormat": "read",
+     "editorMode": "code",
+     "instant": false,
+     "range": true,
+     "refId": "B",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "fillOpacity": 8,
+      "lineWidth": 1,
+      "showPoints": "never",
+      "spanNulls": false,
+      "drawStyle": "line",
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "unit": "Bps"
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "bottom",
+     "calcs": [
+      "lastNotNull",
+      "max"
+     ],
+     "showLegend": true,
+     "sortBy": "Max",
+     "sortDesc": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "transformations": []
+  },
+  {
+   "id": 13,
+   "type": "timeseries",
+   "title": "Network bytes per second",
+   "description": "What crosses the wire. Verify reads a whole batch back, so offloading costs twice its bytes on the network.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 8,
+    "y": 6
+   },
+   "targets": [
+    {
+     "expr": "rate(sealed_log_network_bytes_total{job=\"sealed-log\"}[5m])",
+     "legendFormat": "service {{direction}}",
+     "editorMode": "code",
+     "instant": false,
+     "range": true,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    },
+    {
+     "expr": "sum by (function, direction) (rate(atlas_function_bytes_total{function=~\"sealed_log.(fetch|verify|append)\"}[5m]))",
+     "legendFormat": "atlas {{function}} {{direction}}",
+     "editorMode": "code",
+     "instant": false,
+     "range": true,
+     "refId": "B",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "fillOpacity": 8,
+      "lineWidth": 1,
+      "showPoints": "never",
+      "spanNulls": false,
+      "drawStyle": "line",
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "unit": "Bps"
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "bottom",
+     "calcs": [
+      "lastNotNull",
+      "max"
+     ],
+     "showLegend": true,
+     "sortBy": "Max",
+     "sortDesc": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "transformations": []
+  },
+  {
+   "id": 14,
+   "type": "timeseries",
+   "title": "Offload per second",
+   "description": "Sent: blob bytes appended. Freed: what left the shards (sent less changed blobs and the 21-byte places).",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 16,
+    "y": 6
+   },
+   "targets": [
+    {
+     "expr": "sum by (kind) (rate(atlas_sealed_log_offload_bytes_total[5m]))",
+     "legendFormat": "{{kind}}",
+     "editorMode": "code",
+     "instant": false,
+     "range": true,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "fillOpacity": 8,
+      "lineWidth": 1,
+      "showPoints": "never",
+      "spanNulls": false,
+      "drawStyle": "line",
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "unit": "Bps"
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "bottom",
+     "calcs": [
+      "lastNotNull",
+      "max"
+     ],
+     "showLegend": true,
+     "sortBy": "Max",
+     "sortDesc": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "transformations": []
+  },
+  {
+   "id": 15,
+   "type": "timeseries",
+   "title": "Values per second",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 0,
+    "y": 14
+   },
+   "targets": [
+    {
+     "expr": "rate(sealed_log_values_appended_total{job=\"sealed-log\"}[5m])",
+     "legendFormat": "appended",
+     "editorMode": "code",
+     "instant": false,
+     "range": true,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    },
+    {
+     "expr": "rate(sealed_log_values_read_total{job=\"sealed-log\"}[5m])",
+     "legendFormat": "read",
+     "editorMode": "code",
+     "instant": false,
+     "range": true,
+     "refId": "B",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "fillOpacity": 8,
+      "lineWidth": 1,
+      "showPoints": "never",
+      "spanNulls": false,
+      "drawStyle": "line",
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "bottom",
+     "calcs": [
+      "lastNotNull",
+      "max"
+     ],
+     "showLegend": true,
+     "sortBy": "Max",
+     "sortDesc": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "transformations": []
+  },
+  {
+   "id": 16,
+   "type": "timeseries",
+   "title": "Requests per second",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 8,
+    "y": 14
+   },
+   "targets": [
+    {
+     "expr": "sum by (op) (rate(sealed_log_requests_total{job=\"sealed-log\"}[5m]))",
+     "legendFormat": "{{op}}",
+     "editorMode": "code",
+     "instant": false,
+     "range": true,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "fillOpacity": 8,
+      "lineWidth": 1,
+      "showPoints": "never",
+      "spanNulls": false,
+      "drawStyle": "line",
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "bottom",
+     "calcs": [
+      "lastNotNull",
+      "max"
+     ],
+     "showLegend": true,
+     "sortBy": "Max",
+     "sortDesc": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "transformations": []
+  },
+  {
+   "id": 17,
+   "type": "timeseries",
+   "title": "Group commits",
+   "description": "Appends that arrive together share one fdatasync. More per commit means the disk is the limit.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 16,
+    "y": 14
+   },
+   "targets": [
+    {
+     "expr": "rate(sealed_log_commits_total{job=\"sealed-log\"}[5m])",
+     "legendFormat": "commits per second",
+     "editorMode": "code",
+     "instant": false,
+     "range": true,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    },
+    {
+     "expr": "rate(sealed_log_commit_appends_total{job=\"sealed-log\"}[5m]) / rate(sealed_log_commits_total{job=\"sealed-log\"}[5m])",
+     "legendFormat": "appends per commit",
+     "editorMode": "code",
+     "instant": false,
+     "range": true,
+     "refId": "B",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "fillOpacity": 8,
+      "lineWidth": 1,
+      "showPoints": "never",
+      "spanNulls": false,
+      "drawStyle": "line",
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "bottom",
+     "calcs": [
+      "lastNotNull",
+      "max"
+     ],
+     "showLegend": true,
+     "sortBy": "Max",
+     "sortDesc": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "transformations": []
+  },
+  {
+   "id": 18,
+   "type": "row",
+   "title": "Latency",
+   "collapsed": false,
+   "panels": [],
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 22
+   }
+  },
+  {
+   "id": 19,
+   "type": "timeseries",
+   "title": "Append: time in the service",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 0,
+    "y": 23
+   },
+   "targets": [
+    {
+     "expr": "histogram_quantile(0.5, sum by (le) (rate(sealed_log_request_duration_seconds_bucket{job=\"sealed-log\",op=\"append\"}[5m])))",
+     "legendFormat": "p50",
+     "editorMode": "code",
+     "instant": false,
+     "range": true,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    },
+    {
+     "expr": "histogram_quantile(0.95, sum by (le) (rate(sealed_log_request_duration_seconds_bucket{job=\"sealed-log\",op=\"append\"}[5m])))",
+     "legendFormat": "p95",
+     "editorMode": "code",
+     "instant": false,
+     "range": true,
+     "refId": "B",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    },
+    {
+     "expr": "histogram_quantile(0.99, sum by (le) (rate(sealed_log_request_duration_seconds_bucket{job=\"sealed-log\",op=\"append\"}[5m])))",
+     "legendFormat": "p99",
+     "editorMode": "code",
+     "instant": false,
+     "range": true,
+     "refId": "C",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "fillOpacity": 8,
+      "lineWidth": 1,
+      "showPoints": "never",
+      "spanNulls": false,
+      "drawStyle": "line",
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "unit": "s"
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "bottom",
+     "calcs": [
+      "lastNotNull",
+      "max"
+     ],
+     "showLegend": true,
+     "sortBy": "Max",
+     "sortDesc": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "transformations": []
+  },
+  {
+   "id": 20,
+   "type": "timeseries",
+   "title": "Read: time in the service",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 8,
+    "y": 23
+   },
+   "targets": [
+    {
+     "expr": "histogram_quantile(0.5, sum by (le) (rate(sealed_log_request_duration_seconds_bucket{job=\"sealed-log\",op=\"read\"}[5m])))",
+     "legendFormat": "p50",
+     "editorMode": "code",
+     "instant": false,
+     "range": true,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    },
+    {
+     "expr": "histogram_quantile(0.95, sum by (le) (rate(sealed_log_request_duration_seconds_bucket{job=\"sealed-log\",op=\"read\"}[5m])))",
+     "legendFormat": "p95",
+     "editorMode": "code",
+     "instant": false,
+     "range": true,
+     "refId": "B",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    },
+    {
+     "expr": "histogram_quantile(0.99, sum by (le) (rate(sealed_log_request_duration_seconds_bucket{job=\"sealed-log\",op=\"read\"}[5m])))",
+     "legendFormat": "p99",
+     "editorMode": "code",
+     "instant": false,
+     "range": true,
+     "refId": "C",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "fillOpacity": 8,
+      "lineWidth": 1,
+      "showPoints": "never",
+      "spanNulls": false,
+      "drawStyle": "line",
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "unit": "s"
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "bottom",
+     "calcs": [
+      "lastNotNull",
+      "max"
+     ],
+     "showLegend": true,
+     "sortBy": "Max",
+     "sortDesc": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "transformations": []
+  },
+  {
+   "id": 21,
+   "type": "timeseries",
+   "title": "Time Atlas waits, per call",
+   "description": "Connecting, the network and the service together. fetch is a reader's one blob; append and verify are offload batches.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 16,
+    "y": 23
+   },
+   "targets": [
+    {
+     "expr": "histogram_quantile(0.95, sum by (function, le) (rate(atlas_function_duration_seconds_bucket{function=~\"sealed_log.(fetch|verify|append)\"}[5m])))",
+     "legendFormat": "{{function}} p95",
+     "editorMode": "code",
+     "instant": false,
+     "range": true,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    },
+    {
+     "expr": "histogram_quantile(0.5, sum by (function, le) (rate(atlas_function_duration_seconds_bucket{function=~\"sealed_log.(fetch|verify|append)\"}[5m])))",
+     "legendFormat": "{{function}} p50",
+     "editorMode": "code",
+     "instant": false,
+     "range": true,
+     "refId": "B",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "fillOpacity": 8,
+      "lineWidth": 1,
+      "showPoints": "never",
+      "spanNulls": false,
+      "drawStyle": "line",
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "unit": "s"
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "bottom",
+     "calcs": [
+      "lastNotNull",
+      "max"
+     ],
+     "showLegend": true,
+     "sortBy": "Max",
+     "sortDesc": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "transformations": []
+  },
+  {
+   "id": 22,
+   "type": "timeseries",
+   "title": "Network overhead per call (mean)",
+   "description": "What Atlas waits less what the service spends: the wire, both TCP stacks, and connecting. The disk's own time is in the next panel.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 0,
+    "y": 31
+   },
+   "targets": [
+    {
+     "expr": "(sum(rate(atlas_function_duration_seconds_sum{function=~\"sealed_log.append\"}[5m])) / sum(rate(atlas_function_duration_seconds_count{function=~\"sealed_log.append\"}[5m]))) - (sum(rate(sealed_log_request_duration_seconds_sum{job=\"sealed-log\",op=\"append\"}[5m])) / sum(rate(sealed_log_request_duration_seconds_count{job=\"sealed-log\",op=\"append\"}[5m])))",
+     "legendFormat": "append",
+     "editorMode": "code",
+     "instant": false,
+     "range": true,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    },
+    {
+     "expr": "(sum(rate(atlas_function_duration_seconds_sum{function=~\"sealed_log.(fetch|verify)\"}[5m])) / sum(rate(atlas_function_duration_seconds_count{function=~\"sealed_log.(fetch|verify)\"}[5m]))) - (sum(rate(sealed_log_request_duration_seconds_sum{job=\"sealed-log\",op=\"read\"}[5m])) / sum(rate(sealed_log_request_duration_seconds_count{job=\"sealed-log\",op=\"read\"}[5m])))",
+     "legendFormat": "read",
+     "editorMode": "code",
+     "instant": false,
+     "range": true,
+     "refId": "B",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "fillOpacity": 8,
+      "lineWidth": 1,
+      "showPoints": "never",
+      "spanNulls": false,
+      "drawStyle": "line",
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "unit": "s"
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "bottom",
+     "calcs": [
+      "lastNotNull",
+      "max"
+     ],
+     "showLegend": true,
+     "sortBy": "Max",
+     "sortDesc": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "transformations": []
+  },
+  {
+   "id": 23,
+   "type": "timeseries",
+   "title": "Disk: fdatasync and reads",
+   "description": "The disk itself, with nothing of the network in it.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 8,
+    "y": 31
+   },
+   "targets": [
+    {
+     "expr": "histogram_quantile(0.5, sum by (le) (rate(sealed_log_fdatasync_duration_seconds_bucket{job=\"sealed-log\"}[5m])))",
+     "legendFormat": "fdatasync p50",
+     "editorMode": "code",
+     "instant": false,
+     "range": true,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    },
+    {
+     "expr": "histogram_quantile(0.95, sum by (le) (rate(sealed_log_fdatasync_duration_seconds_bucket{job=\"sealed-log\"}[5m])))",
+     "legendFormat": "fdatasync p95",
+     "editorMode": "code",
+     "instant": false,
+     "range": true,
+     "refId": "B",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    },
+    {
+     "expr": "histogram_quantile(0.99, sum by (le) (rate(sealed_log_fdatasync_duration_seconds_bucket{job=\"sealed-log\"}[5m])))",
+     "legendFormat": "fdatasync p99",
+     "editorMode": "code",
+     "instant": false,
+     "range": true,
+     "refId": "C",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    },
+    {
+     "expr": "histogram_quantile(0.95, sum by (le) (rate(sealed_log_disk_read_duration_seconds_bucket{job=\"sealed-log\"}[5m])))",
+     "legendFormat": "read one value p95",
+     "editorMode": "code",
+     "instant": false,
+     "range": true,
+     "refId": "D",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "fillOpacity": 8,
+      "lineWidth": 1,
+      "showPoints": "never",
+      "spanNulls": false,
+      "drawStyle": "line",
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "unit": "s"
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "bottom",
+     "calcs": [
+      "lastNotNull",
+      "max"
+     ],
+     "showLegend": true,
+     "sortBy": "Max",
+     "sortDesc": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "transformations": []
+  },
+  {
+   "id": 24,
+   "type": "timeseries",
+   "title": "Waiting for the writer",
+   "description": "An append queued behind the commit in progress. Growing waits mean writes come faster than the disk takes them.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 16,
+    "y": 31
+   },
+   "targets": [
+    {
+     "expr": "histogram_quantile(0.5, sum by (le) (rate(sealed_log_queue_duration_seconds_bucket{job=\"sealed-log\"}[5m])))",
+     "legendFormat": "p50",
+     "editorMode": "code",
+     "instant": false,
+     "range": true,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    },
+    {
+     "expr": "histogram_quantile(0.95, sum by (le) (rate(sealed_log_queue_duration_seconds_bucket{job=\"sealed-log\"}[5m])))",
+     "legendFormat": "p95",
+     "editorMode": "code",
+     "instant": false,
+     "range": true,
+     "refId": "B",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    },
+    {
+     "expr": "histogram_quantile(0.99, sum by (le) (rate(sealed_log_queue_duration_seconds_bucket{job=\"sealed-log\"}[5m])))",
+     "legendFormat": "p99",
+     "editorMode": "code",
+     "instant": false,
+     "range": true,
+     "refId": "C",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "fillOpacity": 8,
+      "lineWidth": 1,
+      "showPoints": "never",
+      "spanNulls": false,
+      "drawStyle": "line",
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "unit": "s"
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "bottom",
+     "calcs": [
+      "lastNotNull",
+      "max"
+     ],
+     "showLegend": true,
+     "sortBy": "Max",
+     "sortDesc": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "transformations": []
+  },
+  {
+   "id": 25,
+   "type": "row",
+   "title": "Disk",
+   "collapsed": false,
+   "panels": [],
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 39
+   }
+  },
+  {
+   "id": 26,
+   "type": "timeseries",
+   "title": "Log size",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 0,
+    "y": 40
+   },
+   "targets": [
+    {
+     "expr": "sealed_log_bytes{job=\"sealed-log\"}",
+     "legendFormat": "log",
+     "editorMode": "code",
+     "instant": false,
+     "range": true,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "fillOpacity": 8,
+      "lineWidth": 1,
+      "showPoints": "never",
+      "spanNulls": false,
+      "drawStyle": "line",
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "unit": "bytes"
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "bottom",
+     "calcs": [
+      "lastNotNull",
+      "max"
+     ],
+     "showLegend": true,
+     "sortBy": "Max",
+     "sortDesc": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "transformations": []
+  },
+  {
+   "id": 27,
+   "type": "timeseries",
+   "title": "Data disk",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 8,
+    "y": 40
+   },
+   "targets": [
+    {
+     "expr": "sealed_log_filesystem_bytes{job=\"sealed-log\",kind=\"size\"} - sealed_log_filesystem_bytes{job=\"sealed-log\",kind=\"free\"}",
+     "legendFormat": "used",
+     "editorMode": "code",
+     "instant": false,
+     "range": true,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    },
+    {
+     "expr": "sealed_log_filesystem_bytes{job=\"sealed-log\",kind=\"avail\"}",
+     "legendFormat": "available",
+     "editorMode": "code",
+     "instant": false,
+     "range": true,
+     "refId": "B",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "fillOpacity": 25,
+      "lineWidth": 1,
+      "showPoints": "never",
+      "spanNulls": false,
+      "drawStyle": "line",
+      "stacking": {
+       "mode": "normal",
+       "group": "A"
+      }
+     },
+     "unit": "bytes"
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "bottom",
+     "calcs": [
+      "lastNotNull",
+      "max"
+     ],
+     "showLegend": true,
+     "sortBy": "Max",
+     "sortDesc": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "transformations": []
+  },
+  {
+   "id": 28,
+   "type": "stat",
+   "title": "Segments",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 4,
+    "x": 16,
+    "y": 40
+   },
+   "targets": [
+    {
+     "expr": "sealed_log_segments{job=\"sealed-log\"}",
+     "legendFormat": "__auto",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "text",
+        "value": null
+       }
+      ]
+     },
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "options": {
+    "colorMode": "value",
+    "graphMode": "none",
+    "justifyMode": "auto",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "textMode": "auto"
+   },
+   "transformations": []
+  },
+  {
+   "id": 29,
+   "type": "stat",
+   "title": "Days until the disk fills",
+   "description": "At the rate the log grew over the last 6 hours.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 4,
+    "x": 20,
+    "y": 40
+   },
+   "targets": [
+    {
+     "expr": "sealed_log_filesystem_bytes{job=\"sealed-log\",kind=\"avail\"} / (deriv(sealed_log_bytes{job=\"sealed-log\"}[6h]) * 86400) > 0",
+     "legendFormat": "__auto",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "text",
+        "value": null
+       }
+      ]
+     },
+     "unit": "d"
+    },
+    "overrides": []
+   },
+   "options": {
+    "colorMode": "value",
+    "graphMode": "none",
+    "justifyMode": "auto",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "textMode": "auto"
+   },
+   "transformations": []
+  },
+  {
+   "id": 30,
+   "type": "row",
+   "title": "Offload",
+   "collapsed": false,
+   "panels": [],
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 48
+   }
+  },
+  {
+   "id": 31,
+   "type": "timeseries",
+   "title": "What the offload is doing",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 0,
+    "y": 49
+   },
+   "targets": [
+    {
+     "expr": "max by (state) (atlas_sealed_log_offload_state)",
+     "legendFormat": "{{state}}",
+     "editorMode": "code",
+     "instant": false,
+     "range": true,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "fillOpacity": 25,
+      "lineWidth": 1,
+      "showPoints": "never",
+      "spanNulls": false,
+      "drawStyle": "line",
+      "stacking": {
+       "mode": "normal",
+       "group": "A"
+      }
+     },
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "bottom",
+     "calcs": [
+      "lastNotNull",
+      "max"
+     ],
+     "showLegend": true,
+     "sortBy": "Max",
+     "sortDesc": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "transformations": []
+  },
+  {
+   "id": 32,
+   "type": "timeseries",
+   "title": "Files per minute",
+   "description": "Changed: more articles were sealed into the blob while it was on its way, so it stays local and its copy goes unused.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 8,
+    "y": 49
+   },
+   "targets": [
+    {
+     "expr": "sum by (result) (rate(atlas_sealed_log_offload_files_total[5m])) * 60",
+     "legendFormat": "{{result}}",
+     "editorMode": "code",
+     "instant": false,
+     "range": true,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "fillOpacity": 25,
+      "lineWidth": 1,
+      "showPoints": "never",
+      "spanNulls": false,
+      "drawStyle": "line",
+      "stacking": {
+       "mode": "normal",
+       "group": "A"
+      }
+     },
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "bottom",
+     "calcs": [
+      "lastNotNull",
+      "max"
+     ],
+     "showLegend": true,
+     "sortBy": "Max",
+     "sortDesc": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "transformations": []
+  },
+  {
+   "id": 33,
+   "type": "timeseries",
+   "title": "Share of time throttled",
+   "description": "Waiting to stay under offload_mb_per_second. Near 0 means the network or the service is the limit, not the setting.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 16,
+    "y": 49
+   },
+   "targets": [
+    {
+     "expr": "rate(atlas_sealed_log_offload_throttled_milliseconds_total[5m]) / 1000",
+     "legendFormat": "throttled",
+     "editorMode": "code",
+     "instant": false,
+     "range": true,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "fillOpacity": 8,
+      "lineWidth": 1,
+      "showPoints": "never",
+      "spanNulls": false,
+      "drawStyle": "line",
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "unit": "percentunit"
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "bottom",
+     "calcs": [
+      "lastNotNull",
+      "max"
+     ],
+     "showLegend": true,
+     "sortBy": "Max",
+     "sortDesc": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "transformations": []
+  },
+  {
+   "id": 34,
+   "type": "timeseries",
+   "title": "Sweep",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 0,
+    "y": 57
+   },
+   "targets": [
+    {
+     "expr": "atlas_sealed_log_sweep{kind=~\"shards|shards_left\"}",
+     "legendFormat": "{{kind}}",
+     "editorMode": "code",
+     "instant": false,
+     "range": true,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "fillOpacity": 8,
+      "lineWidth": 1,
+      "showPoints": "never",
+      "spanNulls": false,
+      "drawStyle": "line",
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "bottom",
+     "calcs": [
+      "lastNotNull",
+      "max"
+     ],
+     "showLegend": true,
+     "sortBy": "Max",
+     "sortDesc": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "transformations": []
+  },
+  {
+   "id": 35,
+   "type": "stat",
+   "title": "Last sweep finished",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 4,
+    "x": 8,
+    "y": 57
+   },
+   "targets": [
+    {
+     "expr": "atlas_sealed_log_sweep{kind=\"last_done_timestamp_seconds\"} * 1000",
+     "legendFormat": "__auto",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "text",
+        "value": null
+       }
+      ]
+     },
+     "unit": "dateTimeFromNow"
+    },
+    "overrides": []
+   },
+   "options": {
+    "colorMode": "value",
+    "graphMode": "none",
+    "justifyMode": "auto",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "textMode": "auto"
+   },
+   "transformations": []
+  },
+  {
+   "id": 36,
+   "type": "stat",
+   "title": "Last sweep moved",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 4,
+    "x": 12,
+    "y": 57
+   },
+   "targets": [
+    {
+     "expr": "atlas_sealed_log_sweep{kind=\"last_bytes\"}",
+     "legendFormat": "__auto",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "text",
+        "value": null
+       }
+      ]
+     },
+     "unit": "bytes"
+    },
+    "overrides": []
+   },
+   "options": {
+    "colorMode": "value",
+    "graphMode": "none",
+    "justifyMode": "auto",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "textMode": "auto"
+   },
+   "transformations": []
+  },
+  {
+   "id": 37,
+   "type": "timeseries",
+   "title": "Failures",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 0,
+    "y": 65
+   },
+   "targets": [
+    {
+     "expr": "sum by (kind) (increase(atlas_sealed_log_offload_failures_total[5m]))",
+     "legendFormat": "offload {{kind}}",
+     "editorMode": "code",
+     "instant": false,
+     "range": true,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    },
+    {
+     "expr": "sum by (op) (increase(sealed_log_request_errors_total{job=\"sealed-log\"}[5m]))",
+     "legendFormat": "service {{op}}",
+     "editorMode": "code",
+     "instant": false,
+     "range": true,
+     "refId": "B",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    },
+    {
+     "expr": "increase(sealed_log_checksum_failures_total{job=\"sealed-log\"}[5m])",
+     "legendFormat": "checksum",
+     "editorMode": "code",
+     "instant": false,
+     "range": true,
+     "refId": "C",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    },
+    {
+     "expr": "sum by (result) (increase(atlas_sealed_log_connects_total{result=\"failed\"}[5m]))",
+     "legendFormat": "connect failed",
+     "editorMode": "code",
+     "instant": false,
+     "range": true,
+     "refId": "D",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "fillOpacity": 25,
+      "lineWidth": 1,
+      "showPoints": "never",
+      "spanNulls": false,
+      "drawStyle": "bars",
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "bottom",
+     "calcs": [
+      "lastNotNull",
+      "max"
+     ],
+     "showLegend": true,
+     "sortBy": "Max",
+     "sortDesc": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "transformations": []
+  },
+  {
+   "id": 38,
+   "type": "timeseries",
+   "title": "Connections",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 12,
+    "y": 65
+   },
+   "targets": [
+    {
+     "expr": "sealed_log_connections{job=\"sealed-log\"}",
+     "legendFormat": "open at the service",
+     "editorMode": "code",
+     "instant": false,
+     "range": true,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    },
+    {
+     "expr": "sum by (role) (increase(atlas_sealed_log_connects_total[5m]))",
+     "legendFormat": "new from {{role}}",
+     "editorMode": "code",
+     "instant": false,
+     "range": true,
+     "refId": "B",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "fillOpacity": 8,
+      "lineWidth": 1,
+      "showPoints": "never",
+      "spanNulls": false,
+      "drawStyle": "line",
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "bottom",
+     "calcs": [
+      "lastNotNull",
+      "max"
+     ],
+     "showLegend": true,
+     "sortBy": "Max",
+     "sortDesc": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "transformations": []
+  }
+ ]
+}

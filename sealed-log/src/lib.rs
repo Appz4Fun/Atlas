@@ -13,8 +13,12 @@ use std::io::{self, BufReader, BufWriter, Error, ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering::Relaxed;
 use std::sync::{Arc, Mutex, RwLock, mpsc};
 use std::time::{Duration, Instant};
+
+pub mod metrics;
+use metrics::STATS;
 
 const MAGIC: [u8; 4] = *b"SLG1";
 const HEADER: usize = 4 + 4 + 8 + 4;
@@ -108,6 +112,7 @@ struct Tail {
 
 struct Group {
     values: Vec<(u64, Vec<u8>)>,
+    queued: Instant,
     done: mpsc::Sender<io::Result<Vec<Locator>>>,
 }
 
@@ -181,14 +186,20 @@ impl Log {
         });
         let state = Tail { segment: last, file, pos, reserved };
         let (d, shared) = (dir.to_path_buf(), tail);
-        std::thread::Builder::new().name("sealed-log-writer".into()).spawn(move || write_loop(d, segment_bytes, state, shared, rx))?;
+        std::thread::Builder::new()
+            .name("sealed-log-writer".into())
+            .spawn(move || write_loop(d, segment_bytes, state, shared, rx))?;
         Ok(log)
     }
 
     /// Stores values, returning where each went once they are on disk.
     pub fn append(&self, values: Vec<(u64, Vec<u8>)>) -> io::Result<Vec<Locator>> {
         let (done, wait) = mpsc::channel();
-        self.writer.lock().unwrap().send(Group { values, done }).map_err(|_| Error::other("writer stopped"))?;
+        self.writer
+            .lock()
+            .unwrap()
+            .send(Group { values, done, queued: Instant::now() })
+            .map_err(|_| Error::other("writer stopped"))?;
         wait.recv().map_err(|_| Error::other("writer stopped"))?
     }
 
@@ -203,6 +214,17 @@ impl Log {
 
     /// A value, its checksum checked. A place past what's been written is an error.
     pub fn read(&self, at: Locator) -> io::Result<Vec<u8>> {
+        let started = Instant::now();
+        let value = self.read_unmeasured(at);
+        STATS.disk_read_seconds.since(started);
+        if let Ok(v) = &value {
+            STATS.values_read.fetch_add(1, Relaxed);
+            STATS.bytes_read.fetch_add(v.len() as u64, Relaxed);
+        }
+        value
+    }
+
+    fn read_unmeasured(&self, at: Locator) -> io::Result<Vec<u8>> {
         let (seg, pos) = *self.tail.read().unwrap();
         let end = at.offset + HEADER as u64 + at.len as u64;
         if at.segment > seg || (at.segment == seg && end > pos) {
@@ -221,18 +243,39 @@ impl Log {
         }
         let value = raw.split_off(HEADER);
         if crc_of(key, &value) != crc {
+            STATS.checksum_failures.fetch_add(1, Relaxed);
             return Err(invalid(format!("{at:?} failed its checksum")));
         }
         Ok(value)
     }
 
     pub fn stats(&self) -> String {
+        let (seg, pos, bytes) = self.tail();
+        format!("{{\"segment\":{seg},\"position\":{pos},\"bytes\":{bytes}}}")
+    }
+
+    /// The segment being written, how far it has come, and the bytes the log holds.
+    pub fn tail(&self) -> (u32, u64, u64) {
         let (seg, pos) = *self.tail.read().unwrap();
-        format!("{{\"segment\":{seg},\"position\":{pos},\"bytes\":{}}}", seg as u64 * self.segment_bytes + pos)
+        (seg, pos, seg as u64 * self.segment_bytes + pos)
+    }
+
+    pub fn segment_bytes(&self) -> u64 {
+        self.segment_bytes
+    }
+
+    pub fn dir(&self) -> &Path {
+        &self.dir
     }
 }
 
-fn write_loop(dir: PathBuf, segment_bytes: u64, mut t: Tail, shared: Arc<RwLock<(u32, u64)>>, rx: mpsc::Receiver<Group>) {
+fn write_loop(
+    dir: PathBuf,
+    segment_bytes: u64,
+    mut t: Tail,
+    shared: Arc<RwLock<(u32, u64)>>,
+    rx: mpsc::Receiver<Group>,
+) {
     let mut last_checkpoint = Instant::now();
     while let Ok(first) = rx.recv() {
         let mut groups = vec![first];
@@ -243,10 +286,20 @@ fn write_loop(dir: PathBuf, segment_bytes: u64, mut t: Tail, shared: Arc<RwLock<
             groups.push(more);
         }
         let before = (t.segment, t.pos);
+        let started = Instant::now();
+        for g in &groups {
+            STATS.queue_seconds.observe(started.saturating_duration_since(g.queued));
+        }
         let answers = write_group(&dir, segment_bytes, &mut t, &groups);
+        STATS.commit_seconds.since(started);
         match answers {
             Ok(mut per_group) => {
                 *shared.write().unwrap() = (t.segment, t.pos);
+                STATS.commits.fetch_add(1, Relaxed);
+                STATS.commit_appends.fetch_add(groups.len() as u64, Relaxed);
+                let values: usize = groups.iter().map(|g| g.values.len()).sum();
+                STATS.values_appended.fetch_add(values as u64, Relaxed);
+                STATS.bytes_appended.fetch_add(total as u64, Relaxed);
                 for g in groups.iter().rev() {
                     let _ = g.done.send(Ok(per_group.pop().unwrap_or_default()));
                 }
@@ -257,6 +310,7 @@ fn write_loop(dir: PathBuf, segment_bytes: u64, mut t: Tail, shared: Arc<RwLock<
                 if t.segment == before.0 {
                     t.pos = before.1;
                 }
+                STATS.commit_failures.fetch_add(1, Relaxed);
                 eprintln!("sealed-log: write failed: {e}");
                 for g in &groups {
                     let _ = g.done.send(Err(Error::new(e.kind(), e.to_string())));
@@ -284,7 +338,8 @@ fn write_group(dir: &Path, segment_bytes: u64, t: &mut Tail, groups: &[Group]) -
             if t.pos > 0 && t.pos + size > segment_bytes {
                 t.file.write_all_at(&buf, buf_at)?;
                 buf.clear();
-                t.file.sync_data()?;
+                sync(&t.file)?;
+                STATS.segments_rolled.fetch_add(1, Relaxed);
                 // the unused rest of the reservation goes back
                 t.file.set_len(t.pos)?;
                 t.segment += 1;
@@ -309,8 +364,15 @@ fn write_group(dir: &Path, segment_bytes: u64, t: &mut Tail, groups: &[Group]) -
         out.push(places);
     }
     t.file.write_all_at(&buf, buf_at)?;
-    t.file.sync_data()?;
+    sync(&t.file)?;
     Ok(out)
+}
+
+fn sync(file: &File) -> io::Result<()> {
+    let started = Instant::now();
+    let done = file.sync_data();
+    STATS.fdatasync_seconds.since(started);
+    done
 }
 
 fn read_frame(r: &mut impl Read) -> io::Result<(u8, Vec<u8>)> {
@@ -342,6 +404,23 @@ fn take<'a>(b: &mut &'a [u8], n: usize) -> io::Result<&'a [u8]> {
 }
 
 fn handle(log: &Log, op: u8, body: &[u8]) -> io::Result<Vec<u8>> {
+    let started = Instant::now();
+    let answer = handle_unmeasured(log, op, body);
+    let counted = match op {
+        OP_APPEND => &STATS.append,
+        OP_READ => &STATS.read,
+        OP_STATS => &STATS.stats,
+        _ => return answer,
+    };
+    counted.requests.fetch_add(1, Relaxed);
+    if answer.is_err() {
+        counted.errors.fetch_add(1, Relaxed);
+    }
+    counted.seconds.since(started);
+    answer
+}
+
+fn handle_unmeasured(log: &Log, op: u8, body: &[u8]) -> io::Result<Vec<u8>> {
     let mut b = body;
     match op {
         OP_APPEND => {
@@ -368,16 +447,42 @@ fn handle(log: &Log, op: u8, body: &[u8]) -> io::Result<Vec<u8>> {
     }
 }
 
+struct Open;
+
+impl Open {
+    fn new() -> Open {
+        STATS.connections.fetch_add(1, Relaxed);
+        STATS.connections_total.fetch_add(1, Relaxed);
+        Open
+    }
+}
+
+impl Drop for Open {
+    fn drop(&mut self) {
+        STATS.connections.fetch_sub(1, Relaxed);
+    }
+}
+
 fn serve_one(log: &Log, s: TcpStream) -> io::Result<()> {
+    let _open = Open::new();
     s.set_nodelay(true)?;
     let mut r = BufReader::with_capacity(1 << 20, s.try_clone()?);
     let mut w = BufWriter::with_capacity(1 << 20, s);
     loop {
         let (op, body) = read_frame(&mut r)?;
-        match handle(log, op, &body) {
-            Ok(out) => write_frame(&mut w, 0, &out)?,
-            Err(e) => write_frame(&mut w, 1, e.to_string().as_bytes())?,
-        }
+        STATS.network_received.fetch_add(5 + body.len() as u64, Relaxed);
+        let sent = match handle(log, op, &body) {
+            Ok(out) => {
+                write_frame(&mut w, 0, &out)?;
+                out.len()
+            }
+            Err(e) => {
+                let text = e.to_string();
+                write_frame(&mut w, 1, text.as_bytes())?;
+                text.len()
+            }
+        };
+        STATS.network_sent.fetch_add(5 + sent as u64, Relaxed);
     }
 }
 
