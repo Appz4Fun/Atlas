@@ -8,7 +8,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 
 use atlas::config::Config;
-use atlas::parser::Release;
+use atlas::parser::{Article, Release};
 use atlas::{api, db, store};
 use common::stage::{article, release_of};
 
@@ -169,14 +169,14 @@ fn the_web_ui_end_to_end() {
     assert_eq!(fetch(port, &format!("/ui/release?id={id}"), "").status(), 303);
 
     // one post spread over two groups: one row, whole, and an NZB with all of it
-    for (group, part) in [("alt.binaries.g1", 1), ("alt.binaries.g2", 2)] {
-        let one = article("split.bin", part, 2, &format!("<split.{part}@x>"));
+    let posted = |name: &str, group: &str, one: Article, date: &str| {
         let size = one.bytes;
         store::save(
             &main,
             &[Release {
-                name: "Spread.Post.S01E01-GRP".into(),
+                name: name.into(),
                 group: group.into(),
+                date: date.into(),
                 articles: vec![one],
                 size,
                 complete: false,
@@ -184,6 +184,11 @@ fn the_web_ui_end_to_end() {
             }],
         )
         .unwrap();
+    };
+    const DAY: &str = "2026-10-03 17:41:49";
+    for (group, part) in [("alt.binaries.g1", 1), ("alt.binaries.g2", 2)] {
+        let one = article("split.bin", part, 2, &format!("<split.{part}@x>"));
+        posted("Spread.Post.S01E01-GRP", group, one, DAY);
     }
     let spread = fetch(port, "/ui/results?q=Spread", &cookie);
     assert_eq!(spread.body.matches("Spread.Post.S01E01-GRP</a>").count(), 1, "{}", spread.body);
@@ -204,28 +209,69 @@ fn the_web_ui_end_to_end() {
     let one_file = fetch(port, &format!("/api?t=get&id={spread_id}&file=1&apikey={KEY}"), "");
     assert!(one_file.body.contains("split.1@x") && one_file.body.contains("split.2@x"), "{}", one_file.body);
 
-    // parts both groups have count once, and it isn't whole until the missing part comes
-    for (group, part) in [("alt.binaries.g1", 1), ("alt.binaries.g2", 1), ("alt.binaries.g2", 2)] {
-        let one = article("gap.bin", part, 3, &format!("<gap.{group}.{part}@x>"));
-        let size = one.bytes;
-        store::save(
-            &main,
-            &[Release {
-                name: "Gapped.Post.S01E01-GRP".into(),
-                group: group.into(),
-                articles: vec![one],
-                size,
-                complete: false,
-                ..Default::default()
-            }],
-        )
-        .unwrap();
+    // its rows can share a fingerprint, and hiding copies doesn't lose the post
+    let spread_shards: Vec<_> = ["alt.binaries.g1", "alt.binaries.g2"]
+        .map(|group| db::open_shard(&store::shard_path(&main, store::shard_of(group))).unwrap())
+        .into_iter()
+        .collect();
+    for shard in &spread_shards {
+        shard
+            .execute(
+                "insert into release_fingerprint (release_id, posted)
+                 select id, x'01' from releases where name = 'Spread.Post.S01E01-GRP'",
+                [],
+            )
+            .unwrap();
+    }
+    let hiding = fetch(port, "/ui/results?q=Spread&filters=Hide%20copies&sort=group&dir=asc", &cookie);
+    assert_eq!(hiding.body.matches("Spread.Post.S01E01-GRP</a>").count(), 1, "{}", hiding.body);
+    for shard in &spread_shards {
+        shard.execute("delete from release_fingerprint", []).unwrap();
+    }
+
+    // it isn't whole until the missing part comes
+    for (group, part) in [("alt.binaries.g1", 1), ("alt.binaries.g2", 2)] {
+        posted("Gapped.Post.S01E01-GRP", group, article("gap.bin", part, 3, &format!("<gap.{part}@x>")), DAY);
     }
     let gapped = fetch(port, "/ui/results?q=Gapped", &cookie);
-    assert!(gapped.body.contains("INCOMPLETE"), "{}", gapped.body);
+    assert!(gapped.body.contains("INCOMPLETE") && gapped.body.contains("2 GROUPS"), "{}", gapped.body);
     let gap_id = gapped.body.split("/ui/release?id=").nth(1).unwrap().split('"').next().unwrap().to_string();
     let opened = fetch(port, &format!("/ui/release?id={gap_id}"), &cookie);
     assert!(opened.body.contains("2 of 3"), "{}", opened.body);
+
+    // a name and poster anyone can copy aren't enough: what doesn't fit one upload stays in its own group
+    let other_part = |file: &str, id: &str, subject: Option<&str>, parts: i64| {
+        let mut one = article(file, 2, parts, id);
+        if let Some(subject) = subject {
+            one.subject = subject.into();
+        }
+        one
+    };
+    for (name, one, date) in [
+        // a part the other group has too, under another message id
+        ("Same.Part", article("x.bin", 1, 2, "<swap@evil>"), DAY),
+        // another subject for the same file
+        ("New.Subject", other_part("x.bin", "<subject@evil>", Some("\"x.bin\" yEnc (2/2) other"), 2), DAY),
+        // another count of parts
+        ("New.Count", other_part("x.bin", "<count@evil>", None, 3), DAY),
+        // no file in common
+        ("New.File", other_part("y.bin", "<file@evil>", None, 2), DAY),
+        // long after
+        ("Much.Later", other_part("x.bin", "<later@evil>", None, 2), "2026-10-05 17:41:49"),
+        // no date to go by
+        ("No.Date", other_part("x.bin", "<nodate@evil>", None, 2), ""),
+    ] {
+        let name = format!("{name}.Fake.S01E01-GRP");
+        posted(&name, "alt.binaries.g1", article("x.bin", 1, 2, &format!("<{name}@x>")), DAY);
+        posted(&name, "alt.binaries.g2", one, date);
+        let found = fetch(port, &format!("/ui/results?q=%22{name}%22"), &cookie);
+        assert_eq!(found.body.matches(&format!("{name}</a>")).count(), 2, "{}", found.body);
+        assert!(found.body.contains("INCOMPLETE") && !found.body.contains(" GROUPS"), "{}", found.body);
+        let id = found.body.split("/ui/release?id=").nth(1).unwrap().split('"').next().unwrap().to_string();
+        let nzb = fetch(port, &format!("/ui/nzb?id={id}"), &cookie);
+        assert_eq!(nzb.body.matches("<group>").count(), 1, "{}", nzb.body);
+        assert!(!nzb.body.contains("@evil") || !nzb.body.contains(&format!("{name}@x")), "{}", nzb.body);
+    }
 
     // copies, listed together, with what tells them apart
     assert_eq!(fetch(port, "/ui/duplicates", "").status(), 303);

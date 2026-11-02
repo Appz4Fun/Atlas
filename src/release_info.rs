@@ -1,7 +1,8 @@
 //! What the release page says about a posting itself: who posted it, its names, its PAR2 files
 //! and how much of it is there. Read when the page opens, soo nothing here is stored.
 
-use std::collections::HashMap;
+use std::collections::btree_map::Entry;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::LazyLock;
 
 use regex::Regex;
@@ -158,8 +159,8 @@ pub fn contents_with(conn: &Connection, id: i64) -> Result<Contents> {
 
 fn contents_of(conn: &Connection, ids: &[i64]) -> Result<Contents> {
     let mut totals = Contents::default();
-    let (files, _) = union_files(conn, ids)?;
-    for (filename, file) in &files {
+    let union = union_files(conn, ids)?;
+    for (filename, file) in &union.files {
         let seen = store::seen_count(&file.seen);
         totals.files += 1;
         totals.articles_seen += seen;
@@ -179,13 +180,9 @@ fn contents_of(conn: &Connection, ids: &[i64]) -> Result<Contents> {
         }
     }
     let mut bytes: HashMap<String, i64> = HashMap::new();
-    let mut counted = std::collections::HashSet::new();
     for id in ids {
         store::each_article(conn, *id, &mut |article| {
-            let filename = article.filename.unwrap_or_default();
-            if article.part.is_none() || counted.insert((filename.clone(), article.part)) {
-                *bytes.entry(filename).or_default() += article.bytes.unwrap_or(0);
-            }
+            *bytes.entry(article.filename.unwrap_or_default()).or_default() += article.bytes.unwrap_or(0);
             Ok(())
         })?;
     }
@@ -256,47 +253,125 @@ impl SplitPost {
     }
 }
 
-/// The rest of this release's post in other groups, if it has any. None: it's all here.
+/// How far apart a split post's groups can have got their articles, in days. Each row keeps its newest article's date,
+/// and real ones are minutes apart.
+const SPLIT_POST_DAYS: f64 = 1.0;
+
+/// The rest of this release's post in other groups, if it has any. None: it's all here, or the rows that look like it
+/// don't add up to one upload. Name and poster are only what the headers say, and anyone can copy those to another group,
+/// soo any doubt leaves every row on its own, and every row of a post gets the same answer.
 pub fn split_post_with(conn: &Connection, release: &crate::search::ReleaseRow) -> Result<Option<SplitPost>> {
     let posted = names_with(conn, release.id)?.map_or(release.name.clone(), |n| n.posted);
-    let (mut ids, mut groups, mut size) = (Vec::new(), Vec::new(), 0);
+    let (mut ids, mut groups, mut size, mut dates) = (Vec::new(), Vec::new(), 0, Vec::new());
     for s in 0..store::SHARDS {
         let mut stmt = conn.prepare_cached(&format!(
-            "select id, group_name, coalesce(size, 0) from s{s}.releases where name = ?1 and poster is ?2 and not atlas_blocked(group_name) limit 64"
+            "select id, group_name, coalesce(size, 0), julianday(posted_date) from s{s}.releases
+             where name = ?1 and poster is ?2 and not atlas_blocked(group_name) limit 64"
         ))?;
         let rows = stmt.query_map(rusqlite::params![posted, release.poster], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?.unwrap_or_default(), r.get::<_, i64>(2)?))
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                r.get::<_, i64>(2)?,
+                r.get::<_, Option<f64>>(3)?,
+            ))
         })?;
         for row in rows {
-            let (id, group, bytes) = row?;
+            let (id, group, bytes, date) = row?;
             ids.push(id);
             groups.push(group);
             size += bytes;
+            dates.push(date);
         }
     }
-    if ids.len() < 2 {
+    if ids.len() < 2 || !close_together(&dates) {
         return Ok(None);
     }
     ids.sort_unstable();
     groups.sort_unstable();
     groups.dedup();
-    let complete = split_is_complete(conn, &ids)?;
-    Ok(Some(SplitPost { ids, groups, size, complete }))
+    let files = union_files(conn, &ids)?;
+    if !files.one_upload() {
+        return Ok(None);
+    }
+    Ok(Some(SplitPost { ids, groups, size, complete: files.complete() }))
 }
 
-/// Each file across these releases, by name: what's expected of it, and which parts any of them has.
+fn close_together(dates: &[Option<f64>]) -> bool {
+    let Some(dates) = dates.iter().copied().collect::<Option<Vec<f64>>>() else { return false };
+    let (first, last) = dates.iter().fold((f64::MAX, f64::MIN), |(lo, hi), d| (lo.min(*d), hi.max(*d)));
+    last - first <= SPLIT_POST_DAYS
+}
+
+/// A file across releases: what's expected of it, and which parts any of them has.
 struct UnionFile {
     expected: Option<i64>,
     seen: Vec<u8>,
+    /// its subject, less the part number
+    subject: Option<String>,
 }
 
-fn union_files(conn: &Connection, ids: &[i64]) -> Result<(std::collections::BTreeMap<String, UnionFile>, Option<i64>)> {
-    let mut files: std::collections::BTreeMap<String, UnionFile> = Default::default();
-    let mut file_total = None;
+/// Each file across these releases, by name, and what says whether they're one upload.
+#[derive(Default)]
+struct UnionFiles {
+    files: BTreeMap<String, UnionFile>,
+    /// what each file says the post has
+    file_totals: BTreeSet<Option<i64>>,
+    /// each release's filenames
+    rows: Vec<BTreeSet<String>>,
+    /// two releases have a file they don't agree on, or a part of it both have
+    conflict: bool,
+}
+
+impl UnionFiles {
+    /// Whether the releases can be parts of one upload. Each article went to one group, soo no part is in two of them,
+    /// they say the same of every file they share, and each shares one with the rest.
+    fn one_upload(&self) -> bool {
+        let mut totals = self.file_totals.iter();
+        let total_fits = match (totals.next(), totals.next()) {
+            (Some(total), None) => total.is_none_or(|total| self.files.len() as i64 <= total),
+            _ => false,
+        };
+        !self.conflict && total_fits && self.linked()
+    }
+
+    fn linked(&self) -> bool {
+        let Some((first, rest)) = self.rows.split_first() else { return false };
+        let mut reached = first.clone();
+        let mut left: Vec<&BTreeSet<String>> = rest.iter().collect();
+        while let Some(at) = left.iter().position(|row| !row.is_disjoint(&reached)) {
+            reached.extend(left.swap_remove(at).iter().cloned());
+        }
+        left.is_empty()
+    }
+
+    /// Whether every file the post says it has is there with exactly its parts.
+    fn complete(&self) -> bool {
+        let total = self.file_totals.iter().next().copied().flatten();
+        !self.files.is_empty()
+            && total.is_none_or(|total| self.files.len() as i64 == total)
+            && self.files.values().all(|f| f.expected.is_some_and(|want| store::is_exactly(&f.seen, want)))
+    }
+}
+
+/// A subject without the number that changes from part to part, the N in `(N/M)`.
+fn subject_of_file(subject: &str) -> String {
+    for (open, _) in subject.rmatch_indices('(') {
+        let rest = &subject[open + 1..];
+        let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+        if digits > 0 && rest[digits..].starts_with('/') {
+            return format!("{}({}", &subject[..open], &rest[digits..]);
+        }
+    }
+    subject.to_string()
+}
+
+fn union_files(conn: &Connection, ids: &[i64]) -> Result<UnionFiles> {
+    let mut union = UnionFiles::default();
     for id in ids {
         let s = store::shard_of_id(*id);
         let mut stmt = conn.prepare_cached(&format!(
-            "select filename, expected, seen, file_total from s{s}.files where release_id = ?"
+            "select filename, expected, seen, file_total, subject from s{s}.files where release_id = ?"
         ))?;
         let rows = stmt.query_map([id], |r| {
             Ok((
@@ -304,33 +379,39 @@ fn union_files(conn: &Connection, ids: &[i64]) -> Result<(std::collections::BTre
                 r.get::<_, Option<i64>>(1)?,
                 r.get::<_, Vec<u8>>(2)?,
                 r.get::<_, Option<i64>>(3)?,
+                r.get::<_, Option<String>>(4)?,
             ))
         })?;
+        let mut filenames = BTreeSet::new();
         for row in rows {
-            let (filename, expected, seen, total) = row?;
-            file_total = file_total.max(total);
-            let file = files.entry(filename).or_insert(UnionFile { expected: None, seen: Vec::new() });
-            file.expected = file.expected.max(expected);
-            if file.seen.len() < seen.len() {
-                file.seen.resize(seen.len(), 0);
-            }
-            for (slot, bits) in file.seen.iter_mut().zip(seen) {
-                *slot |= bits;
+            let (filename, expected, seen, total, subject) = row?;
+            union.file_totals.insert(total);
+            filenames.insert(filename.clone());
+            let subject = subject.as_deref().map(subject_of_file);
+            match union.files.entry(filename) {
+                Entry::Vacant(file) => {
+                    file.insert(UnionFile { expected, seen, subject });
+                }
+                Entry::Occupied(mut file) => {
+                    let file = file.get_mut();
+                    union.conflict |=
+                        expected.is_none() || file.expected != expected || subject.is_none() || file.subject != subject;
+                    if file.seen.len() < seen.len() {
+                        file.seen.resize(seen.len(), 0);
+                    }
+                    for (slot, bits) in file.seen.iter_mut().zip(seen) {
+                        union.conflict |= *slot & bits != 0;
+                        *slot |= bits;
+                    }
+                }
             }
         }
+        union.rows.push(filenames);
     }
-    Ok((files, file_total))
+    Ok(union)
 }
 
-/// Whether every file the post says it has is there with all its parts, across the releases.
-fn split_is_complete(conn: &Connection, ids: &[i64]) -> Result<bool> {
-    let (files, file_total) = union_files(conn, ids)?;
-    Ok(!files.is_empty()
-        && file_total.is_none_or(|total| files.len() as i64 >= total)
-        && files.values().all(|f| f.expected.is_some_and(|want| store::seen_count(&f.seen) >= want)))
-}
-
-/// What's in the whole post: each file once, and each of its parts once, whichever groups have them.
+/// What's in the whole post: each file once, whichever groups have its parts.
 pub fn contents_of_split(conn: &Connection, post: &SplitPost) -> Result<Contents> {
     contents_of(conn, &post.ids)
 }

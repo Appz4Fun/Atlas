@@ -116,8 +116,8 @@ pub fn build_nzb(release_id: i64) -> Result<Option<String>> {
     crate::metrics::timed("nzb.build", || whole_nzb(release_id))
 }
 
-/// A release's articles and groups. For a post spread over several groups, that's all of them, each part once: it only
-/// makes its files with all of them.
+/// A release's articles and groups. For a post spread over several groups, that's all of them: it only makes its files
+/// with all of them.
 fn inventory(release: &ReleaseRow) -> Result<(Vec<ArticleRow>, Vec<String>)> {
     if !release.complete {
         let conn = crate::db::open()?;
@@ -127,7 +127,6 @@ fn inventory(release: &ReleaseRow) -> Result<(Vec<ArticleRow>, Vec<String>)> {
                 all.extend(crate::store::articles(&conn, *id)?);
             }
             all.sort_by(|a, b| (&a.filename, a.part, &a.message_id).cmp(&(&b.filename, b.part, &b.message_id)));
-            all.dedup_by(|a, b| a.filename == b.filename && a.part.is_some() && a.part == b.part);
             return Ok((all, post.groups));
         }
     }

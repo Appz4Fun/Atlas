@@ -520,6 +520,28 @@ impl Search {
         } else {
             read == PAGE_SIZE
         };
+        // a post spread over several groups is one row, unless the search is about one of the groups. Before copies are
+        // hidden: its rows can look like copies of each other
+        let mut split = HashMap::new();
+        let conn = crate::db::open().ok();
+        let one_group = !self.fields.group.is_empty();
+        let post_of = |r: &ReleaseRow| {
+            if r.complete {
+                return None;
+            }
+            conn.as_ref().and_then(|conn| release_info::split_post_with(conn, r).ok().flatten())
+        };
+        let folded = |r: &ReleaseRow, post: &release_info::SplitPost| !one_group && post.listed_id() != r.id;
+        found.retain_mut(|r| {
+            let Some(post) = post_of(r) else { return true };
+            if folded(r, &post) {
+                return false;
+            }
+            r.size = Some(post.size);
+            r.complete = post.complete;
+            split.insert(r.id, post.groups.len());
+            true
+        });
         if hide_copies {
             // a copy of something on an earlier page is a copy too
             if !windowed && self.offset > 0 {
@@ -527,27 +549,10 @@ impl Search {
                 let start = self.offset - earlier;
                 before = self.search(filter.as_ref(), start, earlier).unwrap_or_default();
             }
+            before.retain(|r| !post_of(r).is_some_and(|post| folded(r, &post)));
             let ids: Vec<i64> = before.iter().filter(|r| tagged(r)).chain(found.iter()).map(|r| r.id).collect();
             let hidden = crate::duplicates::later_copies(&ids).unwrap_or_default();
             found.retain(|r| !hidden.contains(&r.id));
-        }
-        // a post spread over several groups is one row, unless the search is about one of the groups
-        let mut split = HashMap::new();
-        if let Ok(conn) = crate::db::open() {
-            let one_group = !self.fields.group.is_empty();
-            found.retain_mut(|r| {
-                if r.complete {
-                    return true;
-                }
-                let Ok(Some(post)) = release_info::split_post_with(&conn, r) else { return true };
-                if !one_group && post.listed_id() != r.id {
-                    return false;
-                }
-                r.size = Some(post.size);
-                r.complete = post.complete;
-                split.insert(r.id, post.groups.len());
-                true
-            });
         }
         let ids: Vec<i64> = found.iter().map(|r| r.id).collect();
         let categories = crate::category::categories_of(&ids).unwrap_or_default();
