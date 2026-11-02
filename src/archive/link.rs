@@ -4,7 +4,7 @@
 //! size and the MD5 of its first 16 KiB, which a file's first article shows too. A row whose file matches is that file,
 //! and it leads the upload: the volume rows link to it, and it takes their name.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
 use md5::{Digest, Md5};
@@ -12,6 +12,7 @@ use rusqlite::{OptionalExtension, params};
 
 use crate::config::{ArchiveConfig, Config};
 use crate::par2::{self, Par2File};
+use crate::postprocess::bodies::PAST_BUDGET;
 use crate::postprocess::schema::ShardTable;
 use crate::postprocess::step::{
     BodyRequest, Got, Needs, Outcome, ReleaseInfo, Reruns, Step, StepCtx, StepError, StepId, StepMask, StepWrite, mask,
@@ -25,24 +26,62 @@ use super::{ARTICLE_CAP, NAME_SOURCE_PAR2, select};
 
 pub const LINK_STEP: StepId = StepId(7);
 
-/// Each row of a linked upload, the lead's own included, and the row it's linked to.
+/// Each row of a linked upload, the lead's own included, and the row it's linked to. A row of the files repaired keeps
+/// which of the set's files it is (its file id in the set), and a recovery row how many of them its set has to look for.
 pub const UPLOAD_LINK: ShardTable = ShardTable {
     name: "upload_link",
     create: "create table if not exists upload_link (
         release_id INTEGER PRIMARY KEY,
         lead_id    INTEGER NOT NULL,
-        recovery   INTEGER NOT NULL DEFAULT 0
+        recovery   INTEGER NOT NULL DEFAULT 0,
+        par2_file  BLOB,
+        wanted     INTEGER
     )",
     indexes: &[("upload_link_lead", "create index if not exists upload_link_lead on upload_link(lead_id)")],
     release_key: Some("release_id"),
     added: &[],
 };
 
+/// The rows a recovery row has fetched an article of and found none of its set's files in, soo a later run goes on
+/// from the rest.
+pub const UPLOAD_LINK_TRIED: ShardTable = ShardTable {
+    name: "upload_link_tried",
+    create: "create table if not exists upload_link_tried (
+        release_id   INTEGER NOT NULL,
+        candidate_id INTEGER NOT NULL,
+        PRIMARY KEY (release_id, candidate_id)
+    ) without rowid",
+    indexes: &[],
+    release_key: Some("release_id"),
+    added: &[],
+};
+
+/// Where a lead's rows are now: another run may have moved them on to a bigger file since this one read them.
+macro_rules! lead_now {
+    ($lead:literal) => {
+        concat!("coalesce((select n.lead_id from upload_link n where n.release_id = ", $lead, "), ", $lead, ")")
+    };
+}
+/// ?1 the old lead, ?2 the new: every row of the old one's upload goes with the new.
+pub const MOVE_UPLOAD: &str =
+    concat!("update upload_link set lead_id = ", lead_now!("?2"), " where lead_id = ?1 and ?1 != ?2");
 pub const LINK_LEAD: &str = "insert into upload_link (release_id, lead_id) values (?1, ?1)
     on conflict(release_id) do nothing";
-/// ?3: 1 for a row of recovery data, 0 for one of the files it repairs
-pub const LINK_MEMBER: &str = "insert into upload_link (release_id, lead_id, recovery) values (?1, ?2, ?3)
-    on conflict(release_id) do update set lead_id = excluded.lead_id, recovery = excluded.recovery";
+/// ?1 a row of one of the files repaired, ?2 its lead, ?3 the file's id in the set
+pub const LINK_DATA: &str = concat!(
+    "insert into upload_link (release_id, lead_id, recovery, par2_file) values (?1, ",
+    lead_now!("?2"),
+    ", 0, ?3)
+    on conflict(release_id) do update set lead_id = excluded.lead_id, recovery = 0, par2_file = excluded.par2_file"
+);
+/// ?1 a row of recovery data, ?2 its lead, ?3 how many files its set looks for
+pub const LINK_RECOVERY: &str = concat!(
+    "insert into upload_link (release_id, lead_id, recovery, wanted) values (?1, ",
+    lead_now!("?2"),
+    ", 1, ?3)
+    on conflict(release_id) do update set lead_id = excluded.lead_id, recovery = 1, wanted = excluded.wanted"
+);
+const TRIED: &str = "insert into upload_link_tried (release_id, candidate_id) values (?1, ?2) on conflict do nothing";
 /// A recovery volume isn't a copy of the files it repairs, whatever its set's list made it look like.
 const CLEAR_CONTENT: &str = crate::duplicates::CLEAR_CONTENT;
 /// The lead's name, from the set, unless something better named it.
@@ -73,6 +112,10 @@ const MAX_CHECKS: usize = 16;
 /// A volume whose files haven't turned up looks again this often, while it's this new.
 const LOOK_AGAIN_SECS: i64 = 6 * 3600;
 const LOOK_AGAIN_FOR_DAYS: f64 = 3.0;
+/// A volume that ran out of articles to fetch before it ran out of rows to check goes on this soon, until it has
+/// checked this many.
+const RESUME_SECS: i64 = 600;
+const MAX_TRIED: i64 = 200;
 
 /// The steps a rename runs again, database ones and network ones.
 static ON_RENAME: LazyLock<(StepMask, StepMask)> = LazyLock::new(|| {
@@ -205,6 +248,7 @@ impl LinkStep {
                    and abs(julianday(r.posted_date) - julianday(?5)) <= ?6
                    and not exists (select 1 from files g where g.release_id = r.id and g.id != f.id)
                    and not exists (select 1 from upload_link l where l.release_id = r.id and l.lead_id != r.id)
+                   and not exists (select 1 from upload_link_tried t where t.release_id = ?3 and t.candidate_id = r.id)
                  limit ?7",
             )
             .map_err(retry)?;
@@ -243,17 +287,24 @@ impl LinkStep {
         Ok(ctx.segments(file.id, &SegmentPick::First(1)).map_err(retry)?.into_iter().next())
     }
 
-    fn check(&self, ctx: &mut StepCtx<'_>, candidate: &Candidate) -> Result<Seen, StepError> {
-        let Some(seg) = self.article_of(ctx, &candidate.file)? else { return Ok(Seen::default()) };
+    /// What a candidate's article says, or None when this run may fetch no more.
+    fn check(&self, ctx: &mut StepCtx<'_>, candidate: &Candidate) -> Result<Option<Seen>, StepError> {
+        let Some(seg) = self.article_of(ctx, &candidate.file)? else { return Ok(Some(Seen::default())) };
         let wanted = BodyRequest {
             message_id: seg.message_id.clone(),
             file: candidate.file.filename.clone(),
             max_bytes: Some(ARTICLE_CAP),
         };
         Ok(match ctx.fetch_article(&wanted)?.got {
-            Got::Body(raw) => Seen::of_article(&raw),
-            Got::Missing | Got::TooBig | Got::Refused(_) => Seen::default(),
+            Got::Body(raw) => Some(Seen::of_article(&raw)),
+            Got::Refused(why) if why == PAST_BUDGET => None,
+            Got::Missing | Got::TooBig | Got::Refused(_) => Some(Seen::default()),
         })
+    }
+
+    /// How many rows this volume has checked and found none of its files in, over its earlier runs.
+    fn tried(&self, ctx: &StepCtx<'_>, id: i64) -> Result<i64, StepError> {
+        Ok(query_one(ctx, "select count(*) from upload_link_tried where release_id = ?", id)?.unwrap_or(0))
     }
 
     /// The lead's name, if it has none: the volume's own, or the set's best.
@@ -310,58 +361,114 @@ impl Step for LinkStep {
     }
     fn run(&self, ctx: &mut StepCtx<'_>) -> Result<Outcome, StepError> {
         let id = ctx.release().id;
-        let lead: Option<i64> = ctx
-            .conn()
-            .prepare_cached("select lead_id from upload_link where release_id = ?")
-            .and_then(|mut stmt| stmt.query_row([id], |r| r.get(0)).optional())
-            .map_err(retry)?;
-        if lead.is_some() {
-            return Ok(Outcome { matched: true, ..Default::default() });
-        }
         let files = ctx.files().map_err(retry)?;
         let Some(par2_file) = self.par2_file(ctx, &files)? else { return Ok(Outcome::default()) };
+        // the upload this row is in already, and which of its set's files that has
+        let mine: Option<i64> = query_one(ctx, "select lead_id from upload_link where release_id = ?", id)?;
+        let mut members = HashSet::new();
+        let mut have: HashSet<Vec<u8>> = HashSet::new();
+        if let Some(lead) = mine {
+            let mut stmt = ctx
+                .conn()
+                .prepare_cached("select release_id, par2_file from upload_link where lead_id = ?")
+                .map_err(retry)?;
+            let rows = stmt
+                .query_map([lead], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<Vec<u8>>>(1)?)))
+                .map_err(retry)?;
+            for row in rows {
+                let (member, file) = row.map_err(retry)?;
+                members.insert(member);
+                have.extend(file);
+            }
+        }
         let inventory = self.inventory(ctx, &par2_file)?;
         let wanted = wanted(&inventory.files);
         if wanted.is_empty() {
-            return Ok(Outcome::default());
+            return Ok(Outcome { matched: mine.is_some(), ..Default::default() });
         }
-        let mut candidates = self.candidates(ctx)?;
-        candidates.sort_by(|a, b| a.apart.total_cmp(&b.apart));
-        let mut checks = 0;
-        let mut found: Vec<(i64, &Par2File)> = Vec::new();
-        for want in &wanted {
-            let fits = candidates.iter().filter(|c| {
-                c.file.expected.is_some_and(|expected| parts_fit(want.size, expected, c.bytes, c.parts))
-                    && !found.iter().any(|(id, _)| *id == c.id)
-            });
-            for candidate in fits.cloned().collect::<Vec<_>>() {
+        let mut missing: Vec<&Par2File> = wanted.iter().copied().filter(|f| !have.contains(&f.file_id[..])).collect();
+        let (mut found, mut tried, mut more) = (Vec::new(), Vec::new(), false);
+        if !missing.is_empty() {
+            let mut candidates = self.candidates(ctx)?;
+            candidates.retain(|c| !members.contains(&c.id));
+            candidates.sort_by(|a, b| a.apart.total_cmp(&b.apart));
+            let mut checks = 0;
+            for candidate in candidates {
+                if missing.is_empty() {
+                    break;
+                }
+                let fits = candidate.file.expected.is_some_and(|expected| {
+                    missing.iter().any(|want| parts_fit(want.size, expected, candidate.bytes, candidate.parts))
+                });
+                if !fits {
+                    continue;
+                }
                 if checks >= MAX_CHECKS {
+                    more = true;
                     break;
                 }
                 checks += 1;
-                if self.check(ctx, &candidate)?.is(want) {
-                    found.push((candidate.id, want));
+                let Some(seen) = self.check(ctx, &candidate)? else {
+                    more = true;
                     break;
+                };
+                match missing.iter().position(|want| seen.is(want)) {
+                    Some(at) => found.push((candidate, missing.remove(at))),
+                    None => tried.push(candidate.id),
                 }
             }
         }
-        let Some(&(lead, _)) = found.iter().max_by_key(|(_, f)| f.size) else {
-            let young = age_days(ctx, ctx.release()).is_some_and(|days| days < LOOK_AGAIN_FOR_DAYS);
-            let wait_until = young.then(|| chrono::Utc::now().timestamp() + LOOK_AGAIN_SECS);
-            return Ok(Outcome { wait_until, ..Default::default() });
+        let now = chrono::Utc::now().timestamp();
+        let wait_until = if more && !missing.is_empty() && self.tried(ctx, id)? + (tried.len() as i64) < MAX_TRIED {
+            Some(now + RESUME_SECS)
+        } else if !missing.is_empty() && age_days(ctx, ctx.release()).is_some_and(|days| days < LOOK_AGAIN_FOR_DAYS) {
+            Some(now + LOOK_AGAIN_SECS)
+        } else {
+            None
         };
-        let mut writes = vec![
-            StepWrite::new(LINK_LEAD, vec![lead.into()]),
-            StepWrite::new(LINK_MEMBER, vec![id.into(), lead.into(), 1i64.into()]),
-            StepWrite::new(CLEAR_CONTENT, vec![id.into()]),
-        ];
-        // the rest of the set's files, as rows of their own, go with it
-        for (other, _) in found.iter().filter(|(other, _)| *other != lead) {
-            writes.push(StepWrite::new(LINK_MEMBER, vec![(*other).into(), lead.into(), 0i64.into()]));
+        let mut writes: Vec<StepWrite> =
+            tried.iter().map(|other| StepWrite::new(TRIED, vec![id.into(), (*other).into()])).collect();
+        if found.is_empty() {
+            return Ok(Outcome { matched: mine.is_some(), writes, wait_until, ..Default::default() });
         }
+        // the uploads this joins: its own, and any a file it found leads. The biggest file leads them all
+        let mut uploads: Vec<(i64, i64)> = Vec::new();
+        if let Some(lead) = mine {
+            uploads.push((
+                lead,
+                query_one(ctx, "select coalesce(size, 0) from releases where id = ?", lead)?.unwrap_or(0),
+            ));
+        }
+        for (candidate, _) in &found {
+            let leads: Option<i64> =
+                query_one(ctx, "select 1 from upload_link where release_id = ?1 and lead_id = ?1", candidate.id)?;
+            if leads.is_some() {
+                uploads.push((candidate.id, candidate.bytes));
+            }
+        }
+        let lead = found
+            .iter()
+            .map(|(c, _)| (c.id, c.bytes))
+            .chain(uploads.iter().copied())
+            .max_by_key(|&(_, bytes)| bytes)
+            .map_or(id, |(lead, _)| lead);
+        for (old, _) in uploads.iter().filter(|(old, _)| *old != lead) {
+            writes.push(StepWrite::new(MOVE_UPLOAD, vec![(*old).into(), lead.into()]));
+        }
+        for (candidate, file) in &found {
+            writes
+                .push(StepWrite::new(LINK_DATA, vec![candidate.id.into(), lead.into(), file.file_id.to_vec().into()]));
+        }
+        writes.push(StepWrite::new(LINK_RECOVERY, vec![id.into(), lead.into(), (wanted.len() as i64).into()]));
+        writes.push(StepWrite::new(CLEAR_CONTENT, vec![id.into()]));
         writes.extend(self.lead_writes(ctx, lead, &inventory.files));
-        Ok(Outcome { matched: true, writes, ..Default::default() })
+        Ok(Outcome { matched: true, writes, wait_until, ..Default::default() })
     }
+}
+
+/// The one value a query of one id gives, if it gives a row.
+fn query_one<T: rusqlite::types::FromSql>(ctx: &StepCtx<'_>, sql: &str, id: i64) -> Result<Option<T>, StepError> {
+    ctx.conn().prepare_cached(sql).and_then(|mut stmt| stmt.query_row([id], |r| r.get(0)).optional()).map_err(retry)
 }
 
 #[cfg(test)]
@@ -440,6 +547,36 @@ mod tests {
         assert!(seen.is(&file(104_857_600, 3)));
         let small = Seen { size: Some(2 << 20), md5_16k: None };
         assert!(!small.is(&file(2 << 20, 3)), "too small to go by size alone");
+    }
+
+    fn links(conn: &rusqlite::Connection) -> Vec<(i64, i64)> {
+        let mut stmt = conn.prepare("select release_id, lead_id from upload_link order by release_id").unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().collect::<rusqlite::Result<_>>().unwrap()
+    }
+
+    fn write(conn: &rusqlite::Connection, sql: &str, params: Vec<rusqlite::types::Value>) {
+        conn.execute(sql, rusqlite::params_from_iter(params)).unwrap();
+    }
+
+    #[test]
+    fn a_bigger_file_found_later_takes_the_whole_upload() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("atlas.s0.db");
+        crate::store::create_shard(&path).unwrap();
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let (sample, mkv, vol_a, vol_b) = (8i64, 16i64, 24i64, 32i64);
+        // one volume finds only the sample, and it leads
+        write(&conn, LINK_DATA, vec![sample.into(), sample.into(), vec![1u8; 16].into()]);
+        write(&conn, LINK_RECOVERY, vec![vol_a.into(), sample.into(), 2i64.into()]);
+        // another finds both: the bigger file leads, and the sample's upload goes with it
+        write(&conn, MOVE_UPLOAD, vec![sample.into(), mkv.into()]);
+        write(&conn, LINK_DATA, vec![mkv.into(), mkv.into(), vec![2u8; 16].into()]);
+        write(&conn, LINK_RECOVERY, vec![vol_b.into(), mkv.into(), 2i64.into()]);
+        assert_eq!(links(&conn), [(sample, mkv), (mkv, mkv), (vol_a, mkv), (vol_b, mkv)]);
+        // a run that still thinks the sample leads links to where its upload went
+        write(&conn, LINK_DATA, vec![sample.into(), sample.into(), vec![1u8; 16].into()]);
+        write(&conn, LINK_RECOVERY, vec![vol_a.into(), sample.into(), 2i64.into()]);
+        assert_eq!(links(&conn), [(sample, mkv), (mkv, mkv), (vol_a, mkv), (vol_b, mkv)]);
     }
 
     #[test]

@@ -3,7 +3,7 @@
 //! The api key never reaches a page. Signing in with it sets a cookie derived from it,
 //! and the server does the searching and the NZB downloads itself.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use std::sync::LazyLock;
 
@@ -541,16 +541,27 @@ impl Search {
         let folded = |r: &ReleaseRow, post: &release_info::SplitPost| {
             (!one_group || post.lead.is_some()) && post.listed_id() != r.id
         };
-        found.retain_mut(|r| {
-            let Some(post) = post_of(r) else { return true };
-            if folded(r, &post) {
-                return false;
-            }
-            r.size = Some(post.size);
-            r.complete = post.complete;
-            split.insert(r.id, post);
-            true
-        });
+        // a row folded into one that isn't on this page brings that one here in its place: a page of nothing but an
+        // upload's recovery rows would show none of it
+        let on_page: HashSet<i64> = found.iter().map(|r| r.id).collect();
+        let mut brought = HashSet::new();
+        found = std::mem::take(&mut found)
+            .into_iter()
+            .filter_map(|mut r| {
+                let Some(post) = post_of(&r) else { return Some(r) };
+                if folded(&r, &post) {
+                    let listed = post.listed_id();
+                    if on_page.contains(&listed) || !brought.insert(listed) {
+                        return None;
+                    }
+                    r = conn.as_ref().and_then(|conn| crate::search::get_release_with(conn, listed).ok().flatten())?;
+                }
+                r.size = Some(post.size);
+                r.complete = post.complete;
+                split.insert(r.id, post);
+                Some(r)
+            })
+            .collect();
         if hide_copies {
             // a copy of something on an earlier page is a copy too
             if !windowed && self.offset > 0 {

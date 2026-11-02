@@ -340,19 +340,30 @@ pub fn linked_post_with(conn: &Connection, id: i64) -> Result<Option<SplitPost>>
     };
     let Some(lead) = stmt.query_row([id], |r| r.get::<_, i64>(0)).optional()? else { return Ok(None) };
     let sql = format!(
-        "select r.id, r.group_name, coalesce(r.size, 0), l.recovery from s{s}.upload_link l
+        "select r.id, r.group_name, coalesce(r.size, 0), l.recovery, coalesce(l.wanted, 0) from s{s}.upload_link l
          join s{s}.releases r on r.id = l.release_id where l.lead_id = ?1 order by r.id limit {LINKED_ROWS}"
     );
     let (mut ids, mut groups, mut size, mut has_lead, mut recovery) = (Vec::new(), Vec::new(), 0, false, Vec::new());
+    // the files its sets look for, and the rows found of them
+    let (mut wanted, mut files) = (0, 0);
     let mut stmt = conn.prepare_cached(&sql)?;
     let rows = stmt.query_map([lead], |r| {
-        Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, i64>(2)?, r.get::<_, i64>(3)? != 0))
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, Option<String>>(1)?,
+            r.get::<_, i64>(2)?,
+            r.get::<_, i64>(3)? != 0,
+            r.get::<_, i64>(4)?,
+        ))
     })?;
     for row in rows {
-        let (row_id, group, bytes, repairs) = row?;
+        let (row_id, group, bytes, repairs, looks_for) = row?;
         has_lead |= row_id == lead;
         if repairs {
             recovery.push(row_id);
+            wanted = wanted.max(looks_for);
+        } else {
+            files += 1;
         }
         ids.push(row_id);
         groups.push(group.unwrap_or_default());
@@ -363,7 +374,8 @@ pub fn linked_post_with(conn: &Connection, id: i64) -> Result<Option<SplitPost>>
     }
     groups.sort_unstable();
     groups.dedup();
-    let complete = union_files(conn, &ids)?.complete_by_files();
+    // a file of the set that hasn't turned up is missing from the download, however whole the rest is
+    let complete = files >= wanted && union_files(conn, &ids)?.complete_by_files();
     Ok(Some(SplitPost { ids, groups, size, complete, lead: Some(lead), recovery }))
 }
 
@@ -759,7 +771,10 @@ mod tests {
     fn a_linked_upload_is_all_its_rows() {
         let (_dir, conn) = linked_shard();
         assert_eq!(linked_post_with(&conn, 16).unwrap(), None, "nothing linked yet");
-        conn.execute_batch("insert into s0.upload_link values (8, 8, 0), (16, 8, 1), (24, 8, 1);").unwrap();
+        conn.execute_batch(
+            "insert into s0.upload_link (release_id, lead_id, recovery, wanted) values (8, 8, 0, null), (16, 8, 1, 1), (24, 8, 1, 1);",
+        )
+        .unwrap();
         for id in [8, 16, 24] {
             let post = linked_post_with(&conn, id).unwrap().unwrap();
             assert_eq!(post.ids, [8, 16, 24]);
@@ -774,13 +789,16 @@ mod tests {
         // a row that's linked is whole whatever it says of itself
         let row = crate::search::ReleaseRow { id: 16, complete: true, ..Default::default() };
         assert_eq!(whole_post_with(&conn, &row).unwrap().unwrap().lead, Some(8));
+        // a set that looks for two files, with one found, isn't all there
+        conn.execute_batch("update s0.upload_link set wanted = 2 where release_id = 24").unwrap();
+        assert!(!linked_post_with(&conn, 16).unwrap().unwrap().complete);
     }
 
     #[test]
     fn a_link_whose_file_is_gone_is_no_link() {
         let (_dir, conn) = linked_shard();
         conn.execute_batch(
-            "insert into s0.upload_link values (16, 8, 1), (24, 8, 1); delete from s0.releases where id = 8;",
+            "insert into s0.upload_link (release_id, lead_id, recovery) values (16, 8, 1), (24, 8, 1); delete from s0.releases where id = 8;",
         )
         .unwrap();
         assert_eq!(linked_post_with(&conn, 16).unwrap(), None);
