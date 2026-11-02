@@ -84,6 +84,11 @@ enum Codec {
     Deflate64,
     Lzw,
     Lz4,
+    Rar5 {
+        extra_dist: bool,
+        size: Option<u64>,
+        packed: Option<u64>,
+    },
 }
 
 /// A layer found: what to record, and how to go on.
@@ -180,6 +185,10 @@ fn decode(codec: Codec, input: &[u8], limit: usize) -> (Vec<u8>, End) {
         Codec::Deflate64 => codec::inflate::deflate64(input, limit),
         Codec::Lzw => codec::lzw::uncompress(input, limit),
         Codec::Lz4 => codec::lz4::lz4(input, limit),
+        Codec::Rar5 { extra_dist, size, packed } => {
+            let to = packed.and_then(|p| usize::try_from(p).ok()).map_or(input.len(), |p| p.min(input.len()));
+            codec::rar5::rar5(&input[..to], extra_dist, size, limit)
+        }
     }
 }
 
@@ -290,6 +299,15 @@ fn from_entries(data: &[u8]) -> Opened {
             "xz" => View::Stored { from: at, to },
             _ => View::Stop("no decoder for this yet"),
         }
+    } else if head.split_before {
+        View::Stop("starts in the volume before")
+    } else if head.solid {
+        View::Stop("solid: needs the files before it")
+    } else if format == "RAR5" && head.rar_version <= 1 {
+        let codec = Codec::Rar5 { extra_dist: head.rar_version == 1, size: head.unpacked, packed: head.packed };
+        View::Decode { from: at, codec }
+    } else if format == "RAR5" {
+        View::Stop("a RAR algorithm newer than this knows")
     } else {
         View::Stop("no decoder for this yet")
     };

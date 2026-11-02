@@ -32,6 +32,15 @@ pub struct ArchiveHead {
     /// a folder, not a file
     #[serde(skip)]
     pub dir: bool,
+    /// RAR5's compression version: 0 for RAR 5, 1 for RAR 7's longer distances
+    #[serde(skip)]
+    pub rar_version: u8,
+    /// RAR: decoding this file needs the ones before it
+    #[serde(skip)]
+    pub solid: bool,
+    /// RAR: this file's data began in the volume before
+    #[serde(skip)]
+    pub split_before: bool,
 }
 
 pub fn parse(data: &[u8]) -> Option<ArchiveHead> {
@@ -207,6 +216,7 @@ fn rar5_file(data: &[u8], mut p: usize, end: usize, extra: u64, packed: u64, fla
     head.packed = Some(packed);
     // the block header's "data goes on in the next volume"
     head.continues = flags & 0x10 != 0;
+    head.split_before = flags & 0x08 != 0;
     let file_flags = vint(data, &mut p)?;
     let unpacked = vint(data, &mut p);
     let _attributes = vint(data, &mut p);
@@ -231,6 +241,8 @@ fn rar5_file(data: &[u8], mut p: usize, end: usize, extra: u64, packed: u64, fla
         .map(name_of);
     let method = (info >> 7) & 7;
     head.method = Some(format!("m{method}"));
+    head.rar_version = (info & 0x3f) as u8;
+    head.solid = info & 0x40 != 0;
     let extra_area = usize::try_from(extra).ok().and_then(|e| end.checked_sub(e)).and_then(|from| data.get(from..end));
     head.encrypted = extra_area.is_some_and(has_crypt_record);
     head.data_at = Some(end);
