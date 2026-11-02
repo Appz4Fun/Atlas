@@ -64,6 +64,12 @@ pub struct Feature {
     pub release_name: Option<String>,
 }
 
+impl Feature {
+    pub fn is_movie(&self) -> bool {
+        self.kind.as_deref().is_some_and(|k| k.eq_ignore_ascii_case("movie"))
+    }
+}
+
 /// The film or episode most of the hash's exact matches agree on. Subtitles found by name rather than by
 /// hash say nothing about this file, soo only `moviehash_match` ones count.
 pub fn best_match(reply: &Value) -> Option<Feature> {
@@ -200,6 +206,7 @@ impl Step for OpenSubtitlesStep {
         };
         let id = ctx.release().id;
         let f = reply.clone().unwrap_or_default();
+        let film_imdb = f.imdb_id.filter(|_| f.is_movie());
         let mut writes = vec![StepWrite::new(
             SET_MATCH,
             vec![
@@ -216,7 +223,9 @@ impl Step for OpenSubtitlesStep {
                 now_secs().into(),
             ],
         )];
-        if let Some(imdb) = f.imdb_id {
+        // media_release holds a show's id for an episode, and an episode's own id would hide it from searches by
+        // the show, soo only a film's goes there
+        if let Some(imdb) = film_imdb {
             writes.push(StepWrite::new(SET_IMDB, vec![id.into(), imdb.into()]));
         }
         Ok(Outcome { matched: reply.is_some(), writes, ..Outcome::default() })
@@ -287,6 +296,7 @@ mod tests {
             "season_number": 1, "episode_number": 2}}}]});
         let f = best_match(&reply).unwrap();
         assert_eq!((f.title.as_deref(), f.season, f.episode), (Some("The Show"), Some(1), Some(2)));
+        assert!(!f.is_movie(), "its own id stays out of media_release");
     }
 
     #[test]

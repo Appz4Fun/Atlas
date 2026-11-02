@@ -93,6 +93,11 @@ impl Step for ProbeStep {
     fn reruns(&self) -> Reruns {
         Reruns { on_rename: false, on_growth: true }
     }
+    /// What a probe reads, a bit per version, soo a release probed before a version gets probed again. Bit 1:
+    /// chapters, commentary, more than one article of a header, and the OpenSubtitles hash.
+    fn config_stamp(&self) -> u64 {
+        1
+    }
     fn run(&self, ctx: &mut StepCtx<'_>) -> Result<Outcome, StepError> {
         let retry = |e: rusqlite::Error| StepError::Retry(e.to_string());
         let files = ctx.files().map_err(retry)?;
@@ -153,9 +158,6 @@ impl Step for ProbeStep {
                 }
             }
             let total = file.expected.unwrap_or(file.parts_seen);
-            if !front.is_empty() {
-                read_more_front(ctx, file, total, &mut front, &mut info)?;
-            }
             if total > 2 {
                 let middle = ctx.segments(file.id, &SegmentPick::Parts(vec![(total + 1) / 2])).map_err(retry)?;
                 if let Some(middle) = middle.into_iter().next()
@@ -179,6 +181,10 @@ impl Step for ProbeStep {
             derive(&mut info, wire_bytes, file.expected, last_lines.as_ref());
             let known_last = last_part(&info, last_lines.as_ref(), last_body);
             info.moviehash = moviehash_of(ctx, file, &files, &front, &info, known_last)?;
+            // last, being the most it may read: a release's article budget goes to the checks above first
+            if !front.is_empty() {
+                read_more_front(ctx, file, total, &mut front, &mut info)?;
+            }
         }
 
         let empty = info.yenc.is_none() && info.nfo.is_none() && info.sfv.is_empty() && info.health.is_empty();
