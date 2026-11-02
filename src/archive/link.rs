@@ -402,9 +402,12 @@ impl Step for LinkStep {
         *self.limits.lock().unwrap() = cfg.archive.clone();
         cfg.archive.enabled
     }
-    /// Only a row its PAR2 set named: the volumes of an upload like this are the ones that get a name.
+    /// Only a row its PAR2 set named: the volumes of an upload like this are the ones that get a name. PreDB may confirm
+    /// that name later and take over as its source; the volume still links (run only goes on for a row of PAR2 files).
     fn applies(&self, release: &ReleaseInfo) -> bool {
-        release.name_source == Some(i64::from(NAME_SOURCE_PAR2))
+        release.name_source.is_some_and(|source| {
+            source == i64::from(NAME_SOURCE_PAR2) || source == i64::from(crate::naming::NameSource::PreDb.value())
+        })
     }
     /// A volume gets its name in the same run, from an earlier step, soo the name is what brings this back.
     fn reruns(&self) -> Reruns {

@@ -2,7 +2,7 @@
 //! and how much of it is there. Read when the page opens, soo nothing here is stored.
 
 use std::collections::btree_map::Entry;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::LazyLock;
 
 use regex::Regex;
@@ -328,6 +328,7 @@ impl SplitPost {
 }
 
 /// The most rows a linked upload is read with: a set of a few hundred volumes, each posted on its own, is about the most.
+/// One with more isn't shown as one upload, rather than as part of one.
 const LINKED_ROWS: usize = 1_024;
 
 /// The upload a row is linked into, all its rows together. None: it isn't linked, or its lead is gone.
@@ -340,12 +341,14 @@ pub fn linked_post_with(conn: &Connection, id: i64) -> Result<Option<SplitPost>>
     };
     let Some(lead) = stmt.query_row([id], |r| r.get::<_, i64>(0)).optional()? else { return Ok(None) };
     let sql = format!(
-        "select r.id, r.group_name, coalesce(r.size, 0), l.recovery, coalesce(l.wanted, 0) from s{s}.upload_link l
-         join s{s}.releases r on r.id = l.release_id where l.lead_id = ?1 order by r.id limit {LINKED_ROWS}"
+        "select r.id, r.group_name, coalesce(r.size, 0), l.recovery, coalesce(l.wanted, 0), l.par2_file
+         from s{s}.upload_link l join s{s}.releases r on r.id = l.release_id where l.lead_id = ?1 order by r.id
+         limit {}",
+        LINKED_ROWS + 1
     );
     let (mut ids, mut groups, mut size, mut has_lead, mut recovery) = (Vec::new(), Vec::new(), 0, false, Vec::new());
-    // the files its sets look for, and the rows found of them
-    let (mut wanted, mut files) = (0, 0);
+    // the files its sets look for, and those found: a file posted twice is still one file
+    let (mut wanted, mut files) = (0, HashSet::new());
     let mut stmt = conn.prepare_cached(&sql)?;
     let rows = stmt.query_map([lead], |r| {
         Ok((
@@ -354,28 +357,29 @@ pub fn linked_post_with(conn: &Connection, id: i64) -> Result<Option<SplitPost>>
             r.get::<_, i64>(2)?,
             r.get::<_, i64>(3)? != 0,
             r.get::<_, i64>(4)?,
+            r.get::<_, Option<Vec<u8>>>(5)?,
         ))
     })?;
     for row in rows {
-        let (row_id, group, bytes, repairs, looks_for) = row?;
+        let (row_id, group, bytes, repairs, looks_for, file) = row?;
         has_lead |= row_id == lead;
         if repairs {
             recovery.push(row_id);
             wanted = wanted.max(looks_for);
         } else {
-            files += 1;
+            files.insert(file.unwrap_or_else(|| row_id.to_le_bytes().to_vec()));
         }
         ids.push(row_id);
         groups.push(group.unwrap_or_default());
         size += bytes;
     }
-    if !has_lead || ids.len() < 2 {
+    if !has_lead || ids.len() < 2 || ids.len() > LINKED_ROWS {
         return Ok(None);
     }
     groups.sort_unstable();
     groups.dedup();
     // a file of the set that hasn't turned up is missing from the download, however whole the rest is
-    let complete = files >= wanted && union_files(conn, &ids)?.complete_by_files();
+    let complete = files.len() as i64 >= wanted && union_files(conn, &ids)?.complete_by_files();
     Ok(Some(SplitPost { ids, groups, size, complete, lead: Some(lead), recovery }))
 }
 
@@ -792,6 +796,19 @@ mod tests {
         // a set that looks for two files, with one found, isn't all there
         conn.execute_batch("update s0.upload_link set wanted = 2 where release_id = 24").unwrap();
         assert!(!linked_post_with(&conn, 16).unwrap().unwrap().complete);
+    }
+
+    #[test]
+    fn a_file_posted_twice_counts_once() {
+        let (_dir, conn) = linked_shard();
+        conn.execute_batch(
+            "insert into s0.upload_link (release_id, lead_id, recovery, wanted, par2_file)
+             values (8, 8, 0, null, x'01'), (16, 8, 0, null, x'01'), (24, 8, 1, 2, null);",
+        )
+        .unwrap();
+        assert!(!linked_post_with(&conn, 8).unwrap().unwrap().complete, "two copies of one file of two");
+        conn.execute_batch("update s0.upload_link set par2_file = x'02' where release_id = 16").unwrap();
+        assert!(linked_post_with(&conn, 8).unwrap().unwrap().complete);
     }
 
     #[test]
