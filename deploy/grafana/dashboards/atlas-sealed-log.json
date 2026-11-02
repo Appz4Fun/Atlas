@@ -270,7 +270,7 @@
    },
    "targets": [
     {
-     "expr": "1 - sealed_log_filesystem_bytes{job=\"sealed-log\",kind=\"avail\"} / sealed_log_filesystem_bytes{job=\"sealed-log\",kind=\"size\"}",
+     "expr": "1 - sealed_log_filesystem_bytes{job=\"sealed-log\",kind=\"avail\"} / ignoring(kind) sealed_log_filesystem_bytes{job=\"sealed-log\",kind=\"size\"}",
      "legendFormat": "__auto",
      "editorMode": "code",
      "instant": true,
@@ -1641,7 +1641,7 @@
    },
    "targets": [
     {
-     "expr": "sealed_log_filesystem_bytes{job=\"sealed-log\",kind=\"size\"} - sealed_log_filesystem_bytes{job=\"sealed-log\",kind=\"free\"}",
+     "expr": "sealed_log_filesystem_bytes{job=\"sealed-log\",kind=\"size\"} - ignoring(kind) sealed_log_filesystem_bytes{job=\"sealed-log\",kind=\"free\"}",
      "legendFormat": "used",
      "editorMode": "code",
      "instant": false,
@@ -1777,7 +1777,7 @@
    },
    "targets": [
     {
-     "expr": "sealed_log_filesystem_bytes{job=\"sealed-log\",kind=\"avail\"} / (deriv(sealed_log_bytes{job=\"sealed-log\"}[6h]) * 86400) > 0",
+     "expr": "sealed_log_filesystem_bytes{job=\"sealed-log\",kind=\"avail\"} / ignoring(kind) (deriv(sealed_log_bytes{job=\"sealed-log\"}[6h]) * 86400) > 0",
      "legendFormat": "__auto",
      "editorMode": "code",
      "instant": true,

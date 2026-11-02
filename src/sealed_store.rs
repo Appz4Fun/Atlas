@@ -125,6 +125,8 @@ pub fn offload_batch(shard: &Path, after: i64) -> anyhow::Result<(Option<i64>, u
     let values: Vec<(u64, &[u8])> = batch.iter().map(|(id, b)| (*id as u64, &b[..])).collect();
     let places = with_client("sealed_log.append", |c| c.append(&values))?;
     metrics::function_bytes("sealed_log.append", "sent", bytes as u64);
+    // in the log now, whatever happens next: a retry sends it again
+    names::SEALED_LOG_OFFLOAD_BYTES.inc(&[("kind", "sent")], bytes as u64);
     // only what comes back the same replaces anything
     let back = with_client("sealed_log.verify", |c| c.read(&places))?;
     metrics::function_bytes("sealed_log.verify", "received", bytes as u64);
@@ -155,7 +157,6 @@ pub fn offload_batch(shard: &Path, after: i64) -> anyhow::Result<(Option<i64>, u
     })?;
     names::SEALED_LOG_OFFLOAD_FILES.inc(&[("result", "moved")], swapped);
     names::SEALED_LOG_OFFLOAD_FILES.inc(&[("result", "changed")], changed);
-    names::SEALED_LOG_OFFLOAD_BYTES.inc(&[("kind", "sent")], bytes as u64);
     names::SEALED_LOG_OFFLOAD_BYTES.inc(&[("kind", "freed")], freed);
     Ok((Some(last), bytes as u64))
 }

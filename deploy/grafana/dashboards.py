@@ -515,7 +515,7 @@ def sealed_log():
     b.stat("Service", f"up{{{svc}}}", w=2, thresholds=[{"color": "text", "value": None}], mappings=UP_MAP)
     b.stat("Log size", f"sealed_log_bytes{{{svc}}}", "bytes", w=3)
     b.stat("Disk free", f'sealed_log_filesystem_bytes{{{svc},kind="avail"}}', "bytes", w=3)
-    b.stat("Disk used", f'1 - sealed_log_filesystem_bytes{{{svc},kind="avail"}} / sealed_log_filesystem_bytes{{{svc},kind="size"}}',
+    b.stat("Disk used", f'1 - sealed_log_filesystem_bytes{{{svc},kind="avail"}} / ignoring(kind) sealed_log_filesystem_bytes{{{svc},kind="size"}}',
            "percentunit", w=3, thresholds=[{"color": "green", "value": None}, {"color": "orange", "value": 0.8}, {"color": "red", "value": 0.95}])
     b.stat("Writing now", f"rate(sealed_log_bytes_appended_total{{{svc}}}[5m])", "Bps", w=3)
     b.stat("Reading now", f"rate(sealed_log_bytes_read_total{{{svc}}}[5m])", "Bps", w=3)
@@ -582,11 +582,11 @@ def sealed_log():
     b.row("Disk")
     b.graph("Log size", [q(f"sealed_log_bytes{{{svc}}}", "log")], "bytes", w=8)
     b.graph("Data disk", [
-        q(f'sealed_log_filesystem_bytes{{{svc},kind="size"}} - sealed_log_filesystem_bytes{{{svc},kind="free"}}', "used"),
+        q(f'sealed_log_filesystem_bytes{{{svc},kind="size"}} - ignoring(kind) sealed_log_filesystem_bytes{{{svc},kind="free"}}', "used"),
         q(f'sealed_log_filesystem_bytes{{{svc},kind="avail"}}', "available"),
     ], "bytes", stacked=True, w=8)
     b.stat("Segments", f"sealed_log_segments{{{svc}}}", w=4)
-    b.stat("Days until the disk fills", f'sealed_log_filesystem_bytes{{{svc},kind="avail"}} / (deriv(sealed_log_bytes{{{svc}}}[6h]) * 86400) > 0',
+    b.stat("Days until the disk fills", f'sealed_log_filesystem_bytes{{{svc},kind="avail"}} / ignoring(kind) (deriv(sealed_log_bytes{{{svc}}}[6h]) * 86400) > 0',
            "d", w=4, description="At the rate the log grew over the last 6 hours.")
 
     b.row("Offload")
