@@ -126,7 +126,6 @@ pub fn migrate(conn: &Connection) -> Result<()> {
             ))?;
         }
     }
-    conn.execute(crate::duplicates::FORGET_OLD_TWINS, [])?;
     Ok(())
 }
 

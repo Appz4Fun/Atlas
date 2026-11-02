@@ -91,9 +91,16 @@ pub fn twin_fingerprint(files: &[Par2File], block_size: Option<u64>, posted: &[(
 /// Marks a fingerprint as this kind. Ones from before a twin meant all of this are as long as the hash alone.
 const TWIN_VERSION: u8 = 2;
 
-/// Those older ones proved less, soo they go: nothing may lend articles on their word.
-pub const FORGET_OLD_TWINS: &str =
-    "update release_fingerprint set posted = null where posted is not null and length(posted) != 21";
+/// Those older ones proved less, soo they go when indexing starts: nothing may lend articles on their word.
+pub fn forget_old_twins(conn: &Connection) {
+    for s in 0..store::SHARDS {
+        let sql = format!(
+            "update s{s}.release_fingerprint set posted = null where posted is not null and length(posted) != 21"
+        );
+        // a shard that hasn't got the table yet has none
+        let _ = conn.execute(&sql, []);
+    }
+}
 
 /// Whether one archive's listing says what a whole release holds: everything real in it is that archive's volumes.
 /// Names that differ count as different archives, soo an obfuscated set makes no fingerprint, which is the safe way

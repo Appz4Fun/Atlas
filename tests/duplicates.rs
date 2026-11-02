@@ -58,6 +58,19 @@ fn copies_are_found_across_shards_and_go_with_their_release() {
     assert_eq!(later_copies(&[first, other, twin, pair]).unwrap(), [twin, pair]);
 
     let conn = db::open().unwrap();
+    let new_form = [2u8; 21];
+    shard_d.execute(SET_POSTED, rusqlite::params![other, new_form.as_slice()]).unwrap();
+    atlas::duplicates::forget_old_twins(&conn);
+    let kept: Option<Vec<u8>> = shard_d
+        .query_row("select posted from release_fingerprint where release_id = ?", [other], |r| r.get(0))
+        .unwrap();
+    assert_eq!(kept.as_deref(), Some(new_form.as_slice()), "the new form stays");
+    for (shard, id, posted) in [(&shard_a, first, b"same-posted".as_slice()), (&shard_b, twin, b"same-posted")] {
+        let gone: Option<Vec<u8>> =
+            shard.query_row("select posted from release_fingerprint where release_id = ?", [id], |r| r.get(0)).unwrap();
+        assert_eq!(gone, None, "the old form goes");
+        shard.execute(SET_POSTED, rusqlite::params![id, posted]).unwrap();
+    }
     let ids = |kind| -> Vec<Vec<i64>> {
         clusters_with(&conn, kind, 0, 10)
             .unwrap()
