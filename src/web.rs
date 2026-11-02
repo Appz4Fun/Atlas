@@ -100,7 +100,7 @@ fn cookie_header(value: &str, max_age: i64) -> (String, String) {
 
 fn redirect(mut headers: Vec<(String, String)>) -> ApiResponse {
     headers.push(("Location".into(), "/".into()));
-    ApiResponse { status: 303, content_type: None, body: String::new(), headers, bytes: None }
+    ApiResponse { status: 303, content_type: None, body: String::new(), headers, bytes: None, failed: false }
 }
 
 fn asset(content_type: &'static str, body: &str) -> ApiResponse {
@@ -114,6 +114,7 @@ fn asset(content_type: &'static str, body: &str) -> ApiResponse {
             ("X-Content-Type-Options".into(), "nosniff".into()),
         ],
         bytes: None,
+        failed: false,
     }
 }
 
@@ -128,6 +129,7 @@ fn html(status: u16, body: String) -> ApiResponse {
             ("X-Content-Type-Options".into(), "nosniff".into()),
         ],
         bytes: None,
+        failed: false,
     }
 }
 
@@ -1159,6 +1161,7 @@ fn filled_nzb(args: &HashMap<String, String>) -> ApiResponse {
                 body: content,
                 headers: vec![("Content-Disposition".into(), format!("attachment; filename=\"{filename}\""))],
                 bytes: None,
+                failed: false,
             }
         }
         Ok(None) => ApiResponse::not_found(),
@@ -1639,6 +1642,7 @@ fn poster(args: &HashMap<String, String>) -> ApiResponse {
             ("X-Content-Type-Options".into(), "nosniff".into()),
         ],
         bytes: Some(bytes),
+        failed: false,
     }
 }
 

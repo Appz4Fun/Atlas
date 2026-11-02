@@ -102,3 +102,10 @@ api_key = ""
 
 [media.trakt]
 client_id = ""
+
+[metrics]
+enabled = false
+host = "127.0.0.1"
+indexer_port = 9092
+api_port = 9093
+catalog_every_secs = 1800

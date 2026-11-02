@@ -1384,6 +1384,8 @@ impl ShardWriter {
         let grouping_from = grouping_from(&tx)?;
         let now = chrono::Utc::now().timestamp();
         let (mut new_releases, mut new_articles) = (0i64, 0i64);
+        // inline names this save changes, for the metrics once it's committed
+        let mut renames = crate::postprocess::apply::Renames::new();
         {
             let mut upsert = tx.prepare_cached(
                 "insert into releases
@@ -1417,6 +1419,15 @@ impl ShardWriter {
                 // what the row's name is, not what this slice's files happen to be called
                 let is_obfuscated = collection.as_ref().map_or(release.is_obfuscated, |c| c.is_obfuscated);
                 let id = global_id(ids.next()?, shard);
+                if let Some(first) = release
+                    .display_name
+                    .as_deref()
+                    .map(|d| inline_rename(&tx, name, &release.group, d, is_obfuscated))
+                    .transpose()?
+                    .flatten()
+                {
+                    renames.push((crate::naming::NameSource::InlineBody as u8, first));
+                }
                 let row: Option<Saved> = upsert
                     .query_row(
                         params![
@@ -1549,6 +1560,7 @@ impl ShardWriter {
         let r = tx.commit();
         profile::COMMIT.add_since(t);
         if r.is_ok() {
+            crate::postprocess::apply::count_names(&renames);
             for id in completed {
                 self.remember_completed(id);
             }
@@ -1706,6 +1718,28 @@ pub(crate) fn uncount_copies(conn: &Connection, release_id: i64, bytes: i64, cou
 
 /// Save releases from anywhere (AI search): each to its group's shard, in one
 /// transaction per shard.
+/// Whether the save's upsert changes this row's name to `display`, and if soo whether
+/// it's the first real name of an obfuscated post. Repeat saves of a name change nothing.
+fn inline_rename(
+    tx: &Connection,
+    name: &str,
+    group: &str,
+    display: &str,
+    is_obfuscated: bool,
+) -> rusqlite::Result<Option<bool>> {
+    let row: Option<(Option<String>, Option<i64>)> = tx
+        .prepare_cached("select display_name, name_source from releases where name = ?1 and group_name = ?2")?
+        .query_row(params![name, group], |r| Ok((r.get(0)?, r.get(1)?)))
+        .optional()?;
+    Ok(match row {
+        None => Some(is_obfuscated),
+        // a later stage's name: the upsert leaves it
+        Some((_, Some(_))) => None,
+        Some((Some(old), None)) if old == display => None,
+        Some((old, None)) => Some(old.is_none() && is_obfuscated),
+    })
+}
+
 pub fn save(main: &Path, releases: &[Release]) -> Result<()> {
     let ids = Ids::new(main);
     let mut by_shard: Vec<Vec<Release>> = vec![Vec::new(); SHARDS];

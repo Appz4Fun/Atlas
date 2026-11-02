@@ -41,25 +41,37 @@ pub struct ApiResponse {
     pub headers: Vec<(String, String)>,
     /// sent in place of `body`, for what isn't text
     pub bytes: Option<Vec<u8>>,
+    /// atlas itself failed, whatever the status says: Newznab errors go out as 200
+    pub failed: bool,
 }
 
 impl ApiResponse {
     fn xml(status: u16, body: String) -> Self {
-        ApiResponse { status, content_type: Some(XML), body, headers: Vec::new(), bytes: None }
+        ApiResponse { status, content_type: Some(XML), body, headers: Vec::new(), bytes: None, failed: false }
     }
 
     pub(crate) fn not_found() -> Self {
-        ApiResponse { status: 404, content_type: None, body: String::new(), headers: Vec::new(), bytes: None }
+        ApiResponse {
+            status: 404,
+            content_type: None,
+            body: String::new(),
+            headers: Vec::new(),
+            bytes: None,
+            failed: false,
+        }
     }
 
     /// newznab error, sent with http 200 like real indexers do
     fn error(code: u16, description: &str) -> Self {
-        ApiResponse::xml(
+        let mut response = ApiResponse::xml(
             200,
             format!(
                 "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<error code=\"{code}\" description=\"{description}\"/>"
             ),
-        )
+        );
+        // 1xx and 2xx are about the request; 900 is atlas's own
+        response.failed = code >= 900;
+        response
     }
 }
 
@@ -373,6 +385,30 @@ pub(crate) fn get_nzb(args: &HashMap<String, String>) -> ApiResponse {
         body: content,
         headers: vec![("Content-Disposition".into(), format!("attachment; filename=\"{filename}\""))],
         bytes: None,
+        failed: false,
+    }
+}
+
+/// What a request is called in metrics: only names from this list, soo no client can make new series.
+struct Endpoint {
+    label: &'static str,
+    function: &'static str,
+}
+
+fn endpoint_of(path: &str, query: &str) -> Endpoint {
+    let named = |label, function| Endpoint { label, function };
+    if path != "/api" {
+        return named("other", "api.other");
+    }
+    match parse_query(query).get("t").map(String::as_str) {
+        Some("caps") => named("caps", "api.caps"),
+        Some("get") => named("get", "api.get"),
+        Some("search") => named("search", "api.search"),
+        Some("tvsearch") => named("tvsearch", "api.tvsearch"),
+        Some("movie") => named("movie", "api.movie"),
+        Some("music" | "audio") => named("music", "api.music"),
+        Some("book") => named("book", "api.book"),
+        _ => named("other", "api.other"),
     }
 }
 
@@ -394,6 +430,8 @@ fn respond(mut request: Request, api_key: &str, fallback_host: &str) {
     let cookies = request.headers().iter().find(|h| h.field.equiv("Cookie")).map(|h| h.value.as_str().to_string());
 
     let is_get = matches!(request.method(), tiny_http::Method::Get | tiny_http::Method::Head);
+    let endpoint = endpoint_of(path, query);
+    let span = crate::metrics::span(endpoint.function);
     let resp = if is_get {
         crate::web::get(path, query, cookies.as_deref(), &base, api_key)
             .unwrap_or_else(|| handle(path, query, &base, api_key))
@@ -402,8 +440,25 @@ fn respond(mut request: Request, api_key: &str, fallback_host: &str) {
         let _ = request.as_reader().take(MAX_FORM_BODY).read_to_string(&mut body);
         crate::web::post(path, &body, &base, api_key).unwrap_or_else(ApiResponse::not_found)
     } else {
-        ApiResponse { status: 405, content_type: None, body: String::new(), headers: Vec::new(), bytes: None }
+        ApiResponse {
+            status: 405,
+            content_type: None,
+            body: String::new(),
+            headers: Vec::new(),
+            bytes: None,
+            failed: false,
+        }
     };
+    if resp.status >= 500 || resp.failed {
+        span.failed();
+    }
+    drop(span);
+    let sent = resp.bytes.as_ref().map_or(resp.body.len(), Vec::len) as u64;
+    let status = resp.status.to_string();
+    let labels = [("endpoint", endpoint.label), ("status", status.as_str())];
+    crate::metrics::names::API_REQUESTS.inc(&labels, 1);
+    crate::metrics::names::API_BYTES.inc(&[("endpoint", endpoint.label)], sent);
+    crate::metrics::function_bytes(endpoint.function, "sent", sent);
 
     let mut response = match resp.bytes {
         Some(bytes) => Response::from_data(bytes),
@@ -479,6 +534,22 @@ pub fn stop() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_atlass_own_errors_count_as_failed() {
+        assert!(ApiResponse::error(900, "Search failed").failed);
+        assert_eq!(ApiResponse::error(900, "Search failed").status, 200);
+        assert!(!ApiResponse::error(200, "Missing parameter (t)").failed);
+        assert!(!ApiResponse::error(100, "Incorrect user credentials").failed);
+    }
+
+    #[test]
+    fn a_client_cant_invent_an_endpoint_label() {
+        assert_eq!(endpoint_of("/api", "t=movie&q=x").label, "movie");
+        assert_eq!(endpoint_of("/api", "t=audio").label, "music");
+        assert_eq!(endpoint_of("/api", "t=whatever").label, "other");
+        assert_eq!(endpoint_of("/some/path", "t=movie").label, "other");
+    }
 
     #[test]
     fn query_parsing() {

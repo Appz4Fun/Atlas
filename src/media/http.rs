@@ -73,6 +73,11 @@ pub enum Reply {
     NotFound,
 }
 
+/// What `Client::outage` is for: no answer, or a 5xx.
+fn is_outage(sent: &Result<ureq::http::Response<ureq::Body>, ureq::Error>) -> bool {
+    sent.as_ref().map_or(true, |resp| resp.status().is_server_error())
+}
+
 impl Client {
     pub fn new(name: &'static str, base: &str, per_minute: i64) -> Client {
         Client {
@@ -123,17 +128,41 @@ impl Client {
     /// `url` holds any key, soo it's never logged and never in a `Trouble`.
     pub fn get(&self, url: &str, headers: &[(&str, &str)]) -> Result<Reply, Trouble> {
         self.ready()?;
+        let span = crate::metrics::span("media.request");
         let mut request = self.agent.get(url);
         for (name, value) in headers {
             request = request.header(*name, *value);
         }
-        self.answer(request.call())
+        let sent = request.call();
+        self.counted(&span, is_outage(&sent), self.answer(sent))
     }
 
     /// As `get`, with a body that can hold a key.
     pub fn post_json(&self, url: &str, body: &Value) -> Result<Reply, Trouble> {
         self.ready()?;
-        self.answer(self.agent.post(url).send_json(body))
+        let span = crate::metrics::span("media.request");
+        let sent = self.agent.post(url).send_json(body);
+        self.counted(&span, is_outage(&sent), self.answer(sent))
+    }
+
+    fn counted(
+        &self,
+        span: &crate::metrics::Span,
+        outage: bool,
+        reply: Result<Reply, Trouble>,
+    ) -> Result<Reply, Trouble> {
+        let result = match &reply {
+            Ok(Reply::Json(_)) => "ok",
+            Ok(Reply::NotFound) => "not_found",
+            // what it asked for, as opposed to a pause an outage brought on
+            Err(Trouble::Paused(_)) if !outage => "paused",
+            Err(_) => {
+                span.failed();
+                "failed"
+            }
+        };
+        crate::metrics::names::MEDIA_REQUESTS.inc(&[("provider", self.name), ("result", result)], 1);
+        reply
     }
 
     fn ready(&self) -> Result<(), Trouble> {

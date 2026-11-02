@@ -137,6 +137,49 @@ enum Refusal {
     Other,
 }
 
+/// A failure on `server`, by kind, and when it hit.
+fn note_failure(server: &str, kind: &'static str) {
+    use crate::metrics::names::{NNTP_FAILURES, NNTP_LAST_FAILURE};
+    let labels = [("server", server), ("kind", kind)];
+    NNTP_FAILURES.inc(&labels, 1);
+    NNTP_LAST_FAILURE.set(&labels, chrono::Utc::now().timestamp() as f64);
+}
+
+/// Every kind `atlas_nntp_failures_total` has, soo each series is there before its first failure.
+pub const FAILURE_KINDS: [&str; 13] = [
+    "timeout",
+    "connection_closed",
+    "io",
+    "protocol",
+    "decompress",
+    "no_such_article",
+    "no_such_group",
+    "too_many_connections",
+    "auth_rejected",
+    "reply_4xx",
+    "reply_5xx",
+    "reply_other",
+    "skipped_while_resting",
+];
+
+/// What kind of failure `e` is, for `atlas_nntp_failures_total`.
+fn failure_kind(e: &NntpError) -> &'static str {
+    match e {
+        NntpError::Io(e) if e.kind() == io::ErrorKind::TimedOut => "timeout",
+        NntpError::Io(e) if e.kind() == io::ErrorKind::UnexpectedEof => "connection_closed",
+        NntpError::Io(_) => "io",
+        NntpError::Protocol(_) => "protocol",
+        NntpError::Decompress(_) => "decompress",
+        NntpError::Reply { code: 420 | 423 | 430, .. } => "no_such_article",
+        NntpError::Reply { code: 411, .. } => "no_such_group",
+        NntpError::Reply { .. } if refusal(e) == Refusal::TooMany => "too_many_connections",
+        NntpError::Reply { .. } if refusal(e) == Refusal::Auth => "auth_rejected",
+        NntpError::Reply { code, .. } if (400..500).contains(code) => "reply_4xx",
+        NntpError::Reply { code, .. } if (500..600).contains(code) => "reply_5xx",
+        NntpError::Reply { .. } => "reply_other",
+    }
+}
+
 /// Why a connect/login failed, from the reply text (codes overlap: some
 /// providers use 481/502 for both a bad login and the connection limit).
 fn refusal(e: &NntpError) -> Refusal {
@@ -257,9 +300,54 @@ pub struct Conn {
     /// since the pool last collected them
     wire: u64,
     text: u64,
+    /// bytes written, for the command being measured
+    sent: u64,
+    /// the server's key, for metrics
+    server: Arc<str>,
+}
+
+/// One command being measured, see `Conn::measure`.
+struct Measured {
+    command: &'static str,
+    function: &'static str,
+    started: Instant,
+    wire: u64,
+    sent: u64,
+    _span: crate::metrics::Span,
 }
 
 impl Conn {
+    fn measure(&self, command: &'static str, function: &'static str) -> Measured {
+        Measured {
+            command,
+            function,
+            started: Instant::now(),
+            wire: self.wire,
+            sent: self.sent,
+            _span: crate::metrics::span(function),
+        }
+    }
+
+    fn measured<T>(&self, m: Measured, r: &Result<T>) {
+        use crate::metrics::names::{NNTP_BYTES, NNTP_COMMAND_SECONDS, NNTP_COMMANDS};
+        let server = &*self.server;
+        let result = match r {
+            Ok(_) => "ok",
+            Err(e) if e.is_empty_range() || e.code() == Some(430) || e.code() == Some(411) => "not_found",
+            Err(_) => {
+                m._span.failed();
+                "error"
+            }
+        };
+        let (received, sent) = (self.wire - m.wire, self.sent - m.sent);
+        NNTP_COMMANDS.inc(&[("server", server), ("command", m.command), ("result", result)], 1);
+        NNTP_COMMAND_SECONDS.observe(&[("server", server), ("command", m.command)], m.started.elapsed().as_secs_f64());
+        NNTP_BYTES.inc(&[("server", server), ("command", m.command), ("direction", "received")], received);
+        NNTP_BYTES.inc(&[("server", server), ("command", m.command), ("direction", "sent")], sent);
+        crate::metrics::function_bytes(m.function, "received", received);
+        crate::metrics::function_bytes(m.function, "sent", sent);
+    }
+
     /// Connect and log in. With `compress` it also asks for gzip compressed
     /// header listings (XFEATURE COMPRESS GZIP), which servers may refuse.
     pub async fn open(server: &UsenetServer, timeout: Duration, compress: bool) -> Result<Conn> {
@@ -277,7 +365,17 @@ impl Conn {
         };
 
         let mut conn = Conn::over(stream, timeout);
+        conn.server = server_key(server).into();
+        let measure = conn.measure("LOGIN", "nntp.login");
+        let r = conn.log_in(server, compress).await;
+        conn.measured(measure, &r);
+        r?;
+        Ok(conn)
+    }
 
+    /// The greeting, the login, and asking for compression.
+    async fn log_in(&mut self, server: &UsenetServer, compress: bool) -> Result<()> {
+        let conn = self;
         let (code, message) = conn.read_status().await?;
         if code != 200 && code != 201 {
             return Err(NntpError::Reply { code, message });
@@ -300,7 +398,7 @@ impl Conn {
             conn.compressed = code == 290;
         }
 
-        Ok(conn)
+        Ok(())
     }
 
     fn over(stream: Box<dyn AsyncStream>, timeout: Duration) -> Conn {
@@ -311,6 +409,8 @@ impl Conn {
             compressed: false,
             wire: 0,
             text: 0,
+            sent: 0,
+            server: Arc::from(""),
         }
     }
 
@@ -396,6 +496,7 @@ impl Conn {
             return Err(NntpError::Protocol("newline in command".into()));
         }
 
+        self.sent += line.len() as u64 + 2;
         let mut buf = Vec::with_capacity(line.len() + 2);
         buf.extend_from_slice(line.as_bytes());
         buf.extend_from_slice(b"\r\n");
@@ -475,6 +576,13 @@ impl Conn {
     /// `body` with a bound. None: over `max_bytes`, or more than one line per
     /// 16 of them. At most `max_bytes` + 64 KiB off the wire, one long line included.
     pub async fn body_capped(&mut self, message_id: &str, max_bytes: usize) -> Result<Option<Vec<u8>>> {
+        let measure = self.measure("BODY", "nntp.body_capped");
+        let r = self.body_capped_unmeasured(message_id, max_bytes).await;
+        self.measured(measure, &r);
+        r
+    }
+
+    async fn body_capped_unmeasured(&mut self, message_id: &str, max_bytes: usize) -> Result<Option<Vec<u8>>> {
         let (code, message) = self.command("BODY", Some(message_id)).await?;
         if code != 222 {
             return Err(NntpError::Reply { code, message });
@@ -535,6 +643,13 @@ impl Conn {
     /// connection cant take another request. Line ends count: an article of empty
     /// lines stops at the cap too, with at most `max_bytes / 2` lines kept.
     pub async fn body_prefix(&mut self, message_id: &str, max_bytes: usize) -> Result<(Vec<u8>, bool)> {
+        let measure = self.measure("BODY", "nntp.body_prefix");
+        let r = self.body_prefix_unmeasured(message_id, max_bytes).await;
+        self.measured(measure, &r);
+        r
+    }
+
+    async fn body_prefix_unmeasured(&mut self, message_id: &str, max_bytes: usize) -> Result<(Vec<u8>, bool)> {
         let (code, message) = self.command("BODY", Some(message_id)).await?;
         if code != 222 {
             return Err(NntpError::Reply { code, message });
@@ -595,6 +710,13 @@ impl Conn {
 
     /// GROUP -> (count, first, last, name)
     pub async fn select_group(&mut self, group: &str) -> Result<(u64, u64, u64, String)> {
+        let measure = self.measure("GROUP", "nntp.group");
+        let r = self.select_group_unmeasured(group).await;
+        self.measured(measure, &r);
+        r
+    }
+
+    async fn select_group_unmeasured(&mut self, group: &str) -> Result<(u64, u64, u64, String)> {
         let (code, message) = self.command("GROUP", Some(group)).await?;
 
         if code != 211 {
@@ -614,6 +736,13 @@ impl Conn {
 
     /// XOVER pulls a whole header range in one shot
     pub async fn xover(&mut self, start: u64, end: u64) -> Result<Vec<Overview>> {
+        let measure = self.measure("XOVER", "nntp.xover");
+        let r = self.xover_unmeasured(start, end).await;
+        self.measured(measure, &r);
+        r
+    }
+
+    async fn xover_unmeasured(&mut self, start: u64, end: u64) -> Result<Vec<Overview>> {
         let (code, message) = self.command("XOVER", Some(&format!("{start}-{end}"))).await?;
 
         if code != 224 {
@@ -627,6 +756,13 @@ impl Conn {
 
     /// BODY, yEnc decoded when the article is yEnc.
     pub async fn body(&mut self, message_id: &str) -> Result<Vec<u8>> {
+        let measure = self.measure("BODY", "nntp.body");
+        let r = self.body_unmeasured(message_id).await;
+        self.measured(measure, &r);
+        r
+    }
+
+    async fn body_unmeasured(&mut self, message_id: &str) -> Result<Vec<u8>> {
         let (code, message) = self.command("BODY", Some(message_id)).await?;
 
         if code != 222 {
@@ -668,6 +804,13 @@ impl Conn {
     /// another request. Listings come sorted by number (RFC 3977), soo
     /// `first` is the range's first even then.
     pub async fn xover_ends(&mut self, start: u64, end: u64, rows: usize) -> Result<Ends> {
+        let measure = self.measure("XOVER", "nntp.xover_ends");
+        let r = self.xover_ends_unmeasured(start, end, rows).await;
+        self.measured(measure, &r);
+        r
+    }
+
+    async fn xover_ends_unmeasured(&mut self, start: u64, end: u64, rows: usize) -> Result<Ends> {
         let (code, message) = self.command("XOVER", Some(&format!("{start}-{end}"))).await?;
 
         if code != 224 {
@@ -705,6 +848,13 @@ impl Conn {
 
     /// LIST ACTIVE -> (name, approx article count), biggest first. Empty groups dropped.
     pub async fn list_groups(&mut self, pattern: Option<&str>) -> Result<Vec<(String, u64)>> {
+        let measure = self.measure("LIST", "nntp.list_groups");
+        let r = self.list_groups_unmeasured(pattern).await;
+        self.measured(measure, &r);
+        r
+    }
+
+    async fn list_groups_unmeasured(&mut self, pattern: Option<&str>) -> Result<Vec<(String, u64)>> {
         let lines = match self.list_active(pattern).await {
             Ok(lines) => lines,
             Err(NntpError::Reply { .. }) if pattern.is_some() => self.list_active(None).await?,
@@ -977,6 +1127,9 @@ impl Lease {
     /// end the request: drop the connection when `r` broke it
     fn check<T>(&mut self, r: Result<T>) -> Result<T> {
         self.busy = false;
+        if let Err(e) = &r {
+            note_failure(&self.server.key, failure_kind(e));
+        }
         if r.as_ref().err().is_some_and(NntpError::breaks_connection) {
             self.collect_traffic();
             self.conn = None;
@@ -1006,7 +1159,14 @@ impl Drop for Lease {
 /// One server's numbers for the stats dashboard.
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct ServerStat {
+    /// which pool these totals are of: a new one starts them over
+    #[serde(skip)]
+    pub pool: u64,
     pub host: String,
+    /// what names it in stored state and in metrics, see `server_keys`
+    pub key: String,
+    /// requests waiting for a free connection right now
+    pub waiting: usize,
     pub priority: i64,
     pub connections: u32,
     /// what atlas allows itself now (lower than `connections` when the provider refused more)
@@ -1092,6 +1252,8 @@ const DATE_ROWS: usize = DATE_SCAN_MAX as usize;
 /// message-id, which is the same everywhere, soo a missing article is asked
 /// of every server in priority order.
 pub struct Pool {
+    /// tells this pool from the one before it, see `ServerStat::pool`
+    id: u64,
     servers: Vec<Arc<Server>>,
     active: AtomicUsize,
     ready: AtomicBool,
@@ -1213,10 +1375,16 @@ pub fn legacy_server_keys(servers: &[UsenetServer]) -> Vec<Vec<String>> {
 }
 
 impl Pool {
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
     pub fn new(servers: &[UsenetServer]) -> Pool {
         let keys = server_keys(servers);
         let legacy = legacy_server_keys(servers);
+        static POOLS: AtomicU64 = AtomicU64::new(1);
         Pool {
+            id: POOLS.fetch_add(1, Ordering::Relaxed),
             servers: servers
                 .iter()
                 .zip(keys)
@@ -1491,19 +1659,29 @@ impl Pool {
         }
 
         if !force && server.down_until.lock().unwrap().is_some_and(|t| Instant::now() < t) {
+            note_failure(&server.key, "skipped_while_resting");
             return Err(NntpError::Io(io::Error::new(
                 io::ErrorKind::ConnectionRefused,
                 format!("{} failed recently, skipping it", server.cfg.host),
             )));
         }
 
-        let e = match Conn::open(&server.cfg, self.timeout, server.compress()).await {
+        let connecting = crate::metrics::span("nntp.connect");
+        let opened = Conn::open(&server.cfg, self.timeout, server.compress()).await;
+        let connects = |result: &'static str| {
+            crate::metrics::names::NNTP_CONNECTS.inc(&[("server", server.key.as_str()), ("result", result)], 1);
+        };
+        let e = match opened {
             Ok(conn) => {
+                connects("ok");
                 *server.down_until.lock().unwrap() = None;
                 return Ok(Some(Lease::new(conn, server.clone(), permit)));
             }
             Err(e) => e,
         };
+        connects("failed");
+        connecting.failed();
+        note_failure(&server.key, failure_kind(&e));
 
         let limit = server.limit.load(Ordering::Relaxed);
         let others_open = server.permits.available_permits() + 1 < limit;
@@ -2173,7 +2351,10 @@ impl Pool {
                     "ok"
                 };
                 ServerStat {
+                    pool: self.id,
                     host: s.cfg.host.clone(),
+                    key: s.key.clone(),
+                    waiting: s.waiting.load(Ordering::Relaxed),
                     priority: s.cfg.priority,
                     connections: s.cfg.connections(),
                     limit,

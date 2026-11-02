@@ -145,6 +145,7 @@ impl BodyFetcher {
             request.max_bytes.map_or(cap, |m| m.min(cap))
         };
         // the run's deadline holds for the whole read: a slow server's timeouts are per read
+        let span = crate::metrics::span("stage.fetch_body");
         let fetched = self.handle.block_on(unless_stopped(&self.stop, async {
             tokio::time::timeout(left, async {
                 let _permit = self.in_flight.acquire().await.expect("semaphore closed");
@@ -152,6 +153,10 @@ impl BodyFetcher {
             })
             .await
         }));
+        if matches!(fetched, Some(Ok(Err(_))) | Some(Err(_))) {
+            span.failed();
+        }
+        drop(span);
         let fetched = match fetched {
             Some(Err(_elapsed)) => return Err(StepError::Transient("a body took past the run's deadline".into())),
             Some(Ok(result)) => Some(result),

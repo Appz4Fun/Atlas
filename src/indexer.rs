@@ -323,12 +323,17 @@ fn writer(
         }
 
         let t = std::time::Instant::now();
+        let span = crate::metrics::span("db.save_batch");
         let result = match &mut opened {
             Ok(conn) => {
                 store.save(conn, ids, batch.iter().map(|job| job.releases.as_slice())).map_err(|e| e.to_string())
             }
             Err(e) => Err(format!("couldnt open {}: {e}", path.display())),
         };
+        if result.is_err() {
+            span.failed();
+        }
+        drop(span);
         Load::add_since(&LOAD.writer_busy_ns, t);
         LOAD.writer_batches.fetch_add(1, Relaxed);
         LOAD.writer_slices.fetch_add(batch.len() as u64, Relaxed);
@@ -382,10 +387,15 @@ fn run_stage_jobs(
     let start = std::time::Instant::now();
     while let Some(job) = stage.pop_front() {
         let t = std::time::Instant::now();
+        let span = crate::metrics::span("db.stage_transaction");
         let result = match opened {
             Ok(conn) => stage_transaction(conn, job.work).map_err(|e| e.to_string()),
             Err(e) => Err(format!("couldnt open {}: {e}", path.display())),
         };
+        if result.is_err() {
+            span.failed();
+        }
+        drop(span);
         let _ = job.done.send(result);
         Load::add_since(&LOAD.writer_stage_ns, t);
         Load::add_since(&LOAD.writer_busy_ns, t);
@@ -416,13 +426,20 @@ fn housekeeping(conn: &mut Connection, store: &mut crate::store::ShardWriter, se
     let t = std::time::Instant::now();
     if seal {
         let sealing = std::time::Instant::now();
+        let span = crate::metrics::span("db.seal");
         if store.seal_some(conn, chrono::Utc::now().timestamp()).is_err() {
+            span.failed();
             LOAD.writer_seal_errors.fetch_add(1, Relaxed);
         }
+        drop(span);
         Load::add_since(&LOAD.writer_seal_ns, sealing);
     }
     let checkpointing = std::time::Instant::now();
-    let _ = db::finish_checkpoint(conn);
+    let span = crate::metrics::span("db.checkpoint");
+    if db::finish_checkpoint(conn).is_err() {
+        span.failed();
+    }
+    drop(span);
     Load::add_since(&LOAD.writer_checkpoint_ns, checkpointing);
     Load::add_since(&LOAD.writer_busy_ns, t);
 }
@@ -1718,6 +1735,16 @@ async fn save_slice(pool: &Arc<Pool>, db: &Db, group: &str, headers: Vec<Overvie
     if crate::filters::group_blocked(group) {
         return Ok(Progress { articles, ..Progress::default() });
     }
+    let span = crate::metrics::span("indexer.save_slice");
+    let saved = parse_and_save(pool, db, group, headers).await;
+    if saved.is_err() {
+        span.failed();
+    }
+    saved
+}
+
+async fn parse_and_save(pool: &Arc<Pool>, db: &Db, group: &str, headers: Vec<Overview>) -> Result<Progress> {
+    let articles = headers.len() as i64;
     crate::profile::SLICES.add(1);
     crate::profile::HEADERS.add(articles as u64);
 
@@ -1726,6 +1753,7 @@ async fn save_slice(pool: &Arc<Pool>, db: &Db, group: &str, headers: Vec<Overvie
     let parsing = {
         let group = group.to_string();
         move || {
+            let _span = crate::metrics::span("indexer.parse_slice");
             let (articles, uploads, skipped) = crate::filters::gather_per_article(&group, headers_to_articles(headers));
             let mut releases: Vec<Release> =
                 crate::collections::group_articles(&group, articles).into_values().collect();
@@ -1742,6 +1770,7 @@ async fn save_slice(pool: &Arc<Pool>, db: &Db, group: &str, headers: Vec<Overvie
     let t = std::time::Instant::now();
     // once the stage has a body budget it reads them, not the save path
     let names = if crate::archive::inline_lookups() {
+        let _span = crate::metrics::span("indexer.first_names");
         first_names(pool.clone(), releases.iter().map(name_sources).collect()).await
     } else {
         Vec::new()
@@ -1760,7 +1789,14 @@ async fn save_slice(pool: &Arc<Pool>, db: &Db, group: &str, headers: Vec<Overvie
     }
 
     let count = releases.len() as i64;
-    db.save(releases).await?;
+    {
+        let span = crate::metrics::span("indexer.wait_for_save");
+        let saved = db.save(releases).await;
+        if saved.is_err() {
+            span.failed();
+        }
+        saved?;
+    }
 
     Ok(Progress { articles, bytes, releases: count, skipped })
 }

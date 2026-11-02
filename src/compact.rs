@@ -334,6 +334,10 @@ fn interruptible(conn: &Connection, stop: &Arc<AtomicBool>) -> Result<()> {
 /// Compact every shard of `main`. Returns the total before and after. Once
 /// `stop` is set, shards not done are left as they were (and an error says so).
 pub fn run(main: &Path, progress: &(dyn Fn(&str) + Sync), stop: &Arc<AtomicBool>) -> Result<Shrunk> {
+    crate::metrics::timed("db.compact", || run_locked(main, progress, stop))
+}
+
+fn run_locked(main: &Path, progress: &(dyn Fn(&str) + Sync), stop: &Arc<AtomicBool>) -> Result<Shrunk> {
     let _lock = Lock::take(main)?;
     // a conversion's swap cut short is finished (or undone) like at a start;
     // shards with no main database at all are refused: the main database

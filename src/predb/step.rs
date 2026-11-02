@@ -206,6 +206,8 @@ impl Step for PredbMatch {
         .map_err(retry)?;
 
         let hit = found.filter(|m| !renames_pack_to_episode(current_name(r), &m.title.title));
+        let lookup = if hit.is_some() { "matched" } else { "no_match" };
+        crate::metrics::names::PREDB_LOOKUPS.inc(&[("result", lookup)], 1);
         let Some(m) = hit else {
             let mut writes = Vec::new();
             if !inner.is_empty() {
@@ -219,6 +221,14 @@ impl Step for PredbMatch {
         };
 
         let t = m.title;
+        let how = match m.kind {
+            super::matcher::Kind::Exact => "exact",
+            super::matcher::Kind::Normalized => "normalized",
+            super::matcher::Kind::Hash => "hash",
+            super::matcher::Kind::InnerFile => "inner_file",
+        };
+        let predb_category = crate::metrics::predb_category_label(t.category.as_deref().unwrap_or("none"));
+        crate::metrics::names::PREDB_MATCHES.inc(&[("kind", how), ("category", &predb_category)], 1);
         let known: Option<i64> = ctx
             .conn()
             .prepare_cached("select title_id from predb_match where release_id = ?1")

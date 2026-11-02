@@ -72,6 +72,13 @@ impl Step for CategoryStep {
     fn run(&self, ctx: &mut StepCtx<'_>) -> Result<Outcome, StepError> {
         let id = ctx.release().id;
         let d = classify_release(ctx.release(), &self.options.read().unwrap());
+        if stores(&d) {
+            let category = super::label(d.category).unwrap_or_else(|| d.category.to_string());
+            let root = super::label(super::root_of(d.category)).unwrap_or_else(|| "Other".into());
+            let names = [("category", category.as_str()), ("root", root.as_str())];
+            crate::metrics::names::CATEGORIZED.inc(&names, 1);
+            crate::metrics::names::RELEASE_SIZE.observe(&[("root", &root)], ctx.release().size.max(0) as f64);
+        }
         let writes = if stores(&d) {
             vec![StepWrite::new(UPSERT, vec![id.into(), d.category.into()])]
         } else if has_row(ctx.conn(), id).map_err(|e| StepError::Retry(e.to_string()))? {

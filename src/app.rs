@@ -799,6 +799,7 @@ pub fn main_menu() -> i32 {
     );
 
     api::start(&mut config);
+    crate::metrics::start(&config, crate::metrics::Role::Api);
 
     loop {
         ui::clear();

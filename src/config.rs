@@ -158,6 +158,7 @@ pub struct Config {
     pub predb: PredbConfig,
     pub category: CategoryConfig,
     pub media: MediaConfig,
+    pub metrics: MetricsConfig,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -404,6 +405,53 @@ impl PredbConfig {
     }
 }
 
+/// The `metrics` object of config.toml, see the README. Off unless asked for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MetricsConfig {
+    pub enabled: bool,
+    pub host: String,
+    pub indexer_port: u16,
+    pub api_port: u16,
+    /// seconds between walks over every release
+    pub catalog_every_secs: u64,
+}
+
+impl Default for MetricsConfig {
+    fn default() -> Self {
+        MetricsConfig {
+            enabled: false,
+            host: "127.0.0.1".into(),
+            indexer_port: 9092,
+            api_port: 9093,
+            catalog_every_secs: 1800,
+        }
+    }
+}
+
+impl MetricsConfig {
+    fn from_value(v: Option<&Value>) -> MetricsConfig {
+        let mut c = MetricsConfig::default();
+        let Some(v) = v else { return c };
+        if let Some(b) = v.get("enabled").and_then(as_bool) {
+            c.enabled = b;
+        }
+        if let Some(host) = v.get("host").and_then(Value::as_str).filter(|h| !h.is_empty()) {
+            c.host = host.to_string();
+        }
+        let port = |key: &str| v.get(key).and_then(as_int).and_then(|n| u16::try_from(n).ok());
+        if let Some(p) = port("indexer_port") {
+            c.indexer_port = p;
+        }
+        if let Some(p) = port("api_port") {
+            c.api_port = p;
+        }
+        if let Some(n) = v.get("catalog_every_secs").and_then(as_int).and_then(|n| u64::try_from(n).ok()) {
+            c.catalog_every_secs = n.max(60);
+        }
+        c
+    }
+}
+
 /// The `naming` object of config.json, see the README.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NamingConfig {
@@ -599,6 +647,7 @@ impl Default for Config {
             postprocess: PostprocessConfig::default(),
             archive: ArchiveConfig::default(),
             naming: NamingConfig::default(),
+            metrics: MetricsConfig::default(),
             predb: PredbConfig::default(),
             category: CategoryConfig::default(),
             media: MediaConfig::default(),
@@ -747,6 +796,7 @@ impl Config {
             postprocess: PostprocessConfig::from_value(v.get("postprocess")),
             archive: ArchiveConfig::from_value(v.get("archive")),
             naming: NamingConfig::from_value(v.get("naming")),
+            metrics: MetricsConfig::from_value(v.get("metrics")),
             predb: PredbConfig::from_value(v.get("predb")),
             category: CategoryConfig::from_value(v.get("category")),
             media: MediaConfig::from_value(v.get("media")),
@@ -1293,6 +1343,28 @@ mod tests {
         assert_eq!((c.poll_minutes, c.page_size, c.max_pages_per_poll), (1, 100, 20));
         assert_eq!((c.max_db_mb, c.request_delay_ms, c.timeout_secs), (64, 250, 120));
         assert_eq!((c.late_per_second, c.history_pages), (0, 0));
+    }
+
+    #[test]
+    fn metrics_settings_default_off_and_on_loopback() {
+        let c = Config::from_value(&json!({})).metrics;
+        assert_eq!(c, MetricsConfig::default());
+        assert!(!c.enabled);
+        assert_eq!(c.host, "127.0.0.1");
+        let c = Config::from_value(&json!({"metrics": {"enabled": true, "host": "0.0.0.0", "indexer_port": 19092,
+            "api_port": 19093, "catalog_every_secs": 5}}))
+        .metrics;
+        assert_eq!(
+            c,
+            MetricsConfig {
+                enabled: true,
+                host: "0.0.0.0".into(),
+                indexer_port: 19092,
+                api_port: 19093,
+                catalog_every_secs: 60
+            }
+        );
+        assert_eq!(Config::from_value(&json!({"metrics": {"indexer_port": 70000}})).metrics.indexer_port, 9092);
     }
 
     #[test]
