@@ -275,6 +275,38 @@ fn the_web_ui_end_to_end() {
     let opened = fetch(port, &format!("/ui/release?id={gap_id}"), &cookie);
     assert!(opened.body.contains("2 of 3"), "{}", opened.body);
 
+    // the NZB with gaps filled from a twin has all of it too
+    posted("Gap.Twin.S01E01-GRP", "alt.binaries.g3", article("gap.bin", 1, 3, "<twin.1@x>"), DAY);
+    posted("Gap.Twin.S01E01-GRP", "alt.binaries.g3", article("gap.bin", 3, 3, "<twin.3@x>"), DAY);
+    let twin_shards: Vec<_> = ["alt.binaries.g1", "alt.binaries.g2", "alt.binaries.g3"]
+        .map(|group| db::open_shard(&store::shard_path(&main, store::shard_of(group))).unwrap())
+        .into_iter()
+        .collect();
+    for shard in &twin_shards {
+        shard
+            .execute(
+                "insert or ignore into release_fingerprint (release_id, posted)
+                 select id, x'02' from releases where name in ('Gapped.Post.S01E01-GRP', 'Gap.Twin.S01E01-GRP')",
+                [],
+            )
+            .unwrap();
+    }
+    let filled = fetch(port, &format!("/ui/nzb?id={gap_id}&fill=1"), &cookie);
+    assert!(filled.body.contains("gap.1@x") && filled.body.contains("gap.2@x"), "{}", filled.body);
+    assert!(filled.body.contains("<group>alt.binaries.g1</group>"), "{}", filled.body);
+    assert!(filled.body.contains("<group>alt.binaries.g2</group>"), "{}", filled.body);
+    for shard in &twin_shards {
+        shard.execute("delete from release_fingerprint", []).unwrap();
+    }
+
+    // too many groups to be a real post
+    for at in 1..=17 {
+        let one = article("many.bin", at, 17, &format!("<many.{at}@x>"));
+        posted("Many.Groups.S01E01-GRP", &format!("alt.binaries.many{at}"), one, DAY);
+    }
+    let many = fetch(port, "/ui/results?q=Many.Groups", &cookie);
+    assert!(!many.body.contains(" GROUPS"), "{}", many.body);
+
     // a name and poster anyone can copy aren't enough: what doesn't fit one upload stays in its own group
     let other_part = |file: &str, id: &str, subject: Option<&str>, parts: i64| {
         let mut one = article(file, 2, parts, id);

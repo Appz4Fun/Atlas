@@ -63,7 +63,7 @@ pub fn render_nzb(release: &ReleaseRow, articles: &[ArticleRow]) -> String {
 }
 
 /// The same, for articles found in any of `groups`.
-fn render_nzb_in(release: &ReleaseRow, articles: &[ArticleRow], groups: &[String]) -> String {
+pub(crate) fn render_nzb_in(release: &ReleaseRow, articles: &[ArticleRow], groups: &[String]) -> String {
     let mut x = String::new();
     x.push_str("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n");
     x.push_str(
@@ -118,7 +118,7 @@ pub fn build_nzb(release_id: i64) -> Result<Option<String>> {
 
 /// A release's articles and groups. For a post spread over several groups, that's all of them: it only makes its files
 /// with all of them.
-fn inventory(release: &ReleaseRow) -> Result<(Vec<ArticleRow>, Vec<String>)> {
+pub(crate) fn inventory(release: &ReleaseRow) -> crate::db::Result<(Vec<ArticleRow>, Vec<String>)> {
     if !release.complete {
         let conn = crate::db::open()?;
         if let Some(post) = crate::release_info::split_post_with(&conn, release)? {

@@ -257,6 +257,9 @@ impl SplitPost {
 /// and real ones are minutes apart.
 const SPLIT_POST_DAYS: f64 = 1.0;
 
+/// The most groups a split post can span. Real ones have a handful, and every file of its NZB lists them all.
+const SPLIT_POST_GROUPS: usize = 16;
+
 /// The rest of this release's post in other groups, if it has any. None: it's all here, or the rows that look like it
 /// don't add up to one upload. Name and poster are only what the headers say, and anyone can copy those to another group,
 /// soo any doubt leaves every row on its own, and every row of a post gets the same answer.
@@ -284,7 +287,7 @@ pub fn split_post_with(conn: &Connection, release: &crate::search::ReleaseRow) -
             dates.push(date);
         }
     }
-    if ids.len() < 2 || !close_together(&dates) {
+    if !(2..=SPLIT_POST_GROUPS).contains(&ids.len()) || !close_together(&dates) {
         return Ok(None);
     }
     ids.sort_unstable();
