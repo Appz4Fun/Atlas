@@ -172,7 +172,7 @@ fn the_web_ui_end_to_end() {
     assert!(twins.body.contains("Twins 1") && twins.body.contains("Tv.Findword"), "{}", twins.body);
     assert!(twins.body.contains("/ui/release?id=") && twins.body.contains("TWIN"), "{}", twins.body);
     assert!(!twins.body.contains("<script>alert"), "{}", twins.body);
-    assert!(fetch(port, "/ui/duplicates?kind=pairs", &cookie).body.contains("no pairs found yet"));
+    assert!(fetch(port, "/ui/duplicates?kind=alts", &cookie).body.contains("no alts found yet"));
     let opened = fetch(port, &format!("/ui/release?id={script}"), &cookie);
     assert!(opened.body.contains("Other copies") && opened.body.contains("Tv.Findword"), "{}", opened.body);
 

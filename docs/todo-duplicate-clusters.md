@@ -10,11 +10,11 @@ Group releases that hold the same content, even when they were posted differentl
 
 | Word | Meaning | Can one replace the other? |
 |---|---|---|
-| **Cluster** | Every release known to hold the same content. Its members are linked as pairs or twins. | Only as twins |
-| **Pair** | Same content, different packaging. One is RAR5 and the other is 7z, for example. | No. Each one is a separate download, so its articles can't be swapped in. It's a fallback for the whole release. |
+| **Cluster** | Every release known to hold the same content. Its members are linked as alts or twins. | Only as twins |
+| **Alt** | Same content, different packaging. One is RAR5 and the other is 7z, for example. | No. Each one is a separate download, so its articles can't be swapped in. It's a fallback for the whole release. |
 | **Twin** | The same posting in everything but message-ids: same files and names, same PAR2 set and recovery volumes, same article counts. | Yes |
 
-A different encode of the same title is not the same content, so it's neither a pair nor a twin. RustyGet calls that an alt. Keeping the same meanings for "twin" and "alt" lets Atlas hand its clusters to RustyGet later.
+A different encode of the same title is not the same content, so it's neither an alt nor a twin.
 
 ## What Atlas already has
 
@@ -32,20 +32,20 @@ Built on the `feat/release-details` branch. Instead of cluster tables, each rele
 ### Done
 
 - [x] **Posted fingerprint:** the PAR2 set, its block size, recovery blocks, each file's name, size and MD5, and articles per file. Equal ones make a **twin**. Sizes on the wire aren't compared, as they count headers that differ between posters.
-- [x] **Content fingerprint:** exact sizes of the real files, at least 1 MiB, leaving out samples, with names ignored. Equal ones with different posted files make a **pair**.
+- [x] **Content fingerprint:** exact sizes of the real files, at least 1 MiB, leaving out samples, with names ignored. Equal ones with different posted files make an **alt**.
 - [x] Written by the archive and PAR2 steps as releases are read.
-- [x] Web UI: "Other copies" on the release page, with TWIN and PAIR tags, and counts in results.
-- [x] Newznab API: `twins` and `pairs` attributes.
+- [x] Web UI: "Other copies" on the release page, with TWIN and ALT tags, and counts in results.
+- [x] Newznab API: `twins` and `alts` attributes.
 - [x] "Hide copies" filter in search, off by default, within a page.
 - [x] NZB download: when a twin has articles a release is missing, an NZB that takes them from it. A twin's file counts only with the same name, part count and part sizes.
-- [x] Tests: same sizes with different hashes make no twin, another encode makes no pair, packed files make no content fingerprint, copies are found across shards, and a purged release is no one's copy.
+- [x] Tests: same sizes with different hashes make no twin, another encode makes no alt, packed files make no content fingerprint, copies are found across shards, and a purged release is no one's copy.
 
 ### Left
 
-- [x] **A page of every cluster.** Duplicates lists twins and pairs at once, biggest first, and each copy shows its poster, email, PAR2 files, repair, health, encryption, password, tags, scores, poster and links. The release page's "Other copies" shows the same.
-- [ ] **Prod has no archive data yet.** Bodies are now on by default, at 600 fetches a minute, so a config without the key starts reading on the next start. Twins, pairs, encryption types and NFO passwords fill in from there.
+- [x] **A page of every cluster.** Duplicates lists twins and alts at once, biggest first, and each copy shows its poster, email, PAR2 files, repair, health, encryption, password, tags, scores, poster and links. The release page's "Other copies" shows the same.
+- [ ] **Prod has no archive data yet.** Bodies are now on by default, at 600 fetches a minute, so a config without the key starts reading on the next start. Twins, alts, encryption types and NFO passwords fill in from there.
 - [ ] Once there's data: how many copies, the share of each kind, a hand check of a sample for false matches, and how long lookups take with real fingerprints. Today's timings only cover an empty table: about 30 to 60 ms more per page.
-- [ ] Only complete lists make a content fingerprint, because a partial one could call two releases the same. Reading only a RAR's first article often gives a partial list, so pairs may be rare until more is read. Check this once there's data.
+- [ ] Only complete lists make a content fingerprint, because a partial one could call two releases the same. Reading only a RAR's first article often gives a partial list, so alts may be rare until more is read. Check this once there's data.
 - [x] Collapse copies across a whole search: "Hide copies" also looks back over the 2,000 results before a page.
 - [ ] Encrypted archives with hidden names have no listing, so they get no content fingerprint. They can still be twins through PAR2.
 
@@ -104,4 +104,4 @@ Everything below goes on the release page in the web UI. The API has the tags an
 ## Open questions on clusters
 
 1. **Do two postings with the same message-ids count as twins, or as one release listed twice?** They're the same articles, so nothing is gained by swapping between them. Today they'd show as twins.
-2. **Is matching exact file sizes enough for a pair?** It's what's built, because archive headers don't reliably give a checksum for split files, and two encodes rarely match to the byte. The sample check on real data will say.
+2. **Is matching exact file sizes enough for an alt?** It's what's built, because archive headers don't reliably give a checksum for split files, and two encodes rarely match to the byte. The sample check on real data will say.

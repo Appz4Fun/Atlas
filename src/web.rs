@@ -743,8 +743,8 @@ fn row(
         if count.twins > 0 {
             tags.push_str(&tag("tag-ok", &format!("{} TWIN{}", count.twins, if count.twins == 1 { "" } else { "S" })));
         }
-        if count.pairs > 0 {
-            tags.push_str(&tag("tag-ref", &format!("{} PAIR{}", count.pairs, if count.pairs == 1 { "" } else { "S" })));
+        if count.alts > 0 {
+            tags.push_str(&tag("tag-ref", &format!("{} ALT{}", count.alts, if count.alts == 1 { "" } else { "S" })));
         }
     }
     tags.push_str(&password_tag(passwords.get(&r.id)));
@@ -1474,7 +1474,7 @@ fn copies_html(copies: &[(crate::duplicates::Copy, ReleaseRow)]) -> String {
     }
     let badge = |kind: &Copy| match kind {
         Copy::Twin => tag("tag-ok", "TWIN"),
-        Copy::Pair => tag("tag-ref", "PAIR"),
+        Copy::Alt => tag("tag-ref", "ALT"),
     };
     let Ok(conn) = crate::db::open() else { return String::new() };
     let cards: String =
@@ -1482,22 +1482,22 @@ fn copies_html(copies: &[(crate::duplicates::Copy, ReleaseRow)]) -> String {
     let rest: String = copies.iter().skip(FULL_COPIES).map(|(kind, copy)| copy_link(&badge(kind), copy)).collect();
     let rest = if rest.is_empty() { rest } else { format!("<ul class=\"copy-rest\">{rest}</ul>") };
     format!(
-        "<h2>Other copies</h2><div class=\"copies\">{cards}</div>{rest}<p class=\"sort\">A twin is the same posting: the same files, PAR2 set, recovery volumes and article counts. A pair holds the same content packed differently.</p>"
+        "<h2>Other copies</h2><div class=\"copies\">{cards}</div>{rest}<p class=\"sort\">A twin is the same posting: the same files, PAR2 set, recovery volumes and article counts. An alt holds the same content packed differently.</p>"
     )
 }
 
 /// Every cluster of copies, whichever release they're found from.
 fn duplicates_page(args: &HashMap<String, String>) -> ApiResponse {
     use crate::duplicates::{ClusterKind, cluster_count_with, clusters_with};
-    let kind = if args.get("kind").is_some_and(|k| k == "pairs") { ClusterKind::Pairs } else { ClusterKind::Twins };
+    let kind = if args.get("kind").is_some_and(|k| k == "alts") { ClusterKind::Alts } else { ClusterKind::Twins };
     let number = args.get("page").and_then(|p| p.parse::<i64>().ok()).unwrap_or(1).max(1);
     let read = crate::db::open().and_then(|conn| {
         let twins = cluster_count_with(&conn, ClusterKind::Twins)?;
-        let pairs = cluster_count_with(&conn, ClusterKind::Pairs)?;
+        let alts = cluster_count_with(&conn, ClusterKind::Alts)?;
         let page = clusters_with(&conn, kind, (number - 1) * CLUSTERS_PER_PAGE, CLUSTERS_PER_PAGE)?;
-        Ok((conn, twins, pairs, page))
+        Ok((conn, twins, alts, page))
     });
-    let (conn, twins, pairs, page) = match read {
+    let (conn, twins, alts, page) = match read {
         Ok(found) => found,
         Err(e) => {
             eprintln!("web duplicates failed: {e}");
@@ -1515,11 +1515,11 @@ fn duplicates_page(args: &HashMap<String, String>) -> ApiResponse {
             tag("tag-ok", "TWIN"),
             "Twins are the same posting: the same files, PAR2 set, recovery volumes and article counts, so one can fill the other's gaps.",
         ),
-        ClusterKind::Pairs => (
-            pairs,
-            "pairs",
-            tag("tag-ref", "PAIR"),
-            "Pairs hold files of the same exact sizes, packed differently, so each is a separate download.",
+        ClusterKind::Alts => (
+            alts,
+            "alts",
+            tag("tag-ref", "ALT"),
+            "Alts hold files of the same exact sizes, packed differently, so each is a separate download.",
         ),
     };
     let clusters: String = page
@@ -1560,10 +1560,10 @@ fn duplicates_page(args: &HashMap<String, String>) -> ApiResponse {
         String::new()
     };
     let content = format!(
-        "{masthead}<div class=\"release\"><main><h1>Duplicates</h1><div class=\"chips\">{twins}{pairs}</div><p class=\"sort\">{about}</p>{body}{pager}</main></div>",
+        "{masthead}<div class=\"release\"><main><h1>Duplicates</h1><div class=\"chips\">{twins}{alts}</div><p class=\"sort\">{about}</p>{body}{pager}</main></div>",
         masthead = masthead(true),
         twins = chip("twins", "Twins", twins, kind == ClusterKind::Twins),
-        pairs = chip("pairs", "Pairs", pairs, kind == ClusterKind::Pairs),
+        alts = chip("alts", "Alts", alts, kind == ClusterKind::Alts),
     );
     html(200, self::page("Duplicates · Atlas", &content))
 }
