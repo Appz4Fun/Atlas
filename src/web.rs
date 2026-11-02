@@ -506,6 +506,16 @@ impl Search {
                 } else {
                     HashMap::new()
                 };
+                // by the size it shows: all of a post spread over several groups
+                if sort == SortBy::Size
+                    && let Ok(conn) = crate::db::open()
+                {
+                    for r in found.iter_mut().filter(|r| !r.complete) {
+                        if let Ok(Some(post)) = release_info::split_post_with(&conn, r) {
+                            r.size = Some(post.size);
+                        }
+                    }
+                }
                 sort_rows(&mut found, sort, self.descending, &categories, &scores);
             }
             let start = usize::try_from(self.offset).unwrap_or(0).min(found.len());
@@ -520,6 +530,28 @@ impl Search {
         } else {
             read == PAGE_SIZE
         };
+        // a post spread over several groups is one row, unless the search is about one of the groups. Before copies are
+        // hidden: its rows can look like copies of each other
+        let mut split = HashMap::new();
+        let conn = crate::db::open().ok();
+        let one_group = !self.fields.group.is_empty();
+        let post_of = |r: &ReleaseRow| {
+            if r.complete {
+                return None;
+            }
+            conn.as_ref().and_then(|conn| release_info::split_post_with(conn, r).ok().flatten())
+        };
+        let folded = |r: &ReleaseRow, post: &release_info::SplitPost| !one_group && post.listed_id() != r.id;
+        found.retain_mut(|r| {
+            let Some(post) = post_of(r) else { return true };
+            if folded(r, &post) {
+                return false;
+            }
+            r.size = Some(post.size);
+            r.complete = post.complete;
+            split.insert(r.id, post.groups.len());
+            true
+        });
         if hide_copies {
             // a copy of something on an earlier page is a copy too
             if !windowed && self.offset > 0 {
@@ -527,6 +559,7 @@ impl Search {
                 let start = self.offset - earlier;
                 before = self.search(filter.as_ref(), start, earlier).unwrap_or_default();
             }
+            before.retain(|r| !post_of(r).is_some_and(|post| folded(r, &post)));
             let ids: Vec<i64> = before.iter().filter(|r| tagged(r)).chain(found.iter()).map(|r| r.id).collect();
             let hidden = crate::duplicates::later_copies(&ids).unwrap_or_default();
             found.retain(|r| !hidden.contains(&r.id));
@@ -536,6 +569,7 @@ impl Search {
         let passwords = crate::archive::store::passwords(&ids);
         let media = crate::media::query::attrs_of(&ids).unwrap_or_default();
         let extras = RowExtras {
+            split,
             copies: crate::duplicates::counts(&ids).unwrap_or_default(),
             details: crate::media::details::kept_for(media.iter().map(|(id, m)| (*id, m.kind, &m.ids))),
         };
@@ -648,6 +682,8 @@ impl Search {
 /// What a result shows beyond its own row.
 #[derive(Default)]
 struct RowExtras {
+    /// groups, for a post spread over several
+    split: HashMap<i64, usize>,
     copies: HashMap<i64, crate::duplicates::CopyCount>,
     details: HashMap<i64, crate::media::details::Details>,
 }
@@ -737,6 +773,9 @@ fn row(
         if count.alts > 0 {
             tags.push_str(&tag("tag-ref", &format!("{} ALT{}", count.alts, if count.alts == 1 { "" } else { "S" })));
         }
+    }
+    if let Some(groups) = extras.split.get(&r.id) {
+        tags.push_str(&tag("tag-ref", &format!("{groups} GROUPS")));
     }
     tags.push_str(&password_tag(passwords.get(&r.id)));
     if !r.complete {
@@ -962,7 +1001,18 @@ fn release_page(args: &HashMap<String, String>) -> ApiResponse {
     let inner = crate::archive::store::view(id);
     let media = crate::media::query::attrs_of(&ids).unwrap_or_default().remove(&id);
     let names = release_info::names(id).unwrap_or_default();
-    let contents = release_info::contents(id).unwrap_or_default();
+    let mut contents = release_info::contents(id).unwrap_or_default();
+    let mut release = release;
+    // a post spread over several groups is shown whole
+    if !release.complete
+        && let Ok(conn) = crate::db::open()
+        && let Ok(Some(post)) = release_info::split_post_with(&conn, &release)
+    {
+        contents = release_info::contents_of_split(&conn, &post).unwrap_or(contents);
+        release.size = Some(post.size);
+        release.complete = post.complete;
+        release.parts = Some(contents.articles_seen);
+    }
     html(200, release_html(&release, category, &inner, media.as_ref(), names.as_ref(), &contents))
 }
 
