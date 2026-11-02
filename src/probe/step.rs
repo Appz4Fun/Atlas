@@ -12,8 +12,8 @@ use crate::release_info;
 use crate::store::{FileInfo, SegmentPick};
 
 use super::{
-    ProbeInfo, SET_PROBE, agent_of, derive, imdb_ids, keep_headers, media, moviehash, nfo_text, parse_sfv, xref_groups,
-    yenc,
+    ProbeInfo, SET_PROBE, agent_of, derive, imdb_ids, keep_headers, media, moviehash, nest, nfo_text, parse_sfv,
+    xref_groups, yenc,
 };
 
 pub const PROBE_STEP: StepId = StepId(4);
@@ -297,6 +297,9 @@ fn moviehash_of(
     if info.media.is_none() {
         return Ok(None);
     }
+    if info.layers.len() > 1 || (!info.layers.is_empty() && info.archive.is_none()) {
+        return chain_moviehash(ctx, file, files, front, info.segment_size, known_last);
+    }
     let Some(head) = &info.archive else {
         let Some(size) = info.yenc.as_ref().and_then(|y| y.file_size) else { return Ok(None) };
         if size < 2 * CHUNK {
@@ -350,15 +353,44 @@ fn moviehash_of(
     Ok(tail.and_then(|tail| moviehash::moviehash(size, inner_front, &tail)))
 }
 
-/// What the first bytes are. A stored file in an archive is read as itself.
-fn inspect(body: &[u8], info: &mut ProbeInfo) {
-    info.media = media::parse(body);
-    if let Some(head) = super::archive::parse(body) {
-        if let Some(inner) = head.stored_at.and_then(|at| body.get(at..)) {
-            info.media = media::parse(inner);
-        }
-        info.archive = Some(head);
+/// The hash of a video under more than one layer, or under a tar or the like: only when every layer is stored,
+/// soo the video's end is a known place in this one file, and the file is all there is.
+fn chain_moviehash(
+    ctx: &mut StepCtx<'_>,
+    file: &FileInfo,
+    files: &[FileInfo],
+    front: &[u8],
+    segment: Option<u64>,
+    known_last: Option<(i64, Vec<u8>)>,
+) -> Result<Option<String>, StepError> {
+    const CHUNK: u64 = moviehash::CHUNK as u64;
+    let nest = nest::unwrap(front);
+    let (Some(at), Some(last)) = (nest.outer_at, nest.layers.last()) else { return Ok(None) };
+    if nest.layers.iter().any(|l| !l.stored || l.continues || l.stop.is_some()) {
+        return Ok(None);
     }
+    let Some(size) = last.unpacked.filter(|s| *s >= 2 * CHUNK) else { return Ok(None) };
+    // the volumes after this one would hold the end: not followed yet
+    if moviehash::last_volume(&file.filename, files).is_some_and(|v| v.id != file.id) {
+        return Ok(None);
+    }
+    let end = at as u64 + size;
+    let tail = match usize::try_from(end).ok().and_then(|e| front.get(e - moviehash::CHUNK..e)) {
+        Some(tail) => Some(tail.to_vec()),
+        None => match segment {
+            Some(segment) => file_range(ctx, file, segment, end - CHUNK, end, known_last.as_ref())?,
+            None => None,
+        },
+    };
+    Ok(tail.and_then(|tail| moviehash::moviehash(size, front.get(at..)?, &tail)))
+}
+
+/// What the first bytes are. A file in an archive, or in an archive in that, and soo on down, is read as itself.
+fn inspect(body: &[u8], info: &mut ProbeInfo) {
+    info.archive = super::archive::parse(body);
+    let nest = nest::unwrap(body);
+    info.media = media::parse(&nest.inner);
+    info.layers = nest.layers;
 }
 
 #[cfg(test)]

@@ -1323,6 +1323,9 @@ fn probe_html(p: &crate::probe::ProbeInfo, matched: Option<&crate::probe::opensu
         }
         dd(&mut packed, "File CRC32", a.crc32.map_or(String::new(), |c| format!("{c:08x}")));
     }
+    if p.layers.len() > 1 || (p.archive.is_none() && !p.layers.is_empty()) {
+        dd(&mut packed, "Layers", nested_chain(&p.layers));
+    }
 
     let mut tracks = String::new();
     if let Some(m) = &p.media {
@@ -1831,6 +1834,23 @@ fn login_page(base: &str, wrong_key: bool) -> String {
             masthead = masthead(false),
         ),
     )
+}
+
+/// Each layer an archive was followed down through, outermost first: `RAR5 m0 › 7z copy › movie.mkv`.
+fn nested_chain(layers: &[crate::probe::nest::Layer]) -> String {
+    let mut parts: Vec<String> = layers
+        .iter()
+        .map(|l| {
+            let method = l.method.as_deref().map(|m| format!(" {m}")).unwrap_or_default();
+            let stop =
+                l.stop.as_deref().map(|why| format!(" {}", tag("tag-bad", &why.to_uppercase()))).unwrap_or_default();
+            format!("{}{}{stop}", escape(&l.format), escape(&method))
+        })
+        .collect();
+    if let Some(name) = layers.last().filter(|l| l.stop.is_none()).and_then(|l| l.name.as_deref()) {
+        parts.push(escape(name));
+    }
+    parts.join(" › ")
 }
 
 #[cfg(test)]

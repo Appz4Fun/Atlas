@@ -12,9 +12,14 @@ Stdlib only. Mirrors tests/common/mod.rs (the Rust mock the test suite uses).
 """
 import argparse
 import email.utils
+import io
+import random
 import socketserver
 import struct
+import tarfile
 import time
+import zipfile
+import zlib
 
 GROUP = "alt.binaries.test"
 PASSWORD = "secret"
@@ -45,6 +50,41 @@ def par2_filedesc(name, size):
     p = b"PAR2\0PKT" + struct.pack("<Q", length) + b"\0" * 32
     p += b"PAR 2.0\0FileDesc" + b"\7" * 48 + struct.pack("<Q", size) + nb
     return p
+
+
+def nested_archive(name):
+    """A RAR5 (stored) holding a 7z (copy) holding a zip (deflate) holding a tar holding a Matroska file."""
+    rng = random.Random(5)
+    mkv = b"\x1a\x45\xdf\xa3\x9f\x42\x86\x81\x01\x42\xf7\x81\x01\x42\xf2\x81\x04\x42\xf3\x81\x08\x42\x82\x88matroska"
+    mkv += bytes(rng.getrandbits(8) for _ in range(20_000))
+    t = io.BytesIO()
+    with tarfile.open(fileobj=t, mode="w", format=tarfile.USTAR_FORMAT) as tf:
+        info = tarfile.TarInfo(f"{name}.mkv")
+        info.size = len(mkv)
+        tf.addfile(info, io.BytesIO(mkv))
+    z = io.BytesIO()
+    with zipfile.ZipFile(z, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(f"{name}.tar", t.getvalue())
+    packed, nxt = z.getvalue(), b"\0" * 8
+    start = struct.pack("<QQI", len(packed), len(nxt), zlib.crc32(nxt))
+    sz = b"7z\xbc\xaf\x27\x1c\x00\x04" + struct.pack("<I", zlib.crc32(start)) + start + packed + nxt
+
+    def vint(n):
+        out = bytearray()
+        while True:
+            b, n = n & 0x7F, n >> 7
+            out.append(b | (0x80 if n else 0))
+            if not n:
+                return bytes(out)
+
+    def block(ty, fields, data=None):
+        inner = vint(ty) + vint(2 if data is not None else 0) + (vint(len(data)) if data is not None else b"") + fields
+        body = vint(len(inner)) + inner
+        return struct.pack("<I", zlib.crc32(body)) + body + (data or b"")
+
+    fname = f"{name}.7z".encode()
+    fields = vint(0) + vint(len(sz)) + vint(0x20) + vint(0) + vint(0) + vint(len(fname)) + fname
+    return b"Rar!\x1a\x07\x01\x00" + block(1, vint(0)) + block(2, fields, sz) + block(5, vint(0))
 
 
 def build_posts():
@@ -84,6 +124,13 @@ def build_posts():
     add(f'[1/2] - "{obf}.part1.rar" yEnc (1/1)', yenc(f"{obf}.part1.rar", b"x" * 4000), size=2_000_000)
     add(f'[2/2] - "{obf}.par2" yEnc (1/1)',
         yenc(f"{obf}.par2", par2_filedesc("Hidden.Name.2022.2160p.UHD.BluRay.x265-HDR.mkv", 2_000_000)))
+
+    # archives inside archives: RAR5 > 7z > zip > tar > mkv
+    nest = "Nested.Movie.2021.1080p.BluRay.x264-NEST"
+    data = nested_archive(nest)
+    for seg in (1, 2, 3):
+        add(f'"{nest}.rar" yEnc ({seg}/3)', yenc(f"{nest}.rar", data), size=900_000,
+            author="nester <n@mock.example>")
     return posts
 
 

@@ -2,8 +2,10 @@
 //! integrity checks, the NNTP headers XOVER leaves out, what the first bytes of the file are, and its NFO and SFV.
 
 pub mod archive;
+pub mod lzma;
 pub mod media;
 pub mod moviehash;
+pub mod nest;
 pub mod opensubtitles;
 pub mod step;
 pub mod yenc;
@@ -64,6 +66,9 @@ pub struct ProbeInfo {
     pub headers: BTreeMap<String, String>,
     pub crossposted_to: Vec<String>,
     pub archive: Option<archive::ArchiveHead>,
+    /// every archive and compressed stream the file was followed down through, outermost first
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub layers: Vec<nest::Layer>,
     pub media: Option<media::MediaInfo>,
     pub nfo: Option<String>,
     pub imdb_ids: Vec<String>,
