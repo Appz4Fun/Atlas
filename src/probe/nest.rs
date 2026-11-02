@@ -101,6 +101,11 @@ pub fn unwrap(data: &[u8]) -> Nest<'_> {
                 layers.push(layer);
                 break;
             }
+            View::Stored { from, to } if from >= to || lo + to > hi => {
+                layer.stop = Some("no file starts in what was read".to_string());
+                layers.push(layer);
+                break;
+            }
             View::Stored { from, to } => {
                 layer.offset = from as u64;
                 layer.stored = true;
@@ -111,7 +116,11 @@ pub fn unwrap(data: &[u8]) -> Nest<'_> {
             }
             View::Decode { from, codec } => {
                 layer.offset = from as u64;
-                let input = &buf[lo + from..hi];
+                let Some(input) = buf.get(lo + from..hi).filter(|i| !i.is_empty()) else {
+                    layer.stop = Some("no file starts in what was read".to_string());
+                    layers.push(layer);
+                    break;
+                };
                 let limit = budget.min(input.len().saturating_mul(MAX_RATIO));
                 let (out, end) = decode(codec, input, limit);
                 if out.is_empty() {
@@ -294,7 +303,8 @@ fn seven_z(data: &[u8]) -> Opened {
     let Some(body) = data.get(AT..to).filter(|b| !b.is_empty()) else {
         return Opened { layer, view: View::Stop("no file starts in what was read") };
     };
-    if open(body).is_some() || crate::archive::identify(body) != crate::archive::Format::Unknown {
+    // by magic number only: opening it here would recurse past the depth limit
+    if known_start(body) || crate::archive::identify(body) != crate::archive::Format::Unknown {
         layer.method = Some("copy".into());
         layer.stored = true;
         return Opened { layer, view: View::Stored { from: AT, to } };
@@ -311,6 +321,25 @@ fn seven_z(data: &[u8]) -> Opened {
         }
         _ => Opened { layer, view: View::Stop("packed some way the front doesn't show, or encrypted") },
     }
+}
+
+/// Whether `data` starts the way something [`open`] reads does, without opening it.
+fn known_start(data: &[u8]) -> bool {
+    const MAGIC: &[&[u8]] = &[
+        b"Rar!\x1a\x07",
+        b"PK\x03\x04",
+        b"7z\xbc\xaf\x27\x1c",
+        &[0x1f, 0x8b, 8],
+        b"\xfd7zXZ\0",
+        b"LZIP\x01",
+        &[0x28, 0xb5, 0x2f, 0xfd],
+        b"BZh",
+        &[0x1f, 0x9d],
+        &[0x04, 0x22, 0x4d, 0x18],
+        &[0x02, 0x21, 0x4c, 0x18],
+        b"\x89LZO\0\r\n\x1a\n",
+    ];
+    MAGIC.iter().any(|m| data.starts_with(m)) || data.get(..512).is_some_and(tar_checksum_ok)
 }
 
 /// gzip's header, with the original file's name when it kept one, then raw deflate.

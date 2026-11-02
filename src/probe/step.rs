@@ -94,9 +94,10 @@ impl Step for ProbeStep {
         Reruns { on_rename: false, on_growth: true }
     }
     /// What a probe reads, a bit per version, soo a release probed before a version gets probed again. Bit 1:
-    /// chapters, commentary, more than one article of a header, and the OpenSubtitles hash.
+    /// chapters, commentary, more than one article of a header, and the OpenSubtitles hash. Bit 2: archives inside
+    /// archives, followed down.
     fn config_stamp(&self) -> u64 {
-        1
+        1 | 2
     }
     fn run(&self, ctx: &mut StepCtx<'_>) -> Result<Outcome, StepError> {
         let retry = |e: rusqlite::Error| StepError::Retry(e.to_string());
@@ -297,7 +298,9 @@ fn moviehash_of(
     if info.media.is_none() {
         return Ok(None);
     }
-    if info.layers.len() > 1 || (!info.layers.is_empty() && info.archive.is_none()) {
+    // the walk follows the biggest file, which needn't be the first one the old way reads
+    let other_file = info.layers.first().is_some_and(|l| info.archive.as_ref().is_none_or(|a| a.name != l.name));
+    if info.layers.len() > 1 || other_file {
         return chain_moviehash(ctx, file, files, front, info.segment_size, known_last);
     }
     let Some(head) = &info.archive else {

@@ -295,3 +295,33 @@ fn layers_read_back_from_their_json() {
     let kept: Vec<Layer> = n.layers.iter().map(|l| Layer { continues: false, ..l.clone() }).collect();
     assert_eq!(back, kept);
 }
+
+#[test]
+fn thousands_of_7z_wrappers_stay_within_the_depth_limit() {
+    // checking whether a 7z holds another must not open that one too: the stack would be the limit
+    let mut data = video();
+    for _ in 0..5000 {
+        let mut z = b"7z\xbc\xaf\x27\x1c\x00\x04".to_vec();
+        z.extend([0; 4]);
+        z.extend((data.len() as u64).to_le_bytes());
+        z.extend([0; 12]);
+        z.extend(data);
+        data = z;
+    }
+    let n = unwrap(&data);
+    assert_eq!(n.layers.len(), MAX_DEPTH + 1);
+}
+
+#[test]
+fn headers_cut_before_their_data_stop_cleanly() {
+    let n = unwrap(b"LZIP\x01");
+    assert_eq!(n.layers[0].stop.as_deref(), Some("no file starts in what was read"));
+    // a zip LZMA entry holding only the start of its own header
+    let z = zip_entry(14, "a", &[9, 0, 5, 0, 0x5d], 100);
+    let n = unwrap(&z);
+    assert_eq!(formats(&n), ["ZIP lzma"]);
+    assert!(n.layers[0].stop.is_some());
+    for cut in 0..z.len() {
+        let _ = unwrap(&z[..cut]);
+    }
+}
