@@ -39,6 +39,8 @@ pub struct Sps {
     /// left, right, top, bottom in luma samples
     pub crop: [u32; 4],
     pub full_range: bool,
+    /// matrix_coefficients (H.273), when the VUI says
+    pub matrix: Option<u8>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -213,9 +215,9 @@ pub fn parse_sps(nal: &[u8]) -> Result<Sps> {
             return Err(DecodeError::Invalid("crop"));
         }
     }
-    let mut full_range = false;
+    let (mut full_range, mut matrix) = (false, None);
     if r.flag()? {
-        // VUI, as far as the range
+        // VUI, as far as the colour description
         if r.flag()? && r.bits(8)? == 255 {
             r.skip(32)?;
         }
@@ -225,6 +227,10 @@ pub fn parse_sps(nal: &[u8]) -> Result<Sps> {
         if r.flag()? {
             r.skip(3)?;
             full_range = r.flag()?;
+            if r.flag()? {
+                r.skip(16)?; // colour primaries, transfer
+                matrix = Some(r.bits(8)? as u8);
+            }
         }
     }
     Ok(Sps {
@@ -246,6 +252,7 @@ pub fn parse_sps(nal: &[u8]) -> Result<Sps> {
         mbaff,
         crop,
         full_range,
+        matrix,
     })
 }
 

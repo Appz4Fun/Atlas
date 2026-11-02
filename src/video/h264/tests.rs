@@ -106,7 +106,14 @@ fn pictures_match_the_reference_decoder() {
         assert_eq!((w, h), size, "{name}");
         assert_eq!(md5s(&p), want, "{name}");
         assert_eq!(p.full_range, name == "full_range", "{name}");
+        assert_eq!(p.matrix, None, "{name}");
     }
+}
+
+#[test]
+fn the_colour_matrix_comes_from_the_vui() {
+    let p = decode_keyframe(&split_annex_b(&fixture("bt709.h264"))).unwrap();
+    assert_eq!((p.luma8().0, p.matrix), (64, Some(1)));
 }
 
 #[test]

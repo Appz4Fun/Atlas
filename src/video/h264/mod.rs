@@ -76,7 +76,8 @@ fn decode(units: &[&[u8]], partial: bool) -> (Option<Picture>, Option<DecodeErro
     f.deblock();
     let [left, right, top, bottom] = f.sps.crop.map(|c| c as usize);
     let crop = Crop { left, right, top, bottom };
-    (Some(Picture { bit_depth: 8, crop, full_range: f.sps.full_range, planes: f.planes }), error)
+    let (full_range, matrix) = (f.sps.full_range, f.sps.matrix);
+    (Some(Picture { bit_depth: 8, crop, full_range, matrix, planes: f.planes }), error)
 }
 
 fn read_picture(units: &[&[u8]], frame: &mut Option<Frame>) -> Result<()> {
