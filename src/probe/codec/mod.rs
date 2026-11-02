@@ -7,6 +7,7 @@ pub mod inflate;
 pub mod lz4;
 pub mod lzw;
 mod ppmd_h;
+pub mod ppmd_i;
 pub mod rar15;
 pub mod rar20;
 pub mod rar3;

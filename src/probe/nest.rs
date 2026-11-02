@@ -101,6 +101,11 @@ enum Codec {
         /// the stream goes on in the next volume
         continues: bool,
     },
+    /// PPMd variant I, as zip has it (method 98)
+    PpmdZip {
+        size: Option<u64>,
+        packed: Option<u64>,
+    },
 }
 
 /// A layer found: what to record, and how to go on.
@@ -225,6 +230,11 @@ fn decode(codec: Codec, input: &[u8], limit: usize) -> (Vec<u8>, End) {
             };
             decode(&input[..to], size, limit, complete)
         }
+        Codec::PpmdZip { size, packed } => {
+            // the range coder reads ahead, so it must not read on into the next entry
+            let to = packed.and_then(|p| usize::try_from(p).ok()).map_or(input.len(), |p| p.min(input.len()));
+            codec::ppmd_i::zip(&input[..to], size, limit)
+        }
     }
 }
 
@@ -325,6 +335,7 @@ fn from_entries(data: &[u8]) -> Opened {
             "deflate64" => View::Decode { from: at, codec: Codec::Deflate64 },
             "bzip2" => View::Decode { from: at, codec: Codec::Bzip2 },
             "zstd" => View::Decode { from: at, codec: Codec::Zstd },
+            "ppmd" => View::Decode { from: at, codec: Codec::PpmdZip { size: head.unpacked, packed: head.packed } },
             "lzma" => match zip_lzma(&data[at..to]) {
                 Some((skip, props)) => {
                     View::Decode { from: at + skip, codec: Codec::Lzma { props, size: head.unpacked } }

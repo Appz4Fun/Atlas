@@ -273,9 +273,9 @@ fn methods_not_decoded_yet_say_so() {
     let n = unwrap(&lzo);
     assert_eq!(n.layers[0].format, "LZOP");
     assert_eq!(n.layers[0].stop.as_deref(), Some("no decoder for this yet"));
-    let z = zip_entry(98, "movie.mkv", &[1, 2, 3], 3);
+    let z = zip_entry(97, "movie.mkv", &[1, 2, 3], 3);
     let n = unwrap(&z);
-    assert_eq!(formats(&n), ["ZIP ppmd"]);
+    assert_eq!(formats(&n), ["ZIP other"]);
     assert_eq!(n.layers[0].stop.as_deref(), Some("no decoder for this yet"));
 }
 
@@ -291,6 +291,13 @@ fn single_streams() {
     same(&n.inner, &v);
     let z = zip_entry(93, "movie.mkv", &zstd::encode_all(&v[..], 3).unwrap(), v.len());
     same(&unwrap(&z).inner, &v);
+    // pyppmd's PPMd I, with a second entry after it the range coder mustn't read into
+    let want = include_bytes!("../../../tests/fixtures/ppmd/mixed.bin");
+    let ppmd = include_bytes!("../../../tests/fixtures/ppmd/mixed.ppmd");
+    let z = [zip_entry(98, "mixed.bin", ppmd, want.len()), zip_entry(0, "next", &[7; 64], 64)].concat();
+    let n = unwrap(&z);
+    assert_eq!(formats(&n), ["ZIP ppmd"]);
+    same(&n.inner, want);
     // python's xz, with real matches
     let xz = include_bytes!("../../../tests/fixtures/nest/sample.xz");
     let n = unwrap(xz);
