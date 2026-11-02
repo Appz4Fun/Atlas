@@ -3,6 +3,7 @@
 //! model's choices depend on when its memory runs out, soo the allocator is the original's, over one byte heap
 //! with 12-byte units and 32-bit offsets for pointers; 0 is null.
 
+use super::heap::Heap;
 use super::rarbits::Bits;
 
 const UNIT: u32 = 12;
@@ -62,7 +63,7 @@ struct State {
 }
 
 pub struct Ppm {
-    heap: Vec<u8>,
+    heap: Heap,
     /// the model's memory in bytes; 0 before the first start
     size: u32,
     indx2units: [u8; N_INDEXES],
@@ -121,7 +122,7 @@ fn get_byte(bits: &mut Bits<'_>) -> u32 {
 impl Default for Ppm {
     fn default() -> Ppm {
         Ppm {
-            heap: Vec::new(),
+            heap: Heap::default(),
             size: 0,
             indx2units: [0; N_INDEXES],
             units2indx: [0; 128],
@@ -171,13 +172,11 @@ impl Ppm {
     // ---- the heap: out of range reads give 0 and writes go nowhere, which only damaged data reaches
 
     fn b(&self, at: u32) -> u32 {
-        u32::from(self.heap.get(at as usize).copied().unwrap_or(0))
+        u32::from(self.heap.get(at as usize))
     }
 
     fn set_b(&mut self, at: u32, v: u32) {
-        if let Some(x) = self.heap.get_mut(at as usize) {
-            *x = v as u8;
-        }
+        self.heap.set(at as usize, v as u8);
     }
 
     fn w(&self, at: u32) -> u32 {
@@ -300,7 +299,7 @@ impl Ppm {
             return;
         }
         let alloc = t / UNIT * UNIT + 2 * UNIT;
-        self.heap = vec![0; (self.heap_start + alloc) as usize];
+        self.heap = Heap::new((self.heap_start + alloc) as usize);
         self.heap_end = self.heap_start + alloc - UNIT;
         self.size = t;
     }
@@ -1176,7 +1175,8 @@ impl Ppm {
 
     /// The next byte, or None for damaged data.
     pub fn decode_char(&mut self, bits: &mut Bits<'_>) -> Option<u8> {
-        if self.broken || !self.ctx_ok(self.min_ctx) {
+        // a model that wants more memory than the budget can't go on
+        if self.broken || self.heap.over || !self.ctx_ok(self.min_ctx) {
             return None;
         }
         let ctx = self.min_ctx;

@@ -2,6 +2,7 @@
 
 pub mod bcj;
 pub mod bzip2;
+pub mod heap;
 pub mod inflate;
 pub mod lz4;
 pub mod lzw;
