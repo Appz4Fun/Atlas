@@ -1951,9 +1951,10 @@ fn ask(body: &str, htmx: bool) -> ApiResponse {
     }
     let sorts: Vec<&str> = std::iter::once("relevance").chain(SortBy::ALL.iter().map(|(_, word)| *word)).collect();
     let choices = gemini::Choices { filters: FILTERS, sorts: &sorts };
-    let plan = match gemini::plan(&gemini::load(), &question, &choices) {
+    let settings = gemini::load();
+    let plan = match gemini::plan(&settings, &question, &choices) {
         Ok(plan) => plan,
-        Err(why) => return failed("Gemini could not read that", &why),
+        Err(why) => return failed("Gemini did not answer", &why),
     };
     let search = Search::from_args(&plan_args(&plan));
     let query = search.query(&search.cat, 0);
@@ -1970,9 +1971,14 @@ fn ask(body: &str, htmx: bool) -> ApiResponse {
     }
     let said = if plan.note.is_empty() { String::new() } else { format!(" {}", escape(&plan.note)) };
     let note = format!(
-        "<div class=\"ask-read\" data-q=\"{}\"><p><span class=\"tag tag-ref\">GEMINI</span>{said}</p><p class=\"path\">Searched {}</p></div>",
+        "<div class=\"ask-read\" data-q=\"{}\"><p><span class=\"tag tag-ref\">GEMINI</span>{said}</p><p class=\"path\">Searched {}{}</p></div>",
         attr(&search.q),
         escape(&described(&search)),
+        if plan.model.is_empty() || plan.model == settings.model() {
+            String::new()
+        } else {
+            format!(". Answered by {}, as {} was busy", escape(&plan.model), escape(settings.model()))
+        },
     );
     // the search box takes the words from `data-q` (web.js): swapping the box would drop the form's listener on it
     first_page(&search, &ask_note(&note, " hx-swap-oob=\"true\""))

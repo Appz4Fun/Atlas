@@ -7,6 +7,7 @@ mod common;
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use atlas::config::Config;
@@ -63,7 +64,7 @@ fn post(port: u16, path: &str, body: &str, cookie: &str, htmx: bool) -> Reply {
 }
 
 /// Answers like Gemini: a model lookup, and a generateContent that reads every question as 2160p "findword".
-fn fake_gemini(seen: Arc<Mutex<Vec<String>>>) -> u16 {
+fn fake_gemini(seen: Arc<Mutex<Vec<String>>>, all_busy: Arc<AtomicBool>) -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     std::thread::spawn(move || {
@@ -90,6 +91,13 @@ fn fake_gemini(seen: Arc<Mutex<Vec<String>>>) -> u16 {
             let good = head.lines().any(|l| l.eq_ignore_ascii_case(&format!("x-goog-api-key: {GEMINI_KEY}")));
             let (status, reply) = if !good {
                 (400, json!({"error": {"code": 400, "message": "API key not valid. Please pass a valid API key."}}))
+            } else if head.starts_with("POST /v1beta/models/gemini-busy:") {
+                (
+                    503,
+                    json!({"error": {"code": 503, "status": "UNAVAILABLE", "message": "This model is currently experiencing high demand."}}),
+                )
+            } else if head.starts_with("POST /v1beta/models/gemini-3.") && all_busy.load(Ordering::SeqCst) {
+                (429, json!({"error": {"code": 429, "status": "RESOURCE_EXHAUSTED", "message": "Quota exceeded."}}))
             } else if head.starts_with("POST ") {
                 let plan = json!({
                     "note": "4K copies of Findword",
@@ -120,7 +128,8 @@ fn fake_gemini(seen: Arc<Mutex<Vec<String>>>) -> u16 {
 fn ask_ai_end_to_end() {
     let home = tempfile::tempdir().unwrap();
     let seen = Arc::new(Mutex::new(Vec::new()));
-    let gemini = fake_gemini(seen.clone());
+    let all_busy = Arc::new(AtomicBool::new(false));
+    let gemini = fake_gemini(seen.clone(), all_busy.clone());
     // SAFETY: only test in this binary; the fake's thread reads no environment
     unsafe {
         std::env::set_var("ATLAS_HOME", home.path());
@@ -228,6 +237,25 @@ fn ask_ai_end_to_end() {
         "{}",
         typed.body
     );
+
+    // a busy model is asked again, then a fallback answers, and the note says which
+    post(port, "/ui/settings", "key=&model=gemini-busy&do=save", &cookie, false);
+    let fell_back = post(port, "/ui/ask", "ask=4k+findword", &cookie, true);
+    assert!(fell_back.body.contains("Film.Findword"), "{}", fell_back.body);
+    assert!(
+        fell_back.body.contains("Answered by gemini-3.5-flash-lite, as gemini-busy was busy"),
+        "{}",
+        fell_back.body
+    );
+    let tries: Vec<String> =
+        seen.lock().unwrap().iter().rev().take(4).map(|r| r.lines().next().unwrap().to_string()).collect();
+    assert_eq!(tries.iter().filter(|t| t.contains("/gemini-busy:")).count(), 3, "{tries:?}");
+    // every model busy: said so, and the results stay
+    all_busy.store(true, Ordering::SeqCst);
+    let busy = post(port, "/ui/ask", "ask=4k+findword", &cookie, true);
+    assert_eq!(busy.header("HX-Retarget").as_deref(), Some("#ask-note"));
+    assert!(busy.body.contains("too busy right now") && busy.body.contains("Quota exceeded"), "{}", busy.body);
+    all_busy.store(false, Ordering::SeqCst);
 
     // removing the key turns it off
     let removed = post(port, "/ui/settings", "do=forget", &cookie, false);

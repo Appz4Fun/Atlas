@@ -15,6 +15,10 @@ use crate::category::TABLE;
 
 /// Google's name for its newest Flash model, soo the default doesn't age out.
 pub const DEFAULT_MODEL: &str = "gemini-flash-latest";
+/// Asked in turn when the chosen model is too busy to answer: each model has its own capacity at Google.
+const FALLBACK_MODELS: &[&str] = &["gemini-3.5-flash-lite", "gemini-3.6-flash"];
+/// The waits before asking a busy model again, then the fallbacks get one try each.
+const BUSY_WAITS: [Duration; 2] = [Duration::from_secs(1), Duration::from_secs(3)];
 const DEFAULT_BASE: &str = "https://generativelanguage.googleapis.com";
 const FILE: &str = "gemini.json";
 /// What a question can be. Anything longer isn't a search.
@@ -127,6 +131,8 @@ pub struct Plan {
     pub dir: String,
     /// one sentence on how Gemini read the question
     pub note: String,
+    /// the model that answered: a fallback's name when the chosen one was busy
+    pub model: String,
 }
 
 /// What the page can search on, for the prompt and the schema.
@@ -253,6 +259,7 @@ pub fn parse_reply(reply: &Value) -> Result<Plan, String> {
         sort: if sort == "relevance" { String::new() } else { sort },
         dir: field("dir"),
         note: field("note"),
+        model: String::new(),
     })
 }
 
@@ -305,24 +312,68 @@ pub fn plan(settings: &Settings, question: &str, choices: &Choices) -> Result<Pl
     planned
 }
 
+/// Why a model gave no plan.
+enum Failed {
+    /// overloaded or out of quota for now: another try, or another model, may answer
+    Busy(String),
+    /// the model isn't there (a fallback Google renamed)
+    Missing,
+    Other(String),
+}
+
+/// The chosen model, asked again after `BUSY_WAITS` while it's busy, then each fallback once.
 fn ask(settings: &Settings, question: &str, choices: &Choices) -> Result<Plan, String> {
-    let model = model_path(settings.model())?;
+    let chosen = model_path(settings.model())?;
+    let body = request_body(question, choices);
+    let mut last_busy = String::new();
+    for attempt in 0..=BUSY_WAITS.len() {
+        match ask_model(settings, chosen, &body) {
+            Ok(plan) => return Ok(plan),
+            Err(Failed::Busy(said)) => last_busy = said,
+            Err(Failed::Missing) => return Err(format!("Gemini has no model called {chosen}: check it in Settings")),
+            Err(Failed::Other(said)) => return Err(said),
+        }
+        if let Some(wait) = BUSY_WAITS.get(attempt) {
+            std::thread::sleep(*wait);
+        }
+    }
+    for fallback in FALLBACK_MODELS.iter().filter(|m| **m != chosen) {
+        match ask_model(settings, fallback, &body) {
+            Ok(plan) => return Ok(plan),
+            Err(Failed::Busy(said)) => last_busy = said,
+            Err(Failed::Missing) => {}
+            Err(Failed::Other(said)) => return Err(said),
+        }
+    }
+    Err(format!("Gemini is too busy right now, on {chosen} and the fallbacks. Try again in a minute. {last_busy}"))
+}
+
+fn ask_model(settings: &Settings, model: &str, body: &Value) -> Result<Plan, Failed> {
     let base = base_url();
     let url = format!("{base}/v1beta/models/{model}:generateContent");
-    let mut resp = agent(&base, Duration::from_secs(45))
+    let mut resp = agent(&base, Duration::from_secs(30))
         .post(&url)
         .header("x-goog-api-key", &settings.api_key)
-        .send_json(request_body(question, choices))
-        .map_err(|e| format!("could not reach Gemini: {e}"))?;
+        .send_json(body)
+        .map_err(|e| Failed::Other(format!("could not reach Gemini: {e}")))?;
     let status = resp.status().as_u16();
     let reply: Value = resp.body_mut().read_json().unwrap_or(Value::Null);
-    if !(200..300).contains(&status) {
-        return Err(match parse_reply(&reply) {
-            Err(said) if reply.get("error").is_some() => said,
-            _ => format!("Gemini answered {status}"),
-        });
+    if (200..300).contains(&status) {
+        let mut plan = parse_reply(&reply).map_err(Failed::Other)?;
+        plan.model = model.to_string();
+        return Ok(plan);
     }
-    parse_reply(&reply)
+    let said = match parse_reply(&reply) {
+        Err(said) if reply.get("error").is_some() => said,
+        _ => format!("Gemini answered {status}"),
+    };
+    let state = reply.pointer("/error/status").and_then(Value::as_str).unwrap_or_default();
+    Err(match status {
+        429 | 500 | 502 | 503 | 504 => Failed::Busy(said),
+        _ if matches!(state, "UNAVAILABLE" | "RESOURCE_EXHAUSTED") => Failed::Busy(said),
+        404 => Failed::Missing,
+        _ => Failed::Other(said),
+    })
 }
 
 /// Whether Gemini takes the key and knows the model: a model lookup, which costs nothing.
