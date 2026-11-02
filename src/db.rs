@@ -41,8 +41,10 @@ static READER_SWEEP: Once = Once::new();
 const MAX_READERS: usize = 4;
 const READER_IDLE: Duration = Duration::from_secs(600);
 const READER_SWEEP_EVERY: Duration = Duration::from_secs(30);
-/// per shard, against the default 2MB: a filtered search walks one shard's category table and index in order
-const READER_CACHE_KIB: i64 = 16 * 1024;
+/// All the page cache kept readers may hold together, however many searches run at once, which is split
+/// evenly per reader per shard. A shard's default is 2MB.
+const READERS_CACHE_KIB: i64 = 128 * 1024;
+const READER_CACHE_KIB: i64 = READERS_CACHE_KIB / (MAX_READERS as i64 * store::SHARDS as i64);
 
 /// What identifies the main database and each shard's file right now. None where that can't be told, and
 /// where an open file can't be renamed (Windows): no connection is kept there.
