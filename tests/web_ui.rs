@@ -10,7 +10,7 @@ use std::net::{TcpListener, TcpStream};
 use atlas::config::Config;
 use atlas::parser::Release;
 use atlas::{api, db, store};
-use common::stage::release_of;
+use common::stage::{article, release_of};
 
 const KEY: &str = "web-ui-key";
 
@@ -167,6 +167,39 @@ fn the_web_ui_end_to_end() {
     );
     assert_eq!(fetch(port, "/ui/release?id=999999999", &cookie).status(), 404);
     assert_eq!(fetch(port, &format!("/ui/release?id={id}"), "").status(), 303);
+
+    // one post spread over two groups: one row, whole, and an NZB with all of it
+    for (group, part) in [("alt.binaries.g1", 1), ("alt.binaries.g2", 2)] {
+        let one = article("split.bin", part, 2, &format!("<split.{part}@x>"));
+        let size = one.bytes;
+        store::save(
+            &main,
+            &[Release {
+                name: "Spread.Post.S01E01-GRP".into(),
+                group: group.into(),
+                articles: vec![one],
+                size,
+                complete: false,
+                ..Default::default()
+            }],
+        )
+        .unwrap();
+    }
+    let spread = fetch(port, "/ui/results?q=Spread", &cookie);
+    assert_eq!(spread.body.matches("Spread.Post.S01E01-GRP</a>").count(), 1, "{}", spread.body);
+    assert!(spread.body.contains("2 GROUPS") && !spread.body.contains("INCOMPLETE"), "{}", spread.body);
+    let both = fetch(port, "/ui/results?group=alt.binaries.g2&q=Spread", &cookie);
+    assert_eq!(both.body.matches("Spread.Post.S01E01-GRP</a>").count(), 1, "{}", both.body);
+    let spread_id = spread.body.split("/ui/release?id=").nth(1).unwrap().split('"').next().unwrap().to_string();
+    let whole = fetch(port, &format!("/ui/nzb?id={spread_id}"), &cookie);
+    assert!(whole.body.contains("split.1@x") && whole.body.contains("split.2@x"), "{}", whole.body);
+    assert!(
+        whole.body.contains("<group>alt.binaries.g1</group>") && whole.body.contains("<group>alt.binaries.g2</group>"),
+        "{}",
+        whole.body
+    );
+    let opened = fetch(port, &format!("/ui/release?id={spread_id}"), &cookie);
+    assert!(opened.body.contains("COMPLETE") && !opened.body.contains("INCOMPLETE"), "{}", opened.body);
 
     // copies, listed together, with what tells them apart
     assert_eq!(fetch(port, "/ui/duplicates", "").status(), 303);

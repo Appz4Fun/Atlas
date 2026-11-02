@@ -59,6 +59,11 @@ fn is_xml_char(c: char) -> bool {
 }
 
 pub fn render_nzb(release: &ReleaseRow, articles: &[ArticleRow]) -> String {
+    render_nzb_in(release, articles, std::slice::from_ref(&release.group_name))
+}
+
+/// The same, for articles found in any of `groups`.
+fn render_nzb_in(release: &ReleaseRow, articles: &[ArticleRow], groups: &[String]) -> String {
     let mut x = String::new();
     x.push_str("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n");
     x.push_str(
@@ -82,7 +87,11 @@ pub fn render_nzb(release: &ReleaseRow, articles: &[ArticleRow]) -> String {
             article_timestamp(first.posted_date.as_deref().unwrap_or("")),
             escape_attr(first.subject.as_deref().unwrap_or("")),
         );
-        let _ = writeln!(x, "    <groups>\n      <group>{}</group>\n    </groups>", escape_text(&release.group_name));
+        x.push_str("    <groups>\n");
+        for group in groups {
+            let _ = writeln!(x, "      <group>{}</group>", escape_text(group));
+        }
+        x.push_str("    </groups>\n");
         x.push_str("    <segments>\n");
 
         for a in file_articles {
@@ -113,6 +122,20 @@ fn whole_nzb(release_id: i64) -> Result<Option<String>> {
 
     if articles.is_empty() {
         return Ok(None);
+    }
+
+    // a post spread over several groups only makes its files with all of them
+    let conn = crate::db::open()?;
+    if !release.complete
+        && let Some(post) = crate::release_info::split_post_with(&conn, &release)?
+    {
+        let mut all = Vec::new();
+        for id in &post.ids {
+            all.extend(crate::store::articles(&conn, *id)?);
+        }
+        all.sort_by(|a, b| (&a.filename, a.part, &a.message_id).cmp(&(&b.filename, b.part, &b.message_id)));
+        all.dedup_by(|a, b| a.filename == b.filename && a.part.is_some() && a.part == b.part);
+        return Ok(Some(render_nzb_in(&release, &all, &post.groups)));
     }
 
     Ok(Some(render_nzb(&release, &articles)))

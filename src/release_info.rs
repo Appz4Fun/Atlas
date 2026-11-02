@@ -231,6 +231,97 @@ pub fn groups_of_with(conn: &Connection, name: &str) -> Result<Vec<GroupPosting>
     Ok(out)
 }
 
+/// One post whose articles went to several groups, each article to one of them: every group holds a release of the same
+/// name from the same poster, and only together do they make the files.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SplitPost {
+    /// each group's release, lowest id first
+    pub ids: Vec<i64>,
+    pub groups: Vec<String>,
+    pub size: i64,
+    /// every file has all its parts, across the groups
+    pub complete: bool,
+}
+
+impl SplitPost {
+    /// The one to list. A search that isn't about one group shows only this.
+    pub fn listed_id(&self) -> i64 {
+        self.ids.iter().copied().max().unwrap_or(0)
+    }
+}
+
+/// The rest of this release's post in other groups, if it has any. None: it's all here.
+pub fn split_post_with(conn: &Connection, release: &crate::search::ReleaseRow) -> Result<Option<SplitPost>> {
+    let posted = names_with(conn, release.id)?.map_or(release.name.clone(), |n| n.posted);
+    let (mut ids, mut groups, mut size) = (Vec::new(), Vec::new(), 0);
+    for s in 0..store::SHARDS {
+        let mut stmt = conn.prepare_cached(&format!(
+            "select id, group_name, coalesce(size, 0) from s{s}.releases where name = ?1 and poster is ?2 limit 64"
+        ))?;
+        let rows = stmt.query_map(rusqlite::params![posted, release.poster], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?.unwrap_or_default(), r.get::<_, i64>(2)?))
+        })?;
+        for row in rows {
+            let (id, group, bytes) = row?;
+            ids.push(id);
+            groups.push(group);
+            size += bytes;
+        }
+    }
+    if ids.len() < 2 {
+        return Ok(None);
+    }
+    ids.sort_unstable();
+    groups.sort_unstable();
+    groups.dedup();
+    let complete = split_is_complete(conn, &ids)?;
+    Ok(Some(SplitPost { ids, groups, size, complete }))
+}
+
+/// Whether each file's parts, put together across the releases, are all there.
+fn split_is_complete(conn: &Connection, ids: &[i64]) -> Result<bool> {
+    let mut files: HashMap<String, (Option<i64>, Vec<u8>)> = HashMap::new();
+    for id in ids {
+        let s = store::shard_of_id(*id);
+        let mut stmt =
+            conn.prepare_cached(&format!("select filename, expected, seen from s{s}.files where release_id = ?"))?;
+        let rows = stmt
+            .query_map([id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<i64>>(1)?, r.get::<_, Vec<u8>>(2)?)))?;
+        for row in rows {
+            let (filename, expected, seen) = row?;
+            let file = files.entry(filename).or_default();
+            file.0 = file.0.or(expected);
+            if file.1.len() < seen.len() {
+                file.1.resize(seen.len(), 0);
+            }
+            for (slot, bits) in file.1.iter_mut().zip(seen) {
+                *slot |= bits;
+            }
+        }
+    }
+    Ok(!files.is_empty()
+        && files.values().all(|(expected, seen)| expected.is_some_and(|want| store::seen_count(seen) >= want)))
+}
+
+/// What's in the whole post, from what one release's `contents` said and the other releases'.
+pub fn contents_of_split(conn: &Connection, post: &SplitPost) -> Result<Contents> {
+    let mut all = Contents::default();
+    for (at, id) in post.ids.iter().enumerate() {
+        let one = contents_with(conn, *id)?;
+        if at == 0 {
+            all = one;
+            continue;
+        }
+        all.articles_seen = (all.articles_seen + one.articles_seen).min(all.articles_expected);
+        all.data_articles_seen = (all.data_articles_seen + one.data_articles_seen).min(all.data_articles_expected);
+        all.recovery_articles_seen =
+            (all.recovery_articles_seen + one.recovery_articles_seen).min(all.recovery_articles_expected);
+        all.data_bytes += one.data_bytes;
+        all.recovery_bytes += one.recovery_bytes;
+    }
+    Ok(all)
+}
+
 /// A From header, split up.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Poster {
