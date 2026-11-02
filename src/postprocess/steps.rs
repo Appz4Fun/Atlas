@@ -12,6 +12,7 @@ pub fn all() -> Vec<Arc<dyn Step>> {
     vec![
         Arc::new(archive::Par2Step::default()),
         Arc::new(archive::ListStep::default()),
+        Arc::new(crate::archive::link::LinkStep::default()),
         Arc::new(crate::probe::ProbeStep::default()),
         Arc::new(crate::probe::opensubtitles::OpenSubtitlesStep::default()),
         Arc::new(naming::Naming),

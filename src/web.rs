@@ -510,8 +510,8 @@ impl Search {
                 if sort == SortBy::Size
                     && let Ok(conn) = crate::db::open()
                 {
-                    for r in found.iter_mut().filter(|r| !r.complete) {
-                        if let Ok(Some(post)) = release_info::split_post_with(&conn, r) {
+                    for r in found.iter_mut() {
+                        if let Ok(Some(post)) = release_info::whole_post_with(&conn, r) {
                             r.size = Some(post.size);
                         }
                     }
@@ -535,13 +535,12 @@ impl Search {
         let mut split = HashMap::new();
         let conn = crate::db::open().ok();
         let one_group = !self.fields.group.is_empty();
-        let post_of = |r: &ReleaseRow| {
-            if r.complete {
-                return None;
-            }
-            conn.as_ref().and_then(|conn| release_info::split_post_with(conn, r).ok().flatten())
+        let post_of =
+            |r: &ReleaseRow| conn.as_ref().and_then(|conn| release_info::whole_post_with(conn, r).ok().flatten());
+        // an upload linked by its PAR2 set is in one group, soo it stays one row whatever the search
+        let folded = |r: &ReleaseRow, post: &release_info::SplitPost| {
+            (!one_group || post.lead.is_some()) && post.listed_id() != r.id
         };
-        let folded = |r: &ReleaseRow, post: &release_info::SplitPost| !one_group && post.listed_id() != r.id;
         found.retain_mut(|r| {
             let Some(post) = post_of(r) else { return true };
             if folded(r, &post) {
@@ -549,7 +548,7 @@ impl Search {
             }
             r.size = Some(post.size);
             r.complete = post.complete;
-            split.insert(r.id, post.groups.len());
+            split.insert(r.id, post);
             true
         });
         if hide_copies {
@@ -568,7 +567,10 @@ impl Search {
         let categories = crate::category::categories_of(&ids).unwrap_or_default();
         let passwords = crate::archive::store::passwords(&ids);
         let media = crate::media::query::attrs_of(&ids).unwrap_or_default();
+        // a post spread over several groups is all its rows together, whatever one of them holds
+        let single: Vec<i64> = ids.iter().copied().filter(|id| !split.contains_key(id)).collect();
         let extras = RowExtras {
+            recovery: release_info::recovery_only_of(&single),
             split,
             copies: crate::duplicates::counts(&ids).unwrap_or_default(),
             details: crate::media::details::kept_for(media.iter().map(|(id, m)| (*id, m.kind, &m.ids))),
@@ -682,10 +684,12 @@ impl Search {
 /// What a result shows beyond its own row.
 #[derive(Default)]
 struct RowExtras {
-    /// groups, for a post spread over several
-    split: HashMap<i64, usize>,
+    /// all of the post a row lists: spread over several groups, or linked by its PAR2 set
+    split: HashMap<i64, release_info::SplitPost>,
     copies: HashMap<i64, crate::duplicates::CopyCount>,
     details: HashMap<i64, crate::media::details::Details>,
+    /// rows with nothing but PAR2 data in them
+    recovery: HashMap<i64, release_info::RecoveryOnly>,
 }
 
 /// Columns of the results table.
@@ -693,6 +697,56 @@ const COLUMNS: usize = 6;
 
 fn tag(class: &str, text: &str) -> String {
     format!(" <span class=\"tag {class}\">{}</span>", escape(text))
+}
+
+/// What a row's size is, for its tooltip.
+fn size_note(size: Option<i64>, recovery: Option<&release_info::RecoveryOnly>) -> String {
+    let bytes = format!("{} bytes", thousands(size.unwrap_or(0)));
+    match recovery {
+        None => bytes,
+        Some(recovery) => match recovery.repairs_bytes() {
+            Some(whole) => {
+                format!("{bytes} of PAR2 recovery data only. The files it repairs are {}", fmt_size(Some(whole)))
+            }
+            None => format!("{bytes} of PAR2 recovery data only"),
+        },
+    }
+}
+
+/// Says a release is an upload's rows put back together.
+fn linked_tag(rows: usize) -> String {
+    let title = format!("{rows} files posted under random names, joined by their PAR2 set");
+    format!(" <span class=\"tag tag-ref\" title=\"{}\">LINKED</span>", attr(&title))
+}
+
+/// Why a PAR2-only row's download isn't the release it's named after.
+fn recovery_warning(recovery: &release_info::RecoveryOnly) -> String {
+    let files: Vec<&str> = recovery.repairs.iter().map(|(name, _)| name.as_str()).collect();
+    let body = match (recovery.repairs_bytes(), files.as_slice()) {
+        (Some(whole), [one]) => format!(
+            "Its NZB holds PAR2 recovery data only. The file it repairs, {one} ({}), was posted under another name, and Atlas hasn't linked the two yet.",
+            fmt_size(Some(whole))
+        ),
+        (Some(whole), _) => format!(
+            "Its NZB holds PAR2 recovery data only. The {} files it repairs ({}) were posted under other names, and Atlas hasn't linked them yet.",
+            files.len(),
+            fmt_size(Some(whole))
+        ),
+        (None, _) => "Its NZB holds PAR2 recovery data only. The files it repairs aren't in this release.".to_string(),
+    };
+    diag("caution", "this is not the whole release", &body)
+}
+
+/// Says a row is only PAR2 data, and what it repairs.
+fn recovery_tag(recovery: &release_info::RecoveryOnly) -> String {
+    let title = match recovery.repairs_bytes() {
+        Some(whole) => format!(
+            "Only PAR2 recovery data. The files it repairs ({}) were posted under other names",
+            fmt_size(Some(whole))
+        ),
+        None => "Only PAR2 recovery data".to_string(),
+    };
+    format!(" <span class=\"tag tag-warn\" title=\"{}\">PAR2 ONLY</span>", attr(&title))
 }
 
 fn password_tag(password: Option<&Password>) -> String {
@@ -766,7 +820,12 @@ fn row(
             d.kind, d.tmdb_id
         )
     });
-    if let Some(count) = extras.copies.get(&r.id) {
+    let recovery = extras.recovery.get(&r.id);
+    if let Some(recovery) = recovery {
+        tags.push_str(&recovery_tag(recovery));
+    }
+    // a recovery volume is no copy of the others of its set, whatever the set's list makes them look like
+    if let Some(count) = extras.copies.get(&r.id).filter(|_| recovery.is_none()) {
         if count.twins > 0 {
             tags.push_str(&tag("tag-ok", &format!("{} TWIN{}", count.twins, if count.twins == 1 { "" } else { "S" })));
         }
@@ -774,8 +833,13 @@ fn row(
             tags.push_str(&tag("tag-ref", &format!("{} ALT{}", count.alts, if count.alts == 1 { "" } else { "S" })));
         }
     }
-    if let Some(groups) = extras.split.get(&r.id) {
-        tags.push_str(&tag("tag-ref", &format!("{groups} GROUPS")));
+    if let Some(post) = extras.split.get(&r.id) {
+        if post.groups.len() > 1 {
+            tags.push_str(&tag("tag-ref", &format!("{} GROUPS", post.groups.len())));
+        }
+        if post.lead.is_some() {
+            tags.push_str(&linked_tag(post.ids.len()));
+        }
     }
     tags.push_str(&password_tag(passwords.get(&r.id)));
     if !r.complete {
@@ -787,12 +851,12 @@ fn row(
         .collect::<Vec<_>>()
         .join(" · ");
     format!(
-        "<tr><td class=\"name\">{thumb}<a href=\"/ui/release?id={id}\">{name}</a>{tags}<div class=\"row-meta\">{meta}</div></td><td class=\"col-cat dim\">{category}</td><td class=\"num col-size\" title=\"{bytes} bytes\">{size}</td><td class=\"dim col-posted\">{posted}</td><td class=\"dim col-group\"><a class=\"quiet\" href=\"/?group={group_link}\">{group}</a></td><td><a class=\"button small primary\" href=\"/ui/nzb?id={id}\">NZB</a></td></tr>",
+        "<tr><td class=\"name\">{thumb}<a href=\"/ui/release?id={id}\">{name}</a>{tags}<div class=\"row-meta\">{meta}</div></td><td class=\"col-cat dim\">{category}</td><td class=\"num col-size\" title=\"{size_note}\">{size}</td><td class=\"dim col-posted\">{posted}</td><td class=\"dim col-group\"><a class=\"quiet\" href=\"/?group={group_link}\">{group}</a></td><td><a class=\"button small primary\" href=\"/ui/nzb?id={id}\">NZB</a></td></tr>",
         id = r.id,
         name = escape(&r.name),
         group = escape(&r.group_name),
         group_link = attr(&url_encode(&r.group_name)),
-        bytes = thousands(r.size.unwrap_or(0)),
+        size_note = attr(&size_note(r.size, recovery)),
     )
 }
 
@@ -998,22 +1062,33 @@ fn release_page(args: &HashMap<String, String>) -> ApiResponse {
     };
     let ids = [id];
     let category = crate::category::categories_of(&ids).unwrap_or_default().get(&id).copied();
-    let inner = crate::archive::store::view(id);
+    let mut inner = crate::archive::store::view(id);
     let media = crate::media::query::attrs_of(&ids).unwrap_or_default().remove(&id);
     let names = release_info::names(id).unwrap_or_default();
     let mut contents = release_info::contents(id).unwrap_or_default();
     let mut release = release;
-    // a post spread over several groups is shown whole
-    if !release.complete
-        && let Ok(conn) = crate::db::open()
-        && let Ok(Some(post)) = release_info::split_post_with(&conn, &release)
+    let mut whole_post = false;
+    // a post spread over several groups, or linked by its PAR2 set, is shown whole
+    if let Ok(conn) = crate::db::open()
+        && let Ok(Some(post)) = release_info::whole_post_with(&conn, &release)
     {
         contents = release_info::contents_of_split(&conn, &post).unwrap_or(contents);
         release.size = Some(post.size);
         release.complete = post.complete;
         release.parts = Some(contents.articles_seen);
+        whole_post = true;
+        // a linked upload's file list is its set's, read from a volume
+        if inner.files.is_empty()
+            && let Some(listed) =
+                post.recovery.iter().map(|id| crate::archive::store::view(*id)).find(|v| !v.files.is_empty())
+        {
+            inner.files = listed.files;
+        }
     }
-    html(200, release_html(&release, category, &inner, media.as_ref(), names.as_ref(), &contents))
+    let recovery = (!whole_post)
+        .then(|| crate::db::open().ok().and_then(|conn| release_info::recovery_only_with(&conn, id).ok().flatten()))
+        .flatten();
+    html(200, release_html(&release, category, &inner, media.as_ref(), names.as_ref(), &contents, recovery.as_ref()))
 }
 
 fn release_problem(status: u16, level: &str, title: &str, body: &str) -> ApiResponse {
@@ -1032,11 +1107,15 @@ fn release_html(
     media: Option<&MediaAttrs>,
     names: Option<&release_info::Names>,
     contents: &release_info::Contents,
+    recovery: Option<&release_info::RecoveryOnly>,
 ) -> String {
     let category = category.unwrap_or(UNCATEGORIZED);
     let mut tags = String::new();
     if let Some(text) = media.and_then(media_label) {
         tags.push_str(&tag("tag-ref", &text));
+    }
+    if let Some(recovery) = recovery {
+        tags.push_str(&recovery_tag(recovery));
     }
     tags.push_str(&password_tag(inner.password.as_ref()));
     tags.push_str(&if r.complete { tag("tag-ok", "COMPLETE") } else { tag("tag-warn", "INCOMPLETE") });
@@ -1059,9 +1138,17 @@ fn release_html(
         fact("Title", search_link("q", &parsed.title));
     }
     if let Some(size) = r.size {
+        let repairs = recovery.map_or(String::new(), |recovery| match recovery.repairs_bytes() {
+            Some(whole) => format!(
+                "<br>PAR2 recovery data only. The files it repairs are {} · {} bytes",
+                escape(&fmt_size(Some(whole))),
+                thousands(whole)
+            ),
+            None => "<br>PAR2 recovery data only".to_string(),
+        });
         fact(
             "Size",
-            format!("{} · <a href=\"/?size={size}\">{} bytes</a>", escape(&fmt_size(r.size)), thousands(size)),
+            format!("{} · <a href=\"/?size={size}\">{} bytes</a>{repairs}", escape(&fmt_size(r.size)), thousands(size)),
         );
     }
     fact("Posted", escape(&fmt_date(r.posted_date.as_deref())));
@@ -1155,8 +1242,9 @@ fn release_html(
                 )
             })
             .collect();
+        let heading = if recovery.is_some() { "Files its PAR2 set repairs" } else { "Files inside" };
         format!(
-            "<h2>Files inside</h2><div class=\"table-wrap\"><table><thead><tr><th>Name</th><th class=\"num\">Size</th></tr></thead><tbody>{rows}</tbody></table></div>"
+            "<h2>{heading}</h2><div class=\"table-wrap\"><table><thead><tr><th>Name</th><th class=\"num\">Size</th></tr></thead><tbody>{rows}</tbody></table></div>"
         )
     };
 
@@ -1178,7 +1266,9 @@ fn release_html(
     } else {
         String::new()
     };
-    let copies = copies_html(&copies);
+    // the other volumes of its set aren't copies of the release, whatever the set's list makes them look like
+    let copies = if recovery.is_some() { String::new() } else { copies_html(&copies) };
+    let warning = recovery.map_or(String::new(), recovery_warning);
 
     page(
         &format!("{} · Atlas", r.name),
@@ -1187,7 +1277,7 @@ fn release_html(
 <p class="path"><a href="/">atlas::releases</a>::<b>{id}</b></p>
 <h1>{name}</h1><p>{tags}</p>
 <div class="actions"><a class="button primary" href="/ui/nzb?id={id}">Download NZB</a>{fill}<a class="button" href="/?cat={category}">More in this category</a></div>
-<div id="title-details" hx-get="/ui/details?id={id}" hx-trigger="load" hx-swap="outerHTML"></div>
+{warning}<div id="title-details" hx-get="/ui/details?id={id}" hx-trigger="load" hx-swap="outerHTML"></div>
 <div class="panel"><dl class="facts">{facts}</dl></div>
 {copies}
 {probe}

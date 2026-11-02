@@ -322,11 +322,14 @@ fn rss(
 ) -> ApiResponse {
     let ids: Vec<i64> = releases.iter().map(|r| r.id).collect();
     let copies = crate::duplicates::counts(&ids).unwrap_or_default();
+    // what the NZB holds: all of a post cut across groups, or of an upload linked by its PAR2 set
+    let conn = crate::db::open().ok();
     let items: String = releases
         .iter()
         .map(|r| {
             let nzb_url = format!("{base}/api?t=get&id={}&apikey={api_key}", r.id);
-            let size = r.size.unwrap_or(0);
+            let whole = conn.as_ref().and_then(|conn| crate::release_info::whole_post_with(conn, r).ok().flatten());
+            let size = whole.map_or(r.size.unwrap_or(0), |post| post.size);
             let password = passwords
                 .get(&r.id)
                 .map_or(String::new(), |p| format!("<newznab:attr name=\"password\" value=\"{}\"/>", p.code()));

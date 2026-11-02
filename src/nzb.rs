@@ -116,19 +116,17 @@ pub fn build_nzb(release_id: i64) -> Result<Option<String>> {
     crate::metrics::timed("nzb.build", || whole_nzb(release_id))
 }
 
-/// A release's articles and groups. For a post spread over several groups, that's all of them: it only makes its files
-/// with all of them.
+/// A release's articles and groups. For a post spread over several groups, or an upload linked by its PAR2 set, that's
+/// all of them: it only makes its files with all of them.
 pub(crate) fn inventory(release: &ReleaseRow) -> crate::db::Result<(Vec<ArticleRow>, Vec<String>)> {
-    if !release.complete {
-        let conn = crate::db::open()?;
-        if let Some(post) = crate::release_info::split_post_with(&conn, release)? {
-            let mut all = Vec::new();
-            for id in &post.ids {
-                all.extend(crate::store::articles(&conn, *id)?);
-            }
-            all.sort_by(|a, b| (&a.filename, a.part, &a.message_id).cmp(&(&b.filename, b.part, &b.message_id)));
-            return Ok((all, post.groups));
+    let conn = crate::db::open()?;
+    if let Some(post) = crate::release_info::whole_post_with(&conn, release)? {
+        let mut all = Vec::new();
+        for id in &post.ids {
+            all.extend(crate::store::articles(&conn, *id)?);
         }
+        all.sort_by(|a, b| (&a.filename, a.part, &a.message_id).cmp(&(&b.filename, b.part, &b.message_id)));
+        return Ok((all, post.groups));
     }
     Ok((get_articles(release.id)?, vec![release.group_name.clone()]))
 }

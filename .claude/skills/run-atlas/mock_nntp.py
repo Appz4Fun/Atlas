@@ -12,6 +12,7 @@ Stdlib only. Mirrors tests/common/mod.rs (the Rust mock the test suite uses).
 """
 import argparse
 import email.utils
+import hashlib
 import io
 import random
 import socketserver
@@ -50,6 +51,35 @@ def par2_filedesc(name, size):
     p = b"PAR2\0PKT" + struct.pack("<Q", length) + b"\0" * 32
     p += b"PAR 2.0\0FileDesc" + b"\7" * 48 + struct.pack("<Q", size) + nb
     return p
+
+
+def par2_packet(set_id, kind, body):
+    body += b"\0" * (-len(body) % 4)
+    return b"PAR2\0PKT" + struct.pack("<Q", 64 + len(body)) + b"\0" * 16 + set_id + kind + body
+
+
+def par2_set(files, block=65536):
+    """A whole PAR2 set's critical packets (Main, then a FileDesc per file) for (name, data) pairs."""
+    descs = []
+    for name, data in files:
+        md5, md5_16k = hashlib.md5(data).digest(), hashlib.md5(data[:16384]).digest()
+        file_id = hashlib.md5(md5_16k + struct.pack("<Q", len(data)) + name.encode()).digest()
+        descs.append((file_id, md5 + md5_16k + struct.pack("<Q", len(data)) + name.encode()))
+    main = struct.pack("<QI", block, len(descs)) + b"".join(sorted(f for f, _ in descs))
+    set_id = hashlib.md5(main).digest()
+    out = par2_packet(set_id, b"PAR 2.0\0Main\0\0\0\0", main)
+    for file_id, rest in descs:
+        out += par2_packet(set_id, b"PAR 2.0\0FileDesc", file_id + rest)
+    return out
+
+
+def yenc_part(name, data, part, total, size):
+    """One article of a file posted in parts: `data` is that part's bytes."""
+    lines = yenc(name, data)
+    lines[0] = f"=ybegin part={part} total={total} line=128 size={size} name={name}".encode()
+    begin = (part - 1) * len(data) + 1
+    lines.insert(1, f"=ypart begin={begin} end={begin + len(data) - 1}".encode())
+    return lines
 
 
 def nested_archive(name):
@@ -124,6 +154,34 @@ def build_posts():
     add(f'[1/2] - "{obf}.part1.rar" yEnc (1/1)', yenc(f"{obf}.part1.rar", b"x" * 4000), size=2_000_000)
     add(f'[2/2] - "{obf}.par2" yEnc (1/1)',
         yenc(f"{obf}.par2", par2_filedesc("Hidden.Name.2022.2160p.UHD.BluRay.x265-HDR.mkv", 2_000_000)))
+
+    # a fully obfuscated upload: every file under its own random subject and poster, soo each is a release of its own.
+    # The PAR2 index and recovery volumes name it; the mkv itself has no name anywhere
+    rng = random.Random(7)
+    real = "Linked.Movie.2025.2160p.BluRay.x265-LINK"
+    part = 1_000_000
+    mkv = b"\x1a\x45\xdf\xa3" + bytes(rng.getrandbits(8) for _ in range(3 * part - 4))
+    packets = par2_set([(f"{real}.mkv", mkv)])
+
+    def random_name(n):
+        return "".join(rng.choice("abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ0123456789") for _ in range(n))
+
+    def random_poster():
+        return f"{random_name(9)} <{random_name(12)}@{random_name(8)}.example>"
+
+    hidden = random_name(24)
+    poster = random_poster()
+    for seg in (1, 2, 3):
+        add(f'"{hidden}" yEnc ({seg}/3)', yenc_part(hidden, mkv[(seg - 1) * part:seg * part], seg, 3, len(mkv)),
+            author=poster, size=1_032_000)
+    # three articles each, and over 1 MiB: smaller is never looked inside
+    for padding in (1_200_000, 2_400_000, 4_800_000):
+        name, author = random_name(20), random_poster()
+        volume = packets + b"\0" * padding
+        third = -(-len(volume) // 3)
+        for seg in (1, 2, 3):
+            add(f'"{name}" yEnc ({seg}/3)', yenc_part(name, volume[(seg - 1) * third:seg * third], seg, 3, len(volume)),
+                author=author, size=third + 600)
 
     # archives inside archives: RAR5 > 7z > zip > tar > mkv
     nest = "Nested.Movie.2021.1080p.BluRay.x264-NEST"
