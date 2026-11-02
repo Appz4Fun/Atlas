@@ -37,7 +37,7 @@ fn is_small_text(name: &str) -> bool {
 
 /// The file the probe's about: the one with the most parts, and of those, the first by name, soo a set of RAR
 /// volumes gives its first volume.
-fn main_file(files: &[FileInfo]) -> Option<&FileInfo> {
+pub(crate) fn main_file(files: &[FileInfo]) -> Option<&FileInfo> {
     let parts = |f: &FileInfo| f.expected.unwrap_or(f.parts_seen);
     let candidates: Vec<&FileInfo> =
         files.iter().filter(|f| !is_par2(&f.filename) && !is_small_text(&f.filename)).collect();

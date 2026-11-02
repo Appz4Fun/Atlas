@@ -62,10 +62,12 @@ pub fn get(path: &str, query: &str, cookies: Option<&str>, base: &str, api_key: 
         "/ui/duplicates" if signed_in => duplicates_page(&args),
         "/ui/details" if signed_in => details_panel(&args),
         "/ui/poster" if signed_in => poster(&args),
+        "/ui/meta" if signed_in => crate::web_meta::fragment(&args),
+        "/ui/row" if signed_in => crate::web_meta::row_panel(&args),
         "/ui/settings" if signed_in => html(200, settings_page(None)),
         "/ui/nzb" if signed_in && args.get("fill").is_some_and(|v| v == "1") => filled_nzb(&args),
         "/ui/nzb" if signed_in => get_nzb(&args),
-        "/ui/details" | "/ui/poster" => {
+        "/ui/details" | "/ui/poster" | "/ui/meta" | "/ui/row" => {
             ApiResponse { headers: vec![("HX-Redirect".into(), "/".into())], ..html(401, String::new()) }
         }
         "/ui/nzb" | "/ui/release" | "/ui/duplicates" | "/ui/settings" => redirect(Vec::new()),
@@ -134,7 +136,7 @@ fn asset(content_type: &'static str, body: &str) -> ApiResponse {
     }
 }
 
-fn html(status: u16, body: String) -> ApiResponse {
+pub(crate) fn html(status: u16, body: String) -> ApiResponse {
     ApiResponse {
         status,
         content_type: Some("text/html; charset=utf-8"),
@@ -169,11 +171,11 @@ fn same(a: &str, b: &str) -> bool {
 }
 
 /// `escape`, and safe inside a quoted attribute too
-fn attr(s: &str) -> String {
+pub(crate) fn attr(s: &str) -> String {
     escape(s).replace('"', "&quot;").replace('\'', "&#39;")
 }
 
-fn url_encode(s: &str) -> String {
+pub(crate) fn url_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
@@ -705,9 +707,9 @@ struct RowExtras {
 }
 
 /// Columns of the results table.
-const COLUMNS: usize = 6;
+pub(crate) const COLUMNS: usize = 6;
 
-fn tag(class: &str, text: &str) -> String {
+pub(crate) fn tag(class: &str, text: &str) -> String {
     format!(" <span class=\"tag {class}\">{}</span>", escape(text))
 }
 
@@ -797,6 +799,7 @@ fn row(
     if !r.complete {
         tags.push_str(&tag("tag-warn", "INCOMPLETE"));
     }
+    tags.push_str(&crate::web_meta::drawer_trigger(r.id));
     let meta = [category.as_str(), size.as_str(), posted.as_str()]
         .into_iter()
         .filter(|part| !part.is_empty())
@@ -813,12 +816,12 @@ fn row(
 }
 
 /// A link to search on a value, showing other words than the value.
-fn search_link_to(param: &str, value: &str, shown: &str) -> String {
+pub(crate) fn search_link_to(param: &str, value: &str, shown: &str) -> String {
     format!("<a href=\"/?{param}={}\">{}</a>", attr(&url_encode(value)), escape(shown))
 }
 
 /// 2684354560 as 2,684,354,560
-fn thousands(n: i64) -> String {
+pub(crate) fn thousands(n: i64) -> String {
     let digits = n.unsigned_abs().to_string();
     let mut out = String::new();
     for (i, c) in digits.chars().enumerate() {
@@ -1182,14 +1185,17 @@ fn release_html(
         )
     };
 
-    let probe = crate::db::open()
-        .ok()
-        .and_then(|conn| {
-            let found = crate::probe::read(&conn, r.id)?;
-            let matched = crate::probe::opensubtitles::read(&conn, r.id);
-            Some(probe_html(&found, matched.as_ref()))
-        })
-        .unwrap_or_default();
+    // the probe row is decoded once: the panels below read the same one
+    let conn = crate::db::open().ok();
+    let found = conn.as_ref().and_then(|c| crate::probe::read(c, r.id));
+    let probe = match (conn.as_ref(), found.as_ref()) {
+        (Some(c), Some(found)) => probe_html(found, crate::probe::opensubtitles::read(c, r.id).as_ref()),
+        _ => String::new(),
+    };
+    let meta = crate::web_meta::meta_html(
+        conn.as_ref(),
+        &crate::web_meta::MetaInputs { release: r, inner, names, contents, probe: found.as_ref() },
+    );
     let copies = crate::duplicates::copies(r.id).unwrap_or_default();
     let has_twin = crate::duplicates::can_fill(&copies);
     let fill = if has_twin && contents.articles_seen < contents.articles_expected {
@@ -1212,6 +1218,7 @@ fn release_html(
 <div id="title-details" hx-get="/ui/details?id={id}" hx-trigger="load" hx-swap="outerHTML"></div>
 <div class="panel"><dl class="facts">{facts}</dl></div>
 {copies}
+{meta}
 {probe}
 {files}
 </main></div>"#,
@@ -1246,7 +1253,7 @@ fn filled_nzb(args: &HashMap<String, String>) -> ApiResponse {
     }
 }
 
-fn verdict(ok: Option<bool>, good: &str, bad: &str) -> String {
+pub(crate) fn verdict(ok: Option<bool>, good: &str, bad: &str) -> String {
     match ok {
         Some(true) => tag("tag-ok", good),
         Some(false) => tag("tag-bad", bad),
@@ -1254,7 +1261,7 @@ fn verdict(ok: Option<bool>, good: &str, bad: &str) -> String {
     }
 }
 
-fn panel(title: &str, facts: &str) -> String {
+pub(crate) fn panel(title: &str, facts: &str) -> String {
     if facts.is_empty() {
         return String::new();
     }
@@ -2167,6 +2174,30 @@ mod tests {
         assert!(html.contains("TV/HD") && html.contains("2.0 KB"), "{html}");
         assert!(html.contains("PASSWORD?") && html.contains("INCOMPLETE"), "{html}");
         assert!(html.contains("/ui/nzb?id=7") && html.contains("/ui/release?id=7"), "{html}");
+    }
+
+    #[test]
+    fn a_row_carries_the_drawer_trigger() {
+        let release = ReleaseRow {
+            id: 7,
+            name: "Some.Show.S01E01-GRP".into(),
+            group_name: "alt.binaries.g".into(),
+            poster: None,
+            posted_date: Some("2026-10-03 17:41:49".into()),
+            size: Some(2048),
+            complete: false,
+            parts: None,
+        };
+        let html = row(&release, &HashMap::new(), &HashMap::new(), &HashMap::new(), &RowExtras::default());
+        assert_eq!(html.matches("class=\"icon-button drawer-toggle\"").count(), 1, "{html}");
+        // after the tags, before the row's second line
+        let toggle = html.find("drawer-toggle").unwrap();
+        assert!(
+            html.find("INCOMPLETE").unwrap() < toggle && toggle < html.find("<div class=\"row-meta\">").unwrap(),
+            "{html}"
+        );
+        assert!(html.contains("hx-get=\"/ui/row?id=7\"") && html.contains("hx-target=\"closest tr\""), "{html}");
+        assert!(html.contains("<td class=\"num col-size\" title=\"2,048 bytes\">2.0 KB</td>"), "{html}");
     }
 
     #[test]

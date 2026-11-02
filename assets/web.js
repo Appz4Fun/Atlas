@@ -76,3 +76,17 @@ document.addEventListener('htmx:afterSettle', () => {
   box.value = read.dataset.q;
   read.removeAttribute('data-q');
 });
+
+// A result's drawer: the first click loads it (htmx, once), later clicks fold and unfold it.
+document.addEventListener('click', (event) => {
+  const toggle = event.target.closest('.drawer-toggle');
+  if (!toggle) return;
+  const drawer = toggle.closest('tr')?.nextElementSibling;
+  if (!drawer || !drawer.classList.contains('drawer-row')) return;
+  drawer.hidden = !drawer.hidden;
+  toggle.setAttribute('aria-expanded', String(!drawer.hidden));
+});
+document.addEventListener('htmx:afterSwap', (event) => {
+  const toggle = event.detail.elt;
+  if (toggle?.classList?.contains('drawer-toggle')) toggle.setAttribute('aria-expanded', 'true');
+});
