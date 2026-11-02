@@ -71,7 +71,12 @@ enum View {
 #[derive(Clone, Copy, Debug)]
 enum Codec {
     Deflate,
-    Lzma { props: Props, size: Option<u64> },
+    /// gzip's members, headers and all
+    Gzip,
+    Lzma {
+        props: Props,
+        size: Option<u64>,
+    },
     Lzma2,
     Zstd,
 }
@@ -162,6 +167,7 @@ fn cap_name(name: &str) -> String {
 fn decode(codec: Codec, input: &[u8], limit: usize) -> (Vec<u8>, End) {
     match codec {
         Codec::Deflate => inflate(input, limit),
+        Codec::Gzip => gunzip(input, limit),
         Codec::Lzma { props, size } => lzma::lzma(input, props, size, limit),
         Codec::Lzma2 => lzma::lzma2(input, limit),
         Codec::Zstd => unzstd(input, limit),
@@ -189,9 +195,7 @@ fn open(data: &[u8]) -> Option<Opened> {
         let props = Props { lc: 3, lp: 0, pb: 2 };
         return Some(Opened { layer: l, view: View::Decode { from: 6, codec: Codec::Lzma { props, size: None } } });
     }
-    if data.starts_with(&[0x28, 0xb5, 0x2f, 0xfd])
-        || (data.get(1..4) == Some(&[0x2a, 0x4d, 0x18][..]) && data[0] & 0xf0 == 0x50)
-    {
+    if data.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) || zstd_skippable(data) {
         let mut l = layer("ZSTD");
         l.method = Some("zstd".into());
         return Some(Opened { layer: l, view: View::Decode { from: 0, codec: Codec::Zstd } });
@@ -334,6 +338,11 @@ fn seven_z(data: &[u8]) -> Opened {
     }
 }
 
+/// A zstd skippable frame, which a stream can open with before its real one.
+fn zstd_skippable(data: &[u8]) -> bool {
+    data.get(1..4) == Some(&[0x2a, 0x4d, 0x18][..]) && data[0] & 0xf0 == 0x50
+}
+
 /// Whether `data` starts the way something [`open`] reads does, without opening it.
 fn known_start(data: &[u8]) -> bool {
     const MAGIC: &[&[u8]] = &[
@@ -351,14 +360,31 @@ fn known_start(data: &[u8]) -> bool {
         b"\x89LZO\0\r\n\x1a\n",
     ];
     MAGIC.iter().any(|m| data.starts_with(m))
+        || zstd_skippable(data)
         || data.get(..512).is_some_and(tar_checksum_ok)
         || lzma_alone(data).is_some()
 }
 
-/// gzip's header, with the original file's name when it kept one, then raw deflate.
+/// gzip: a header, with the original file's name when it kept one, then raw deflate; and maybe more members after,
+/// each with its own header, whose output follows on.
 fn gzip(data: &[u8]) -> Opened {
     let mut layer = Layer { format: "GZIP".into(), method: Some("deflate".into()), ..Layer::default() };
-    let flags = data.get(3).copied().unwrap_or(0);
+    let Some((p, name)) = gzip_header(data) else {
+        return Opened { layer, view: View::Stop("no file starts in what was read") };
+    };
+    layer.name = name;
+    if p >= data.len() {
+        return Opened { layer, view: View::Stop("no file starts in what was read") };
+    }
+    Opened { layer, view: View::Decode { from: 0, codec: Codec::Gzip } }
+}
+
+/// Where a gzip member's deflate starts, and the name it kept.
+fn gzip_header(data: &[u8]) -> Option<(usize, Option<String>)> {
+    if !data.starts_with(&[0x1f, 0x8b, 8]) {
+        return None;
+    }
+    let flags = *data.get(3)?;
     let mut p = 10usize;
     if flags & 4 != 0 {
         let extra = data.get(p..p + 2).map_or(0, |b| usize::from(u16::from_le_bytes([b[0], b[1]])));
@@ -368,21 +394,40 @@ fn gzip(data: &[u8]) -> Opened {
         let rest = data.get(*p..)?;
         let n = rest.iter().position(|b| *b == 0)?;
         *p += n + 1;
-        Some(String::from_utf8_lossy(&rest[..n]).into_owned())
+        Some(String::from_utf8_lossy(&rest[..n.min(crate::archive::MAX_NAME_BYTES)]).into_owned())
     };
+    let mut name = None;
     if flags & 8 != 0 {
-        layer.name = cstr(&mut p);
+        name = Some(cstr(&mut p)?);
     }
     if flags & 16 != 0 {
-        let _comment = cstr(&mut p);
+        cstr(&mut p)?;
     }
     if flags & 2 != 0 {
         p += 2;
     }
-    if p >= data.len() {
-        return Opened { layer, view: View::Stop("no file starts in what was read") };
+    Some((p, name))
+}
+
+/// Every gzip member in turn, from the front, to `limit` bytes.
+fn gunzip(input: &[u8], limit: usize) -> (Vec<u8>, End) {
+    let mut out = Vec::new();
+    let mut at = 0usize;
+    loop {
+        let Some((p, _)) = gzip_header(&input[at..]) else { return (out, End::Cut) };
+        let Some(member) = input.get(at + p..) else { return (out, End::Cut) };
+        let (more, end, used) = inflate_counted(member, limit - out.len());
+        out.extend_from_slice(&more);
+        match end {
+            End::Done => {}
+            e => return (out, e),
+        }
+        // past the deflate, the member's CRC and size
+        at += p + used + 8;
+        if !input.get(at..).is_some_and(|rest| rest.starts_with(&[0x1f, 0x8b, 8])) {
+            return (out, End::Done);
+        }
     }
-    Opened { layer, view: View::Decode { from: p, codec: Codec::Deflate } }
 }
 
 /// xz: its first block, when its one filter is LZMA2.
@@ -462,23 +507,32 @@ fn tar(data: &[u8]) -> Option<Opened> {
     }
     let mut at = 0usize;
     let mut long_name: Option<String> = None;
+    let mut long_size: Option<u64> = None;
     let mut best: Option<(u64, usize, String)> = None;
     for _ in 0..256 {
         let Some(h) = data.get(at..at + 512) else { break };
         if h.iter().all(|b| *b == 0) || !tar_checksum_ok(h) {
             break;
         }
-        let size = tar_size(&h[124..136])?;
+        let mut size = tar_size(&h[124..136])?;
         let kind = h[156];
         let body = at + 512;
+        let body_bytes = |n: u64| usize::try_from(n).ok().and_then(|n| data.get(body..body.checked_add(n)?));
         match kind {
-            b'L' => long_name = data.get(body..body + size as usize).map(cstr),
+            b'L' => {
+                long_name = body_bytes(size.min(crate::archive::MAX_NAME_BYTES as u64 + 1)).map(cstr);
+            }
             b'x' => {
-                if let Some(path) = data.get(body..body + size as usize).and_then(pax_path) {
-                    long_name = Some(path);
+                if let Some(records) = body_bytes(size) {
+                    let (path, pax_size) = pax(records);
+                    long_name = path.or(long_name);
+                    long_size = pax_size.or(long_size);
                 }
             }
             b'0' | 0 | b'7' => {
+                if let Some(s) = long_size.take() {
+                    size = s;
+                }
                 let name = long_name.take().unwrap_or_else(|| {
                     let prefix = if &h[257..262] == b"ustar" { cstr(&h[345..500]) } else { String::new() };
                     let name = cstr(&h[..100]);
@@ -488,7 +542,10 @@ fn tar(data: &[u8]) -> Option<Opened> {
                     best = Some((size, body, name));
                 }
             }
-            _ => long_name = None,
+            _ => {
+                long_name = None;
+                long_size = None;
+            }
         }
         let Some(next) = usize::try_from(size.div_ceil(512) * 512).ok().and_then(|s| body.checked_add(s)) else {
             break;
@@ -534,21 +591,44 @@ fn tar_size(field: &[u8]) -> Option<u64> {
     u64::from_str_radix(s, 8).ok()
 }
 
-/// `path=` from a pax header's `<len> key=value\n` records.
-fn pax_path(body: &[u8]) -> Option<String> {
-    let text = String::from_utf8_lossy(body);
-    text.lines().find_map(|line| line.split_once(' ').and_then(|(_, kv)| kv.strip_prefix("path=")).map(str::to_string))
+/// `path=` and `size=` from a pax header's `<len> key=value\n` records, the path cut to what a name needs before
+/// any of it is copied.
+fn pax(body: &[u8]) -> (Option<String>, Option<u64>) {
+    let (mut path, mut size) = (None, None);
+    let mut p = 0usize;
+    while p < body.len() {
+        let rest = &body[p..];
+        let Some(space) = rest.iter().take(20).position(|b| *b == b' ') else { break };
+        let Some(len) = std::str::from_utf8(&rest[..space]).ok().and_then(|n| n.parse::<usize>().ok()) else {
+            break;
+        };
+        let Some(record) = rest.get(space + 1..len).filter(|_| len > space + 1) else { break };
+        let record = record.strip_suffix(b"\n").unwrap_or(record);
+        if let Some(v) = record.strip_prefix(b"path=") {
+            path = Some(String::from_utf8_lossy(&v[..v.len().min(crate::archive::MAX_NAME_BYTES)]).into_owned());
+        } else if let Some(v) = record.strip_prefix(b"size=") {
+            size = std::str::from_utf8(v).ok().and_then(|v| v.parse().ok());
+        }
+        p += len;
+    }
+    (path, size)
 }
 
 /// Raw deflate, from the front, to `limit` bytes.
 fn inflate(input: &[u8], limit: usize) -> (Vec<u8>, End) {
+    let (out, end, _) = inflate_counted(input, limit);
+    (out, end)
+}
+
+/// Raw deflate, and how much of the input it took.
+fn inflate_counted(input: &[u8], limit: usize) -> (Vec<u8>, End, usize) {
     let mut d = flate2::Decompress::new(false);
     let mut out = Vec::new();
     let mut window = Vec::with_capacity(1 << 16);
     loop {
         if out.len() >= limit {
             out.truncate(limit);
-            return (out, End::Limit);
+            return (out, End::Limit, d.total_in() as usize);
         }
         window.clear();
         let before = d.total_in();
@@ -556,11 +636,11 @@ fn inflate(input: &[u8], limit: usize) -> (Vec<u8>, End) {
         let status = d.decompress_vec(rest, &mut window, flate2::FlushDecompress::None);
         out.extend_from_slice(&window);
         match status {
-            Ok(flate2::Status::StreamEnd) if out.len() <= limit => return (out, End::Done),
+            Ok(flate2::Status::StreamEnd) if out.len() <= limit => return (out, End::Done, d.total_in() as usize),
             Ok(flate2::Status::StreamEnd) => {}
-            Ok(_) if d.total_in() == before && window.is_empty() => return (out, End::Cut),
+            Ok(_) if d.total_in() == before && window.is_empty() => return (out, End::Cut, d.total_in() as usize),
             Ok(_) => {}
-            Err(_) => return (out, End::Cut),
+            Err(_) => return (out, End::Cut, d.total_in() as usize),
         }
     }
 }

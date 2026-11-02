@@ -358,13 +358,84 @@ fn a_rar5_name_stays_inside_its_header() {
 
 #[test]
 fn a_7z_copy_of_a_lzma_stream_goes_on_down() {
-    let inner = lzma_alone_of(&video());
+    let z = seven_z_copy(&lzma_alone_of(&video()));
+    let n = unwrap(&z);
+    assert_eq!(formats(&n), ["7z copy", "LZMA lzma"]);
+    same(&n.inner, &video());
+}
+
+fn seven_z_copy(inner: &[u8]) -> Vec<u8> {
     let mut z = b"7z\xbc\xaf\x27\x1c\x00\x04".to_vec();
     z.extend([0; 4]);
     z.extend((inner.len() as u64).to_le_bytes());
     z.extend([0; 12]);
     z.extend(inner);
+    z
+}
+
+#[test]
+fn a_7z_copy_of_a_zstd_stream_with_a_skippable_frame_goes_on_down() {
+    let mut zst = vec![0x50, 0x2a, 0x4d, 0x18, 4, 0, 0, 0, 1, 2, 3, 4];
+    zst.extend(zstd::encode_all(&video()[..], 3).unwrap());
+    let z = seven_z_copy(&zst);
     let n = unwrap(&z);
-    assert_eq!(formats(&n), ["7z copy", "LZMA lzma"]);
+    assert_eq!(formats(&n), ["7z copy", "ZSTD zstd"]);
     same(&n.inner, &video());
+}
+
+#[test]
+fn every_gzip_member_follows_on() {
+    let t = tar_of("movie.mkv", &video());
+    let gz = [gzip_of("movie.tar", &t[..512]), gzip_of("", &t[512..])].concat();
+    let n = unwrap(&gz);
+    assert_eq!(formats(&n), ["GZIP deflate", "TAR store"]);
+    same(&n.inner, &video());
+}
+
+/// A tar header of `kind` for `size` bytes.
+fn tar_header(name: &str, size: usize, kind: u8) -> Vec<u8> {
+    let mut h = tar_of(name, &[]);
+    h.truncate(512);
+    h[124..135].copy_from_slice(format!("{size:011o}").as_bytes());
+    h[156] = kind;
+    h[148..156].copy_from_slice(b"        ");
+    let sum: u32 = h.iter().map(|b| u32::from(*b)).sum();
+    h[148..155].copy_from_slice(format!("{sum:06o}\0").as_bytes());
+    h
+}
+
+fn pax_record(kv: &[u8]) -> Vec<u8> {
+    // the length counts itself
+    let mut len = kv.len() + 3;
+    while format!("{len} ").len() + kv.len() + 1 != len {
+        len = format!("{len} ").len() + kv.len() + 1;
+    }
+    [format!("{len} ").as_bytes(), kv, b"\n"].concat()
+}
+
+#[test]
+fn a_pax_size_stands_for_the_next_file() {
+    let v = video();
+    let mut records = pax_record(format!("size={}", v.len()).as_bytes());
+    records.extend(pax_record(b"path=a/very/long/movie.mkv"));
+    let mut t = tar_header("pax", records.len(), b'x');
+    t.extend(&records);
+    t.resize(t.len().div_ceil(512) * 512, 0);
+    // what a tar of a file past 8 GiB writes: no size in the header itself
+    t.extend(tar_header("movie.mkv", 0, b'0'));
+    t.extend(&v);
+    let n = unwrap(&t);
+    assert_eq!(formats(&n), ["TAR store"]);
+    assert_eq!(n.layers[0].name.as_deref(), Some("a/very/long/movie.mkv"));
+    assert_eq!(n.layers[0].unpacked, Some(v.len() as u64));
+    same(&n.inner, &v);
+    // a huge path is cut before it's copied
+    let records = pax_record(&[b"path=".as_slice(), &[0xff; 100_000]].concat());
+    let mut t = tar_header("pax", records.len(), b'x');
+    t.extend(&records);
+    t.resize(t.len().div_ceil(512) * 512, 0);
+    t.extend(tar_header("movie.mkv", v.len(), b'0'));
+    t.extend(&v);
+    let n = unwrap(&t);
+    assert!(n.layers[0].name.as_ref().unwrap().len() <= 512 * 3);
 }
