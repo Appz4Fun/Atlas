@@ -2,18 +2,22 @@
 
 use std::collections::HashMap;
 use std::io::Read;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Once};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use tiny_http::{Header, Request, Response, Server};
 
 use crate::config::{Config, get_api_key};
 use crate::dates::pub_date;
+use crate::db;
 use crate::nzb::{build_nzb, build_nzb_file, nzb_filename};
 use crate::search::{all_releases, get_release, newest_in_categories, search_all_releases, search_in_categories};
 use crate::ui;
 
 const WORKERS: usize = 4;
+/// Reads several GB when little is cached, which on a machine short of memory is every pass, soo not often.
+const WARM_EVERY: Duration = Duration::from_secs(3600);
 
 const CAPS: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <caps>
@@ -516,7 +520,25 @@ pub fn start(config: &mut Config) -> bool {
         .collect();
 
     *RUNNING.lock().unwrap() = Some(Running { server, workers });
+    start_warming();
     true
+}
+
+/// One thread however often the api restarts, idle while it's stopped.
+fn start_warming() {
+    static WARMING: Once = Once::new();
+    WARMING.call_once(|| {
+        thread::spawn(|| {
+            loop {
+                if RUNNING.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+                    && let Err(e) = db::open().and_then(|conn| db::warm_search_tables(&conn))
+                {
+                    eprintln!("warming the search tables failed: {e}");
+                }
+                thread::sleep(WARM_EVERY);
+            }
+        });
+    });
 }
 
 pub fn stop() {

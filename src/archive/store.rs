@@ -144,7 +144,7 @@ pub fn passwords_with(conn: &Connection, ids: &[i64]) -> HashMap<i64, Password> 
 }
 
 pub fn passwords(ids: &[i64]) -> HashMap<i64, Password> {
-    db::open().map(|conn| passwords_with(&conn, ids)).unwrap_or_default()
+    db::with_reader(|conn| Ok(passwords_with(conn, ids))).unwrap_or_default()
 }
 
 /// What the release view shows.

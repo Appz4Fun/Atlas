@@ -5,8 +5,9 @@
 
 use std::collections::BTreeSet;
 use std::fs;
-use std::path::Path;
-use std::time::Duration;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, Once};
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -21,6 +22,112 @@ pub type Result<T> = rusqlite::Result<T>;
 /// The main database with every shard attached (s0 .. s7), for reads across them.
 pub fn open() -> Result<Connection> {
     open_with_shards(&paths::database())
+}
+
+/// Read connections kept open between api requests, for their page caches. Idle ones hold no read
+/// transaction, but they do hold their files, soo one is dropped once a shard's file is replaced (a
+/// compaction, a conversion) rather than left reading the old one and keeping its space from being freed.
+struct Reader {
+    main: PathBuf,
+    files: Vec<Option<(u64, u64)>>,
+    conn: Connection,
+    last_used: Instant,
+}
+
+static READERS: Mutex<Vec<Reader>> = Mutex::new(Vec::new());
+static READER_SWEEP: Once = Once::new();
+
+/// one per api worker
+const MAX_READERS: usize = 4;
+const READER_IDLE: Duration = Duration::from_secs(600);
+const READER_SWEEP_EVERY: Duration = Duration::from_secs(30);
+/// per shard, against the default 2MB: a filtered search walks one shard's category table and index in order
+const READER_CACHE_KIB: i64 = 16 * 1024;
+
+/// What identifies the main database and each shard's file right now. None where that can't be told, and
+/// where an open file can't be renamed (Windows): no connection is kept there.
+#[cfg(unix)]
+fn file_ids(main: &Path) -> Option<Vec<Option<(u64, u64)>>> {
+    use std::os::unix::fs::MetadataExt;
+    let id = |path: &Path| std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()));
+    Some(std::iter::once(id(main)).chain(store::shard_paths(main).iter().map(|p| id(p))).collect())
+}
+
+#[cfg(not(unix))]
+fn file_ids(_main: &Path) -> Option<Vec<Option<(u64, u64)>>> {
+    None
+}
+
+fn open_reader(main: &Path) -> Result<Connection> {
+    let conn = open_with_shards(main)?;
+    for (i, path) in store::shard_paths(main).iter().enumerate() {
+        if path.exists() {
+            conn.execute_batch(&format!("pragma s{i}.cache_size = -{READER_CACHE_KIB}"))?;
+        }
+    }
+    Ok(conn)
+}
+
+fn sweep_readers() {
+    let now = Instant::now();
+    let mut readers = READERS.lock().unwrap_or_else(|e| e.into_inner());
+    let (keep, drop_them): (Vec<_>, Vec<_>) = readers
+        .drain(..)
+        .partition(|r| now.duration_since(r.last_used) < READER_IDLE && file_ids(&r.main).as_ref() == Some(&r.files));
+    *readers = keep;
+    drop(readers);
+    drop(drop_them);
+}
+
+/// `f` on a read connection to the main database and its shards: a kept one when its files are still the
+/// ones in place, otherwise a new one. For reads only.
+pub fn with_reader<T>(f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+    with_reader_at(&paths::database(), f)
+}
+
+fn with_reader_at<T>(main: &Path, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+    let Some(files) = file_ids(main) else {
+        return f(&open_with_shards(main)?);
+    };
+    READER_SWEEP.call_once(|| {
+        std::thread::spawn(|| {
+            loop {
+                std::thread::sleep(READER_SWEEP_EVERY);
+                sweep_readers();
+            }
+        });
+    });
+    let kept = {
+        let mut readers = READERS.lock().unwrap_or_else(|e| e.into_inner());
+        readers.iter().position(|r| r.main == main && r.files == files).map(|i| readers.swap_remove(i))
+    };
+    let conn = match kept {
+        Some(reader) => reader.conn,
+        None => open_reader(main)?,
+    };
+    let out = f(&conn);
+    let mut readers = READERS.lock().unwrap_or_else(|e| e.into_inner());
+    if readers.len() < MAX_READERS {
+        readers.push(Reader { main: main.to_path_buf(), files, conn, last_used: Instant::now() });
+    }
+    out
+}
+
+/// Reads what a search reads from every shard into the OS's cache, one table at a time soo no read
+/// transaction lasts long. `count(*)` walks every leaf of the table or index it's told to use.
+pub fn warm_search_tables(conn: &Connection) -> Result<()> {
+    for i in 0..store::SHARDS {
+        for from in [
+            "release_category not indexed",
+            "release_category indexed by category_release",
+            "releases_fts_data",
+            "releases_fts_idx",
+            "releases_fts_docsize",
+        ] {
+            conn.query_row(&format!("select count(*) from s{i}.{from}"), [], |_| Ok(()))?;
+        }
+    }
+    Ok(())
 }
 
 /// The main database at `path` with its shards attached, see `open`.
@@ -585,6 +692,59 @@ pub fn update_backfill_cursor(conn: &Connection, group: &str, article: i64) -> R
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    /// Marks the connection `f` gets: true when it's one that was marked before.
+    fn was_kept(main: &Path) -> bool {
+        with_reader_at(main, |conn| {
+            let kept = conn.prepare("select 1 from temp.kept").is_ok();
+            conn.execute_batch("create temp table if not exists kept(x)")?;
+            Ok(kept)
+        })
+        .unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_reader_is_kept_until_a_shard_file_is_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        create_db_at(&main).unwrap();
+        assert!(!was_kept(&main));
+        assert!(was_kept(&main));
+
+        let shard = &store::shard_paths(&main)[3];
+        let swapped = dir.path().join("swapped.db");
+        fs::copy(shard, &swapped).unwrap();
+        fs::rename(&swapped, shard).unwrap();
+        assert!(!was_kept(&main));
+
+        sweep_readers();
+        assert!(was_kept(&main), "the sweep leaves a reader whose files are in place");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_sweep_drops_a_reader_whose_file_was_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        create_db_at(&main).unwrap();
+        was_kept(&main);
+        let shard = &store::shard_paths(&main)[0];
+        let swapped = dir.path().join("swapped.db");
+        fs::copy(shard, &swapped).unwrap();
+        fs::rename(&swapped, shard).unwrap();
+        sweep_readers();
+        let held = READERS.lock().unwrap().iter().filter(|r| r.main == main).count();
+        assert_eq!(held, 0);
+    }
+
+    #[test]
+    fn warming_reads_every_shard_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        create_db_at(&main).unwrap();
+        warm_search_tables(&open_with_shards(&main).unwrap()).unwrap();
+    }
     #[test]
     fn group_dates_only_ever_widen() {
         let dir = tempfile::tempdir().unwrap();
