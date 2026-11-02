@@ -309,10 +309,13 @@ pub struct Bounds {
     pub fts: i64,
     /// newest releases per shard
     pub like: i64,
+    /// matches of a word's exact form past which it's too common to rank
+    pub common: i64,
 }
 
 impl Bounds {
-    pub const DEFAULT: Bounds = Bounds { rejects: 2_000, no_row: 20_000, fts: 20_000, like: 100_000 };
+    pub const DEFAULT: Bounds =
+        Bounds { rejects: 2_000, no_row: 20_000, fts: 20_000, like: 100_000, common: COMMON_MATCHES };
 }
 
 pub const MAX_FILTER_OFFSET: i64 = 10_000;
@@ -441,6 +444,26 @@ fn ranked_ids_sql(f: &CatFilter) -> String {
     )
 }
 
+/// `ranked_ids_sql` for words too common to rank: newest first with no scores, and each shard stops at a page's worth.
+/// Parameters: ?1 the query, ?2 matches per shard, ?3 rows per shard.
+fn newest_ids_sql(f: &CatFilter) -> String {
+    let join = if f.uncategorized { "left join" } else { "cross join" };
+    let clause = cat_clause(f);
+    format!(
+        "select id from ({}) order by id desc",
+        union(&shards(None), |i| format!(
+            "select * from (select releases_fts.rowid as id
+               from s{i}.releases_fts
+               {join} s{i}.release_category c on c.release_id = releases_fts.rowid
+              where releases_fts match ?1
+                and releases_fts.rowid >= (select min(rowid) from (select rowid from s{i}.releases_fts
+                                            where releases_fts match ?1 order by rowid desc limit ?2))
+                and {clause}
+              order by releases_fts.rowid desc limit ?3)"
+        ))
+    )
+}
+
 /// Reads `releases` only for ids that get as far as the page, skipping the ones a client may not see.
 fn page_of_ids(conn: &Connection, sql: &str, vals: &[Value], offset: i64, limit: i64) -> Result<Vec<ReleaseRow>> {
     let mut probes = (0..store::SHARDS).map(|s| conn.prepare(&probe_sql(s))).collect::<Result<Vec<_>>>()?;
@@ -477,6 +500,13 @@ pub fn search_in_categories_with(
 ) -> Result<Vec<ReleaseRow>> {
     if offset > MAX_FILTER_OFFSET || (f.leaves.is_empty() && !f.uncategorized) {
         return Ok(Vec::new());
+    }
+    if let Some(exact) = common_exact(conn, query, &shards(None), bounds.common) {
+        let per_shard = offset + limit + bounds.rejects as i64;
+        let vals = [text(exact), Value::Integer(bounds.fts), Value::Integer(per_shard)];
+        if let Ok(rows) = page_of_ids(conn, &newest_ids_sql(f), &vals, offset, limit) {
+            return Ok(rows);
+        }
     }
     let clause = cat_clause(f);
     let like = format!(
@@ -871,6 +901,38 @@ mod tests {
             search_in_categories_with(&conn, "Findme", &parse_filter("5040").unwrap(), 0, 3, &Bounds::DEFAULT).unwrap();
         let want: Vec<i64> = added.iter().rev().take(3).copied().collect();
         assert_eq!(got.iter().map(|r| r.id).collect::<Vec<_>>(), want);
+    }
+
+    #[test]
+    fn a_common_word_in_a_category_comes_back_newest_first() {
+        let f = cats_fixture();
+        let groups = groups_in_shards(4);
+        let mut tv = Vec::new();
+        for i in 0..6 {
+            tv.push(f.add(&format!("Common.Word.{i}"), &groups[i % 4], Some(5040)));
+            f.add(&format!("Common.Book.{i}"), &groups[i % 4], Some(7020));
+        }
+        f.add("Commonly.Tv", &groups[0], Some(5040));
+        let hidden = crate::parser::Release { is_obfuscated: true, ..cat_release("Common.Hidden", &groups[1]) };
+        store::save(&f.main, &[hidden]).unwrap();
+        let no_row = f.add("Common.None", &groups[2], None);
+        let conn = f.conn();
+        let common = Bounds { common: 2, ..Bounds::DEFAULT };
+        let ids = |cat: &str, offset, limit| -> Vec<i64> {
+            search_in_categories_with(&conn, "common", &parse_filter(cat).unwrap(), offset, limit, &common)
+                .unwrap()
+                .iter()
+                .map(|r| r.id)
+                .collect()
+        };
+        let newest: Vec<i64> = tv.iter().rev().copied().collect();
+        assert_eq!(ids("5040", 0, 4), newest[..4], "newest first, the word as written");
+        assert_eq!(ids("5040", 4, 4), newest[4..], "and its next page");
+        assert_eq!(ids("8000", 0, 10), [no_row], "no row, and not the hidden one");
+        // few enough to rank: a word's start finds longer ones
+        let ranked =
+            search_in_categories_with(&conn, "common", &parse_filter("5040").unwrap(), 0, 10, &Bounds::DEFAULT);
+        assert_eq!(ranked.unwrap().len(), 7);
     }
 
     #[test]
