@@ -1,7 +1,7 @@
 //! Inner file names from RAR4 and RAR5 headers, in one article's bytes.
 #![cfg_attr(not(test), deny(clippy::indexing_slicing, clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
-use super::{Encryption, Listing, MAX_NAME_BYTES, crc32};
+use super::{Encryption, Listing, MAX_NAME_BYTES, PasswordTest, crc32};
 
 const MAX_BLOCKS: usize = 65_536;
 const MARK4: &[u8] = b"Rar!\x1a\x07\x00";
@@ -252,7 +252,7 @@ fn block5(l: &mut Listing, inner: &[u8]) -> Option<u64> {
             l.encryption = Some(Encryption::Rar5Aes256);
             l.headers_encrypted = true;
             // the header's own: version, flags, kdf, salt, check
-            l.password_check = password_check(inner.get(p..end)?, false).or(l.password_check);
+            l.password_check = password_check(inner.get(p..end)?, false).map(PasswordTest::Rar5).or(l.password_check);
         }
         5 => l.complete = true,
         2 | 3 => {
@@ -277,7 +277,8 @@ fn block5(l: &mut Listing, inner: &[u8]) -> Option<u64> {
                 if encrypted_record(inner.get(end..)?) {
                     l.encrypted = true;
                     l.encryption = Some(Encryption::Rar5Aes256);
-                    l.password_check = l.password_check.or_else(|| record_check(inner.get(end..)?));
+                    l.password_check =
+                        l.password_check.or_else(|| record_check(inner.get(end..)?).map(PasswordTest::Rar5));
                 }
                 if file_flags & 1 == 0 {
                     let size = (file_flags & 8 == 0).then_some(unpacked);

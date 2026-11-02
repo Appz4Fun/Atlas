@@ -63,6 +63,16 @@ fn every_field_finds_its_releases_and_counts_them() {
         let part = Fields { team: "BB".into(), ..Fields::default() };
         assert!(names(&part, "").is_empty(), "the whole group, not the start of one");
 
+        // each counted once, whichever spellings it matches
+        let group = Fields { group: a.clone(), ..Fields::default() };
+        let any = |words: &[&str]| {
+            let choices: Vec<String> = words.iter().map(|w| w.to_string()).collect();
+            atlas::field_search::count_any(&group, &choices, None).unwrap().count
+        };
+        assert_eq!(any(&["One", "Three"]), 2);
+        assert_eq!(any(&["One", "Film.One"]), 1);
+        assert_eq!(any(&["Nothing"]), 0);
+
         let size = find(&group, "", None, 0, 1).unwrap()[0].size.unwrap();
         let bytes = Fields { size: size.to_string(), ..Fields::default() };
         assert_eq!(names(&bytes, "").len(), 4);

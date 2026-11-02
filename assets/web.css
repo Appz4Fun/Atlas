@@ -159,6 +159,7 @@ input::placeholder { color: var(--muted); }
 .quiet:hover { color: var(--rust); text-decoration: underline; }
 .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; }
 .chip { padding: 3px 10px; font: 600 .74rem/1.5 var(--font-mono); color: var(--muted); text-decoration: none; background: var(--surface); border: 1px solid var(--line-strong); border-radius: 999px; }
+.chips .sort-link { align-self: center; margin-left: 6px; font: 600 .74rem/1.5 var(--font-mono); }
 .chip:hover { color: var(--ink); border-color: var(--ink); }
 .chip[aria-current] { color: var(--rust); background: var(--rust-soft); border-color: transparent; }
 
@@ -208,6 +209,7 @@ td.dim { color: var(--muted); font-size: .82rem; }
 .title-details h2 { margin-top: 0; }
 .poster { flex: none; width: 171px; height: 256px; object-fit: cover; background: var(--sunken); border-radius: var(--radius-sm); }
 .poster:not([src]) { display: none; }
+.backdrop { display: block; width: 100%; max-height: 240px; margin-bottom: 14px; object-fit: cover; background: var(--sunken); border-radius: var(--radius); }
 
 .copies { display: flex; flex-direction: column; gap: 10px; }
 .copy { display: flex; gap: 16px; padding: 14px 16px; }

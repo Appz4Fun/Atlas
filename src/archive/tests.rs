@@ -202,7 +202,7 @@ mod rar_tests {
             let check = l.password_check.expect("a check value");
             assert_eq!(check.accepts("password"), Some(true));
             assert_eq!(check.accepts("wrong"), Some(false));
-            assert_eq!(rar::PasswordCheck::from_bytes(&check.to_bytes()), Some(check));
+            assert_eq!(PasswordTest::from_bytes(&check.to_bytes()), Some(check));
         }
         let many = rar::PasswordCheck { kdf: 30, salt: [0; 16], check: [0; 8] };
         assert_eq!(many.accepts("x"), None, "too slow to try");

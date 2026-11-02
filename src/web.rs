@@ -203,15 +203,17 @@ enum SortBy {
     Size,
     Posted,
     Group,
+    Rating,
 }
 
 impl SortBy {
-    const ALL: [(SortBy, &'static str); 5] = [
+    const ALL: [(SortBy, &'static str); 6] = [
         (SortBy::Name, "name"),
         (SortBy::Category, "category"),
         (SortBy::Size, "size"),
         (SortBy::Posted, "posted"),
         (SortBy::Group, "group"),
+        (SortBy::Rating, "rating"),
     ];
 
     fn word(self) -> &'static str {
@@ -224,7 +226,13 @@ impl SortBy {
 }
 
 /// Puts results in order, with those that have no value for the column last either way.
-fn sort_rows(rows: &mut [ReleaseRow], by: SortBy, descending: bool, categories: &HashMap<i64, i64>) {
+fn sort_rows(
+    rows: &mut [ReleaseRow],
+    by: SortBy,
+    descending: bool,
+    categories: &HashMap<i64, i64>,
+    scores: &HashMap<i64, i64>,
+) {
     let flip = |o: std::cmp::Ordering| if descending { o.reverse() } else { o };
     rows.sort_by(|a, b| match by {
         SortBy::Name => flip(a.name.to_lowercase().cmp(&b.name.to_lowercase())),
@@ -247,6 +255,12 @@ fn sort_rows(rows: &mut [ReleaseRow], by: SortBy, descending: bool, categories: 
             }
         }
         SortBy::Group => flip(a.group_name.cmp(&b.group_name)),
+        SortBy::Rating => match (scores.get(&a.id), scores.get(&b.id)) {
+            (Some(x), Some(y)) => flip(x.cmp(y)),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        },
     });
 }
 
@@ -256,6 +270,38 @@ const MAX_EARLIER_FOR_COPIES: i64 = 2_000;
 /// The quick filters over results. Each is also searched for, except the last.
 const FILTERS: &[&str] = &["2160p", "1080p", "DV", "HDR", "Remux", "WEB-DL", "BluRay", HIDE_COPIES];
 const HIDE_COPIES: &str = "Hide copies";
+
+/// The first of each list, then the second of each, and soo on, each row once.
+fn take_in_turn(lists: &[Vec<ReleaseRow>]) -> Vec<ReleaseRow> {
+    let longest = lists.iter().map(Vec::len).max().unwrap_or(0);
+    let mut seen = std::collections::HashSet::new();
+    let mut rows = Vec::new();
+    for at in 0..longest {
+        for row in lists.iter().filter_map(|list| list.get(at)) {
+            if seen.insert(row.id) {
+                rows.push(row.clone());
+            }
+        }
+    }
+    rows
+}
+
+/// How many searches a set of filters can turn into.
+const MAX_WORD_CHOICES: usize = 12;
+
+/// How names write what a filter asks. The search goes by word prefix, soo `HDR` covers `HDR10`.
+fn filter_spellings(filter: &str) -> &'static [&'static str] {
+    match filter {
+        "2160p" => &["2160p", "4k", "UHD"],
+        "1080p" => &["1080p"],
+        "DV" => &["DV", "DoVi", "DolbyVision", "Dolby.Vision"],
+        "HDR" => &["HDR"],
+        "Remux" => &["Remux"],
+        "WEB-DL" => &["WEB-DL", "WEBDL", "WEB"],
+        "BluRay" => &["BluRay", "Blu-Ray", "BDRip", "BRRip"],
+        _ => &[],
+    }
+}
 
 /// Whether a name's tags say what a filter asks. The search itself goes by word prefix, soo "DV" finds DVDRip too.
 fn filter_matches(filter: &str, tags: &release_tags::Tags) -> bool {
@@ -332,7 +378,11 @@ impl Search {
             filters: self.filters.clone(),
             fields: self.fields.clone(),
             sort: Some(by),
-            descending: if current { !descending } else { matches!(by, SortBy::Size | SortBy::Posted) },
+            descending: if current {
+                !descending
+            } else {
+                matches!(by, SortBy::Size | SortBy::Posted | SortBy::Rating)
+            },
         };
         let query = attr(&flipped.query(&self.cat, 0));
         let arrow = match (current, descending) {
@@ -354,14 +404,43 @@ impl Search {
         self.query_with(cat, offset, &self.filters)
     }
 
-    /// The words to look for: the box, and what the filters add to it.
-    fn words(&self) -> String {
-        let mut words = self.q.clone();
+    /// Each way of writing what the filters ask for, as words to search. `filter_matches` checks what comes back.
+    fn word_choices(&self) -> Vec<String> {
+        let mut choices = vec![self.q.clone()];
         for filter in self.filters.iter().filter(|f| **f != HIDE_COPIES) {
-            words.push(' ');
-            words.push_str(filter);
+            let written = filter_spellings(filter);
+            let next: Vec<String> = choices
+                .iter()
+                .flat_map(|words| written.iter().map(move |spelling| format!("{words} {spelling}")))
+                .take(MAX_WORD_CHOICES)
+                .collect();
+            choices = next;
         }
-        words.trim().to_string()
+        choices.iter().map(|words| words.trim().to_string()).collect()
+    }
+
+    /// Every spelling's results taken in turn, or the one search there is. Taking them in turn keeps a row's place as
+    /// more are asked for, soo "Load more" neither repeats nor skips any.
+    fn search(
+        &self,
+        filter: Option<&crate::category::CatFilter>,
+        from: i64,
+        count: i64,
+    ) -> Result<Vec<ReleaseRow>, String> {
+        let one = |words: &str, from: i64, count: i64| {
+            if self.fields.any() {
+                field_search::find(&self.fields, words, filter, from, count).map_err(|e| e.to_string())
+            } else {
+                find_releases(words, filter, from, count).map_err(|e| e.to_string())
+            }
+        };
+        let choices = self.word_choices();
+        if let [only] = choices.as_slice() {
+            return one(only, from, count);
+        }
+        let lists = choices.iter().map(|words| one(words, 0, from + count)).collect::<Result<Vec<_>, _>>()?;
+        let rows = take_in_turn(&lists);
+        Ok(rows.into_iter().skip(from as usize).take(count as usize).collect())
     }
 
     fn filter_links(&self) -> String {
@@ -383,6 +462,7 @@ impl Search {
                 escape(filter)
             );
         }
+        out.push_str(&self.sort_link(SortBy::Rating, "Best rated"));
         out.push_str("</div>");
         out
     }
@@ -391,11 +471,7 @@ impl Search {
     fn body(&self) -> String {
         let filter = parse_filter(&self.cat);
         let (from, count) = if self.sort.is_some() { (0, SORT_WINDOW) } else { (self.offset, PAGE_SIZE) };
-        let searched = if self.fields.any() {
-            field_search::find(&self.fields, &self.words(), filter.as_ref(), from, count)
-        } else {
-            find_releases(&self.words(), filter.as_ref(), from, count)
-        };
+        let searched = self.search(filter.as_ref(), from, count);
         let found = match searched {
             Ok(found) => found,
             Err(e) => {
@@ -421,7 +497,17 @@ impl Search {
         let page_was_full = if let Some(sort) = self.sort {
             let ids: Vec<i64> = found.iter().map(|r| r.id).collect();
             let categories = crate::category::categories_of(&ids).unwrap_or_default();
-            sort_rows(&mut found, sort, self.descending, &categories);
+            // only the scores already kept: fetching them for a whole search would use up the providers' limits
+            let scores: HashMap<i64, i64> = if sort == SortBy::Rating {
+                let media = crate::media::query::attrs_of(&ids).unwrap_or_default();
+                crate::media::details::kept_for(media.iter().map(|(id, m)| (*id, m.kind, &m.ids)))
+                    .into_iter()
+                    .filter_map(|(id, d)| Some((id, score_value(&d)?)))
+                    .collect()
+            } else {
+                HashMap::new()
+            };
+            sort_rows(&mut found, sort, self.descending, &categories, &scores);
             let start = usize::try_from(self.offset).unwrap_or(0).min(found.len());
             let end = (start + PAGE_SIZE as usize).min(found.len());
             let more = end < found.len();
@@ -443,12 +529,7 @@ impl Search {
             if self.sort.is_none() && self.offset > 0 {
                 let earlier = self.offset.min(MAX_EARLIER_FOR_COPIES);
                 let start = self.offset - earlier;
-                before = if self.fields.any() {
-                    field_search::find(&self.fields, &self.words(), filter.as_ref(), start, earlier)
-                } else {
-                    find_releases(&self.words(), filter.as_ref(), start, earlier)
-                }
-                .unwrap_or_default();
+                before = self.search(filter.as_ref(), start, earlier).unwrap_or_default();
             }
             let shown = before.iter().filter(|r| {
                 let tags = release_tags::parse(&r.name);
@@ -546,7 +627,7 @@ impl Search {
         }
         let total = if self.fields.any() {
             let filter = parse_filter(&self.cat);
-            match field_search::count(&self.fields, &self.words(), filter.as_ref()) {
+            match field_search::count_any(&self.fields, &self.word_choices(), filter.as_ref()) {
                 Ok(total) => format!("<strong class=\"total\">{}</strong>", escape(&total.describe())),
                 Err(e) => {
                     eprintln!("web count failed: {e}");
@@ -584,6 +665,11 @@ fn password_tag(password: Option<&Password>) -> String {
         Some(Password::Maybe) => tag("tag-warn", "PASSWORD?"),
         _ => String::new(),
     }
+}
+
+/// The score to sort by, out of 100, the same one a result shows.
+fn score_value(d: &crate::media::details::Details) -> Option<i64> {
+    d.imdb_score.or(d.tmdb_score).or(d.trakt_score)
 }
 
 /// The one score a result has room for.
@@ -1518,8 +1604,16 @@ fn details_html(d: &crate::media::details::Details) -> String {
     } else {
         String::new()
     };
+    let backdrop = if d.backdrop.is_some() {
+        format!(
+            "<img class=\"backdrop\" src=\"/ui/poster?kind={}&amp;tmdb={}&amp;art=backdrop\" alt=\"\" loading=\"lazy\">",
+            d.kind, d.tmdb_id
+        )
+    } else {
+        String::new()
+    };
     format!(
-        "<section class=\"panel title-details\">{poster}<div><h2>{}</h2><p>{scores}</p><p>{}</p><dl class=\"facts\">{lines}</dl></div></section>",
+        "{backdrop}<section class=\"panel title-details\">{poster}<div><h2>{}</h2><p>{scores}</p><p>{}</p><dl class=\"facts\">{lines}</dl></div></section>",
         escape(d.title.as_deref().unwrap_or_default()),
         escape(d.overview.as_deref().unwrap_or_default()),
     )
@@ -1527,8 +1621,13 @@ fn details_html(d: &crate::media::details::Details) -> String {
 
 fn poster(args: &HashMap<String, String>) -> ApiResponse {
     let number = |key: &str| args.get(key).and_then(|v| v.trim().parse::<i64>().ok()).unwrap_or(0);
-    let Some(bytes) = crate::media::details::poster(number("kind"), number("tmdb"), &crate::config::media_config())
-    else {
+    let cfg = crate::config::media_config();
+    let found = if args.get("art").is_some_and(|art| art == "backdrop") {
+        crate::media::details::backdrop(number("kind"), number("tmdb"), &cfg)
+    } else {
+        crate::media::details::poster(number("kind"), number("tmdb"), &cfg)
+    };
+    let Some(bytes) = found else {
         return ApiResponse::not_found();
     };
     ApiResponse {
@@ -1545,6 +1644,7 @@ fn poster(args: &HashMap<String, String>) -> ApiResponse {
 
 fn password_fact(inner: &crate::archive::store::InnerView, hint: &release_info::PasswordHint) -> String {
     let verdict = match inner.password_check.and_then(|check| check.accepts(&hint.password)) {
+        Some(true) if inner.password_check.is_some_and(|check| !check.certain()) => tag("tag-ok", "PROBABLY WORKS"),
         Some(true) => tag("tag-ok", "WORKS"),
         Some(false) => tag("tag-bad", "WRONG"),
         None => ", not tried".to_string(),
@@ -1877,6 +1977,9 @@ mod tests {
         assert!(html.contains("IMDB 87") && !html.contains("Metacritic"), "{html}");
         assert!(html.contains("<dt>Blu-ray</dt><dd>1999-09-21</dd>"), "{html}");
         assert!(html.contains("/ui/poster?kind=2&amp;tmdb=603"), "{html}");
+        assert!(!html.contains("art=backdrop"), "{html}");
+        let wide = details_html(&crate::media::details::Details { backdrop: Some("/b.jpg".into()), ..d.clone() });
+        assert!(wide.contains("art=backdrop"), "{wide}");
     }
 
     #[test]
@@ -1912,7 +2015,7 @@ mod tests {
     fn every_column_sorts_both_ways() {
         let order = |by, descending| {
             let mut rows = vec![release(1, "b", Some(5)), release(2, "A", None), release(3, "c", Some(9))];
-            sort_rows(&mut rows, by, descending, &HashMap::new());
+            sort_rows(&mut rows, by, descending, &HashMap::new(), &HashMap::new());
             rows.iter().map(|r| r.id).collect::<Vec<_>>()
         };
         assert_eq!(order(SortBy::Name, false), [2, 1, 3]);
@@ -1920,6 +2023,39 @@ mod tests {
         assert_eq!(order(SortBy::Size, false), [1, 3, 2], "no size goes last");
         assert_eq!(order(SortBy::Size, true), [3, 1, 2], "either way");
         assert_eq!(order(SortBy::Group, true), [3, 2, 1]);
+    }
+
+    #[test]
+    fn a_filter_searches_each_way_it_is_written() {
+        let mut args = HashMap::new();
+        args.insert("q".to_string(), "film".to_string());
+        args.insert("filters".to_string(), "2160p,DV".to_string());
+        let choices = Search::from_args(&args).word_choices();
+        assert!(choices.contains(&"film 4k DoVi".to_string()), "{choices:?}");
+        assert!(choices.len() <= MAX_WORD_CHOICES);
+        args.remove("filters");
+        assert_eq!(Search::from_args(&args).word_choices(), ["film"]);
+    }
+
+    #[test]
+    fn asking_for_more_keeps_each_row_in_its_place() {
+        let rows = |ids: &[i64]| ids.iter().map(|id| ReleaseRow { id: *id, ..Default::default() }).collect::<Vec<_>>();
+        let ids = |rows: Vec<ReleaseRow>| rows.iter().map(|r| r.id).collect::<Vec<_>>();
+        let short = take_in_turn(&[rows(&[1, 2]), rows(&[9, 1])]);
+        let long = take_in_turn(&[rows(&[1, 2, 3, 4]), rows(&[9, 1, 8, 7])]);
+        assert_eq!(ids(short.clone()), [1, 9, 2]);
+        assert_eq!(ids(long)[..short.len()], ids(short));
+    }
+
+    #[test]
+    fn rated_rows_come_first_either_way() {
+        let row = |id| ReleaseRow { id, ..Default::default() };
+        let scores = HashMap::from([(1, 50), (2, 90)]);
+        let mut rows = [row(3), row(1), row(2)];
+        sort_rows(&mut rows, SortBy::Rating, true, &HashMap::new(), &scores);
+        assert_eq!(rows.iter().map(|r| r.id).collect::<Vec<_>>(), [2, 1, 3]);
+        sort_rows(&mut rows, SortBy::Rating, false, &HashMap::new(), &scores);
+        assert_eq!(rows.iter().map(|r| r.id).collect::<Vec<_>>(), [1, 2, 3]);
     }
 
     #[test]
@@ -1938,10 +2074,10 @@ mod tests {
     fn filters_come_from_the_list_and_stay_in_links() {
         let s = Search::from_args(&parse_query("q=x&filters=DV,<b>,Remux"));
         assert_eq!(s.filters, ["DV", "Remux"]);
-        assert_eq!(s.words(), "x DV Remux");
+        assert_eq!(s.word_choices()[0], "x DV Remux");
         assert_eq!(s.query("2040", 0), "q=x&cat=2040&filters=DV%2CRemux");
         let hide = Search::from_args(&parse_query("filters=Hide%20copies"));
-        assert_eq!(hide.words(), "", "not a word to look for");
+        assert_eq!(hide.word_choices(), [""], "not a word to look for");
         let links = s.filter_links();
         assert_eq!(links.matches("aria-current").count(), 2, "{links}");
         assert!(!filter_matches("DV", &release_tags::parse("A.1999.DVDRip.XviD-X")), "not a DVD");
