@@ -1189,7 +1189,9 @@ fn release_html(
     let conn = crate::db::open().ok();
     let found = conn.as_ref().and_then(|c| crate::probe::read(c, r.id));
     let probe = match (conn.as_ref(), found.as_ref()) {
-        (Some(c), Some(found)) => probe_html(found, crate::probe::opensubtitles::read(c, r.id).as_ref()),
+        (Some(c), Some(found)) => {
+            probe_html(found, crate::probe::opensubtitles::read(c, r.id).as_ref(), crate::web_meta::salt_of(Some(c)))
+        }
         _ => String::new(),
     };
     let meta = crate::web_meta::meta_html(
@@ -1269,7 +1271,11 @@ pub(crate) fn panel(title: &str, facts: &str) -> String {
 }
 
 /// What reading a release's articles found, without downloading it.
-fn probe_html(p: &crate::probe::ProbeInfo, matched: Option<&crate::probe::opensubtitles::Stored>) -> String {
+fn probe_html(
+    p: &crate::probe::ProbeInfo,
+    matched: Option<&crate::probe::opensubtitles::Stored>,
+    salt: Option<i64>,
+) -> String {
     let dd = |out: &mut String, name: &str, value: String| {
         if !value.is_empty() {
             let _ = write!(out, "<dt>{name}</dt><dd>{value}</dd>");
@@ -1322,7 +1328,8 @@ fn probe_html(p: &crate::probe::ProbeInfo, matched: Option<&crate::probe::opensu
     }
     for (name, value) in &p.headers {
         if !matches!(name.as_str(), "User-Agent" | "X-Newsreader" | "X-Newsposter" | "Xref") {
-            dd(&mut posted, &escape(name), escape(value));
+            // the posting account, host and IP are shown as salted keys, as the Headers fold-out shows them
+            dd(&mut posted, &escape(name), crate::web_meta::redact_header(name, value, salt));
         }
     }
     if !p.crossposted_to.is_empty() {

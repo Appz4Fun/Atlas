@@ -189,6 +189,11 @@ fn look(conn: Option<&Connection>, release_id: i64) -> Looked {
 
 /// The install's salt for the account and host keys: made once, by whoever asks first, and kept in shard 0's
 /// `meta`. None when it can't be read or made, and then no salted key is shown at all.
+/// The install's salt for the account and host keys, for the pages that show headers on their own.
+pub(crate) fn salt_of(conn: Option<&Connection>) -> Option<i64> {
+    conn.and_then(salt)
+}
+
 fn salt(conn: &Connection) -> Option<i64> {
     let read = || {
         conn.query_row("select value from s0.meta where key = 'key_salt'", [], |r| r.get::<_, i64>(0))
@@ -365,7 +370,7 @@ fn obfuscation_fact(names: Option<&Names>, inner: &InnerView, files: &[FileInfo]
 /// none / subject only / file names only / subject and file names / everything (renamed from …): the subject
 /// is the release name the post gave, the file names are the posted ones.
 fn obfuscation_level(names: Option<&Names>, inner: &InnerView, files: &[FileInfo]) -> String {
-    let subject = names.is_some_and(|n| n.obfuscated);
+    let subject = names.is_some_and(|n| n.obfuscated || looks_obfuscated(&n.posted));
     let judged: Vec<&str> = files.iter().map(|f| f.filename.as_str()).filter(|n| !n.is_empty()).collect();
     let file_names = !judged.is_empty() && judged.iter().filter(|n| looks_obfuscated(n)).count() * 2 > judged.len();
     let recovered = names.and_then(|n| n.source).filter(|s| {
@@ -1260,7 +1265,10 @@ fn contents_profile(files: &[FileInfo], size: Option<i64>, c: &Contents) -> Opti
     let volumes = n(FileKind::RarVolume) + n(FileKind::SevenZVolume) + n(FileKind::ZipVolume) + n(FileKind::RawSplit);
     let each = data_bytes(size, c)
         .filter(|_| volumes > 0)
-        .map(|bytes| format!(" (about {} each)", fmt_size(Some(bytes / volumes as i64))))
+        .map(|bytes| match volumes {
+            1 => format!(" ({})", fmt_size(Some(bytes))),
+            n => format!(" (about {} each)", fmt_size(Some(bytes / n as i64))),
+        })
         .unwrap_or_default();
     let mut parts = Vec::new();
     for (kind, word) in [
@@ -1716,7 +1724,7 @@ fn headers_fragment(conn: &Connection, id: i64) -> String {
 }
 
 /// A header's value as HTML, with the posting account, host and IP replaced by their keys.
-fn redact_header(name: &str, value: &str, salt: Option<i64>) -> String {
+pub(crate) fn redact_header(name: &str, value: &str, salt: Option<i64>) -> String {
     let keyed = |v: &str| match salt {
         Some(salt) => key_code(&key12(salt, v)),
         None => "<span class=\"dim\">hidden</span>".to_string(),
@@ -2201,12 +2209,16 @@ mod tests {
         assert!(looks_obfuscated(&hidden[0].filename) && !looks_obfuscated(&readable[0].filename));
         let plain = InnerView::default();
         let subject = |hidden: bool, source: Option<NameSource>| Names {
-            posted: "aB3dE6fG9hJ2kL5mN8pQ".into(),
+            posted: NAME.into(),
             display: None,
             obfuscated: hidden,
             source: source.map(|s| s as i64),
         };
         assert_eq!(obfuscation_level(None, &plain, &readable), "none");
+        // a random posted name is a hidden subject even once the row has been renamed and its flag reset
+        let renamed = Names { posted: "aB3dE6fG9hJ2kL5mN8pQ".into(), ..subject(false, Some(NameSource::Par2)) };
+        assert_eq!(obfuscation_level(Some(&renamed), &plain, &readable), "subject only");
+        assert_eq!(obfuscation_level(Some(&renamed), &plain, &hidden), "everything (renamed from the PAR2 file)");
         assert_eq!(obfuscation_level(Some(&subject(true, None)), &plain, &readable), "subject only");
         assert_eq!(obfuscation_level(Some(&subject(false, None)), &plain, &hidden), "file names only");
         assert_eq!(obfuscation_level(Some(&subject(true, None)), &plain, &hidden), "subject and file names");
@@ -2571,6 +2583,11 @@ mod tests {
             Some("SFV, 1 sample, 1 video file, 1 audio file, 1 image, 1 text file, 1 other file")
         );
         assert_eq!(contents_profile(&[], None, &Contents::default()), None);
+        let single = [file("x.rar", 1), file("x.nfo", 1)];
+        assert_eq!(
+            contents_profile(&single, Some(MIB), &Contents::default()).as_deref(),
+            Some("1 RAR volume (1.0 MB), NFO")
+        );
         assert!(kind_of("x.part01.rar") == FileKind::RarVolume && kind_of("x.r00") == FileKind::RarVolume);
         assert!(kind_of("x.7z.001") == FileKind::SevenZVolume && kind_of("x.z01") == FileKind::ZipVolume);
         assert!(kind_of("x.001") == FileKind::RawSplit && kind_of("x.rev") == FileKind::Rev);

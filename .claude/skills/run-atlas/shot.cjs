@@ -38,6 +38,8 @@ if (click) {
   await page.locator(click).first().click();
   await page.waitForLoadState('networkidle');
   await page.waitForTimeout(500);
+  await page.evaluate(() => window.scrollTo(0, 0));
+  await page.waitForTimeout(200);
 }
 await page.screenshot({ path: out, fullPage: true });
 const names = await page.locator('td.name > a').allTextContents();

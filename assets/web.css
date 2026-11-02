@@ -234,8 +234,8 @@ details.meta summary:hover { color: var(--rust); }
 details.meta .meta-body { margin-top: 10px; }
 .meta .table-wrap { max-height: 24rem; overflow: auto; }
 .meta td, .meta th { font-size: .82rem; }
-.meta td.name { max-width: 28rem; }
-.partmap { font-family: var(--font-mono); letter-spacing: .04em; white-space: nowrap; }
+.meta td.name { min-width: 18rem; max-width: 28rem; }
+.partmap { font: .6rem/1 var(--font-mono); letter-spacing: 0; white-space: nowrap; }
 code.key { padding: 1px 5px; font: .82rem var(--font-mono); background: var(--sunken); border: 1px solid var(--line); border-radius: 4px; overflow-wrap: anywhere; user-select: all; }
 tr.drawer-row code.key, .drawer-card code.key { background: var(--surface); }
 
