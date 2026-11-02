@@ -32,9 +32,16 @@ fn frames(input: &[u8], out: &mut Vec<u8>, limit: usize) -> Option<End> {
                 if size == FRAME || size == LEGACY {
                     break;
                 }
-                let block = input.get(p + 4..p + 4 + size as usize)?;
-                p += 4 + size as usize;
-                sequences(block, out, limit)?;
+                // a block cut short still gives what it holds
+                let to = (p + 4).checked_add(size as usize)?;
+                let block = input.get(p + 4..to.min(input.len()))?;
+                let cut = to > input.len();
+                p = to;
+                let whole = sequences(block, out, limit);
+                if cut {
+                    return if out.len() >= limit { Some(End::Limit) } else { None };
+                }
+                whole?;
                 if out.len() >= limit {
                     return Some(End::Limit);
                 }
@@ -148,6 +155,21 @@ mod tests {
             assert_eq!(end, End::Cut);
             assert!(front.len() > 1000 && want.starts_with(&front));
         }
+    }
+
+    #[test]
+    fn a_cut_legacy_block_gives_what_it_holds() {
+        // one block of 16 literals (18 bytes), its size saying 19 and its last byte missing
+        let mut data = vec![0x02, 0x21, 0x4c, 0x18, 19, 0, 0, 0, 0xf0, 1];
+        data.extend(b"0123456789abcdef");
+        let (out, end) = lz4(&data[..data.len() - 4], usize::MAX);
+        assert_eq!(end, End::Cut);
+        assert_eq!(out, b"0123456789ab");
+        let (out, end) = lz4(&data, usize::MAX);
+        assert_eq!(end, End::Cut);
+        assert_eq!(out, b"0123456789abcdef");
+        let (out, end) = lz4(&data, 5);
+        assert_eq!((&out[..], end), (&b"01234"[..], End::Limit));
     }
 
     #[test]

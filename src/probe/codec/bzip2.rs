@@ -59,7 +59,7 @@ fn streams(bits: &mut Bits<'_>, out: &mut Vec<u8>, limit: usize) -> Option<End> 
             if magic != BLOCK_MAGIC {
                 return None;
             }
-            block(bits, out, max)?;
+            block(bits, out, max, limit)?;
             if out.len() >= limit {
                 return Some(End::Limit);
             }
@@ -120,7 +120,8 @@ impl Table {
     }
 }
 
-fn block(bits: &mut Bits<'_>, out: &mut Vec<u8>, max: usize) -> Option<()> {
+/// One block, its output stopping at `limit` bytes in all.
+fn block(bits: &mut Bits<'_>, out: &mut Vec<u8>, max: usize, limit: usize) -> Option<()> {
     if bits.bit()? {
         // randomised blocks: bzip2 stopped writing these in 0.9.5
         return None;
@@ -247,10 +248,14 @@ fn block(bits: &mut Bits<'_>, out: &mut Vec<u8>, max: usize) -> Option<()> {
     let mut p = next[orig_ptr] as usize;
     let (mut last, mut same) = (None, 0u8);
     for _ in 0..data.len() {
+        if out.len() >= limit {
+            break;
+        }
         let b = data[p];
         p = next[p] as usize;
         if same == 4 {
-            out.extend(std::iter::repeat_n(last.unwrap_or(0), usize::from(b)));
+            let n = usize::from(b).min(limit - out.len());
+            out.extend(std::iter::repeat_n(last.unwrap_or(0), n));
             same = 0;
             last = None;
             continue;
@@ -281,6 +286,19 @@ mod tests {
         assert_eq!(end, End::Cut);
         let (out, end) = bzip2(packed, 100);
         assert_eq!((out.len(), end), (100, End::Limit));
+    }
+
+    #[test]
+    fn long_runs_stop_at_the_limit() {
+        // 40 MB of one byte packs to 51 bytes; its runs must not run past the limit
+        let hex =
+            "425a68393141592653595cb4005701325f0108a00000100008200030cc09aa69a04a515b501294578bb9229c28482e5a002b80";
+        let packed: Vec<u8> =
+            (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap()).collect();
+        let (out, end) = bzip2(&packed, 1000);
+        assert_eq!((out.len(), end), (1000, End::Limit));
+        assert!(out.capacity() < 1 << 20, "{} bytes held", out.capacity());
+        assert!(out.iter().all(|&b| b == b'a'));
     }
 
     #[test]

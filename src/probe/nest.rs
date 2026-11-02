@@ -204,7 +204,8 @@ fn open(data: &[u8]) -> Option<Opened> {
         let props = Props { lc: 3, lp: 0, pb: 2 };
         return Some(Opened { layer: l, view: View::Decode { from: 6, codec: Codec::Lzma { props, size: None } } });
     }
-    if data.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) || zstd_skippable(data) {
+    // skippable frames are both zstd's and LZ4's: what follows them says which
+    if data.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) || (zstd_skippable(data) && !lz4_after_skippable(data)) {
         let mut l = layer("ZSTD");
         l.method = Some("zstd".into());
         return Some(Opened { layer: l, view: View::Decode { from: 0, codec: Codec::Zstd } });
@@ -225,7 +226,10 @@ fn open(data: &[u8]) -> Option<Opened> {
     if data.starts_with(&[0x1f, 0x9d]) {
         return decode("COMPRESS", "lzw", Codec::Lzw);
     }
-    if data.starts_with(&[0x04, 0x22, 0x4d, 0x18]) || data.starts_with(&[0x02, 0x21, 0x4c, 0x18]) {
+    if data.starts_with(&[0x04, 0x22, 0x4d, 0x18])
+        || data.starts_with(&[0x02, 0x21, 0x4c, 0x18])
+        || lz4_after_skippable(data)
+    {
         return decode("LZ4", "lz4", Codec::Lz4);
     }
     if data.starts_with(b"\x89LZO\0\r\n\x1a\n") {
@@ -352,6 +356,22 @@ fn seven_z(data: &[u8]) -> Opened {
 /// A zstd skippable frame, which a stream can open with before its real one.
 fn zstd_skippable(data: &[u8]) -> bool {
     data.get(1..4) == Some(&[0x2a, 0x4d, 0x18][..]) && data[0] & 0xf0 == 0x50
+}
+
+/// Whether the first frame after a run of skippable frames is an LZ4 one.
+fn lz4_after_skippable(data: &[u8]) -> bool {
+    let mut p = 0usize;
+    for _ in 0..64 {
+        let Some(rest) = data.get(p..) else { return false };
+        if !zstd_skippable(rest) {
+            return rest.starts_with(&[0x04, 0x22, 0x4d, 0x18]) || rest.starts_with(&[0x02, 0x21, 0x4c, 0x18]);
+        }
+        let Some(size) = rest.get(4..8).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize) else {
+            return false;
+        };
+        p = p.saturating_add(8).saturating_add(size);
+    }
+    false
 }
 
 /// Whether `data` starts the way something [`open`] reads does, without opening it.

@@ -460,4 +460,10 @@ fn bzip2_compress_lz4_and_deflate64() {
     let bz = include_bytes!("../../../tests/fixtures/nest/mixed.bz2");
     let z = zip_entry(12, "mixed.bin", bz, want.len());
     same(&unwrap(&z).inner, want);
+    // LZ4 behind a skippable frame is still LZ4, not zstd
+    let mut skipped = vec![0x5a, 0x2a, 0x4d, 0x18, 3, 0, 0, 0, 1, 2, 3];
+    skipped.extend_from_slice(include_bytes!("../../../tests/fixtures/nest/mixed.lz4"));
+    let n = unwrap(&skipped);
+    assert_eq!(formats(&n), ["LZ4 lz4"]);
+    same(&n.inner, want);
 }
