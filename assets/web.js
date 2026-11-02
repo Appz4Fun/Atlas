@@ -77,12 +77,16 @@ document.addEventListener('htmx:afterSettle', () => {
   read.removeAttribute('data-q');
 });
 
-// A result's drawer: the first click loads it (htmx, once), later clicks fold and unfold it.
+// A drawer: the first click loads it (htmx, once), later clicks fold and unfold it. Under a result row the drawer
+// is the next row; on a copy card or a copy link it is the card appended inside the copy's body or list item.
 document.addEventListener('click', (event) => {
   const toggle = event.target.closest('.drawer-toggle');
   if (!toggle) return;
-  const drawer = toggle.closest('tr')?.nextElementSibling;
-  if (!drawer || !drawer.classList.contains('drawer-row')) return;
+  const row = toggle.closest('tr');
+  const drawer = row
+    ? row.nextElementSibling
+    : toggle.closest('.copy-body, li')?.querySelector(':scope > .drawer-card');
+  if (!drawer || !(drawer.classList.contains('drawer-row') || drawer.classList.contains('drawer-card'))) return;
   drawer.hidden = !drawer.hidden;
   toggle.setAttribute('aria-expanded', String(!drawer.hidden));
 });

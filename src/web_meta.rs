@@ -104,8 +104,18 @@ pub(crate) fn row_panel(args: &HashMap<String, String>) -> ApiResponse {
 
 /// The button a result row carries in its name cell: the first click loads the drawer under the row.
 pub(crate) fn drawer_trigger(id: i64) -> String {
+    trigger(&format!("/ui/row?id={id}"), "closest tr", "afterend")
+}
+
+/// The `+` on a copy card or a copy link: the first click appends a `<div class="drawer-card">` inside `target`, an
+/// htmx target such as `closest li`, soo the facts open under the copy they belong to.
+pub(crate) fn card_trigger(id: i64, target: &str) -> String {
+    trigger(&format!("/ui/row?id={id}&amp;as=card"), target, "beforeend")
+}
+
+fn trigger(url: &str, target: &str, swap: &str) -> String {
     format!(
-        " <button class=\"icon-button drawer-toggle\" type=\"button\" title=\"More facts\" aria-expanded=\"false\" hx-get=\"/ui/row?id={id}\" hx-target=\"closest tr\" hx-swap=\"afterend\" hx-trigger=\"click once\">+</button>"
+        " <button class=\"icon-button drawer-toggle\" type=\"button\" title=\"More facts\" aria-expanded=\"false\" hx-get=\"{url}\" hx-target=\"{target}\" hx-swap=\"{swap}\" hx-trigger=\"click once\">+</button>"
     )
 }
 
@@ -2997,6 +3007,14 @@ mod tests {
                 && trigger.contains("hx-target=\"closest tr\"")
                 && trigger.contains("hx-swap=\"afterend\""),
             "{trigger}"
+        );
+        let card = card_trigger(7, "closest li");
+        assert!(
+            card.contains("class=\"icon-button drawer-toggle\"")
+                && card.contains("hx-get=\"/ui/row?id=7&amp;as=card\"")
+                && card.contains("hx-target=\"closest li\"")
+                && card.contains("hx-swap=\"beforeend\""),
+            "{card}"
         );
         let f = Fixture::new();
         let compact = compact_html(&f.inputs(), &looked(volumes(3)));

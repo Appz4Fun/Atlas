@@ -1577,14 +1577,22 @@ fn copy_card(conn: &rusqlite::Connection, badge: &str, r: &ReleaseRow) -> String
         )
     });
     format!(
-        "<article class=\"panel copy\">{thumb}<div class=\"copy-body\"><div class=\"copy-head\"><div class=\"name\"><a href=\"/ui/release?id={id}\">{name}</a>{tags}</div><a class=\"button small primary\" href=\"/ui/nzb?id={id}\">NZB</a></div><dl class=\"facts facts-wide\">{facts}</dl></div></article>",
+        "<article class=\"panel copy\">{thumb}<div class=\"copy-body\"><div class=\"copy-head\"><div class=\"name\"><a href=\"/ui/release?id={id}\">{name}</a>{tags}{more}</div><a class=\"button small primary\" href=\"/ui/nzb?id={id}\">NZB</a></div><dl class=\"facts facts-wide\">{facts}</dl></div></article>",
         id = r.id,
         name = escape(&r.name),
+        more = crate::web_meta::card_trigger(r.id, "closest .copy-body"),
     )
 }
 
+/// A copy past the first few: its name, badge and size, with the `+` that opens its drawer in place.
 fn copy_link(badge: &str, r: &ReleaseRow) -> String {
-    format!("<li><a href=\"/ui/release?id={}\">{}</a>{badge} {}</li>", r.id, escape(&r.name), escape(&fmt_size(r.size)))
+    format!(
+        "<li><a href=\"/ui/release?id={}\">{}</a>{badge} {}{}</li>",
+        r.id,
+        escape(&r.name),
+        escape(&fmt_size(r.size)),
+        crate::web_meta::card_trigger(r.id, "closest li")
+    )
 }
 
 /// Other postings of this release's content.
@@ -2205,6 +2213,46 @@ mod tests {
         );
         assert!(html.contains("hx-get=\"/ui/row?id=7\"") && html.contains("hx-target=\"closest tr\""), "{html}");
         assert!(html.contains("<td class=\"num col-size\" title=\"2,048 bytes\">2.0 KB</td>"), "{html}");
+    }
+
+    #[test]
+    fn a_copy_carries_the_drawer_trigger_as_a_card() {
+        let release = ReleaseRow {
+            id: 7,
+            name: "Some.Show.S01E01-GRP".into(),
+            group_name: "alt.binaries.g".into(),
+            poster: Some("poster <p@example.com>".into()),
+            posted_date: Some("2026-10-03 17:41:49".into()),
+            size: Some(2048),
+            complete: true,
+            parts: None,
+        };
+        // a link opens its drawer inside its own list item
+        let link = copy_link(&tag("tag-ok", "TWIN"), &release);
+        assert!(
+            link.starts_with("<li><a href=\"/ui/release?id=7\">Some.Show.S01E01-GRP</a>") && link.ends_with("</li>")
+        );
+        assert_eq!(link.matches("drawer-toggle").count(), 1, "{link}");
+        assert!(
+            link.contains("hx-get=\"/ui/row?id=7&amp;as=card\"")
+                && link.contains("hx-target=\"closest li\"")
+                && link.contains("hx-swap=\"beforeend\""),
+            "{link}"
+        );
+        // a card opens it under its facts, inside the card's body
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        crate::db::create_db_at(&main).unwrap();
+        let conn = crate::db::open_with_shards(&main).unwrap();
+        let card = copy_card(&conn, &tag("tag-ok", "TWIN"), &release);
+        assert_eq!(card.matches("drawer-toggle").count(), 1, "{card}");
+        let toggle = card.find("drawer-toggle").unwrap();
+        assert!(card.find("TWIN").unwrap() < toggle && toggle < card.find("href=\"/ui/nzb?id=7\"").unwrap(), "{card}");
+        assert!(
+            card.contains("hx-get=\"/ui/row?id=7&amp;as=card\"") && card.contains("hx-target=\"closest .copy-body\""),
+            "{card}"
+        );
+        assert!(card.contains("<dt>Poster</dt>") && card.contains("<dt>Email</dt>"), "{card}");
     }
 
     #[test]
