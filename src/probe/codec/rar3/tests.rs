@@ -75,3 +75,28 @@ fn junk_never_panics() {
         let _ = crate::probe::codec::rar20::rar20(&data, None, 1 << 16, n % 2 == 0);
     }
 }
+
+#[test]
+fn filter_programs_are_charged_to_the_work_budget() {
+    // a 65 535-byte program, of zeros, with only 1000 bytes of work left
+    let mut data = vec![0x07, 0xff, 0xff];
+    data.resize(70_000, 0);
+    let mut st = State {
+        bits: Bits { data: &data, addr: 0, bit: 0 },
+        safe: data.len(),
+        old_table: [0; TABLE],
+        reps: [0; 4],
+        last_len: 0,
+        low_dist: 0,
+        low_reps: 0,
+        filters: Filters { work: 1000, ..Filters::default() },
+        ppm: None,
+        esc: 2,
+    };
+    assert!(matches!(read_vm_code(&mut st, 0), Err(Stop::Cut)));
+    // with room for it, the program costs its length
+    st.bits.addr = 0;
+    st.filters.work = 70_000;
+    let _ = read_vm_code(&mut st, 0);
+    assert_eq!(st.filters.work, 70_000 - 0xffff);
+}

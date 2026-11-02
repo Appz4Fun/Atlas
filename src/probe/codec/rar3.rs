@@ -88,8 +88,8 @@ struct Filters {
     pending: Vec<Pending>,
     /// where the furthest pending block ends: past the limit, decoding goes on to here
     reach: usize,
-    /// filter bytes still allowed: filters that don't overlap cover each byte once, so more than the output and
-    /// one filter's memory is work no real file asks for
+    /// filter work still allowed, block bytes and program bytes alike: filters that don't overlap cover each byte
+    /// once, so more than the output and one filter's memory is work no real file asks for
     work: usize,
 }
 
@@ -290,6 +290,8 @@ fn ppm_step(st: &mut State<'_>, out: &mut Vec<u8>, target: usize) -> Result<PpmS
             if len == 0 {
                 return Err(Stop::Cut);
             }
+            // decoding the program is work too, and none of it reaches the output
+            st.filters.work = st.filters.work.checked_sub(len).ok_or(Stop::Cut)?;
             let code = (0..len).map(|_| next()).collect::<Result<Vec<u8>, Stop>>()?;
             add_vm_code(&mut st.filters, u32::from(first), &code, out.len())?;
         }
@@ -443,6 +445,8 @@ fn read_vm_code(st: &mut State<'_>, at: usize) -> Result<(), Stop> {
     if len == 0 {
         return Err(Stop::Cut);
     }
+    st.filters.work = st.filters.work.checked_sub(len as usize).ok_or(Stop::Cut)?;
+    let bits = &mut st.bits;
     let code: Vec<u8> = (0..len).map(|_| bits.take(8) as u8).collect();
     if bits.past_end() {
         return Err(Stop::Cut);
