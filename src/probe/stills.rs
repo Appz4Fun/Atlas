@@ -151,6 +151,27 @@ fn stored_span(ctx: &mut StepCtx<'_>, volume: &FileInfo) -> Result<Option<(u64, 
     Ok(Some((at as u64, at as u64 + packed, first)))
 }
 
+/// Once a stored volume's last part is read, what follows its share of the video (the end-of-archive block) is cut
+/// off `data`, before it can pass for frame bytes. The new end, or None when the volume's header doesn't add up.
+fn volume_end(
+    ctx: &mut StepCtx<'_>,
+    layout: &Layout<'_>,
+    file: &FileInfo,
+    next: i64,
+    end: u64,
+    data: &mut Vec<u8>,
+) -> Result<Option<u64>, StepError> {
+    if !matches!(layout, Layout::Stored(_)) || next <= parts(file) {
+        return Ok(Some(end));
+    }
+    let Some((_, until, _)) = stored_span(ctx, file)? else { return Ok(None) };
+    if end < until || end - until > data.len() as u64 {
+        return Ok(None);
+    }
+    data.truncate(data.len() - (end - until) as usize);
+    Ok(Some(until))
+}
+
 /// A keyframe from part `part` of `file` on: the frame's bytes and its time. In a stored RAR set, a frame that runs
 /// off the end of one volume carries on after the next one's headers.
 fn keyframe_from(
@@ -163,6 +184,8 @@ fn keyframe_from(
     let Some((begin, mut data)) = read(ctx, file, part)? else { return Ok(None) };
     // the file being read, its next part, and where in it the data read so far ends
     let (mut file, mut next, mut end) = (file, part + 1, begin + data.len() as u64);
+    let Some(e) = volume_end(ctx, layout, file, next, end, &mut data)? else { return Ok(None) };
+    end = e;
     for _ in 0..MORE_ARTICLES {
         match mkv::find_keyframe(&data, track) {
             Found::Frame { start, len, timestamp } => return Ok(Some((data[start..start + len].to_vec(), timestamp))),
@@ -170,30 +193,27 @@ fn keyframe_from(
             _ => {}
         }
         if next > parts(file) {
+            // on into the next volume, after its headers
             let Layout::Stored(volumes) = layout else { break };
             let Some(after) = volumes.iter().position(|v| v.id == file.id).and_then(|i| volumes.get(i + 1)) else {
                 break;
             };
-            // this volume's share ends where its header says, before the end-of-archive block
-            let Some((_, until, _)) = stored_span(ctx, file)? else { break };
-            if end < until || end - until > data.len() as u64 {
-                break;
-            }
-            data.truncate(data.len() - (end - until) as usize);
             let Some((from, _, first)) = stored_span(ctx, after)? else { break };
             let Some(body) = first.get(from as usize..) else { break };
             data.extend_from_slice(body);
             (file, next, end) = (after, 2, first.len() as u64);
-            continue;
+        } else {
+            // the next part has to carry straight on, or the bytes are no use
+            let Some((from, more)) = read(ctx, file, next)? else { break };
+            if from != end {
+                break;
+            }
+            end += more.len() as u64;
+            next += 1;
+            data.extend(more);
         }
-        // the next part has to carry straight on, or the bytes are no use
-        let Some((from, more)) = read(ctx, file, next)? else { break };
-        if from != end {
-            break;
-        }
-        end += more.len() as u64;
-        next += 1;
-        data.extend(more);
+        let Some(e) = volume_end(ctx, layout, file, next, end, &mut data)? else { break };
+        end = e;
     }
     Ok(match mkv::find_keyframe(&data, track) {
         Found::Frame { start, len, timestamp } => Some((data[start..start + len].to_vec(), timestamp)),
