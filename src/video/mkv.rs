@@ -4,6 +4,8 @@
 use crate::probe::media::{element_id, element_size};
 
 const SEGMENT: u32 = 0x1853_8067;
+const INFO: u32 = 0x1549_A966;
+const TIMESTAMP_SCALE: u32 = 0x2A_D7B1;
 const TRACKS: u32 = 0x1654_AE6B;
 const TRACK_ENTRY: u32 = 0xAE;
 const CLUSTER: u32 = 0x1F43_B675;
@@ -32,6 +34,15 @@ pub struct VideoTrack {
     pub codec: Codec,
     /// hvcC or avcC
     pub private: Vec<u8>,
+    /// nanoseconds in one tick of a block's timestamp
+    pub timestamp_scale: u64,
+}
+
+impl VideoTrack {
+    /// A timestamp from [`find_keyframe`] in milliseconds.
+    pub fn millis(&self, ticks: i64) -> i64 {
+        (i128::from(ticks) * i128::from(self.timestamp_scale) / 1_000_000) as i64
+    }
 }
 
 /// One element at `at`: its id, the size of its body (None: unknown) and where the body starts.
@@ -72,11 +83,21 @@ pub fn video_track(front: &[u8]) -> Option<VideoTrack> {
 
 fn tracks_in(segment: &[u8]) -> Option<VideoTrack> {
     let mut at = 0;
+    // the default when Info doesn't say, or comes after Tracks
+    let mut scale = 1_000_000;
     while let Some((id, size, start)) = element(segment, at) {
         let size = usize::try_from(size?).ok()?;
+        if id == INFO {
+            let body = segment.get(start..start + size)?;
+            if let Some((_, v)) = children(body).find(|(id, _)| *id == TIMESTAMP_SCALE) {
+                scale = uint(v).max(1);
+            }
+        }
         if id == TRACKS {
             let body = segment.get(start..start + size)?;
-            return children(body).filter(|(id, _)| *id == TRACK_ENTRY).find_map(|(_, entry)| track(entry));
+            let mut track = children(body).filter(|(id, _)| *id == TRACK_ENTRY).find_map(|(_, entry)| track(entry))?;
+            track.timestamp_scale = scale;
+            return Some(track);
         }
         if id == CLUSTER {
             return None;
@@ -102,10 +123,10 @@ fn track(entry: &[u8]) -> Option<VideoTrack> {
         b"V_MPEG4/ISO/AVC" => Codec::Avc,
         _ => return None,
     };
-    (kind? == 1).then_some(VideoTrack { number: number?, codec, private: private? })
+    (kind? == 1).then_some(VideoTrack { number: number?, codec, private: private?, timestamp_scale: 1_000_000 })
 }
 
-/// A keyframe found in a run of bytes.
+/// A keyframe found in a run of bytes. Its timestamp is in the segment's ticks: see [`VideoTrack::millis`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Found {
     /// the frame, all there: `data[start..start + len]`
@@ -180,7 +201,7 @@ pub fn find_keyframe(data: &[u8], track: u64) -> Found {
                     let have = data.len().saturating_sub(start).min(size);
                     let body = &data[start..start + have];
                     let (block, key) = if id == SIMPLE_BLOCK {
-                        (Some((0, body)), body.get(..4).and_then(block_head).map(|h| h.2 & 0x80 != 0))
+                        (Some((0, body)), block_head(body).map(|h| h.2 & 0x80 != 0))
                     } else {
                         // a group is a keyframe when nothing's referenced; seen only once it's all here
                         let mut block = None;
@@ -288,6 +309,30 @@ mod tests {
         let Found::Frame { start, len, .. } = find_keyframe(&data[from..], t.number) else { panic!() };
         let cut = &data[from..from + start + len / 2];
         assert_eq!(find_keyframe(cut, t.number), Found::Partial { start, len, have: len / 2 });
+    }
+
+    #[test]
+    fn a_track_number_past_127_is_found() {
+        // a cluster at time 5 holding one keyframe of track 128, whose number takes two bytes
+        let frame = [9u8; 20];
+        let mut block = vec![0x40, 0x80, 0x00, 0x02, 0x80];
+        block.extend(frame);
+        let mut body = vec![0xE7, 0x81, 0x05, 0xA3, 0x80 | block.len() as u8];
+        body.extend(&block);
+        let mut data = vec![0x00, 0x1F, 0x43, 0xB6, 0x75, 0x80 | body.len() as u8];
+        data.extend(&body);
+        let Found::Frame { start, len, timestamp } = find_keyframe(&data, 128) else { panic!() };
+        assert_eq!((&data[start..start + len], timestamp), (&frame[..], 7));
+        assert_eq!(find_keyframe(&data, 1), Found::None);
+    }
+
+    #[test]
+    fn timestamps_follow_the_segment_scale() {
+        let mut t = video_track(&fixture()).unwrap();
+        assert_eq!(t.timestamp_scale, 1_000_000);
+        assert_eq!(t.millis(2500), 2500);
+        t.timestamp_scale = 100_000;
+        assert_eq!(t.millis(2500), 250);
     }
 
     #[test]

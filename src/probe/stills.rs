@@ -5,7 +5,7 @@ use sha2::Digest;
 
 use crate::config::Config;
 use crate::postprocess::schema::ShardTable;
-use crate::postprocess::step::{Got, Needs, Outcome, ReleaseInfo, Step, StepCtx, StepError, StepId, StepWrite};
+use crate::postprocess::step::{Got, Needs, Outcome, ReleaseInfo, Reruns, Step, StepCtx, StepError, StepId, StepWrite};
 use crate::store::{self, FileInfo, SegmentPick};
 use crate::video::mkv::{self, Codec, Found, VideoTrack};
 use crate::video::{hevc, jpeg};
@@ -112,18 +112,24 @@ fn parts(f: &FileInfo) -> i64 {
 
 /// The file and part `percent` of the way through the video.
 fn part_at<'a>(layout: &Layout<'a>, percent: u8) -> Option<(&'a FileInfo, i64)> {
-    // how far into the file, in hundredths
-    let (file, hundredths) = match layout {
-        Layout::Plain(f) => (*f, i64::from(percent)),
-        Layout::Stored(volumes) => {
-            // volumes are all the size of the first but the last: the right one, and how far into it
-            let at = volumes.len() as i64 * i64::from(percent);
-            let index = ((at / 100) as usize).min(volumes.len() - 1);
-            (volumes[index], at - index as i64 * 100)
-        }
+    let volumes: &[&FileInfo] = match layout {
+        Layout::Plain(f) => std::slice::from_ref(f),
+        Layout::Stored(volumes) => volumes,
     };
-    let total = parts(file);
-    (total > 0).then(|| (file, (total * hundredths / 100 + 1).clamp(1, total)))
+    // by articles across the set, since the last volume is often short
+    let total: i64 = volumes.iter().map(|f| parts(f).max(0)).sum();
+    if total <= 0 {
+        return None;
+    }
+    let mut at = total * i64::from(percent) / 100;
+    for file in volumes {
+        let n = parts(file).max(0);
+        if at < n {
+            return Some((file, at + 1));
+        }
+        at -= n;
+    }
+    volumes.iter().rev().find(|f| parts(f) > 0).map(|f| (*f, parts(f)))
 }
 
 /// Part `part` of a file, decoded, with what the yEnc header says it starts at.
@@ -222,6 +228,10 @@ impl Step for StillsStep {
     fn needs(&self) -> Needs {
         Needs::Bodies
     }
+    fn reruns(&self) -> Reruns {
+        // a release that grows may have the articles a still needed
+        Reruns { on_rename: false, on_growth: true }
+    }
     fn enabled(&self, cfg: &Config) -> bool {
         cfg.archive.enabled
     }
@@ -273,7 +283,7 @@ impl Step for StillsStep {
                 vec![
                     release_id.into(),
                     i64::from(percent).into(),
-                    at.into(),
+                    track.millis(at).into(),
                     sha256.into(),
                     i64::from(w).into(),
                     i64::from(h).into(),
@@ -315,6 +325,17 @@ mod tests {
         assert_eq!((f.filename.as_str(), p), ("film.part07.rar", 1));
         let (f, p) = part_at(&layout, 30).unwrap();
         assert_eq!((f.filename.as_str(), p), ("film.part03.rar", 17));
+        // a short last volume counts for what it holds
+        let short = [file("a.part1.rar", 100), file("a.part2.rar", 4)];
+        let layout = Layout::Stored(short.iter().collect());
+        let picks: Vec<_> = [25, 50, 75, 100]
+            .into_iter()
+            .map(|p| part_at(&layout, p).map(|(f, n)| (f.filename.clone(), n)).unwrap())
+            .collect();
+        assert_eq!(picks[0], ("a.part1.rar".into(), 27));
+        assert_eq!(picks[1], ("a.part1.rar".into(), 53));
+        assert_eq!(picks[2], ("a.part1.rar".into(), 79));
+        assert_eq!(picks[3], ("a.part2.rar".into(), 4));
     }
 
     #[test]
