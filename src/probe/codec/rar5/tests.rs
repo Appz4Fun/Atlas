@@ -83,3 +83,33 @@ fn junk_never_panics() {
         let _ = rar5(&d, seed & 1 == 0, None, 1 << 20);
     }
 }
+
+/// A block header: flags, check byte, one size byte.
+fn block_head(flags: u8, size: u8) -> [u8; 3] {
+    let check = 0x5a ^ flags ^ size;
+    [flags, check, size]
+}
+
+#[test]
+fn a_stream_of_empty_blocks_is_cut_short() {
+    let data = include_bytes!("../../../../tests/fixtures/rar5/m1_fastest.rar");
+    let head = entries(data).into_iter().find(|h| !h.dir && h.stored_at.is_none() && !h.solid).unwrap();
+    let packed = &data[head.data_at.unwrap()..][..head.packed.unwrap() as usize];
+    let size = head.unpacked.unwrap() as usize;
+    // the file's one block, no longer the last, then thousands of empty ones and a last one
+    let flags = packed[0];
+    let count = usize::from((flags >> 3) & 3) + 1;
+    let block_size = (0..count).fold(0usize, |s, i| s | usize::from(packed[2 + i]) << (8 * i));
+    assert_eq!(2 + count + block_size, packed.len(), "one block");
+    let mut stream = packed.to_vec();
+    stream[0] &= !0x40;
+    let sum = 0x5a ^ u32::from(stream[0]) ^ block_size as u32 ^ (block_size >> 8) as u32 ^ (block_size >> 16) as u32;
+    stream[1] = sum as u8;
+    for _ in 0..20_000 {
+        stream.extend(block_head(0x07, 0));
+    }
+    stream.extend(block_head(0x47, 0));
+    let (out, end) = rar5(&stream, head.rar_version == 1, None, size + 10);
+    assert_eq!(end, End::Cut);
+    assert_eq!(out.len(), size);
+}

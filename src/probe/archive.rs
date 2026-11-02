@@ -32,7 +32,8 @@ pub struct ArchiveHead {
     /// a folder, not a file
     #[serde(skip)]
     pub dir: bool,
-    /// RAR5's compression version: 0 for RAR 5, 1 for RAR 7's longer distances
+    /// RAR5's compression version: 0 for RAR 5, 1 for RAR 7's longer distances. RAR4's version needed to unpack:
+    /// 15, 20, 26 or 29.
     #[serde(skip)]
     pub rar_version: u8,
     /// RAR: decoding this file needs the ones before it
@@ -94,6 +95,8 @@ fn le32(b: &[u8], at: usize) -> Option<u32> {
 fn rar4(data: &[u8], max: usize) -> Vec<ArchiveHead> {
     let mut out = Vec::new();
     let mut at = RAR4.len();
+    let mut solid_archive = false;
+    let mut files = 0;
     while let (Some(kind), Some(flags), Some(size)) = (data.get(at + 2), le16(data, at + 3), le16(data, at + 5)) {
         let size = usize::from(size);
         if size < 7 || out.len() >= max {
@@ -104,6 +107,7 @@ fn rar4(data: &[u8], max: usize) -> Vec<ArchiveHead> {
         };
         match *kind {
             0x73 => {
+                solid_archive = flags & 0x0008 != 0;
                 if flags & 0x0080 != 0 {
                     out.push(ArchiveHead {
                         format: "RAR4".into(),
@@ -122,6 +126,11 @@ fn rar4(data: &[u8], max: usize) -> Vec<ArchiveHead> {
                 head.crc32 = le32(data, at + 16);
                 let method = data.get(at + 25).copied();
                 head.method = method.map(|m| format!("m{}", m.saturating_sub(0x30)));
+                head.rar_version = data.get(at + 24).copied().unwrap_or(0);
+                // before 2.0 a file's own flag isn't read: every file after the first in a solid archive is solid
+                head.solid = if head.rar_version < 20 { solid_archive && files > 0 } else { flags & 0x0010 != 0 };
+                head.split_before = flags & 0x0001 != 0;
+                files += 1;
                 let name_len = usize::from(le16(data, at + 26).unwrap_or(0));
                 let high = if flags & 0x0100 != 0 { 8 } else { 0 };
                 // within this header, and no longer than a name needs

@@ -252,13 +252,22 @@ fn methods_not_decoded_yet_say_so() {
     let n = unwrap(&r);
     assert_eq!(formats(&n), ["RAR5 m3"]);
     assert_eq!(n.layers[0].stop.as_deref(), Some("starts in the volume before"));
-    // RAR4's own compression comes in a later change
-    let mut fields = r4_file_fields(b"movie.mkv", v.len() as u32);
-    fields[14] = 0x33;
-    let r = rar4(&[r4_main(0), [r4_block(0x74, 0, &fields, Some(v.len() as u32)), v.clone()].concat()]);
-    let n = unwrap(&r);
-    assert_eq!(formats(&n), ["RAR4 m3"]);
-    assert_eq!(n.layers[0].stop.as_deref(), Some("no decoder for this yet"));
+    // a RAR4 version that was never made, and a file whose front is in the volume before
+    let rar4_m3 = |version: u8, flags: u16, data: &[u8]| {
+        let mut fields = r4_file_fields(b"movie.mkv", data.len() as u32);
+        fields[13] = version;
+        fields[14] = 0x33;
+        rar4(&[r4_main(0), [r4_block(0x74, flags, &fields, Some(data.len() as u32)), data.to_vec()].concat()])
+    };
+    let zeros = [0u8; 64];
+    for (version, flags, data, why) in
+        [(40, 0, &zeros, "no decoder for this yet"), (29, 1, &zeros, "starts in the volume before")]
+    {
+        let r = rar4_m3(version, flags, data);
+        let n = unwrap(&r);
+        assert_eq!(formats(&n), ["RAR4 m3"]);
+        assert_eq!(n.layers[0].stop.as_deref(), Some(why));
+    }
     let mut lzo = b"\x89LZO\0\r\n\x1a\n".to_vec();
     lzo.extend([0; 20]);
     let n = unwrap(&lzo);
@@ -505,6 +514,50 @@ fn compressed_rar5_goes_on_down() {
     // the same file at m5 decodes the same
     let m5 = include_bytes!("../../../tests/fixtures/rar5/m5_max.rar");
     same(&unwrap(m5).inner, &n.inner);
+}
+
+#[test]
+fn compressed_rar4_goes_on_down() {
+    for (data, format) in [
+        (&include_bytes!("../../../tests/fixtures/rar3/compressed_text_rar300.rar")[..], "RAR4 m3"),
+        (include_bytes!("../../../tests/fixtures/rar3/rarvm_audio_stereo_rar300.rar"), "RAR4 m5"),
+        (include_bytes!("../../../tests/fixtures/rar3/rar250_biglz.rar"), "RAR4 m5"),
+        (include_bytes!("../../../tests/fixtures/rar3/readme_154_normal.rar"), "RAR4 m3"),
+    ] {
+        let n = unwrap(data);
+        let head = crate::probe::archive::parse(data).unwrap();
+        assert_eq!(formats(&n)[0], format);
+        assert!(n.layers[0].stop.is_none(), "{format}: {:?}", n.layers[0].stop);
+        assert_eq!(n.inner.len() as u64, head.unpacked.unwrap());
+        assert_eq!(crate::archive::crc32(&n.inner), head.crc32.unwrap());
+    }
+    // past the ratio cap, with a filter's block running over it: still a true front
+    let data = include_bytes!("../../../tests/fixtures/rar3/rarvm_x86_e8_rar300.rar");
+    let n = unwrap(data);
+    assert!(n.layers[0].capped);
+    let head = crate::probe::archive::parse(data).unwrap();
+    let at = head.data_at.unwrap();
+    let (whole, _) = codec::rar3::rar29(&data[at..at + head.packed.unwrap() as usize], head.unpacked, usize::MAX, true);
+    assert!(n.inner.len() > 40_000 && whole.starts_with(&n.inner));
+    // split after a few packed bytes: the rest is in the next volume, so nothing past them is made up
+    let data = include_bytes!("../../../tests/fixtures/rar3/compressed_text_rar300.rar");
+    let head = crate::probe::archive::parse(data).unwrap();
+    let at = head.data_at.unwrap();
+    let (whole, _) = codec::rar3::rar29(&data[at..at + head.packed.unwrap() as usize], head.unpacked, usize::MAX, true);
+    let file = 20;
+    assert_eq!(data[file + 2], 0x74);
+    for keep in [10u32, 34, 60] {
+        let mut split = data[..at + keep as usize].to_vec();
+        split[file + 3] |= 0x02;
+        split[file + 7..file + 11].copy_from_slice(&keep.to_le_bytes());
+        let n = unwrap(&split);
+        let stop = n.layers[0].stop.as_deref();
+        assert!(
+            stop == Some("nothing decoded") || whole.starts_with(&n.inner),
+            "kept {keep}: {stop:?} {:?}",
+            String::from_utf8_lossy(&n.inner)
+        );
+    }
 }
 
 #[test]
