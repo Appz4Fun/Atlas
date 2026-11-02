@@ -259,6 +259,9 @@ pub fn parse_sps(nal: &[u8]) -> Result<Sps> {
     if r.flag()? {
         let bit_depth_luma = r.bits(4)? as u8 + 1;
         let bit_depth_chroma = r.bits(4)? as u8 + 1;
+        if bit_depth_luma > s.bit_depth_luma || bit_depth_chroma > s.bit_depth_chroma {
+            return Err(DecodeError::Invalid("PCM bit depth"));
+        }
         let log2_min = r.ue_max(2, "PCM size")? + 3;
         let log2_max = log2_min + r.ue_max(2, "PCM size")?;
         s.pcm = Some(Pcm { bit_depth_luma, bit_depth_chroma, log2_min, log2_max, loop_filter_disabled: r.flag()? });

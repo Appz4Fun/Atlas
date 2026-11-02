@@ -19,7 +19,7 @@ use crate::video::picture::{Crop, Picture};
 
 /// Decodes the first picture in `units` (NAL units, in order, parameter sets first), which must be intra.
 pub fn decode_keyframe(units: &[&[u8]]) -> Result<Picture> {
-    let (picture, error) = decode_partly(units);
+    let (picture, error) = decode(units, false);
     match error {
         Some(e) => Err(e),
         None => picture.ok_or(DecodeError::Truncated),
@@ -27,13 +27,23 @@ pub fn decode_keyframe(units: &[&[u8]]) -> Result<Picture> {
 }
 
 /// What was decoded before anything went wrong, and what did.
+#[cfg(test)]
 pub(crate) fn decode_partly(units: &[&[u8]]) -> (Option<Picture>, Option<DecodeError>) {
+    decode(units, true)
+}
+
+/// The picture and any error. A picture with an error is filtered only when `partial` asks for it: no one else
+/// looks at it.
+fn decode(units: &[&[u8]], partial: bool) -> (Option<Picture>, Option<DecodeError>) {
     let mut frame: Option<Frame> = None;
     let mut error = read_picture(units, &mut frame).err();
     let Some(mut f) = frame else { return (None, error.or(Some(DecodeError::Truncated))) };
     // a slice that never came leaves its part of the picture grey
     if error.is_none() && f.ctb_slice.contains(&-1) {
         error = Some(DecodeError::Truncated);
+    }
+    if error.is_some() && !partial {
+        return (None, error);
     }
     f.deblock();
     f.apply_sao();
@@ -86,8 +96,8 @@ fn read_picture(units: &[&[u8]], frame: &mut Option<Frame>) -> Result<()> {
                     Some(f) => f,
                     None if header.first_in_picture => {
                         // Level 6.2's biggest picture
-                        if u64::from(s.width) * u64::from(s.height) > 8192 * 4320 {
-                            return Err(DecodeError::Unsupported("picture bigger than 8K"));
+                        if u64::from(s.width) * u64::from(s.height) > crate::video::MAX_LUMA_SAMPLES {
+                            return Err(DecodeError::Unsupported("picture bigger than 4K"));
                         }
                         frame.insert(Frame::new(s, p))
                     }

@@ -168,7 +168,10 @@ fn a_size_that_isnt_whole_coding_blocks_is_refused() {
     let sps = units.iter().position(|u| (u[0] >> 1) & 0x3f == super::nal::SPS).unwrap();
     units[sps][20] ^= 0x10;
     let refs: Vec<&[u8]> = units.iter().map(Vec::as_slice).collect();
-    assert!(decode_keyframe(&refs).is_err());
+    assert_eq!(
+        decode_keyframe(&refs).unwrap_err(),
+        crate::video::bits::DecodeError::Invalid("picture size not whole coding blocks")
+    );
 }
 
 #[test]
@@ -246,4 +249,23 @@ fn random_damage_never_panics() {
             let _ = decode_keyframe(&split_annex_b(&d));
         }
     }
+}
+
+#[test]
+fn pcm_deeper_than_the_picture_is_refused() {
+    let data = std::fs::read(format!("{}/tests/fixtures/hevc/s2.hevc", env!("CARGO_MANIFEST_DIR"))).unwrap();
+    let mut units: Vec<Vec<u8>> = split_annex_b(&data).iter().map(|u| u.to_vec()).collect();
+    let sps = units.iter().position(|u| u[0] >> 1 & 0x3F == 33).unwrap();
+    units[sps][23] ^= 0x20;
+    let refs: Vec<&[u8]> = units.iter().map(Vec::as_slice).collect();
+    assert_eq!(decode_keyframe(&refs).unwrap_err(), crate::video::bits::DecodeError::Invalid("PCM bit depth"));
+}
+
+#[test]
+fn a_frame_of_endless_tiny_units_is_refused() {
+    let frame: Vec<u8> = std::iter::repeat_n([1u8, 0x26], crate::video::MAX_UNITS + 1).flatten().collect();
+    assert_eq!(
+        super::nal::split_sized(&frame, 1).unwrap_err(),
+        crate::video::bits::DecodeError::Invalid("too many NAL units")
+    );
 }
