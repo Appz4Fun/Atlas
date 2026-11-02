@@ -538,6 +538,9 @@ fn start_warming() {
                 thread::sleep(WARM_EVERY);
             }
         });
+        thread::spawn(|| {
+            crate::web::keep_sort_windows_warm(|| RUNNING.lock().unwrap_or_else(|e| e.into_inner()).is_some());
+        });
     });
 }
 

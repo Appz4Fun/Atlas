@@ -5,7 +5,9 @@
 
 use std::collections::HashMap;
 use std::fmt::Write;
-use std::sync::LazyLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use sha1::{Digest, Sha1};
 
@@ -184,6 +186,7 @@ fn search_query(q: &str, cat: &str, offset: i64) -> String {
     parts.join("&")
 }
 
+#[derive(Clone)]
 struct Search {
     q: String,
     cat: String,
@@ -198,7 +201,7 @@ struct Search {
 /// Up to this many results get sorted: the newest or best matching ones.
 const SORT_WINDOW: i64 = 2_000;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum SortBy {
     Name,
     Category,
@@ -235,8 +238,19 @@ fn sort_rows(
     categories: &HashMap<i64, i64>,
     scores: &HashMap<i64, i64>,
 ) {
+    rows.sort_by(|a, b| row_order(a, b, by, descending, categories, scores));
+}
+
+fn row_order(
+    a: &ReleaseRow,
+    b: &ReleaseRow,
+    by: SortBy,
+    descending: bool,
+    categories: &HashMap<i64, i64>,
+    scores: &HashMap<i64, i64>,
+) -> std::cmp::Ordering {
     let flip = |o: std::cmp::Ordering| if descending { o.reverse() } else { o };
-    rows.sort_by(|a, b| match by {
+    match by {
         SortBy::Name => flip(a.name.to_lowercase().cmp(&b.name.to_lowercase())),
         SortBy::Category => {
             let of =
@@ -263,7 +277,7 @@ fn sort_rows(
             (None, Some(_)) => std::cmp::Ordering::Greater,
             (None, None) => std::cmp::Ordering::Equal,
         },
-    });
+    }
 }
 
 /// How far back "Hide copies" looks for what a page's copies are copies of.
@@ -462,21 +476,16 @@ impl Search {
 
     /// The table rows, or a full-width diagnostic when the first page has none.
     fn body(&self) -> String {
+        if self.sorts_from_a_window() {
+            return self.body_from_window();
+        }
         let filter = parse_filter(&self.cat);
         let windowed = self.windowed();
         let (from, count) = if windowed { (0, SORT_WINDOW) } else { (self.offset, PAGE_SIZE) };
         let searched = self.search(filter.as_ref(), from, count);
         let found = match searched {
             Ok(found) => found,
-            Err(e) => {
-                eprintln!("web search failed: {e}");
-                let message = "Atlas couldn't read its database. The error is in its log. Search again in a moment.";
-                return if self.offset == 0 {
-                    diag("caution", "the search failed", message)
-                } else {
-                    format!("<tr><td colspan=\"{COLUMNS}\" class=\"note\">{}</td></tr>", escape(message))
-                };
-            }
+            Err(e) => return self.search_failed(&e),
         };
         let read = found.len() as i64;
         let tagged = |r: &ReleaseRow| self.has_tags(r);
@@ -534,24 +543,14 @@ impl Search {
         // hidden: its rows can look like copies of each other
         let mut split = HashMap::new();
         let conn = crate::db::open().ok();
-        let one_group = !self.fields.group.is_empty();
         let post_of = |r: &ReleaseRow| {
             if r.complete {
                 return None;
             }
             conn.as_ref().and_then(|conn| release_info::split_post_with(conn, r).ok().flatten())
         };
-        let folded = |r: &ReleaseRow, post: &release_info::SplitPost| !one_group && post.listed_id() != r.id;
-        found.retain_mut(|r| {
-            let Some(post) = post_of(r) else { return true };
-            if folded(r, &post) {
-                return false;
-            }
-            r.size = Some(post.size);
-            r.complete = post.complete;
-            split.insert(r.id, post.groups.len());
-            true
-        });
+        let folded = |r: &ReleaseRow, post: &release_info::SplitPost| self.folds(r, post);
+        found.retain_mut(|r| self.fold_split_post(conn.as_ref(), r, &mut split));
         if hide_copies {
             // a copy of something on an earlier page is a copy too
             if !windowed && self.offset > 0 {
@@ -564,24 +563,81 @@ impl Search {
             let hidden = crate::duplicates::later_copies(&ids).unwrap_or_default();
             found.retain(|r| !hidden.contains(&r.id));
         }
-        let ids: Vec<i64> = found.iter().map(|r| r.id).collect();
-        let categories = crate::category::categories_of(&ids).unwrap_or_default();
-        let passwords = crate::archive::store::passwords(&ids);
-        let media = crate::media::query::attrs_of(&ids).unwrap_or_default();
-        let extras = RowExtras {
-            split,
-            copies: crate::duplicates::counts(&ids).unwrap_or_default(),
-            details: crate::media::details::kept_for(media.iter().map(|(id, m)| (*id, m.kind, &m.ids))),
-        };
-
-        let mut out: String = found.iter().map(|r| row(r, &categories, &passwords, &media, &extras)).collect();
+        let mut out = rows_html(&found, split).concat();
         if page_was_full {
-            let next = self.query(&self.cat, self.offset + PAGE_SIZE);
-            let next = attr(&next);
-            let _ = write!(
-                out,
-                "<tr><td colspan=\"{COLUMNS}\" class=\"note\"><a class=\"button\" href=\"/?{next}\" hx-get=\"/ui/results?{next}\" hx-target=\"closest tr\" hx-swap=\"outerHTML\">Load more</a></td></tr>"
-            );
+            out.push_str(&self.load_more());
+        }
+        out
+    }
+
+    fn search_failed(&self, error: &str) -> String {
+        eprintln!("web search failed: {error}");
+        let message = "Atlas couldn't read its database. The error is in its log. Search again in a moment.";
+        if self.offset == 0 {
+            diag("caution", "the search failed", message)
+        } else {
+            format!("<tr><td colspan=\"{COLUMNS}\" class=\"note\">{}</td></tr>", escape(message))
+        }
+    }
+
+    fn load_more(&self) -> String {
+        let next = attr(&self.query(&self.cat, self.offset + PAGE_SIZE));
+        format!(
+            "<tr><td colspan=\"{COLUMNS}\" class=\"note\"><a class=\"button\" href=\"/?{next}\" hx-get=\"/ui/results?{next}\" hx-target=\"closest tr\" hx-swap=\"outerHTML\">Load more</a></td></tr>"
+        )
+    }
+
+    /// Whether a row of a split post is left out for the row that stands for the post, unless the search is about one
+    /// of its groups.
+    fn folds(&self, r: &ReleaseRow, post: &release_info::SplitPost) -> bool {
+        self.fields.group.is_empty() && post.listed_id() != r.id
+    }
+
+    /// Makes a row of a split post say what all of the post comes to. False when another row stands for it.
+    fn fold_split_post(
+        &self,
+        conn: Option<&rusqlite::Connection>,
+        r: &mut ReleaseRow,
+        split: &mut HashMap<i64, usize>,
+    ) -> bool {
+        if r.complete {
+            return true;
+        }
+        let Some(post) = conn.and_then(|conn| release_info::split_post_with(conn, r).ok().flatten()) else {
+            return true;
+        };
+        if self.folds(r, &post) {
+            return false;
+        }
+        r.size = Some(post.size);
+        r.complete = post.complete;
+        split.insert(r.id, post.groups.len());
+        true
+    }
+
+    /// A sort takes its page from the search's window, with no database in the way once the window has been filled.
+    /// "Hide copies" depends on what's before the page, soo it still works the page out each time.
+    fn sorts_from_a_window(&self) -> bool {
+        self.sort.is_some() && !self.filters.contains(&HIDE_COPIES)
+    }
+
+    fn body_from_window(&self) -> String {
+        let window = match window_of(self) {
+            Ok(window) => window,
+            Err(e) => return self.search_failed(&e),
+        };
+        let Some(by) = self.sort else { return String::new() };
+        let (rows, more) = window.page(self, by);
+        if rows.is_empty() {
+            return if self.offset == 0 {
+                self.nothing_found()
+            } else {
+                format!("<tr><td colspan=\"{COLUMNS}\" class=\"note dim\">That's all of them.</td></tr>")
+            };
+        }
+        let mut out = rows.concat();
+        if more {
+            out.push_str(&self.load_more());
         }
         out
     }
@@ -659,17 +715,14 @@ impl Search {
             );
         }
         // the count goes by words and fields only, soo with tags filtering the page it would count rows it hides
-        let total = if self.fields.any() && !self.filters_by_tags() {
-            let filter = parse_filter(&self.cat);
-            match field_search::count_any(&self.fields, std::slice::from_ref(&self.q), filter.as_ref()) {
-                Ok(total) => format!("<strong class=\"total\">{}</strong>", escape(&total.describe())),
-                Err(e) => {
-                    eprintln!("web count failed: {e}");
-                    String::new()
-                }
-            }
-        } else {
+        let total = if !self.fields.any() || self.filters_by_tags() {
             String::new()
+        } else if self.sorts_from_a_window()
+            && let Ok(window) = window_of(self)
+        {
+            window.total.get_or_init(|| self.total()).clone()
+        } else {
+            self.total()
         };
         format!(
             "<div class=\"summary\"><span class=\"path\">{path}</span>{total}<span class=\"sort\">{}</span></div>{}",
@@ -677,6 +730,346 @@ impl Search {
             if scope.is_empty() { String::new() } else { format!("<div class=\"chips\">{scope}</div>") },
         )
     }
+
+    fn total(&self) -> String {
+        let filter = parse_filter(&self.cat);
+        match field_search::count_any(&self.fields, std::slice::from_ref(&self.q), filter.as_ref()) {
+            Ok(total) => format!("<strong class=\"total\">{}</strong>", escape(&total.describe())),
+            Err(e) => {
+                eprintln!("web count failed: {e}");
+                String::new()
+            }
+        }
+    }
+}
+
+/// How old a window can get before a click on it starts a new one. The click still gets the old one straight away.
+const WINDOW_FRESH: Duration = Duration::from_secs(60);
+/// How often the windows nobody has clicked lately are made again, soo the first click of the day finds one.
+const WINDOW_IDLE_FRESH: Duration = Duration::from_secs(15 * 60);
+/// What counts as lately.
+const WINDOW_IN_USE: Duration = Duration::from_secs(10 * 60);
+/// Searches with a window: a filled one is a few MB.
+const WINDOWS_KEPT: usize = 24;
+/// How long a click sorting by size waits for a new window's split posts, the most that a size can depend on. Past it
+/// the page goes by the sizes known so far, and the next click has them all.
+const SIZES_WAIT: Duration = Duration::from_secs(1);
+/// Threads rendering a window's rows.
+const FILL_THREADS: usize = 4;
+
+/// Places in a window's rows, in the order a column and direction put them.
+type Order = Arc<Vec<usize>>;
+
+/// One row as a results page shows it.
+struct ShownRow {
+    html: String,
+    /// what it sorts by: all of a post spread over several groups
+    size: Option<i64>,
+    /// another row stands for its post
+    folded: bool,
+}
+
+/// The first `SORT_WINDOW` results of one search, whatever the sort, kept in memory: choosing a column only puts these
+/// in another order. Rows are rendered in the background, each the first time something needs it.
+struct Window {
+    built: Instant,
+    rows: Vec<ReleaseRow>,
+    /// by release, for the columns that need them, read once
+    categories: OnceLock<HashMap<i64, i64>>,
+    scores: OnceLock<HashMap<i64, i64>>,
+    total: OnceLock<String>,
+    shown: Mutex<HashMap<i64, ShownRow>>,
+    orders: Mutex<HashMap<(SortBy, bool), Order>>,
+    filled: AtomicBool,
+}
+
+impl Window {
+    fn read(search: &Search) -> Result<Window, String> {
+        let filter = parse_filter(&search.cat);
+        let rows = search.search(filter.as_ref(), 0, SORT_WINDOW)?;
+        Ok(Window {
+            built: Instant::now(),
+            rows: search.keep_tagged(rows, usize::MAX),
+            categories: OnceLock::new(),
+            scores: OnceLock::new(),
+            total: OnceLock::new(),
+            shown: Mutex::new(HashMap::new()),
+            orders: Mutex::new(HashMap::new()),
+            filled: AtomicBool::new(false),
+        })
+    }
+
+    fn ids(&self) -> Vec<i64> {
+        self.rows.iter().map(|r| r.id).collect()
+    }
+
+    fn categories(&self) -> &HashMap<i64, i64> {
+        self.categories.get_or_init(|| crate::category::categories_of(&self.ids()).unwrap_or_default())
+    }
+
+    /// Only the scores already kept: fetching them for a whole search would use up the providers' limits.
+    fn scores(&self) -> &HashMap<i64, i64> {
+        self.scores.get_or_init(|| {
+            let media = crate::media::query::attrs_of(&self.ids()).unwrap_or_default();
+            crate::media::details::kept_for(media.iter().map(|(id, m)| (*id, m.kind, &m.ids)))
+                .into_iter()
+                .filter_map(|(id, d)| Some((id, score_value(&d)?)))
+                .collect()
+        })
+    }
+
+    fn order(&self, by: SortBy, descending: bool) -> Order {
+        if let Some(order) = lock(&self.orders).get(&(by, descending)) {
+            return order.clone();
+        }
+        let none = HashMap::new();
+        let categories = if by == SortBy::Category { self.categories() } else { &none };
+        let scores = if by == SortBy::Rating { self.scores() } else { &none };
+        let mut sized = None;
+        if by == SortBy::Size {
+            let shown = lock(&self.shown);
+            let mut rows = self.rows.clone();
+            for r in &mut rows {
+                if let Some(row) = shown.get(&r.id) {
+                    r.size = row.size;
+                }
+            }
+            sized = Some(rows);
+        }
+        let rows = sized.as_ref().unwrap_or(&self.rows);
+        let mut order: Vec<usize> = (0..rows.len()).collect();
+        order.sort_by(|&a, &b| row_order(&rows[a], &rows[b], by, descending, categories, scores));
+        let order = Arc::new(order);
+        lock(&self.orders).insert((by, descending), order.clone());
+        order
+    }
+
+    /// Renders rows that aren't yet.
+    fn render(&self, search: &Search, rows: &[ReleaseRow]) {
+        let conn = crate::db::open().ok();
+        let mut kept = Vec::with_capacity(rows.len());
+        let mut split = HashMap::new();
+        let mut done = Vec::with_capacity(rows.len());
+        for r in rows {
+            let mut r = r.clone();
+            if search.fold_split_post(conn.as_ref(), &mut r, &mut split) {
+                kept.push(r);
+            } else {
+                done.push((r.id, ShownRow { html: String::new(), size: r.size, folded: true }));
+            }
+        }
+        for (r, html) in kept.iter().zip(rows_html(&kept, split)) {
+            done.push((r.id, ShownRow { html, size: r.size, folded: false }));
+        }
+        lock(&self.shown).extend(done);
+    }
+
+    /// A page's rows, and whether more follow. Renders only what the page reaches and nothing has rendered yet.
+    fn page(&self, search: &Search, by: SortBy) -> (Vec<String>, bool) {
+        if by == SortBy::Size {
+            let started = Instant::now();
+            while !self.filled.load(Ordering::Acquire) && started.elapsed() < SIZES_WAIT {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        let order = self.order(by, search.descending);
+        let skip = usize::try_from(search.offset).unwrap_or(0);
+        let wanted = PAGE_SIZE as usize + 1;
+        loop {
+            let mut page = Vec::with_capacity(wanted);
+            let mut missing = Vec::new();
+            {
+                let shown = lock(&self.shown);
+                let mut passed = 0;
+                for &place in order.iter() {
+                    let r = &self.rows[place];
+                    match shown.get(&r.id) {
+                        Some(row) if row.folded => continue,
+                        Some(row) => {
+                            if passed >= skip {
+                                page.push(row.html.clone());
+                            }
+                            passed += 1;
+                        }
+                        None => missing.push(r.clone()),
+                    }
+                    if page.len() == wanted || missing.len() == PAGE_SIZE as usize {
+                        break;
+                    }
+                }
+            }
+            if missing.is_empty() {
+                let more = page.len() == wanted;
+                page.truncate(PAGE_SIZE as usize);
+                return (page, more);
+            }
+            self.render(search, &missing);
+        }
+    }
+
+    /// Renders every row and works out every order, soo no click has any of it left to do.
+    fn fill(&self, search: &Search) {
+        let shown = lock(&self.shown);
+        let missing: Vec<ReleaseRow> = self.rows.iter().filter(|r| !shown.contains_key(&r.id)).cloned().collect();
+        drop(shown);
+        let slices: Vec<&[ReleaseRow]> = missing.chunks(PAGE_SIZE as usize).collect();
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..FILL_THREADS {
+                scope.spawn(|| {
+                    while let Some(slice) = slices.get(next.fetch_add(1, Ordering::Relaxed)) {
+                        self.render(search, slice);
+                    }
+                });
+            }
+        });
+        // sizes may have changed with the split posts
+        lock(&self.orders).clear();
+        for (by, _) in SortBy::ALL {
+            self.order(by, false);
+            self.order(by, true);
+        }
+        self.filled.store(true, Ordering::Release);
+    }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// A search's window, and what keeps two clicks from each reading one.
+struct WindowSlot {
+    /// the search, with no sort or page
+    search: Search,
+    window: Mutex<Option<Arc<Window>>>,
+    reading: Mutex<()>,
+    replacing: AtomicBool,
+    used: Mutex<Instant>,
+    /// a category's own page, kept warm whether or not anyone has clicked it
+    always: bool,
+}
+
+static WINDOWS: LazyLock<Mutex<HashMap<String, Arc<WindowSlot>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// One background read at a time, on a machine that's indexing.
+static BACKGROUND: Mutex<()> = Mutex::new(());
+
+fn slot_of(search: &Search, always: bool) -> Arc<WindowSlot> {
+    let plain = Search { offset: 0, sort: None, descending: true, ..search.clone() };
+    let key = plain.query(&plain.cat, 0);
+    let mut windows = lock(&WINDOWS);
+    if !windows.contains_key(&key) && windows.len() >= WINDOWS_KEPT {
+        let oldest = windows
+            .iter()
+            .filter(|(_, slot)| !slot.always)
+            .min_by_key(|(_, slot)| *lock(&slot.used))
+            .map(|(k, _)| k.clone());
+        if let Some(oldest) = oldest {
+            windows.remove(&oldest);
+        }
+    }
+    windows
+        .entry(key)
+        .or_insert_with(|| {
+            Arc::new(WindowSlot {
+                search: plain,
+                window: Mutex::new(None),
+                reading: Mutex::new(()),
+                replacing: AtomicBool::new(false),
+                // nobody has clicked it yet
+                used: Mutex::new(Instant::now().checked_sub(WINDOW_IN_USE).unwrap_or_else(Instant::now)),
+                always,
+            })
+        })
+        .clone()
+}
+
+/// The window to answer with now: the one there is, however old, or a new one when there's none.
+fn window_of(search: &Search) -> Result<Arc<Window>, String> {
+    let slot = slot_of(search, false);
+    *lock(&slot.used) = Instant::now();
+    if let Some(window) = lock(&slot.window).clone() {
+        if window.built.elapsed() > WINDOW_FRESH {
+            replace_in_background(&slot);
+        }
+        return Ok(window);
+    }
+    let _reading = lock(&slot.reading);
+    if let Some(window) = lock(&slot.window).clone() {
+        return Ok(window);
+    }
+    let window = Arc::new(Window::read(&slot.search)?);
+    *lock(&slot.window) = Some(window.clone());
+    let (filling, for_fill) = (window.clone(), slot.clone());
+    std::thread::spawn(move || {
+        let _turn = lock(&BACKGROUND);
+        filling.fill(&for_fill.search);
+    });
+    Ok(window)
+}
+
+/// Clears `replacing` however the work ends.
+struct Replacing(Arc<WindowSlot>);
+
+impl Drop for Replacing {
+    fn drop(&mut self) {
+        self.0.replacing.store(false, Ordering::Release);
+    }
+}
+
+fn replace_in_background(slot: &Arc<WindowSlot>) {
+    if slot.replacing.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let replacing = Replacing(slot.clone());
+    std::thread::spawn(move || replace(replacing));
+}
+
+/// A new window takes over only once it's filled, soo a click never finds a worse one than the last.
+fn replace(replacing: Replacing) {
+    let slot = &replacing.0;
+    let _turn = lock(&BACKGROUND);
+    let Ok(window) = Window::read(&slot.search) else { return };
+    window.fill(&slot.search);
+    *lock(&slot.window) = Some(Arc::new(window));
+}
+
+/// Keeps a window ready for each category's page and for what was clicked lately. Doesn't return.
+pub(crate) fn keep_sort_windows_warm(running: impl Fn() -> bool) {
+    let plain = Search::from_args(&HashMap::new());
+    slot_of(&plain, true);
+    for root in TABLE {
+        slot_of(&Search { cat: root.id.to_string(), ..plain.clone() }, true);
+    }
+    loop {
+        if running() {
+            let slots: Vec<Arc<WindowSlot>> = lock(&WINDOWS).values().cloned().collect();
+            for slot in slots {
+                let in_use = lock(&slot.used).elapsed() < WINDOW_IN_USE;
+                let fresh_for = if in_use { WINDOW_FRESH } else { WINDOW_IDLE_FRESH };
+                let current = lock(&slot.window).clone();
+                let stale = current.is_none_or(|window| window.built.elapsed() > fresh_for);
+                if stale && !slot.replacing.swap(true, Ordering::AcqRel) {
+                    replace(Replacing(slot.clone()));
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_secs(5));
+    }
+}
+
+/// Each row's HTML, with what it shows beyond itself read for all of them at once.
+fn rows_html(found: &[ReleaseRow], split: HashMap<i64, usize>) -> Vec<String> {
+    let ids: Vec<i64> = found.iter().map(|r| r.id).collect();
+    let categories = crate::category::categories_of(&ids).unwrap_or_default();
+    let passwords = crate::archive::store::passwords(&ids);
+    let media = crate::media::query::attrs_of(&ids).unwrap_or_default();
+    let extras = RowExtras {
+        split,
+        copies: crate::duplicates::counts(&ids).unwrap_or_default(),
+        details: crate::media::details::kept_for(media.iter().map(|(id, m)| (*id, m.kind, &m.ids))),
+    };
+    found.iter().map(|r| row(r, &categories, &passwords, &media, &extras)).collect()
 }
 
 /// What a result shows beyond its own row.
