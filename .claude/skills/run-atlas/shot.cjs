@@ -13,7 +13,9 @@ const { chromium } = require('playwright');
 
 (async () => {
 
-const [base, key, outArg, path = '/', ...rest] = process.argv.slice(2);
+const [base, key, outArg, ...rest] = process.argv.slice(2);
+// PATH is optional, so `shot OUT --dark` must not take --dark for it
+const path = rest[0] && !rest[0].startsWith('--') ? rest.shift() : '/';
 if (!outArg) { console.error('usage: shot.cjs BASE KEY OUT [PATH] [--dark] [--width N]'); process.exit(1); }
 const out = outArg.endsWith('.png') ? outArg : `${outArg}.png`;
 const dark = rest.includes('--dark');

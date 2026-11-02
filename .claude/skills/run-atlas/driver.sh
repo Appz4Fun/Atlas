@@ -22,6 +22,10 @@ API_PORT="${API_PORT:-9099}"
 KEY="driver-key"
 BASE="http://127.0.0.1:$API_PORT"
 SESSION=atlas
+# absolute, because the menu is launched after a cd into ATLAS_HOME
+mkdir -p "$ATLAS_HOME"
+ATLAS_HOME="$(cd "$ATLAS_HOME" && pwd)"
+case "$ATLAS_BIN" in /*) ;; *) ATLAS_BIN="$PWD/$ATLAS_BIN" ;; esac
 
 count() { curl -s "$BASE/api?t=search&apikey=$KEY&limit=100" | { grep -o '<item>' || true; } | wc -l; }
 
