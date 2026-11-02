@@ -212,6 +212,15 @@ pub struct MediaConfig {
     pub omdb: OmdbConfig,
     pub trakt: TraktConfig,
     pub tvdb: TvdbConfig,
+    pub opensubtitles: OpenSubtitlesConfig,
+}
+
+/// What a probed video's hash matches: opensubtitles.com's REST API.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpenSubtitlesConfig {
+    pub api_key: String,
+    pub requests_per_minute: i64,
+    pub base_url: Option<String>,
 }
 
 impl Default for MediaConfig {
@@ -226,6 +235,7 @@ impl Default for MediaConfig {
             omdb: OmdbConfig { api_key: String::new(), requests_per_minute: 30, base_url: None },
             trakt: TraktConfig { client_id: String::new(), requests_per_minute: 120, base_url: None },
             tvdb: TvdbConfig { api_key: String::new(), pin: String::new(), requests_per_minute: 120, base_url: None },
+            opensubtitles: OpenSubtitlesConfig { api_key: String::new(), requests_per_minute: 60, base_url: None },
         }
     }
 }
@@ -286,6 +296,11 @@ impl MediaConfig {
         c.tvdb.pin = text(tvdb, "pin").unwrap_or_default();
         rate(tvdb, 600, &mut c.tvdb.requests_per_minute);
         c.tvdb.base_url = text(tvdb, "base_url").filter(|u| !u.is_empty());
+        let opensubtitles = v.get("opensubtitles");
+        c.opensubtitles.api_key = text(opensubtitles, "api_key").unwrap_or_default();
+        // their published limit is 40 in 10 s
+        rate(opensubtitles, 240, &mut c.opensubtitles.requests_per_minute);
+        c.opensubtitles.base_url = text(opensubtitles, "base_url").filter(|u| !u.is_empty());
         c
     }
 }
