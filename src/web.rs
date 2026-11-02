@@ -997,7 +997,7 @@ fn search_page(args: &HashMap<String, String>, base: &str) -> String {
 </main></div>"##,
             masthead = masthead(true),
             nav = category_nav(&search, ""),
-            q = q_input(&search.q, ""),
+            q = q_input(&search.q),
             ask = ask_box(&gemini::load()),
             cat = category_input(&search.cat, ""),
             scope = scope_inputs(&search, ""),
@@ -1833,9 +1833,9 @@ fn id_links(kind: i64, ids: &crate::media::resolve::Ids) -> String {
 }
 
 /// Also what someone pointing a browser at the bare address gets, soo it says how to set up a client.
-fn q_input(q: &str, oob: &str) -> String {
+fn q_input(q: &str) -> String {
     format!(
-        "<input id=\"q\" name=\"q\" type=\"search\" placeholder=\"Search releases\" value=\"{}\" autocomplete=\"off\" spellcheck=\"false\" autofocus aria-label=\"Search releases\"{oob}>",
+        "<input id=\"q\" name=\"q\" type=\"search\" placeholder=\"Search releases\" value=\"{}\" autocomplete=\"off\" spellcheck=\"false\" autofocus aria-label=\"Search releases\">",
         attr(q)
     )
 }
@@ -1854,7 +1854,7 @@ fn ask_box(settings: &gemini::Settings) -> String {
         );
     }
     format!(
-        r##"<form id="ask" class="searchbar askbar" action="/ui/ask" method="post" hx-post="/ui/ask" hx-target="#results" hx-sync="this:replace" hx-indicator="#asking" hx-disabled-elt="find button">
+        r##"<form id="ask" class="searchbar askbar" action="/ui/ask" method="post" hx-post="/ui/ask" hx-target="#results" hx-sync="#search:replace" hx-indicator="#asking" hx-disabled-elt="find button">
 <div class="search-field"><input id="ask-q" name="ask" type="search" maxlength="{max}" placeholder="Ask in plain words: 4K Dolby Vision remuxes of Dune, biggest first" autocomplete="off" aria-label="Ask in plain words"></div>
 <button class="button">Ask AI</button><span id="asking" class="busy">asking Gemini…</span></form>
 {note}"##,
@@ -1948,11 +1948,12 @@ fn ask(body: &str, htmx: bool) -> ApiResponse {
     }
     let said = if plan.note.is_empty() { String::new() } else { format!(" {}", escape(&plan.note)) };
     let note = format!(
-        "<div class=\"ask-read\"><p><span class=\"tag tag-ref\">GEMINI</span>{said}</p><p class=\"path\">Searched {}</p></div>",
+        "<div class=\"ask-read\" data-q=\"{}\"><p><span class=\"tag tag-ref\">GEMINI</span>{said}</p><p class=\"path\">Searched {}</p></div>",
+        attr(&search.q),
         escape(&described(&search)),
     );
-    let oob = " hx-swap-oob=\"true\"";
-    first_page(&search, &format!("{}{}", ask_note(&note, oob), q_input(&search.q, oob)))
+    // the search box takes the words from `data-q` (web.js): swapping the box would drop the form's listener on it
+    first_page(&search, &ask_note(&note, " hx-swap-oob=\"true\""))
 }
 
 fn settings_page(message: Option<(&str, &str, String)>) -> String {

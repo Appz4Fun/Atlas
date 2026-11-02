@@ -185,13 +185,20 @@ fn ask_ai_end_to_end() {
     // the search page has the box now, and never the key
     let page = fetch(port, "/", &cookie);
     assert!(page.body.contains("id=\"ask\"") && !page.body.contains(GEMINI_KEY), "{}", page.body);
+    // a newer plain search supersedes a question still waiting on Gemini, and the other way round
+    assert!(
+        page.body.contains("hx-post=\"/ui/ask\" hx-target=\"#results\" hx-sync=\"#search:replace\""),
+        "{}",
+        page.body
+    );
 
     // a question becomes a search
     let asked = post(port, "/ui/ask", "ask=4k+findword+please", &cookie, true);
     assert_eq!(asked.status(), 200);
     assert!(asked.body.contains("Film.Findword") && !asked.body.contains("Tv.Findword"), "{}", asked.body);
     assert!(asked.body.contains("4K copies of Findword") && asked.body.contains("id=\"ask-note\""), "{}", asked.body);
-    assert!(asked.body.contains("value=\"Findword\""), "the search box follows: {}", asked.body);
+    assert!(asked.body.contains("data-q=\"Findword\""), "the search box follows: {}", asked.body);
+    assert!(!asked.body.contains("id=\"q\""), "the box keeps its listeners, soo it isn't swapped: {}", asked.body);
     assert_eq!(asked.header("HX-Push-Url").as_deref(), Some("/?q=Findword&filters=2160p"));
     assert!(!asked.body.contains(GEMINI_KEY));
     let request = seen.lock().unwrap().last().cloned().unwrap();
@@ -202,6 +209,13 @@ fn ask_ai_end_to_end() {
     let plain = post(port, "/ui/ask", "ask=4k+findword", &cookie, false);
     assert_eq!(plain.status(), 303);
     assert_eq!(plain.header("Location").as_deref(), Some("/?q=Findword&filters=2160p"));
+
+    // too long to be a question: turned away whole, never cut short
+    let long = format!("ask={}", "%E4%B8%AD".repeat(1000));
+    assert_eq!(post(port, "/ui/ask", &long, &cookie, true).status(), 413);
+    // 500 characters of CJK fits
+    let cjk = format!("ask={}", "%E4%B8%AD".repeat(500));
+    assert_eq!(post(port, "/ui/ask", &cjk, &cookie, true).status(), 200);
 
     // nothing asked: said where the note goes, the results stay
     let empty = post(port, "/ui/ask", "ask=+", &cookie, true);

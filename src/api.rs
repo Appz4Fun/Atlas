@@ -416,8 +416,9 @@ fn endpoint_of(path: &str, query: &str) -> Endpoint {
     }
 }
 
-/// A small form, not an upload: anything past this can't be a key.
-const MAX_FORM_BODY: u64 = 4096;
+/// A small form, not an upload: a key, or an Ask AI question of 500 characters percent-encoded. Anything longer is
+/// turned away whole, never read in part.
+const MAX_FORM_BODY: u64 = 8192;
 
 fn respond(mut request: Request, api_key: &str, fallback_host: &str) {
     let url = request.url().to_string();
@@ -441,9 +442,22 @@ fn respond(mut request: Request, api_key: &str, fallback_host: &str) {
             .unwrap_or_else(|| handle(path, query, &base, api_key))
     } else if *request.method() == tiny_http::Method::Post && crate::web::takes_post(path) {
         let mut body = String::new();
-        let _ = request.as_reader().take(MAX_FORM_BODY).read_to_string(&mut body);
+        let _ = request.as_reader().take(MAX_FORM_BODY + 1).read_to_string(&mut body);
+        let too_long = body.len() as u64 > MAX_FORM_BODY;
         let htmx = request.headers().iter().any(|h| h.field.equiv("HX-Request"));
-        crate::web::post(path, &body, cookies.as_deref(), htmx, &base, api_key).unwrap_or_else(ApiResponse::not_found)
+        if too_long {
+            ApiResponse {
+                status: 413,
+                content_type: None,
+                body: String::new(),
+                headers: Vec::new(),
+                bytes: None,
+                failed: false,
+            }
+        } else {
+            crate::web::post(path, &body, cookies.as_deref(), htmx, &base, api_key)
+                .unwrap_or_else(ApiResponse::not_found)
+        }
     } else {
         ApiResponse {
             status: 405,
