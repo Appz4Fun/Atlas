@@ -235,8 +235,11 @@ impl Step for Par2Step {
         let one_set =
             inventory.files.first().is_some_and(|first| inventory.files.iter().all(|f| f.set_id == first.set_id));
         let covers_all = inventory.complete && one_set && inventory.files.len() == posted_files;
-        let posted = covers_all.then(|| duplicates::posted_fingerprint(&inventory.files)).flatten();
-        let posted_names = covers_all.then(|| duplicates::posted_names_fingerprint(&inventory.files)).flatten();
+        let recovery_blocks = files.iter().map(|f| crate::release_info::recovery_blocks(&f.filename)).sum::<i64>();
+        let articles: Vec<i64> = files.iter().map(|f| f.expected.unwrap_or(f.parts_seen)).collect();
+        let posted = covers_all
+            .then(|| duplicates::twin_fingerprint(&inventory.files, inventory.block_size, recovery_blocks, &articles))
+            .flatten();
         let sizes = inventory.block_size.filter(|_| covers_all).map(|block| {
             // each file's last block is padded on its own
             let blocks: u64 = inventory.files.iter().map(|f| f.size.div_ceil(block)).sum();
@@ -253,10 +256,6 @@ impl Step for Par2Step {
         if let Some(posted) = posted {
             let params = vec![ctx.release().id.into(), posted.into()];
             outcome.writes.push(StepWrite::new(duplicates::SET_POSTED, params));
-        }
-        if let Some(names) = posted_names {
-            let params = vec![ctx.release().id.into(), names.into()];
-            outcome.writes.push(StepWrite::new(duplicates::SET_POSTED_NAMES, params));
         }
         if let Some((block, blocks)) = sizes {
             let params = vec![ctx.release().id.into(), block.into(), blocks.into()];
