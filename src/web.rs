@@ -269,46 +269,15 @@ fn sort_rows(
 /// How far back "Hide copies" looks for what a page's copies are copies of.
 const MAX_EARLIER_FOR_COPIES: i64 = 2_000;
 
-/// The quick filters over results. Each is also searched for, except the last.
+/// The quick filters over results. Each but the last keeps the results whose name's tags say so, among the first
+/// `SORT_WINDOW`: searching the index for each way a tag is written was three or four full searches a click.
 const FILTERS: &[&str] = &["2160p", "1080p", "DV", "HDR", "Remux", "WEB-DL", "BluRay", HIDE_COPIES];
 const HIDE_COPIES: &str = "Hide copies";
 
-/// The first of each list, then the second of each, and soo on, each row once.
-fn take_in_turn(lists: &[Vec<ReleaseRow>]) -> Vec<ReleaseRow> {
-    let longest = lists.iter().map(Vec::len).max().unwrap_or(0);
-    let mut seen = std::collections::HashSet::new();
-    let mut rows = Vec::new();
-    for at in 0..longest {
-        for row in lists.iter().filter_map(|list| list.get(at)) {
-            if seen.insert(row.id) {
-                rows.push(row.clone());
-            }
-        }
-    }
-    rows
-}
+/// How many names have their tags read at once, before checking whether the page is full.
+const TAG_SLICE: usize = 128;
 
-/// How far a filtered search can page: this many rows, read for each way its words are written.
-const MAX_MERGED_ROWS: i64 = 5_000;
-
-/// How many searches a set of filters can turn into.
-const MAX_WORD_CHOICES: usize = 12;
-
-/// How names write what a filter asks. The search goes by word prefix, soo `HDR` covers `HDR10`.
-fn filter_spellings(filter: &str) -> &'static [&'static str] {
-    match filter {
-        "2160p" => &["2160p", "4k", "UHD"],
-        "1080p" => &["1080p"],
-        "DV" => &["DV", "DoVi", "DolbyVision", "Dolby.Vision"],
-        "HDR" => &["HDR"],
-        "Remux" => &["Remux"],
-        "WEB-DL" => &["WEB-DL", "WEBDL", "WEB"],
-        "BluRay" => &["BluRay", "Blu-Ray", "BDRip", "BRRip"],
-        _ => &[],
-    }
-}
-
-/// Whether a name's tags say what a filter asks. The search itself goes by word prefix, soo "DV" finds DVDRip too.
+/// Whether a name's tags say what a filter asks. Tags, not words, soo "DV" leaves DVDRip out.
 fn filter_matches(filter: &str, tags: &release_tags::Tags) -> bool {
     let quality = tags.quality.as_deref().unwrap_or_default();
     match filter {
@@ -409,47 +378,62 @@ impl Search {
         self.query_with(cat, offset, &self.filters)
     }
 
-    /// Each way of writing what the filters ask for, as words to search. `filter_matches` checks what comes back.
-    fn word_choices(&self) -> Vec<String> {
-        let mut choices = vec![self.q.clone()];
-        for filter in self.filters.iter().filter(|f| **f != HIDE_COPIES) {
-            let written = filter_spellings(filter);
-            let next: Vec<String> = choices
-                .iter()
-                .flat_map(|words| written.iter().map(move |spelling| format!("{words} {spelling}")))
-                .take(MAX_WORD_CHOICES)
-                .collect();
-            choices = next;
-        }
-        choices.iter().map(|words| words.trim().to_string()).collect()
+    /// Whether a filter other than "Hide copies" is on: those go by the tags of the results.
+    fn filters_by_tags(&self) -> bool {
+        self.filters.iter().any(|f| *f != HIDE_COPIES)
     }
 
-    /// Every spelling's results taken in turn, or the one search there is. Taking them in turn keeps a row's place as
-    /// more are asked for, soo "Load more" neither repeats nor skips any.
+    /// Whether the page is cut from the first `SORT_WINDOW` results, sorted or filtered, instead of read by offset.
+    fn windowed(&self) -> bool {
+        self.sort.is_some() || self.filters_by_tags()
+    }
+
+    /// Whether a name's tags say what every filter asks.
+    fn has_tags(&self, row: &ReleaseRow) -> bool {
+        if !self.filters_by_tags() {
+            return true;
+        }
+        let tags = release_tags::parse(&row.name);
+        self.filters.iter().all(|filter| filter_matches(filter, &tags))
+    }
+
+    /// The rows `has_tags` keeps, in order, until there are `enough`. Reading a name's tags takes about a millisecond,
+    /// soo they are read a slice at a time, on every core.
+    fn keep_tagged(&self, rows: Vec<ReleaseRow>, enough: usize) -> Vec<ReleaseRow> {
+        if !self.filters_by_tags() {
+            return rows;
+        }
+        let cores = std::thread::available_parallelism().map_or(4, |n| n.get()).min(16);
+        let mut kept = Vec::new();
+        for slice in rows.chunks(TAG_SLICE) {
+            let per = slice.len().div_ceil(cores).max(1);
+            let keep: Vec<bool> = std::thread::scope(|scope| {
+                let parts: Vec<_> = slice
+                    .chunks(per)
+                    .map(|part| scope.spawn(move || part.iter().map(|r| self.has_tags(r)).collect::<Vec<_>>()))
+                    .collect();
+                parts.into_iter().flat_map(|part| part.join().unwrap_or_default()).collect()
+            });
+            kept.extend(slice.iter().zip(keep).filter(|(_, keep)| *keep).map(|(r, _)| r.clone()));
+            if kept.len() >= enough {
+                break;
+            }
+        }
+        kept
+    }
+
+    /// The search itself: one, whatever the filters.
     fn search(
         &self,
         filter: Option<&crate::category::CatFilter>,
         from: i64,
         count: i64,
     ) -> Result<Vec<ReleaseRow>, String> {
-        let one = |words: &str, from: i64, count: i64| {
-            if self.fields.any() {
-                field_search::find(&self.fields, words, filter, from, count).map_err(|e| e.to_string())
-            } else {
-                find_releases(words, filter, from, count).map_err(|e| e.to_string())
-            }
-        };
-        let choices = self.word_choices();
-        if let [only] = choices.as_slice() {
-            return one(only, from, count);
+        if self.fields.any() {
+            field_search::find(&self.fields, &self.q, filter, from, count).map_err(|e| e.to_string())
+        } else {
+            find_releases(&self.q, filter, from, count).map_err(|e| e.to_string())
         }
-        // each spelling is read from its start, soo paging has to stop somewhere
-        if from.saturating_add(count) > MAX_MERGED_ROWS {
-            return Ok(Vec::new());
-        }
-        let lists = choices.iter().map(|words| one(words, 0, from + count)).collect::<Result<Vec<_>, _>>()?;
-        let rows = take_in_turn(&lists);
-        Ok(rows.into_iter().skip(from as usize).take(count as usize).collect())
     }
 
     fn filter_links(&self) -> String {
@@ -479,7 +463,8 @@ impl Search {
     /// The table rows, or a full-width diagnostic when the first page has none.
     fn body(&self) -> String {
         let filter = parse_filter(&self.cat);
-        let (from, count) = if self.sort.is_some() { (0, SORT_WINDOW) } else { (self.offset, PAGE_SIZE) };
+        let windowed = self.windowed();
+        let (from, count) = if windowed { (0, SORT_WINDOW) } else { (self.offset, PAGE_SIZE) };
         let searched = self.search(filter.as_ref(), from, count);
         let found = match searched {
             Ok(found) => found,
@@ -493,6 +478,11 @@ impl Search {
                 };
             }
         };
+        let read = found.len() as i64;
+        let tagged = |r: &ReleaseRow| self.has_tags(r);
+        // a sort needs every match in the window, a page only up to one past its end
+        let enough = if self.sort.is_some() { usize::MAX } else { (self.offset + PAGE_SIZE) as usize + 1 };
+        let mut found = self.keep_tagged(found, enough);
         if found.is_empty() {
             return if self.offset == 0 {
                 self.nothing_found()
@@ -500,23 +490,24 @@ impl Search {
                 format!("<tr><td colspan=\"{COLUMNS}\" class=\"note dim\">That's all of them.</td></tr>")
             };
         }
-        let mut found = found;
         let hide_copies = self.filters.contains(&HIDE_COPIES);
         let mut before = Vec::new();
-        let page_was_full = if let Some(sort) = self.sort {
-            let ids: Vec<i64> = found.iter().map(|r| r.id).collect();
-            let categories = crate::category::categories_of(&ids).unwrap_or_default();
-            // only the scores already kept: fetching them for a whole search would use up the providers' limits
-            let scores: HashMap<i64, i64> = if sort == SortBy::Rating {
-                let media = crate::media::query::attrs_of(&ids).unwrap_or_default();
-                crate::media::details::kept_for(media.iter().map(|(id, m)| (*id, m.kind, &m.ids)))
-                    .into_iter()
-                    .filter_map(|(id, d)| Some((id, score_value(&d)?)))
-                    .collect()
-            } else {
-                HashMap::new()
-            };
-            sort_rows(&mut found, sort, self.descending, &categories, &scores);
+        let page_was_full = if windowed {
+            if let Some(sort) = self.sort {
+                let ids: Vec<i64> = found.iter().map(|r| r.id).collect();
+                let categories = crate::category::categories_of(&ids).unwrap_or_default();
+                // only the scores already kept: fetching them for a whole search would use up the providers' limits
+                let scores: HashMap<i64, i64> = if sort == SortBy::Rating {
+                    let media = crate::media::query::attrs_of(&ids).unwrap_or_default();
+                    crate::media::details::kept_for(media.iter().map(|(id, m)| (*id, m.kind, &m.ids)))
+                        .into_iter()
+                        .filter_map(|(id, d)| Some((id, score_value(&d)?)))
+                        .collect()
+                } else {
+                    HashMap::new()
+                };
+                sort_rows(&mut found, sort, self.descending, &categories, &scores);
+            }
             let start = usize::try_from(self.offset).unwrap_or(0).min(found.len());
             let end = (start + PAGE_SIZE as usize).min(found.len());
             let more = end < found.len();
@@ -527,24 +518,16 @@ impl Search {
             found = found.drain(start..end).collect();
             more
         } else {
-            found.len() as i64 == PAGE_SIZE
+            read == PAGE_SIZE
         };
-        found.retain(|r| {
-            let tags = release_tags::parse(&r.name);
-            self.filters.iter().all(|filter| filter_matches(filter, &tags))
-        });
         if hide_copies {
             // a copy of something on an earlier page is a copy too
-            if self.sort.is_none() && self.offset > 0 {
+            if !windowed && self.offset > 0 {
                 let earlier = self.offset.min(MAX_EARLIER_FOR_COPIES);
                 let start = self.offset - earlier;
                 before = self.search(filter.as_ref(), start, earlier).unwrap_or_default();
             }
-            let shown = before.iter().filter(|r| {
-                let tags = release_tags::parse(&r.name);
-                self.filters.iter().all(|filter| filter_matches(filter, &tags))
-            });
-            let ids: Vec<i64> = shown.chain(found.iter()).map(|r| r.id).collect();
+            let ids: Vec<i64> = before.iter().filter(|r| tagged(r)).chain(found.iter()).map(|r| r.id).collect();
             let hidden = crate::duplicates::later_copies(&ids).unwrap_or_default();
             found.retain(|r| !hidden.contains(&r.id));
         }
@@ -587,6 +570,9 @@ impl Search {
                 "<a href=\"/?{everywhere}\" hx-get=\"/ui/results?{everywhere}\" hx-target=\"#results\">Look in all categories</a>. "
             );
         }
+        if self.filters_by_tags() {
+            let _ = write!(hint, "The filters look through the first {SORT_WINDOW} results. ");
+        }
         if !self.q.is_empty() {
             hint.push_str("A search matches every word you type, from the start of a word in the release name.");
         } else {
@@ -612,6 +598,10 @@ impl Search {
                 by.word(),
                 if self.descending { "descending" } else { "ascending" }
             ),
+            None if self.filters_by_tags() => format!(
+                "{} first, filtered among the first {SORT_WINDOW}",
+                if self.q.is_empty() { "Newest" } else { "Best or newest matches" }
+            ),
             None if self.q.is_empty() => "Newest first".to_string(),
             None => "Best or newest matches first".to_string(),
         };
@@ -636,7 +626,7 @@ impl Search {
         }
         let total = if self.fields.any() {
             let filter = parse_filter(&self.cat);
-            match field_search::count_any(&self.fields, &self.word_choices(), filter.as_ref()) {
+            match field_search::count_any(&self.fields, std::slice::from_ref(&self.q), filter.as_ref()) {
                 Ok(total) => format!("<strong class=\"total\">{}</strong>", escape(&total.describe())),
                 Err(e) => {
                     eprintln!("web count failed: {e}");
@@ -2037,25 +2027,18 @@ mod tests {
     }
 
     #[test]
-    fn a_filter_searches_each_way_it_is_written() {
-        let mut args = HashMap::new();
-        args.insert("q".to_string(), "film".to_string());
-        args.insert("filters".to_string(), "2160p,DV".to_string());
-        let choices = Search::from_args(&args).word_choices();
-        assert!(choices.contains(&"film 4k DoVi".to_string()), "{choices:?}");
-        assert!(choices.len() <= MAX_WORD_CHOICES);
-        args.remove("filters");
-        assert_eq!(Search::from_args(&args).word_choices(), ["film"]);
-    }
-
-    #[test]
-    fn asking_for_more_keeps_each_row_in_its_place() {
-        let rows = |ids: &[i64]| ids.iter().map(|id| ReleaseRow { id: *id, ..Default::default() }).collect::<Vec<_>>();
-        let ids = |rows: Vec<ReleaseRow>| rows.iter().map(|r| r.id).collect::<Vec<_>>();
-        let short = take_in_turn(&[rows(&[1, 2]), rows(&[9, 1])]);
-        let long = take_in_turn(&[rows(&[1, 2, 3, 4]), rows(&[9, 1, 8, 7])]);
-        assert_eq!(ids(short.clone()), [1, 9, 2]);
-        assert_eq!(ids(long)[..short.len()], ids(short));
+    fn tags_are_read_in_order_until_the_page_is_full() {
+        let names = ["A.2024.2160p.WEB-DL.DV.H265-X", "B.2024.1080p.WEB-DL.H264-X", "C.2024.2160p.BluRay.REMUX-X"];
+        let rows: Vec<ReleaseRow> = (0..300)
+            .map(|i| ReleaseRow { id: i, name: names[i as usize % 3].to_string(), ..Default::default() })
+            .collect();
+        let uhd = Search::from_args(&parse_query("filters=2160p"));
+        let kept = uhd.keep_tagged(rows.clone(), usize::MAX);
+        assert_eq!(kept.len(), 200);
+        assert!(kept.windows(2).all(|w| w[0].id < w[1].id), "in order");
+        assert_eq!(uhd.keep_tagged(rows.clone(), 3).len(), (0..TAG_SLICE).filter(|i| i % 3 != 1).count(), "one slice");
+        let all = Search::from_args(&parse_query("filters=Hide%20copies"));
+        assert_eq!(all.keep_tagged(rows, 1).len(), 300, "no tags to read");
     }
 
     #[test]
@@ -2085,10 +2068,10 @@ mod tests {
     fn filters_come_from_the_list_and_stay_in_links() {
         let s = Search::from_args(&parse_query("q=x&filters=DV,<b>,Remux"));
         assert_eq!(s.filters, ["DV", "Remux"]);
-        assert_eq!(s.word_choices()[0], "x DV Remux");
+        assert!(s.windowed(), "tags are checked over the first results");
         assert_eq!(s.query("2040", 0), "q=x&cat=2040&filters=DV%2CRemux");
         let hide = Search::from_args(&parse_query("filters=Hide%20copies"));
-        assert_eq!(hide.word_choices(), [""], "not a word to look for");
+        assert!(!hide.filters_by_tags() && !hide.windowed(), "pages by offset as before");
         let links = s.filter_links();
         assert_eq!(links.matches("aria-current").count(), 2, "{links}");
         assert!(!filter_matches("DV", &release_tags::parse("A.1999.DVDRip.XviD-X")), "not a DVD");

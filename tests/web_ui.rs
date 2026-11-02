@@ -67,9 +67,11 @@ fn the_web_ui_end_to_end() {
     }
     db::create_db().unwrap();
     let main = home.path().join("atlas.db");
-    for (name, group) in
-        [("Tv.Findword.S01E01-GRP", "alt.binaries.g1"), ("<script>alert(1)</script>", "alt.binaries.g2")]
-    {
+    for (name, group) in [
+        ("Tv.Findword.S01E01-GRP", "alt.binaries.g1"),
+        ("<script>alert(1)</script>", "alt.binaries.g2"),
+        ("Film.Findword.2024.2160p.WEB-DL.DV.H265-GRP", "alt.binaries.g3"),
+    ] {
         store::save(&main, &[Release { group: group.into(), ..release_of(name, "x.bin", 2, 2) }]).unwrap();
     }
     let shard = db::open_shard(&store::shard_path(&main, store::shard_of("alt.binaries.g1"))).unwrap();
@@ -121,6 +123,13 @@ fn the_web_ui_end_to_end() {
     assert!(found.body.contains("class=\"chip\""), "{}", found.body);
     let filtered = fetch(port, "/ui/results?q=Findword&filters=2160p", &cookie);
     assert!(!filtered.body.contains("Tv.Findword"), "not 2160p: {}", filtered.body);
+    assert!(filtered.body.contains("Film.Findword"), "2160p: {}", filtered.body);
+    // with no words, the newest are filtered: no search for each way a tag is written
+    let newest = fetch(port, "/ui/results?filters=2160p,DV", &cookie);
+    assert!(newest.body.contains("Film.Findword") && !newest.body.contains("Tv.Findword"), "{}", newest.body);
+    assert!(newest.body.contains("aria-current=\"true\">DV<"), "the chip shows it's on: {}", newest.body);
+    let none = fetch(port, "/ui/results?q=Findword&filters=Remux", &cookie);
+    assert!(none.body.contains("nothing matches"), "{}", none.body);
     assert_eq!(
         fetch(port, "/ui/results?q=Findword&filters=2160p", &cookie).header("HX-Push-Url").as_deref(),
         Some("/?q=Findword&filters=2160p")
