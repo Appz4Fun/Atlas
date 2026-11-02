@@ -36,6 +36,8 @@ pub struct VideoTrack {
     pub private: Vec<u8>,
     /// nanoseconds in one tick of a block's timestamp
     pub timestamp_scale: u64,
+    /// DisplayWidth and DisplayHeight: the shape the picture is shown at, when it isn't its samples'
+    pub display: Option<(u64, u64)>,
 }
 
 impl VideoTrack {
@@ -109,8 +111,10 @@ fn tracks_in(segment: &[u8]) -> Option<VideoTrack> {
 
 fn track(entry: &[u8]) -> Option<VideoTrack> {
     let (mut number, mut kind, mut codec, mut private) = (None, None, None, None);
+    let mut display = None;
     for (id, v) in children(entry) {
         match id {
+            0xE0 => display = display_size(v),
             0xD7 => number = Some(uint(v)),
             0x83 => kind = Some(uint(v)),
             0x86 => codec = Some(v),
@@ -123,7 +127,22 @@ fn track(entry: &[u8]) -> Option<VideoTrack> {
         b"V_MPEG4/ISO/AVC" => Codec::Avc,
         _ => return None,
     };
-    (kind? == 1).then_some(VideoTrack { number: number?, codec, private: private?, timestamp_scale: 1_000_000 })
+    let track = VideoTrack { number: number?, codec, private: private?, timestamp_scale: 1_000_000, display };
+    (kind? == 1).then_some(track)
+}
+
+/// DisplayWidth and DisplayHeight from a Video element, when both are there. Whatever their unit, they give the
+/// shape.
+fn display_size(video: &[u8]) -> Option<(u64, u64)> {
+    let (mut w, mut h) = (None, None);
+    for (id, v) in children(video) {
+        match id {
+            0x54B0 => w = Some(uint(v)),
+            0x54BA => h = Some(uint(v)),
+            _ => {}
+        }
+    }
+    Some((w.filter(|w| *w > 0)?, h.filter(|h| *h > 0)?))
 }
 
 /// A keyframe found in a run of bytes. Its timestamp is in the segment's ticks: see [`VideoTrack::millis`].
@@ -292,7 +311,7 @@ mod tests {
             let p = crate::video::hevc::decode_keyframe(&units).unwrap();
             assert_eq!(p.luma8().0, 320);
             if let Ok(dir) = std::env::var("ATLAS_STILL_DIR") {
-                let [y, cb, cr] = p.to_8bit(320);
+                let [y, cb, cr] = p.to_8bit(320, None);
                 let jpeg = crate::video::jpeg::encode(&y.data, &cb.data, &cr.data, y.width, y.height, 85);
                 std::fs::write(format!("{dir}/still{from}.jpg"), jpeg).unwrap();
             }

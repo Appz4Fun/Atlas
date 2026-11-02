@@ -143,21 +143,48 @@ fn read(ctx: &mut StepCtx<'_>, file: &FileInfo, part: i64) -> Result<Option<(u64
     Ok(yenc_decode(&article.lines).map(|body| (begin.saturating_sub(1), body)))
 }
 
-/// A keyframe from part `part` on: the frame's bytes and its time.
+/// Where a stored file's bytes sit in a RAR volume: from and to, by the volume's own header in its first part.
+fn stored_span(ctx: &mut StepCtx<'_>, volume: &FileInfo) -> Result<Option<(u64, u64, Vec<u8>)>, StepError> {
+    let Some((0, first)) = read(ctx, volume, 1)? else { return Ok(None) };
+    let Some(head) = archive::parse(&first) else { return Ok(None) };
+    let (Some(at), Some(packed)) = (head.stored_at, head.packed) else { return Ok(None) };
+    Ok(Some((at as u64, at as u64 + packed, first)))
+}
+
+/// A keyframe from part `part` of `file` on: the frame's bytes and its time. In a stored RAR set, a frame that runs
+/// off the end of one volume carries on after the next one's headers.
 fn keyframe_from(
     ctx: &mut StepCtx<'_>,
+    layout: &Layout<'_>,
     file: &FileInfo,
     part: i64,
     track: u64,
 ) -> Result<Option<(Vec<u8>, i64)>, StepError> {
     let Some((begin, mut data)) = read(ctx, file, part)? else { return Ok(None) };
-    let mut end = begin + data.len() as u64;
-    for next in part + 1..=part + MORE_ARTICLES as i64 {
+    // the file being read, its next part, and where in it the data read so far ends
+    let (mut file, mut next, mut end) = (file, part + 1, begin + data.len() as u64);
+    for _ in 0..MORE_ARTICLES {
         match mkv::find_keyframe(&data, track) {
             Found::Frame { start, len, timestamp } => return Ok(Some((data[start..start + len].to_vec(), timestamp))),
             Found::Partial { start, len, .. } if start + len - data.len() > MORE_ARTICLES * data.len() => break,
-            _ if next > parts(file) => break,
             _ => {}
+        }
+        if next > parts(file) {
+            let Layout::Stored(volumes) = layout else { break };
+            let Some(after) = volumes.iter().position(|v| v.id == file.id).and_then(|i| volumes.get(i + 1)) else {
+                break;
+            };
+            // this volume's share ends where its header says, before the end-of-archive block
+            let Some((_, until, _)) = stored_span(ctx, file)? else { break };
+            if end < until || end - until > data.len() as u64 {
+                break;
+            }
+            data.truncate(data.len() - (end - until) as usize);
+            let Some((from, _, first)) = stored_span(ctx, after)? else { break };
+            let Some(body) = first.get(from as usize..) else { break };
+            data.extend_from_slice(body);
+            (file, next, end) = (after, 2, first.len() as u64);
+            continue;
         }
         // the next part has to carry straight on, or the bytes are no use
         let Some((from, more)) = read(ctx, file, next)? else { break };
@@ -165,6 +192,7 @@ fn keyframe_from(
             break;
         }
         end += more.len() as u64;
+        next += 1;
         data.extend(more);
     }
     Ok(match mkv::find_keyframe(&data, track) {
@@ -207,7 +235,7 @@ fn still_of(track: &VideoTrack, frame: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
         }
         Codec::Avc => return None,
     };
-    let [y, cb, cr] = picture.to_8bit(STILL_WIDTH);
+    let [y, cb, cr] = picture.to_8bit(STILL_WIDTH, track.display);
     let jpeg = jpeg::encode(&y.data, &cb.data, &cr.data, y.width, y.height, QUALITY);
     Some((jpeg, y.width as u32, y.height as u32))
 }
@@ -274,7 +302,7 @@ impl Step for StillsStep {
         let mut made = 0;
         for percent in POSITIONS {
             let Some((file, part)) = part_at(&layout, percent) else { continue };
-            let Some((frame, at)) = keyframe_from(ctx, file, part, track.number)? else { continue };
+            let Some((frame, at)) = keyframe_from(ctx, &layout, file, part, track.number)? else { continue };
             let Some((jpeg, w, h)) = still_of(&track, &frame) else { continue };
             let Some(sha256) = keep(&jpeg) else { continue };
             made += 1;

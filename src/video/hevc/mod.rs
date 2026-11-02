@@ -53,7 +53,16 @@ fn decode(units: &[&[u8]], partial: bool) -> (Option<Picture>, Option<DecodeErro
         top: f.sps.crop[2] as usize,
         bottom: f.sps.crop[3] as usize,
     };
-    (Some(Picture { bit_depth: f.sps.bit_depth_luma, crop, full_range: f.sps.full_range, planes: f.planes }), error)
+    (
+        Some(Picture {
+            bit_depth: f.sps.bit_depth_luma,
+            crop,
+            full_range: f.sps.full_range,
+            matrix: f.sps.colour.map(|c| c.2),
+            planes: f.planes,
+        }),
+        error,
+    )
 }
 
 fn read_picture(units: &[&[u8]], frame: &mut Option<Frame>) -> Result<()> {
