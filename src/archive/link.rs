@@ -218,13 +218,20 @@ impl LinkStep {
         Ok(listed.then(|| files[0].clone()))
     }
 
+    /// The set's list of files, from the volume's first article and, when that doesn't hold all of it or can't be
+    /// read, its last: a set repeats its descriptions there.
     fn inventory(&self, ctx: &mut StepCtx<'_>, file: &FileInfo) -> Result<par2::Inventory, StepError> {
-        let Some(seg) = first_article(ctx, file)? else { return Ok(par2::Inventory::default()) };
-        let Some(mut body) = fetch_one(ctx, &seg, &file.filename)? else { return Ok(par2::Inventory::default()) };
+        let mut body = Vec::new();
+        let first = first_article(ctx, file)?;
+        if let Some(seg) = &first
+            && let Some(got) = fetch_one(ctx, seg, &file.filename)?
+        {
+            body = got;
+        }
         let mut inventory = par2::inventory(&body);
         if !inventory.complete {
             let last = ctx.segments(file.id, &SegmentPick::Last(1)).map_err(retry)?.into_iter().last();
-            if let Some(last) = last.filter(|s| s.message_id != seg.message_id)
+            if let Some(last) = last.filter(|s| first.as_ref().is_none_or(|f| s.message_id != f.message_id))
                 && let Some(more) = fetch_one(ctx, &last, &file.filename)?
             {
                 body.extend(more);
@@ -235,7 +242,7 @@ impl LinkStep {
     }
 
     /// Single-file rows near this one that could hold a file of between `sizes` bytes, nearest in time first. Only
-    /// rows with no name yet, or that lead an upload already: a PAR2 set is anyone's to post, and a made-up one mustn't
+    /// rows with no readable name, or that lead an upload already: a PAR2 set is anyone's to post, and a made-up one mustn't
     /// add its files to a release people download by its name. What the article count must be for those sizes is
     /// weighed here too, roughly, soo a busy group's other rows don't crowd the real one out of the limit; `parts_fit`
     /// then weighs each closely.
@@ -255,7 +262,7 @@ impl LinkStep {
                    and not exists (select 1 from upload_link l where l.release_id = r.id and l.lead_id != r.id)
                    and not exists (select 1 from upload_link_tried t where t.release_id = ?3 and t.candidate_id = r.id)
                    and r.size > 0 and r.parts > 0
-                   and (r.display_name is null
+                   and ((r.is_obfuscated = 1 and r.display_name is null)
                         or exists (select 1 from upload_link l where l.release_id = r.id and l.lead_id = r.id))
                    and f.expected between ?8 * 1.005 * r.parts / r.size - 2 and ?9 * 1.08 * r.parts / r.size + 2
                  order by abs(julianday(r.posted_date) - julianday(?5))
@@ -416,10 +423,17 @@ impl Step for LinkStep {
             }
         }
         let inventory = self.inventory(ctx, &par2_file)?;
+        let young = age_days(ctx, ctx.release()).is_some_and(|days| days < LOOK_AGAIN_FOR_DAYS);
+        let now = chrono::Utc::now().timestamp();
         let wanted = wanted(&inventory.files);
         if wanted.is_empty() {
-            return Ok(Outcome { matched: mine.is_some(), ..Default::default() });
+            // a set that couldn't be read at all may be readable later
+            let wait_until = (inventory.files.is_empty() && young).then_some(now + LOOK_AGAIN_SECS);
+            return Ok(Outcome { matched: mine.is_some(), wait_until, ..Default::default() });
         }
+        // a set read only in part may have more files than it shows: the link can't call itself whole, and it looks
+        // again for the rest of the list
+        let unknown = i64::from(!inventory.complete);
         let mut missing: Vec<&Par2File> = wanted.iter().copied().filter(|f| !have.contains(&f.file_id[..])).collect();
         let (mut found, mut tried, mut more) = (Vec::new(), Vec::new(), false);
         if !missing.is_empty() {
@@ -453,17 +467,21 @@ impl Step for LinkStep {
                 }
             }
         }
-        let now = chrono::Utc::now().timestamp();
         let wait_until = if more && !missing.is_empty() && self.tried(ctx, id)? + (tried.len() as i64) < MAX_TRIED {
             Some(now + RESUME_SECS)
-        } else if !missing.is_empty() && age_days(ctx, ctx.release()).is_some_and(|days| days < LOOK_AGAIN_FOR_DAYS) {
+        } else if (!missing.is_empty() || unknown != 0) && young {
             Some(now + LOOK_AGAIN_SECS)
         } else {
             None
         };
         let mut writes: Vec<StepWrite> =
             tried.iter().map(|other| StepWrite::new(TRIED, vec![id.into(), (*other).into()])).collect();
+        let looks_for = wanted.len() as i64 + unknown;
         if found.is_empty() {
+            // what it looks for may be known better now
+            if let Some(lead) = mine {
+                writes.push(StepWrite::new(LINK_RECOVERY, vec![id.into(), lead.into(), looks_for.into()]));
+            }
             return Ok(Outcome { matched: mine.is_some(), writes, wait_until, ..Default::default() });
         }
         // the uploads this joins: its own, and any a file it found leads. The biggest file leads them all
@@ -494,7 +512,7 @@ impl Step for LinkStep {
             writes
                 .push(StepWrite::new(LINK_DATA, vec![candidate.id.into(), lead.into(), file.file_id.to_vec().into()]));
         }
-        writes.push(StepWrite::new(LINK_RECOVERY, vec![id.into(), lead.into(), (wanted.len() as i64).into()]));
+        writes.push(StepWrite::new(LINK_RECOVERY, vec![id.into(), lead.into(), looks_for.into()]));
         writes.push(StepWrite::new(CLEAR_CONTENT, vec![id.into()]));
         writes.extend(self.lead_writes(ctx, lead, &inventory.files));
         Ok(Outcome { matched: true, writes, wait_until, ..Default::default() })
