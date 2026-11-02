@@ -191,6 +191,11 @@ fn damage_is_an_error_not_a_panic() {
         let refs: Vec<&[u8]> = flipped.iter().map(Vec::as_slice).collect();
         let _ = decode_keyframe(&refs);
     }
+    // a run of ones: an endless cu_qp_delta suffix
+    let mut ones: Vec<Vec<u8>> = units.iter().map(|u| u.to_vec()).collect();
+    ones[slice][291..=340].fill(0xff);
+    let refs: Vec<&[u8]> = ones.iter().map(Vec::as_slice).collect();
+    assert!(decode_keyframe(&refs).is_err());
 }
 
 /// ATLAS_HEVC_FILE=x.hevc ATLAS_HEVC_REF=x.yuv cargo test -- --ignored compare_with_reference: decodes any stream
