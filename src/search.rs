@@ -108,12 +108,79 @@ fn union(shards: &[usize], part: impl Fn(usize) -> String) -> String {
     if parts.is_empty() { "select null where 0".into() } else { parts.join("\nunion all\n") }
 }
 
+/// Matches of a word's exact form, across shards, past which it's too common to rank.
+const COMMON_MATCHES: i64 = 2_000;
+
+/// The words in their exact form, when that matches `common` or more releases. None: they match fewer.
+fn common_exact(conn: &Connection, query: &str, in_shards: &[usize], common: i64) -> Option<String> {
+    let exact = fts_query(query).replace("\"*", "\"");
+    if exact.is_empty() {
+        return None;
+    }
+    let mut found = 0;
+    for i in in_shards {
+        let sql = format!(
+            "select count(*) from (select 1 from s{i}.releases_fts where releases_fts match ?1 limit {common})"
+        );
+        found += conn.query_row(&sql, [&exact], |r| r.get::<_, i64>(0)).ok()?;
+        if found >= common {
+            return Some(exact);
+        }
+    }
+    None
+}
+
+/// The newest matches of the words as written, when they match too much to rank: scoring has to read every match, and
+/// a word with a `*` has to read all of them before the first comes back, which is seconds on a cold disk. Exact words
+/// are read newest first and stop at a page. None: few enough to rank, or the FTS index won't take the query.
+fn common_words_newest(
+    conn: &Connection,
+    query: &str,
+    group: Option<&str>,
+    page: i64,
+    page_size: i64,
+    common: i64,
+) -> Option<Vec<ReleaseRow>> {
+    let in_shards = shards(group.map(|g| [g]).as_ref().map(|a| a.as_slice()));
+    let exact = common_exact(conn, query, &in_shards, common)?;
+    let group_filter = if group.is_some() { "r.group_name = ?2 and " } else { "" };
+    let sql = format!(
+        "select * from ({}) order by 1 desc limit ?3 offset ?4",
+        union(&in_shards, |i| format!(
+            "select * from (select {COLUMNS} from s{i}.releases_fts f cross join s{i}.releases r on r.id = f.rowid
+             where f.releases_fts match ?1 and {group_filter}{VISIBLE_RELEASE}
+             order by f.rowid desc limit ?3 + ?4)"
+        ))
+    );
+    let vals = [
+        text(exact),
+        group.map(text).unwrap_or(Value::Null),
+        Value::Integer(page_size),
+        Value::Integer(page * page_size),
+    ];
+    query_rows(conn, &sql, &vals).ok()
+}
+
 /// Search within one group (`Some`) or all of them (`None`). `page` is 0 based.
 ///
 /// Parameters: ?1 the query, ?2 the group, ?3 limit, ?4 offset.
 pub fn search(query: &str, group: Option<&str>, page: i64, page_size: i64) -> Result<Vec<ReleaseRow>> {
+    search_past(query, group, page, page_size, COMMON_MATCHES)
+}
+
+#[doc(hidden)]
+pub fn search_past(
+    query: &str,
+    group: Option<&str>,
+    page: i64,
+    page_size: i64,
+    common: i64,
+) -> Result<Vec<ReleaseRow>> {
     if query.trim().is_empty() {
         return Ok(Vec::new());
+    }
+    if let Some(rows) = common_words_newest(&db::open()?, query, group, page, page_size, common) {
+        return Ok(rows);
     }
 
     let group_filter = if group.is_some() { "r.group_name = ?2 and " } else { "" };
@@ -181,7 +248,9 @@ pub fn count(query: &str, group: Option<&str>) -> Result<i64> {
     );
 
     // ?2 is only in the sql with a group
-    let mut fts_vals = vec![text(fts_query(query))];
+    // what `search` would read, soo a count never promises more than it can return
+    let words = common_exact(&db::open()?, query, &in_shards, COMMON_MATCHES).unwrap_or_else(|| fts_query(query));
+    let mut fts_vals = vec![text(words)];
     let mut like_vals = vec![text(like_query(query))];
     if let Some(g) = group {
         fts_vals.push(text(g));
