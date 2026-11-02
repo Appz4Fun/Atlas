@@ -164,6 +164,9 @@ fn run(data: &[u8], extra_dist: bool, target: usize, out: &mut Vec<u8>, filters:
     let mut last_len = 0usize;
     // filters that don't overlap cover each byte once: more than that is work no real file asks for
     let mut filter_work = target.saturating_add(MAX_FILTER_BLOCK);
+    // block headers, and the tables they bring, are work that makes no output: real blocks run far longer than
+    // 4 KiB, so more than this is a stream of nothing else
+    let mut blocks_left = 1024 + target / 4096;
     loop {
         if out.len() >= target {
             return End::Done;
@@ -173,6 +176,8 @@ fn run(data: &[u8], extra_dist: bool, target: usize, out: &mut Vec<u8>, filters:
             if block.last {
                 return End::Done;
             }
+            let Some(left) = blocks_left.checked_sub(1) else { return End::Cut };
+            blocks_left = left;
             let Some(next) = block_header(&mut bits) else { return End::Cut };
             block = next;
             if block.tables {

@@ -52,6 +52,9 @@ struct State<'a> {
     audio: [Audio; 4],
     channel: usize,
     channel_delta: i32,
+    /// new tables still allowed: each is work that makes no output, so a stream of nothing else would run as long
+    /// as its input
+    tables_left: usize,
 }
 
 /// One file's packed data, from the front, to `limit` bytes. `complete`: `data` is all of it, not a cut front.
@@ -72,6 +75,8 @@ pub fn rar20(data: &[u8], size: Option<u64>, limit: usize, complete: bool) -> (V
         audio: [Audio::default(); 4],
         channel: 0,
         channel_delta: 0,
+        // real blocks run far longer than 4 KiB
+        tables_left: 1024 + target / 4096,
     };
     let mut out = Vec::new();
     let end = match run(&mut st, target, &mut out) {
@@ -165,6 +170,7 @@ fn run(st: &mut State<'_>, target: usize, out: &mut Vec<u8>) -> Option<()> {
 }
 
 fn read_tables(st: &mut State<'_>) -> Option<Blocks> {
+    st.tables_left = st.tables_left.checked_sub(1)?;
     let bits = &mut st.bits;
     let field = bits.peek16();
     let audio = field & 0x8000 != 0;
