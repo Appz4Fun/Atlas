@@ -88,15 +88,21 @@ def nested_archive(name):
 
 
 def build_posts():
-    # dated a few hours back so post-processing's settle time has passed
-    when = email.utils.formatdate(time.time() - 4 * 3600)
+    # dated a few hours back so post-processing's settle time has passed; GMT, as Nyuu writes it
+    posted = time.time() - 4 * 3600
+    when = email.utils.formatdate(posted, usegmt=True)
     posts = []
+
+    def nyuu_id(n):
+        # Nyuu's grammar: 24 letters in alternating case, a dash, the millisecond clock
+        letters = "".join(chr((65 if i % 2 == 0 else 97) + (n * 7 + i * 5) % 26) for i in range(24))
+        return f"<{letters}-{int(posted * 1000) + n * 1500}@nyuu>"
 
     def add(subject, body, author="poster <p@mock.example>", size=None):
         n = len(posts) + 1
         raw = sum(len(l) + 2 for l in body)
         posts.append(dict(n=n, subject=subject, author=author, date=when,
-                          msgid=f"<msg{n}@mock.example>", bytes=size or raw, body=body))
+                          msgid=nyuu_id(n), bytes=size or raw, body=body))
 
     # a movie: 2 rar volumes (2 articles each), an nfo and a par2 index
     movie = "Cool.Movie.2024.1080p.WEB-DL.DDP5.1.H.264-GRP"
@@ -202,8 +208,13 @@ class Handler(socketserver.StreamRequestHandler):
                     continue
                 if verb == "ARTICLE":
                     self.send(f"220 0 {arg}")
-                    for h in (f"From: {p['author']}", f"Subject: {p['subject']}", f"Message-ID: {arg}",
-                              f"Newsgroups: {GROUP}", "User-Agent: Nyuu/0.4.2", ""):
+                    # the headers a provider adds on injection, so the release page has them to show
+                    for h in (f"Path: news.mock.example!feeder.mock.example!not-for-mail",
+                              f"From: {p['author']}", f"Subject: {p['subject']}", f"Message-ID: {arg}",
+                              f"Newsgroups: {GROUP}", f"Date: {p['date']}", f"Injection-Date: {p['date']}",
+                              'Injection-Info: news.mock.example; posting-account="u-1234"; '
+                              'posting-host="203.0.113.7"; logging-data="4242"; mail-complaints-to="abuse@mock.example"',
+                              "Organization: Mock Usenet", "User-Agent: Nyuu/0.4.2", ""):
                         self.send(h)
                 else:
                     self.send(f"222 0 {arg}")

@@ -168,6 +168,30 @@ fn the_web_ui_end_to_end() {
     assert_eq!(fetch(port, "/ui/release?id=999999999", &cookie).status(), 404);
     assert_eq!(fetch(port, &format!("/ui/release?id={id}"), "").status(), 303);
 
+    // every catalog fact: the panels, their lazy fold-outs, and the drawer under a result row
+    assert!(
+        release.body.contains("<h2>Keys</h2>") && release.body.contains("hx-get=\"/ui/meta?id="),
+        "{}",
+        release.body
+    );
+    let parts = fetch(port, &format!("/ui/meta?id={id}&part=parts"), &cookie);
+    assert_eq!(parts.status(), 200);
+    assert!(parts.body.contains("<table") && parts.body.contains("x.bin"), "{}", parts.body);
+    assert_eq!(fetch(port, &format!("/ui/meta?id={id}&part=nope"), &cookie).status(), 400);
+    // the fragments go through the same filtered reader as the page: no release, no fragment
+    assert_eq!(fetch(port, "/ui/meta?id=999999999&part=parts", &cookie).status(), 404);
+    let drawer = fetch(port, &format!("/ui/row?id={id}"), &cookie);
+    assert_eq!(drawer.status(), 200);
+    assert!(
+        drawer.body.starts_with("<tr class=\"drawer-row\">") && drawer.body.contains("Full page"),
+        "{}",
+        drawer.body
+    );
+    let locked = fetch(port, &format!("/ui/row?id={id}"), "");
+    assert_eq!(locked.status(), 401);
+    assert_eq!(locked.header("HX-Redirect").as_deref(), Some("/"));
+    assert!(found.body.contains("drawer-toggle"), "{}", found.body);
+
     // one post spread over two groups: one row, whole, and an NZB with all of it
     let posted = |name: &str, group: &str, one: Article, date: &str| {
         let size = one.bytes;
