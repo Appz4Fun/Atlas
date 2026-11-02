@@ -163,7 +163,9 @@ impl Picture {
             Some((sw, sh)) => (dw as u128 * u128::from(sh) / u128::from(sw)) as usize,
             None => h * dw / w,
         };
-        let dh = dh.max(2) & !1;
+        // never taller than the samples, nor than twice the width it's kept at: what's allocated stays within what
+        // the decoder already allowed
+        let dh = dh.min(h).min(max_width.max(2) * 2).max(2) & !1;
         let shift = self.bit_depth.saturating_sub(8);
         let mut y = shrink(&self.planes[0], self.crop.left, self.crop.top, w, h, dw, dh, shift);
         let chroma = |p: &Plane| shrink(p, self.crop.left / 2, self.crop.top / 2, w / 2, h / 2, dw / 2, dh / 2, shift);
@@ -204,6 +206,10 @@ mod tests {
         // nonsense is ignored
         let [y, ..] = p.to_8bit(960, Some((100_000, 1)));
         assert_eq!((y.width, y.height), (960, 720));
+        // a shape that would stretch it tall is held to the samples' height
+        let tall = flat(960, 9824, [128; 3], None);
+        let [y, ..] = tall.to_8bit(960, Some((240, 9824)));
+        assert!(y.height <= 1920, "{}", y.height);
     }
 
     #[test]
