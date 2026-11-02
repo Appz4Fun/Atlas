@@ -234,7 +234,12 @@ impl LinkStep {
         Ok(inventory)
     }
 
-    fn candidates(&self, ctx: &StepCtx<'_>) -> Result<Vec<Candidate>, StepError> {
+    /// Single-file rows near this one that could hold a file of between `sizes` bytes, nearest in time first. Only
+    /// rows with no name of their own: a PAR2 set is anyone's to post, and a made-up one mustn't add its files to a
+    /// release people download by its name. What the article count must be for those sizes is weighed here too,
+    /// roughly, soo a busy group's other rows don't crowd the real one out of the limit; `parts_fit` then weighs each
+    /// closely.
+    fn candidates(&self, ctx: &StepCtx<'_>, sizes: (u64, u64)) -> Result<Vec<Candidate>, StepError> {
         let me = ctx.release();
         let Some(posted) = me.posted_date.clone() else { return Ok(Vec::new()) };
         let span = ID_WINDOW * crate::store::SHARDS as i64;
@@ -249,12 +254,27 @@ impl LinkStep {
                    and not exists (select 1 from files g where g.release_id = r.id and g.id != f.id)
                    and not exists (select 1 from upload_link l where l.release_id = r.id and l.lead_id != r.id)
                    and not exists (select 1 from upload_link_tried t where t.release_id = ?3 and t.candidate_id = r.id)
+                   and r.size > 0 and r.parts > 0
+                   and (r.is_obfuscated = 1 or r.display_name is null
+                        or exists (select 1 from upload_link l where l.release_id = r.id and l.lead_id = r.id))
+                   and f.expected between ?8 * 1.005 * r.parts / r.size - 2 and ?9 * 1.08 * r.parts / r.size + 2
+                 order by abs(julianday(r.posted_date) - julianday(?5))
                  limit ?7",
             )
             .map_err(retry)?;
         let rows = stmt
             .query_map(
-                params![me.id - span, me.id + span, me.id, me.group, posted, DAY_WINDOW, MAX_CANDIDATES as i64],
+                params![
+                    me.id - span,
+                    me.id + span,
+                    me.id,
+                    me.group,
+                    posted,
+                    DAY_WINDOW,
+                    MAX_CANDIDATES as i64,
+                    sizes.0 as f64,
+                    sizes.1 as f64
+                ],
                 |r| {
                     Ok(Candidate {
                         id: r.get(0)?,
@@ -295,11 +315,25 @@ impl LinkStep {
             file: candidate.file.filename.clone(),
             max_bytes: Some(ARTICLE_CAP),
         };
-        Ok(match ctx.fetch_article(&wanted)?.got {
+        let got = match ctx.fetch_article(&wanted)?.got {
+            // the first is gone from the server: its last says the size, which is enough for a big file
+            Got::Missing => match self.last_article(ctx, &candidate.file, &seg.message_id)? {
+                Some(last) => ctx.fetch_article(&BodyRequest { message_id: last.message_id, ..wanted })?.got,
+                None => Got::Missing,
+            },
+            got => got,
+        };
+        Ok(match got {
             Got::Body(raw) => Some(Seen::of_article(&raw)),
             Got::Refused(why) if why == PAST_BUDGET => None,
             Got::Missing | Got::TooBig | Got::Refused(_) => Some(Seen::default()),
         })
+    }
+
+    /// A file's last article, unless that's the one already tried.
+    fn last_article(&self, ctx: &StepCtx<'_>, file: &FileInfo, tried: &str) -> Result<Option<SegmentRef>, StepError> {
+        let last = ctx.segments(file.id, &SegmentPick::Last(1)).map_err(retry)?.into_iter().last();
+        Ok(last.filter(|s| s.message_id != tried))
     }
 
     /// How many rows this volume has checked and found none of its files in, over its earlier runs.
@@ -389,7 +423,8 @@ impl Step for LinkStep {
         let mut missing: Vec<&Par2File> = wanted.iter().copied().filter(|f| !have.contains(&f.file_id[..])).collect();
         let (mut found, mut tried, mut more) = (Vec::new(), Vec::new(), false);
         if !missing.is_empty() {
-            let mut candidates = self.candidates(ctx)?;
+            let sizes = missing.iter().fold((u64::MAX, 0), |(least, most), f| (least.min(f.size), most.max(f.size)));
+            let mut candidates = self.candidates(ctx, sizes)?;
             candidates.retain(|c| !members.contains(&c.id));
             candidates.sort_by(|a, b| a.apart.total_cmp(&b.apart));
             let mut checks = 0;
