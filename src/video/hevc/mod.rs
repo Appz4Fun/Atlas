@@ -29,8 +29,12 @@ pub fn decode_keyframe(units: &[&[u8]]) -> Result<Picture> {
 /// What was decoded before anything went wrong, and what did.
 pub(crate) fn decode_partly(units: &[&[u8]]) -> (Option<Picture>, Option<DecodeError>) {
     let mut frame: Option<Frame> = None;
-    let error = read_picture(units, &mut frame).err();
+    let mut error = read_picture(units, &mut frame).err();
     let Some(mut f) = frame else { return (None, error.or(Some(DecodeError::Truncated))) };
+    // a slice that never came leaves its part of the picture grey
+    if error.is_none() && f.ctb_slice.contains(&-1) {
+        error = Some(DecodeError::Truncated);
+    }
     f.deblock();
     f.apply_sao();
     let crop = Crop {
@@ -65,15 +69,16 @@ fn read_picture(units: &[&[u8]], frame: &mut Option<Frame>) -> Result<()> {
                 if frame.is_none() && !nal::is_irap(kind) {
                     return Err(DecodeError::Unsupported("a picture that isn't a keyframe"));
                 }
+                // the next picture's first slice ends this one, read no further: it may be one we can't decode
+                if frame.is_some() && unit.get(2).is_some_and(|b| b & 0x80 != 0) {
+                    break;
+                }
                 let data = rbsp(unit);
                 let lookup = |id: u32| {
                     let p = pps.get(&id)?;
                     Some((sps.get(&p.sps_id)?.clone(), p.clone()))
                 };
                 let (header, s, p) = slice::parse(&data, h, lookup, previous.as_ref())?;
-                if header.first_in_picture && frame.is_some() {
-                    break;
-                }
                 let f = match frame {
                     Some(f) if f.pps.id != p.id || f.sps.id != s.id => {
                         return Err(DecodeError::Unsupported("parameter sets changing within a picture"));

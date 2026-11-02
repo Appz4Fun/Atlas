@@ -131,6 +131,46 @@ fn cropped_odd_size_with_some_lossless_blocks() {
     );
 }
 
+fn units_of(name: &str) -> Vec<Vec<u8>> {
+    let path = format!("{}/tests/fixtures/hevc/{name}.hevc", env!("CARGO_MANIFEST_DIR"));
+    split_annex_b(&std::fs::read(path).unwrap()).into_iter().map(<[u8]>::to_vec).collect()
+}
+
+#[test]
+fn a_picture_missing_slices_is_truncated() {
+    // s2 has three slices: parameter sets, SEI and only the first
+    let units = units_of("s2");
+    let slices = units.iter().filter(|u| super::nal::is_slice((u[0] >> 1) & 0x3f)).count();
+    assert_eq!(slices, 3);
+    let first_slice = units.iter().position(|u| super::nal::is_slice((u[0] >> 1) & 0x3f)).unwrap();
+    let refs: Vec<&[u8]> = units[..=first_slice].iter().map(Vec::as_slice).collect();
+    assert_eq!(decode_keyframe(&refs).err(), Some(super::DecodeError::Truncated));
+    let (partial, _) = super::decode_partly(&refs);
+    assert!(partial.is_some(), "what was decoded is still there");
+}
+
+#[test]
+fn the_next_picture_ends_this_one_whatever_it_is() {
+    // a P slice after the keyframe: the keyframe alone decodes
+    let mut units = units_of("s1");
+    let slice = units.iter().position(|u| super::nal::is_slice((u[0] >> 1) & 0x3f)).unwrap();
+    // TRAIL_R with first_slice_segment_in_pic_flag set and garbage after: never parsed
+    units.push(vec![0x02, 0x01, 0x80 | 0x40, 0xff, 0xff]);
+    let refs: Vec<&[u8]> = units.iter().map(Vec::as_slice).collect();
+    assert!(slice < units.len() - 1);
+    assert_eq!(md5s(&decode_keyframe(&refs).unwrap()), md5s(&decode("s1")));
+}
+
+#[test]
+fn a_size_that_isnt_whole_coding_blocks_is_refused() {
+    // the damage that made a height of 123 with 8 sample blocks
+    let mut units = units_of("s1");
+    let sps = units.iter().position(|u| (u[0] >> 1) & 0x3f == super::nal::SPS).unwrap();
+    units[sps][20] ^= 0x10;
+    let refs: Vec<&[u8]> = units.iter().map(Vec::as_slice).collect();
+    assert!(decode_keyframe(&refs).is_err());
+}
+
 #[test]
 fn damage_is_an_error_not_a_panic() {
     let path = format!("{}/tests/fixtures/hevc/s1.hevc", env!("CARGO_MANIFEST_DIR"));

@@ -239,6 +239,11 @@ pub fn parse_sps(nal: &[u8]) -> Result<Sps> {
     if !(4..=6).contains(&s.log2_ctb) {
         return Err(DecodeError::Invalid("coding tree size"));
     }
+    // a picture is whole coding blocks: anything else would be decoded past its edge
+    let min_cb = 1u32 << s.log2_min_cb;
+    if s.width % min_cb != 0 || s.height % min_cb != 0 {
+        return Err(DecodeError::Invalid("picture size not whole coding blocks"));
+    }
     s.log2_min_tb = r.ue_max(3, "transform size")? + 2;
     s.log2_max_tb = s.log2_min_tb + r.ue_max(3, "transform size")?;
     if s.log2_max_tb > 5 || s.log2_min_tb >= s.log2_min_cb || s.log2_max_tb > s.log2_ctb {
