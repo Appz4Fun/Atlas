@@ -506,3 +506,44 @@ fn compressed_rar5_goes_on_down() {
     let m5 = include_bytes!("../../../tests/fixtures/rar5/m5_max.rar");
     same(&unwrap(m5).inner, &n.inner);
 }
+
+#[test]
+fn xz_filters_in_front_of_lzma2_are_undone() {
+    // made by liblzma from code with branches for every architecture; arm64 by xz 5.4
+    let want = include_bytes!("../../../tests/fixtures/xz/code.bin");
+    for (packed, method) in [
+        (&include_bytes!("../../../tests/fixtures/xz/x86.xz")[..], "x86+lzma2"),
+        (include_bytes!("../../../tests/fixtures/xz/x86-start.xz"), "x86+lzma2"),
+        (include_bytes!("../../../tests/fixtures/xz/powerpc.xz"), "powerpc+lzma2"),
+        (include_bytes!("../../../tests/fixtures/xz/ia64.xz"), "ia64+lzma2"),
+        (include_bytes!("../../../tests/fixtures/xz/arm.xz"), "arm+lzma2"),
+        (include_bytes!("../../../tests/fixtures/xz/armthumb.xz"), "armthumb+lzma2"),
+        (include_bytes!("../../../tests/fixtures/xz/sparc.xz"), "sparc+lzma2"),
+        (include_bytes!("../../../tests/fixtures/xz/arm64.xz"), "arm64+lzma2"),
+        (include_bytes!("../../../tests/fixtures/xz/delta.xz"), "delta+lzma2"),
+        (include_bytes!("../../../tests/fixtures/xz/delta-x86.xz"), "delta+x86+lzma2"),
+    ] {
+        let n = unwrap(packed);
+        assert_eq!(n.layers[0].method.as_deref(), Some(method));
+        assert_eq!(n.layers[0].stop, None, "{method}");
+        same(&n.inner, want);
+        // the filter did change something, so undoing it is what made these equal
+        let header_len = (usize::from(packed[12]) + 1) * 4;
+        let (raw, _) = lzma::lzma2(&packed[12 + header_len..], usize::MAX);
+        assert_ne!(&raw[..], &want[..], "{method}");
+        // cut short, what comes out is still a true front
+        let n = unwrap(&packed[..packed.len() / 2]);
+        assert!(n.inner.len() > 1000 && want.starts_with(&n.inner), "{method}: {}", n.inner.len());
+    }
+}
+
+#[test]
+fn an_xz_filter_with_no_decoder_says_so() {
+    let mut xz = include_bytes!("../../../tests/fixtures/xz/arm64.xz").to_vec();
+    // arm64 (0x0a) to riscv (0x0b), which nothing here decodes; the header's crc isn't checked
+    let at = xz[12..].iter().position(|&b| b == 0x0a).unwrap() + 12;
+    xz[at] = 0x0b;
+    let n = unwrap(&xz);
+    assert_eq!(n.layers[0].method.as_deref(), Some("riscv+lzma2"));
+    assert_eq!(n.layers[0].stop.as_deref(), Some("no decoder for this filter yet"));
+}
