@@ -996,6 +996,7 @@ fn release_page(args: &HashMap<String, String>) -> ApiResponse {
         contents = release_info::contents_of_split(&conn, &post).unwrap_or(contents);
         release.size = Some(post.size);
         release.complete = post.complete;
+        release.parts = Some(contents.articles_seen);
     }
     html(200, release_html(&release, category, &inner, media.as_ref(), names.as_ref(), &contents))
 }
