@@ -80,6 +80,9 @@ pub fn split_sized(data: &[u8], length_size: usize) -> Result<Vec<&[u8]>> {
         at += length_size;
         let unit = data.get(at..at.checked_add(len).ok_or(DecodeError::Truncated)?).ok_or(DecodeError::Truncated)?;
         if !unit.is_empty() {
+            if out.len() == crate::video::MAX_UNITS {
+                return Err(DecodeError::Invalid("too many NAL units"));
+            }
             out.push(unit);
         }
         at += len;
