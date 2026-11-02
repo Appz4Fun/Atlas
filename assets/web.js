@@ -66,3 +66,13 @@ document.addEventListener('htmx:responseError', (event) => {
 document.addEventListener('htmx:afterSwap', () => {
   if (narrow.matches) foldNavigation();
 });
+
+// Ask AI: the search box shows the words Gemini searched with. Its value is set, not the box swapped, soo the
+// search form keeps listening to it.
+document.addEventListener('htmx:afterSettle', () => {
+  const read = document.querySelector('#ask-note [data-q]');
+  const box = document.getElementById('q');
+  if (!read || !box) return;
+  box.value = read.dataset.q;
+  read.removeAttribute('data-q');
+});

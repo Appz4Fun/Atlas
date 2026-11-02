@@ -13,6 +13,7 @@ use crate::api::{ApiResponse, escape, find_releases, get_nzb, parse_query};
 use crate::archive::Password;
 use crate::category::{TABLE, UNCATEGORIZED, label, parse_filter};
 use crate::field_search::{self, Fields};
+use crate::gemini;
 use crate::media::query::MediaAttrs;
 use crate::media::title::Kind;
 use crate::search::{ReleaseRow, get_release};
@@ -61,18 +62,27 @@ pub fn get(path: &str, query: &str, cookies: Option<&str>, base: &str, api_key: 
         "/ui/duplicates" if signed_in => duplicates_page(&args),
         "/ui/details" if signed_in => details_panel(&args),
         "/ui/poster" if signed_in => poster(&args),
+        "/ui/settings" if signed_in => html(200, settings_page(None)),
         "/ui/nzb" if signed_in && args.get("fill").is_some_and(|v| v == "1") => filled_nzb(&args),
         "/ui/nzb" if signed_in => get_nzb(&args),
         "/ui/details" | "/ui/poster" => {
             ApiResponse { headers: vec![("HX-Redirect".into(), "/".into())], ..html(401, String::new()) }
         }
-        "/ui/nzb" | "/ui/release" | "/ui/duplicates" => redirect(Vec::new()),
+        "/ui/nzb" | "/ui/release" | "/ui/duplicates" | "/ui/settings" => redirect(Vec::new()),
         _ => return None,
     })
 }
 
-/// A POST the ui answers. None: not ours.
-pub fn post(path: &str, body: &str, base: &str, api_key: &str) -> Option<ApiResponse> {
+/// A POST the ui answers. None: not ours. `htmx`: htmx sent it, and swaps in what comes back.
+pub fn post(
+    path: &str,
+    body: &str,
+    cookies: Option<&str>,
+    htmx: bool,
+    base: &str,
+    api_key: &str,
+) -> Option<ApiResponse> {
+    let signed_in = signed_in(cookies, api_key);
     match path {
         "/login" => {
             let args = parse_query(body);
@@ -85,13 +95,19 @@ pub fn post(path: &str, body: &str, base: &str, api_key: &str) -> Option<ApiResp
             })
         }
         "/logout" => Some(redirect(vec![cookie_header("", 0)])),
+        "/ui/ask" if signed_in => Some(ask(body, htmx)),
+        "/ui/settings" if signed_in => Some(save_settings(body)),
+        "/ui/ask" if htmx => {
+            Some(ApiResponse { headers: vec![("HX-Redirect".into(), "/".into())], ..html(401, String::new()) })
+        }
+        "/ui/ask" | "/ui/settings" => Some(redirect(Vec::new())),
         _ => None,
     }
 }
 
 /// The ui reads a request body only on these paths.
 pub fn takes_post(path: &str) -> bool {
-    matches!(path, "/login" | "/logout")
+    matches!(path, "/login" | "/logout" | "/ui/ask" | "/ui/settings")
 }
 
 fn cookie_header(value: &str, max_age: i64) -> (String, String) {
@@ -847,14 +863,18 @@ fn results(args: &HashMap<String, String>) -> ApiResponse {
     if search.offset > 0 {
         return html(200, search.body());
     }
-    // the sidebar and the form follow the search too
+    first_page(&search, &ask_note("", " hx-swap-oob=\"true\""))
+}
+
+/// A new search's results, with the sidebar and the form following it. `more` goes in too, for out of band swaps.
+fn first_page(search: &Search, more: &str) -> ApiResponse {
     let oob = " hx-swap-oob=\"true\"";
     let body = format!(
-        "{}{}{}{}",
-        results_html(&search),
-        category_nav(&search, oob),
+        "{}{}{}{}{more}",
+        results_html(search),
+        category_nav(search, oob),
         category_input(&search.cat, oob),
-        scope_inputs(&search, oob),
+        scope_inputs(search, oob),
     );
     let mut resp = html(200, body);
     // the address bar follows the search, and reloads the full page
@@ -948,7 +968,7 @@ fn page(title: &str, content: &str) -> String {
 
 fn masthead(signed_in: bool) -> String {
     let tools = if signed_in {
-        "<a class=\"button\" href=\"/ui/duplicates\">Duplicates</a><form method=\"post\" action=\"/logout\"><button class=\"button\">Sign out</button></form>"
+        "<a class=\"button\" href=\"/ui/duplicates\">Duplicates</a><a class=\"button\" href=\"/ui/settings\">Settings</a><form method=\"post\" action=\"/logout\"><button class=\"button\">Sign out</button></form>"
     } else {
         ""
     };
@@ -967,16 +987,18 @@ fn search_page(args: &HashMap<String, String>, base: &str) -> String {
 <div class="layout"><aside class="sidebar"><details class="navigation" open><summary>Categories</summary>{nav}</details></aside>
 <main>
 <form id="search" class="searchbar" role="search" action="/" method="get" hx-get="/ui/results" hx-target="#results" hx-sync="this:replace" hx-indicator="#busy" hx-trigger="submit, input changed delay:300ms from:#q, change target:.scope-field">
-<div class="search-field"><input id="q" name="q" type="search" placeholder="Search releases" value="{q}" autocomplete="off" spellcheck="false" autofocus aria-label="Search releases"><kbd>/</kbd></div>
+<div class="search-field">{q}<kbd>/</kbd></div>
 {cat}<button class="button primary">Search</button><span id="busy" class="busy">searching…</span>
 {scope}</form>
+{ask}
 <div id="failure"></div>
 <div id="results">{results}</div>
 <footer class="footer">Newznab API: <code>{base}/api</code></footer>
 </main></div>"##,
             masthead = masthead(true),
             nav = category_nav(&search, ""),
-            q = attr(&search.q),
+            q = q_input(&search.q),
+            ask = ask_box(&gemini::load()),
             cat = category_input(&search.cat, ""),
             scope = scope_inputs(&search, ""),
             results = results_html(&search),
@@ -1811,6 +1833,201 @@ fn id_links(kind: i64, ids: &crate::media::resolve::Ids) -> String {
 }
 
 /// Also what someone pointing a browser at the bare address gets, soo it says how to set up a client.
+fn q_input(q: &str) -> String {
+    format!(
+        "<input id=\"q\" name=\"q\" type=\"search\" placeholder=\"Search releases\" value=\"{}\" autocomplete=\"off\" spellcheck=\"false\" autofocus aria-label=\"Search releases\">",
+        attr(q)
+    )
+}
+
+/// Where what Gemini made of a question goes: always on the page, soo a plain search can empty it.
+fn ask_note(content: &str, oob: &str) -> String {
+    format!("<div id=\"ask-note\" aria-live=\"polite\"{oob}>{content}</div>")
+}
+
+/// The plain words box, or where to turn it on.
+fn ask_box(settings: &gemini::Settings) -> String {
+    let note = ask_note("", "");
+    if !settings.has_key() {
+        return format!(
+            "<p class=\"ask-off\">Search in plain words with Gemini: <a href=\"/ui/settings\">add a key in Settings</a>.</p>{note}"
+        );
+    }
+    format!(
+        r##"<form id="ask" class="searchbar askbar" action="/ui/ask" method="post" hx-post="/ui/ask" hx-target="#results" hx-sync="#search:replace" hx-indicator="#asking" hx-disabled-elt="find button">
+<div class="search-field"><input id="ask-q" name="ask" type="search" maxlength="{max}" placeholder="Ask in plain words: 4K Dolby Vision remuxes of Dune, biggest first" autocomplete="off" aria-label="Ask in plain words"></div>
+<button class="button">Ask AI</button><span id="asking" class="busy">asking Gemini…</span></form>
+{note}"##,
+        max = gemini::MAX_QUESTION,
+    )
+}
+
+/// The search page's arguments for what Gemini read a question as, keeping only what the page knows.
+fn plan_args(plan: &gemini::Plan) -> HashMap<String, String> {
+    let mut args = HashMap::new();
+    let mut put = |k: &str, v: &str| {
+        if !v.is_empty() {
+            args.insert(k.to_string(), v.to_string());
+        }
+    };
+    put("q", &plan.q);
+    if category_name(&plan.cat).is_some() {
+        put("cat", &plan.cat);
+    }
+    put("filters", &plan.filters.join(","));
+    put("group", &plan.group);
+    put("poster", &plan.poster);
+    put("team", &plan.team);
+    if SortBy::from_word(&plan.sort).is_some() {
+        put("sort", &plan.sort);
+        put("dir", if plan.dir == "asc" { "asc" } else { "desc" });
+    }
+    args
+}
+
+/// "“dune” in Movies / UHD, 2160p and DV, biggest first": the search a question became, in words.
+fn described(search: &Search) -> String {
+    let mut what =
+        if search.q.is_empty() { "the newest releases".to_string() } else { format!("\u{201c}{}\u{201d}", search.q) };
+    if let Some(name) = category_name(&search.cat) {
+        what.push_str(&format!(" in {name}"));
+    }
+    let mut parts = vec![what];
+    if !search.filters.is_empty() {
+        parts.push(search.filters.join(", "));
+    }
+    for (name, value) in search.fields.chosen() {
+        parts.push(format!("{} {value}", name.to_lowercase()));
+    }
+    if let Some(by) = search.sort {
+        let way = match (by, search.descending) {
+            (SortBy::Posted, true) => "newest first".to_string(),
+            (SortBy::Posted, false) => "oldest first".to_string(),
+            (SortBy::Size, true) => "biggest first".to_string(),
+            (SortBy::Size, false) => "smallest first".to_string(),
+            (SortBy::Rating, true) => "best rated first".to_string(),
+            (by, true) => format!("by {}, Z to A", by.word()),
+            (by, false) => format!("by {}, A to Z", by.word()),
+        };
+        parts.push(way);
+    }
+    parts.join(", ")
+}
+
+/// Plain words to a search: Gemini reads them, the page searches with what it read.
+fn ask(body: &str, htmx: bool) -> ApiResponse {
+    let args = parse_query(body);
+    let question: String = args.get("ask").map_or("", |q| q.trim()).chars().take(gemini::MAX_QUESTION).collect();
+    let failed = |title: &str, why: &str| {
+        let mut resp = html(200, diag("caution", title, why));
+        resp.headers.push(("HX-Retarget".into(), "#ask-note".into()));
+        resp.headers.push(("HX-Reswap".into(), "innerHTML".into()));
+        resp
+    };
+    if question.is_empty() {
+        return failed("ask something first", "Type what you want in the Ask AI box, like 4K remuxes of Dune.");
+    }
+    let sorts: Vec<&str> = std::iter::once("relevance").chain(SortBy::ALL.iter().map(|(_, word)| *word)).collect();
+    let choices = gemini::Choices { filters: FILTERS, sorts: &sorts };
+    let plan = match gemini::plan(&gemini::load(), &question, &choices) {
+        Ok(plan) => plan,
+        Err(why) => return failed("Gemini could not read that", &why),
+    };
+    let search = Search::from_args(&plan_args(&plan));
+    let query = search.query(&search.cat, 0);
+    if !htmx {
+        let to = if query.is_empty() { "/".to_string() } else { format!("/?{query}") };
+        return ApiResponse {
+            status: 303,
+            content_type: None,
+            body: String::new(),
+            headers: vec![("Location".into(), to)],
+            bytes: None,
+            failed: false,
+        };
+    }
+    let said = if plan.note.is_empty() { String::new() } else { format!(" {}", escape(&plan.note)) };
+    let note = format!(
+        "<div class=\"ask-read\" data-q=\"{}\"><p><span class=\"tag tag-ref\">GEMINI</span>{said}</p><p class=\"path\">Searched {}</p></div>",
+        attr(&search.q),
+        escape(&described(&search)),
+    );
+    // the search box takes the words from `data-q` (web.js): swapping the box would drop the form's listener on it
+    first_page(&search, &ask_note(&note, " hx-swap-oob=\"true\""))
+}
+
+fn settings_page(message: Option<(&str, &str, String)>) -> String {
+    let settings = gemini::load();
+    let masked = escape(&gemini::masked(&settings.api_key));
+    let status = if settings.from_env {
+        format!(
+            "Atlas uses the key in <code>GEMINI_API_KEY</code>, <code>{masked}</code>. A key saved here takes its place."
+        )
+    } else if settings.has_key() {
+        format!("A key is saved: <code>{masked}</code>. Paste another to replace it.")
+    } else {
+        "No key yet. Make one in <a href=\"https://aistudio.google.com/apikey\" target=\"_blank\" rel=\"noreferrer noopener\">Google AI Studio</a>, then paste it here.".to_string()
+    };
+    let forget = if settings.has_key() && !settings.from_env {
+        "<button class=\"button\" name=\"do\" value=\"forget\">Remove key</button>"
+    } else {
+        ""
+    };
+    let message = message.map_or(String::new(), |(level, title, body)| diag(level, title, &body));
+    page(
+        "Atlas settings",
+        &format!(
+            r#"{masthead}<main class="detail settings">
+<p class="path"><a href="/">Atlas</a> › Settings</p><h1>Settings</h1>{message}
+<section class="panel"><h2>Ask AI with Gemini</h2>
+<p>Ask AI, on the search page, sends what you type to Google's Gemini with the list of categories and filters, then searches with the fields Gemini sends back. Nothing from your index goes to Google.</p>
+<p>{status}</p>
+<form class="settings-form" method="post" action="/ui/settings">
+<label for="gemini-key">Gemini API key</label>
+<input id="gemini-key" name="key" type="password" autocomplete="off" spellcheck="false" placeholder="{placeholder}">
+<label for="gemini-model">Model</label>
+<input id="gemini-model" name="model" type="text" value="{model}" placeholder="{default}" autocomplete="off" spellcheck="false">
+<p class="hint">Leave it empty for <code>{default}</code>, which follows Google's newest Flash model.</p>
+<div class="actions"><button class="button primary" name="do" value="save">Save</button>{forget}</div>
+</form></section></main>"#,
+            masthead = masthead(true),
+            placeholder = if settings.has_key() { "Paste a new key to replace it" } else { "Paste your key" },
+            model = attr(&settings.model),
+            default = gemini::DEFAULT_MODEL,
+        ),
+    )
+}
+
+fn save_settings(body: &str) -> ApiResponse {
+    let args = parse_query(body);
+    let get = |k: &str| args.get(k).map_or("", |v| v.trim());
+    let message = if get("do") == "forget" {
+        match gemini::forget() {
+            Ok(()) => ("help", "the key is removed", "Ask AI is off until you add another.".to_string()),
+            Err(e) => ("caution", "could not remove the key", e.to_string()),
+        }
+    } else {
+        let (key, model) = (get("key"), get("model"));
+        if !key.is_empty() && !gemini::looks_like_key(key) {
+            ("caution", "that is not a Gemini key", "A key is one line of letters, digits, - and _.".to_string())
+        } else if !model.is_empty()
+            && let Err(why) = gemini::model_path(model)
+        {
+            ("caution", "that is not a model name", why)
+        } else {
+            match gemini::save(key, model) {
+                Err(e) => ("caution", "could not save", e.to_string()),
+                Ok(saved) if !saved.has_key() => ("note", "saved", "Paste a key to turn Ask AI on.".to_string()),
+                Ok(saved) => match gemini::check(&saved) {
+                    Ok(()) => ("help", "saved", format!("Gemini took the key, and knows {}.", saved.model())),
+                    Err(why) => ("caution", "saved, but Gemini did not take it", why),
+                },
+            }
+        }
+    };
+    html(200, settings_page(Some(message)))
+}
+
 fn login_page(base: &str, wrong_key: bool) -> String {
     let error = if wrong_key {
         diag("caution", "that is not the API key", "Check api_key in config.toml.")
@@ -1869,21 +2086,21 @@ mod tests {
 
     #[test]
     fn signing_in_takes_the_key_and_the_cookie_is_not_the_key() {
-        let wrong = post("/login", "key=nope", "http://x", KEY).unwrap();
+        let wrong = post("/login", "key=nope", None, false, "http://x", KEY).unwrap();
         assert_eq!(wrong.status, 401);
         assert!(header(&wrong, "Set-Cookie").is_none());
         assert!(wrong.body.contains("not the API key"));
 
-        let right = post("/login", &format!("key={KEY}"), "http://x", KEY).unwrap();
+        let right = post("/login", &format!("key={KEY}"), None, false, "http://x", KEY).unwrap();
         assert_eq!(right.status, 303);
         assert_eq!(header(&right, "Location"), Some("/"));
         let set = header(&right, "Set-Cookie").unwrap();
         assert!(set.contains("HttpOnly") && set.contains("SameSite=Strict"), "{set}");
         assert!(!set.contains(KEY), "{set}");
 
-        let out = post("/logout", "", "http://x", KEY).unwrap();
+        let out = post("/logout", "", None, false, "http://x", KEY).unwrap();
         assert!(header(&out, "Set-Cookie").unwrap().contains("Max-Age=0"));
-        assert!(post("/api", "", "http://x", KEY).is_none());
+        assert!(post("/api", "", None, false, "http://x", KEY).is_none());
     }
 
     #[test]
