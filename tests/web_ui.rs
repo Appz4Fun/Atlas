@@ -178,6 +178,8 @@ fn the_web_ui_end_to_end() {
     assert_eq!(parts.status(), 200);
     assert!(parts.body.contains("<table") && parts.body.contains("x.bin"), "{}", parts.body);
     assert_eq!(fetch(port, &format!("/ui/meta?id={id}&part=nope"), &cookie).status(), 400);
+    // the fragments go through the same filtered reader as the page: no release, no fragment
+    assert_eq!(fetch(port, "/ui/meta?id=999999999&part=parts", &cookie).status(), 404);
     let drawer = fetch(port, &format!("/ui/row?id={id}"), &cookie);
     assert_eq!(drawer.status(), 200);
     assert!(

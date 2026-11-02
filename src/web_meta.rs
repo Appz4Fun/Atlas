@@ -75,12 +75,21 @@ fn panels_html(i: &MetaInputs<'_>, l: &Looked) -> String {
 /// `/ui/meta?id=&part=headers|parts|hashes`: the body of one lazy `<details>`.
 pub(crate) fn fragment(args: &HashMap<String, String>) -> ApiResponse {
     let id = arg_id(args);
+    let part = args.get("part").map(String::as_str).unwrap_or("");
+    if !matches!(part, "headers" | "parts" | "hashes") {
+        return html(400, String::new());
+    }
     let Ok(conn) = crate::db::open() else { return html(500, String::new()) };
-    let body = match args.get("part").map(String::as_str).unwrap_or("") {
+    // the reader the page, the NZB and the drawer use: a release in a blocked group, or none, is not served
+    match crate::search::get_release_with(&conn, id) {
+        Ok(Some(_)) => {}
+        Ok(None) => return html(404, String::new()),
+        Err(_) => return html(500, String::new()),
+    }
+    let body = match part {
         "headers" => headers_fragment(&conn, id),
         "parts" => parts_fragment(&conn, id),
-        "hashes" => hashes_fragment(&conn, id),
-        _ => return html(400, String::new()),
+        _ => hashes_fragment(&conn, id),
     };
     html(200, body)
 }
@@ -1148,9 +1157,13 @@ fn inside_panel(i: &MetaInputs<'_>, l: &Looked, compact: bool) -> Facts {
         return f;
     }
     f.add("Volumes", volume_scheme(&l.files, size, i.contents));
-    if let Some(bytes) = unpacked_estimate(&l.files, size, i.contents, i.inner, head) {
-        f.add("Unpacks to about", Some(fmt_size(Some(bytes))));
-    }
+    f.add(
+        "Unpacks to",
+        unpacked_estimate(&l.files, size, i.contents, i.inner, head).map(|u| match u {
+            Unpacked::About(bytes) => format!("about {}", fmt_size(Some(bytes))),
+            Unpacked::AtLeast(bytes) => format!("at least {} (partial listing)", fmt_size(Some(bytes))),
+        }),
+    );
     // the head's packed size is the first file's bytes in the volume read, its unpacked size the whole file's: a
     // ratio between them means something only when one volume holds the whole archive
     if let Some(a) = head
@@ -1375,32 +1388,55 @@ fn volume_scheme(files: &[FileInfo], size: Option<i64>, c: &Contents) -> Option<
     Some(format!("{count} volume{}{each} ({scheme}){rev}", plural(count)))
 }
 
+/// What the release unpacks to, and how far the figure can be trusted.
+#[derive(Debug, PartialEq, Eq)]
+enum Unpacked {
+    /// the whole of it, within about a tenth
+    About(i64),
+    /// from a listing that may stop before the archive's end: no less than this
+    AtLeast(i64),
+}
+
 /// What the release unpacks to: the listed files' sizes when they are known, the archive's own figure for a
-/// single file, else the posted data less yEnc's overhead.
+/// single file, else the posted data less yEnc's overhead. A stored listing can stop short (RAR headers past the
+/// bytes read, a ZIP read from its front) and whether it did is not stored, soo a listing's sum counts as the
+/// whole only when it comes within a tenth of the posted data; below that it is a lower bound.
 fn unpacked_estimate(
     files: &[FileInfo],
     size: Option<i64>,
     c: &Contents,
     inner: &InnerView,
     head: Option<&crate::probe::archive::ArchiveHead>,
-) -> Option<i64> {
+) -> Option<Unpacked> {
+    // yEnc adds about 2% in escapes and a little in control lines
+    let posted = data_bytes(size, c).map(|bytes| bytes * 100 / 103);
+    let against_posted = |bytes: i64| match posted {
+        Some(p) if bytes * 10 >= p * 9 => Unpacked::About(bytes),
+        _ => Unpacked::AtLeast(bytes),
+    };
     // the archive's own listing when there is one. A PAR2 inventory lists the posted files, which are the
     // contents only when none of them is an archive; added to the archive's listing it would count the volumes
     // and what is inside them both
     let listed: Vec<&InnerFileRow> = inner.files.iter().filter(|r| r.source != SOURCE_PAR2).collect();
-    let rows = if listed.is_empty() {
-        let par2: Vec<&InnerFileRow> = inner.files.iter().filter(|r| r.source == SOURCE_PAR2).collect();
-        if crate::duplicates::lists_archives(par2.iter().map(|r| r.name.as_str())) { Vec::new() } else { par2 }
+    if !listed.is_empty() {
+        if listed.iter().all(|r| r.size.is_some()) {
+            return Some(against_posted(listed.iter().filter_map(|r| r.size).sum()));
+        }
     } else {
-        listed
-    };
-    if !rows.is_empty() && rows.iter().all(|r| r.size.is_some()) {
-        return Some(rows.iter().filter_map(|r| r.size).sum());
+        // a PAR2 set names every file it protects, soo its sum is the whole
+        let par2: Vec<&InnerFileRow> = inner.files.iter().filter(|r| r.source == SOURCE_PAR2).collect();
+        if !par2.is_empty()
+            && !crate::duplicates::lists_archives(par2.iter().map(|r| r.name.as_str()))
+            && par2.iter().all(|r| r.size.is_some())
+        {
+            return Some(Unpacked::About(par2.iter().filter_map(|r| r.size).sum()));
+        }
     }
+    // the first file's size, which is the archive's when it holds one file
     if let Some(unpacked) = head.and_then(|a| a.unpacked)
-        && rows.len() <= 1
+        && listed.len() <= 1
     {
-        return Some(unpacked as i64);
+        return Some(against_posted(unpacked as i64));
     }
     let by_kind = counts(files);
     let volumes = by_kind
@@ -1420,8 +1456,7 @@ fn unpacked_estimate(
     if volumes == 0 && !files.is_empty() {
         return None;
     }
-    // yEnc adds about 2% in escapes and a little in control lines
-    data_bytes(size, c).map(|bytes| bytes * 100 / 103)
+    posted.map(Unpacked::About)
 }
 
 /// Tells about the packer: ngPost's defaults, an archive inside an archive.
@@ -2686,14 +2721,39 @@ mod tests {
         let size = Some(47 * 50 * MIB);
         // the archive's listing when all of it is sized, else the archive's figure, else the data less yEnc's
         // overhead; the PAR2 inventory's rows are not added to the archive's listing
-        assert_eq!(unpacked_estimate(&files, size, &contents(), &inner(), Some(&head)), Some(2_400_000_000));
+        let about = |n: i64| Some(Unpacked::About(n));
+        assert_eq!(unpacked_estimate(&files, size, &contents(), &inner(), Some(&head)), about(2_400_000_000));
         assert_eq!(
             unpacked_estimate(&files, size, &contents(), &InnerView::default(), Some(&head)),
-            Some(2_400_000_000)
+            about(2_400_000_000)
         );
         assert_eq!(
             unpacked_estimate(&files, size, &contents(), &InnerView::default(), None),
-            Some(47 * 50 * MIB * 100 / 103)
+            about(47 * 50 * MIB * 100 / 103)
+        );
+        // a listing that stops short of the archive's end (one episode of a season pack) is a lower bound,
+        // and so is any listing when nothing says what was posted
+        let episode = InnerView {
+            files: vec![InnerFileRow {
+                seq: 0,
+                name: "Show.S01E01.mkv".into(),
+                size: Some(350_000_000),
+                source: SOURCE_RAR,
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            unpacked_estimate(&files, size, &contents(), &episode, Some(&head)),
+            Some(Unpacked::AtLeast(350_000_000))
+        );
+        assert_eq!(
+            unpacked_estimate(&files, None, &Contents::default(), &inner(), Some(&head)),
+            Some(Unpacked::AtLeast(2_400_000_000))
+        );
+        let first_of_many = ArchiveHead { unpacked: Some(350_000_000), ..head.clone() };
+        assert_eq!(
+            unpacked_estimate(&files, size, &contents(), &InnerView::default(), Some(&first_of_many)),
+            Some(Unpacked::AtLeast(350_000_000))
         );
         assert_eq!(
             unpacked_estimate(&[file("x.nfo", 1)], Some(4000), &Contents::default(), &InnerView::default(), None),
@@ -2713,7 +2773,7 @@ mod tests {
         };
         assert_eq!(
             unpacked_estimate(&files, size, &contents(), &par2_of_volumes, None),
-            Some(47 * 50 * MIB * 100 / 103)
+            about(47 * 50 * MIB * 100 / 103)
         );
         // one of plain files is the contents
         let par2_of_contents = InnerView {
@@ -2724,7 +2784,7 @@ mod tests {
             ..Default::default()
         };
         let plain = [file(&format!("{NAME}.mkv"), 3000), file(&format!("{NAME}.nfo"), 1)];
-        assert_eq!(unpacked_estimate(&plain, size, &contents(), &par2_of_contents, None), Some(2_400_004_000));
+        assert_eq!(unpacked_estimate(&plain, size, &contents(), &par2_of_contents, None), about(2_400_004_000));
 
         let random: Vec<FileInfo> =
             (1..=47).map(|v| file(&format!("x7Qp2mZk9vL4nB8wT3rY.part{v:02}.rar"), 50)).collect();
@@ -2746,7 +2806,11 @@ mod tests {
 
         let html = full();
         assert!(html.contains("<dt>PAR2</dt><dd>slice 1.0 MB, up to 96 of 1,000 blocks (9.6%)</dd>"), "{html}");
-        assert!(html.contains("<dt>Unpacks to about</dt><dd>2.2 GB</dd>"), "{html}");
+        assert!(html.contains("<dt>Unpacks to</dt><dd>about 2.2 GB</dd>"), "{html}");
+        let mut partial = Fixture::new();
+        partial.inner = episode;
+        let html = inside_panel(&partial.inputs(), &looked(volumes(47)), false).html;
+        assert!(html.contains("<dt>Unpacks to</dt><dd>at least 333.8 MB (partial listing)</dd>"), "{html}");
         // 47 volumes: the head's packed size is one volume's slice of the first file, soo no ratio
         assert!(!html.contains("<dt>Packed</dt>"), "{html}");
         let f = Fixture::new();
