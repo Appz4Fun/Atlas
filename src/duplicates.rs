@@ -36,7 +36,7 @@ pub const FINGERPRINT: ShardTable = ShardTable {
         ),
     ],
     release_key: Some("release_id"),
-    added: &[("par2_block", "INTEGER"), ("par2_blocks", "INTEGER")],
+    added: &[("par2_block", "INTEGER"), ("par2_blocks", "INTEGER"), ("posted_names", "BLOB")],
 };
 
 pub const SET_POSTED: &str = "insert into release_fingerprint (release_id, posted) values (?1, ?2)
@@ -57,28 +57,24 @@ const MIN_CONTENT_FILE: u64 = 1 << 20;
 const MAX_COPIES: i64 = 50;
 
 /// Everything a posting is, from a complete PAR2 set and the files posted with it: the set itself and its block size,
-/// each file's name, size and MD5, how many recovery blocks came with it, and how many articles each file was cut into.
+/// each file's name, size and MD5, and every posted file's name with its article count, recovery volumes included.
 /// Two equal ones are the same posting in all but message-ids, which is what makes a **twin**: the same bytes under the
-/// same names, cut up the same way, with the same repair. PAR2 file sizes and part counts equal means articles are too,
-/// and sizes on the wire can't say more, as they also count headers that differ between posters.
-pub fn twin_fingerprint(
-    files: &[Par2File],
-    block_size: Option<u64>,
-    recovery_blocks: i64,
-    articles_per_file: &[i64],
-) -> Option<Vec<u8>> {
+/// same names, cut up the same way, with the same repair. Part counts and sizes equal means articles are too, and sizes
+/// on the wire can't say more, as they also count headers that differ between posters.
+pub fn twin_fingerprint(files: &[Par2File], block_size: Option<u64>, posted: &[(&str, i64)]) -> Option<Vec<u8>> {
     let first = files.first()?;
     let mut named: Vec<(&str, u64, [u8; 16])> = files.iter().map(|f| (f.name.as_str(), f.size, f.md5)).collect();
     named.sort_unstable();
     named.dedup();
-    let mut articles = articles_per_file.to_vec();
-    articles.sort_unstable();
+    let mut posted = posted.to_vec();
+    posted.sort_unstable();
     let mut sha = Sha1::new();
     sha.update(first.set_id);
     sha.update(block_size.unwrap_or(0).to_le_bytes());
-    sha.update(recovery_blocks.to_le_bytes());
-    sha.update((articles.len() as u64).to_le_bytes());
-    for parts in articles {
+    sha.update((posted.len() as u64).to_le_bytes());
+    for (name, parts) in posted {
+        sha.update((name.len() as u64).to_le_bytes());
+        sha.update(name.as_bytes());
         sha.update(parts.to_le_bytes());
     }
     for (name, size, md5) in named {
@@ -87,8 +83,17 @@ pub fn twin_fingerprint(
         sha.update(size.to_le_bytes());
         sha.update(md5);
     }
-    Some(sha.finalize().to_vec())
+    let mut out = vec![TWIN_VERSION];
+    out.extend(sha.finalize());
+    Some(out)
 }
+
+/// Marks a fingerprint as this kind. Ones from before a twin meant all of this are as long as the hash alone.
+const TWIN_VERSION: u8 = 2;
+
+/// Those older ones proved less, soo they go: nothing may lend articles on their word.
+pub const FORGET_OLD_TWINS: &str =
+    "update release_fingerprint set posted = null where posted is not null and length(posted) != 21";
 
 /// Whether one archive's listing says what a whole release holds: everything real in it is that archive's volumes.
 /// Names that differ count as different archives, soo an obfuscated set makes no fingerprint, which is the safe way
@@ -514,6 +519,10 @@ mod tests {
 
     const GB: u64 = 1 << 30;
 
+    fn content(files: &[(&str, u64)]) -> Option<Vec<u8>> {
+        content_fingerprint(files.iter().map(|(name, size)| (*name, Some(*size))))
+    }
+
     fn par2(size: u64, md5: u8) -> Par2File {
         Par2File { set_id: [0; 16], file_id: [0; 16], md5: [md5; 16], md5_16k: [0; 16], size, name: "x".into() }
     }
@@ -543,24 +552,25 @@ mod tests {
     fn a_twin_is_the_same_in_everything() {
         let file = |name: &str, md5: u8| Par2File { name: name.into(), ..par2(GB, md5) };
         let files = [file("a.rar", 1), file("b.rar", 2)];
-        let print =
-            |files: &[Par2File], block, recovery, parts: &[i64]| twin_fingerprint(files, Some(block), recovery, parts);
-        let base = print(&files, 1024, 16, &[1400, 1400, 1, 9]);
+        let posted = [("a.rar", 1400), ("b.rar", 1400), ("a.par2", 1), ("a.vol000+16.par2", 9)];
+        let print = |files: &[Par2File], block, posted: &[(&str, i64)]| twin_fingerprint(files, Some(block), posted);
+        let base = print(&files, 1024, &posted);
         assert!(base.is_some());
-        assert_eq!(base, print(&[file("b.rar", 2), file("a.rar", 1)], 1024, 16, &[9, 1, 1400, 1400]), "in any order");
-        assert_ne!(base, print(&[file("a.rar", 2), file("b.rar", 1)], 1024, 16, &[1400, 1400, 1, 9]), "swapped names");
-        assert_ne!(base, print(&[file("a.rar", 1), file("b.rar", 3)], 1024, 16, &[1400, 1400, 1, 9]), "other bytes");
-        assert_ne!(base, print(&files, 2048, 16, &[1400, 1400, 1, 9]), "another block size");
-        assert_ne!(base, print(&files, 1024, 32, &[1400, 1400, 1, 9]), "more recovery");
-        assert_ne!(base, print(&files, 1024, 16, &[1400, 1400, 1, 9, 9]), "another recovery volume");
-        assert_ne!(base, print(&files, 1024, 16, &[1500, 1300, 1, 9]), "cut up differently");
+        let shuffled = [posted[3], posted[0], posted[2], posted[1]];
+        assert_eq!(base, print(&[file("b.rar", 2), file("a.rar", 1)], 1024, &shuffled), "in any order");
+        assert_ne!(base, print(&[file("a.rar", 2), file("b.rar", 1)], 1024, &posted), "swapped names");
+        assert_ne!(base, print(&[file("a.rar", 1), file("b.rar", 3)], 1024, &posted), "other bytes");
+        assert_ne!(base, print(&files, 2048, &posted), "another block size");
+        let other_volume = [posted[0], posted[1], posted[2], ("a.vol016+16.par2", 9)];
+        assert_ne!(base, print(&files, 1024, &other_volume), "other recovery slices");
+        let more = [posted[0], posted[1], posted[2], posted[3], ("a.vol016+16.par2", 9)];
+        assert_ne!(base, print(&files, 1024, &more), "more recovery");
+        let swapped_counts = [("a.rar", 1300), ("b.rar", 1500), posted[2], posted[3]];
+        let other_counts = [("a.rar", 1500), ("b.rar", 1300), posted[2], posted[3]];
+        assert_ne!(print(&files, 1024, &swapped_counts), print(&files, 1024, &other_counts), "cut up differently");
         let other_set = Par2File { set_id: [7; 16], ..file("a.rar", 1) };
-        assert_ne!(base, print(&[other_set, file("b.rar", 2)], 1024, 16, &[1400, 1400, 1, 9]), "another PAR2 set");
-        assert_eq!(twin_fingerprint(&[], Some(1024), 16, &[1]), None);
-    }
-
-    fn content(files: &[(&str, u64)]) -> Option<Vec<u8>> {
-        content_fingerprint(files.iter().map(|(name, size)| (*name, Some(*size))))
+        assert_ne!(base, print(&[other_set, file("b.rar", 2)], 1024, &posted), "another PAR2 set");
+        assert_eq!(twin_fingerprint(&[], Some(1024), &posted), None);
     }
 
     #[test]
