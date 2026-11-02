@@ -348,7 +348,11 @@ fn run(data: &[u8], extra_dist: bool, target: usize, out: &mut Vec<u8>, filters:
             let len = filter_number(&mut bits);
             let kind = bits.take(3);
             let channels = if kind == 0 { bits.take(5) as usize + 1 } else { 0 };
-            if filters.len() < MAX_FILTERS && (4..=MAX_FILTER_BLOCK).contains(&len) {
+            if (4..=MAX_FILTER_BLOCK).contains(&len) {
+                // past the cap a filter can't be kept, so what follows can't be trusted: stop where it is
+                if filters.len() == MAX_FILTERS {
+                    return End::Cut;
+                }
                 filters.push(Filter { kind, start: out.len() + start, len, channels });
             }
             continue;

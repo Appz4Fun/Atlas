@@ -38,6 +38,9 @@ pub struct ArchiveHead {
     /// RAR: decoding this file needs the ones before it
     #[serde(skip)]
     pub solid: bool,
+    /// RAR: this file's data began in the volume before
+    #[serde(skip)]
+    pub split_before: bool,
 }
 
 pub fn parse(data: &[u8]) -> Option<ArchiveHead> {
@@ -213,6 +216,7 @@ fn rar5_file(data: &[u8], mut p: usize, end: usize, extra: u64, packed: u64, fla
     head.packed = Some(packed);
     // the block header's "data goes on in the next volume"
     head.continues = flags & 0x10 != 0;
+    head.split_before = flags & 0x08 != 0;
     let file_flags = vint(data, &mut p)?;
     let unpacked = vint(data, &mut p);
     let _attributes = vint(data, &mut p);

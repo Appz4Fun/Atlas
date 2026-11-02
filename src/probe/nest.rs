@@ -299,6 +299,8 @@ fn from_entries(data: &[u8]) -> Opened {
             "xz" => View::Stored { from: at, to },
             _ => View::Stop("no decoder for this yet"),
         }
+    } else if head.split_before {
+        View::Stop("starts in the volume before")
     } else if head.solid {
         View::Stop("solid: needs the files before it")
     } else if format == "RAR5" && head.rar_version <= 1 {

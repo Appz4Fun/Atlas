@@ -242,6 +242,16 @@ fn methods_not_decoded_yet_say_so() {
     let n = unwrap(&r);
     assert_eq!(formats(&n), ["RAR5 m3"]);
     assert_eq!(n.layers[0].stop.as_deref(), Some("a RAR algorithm newer than this knows"));
+    // a RAR5 file whose front is in the volume before
+    let fields =
+        [&vint(0)[..], &vint(v.len() as u64), &vint(0x20), &vint(3 << 7), &[0], &vint(9), b"movie.mkv"].concat();
+    let inner = [&vint(2)[..], &vint(2 | 8), &vint(v.len() as u64), &fields].concat();
+    let body = [vint(inner.len() as u64), inner].concat();
+    let block = [&crate::archive::crc32(&body).to_le_bytes()[..], &body, &v].concat();
+    let r = rar5(&[r5_main(), block, r5_end()]);
+    let n = unwrap(&r);
+    assert_eq!(formats(&n), ["RAR5 m3"]);
+    assert_eq!(n.layers[0].stop.as_deref(), Some("starts in the volume before"));
     // RAR4's own compression comes in a later change
     let mut fields = r4_file_fields(b"movie.mkv", v.len() as u32);
     fields[14] = 0x33;
