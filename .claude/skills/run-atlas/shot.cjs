@@ -1,6 +1,7 @@
-// node shot.cjs BASE KEY OUT [PATH] [--dark] [--width N]
+// node shot.cjs BASE KEY OUT [PATH] [--dark] [--width N] [--click SELECTOR]
 // Signs in to the Atlas web UI with KEY, opens PATH (default /), waits for
-// htmx to settle and saves OUT (".png" added if missing). Prints the page's
+// htmx to settle, clicks SELECTOR when given (and waits for what it loads), and
+// saves OUT (".png" added if missing). Prints the page's
 // <title> and the first result names so an agent can check without looking.
 // CommonJS on purpose: ESM `import` ignores NODE_PATH, where the container's playwright lives
 // the container's browsers live in /opt/pw-browsers; a shell without
@@ -16,11 +17,13 @@ const { chromium } = require('playwright');
 const [base, key, outArg, ...rest] = process.argv.slice(2);
 // PATH is optional, so `shot OUT --dark` must not take --dark for it
 const path = rest[0] && !rest[0].startsWith('--') ? rest.shift() : '/';
-if (!outArg) { console.error('usage: shot.cjs BASE KEY OUT [PATH] [--dark] [--width N]'); process.exit(1); }
+if (!outArg) { console.error('usage: shot.cjs BASE KEY OUT [PATH] [--dark] [--width N] [--click SELECTOR]'); process.exit(1); }
 const out = outArg.endsWith('.png') ? outArg : `${outArg}.png`;
 const dark = rest.includes('--dark');
 const wi = rest.indexOf('--width');
 const width = wi >= 0 ? Number(rest[wi + 1]) : 1400;
+const ci = rest.indexOf('--click');
+const click = ci >= 0 ? rest[ci + 1] : null;
 
 const browser = await chromium.launch();
 const page = await browser.newPage({ viewport: { width, height: 900 }, colorScheme: dark ? 'dark' : 'light' });
@@ -31,6 +34,11 @@ if (await page.locator('#key').count()) {
 }
 await page.goto(base + path);
 await page.waitForLoadState('networkidle');
+if (click) {
+  await page.locator(click).first().click();
+  await page.waitForLoadState('networkidle');
+  await page.waitForTimeout(500);
+}
 await page.screenshot({ path: out, fullPage: true });
 const names = await page.locator('td.name > a').allTextContents();
 console.log(JSON.stringify({ out, title: await page.title(), url: page.url(), results: names.slice(0, 10) }));
