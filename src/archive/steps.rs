@@ -6,6 +6,8 @@ use std::time::{Duration, Instant};
 use rusqlite::params;
 use rusqlite::types::Value;
 
+use crate::duplicates;
+
 use crate::config::{ArchiveConfig, Config};
 use crate::naming::{self, NameSource};
 use crate::par2;
@@ -38,7 +40,7 @@ pub(crate) fn first_article(ctx: &StepCtx<'_>, file: &FileInfo) -> Result<Option
 }
 
 /// A file's last articles, last one last. Empty when its last isnt indexed.
-fn tail_articles(ctx: &StepCtx<'_>, file: &FileInfo) -> Result<Vec<SegmentRef>, StepError> {
+pub(crate) fn tail_articles(ctx: &StepCtx<'_>, file: &FileInfo) -> Result<Vec<SegmentRef>, StepError> {
     let segs = ctx.segments(file.id, &SegmentPick::Last(2)).map_err(retry)?;
     let last_is_there = match (file.expected, segs.last().and_then(|s| s.part)) {
         (Some(expected), Some(part)) => part == expected,
@@ -116,8 +118,26 @@ fn finish(ctx: &StepCtx<'_>, source: i64, listing: Listing, limits: &ArchiveConf
         // past the total: what's there stays, and this list goes unstored
         writes.push(StepWrite::new(archive_store::COUNT_OVER_QUOTA, vec![]));
     }
+    // part of a list would call two releases the same when only their first files are
+    if listing.complete
+        && !listing.damaged
+        && let Some(content) = duplicates::content_fingerprint(listing.files.iter().map(|f| (f.name.as_str(), f.size)))
+    {
+        writes.push(StepWrite::new(duplicates::SET_CONTENT, vec![id.into(), content.into()]));
+    }
     if source != SOURCE_PAR2 {
         writes.push(StepWrite::new(archive_store::UPSERT_RELEASE, vec![id.into(), listing.password().code().into()]));
+        if let Some(encryption) = listing.encryption {
+            writes.push(StepWrite::new(
+                archive_store::SET_ENCRYPTION,
+                vec![
+                    id.into(),
+                    encryption.code().into(),
+                    i64::from(listing.headers_encrypted).into(),
+                    listing.password_check.map(|check| check.to_bytes()).into(),
+                ],
+            ));
+        }
     }
 
     let name_source = if source == SOURCE_PAR2 { NAME_SOURCE_PAR2 } else { NAME_SOURCE_INNER };
@@ -202,7 +222,36 @@ impl Step for Par2Step {
             return Ok(Outcome::default());
         }
         let limits = self.limits.lock().unwrap().clone();
-        finish(ctx, SOURCE_PAR2, listing_of(inventory), &limits)
+        // one set that covers every posted file. A release can hold several sets, and one proves only its own files
+        let posted_files = files.iter().filter(|f| !f.filename.to_ascii_lowercase().ends_with(".par2")).count();
+        let one_set =
+            inventory.files.first().is_some_and(|first| inventory.files.iter().all(|f| f.set_id == first.set_id));
+        let covers_all = inventory.complete && one_set && inventory.files.len() == posted_files;
+        let posted = covers_all.then(|| duplicates::posted_fingerprint(&inventory.files)).flatten();
+        let posted_names = covers_all.then(|| duplicates::posted_names_fingerprint(&inventory.files)).flatten();
+        let sizes = inventory.block_size.filter(|_| covers_all).map(|block| {
+            // each file's last block is padded on its own
+            let blocks: u64 = inventory.files.iter().map(|f| f.size.div_ceil(block)).sum();
+            (block as i64, blocks as i64)
+        });
+        let mut outcome = finish(ctx, SOURCE_PAR2, listing_of(inventory), &limits)?;
+        // one set's files are only some of the release's, soo they don't say what the release holds
+        if !covers_all {
+            outcome.writes.retain(|write| write.sql != duplicates::SET_CONTENT);
+        }
+        if let Some(posted) = posted {
+            let params = vec![ctx.release().id.into(), posted.into()];
+            outcome.writes.push(StepWrite::new(duplicates::SET_POSTED, params));
+        }
+        if let Some(names) = posted_names {
+            let params = vec![ctx.release().id.into(), names.into()];
+            outcome.writes.push(StepWrite::new(duplicates::SET_POSTED_NAMES, params));
+        }
+        if let Some((block, blocks)) = sizes {
+            let params = vec![ctx.release().id.into(), block.into(), blocks.into()];
+            outcome.writes.push(StepWrite::new(duplicates::SET_PAR2_SIZES, params));
+        }
+        Ok(outcome)
     }
 }
 
@@ -253,7 +302,8 @@ fn budgeted(
 fn zip_list(ctx: &mut StepCtx<'_>, head: &Head<'_>, body: &[u8], left: &mut usize) -> Result<Listing, StepError> {
     let in_body = zip::list_tail(body);
     if !in_body.files.is_empty() {
-        return Ok(in_body);
+        // with the first entry's password check, which only the local header has
+        return Ok(zip::list(body, body));
     }
     let segs = tail_articles(ctx, head.tail)?;
     let Some(last) = segs.last() else { return Ok(zip::list(body, &[])) };

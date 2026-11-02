@@ -5,7 +5,7 @@ use crate::db::{self, Result};
 use crate::store;
 
 /// One search hit. `name` is the display name when we have one.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ReleaseRow {
     pub id: i64,
     pub name: String,
@@ -30,16 +30,16 @@ pub struct ArticleRow {
     pub posted_date: Option<String>,
 }
 
-const COLUMNS: &str =
+pub(crate) const COLUMNS: &str =
     "r.id, coalesce(r.display_name, r.name), r.group_name, r.poster, r.posted_date, r.size, r.complete, r.parts";
 
 /// hide obfuscated junk unless we managed to get a real name for it
-const VISIBLE_RELEASE: &str = "(
+pub(crate) const VISIBLE_RELEASE: &str = "(
     r.display_name is not null
     or (r.is_obfuscated = 0 and (length(r.name) < 16 or r.name glob '*[^A-Za-z0-9]*'))
 ) and not atlas_blocked(r.group_name)";
 
-fn release_row(r: &Row) -> rusqlite::Result<ReleaseRow> {
+pub(crate) fn release_row(r: &Row) -> rusqlite::Result<ReleaseRow> {
     Ok(ReleaseRow {
         id: r.get(0)?,
         name: r.get::<_, Option<String>>(1)?.unwrap_or_default(),

@@ -51,7 +51,7 @@ min_size_bytes = 0
 min_files = 1
 reject_par2_only = true
 backlog_per_second = 2000
-body_fetches_per_minute = 0
+body_fetches_per_minute = 600
 body_connections = 2
 body_min_size_bytes = 1048576
 body_max_size_bytes = 107374182400
@@ -92,9 +92,12 @@ nfo = true
 negative_ttl_days = 30
 
 [media.tvmaze]
-enabled = false
+enabled = true
 
 [media.tmdb]
+api_key = ""
+
+[media.omdb]
 api_key = ""
 
 [media.trakt]

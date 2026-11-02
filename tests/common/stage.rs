@@ -106,7 +106,7 @@ impl Step for TestStep {
 }
 
 pub fn quick_config() -> PostprocessConfig {
-    PostprocessConfig { settle_secs: 1, complete_settle_secs: 1, ..Default::default() }
+    PostprocessConfig { settle_secs: 1, complete_settle_secs: 1, body_fetches_per_minute: 0, ..Default::default() }
 }
 
 /// A shard, a stage's worth of runtime, and whatever was saved first.

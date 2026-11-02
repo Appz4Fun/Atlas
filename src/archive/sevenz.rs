@@ -2,7 +2,7 @@
 //! is, and that one may be LZMA packed.
 #![cfg_attr(not(test), deny(clippy::indexing_slicing, clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
-use super::{Listing, MAX_ENTRIES, crc32};
+use super::{Encryption, Listing, MAX_ENTRIES, crc32};
 
 const MAX_NEXT: u64 = 16 * 1024 * 1024;
 const MAX_DECODED: usize = 16 * 1024 * 1024;
@@ -417,6 +417,7 @@ fn header(r: &mut Reader<'_>, l: &mut Listing) -> Option<()> {
         let main = streams(r)?;
         if main.folders.iter().any(|f| f.aes) {
             l.encrypted = true;
+            l.encryption = Some(Encryption::SevenZipAes256);
         }
         sizes = main.sizes;
         id = r.byte()?;
@@ -504,6 +505,7 @@ fn nested(head: &[u8], window: &[u8], at: u64, first: Vec<u8>, l: &mut Listing) 
         let encoded = streams(&mut r)?;
         if encoded.folders.iter().any(|f| f.aes) {
             l.encrypted = true;
+            l.encryption = Some(Encryption::SevenZipAes256);
             l.headers_encrypted = true;
             return Some(());
         }

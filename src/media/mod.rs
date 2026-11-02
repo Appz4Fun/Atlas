@@ -1,5 +1,6 @@
 //! TV and movie IDs: each release's title, each title resolved once, and searches by ID.
 
+pub mod details;
 pub mod fanout;
 pub mod http;
 pub mod parse;

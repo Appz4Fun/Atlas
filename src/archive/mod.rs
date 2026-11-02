@@ -113,10 +113,97 @@ impl Password {
     }
 }
 
+/// How an archive is encrypted. Stored by code, soo the numbers stay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Encryption {
+    Rar4Aes128,
+    Rar5Aes256,
+    SevenZipAes256,
+    ZipCrypto,
+    ZipAes,
+}
+
+impl Encryption {
+    pub fn code(self) -> i64 {
+        match self {
+            Encryption::Rar4Aes128 => 1,
+            Encryption::Rar5Aes256 => 2,
+            Encryption::SevenZipAes256 => 3,
+            Encryption::ZipCrypto => 4,
+            Encryption::ZipAes => 5,
+        }
+    }
+
+    pub fn from_code(n: i64) -> Option<Encryption> {
+        match n {
+            1 => Some(Encryption::Rar4Aes128),
+            2 => Some(Encryption::Rar5Aes256),
+            3 => Some(Encryption::SevenZipAes256),
+            4 => Some(Encryption::ZipCrypto),
+            5 => Some(Encryption::ZipAes),
+            _ => None,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Encryption::Rar4Aes128 => "RAR4, AES-128",
+            Encryption::Rar5Aes256 => "RAR5, AES-256",
+            Encryption::SevenZipAes256 => "7z, AES-256",
+            Encryption::ZipCrypto => "ZIP, ZipCrypto",
+            Encryption::ZipAes => "ZIP, AES",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InnerFile {
     pub name: String,
     pub size: Option<u64>,
+}
+
+/// What an archive's headers keep to test a password with nothing decrypted but a few bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PasswordTest {
+    Rar5(rar::PasswordCheck),
+    Zip(zip::PasswordCheck),
+}
+
+impl PasswordTest {
+    /// A RAR5 check starts with its round count, which is never this high.
+    const ZIP_TAG: u8 = 0xff;
+
+    pub fn to_bytes(self) -> Vec<u8> {
+        match self {
+            PasswordTest::Rar5(check) => check.to_bytes(),
+            PasswordTest::Zip(check) => {
+                let mut out = vec![Self::ZIP_TAG];
+                out.extend(check.to_bytes());
+                out
+            }
+        }
+    }
+
+    pub fn from_bytes(b: &[u8]) -> Option<PasswordTest> {
+        if b.first() == Some(&Self::ZIP_TAG) {
+            zip::PasswordCheck::from_bytes(b.get(1..)?).map(PasswordTest::Zip)
+        } else {
+            rar::PasswordCheck::from_bytes(b).map(PasswordTest::Rar5)
+        }
+    }
+
+    /// Whether this is the password. None: too many rounds to find out here.
+    pub fn accepts(&self, password: &str) -> Option<bool> {
+        match self {
+            PasswordTest::Rar5(check) => check.accepts(password),
+            PasswordTest::Zip(check) => Some(check.accepts(password)),
+        }
+    }
+
+    /// Whether a yes settles it. ZipCrypto's check is one byte, soo one wrong password in 256 passes.
+    pub fn certain(&self) -> bool {
+        !matches!(self, PasswordTest::Zip(zip::PasswordCheck::Crypto { .. }))
+    }
 }
 
 /// What a parser read. Total functions: bad bytes give a listing that says so.
@@ -128,6 +215,10 @@ pub struct Listing {
     pub encrypted: bool,
     /// and the names cannot be read
     pub headers_encrypted: bool,
+    /// what kind, once `encrypted`
+    pub encryption: Option<Encryption>,
+    /// RAR5: what a password can be tried against, with nothing downloaded
+    pub password_check: Option<PasswordTest>,
     /// the end of the list was seen
     pub complete: bool,
     /// a header failed its CRC or its structure

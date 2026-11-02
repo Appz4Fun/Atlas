@@ -28,6 +28,7 @@ const FAST: i64 = 600_000;
 
 fn no_providers() -> MediaConfig {
     let mut c = MediaConfig::default();
+    c.tvmaze.enabled = false;
     c.tvmaze.requests_per_minute = FAST;
     c.tmdb.requests_per_minute = FAST;
     c

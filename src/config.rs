@@ -181,6 +181,15 @@ pub struct TmdbConfig {
     pub api_key: String,
     pub requests_per_minute: i64,
     pub base_url: Option<String>,
+    pub image_base_url: Option<String>,
+}
+
+/// Ratings for the release page. Only asked when someone opens a release.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OmdbConfig {
+    pub api_key: String,
+    pub requests_per_minute: i64,
+    pub base_url: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -199,6 +208,7 @@ pub struct MediaConfig {
     pub max_titles: i64,
     pub tvmaze: TvmazeConfig,
     pub tmdb: TmdbConfig,
+    pub omdb: OmdbConfig,
     pub trakt: TraktConfig,
     pub tvdb: TvdbConfig,
 }
@@ -210,8 +220,9 @@ impl Default for MediaConfig {
             nfo: true,
             negative_ttl_days: 30,
             max_titles: 10_000_000,
-            tvmaze: TvmazeConfig { enabled: false, requests_per_minute: 90, base_url: None },
-            tmdb: TmdbConfig { api_key: String::new(), requests_per_minute: 240, base_url: None },
+            tvmaze: TvmazeConfig { enabled: true, requests_per_minute: 90, base_url: None },
+            tmdb: TmdbConfig { api_key: String::new(), requests_per_minute: 240, base_url: None, image_base_url: None },
+            omdb: OmdbConfig { api_key: String::new(), requests_per_minute: 30, base_url: None },
             trakt: TraktConfig { client_id: String::new(), requests_per_minute: 120, base_url: None },
             tvdb: TvdbConfig { api_key: String::new(), pin: String::new(), requests_per_minute: 120, base_url: None },
         }
@@ -260,6 +271,11 @@ impl MediaConfig {
         c.tmdb.api_key = text(tmdb, "api_key").unwrap_or_default();
         rate(tmdb, 3_000, &mut c.tmdb.requests_per_minute);
         c.tmdb.base_url = text(tmdb, "base_url").filter(|u| !u.is_empty());
+        c.tmdb.image_base_url = text(tmdb, "image_base_url").filter(|u| !u.is_empty());
+        let omdb = v.get("omdb");
+        c.omdb.api_key = text(omdb, "api_key").unwrap_or_default();
+        rate(omdb, 600, &mut c.omdb.requests_per_minute);
+        c.omdb.base_url = text(omdb, "base_url").filter(|u| !u.is_empty());
         let trakt = v.get("trakt");
         c.trakt.client_id = text(trakt, "client_id").unwrap_or_default();
         rate(trakt, 200, &mut c.trakt.requests_per_minute);
@@ -500,7 +516,7 @@ impl Default for PostprocessConfig {
             reject_par2_only: true,
             group_rules: HashMap::new(),
             backlog_per_second: 2000,
-            body_fetches_per_minute: 0,
+            body_fetches_per_minute: 600,
             body_connections: 2,
             body_min_size_bytes: 1 << 20,
             body_max_size_bytes: 100 << 30,
@@ -1146,21 +1162,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn media_is_all_off_when_absent() {
+    fn tvmaze_is_on_when_absent_as_it_needs_no_key() {
         let c = Config::from_value(&json!({})).media;
-        assert!(!c.any_provider());
+        assert!(c.any_provider());
         assert!(c.parse);
     }
 
     #[test]
-    fn tvmaze_needs_its_switch() {
-        assert!(!MediaConfig::from_value(Some(&json!({"tvmaze": {}}))).any_provider());
-        assert!(MediaConfig::from_value(Some(&json!({"tvmaze": {"enabled": true}}))).any_provider());
+    fn tvmaze_can_be_turned_off() {
+        assert!(MediaConfig::from_value(Some(&json!({"tvmaze": {}}))).any_provider());
+        assert!(!MediaConfig::from_value(Some(&json!({"tvmaze": {"enabled": false}}))).any_provider());
     }
 
     #[test]
     fn an_empty_key_is_off() {
-        assert!(!MediaConfig::from_value(Some(&json!({"tmdb": {"api_key": ""}}))).any_provider());
+        let c = json!({"tvmaze": {"enabled": false}, "tmdb": {"api_key": ""}});
+        assert!(!MediaConfig::from_value(Some(&c)).any_provider());
     }
 
     #[test]
@@ -1176,7 +1193,8 @@ mod tests {
     #[test]
     fn a_key_turns_tvdb_on() {
         assert!(MediaConfig::from_value(Some(&json!({"tvdb": {"api_key": "K"}}))).any_provider());
-        assert!(!MediaConfig::from_value(Some(&json!({"tvdb": {"api_key": " "}}))).any_provider());
+        let blank = json!({"tvmaze": {"enabled": false}, "tvdb": {"api_key": " "}});
+        assert!(!MediaConfig::from_value(Some(&blank)).any_provider());
     }
 
     #[test]
@@ -1188,9 +1206,11 @@ mod tests {
     }
 
     #[test]
-    fn the_example_keeps_every_provider_off() {
+    fn the_example_turns_on_what_needs_no_key() {
         let example = parse_config(Path::new("config.toml"), include_str!("../config.example.toml")).unwrap();
-        assert!(!Config::from_value(&example).media.any_provider());
+        let media = Config::from_value(&example).media;
+        assert!(media.tvmaze.enabled);
+        assert!(media.tmdb.api_key.is_empty());
     }
 
     #[test]
@@ -1521,7 +1541,7 @@ mod tests {
         let c = Config::from_value(&json!({}));
         assert_eq!(c.postprocess, PostprocessConfig::default());
         assert!(c.postprocess.enabled);
-        assert_eq!(c.postprocess.body_fetches_per_minute, 0, "no bodies unless asked");
+        assert_eq!(c.postprocess.body_fetches_per_minute, 600, "everything on unless turned off");
     }
 
     #[test]
@@ -1554,7 +1574,7 @@ mod tests {
         assert_eq!(c.workers, 2);
         assert_eq!(c.settle_secs, 1, "floored");
         assert_eq!(c.complete_settle_secs, 900);
-        assert_eq!(c.body_fetches_per_minute, 0);
+        assert_eq!(c.body_fetches_per_minute, 600);
         assert_eq!(c.min_completion_percent, 100);
         assert_eq!(c.max_attempts, 5);
         assert!(c.group_rules.is_empty());

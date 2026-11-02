@@ -39,15 +39,17 @@ pub struct ApiResponse {
     pub content_type: Option<&'static str>,
     pub body: String,
     pub headers: Vec<(String, String)>,
+    /// sent in place of `body`, for what isn't text
+    pub bytes: Option<Vec<u8>>,
 }
 
 impl ApiResponse {
     fn xml(status: u16, body: String) -> Self {
-        ApiResponse { status, content_type: Some(XML), body, headers: Vec::new() }
+        ApiResponse { status, content_type: Some(XML), body, headers: Vec::new(), bytes: None }
     }
 
     pub(crate) fn not_found() -> Self {
-        ApiResponse { status: 404, content_type: None, body: String::new(), headers: Vec::new() }
+        ApiResponse { status: 404, content_type: None, body: String::new(), headers: Vec::new(), bytes: None }
     }
 
     /// newznab error, sent with http 200 like real indexers do
@@ -262,6 +264,35 @@ fn search(q: &str, args: &HashMap<String, String>, base: &str, api_key: &str) ->
     }
 }
 
+/// What a name says and how many copies a release has, as Newznab attributes. Words other indexers use where
+/// they exist: `team` for the group, `video` and `audio` for codecs.
+fn release_attrs(r: &crate::search::ReleaseRow, copies: Option<&crate::duplicates::CopyCount>) -> String {
+    let tags = crate::release_tags::parse(&r.name);
+    let mut out = String::new();
+    let mut add = |name: &str, value: &str| {
+        if !value.is_empty() {
+            out.push_str(&format!(
+                "<newznab:attr name=\"{name}\" value=\"{}\"/>",
+                escape(value).replace('"', "&quot;")
+            ));
+        }
+    };
+    add("poster", r.poster.as_deref().unwrap_or_default());
+    add("group", &r.group_name);
+    add("resolution", tags.resolution.as_deref().unwrap_or_default());
+    add("video", tags.codec.as_deref().unwrap_or_default());
+    add("audio", &tags.audio.join(", "));
+    add("hdr", &tags.hdr.join(", "));
+    add("source", tags.quality.as_deref().unwrap_or_default());
+    add("language", &tags.languages.join(", "));
+    add("team", tags.group.as_deref().unwrap_or_default());
+    if let Some(copies) = copies {
+        add("twins", &copies.twins.to_string());
+        add("pairs", &copies.pairs.to_string());
+    }
+    out
+}
+
 #[allow(clippy::too_many_arguments)]
 fn rss(
     base: &str,
@@ -273,6 +304,8 @@ fn rss(
     media: &HashMap<i64, crate::media::query::MediaAttrs>,
     on: &crate::media::query::IdParams,
 ) -> ApiResponse {
+    let ids: Vec<i64> = releases.iter().map(|r| r.id).collect();
+    let copies = crate::duplicates::counts(&ids).unwrap_or_default();
     let items: String = releases
         .iter()
         .map(|r| {
@@ -283,6 +316,7 @@ fn rss(
                 .map_or(String::new(), |p| format!("<newznab:attr name=\"password\" value=\"{}\"/>", p.code()));
             let category = categories.get(&r.id).copied().unwrap_or(crate::category::UNCATEGORIZED);
             let attrs = media.get(&r.id).map_or(String::new(), |a| a.xml(on));
+            let attrs = format!("{attrs}{}", release_attrs(r, copies.get(&r.id)));
             format!(
                 "    <item>      <title>{}</title>      <guid isPermaLink=\"false\">{}</guid>      <link>{}</link>      <size>{size}</size>      <pubDate>{}</pubDate>      <enclosure url=\"{}\" type=\"application/x-nzb\" length=\"{size}\"/>      <newznab:attr name=\"category\" value=\"{category}\"/>{attrs}{password}    </item>",
                 escape(&r.name),
@@ -338,6 +372,7 @@ pub(crate) fn get_nzb(args: &HashMap<String, String>) -> ApiResponse {
         content_type: Some("application/x-nzb"),
         body: content,
         headers: vec![("Content-Disposition".into(), format!("attachment; filename=\"{filename}\""))],
+        bytes: None,
     }
 }
 
@@ -367,10 +402,14 @@ fn respond(mut request: Request, api_key: &str, fallback_host: &str) {
         let _ = request.as_reader().take(MAX_FORM_BODY).read_to_string(&mut body);
         crate::web::post(path, &body, &base, api_key).unwrap_or_else(ApiResponse::not_found)
     } else {
-        ApiResponse { status: 405, content_type: None, body: String::new(), headers: Vec::new() }
+        ApiResponse { status: 405, content_type: None, body: String::new(), headers: Vec::new(), bytes: None }
     };
 
-    let mut response = Response::from_string(resp.body).with_status_code(resp.status);
+    let mut response = match resp.bytes {
+        Some(bytes) => Response::from_data(bytes),
+        None => Response::from_string(resp.body),
+    }
+    .with_status_code(resp.status);
 
     let mut headers = resp.headers;
     headers.push(("Content-Type".into(), resp.content_type.unwrap_or("text/html; charset=utf-8").into()));
