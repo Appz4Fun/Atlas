@@ -41,8 +41,6 @@ pub const FINGERPRINT: ShardTable = ShardTable {
 
 pub const SET_POSTED: &str = "insert into release_fingerprint (release_id, posted) values (?1, ?2)
     on conflict(release_id) do update set posted = excluded.posted";
-pub const SET_POSTED_NAMES: &str = "insert into release_fingerprint (release_id, posted_names) values (?1, ?2)
-    on conflict(release_id) do update set posted_names = excluded.posted_names";
 pub const SET_PAR2_SIZES: &str =
     "insert into release_fingerprint (release_id, par2_block, par2_blocks) values (?1, ?2, ?3)
     on conflict(release_id) do update set par2_block = excluded.par2_block, par2_blocks = excluded.par2_blocks";
@@ -50,7 +48,7 @@ pub const SET_CONTENT: &str = "insert into release_fingerprint (release_id, cont
     on conflict(release_id) do update set content = excluded.content";
 
 /// A release that no longer proves what it did, as when more of it has arrived. Its old answer goes.
-pub const CLEAR_POSTED: &str = "update release_fingerprint set posted = null, posted_names = null, par2_block = null,
+pub const CLEAR_POSTED: &str = "update release_fingerprint set posted = null, par2_block = null,
     par2_blocks = null where release_id = ?1";
 pub const CLEAR_CONTENT: &str = "update release_fingerprint set content = null where release_id = ?1";
 
@@ -58,45 +56,50 @@ pub const CLEAR_CONTENT: &str = "update release_fingerprint set content = null w
 const MIN_CONTENT_FILE: u64 = 1 << 20;
 const MAX_COPIES: i64 = 50;
 
-/// What the posted files are, from a PAR2 set: their sizes and MD5s. Two equal ones are byte-identical.
-pub fn posted_fingerprint(files: &[Par2File]) -> Option<Vec<u8>> {
-    if files.is_empty() {
-        return None;
-    }
-    let mut hashes: Vec<(u64, [u8; 16])> = files.iter().map(|f| (f.size, f.md5)).collect();
-    hashes.sort_unstable();
-    hashes.dedup();
-    let mut sha = Sha1::new();
-    for (size, md5) in hashes {
-        sha.update(size.to_le_bytes());
-        sha.update(md5);
-    }
-    Some(sha.finalize().to_vec())
-}
-
-/// The same, with each file's name. Two equal ones have the same bytes under each name, which is what filling one's
-/// gaps from the other by file name takes: the same files under swapped names are still twins, but not this.
-pub fn posted_names_fingerprint(files: &[Par2File]) -> Option<Vec<u8>> {
-    if files.is_empty() {
-        return None;
-    }
+/// Everything a posting is, from a complete PAR2 set and the files posted with it: the set itself and its block size,
+/// each file's name, size and MD5, and every posted file's name with its article count, recovery volumes included.
+/// Two equal ones are the same posting in all but message-ids, which is what makes a **twin**: the same bytes under the
+/// same names, cut up the same way, with the same repair. Part counts and sizes equal means articles are too, and sizes
+/// on the wire can't say more, as they also count headers that differ between posters.
+pub fn twin_fingerprint(files: &[Par2File], block_size: Option<u64>, posted: &[(&str, i64)]) -> Option<Vec<u8>> {
+    let first = files.first()?;
     let mut named: Vec<(&str, u64, [u8; 16])> = files.iter().map(|f| (f.name.as_str(), f.size, f.md5)).collect();
     named.sort_unstable();
     named.dedup();
+    let mut posted = posted.to_vec();
+    posted.sort_unstable();
     let mut sha = Sha1::new();
+    sha.update(first.set_id);
+    sha.update(block_size.unwrap_or(0).to_le_bytes());
+    sha.update((posted.len() as u64).to_le_bytes());
+    for (name, parts) in posted {
+        sha.update((name.len() as u64).to_le_bytes());
+        sha.update(name.as_bytes());
+        sha.update(parts.to_le_bytes());
+    }
     for (name, size, md5) in named {
         sha.update((name.len() as u64).to_le_bytes());
         sha.update(name.as_bytes());
         sha.update(size.to_le_bytes());
         sha.update(md5);
     }
-    Some(sha.finalize().to_vec())
+    let mut out = vec![TWIN_VERSION];
+    out.extend(sha.finalize());
+    Some(out)
 }
 
-fn posted_names(conn: &Connection, id: i64) -> Option<Vec<u8>> {
-    let s = store::shard_of_id(id);
-    let sql = format!("select posted_names from s{s}.release_fingerprint where release_id = ?");
-    conn.query_row(&sql, [id], |r| r.get(0)).ok().flatten()
+/// Marks a fingerprint as this kind. Ones from before a twin meant all of this are as long as the hash alone.
+const TWIN_VERSION: u8 = 2;
+
+/// Those older ones proved less, soo they go when indexing starts: nothing may lend articles on their word.
+pub fn forget_old_twins(conn: &Connection) {
+    for s in 0..store::SHARDS {
+        let sql = format!(
+            "update s{s}.release_fingerprint set posted = null where posted is not null and length(posted) != 21"
+        );
+        // a shard that hasn't got the table yet has none
+        let _ = conn.execute(&sql, []);
+    }
 }
 
 /// Whether one archive's listing says what a whole release holds: everything real in it is that archive's volumes.
@@ -497,10 +500,8 @@ pub fn fill_gaps(own: &mut Vec<ArticleRow>, twin: &[ArticleRow]) -> usize {
 }
 
 /// Whether a twin of this release can lend it articles.
-pub fn can_fill(id: i64, copies: &[(Copy, ReleaseRow)]) -> bool {
-    let Ok(conn) = db::open() else { return false };
-    let names = posted_names(&conn, id);
-    names.is_some() && copies.iter().any(|(kind, r)| *kind == Copy::Twin && posted_names(&conn, r.id) == names)
+pub fn can_fill(copies: &[(Copy, ReleaseRow)]) -> bool {
+    copies.iter().any(|(kind, _)| *kind == Copy::Twin)
 }
 
 /// A release's NZB, its gaps filled from its twins.
@@ -511,9 +512,8 @@ pub fn filled_nzb(id: i64) -> db::Result<Option<String>> {
     if articles.is_empty() {
         return Ok(None);
     }
-    let names = posted_names(&conn, id);
     for (kind, twin) in copies_with(&conn, id)? {
-        if kind == Copy::Twin && names.is_some() && posted_names(&conn, twin.id) == names {
+        if kind == Copy::Twin {
             fill_gaps(&mut articles, &store::articles(&conn, twin.id)?);
         }
     }
@@ -525,6 +525,14 @@ mod tests {
     use super::*;
 
     const GB: u64 = 1 << 30;
+
+    fn content(files: &[(&str, u64)]) -> Option<Vec<u8>> {
+        content_fingerprint(files.iter().map(|(name, size)| (*name, Some(*size))))
+    }
+
+    fn par2(size: u64, md5: u8) -> Par2File {
+        Par2File { set_id: [0; 16], file_id: [0; 16], md5: [md5; 16], md5_16k: [0; 16], size, name: "x".into() }
+    }
 
     #[test]
     fn only_one_archive_speaks_for_a_release() {
@@ -548,29 +556,28 @@ mod tests {
     }
 
     #[test]
-    fn swapped_names_are_twins_but_cant_lend_articles() {
+    fn a_twin_is_the_same_in_everything() {
         let file = |name: &str, md5: u8| Par2File { name: name.into(), ..par2(GB, md5) };
-        let (one, swapped) = ([file("a.rar", 1), file("b.rar", 2)], [file("a.rar", 2), file("b.rar", 1)]);
-        assert_eq!(posted_fingerprint(&one), posted_fingerprint(&swapped));
-        assert_ne!(posted_names_fingerprint(&one), posted_names_fingerprint(&swapped));
-        assert_eq!(posted_names_fingerprint(&one), posted_names_fingerprint(&[file("b.rar", 2), file("a.rar", 1)]));
-    }
-
-    fn par2(size: u64, md5: u8) -> Par2File {
-        Par2File { set_id: [0; 16], file_id: [0; 16], md5: [md5; 16], md5_16k: [0; 16], size, name: "x".into() }
-    }
-
-    #[test]
-    fn posted_files_match_by_hash_in_any_order() {
-        let a = posted_fingerprint(&[par2(GB, 1), par2(GB, 2)]);
-        assert!(a.is_some());
-        assert_eq!(a, posted_fingerprint(&[par2(GB, 2), par2(GB, 1)]));
-        assert_ne!(a, posted_fingerprint(&[par2(GB, 1), par2(GB, 3)]), "same sizes, other bytes");
-        assert_eq!(posted_fingerprint(&[]), None);
-    }
-
-    fn content(files: &[(&str, u64)]) -> Option<Vec<u8>> {
-        content_fingerprint(files.iter().map(|(name, size)| (*name, Some(*size))))
+        let files = [file("a.rar", 1), file("b.rar", 2)];
+        let posted = [("a.rar", 1400), ("b.rar", 1400), ("a.par2", 1), ("a.vol000+16.par2", 9)];
+        let print = |files: &[Par2File], block, posted: &[(&str, i64)]| twin_fingerprint(files, Some(block), posted);
+        let base = print(&files, 1024, &posted);
+        assert!(base.is_some());
+        let shuffled = [posted[3], posted[0], posted[2], posted[1]];
+        assert_eq!(base, print(&[file("b.rar", 2), file("a.rar", 1)], 1024, &shuffled), "in any order");
+        assert_ne!(base, print(&[file("a.rar", 2), file("b.rar", 1)], 1024, &posted), "swapped names");
+        assert_ne!(base, print(&[file("a.rar", 1), file("b.rar", 3)], 1024, &posted), "other bytes");
+        assert_ne!(base, print(&files, 2048, &posted), "another block size");
+        let other_volume = [posted[0], posted[1], posted[2], ("a.vol016+16.par2", 9)];
+        assert_ne!(base, print(&files, 1024, &other_volume), "other recovery slices");
+        let more = [posted[0], posted[1], posted[2], posted[3], ("a.vol016+16.par2", 9)];
+        assert_ne!(base, print(&files, 1024, &more), "more recovery");
+        let swapped_counts = [("a.rar", 1300), ("b.rar", 1500), posted[2], posted[3]];
+        let other_counts = [("a.rar", 1500), ("b.rar", 1300), posted[2], posted[3]];
+        assert_ne!(print(&files, 1024, &swapped_counts), print(&files, 1024, &other_counts), "cut up differently");
+        let other_set = Par2File { set_id: [7; 16], ..file("a.rar", 1) };
+        assert_ne!(base, print(&[other_set, file("b.rar", 2)], 1024, &posted), "another PAR2 set");
+        assert_eq!(twin_fingerprint(&[], Some(1024), &posted), None);
     }
 
     #[test]

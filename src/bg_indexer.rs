@@ -1169,6 +1169,10 @@ fn index(config: Config, stop: Arc<AtomicBool>, writing: Option<WriteGuard>) -> 
         }
     };
 
+    if let Ok(conn) = crate::db::open() {
+        crate::duplicates::forget_old_twins(&conn);
+    }
+
     let stats = Arc::new(Mutex::new(Stats::new()));
     write_status(true, &groups_label(&config.tracked_groups(), 0), &config.index_mode, false, "running", false, 0);
 

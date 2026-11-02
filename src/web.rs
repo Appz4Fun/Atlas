@@ -1124,7 +1124,7 @@ fn release_html(
         .and_then(|conn| crate::probe::read(&conn, r.id))
         .map_or(String::new(), |p| probe_html(&p));
     let copies = crate::duplicates::copies(r.id).unwrap_or_default();
-    let has_twin = crate::duplicates::can_fill(r.id, &copies);
+    let has_twin = crate::duplicates::can_fill(&copies);
     let fill = if has_twin && contents.articles_seen < contents.articles_expected {
         format!(
             "<a class=\"button\" href=\"/ui/nzb?id={}&amp;fill=1\">NZB, gaps filled from a twin (check it with PAR2)</a>",
@@ -1482,7 +1482,7 @@ fn copies_html(copies: &[(crate::duplicates::Copy, ReleaseRow)]) -> String {
     let rest: String = copies.iter().skip(FULL_COPIES).map(|(kind, copy)| copy_link(&badge(kind), copy)).collect();
     let rest = if rest.is_empty() { rest } else { format!("<ul class=\"copy-rest\">{rest}</ul>") };
     format!(
-        "<h2>Other copies</h2><div class=\"copies\">{cards}</div>{rest}<p class=\"sort\">A twin has the same files, proven by PAR2 hashes. A pair holds the same content packed differently.</p>"
+        "<h2>Other copies</h2><div class=\"copies\">{cards}</div>{rest}<p class=\"sort\">A twin is the same posting: the same files, PAR2 set, recovery volumes and article counts. A pair holds the same content packed differently.</p>"
     )
 }
 
@@ -1513,7 +1513,7 @@ fn duplicates_page(args: &HashMap<String, String>) -> ApiResponse {
             twins,
             "twins",
             tag("tag-ok", "TWIN"),
-            "Twins are the same posted files, proven by PAR2 hashes, so one can fill the other's gaps.",
+            "Twins are the same posting: the same files, PAR2 set, recovery volumes and article counts, so one can fill the other's gaps.",
         ),
         ClusterKind::Pairs => (
             pairs,
