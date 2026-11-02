@@ -118,7 +118,7 @@ pub(crate) fn card_trigger(id: i64, target: &str) -> String {
 /// flight, a second click is dropped rather than fetched twice.
 fn trigger(url: &str, target: &str, swap: &str) -> String {
     format!(
-        " <button class=\"icon-button drawer-toggle\" type=\"button\" title=\"More facts\" aria-expanded=\"false\" hx-get=\"{url}\" hx-target=\"{target}\" hx-swap=\"{swap}\" hx-trigger=\"click\" hx-sync=\"this:drop\">+</button>"
+        " <button class=\"icon-button drawer-toggle\" type=\"button\" title=\"More facts\" aria-label=\"More facts\" aria-expanded=\"false\" hx-get=\"{url}\" hx-target=\"{target}\" hx-swap=\"{swap}\" hx-trigger=\"click\" hx-sync=\"this:drop\">+</button>"
     )
 }
 
@@ -143,6 +143,28 @@ struct Looked {
     predb: Option<PredbFacts>,
     salt: Option<i64>,
     id_key: Option<store::IdKey>,
+    /// one row a file, in file name order; empty for a release saved before Atlas kept timing
+    timing: Vec<FileTiming>,
+}
+
+/// One `file_timing` row (`store::FILE_TIMING`): what the overview said about a file's articles, folded at
+/// ingest. Dates are the poster's clock with the zone dropped, soo they compare with each other and with
+/// nothing else.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct FileTiming {
+    first_date: Option<i64>,
+    last_date: Option<i64>,
+    number_first: Option<i64>,
+    number_last: Option<i64>,
+    lines: Option<i64>,
+    references_seen: i64,
+    xref_groups_max: Option<i64>,
+    /// runs of one From in arrival order: 1 is one From throughout
+    from_variants: i64,
+    encoded_subject: bool,
+    late_articles: i64,
+    /// the articles the row covers
+    articles: i64,
 }
 
 /// `predb_match` has `title_id, kind, category, pre_at, nuked, matched_at` and no feed, source or reason
@@ -206,9 +228,36 @@ fn look(conn: Option<&Connection>, release_id: i64) -> Looked {
             )
             .ok();
         l.id_key = store::IdKey::of(&s).ok();
+        l.timing = read_timing(&s, release_id).unwrap_or_default();
     }
     l.salt = salt(conn);
     l
+}
+
+/// The release's `file_timing` rows, by file name, through `files` soo a row of a file that is gone is not one.
+fn read_timing(s: &Connection, release_id: i64) -> rusqlite::Result<Vec<FileTiming>> {
+    s.prepare_cached(
+        "select t.first_date, t.last_date, t.number_first, t.number_last, t.lines, t.references_seen, t.xref_groups_max,
+                t.from_variants, t.encoded_subject, t.late_articles, t.articles
+         from file_timing t join files f on f.id = t.file_id
+         where f.release_id = ?1 order by f.filename limit ?2",
+    )?
+    .query_map(rusqlite::params![release_id, FILES_CAP as i64], |r| {
+        Ok(FileTiming {
+            first_date: r.get(0)?,
+            last_date: r.get(1)?,
+            number_first: r.get(2)?,
+            number_last: r.get(3)?,
+            lines: r.get(4)?,
+            references_seen: r.get(5)?,
+            xref_groups_max: r.get(6)?,
+            from_variants: r.get(7)?,
+            encoded_subject: r.get::<_, i64>(8)? != 0,
+            late_articles: r.get(9)?,
+            articles: r.get(10)?,
+        })
+    })?
+    .collect()
 }
 
 /// The install's salt for the account and host keys: made once, by whoever asks first, and kept in shard 0's
@@ -348,6 +397,13 @@ fn names_panel(i: &MetaInputs<'_>, l: &Looked, compact: bool) -> Facts {
             let list: Vec<String> = reports.iter().map(|r| format!("a {r} report")).collect();
             f.add("NFO reports", Some(format!("includes {}", list.join(" and "))));
         }
+    }
+    let encoded = l.timing.iter().filter(|t| t.encoded_subject).count();
+    if encoded > 0 {
+        f.add(
+            "Encoded subjects",
+            Some(format!("{encoded} of {} file{} posted with RFC 2047 words", l.timing.len(), plural(l.timing.len()))),
+        );
     }
     if let Some(p) = &l.predb {
         let kind = match p.kind {
@@ -768,7 +824,197 @@ fn where_panel(i: &MetaInputs<'_>, l: &Looked, compact: bool) -> Facts {
         }
         f.add("Id timestamp", Some(text));
     }
+    if !l.timing.is_empty() {
+        let covered = timed(&l.timing);
+        let partial = i.release.parts.filter(|p| *p > covered);
+        f.add("First and last article", first_and_last(&l.timing));
+        if let Some(parts) = partial {
+            f.add(
+                "Timing covers",
+                Some(format!(
+                    "{} of {} articles; the rest were saved before Atlas kept timing",
+                    thousands(covered),
+                    thousands(parts)
+                )),
+            );
+        }
+        // the row's size is every article's: a rate in bytes only when the timing has them all
+        f.add("Posting rate", posting_rate(&l.timing, if partial.is_none() { i.release.size } else { None }));
+        f.add("File order", file_order(&l.timing));
+        f.add("Sessions", sessions(&l.timing));
+        f.add("Article numbers", article_numbers(&l.timing));
+        f.add("Threaded replies", Some(threaded_replies(&l.timing)));
+        f.add("Crossposts per article", crossposts(&l.timing));
+        f.add("From variants", from_variants(&l.timing));
+    }
     f
+}
+
+// ---------------------------------------------------------------- timing (file_timing, from the overview)
+
+/// A gap between files longer than this opens another posting session.
+const SESSION_GAP: i64 = 30 * 60;
+
+/// The poster's clock as the row keeps it: no zone to print.
+fn fmt_wall(ts: i64) -> String {
+    chrono::DateTime::from_timestamp(ts, 0).map(|d| d.format("%Y-%m-%d %H:%M").to_string()).unwrap_or_default()
+}
+
+/// The articles the rows cover.
+fn timed(timing: &[FileTiming]) -> i64 {
+    timing.iter().map(|t| t.articles).sum()
+}
+
+/// The first and the last date over the rows, when any has them.
+fn date_span(timing: &[FileTiming]) -> Option<(i64, i64)> {
+    let first = timing.iter().filter_map(|t| t.first_date).min()?;
+    let last = timing.iter().filter_map(|t| t.last_date).max()?;
+    Some((first, last.max(first)))
+}
+
+/// The files' own [first, last] spans, those with both dates, earliest first.
+fn file_spans(timing: &[FileTiming]) -> Vec<(i64, i64)> {
+    let mut spans: Vec<(i64, i64)> = timing.iter().filter_map(|t| Some((t.first_date?, t.last_date?))).collect();
+    spans.sort_unstable();
+    spans
+}
+
+/// "2026-10-02 10:11 to 2026-10-02 11:40 by the poster's clock, 1 h"
+fn first_and_last(timing: &[FileTiming]) -> Option<String> {
+    let (first, last) = date_span(timing)?;
+    let span = if last - first < 60 {
+        "within a minute".to_string()
+    } else {
+        fmt_skew(last - first).trim_start_matches('+').to_string()
+    };
+    Some(format!("{} to {} by the poster's clock, {span}", fmt_wall(first), fmt_wall(last)))
+}
+
+/// "41.2 articles a minute, 15.3 MB/s" over a span of a minute or more; `size` is the bytes the rows cover.
+fn posting_rate(timing: &[FileTiming], size: Option<i64>) -> Option<String> {
+    let (first, last) = date_span(timing)?;
+    let secs = last - first;
+    let articles = timed(timing);
+    if secs < 60 || articles <= 0 {
+        return None;
+    }
+    let mut text = format!("{:.1} articles a minute", articles as f64 * 60.0 / secs as f64);
+    if let Some(size) = size.filter(|s| *s > 0) {
+        let _ = write!(text, ", {}/s", fmt_size(Some(size / secs)));
+    }
+    Some(text)
+}
+
+/// "4 files one after another" or "interleaved: 2 of 4 files started before an earlier one ended".
+fn file_order(timing: &[FileTiming]) -> Option<String> {
+    let spans = file_spans(timing);
+    if spans.len() < 2 {
+        return None;
+    }
+    let mut end = spans[0].1;
+    let mut interleaved = 0;
+    for &(first, last) in &spans[1..] {
+        if first < end {
+            interleaved += 1;
+        }
+        end = end.max(last);
+    }
+    Some(if interleaved == 0 {
+        format!("{} files one after another", spans.len())
+    } else {
+        format!("interleaved: {interleaved} of {} files started before an earlier one ended", spans.len())
+    })
+}
+
+/// "one session" or "3 sessions, gaps over 30 min between files".
+fn sessions(timing: &[FileTiming]) -> Option<String> {
+    let spans = file_spans(timing);
+    if spans.len() < 2 {
+        return None;
+    }
+    let mut count = 1;
+    let mut end = spans[0].1;
+    for &(first, last) in &spans[1..] {
+        if first - end > SESSION_GAP {
+            count += 1;
+        }
+        end = end.max(last);
+    }
+    Some(if count == 1 { "one session".into() } else { format!("{count} sessions, gaps over 30 min between files") })
+}
+
+/// "1,200–1,251 where it was read, adjacent" or ", 12 other articles between them".
+fn article_numbers(timing: &[FileTiming]) -> Option<String> {
+    let first = timing.iter().filter_map(|t| t.number_first).min()?;
+    let last = timing.iter().filter_map(|t| t.number_last).max()?;
+    let mut text = format!("{}–{} where it was read", thousands(first), thousands(last));
+    let others = last - first + 1 - timed(timing);
+    if others <= 0 {
+        text.push_str(", adjacent");
+    } else {
+        let _ = write!(text, ", {} other article{} between them", thousands(others), plural(others as usize));
+    }
+    Some(text)
+}
+
+/// "none" or "3 articles carried References".
+fn threaded_replies(timing: &[FileTiming]) -> String {
+    let seen: i64 = timing.iter().map(|t| t.references_seen).sum();
+    if seen == 0 {
+        "none".into()
+    } else {
+        format!("{} article{} carried References", thousands(seen), plural(seen as usize))
+    }
+}
+
+/// "one group, by Xref" or "3 groups at most, by Xref"; nothing when the server sent no Xref.
+fn crossposts(timing: &[FileTiming]) -> Option<String> {
+    let most = timing.iter().filter_map(|t| t.xref_groups_max).max()?;
+    Some(if most <= 1 { "one group, by Xref".into() } else { format!("{most} groups at most, by Xref") })
+}
+
+/// "one From throughout" or "From changed 5 times between articles (rotating identity)".
+fn from_variants(timing: &[FileTiming]) -> Option<String> {
+    if timing.is_empty() {
+        return None;
+    }
+    let changes: i64 = timing.iter().map(|t| (t.from_variants - 1).max(0)).sum();
+    Some(if changes == 0 {
+        "one From throughout".into()
+    } else {
+        format!("From changed {changes} time{} between articles (rotating identity)", plural(changes as usize))
+    })
+}
+
+/// "128 lines an article, 4,096 bytes a line"; `size` is the bytes the rows cover.
+fn lines_per_article(timing: &[FileTiming], size: Option<i64>) -> Option<String> {
+    let lines: i64 = timing.iter().filter_map(|t| t.lines).sum();
+    let articles = timed(timing);
+    if lines <= 0 || articles <= 0 {
+        return None;
+    }
+    let mut text = format!("{} lines an article", thousands(lines / articles));
+    if let Some(size) = size.filter(|s| *s > 0) {
+        let _ = write!(text, ", {} bytes a line", thousands(size / lines));
+    }
+    Some(text)
+}
+
+/// "none" or "3 arrived after the file sealed".
+fn late_articles(timing: &[FileTiming]) -> String {
+    let late: i64 = timing.iter().map(|t| t.late_articles).sum();
+    if late == 0 { "none".into() } else { format!("{} arrived after the file sealed", thousands(late)) }
+}
+
+/// A key over the per-file Lines sums in file name order: a post made again with the same line length keys
+/// the same, whatever its subjects say. None unless every file has lines.
+fn lines_key(timing: &[FileTiming]) -> Option<String> {
+    let lines: Vec<String> =
+        timing.iter().map(|t| t.lines.filter(|l| *l > 0).map(|l| l.to_string())).collect::<Option<_>>()?;
+    if lines.is_empty() {
+        return None;
+    }
+    Some(key16(lines.join(",").as_bytes()))
 }
 
 const MONTHS: [&str; 12] = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
@@ -1619,6 +1865,11 @@ fn health_panel(i: &MetaInputs<'_>, l: &Looked, compact: bool) -> Facts {
             if grew >= 60 { format!(", grew for {}", fmt_skew(grew).trim_start_matches('+')) } else { String::new() };
         f.add("Last arrival", Some(format!("{}{span}", fmt_unix(*newest))));
     }
+    if !l.timing.is_empty() {
+        let partial = i.release.parts.is_some_and(|p| p > timed(&l.timing));
+        f.add("Lines per article", lines_per_article(&l.timing, if partial { None } else { i.release.size }));
+        f.add("Late articles", Some(late_articles(&l.timing)));
+    }
     f
 }
 
@@ -1663,6 +1914,7 @@ fn keys_panel(i: &MetaInputs<'_>, l: &Looked, compact: bool) -> Facts {
     {
         f.key("NZBLNK", Some(nzblnk(&i.release.name, subject, &i.release.group_name)));
     }
+    f.key("Lines key", lines_key(&l.timing));
     f
 }
 
@@ -2225,6 +2477,7 @@ mod tests {
             }),
             salt: Some(7),
             id_key: None,
+            timing: Vec::new(),
         }
     }
 
@@ -2994,6 +3247,132 @@ mod tests {
         }
     }
 
+    /// a file posted from `first` to `last` by the poster's clock, `articles` articles of 100 lines
+    fn timed(first: i64, last: i64, articles: i64, numbers: (i64, i64)) -> FileTiming {
+        FileTiming {
+            first_date: Some(first),
+            last_date: Some(last),
+            number_first: Some(numbers.0),
+            number_last: Some(numbers.1),
+            lines: Some(articles * 100),
+            from_variants: 1,
+            articles,
+            ..Default::default()
+        }
+    }
+
+    /// 2026-10-02 10:00 by the poster's clock
+    const TEN: i64 = 1_790_935_200;
+
+    #[test]
+    fn timing_facts_read_the_rows() {
+        // three files: two back to back, the third after a 31 minute gap, 30 articles over an hour
+        let rows = vec![
+            timed(TEN, TEN + 600, 10, (100, 109)),
+            timed(TEN + 700, TEN + 1300, 10, (110, 119)),
+            timed(TEN + 3200, TEN + 3800, 10, (120, 129)),
+        ];
+        assert_eq!(
+            first_and_last(&rows).as_deref(),
+            Some("2026-10-02 10:00 to 2026-10-02 11:03 by the poster's clock, 1 h")
+        );
+        let rate = posting_rate(&rows, Some(3_800_000)).unwrap();
+        assert!(rate.starts_with("0.5 articles a minute, ") && rate.ends_with("/s"), "{rate}");
+        assert_eq!(posting_rate(&rows, None).as_deref(), Some("0.5 articles a minute"));
+        assert_eq!(file_order(&rows).as_deref(), Some("3 files one after another"));
+        assert_eq!(sessions(&rows).as_deref(), Some("2 sessions, gaps over 30 min between files"));
+        assert_eq!(article_numbers(&rows).as_deref(), Some("100–129 where it was read, adjacent"));
+        assert_eq!(threaded_replies(&rows), "none");
+        assert_eq!(crossposts(&rows), None, "no Xref from this server");
+        assert_eq!(from_variants(&rows).as_deref(), Some("one From throughout"));
+        assert_eq!(
+            lines_per_article(&rows, Some(3_800_000)).as_deref(),
+            Some("100 lines an article, 1,266 bytes a line")
+        );
+        assert_eq!(lines_per_article(&rows, None).as_deref(), Some("100 lines an article"));
+        assert_eq!(late_articles(&rows), "none");
+        assert_eq!(lines_key(&rows).as_deref(), Some(key16(b"1000,1000,1000").as_str()));
+
+        // a minute or less: no rate, and the span says so
+        let quick = vec![timed(TEN, TEN + 30, 3, (1, 3))];
+        assert_eq!(
+            first_and_last(&quick).as_deref(),
+            Some("2026-10-02 10:00 to 2026-10-02 10:00 by the poster's clock, within a minute")
+        );
+        assert_eq!(posting_rate(&quick, Some(1)), None);
+        assert_eq!(file_order(&quick), None, "one file has no order");
+        assert_eq!(sessions(&quick), None);
+
+        // interleaved files, other articles between the numbers, threads, Xref, rotating Froms, late rows
+        let mut busy = vec![timed(TEN, TEN + 600, 10, (100, 109)), timed(TEN + 300, TEN + 900, 10, (111, 120))];
+        busy[0].references_seen = 3;
+        busy[0].xref_groups_max = Some(1);
+        busy[1].xref_groups_max = Some(3);
+        busy[0].from_variants = 3;
+        busy[1].from_variants = 2;
+        busy[1].late_articles = 2;
+        busy[1].lines = None;
+        assert_eq!(file_order(&busy).as_deref(), Some("interleaved: 1 of 2 files started before an earlier one ended"));
+        assert_eq!(sessions(&busy).as_deref(), Some("one session"));
+        assert_eq!(article_numbers(&busy).as_deref(), Some("100–120 where it was read, 1 other article between them"));
+        assert_eq!(threaded_replies(&busy), "3 articles carried References");
+        assert_eq!(crossposts(&busy).as_deref(), Some("3 groups at most, by Xref"));
+        assert_eq!(crossposts(&busy[..1]).as_deref(), Some("one group, by Xref"));
+        assert_eq!(from_variants(&busy).as_deref(), Some("From changed 3 times between articles (rotating identity)"));
+        assert_eq!(late_articles(&busy), "2 arrived after the file sealed");
+        assert_eq!(lines_key(&busy), None, "a file without lines keys nothing");
+        assert_eq!(lines_per_article(&busy, Some(1)).as_deref(), Some("50 lines an article, 0 bytes a line"));
+
+        // rows without dates or numbers say nothing about them
+        let bare = vec![FileTiming { articles: 4, from_variants: 1, ..Default::default() }];
+        assert_eq!(first_and_last(&bare), None);
+        assert_eq!(article_numbers(&bare), None);
+        assert_eq!(from_variants(&bare).as_deref(), Some("one From throughout"));
+        assert_eq!(from_variants(&[]), None);
+    }
+
+    #[test]
+    fn timing_rows_fill_the_panels_and_not_the_drawer() {
+        let f = Fixture::new();
+        let mut l = looked(volumes(3));
+        assert!(!where_panel(&f.inputs(), &l, false).html.contains("First and last article"), "no rows, no facts");
+        // the row has 2,350 articles; the timing covers 2,000 of them
+        l.timing = vec![timed(TEN, TEN + 3600, 1000, (500, 1499)), timed(TEN + 3700, TEN + 7200, 1000, (1500, 2499))];
+        let page = panels_html(&f.inputs(), &l);
+        for fact in [
+            "<dt>First and last article</dt><dd>2026-10-02 10:00 to 2026-10-02 12:00 by the poster's clock, 2 h</dd>",
+            "<dt>Timing covers</dt><dd>2,000 of 2,350 articles; the rest were saved before Atlas kept timing</dd>",
+            "<dt>Posting rate</dt><dd>16.7 articles a minute</dd>",
+            "<dt>File order</dt><dd>2 files one after another</dd>",
+            "<dt>Sessions</dt><dd>one session</dd>",
+            "<dt>Article numbers</dt><dd>500–2,499 where it was read, adjacent</dd>",
+            "<dt>Threaded replies</dt><dd>none</dd>",
+            "<dt>From variants</dt><dd>one From throughout</dd>",
+            "<dt>Lines per article</dt><dd>100 lines an article</dd>",
+            "<dt>Late articles</dt><dd>none</dd>",
+            "<dt>Lines key</dt>",
+        ] {
+            assert!(page.contains(fact), "{fact}\n{page}");
+        }
+        assert!(!page.contains("Crossposts per article") && !page.contains("Encoded subjects"), "{page}");
+        // the whole release timed: the rates carry bytes too
+        l.timing[1].articles = 1350;
+        l.timing[1].encoded_subject = true;
+        l.timing[0].xref_groups_max = Some(2);
+        let page = panels_html(&f.inputs(), &l);
+        for fact in [
+            "<dt>Posting rate</dt><dd>19.6 articles a minute, 334.2 KB/s</dd>",
+            "<dt>Lines per article</dt><dd>85 lines an article, 12,320 bytes a line</dd>",
+            "<dt>Crossposts per article</dt><dd>2 groups at most, by Xref</dd>",
+            "<dt>Encoded subjects</dt><dd>1 of 2 files posted with RFC 2047 words</dd>",
+        ] {
+            assert!(page.contains(fact), "{fact}\n{page}");
+        }
+        assert!(!page.contains("Timing covers"), "{page}");
+        let drawer = compact_html(&f.inputs(), &l);
+        assert!(!drawer.contains("First and last article") && !drawer.contains("Lines key"), "{drawer}");
+    }
+
     #[test]
     fn drawer_markup_spans_the_table() {
         assert_eq!(
@@ -3009,6 +3388,10 @@ mod tests {
                 && trigger.contains("hx-get=\"/ui/row?id=7\"")
                 && trigger.contains("hx-target=\"closest tr\"")
                 && trigger.contains("hx-swap=\"afterend\""),
+            "{trigger}"
+        );
+        assert!(
+            trigger.contains("aria-label=\"More facts\"") && trigger.contains("aria-expanded=\"false\""),
             "{trigger}"
         );
         let card = card_trigger(7, "closest li");

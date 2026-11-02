@@ -88,20 +88,23 @@ def nested_archive(name):
 
 
 def build_posts():
-    # dated a few hours back so post-processing's settle time has passed; GMT, as Nyuu writes it
+    # dated a few hours back so post-processing's settle time has passed, one article every 40 seconds so the
+    # release pages have a posting rate and a span to show; GMT, as Nyuu writes it
     posted = time.time() - 4 * 3600
-    when = email.utils.formatdate(posted, usegmt=True)
     posts = []
 
+    def when(n):
+        return posted + n * 40
+
     def nyuu_id(n):
-        # Nyuu's grammar: 24 letters in alternating case, a dash, the millisecond clock
+        # Nyuu's grammar: 24 letters in alternating case, a dash, the millisecond clock (1.5 s after the Date)
         letters = "".join(chr((65 if i % 2 == 0 else 97) + (n * 7 + i * 5) % 26) for i in range(24))
-        return f"<{letters}-{int(posted * 1000) + n * 1500}@nyuu>"
+        return f"<{letters}-{int(when(n) * 1000) + 1500}@nyuu>"
 
     def add(subject, body, author="poster <p@mock.example>", size=None):
         n = len(posts) + 1
         raw = sum(len(l) + 2 for l in body)
-        posts.append(dict(n=n, subject=subject, author=author, date=when,
+        posts.append(dict(n=n, subject=subject, author=author, date=email.utils.formatdate(when(n), usegmt=True),
                           msgid=nyuu_id(n), bytes=size or raw, body=body))
 
     # a movie: 2 rar volumes (2 articles each), an nfo and a par2 index
@@ -197,7 +200,11 @@ class Handler(socketserver.StreamRequestHandler):
                     continue
                 self.send("224 overview follows")
                 for p in hits:
-                    self.send(f'{p["n"]}\t{p["subject"]}\t{p["author"]}\t{p["date"]}\t{p["msgid"]}\t\t{p["bytes"]}\t10')
+                    # field 8 is Xref:full, as the big providers send it; the movie (posts 1-6) is crossposted
+                    xref = f"Xref: news.mock.example {GROUP}:{p['n']}"
+                    if p["n"] <= 6:
+                        xref += f" alt.binaries.movies:{p['n'] + 1000}"
+                    self.send(f'{p["n"]}\t{p["subject"]}\t{p["author"]}\t{p["date"]}\t{p["msgid"]}\t\t{p["bytes"]}\t10\t{xref}')
                 self.send(".")
             elif verb == "STAT":
                 self.send("223 0 there" if self.find(arg) else "430 no such article")

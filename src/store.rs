@@ -29,6 +29,7 @@ use rusqlite::{Connection, OptionalExtension, Result, TransactionBehavior, param
 
 use crate::db;
 use crate::parser::{Article, Release};
+use crate::postprocess::schema::ShardTable;
 use crate::profile;
 use crate::search::ArticleRow;
 
@@ -555,6 +556,142 @@ pub(crate) fn is_exactly(bits: &[u8], expected: i64) -> bool {
     let count: i64 = bits.iter().map(|b| i64::from(b.count_ones())).sum();
     let highest = bits.iter().rposition(|b| *b != 0).map(|i| i as i64 * 8 + 7 - i64::from(bits[i].leading_zeros()));
     count == expected && highest == Some(expected)
+}
+
+/// What the overview said about a file's articles, folded in as they are
+/// saved, for the Where and when, Health and Keys facts of the release page:
+/// the first and last Date (the poster's clock, zone dropped), the first and
+/// last article number, the Lines sum, how many carried References, the most
+/// groups an Xref named (only servers with `Xref:full` send one), how the From
+/// changed, whether a subject had an RFC 2047 word, how many articles came
+/// after the file sealed, and how many articles all that covers. One row a
+/// file, written by `Timing::write`; a release saved before the table has
+/// none, and its facts stay off.
+pub const FILE_TIMING: ShardTable = ShardTable {
+    name: "file_timing",
+    create: "create table if not exists file_timing (
+        file_id         INTEGER PRIMARY KEY,
+        release_id      INTEGER NOT NULL,
+        first_date      INTEGER,
+        last_date       INTEGER,
+        number_first    INTEGER,
+        number_last     INTEGER,
+        lines           INTEGER,
+        references_seen INTEGER NOT NULL DEFAULT 0,
+        xref_groups_max INTEGER,
+        from_hash       INTEGER,
+        from_variants   INTEGER NOT NULL DEFAULT 1,
+        encoded_subject INTEGER NOT NULL DEFAULT 0,
+        late_articles   INTEGER NOT NULL DEFAULT 0,
+        articles        INTEGER NOT NULL DEFAULT 0
+    )",
+    indexes: &[("file_timing_release", "create index if not exists file_timing_release on file_timing(release_id)")],
+    release_key: Some("release_id"),
+    added: &[],
+};
+
+/// One save's articles of one file, as `file_timing` keeps them. `from_variants`
+/// counts runs of one From in arrival order, soo a poster that rotates
+/// identities counts high and a steady one stays at 1; `from_hash` is the From
+/// the run ended on, for the next save to continue the count from.
+#[derive(Debug, Default)]
+struct Timing {
+    articles: i64,
+    first_date: Option<i64>,
+    last_date: Option<i64>,
+    number_first: Option<u64>,
+    number_last: Option<u64>,
+    lines: i64,
+    references: i64,
+    xref_max: Option<i64>,
+    from_first: Option<i64>,
+    from_last: Option<i64>,
+    from_runs: i64,
+    encoded_subject: bool,
+}
+
+impl Timing {
+    fn fold(&mut self, a: &Article, key: &IdKey) {
+        self.articles += 1;
+        if let Some(ts) = crate::dates::naive_timestamp(&a.date) {
+            self.first_date = Some(self.first_date.map_or(ts, |f| f.min(ts)));
+            self.last_date = Some(self.last_date.map_or(ts, |l| l.max(ts)));
+        }
+        // 0 is what a header without a number parses to
+        if a.number > 0 {
+            self.number_first = Some(self.number_first.map_or(a.number, |n| n.min(a.number)));
+            self.number_last = Some(self.number_last.map_or(a.number, |n| n.max(a.number)));
+        }
+        self.lines += a.lines.max(0);
+        if !a.references.trim().is_empty() {
+            self.references += 1;
+        }
+        if let Some(groups) = a.xref_groups {
+            let groups = i64::from(groups);
+            self.xref_max = Some(self.xref_max.map_or(groups, |m| m.max(groups)));
+        }
+        // the shard's id key: never 0, and the From itself is not what is kept
+        let from = key.hash(&a.author);
+        if self.from_last != Some(from) {
+            self.from_runs += 1;
+        }
+        self.from_first.get_or_insert(from);
+        self.from_last = Some(from);
+        self.encoded_subject |= a.subject.contains("=?") && a.subject.contains("?=");
+    }
+
+    /// Fold this save into the file's row. `late`: the file was sealed before
+    /// these arrived. The dates, numbers and the Xref count keep the extremes,
+    /// the counts add up, and a From run that continues the last save's is one.
+    fn write(&self, conn: &Connection, file_id: i64, release_id: i64, late: bool) -> Result<()> {
+        if self.articles == 0 {
+            return Ok(());
+        }
+        conn.prepare_cached(
+            "insert into file_timing (file_id, release_id, first_date, last_date, number_first, number_last, lines,
+                                      references_seen, xref_groups_max, from_hash, from_variants, encoded_subject,
+                                      late_articles, articles)
+             values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+             on conflict(file_id) do update set
+                release_id = excluded.release_id,
+                first_date = min(coalesce(file_timing.first_date, excluded.first_date),
+                                 coalesce(excluded.first_date, file_timing.first_date)),
+                last_date = max(coalesce(file_timing.last_date, excluded.last_date),
+                                coalesce(excluded.last_date, file_timing.last_date)),
+                number_first = min(coalesce(file_timing.number_first, excluded.number_first),
+                                   coalesce(excluded.number_first, file_timing.number_first)),
+                number_last = max(coalesce(file_timing.number_last, excluded.number_last),
+                                  coalesce(excluded.number_last, file_timing.number_last)),
+                lines = coalesce(file_timing.lines, 0) + coalesce(excluded.lines, 0),
+                references_seen = file_timing.references_seen + excluded.references_seen,
+                xref_groups_max = max(coalesce(file_timing.xref_groups_max, excluded.xref_groups_max),
+                                      coalesce(excluded.xref_groups_max, file_timing.xref_groups_max)),
+                from_variants = file_timing.from_variants + excluded.from_variants
+                                - (case when file_timing.from_hash = ?15 then 1 else 0 end),
+                from_hash = excluded.from_hash,
+                encoded_subject = max(file_timing.encoded_subject, excluded.encoded_subject),
+                late_articles = file_timing.late_articles + excluded.late_articles,
+                articles = file_timing.articles + excluded.articles",
+        )?
+        .execute(params![
+            file_id,
+            release_id,
+            self.first_date,
+            self.last_date,
+            self.number_first.map(|n| n as i64),
+            self.number_last.map(|n| n as i64),
+            self.lines,
+            self.references,
+            self.xref_max,
+            self.from_last,
+            self.from_runs,
+            self.encoded_subject as i64,
+            if late { self.articles } else { 0 },
+            self.articles,
+            self.from_first,
+        ])?;
+        Ok(())
+    }
 }
 
 /// the article whose subject a file's NZB entry uses comes first in (part, a
@@ -1476,8 +1613,10 @@ impl ShardWriter {
                     }
                     let index = others.then_some((release_id, &key));
                     let before = added.len();
+                    let mut timing = Timing::default();
                     for a in articles {
                         if add_segment(&tx, domains, &f, index, a, &mut sealed)? {
+                            timing.fold(a, &key);
                             let unsure = f.sealed && sealed.guessed;
                             if unsure {
                                 // maybe a copy of what the blob has: only its part
@@ -1495,6 +1634,7 @@ impl ShardWriter {
                     }
                     if added.len() > before {
                         put_file(&tx, &f)?;
+                        timing.write(&tx, f.id, release_id, f.sealed)?;
                         if !f.sealed && f.expected.is_some_and(|e| is_exactly(&f.seen, e)) {
                             completed.push(f.id);
                         }
@@ -2411,6 +2551,134 @@ mod tests {
         };
         save(&main, &[release]).unwrap();
         (dir, main)
+    }
+
+    #[test]
+    fn file_timing_folds_each_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        db::create_db_at(&main).unwrap();
+        let art = |id: &str, part: i64, number: u64, date: &str, from: &str, lines: i64| Article {
+            message_id: id.into(),
+            subject: format!("\"a.rar\" yEnc ({part}/4)"),
+            author: from.into(),
+            date: date.into(),
+            number,
+            lines,
+            filename: Some("a.rar".into()),
+            part: Some(part),
+            total_parts: Some(4),
+            bytes: 100,
+            ..Default::default()
+        };
+        let release = |articles: Vec<Article>| Release {
+            name: "Rel".into(),
+            group: "alt.binaries.t".into(),
+            articles,
+            ..Default::default()
+        };
+        #[derive(Debug, PartialEq)]
+        struct Row {
+            dates: (Option<i64>, Option<i64>),
+            numbers: (Option<i64>, Option<i64>),
+            lines: Option<i64>,
+            references: i64,
+            xref: Option<i64>,
+            from_hash: Option<i64>,
+            from_variants: i64,
+            encoded: i64,
+            late: i64,
+            articles: i64,
+        }
+        let conn = db::open_at(&shard_path(&main, shard_of("alt.binaries.t"))).unwrap();
+        let key = IdKey::of(&conn).unwrap();
+        let row = || {
+            conn.query_row(
+                "select first_date, last_date, number_first, number_last, lines, references_seen, xref_groups_max,
+                        from_hash, from_variants, encoded_subject, late_articles, articles
+                 from file_timing",
+                [],
+                |r| {
+                    Ok(Row {
+                        dates: (r.get(0)?, r.get(1)?),
+                        numbers: (r.get(2)?, r.get(3)?),
+                        lines: r.get(4)?,
+                        references: r.get(5)?,
+                        xref: r.get(6)?,
+                        from_hash: r.get(7)?,
+                        from_variants: r.get(8)?,
+                        encoded: r.get(9)?,
+                        late: r.get(10)?,
+                        articles: r.get(11)?,
+                    })
+                },
+            )
+            .unwrap()
+        };
+        // 2026-10-02 10:00:00 by the poster's clock
+        let ten = 1_790_935_200;
+
+        // one From, two articles, nothing threaded, no Xref
+        save(
+            &main,
+            &[release(vec![
+                art("<a1@x>", 1, 101, "2026-10-02 10:00:00", "A <a@x>", 10),
+                art("<a2@x>", 2, 102, "2026-10-02 10:05:00", "A <a@x>", 20),
+            ])],
+        )
+        .unwrap();
+        assert_eq!(
+            row(),
+            Row {
+                dates: (Some(ten), Some(ten + 300)),
+                numbers: (Some(101), Some(102)),
+                lines: Some(30),
+                references: 0,
+                xref: None,
+                from_hash: Some(key.hash("A <a@x>")),
+                from_variants: 1,
+                encoded: 0,
+                late: 0,
+                articles: 2,
+            }
+        );
+
+        // an earlier article from another From, threaded, crossposted, with an encoded word: the extremes
+        // move, the counts add, and the From run count grows by one
+        let mut from_b = art("<a3@x>", 3, 100, "2026-10-02 09:58:00", "B <b@x>", 5);
+        from_b.references = "<r@x>".into();
+        from_b.xref_groups = Some(2);
+        from_b.subject = "=?utf-8?q?a.rar?= yEnc (3/4)".into();
+        save(&main, &[release(vec![from_b])]).unwrap();
+        assert_eq!(
+            row(),
+            Row {
+                dates: (Some(ten - 120), Some(ten + 300)),
+                numbers: (Some(100), Some(102)),
+                lines: Some(35),
+                references: 1,
+                xref: Some(2),
+                from_hash: Some(key.hash("B <b@x>")),
+                from_variants: 2,
+                encoded: 1,
+                late: 0,
+                articles: 3,
+            }
+        );
+
+        // the same From again continues the run; a duplicate article changes nothing
+        let a4 = art("<a4@x>", 4, 103, "2026-10-02 10:06:00", "B <b@x>", 0);
+        save(&main, &[release(vec![a4.clone()])]).unwrap();
+        save(&main, &[release(vec![a4])]).unwrap();
+        let after_four = row();
+        assert_eq!((after_four.from_variants, after_four.articles, after_four.numbers.1), (2, 4, Some(103)));
+
+        // an article for a sealed file counts as late
+        let file_id: i64 = conn.query_row("select id from files", [], |r| r.get(0)).unwrap();
+        seal_file(&conn, file_id).unwrap();
+        save(&main, &[release(vec![art("<a5@x>", 4, 104, "2026-10-02 10:07:00", "B <b@x>", 7)])]).unwrap();
+        let sealed = row();
+        assert_eq!((sealed.late, sealed.articles, sealed.lines, sealed.from_variants), (1, 5, Some(42), 2));
     }
 
     #[test]

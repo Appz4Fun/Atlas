@@ -40,6 +40,7 @@ fn slice(group: &str, start: u64, size: u64, per_release: u64, seed: u64) -> Vec
                 references: String::new(),
                 bytes: 750_000,
                 lines: 5000,
+                xref_groups: None,
             }
         })
         .collect();

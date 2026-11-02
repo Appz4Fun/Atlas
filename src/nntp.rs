@@ -97,6 +97,8 @@ pub struct Overview {
     pub references: String,
     pub bytes: i64,
     pub lines: i64,
+    /// the groups field 8 names when it is an `Xref:` line, which only a server with `Xref:full` sends
+    pub xref_groups: Option<u16>,
 }
 
 impl Overview {
@@ -110,6 +112,7 @@ impl Overview {
             references: self.references,
             bytes: self.bytes,
             lines: self.lines,
+            xref_groups: self.xref_groups,
             ..Default::default()
         }
     }
@@ -2723,7 +2726,19 @@ fn parse_overview(line: &[u8]) -> Option<Overview> {
         references: field(5),
         bytes: int(6),
         lines: int(7),
+        xref_groups: fields.get(8).and_then(|f| xref_groups(f)),
     })
+}
+
+/// The groups an overview's `Xref:` field names: `Xref: host group:number group:number`, the full-header form
+/// a server with `Xref:full` in its OVERVIEW.FMT sends. None when the field is something else, or missing.
+fn xref_groups(field: &str) -> Option<u16> {
+    let field = field.trim_start();
+    if field.len() < 5 || !field.as_bytes()[..5].eq_ignore_ascii_case(b"xref:") {
+        return None;
+    }
+    let groups = field[5..].split_whitespace().skip(1).filter(|t| t.contains(':')).count();
+    Some(groups.min(usize::from(u16::MAX)) as u16)
 }
 
 /// fnmatch-ish match supporting `*` and `?`
@@ -2878,6 +2893,13 @@ mod tests {
         assert_eq!(o.bytes, 1234);
         let a = o.into_article();
         assert_eq!(a.date, "2026-10-02 10:11:12");
+        assert_eq!(a.xref_groups, None, "seven fields: no Xref");
+        let full = b"42\tsubj\tme@x\tFri, 02 Oct 2026 10:11:12 +0000\t<id@x>\t\t1234\t10\tXref: news.example alt.binaries.a:42 alt.binaries.b:7";
+        assert_eq!(parse_overview(full).unwrap().xref_groups, Some(2));
+        let other = b"42\tsubj\tme@x\tFri, 02 Oct 2026 10:11:12 +0000\t<id@x>\t\t1234\t10\tBytes: 1234";
+        assert_eq!(parse_overview(other).unwrap().xref_groups, None, "another header in field 8");
+        assert_eq!(xref_groups("xref: host"), Some(0));
+        assert_eq!(xref_groups(""), None);
     }
 
     fn run<F: Future>(f: F) -> F::Output {
