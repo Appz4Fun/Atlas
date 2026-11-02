@@ -1,0 +1,1868 @@
+# Corrected fragment W10b: sections sevenz, zip, par2, sfv, srr, srs, split_raw.
+# Generated from archive-field-catalog.yaml by verification pass W10b; the main session merges.
+formats:
+  sevenz:
+    detect:
+      magic: 37 7A BC AF 27 1C
+      offset: 0
+    structures:
+      start_header:
+      - name: signature
+        where: 'bytes 0-5: 37 7A BC AF 27 1C'
+        type: bytes6
+        read_from: first_article
+        use: format detection; SFX search key
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1b s2
+        atlas: stored
+        atlas_where: probe/archive.rs:36-37 (format "7z")
+      - name: version
+        where: byte 6 major (0; reader checks), byte 7 minor (0x04 = 7-Zip 9.x+ writer)
+        type: uint8
+        read_from: first_article
+        use: writer hint
+        proves: tool
+        leak: true
+        status: VERIFIED
+        source: w1b s2
+        atlas: parsed
+        atlas_where: sevenz.rs:37 (major checked == 0; minor not read)
+      - name: start_header_crc
+        where: '@8 uint32 CRC32 over bytes 12-31'
+        type: uint32
+        read_from: first_article
+        use: validates start header from article 1
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1b s2
+        atlas: parsed
+        atlas_where: sevenz.rs:40 (checked, dropped)
+      - name: next_header_offset
+        where: '@12 uint64 LE; relative to byte 32 (absolute = 32 + value)'
+        type: uint64
+        read_from: first_article
+        use: points at tail header (last article)
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1b s2
+        atlas: parsed
+        atlas_where: sevenz.rs:43, 472-479 (Start.offset, dropped)
+      - name: next_header_size
+        where: '@20 uint64 LE; length of next-header block'
+        type: uint64
+        read_from: first_article
+        use: exact tail fetch length
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1b s2
+        atlas: parsed
+        atlas_where: sevenz.rs:Start.size (dropped)
+      - name: next_header_crc
+        where: '@28 uint32 CRC32 of next-header block'
+        type: uint32
+        read_from: first_article
+        use: verify tail fetch; fingerprint
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1b s2
+        atlas: parsed
+        atlas_where: sevenz.rs:487 (Start.crc checked against header)
+      - name: start_header_zeroed_recovery
+        where: 'zeroed start header: reader scans last 512 bytes for header markers'
+        type: derived
+        read_from: last_article
+        use: recover damaged posts
+        proves: none
+        leak: false
+        status: UNVERIFIED
+        source: w1b s2 (partial)
+        atlas: 'no'
+        atlas_where: not implemented (w9a section 4.1 lists no recovery path)
+      - name: sfx_signature_search
+        where: signature at non-zero offset with valid start CRC = SFX or prefixed
+        type: derived
+        read_from: first_article
+        use: prefixed or obfuscated posts
+        proves: none
+        leak: false
+        status: UNVERIFIED
+        source: w1b s2 (partial)
+        atlas: 'no'
+        atlas_where: not implemented; SFX RAR scan is only in prototype rar_meta.rs:219
+      next_header:
+      - name: next_header_first_byte
+        where: 0x01 kHeader (plain) or 0x17 kEncodedHeader
+        type: uint8
+        read_from: last_article
+        use: plain or packed header branch
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1b s3
+        atlas: parsed
+        atlas_where: sevenz.rs:500-504 (nested)
+      - name: encoded_header_streams
+        where: 'kEncodedHeader: one-folder StreamsInfo; decoded output must start 0x01'
+        type: record
+        read_from: last_article
+        use: header decode pipeline
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1b s3
+        atlas: parsed
+        atlas_where: sevenz.rs:513-535 (LZMA id 030101 only)
+      - name: encoded_header_plain_aes
+        where: 'with -mhe=on: AES coder 06F10701 and its props visible in plaintext'
+        type: record
+        read_from: last_article
+        use: encrypted-header archive without password
+        proves: tool
+        leak: true
+        status: VERIFIED
+        source: w1b s3; w7b s3.5
+        atlas: stored
+        atlas_where: archive_release.names_hidden / encryption=3 (steps.rs:142-152 via headers_encrypted)
+      - name: encoded_header_folder_crc
+        where: CRC32 of decoded header (folder digest)
+        type: uint32
+        read_from: last_article
+        use: per-archive key across reposts
+        proves: twin
+        leak: false
+        status: VERIFIED
+        source: w1b s10
+        atlas: parsed
+        atlas_where: sevenz.rs:534-536 (folder CRC used to verify header; dropped)
+      streams_info:
+      - name: pack_pos
+        where: 'kPackInfo PackPos: first packed stream offset, relative to byte 32'
+        type: uint64
+        read_from: last_article
+        use: absolute packed data position
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1b s5.3
+        atlas: parsed
+        atlas_where: sevenz.rs:207-230 (used for decode, dropped)
+      - name: pack_sizes
+        where: kSize per packed stream
+        type: uint64
+        read_from: last_article
+        use: byte range per folder input -> articles
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1b s5.3
+        atlas: parsed
+        atlas_where: sevenz.rs:207-230 (used for decode, dropped)
+      - name: pack_crcs
+        where: kCRC Digests of packed streams
+        type: uint32
+        read_from: last_article
+        use: integrity only with the full stream
+        proves: twin
+        leak: false
+        status: VERIFIED
+        source: w1b s5.3
+        atlas: parsed
+        atlas_where: sevenz.rs:224 (r.digests(count)? return dropped)
+      - name: folder_list
+        where: 'kFolder: NumFolders; External byte must be 0'
+        type: record
+        read_from: last_article
+        use: coder graph per folder
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1b s5.4
+        atlas: parsed
+        atlas_where: sevenz.rs:126, 184 (Folder.coders; used only for AES/LZMA checks; not persisted)
+      - name: coder_flags_and_id
+        where: coder flags byte (id size, complex, props bit) + method id bytes
+        type: record
+        read_from: last_article
+        use: decode pipeline
+        proves: tool
+        leak: true
+        status: VERIFIED
+        source: w1b s5.5
+        atlas: parsed
+        atlas_where: sevenz.rs:126, 181-183, 513 (ids used; method chain not kept)
+      - name: bind_pairs_packed_streams
+        where: NumBindPairs = out-1; packed stream indices
+        type: record
+        read_from: last_article
+        use: coder chain wiring
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1b s5.5
+        atlas: parsed
+        atlas_where: sevenz.rs:191-201 (dropped)
+      - name: coders_unpack_size
+        where: kCodersUnPackSize per coder output
+        type: uint64
+        read_from: last_article
+        use: unpacked size of each coder output
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1b s5.4
+        atlas: parsed
+        atlas_where: sevenz.rs:245-249 -> Folder::size (sevenz.rs:135-139)
+      - name: folder_crc
+        where: kCRC of each folder final output
+        type: uint32
+        read_from: last_article
+        use: folder integrity; twin key
+        proves: twin
+        leak: false
+        status: VERIFIED
+        source: w1b s5.4
+        atlas: parsed
+        atlas_where: sevenz.rs:254-257 (Folder.crc; only used for header verify)
+      - name: substream_counts
+        where: kNumUnPackStream per folder (files in solid block)
+        type: uint64
+        read_from: last_article
+        use: files per solid block
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1b s5.6
+        atlas: parsed
+        atlas_where: sevenz.rs:267-274 (per_folder; dropped)
+      - name: substream_sizes
+        where: 'kSize: N-1 sizes per folder; last = folder size minus sum'
+        type: uint64
+        read_from: last_article
+        use: per-file offsets in folder
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1b s5.6
+        atlas: stored
+        atlas_where: sevenz.rs:279-292 -> Streams.sizes -> archive_inner_files.size
+      - name: substream_crcs
+        where: per-file CRC32 (single-substream folder inherits folder CRC)
+        type: uint32
+        read_from: last_article
+        use: per-file CRC (needs full file)
+        proves: twin
+        leak: false
+        status: VERIFIED
+        source: w1b s5.6
+        atlas: parsed
+        atlas_where: 'sevenz.rs:299-304 (digests read and discarded: free per-file CRC32 lost)'
+      - name: file_order_in_header
+        where: dirs, then empty files, then data files in add order; no type sort by default
+        type: derived
+        read_from: last_article
+        use: which files sit in solid block 1
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: log W4B (7zHandlerOut)
+        atlas: 'no'
+        atlas_where: 'no solid-block ordering stored (w9a section 4: per-folder counts parsed, no solid flag)'
+      files_info:
+      - name: files_num
+        where: 'NUMBER: NumFiles'
+        type: uint64
+        read_from: last_article
+        use: file count
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1b s5.7
+        atlas: parsed
+        atlas_where: sevenz.rs:350-389 (entry list; count not stored separately)
+      - name: empty_stream
+        where: 'kEmptyStream bitfield: no data stream (dir or empty file)'
+        type: bitfield
+        read_from: last_article
+        use: separates dirs and empty entries
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1b s5.7
+        atlas: parsed
+        atlas_where: sevenz.rs:350, 369 (dropped after use)
+      - name: empty_file
+        where: 'kEmptyFile bitfield over empty-stream entries: empty file vs dir'
+        type: bitfield
+        read_from: last_article
+        use: directory vs empty file
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1b s5.7
+        atlas: parsed
+        atlas_where: sevenz.rs:352-353, 370 (dropped after use)
+      - name: anti_items
+        where: 'kAnti bitfield: deletion marker (update archives)'
+        type: bitfield
+        read_from: last_article
+        use: rare; deletion flag
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1b s5.7
+        atlas: 'no'
+        atlas_where: kAnti skipped at sevenz.rs:363; anti-items listed as files
+      - name: names
+        where: 'kName: external byte, then NUL-terminated UTF-16LE per file; ''/'' separator'
+        type: utf16le
+        read_from: last_article
+        use: file path and packer directory tree
+        proves: same_uploader
+        leak: true
+        status: VERIFIED
+        source: w1b s5.7; w5c s4.4
+        atlas: stored
+        atlas_where: sevenz.rs:355-362 -> archive_inner_files.name
+      - name: ctime_atime
+        where: 'kCTime / kATime: fixed 8-byte FILETIME per defined file (UTC); presence follows -mtc/-mta'
+        type: filetime
+        read_from: last_article
+        use: UTC times; presence reflects packer flags
+        proves: same_uploader
+        leak: true
+        status: VERIFIED
+        source: w1b s5.7
+        atlas: 'no'
+        atlas_where: kCTime/kATime skipped (sevenz.rs:363)
+      - name: mtime
+        where: 'kMTime: fixed 8-byte FILETIME per file (UTC)'
+        type: filetime
+        read_from: last_article
+        use: UTC mtime; compare to Usenet Date
+        proves: same_uploader
+        leak: true
+        status: VERIFIED
+        source: w5c s1.9
+        atlas: 'no'
+        atlas_where: kMTime skipped (sevenz.rs:363)
+      - name: win_attributes
+        where: 'kWinAttrib: UINT32 per file; low 16 bits Windows attrs'
+        type: uint32
+        read_from: last_article
+        use: dir, hidden, archive bits
+        proves: tool
+        leak: true
+        status: VERIFIED
+        source: w1b s5.7; w5c s6.6
+        atlas: 'no'
+        atlas_where: kWinAttrib skipped (sevenz.rs:363)
+      - name: attr_unix_mode
+        where: bit 0x8000 = Unix extension; high 16 bits = st_mode
+        type: derived
+        read_from: last_article
+        use: symlink, permissions, umask
+        proves: tool
+        leak: true
+        status: VERIFIED
+        source: w5c s3.8
+        atlas: 'no'
+        atlas_where: high 16 bits of kWinAttrib not read (sevenz.rs:363)
+      - name: start_pos
+        where: kStartPos per defined file (rare)
+        type: uint64
+        read_from: last_article
+        use: rare; ignore unless seen
+        proves: none
+        leak: false
+        status: UNVERIFIED
+        source: w1b s5.7
+        atlas: 'no'
+        atlas_where: kStartPos skipped (sevenz.rs:363)
+      - name: dummy_padding
+        where: 'kDummy 0x19: zero padding; nonzero bytes = header error'
+        type: bytes
+        read_from: last_article
+        use: 7-Zip-style writer fingerprint
+        proves: tool
+        leak: true
+        status: VERIFIED
+        source: w8c h; w5c s6.7
+        atlas: 'no'
+        atlas_where: kDummy skipped (correct; sevenz.rs:363)
+      - name: comment_record
+        where: 'kComment 0x16: skipped as unknown property'
+        type: record
+        read_from: last_article
+        use: not parsed
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w8c h
+        atlas: 'no'
+        atlas_where: kComment skipped (sevenz.rs:363)
+      - name: archive_properties
+        where: 'kArchiveProperties 0x02 and kAdditionalStreamsInfo 0x03: skip or external data'
+        type: record
+        read_from: last_article
+        use: rare external names and times
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1b s5.1-5.2
+        atlas: 'no'
+        atlas_where: kArchiveProperties / kAdditionalStreamsInfo not read (no branch)
+      - name: external_flag
+        where: External byte (0 inline) on name, time and attribute vectors
+        type: uint8
+        read_from: last_article
+        use: 7-Zip writes 0
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1b s5.7
+        atlas: 'no'
+        atlas_where: External byte not read
+      coders:
+      - name: lzma_props
+        where: 'LZMA 030101: byte0 = (pb*5+lp)*9+lc (0x5D default); dict uint32 LE'
+        type: record
+        read_from: last_article
+        use: lc/lp/pb and dict = settings fingerprint
+        proves: tool
+        leak: true
+        status: VERIFIED
+        source: w1b s6.2
+        atlas: 'no'
+        atlas_where: only props.len()==5 checked (w9a section 4); dict/lc/lp/pb not kept
+      - name: lzma2_props
+        where: 'LZMA2 21: 1 byte dictionary code'
+        type: uint8
+        read_from: last_article
+        use: dict size (formula not confirmed)
+        proves: tool
+        leak: true
+        status: VERIFIED
+        source: w1b s6; 7zHeader.h k_LZMA2 0x21 (fetched); dict formula still not confirmed
+        atlas: 'no'
+        atlas_where: props passed to decoder, not kept
+      - name: ppmd_props
+        where: 'PPMd 030401: order byte + memSize uint32 LE'
+        type: record
+        read_from: last_article
+        use: PPMd order and memory
+        proves: tool
+        leak: true
+        status: VERIFIED
+        source: w1b s6
+        atlas: 'no'
+        atlas_where: props not parsed
+      - name: copy_method
+        where: 'COPY 00: store (-mx0); packed == unpacked'
+        type: derived
+        read_from: first_article
+        use: 'file i at 32+PackPos+sum(prior sizes): inner MKV readable'
+        proves: tool
+        leak: true
+        status: VERIFIED
+        source: w1b s8; 7zHeader.h k_Copy 0 (fetched)
+        atlas: 'no'
+        atlas_where: no method string kept (w9a section 4.1 method chain not kept)
+      - name: branch_filters
+        where: BCJ x86 03030103, PPC 03030205, IA64 03030401, ARM 03030501, ARMT 03030701, SPARC 03030805, ARM64 0A, RISC-V 0B; also SWAP2 020302 and SWAP4 020304 (IsFilterMethod)
+        type: derived
+        read_from: last_article
+        use: filter chain; newer 7-Zip versions add ARM64 and RISC-V
+        proves: tool
+        leak: true
+        status: VERIFIED
+        source: w1b s6; log W8A; 7zHeader.h k_* constants and IsFilterMethod (fetched)
+        atlas: 'no'
+        atlas_where: filters not parsed; only LZMA header path (sevenz.rs:513-516)
+      - name: bcj2_and_delta
+        where: 'BCJ2 0303011B (4 in-streams); Delta 03 (1 byte: distance-1)'
+        type: derived
+        read_from: full
+        use: partial decode harder for BCJ2
+        proves: tool
+        leak: true
+        status: VERIFIED
+        source: w1b s6; 7zHeader.h k_BCJ2 0x303011B, k_Delta 0x03 (fetched)
+        atlas: 'no'
+        atlas_where: not parsed
+      - name: deflate_bzip2_ids
+        where: Deflate 040108, BZip2 040202, Deflate64 040109 (footnotes disagree)
+        type: derived
+        read_from: last_article
+        use: method ids
+        proves: tool
+        leak: true
+        status: VERIFIED
+        source: w1b s6; 7zHeader.h k_Deflate 0x40108, k_Deflate64 0x40109, k_BZip2 0x40202 (fetched)
+        atlas: 'no'
+        atlas_where: ids not kept (method chain not persisted)
+      - name: fork_codec_ids
+        where: ZSTD 04F71101, Brotli 04F71102, LZ4 04F71104, LZS 04F71105, Lizard 04F71106 (fork ids)
+        type: derived
+        read_from: last_article
+        use: non-stock codecs
+        proves: tool
+        leak: true
+        status: UNVERIFIED
+        source: 'w1b s6; 7zHeader.h:(comment only) "0x4F71101, 7z-zstd": only the zstd id appears, as a comment; LZ4/Brotli/LZS/Lizard not in header'
+        atlas: 'no'
+        atlas_where: not parsed
+      - name: aes_props
+        where: 'props[0]: bits 0-5 NumCyclesPower; bit 0x80 = salt present; bit 0x40 = IV present. props[1]: high nibble = SaltSize-1, low nibble = IVSize-1 (salt size = bit7 + hi nibble, IV size = bit6 + lo nibble). Then
+          salt bytes, then IV bytes. Encoder default: props[0]=0xD3 (cycles 19, salt, IV), props[1]=0x3F (salt 4, IV 16), total 22 bytes.'
+        type: record
+        read_from: last_article
+        use: encryption detect without password
+        proves: tool
+        leak: true
+        status: VERIFIED
+        source: w1b s6.1; w7b s3.1; 7zAes.cpp:214-226 (fetched); proto sevenz_zip_meta.rs:429-439 matches decoder formula
+        atlas: parsed
+        atlas_where: sevenz.rs:181-183 (AES id -> encryption flag only; props not parsed)
+      - name: aes_cycles_power
+        where: NumCyclesPower (7-Zip default 19 = 2^19 SHA-256 rounds)
+        type: derived
+        read_from: last_article
+        use: KDF cost; default fingerprint
+        proves: tool
+        leak: true
+        status: VERIFIED
+        source: w7b s3.1; 7zAes.cpp:236 (NumCyclesPower = 19) (fetched)
+        atlas: 'no'
+        atlas_where: 'not parsed (w9a section 4: AES props not parsed)'
+      - name: aes_iv
+        where: 16-byte random IV per AES coder (encoder _ivSize=16). A 4-byte salt is ALSO written by default (encoder SaltSize=4 in ResetSalt; props bit 0x80 set). Props therefore carry salt + IV.
+        type: bytes16
+        read_from: last_article
+        use: per-archive twin key across volumes
+        proves: twin
+        leak: true
+        status: VERIFIED
+        source: 'w7b s3.1, s3.3; 7zAes.cpp:194-226 (fetched); superseded text: "no salt by default"'
+        atlas: 'no'
+        atlas_where: not parsed (w9a section 4)
+      - name: aes_password_encoding
+        where: password encoded as UTF-16LE bytes, no BOM
+        type: derived
+        read_from: last_article
+        use: password test input encoding
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w8c h
+        atlas: 'no'
+        atlas_where: not in w9a (password path not inspected)
+      - name: other_crypto_ids
+        where: ZipCrypto 06F10101 and RAR29 crypto 06F10303 are not defined in 7zHeader.h; ids from w1b s6 only
+        type: derived
+        read_from: last_article
+        use: legacy encryption ids
+        proves: none
+        leak: false
+        status: UNVERIFIED
+        source: w1b s6 (not re-checked; not in 7zHeader.h)
+        atlas: 'no'
+        atlas_where: not parsed; AES id only (sevenz.rs:181-183)
+      - name: multivolume_logical_offsets
+        where: '7z split (.7z.001...): offsets in logical stream; equal volume size assumed'
+        type: derived
+        read_from: last_article
+        use: locate the volume holding the header
+        proves: none
+        leak: false
+        status: UNVERIFIED
+        source: w1b s7
+        atlas: parsed
+        atlas_where: steps.rs:353-364 (seven_list joins articles; logical-offset header search not verified)
+    partial_decode:
+      codec: LZMA2 and LZMA1 from offset 32 (+ BCJ and Delta chains)
+      crate: lzma-rust2 0.25 Lzma2Reader (64 MiB dict)
+      result: 'SOLVED for first folder: 10% packed -> 786 KB correct; MKV magic check; BCJ2 untested'
+    rust:
+      parse: hand-written (proto/sevenz_zip_meta.rs)
+      decode: lzma-rust2 0.25 Lzma2Reader + filter::bcj/delta
+      crypto: sha2 (7z KDF) + aes-256 cbc
+  zip:
+    detect:
+      magic: 50 4B 03 04
+      offset: 0
+      variants: 50 4B 05 06 (empty), 50 4B 07 08 (spanned marker)
+    structures:
+      local_file_header:
+      - name: lfh_version_needed
+        where: '@4 uint16: 20, 45 (zip64), 46 (bzip2), 51 (AES), 63 (LZMA/PPMd)'
+        type: uint16
+        read_from: first_article
+        use: feature check (zip64, AES)
+        proves: tool
+        leak: true
+        status: VERIFIED
+        source: w1c s1.1
+        atlas: 'no'
+        atlas_where: not read (w9a 5.1)
+      - name: lfh_gp_flags
+        where: '@6 uint16: bit0 encrypted, bit3 data descriptor, bit6 strong, bit11 UTF-8, bit13 CD masking; bits1-2 deflate mode'
+        type: uint16
+        read_from: first_article
+        use: encryption, streaming writer, name encoding
+        proves: tool
+        leak: true
+        status: VERIFIED
+        source: w1c s1.7
+        atlas: parsed
+        atlas_where: zip.rs:36-38, 206, 244-246 (listing); probe/archive.rs:191 uses bit 0 only
+      - name: lfh_method
+        where: '@8 uint16: 0 store, 8 deflate, 9 deflate64, 12 bzip2, 14 LZMA, 93 zstd, 95 xz, 98 PPMd, 99 AE-x'
+        type: uint16
+        read_from: first_article
+        use: codec; 99 = real method in 0x9901
+        proves: tool
+        leak: true
+        status: VERIFIED
+        source: w1c s1.8
+        atlas: stored
+        atlas_where: probe/archive.rs:189-204 -> ArchiveHead.method text; numeric value lost for "other"
+      - name: lfh_dos_time_date
+        where: '@10 time (h<<11|m<<5|s/2), @12 date; local clock, 2 s'
+        type: uint32
+        read_from: first_article
+        use: local clock (no zone)
+        proves: same_uploader
+        leak: true
+        status: VERIFIED
+        source: w5c s1.3
+        atlas: 'no'
+        atlas_where: not read (w9a 5.1)
+      - name: lfh_crc32
+        where: '@14 uint32; 0 when data descriptor bit set'
+        type: uint32
+        read_from: first_article
+        use: content fingerprint
+        proves: twin
+        leak: false
+        status: VERIFIED
+        source: w1c s1.1
+        atlas: stored
+        atlas_where: probe/archive.rs:207 (first entry, bit 3 clear); listing never reads it (zip.rs:217-237)
+      - name: lfh_sizes
+        where: '@18 compressed, @22 uncompressed (0xFFFFFFFF = see zip64 extra)'
+        type: uint32
+        read_from: first_article
+        use: file size without download
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1c s1.1
+        atlas: stored
+        atlas_where: probe/archive.rs:210-216 -> ArchiveHead.packed; zip.rs:235-237 -> size
+      - name: lfh_name_extra_len
+        where: '@26 uint16 name length; @28 uint16 extra length'
+        type: uint16
+        read_from: first_article
+        use: bounds name and extra
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1c s1.1
+        atlas: parsed
+        atlas_where: zip.rs:226-227
+      - name: lfh_name
+        where: '@30 name: CP437 unless UTF-8 bit or 0x7075 present'
+        type: bytes
+        read_from: first_article
+        use: entry path
+        proves: same_uploader
+        leak: true
+        status: VERIFIED
+        source: w1c s1.1
+        atlas: stored
+        atlas_where: probe/archive.rs:217 (lossy UTF-8); zip.rs:236 via name_of -> archive_inner_files.name
+      - name: lfh_encryption_header
+        where: 'after extra: ZipCrypto 12-byte header, or AE-x salt + 2-byte verifier'
+        type: bytes
+        read_from: first_article
+        use: encryption present; password test input
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w7b s4
+        atlas: stored
+        atlas_where: zip.rs:80, 194-206 -> archive_release.password_check (BLOB)
+      - name: data_descriptor
+        where: 'after data when bit 3: sig 0x08074B50 + CRC + comp + uncomp (12 B without sig)'
+        type: record
+        read_from: last_article
+        use: real CRC and sizes for bit-3 entries
+        proves: twin
+        leak: false
+        status: VERIFIED
+        source: w1c s1.2
+        atlas: 'no'
+        atlas_where: not read (w9a 5.1)
+      - name: data_descriptor_zip64
+        where: 'zip64 variant: 24 B with sig, 20 B without (8-byte sizes)'
+        type: record
+        read_from: last_article
+        use: zip64 real sizes
+        proves: none
+        leak: false
+        status: UNVERIFIED
+        source: w1c s1.2
+        atlas: 'no'
+        atlas_where: not read (w9a 5.1)
+      extras:
+      - name: extra_zip64_0001
+        where: '0x0001: uncompressed, compressed, offset, disk (only where base field is 0xFFFFFFFF)'
+        type: record
+        read_from: first_article (local) / last_article (CD)
+        use: true sizes and offsets over 4 GiB
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1c s1.5
+        atlas: parsed
+        atlas_where: zip.rs:49-72 -> sizes (stored via listing and probe)
+      - name: extra_ntfs_000a
+        where: '0x000a: reserved 4, tag 0x0001 size 24: mtime, atime, ctime as FILETIME (100 ns, UTC)'
+        type: record
+        read_from: first_article
+        use: high-precision UTC; Windows writer fingerprint
+        proves: tool
+        leak: true
+        status: VERIFIED
+        source: 'w2c s1; Info-ZIP extrafld.txt:206-233 (fetched): TSize, Reserved, Tag 0x0001, Size 24, 3 x 8-byte FILETIME'
+        atlas: 'no'
+        atlas_where: 0x000a not read (w9a 5.1)
+      - name: extra_ut_5455
+        where: '0x5455: flags byte (bit0 mtime, bit1 atime, bit2 ctime), Unix seconds; CD may carry mtime only'
+        type: record
+        read_from: first_article (local) / last_article (CD)
+        use: UTC time; pairs with DOS time for tz offset
+        proves: same_uploader
+        leak: true
+        status: VERIFIED
+        source: 'w2c s1; Info-ZIP extrafld.txt:817-840 (fetched): flags byte, ModTime, AcTime, CrTime'
+        atlas: 'no'
+        atlas_where: 0x5455 not read (w9a 5.1)
+      - name: extra_ux_7875
+        where: '0x7875: version 1, UID size + UID, GID size + GID (2 or 4 bytes)'
+        type: record
+        read_from: first_article / last_article
+        use: numeric uid and gid of packer
+        proves: same_uploader
+        leak: true
+        status: VERIFIED
+        source: 'w2c s1; Info-ZIP extrafld.txt:1339-1363 (fetched): Version, UIDSize, UID, GIDSize, GID'
+        atlas: 'no'
+        atlas_where: 0x7875 not read (w9a 5.1)
+      - name: extra_ux_5855
+        where: '0x5855: atime, mtime (LE32), uid and gid LE16 if size >= 12'
+        type: record
+        read_from: first_article / last_article
+        use: UTC times and ids (old Info-ZIP)
+        proves: same_uploader
+        leak: true
+        status: VERIFIED
+        source: 'w2c s1; Info-ZIP extrafld.txt:874-892 (fetched): AcTime, ModTime, optional UID/GID'
+        atlas: 'no'
+        atlas_where: 0x5855 not read (w9a 5.1)
+      - name: extra_unix_000d
+        where: '0x000d PKWARE Unix: atime, mtime, uid (LE16), gid (LE16), optional tail'
+        type: record
+        read_from: first_article
+        use: UTC times and ids
+        proves: same_uploader
+        leak: true
+        status: VERIFIED
+        source: 'w2c s1; Info-ZIP extrafld.txt:583-600 (fetched): AcTime, ModTime, UID, GID'
+        atlas: 'no'
+        atlas_where: 0x000d not read (w9a 5.1)
+      - name: extra_unicode_path_7075
+        where: '0x7075: version 1, CRC32 of header name, UTF-8 name; ignore on CRC mismatch'
+        type: record
+        read_from: first_article / last_article
+        use: true UTF-8 name
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w2c s1
+        atlas: 'no'
+        atlas_where: 0x7075 not read (w9a 5.1)
+      - name: extra_unicode_comment_6375
+        where: '0x6375: version 1, CRC32 of CD comment, UTF-8 comment; ignore on CRC mismatch'
+        type: record
+        read_from: last_article
+        use: Unicode comment
+        proves: same_uploader
+        leak: true
+        status: VERIFIED
+        source: w8c e
+        atlas: 'no'
+        atlas_where: 0x6375 not read (w9a 5.1)
+      - name: aes_vendor_version
+        where: '0x9901 at +0 uint16 LE: 1 = AE-1 (CRC kept), 2 = AE-2 (CRC zero)'
+        type: uint16
+        read_from: first_article (local) / last_article (CD)
+        use: AE-1 vs AE-2 (CRC availability)
+        proves: tool
+        leak: true
+        status: VERIFIED
+        source: w8c e; libarchive archive_read_support_format_zip.c:1208-1213 (vendor = le16 at +0) (fetched)
+        atlas: 'no'
+        atlas_where: vendor version not read (w9a 5.1)
+      - name: aes_vendor_id
+        where: '0x9901 at +2: ASCII ''AE'''
+        type: ascii2
+        read_from: first_article
+        use: confirms WinZip AES extra
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w2c s1
+        atlas: 'no'
+        atlas_where: '"AE" not checked; zip.rs:182-191 reads strength only'
+      - name: aes_strength
+        where: '0x9901 at +4: 1 = AES-128 (salt 8), 2 = AES-192 (salt 12), 3 = AES-256 (salt 16)'
+        type: uint8
+        read_from: first_article
+        use: key and salt sizes
+        proves: tool
+        leak: true
+        status: VERIFIED
+        source: w7b s4.2 (strength code to salt size; not re-checked in this pass)
+        atlas: parsed
+        atlas_where: zip.rs:182-191 -> password_check (zip.rs:197-201) -> BLOB
+      - name: aes_actual_method
+        where: '0x9901 at +5, uint16 LE: real compression method. Note: libarchive reads 1 byte only (c:1220-1225, bug).'
+        type: uint16
+        read_from: first_article
+        use: real codec behind method 99
+        proves: tool
+        leak: true
+        status: VERIFIED
+        source: w8c e; libarchive archive_read_support_format_zip.c:1208-1225 (fetched)
+        atlas: 'no'
+        atlas_where: +5 method not read (w9a 5.1)
+      - name: ae2_crc_zero
+        where: AE-2 stores CRC32 = 0; CRC is not checked
+        type: derived
+        read_from: first_article
+        use: no CRC fingerprint for AE-2
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w2c s1
+        atlas: 'no'
+        atlas_where: CRC not checked (w9a 5.1)
+      - name: extra_strong_encryption_0017
+        where: 0x0017 strong encryption header (GP bit 6)
+        type: record
+        read_from: first_article
+        use: strong encryption detect (rare)
+        proves: none
+        leak: false
+        status: UNVERIFIED
+        source: w1c s1.6
+        atlas: 'no'
+        atlas_where: 0x0017 not read (w9a 5.1)
+      - name: extra_other_ids
+        where: 'other IDs: 0x0007, 0x0009, 0x000C, 0x000F, 0x0014-0x0017, 0x0065, 0x0066, 0x07C8, 0x2605, 0x2705, 0x334D, 0x4154, 0x4341, 0x4453, 0x4704, 0x470F, 0x4854, 0x4B46, 0x4C41, 0x4D49, 0x4D63, 0x4F4C, 0x5356, 0x554E,
+          0x6542, 0x6854, 0x756E, 0x7855, 0xFB4A (0x5855 and 0x6375 removed: own entries; 0x9902, 0xA11E, 0xCAFE, 0x4690 not in extrafld.txt)'
+        type: record
+        read_from: first_article
+        use: platform fingerprints
+        proves: tool
+        leak: true
+        status: UNVERIFIED
+        source: w1c s1.6; Info-ZIP extrafld.txt table (fetched) for IDs listed there
+        atlas: 'no'
+        atlas_where: other extra IDs not read (w9a 5.1)
+      central_directory:
+      - name: cd_version_made_by
+        where: 'CD @4 uint16: upper byte host OS (0 MS-DOS, 3 UNIX, 7 macOS classic, 10 NTFS, 11 MVS, 14 VFAT, 19 OS X), lower byte spec version'
+        type: uint16
+        read_from: last_article
+        use: strongest zip packer fingerprint
+        proves: tool
+        leak: true
+        status: VERIFIED
+        source: 'w1c s1.9; w5c s6.4; APPNOTE host table as cited by w1c (fetched source for ZIP: libarchive does not table this)'
+        atlas: 'no'
+        atlas_where: not read (w9a 5.2)
+      - name: cd_version_needed
+        where: 'CD @6 uint16: version needed to extract'
+        type: uint16
+        read_from: last_article
+        use: tool hint
+        proves: tool
+        leak: true
+        status: UNVERIFIED
+        source: APPNOTE CD layout (not fetched); w9a 5.2 row
+        atlas: 'no'
+        atlas_where: not read (w9a 5.2)
+      - name: cd_gp_flags
+        where: 'CD @8 uint16: GP flag (bit0 encrypted, bit3 data descriptor, bit11 UTF-8, bit13 masked)'
+        type: uint16
+        read_from: last_article
+        use: encryption and name encoding
+        proves: tool
+        leak: true
+        status: UNVERIFIED
+        source: APPNOTE CD layout (not fetched); w9a 5.2 row (parsed)
+        atlas: parsed
+        atlas_where: zip.rs:304-306 -> is_encrypted (zip.rs:36-38)
+      - name: cd_method
+        where: 'CD @10 uint16: compression method (99 = AES, actual method in 0x9901 at +5)'
+        type: uint16
+        read_from: last_article
+        use: method and AES detection
+        proves: tool
+        leak: true
+        status: UNVERIFIED
+        source: APPNOTE CD layout (not fetched); w9a 5.2 row (parsed)
+        atlas: parsed
+        atlas_where: zip.rs:305 (only used for is_encrypted, zip.rs:320)
+      - name: cd_dos_time_date
+        where: CD @12 uint16 time, @14 uint16 date (DOS local time, 2 s resolution)
+        type: uint32
+        read_from: last_article
+        use: packer clock; compare to Usenet Date
+        proves: same_uploader
+        leak: true
+        status: UNVERIFIED
+        source: APPNOTE CD layout (not fetched); w9a 5.2 row (no)
+        atlas: 'no'
+        atlas_where: not read (w9a 5.2)
+      - name: cd_crc32
+        where: CD @16 uint32 CRC-32 of the uncompressed data (free per-entry CRC)
+        type: uint32
+        read_from: last_article
+        use: per-file CRC; twin key
+        proves: twin
+        leak: false
+        status: UNVERIFIED
+        source: APPNOTE CD layout (not fetched); w9a 5.2 row (never read)
+        atlas: 'no'
+        atlas_where: CD CRC-32 never read (zip.rs:298-333)
+      - name: cd_compressed_size
+        where: CD @20 uint32 compressed size (zip64 extra when 0xFFFFFFFF)
+        type: uint32
+        read_from: last_article
+        use: packed length per entry
+        proves: none
+        leak: false
+        status: UNVERIFIED
+        source: APPNOTE CD layout (not fetched); w9a 5.2 row (parsed, dropped)
+        atlas: parsed
+        atlas_where: zip.rs:306; discarded at zip.rs:324
+      - name: cd_name_extra_len
+        where: CD @28 uint16 name length, @30 uint16 extra length
+        type: uint16
+        read_from: last_article
+        use: slice name, extra, comment
+        proves: none
+        leak: false
+        status: UNVERIFIED
+        source: APPNOTE CD layout (not fetched); w9a 5.2 row (parsed)
+        atlas: parsed
+        atlas_where: zip.rs:309-310
+      - name: cd_external_attr
+        where: 'CD @38 uint32: low byte DOS attrs; host 3: high 16 bits = st_mode'
+        type: uint32
+        read_from: last_article
+        use: unix mode, symlink, dir
+        proves: tool
+        leak: true
+        status: VERIFIED
+        source: w5c s6.5
+        atlas: 'no'
+        atlas_where: not read; directory detection uses name suffix only (zip.rs:44-46, 326)
+      - name: cd_internal_attr_disk_start
+        where: CD @36 internal attrs (bit0 text); @34 disk start (0xFFFF = zip64)
+        type: uint16
+        read_from: last_article
+        use: text flag; which disk holds entry
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1c s1.3
+        atlas: 'no'
+        atlas_where: not read (w9a 5.2)
+      - name: cd_relative_offset
+        where: CD @42 uint32 local header offset (0xFFFFFFFF = zip64 extra)
+        type: uint32
+        read_from: last_article
+        use: locate local header and data
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1c s1.3
+        atlas: 'no'
+        atlas_where: not read (w9a 5.2)
+      - name: cd_entry_comment
+        where: 'CD comment: length @32 uint16; text after name and extra'
+        type: bytes
+        read_from: last_article
+        use: per-entry note
+        proves: same_uploader
+        leak: true
+        status: VERIFIED
+        source: w1c s1.3
+        atlas: parsed
+        atlas_where: zip.rs:311, 317-319 (length check only; content not read)
+      eocd_and_zip64:
+      - name: eocd_record
+        where: 'EOCD 0x06054B50 (22 B): disk numbers, entries, CD size @12, CD offset @16, comment length @20'
+        type: record
+        read_from: last_article
+        use: CD location; entry count; spanned disk
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1c s1.4
+        atlas: parsed
+        atlas_where: zip.rs:271-297 (walk only; not stored)
+      - name: eocd_comment
+        where: 'EOCD comment after 22 B: packer name or release note'
+        type: bytes
+        read_from: last_article
+        use: packer name, group note
+        proves: same_uploader
+        leak: true
+        status: VERIFIED
+        source: w1c s1.4; w5c s5.4
+        atlas: 'no'
+        atlas_where: EOCD comment ignored (w9a 5.3)
+      - name: zip64_eocd
+        where: Zip64 EOCD 0x06064B50 (56 B) and locator 0x07064B50 (20 B, just before EOCD)
+        type: record
+        read_from: last_article
+        use: CD in zip64 archives; locator is the cheap entry point
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1c s1.5
+        atlas: parsed
+        atlas_where: zip.rs:276-288 (not stored)
+      - name: split_disk_fields
+        where: 'EOCD and locator disk fields: total disks and CD disk (spanned zips)'
+        type: derived
+        read_from: last_article
+        use: volume count for spanned zip
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1c s1.12
+        atlas: 'no'
+        atlas_where: not read; split ZIP unsupported (w9a 5.2)
+      - name: split_raw_zip001
+        where: 'raw slices of one zip (7-Zip -tzip -v): concatenate before parsing'
+        type: derived
+        read_from: separate_file
+        use: reassemble zip from .001 parts
+        proves: none
+        leak: false
+        status: UNVERIFIED
+        source: w1c s2.1
+        atlas: 'no'
+        atlas_where: not in w9a (no multi-part join for ZIP)
+      - name: split_z01_naming
+        where: PKWARE spanned .z01..zNN plus final .zip naming
+        type: derived
+        read_from: separate_file
+        use: spanned naming
+        proves: none
+        leak: false
+        status: UNVERIFIED
+        source: w1c s1.12
+        atlas: 'no'
+        atlas_where: not in w9a (no .z01 handling)
+      - name: tz_offset_dos_vs_ut
+        where: 'DOS local time minus UT or NTFS UTC: packer UTC offset (about 2 s, DST ambiguous)'
+        type: derived
+        read_from: first_article
+        use: uploader timezone
+        proves: same_uploader
+        leak: true
+        status: UNVERIFIED
+        source: w5c s1.11
+        atlas: 'no'
+        atlas_where: not computed (w9a 5.2 lists DOS time as not read)
+      encryption:
+      - name: zipcrypto_check_byte
+        where: 12-byte encryption header, last byte (index 11). Check byte = high byte of CRC-32 (crc >> 24) normally; = high byte of DOS time when GP bit 3 is set. 1/256 false positive.
+        type: uint8
+        read_from: first_article
+        use: cheap password test
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: libarchive archive_read_support_format_zip.c:1306-1308 (decdat = p[11] if bit3 else p[17]), 3420 (fetched)
+        atlas: stored
+        atlas_where: PasswordCheck::Crypto zip.rs:80, 194-206 -> archive_release.password_check (BLOB)
+      - name: winzip_aes_salt_verifier
+        where: salt 8/12/16 bytes by strength, then 2-byte verifier; PBKDF2-SHA1 x1000
+        type: bytes
+        read_from: first_article
+        use: per-entry salt; password test
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w7b s4.2
+        atlas: stored
+        atlas_where: PasswordCheck::Aes zip.rs:82 -> archive_release.password_check (BLOB)
+    partial_decode:
+      codec: deflate (method 8); stored (0)
+      crate: flate2 1.1.10
+      result: about 1:1 prefix from first articles; LZMA and zstd entries untested
+    rust:
+      parse: hand-written (proto/sevenz_zip_meta.rs); rc-zip is the sans-io option
+      decode: flate2 1.1.10
+      crypto: pbkdf2+hmac+sha1 (WinZip AES); ZipCrypto by hand
+  par2:
+    detect:
+      magic: 50 41 52 32 00 50 4B 54
+      offset: 0
+      note: per packet
+    structures:
+      packet_header:
+      - name: packet_magic
+        where: '@0 8 bytes: ''PAR2'' NUL ''PKT'' = 50 41 52 32 00 50 4B 54 (every packet)'
+        type: bytes8
+        read_from: first_article or separate_file
+        use: find packets anywhere
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1c s3.1
+        atlas: parsed
+        atlas_where: par2.rs:67-77 (resync scan)
+      - name: packet_length
+        where: '@8 uint64 LE; multiple of 4; includes 64-byte header'
+        type: uint64
+        read_from: first_article
+        use: packet bounds
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1c s3.1
+        atlas: parsed
+        atlas_where: par2.rs:78-87 (dropped)
+      - name: packet_md5
+        where: '@16 MD5 over bytes 32..end of packet'
+        type: bytes16
+        read_from: first_article
+        use: validate each packet on its own
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1c s3.1
+        atlas: 'no'
+        atlas_where: not verified (w9a 6)
+      - name: recovery_set_id
+        where: '@32 16 bytes: MD5 of Main packet body'
+        type: bytes16
+        read_from: first_article
+        use: joins packets of one set
+        proves: twin
+        leak: false
+        status: VERIFIED
+        source: w1c s3.1
+        atlas: parsed
+        atlas_where: Par2File.set_id (par2.rs:89, 113); not stored
+      - name: packet_type
+        where: 'bytes 48-63: "PAR 2.0\0" + type name, NUL-padded to 16 bytes. Examples: "PAR 2.0\0Main\0\0\0\0", "PAR 2.0\0FileDesc", "PAR 2.0\0IFSC\0\0\0\0", "PAR 2.0\0RecvSlic", "PAR 2.0\0Creator\0", "PAR 2.0\0UniFileN",
+          "PAR 2.0\0CommASCI", "PAR 2.0\0CommUni\0", "PAR 2.0\0FileSlic", "PAR 2.0\0RFSC\0\0\0\0", "PAR 2.0\0PkdMain\0", "PAR 2.0\0PkdRecvS"'
+        type: ascii16
+        read_from: first_article
+        use: packet dispatch
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1c s3.2 (w1c:297-304); proto par2_sfv_srr_meta.rs:148-159 (fetched)
+        atlas: parsed
+        atlas_where: par2.rs:93-124 dispatch
+      packets:
+      - name: main_slice_size
+        where: 'Main body @0 uint64: block size (multiple of 4)'
+        type: uint64
+        read_from: first_article
+        use: needed for every slice calculation
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1c s3.3
+        atlas: stored
+        atlas_where: Inventory.block_size (par2.rs:95) -> SET_PAR2_SIZES (steps.rs:249-253)
+      - name: main_file_count
+        where: 'Main body @8 uint32 LE: number of files in the recovery set N; file IDs (16 B each) start at body @12'
+        type: uint32
+        read_from: first_article
+        use: split recovery-set IDs from non-recovery IDs
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: proto par2_sfv_srr_meta.rs:254-256 (fetched); w9a 6 (par2.rs:96); PAR2 v2.0 spec not reachable (proxy 403)
+        atlas: 'no'
+        atlas_where: 'body @8 not read (w9a 6: ids start at body 12, par2.rs:96)'
+      - name: main_file_ids
+        where: 'Main body: N recovery-set file IDs (sorted), then non-recovery IDs'
+        type: bytes16 list
+        read_from: first_article
+        use: set membership
+        proves: alt
+        leak: false
+        status: VERIFIED
+        source: w1c s3.3; proto par2_sfv_srr_meta.rs:254-256 (ids start at body 12) (fetched)
+        atlas: parsed
+        atlas_where: par2.rs:96-101 -> mains; used for complete (par2.rs:132-134); not stored
+      - name: fd_file_id
+        where: FileDesc @0 16 bytes = MD5(MD5-16k || length LE8 || name)
+        type: bytes16
+        read_from: first_article
+        use: join packets to a file
+        proves: alt
+        leak: false
+        status: VERIFIED
+        source: w1c s3.3
+        atlas: parsed
+        atlas_where: par2.rs:103-113; not stored
+      - name: fd_file_md5
+        where: FileDesc @16 MD5 of entire file
+        type: bytes16
+        read_from: full
+        use: whole-file verify
+        proves: twin
+        leak: false
+        status: VERIFIED
+        source: w1c s3.3
+        atlas: parsed
+        atlas_where: Par2File.md5 (par2.rs:103-113)
+      - name: fd_md5_16k
+        where: FileDesc @32 MD5 of first 16 KiB; matches article 1
+        type: bytes16
+        read_from: first_article
+        use: identify file from first article
+        proves: twin
+        leak: false
+        status: VERIFIED
+        source: w1c s3.3
+        atlas: parsed
+        atlas_where: Par2File.md5_16k; dropped by listing_of (steps.rs:72-76)
+      - name: fd_file_length
+        where: FileDesc @48 uint64 file length
+        type: uint64
+        read_from: first_article
+        use: file size without the file
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1c s3.3
+        atlas: stored
+        atlas_where: archive_inner_files.size (steps.rs:74)
+      - name: fd_file_name
+        where: FileDesc @56 ASCII name, zero padded; directories with '/'
+        type: ascii
+        read_from: first_article
+        use: file name and directory layout
+        proves: same_uploader
+        leak: true
+        status: VERIFIED
+        source: w1c s3.3; w5c s4.5
+        atlas: stored
+        atlas_where: archive_inner_files.name (par2.rs:108-110 via clean_name)
+      - name: ifsc_slice_checksums
+        where: 'IFSC: file ID, then per slice MD5 (16) + CRC32 (4); last slice zero-filled'
+        type: record
+        read_from: first_article per slice
+        use: per-slice match of a partial file
+        proves: twin
+        leak: false
+        status: VERIFIED
+        source: w1c s3.3
+        atlas: 'no'
+        atlas_where: no IFSC branch (par2.rs:93-124)
+      - name: ifsc_whole_file_crc32
+        where: whole-file CRC32 from IFSC CRCs via crc32 combine and zero-unpad algebra
+        type: derived
+        read_from: full (IFSC packet)
+        use: content CRC without the file
+        proves: twin
+        leak: false
+        status: VERIFIED
+        source: log W6C
+        atlas: 'no'
+        atlas_where: no IFSC branch (par2.rs:93-124)
+      - name: recovery_slice
+        where: 'RecvSlic: uint32 exponent + recovery data (large; skip)'
+        type: record
+        read_from: separate_file
+        use: recovery block count and index
+        proves: tool
+        leak: false
+        status: VERIFIED
+        source: w1c s3.3
+        atlas: 'no'
+        atlas_where: no RecvSlic branch; block count not counted
+      - name: creator_text
+        where: 'Creator packet: ASCII text naming client and contact'
+        type: ascii
+        read_from: first_article
+        use: packer fingerprint
+        proves: tool
+        leak: true
+        status: VERIFIED
+        source: w1c s3.3
+        atlas: 'no'
+        atlas_where: no Creator branch (par2.rs:93-124)
+      - name: creator_par2cmdline
+        where: '''Created by PACKAGE version VERSION.'' (one copy per recovery volume)'
+        type: ascii
+        read_from: first_article
+        use: par2cmdline version
+        proves: tool
+        leak: true
+        status: VERIFIED
+        source: log W2B
+        atlas: 'no'
+        atlas_where: no Creator branch (par2.rs:93-124)
+      - name: creator_parpar
+        where: '''ParPar v<ver> <arch> [url]'': leaks CPU arch'
+        type: ascii
+        read_from: first_article
+        use: ParPar version and CPU arch
+        proves: tool
+        leak: true
+        status: VERIFIED
+        source: log W2B
+        atlas: 'no'
+        atlas_where: no Creator branch (par2.rs:93-124)
+      - name: creator_other_clients
+        where: MultiPar, QuickPar, phpar2, turbo creator strings
+        type: ascii
+        read_from: first_article
+        use: client fingerprint
+        proves: tool
+        leak: true
+        status: UNVERIFIED
+        source: w1c s3.5
+        atlas: 'no'
+        atlas_where: no Creator branch (par2.rs:93-124)
+      - name: uni_file_name
+        where: 'UniFileN body: File ID (16 B) at @0, then UTF-8 name from @16 (prototype reads name at body 16); ParPar writes it only for non-ASCII names'
+        type: utf8
+        read_from: first_article
+        use: non-ASCII name
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: log W2B; proto par2_sfv_srr_meta.rs:284 (fetched). Spec layout not re-checked (PAR2 spec fetch 403).
+        atlas: parsed
+        atlas_where: par2.rs:115-131 overrides ASCII name; not stored separately
+      - name: comm_ascii
+        where: 'CommASCI packet: ASCII comment text'
+        type: ascii
+        read_from: first_article
+        use: packer note
+        proves: same_uploader
+        leak: true
+        status: VERIFIED
+        source: w5c s5.7
+        atlas: 'no'
+        atlas_where: comment packets not read
+      - name: comm_unicode
+        where: 'CommUni packet: MD5 of ASCII comment + UTF-8 text'
+        type: record
+        read_from: first_article
+        use: edited comment detection
+        proves: same_uploader
+        leak: true
+        status: VERIFIED
+        source: w5c s5.8
+        atlas: 'no'
+        atlas_where: comment packets not read
+      - name: file_slice_packet
+        where: 'FileSlic: file ID, slice index, slice data (large)'
+        type: record
+        read_from: separate_file
+        use: raw data slice
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1c s3.3
+        atlas: 'no'
+        atlas_where: FileSlic ignored (data; correct)
+      - name: rfsc_packet
+        where: 'RFSC: per-recovery-slice checksums (spec says never used)'
+        type: record
+        read_from: separate_file
+        use: rarely present
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1c s3.3
+        atlas: 'no'
+        atlas_where: RFSC not read
+      - name: packed_packets
+        where: 'PkdMain / PkdRecvS: packed forms of Main and RecvSlic'
+        type: record
+        read_from: separate_file
+        use: rarely produced
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1c s3.3
+        atlas: 'no'
+        atlas_where: PkdMain/PkdRecvS not read
+      - name: par3_draft
+        where: PAR3 magic 'PAR3' NUL 'PKT', BLAKE3 fingerprints, 8-byte types (alpha draft)
+        type: record
+        read_from: separate_file
+        use: rare; detect only
+        proves: tool
+        leak: true
+        status: UNVERIFIED
+        source: w1c s3.7
+        atlas: 'no'
+        atlas_where: PAR3 not handled
+      - name: par2_naming
+        where: index 'name.par2' (no recovery data) vs 'name.volNNN+MM.par2' (recovery)
+        type: derived
+        read_from: separate_file
+        use: index vs recovery sidecar
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1c s3.6
+        atlas: 'no'
+        atlas_where: file naming not parsed in inventory
+    partial_decode:
+      codec: none
+      crate: none
+      result: not applicable; packets are plain
+    rust:
+      parse: hand-written (proto/par2_sfv_srr_meta.rs)
+      decode: none
+      crypto: md-5 + crc32fast
+  sfv:
+    detect:
+      magic: none (text)
+      offset: 0
+      note: 'lines: NAME CRC32'
+    structures:
+      lines:
+      - name: sfv_entry
+        where: '''FILENAME'' + one or more spaces + 8 hex CRC32 per line'
+        type: ascii
+        read_from: separate_file
+        use: file names and CRC32 (same CRC as zip and IFSC)
+        proves: twin
+        leak: false
+        status: VERIFIED
+        source: w1c s4.1
+        atlas: stored
+        atlas_where: ProbeInfo.sfv (probe/mod.rs:70) -> release_probe.info
+      - name: sfv_comment
+        where: lines starting with ';' (e.g. '; This is a comment')
+        type: ascii
+        read_from: separate_file
+        use: comments
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1c s4.1
+        atlas: parsed
+        atlas_where: probe/mod.rs:189 starts_with(';') skip (dropped)
+      - name: sfv_generator_header
+        where: '''; Generated by <tool> ... on <date>'' (QuickSFV, cksfv, RapidCRC, pyReScene)'
+        type: ascii
+        read_from: separate_file
+        use: generator, version, local clock
+        proves: tool
+        leak: true
+        status: UNVERIFIED
+        source: w1c s4.1; w5c s5.9
+        atlas: parsed
+        atlas_where: 'probe/mod.rs:189 skip (dropped): packer fingerprint lost'
+      - name: sfv_md5_sha1_variants
+        where: .md5 (HEX32, two spaces) and .sha1 (40 hex) sidecar variants
+        type: ascii
+        read_from: separate_file
+        use: alt checksum sidecars
+        proves: none
+        leak: false
+        status: UNVERIFIED
+        source: w1c s4.1
+        atlas: 'no'
+        atlas_where: only .sfv handled (probe/step.rs run loop)
+      - name: nfo_sidecar
+        where: NFO release text (CP437, ANSI art); inside archive or as sidecar
+        type: text
+        read_from: full or separate_file
+        use: group, date, tool, URLs
+        proves: same_uploader
+        leak: true
+        status: UNVERIFIED
+        source: w1c s4.2; w5c s5.11
+        atlas: stored
+        atlas_where: ProbeInfo.nfo (MAX_NFO) -> release_probe.info
+    partial_decode:
+      codec: none
+      crate: none
+      result: not applicable
+    rust:
+      parse: hand-written (proto/par2_sfv_srr_meta.rs)
+      decode: none
+      crypto: crc32fast
+  srr:
+    detect:
+      magic: 69 69 69
+      offset: 0
+      note: CRC 0x6969 then type 0x69
+    structures:
+      blocks:
+      - name: srr_header_block
+        where: '0x69 SRR header: HEAD_CRC 0x6969; flag 0x0001 app name; APNS uint16 + app name'
+        type: record
+        read_from: separate_file
+        use: generator app name
+        proves: tool
+        leak: true
+        status: VERIFIED
+        source: w5b s7
+        atlas: 'no'
+        atlas_where: 'no SRR parser in Atlas copy (w9a 7: grep finds nothing)'
+      - name: srr_stored_file
+        where: '0x6A stored file: CRC 0x6A6A, flag 0x8000; ADD_SIZE = file size; NAME_SIZE; name; data (nfo, sfv)'
+        type: record
+        read_from: separate_file
+        use: nfo, sfv and sample names and bodies
+        proves: same_uploader
+        leak: true
+        status: VERIFIED
+        source: w5b s7
+        atlas: 'no'
+        atlas_where: 'no SRR parser in Atlas copy (w9a 7: grep finds nothing)'
+      - name: srr_rar_file
+        where: '0x71 RAR file name: CRC 0x7171; flag 0x0001 = recovery removed; NAME_SIZE; name'
+        type: record
+        read_from: separate_file
+        use: RAR volume names of the set
+        proves: alt
+        leak: false
+        status: VERIFIED
+        source: w5b s7
+        atlas: 'no'
+        atlas_where: 'no SRR parser in Atlas copy (w9a 7: grep finds nothing)'
+      - name: srr_oso_hash
+        where: '0x6B OSO hash: file size uint64, 64-bit hash, NAME_SIZE, file name (no path)'
+        type: record
+        read_from: separate_file
+        use: size + hash per video file
+        proves: twin
+        leak: false
+        status: VERIFIED
+        source: w5b s7
+        atlas: 'no'
+        atlas_where: 'no SRR parser in Atlas copy (w9a 7: grep finds nothing)'
+      - name: srr_padding
+        where: '0x6C padding after RAR end block: ADD_SIZE bytes (existing parser has no branch)'
+        type: record
+        read_from: separate_file
+        use: padding length
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w5b s7
+        atlas: 'no'
+        atlas_where: 'no SRR parser in Atlas copy (w9a 7: grep finds nothing)'
+      - name: srr_rar_block_stream
+        where: RAR blocks 0x72-0x7B follow each SRR RAR block in the stream
+        type: record
+        read_from: separate_file
+        use: RAR headers stored inside SRR
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w5b s7
+        atlas: 'no'
+        atlas_where: 'no SRR parser in Atlas copy (w9a 7: grep finds nothing)'
+    partial_decode:
+      codec: none
+      crate: none
+      result: not applicable
+    rust:
+      parse: hand-written (proto/par2_sfv_srr_meta.rs)
+      decode: none
+      crypto: none
+  srs:
+    detect:
+      magic: 53 52 53 46
+      offset: 0
+      note: SRSF in MP3/stream; MKV uses EBML elements
+    structures:
+      containers_and_tracks:
+      - name: srs_detect_srsf
+        where: '''SRSF'' = 53 52 53 46 marker (MP3 and stream; RIFF and MOV chunks)'
+        type: bytes4
+        read_from: full or separate_file
+        use: identify SRS container
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w5b s8
+        atlas: 'no'
+        atlas_where: 'no SRS parser in Atlas copy (w9a 7: "No parser")'
+      - name: srs_mkv_elements
+        where: EBML 0x6A75 ReSampleFile, 0x6B75 ReSampleTrack
+        type: record
+        read_from: separate_file
+        use: MKV sample tracks
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w5b s8
+        atlas: 'no'
+        atlas_where: 'no SRS parser in Atlas copy (w9a 7: "No parser")'
+      - name: srs_container_wrappers
+        where: RIFF chunk SRSF + LE32; MOV atom BE32 + SRSF; FLAC block 0x73; ASF GUID (name only)
+        type: record
+        read_from: separate_file
+        use: wrapper per container
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w5b s8
+        atlas: 'no'
+        atlas_where: 'no SRS parser in Atlas copy (w9a 7: "No parser")'
+      - name: srs_file_flags
+        where: 'FileData uint16: 0x1 SIMPLE_BLOCK_FIX, 0x2 ATTACHMENTS_REMOVED'
+        type: uint16
+        read_from: separate_file
+        use: rebuild mode
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w5b s8
+        atlas: 'no'
+        atlas_where: 'no SRS parser in Atlas copy (w9a 7: "No parser")'
+      - name: srs_app_and_sample_name
+        where: app name (uint16 length + UTF-8); sample basename (uint16 length + UTF-8)
+        type: utf8
+        read_from: separate_file
+        use: which tool; sample name
+        proves: alt
+        leak: false
+        status: VERIFIED
+        source: w5b s8
+        atlas: 'no'
+        atlas_where: 'no SRS parser in Atlas copy (w9a 7: "No parser")'
+      - name: srs_sample_size_crc
+        where: sample size uint64 LE and CRC32 uint32 LE (rebuild must match)
+        type: record
+        read_from: separate_file
+        use: full-sample CRC check
+        proves: twin
+        leak: false
+        status: VERIFIED
+        source: w5b s8
+        atlas: 'no'
+        atlas_where: 'no SRS parser in Atlas copy (w9a 7: "No parser")'
+      - name: srs_track_header
+        where: 'TrackData: flags (0x4 big file, 0x8 big track no), track no, data length, match offset uint64'
+        type: record
+        read_from: separate_file
+        use: locate each track in full file
+        proves: twin
+        leak: false
+        status: VERIFIED
+        source: w5b s8
+        atlas: 'no'
+        atlas_where: 'no SRS parser in Atlas copy (w9a 7: "No parser")'
+      - name: srs_track_signature
+        where: 'signature bytes (length uint16 + bytes): first bytes of the track'
+        type: bytes
+        read_from: separate_file
+        use: find track by content
+        proves: twin
+        leak: false
+        status: VERIFIED
+        source: w5b s8
+        atlas: 'no'
+        atlas_where: 'no SRS parser in Atlas copy (w9a 7: "No parser")'
+      - name: srs_match_offset_sentinel
+        where: match offset 0 is legal for MP3 and stream; -1 = failure
+        type: uint64
+        read_from: separate_file
+        use: interpret offsets
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w5b s8
+        atlas: 'no'
+        atlas_where: 'no SRS parser in Atlas copy (w9a 7: "No parser")'
+      - name: srs_codec_not_stored
+        where: codec, compression and check bytes are not serialized
+        type: derived
+        read_from: separate_file
+        use: codec must come from the sample
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w5b s8
+        atlas: 'no'
+        atlas_where: 'no SRS parser in Atlas copy (w9a 7: "No parser")'
+      - name: srs_vob_rar_signature
+        where: 'VOB sample: track 1 signature starts with ''Rar!'''
+        type: bytes
+        read_from: separate_file
+        use: RAR volume sample
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w5b s8
+        atlas: 'no'
+        atlas_where: 'no SRS parser in Atlas copy (w9a 7: "No parser")'
+      - name: srs_fingerprint_srsp
+        where: SRSP fingerprint sub-block (music)
+        type: record
+        read_from: separate_file
+        use: audio fingerprint
+        proves: none
+        leak: false
+        status: UNVERIFIED
+        source: w5b s8
+        atlas: 'no'
+        atlas_where: 'no SRS parser in Atlas copy (w9a 7: "No parser")'
+    partial_decode:
+      codec: none
+      crate: none
+      result: not applicable
+    rust:
+      parse: hand-written (EBML, RIFF, MOV readers per pyrescene)
+      decode: none
+      crypto: none
+  split_raw:
+    detect:
+      magic: none (classify joined stream)
+      offset: 0
+      note: never classify by extension
+    structures:
+      layout:
+      - name: raw_numeric_suffix_order
+        where: '''.001'', ''.002'' ...: order = numeric suffix; no header'
+        type: derived
+        read_from: separate_file
+        use: volume order
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1c s2.1
+        atlas: 'no'
+        atlas_where: not covered by w9a (no raw .NNN join for generic splits)
+      - name: raw_last_part_shorter
+        where: last part shorter than nominal size; total count = number of parts
+        type: derived
+        read_from: separate_file
+        use: completeness and count
+        proves: none
+        leak: false
+        status: UNVERIFIED
+        source: w1c s2.3
+        atlas: 'no'
+        atlas_where: not covered by w9a
+      - name: raw_classify_by_magic
+        where: 'classify joined stream by magic, not extension: ZIP 50 4B 03 04, 7z, RAR, EBML 1A 45 DF A3, PAR2, gzip 1F 8B, bzip2 42 5A 68, xz FD 37 7A 58 5A 00, zstd 28 B5 2F FD'
+        type: bytes
+        read_from: first_article
+        use: inner format of .001
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1c s2.2; log W8B
+        atlas: parsed
+        atlas_where: 'partial: probe/archive.rs:31-43 (RAR/7z/ZIP) and archive/mod.rs:51-88 (PAR2) per w9a 1.1; gzip/bzip2/xz/zstd/EBML not listed'
+      - name: raw_iso_pvd
+        where: ISO 9660 'CD001' at 0x8001, 0x8801, 0x9001
+        type: ascii
+        read_from: first_article or last_article
+        use: ISO volume detect
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: log W8B
+        atlas: 'no'
+        atlas_where: not covered by w9a (identify handles "images"; ISO CD001 not confirmed)
+      - name: raw_mp4_ftyp
+        where: MP4 'ftyp' at offset 4 (sniff row)
+        type: ascii4
+        read_from: first_article
+        use: MP4 detect
+        proves: none
+        leak: false
+        status: UNVERIFIED
+        source: w8b (MP4 row); w1c s2.2
+        atlas: 'no'
+        atlas_where: not covered by w9a (media module not in copy)
+      - name: raw_nested_offset
+        where: 'nested store archive: inner offset = outer data offset + inner offset; compressed stops at first decoder'
+        type: derived
+        read_from: first_article
+        use: nesting depth rules
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: log W8B
+        atlas: 'no'
+        atlas_where: not covered by w9a
+      - name: raw_par2_only_for_missing
+        where: a missing middle volume is recoverable only via PAR2
+        type: derived
+        read_from: separate_file
+        use: gap handling
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1c s2.3
+        atlas: 'no'
+        atlas_where: not covered by w9a
+      - name: sevenz_logical_split
+        where: '7z split (.7z.001...): logical offsets; header in last volume'
+        type: derived
+        read_from: last_article
+        use: locate header volume
+        proves: none
+        leak: false
+        status: UNVERIFIED
+        source: w1b s7
+        atlas: 'no'
+        atlas_where: steps.rs:353-364 joins articles; logical-offset header search not confirmed
+      - name: rar_newnumbering_names
+        where: RAR .partNN.rar (MHD_NEWNUMBERING) vs old .rNN naming
+        type: derived
+        read_from: first_article
+        use: naming scheme
+        proves: tool
+        leak: true
+        status: VERIFIED
+        source: w5b s2
+        atlas: 'no'
+        atlas_where: not covered by w9a (RAR naming in rar.rs not in w9a 4-7)
+    partial_decode:
+      codec: depends on inner format
+      crate: see inner formats
+      result: not applicable at split level
+    rust:
+      parse: magic classifier (hand table); infer crate as cross-check (usage UNVERIFIED)
+      decode: none
+      crypto: none

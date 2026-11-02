@@ -1,0 +1,126 @@
+# Elementary-stream metadata field catalog (video, HDR, Dolby Vision, audio, frames, fingerprints)
+# Built 2026-11-02 by the "Extract video, HDR and audio stream metadata" research thread.
+# Rust-only: every parse path below avoids ffmpeg/mediainfo/dovi_tool binaries.
+#
+# Keys per field:
+#   where:    bitstream location (NAL/SEI/OBU/frame header) or container fallback
+#   reach:    bytes needed. front = first ~6 articles (CodecPrivate + first keyframe);
+#             rpu1 = first Dolby Vision RPU (in the first keyframe); mid = a mid-file window;
+#             tail = last articles (Cues/Tags/moov); whole = every frame
+#   parse:    crate + entry point, or "own" (small std-only parser; code under research/stream-metadata/code/)
+#   verified: tested   = parsed in Rust from a generated sample and matched ffprobe / the injected value
+#             source   = read in reference source (ffmpeg, MediaInfo, dovi_tool, x264/x265) but not run
+#             unverified
+#   atlas:    what main a29ee52 (src/probe/media.rs) does today: stored | partial | no
+#   use:      describe = shown on the release page / searchable tag
+#             encode   = same-encode key (links twins/alts across remuxes)
+#             film     = same-film key (links different encodes of one title)
+#
+# Crates (all tested in waves 5-7 unless noted):
+#   matroska-demuxer 0.8.1 (MKV front: tracks, CodecPrivate, first frames; no mid-file start)
+#   scuffle-h265 0.2.2 (HEVC SPS + VUI), h264-reader 0.9.0 (AVC SPS/PPS/SEI), scuffle-av1 0.1.4 (av1C + seq header)
+#   dolby_vision 3.4.0 MIT (RPU), hdr10plus 2.1.5 MIT (ST 2094-40)
+#   rust_h265 0.4.0 MIT/Apache, rusty_h265 0.6.2 Apache (HEVC decode, bit-exact 8/10-bit), rust_h264 0.6.0 (AVC decode, bit-exact)
+#   rav1d 1.1.0 BSD-2 (AV1 decode via its C-ABI; not tested), oxideav-mpeg12video 0.0.13 (MPEG-2; wave 7)
+#   image_hasher 3.1.1 / blockhash 1.0.0 (frame hash), rusty-chromaprint 0.3.0 MIT (audio fp), symphonia (AAC/FLAC decode)
+#   oxideav-ac3 0.0.11 MIT (AC-3/E-AC-3 decode; wave 7)
+
+video:
+  codec_config:
+    - {field: codec, where: "MKV CodecID / MP4 sample entry", reach: front, parse: own, verified: tested, atlas: stored, use: describe}
+    - {field: profile_tier_level, where: "hvcC bytes 1-12 / avcC bytes 1-3 / av1C seq_profile+seq_level_idx_0+seq_tier_0", reach: front, parse: "own (hvcC), scuffle-av1 AV1CodecConfigurationRecord", verified: tested, atlas: no, use: describe, note: "HEVC level_idc/30 = level (153 = 5.1)"}
+    - {field: chroma_format, where: "hvcC chromaFormat / SPS chroma_format_idc / av1C subsampling_x/y", reach: front, parse: scuffle-h265 Sps, verified: tested, atlas: no, use: describe}
+    - {field: bit_depth, where: "hvcC bitDepthLumaMinus8 / SPS / av1C high_bitdepth+twelve_bit", reach: front, parse: own/scuffle, verified: tested, atlas: partial, use: describe, note: "Atlas reads MKV Colour BitsPerChannel only; mkvmerge and Lavf leave it empty, so x265 10-bit shows None"}
+    - {field: nal_length_size, where: "hvcC lengthSizeMinusOne / avcC", reach: front, parse: own, verified: tested, atlas: no, use: "needed to walk frames"}
+    - {field: parameter_sets, where: "hvcC arrays (VPS/SPS/PPS + prefix SEI) / avcC SPS+PPS / av1C configOBUs", reach: front, parse: own, verified: tested, atlas: no, use: "feeds SPS parse and decoder", note: "x265 also copies its prefix SEIs (info string, 137, 144) into hvcC"}
+  sps_vui:
+    - {field: coded_size, where: "SPS pic_width/height_in_luma_samples", reach: front, parse: scuffle-h265 / h264-reader, verified: tested, atlas: partial, use: describe, note: "Atlas uses MKV PixelWidth/Height"}
+    - {field: display_size_after_crop, where: "SPS conformance_window / frame_cropping (1088 -> 1080)", reach: front, parse: scuffle-h265 ConformanceWindow, verified: source, atlas: partial, use: describe}
+    - {field: sample_aspect_ratio, where: "VUI aspect_ratio_idc / sar_width/height", reach: front, parse: scuffle-h265 VuiParameters, verified: source, atlas: partial, use: describe, note: "Atlas has MKV DisplayWidth/Height"}
+    - {field: frame_rate, where: "VUI timing num_units_in_tick/time_scale; AVC fps = time_scale/(2*tick); AV1 timing_info or MKV DefaultDuration", reach: front, parse: scuffle-h265 VuiTimingInfo / h264-reader, verified: tested, atlas: partial, use: describe, note: "Atlas uses MKV DefaultDuration only"}
+    - {field: full_range, where: "VUI video_full_range_flag / av1 color_range", reach: front, parse: scuffle-h265 VideoSignalType, verified: tested, atlas: no, use: describe}
+    - {field: colour_primaries, where: "VUI colour_primaries (9 = BT.2020)", reach: front, parse: scuffle-h265, verified: tested, atlas: partial, use: describe, note: "Atlas: MKV Colour only"}
+    - {field: transfer_characteristics, where: "VUI (16 = PQ, 18 = HLG, 1 = BT.709)", reach: front, parse: scuffle-h265, verified: tested, atlas: partial, use: describe, note: "Atlas: MKV Colour only, so ffmpeg/mkvmerge x265 HDR10 files show no HDR or just PQ"}
+    - {field: matrix_coefficients, where: "VUI (9 = BT.2020nc)", reach: front, parse: scuffle-h265, verified: tested, atlas: no, use: describe}
+    - {field: chroma_sample_location, where: "VUI chroma_loc_info", reach: front, parse: scuffle-h265, verified: source, atlas: no, use: describe}
+    - {field: interlace, where: "AVC frame_mbs_only_flag + mb_adaptive_frame_field_flag (PAFF/MBAFF); HEVC field_seq_flag + pic_timing pic_struct; MPEG-2 progressive_sequence", reach: front, parse: h264-reader / own, verified: source, atlas: no, use: "describe (interlaced tag)"}
+    - {field: film_grain, where: "AV1 film_grain_params_present (seq) + apply_grain; AVC/HEVC SEI 19", reach: front, parse: own, verified: source, atlas: no, use: "describe (film grain synthesis)"}
+    - {field: stereo_3d, where: "SEI 45 frame_packing (3 = SBS, 4 = TB); AVC MVC NAL 15/20; MV-HEVC nuh_layer_id > 0", reach: front, parse: own, verified: source, atlas: no, use: "describe (3D)"}
+  sei_and_obu:
+    - {field: x264_info, where: "SEI 5 user_data_unregistered, UUID dc45e9bd-e6d9-48b7-962c-d820d923eeef, first AU only", value: "x264 - core N rNNNN hash - H.264/MPEG-4 AVC codec - Copyleft 2003-YYYY - ... - options: ...", reach: front, parse: "h264-reader user data / own", verified: tested, atlas: no, use: "describe (encoder, crf, preset) + encode"}
+    - {field: x265_info, where: "SEI 5, UUID 2ca2de09-b517-47db-bb55-a4fe7fc2fc4e, first AU (+ hvcC SEI array); gated by --info (default on)", value: "x265 (build N) - ver:bitdepth - H.265/HEVC codec - ... options: ...", reach: front, parse: own, verified: tested, atlas: no, use: "describe + encode"}
+    - {field: other_encoders, where: "none: NVENC, libaom, SVT-AV1, AMF write no identity string; VideoToolbox none fixed", reach: front, parse: n/a, verified: source, atlas: no, use: "absence is itself a weak hint"}
+    - {field: closed_captions, where: "SEI 4 T.35 country 0xB5 provider 0x0031 'GA94' type 0x03, cc_count > 0", reach: front, parse: own, verified: source, atlas: no, use: "describe (CC)"}
+    - {field: hlg_compat, where: "SEI 147 alternative_transfer_characteristics", reach: front, parse: own, verified: source, atlas: no, use: describe}
+    - {field: ambient_viewing, where: "SEI 148", reach: front, parse: own, verified: source, atlas: no, use: describe}
+  frames:
+    - {field: first_idr_payload_hash, where: "hash of the first IDR NAL/OBU payload bytes", reach: front, parse: own, verified: unverified, atlas: no, use: encode, note: "survives remux (MKV <-> MP4), not re-encode"}
+    - {field: keyframe_thumbnail, where: "decode one IDR/CRA", reach: "mid (front IDR is often black)", parse: "rust_h265 / rusty_h265 (HEVC 8/10-bit), rust_h264 (AVC 8/10-bit), rav1d (AV1), oxideav-mpeg12video (MPEG-2)", verified: tested, atlas: no, use: describe, cost: "~10 ms/frame at 720p; 2160p see wave 7"}
+    - {field: frame_phash, where: "decoded luma, crop letterbox (DV L5 or detect), area-downscale 32x32, DCT/median hash", reach: mid, parse: "image_hasher / own", verified: tested, atlas: no, use: film, note: "identical across 8/10-bit and 720p/1080p; 0-3/64 bits to 360p; PQ vs SDR untested"}
+    - {field: gop_structure, where: "MKV SimpleBlock keyframe flag + timestamps; Cues", reach: "front/tail", parse: own walker, verified: tested, atlas: no, use: "describe (keyint) + weak encode"}
+
+hdr10:
+  - {field: mastering_display, where: "HEVC SEI 137 (primaries, white point, max/min luminance); AV1 metadata OBU HDR_MDCV; container fallback MKV MasteringMetadata 0x55D0 / MP4 mdcv", reach: front, parse: own, verified: tested, atlas: partial, use: describe, note: "Atlas only knows a MasteringMetadata element exists; mkvmerge and Lavf do not write it for x265 files"}
+  - {field: max_cll_fall, where: "HEVC SEI 144; AV1 HDR_CLL; MKV MaxCLL 0x55BC / MaxFALL 0x55BD; MP4 clli", reach: front, parse: own, verified: tested, atlas: no, use: describe}
+  - {field: hdr_format_label, where: "derived: PQ + SEI 137 = HDR10; + HDR10+ = HDR10+; + RPU = DV; transfer 18 = HLG", reach: front, parse: own, verified: tested, atlas: partial, use: describe}
+
+hdr10plus:
+  - {field: present, where: "HEVC prefix SEI 4, T.35 0xB5 / 0x003C / 0x0001, app id 4 v1; AV1 T.35 metadata OBU (no country byte)", reach: front, parse: "hdr10plus Hdr10PlusMetadata::parse from the 0xB5 byte", verified: tested, atlas: no, use: describe}
+  - {field: profile, values: "A (no tone mapping, targeted lum 0) / B (bezier curve)", reach: front, parse: hdr10plus set_profile, verified: tested, atlas: no, use: describe}
+  - {field: per_frame, values: "num_windows, targeted_system_display_maximum_luminance, maxscl[3], average_maxrgb, distribution percentiles, bezier anchors", reach: "front (per scene)", parse: hdr10plus, verified: tested, atlas: no, use: describe}
+
+dolby_vision:
+  config:
+    - {field: dv_config_record, where: "MKV BlockAdditionMapping 0x41E4 (BlockAddIDType dvcC/dvvC, ExtraData 0x41ED); MP4 dvcC/dvvC; TS descriptor 0xB0", layout: "u8 major, u8 minor, u16 [profile 7b | level 6b | rpu | el | bl], u8 [compat_id 4b | md_compression 2b | 2 reserved]", reach: front, parse: own, verified: source, atlas: partial, use: describe, note: "Atlas reads profile, level, el flag; not compat id. ffmpeg 6.1 writes no dvcC at all, so use the RPU too"}
+    - {field: compat_id, values: "0 none, 1 HDR10 (8.1), 2 SDR (8.2), 4 HLG (8.4), 6 BD (7.6)", reach: front, parse: own, verified: unverified, atlas: no, use: describe, note: "only the config record separates 8.1 from 8.4"}
+    - {field: dv_level_table, values: "level -> max resolution@fps", verified: unverified, atlas: no, use: describe, note: "Dolby Profiles and Levels PDF not reachable"}
+  rpu:
+    - {field: rpu_parse_failure, note: "dolby_vision 3.4.0 (crates.io) errors on RPUs with Level 253; dovi_tool main handles it. Fall back to dvcC or pin git", verified: tested}
+    - {field: rpu_present, where: "HEVC NAL type 62 (UNSPEC62); AV1 T.35 OBU provider 0x003B", reach: rpu1, parse: "dolby_vision DoviRpu::parse_unspec62_nalu / parse_itu_t35_dovi_metadata_obu", verified: tested, atlas: no, use: describe}
+    - {field: profile, where: "RPU header: vdr_rpu_profile 0 + full range = 5; 1 + el_spatial_resampling + !disable_residual = 7 (10-bit EL) or 4; else 8", reach: rpu1, parse: dolby_vision dovi_profile, verified: tested, atlas: no, use: describe}
+    - {field: el_type, values: "FEL / MEL / none; MEL = NLQ offsets and deadzones all zero", reach: rpu1, parse: dolby_vision el_type, verified: "tested on 11 real P7 dovi_tool fixtures (FEL and MEL all correct)", atlas: partial, use: describe, note: "Atlas has only the dvcC el_present flag"}
+    - {field: cm_version, values: "CM v2.9 levels [1,2,4,5,6,255]; CM v4.0 levels [3,8,9,10,11,254]", reach: rpu1, parse: "dolby_vision vdr_dm_data; decide by levels present (cmv29_metadata is Some even on CMv4)", verified: tested, atlas: no, use: describe}
+    - {field: L1, values: "min/max/avg PQ per shot (u12)", reach: "whole for MaxCLL-style stats", parse: dolby_vision, verified: "tested (min_pq mismatch under study)", atlas: no, use: describe}
+    - {field: L2, values: "per target display: target_max_pq, trim slope/offset/power/chroma_weight/saturation_gain, ms_weight", reach: "rpu1 gives a lower bound; full set needs whole", parse: dolby_vision, verified: tested, atlas: no, use: describe}
+    - {field: L5, values: "active area offsets (letterbox)", reach: rpu1, parse: dolby_vision, verified: tested, atlas: no, use: "describe + crop for frame hash"}
+    - {field: L6, values: "MaxCLL, MaxFALL, mastering max/min luminance (u16)", reach: rpu1, parse: dolby_vision, verified: tested, atlas: no, use: describe}
+    - {field: L8, values: "CMv4 trims per target_display_index incl. mid contrast, clip trim, sat/hue vectors", reach: rpu1, parse: dolby_vision, verified: tested, atlas: no, use: describe}
+    - {field: L9, values: "source primary index or 8 x u16 primaries", reach: rpu1, parse: dolby_vision, verified: tested, atlas: no, use: describe}
+    - {field: L10, values: "target display primaries", reach: rpu1, parse: dolby_vision, verified: source, atlas: no, use: describe}
+    - {field: L11, values: "content_type u8, whitepoint (low nibble), reference_mode_flag (bit 4)", reach: rpu1, parse: dolby_vision, verified: tested, atlas: no, use: describe}
+    - {field: L254, values: "dm_mode, dm_version_index", reach: rpu1, parse: dolby_vision, verified: tested, atlas: no, use: describe}
+    - {field: frame_and_scene_count, where: "count RPUs / scene_refresh_flag", reach: whole, parse: dolby_vision, verified: source, atlas: no, use: describe}
+
+audio:
+  common:
+    - {field: codec_channels_rate, where: "MKV Audio element / MP4 sample entry, confirmed by frame header", reach: front, parse: own, verified: tested, atlas: stored, use: describe}
+    - {field: track_flags, where: "MKV FlagCommentary 0x55AF, FlagHearingImpaired 0x55AB, FlagVisualImpaired 0x55AC, FlagOriginal, Forced 0x55AA, Name, Language", reach: front, parse: own, verified: source, atlas: partial, use: describe}
+    - {field: codec_private_note, note: "MKV A_AC3/A_EAC3/A_TRUEHD/A_DTS CodecPrivate is usually empty: parse frames"}
+  ac3:
+    - {field: bsi, values: "fscod, frmsizecod -> bitrate, bsid, bsmod (service kind), acmod, lfeon, dialnorm (dB = -dialnorm, 0 -> -31), compr, cmixlev, surmixlev, dsurmod (Dolby Surround), roomtyp", where: "syncframe 0x0B77", reach: front, parse: own, verified: "tested (rate/channels/bitrate); options in wave 7", atlas: no, use: describe}
+    - {field: crc2_sequence, where: "last 2 bytes of each syncframe", reach: "front/mid", parse: own, verified: tested, atlas: no, use: encode, note: "identical across MKV/MP4 remux; skip silent runs"}
+  eac3:
+    - {field: bsi, values: "strmtyp (0 independent, 1 dependent), substreamid, frmsiz, acmod, lfeon, dialnorm, chanmap (7.1 via dependent substream)", reach: front, parse: own, verified: "tested (5.1); 7.1 in wave 7", atlas: no, use: describe}
+    - {field: atmos_joc, where: "addbsi eac3_extension_type_a + complexity_index (ffmpeg) or EMDF 0x5838 payload 14 JOC with joc_num_objects (MediaInfo: >= 1/8 of frames); MP4 dec3 tail flag_ec3_extension_type_joc + joc_complexity_index", reach: "front (dec3) / several frames", parse: own, verified: source, atlas: partial, use: describe, note: "Atlas: track name contains 'atmos' only"}
+  truehd:
+    - {field: major_sync, values: "0xF8726FBA, sample rate, 6ch/8ch channel assignment -> layout, is_vbr, peak_bitrate, num_substreams, substream_info", reach: front, parse: own (ffmpeg mlp_parse.c port), verified: "tested: CRC rule verified on every sync of 52 files (12 truehdd fixtures incl. 3 Atmos, 39 real encoder files); CRC covers [sync, sync+C), C=26 (FBB, or FBA byte25 bit0=0) else 28+2*(byte26>>4), stored BE after; truehdd Crc16 poly 0x2D", atlas: no, use: describe}
+    - {field: atmos, where: "FBA sync && substream_info bit 7 (truehdd presentation rule = MediaInfo); flag inconsistent if num_substreams != 4 (ffmpeg rule)", reach: front, parse: own (code/w10c_main.rs), verified: "tested on 3 real Atmos + 49 non-Atmos files, all rules agree", atlas: partial, use: describe, note: "object count is not in the major sync"}
+  dts:
+    - {field: core, values: "sync 0x7FFE8001, amode, sfreq, rate, lfe, pcmr", reach: front, parse: own, verified: tested, atlas: no, use: describe}
+    - {field: hd_and_x, where: "ExSS 0x64582025; XLL 0x41A29547 (MA), XBR 0x655E315E (HRA); DTS:X = XLL extradata sync 0x02000850, IMAX = 0xF14000D0 (>>1)", reach: front, parse: own, verified: source, atlas: no, use: describe, note: "MediaInfo: X sync announces metadata, not proof of objects"}
+  aac:
+    - {field: audio_specific_config, values: "object type (5b, 31 escape), sampling index (0xF -> 24-bit), channel config, SBR (HE-AAC) / PS (HEv2) explicit or 0x2b7/0x548 sync extension", where: "MKV A_AAC CodecPrivate / MP4 esds", reach: front, parse: own, verified: source, atlas: no, use: describe}
+  flac:
+    - {field: streaminfo, values: "rate, channels, bits, total samples, MD5 of decoded PCM", reach: front, parse: own, verified: tested, atlas: no, use: "describe + encode (MD5 is a rename/remux-proof exact audio key)"}
+  opus:
+    - {field: opushead, values: "channels, pre-skip, input rate, mapping family", reach: front, parse: own, verified: source, atlas: no, use: describe}
+  fingerprint:
+    - {field: chromaprint, where: "decoded PCM -> rusty-chromaprint", reach: "mid (2160p remux has < 1 s audio per 5 MB)", parse: "symphonia (AAC/FLAC) or oxideav-ac3 -> rusty-chromaprint match_fingerprints", verified: "tested FLAC vs AAC 0.992, unrelated 0", atlas: no, use: film}
+
+sampling_plan:
+  front: "6 articles: Tracks, CodecPrivate (hvcC SPS + x265 SEI), first keyframe SEI, first DV RPU"
+  tail: "1-5 articles: Cues (front SeekHead gives offset), mkvmerge statistics Tags (BPS, NUMBER_OF_FRAMES), MP4 moov"
+  mid: "3 windows at 25/50/75%: resync on Cluster 1F43B675 (skip CRC-32 0xBF and Void 0xEC before Timestamp 0xE7; known track number; next cluster at offset+size). Tested: keyframe + 10 s audio = 13-16 extra articles at 720p; ~12 (1080p) to ~40 (2160p) per window planned"
+  compressed_archives: "7z LZMA2 and RAR5 prefix decode works (archive thread), so front fields are reachable; mid windows need store mode"
+
+prototype: "code/streamprobe/ (Rust, prints JSON for all phase-1 fields; matches ffprobe on 12 test MKVs). Note: matroska-demuxer follows SeekHead to EOF and fails on partial files; use Atlas's own EBML walker."

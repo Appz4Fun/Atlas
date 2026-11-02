@@ -1,0 +1,5 @@
+[package]
+name = "w10b_walker"
+version = "0.1.0"
+edition = "2021"
+[dependencies]

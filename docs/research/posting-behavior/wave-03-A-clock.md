@@ -1,0 +1,12 @@
+# Wave 3 A: uploader clock fingerprints (07:52Z; WebFetch hit its hourly limit, facts from raw GitHub + search snippets)
+
+1. UTC offset from one BODY: stored .part01.rar article 1 has RAR4 FTIME (DOS LOCAL, 2 s) + start of MKV with Segment Info DateUTC (UTC, ns since 2001). round15min(DOS_mtime - DateUTC) = uploader UTC offset when the uploader remuxed. First-post Date - DateUTC = mux-to-post latency habit. RAR5 mtime is FILETIME or Unix (FHEXTRA_HTIME_UNIXTIME flag) -> Windows desktop vs Linux/seedbox packer. unrar arcread.cpp 1128-1152; matroska.org/technical/elements.html (4, med-high)
+2. Exact inner mtime (+size+name) = same disk copy (repost/same-source key). RAR5 FILETIME 100 ns; ZIP 0x5455 UTC extra vs DOS local gives TZ (Go archive/zip reader.go 484-499); 7z times in end header (last article). (3, high)
+3. PAR2 Creator packet: ParPar writes 'ParPar v<ver> <process.arch> [url]' -> tool version + CPU arch; par2cmdline/MultiPar have their own. ParPar bin/parpar.js:336. (3, high)
+4. Nyuu clock offset, XOVER only: genTime (Message-ID ms == Date) minus arrival interpolated from article numbers (ngPost articles in the same group act as a server clock, since server stamps their Date). Workgroup Windows syncs NTP weekly (604800 s) -> sawtooth offset with machine-specific slope = Kohno-style fingerprint. Caveat: NTP hosts flatten it (Polcak 2014). Kohno 2005 caida.org/catalog/papers/2005_fingerprinting/; Murdoch usenix08 clockskew. (5, med-low)
+5. INN server-assigned Message-ID <radix32(time-673416000)$radix32(pid)$count@domain>: one nnrpd per connection -> same pid + running counter; time to the second. Injection-Info logging-data = same pid. Only when the server assigns IDs. inn lib/messageid.c, nnrpd/post.c 569-640. (4, high mechanism / low coverage)
+6. <hex$0$counter$hex@host> (speedium.nl): first field = hex unix time (2020-05-29); rest guessed counter + server id. Unverified. (4, low)
+7. Circadian "Timeprints" (Johansson et al., Security Informatics 2015): 24x7 hour histograms, cosine similarity; tie-breaker only. (2, medium)
+8. Scene inner mtimes are the group's, so they link reposts, not uploaders; uploader signature = pre time -> first post gap.
+
+Next: real HEAD from 2-3 backbones for $0$ fields / Injection-Date survival; one-BODY "first-article dossier" (RAR host OS/time format/ns, MKV DateUTC + writing app, PAR2 creator) and its uniqueness per uploader; postie Date order vs arrival order may leak per-file batches.

@@ -1,0 +1,6 @@
+# W6A yEnc validation (Haiku)
+- Spec 1.3 (yenc-0.4.0 sdist doc/yenc-draft.1.3.txt): decoder must recompute part size from begin/end and compare with =yend size; pcrc32 required on multipart =yend; crc32 optional. begin/end 1-based inclusive (by example).
+- Checklist: name/size/line present; total if part; 1<=begin<=end<=size; 1<=part<=total; yend part==ybegin part; yend size==end-begin+1==decoded len; CRC of decoded bytes == pcrc32; never fall back to crc32 for a part; across parts name/size/total agree, ranges contiguous and non-overlapping; if crc32 present it must equal combine of pcrc32s. Key only verified parts.
+- Bugs: yencoding 0.1.0 finish_decode uses pcrc32.or(crc32) -> false mismatches; no length checks; double dot-unstuff. Python yenc 0.4.0 string-compares %08x -> false error on unpadded CRC. rapidyenc decoder doesn't verify CRC.
+- Most bugs cause false rejects, not false accepts. Main false-accept risk: valid CRC with wrong offset metadata -> include begin/end/part/size in keys.
+CORRECTIONS (mine): parse pcrc32 as 1-8 hex digits case-insensitive, compare numerically (ngPost/NewsUP unpadded, GoPostStuff uppercase; peers). Some old tools (PowerPost 2004 per peer) omit crc32; treat missing pcrc32 as "unverified part", not error.

@@ -1,0 +1,3 @@
+Counter({'floor(first ms)==date': 1137, 'date later by 1': 26, 'date later by 2-5': 18, 'date later by >5': 2})
+other NZBs 137 all dates multiple of 1000 27 single-date NZBs 85
+other domains [('1469457618.local', 2792), ('UFK', 2582), ('', 2184), ('powerpost2000AA.local', 1572), ('news.astraweb.com', 1007), ('reader.easyusenet.nl', 613), ('news.example', 234), ('news.free.fr', 202)]
