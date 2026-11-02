@@ -389,9 +389,23 @@ fn the_web_ui_end_to_end() {
     assert!(twins.body.contains("Twins 1") && twins.body.contains("Tv.Findword"), "{}", twins.body);
     assert!(twins.body.contains("/ui/release?id=") && twins.body.contains("TWIN"), "{}", twins.body);
     assert!(!twins.body.contains("<script>alert"), "{}", twins.body);
+    // every copy card has the + that opens its facts in place, as a card rather than a table row
+    assert_eq!(twins.body.matches("drawer-toggle").count(), 2, "{}", twins.body);
+    assert!(twins.body.contains(&format!("hx-get=\"/ui/row?id={id}&amp;as=card\"")), "{}", twins.body);
+    let card = fetch(port, &format!("/ui/row?id={id}&as=card"), &cookie);
+    assert_eq!(card.status(), 200);
+    assert!(card.body.starts_with("<div class=\"drawer-card\">") && card.body.ends_with("</div>"), "{}", card.body);
+    assert!(card.body.contains("<dl class=\"facts facts-wide\">") && card.body.contains("Full page"), "{}", card.body);
+    // the drawer reads through the same filtered reader as the page: an unknown id gets no facts, in either shape
+    for shape in ["", "&as=card"] {
+        let none = fetch(port, &format!("/ui/row?id=999999999{shape}"), &cookie);
+        assert_eq!(none.status(), 200);
+        assert!(none.body.contains("There is no such release.") && !none.body.contains("<dl"), "{}", none.body);
+    }
     assert!(fetch(port, "/ui/duplicates?kind=alts", &cookie).body.contains("no alts found yet"));
     let opened = fetch(port, &format!("/ui/release?id={script}"), &cookie);
     assert!(opened.body.contains("Other copies") && opened.body.contains("Tv.Findword"), "{}", opened.body);
+    assert!(opened.body.contains(&format!("hx-get=\"/ui/row?id={id}&amp;as=card\"")), "{}", opened.body);
 
     let nzb = fetch(port, &format!("/ui/nzb?id={id}"), &cookie);
     assert_eq!(nzb.status(), 200);

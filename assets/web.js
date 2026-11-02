@@ -77,16 +77,31 @@ document.addEventListener('htmx:afterSettle', () => {
   read.removeAttribute('data-q');
 });
 
-// A result's drawer: the first click loads it (htmx, once), later clicks fold and unfold it.
+// A drawer: the first click loads it, later clicks fold and unfold it. Under a result row the drawer is the next
+// row; on a copy card or a copy link it is the card appended inside the copy's body or list item.
+const drawerOf = (toggle) => {
+  const row = toggle.closest('tr');
+  const drawer = row
+    ? row.nextElementSibling
+    : toggle.closest('.copy-body, li')?.querySelector(':scope > .drawer-card');
+  const isDrawer = drawer && (drawer.classList.contains('drawer-row') || drawer.classList.contains('drawer-card'));
+  return isDrawer ? drawer : null;
+};
+// In the capture phase, soo a loaded drawer is folded here and the click never reaches htmx on the button: it
+// fetches only while there is no drawer, and a fetch that failed is simply tried again by the next click.
 document.addEventListener('click', (event) => {
   const toggle = event.target.closest('.drawer-toggle');
   if (!toggle) return;
-  const drawer = toggle.closest('tr')?.nextElementSibling;
-  if (!drawer || !drawer.classList.contains('drawer-row')) return;
+  const drawer = drawerOf(toggle);
+  if (!drawer) return;
+  event.stopPropagation();
   drawer.hidden = !drawer.hidden;
   toggle.setAttribute('aria-expanded', String(!drawer.hidden));
-});
+}, true);
+// htmx fires this on the swap target, not on the button: the row, copy body or list item whose + just loaded its
+// drawer, which opens unfolded. The toggle in it takes the drawer's state, soo it reads as open from the first load.
 document.addEventListener('htmx:afterSwap', (event) => {
-  const toggle = event.detail.elt;
-  if (toggle?.classList?.contains('drawer-toggle')) toggle.setAttribute('aria-expanded', 'true');
+  const toggle = event.target instanceof Element ? event.target.querySelector('.drawer-toggle') : null;
+  const drawer = toggle && drawerOf(toggle);
+  if (drawer) toggle.setAttribute('aria-expanded', String(!drawer.hidden));
 });

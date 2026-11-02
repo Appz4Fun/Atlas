@@ -228,6 +228,7 @@ td.dim { color: var(--muted); font-size: .82rem; }
 tr.drawer-row td { padding: 10px 14px 14px; background: var(--sunken); border-top: 0; white-space: normal; }
 tr.drawer-row .dim, .drawer-card .dim { margin: 8px 0 0; font-size: .82rem; }
 .drawer-card { margin-top: 10px; padding: 10px 12px; background: var(--sunken); border-radius: var(--radius-sm); }
+.copy-rest .drawer-card { margin: 6px 0 10px; }
 details.meta { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--line); }
 details.meta summary { cursor: pointer; font: 600 .74rem/1.9 var(--font-mono); letter-spacing: .04em; text-transform: uppercase; color: var(--muted); }
 details.meta summary:hover { color: var(--rust); }
