@@ -12,7 +12,7 @@ Group releases that hold the same content, even when they were posted differentl
 |---|---|---|
 | **Cluster** | Every release known to hold the same content. Its members are linked as pairs or twins. | Only as twins |
 | **Pair** | Same content, different packaging. One is RAR5 and the other is 7z, for example. | No. Each one is a separate download, so its articles can't be swapped in. It's a fallback for the whole release. |
-| **Twin** | Same content and same packaging: same container, same article count, same article sizes. | Yes |
+| **Twin** | The same posting in everything but message-ids: same files and names, same PAR2 set and recovery volumes, same article counts. | Yes |
 
 A different encode of the same title is not the same content, so it's neither a pair nor a twin. RustyGet calls that an alt. Keeping the same meanings for "twin" and "alt" lets Atlas hand its clusters to RustyGet later.
 
@@ -31,7 +31,7 @@ Built on the `feat/release-details` branch. Instead of cluster tables, each rele
 
 ### Done
 
-- [x] **Posted fingerprint:** sizes and MD5s from a complete PAR2 set. Equal ones are byte-identical, which makes a **twin**.
+- [x] **Posted fingerprint:** the PAR2 set, its block size, recovery blocks, each file's name, size and MD5, and articles per file. Equal ones make a **twin**. Sizes on the wire aren't compared, as they count headers that differ between posters.
 - [x] **Content fingerprint:** exact sizes of the real files, at least 1 MiB, leaving out samples, with names ignored. Equal ones with different posted files make a **pair**.
 - [x] Written by the archive and PAR2 steps as releases are read.
 - [x] Web UI: "Other copies" on the release page, with TWIN and PAIR tags, and counts in results.

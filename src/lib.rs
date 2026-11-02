@@ -40,6 +40,7 @@ pub mod ptt;
 pub mod release_info;
 pub mod release_tags;
 pub mod sab;
+pub mod sealed_store;
 pub mod search;
 pub mod stats_dashboard;
 pub mod store;

@@ -1111,6 +1111,7 @@ pub fn run() -> i32 {
     }
 
     crate::metrics::start(&config, crate::metrics::Role::Indexer);
+    crate::sealed_store::spawn_offload(&config.sealed_log, stop.clone());
     if config.metrics.enabled {
         crate::metrics::catalog::spawn(Duration::from_secs(config.metrics.catalog_every_secs), stop.clone());
     }
@@ -1169,6 +1170,10 @@ fn index(config: Config, stop: Arc<AtomicBool>, writing: Option<WriteGuard>) -> 
     };
 
     crate::media::details::start_backfill(stop.clone());
+
+    if let Ok(conn) = crate::db::open() {
+        crate::duplicates::forget_old_twins(&conn);
+    }
 
     let stats = Arc::new(Mutex::new(Stats::new()));
     write_status(true, &groups_label(&config.tracked_groups(), 0), &config.index_mode, false, "running", false, 0);

@@ -327,6 +327,8 @@ Atlas seals each file that is complete, or untouched for three days, into one zs
 
 A release ID tells Atlas which file holds the release, and IDs keep counting up across all 8 files in the order releases are added, so the newest releases still come first.
 
+Sealed articles can live on another machine, on a big disk. Run the service in `sealed-log/` with `docker compose up -d --build` there, and set `sealed_log.addr` and `sealed_log.offload = true` in `config.toml`. The indexer then moves blobs of files untouched for a day: it appends them, reads each back and compares, and only then swaps the blob in `files.blob` for its place in the log. An NZB needs the service up to read those articles, and indexing goes on without it. A shard with articles there can't be compacted, because that would pull them all back, so turn `auto_run_compact` off and reclaim the freed pages with `VACUUM` while the indexer is stopped.
+
 PreDB titles, if you turn them on, live apart in `atlas.predb.db`. Compaction and conversion never touch it. It takes about 153 MB per million titles, and grows by under 2 MB a day.
 
 ### Converting an older database
@@ -607,7 +609,7 @@ Open `http://HOST:PORT/` in a browser to search and browse releases, filter by c
 
 Sign in with the `api_key` from `config.toml`. The browser keeps a cookie for 30 days, derived from the key rather than the key itself, and changing the key signs everyone out. Traffic is plain HTTP, like the API, so keep it on a network you trust.
 
-A release's page lists its other copies, once Atlas has read both: a **twin** has the same posted files, proven by PAR2 hashes, and a **pair** holds files of the same exact sizes packed differently, such as RAR5 and 7z. A release needs its archive or PAR2 set read to take part.
+A release's page lists its other copies, once Atlas has read both: a **twin** is the same posting, with the same files, PAR2 set, recovery volumes and article counts, and a **pair** holds files of the same exact sizes packed differently, such as RAR5 and 7z. A release needs its archive or PAR2 set read to take part.
 
 Duplicates, at the top of each page, lists every set of copies at once. Each copy shows its poster, email, PAR2 files, repair, health, encryption, password, tags, scores and links, so you can choose between them. The scores and posters are the ones already fetched, when someone opened the title.
 
