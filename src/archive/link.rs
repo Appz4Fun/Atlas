@@ -235,10 +235,10 @@ impl LinkStep {
     }
 
     /// Single-file rows near this one that could hold a file of between `sizes` bytes, nearest in time first. Only
-    /// rows with no name of their own: a PAR2 set is anyone's to post, and a made-up one mustn't add its files to a
-    /// release people download by its name. What the article count must be for those sizes is weighed here too,
-    /// roughly, soo a busy group's other rows don't crowd the real one out of the limit; `parts_fit` then weighs each
-    /// closely.
+    /// rows with no name yet, or that lead an upload already: a PAR2 set is anyone's to post, and a made-up one mustn't
+    /// add its files to a release people download by its name. What the article count must be for those sizes is
+    /// weighed here too, roughly, soo a busy group's other rows don't crowd the real one out of the limit; `parts_fit`
+    /// then weighs each closely.
     fn candidates(&self, ctx: &StepCtx<'_>, sizes: (u64, u64)) -> Result<Vec<Candidate>, StepError> {
         let me = ctx.release();
         let Some(posted) = me.posted_date.clone() else { return Ok(Vec::new()) };
@@ -255,7 +255,7 @@ impl LinkStep {
                    and not exists (select 1 from upload_link l where l.release_id = r.id and l.lead_id != r.id)
                    and not exists (select 1 from upload_link_tried t where t.release_id = ?3 and t.candidate_id = r.id)
                    and r.size > 0 and r.parts > 0
-                   and (r.is_obfuscated = 1 or r.display_name is null
+                   and (r.display_name is null
                         or exists (select 1 from upload_link l where l.release_id = r.id and l.lead_id = r.id))
                    and f.expected between ?8 * 1.005 * r.parts / r.size - 2 and ?9 * 1.08 * r.parts / r.size + 2
                  order by abs(julianday(r.posted_date) - julianday(?5))
