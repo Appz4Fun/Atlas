@@ -532,4 +532,23 @@ fn compressed_rar4_goes_on_down() {
     let at = head.data_at.unwrap();
     let (whole, _) = codec::rar3::rar29(&data[at..at + head.packed.unwrap() as usize], head.unpacked, usize::MAX, true);
     assert!(n.inner.len() > 40_000 && whole.starts_with(&n.inner));
+    // split after a few packed bytes: the rest is in the next volume, so nothing past them is made up
+    let data = include_bytes!("../../../tests/fixtures/rar3/compressed_text_rar300.rar");
+    let head = crate::probe::archive::parse(data).unwrap();
+    let at = head.data_at.unwrap();
+    let (whole, _) = codec::rar3::rar29(&data[at..at + head.packed.unwrap() as usize], head.unpacked, usize::MAX, true);
+    let file = 20;
+    assert_eq!(data[file + 2], 0x74);
+    for keep in [10u32, 34, 60] {
+        let mut split = data[..at + keep as usize].to_vec();
+        split[file + 3] |= 0x02;
+        split[file + 7..file + 11].copy_from_slice(&keep.to_le_bytes());
+        let n = unwrap(&split);
+        let stop = n.layers[0].stop.as_deref();
+        assert!(
+            stop == Some("nothing decoded") || whole.starts_with(&n.inner),
+            "kept {keep}: {stop:?} {:?}",
+            String::from_utf8_lossy(&n.inner)
+        );
+    }
 }

@@ -36,9 +36,10 @@ impl See2 {
     }
 
     fn mean(&mut self) -> u32 {
-        let r = (self.summ as i16) >> self.shift;
-        self.summ = self.summ.wrapping_sub(r as u16);
-        (i32::from(r) + i32::from(r == 0)) as u32
+        // unsigned: past 0x7fff a signed shift would make the estimate negative
+        let r = self.summ >> self.shift;
+        self.summ = self.summ.wrapping_sub(r);
+        u32::from(r) + u32::from(r == 0)
     }
 
     fn update(&mut self) {
@@ -1221,6 +1222,13 @@ impl Ppm {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn see_estimates_stay_unsigned_past_0x7fff() {
+        let mut see = See2 { summ: 38766, shift: 7, count: 1 };
+        assert_eq!(see.mean(), 302);
+        assert_eq!(see.summ, 38766 - 302);
+    }
 
     #[test]
     fn a_model_that_runs_out_of_memory_starts_over_without_panicking() {

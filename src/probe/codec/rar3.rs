@@ -86,6 +86,8 @@ struct Filters {
     old_lengths: Vec<u32>,
     last: usize,
     pending: Vec<Pending>,
+    /// where the furthest pending block ends: past the limit, decoding goes on to here
+    reach: usize,
     /// filter bytes still allowed: filters that don't overlap cover each byte once, so more than the output and
     /// one filter's memory is work no real file asks for
     work: usize,
@@ -158,8 +160,8 @@ fn run(st: &mut State<'_>, size: usize, limit: usize, out: &mut Vec<u8>) -> Resu
             return Ok(());
         }
         if out.len() >= goal {
-            let at = out.len();
-            if !st.filters.pending.iter().any(|f| f.start < at && f.start.saturating_add(f.len) > at) {
+            // kept as filters come, not scanned for each byte: thousands of filters would make that slow
+            if out.len() >= st.filters.reach {
                 return Ok(());
             }
         }
@@ -507,6 +509,7 @@ fn add_vm_code(f: &mut Filters, first: u32, code: &[u8], at: usize) -> Result<()
     }
     pos = pos.min(f.kinds.len() - 1);
     f.work = f.work.checked_sub(len as usize).ok_or(Stop::Cut)?;
+    f.reach = f.reach.max((at + start).saturating_add(len as usize));
     f.pending.push(Pending { kind: f.kinds[pos], start: at + start, len: len as usize, regs });
     Ok(())
 }

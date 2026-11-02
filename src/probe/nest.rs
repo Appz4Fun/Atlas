@@ -94,6 +94,8 @@ enum Codec {
         version: u8,
         size: Option<u64>,
         packed: Option<u64>,
+        /// the stream goes on in the next volume
+        continues: bool,
     },
 }
 
@@ -195,9 +197,10 @@ fn decode(codec: Codec, input: &[u8], limit: usize) -> (Vec<u8>, End) {
             let to = packed.and_then(|p| usize::try_from(p).ok()).map_or(input.len(), |p| p.min(input.len()));
             codec::rar5::rar5(&input[..to], extra_dist, size, limit)
         }
-        Codec::Rar4 { version, size, packed } => {
+        Codec::Rar4 { version, size, packed, continues } => {
             let to = packed.and_then(|p| usize::try_from(p).ok()).map_or(input.len(), |p| p.min(input.len()));
-            let complete = packed.is_some_and(|p| p <= input.len() as u64);
+            // a volume's chunk is only the front of the stream
+            let complete = !continues && packed.is_some_and(|p| p <= input.len() as u64);
             let decode = match version {
                 15 => codec::rar15::rar15,
                 20 | 26 => codec::rar20::rar20,
@@ -325,7 +328,12 @@ fn from_entries(data: &[u8]) -> Opened {
     } else if format == "RAR5" {
         View::Stop("a RAR algorithm newer than this knows")
     } else if format == "RAR4" && matches!(head.rar_version, 15 | 20 | 26 | 29 | 36) {
-        let codec = Codec::Rar4 { version: head.rar_version, size: head.unpacked, packed: head.packed };
+        let codec = Codec::Rar4 {
+            version: head.rar_version,
+            size: head.unpacked,
+            packed: head.packed,
+            continues: head.continues,
+        };
         View::Decode { from: at, codec }
     } else {
         View::Stop("no decoder for this yet")
