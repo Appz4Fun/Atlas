@@ -153,36 +153,42 @@ pub fn contents(id: i64) -> Result<Contents> {
 }
 
 pub fn contents_with(conn: &Connection, id: i64) -> Result<Contents> {
-    let s = store::shard_of_id(id);
+    contents_of(conn, &[id])
+}
+
+fn contents_of(conn: &Connection, ids: &[i64]) -> Result<Contents> {
     let mut totals = Contents::default();
-    let mut stmt = conn.prepare(&format!("select filename, expected, seen from s{s}.files where release_id = ?"))?;
-    let files = stmt.query_map([id], |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, Option<i64>>(1)?, store::seen_count(&r.get::<_, Vec<u8>>(2)?)))
-    })?;
-    for file in files {
-        let (filename, expected, seen) = file?;
+    let (files, _) = union_files(conn, ids)?;
+    for (filename, file) in &files {
+        let seen = store::seen_count(&file.seen);
         totals.files += 1;
         totals.articles_seen += seen;
-        let want = expected.unwrap_or(seen).max(seen);
+        let want = file.expected.unwrap_or(seen).max(seen);
         totals.articles_expected += want;
-        if is_recovery_volume(&filename) {
+        if is_recovery_volume(filename) {
             totals.recovery_articles_seen += seen;
             totals.recovery_articles_expected += want;
-        } else if !is_par2(&filename) {
+        } else if !is_par2(filename) {
             totals.data_articles_seen += seen;
             totals.data_articles_expected += want;
         }
-        if is_par2(&filename) {
+        if is_par2(filename) {
             totals.par2_files += 1;
-            totals.recovery_volumes += i64::from(is_recovery_volume(&filename));
-            totals.recovery_blocks += recovery_blocks(&filename);
+            totals.recovery_volumes += i64::from(is_recovery_volume(filename));
+            totals.recovery_blocks += recovery_blocks(filename);
         }
     }
     let mut bytes: HashMap<String, i64> = HashMap::new();
-    store::each_article(conn, id, &mut |article| {
-        *bytes.entry(article.filename.unwrap_or_default()).or_default() += article.bytes.unwrap_or(0);
-        Ok(())
-    })?;
+    let mut counted = std::collections::HashSet::new();
+    for id in ids {
+        store::each_article(conn, *id, &mut |article| {
+            let filename = article.filename.unwrap_or_default();
+            if article.part.is_none() || counted.insert((filename.clone(), article.part)) {
+                *bytes.entry(filename).or_default() += article.bytes.unwrap_or(0);
+            }
+            Ok(())
+        })?;
+    }
     for (filename, size) in bytes {
         if is_recovery_volume(&filename) {
             totals.recovery_bytes += size;
@@ -190,7 +196,7 @@ pub fn contents_with(conn: &Connection, id: i64) -> Result<Contents> {
             totals.data_bytes += size;
         }
     }
-    if let Some((block, blocks)) = crate::duplicates::par2_sizes(conn, id) {
+    if let Some((block, blocks)) = ids.iter().find_map(|id| crate::duplicates::par2_sizes(conn, *id)) {
         totals.par2_block = Some(block);
         totals.par2_blocks = Some(blocks);
     }
@@ -256,7 +262,7 @@ pub fn split_post_with(conn: &Connection, release: &crate::search::ReleaseRow) -
     let (mut ids, mut groups, mut size) = (Vec::new(), Vec::new(), 0);
     for s in 0..store::SHARDS {
         let mut stmt = conn.prepare_cached(&format!(
-            "select id, group_name, coalesce(size, 0) from s{s}.releases where name = ?1 and poster is ?2 limit 64"
+            "select id, group_name, coalesce(size, 0) from s{s}.releases where name = ?1 and poster is ?2 and not atlas_blocked(group_name) limit 64"
         ))?;
         let rows = stmt.query_map(rusqlite::params![posted, release.poster], |r| {
             Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?.unwrap_or_default(), r.get::<_, i64>(2)?))
@@ -278,48 +284,55 @@ pub fn split_post_with(conn: &Connection, release: &crate::search::ReleaseRow) -
     Ok(Some(SplitPost { ids, groups, size, complete }))
 }
 
-/// Whether each file's parts, put together across the releases, are all there.
-fn split_is_complete(conn: &Connection, ids: &[i64]) -> Result<bool> {
-    let mut files: HashMap<String, (Option<i64>, Vec<u8>)> = HashMap::new();
+/// Each file across these releases, by name: what's expected of it, and which parts any of them has.
+struct UnionFile {
+    expected: Option<i64>,
+    seen: Vec<u8>,
+}
+
+fn union_files(conn: &Connection, ids: &[i64]) -> Result<(std::collections::BTreeMap<String, UnionFile>, Option<i64>)> {
+    let mut files: std::collections::BTreeMap<String, UnionFile> = Default::default();
+    let mut file_total = None;
     for id in ids {
         let s = store::shard_of_id(*id);
-        let mut stmt =
-            conn.prepare_cached(&format!("select filename, expected, seen from s{s}.files where release_id = ?"))?;
-        let rows = stmt
-            .query_map([id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<i64>>(1)?, r.get::<_, Vec<u8>>(2)?)))?;
+        let mut stmt = conn.prepare_cached(&format!(
+            "select filename, expected, seen, file_total from s{s}.files where release_id = ?"
+        ))?;
+        let rows = stmt.query_map([id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<i64>>(1)?,
+                r.get::<_, Vec<u8>>(2)?,
+                r.get::<_, Option<i64>>(3)?,
+            ))
+        })?;
         for row in rows {
-            let (filename, expected, seen) = row?;
-            let file = files.entry(filename).or_default();
-            file.0 = file.0.or(expected);
-            if file.1.len() < seen.len() {
-                file.1.resize(seen.len(), 0);
+            let (filename, expected, seen, total) = row?;
+            file_total = file_total.max(total);
+            let file = files.entry(filename).or_insert(UnionFile { expected: None, seen: Vec::new() });
+            file.expected = file.expected.max(expected);
+            if file.seen.len() < seen.len() {
+                file.seen.resize(seen.len(), 0);
             }
-            for (slot, bits) in file.1.iter_mut().zip(seen) {
+            for (slot, bits) in file.seen.iter_mut().zip(seen) {
                 *slot |= bits;
             }
         }
     }
-    Ok(!files.is_empty()
-        && files.values().all(|(expected, seen)| expected.is_some_and(|want| store::seen_count(seen) >= want)))
+    Ok((files, file_total))
 }
 
-/// What's in the whole post, from what one release's `contents` said and the other releases'.
+/// Whether every file the post says it has is there with all its parts, across the releases.
+fn split_is_complete(conn: &Connection, ids: &[i64]) -> Result<bool> {
+    let (files, file_total) = union_files(conn, ids)?;
+    Ok(!files.is_empty()
+        && file_total.is_none_or(|total| files.len() as i64 >= total)
+        && files.values().all(|f| f.expected.is_some_and(|want| store::seen_count(&f.seen) >= want)))
+}
+
+/// What's in the whole post: each file once, and each of its parts once, whichever groups have them.
 pub fn contents_of_split(conn: &Connection, post: &SplitPost) -> Result<Contents> {
-    let mut all = Contents::default();
-    for (at, id) in post.ids.iter().enumerate() {
-        let one = contents_with(conn, *id)?;
-        if at == 0 {
-            all = one;
-            continue;
-        }
-        all.articles_seen = (all.articles_seen + one.articles_seen).min(all.articles_expected);
-        all.data_articles_seen = (all.data_articles_seen + one.data_articles_seen).min(all.data_articles_expected);
-        all.recovery_articles_seen =
-            (all.recovery_articles_seen + one.recovery_articles_seen).min(all.recovery_articles_expected);
-        all.data_bytes += one.data_bytes;
-        all.recovery_bytes += one.recovery_bytes;
-    }
-    Ok(all)
+    contents_of(conn, &post.ids)
 }
 
 /// A From header, split up.

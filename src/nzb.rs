@@ -116,29 +116,33 @@ pub fn build_nzb(release_id: i64) -> Result<Option<String>> {
     crate::metrics::timed("nzb.build", || whole_nzb(release_id))
 }
 
+/// A release's articles and groups. For a post spread over several groups, that's all of them, each part once: it only
+/// makes its files with all of them.
+fn inventory(release: &ReleaseRow) -> Result<(Vec<ArticleRow>, Vec<String>)> {
+    if !release.complete {
+        let conn = crate::db::open()?;
+        if let Some(post) = crate::release_info::split_post_with(&conn, release)? {
+            let mut all = Vec::new();
+            for id in &post.ids {
+                all.extend(crate::store::articles(&conn, *id)?);
+            }
+            all.sort_by(|a, b| (&a.filename, a.part, &a.message_id).cmp(&(&b.filename, b.part, &b.message_id)));
+            all.dedup_by(|a, b| a.filename == b.filename && a.part.is_some() && a.part == b.part);
+            return Ok((all, post.groups));
+        }
+    }
+    Ok((get_articles(release.id)?, vec![release.group_name.clone()]))
+}
+
 fn whole_nzb(release_id: i64) -> Result<Option<String>> {
     let Some(release) = get_release(release_id)? else { return Ok(None) };
-    let articles = get_articles(release_id)?;
+    let (articles, groups) = inventory(&release)?;
 
     if articles.is_empty() {
         return Ok(None);
     }
 
-    // a post spread over several groups only makes its files with all of them
-    let conn = crate::db::open()?;
-    if !release.complete
-        && let Some(post) = crate::release_info::split_post_with(&conn, &release)?
-    {
-        let mut all = Vec::new();
-        for id in &post.ids {
-            all.extend(crate::store::articles(&conn, *id)?);
-        }
-        all.sort_by(|a, b| (&a.filename, a.part, &a.message_id).cmp(&(&b.filename, b.part, &b.message_id)));
-        all.dedup_by(|a, b| a.filename == b.filename && a.part.is_some() && a.part == b.part);
-        return Ok(Some(render_nzb_in(&release, &all, &post.groups)));
-    }
-
-    Ok(Some(render_nzb(&release, &articles)))
+    Ok(Some(render_nzb_in(&release, &articles, &groups)))
 }
 
 /// One file of a release as its own NZB: `file` counts from 1, in the order the release's whole NZB lists them.
@@ -148,11 +152,11 @@ pub fn build_nzb_file(release_id: i64, file: usize) -> Result<Option<String>> {
 
 fn one_file_nzb(release_id: i64, file: usize) -> Result<Option<String>> {
     let Some(release) = get_release(release_id)? else { return Ok(None) };
-    let articles = get_articles(release_id)?;
+    let (articles, groups) = inventory(&release)?;
     // sorted by filename, soo each file's articles are one run
     let mut runs = articles.chunk_by(|a, b| a.filename == b.filename);
     let Some(one) = file.checked_sub(1).and_then(|at| runs.nth(at)) else { return Ok(None) };
-    Ok(Some(render_nzb(&release, one)))
+    Ok(Some(render_nzb_in(&release, one, &groups)))
 }
 
 /// Write the nzb for a release, into `output_dir` or the current dir.

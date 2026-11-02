@@ -200,6 +200,32 @@ fn the_web_ui_end_to_end() {
     );
     let opened = fetch(port, &format!("/ui/release?id={spread_id}"), &cookie);
     assert!(opened.body.contains("COMPLETE") && !opened.body.contains("INCOMPLETE"), "{}", opened.body);
+    assert!(opened.body.contains("2 of 2"), "{}", opened.body);
+    let one_file = fetch(port, &format!("/api?t=get&id={spread_id}&file=1&apikey={KEY}"), "");
+    assert!(one_file.body.contains("split.1@x") && one_file.body.contains("split.2@x"), "{}", one_file.body);
+
+    // parts both groups have count once, and it isn't whole until the missing part comes
+    for (group, part) in [("alt.binaries.g1", 1), ("alt.binaries.g2", 1), ("alt.binaries.g2", 2)] {
+        let one = article("gap.bin", part, 3, &format!("<gap.{group}.{part}@x>"));
+        let size = one.bytes;
+        store::save(
+            &main,
+            &[Release {
+                name: "Gapped.Post.S01E01-GRP".into(),
+                group: group.into(),
+                articles: vec![one],
+                size,
+                complete: false,
+                ..Default::default()
+            }],
+        )
+        .unwrap();
+    }
+    let gapped = fetch(port, "/ui/results?q=Gapped", &cookie);
+    assert!(gapped.body.contains("INCOMPLETE"), "{}", gapped.body);
+    let gap_id = gapped.body.split("/ui/release?id=").nth(1).unwrap().split('"').next().unwrap().to_string();
+    let opened = fetch(port, &format!("/ui/release?id={gap_id}"), &cookie);
+    assert!(opened.body.contains("2 of 3"), "{}", opened.body);
 
     // copies, listed together, with what tells them apart
     assert_eq!(fetch(port, "/ui/duplicates", "").status(), 303);
