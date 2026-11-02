@@ -43,6 +43,7 @@ ureq = { version = "3", default-features = false, features = ["json", "rustls"] 
 webbrowser = "1"
 webpki-roots = "1"
 zstd = "0.13"
+sealed-log = { path = "sealed-log" }
 
 [target.'cfg(unix)'.dependencies]
 signal-hook = "0.4"

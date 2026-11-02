@@ -159,6 +159,7 @@ pub struct Config {
     pub category: CategoryConfig,
     pub media: MediaConfig,
     pub metrics: MetricsConfig,
+    pub sealed_log: SealedLogConfig,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -405,6 +406,45 @@ impl PredbConfig {
     }
 }
 
+/// The `sealed_log` object of config.toml, see the README. Off unless it has an address.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SealedLogConfig {
+    /// host:port of the `sealed-log` service, empty for none
+    pub addr: String,
+    /// move sealed articles there while indexing
+    pub offload: bool,
+    /// the most the move sends a second
+    pub offload_mb_per_second: u64,
+}
+
+impl Default for SealedLogConfig {
+    fn default() -> Self {
+        SealedLogConfig { addr: String::new(), offload: false, offload_mb_per_second: 50 }
+    }
+}
+
+impl SealedLogConfig {
+    fn from_value(v: Option<&Value>) -> SealedLogConfig {
+        let mut c = SealedLogConfig::default();
+        let Some(v) = v else { return c };
+        if let Some(a) = v.get("addr").and_then(Value::as_str) {
+            c.addr = a.to_string();
+        }
+        if let Some(b) = v.get("offload").and_then(as_bool) {
+            c.offload = b;
+        }
+        if let Some(n) = v.get("offload_mb_per_second").and_then(as_int).and_then(|n| u64::try_from(n).ok()) {
+            c.offload_mb_per_second = n.max(1);
+        }
+        c
+    }
+}
+
+/// The file's `sealed_log` object, for anything that reads articles: no keyring.
+pub fn sealed_log_config() -> SealedLogConfig {
+    read_file().map_or_else(SealedLogConfig::default, |v| SealedLogConfig::from_value(v.get("sealed_log")))
+}
+
 /// The `metrics` object of config.toml, see the README. Off unless asked for.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MetricsConfig {
@@ -648,6 +688,7 @@ impl Default for Config {
             archive: ArchiveConfig::default(),
             naming: NamingConfig::default(),
             metrics: MetricsConfig::default(),
+            sealed_log: SealedLogConfig::default(),
             predb: PredbConfig::default(),
             category: CategoryConfig::default(),
             media: MediaConfig::default(),
@@ -797,6 +838,7 @@ impl Config {
             archive: ArchiveConfig::from_value(v.get("archive")),
             naming: NamingConfig::from_value(v.get("naming")),
             metrics: MetricsConfig::from_value(v.get("metrics")),
+            sealed_log: SealedLogConfig::from_value(v.get("sealed_log")),
             predb: PredbConfig::from_value(v.get("predb")),
             category: CategoryConfig::from_value(v.get("category")),
             media: MediaConfig::from_value(v.get("media")),
