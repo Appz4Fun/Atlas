@@ -91,14 +91,28 @@ pub fn twin_fingerprint(files: &[Par2File], block_size: Option<u64>, posted: &[(
 /// Marks a fingerprint as this kind. Ones from before a twin meant all of this are as long as the hash alone.
 const TWIN_VERSION: u8 = 2;
 
-/// Those older ones proved less, soo they go when indexing starts: nothing may lend articles on their word.
+/// Those older ones proved less, soo they go when indexing starts: nothing may lend articles on their word. Their
+/// releases are read again for the new kind, including any whose old fingerprint went before this queued them: they
+/// have a PAR2 set's sizes and no fingerprint, which nothing else leaves behind.
 pub fn forget_old_twins(conn: &Connection) {
+    let bit = crate::postprocess::step::mask(crate::archive::steps::PAR2_STEP);
+    let now = crate::media::http::now_secs();
     for s in 0..store::SHARDS {
+        let old = "(posted is not null and length(posted) != 21) or (posted is null and par2_block is not null)";
         let sql = format!(
-            "update s{s}.release_fingerprint set posted = null where posted is not null and length(posted) != 21"
+            "begin immediate;
+             insert into s{s}.pp_queue (release_id, due_at)
+                 select release_id, {now} from s{s}.release_fingerprint where {old}
+                 on conflict(release_id) do update set due_at = excluded.due_at;
+             update s{s}.pp_state set done = done & ~{bit}, failed = failed & ~{bit}
+                 where release_id in (select release_id from s{s}.release_fingerprint where {old});
+             update s{s}.release_fingerprint set posted = null, par2_block = null, par2_blocks = null where {old};
+             commit;"
         );
-        // a shard that hasn't got the table yet has none
-        let _ = conn.execute(&sql, []);
+        // a shard that hasn't got the tables yet has none
+        if conn.execute_batch(&sql).is_err() {
+            let _ = conn.execute_batch("rollback");
+        }
     }
 }
 
