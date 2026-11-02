@@ -19,8 +19,10 @@ pub(crate) fn check(name: &str, data: &[u8], version: &[u8], decode: Decode) -> 
         assert_eq!(end, End::Done, "{name}: {:?}", head.name);
         assert_eq!(out.len() as u64, size, "{name}: {:?}", head.name);
         assert_eq!(crc32(&out), want, "{name}: {:?}", head.name);
-        // a cut front is a true front
-        for cut in [packed.len() / 3, packed.len() * 2 / 3] {
+        // a cut front is a true front, down to a few bytes, shorter than the margin a cut stream keeps back
+        for cut in
+            [1, 2, 5, 15, 16, 17, 30, packed.len() / 3, packed.len() * 2 / 3].into_iter().filter(|&c| c < packed.len())
+        {
             let (front, _) = decode(&packed[..cut], Some(size), usize::MAX, false);
             assert!(out.starts_with(&front), "{name}: {:?} cut at {cut}", head.name);
         }

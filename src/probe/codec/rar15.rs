@@ -3,7 +3,7 @@
 //! from the format as unrar describes it.
 
 use super::super::lzma::End;
-use super::rarbits::Bits;
+use super::rarbits::{Bits, MARGIN};
 
 const DEC_L1: &[u32] = &[0x8000, 0xa000, 0xc000, 0xd000, 0xe000, 0xea00, 0xee00, 0xf000, 0xf200, 0xf200, 0xffff];
 const POS_L1: [u32; 13] = [0, 0, 0, 2, 3, 5, 7, 11, 16, 20, 24, 32, 32];
@@ -67,6 +67,10 @@ struct State<'a> {
 
 /// One file's packed data, from the front, to `limit` bytes. `complete`: `data` is all of it, not a cut front.
 pub fn rar15(data: &[u8], size: Option<u64>, limit: usize, complete: bool) -> (Vec<u8>, End) {
+    // a cut stream shorter than the margin has no byte that's safe to decode from
+    if !complete && data.len() < MARGIN {
+        return (Vec::new(), End::Cut);
+    }
     let target = size.and_then(|s| usize::try_from(s).ok()).unwrap_or(usize::MAX).min(limit);
     let mut st = State {
         bits: Bits { data, addr: 0, bit: 0 },
@@ -105,7 +109,7 @@ pub fn rar15(data: &[u8], size: Option<u64>, limit: usize, complete: bool) -> (V
         st.ch_set_c[usize::from(i)] = ((256 - i) & 0xff) << 8;
     }
     corr_huff(&mut st.ch_set_b, &mut st.n_to_pl_b);
-    let safe = if complete { data.len() } else { data.len().saturating_sub(16) };
+    let safe = if complete { data.len() } else { data.len() - MARGIN };
     let mut end = End::Done;
     if target > 0 {
         st.get_flags();

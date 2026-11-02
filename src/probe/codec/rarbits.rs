@@ -1,6 +1,9 @@
 //! What RAR's decoders since 2.0 share: big-endian bits, and Huffman tables in RAR's form.
 
 /// Big-endian bits from a byte slice, past whose end reads give zeros: the caller checks `past_end`.
+/// How many bytes a cut stream keeps back: a symbol starting before them has all the lookahead it can read.
+pub const MARGIN: usize = 16;
+
 pub struct Bits<'a> {
     pub data: &'a [u8],
     pub addr: usize,

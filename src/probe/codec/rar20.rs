@@ -3,7 +3,7 @@
 
 use super::super::lzma::End;
 use super::rar3::adapt;
-use super::rarbits::{Bits, Table};
+use super::rarbits::{Bits, MARGIN, Table};
 
 const NC: usize = 298;
 const DC: usize = 48;
@@ -56,10 +56,14 @@ struct State<'a> {
 
 /// One file's packed data, from the front, to `limit` bytes. `complete`: `data` is all of it, not a cut front.
 pub fn rar20(data: &[u8], size: Option<u64>, limit: usize, complete: bool) -> (Vec<u8>, End) {
+    // a cut stream shorter than the margin has no byte that's safe to decode from
+    if !complete && data.len() < MARGIN {
+        return (Vec::new(), End::Cut);
+    }
     let target = size.and_then(|s| usize::try_from(s).ok()).unwrap_or(usize::MAX).min(limit);
     let mut st = State {
         bits: Bits { data, addr: 0, bit: 0 },
-        safe: if complete { data.len() } else { data.len().saturating_sub(16) },
+        safe: if complete { data.len() } else { data.len() - MARGIN },
         old_table: [0; MC * 4],
         reps: [0; 4],
         rep_at: 0,
