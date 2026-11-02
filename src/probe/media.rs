@@ -276,6 +276,8 @@ fn hdr_name(transfer: Option<u64>, mastering: bool) -> Option<String> {
         Some(16) if mastering => Some("HDR10".into()),
         Some(16) => Some("PQ".into()),
         Some(18) => Some("HLG".into()),
+        // mastering data says HDR10 even when the transfer wasn't written down
+        None if mastering => Some("HDR10".into()),
         _ => None,
     }
 }
@@ -765,6 +767,15 @@ fn trak(body: &[u8], info: &mut MediaInfo) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hdr_names_follow_the_transfer_and_mastering_data() {
+        assert_eq!(hdr_name(Some(16), true).as_deref(), Some("HDR10"));
+        assert_eq!(hdr_name(Some(16), false).as_deref(), Some("PQ"));
+        assert_eq!(hdr_name(Some(18), false).as_deref(), Some("HLG"));
+        assert_eq!(hdr_name(None, true).as_deref(), Some("HDR10"));
+        assert_eq!(hdr_name(Some(1), false), None);
+    }
 
     fn el(id: &[u8], body: &[u8]) -> Vec<u8> {
         let mut out = id.to_vec();

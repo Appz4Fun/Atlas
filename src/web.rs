@@ -2063,7 +2063,8 @@ fn poster(args: &HashMap<String, String>) -> ApiResponse {
 
 /// SDR, HDR10, HLG, PQ, DV, or DV with the layer it falls back to: `DV HDR10`.
 fn hdr_summary(v: &crate::probe::media::VideoTrack) -> String {
-    let base = v.hdr.clone();
+    // PQ with no mastering data is HDR10 whose static metadata wasn't carried into the container
+    let base = v.hdr.clone().map(|h| if h == "PQ" { "HDR10 (no mastering data)".to_string() } else { h });
     match (v.dv_profile, base) {
         (Some(p), Some(base)) => format!("DV P{p} + {base}"),
         // profile 5 has no fallback: its colour only DV players get right
@@ -2785,6 +2786,8 @@ mod tests {
         assert_eq!(hdr_summary(&v(Some("HDR10"), None)), "HDR10");
         assert_eq!(hdr_summary(&v(Some("HDR10"), Some(7))), "DV P7 + HDR10");
         assert_eq!(hdr_summary(&v(None, Some(5))), "DV P5");
+        assert_eq!(hdr_summary(&v(Some("HLG"), None)), "HLG");
+        assert_eq!(hdr_summary(&v(Some("PQ"), Some(8))), "DV P8 + HDR10 (no mastering data)");
         assert_eq!(key_options("cpuid=1 preset=slow crf=18.0 aq-mode=3 rc=crf"), "preset=slow crf=18.0 rc=crf");
     }
 
