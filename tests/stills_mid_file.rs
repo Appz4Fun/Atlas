@@ -29,9 +29,15 @@ fn clip(codec: &str) -> Vec<u8> {
 fn volumes(name: &str, inner: &[u8], split: usize) -> (Vec<u8>, Vec<u8>) {
     let fields = r4_file_fields(name.as_bytes(), inner.len() as u32);
     let (one, two) = inner.split_at(split);
-    let first =
-        [R4_MARK.to_vec(), r4_main(0x0001), r4_block(0x74, 0x0002, &fields, Some(one.len() as u32)), one.to_vec()]
-            .concat();
+    // a volume ends with an end-of-archive block that says another follows
+    let first = [
+        R4_MARK.to_vec(),
+        r4_main(0x0001),
+        r4_block(0x74, 0x0002, &fields, Some(one.len() as u32)),
+        one.to_vec(),
+        r4_block(0x7b, 0x4001, &[], None),
+    ]
+    .concat();
     let last = [
         R4_MARK.to_vec(),
         r4_main(0x0001),
@@ -44,7 +50,8 @@ fn volumes(name: &str, inner: &[u8], split: usize) -> (Vec<u8>, Vec<u8>) {
 }
 
 /// Where to split `inner` across two volumes so that one still's keyframe runs from the first into the second:
-/// the middle of a keyframe that's the first one from where some position's article starts.
+/// three bytes before the end of a keyframe that's the first one from where some position's article starts, so the
+/// first volume's end-of-archive block is longer than what's missing.
 fn split_in_a_keyframe(name: &str, inner: &[u8]) -> usize {
     let track = mkv::video_track(inner).unwrap();
     let mut keyframes = Vec::new();
@@ -54,13 +61,13 @@ fn split_in_a_keyframe(name: &str, inner: &[u8]) -> usize {
         from += start + len;
     }
     for &(at, len) in &keyframes {
-        let split = at + len / 2;
+        let split = at + len - 3;
         // the first volume is the biggest, as in a real set
         if split < inner.len() / 2 + 64 {
             continue;
         }
         let (first, last) = volumes(name, inner, split);
-        let header = first.len() - split;
+        let header = first.len() - split - r4_block(0x7b, 0x4001, &[], None).len();
         let (a1, a2) = (first.len().div_ceil(SEGMENT), last.len().div_ceil(SEGMENT));
         for percent in [25, 50, 75] {
             let part = (a1 + a2) * percent / 100;
