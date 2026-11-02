@@ -334,3 +334,24 @@ fn long_names_are_cut() {
     let kept = n.layers[0].name.as_deref().unwrap();
     assert!(kept.len() <= crate::archive::MAX_NAME_BYTES && name.starts_with(kept));
 }
+
+#[test]
+fn zstd_keeps_to_its_limit_and_reads_past_skippable_frames() {
+    let zeros = zstd::encode_all(&vec![0u8; 60_000][..], 3).unwrap();
+    let n = unwrap(&zeros);
+    assert!(n.layers[0].capped);
+    assert!(n.inner.len() <= zeros.len() * MAX_RATIO);
+    let v = video();
+    let mut skippable = vec![0x50, 0x2a, 0x4d, 0x18, 4, 0, 0, 0, 1, 2, 3, 4];
+    skippable.extend(zstd::encode_all(&v[..], 3).unwrap());
+    same(&unwrap(&skippable).inner, &v);
+}
+
+#[test]
+fn a_rar5_name_stays_inside_its_header() {
+    // a name length running past the header into the next one
+    let fields = [&vint(0)[..], &vint(5), &vint(0x20), &vint(0), &[0], &vint(5000), b"a.mkv"].concat();
+    let r = rar5(&[r5_main(), r5_block(2, &fields, &[], Some(b"hello")), r5_end()]);
+    let heads = crate::probe::archive::entries(&r);
+    assert!(heads.iter().all(|h| h.name.is_none()));
+}

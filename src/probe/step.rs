@@ -181,10 +181,15 @@ impl Step for ProbeStep {
             }
             derive(&mut info, wire_bytes, file.expected, last_lines.as_ref());
             let known_last = last_part(&info, last_lines.as_ref(), last_body);
-            info.moviehash = moviehash_of(ctx, file, &files, &front, &info, known_last)?;
+            info.moviehash = moviehash_of(ctx, file, &files, &front, &info, known_last.clone())?;
             // last, being the most it may read: a release's article budget goes to the checks above first
             if !front.is_empty() {
+                let before = info.layers.clone();
                 read_more_front(ctx, file, total, &mut front, &mut info)?;
+                // more of the front can show a bigger file than the one hashed
+                if info.layers != before {
+                    info.moviehash = moviehash_of(ctx, file, &files, &front, &info, known_last)?;
+                }
             }
         }
 

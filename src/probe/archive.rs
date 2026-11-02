@@ -64,6 +64,12 @@ pub fn entries(data: &[u8]) -> Vec<ArchiveHead> {
 
 const MAX_ENTRIES: usize = 256;
 
+/// A file name from an archive's header, cut to what a name needs before any of it is copied.
+fn name_of(raw: &[u8]) -> String {
+    let raw = &raw[..raw.len().min(crate::archive::MAX_NAME_BYTES)];
+    String::from_utf8_lossy(raw).into_owned()
+}
+
 fn first(heads: Vec<ArchiveHead>, format: &str) -> ArchiveHead {
     heads.into_iter().next().unwrap_or_else(|| ArchiveHead { format: format.into(), ..ArchiveHead::default() })
 }
@@ -109,9 +115,10 @@ fn rar4(data: &[u8], max: usize) -> Vec<ArchiveHead> {
                 head.method = method.map(|m| format!("m{}", m.saturating_sub(0x30)));
                 let name_len = usize::from(le16(data, at + 26).unwrap_or(0));
                 let high = if flags & 0x0100 != 0 { 8 } else { 0 };
+                // within this header, and no longer than a name needs
                 head.name = data
-                    .get(at + 32 + high..at + 32 + high + name_len)
-                    .map(|n| String::from_utf8_lossy(n.split(|b| *b == 0).next().unwrap_or(n)).into_owned());
+                    .get(at + 32 + high..(at + 32 + high + name_len).min(at + size))
+                    .map(|n| name_of(n.split(|b| *b == 0).next().unwrap_or(n)));
                 head.encrypted = flags & 0x0004 != 0;
                 head.continues = flags & 0x0002 != 0;
                 head.dir = flags & 0x00e0 == 0x00e0;
@@ -215,10 +222,13 @@ fn rar5_file(data: &[u8], mut p: usize, end: usize, extra: u64, packed: u64, fla
     let name_len = vint(data, &mut p)?;
     head.unpacked = unpacked.filter(|_| file_flags & 8 == 0);
     head.dir = file_flags & 1 != 0;
+    // within this header, and no longer than a name needs
     head.name = usize::try_from(name_len)
         .ok()
-        .and_then(|n| data.get(p..p.checked_add(n)?))
-        .map(|n| String::from_utf8_lossy(n).into_owned());
+        .and_then(|n| p.checked_add(n))
+        .filter(|to| *to <= end)
+        .and_then(|to| data.get(p..to))
+        .map(name_of);
     let method = (info >> 7) & 7;
     head.method = Some(format!("m{method}"));
     let extra_area = usize::try_from(extra).ok().and_then(|e| end.checked_sub(e)).and_then(|from| data.get(from..end));
@@ -283,7 +293,7 @@ fn zip_entry(data: &[u8]) -> ArchiveHead {
         head.unpacked = Some(long_unpacked).filter(|size| *size != u64::from(u32::MAX));
         head.packed = Some(long_packed).filter(|size| *size != u64::from(u32::MAX));
     }
-    head.name = data.get(30..30 + name_len).map(|n| String::from_utf8_lossy(n).into_owned());
+    head.name = data.get(30..30 + name_len).map(name_of);
     head.dir = head.name.as_deref().is_some_and(|n| n.ends_with('/'));
     head.data_at = Some(30 + name_len + extra_len);
     head.continues = later;

@@ -583,7 +583,12 @@ fn unzstd(input: &[u8], limit: usize) -> (Vec<u8>, End) {
         };
         let wrote = dst.pos();
         out.extend_from_slice(&chunk[..wrote]);
-        if hint == 0 && wrote < chunk.len() {
+        if out.len() >= limit {
+            out.truncate(limit);
+            return (out, End::Limit);
+        }
+        // a frame ended, and nothing's left to start another (a skippable frame is followed by the real one)
+        if hint == 0 && wrote < chunk.len() && src.pos() == input.len() {
             return (out, End::Done);
         }
         if wrote == 0 && src.pos() == before {
