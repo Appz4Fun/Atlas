@@ -101,21 +101,22 @@ pub fn parse(
             s.sao_luma = r.flag()?;
             s.sao_chroma = r.flag()?;
         }
-        s.qp = pps.init_qp + r.se()?;
-        let min_qp = -6 * (i32::from(sps.bit_depth_luma) - 8);
-        if !(min_qp..=51).contains(&s.qp) {
+        let qp = i64::from(pps.init_qp) + i64::from(r.se()?);
+        let min_qp = -6 * (i64::from(sps.bit_depth_luma) - 8);
+        if !(min_qp..=51).contains(&qp) {
             return Err(DecodeError::Invalid("slice QP"));
         }
+        s.qp = qp as i32;
         if pps.slice_chroma_qp_offsets {
-            s.cb_qp_offset = r.se()?;
-            s.cr_qp_offset = r.se()?;
+            s.cb_qp_offset = r.se_in(-12..=12, "slice chroma QP offset")?;
+            s.cr_qp_offset = r.se_in(-12..=12, "slice chroma QP offset")?;
         }
         let override_ = pps.deblocking_override && r.flag()?;
         if override_ {
             s.deblocking_disabled = r.flag()?;
             if !s.deblocking_disabled {
-                s.beta_offset = r.se()? * 2;
-                s.tc_offset = r.se()? * 2;
+                s.beta_offset = r.se_in(-6..=6, "beta offset")? * 2;
+                s.tc_offset = r.se_in(-6..=6, "tc offset")? * 2;
             }
         } else {
             s.deblocking_disabled = pps.deblocking_disabled;

@@ -347,7 +347,8 @@ pub fn parse_pps(nal: &[u8]) -> Result<Pps> {
     p.cabac_init_present = r.flag()?;
     r.ue_max(14, "reference count")?;
     r.ue_max(14, "reference count")?;
-    p.init_qp = 26 + r.se()?;
+    // down to -(26 + QpBdOffset), at 16 bits at most
+    p.init_qp = 26 + r.se_in(-74..=25, "init_qp_minus26")?;
     p.constrained_intra_pred = r.flag()?;
     p.transform_skip = r.flag()?;
     if r.flag()? {
@@ -372,8 +373,8 @@ pub fn parse_pps(nal: &[u8]) -> Result<Pps> {
         p.deblocking_override = r.flag()?;
         p.deblocking_disabled = r.flag()?;
         if !p.deblocking_disabled {
-            p.beta_offset = r.se()? * 2;
-            p.tc_offset = r.se()? * 2;
+            p.beta_offset = r.se_in(-6..=6, "beta offset")? * 2;
+            p.tc_offset = r.se_in(-6..=6, "tc offset")? * 2;
         }
     }
     if r.flag()? {

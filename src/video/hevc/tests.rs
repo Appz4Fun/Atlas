@@ -269,3 +269,10 @@ fn a_frame_of_endless_tiny_units_is_refused() {
         crate::video::bits::DecodeError::Invalid("too many NAL units")
     );
 }
+
+#[test]
+fn a_pps_with_a_huge_initial_qp_is_an_error() {
+    let pps: &[u8] = &[0x44, 0x01, 0xc0, 0x60, 0x00, 0x00, 0x03, 0x00, 0x3f, 0xff, 0xff, 0xff, 0x80];
+    assert_eq!(super::params::parse_pps(pps).err(), Some(super::DecodeError::Invalid("init_qp_minus26")));
+    assert!(decode_keyframe(&[pps]).is_err());
+}
