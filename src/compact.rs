@@ -459,6 +459,11 @@ fn compact_shard(
     )?;
     conn.execute("attach database ? as old", [path.to_string_lossy()])?;
     refuse_what_wouldnt_be_copied(&conn, shard)?;
+    if crate::sealed_store::has_places(&conn)? {
+        anyhow::bail!(
+            "shard {shard} has articles in the sealed log: compacting would pull them all back. VACUUM it instead, and turn auto_run_compact off"
+        );
+    }
 
     // how many articles use each domain, as rows and inside sealed blobs
     say("counting domains");

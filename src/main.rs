@@ -25,6 +25,8 @@ fn main() -> ExitCode {
         Err(e) => eprintln!("couldnt convert config.json to config.toml, still using it: {e}"),
     }
 
+    atlas::sealed_store::configure(&atlas::config::sealed_log_config().addr);
+
     let code = if has("--convert") {
         run_convert()
     } else if has("--compact") {

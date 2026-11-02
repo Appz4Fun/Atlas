@@ -613,7 +613,7 @@ impl Search {
                 if self.descending { "descending" } else { "ascending" }
             ),
             None if self.q.is_empty() => "Newest first".to_string(),
-            None => "Best matches first".to_string(),
+            None => "Best or newest matches first".to_string(),
         };
         let mut scope = String::new();
         for (name, value) in self.fields.chosen() {
@@ -1944,7 +1944,7 @@ mod tests {
                 descending: true
             }
             .summary()
-            .contains("Best matches first")
+            .contains("Best or newest matches first")
         );
     }
 
