@@ -522,8 +522,9 @@ def sealed_log():
     b.stat("Freed from shards in range", 'sum(increase(atlas_sealed_log_offload_bytes_total{kind="freed"}[$__range]))', "bytes", w=4,
            description="Blob bytes the swaps took out of the shards. SQLite gives the space back only after a VACUUM.")
     b.stat("Errors in range",
-           f"sum(increase(sealed_log_request_errors_total{{{svc}}}[$__range])) + sum(increase(sealed_log_commit_failures_total{{{svc}}}[$__range]))"
-           " + sum(increase(atlas_sealed_log_offload_failures_total[$__range]))", w=3, thresholds=GOOD_BAD,
+           f"(sum(increase(sealed_log_request_errors_total{{{svc}}}[$__range])) or vector(0))"
+           f" + (sum(increase(sealed_log_commit_failures_total{{{svc}}}[$__range])) or vector(0))"
+           " + (sum(increase(atlas_sealed_log_offload_failures_total[$__range])) or vector(0))", w=3, thresholds=GOOD_BAD,
            description="Failed requests and commits in the service, and failed offload batches in Atlas.")
 
     b.row("Throughput")

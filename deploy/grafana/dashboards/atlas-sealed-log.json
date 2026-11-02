@@ -514,7 +514,7 @@
    },
    "targets": [
     {
-     "expr": "sum(increase(sealed_log_request_errors_total{job=\"sealed-log\"}[$__range])) + sum(increase(sealed_log_commit_failures_total{job=\"sealed-log\"}[$__range])) + sum(increase(atlas_sealed_log_offload_failures_total[$__range]))",
+     "expr": "(sum(increase(sealed_log_request_errors_total{job=\"sealed-log\"}[$__range])) or vector(0)) + (sum(increase(sealed_log_commit_failures_total{job=\"sealed-log\"}[$__range])) or vector(0)) + (sum(increase(atlas_sealed_log_offload_failures_total[$__range])) or vector(0))",
      "legendFormat": "__auto",
      "editorMode": "code",
      "instant": true,
