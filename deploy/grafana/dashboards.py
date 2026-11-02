@@ -476,7 +476,7 @@ def system():
     b.stat("Indexer started", 'atlas_process_start_time_seconds{role="indexer"} * 1000', "dateTimeAsIso", w=6)
     b.stat("API started", 'atlas_process_start_time_seconds{role="api"} * 1000', "dateTimeAsIso", w=6)
     b.stat("Time to answer a scrape", "max(atlas_scrape_render_seconds)", "s", w=6)
-    b.graph("Scrape up", [q('up{job="atlas"}', "{{role}}")], description="A gap is Atlas restarting or the Mac being away; the scrape picks up by itself.")
+    b.graph("Scrape up", [q('up{job="atlas"}', "{{role}}")], description="A gap is Atlas restarting or the machine being away; the scrape picks up by itself.")
     b.graph("Restarts", [q("changes(atlas_process_start_time_seconds[1h])", "{{role}}")], description="Starts in the last hour, per process.")
     b.graph("CPU cores used", [q("rate(atlas_process_cpu_milliseconds_total[5m]) / 1000", "{{role}}")])
     b.graph("Memory", [q("atlas_process_resident_memory_bytes", "{{role}}")], "bytes")

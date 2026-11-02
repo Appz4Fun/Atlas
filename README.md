@@ -817,6 +817,49 @@ python3 deploy/grafana/dashboards.py build
 GRAFANA_USER=admin GRAFANA_PASSWORD=... python3 deploy/grafana/dashboards.py push http://grafana:3000
 ```
 
+You can also import them by hand from [`grafana/`](grafana/). The [dashboards page](https://appz4fun.github.io/Atlas/) shows all six.
+
+The screenshots come from a real instance, with its address, host name and news server names replaced by placeholders.
+
+**Overview**
+
+![Grafana overview dashboard](grafana/screenshots/atlas-overview.png)
+
+<details>
+<summary>Database and process</summary>
+
+![Grafana database and process dashboard](grafana/screenshots/atlas-system.png)
+
+</details>
+
+<details>
+<summary>Functions</summary>
+
+![Grafana functions dashboard](grafana/screenshots/atlas-functions.png)
+
+</details>
+
+<details>
+<summary>NNTP servers</summary>
+
+![Grafana NNTP servers dashboard](grafana/screenshots/atlas-nntp.png)
+
+</details>
+
+<details>
+<summary>Pipeline</summary>
+
+![Grafana pipeline dashboard](grafana/screenshots/atlas-pipeline.png)
+
+</details>
+
+<details>
+<summary>Releases and content</summary>
+
+![Grafana releases and content dashboard](grafana/screenshots/atlas-content.png)
+
+</details>
+
 ## Environment variables
 
 | Variable | Description |
@@ -893,6 +936,7 @@ CI (`.github/workflows/ci.yml`) checks formatting, runs clippy, and runs the tes
 | `src/api.rs`, `src/nzb.rs` | Newznab API and NZB building. |
 | `src/metrics/` | The registry, every metric's name, the `/metrics` listener, and the catalog walk. |
 | `deploy/` | The scrape config and the Grafana dashboards. |
+| `grafana/` | The dashboards exported for import, their screenshots and the GitHub Pages site. |
 | `src/app.rs`, `src/ui.rs`, `src/groups_menu.rs`, `src/ai.rs` | The terminal menus and AI search. |
 | `src/dashboard.rs`, `src/stats_dashboard.rs` | The live dashboard and the stats dashboard. |
 | `src/profile.rs` | Timing counters for `ATLAS_PROFILE`, and the load counters behind the Bottleneck page. |

@@ -403,7 +403,7 @@
    "id": 8,
    "type": "timeseries",
    "title": "Scrape up",
-   "description": "A gap is Atlas restarting or the Mac being away; the scrape picks up by itself.",
+   "description": "A gap is Atlas restarting or the machine being away; the scrape picks up by itself.",
    "datasource": {
     "type": "prometheus",
     "uid": "victoriametrics"
