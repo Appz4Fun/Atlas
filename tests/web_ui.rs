@@ -131,6 +131,16 @@ fn the_web_ui_end_to_end() {
             .contains(r#"name="group" value="alt.binaries.g1""#)
     );
 
+    let sorted = fetch(port, "/ui/results?sort=name&dir=asc", &cookie);
+    assert!(sorted.body.find("&lt;script&gt;").unwrap() < sorted.body.find("Tv.Findword").unwrap(), "{}", sorted.body);
+    let sorted = fetch(port, "/ui/results?sort=name&dir=desc", &cookie);
+    assert!(sorted.body.find("&lt;script&gt;").unwrap() > sorted.body.find("Tv.Findword").unwrap(), "{}", sorted.body);
+    assert!(sorted.body.contains("sort=name&amp;dir=asc"), "the heading flips: {}", sorted.body);
+    let by_group = fetch(port, "/ui/results?group=alt.binaries.g1", &cookie);
+    assert!(by_group.body.contains("Findword") && by_group.body.contains("1 release"), "{}", by_group.body);
+    assert!(!by_group.body.contains("alert(1)"), "{}", by_group.body);
+    assert_eq!(by_group.header("HX-Push-Url").as_deref(), Some("/?group=alt.binaries.g1"));
+
     let by_cat = fetch(port, "/ui/results?cat=5000", &cookie);
     assert!(by_cat.body.contains("Findword") && !by_cat.body.contains("alert(1)"), "{}", by_cat.body);
     assert!(fetch(port, "/ui/results?q=nothinglikethis", &cookie).body.contains("nothing matches"));
@@ -146,6 +156,25 @@ fn the_web_ui_end_to_end() {
     );
     assert_eq!(fetch(port, "/ui/release?id=999999999", &cookie).status(), 404);
     assert_eq!(fetch(port, &format!("/ui/release?id={id}"), "").status(), 303);
+
+    // copies, listed together, with what tells them apart
+    assert_eq!(fetch(port, "/ui/duplicates", "").status(), 303);
+    assert!(fetch(port, "/ui/duplicates", &cookie).body.contains("no twins found yet"));
+    let script: i64 = {
+        let shard = db::open_shard(&store::shard_path(&main, store::shard_of("alt.binaries.g2"))).unwrap();
+        let script = shard.query_row("select id from releases where group_name = 'alt.binaries.g2'", [], |r| r.get(0));
+        let script: i64 = script.unwrap();
+        shard.execute(atlas::duplicates::SET_POSTED, rusqlite::params![script, b"same".as_slice()]).unwrap();
+        script
+    };
+    shard.execute(atlas::duplicates::SET_POSTED, rusqlite::params![id, b"same".as_slice()]).unwrap();
+    let twins = fetch(port, "/ui/duplicates?kind=twins", &cookie);
+    assert!(twins.body.contains("Twins 1") && twins.body.contains("Tv.Findword"), "{}", twins.body);
+    assert!(twins.body.contains("/ui/release?id=") && twins.body.contains("TWIN"), "{}", twins.body);
+    assert!(!twins.body.contains("<script>alert"), "{}", twins.body);
+    assert!(fetch(port, "/ui/duplicates?kind=pairs", &cookie).body.contains("no pairs found yet"));
+    let opened = fetch(port, &format!("/ui/release?id={script}"), &cookie);
+    assert!(opened.body.contains("Other copies") && opened.body.contains("Tv.Findword"), "{}", opened.body);
 
     let nzb = fetch(port, &format!("/ui/nzb?id={id}"), &cookie);
     assert_eq!(nzb.status(), 200);

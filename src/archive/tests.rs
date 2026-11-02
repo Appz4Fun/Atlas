@@ -202,7 +202,7 @@ mod rar_tests {
             let check = l.password_check.expect("a check value");
             assert_eq!(check.accepts("password"), Some(true));
             assert_eq!(check.accepts("wrong"), Some(false));
-            assert_eq!(rar::PasswordCheck::from_bytes(&check.to_bytes()), Some(check));
+            assert_eq!(PasswordTest::from_bytes(&check.to_bytes()), Some(check));
         }
         let many = rar::PasswordCheck { kdf: 30, salt: [0; 16], check: [0; 8] };
         assert_eq!(many.accepts("x"), None, "too slow to try");
@@ -713,7 +713,7 @@ mod select_tests {
             archive: ArchiveConfig { enabled: archive, ..Default::default() },
             ..Config::default()
         };
-        assert!(!stage_owns_names(&Config::default()), "an existing config.toml");
+        assert!(stage_owns_names(&Config::default()), "an existing config.toml");
         assert!(!stage_owns_names(&config(false, 300, true)), "the stage is off");
         assert!(stage_owns_names(&config(true, 300, true)), "a body budget");
         assert!(!stage_owns_names(&config(true, 300, false)), "the budget serves other parts");

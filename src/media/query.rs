@@ -480,6 +480,7 @@ mod tests {
     #[test]
     fn tvdb_offers_only_what_it_fills() {
         let mut cfg = MediaConfig::default();
+        cfg.tvmaze.enabled = false;
         cfg.tvdb.api_key = "K".into();
         let on = id_params(&cfg, false);
         let tv = IdSet { tvdb: true, imdb: true, tvmaze: true, tmdb: true, ..IdSet::default() };
@@ -521,7 +522,9 @@ mod tests {
 
     #[test]
     fn id_params_table() {
-        let default = MediaConfig::default();
+        let mut default = MediaConfig::default();
+        assert!(id_params(&default, false).tv.tvmaze, "tvmaze is on unless turned off");
+        default.tvmaze.enabled = false;
         let on = id_params(&default, false);
         assert_eq!(on, IdParams::default());
         let budget = id_params(&default, true);

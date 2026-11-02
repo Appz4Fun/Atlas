@@ -303,6 +303,29 @@ pub fn serve(stream: TcpStream, state: &Server, over_limit: bool) {
                     }
                 }
             }
+            "STAT" => {
+                let there = posts_lock().iter().any(|p| p.message_id == arg);
+                send(&mut out, if there { &b"223 0 there"[..] } else { &b"430 no such article"[..] });
+            }
+            "ARTICLE" => match posts_lock().iter().find(|p| p.message_id == arg).filter(|_| state.bodies) {
+                Some(post) => {
+                    send(&mut out, b"220 0 article");
+                    send(&mut out, b"From: tester@example.org");
+                    send(&mut out, b"User-Agent: Nyuu/0.4.2");
+                    send(&mut out, b"Path: news.example!not-for-mail");
+                    send(&mut out, b"Xref: news alt.binaries.test:1 alt.binaries.other:2");
+                    send(&mut out, b"");
+                    for line in &post.body {
+                        let mut line = line.clone();
+                        if line.first() == Some(&b'.') {
+                            line.insert(0, b'.');
+                        }
+                        send(&mut out, &line);
+                    }
+                    send(&mut out, b".");
+                }
+                None => send(&mut out, b"430 no such article"),
+            },
             "BODY" if state.body_trouble => send(&mut out, b"502 try later"),
             "BODY" => match posts_lock().iter().find(|p| p.message_id == arg).filter(|_| state.bodies) {
                 Some(p) => {

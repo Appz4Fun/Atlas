@@ -40,7 +40,7 @@ pub(crate) fn first_article(ctx: &StepCtx<'_>, file: &FileInfo) -> Result<Option
 }
 
 /// A file's last articles, last one last. Empty when its last isnt indexed.
-fn tail_articles(ctx: &StepCtx<'_>, file: &FileInfo) -> Result<Vec<SegmentRef>, StepError> {
+pub(crate) fn tail_articles(ctx: &StepCtx<'_>, file: &FileInfo) -> Result<Vec<SegmentRef>, StepError> {
     let segs = ctx.segments(file.id, &SegmentPick::Last(2)).map_err(retry)?;
     let last_is_there = match (file.expected, segs.last().and_then(|s| s.part)) {
         (Some(expected), Some(part)) => part == expected,
@@ -302,7 +302,8 @@ fn budgeted(
 fn zip_list(ctx: &mut StepCtx<'_>, head: &Head<'_>, body: &[u8], left: &mut usize) -> Result<Listing, StepError> {
     let in_body = zip::list_tail(body);
     if !in_body.files.is_empty() {
-        return Ok(in_body);
+        // with the first entry's password check, which only the local header has
+        return Ok(zip::list(body, body));
     }
     let segs = tail_articles(ctx, head.tail)?;
     let Some(last) = segs.last() else { return Ok(zip::list(body, &[])) };

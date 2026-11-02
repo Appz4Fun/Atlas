@@ -1260,6 +1260,7 @@ mod tests {
     #[test]
     fn a_provider_turning_on_or_off_rebuilds() {
         let mut config = Config::default();
+        config.media.tvmaze.enabled = false;
         let before = stage_shape(&config);
         config.media.tvmaze.enabled = true;
         assert_ne!(stage_shape(&config), before);

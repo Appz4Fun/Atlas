@@ -280,7 +280,7 @@ fn release_attrs(r: &crate::search::ReleaseRow, copies: Option<&crate::duplicate
     add("poster", r.poster.as_deref().unwrap_or_default());
     add("group", &r.group_name);
     add("resolution", tags.resolution.as_deref().unwrap_or_default());
-    add("video", tags.codec.unwrap_or_default());
+    add("video", tags.codec.as_deref().unwrap_or_default());
     add("audio", &tags.audio.join(", "));
     add("hdr", &tags.hdr.join(", "));
     add("source", tags.quality.as_deref().unwrap_or_default());

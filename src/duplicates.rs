@@ -192,6 +192,86 @@ pub fn copies(id: i64) -> db::Result<Vec<(Copy, ReleaseRow)>> {
     copies_with(&db::open()?, id)
 }
 
+/// Which copies a list of clusters is of.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClusterKind {
+    Twins,
+    Pairs,
+}
+
+impl ClusterKind {
+    pub fn column(self) -> &'static str {
+        match self {
+            ClusterKind::Twins => "posted",
+            ClusterKind::Pairs => "content",
+        }
+    }
+}
+
+/// Every fingerprint in every shard, as `release_id, posted, content`. Empty: no shard has the table yet.
+fn all_fingerprints(conn: &Connection) -> String {
+    (0..store::SHARDS)
+        .filter(|s| conn.prepare(&format!("select 1 from s{s}.release_fingerprint limit 0")).is_ok())
+        // a row can outlive its release, and a blocked group's are never shown
+        .map(|s| {
+            format!(
+                "select f.release_id, f.posted, f.content from s{s}.release_fingerprint f
+                 join s{s}.releases r on r.id = f.release_id where not atlas_blocked(r.group_name)"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" union all ")
+}
+
+/// Which fingerprints make a cluster: twins are equal posted files, and a pair has to differ in them.
+fn cluster_sql(conn: &Connection, kind: ClusterKind) -> Option<String> {
+    let all = all_fingerprints(conn);
+    if all.is_empty() {
+        return None;
+    }
+    let column = kind.column();
+    let copies = match kind {
+        ClusterKind::Twins => "count(*)",
+        ClusterKind::Pairs => "count(distinct coalesce(posted, release_id))",
+    };
+    Some(format!(
+        "select {column} as fingerprint, count(*) as members from ({all}) where {column} is not null
+         group by {column} having {copies} > 1"
+    ))
+}
+
+/// How many clusters there are of this kind.
+pub fn cluster_count_with(conn: &Connection, kind: ClusterKind) -> db::Result<i64> {
+    let Some(sql) = cluster_sql(conn, kind) else { return Ok(0) };
+    conn.query_row(&format!("select count(*) from ({sql})"), [], |r| r.get(0))
+}
+
+/// A page of clusters, biggest first, each as the releases in it. Every release of a cluster is listed, up to
+/// `MAX_COPIES` a shard.
+pub fn clusters_with(
+    conn: &Connection,
+    kind: ClusterKind,
+    offset: i64,
+    limit: i64,
+) -> db::Result<Vec<Vec<ReleaseRow>>> {
+    let Some(sql) = cluster_sql(conn, kind) else { return Ok(Vec::new()) };
+    let mut stmt =
+        conn.prepare(&format!("select fingerprint from ({sql}) order by members desc, fingerprint limit ? offset ?"))?;
+    let prints = stmt.query_map([limit, offset], |r| r.get::<_, Vec<u8>>(0))?.collect::<db::Result<Vec<_>>>()?;
+    let mut out = Vec::with_capacity(prints.len());
+    for print in prints {
+        let mut members = Vec::new();
+        // no release has id 0, soo nothing is left out
+        for id in matching(conn, kind.column(), &print, 0)? {
+            members.extend(get_release_with(conn, id)?);
+        }
+        if members.len() > 1 {
+            out.push(members);
+        }
+    }
+    Ok(out)
+}
+
 /// How many other copies a release has.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CopyCount {
