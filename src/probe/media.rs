@@ -133,7 +133,8 @@ fn float(b: &[u8]) -> Option<f64> {
 }
 
 fn text(b: &[u8]) -> String {
-    String::from_utf8_lossy(b).trim_end_matches('\0').trim().to_string()
+    let whole = String::from_utf8_lossy(b.get(..MAX_TRACK_TEXT * 4).unwrap_or(b));
+    whole.trim_end_matches('\0').trim().chars().take(MAX_TRACK_TEXT).collect()
 }
 
 #[derive(Default)]
@@ -287,7 +288,19 @@ fn segment(body: &[u8], info: &mut MediaInfo) {
     });
 }
 
+/// The most tracks kept. Real files have a few dozen at most, and these come from Usenet.
+const MAX_TRACKS: usize = 128;
+/// The most characters kept of a track's codec, name or language.
+const MAX_TRACK_TEXT: usize = 256;
+
+fn is_full(info: &MediaInfo) -> bool {
+    info.video.len() + info.audio.len() + info.subtitles.len() >= MAX_TRACKS
+}
+
 fn add_track(t: Track, info: &mut MediaInfo) {
+    if is_full(info) {
+        return;
+    }
     match t.kind {
         1 => info.video.push(VideoTrack {
             hdr: hdr_name(t.transfer, t.mastering),
@@ -393,6 +406,9 @@ fn mp4_language(code: u16) -> Option<String> {
 }
 
 fn trak(body: &[u8], info: &mut MediaInfo) {
+    if is_full(info) {
+        return;
+    }
     let (mut handler, mut language, mut entry): ([u8; 4], Option<String>, Option<Vec<u8>>) = ([0; 4], None, None);
     boxes(body, &mut |kind, v| {
         if kind == b"mdia" {
@@ -509,6 +525,17 @@ mod tests {
         .concat();
         [el(&[0x1A, 0x45, 0xDF, 0xA3], &el(&[0x42, 0x82], b"matroska")), el(&[0x18, 0x53, 0x80, 0x67], &segment)]
             .concat()
+    }
+
+    #[test]
+    fn a_flood_of_tracks_is_cut_short() {
+        let video = el(&[0x83], &[1]);
+        let entry = el(&[0xAE], &video);
+        let tracks = el(&[0x16, 0x54, 0xAE, 0x6B], &entry.repeat(MAX_TRACKS * 2));
+        let segment = el(&[0x18, 0x53, 0x80, 0x67], &tracks);
+        let data = [el(&[0x1A, 0x45, 0xDF, 0xA3], &el(&[0x42, 0x82], b"matroska")), segment].concat();
+        assert_eq!(parse(&data).unwrap().video.len(), MAX_TRACKS);
+        assert_eq!(text(&[b'a'; 10_000]).len(), MAX_TRACK_TEXT);
     }
 
     #[test]

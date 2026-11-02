@@ -438,10 +438,16 @@ pub fn for_title(cfg: &MediaConfig, kind: i64, ids: &Ids) -> Option<Details> {
     let tmdb_on = !cfg.tmdb.api_key.is_empty();
     let asked = sources.as_deref().filter(|_| tmdb_on);
     let tmdb_id = ids.tmdb.or_else(|| lookup(&conn, asked, kind, ids, now));
+    let own = ids.tvdb.filter(|_| kind == Kind::Tv as i64);
+    let own_kept = own.and_then(|tvdb| read(&conn, kind, -tvdb).ok().flatten());
     if let Some(tmdb_id) = tmdb_id {
         let kept = read(&conn, kind, tmdb_id).ok().flatten();
         if kept.as_ref().is_some_and(|d| now - d.fetched_at < KEEP_FOR) {
             return kept;
+        }
+        // TheTVDB's record is only kept when TMDB had none, soo TMDB isn't asked again until it's old
+        if own_kept.as_ref().is_some_and(|d| now - d.fetched_at < KEEP_FOR) {
+            return own_kept;
         }
         if tmdb_on {
             match asked?.fetch(kind, tmdb_id, ids, now) {
@@ -450,10 +456,7 @@ pub fn for_title(cfg: &MediaConfig, kind: i64, ids: &Ids) -> Option<Details> {
                     return Some(fresh);
                 }
                 // a failure says nothing about the title
-                Err(()) => {
-                    let own = ids.tvdb.filter(|_| kind == Kind::Tv as i64);
-                    return kept.or_else(|| read(&conn, kind, -own?).ok().flatten());
-                }
+                Err(()) => return kept.or(own_kept),
                 // gone from TMDB: TheTVDB may still have it
                 Ok(None) => {}
             }
@@ -463,12 +466,11 @@ pub fn for_title(cfg: &MediaConfig, kind: i64, ids: &Ids) -> Option<Details> {
         }
     }
     // a show TMDB has no record of, or no TMDB key
-    let tvdb_id = ids.tvdb.filter(|_| kind == Kind::Tv as i64)?;
-    let kept = read(&conn, kind, -tvdb_id).ok().flatten();
-    if kept.as_ref().is_some_and(|d| now - d.fetched_at < KEEP_FOR) {
-        return kept;
+    let tvdb_id = own?;
+    if own_kept.as_ref().is_some_and(|d| now - d.fetched_at < KEEP_FOR) {
+        return own_kept;
     }
-    let Some(fresh) = sources.and_then(|s| s.fetch_tvdb(tvdb_id, ids, now)) else { return kept };
+    let Some(fresh) = sources.and_then(|s| s.fetch_tvdb(tvdb_id, ids, now)) else { return own_kept };
     let _ = write(&conn, &fresh);
     Some(fresh)
 }

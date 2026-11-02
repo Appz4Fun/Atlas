@@ -288,6 +288,9 @@ fn take_in_turn(lists: &[Vec<ReleaseRow>]) -> Vec<ReleaseRow> {
     rows
 }
 
+/// How far a filtered search can page: this many rows, read for each way its words are written.
+const MAX_MERGED_ROWS: i64 = 5_000;
+
 /// How many searches a set of filters can turn into.
 const MAX_WORD_CHOICES: usize = 12;
 
@@ -439,6 +442,10 @@ impl Search {
         let choices = self.word_choices();
         if let [only] = choices.as_slice() {
             return one(only, from, count);
+        }
+        // each spelling is read from its start, soo paging has to stop somewhere
+        if from.saturating_add(count) > MAX_MERGED_ROWS {
+            return Ok(Vec::new());
         }
         let lists = choices.iter().map(|words| one(words, 0, from + count)).collect::<Result<Vec<_>, _>>()?;
         let rows = take_in_turn(&lists);

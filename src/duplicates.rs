@@ -6,7 +6,9 @@
 //! shard, soo there are no clusters to keep in step: purging a release takes its row with it.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::LazyLock;
 
+use regex::Regex;
 use rusqlite::{Connection, OptionalExtension};
 use sha1::{Digest, Sha1};
 
@@ -46,6 +48,11 @@ pub const SET_PAR2_SIZES: &str =
     on conflict(release_id) do update set par2_block = excluded.par2_block, par2_blocks = excluded.par2_blocks";
 pub const SET_CONTENT: &str = "insert into release_fingerprint (release_id, content) values (?1, ?2)
     on conflict(release_id) do update set content = excluded.content";
+
+/// A release that no longer proves what it did, as when more of it has arrived. Its old answer goes.
+pub const CLEAR_POSTED: &str = "update release_fingerprint set posted = null, posted_names = null, par2_block = null,
+    par2_blocks = null where release_id = ?1";
+pub const CLEAR_CONTENT: &str = "update release_fingerprint set content = null where release_id = ?1";
 
 /// Files smaller than this don't count: NFOs, samples' subtitles, and the like differ between postings.
 const MIN_CONTENT_FILE: u64 = 1 << 20;
@@ -90,6 +97,39 @@ fn posted_names(conn: &Connection, id: i64) -> Option<Vec<u8>> {
     let s = store::shard_of_id(id);
     let sql = format!("select posted_names from s{s}.release_fingerprint where release_id = ?");
     conn.query_row(&sql, [id], |r| r.get(0)).ok().flatten()
+}
+
+/// Whether one archive's listing says what a whole release holds: everything real in it is that archive's volumes.
+/// Names that differ count as different archives, soo an obfuscated set makes no fingerprint, which is the safe way
+/// to be wrong: a release with another archive beside the one read must not match one without it.
+pub fn one_archive_set<'a>(mut names: impl Iterator<Item = &'a str>) -> bool {
+    use crate::archive::select::{Kind, classify};
+    let mut set = None;
+    names.all(|name| {
+        let family = match classify(name) {
+            Kind::Par2Base | Kind::Par2Vol(_) | Kind::Nfo | Kind::Image => return true,
+            Kind::Rar(_) => "rar",
+            Kind::SevenZip(_) => "7z",
+            Kind::Zip(_) => "zip",
+            Kind::Numbered(_) => "numbered",
+            Kind::NotArchive | Kind::Unidentified => {
+                let lower = name.to_ascii_lowercase();
+                return is_sample(&lower) || lower.ends_with(".sfv") || lower.ends_with(".nzb");
+            }
+        };
+        let this = (family, volume_set(name));
+        *set.get_or_insert(this) == this
+    }) && set.is_some()
+}
+
+/// A volume's name without what makes it that volume: `a.part01.rar`, `a.r00`, `a.z01`, `a.7z.001` and `a.001` are `a`.
+fn volume_set(name: &str) -> &str {
+    static VOLUME_END: LazyLock<Regex> = LazyLock::new(|| {
+        #[allow(clippy::unwrap_used)]
+        Regex::new(r"(?i)(\.part\d+\.rar|\.7z\.\d+|\.[^./\\]+)$").unwrap()
+    });
+    let name = crate::archive::names::base_name(name);
+    VOLUME_END.find(name).filter(|m| m.start() > 0).map_or(name, |m| &name[..m.start()])
 }
 
 fn is_archive(name: &str) -> bool {
@@ -485,6 +525,21 @@ mod tests {
     use super::*;
 
     const GB: u64 = 1 << 30;
+
+    #[test]
+    fn only_one_archive_speaks_for_a_release() {
+        let one = |names: &[&str]| one_archive_set(names.iter().copied());
+        assert!(one(&["a.part01.rar", "a.part02.rar", "a.par2", "a.vol0+1.par2", "a.nfo", "a-sample.mkv"]));
+        assert!(one(&["a.rar", "a.r00", "a.r01"]));
+        assert!(one(&["a.7z.001", "a.7z.002"]));
+        assert!(one(&["a.z01", "a.z02", "a.zip"]), "a split ZIP");
+        assert!(one(&["a.rar", "a.s00"]));
+        assert!(one(&["a.cbz"]));
+        assert!(!one(&["a.rar", "a.zip"]), "same name, different archives");
+        assert!(!one(&["a.rar", "b.rar"]), "two archives");
+        assert!(!one(&["a.rar", "a.mkv"]), "something outside it");
+        assert!(!one(&["a.nfo"]), "no archive at all");
+    }
 
     #[test]
     fn a_file_of_unknown_size_makes_no_content_fingerprint() {
