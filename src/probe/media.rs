@@ -19,6 +19,14 @@ pub struct MediaInfo {
     pub chapters: Vec<Chapter>,
     /// when it was muxed, in Unix seconds
     pub muxed_at: Option<i64>,
+    /// Matroska's SegmentUID, in hex: the same mux posted again has the same one
+    pub segment_uid: Option<String>,
+    /// how many chapter editions: more than one is often a seamless branching cut
+    pub editions: u32,
+    /// the encoder and its version, from the settings x264 and x265 write into the first frame
+    pub encoder: Option<String>,
+    /// those settings, as they're written
+    pub encoder_options: Option<String>,
     /// files attached to it: fonts, cover art
     pub attachments: Vec<Attachment>,
     /// cover art that was attached whole, kept apart from the JSON
@@ -89,6 +97,8 @@ pub struct AudioTrack {
     pub atmos: bool,
     /// the commentary flag, or a name that says so
     pub commentary: bool,
+    /// the player's pick when nothing else says
+    pub default: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -100,6 +110,7 @@ pub struct SubtitleTrack {
     pub forced: bool,
     pub hearing_impaired: bool,
     pub commentary: bool,
+    pub default: bool,
 }
 
 const EBML_MAGIC: &[u8] = &[0x1a, 0x45, 0xdf, 0xa3];
@@ -113,13 +124,49 @@ pub fn is_mp4(data: &[u8]) -> bool {
 }
 
 pub fn parse(data: &[u8]) -> Option<MediaInfo> {
-    if is_matroska(data) {
-        Some(matroska(data))
+    let mut info = if is_matroska(data) {
+        matroska(data)
     } else if is_mp4(data) {
-        Some(mp4(data))
+        mp4(data)
     } else {
-        None
+        return None;
+    };
+    if let Some((encoder, options)) = encoder_settings(data) {
+        info.encoder = Some(encoder);
+        info.encoder_options = options;
     }
+    Some(info)
+}
+
+/// The most characters kept of an encoder's settings. x265's run to about 3000.
+const MAX_ENCODER_OPTIONS: usize = 6000;
+
+/// What x264 and x265 write as text into an SEI of the first frame: `x264 - core 164 r3095 baee400 - H.264/MPEG-4
+/// AVC codec - ... - options: cabac=1 ref=4 ...`, or `x265 (build 199) - 3.5+1-f0c1022b6:[Linux][GCC 10.2.1][64
+/// bit] 10bit - H.265/HEVC codec - ... - options: cpuid=1111039 ...`. The encoder with its version, and the options.
+fn encoder_settings(data: &[u8]) -> Option<(String, Option<String>)> {
+    let (at, x265) = [(b"x264 - core ".as_slice(), false), (b"x265 (build ".as_slice(), true)]
+        .into_iter()
+        .find_map(|(needle, x265)| data.windows(needle.len()).position(|w| w == needle).map(|at| (at, x265)))?;
+    let rest = &data[at..];
+    let end = rest.iter().position(|b| *b == 0 || !(b.is_ascii_graphic() || *b == b' ')).unwrap_or(rest.len());
+    let line = String::from_utf8_lossy(&rest[..end.min(MAX_ENCODER_OPTIONS + 512)]).into_owned();
+    let mut parts = line.split(" - ");
+    parts.next()?;
+    let encoder = if x265 {
+        // `x265 (build 199)`, then `3.5+1-f0c1022b6:[Linux][GCC 10.2.1][64 bit] 10bit`
+        let version = parts.next().and_then(|v| v.split(':').next()).unwrap_or_default();
+        format!("x265 {}", version.trim())
+    } else {
+        // `x264 - core 164 r3095 baee400`
+        let core = parts.next().unwrap_or_default();
+        format!("x264 {}", core.trim())
+    };
+    let options = line
+        .split_once("options: ")
+        .map(|(_, o)| o.trim().chars().take(MAX_ENCODER_OPTIONS).collect::<String>())
+        .filter(|o| !o.is_empty());
+    Some((encoder.trim().to_string(), options))
 }
 
 // ---- EBML
@@ -200,6 +247,8 @@ struct Track {
     forced: bool,
     hearing_impaired: bool,
     commentary: bool,
+    /// None: not said, which means it is
+    flag_default: Option<bool>,
     default_duration: Option<u64>,
     width: Option<u64>,
     height: Option<u64>,
@@ -244,6 +293,7 @@ fn track_entry(b: &[u8]) -> Track {
             0x55AA => t.forced = uint(v) != 0,
             0x55AB => t.hearing_impaired = uint(v) != 0,
             0x55AF => t.commentary = uint(v) != 0,
+            0x88 => t.flag_default = Some(uint(v) != 0),
             0x23E383 => t.default_duration = Some(uint(v)),
             0xE0 => walk(v, &mut |id, v| {
                 match id {
@@ -330,6 +380,9 @@ fn segment(body: &[u8], info: &mut MediaInfo) {
                         0x2AD7B1 => scale = uint(v),
                         0x4489 => duration = float(v),
                         0x4461 => info.muxed_at = date_utc(v),
+                        0x73A4 if v.len() == 16 => {
+                            info.segment_uid = Some(v.iter().map(|b| format!("{b:02x}")).collect());
+                        }
                         _ => {}
                     }
                     true
@@ -342,7 +395,14 @@ fn segment(body: &[u8], info: &mut MediaInfo) {
                 }
                 true
             }),
-            0x1043_A770 if info.chapters.is_empty() => chapters(v, info),
+            0x1043_A770 if info.chapters.is_empty() => {
+                info.editions = 0;
+                walk(v, &mut |id, _| {
+                    info.editions += u32::from(id == 0x45B9);
+                    true
+                });
+                chapters(v, info);
+            }
             0x1941_A469 => attachments(v, info),
             // what's after the first cluster is the video itself
             0x1F43_B675 => {
@@ -522,6 +582,7 @@ fn add_track(t: Track, info: &mut MediaInfo) {
         2 => info.audio.push(AudioTrack {
             atmos: t.name.as_deref().is_some_and(|n| n.to_ascii_lowercase().contains("atmos")),
             commentary: t.commentary || says_commentary(t.name.as_deref()),
+            default: t.flag_default.unwrap_or(true),
             codec: t.codec,
             channels: t.channels,
             sample_rate: t.sample_rate,
@@ -533,6 +594,7 @@ fn add_track(t: Track, info: &mut MediaInfo) {
             commentary: t.commentary || says_commentary(t.name.as_deref()),
             hearing_impaired: t.hearing_impaired
                 || t.name.as_deref().is_some_and(|n| n.to_ascii_lowercase().contains("sdh")),
+            default: t.flag_default.unwrap_or(true),
             codec: t.codec,
             language: t.language,
             name: t.name,
@@ -913,6 +975,38 @@ mod tests {
         assert_eq!(m.cover, None);
         let json = serde_json::to_string(&m).unwrap();
         assert!(!json.contains("cover\":{"), "the image stays out of the JSON: {json}");
+    }
+
+    #[test]
+    fn encoder_settings_come_from_the_first_frame() {
+        let x265 = b"\x00\x00\x01\x4e\x01\x05x265 (build 199) - 3.5+1-f0c1022b6:[Linux][GCC 10.2.1][64 bit] 10bit - H.265/HEVC codec - Copyright 2013-2018 (c) Multicoreware, Inc - http://x265.org - options: cpuid=1111039 crf=18.0 preset=slow\x00\x80";
+        let (encoder, options) = encoder_settings(x265).unwrap();
+        assert_eq!(encoder, "x265 3.5+1-f0c1022b6");
+        assert_eq!(options.as_deref(), Some("cpuid=1111039 crf=18.0 preset=slow"));
+        let x264 = b"junk x264 - core 164 r3095 baee400 - H.264/MPEG-4 AVC codec - Copyleft 2003-2022 - http://www.videolan.org/x264.html - options: cabac=1 ref=4 crf=16.0\x00";
+        let (encoder, options) = encoder_settings(x264).unwrap();
+        assert_eq!(encoder, "x264 core 164 r3095 baee400");
+        assert_eq!(options.as_deref(), Some("cabac=1 ref=4 crf=16.0"));
+        assert_eq!(encoder_settings(b"nothing here"), None);
+    }
+
+    #[test]
+    fn the_segment_uid_editions_and_default_flags_come_out() {
+        let uid: Vec<u8> = (1..=16).collect();
+        let info = el(&[0x73, 0xA4], &uid);
+        let atom = el(&[0xB6], &el(&[0x91], &[0]));
+        let chapters = el(&[0x10, 0x43, 0xA7, 0x70], &[el(&[0x45, 0xB9], &atom), el(&[0x45, 0xB9], &atom)].concat());
+        let a1 = [el(&[0x83], &[2]), el(&[0x86], b"A_AC3")].concat();
+        let a2 = [el(&[0x83], &[2]), el(&[0x86], b"A_AC3"), el(&[0x88], &[0])].concat();
+        let tracks = el(&[0x16, 0x54, 0xAE, 0x6B], &[el(&[0xAE], &a1), el(&[0xAE], &a2)].concat());
+        let segment = [el(&[0x15, 0x49, 0xA9, 0x66], &info), tracks, chapters].concat();
+        let data =
+            [el(&[0x1A, 0x45, 0xDF, 0xA3], &el(&[0x42, 0x82], b"matroska")), el(&[0x18, 0x53, 0x80, 0x67], &segment)]
+                .concat();
+        let m = parse(&data).unwrap();
+        assert_eq!(m.segment_uid.as_deref(), Some("0102030405060708090a0b0c0d0e0f10"));
+        assert_eq!(m.editions, 2);
+        assert_eq!(m.audio.iter().map(|a| a.default).collect::<Vec<_>>(), [true, false], "unsaid means default");
     }
 
     #[test]

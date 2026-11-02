@@ -95,9 +95,10 @@ impl Step for ProbeStep {
     }
     /// What a probe reads, a bit per version, soo a release probed before a version gets probed again. Bit 1:
     /// chapters, commentary, more than one article of a header, and the OpenSubtitles hash. Bit 2: archives inside
-    /// archives, followed down. Bit 4: attachments, cover art, when it was muxed, MaxCLL and MaxFALL.
+    /// archives, followed down. Bit 4: attachments, cover art, when it was muxed, MaxCLL and MaxFALL. Bit 8:
+    /// SegmentUID, editions, default flags and the encoder's settings.
     fn config_stamp(&self) -> u64 {
-        1 | 2 | 4
+        1 | 2 | 4 | 8
     }
     fn run(&self, ctx: &mut StepCtx<'_>) -> Result<Outcome, StepError> {
         let retry = |e: rusqlite::Error| StepError::Retry(e.to_string());
@@ -241,6 +242,19 @@ fn read_more_front(
         front.extend(body);
         inspect(front, info);
         part += 1;
+    }
+    // the encoder's settings are in the first frame, just past the header: one more article when they're not here yet
+    let wants_encoder = info.media.as_ref().is_some_and(|m| {
+        m.header_complete
+            && m.encoder.is_none()
+            && m.video.iter().any(|v| v.codec.contains("AVC") || v.codec.contains("HEVC") || v.codec.contains("H264"))
+    });
+    if wants_encoder
+        && part <= total.min(FRONT_ARTICLES)
+        && let Some(body) = read_part(ctx, file, part, front.len() as u64)?
+    {
+        front.extend(body);
+        inspect(front, info);
     }
     Ok(())
 }

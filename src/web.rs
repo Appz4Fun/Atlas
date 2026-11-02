@@ -1515,6 +1515,26 @@ fn probe_html(
         dd(&mut tracks, "Written by", m.writing_app.as_deref().map_or(String::new(), escape));
         dd(&mut tracks, "Muxed by", m.muxing_app.as_deref().map_or(String::new(), escape));
         dd(&mut tracks, "Title", m.title.as_deref().map_or(String::new(), escape));
+        dd(&mut tracks, "HDR", m.video.first().map_or(String::new(), |v| escape(&hdr_summary(v))));
+        if let Some(encoder) = &m.encoder {
+            let settings = m.encoder_options.as_deref().map_or(String::new(), |o| {
+                let key = key_options(o);
+                let key = if key.is_empty() { String::new() } else { format!(" · {}", escape(&key)) };
+                format!(
+                    "{key}<details class=\"settings\"><summary>All settings</summary><code>{}</code></details>",
+                    escape(o)
+                )
+            });
+            dd(&mut tracks, "Encoder", format!("{}{settings}", escape(encoder)));
+        }
+        if m.editions > 1 {
+            dd(&mut tracks, "Editions", format!("{} (often a seamless branching cut)", m.editions));
+        }
+        dd(
+            &mut tracks,
+            "SegmentUID",
+            m.segment_uid.as_deref().map_or(String::new(), |u| format!("<code>{}</code>", escape(u))),
+        );
         dd(
             &mut tracks,
             "Muxed",
@@ -1570,6 +1590,9 @@ fn probe_html(
             if a.atmos {
                 parts.push("Atmos".into());
             }
+            if a.default {
+                parts.push("default".into());
+            }
             // a name that says so already
             if a.commentary && !a.name.as_deref().is_some_and(|n| n.to_ascii_lowercase().contains("commentary")) {
                 parts.push("commentary".into());
@@ -1585,6 +1608,9 @@ fn probe_html(
             }
             if s.hearing_impaired {
                 parts.push("SDH".into());
+            }
+            if s.default {
+                parts.push("default".into());
             }
             // a name that says so already
             if s.commentary && !s.name.as_deref().is_some_and(|n| n.to_ascii_lowercase().contains("commentary")) {
@@ -1892,7 +1918,23 @@ fn details_panel(args: &HashMap<String, String>) -> ApiResponse {
     let media = crate::media::query::attrs_of(&[id]).unwrap_or_default().remove(&id);
     let details =
         media.as_ref().and_then(|m| crate::media::details::for_title(&crate::config::media_config(), m.kind, &m.ids));
-    html(200, details.map(|d| details_html(&d)).unwrap_or_default())
+    let file_secs = crate::db::open()
+        .ok()
+        .and_then(|conn| crate::probe::read(&conn, id))
+        .and_then(|p| p.media.and_then(|m| m.duration_secs));
+    html(200, details.map(|d| details_html(&d, file_secs)).unwrap_or_default())
+}
+
+/// How this file's length compares with the title's, when they differ by more than credits and logos do.
+fn runtime_note(minutes: i64, file_secs: Option<f64>) -> String {
+    let Some(secs) = file_secs.filter(|s| *s > 60.0) else { return String::new() };
+    let file_minutes = (secs / 60.0).round() as i64;
+    let diff = file_minutes - minutes;
+    if diff.abs() < 4 || minutes <= 0 {
+        return String::new();
+    }
+    let what = if diff > 0 { "longer: maybe an extended cut" } else { "shorter: maybe a cut version, or not the film" };
+    format!(" · this file is {file_minutes} min, {} min {what}", diff.abs())
 }
 
 fn scores_html(d: &crate::media::details::Details) -> String {
@@ -1909,7 +1951,7 @@ fn scores_html(d: &crate::media::details::Details) -> String {
     .collect()
 }
 
-fn details_html(d: &crate::media::details::Details) -> String {
+fn details_html(d: &crate::media::details::Details, file_secs: Option<f64>) -> String {
     let mut lines = String::new();
     let mut line = |name: &str, value: Option<String>| {
         if let Some(value) = value {
@@ -1919,7 +1961,7 @@ fn details_html(d: &crate::media::details::Details) -> String {
     line("Released", d.released.clone());
     line("Blu-ray", d.bluray.clone());
     line("Genres", d.genres.clone());
-    line("Runtime", d.runtime.map(|minutes| format!("{minutes} min")));
+    line("Runtime", d.runtime.map(|minutes| format!("{minutes} min{}", runtime_note(minutes, file_secs))));
     line("Network", d.network.clone());
     line("Status", d.status.clone());
     line("Cast", d.cast.clone());
@@ -2017,6 +2059,28 @@ fn poster(args: &HashMap<String, String>) -> ApiResponse {
         bytes: Some(bytes),
         failed: false,
     }
+}
+
+/// SDR, HDR10, HLG, PQ, DV, or DV with the layer it falls back to: `DV HDR10`.
+fn hdr_summary(v: &crate::probe::media::VideoTrack) -> String {
+    let base = v.hdr.clone();
+    match (v.dv_profile, base) {
+        (Some(p), Some(base)) => format!("DV P{p} + {base}"),
+        // profile 5 has no fallback: its colour only DV players get right
+        (Some(p), None) => format!("DV P{p}"),
+        (None, Some(base)) => base,
+        (None, None) => "SDR".into(),
+    }
+}
+
+/// What most decides how an encode looks: rate control and its value, and x265's preset when it's written.
+fn key_options(options: &str) -> String {
+    let wanted = ["preset", "crf", "bitrate", "qp", "rc", "tune"];
+    options
+        .split_whitespace()
+        .filter(|kv| kv.split_once('=').is_some_and(|(k, _)| wanted.contains(&k)))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// The shape it's shown in, when that's not the shape it's stored in: anamorphic video.
@@ -2691,14 +2755,37 @@ mod tests {
             bluray: Some("1999-09-21".into()),
             ..Default::default()
         };
-        let html = details_html(&d);
+        let html = details_html(&d, None);
         assert!(!html.contains("<b>") && !html.contains("<i>"), "{html}");
         assert!(html.contains("IMDB 87") && !html.contains("Metacritic"), "{html}");
         assert!(html.contains("<dt>Blu-ray</dt><dd>1999-09-21</dd>"), "{html}");
         assert!(html.contains("/ui/poster?kind=2&amp;tmdb=603"), "{html}");
         assert!(!html.contains("art=backdrop"), "{html}");
-        let wide = details_html(&crate::media::details::Details { backdrop: Some("/b.jpg".into()), ..d.clone() });
+        let wide = details_html(&crate::media::details::Details { backdrop: Some("/b.jpg".into()), ..d.clone() }, None);
         assert!(wide.contains("art=backdrop"), "{wide}");
+    }
+
+    #[test]
+    fn a_file_much_longer_or_shorter_than_the_title_says_so() {
+        assert_eq!(runtime_note(136, Some(136.0 * 60.0 + 100.0)), "");
+        assert_eq!(runtime_note(136, None), "");
+        assert!(runtime_note(136, Some(152.0 * 60.0)).contains("16 min longer"));
+        assert!(runtime_note(136, Some(44.0 * 60.0)).contains("92 min shorter"));
+    }
+
+    #[test]
+    fn hdr_is_summed_up_and_the_key_settings_picked() {
+        use crate::probe::media::VideoTrack;
+        let v = |hdr: Option<&str>, dv: Option<u8>| VideoTrack {
+            hdr: hdr.map(str::to_string),
+            dv_profile: dv,
+            ..VideoTrack::default()
+        };
+        assert_eq!(hdr_summary(&v(None, None)), "SDR");
+        assert_eq!(hdr_summary(&v(Some("HDR10"), None)), "HDR10");
+        assert_eq!(hdr_summary(&v(Some("HDR10"), Some(7))), "DV P7 + HDR10");
+        assert_eq!(hdr_summary(&v(None, Some(5))), "DV P5");
+        assert_eq!(key_options("cpuid=1 preset=slow crf=18.0 aq-mode=3 rc=crf"), "preset=slow crf=18.0 rc=crf");
     }
 
     #[test]
