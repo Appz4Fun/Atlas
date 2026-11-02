@@ -261,6 +261,9 @@ fn still_of(track: &VideoTrack, frame: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
         }
     };
     let [y, cb, cr] = picture.to_8bit(STILL_WIDTH, track.display);
+    if y.width == 0 {
+        return None;
+    }
     let jpeg = jpeg::encode(&y.data, &cb.data, &cr.data, y.width, y.height, QUALITY);
     Some((jpeg, y.width as u32, y.height as u32))
 }

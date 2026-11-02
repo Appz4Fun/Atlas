@@ -97,17 +97,22 @@ fn to_bt601(y: &mut Plane8, cb: &mut Plane8, cr: &mut Plane8, (kr, kb): (f32, f3
 }
 
 impl Picture {
+    /// The crop to show by: the stream's, unless it leaves nothing of the picture, which is damage, and then none.
+    fn window(&self) -> Crop {
+        let y = &self.planes[0];
+        let fits = self.crop.left.saturating_add(self.crop.right) < y.width
+            && self.crop.top.saturating_add(self.crop.bottom) < y.height;
+        if fits { self.crop } else { Crop::default() }
+    }
+
     /// The luma that's shown, scaled to 8 bits.
     pub fn luma8(&self) -> (usize, usize, Vec<u8>) {
-        let y = &self.planes[0];
-        let (w, h) = (
-            y.width.saturating_sub(self.crop.left + self.crop.right),
-            y.height.saturating_sub(self.crop.top + self.crop.bottom),
-        );
+        let (y, crop) = (&self.planes[0], self.window());
+        let (w, h) = (y.width - (crop.left + crop.right), y.height - (crop.top + crop.bottom));
         let shift = self.bit_depth.saturating_sub(8);
         let mut out = Vec::with_capacity(w * h);
-        for row in self.crop.top..self.crop.top + h {
-            for col in self.crop.left..self.crop.left + w {
+        for row in crop.top..crop.top + h {
+            for col in crop.left..crop.left + w {
                 out.push((y.get(col, row) >> shift).min(255) as u8);
             }
         }
@@ -149,10 +154,13 @@ impl Picture {
     /// `max_width` wide. Its shape is `display` (width to height) when that's given and near the samples' shape,
     /// for anamorphic video, else the samples'. Wider samples (10 bit) lose their low bits: a still, not a grade.
     pub fn to_8bit(&self, max_width: usize, display: Option<(u64, u64)>) -> [Plane8; 3] {
-        let (w, h) = (
-            self.planes[0].width.saturating_sub(self.crop.left + self.crop.right).max(2),
-            self.planes[0].height.saturating_sub(self.crop.top + self.crop.bottom).max(2),
-        );
+        let crop = self.window();
+        let (w, h) =
+            (self.planes[0].width - (crop.left + crop.right), self.planes[0].height - (crop.top + crop.bottom));
+        if w < 2 || h < 2 {
+            let empty = || Plane8 { width: 0, height: 0, data: Vec::new() };
+            return [empty(), empty(), empty()];
+        }
         let dw = w.min(max_width.max(2)) & !1;
         // a display shape far off the coded one is a mistake: anamorphic video is squeezed 2x at most
         let shape = display.filter(|&(dw, dh)| {
@@ -167,8 +175,8 @@ impl Picture {
         // the decoder already allowed
         let dh = dh.min(h).min(max_width.max(2) * 2).max(2) & !1;
         let shift = self.bit_depth.saturating_sub(8);
-        let mut y = shrink(&self.planes[0], self.crop.left, self.crop.top, w, h, dw, dh, shift);
-        let chroma = |p: &Plane| shrink(p, self.crop.left / 2, self.crop.top / 2, w / 2, h / 2, dw / 2, dh / 2, shift);
+        let mut y = shrink(&self.planes[0], crop.left, crop.top, w, h, dw, dh, shift);
+        let chroma = |p: &Plane| shrink(p, crop.left / 2, crop.top / 2, w / 2, h / 2, dw / 2, dh / 2, shift);
         let (mut cb, mut cr) = (chroma(&self.planes[1]), chroma(&self.planes[2]));
         if !self.full_range {
             // a JPEG's samples are full range
@@ -207,6 +215,11 @@ mod tests {
         let [y, ..] = p.to_8bit(960, Some((100_000, 1)));
         assert_eq!((y.width, y.height), (960, 720));
         // a shape that would stretch it tall is held to the samples' height
+        // a crop that leaves nothing is ignored, not read past
+        let mut cropped = flat(8, 8, [128; 3], None);
+        cropped.crop.top = 8;
+        let [y, ..] = cropped.to_8bit(960, None);
+        assert_eq!((y.width, y.height), (8, 8));
         let tall = flat(960, 9824, [128; 3], None);
         let [y, ..] = tall.to_8bit(960, Some((240, 9824)));
         assert!(y.height <= 1920, "{}", y.height);
