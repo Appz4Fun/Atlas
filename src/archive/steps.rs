@@ -178,6 +178,8 @@ macro_rules! limits_from_enabled {
 }
 
 /// Reads a PAR2 set's file list.
+pub const PAR2_STEP: StepId = StepId(1);
+
 #[derive(Default)]
 pub struct Par2Step {
     limits: Mutex<ArchiveConfig>,
@@ -185,7 +187,7 @@ pub struct Par2Step {
 
 impl Step for Par2Step {
     fn id(&self) -> StepId {
-        StepId(1)
+        PAR2_STEP
     }
     fn name(&self) -> &'static str {
         "archive_par2"
