@@ -109,3 +109,10 @@ host = "127.0.0.1"
 indexer_port = 9092
 api_port = 9093
 catalog_every_secs = 1800
+
+[sealed_log]
+# host:port of the sealed-log service (sealed-log/compose.yml). Empty keeps every article here.
+addr = ""
+# move sealed articles there while indexing
+offload = false
+offload_mb_per_second = 50
