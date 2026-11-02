@@ -112,6 +112,15 @@ impl<'a> BitReader<'a> {
         i32::try_from(v).map_err(|_| DecodeError::Invalid("exp-Golomb code"))
     }
 
+    /// se(v) that must be in `range`
+    pub fn se_in(&mut self, range: std::ops::RangeInclusive<i32>, what: &'static str) -> Result<i32> {
+        let v = self.se()?;
+        if !range.contains(&v) {
+            return Err(DecodeError::Invalid(what));
+        }
+        Ok(v)
+    }
+
     /// ue(v) that must be at most `max`
     pub fn ue_max(&mut self, max: u32, what: &'static str) -> Result<u32> {
         let v = self.ue()?;
