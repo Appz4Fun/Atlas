@@ -274,6 +274,8 @@ fn run(data: &[u8], extra_dist: bool, target: usize, out: &mut Vec<u8>, filters:
     let Some(mut tables) = read_tables(&mut bits, extra_dist) else { return End::Cut };
     let mut reps = [0usize; 4];
     let mut last_len = 0usize;
+    // filters that don't overlap cover each byte once: more than that is work no real file asks for
+    let mut filter_work = target.saturating_add(MAX_FILTER_BLOCK);
     loop {
         if out.len() >= target {
             return End::Done;
@@ -349,10 +351,11 @@ fn run(data: &[u8], extra_dist: bool, target: usize, out: &mut Vec<u8>, filters:
             let kind = bits.take(3);
             let channels = if kind == 0 { bits.take(5) as usize + 1 } else { 0 };
             if (4..=MAX_FILTER_BLOCK).contains(&len) {
-                // past the cap a filter can't be kept, so what follows can't be trusted: stop where it is
-                if filters.len() == MAX_FILTERS {
+                // past the caps a filter can't be kept, so what follows can't be trusted: stop where it is
+                if filters.len() == MAX_FILTERS || len > filter_work {
                     return End::Cut;
                 }
+                filter_work -= len;
                 filters.push(Filter { kind, start: out.len() + start, len, channels });
             }
             continue;
