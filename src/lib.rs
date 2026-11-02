@@ -20,6 +20,7 @@ pub mod download;
 pub mod duplicates;
 pub mod field_search;
 pub mod filters;
+pub mod gemini;
 pub mod groups_menu;
 pub mod indexer;
 pub mod media;

@@ -442,7 +442,8 @@ fn respond(mut request: Request, api_key: &str, fallback_host: &str) {
     } else if *request.method() == tiny_http::Method::Post && crate::web::takes_post(path) {
         let mut body = String::new();
         let _ = request.as_reader().take(MAX_FORM_BODY).read_to_string(&mut body);
-        crate::web::post(path, &body, &base, api_key).unwrap_or_else(ApiResponse::not_found)
+        let htmx = request.headers().iter().any(|h| h.field.equiv("HX-Request"));
+        crate::web::post(path, &body, cookies.as_deref(), htmx, &base, api_key).unwrap_or_else(ApiResponse::not_found)
     } else {
         ApiResponse {
             status: 405,
