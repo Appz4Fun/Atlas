@@ -396,6 +396,12 @@ fn the_web_ui_end_to_end() {
     assert_eq!(card.status(), 200);
     assert!(card.body.starts_with("<div class=\"drawer-card\">") && card.body.ends_with("</div>"), "{}", card.body);
     assert!(card.body.contains("<dl class=\"facts facts-wide\">") && card.body.contains("Full page"), "{}", card.body);
+    // the drawer reads through the same filtered reader as the page: an unknown id gets no facts, in either shape
+    for shape in ["", "&as=card"] {
+        let none = fetch(port, &format!("/ui/row?id=999999999{shape}"), &cookie);
+        assert_eq!(none.status(), 200);
+        assert!(none.body.contains("There is no such release.") && !none.body.contains("<dl"), "{}", none.body);
+    }
     assert!(fetch(port, "/ui/duplicates?kind=alts", &cookie).body.contains("no alts found yet"));
     let opened = fetch(port, &format!("/ui/release?id={script}"), &cookie);
     assert!(opened.body.contains("Other copies") && opened.body.contains("Tv.Findword"), "{}", opened.body);
