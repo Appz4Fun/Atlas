@@ -300,7 +300,7 @@ fn release_attrs(r: &crate::search::ReleaseRow, copies: Option<&crate::duplicate
     add("team", tags.group.as_deref().unwrap_or_default());
     if let Some(copies) = copies {
         add("twins", &copies.twins.to_string());
-        add("pairs", &copies.pairs.to_string());
+        add("alts", &copies.alts.to_string());
     }
     out
 }

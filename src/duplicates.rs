@@ -1,5 +1,5 @@
 //! Other postings of the same content. A **twin** has the same posted files, proven by PAR2 hashes, soo
-//! its articles can stand in for this one's. A **pair** holds the same files packed differently, soo
+//! its articles can stand in for this one's. An **alt** holds the same files packed differently, soo
 //! it's another whole download, not a source of articles.
 //!
 //! Each release keeps two fingerprints in its shard, and copies are found by looking them up in every
@@ -199,7 +199,7 @@ pub fn content_fingerprint<'a>(files: impl Iterator<Item = (&'a str, Option<u64>
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Copy {
     Twin,
-    Pair,
+    Alt,
 }
 
 fn matching(conn: &Connection, column: &str, fingerprint: &[u8], id: i64) -> db::Result<Vec<i64>> {
@@ -232,7 +232,7 @@ pub fn copies_with(conn: &Connection, id: i64) -> db::Result<Vec<(Copy, ReleaseR
         Some(fingerprint) => matching(conn, "posted", fingerprint, id)?,
         None => Vec::new(),
     };
-    let pairs = match &content {
+    let alts = match &content {
         Some(fingerprint) => matching(conn, "content", fingerprint, id)?,
         None => Vec::new(),
     };
@@ -242,9 +242,9 @@ pub fn copies_with(conn: &Connection, id: i64) -> db::Result<Vec<(Copy, ReleaseR
             out.push((Copy::Twin, release));
         }
     }
-    for pair in pairs.iter().filter(|pair| !twins.contains(pair)) {
-        if let Some(release) = get_release_with(conn, *pair)? {
-            out.push((Copy::Pair, release));
+    for alt in alts.iter().filter(|alt| !twins.contains(alt)) {
+        if let Some(release) = get_release_with(conn, *alt)? {
+            out.push((Copy::Alt, release));
         }
     }
     Ok(out)
@@ -258,14 +258,14 @@ pub fn copies(id: i64) -> db::Result<Vec<(Copy, ReleaseRow)>> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ClusterKind {
     Twins,
-    Pairs,
+    Alts,
 }
 
 impl ClusterKind {
     pub fn column(self) -> &'static str {
         match self {
             ClusterKind::Twins => "posted",
-            ClusterKind::Pairs => "content",
+            ClusterKind::Alts => "content",
         }
     }
 }
@@ -285,7 +285,7 @@ fn all_fingerprints(conn: &Connection) -> String {
         .join(" union all ")
 }
 
-/// Which fingerprints make a cluster: twins are equal posted files, and a pair has to differ in them.
+/// Which fingerprints make a cluster: twins are equal posted files, and an alt has to differ in them.
 fn cluster_sql(conn: &Connection, kind: ClusterKind) -> Option<String> {
     let all = all_fingerprints(conn);
     if all.is_empty() {
@@ -294,7 +294,7 @@ fn cluster_sql(conn: &Connection, kind: ClusterKind) -> Option<String> {
     let column = kind.column();
     let copies = match kind {
         ClusterKind::Twins => "count(*)",
-        ClusterKind::Pairs => "count(distinct coalesce(posted, release_id))",
+        ClusterKind::Alts => "count(distinct coalesce(posted, release_id))",
     };
     Some(format!(
         "select {column} as fingerprint, count(*) as members from ({all}) where {column} is not null
@@ -338,7 +338,7 @@ pub fn clusters_with(
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CopyCount {
     pub twins: i64,
-    pub pairs: i64,
+    pub alts: i64,
 }
 
 type Fingerprints = HashMap<i64, (Option<Vec<u8>>, Option<Vec<u8>>)>;
@@ -424,14 +424,14 @@ pub fn counts_with(conn: &Connection, ids: &[i64]) -> db::Result<HashMap<i64, Co
     let mut out = HashMap::new();
     for (id, (p, c)) in &prints {
         let twins = p.as_ref().and_then(|p| posted.get(p)).map_or(0, |n| (n - 1).max(0));
-        // a twin with the same content is a twin, not a pair as well
+        // a twin with the same content is a twin, not an alt as well
         let same_posting = match (p, c) {
             (Some(p), Some(c)) => both.get(&(p.clone(), c.clone())).map_or(0, |n| (n - 1).max(0)),
             _ => 0,
         };
-        let pairs = c.as_ref().and_then(|c| content.get(c)).map_or(0, |n| (n - 1 - same_posting).max(0));
-        if twins > 0 || pairs > 0 {
-            out.insert(*id, CopyCount { twins, pairs });
+        let alts = c.as_ref().and_then(|c| content.get(c)).map_or(0, |n| (n - 1 - same_posting).max(0));
+        if twins > 0 || alts > 0 {
+            out.insert(*id, CopyCount { twins, alts });
         }
     }
     Ok(out)
