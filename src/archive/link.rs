@@ -135,14 +135,14 @@ fn is_par2_name(name: &str) -> bool {
     name.to_ascii_lowercase().ends_with(".par2")
 }
 
-/// The files of a set worth looking for: big enough, and each told apart from the rest by its size and first 16 KiB.
-/// Two the same would be a guess.
+/// The files of a set worth looking for: big enough, each told apart from the rest by its size and first 16 KiB, and
+/// each bound to its file id. Two the same would be a guess; one not bound could claim any size under any id.
 pub fn wanted(files: &[Par2File]) -> Vec<&Par2File> {
     let mut seen: HashMap<(u64, [u8; 16]), usize> = HashMap::new();
     for f in files {
         *seen.entry((f.size, f.md5_16k)).or_default() += 1;
     }
-    files.iter().filter(|f| f.size >= MIN_LINKED && seen[&(f.size, f.md5_16k)] == 1).collect()
+    files.iter().filter(|f| f.bound && f.size >= MIN_LINKED && seen[&(f.size, f.md5_16k)] == 1).collect()
 }
 
 /// Whether a file of `expected` articles can be one of `size` bytes, from what its articles weigh on the wire: `bytes`
@@ -479,9 +479,18 @@ impl Step for LinkStep {
                     break;
                 }
                 checks += 1;
-                let Some(seen) = self.check(ctx, &candidate)? else {
-                    more = true;
-                    break;
+                let seen = match self.check(ctx, &candidate) {
+                    Ok(Some(seen)) => seen,
+                    // out of bodies for now: what was learned so far is kept, and the rest waits for a later run
+                    Ok(None) => {
+                        more = true;
+                        break;
+                    }
+                    Err(StepError::OutOfBudget) if !found.is_empty() || !tried.is_empty() => {
+                        more = true;
+                        break;
+                    }
+                    Err(e) => return Err(e),
                 };
                 let fits: Vec<usize> = (0..missing.len()).filter(|&at| seen.is(missing[at])).collect();
                 match fits[..] {
@@ -571,7 +580,15 @@ mod tests {
     use super::*;
 
     fn file(size: u64, md5: u8) -> Par2File {
-        Par2File { set_id: [0; 16], file_id: [md5; 16], md5: [md5; 16], md5_16k: [md5; 16], size, name: "x".into() }
+        Par2File {
+            set_id: [0; 16],
+            file_id: [md5; 16],
+            md5: [md5; 16],
+            md5_16k: [md5; 16],
+            size,
+            name: "x".into(),
+            bound: true,
+        }
     }
 
     #[test]
