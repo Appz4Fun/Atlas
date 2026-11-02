@@ -24,11 +24,15 @@ pub struct Bucket {
 
 impl Bucket {
     pub fn new(per_minute: i64, now: Instant) -> Bucket {
-        Bucket { per_minute: per_minute.max(1) as f64, tokens: 1.0, last: now }
+        let per_minute = if per_minute == -1 { f64::INFINITY } else { per_minute.max(1) as f64 };
+        Bucket { per_minute, tokens: 1.0, last: now }
     }
 
     /// Zero: a token was taken. Otherwise how long until there is one, with none taken.
     pub fn wait_for(&mut self, now: Instant) -> Duration {
+        if self.per_minute.is_infinite() {
+            return Duration::ZERO;
+        }
         let elapsed = now.saturating_duration_since(self.last).as_secs_f64();
         self.tokens = (self.tokens + elapsed * self.per_minute / 60.0).min(1.0);
         self.last = now;
@@ -262,6 +266,15 @@ impl<T: Clone> Default for Memo<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn minus_one_never_waits() {
+        let now = Instant::now();
+        let mut b = Bucket::new(-1, now);
+        for _ in 0..1000 {
+            assert_eq!(b.wait_for(now), Duration::ZERO);
+        }
+    }
 
     #[test]
     fn the_bucket_refills_by_the_clock() {

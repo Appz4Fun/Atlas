@@ -273,7 +273,8 @@ impl MediaConfig {
         }
         let rate = |o: Option<&Value>, max: i64, slot: &mut i64| {
             if let Some(n) = o.and_then(|o| o.get("requests_per_minute")).and_then(as_int) {
-                *slot = n.clamp(1, max);
+                // -1 is no limit, for a plan that has none
+                *slot = if n == -1 { -1 } else { n.clamp(1, max) };
             }
         };
         let text = |o: Option<&Value>, key: &str| {
@@ -1406,6 +1407,17 @@ mod tests {
         assert_eq!((c.poll_minutes, c.page_size, c.max_pages_per_poll), (1, 100, 20));
         assert_eq!((c.max_db_mb, c.request_delay_ms, c.timeout_secs), (64, 250, 120));
         assert_eq!((c.late_per_second, c.history_pages), (0, 0));
+    }
+
+    #[test]
+    fn a_rate_of_minus_one_is_no_limit_and_zero_stays_the_slowest() {
+        let omdb = |n: i64| {
+            MediaConfig::from_value(Some(&json!({"omdb": {"requests_per_minute": n}}))).omdb.requests_per_minute
+        };
+        assert_eq!(omdb(-1), -1);
+        assert_eq!(omdb(0), 1);
+        assert_eq!(omdb(-5), 1);
+        assert_eq!(omdb(5_000), 600);
     }
 
     #[test]
