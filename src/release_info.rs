@@ -267,10 +267,7 @@ pub fn split_post_with(conn: &Connection, release: &crate::search::ReleaseRow) -
     let posted = names_with(conn, release.id)?.map_or(release.name.clone(), |n| n.posted);
     let (mut ids, mut groups, mut size, mut dates) = (Vec::new(), Vec::new(), 0, Vec::new());
     for s in 0..store::SHARDS {
-        let mut stmt = conn.prepare_cached(&format!(
-            "select id, group_name, coalesce(size, 0), julianday(posted_date) from s{s}.releases
-             where name = ?1 and poster is ?2 and not atlas_blocked(group_name) limit 64"
-        ))?;
+        let mut stmt = conn.prepare_cached(&split_post_sql(s))?;
         let rows = stmt.query_map(rusqlite::params![posted, release.poster], |r| {
             Ok((
                 r.get::<_, i64>(0)?,
@@ -298,6 +295,16 @@ pub fn split_post_with(conn: &Connection, release: &crate::search::ReleaseRow) -
         return Ok(None);
     }
     Ok(Some(SplitPost { ids, groups, size, complete: files.complete() }))
+}
+
+/// A shard's rows of one name and poster. `+poster` keeps the lookup on the name index: with no statistics SQLite
+/// would rather walk `idx_release_poster`, every row a busy poster ever posted, and a page of results took minutes.
+/// Parameters: ?1 the posted name, ?2 the poster.
+fn split_post_sql(s: usize) -> String {
+    format!(
+        "select id, group_name, coalesce(size, 0), julianday(posted_date) from s{s}.releases
+         where name = ?1 and +poster is ?2 and not atlas_blocked(group_name) limit 64"
+    )
 }
 
 fn close_together(dates: &[Option<f64>]) -> bool {
@@ -559,6 +566,29 @@ pub fn password_hint_with(conn: &Connection, id: i64, names: Option<&Names>) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_split_post_is_looked_up_by_name_not_poster() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::filters::register_sql(&conn).unwrap();
+        conn.execute_batch(
+            "attach ':memory:' as s0;
+             create table s0.releases (id INTEGER PRIMARY KEY, name TEXT, group_name TEXT, poster TEXT,
+                 posted_date TEXT, size INTEGER);
+             create unique index s0.idx_release_unique on releases(name, group_name);
+             create index s0.idx_release_poster on releases(poster);",
+        )
+        .unwrap();
+        let plan: Vec<String> = conn
+            .prepare(&format!("explain query plan {}", split_post_sql(0)))
+            .unwrap()
+            .query_map(["a.name", "someone"], |r| r.get(3))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        let plan = plan.join(" | ");
+        assert!(plan.contains("idx_release_unique") && !plan.contains("idx_release_poster"), "{plan}");
+    }
 
     #[test]
     fn an_estimate_goes_by_the_whole_of_the_data() {
