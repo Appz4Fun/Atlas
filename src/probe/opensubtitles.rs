@@ -10,12 +10,16 @@ use crate::config::{Config, OpenSubtitlesConfig};
 use crate::media::http::{Client, Reply, encode, now_secs};
 use crate::media::resolve::Trouble;
 use crate::postprocess::schema::ShardTable;
-use crate::postprocess::step::{Needs, Outcome, ReleaseInfo, Step, StepCtx, StepError, StepId, StepWrite};
+use crate::postprocess::step::{
+    Needs, Outcome, ReleaseInfo, Reruns, Step, StepCtx, StepError, StepId, StepWrite, mask,
+};
 use crate::store;
 
 use super::step::MOVIEHASH_FACT;
 
 pub const OPENSUBTITLES_STEP: StepId = StepId(5);
+/// In the media steps' range: it runs after `media_parse` makes the release's row.
+pub const OPENSUBTITLES_IMDB_STEP: StepId = StepId(35);
 
 const BASE_URL: &str = "https://api.opensubtitles.com/api/v1";
 
@@ -207,7 +211,7 @@ impl Step for OpenSubtitlesStep {
         let id = ctx.release().id;
         let f = reply.clone().unwrap_or_default();
         let film_imdb = f.imdb_id.filter(|_| f.is_movie());
-        let mut writes = vec![StepWrite::new(
+        let writes = vec![StepWrite::new(
             SET_MATCH,
             vec![
                 id.into(),
@@ -223,12 +227,51 @@ impl Step for OpenSubtitlesStep {
                 now_secs().into(),
             ],
         )];
-        // media_release holds a show's id for an episode, and an episode's own id would hide it from searches by
-        // the show, soo only a film's goes there
-        if let Some(imdb) = film_imdb {
-            writes.push(StepWrite::new(SET_IMDB, vec![id.into(), imdb.into()]));
-        }
-        Ok(Outcome { matched: reply.is_some(), writes, ..Outcome::default() })
+        // a film's id goes to media_release in its own step, after the release has a row there
+        let rerun = if film_imdb.is_some() { mask(OPENSUBTITLES_IMDB_STEP) } else { 0 };
+        Ok(Outcome { matched: reply.is_some(), writes, rerun, ..Outcome::default() })
+    }
+}
+
+/// A film's IMDb id from its hash match, into `media_release`, once the release has a row there: a name found
+/// later (an NFO's, say) makes the row after the match was asked for. An episode's own id stays out, since
+/// `media_release` holds its show's and an episode's would hide it from searches by the show.
+pub struct OpenSubtitlesImdb;
+
+impl Step for OpenSubtitlesImdb {
+    fn id(&self) -> StepId {
+        OPENSUBTITLES_IMDB_STEP
+    }
+    fn name(&self) -> &'static str {
+        "opensubtitles_imdb"
+    }
+    fn rank(&self) -> u16 {
+        505
+    }
+    fn needs(&self) -> Needs {
+        Needs::Database
+    }
+    fn enabled(&self, cfg: &Config) -> bool {
+        cfg.media.parse && !cfg.media.opensubtitles.api_key.is_empty()
+    }
+    fn reruns(&self) -> Reruns {
+        Reruns { on_rename: true, on_growth: true }
+    }
+    fn run(&self, ctx: &mut StepCtx<'_>) -> Result<Outcome, StepError> {
+        let id = ctx.release().id;
+        let imdb: Option<i64> = ctx
+            .conn()
+            .query_row(
+                "select imdb_id from release_opensubtitles
+                 where release_id = ?1 and imdb_id is not null and lower(kind) = 'movie'",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| StepError::Retry(e.to_string()))?;
+        let Some(imdb) = imdb else { return Ok(Outcome::default()) };
+        let writes = vec![StepWrite::new(SET_IMDB, vec![id.into(), imdb.into()])];
+        Ok(Outcome { matched: true, writes, ..Outcome::default() })
     }
 }
 

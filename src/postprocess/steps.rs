@@ -21,6 +21,7 @@ pub fn all() -> Vec<Arc<dyn Step>> {
         parse,
         lookup,
         nfo,
+        Arc::new(crate::probe::opensubtitles::OpenSubtitlesImdb),
     ]
 }
 

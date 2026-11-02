@@ -158,6 +158,18 @@ fn a_stored_set_gives_its_films_hash_and_what_it_is() {
         assert!(Instant::now() < deadline, "no probe and match");
         std::thread::sleep(Duration::from_millis(100));
     };
+    // the film's id reaches its media row, made by the media steps after the match
+    let pinned = loop {
+        let conn = db::open_shard(&shard).unwrap();
+        let row: Option<(Option<i64>, i64)> =
+            conn.query_row("select imdb_id, imdb_from_nfo from media_release", [], |r| Ok((r.get(0)?, r.get(1)?))).ok();
+        if let Some((Some(id), from_file)) = row {
+            break (id, from_file);
+        }
+        assert!(Instant::now() < deadline, "no imdb id on the media row");
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert_eq!(pinned, (133093, 1));
     stop.store(true, Ordering::Relaxed);
     assert_eq!(runner.join().unwrap(), 0);
 

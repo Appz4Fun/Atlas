@@ -298,12 +298,15 @@ fn moviehash_of(
         return Ok(None);
     }
     let Some(head) = &info.archive else {
-        let (Some(size), Some(segment)) = (info.yenc.as_ref().and_then(|y| y.file_size), info.segment_size) else {
-            return Ok(None);
-        };
+        let Some(size) = info.yenc.as_ref().and_then(|y| y.file_size) else { return Ok(None) };
         if size < 2 * CHUNK {
             return Ok(None);
         }
+        // posted whole in one article: both ends are already here
+        if front.len() as u64 == size {
+            return Ok(moviehash::moviehash(size, front, front));
+        }
+        let Some(segment) = info.segment_size else { return Ok(None) };
         let tail = file_range(ctx, file, segment, size - CHUNK, size, known_last.as_ref())?;
         return Ok(tail.and_then(|tail| moviehash::moviehash(size, front, &tail)));
     };
