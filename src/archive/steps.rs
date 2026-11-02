@@ -129,10 +129,14 @@ fn finish(ctx: &StepCtx<'_>, source: i64, listing: Listing, limits: &ArchiveConf
     let content = (listing.complete && !listing.damaged && speaks_for_release)
         .then(|| duplicates::content_fingerprint(listing.files.iter().map(|f| (f.name.as_str(), f.size))))
         .flatten();
-    writes.push(match content {
-        Some(content) => StepWrite::new(duplicates::SET_CONTENT, vec![id.into(), content.into()]),
-        None => StepWrite::new(duplicates::CLEAR_CONTENT, vec![id.into()]),
-    });
+    // a PAR2 set of archive volumes says nothing about what's inside them: that's the archive step's to say
+    let leaves_it = source == SOURCE_PAR2 && duplicates::lists_archives(listing.files.iter().map(|f| f.name.as_str()));
+    if !leaves_it {
+        writes.push(match content {
+            Some(content) => StepWrite::new(duplicates::SET_CONTENT, vec![id.into(), content.into()]),
+            None => StepWrite::new(duplicates::CLEAR_CONTENT, vec![id.into()]),
+        });
+    }
     if source != SOURCE_PAR2 {
         writes.push(StepWrite::new(archive_store::UPSERT_RELEASE, vec![id.into(), listing.password().code().into()]));
         if let Some(encryption) = listing.encryption {
@@ -178,6 +182,8 @@ macro_rules! limits_from_enabled {
 }
 
 /// Reads a PAR2 set's file list.
+pub const PAR2_STEP: StepId = StepId(1);
+
 #[derive(Default)]
 pub struct Par2Step {
     limits: Mutex<ArchiveConfig>,
@@ -185,7 +191,7 @@ pub struct Par2Step {
 
 impl Step for Par2Step {
     fn id(&self) -> StepId {
-        StepId(1)
+        PAR2_STEP
     }
     fn name(&self) -> &'static str {
         "archive_par2"
@@ -251,7 +257,6 @@ impl Step for Par2Step {
             outcome.writes.retain(|write| write.sql != duplicates::SET_CONTENT);
             let id = ctx.release().id;
             outcome.writes.push(StepWrite::new(duplicates::CLEAR_POSTED, vec![id.into()]));
-            outcome.writes.push(StepWrite::new(duplicates::CLEAR_CONTENT, vec![id.into()]));
         }
         if let Some(posted) = posted {
             let params = vec![ctx.release().id.into(), posted.into()];

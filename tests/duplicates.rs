@@ -60,7 +60,14 @@ fn copies_are_found_across_shards_and_go_with_their_release() {
     let conn = db::open().unwrap();
     let new_form = [2u8; 21];
     shard_d.execute(SET_POSTED, rusqlite::params![other, new_form.as_slice()]).unwrap();
+    let par2_bit = atlas::postprocess::step::mask(atlas::archive::steps::PAR2_STEP);
+    shard_a.execute("insert or replace into pp_state (release_id, done) values (?, ?)", [first, par2_bit | 4]).unwrap();
     atlas::duplicates::forget_old_twins(&conn);
+    let done: i64 = shard_a.query_row("select done from pp_state where release_id = ?", [first], |r| r.get(0)).unwrap();
+    assert_eq!(done, 4, "only the PAR2 step runs again");
+    let queued: i64 =
+        shard_a.query_row("select count(*) from pp_queue where release_id = ?", [first], |r| r.get(0)).unwrap();
+    assert_eq!(queued, 1, "and it's queued");
     let kept: Option<Vec<u8>> = shard_d
         .query_row("select posted from release_fingerprint where release_id = ?", [other], |r| r.get(0))
         .unwrap();
