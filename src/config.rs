@@ -207,6 +207,8 @@ pub struct MediaConfig {
     pub nfo: bool,
     pub negative_ttl_days: u32,
     pub max_titles: i64,
+    /// titles a minute to fetch posters and ratings for in the background. 0: only when a release is opened
+    pub details_per_minute: i64,
     pub tvmaze: TvmazeConfig,
     pub tmdb: TmdbConfig,
     pub omdb: OmdbConfig,
@@ -221,6 +223,7 @@ impl Default for MediaConfig {
             nfo: true,
             negative_ttl_days: 30,
             max_titles: 10_000_000,
+            details_per_minute: 120,
             tvmaze: TvmazeConfig { enabled: true, requests_per_minute: 90, base_url: None },
             tmdb: TmdbConfig { api_key: String::new(), requests_per_minute: 240, base_url: None, image_base_url: None },
             omdb: OmdbConfig { api_key: String::new(), requests_per_minute: 30, base_url: None },
@@ -253,6 +256,9 @@ impl MediaConfig {
         }
         if let Some(n) = v.get("max_titles").and_then(as_int) {
             c.max_titles = n.max(1_000);
+        }
+        if let Some(n) = v.get("details_per_minute").and_then(as_int) {
+            c.details_per_minute = n.clamp(0, 600);
         }
         let rate = |o: Option<&Value>, max: i64, slot: &mut i64| {
             if let Some(n) = o.and_then(|o| o.get("requests_per_minute")).and_then(as_int) {

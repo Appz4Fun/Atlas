@@ -1,12 +1,13 @@
 //! What a title is: its overview, cast, dates, ratings and poster, for the release page.
 //!
-//! Fetched from TMDB and OMDb when someone opens a release, and kept in `atlas.details.db`, soo a page
-//! costs a request only the first time, or once what's kept is old. Releases nobody opens cost nothing.
+//! Fetched from TMDB and OMDb when someone opens a release, and in the background for every title with an id, and kept
+//! in `atlas.details.db`, soo a page costs a request only the first time, or once what's kept is old.
 
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::{LazyLock, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use rusqlite::{Connection, OptionalExtension, params};
@@ -30,8 +31,14 @@ const KEEP_FOR: i64 = 30 * 86_400;
 const RETRY_AFTER: i64 = 3_600;
 const MAX_CAST: usize = 8;
 const MAX_POSTER: u64 = 8 << 20;
-/// Past this, the oldest posters go.
-const MAX_POSTER_CACHE: u64 = 512 << 20;
+/// Past this, the oldest posters go. Tens of thousands of titles at about 50 KB each fit.
+const MAX_POSTER_CACHE: u64 = 4 << 30;
+/// How many new images between looks at the cache's size: a look reads the whole folder.
+const TRIM_EVERY: u64 = 256;
+/// How long a finished pass over the titles rests.
+const BACKFILL_REST: Duration = Duration::from_secs(6 * 3600);
+/// Past a start, soo it doesn't add to what starting up does.
+const BACKFILL_DELAY: Duration = Duration::from_secs(30);
 
 const SCHEMA: &str = "
 create table if not exists details (
@@ -574,10 +581,89 @@ fn image(path: &str, base: &str) -> Option<Vec<u8>> {
     if !bytes.starts_with(&[0xff, 0xd8, 0xff]) {
         return None;
     }
-    if std::fs::create_dir_all(poster_dir()).is_ok() && std::fs::write(&file, &bytes).is_ok() {
+    static WRITTEN: AtomicU64 = AtomicU64::new(0);
+    if std::fs::create_dir_all(poster_dir()).is_ok()
+        && std::fs::write(&file, &bytes).is_ok()
+        && WRITTEN.fetch_add(1, Ordering::Relaxed).is_multiple_of(TRIM_EVERY)
+    {
         trim_posters(&poster_dir(), MAX_POSTER_CACHE);
     }
     Some(bytes)
+}
+
+/// Every title with an id, newest first, once each.
+fn known_titles() -> rusqlite::Result<Vec<(i64, Ids)>> {
+    let conn = crate::db::open()?;
+    let mut rows: Vec<(i64, i64, Ids)> = Vec::new();
+    for s in 0..crate::store::SHARDS {
+        let sql = format!(
+            "select max(release_id), kind, tmdb_id, imdb_id, tvdb_id, trakt_id from s{s}.media_release
+             where tmdb_id is not null or imdb_id is not null or tvdb_id is not null
+             group by kind, tmdb_id, imdb_id, tvdb_id, trakt_id"
+        );
+        // a shard from before media has none
+        let Ok(mut stmt) = conn.prepare(&sql) else { continue };
+        let found = stmt.query_map([], |r| {
+            let ids = Ids { tmdb: r.get(2)?, imdb: r.get(3)?, tvdb: r.get(4)?, trakt: r.get(5)?, ..Ids::default() };
+            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, ids))
+        })?;
+        for row in found {
+            rows.push(row?);
+        }
+    }
+    rows.sort_by_key(|(release, ..)| std::cmp::Reverse(*release));
+    let mut seen = std::collections::HashSet::new();
+    Ok(rows
+        .into_iter()
+        .filter(|(_, kind, ids)| seen.insert((*kind, ids.tmdb, ids.imdb, ids.tvdb)))
+        .map(|(_, kind, ids)| (kind, ids))
+        .collect())
+}
+
+/// One pass over every title: what's missing or old is fetched, at most `details_per_minute`, and its poster kept.
+/// Returns how many titles had to go out for something.
+pub fn backfill_pass(cfg: &MediaConfig, stop: &AtomicBool) -> usize {
+    let Ok(titles) = known_titles() else { return 0 };
+    let pace = Duration::from_secs_f64(60.0 / cfg.details_per_minute.max(1) as f64);
+    let mut fetched = 0;
+    for (kind, ids) in titles {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        let started = std::time::Instant::now();
+        let details = for_title(cfg, kind, &ids);
+        if let Some(d) = details.filter(|d| !poster_kept(d)) {
+            let _ = poster(d.kind, d.tmdb_id, cfg);
+        }
+        // what was already kept takes no time, and costs no one anything
+        if started.elapsed() > Duration::from_millis(20) {
+            fetched += 1;
+            std::thread::sleep(pace.saturating_sub(started.elapsed()));
+        }
+    }
+    fetched
+}
+
+fn rest(how_long: Duration, stop: &AtomicBool) {
+    let until = std::time::Instant::now() + how_long;
+    while std::time::Instant::now() < until && !stop.load(Ordering::Relaxed) {
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
+/// Keeps every title's poster and ratings fetched, soo results can show them without anyone opening a release.
+pub fn start_backfill(stop: Arc<AtomicBool>) {
+    std::thread::spawn(move || {
+        rest(BACKFILL_DELAY, &stop);
+        while !stop.load(Ordering::Relaxed) {
+            let cfg = crate::config::media_config();
+            let on = cfg.details_per_minute > 0 && !(cfg.tmdb.api_key.is_empty() && cfg.tvdb.api_key.is_empty());
+            if on {
+                backfill_pass(&cfg, &stop);
+            }
+            rest(BACKFILL_REST, &stop);
+        }
+    });
 }
 
 fn trim_posters(dir: &Path, limit: u64) {
