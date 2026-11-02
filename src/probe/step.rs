@@ -319,7 +319,8 @@ fn moviehash_of(
         // one volume: the file ends where its stored bytes do
         let (Some(packed), Some(segment)) = (head.packed, info.segment_size) else { return Ok(None) };
         let end = at as u64 + packed;
-        if packed < CHUNK {
+        // the volumes after it aren't indexed
+        if packed < CHUNK || head.continues {
             return Ok(None);
         }
         file_range(ctx, file, segment, end - CHUNK, end, known_last.as_ref())?
@@ -335,8 +336,9 @@ fn moviehash_of(
         let Some(body) = yenc_decode(&article.lines) else { return Ok(None) };
         let Some(last_head) = super::archive::parse(&body) else { return Ok(None) };
         let (Some(last_at), Some(packed)) = (last_head.stored_at, last_head.packed) else { return Ok(None) };
-        // the same file, still stored, and its last piece holds a whole 64 KiB
-        if last_head.name.as_deref() != Some(name) || packed < CHUNK {
+        // the same file, still stored, and its last piece holds a whole 64 KiB,
+        // and this is its end: the last volume indexed needn't be the set's last
+        if last_head.name.as_deref() != Some(name) || packed < CHUNK || last_head.continues {
             return Ok(None);
         }
         let end = last_at as u64 + packed;
