@@ -5,6 +5,7 @@
 //! and cutting the model back.
 
 use super::super::lzma::End;
+use super::heap::Heap;
 
 const UNIT: u32 = 12;
 const N_INDEXES: usize = 38;
@@ -57,7 +58,7 @@ struct State {
 }
 
 struct Model {
-    heap: Vec<u8>,
+    heap: Heap,
     size: u32,
     align: u32,
     glue_count: u32,
@@ -145,7 +146,7 @@ impl Model {
     fn new(size: u32, max_order: u32, restore: u32) -> Model {
         let align = 4 - (size & 3);
         let mut m = Model {
-            heap: vec![0; (align + size) as usize],
+            heap: Heap::new((align + size) as usize),
             size,
             align,
             glue_count: 0,
@@ -208,13 +209,11 @@ impl Model {
     // ---- the heap: out of range reads give 0 and writes go nowhere, which only damaged data reaches
 
     fn b(&self, at: u32) -> u32 {
-        u32::from(self.heap.get(at as usize).copied().unwrap_or(0))
+        u32::from(self.heap.get(at as usize))
     }
 
     fn set_b(&mut self, at: u32, v: u32) {
-        if let Some(x) = self.heap.get_mut(at as usize) {
-            *x = v as u8;
-        }
+        self.heap.set(at as usize, v as u8);
     }
 
     fn w(&self, at: u32) -> u32 {
@@ -237,8 +236,19 @@ impl Model {
 
     fn copy(&mut self, to: u32, from: u32, bytes: u32) {
         let (to, from, n) = (to as usize, from as usize, bytes as usize);
-        if from.saturating_add(n) <= self.heap.len() && to.saturating_add(n) <= self.heap.len() {
-            self.heap.copy_within(from..from + n, to);
+        let size = self.heap.size();
+        if from.saturating_add(n) > size || to.saturating_add(n) > size {
+            return;
+        }
+        // units move down to lower addresses or into free ones, but copy the safe way round either way
+        if to <= from {
+            for i in 0..n {
+                self.heap.set(to + i, self.heap.get(from + i));
+            }
+        } else {
+            for i in (0..n).rev() {
+                self.heap.set(to + i, self.heap.get(from + i));
+            }
         }
     }
 
@@ -353,7 +363,7 @@ impl Model {
             self.set_d(self.lo_unit, 0);
         }
         let mut steps = 0usize;
-        let max_steps = self.heap.len() / UNIT as usize + N_INDEXES;
+        let max_steps = self.heap.size() / UNIT as usize + N_INDEXES;
         for i in 0..N_INDEXES {
             let mut next = self.free_list[i];
             self.free_list[i] = 0;
@@ -508,7 +518,7 @@ impl Model {
             node = node.wrapping_add(nu.wrapping_mul(UNIT));
         }
         self.units_start = node;
-        let max_steps = self.heap.len() / UNIT as usize;
+        let max_steps = self.heap.size() / UNIT as usize;
         // `i` picks the free list as well as its count
         #[allow(clippy::needless_range_loop)]
         for i in 0..N_INDEXES {
@@ -1359,13 +1369,14 @@ fn run(data: &[u8], size: Option<u64>, limit: usize) -> (Vec<u8>, End, (u32, u32
     let seen = |_: &Model| (0, 0);
     while out.len() < target {
         // what comes after a byte that isn't there is a guess
-        if rc.overran() || model.broken {
+        // past the memory budget the model can't go on
+        if rc.overran() || model.broken || model.heap.over {
             return (out, End::Cut, seen(&model));
         }
         match model.decode_symbol(&mut rc) {
             Some(b) => out.push(b),
             None => {
-                let end = if size.is_none() && !model.broken { End::Done } else { End::Cut };
+                let end = if size.is_none() && !model.broken && !model.heap.over { End::Done } else { End::Cut };
                 return (out, end, seen(&model));
             }
         }

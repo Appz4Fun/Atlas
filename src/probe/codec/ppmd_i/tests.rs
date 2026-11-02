@@ -25,6 +25,15 @@ fn decodes_what_pyppmd_made() {
 }
 
 #[test]
+fn the_biggest_model_a_header_can_ask_for_still_decodes() {
+    // the heap keeps only what's written, so this costs a few MiB, not 256 (see heap.rs's test)
+    let want = fixture("mixed.bin");
+    let (out, end, _) = run(&fixture("mixed-256m.ppmd"), Some(want.len() as u64), usize::MAX);
+    assert_eq!(end, End::Done);
+    assert!(out == want);
+}
+
+#[test]
 fn starts_over_or_cuts_back_when_memory_runs_out() {
     let want = lcg_text();
     for (name, restarts) in [("restart.ppmd", true), ("cutoff.ppmd", false)] {
