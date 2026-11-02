@@ -186,3 +186,37 @@ fn random_damage_never_panics() {
         }
     }
 }
+
+#[test]
+fn a_picture_bigger_than_4k_is_refused() {
+    // 8K by SPS: 512 x 270 macroblocks, refused before anything is allocated
+    let mut sps = vec![0x67, 100, 0, 51];
+    let mut bits = String::new();
+    let ue = |v: u32, bits: &mut String| {
+        let n = 32 - (v + 1).leading_zeros();
+        bits.push_str(&"0".repeat(n as usize - 1));
+        bits.push_str(&format!("{:b}", v + 1));
+    };
+    // id, chroma 4:2:0, luma and chroma depth 8
+    for v in [0, 1, 0, 0] {
+        ue(v, &mut bits);
+    }
+    bits.push_str("00"); // bypass, no scaling
+    ue(0, &mut bits); // log2_max_frame_num
+    ue(2, &mut bits); // poc type 2
+    ue(1, &mut bits); // refs
+    bits.push('0');
+    ue(511, &mut bits);
+    ue(269, &mut bits);
+    bits.push_str("1100"); // frame_mbs_only, direct8x8, no crop, no VUI
+    bits.push('1');
+    while !bits.len().is_multiple_of(8) {
+        bits.push('0');
+    }
+    sps.extend(bits.as_bytes().chunks(8).map(|c| u8::from_str_radix(std::str::from_utf8(c).unwrap(), 2).unwrap()));
+    let data = fixture("i8x8.h264");
+    let mut units = split_annex_b(&data);
+    let at = units.iter().position(|u| u[0] & 0x1F == 7).unwrap();
+    units[at] = &sps;
+    assert_eq!(decode_keyframe(&units).unwrap_err(), DecodeError::Unsupported("picture bigger than 4K"));
+}
