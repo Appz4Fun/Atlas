@@ -187,10 +187,10 @@ fn keyframe_from(
     let Some(e) = volume_end(ctx, layout, file, next, end, &mut data)? else { return Ok(None) };
     end = e;
     for _ in 0..MORE_ARTICLES {
-        match mkv::find_keyframe(&data, track) {
-            Found::Frame { start, len, timestamp } => return Ok(Some((data[start..start + len].to_vec(), timestamp))),
-            Found::Partial { start, len, .. } if start + len - data.len() > MORE_ARTICLES * data.len() => break,
-            _ => {}
+        // a frame not all here yet reads on: the article budget is the limit, since a volume's last article can be
+        // far shorter than the rest and says nothing about how many more the frame needs
+        if let Found::Frame { start, len, timestamp } = mkv::find_keyframe(&data, track) {
+            return Ok(Some((data[start..start + len].to_vec(), timestamp)));
         }
         if next > parts(file) {
             // on into the next volume, after its headers
