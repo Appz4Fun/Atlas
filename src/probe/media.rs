@@ -404,7 +404,13 @@ fn date_utc(b: &[u8]) -> Option<i64> {
 }
 
 /// The most attachments listed. Anime releases carry a few dozen fonts.
-const MAX_ATTACHMENTS: usize = 128;
+const MAX_ATTACHMENTS: usize = 64;
+/// The most characters kept of an attachment's name, type or description: a list, not a store.
+const MAX_ATTACHMENT_TEXT: usize = 96;
+
+fn short(b: &[u8]) -> String {
+    text(b).chars().take(MAX_ATTACHMENT_TEXT).collect()
+}
 /// The largest cover kept: covers are a few hundred KB, and each is stored with its release.
 pub const MAX_COVER: usize = 512 * 1024;
 
@@ -419,9 +425,9 @@ fn attachments(body: &[u8], info: &mut MediaInfo) {
         let mut data: Option<(&[u8], bool)> = None;
         walk_sized(file, &mut |id, v, size| {
             match id {
-                0x466E => a.name = text(v),
-                0x4660 => a.mime = Some(text(v)).filter(|m| !m.is_empty()),
-                0x467E => a.description = Some(text(v)).filter(|d| !d.is_empty()),
+                0x466E => a.name = short(v),
+                0x4660 => a.mime = Some(short(v)).filter(|m| !m.is_empty()),
+                0x467E => a.description = Some(short(v)).filter(|d| !d.is_empty()),
                 0x465C => {
                     a.size = size.unwrap_or(v.len() as u64);
                     data = Some((v, size == Some(v.len() as u64)));
@@ -907,6 +913,16 @@ mod tests {
         assert_eq!(m.cover, None);
         let json = serde_json::to_string(&m).unwrap();
         assert!(!json.contains("cover\":{"), "the image stays out of the JSON: {json}");
+    }
+
+    #[test]
+    fn a_flood_of_attachments_is_cut_short() {
+        let long = vec![b'a'; 100];
+        let files = attached(&long, &long, &[0; 4]).repeat(MAX_ATTACHMENTS + 2);
+        let m = parse(&with_attachments(&files, 0)).unwrap();
+        assert_eq!(m.attachments.len(), MAX_ATTACHMENTS);
+        assert_eq!(m.attachments[0].name.len(), MAX_ATTACHMENT_TEXT);
+        assert_eq!(m.attachments[0].mime.as_ref().unwrap().len(), MAX_ATTACHMENT_TEXT);
     }
 
     #[test]
