@@ -6,7 +6,9 @@
 //! shard, soo there are no clusters to keep in step: purging a release takes its row with it.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::LazyLock;
 
+use regex::Regex;
 use rusqlite::{Connection, OptionalExtension};
 use sha1::{Digest, Sha1};
 
@@ -101,19 +103,33 @@ fn posted_names(conn: &Connection, id: i64) -> Option<Vec<u8>> {
 /// Names that differ count as different archives, soo an obfuscated set makes no fingerprint, which is the safe way
 /// to be wrong: a release with another archive beside the one read must not match one without it.
 pub fn one_archive_set<'a>(mut names: impl Iterator<Item = &'a str>) -> bool {
-    let side_file = |name: &str| {
-        let lower = name.to_ascii_lowercase();
-        let ext = lower.rsplit('.').next().unwrap_or_default();
-        is_sample(&lower) || matches!(ext, "par2" | "nfo" | "sfv" | "txt" | "jpg" | "jpeg" | "png" | "nzb")
-    };
+    use crate::archive::select::{Kind, classify};
     let mut set = None;
     names.all(|name| {
-        side_file(name)
-            || (is_archive(name) && {
-                let stem = crate::archive::names::stem(name);
-                *set.get_or_insert(stem) == stem
-            })
+        let family = match classify(name) {
+            Kind::Par2Base | Kind::Par2Vol(_) | Kind::Nfo | Kind::Image => return true,
+            Kind::Rar(_) => "rar",
+            Kind::SevenZip(_) => "7z",
+            Kind::Zip(_) => "zip",
+            Kind::Numbered(_) => "numbered",
+            Kind::NotArchive | Kind::Unidentified => {
+                let lower = name.to_ascii_lowercase();
+                return is_sample(&lower) || lower.ends_with(".sfv") || lower.ends_with(".nzb");
+            }
+        };
+        let this = (family, volume_set(name));
+        *set.get_or_insert(this) == this
     }) && set.is_some()
+}
+
+/// A volume's name without what makes it that volume: `a.part01.rar`, `a.r00`, `a.z01`, `a.7z.001` and `a.001` are `a`.
+fn volume_set(name: &str) -> &str {
+    static VOLUME_END: LazyLock<Regex> = LazyLock::new(|| {
+        #[allow(clippy::unwrap_used)]
+        Regex::new(r"(?i)(\.part\d+\.rar|\.7z\.\d+|\.[^./\\]+)$").unwrap()
+    });
+    let name = crate::archive::names::base_name(name);
+    VOLUME_END.find(name).filter(|m| m.start() > 0).map_or(name, |m| &name[..m.start()])
 }
 
 fn is_archive(name: &str) -> bool {
@@ -516,6 +532,10 @@ mod tests {
         assert!(one(&["a.part01.rar", "a.part02.rar", "a.par2", "a.vol0+1.par2", "a.nfo", "a-sample.mkv"]));
         assert!(one(&["a.rar", "a.r00", "a.r01"]));
         assert!(one(&["a.7z.001", "a.7z.002"]));
+        assert!(one(&["a.z01", "a.z02", "a.zip"]), "a split ZIP");
+        assert!(one(&["a.rar", "a.s00"]));
+        assert!(one(&["a.cbz"]));
+        assert!(!one(&["a.rar", "a.zip"]), "same name, different archives");
         assert!(!one(&["a.rar", "b.rar"]), "two archives");
         assert!(!one(&["a.rar", "a.mkv"]), "something outside it");
         assert!(!one(&["a.nfo"]), "no archive at all");

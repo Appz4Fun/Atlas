@@ -83,6 +83,7 @@ impl Contents {
         // sizes are of the articles that are there. What's missing is taken to be as big as what isn't
         missing == 0
             || (self.data_articles_seen > 0
+                && self.data_bytes > 0
                 && i128::from(self.recovery_bytes) * i128::from(self.data_articles_seen)
                     >= missing * i128::from(self.data_bytes))
     }
@@ -381,6 +382,9 @@ mod tests {
             ..Contents::default()
         };
         assert!(thin.repairable());
+        // overviews can leave sizes out, and no sizes say nothing
+        let unsized_data = Contents { data_bytes: 0, recovery_bytes: 0, ..half_there };
+        assert!(!unsized_data.repairable());
     }
 
     #[test]
