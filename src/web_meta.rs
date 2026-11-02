@@ -113,9 +113,12 @@ pub(crate) fn card_trigger(id: i64, target: &str) -> String {
     trigger(&format!("/ui/row?id={id}&amp;as=card"), target, "beforeend")
 }
 
+/// Every click reaches htmx until a drawer is there: web.js folds and unfolds a loaded drawer before htmx sees the
+/// click, soo there is one fetch per drawer, and a failed one is tried again by the next click. While a fetch is in
+/// flight, a second click is dropped rather than fetched twice.
 fn trigger(url: &str, target: &str, swap: &str) -> String {
     format!(
-        " <button class=\"icon-button drawer-toggle\" type=\"button\" title=\"More facts\" aria-expanded=\"false\" hx-get=\"{url}\" hx-target=\"{target}\" hx-swap=\"{swap}\" hx-trigger=\"click once\">+</button>"
+        " <button class=\"icon-button drawer-toggle\" type=\"button\" title=\"More facts\" aria-expanded=\"false\" hx-get=\"{url}\" hx-target=\"{target}\" hx-swap=\"{swap}\" hx-trigger=\"click\" hx-sync=\"this:drop\">+</button>"
     )
 }
 
