@@ -84,6 +84,7 @@ pub const SHARD_TABLES: &[&ShardTable] = &[
     &crate::archive::store::NFO_PASSWORD,
     &crate::duplicates::FINGERPRINT,
     &crate::probe::PROBE,
+    &crate::probe::COVER,
     &crate::probe::opensubtitles::OPENSUBTITLES,
     &crate::predb::step::MATCH,
     &crate::predb::step::INNER_KEY,

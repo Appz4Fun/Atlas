@@ -33,9 +33,24 @@ pub fn name_source_label(source: i64) -> Option<&'static str> {
     .find_map(|(known, label)| (known as i64 == source).then_some(label))
 }
 
+/// One file of a release's NZB.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NzbFile {
+    pub name: String,
+    /// as posted: the articles' bytes, yEnc and all
+    pub bytes: i64,
+    pub seen: i64,
+    pub expected: i64,
+}
+
+/// The most files listed of one release. Some posts are thousands of little files.
+pub const MAX_LISTED_FILES: usize = 1000;
+
 /// Totals over a release's files.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Contents {
+    /// the files themselves, by name, `MAX_LISTED_FILES` at most
+    pub list: Vec<NzbFile>,
     pub files: i64,
     pub par2_files: i64,
     pub recovery_volumes: i64,
@@ -165,6 +180,9 @@ pub fn contents_with(conn: &Connection, id: i64) -> Result<Contents> {
         totals.articles_seen += seen;
         let want = expected.unwrap_or(seen).max(seen);
         totals.articles_expected += want;
+        if totals.list.len() < MAX_LISTED_FILES {
+            totals.list.push(NzbFile { name: filename.clone(), bytes: 0, seen, expected: want });
+        }
         if is_recovery_volume(&filename) {
             totals.recovery_articles_seen += seen;
             totals.recovery_articles_expected += want;
@@ -183,6 +201,23 @@ pub fn contents_with(conn: &Connection, id: i64) -> Result<Contents> {
         *bytes.entry(article.filename.unwrap_or_default()).or_default() += article.bytes.unwrap_or(0);
         Ok(())
     })?;
+    for file in &mut totals.list {
+        file.bytes = bytes.get(&file.name).copied().unwrap_or(0);
+    }
+    // the way they're read: the text files, then a RAR set from its first volume, then PAR2
+    totals.list.sort_by_cached_key(|f| {
+        let lower = f.name.to_ascii_lowercase();
+        let rank = if is_par2(&f.name) {
+            3
+        } else if lower.ends_with(".rar") {
+            1
+        } else if lower.ends_with(".nfo") || lower.ends_with(".sfv") || lower.ends_with(".txt") {
+            0
+        } else {
+            2
+        };
+        (rank, lower)
+    });
     for (filename, size) in bytes {
         if is_recovery_volume(&filename) {
             totals.recovery_bytes += size;

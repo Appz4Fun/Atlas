@@ -44,6 +44,37 @@ pub const PROBE: ShardTable = ShardTable {
     added: &[("moviehash", "TEXT")],
 };
 
+/// Cover art attached to a release's video, kept as it came: a JPEG or PNG of at most `media::MAX_COVER`.
+pub const COVER: ShardTable = ShardTable {
+    name: "release_cover",
+    create: "create table if not exists release_cover (
+        release_id INTEGER PRIMARY KEY,
+        mime       TEXT NOT NULL,
+        image      BLOB NOT NULL
+    )",
+    indexes: &[],
+    release_key: Some("release_id"),
+    added: &[],
+};
+
+pub const SET_COVER: &str = "insert or replace into release_cover (release_id, mime, image) values (?1, ?2, ?3)";
+pub const DROP_COVER: &str = "delete from release_cover where release_id = ?1";
+
+/// A release's cover art: its type and bytes.
+pub fn cover(conn: &rusqlite::Connection, release_id: i64) -> Option<(String, Vec<u8>)> {
+    let s = store::shard_of_id(release_id);
+    conn.query_row(&format!("select mime, image from s{s}.release_cover where release_id = ?"), [release_id], |r| {
+        Ok((r.get(0)?, r.get(1)?))
+    })
+    .ok()
+}
+
+/// Whether a release has cover art, without reading it.
+pub fn has_cover(conn: &rusqlite::Connection, release_id: i64) -> bool {
+    let s = store::shard_of_id(release_id);
+    conn.query_row(&format!("select 1 from s{s}.release_cover where release_id = ?"), [release_id], |_| Ok(())).is_ok()
+}
+
 pub const SET_PROBE: &str = "insert or replace into release_probe (release_id, crc32, agent, info, moviehash)
     values (?1, ?2, ?3, ?4, ?5)";
 

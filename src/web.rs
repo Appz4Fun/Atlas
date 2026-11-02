@@ -61,9 +61,10 @@ pub fn get(path: &str, query: &str, cookies: Option<&str>, base: &str, api_key: 
         "/ui/duplicates" if signed_in => duplicates_page(&args),
         "/ui/details" if signed_in => details_panel(&args),
         "/ui/poster" if signed_in => poster(&args),
+        "/ui/cover" if signed_in => cover(&args),
         "/ui/nzb" if signed_in && args.get("fill").is_some_and(|v| v == "1") => filled_nzb(&args),
         "/ui/nzb" if signed_in => get_nzb(&args),
-        "/ui/details" | "/ui/poster" => {
+        "/ui/details" | "/ui/poster" | "/ui/cover" => {
             ApiResponse { headers: vec![("HX-Redirect".into(), "/".into())], ..html(401, String::new()) }
         }
         "/ui/nzb" | "/ui/release" | "/ui/duplicates" => redirect(Vec::new()),
@@ -1091,6 +1092,7 @@ fn release_html(
         fact("Links", links);
     }
 
+    let nzb_files = nzb_files_html(contents);
     let files = if inner.files.is_empty() {
         String::new()
     } else {
@@ -1106,7 +1108,7 @@ fn release_html(
             })
             .collect();
         format!(
-            "<h2>Files inside</h2><div class=\"table-wrap\"><table><thead><tr><th>Name</th><th class=\"num\">Size</th></tr></thead><tbody>{rows}</tbody></table></div>"
+            "<h2>Files inside the archives</h2><div class=\"table-wrap\"><table><thead><tr><th>Name</th><th class=\"num\">Size</th></tr></thead><tbody>{rows}</tbody></table></div>"
         )
     };
 
@@ -1115,7 +1117,8 @@ fn release_html(
         .and_then(|conn| {
             let found = crate::probe::read(&conn, r.id)?;
             let matched = crate::probe::opensubtitles::read(&conn, r.id);
-            Some(probe_html(&found, matched.as_ref()))
+            let cover = crate::probe::has_cover(&conn, r.id).then_some(r.id);
+            Some(probe_html(&found, matched.as_ref(), cover))
         })
         .unwrap_or_default();
     let copies = crate::duplicates::copies(r.id).unwrap_or_default();
@@ -1141,12 +1144,47 @@ fn release_html(
 <div class="panel"><dl class="facts">{facts}</dl></div>
 {copies}
 {probe}
+{nzb_files}
 {files}
 </main></div>"#,
             masthead = masthead(true),
             id = r.id,
             name = escape(&r.name),
         ),
+    )
+}
+
+/// The files the NZB lists, with how many of each one's articles were seen.
+fn nzb_files_html(contents: &release_info::Contents) -> String {
+    if contents.list.is_empty() {
+        return String::new();
+    }
+    let rows: String = contents
+        .list
+        .iter()
+        .map(|f| {
+            let state = if f.seen >= f.expected {
+                tag("tag-ok", "COMPLETE")
+            } else {
+                tag("tag-warn", &format!("{} MISSING", thousands(f.expected - f.seen)))
+            };
+            format!(
+                "<tr><td class=\"name\">{}</td><td class=\"num col-size\" title=\"{} bytes\">{}</td><td class=\"num\">{} / {}</td><td class=\"col-state\">{state}</td></tr>",
+                escape(&f.name),
+                f.bytes,
+                escape(&fmt_size(Some(f.bytes))),
+                thousands(f.seen),
+                thousands(f.expected),
+            )
+        })
+        .collect();
+    let more = if (contents.files as usize) > contents.list.len() {
+        format!("<p class=\"note\">The first {} of {} files.</p>", contents.list.len(), thousands(contents.files))
+    } else {
+        String::new()
+    };
+    format!(
+        "<h2>Files in the NZB</h2><div class=\"table-wrap\"><table><thead><tr><th>Name</th><th class=\"num col-size\">Posted size</th><th class=\"num\">Articles</th><th class=\"col-state\">State</th></tr></thead><tbody>{rows}</tbody></table></div>{more}"
     )
 }
 
@@ -1190,7 +1228,11 @@ fn panel(title: &str, facts: &str) -> String {
 }
 
 /// What reading a release's articles found, without downloading it.
-fn probe_html(p: &crate::probe::ProbeInfo, matched: Option<&crate::probe::opensubtitles::Stored>) -> String {
+fn probe_html(
+    p: &crate::probe::ProbeInfo,
+    matched: Option<&crate::probe::opensubtitles::Stored>,
+    cover: Option<i64>,
+) -> String {
     let dd = |out: &mut String, name: &str, value: String| {
         if !value.is_empty() {
             let _ = write!(out, "<dt>{name}</dt><dd>{value}</dd>");
@@ -1282,6 +1324,13 @@ fn probe_html(p: &crate::probe::ProbeInfo, matched: Option<&crate::probe::opensu
         dd(&mut tracks, "Title", m.title.as_deref().map_or(String::new(), escape));
         dd(
             &mut tracks,
+            "Muxed",
+            m.muxed_at
+                .and_then(|t| chrono::DateTime::from_timestamp(t, 0))
+                .map_or(String::new(), |t| t.format("%Y-%m-%d %H:%M UTC").to_string()),
+        );
+        dd(
+            &mut tracks,
             "Duration",
             m.duration_secs.map_or(String::new(), |s| {
                 let s = s as u64;
@@ -1292,6 +1341,9 @@ fn probe_html(p: &crate::probe::ProbeInfo, matched: Option<&crate::probe::opensu
             let mut parts = vec![v.codec.clone()];
             if let (Some(w), Some(h)) = (v.width, v.height) {
                 parts.push(format!("{w}×{h}"));
+                if let Some(aspect) = display_aspect(w, h, v.display_width, v.display_height) {
+                    parts.push(aspect);
+                }
             }
             if let Some(rate) = v.frame_rate {
                 parts.push(format!("{rate:.3} fps"));
@@ -1300,13 +1352,21 @@ fn probe_html(p: &crate::probe::ProbeInfo, matched: Option<&crate::probe::opensu
                 parts.push(format!("{depth}-bit"));
             }
             parts.extend(v.hdr.clone());
+            parts.extend(v.primaries.and_then(primaries_name).map(str::to_string));
+            if v.hdr.is_none() {
+                parts.extend(v.transfer.and_then(transfer_name).map(str::to_string));
+            }
             if let Some(profile) = v.dv_profile {
+                let level = v.dv_level.filter(|l| *l > 0).map_or(String::new(), |l| format!(" level {l}"));
                 let layer = match v.dv_enhancement_layer {
                     Some(true) => ", enhancement layer",
                     _ => "",
                 };
-                parts.push(format!("Dolby Vision profile {profile}{layer}"));
+                parts.push(format!("Dolby Vision profile {profile}{level}{layer}"));
             }
+            parts.extend(v.max_cll.filter(|n| *n > 0).map(|n| format!("MaxCLL {n} nits")));
+            parts.extend(v.max_fall.filter(|n| *n > 0).map(|n| format!("MaxFALL {n} nits")));
+            parts.extend(v.language.clone().filter(|l| l != "und"));
             dd(&mut tracks, "Video", escape(&parts.join(", ")));
         }
         for a in &m.audio {
@@ -1369,6 +1429,31 @@ fn probe_html(p: &crate::probe::ProbeInfo, matched: Option<&crate::probe::opensu
         }
     }
 
+    let attachments = p.media.as_ref().map_or(String::new(), |m| {
+        if m.attachments.is_empty() {
+            return String::new();
+        }
+        let rows: String = m
+            .attachments
+            .iter()
+            .map(|a| {
+                format!(
+                    "<tr><td class=\"name\">{}</td><td class=\"dim\">{}</td><td class=\"num\">{}</td></tr>",
+                    escape(&a.name),
+                    escape(a.description.as_deref().or(a.mime.as_deref()).unwrap_or("")),
+                    fmt_size(Some(a.size as i64))
+                )
+            })
+            .collect();
+        format!(
+            "<h2>Attachments</h2><div class=\"table-wrap\"><table><thead><tr><th>Name</th><th>Type</th><th class=\"num\">Size</th></tr></thead><tbody>{rows}</tbody></table></div>"
+        )
+    });
+    let cover = cover.map_or(String::new(), |id| {
+        format!(
+            "<h2>Cover art</h2><div class=\"panel cover-panel\"><a href=\"/ui/cover?id={id}\"><img class=\"cover\" src=\"/ui/cover?id={id}\" alt=\"Cover art attached to the video\" loading=\"lazy\"></a></div>"
+        )
+    });
     let imdb: Vec<String> = p
         .imdb_ids
         .iter()
@@ -1390,7 +1475,7 @@ fn probe_html(p: &crate::probe::ProbeInfo, matched: Option<&crate::probe::opensu
         format!("<h2>SFV</h2><div class=\"table-wrap\"><table><tbody>{rows}</tbody></table></div>")
     };
     format!(
-        "{}{}{}{}{}{nfo}{sfv}",
+        "{cover}{}{}{attachments}{}{}{}{nfo}{sfv}",
         panel("Tracks", &tracks),
         panel("Chapters", &chapters),
         panel("yEnc", &yenc),
@@ -1678,6 +1763,56 @@ fn poster(args: &HashMap<String, String>) -> ApiResponse {
         body: String::new(),
         headers: vec![
             ("Cache-Control".into(), "private, max-age=2592000".into()),
+            ("X-Content-Type-Options".into(), "nosniff".into()),
+        ],
+        bytes: Some(bytes),
+        failed: false,
+    }
+}
+
+/// The shape it's shown in, when that's not the shape it's stored in: anamorphic video.
+fn display_aspect(w: u64, h: u64, dw: Option<u64>, dh: Option<u64>) -> Option<String> {
+    let (dw, dh) = (dw?, dh.unwrap_or(h));
+    if dw == 0 || dh == 0 || dw * h == dh * w {
+        return None;
+    }
+    Some(format!("shown at {:.2}:1", dw as f64 / dh as f64))
+}
+
+/// ITU-T H.273 colour primaries, as Matroska stores them.
+fn primaries_name(code: u64) -> Option<&'static str> {
+    match code {
+        1 => Some("BT.709"),
+        5 | 6 => Some("BT.601"),
+        9 => Some("BT.2020"),
+        11 => Some("DCI-P3"),
+        12 => Some("Display P3"),
+        _ => None,
+    }
+}
+
+/// The transfer, when it isn't already named as HDR.
+fn transfer_name(code: u64) -> Option<&'static str> {
+    match code {
+        16 => Some("PQ"),
+        18 => Some("HLG"),
+        _ => None,
+    }
+}
+
+/// The cover art attached to a release's video.
+fn cover(args: &HashMap<String, String>) -> ApiResponse {
+    let id = args.get("id").and_then(|v| v.trim().parse::<i64>().ok()).unwrap_or(0);
+    let Some((mime, bytes)) = crate::db::open().ok().and_then(|conn| crate::probe::cover(&conn, id)) else {
+        return ApiResponse::not_found();
+    };
+    let content_type = if mime == "image/png" { "image/png" } else { "image/jpeg" };
+    ApiResponse {
+        status: 200,
+        content_type: Some(content_type),
+        body: String::new(),
+        headers: vec![
+            ("Cache-Control".into(), "private, max-age=86400".into()),
             ("X-Content-Type-Options".into(), "nosniff".into()),
         ],
         bytes: Some(bytes),

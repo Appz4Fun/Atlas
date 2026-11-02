@@ -38,7 +38,7 @@ fn send(port: u16, request: &str) -> Reply {
     stream.write_all(request.as_bytes()).unwrap();
     let mut raw = Vec::new();
     stream.read_to_end(&mut raw).unwrap();
-    let raw = String::from_utf8(raw).unwrap();
+    let raw = String::from_utf8_lossy(&raw).into_owned();
     let (head, body) = raw.split_once("\r\n\r\n").unwrap();
     Reply { head: head.into(), body: body.into() }
 }
@@ -165,6 +165,34 @@ fn the_web_ui_end_to_end() {
         "{}",
         release.body
     );
+    assert!(release.body.contains("Files in the NZB") && release.body.contains("x.bin"), "{}", release.body);
+    assert!(!release.body.contains("Cover art"), "none kept yet: {}", release.body);
+    let info = r#"{"health":{},"headers":{},"crossposted_to":[],"imdb_ids":[],"sfv":{},"media":{"container":"matroska","attachments":[{"name":"cover.jpg","mime":"image/jpeg","size":4}],
+        "video":[{"codec":"V_MPEGH/ISO/HEVC","width":1440,"height":1080,"display_width":1920,"display_height":1080,"primaries":9,"dv_profile":8,"dv_level":6}]}}"#;
+    shard.execute("insert into release_probe (release_id, info) values (?, ?)", rusqlite::params![id, info]).unwrap();
+    let jpeg = [0xff_u8, 0xd8, 0xff, 0xd9];
+    shard
+        .execute(
+            "insert into release_cover (release_id, mime, image) values (?, 'image/jpeg', ?)",
+            rusqlite::params![id, jpeg],
+        )
+        .unwrap();
+    let release = fetch(port, &format!("/ui/release?id={id}"), &cookie);
+    for wanted in [
+        "Cover art",
+        &format!("/ui/cover?id={id}"),
+        "Attachments",
+        "cover.jpg",
+        "shown at 1.78:1",
+        "BT.2020",
+        "profile 8 level 6",
+    ] {
+        assert!(release.body.contains(wanted), "{wanted}: {}", release.body);
+    }
+    let cover = fetch(port, &format!("/ui/cover?id={id}"), &cookie);
+    assert_eq!((cover.status(), cover.header("Content-Type").as_deref()), (200, Some("image/jpeg")));
+    assert_eq!(fetch(port, &format!("/ui/cover?id={id}"), "").status(), 401);
+    assert_eq!(fetch(port, "/ui/cover?id=999999999", &cookie).status(), 404);
     assert_eq!(fetch(port, "/ui/release?id=999999999", &cookie).status(), 404);
     assert_eq!(fetch(port, &format!("/ui/release?id={id}"), "").status(), 303);
 
