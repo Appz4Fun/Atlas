@@ -20,8 +20,8 @@ const SEGMENT: usize = 20_000;
 /// what each article claims to be, soo the releases are big enough to want stills
 const CLAIMED: u64 = 12_000_000;
 
-fn clip() -> Vec<u8> {
-    std::fs::read(format!("{}/tests/fixtures/hevc/clip.mkv", env!("CARGO_MANIFEST_DIR"))).unwrap()
+fn clip(codec: &str) -> Vec<u8> {
+    std::fs::read(format!("{}/tests/fixtures/{codec}/clip.mkv", env!("CARGO_MANIFEST_DIR"))).unwrap()
 }
 
 /// The two volumes of a stored RAR4 set holding `inner` as `name`.
@@ -63,7 +63,7 @@ fn posts_of(first_number: u64, index: usize, count: usize, name: &str, data: &[u
 }
 
 #[test]
-fn hevc_releases_get_three_stills_from_their_middles() {
+fn video_releases_get_three_stills_from_their_middles() {
     let home = tempfile::tempdir().unwrap();
     // SAFETY: only test in this binary, set before any thread is spawned
     unsafe {
@@ -71,9 +71,12 @@ fn hevc_releases_get_three_stills_from_their_middles() {
         std::env::set_var("ATLAS_NO_KEYRING", "1");
         std::env::set_var("ATLAS_SAB_DIR", home.path().join("no-sabnzbd"));
     }
-    let inner = clip();
+    let inner = clip("hevc");
     let plain = "Plain.Film.2001.1080p.WEB-DL.x265-GRP";
     let mut posts = posts_of(1, 1, 1, &format!("{plain}.mkv"), &inner);
+    let avc = "Avc.Film.2003.720p.HDTV.x264-GRP";
+    let next = posts.len() as u64 + 1;
+    posts.extend(posts_of(next, 1, 1, &format!("{avc}.mkv"), &clip("h264")));
     let set = "Stored.Film.2002.1080p.BluRay.x265-GRP";
     let (first, last) = volumes(&format!("{set}.mkv"), &inner);
     let next = posts.len() as u64 + 1;
@@ -111,7 +114,7 @@ fn hevc_releases_get_three_stills_from_their_middles() {
                 q.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?.collect()
             })
             .unwrap_or_default();
-        if rows.len() == 6 {
+        if rows.len() == 9 {
             break rows;
         }
         assert!(Instant::now() < deadline, "stills so far: {rows:?}");
@@ -120,7 +123,7 @@ fn hevc_releases_get_three_stills_from_their_middles() {
     stop.store(true, Ordering::Relaxed);
     assert_eq!(runner.join().unwrap(), 0);
 
-    for name in [plain, set] {
+    for name in [plain, set, avc] {
         let mine: Vec<_> = rows.iter().filter(|r| r.0.starts_with(&name[..10])).collect();
         assert_eq!(mine.iter().map(|r| r.1).collect::<Vec<_>>(), [25, 50, 75], "{name}: {rows:?}");
         assert!(mine.iter().all(|r| (r.3, r.4) == (320, 180)));

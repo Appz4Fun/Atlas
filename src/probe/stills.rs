@@ -1,5 +1,5 @@
 //! Stills: a keyframe from a quarter, half and three quarters of the way into a release's video, decoded by
-//! our own decoder and kept as JPEGs. The articles are read from the middle of the file, a few each.
+//! our own HEVC or H.264 decoder and kept as JPEGs. The articles are read from the middle of the file, a few each.
 
 use sha2::Digest;
 
@@ -8,7 +8,7 @@ use crate::postprocess::schema::ShardTable;
 use crate::postprocess::step::{Got, Needs, Outcome, ReleaseInfo, Reruns, Step, StepCtx, StepError, StepId, StepWrite};
 use crate::store::{self, FileInfo, SegmentPick};
 use crate::video::mkv::{self, Codec, Found, VideoTrack};
-use crate::video::{hevc, jpeg};
+use crate::video::{h264, hevc, jpeg};
 
 use super::step::{fetch_raw, main_file};
 use super::{ProbeInfo, archive, moviehash, yenc};
@@ -205,7 +205,12 @@ fn still_of(track: &VideoTrack, frame: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
             units.extend(hevc::nal::split_sized(frame, hvcc.length_size).ok()?);
             hevc::decode_keyframe(&units).ok()?
         }
-        Codec::Avc => return None,
+        Codec::Avc => {
+            let avcc = h264::parse_avcc(&track.private).ok()?;
+            let mut units: Vec<&[u8]> = avcc.units.iter().map(Vec::as_slice).collect();
+            units.extend(hevc::nal::split_sized(frame, avcc.length_size).ok()?);
+            h264::decode_keyframe(&units).ok()?
+        }
     };
     let [y, cb, cr] = picture.to_8bit(STILL_WIDTH);
     let jpeg = jpeg::encode(&y.data, &cb.data, &cr.data, y.width, y.height, QUALITY);
@@ -249,11 +254,11 @@ impl Step for StillsStep {
         let Some(info) = info.and_then(|i| serde_json::from_str::<ProbeInfo>(&i).ok()) else {
             return Ok(Outcome::default());
         };
-        // only video we can decode: HEVC in Matroska, for now
+        // only video we can decode: HEVC or H.264 in Matroska, for now
         let media = info.media.as_ref();
         let wanted = media.is_some_and(|m| {
             matches!(m.container.as_str(), "matroska" | "webm")
-                && m.video.first().is_some_and(|v| v.codec == "V_MPEGH/ISO/HEVC")
+                && m.video.first().is_some_and(|v| matches!(v.codec.as_str(), "V_MPEGH/ISO/HEVC" | "V_MPEG4/ISO/AVC"))
         });
         if !wanted || info.archive.as_ref().is_some_and(|a| a.encrypted || a.method.as_deref() != Some("m0")) {
             return Ok(Outcome::default());
