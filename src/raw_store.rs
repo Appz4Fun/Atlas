@@ -11,6 +11,7 @@
 //!   `raw_backfill_deepest` / `raw_group_bounds`) so shard resets never require re-querying OpenSubtitles or
 //!   re-downloading probed Usenet article bodies or video stills.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 #[cfg(not(test))]
 use std::sync::{Mutex, OnceLock};
@@ -484,6 +485,8 @@ pub fn put_http_cache(source: &str, url: &str, status: u16, body: &str) {
     let cache_key = format!("GET:{source}:{clean_url}");
     let now = chrono::Utc::now().timestamp();
     let _ = with_raw(|conn| {
+        conn.prepare_cached("DELETE FROM raw_http_cache WHERE cache_key = ?1")?
+            .execute(params![&cache_key])?;
         prune_http_cache(conn, incoming_bytes, MAX_HTTP_CACHE_ROWS, MAX_HTTP_CACHE_BYTES, now)?;
         conn.prepare_cached(
             "INSERT OR REPLACE INTO raw_http_cache (cache_key, source, url, status, body_zst, fetched_at)
@@ -538,7 +541,8 @@ fn prune_predb_log(conn: &Connection, incoming_bytes: i64, max_rows: i64, max_by
 /// in `raw_http_cache`.
 pub fn record_predb_page(source_id: i64, source_key: &str, url: &str, page: u32, body: &str) {
     let Some(zst) = compress(body) else { return };
-    if zst.len() as i64 > MAX_PREDB_LOG_BYTES {
+    let incoming_bytes = zst.len() as i64;
+    if incoming_bytes > MAX_PREDB_LOG_BYTES {
         return;
     }
     let sha256 = Sha256::digest(body.as_bytes()).to_vec();
@@ -546,14 +550,22 @@ pub fn record_predb_page(source_id: i64, source_key: &str, url: &str, page: u32,
     let now = chrono::Utc::now().timestamp();
     let cache_forever = is_immutable_predb_page(source_key, page);
     let _ = with_raw(|conn| {
-        prune_predb_log(conn, zst.len() as i64, MAX_PREDB_LOG_ROWS, MAX_PREDB_LOG_BYTES)?;
-        conn.prepare_cached(
-            "INSERT OR IGNORE INTO raw_predb_log (source_id, source_key, url, page, body_sha256, body_zst, fetched_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        )?
-        .execute(params![source_id, source_key, clean_url, i64::from(page), sha256, &zst, now])?;
-        if cache_forever {
+        let already_archived: bool = conn
+            .prepare_cached("SELECT EXISTS(SELECT 1 FROM raw_predb_log WHERE source_id = ?1 AND body_sha256 = ?2)")?
+            .query_row(params![source_id, &sha256], |r| r.get(0))?;
+        if !already_archived {
+            prune_predb_log(conn, incoming_bytes, MAX_PREDB_LOG_ROWS, MAX_PREDB_LOG_BYTES)?;
+            conn.prepare_cached(
+                "INSERT OR IGNORE INTO raw_predb_log (source_id, source_key, url, page, body_sha256, body_zst, fetched_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            )?
+            .execute(params![source_id, source_key, &clean_url, i64::from(page), &sha256, &zst, now])?;
+        }
+        if cache_forever && incoming_bytes <= MAX_HTTP_CACHE_BYTES {
             let cache_key = format!("GET:{source_key}:{clean_url}");
+            conn.prepare_cached("DELETE FROM raw_http_cache WHERE cache_key = ?1")?
+                .execute(params![&cache_key])?;
+            prune_http_cache(conn, incoming_bytes, MAX_HTTP_CACHE_ROWS, MAX_HTTP_CACHE_BYTES, now)?;
             conn.prepare_cached(
                 "INSERT OR REPLACE INTO raw_http_cache (cache_key, source, url, status, body_zst, fetched_at)
                  VALUES (?1, ?2, ?3, 200, ?4, ?5)",
@@ -570,48 +582,76 @@ fn first_segment_mid_in(
     file_id: i64,
     blob: Option<&[u8]>,
 ) -> rusqlite::Result<String> {
+    let mut best: Option<(Option<i64>, String)> = None;
+    let mut consider = |part: Option<i64>, mid: String| {
+        if mid.is_empty() {
+            return;
+        }
+        let replace = match &best {
+            Some((bp, bm)) => crate::store::subject_key(part, &mid) < crate::store::subject_key(*bp, bm),
+            None => true,
+        };
+        if replace {
+            best = Some((part, mid));
+        }
+    };
     if has_table(conn, schema, "segments")? {
         let has_domains = has_table(conn, schema, "domains")?;
         let sql = if has_domains {
             format!(
-                "SELECT s.local, d.suffix
+                "SELECT s.part, s.local, d.suffix
                  FROM {schema}.segments s
                  LEFT JOIN {schema}.domains d ON d.id = s.domain
-                 WHERE s.file_id = ?1
-                 ORDER BY s.part IS NOT NULL, s.part, s.local
-                 LIMIT 1"
+                 WHERE s.file_id = ?1"
             )
         } else {
             format!(
-                "SELECT s.local, NULL
+                "SELECT s.part, s.local, NULL
                  FROM {schema}.segments s
-                 WHERE s.file_id = ?1
-                 ORDER BY s.part IS NOT NULL, s.part, s.local
-                 LIMIT 1"
+                 WHERE s.file_id = ?1"
             )
         };
-        if let Some((local, suffix)) = conn
-            .prepare_cached(&sql)?
-            .query_row([file_id], |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Option<String>>(1)?)))
-            .optional()?
-        {
-            return Ok(crate::store::decode(&local, suffix.as_deref()));
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let mut rows = stmt.query([file_id])?;
+        while let Some(r) = rows.next()? {
+            let part: Option<i64> = r.get(0)?;
+            let local: Vec<u8> = r.get(1)?;
+            let suffix: Option<String> = r.get(2)?;
+            consider(part, crate::store::decode(&local, suffix.as_deref()));
         }
     }
     if let Some(bytes) = blob
         && let Ok(segs) = crate::blob::decode_capped(bytes, crate::store::READ_MAX_SEGMENTS as usize)
-        && let Some(seg) = segs.iter().min_by_key(|s| (s.part.is_some(), s.part.unwrap_or(0)))
     {
-        let suffix: Option<String> = if seg.domain != 0 && has_table(conn, schema, "domains")? {
-            conn.prepare_cached(&format!("SELECT suffix FROM {schema}.domains WHERE id = ?1"))?
-                .query_row([seg.domain], |r| r.get(0))
-                .optional()?
-        } else {
-            None
-        };
-        return Ok(crate::store::decode(&seg.local, suffix.as_deref()));
+        let has_domains = has_table(conn, schema, "domains")?;
+        for seg in segs {
+            let suffix: Option<String> = if seg.domain != 0 && has_domains {
+                conn.prepare_cached(&format!("SELECT suffix FROM {schema}.domains WHERE id = ?1"))?
+                    .query_row([seg.domain], |r| r.get(0))
+                    .optional()?
+            } else {
+                None
+            };
+            consider(seg.part, crate::store::decode(&seg.local, suffix.as_deref()));
+        }
     }
-    Ok(String::new())
+    Ok(best.map(|(_, mid)| mid).unwrap_or_default())
+}
+
+fn hash_file_fields_into(
+    hasher: &mut Sha256,
+    filename: &str,
+    first_mid: &str,
+    expected: Option<i64>,
+    seen: &[u8],
+) {
+    hasher.update((filename.len() as u64).to_le_bytes());
+    hasher.update(filename.as_bytes());
+    hasher.update((first_mid.len() as u64).to_le_bytes());
+    hasher.update(first_mid.as_bytes());
+    hasher.update(expected.unwrap_or(-1).to_le_bytes());
+    hasher.update((seen.len() as u64).to_le_bytes());
+    hasher.update(seen);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -634,19 +674,13 @@ fn hash_file_row_into(
             resolved.as_str()
         }
     };
-    hasher.update((filename.len() as u64).to_le_bytes());
-    hasher.update(filename.as_bytes());
-    hasher.update((first_mid.len() as u64).to_le_bytes());
-    hasher.update(first_mid.as_bytes());
-    hasher.update(expected.unwrap_or(-1).to_le_bytes());
-    hasher.update((seen.len() as u64).to_le_bytes());
-    hasher.update(seen);
+    hash_file_fields_into(hasher, filename, first_mid, expected, seen);
     Ok(())
 }
 
 /// Computes a deterministic SHA-256 content identity for `release_id` in `schema` from its ordered
 /// files and their first article message-IDs (`subject_mid` / first segment), expected part count,
-/// and seen-parts bitmap (or from `articles` in legacy pre-sharding databases).
+/// and seen-parts bitmap (folded identically from `articles` in legacy pre-sharding databases).
 /// Returns `None` if the release has no indexed files or articles.
 pub fn release_content_id_in(conn: &Connection, schema: &str, release_id: i64) -> Option<Vec<u8>> {
     if has_table(conn, schema, "files").unwrap_or(false) {
@@ -684,26 +718,37 @@ pub fn release_content_id_in(conn: &Connection, schema: &str, release_id: i64) -
     }
     if has_table(conn, schema, "articles").unwrap_or(false) {
         let sql = format!(
-            "SELECT coalesce(filename, ''), coalesce(message_id, ''), coalesce(part, -1), coalesce(total_parts, -1), coalesce(bytes, 0)
-             FROM {schema}.articles WHERE release_id = ?1
-             ORDER BY coalesce(filename, ''), part IS NOT NULL, part, coalesce(message_id, '')"
+            "SELECT coalesce(filename, ''), coalesce(message_id, ''), part, total_parts
+             FROM {schema}.articles WHERE release_id = ?1"
         );
         let mut stmt = conn.prepare_cached(&sql).ok()?;
-        let rows: Vec<(String, String, i64, i64, i64)> = stmt
-            .query_map([release_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
-            .ok()?
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .ok()?;
-        if !rows.is_empty() {
+        let mut rows = stmt.query([release_id]).ok()?;
+        let mut files: BTreeMap<String, crate::store::FileState> = BTreeMap::new();
+        while let Some(r) = rows.next().ok()? {
+            let filename: String = r.get(0).ok()?;
+            let mid: String = r.get(1).ok()?;
+            if mid.is_empty() {
+                continue;
+            }
+            let part: Option<i64> = r.get(2).ok()?;
+            let total_parts: Option<i64> = r.get(3).ok()?;
+            files.entry(filename).or_default().add(&crate::parser::Article {
+                message_id: mid,
+                part,
+                total_parts,
+                ..crate::parser::Article::default()
+            });
+        }
+        if !files.is_empty() {
             let mut hasher = Sha256::new();
-            for (filename, mid, part, total, bytes) in rows {
-                hasher.update((filename.len() as u64).to_le_bytes());
-                hasher.update(filename.as_bytes());
-                hasher.update((mid.len() as u64).to_le_bytes());
-                hasher.update(mid.as_bytes());
-                hasher.update(part.to_le_bytes());
-                hasher.update(total.to_le_bytes());
-                hasher.update(bytes.to_le_bytes());
+            for (filename, f) in &files {
+                hash_file_fields_into(
+                    &mut hasher,
+                    filename,
+                    f.subject_mid.as_deref().unwrap_or(""),
+                    f.expected,
+                    &f.seen,
+                );
             }
             return Some(hasher.finalize().to_vec());
         }
@@ -763,7 +808,12 @@ pub fn put_opensubtitles(moviehash: &str, feature: Option<&Feature>) {
     let f = feature.cloned().unwrap_or_default();
     let now = chrono::Utc::now().timestamp();
     let _ = with_raw(|conn| {
-        prune_opensubtitles(conn, MAX_OPENSUBTITLES_ROWS)?;
+        let exists: bool = conn
+            .prepare_cached("SELECT EXISTS(SELECT 1 FROM raw_opensubtitles WHERE moviehash = ?1)")?
+            .query_row(params![moviehash], |r| r.get(0))?;
+        if !exists {
+            prune_opensubtitles(conn, MAX_OPENSUBTITLES_ROWS)?;
+        }
         conn.prepare_cached(
             "INSERT INTO raw_opensubtitles
              (moviehash, imdb_id, tmdb_id, kind, title, year, season, episode, release_name, raw_json_zst, checked_at)
@@ -875,26 +925,36 @@ pub struct ProbeRecord<'a> {
     pub cover: Option<(&'a str, &'a str)>,
 }
 
+fn delete_oldest_probes(conn: &Connection, limit: i64) -> rusqlite::Result<usize> {
+    let victims: Vec<(String, String)> = conn
+        .prepare_cached("SELECT name, group_name FROM raw_probes ORDER BY probed_at ASC LIMIT ?1")?
+        .query_map(params![limit], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if victims.is_empty() {
+        return Ok(0);
+    }
+    let mut del_probe = conn.prepare_cached("DELETE FROM raw_probes WHERE name = ?1 AND group_name = ?2")?;
+    let mut del_pw = conn.prepare_cached("DELETE FROM raw_nfo_passwords WHERE name = ?1 AND group_name = ?2")?;
+    let mut del_cov = conn.prepare_cached("DELETE FROM raw_covers WHERE name = ?1 AND group_name = ?2")?;
+    let mut deleted = 0;
+    for (name, group) in &victims {
+        deleted += del_probe.execute(params![name, group])?;
+        del_pw.execute(params![name, group])?;
+        del_cov.execute(params![name, group])?;
+    }
+    Ok(deleted)
+}
+
 fn prune_probes(conn: &Connection, incoming_bytes: i64, max_rows: i64, max_bytes: i64) -> rusqlite::Result<()> {
     let rows = raw_meta_get(conn, "probe_rows")?;
     let mut bytes = raw_meta_get(conn, "probe_bytes")?;
     if rows >= max_rows {
         let to_drop = (rows - max_rows + 1).max(64);
-        conn.execute(
-            "DELETE FROM raw_probes WHERE (name, group_name) IN (
-                SELECT name, group_name FROM raw_probes ORDER BY probed_at ASC LIMIT ?1
-            )",
-            params![to_drop],
-        )?;
+        delete_oldest_probes(conn, to_drop)?;
         bytes = raw_meta_get(conn, "probe_bytes")?;
     }
     while bytes + incoming_bytes > max_bytes {
-        let deleted = conn.execute(
-            "DELETE FROM raw_probes WHERE (name, group_name) IN (
-                SELECT name, group_name FROM raw_probes ORDER BY probed_at ASC LIMIT 64
-            )",
-            [],
-        )?;
+        let deleted = delete_oldest_probes(conn, 64)?;
         if deleted == 0 {
             break;
         }
@@ -915,6 +975,8 @@ pub fn put_probe(rec: &ProbeRecord<'_>) {
     }
     let now = chrono::Utc::now().timestamp();
     let _ = with_raw(|conn| {
+        conn.prepare_cached("DELETE FROM raw_probes WHERE name = ?1 AND group_name = ?2")?
+            .execute(params![rec.name, rec.group_name])?;
         prune_probes(conn, incoming_bytes, MAX_RAW_PROBES_ROWS, MAX_RAW_PROBES_BYTES)?;
         conn.prepare_cached(
             "INSERT OR REPLACE INTO raw_probes
@@ -934,7 +996,22 @@ pub fn put_probe(rec: &ProbeRecord<'_>) {
             rec.config_stamp as i64,
             now
         ])?;
-        if let Some(pw) = rec.nfo_password {
+        if let Some(pw) = rec.nfo_password.filter(|pw| pw.len() <= 256) {
+            let exists: bool = conn
+                .prepare_cached("SELECT EXISTS(SELECT 1 FROM raw_nfo_passwords WHERE name = ?1 AND group_name = ?2)")?
+                .query_row(params![rec.name, rec.group_name], |r| r.get(0))?;
+            if !exists {
+                let count: i64 = conn.query_row("SELECT count(*) FROM raw_nfo_passwords", [], |r| r.get(0))?;
+                if count >= MAX_RAW_PROBES_ROWS {
+                    let to_drop = (count - MAX_RAW_PROBES_ROWS + 1).max(64);
+                    conn.execute(
+                        "DELETE FROM raw_nfo_passwords WHERE (name, group_name) IN (
+                            SELECT name, group_name FROM raw_nfo_passwords LIMIT ?1
+                        )",
+                        params![to_drop],
+                    )?;
+                }
+            }
             conn.prepare_cached(
                 "INSERT OR REPLACE INTO raw_nfo_passwords (name, group_name, content_id, password) VALUES (?1, ?2, ?3, ?4)",
             )?
@@ -942,6 +1019,21 @@ pub fn put_probe(rec: &ProbeRecord<'_>) {
         }
         match rec.cover {
             Some((mime, sha256)) => {
+                let exists: bool = conn
+                    .prepare_cached("SELECT EXISTS(SELECT 1 FROM raw_covers WHERE name = ?1 AND group_name = ?2)")?
+                    .query_row(params![rec.name, rec.group_name], |r| r.get(0))?;
+                if !exists {
+                    let count: i64 = conn.query_row("SELECT count(*) FROM raw_covers", [], |r| r.get(0))?;
+                    if count >= MAX_RAW_PROBES_ROWS {
+                        let to_drop = (count - MAX_RAW_PROBES_ROWS + 1).max(64);
+                        conn.execute(
+                            "DELETE FROM raw_covers WHERE (name, group_name) IN (
+                                SELECT name, group_name FROM raw_covers LIMIT ?1
+                            )",
+                            params![to_drop],
+                        )?;
+                    }
+                }
                 conn.prepare_cached(
                     "INSERT OR REPLACE INTO raw_covers (name, group_name, content_id, mime, sha256) VALUES (?1, ?2, ?3, ?4, ?5)",
                 )?
@@ -1253,15 +1345,26 @@ pub fn put_archive(rec: &ArchiveRecord<'_>) {
             }
         }
         if let Some(pw) = rec.password {
-            let count: i64 = conn.query_row("SELECT count(*) FROM raw_archives", [], |r| r.get(0))?;
-            if count >= MAX_RAW_ARCHIVES_ROWS {
-                let to_drop = (count - MAX_RAW_ARCHIVES_ROWS + 1).max(64);
-                conn.execute(
-                    "DELETE FROM raw_archives WHERE (name, group_name) IN (
-                        SELECT name, group_name FROM raw_archives LIMIT ?1
-                    )",
-                    params![to_drop],
-                )?;
+            let exists: bool = conn
+                .prepare_cached("SELECT EXISTS(SELECT 1 FROM raw_archives WHERE name = ?1 AND group_name = ?2)")?
+                .query_row(params![rec.name, rec.group_name], |r| r.get(0))?;
+            if !exists {
+                let count: i64 = conn.query_row("SELECT count(*) FROM raw_archives", [], |r| r.get(0))?;
+                if count >= MAX_RAW_ARCHIVES_ROWS {
+                    let to_drop = (count - MAX_RAW_ARCHIVES_ROWS + 1).max(64);
+                    let victims: Vec<(String, String)> = conn
+                        .prepare_cached("SELECT name, group_name FROM raw_archives LIMIT ?1")?
+                        .query_map(params![to_drop], |r| Ok((r.get(0)?, r.get(1)?)))?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    let mut del_arch = conn.prepare_cached("DELETE FROM raw_archives WHERE name = ?1 AND group_name = ?2")?;
+                    let mut del_files = conn.prepare_cached(
+                        "DELETE FROM raw_archive_inner_files WHERE release_name = ?1 AND group_name = ?2",
+                    )?;
+                    for (name, group) in &victims {
+                        del_arch.execute(params![name, group])?;
+                        del_files.execute(params![name, group])?;
+                    }
+                }
             }
             conn.prepare_cached(
                 "INSERT OR REPLACE INTO raw_archives
@@ -1355,15 +1458,20 @@ pub fn put_par2(rec: &Par2Record<'_>) {
         return;
     }
     let _ = with_raw(|conn| {
-        let count: i64 = conn.query_row("SELECT count(*) FROM raw_par2", [], |r| r.get(0))?;
-        if count >= MAX_RAW_ARCHIVES_ROWS {
-            let to_drop = (count - MAX_RAW_ARCHIVES_ROWS + 1).max(64);
-            conn.execute(
-                "DELETE FROM raw_par2 WHERE (name, group_name) IN (
-                    SELECT name, group_name FROM raw_par2 LIMIT ?1
-                )",
-                params![to_drop],
-            )?;
+        let exists: bool = conn
+            .prepare_cached("SELECT EXISTS(SELECT 1 FROM raw_par2 WHERE name = ?1 AND group_name = ?2)")?
+            .query_row(params![rec.name, rec.group_name], |r| r.get(0))?;
+        if !exists {
+            let count: i64 = conn.query_row("SELECT count(*) FROM raw_par2", [], |r| r.get(0))?;
+            if count >= MAX_RAW_ARCHIVES_ROWS {
+                let to_drop = (count - MAX_RAW_ARCHIVES_ROWS + 1).max(64);
+                conn.execute(
+                    "DELETE FROM raw_par2 WHERE (name, group_name) IN (
+                        SELECT name, group_name FROM raw_par2 LIMIT ?1
+                    )",
+                    params![to_drop],
+                )?;
+            }
         }
         conn.prepare_cached(
             "INSERT OR REPLACE INTO raw_par2
@@ -2048,9 +2156,22 @@ mod tests {
             let conn = create(&raw_path).unwrap();
             assert_eq!(raw_meta_get(&conn, "probe_rows").unwrap(), 1);
             assert_eq!(raw_meta_get(&conn, "probe_bytes").unwrap(), r#"{"nfo":"hi"}"#.len() as i64);
+            // Recording a duplicate PreDB payload at MAX_PREDB_LOG_ROWS must not evict existing rows
+            record_predb_page(1, "predb_club", "https://predb.club/api/v1/?page=2", 2, r#"{"data":{"rows":[]}}"#);
+            let pre_count: i64 = conn.query_row("SELECT count(*) FROM raw_predb_log", [], |r| r.get(0)).unwrap();
+            assert_eq!(pre_count, 1);
+            conn.execute("UPDATE raw_meta SET value = ?1 WHERE key = 'predb_rows'", [MAX_PREDB_LOG_ROWS]).unwrap();
+            record_predb_page(1, "predb_club", "https://predb.club/api/v1/?page=2", 2, r#"{"data":{"rows":[]}}"#);
+            let post_count: i64 = conn.query_row("SELECT count(*) FROM raw_predb_log", [], |r| r.get(0)).unwrap();
+            assert_eq!(post_count, 1, "duplicate PreDB payload must not trigger eviction");
+
             prune_probes(&conn, MAX_RAW_PROBES_BYTES, MAX_RAW_PROBES_ROWS, MAX_RAW_PROBES_BYTES).unwrap();
             assert_eq!(raw_meta_get(&conn, "probe_rows").unwrap(), 0);
             assert_eq!(raw_meta_get(&conn, "probe_bytes").unwrap(), 0);
+            let pw_count: i64 = conn.query_row("SELECT count(*) FROM raw_nfo_passwords", [], |r| r.get(0)).unwrap();
+            let cov_count: i64 = conn.query_row("SELECT count(*) FROM raw_covers", [], |r| r.get(0)).unwrap();
+            assert_eq!(pw_count, 0, "dependent raw_nfo_passwords row must be pruned with parent probe");
+            assert_eq!(cov_count, 0, "dependent raw_covers row must be pruned with parent probe");
             let now = chrono::Utc::now().timestamp();
             prune_http_cache(&conn, MAX_HTTP_CACHE_BYTES, MAX_HTTP_CACHE_ROWS, MAX_HTTP_CACHE_BYTES, now).unwrap();
             assert_eq!(raw_meta_get(&conn, "http_rows").unwrap(), 0);
@@ -2058,6 +2179,76 @@ mod tests {
         }
 
         set_test_raw_path(None);
+    }
+
+    #[test]
+    fn legacy_articles_content_id_matches_sharded_files_content_id() {
+        let legacy = Connection::open_in_memory().unwrap();
+        legacy
+            .execute_batch(
+                "CREATE TABLE articles (
+                    id INTEGER PRIMARY KEY,
+                    release_id INTEGER,
+                    message_id TEXT,
+                    subject TEXT,
+                    filename TEXT,
+                    part INTEGER,
+                    total_parts INTEGER,
+                    bytes INTEGER,
+                    file_total INTEGER
+                );
+                INSERT INTO articles (release_id, message_id, subject, filename, part, total_parts, bytes, file_total) VALUES
+                    (1, '<seg2@news.example>', 'sub2', 'movie.mkv', 2, 2, 750000, 2),
+                    (1, '<seg1@news.example>', 'sub1', 'movie.mkv', 1, 2, 750000, 2),
+                    (1, '<nfo1@news.example>', 'subnfo', 'movie.nfo', 1, 1, 4096, 1);",
+            )
+            .unwrap();
+
+        let sharded = Connection::open_in_memory().unwrap();
+        crate::store::build_shard(&sharded).unwrap();
+        let articles = [
+            crate::parser::Article {
+                message_id: "<seg2@news.example>".into(),
+                subject: "sub2".into(),
+                filename: Some("movie.mkv".into()),
+                part: Some(2),
+                total_parts: Some(2),
+                bytes: 750000,
+                file_total: Some(2),
+                ..Default::default()
+            },
+            crate::parser::Article {
+                message_id: "<seg1@news.example>".into(),
+                subject: "sub1".into(),
+                filename: Some("movie.mkv".into()),
+                part: Some(1),
+                total_parts: Some(2),
+                bytes: 750000,
+                file_total: Some(2),
+                ..Default::default()
+            },
+            crate::parser::Article {
+                message_id: "<nfo1@news.example>".into(),
+                subject: "subnfo".into(),
+                filename: Some("movie.nfo".into()),
+                part: Some(1),
+                total_parts: Some(1),
+                bytes: 4096,
+                file_total: Some(1),
+                ..Default::default()
+            },
+        ];
+        for name in ["movie.mkv", "movie.nfo"] {
+            let mut f = crate::store::file(&sharded, 1, name).unwrap();
+            for a in articles.iter().filter(|a| a.filename.as_deref() == Some(name)) {
+                f.add(a);
+            }
+            crate::store::put_file(&sharded, &f).unwrap();
+        }
+
+        let legacy_cid = release_content_id(&legacy, 1).expect("legacy content_id");
+        let sharded_cid = release_content_id(&sharded, 1).expect("sharded content_id");
+        assert_eq!(legacy_cid, sharded_cid);
     }
 
     #[test]
