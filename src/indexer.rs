@@ -213,7 +213,7 @@ impl Drop for Writers {
 struct SaveJob {
     releases: Vec<Release>,
     /// `(name, group, display name)` of releases saved before
-    names: Vec<(String, String, String)>,
+    names: Vec<crate::store::FoundName>,
     done: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
 }
 
@@ -484,7 +484,7 @@ impl Db {
         self.send(shard, releases, Vec::new()).await
     }
 
-    async fn send(&self, shard: usize, releases: Vec<Release>, names: Vec<(String, String, String)>) -> Result<()> {
+    async fn send(&self, shard: usize, releases: Vec<Release>, names: Vec<crate::store::FoundName>) -> Result<()> {
         let (done, saved) = tokio::sync::oneshot::channel();
         crate::profile::LOAD.writer_queued.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if self.saves[shard].send(WriterJob::Save(SaveJob { releases, names, done })).is_err() {
@@ -525,8 +525,8 @@ fn settle_names(named: Named, finished: &mut Finished, done: &mut usize, error: 
     }
 }
 
-/// Releases of a slice and the bodies that may name them (see `name_sources`).
-type NameJobs = Vec<(String, Vec<(String, Extract)>)>;
+/// Releases of a slice, as their name and collection, and the bodies that may name them (see `name_sources`).
+type NameJobs = Vec<((String, Option<String>), Vec<(String, Extract)>)>;
 
 /// Look up real names for releases of `group` that are saved already, and
 /// save the ones found. A pass runs these alongside its next slices and waits
@@ -541,11 +541,16 @@ async fn name_releases(
     _permit: tokio::sync::OwnedSemaphorePermit,
 ) -> Result<()> {
     let t = Instant::now();
-    let (releases, sources): (Vec<String>, Vec<_>) = jobs.into_iter().unzip();
+    let (releases, sources): (Vec<_>, Vec<_>) = jobs.into_iter().unzip();
     let found = first_names(pool, sources).await;
     crate::profile::NAMES.add_since(t);
-    let names: Vec<_> =
-        releases.into_iter().zip(found).filter_map(|(name, found)| Some((name, group.clone(), found?))).collect();
+    let names: Vec<_> = releases
+        .into_iter()
+        .zip(found)
+        .filter_map(|((name, collection), found)| {
+            Some(crate::store::FoundName { name, collection, group: group.clone(), display: found? })
+        })
+        .collect();
     if names.is_empty() {
         return Ok(());
     }
@@ -1929,8 +1934,8 @@ fn slice_date(headers: &[Overview]) -> Option<db::Dated> {
 
 /// Parse one slice into releases, look up real names, save.
 /// `unsaved` is the slice's room in the unsaved budget: it goes back once the
-/// headers are parsed, soo slow name lookups and saves dont hold the budget
-/// (a pass saves one slice at a time, soo what it holds past it is one slice).
+/// slice is saved, before its names are looked up, soo slow name lookups dont
+/// hold the budget but releases waiting on the writer still count in it.
 async fn save_slice(
     db: &Db,
     group: &str,
@@ -1976,13 +1981,16 @@ async fn parse_and_save(
         tokio::task::spawn_blocking(parsing).await.map_err(|e| anyhow!("parse task failed: {e}"))?;
     crate::profile::PARSE.add_since(t);
     crate::profile::Load::add_since(&crate::profile::LOAD.parse_ns, t);
-    drop(unsaved);
 
     // real names from par2/nfo bodies come after the save, alongside the
     // pass's next slices: a slow body doesnt hold up the pass. Once the
     // naming stage has a body budget it reads them, not the save path.
     let names: Vec<_> = if crate::archive::inline_lookups() {
-        releases.iter().map(|r| (r.name.clone(), name_sources(r))).filter(|(_, sources)| !sources.is_empty()).collect()
+        releases
+            .iter()
+            .map(|r| ((r.name.clone(), r.collection.clone()), name_sources(r)))
+            .filter(|(_, sources)| !sources.is_empty())
+            .collect()
     } else {
         Vec::new()
     };
@@ -2006,6 +2014,9 @@ async fn parse_and_save(
         }
         saved?;
     }
+    // the parsed releases stood for these headers until they were committed: the room goes back only now, soo
+    // slices waiting on a slow writer stay inside `max_unsaved_headers`
+    drop(unsaved);
 
     Ok((Progress { articles, bytes, releases: count, skipped }, names))
 }

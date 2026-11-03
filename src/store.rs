@@ -1482,15 +1482,27 @@ impl ShardWriter {
         Ok(sealed)
     }
 
-    /// Names par2 / nfo bodies gave releases saved before, as
-    /// `(name, group, display name)`, in one transaction.
-    pub fn set_names(&mut self, conn: &mut Connection, names: &[(String, String, String)]) -> Result<()> {
+    /// Names par2 / nfo bodies gave releases saved before, in one transaction. Each goes to the row its release
+    /// was saved under: a collection's is the row its key points at, whose name may not be the slice's (see
+    /// `collection_row`). A name a later stage gave a row stays, as the save's upsert leaves it.
+    pub fn set_names(&mut self, conn: &mut Connection, names: &[FoundName]) -> Result<()> {
         let tx = conn.transaction()?;
         {
-            let mut update =
-                tx.prepare_cached("update releases set display_name = ?3 where name = ?1 and group_name = ?2")?;
-            for (name, group, display) in names {
-                update.execute(params![name, group, display])?;
+            let key = IdKey::of(&tx)?;
+            let mut by_key = tx.prepare_cached("select release_id from collections where key = ?")?;
+            let mut by_name = tx.prepare_cached("select id from releases where name = ? and group_name = ?")?;
+            let mut update = tx.prepare_cached(
+                "update releases set display_name = ?2 where id = ?1 and name_source is null
+                 and display_name is not ?2",
+            )?;
+            for found in names {
+                let id: Option<i64> = match &found.collection {
+                    Some(collection) => by_key.query_row([key.hash(collection)], |r| r.get(0)).optional()?,
+                    None => by_name.query_row(params![found.name, found.group], |r| r.get(0)).optional()?,
+                };
+                if let Some(id) = id {
+                    update.execute(params![id, found.display])?;
+                }
             }
         }
         tx.commit()
@@ -1808,6 +1820,16 @@ fn split_old_rows<'a>(tx: &Connection, grouping_from: i64, release: &'a Release)
         pieces.push(Cow::Owned(piece(name, release.collection.clone(), rest.clone())));
     }
     Ok(pieces)
+}
+
+/// A real name found for a release saved before: the release as the slice had it (its name, and its collection
+/// when it has one), its group, and the name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FoundName {
+    pub name: String,
+    pub collection: Option<String>,
+    pub group: String,
+    pub display: String,
 }
 
 /// A collection in a save: its hash, the name its release is saved under,
@@ -4108,6 +4130,38 @@ mod tests {
             .query_row("select display_name, is_obfuscated from releases", [], |r| Ok((r.get(0)?, r.get(1)?)))
             .unwrap();
         assert_eq!((name.as_str(), flag), ("kept", 0));
+    }
+
+    #[test]
+    fn a_found_name_goes_to_the_row_its_collection_was_saved_under_and_spares_a_stage_name() {
+        let (_dir, main, mut conn) = fresh_shard_db();
+        // the collection's row keeps its first name; a later slice calls it something else
+        save(&main, &[in_collection("key", "First", "a.rar", "<1@x>", "p")]).unwrap();
+        save(&main, &[part_of("Other", 1, 1, "<9@x>")]).unwrap();
+        let found = |name: &str, collection: Option<&str>, display: &str| FoundName {
+            name: name.into(),
+            collection: collection.map(str::to_string),
+            group: "alt.binaries.t".into(),
+            display: display.into(),
+        };
+        let mut writer = ShardWriter::new(shard_of("alt.binaries.t"));
+        writer.set_names(&mut conn, &[found("Later.Slice.Name", Some("key"), "Real.Name")]).unwrap();
+        fn display(conn: &Connection, name: &str) -> Option<String> {
+            conn.query_row("select display_name from releases where name = ?", [name], |r| r.get(0)).unwrap()
+        }
+        assert_eq!(
+            display(&conn, "First").as_deref(),
+            Some("Real.Name"),
+            "by the collection's key, not the slice's name"
+        );
+        assert_eq!(display(&conn, "Other"), None);
+        // a stage named it since: that name stays
+        conn.execute("update releases set display_name = 'Stage', name_source = 40 where name = 'First'", []).unwrap();
+        writer.set_names(&mut conn, &[found("First", Some("key"), "Body.Name")]).unwrap();
+        assert_eq!(display(&conn, "First").as_deref(), Some("Stage"));
+        // no collection: by its name
+        writer.set_names(&mut conn, &[found("Other", None, "Named")]).unwrap();
+        assert_eq!(display(&conn, "Other").as_deref(), Some("Named"));
     }
 
     #[test]
