@@ -441,19 +441,33 @@ fn lead_of(conn: &Connection, id: i64) -> Result<Option<i64>> {
         return Ok(None);
     };
     let sets: Vec<Vec<u8>> = sets.query_map([id], |r| r.get(0))?.collect::<Result<_>>()?;
+    // the set's packets are public: a volume sealed by a repost of its Main packet is only this upload's when the
+    // same poster put it up. The lead and its link rows share a shard, soo its poster is read there
+    let Some(poster) = poster_of(conn, id)? else { return Ok(None) };
     for set in sets {
         for other in 0..store::SHARDS {
             let Ok(mut stmt) = conn.prepare_cached(&format!(
-                "select lead_id from s{other}.upload_link where set_id = ?1 and recovery = 1 limit 1"
+                "select l.lead_id from s{other}.upload_link l join s{other}.releases r on r.id = l.lead_id
+                 where l.set_id = ?1 and l.recovery = 1 and r.poster = ?2 limit 1"
             )) else {
                 continue;
             };
-            if let Some(lead) = stmt.query_row([&set], |r| r.get::<_, i64>(0)).optional()? {
+            if let Some(lead) = stmt.query_row(rusqlite::params![&set, &poster], |r| r.get::<_, i64>(0)).optional()? {
                 return Ok(Some(lead));
             }
         }
     }
     Ok(None)
+}
+
+/// Who posted a release, as its articles' From says. None: no such row, or no From was kept.
+fn poster_of(conn: &Connection, id: i64) -> Result<Option<String>> {
+    let s = store::shard_of_id(id);
+    Ok(conn
+        .prepare_cached(&format!("select poster from s{s}.releases where id = ?"))?
+        .query_row([id], |r| r.get::<_, Option<String>>(0))
+        .optional()?
+        .flatten())
 }
 
 /// Whether every file of a release is a PAR2 file: a recovery volume posted on its own.
@@ -464,8 +478,9 @@ fn par2_only(conn: &Connection, id: i64) -> Result<bool> {
             "select count(*) from s{s}.files where release_id = ?1 and lower(filename) not like '%.par2'"
         ))?
         .query_row([id], |r| r.get(0))?;
-    let any: i64 =
-        conn.prepare_cached(&format!("select count(*) from s{s}.files where release_id = ?1"))?.query_row([id], |r| r.get(0))?;
+    let any: i64 = conn
+        .prepare_cached(&format!("select count(*) from s{s}.files where release_id = ?1"))?
+        .query_row([id], |r| r.get(0))?;
     Ok(data == 0 && any > 0)
 }
 
@@ -519,9 +534,12 @@ pub fn linked_post_with(conn: &Connection, id: i64) -> Result<Option<SplitPost>>
         groups.push(group.unwrap_or_default());
         size += bytes;
     }
-    // the set's other volumes, posted to groups of other shards: the same sealed set is the same upload
-    for set in &sets {
-        for other in crate::archive::store::releases_of_set_with(conn, set, 0) {
+    // the set's other volumes, posted to groups of other shards by the same poster: the same sealed set is the same
+    // upload. Anyone can repost a set's public Main packet, soo another poster's volume is not
+    let poster = if sets.is_empty() { None } else { poster_of(conn, lead)? };
+    for (set, poster) in sets.iter().zip(std::iter::repeat(poster.as_deref())) {
+        let Some(poster) = poster else { break };
+        for other in crate::archive::store::releases_of_set_with(conn, set, 0, poster) {
             if ids.contains(&other) || ids.len() > LINKED_ROWS || !par2_only(conn, other)? {
                 continue;
             }

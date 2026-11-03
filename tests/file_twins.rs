@@ -4,7 +4,7 @@
 
 mod common;
 
-use atlas::duplicates::{Copy, copies, file_twins_with, fill_from_copies_with};
+use atlas::duplicates::{Copy, copies, file_twins_with, fill_from_copies_of, fill_from_copies_with};
 use atlas::parser::Release;
 use atlas::{db, store};
 use common::stage::{article, release_of};
@@ -62,6 +62,18 @@ fn a_file_twin_in_another_shard_fills_the_gaps() {
     // the NZB the API serves has the borrowed article in it
     let nzb = atlas::nzb::build_nzb(mine).unwrap().unwrap();
     assert!(nzb.contains("Theirs.Movie.mkv.3@x"), "{nzb}");
+    // once a part both have was read on both sides and the bytes differ, the other posting is another file, whatever
+    // its set says: it lends nothing
+    let crc = atlas::archive::store::SET_SEGMENT_CRC;
+    shard_a.execute(crc, rusqlite::params![mine, "<Mine.x9k2.bin.1@x>", 700_000, 11]).unwrap();
+    shard_b.execute(crc, rusqlite::params![theirs, "<Theirs.Movie.mkv.1@x>", 700_000, 22]).unwrap();
+    let mut articles = store::articles(&conn, mine).unwrap();
+    assert_eq!(fill_from_copies_with(&conn, mine, &mut articles).unwrap(), 0, "other bytes in part 1");
+    assert!(!atlas::nzb::build_nzb(mine).unwrap().unwrap().contains("Theirs"));
+    // the same bytes, and it lends again
+    shard_b.execute(crc, rusqlite::params![theirs, "<Theirs.Movie.mkv.1@x>", 700_000, 11]).unwrap();
+    let mut articles = store::articles(&conn, mine).unwrap();
+    assert_eq!(fill_from_copies_with(&conn, mine, &mut articles).unwrap(), 1);
 
     // two postings that share only an NFO hold different archives under the same name, cut up the same way: the
     // other's archive parts must not fill this one's gaps, and its NFO (not posted here) maps to nothing
@@ -148,4 +160,75 @@ fn a_file_twin_in_another_shard_fills_the_gaps() {
         )
         .unwrap();
     assert!(!file_twins_with(&conn, short)[0].one_file);
+
+    // an article borrowed from one donor keeps what it was read to hold: a later donor whose copy of that part
+    // differs is another file, and lends nothing, even though this posting never had the part itself
+    let base = Release { group: in_shard(6).into(), ..release_of("Base", "base.bin", 1, 3) };
+    let donb = Release { group: in_shard(1).into(), ..release_of("DonB", "Base.mkv", 2, 3) };
+    let donc = Release {
+        group: in_shard(7).into(),
+        articles: vec![
+            article("Base.mkv", 2, 3, "<DonC.Base.mkv.2@x>"),
+            article("Base.mkv", 3, 3, "<DonC.Base.mkv.3@x>"),
+        ],
+        ..release_of("DonC", "Base.mkv", 3, 3)
+    };
+    for release in [base, donb, donc] {
+        store::save(&main, &[release]).unwrap();
+    }
+    let shard = |s: usize| db::open_shard(&store::shard_path(&main, s)).unwrap();
+    let id = |s: usize, name: &str| -> i64 {
+        shard(s).query_row("select id from releases where name = ?", [name], |r| r.get(0)).unwrap()
+    };
+    let (base, donb, donc) = (id(6, "Base"), id(1, "DonB"), id(7, "DonC"));
+    assert!(donb < donc, "file twins lend in id order: B first");
+    let base_md5 = (vec![8u8; 16], vec![8u8; 16], size);
+    for (s, row, set) in [(6, base, 21u8), (1, donb, 22u8), (7, donc, 23u8)] {
+        shard(s)
+            .execute(
+                insert,
+                rusqlite::params![
+                    row,
+                    vec![4u8; 16],
+                    vec![set; 16],
+                    base_md5.0,
+                    base_md5.1,
+                    base_md5.2,
+                    "Base.mkv",
+                    9,
+                    1,
+                    1,
+                    1
+                ],
+            )
+            .unwrap();
+    }
+    shard(1).execute(crc, rusqlite::params![donb, "<DonB.Base.mkv.2@x>", 700_000, 5]).unwrap();
+    shard(7).execute(crc, rusqlite::params![donc, "<DonC.Base.mkv.2@x>", 700_000, 6]).unwrap();
+    let mut articles = store::articles(&conn, base).unwrap();
+    assert_eq!(fill_from_copies_with(&conn, base, &mut articles).unwrap(), 1, "B's part 2 only");
+    assert!(articles.iter().any(|a| a.message_id == "<DonB.Base.mkv.2@x>"));
+    assert!(!articles.iter().any(|a| a.message_id.contains("DonC")), "C's part 2 differs from the part now held");
+
+    // a part that came from another row of the same post (one cut across groups) is checked the same way: what that
+    // row was read to hold counts against the donors, whether or not that row is a donor itself
+    let split = Release {
+        group: in_shard(2).into(),
+        articles: vec![article("base.bin", 2, 3, "<Split.base.bin.2@x>")],
+        ..release_of("Split", "base.bin", 1, 3)
+    };
+    store::save(&main, &[split]).unwrap();
+    let split = id(2, "Split");
+    shard(2).execute(crc, rusqlite::params![split, "<Split.base.bin.2@x>", 700_000, 7]).unwrap();
+    let gathered = || {
+        let mut all = store::articles(&conn, base).unwrap();
+        all.extend(store::articles(&conn, split).unwrap());
+        all
+    };
+    // the other row's part 2 holds other bytes than B's and C's: neither lends anything
+    let mut articles = gathered();
+    assert_eq!(fill_from_copies_of(&conn, base, &[base, split], &mut articles).unwrap(), 0);
+    // without that row's CRCs the conflict goes unseen and C lends part 3
+    let mut articles = gathered();
+    assert_eq!(fill_from_copies_with(&conn, base, &mut articles).unwrap(), 1);
 }

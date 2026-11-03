@@ -567,6 +567,11 @@ fn posted_name<'a>(articles: &'a [ArticleRow], name: &str, one_file: bool) -> Op
     }
 }
 
+/// What articles were found to hold, by message-id: `(decoded length, CRC32)` from `segment_crc`, for the two
+/// postings a fill is between. A part both have and both know must agree, or the two files are not the same bytes
+/// however alike their sets and names.
+pub type KnownCrcs = HashMap<String, (i64, i64)>;
+
 /// Adds what `own` is missing from a file twin's articles: each of the twin's files the sets say is one of this
 /// release's is read as that file, and fills its gaps by `fill_gaps`'s rules. Nothing else of the twin's is touched:
 /// two postings that share an NFO can hold different archives under the same names. Returns how many.
@@ -575,6 +580,7 @@ pub fn fill_gaps_from(
     twin: &[ArticleRow],
     names: &[(String, String)],
     one_file: bool,
+    known: &KnownCrcs,
 ) -> usize {
     let mut renamed: Vec<ArticleRow> = Vec::new();
     for (theirs, mine) in names {
@@ -591,34 +597,57 @@ pub fn fill_gaps_from(
     if renamed.is_empty() {
         return 0;
     }
-    fill_gaps(own, &renamed)
+    fill_gaps_checked(own, &renamed, known)
 }
 
 /// Adds what `own` is missing from every twin and file twin of `release`, and returns how many articles that was.
 /// A file twin lends only the files its set vouches for, under the names the sets map; a twin by the posted
 /// fingerprint lends every file by its posted name. `conn` has the shards attached.
 pub fn fill_from_copies_with(conn: &Connection, id: i64, own: &mut Vec<ArticleRow>) -> db::Result<usize> {
+    fill_from_copies_of(conn, id, &[id], own)
+}
+
+/// `fill_from_copies_with` for articles gathered from several rows (`rows`: a post cut across groups, or a linked
+/// upload), soo what each row's articles were read to hold is checked against the donors too.
+pub fn fill_from_copies_of(conn: &Connection, id: i64, rows: &[i64], own: &mut Vec<ArticleRow>) -> db::Result<usize> {
     let mut added = 0;
+    // what every posting seen soo far was read to hold: an article borrowed from one donor keeps its CRC, soo the
+    // next donor's copy of that part is checked against it too
+    let mut known = crate::archive::store::segment_crcs_with(conn, id);
+    for row in rows.iter().filter(|row| **row != id) {
+        known.extend(crate::archive::store::segment_crcs_with(conn, *row));
+    }
     for twin in file_twins_with(conn, id) {
-        added += fill_gaps_from(own, &store::articles(conn, twin.id)?, &twin.names, twin.one_file);
+        known.extend(crate::archive::store::segment_crcs_with(conn, twin.id));
+        added += fill_gaps_from(own, &store::articles(conn, twin.id)?, &twin.names, twin.one_file, &known);
     }
     let mut seen: HashSet<i64> = HashSet::new();
     for twin in twins_with(conn, id)? {
         if seen.insert(twin) {
-            added += fill_gaps(own, &store::articles(conn, twin)?);
+            known.extend(crate::archive::store::segment_crcs_with(conn, twin));
+            added += fill_gaps_checked(own, &store::articles(conn, twin)?, &known);
         }
     }
     Ok(added)
 }
 
-/// Adds what `own` is missing from a twin's articles, file by file. A twin's file counts only under the
-/// same name, with the same number of parts, and the same size for every part both have. Returns how many.
+/// `fill_gaps_checked` with nothing known about the articles' bytes.
 pub fn fill_gaps(own: &mut Vec<ArticleRow>, twin: &[ArticleRow]) -> usize {
-    let mut have: HashMap<Option<String>, HashMap<i64, Option<i64>>> = HashMap::new();
+    fill_gaps_checked(own, twin, &KnownCrcs::new())
+}
+
+/// Adds what `own` is missing from a twin's articles, file by file. A twin's file counts only under the
+/// same name, with the same number of parts, the same size for every part both have, and the same decoded length and
+/// CRC32 for every part both have that `known` has read: one that differs says the two files are not the same bytes,
+/// and the twin lends nothing of that file. Returns how many.
+pub fn fill_gaps_checked(own: &mut Vec<ArticleRow>, twin: &[ArticleRow], known: &KnownCrcs) -> usize {
+    /// a file's parts this posting has: each part's wire size and message-id
+    type Parts = HashMap<i64, (Option<i64>, String)>;
+    let mut have: HashMap<Option<String>, Parts> = HashMap::new();
     let mut templates: HashMap<Option<String>, ArticleRow> = HashMap::new();
     for article in own.iter() {
         if let Some(part) = article.part {
-            have.entry(article.filename.clone()).or_default().insert(part, article.bytes);
+            have.entry(article.filename.clone()).or_default().insert(part, (article.bytes, article.message_id.clone()));
         }
         templates.entry(article.filename.clone()).or_insert_with(|| article.clone());
     }
@@ -630,11 +659,20 @@ pub fn fill_gaps(own: &mut Vec<ArticleRow>, twin: &[ArticleRow]) -> usize {
     for (filename, articles) in by_file {
         let (Some(parts), Some(template)) = (have.get(filename), templates.get(filename)) else { continue };
         let same_total = articles.iter().all(|a| a.total_parts.is_some() && a.total_parts == template.total_parts);
-        let same_sizes =
-            articles.iter().all(|a| a.part.and_then(|part| parts.get(&part)).is_none_or(|bytes| *bytes == a.bytes));
+        let same_sizes = articles
+            .iter()
+            .all(|a| a.part.and_then(|part| parts.get(&part)).is_none_or(|(bytes, _)| *bytes == a.bytes));
+        // a part both have, both read: the same bytes or not the same file
+        let same_bytes = articles.iter().all(|a| {
+            let (Some(theirs), Some((_, mine))) = (known.get(&a.message_id), a.part.and_then(|part| parts.get(&part)))
+            else {
+                return true;
+            };
+            known.get(mine).is_none_or(|mine| mine == theirs)
+        });
         // with no part in common, nothing says the two were cut up the same way
         let shared = articles.iter().any(|a| a.part.is_some_and(|part| parts.contains_key(&part)));
-        if !same_total || !same_sizes || !shared {
+        if !same_total || !same_sizes || !same_bytes || !shared {
             continue;
         }
         for article in articles {
@@ -780,6 +818,16 @@ mod tests {
         assert_eq!(fill_gaps(&mut own, &[article("a.rar", 1, 3, 90, "t1"), article("a.rar", 2, 3, 90, "t2")]), 0);
         assert_eq!(fill_gaps(&mut own, &[article("a.rar", 2, 4, 100, "t2")]), 0, "another part count");
         assert_eq!(fill_gaps(&mut own, &[article("a.rar", 2, 3, 100, "t2")]), 0, "no part in common");
+        // a part both have and both read must hold the same bytes, or the twin's file is another file
+        let mut own = vec![article("a.rar", 1, 2, 100, "own1")];
+        let twin = vec![article("a.rar", 1, 2, 100, "t1"), article("a.rar", 2, 2, 100, "t2")];
+        let known: KnownCrcs = [("own1".to_string(), (90, 1)), ("t1".to_string(), (90, 2))].into_iter().collect();
+        assert_eq!(fill_gaps_checked(&mut own, &twin, &known), 0, "other bytes under the same name");
+        let known: KnownCrcs = [("own1".to_string(), (90, 1)), ("t1".to_string(), (90, 1))].into_iter().collect();
+        assert_eq!(fill_gaps_checked(&mut own, &twin, &known), 1, "the same bytes");
+        let known: KnownCrcs = [("t1".to_string(), (90, 2))].into_iter().collect();
+        let mut own = vec![article("a.rar", 1, 2, 100, "own1")];
+        assert_eq!(fill_gaps_checked(&mut own, &twin, &known), 1, "one side unread says nothing");
     }
 
     #[test]
@@ -793,23 +841,23 @@ mod tests {
         ];
         // the sets call it Movie.2024.mkv on both sides; this posting's one data file carries a random name
         let names = vec![("Movie.2024.mkv".to_string(), "Movie.2024.mkv".to_string())];
-        assert_eq!(fill_gaps_from(&mut own, &twin, &names, true), 1);
+        assert_eq!(fill_gaps_from(&mut own, &twin, &names, true, &KnownCrcs::new()), 1);
         assert_eq!(own.iter().map(|a| a.message_id.as_str()).collect::<Vec<_>>(), ["own1", "t2", "own3"]);
         assert_eq!(own[1].filename.as_deref(), Some("abc123.bin"), "under this posting's name");
         // a set of several data files says nothing about which one a random name stands for
         let mut own = vec![article("abc123.bin", 1, 3, 100, "own1"), article("abc123.bin", 3, 3, 50, "own3")];
-        assert_eq!(fill_gaps_from(&mut own, &twin, &names, false), 0);
+        assert_eq!(fill_gaps_from(&mut own, &twin, &names, false, &KnownCrcs::new()), 0);
         // a name the twin's articles don't carry fills nothing
         let mut own = vec![article("a.rar", 1, 2, 100, "own1")];
-        assert_eq!(fill_gaps_from(&mut own, &twin, &[("x.rar".into(), "a.rar".into())], true), 0);
+        assert_eq!(fill_gaps_from(&mut own, &twin, &[("x.rar".into(), "a.rar".into())], true, &KnownCrcs::new()), 0);
         // two data files here: which is which can't be told by name, soo nothing fills
         let mut own = vec![article("one.bin", 1, 3, 100, "o1"), article("two.bin", 1, 3, 100, "o2")];
-        assert_eq!(fill_gaps_from(&mut own, &twin, &names, true), 0);
+        assert_eq!(fill_gaps_from(&mut own, &twin, &names, true, &KnownCrcs::new()), 0);
         // only the file the sets share is read as this release's; the twin's other files aren't, whatever they're called
         let mut own = vec![article("abc123.bin", 1, 3, 100, "own1")];
         let twin = vec![article("abc123.bin", 2, 3, 100, "t2"), article("Movie.2024.nfo", 1, 1, 10, "n1")];
         let nfo = vec![("Movie.2024.nfo".to_string(), "Movie.2024.nfo".to_string())];
-        assert_eq!(fill_gaps_from(&mut own, &twin, &nfo, true), 0);
+        assert_eq!(fill_gaps_from(&mut own, &twin, &nfo, true, &KnownCrcs::new()), 0);
         assert_eq!(own.len(), 1);
     }
 
