@@ -791,7 +791,10 @@ impl UnionFiles {
 
     /// Whether every file the post says it has is there with exactly its parts.
     fn complete(&self) -> bool {
-        let total = self.file_totals.iter().copied().flatten().next();
+        if self.file_totals.len() > 1 {
+            return false;
+        }
+        let total = self.file_totals.iter().copied().flatten().next_back();
         !self.files.is_empty()
             && total.is_none_or(|total| self.files.len() as i64 == total + i64::from(self.zero_indexed))
             && self.files.values().all(|f| f.expected.is_some_and(|want| store::is_exactly(&f.seen, want)))
