@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
 use atlas::nntp::{DEFAULT_BURST_BYTES, RATE_750_MBIT, RateLimiter, TokenBucket};
@@ -255,3 +256,210 @@ fn test_channel_capacity_bound_backpressure() {
         producer.await.expect("producer failed");
     });
 }
+
+#[test]
+fn test_adversarial_burst_edge_case_20mb() {
+    run_async(async {
+        // Burst capacity: DEFAULT_BURST_BYTES = 10 MB (10,000,000 bytes)
+        // Rate: RATE_750_MBIT = 93,750,000 bytes/sec
+        let limiter = Arc::new(TokenBucket::new(RATE_750_MBIT, DEFAULT_BURST_BYTES));
+
+        // Part 1: Sudden 20 MB burst request (2x burst capacity) from a single task
+        // Slicing into two 10 MB chunks:
+        // Chunk 1: consumes 10 MB burst buffer immediately (< 20 ms).
+        // Chunk 2: 10 MB deficit at 93.75 MB/s => ~106.67 ms.
+        let t0 = Instant::now();
+        limiter.acquire(20_000_000).await;
+        let elapsed_single = t0.elapsed();
+
+        assert!(
+            elapsed_single >= Duration::from_millis(90),
+            "20 MB burst was not throttled properly: {elapsed_single:?}"
+        );
+        assert!(
+            elapsed_single < Duration::from_millis(300),
+            "20 MB burst deadlocked or lagged: {elapsed_single:?}"
+        );
+
+        // Part 2: Concurrent burst: two tasks simultaneously request 20 MB each (total 40 MB)
+        // Reset bucket to full burst capacity
+        limiter.set_tokens(DEFAULT_BURST_BYTES);
+
+        let t1 = Instant::now();
+        let l1 = limiter.clone();
+        let l2 = limiter.clone();
+
+        let h1 = tokio::spawn(async move {
+            l1.acquire(20_000_000).await;
+        });
+        let h2 = tokio::spawn(async move {
+            l2.acquire(20_000_000).await;
+        });
+
+        h1.await.expect("task 1 failed");
+        h2.await.expect("task 2 failed");
+
+        let elapsed_concurrent = t1.elapsed();
+        // 40 MB total with 10 MB initial burst = 30 MB deficit at 93.75 MB/s => ~320 ms
+        assert!(
+            elapsed_concurrent >= Duration::from_millis(270),
+            "concurrent 20 MB bursts did not enforce 750 Mbit pacing: {elapsed_concurrent:?}"
+        );
+        assert!(
+            elapsed_concurrent < Duration::from_millis(700),
+            "concurrent 20 MB bursts deadlocked: {elapsed_concurrent:?}"
+        );
+    });
+}
+
+#[test]
+fn test_adversarial_microsecond_precision_fractional_accumulation() {
+    run_async(async {
+        let limiter = TokenBucket::new(RATE_750_MBIT, DEFAULT_BURST_BYTES);
+
+        // Sub-test A: Rapid burst of 50,000 single-byte acquisitions
+        limiter.set_tokens(50_000);
+        let t0 = Instant::now();
+        for _ in 0..50_000 {
+            limiter.acquire(1).await;
+        }
+        let elapsed = t0.elapsed();
+        // 50,000 acquires should execute in under 300 ms without lock thrashing or deadlocks
+        assert!(
+            elapsed < Duration::from_millis(300),
+            "rapid 1-byte acquisitions were excessively slow: {elapsed:?}"
+        );
+
+        // Sub-test B: Microsecond fractional nanosecond accumulation without token loss
+        limiter.set_tokens(0);
+        let start = Instant::now();
+        let steps = 500;
+        let mut observed_tokens = 0;
+        for _ in 0..steps {
+            tokio::task::yield_now().await;
+            observed_tokens = limiter.available_tokens();
+        }
+        let total_nanos = start.elapsed().as_nanos() as u128;
+        let expected_tokens = (total_nanos * RATE_750_MBIT as u128 / 1_000_000_000) as u64;
+
+        // Verify fractional nanoseconds preserved exact rate without truncation drift
+        let diff = (expected_tokens as i64 - observed_tokens as i64).abs();
+        assert!(
+            diff <= 50_000,
+            "microsecond precision drifted: expected ~{expected_tokens}, got {observed_tokens}, diff {diff}"
+        );
+    });
+}
+
+#[test]
+fn test_adversarial_high_concurrency_100_tasks() {
+    run_async(async {
+        let limiter = Arc::new(TokenBucket::new(RATE_750_MBIT, DEFAULT_BURST_BYTES));
+        limiter.set_tokens(0);
+
+        let task_count = 128;
+        let bytes_per_task = 50_000; // total 6,400,000 bytes
+        let completed_count = Arc::new(AtomicU64::new(0));
+        let total_bytes = Arc::new(AtomicU64::new(0));
+
+        let t0 = Instant::now();
+        let mut handles = Vec::with_capacity(task_count);
+
+        for task_id in 0..task_count {
+            let lim = limiter.clone();
+            let c_count = completed_count.clone();
+            let b_count = total_bytes.clone();
+
+            handles.push(tokio::spawn(async move {
+                let start_task = Instant::now();
+                lim.acquire(bytes_per_task).await;
+                b_count.fetch_add(bytes_per_task as u64, Ordering::Relaxed);
+                c_count.fetch_add(1, Ordering::Relaxed);
+                let duration = start_task.elapsed();
+                assert!(
+                    duration < Duration::from_secs(3),
+                    "task {task_id} suffered starvation: {duration:?}"
+                );
+            }));
+        }
+
+        for h in handles {
+            h.await.expect("task panicked");
+        }
+
+        let elapsed = t0.elapsed();
+        assert_eq!(completed_count.load(Ordering::Relaxed), 128, "not all tasks completed");
+        assert_eq!(total_bytes.load(Ordering::Relaxed), 6_400_000);
+
+        // 6.4 MB at 93.75 MB/s => theoretical duration 68.26 ms
+        assert!(
+            elapsed >= Duration::from_millis(55),
+            "concurrency violated rate limit: elapsed {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "concurrency deadlocked or lagged: elapsed {elapsed:?}"
+        );
+    });
+}
+
+#[test]
+fn test_adversarial_loopback_wire_benchmark_750mbit_bounds() {
+    run_async(async {
+        let (mut client_io, mut server_io) = tokio::io::duplex(2 * 1024 * 1024);
+        let limiter = Arc::new(TokenBucket::new(RATE_750_MBIT, DEFAULT_BURST_BYTES));
+
+        let total_bytes: usize = 30_000_000;
+        let chunk_size: usize = 256 * 1024; // 256 KB chunks
+
+        let writer = tokio::spawn(async move {
+            let chunk = vec![0x42u8; chunk_size];
+            let mut remaining = total_bytes;
+            while remaining > 0 {
+                let to_write = remaining.min(chunk_size);
+                server_io.write_all(&chunk[..to_write]).await.expect("write failed");
+                remaining -= to_write;
+            }
+        });
+
+        // Drain initial burst tokens to measure steady-state line rate
+        limiter.set_tokens(0);
+
+        let start_time = Instant::now();
+        let mut bytes_read = 0;
+        let mut buf = vec![0u8; chunk_size];
+
+        while bytes_read < total_bytes {
+            let to_read = (total_bytes - bytes_read).min(chunk_size);
+            let n = client_io.read(&mut buf[..to_read]).await.expect("read failed");
+            if n == 0 {
+                break;
+            }
+            limiter.acquire(n).await;
+            bytes_read += n;
+        }
+
+        let elapsed = start_time.elapsed();
+        writer.await.expect("writer failed");
+
+        assert_eq!(bytes_read, total_bytes);
+
+        // Throughput in Mbit/s
+        let elapsed_secs = elapsed.as_secs_f64();
+        let throughput_mbps = (total_bytes as f64 * 8.0) / (elapsed_secs * 1_000_000.0);
+        println!(
+            "Adversarial Wire Benchmark: transferred {total_bytes} bytes in {elapsed_secs:.4}s -> {throughput_mbps:.2} Mbit/s"
+        );
+
+        // Target: [712.5, 750.0] Mbit/s (95% to 100% of 750 Mbit/s)
+        assert!(
+            throughput_mbps <= 750.01,
+            "rate limiter exceeded 750 Mbit/s ceiling: {throughput_mbps:.2} Mbit/s"
+        );
+        assert!(
+            throughput_mbps >= 712.5,
+            "rate limiter underperformed 712.5 Mbit/s bound: {throughput_mbps:.2} Mbit/s"
+        );
+    });
+}
+
