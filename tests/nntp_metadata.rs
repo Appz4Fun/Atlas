@@ -168,33 +168,50 @@ fn tc_t1_f19_4_mkv_metadata_parse_wrapper() {
 // Feature 20: SPS VUI Colour Space & HDR10/HLG Recovery from CodecPrivate
 // ============================================================================
 
+fn build_hevc_10bit_sps_nal(primaries: u8, transfer: u8, matrix: u8) -> Vec<u8> {
+    vec![
+        0x42, 0x01, // NAL header (type 33 = SPS_NUT)
+        0x01,       // vps_id=0, max_sub_layers_minus1=0, temporal_id_nesting_flag=1
+        0x02, 0x20, 0x40, 0x08, 0x01, 0xB0, 0x01, 0x01, 0x01, 0x01, 0x01, 0x99, // profile_tier_level (Main 10, Level 5.1)
+        0x22, 0x12, 0x24, 0xDA, 0x7A, 0xAC, 0x22, 0xB5, // SPS fields up to colour_description_present_flag=1
+        primaries, transfer, matrix, 0x80,
+    ]
+}
+
 #[test]
 fn tc_t1_f20_1_sps_vui_hdr10_recovery() {
-    // Synthetic HEVC SPS NAL unit (NAL type 33: 0x42, 0x01) containing HDR10 VUI parameters
+    // Valid ITU-T H.265 Main 10 SPS NAL unit (NAL type 33: 0x42, 0x01) containing HDR10 VUI parameters:
     // colour_primaries = 9 (BT.2020), transfer_characteristics = 16 (SMPTE ST 2084 / PQ), matrix_coeffs = 9
-    let sps_nal = [0x42, 0x01, 0x01, 0x02, 9, 16, 9, 0x00];
+    let sps_nal = build_hevc_10bit_sps_nal(9, 16, 9);
     let vui = H265Sps::parse_vui(&sps_nal).expect("must parse VUI parameters");
     assert_eq!(vui.colour_primaries, 9);
     assert_eq!(vui.transfer_characteristics, 16);
     assert_eq!(vui.matrix_coeffs, 9);
+    assert_eq!(vui.bit_depth, 10);
     assert_eq!(vui.hdr.as_deref(), Some("HDR10"));
+
+    // Truncated SPS payloads that merely contain `09 10` bytes must return None
+    assert!(H265Sps::parse_vui(&[0x42, 0x01, 0x09, 0x10]).is_none());
+    assert!(H265Sps::parse_vui(&[0x42, 0x01, 0x01, 0x02, 9, 16, 9, 0x00]).is_none());
 }
 
 #[test]
 fn tc_t1_f20_2_sps_vui_hlg_recovery() {
-    // Synthetic HEVC SPS NAL unit with HLG transfer characteristics = 18 (ARIB STD-B67), colour_primaries = 9
-    let sps_nal = [0x42, 0x01, 0x01, 0x02, 9, 18, 9, 0x00];
+    // Valid ITU-T H.265 Main 10 SPS NAL unit with HLG transfer characteristics = 18 (ARIB STD-B67), colour_primaries = 9
+    let sps_nal = build_hevc_10bit_sps_nal(9, 18, 9);
     let vui = H265Sps::parse_vui(&sps_nal).expect("must parse HLG VUI");
     assert_eq!(vui.colour_primaries, 9);
     assert_eq!(vui.transfer_characteristics, 18);
     assert_eq!(vui.matrix_coeffs, 9);
+    assert_eq!(vui.bit_depth, 10);
     assert_eq!(vui.hdr.as_deref(), Some("HLG"));
 }
 
 #[test]
 fn tc_t1_f20_3_sps_vui_annex_b_prefix_support() {
     // Same SPS with 4-byte Annex B prefix [0, 0, 0, 1]
-    let sps_annex_b = [0x00, 0x00, 0x00, 0x01, 0x42, 0x01, 0x01, 0x02, 9, 16, 9, 0x00];
+    let mut sps_annex_b = vec![0x00, 0x00, 0x00, 0x01];
+    sps_annex_b.extend_from_slice(&build_hevc_10bit_sps_nal(9, 16, 9));
     let vui = H265Sps::parse_vui(&sps_annex_b).expect("must strip Annex B prefix and parse VUI");
     assert_eq!(vui.hdr.as_deref(), Some("HDR10"));
 }
@@ -259,7 +276,7 @@ fn tc_t1_f22_1_dolby_vision_dvcc_dvvc_profile7_fel() {
     // dvvC/dvcC atom payload: version=1, profile=7 (byte 2 >> 1 = 7), level=6, el_present=1.
     // The configuration record preserves el_present=true while leaving fel=false until RPU/NLQ is inspected.
     let dv_box = [1, 0, (7 << 1), (6 << 3) | 0b011];
-    let dv_info = DolbyVisionInfo::parse_rpu(&dv_box).expect("must parse dvvC record");
+    let dv_info = DolbyVisionInfo::from_dvcc_dvvc(&dv_box).expect("must parse dvvC record");
     assert_eq!(dv_info.profile, 7);
     assert_eq!(dv_info.level, Some(6));
     assert!(dv_info.el_present);
@@ -270,7 +287,7 @@ fn tc_t1_f22_1_dolby_vision_dvcc_dvvc_profile7_fel() {
 fn tc_t1_f22_2_dolby_vision_dvcc_dvvc_profile8_cm29() {
     // dvvC atom payload: version=1, profile=8, level=6, el_present=0
     let dv_box = [1, 0, (8 << 1), (6 << 3) | 0b101];
-    let dv_info = DolbyVisionInfo::parse_rpu(&dv_box).expect("must parse dvvC record");
+    let dv_info = DolbyVisionInfo::from_dvcc_dvvc(&dv_box).expect("must parse dvvC record");
     assert_eq!(dv_info.profile, 8);
     assert_eq!(dv_info.level, Some(6));
     assert!(!dv_info.fel);
@@ -285,6 +302,13 @@ fn tc_t1_f22_3_dolby_vision_level253_crash_immunity() {
 
     let empty = &[];
     assert!(DolbyVisionInfo::parse_rpu(empty).is_none());
+
+    // Ordinary length-prefixed HEVC type-19 (IDR_W_RADL) sample of 2,560 bytes (`00 00 0A 00`)
+    // must not be misinterpreted as a Dolby Vision Profile 5 configuration record.
+    let mut idr_sample = vec![0x00, 0x00, 0x0A, 0x00, 19 << 1, 0x01];
+    idr_sample.resize(4 + 2_560, 0x55);
+    assert!(DolbyVisionInfo::parse_rpu(&idr_sample).is_none());
+    assert!(DolbyVisionInfo::parse_rpu_with_length_size(&idr_sample, 4).is_none());
 }
 
 // ============================================================================
@@ -308,8 +332,8 @@ fn tc_t1_f23_1_audio_bitstream_truehd_atmos() {
 #[test]
 fn tc_t1_f23_2_audio_bitstream_eac3_atmos() {
     let mut data = vec![0u8; 64];
-    // EMDF sync word: 0x5838
-    data[20..22].copy_from_slice(&[0x58, 0x38]);
+    // EMDF sync word 0x5838 + container_len=4 + version=0, key_id=0, payload_id=14 (JOC) + 12b joc_header
+    data[20..28].copy_from_slice(&[0x58, 0x38, 0x00, 0x04, 0x03, 0x80, 0x00, 0x00]);
 
     let probe = AudioBitstream::probe(&data);
     assert!(probe.has_atmos);
@@ -356,6 +380,14 @@ fn tc_t1_f24_2_mp4_extended_size_mdat_offset() {
     let prefix = [ftyp.clone(), mdat_head].concat();
     let moov_offset = Mp4Prober::find_moov_offset(&prefix).expect("must calculate extended moov offset");
     assert_eq!(moov_offset, ftyp.len() as u64 + 500_000_000);
+
+    // Malformed extended-size box with u64::MAX must return None without arithmetic overflow
+    let mut overflow_free = vec![0u8; 16];
+    overflow_free[0..4].copy_from_slice(&1u32.to_be_bytes());
+    overflow_free[4..8].copy_from_slice(b"free");
+    overflow_free[8..16].copy_from_slice(&u64::MAX.to_be_bytes());
+    assert!(Mp4Prober::find_moov_offset(&overflow_free).is_none());
+    assert!(Mp4Prober::probe_tail_moov(&overflow_free).is_none());
 }
 
 // ============================================================================
@@ -395,6 +427,26 @@ fn tc_t1_f25_3_disc_prober_dvd_disc_id_md5() {
 
     let disc_id_hex = DiscProber::dvd_disc_id_hex(&video_ts, &vts);
     assert_eq!(disc_id_hex.len(), 32, "DVD Disc ID must be 32-character hex");
+    assert_eq!(
+        disc_id_hex, "732ca863c2a0e85d17bdf1de2a09813e",
+        "DVDDiscID must hash the complete VIDEO_TS.IFO and VTS_01_0.IFO files without 16 KiB truncation"
+    );
+
+    let mut video_ts_tail_modified = video_ts.clone();
+    video_ts_tail_modified[19_999] ^= 0xFF;
+    assert_ne!(
+        DiscProber::dvd_disc_id_hex(&video_ts_tail_modified, &vts),
+        disc_id_hex,
+        "bytes past 16 KiB in VIDEO_TS.IFO must contribute to DVDDiscID"
+    );
+
+    let mut vts_tail_modified = vts.clone();
+    vts_tail_modified[19_999] ^= 0xFF;
+    assert_ne!(
+        DiscProber::dvd_disc_id_hex(&video_ts, &vts_tail_modified),
+        disc_id_hex,
+        "bytes past 16 KiB in VTS_01_0.IFO must contribute to DVDDiscID"
+    );
 
     let marker_disc = [vec![0u8; 100], b"VIDEO_TS.IFO".to_vec(), vec![0u8; 100]].concat();
     let info = DiscProber::probe(&marker_disc).expect("must identify DVD marker");

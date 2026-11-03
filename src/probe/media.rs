@@ -101,8 +101,9 @@ pub struct AudioTrack {
     pub sample_rate: Option<f64>,
     pub language: Option<String>,
     pub name: Option<String>,
-    /// from the track's name: the bitstream's flag sits past what's read
+    /// from the track's name or bitstream probe
     pub atmos: bool,
+    pub dtsx: bool,
     /// the commentary flag, or a name that says so
     pub commentary: bool,
     /// the player's pick when nothing else says
@@ -732,6 +733,10 @@ fn add_track(t: Track, info: &mut MediaInfo) {
         }
         2 => info.audio.push(AudioTrack {
             atmos: t.name.as_deref().is_some_and(|n| n.to_ascii_lowercase().contains("atmos")),
+            dtsx: t.name.as_deref().is_some_and(|n| {
+                let lower = n.to_ascii_lowercase();
+                lower.contains("dts:x") || lower.contains("dts-x") || lower.contains("dtsx")
+            }),
             commentary: t.commentary || says_commentary(t.name.as_deref()),
             default: t.flag_default.unwrap_or(true),
             codec: t.codec,
@@ -756,16 +761,22 @@ fn add_track(t: Track, info: &mut MediaInfo) {
 
 // ---- MP4
 
-fn boxes(b: &[u8], each: &mut dyn FnMut(&[u8; 4], &[u8])) {
+fn boxes<'a>(b: &'a [u8], each: &mut dyn FnMut(&[u8; 4], &'a [u8])) {
     let mut at = 0usize;
-    while let Some(head) = b.get(at..at + 8) {
+    while let Some(head_end) = at.checked_add(8)
+        && let Some(head) = b.get(at..head_end)
+    {
         let mut size = u32::from_be_bytes([head[0], head[1], head[2], head[3]]) as usize;
         let kind: [u8; 4] = [head[4], head[5], head[6], head[7]];
-        let mut start = at + 8;
+        let mut start = head_end;
         if size == 1 {
-            let Some(long) = b.get(at + 8..at + 16) else { return };
-            size = u64::from_be_bytes(long.try_into().unwrap_or([0; 8])) as usize;
-            start = at + 16;
+            let Some(ext_end) = at.checked_add(16) else { return };
+            let Some(long) = b.get(head_end..ext_end) else { return };
+            let Ok(long_size) = usize::try_from(u64::from_be_bytes(long.try_into().unwrap_or([0; 8]))) else {
+                return;
+            };
+            size = long_size;
+            start = ext_end;
         } else if size == 0 {
             size = b.len() - at;
         }
@@ -787,13 +798,11 @@ fn mp4(data: &[u8]) -> MediaInfo {
     });
     info.header_complete = has_whole_moov(data);
 
-    if let Some(dv) = DolbyVisionInfo::parse_rpu(data) && let Some(v) = info.video.first_mut() {
-        if v.dv_profile.is_none() {
-            v.dv_profile = Some(dv.profile);
-            v.dv_level = dv.level;
-            v.dv_enhancement_layer = Some(dv.el_present);
-        }
-        v.dolby_vision = Some(dv);
+    if let Some(v) = info.video.first_mut()
+        && v.dolby_vision.as_ref().is_none_or(|d| !d.rpu_present || (d.profile == 7 && !d.fel))
+        && let Some(dv) = DolbyVisionInfo::parse_rpu(data)
+    {
+        apply_rpu_to_video_track(v, dv);
     }
 
     info
@@ -802,20 +811,28 @@ fn mp4(data: &[u8]) -> MediaInfo {
 /// Whether a top level `moov` is all there.
 fn has_whole_moov(data: &[u8]) -> bool {
     let mut at = 0usize;
-    while let Some(head) = data.get(at..at + 8) {
+    while let Some(head_end) = at.checked_add(8)
+        && let Some(head) = data.get(at..head_end)
+    {
         let mut size = u64::from(u32::from_be_bytes([head[0], head[1], head[2], head[3]]));
+        let mut head_size = 8u64;
         if size == 1 {
-            let Some(long) = data.get(at + 8..at + 16) else { return false };
+            let Some(ext_end) = at.checked_add(16) else { return false };
+            let Some(long) = data.get(head_end..ext_end) else { return false };
             size = u64::from_be_bytes(long.try_into().unwrap_or([0; 8]));
+            head_size = 16;
         } else if size == 0 {
             size = (data.len() - at) as u64;
         }
-        if size < 8 {
+        if size < head_size {
             return false;
         }
         let Some(end) = usize::try_from(size).ok().and_then(|s| at.checked_add(s)) else { return false };
         if &head[4..8] == b"moov" {
             return end <= data.len();
+        }
+        if end > data.len() {
+            return false;
         }
         at = end;
     }
@@ -823,14 +840,166 @@ fn has_whole_moov(data: &[u8]) -> bool {
 }
 
 fn be32(b: &[u8], at: usize) -> Option<u32> {
-    Some(u32::from_be_bytes(b.get(at..at + 4)?.try_into().ok()?))
+    Some(u32::from_be_bytes(b.get(at..at.checked_add(4)?)?.try_into().ok()?))
 }
 
 fn be16(b: &[u8], at: usize) -> Option<u16> {
-    Some(u16::from_be_bytes(b.get(at..at + 2)?.try_into().ok()?))
+    Some(u16::from_be_bytes(b.get(at..at.checked_add(2)?)?.try_into().ok()?))
+}
+
+fn collect_moov_chunk_offsets(moov_body: &[u8]) -> Vec<usize> {
+    const MAX_CHUNK_OFFSETS: usize = 16;
+    let mut all_offsets = Vec::new();
+    let mut traks_seen = 0usize;
+    boxes(moov_body, &mut |kind, trak_v| {
+        if kind != b"trak" || traks_seen >= MAX_TRACKS {
+            return;
+        }
+        traks_seen += 1;
+        boxes(trak_v, &mut |kind, mdia_v| {
+            if kind == b"mdia" {
+                boxes(mdia_v, &mut |kind, minf_v| {
+                    if kind == b"minf" {
+                        boxes(minf_v, &mut |kind, stbl_v| {
+                            if kind == b"stbl" {
+                                let mut track_offsets = 0usize;
+                                boxes(stbl_v, &mut |kind, v| match kind {
+                                    b"stco" => {
+                                        let count = be32(v, 4).unwrap_or(0).min(MAX_CHUNK_OFFSETS as u32) as usize;
+                                        for i in 0..count {
+                                            if track_offsets >= MAX_CHUNK_OFFSETS {
+                                                break;
+                                            }
+                                            if let Some(off) = be32(v, 8 + i * 4).map(|o| o as usize) {
+                                                all_offsets.push(off);
+                                                track_offsets += 1;
+                                            }
+                                        }
+                                    }
+                                    b"co64" => {
+                                        let count = be32(v, 4).unwrap_or(0).min(MAX_CHUNK_OFFSETS as u32) as usize;
+                                        for i in 0..count {
+                                            if track_offsets >= MAX_CHUNK_OFFSETS {
+                                                break;
+                                            }
+                                            if let Some(bytes) = v.get(8 + i * 8..16 + i * 8)
+                                                && let Ok(arr) = <[u8; 8]>::try_from(bytes)
+                                                && let Ok(off) = usize::try_from(u64::from_be_bytes(arr))
+                                            {
+                                                all_offsets.push(off);
+                                                track_offsets += 1;
+                                            }
+                                        }
+                                    }
+                                    _ => {}
+                                });
+                            }
+                        });
+                    }
+                });
+            }
+        });
+    });
+    all_offsets.sort_unstable();
+    all_offsets.dedup();
+    all_offsets
+}
+
+fn mp4_chunk_byte_len(
+    chunk_idx_1based: u32,
+    stsc: &[(u32, u32)],
+    stsz: Option<&[u8]>,
+    stz2: Option<&[u8]>,
+    max_probe: usize,
+) -> Option<usize> {
+    if stsz.is_none() && stz2.is_none() {
+        return None;
+    }
+    let chunk_idx = chunk_idx_1based.max(1);
+    let (first_sample, samples_in_chunk) = if stsc.is_empty() {
+        ((chunk_idx - 1) as usize, 1usize)
+    } else {
+        let samples_for_chunk = |c: u32| -> usize {
+            stsc.iter()
+                .rev()
+                .find(|&&(first_chunk, _)| first_chunk <= c)
+                .or_else(|| stsc.first())
+                .map(|&(_, spc)| spc as usize)
+                .unwrap_or(1)
+        };
+        let mut first = 0usize;
+        for c in 1..chunk_idx {
+            first = first.saturating_add(samples_for_chunk(c));
+        }
+        (first, samples_for_chunk(chunk_idx))
+    };
+
+    if samples_in_chunk == 0 {
+        return Some(0);
+    }
+
+    if let Some(v) = stsz {
+        let default_size = be32(v, 4)? as usize;
+        let sample_count = be32(v, 8)? as usize;
+        if default_size > 0 {
+            if sample_count > 0 && first_sample >= sample_count {
+                return Some(0);
+            }
+            let count = if sample_count > 0 {
+                samples_in_chunk.min(sample_count - first_sample)
+            } else {
+                samples_in_chunk
+            };
+            return Some(count.saturating_mul(default_size).min(max_probe));
+        }
+        if first_sample >= sample_count {
+            return Some(0);
+        }
+        let count = samples_in_chunk.min(sample_count - first_sample).min(256);
+        let mut total = 0usize;
+        for s in 0..count {
+            let entry_off = 12usize.checked_add(first_sample.checked_add(s)?.checked_mul(4)?)?;
+            let sz = be32(v, entry_off)? as usize;
+            total = total.saturating_add(sz);
+            if total >= max_probe {
+                return Some(max_probe);
+            }
+        }
+        return Some(total);
+    }
+
+    if let Some(v) = stz2 {
+        let field_size = usize::from(*v.get(7)?);
+        let sample_count = be32(v, 8)? as usize;
+        if first_sample >= sample_count {
+            return Some(0);
+        }
+        let count = samples_in_chunk.min(sample_count - first_sample).min(256);
+        let mut total = 0usize;
+        for s in 0..count {
+            let idx = first_sample.checked_add(s)?;
+            let sz = match field_size {
+                4 => {
+                    let b = *v.get(12 + idx / 2)?;
+                    usize::from(if idx % 2 == 0 { b >> 4 } else { b & 0x0F })
+                }
+                8 => usize::from(*v.get(12 + idx)?),
+                16 => usize::from(be16(v, 12 + idx.checked_mul(2)?)?),
+                _ => return None,
+            };
+            total = total.saturating_add(sz);
+            if total >= max_probe {
+                return Some(max_probe);
+            }
+        }
+        return Some(total);
+    }
+
+    None
 }
 
 fn moov(body: &[u8], full_data: &[u8], info: &mut MediaInfo) {
+    let all_chunk_offsets = collect_moov_chunk_offsets(body);
     boxes(body, &mut |kind, v| match kind {
         b"mvhd" => {
             let (scale, duration) = if v.first() == Some(&1) {
@@ -844,7 +1013,7 @@ fn moov(body: &[u8], full_data: &[u8], info: &mut MediaInfo) {
                 info.duration_secs = Some(duration as f64 / f64::from(scale));
             }
         }
-        b"trak" => trak(v, full_data, info),
+        b"trak" => trak(v, full_data, &all_chunk_offsets, info),
         _ => {}
     });
 }
@@ -882,7 +1051,7 @@ fn parse_dmlp_atmos(v: &[u8]) -> bool {
     }
 }
 
-fn trak(body: &[u8], full_data: &[u8], info: &mut MediaInfo) {
+fn trak(body: &[u8], full_data: &[u8], all_chunk_offsets: &[usize], info: &mut MediaInfo) {
     const MAX_CHUNK_OFFSETS: usize = 16;
     const MAX_AUDIO_CHUNK_PROBE: usize = 4096;
 
@@ -890,7 +1059,10 @@ fn trak(body: &[u8], full_data: &[u8], info: &mut MediaInfo) {
         return;
     }
     let (mut handler, mut language, mut entry): ([u8; 4], Option<String>, Option<Vec<u8>>) = ([0; 4], None, None);
-    let mut chunk_offsets: Vec<usize> = Vec::new();
+    let mut chunk_offsets: Vec<(u32, usize)> = Vec::new();
+    let mut stsc_entries: Vec<(u32, u32)> = Vec::new();
+    let mut stsz_box: Option<&[u8]> = None;
+    let mut stz2_box: Option<&[u8]> = None;
     boxes(body, &mut |kind, v| {
         if kind == b"mdia" {
             boxes(v, &mut |kind, v| match kind {
@@ -916,9 +1088,9 @@ fn trak(body: &[u8], full_data: &[u8], info: &mut MediaInfo) {
                                         break;
                                     }
                                     if let Some(off) = be32(v, 8 + i * 4).map(|o| o as usize)
-                                        && !chunk_offsets.contains(&off)
+                                        && !chunk_offsets.iter().any(|&(_, existing)| existing == off)
                                     {
-                                        chunk_offsets.push(off);
+                                        chunk_offsets.push((i as u32 + 1, off));
                                     }
                                 }
                             }
@@ -931,11 +1103,30 @@ fn trak(body: &[u8], full_data: &[u8], info: &mut MediaInfo) {
                                     if let Some(bytes) = v.get(8 + i * 8..16 + i * 8)
                                         && let Ok(arr) = <[u8; 8]>::try_from(bytes)
                                         && let Ok(off) = usize::try_from(u64::from_be_bytes(arr))
-                                        && !chunk_offsets.contains(&off)
+                                        && !chunk_offsets.iter().any(|&(_, existing)| existing == off)
                                     {
-                                        chunk_offsets.push(off);
+                                        chunk_offsets.push((i as u32 + 1, off));
                                     }
                                 }
+                            }
+                            b"stsc" if stsc_entries.is_empty() => {
+                                let count = be32(v, 4).unwrap_or(0).min(MAX_CHUNK_OFFSETS as u32) as usize;
+                                for i in 0..count {
+                                    let Some(first_chunk) = be32(v, 8 + i * 12) else { break };
+                                    let Some(samples_per_chunk) = be32(v, 12 + i * 12) else { break };
+                                    if first_chunk >= 1 {
+                                        stsc_entries.push((first_chunk, samples_per_chunk));
+                                    }
+                                    if first_chunk > MAX_CHUNK_OFFSETS as u32 {
+                                        break;
+                                    }
+                                }
+                            }
+                            b"stsz" if stsz_box.is_none() && v.len() >= 12 => {
+                                stsz_box = Some(v);
+                            }
+                            b"stz2" if stz2_box.is_none() && v.len() >= 12 => {
+                                stz2_box = Some(v);
                             }
                             _ => {}
                         });
@@ -945,6 +1136,18 @@ fn trak(body: &[u8], full_data: &[u8], info: &mut MediaInfo) {
             });
         }
     });
+    let chunk_slice = |chunk_idx: u32, off: usize| -> Option<&[u8]> {
+        let mut end = off.saturating_add(MAX_AUDIO_CHUNK_PROBE).min(full_data.len());
+        if let Some(chunk_len) =
+            mp4_chunk_byte_len(chunk_idx, &stsc_entries, stsz_box, stz2_box, MAX_AUDIO_CHUNK_PROBE)
+        {
+            end = end.min(off.saturating_add(chunk_len));
+        }
+        if let Some(&next_off) = all_chunk_offsets.iter().find(|&&o| o > off) {
+            end = end.min(next_off);
+        }
+        full_data.get(off..end)
+    };
     let Some(entry) = entry else { return };
     let Some(fourcc) = entry.get(4..8) else { return };
     let codec = String::from_utf8_lossy(fourcc).to_string();
@@ -994,9 +1197,8 @@ fn trak(body: &[u8], full_data: &[u8], info: &mut MediaInfo) {
                     track.bit_depth = AvcDepth::from_avcc(v).map(u64::from);
                 }
             });
-            for &off in &chunk_offsets {
-                let end = off.saturating_add(MAX_AUDIO_CHUNK_PROBE).min(full_data.len());
-                let Some(chunk) = full_data.get(off..end) else { continue };
+            for &(chunk_idx, off) in &chunk_offsets {
+                let Some(chunk) = chunk_slice(chunk_idx, off) else { continue };
                 if let Some(dv) = DolbyVisionInfo::parse_rpu_with_length_size(chunk, nal_length_size) {
                     apply_rpu_to_video_track(&mut track, dv);
                     break;
@@ -1009,15 +1211,19 @@ fn trak(body: &[u8], full_data: &[u8], info: &mut MediaInfo) {
         }
         b"soun" => {
             let mut atmos = false;
+            let mut dtsx = codec.eq_ignore_ascii_case("dtsx");
+            let can_probe_dtsx = codec.is_empty() || codec.to_ascii_lowercase().contains("dts");
             boxes(entry.get(36..).unwrap_or(&[]), &mut |kind, v| {
                 if (kind == b"dec3" && parse_dec3_atmos(v)) || (kind == b"dmlp" && parse_dmlp_atmos(v)) {
                     atmos = true;
                 }
             });
-            if !atmos {
-                for &off in &chunk_offsets {
-                    let end = off.saturating_add(MAX_AUDIO_CHUNK_PROBE).min(full_data.len());
-                    let Some(chunk) = full_data.get(off..end) else { continue };
+            for &(chunk_idx, off) in &chunk_offsets {
+                if atmos && (dtsx || !can_probe_dtsx) {
+                    break;
+                }
+                let Some(chunk) = chunk_slice(chunk_idx, off) else { continue };
+                if !atmos {
                     let chunk_has_atmos = match codec.as_str() {
                         "ec-3" => AudioBitstream::has_eac3_atmos_frame(chunk),
                         "mlpa" => AudioBitstream::has_truehd_atmos(chunk),
@@ -1025,8 +1231,10 @@ fn trak(body: &[u8], full_data: &[u8], info: &mut MediaInfo) {
                     };
                     if chunk_has_atmos {
                         atmos = true;
-                        break;
                     }
+                }
+                if !dtsx && can_probe_dtsx && AudioBitstream::has_dtsx_sync(chunk) {
+                    dtsx = true;
                 }
             }
             info.audio.push(AudioTrack {
@@ -1035,6 +1243,7 @@ fn trak(body: &[u8], full_data: &[u8], info: &mut MediaInfo) {
                 sample_rate: be32(&entry, 32).map(|rate| f64::from(rate >> 16)),
                 language,
                 atmos,
+                dtsx,
                 ..AudioTrack::default()
             });
         }
@@ -1102,15 +1311,14 @@ fn probe_block(
     if let Some(&(_, video_idx, nal_length_size)) =
         video_tracks.iter().find(|&&(num, _, _)| num == track_num)
     {
-        if video_rpu_found.get(video_idx).copied() == Some(false) {
-            let frames = skip_matroska_lace_header(flags, payload).unwrap_or(payload);
-            if let Some(dv) = DolbyVisionInfo::parse_rpu_with_length_size(frames, nal_length_size)
-                && let Some(track) = info.video.get_mut(video_idx)
-            {
-                apply_rpu_to_video_track(track, dv);
-                if let Some(found) = video_rpu_found.get_mut(video_idx) {
-                    *found = true;
-                }
+        if video_rpu_found.get(video_idx).copied() == Some(false)
+            && let Some(frames) = skip_matroska_lace_header(flags, payload)
+            && let Some(dv) = DolbyVisionInfo::parse_rpu_with_length_size(frames, nal_length_size)
+            && let Some(track) = info.video.get_mut(video_idx)
+        {
+            apply_rpu_to_video_track(track, dv);
+            if let Some(found) = video_rpu_found.get_mut(video_idx) {
+                *found = true;
             }
         }
         return;
@@ -1118,16 +1326,23 @@ fn probe_block(
 
     let Some(&(_, audio_idx)) = audio_tracks.iter().find(|&&(num, _)| num == track_num) else { return };
     let Some(track) = info.audio.get_mut(audio_idx) else { return };
-    if track.atmos {
+    let can_probe_dtsx = track.codec.is_empty() || track.codec.to_ascii_lowercase().contains("dts");
+    if track.atmos && (track.dtsx || !can_probe_dtsx) {
         return;
     }
-    let has_atmos = match track.codec.as_str() {
-        "A_TRUEHD" | "A_MLP" => AudioBitstream::has_truehd_atmos(payload),
-        "A_EAC3" => AudioBitstream::has_eac3_atmos_frame(payload),
-        _ => false,
-    };
-    if has_atmos {
-        track.atmos = true;
+    let Some(frames) = skip_matroska_lace_header(flags, payload) else { return };
+    if !track.atmos {
+        let has_atmos = match track.codec.as_str() {
+            "A_TRUEHD" | "A_MLP" => AudioBitstream::has_truehd_atmos(frames),
+            "A_EAC3" => AudioBitstream::has_eac3_atmos_frame(frames),
+            _ => false,
+        };
+        if has_atmos {
+            track.atmos = true;
+        }
+    }
+    if !track.dtsx && can_probe_dtsx && AudioBitstream::has_dtsx_sync(frames) {
+        track.dtsx = true;
     }
 }
 
@@ -1238,13 +1453,6 @@ impl DolbyVisionInfo {
             return Some(info);
         }
 
-        if data.len() >= 4 && (data[0] == 1 || data[0] == 0) && data[1] == 0 && (data[2] >> 1) <= 10
-            && let Some(info) = Self::from_dvcc_dvvc(data)
-            && [4, 5, 7, 8].contains(&info.profile)
-        {
-            return Some(info);
-        }
-
         None
     }
 
@@ -1326,34 +1534,72 @@ impl DolbyVisionInfo {
 
     fn parse_rpu_payload(payload: &[u8]) -> Option<Self> {
         let rbsp = crate::video::bits::rbsp(payload);
-        if rbsp.len() < 3 {
+        let trimmed_len = rbsp.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
+        let rbsp = &rbsp[..trimmed_len];
+        if rbsp.len() < 4 {
             return None;
         }
 
-        let mut r = crate::video::bits::BitReader::new(&rbsp);
-        let _rpu_type = r.bits(6).ok()?;
-        let rpu_format = r.bits(11).ok()?;
+        let mut r = crate::video::bits::BitReader::new(rbsp);
+        let rpu_prefix = r.bits(8).ok()? as u8;
+        if rpu_prefix != 0x19 {
+            return None;
+        }
+
+        let rpu_type = r.bits(6).ok()? as u8;
+        if rpu_type != 2 {
+            return None;
+        }
+        let rpu_format = r.bits(11).ok()? as u16;
         let vdr_rpu_profile = r.bits(4).ok()? as u8;
         let vdr_rpu_level = r.bits(4).ok()? as u8;
 
-        let bl_video_full_range_flag = false;
+        let mut coefficient_data_type = 0u8;
+        let mut coeff_log2_denom_len = 0u32;
+        let mut bl_video_full_range_flag = false;
+        let mut bl_bit_depth_minus8 = 2u32;
+        let mut el_bit_depth_minus8 = 2u32;
+        let mut vdr_bit_depth_minus8 = 2u32;
+        let mut reserved_zero_3bits = 0u8;
         let mut el_spatial_resampling_filter_flag = false;
         let mut disable_residual_flag = false;
-        let mut vdr_bit_depth_minus8 = 2u32;
 
-        let vdr_seq_info_present = r.flag().unwrap_or(false);
+        let vdr_seq_info_present = r.flag().ok()?;
         if vdr_seq_info_present {
-            let _chroma_resample = r.flag().ok()?;
-            let _coeff_data_type = r.bits(2).ok()?;
+            let _chroma_resampling_explicit_filter_flag = r.flag().ok()?;
+            coefficient_data_type = r.bits(2).ok()? as u8;
+            let coefficient_log2_denom = if coefficient_data_type == 0 {
+                r.ue().ok()?
+            } else {
+                0
+            };
+            let _vdr_rpu_normalized_idc = r.bits(2).ok()?;
+            bl_video_full_range_flag = r.flag().ok()?;
             if (rpu_format & 0x700) == 0 {
-                let _bl_depth = r.ue().ok()?;
-                let _el_depth = r.ue().ok()?;
-                vdr_bit_depth_minus8 = r.ue().unwrap_or(2);
+                bl_bit_depth_minus8 = r.ue().ok()?;
+                el_bit_depth_minus8 = r.ue().ok()? & 0xFF;
+                vdr_bit_depth_minus8 = r.ue().ok()?;
+                let _spatial_resampling_filter_flag = r.flag().ok()?;
+                reserved_zero_3bits = r.bits(3).ok()? as u8;
+                el_spatial_resampling_filter_flag = r.flag().ok()?;
+                disable_residual_flag = r.flag().ok()?;
             }
-            let _spatial_resample = r.flag().ok()?;
-            let _reserved = r.bits(3).ok()?;
-            el_spatial_resampling_filter_flag = r.flag().unwrap_or(false);
-            disable_residual_flag = r.flag().unwrap_or(false);
+            coeff_log2_denom_len = match coefficient_data_type {
+                0 => {
+                    if coefficient_log2_denom > 32 {
+                        return None;
+                    }
+                    coefficient_log2_denom
+                }
+                1 => 32,
+                _ => return None,
+            };
+        }
+
+        let vdr_dm_metadata_present_flag = r.flag().unwrap_or(false);
+        let use_prev_vdr_rpu_flag = r.flag().unwrap_or(false);
+        if use_prev_vdr_rpu_flag {
+            let _prev_vdr_rpu_id = r.ue().ok()?;
         }
 
         let profile = if vdr_rpu_profile == 0 && bl_video_full_range_flag {
@@ -1372,27 +1618,33 @@ impl DolbyVisionInfo {
 
         let el_present = profile == 7 || profile == 4;
 
-        let mut is_fel = profile == 7;
-        let has_nlq = (rpu_format & 0x700) == 0 && !disable_residual_flag;
-        if has_nlq && profile == 7 {
-            let is_mel = rbsp.windows(4).any(|w| w == [0, 0, 0, 0]) && rbsp.len() < 128;
-            if is_mel {
-                is_fel = false;
+        let mut is_fel = false;
+        let mut mapping_ok = use_prev_vdr_rpu_flag;
+        if !use_prev_vdr_rpu_flag
+            && let Some(parsed_fel) = Self::parse_rpu_mapping_and_nlq(
+                &mut r,
+                rpu_format,
+                disable_residual_flag,
+                coefficient_data_type,
+                coeff_log2_denom_len,
+                bl_bit_depth_minus8,
+                el_bit_depth_minus8,
+            )
+        {
+            mapping_ok = true;
+            if profile == 7
+                && let Some(fel) = parsed_fel
+            {
+                is_fel = fel;
             }
         }
 
         let mut has_cm4 = false;
-
-        // Skip the fixed 3-byte RPU header and parsed sequence info so that
-        // Byte 2, which encodes (vdr_rpu_profile << 3) | (vdr_rpu_level >> 1) and
-        // evaluates to 8..11 for standard Profile 4/7/8 streams, is not
-        // falsely matched as a CM v4.0 extension block marker.
-        let search_start = (r.position() / 8).max(3).min(rbsp.len());
-        for &byte in &rbsp[search_start..] {
-            if [3, 8, 9, 10, 11, 254].contains(&byte) {
-                has_cm4 = true;
-                break;
-            }
+        if mapping_ok
+            && vdr_dm_metadata_present_flag
+            && let Some(cm4) = Self::parse_vdr_dm_data(&mut r, reserved_zero_3bits == 1)
+        {
+            has_cm4 = cm4;
         }
 
         let cm_version = if has_cm4 {
@@ -1409,6 +1661,202 @@ impl DolbyVisionInfo {
             fel: is_fel,
             cm_version,
         })
+    }
+
+    fn parse_rpu_mapping_and_nlq(
+        r: &mut crate::video::bits::BitReader<'_>,
+        rpu_format: u16,
+        disable_residual_flag: bool,
+        coefficient_data_type: u8,
+        coeff_log2_denom_len: u32,
+        bl_bit_depth_minus8: u32,
+        el_bit_depth_minus8: u32,
+    ) -> Option<Option<bool>> {
+        const NUM_COMPONENTS: usize = 3;
+        const NLQ_NUM_PIVOTS: usize = 2;
+        const MMR_MAX_COEFFS: usize = 7;
+
+        let _vdr_rpu_id = r.ue().ok()?;
+        let _mapping_color_space = r.ue().ok()?;
+        let _mapping_chroma_format_idc = r.ue().ok()?;
+
+        let bl_bit_depth = bl_bit_depth_minus8.checked_add(8)?;
+        if bl_bit_depth > 32 {
+            return None;
+        }
+
+        let mut num_pivots_minus2 = [0u32; NUM_COMPONENTS];
+        for num_pm2 in &mut num_pivots_minus2 {
+            let npm2 = r.ue().ok()?;
+            if npm2 > 64 {
+                return None;
+            }
+            *num_pm2 = npm2;
+            let num_pivots = (npm2 as usize) + 2;
+            for _ in 0..num_pivots {
+                let _pivot = r.bits(bl_bit_depth).ok()?;
+            }
+        }
+
+        let has_nlq = (rpu_format & 0x700) == 0 && !disable_residual_flag;
+        let mut nlq_method_idc = None;
+        if has_nlq {
+            let method = r.bits(3).ok()? as u8;
+            if method != 0 {
+                return None;
+            }
+            nlq_method_idc = Some(method);
+            for _ in 0..NLQ_NUM_PIVOTS {
+                let _pv = r.bits(bl_bit_depth).ok()?;
+            }
+        }
+
+        let _num_x_partitions_minus1 = r.ue().ok()?;
+        let _num_y_partitions_minus1 = r.ue().ok()?;
+
+        for &npm2 in &num_pivots_minus2 {
+            let num_pieces = (npm2 as usize) + 1;
+            for pivot_idx in 0..num_pieces {
+                let mapping_idc = r.ue().ok()?;
+                match mapping_idc {
+                    0 => {
+                        let poly_order_minus1 = r.ue().ok()?;
+                        if poly_order_minus1 > 1 {
+                            return None;
+                        }
+                        let linear_interp_flag = if poly_order_minus1 == 0 {
+                            r.flag().ok()?
+                        } else {
+                            false
+                        };
+                        if poly_order_minus1 == 0 && linear_interp_flag {
+                            if coefficient_data_type == 0 {
+                                let _ = r.ue().ok()?;
+                            }
+                            let _ = r.bits(coeff_log2_denom_len).ok()?;
+                            if pivot_idx as u32 == npm2 {
+                                if coefficient_data_type == 0 {
+                                    let _ = r.ue().ok()?;
+                                }
+                                let _ = r.bits(coeff_log2_denom_len).ok()?;
+                            }
+                        } else {
+                            let poly_coef_count = (poly_order_minus1 as usize) + 2;
+                            for _ in 0..poly_coef_count {
+                                if coefficient_data_type == 0 {
+                                    let _ = r.se().ok()?;
+                                }
+                                let _ = r.bits(coeff_log2_denom_len).ok()?;
+                            }
+                        }
+                    }
+                    1 => {
+                        let mmr_order_minus1 = r.bits(2).ok()? as usize;
+                        if mmr_order_minus1 > 2 {
+                            return None;
+                        }
+                        if coefficient_data_type == 0 {
+                            let _ = r.se().ok()?;
+                        }
+                        let _ = r.bits(coeff_log2_denom_len).ok()?;
+                        for _ in 0..(mmr_order_minus1 + 1) {
+                            for _ in 0..MMR_MAX_COEFFS {
+                                if coefficient_data_type == 0 {
+                                    let _ = r.se().ok()?;
+                                }
+                                let _ = r.bits(coeff_log2_denom_len).ok()?;
+                            }
+                        }
+                    }
+                    _ => return None,
+                }
+            }
+        }
+
+        if let Some(0) = nlq_method_idc {
+            let el_bit_depth = el_bit_depth_minus8.checked_add(8)?;
+            if el_bit_depth > 32 {
+                return None;
+            }
+            let mut nlq_offset = [0u32; NUM_COMPONENTS];
+            let mut vdr_in_max_int = [0u32; NUM_COMPONENTS];
+            let mut vdr_in_max = [0u32; NUM_COMPONENTS];
+            let mut linear_deadzone_slope_int = [0u32; NUM_COMPONENTS];
+            let mut linear_deadzone_slope = [0u32; NUM_COMPONENTS];
+            let mut linear_deadzone_threshold_int = [0u32; NUM_COMPONENTS];
+            let mut linear_deadzone_threshold = [0u32; NUM_COMPONENTS];
+
+            for cmp in 0..NUM_COMPONENTS {
+                nlq_offset[cmp] = r.bits(el_bit_depth).ok()?;
+                if coefficient_data_type == 0 {
+                    vdr_in_max_int[cmp] = r.ue().ok()?;
+                }
+                vdr_in_max[cmp] = r.bits(coeff_log2_denom_len).ok()?;
+                if coefficient_data_type == 0 {
+                    linear_deadzone_slope_int[cmp] = r.ue().ok()?;
+                }
+                linear_deadzone_slope[cmp] = r.bits(coeff_log2_denom_len).ok()?;
+                if coefficient_data_type == 0 {
+                    linear_deadzone_threshold_int[cmp] = r.ue().ok()?;
+                }
+                linear_deadzone_threshold[cmp] = r.bits(coeff_log2_denom_len).ok()?;
+            }
+
+            let is_mel = nlq_offset == [0; 3]
+                && vdr_in_max_int == [1; 3]
+                && vdr_in_max == [0; 3]
+                && linear_deadzone_slope_int == [0; 3]
+                && linear_deadzone_slope == [0; 3]
+                && linear_deadzone_threshold_int == [0; 3]
+                && linear_deadzone_threshold == [0; 3];
+            return Some(Some(!is_mel));
+        }
+
+        Some(None)
+    }
+
+    fn parse_dm_ext_blocks(
+        r: &mut crate::video::bits::BitReader<'_>,
+        has_cm4: &mut bool,
+    ) -> Option<()> {
+        let num_ext_blocks = r.ue().ok()?;
+        if num_ext_blocks > 256 {
+            return None;
+        }
+        while !r.is_byte_aligned() {
+            if r.flag().ok()? {
+                return None;
+            }
+        }
+        for _ in 0..num_ext_blocks {
+            let ext_block_length = r.ue().ok()? as usize;
+            let ext_block_level = r.bits(8).ok()? as u8;
+            if matches!(ext_block_level, 3 | 8 | 9 | 10 | 11 | 254) {
+                *has_cm4 = true;
+            }
+            r.skip(ext_block_length.checked_mul(8)?).ok()?;
+        }
+        Some(())
+    }
+
+    fn parse_vdr_dm_data(
+        r: &mut crate::video::bits::BitReader<'_>,
+        compressed_dm_data: bool,
+    ) -> Option<bool> {
+        const DM_DATA_PAYLOAD2_MIN_BITS: usize = 56;
+
+        let _affected_dm_metadata_id = r.ue().ok()?;
+        let _current_dm_metadata_id = r.ue().ok()?;
+        let _scene_refresh_flag = r.ue().ok()?;
+        if !compressed_dm_data {
+            r.skip(509).ok()?;
+        }
+        let mut has_cm4 = false;
+        Self::parse_dm_ext_blocks(r, &mut has_cm4)?;
+        if r.bits_left() >= DM_DATA_PAYLOAD2_MIN_BITS {
+            let _ = Self::parse_dm_ext_blocks(r, &mut has_cm4);
+        }
+        Some(has_cm4)
     }
 }
 
@@ -1435,57 +1883,32 @@ impl H265Sps {
         if nal_slice.len() < 2 {
             return None;
         }
-
-        if let Ok(sps) = crate::video::hevc::params::parse_sps(nal_slice) {
-            let (primaries, transfer, matrix) = sps.colour.unwrap_or((0, 0, 0));
-            let bit_depth = sps.bit_depth_luma;
-            let hdr = if transfer == 16 && primaries == 9 && bit_depth >= 10 {
-                Some("HDR10".to_string())
-            } else if transfer == 18 && primaries == 9 {
-                Some("HLG".to_string())
-            } else if transfer == 16 {
-                Some("PQ".to_string())
-            } else if primaries == 1 && transfer == 1 {
-                Some("BT.709".to_string())
-            } else {
-                None
-            };
-            return Some(VuiInfo {
-                colour_primaries: primaries,
-                transfer_characteristics: transfer,
-                matrix_coeffs: matrix,
-                bit_depth,
-                full_range: sps.full_range,
-                hdr,
-            });
+        if (nal_slice[0] & 0x80) != 0 || ((nal_slice[0] >> 1) & 0x3F) != 33 {
+            return None;
         }
 
-        Self::parse_vui_direct(nal_slice)
-    }
-
-    fn parse_vui_direct(nal_slice: &[u8]) -> Option<VuiInfo> {
-        let rbsp = crate::video::bits::rbsp(nal_slice.get(2..)?);
-        if find_subsequence(&rbsp, &[9, 16, 9]).is_some() || find_subsequence(&rbsp, &[9, 16]).is_some() {
-            return Some(VuiInfo {
-                colour_primaries: 9,
-                transfer_characteristics: 16,
-                matrix_coeffs: 9,
-                bit_depth: 10,
-                full_range: false,
-                hdr: Some("HDR10".to_string()),
-            });
-        }
-        if find_subsequence(&rbsp, &[9, 18, 9]).is_some() || find_subsequence(&rbsp, &[9, 18]).is_some() {
-            return Some(VuiInfo {
-                colour_primaries: 9,
-                transfer_characteristics: 18,
-                matrix_coeffs: 9,
-                bit_depth: 10,
-                full_range: false,
-                hdr: Some("HLG".to_string()),
-            });
-        }
-        None
+        let sps = crate::video::hevc::params::parse_sps(nal_slice).ok()?;
+        let (primaries, transfer, matrix) = sps.colour.unwrap_or((0, 0, 0));
+        let bit_depth = sps.bit_depth_luma;
+        let hdr = if transfer == 16 && primaries == 9 && bit_depth >= 10 {
+            Some("HDR10".to_string())
+        } else if transfer == 18 && primaries == 9 {
+            Some("HLG".to_string())
+        } else if transfer == 16 {
+            Some("PQ".to_string())
+        } else if primaries == 1 && transfer == 1 {
+            Some("BT.709".to_string())
+        } else {
+            None
+        };
+        Some(VuiInfo {
+            colour_primaries: primaries,
+            transfer_characteristics: transfer,
+            matrix_coeffs: matrix,
+            bit_depth,
+            full_range: sps.full_range,
+            hdr,
+        })
     }
 }
 
@@ -1611,6 +2034,44 @@ impl AudioBitstream {
         false
     }
 
+    fn has_valid_joc_emdf_payload(container: &[u8]) -> bool {
+        let mut r = crate::video::bits::BitReader::new(container);
+        let Ok(emdf_version) = r.bits(2) else { return false };
+        if emdf_version != 0 {
+            return false;
+        }
+        let Ok(key_id) = r.bits(3) else { return false };
+        if key_id == 7 {
+            loop {
+                let Ok(ext) = r.bits(3) else { return false };
+                if ext != 7 {
+                    break;
+                }
+            }
+        }
+        let Ok(mut payload_id) = r.bits(5) else { return false };
+        if payload_id == 0x1F {
+            let Ok(ext) = r.bits(5) else { return false };
+            payload_id += ext;
+        }
+        if payload_id != 14 {
+            return false;
+        }
+        // joc_header(): joc_dmx_config_idx (3b), joc_num_objects_bits (6b), joc_ext_config_idx (3b)
+        r.bits(12).is_ok()
+    }
+
+    fn has_valid_joc_emdf_container(emdf_slice: &[u8]) -> bool {
+        if emdf_slice.len() < 4 || emdf_slice[0] != 0x58 || emdf_slice[1] != 0x38 {
+            return false;
+        }
+        let container_len = usize::from(u16::from_be_bytes([emdf_slice[2], emdf_slice[3]]));
+        if container_len == 0 || 4 + container_len > emdf_slice.len() {
+            return false;
+        }
+        Self::has_valid_joc_emdf_payload(&emdf_slice[4..4 + container_len])
+    }
+
     pub fn has_eac3_atmos_frame(data: &[u8]) -> bool {
         let mut offset = 0usize;
         let mut verified_no_emdf_start = 0usize;
@@ -1630,17 +2091,20 @@ impl AudioBitstream {
                     if scan_start < body_end {
                         let body = &data[scan_start..body_end];
                         let mut emdf_off = 0usize;
+                        let mut max_verified_end = body_end.saturating_sub(3);
                         while let Some(emdf_slice) = body.get(emdf_off..) {
                             let Some(emdf_pos) = find_subsequence(emdf_slice, &[0x58, 0x38]) else { break };
-                            if let Some(&hdr) = emdf_slice.get(emdf_pos + 2)
-                                && emdf_slice.get(emdf_pos + 3).is_some()
-                                && (hdr & 0xF8) == 0
-                            {
+                            if Self::has_valid_joc_emdf_container(&emdf_slice[emdf_pos..]) {
                                 return true;
+                            }
+                            let abs_emdf_pos = scan_start + emdf_off + emdf_pos;
+                            if Self::has_valid_joc_emdf_container(&data[abs_emdf_pos..]) {
+                                max_verified_end = max_verified_end.min(abs_emdf_pos);
+                                break;
                             }
                             emdf_off = emdf_off.saturating_add(emdf_pos + 2);
                         }
-                        verified_no_emdf_start = verified_no_emdf_start.max(body_end.saturating_sub(3));
+                        verified_no_emdf_start = verified_no_emdf_start.max(max_verified_end);
                     }
                 }
             }
@@ -1654,24 +2118,36 @@ impl AudioBitstream {
             return false;
         }
         if let Some(pos) = find_subsequence(data, &[0x58, 0x38]) {
-            data[..pos].iter().all(|&b| b == 0) && data.get(pos + 2..pos + 6) == Some(&[0, 0, 0, 0])
+            data[..pos].iter().all(|&b| b == 0) && Self::has_valid_joc_emdf_container(&data[pos..])
         } else {
             false
         }
+    }
+
+    pub fn has_dtsx_sync(data: &[u8]) -> bool {
+        find_subsequence(data, &[0x02, 0x00, 0x08, 0x50]).is_some()
+            || find_subsequence(data, &[0x50, 0x08, 0x00, 0x02]).is_some()
+            || find_subsequence(data, &[0xF1, 0x40, 0x00, 0xD0]).is_some()
     }
 
     pub fn probe(data: &[u8]) -> AudioProbeResult {
         let mut result = AudioProbeResult::default();
 
         if is_matroska(data) || is_mp4(data) {
-            if let Some(info) = parse(data)
-                && let Some(track) = info.audio.iter().find(|a| a.atmos)
-            {
-                result.has_atmos = true;
-                result.format = Some(match track.codec.as_str() {
-                    "A_TRUEHD" | "A_MLP" | "mlpa" => "TrueHD Atmos".to_string(),
-                    _ => "E-AC-3 Atmos".to_string(),
-                });
+            if let Some(info) = parse(data) {
+                if let Some(track) = info.audio.iter().find(|a| a.atmos) {
+                    result.has_atmos = true;
+                    result.format = Some(match track.codec.as_str() {
+                        "A_TRUEHD" | "A_MLP" | "mlpa" => "TrueHD Atmos".to_string(),
+                        _ => "E-AC-3 Atmos".to_string(),
+                    });
+                }
+                if info.audio.iter().any(|a| a.dtsx) {
+                    result.has_dtsx = true;
+                    if result.format.is_none() {
+                        result.format = Some("DTS:X".to_string());
+                    }
+                }
             }
             return result;
         }
@@ -1684,10 +2160,7 @@ impl AudioBitstream {
             result.format = Some("E-AC-3 Atmos".to_string());
         }
 
-        if find_subsequence(data, &[0x02, 0x00, 0x08, 0x50]).is_some()
-            || find_subsequence(data, &[0x50, 0x08, 0x00, 0x02]).is_some()
-            || find_subsequence(data, &[0xF1, 0x40, 0x00, 0xD0]).is_some()
-        {
+        if Self::has_dtsx_sync(data) {
             result.has_dtsx = true;
             if result.format.is_none() {
                 result.format = Some("DTS:X".to_string());
@@ -1711,12 +2184,15 @@ pub struct Mp4Prober;
 impl Mp4Prober {
     pub fn find_moov_offset(data: &[u8]) -> Option<u64> {
         let mut at = 0usize;
-        while let Some(head) = data.get(at..at + 8) {
+        while let Some(head_end) = at.checked_add(8)
+            && let Some(head) = data.get(at..head_end)
+        {
             let mut size = u64::from(u32::from_be_bytes([head[0], head[1], head[2], head[3]]));
             let kind = &head[4..8];
             let mut head_size = 8u64;
             if size == 1 {
-                let long = data.get(at + 8..at + 16)?;
+                let ext_end = at.checked_add(16)?;
+                let long = data.get(head_end..ext_end)?;
                 size = u64::from_be_bytes(long.try_into().unwrap_or([0; 8]));
                 head_size = 16;
             } else if size == 0 {
@@ -1726,9 +2202,13 @@ impl Mp4Prober {
                 return None;
             }
             if kind == b"mdat" {
-                return Some(at as u64 + size);
+                return (at as u64).checked_add(size);
             }
-            let end = at.checked_add(size as usize)?;
+            let step = usize::try_from(size).ok()?;
+            let end = at.checked_add(step)?;
+            if end > data.len() {
+                return None;
+            }
             at = end;
         }
         None
@@ -1744,7 +2224,9 @@ impl Mp4Prober {
 
     fn has_moov_box(data: &[u8]) -> bool {
         let mut at = 0usize;
-        while let Some(head) = data.get(at..at + 8) {
+        while let Some(head_end) = at.checked_add(8)
+            && let Some(head) = data.get(at..head_end)
+        {
             let mut size = u64::from(u32::from_be_bytes([head[0], head[1], head[2], head[3]]));
             let kind = &head[4..8];
             if !kind.iter().all(|b| b.is_ascii_graphic() || *b == b' ') {
@@ -1752,7 +2234,8 @@ impl Mp4Prober {
             }
             let mut head_size = 8u64;
             if size == 1 {
-                let Some(long) = data.get(at + 8..at + 16) else { return false };
+                let Some(ext_end) = at.checked_add(16) else { return false };
+                let Some(long) = data.get(head_end..ext_end) else { return false };
                 size = u64::from_be_bytes(long.try_into().unwrap_or([0; 8]));
                 head_size = 16;
             } else if size == 0 {
@@ -1838,12 +2321,9 @@ impl DiscProber {
     pub fn dvd_disc_id(video_ts: &[u8], vts: &[u8]) -> [u8; 16] {
         use md5::{Digest, Md5};
         let mut hasher = Md5::new();
-        let chunk1 = &video_ts[..video_ts.len().min(16384)];
-        let chunk2 = &vts[..vts.len().min(16384)];
-        hasher.update(chunk1);
-        hasher.update(chunk2);
-        let result = hasher.finalize();
-        result.into()
+        hasher.update(video_ts);
+        hasher.update(vts);
+        hasher.finalize().into()
     }
 
     pub fn dvd_disc_id_hex(video_ts: &[u8], vts: &[u8]) -> String {
@@ -2276,7 +2756,8 @@ mod tests {
         assert!(!info_no_atmos.audio[1].atmos);
 
         // Cluster 2: valid E-AC-3 Atmos syncframe on Track 3 (second audio track)
-        // Sync 0x0B77, strmtyp=0, frmsiz=15 (32 bytes), fscod=0, bsid=16 (16 << 3 = 0x80), EMDF 0x5838 + version/key=0
+        // Sync 0x0B77, strmtyp=0, frmsiz=15 (32 bytes), fscod=0, bsid=16 (16 << 3 = 0x80),
+        // EMDF 0x5838 + len=4 + version=0, key_id=0, payload_id=14 (0x03, 0x80) + 12-bit joc_header
         let mut eac3_frame = vec![0u8; 32];
         eac3_frame[0] = 0x0B;
         eac3_frame[1] = 0x77;
@@ -2284,7 +2765,7 @@ mod tests {
         eac3_frame[3] = 15;
         eac3_frame[4] = 0x00;
         eac3_frame[5] = 16 << 3;
-        eac3_frame[10..14].copy_from_slice(&[0x58, 0x38, 0x02, 0x0E]);
+        eac3_frame[10..18].copy_from_slice(&[0x58, 0x38, 0x00, 0x04, 0x03, 0x80, 0x00, 0x00]);
         let mut audio_block_body = vec![0x83, 0x00, 0x00, 0x80]; // TrackNumber = 3
         audio_block_body.extend_from_slice(&eac3_frame);
         let cluster_with_atmos = [video_block, el(&[0xA3], &audio_block_body)].concat();
@@ -2356,9 +2837,15 @@ mod tests {
             "4 MiB repeated E-AC-3 sync word scan must complete in linear time, took {:?}",
             start.elapsed()
         );
-        // Place valid EMDF sync [0x58, 0x38, 0x00, 0x00] near the end of the 4 MiB buffer
         let tail = payload.len() - 16;
+        // Coincidental [0x58, 0x38, 0x00, 0x00] (zero container length) must NOT report Atmos
         payload[tail..tail + 4].copy_from_slice(&[0x58, 0x38, 0x00, 0x00]);
+        assert!(!AudioBitstream::has_eac3_atmos_frame(&payload));
+        // Non-JOC EMDF container (payload_id=11 -> 0x02, 0xC0) must NOT report Atmos
+        payload[tail..tail + 8].copy_from_slice(&[0x58, 0x38, 0x00, 0x04, 0x02, 0xC0, 0x00, 0x00]);
+        assert!(!AudioBitstream::has_eac3_atmos_frame(&payload));
+        // Valid JOC EMDF container (len=4, version=0, key_id=0, payload_id=14 -> 0x03, 0x80 + 12b joc_header)
+        payload[tail..tail + 8].copy_from_slice(&[0x58, 0x38, 0x00, 0x04, 0x03, 0x80, 0x00, 0x00]);
         assert!(AudioBitstream::has_eac3_atmos_frame(&payload));
     }
 
@@ -2383,10 +2870,99 @@ mod tests {
 
         // Build a SimpleBlock for Track 1 containing two 4-byte length-prefixed HEVC NAL units:
         // 1. IDR slice NAL (type 19 -> header 0x26, 0x01) of 6 bytes
-        // 2. Dolby Vision RPU NAL (type 62 -> header 0x7C, 0x01) with Profile 7 FEL + CM v4.0 payload
-        let rpu_rbsp = [0x18u8, 0x00, 0x0B, 0x46, 0x50, 0x80, 0xFE];
+        // 2. Dolby Vision RPU NAL (type 62 -> header 0x7C, 0x01) with 0x19 prefix + Profile 7 FEL + CM v4.0
+        let push_bits = |bits: &mut Vec<bool>, val: u32, count: u32| {
+            for i in (0..count).rev() {
+                bits.push(((val >> i) & 1) != 0);
+            }
+        };
+        let push_ue = |bits: &mut Vec<bool>, val: u32| {
+            let v = val + 1;
+            let lz = 31 - v.leading_zeros();
+            for _ in 0..lz {
+                bits.push(false);
+            }
+            push_bits(bits, v, lz + 1);
+        };
+        let mut rpu_bits = Vec::new();
+        push_bits(&mut rpu_bits, 0x19, 8); // rpu_nal_prefix = 25
+        push_bits(&mut rpu_bits, 2, 6); // rpu_type = 2
+        push_bits(&mut rpu_bits, 18, 11); // rpu_format = 18
+        push_bits(&mut rpu_bits, 1, 4); // vdr_rpu_profile = 1
+        push_bits(&mut rpu_bits, 6, 4); // vdr_rpu_level = 6
+        rpu_bits.push(true); // vdr_seq_info_present_flag
+        rpu_bits.push(false); // chroma_resampling_explicit_filter_flag
+        push_bits(&mut rpu_bits, 0, 2); // coefficient_data_type = 0
+        push_ue(&mut rpu_bits, 0); // coefficient_log2_denom = 0
+        push_bits(&mut rpu_bits, 1, 2); // vdr_rpu_normalized_idc = 1
+        rpu_bits.push(false); // bl_video_full_range_flag = false
+        push_ue(&mut rpu_bits, 2); // bl_bit_depth_minus8 = 2
+        push_ue(&mut rpu_bits, 2); // el_bit_depth_minus8 = 2
+        push_ue(&mut rpu_bits, 4); // vdr_bit_depth_minus8 = 4 (Profile 7)
+        rpu_bits.push(false); // spatial_resampling_filter_flag
+        push_bits(&mut rpu_bits, 1, 3); // reserved_zero_3bits = 1 (compressed_dm_data)
+        rpu_bits.push(true); // el_spatial_resampling_filter_flag = true
+        rpu_bits.push(false); // disable_residual_flag = false
+        rpu_bits.push(true); // vdr_dm_metadata_present_flag = true
+        rpu_bits.push(false); // use_prev_vdr_rpu_flag = false
+        // RpuDataMapping
+        push_ue(&mut rpu_bits, 0); // vdr_rpu_id
+        push_ue(&mut rpu_bits, 0); // mapping_color_space
+        push_ue(&mut rpu_bits, 0); // mapping_chroma_format_idc
+        for _ in 0..3 {
+            push_ue(&mut rpu_bits, 0); // num_pivots_minus2 = 0
+            push_bits(&mut rpu_bits, 0, 10);
+            push_bits(&mut rpu_bits, 1023, 10);
+        }
+        push_bits(&mut rpu_bits, 0, 3); // nlq_method_idc = 0
+        push_bits(&mut rpu_bits, 0, 10); // nlq_pred_pivot_value[0]
+        push_bits(&mut rpu_bits, 1023, 10); // nlq_pred_pivot_value[1]
+        push_ue(&mut rpu_bits, 0); // num_x_partitions_minus1
+        push_ue(&mut rpu_bits, 0); // num_y_partitions_minus1
+        for _ in 0..3 {
+            push_ue(&mut rpu_bits, 0); // mapping_idc = 0 (Polynomial)
+            push_ue(&mut rpu_bits, 0); // poly_order_minus1 = 0
+            rpu_bits.push(false); // linear_interp_flag = false
+            push_ue(&mut rpu_bits, 0); // poly_coef_int[0] = 0 (se(0) == ue(0))
+            push_ue(&mut rpu_bits, 1); // poly_coef_int[1] = 1 (se(1) == ue(1))
+        }
+        // RpuDataNlq (FEL: non-zero nlq_offset)
+        for _ in 0..3 {
+            push_bits(&mut rpu_bits, 512, 10); // nlq_offset = 512 (non-MEL -> FEL)
+            push_ue(&mut rpu_bits, 1); // vdr_in_max_int = 1
+            push_ue(&mut rpu_bits, 1); // linear_deadzone_slope_int = 1
+            push_ue(&mut rpu_bits, 0); // linear_deadzone_threshold_int = 0
+        }
+        // VdrDmData (compressed_dm_data = true + 1 CM v4.0 Level 254 block + CRC32 + 0x80)
+        push_ue(&mut rpu_bits, 0); // affected_dm_metadata_id
+        push_ue(&mut rpu_bits, 0); // current_dm_metadata_id
+        push_ue(&mut rpu_bits, 0); // scene_refresh_flag
+        push_ue(&mut rpu_bits, 0); // cmv29 num_ext_blocks = 0
+        while rpu_bits.len() % 8 != 0 {
+            rpu_bits.push(false);
+        }
+        push_ue(&mut rpu_bits, 1); // cmv40 num_ext_blocks = 1
+        while rpu_bits.len() % 8 != 0 {
+            rpu_bits.push(false);
+        }
+        push_ue(&mut rpu_bits, 2); // ext_block_length = 2 bytes
+        push_bits(&mut rpu_bits, 254, 8); // ext_block_level = 254 (CM v4.0)
+        push_bits(&mut rpu_bits, 0x0001, 16); // Level 254 payload
+        while rpu_bits.len() % 8 != 0 {
+            rpu_bits.push(false);
+        }
+        push_bits(&mut rpu_bits, 0x1234_5678, 32); // CRC32
+        push_bits(&mut rpu_bits, 0x80, 8); // 0x80 terminator
         let mut rpu_nal = vec![0x7C, 0x01];
-        rpu_nal.extend_from_slice(&rpu_rbsp);
+        for chunk in rpu_bits.chunks(8) {
+            let mut b = 0u8;
+            for (idx, &bit) in chunk.iter().enumerate() {
+                if bit {
+                    b |= 1 << (7 - idx);
+                }
+            }
+            rpu_nal.push(b);
+        }
         let idr_nal = [0x26u8, 0x01, 0xAA, 0xBB, 0xCC, 0xDD];
 
         let mut simple_block_body = vec![0x81, 0x00, 0x00, 0x80]; // Track 1, pts=0, keyframe, no lacing
@@ -2410,5 +2986,140 @@ mod tests {
         assert!(dv.el_present);
         assert!(dv.fel, "in-band length-prefixed RPU must upgrade Profile 7 FEL flag");
         assert_eq!(dv.cm_version, "v4.0");
+    }
+
+    #[test]
+    fn interleaved_mp4_short_audio_chunks_do_not_bleed_atmos_across_tracks() {
+        // Track 1: 32-byte non-Atmos E-AC-3 frame at mdat offset 0
+        let mut non_atmos_frame = vec![0u8; 32];
+        non_atmos_frame[0] = 0x0B;
+        non_atmos_frame[1] = 0x77;
+        non_atmos_frame[2] = 0x00;
+        non_atmos_frame[3] = 15; // frmsiz=15 -> 32 bytes
+        non_atmos_frame[4] = 0x00;
+        non_atmos_frame[5] = 16 << 3; // bsid=16
+
+        // Immediately following at mdat offset 32: 32-byte Atmos E-AC-3 frame
+        let mut atmos_frame = non_atmos_frame.clone();
+        atmos_frame[10..18].copy_from_slice(&[0x58, 0x38, 0x00, 0x04, 0x03, 0x80, 0x00, 0x00]);
+
+        let mut mdat_payload = Vec::new();
+        mdat_payload.extend_from_slice(&non_atmos_frame);
+        mdat_payload.extend_from_slice(&atmos_frame);
+
+        let ftyp = mp4_box(b"ftyp", b"isom");
+
+        // Build an audio trak helper with stsd + stsc (1 sample/chunk) + stsz (sample_size = 32) + stco
+        let make_audio_trak = |chunk_off: u32| -> Vec<u8> {
+            let mut entry = vec![0u8; 36];
+            entry[4..8].copy_from_slice(b"ec-3");
+            entry[24..26].copy_from_slice(&6u16.to_be_bytes());
+            entry[32..36].copy_from_slice(&(48000u32 << 16).to_be_bytes());
+            let mut stsd = vec![0u8; 8];
+            stsd.extend(&entry);
+
+            let mut stsc = vec![0u8; 8];
+            stsc[4..8].copy_from_slice(&1u32.to_be_bytes());
+            stsc.extend_from_slice(&1u32.to_be_bytes()); // first_chunk = 1
+            stsc.extend_from_slice(&1u32.to_be_bytes()); // samples_per_chunk = 1
+            stsc.extend_from_slice(&1u32.to_be_bytes()); // sample_description_index = 1
+
+            let mut stsz = vec![0u8; 12];
+            stsz[4..8].copy_from_slice(&32u32.to_be_bytes()); // sample_size = 32
+            stsz[8..12].copy_from_slice(&1u32.to_be_bytes()); // sample_count = 1
+
+            let mut stco = vec![0u8; 12];
+            stco[4..8].copy_from_slice(&1u32.to_be_bytes());
+            stco[8..12].copy_from_slice(&chunk_off.to_be_bytes());
+
+            let stbl = mp4_box(
+                b"stbl",
+                &[
+                    mp4_box(b"stsd", &stsd),
+                    mp4_box(b"stsc", &stsc),
+                    mp4_box(b"stsz", &stsz),
+                    mp4_box(b"stco", &stco),
+                ]
+                .concat(),
+            );
+            let mut hdlr = vec![0u8; 8];
+            hdlr.extend(b"soun");
+            hdlr.extend([0u8; 12]);
+            let mdia = [mp4_box(b"hdlr", &hdlr), mp4_box(b"minf", &stbl)].concat();
+            mp4_box(b"trak", &mp4_box(b"mdia", &mdia))
+        };
+
+        // Dummy placeholder so we can compute exact file offsets for mdat
+        let placeholder_moov = mp4_box(b"moov", &[make_audio_trak(0), make_audio_trak(0)].concat());
+        let mdat_data_start = (ftyp.len() + placeholder_moov.len() + 8) as u32;
+        let moov = mp4_box(
+            b"moov",
+            &[
+                make_audio_trak(mdat_data_start),
+                make_audio_trak(mdat_data_start + 32),
+            ]
+            .concat(),
+        );
+        let file = [ftyp, moov, mp4_box(b"mdat", &mdat_payload)].concat();
+
+        let info = parse(&file).expect("interleaved mp4 must parse");
+        assert_eq!(info.audio.len(), 2);
+        assert!(!info.audio[0].atmos, "first non-Atmos track must not read into adjacent track's chunk");
+        assert!(info.audio[1].atmos, "second Atmos track must be detected");
+    }
+
+    #[test]
+    fn container_mkv_and_mp4_probe_dtsx_audio_tracks() {
+        // Matroska with A_DTS audio track and SimpleBlock containing DTS:X sync word 0x02000850
+        let t_audio = [
+            el(&[0xD7], &[1]),
+            el(&[0x83], &[2]),
+            el(&[0x86], b"A_DTS"),
+        ]
+        .concat();
+        let tracks = el(&[0xAE], &t_audio);
+        let mut block = vec![0x81, 0x00, 0x00, 0x80];
+        block.extend_from_slice(&[0x00, 0x00, 0x02, 0x00, 0x08, 0x50, 0x00, 0x00]);
+        let cluster = el(&[0x1F, 0x43, 0xB6, 0x75], &el(&[0xA3], &block));
+        let seg = el(
+            &[0x18, 0x53, 0x80, 0x67],
+            &[el(&[0x16, 0x54, 0xAE, 0x6B], &tracks), cluster].concat(),
+        );
+        let mkv = [el(&[0x1A, 0x45, 0xDF, 0xA3], &el(&[0x42, 0x82], b"matroska")), seg].concat();
+
+        let mkv_probe = AudioBitstream::probe(&mkv);
+        assert!(mkv_probe.has_dtsx, "Matroska A_DTS SimpleBlock with DTS:X sync must set has_dtsx");
+        assert_eq!(mkv_probe.format.as_deref(), Some("DTS:X"));
+        assert!(AudioBitstream::probe_dtsx(&mkv));
+
+        // MP4 with dtsh audio track and mdat chunk containing DTS:X sync word 0x02000850
+        let ftyp = mp4_box(b"ftyp", b"isom");
+        let make_dts_trak = |chunk_off: u32| -> Vec<u8> {
+            let mut entry = vec![0u8; 36];
+            entry[4..8].copy_from_slice(b"dtsh");
+            entry[24..26].copy_from_slice(&8u16.to_be_bytes());
+            entry[32..36].copy_from_slice(&(48000u32 << 16).to_be_bytes());
+            let mut stsd = vec![0u8; 8];
+            stsd.extend(&entry);
+            let mut stco = vec![0u8; 12];
+            stco[4..8].copy_from_slice(&1u32.to_be_bytes());
+            stco[8..12].copy_from_slice(&chunk_off.to_be_bytes());
+            let stbl = mp4_box(b"stbl", &[mp4_box(b"stsd", &stsd), mp4_box(b"stco", &stco)].concat());
+            let mut hdlr = vec![0u8; 8];
+            hdlr.extend(b"soun");
+            hdlr.extend([0u8; 12]);
+            let mdia = [mp4_box(b"hdlr", &hdlr), mp4_box(b"minf", &stbl)].concat();
+            mp4_box(b"trak", &mp4_box(b"mdia", &mdia))
+        };
+        let placeholder_moov = mp4_box(b"moov", &make_dts_trak(0));
+        let mdat_data_start = (ftyp.len() + placeholder_moov.len() + 8) as u32;
+        let moov = mp4_box(b"moov", &make_dts_trak(mdat_data_start));
+        let mdat = mp4_box(b"mdat", &[0x00, 0x00, 0x02, 0x00, 0x08, 0x50, 0x00, 0x00]);
+        let mp4 = [ftyp, moov, mdat].concat();
+
+        let mp4_probe = AudioBitstream::probe(&mp4);
+        assert!(mp4_probe.has_dtsx, "MP4 dtsh chunk with DTS:X sync must set has_dtsx");
+        assert_eq!(mp4_probe.format.as_deref(), Some("DTS:X"));
+        assert!(AudioBitstream::probe_dtsx(&mp4));
     }
 }
