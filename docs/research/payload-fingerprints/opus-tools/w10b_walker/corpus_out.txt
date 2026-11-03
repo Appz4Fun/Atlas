@@ -1,0 +1,106 @@
+SELFTEST ok
+FILE r5vol.part1.rar bytes=1048576
+  RAR5 sig_off=0 main_flags=0x1 vol=None locator=Some((Some(1048471), None)) end=true more_vols=Some(true) hdr_enc=false trunc=false bad_hdr_crc=0
+  ENTRY FILE name="payload.bin" unp=3000000 pack=1048402 crc=3258e1c5 os=1 ver=0 meth=0 dict=0 solid=false dir=false sb=false sa=true unpver=0 enc=false
+  ENTRY SVC name="QO" unp=62 pack=62 crc=- os=1 ver=0 meth=0 dict=0 solid=false dir=false sb=false sa=false unpver=0 enc=false
+FILE r5vol.part2.rar bytes=1048576
+  RAR5 sig_off=0 main_flags=0x3 vol=Some(1) locator=Some((Some(1048471), None)) end=true more_vols=Some(true) hdr_enc=false trunc=false bad_hdr_crc=0
+  ENTRY FILE name="payload.bin" unp=3000000 pack=1048401 crc=fb86c456 os=1 ver=0 meth=0 dict=0 solid=false dir=false sb=true sa=true unpver=0 enc=false
+  ENTRY SVC name="QO" unp=62 pack=62 crc=- os=1 ver=0 meth=0 dict=0 solid=false dir=false sb=false sa=false unpver=0 enc=false
+FILE r5vol.part3.rar bytes=903414
+  RAR5 sig_off=0 main_flags=0x3 vol=Some(2) locator=Some((Some(903317), None)) end=true more_vols=Some(false) hdr_enc=false trunc=false bad_hdr_crc=0
+  ENTRY FILE name="payload.bin" unp=3000000 pack=903197 crc=015327bf os=1 ver=0 meth=0 dict=0 solid=false dir=false sb=true sa=false unpver=0 enc=false
+  ENTRY FILE name="small.txt" unp=6 pack=6 crc=363a3020 os=1 ver=0 meth=0 dict=0 solid=false dir=false sb=false sa=false unpver=0 enc=false
+  ENTRY SVC name="QO" unp=62 pack=62 crc=- os=1 ver=0 meth=0 dict=0 solid=false dir=false sb=false sa=false unpver=0 enc=false
+FILE r4vol.part1.rar bytes=1048576
+  RAR4 sig_off=0 main_flags=0x111 vol=None locator=None end=true more_vols=Some(true) hdr_enc=false trunc=false bad_hdr_crc=0
+  ENTRY FILE name="payload.bin" unp=3000000 pack=1048488 crc=b79fa41d os=3 ver=0 meth=48 dict=0 solid=false dir=false sb=false sa=true unpver=20 enc=false
+FILE r4vol.part2.rar bytes=1048576
+  RAR4 sig_off=0 main_flags=0x11 vol=None locator=None end=true more_vols=Some(true) hdr_enc=false trunc=false bad_hdr_crc=0
+  ENTRY FILE name="payload.bin" unp=3000000 pack=1048488 crc=80d9a156 os=3 ver=0 meth=48 dict=0 solid=false dir=false sb=true sa=true unpver=20 enc=false
+FILE r4vol.part3.rar bytes=903164
+  RAR4 sig_off=0 main_flags=0x11 vol=None locator=None end=true more_vols=Some(false) hdr_enc=false trunc=false bad_hdr_crc=0
+  ENTRY FILE name="payload.bin" unp=3000000 pack=903024 crc=015327bf os=3 ver=0 meth=48 dict=0 solid=false dir=false sb=true sa=false unpver=20 enc=false
+  ENTRY FILE name="small.txt" unp=6 pack=6 crc=363a3020 os=3 ver=0 meth=48 dict=0 solid=false dir=false sb=false sa=false unpver=20 enc=false
+FILE r5hp.rar bytes=254
+  RAR5 sig_off=0 main_flags=0x0 vol=None locator=None end=false more_vols=None hdr_enc=true trunc=false bad_hdr_crc=0
+  ENC kdf_log2=15 salt=6de38682f17008b6b6a97c11d465301d check=c801a9994c2f408969e64fdb
+FILE r5p.rar bytes=156
+  RAR5 sig_off=0 main_flags=0x0 vol=None locator=Some((Some(0), None)) end=true more_vols=Some(false) hdr_enc=false trunc=false bad_hdr_crc=0
+  ENTRY FILE name="small.txt" unp=6 pack=32 crc=e75e5153 os=1 ver=0 meth=3 dict=0 solid=false dir=false sb=false sa=false unpver=0 enc=true
+FILE r7.rar bytes=3000269
+  RAR5 sig_off=0 main_flags=0x0 vol=None locator=Some((Some(3000119), None)) end=true more_vols=Some(false) hdr_enc=false trunc=false bad_hdr_crc=0
+  ENTRY FILE name="payload.bin" unp=3000000 pack=3000000 crc=015327bf os=1 ver=0 meth=0 dict=5 solid=false dir=false sb=false sa=false unpver=0 enc=false
+  ENTRY FILE name="small.txt" unp=6 pack=6 crc=363a3020 os=1 ver=0 meth=0 dict=5 solid=false dir=false sb=false sa=false unpver=0 enc=false
+  ENTRY SVC name="QO" unp=115 pack=115 crc=- os=1 ver=0 meth=0 dict=0 solid=false dir=false sb=false sa=false unpver=0 enc=false
+FILE set.par2 bytes=1416
+  PAR2 packets=10 truncated=0 bad_md5=0
+  SET 78f0dcfb1b873ae8d539fc8cf315de46 MAIN slice=384000 nrec=4 fileids=4
+  SET 78f0dcfb1b873ae8d539fc8cf315de46 FD id=6813c090b7d3477e0d1571043336e378 md5=c648cb7dc46564f8ed7b87a6a84443ad md5_16k=c1a58167e63bc4658f34d9b5f7195364 len=1048576 name="r5vol.part1.rar"
+  SET 78f0dcfb1b873ae8d539fc8cf315de46 IFSC id=6813c090b7d3477e0d1571043336e378 slices=3 first_crc=580a6ee9
+  SET 78f0dcfb1b873ae8d539fc8cf315de46 FD id=78ac2670e84815639cd45cc7d5ed77b3 md5=9af13bea1263473530a30bcb5255704b md5_16k=f67bb18d901706b46e7b8f4e0568ff26 len=1048576 name="r5vol.part2.rar"
+  SET 78f0dcfb1b873ae8d539fc8cf315de46 IFSC id=78ac2670e84815639cd45cc7d5ed77b3 slices=3 first_crc=24446e34
+  SET 78f0dcfb1b873ae8d539fc8cf315de46 FD id=9e723066a1c4deeed072a218507a9e53 md5=f4844cfee5f9e6b7b2de9d1b79a2b088 md5_16k=e2cb61456bd8640a116082a83080287e len=903414 name="r5vol.part3.rar"
+  SET 78f0dcfb1b873ae8d539fc8cf315de46 IFSC id=9e723066a1c4deeed072a218507a9e53 slices=3 first_crc=911c96d6
+  SET 78f0dcfb1b873ae8d539fc8cf315de46 FD id=beab8ef39c8f2dc30826f6ddfa04f34f md5=6482d7350afc08f7924c1353ec2bd20c md5_16k=ba4cb40d64968004617e32723b1f3ffb len=3000000 name="payload.bin"
+  SET 78f0dcfb1b873ae8d539fc8cf315de46 IFSC id=beab8ef39c8f2dc30826f6ddfa04f34f slices=8 first_crc=554c2ab6
+  SET 78f0dcfb1b873ae8d539fc8cf315de46 CREATOR "w10b-pygen"
+  SET 78f0dcfb1b873ae8d539fc8cf315de46 counts={"creator": 1, "fd": 4, "ifsc": 4, "main": 1}
+FILE set.vol0+2.par2 bytes=770968
+  PAR2 packets=22 truncated=0 bad_md5=0
+  SET 78f0dcfb1b873ae8d539fc8cf315de46 MAIN slice=384000 nrec=4 fileids=4
+  SET 78f0dcfb1b873ae8d539fc8cf315de46 FD id=6813c090b7d3477e0d1571043336e378 md5=c648cb7dc46564f8ed7b87a6a84443ad md5_16k=c1a58167e63bc4658f34d9b5f7195364 len=1048576 name="r5vol.part1.rar"
+  SET 78f0dcfb1b873ae8d539fc8cf315de46 IFSC id=6813c090b7d3477e0d1571043336e378 slices=3 first_crc=580a6ee9
+  SET 78f0dcfb1b873ae8d539fc8cf315de46 FD id=78ac2670e84815639cd45cc7d5ed77b3 md5=9af13bea1263473530a30bcb5255704b md5_16k=f67bb18d901706b46e7b8f4e0568ff26 len=1048576 name="r5vol.part2.rar"
+  SET 78f0dcfb1b873ae8d539fc8cf315de46 IFSC id=78ac2670e84815639cd45cc7d5ed77b3 slices=3 first_crc=24446e34
+  SET 78f0dcfb1b873ae8d539fc8cf315de46 FD id=9e723066a1c4deeed072a218507a9e53 md5=f4844cfee5f9e6b7b2de9d1b79a2b088 md5_16k=e2cb61456bd8640a116082a83080287e len=903414 name="r5vol.part3.rar"
+  SET 78f0dcfb1b873ae8d539fc8cf315de46 IFSC id=9e723066a1c4deeed072a218507a9e53 slices=3 first_crc=911c96d6
+  SET 78f0dcfb1b873ae8d539fc8cf315de46 FD id=beab8ef39c8f2dc30826f6ddfa04f34f md5=6482d7350afc08f7924c1353ec2bd20c md5_16k=ba4cb40d64968004617e32723b1f3ffb len=3000000 name="payload.bin"
+  SET 78f0dcfb1b873ae8d539fc8cf315de46 IFSC id=beab8ef39c8f2dc30826f6ddfa04f34f slices=8 first_crc=554c2ab6
+  SET 78f0dcfb1b873ae8d539fc8cf315de46 CREATOR "w10b-pygen"
+  SET 78f0dcfb1b873ae8d539fc8cf315de46 MAIN slice=384000 nrec=4 fileids=4
+  SET 78f0dcfb1b873ae8d539fc8cf315de46 FD id=6813c090b7d3477e0d1571043336e378 md5=c648cb7dc46564f8ed7b87a6a84443ad md5_16k=c1a58167e63bc4658f34d9b5f7195364 len=1048576 name="r5vol.part1.rar"
+  SET 78f0dcfb1b873ae8d539fc8cf315de46 IFSC id=6813c090b7d3477e0d1571043336e378 slices=3 first_crc=580a6ee9
+  SET 78f0dcfb1b873ae8d539fc8cf315de46 FD id=78ac2670e84815639cd45cc7d5ed77b3 md5=9af13bea1263473530a30bcb5255704b md5_16k=f67bb18d901706b46e7b8f4e0568ff26 len=1048576 name="r5vol.part2.rar"
+  SET 78f0dcfb1b873ae8d539fc8cf315de46 IFSC id=78ac2670e84815639cd45cc7d5ed77b3 slices=3 first_crc=24446e34
+  SET 78f0dcfb1b873ae8d539fc8cf315de46 FD id=9e723066a1c4deeed072a218507a9e53 md5=f4844cfee5f9e6b7b2de9d1b79a2b088 md5_16k=e2cb61456bd8640a116082a83080287e len=903414 name="r5vol.part3.rar"
+  SET 78f0dcfb1b873ae8d539fc8cf315de46 IFSC id=9e723066a1c4deeed072a218507a9e53 slices=3 first_crc=911c96d6
+  SET 78f0dcfb1b873ae8d539fc8cf315de46 FD id=beab8ef39c8f2dc30826f6ddfa04f34f md5=6482d7350afc08f7924c1353ec2bd20c md5_16k=ba4cb40d64968004617e32723b1f3ffb len=3000000 name="payload.bin"
+  SET 78f0dcfb1b873ae8d539fc8cf315de46 IFSC id=beab8ef39c8f2dc30826f6ddfa04f34f slices=8 first_crc=554c2ab6
+  SET 78f0dcfb1b873ae8d539fc8cf315de46 CREATOR "w10b-pygen"
+  SET 78f0dcfb1b873ae8d539fc8cf315de46 counts={"creator": 2, "fd": 8, "ifsc": 8, "main": 2, "recv": 2}
+=== PREFIX 700000
+FILE r5vol.part1.rar bytes=700000
+  RAR5 sig_off=0 main_flags=0x1 vol=None locator=Some((Some(1048471), None)) end=false more_vols=None hdr_enc=false trunc=true bad_hdr_crc=0
+  ENTRY FILE name="payload.bin" unp=3000000 pack=1048402 crc=3258e1c5 os=1 ver=0 meth=0 dict=0 solid=false dir=false sb=false sa=true unpver=0 enc=false
+FILE r5vol.part3.rar bytes=700000
+  RAR5 sig_off=0 main_flags=0x3 vol=Some(2) locator=Some((Some(903317), None)) end=false more_vols=None hdr_enc=false trunc=true bad_hdr_crc=0
+  ENTRY FILE name="payload.bin" unp=3000000 pack=903197 crc=015327bf os=1 ver=0 meth=0 dict=0 solid=false dir=false sb=true sa=false unpver=0 enc=false
+FILE r4vol.part3.rar bytes=700000
+  RAR4 sig_off=0 main_flags=0x11 vol=None locator=None end=false more_vols=None hdr_enc=false trunc=true bad_hdr_crc=0
+  ENTRY FILE name="payload.bin" unp=3000000 pack=903024 crc=015327bf os=3 ver=0 meth=48 dict=0 solid=false dir=false sb=true sa=false unpver=20 enc=false
+FILE r7.rar bytes=700000
+  RAR5 sig_off=0 main_flags=0x0 vol=None locator=Some((Some(3000119), None)) end=false more_vols=None hdr_enc=false trunc=true bad_hdr_crc=0
+  ENTRY FILE name="payload.bin" unp=3000000 pack=3000000 crc=015327bf os=1 ver=0 meth=0 dict=5 solid=false dir=false sb=false sa=false unpver=0 enc=false
+FILE set.vol0+2.par2 bytes=700000
+  PAR2 packets=11 truncated=1 bad_md5=0
+  SET 78f0dcfb1b873ae8d539fc8cf315de46 MAIN slice=384000 nrec=4 fileids=4
+  SET 78f0dcfb1b873ae8d539fc8cf315de46 FD id=6813c090b7d3477e0d1571043336e378 md5=c648cb7dc46564f8ed7b87a6a84443ad md5_16k=c1a58167e63bc4658f34d9b5f7195364 len=1048576 name="r5vol.part1.rar"
+  SET 78f0dcfb1b873ae8d539fc8cf315de46 IFSC id=6813c090b7d3477e0d1571043336e378 slices=3 first_crc=580a6ee9
+  SET 78f0dcfb1b873ae8d539fc8cf315de46 FD id=78ac2670e84815639cd45cc7d5ed77b3 md5=9af13bea1263473530a30bcb5255704b md5_16k=f67bb18d901706b46e7b8f4e0568ff26 len=1048576 name="r5vol.part2.rar"
+  SET 78f0dcfb1b873ae8d539fc8cf315de46 IFSC id=78ac2670e84815639cd45cc7d5ed77b3 slices=3 first_crc=24446e34
+  SET 78f0dcfb1b873ae8d539fc8cf315de46 FD id=9e723066a1c4deeed072a218507a9e53 md5=f4844cfee5f9e6b7b2de9d1b79a2b088 md5_16k=e2cb61456bd8640a116082a83080287e len=903414 name="r5vol.part3.rar"
+  SET 78f0dcfb1b873ae8d539fc8cf315de46 IFSC id=9e723066a1c4deeed072a218507a9e53 slices=3 first_crc=911c96d6
+  SET 78f0dcfb1b873ae8d539fc8cf315de46 FD id=beab8ef39c8f2dc30826f6ddfa04f34f md5=6482d7350afc08f7924c1353ec2bd20c md5_16k=ba4cb40d64968004617e32723b1f3ffb len=3000000 name="payload.bin"
+  SET 78f0dcfb1b873ae8d539fc8cf315de46 IFSC id=beab8ef39c8f2dc30826f6ddfa04f34f slices=8 first_crc=554c2ab6
+  SET 78f0dcfb1b873ae8d539fc8cf315de46 CREATOR "w10b-pygen"
+  SET 78f0dcfb1b873ae8d539fc8cf315de46 counts={"creator": 1, "fd": 4, "ifsc": 4, "main": 1, "recv": 1}
+=== PREFIX 300
+FILE set.par2 bytes=300
+  PAR2 packets=2 truncated=1 bad_md5=0
+  SET 78f0dcfb1b873ae8d539fc8cf315de46 MAIN slice=384000 nrec=4 fileids=4
+  SET 78f0dcfb1b873ae8d539fc8cf315de46 FD id=6813c090b7d3477e0d1571043336e378 md5=c648cb7dc46564f8ed7b87a6a84443ad md5_16k=c1a58167e63bc4658f34d9b5f7195364 len=1048576 name="r5vol.part1.rar"
+  SET 78f0dcfb1b873ae8d539fc8cf315de46 counts={"fd": 1, "main": 1}
+FILE r5vol.part2.rar bytes=300
+  RAR5 sig_off=0 main_flags=0x3 vol=Some(1) locator=Some((Some(1048471), None)) end=false more_vols=None hdr_enc=false trunc=true bad_hdr_crc=0
+  ENTRY FILE name="payload.bin" unp=3000000 pack=1048401 crc=fb86c456 os=1 ver=0 meth=0 dict=0 solid=false dir=false sb=true sa=true unpver=0 enc=false

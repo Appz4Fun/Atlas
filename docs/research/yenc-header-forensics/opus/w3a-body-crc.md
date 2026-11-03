@@ -1,0 +1,9 @@
+# Wave 3A: X-Received-Body-CRC and signature headers (Opus subagent)
+- CORRECTION to W2B: X-Received-Bytes / X-Received-Body-CRC are stamped at INJECTION by Highwinds (fxNN.iad.POSTED Path; frugalusenet/easynews abuse addrs) and travel with the article; seen on eternal-september reads (non-Highwinds reader); Google Groups posts in same thread lack them. Examples: 2251/1999428372, 10722/3022300456, 1236/842137195 (Lines 12). https://www.electronics-related.com/showthread/sci.electronics.design/795853-7.php , https://www.pcreview.co.uk/threads/cool-add-on-for-chrome-html5.4067674/
+- Usenet.Farm sample: X-Received-Bytes 6481 for a 5071-byte yEnc file -> likely body-only bytes (inference).
+- CRC input bytes undocumented anywhere; INN/Diablo/Cleanfeed don't emit it.
+- Verdict: same value on every provider for the same injected article; a fingerprint of the Highwinds/Usenet.Farm injection path; catches only byte-identical re-injections through a stamping server; confirming signal, not primary key. Verify live: BODY CRC variants (raw/dot-stuffed/unstuffed, CRLF); whether readers add it; LIST OVERVIEW.FMT / LIST HEADERS / XHDR support.
+- X-Ufhash/X-Ufk: opaque, unanswered 2019 queries (forums.suse.com/t/x-ufhash-nntp-header-query/34607).
+- Verify-Signature-newzNZB: python-tuple string with encrypted blob + own msgid, checked via verify.newznzb.info; X-Newsposter: newzNZB. newzNZB msgid <unixtime.SESSIONNUM.partnum@PRiVATE> e.g. <1484241488.82292.110@PRiVATE>; subject has fixed upload hash + file index "[8d2d235457976f] [47/69]". https://raw.githubusercontent.com/scriptzteam/Usenet_-_Verify-Signature-newzNZB/master/README.md
+- Blocked this wave: Wayback, sourcegraph, grep.app, NNTP port 119.
+Leads: live NNTP probe (best done from Atlas host with Eweka); raw fixtures with fxNN.iad.POSTED; Giganews X-Trace and X-Ufhash prefix comparison.

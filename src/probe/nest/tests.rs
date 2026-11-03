@@ -1,7 +1,9 @@
 use std::io::Write;
 
 use super::*;
-use crate::archive::testkit::{r4_file, r4_main, r5_block, r5_end, r5_file, r5_main, rar4, rar5, sz_wrap, vint};
+use crate::archive::testkit::{
+    r4_block, r4_file, r4_file_fields, r4_main, r5_block, r5_end, r5_file, r5_main, rar4, rar5, sz_wrap, vint,
+};
 
 /// The start of a Matroska file, then filler: what sits at the bottom of the chain.
 fn video() -> Vec<u8> {
@@ -233,20 +235,47 @@ fn the_budget_covers_every_layer_together() {
 #[test]
 fn methods_not_decoded_yet_say_so() {
     let v = video();
+    // a RAR5 algorithm version past RAR 7's
     let fields =
-        [&vint(0)[..], &vint(v.len() as u64), &vint(0x20), &vint(3 << 7), &[0], &vint(9), b"movie.mkv"].concat();
+        [&vint(0)[..], &vint(v.len() as u64), &vint(0x20), &vint(3 << 7 | 2), &[0], &vint(9), b"movie.mkv"].concat();
     let r = rar5(&[r5_main(), r5_block(2, &fields, &[], Some(&v)), r5_end()]);
     let n = unwrap(&r);
     assert_eq!(formats(&n), ["RAR5 m3"]);
+    assert_eq!(n.layers[0].stop.as_deref(), Some("a RAR algorithm newer than this knows"));
+    // a RAR5 file whose front is in the volume before
+    let fields =
+        [&vint(0)[..], &vint(v.len() as u64), &vint(0x20), &vint(3 << 7), &[0], &vint(9), b"movie.mkv"].concat();
+    let inner = [&vint(2)[..], &vint(2 | 8), &vint(v.len() as u64), &fields].concat();
+    let body = [vint(inner.len() as u64), inner].concat();
+    let block = [&crate::archive::crc32(&body).to_le_bytes()[..], &body, &v].concat();
+    let r = rar5(&[r5_main(), block, r5_end()]);
+    let n = unwrap(&r);
+    assert_eq!(formats(&n), ["RAR5 m3"]);
+    assert_eq!(n.layers[0].stop.as_deref(), Some("starts in the volume before"));
+    // a RAR4 version that was never made, and a file whose front is in the volume before
+    let rar4_m3 = |version: u8, flags: u16, data: &[u8]| {
+        let mut fields = r4_file_fields(b"movie.mkv", data.len() as u32);
+        fields[13] = version;
+        fields[14] = 0x33;
+        rar4(&[r4_main(0), [r4_block(0x74, flags, &fields, Some(data.len() as u32)), data.to_vec()].concat()])
+    };
+    let zeros = [0u8; 64];
+    for (version, flags, data, why) in
+        [(40, 0, &zeros, "no decoder for this yet"), (29, 1, &zeros, "starts in the volume before")]
+    {
+        let r = rar4_m3(version, flags, data);
+        let n = unwrap(&r);
+        assert_eq!(formats(&n), ["RAR4 m3"]);
+        assert_eq!(n.layers[0].stop.as_deref(), Some(why));
+    }
+    let mut lzo = b"\x89LZO\0\r\n\x1a\n".to_vec();
+    lzo.extend([0; 20]);
+    let n = unwrap(&lzo);
+    assert_eq!(n.layers[0].format, "LZOP");
     assert_eq!(n.layers[0].stop.as_deref(), Some("no decoder for this yet"));
-    let mut bz = b"BZh91AY&SY".to_vec();
-    bz.extend([0; 20]);
-    let n = unwrap(&bz);
-    assert_eq!(n.layers[0].format, "BZIP2");
-    assert_eq!(n.layers[0].stop.as_deref(), Some("no decoder for this yet"));
-    let z = zip_entry(12, "movie.mkv", &[1, 2, 3], 3);
+    let z = zip_entry(97, "movie.mkv", &[1, 2, 3], 3);
     let n = unwrap(&z);
-    assert_eq!(formats(&n), ["ZIP bzip2"]);
+    assert_eq!(formats(&n), ["ZIP other"]);
     assert_eq!(n.layers[0].stop.as_deref(), Some("no decoder for this yet"));
 }
 
@@ -262,6 +291,13 @@ fn single_streams() {
     same(&n.inner, &v);
     let z = zip_entry(93, "movie.mkv", &zstd::encode_all(&v[..], 3).unwrap(), v.len());
     same(&unwrap(&z).inner, &v);
+    // pyppmd's PPMd I, with a second entry after it the range coder mustn't read into
+    let want = include_bytes!("../../../tests/fixtures/ppmd/mixed.bin");
+    let ppmd = include_bytes!("../../../tests/fixtures/ppmd/mixed.ppmd");
+    let z = [zip_entry(98, "mixed.bin", ppmd, want.len()), zip_entry(0, "next", &[7; 64], 64)].concat();
+    let n = unwrap(&z);
+    assert_eq!(formats(&n), ["ZIP ppmd"]);
+    same(&n.inner, want);
     // python's xz, with real matches
     let xz = include_bytes!("../../../tests/fixtures/nest/sample.xz");
     let n = unwrap(xz);
@@ -438,4 +474,129 @@ fn a_pax_size_stands_for_the_next_file() {
     t.extend(&v);
     let n = unwrap(&t);
     assert!(n.layers[0].name.as_ref().unwrap().len() <= 512 * 3);
+}
+
+#[test]
+fn bzip2_compress_lz4_and_deflate64() {
+    let want = include_bytes!("../../../tests/fixtures/nest/mixed.bin");
+    for (packed, format) in [
+        (&include_bytes!("../../../tests/fixtures/nest/mixed.bz2")[..], "BZIP2 bzip2"),
+        (include_bytes!("../../../tests/fixtures/nest/mixed.Z"), "COMPRESS lzw"),
+        (include_bytes!("../../../tests/fixtures/nest/mixed.lz4"), "LZ4 lz4"),
+    ] {
+        let n = unwrap(packed);
+        assert_eq!(formats(&n), [format]);
+        same(&n.inner, want);
+    }
+    let d64 = include_bytes!("../../../tests/fixtures/nest/mixed.deflate64");
+    let z = zip_entry(9, "mixed.bin", d64, want.len());
+    let n = unwrap(&z);
+    assert_eq!(formats(&n), ["ZIP deflate64"]);
+    same(&n.inner, want);
+    let bz = include_bytes!("../../../tests/fixtures/nest/mixed.bz2");
+    let z = zip_entry(12, "mixed.bin", bz, want.len());
+    same(&unwrap(&z).inner, want);
+    // LZ4 behind a skippable frame is still LZ4, not zstd
+    let mut skipped = vec![0x5a, 0x2a, 0x4d, 0x18, 3, 0, 0, 0, 1, 2, 3];
+    skipped.extend_from_slice(include_bytes!("../../../tests/fixtures/nest/mixed.lz4"));
+    let n = unwrap(&skipped);
+    assert_eq!(formats(&n), ["LZ4 lz4"]);
+    same(&n.inner, want);
+}
+
+#[test]
+fn compressed_rar5_goes_on_down() {
+    let data = include_bytes!("../../../tests/fixtures/rar5/m3_default.rar");
+    let n = unwrap(data);
+    assert_eq!(formats(&n), ["RAR5 m3"]);
+    assert!(n.layers[0].stop.is_none());
+    assert_eq!(n.inner.len() as u64, n.layers[0].unpacked.unwrap());
+    // the same file at m5 decodes the same
+    let m5 = include_bytes!("../../../tests/fixtures/rar5/m5_max.rar");
+    same(&unwrap(m5).inner, &n.inner);
+}
+
+#[test]
+fn compressed_rar4_goes_on_down() {
+    for (data, format) in [
+        (&include_bytes!("../../../tests/fixtures/rar3/compressed_text_rar300.rar")[..], "RAR4 m3"),
+        (include_bytes!("../../../tests/fixtures/rar3/rarvm_audio_stereo_rar300.rar"), "RAR4 m5"),
+        (include_bytes!("../../../tests/fixtures/rar3/rar250_biglz.rar"), "RAR4 m5"),
+        (include_bytes!("../../../tests/fixtures/rar3/readme_154_normal.rar"), "RAR4 m3"),
+    ] {
+        let n = unwrap(data);
+        let head = crate::probe::archive::parse(data).unwrap();
+        assert_eq!(formats(&n)[0], format);
+        assert!(n.layers[0].stop.is_none(), "{format}: {:?}", n.layers[0].stop);
+        assert_eq!(n.inner.len() as u64, head.unpacked.unwrap());
+        assert_eq!(crate::archive::crc32(&n.inner), head.crc32.unwrap());
+    }
+    // past the ratio cap, with a filter's block running over it: still a true front
+    let data = include_bytes!("../../../tests/fixtures/rar3/rarvm_x86_e8_rar300.rar");
+    let n = unwrap(data);
+    assert!(n.layers[0].capped);
+    let head = crate::probe::archive::parse(data).unwrap();
+    let at = head.data_at.unwrap();
+    let (whole, _) = codec::rar3::rar29(&data[at..at + head.packed.unwrap() as usize], head.unpacked, usize::MAX, true);
+    assert!(n.inner.len() > 40_000 && whole.starts_with(&n.inner));
+    // split after a few packed bytes: the rest is in the next volume, so nothing past them is made up
+    let data = include_bytes!("../../../tests/fixtures/rar3/compressed_text_rar300.rar");
+    let head = crate::probe::archive::parse(data).unwrap();
+    let at = head.data_at.unwrap();
+    let (whole, _) = codec::rar3::rar29(&data[at..at + head.packed.unwrap() as usize], head.unpacked, usize::MAX, true);
+    let file = 20;
+    assert_eq!(data[file + 2], 0x74);
+    for keep in [10u32, 34, 60] {
+        let mut split = data[..at + keep as usize].to_vec();
+        split[file + 3] |= 0x02;
+        split[file + 7..file + 11].copy_from_slice(&keep.to_le_bytes());
+        let n = unwrap(&split);
+        let stop = n.layers[0].stop.as_deref();
+        assert!(
+            stop == Some("nothing decoded") || whole.starts_with(&n.inner),
+            "kept {keep}: {stop:?} {:?}",
+            String::from_utf8_lossy(&n.inner)
+        );
+    }
+}
+
+#[test]
+fn xz_filters_in_front_of_lzma2_are_undone() {
+    // made by liblzma from code with branches for every architecture; arm64 by xz 5.4
+    let want = include_bytes!("../../../tests/fixtures/xz/code.bin");
+    for (packed, method) in [
+        (&include_bytes!("../../../tests/fixtures/xz/x86.xz")[..], "x86+lzma2"),
+        (include_bytes!("../../../tests/fixtures/xz/x86-start.xz"), "x86+lzma2"),
+        (include_bytes!("../../../tests/fixtures/xz/powerpc.xz"), "powerpc+lzma2"),
+        (include_bytes!("../../../tests/fixtures/xz/ia64.xz"), "ia64+lzma2"),
+        (include_bytes!("../../../tests/fixtures/xz/arm.xz"), "arm+lzma2"),
+        (include_bytes!("../../../tests/fixtures/xz/armthumb.xz"), "armthumb+lzma2"),
+        (include_bytes!("../../../tests/fixtures/xz/sparc.xz"), "sparc+lzma2"),
+        (include_bytes!("../../../tests/fixtures/xz/arm64.xz"), "arm64+lzma2"),
+        (include_bytes!("../../../tests/fixtures/xz/delta.xz"), "delta+lzma2"),
+        (include_bytes!("../../../tests/fixtures/xz/delta-x86.xz"), "delta+x86+lzma2"),
+    ] {
+        let n = unwrap(packed);
+        assert_eq!(n.layers[0].method.as_deref(), Some(method));
+        assert_eq!(n.layers[0].stop, None, "{method}");
+        same(&n.inner, want);
+        // the filter did change something, so undoing it is what made these equal
+        let header_len = (usize::from(packed[12]) + 1) * 4;
+        let (raw, _) = lzma::lzma2(&packed[12 + header_len..], usize::MAX);
+        assert_ne!(&raw[..], &want[..], "{method}");
+        // cut short, what comes out is still a true front
+        let n = unwrap(&packed[..packed.len() / 2]);
+        assert!(n.inner.len() > 1000 && want.starts_with(&n.inner), "{method}: {}", n.inner.len());
+    }
+}
+
+#[test]
+fn an_xz_filter_with_no_decoder_says_so() {
+    let mut xz = include_bytes!("../../../tests/fixtures/xz/arm64.xz").to_vec();
+    // arm64 (0x0a) to riscv (0x0b), which nothing here decodes; the header's crc isn't checked
+    let at = xz[12..].iter().position(|&b| b == 0x0a).unwrap() + 12;
+    xz[at] = 0x0b;
+    let n = unwrap(&xz);
+    assert_eq!(n.layers[0].method.as_deref(), Some("riscv+lzma2"));
+    assert_eq!(n.layers[0].stop.as_deref(), Some("no decoder for this filter yet"));
 }

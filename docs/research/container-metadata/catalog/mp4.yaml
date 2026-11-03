@@ -1,0 +1,3565 @@
+# Atlas field catalog, part 2: MP4 / MOV / M4V (ISO BMFF), including fragmented MP4
+# Synthesized 2026-11-02 from raw/w1b.md, w2b.md, w3a.md, w4b.md, w5c.md, w6c.md, w7a.md and tools/atlas_media_a29ee52.rs (Atlas a29ee52).
+# verified: spec = ISO/IEC 14496-12/-14/-15 or Apple QTFF as recalled in raw notes (not re-read); source = FFmpeg or mutagen source read; tested = local ffmpeg 6.1.1 / mkvmerge output; memory = unverified.
+# atlas: parsed | partial | buggy | no. Atlas today reads only moov (mvhd duration, trak hdlr/mdhd language/stsd fourcc, video w/h + dvcC/dvvC, audio channels/rate, subtitle tracks); no ftyp, no tail fetch.
+# location: front_or_tail for anything inside moov (front when faststart, else after mdat). cost: tail for moov fields because ffmpeg default is moov-at-end.
+schema_version: 1
+container: mp4
+fields:
+- id: mp4.ftyp.major_brand
+  path: ftyp/major_brand
+  raw: ftyp +8 fourcc
+  type: fourcc
+  meaning: 'major brand: isom, iso2, iso5 (fragmented), mp41, mp42, M4V , qt  , dash, msdh'
+  example: isom
+  location: front
+  location_note: first box in every file
+  linking: [alt]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w2b.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: first_article
+- id: mp4.ftyp.minor_version
+  path: ftyp/minor_version
+  raw: ftyp +12 u32
+  type: uint
+  meaning: minor version; ffmpeg writes 0x200
+  example: '512'
+  location: front
+  location_note: ''
+  linking: [tool]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w2b.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: first_article
+- id: mp4.ftyp.compatible_brands
+  path: ftyp/compatible_brands[]
+  raw: ftyp +16.. fourcc list
+  type: fourcc_list
+  meaning: brand set; muxer and profile hints (isom iso2 avc1 mp41; iso5 iso6 mp41 for fragments; hvc1, qt)
+  example: isom iso2 avc1 mp41
+  location: front
+  location_note: ''
+  linking: [alt]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w2b.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: first_article
+- id: mp4.ftyp.brand_dby1
+  path: ftyp/compatible_brands contains dby1
+  raw: ftyp compat list fourcc dby1
+  type: bool
+  meaning: Dolby Vision marker brand; a hint only, the dvcC/dvvC box is the authority
+  example: 'true'
+  location: front
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w1b.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: first_article
+- id: mp4.box.largesize
+  path: any box header
+  raw: box size field == 1, u64 at +8
+  type: uint
+  meaning: 64-bit box size; header becomes 16 bytes; used by mdat and moov in files over 4 GiB
+  example: '5368709120'
+  location: front_or_tail
+  location_note: ''
+  linking: [none]
+  privacy: false
+  atlas: parsed
+  verified: source
+  source: tools/atlas_media_a29ee52.rs
+  cost: first_article
+- id: mp4.box.size_zero
+  path: any box header
+  raw: box size field == 0
+  type: bool
+  meaning: box runs to EOF; legal only for the last box; an mdat of size 0 at EOF means no moov follows (truncated or stream write)
+  example: 'true'
+  location: front
+  location_note: ''
+  linking: [none]
+  privacy: false
+  atlas: parsed
+  verified: source
+  source: tools/atlas_media_a29ee52.rs
+  cost: first_article
+- id: mp4.top.free_skip_wide
+  path: top-level free / skip / wide
+  raw: 4cc at box offset +4
+  type: string
+  meaning: padding boxes; ffmpeg writes free at offset 32 before mdat; MP4Box -moovpad pads after moov; skip when walking
+  example: free
+  location: front
+  location_note: ''
+  linking: [tool]
+  privacy: false
+  atlas: 'no'
+  verified: memory
+  source: raw/w2b.md
+  cost: first_article
+- id: mp4.top.mdat_size
+  path: mdat
+  raw: mdat box header size (u32 or largesize)
+  type: uint
+  meaning: payload size of media data; moov offset in moov-at-end files = mdat_offset + mdat_size
+  example: '28883'
+  location: front
+  location_note: in first article even when moov is at the end
+  linking: [none]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w2b.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: first_article
+- id: mp4.top.box_order
+  path: top-level box sequence
+  raw: 4cc list of top-level boxes
+  type: string
+  meaning: ftyp, [free], mdat, moov = ffmpeg default (moov at end); ftyp, moov, free, mdat = faststart or MP4Box; moov, mdat, mfra = fragmented
+  example: ftyp free mdat moov
+  location: front_or_tail
+  location_note: order decides whether metadata is in article 1
+  linking: [tool]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w2b.md
+  cost: first_article
+- id: mp4.top.sidx
+  path: sidx
+  raw: top-level sidx 4cc
+  type: bool
+  meaning: segment index box; per-segment duration and byte size for DASH/CMAF; ffmpeg frag mode did not write one
+  example: 'true'
+  location: front_or_tail
+  location_note: ''
+  linking: [tool]
+  privacy: false
+  atlas: 'no'
+  verified: memory
+  source: raw/w2b.md
+  cost: first_article
+- id: mp4.top.mfra_mfro
+  path: mfra/mfro
+  raw: 'last 16 bytes of file: mfro size u32 at -4'
+  type: uint
+  meaning: size of mfra index at end; gives the tail offset of tfra random-access index
+  example: 1 25 (bytes)
+  location: tail
+  location_note: fragmented files only
+  linking: [none]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w2b.md; corpus:w10_frag_dualaudio.mp4,w10_frag_hevc.mp4
+  cost: tail
+- id: mp4.mvhd.version
+  path: moov/mvhd/version
+  raw: mvhd +0 u8
+  type: uint
+  meaning: 0 = 32-bit times and duration; 1 = 64-bit times and duration
+  example: '0'
+  location: front_or_tail
+  location_note: ''
+  linking: [none]
+  privacy: false
+  atlas: 'no'
+  verified: source
+  source: raw/w5c.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.mvhd.creation_time
+  path: moov/mvhd/creation_time
+  raw: mvhd +4 (v0 u32) / +4 (v1 u64)
+  type: uint
+  meaning: seconds since 1904-01-01 UTC; 0 = unset (ffmpeg default); a real value = set by tool or user
+  example: '3787009445'
+  location: front_or_tail
+  location_note: ''
+  linking: [twin, alt]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w2b.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.mvhd.modification_time
+  path: moov/mvhd/modification_time
+  raw: mvhd +8 (v0) / +12 (v1)
+  type: uint
+  meaning: last modification, seconds since 1904
+  example: '3787009445'
+  location: front_or_tail
+  location_note: ''
+  linking: [twin]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w1b.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.mvhd.timescale
+  path: moov/mvhd/timescale
+  raw: mvhd +12 (v0) / +20 (v1) u32
+  type: uint
+  meaning: ticks per second for movie-level duration; often 1000 or 600 (ffmpeg uses 1000 for movie)
+  example: '1000'
+  location: front_or_tail
+  location_note: ''
+  linking: [none]
+  privacy: false
+  atlas: parsed
+  verified: source
+  source: raw/w5c.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.mvhd.duration
+  path: moov/mvhd/duration
+  raw: mvhd +16 (v0 u32) / +24 (v1 u64)
+  type: uint
+  meaning: movie duration in movie timescale; 0 or all-ones when unknown (common for fragmented files)
+  example: '5432117'
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: parsed
+  verified: source
+  source: raw/w5c.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.mvhd.rate
+  path: moov/mvhd/rate
+  raw: mvhd +20 (v0) 16.16
+  type: float
+  meaning: preferred playback rate, 1.0 = normal
+  example: '1.0'
+  location: front_or_tail
+  location_note: ''
+  linking: [none]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w1b.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.mvhd.volume
+  path: moov/mvhd/volume
+  raw: mvhd +24 (v0) 8.8
+  type: float
+  meaning: preferred playback volume, 1.0 = full
+  example: '1.0'
+  location: front_or_tail
+  location_note: ''
+  linking: [none]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w1b.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.mvhd.matrix
+  path: moov/mvhd/matrix
+  raw: mvhd +36 (v0) 9 x 32-bit
+  type: string
+  meaning: display transform for whole movie; identity normally
+  example: identity
+  location: front_or_tail
+  location_note: ''
+  linking: [none]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w1b.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.mvhd.next_track_id
+  path: moov/mvhd/next_track_ID
+  raw: mvhd last u32
+  type: uint
+  meaning: next track id to allocate; gaps against track count show tracks removed by an editor
+  example: '4'
+  location: front_or_tail
+  location_note: ''
+  linking: [tool, alt]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w1b.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.tkhd.track_id
+  path: moov/trak/tkhd/track_ID
+  raw: tkhd +12 (v0) / +20 (v1) u32
+  type: uint
+  meaning: track id; referenced by tref and sample tables
+  example: '1'
+  location: front_or_tail
+  location_note: ''
+  linking: [none]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w1b.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.tkhd.creation_time
+  path: moov/trak/tkhd/creation_time
+  raw: tkhd +4
+  type: uint
+  meaning: per-track creation time; can differ from mvhd
+  example: '3787009445'
+  location: front_or_tail
+  location_note: ''
+  linking: [twin]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w1b.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.tkhd.duration
+  path: moov/trak/tkhd/duration
+  raw: tkhd +20 (v0) / +28 (v1)
+  type: uint
+  meaning: track duration in movie timescale; differs from mdhd when edit list shifts start
+  example: '5432117'
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w1b.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.tkhd.flag_enabled
+  path: moov/trak/tkhd/flags bit 0
+  raw: tkhd flags 0x000001
+  type: bool
+  meaning: track enabled; ffmpeg enables only the default subtitle track in tests
+  example: 'true'
+  location: front_or_tail
+  location_note: ''
+  linking: [alt]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w3a.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.tkhd.flag_in_movie
+  path: moov/trak/tkhd/flags bit 1
+  raw: tkhd flags 0x000002
+  type: bool
+  meaning: track takes part in normal playback
+  example: 'true'
+  location: front_or_tail
+  location_note: ''
+  linking: [none]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w1b.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.tkhd.flag_in_preview
+  path: moov/trak/tkhd/flags bit 2
+  raw: tkhd flags 0x000004
+  type: bool
+  meaning: track used in preview only
+  example: 'false'
+  location: front_or_tail
+  location_note: ''
+  linking: [none]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w1b.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.tkhd.alternate_group
+  path: moov/trak/tkhd/alternate_group
+  raw: tkhd i16 at +36 (v0)
+  type: int
+  meaning: alternative group (audio languages, commentary, quality variants); 0 = none
+  example: '1'
+  location: front_or_tail
+  location_note: ''
+  linking: [alt, same_film]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w1b.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.tkhd.layer
+  path: moov/trak/tkhd/layer
+  raw: tkhd i16 at +34
+  type: int
+  meaning: z-order; usually 0
+  example: '0'
+  location: front_or_tail
+  location_note: ''
+  linking: [none]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w1b.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.tkhd.volume
+  path: moov/trak/tkhd/volume
+  raw: tkhd 8.8 at +40
+  type: float
+  meaning: 1.0 for audio, 0 for video
+  example: '1.0'
+  location: front_or_tail
+  location_note: ''
+  linking: [none]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w1b.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.tkhd.matrix_rotation
+  path: moov/trak/tkhd/matrix
+  raw: tkhd 9 x 32-bit at +44 (a,b,c,d = rotation)
+  type: string
+  meaning: 'rotation: 90 or 270 degrees = portrait phone video; flips show as negative a/d'
+  example: rot 90
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w1b.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.tkhd.width
+  path: moov/trak/tkhd/width
+  raw: tkhd last 8 bytes, 16.16
+  type: float
+  meaning: display width; may differ from coded width (pasp, clap)
+  example: '1920.0'
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w1b.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.tkhd.height
+  path: moov/trak/tkhd/height
+  raw: tkhd last 4 bytes, 16.16
+  type: float
+  meaning: display height
+  example: '1080.0'
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w1b.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.elst.entry_count
+  path: moov/trak/edts/elst/entry_count
+  raw: elst +4 u32
+  type: uint
+  meaning: number of edit list entries; 0 = no edit list
+  example: '2'
+  location: front_or_tail
+  location_note: ''
+  linking: [none]
+  privacy: false
+  atlas: 'no'
+  verified: source
+  source: raw/w5c.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.elst.segment_duration
+  path: moov/trak/edts/elst/segment_duration
+  raw: elst entry +0 (v0 u32) / +0 (v1 u64)
+  type: uint
+  meaning: duration of this edit in movie timescale
+  example: '1000'
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: source
+  source: raw/w5c.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.elst.media_time
+  path: moov/trak/edts/elst/media_time
+  raw: elst entry +4 (v0 i32) / +8 (v1 i64)
+  type: int
+  meaning: start point in media timescale; -1 = empty edit (leading delay)
+  example: '1024'
+  location: front_or_tail
+  location_note: non-zero first media_time = encoder priming to trim
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: source
+  source: raw/w5c.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.elst.media_rate
+  path: moov/trak/edts/elst/media_rate
+  raw: elst entry +8 u16.u16
+  type: float
+  meaning: 1.0 normal; any other value = speed edit
+  example: '1.0'
+  location: front_or_tail
+  location_note: ''
+  linking: [none]
+  privacy: false
+  atlas: 'no'
+  verified: source
+  source: raw/w5c.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.mdhd.timescale
+  path: moov/trak/mdia/mdhd/timescale
+  raw: mdhd +12 (v0) / +20 (v1)
+  type: uint
+  meaning: 'media ticks per second: 48000 audio, 90000 or 12800 video, 1000000 for tx3g in ffmpeg'
+  example: '1000000'
+  location: front_or_tail
+  location_note: ''
+  linking: [none]
+  privacy: false
+  atlas: 'no'
+  verified: source
+  source: raw/w5c.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.mdhd.duration
+  path: moov/trak/mdia/mdhd/duration
+  raw: mdhd +16 (v0) / +24 (v1)
+  type: uint
+  meaning: track duration in media ticks; all-ones = unknown
+  example: '3000000'
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: source
+  source: raw/w5c.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.mdhd.language
+  path: moov/trak/mdia/mdhd/language
+  raw: mdhd +20 (v0) / +32 (v1) u16 packed
+  type: string
+  meaning: ISO-639-2/T, three 5-bit letters each plus 0x60; 0x55C4 = und; eng = 0x15C7
+  example: eng
+  location: front_or_tail
+  location_note: ''
+  linking: [none]
+  privacy: false
+  atlas: parsed
+  verified: source
+  source: raw/w1b.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.mdhd.creation_time
+  path: moov/trak/mdia/mdhd/creation_time
+  raw: mdhd +4
+  type: uint
+  meaning: per-track creation time; ffmpeg writes the same as mvhd when metadata set
+  example: '3787009445'
+  location: front_or_tail
+  location_note: ''
+  linking: [twin]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w2b.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.hdlr.handler_type
+  path: moov/trak/mdia/hdlr/handler_type
+  raw: hdlr +8 fourcc
+  type: fourcc
+  meaning: 'track kind: vide, soun, sbtl (ffmpeg tx3g), subt (Apple), text, meta, hint, clcp'
+  example: vide
+  location: front_or_tail
+  location_note: ''
+  linking: [none]
+  privacy: false
+  atlas: parsed
+  verified: source
+  source: raw/w1b.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.hdlr.name
+  path: moov/trak/mdia/hdlr/name
+  raw: hdlr +32 string (C or Pascal)
+  type: string
+  meaning: 'muxer fingerprint: VideoHandler / SoundHandler (ffmpeg), SubtitleHandler (ffmpeg tx3g), L-SMASH Video Handler, GPAC ISO Video Handler, Core Media Video (Apple)'
+  example: VideoHandler
+  location: front_or_tail
+  location_note: ''
+  linking: [tool, alt]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w2b.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.hdlr.meta_type
+  path: moov/meta/hdlr/handler_type
+  raw: meta hdlr +8 fourcc
+  type: fourcc
+  meaning: mdir = iTunes-style ilst; mdta = QuickTime keys + ilst
+  example: mdir
+  location: front_or_tail
+  location_note: ''
+  linking: [tool]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w2b.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.minf.vmhd
+  path: moov/trak/mdia/minf/vmhd
+  raw: minf/vmhd presence
+  type: bool
+  meaning: video media header present; graphicsmode and opcolor usually zero
+  example: 'true'
+  location: front_or_tail
+  location_note: ''
+  linking: [none]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w1b.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.minf.smhd
+  path: moov/trak/mdia/minf/smhd
+  raw: minf/smhd presence, balance u16 at +8
+  type: bool
+  meaning: sound media header; balance 0 = centre
+  example: 'true'
+  location: front_or_tail
+  location_note: ''
+  linking: [none]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w1b.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.minf.sthd
+  path: moov/trak/mdia/minf/sthd
+  raw: minf/sthd presence
+  type: bool
+  meaning: subtitle media header (text/sbtl tracks)
+  example: 'true'
+  location: front_or_tail
+  location_note: ''
+  linking: [none]
+  privacy: false
+  atlas: 'no'
+  verified: memory
+  source: raw/w1b.md
+  cost: tail
+- id: mp4.minf.nmhd
+  path: moov/trak/mdia/minf/nmhd
+  raw: minf/nmhd presence
+  type: bool
+  meaning: 'null media header: timecode, chapter text or hint tracks'
+  example: 'true'
+  location: front_or_tail
+  location_note: ''
+  linking: [none]
+  privacy: false
+  atlas: 'no'
+  verified: memory
+  source: raw/w1b.md
+  cost: tail
+- id: mp4.dinf.dref_self_contained
+  path: minf/dinf/dref entry flags
+  raw: dref entry flags & 0x000001
+  type: bool
+  meaning: data in this file; 0 = dref url points at another file (external reference)
+  example: 'true'
+  location: front_or_tail
+  location_note: ''
+  linking: [none]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w1b.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.dinf.dref_url
+  path: minf/dinf/dref/url
+  raw: dref url entry string
+  type: string
+  meaning: external file location if dref is not self-contained
+  example: file:///Users/...
+  location: front_or_tail
+  location_note: may carry a local path from the authoring machine
+  linking: [uploader]
+  privacy: true
+  atlas: 'no'
+  verified: tested
+  source: raw/w1b.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.stsd.avc1
+  path: stbl/stsd/entry fourcc avc1
+  raw: stsd entry +4 fourcc
+  type: fourcc
+  meaning: AVC/H.264, parameter sets only in avcC
+  example: avc1
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: parsed
+  verified: tested
+  source: raw/w2b.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.stsd.avc3
+  path: stbl/stsd/entry fourcc avc3
+  raw: stsd entry +4 fourcc
+  type: fourcc
+  meaning: AVC/H.264 with SPS/PPS also in band in samples
+  example: avc3
+  location: front_or_tail
+  location_note: ''
+  linking: [tool]
+  privacy: false
+  atlas: parsed
+  verified: tested
+  source: raw/w1b.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.stsd.hvc1
+  path: stbl/stsd/entry fourcc hvc1
+  raw: stsd entry +4 fourcc
+  type: fourcc
+  meaning: HEVC, parameter sets out of band in hvcC only
+  example: hvc1
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: parsed
+  verified: tested
+  source: raw/w1b.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.stsd.hev1
+  path: stbl/stsd/entry fourcc hev1
+  raw: stsd entry +4 fourcc
+  type: fourcc
+  meaning: HEVC with in-band parameter sets; ffmpeg writes hev1 for plain HEVC
+  example: hev1
+  location: front_or_tail
+  location_note: ''
+  linking: [tool]
+  privacy: false
+  atlas: parsed
+  verified: tested
+  source: raw/w7a.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.stsd.dvh1
+  path: stbl/stsd/entry fourcc dvh1
+  raw: stsd entry +4 fourcc
+  type: fourcc
+  meaning: Dolby Vision HEVC, parameter sets out of band; the fourcc alone does not prove DV (ffmpeg dvh1 tag had no dvcC)
+  example: dvh1
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: parsed
+  verified: tested
+  source: raw/w7a.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.stsd.dvhe
+  path: stbl/stsd/entry fourcc dvhe
+  raw: stsd entry +4 fourcc
+  type: fourcc
+  meaning: Dolby Vision HEVC, parameter sets in band
+  example: dvhe
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: parsed
+  verified: tested
+  source: raw/w6c.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.stsd.av01
+  path: stbl/stsd/entry fourcc av01
+  raw: stsd entry +4 fourcc
+  type: fourcc
+  meaning: AV1; config in av1C
+  example: av01
+  location: front_or_tail
+  location_note: ''
+  linking: [none]
+  privacy: false
+  atlas: parsed
+  verified: tested
+  source: raw/w6c.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.stsd.vp09
+  path: stbl/stsd/entry fourcc vp09
+  raw: stsd entry +4 fourcc
+  type: fourcc
+  meaning: VP9; config in vpcC
+  example: vp09
+  location: front_or_tail
+  location_note: ''
+  linking: [none]
+  privacy: false
+  atlas: parsed
+  verified: tested
+  source: raw/w6c.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.stsd.mp4a
+  path: stbl/stsd/entry fourcc mp4a
+  raw: stsd entry +4 fourcc
+  type: fourcc
+  meaning: MPEG-4 audio (AAC, HE-AAC, MP3 via esds); real codec is in esds objectTypeIndication
+  example: mp4a
+  location: front_or_tail
+  location_note: ''
+  linking: [none]
+  privacy: false
+  atlas: parsed
+  verified: source
+  source: raw/w5c.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.stsd.ac-3
+  path: stbl/stsd/entry fourcc ac-3
+  raw: stsd entry +4 fourcc
+  type: fourcc
+  meaning: Dolby Digital (AC-3); config in dac3
+  example: ac-3
+  location: front_or_tail
+  location_note: ''
+  linking: [none]
+  privacy: false
+  atlas: parsed
+  verified: source
+  source: raw/w5c.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.stsd.ec-3
+  path: stbl/stsd/entry fourcc ec-3
+  raw: stsd entry +4 fourcc
+  type: fourcc
+  meaning: Dolby Digital Plus (E-AC-3); config in dec3, Atmos JOC flag inside dec3
+  example: ec-3
+  location: front_or_tail
+  location_note: ''
+  linking: [none]
+  privacy: false
+  atlas: parsed
+  verified: source
+  source: raw/w5c.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.stsd.ac-4
+  path: stbl/stsd/entry fourcc ac-4
+  raw: stsd entry +4 fourcc
+  type: fourcc
+  meaning: Dolby AC-4; config in dac4
+  example: ac-4
+  location: front_or_tail
+  location_note: ''
+  linking: [none]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w5c.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.stsd.dtsc
+  path: stbl/stsd/entry fourcc dtsc
+  raw: stsd entry +4 fourcc
+  type: fourcc
+  meaning: DTS core only; config in ddts
+  example: dtsc
+  location: front_or_tail
+  location_note: ''
+  linking: [none]
+  privacy: false
+  atlas: parsed
+  verified: source
+  source: raw/w5c.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.stsd.dtsh
+  path: stbl/stsd/entry fourcc dtsh
+  raw: stsd entry +4 fourcc
+  type: fourcc
+  meaning: DTS-HD high resolution (core plus extension); ddts StreamConstruction tells profile
+  example: dtsh
+  location: front_or_tail
+  location_note: ''
+  linking: [none]
+  privacy: false
+  atlas: parsed
+  verified: source
+  source: raw/w5c.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.stsd.dtsl
+  path: stbl/stsd/entry fourcc dtsl
+  raw: stsd entry +4 fourcc
+  type: fourcc
+  meaning: DTS-HD lossless (MA)
+  example: dtsl
+  location: front_or_tail
+  location_note: ''
+  linking: [none]
+  privacy: false
+  atlas: parsed
+  verified: source
+  source: raw/w5c.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.stsd.dtsx
+  path: stbl/stsd/entry fourcc dtsx
+  raw: stsd entry +4 fourcc
+  type: fourcc
+  meaning: DTS-HD lossless with extension (DTS:X tiers signalled inside stream)
+  example: dtsx
+  location: front_or_tail
+  location_note: ''
+  linking: [none]
+  privacy: false
+  atlas: parsed
+  verified: tested
+  source: raw/w5c.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.stsd.mlpa
+  path: stbl/stsd/entry fourcc mlpa
+  raw: stsd entry +4 fourcc
+  type: fourcc
+  meaning: Dolby TrueHD (MLP); format info in dmlp box
+  example: mlpa
+  location: front_or_tail
+  location_note: ''
+  linking: [none]
+  privacy: false
+  atlas: parsed
+  verified: source
+  source: raw/w5c.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.stsd.Opus
+  path: stbl/stsd/entry fourcc Opus
+  raw: stsd entry +4 fourcc
+  type: fourcc
+  meaning: Opus; config in dOps (OpusHead without magic)
+  example: Opus
+  location: front_or_tail
+  location_note: ''
+  linking: [none]
+  privacy: false
+  atlas: parsed
+  verified: source
+  source: raw/w5c.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.stsd.fLaC
+  path: stbl/stsd/entry fourcc fLaC
+  raw: stsd entry +4 fourcc
+  type: fourcc
+  meaning: FLAC; STREAMINFO in dfLa
+  example: fLaC
+  location: front_or_tail
+  location_note: ''
+  linking: [none]
+  privacy: false
+  atlas: parsed
+  verified: source
+  source: raw/w5c.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.stsd.alac
+  path: stbl/stsd/entry fourcc alac
+  raw: stsd entry +4 fourcc
+  type: fourcc
+  meaning: Apple Lossless; magic cookie in alac child box
+  example: alac
+  location: front_or_tail
+  location_note: ''
+  linking: [none]
+  privacy: false
+  atlas: parsed
+  verified: tested
+  source: raw/w5c.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.stsd.ipcm
+  path: stbl/stsd/entry fourcc ipcm
+  raw: stsd entry +4 fourcc
+  type: fourcc
+  meaning: uncompressed integer PCM (ISO); lpcm is the QuickTime form
+  example: ipcm
+  location: front_or_tail
+  location_note: ''
+  linking: [none]
+  privacy: false
+  atlas: parsed
+  verified: tested
+  source: raw/w5c.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.stsd.tx3g
+  path: stbl/stsd/entry fourcc tx3g
+  raw: stsd entry +4 fourcc
+  type: fourcc
+  meaning: 3GPP timed text (ffmpeg mov_text); font table ftab inside
+  example: tx3g
+  location: front_or_tail
+  location_note: ''
+  linking: [same_subs]
+  privacy: false
+  atlas: parsed
+  verified: tested
+  source: raw/w3a.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.stsd.wvtt
+  path: stbl/stsd/entry fourcc wvtt
+  raw: stsd entry +4 fourcc
+  type: fourcc
+  meaning: WebVTT in MP4; vttC config box (ffmpeg 6.1 refused to write it)
+  example: wvtt
+  location: front_or_tail
+  location_note: ''
+  linking: [same_subs]
+  privacy: false
+  atlas: parsed
+  verified: tested
+  source: raw/w3a.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.stsd.stpp
+  path: stbl/stsd/entry fourcc stpp
+  raw: stsd entry +4 fourcc
+  type: fourcc
+  meaning: XML subtitles (TTML) in MP4; namespace and schema in sample entry
+  example: stpp
+  location: front_or_tail
+  location_note: ''
+  linking: [same_subs]
+  privacy: false
+  atlas: parsed
+  verified: tested
+  source: raw/w3a.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.stsd.c608
+  path: stbl/stsd/entry fourcc c608 / c708
+  raw: stsd entry +4 fourcc
+  type: fourcc
+  meaning: CEA-608 / CEA-708 closed captions carried as a track
+  example: c608
+  location: front_or_tail
+  location_note: ''
+  linking: [same_subs]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w3a.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.stsd.video.width
+  path: stbl/stsd/entry/visual width
+  raw: stsd entry +32 u16
+  type: uint
+  meaning: coded width in pixels
+  example: '1920'
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: parsed
+  verified: source
+  source: tools/atlas_media_a29ee52.rs; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.stsd.video.height
+  path: stbl/stsd/entry/visual height
+  raw: stsd entry +34 u16
+  type: uint
+  meaning: coded height in pixels
+  example: '1080'
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: parsed
+  verified: source
+  source: tools/atlas_media_a29ee52.rs; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.stsd.video.horizresolution
+  path: stbl/stsd/entry/visual horizresolution
+  raw: stsd entry +36 16.16
+  type: float
+  meaning: 72 dpi typical; no information
+  example: '72.0'
+  location: front_or_tail
+  location_note: ''
+  linking: [none]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w1b.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.stsd.video.frame_count
+  path: stbl/stsd/entry/visual frame_count
+  raw: stsd entry +48 u16
+  type: uint
+  meaning: frames per sample; 1 typical
+  example: '1'
+  location: front_or_tail
+  location_note: ''
+  linking: [none]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w1b.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.stsd.video.compressorname
+  path: stbl/stsd/entry/visual compressorname
+  raw: stsd entry +50 Pascal string 32 B
+  type: string
+  meaning: 'encoder name written into the sample entry: x264 core, HandBrake, Lavf, x265, Apple'
+  example: Lavf60.16.100
+  location: front_or_tail
+  location_note: ''
+  linking: [tool, twin]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w1b.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.stsd.video.depth
+  path: stbl/stsd/entry/visual depth
+  raw: stsd entry +82 u16
+  type: uint
+  meaning: 0x0018 = colour no alpha (not bit depth); bit depth lives in config boxes
+  example: '24'
+  location: front_or_tail
+  location_note: do not read as bit depth
+  linking: [none]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w1b.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.stsd.audio.channelcount
+  path: stbl/stsd/entry/audio channelcount
+  raw: stsd entry +24 u16
+  type: uint
+  meaning: channel count from the sample entry; ignores dac3/dec3/esds and chnl layout
+  example: '6'
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: parsed
+  verified: source
+  source: tools/atlas_media_a29ee52.rs; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.stsd.audio.samplesize
+  path: stbl/stsd/entry/audio samplesize
+  raw: stsd entry +26 u16
+  type: uint
+  meaning: nominal bits per sample; 16 typical, 0 for compressed codecs
+  example: '16'
+  location: front_or_tail
+  location_note: ''
+  linking: [none]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w1b.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.stsd.audio.samplerate
+  path: stbl/stsd/entry/audio samplerate
+  raw: stsd entry +32 16.16
+  type: uint
+  meaning: integer part only; 16-bit field cannot hold rates above 65535, so read dfLa, dOps, esds ASC or the v1/v2 sound entry
+  example: '48000'
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: partial
+  verified: tested
+  source: raw/w1b.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.stsd.audio.version
+  path: stbl/stsd/entry/audio version
+  raw: stsd entry +16 u16
+  type: uint
+  meaning: QuickTime sound description version 0/1/2; v2 carries 64-bit rate and channel count
+  example: '0'
+  location: front_or_tail
+  location_note: ''
+  linking: [none]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w1b.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.avcC.profile_idc
+  path: avcC/AVCProfileIndication
+  raw: avcC +1 u8
+  type: uint
+  meaning: 66 baseline, 77 main, 100 high, 110 high10, 122 high422, 244 high444
+  example: '100'
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w6c.md; corpus:c_mp4_faststart.mp4,c_mp4_nofaststart.mp4,w10_dualaudio.mp4
+  cost: tail
+- id: mp4.avcC.profile_compat
+  path: avcC/profile_compatibility
+  raw: avcC +2 u8
+  type: uint
+  meaning: constraint flags
+  example: '0'
+  location: front_or_tail
+  location_note: ''
+  linking: [none]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w6c.md; corpus:c_mp4_faststart.mp4,c_mp4_nofaststart.mp4,w10_dualaudio.mp4
+  cost: tail
+- id: mp4.avcC.level_idc
+  path: avcC/AVCLevelIndication
+  raw: avcC +3 u8
+  type: uint
+  meaning: level x 10 (41 = 4.1)
+  example: '41'
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w6c.md; corpus:c_mp4_faststart.mp4,c_mp4_nofaststart.mp4,w10_dualaudio.mp4
+  cost: tail
+- id: mp4.avcC.length_size
+  path: avcC/lengthSizeMinusOne
+  raw: avcC +4 bits 0-1
+  type: uint
+  meaning: NAL length field size minus 1; 3 = 4-byte lengths
+  example: '3'
+  location: front_or_tail
+  location_note: ''
+  linking: [none]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w6c.md; corpus:c_mp4_faststart.mp4,c_mp4_nofaststart.mp4,w10_dualaudio.mp4
+  cost: tail
+- id: mp4.avcC.sps
+  path: avcC/SPS array
+  raw: avcC +6 count, u16 length + bytes
+  type: binary
+  meaning: 'SPS NAL: resolution, frame rate, VUI colour and HDR hints, can be parsed without a frame'
+  example: 67 64 00 28 ...
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w6c.md; corpus:c_mp4_faststart.mp4,c_mp4_nofaststart.mp4,w10_dualaudio.mp4
+  cost: tail
+- id: mp4.avcC.ext_bit_depth
+  path: avcC SPS-extension bytes (profiles 100/110/122/144)
+  raw: 'avcC after PPS: byte 0 chroma_format bits 0-1, byte 1 bit_depth_luma_minus8 bits 0-2, byte 2 chroma bits 0-2'
+  type: uint
+  meaning: bit depth for High profiles; fd fa fa = 4:2:0 10-bit
+  example: '10'
+  location: front_or_tail
+  location_note: fixes bit_depth for 10-bit H.264
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w6c.md; corpus:c_mp4_faststart.mp4,c_mp4_nofaststart.mp4,w10_dualaudio.mp4
+  cost: tail
+- id: mp4.hvcC.profile
+  path: hvcC/general_profile_idc
+  raw: hvcC +1 bits 0-4 (+ space bits 6-7, tier bit 5)
+  type: uint
+  meaning: 1 Main, 2 Main 10, 3 Main Still, 4 RExt, 9 SCC; Main 10 is the HDR profile
+  example: '2'
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w6c.md; corpus:dv5_strict.mp4,dv81_dvh1.mp4,dv81_strict.mp4
+  cost: tail
+- id: mp4.hvcC.compat_flags
+  path: hvcC/general_profile_compatibility_flags
+  raw: hvcC +2 u32
+  type: uint
+  meaning: profile compatibility bit set
+  example: '0x60000000'
+  location: front_or_tail
+  location_note: ''
+  linking: [none]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w6c.md; corpus:dv5_strict.mp4,dv81_dvh1.mp4,dv81_strict.mp4
+  cost: tail
+- id: mp4.hvcC.level
+  path: hvcC/general_level_idc
+  raw: hvcC +12 u8
+  type: uint
+  meaning: level x 30 (153 = 5.1, 120 = 4.0)
+  example: '153'
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w6c.md; corpus:dv5_strict.mp4,dv81_dvh1.mp4,dv81_strict.mp4
+  cost: tail
+- id: mp4.hvcC.chroma_format
+  path: hvcC/chromaFormat
+  raw: hvcC +16 bits 0-1
+  type: uint
+  meaning: 1 = 4:2:0, 2 = 4:2:2, 3 = 4:4:4
+  example: '1'
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w6c.md; corpus:dv5_strict.mp4,dv81_dvh1.mp4,dv81_strict.mp4
+  cost: tail
+- id: mp4.hvcC.bit_depth_luma
+  path: hvcC/bitDepthLumaMinus8
+  raw: hvcC +17 bits 0-2
+  type: uint
+  meaning: luma bit depth minus 8; 2 = 10-bit; always present, unlike MKV BitsPerChannel
+  example: '2'
+  location: front_or_tail
+  location_note: primary bit_depth source for MP4
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w6c.md; corpus:dv5_strict.mp4,dv81_dvh1.mp4,dv81_strict.mp4
+  cost: tail
+- id: mp4.hvcC.bit_depth_chroma
+  path: hvcC/bitDepthChromaMinus8
+  raw: hvcC +18 bits 0-2
+  type: uint
+  meaning: chroma bit depth minus 8
+  example: '2'
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w6c.md; corpus:dv5_strict.mp4,dv81_dvh1.mp4,dv81_strict.mp4
+  cost: tail
+- id: mp4.hvcC.avg_frame_rate
+  path: hvcC/avgFrameRate
+  raw: hvcC +19 u16
+  type: uint
+  meaning: frames per 256 seconds; 0 = unspecified
+  example: '6144'
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w6c.md; corpus:dv5_strict.mp4,dv81_dvh1.mp4,dv81_strict.mp4
+  cost: tail
+- id: mp4.hvcC.constant_frame_rate
+  path: hvcC/constantFrameRate
+  raw: hvcC +21 bits 6-7
+  type: uint
+  meaning: 0 unknown, 1 CFR, 2 CFR per temporal layer
+  example: '1'
+  location: front_or_tail
+  location_note: ''
+  linking: [none]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w6c.md; corpus:dv5_strict.mp4,dv81_dvh1.mp4,dv81_strict.mp4
+  cost: tail
+- id: mp4.hvcC.length_size
+  path: hvcC/lengthSizeMinusOne
+  raw: hvcC +21 bits 0-1
+  type: uint
+  meaning: NAL length size minus 1
+  example: '3'
+  location: front_or_tail
+  location_note: ''
+  linking: [none]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w6c.md; corpus:dv5_strict.mp4,dv81_dvh1.mp4,dv81_strict.mp4
+  cost: tail
+- id: mp4.hvcC.arrays
+  path: hvcC/arrays (VPS 32, SPS 33, PPS 34, SEI 39/40)
+  raw: hvcC +22 numOfArrays then arrays
+  type: binary
+  meaning: parameter sets and prefix SEI; ffmpeg muxes keep SEI 137/144 here, mkvmerge strips them
+  example: 'arrays: 3 (VPS, SPS, PPS) + SEI'
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film, tool]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w6c.md; corpus:dv5_strict.mp4,dv81_dvh1.mp4,dv81_strict.mp4
+  cost: tail
+- id: mp4.hvcC.sei_mastering
+  path: hvcC SEI array payload type 137
+  raw: hvcC SEI NAL (type 39) payload type 137
+  type: bool
+  meaning: SMPTE ST 2086 mastering display present in config (ffmpeg); absence means check first IDR
+  example: 'true'
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w6c.md; corpus:dv5_strict.mp4,dv81_dvh1.mp4,dv81_strict.mp4
+  cost: tail
+- id: mp4.hvcC.sei_content_light
+  path: hvcC SEI array payload type 144
+  raw: hvcC SEI NAL (type 39) payload type 144
+  type: bool
+  meaning: content light level (MaxCLL, MaxFALL) present in config (ffmpeg)
+  example: 'true'
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w6c.md; corpus:dv5_strict.mp4,dv81_dvh1.mp4,dv81_strict.mp4
+  cost: tail
+- id: mp4.av1C.seq_profile
+  path: av1C/seq_profile
+  raw: av1C +1 bits 5-7
+  type: uint
+  meaning: 0 main, 1 high, 2 professional
+  example: '0'
+  location: front_or_tail
+  location_note: ''
+  linking: [none]
+  privacy: false
+  atlas: 'no'
+  verified: source
+  source: raw/w6c.md
+  cost: tail
+- id: mp4.av1C.seq_level_idx
+  path: av1C/seq_level_idx_0
+  raw: av1C +1 bits 0-4
+  type: uint
+  meaning: AV1 level index (8 = 5.0)
+  example: '8'
+  location: front_or_tail
+  location_note: ''
+  linking: [none]
+  privacy: false
+  atlas: 'no'
+  verified: source
+  source: raw/w6c.md
+  cost: tail
+- id: mp4.av1C.high_bitdepth
+  path: av1C/high_bitdepth
+  raw: av1C +2 bit 6
+  type: bool
+  meaning: with twelve_bit gives 8, 10 or 12 bit depth
+  example: 'true'
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w6c.md
+  cost: tail
+- id: mp4.av1C.twelve_bit
+  path: av1C/twelve_bit
+  raw: av1C +2 bit 5
+  type: bool
+  meaning: 12-bit when high_bitdepth is set
+  example: 'false'
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: source
+  source: raw/w6c.md
+  cost: tail
+- id: mp4.av1C.chroma_flags
+  path: av1C/monochrome, chroma_subsampling_x/y, chroma_sample_position
+  raw: av1C +2 bits 4..0
+  type: string
+  meaning: monochrome flag and 4:2:0 / 4:2:2 / 4:4:4 layout
+  example: '4:2:0'
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w6c.md
+  cost: tail
+- id: mp4.av1C.config_obus
+  path: av1C/configOBUs
+  raw: av1C +4 to end of box
+  type: binary
+  meaning: sequence header OBU (type 1), optional metadata OBUs (HDR10+ or DV carry as T.35 metadata OBUs in-band, memory)
+  example: 0a 0b 00 00 ...
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w6c.md
+  cost: tail
+- id: mp4.vpcC.profile
+  path: vpcC/profile
+  raw: vpcC +4 u8
+  type: uint
+  meaning: VP9 profile 0-3
+  example: '2'
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w6c.md
+  cost: tail
+- id: mp4.vpcC.level
+  path: vpcC/level
+  raw: vpcC +5 u8
+  type: uint
+  meaning: VP9 level x 10 (20 = 2.0)
+  example: '20'
+  location: front_or_tail
+  location_note: ''
+  linking: [none]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w6c.md
+  cost: tail
+- id: mp4.vpcC.bit_depth
+  path: vpcC/bitDepth
+  raw: vpcC +6 bits 4-7
+  type: uint
+  meaning: 8, 10 or 12
+  example: '10'
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w6c.md
+  cost: tail
+- id: mp4.vpcC.chroma_full_range
+  path: vpcC/chromaSubsampling, videoFullRangeFlag
+  raw: vpcC +6 bits 1-3 and bit 0
+  type: string
+  meaning: chroma layout and full-range flag
+  example: 1 full=0
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w6c.md
+  cost: tail
+- id: mp4.vpcC.colour
+  path: vpcC/colourPrimaries, transferCharacteristics, matrixCoefficients
+  raw: vpcC +7 to +9
+  type: string
+  meaning: CICP colour codes, same values as colr nclx
+  example: 9 16 9
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w6c.md
+  cost: tail
+- id: mp4.dvcC.version
+  path: dvcC/dvvC/dvwC dv_version_major, dv_version_minor
+  raw: dvcC +0 u8 major, +1 u8 minor
+  type: string
+  meaning: Dolby Vision config version (1.0)
+  example: '1.0'
+  location: front_or_tail
+  location_note: ''
+  linking: [none]
+  privacy: false
+  atlas: 'no'
+  verified: source
+  source: raw/w6c.md
+  cost: tail
+- id: mp4.dvcC.box_name
+  path: sample entry child dvcC / dvvC / dvwC
+  raw: fourcc of config child
+  type: fourcc
+  meaning: dvcC profiles up to 7, dvvC profile 8 and up, dvwC profile 10 (AV1); ffmpeg picks the same split
+  example: dvvC
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: partial
+  verified: source
+  source: raw/w6c.md
+  cost: tail
+- id: mp4.dvcC.profile
+  path: dvcC/dv_profile
+  raw: dvcC/dvvC +2 bits 1-7 of u16 +2..+3
+  type: uint
+  meaning: 5 IPT-PQ no HDR10 base, 7 dual layer (MEL/FEL), 8 single layer with compat id, 10 AV1
+  example: '8'
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: parsed
+  verified: source
+  source: raw/w6c.md
+  cost: tail
+- id: mp4.dvcC.level
+  path: dvcC/dv_level
+  raw: dvcC/dvvC +2 bit 0 and +3 bits 3-7
+  type: uint
+  meaning: DV level 1 to 13 (6 bits)
+  example: '6'
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: parsed
+  verified: tested
+  source: raw/w7a.md
+  cost: tail
+- id: mp4.dvcC.rpu_present
+  path: dvcC/rpu_present_flag
+  raw: dvcC/dvvC +3 bit 2
+  type: bool
+  meaning: RPU NALs present in the bitstream
+  example: 'true'
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: source
+  source: raw/w6c.md
+  cost: tail
+- id: mp4.dvcC.el_present
+  path: dvcC/el_present_flag
+  raw: dvcC/dvvC +3 bit 1
+  type: bool
+  meaning: enhancement layer present (dual layer profile 7 and FEL/MEL)
+  example: 'false'
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: parsed
+  verified: tested
+  source: raw/w7a.md
+  cost: tail
+- id: mp4.dvcC.bl_present
+  path: dvcC/bl_present_flag
+  raw: dvcC/dvvC +3 bit 0
+  type: bool
+  meaning: base layer present
+  example: 'true'
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w7a.md
+  cost: tail
+- id: mp4.dvcC.bl_signal_compatibility_id
+  path: dvcC/dv_bl_signal_compatibility_id
+  raw: dvcC/dvvC +4 bits 4-7
+  type: uint
+  meaning: 0 none (profile 5), 1 HDR10 base, 2 SDR base, 4 HLG base; drives the DV label
+  example: '1'
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w7a.md
+  cost: tail
+- id: mp4.dvcC.md_compression
+  path: dvcC/dv_md_compression
+  raw: dvcC/dvvC +4 bits 2-3
+  type: uint
+  meaning: RPU metadata compression mode (0 none)
+  example: '0'
+  location: front_or_tail
+  location_note: ''
+  linking: [none]
+  privacy: false
+  atlas: 'no'
+  verified: source
+  source: raw/w6c.md
+  cost: tail
+- id: mp4.dvcC.absent_on_dvh1
+  path: sample entry dvh1/hev1 without dvcC or dvvC
+  raw: absence of config child
+  type: bool
+  meaning: 'absence does not prove non-DV: ffmpeg 6.1 writes no DV box even for DV input; check RPU NALs'
+  example: 'true'
+  location: front_or_tail
+  location_note: ''
+  linking: [none]
+  privacy: false
+  atlas: 'no'
+  verified: memory
+  source: raw/w7a.md
+  cost: tail
+- id: mp4.colr.nclx_primaries
+  path: stsd entry colr (nclx) colour_primaries
+  raw: colr +4 u16 (type nclx)
+  type: uint
+  meaning: 'CICP primaries: 1 BT.709, 9 BT.2020'
+  example: '9'
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w7a.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.colr.nclx_transfer
+  path: stsd entry colr (nclx) transfer_characteristics
+  raw: colr +6 u16
+  type: uint
+  meaning: 'CICP transfer: 1 BT.709, 16 PQ (HDR10 family), 18 HLG'
+  example: '16'
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w7a.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.colr.nclx_matrix
+  path: stsd entry colr (nclx) matrix_coefficients
+  raw: colr +8 u16
+  type: uint
+  meaning: 'CICP matrix: 9 BT.2020 non-constant luminance'
+  example: '9'
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w7a.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.colr.nclx_full_range
+  path: stsd entry colr (nclx) full_range_flag
+  raw: colr +10 bit 7
+  type: bool
+  meaning: full range (0-255) video
+  example: 'false'
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w1b.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.colr.prof_icc
+  path: stsd entry colr (prof) ICC profile
+  raw: colr type prof, payload ICC
+  type: binary
+  meaning: embedded ICC profile; the desc tag name can name the grading or mastering tool
+  example: sRGB IEC61966-2.1
+  location: front_or_tail
+  location_note: ''
+  linking: [tool]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w1b.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.mdcv.primaries_white
+  path: stsd entry mdcv primaries and white point
+  raw: 'mdcv 24 B: 3 x (x,y) u16 + white x,y (0.00002 units)'
+  type: string
+  meaning: SMPTE ST 2086 mastering display primaries and white point
+  example: G(13250,34500) B(7500,3000) R(34000,16000) WP(15635,16450)
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: memory
+  source: raw/w1b.md
+  cost: tail
+- id: mp4.mdcv.max_min_luminance
+  path: stsd entry mdcv max and min luminance
+  raw: mdcv u32 max (0.0001 cd/m2), u32 min
+  type: string
+  meaning: mastering display peak and black level
+  example: 1000 cd/m2 / 0.0001 cd/m2
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: memory
+  source: raw/w1b.md
+  cost: tail
+- id: mp4.clli.max_cll
+  path: stsd entry clli maxCLL, maxFALL
+  raw: clli u16 maxCLL, u16 maxFALL
+  type: string
+  meaning: content light level in cd/m2
+  example: 1000 / 400
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: memory
+  source: raw/w1b.md
+  cost: tail
+- id: mp4.pasp.hspacing_vspacing
+  path: stsd entry pasp hSpacing, vSpacing
+  raw: pasp u32 + u32
+  type: string
+  meaning: pixel aspect ratio; anamorphic SD (DVD-origin 4:3 in a 16:9 frame)
+  example: 32/27
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w1b.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.clap.clean_aperture
+  path: stsd entry clap cleanApertureWidthN/D, HeightN/D, offsets
+  raw: clap 8 x u32
+  type: string
+  meaning: cropped display area; compare with coded size for letterboxing
+  example: 1920/1 1038/1
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: memory
+  source: raw/w1b.md
+  cost: tail
+- id: mp4.btrt.buffer_size_db
+  path: stsd entry btrt bufferSizeDB
+  raw: btrt +0 u32
+  type: uint
+  meaning: decoder buffer size in bytes
+  example: '2000000'
+  location: front_or_tail
+  location_note: ''
+  linking: [none]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w1b.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.btrt.max_bitrate
+  path: stsd entry btrt maxBitrate
+  raw: btrt +4 u32
+  type: uint
+  meaning: declared peak bits per second; 0 when encoder did not declare
+  example: '25000000'
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w5c.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.btrt.avg_bitrate
+  path: stsd entry btrt avgBitrate
+  raw: btrt +8 u32
+  type: uint
+  meaning: declared average bits per second (ffmpeg writes it); may be stale after remux
+  example: '8421000'
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w5c.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.sv3d.st3d.sa3d
+  path: stsd entry sv3d / st3d / SA3D
+  raw: child boxes of visual or audio entry
+  type: string
+  meaning: spherical 360 video (sv3d), stereo flag (st3d, Apple MV-HEVC), ambisonic audio (SA3D)
+  example: sv3d equirectangular
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: memory
+  source: raw/w1b.md
+  cost: tail
+- id: mp4.esds.object_type
+  path: esds/ES_Descriptor/DecoderConfig objectTypeIndication
+  raw: esds DecoderConfigDescriptor tag 0x04 +1 u8
+  type: uint
+  meaning: 0x40 MPEG-4 AAC, 0x66 to 0x68 MPEG-2 AAC, 0x6B MP3
+  example: '64'
+  location: front_or_tail
+  location_note: ''
+  linking: [none]
+  privacy: false
+  atlas: 'no'
+  verified: source
+  source: raw/w5c.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.esds.aot
+  path: esds/DecoderSpecificInfo audioObjectType
+  raw: AudioSpecificConfig first 5 bits (31 = escape)
+  type: uint
+  meaning: 2 AAC LC, 5 HE-AAC v1 (SBR), 29 HE-AAC v2 (SBR+PS)
+  example: '2'
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: memory
+  source: raw/w5c.md
+  cost: tail
+- id: mp4.esds.sample_rate_index
+  path: esds/AudioSpecificConfig samplingFrequencyIndex
+  raw: ASC bits 5-8 (0xF = explicit 24-bit rate)
+  type: uint
+  meaning: index into 96000..7350 table, or explicit Hz
+  example: '3'
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: memory
+  source: raw/w5c.md
+  cost: tail
+- id: mp4.esds.channel_config
+  path: esds/AudioSpecificConfig channelConfiguration
+  raw: ASC bits 9-12
+  type: uint
+  meaning: 1 mono, 2 stereo, 6 5.1, 7 7.1; with PS a channel config 1 means stereo
+  example: '2'
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: memory
+  source: raw/w5c.md
+  cost: tail
+- id: mp4.esds.sbr_ps_flags
+  path: esds/ASC extension (AOT 5/29, sync 0x2b7 / 0x548)
+  raw: ASC extension bits after channel config
+  type: string
+  meaning: SBR and PS present; extensionSamplingFrequency is the real output rate for HE-AAC
+  example: SBR
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: memory
+  source: raw/w5c.md
+  cost: tail
+- id: mp4.esds.avg_bitrate
+  path: esds/DecoderConfig avgBitrate
+  raw: esds DecoderConfigDescriptor +9 u32
+  type: uint
+  meaning: encoder-declared average bits per second
+  example: '192000'
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: source
+  source: raw/w5c.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.esds.max_bitrate
+  path: esds/DecoderConfig maxBitrate
+  raw: esds DecoderConfigDescriptor +5 u32
+  type: uint
+  meaning: declared peak bits per second
+  example: '192000'
+  location: front_or_tail
+  location_note: ''
+  linking: [none]
+  privacy: false
+  atlas: 'no'
+  verified: source
+  source: raw/w5c.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.dac3.fscod
+  path: dac3 fscod
+  raw: dac3 payload bits 23-22 (MSB first)
+  type: uint
+  meaning: 0 48 kHz, 1 44.1 kHz, 2 32 kHz
+  example: '0'
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: source
+  source: raw/w5c.md; corpus:w10_dualaudio.mp4,w10_frag_dualaudio.mp4
+  cost: tail
+- id: mp4.dac3.bsmod
+  path: dac3 bsmod
+  raw: dac3 payload bits 16-14
+  type: uint
+  meaning: bitstream mode; 7 with more than one channel = karaoke
+  example: '0'
+  location: front_or_tail
+  location_note: ''
+  linking: [none]
+  privacy: false
+  atlas: 'no'
+  verified: source
+  source: raw/w5c.md; corpus:w10_dualaudio.mp4,w10_frag_dualaudio.mp4
+  cost: tail
+- id: mp4.dac3.acmod_lfeon
+  path: dac3 acmod, lfeon
+  raw: dac3 payload bits 13-11 (acmod), bit 10 (lfeon)
+  type: string
+  meaning: 'channel layout: channels = [2,1,2,3,3,4,4,5][acmod] + lfeon'
+  example: 3/2 + LFE
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: source
+  source: raw/w5c.md; corpus:w10_dualaudio.mp4,w10_frag_dualaudio.mp4
+  cost: tail
+- id: mp4.dac3.bit_rate_code
+  path: dac3 bit_rate_code
+  raw: dac3 payload bits 9-5
+  type: uint
+  meaning: 'table index: 0 = 32 kbps ... 13 = 320, 18 = 640 kbps'
+  example: '13'
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: source
+  source: raw/w5c.md; corpus:w10_dualaudio.mp4,w10_frag_dualaudio.mp4
+  cost: tail
+- id: mp4.dec3.data_rate
+  path: dec3 data_rate
+  raw: dec3 bytes 0-1, 13 bits
+  type: uint
+  meaning: E-AC-3 stream bitrate in kbps
+  example: '640'
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: source
+  source: raw/w5c.md; corpus:c_mp4_faststart.mp4,c_mp4_nofaststart.mp4,w10_chap_ac3.mp4
+  cost: tail
+- id: mp4.dec3.num_ind_sub
+  path: dec3 num_ind_sub
+  raw: dec3 byte 1 bits 0-2 (+1)
+  type: uint
+  meaning: independent substreams minus one
+  example: '0'
+  location: front_or_tail
+  location_note: ''
+  linking: [none]
+  privacy: false
+  atlas: 'no'
+  verified: source
+  source: raw/w5c.md; corpus:c_mp4_faststart.mp4,c_mp4_nofaststart.mp4,w10_chap_ac3.mp4
+  cost: tail
+- id: mp4.dec3.substream_acmod_lfeon
+  path: dec3 substream 0 acmod, lfeon, bsmod
+  raw: dec3 first 24 bits after header
+  type: string
+  meaning: channel layout of the first substream; FFmpeg bsmod mask (0x1f) may be wrong, check spec
+  example: 5/1 + LFE
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: source
+  source: raw/w5c.md; corpus:c_mp4_faststart.mp4,c_mp4_nofaststart.mp4,w10_chap_ac3.mp4
+  cost: tail
+- id: mp4.dec3.num_dep_sub_chan_loc
+  path: dec3 num_dep_sub and chan_loc
+  raw: 'dec3 substream bits: num_dep_sub 4, chan_loc 9'
+  type: string
+  meaning: dependent substreams add speaker pairs (e.g. Ls Rs, Lrs Rrs)
+  example: chan_loc 0x0
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w5c.md; corpus:c_mp4_faststart.mp4,c_mp4_nofaststart.mp4,w10_chap_ac3.mp4
+  cost: tail
+- id: mp4.dec3.joc_flag
+  path: dec3 JOC / Atmos extension
+  raw: 'dec3 after substreams: flag_ec3_extension_type_a bit + complexity_index_type_a 8 bits'
+  type: string
+  meaning: Dolby Atmos (JOC) present; complexity index = number of dynamic objects supported
+  example: JOC complexity 16
+  location: front_or_tail
+  location_note: FFmpeg keeps raw bytes; parse yourself
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w5c.md; corpus:c_mp4_faststart.mp4,c_mp4_nofaststart.mp4,w10_chap_ac3.mp4
+  cost: tail
+- id: mp4.dac4.ac4_dsi
+  path: dac4 ac4_dsi_v1 presentation table
+  raw: dac4 payload (TS 103 190-2)
+  type: string
+  meaning: AC-4 version, frame rate index, presentations; Atmos is an AC-4 presentation flag
+  example: ac4 v1 fs 48k
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: memory
+  source: raw/w5c.md
+  cost: tail
+- id: mp4.ddts.sampling_frequency
+  path: ddts DTSSamplingFrequency
+  raw: ddts +0 u32
+  type: uint
+  meaning: sample rate Hz
+  example: '48000'
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: source
+  source: raw/w5c.md
+  cost: tail
+- id: mp4.ddts.avg_bitrate
+  path: ddts avgBitrate
+  raw: ddts +8 u32
+  type: uint
+  meaning: average bits per second
+  example: '1509000'
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: source
+  source: raw/w5c.md
+  cost: tail
+- id: mp4.ddts.pcm_sample_depth
+  path: ddts pcmSampleDepth
+  raw: ddts +12 u8
+  type: uint
+  meaning: PCM depth of decoded output (16 or 24)
+  example: '24'
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: source
+  source: raw/w5c.md
+  cost: tail
+- id: mp4.ddts.stream_construction
+  path: ddts StreamConstruction and FrameDuration
+  raw: ddts +13 packed bits (FrameDuration 2, StreamConstruction 5)
+  type: uint
+  meaning: DTS profile (core, core plus extension, HD MA/HRA) per spec Table E-2
+  example: '16'
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: source
+  source: raw/w5c.md
+  cost: tail
+- id: mp4.ddts.channel_layout
+  path: ddts ChannelLayout
+  raw: ddts 16-bit field near end
+  type: uint
+  meaning: speaker mask; RepresentationType 2 or 3 means layout may be missing
+  example: '0x000f'
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: source
+  source: raw/w5c.md
+  cost: tail
+- id: mp4.dmlp.format_info
+  path: dmlp format_info
+  raw: dmlp +0 u32; ratebits 31-28, CA1 19-15, CA2 12-0
+  type: string
+  meaning: TrueHD sample rate and channel assignment (FFmpeg mov_read_dmlp)
+  example: 48 kHz 7.1
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: source
+  source: raw/w5c.md
+  cost: tail
+- id: mp4.dmlp.peak_data_rate
+  path: dmlp peak data rate
+  raw: dmlp after format_info, 15 bits
+  type: uint
+  meaning: TrueHD peak kbps (FFmpeg does not parse)
+  example: '18000'
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: memory
+  source: raw/w5c.md
+  cost: tail
+- id: mp4.dOps.output_channel_count
+  path: dOps OutputChannelCount
+  raw: dOps +1 u8
+  type: uint
+  meaning: output channel count
+  example: '2'
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: source
+  source: raw/w5c.md
+  cost: tail
+- id: mp4.dOps.pre_skip
+  path: dOps PreSkip
+  raw: dOps +2 u16 BE
+  type: uint
+  meaning: encoder delay in samples at 48 kHz to trim (312 typical)
+  example: '312'
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: source
+  source: raw/w5c.md
+  cost: tail
+- id: mp4.dOps.input_sample_rate
+  path: dOps InputSampleRate
+  raw: dOps +4 u32 BE
+  type: uint
+  meaning: original input rate (informative; decoder outputs 48 kHz)
+  example: '48000'
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: source
+  source: raw/w5c.md
+  cost: tail
+- id: mp4.dOps.output_gain
+  path: dOps OutputGain
+  raw: dOps +8 i16 BE (Q7.8 dB)
+  type: float
+  meaning: playback gain in dB
+  example: '0.0'
+  location: front_or_tail
+  location_note: ''
+  linking: [none]
+  privacy: false
+  atlas: 'no'
+  verified: source
+  source: raw/w5c.md
+  cost: tail
+- id: mp4.dOps.channel_mapping_family
+  path: dOps ChannelMappingFamily
+  raw: dOps +10 u8
+  type: uint
+  meaning: 0 mono/stereo, 1 surround with mapping table
+  example: '0'
+  location: front_or_tail
+  location_note: ''
+  linking: [none]
+  privacy: false
+  atlas: 'no'
+  verified: source
+  source: raw/w5c.md
+  cost: tail
+- id: mp4.dfLa.total_samples
+  path: dfLa STREAMINFO total_samples
+  raw: dfLa payload STREAMINFO bits (u36 at byte 13)
+  type: uint
+  meaning: exact sample count; no payload walk needed
+  example: '2646000'
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: source
+  source: raw/w5c.md
+  cost: tail
+- id: mp4.dfLa.sample_rate_channels_bps
+  path: dfLa STREAMINFO rate, channels, bits per sample
+  raw: dfLa STREAMINFO bytes 10-12
+  type: string
+  meaning: sample rate (20 bits, can exceed 65535), channel count, bit depth
+  example: 96000 Hz 2ch 24-bit
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: source
+  source: raw/w5c.md
+  cost: tail
+- id: mp4.dfLa.md5
+  path: dfLa STREAMINFO MD5
+  raw: dfLa STREAMINFO bytes 18-33
+  type: binary
+  meaning: MD5 of decoded PCM; exact content key for audio that is identical across encodes
+  example: 9b3c...
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film, twin]
+  privacy: false
+  atlas: 'no'
+  verified: source
+  source: raw/w5c.md
+  cost: tail
+- id: mp4.alac.cookie
+  path: alac ALACSpecificConfig
+  raw: alac child box, 24-byte cookie
+  type: string
+  meaning: frameLength, bit depth, channels, maxFrameBytes, avgBitRate, sampleRate
+  example: frame 4096, 16-bit
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: memory
+  source: raw/w5c.md
+  cost: tail
+- id: mp4.chnl.layout
+  path: chnl channel layout
+  raw: 'chnl child of audio entry: stream_structure, layout, speaker positions'
+  type: string
+  meaning: explicit speaker order incl. LFE and custom layouts (FFmpeg mov_chan.c)
+  example: layout 6 (5.1)
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: source
+  source: raw/w5c.md
+  cost: tail
+- id: mp4.stts.entries
+  path: stbl/stts entries (sample_count, sample_delta)
+  raw: stts +4 entry_count, then u32 count, u32 delta
+  type: string
+  meaning: decode time deltas; one entry means CFR (fps = timescale / delta); several distinct deltas mean VFR
+  example: 1 entry delta 1001
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: source
+  source: raw/w5c.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.stsz.sample_count
+  path: stbl/stsz sample_count
+  raw: stsz +8 u32
+  type: uint
+  meaning: exact frame count for video; packet count for audio; includes filler samples for tx3g (not event count)
+  example: '63432'
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: source
+  source: raw/w5c.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.stsz.sample_sizes
+  path: stbl/stsz per-sample sizes
+  raw: stsz +12 table (or uniform size at +4 when nonzero)
+  type: string
+  meaning: 'byte size of each sample: exact bitrate and GOP byte totals'
+  example: uniform 0 (table)
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: source
+  source: raw/w5c.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.stz2.field_size
+  path: stbl/stz2 field_size
+  raw: stz2 +7 u8 (4, 8 or 16)
+  type: uint
+  meaning: compact sample size table width
+  example: '16'
+  location: front_or_tail
+  location_note: ''
+  linking: [none]
+  privacy: false
+  atlas: 'no'
+  verified: memory
+  source: raw/w5c.md
+  cost: tail
+- id: mp4.ctts.offsets
+  path: stbl/ctts (sample_count, sample_offset)
+  raw: ctts +4 entry_count, then u32 count, i32 offset (v1) or u32 (v0)
+  type: string
+  meaning: composition offset per sample; B-frame reorder and edit timing
+  example: 2 entries
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w5c.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.cslg.reorder_bounds
+  path: stbl/cslg shifts
+  raw: 'cslg v0 or v1: composition_to_dts_shift, least and greatest decode-to-display delta'
+  type: string
+  meaning: exact B-frame reorder bounds without scanning ctts; FFmpeg does not parse it
+  example: shift 1024, least 0, greatest 2048
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: memory
+  source: raw/w5c.md
+  cost: tail
+- id: mp4.stss.sync_samples
+  path: stbl/stss sync sample numbers
+  raw: stss +4 entry_count, then u32 1-based numbers
+  type: string
+  meaning: keyframe list; gaps give GOP length; absent means every sample is sync
+  example: 1, 49, 97
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: source
+  source: raw/w5c.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.stsc.entries
+  path: stbl/stsc (first_chunk, samples_per_chunk, sample_description_index)
+  raw: stsc +4 entry_count, 12-byte entries
+  type: string
+  meaning: sample-to-chunk map; chunk layout and interleaving
+  example: 1 entry 1 spc 1
+  location: front_or_tail
+  location_note: ''
+  linking: [none]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w5c.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.stco.chunk_offsets
+  path: stbl/stco or co64 chunk offsets
+  raw: stco +4 entry_count u32 table; co64 u64
+  type: string
+  meaning: absolute file offsets of chunks; locate mdat payload and map a byte offset to an article in tail fetches
+  example: co64 entries 2100
+  location: front_or_tail
+  location_note: co64 for files over 4 GiB
+  linking: [none]
+  privacy: false
+  atlas: 'no'
+  verified: source
+  source: raw/w5c.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.sgpd.roll_group
+  path: stbl/sgpd roll grouping
+  raw: sgpd grouping_type roll, roll_distance i16
+  type: int
+  meaning: pre-roll in samples (Opus and AAC pre-roll signalling)
+  example: '-1'
+  location: front_or_tail
+  location_note: ''
+  linking: [none]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w5c.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.sbgp.group_map
+  path: stbl/sbgp grouping map
+  raw: sbgp grouping_type and entries
+  type: string
+  meaning: samples mapped to sgpd groups (roll, sync, encryption)
+  example: roll 1 entry
+  location: front_or_tail
+  location_note: ''
+  linking: [none]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w5c.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.tref.chap
+  path: trak/tref/chap track ids
+  raw: tref child chap, u32 track ids
+  type: string
+  meaning: points at a text track holding chapter names with per-sample times (QuickTime chapters)
+  example: track 3
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w1b.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.udta.name
+  path: moov/udta/name or trak/udta/name
+  raw: name box payload
+  type: string
+  meaning: title (movie) or track name; ffmpeg writes trak name from title metadata
+  example: Forced
+  location: front_or_tail
+  location_note: ''
+  linking: [alt]
+  privacy: false
+  atlas: 'no'
+  verified: memory
+  source: raw/w3a.md
+  cost: tail
+- id: mp4.udta.chpl_entries
+  path: moov/udta/chpl chapter list (Nero)
+  raw: 'chpl v1: count u8 at +8, entries u64 start (100 ns) + u8 len + title'
+  type: string
+  meaning: chapter starts in 100 ns units (divide by 1e7 for seconds) and titles
+  example: 00:00:00.000 Opening
+  location: front_or_tail
+  location_note: Atlas reads MKV chapters only
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: source
+  source: raw/w5c.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.udta.xyz_location
+  path: moov/udta/xyz (ISO 6709 location)
+  raw: udta 4cc xyz payload string
+  type: string
+  meaning: GPS location written by phone or camera; ISO 6709 string
+  example: +37.7749-122.4194/
+  location: front_or_tail
+  location_note: ''
+  linking: [none]
+  privacy: true
+  atlas: 'no'
+  verified: tested
+  source: raw/w4b.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.meta.keys_mdta
+  path: moov/meta/keys (mdta key names)
+  raw: meta/keys entry list, 1-based index
+  type: string
+  meaning: QuickTime keys such as com.apple.quicktime.make, model, software, creationdate, location.ISO6709, author
+  example: com.apple.quicktime.software
+  location: front_or_tail
+  location_note: key order is a muxer signature
+  linking: [tool]
+  privacy: true
+  atlas: 'no'
+  verified: memory
+  source: raw/w4b.md
+  cost: tail
+- id: mp4.ilst.nam
+  path: meta/ilst/©nam
+  raw: ilst child ©nam, data atom
+  type: string
+  meaning: title
+  example: Test Film
+  location: front_or_tail
+  location_note: ''
+  linking: [alt]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w1b.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.ilst.art_aart
+  path: meta/ilst/©ART and aART
+  raw: ilst ©ART, aART data atoms
+  type: string
+  meaning: artist and album artist names
+  example: Director Name
+  location: front_or_tail
+  location_note: ''
+  linking: [alt]
+  privacy: false
+  atlas: 'no'
+  verified: source
+  source: raw/w4b.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.ilst.alb_day
+  path: meta/ilst/©alb and ©day
+  raw: ilst ©alb, ©day data atoms
+  type: string
+  meaning: album and release date YYYY or YYYY-MM-DD (can be partial)
+  example: '2001'
+  location: front_or_tail
+  location_note: ''
+  linking: [alt]
+  privacy: false
+  atlas: 'no'
+  verified: source
+  source: raw/w4b.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.ilst.gen_gnre
+  path: meta/ilst/©gen or gnre
+  raw: ilst ©gen text or gnre numeric
+  type: string
+  meaning: genre; gnre is ID3 numeric index, only one of ©gen or gnre should appear
+  example: Drama
+  location: front_or_tail
+  location_note: ''
+  linking: [none]
+  privacy: false
+  atlas: 'no'
+  verified: source
+  source: raw/w4b.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.ilst.cmt_desc_ldes
+  path: meta/ilst/©cmt, desc, ldes
+  raw: ilst text atoms
+  type: string
+  meaning: comment, short description, long description; free text can name the uploader
+  example: ripped by ...
+  location: front_or_tail
+  location_note: ''
+  linking: [uploader]
+  privacy: true
+  atlas: 'no'
+  verified: source
+  source: raw/w4b.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.ilst.wrt_cprt
+  path: meta/ilst/©wrt and cprt
+  raw: ilst ©wrt, cprt data atoms
+  type: string
+  meaning: composer or writer; copyright notice
+  example: (c) 2001 Studio
+  location: front_or_tail
+  location_note: ''
+  linking: [none]
+  privacy: false
+  atlas: 'no'
+  verified: source
+  source: raw/w4b.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.ilst.too
+  path: meta/ilst/©too
+  raw: ilst ©too data atom
+  type: string
+  meaning: 'encoding tool: HandBrake x.y, Lavf60.16.100, x265, GPAC; strong tool fingerprint'
+  example: Lavf60.16.100
+  location: front_or_tail
+  location_note: ''
+  linking: [tool, twin]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w2b.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.ilst.tvsh_tvsn_tves
+  path: meta/ilst/tvsh, tvsn, tves, tven
+  raw: ilst text and int32 atoms
+  type: string
+  meaning: 'TV show name, season, episode, episode id: series key'
+  example: Show / 1 / 4
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film, alt]
+  privacy: false
+  atlas: 'no'
+  verified: source
+  source: raw/w4b.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.ilst.stik
+  path: meta/ilst/stik
+  raw: ilst stik data uint8
+  type: uint
+  meaning: 'media kind: 0 or 9 movie, 1 normal music, 2 audiobook, 6 music video, 10 TV show, 11 booklet, 14 ringtone'
+  example: '9'
+  location: front_or_tail
+  location_note: ''
+  linking: [none]
+  privacy: false
+  atlas: 'no'
+  verified: source
+  source: raw/w4b.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.ilst.hdvd
+  path: meta/ilst/hdvd
+  raw: ilst hdvd data uint8
+  type: bool
+  meaning: HD video flag written by iTunes-style tools
+  example: '1'
+  location: front_or_tail
+  location_note: ''
+  linking: [none]
+  privacy: false
+  atlas: 'no'
+  verified: source
+  source: raw/w4b.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.ilst.rtng
+  path: meta/ilst/rtng
+  raw: ilst rtng data uint8
+  type: uint
+  meaning: 'content rating: 0 none, 2 clean, 4 explicit'
+  example: '0'
+  location: front_or_tail
+  location_note: ''
+  linking: [none]
+  privacy: false
+  atlas: 'no'
+  verified: source
+  source: raw/w4b.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.ilst.covr
+  path: meta/ilst/covr
+  raw: ilst covr data atom, type 13 JPEG or 14 PNG
+  type: binary
+  meaning: cover art bytes; identical covers across releases are a weak twin signal
+  example: JPEG 600x900
+  location: front_or_tail
+  location_note: may be several MB; keep out of hash
+  linking: [twin]
+  privacy: false
+  atlas: 'no'
+  verified: source
+  source: raw/w4b.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.ilst.cnID
+  path: meta/ilst/cnID
+  raw: ilst cnID data int32
+  type: uint
+  meaning: iTunes catalog ID; same title across SD and HD encodes; strongest same_film key for store files
+  example: '123456789'
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: source
+  source: raw/w4b.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.ilst.sfID
+  path: meta/ilst/sfID
+  raw: ilst sfID data int32
+  type: uint
+  meaning: iTunes storefront country code (143441 US, 143444 GB); narrows the buyer
+  example: '143441'
+  location: front_or_tail
+  location_note: ''
+  linking: [uploader]
+  privacy: true
+  atlas: 'no'
+  verified: source
+  source: raw/w4b.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.ilst.akID
+  path: meta/ilst/akID
+  raw: ilst akID data int8
+  type: uint
+  meaning: 'account type: 0 iTunes, 1 AOL'
+  example: '0'
+  location: front_or_tail
+  location_note: low sensitivity
+  linking: [none]
+  privacy: false
+  atlas: 'no'
+  verified: source
+  source: raw/w4b.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.ilst.atID_plID_geID
+  path: meta/ilst/atID, plID, geID
+  raw: ilst int32 or int64 atoms
+  type: uint
+  meaning: artist, playlist and genre store IDs; plID and atID unclear, treat as private until checked
+  example: '0'
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: true
+  atlas: 'no'
+  verified: source
+  source: raw/w4b.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.ilst.cmID_egid_xid
+  path: meta/ilst/cmID, egid, xid
+  raw: ilst int or string atoms
+  type: string
+  meaning: 'content match ID, episode global ID, vendor content ID: cross-store keys'
+  example: xid vendor string
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w4b.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.ilst.apID
+  path: meta/ilst/apID
+  raw: ilst apID text
+  type: string
+  meaning: 'purchasing Apple ID (account email); buyer identity: store hashed or drop, never display'
+  example: name@example.com
+  location: front_or_tail
+  location_note: ''
+  linking: [uploader]
+  privacy: true
+  atlas: 'no'
+  verified: source
+  source: raw/w4b.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.ilst.purd
+  path: meta/ilst/purd
+  raw: ilst purd text
+  type: string
+  meaning: purchase date string; with apID identifies one buy event
+  example: '2024-01-02T03:04:05Z'
+  location: front_or_tail
+  location_note: ''
+  linking: [uploader]
+  privacy: true
+  atlas: 'no'
+  verified: source
+  source: raw/w4b.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.ilst.ownr
+  path: meta/ilst/ownr
+  raw: ilst ownr text
+  type: string
+  meaning: owner name of purchased copy
+  example: name
+  location: front_or_tail
+  location_note: ''
+  linking: [uploader]
+  privacy: true
+  atlas: 'no'
+  verified: tested
+  source: raw/w4b.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.ilst.trkn_disk
+  path: meta/ilst/trkn, disk
+  raw: ilst trkn / disk pair data
+  type: string
+  meaning: track and disc numbers within a set
+  example: 3/12
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w4b.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.ilst.freeform_iTunEXTC
+  path: meta/ilst/----:com.apple.iTunes:iTunEXTC
+  raw: 'freeform: mean, name, data type 1 UTF-8'
+  type: string
+  meaning: content advisory string mpaa|R|400| (system, rating, points)
+  example: mpaa|R|400|
+  location: front_or_tail
+  location_note: ''
+  linking: [none]
+  privacy: false
+  atlas: 'no'
+  verified: memory
+  source: raw/w5c.md
+  cost: tail
+- id: mp4.ilst.freeform_iTunMOVI
+  path: meta/ilst/----:com.apple.iTunes:iTunMOVI
+  raw: freeform, data type 1 or XML plist
+  type: string
+  meaning: XML plist with cast, directors, producers, screenwriters, studio; same film across encodes
+  example: cast array of name
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: memory
+  source: raw/w5c.md
+  cost: tail
+- id: mp4.ilst.freeform_iTunSMPB
+  path: meta/ilst/----:com.apple.iTunes:iTunSMPB
+  raw: 'freeform text: hex fields'
+  type: string
+  meaning: AAC priming samples, padding and original sample count (2112 typical from Apple encoder)
+  example: 00000000 00000840 000000B0 ...
+  location: front_or_tail
+  location_note: ''
+  linking: [tool]
+  privacy: false
+  atlas: 'no'
+  verified: memory
+  source: raw/w5c.md
+  cost: tail
+- id: mp4.ilst.freeform_ISRC
+  path: meta/ilst/----:com.apple.iTunes:ISRC
+  raw: freeform text
+  type: string
+  meaning: recording code; same_film key for music tracks
+  example: USSM10012345
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: memory
+  source: raw/w5c.md
+  cost: tail
+- id: mp4.ilst.data_type
+  path: meta/ilst/*/data atom type code
+  raw: 'data atom flags u24: 1 UTF-8, 13 JPEG, 14 PNG, 21 integer, 17 datetime'
+  type: uint
+  meaning: how to decode the value; mutagen type table
+  example: '1'
+  location: front_or_tail
+  location_note: ''
+  linking: [none]
+  privacy: false
+  atlas: 'no'
+  verified: memory
+  source: raw/w5c.md
+  cost: tail
+- id: mp4.uuid.xmp
+  path: uuid be7acfcb-97a9-42e8-9c71-999491e3afac (XMP)
+  raw: uuid box, 16-byte type, XML payload
+  type: string
+  meaning: XMP packet from editors and cameras; may hold author, GPS, tool history
+  example: x:xmpmeta ...
+  location: front_or_tail
+  location_note: scan for privacy fields before publishing
+  linking: [tool]
+  privacy: true
+  atlas: 'no'
+  verified: memory
+  source: raw/w4b.md
+  cost: tail
+- id: mp4.uuid.xmp_document_id
+  path: XMP xmpMM:DocumentID
+  raw: XMP packet element
+  type: string
+  meaning: export lineage ID from Premiere-style tools; equal IDs mean one export chain
+  example: xmp.did:...
+  location: front_or_tail
+  location_note: ''
+  linking: [twin]
+  privacy: false
+  atlas: 'no'
+  verified: memory
+  source: raw/w4b.md
+  cost: tail
+- id: mp4.uuid.xmp_creator_tool
+  path: XMP xmp:CreatorTool
+  raw: XMP packet element
+  type: string
+  meaning: authoring application name and version
+  example: Adobe Premiere Pro 2026
+  location: front_or_tail
+  location_note: ''
+  linking: [tool]
+  privacy: false
+  atlas: 'no'
+  verified: memory
+  source: raw/w4b.md
+  cost: tail
+- id: mp4.mvex.present
+  path: moov/mvex
+  raw: moov child mvex
+  type: bool
+  meaning: file is fragmented; samples live in moof, moov sample tables are empty
+  example: 'true'
+  location: front_or_tail
+  location_note: ''
+  linking: [none]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w2b.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.mehd.fragment_duration
+  path: moov/mvex/mehd fragment_duration
+  raw: mehd +4 (v0 u32 / v1 u64)
+  type: uint
+  meaning: total duration in movie timescale when mvhd duration is 0
+  example: '2080'
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: memory
+  source: raw/w5c.md
+  cost: tail
+- id: mp4.trex.defaults
+  path: moov/mvex/trex defaults
+  raw: 'trex per track: default duration, size, flags'
+  type: string
+  meaning: defaults for trun samples that omit fields
+  example: dur 1001 size 0
+  location: front_or_tail
+  location_note: ''
+  linking: [none]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w5c.md; corpus:a_aac.m4a,c_mp4_faststart.mp4,c_mp4_nofaststart.mp4
+  cost: tail
+- id: mp4.moof.mfhd_sequence
+  path: moof/mfhd sequence_number
+  raw: mfhd +4 u32
+  type: uint
+  meaning: fragment sequence; gaps reveal missing fragments in a partial download
+  example: '1'
+  location: targeted_fetch
+  location_note: per fragment, not in moov
+  linking: [none]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w2b.md; corpus:w10_frag_dualaudio.mp4,w10_frag_hevc.mp4
+  cost: targeted
+- id: mp4.tfhd.flags
+  path: moof/traf/tfhd flags
+  raw: tfhd +1 flags 24 bits
+  type: uint
+  meaning: which defaults and base_data_offset are present in this fragment
+  example: '0x020038'
+  location: targeted_fetch
+  location_note: ''
+  linking: [none]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w2b.md; corpus:w10_frag_dualaudio.mp4,w10_frag_hevc.mp4
+  cost: targeted
+- id: mp4.tfdt.base_media_decode_time
+  path: moof/traf/tfdt baseMediaDecodeTime
+  raw: tfdt +4 (v0 u32 / v1 u64)
+  type: uint
+  meaning: decode time of the first sample in the fragment; continuity check for VFR and gaps
+  example: '90000'
+  location: targeted_fetch
+  location_note: ''
+  linking: [none]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w2b.md; corpus:w10_frag_dualaudio.mp4,w10_frag_hevc.mp4
+  cost: targeted
+- id: mp4.trun.sample_count
+  path: moof/traf/trun sample_count
+  raw: trun +4 u32
+  type: uint
+  meaning: samples in this fragment; summing gives exact frame count with no payload read
+  example: '48'
+  location: targeted_fetch
+  location_note: walk moof headers and skip mdat by size
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: source
+  source: raw/w5c.md; corpus:w10_frag_dualaudio.mp4,w10_frag_hevc.mp4
+  cost: targeted
+- id: mp4.trun.sample_durations_sizes
+  path: moof/traf/trun per-sample duration and size
+  raw: trun flags 0x100 duration, 0x200 size
+  type: string
+  meaning: per-sample durations (VFR detection) and byte sizes (bitrate per fragment)
+  example: duration present, size present
+  location: targeted_fetch
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: source
+  source: raw/w5c.md; corpus:w10_frag_dualaudio.mp4,w10_frag_hevc.mp4
+  cost: targeted
+- id: mp4.trun.data_offset
+  path: moof/traf/trun data_offset
+  raw: trun flags 0x001, i32 after sample_count
+  type: int
+  meaning: offset of sample data relative to moof base; locates mdat payload
+  example: '-1234'
+  location: targeted_fetch
+  location_note: ''
+  linking: [none]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w2b.md; corpus:w10_frag_dualaudio.mp4,w10_frag_hevc.mp4
+  cost: targeted
+- id: mp4.sidx.references
+  path: sidx references (subsegment duration, referenced_size)
+  raw: sidx reference_count then 12-byte entries
+  type: string
+  meaning: per-segment duration and byte size; gives duration without walking moof
+  example: 12 refs of 2.0 s
+  location: front_or_tail
+  location_note: usually after moov, before first moof
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: memory
+  source: raw/w5c.md
+  cost: first_article
+- id: mp4.sidx.timescale
+  path: sidx timescale and earliest_presentation_time
+  raw: sidx +12 u32 timescale, earliest_presentation_time
+  type: uint
+  meaning: ticks for sidx durations
+  example: '90000'
+  location: front_or_tail
+  location_note: ''
+  linking: [none]
+  privacy: false
+  atlas: 'no'
+  verified: memory
+  source: raw/w5c.md
+  cost: first_article
+- id: mp4.tfra.entries
+  path: mfra/tfra random access entries
+  raw: 'tfra per track: time, moof_offset, traf and trun numbers'
+  type: string
+  meaning: sync sample index for fragmented files (time and offset of each keyframe)
+  example: 1 entry per GOP
+  location: tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w5c.md; corpus:w10_frag_dualaudio.mp4,w10_frag_hevc.mp4
+  cost: tail
+- id: mp4.emsg.scheme_id
+  path: emsg scheme_id_uri, value
+  raw: emsg top-level or inside moof, version 0/1 layout
+  type: string
+  meaning: 'in-band event message: DASH events, SCTE-35 ad markers, ID3; scheme tells the kind'
+  example: urn:scte:scte35:2013:bin
+  location: targeted_fetch
+  location_note: ''
+  linking: [tool]
+  privacy: false
+  atlas: 'no'
+  verified: memory
+  source: raw/w2b.md
+  cost: targeted
+- id: mp4.pssh.system_id
+  path: moov/pssh system ID
+  raw: pssh full box, 16-byte SystemID
+  type: string
+  meaning: 'DRM system: edef8ba9 Widevine, 9a04f079 PlayReady, 94ce86fb FairPlay (memory)'
+  example: edef8ba9-79d6-4ace-a3c8-27dcd51d21ed
+  location: front_or_tail
+  location_note: 'DRM leftover: a protected file from a streaming service'
+  linking: [none]
+  privacy: false
+  atlas: 'no'
+  verified: memory
+  source: raw/w2b.md
+  cost: tail
+- id: mp4.pssh.kids
+  path: moov/pssh key ID list
+  raw: pssh v1 KID count and 16-byte KIDs
+  type: string
+  meaning: key IDs the DRM covers; same KID across releases = same encryption source
+  example: 1 KID
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: memory
+  source: raw/w2b.md
+  cost: tail
+- id: mp4.tenc.default_kid
+  path: moov/trak/mdia/minf/stbl/stsd/sinf/schi/tenc default_KID
+  raw: tenc +8 16 bytes (v0 +8, v1 same)
+  type: string
+  meaning: track default key ID; sinf present means the track is encrypted
+  example: 2d7f...
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: memory
+  source: raw/w2b.md
+  cost: tail
+- id: mp4.sinf.frma_original_format
+  path: stsd/sinf/frma data_format
+  raw: frma payload fourcc
+  type: fourcc
+  meaning: original codec before encryption (avc1, mp4a); reveals the real codec under DRM
+  example: avc1
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: memory
+  source: raw/w2b.md
+  cost: tail
+- id: mp4.schm.scheme_type
+  path: stsd/sinf/schm scheme_type
+  raw: 'schm payload fourcc: cenc or cbcs'
+  type: fourcc
+  meaning: 'CENC scheme: cenc = AES-CTR full, cbcs = AES-CBC pattern'
+  example: cbcs
+  location: front_or_tail
+  location_note: ''
+  linking: [none]
+  privacy: false
+  atlas: 'no'
+  verified: memory
+  source: raw/w2b.md
+  cost: tail
+derived:
+- id: derived.mp4.duration_precedence
+  path: derived from mvhd duration/timescale, tkhd, mdhd, mehd, sidx, moof walk
+  raw: n/a
+  type: float
+  meaning: 'order: mvhd duration if non-zero and not all-ones; else mehd fragment_duration; else sum of sidx durations; else sum of trun durations; else max mdhd duration; playable length subtracts leading empty elst edits'
+  example: '5432.117'
+  location: front_or_tail
+  location_note: moov-at-end needs tail fetch
+  linking: [same_film]
+  privacy: false
+  atlas: partial
+  verified: source
+  source: raw/w5c.md
+  cost: tail
+- id: derived.mp4.frame_count
+  path: derived from stsz sample_count, else sum of trun sample_count
+  raw: n/a
+  type: uint
+  meaning: exact video frame count; for tx3g subtract filler samples (zero size) to get events
+  example: '63432'
+  location: front_or_tail
+  location_note: 'fragmented: walk moof headers'
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: source
+  source: raw/w5c.md
+  cost: tail
+- id: derived.mp4.fps_cfr_vfr
+  path: derived from stts deltas and mdhd timescale
+  raw: n/a
+  type: string
+  meaning: 'CFR when one distinct delta: fps = timescale / delta; VFR when several; average fps = frame_count * timescale / duration_ticks'
+  example: CFR 23.976
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: source
+  source: raw/w5c.md
+  cost: tail
+- id: derived.mp4.avg_bitrate_per_track
+  path: 'derived: sum(stsz) * 8 / (mdhd.duration / mdhd.timescale), fallback btrt avgBitrate or esds avgBitrate'
+  raw: n/a
+  type: uint
+  meaning: per-track average bits per second; prefer elst-trimmed duration for playable bitrate
+  example: '8421000'
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: source
+  source: raw/w5c.md
+  cost: tail
+- id: derived.mp4.max_bitrate_window
+  path: 'derived: max over 1 s windows of stsz bytes via stts timing, else btrt maxBitrate'
+  raw: n/a
+  type: uint
+  meaning: peak video bitrate estimate (window size stated)
+  example: '25300000'
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: memory
+  source: raw/w5c.md
+  cost: tail
+- id: derived.mp4.gop_keyint
+  path: derived from stss gaps converted with stts DTS
+  raw: n/a
+  type: string
+  meaning: 'keyframe interval in frames and seconds: min, median, max; absent stss = every frame is sync (intra-only)'
+  example: GOP 48 frames (2.0 s)
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: source
+  source: raw/w5c.md
+  cost: tail
+- id: derived.mp4.bframe_depth
+  path: derived from ctts offsets or cslg greatest minus least delta
+  raw: n/a
+  type: uint
+  meaning: B-frame reorder depth; 0 = no reordering
+  example: '2'
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: memory
+  source: raw/w5c.md
+  cost: tail
+- id: derived.mp4.aac_priming_offset
+  path: derived from elst first non-empty media_time, iTunSMPB, or dOps pre_skip
+  raw: n/a
+  type: uint
+  meaning: encoder delay in samples to trim; 1024 or 2112 typical for AAC, 312 for Opus
+  example: '2112'
+  location: front_or_tail
+  location_note: ''
+  linking: [tool]
+  privacy: false
+  atlas: 'no'
+  verified: source
+  source: raw/w5c.md
+  cost: tail
+- id: derived.mp4.chapter_list
+  path: derived from udta/chpl (100 ns), else tref chap text track samples
+  raw: n/a
+  type: string
+  meaning: chapter list with start times in seconds and titles; chpl preferred
+  example: 0.0 Opening; 600.0 Act two
+  location: front_or_tail
+  location_note: chpl lives in moov/udta
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: source
+  source: raw/w5c.md
+  cost: tail
+- id: derived.mp4.hdr_label
+  path: derived from colr nclx transfer, mdcv, clli, dvcC, hvcC SEI 137/144, avcC/av1C/vpcC
+  raw: n/a
+  type: string
+  meaning: 'same precedence as MKV: DV record first; then HDR10+ SEI; HDR10 if PQ with mdcv or clli or SEI 137/144; PQ without static metadata; HLG (18); SDR (1)'
+  example: HDR10 (mdcv + clli)
+  location: front_or_tail
+  location_note: Atlas reads no colr today, so hdr is null on MP4 (w7a)
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w6c.md
+  cost: tail
+- id: derived.mp4.dv_summary
+  path: derived from dvcC/dvvC/dvwC record
+  raw: n/a
+  type: string
+  meaning: DV profile, level, EL and BL presence, compat id as one string; dvh1 or dvhe without box = DV unknown, not DV absent
+  example: DV 8.1 level 6, HDR10 compatible, no EL
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: partial
+  verified: tested
+  source: raw/w7a.md
+  cost: tail
+- id: derived.mp4.bit_depth
+  path: derived from hvcC bytes 17/18, avcC ext, av1C byte 2, vpcC byte 6
+  raw: n/a
+  type: uint
+  meaning: bit depth from codec config records; the stsd depth field is not bit depth
+  example: '10'
+  location: front_or_tail
+  location_note: fixes Atlas bit_depth None on MP4
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w6c.md
+  cost: tail
+- id: derived.mp4.sample_rate_true
+  path: derived from dfLa STREAMINFO, dOps input rate, esds SBR extension, v1/v2 sound entry
+  raw: n/a
+  type: uint
+  meaning: true output sample rate; 16-bit stsd field is wrong above 65535 Hz
+  example: '96000'
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: 'no'
+  verified: spec
+  source: raw/w1b.md
+  cost: tail
+- id: derived.mp4.audio_channel_layout
+  path: derived from dac3 acmod/lfeon, dec3 JOC and substreams, ddts ChannelLayout, chnl, dmlp CA1/CA2
+  raw: n/a
+  type: string
+  meaning: speaker layout and Atmos flag from the codec box, not from the stsd channelcount
+  example: 5.1 (dec3 JOC)
+  location: front_or_tail
+  location_note: ''
+  linking: [same_film]
+  privacy: false
+  atlas: partial
+  verified: source
+  source: raw/w5c.md
+  cost: tail
+- id: derived.mp4.faststart
+  path: derived from top-level box order (moov before mdat)
+  raw: n/a
+  type: bool
+  meaning: true = metadata in the first article; false = needs tail fetch from the mdat end
+  example: 'true'
+  location: front
+  location_note: decides the fetch plan
+  linking: [tool]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w2b.md
+  cost: first_article
+- id: derived.mp4.tail_fetch_plan
+  path: 'derived: moov_off = mdat_off + mdat_size (skip free/skip/wide); read moov size, fetch until satisfied; map offset to RAR volume and yEnc part'
+  raw: n/a
+  type: string
+  meaning: 'how to reach moov when it is at the end: header math, then article range; size 0 mdat = no moov'
+  example: moov at 1.2 GB, 96 KB, 2 articles
+  location: tail
+  location_note: ''
+  linking: [none]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w2b.md
+  cost: tail
+- id: derived.mp4.alt_key
+  path: 'derived: sha256(codec config records) + first video sample payload + first 8 video + first 16 audio payloads'
+  raw: n/a
+  type: binary
+  meaning: 'remux-stable key: all remux variants kept payloads byte-identical; avcC equals MKV CodecPrivate; needs stco/stsz to find payloads'
+  example: sha256:91ab...
+  location: tail
+  location_note: about 200 KB at 1080p; needs moov then targeted payload reads
+  linking: [alt]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w6c.md
+  cost: targeted
+- id: derived.mp4.muxer_fingerprint
+  path: 'derived: ftyp major+compat, hdlr names, ©too, compressorname, mvhd timescale, meta key order'
+  raw: n/a
+  type: string
+  meaning: muxer signature for matching releases from the same tool chain
+  example: isom + VideoHandler + Lavf60 + 1000
+  location: front_or_tail
+  location_note: ''
+  linking: [tool]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w2b.md
+  cost: tail
+- id: derived.mp4.creation_time_state
+  path: derived from mvhd creation_time == 0
+  raw: n/a
+  type: string
+  meaning: unset (muxer default, 0) vs set (value present); a set value is user or tool metadata
+  example: unset
+  location: front_or_tail
+  location_note: ''
+  linking: [twin]
+  privacy: false
+  atlas: 'no'
+  verified: tested
+  source: raw/w2b.md
+  cost: tail
+- id: derived.mp4.encrypted_flag
+  path: 'derived: sinf present in any stsd entry, or pssh in moov'
+  raw: n/a
+  type: bool
+  meaning: DRM-protected copy (streaming rip or leftover); sinf/frma gives the original codec
+  example: 'true'
+  location: front_or_tail
+  location_note: ''
+  linking: [none]
+  privacy: false
+  atlas: 'no'
+  verified: spec
+  source: raw/w2b.md
+  cost: tail

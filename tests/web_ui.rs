@@ -38,7 +38,7 @@ fn send(port: u16, request: &str) -> Reply {
     stream.write_all(request.as_bytes()).unwrap();
     let mut raw = Vec::new();
     stream.read_to_end(&mut raw).unwrap();
-    let raw = String::from_utf8(raw).unwrap();
+    let raw = String::from_utf8_lossy(&raw).into_owned();
     let (head, body) = raw.split_once("\r\n\r\n").unwrap();
     Reply { head: head.into(), body: body.into() }
 }
@@ -165,8 +165,62 @@ fn the_web_ui_end_to_end() {
         "{}",
         release.body
     );
+    assert!(release.body.contains("Files in the NZB") && release.body.contains("x.bin"), "{}", release.body);
+    assert!(!release.body.contains("Cover art"), "none kept yet: {}", release.body);
+    let info = r#"{"health":{},"headers":{},"crossposted_to":[],"imdb_ids":[],"sfv":{},"media":{"container":"matroska","attachments":[{"name":"cover.jpg","mime":"image/jpeg","size":4}],
+        "video":[{"codec":"V_MPEGH/ISO/HEVC","width":1440,"height":1080,"display_width":1920,"display_height":1080,"primaries":9,"dv_profile":8,"dv_level":6}]}}"#;
+    shard.execute("insert into release_probe (release_id, info) values (?, ?)", rusqlite::params![id, info]).unwrap();
+    let jpeg = [0xff_u8, 0xd8, 0xff, 0xd9];
+    let sha256 = atlas::probe::keep_cover(&jpeg).unwrap();
+    assert!(home.path().join("covers").join(&sha256).exists());
+    shard
+        .execute(
+            "insert into release_cover (release_id, mime, sha256) values (?, 'image/jpeg', ?)",
+            rusqlite::params![id, sha256],
+        )
+        .unwrap();
+    let release = fetch(port, &format!("/ui/release?id={id}"), &cookie);
+    for wanted in [
+        "Cover art",
+        &format!("/ui/cover?id={id}"),
+        "Attachments",
+        "cover.jpg",
+        "shown at 1.78:1",
+        "BT.2020",
+        "profile 8 level 6",
+    ] {
+        assert!(release.body.contains(wanted), "{wanted}: {}", release.body);
+    }
+    let cover = fetch(port, &format!("/ui/cover?id={id}"), &cookie);
+    assert_eq!((cover.status(), cover.header("Content-Type").as_deref()), (200, Some("image/jpeg")));
+    assert_eq!(fetch(port, &format!("/ui/cover?id={id}"), "").status(), 401);
+    assert_eq!(fetch(port, "/ui/cover?id=999999999", &cookie).status(), 404);
     assert_eq!(fetch(port, "/ui/release?id=999999999", &cookie).status(), 404);
     assert_eq!(fetch(port, &format!("/ui/release?id={id}"), "").status(), 303);
+
+    // every catalog fact: the panels, their lazy fold-outs, and the drawer under a result row
+    assert!(
+        release.body.contains("<h2>Keys</h2>") && release.body.contains("hx-get=\"/ui/meta?id="),
+        "{}",
+        release.body
+    );
+    let parts = fetch(port, &format!("/ui/meta?id={id}&part=parts"), &cookie);
+    assert_eq!(parts.status(), 200);
+    assert!(parts.body.contains("<table") && parts.body.contains("x.bin"), "{}", parts.body);
+    assert_eq!(fetch(port, &format!("/ui/meta?id={id}&part=nope"), &cookie).status(), 400);
+    // the fragments go through the same filtered reader as the page: no release, no fragment
+    assert_eq!(fetch(port, "/ui/meta?id=999999999&part=parts", &cookie).status(), 404);
+    let drawer = fetch(port, &format!("/ui/row?id={id}"), &cookie);
+    assert_eq!(drawer.status(), 200);
+    assert!(
+        drawer.body.starts_with("<tr class=\"drawer-row\">") && drawer.body.contains("Full page"),
+        "{}",
+        drawer.body
+    );
+    let locked = fetch(port, &format!("/ui/row?id={id}"), "");
+    assert_eq!(locked.status(), 401);
+    assert_eq!(locked.header("HX-Redirect").as_deref(), Some("/"));
+    assert!(found.body.contains("drawer-toggle"), "{}", found.body);
 
     // one post spread over two groups: one row, whole, and an NZB with all of it
     let posted = |name: &str, group: &str, one: Article, date: &str| {
@@ -365,9 +419,23 @@ fn the_web_ui_end_to_end() {
     assert!(twins.body.contains("Twins 1") && twins.body.contains("Tv.Findword"), "{}", twins.body);
     assert!(twins.body.contains("/ui/release?id=") && twins.body.contains("TWIN"), "{}", twins.body);
     assert!(!twins.body.contains("<script>alert"), "{}", twins.body);
+    // every copy card has the + that opens its facts in place, as a card rather than a table row
+    assert_eq!(twins.body.matches("drawer-toggle").count(), 2, "{}", twins.body);
+    assert!(twins.body.contains(&format!("hx-get=\"/ui/row?id={id}&amp;as=card\"")), "{}", twins.body);
+    let card = fetch(port, &format!("/ui/row?id={id}&as=card"), &cookie);
+    assert_eq!(card.status(), 200);
+    assert!(card.body.starts_with("<div class=\"drawer-card\">") && card.body.ends_with("</div>"), "{}", card.body);
+    assert!(card.body.contains("<dl class=\"facts facts-wide\">") && card.body.contains("Full page"), "{}", card.body);
+    // the drawer reads through the same filtered reader as the page: an unknown id gets no facts, in either shape
+    for shape in ["", "&as=card"] {
+        let none = fetch(port, &format!("/ui/row?id=999999999{shape}"), &cookie);
+        assert_eq!(none.status(), 200);
+        assert!(none.body.contains("There is no such release.") && !none.body.contains("<dl"), "{}", none.body);
+    }
     assert!(fetch(port, "/ui/duplicates?kind=alts", &cookie).body.contains("no alts found yet"));
     let opened = fetch(port, &format!("/ui/release?id={script}"), &cookie);
     assert!(opened.body.contains("Other copies") && opened.body.contains("Tv.Findword"), "{}", opened.body);
+    assert!(opened.body.contains(&format!("hx-get=\"/ui/row?id={id}&amp;as=card\"")), "{}", opened.body);
 
     let nzb = fetch(port, &format!("/ui/nzb?id={id}"), &cookie);
     assert_eq!(nzb.status(), 200);

@@ -23,7 +23,8 @@ fn fetch(port: u16, path: &str, cookie: &str) -> String {
     stream.write_all(request.as_bytes()).unwrap();
     let mut raw = Vec::new();
     stream.read_to_end(&mut raw).unwrap();
-    String::from_utf8(raw).unwrap()
+    // the body comes chunked, and a chunk can end inside a character
+    String::from_utf8_lossy(&raw).into_owned()
 }
 
 fn login(port: u16) -> String {

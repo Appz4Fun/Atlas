@@ -10,6 +10,7 @@ use std::borrow::Cow;
 use serde::{Deserialize, Serialize};
 
 use super::archive::{self, ArchiveHead};
+use super::codec::{self, bcj::Filter};
 use super::lzma::{self, End, Props};
 
 /// Layers unwrapped at most. One more found past these is recorded and left shut.
@@ -78,7 +79,33 @@ enum Codec {
         size: Option<u64>,
     },
     Lzma2,
+    /// xz's LZMA2, then the filters in front of it, undone last first
+    Xz {
+        filters: [Option<Filter>; 3],
+    },
     Zstd,
+    Bzip2,
+    Deflate64,
+    Lzw,
+    Lz4,
+    Rar5 {
+        extra_dist: bool,
+        size: Option<u64>,
+        packed: Option<u64>,
+    },
+    /// RAR4's compressions by the version needed to unpack: 15, 20 and 26, or 29
+    Rar4 {
+        version: u8,
+        size: Option<u64>,
+        packed: Option<u64>,
+        /// the stream goes on in the next volume
+        continues: bool,
+    },
+    /// PPMd variant I, as zip has it (method 98)
+    PpmdZip {
+        size: Option<u64>,
+        packed: Option<u64>,
+    },
 }
 
 /// A layer found: what to record, and how to go on.
@@ -170,7 +197,44 @@ fn decode(codec: Codec, input: &[u8], limit: usize) -> (Vec<u8>, End) {
         Codec::Gzip => gunzip(input, limit),
         Codec::Lzma { props, size } => lzma::lzma(input, props, size, limit),
         Codec::Lzma2 => lzma::lzma2(input, limit),
+        Codec::Xz { filters } => {
+            let (mut out, end) = lzma::lzma2(input, limit);
+            let mut last = out.len();
+            for f in filters.iter().rev().flatten() {
+                let done = f.undo(&mut out[..last]);
+                // a branch cut by where decoding stopped can't be undone yet
+                if end != End::Done {
+                    last = done;
+                }
+            }
+            out.truncate(last);
+            (out, end)
+        }
         Codec::Zstd => unzstd(input, limit),
+        Codec::Bzip2 => codec::bzip2::bzip2(input, limit),
+        Codec::Deflate64 => codec::inflate::deflate64(input, limit),
+        Codec::Lzw => codec::lzw::uncompress(input, limit),
+        Codec::Lz4 => codec::lz4::lz4(input, limit),
+        Codec::Rar5 { extra_dist, size, packed } => {
+            let to = packed.and_then(|p| usize::try_from(p).ok()).map_or(input.len(), |p| p.min(input.len()));
+            codec::rar5::rar5(&input[..to], extra_dist, size, limit)
+        }
+        Codec::Rar4 { version, size, packed, continues } => {
+            let to = packed.and_then(|p| usize::try_from(p).ok()).map_or(input.len(), |p| p.min(input.len()));
+            // a volume's chunk is only the front of the stream
+            let complete = !continues && packed.is_some_and(|p| p <= input.len() as u64);
+            let decode = match version {
+                15 => codec::rar15::rar15,
+                20 | 26 => codec::rar20::rar20,
+                _ => codec::rar3::rar29,
+            };
+            decode(&input[..to], size, limit, complete)
+        }
+        Codec::PpmdZip { size, packed } => {
+            // the range coder reads ahead, so it must not read on into the next entry
+            let to = packed.and_then(|p| usize::try_from(p).ok()).map_or(input.len(), |p| p.min(input.len()));
+            codec::ppmd_i::zip(&input[..to], size, limit)
+        }
     }
 }
 
@@ -195,7 +259,8 @@ fn open(data: &[u8]) -> Option<Opened> {
         let props = Props { lc: 3, lp: 0, pb: 2 };
         return Some(Opened { layer: l, view: View::Decode { from: 6, codec: Codec::Lzma { props, size: None } } });
     }
-    if data.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) || zstd_skippable(data) {
+    // skippable frames are both zstd's and LZ4's: what follows them says which
+    if data.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) || (zstd_skippable(data) && !lz4_after_skippable(data)) {
         let mut l = layer("ZSTD");
         l.method = Some("zstd".into());
         return Some(Opened { layer: l, view: View::Decode { from: 0, codec: Codec::Zstd } });
@@ -206,21 +271,24 @@ fn open(data: &[u8]) -> Option<Opened> {
     if let Some(opened) = tar(data) {
         return Some(opened);
     }
-    let not_yet = |format: &str| Some(Opened { layer: layer(format), view: View::Stop("no decoder for this yet") });
-    if data.starts_with(b"BZh")
-        && data.get(3).is_some_and(|b| (b'1'..=b'9').contains(b))
-        && data.get(4..10) == Some(b"1AY&SY")
-    {
-        return not_yet("BZIP2");
+    let decode = |format: &str, method: &str, codec| {
+        let layer = Layer { format: format.into(), method: Some(method.into()), ..Layer::default() };
+        Some(Opened { layer, view: View::Decode { from: 0, codec } })
+    };
+    if data.starts_with(b"BZh") && data.get(3).is_some_and(|b| (b'1'..=b'9').contains(b)) {
+        return decode("BZIP2", "bzip2", Codec::Bzip2);
     }
     if data.starts_with(&[0x1f, 0x9d]) {
-        return not_yet("COMPRESS");
+        return decode("COMPRESS", "lzw", Codec::Lzw);
     }
-    if data.starts_with(&[0x04, 0x22, 0x4d, 0x18]) {
-        return not_yet("LZ4");
+    if data.starts_with(&[0x04, 0x22, 0x4d, 0x18])
+        || data.starts_with(&[0x02, 0x21, 0x4c, 0x18])
+        || lz4_after_skippable(data)
+    {
+        return decode("LZ4", "lz4", Codec::Lz4);
     }
     if data.starts_with(b"\x89LZO\0\r\n\x1a\n") {
-        return not_yet("LZOP");
+        return Some(Opened { layer: layer("LZOP"), view: View::Stop("no decoder for this yet") });
     }
     None
 }
@@ -264,7 +332,10 @@ fn from_entries(data: &[u8]) -> Opened {
         let to = end(head.packed);
         match method {
             "deflate" => View::Decode { from: at, codec: Codec::Deflate },
+            "deflate64" => View::Decode { from: at, codec: Codec::Deflate64 },
+            "bzip2" => View::Decode { from: at, codec: Codec::Bzip2 },
             "zstd" => View::Decode { from: at, codec: Codec::Zstd },
+            "ppmd" => View::Decode { from: at, codec: Codec::PpmdZip { size: head.unpacked, packed: head.packed } },
             "lzma" => match zip_lzma(&data[at..to]) {
                 Some((skip, props)) => {
                     View::Decode { from: at + skip, codec: Codec::Lzma { props, size: head.unpacked } }
@@ -275,6 +346,23 @@ fn from_entries(data: &[u8]) -> Opened {
             "xz" => View::Stored { from: at, to },
             _ => View::Stop("no decoder for this yet"),
         }
+    } else if head.split_before {
+        View::Stop("starts in the volume before")
+    } else if head.solid {
+        View::Stop("solid: needs the files before it")
+    } else if format == "RAR5" && head.rar_version <= 1 {
+        let codec = Codec::Rar5 { extra_dist: head.rar_version == 1, size: head.unpacked, packed: head.packed };
+        View::Decode { from: at, codec }
+    } else if format == "RAR5" {
+        View::Stop("a RAR algorithm newer than this knows")
+    } else if format == "RAR4" && matches!(head.rar_version, 15 | 20 | 26 | 29 | 36) {
+        let codec = Codec::Rar4 {
+            version: head.rar_version,
+            size: head.unpacked,
+            packed: head.packed,
+            continues: head.continues,
+        };
+        View::Decode { from: at, codec }
     } else {
         View::Stop("no decoder for this yet")
     };
@@ -341,6 +429,22 @@ fn seven_z(data: &[u8]) -> Opened {
 /// A zstd skippable frame, which a stream can open with before its real one.
 fn zstd_skippable(data: &[u8]) -> bool {
     data.get(1..4) == Some(&[0x2a, 0x4d, 0x18][..]) && data[0] & 0xf0 == 0x50
+}
+
+/// Whether the first frame after a run of skippable frames is an LZ4 one.
+fn lz4_after_skippable(data: &[u8]) -> bool {
+    let mut p = 0usize;
+    for _ in 0..64 {
+        let Some(rest) = data.get(p..) else { return false };
+        if !zstd_skippable(rest) {
+            return rest.starts_with(&[0x04, 0x22, 0x4d, 0x18]) || rest.starts_with(&[0x02, 0x21, 0x4c, 0x18]);
+        }
+        let Some(size) = rest.get(4..8).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize) else {
+            return false;
+        };
+        p = p.saturating_add(8).saturating_add(size);
+    }
+    false
 }
 
 /// Whether `data` starts the way something [`open`] reads does, without opening it.
@@ -430,7 +534,7 @@ fn gunzip(input: &[u8], limit: usize) -> (Vec<u8>, End) {
     }
 }
 
-/// xz: its first block, when its one filter is LZMA2.
+/// xz: its first block, LZMA2 with up to three filters in front.
 fn xz(data: &[u8]) -> Opened {
     let mut layer = Layer { format: "XZ".into(), ..Layer::default() };
     let stop = |layer: Layer, why| Opened { layer, view: View::Stop(why) };
@@ -461,22 +565,40 @@ fn xz(data: &[u8]) -> Opened {
         layer.unpacked = vli(&mut p);
     }
     let mut ids = Vec::new();
+    let mut props = Vec::new();
     for _ in 0..=(flags & 3) {
         let (Some(id), Some(len)) = (vli(&mut p), vli(&mut p)) else { return stop(layer, "damaged") };
-        p += usize::try_from(len).unwrap_or(usize::MAX / 2);
+        let to = usize::try_from(len).ok().and_then(|l| p.checked_add(l));
+        let Some(prop) = to.and_then(|to| header.get(p..to)) else { return stop(layer, "damaged") };
+        p += prop.len();
         ids.push(id);
+        props.push(prop);
     }
     let name = |id: u64| match id {
         0x21 => "lzma2".to_string(),
         0x03 => "delta".to_string(),
-        0x04..=0x0b => "bcj".to_string(),
+        0x04 => "x86".to_string(),
+        0x05 => "powerpc".to_string(),
+        0x06 => "ia64".to_string(),
+        0x07 => "arm".to_string(),
+        0x08 => "armthumb".to_string(),
+        0x09 => "sparc".to_string(),
+        0x0a => "arm64".to_string(),
+        0x0b => "riscv".to_string(),
         _ => format!("filter {id:#x}"),
     };
     layer.method = Some(ids.iter().map(|id| name(*id)).collect::<Vec<_>>().join("+"));
-    if ids != [0x21] {
+    // up to three filters, then LZMA2 last
+    if ids.last() != Some(&0x21) {
         return stop(layer, "no decoder for this filter yet");
     }
-    Opened { layer, view: View::Decode { from: 12 + header_len, codec: Codec::Lzma2 } }
+    let mut filters = [None; 3];
+    for (i, (id, prop)) in ids.iter().zip(&props).take(ids.len() - 1).enumerate() {
+        let Some(f) = Filter::from_xz(*id, prop) else { return stop(layer, "no decoder for this filter yet") };
+        filters[i] = Some(f);
+    }
+    let codec = if ids.len() == 1 { Codec::Lzma2 } else { Codec::Xz { filters } };
+    Opened { layer, view: View::Decode { from: 12 + header_len, codec } }
 }
 
 /// `.lzma`: a properties byte, the dictionary size, the unpacked size, then the stream. No magic number, soo only

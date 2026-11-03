@@ -17,10 +17,34 @@ pub struct MediaInfo {
     pub subtitles: Vec<SubtitleTrack>,
     /// the first edition's chapters, in order
     pub chapters: Vec<Chapter>,
+    /// when it was muxed, in Unix seconds
+    pub muxed_at: Option<i64>,
+    /// files attached to it: fonts, cover art
+    pub attachments: Vec<Attachment>,
+    /// cover art that was attached whole, kept apart from the JSON
+    #[serde(skip)]
+    pub cover: Option<Cover>,
     /// Everything before the video was read: the first cluster, or an MP4's `moov`, was reached. False means
     /// more of the file's start would say more.
     #[serde(skip)]
     pub header_complete: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Attachment {
+    pub name: String,
+    pub mime: Option<String>,
+    /// as the file says: what was read may be less
+    pub size: u64,
+    pub description: Option<String>,
+}
+
+/// A whole JPEG or PNG attached to the file.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Cover {
+    pub mime: &'static str,
+    pub bytes: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -44,6 +68,9 @@ pub struct VideoTrack {
     pub hdr: Option<String>,
     pub primaries: Option<u64>,
     pub transfer: Option<u64>,
+    /// brightest pixel and brightest frame average, in nits
+    pub max_cll: Option<u64>,
+    pub max_fall: Option<u64>,
     pub dv_profile: Option<u8>,
     pub dv_level: Option<u8>,
     pub dv_enhancement_layer: Option<bool>,
@@ -97,7 +124,7 @@ pub fn parse(data: &[u8]) -> Option<MediaInfo> {
 
 // ---- EBML
 
-fn element_id(b: &[u8]) -> Option<(u32, usize)> {
+pub(crate) fn element_id(b: &[u8]) -> Option<(u32, usize)> {
     let first = *b.first()?;
     let len = first.leading_zeros() as usize + 1;
     if len > 4 {
@@ -111,7 +138,7 @@ fn element_id(b: &[u8]) -> Option<(u32, usize)> {
 }
 
 /// The size, or None for "unknown", and its length.
-fn element_size(b: &[u8]) -> Option<(Option<u64>, usize)> {
+pub(crate) fn element_size(b: &[u8]) -> Option<(Option<u64>, usize)> {
     let first = *b.first()?;
     let len = first.leading_zeros() as usize + 1;
     if len > 8 {
@@ -128,6 +155,11 @@ fn element_size(b: &[u8]) -> Option<(Option<u64>, usize)> {
 
 /// Calls `each` with every element in `b`. One running past the end gets what's there, and ends the walk.
 fn walk(b: &[u8], each: &mut dyn FnMut(u32, &[u8]) -> bool) {
+    walk_sized(b, &mut |id, body, _| each(id, body));
+}
+
+/// `walk`, also giving the size each element says it has: more than its body when it runs past the end.
+fn walk_sized<'a>(b: &'a [u8], each: &mut dyn FnMut(u32, &'a [u8], Option<u64>) -> bool) {
     let mut at = 0usize;
     while at < b.len() {
         let Some((id, id_len)) = b.get(at..).and_then(element_id) else { return };
@@ -135,7 +167,7 @@ fn walk(b: &[u8], each: &mut dyn FnMut(u32, &[u8]) -> bool) {
         let start = at + id_len + size_len;
         let end = size.map_or(b.len(), |s| start.saturating_add(s as usize)).min(b.len());
         let Some(body) = b.get(start..end) else { return };
-        if !each(id, body) {
+        if !each(id, body, size) {
             return;
         }
         at = end;
@@ -177,6 +209,8 @@ struct Track {
     transfer: Option<u64>,
     primaries: Option<u64>,
     mastering: bool,
+    max_cll: Option<u64>,
+    max_fall: Option<u64>,
     dv: Option<(u8, u8, bool)>,
     channels: Option<u64>,
     sample_rate: Option<f64>,
@@ -223,6 +257,8 @@ fn track_entry(b: &[u8]) -> Track {
                             0x55BA => t.transfer = Some(uint(v)),
                             0x55BB => t.primaries = Some(uint(v)),
                             0x55D0 => t.mastering = true,
+                            0x55BC => t.max_cll = Some(uint(v)),
+                            0x55BD => t.max_fall = Some(uint(v)),
                             _ => {}
                         }
                         true
@@ -293,6 +329,7 @@ fn segment(body: &[u8], info: &mut MediaInfo) {
                         0x5741 => info.writing_app = Some(text(v)),
                         0x2AD7B1 => scale = uint(v),
                         0x4489 => duration = float(v),
+                        0x4461 => info.muxed_at = date_utc(v),
                         _ => {}
                     }
                     true
@@ -306,6 +343,7 @@ fn segment(body: &[u8], info: &mut MediaInfo) {
                 true
             }),
             0x1043_A770 if info.chapters.is_empty() => chapters(v, info),
+            0x1941_A469 => attachments(v, info),
             // what's after the first cluster is the video itself
             0x1F43_B675 => {
                 info.header_complete = true;
@@ -355,6 +393,96 @@ fn chapters(body: &[u8], info: &mut MediaInfo) {
     });
 }
 
+/// Matroska's dates count nanoseconds from 2001-01-01.
+fn date_utc(b: &[u8]) -> Option<i64> {
+    if b.len() != 8 {
+        return None;
+    }
+    let ns = i64::from_be_bytes(b.try_into().ok()?);
+    // a zero date is a muxer that didn't set one
+    (ns != 0).then(|| 978_307_200 + ns.div_euclid(1_000_000_000))
+}
+
+/// The most attachments listed. Anime releases carry a few dozen fonts.
+const MAX_ATTACHMENTS: usize = 64;
+/// The most characters kept of an attachment's name, type or description: a list, not a store.
+const MAX_ATTACHMENT_TEXT: usize = 96;
+
+fn short(b: &[u8]) -> String {
+    text(b).chars().take(MAX_ATTACHMENT_TEXT).collect()
+}
+/// The largest cover kept: covers are a few hundred KB, and each is stored with its release.
+pub const MAX_COVER: usize = 512 * 1024;
+
+/// Every attachment, and the cover art when it's here whole.
+fn attachments(body: &[u8], info: &mut MediaInfo) {
+    let mut best: Option<(u8, Cover)> = None;
+    walk(body, &mut |id, file| {
+        if id != 0x61A7 || info.attachments.len() >= MAX_ATTACHMENTS {
+            return true;
+        }
+        let mut a = Attachment::default();
+        let mut data: Option<(&[u8], bool)> = None;
+        walk_sized(file, &mut |id, v, size| {
+            match id {
+                0x466E => a.name = short(v),
+                0x4660 => a.mime = Some(short(v)).filter(|m| !m.is_empty()),
+                0x467E => a.description = Some(short(v)).filter(|d| !d.is_empty()),
+                0x465C => {
+                    a.size = size.unwrap_or(v.len() as u64);
+                    data = Some((v, size == Some(v.len() as u64)));
+                }
+                _ => {}
+            }
+            true
+        });
+        if let Some((bytes, true)) = data
+            && let Some(rank) = cover_rank(&a.name)
+            && best.as_ref().is_none_or(|(r, _)| rank < *r)
+            && let Some(cover) = cover_of(bytes)
+        {
+            best = Some((rank, cover));
+        }
+        info.attachments.push(a);
+        true
+    });
+    if let Some((_, cover)) = best {
+        info.cover = Some(cover);
+    }
+}
+
+/// How good a cover a name makes, best first: the Matroska names for cover art, then any image.
+fn cover_rank(name: &str) -> Option<u8> {
+    let lower = name.to_ascii_lowercase();
+    let stem = lower.rsplit_once('.').map_or(lower.as_str(), |(stem, _)| stem);
+    match stem {
+        "cover" => Some(0),
+        "cover_land" => Some(1),
+        "small_cover" => Some(2),
+        "small_cover_land" => Some(3),
+        _ if [".jpg", ".jpeg", ".png"].iter().any(|ext| lower.ends_with(ext)) => Some(4),
+        _ => None,
+    }
+}
+
+/// A JPEG or PNG that is all there, by its own markers, and small enough to keep.
+fn cover_of(bytes: &[u8]) -> Option<Cover> {
+    if bytes.len() > MAX_COVER {
+        return None;
+    }
+    let mime = if bytes.starts_with(&[0xff, 0xd8, 0xff]) && bytes.ends_with(&[0xff, 0xd9]) {
+        "image/jpeg"
+    } else if bytes.starts_with(b"\x89PNG\r\n\x1a\n")
+        && bytes.len() >= 12
+        && &bytes[bytes.len() - 8..bytes.len() - 4] == b"IEND"
+    {
+        "image/png"
+    } else {
+        return None;
+    };
+    Some(Cover { mime, bytes: bytes.to_vec() })
+}
+
 fn says_commentary(name: Option<&str>) -> bool {
     name.is_some_and(|n| n.to_ascii_lowercase().contains("commentary"))
 }
@@ -384,6 +512,8 @@ fn add_track(t: Track, info: &mut MediaInfo) {
             bit_depth: t.bit_depth,
             primaries: t.primaries,
             transfer: t.transfer,
+            max_cll: t.max_cll,
+            max_fall: t.max_fall,
             dv_profile: t.dv.map(|d| d.0),
             dv_level: t.dv.map(|d| d.1),
             dv_enhancement_layer: t.dv.map(|d| d.2),
@@ -744,5 +874,66 @@ mod tests {
         let v = &m.video[0];
         assert_eq!((v.codec.as_str(), v.width, v.height), ("hvc1", Some(1920), Some(1080)));
         assert_eq!((v.dv_profile, v.dv_enhancement_layer), (Some(7), Some(true)));
+    }
+    fn attached(name: &[u8], mime: &[u8], data: &[u8]) -> Vec<u8> {
+        let body = [el(&[0x46, 0x6E], name), el(&[0x46, 0x60], mime), el(&[0x46, 0x5C], data)].concat();
+        el(&[0x61, 0xA7], &body)
+    }
+
+    fn with_attachments(files: &[u8], cut: usize) -> Vec<u8> {
+        let info = [el(&[0x44, 0x61], &(86_400i64 * 1_000_000_000).to_be_bytes())].concat();
+        let segment = [el(&[0x15, 0x49, 0xA9, 0x66], &info), el(&[0x19, 0x41, 0xA4, 0x69], files)].concat();
+        let mut data =
+            [el(&[0x1A, 0x45, 0xDF, 0xA3], &el(&[0x42, 0x82], b"matroska")), el(&[0x18, 0x53, 0x80, 0x67], &segment)]
+                .concat();
+        data.truncate(data.len() - cut);
+        data
+    }
+
+    #[test]
+    fn attachments_are_listed_and_the_cover_kept() {
+        let jpeg = [&[0xff, 0xd8, 0xff, 0xe0][..], &[7; 100], &[0xff, 0xd9]].concat();
+        let small = [&[0xff, 0xd8, 0xff, 0xe0][..], &[1; 10], &[0xff, 0xd9]].concat();
+        let files = [
+            attached(b"Arial.ttf", b"font/ttf", &[0; 50]),
+            attached(b"small_cover.jpg", b"image/jpeg", &small),
+            attached(b"cover.jpg", b"image/jpeg", &jpeg),
+        ]
+        .concat();
+        let m = parse(&with_attachments(&files, 0)).unwrap();
+        let names: Vec<_> = m.attachments.iter().map(|a| (a.name.as_str(), a.size)).collect();
+        assert_eq!(names, [("Arial.ttf", 50), ("small_cover.jpg", 16), ("cover.jpg", 106)]);
+        assert_eq!(m.attachments[0].mime.as_deref(), Some("font/ttf"));
+        assert_eq!(m.cover, Some(Cover { mime: "image/jpeg", bytes: jpeg.clone() }), "the better name wins");
+        assert_eq!(m.muxed_at, Some(978_307_200 + 86_400));
+
+        // cut off inside the cover: listed at its full size, but not kept
+        let m = parse(&with_attachments(&attached(b"cover.jpg", b"image/jpeg", &jpeg), 10)).unwrap();
+        assert_eq!(m.attachments[0].size, 106);
+        assert_eq!(m.cover, None);
+        let json = serde_json::to_string(&m).unwrap();
+        assert!(!json.contains("cover\":{"), "the image stays out of the JSON: {json}");
+    }
+
+    #[test]
+    fn a_flood_of_attachments_is_cut_short() {
+        let long = vec![b'a'; 100];
+        let files = attached(&long, &long, &[0; 4]).repeat(MAX_ATTACHMENTS + 2);
+        let m = parse(&with_attachments(&files, 0)).unwrap();
+        assert_eq!(m.attachments.len(), MAX_ATTACHMENTS);
+        assert_eq!(m.attachments[0].name.len(), MAX_ATTACHMENT_TEXT);
+        assert_eq!(m.attachments[0].mime.as_ref().unwrap().len(), MAX_ATTACHMENT_TEXT);
+    }
+
+    #[test]
+    fn only_whole_small_images_make_a_cover() {
+        let png = [&b"\x89PNG\r\n\x1a\n"[..], &[0; 20], b"\0\0\0\0IEND\xae\x42\x60\x82"].concat();
+        assert_eq!(cover_of(&png).map(|c| c.mime), Some("image/png"));
+        assert_eq!(cover_of(&png[..png.len() - 1]), None);
+        assert_eq!(cover_of(&[0xff, 0xd8, 0xff, 0xe0, 0, 0]), None, "no end marker");
+        let huge = [&[0xff, 0xd8, 0xff][..], &vec![0; MAX_COVER], &[0xff, 0xd9]].concat();
+        assert_eq!(cover_of(&huge), None);
+        assert_eq!(cover_rank("Cover.JPG"), Some(0));
+        assert_eq!(cover_rank("font.otf"), None);
     }
 }

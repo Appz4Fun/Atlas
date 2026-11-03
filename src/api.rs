@@ -322,11 +322,14 @@ fn rss(
 ) -> ApiResponse {
     let ids: Vec<i64> = releases.iter().map(|r| r.id).collect();
     let copies = crate::duplicates::counts(&ids).unwrap_or_default();
+    // what the NZB holds: all of a post cut across groups, or of an upload linked by its PAR2 set
+    let conn = crate::db::open().ok();
     let items: String = releases
         .iter()
         .map(|r| {
             let nzb_url = format!("{base}/api?t=get&id={}&apikey={api_key}", r.id);
-            let size = r.size.unwrap_or(0);
+            let whole = conn.as_ref().and_then(|conn| crate::release_info::whole_post_with(conn, r).ok().flatten());
+            let size = whole.map_or(r.size.unwrap_or(0), |post| post.size);
             let password = passwords
                 .get(&r.id)
                 .map_or(String::new(), |p| format!("<newznab:attr name=\"password\" value=\"{}\"/>", p.code()));
@@ -416,8 +419,9 @@ fn endpoint_of(path: &str, query: &str) -> Endpoint {
     }
 }
 
-/// A small form, not an upload: anything past this can't be a key.
-const MAX_FORM_BODY: u64 = 4096;
+/// A small form, not an upload: a key, or an Ask AI question of 500 characters percent-encoded. Anything longer is
+/// turned away whole, never read in part.
+const MAX_FORM_BODY: u64 = 8192;
 
 fn respond(mut request: Request, api_key: &str, fallback_host: &str) {
     let url = request.url().to_string();
@@ -441,8 +445,22 @@ fn respond(mut request: Request, api_key: &str, fallback_host: &str) {
             .unwrap_or_else(|| handle(path, query, &base, api_key))
     } else if *request.method() == tiny_http::Method::Post && crate::web::takes_post(path) {
         let mut body = String::new();
-        let _ = request.as_reader().take(MAX_FORM_BODY).read_to_string(&mut body);
-        crate::web::post(path, &body, &base, api_key).unwrap_or_else(ApiResponse::not_found)
+        let _ = request.as_reader().take(MAX_FORM_BODY + 1).read_to_string(&mut body);
+        let too_long = body.len() as u64 > MAX_FORM_BODY;
+        let htmx = request.headers().iter().any(|h| h.field.equiv("HX-Request"));
+        if too_long {
+            ApiResponse {
+                status: 413,
+                content_type: None,
+                body: String::new(),
+                headers: Vec::new(),
+                bytes: None,
+                failed: false,
+            }
+        } else {
+            crate::web::post(path, &body, cookies.as_deref(), htmx, &base, api_key)
+                .unwrap_or_else(ApiResponse::not_found)
+        }
     } else {
         ApiResponse {
             status: 405,

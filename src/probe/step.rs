@@ -12,8 +12,8 @@ use crate::release_info;
 use crate::store::{FileInfo, SegmentPick};
 
 use super::{
-    ProbeInfo, SET_PROBE, agent_of, derive, imdb_ids, keep_headers, media, moviehash, nest, nfo_text, parse_sfv,
-    xref_groups, yenc,
+    DROP_COVER, ProbeInfo, SET_COVER, SET_PROBE, agent_of, derive, imdb_ids, keep_headers, media, moviehash, nest,
+    nfo_text, parse_sfv, xref_groups, yenc,
 };
 
 pub const PROBE_STEP: StepId = StepId(4);
@@ -37,7 +37,7 @@ fn is_small_text(name: &str) -> bool {
 
 /// The file the probe's about: the one with the most parts, and of those, the first by name, soo a set of RAR
 /// volumes gives its first volume.
-fn main_file(files: &[FileInfo]) -> Option<&FileInfo> {
+pub(crate) fn main_file(files: &[FileInfo]) -> Option<&FileInfo> {
     let parts = |f: &FileInfo| f.expected.unwrap_or(f.parts_seen);
     let candidates: Vec<&FileInfo> =
         files.iter().filter(|f| !is_par2(&f.filename) && !is_small_text(&f.filename)).collect();
@@ -52,7 +52,7 @@ fn first_volume_key(name: &str) -> (u8, String) {
     (rank, lower)
 }
 
-fn fetch_raw(ctx: &mut StepCtx<'_>, message_id: &str, file: &str) -> Result<Got, StepError> {
+pub(super) fn fetch_raw(ctx: &mut StepCtx<'_>, message_id: &str, file: &str) -> Result<Got, StepError> {
     let wanted = BodyRequest {
         message_id: message_id.to_string(),
         file: file.to_string(),
@@ -95,9 +95,9 @@ impl Step for ProbeStep {
     }
     /// What a probe reads, a bit per version, soo a release probed before a version gets probed again. Bit 1:
     /// chapters, commentary, more than one article of a header, and the OpenSubtitles hash. Bit 2: archives inside
-    /// archives, followed down.
+    /// archives, followed down. Bit 4: attachments, cover art, when it was muxed, MaxCLL and MaxFALL.
     fn config_stamp(&self) -> u64 {
-        1 | 2
+        1 | 2 | 4
     }
     fn run(&self, ctx: &mut StepCtx<'_>) -> Result<Outcome, StepError> {
         let retry = |e: rusqlite::Error| StepError::Retry(e.to_string());
@@ -197,6 +197,14 @@ impl Step for ProbeStep {
         if empty {
             return Ok(Outcome { writes, ..Outcome::default() });
         }
+        // a look that finds no cover drops one an earlier look kept
+        let cover = info.media.as_mut().and_then(|m| m.cover.take());
+        writes.push(match cover.and_then(|c| super::keep_cover(&c.bytes).map(|sha256| (c.mime, sha256))) {
+            Some((mime, sha256)) => {
+                StepWrite::new(SET_COVER, vec![release_id.into(), mime.to_string().into(), sha256.into()])
+            }
+            None => StepWrite::new(DROP_COVER, vec![release_id.into()]),
+        });
         let crc = info.file_crc32.map(i64::from);
         let agent = agent_of(&info.headers).map(str::to_string);
         let hash = info.moviehash.clone();
@@ -238,7 +246,12 @@ fn read_more_front(
 }
 
 /// One part of a file, decoded, when it holds the file's bytes from `offset` (0 based) on.
-fn read_part(ctx: &mut StepCtx<'_>, file: &FileInfo, part: i64, offset: u64) -> Result<Option<Vec<u8>>, StepError> {
+pub(super) fn read_part(
+    ctx: &mut StepCtx<'_>,
+    file: &FileInfo,
+    part: i64,
+    offset: u64,
+) -> Result<Option<Vec<u8>>, StepError> {
     let segs = ctx.segments(file.id, &SegmentPick::Parts(vec![part])).map_err(|e| StepError::Retry(e.to_string()))?;
     let Some(seg) = segs.into_iter().next().filter(|s| s.part.is_none_or(|p| p == part)) else { return Ok(None) };
     let Got::Body(raw) = fetch_raw(ctx, &seg.message_id, &file.filename)? else { return Ok(None) };

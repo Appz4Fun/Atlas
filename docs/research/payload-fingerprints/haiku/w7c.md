@@ -1,0 +1,6 @@
+# W7C server-side body hashing (Haiku, ~09:58Z)
+- Cleanfeed (crooks fork) EMP: md5_hex of the raw body (no headers), binaries INCLUDED as raw bytes (no fuzzy normalisation for binaries); reject tag 'EMP (md5)'; do_md5=1, md5_max_length 2000 lines, MD5RateCutoff 5 (sample 3) per MD5RateBaseInterval 7200 s; logs emp.md5.bin; adds no header. https://raw.githubusercontent.com/crooks/cleanfeed/master/cleanfeed ; https://www.mixmin.net/cleanfeed/config.html
+- Fuzzy MD5 only for text bodies <700 lines. Other EMP keys: host+lines, host+groups, From+Subject+Lines.
+- NewsDemon claims ingest dedupe ("article deduplication", "strip duplicates before the spool"), method unstated. unseenet issues #123/#132 propose SimHash/MinHash body fingerprints.
+- No X-EMP / X-Body-Hash headers found; Diablo/PyClean unverified.
+My inference: raw-body dedupe (Cleanfeed EMP, provider dedupe) is a reason obfuscating posters vary the yEnc name= / subject per article: the raw body hash changes while the decoded payload (and pcrc32) does not. So Atlas should key on DECODED payload CRC, never on raw-body hashes like X-Received-Body-CRC, when matching across obfuscated reposts (raw-body keys only match same-tool, same-name re-injections).

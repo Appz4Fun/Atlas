@@ -40,10 +40,20 @@ $D api 't=get&id=15' > x.nzb       # NZB for a release id (<guid> in search resu
 $D shot /tmp/home                  # sign in + full-page screenshot of / -> /tmp/home.png
 $D shot /tmp/rel '/ui/release?id=15'
 $D shot /tmp/phone / --dark --width 390
-$D screen                # print the terminal menu (tmux capture-pane)
+$D shot /tmp/parts '/ui/release?id=15' --click 'details.meta-parts summary'   # open something first
+$D screen                # print the terminal menu (tmux capture-pane, trailing blank rows dropped)
 $D keys 2 Enter          # send keys: 2=Search, then 2=All Groups, then type a query
 $D down                  # Exit menu, SIGTERM the indexer via bg_indexer.pid, stop the mock
 rm -rf /tmp/atlas-run    # fresh start next time (up reuses an existing config.toml/db)
+```
+
+A menu search, start to finish (verified; one key batch per screen, with a
+pause, because each screen reads its own line):
+
+```bash
+$D keys 2 Enter; sleep 1; $D keys 2 Enter; sleep 1; $D keys movie Enter; sleep 2; $D screen | tail -8
+# ->  1  Cool.Movie.2024.1080p.WEB-DL.DDP5.1.H.264-GRP   2.9 MB  Movies/HD  6  2026-11-02
+$D keys 0 Enter          # Back from results goes to the MAIN menu; one more 0 exits Atlas (and the API)
 ```
 
 `shot` prints JSON with the page title and the first result names, so you can
@@ -73,7 +83,7 @@ ATLAS_HOME=/tmp/atlas-run target/release/atlas --purge                          
 ## Test (internals: most PRs touch these)
 
 ```bash
-cargo test --locked --test web_ui --test e2e   # one or two files; each tests/*.rs is its own binary
+cargo test --locked --test web_ui --test e2e   # one or two files; each tests/*.rs is its own binary (~1.5 min cold)
 cargo test --locked                            # everything (what CI runs, with fmt + clippy)
 cargo fmt --check && cargo clippy --all-targets --locked -- -D warnings
 ```
@@ -113,6 +123,12 @@ server. Useless headless without tmux; use the driver.
   trying the Linux secret service (no D-Bus here).
 - The driver's config sets `settle_secs = 0` / `complete_settle_secs = 0` so
   post-processing runs at once; the mock's posts are dated 4h back too.
+- **`0` from search results is Back to the main menu, not to the Search
+  submenu**, so a habitual second `0` exits Atlas and the web UI/API with it
+  (the indexer keeps running). `status` then says `menu: exited`; `up` again
+  restarts the menu on the same data in ~4s.
+- **`$(tmux capture-pane) | tail` shows only blank lines**: the pane is 50 rows
+  and every menu draws at the top. `screen` strips the trailing blank rows.
 - tmux window is 160x50: the ratatui panels wrap badly under ~120 columns.
 
 ## Troubleshooting

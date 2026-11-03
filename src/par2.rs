@@ -3,6 +3,7 @@
 
 use std::sync::LazyLock;
 
+use md5::Digest;
 use regex::Regex;
 
 use crate::archive::names::{best_name, clean_name};
@@ -34,6 +35,9 @@ pub struct Par2File {
     pub md5_16k: [u8; 16],
     pub size: u64,
     pub name: String,
+    /// its file id is the MD5 of its first-16-KiB hash, size and name, as PAR2 makes it, soo a Main that lists the id
+    /// vouches for this size and hash too
+    pub bound: bool,
 }
 
 /// What a set's packets say.
@@ -46,6 +50,9 @@ pub struct Inventory {
     pub complete: bool,
     /// a packet ran past the data
     pub truncated: bool,
+    /// (set id, file id) from each Main packet whose body hashes to its set id: a set whose list of files can't have
+    /// been added to without changing its id
+    pub sealed: Vec<([u8; 16], [u8; 16])>,
 }
 
 fn id_at(b: &[u8], at: usize) -> Option<[u8; 16]> {
@@ -94,7 +101,11 @@ pub fn inventory(data: &[u8]) -> Inventory {
             saw_main = true;
             inv.block_size = inv.block_size.or(u64_at(body, 0).filter(|size| *size > 0));
             let ids = body.get(12..).unwrap_or(&[]);
+            let sealed = <[u8; 16]>::from(md5::Md5::digest(body)) == set_id;
             for id in ids.as_chunks::<16>().0.iter().take(MAX_FILES) {
+                if sealed && inv.sealed.len() < MAX_FILES && !inv.sealed.contains(&(set_id, *id)) {
+                    inv.sealed.push((set_id, *id));
+                }
                 if mains.len() < MAX_FILES && !mains.contains(&(set_id, *id)) {
                     mains.push((set_id, *id));
                 }
@@ -106,11 +117,19 @@ pub fn inventory(data: &[u8]) -> Inventory {
                 continue;
             };
             let cut = raw.iter().position(|b| *b == 0).unwrap_or(raw.len());
-            let name = String::from_utf8_lossy(raw.get(..cut).unwrap_or(&[])).into_owned();
+            let raw_name = raw.get(..cut).unwrap_or(&[]);
+            let bound = <[u8; 16]>::from(
+                md5::Md5::new()
+                    .chain_update(md5_16k)
+                    .chain_update(size.to_le_bytes())
+                    .chain_update(raw_name)
+                    .finalize(),
+            ) == file_id;
+            let name = String::from_utf8_lossy(raw_name).into_owned();
             let Some(name) = clean_name(&name) else { continue };
             let there = inv.files.iter().any(|f| f.set_id == set_id && f.file_id == file_id && f.name == name);
             if !there && inv.files.len() < MAX_FILES {
-                inv.files.push(Par2File { set_id, file_id, md5, md5_16k, size, name });
+                inv.files.push(Par2File { set_id, file_id, md5, md5_16k, size, name, bound });
             }
         } else if &kind == UNICODE {
             let (Some(file_id), Some(raw)) = (id_at(body, 0), body.get(16..)) else { continue };
@@ -239,6 +258,24 @@ mod tests {
     }
 
     #[test]
+    fn a_main_whose_body_hashes_to_its_set_id_seals_its_list() {
+        let mut body = vec![0u8; 8];
+        body.extend(1u32.to_le_bytes());
+        body.extend([7u8; 16]);
+        let id: [u8; 16] = md5::Md5::digest(&body).into();
+        let mut real = Vec::new();
+        real.extend_from_slice(MAGIC);
+        real.extend_from_slice(&((HEADER_LEN + body.len()) as u64).to_le_bytes());
+        real.extend_from_slice(&[0u8; 16]);
+        real.extend_from_slice(&id);
+        real.extend_from_slice(MAIN);
+        real.extend_from_slice(&body);
+        assert_eq!(inventory(&real).sealed, [(id, [7u8; 16])]);
+        // a set id that isn't its Main's hash seals nothing
+        assert!(inventory(&main_packet(1, &[7])).sealed.is_empty());
+    }
+
+    #[test]
     fn a_constant_id_helper_keeps_every_name() {
         let a = [file_desc_packet("small.nfo", 10), file_desc_packet("Hidden.Show.S01E01.mkv", 9_000)].concat();
         assert_eq!(inventory(&a).files.len(), 2);
@@ -273,6 +310,25 @@ mod tests {
         ]
         .concat();
         assert_eq!(display_name(&data).as_deref(), Some("Real.Movie.2024.1080p-GRP"));
+    }
+
+    #[test]
+    fn a_desc_is_bound_only_when_its_id_hashes_its_size_and_name() {
+        let (md5_16k, size, name) = ([4u8; 16], 5_000_000u64, b"a.mkv");
+        let id: [u8; 16] =
+            md5::Md5::new().chain_update(md5_16k).chain_update(size.to_le_bytes()).chain_update(name).finalize().into();
+        let real = |size: u64| {
+            let mut body = id.to_vec();
+            body.extend([3u8; 16]);
+            body.extend(md5_16k);
+            body.extend(size.to_le_bytes());
+            body.extend(b"a.mkv\0\0\0");
+            packet(1, FILE_DESC, &body)
+        };
+        assert!(inventory(&real(size)).files[0].bound);
+        // the same id claiming another size
+        assert!(!inventory(&real(size + 1)).files[0].bound);
+        assert!(!inventory(&desc(1, 1, "a.mkv", size)).files[0].bound);
     }
 
     #[test]
