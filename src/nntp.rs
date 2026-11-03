@@ -950,6 +950,49 @@ impl Conn {
         Ok(lines.iter().filter_map(|l| parse_overview(l)).collect())
     }
 
+    /// Queries the NNTP server's UTC clock via `DATE` (`111 YYYYMMDDhhmmss`).
+    pub async fn server_date_utc(&mut self) -> Result<chrono::DateTime<chrono::Utc>> {
+        let (code, message) = self.command("DATE", None).await?;
+        if code != 111 {
+            return Err(NntpError::Reply { code, message });
+        }
+        let line = format!("{code} {message}");
+        crate::discovery::ServerClock::parse_nntp_date(&line)
+            .ok_or_else(|| NntpError::Protocol(format!("invalid DATE response: {line}")))
+    }
+
+    /// Measures the server's clock skew (`server_utc - local_utc`) in seconds via `DATE`.
+    /// Positive skew means the provider clock runs ahead of UTC (e.g. Giganews `+5.74s`).
+    pub async fn clock_skew_seconds(&mut self) -> Result<f64> {
+        let server_dt = self.server_date_utc().await?;
+        let now = chrono::Utc::now();
+        Ok((server_dt.timestamp_millis() - now.timestamp_millis()) as f64 / 1_000.0)
+    }
+
+    /// `XZVER` compressed overview fetch (yEnc-encoded deflate/zlib stream) for providers
+    /// such as XSNews (`reader.xsnews.nl`) and Usenet.Farm (`farm.newsgroupdirect.com`)
+    /// where `XFEATURE COMPRESS GZIP` returns `500` but `XZVER` returns `224`.
+    /// Refuses to send `XZVER` on Highwinds backends where `XZVER` hangs on the wire.
+    pub async fn xzver(&mut self, start: u64, end: u64) -> Result<Vec<Overview>> {
+        if is_highwinds_xzver_hang_host(&self.server) {
+            return Err(NntpError::Protocol(format!(
+                "XZVER disabled on Highwinds host {} (hangs on wire; use XFEATURE COMPRESS GZIP)",
+                self.server
+            )));
+        }
+        let (code, message) = self.command("XZVER", Some(&format!("{start}-{end}"))).await?;
+        if code != 224 {
+            return Err(NntpError::Reply { code, message });
+        }
+        let mut raw_lines = Vec::new();
+        self.each_plain_line(|l| {
+            raw_lines.push(l);
+            true
+        })
+        .await?;
+        decode_xzver_lines(&raw_lines)
+    }
+
     /// BODY, yEnc decoded when the article is yEnc.
     pub async fn body(&mut self, message_id: &str) -> Result<Vec<u8>> {
         let measure = self.measure("BODY", "nntp.body");
@@ -3094,6 +3137,54 @@ fn push_yenc_line(payload: &mut Vec<u8>, line: &[u8]) {
     }
 }
 
+/// Returns `true` for Highwinds / Omicron backends (e.g. `news.eweka.nl`,
+/// `news.newshosting.com`) where `XZVER` is advertised in `HELP` but hangs on the
+/// wire and `XFEATURE COMPRESS GZIP` (`290`) must be used instead.
+pub fn is_highwinds_xzver_hang_host(host: &str) -> bool {
+    let lower = host.to_ascii_lowercase();
+    lower.contains("eweka.nl")
+        || lower.contains("newshosting.com")
+        || lower.contains("highwinds")
+        || lower.contains("hwng")
+        || lower.contains("tweaknews")
+        || lower.contains("easynews")
+        || lower.contains("usenetserver.com")
+}
+
+/// Decodes an `XZVER` multi-line response body (yEnc-wrapped or headerless yEnc lines
+/// containing a raw-deflate, zlib, or gzip overview stream) into `Overview` records.
+pub fn decode_xzver_lines(lines: &[Vec<u8>]) -> Result<Vec<Overview>> {
+    if lines.is_empty() {
+        return Ok(Vec::new());
+    }
+    let compressed = if let Some(decoded) = yenc_decode(lines) {
+        decoded
+    } else {
+        let mut payload = Vec::with_capacity(lines.iter().map(|l| l.len()).sum());
+        for line in lines {
+            if line.starts_with(b"=ypart ") || line.starts_with(b"=yend") {
+                continue;
+            }
+            push_yenc_line(&mut payload, line);
+        }
+        nntmux_yenc::decoder::decode(&payload)
+    };
+    let mut inflater = Inflater::default();
+    let mut inflated = Vec::new();
+    inflater.feed(&compressed, &mut inflated)?;
+    Ok(inflated
+        .split(|&b| b == b'\n')
+        .map(|mut l| {
+            if l.last() == Some(&b'\r') {
+                l = &l[..l.len() - 1];
+            }
+            l
+        })
+        .filter(|l| !l.is_empty() && *l != b".")
+        .filter_map(parse_overview)
+        .collect())
+}
+
 #[cfg(test)]
 mod yenc_decode_tests {
     use super::yenc_decode;
@@ -3777,6 +3868,92 @@ mod tests {
             let chunk2 = conn.read_chunk(Duration::from_secs(5)).await.unwrap();
             assert_eq!(chunk2.len(), 5_000);
             assert_eq!(conn.wire, 10_000);
+        });
+    }
+
+    #[test]
+    fn overview_empty_and_zero_lines_preserve_bytes_and_two_digit_date_years() {
+        // Empirical probe (2026-11-03): Eweka/Newshosting omit Lines (empty) on 55-64% of rows;
+        // XSNews sends "0" on 64% of rows; all providers send 2-digit Date years on 13-68% of rows.
+        let eweka_row = b"2501325020\t[1/8] - \"sample.mkv\" yEnc (1/20)\tposter@usenet.test\t03 Nov 26 03:20:32 GMT\t<1793676032419$1@nyuu>\t\t788233\t\tXref: news.eweka.nl alt.binaries.test:2501325020";
+        let xsnews_row = b"1548224143\t[2/8] - \"sample.mkv\" yEnc (1/20)\tposter@usenet.test\tTue, 03 Nov 26 03:20:33 +0000\t<1793676033000$2@nyuu>\t\t791848\t0\tXref: reader.xsnews.nl alt.binaries.test:1548224143";
+
+        let ov_eweka = parse_overview(eweka_row).expect("must parse row with empty Lines");
+        assert_eq!(ov_eweka.bytes, 788_233);
+        assert_eq!(ov_eweka.lines, 0);
+        let art_eweka = ov_eweka.into_article();
+        assert_eq!(art_eweka.bytes, 788_233);
+        assert_eq!(art_eweka.date, "2026-11-03 03:20:32");
+
+        let ov_xsnews = parse_overview(xsnews_row).expect("must parse row with 0 Lines");
+        assert_eq!(ov_xsnews.bytes, 791_848);
+        assert_eq!(ov_xsnews.lines, 0);
+        let art_xsnews = ov_xsnews.into_article();
+        assert_eq!(art_xsnews.bytes, 791_848);
+        assert_eq!(art_xsnews.date, "2026-11-03 03:20:33");
+    }
+
+    #[test]
+    fn highwinds_xzver_hang_guard_and_xzver_deflate_overview_decode() {
+        use flate2::write::DeflateEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        assert!(is_highwinds_xzver_hang_host("news.eweka.nl:563"));
+        assert!(is_highwinds_xzver_hang_host("news.newshosting.com:563"));
+        assert!(!is_highwinds_xzver_hang_host("reader.xsnews.nl:563"));
+        assert!(!is_highwinds_xzver_hang_host("farm.newsgroupdirect.com:563"));
+
+        // Build a raw-deflate + yEnc-encoded XZVER payload (as returned by XSNews / Usenet.Farm)
+        let plain_overview = b"100\tsubj 1\tfrom@test\t03 Nov 26 03:20:38 GMT\t<id1@test>\t\t791848\t0\tXref: reader.xsnews.nl alt.binaries.test:100\r\n101\tsubj 2\tfrom@test\t03 Nov 26 03:20:39 GMT\t<id2@test>\t\t384000\t\tXref: reader.xsnews.nl alt.binaries.test:101\r\n";
+        let mut enc = DeflateEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(plain_overview).unwrap();
+        let deflated = enc.finish().unwrap();
+
+        let mut yenc_body = Vec::new();
+        for &b in &deflated {
+            let shifted = b.wrapping_add(42);
+            if matches!(shifted, 0x00 | 0x0A | 0x0D | b'=' | b'.') {
+                yenc_body.push(b'=');
+                yenc_body.push(shifted.wrapping_add(64));
+            } else {
+                yenc_body.push(shifted);
+            }
+        }
+        let lines = vec![
+            format!("=ybegin line=128 size={} name=xzver", deflated.len()).into_bytes(),
+            yenc_body,
+            format!("=yend size={}", deflated.len()).into_bytes(),
+        ];
+
+        let overviews = decode_xzver_lines(&lines).expect("must decode XZVER yEnc+deflate overview");
+        assert_eq!(overviews.len(), 2);
+        assert_eq!(overviews[0].number, 100);
+        assert_eq!(overviews[0].bytes, 791_848);
+        assert_eq!(overviews[1].number, 101);
+        assert_eq!(overviews[1].bytes, 384_000);
+    }
+
+    #[test]
+    fn conn_server_date_utc_parses_111_response() {
+        run(async {
+            let (client, mut server) = tokio::io::duplex(4096);
+            let mut conn = Conn::over(Box::new(client), Duration::from_secs(5));
+
+            tokio::spawn(async move {
+                let mut reader = BufReader::new(&mut server);
+                let mut cmd = String::new();
+                reader.read_line(&mut cmd).await.unwrap();
+                assert_eq!(cmd, "DATE\r\n");
+                reader
+                    .get_mut()
+                    .write_all(b"111 20261103032044\r\n")
+                    .await
+                    .unwrap();
+            });
+
+            let dt = conn.server_date_utc().await.unwrap();
+            assert_eq!(dt.to_rfc3339(), "2026-11-03T03:20:44+00:00");
         });
     }
 }

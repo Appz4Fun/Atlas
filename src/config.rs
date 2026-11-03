@@ -796,6 +796,45 @@ impl Config {
         self.servers.sort_by_key(|s| s.priority);
     }
 
+    /// Returns any `(host:port)` keys that appear more than once with the same `(host, port, username)`
+    /// (and no distinct `key`), such as `news.newshosting.com` listed twice in a provider config,
+    /// which would otherwise open double the account's permitted connections and trigger `502`/`482` refusals.
+    pub fn duplicate_servers(&self) -> Vec<String> {
+        let mut seen = std::collections::HashSet::new();
+        let mut duplicates = Vec::new();
+        for s in &self.servers {
+            let id = (
+                s.host.trim().to_ascii_lowercase(),
+                s.port,
+                s.username.trim().to_string(),
+                s.key.clone(),
+            );
+            if !seen.insert(id) {
+                let label = format!("{}:{}", s.host.trim(), s.port);
+                if !duplicates.contains(&label) {
+                    duplicates.push(label);
+                }
+            }
+        }
+        duplicates
+    }
+
+    /// Removes duplicate `(host, port, username, key)` server entries in place, keeping the first occurrence.
+    /// Returns the number of duplicate entries removed.
+    pub fn dedup_servers(&mut self) -> usize {
+        let before = self.servers.len();
+        let mut seen = std::collections::HashSet::new();
+        self.servers.retain(|s| {
+            seen.insert((
+                s.host.trim().to_ascii_lowercase(),
+                s.port,
+                s.username.trim().to_string(),
+                s.key.clone(),
+            ))
+        });
+        before - self.servers.len()
+    }
+
     /// groups the indexer should walk, falls back to the single `group` field
     pub fn tracked_groups(&self) -> Vec<String> {
         let groups: Vec<String> =
@@ -1726,5 +1765,20 @@ mod tests {
         assert_eq!(c.max_attempts, 5);
         assert!(c.group_rules.is_empty());
         assert_eq!(Config::from_value(&json!({"postprocess": 3})).postprocess, PostprocessConfig::default());
+    }
+
+    #[test]
+    fn duplicate_servers_and_dedup_servers_guard() {
+        let mut c = Config::from_value(&json!({
+            "usenet_servers": [
+                {"host": "news.newshosting.com", "port": 563, "username": "u1", "password": "p1", "connections": 30},
+                {"host": "news.eweka.nl", "port": 563, "username": "u2", "password": "p2", "connections": 30},
+                {"host": "news.newshosting.com", "port": 563, "username": "u1", "password": "p1", "connections": 30}
+            ]
+        }));
+        assert_eq!(c.duplicate_servers(), vec!["news.newshosting.com:563".to_string()]);
+        assert_eq!(c.dedup_servers(), 1);
+        assert_eq!(c.servers.len(), 2);
+        assert!(c.duplicate_servers().is_empty());
     }
 }

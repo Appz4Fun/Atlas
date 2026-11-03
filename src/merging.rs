@@ -137,6 +137,15 @@ impl ReleaseAssembler {
         releases
     }
 
+    /// Subtract a provider's measured `DATE` clock skew (in seconds) from candidate runs
+    /// before joining files across servers (e.g., Giganews running +5.74 s ahead of UTC).
+    pub fn apply_clock_skew(runs: &mut [CandidateFileRun], skew_seconds: f64) {
+        for run in runs.iter_mut() {
+            run.t_start -= skew_seconds;
+            run.t_end -= skew_seconds;
+        }
+    }
+
     fn create_merged_release(runs: Vec<CandidateFileRun>) -> MergedRelease {
         let total_size: u64 = runs.iter().map(|r| r.size).sum();
         let name = runs.first().map(|r| r.filename.clone()).unwrap_or_else(|| "unnamed".to_string());
@@ -227,6 +236,20 @@ impl Par2Bridge {
             *par2_prefix_counts.entry((f.size, f.md5_16k)).or_insert(0) += 1;
         }
 
+        // Determine whether `first_articles` is keyed by `CandidateFileRun::file_index`
+        // (e.g. 1-based `1..=N`) or by 0-based slice index `0..candidate_runs.len()`.
+        // Never mix both namespaces in a single `.find()` so out-of-order `first_articles`
+        // cannot cross-match run `0` (`file_index == Some(1)`) against `ArticleHead { file_index: 1 }`.
+        let all_in_slice_bounds = first_articles.iter().all(|a| a.file_index < candidate_runs.len());
+        let any_zero_head = first_articles.iter().any(|a| a.file_index == 0);
+        let any_zero_run = candidate_runs.iter().any(|r| r.file_index == Some(0));
+        let all_match_run_index = first_articles
+            .iter()
+            .all(|a| candidate_runs.iter().any(|r| r.file_index == Some(a.file_index as i64)));
+        let use_run_file_index = !first_articles.is_empty()
+            && all_match_run_index
+            && (!all_in_slice_bounds || (!any_zero_head && !any_zero_run));
+
         let mut candidate_heads: Vec<Option<(&ArticleHead, [u8; 16])>> = Vec::with_capacity(candidate_runs.len());
         let mut candidate_prefix_counts: HashMap<(u64, [u8; 16]), usize> = HashMap::new();
         for (i, run) in candidate_runs.iter().enumerate() {
@@ -234,9 +257,13 @@ impl Par2Bridge {
                 candidate_heads.push(None);
                 continue;
             }
-            let head = first_articles
-                .iter()
-                .find(|a| a.file_index == i || a.file_index == run.file_index.unwrap_or(-1) as usize);
+            let head = if use_run_file_index {
+                first_articles
+                    .iter()
+                    .find(|a| Some(a.file_index as i64) == run.file_index)
+            } else {
+                first_articles.iter().find(|a| a.file_index == i)
+            };
             if let Some(article_head) = head {
                 let md5_bytes = if article_head.payload.len() >= 16384 {
                     &article_head.payload[..16384]
@@ -1122,5 +1149,128 @@ mod tests {
         assert!(!res.success);
         assert!(runs[0].full_md5.is_none());
         assert!(runs[1].full_md5.is_none());
+    }
+
+    #[test]
+    fn par2_bridge_reversed_article_heads_with_1_based_run_indices() {
+        let make_desc = |file_id: [u8; 16], full_md5: [u8; 16], md5_16k: [u8; 16], size: u64, name: &str| {
+            let mut body = Vec::new();
+            body.extend_from_slice(&file_id);
+            body.extend_from_slice(&full_md5);
+            body.extend_from_slice(&md5_16k);
+            body.extend_from_slice(&size.to_le_bytes());
+            body.extend_from_slice(name.as_bytes());
+            body.push(0);
+            while !body.len().is_multiple_of(4) {
+                body.push(0);
+            }
+            let mut pkt = Vec::new();
+            pkt.extend_from_slice(b"PAR2\0PKT");
+            pkt.extend_from_slice(&((64 + body.len()) as u64).to_le_bytes());
+            pkt.extend_from_slice(&[0u8; 16]);
+            pkt.extend_from_slice(&[0x55; 16]);
+            pkt.extend_from_slice(b"PAR 2.0\0FileDesc");
+            pkt.extend_from_slice(&body);
+            pkt
+        };
+
+        let mut par2 = Vec::new();
+        let mut runs = Vec::new();
+        let mut heads = Vec::new();
+        const EQUAL_SIZE: u64 = 50_000_000;
+
+        for i in 1..=10 {
+            let payload = vec![i as u8; 20_000];
+            let md5_16k: [u8; 16] = md5::Md5::digest(&payload[..16_384]).into();
+            par2.extend(make_desc(
+                [i as u8; 16],
+                [i as u8; 16],
+                md5_16k,
+                EQUAL_SIZE,
+                &format!("Release.part{:02}.rar", i),
+            ));
+            runs.push(CandidateFileRun {
+                filename: format!("obf_{i:04}.bin"),
+                group: "alt.binaries.test".into(),
+                poster: "anon@usenet".into(),
+                size: EQUAL_SIZE,
+                yenc_total: Some(50),
+                yenc_part_size: Some(750_000),
+                file_index: Some(i as i64),
+                rar_volume_idx: None,
+                archive_format: Some("rar5".into()),
+                member_id: None,
+                byte_offset: 0,
+                t_start: 0.0,
+                t_end: 1.0,
+                file_crc: None,
+                md5_16k: None,
+                full_md5: None,
+                unpacked_crc32: None,
+                creation_salt: None,
+                is_obfuscated: true,
+            });
+            heads.push(ArticleHead {
+                file_index: (i - 1) as usize,
+                payload,
+            });
+        }
+
+        // Reverse `heads` so `ArticleHead { file_index: 1 }` precedes `ArticleHead { file_index: 0 }`
+        heads.reverse();
+
+        let res = Par2Bridge::resolve(&par2, &mut runs, &heads);
+        assert_eq!(res.resolved_count, 10);
+        assert!(res.success);
+        for (idx, run) in runs.iter().enumerate() {
+            assert_eq!(run.filename, format!("Release.part{:02}.rar", idx + 1));
+            assert_eq!(run.full_md5, Some([(idx + 1) as u8; 16]));
+            assert!(!run.is_obfuscated);
+        }
+    }
+
+    #[test]
+    fn apply_clock_skew_aligns_giganews_ahead_runs_within_join_window() {
+        let run1 = CandidateFileRun {
+            filename: "part01.rar".into(),
+            group: "alt.binaries.movies".into(),
+            poster: "poster@usenet".into(),
+            size: 50_000_000,
+            yenc_total: Some(50),
+            yenc_part_size: Some(750_000),
+            file_index: Some(1),
+            rar_volume_idx: Some(1),
+            archive_format: Some("rar5".into()),
+            member_id: None,
+            byte_offset: 0,
+            t_start: 100.0,
+            t_end: 110.0,
+            file_crc: Some(1),
+            md5_16k: None,
+            full_md5: None,
+            unpacked_crc32: None,
+            creation_salt: None,
+            is_obfuscated: false,
+        };
+
+        // Run 2 observed on Giganews (`super.newsgroupdirect.com`) whose clock runs +5.74s ahead:
+        // true gap is +0.20s (`110.20..120.20`), but raw server clock reports `115.94..125.94` (+5.94s gap > 2.0s).
+        let mut giga_runs = vec![CandidateFileRun {
+            filename: "part02.rar".into(),
+            file_index: Some(2),
+            rar_volume_idx: Some(2),
+            t_start: 115.94,
+            t_end: 125.94,
+            file_crc: Some(2),
+            ..run1.clone()
+        }];
+
+        let uncalibrated = ReleaseAssembler::join_runs(&[run1.clone(), giga_runs[0].clone()], None);
+        assert_eq!(uncalibrated.len(), 2, "uncalibrated +5.74s skew exceeds +2.0s join window");
+
+        ReleaseAssembler::apply_clock_skew(&mut giga_runs, 5.74);
+        let calibrated = ReleaseAssembler::join_runs(&[run1, giga_runs[0].clone()], None);
+        assert_eq!(calibrated.len(), 1, "skew-calibrated Giganews run must join cleanly");
+        assert_eq!(calibrated[0].runs.len(), 2);
     }
 }

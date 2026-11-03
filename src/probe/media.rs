@@ -367,6 +367,7 @@ fn matroska(data: &[u8]) -> MediaInfo {
 }
 
 fn segment(body: &[u8], info: &mut MediaInfo) {
+    let mut video_tracks: Vec<(u64, usize, usize)> = Vec::new();
     let mut audio_tracks: Vec<(u64, usize)> = Vec::new();
     let mut next_track_num = 1u64;
     walk(body, &mut |id, v| {
@@ -395,7 +396,15 @@ fn segment(body: &[u8], info: &mut MediaInfo) {
                     let t = track_entry(v);
                     let track_num = t.number.unwrap_or(next_track_num);
                     next_track_num = track_num.saturating_add(1);
-                    if t.kind == 2 && !is_full(info) {
+                    if t.kind == 1 && !is_full(info) {
+                        let nal_length_size = t
+                            .codec_private
+                            .as_deref()
+                            .and_then(|cp| cp.get(21))
+                            .map(|&b| usize::from(b & 0x03) + 1)
+                            .unwrap_or(4);
+                        video_tracks.push((track_num, info.video.len(), nal_length_size));
+                    } else if t.kind == 2 && !is_full(info) {
                         audio_tracks.push((track_num, info.audio.len()));
                     }
                     add_track(t, info);
@@ -442,7 +451,7 @@ fn segment(body: &[u8], info: &mut MediaInfo) {
             // what's after the first cluster is the video itself
             0x1F43_B675 => {
                 info.header_complete = true;
-                probe_cluster(v, &audio_tracks, info);
+                probe_cluster(v, &video_tracks, &audio_tracks, info);
                 return false;
             }
             _ => {}
@@ -882,6 +891,7 @@ fn trak(body: &[u8], full_data: &[u8], info: &mut MediaInfo) {
                 language,
                 ..VideoTrack::default()
             };
+            let mut nal_length_size = 4usize;
             boxes(entry.get(86..).unwrap_or(&[]), &mut |kind, v| {
                 if (kind == b"dvcC" || kind == b"dvvC")
                     && track.dv_profile.is_none()
@@ -892,6 +902,9 @@ fn trak(body: &[u8], full_data: &[u8], info: &mut MediaInfo) {
                     track.dv_enhancement_layer = Some(el);
                     track.dolby_vision = DolbyVisionInfo::from_dvcc_dvvc(v);
                 } else if kind == b"hvcC" {
+                    if let Some(&len_byte) = v.get(21) {
+                        nal_length_size = usize::from(len_byte & 0x03) + 1;
+                    }
                     if track.bit_depth.is_none() {
                         track.bit_depth = HevcDepth::from_hvcc(v).map(u64::from);
                     }
@@ -915,6 +928,14 @@ fn trak(body: &[u8], full_data: &[u8], info: &mut MediaInfo) {
                     track.bit_depth = AvcDepth::from_avcc(v).map(u64::from);
                 }
             });
+            for &off in &chunk_offsets {
+                let end = off.saturating_add(MAX_AUDIO_CHUNK_PROBE).min(full_data.len());
+                let Some(chunk) = full_data.get(off..end) else { continue };
+                if let Some(dv) = DolbyVisionInfo::parse_rpu_with_length_size(chunk, nal_length_size) {
+                    apply_rpu_to_video_track(&mut track, dv);
+                    break;
+                }
+            }
             if track.hdr.is_none() {
                 track.hdr = hdr_name(track.transfer, false, track.primaries, track.bit_depth);
             }
@@ -958,9 +979,77 @@ fn trak(body: &[u8], full_data: &[u8], info: &mut MediaInfo) {
     }
 }
 
-fn probe_block(block: &[u8], audio_tracks: &[(u64, usize)], info: &mut MediaInfo) {
+fn apply_rpu_to_video_track(v: &mut VideoTrack, mut dv: DolbyVisionInfo) {
+    if v.dv_profile.is_none() {
+        v.dv_profile = Some(dv.profile);
+    }
+    if v.dv_level.is_none() {
+        v.dv_level = dv.level;
+    } else if dv.level.is_none() || dv.level == Some(0) {
+        dv.level = v.dv_level;
+    }
+    if v.dv_enhancement_layer.is_none() {
+        v.dv_enhancement_layer = Some(dv.el_present);
+    }
+    v.dolby_vision = Some(dv);
+}
+
+fn skip_matroska_lace_header(flags: u8, payload: &[u8]) -> Option<&[u8]> {
+    match (flags >> 1) & 0x03 {
+        0 => Some(payload),
+        1 => {
+            let lace_count = usize::from(*payload.first()?);
+            let mut pos = 1usize;
+            for _ in 0..lace_count {
+                while *payload.get(pos)? == 0xFF {
+                    pos += 1;
+                }
+                pos += 1;
+            }
+            payload.get(pos..)
+        }
+        2 => payload.get(1..),
+        3 => {
+            let lace_count = usize::from(*payload.first()?);
+            let mut pos = 1usize;
+            for _ in 0..lace_count {
+                let (_, vint_len) = element_size(payload.get(pos..)?)?;
+                pos += vint_len;
+            }
+            payload.get(pos..)
+        }
+        _ => None,
+    }
+}
+
+fn probe_block(
+    block: &[u8],
+    video_tracks: &[(u64, usize, usize)],
+    audio_tracks: &[(u64, usize)],
+    video_rpu_found: &mut [bool],
+    info: &mut MediaInfo,
+) {
     let Some((Some(track_num), vint_len)) = element_size(block) else { return };
+    let Some(&flags) = block.get(vint_len + 2) else { return };
     let Some(payload) = block.get(vint_len + 3..) else { return };
+
+    if let Some(&(_, video_idx, nal_length_size)) =
+        video_tracks.iter().find(|&&(num, _, _)| num == track_num)
+    {
+        if video_rpu_found.get(video_idx).copied() == Some(false) {
+            let frames = skip_matroska_lace_header(flags, payload).unwrap_or(payload);
+            if let Some(dv) = DolbyVisionInfo::parse_rpu_with_length_size(frames, nal_length_size)
+                && let Some(track) = info.video.get_mut(video_idx)
+            {
+                apply_rpu_to_video_track(track, dv);
+                if let Some(found) = video_rpu_found.get_mut(video_idx) {
+                    *found = true;
+                }
+            }
+        }
+        return;
+    }
+
     let Some(&(_, audio_idx)) = audio_tracks.iter().find(|&&(num, _)| num == track_num) else { return };
     let Some(track) = info.audio.get_mut(audio_idx) else { return };
     if track.atmos {
@@ -976,13 +1065,19 @@ fn probe_block(block: &[u8], audio_tracks: &[(u64, usize)], info: &mut MediaInfo
     }
 }
 
-fn probe_cluster(data: &[u8], audio_tracks: &[(u64, usize)], info: &mut MediaInfo) {
+fn probe_cluster(
+    data: &[u8],
+    video_tracks: &[(u64, usize, usize)],
+    audio_tracks: &[(u64, usize)],
+    info: &mut MediaInfo,
+) {
+    let mut video_rpu_found = vec![false; info.video.len()];
     walk(data, &mut |id, body| {
         match id {
-            0xA3 => probe_block(body, audio_tracks, info),
+            0xA3 => probe_block(body, video_tracks, audio_tracks, &mut video_rpu_found, info),
             0xA0 => walk(body, &mut |sub_id, sub_body| {
                 if sub_id == 0xA1 {
-                    probe_block(sub_body, audio_tracks, info);
+                    probe_block(sub_body, video_tracks, audio_tracks, &mut video_rpu_found, info);
                 }
                 true
             }),
@@ -991,13 +1086,11 @@ fn probe_cluster(data: &[u8], audio_tracks: &[(u64, usize)], info: &mut MediaInf
         true
     });
 
-    if let Some(dv) = DolbyVisionInfo::parse_rpu(data) && let Some(v) = info.video.first_mut() {
-        if v.dv_profile.is_none() {
-            v.dv_profile = Some(dv.profile);
-            v.dv_level = dv.level;
-            v.dv_enhancement_layer = Some(dv.el_present);
-        }
-        v.dolby_vision = Some(dv);
+    if video_rpu_found.first().copied() == Some(false)
+        && let Some(dv) = DolbyVisionInfo::parse_rpu(data)
+        && let Some(v) = info.video.first_mut()
+    {
+        apply_rpu_to_video_track(v, dv);
     }
 }
 
@@ -1059,6 +1152,15 @@ impl DolbyVisionInfo {
         })
     }
 
+    pub fn parse_rpu_with_length_size(data: &[u8], nal_length_size: usize) -> Option<Self> {
+        if let Some(nal_payload) = Self::extract_length_prefixed_rpu_nal(data, nal_length_size)
+            && let Some(info) = Self::parse_rpu_payload(nal_payload)
+        {
+            return Some(info);
+        }
+        Self::parse_rpu(data)
+    }
+
     pub fn parse_rpu(data: &[u8]) -> Option<Self> {
         if data.is_empty() {
             return None;
@@ -1084,8 +1186,40 @@ impl DolbyVisionInfo {
         Self::parse_rpu(nal)
     }
 
+    fn extract_length_prefixed_rpu_nal(data: &[u8], nal_length_size: usize) -> Option<&[u8]> {
+        if !(1..=4).contains(&nal_length_size) || data.len() < nal_length_size + 2 {
+            return None;
+        }
+        let mut pos = 0usize;
+        while pos.saturating_add(nal_length_size).saturating_add(2) <= data.len() {
+            let len_bytes = data.get(pos..pos + nal_length_size)?;
+            let nal_len = len_bytes.iter().fold(0usize, |acc, &b| (acc << 8) | usize::from(b));
+            if nal_len < 2 {
+                break;
+            }
+            let nal_start = pos + nal_length_size;
+            let nal_end = nal_start.saturating_add(nal_len);
+            let hdr0 = *data.get(nal_start)?;
+            let hdr1 = *data.get(nal_start + 1)?;
+            let forbidden_zero = (hdr0 & 0x80) == 0;
+            let nal_type = (hdr0 >> 1) & 0x3f;
+            let tid_plus1 = hdr1 & 0x07;
+            if forbidden_zero && tid_plus1 != 0 && nal_type == 62 {
+                let payload_end = nal_end.min(data.len());
+                if nal_start + 2 < payload_end {
+                    return Some(&data[nal_start + 2..payload_end]);
+                }
+            }
+            if nal_end > data.len() {
+                break;
+            }
+            pos = nal_end;
+        }
+        None
+    }
+
     fn extract_rpu_nal(data: &[u8]) -> Option<&[u8]> {
-        if data.len() >= 2 && ((data[0] >> 1) & 0x3f) == 62 {
+        if data.len() >= 2 && (data[0] & 0x80) == 0 && ((data[0] >> 1) & 0x3f) == 62 && (data[1] & 0x07) != 0 {
             return Some(&data[2..]);
         }
 
@@ -1120,7 +1254,8 @@ impl DolbyVisionInfo {
             i += start_len;
         }
 
-        None
+        Self::extract_length_prefixed_rpu_nal(data, 4)
+            .or_else(|| Self::extract_length_prefixed_rpu_nal(data, 2))
     }
 
     fn parse_rpu_payload(payload: &[u8]) -> Option<Self> {
@@ -1402,7 +1537,7 @@ impl AudioBitstream {
     pub fn has_truehd_atmos(data: &[u8]) -> bool {
         for (i, window) in data.windows(4).enumerate() {
             if (window == [0xF8, 0x72, 0x6F, 0xBA] || window == [0xBA, 0x6F, 0x72, 0xF8])
-                && data.get(i + 7).is_some_and(|&b| b & 0x80 != 0)
+                && data.get(i + 17).is_some_and(|&b| b & 0x80 != 0)
             {
                 return true;
             }
@@ -1412,30 +1547,38 @@ impl AudioBitstream {
 
     pub fn has_eac3_atmos_frame(data: &[u8]) -> bool {
         let mut offset = 0usize;
+        let mut verified_no_emdf_start = 0usize;
         while let Some(slice) = data.get(offset..) {
             let Some(pos) = find_subsequence(slice, &[0x0B, 0x77]) else { break };
-            let frame = &slice[pos..];
+            let frame_start = offset + pos;
+            let frame = &data[frame_start..];
             if frame.len() >= 8 {
                 let strmtyp = (frame[2] >> 6) & 0x03;
                 let frmsiz = ((usize::from(frame[2] & 0x07)) << 8) | usize::from(frame[3]);
                 let frame_size = (frmsiz + 1) * 2;
                 let bsid = (frame[5] >> 3) & 0x1F;
                 if strmtyp != 3 && frmsiz >= 3 && (11..=16).contains(&bsid) {
-                    let body = &frame[6..frame.len().min(frame_size)];
-                    let mut emdf_off = 0usize;
-                    while let Some(emdf_slice) = body.get(emdf_off..) {
-                        let Some(emdf_pos) = find_subsequence(emdf_slice, &[0x58, 0x38]) else { break };
-                        if let Some(&hdr) = emdf_slice.get(emdf_pos + 2)
-                            && emdf_slice.get(emdf_pos + 3).is_some()
-                            && (hdr & 0xF8) == 0
-                        {
-                            return true;
+                    let body_start = frame_start + 6;
+                    let body_end = frame_start.saturating_add(frame_size).min(data.len());
+                    let scan_start = body_start.max(verified_no_emdf_start);
+                    if scan_start < body_end {
+                        let body = &data[scan_start..body_end];
+                        let mut emdf_off = 0usize;
+                        while let Some(emdf_slice) = body.get(emdf_off..) {
+                            let Some(emdf_pos) = find_subsequence(emdf_slice, &[0x58, 0x38]) else { break };
+                            if let Some(&hdr) = emdf_slice.get(emdf_pos + 2)
+                                && emdf_slice.get(emdf_pos + 3).is_some()
+                                && (hdr & 0xF8) == 0
+                            {
+                                return true;
+                            }
+                            emdf_off = emdf_off.saturating_add(emdf_pos + 2);
                         }
-                        emdf_off = emdf_off.saturating_add(emdf_pos + 2);
+                        verified_no_emdf_start = verified_no_emdf_start.max(body_end.saturating_sub(3));
                     }
                 }
             }
-            offset = offset.saturating_add(pos + 2);
+            offset = frame_start.saturating_add(2);
         }
         false
     }
@@ -2076,10 +2219,84 @@ mod tests {
 
     #[test]
     fn truehd_repeated_sync_words_scan_in_one_linear_pass() {
-        let mut payload = [0xF8, 0x72, 0x6F, 0xBA, 0x00, 0x00, 0x00, 0x00].repeat(8_192);
+        let mut frame = [0u8; 24];
+        frame[0..4].copy_from_slice(&[0xF8, 0x72, 0x6F, 0xBA]);
+        let mut payload = frame.repeat(4_096);
         assert!(!AudioBitstream::has_truehd_atmos(&payload));
-        let last = payload.len() - 8;
+        let last = payload.len() - 24;
+        // Bit 7 at +7 (channel assignment field) must NOT falsely trigger Atmos
         payload[last + 7] = 0x80;
+        assert!(!AudioBitstream::has_truehd_atmos(&payload));
+        // Bit 7 at +17 (substream_info 4th substream flag) must trigger Atmos
+        payload[last + 17] = 0x80;
         assert!(AudioBitstream::has_truehd_atmos(&payload));
+    }
+
+    #[test]
+    fn eac3_repeated_sync_words_in_4mib_scan_in_linear_time() {
+        // 4 MiB of repeated [0x0B, 0x77, 0x07, 0xFF, 0x00, 0x80] (frmsiz=2047 -> 4096-byte frame, bsid=16)
+        let pattern = [0x0B, 0x77, 0x07, 0xFF, 0x00, 0x80];
+        let mut payload = pattern.repeat(4 * 1024 * 1024 / pattern.len());
+        let start = std::time::Instant::now();
+        assert!(!AudioBitstream::has_eac3_atmos_frame(&payload));
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(250),
+            "4 MiB repeated E-AC-3 sync word scan must complete in linear time, took {:?}",
+            start.elapsed()
+        );
+        // Place valid EMDF sync [0x58, 0x38, 0x00, 0x00] near the end of the 4 MiB buffer
+        let tail = payload.len() - 16;
+        payload[tail..tail + 4].copy_from_slice(&[0x58, 0x38, 0x00, 0x00]);
+        assert!(AudioBitstream::has_eac3_atmos_frame(&payload));
+    }
+
+    #[test]
+    fn mkv_simpleblock_length_prefixed_hevc_nal62_rpu_upgrades_dvcc_profile7_fel() {
+        // Track 1: HEVC with dvvC BlockAdditionMapping (Profile 7, Level 6, el_present=1, fel initially false)
+        let dvvc = [1u8, 0, 7 << 1, (6 << 3) | 0b111];
+        let mapping = el(&[0x41, 0xE4], &el(&[0x41, 0xED], &dvvc));
+        // Minimal 23-byte hvcC with lengthSizeMinusOne = 3 (4-byte NAL length prefixes) at byte 21
+        let mut hvcc = [0u8; 23];
+        hvcc[0] = 1;
+        hvcc[21] = 0xFC | 0x03;
+        let t1 = [
+            el(&[0xD7], &[1]),
+            el(&[0x83], &[1]),
+            el(&[0x86], b"V_MPEGH/ISO/HEVC"),
+            el(&[0x63, 0xA2], &hvcc),
+            mapping,
+        ]
+        .concat();
+        let tracks = el(&[0xAE], &t1);
+
+        // Build a SimpleBlock for Track 1 containing two 4-byte length-prefixed HEVC NAL units:
+        // 1. IDR slice NAL (type 19 -> header 0x26, 0x01) of 6 bytes
+        // 2. Dolby Vision RPU NAL (type 62 -> header 0x7C, 0x01) with Profile 7 FEL + CM v4.0 payload
+        let rpu_rbsp = [0x18u8, 0x00, 0x0B, 0x46, 0x50, 0x80, 0xFE];
+        let mut rpu_nal = vec![0x7C, 0x01];
+        rpu_nal.extend_from_slice(&rpu_rbsp);
+        let idr_nal = [0x26u8, 0x01, 0xAA, 0xBB, 0xCC, 0xDD];
+
+        let mut simple_block_body = vec![0x81, 0x00, 0x00, 0x80]; // Track 1, pts=0, keyframe, no lacing
+        simple_block_body.extend_from_slice(&(idr_nal.len() as u32).to_be_bytes());
+        simple_block_body.extend_from_slice(&idr_nal);
+        simple_block_body.extend_from_slice(&(rpu_nal.len() as u32).to_be_bytes());
+        simple_block_body.extend_from_slice(&rpu_nal);
+
+        let cluster = el(&[0x1F, 0x43, 0xB6, 0x75], &el(&[0xA3], &simple_block_body));
+        let segment = el(
+            &[0x18, 0x53, 0x80, 0x67],
+            &[el(&[0x16, 0x54, 0xAE, 0x6B], &tracks), cluster].concat(),
+        );
+        let mkv = [el(&[0x1A, 0x45, 0xDF, 0xA3], &el(&[0x42, 0x82], b"matroska")), segment].concat();
+
+        let info = parse(&mkv).expect("mkv with length-prefixed HEVC SimpleBlock must parse");
+        assert_eq!(info.video.len(), 1);
+        let dv = info.video[0].dolby_vision.as_ref().expect("Dolby Vision info must be present");
+        assert_eq!(dv.profile, 7);
+        assert_eq!(dv.level, Some(6));
+        assert!(dv.el_present);
+        assert!(dv.fel, "in-band length-prefixed RPU must upgrade Profile 7 FEL flag");
+        assert_eq!(dv.cm_version, "v4.0");
     }
 }

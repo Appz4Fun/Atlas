@@ -73,7 +73,7 @@ Sources: [posting-behavior/FINAL-REPORT.md](posting-behavior/FINAL-REPORT.md) (v
 - [ ] P3-P6: ms-continuity placement, NewsUP drand48, size-vector twin key with entropy gate, X-Received-Body-CRC twin key, offline seed searches.
 - [ ] End-to-start file join by the right clock (Nyuu ms, server-ID time, article rank), then PAR2 file-size match and 16 KB MD5 tie-break; veto-aware union-find (~80 lines, our own).
 - [ ] Validate on Atlas's own XOVER/HEAD data (everything so far was measured on public NZBs). Needs the owner's go.
-- [ ] Run the read-only provider probe [posting-behavior/nntp-probe/](posting-behavior/nntp-probe/) once per provider account (owner action) to settle NEWNEWS, HDR on NNTP-Posting-Date, Lines, clock skew and server-ID shapes.
+- [x] Run the read-only provider probe [posting-behavior/nntp-probe/](posting-behavior/nntp-probe/) once per provider account (completed 2026-11-03 in [posting-behavior/nntp-probe/results-2026-11-03.md](posting-behavior/nntp-probe/results-2026-11-03.md), PR #74): `NEWNEWS` is disabled everywhere (`400`/`500`/`502`), non-overview `XHDR`/`HDR` returns `221` with no values or `400`/`501`/`503`, `Lines` is empty/`"0"` on up to 64% of rows, 2-digit `Date` years appear on 13–68% of rows, Giganews (`super.newsgroupdirect.com`) runs **+5.74 s** ahead on `DATE`, and `XZVER` works on XSNews/Usenet.Farm while hanging on Highwinds (`XFEATURE COMPRESS GZIP` 290). Follow-up: re-run on a busy obfuscated binaries group to sample server-assigned Message-IDs.
 
 ## 6. Frames and fingerprints
 
@@ -95,7 +95,7 @@ Source: [metadata-visibility/MAP.md](metadata-visibility/MAP.md) section 4 (visi
 - What share of release MP4s are faststart? (`release_probe` can answer this.)
 - Does mkvmerge write the T.35 HDR10+ block-addition mapping?
 - Is Highwinds S/K per upload or per connection, and is K ever reused?
-- Does any provider allow `XHDR X-Received-Body-CRC`?
+- ~~Does any provider allow `XHDR X-Received-Body-CRC`?~~ **Settled (2026-11-03 probe):** No — every probed provider returns `221` with zero values or `400`/`501`/`503` for non-overview headers on `XHDR`/`HDR`; reading `X-Received-Body-CRC` requires `HEAD` per article.
 - Does WinRAR repeat the same `-hp` salt in every volume?
 - What default dictionary size does each RAR and 7-Zip version write? (Needed for the packer-version fingerprint.)
 - What Creator strings do MultiPar and QuickPar write in PAR2?
