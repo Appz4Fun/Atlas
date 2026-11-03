@@ -221,16 +221,22 @@ impl Par2Bridge {
             }
         }
 
-        // Step 2 & 3: 16 KiB MD5 tie-breaker and RAR5 volume vint fallback for equal sizes
-        for (i, run) in candidate_runs.iter_mut().enumerate() {
+        // Precompute (size, md5_16k) frequencies to reject ambiguous 16 KiB prefix matches
+        let mut par2_prefix_counts: HashMap<(u64, [u8; 16]), usize> = HashMap::new();
+        for f in &inv.files {
+            *par2_prefix_counts.entry((f.size, f.md5_16k)).or_insert(0) += 1;
+        }
+
+        let mut candidate_heads: Vec<Option<(&ArticleHead, [u8; 16])>> = Vec::with_capacity(candidate_runs.len());
+        let mut candidate_prefix_counts: HashMap<(u64, [u8; 16]), usize> = HashMap::new();
+        for (i, run) in candidate_runs.iter().enumerate() {
             if run.full_md5.is_some() {
+                candidate_heads.push(None);
                 continue;
             }
-
             let head = first_articles
                 .iter()
                 .find(|a| a.file_index == i || a.file_index == run.file_index.unwrap_or(-1) as usize);
-
             if let Some(article_head) = head {
                 let md5_bytes = if article_head.payload.len() >= 16384 {
                     &article_head.payload[..16384]
@@ -238,11 +244,43 @@ impl Par2Bridge {
                     &article_head.payload
                 };
                 let head_md5: [u8; 16] = md5::Md5::digest(md5_bytes).into();
+                *candidate_prefix_counts.entry((run.size, head_md5)).or_insert(0) += 1;
+                candidate_heads.push(Some((article_head, head_md5)));
+            } else {
+                candidate_heads.push(None);
+            }
+        }
 
-                // Check 16 KB MD5 match against remaining PAR2 files with identical size
-                if let Some(f) = inv.files.iter().find(|pf| {
-                    pf.size == run.size && pf.md5_16k == head_md5 && !matched_file_ids.contains(&pf.file_id)
-                }) {
+        // Step 2 & 3: 16 KiB MD5 tie-breaker and RAR5 volume vint fallback for equal sizes
+        for (run, head_entry) in candidate_runs.iter_mut().zip(candidate_heads) {
+            if run.full_md5.is_some() {
+                continue;
+            }
+
+            if let Some((article_head, head_md5)) = head_entry {
+                let unique_prefix = par2_prefix_counts.get(&(run.size, head_md5)) == Some(&1)
+                    && candidate_prefix_counts.get(&(run.size, head_md5)) == Some(&1);
+
+                let prefix_match = if unique_prefix {
+                    inv.files.iter().find(|pf| {
+                        pf.size == run.size && pf.md5_16k == head_md5 && !matched_file_ids.contains(&pf.file_id)
+                    })
+                } else if let Some(expected_crc) = run.file_crc {
+                    let mut crc_matches = inv.files.iter().filter(|pf| {
+                        pf.size == run.size
+                            && pf.md5_16k == head_md5
+                            && pf.crc32 == Some(expected_crc)
+                            && !matched_file_ids.contains(&pf.file_id)
+                    });
+                    match (crc_matches.next(), crc_matches.next()) {
+                        (Some(f), None) => Some(f),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+
+                if let Some(f) = prefix_match {
                     run.filename = f.name.clone();
                     run.full_md5 = Some(f.md5);
                     run.md5_16k = Some(f.md5_16k);
@@ -262,14 +300,16 @@ impl Par2Bridge {
                     let vol_p1 = format!("part{:02}.", vol_num);
                     let vol_p2 = format!("part{}.", vol_num);
                     let vol_p3 = format!(".r{:02}", vol_num.saturating_sub(1));
-                    if let Some(f) = inv.files.iter().find(|pf| {
+                    let mut vol_matches = inv.files.iter().filter(|pf| {
                         let lower = pf.name.to_ascii_lowercase();
-                        !matched_file_ids.contains(&pf.file_id)
+                        pf.size == run.size
+                            && !matched_file_ids.contains(&pf.file_id)
                             && (lower.contains(&vol_p0)
                                 || lower.contains(&vol_p1)
                                 || lower.contains(&vol_p2)
                                 || lower.contains(&vol_p3))
-                    }) {
+                    });
+                    if let (Some(f), None) = (vol_matches.next(), vol_matches.next()) {
                         run.filename = f.name.clone();
                         run.full_md5 = Some(f.md5);
                         run.md5_16k = Some(f.md5_16k);
@@ -591,6 +631,7 @@ pub struct ReleaseCandidate {
 impl ReleaseCandidate {
     pub fn is_lcm_compatible(&self, other: &Self) -> bool {
         self.lcm_matched_intervals >= 4
+            || other.lcm_matched_intervals >= 4
             || (self.yenc_part_size.is_some()
                 && other.yenc_part_size.is_some()
                 && self.yenc_part_size != other.yenc_part_size)
@@ -981,5 +1022,105 @@ mod tests {
         vol3.extend([0u8; 4]); // CRC32
         vol3.extend([9, 1, 0x01, 2, 0x03, 2]);
         assert_eq!(Par2Bridge::parse_rar5_volume_num(&vol3), Some(3));
+    }
+
+    #[test]
+    fn lcm_compatibility_is_symmetric_across_argument_order() {
+        let a = ReleaseCandidate {
+            name: "rel_a".into(),
+            full_md5: None,
+            size: 100_000_000,
+            unpacked_crc32: None,
+            yenc_total: Some(100),
+            creation_salt: None,
+            segment_uid: None,
+            lcm_matched_intervals: 0,
+            yenc_part_size: None,
+        };
+        let mut b = a.clone();
+        b.name = "rel_b".into();
+        b.yenc_total = Some(200);
+        b.lcm_matched_intervals = 4;
+
+        assert!(a.is_lcm_compatible(&b));
+        assert!(b.is_lcm_compatible(&a));
+        assert_eq!(
+            InterReleaseDeduplication::can_deduplicate_as_twin(&a, &b),
+            InterReleaseDeduplication::can_deduplicate_as_twin(&b, &a)
+        );
+        assert_eq!(InterReleaseDeduplication::partition_releases(&a, &b), ReleasePartition::Twin);
+        assert_eq!(InterReleaseDeduplication::partition_releases(&b, &a), ReleasePartition::Twin);
+    }
+
+    #[test]
+    fn ambiguous_16k_prefix_uses_rar5_volume_or_remains_unresolved() {
+        let make_desc = |file_id: [u8; 16], full_md5: [u8; 16], md5_16k: [u8; 16], size: u64, name: &str| {
+            let mut body = Vec::new();
+            body.extend_from_slice(&file_id);
+            body.extend_from_slice(&full_md5);
+            body.extend_from_slice(&md5_16k);
+            body.extend_from_slice(&size.to_le_bytes());
+            body.extend_from_slice(name.as_bytes());
+            body.push(0);
+            while !body.len().is_multiple_of(4) {
+                body.push(0);
+            }
+            let mut pkt = Vec::new();
+            pkt.extend_from_slice(b"PAR2\0PKT");
+            pkt.extend_from_slice(&((64 + body.len()) as u64).to_le_bytes());
+            pkt.extend_from_slice(&[0u8; 16]);
+            pkt.extend_from_slice(&[0x77; 16]);
+            pkt.extend_from_slice(b"PAR 2.0\0FileDesc");
+            pkt.extend_from_slice(&body);
+            pkt
+        };
+
+        // Two RAR5 volumes of equal size (50_000) that share the exact same 16 KiB prefix
+        // Wait: if they share the first 16 KiB, they have the same md5_16k.
+        // For non-RAR5 files with identical first 16 KiB and no CRC, neither should be resolved
+        // rather than assigning the wrong filename/full_md5 based on candidate order.
+        let shared_head = vec![0x42u8; 16_384];
+        let shared_16k: [u8; 16] = md5::Md5::digest(&shared_head).into();
+        let par2_non_rar = [
+            make_desc([1; 16], [0xA1; 16], shared_16k, 50_000, "disc1.iso"),
+            make_desc([2; 16], [0xB2; 16], shared_16k, 50_000, "disc2.iso"),
+        ]
+        .concat();
+
+        let base_run = CandidateFileRun {
+            filename: "obf_a.bin".into(),
+            group: "g".into(),
+            poster: "p".into(),
+            size: 50_000,
+            yenc_total: None,
+            yenc_part_size: None,
+            file_index: Some(0),
+            rar_volume_idx: None,
+            archive_format: None,
+            member_id: None,
+            byte_offset: 0,
+            t_start: 0.0,
+            t_end: 1.0,
+            file_crc: None,
+            md5_16k: None,
+            full_md5: None,
+            unpacked_crc32: None,
+            creation_salt: None,
+            is_obfuscated: true,
+        };
+        let mut run2 = base_run.clone();
+        run2.filename = "obf_b.bin".into();
+        run2.file_index = Some(1);
+
+        let mut runs = vec![base_run, run2];
+        let heads = vec![
+            ArticleHead { file_index: 0, payload: shared_head.clone() },
+            ArticleHead { file_index: 1, payload: shared_head },
+        ];
+        let res = Par2Bridge::resolve(&par2_non_rar, &mut runs, &heads);
+        assert_eq!(res.resolved_count, 0, "ambiguous 16 KiB prefix without disambiguator must stay unresolved");
+        assert!(!res.success);
+        assert!(runs[0].full_md5.is_none());
+        assert!(runs[1].full_md5.is_none());
     }
 }

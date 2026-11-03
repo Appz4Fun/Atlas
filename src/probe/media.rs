@@ -468,10 +468,16 @@ fn segment(body: &[u8], info: &mut MediaInfo) {
                 chapters(v, info);
             }
             0x1941_A469 => attachments(v, info),
-            0x1254_C367 => {
+            0x1254_C367 if info.tags.len() < MAX_TAGS => {
                 walk(v, &mut |id, tag| {
+                    if info.tags.len() >= MAX_TAGS {
+                        return false;
+                    }
                     if id == 0x7373 {
                         walk(tag, &mut |id, simple_tag| {
+                            if info.tags.len() >= MAX_TAGS {
+                                return false;
+                            }
                             if id == 0x67C8 {
                                 let mut name = None;
                                 let mut string_val = None;
@@ -486,14 +492,15 @@ fn segment(body: &[u8], info: &mut MediaInfo) {
                                 if let (Some(n), Some(s)) = (name, string_val)
                                     && !n.is_empty()
                                     && !s.is_empty()
+                                    && (info.tags.len() < MAX_TAGS || info.tags.contains_key(&n))
                                 {
                                     info.tags.insert(n, s);
                                 }
                             }
-                            true
+                            info.tags.len() < MAX_TAGS
                         });
                     }
-                    true
+                    info.tags.len() < MAX_TAGS
                 });
             }
             // what's after the first cluster is the video itself
@@ -507,6 +514,9 @@ fn segment(body: &[u8], info: &mut MediaInfo) {
         true
     });
 }
+
+/// The most tags kept from Matroska `Tags` elements.
+const MAX_TAGS: usize = 64;
 
 /// The most chapters kept. A Blu-ray has a few dozen; these come from Usenet.
 const MAX_CHAPTERS: usize = 256;
@@ -1110,7 +1120,7 @@ impl DolbyVisionInfo {
             level: Some(level),
             rpu_present,
             el_present,
-            fel: profile == 7 && el_present,
+            fel: false,
             cm_version: "v2.9".to_string(),
         })
     }
@@ -1120,6 +1130,12 @@ impl DolbyVisionInfo {
             return None;
         }
 
+        if let Some(nal_payload) = Self::extract_rpu_nal(data)
+            && let Some(info) = Self::parse_rpu_payload(nal_payload)
+        {
+            return Some(info);
+        }
+
         if data.len() >= 4 && (data[0] == 1 || data[0] == 0) && data[1] == 0 && (data[2] >> 1) <= 10
             && let Some(info) = Self::from_dvcc_dvvc(data)
             && [4, 5, 7, 8].contains(&info.profile)
@@ -1127,8 +1143,7 @@ impl DolbyVisionInfo {
             return Some(info);
         }
 
-        let nal_payload = Self::extract_rpu_nal(data)?;
-        Self::parse_rpu_payload(nal_payload)
+        None
     }
 
     pub fn parse_unspec62(nal: &[u8]) -> Option<Self> {
@@ -1451,22 +1466,12 @@ pub struct AudioBitstream;
 
 impl AudioBitstream {
     pub fn has_truehd_atmos(data: &[u8]) -> bool {
-        let mut offset = 0usize;
-        while let Some(slice) = data.get(offset..) {
-            let pos = match (
-                find_subsequence(slice, &[0xF8, 0x72, 0x6F, 0xBA]),
-                find_subsequence(slice, &[0xBA, 0x6F, 0x72, 0xF8]),
-            ) {
-                (Some(a), Some(b)) => Some(a.min(b)),
-                (Some(a), None) => Some(a),
-                (None, Some(b)) => Some(b),
-                (None, None) => None,
-            };
-            let Some(pos) = pos else { break };
-            if slice.get(pos + 7).is_some_and(|&b| b & 0x80 != 0) {
+        for (i, window) in data.windows(4).enumerate() {
+            if (window == [0xF8, 0x72, 0x6F, 0xBA] || window == [0xBA, 0x6F, 0x72, 0xF8])
+                && data.get(i + 7).is_some_and(|&b| b & 0x80 != 0)
+            {
                 return true;
             }
-            offset = offset.saturating_add(pos + 4);
         }
         false
     }
@@ -2153,5 +2158,40 @@ mod tests {
         let info_atmos = parse(&mkv_with_atmos).unwrap();
         assert!(!info_atmos.audio[0].atmos, "first audio track must remain non-Atmos");
         assert!(info_atmos.audio[1].atmos, "second audio track must be marked Atmos");
+    }
+
+    #[test]
+    fn dvcc_profile7_defers_fel_until_rpu_is_inspected() {
+        let dv_box = [1, 0, 7 << 1, (6 << 3) | 0b011];
+        let info = DolbyVisionInfo::from_dvcc_dvvc(&dv_box).expect("must parse dvvC");
+        assert_eq!(info.profile, 7);
+        assert_eq!(info.level, Some(6));
+        assert!(info.el_present);
+        assert!(!info.fel, "configuration record alone cannot classify MEL vs FEL");
+    }
+
+    #[test]
+    fn a_flood_of_mkv_tags_is_cut_short_at_max_tags() {
+        let mut tag_entries = Vec::new();
+        for i in 0..(MAX_TAGS + 20) {
+            let name = format!("TAG_{i}");
+            let simple = [el(&[0x45, 0xA3], name.as_bytes()), el(&[0x44, 0x87], b"val")].concat();
+            tag_entries.extend(el(&[0x73, 0x73], &el(&[0x67, 0xC8], &simple)));
+        }
+        let tags_elem = el(&[0x12, 0x54, 0xC3, 0x67], &tag_entries);
+        let segment = el(&[0x18, 0x53, 0x80, 0x67], &tags_elem);
+        let mkv = [el(&[0x1A, 0x45, 0xDF, 0xA3], &el(&[0x42, 0x82], b"matroska")), segment].concat();
+
+        let info = parse(&mkv).expect("mkv with many tags must parse");
+        assert_eq!(info.tags.len(), MAX_TAGS);
+    }
+
+    #[test]
+    fn truehd_repeated_sync_words_scan_in_one_linear_pass() {
+        let mut payload = [0xF8, 0x72, 0x6F, 0xBA, 0x00, 0x00, 0x00, 0x00].repeat(8_192);
+        assert!(!AudioBitstream::has_truehd_atmos(&payload));
+        let last = payload.len() - 8;
+        payload[last + 7] = 0x80;
+        assert!(AudioBitstream::has_truehd_atmos(&payload));
     }
 }
