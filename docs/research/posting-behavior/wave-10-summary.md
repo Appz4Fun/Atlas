@@ -1,0 +1,15 @@
+# Wave 10 merged (11:26-11:36Z), the last wave
+- RED TEAM of the wave 9 pipeline spec found 14 issues. The four most serious:
+  - Cost tiers: with per-article random subjects, file identity needs every body. Test 1's 50-body budget only holds when subjects are stable or Nyuu ms identity is available.
+  - The +0.5 s join window misses 15% of real Nyuu gaps. postie sends 2 files at once, so its files overlap. Windows must be set per tool.
+  - Injection-Date is missing for Nyuu and postie posts. The Nyuu Message-ID ms is the best clock and must be used.
+  - A hash16k match proves which volume a run is, not which upload it belongs to. Twins share it, so dedupe must key on (msgid, group, num) and output twin groups instead of merging them.
+  - Also: veto only on content (part size, total, CRC), never on tool or :bytes. Highwinds S looked per-upload in 7/7 real NZBs. Add the container-header fallback. Build runs once per msgid for crossposts. Reopen runs on late parts and hold publication about 4 h.
+  - Minimal v1: ingest+dedupe, then file runs, then the end-to-start join, then content resolve (PAR2 → sizeChain → hash16k, or the container header when there is no PAR2), then union and output with Proven/SizeMatched/TimeOnly levels plus twin and alt groups.
+- LIVE CALIBRATION PLAN:
+  - Fields to persist per article.
+  - About 15 low-cardinality Prometheus metrics, LAN only, with no names or IDs in labels.
+  - 4 ground-truth sources: clear subjects with labels masked, external NZBs, postie PAR2 real names, and Nyuu ms. A 20% holdout.
+  - Rollout: instrument and run the probe, then shadow for 2 weeks, then fit thresholds, then promote per confidence level. Promotion needs precision ≥.98 for 7 days and ≤1 body per file.
+  - 8 Grafana panels with queries.
+- FINAL TABLES: 30 signals × proves × read cost × evidence × Atlas status, a 7-tool fingerprint table, 8 provider families, and 19 dead ends.

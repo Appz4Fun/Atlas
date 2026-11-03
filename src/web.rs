@@ -13,6 +13,7 @@ use crate::api::{ApiResponse, escape, find_releases, get_nzb, parse_query};
 use crate::archive::Password;
 use crate::category::{TABLE, UNCATEGORIZED, label, parse_filter};
 use crate::field_search::{self, Fields};
+use crate::gemini;
 use crate::media::query::MediaAttrs;
 use crate::media::title::Kind;
 use crate::search::{ReleaseRow, get_release};
@@ -61,18 +62,29 @@ pub fn get(path: &str, query: &str, cookies: Option<&str>, base: &str, api_key: 
         "/ui/duplicates" if signed_in => duplicates_page(&args),
         "/ui/details" if signed_in => details_panel(&args),
         "/ui/poster" if signed_in => poster(&args),
+        "/ui/meta" if signed_in => crate::web_meta::fragment(&args),
+        "/ui/row" if signed_in => crate::web_meta::row_panel(&args),
+        "/ui/settings" if signed_in => html(200, settings_page(None)),
         "/ui/nzb" if signed_in && args.get("fill").is_some_and(|v| v == "1") => filled_nzb(&args),
         "/ui/nzb" if signed_in => get_nzb(&args),
-        "/ui/details" | "/ui/poster" => {
+        "/ui/details" | "/ui/poster" | "/ui/meta" | "/ui/row" => {
             ApiResponse { headers: vec![("HX-Redirect".into(), "/".into())], ..html(401, String::new()) }
         }
-        "/ui/nzb" | "/ui/release" | "/ui/duplicates" => redirect(Vec::new()),
+        "/ui/nzb" | "/ui/release" | "/ui/duplicates" | "/ui/settings" => redirect(Vec::new()),
         _ => return None,
     })
 }
 
-/// A POST the ui answers. None: not ours.
-pub fn post(path: &str, body: &str, base: &str, api_key: &str) -> Option<ApiResponse> {
+/// A POST the ui answers. None: not ours. `htmx`: htmx sent it, and swaps in what comes back.
+pub fn post(
+    path: &str,
+    body: &str,
+    cookies: Option<&str>,
+    htmx: bool,
+    base: &str,
+    api_key: &str,
+) -> Option<ApiResponse> {
+    let signed_in = signed_in(cookies, api_key);
     match path {
         "/login" => {
             let args = parse_query(body);
@@ -85,13 +97,19 @@ pub fn post(path: &str, body: &str, base: &str, api_key: &str) -> Option<ApiResp
             })
         }
         "/logout" => Some(redirect(vec![cookie_header("", 0)])),
+        "/ui/ask" if signed_in => Some(ask(body, htmx)),
+        "/ui/settings" if signed_in => Some(save_settings(body)),
+        "/ui/ask" if htmx => {
+            Some(ApiResponse { headers: vec![("HX-Redirect".into(), "/".into())], ..html(401, String::new()) })
+        }
+        "/ui/ask" | "/ui/settings" => Some(redirect(Vec::new())),
         _ => None,
     }
 }
 
 /// The ui reads a request body only on these paths.
 pub fn takes_post(path: &str) -> bool {
-    matches!(path, "/login" | "/logout")
+    matches!(path, "/login" | "/logout" | "/ui/ask" | "/ui/settings")
 }
 
 fn cookie_header(value: &str, max_age: i64) -> (String, String) {
@@ -118,7 +136,7 @@ fn asset(content_type: &'static str, body: &str) -> ApiResponse {
     }
 }
 
-fn html(status: u16, body: String) -> ApiResponse {
+pub(crate) fn html(status: u16, body: String) -> ApiResponse {
     ApiResponse {
         status,
         content_type: Some("text/html; charset=utf-8"),
@@ -153,11 +171,11 @@ fn same(a: &str, b: &str) -> bool {
 }
 
 /// `escape`, and safe inside a quoted attribute too
-fn attr(s: &str) -> String {
+pub(crate) fn attr(s: &str) -> String {
     escape(s).replace('"', "&quot;").replace('\'', "&#39;")
 }
 
-fn url_encode(s: &str) -> String {
+pub(crate) fn url_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
@@ -506,6 +524,16 @@ impl Search {
                 } else {
                     HashMap::new()
                 };
+                // by the size it shows: all of a post spread over several groups
+                if sort == SortBy::Size
+                    && let Ok(conn) = crate::db::open()
+                {
+                    for r in found.iter_mut().filter(|r| !r.complete) {
+                        if let Ok(Some(post)) = release_info::split_post_with(&conn, r) {
+                            r.size = Some(post.size);
+                        }
+                    }
+                }
                 sort_rows(&mut found, sort, self.descending, &categories, &scores);
             }
             let start = usize::try_from(self.offset).unwrap_or(0).min(found.len());
@@ -520,6 +548,28 @@ impl Search {
         } else {
             read == PAGE_SIZE
         };
+        // a post spread over several groups is one row, unless the search is about one of the groups. Before copies are
+        // hidden: its rows can look like copies of each other
+        let mut split = HashMap::new();
+        let conn = crate::db::open().ok();
+        let one_group = !self.fields.group.is_empty();
+        let post_of = |r: &ReleaseRow| {
+            if r.complete {
+                return None;
+            }
+            conn.as_ref().and_then(|conn| release_info::split_post_with(conn, r).ok().flatten())
+        };
+        let folded = |r: &ReleaseRow, post: &release_info::SplitPost| !one_group && post.listed_id() != r.id;
+        found.retain_mut(|r| {
+            let Some(post) = post_of(r) else { return true };
+            if folded(r, &post) {
+                return false;
+            }
+            r.size = Some(post.size);
+            r.complete = post.complete;
+            split.insert(r.id, post.groups.len());
+            true
+        });
         if hide_copies {
             // a copy of something on an earlier page is a copy too
             if !windowed && self.offset > 0 {
@@ -527,6 +577,7 @@ impl Search {
                 let start = self.offset - earlier;
                 before = self.search(filter.as_ref(), start, earlier).unwrap_or_default();
             }
+            before.retain(|r| !post_of(r).is_some_and(|post| folded(r, &post)));
             let ids: Vec<i64> = before.iter().filter(|r| tagged(r)).chain(found.iter()).map(|r| r.id).collect();
             let hidden = crate::duplicates::later_copies(&ids).unwrap_or_default();
             found.retain(|r| !hidden.contains(&r.id));
@@ -536,6 +587,7 @@ impl Search {
         let passwords = crate::archive::store::passwords(&ids);
         let media = crate::media::query::attrs_of(&ids).unwrap_or_default();
         let extras = RowExtras {
+            split,
             copies: crate::duplicates::counts(&ids).unwrap_or_default(),
             details: crate::media::details::kept_for(media.iter().map(|(id, m)| (*id, m.kind, &m.ids))),
         };
@@ -648,14 +700,16 @@ impl Search {
 /// What a result shows beyond its own row.
 #[derive(Default)]
 struct RowExtras {
+    /// groups, for a post spread over several
+    split: HashMap<i64, usize>,
     copies: HashMap<i64, crate::duplicates::CopyCount>,
     details: HashMap<i64, crate::media::details::Details>,
 }
 
 /// Columns of the results table.
-const COLUMNS: usize = 6;
+pub(crate) const COLUMNS: usize = 6;
 
-fn tag(class: &str, text: &str) -> String {
+pub(crate) fn tag(class: &str, text: &str) -> String {
     format!(" <span class=\"tag {class}\">{}</span>", escape(text))
 }
 
@@ -738,10 +792,14 @@ fn row(
             tags.push_str(&tag("tag-ref", &format!("{} ALT{}", count.alts, if count.alts == 1 { "" } else { "S" })));
         }
     }
+    if let Some(groups) = extras.split.get(&r.id) {
+        tags.push_str(&tag("tag-ref", &format!("{groups} GROUPS")));
+    }
     tags.push_str(&password_tag(passwords.get(&r.id)));
     if !r.complete {
         tags.push_str(&tag("tag-warn", "INCOMPLETE"));
     }
+    tags.push_str(&crate::web_meta::drawer_trigger(r.id));
     let meta = [category.as_str(), size.as_str(), posted.as_str()]
         .into_iter()
         .filter(|part| !part.is_empty())
@@ -758,12 +816,12 @@ fn row(
 }
 
 /// A link to search on a value, showing other words than the value.
-fn search_link_to(param: &str, value: &str, shown: &str) -> String {
+pub(crate) fn search_link_to(param: &str, value: &str, shown: &str) -> String {
     format!("<a href=\"/?{param}={}\">{}</a>", attr(&url_encode(value)), escape(shown))
 }
 
 /// 2684354560 as 2,684,354,560
-fn thousands(n: i64) -> String {
+pub(crate) fn thousands(n: i64) -> String {
     let digits = n.unsigned_abs().to_string();
     let mut out = String::new();
     for (i, c) in digits.chars().enumerate() {
@@ -808,14 +866,18 @@ fn results(args: &HashMap<String, String>) -> ApiResponse {
     if search.offset > 0 {
         return html(200, search.body());
     }
-    // the sidebar and the form follow the search too
+    first_page(&search, &ask_note("", " hx-swap-oob=\"true\""))
+}
+
+/// A new search's results, with the sidebar and the form following it. `more` goes in too, for out of band swaps.
+fn first_page(search: &Search, more: &str) -> ApiResponse {
     let oob = " hx-swap-oob=\"true\"";
     let body = format!(
-        "{}{}{}{}",
-        results_html(&search),
-        category_nav(&search, oob),
+        "{}{}{}{}{more}",
+        results_html(search),
+        category_nav(search, oob),
         category_input(&search.cat, oob),
-        scope_inputs(&search, oob),
+        scope_inputs(search, oob),
     );
     let mut resp = html(200, body);
     // the address bar follows the search, and reloads the full page
@@ -909,7 +971,7 @@ fn page(title: &str, content: &str) -> String {
 
 fn masthead(signed_in: bool) -> String {
     let tools = if signed_in {
-        "<a class=\"button\" href=\"/ui/duplicates\">Duplicates</a><form method=\"post\" action=\"/logout\"><button class=\"button\">Sign out</button></form>"
+        "<a class=\"button\" href=\"/ui/duplicates\">Duplicates</a><a class=\"button\" href=\"/ui/settings\">Settings</a><form method=\"post\" action=\"/logout\"><button class=\"button\">Sign out</button></form>"
     } else {
         ""
     };
@@ -928,16 +990,18 @@ fn search_page(args: &HashMap<String, String>, base: &str) -> String {
 <div class="layout"><aside class="sidebar"><details class="navigation" open><summary>Categories</summary>{nav}</details></aside>
 <main>
 <form id="search" class="searchbar" role="search" action="/" method="get" hx-get="/ui/results" hx-target="#results" hx-sync="this:replace" hx-indicator="#busy" hx-trigger="submit, input changed delay:300ms from:#q, change target:.scope-field">
-<div class="search-field"><input id="q" name="q" type="search" placeholder="Search releases" value="{q}" autocomplete="off" spellcheck="false" autofocus aria-label="Search releases"><kbd>/</kbd></div>
+<div class="search-field">{q}<kbd>/</kbd></div>
 {cat}<button class="button primary">Search</button><span id="busy" class="busy">searching…</span>
 {scope}</form>
+{ask}
 <div id="failure"></div>
 <div id="results">{results}</div>
 <footer class="footer">Newznab API: <code>{base}/api</code></footer>
 </main></div>"##,
             masthead = masthead(true),
             nav = category_nav(&search, ""),
-            q = attr(&search.q),
+            q = q_input(&search.q),
+            ask = ask_box(&gemini::load()),
             cat = category_input(&search.cat, ""),
             scope = scope_inputs(&search, ""),
             results = results_html(&search),
@@ -962,7 +1026,18 @@ fn release_page(args: &HashMap<String, String>) -> ApiResponse {
     let inner = crate::archive::store::view(id);
     let media = crate::media::query::attrs_of(&ids).unwrap_or_default().remove(&id);
     let names = release_info::names(id).unwrap_or_default();
-    let contents = release_info::contents(id).unwrap_or_default();
+    let mut contents = release_info::contents(id).unwrap_or_default();
+    let mut release = release;
+    // a post spread over several groups is shown whole
+    if !release.complete
+        && let Ok(conn) = crate::db::open()
+        && let Ok(Some(post)) = release_info::split_post_with(&conn, &release)
+    {
+        contents = release_info::contents_of_split(&conn, &post).unwrap_or(contents);
+        release.size = Some(post.size);
+        release.complete = post.complete;
+        release.parts = Some(contents.articles_seen);
+    }
     html(200, release_html(&release, category, &inner, media.as_ref(), names.as_ref(), &contents))
 }
 
@@ -1110,14 +1185,19 @@ fn release_html(
         )
     };
 
-    let probe = crate::db::open()
-        .ok()
-        .and_then(|conn| {
-            let found = crate::probe::read(&conn, r.id)?;
-            let matched = crate::probe::opensubtitles::read(&conn, r.id);
-            Some(probe_html(&found, matched.as_ref()))
-        })
-        .unwrap_or_default();
+    // the probe row is decoded once: the panels below read the same one
+    let conn = crate::db::open().ok();
+    let found = conn.as_ref().and_then(|c| crate::probe::read(c, r.id));
+    let probe = match (conn.as_ref(), found.as_ref()) {
+        (Some(c), Some(found)) => {
+            probe_html(found, crate::probe::opensubtitles::read(c, r.id).as_ref(), crate::web_meta::salt_of(Some(c)))
+        }
+        _ => String::new(),
+    };
+    let meta = crate::web_meta::meta_html(
+        conn.as_ref(),
+        &crate::web_meta::MetaInputs { release: r, inner, names, contents, probe: found.as_ref() },
+    );
     let copies = crate::duplicates::copies(r.id).unwrap_or_default();
     let has_twin = crate::duplicates::can_fill(&copies);
     let fill = if has_twin && contents.articles_seen < contents.articles_expected {
@@ -1140,6 +1220,7 @@ fn release_html(
 <div id="title-details" hx-get="/ui/details?id={id}" hx-trigger="load" hx-swap="outerHTML"></div>
 <div class="panel"><dl class="facts">{facts}</dl></div>
 {copies}
+{meta}
 {probe}
 {files}
 </main></div>"#,
@@ -1174,7 +1255,7 @@ fn filled_nzb(args: &HashMap<String, String>) -> ApiResponse {
     }
 }
 
-fn verdict(ok: Option<bool>, good: &str, bad: &str) -> String {
+pub(crate) fn verdict(ok: Option<bool>, good: &str, bad: &str) -> String {
     match ok {
         Some(true) => tag("tag-ok", good),
         Some(false) => tag("tag-bad", bad),
@@ -1182,7 +1263,7 @@ fn verdict(ok: Option<bool>, good: &str, bad: &str) -> String {
     }
 }
 
-fn panel(title: &str, facts: &str) -> String {
+pub(crate) fn panel(title: &str, facts: &str) -> String {
     if facts.is_empty() {
         return String::new();
     }
@@ -1190,7 +1271,11 @@ fn panel(title: &str, facts: &str) -> String {
 }
 
 /// What reading a release's articles found, without downloading it.
-fn probe_html(p: &crate::probe::ProbeInfo, matched: Option<&crate::probe::opensubtitles::Stored>) -> String {
+fn probe_html(
+    p: &crate::probe::ProbeInfo,
+    matched: Option<&crate::probe::opensubtitles::Stored>,
+    salt: Option<i64>,
+) -> String {
     let dd = |out: &mut String, name: &str, value: String| {
         if !value.is_empty() {
             let _ = write!(out, "<dt>{name}</dt><dd>{value}</dd>");
@@ -1243,7 +1328,8 @@ fn probe_html(p: &crate::probe::ProbeInfo, matched: Option<&crate::probe::opensu
     }
     for (name, value) in &p.headers {
         if !matches!(name.as_str(), "User-Agent" | "X-Newsreader" | "X-Newsposter" | "Xref") {
-            dd(&mut posted, &escape(name), escape(value));
+            // the posting account, host and IP are shown as salted keys, as the Headers fold-out shows them
+            dd(&mut posted, &escape(name), crate::web_meta::redact_header(name, value, salt));
         }
     }
     if !p.crossposted_to.is_empty() {
@@ -1272,6 +1358,9 @@ fn probe_html(p: &crate::probe::ProbeInfo, matched: Option<&crate::probe::opensu
             );
         }
         dd(&mut packed, "File CRC32", a.crc32.map_or(String::new(), |c| format!("{c:08x}")));
+    }
+    if p.layers.len() > 1 || (p.archive.is_none() && !p.layers.is_empty()) {
+        dd(&mut packed, "Layers", nested_chain(&p.layers));
     }
 
     let mut tracks = String::new();
@@ -1488,14 +1577,22 @@ fn copy_card(conn: &rusqlite::Connection, badge: &str, r: &ReleaseRow) -> String
         )
     });
     format!(
-        "<article class=\"panel copy\">{thumb}<div class=\"copy-body\"><div class=\"copy-head\"><div class=\"name\"><a href=\"/ui/release?id={id}\">{name}</a>{tags}</div><a class=\"button small primary\" href=\"/ui/nzb?id={id}\">NZB</a></div><dl class=\"facts facts-wide\">{facts}</dl></div></article>",
+        "<article class=\"panel copy\">{thumb}<div class=\"copy-body\"><div class=\"copy-head\"><div class=\"name\"><a href=\"/ui/release?id={id}\">{name}</a>{tags}{more}</div><a class=\"button small primary\" href=\"/ui/nzb?id={id}\">NZB</a></div><dl class=\"facts facts-wide\">{facts}</dl></div></article>",
         id = r.id,
         name = escape(&r.name),
+        more = crate::web_meta::card_trigger(r.id, "closest .copy-body"),
     )
 }
 
+/// A copy past the first few: its name, badge and size, with the `+` that opens its drawer in place.
 fn copy_link(badge: &str, r: &ReleaseRow) -> String {
-    format!("<li><a href=\"/ui/release?id={}\">{}</a>{badge} {}</li>", r.id, escape(&r.name), escape(&fmt_size(r.size)))
+    format!(
+        "<li><a href=\"/ui/release?id={}\">{}</a>{badge} {}{}</li>",
+        r.id,
+        escape(&r.name),
+        escape(&fmt_size(r.size)),
+        crate::web_meta::card_trigger(r.id, "closest li")
+    )
 }
 
 /// Other postings of this release's content.
@@ -1758,6 +1855,207 @@ fn id_links(kind: i64, ids: &crate::media::resolve::Ids) -> String {
 }
 
 /// Also what someone pointing a browser at the bare address gets, soo it says how to set up a client.
+fn q_input(q: &str) -> String {
+    format!(
+        "<input id=\"q\" name=\"q\" type=\"search\" placeholder=\"Search releases\" value=\"{}\" autocomplete=\"off\" spellcheck=\"false\" autofocus aria-label=\"Search releases\">",
+        attr(q)
+    )
+}
+
+/// Where what Gemini made of a question goes: always on the page, soo a plain search can empty it.
+fn ask_note(content: &str, oob: &str) -> String {
+    format!("<div id=\"ask-note\" aria-live=\"polite\"{oob}>{content}</div>")
+}
+
+/// The plain words box, or where to turn it on.
+fn ask_box(settings: &gemini::Settings) -> String {
+    let note = ask_note("", "");
+    if !settings.has_key() {
+        return format!(
+            "<p class=\"ask-off\">Search in plain words with Gemini: <a href=\"/ui/settings\">add a key in Settings</a>.</p>{note}"
+        );
+    }
+    format!(
+        r##"<form id="ask" class="searchbar askbar" action="/ui/ask" method="post" hx-post="/ui/ask" hx-target="#results" hx-sync="#search:replace" hx-indicator="#asking" hx-disabled-elt="find button">
+<div class="search-field"><input id="ask-q" name="ask" type="search" maxlength="{max}" placeholder="Ask in plain words: 4K Dolby Vision remuxes of Dune, biggest first" autocomplete="off" aria-label="Ask in plain words"></div>
+<button class="button">Ask AI</button><span id="asking" class="busy">asking Gemini…</span></form>
+{note}"##,
+        max = gemini::MAX_QUESTION,
+    )
+}
+
+/// The search page's arguments for what Gemini read a question as, keeping only what the page knows.
+fn plan_args(plan: &gemini::Plan) -> HashMap<String, String> {
+    let mut args = HashMap::new();
+    let mut put = |k: &str, v: &str| {
+        if !v.is_empty() {
+            args.insert(k.to_string(), v.to_string());
+        }
+    };
+    put("q", &plan.q);
+    if category_name(&plan.cat).is_some() {
+        put("cat", &plan.cat);
+    }
+    put("filters", &plan.filters.join(","));
+    put("group", &plan.group);
+    put("poster", &plan.poster);
+    put("team", &plan.team);
+    if SortBy::from_word(&plan.sort).is_some() {
+        put("sort", &plan.sort);
+        put("dir", if plan.dir == "asc" { "asc" } else { "desc" });
+    }
+    args
+}
+
+/// "“dune” in Movies / UHD, 2160p and DV, biggest first": the search a question became, in words.
+fn described(search: &Search) -> String {
+    let mut what =
+        if search.q.is_empty() { "the newest releases".to_string() } else { format!("\u{201c}{}\u{201d}", search.q) };
+    if let Some(name) = category_name(&search.cat) {
+        what.push_str(&format!(" in {name}"));
+    }
+    let mut parts = vec![what];
+    if !search.filters.is_empty() {
+        parts.push(search.filters.join(", "));
+    }
+    for (name, value) in search.fields.chosen() {
+        parts.push(format!("{} {value}", name.to_lowercase()));
+    }
+    if let Some(by) = search.sort {
+        let way = match (by, search.descending) {
+            (SortBy::Posted, true) => "newest first".to_string(),
+            (SortBy::Posted, false) => "oldest first".to_string(),
+            (SortBy::Size, true) => "biggest first".to_string(),
+            (SortBy::Size, false) => "smallest first".to_string(),
+            (SortBy::Rating, true) => "best rated first".to_string(),
+            (by, true) => format!("by {}, Z to A", by.word()),
+            (by, false) => format!("by {}, A to Z", by.word()),
+        };
+        parts.push(way);
+    }
+    parts.join(", ")
+}
+
+/// Plain words to a search: Gemini reads them, the page searches with what it read.
+fn ask(body: &str, htmx: bool) -> ApiResponse {
+    let args = parse_query(body);
+    let question: String = args.get("ask").map_or("", |q| q.trim()).chars().take(gemini::MAX_QUESTION).collect();
+    let failed = |title: &str, why: &str| {
+        let mut resp = html(200, diag("caution", title, why));
+        resp.headers.push(("HX-Retarget".into(), "#ask-note".into()));
+        resp.headers.push(("HX-Reswap".into(), "innerHTML".into()));
+        resp
+    };
+    if question.is_empty() {
+        return failed("ask something first", "Type what you want in the Ask AI box, like 4K remuxes of Dune.");
+    }
+    let sorts: Vec<&str> = std::iter::once("relevance").chain(SortBy::ALL.iter().map(|(_, word)| *word)).collect();
+    let choices = gemini::Choices { filters: FILTERS, sorts: &sorts };
+    let settings = gemini::load();
+    let plan = match gemini::plan(&settings, &question, &choices) {
+        Ok(plan) => plan,
+        Err(why) => return failed("Gemini did not answer", &why),
+    };
+    let search = Search::from_args(&plan_args(&plan));
+    let query = search.query(&search.cat, 0);
+    if !htmx {
+        let to = if query.is_empty() { "/".to_string() } else { format!("/?{query}") };
+        return ApiResponse {
+            status: 303,
+            content_type: None,
+            body: String::new(),
+            headers: vec![("Location".into(), to)],
+            bytes: None,
+            failed: false,
+        };
+    }
+    let said = if plan.note.is_empty() { String::new() } else { format!(" {}", escape(&plan.note)) };
+    let note = format!(
+        "<div class=\"ask-read\" data-q=\"{}\"><p><span class=\"tag tag-ref\">GEMINI</span>{said}</p><p class=\"path\">Searched {}{}</p></div>",
+        attr(&search.q),
+        escape(&described(&search)),
+        if plan.model.is_empty() || plan.model == settings.model() {
+            String::new()
+        } else {
+            format!(". Answered by {}, as {} was busy", escape(&plan.model), escape(settings.model()))
+        },
+    );
+    // the search box takes the words from `data-q` (web.js): swapping the box would drop the form's listener on it
+    first_page(&search, &ask_note(&note, " hx-swap-oob=\"true\""))
+}
+
+fn settings_page(message: Option<(&str, &str, String)>) -> String {
+    let settings = gemini::load();
+    let masked = escape(&gemini::masked(&settings.api_key));
+    let status = if settings.from_env {
+        format!(
+            "Atlas uses the key in <code>GEMINI_API_KEY</code>, <code>{masked}</code>. A key saved here takes its place."
+        )
+    } else if settings.has_key() {
+        format!("A key is saved: <code>{masked}</code>. Paste another to replace it.")
+    } else {
+        "No key yet. Make one in <a href=\"https://aistudio.google.com/apikey\" target=\"_blank\" rel=\"noreferrer noopener\">Google AI Studio</a>, then paste it here.".to_string()
+    };
+    let forget = if settings.has_key() && !settings.from_env {
+        "<button class=\"button\" name=\"do\" value=\"forget\">Remove key</button>"
+    } else {
+        ""
+    };
+    let message = message.map_or(String::new(), |(level, title, body)| diag(level, title, &body));
+    page(
+        "Atlas settings",
+        &format!(
+            r#"{masthead}<main class="detail settings">
+<p class="path"><a href="/">Atlas</a> › Settings</p><h1>Settings</h1>{message}
+<section class="panel"><h2>Ask AI with Gemini</h2>
+<p>Ask AI, on the search page, sends what you type to Google's Gemini with the list of categories and filters, then searches with the fields Gemini sends back. Nothing from your index goes to Google.</p>
+<p>{status}</p>
+<form class="settings-form" method="post" action="/ui/settings">
+<label for="gemini-key">Gemini API key</label>
+<input id="gemini-key" name="key" type="password" autocomplete="off" spellcheck="false" placeholder="{placeholder}">
+<label for="gemini-model">Model</label>
+<input id="gemini-model" name="model" type="text" value="{model}" placeholder="{default}" autocomplete="off" spellcheck="false">
+<p class="hint">Leave it empty for <code>{default}</code>, which follows Google's newest Flash model.</p>
+<div class="actions"><button class="button primary" name="do" value="save">Save</button>{forget}</div>
+</form></section></main>"#,
+            masthead = masthead(true),
+            placeholder = if settings.has_key() { "Paste a new key to replace it" } else { "Paste your key" },
+            model = attr(&settings.model),
+            default = gemini::DEFAULT_MODEL,
+        ),
+    )
+}
+
+fn save_settings(body: &str) -> ApiResponse {
+    let args = parse_query(body);
+    let get = |k: &str| args.get(k).map_or("", |v| v.trim());
+    let message = if get("do") == "forget" {
+        match gemini::forget() {
+            Ok(()) => ("help", "the key is removed", "Ask AI is off until you add another.".to_string()),
+            Err(e) => ("caution", "could not remove the key", e.to_string()),
+        }
+    } else {
+        let (key, model) = (get("key"), get("model"));
+        if !key.is_empty() && !gemini::looks_like_key(key) {
+            ("caution", "that is not a Gemini key", "A key is one line of letters, digits, - and _.".to_string())
+        } else if !model.is_empty()
+            && let Err(why) = gemini::model_path(model)
+        {
+            ("caution", "that is not a model name", why)
+        } else {
+            match gemini::save(key, model) {
+                Err(e) => ("caution", "could not save", e.to_string()),
+                Ok(saved) if !saved.has_key() => ("note", "saved", "Paste a key to turn Ask AI on.".to_string()),
+                Ok(saved) => match gemini::check(&saved) {
+                    Ok(()) => ("help", "saved", format!("Gemini took the key, and knows {}.", saved.model())),
+                    Err(why) => ("caution", "saved, but Gemini did not take it", why),
+                },
+            }
+        }
+    };
+    html(200, settings_page(Some(message)))
+}
+
 fn login_page(base: &str, wrong_key: bool) -> String {
     let error = if wrong_key {
         diag("caution", "that is not the API key", "Check api_key in config.toml.")
@@ -1783,6 +2081,23 @@ fn login_page(base: &str, wrong_key: bool) -> String {
     )
 }
 
+/// Each layer an archive was followed down through, outermost first: `RAR5 m0 › 7z copy › movie.mkv`.
+fn nested_chain(layers: &[crate::probe::nest::Layer]) -> String {
+    let mut parts: Vec<String> = layers
+        .iter()
+        .map(|l| {
+            let method = l.method.as_deref().map(|m| format!(" {m}")).unwrap_or_default();
+            let stop =
+                l.stop.as_deref().map(|why| format!(" {}", tag("tag-bad", &why.to_uppercase()))).unwrap_or_default();
+            format!("{}{}{stop}", escape(&l.format), escape(&method))
+        })
+        .collect();
+    if let Some(name) = layers.last().filter(|l| l.stop.is_none()).and_then(|l| l.name.as_deref()) {
+        parts.push(escape(name));
+    }
+    parts.join(" › ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1799,21 +2114,21 @@ mod tests {
 
     #[test]
     fn signing_in_takes_the_key_and_the_cookie_is_not_the_key() {
-        let wrong = post("/login", "key=nope", "http://x", KEY).unwrap();
+        let wrong = post("/login", "key=nope", None, false, "http://x", KEY).unwrap();
         assert_eq!(wrong.status, 401);
         assert!(header(&wrong, "Set-Cookie").is_none());
         assert!(wrong.body.contains("not the API key"));
 
-        let right = post("/login", &format!("key={KEY}"), "http://x", KEY).unwrap();
+        let right = post("/login", &format!("key={KEY}"), None, false, "http://x", KEY).unwrap();
         assert_eq!(right.status, 303);
         assert_eq!(header(&right, "Location"), Some("/"));
         let set = header(&right, "Set-Cookie").unwrap();
         assert!(set.contains("HttpOnly") && set.contains("SameSite=Strict"), "{set}");
         assert!(!set.contains(KEY), "{set}");
 
-        let out = post("/logout", "", "http://x", KEY).unwrap();
+        let out = post("/logout", "", None, false, "http://x", KEY).unwrap();
         assert!(header(&out, "Set-Cookie").unwrap().contains("Max-Age=0"));
-        assert!(post("/api", "", "http://x", KEY).is_none());
+        assert!(post("/api", "", None, false, "http://x", KEY).is_none());
     }
 
     #[test]
@@ -1880,6 +2195,70 @@ mod tests {
         assert!(html.contains("TV/HD") && html.contains("2.0 KB"), "{html}");
         assert!(html.contains("PASSWORD?") && html.contains("INCOMPLETE"), "{html}");
         assert!(html.contains("/ui/nzb?id=7") && html.contains("/ui/release?id=7"), "{html}");
+    }
+
+    #[test]
+    fn a_row_carries_the_drawer_trigger() {
+        let release = ReleaseRow {
+            id: 7,
+            name: "Some.Show.S01E01-GRP".into(),
+            group_name: "alt.binaries.g".into(),
+            poster: None,
+            posted_date: Some("2026-10-03 17:41:49".into()),
+            size: Some(2048),
+            complete: false,
+            parts: None,
+        };
+        let html = row(&release, &HashMap::new(), &HashMap::new(), &HashMap::new(), &RowExtras::default());
+        assert_eq!(html.matches("class=\"icon-button drawer-toggle\"").count(), 1, "{html}");
+        // after the tags, before the row's second line
+        let toggle = html.find("drawer-toggle").unwrap();
+        assert!(
+            html.find("INCOMPLETE").unwrap() < toggle && toggle < html.find("<div class=\"row-meta\">").unwrap(),
+            "{html}"
+        );
+        assert!(html.contains("hx-get=\"/ui/row?id=7\"") && html.contains("hx-target=\"closest tr\""), "{html}");
+        assert!(html.contains("<td class=\"num col-size\" title=\"2,048 bytes\">2.0 KB</td>"), "{html}");
+    }
+
+    #[test]
+    fn a_copy_carries_the_drawer_trigger_as_a_card() {
+        let release = ReleaseRow {
+            id: 7,
+            name: "Some.Show.S01E01-GRP".into(),
+            group_name: "alt.binaries.g".into(),
+            poster: Some("poster <p@example.com>".into()),
+            posted_date: Some("2026-10-03 17:41:49".into()),
+            size: Some(2048),
+            complete: true,
+            parts: None,
+        };
+        // a link opens its drawer inside its own list item
+        let link = copy_link(&tag("tag-ok", "TWIN"), &release);
+        assert!(
+            link.starts_with("<li><a href=\"/ui/release?id=7\">Some.Show.S01E01-GRP</a>") && link.ends_with("</li>")
+        );
+        assert_eq!(link.matches("drawer-toggle").count(), 1, "{link}");
+        assert!(
+            link.contains("hx-get=\"/ui/row?id=7&amp;as=card\"")
+                && link.contains("hx-target=\"closest li\"")
+                && link.contains("hx-swap=\"beforeend\""),
+            "{link}"
+        );
+        // a card opens it under its facts, inside the card's body
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        crate::db::create_db_at(&main).unwrap();
+        let conn = crate::db::open_with_shards(&main).unwrap();
+        let card = copy_card(&conn, &tag("tag-ok", "TWIN"), &release);
+        assert_eq!(card.matches("drawer-toggle").count(), 1, "{card}");
+        let toggle = card.find("drawer-toggle").unwrap();
+        assert!(card.find("TWIN").unwrap() < toggle && toggle < card.find("href=\"/ui/nzb?id=7\"").unwrap(), "{card}");
+        assert!(
+            card.contains("hx-get=\"/ui/row?id=7&amp;as=card\"") && card.contains("hx-target=\"closest .copy-body\""),
+            "{card}"
+        );
+        assert!(card.contains("<dt>Poster</dt>") && card.contains("<dt>Email</dt>"), "{card}");
     }
 
     #[test]

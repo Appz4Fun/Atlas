@@ -1,0 +1,6 @@
+# Wave 7 / Agent C: backbone quirks (Haiku)
+- Usenet.Farm VERIFIED real capture (spoved/nntp-client.cr src/nntp/connection/articles.cr doc comment): `X-Ufhash: lHibuaCx...` (~190 chars, URL-encoded), `Date: Fri, 17 Apr 20 05:58:28 UTC` (2-digit year, literal UTC), `Path: not-for-mail`, `Message-Id:` casing, `User-Agent: Nyuu/0.3.8`, `X-Received-Bytes: 740517`, `X-Received-Body-CRC: 3585757165`, Organization Usenet.Farm. The Message-ID stays the client's @nyuu.
+- @UFK: sanderjo/NZBs ubuntu-mate-16.04.2...Feb2017.iso.nzb has `VNdHifYKSAtPRNYRoIhyQLghUETQLDaC@UFK` (32 letters + @UFK). Farm-assigned is INFERRED. X-Ufk: no evidence found.
+- Highwinds VERIFIED (caronc/newsreap tests/var/...@4ax-3.com.msg): Path `...!post01.iad.highwinds-media.com!fx23.iad.POSTED!not-for-mail`, X-Received-Bytes 226569, X-Received-Body-CRC 1037710279, Bytes 226506, Lines 1750, Date with a numeric offset and 4-digit year. Highwinds XOVER having empty Lines is UNVERIFIED.
+- Omicron "path-stripped", Abavia Path stripping and Xref server names: UNVERIFIED.
+- Atlas: normalise Date to an epoch before using it as a tool fingerprint (a Farm rewrite destroys the tool's Date form). X-Ufhash = Farm. X-Received-* = Highwinds family (also Farm). fxNN.<site>.POSTED = Highwinds injection.
