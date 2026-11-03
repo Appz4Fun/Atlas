@@ -316,7 +316,8 @@ pub fn wipe(main: &Path) -> anyhow::Result<()> {
 /// columns) for convert.rs; until then there are no shards. Run with
 /// compaction held off, see `create_db_holding`.
 pub fn create_db_at(path: &Path) -> anyhow::Result<()> {
-    if !path.try_exists()? {
+    let fresh = !path.try_exists()?;
+    if fresh {
         refuse_orphaned_shards(path)?;
     }
     let conn = create_at(path)?;
@@ -350,7 +351,9 @@ pub fn create_db_at(path: &Path) -> anyhow::Result<()> {
     let used = has_progress(&conn)?;
     store::create_main(&conn)?;
     create_shards(path, used)?;
-    crate::raw_store::restore_backfill_deepest(path, &conn);
+    if fresh && !used {
+        crate::raw_store::restore_backfill_deepest(path, &conn);
+    }
     Ok(())
 }
 

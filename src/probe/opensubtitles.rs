@@ -206,12 +206,11 @@ impl Step for OpenSubtitlesStep {
             match client.get(&url, &[("Api-Key", &key), ("Accept", "application/json")]) {
                 Ok(Reply::Json(json)) => {
                     let matched = best_match(&json);
-                    let raw_text = serde_json::to_string(&json).ok();
-                    crate::raw_store::put_opensubtitles(&hash, matched.as_ref(), raw_text.as_deref());
+                    crate::raw_store::put_opensubtitles(&hash, matched.as_ref());
                     matched
                 }
                 Ok(Reply::NotFound) => {
-                    crate::raw_store::put_opensubtitles(&hash, None, None);
+                    crate::raw_store::put_opensubtitles(&hash, None);
                     None
                 }
                 Err(Trouble::Paused(until) | Trouble::BadKey(until)) => {

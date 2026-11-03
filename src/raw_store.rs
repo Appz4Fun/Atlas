@@ -30,6 +30,18 @@ pub const MAX_PREDB_LOG_BYTES: i64 = 512 << 20;
 pub const MAX_HTTP_CACHE_ROWS: i64 = 100_000;
 /// Maximum compressed bytes kept in `raw_http_cache` (512 MiB).
 pub const MAX_HTTP_CACHE_BYTES: i64 = 512 << 20;
+/// Maximum rows kept in `raw_opensubtitles`.
+pub const MAX_OPENSUBTITLES_ROWS: i64 = 200_000;
+/// Maximum rows kept in `raw_probes`.
+pub const MAX_RAW_PROBES_ROWS: i64 = 250_000;
+/// Maximum info JSON bytes kept in `raw_probes` (512 MiB).
+pub const MAX_RAW_PROBES_BYTES: i64 = 512 << 20;
+/// Maximum rows kept in `raw_stills`.
+pub const MAX_RAW_STILLS_ROWS: i64 = 300_000;
+/// Maximum rows kept in `raw_archives` / `raw_par2`.
+pub const MAX_RAW_ARCHIVES_ROWS: i64 = 250_000;
+/// Hard ceiling on total inner-file name bytes in `raw_archive_inner_files` (256 MiB).
+pub const MAX_RAW_ARCHIVE_NAME_BYTES: i64 = 256 << 20;
 /// Freshness window for live metadata HTTP cache hits (12 hours: shorter than `media::resolve`'s 1-day
 /// negative retry and `media::details`'s 30-day refresh, while covering same-day schema-test resets).
 pub const LIVE_HTTP_CACHE_TTL_SECS: i64 = 12 * 3_600;
@@ -93,14 +105,28 @@ CREATE TABLE IF NOT EXISTS raw_covers (
 ) WITHOUT ROWID;
 
 CREATE TABLE IF NOT EXISTS raw_archives (
-    name           TEXT NOT NULL,
-    group_name     TEXT NOT NULL,
-    password       INTEGER NOT NULL,
-    encryption     INTEGER,
-    names_hidden   INTEGER,
-    password_check BLOB,
-    parts          INTEGER,
-    complete       INTEGER,
+    name             TEXT NOT NULL,
+    group_name       TEXT NOT NULL,
+    password         INTEGER NOT NULL,
+    encryption       INTEGER,
+    names_hidden     INTEGER,
+    password_check   BLOB,
+    parts            INTEGER,
+    complete         INTEGER,
+    listing_complete INTEGER,
+    listing_damaged  INTEGER,
+    PRIMARY KEY (name, group_name)
+) WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS raw_par2 (
+    name        TEXT NOT NULL,
+    group_name  TEXT NOT NULL,
+    covers_all  INTEGER NOT NULL DEFAULT 0,
+    posted      BLOB,
+    par2_block  INTEGER,
+    par2_blocks INTEGER,
+    parts       INTEGER,
+    complete    INTEGER,
     PRIMARY KEY (name, group_name)
 ) WITHOUT ROWID;
 
@@ -178,6 +204,8 @@ pub fn create(path: &Path) -> rusqlite::Result<Connection> {
     ensure_column(&conn, "raw_probes", "config_stamp", "INTEGER")?;
     ensure_column(&conn, "raw_archives", "parts", "INTEGER")?;
     ensure_column(&conn, "raw_archives", "complete", "INTEGER")?;
+    ensure_column(&conn, "raw_archives", "listing_complete", "INTEGER")?;
+    ensure_column(&conn, "raw_archives", "listing_damaged", "INTEGER")?;
     Ok(conn)
 }
 
@@ -473,16 +501,31 @@ pub fn get_opensubtitles(moviehash: &str) -> Option<Option<Feature>> {
     .flatten()
 }
 
-/// Persists an OpenSubtitles `moviehash` lookup result into `raw_opensubtitles`.
-pub fn put_opensubtitles(moviehash: &str, feature: Option<&Feature>, raw_json: Option<&str>) {
+fn prune_opensubtitles(conn: &Connection, max_rows: i64) -> rusqlite::Result<()> {
+    let count: i64 = conn.query_row("SELECT count(*) FROM raw_opensubtitles", [], |r| r.get(0))?;
+    if count >= max_rows {
+        let to_drop = (count - max_rows + 1).max(64);
+        conn.execute(
+            "DELETE FROM raw_opensubtitles WHERE moviehash IN (
+                SELECT moviehash FROM raw_opensubtitles ORDER BY checked_at ASC LIMIT ?1
+            )",
+            params![to_drop],
+        )?;
+    }
+    Ok(())
+}
+
+/// Persists an OpenSubtitles `moviehash` lookup result into `raw_opensubtitles`, bounded by `MAX_OPENSUBTITLES_ROWS`
+/// and storing only the compact structured match fields (`raw_json_zst` omitted).
+pub fn put_opensubtitles(moviehash: &str, feature: Option<&Feature>) {
     let f = feature.cloned().unwrap_or_default();
-    let zst = raw_json.and_then(compress);
     let now = chrono::Utc::now().timestamp();
     let _ = with_raw(|conn| {
+        prune_opensubtitles(conn, MAX_OPENSUBTITLES_ROWS)?;
         conn.prepare_cached(
             "INSERT INTO raw_opensubtitles
              (moviehash, imdb_id, tmdb_id, kind, title, year, season, episode, release_name, raw_json_zst, checked_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10)
              ON CONFLICT(moviehash) DO UPDATE SET
                 imdb_id = coalesce(excluded.imdb_id, main.raw_opensubtitles.imdb_id),
                 tmdb_id = coalesce(excluded.tmdb_id, main.raw_opensubtitles.tmdb_id),
@@ -492,7 +535,7 @@ pub fn put_opensubtitles(moviehash: &str, feature: Option<&Feature>, raw_json: O
                 season = coalesce(excluded.season, main.raw_opensubtitles.season),
                 episode = coalesce(excluded.episode, main.raw_opensubtitles.episode),
                 release_name = coalesce(excluded.release_name, main.raw_opensubtitles.release_name),
-                raw_json_zst = coalesce(excluded.raw_json_zst, main.raw_opensubtitles.raw_json_zst),
+                raw_json_zst = NULL,
                 checked_at = excluded.checked_at",
         )?
         .execute(params![
@@ -505,7 +548,6 @@ pub fn put_opensubtitles(moviehash: &str, feature: Option<&Feature>, raw_json: O
             f.season,
             f.episode,
             f.release_name,
-            zst,
             now
         ])?;
         Ok(())
@@ -582,11 +624,50 @@ pub struct ProbeRecord<'a> {
     pub cover: Option<(&'a str, &'a str)>,
 }
 
+fn prune_probes(conn: &Connection, incoming_bytes: i64, max_rows: i64, max_bytes: i64) -> rusqlite::Result<()> {
+    let (rows, bytes): (i64, i64) = conn.query_row(
+        "SELECT count(*), coalesce(sum(length(info)), 0) FROM raw_probes",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    if rows >= max_rows {
+        let to_drop = (rows - max_rows + 1).max(64);
+        conn.execute(
+            "DELETE FROM raw_probes WHERE (name, group_name) IN (
+                SELECT name, group_name FROM raw_probes ORDER BY probed_at ASC LIMIT ?1
+            )",
+            params![to_drop],
+        )?;
+    }
+    if bytes + incoming_bytes > max_bytes {
+        let mut total: i64 =
+            conn.query_row("SELECT coalesce(sum(length(info)), 0) FROM raw_probes", [], |r| r.get(0))?;
+        while total + incoming_bytes > max_bytes {
+            let deleted = conn.execute(
+                "DELETE FROM raw_probes WHERE (name, group_name) IN (
+                    SELECT name, group_name FROM raw_probes ORDER BY probed_at ASC LIMIT 64
+                )",
+                [],
+            )?;
+            if deleted == 0 {
+                break;
+            }
+            total = conn.query_row("SELECT coalesce(sum(length(info)), 0) FROM raw_probes", [], |r| r.get(0))?;
+        }
+    }
+    Ok(())
+}
+
 /// Persists a probed release's `ProbeInfo` JSON, completeness/stamp metadata, optional NFO password, and
 /// optional cover reference into `raw_probes`, `raw_nfo_passwords`, and `raw_covers`.
 pub fn put_probe(rec: &ProbeRecord<'_>) {
+    let incoming_bytes = rec.info.len() as i64;
+    if incoming_bytes > MAX_RAW_PROBES_BYTES {
+        return;
+    }
     let now = chrono::Utc::now().timestamp();
     let _ = with_raw(|conn| {
+        prune_probes(conn, incoming_bytes, MAX_RAW_PROBES_ROWS, MAX_RAW_PROBES_BYTES)?;
         conn.prepare_cached(
             "INSERT OR REPLACE INTO raw_probes
              (name, group_name, crc32, agent, info, moviehash, parts, complete, config_stamp, probed_at)
@@ -660,11 +741,21 @@ pub fn get_stills(name: &str, group_name: &str) -> Vec<SavedStill> {
     .unwrap_or_default()
 }
 
-/// Persists extracted stills for `(name, group_name)` in `raw_stills`.
+/// Persists extracted stills for `(name, group_name)` in `raw_stills`, bounded by `MAX_RAW_STILLS_ROWS`.
 pub fn put_stills(name: &str, group_name: &str, stills: &[SavedStill]) {
     let _ = with_raw(|conn| {
         conn.prepare_cached("DELETE FROM raw_stills WHERE name = ?1 AND group_name = ?2")?
             .execute(params![name, group_name])?;
+        let count: i64 = conn.query_row("SELECT count(*) FROM raw_stills", [], |r| r.get(0))?;
+        if count + stills.len() as i64 > MAX_RAW_STILLS_ROWS {
+            let to_drop = (count + stills.len() as i64 - MAX_RAW_STILLS_ROWS).max(64);
+            conn.execute(
+                "DELETE FROM raw_stills WHERE (name, group_name, position) IN (
+                    SELECT name, group_name, position FROM raw_stills LIMIT ?1
+                )",
+                params![to_drop],
+            )?;
+        }
         let mut insert = conn.prepare_cached(
             "INSERT OR REPLACE INTO raw_stills (name, group_name, position, at_ms, sha256, width, height, phash)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -699,6 +790,8 @@ pub struct SavedArchive {
     pub encryption: Option<i64>,
     pub names_hidden: bool,
     pub password_check: Option<Vec<u8>>,
+    pub listing_complete: bool,
+    pub listing_damaged: bool,
     pub files: Vec<SavedArchiveFile>,
 }
 
@@ -727,8 +820,9 @@ pub fn get_archive_files(release_name: &str, group_name: &str, source: i64) -> V
 }
 
 /// Looks up a previously inspected archive for `(name, group_name)` in `raw_archives` and `raw_archive_inner_files`.
-/// If the previous inspection was an inconclusive `Password::Maybe` (2) with no listed files on a smaller/incomplete
-/// release and the release has since grown, returns `None` so `ListStep` can inspect the newly arrived articles.
+/// If the previous inspection was incomplete/damaged (or an inconclusive `Password::Maybe` with no listed files)
+/// on a smaller/incomplete release and the release has since grown, returns `None` so `ListStep` can inspect
+/// the newly arrived articles.
 pub fn get_archive(
     name: &str,
     group_name: &str,
@@ -736,14 +830,32 @@ pub fn get_archive(
     current_complete: bool,
 ) -> Option<SavedArchive> {
     with_raw(|conn| {
-        type RawArchiveRow = (i64, Option<i64>, Option<i64>, Option<Vec<u8>>, Option<i64>, Option<i64>);
+        type RawArchiveRow = (
+            i64,
+            Option<i64>,
+            Option<i64>,
+            Option<Vec<u8>>,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+        );
         let row: Option<RawArchiveRow> = conn
             .prepare_cached(
-                "SELECT password, encryption, names_hidden, password_check, parts, complete
+                "SELECT password, encryption, names_hidden, password_check, parts, complete, listing_complete, listing_damaged
                  FROM raw_archives WHERE name = ?1 AND group_name = ?2",
             )?
             .query_row(params![name, group_name], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                    r.get(7)?,
+                ))
             })
             .optional()?;
         let files = conn
@@ -765,22 +877,46 @@ pub fn get_archive(
         if row.is_none() && files.is_empty() {
             return Ok(None);
         }
-        let (password, encryption, names_hidden, password_check, saved_parts, saved_complete) = match row {
-            Some((pw, enc, hidden, check, parts, complete)) => {
-                (Some(pw), enc, hidden.unwrap_or(0) != 0, check, parts, complete)
-            }
-            None => (None, None, false, None, None, None),
+        let (
+            password,
+            encryption,
+            names_hidden,
+            password_check,
+            saved_parts,
+            saved_complete,
+            listing_complete,
+            listing_damaged,
+        ) = match row {
+            Some((pw, enc, hidden, check, parts, complete, l_comp, l_dmg)) => (
+                Some(pw),
+                enc,
+                hidden.unwrap_or(0) != 0,
+                check,
+                parts,
+                complete,
+                l_comp.unwrap_or(0) != 0,
+                l_dmg.unwrap_or(0) != 0,
+            ),
+            None => (None, None, false, None, None, None, false, false),
         };
-        if files.is_empty()
-            && password == Some(crate::archive::Password::Maybe.code())
-            && let Some(had_parts) = saved_parts
-        {
+        let inconclusive = !listing_complete
+            || listing_damaged
+            || (files.is_empty() && password == Some(crate::archive::Password::Maybe.code()));
+        if inconclusive && let Some(had_parts) = saved_parts {
             let was_complete = saved_complete.unwrap_or(0) != 0;
             if (current_complete && !was_complete) || current_parts > had_parts {
                 return Ok(None);
             }
         }
-        Ok(Some(SavedArchive { password, encryption, names_hidden, password_check, files }))
+        Ok(Some(SavedArchive {
+            password,
+            encryption,
+            names_hidden,
+            password_check,
+            listing_complete,
+            listing_damaged,
+            files,
+        }))
     })
     .flatten()
 }
@@ -796,9 +932,14 @@ pub struct ArchiveRecord<'a> {
     pub password_check: Option<&'a [u8]>,
     pub parts: i64,
     pub complete: bool,
+    pub listing_complete: bool,
+    pub listing_damaged: bool,
+    pub max_names_bytes: i64,
 }
 
-/// Persists an archive or PAR2 inspection result into `raw_archives` and `raw_archive_inner_files`.
+/// Persists an archive or PAR2 inspection result into `raw_archives` and `raw_archive_inner_files`,
+/// enforcing the configured `archive.max_names_mb` ceiling (capped at `MAX_RAW_ARCHIVE_NAME_BYTES`) and
+/// `MAX_RAW_ARCHIVES_ROWS`.
 pub fn put_archive(rec: &ArchiveRecord<'_>) {
     let _ = with_raw(|conn| {
         conn.prepare_cached(
@@ -806,20 +947,41 @@ pub fn put_archive(rec: &ArchiveRecord<'_>) {
              WHERE release_name = ?1 AND group_name = ?2 AND coalesce(source, 2) = ?3",
         )?
         .execute(params![rec.name, rec.group_name, rec.source])?;
-        let mut insert_file = conn.prepare_cached(
-            "INSERT OR REPLACE INTO raw_archive_inner_files (release_name, group_name, seq, name, size, source)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        )?;
-        for (i, row) in rec.files.iter().enumerate() {
-            let size = row.size.and_then(|s| i64::try_from(s).ok());
-            let seq = rec.source * 65_536 + i as i64;
-            insert_file.execute(params![rec.name, rec.group_name, seq, row.name, size, rec.source])?;
+        if !rec.files.is_empty() {
+            let incoming_bytes: i64 = rec.files.iter().map(|r| r.name.len() as i64 + 32).sum();
+            let effective_quota = rec.max_names_bytes.clamp(0, MAX_RAW_ARCHIVE_NAME_BYTES);
+            let used_bytes: i64 = conn.query_row(
+                "SELECT coalesce(sum(length(cast(name as blob)) + 32), 0) FROM raw_archive_inner_files",
+                [],
+                |r| r.get(0),
+            )?;
+            if used_bytes + incoming_bytes <= effective_quota {
+                let mut insert_file = conn.prepare_cached(
+                    "INSERT OR REPLACE INTO raw_archive_inner_files (release_name, group_name, seq, name, size, source)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                )?;
+                for (i, row) in rec.files.iter().enumerate() {
+                    let size = row.size.and_then(|s| i64::try_from(s).ok());
+                    let seq = rec.source * 65_536 + i as i64;
+                    insert_file.execute(params![rec.name, rec.group_name, seq, row.name, size, rec.source])?;
+                }
+            }
         }
         if let Some(pw) = rec.password {
+            let count: i64 = conn.query_row("SELECT count(*) FROM raw_archives", [], |r| r.get(0))?;
+            if count >= MAX_RAW_ARCHIVES_ROWS {
+                let to_drop = (count - MAX_RAW_ARCHIVES_ROWS + 1).max(64);
+                conn.execute(
+                    "DELETE FROM raw_archives WHERE (name, group_name) IN (
+                        SELECT name, group_name FROM raw_archives LIMIT ?1
+                    )",
+                    params![to_drop],
+                )?;
+            }
             conn.prepare_cached(
                 "INSERT OR REPLACE INTO raw_archives
-                 (name, group_name, password, encryption, names_hidden, password_check, parts, complete)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                 (name, group_name, password, encryption, names_hidden, password_check, parts, complete, listing_complete, listing_damaged)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             )?
             .execute(params![
                 rec.name,
@@ -830,8 +992,91 @@ pub fn put_archive(rec: &ArchiveRecord<'_>) {
                 rec.password_check,
                 rec.parts,
                 i64::from(rec.complete),
+                i64::from(rec.listing_complete),
+                i64::from(rec.listing_damaged),
             ])?;
         }
+        Ok(())
+    });
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SavedPar2 {
+    pub covers_all: bool,
+    pub posted: Option<Vec<u8>>,
+    pub sizes: Option<(i64, i64)>,
+}
+
+/// Looks up cached PAR2 twin-fingerprint and repair-block metadata for `(name, group_name)` in `raw_par2`.
+/// Returns `Some` only when the release's `(parts, complete)` still match the inspected snapshot so twin
+/// fingerprints (which include posted article counts) and `covers_all` remain exact.
+pub fn get_par2(name: &str, group_name: &str, current_parts: i64, current_complete: bool) -> Option<SavedPar2> {
+    with_raw(|conn| {
+        type RawPar2Row = (i64, Option<Vec<u8>>, Option<i64>, Option<i64>, Option<i64>, Option<i64>);
+        let row: Option<RawPar2Row> = conn
+            .prepare_cached(
+                "SELECT covers_all, posted, par2_block, par2_blocks, parts, complete
+                 FROM raw_par2 WHERE name = ?1 AND group_name = ?2",
+            )?
+            .query_row(params![name, group_name], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
+            })
+            .optional()?;
+        let Some((covers_all, posted, par2_block, par2_blocks, saved_parts, saved_complete)) = row else {
+            return Ok(None);
+        };
+        let was_complete = saved_complete.unwrap_or(0) != 0;
+        let had_parts = saved_parts.unwrap_or(0);
+        if was_complete != current_complete || had_parts != current_parts {
+            return Ok(None);
+        }
+        let covers = covers_all != 0;
+        if covers && (posted.is_none() || par2_block.is_none() || par2_blocks.is_none()) {
+            return Ok(None);
+        }
+        Ok(Some(SavedPar2 { covers_all: covers, posted, sizes: par2_block.zip(par2_blocks) }))
+    })
+    .flatten()
+}
+
+pub struct Par2Record<'a> {
+    pub name: &'a str,
+    pub group_name: &'a str,
+    pub covers_all: bool,
+    pub posted: Option<&'a [u8]>,
+    pub sizes: Option<(i64, i64)>,
+    pub parts: i64,
+    pub complete: bool,
+}
+
+/// Persists PAR2 twin-fingerprint and block-size metadata into `raw_par2`, bounded by `MAX_RAW_ARCHIVES_ROWS`.
+pub fn put_par2(rec: &Par2Record<'_>) {
+    let _ = with_raw(|conn| {
+        let count: i64 = conn.query_row("SELECT count(*) FROM raw_par2", [], |r| r.get(0))?;
+        if count >= MAX_RAW_ARCHIVES_ROWS {
+            let to_drop = (count - MAX_RAW_ARCHIVES_ROWS + 1).max(64);
+            conn.execute(
+                "DELETE FROM raw_par2 WHERE (name, group_name) IN (
+                    SELECT name, group_name FROM raw_par2 LIMIT ?1
+                )",
+                params![to_drop],
+            )?;
+        }
+        conn.prepare_cached(
+            "INSERT OR REPLACE INTO raw_par2
+             (name, group_name, covers_all, posted, par2_block, par2_blocks, parts, complete)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        )?
+        .execute(params![
+            rec.name,
+            rec.group_name,
+            i64::from(rec.covers_all),
+            rec.posted,
+            rec.sizes.map(|(b, _)| b),
+            rec.sizes.map(|(_, bs)| bs),
+            rec.parts,
+            i64::from(rec.complete),
+        ])?;
         Ok(())
     });
 }
@@ -872,20 +1117,128 @@ fn has_table(conn: &Connection, schema: &str, table: &str) -> rusqlite::Result<b
         .exists([table])
 }
 
-fn harvest_attached_main(conn: &Connection) -> rusqlite::Result<()> {
-    let tx = conn.unchecked_transaction()?;
-    if has_table(&tx, "main_db", "backfill_deepest")? {
-        tx.execute_batch(
-            "INSERT OR REPLACE INTO main.raw_backfill_deepest (grp, server, oldest_at, runner_up_at)
-             SELECT grp, server, oldest_at, runner_up_at FROM main_db.backfill_deepest;",
+fn harvest_attached_release_tables(tx: &rusqlite::Transaction<'_>, schema: &str) -> rusqlite::Result<()> {
+    if has_table(tx, schema, "release_opensubtitles")? {
+        tx.execute_batch(&format!(
+            "INSERT INTO main.raw_opensubtitles (moviehash, imdb_id, tmdb_id, kind, title, year, season, episode, release_name, checked_at)
+             SELECT moviehash, imdb_id, tmdb_id, kind, title, year, season, episode, release_name, checked_at
+             FROM {schema}.release_opensubtitles WHERE moviehash IS NOT NULL AND moviehash != ''
+             ON CONFLICT(moviehash) DO UPDATE SET
+                 imdb_id = coalesce(main.raw_opensubtitles.imdb_id, excluded.imdb_id),
+                 tmdb_id = coalesce(main.raw_opensubtitles.tmdb_id, excluded.tmdb_id),
+                 kind = coalesce(main.raw_opensubtitles.kind, excluded.kind),
+                 title = coalesce(main.raw_opensubtitles.title, excluded.title),
+                 year = coalesce(main.raw_opensubtitles.year, excluded.year),
+                 season = coalesce(main.raw_opensubtitles.season, excluded.season),
+                 episode = coalesce(main.raw_opensubtitles.episode, excluded.episode),
+                 release_name = coalesce(main.raw_opensubtitles.release_name, excluded.release_name),
+                 checked_at = max(main.raw_opensubtitles.checked_at, excluded.checked_at);"
+        ))?;
+    }
+    if has_table(tx, schema, "release_probe")? {
+        let probe_stamp: Option<i64> = if has_table(tx, schema, "meta")? {
+            tx.query_row(&format!("SELECT value FROM {schema}.meta WHERE key = 'pp_stamp_4'"), [], |r| r.get(0))
+                .optional()?
+        } else {
+            None
+        };
+        tx.execute(
+            &format!(
+                "INSERT OR REPLACE INTO main.raw_probes
+                 (name, group_name, crc32, agent, info, moviehash, parts, complete, config_stamp)
+                 SELECT r.name, r.group_name, p.crc32, p.agent, p.info, p.moviehash,
+                        coalesce(r.parts, 0), coalesce(r.complete, 0), ?1
+                 FROM {schema}.release_probe p JOIN {schema}.releases r ON r.id = p.release_id
+                 WHERE r.name IS NOT NULL AND r.group_name IS NOT NULL"
+            ),
+            params![probe_stamp],
         )?;
     }
-    if has_table(&tx, "main_db", "groups")? {
-        tx.execute_batch(
+    if has_table(tx, schema, "release_cover")? {
+        tx.execute_batch(&format!(
+            "INSERT OR REPLACE INTO main.raw_covers (name, group_name, mime, sha256)
+             SELECT r.name, r.group_name, c.mime, c.sha256
+             FROM {schema}.release_cover c JOIN {schema}.releases r ON r.id = c.release_id
+             WHERE r.name IS NOT NULL AND r.group_name IS NOT NULL;"
+        ))?;
+    }
+    let has_fp = has_table(tx, schema, "release_fingerprint")?;
+    let has_inner = has_table(tx, schema, "archive_inner_files")?;
+    if has_table(tx, schema, "archive_release")? {
+        let listing_complete_expr = match (has_fp, has_inner) {
+            (true, true) => format!(
+                "CASE WHEN (a.password = 0 AND NOT EXISTS (SELECT 1 FROM {schema}.archive_inner_files f WHERE f.release_id = a.release_id AND coalesce(f.source, 2) != 1))
+                           OR EXISTS (SELECT 1 FROM {schema}.release_fingerprint fp WHERE fp.release_id = a.release_id AND fp.content IS NOT NULL)
+                      THEN 1 ELSE 0 END"
+            ),
+            _ => "0".to_string(),
+        };
+        tx.execute_batch(&format!(
+            "INSERT OR REPLACE INTO main.raw_archives
+                 (name, group_name, password, encryption, names_hidden, password_check, parts, complete, listing_complete, listing_damaged)
+             SELECT r.name, r.group_name, a.password, a.encryption, a.names_hidden, a.password_check,
+                    coalesce(r.parts, 0), coalesce(r.complete, 0), {listing_complete_expr}, 0
+             FROM {schema}.archive_release a JOIN {schema}.releases r ON r.id = a.release_id
+             WHERE r.name IS NOT NULL AND r.group_name IS NOT NULL;"
+        ))?;
+    }
+    if has_inner {
+        tx.execute_batch(&format!(
+            "INSERT OR REPLACE INTO main.raw_archive_inner_files (release_name, group_name, seq, name, size, source)
+             SELECT r.name, r.group_name, f.seq, f.name, f.size, f.source
+             FROM {schema}.archive_inner_files f JOIN {schema}.releases r ON r.id = f.release_id
+             WHERE r.name IS NOT NULL AND r.group_name IS NOT NULL;"
+        ))?;
+    }
+    if has_fp {
+        tx.execute_batch(&format!(
+            "INSERT OR REPLACE INTO main.raw_par2
+                 (name, group_name, covers_all, posted, par2_block, par2_blocks, parts, complete)
+             SELECT r.name, r.group_name,
+                    CASE WHEN fp.posted IS NOT NULL AND fp.par2_block IS NOT NULL THEN 1 ELSE 0 END,
+                    fp.posted, fp.par2_block, fp.par2_blocks,
+                    coalesce(r.parts, 0), coalesce(r.complete, 0)
+             FROM {schema}.release_fingerprint fp JOIN {schema}.releases r ON r.id = fp.release_id
+             WHERE r.name IS NOT NULL AND r.group_name IS NOT NULL
+               AND (fp.posted IS NOT NULL OR fp.par2_block IS NOT NULL);"
+        ))?;
+    }
+    if has_table(tx, schema, "release_nfo_password")? {
+        tx.execute_batch(&format!(
+            "INSERT OR REPLACE INTO main.raw_nfo_passwords (name, group_name, password)
+             SELECT r.name, r.group_name, np.password
+             FROM {schema}.release_nfo_password np JOIN {schema}.releases r ON r.id = np.release_id
+             WHERE r.name IS NOT NULL AND r.group_name IS NOT NULL;"
+        ))?;
+    }
+    if has_table(tx, schema, "release_stills")? {
+        tx.execute_batch(&format!(
+            "INSERT OR REPLACE INTO main.raw_stills (name, group_name, position, at_ms, sha256, width, height, phash)
+             SELECT r.name, r.group_name, s.position, s.at_ms, s.sha256, s.width, s.height, s.phash
+             FROM {schema}.release_stills s JOIN {schema}.releases r ON r.id = s.release_id
+             WHERE r.name IS NOT NULL AND r.group_name IS NOT NULL;"
+        ))?;
+    }
+    Ok(())
+}
+
+fn harvest_attached_main(conn: &Connection, schema: &str) -> rusqlite::Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    if has_table(&tx, schema, "backfill_deepest")? {
+        tx.execute_batch(&format!(
+            "INSERT OR REPLACE INTO main.raw_backfill_deepest (grp, server, oldest_at, runner_up_at)
+             SELECT grp, server, oldest_at, runner_up_at FROM {schema}.backfill_deepest;"
+        ))?;
+    }
+    if has_table(&tx, schema, "groups")? {
+        tx.execute_batch(&format!(
             "INSERT OR REPLACE INTO main.raw_group_bounds (name, first_article, last_article, low_article, low_posted, high_article, high_posted)
-             SELECT name, first_article, last_article, low_article, low_posted, high_article, high_posted FROM main_db.groups
-             WHERE low_article IS NOT NULL OR high_article IS NOT NULL OR first_article IS NOT NULL;",
-        )?;
+             SELECT name, first_article, last_article, low_article, low_posted, high_article, high_posted FROM {schema}.groups
+             WHERE low_article IS NOT NULL OR high_article IS NOT NULL OR first_article IS NOT NULL;"
+        ))?;
+    }
+    if has_table(&tx, schema, "releases")? {
+        harvest_attached_release_tables(&tx, schema)?;
     }
     tx.commit()
 }
@@ -898,84 +1251,12 @@ fn harvest_attached_shard(conn: &Connection) -> rusqlite::Result<()> {
         ));
     }
     let tx = conn.unchecked_transaction()?;
-    if has_table(&tx, "sh", "release_opensubtitles")? {
-        tx.execute_batch(
-            "INSERT INTO main.raw_opensubtitles (moviehash, imdb_id, tmdb_id, kind, title, year, season, episode, release_name, checked_at)
-             SELECT moviehash, imdb_id, tmdb_id, kind, title, year, season, episode, release_name, checked_at
-             FROM sh.release_opensubtitles WHERE moviehash IS NOT NULL AND moviehash != ''
-             ON CONFLICT(moviehash) DO UPDATE SET
-                 imdb_id = coalesce(main.raw_opensubtitles.imdb_id, excluded.imdb_id),
-                 tmdb_id = coalesce(main.raw_opensubtitles.tmdb_id, excluded.tmdb_id),
-                 kind = coalesce(main.raw_opensubtitles.kind, excluded.kind),
-                 title = coalesce(main.raw_opensubtitles.title, excluded.title),
-                 year = coalesce(main.raw_opensubtitles.year, excluded.year),
-                 season = coalesce(main.raw_opensubtitles.season, excluded.season),
-                 episode = coalesce(main.raw_opensubtitles.episode, excluded.episode),
-                 release_name = coalesce(main.raw_opensubtitles.release_name, excluded.release_name),
-                 checked_at = max(main.raw_opensubtitles.checked_at, excluded.checked_at);",
-        )?;
-    }
-    if has_table(&tx, "sh", "release_probe")? {
-        let probe_stamp: Option<i64> = if has_table(&tx, "sh", "meta")? {
-            tx.query_row("SELECT value FROM sh.meta WHERE key = 'pp_stamp_4'", [], |r| r.get(0)).optional()?
-        } else {
-            None
-        };
-        tx.execute(
-            "INSERT OR REPLACE INTO main.raw_probes
-             (name, group_name, crc32, agent, info, moviehash, parts, complete, config_stamp)
-             SELECT r.name, r.group_name, p.crc32, p.agent, p.info, p.moviehash,
-                    coalesce(r.parts, 0), coalesce(r.complete, 0), ?1
-             FROM sh.release_probe p JOIN sh.releases r ON r.id = p.release_id
-             WHERE r.name IS NOT NULL AND r.group_name IS NOT NULL",
-            params![probe_stamp],
-        )?;
-    }
-    if has_table(&tx, "sh", "release_cover")? {
-        tx.execute_batch(
-            "INSERT OR REPLACE INTO main.raw_covers (name, group_name, mime, sha256)
-             SELECT r.name, r.group_name, c.mime, c.sha256
-             FROM sh.release_cover c JOIN sh.releases r ON r.id = c.release_id
-             WHERE r.name IS NOT NULL AND r.group_name IS NOT NULL;",
-        )?;
-    }
-    if has_table(&tx, "sh", "archive_release")? {
-        tx.execute_batch(
-            "INSERT OR REPLACE INTO main.raw_archives (name, group_name, password, encryption, names_hidden, password_check, parts, complete)
-             SELECT r.name, r.group_name, a.password, a.encryption, a.names_hidden, a.password_check,
-                    coalesce(r.parts, 0), coalesce(r.complete, 0)
-             FROM sh.archive_release a JOIN sh.releases r ON r.id = a.release_id
-             WHERE r.name IS NOT NULL AND r.group_name IS NOT NULL;",
-        )?;
-    }
-    if has_table(&tx, "sh", "archive_inner_files")? {
-        tx.execute_batch(
-            "INSERT OR REPLACE INTO main.raw_archive_inner_files (release_name, group_name, seq, name, size, source)
-             SELECT r.name, r.group_name, f.seq, f.name, f.size, f.source
-             FROM sh.archive_inner_files f JOIN sh.releases r ON r.id = f.release_id
-             WHERE r.name IS NOT NULL AND r.group_name IS NOT NULL;",
-        )?;
-    }
-    if has_table(&tx, "sh", "release_nfo_password")? {
-        tx.execute_batch(
-            "INSERT OR REPLACE INTO main.raw_nfo_passwords (name, group_name, password)
-             SELECT r.name, r.group_name, np.password
-             FROM sh.release_nfo_password np JOIN sh.releases r ON r.id = np.release_id
-             WHERE r.name IS NOT NULL AND r.group_name IS NOT NULL;",
-        )?;
-    }
-    if has_table(&tx, "sh", "release_stills")? {
-        tx.execute_batch(
-            "INSERT OR REPLACE INTO main.raw_stills (name, group_name, position, at_ms, sha256, width, height, phash)
-             SELECT r.name, r.group_name, s.position, s.at_ms, s.sha256, s.width, s.height, s.phash
-             FROM sh.release_stills s JOIN sh.releases r ON r.id = s.release_id
-             WHERE r.name IS NOT NULL AND r.group_name IS NOT NULL;",
-        )?;
-    }
+    harvest_attached_release_tables(&tx, "sh")?;
     tx.commit()
 }
 
-/// Harvests natural-keyed enrichments from `main` (`atlas.db` + `atlas.s0..s7.db`) into `atlas.raw.db`.
+/// Harvests natural-keyed enrichments from `main` (`atlas.db` + `atlas.s0..s7.db`) into `atlas.raw.db`,
+/// including legacy pre-sharding release tables when `atlas.db` itself holds `releases`.
 /// Any SQL or transaction failure rolls back the failed harvest and returns `Err` so callers never delete
 /// source databases after a partial or failed harvest.
 pub fn harvest_from_shards(main: &Path, log: &dyn Fn(&str)) -> anyhow::Result<()> {
@@ -985,7 +1266,7 @@ pub fn harvest_from_shards(main: &Path, log: &dyn Fn(&str)) -> anyhow::Result<()
         log(&format!("harvesting watermarks from {}...", main.display()));
         conn.execute("ATTACH DATABASE ?1 AS main_db", [main.to_string_lossy().as_ref()])
             .with_context(|| format!("attaching {}", main.display()))?;
-        let res = harvest_attached_main(&conn);
+        let res = harvest_attached_main(&conn, "main_db");
         let _ = conn.execute_batch("ROLLBACK");
         let detach_res = conn.execute("DETACH DATABASE main_db", []);
         res.with_context(|| format!("harvesting {}", main.display()))?;
@@ -1248,7 +1529,7 @@ mod tests {
             episode: None,
             release_name: Some("The.Matrix.1999.1080p-GRP".into()),
         };
-        put_opensubtitles("8e245d9679d31e12", Some(&feat), Some(r#"{"data":[]}"#));
+        put_opensubtitles("8e245d9679d31e12", Some(&feat));
         assert_eq!(get_opensubtitles("8e245d9679d31e12"), Some(Some(feat)));
 
         let stamp = 1 | 2 | 4 | 8;
@@ -1308,14 +1589,35 @@ mod tests {
             password_check: Some(&[1, 2, 3, 4]),
             parts: 20,
             complete: true,
+            listing_complete: true,
+            listing_damaged: false,
+            max_names_bytes: 16 << 20,
         });
         let saved_arch = get_archive("Some.Release-GRP", "alt.binaries.test", 20, true).unwrap();
         assert_eq!(saved_arch.password, Some(crate::archive::Password::Yes.code()));
         assert_eq!(saved_arch.encryption, Some(crate::archive::Encryption::Rar5Aes256.code()));
         assert!(saved_arch.names_hidden);
+        assert!(saved_arch.listing_complete);
+        assert!(!saved_arch.listing_damaged);
         assert_eq!(saved_arch.password_check.as_deref(), Some(&[1, 2, 3, 4][..]));
         assert_eq!(saved_arch.files.len(), 1);
         assert_eq!(saved_arch.files[0].name, "Movie.2026.1080p.mkv");
+
+        // PAR2 twin fingerprint & block metadata roundtrip
+        put_par2(&Par2Record {
+            name: "Some.Release-GRP",
+            group_name: "alt.binaries.test",
+            covers_all: true,
+            posted: Some(&[2; 21]),
+            sizes: Some((384_000, 4_000)),
+            parts: 20,
+            complete: true,
+        });
+        let saved_par2 = get_par2("Some.Release-GRP", "alt.binaries.test", 20, true).unwrap();
+        assert!(saved_par2.covers_all);
+        assert_eq!(saved_par2.posted.as_deref(), Some(&[2; 21][..]));
+        assert_eq!(saved_par2.sizes, Some((384_000, 4_000)));
+        assert_eq!(get_par2("Some.Release-GRP", "alt.binaries.test", 25, true), None);
 
         // HTTP cache byte quota pruning
         {
