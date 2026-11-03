@@ -821,6 +821,8 @@ struct Window {
     /// rows brought in for a post whose own row isn't in the window: once each
     brought: Mutex<HashSet<i64>>,
     orders: Mutex<HashMap<(SortBy, bool), Order>>,
+    /// every row rendered, soo every size is final: a size order is kept only from then on
+    sized: AtomicBool,
     filled: AtomicBool,
 }
 
@@ -837,6 +839,7 @@ impl Window {
             shown: Mutex::new(HashMap::new()),
             brought: Mutex::new(HashSet::new()),
             orders: Mutex::new(HashMap::new()),
+            sized: AtomicBool::new(false),
             filled: AtomicBool::new(false),
         })
     }
@@ -868,6 +871,9 @@ impl Window {
         let categories = if by == SortBy::Category { self.categories() } else { &none };
         let scores = if by == SortBy::Rating { self.scores() } else { &none };
         let mut sized = None;
+        // read before the sizes: an order from sizes that aren't final yet is answered with but never kept, soo it
+        // can't outlive the fill
+        let keep = by != SortBy::Size || self.sized.load(Ordering::Acquire);
         if by == SortBy::Size {
             let shown = lock(&self.shown);
             let mut rows = self.rows.clone();
@@ -882,7 +888,9 @@ impl Window {
         let mut order: Vec<usize> = (0..rows.len()).collect();
         order.sort_by(|&a, &b| row_order(&rows[a], &rows[b], by, descending, categories, scores));
         let order = Arc::new(order);
-        lock(&self.orders).insert((by, descending), order.clone());
+        if keep {
+            lock(&self.orders).insert((by, descending), order.clone());
+        }
         order
     }
 
@@ -917,7 +925,20 @@ impl Window {
         for ((place, r), html) in places.into_iter().zip(&kept).zip(rows_html(&kept, split)) {
             done.push((place, ShownRow { html, size: r.size, folded: false }));
         }
-        lock(&self.shown).extend(done);
+        self.publish(done);
+    }
+
+    /// Keeps rendered rows, each under its place.
+    fn publish(&self, done: Vec<(i64, ShownRow)>) {
+        let mut shown = lock(&self.shown);
+        for (place, row) in done {
+            // two renders of one place can race for the row it brings in: the one that lost says folded, and mustn't
+            // hide the row the other one shows there
+            if row.folded && shown.get(&place).is_some_and(|r| !r.folded) {
+                continue;
+            }
+            shown.insert(place, row);
+        }
     }
 
     /// A page's rows, and whether more follow. Renders only what the page reaches and nothing has rendered yet.
@@ -980,6 +1001,7 @@ impl Window {
             }
         });
         // sizes may have changed with the split posts
+        self.sized.store(true, Ordering::Release);
         lock(&self.orders).clear();
         for (by, _) in SortBy::ALL {
             self.order(by, false);
@@ -1009,6 +1031,32 @@ static WINDOWS: LazyLock<Mutex<HashMap<String, Arc<WindowSlot>>>> = LazyLock::ne
 
 /// One background read at a time, on a machine that's indexing.
 static BACKGROUND: Mutex<()> = Mutex::new(());
+
+/// Background fills and replacements waiting for their turn: no more than there are windows kept.
+static WAITING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// A turn at `BACKGROUND` once one comes, or None when as many are waiting as there are windows kept.
+fn background_turn() -> Option<Waiting> {
+    if WAITING.fetch_add(1, Ordering::AcqRel) >= WINDOWS_KEPT {
+        WAITING.fetch_sub(1, Ordering::AcqRel);
+        return None;
+    }
+    Some(Waiting)
+}
+
+/// One of `WAITING`, given back however the work ends.
+struct Waiting;
+
+impl Drop for Waiting {
+    fn drop(&mut self) {
+        WAITING.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Whether a slot is still kept: one dropped from `WINDOWS` while its work waited has no one to show it to.
+fn still_kept(slot: &Arc<WindowSlot>) -> bool {
+    lock(&WINDOWS).values().any(|kept| Arc::ptr_eq(kept, slot))
+}
 
 fn slot_of(search: &Search, always: bool) -> Arc<WindowSlot> {
     let plain = Search { offset: 0, sort: None, descending: true, ..search.clone() };
@@ -1056,11 +1104,20 @@ fn window_of(search: &Search) -> Result<Arc<Window>, String> {
     }
     let window = Arc::new(Window::read(&slot.search)?);
     *lock(&slot.window) = Some(window.clone());
-    let (filling, for_fill) = (window.clone(), slot.clone());
-    std::thread::spawn(move || {
-        let _turn = lock(&BACKGROUND);
-        filling.fill(&for_fill.search);
-    });
+    // the window answers clicks without it, rendering what a page needs; filled, a click has nothing left to do.
+    // Waiting, it holds neither the window nor its slot, soo a window dropped meanwhile is gone, and isn't filled
+    if let Some(waiting) = background_turn() {
+        let (filling, for_fill) = (Arc::downgrade(&window), Arc::downgrade(&slot));
+        std::thread::spawn(move || {
+            let _waiting = waiting;
+            let _turn = lock(&BACKGROUND);
+            let (Some(window), Some(slot)) = (filling.upgrade(), for_fill.upgrade()) else { return };
+            let current = lock(&slot.window).as_ref().is_some_and(|w| Arc::ptr_eq(w, &window));
+            if current && still_kept(&slot) {
+                window.fill(&slot.search);
+            }
+        });
+    }
     Ok(window)
 }
 
@@ -1078,13 +1135,20 @@ fn replace_in_background(slot: &Arc<WindowSlot>) {
         return;
     }
     let replacing = Replacing(slot.clone());
-    std::thread::spawn(move || replace(replacing));
+    let Some(waiting) = background_turn() else { return };
+    std::thread::spawn(move || {
+        let _waiting = waiting;
+        replace(replacing);
+    });
 }
 
 /// A new window takes over only once it's filled, soo a click never finds a worse one than the last.
 fn replace(replacing: Replacing) {
     let slot = &replacing.0;
     let _turn = lock(&BACKGROUND);
+    if !still_kept(slot) {
+        return;
+    }
     let Ok(window) = Window::read(&slot.search) else { return };
     window.fill(&slot.search);
     *lock(&slot.window) = Some(Arc::new(window));
@@ -2806,6 +2870,60 @@ fn nested_chain(layers: &[crate::probe::nest::Layer]) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    fn window_of_rows(rows: Vec<ReleaseRow>) -> Window {
+        Window {
+            built: Instant::now(),
+            rows,
+            categories: OnceLock::new(),
+            scores: OnceLock::new(),
+            total: OnceLock::new(),
+            shown: Mutex::new(HashMap::new()),
+            brought: Mutex::new(HashSet::new()),
+            orders: Mutex::new(HashMap::new()),
+            sized: AtomicBool::new(false),
+            filled: AtomicBool::new(false),
+        }
+    }
+
+    fn shown(html: &str, size: i64, folded: bool) -> ShownRow {
+        ShownRow { html: html.into(), size: Some(size), folded }
+    }
+
+    #[test]
+    fn a_render_that_lost_the_race_for_a_brought_row_doesnt_hide_it() {
+        let window = window_of_rows(Vec::new());
+        window.publish(vec![(7, shown("<tr>lead</tr>", 10, false))]);
+        window.publish(vec![(7, shown("", 1, true))]);
+        assert_eq!(lock(&window.shown)[&7].html, "<tr>lead</tr>");
+        // the other way round the row still wins
+        window.publish(vec![(8, shown("", 1, true))]);
+        window.publish(vec![(8, shown("<tr>8</tr>", 2, false))]);
+        assert!(!lock(&window.shown)[&8].folded);
+    }
+
+    #[test]
+    fn a_size_order_from_sizes_not_final_yet_isnt_kept() {
+        let row = |id: i64, size: i64| ReleaseRow { id, size: Some(size), ..Default::default() };
+        let window = window_of_rows(vec![row(1, 1), row(2, 2)]);
+        window.order(SortBy::Size, true);
+        assert!(lock(&window.orders).is_empty(), "the fill hasn't rendered every row yet");
+        window.order(SortBy::Name, true);
+        assert_eq!(lock(&window.orders).len(), 1, "a name order doesn't wait on sizes");
+        window.sized.store(true, Ordering::Release);
+        window.order(SortBy::Size, true);
+        assert!(lock(&window.orders).contains_key(&(SortBy::Size, true)));
+    }
+
+    #[test]
+    fn background_work_waits_no_more_than_the_windows_kept() {
+        let turns: Vec<_> = std::iter::from_fn(background_turn).take(WINDOWS_KEPT + 5).collect();
+        assert!(turns.len() <= WINDOWS_KEPT);
+        assert!(background_turn().is_none());
+        drop(turns);
+        assert!(background_turn().is_some(), "a turn given back makes room");
+    }
+
     use super::*;
 
     const KEY: &str = "secret-key";
