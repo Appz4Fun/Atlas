@@ -125,6 +125,12 @@ fn top_with(
     }
     rows.sort_by(|a, b| compare(a, b, by, descending, &whole));
     rows.truncate(usize::try_from(want).unwrap_or(usize::MAX));
+    // the size it was ranked by, which is the one the page shows: a row the page hasn't worked out yet sorts by it too
+    for row in &mut rows {
+        if let Some(&total) = whole.get(&row.id) {
+            row.size = Some(total);
+        }
+    }
     Ok(rows)
 }
 
@@ -582,6 +588,10 @@ mod tests {
             for filter in [Some(&movies), None] {
                 let top = f.top(filter, Column::Size, true, 2, limits);
                 assert_eq!(top, [piece, lead], "indexed {indexed}: the upload's 8,000 before the 6,000s, newest first");
+                // with the size it was ranked by, for a window that sorts rows it hasn't rendered
+                let open = || db::open_with_shards(&f.main);
+                let rows = top_with(&open, filter, Column::Size, true, 2, limits).unwrap();
+                assert_eq!(rows.iter().map(|r| r.size).collect::<Vec<_>>(), [Some(8_000), Some(8_000)]);
                 let all = f.top(filter, Column::Size, true, 10, limits);
                 assert_eq!(all, [piece, lead, big[2], big[1], big[0], small], "indexed {indexed}");
                 // going up its pieces come in by their own size, and the page puts them where the whole goes
