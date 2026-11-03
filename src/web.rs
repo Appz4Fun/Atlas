@@ -1204,7 +1204,8 @@ fn slot_of(search: &Search, always: bool) -> Arc<WindowSlot> {
     } else {
         Search { offset: 0, sort: None, descending: true, ..search.clone() }
     };
-    let key = plain.query(&plain.cat, 0);
+    // by the categories the filter comes to, not how the url spells them: `8000,x1` and `8000,x2` are one window
+    let key = format!("{}|{:?}", plain.query("", 0), parse_filter(&plain.cat));
     let mut windows = lock(&WINDOWS);
     if !windows.contains_key(&key) && windows.len() >= WINDOWS_KEPT {
         let oldest = windows
@@ -3791,6 +3792,9 @@ mod tests {
         let far = Window { asked: GROW_WITH_TAGS, more_in_db: true, ..window_of_rows(Vec::new()) };
         assert!(!far.can_grow(&tags), "tags are read a name at a time, soo they stop somewhere");
         assert!(far.can_grow(&ranked));
+        let spelled = |cat: &str| Search::from_args(&parse_query(&format!("cat={cat}&sort=category")));
+        assert!(Arc::ptr_eq(&slot_of(&spelled("8000,x1"), false), &slot_of(&spelled("8000,x2"), false)));
+        assert!(!Arc::ptr_eq(&slot_of(&spelled("8000"), false), &slot_of(&spelled("2000"), false)));
         let deepest = Window { asked: MAX_WINDOW, more_in_db: true, ..window_of_rows(Vec::new()) };
         assert!(!deepest.can_grow(&ranked), "a url can't have a whole database read into memory");
     }
