@@ -332,8 +332,8 @@ fn tc_t1_f23_1_audio_bitstream_truehd_atmos() {
 #[test]
 fn tc_t1_f23_2_audio_bitstream_eac3_atmos() {
     let mut data = vec![0u8; 64];
-    // EMDF sync word: 0x5838
-    data[20..22].copy_from_slice(&[0x58, 0x38]);
+    // EMDF sync word 0x5838 + container_len=4 + version=0, key_id=0, payload_id=14 (JOC) + 12b joc_header
+    data[20..28].copy_from_slice(&[0x58, 0x38, 0x00, 0x04, 0x03, 0x80, 0x00, 0x00]);
 
     let probe = AudioBitstream::probe(&data);
     assert!(probe.has_atmos);

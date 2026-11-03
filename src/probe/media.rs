@@ -2015,6 +2015,44 @@ impl AudioBitstream {
         false
     }
 
+    fn has_valid_joc_emdf_payload(container: &[u8]) -> bool {
+        let mut r = crate::video::bits::BitReader::new(container);
+        let Ok(emdf_version) = r.bits(2) else { return false };
+        if emdf_version != 0 {
+            return false;
+        }
+        let Ok(key_id) = r.bits(3) else { return false };
+        if key_id == 7 {
+            loop {
+                let Ok(ext) = r.bits(3) else { return false };
+                if ext != 7 {
+                    break;
+                }
+            }
+        }
+        let Ok(mut payload_id) = r.bits(5) else { return false };
+        if payload_id == 0x1F {
+            let Ok(ext) = r.bits(5) else { return false };
+            payload_id += ext;
+        }
+        if payload_id != 14 {
+            return false;
+        }
+        // joc_header(): joc_dmx_config_idx (3b), joc_num_objects_bits (6b), joc_ext_config_idx (3b)
+        r.bits(12).is_ok()
+    }
+
+    fn has_valid_joc_emdf_container(emdf_slice: &[u8]) -> bool {
+        if emdf_slice.len() < 4 || emdf_slice[0] != 0x58 || emdf_slice[1] != 0x38 {
+            return false;
+        }
+        let container_len = usize::from(u16::from_be_bytes([emdf_slice[2], emdf_slice[3]]));
+        if container_len == 0 || 4 + container_len > emdf_slice.len() {
+            return false;
+        }
+        Self::has_valid_joc_emdf_payload(&emdf_slice[4..4 + container_len])
+    }
+
     pub fn has_eac3_atmos_frame(data: &[u8]) -> bool {
         let mut offset = 0usize;
         let mut verified_no_emdf_start = 0usize;
@@ -2034,17 +2072,20 @@ impl AudioBitstream {
                     if scan_start < body_end {
                         let body = &data[scan_start..body_end];
                         let mut emdf_off = 0usize;
+                        let mut max_verified_end = body_end.saturating_sub(3);
                         while let Some(emdf_slice) = body.get(emdf_off..) {
                             let Some(emdf_pos) = find_subsequence(emdf_slice, &[0x58, 0x38]) else { break };
-                            if let Some(&hdr) = emdf_slice.get(emdf_pos + 2)
-                                && emdf_slice.get(emdf_pos + 3).is_some()
-                                && (hdr & 0xF8) == 0
-                            {
+                            if Self::has_valid_joc_emdf_container(&emdf_slice[emdf_pos..]) {
                                 return true;
+                            }
+                            let abs_emdf_pos = scan_start + emdf_off + emdf_pos;
+                            if Self::has_valid_joc_emdf_container(&data[abs_emdf_pos..]) {
+                                max_verified_end = max_verified_end.min(abs_emdf_pos);
+                                break;
                             }
                             emdf_off = emdf_off.saturating_add(emdf_pos + 2);
                         }
-                        verified_no_emdf_start = verified_no_emdf_start.max(body_end.saturating_sub(3));
+                        verified_no_emdf_start = verified_no_emdf_start.max(max_verified_end);
                     }
                 }
             }
@@ -2058,7 +2099,7 @@ impl AudioBitstream {
             return false;
         }
         if let Some(pos) = find_subsequence(data, &[0x58, 0x38]) {
-            data[..pos].iter().all(|&b| b == 0) && data.get(pos + 2..pos + 6) == Some(&[0, 0, 0, 0])
+            data[..pos].iter().all(|&b| b == 0) && Self::has_valid_joc_emdf_container(&data[pos..])
         } else {
             false
         }
@@ -2687,7 +2728,8 @@ mod tests {
         assert!(!info_no_atmos.audio[1].atmos);
 
         // Cluster 2: valid E-AC-3 Atmos syncframe on Track 3 (second audio track)
-        // Sync 0x0B77, strmtyp=0, frmsiz=15 (32 bytes), fscod=0, bsid=16 (16 << 3 = 0x80), EMDF 0x5838 + version/key=0
+        // Sync 0x0B77, strmtyp=0, frmsiz=15 (32 bytes), fscod=0, bsid=16 (16 << 3 = 0x80),
+        // EMDF 0x5838 + len=4 + version=0, key_id=0, payload_id=14 (0x03, 0x80) + 12-bit joc_header
         let mut eac3_frame = vec![0u8; 32];
         eac3_frame[0] = 0x0B;
         eac3_frame[1] = 0x77;
@@ -2695,7 +2737,7 @@ mod tests {
         eac3_frame[3] = 15;
         eac3_frame[4] = 0x00;
         eac3_frame[5] = 16 << 3;
-        eac3_frame[10..14].copy_from_slice(&[0x58, 0x38, 0x02, 0x0E]);
+        eac3_frame[10..18].copy_from_slice(&[0x58, 0x38, 0x00, 0x04, 0x03, 0x80, 0x00, 0x00]);
         let mut audio_block_body = vec![0x83, 0x00, 0x00, 0x80]; // TrackNumber = 3
         audio_block_body.extend_from_slice(&eac3_frame);
         let cluster_with_atmos = [video_block, el(&[0xA3], &audio_block_body)].concat();
@@ -2767,9 +2809,15 @@ mod tests {
             "4 MiB repeated E-AC-3 sync word scan must complete in linear time, took {:?}",
             start.elapsed()
         );
-        // Place valid EMDF sync [0x58, 0x38, 0x00, 0x00] near the end of the 4 MiB buffer
         let tail = payload.len() - 16;
+        // Coincidental [0x58, 0x38, 0x00, 0x00] (zero container length) must NOT report Atmos
         payload[tail..tail + 4].copy_from_slice(&[0x58, 0x38, 0x00, 0x00]);
+        assert!(!AudioBitstream::has_eac3_atmos_frame(&payload));
+        // Non-JOC EMDF container (payload_id=11 -> 0x02, 0xC0) must NOT report Atmos
+        payload[tail..tail + 8].copy_from_slice(&[0x58, 0x38, 0x00, 0x04, 0x02, 0xC0, 0x00, 0x00]);
+        assert!(!AudioBitstream::has_eac3_atmos_frame(&payload));
+        // Valid JOC EMDF container (len=4, version=0, key_id=0, payload_id=14 -> 0x03, 0x80 + 12b joc_header)
+        payload[tail..tail + 8].copy_from_slice(&[0x58, 0x38, 0x00, 0x04, 0x03, 0x80, 0x00, 0x00]);
         assert!(AudioBitstream::has_eac3_atmos_frame(&payload));
     }
 
@@ -2925,7 +2973,7 @@ mod tests {
 
         // Immediately following at mdat offset 32: 32-byte Atmos E-AC-3 frame
         let mut atmos_frame = non_atmos_frame.clone();
-        atmos_frame[10..14].copy_from_slice(&[0x58, 0x38, 0x02, 0x0E]);
+        atmos_frame[10..18].copy_from_slice(&[0x58, 0x38, 0x00, 0x04, 0x03, 0x80, 0x00, 0x00]);
 
         let mut mdat_payload = Vec::new();
         mdat_payload.extend_from_slice(&non_atmos_frame);

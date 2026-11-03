@@ -611,9 +611,13 @@ fn test_audio_bitstream_truehd_atmos_sync_variations() {
 
 #[test]
 fn test_audio_bitstream_eac3_emdf_and_dtsx() {
-    // E-AC-3 EMDF sync: 0x5838
+    // E-AC-3 EMDF sync 0x5838 with zero container length must NOT report Atmos
     let mut eac3_data = vec![0u8; 64];
-    eac3_data[15..17].copy_from_slice(&[0x58, 0x38]);
+    eac3_data[15..19].copy_from_slice(&[0x58, 0x38, 0x00, 0x00]);
+    assert!(!AudioBitstream::probe(&eac3_data).has_atmos);
+
+    // Valid JOC EMDF container (len=4, version=0, key_id=0, payload_id=14 + 12b joc_header)
+    eac3_data[15..23].copy_from_slice(&[0x58, 0x38, 0x00, 0x04, 0x03, 0x80, 0x00, 0x00]);
     let res_eac3 = AudioBitstream::probe(&eac3_data);
     assert!(res_eac3.has_atmos);
     assert_eq!(res_eac3.format.as_deref(), Some("E-AC-3 Atmos"));
