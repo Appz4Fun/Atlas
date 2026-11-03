@@ -582,7 +582,18 @@ fn a_blocked_group_makes_no_request() {
 fn a_rejected_release_makes_no_request() {
     let mut h = fresh();
     let r = release_of("Rejected.Show.S01E01.720p.HDTV.x264-GRP", "rejected.show.vol00+1.par2", 2, 2);
-    no_request_for(&mut h, &[r]);
+    h.save(&[r]);
+    h.save(&[complete(SHOW)]);
+    let s = FixtureServer::start(vec![single()]);
+    // a post of only PAR2 files is rejected only when the rules say so, which the defaults no longer do
+    let media = Media::new(&h.main);
+    media.with_second_pass(Duration::from_millis(200));
+    let mut cfg = config(maze(&s));
+    cfg.postprocess.reject_par2_only = true;
+    start_with(&mut h, cfg, steps_of(&media));
+    wait_for("the fixture's show", || row(&h, SHOW).is_some_and(|r| r.tvdb == Some(3001)));
+    std::thread::sleep(Duration::from_millis(1_500));
+    assert_eq!(s.requests().len(), 1, "{:?}", s.requests());
 }
 
 #[test]

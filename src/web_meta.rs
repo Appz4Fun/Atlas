@@ -167,6 +167,15 @@ struct FileTiming {
     late_articles: i64,
     /// the articles the row covers
     articles: i64,
+    /// what the message-ids said (`discovery::id_facts`): the tool's code, its or the server's clock in ms, and the
+    /// Highwinds host, session key and counters
+    tool: Option<i64>,
+    clock_first: Option<i64>,
+    clock_last: Option<i64>,
+    hw_host: Option<String>,
+    hw_key: Option<String>,
+    hw_n_first: Option<i64>,
+    hw_n_last: Option<i64>,
 }
 
 /// `predb_match` has `title_id, kind, category, pre_at, nuked, matched_at` and no feed, source or reason
@@ -240,7 +249,8 @@ fn look(conn: Option<&Connection>, release_id: i64) -> Looked {
 fn read_timing(s: &Connection, release_id: i64) -> rusqlite::Result<Vec<FileTiming>> {
     s.prepare_cached(
         "select t.first_date, t.last_date, t.number_first, t.number_last, t.lines, t.references_seen, t.xref_groups_max,
-                t.from_variants, t.encoded_subject, t.late_articles, t.articles, t.from_hash
+                t.from_variants, t.encoded_subject, t.late_articles, t.articles, t.from_hash,
+                t.tool, t.clock_first, t.clock_last, t.hw_host, t.hw_key, t.hw_n_first, t.hw_n_last
          from file_timing t join files f on f.id = t.file_id
          where f.release_id = ?1 order by f.filename limit ?2",
     )?
@@ -258,6 +268,13 @@ fn read_timing(s: &Connection, release_id: i64) -> rusqlite::Result<Vec<FileTimi
             late_articles: r.get(9)?,
             articles: r.get(10)?,
             from_hash: r.get(11)?,
+            tool: r.get(12)?,
+            clock_first: r.get(13)?,
+            clock_last: r.get(14)?,
+            hw_host: r.get(15)?,
+            hw_key: r.get(16)?,
+            hw_n_first: r.get(17)?,
+            hw_n_last: r.get(18)?,
         })
     })?
     .collect()
@@ -849,8 +866,65 @@ fn where_panel(i: &MetaInputs<'_>, l: &Looked, compact: bool) -> Facts {
         f.add("Threaded replies", Some(threaded_replies(&l.timing)));
         f.add("Crossposts per article", crossposts(&l.timing));
         f.add("From variants", from_variants(&l.timing));
+        f.add("Posting tool", posting_tool(&l.timing));
+        f.add("Id clock", id_clock(&l.timing));
+        f.add("Server session", server_session(&l.timing));
     }
     f
+}
+
+/// "Nyuu" or "Nyuu, ngPost": the tools the message-ids named, as `discovery` reads them.
+fn posting_tool(timing: &[FileTiming]) -> Option<String> {
+    let mut tools: Vec<&str> = timing
+        .iter()
+        .filter_map(|t| t.tool.and_then(crate::discovery::ToolType::from_code))
+        .map(|t| t.label())
+        .collect();
+    tools.sort_unstable();
+    tools.dedup();
+    (!tools.is_empty()).then(|| tools.join(", "))
+}
+
+/// "2026-10-02 10:00:00.123 to 10:04:59.870 UTC by the ids' clock, 5 min": the milliseconds the tool or the server
+/// wrote into the message-ids, which the poster can't have set.
+fn id_clock(timing: &[FileTiming]) -> Option<String> {
+    let first = timing.iter().filter_map(|t| t.clock_first).min()?;
+    let last = timing.iter().filter_map(|t| t.clock_last).max()?;
+    let fmt = |ms: i64| {
+        chrono::DateTime::from_timestamp_millis(ms).map(|d| d.format("%Y-%m-%d %H:%M:%S%.3f").to_string())
+    };
+    let (a, b) = (fmt(first)?, fmt(last)?);
+    let secs = (last - first) / 1000;
+    let span = if secs < 60 { "within a minute".to_string() } else { fmt_skew(secs).trim_start_matches('+').to_string() };
+    Some(format!("{a} to {b} UTC by the ids' clock, {span}"))
+}
+
+/// "fx09.am4, key JP7, counters 546,176–546,900": the Highwinds session every article came through; more than one
+/// key means more than one connection or session posted the files.
+fn server_session(timing: &[FileTiming]) -> Option<String> {
+    let mut keys: Vec<(String, String)> = timing
+        .iter()
+        .filter_map(|t| Some((t.hw_host.clone()?, t.hw_key.clone()?)))
+        .collect();
+    keys.sort_unstable();
+    keys.dedup();
+    let first = timing.iter().filter_map(|t| t.hw_n_first).min();
+    let last = timing.iter().filter_map(|t| t.hw_n_last).max();
+    match keys.len() {
+        0 => None,
+        1 => {
+            let (host, key) = &keys[0];
+            let counters = match (first, last) {
+                (Some(a), Some(b)) if a != b => {
+                    format!(", counters {}–{}", thousands(a), thousands(b))
+                }
+                (Some(a), _) => format!(", counter {}", thousands(a)),
+                _ => String::new(),
+            };
+            Some(format!("{host}, key {key}{counters}"))
+        }
+        n => Some(format!("{n} sessions: {}", keys.iter().map(|(h, k)| format!("{h} key {k}")).collect::<Vec<_>>().join(", "))),
+    }
 }
 
 // ---------------------------------------------------------------- timing (file_timing, from the overview)

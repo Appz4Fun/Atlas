@@ -94,6 +94,7 @@ families! {
     STAGE_EVENTS "atlas_stage_events_total" Counter &[], "Stage events: steps_done, matched, unmatched, retries, rows_walked, errors.";
     STAGE_BODIES "atlas_stage_bodies_total" Counter &[], "Article bodies the stage has fetched.";
     STAGE_BODY_BYTES "atlas_stage_body_bytes_total" Counter &[], "Bytes of the bodies the stage has fetched.";
+    NZB_FILLED "atlas_nzb_filled_articles_total" Counter &[], "Articles NZBs took from twins and file twins to fill gaps.";
 
     // names
     NAMES_APPLIED "atlas_names_applied_total" Counter &[], "Names written onto releases, by source.";

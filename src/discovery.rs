@@ -191,6 +191,120 @@ impl PostingTool {
     }
 }
 
+/// What one message-id says of its article, for `file_timing`: the tool that made it, the time the tool or the server
+/// wrote into it, and the Highwinds fields that tie one posting session's articles together.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IdFacts {
+    pub tool: Option<ToolType>,
+    /// milliseconds since the epoch: the tool's clock (Nyuu, GoPostStuff) or else the server's (Highwinds, Giganews,
+    /// Diablo, INN), never the poster's Date header
+    pub clock_ms: Option<i64>,
+    /// `T.N$K.R@host` on Highwinds: the host, the session key `K`, and the per-session counter `N`
+    pub hw_host: Option<String>,
+    pub hw_key: Option<String>,
+    pub hw_n: Option<i64>,
+}
+
+impl ToolType {
+    /// A small number for a database column, 0 for none known.
+    pub fn code(self) -> i64 {
+        match self {
+            ToolType::Unknown => 0,
+            ToolType::Nyuu => 1,
+            ToolType::NgPost => 2,
+            ToolType::Postie => 3,
+            ToolType::NewsUp => 4,
+            ToolType::NxgUpper => 5,
+            ToolType::GoPostStuff => 6,
+        }
+    }
+
+    pub fn from_code(code: i64) -> Option<ToolType> {
+        Some(match code {
+            1 => ToolType::Nyuu,
+            2 => ToolType::NgPost,
+            3 => ToolType::Postie,
+            4 => ToolType::NewsUp,
+            5 => ToolType::NxgUpper,
+            6 => ToolType::GoPostStuff,
+            _ => return None,
+        })
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ToolType::Unknown => "unknown",
+            ToolType::Nyuu => "Nyuu",
+            ToolType::NgPost => "ngPost",
+            ToolType::Postie => "Postie",
+            ToolType::NewsUp => "NewsUP",
+            ToolType::NxgUpper => "nxg-upper",
+            ToolType::GoPostStuff => "GoPostStuff",
+        }
+    }
+}
+
+/// Nyuu as it posts by default: letters, then the millisecond it made the id, and nothing between.
+static NYUU_PLAIN_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[A-Za-z]{12,40}(1[0-9]{12})@").unwrap());
+
+/// The facts one message-id gives, with no headers to go by. Cheap: a few anchored regexes.
+pub fn id_facts(message_id: &str) -> IdFacts {
+    let mid = message_id.trim().trim_start_matches('<').trim_end_matches('>');
+    let mut facts = IdFacts::default();
+    if mid.len() > 1024 || !mid.is_ascii() {
+        return facts;
+    }
+    let Some((local, domain)) = mid.split_once('@') else { return facts };
+    if local.is_empty() || domain.is_empty() {
+        return facts;
+    }
+    let info = PostingTool::classify(mid, &HeaderMap::new());
+    let mut tool = info.tool;
+    let mut clock = info.embedded_time_ms.and_then(|ms| i64::try_from(ms).ok());
+    if clock.is_none()
+        && let Some(caps) = NYUU_PLAIN_RE.captures(mid)
+    {
+        tool = ToolType::Nyuu;
+        clock = caps.get(1).and_then(|m| m.as_str().parse().ok());
+    }
+    if tool != ToolType::Unknown {
+        facts.tool = Some(tool);
+    }
+    if let Some(hw) = highwinds_fields(local, domain) {
+        facts.hw_host = Some(hw.host);
+        facts.hw_key = Some(hw.key);
+        facts.hw_n = Some(hw.n);
+    }
+    if clock.is_none() {
+        clock = ServerClock::decode(mid).map(|dt| dt.timestamp_millis());
+    }
+    facts.clock_ms = clock.filter(|ms| *ms > 0);
+    facts
+}
+
+/// `T.N$K.R@fxNN.site`: the server's time `T`, its counter `N`, the session key `K` and `R`, on a Highwinds host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HighwindsId {
+    pub host: String,
+    pub key: String,
+    pub n: i64,
+}
+
+fn highwinds_fields(local: &str, domain: &str) -> Option<HighwindsId> {
+    let host = domain.to_ascii_lowercase();
+    if !host.starts_with("fx") || host.len() > 32 {
+        return None;
+    }
+    let (left, right) = local.split_once('$')?;
+    let (t, n) = left.split_once('.')?;
+    let (key, r) = right.split_once('.')?;
+    if t.is_empty() || key.is_empty() || key.len() > 16 || !r.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let n: i64 = n.parse().ok()?;
+    Some(HighwindsId { host, key: key.to_string(), n })
+}
+
 pub struct ServerClock;
 
 impl ServerClock {
@@ -541,6 +655,24 @@ mod tests {
         let mid = "<EaPmB.546176$JP7.228032@fx09.am4>";
         let dt = ServerClock::decode(mid).expect("highwinds decoded");
         assert_eq!(dt.timestamp(), 1_503_379_236);
+    }
+
+    #[test]
+    fn a_message_id_gives_its_tool_clock_and_session() {
+        let hw = id_facts("<EaPmB.546176$JP7.228032@fx09.am4>");
+        assert_eq!(hw.tool, None);
+        assert_eq!(hw.clock_ms, Some(1_503_379_236_000));
+        assert_eq!((hw.hw_host.as_deref(), hw.hw_key.as_deref(), hw.hw_n), (Some("fx09.am4"), Some("JP7"), Some(546_176)));
+        let nyuu = id_facts("<ZjPsQyLgOjNtQvXbHeKaXyCm1730295651235@nyuu>");
+        assert_eq!(nyuu.tool, Some(ToolType::Nyuu));
+        assert_eq!(nyuu.clock_ms, Some(1_730_295_651_235));
+        assert_eq!(nyuu.hw_key, None);
+        let ng = id_facts("<1064b678-f3f5-4e28-a5af-d48a3a986076@ngPost>");
+        assert_eq!(ng.tool, Some(ToolType::NgPost));
+        assert_eq!(ng.clock_ms, None);
+        assert_eq!(id_facts("<a@b>"), IdFacts::default());
+        assert_eq!(id_facts("nonsense"), IdFacts::default());
+        assert_eq!(ToolType::from_code(ToolType::NewsUp.code()), Some(ToolType::NewsUp));
     }
 
     #[test]
