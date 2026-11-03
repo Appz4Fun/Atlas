@@ -62,12 +62,13 @@ pub fn get(path: &str, query: &str, cookies: Option<&str>, base: &str, api_key: 
         "/ui/duplicates" if signed_in => duplicates_page(&args),
         "/ui/details" if signed_in => details_panel(&args),
         "/ui/poster" if signed_in => poster(&args),
+        "/ui/still" if signed_in => still(&args),
         "/ui/meta" if signed_in => crate::web_meta::fragment(&args),
         "/ui/row" if signed_in => crate::web_meta::row_panel(&args),
         "/ui/settings" if signed_in => html(200, settings_page(None)),
         "/ui/nzb" if signed_in && args.get("fill").is_some_and(|v| v == "1") => filled_nzb(&args),
         "/ui/nzb" if signed_in => get_nzb(&args),
-        "/ui/details" | "/ui/poster" | "/ui/meta" | "/ui/row" => {
+        "/ui/details" | "/ui/poster" | "/ui/still" | "/ui/meta" | "/ui/row" => {
             ApiResponse { headers: vec![("HX-Redirect".into(), "/".into())], ..html(401, String::new()) }
         }
         "/ui/nzb" | "/ui/release" | "/ui/duplicates" | "/ui/settings" => redirect(Vec::new()),
@@ -1187,6 +1188,8 @@ fn release_html(
 
     // the probe row is decoded once: the panels below read the same one
     let conn = crate::db::open().ok();
+    let stills =
+        conn.as_ref().map(|conn| stills_html(r.id, &crate::probe::stills::stills(conn, r.id))).unwrap_or_default();
     let found = conn.as_ref().and_then(|c| crate::probe::read(c, r.id));
     let probe = match (conn.as_ref(), found.as_ref()) {
         (Some(c), Some(found)) => {
@@ -1219,6 +1222,7 @@ fn release_html(
 <div class="actions"><a class="button primary" href="/ui/nzb?id={id}">Download NZB</a>{fill}<a class="button" href="/?cat={category}">More in this category</a></div>
 <div id="title-details" hx-get="/ui/details?id={id}" hx-trigger="load" hx-swap="outerHTML"></div>
 <div class="panel"><dl class="facts">{facts}</dl></div>
+{stills}
 {copies}
 {meta}
 {probe}
@@ -1758,6 +1762,54 @@ fn details_html(d: &crate::media::details::Details) -> String {
     )
 }
 
+/// Stills from the video, in order: each a link to the full size JPEG, with where in the film it's from.
+fn stills_html(id: i64, stills: &[(u8, Option<i64>, u32, u32)]) -> String {
+    if stills.is_empty() {
+        return String::new();
+    }
+    let figures: String = stills
+        .iter()
+        .map(|&(position, at_ms, width, height)| {
+            let src = format!("/ui/still?id={id}&amp;at={position}");
+            let when = at_ms.map_or(format!("{position}%"), |ms| format!("{position}% · {}", clock(ms)));
+            format!(
+                "<figure><a href=\"{src}\"><img src=\"{src}\" width=\"{width}\" height=\"{height}\" loading=\"lazy\" alt=\"Still at {when}\"></a><figcaption>{when}</figcaption></figure>"
+            )
+        })
+        .collect();
+    format!("<h2>Stills</h2><div class=\"stills\">{figures}</div>")
+}
+
+/// A time into the film as h:mm:ss, or m:ss under an hour.
+fn clock(ms: i64) -> String {
+    let secs = ms.max(0) / 1000;
+    let (h, m, s) = (secs / 3600, secs / 60 % 60, secs % 60);
+    if h > 0 { format!("{h}:{m:02}:{s:02}") } else { format!("{m}:{s:02}") }
+}
+
+/// One still's JPEG.
+fn still(args: &HashMap<String, String>) -> ApiResponse {
+    let number = |key: &str| args.get(key).and_then(|v| v.trim().parse::<i64>().ok()).unwrap_or(0);
+    let (id, at) = (number("id"), number("at"));
+    let found = u8::try_from(at)
+        .ok()
+        .and_then(|at| crate::db::open().ok().and_then(|conn| crate::probe::stills::still(&conn, id, at)));
+    let Some(bytes) = found else {
+        return ApiResponse::not_found();
+    };
+    ApiResponse {
+        status: 200,
+        content_type: Some("image/jpeg"),
+        body: String::new(),
+        headers: vec![
+            ("Cache-Control".into(), "private, max-age=86400".into()),
+            ("X-Content-Type-Options".into(), "nosniff".into()),
+        ],
+        bytes: Some(bytes),
+        failed: false,
+    }
+}
+
 fn poster(args: &HashMap<String, String>) -> ApiResponse {
     let number = |key: &str| args.get(key).and_then(|v| v.trim().parse::<i64>().ok()).unwrap_or(0);
     let cfg = crate::config::media_config();
@@ -2132,6 +2184,15 @@ mod tests {
     }
 
     #[test]
+    fn stills_link_their_jpeg_and_say_where_they_are() {
+        assert_eq!(stills_html(7, &[]), "");
+        let html = stills_html(7, &[(25, Some(1_834_500), 960, 540), (50, None, 960, 540)]);
+        assert!(html.contains("<img src=\"/ui/still?id=7&amp;at=25\" width=\"960\" height=\"540\""), "{html}");
+        assert!(html.contains("<figcaption>25% · 30:34</figcaption>") && html.contains("<figcaption>50%</figcaption>"));
+        assert_eq!(clock(3_725_000), "1:02:05");
+    }
+
+    #[test]
     fn only_the_right_cookie_gets_in() {
         for bad in [None, Some("atlas_session=nope"), Some("x=1"), Some("atlas_session"), Some(KEY)] {
             assert!(!signed_in(bad, KEY), "{bad:?}");
@@ -2140,6 +2201,7 @@ mod tests {
             assert_eq!(header(&results, "HX-Redirect"), Some("/"));
             assert_eq!(get("/ui/details", "id=1", bad, "http://x", KEY).unwrap().status, 401, "{bad:?}");
             assert_eq!(get("/ui/poster", "kind=2&tmdb=1", bad, "http://x", KEY).unwrap().status, 401, "{bad:?}");
+            assert_eq!(get("/ui/still", "id=1&at=50", bad, "http://x", KEY).unwrap().status, 401, "{bad:?}");
             let nzb = get("/ui/nzb", "id=1", bad, "http://x", KEY).unwrap();
             assert_eq!(nzb.status, 303, "{bad:?}");
             assert_eq!(get("/ui/release", "id=1", bad, "http://x", KEY).unwrap().status, 303, "{bad:?}");

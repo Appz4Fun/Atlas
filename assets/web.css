@@ -296,3 +296,8 @@ tr.drawer-row code.key, .drawer-card code.key { background: var(--surface); }
   th, td { padding: 10px; }
   .title-details { flex-direction: column; }
 }
+
+.stills { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 12px; margin-bottom: 20px; }
+.stills figure { margin: 0; }
+.stills img { display: block; width: 100%; height: auto; border-radius: 4px; background: var(--sunken); }
+.stills figcaption { margin-top: 4px; font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
