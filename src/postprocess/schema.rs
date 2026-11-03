@@ -86,6 +86,7 @@ pub const SHARD_TABLES: &[&ShardTable] = &[
     &crate::probe::PROBE,
     &crate::probe::COVER,
     &crate::probe::opensubtitles::OPENSUBTITLES,
+    &crate::probe::stills::STILLS,
     &crate::predb::step::MATCH,
     &crate::predb::step::INNER_KEY,
     &crate::category::RELEASE_CATEGORY,
