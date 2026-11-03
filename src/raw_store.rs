@@ -384,6 +384,15 @@ fn with_raw<T>(f: impl FnOnce(&Connection) -> rusqlite::Result<T>) -> Option<T> 
     }
 }
 
+fn with_raw_tx<T>(f: impl FnOnce(&Connection) -> rusqlite::Result<T>) -> Option<T> {
+    with_raw(|conn| {
+        let tx = conn.unchecked_transaction()?;
+        let out = f(&tx)?;
+        tx.commit()?;
+        Ok(out)
+    })
+}
+
 fn compress(text: &str) -> Option<Vec<u8>> {
     zstd::encode_all(text.as_bytes(), 3).ok()
 }
@@ -519,7 +528,7 @@ pub fn put_http_cache(source: &str, url: &str, status: u16, body: &str) {
     let clean_url = canonical_cache_url(url);
     let cache_key = format!("GET:{source}:{clean_url}");
     let now = chrono::Utc::now().timestamp();
-    let _ = with_raw(|conn| {
+    let _ = with_raw_tx(|conn| {
         conn.prepare_cached("DELETE FROM raw_http_cache WHERE cache_key = ?1")?
             .execute(params![&cache_key])?;
         prune_http_cache(conn, incoming_bytes, MAX_HTTP_CACHE_ROWS, MAX_HTTP_CACHE_BYTES, now)?;
@@ -585,7 +594,7 @@ pub fn record_predb_page(source_id: i64, source_key: &str, url: &str, page: u32,
     let now = chrono::Utc::now().timestamp();
     let page_i64 = i64::from(page);
     let cache_forever = is_immutable_predb_page(source_key, page);
-    let _ = with_raw(|conn| {
+    let _ = with_raw_tx(|conn| {
         let existing_id: Option<i64> = conn
             .prepare_cached("SELECT id FROM raw_predb_log WHERE source_id = ?1 AND body_sha256 = ?2")?
             .query_row(params![source_id, &sha256], |r| r.get(0))
@@ -867,7 +876,7 @@ fn prune_opensubtitles(conn: &Connection, max_rows: i64) -> rusqlite::Result<()>
 pub fn put_opensubtitles(moviehash: &str, feature: Option<&Feature>) {
     let f = feature.cloned().unwrap_or_default();
     let now = chrono::Utc::now().timestamp();
-    let _ = with_raw(|conn| {
+    let _ = with_raw_tx(|conn| {
         let exists: bool = conn
             .prepare_cached("SELECT EXISTS(SELECT 1 FROM raw_opensubtitles WHERE moviehash = ?1)")?
             .query_row(params![moviehash], |r| r.get(0))?;
@@ -1073,7 +1082,7 @@ pub fn put_nfo_password(name: &str, group_name: &str, content_id: &[u8], passwor
     if content_id.is_empty() || password.len() > 256 {
         return;
     }
-    let _ = with_raw(|conn| upsert_nfo_password(conn, name, group_name, content_id, password));
+    let _ = with_raw_tx(|conn| upsert_nfo_password(conn, name, group_name, content_id, password));
 }
 
 /// Persists a probed release's `ProbeInfo` JSON, completeness/stamp metadata, optional NFO password, and
@@ -1087,7 +1096,7 @@ pub fn put_probe(rec: &ProbeRecord<'_>) {
         return;
     }
     let now = chrono::Utc::now().timestamp();
-    let _ = with_raw(|conn| {
+    let _ = with_raw_tx(|conn| {
         conn.prepare_cached("DELETE FROM raw_probes WHERE name = ?1 AND group_name = ?2")?
             .execute(params![rec.name, rec.group_name])?;
         prune_probes(conn, incoming_bytes, MAX_RAW_PROBES_ROWS, MAX_RAW_PROBES_BYTES)?;
@@ -1185,7 +1194,7 @@ pub fn put_stills(name: &str, group_name: &str, content_id: &[u8], stills: &[Sav
     if content_id.is_empty() {
         return;
     }
-    let _ = with_raw(|conn| {
+    let _ = with_raw_tx(|conn| {
         conn.prepare_cached("DELETE FROM raw_stills WHERE name = ?1 AND group_name = ?2")?
             .execute(params![name, group_name])?;
         let count: i64 = conn.query_row("SELECT count(*) FROM raw_stills", [], |r| r.get(0))?;
@@ -1317,6 +1326,15 @@ pub fn get_archive(
                 ))
             })
             .optional()?;
+        let Some((pw, enc, hidden, check, saved_parts, saved_complete, l_comp, l_dmg, content_fp)) = row else {
+            return Ok(None);
+        };
+        let password = Some(pw);
+        let encryption = enc;
+        let names_hidden = hidden.unwrap_or(0) != 0;
+        let password_check = check;
+        let listing_complete = l_comp.unwrap_or(0) != 0;
+        let listing_damaged = l_dmg.unwrap_or(0) != 0;
         let files = conn
             .prepare_cached(
                 "SELECT seq, name, size, coalesce(source, 2)
@@ -1333,33 +1351,6 @@ pub fn get_archive(
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        if row.is_none() && files.is_empty() {
-            return Ok(None);
-        }
-        let (
-            password,
-            encryption,
-            names_hidden,
-            password_check,
-            saved_parts,
-            saved_complete,
-            listing_complete,
-            listing_damaged,
-            content_fp,
-        ) = match row {
-            Some((pw, enc, hidden, check, parts, complete, l_comp, l_dmg, c_fp)) => (
-                Some(pw),
-                enc,
-                hidden.unwrap_or(0) != 0,
-                check,
-                parts,
-                complete,
-                l_comp.unwrap_or(0) != 0,
-                l_dmg.unwrap_or(0) != 0,
-                c_fp,
-            ),
-            None => (None, None, false, None, None, None, false, false, None),
-        };
         if files.is_empty() && !names_hidden {
             return Ok(None);
         }
@@ -1411,7 +1402,7 @@ pub fn put_archive(rec: &ArchiveRecord<'_>) {
     if rec.content_id.is_empty() {
         return;
     }
-    let _ = with_raw(|conn| {
+    let _ = with_raw_tx(|conn| {
         conn.prepare_cached(
             "DELETE FROM raw_archive_inner_files
              WHERE release_name = ?1 AND group_name = ?2 AND coalesce(source, 2) = ?3",
@@ -1569,7 +1560,7 @@ pub fn put_par2(rec: &Par2Record<'_>) {
     if rec.content_id.is_empty() {
         return;
     }
-    let _ = with_raw(|conn| {
+    let _ = with_raw_tx(|conn| {
         let exists: bool = conn
             .prepare_cached("SELECT EXISTS(SELECT 1 FROM raw_par2 WHERE name = ?1 AND group_name = ?2)")?
             .query_row(params![rec.name, rec.group_name], |r| r.get(0))?;
