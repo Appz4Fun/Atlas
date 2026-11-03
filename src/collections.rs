@@ -74,7 +74,9 @@ fn compiled(group: &str) -> Compiled {
 }
 
 /// `<base> (12/45)`
-static BASE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\s*(.+?)\s+\(\d+\s*/\s*\d+\)").unwrap());
+static BASE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\s*(.+)\s+\(\d+\s*/\s*\d+\)").unwrap());
+static BRACKET_COUNTER_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\[(\d{1,5})\s*(?:/|of|-)\s*(\d{1,5})\]").unwrap());
 
 /// What upstream's regexes run on: the subject up to its part counter, with a
 /// ` yEnc` when the subject has none. A subject with no part counter is its own base.
@@ -89,24 +91,24 @@ pub fn subject_base(subject: &str) -> Cow<'_, str> {
 
 /// (file number, files) of a base's counter
 fn file_counter(base: &str) -> Option<(i64, i64)> {
-    let c = COUNTER_RE.captures(base)?;
+    let c = BRACKET_COUNTER_RE.captures(base).or_else(|| COUNTER_RE.captures(base))?;
     Some((c[1].parse().ok()?, c[2].parse().ok()?))
 }
 
 const FILE_SIZES: &str = r#"\d{1,3}([,.\/])\d{1,3}\s([kmg])b|(])?\s\d+KB\s(yENC)?|"?\s\d+\sbytes?|[- ]?\d+([.,])?\d+\s([gkm])?B\s-?(\s?yenc)?|\s\(d{1,3},\d{1,3}\s\{K,M,G\}B\)\s|yEnc \d+k$|\{\d+ yEnc bytes\}|yEnc \d+ |\(\d+ ?([kmg])?b(ytes)?\) yEnc$"#;
 const MUSIC_FILE_SIZES: &str = r#"\d{1,3}([,.\/])\d{1,3}\s([kmg])b|(])?\s\d+KB\s(yENC)?|"?\s\d+\sbytes?|[- ]?\d+[.,]?\d+\s([gkm])?B\s-?(\s?yenc)?|\s\(d{1,3},\d{1,3}\s\{K,M,G\}B\)\s|yEnc \d+k$|\{\d+ yEnc bytes\}|yEnc \d+ |\(\d+ ?([kmg])?b(ytes)?\) yEnc$"#;
 const MARKERS: &str =
-    r#"AutoRarPar\d{1,5}|\(\d+\)\s?yEnc|\d+(Amateur|Classic)| \d{4,}[a-z]{4,} |.vol\d+\+\d+|.part\d+"#;
+    r#"AutoRarPar\d{1,5}|\(\d+\)\s?yEnc|\d+(Amateur|Classic)| \d{4,}[a-z]{4,} |\.(vol|iby)\d+[+-]\d+|\.(part|cneg)\d+"#;
 const NUMBERING: &str = r#"((( \(\d\d\) -|(\d\d)? - \d\d\.|\d{4} \d\d -) | - \d\d-| \d\d\. [a-z]).+| \d\d of \d\d| \dof\d)\.mp3"?|([)(\[\s])\d{1,5}(\/|([\s_])of([\s_])|-)\d{1,5}([)\]\s$:])|\(\d{1,3}\|\d{1,3}\)|[^\d]{4}-\d{1,3}-\d{1,3}\.|\s\d{1,3}\sof\s\d{1,3}\.|\s\d{1,3}\/\d{1,3}|\d{1,3}of\d{1,3}\.|^\d{1,3}\/\d{1,3}\s|\d{1,3} - of \d{1,3}"#;
 const MUSIC_NUMBERING: &str = r#"((( \(\d\d\) -|(\d\d)? - \d\d\.|\d{4} \d\d -) | - \d\d-| \d\d\. [a-z]).+| \d\d of \d\d| \dof\d)\.mp3"?|([(\[\s])\d{1,4}(\/|([\s_])of([\s_])|-)\d{1,4}([)\]\s$:])|\(\d{1,3}\|\d{1,3}\)|-\d{1,3}-\d{1,3}\.|\s\d{1,3}\sof\s\d{1,3}\.|\s\d{1,3}\/\d{1,3}|\d{1,3}of\d{1,3}\.|^\d{1,3}\/\d{1,3}\s|\d{1,3} - of \d{1,3}"#;
 // upstream has `\d{3}(?=([\s"]))` where this has `\d{3}[\s"]`: the character
 // it now takes is a quote or a space, and what is taken becomes a space
-const EXTENSIONS: &str = r#"(-? [a-z0-9]+-?|\(?\d{4}\)?([_-])[a-z0-9]+)\.jpg"?| [a-z0-9]+\.mu3"?|((\d{1,3})?\.part(\d{1,5})?|\d{1,5} ?|sample|- Partie \d+)?\.(7z|\d{3}[\s"]|avi|diz|docx?|epub|idx|iso|jpg|m3u|m4a|mds|mkv|mobi|mp4|nfo|nzb|par(\s?2|")|pdf|rar|rev|rtf|r\d\d|sfv|srs|srr|sub|txt|vol.+(par2)|xls|zip|z{2,3})"?|(\s|(\d{2,3})?-)\d{2,3}\.mp3|\d{2,3}\.pdf|\.part\d{1,4}\."#;
+const EXTENSIONS: &str = r#"(-? [a-z0-9]+-?|\(?\d{4}\)?([_-])[a-z0-9]+)\.jpg"?| [a-z0-9]+\.mu3"?|((\d{1,3})?\.(part|cneg)(\d{1,5})?\s*|\d{1,5} ?|sample|- Partie \d+)?\.(7z|\d{3}[\s"]|avi|diz|docx?|epub|idx|iso|jpg|m3u|m4a|mds|mkv|mobi|mp4|nfo|nzb|par(\s?[23]|")|cne[27]|ene|pdf|rar|rev|rtf|r\d\d|sfv|srs|srr|sub|txt|(vol|iby).+(par[23]|cne[27])|xls|zip|z{2,3})"?|(\s|(\d{2,3})?-)\d{2,3}\.mp3|\d{2,3}\.pdf|\.(part|cneg)\d{1,4}\."#;
 // EXTENSIONS without what takes the digits before an extension: `\d{1,5} ?`,
 // `(\d{1,3})?` before `.part`, and the `.mp3` and `.pdf` ones. Upstream's row
 // is gone within hours, Atlas's stays: `Name.2019` and `Name.2021` must stay two posts
-const EXTENSIONS_KEEPING_DIGITS: &str = r#"(-? [a-z0-9]+-?|\(?\d{4}\)?([_-])[a-z0-9]+)\.jpg"?| [a-z0-9]+\.mu3"?|(\.part(\d{1,5})?|sample|- Partie \d+)?\.(7z|\d{3}[\s"]|avi|diz|docx?|epub|idx|iso|jpg|m3u|m4a|mds|mkv|mobi|mp4|nfo|nzb|par(\s?2|")|pdf|rar|rev|rtf|r\d\d|sfv|srs|srr|sub|txt|vol.+(par2)|xls|zip|z{2,3})"?|\.part\d{1,4}\."#;
-const LEFTOVER_EXTENSION: &str = r#"([\-_](proof|sample|thumbs?))*(\.part\d*(\.rar)?|\.rar|\.7z|\.par2)?(\d{1,3}\.rev"|\.vol\d+\+\d+.+?"|\.[A-Za-z0-9]{2,4}"|")"#;
+const EXTENSIONS_KEEPING_DIGITS: &str = r#"(-? [a-z0-9]+-?|\(?\d{4}\)?([_-])[a-z0-9]+)\.jpg"?| [a-z0-9]+\.mu3"?|(\.(part|cneg)(\d{1,5})?\s*|sample|- Partie \d+)?\.(7z|\d{3}[\s"]|avi|diz|docx?|epub|idx|iso|jpg|m3u|m4a|mds|mkv|mobi|mp4|nfo|nzb|par(\s?[23]|")|cne[27]|ene|pdf|rar|rev|rtf|r\d\d|sfv|srs|srr|sub|txt|(vol|iby).+(par[23]|cne[27])|xls|zip|z{2,3})"?|\.(part|cneg)\d{1,4}\."#;
+const LEFTOVER_EXTENSION: &str = r#"([\-_](proof|sample|thumbs?))*(\.(part|cneg)\d*(\.(rar|ene))?|\.(rar|ene)|\.7z|\.(par[23]|cne[27]))?(\d{1,3}\.rev"|\.(vol|iby)\d+[+-]\d+.+?"|\.[A-Za-z0-9]{2,4}"|")"#;
 
 fn insensitive(p: &str) -> Regex {
     RegexBuilder::new(p).case_insensitive(true).build().unwrap()
@@ -399,6 +401,8 @@ mod tests {
         assert_eq!(clean(r#"[2/4] - "Some.Show.S01.1080p-GRP.part2.rar" yEnc (1/1)"#, ""), first);
         assert_eq!(clean(r#"[3/4] - "Some.Show.S01.1080p-GRP.nfo" yEnc (1/1)"#, ""), first);
         assert_eq!(clean(r#"[4/4] - "Some.Show.S01.1080p-GRP.vol00+1.par2" yEnc (1/1)"#, ""), first);
+        assert_eq!(clean(r#"[4/4] - "Some.Show.S01.1080p-GRP.vol001-003.par2" yEnc (1/1)"#, ""), first);
+        assert_eq!(clean(r#"[4/4] - "Some.Show.S01.1080p-GRP.part.vol000+001.PAR2" yEnc (1/1)"#, ""), first);
         // a post's own digits stay
         assert_eq!(clean(r#"[1/2] "Name.2019.mkv" yEnc (1/9)"#, ""), "Name.2019 yEnc");
         assert_eq!(clean(r#"[2/2] "Name.2019.nfo" yEnc (1/1)"#, ""), "Name.2019 yEnc");
@@ -488,6 +492,27 @@ mod tests {
             ],
         );
         assert_eq!(got, vec![("Some.Show.S01.1080p-GRP".to_string(), 5)]);
+
+        let triumph = names(
+            G,
+            &[
+                r#"[EnJoY] =>A Blast from Usenet Past (2/3)<= [01/48] - "The Triumph of the Nerds S01E01 - 1996 (320x240 DivX).nfo" yEnc (0/1)"#,
+                r#"[EnJoY] =>A Blast from Usenet Past (2/3)<= [02/48] - "The Triumph of the Nerds S01E01 - 1996 (320x240 DivX).part.PAR2" yEnc (1/1)"#,
+                r#"[EnJoY] =>A Blast from Usenet Past (2/3)<= [03/48] - "The Triumph of the Nerds S01E01 - 1996 (320x240 DivX).part1.rar" yEnc (001/293)"#,
+                r#"[EnJoY] =>A Blast from Usenet Past (2/3)<= [08/48] - "The Triumph of the Nerds S01E01 - 1996 (320x240 DivX).part.vol000+001.PAR2" yEnc (1/2)"#,
+            ],
+        );
+        assert_eq!(triumph, vec![("The Triumph of the Nerds S01E01 - 1996 (320x240 DivX)".to_string(), 4)]);
+
+        let rot13 = names(
+            G,
+            &[
+                r#"(zvfgre-z) [01/81] - "tbtbahgf.cneg1.ene" lRap (1/10)"#,
+                r#"(zvfgre-z) [58/81] - "tbtbahgf.cneg7.ene" lRap (1/10)"#,
+                r#"(zvfgre-z) [75/81] - "tbtbahgf.iby00+01.cne7" lRap (1/2)"#,
+            ],
+        );
+        assert_eq!(rot13, vec![("tbtbahgf".to_string(), 3)]);
     }
 
     #[test]

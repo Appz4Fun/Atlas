@@ -363,6 +363,67 @@ fn the_web_ui_end_to_end() {
     let indexed = fetch(port, "/ui/results?q=Indexed", &cookie);
     assert!(indexed.body.contains("INCOMPLETE") && !indexed.body.contains(" GROUPS"), "{}", indexed.body);
 
+    // a multi-file upload split by file across groups and suffix-tainted rows with per-file random posters folds into one whole release
+    for (name, group, file_idx, file_name, poster) in [
+        ("Heartsplit.1981.2160p-GRP", "alt.binaries.g1", 1, "Heartsplit.1981.2160p-GRP.par2", "a@rand.local"),
+        (
+            "Heartsplit.1981.2160p-GRP.vol001-003",
+            "alt.binaries.g2",
+            2,
+            "Heartsplit.1981.2160p-GRP.vol001-003.par2",
+            "b@rand.local",
+        ),
+        ("Heartsplit.1981.2160p-GRP.mkv", "alt.binaries.g3", 3, "Heartsplit.1981.2160p-GRP.mkv", "c@rand.local"),
+        (
+            "Heartsplit.1981.2160p-GRP.vol003-007",
+            "alt.binaries.g4",
+            4,
+            "Heartsplit.1981.2160p-GRP.vol003-007.par2",
+            "d@rand.local",
+        ),
+    ] {
+        let mut one = article(file_name, 1, 1, &format!("<heartsplit.{file_idx}@x>"));
+        one.subject = format!("[0{file_idx}/04] - \"{file_name}\" yEnc (1/1)");
+        one.file_total = Some(4);
+        one.author = poster.into();
+        let size = one.bytes;
+        store::save(
+            &main,
+            &[Release {
+                name: name.into(),
+                group: group.into(),
+                poster: poster.into(),
+                date: DAY.into(),
+                articles: vec![one],
+                size,
+                complete: false,
+                ..Default::default()
+            }],
+        )
+        .unwrap();
+    }
+    let heart = fetch(port, "/ui/results?q=Heartsplit", &cookie);
+    assert_eq!(heart.body.matches("Heartsplit.1981.2160p-GRP</a>").count(), 1, "{}", heart.body);
+    assert!(heart.body.contains("4 GROUPS") && !heart.body.contains("INCOMPLETE"), "{}", heart.body);
+    for (name, group) in [
+        ("Heartsplit.1981.2160p-GRP", "alt.binaries.g1"),
+        ("Heartsplit.1981.2160p-GRP.vol001-003", "alt.binaries.g2"),
+        ("Heartsplit.1981.2160p-GRP.mkv", "alt.binaries.g3"),
+        ("Heartsplit.1981.2160p-GRP.vol003-007", "alt.binaries.g4"),
+    ] {
+        let g_shard = db::open_shard(&store::shard_path(&main, store::shard_of(group))).unwrap();
+        let row_id: i64 = g_shard.query_row("select id from releases where name = ?1", [name], |r| r.get(0)).unwrap();
+        let page = fetch(port, &format!("/ui/release?id={row_id}"), &cookie);
+        assert!(page.body.contains("COMPLETE") && !page.body.contains("INCOMPLETE"), "{name}: {}", page.body);
+        assert!(page.body.contains("<h1>Heartsplit.1981.2160p-GRP</h1>"), "{name}: {}", page.body);
+        assert!(page.body.contains("Heartsplit.1981.2160p-GRP.vol001-003.par2"), "{name}: {}", page.body);
+        assert!(page.body.contains("Heartsplit.1981.2160p-GRP.mkv"), "{name}: {}", page.body);
+        let nzb = fetch(port, &format!("/ui/nzb?id={row_id}"), &cookie);
+        for msg in ["heartsplit.1@x", "heartsplit.2@x", "heartsplit.3@x", "heartsplit.4@x"] {
+            assert!(nzb.body.contains(msg), "{name} missing {msg}: {}", nzb.body);
+        }
+    }
+
     // with no count of files, a file only one group has doesn't join
     posted("Extra.File.S01E01-GRP", "alt.binaries.g1", article("x.bin", 1, 2, "<extra.1@x>"), DAY);
     posted("Extra.File.S01E01-GRP", "alt.binaries.g2", article("x.bin", 2, 2, "<extra.2@x>"), DAY);

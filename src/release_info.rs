@@ -130,13 +130,43 @@ fn is_par2(filename: &str) -> bool {
     filename.to_ascii_lowercase().ends_with(".par2")
 }
 
-/// The `MM` of `name.vol000+MM.par2`.
+/// The `MM` of `name.vol000+MM.par2`, or the span of `name.volNNN-MMM.par2`.
 fn recovery_blocks(filename: &str) -> i64 {
     static BLOCKS: LazyLock<Regex> = LazyLock::new(|| {
         #[allow(clippy::unwrap_used)]
-        Regex::new(r"(?i)\.vol\d+[+-](\d+)\.par2$").unwrap()
+        Regex::new(r"(?i)\.vol(\d+)([+-])(\d+)\.par2$").unwrap()
     });
-    BLOCKS.captures(filename).and_then(|hit| hit[1].parse().ok()).unwrap_or(0)
+    let Some(hit) = BLOCKS.captures(filename) else { return 0 };
+    let (Ok(start), Ok(second)) = (hit[1].parse::<i64>(), hit[3].parse::<i64>()) else { return 0 };
+    if &hit[2] == "+" {
+        second
+    } else if second >= start {
+        (second - start).max(1)
+    } else {
+        0
+    }
+}
+
+static POST_MEDIA_EXT: LazyLock<Regex> = LazyLock::new(|| {
+    #[allow(clippy::unwrap_used)]
+    Regex::new(
+        r"(?i)\.(mkv|mp4|m4v|avi|wmv|mov|ts|m2ts|mpg|mpeg|webm|iso|img|bin|7z|zip|exe|mp3|flac|m4a|ogg|wav|wma|ape|aac|opus|epub|mobi|azw3|pdf|cbr|cbz|jpg|jpeg|png|gif|bmp|webp|tiff?|sub|idx|srt|rev|diz)$",
+    )
+    .unwrap()
+});
+
+/// The release stem shared across a split upload's volume, parity and payload files.
+pub fn post_stem(name: &str) -> String {
+    let mut s = crate::parser::strip_release_suffixes(name.trim());
+    loop {
+        let next = POST_MEDIA_EXT.replace(&s, "").into_owned();
+        let next = crate::parser::strip_release_suffixes(&next);
+        if next == s || next.is_empty() {
+            break;
+        }
+        s = next;
+    }
+    s
 }
 
 fn is_recovery_volume(filename: &str) -> bool {
@@ -339,6 +369,28 @@ pub fn groups_of_with(conn: &Connection, name: &str) -> Result<Vec<GroupPosting>
     Ok(out)
 }
 
+/// Every group represented in a split or linked upload's rows, with its combined article count.
+pub fn groups_of_ids(conn: &Connection, ids: &[i64]) -> Result<Vec<GroupPosting>> {
+    let mut by_group: BTreeMap<String, (i64, i64)> = BTreeMap::new();
+    for &id in ids {
+        let s = store::shard_of_id(id);
+        let mut stmt =
+            conn.prepare_cached(&format!("select group_name, coalesce(parts, 0) from s{s}.releases where id = ?1"))?;
+        if let Some((group, articles)) = stmt
+            .query_row([id], |r| Ok((r.get::<_, Option<String>>(0)?.unwrap_or_default(), r.get::<_, i64>(1)?)))
+            .optional()?
+        {
+            let entry = by_group.entry(group).or_insert((0, id));
+            entry.0 += articles;
+            entry.1 = entry.1.min(id);
+        }
+    }
+    let mut out: Vec<GroupPosting> =
+        by_group.into_iter().map(|(group, (articles, id))| GroupPosting { group, articles, id }).collect();
+    out.sort_by(|a, b| b.articles.cmp(&a.articles).then_with(|| a.group.cmp(&b.group)));
+    Ok(out)
+}
+
 /// One post whose articles went to several groups, each article to one of them: every group holds a release of the same
 /// name from the same poster, and only together do they make the files.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -423,15 +475,20 @@ pub fn linked_post_with(conn: &Connection, id: i64) -> Result<Option<SplitPost>>
     Ok(Some(SplitPost { ids, groups, size, complete, lead: Some(lead), recovery }))
 }
 
-/// All of the post a row is part of: an upload linked by its PAR2 set, or the same post cut across groups.
+/// All of the post a row is part of: an upload linked by its PAR2 set, or the same post cut across groups or files.
 pub fn whole_post_with(conn: &Connection, release: &crate::search::ReleaseRow) -> Result<Option<SplitPost>> {
     if let Some(post) = linked_post_with(conn, release.id)? {
         return Ok(Some(post));
     }
-    if release.complete {
+    if release.complete && crate::parser::strip_release_suffixes(&release.name) == release.name {
         return Ok(None);
     }
     split_post_with(conn, release)
+}
+
+/// Whether a single-row release's files are all complete under the current 0- or 1-indexed file counter rule.
+pub fn single_post_complete(conn: &Connection, id: i64) -> Result<bool> {
+    Ok(union_files(conn, &[id])?.complete())
 }
 
 /// How far apart a split post's groups can have got their articles, in days. Each row keeps its newest article's date,
@@ -441,15 +498,26 @@ const SPLIT_POST_DAYS: f64 = 1.0;
 /// The most groups a split post can span. Real ones have a handful, and every file of its NZB lists them all.
 const SPLIT_POST_GROUPS: usize = 16;
 
-/// The rest of this release's post in other groups, if it has any. None: it's all here, or the rows that look like it
-/// don't add up to one upload. Name and poster are only what the headers say, and anyone can copy those to another group,
-/// soo any doubt leaves every row on its own, and every row of a post gets the same answer.
+/// The rest of this release's post in other groups or suffix rows, if it has any. None: it's all here, or the rows that
+/// look like it don't add up to one upload. Name and poster are only what the headers say, and anyone can copy those to
+/// another group, soo any doubt leaves every row on its own, and every row of a post gets the same answer.
 pub fn split_post_with(conn: &Connection, release: &crate::search::ReleaseRow) -> Result<Option<SplitPost>> {
     let posted = names_with(conn, release.id)?.map_or(release.name.clone(), |n| n.posted);
+    let exact = exact_split_post(conn, &posted, &release.poster)?;
+    if exact.as_ref().is_some_and(|p| p.complete) && crate::parser::strip_release_suffixes(&posted) == posted {
+        return Ok(exact);
+    }
+    if let Some(stem_post) = split_stem_post(conn, &posted, release)? {
+        return Ok(Some(stem_post));
+    }
+    Ok(exact)
+}
+
+fn exact_split_post(conn: &Connection, posted: &str, poster: &Option<String>) -> Result<Option<SplitPost>> {
     let (mut ids, mut groups, mut size, mut dates) = (Vec::new(), Vec::new(), 0, Vec::new());
     for s in 0..store::SHARDS {
         let mut stmt = conn.prepare_cached(&split_post_sql(s))?;
-        let rows = stmt.query_map(rusqlite::params![posted, release.poster], |r| {
+        let rows = stmt.query_map(rusqlite::params![posted, poster], |r| {
             Ok((
                 r.get::<_, i64>(0)?,
                 r.get::<_, Option<String>>(1)?.unwrap_or_default(),
@@ -478,6 +546,83 @@ pub fn split_post_with(conn: &Connection, release: &crate::search::ReleaseRow) -
     Ok(Some(SplitPost { ids, groups, size, complete: files.complete(), lead: None, recovery: Vec::new() }))
 }
 
+#[derive(Clone)]
+struct StemCandidate {
+    id: i64,
+    group: String,
+    poster: Option<String>,
+    bytes: i64,
+    date: Option<f64>,
+}
+
+fn split_stem_post(conn: &Connection, posted: &str, release: &crate::search::ReleaseRow) -> Result<Option<SplitPost>> {
+    let stem = post_stem(posted);
+    if stem.len() < 4 {
+        return Ok(None);
+    }
+    let dot_lo = format!("{stem}.");
+    let dot_hi = format!("{stem}/");
+    let mut all = Vec::new();
+    for s in 0..store::SHARDS {
+        let mut stmt = conn.prepare_cached(&split_stem_sql(s))?;
+        let rows = stmt.query_map(rusqlite::params![stem, dot_lo, dot_hi], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                r.get::<_, Option<String>>(3)?,
+                r.get::<_, i64>(4)?,
+                r.get::<_, Option<f64>>(5)?,
+            ))
+        })?;
+        for row in rows {
+            let (id, name, group, poster, bytes, date) = row?;
+            if post_stem(&name).eq_ignore_ascii_case(&stem) {
+                all.push(StemCandidate { id, group, poster, bytes, date });
+            }
+        }
+    }
+    let Some(anchor_date) = all.iter().find(|c| c.id == release.id).and_then(|c| c.date) else {
+        return Ok(None);
+    };
+    let close: Vec<StemCandidate> =
+        all.into_iter().filter(|c| c.date.is_some_and(|d| (d - anchor_date).abs() <= SPLIT_POST_DAYS)).collect();
+    if let Some(post) = try_stem_subset(conn, &stem, &close)? {
+        return Ok(Some(post));
+    }
+    let same_poster: Vec<StemCandidate> = close.iter().filter(|c| c.poster == release.poster).cloned().collect();
+    if let Some(post) = try_stem_subset(conn, &stem, &same_poster)? {
+        return Ok(Some(post));
+    }
+    let same_group: Vec<StemCandidate> = same_poster.into_iter().filter(|c| c.group == release.group_name).collect();
+    try_stem_subset(conn, &stem, &same_group)
+}
+
+fn try_stem_subset(conn: &Connection, stem: &str, subset: &[StemCandidate]) -> Result<Option<SplitPost>> {
+    if !(2..=LINKED_ROWS).contains(&subset.len()) {
+        return Ok(None);
+    }
+    let dates: Vec<Option<f64>> = subset.iter().map(|c| c.date).collect();
+    if !close_together(&dates) {
+        return Ok(None);
+    }
+    let mut ids: Vec<i64> = subset.iter().map(|c| c.id).collect();
+    let mut groups: Vec<String> = subset.iter().map(|c| c.group.clone()).collect();
+    let size: i64 = subset.iter().map(|c| c.bytes).sum();
+    let same_poster = subset.windows(2).all(|w| w[0].poster == w[1].poster);
+    ids.sort_unstable();
+    groups.sort_unstable();
+    groups.dedup();
+    if groups.len() > SPLIT_POST_GROUPS {
+        return Ok(None);
+    }
+    let files = union_files(conn, &ids)?;
+    if !files.one_stem_upload(stem, same_poster) {
+        return Ok(None);
+    }
+    Ok(Some(SplitPost { ids, groups, size, complete: files.complete(), lead: None, recovery: Vec::new() }))
+}
+
 /// A shard's rows of one name and poster. `+poster` keeps the lookup on the name index: with no statistics SQLite
 /// would rather walk `idx_release_poster`, every row a busy poster ever posted, and a page of results took minutes.
 /// Parameters: ?1 the posted name, ?2 the poster.
@@ -485,6 +630,15 @@ fn split_post_sql(s: usize) -> String {
     format!(
         "select id, group_name, coalesce(size, 0), julianday(posted_date) from s{s}.releases
          where name = ?1 and +poster is ?2 and not atlas_blocked(group_name) limit 64"
+    )
+}
+
+/// A shard's rows matching a release stem or `stem.<suffix>` via `idx_release_unique(name, group_name)`.
+/// Parameters: ?1 the stem, ?2 `stem.`, ?3 `stem/`.
+fn split_stem_sql(s: usize) -> String {
+    format!(
+        "select id, name, group_name, poster, coalesce(size, 0), julianday(posted_date) from s{s}.releases
+         where (name = ?1 or (name >= ?2 and name < ?3)) and not atlas_blocked(group_name) limit 128"
     )
 }
 
@@ -512,6 +666,8 @@ struct UnionFiles {
     rows: Vec<BTreeSet<String>>,
     /// two releases have a file they don't agree on, or a part of it both have
     conflict: bool,
+    /// whether any file carries a 0-indexed `[0/N]` or `[00/N]` counter
+    zero_indexed: bool,
 }
 
 impl UnionFiles {
@@ -520,12 +676,32 @@ impl UnionFiles {
     fn one_upload(&self) -> bool {
         let mut totals = self.file_totals.iter();
         let total_fits = match (totals.next(), totals.next()) {
-            (Some(Some(total)), None) => self.files.len() as i64 <= *total,
+            (Some(Some(total)), None) => self.files.len() as i64 <= *total + i64::from(self.zero_indexed),
             // no count to go by, soo every release has the same files
             (Some(None), None) => self.rows.windows(2).all(|pair| pair[0] == pair[1]),
             _ => false,
         };
         !self.conflict && total_fits && self.linked()
+    }
+
+    fn one_stem_upload(&self, stem: &str, same_poster: bool) -> bool {
+        if self.conflict || self.files.is_empty() {
+            return false;
+        }
+        if !self.files.keys().all(|f| post_stem(f).eq_ignore_ascii_case(stem)) {
+            return false;
+        }
+        let non_null: Vec<i64> = self.file_totals.iter().copied().flatten().collect();
+        match non_null.as_slice() {
+            [total] if *total >= 2 => {
+                let want = *total + i64::from(self.zero_indexed);
+                (self.files.len() as i64) <= want
+                    && (self.files.len() >= 2 || (same_poster && self.linked()))
+                    && (!self.file_totals.contains(&None) || same_poster)
+            }
+            [] => same_poster && self.files.len() >= 2 && !self.linked(),
+            _ => false,
+        }
     }
 
     fn linked(&self) -> bool {
@@ -549,7 +725,7 @@ impl UnionFiles {
     fn complete(&self) -> bool {
         let total = self.file_totals.iter().next().copied().flatten();
         !self.files.is_empty()
-            && total.is_none_or(|total| self.files.len() as i64 == total)
+            && total.is_none_or(|total| self.files.len() as i64 == total + i64::from(self.zero_indexed))
             && self.files.values().all(|f| f.expected.is_some_and(|want| store::is_exactly(&f.seen, want)))
     }
 }
@@ -598,6 +774,7 @@ fn union_files(conn: &Connection, ids: &[i64]) -> Result<UnionFiles> {
         for row in rows {
             let (filename, expected, seen, total, subject) = row?;
             union.file_totals.insert(total);
+            union.zero_indexed |= subject.as_deref().is_some_and(crate::parser::has_zero_file_index);
             filenames.insert(filename.clone());
             let subject = subject.as_deref().map(|subject| subject_of_file(subject, expected));
             match union.files.entry(filename) {
@@ -776,6 +953,15 @@ mod tests {
             .unwrap();
         let plan = plan.join(" | ");
         assert!(plan.contains("idx_release_unique") && !plan.contains("idx_release_poster"), "{plan}");
+        let stem_plan: Vec<String> = conn
+            .prepare(&format!("explain query plan {}", split_stem_sql(0)))
+            .unwrap()
+            .query_map(["a.name", "a.name.", "a.name/"], |r| r.get(3))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        let stem_plan = stem_plan.join(" | ");
+        assert!(stem_plan.contains("idx_release_unique") && !stem_plan.contains("idx_release_poster"), "{stem_plan}");
     }
 
     /// `parts` 1..=n seen
@@ -980,10 +1166,100 @@ mod tests {
     #[test]
     fn exact_repair_counts_blocks() {
         assert_eq!(recovery_blocks("a.vol003+04.par2"), 4);
+        assert_eq!(recovery_blocks("a.vol001-003.par2"), 2);
+        assert_eq!(recovery_blocks("a.vol063-101.par2"), 38);
+        assert_eq!(recovery_blocks("a.vol000-000.par2"), 1);
         assert_eq!(recovery_blocks("a.par2"), 0);
         let c = Contents { recovery_blocks: 10, par2_block: Some(1000), par2_blocks: Some(100), ..Contents::default() };
         assert_eq!(c.exact_repair_per_mille(), Some(100), "10 of 100 blocks");
         assert_eq!(Contents::default().exact_repair_per_mille(), None);
+    }
+
+    #[test]
+    fn per_file_cross_group_split_post_merges_by_stem() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        crate::filters::register_sql(&conn).unwrap();
+        for s in 0..store::SHARDS {
+            let path = dir.path().join(format!("atlas.s{s}.db"));
+            store::create_shard(&path).unwrap();
+            conn.execute(&format!("attach database ?1 as s{s}"), [path.to_string_lossy()]).unwrap();
+        }
+        let stem = "One.From.The.Heart.1981.2160p.UHD.BluRay.DV.REMUX.HDR10.HEVC.DTS-HD-MA.5.1-UnKn0wn";
+        let rows = [
+            (8i64, stem.to_string(), "alt.binaries.multimedia.aviation", "p1@nyuu", format!("{stem}.par2"), 1, 1, 1000),
+            (
+                16,
+                format!("{stem}.vol001-003"),
+                "alt.binaries.multimedia.alias",
+                "p2@nyuu",
+                format!("{stem}.vol001-003.par2"),
+                1,
+                1,
+                2000,
+            ),
+            (
+                24,
+                format!("{stem}.vol003-007"),
+                "alt.binaries.multimedia.alias",
+                "p3@nyuu",
+                format!("{stem}.vol003-007.par2"),
+                1,
+                2,
+                3000,
+            ),
+            (
+                32,
+                format!("{stem}.vol003-007"),
+                "alt.binaries.multimedia.aviation",
+                "p3@nyuu",
+                format!("{stem}.vol003-007.par2"),
+                2,
+                2,
+                3000,
+            ),
+            (
+                40,
+                format!("{stem}.mkv"),
+                "alt.binaries.multimedia.alias",
+                "p4@nyuu",
+                format!("{stem}.mkv"),
+                1,
+                1,
+                50_000,
+            ),
+        ];
+        for (id, rname, grp, poster, fname, part, expected, bytes) in rows {
+            conn.execute(
+                "insert into s0.releases (id, name, group_name, poster, posted_date, size, complete, parts, file_total)
+                 values (?1, ?2, ?3, ?4, '2025-11-28 02:30:00', ?5, 0, 1, 4)",
+                rusqlite::params![id, rname, grp, poster, bytes],
+            )
+            .unwrap();
+            let mut bits = vec![0u8; 1];
+            bits[0] |= 1 << part;
+            conn.execute(
+                "insert into s0.files (id, release_id, filename, subject, expected, file_total, seen)
+                 values (?1, ?1, ?2, ?3, ?4, 4, ?5)",
+                rusqlite::params![id, fname, format!("[01/04] - \"{fname}\" yEnc ({part}/{expected})"), expected, bits],
+            )
+            .unwrap();
+        }
+        for id in [8, 16, 24, 32, 40] {
+            let row = crate::search::ReleaseRow {
+                id,
+                name: format!("{stem}.vol001-003"),
+                group_name: "alt.binaries.multimedia.alias".into(),
+                poster: Some("p2@nyuu".into()),
+                complete: false,
+                ..Default::default()
+            };
+            let post = whole_post_with(&conn, &row).unwrap().unwrap();
+            assert_eq!(post.ids, [8, 16, 24, 32, 40]);
+            assert_eq!(post.groups, ["alt.binaries.multimedia.alias", "alt.binaries.multimedia.aviation"]);
+            assert_eq!(post.size, 1000 + 2000 + 3000 + 3000 + 50_000);
+            assert!(post.complete);
+        }
     }
 
     #[test]

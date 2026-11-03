@@ -10,7 +10,7 @@ use std::sync::LazyLock;
 static LONG_ALNUM: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[A-Za-z0-9]{16,}$").unwrap());
 /// What `parse_subject` leaves on a name (RELEASE_SUFFIX_RE only strips archive and par2 suffixes).
 static PAYLOAD_EXT: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\.(mkv|mp4|m4v|avi|wmv|mov|ts|m2ts|mpg|mpeg|webm|iso|img|bin|7z|zip|exe|mp3|flac|m4a|epub|mobi|azw3|pdf|cbr|cbz)$").unwrap()
+    Regex::new(r"(?i)\.(mkv|mp4|m4v|avi|wmv|mov|ts|m2ts|mpg|mpeg|webm|iso|img|bin|7z|zip|exe|mp3|flac|m4a|epub|mobi|azw3|pdf|cbr|cbz|iby\d+[+-]\d+|cne[27]|cneg\d*|ene)$").unwrap()
 });
 /// A token that is release vocabulary is never random.
 static MARKER: LazyLock<Regex> = LazyLock::new(|| {
@@ -65,7 +65,8 @@ pub fn classify(t: &str) -> Token {
     }
     let upper = b.iter().filter(|c| c.is_ascii_uppercase()).count();
     let lower = b.iter().filter(|c| c.is_ascii_lowercase()).count();
-    if len >= MIN_TOKEN && digits > 0 {
+    let min_interleaved = if lower > 0 && upper > 0 { MIN_MIXED_TOKEN } else { MIN_TOKEN };
+    if len >= min_interleaved && digits > 0 {
         let runs = b
             .iter()
             .enumerate()
@@ -194,6 +195,9 @@ mod tests {
             "Qw3Er5Ty7.mkv",
             "nMhb2KxQd7.rar.bin",
             "tZ9wL2xV_pR5nK8q",
+            "9l98j0P.YR",
+            "tbtbahgf.cneg7.ene",
+            "tbtbahgf.iby00+01.cne7",
         ] {
             assert!(is_obfuscated(n), "{n}");
         }

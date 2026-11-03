@@ -77,11 +77,32 @@ static SUBJECT_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
 
 static FILE_COUNT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\[(\d+)\s*/\s*(\d+)\]").unwrap());
 
-static RELEASE_SUFFIX_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)\.(part\d+|r\d+|vol\d+\+\d+|par2|nfo|sfv|rar|0\d\d)$").unwrap());
+static RELEASE_SUFFIX_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)\.(part\d*|r\d+|s\d\d|z\d{2,3}|vol\d+[+-]\d+|par[23]|nfo|sfv|srr|srs|nzb|rar|7z\.\d{2,3}|(?:rar|zip)\.\d{2,3}|0\d\d|iby\d+[+-]\d+|cne[27]|cneg\d*|ene)$",
+    )
+    .unwrap()
+});
+
+pub fn strip_release_suffixes(name: &str) -> String {
+    let mut release_name = name.to_string();
+    loop {
+        let stripped = RELEASE_SUFFIX_RE.replace(&release_name, "").into_owned();
+        if stripped == release_name || stripped.is_empty() {
+            break;
+        }
+        release_name = stripped;
+    }
+    release_name
+}
 
 pub fn is_obfuscated(name: &str) -> bool {
     crate::naming::obfuscation::is_obfuscated(name)
+}
+
+/// Whether a subject carries a 0-indexed `[0/N]` or `[00/N]` file counter.
+pub fn has_zero_file_index(subject: &str) -> bool {
+    FILE_COUNT_RE.captures(subject.trim()).and_then(|c| c[1].parse::<i64>().ok()).is_some_and(|idx| idx == 0)
 }
 
 pub fn parse_subject(subject: &str) -> Option<ParsedSubject> {
@@ -95,14 +116,7 @@ pub fn parse_subject(subject: &str) -> Option<ParsedSubject> {
     let filename = caps.get(1)?.as_str().to_string();
 
     // strip .part1/.r00 type shi soo every part of a release maps to one name
-    let mut release_name = filename.clone();
-    loop {
-        let stripped = RELEASE_SUFFIX_RE.replace(&release_name, "").into_owned();
-        if stripped == release_name {
-            break;
-        }
-        release_name = stripped;
-    }
+    let mut release_name = strip_release_suffixes(&filename);
 
     // some formats only give a filename, no part numbers
     let (part, total_parts) = match (caps.get(2), caps.get(3)) {
@@ -266,7 +280,10 @@ pub fn is_complete(articles: &[Article]) -> bool {
     let file_totals: BTreeSet<i64> = articles.iter().filter_map(|a| a.file_total).collect();
 
     if file_totals.len() == 1 {
-        let expected_files = *file_totals.iter().next().unwrap();
+        let mut expected_files = *file_totals.iter().next().unwrap();
+        if articles.iter().any(|a| a.file_index == Some(0) || has_zero_file_index(&a.subject)) {
+            expected_files += 1;
+        }
         if by_filename.len() as i64 != expected_files {
             return false;
         }
@@ -316,6 +333,26 @@ mod tests {
     fn strips_stacked_suffixes() {
         let p = parse_subject(r#""show.s01e01.vol03+04.par2" yEnc (2/3)"#).unwrap();
         assert_eq!(p.release_name, "show.s01e01");
+        let hyphen = parse_subject(
+            r#"[03/10] - "One.From.The.Heart.1981.2160p.UHD.BluRay.DV.REMUX.HDR10.HEVC.DTS-HD-MA.5.1-UnKn0wn.vol001-003.par2" yEnc (1/9)"#,
+        )
+        .unwrap();
+        assert_eq!(
+            hyphen.release_name,
+            "One.From.The.Heart.1981.2160p.UHD.BluRay.DV.REMUX.HDR10.HEVC.DTS-HD-MA.5.1-UnKn0wn"
+        );
+        let bare_part = parse_subject(r#""Movie.1996.DivX.part.vol000+001.PAR2" yEnc (1/2)"#).unwrap();
+        assert_eq!(bare_part.release_name, "Movie.1996.DivX");
+        let nzb_part = parse_subject(r#""Studio.Title.part.nzb" yEnc (1/3)"#).unwrap();
+        assert_eq!(nzb_part.release_name, "Studio.Title");
+        let par3 = parse_subject(r#""[YE] Bleach - 199 (D07CB813).vol01+02.par3" yEnc (1/1)"#).unwrap();
+        assert_eq!(par3.release_name, "[YE] Bleach - 199 (D07CB813)");
+        let split_7z = parse_subject(r#"[145/155] "579579595695695695695795.7z.145" (1/140)"#).unwrap();
+        assert_eq!(split_7z.release_name, "579579595695695695695795");
+        let rot13 = parse_subject(r#"(zvfgre-z) [58/81] - "tbtbahgf.cneg7.ene" lRap (1/10)"#).unwrap();
+        assert_eq!(rot13.release_name, "tbtbahgf");
+        let rot13_par = parse_subject(r#"(zvfgre-z) [75/81] - "tbtbahgf.iby00+01.cne7" lRap (1/2)"#).unwrap();
+        assert_eq!(rot13_par.release_name, "tbtbahgf");
     }
 
     #[test]
@@ -369,6 +406,15 @@ mod tests {
 
         let rels = group_articles(vec![art(r#"[1/2] - "why.part1.rar" yEnc (1/2)"#, 10)]);
         assert!(!is_complete(&rels["why"].articles));
+
+        // 0-indexed file counters [00/2]..[02/2] produce 3 files with file_total = 2
+        let zero_indexed = vec![
+            art(r#"[00/02] - "rel0.nzb" yEnc (1/1)"#, 2),
+            art(r#"[01/02] - "rel0.part1.rar" yEnc (1/1)"#, 10),
+            art(r#"[02/02] - "rel0.part2.rar" yEnc (1/1)"#, 10),
+        ];
+        let rels = group_articles(zero_indexed);
+        assert!(is_complete(&rels["rel0"].articles));
     }
 
     #[test]
