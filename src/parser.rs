@@ -18,6 +18,8 @@ pub struct Article {
     pub references: String,
     pub bytes: i64,
     pub lines: i64,
+    /// the groups the server's Xref names, when its overview carries the line (`Xref:full`); None elsewhere
+    pub xref_groups: Option<u16>,
     pub filename: Option<String>,
     pub release_name: Option<String>,
     pub part: Option<i64>,
