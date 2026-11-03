@@ -5,12 +5,14 @@
 //! walks the column's index and keeps the rows in the category. Then the shards' tops are merged.
 
 use std::cmp::Ordering;
+use std::collections::HashMap;
 
 use rusqlite::{Connection, OptionalExtension};
 
 use crate::category::{CatFilter, TABLE, UNCATEGORIZED, label};
 use crate::db::{self, Result};
 use crate::field_search::{NAME_INDEX, POSTED_INDEX, SIZE_INDEX, has_index};
+use crate::release_info::LINKED_ROWS;
 use crate::search::{Bounds, COLUMNS, ReleaseRow, VISIBLE_RELEASE, newest_in_categories_with, probe_sql, release_row};
 use crate::store;
 
@@ -82,6 +84,9 @@ pub fn top(filter: Option<&CatFilter>, by: Column, descending: bool, want: i64) 
     crate::metrics::timed("search.sorted", || top_with(&db::open, filter, by, descending, want, LIMITS))
 }
 
+/// A shard's first rows, and the whole size of those that are part of a linked upload.
+type ShardTop = (Vec<ReleaseRow>, HashMap<i64, i64>);
+
 /// `top`, on connections from `open`: one for each shard, read at once.
 fn top_with(
     open: &(dyn Fn() -> Result<Connection> + Sync),
@@ -95,23 +100,38 @@ fn top_with(
         return by_category(&open()?, filter, descending, want);
     }
     // on a cold disk most of the time is waiting for reads
-    let tops: Vec<Result<Vec<ReleaseRow>>> = std::thread::scope(|scope| {
+    let tops: Vec<Result<ShardTop>> = std::thread::scope(|scope| {
         let shards: Vec<_> = (0..store::SHARDS)
-            .map(|s| scope.spawn(move || shard_top(&open()?, s, filter, by, descending, want, limits)))
+            .map(|s| {
+                scope.spawn(move || {
+                    let conn = open()?;
+                    let mut rows = shard_top(&conn, s, filter, by, descending, want, limits)?;
+                    let whole = if by == Column::Size && descending {
+                        linked_sizes(&conn, s, filter, &mut rows, want)?
+                    } else {
+                        HashMap::new()
+                    };
+                    Ok((rows, whole))
+                })
+            })
             .collect();
         shards.into_iter().map(|t| t.join().unwrap_or_else(|e| std::panic::resume_unwind(e))).collect()
     });
-    let mut rows = Vec::new();
+    let (mut rows, mut whole) = (Vec::new(), HashMap::new());
     for top in tops {
-        rows.extend(top?);
+        let (top, sizes) = top?;
+        rows.extend(top);
+        whole.extend(sizes);
     }
-    rows.sort_by(|a, b| compare(a, b, by, descending));
+    rows.sort_by(|a, b| compare(a, b, by, descending, &whole));
     rows.truncate(usize::try_from(want).unwrap_or(usize::MAX));
     Ok(rows)
 }
 
-/// The order `top` gives, on rows already read.
-fn compare(a: &ReleaseRow, b: &ReleaseRow, by: Column, descending: bool) -> Ordering {
+/// The order `top` gives, on rows already read. `whole`: the size of the linked upload a row is part of, which the
+/// page shows for it and sorts it by.
+fn compare(a: &ReleaseRow, b: &ReleaseRow, by: Column, descending: bool, whole: &HashMap<i64, i64>) -> Ordering {
+    let size = |r: &ReleaseRow| whole.get(&r.id).copied().or(r.size);
     fn last_if_none<T: Ord>(a: Option<T>, b: Option<T>, descending: bool) -> Ordering {
         match (a, b) {
             (Some(x), Some(y)) if descending => y.cmp(&x),
@@ -122,7 +142,7 @@ fn compare(a: &ReleaseRow, b: &ReleaseRow, by: Column, descending: bool) -> Orde
         }
     }
     let by_value = match by {
-        Column::Size => last_if_none(a.size, b.size, descending),
+        Column::Size => last_if_none(size(a), size(b), descending),
         Column::Posted => last_if_none(
             a.posted_date.as_deref().filter(|d| !d.is_empty()),
             b.posted_date.as_deref().filter(|d| !d.is_empty()),
@@ -267,6 +287,87 @@ fn walk(
         }
     }
     Ok(Some(rows))
+}
+
+/// A linked upload, posted a file at a time, is one row on the page with the size of all its files, and a size sort
+/// goes by that. Going down, its pieces can each come after the shard's last row while the whole comes before it, soo
+/// the biggest such uploads are read in as well; going up, every piece comes before its whole, soo it's in already.
+/// Gives the whole size of each row read that is part of a linked upload. Uploads matched by name across groups are
+/// still put together only on the page.
+fn linked_sizes(
+    conn: &Connection,
+    s: usize,
+    filter: Option<&CatFilter>,
+    rows: &mut Vec<ReleaseRow>,
+    want: i64,
+) -> Result<HashMap<i64, i64>> {
+    // a shard that hasn't got the table yet has linked nothing
+    let Ok(mut lead_of) = conn.prepare(&format!("select lead_id from s{s}.upload_link where release_id = ?1")) else {
+        return Ok(HashMap::new());
+    };
+    // as linked_post_with counts it: its lead still there, and neither one row nor more than a set has
+    let total_sql = format!(
+        "select sum(coalesce(r.size, 0)) from s{s}.upload_link l join s{s}.releases r on r.id = l.release_id
+         where l.lead_id = ?1 and exists (select 1 from s{s}.releases x where x.id = ?1)
+         having count(*) between 2 and {LINKED_ROWS}"
+    );
+    let mut total_of = conn.prepare(&total_sql)?;
+    // the shard read its first `want` and there were more: what's bigger than its last row as a whole comes first
+    let cutoff = match rows.last() {
+        Some(last) if rows.len() as i64 >= want => last.size,
+        _ => None,
+    };
+    if let Some(cutoff) = cutoff {
+        let bigger = format!(
+            "select l.lead_id from s{s}.upload_link l join s{s}.releases r on r.id = l.release_id
+             group by l.lead_id
+             having count(*) between 2 and {LINKED_ROWS} and sum(coalesce(r.size, 0)) > ?1
+                and exists (select 1 from s{s}.releases x where x.id = l.lead_id)
+             order by sum(coalesce(r.size, 0)) desc limit ?2"
+        );
+        let leads: Vec<i64> = conn.prepare(&bigger)?.query_map([cutoff, want], |r| r.get(0))?.collect::<Result<_>>()?;
+        let mut members = conn.prepare(&format!("select release_id from s{s}.upload_link where lead_id = ?1"))?;
+        let mut category =
+            conn.prepare(&format!("select category from s{s}.release_category where release_id = ?1"))?;
+        let mut probe = conn.prepare(&probe_sql(s))?;
+        let mut have: std::collections::HashSet<i64> = rows.iter().map(|r| r.id).collect();
+        for lead in leads {
+            let ids: Vec<i64> = members.query_map([lead], |r| r.get(0))?.collect::<Result<_>>()?;
+            for id in ids {
+                if !have.insert(id) {
+                    continue;
+                }
+                if let Some(f) = filter {
+                    let kept = match category.query_row([id], |r| r.get::<_, i64>(0)).optional()? {
+                        Some(c) => f.leaves.contains(&c),
+                        None => f.uncategorized,
+                    };
+                    if !kept {
+                        continue;
+                    }
+                }
+                if let Some(row) = probe.query_row([id], release_row).optional()? {
+                    rows.push(row);
+                }
+            }
+        }
+    }
+    let (mut whole, mut totals) = (HashMap::new(), HashMap::new());
+    for row in rows.iter() {
+        let Some(lead) = lead_of.query_row([row.id], |r| r.get::<_, i64>(0)).optional()? else { continue };
+        let total = match totals.get(&lead) {
+            Some(&total) => total,
+            None => {
+                let total: Option<i64> = total_of.query_row([lead], |r| r.get(0)).optional()?.flatten();
+                totals.insert(lead, total);
+                total
+            }
+        };
+        if let Some(total) = total {
+            whole.insert(row.id, total);
+        }
+    }
+    Ok(whole)
 }
 
 /// A category read as far back as it goes: a sort over all of it can't stop at its newest releases.
@@ -447,6 +548,44 @@ mod tests {
     }
 
     #[test]
+    fn a_linked_upload_ranks_by_its_files_together() {
+        let f = fixture();
+        let group = &groups()[0];
+        let shard = f.shard(group);
+        shard.execute_batch(crate::archive::link::UPLOAD_LINK.create).unwrap();
+        // older big ones, then an upload posted a file at a time, each smaller than all of them but bigger together
+        let big: Vec<i64> =
+            (0..3).map(|i| f.add(&format!("Big.{i}"), group, Some(6_000), "2026-09-01", Some(UHD))).collect();
+        let lead = f.add("a1b2c3", group, Some(4_000), "2026-10-01", Some(UHD));
+        let piece = f.add("d4e5f6", group, Some(4_000), "2026-10-01", Some(UHD));
+        let small = f.add("Small", group, Some(10), "2026-10-02", Some(UHD));
+        shard
+            .execute(
+                "insert into upload_link (release_id, lead_id) values (?1, ?1), (?2, ?1)",
+                rusqlite::params![lead, piece],
+            )
+            .unwrap();
+        let movies = crate::category::parse_filter(MOVIES).unwrap();
+        for (limits, indexed) in [(READ_ALL, false), (WALK, true)] {
+            if indexed {
+                f.index_all();
+            }
+            for filter in [Some(&movies), None] {
+                let top = f.top(filter, Column::Size, true, 2, limits);
+                assert_eq!(top, [piece, lead], "indexed {indexed}: the upload's 8,000 before the 6,000s, newest first");
+                let all = f.top(filter, Column::Size, true, 10, limits);
+                assert_eq!(all, [piece, lead, big[2], big[1], big[0], small], "indexed {indexed}");
+                // going up its pieces come in by their own size, and the page puts them where the whole goes
+                let up = f.top(filter, Column::Size, false, 1, limits);
+                assert_eq!(up, [small], "indexed {indexed}");
+            }
+        }
+        // a lead that's gone leaves its pieces on their own, as the page does
+        shard.execute("delete from releases where id = ?", [lead]).unwrap();
+        assert_eq!(f.top(None, Column::Size, true, 2, READ_ALL), [big[2], big[1]]);
+    }
+
+    #[test]
     fn everything_and_no_category_rank_over_every_release() {
         let f = fixture();
         let groups = groups();
@@ -574,18 +713,18 @@ mod tests {
     #[test]
     fn rows_without_a_value_come_last_either_way() {
         let mut rows = [row(1, None, "a"), row(2, Some(5), "b"), row(3, Some(9), "c")];
-        rows.sort_by(|a, b| compare(a, b, Column::Size, true));
+        rows.sort_by(|a, b| compare(a, b, Column::Size, true, &HashMap::new()));
         assert_eq!(rows.iter().map(|r| r.id).collect::<Vec<_>>(), [3, 2, 1]);
-        rows.sort_by(|a, b| compare(a, b, Column::Size, false));
+        rows.sort_by(|a, b| compare(a, b, Column::Size, false, &HashMap::new()));
         assert_eq!(rows.iter().map(|r| r.id).collect::<Vec<_>>(), [2, 3, 1]);
     }
 
     #[test]
     fn equals_are_newest_first() {
         let mut rows = [row(1, Some(5), "x"), row(4, Some(5), "x"), row(2, Some(5), "x")];
-        rows.sort_by(|a, b| compare(a, b, Column::Size, true));
+        rows.sort_by(|a, b| compare(a, b, Column::Size, true, &HashMap::new()));
         assert_eq!(rows.iter().map(|r| r.id).collect::<Vec<_>>(), [4, 2, 1]);
-        rows.sort_by(|a, b| compare(a, b, Column::Name, false));
+        rows.sort_by(|a, b| compare(a, b, Column::Name, false, &HashMap::new()));
         assert_eq!(rows.iter().map(|r| r.id).collect::<Vec<_>>(), [4, 2, 1]);
     }
 }
