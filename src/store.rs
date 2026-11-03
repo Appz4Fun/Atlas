@@ -2,8 +2,7 @@
 //! `atlas.db` (`atlas.s0.db` .. `atlas.s7.db`) by group, each with its own
 //! writer. `atlas.db` itself keeps the per group cursors and the id counter.
 //!
-//! Each shard stores articles compactly (about a quarter of the old layout,
-//! see poc_sqlite_2):
+//! Each shard stores articles compactly (about a quarter of the old layout):
 //! - `releases`, its full text index and triggers: as before
 //! - `files`: one row per file of a release: filename, the subject the NZB
 //!   uses, which parts are there (`seen`, a bitmap) and how many there should be
