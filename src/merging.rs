@@ -325,6 +325,8 @@ impl Par2Bridge {
                     && let Ok(vol_idx) = u32::try_from(vol_num)
                 {
                     run.rar_volume_idx = Some(vol_idx);
+                    let has_complete_prefix =
+                        article_head.payload.len() >= 16_384 || (article_head.payload.len() as u64) >= run.size;
                     let vol_p0 = format!("part{:03}.", vol_num);
                     let vol_p1 = format!("part{:02}.", vol_num);
                     let vol_p2 = format!("part{}.", vol_num);
@@ -333,6 +335,12 @@ impl Par2Bridge {
                         let lower = pf.name.to_ascii_lowercase();
                         pf.size == run.size
                             && !matched_file_ids.contains(&pf.file_id)
+                            && (!has_complete_prefix || pf.md5_16k == head_md5)
+                            && run.md5_16k.is_none_or(|m| pf.md5_16k == m)
+                            && match (run.file_crc, pf.crc32) {
+                                (Some(a), Some(b)) => a == b,
+                                _ => true,
+                            }
                             && (lower.contains(&vol_p0)
                                 || lower.contains(&vol_p1)
                                 || lower.contains(&vol_p2)
@@ -1323,5 +1331,72 @@ mod tests {
             ReleasePartition::Distinct,
             "differing file sizes must not be classified as Twin via LCM intervals"
         );
+    }
+
+    #[test]
+    fn rar5_volume_fallback_rejects_mismatched_complete_prefix() {
+        let make_desc = |file_id: [u8; 16], full_md5: [u8; 16], md5_16k: [u8; 16], size: u64, name: &str| {
+            let mut body = Vec::new();
+            body.extend_from_slice(&file_id);
+            body.extend_from_slice(&full_md5);
+            body.extend_from_slice(&md5_16k);
+            body.extend_from_slice(&size.to_le_bytes());
+            body.extend_from_slice(name.as_bytes());
+            body.push(0);
+            while !body.len().is_multiple_of(4) {
+                body.push(0);
+            }
+            let mut pkt = Vec::new();
+            pkt.extend_from_slice(b"PAR2\0PKT");
+            pkt.extend_from_slice(&((64 + body.len()) as u64).to_le_bytes());
+            pkt.extend_from_slice(&[0u8; 16]);
+            pkt.extend_from_slice(&[0x99; 16]);
+            pkt.extend_from_slice(b"PAR 2.0\0FileDesc");
+            pkt.extend_from_slice(&body);
+            pkt
+        };
+
+        const EQUAL_SIZE: u64 = 50_000_000;
+        let par2 = [
+            make_desc([1; 16], [0xA1; 16], [0x11; 16], EQUAL_SIZE, "Release.part01.rar"),
+            make_desc([2; 16], [0xB2; 16], [0x22; 16], EQUAL_SIZE, "Release.part02.rar"),
+        ]
+        .concat();
+
+        // Foreign RAR5 volume 1 with a complete 16 KiB prefix whose MD5 matches neither PAR2 entry
+        let mut foreign_vol1 = vec![0xCCu8; 16_384];
+        foreign_vol1[..13].copy_from_slice(b"Rar!\x1A\x07\x01\x00\x00\x00\x00\x00\x03");
+        foreign_vol1[13..16].copy_from_slice(&[0x01, 0x00, 0x01]);
+
+        let mut runs = vec![CandidateFileRun {
+            filename: "foreign_obf.bin".into(),
+            group: "alt.binaries.test".into(),
+            poster: "anon@usenet".into(),
+            size: EQUAL_SIZE,
+            yenc_total: None,
+            yenc_part_size: None,
+            file_index: Some(0),
+            rar_volume_idx: None,
+            archive_format: Some("rar5".into()),
+            member_id: None,
+            byte_offset: 0,
+            t_start: 0.0,
+            t_end: 1.0,
+            file_crc: None,
+            md5_16k: None,
+            full_md5: None,
+            unpacked_crc32: None,
+            creation_salt: None,
+            is_obfuscated: true,
+        }];
+        let heads = vec![ArticleHead {
+            file_index: 0,
+            payload: foreign_vol1,
+        }];
+
+        let res = Par2Bridge::resolve(&par2, &mut runs, &heads);
+        assert_eq!(res.resolved_count, 0, "foreign volume 1 with mismatched 16 KiB prefix must not resolve");
+        assert!(runs[0].full_md5.is_none());
+        assert_eq!(runs[0].filename, "foreign_obf.bin");
     }
 }

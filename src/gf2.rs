@@ -162,7 +162,13 @@ pub fn fold_yenc_indexed_parts(total: usize, parts: &[(usize, u32, usize)]) -> R
     }
     let mut map = std::collections::BTreeMap::new();
     for &(num, crc, len) in parts {
-        map.insert(num, (crc, len));
+        if let Some(&prev) = map.get(&num) {
+            if prev != (crc, len) {
+                return Err(FoldError::CorruptPart(num));
+            }
+        } else {
+            map.insert(num, (crc, len));
+        }
     }
     let mut ordered = Vec::with_capacity(total);
     for i in 1..=total {
@@ -250,5 +256,23 @@ mod tests {
     fn missing_intermediate_part() {
         let parts = vec![(1, 0x1111, 100), (2, 0x2222, 100), (4, 0x4444, 100)];
         assert_eq!(fold_yenc_indexed_parts(4, &parts), Err(FoldError::MissingPart(3)));
+    }
+
+    #[test]
+    fn conflicting_duplicate_parts_return_corrupt_part_error() {
+        let identical = vec![(1, 0x1111, 100), (1, 0x1111, 100), (2, 0x2222, 100)];
+        assert!(fold_yenc_indexed_parts(2, &identical).is_ok());
+
+        let conflicting_crc = vec![(1, 0x1111, 100), (1, 0x9999, 100), (2, 0x2222, 100)];
+        assert_eq!(
+            fold_yenc_indexed_parts(2, &conflicting_crc),
+            Err(FoldError::CorruptPart(1))
+        );
+
+        let conflicting_len = vec![(1, 0x1111, 100), (2, 0x2222, 100), (2, 0x2222, 200)];
+        assert_eq!(
+            fold_yenc_indexed_parts(2, &conflicting_len),
+            Err(FoldError::CorruptPart(2))
+        );
     }
 }

@@ -101,8 +101,9 @@ pub struct AudioTrack {
     pub sample_rate: Option<f64>,
     pub language: Option<String>,
     pub name: Option<String>,
-    /// from the track's name: the bitstream's flag sits past what's read
+    /// from the track's name or bitstream probe
     pub atmos: bool,
+    pub dtsx: bool,
     /// the commentary flag, or a name that says so
     pub commentary: bool,
     /// the player's pick when nothing else says
@@ -732,6 +733,10 @@ fn add_track(t: Track, info: &mut MediaInfo) {
         }
         2 => info.audio.push(AudioTrack {
             atmos: t.name.as_deref().is_some_and(|n| n.to_ascii_lowercase().contains("atmos")),
+            dtsx: t.name.as_deref().is_some_and(|n| {
+                let lower = n.to_ascii_lowercase();
+                lower.contains("dts:x") || lower.contains("dts-x") || lower.contains("dtsx")
+            }),
             commentary: t.commentary || says_commentary(t.name.as_deref()),
             default: t.flag_default.unwrap_or(true),
             codec: t.codec,
@@ -1206,14 +1211,19 @@ fn trak(body: &[u8], full_data: &[u8], all_chunk_offsets: &[usize], info: &mut M
         }
         b"soun" => {
             let mut atmos = false;
+            let mut dtsx = codec.eq_ignore_ascii_case("dtsx");
+            let can_probe_dtsx = codec.is_empty() || codec.to_ascii_lowercase().contains("dts");
             boxes(entry.get(36..).unwrap_or(&[]), &mut |kind, v| {
                 if (kind == b"dec3" && parse_dec3_atmos(v)) || (kind == b"dmlp" && parse_dmlp_atmos(v)) {
                     atmos = true;
                 }
             });
-            if !atmos {
-                for &(chunk_idx, off) in &chunk_offsets {
-                    let Some(chunk) = chunk_slice(chunk_idx, off) else { continue };
+            for &(chunk_idx, off) in &chunk_offsets {
+                if atmos && (dtsx || !can_probe_dtsx) {
+                    break;
+                }
+                let Some(chunk) = chunk_slice(chunk_idx, off) else { continue };
+                if !atmos {
                     let chunk_has_atmos = match codec.as_str() {
                         "ec-3" => AudioBitstream::has_eac3_atmos_frame(chunk),
                         "mlpa" => AudioBitstream::has_truehd_atmos(chunk),
@@ -1221,8 +1231,10 @@ fn trak(body: &[u8], full_data: &[u8], all_chunk_offsets: &[usize], info: &mut M
                     };
                     if chunk_has_atmos {
                         atmos = true;
-                        break;
                     }
+                }
+                if !dtsx && can_probe_dtsx && AudioBitstream::has_dtsx_sync(chunk) {
+                    dtsx = true;
                 }
             }
             info.audio.push(AudioTrack {
@@ -1231,6 +1243,7 @@ fn trak(body: &[u8], full_data: &[u8], all_chunk_offsets: &[usize], info: &mut M
                 sample_rate: be32(&entry, 32).map(|rate| f64::from(rate >> 16)),
                 language,
                 atmos,
+                dtsx,
                 ..AudioTrack::default()
             });
         }
@@ -1313,17 +1326,23 @@ fn probe_block(
 
     let Some(&(_, audio_idx)) = audio_tracks.iter().find(|&&(num, _)| num == track_num) else { return };
     let Some(track) = info.audio.get_mut(audio_idx) else { return };
-    if track.atmos {
+    let can_probe_dtsx = track.codec.is_empty() || track.codec.to_ascii_lowercase().contains("dts");
+    if track.atmos && (track.dtsx || !can_probe_dtsx) {
         return;
     }
     let Some(frames) = skip_matroska_lace_header(flags, payload) else { return };
-    let has_atmos = match track.codec.as_str() {
-        "A_TRUEHD" | "A_MLP" => AudioBitstream::has_truehd_atmos(frames),
-        "A_EAC3" => AudioBitstream::has_eac3_atmos_frame(frames),
-        _ => false,
-    };
-    if has_atmos {
-        track.atmos = true;
+    if !track.atmos {
+        let has_atmos = match track.codec.as_str() {
+            "A_TRUEHD" | "A_MLP" => AudioBitstream::has_truehd_atmos(frames),
+            "A_EAC3" => AudioBitstream::has_eac3_atmos_frame(frames),
+            _ => false,
+        };
+        if has_atmos {
+            track.atmos = true;
+        }
+    }
+    if !track.dtsx && can_probe_dtsx && AudioBitstream::has_dtsx_sync(frames) {
+        track.dtsx = true;
     }
 }
 
@@ -2105,18 +2124,30 @@ impl AudioBitstream {
         }
     }
 
+    pub fn has_dtsx_sync(data: &[u8]) -> bool {
+        find_subsequence(data, &[0x02, 0x00, 0x08, 0x50]).is_some()
+            || find_subsequence(data, &[0x50, 0x08, 0x00, 0x02]).is_some()
+            || find_subsequence(data, &[0xF1, 0x40, 0x00, 0xD0]).is_some()
+    }
+
     pub fn probe(data: &[u8]) -> AudioProbeResult {
         let mut result = AudioProbeResult::default();
 
         if is_matroska(data) || is_mp4(data) {
-            if let Some(info) = parse(data)
-                && let Some(track) = info.audio.iter().find(|a| a.atmos)
-            {
-                result.has_atmos = true;
-                result.format = Some(match track.codec.as_str() {
-                    "A_TRUEHD" | "A_MLP" | "mlpa" => "TrueHD Atmos".to_string(),
-                    _ => "E-AC-3 Atmos".to_string(),
-                });
+            if let Some(info) = parse(data) {
+                if let Some(track) = info.audio.iter().find(|a| a.atmos) {
+                    result.has_atmos = true;
+                    result.format = Some(match track.codec.as_str() {
+                        "A_TRUEHD" | "A_MLP" | "mlpa" => "TrueHD Atmos".to_string(),
+                        _ => "E-AC-3 Atmos".to_string(),
+                    });
+                }
+                if info.audio.iter().any(|a| a.dtsx) {
+                    result.has_dtsx = true;
+                    if result.format.is_none() {
+                        result.format = Some("DTS:X".to_string());
+                    }
+                }
             }
             return result;
         }
@@ -2129,10 +2160,7 @@ impl AudioBitstream {
             result.format = Some("E-AC-3 Atmos".to_string());
         }
 
-        if find_subsequence(data, &[0x02, 0x00, 0x08, 0x50]).is_some()
-            || find_subsequence(data, &[0x50, 0x08, 0x00, 0x02]).is_some()
-            || find_subsequence(data, &[0xF1, 0x40, 0x00, 0xD0]).is_some()
-        {
+        if Self::has_dtsx_sync(data) {
             result.has_dtsx = true;
             if result.format.is_none() {
                 result.format = Some("DTS:X".to_string());
@@ -3038,5 +3066,60 @@ mod tests {
         assert_eq!(info.audio.len(), 2);
         assert!(!info.audio[0].atmos, "first non-Atmos track must not read into adjacent track's chunk");
         assert!(info.audio[1].atmos, "second Atmos track must be detected");
+    }
+
+    #[test]
+    fn container_mkv_and_mp4_probe_dtsx_audio_tracks() {
+        // Matroska with A_DTS audio track and SimpleBlock containing DTS:X sync word 0x02000850
+        let t_audio = [
+            el(&[0xD7], &[1]),
+            el(&[0x83], &[2]),
+            el(&[0x86], b"A_DTS"),
+        ]
+        .concat();
+        let tracks = el(&[0xAE], &t_audio);
+        let mut block = vec![0x81, 0x00, 0x00, 0x80];
+        block.extend_from_slice(&[0x00, 0x00, 0x02, 0x00, 0x08, 0x50, 0x00, 0x00]);
+        let cluster = el(&[0x1F, 0x43, 0xB6, 0x75], &el(&[0xA3], &block));
+        let seg = el(
+            &[0x18, 0x53, 0x80, 0x67],
+            &[el(&[0x16, 0x54, 0xAE, 0x6B], &tracks), cluster].concat(),
+        );
+        let mkv = [el(&[0x1A, 0x45, 0xDF, 0xA3], &el(&[0x42, 0x82], b"matroska")), seg].concat();
+
+        let mkv_probe = AudioBitstream::probe(&mkv);
+        assert!(mkv_probe.has_dtsx, "Matroska A_DTS SimpleBlock with DTS:X sync must set has_dtsx");
+        assert_eq!(mkv_probe.format.as_deref(), Some("DTS:X"));
+        assert!(AudioBitstream::probe_dtsx(&mkv));
+
+        // MP4 with dtsh audio track and mdat chunk containing DTS:X sync word 0x02000850
+        let ftyp = mp4_box(b"ftyp", b"isom");
+        let make_dts_trak = |chunk_off: u32| -> Vec<u8> {
+            let mut entry = vec![0u8; 36];
+            entry[4..8].copy_from_slice(b"dtsh");
+            entry[24..26].copy_from_slice(&8u16.to_be_bytes());
+            entry[32..36].copy_from_slice(&(48000u32 << 16).to_be_bytes());
+            let mut stsd = vec![0u8; 8];
+            stsd.extend(&entry);
+            let mut stco = vec![0u8; 12];
+            stco[4..8].copy_from_slice(&1u32.to_be_bytes());
+            stco[8..12].copy_from_slice(&chunk_off.to_be_bytes());
+            let stbl = mp4_box(b"stbl", &[mp4_box(b"stsd", &stsd), mp4_box(b"stco", &stco)].concat());
+            let mut hdlr = vec![0u8; 8];
+            hdlr.extend(b"soun");
+            hdlr.extend([0u8; 12]);
+            let mdia = [mp4_box(b"hdlr", &hdlr), mp4_box(b"minf", &stbl)].concat();
+            mp4_box(b"trak", &mp4_box(b"mdia", &mdia))
+        };
+        let placeholder_moov = mp4_box(b"moov", &make_dts_trak(0));
+        let mdat_data_start = (ftyp.len() + placeholder_moov.len() + 8) as u32;
+        let moov = mp4_box(b"moov", &make_dts_trak(mdat_data_start));
+        let mdat = mp4_box(b"mdat", &[0x00, 0x00, 0x02, 0x00, 0x08, 0x50, 0x00, 0x00]);
+        let mp4 = [ftyp, moov, mdat].concat();
+
+        let mp4_probe = AudioBitstream::probe(&mp4);
+        assert!(mp4_probe.has_dtsx, "MP4 dtsh chunk with DTS:X sync must set has_dtsx");
+        assert_eq!(mp4_probe.format.as_deref(), Some("DTS:X"));
+        assert!(AudioBitstream::probe_dtsx(&mp4));
     }
 }
