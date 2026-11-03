@@ -220,22 +220,36 @@ fn matching(conn: &Connection, column: &str, fingerprint: &[u8], id: i64) -> db:
     Ok(found)
 }
 
-/// The other postings of a release's content, twins first.
-pub fn copies_with(conn: &Connection, id: i64) -> db::Result<Vec<(Copy, ReleaseRow)>> {
+/// A release's (posted, content) fingerprints, either one when a read has kept it.
+type FingerprintPair = (Option<Vec<u8>>, Option<Vec<u8>>);
+
+/// A release's posted and content fingerprints, when a read has kept them. A release with no fingerprint row can
+/// still have file twins by its set.
+fn fingerprints_with(conn: &Connection, id: i64) -> db::Result<FingerprintPair> {
     let s = store::shard_of_id(id);
     let sql = format!("select posted, content from s{s}.release_fingerprint where release_id = ?");
-    // a release with no fingerprint row can still have file twins by its set
-    let (posted, content) = match conn.prepare(&sql) {
+    Ok(match conn.prepare(&sql) {
         Ok(mut stmt) => stmt
             .query_row([id], |r| Ok((r.get::<_, Option<Vec<u8>>>(0)?, r.get::<_, Option<Vec<u8>>>(1)?)))
             .optional()?
             .unwrap_or((None, None)),
         Err(_) => (None, None),
-    };
-    let twins = match &posted {
-        Some(fingerprint) => matching(conn, "posted", fingerprint, id)?,
-        None => Vec::new(),
-    };
+    })
+}
+
+/// The other postings with this release's posted fingerprint: the same files, cut up the same way, in every shard.
+/// Those lend articles file by file under the posted names; a file twin lends only the files its set vouches for.
+pub fn twins_with(conn: &Connection, id: i64) -> db::Result<Vec<i64>> {
+    match fingerprints_with(conn, id)?.0 {
+        Some(fingerprint) => matching(conn, "posted", &fingerprint, id),
+        None => Ok(Vec::new()),
+    }
+}
+
+/// The other postings of a release's content, twins first.
+pub fn copies_with(conn: &Connection, id: i64) -> db::Result<Vec<(Copy, ReleaseRow)>> {
+    let (_, content) = fingerprints_with(conn, id)?;
+    let twins = twins_with(conn, id)?;
     let alts = match &content {
         Some(fingerprint) => matching(conn, "content", fingerprint, id)?,
         None => Vec::new(),
@@ -494,27 +508,43 @@ pub struct FileTwin {
     pub id: i64,
     /// (what the other posting calls the file, what this one does), by the names their sets gave
     pub names: Vec<(String, String)>,
+    /// both sets describe one data file: a posting of it under a random name is that file
+    pub one_file: bool,
+}
+
+/// A name a set gives a file beside the data: its own volumes and the sidecars posted with it.
+fn is_sidecar(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    [".par2", ".nfo", ".sfv", ".srr", ".srs", ".txt"].iter().any(|ext| lower.ends_with(ext))
+}
+
+/// How many data files, sidecars aside, a release's set describes.
+fn data_files_in_set(conn: &Connection, id: i64) -> usize {
+    crate::archive::store::par2_files_with(conn, id).iter().filter(|f| f.bound && !is_sidecar(&f.name)).count()
 }
 
 /// The other postings that hold one or more of this release's files, by the sets' hashes, in every shard.
 pub fn file_twins_with(conn: &Connection, id: i64) -> Vec<FileTwin> {
+    let own = crate::archive::store::par2_files_with(conn, id);
+    let mine_one = own.iter().filter(|f| f.bound && !is_sidecar(&f.name)).count() == 1;
     let mut by_release: HashMap<i64, Vec<(String, String)>> = HashMap::new();
-    for file in crate::archive::store::par2_files_with(conn, id) {
-        for (other, name) in
-            crate::archive::store::same_par2_file_with(conn, file.size, &file.md5_16k, &file.md5, id)
-        {
+    for file in own.iter().filter(|f| f.bound) {
+        for (other, name) in crate::archive::store::same_par2_file_with(conn, file.size, &file.md5_16k, &file.md5, id) {
             by_release.entry(other).or_default().push((name, file.name.clone()));
         }
     }
-    let mut out: Vec<FileTwin> = by_release.into_iter().map(|(id, names)| FileTwin { id, names }).collect();
+    let mut out: Vec<FileTwin> = by_release
+        .into_iter()
+        .map(|(id, names)| FileTwin { id, names, one_file: mine_one && data_files_in_set(conn, id) == 1 })
+        .collect();
     out.sort_by_key(|t| t.id);
     out.truncate(MAX_COPIES as usize);
     out
 }
 
-/// The posted name a set's name stands for among a release's articles: the same name, or the same but for case, or
-/// the one data file of a row that posted its file under a random name.
-fn posted_name<'a>(articles: &'a [ArticleRow], name: &str) -> Option<&'a str> {
+/// The posted name a set's name stands for among a release's articles: the same name, or the same but for case, or,
+/// when `one_file` (the set describes one data file), the one data file of a row that posted it under a random name.
+fn posted_name<'a>(articles: &'a [ArticleRow], name: &str, one_file: bool) -> Option<&'a str> {
     let names: Vec<&str> = {
         let mut seen: Vec<&str> = articles.iter().filter_map(|a| a.filename.as_deref()).collect();
         seen.sort_unstable();
@@ -527,7 +557,10 @@ fn posted_name<'a>(articles: &'a [ArticleRow], name: &str) -> Option<&'a str> {
     if let Some(found) = names.iter().copied().find(|n| n.eq_ignore_ascii_case(name)) {
         return Some(found);
     }
-    let data: Vec<&str> = names.iter().copied().filter(|n| !n.to_ascii_lowercase().ends_with(".par2")).collect();
+    if !one_file || is_sidecar(name) {
+        return None;
+    }
+    let data: Vec<&str> = names.iter().copied().filter(|n| !is_sidecar(n)).collect();
     match data[..] {
         [one] => Some(one),
         _ => None,
@@ -535,16 +568,25 @@ fn posted_name<'a>(articles: &'a [ArticleRow], name: &str) -> Option<&'a str> {
 }
 
 /// Adds what `own` is missing from a file twin's articles: each of the twin's files the sets say is one of this
-/// release's is read as that file, and fills its gaps by `fill_gaps`'s rules. Returns how many.
-pub fn fill_gaps_from(own: &mut Vec<ArticleRow>, twin: &[ArticleRow], names: &[(String, String)]) -> usize {
+/// release's is read as that file, and fills its gaps by `fill_gaps`'s rules. Nothing else of the twin's is touched:
+/// two postings that share an NFO can hold different archives under the same names. Returns how many.
+pub fn fill_gaps_from(
+    own: &mut Vec<ArticleRow>,
+    twin: &[ArticleRow],
+    names: &[(String, String)],
+    one_file: bool,
+) -> usize {
     let mut renamed: Vec<ArticleRow> = Vec::new();
     for (theirs, mine) in names {
-        let (Some(from), Some(to)) = (posted_name(twin, theirs), posted_name(own, mine)) else { continue };
+        let (Some(from), Some(to)) = (posted_name(twin, theirs, one_file), posted_name(own, mine, one_file)) else {
+            continue;
+        };
         let to = to.to_string();
-        renamed.extend(twin.iter().filter(|a| a.filename.as_deref() == Some(from)).map(|a| ArticleRow {
-            filename: Some(to.clone()),
-            ..a.clone()
-        }));
+        renamed.extend(
+            twin.iter()
+                .filter(|a| a.filename.as_deref() == Some(from))
+                .map(|a| ArticleRow { filename: Some(to.clone()), ..a.clone() }),
+        );
     }
     if renamed.is_empty() {
         return 0;
@@ -553,17 +595,17 @@ pub fn fill_gaps_from(own: &mut Vec<ArticleRow>, twin: &[ArticleRow], names: &[(
 }
 
 /// Adds what `own` is missing from every twin and file twin of `release`, and returns how many articles that was.
-/// `conn` has the shards attached.
+/// A file twin lends only the files its set vouches for, under the names the sets map; a twin by the posted
+/// fingerprint lends every file by its posted name. `conn` has the shards attached.
 pub fn fill_from_copies_with(conn: &Connection, id: i64, own: &mut Vec<ArticleRow>) -> db::Result<usize> {
     let mut added = 0;
-    // file twins first, by the names the sets map; then whole twins by the posted names, for the rest of the files
     for twin in file_twins_with(conn, id) {
-        added += fill_gaps_from(own, &store::articles(conn, twin.id)?, &twin.names);
+        added += fill_gaps_from(own, &store::articles(conn, twin.id)?, &twin.names, twin.one_file);
     }
     let mut seen: HashSet<i64> = HashSet::new();
-    for (kind, twin) in copies_with(conn, id)? {
-        if kind == Copy::Twin && seen.insert(twin.id) {
-            added += fill_gaps(own, &store::articles(conn, twin.id)?);
+    for twin in twins_with(conn, id)? {
+        if seen.insert(twin) {
+            added += fill_gaps(own, &store::articles(conn, twin)?);
         }
     }
     Ok(added)
@@ -751,15 +793,24 @@ mod tests {
         ];
         // the sets call it Movie.2024.mkv on both sides; this posting's one data file carries a random name
         let names = vec![("Movie.2024.mkv".to_string(), "Movie.2024.mkv".to_string())];
-        assert_eq!(fill_gaps_from(&mut own, &twin, &names), 1);
+        assert_eq!(fill_gaps_from(&mut own, &twin, &names, true), 1);
         assert_eq!(own.iter().map(|a| a.message_id.as_str()).collect::<Vec<_>>(), ["own1", "t2", "own3"]);
         assert_eq!(own[1].filename.as_deref(), Some("abc123.bin"), "under this posting's name");
+        // a set of several data files says nothing about which one a random name stands for
+        let mut own = vec![article("abc123.bin", 1, 3, 100, "own1"), article("abc123.bin", 3, 3, 50, "own3")];
+        assert_eq!(fill_gaps_from(&mut own, &twin, &names, false), 0);
         // a name the twin's articles don't carry fills nothing
         let mut own = vec![article("a.rar", 1, 2, 100, "own1")];
-        assert_eq!(fill_gaps_from(&mut own, &twin, &[("x.rar".into(), "a.rar".into())]), 0);
+        assert_eq!(fill_gaps_from(&mut own, &twin, &[("x.rar".into(), "a.rar".into())], true), 0);
         // two data files here: which is which can't be told by name, soo nothing fills
         let mut own = vec![article("one.bin", 1, 3, 100, "o1"), article("two.bin", 1, 3, 100, "o2")];
-        assert_eq!(fill_gaps_from(&mut own, &twin, &names), 0);
+        assert_eq!(fill_gaps_from(&mut own, &twin, &names, true), 0);
+        // only the file the sets share is read as this release's; the twin's other files aren't, whatever they're called
+        let mut own = vec![article("abc123.bin", 1, 3, 100, "own1")];
+        let twin = vec![article("abc123.bin", 2, 3, 100, "t2"), article("Movie.2024.nfo", 1, 1, 10, "n1")];
+        let nfo = vec![("Movie.2024.nfo".to_string(), "Movie.2024.nfo".to_string())];
+        assert_eq!(fill_gaps_from(&mut own, &twin, &nfo, true), 0);
+        assert_eq!(own.len(), 1);
     }
 
     #[test]

@@ -65,8 +65,10 @@ pub const NFO_PASSWORD: ShardTable = ShardTable {
 pub const SET_NFO_PASSWORD: &str = "insert or replace into release_nfo_password (release_id, password) values (?1, ?2)";
 
 /// Every file a release's PAR2 set describes, as the set says it: its id in the set, its whole-file MD5, the MD5 of
-/// its first 16 KiB, its size and name, and its CRC32 when the slice checksums folded to one. `sealed`: the set's Main
-/// packet hashes to its set id, soo nobody added this file to someone else's set. `complete`: the whole set was read.
+/// its first 16 KiB, its size and name, and its CRC32 when the slice checksums folded to one. `bound`: the file id
+/// hashes its size, first 16 KiB and name, soo the descriptor is well formed; one that isn't is kept soo the set reads
+/// back whole, but names nothing and matches nothing. `sealed`: the set's Main packet hashes to its set id, soo nobody
+/// added this file to someone else's set. `complete`: the whole set was read.
 /// Kept soo a file is known by its hashes without reading the set again, and soo the same file in another posting, under
 /// any name and from any poster, is found by `(size, md5_16k, md5)`.
 pub const PAR2_FILES: ShardTable = ShardTable {
@@ -80,6 +82,7 @@ pub const PAR2_FILES: ShardTable = ShardTable {
         size       INTEGER NOT NULL,
         name       TEXT NOT NULL,
         crc32      INTEGER,
+        bound      INTEGER NOT NULL DEFAULT 1,
         sealed     INTEGER NOT NULL DEFAULT 0,
         complete   INTEGER NOT NULL DEFAULT 0,
         primary key (release_id, file_id)
@@ -94,8 +97,8 @@ pub const PAR2_FILES: ShardTable = ShardTable {
 
 pub const DELETE_PAR2_FILES: &str = "delete from par2_files where release_id = ?1";
 pub const INSERT_PAR2_FILE: &str = "insert or replace into par2_files
-    (release_id, file_id, set_id, md5, md5_16k, size, name, crc32, sealed, complete)
-    values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)";
+    (release_id, file_id, set_id, md5, md5_16k, size, name, crc32, bound, sealed, complete)
+    values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)";
 
 /// The CRC32 of each article body a step read whole, by the article's message-id: what yEnc's `pcrc32` says, or the
 /// CRC of the decoded bytes when the trailer wasn't seen. Two articles with the same decoded length and CRC hold the
@@ -120,7 +123,10 @@ pub const SET_SEGMENT_CRC: &str =
 
 /// The writes that keep a set's files, every one of them: the small ones and the ones alike too, soo the set reads
 /// back whole.
-pub fn par2_file_writes(release_id: i64, inventory: &crate::par2::Inventory) -> Vec<crate::postprocess::step::StepWrite> {
+pub fn par2_file_writes(
+    release_id: i64,
+    inventory: &crate::par2::Inventory,
+) -> Vec<crate::postprocess::step::StepWrite> {
     use crate::postprocess::step::StepWrite;
     let mut writes = vec![StepWrite::new(DELETE_PAR2_FILES, vec![release_id.into()])];
     for f in &inventory.files {
@@ -136,6 +142,7 @@ pub fn par2_file_writes(release_id: i64, inventory: &crate::par2::Inventory) -> 
                 i64::try_from(f.size).unwrap_or(i64::MAX).into(),
                 f.name.clone().into(),
                 f.crc32.map(i64::from).into(),
+                i64::from(f.bound).into(),
                 i64::from(sealed).into(),
                 i64::from(inventory.complete).into(),
             ],
@@ -148,7 +155,7 @@ pub fn par2_file_writes(release_id: i64, inventory: &crate::par2::Inventory) -> 
 /// it. None: the release holds no complete set, or the shard has no table yet.
 pub fn par2_inventory(conn: &Connection, schema: &str, release_id: i64) -> Option<crate::par2::Inventory> {
     let sql = format!(
-        "select file_id, set_id, md5, md5_16k, size, name, crc32, sealed from {schema}.par2_files
+        "select file_id, set_id, md5, md5_16k, size, name, crc32, sealed, bound from {schema}.par2_files
          where release_id = ? and complete = 1 order by name"
     );
     let mut stmt = conn.prepare_cached(&sql).ok()?;
@@ -167,7 +174,7 @@ pub fn par2_inventory(conn: &Connection, schema: &str, release_id: i64) -> Optio
                     md5_16k: sixteen(3)?,
                     size: u64::try_from(r.get::<_, i64>(4)?).unwrap_or(0),
                     name: r.get(5)?,
-                    bound: true,
+                    bound: r.get::<_, i64>(8)? != 0,
                     crc32: r.get::<_, Option<i64>>(6)?.and_then(|c| u32::try_from(c).ok()),
                 },
                 r.get::<_, i64>(7)? != 0,
@@ -184,20 +191,22 @@ pub fn par2_inventory(conn: &Connection, schema: &str, release_id: i64) -> Optio
     (!inventory.files.is_empty()).then_some(inventory)
 }
 
-/// A file known by its set, found in other releases' sets, in every shard: the same size, first 16 KiB and whole MD5.
-/// Each is `(release id, the file's name there)`. `conn` has the shards attached.
+/// A file known by its set, found in other releases' sets, in every shard: the same size, first 16 KiB and whole MD5,
+/// from a descriptor that hashes to its id. Each is `(release id, the file's name there)`. `conn` has the shards
+/// attached.
 pub fn same_par2_file_with(conn: &Connection, size: u64, md5_16k: &[u8], md5: &[u8], not: i64) -> Vec<(i64, String)> {
     let mut out = Vec::new();
     for s in 0..store::SHARDS {
         let sql = format!(
             "select release_id, name from s{s}.par2_files
-             where size = ?1 and md5_16k = ?2 and md5 = ?3 and release_id != ?4 limit 64"
+             where size = ?1 and md5_16k = ?2 and md5 = ?3 and bound = 1 and release_id != ?4 limit 64"
         );
         let Ok(mut stmt) = conn.prepare_cached(&sql) else { continue };
-        let Ok(rows) = stmt.query_map(
-            rusqlite::params![i64::try_from(size).unwrap_or(i64::MAX), md5_16k, md5, not],
-            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
-        ) else {
+        let Ok(rows) = stmt
+            .query_map(rusqlite::params![i64::try_from(size).unwrap_or(i64::MAX), md5_16k, md5, not], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+            })
+        else {
             continue;
         };
         out.extend(rows.flatten());
@@ -209,7 +218,7 @@ pub fn same_par2_file_with(conn: &Connection, size: u64, md5_16k: &[u8], md5: &[
 pub fn par2_files_with(conn: &Connection, release_id: i64) -> Vec<crate::par2::Par2File> {
     let schema = format!("s{}", store::shard_of_id(release_id));
     let sql = format!(
-        "select file_id, set_id, md5, md5_16k, size, name, crc32 from {schema}.par2_files where release_id = ?"
+        "select file_id, set_id, md5, md5_16k, size, name, crc32, bound from {schema}.par2_files where release_id = ?"
     );
     let Ok(mut stmt) = conn.prepare_cached(&sql) else { return Vec::new() };
     let Ok(rows) = stmt.query_map([release_id], |r| {
@@ -224,7 +233,7 @@ pub fn par2_files_with(conn: &Connection, release_id: i64) -> Vec<crate::par2::P
             md5_16k: sixteen(3)?,
             size: u64::try_from(r.get::<_, i64>(4)?).unwrap_or(0),
             name: r.get(5)?,
-            bound: true,
+            bound: r.get::<_, i64>(7)? != 0,
             crc32: r.get::<_, Option<i64>>(6)?.and_then(|c| u32::try_from(c).ok()),
         })
     }) else {

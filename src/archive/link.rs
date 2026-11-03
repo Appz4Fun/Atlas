@@ -42,7 +42,10 @@ pub const UPLOAD_LINK: ShardTable = ShardTable {
     indexes: &[
         ("upload_link_lead", "create index if not exists upload_link_lead on upload_link(lead_id)"),
         // a volume in another shard finds its upload by its sealed set (`release_info::linked_post_with`)
-        ("upload_link_set", "create index if not exists upload_link_set on upload_link(set_id) where set_id is not null"),
+        (
+            "upload_link_set",
+            "create index if not exists upload_link_set on upload_link(set_id) where set_id is not null",
+        ),
     ],
     release_key: Some("release_id"),
     added: &[],
@@ -828,8 +831,12 @@ mod tests {
         a.crc32 = Some(7);
         let mut b = file(3 << 20, 2);
         b.name = "b.mkv".into();
+        // a descriptor whose id doesn't hash its size and name reads back as it was parsed: not bound
+        let mut c = file(4 << 20, 3);
+        c.name = "c.mkv".into();
+        c.bound = false;
         let inventory = par2::Inventory {
-            files: vec![a.clone(), b.clone()],
+            files: vec![a.clone(), b.clone(), c.clone()],
             block_size: Some(1024),
             complete: true,
             truncated: false,
@@ -839,9 +846,11 @@ mod tests {
             write(&conn, w.sql, w.params);
         }
         let back = super::super::store::par2_inventory(&conn, "main", 8).expect("read back");
-        assert_eq!(back.files, vec![a.clone(), b]);
+        assert_eq!(back.files, vec![a.clone(), b, c]);
         assert_eq!(back.sealed, vec![(a.set_id, a.file_id)]);
         assert!(back.complete);
+        assert!(!back.files[2].bound, "what failed validation when parsed still fails it read back");
+        assert_eq!(wanted(&back.files).len(), 2, "c names nothing");
         assert_eq!(sealed_set(&back, &wanted(&back.files)), None, "b was not sealed");
         // a set read only in part isn't read back: the next run reads the rest
         let partial = par2::Inventory { complete: false, ..inventory };
