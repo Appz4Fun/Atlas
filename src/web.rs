@@ -1967,6 +1967,8 @@ fn details_html(d: &crate::media::details::Details, file_secs: Option<f64>) -> S
     line("Released", d.released.clone());
     line("Blu-ray", d.bluray.clone());
     line("Genres", d.genres.clone());
+    // a show's runtime is the series' usual one, so a long premiere or a double episode isn't a cut
+    let file_secs = file_secs.filter(|_| d.kind == crate::media::title::Kind::Movie as i64);
     line("Runtime", d.runtime.map(|minutes| format!("{minutes} min{}", runtime_note(minutes, file_secs))));
     line("Network", d.network.clone());
     line("Status", d.status.clone());
@@ -2772,6 +2774,11 @@ mod tests {
         assert!(!html.contains("art=backdrop"), "{html}");
         let wide = details_html(&crate::media::details::Details { backdrop: Some("/b.jpg".into()), ..d.clone() }, None);
         assert!(wide.contains("art=backdrop"), "{wide}");
+        let film = crate::media::details::Details { runtime: Some(136), ..d.clone() };
+        assert!(details_html(&film, Some(152.0 * 60.0)).contains("16 min longer"));
+        // a show's runtime is the series' usual one: a double episode isn't a cut
+        let show = crate::media::details::Details { kind: 1, ..film };
+        assert!(!details_html(&show, Some(152.0 * 60.0)).contains("longer"));
     }
 
     #[test]
