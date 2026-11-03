@@ -135,12 +135,23 @@ impl Poller<'_> {
     }
 
     fn page(&mut self, page: i64) -> Result<Vec<Entry>, Trouble> {
-        if !self.first && !(self.pause)(self.delay) {
-            return Err(Trouble::Stopped);
-        }
-        self.first = false;
-        let page = u32::try_from(page).unwrap_or(u32::MAX);
-        let reply = self.fetch.get(&page_url(self.spec, page, self.page_size)).map_err(Trouble::Failed)?;
+        let page_num = u32::try_from(page).unwrap_or(u32::MAX);
+        let url = page_url(self.spec, page_num, self.page_size);
+        let reply = if let Some(cached_body) = crate::raw_store::get_predb_page_cache(self.spec.key, &url, page_num) {
+            self.first = false;
+            HttpReply { status: 200, retry_after: None, rate_reset: None, body: cached_body }
+        } else {
+            if !self.first && !(self.pause)(self.delay) {
+                return Err(Trouble::Stopped);
+            }
+            self.first = false;
+            let fetched = self.fetch.get(&url).map_err(Trouble::Failed)?;
+            if fetched.status == 200 {
+                crate::raw_store::record_predb_page(self.spec.id, self.spec.key, &url, page_num, &fetched.body);
+            }
+            fetched
+        };
+        let page = page_num;
         if reply.status == 429 {
             return Err(Trouble::RateLimited(wait_seconds(&reply, self.now_after(), RATE_LIMIT_DEFAULT)));
         }

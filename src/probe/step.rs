@@ -102,10 +102,27 @@ impl Step for ProbeStep {
     }
     fn run(&self, ctx: &mut StepCtx<'_>) -> Result<Outcome, StepError> {
         let retry = |e: rusqlite::Error| StepError::Retry(e.to_string());
-        let files = ctx.files().map_err(retry)?;
         let release_id = ctx.release().id;
+        let rel_name = ctx.release().name.clone();
+        let rel_group = ctx.release().group.clone();
+        if let Some(saved) = crate::raw_store::get_probe(&rel_name, &rel_group) {
+            let mut writes = Vec::new();
+            if let Some(pw) = saved.nfo_password {
+                writes.push(StepWrite::new(archive::store::SET_NFO_PASSWORD, vec![release_id.into(), pw.into()]));
+            }
+            let hash = saved.moviehash.clone();
+            writes.push(StepWrite::new(
+                SET_PROBE,
+                vec![release_id.into(), saved.crc32.into(), saved.agent.into(), saved.info.into(), hash.clone().into()],
+            ));
+            let rerun = if hash.is_some() { mask(super::opensubtitles::OPENSUBTITLES_STEP) } else { 0 };
+            let facts = hash.map(|h| vec![(MOVIEHASH_FACT, h)]).unwrap_or_default();
+            return Ok(Outcome { matched: true, writes, facts, rerun, ..Outcome::default() });
+        }
+        let files = ctx.files().map_err(retry)?;
         let mut info = ProbeInfo::default();
         let mut writes = Vec::new();
+        let mut found_nfo_password: Option<String> = None;
 
         // the NFO and SFV come first, being the smallest: a budget that runs out still leaves them
         for file in files.iter().filter(|f| is_small_text(&f.filename)).take(3) {
@@ -121,6 +138,7 @@ impl Step for ProbeStep {
             } else if info.nfo.is_none() {
                 info.imdb_ids = imdb_ids(&text);
                 if let Some(password) = release_info::find_password(&text) {
+                    found_nfo_password = Some(password.clone());
                     writes.push(StepWrite::new(
                         archive::store::SET_NFO_PASSWORD,
                         vec![release_id.into(), password.into()],
@@ -210,6 +228,15 @@ impl Step for ProbeStep {
         let agent = agent_of(&info.headers).map(str::to_string);
         let hash = info.moviehash.clone();
         let json = serde_json::to_string(&info).map_err(|e| StepError::Permanent(e.to_string()))?;
+        crate::raw_store::put_probe(
+            &rel_name,
+            &rel_group,
+            crc,
+            agent.as_deref(),
+            &json,
+            hash.as_deref(),
+            found_nfo_password.as_deref(),
+        );
         writes.push(StepWrite::new(
             SET_PROBE,
             vec![release_id.into(), crc.into(), agent.into(), json.into(), hash.clone().into()],

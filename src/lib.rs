@@ -41,6 +41,7 @@ pub mod probe;
 pub mod procs;
 pub mod profile;
 pub mod ptt;
+pub mod raw_store;
 pub mod release_info;
 pub mod release_tags;
 pub mod sab;
