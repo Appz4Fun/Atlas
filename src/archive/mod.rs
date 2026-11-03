@@ -1,6 +1,7 @@
 //! What is inside a release, without downloading it: inner file names and
 //! whether an archive is passworded, from the first bytes of its articles.
 
+pub mod link;
 pub mod names;
 pub mod rar;
 pub mod select;

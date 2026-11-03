@@ -1,0 +1,5 @@
+# Wave 3 merged (07:50-07:55Z)
+- ngPost group-per-file = std::rand() % nbGroups, seeded per run by srand(QUuid.data1) (32-bit). Same stream drives random From. Recovering the seed from observed Froms (brute force 2^32) would predict which group every file of that run went to. Handed to the Opus yEnc thread, which owns PRNG work.
+- Message-ID lookups (ARTICLE/HEAD/STAT <mid>) are group-independent (RFC 3977 6.2.1). Predicted sibling IDs (nxg-upper, newsmangler, GoPostStuff) can be STATed without knowing the group. No evidence of provider STAT throttling; SABnzbd pre-check is slow and deprecated.
+- Group pools: defaults collide (alt.binaries.test, a.b.misc), so pool membership only helps for unusual pools. PAR2 posted in a different group from the RARs is a documented real case (Newsbin forum).
+- Dead end: no public real binary header dumps or NZBs. Best validation data is Atlas's own overview rows and sealed article log. Spotnet spots (RSA key + NZB Message-ID, per peer thread) could be ground-truth labels.

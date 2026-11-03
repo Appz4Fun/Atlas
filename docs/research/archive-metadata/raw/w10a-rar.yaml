@@ -1,0 +1,1295 @@
+rar5:
+  detect:
+    magic: 52 61 72 21 1A 07 01 00
+    offset: 0
+    sfx: scan first ~1 MB for signature; offsets relative to signature
+  structures:
+    block_prefix:
+    - name: hdr_crc
+      where: '@hdr+0 uint32 LE; CRC32 of size..extra end'
+      type: uint32
+      read_from: first_article
+      use: trust header parse on partial read
+      proves: none
+      leak: false
+      status: VERIFIED
+      source: w1a s1; w3c s1.1
+      atlas: parsed
+      atlas_where: archive/rar.rs:216-219 (listing checks CRC32, then used); probe/archive.rs:119 reads and skips
+    - name: hdr_size
+      where: '@hdr+4 vint; counts type..extra end (not CRC)'
+      type: vint
+      read_from: first_article
+      use: next data at hdr+4+len(vint)+size
+      proves: none
+      leak: false
+      status: VERIFIED
+      source: w1a s1
+      atlas: parsed
+      atlas_where: archive/rar.rs:197-214; probe/archive.rs:121
+    - name: hdr_type
+      where: 'vint: 1 MAIN 2 FILE 3 SERVICE 4 CRYPT 5 ENDARC'
+      type: vint
+      read_from: first_article
+      use: block dispatch
+      proves: none
+      leak: false
+      status: VERIFIED
+      source: w1a s1
+      atlas: parsed
+      atlas_where: archive/rar.rs:249-290 (dispatch only)
+    - name: hdr_flags
+      where: 'vint: 0x1 extra, 0x2 data, 0x4 skip-unknown, 0x8 split-before, 0x10 split-after, 0x20 child, 0x40 inherited'
+      type: vint
+      read_from: first_article
+      use: split chain without names
+      proves: none
+      leak: false
+      status: VERIFIED
+      source: w1a s1; w3c s1.1
+      atlas: parsed
+      atlas_where: probe/archive.rs:125-126; archive/rar.rs:242-244; 0x10 SPLIT_AFTER -> continues (probe/archive.rs:138, serde-skip)
+    - name: data_area_start
+      where: 'derived: block+4+len(size vint)+hdr_size; not CRC-covered'
+      type: derived
+      read_from: first_article
+      use: byte map of stored or packed data
+      proves: none
+      leak: false
+      status: VERIFIED
+      source: w1a s1, s16b
+      atlas: parsed
+      atlas_where: probe/archive.rs:160 -> stored_at (serde-skip, not persisted)
+    main_header:
+    - name: main_extra_size
+      where: vint, present if hdr_flags 0x1
+      type: vint
+      read_from: first_article
+      use: skip or parse main extras
+      proves: none
+      leak: false
+      status: VERIFIED
+      source: w1a s2
+      atlas: 'no'
+      atlas_where: probe handles no kind-1 block (probe/archive.rs:129-166); no kind-1 arm in archive/rar.rs:249-290
+    - name: archive_flags
+      where: 'vint: 0x1 VOLUME, 0x2 volume-number present, 0x4 SOLID, 0x8 RECOVERY, 0x10 LOCKED'
+      type: vint
+      read_from: first_article
+      use: multi-volume, solid, RR presence
+      proves: tool
+      leak: true
+      status: VERIFIED
+      source: w1a s2; w3c s1.5
+      atlas: 'no'
+      atlas_where: main header (kind 1) not read in either path
+    - name: volume_number
+      where: vint, present if archive_flags 0x2 (absent in part 1)
+      type: vint
+      read_from: first_article
+      use: exact part index; absence marks part 1
+      proves: none
+      leak: false
+      status: VERIFIED
+      source: w1a s2
+      atlas: 'no'
+      atlas_where: main header (kind 1) not read
+    - name: locator_qlist_offset
+      where: 'extra 0x01: flags 0x1, vint offset to QO from main header start (0 = absent)'
+      type: vint
+      read_from: first_article
+      use: jump to QO cache (target at tail)
+      proves: none
+      leak: false
+      status: VERIFIED
+      source: w3c s1.5
+      atlas: 'no'
+      atlas_where: main header extra 0x01 not read
+    - name: locator_rr_offset
+      where: 'extra 0x01: flags 0x2, vint offset to RR block (0 = absent)'
+      type: vint
+      read_from: first_article
+      use: jump to recovery block (target at tail)
+      proves: none
+      leak: false
+      status: VERIFIED
+      source: w3c s1.5
+      atlas: 'no'
+      atlas_where: main header extra 0x01 not read
+    - name: main_archive_name_time
+      where: 'extra 0x02: flags 0x1 orig name, 0x2 creation time, 0x4 unix, 0x8 ns'
+      type: record
+      read_from: first_article
+      use: original archive name and creation time
+      proves: same_uploader
+      leak: true
+      status: VERIFIED
+      source: w1a s2
+      atlas: 'no'
+      atlas_where: main header extra 0x02 not read (Atlas gap table section 3.1)
+    crypt_header:
+    - name: crypt_version
+      where: 'HEAD_CRYPT vint: 0 = AES-256'
+      type: vint
+      read_from: first_article
+      use: headers encrypted; no listing without password
+      proves: none
+      leak: true
+      status: VERIFIED
+      source: w7b s1.1
+      atlas: parsed
+      atlas_where: archive/rar.rs:362 (_version discarded)
+    - name: crypt_flags
+      where: 'HEAD_CRYPT vint: 0x1 PSWCHECK present'
+      type: vint
+      read_from: first_article
+      use: reject wrong password before decrypt
+      proves: none
+      leak: false
+      status: VERIFIED
+      source: w7b s1.1
+      atlas: parsed
+      atlas_where: archive/rar.rs:363-365 (gates the check value)
+    - name: crypt_lg2_count
+      where: '1 byte: KDF iterations = 2^N (default 15, max 24)'
+      type: uint8
+      read_from: first_article
+      use: KDF cost; reveals -hp setting
+      proves: tool
+      leak: true
+      status: VERIFIED
+      source: w7b s1.1
+      atlas: stored
+      atlas_where: archive_release.password_check BLOB, PasswordCheck.kdf (archive/rar.rs:294-320; store.rs:72-73)
+    - name: crypt_salt
+      where: '16 bytes: archive-level header salt'
+      type: bytes16
+      read_from: first_article
+      use: key derivation; grouping candidate
+      proves: twin
+      leak: true
+      status: VERIFIED
+      source: w7b s1.1
+      atlas: stored
+      atlas_where: same password_check BLOB, PasswordCheck.salt (archive/rar.rs:294-320; store.rs:72-73)
+    - name: crypt_salt_same_across_volumes
+      where: same HEAD_CRYPT salt in every volume of one set (rars writer)
+      type: bytes16
+      read_from: first_article
+      use: group encrypted volumes without names
+      proves: twin
+      leak: true
+      status: UNVERIFIED
+      source: log W8A; WinRAR not checked
+      atlas: 'no'
+      atlas_where: no cross-volume comparison in Atlas
+    - name: crypt_pswcheck_csum
+      where: 8-byte PswCheck + 4-byte csum (first 4 bytes of SHA-256(PswCheck))
+      type: bytes12
+      read_from: first_article
+      use: password test without decrypting
+      proves: none
+      leak: false
+      status: VERIFIED
+      source: w7b s1.1
+      atlas: stored
+      atlas_where: same password_check BLOB; csum verified at archive/rar.rs:372-373
+    - name: crypt_pswcheck_algo
+      where: 'PBKDF2-HMAC-SHA256 at 2^N+32 iterations (Key at 2^N, HashKey at 2^N+16); 32-byte output XOR-folded: PswCheck[i % 8] ^= out[i] (crypt5.cpp:161,179)'
+      type: derived
+      read_from: first_article
+      use: password test algorithm
+      proves: none
+      leak: false
+      status: VERIFIED
+      source: w7b s1.3 (vectors only)
+      check: 'Now verified in source: 2^N+32 iterations, XOR-fold of the 32-byte output into 8 bytes. Key uses 2^N and HashKey 2^N+16 (crypt5.cpp:84-85). Source crypt5.cpp:84-85,161,179.'
+      atlas: 'no'
+      atlas_where: PBKDF2 derivation not in Atlas copy; BLOB stores inputs only
+    - name: encrypted_header_iv
+      where: 16-byte IV before each later header (AES-256-CBC)
+      type: bytes16
+      read_from: first_article
+      use: per-block IV; header lengths stay hidden
+      proves: none
+      leak: false
+      status: VERIFIED
+      source: w7b s1.2
+      atlas: parsed
+      atlas_where: archive/rar.rs:370 (used for file records; header IV not kept)
+    - name: header_contents_hidden
+      where: 'with -hp: names, sizes, header count, volume number, flags inside ciphertext'
+      type: record
+      read_from: first_article
+      use: listing needs the key
+      proves: none
+      leak: false
+      status: VERIFIED
+      source: w7b s1.6
+      atlas: stored
+      atlas_where: archive_release.names_hidden (steps.rs:141-152; store.rs:70-73)
+    file_header:
+    - name: file_extra_size
+      where: vint, present if hdr_flags 0x1
+      type: vint
+      read_from: first_article
+      use: bounds extra records
+      proves: none
+      leak: false
+      status: VERIFIED
+      source: w1a s4
+      atlas: parsed
+      atlas_where: probe/archive.rs:125; archive/rar.rs:243
+    - name: file_data_size
+      where: vint, present if hdr_flags 0x2; packed bytes of this part
+      type: vint
+      read_from: first_article
+      use: packed size; split files sum over volumes
+      proves: none
+      leak: false
+      status: VERIFIED
+      source: w1a s4
+      atlas: stored
+      atlas_where: ArchiveHead.packed (probe/archive.rs:136, probe only); listing skips (archive/rar.rs:244)
+    - name: file_flags
+      where: 'vint: 0x1 DIRECTORY, 0x2 UTIME, 0x4 CRC32 present, 0x8 unknown unpacked size'
+      type: vint
+      read_from: first_article
+      use: dir vs file; CRC and size trust
+      proves: none
+      leak: false
+      status: VERIFIED
+      source: w3c s1.1
+      atlas: parsed
+      atlas_where: head_flags bit 0x04 -> encrypted (archive/rar.rs:104-107, stored); 0x02 -> continues (probe/archive.rs:85, serde-skip); 0x8000 used to skip (archive/rar.rs:65-71);
+        other bits not read
+    - name: file_unpacked_size
+      where: vint, present unconditionally after file_flags (arcread.cpp:820). Ignore the value when file_flags 0x8 is set (arcread.cpp:822-824)
+      type: vint
+      read_from: first_article
+      use: is the MKV complete
+      proves: none
+      leak: false
+      status: VERIFIED
+      source: w1a s4 (split parts unverified)
+      check: Field is always present as a vint after file_flags, even when flag 0x8 is set. Source arcread.cpp:820-824.
+      atlas: stored
+      atlas_where: archive_inner_files.size (archive/rar.rs:284-285); ArchiveHead.unpacked (probe/archive.rs:140,152)
+    - name: file_mtime_unix
+      where: uint32 LE if UTIME flag; UTC Unix seconds
+      type: uint32
+      read_from: first_article
+      use: UTC mtime; clock and zone leak
+      proves: same_uploader
+      leak: true
+      status: VERIFIED
+      source: w3c s1.1; w5c s1
+      atlas: 'no'
+      atlas_where: skipped by p += 4 (probe/archive.rs:143; archive/rar.rs:262-264)
+    - name: file_crc32
+      where: uint32 LE if CRC32 flag; unsplit or last part = unpacked CRC
+      type: uint32
+      read_from: first_article
+      use: content fingerprint (not a key for first split parts)
+      proves: twin
+      leak: false
+      status: VERIFIED
+      source: w3c s1.1; w1a s4
+      atlas: stored
+      atlas_where: ArchiveHead.crc32 (probe/archive.rs:76, first file only); listing file4 never reads @16
+    - name: comp_info
+      where: 'comp_info (32-bit vint). 1-based bit numbers as used here: 1-6 (mask 0x3f) algorithm version; 7 (0x40) solid; 8-10 (0x380) method; 11-15 (0x7c00) dict exponent; 16-20 (0xf8000)
+        dict fraction; 21 (0x100000) FCI_RAR5_COMPAT (RAR7 compression flags)'
+      type: vint
+      read_from: first_article
+      use: 'packer fingerprint: method, dict, version'
+      proves: tool
+      leak: true
+      status: VERIFIED
+      source: w1a s4; w3c s1.1
+      check: 'Bit numbers are 1-based in the YAML while unrar uses 0-based FCI_* masks (headers5.hpp). Give explicit masks. "21 v1 flag" is FCI_RAR5_COMPAT (0x100000, RAR7 compression
+        flags), not a version flag. Sources: headers5.hpp FCI_*; arcread.cpp:876.'
+      atlas: parsed
+      atlas_where: probe/archive.rs:149 (raw read; only the method is used)
+    - name: comp_method
+      where: 'comp_info bits 8-10: 0 = store (-m0), 1-5 compressed'
+      type: derived
+      read_from: first_article
+      use: 'store: inner MKV readable with no decoder'
+      proves: tool
+      leak: true
+      status: VERIFIED
+      source: w1a s17
+      atlas: stored
+      atlas_where: ArchiveHead.method m0..m5 (probe/archive.rs:155-156); listing drops _compression (archive/rar.rs:268)
+    - name: comp_dict_exponent
+      where: comp_info bits 11-15 (mask 0x7c00 as 0-based bits 10-14). dict = 0x20000 << N (128 KiB << N). Mask is 0x0f when version==0 (RAR 5.0), 0x1f otherwise (arcread.cpp:876)
+      type: derived
+      read_from: first_article
+      use: -md setting and packer default
+      proves: tool
+      leak: true
+      status: VERIFIED
+      source: w1a s4
+      check: unrar masks the exponent with 0x0f when comp version is 0 (RAR 5.0) and 0x1f otherwise; prototype rar_meta.rs:883 always uses 0x1f. Source arcread.cpp:876.
+      atlas: 'no'
+      atlas_where: not read
+    - name: comp_version
+      where: 'comp_info bits 1-6: 0 = RAR 5.0, 1 = RAR 7.0+'
+      type: derived
+      read_from: first_article
+      use: RAR 7.x packer detection
+      proves: tool
+      leak: true
+      status: VERIFIED
+      source: w1a s4; w3c s1.1
+      atlas: 'no'
+      atlas_where: not read (probe/archive.rs:149 uses only method)
+    - name: file_host_os
+      where: 'vint: 0 Windows, 1 Unix'
+      type: vint
+      read_from: first_article
+      use: packer OS; decides attribute meaning
+      proves: tool
+      leak: true
+      status: VERIFIED
+      source: w3c s1.1; w8c i
+      atlas: 'no'
+      atlas_where: not read
+    - name: file_attributes
+      where: 'vint: Windows attrs (host 0) or POSIX st_mode (host 1)'
+      type: vint
+      read_from: first_article
+      use: dir, symlink, uploader mode and umask
+      proves: tool
+      leak: true
+      status: VERIFIED
+      source: w1a s4
+      atlas: parsed
+      atlas_where: archive/rar.rs:261 (_attributes dropped); probe/archive.rs:141
+    - name: file_name
+      where: vint length + UTF-8, '/' separator; U+E080-E0FF + U+FFFE = non-portable Unix name
+      type: utf8
+      read_from: first_article
+      use: file path; non-portable name flag
+      proves: none
+      leak: false
+      status: VERIFIED
+      source: w1a s4
+      atlas: stored
+      atlas_where: 'probe: ASCII half only (probe/archive.rs:79-83); listing name4/unicode4 (archive/rar.rs:115-173) -> archive_inner_files.name'
+    extras:
+    - name: extra_encryption
+      where: 'file extra 0x01: vint version (0), vint flags (0x1 PSWCHECK present, 0x2 HASHMAC: unpacked-data CRC/BLAKE2 keyed by HashKey), uint8 KDF lg2 count, salt16, IV16, check12
+        (PswCheck8 + csum4) when 0x1. HashKey = PBKDF2 at 2^N+16 iterations (crypt5.cpp:161)'
+      type: record
+      read_from: first_article
+      use: per-file encryption; TWEAKED makes CRC key-dependent
+      proves: none
+      leak: true
+      status: VERIFIED
+      source: w1a s5
+      check: 'Flag 0x02 is named FHEXTRA_CRYPT_HASHMAC in unrar ("MAC for unpacked data checksums"), not TWEAKED. The HashKey is derived with 2^N+16 iterations. Sources: headers5.hpp
+        FHEXTRA_CRYPT_*; arcread.cpp:1065-1107; crypt5.cpp:84-85,161.'
+      atlas: stored
+      atlas_where: file extra 0x01 check/kdf/salt -> password_check BLOB (archive/rar.rs:294-320, 296-304; store.rs:72-73); presence -> archive_release.encryption=2 (archive/rar.rs:277-282)
+    - name: extra_hash_blake2sp
+      where: 'file extra 0x02: hash_type 0 + 32-byte BLAKE2sp'
+      type: record
+      read_from: first_article
+      use: content identity for unsplit files
+      proves: twin
+      leak: false
+      status: VERIFIED
+      source: w1a s5
+      atlas: 'no'
+      atlas_where: not read
+    - name: extra_time_htime
+      where: 'file extra 0x03: vint flags (0x1 unix time_t, 0x2 mtime, 0x4 ctime, 0x8 atime, 0x10 unix ns). Then per present time, in order mtime, ctime, atime: unix -> uint32 LE seconds;
+        else uint64 LE Windows FILETIME. Then, only if unix AND 0x10: one uint32 LE per present time, same order, value & 0x3fffffff (ignored if >= 1e9). Source arcread.cpp:1133-1163'
+      type: record
+      read_from: first_article
+      use: ns timestamps; OS and clock fingerprint
+      proves: tool
+      leak: true
+      status: VERIFIED
+      source: w5c s1.6; w8c f
+      check: 'YAML gives no layout. Value width depends on the unix flag; with unix+ns the ns words follow all seconds. Prototype rar_meta.rs:660 reads 8 bytes per time when unix+ns:
+        wrong.'
+      atlas: 'no'
+      atlas_where: not read
+    - name: extra_version
+      where: 'file extra 0x04: flags, version number; name gets ;N'
+      type: record
+      read_from: first_article
+      use: file versioning (rare)
+      proves: none
+      leak: false
+      status: VERIFIED
+      source: w1a s5
+      atlas: 'no'
+      atlas_where: not read
+    - name: extra_redirection
+      where: 'file extra 0x05: vint type (0 none, 1 unix symlink, 2 windows symlink, 3 junction, 4 hard link, 5 file copy); vint flags (0x1 target is dir); vint name length; UTF-8 target
+        bytes. Source arcread.cpp:1177-1196'
+      type: record
+      read_from: first_article
+      use: symlink target leaks packer paths; breaks largest-file rule
+      proves: same_uploader
+      leak: true
+      status: VERIFIED
+      source: w5c s4.1
+      check: Missing the name-length vint between flags and the name. Source arcread.cpp:1177-1196 (prototype rar_meta.rs:678 has it right).
+      atlas: 'no'
+      atlas_where: not read (matters for largest-file rule)
+    - name: extra_unix_owner
+      where: 'file extra 0x06: vint flags (0x1 user name, 0x2 group name, 0x4 numeric uid, 0x8 numeric gid). If 0x1: vint len + user name. If 0x2: vint len + group name. If 0x4: vint
+        uid. If 0x8: vint gid. Source arcread.cpp:1197-1230'
+      type: record
+      read_from: first_article
+      use: Unix account and numeric ids of packer
+      proves: same_uploader
+      leak: true
+      status: VERIFIED
+      source: w5c s3.4
+      check: 'Length prefixes missing and uid/gid shown as unconditional. Actual: names are length-prefixed vints, numeric ids present only by flag. Source arcread.cpp:1197-1230 (prototype
+        rar_meta.rs:685 matches source).'
+      atlas: 'no'
+      atlas_where: not read
+    - name: extra_subdata
+      where: 'file extra 0x07: service payload (RR percent vint, CMT text, QO cache)'
+      type: bytes
+      read_from: first_article or last_article
+      use: service payload
+      proves: tool
+      leak: true
+      status: VERIFIED
+      source: w3c s1.4
+      atlas: 'no'
+      atlas_where: service extras not read; probe/archive.rs:174-185 tests type 1 only
+    service_headers:
+    - name: service_name
+      where: 'service name: CMT, QO, ACL, STM, UOW, AV, RR, EA2'
+      type: utf8
+      read_from: first_article or last_article
+      use: selects service decoder
+      proves: none
+      leak: false
+      status: VERIFIED
+      source: w3c s1.1
+      atlas: 'no'
+      atlas_where: service blocks skipped (probe/archive.rs:164-166; archive/rar.rs:258-288)
+    - name: service_cmt
+      where: 'CMT: archive comment in data area; method 0-5; CRC-checked; 16 MiB cap'
+      type: text
+      read_from: first_article if near main header, else full
+      use: poster notes, group tags, URLs
+      proves: same_uploader
+      leak: true
+      status: VERIFIED
+      source: w3c s1.2
+      atlas: 'no'
+      atlas_where: not read
+    - name: service_qo
+      where: 'QO: raw cached headers; entries = CRC32, size vint, flags, backward offset, header bytes'
+      type: record
+      read_from: last_article
+      use: file list without data; -qo leak
+      proves: tool
+      leak: true
+      status: VERIFIED
+      source: w3c s1.3
+      atlas: 'no'
+      atlas_where: not read
+    - name: qo_scope_per_volume
+      where: QO caches only its own volume's headers; normally at end of volume
+      type: record
+      read_from: last_article
+      use: per-volume list, not set-wide
+      proves: none
+      leak: false
+      status: VERIFIED
+      source: log W4B correction
+      atlas: 'no'
+      atlas_where: not read
+    - name: qo_entry_flags
+      where: 'QO entry flags vint: bit meanings'
+      type: vint
+      read_from: last_article
+      use: not needed for listing
+      proves: none
+      leak: false
+      status: UNVERIFIED
+      source: w3c s1.3
+      atlas: 'no'
+      atlas_where: not read
+    - name: service_rr
+      where: 'RR: recovery sectors in data area; found via locator RR offset'
+      type: bytes
+      read_from: last_article
+      use: recovery presence (-rr) and size
+      proves: tool
+      leak: true
+      status: VERIFIED
+      source: w3c s1.4
+      atlas: 'no'
+      atlas_where: not read
+    - name: rr_percent
+      where: SUBDATA vint on RR block (1 byte before RAR 6.10)
+      type: vint
+      read_from: last_article
+      use: -rr percentage
+      proves: tool
+      leak: true
+      status: VERIFIED
+      source: w8c d; w3c s1.4
+      atlas: 'no'
+      atlas_where: not read
+    - name: rr_bytes_from_percent
+      where: percent to recovery byte count
+      type: derived
+      read_from: last_article
+      use: size of recovery data
+      proves: tool
+      leak: false
+      status: UNVERIFIED
+      source: w3c s1.4 (not in sources)
+      atlas: 'no'
+      atlas_where: not read
+    - name: service_acl
+      where: 'ACL: NTFS SECURITY_DESCRIPTOR (owner, group, DACL), compressed; written with -ow'
+      type: record
+      read_from: first_article
+      use: owner SID = Windows account fingerprint
+      proves: same_uploader
+      leak: true
+      status: VERIFIED
+      source: w8c d; w5c s3.1
+      atlas: 'no'
+      atlas_where: not read
+    - name: acl_owner_sid
+      where: owner SID inside the ACL descriptor (S-1-5-21-...-RID)
+      type: derived
+      read_from: first_article
+      use: same Windows account across posts
+      proves: same_uploader
+      leak: true
+      status: UNVERIFIED
+      source: w5c s3.1 (layout)
+      atlas: 'no'
+      atlas_where: not read
+    - name: service_stm_zone
+      where: STM ':Zone.Identifier' child service; name in SubData (UTF-8); body text
+      type: record
+      read_from: first_article
+      use: mark-of-the-web; origin download host
+      proves: alt
+      leak: true
+      status: VERIFIED
+      source: w8c d; w5c s2.1
+      atlas: 'no'
+      atlas_where: not read
+    - name: stm_zone_id
+      where: ZoneId=0-4 in Zone.Identifier body (3 = Internet zone)
+      type: text
+      read_from: first_article
+      use: download zone (value meaning unconfirmed)
+      proves: none
+      leak: true
+      status: VERIFIED
+      source: w5c s2.5
+      atlas: 'no'
+      atlas_where: not read
+    - name: stm_host_url
+      where: HostUrl / ReferrerUrl lines in Zone.Identifier (only when packed with -os)
+      type: text
+      read_from: first_article
+      use: exact origin URL
+      proves: alt
+      leak: true
+      status: UNVERIFIED
+      source: w5c s2.4
+      atlas: 'no'
+      atlas_where: not read
+    - name: service_uow_av_ea2
+      where: UOW, AV, EA2 service names (layouts not read)
+      type: record
+      read_from: first_article
+      use: Unix owner name; other service data
+      proves: same_uploader
+      leak: true
+      status: UNVERIFIED
+      source: w3c s1.7
+      atlas: 'no'
+      atlas_where: not read
+    end_of_archive:
+    - name: endarc_flags
+      where: 'ENDARC vint: 0x1 = not last volume (next part exists)'
+      type: vint
+      read_from: last_article
+      use: cheap next-part test
+      proves: none
+      leak: false
+      status: VERIFIED
+      source: w1a s6
+      check: No change; atlas only.
+      atlas: parsed
+      atlas_where: archive/rar.rs:60-63 sets complete=true (steps.rs:129); flags and volume number dropped
+    - name: endarc_trailer
+      where: nothing read after ENDARC; appended data (signatures, tags) lives after it
+      type: bytes
+      read_from: last_article
+      use: tail-append data from third-party tools
+      proves: same_uploader
+      leak: true
+      status: VERIFIED
+      source: w1a s6
+      atlas: 'no'
+      atlas_where: nothing read after end block
+  partial_decode:
+    codec: RAR5 LZ (methods 1-5); store (method 0) needs no decoder
+    crate: rars 0.12.3 codec::rar50 Unpack50Decoder
+    result: about 1:1 prefix on truncated packed data (10% -> 786 KB); 64 KiB flush loss on last block
+  rust:
+    parse: hand-written (proto/rar_meta.rs)
+    decode: rars 0.12.3 codec::rar50 direct
+    crypto: pbkdf2+hmac+sha2
+rar4:
+  detect:
+    magic: 52 61 72 21 1A 07 00
+    offset: 0
+  structures:
+    block_base:
+    - name: head_crc
+      where: '@hdr+0 uint16 LE; low 16 bits of CRC32 over bytes @hdr+2 .. @hdr+head_size (unrar GetCRC15, rawread.hpp:27)'
+      type: uint16
+      read_from: first_article
+      use: header integrity
+      proves: none
+      leak: false
+      status: UNVERIFIED
+      source: w1a s8
+      check: YAML says CRC16. unrar computes the header check with GetCRC15 (low 16 bits of CRC32 over the header, rawread.hpp); the GetCRC15 body is not in the copies, so status is
+        UNVERIFIED. Prototype rar_meta.rs:424 uses crc32 & 0xffff.
+      atlas: parsed
+      atlas_where: archive/rar.rs:44-51 (checked for 0x73/0x74/0x7a, then dropped); probe does not check
+    - name: head_type
+      where: '@hdr+2 byte: 72 MARK 73 MAIN 74 FILE 75 CMT 76 AV 77 OLDSUB 78 PROTECT 79 SIGN 7A NEWSUB 7B ENDARC'
+      type: uint8
+      read_from: first_article
+      use: block dispatch
+      proves: none
+      leak: false
+      status: VERIFIED
+      source: w1a s8; w5b s1
+      atlas: parsed
+      atlas_where: probe/archive.rs:61; archive/rar.rs:35 (dispatch)
+    - name: head_flags
+      where: '@hdr+3 uint16; 0x8000 LONG_BLOCK, 0x4000 SKIP_IF_UNKNOWN'
+      type: uint16
+      read_from: first_article
+      use: drives every flag test
+      proves: none
+      leak: false
+      status: VERIFIED
+      source: w1a s8
+      atlas: parsed
+      atlas_where: probe/archive.rs:63-66 (0x80 -> headers_encrypted, stored); archive/rar.rs:53-59; probe/archive.rs:84 (0x04 -> encrypted, stored); 0x02 -> continues (probe/archive.rs:85,
+        serde-skip); 0x8000 used to skip (archive/rar.rs:65-71)
+    - name: head_size
+      where: '@hdr+5 uint16; total header length; data starts at block+HEAD_SIZE'
+      type: uint16
+      read_from: first_article
+      use: locates data and next block
+      proves: none
+      leak: false
+      status: VERIFIED
+      source: w1a s8
+      atlas: parsed
+      atlas_where: probe/archive.rs:56-57; archive/rar.rs:38-39 (block length, dropped)
+    - name: add_size
+      where: '@hdr+7 uint32 if LONG_BLOCK; packed size low 32 bits on FILE/NEWSUB'
+      type: uint32
+      read_from: first_article
+      use: packed size
+      proves: none
+      leak: false
+      status: VERIFIED
+      source: w1a s8
+      atlas: parsed
+      atlas_where: probe/archive.rs:93-94; archive/rar.rs:65-71 (skip only)
+    main_header:
+    - name: main_reserved_av
+      where: '@hdr+7 HighPosAV uint16 LE, @hdr+9 PosAV uint32 LE (legacy; headers.hpp:6)'
+      type: uint16
+      read_from: first_article
+      use: ignore
+      proves: none
+      leak: false
+      status: VERIFIED
+      source: w1a s9
+      check: 'Confirmed offsets: HighPosAV @7 (uint16), PosAV @9 (uint32) (SIZEOF_MAINHEAD3=13).'
+      atlas: 'no'
+      atlas_where: legacy, not read
+    - name: main_flags
+      where: '@hdr+3 uint16: 0x1 VOLUME, 0x2 COMMENT, 0x4 LOCK, 0x8 SOLID, 0x10 NEWNUMBERING, 0x20 AV, 0x40 PROTECT, 0x80 PASSWORD, 0x100 FIRSTVOLUME; 0x200 ENCRYPTVER (not in unrar
+        headers.hpp: UNVERIFIED)'
+      type: uint16
+      read_from: first_article
+      use: solid, RR, -hp, naming (.partNN vs .rNN)
+      proves: tool
+      leak: true
+      status: VERIFIED
+      source: w5b s2
+      check: Bit 0x200 "ENCRYPTVER" is not defined in unrar headers.hpp (lines 24-37). Marked UNVERIFIED. Source headers.hpp:24-37.
+      atlas: stored
+      atlas_where: only 0x80 MHD_PASSWORD stored as headers_encrypted (probe/archive.rs:63-66; archive/rar.rs:53-59; steps.rs:148); other bits not read
+    - name: main_comment_inline
+      where: 'MHD_COMMENT: old inline RAR 2.x comment after main header'
+      type: record
+      read_from: first_article
+      use: legacy comment
+      proves: same_uploader
+      leak: true
+      status: VERIFIED
+      source: w3c s2.3
+      atlas: 'no'
+      atlas_where: not read
+    file_header:
+    - name: pack_size_low
+      where: '@hdr+7 uint32 (= add_size on FILE)'
+      type: uint32
+      read_from: first_article
+      use: packed size low 32 bits
+      proves: none
+      leak: false
+      status: VERIFIED
+      source: w1a s10
+      atlas: stored
+      atlas_where: ArchiveHead.packed (probe/archive.rs:74); listing uses only to skip (archive/rar.rs:73-74)
+    - name: unp_size_low
+      where: '@hdr+11 uint32 LE. Unknown size (emit null, not 4 GiB): without LHD_LARGE if low == 0xFFFFFFFF; with LHD_LARGE if low == 0xFFFFFFFF and high == 0xFFFFFFFF (arcread.cpp:320-339)'
+      type: uint32
+      read_from: first_article
+      use: unpacked size low 32 bits
+      proves: none
+      leak: false
+      status: VERIFIED
+      source: w1a s10
+      check: Unknown-size rule is conditional on LHD_LARGE. Without LARGE, unknown = low == 0xFFFFFFFF. With LARGE, unknown only when both halves are 0xFFFFFFFF. Prototype rar_meta.rs:549
+        does not filter. Source arcread.cpp:320-339.
+      atlas: stored
+      atlas_where: ArchiveHead.unpacked (probe/archive.rs:75); archive_inner_files.size (archive/rar.rs:109-110); no 0xFFFFFFFF unknown-size filter (bug)
+    - name: file_host_os
+      where: '@hdr+15 byte: 0 MSDOS, 1 OS2, 2 WIN32, 3 UNIX, 4 MACOS, 5 BEOS (headers.hpp:99-100; BEOS treated as Unix at arcread.cpp:302)'
+      type: uint8
+      read_from: first_article
+      use: packer OS; attribute meaning
+      proves: tool
+      leak: true
+      status: VERIFIED
+      source: w8c i
+      check: Values confirmed. unrar also treats HOST_BEOS (5) as Unix (arcread.cpp:302). Prototype rar_meta.rs only treats 3 as Unix.
+      atlas: 'no'
+      atlas_where: not read
+    - name: file_crc32
+      where: '@hdr+16 uint32: CRC32 of unpacked file'
+      type: uint32
+      read_from: first_article
+      use: content fingerprint (unsplit)
+      proves: twin
+      leak: false
+      status: VERIFIED
+      source: w1a s10
+      atlas: stored
+      atlas_where: ArchiveHead.crc32 (probe/archive.rs:76, first file only); listing file4 never reads @16
+    - name: dos_time
+      where: '@hdr+20 uint32: time low (h<<11|m<<5|s/2), date high; local clock, 2 s'
+      type: uint32
+      read_from: first_article
+      use: local clock, no zone
+      proves: same_uploader
+      leak: true
+      status: VERIFIED
+      source: w1a s10; w5c s1.1
+      atlas: 'no'
+      atlas_where: not read
+    - name: unp_ver
+      where: '@hdr+24 byte: 15, 20 or 29'
+      type: uint8
+      read_from: first_article
+      use: minimum RAR version to extract
+      proves: tool
+      leak: true
+      status: VERIFIED
+      source: w1a s10
+      atlas: 'no'
+      atlas_where: not read
+    - name: method
+      where: '@hdr+25 byte: 0x30 store, 0x31-0x35 compressed'
+      type: uint8
+      read_from: first_article
+      use: 'store: inner media readable'
+      proves: tool
+      leak: true
+      status: VERIFIED
+      source: w5b s2
+      atlas: stored
+      atlas_where: ArchiveHead.method m0..m5 (probe/archive.rs:77-78); listing does not read
+    - name: name_size
+      where: '@hdr+26 uint16'
+      type: uint16
+      read_from: first_article
+      use: length of name field
+      proves: none
+      leak: false
+      status: VERIFIED
+      source: w1a s10
+      atlas: parsed
+      atlas_where: probe/archive.rs:79; archive/rar.rs:92 (used to slice name)
+    - name: file_attr
+      where: '@hdr+28 uint32: Windows attrs; host 3: high 16 bits = st_mode'
+      type: uint32
+      read_from: first_article
+      use: dir, symlink (0xA000), Unix mode
+      proves: tool
+      leak: true
+      status: VERIFIED
+      source: w1a s10; w5c s6.2
+      atlas: 'no'
+      atlas_where: not read
+    - name: high_sizes
+      where: 'if LHD_LARGE: high pack uint32 @+32, then high unp uint32'
+      type: uint32
+      read_from: first_article
+      use: 64-bit sizes over 4 GiB
+      proves: none
+      leak: false
+      status: VERIFIED
+      source: w1a s10
+      atlas: stored
+      atlas_where: high pack word (probe/archive.rs:74); high unp word (probe/archive.rs:75; archive/rar.rs:93-94, 109)
+    - name: file_name
+      where: 'name_size bytes: ASCII; with LHD_UNICODE an encoded stream after NUL; backslash separator'
+      type: bytes
+      read_from: first_article
+      use: file path
+      proves: none
+      leak: false
+      status: VERIFIED
+      source: w2c s2
+      atlas: stored
+      atlas_where: 'probe: ASCII half only (probe/archive.rs:79-83); listing name4/unicode4 (archive/rar.rs:115-173) -> archive_inner_files.name'
+    - name: unicode_name_codes
+      where: '2-bit selectors: 0 plain byte, 1 high-byte fill, 2 word pair, 3 copy run'
+      type: derived
+      read_from: first_article
+      use: decode Unicode name
+      proves: none
+      leak: false
+      status: VERIFIED
+      source: w2c s2
+      atlas: stored
+      atlas_where: decoded in archive/rar.rs:126-173 -> archive_inner_files.name
+    - name: file_salt
+      where: '8 bytes after name if LHD_SALT (0x400): per-file -p salt'
+      type: bytes8
+      read_from: first_article
+      use: per-file key salt; no check value
+      proves: twin
+      leak: false
+      status: VERIFIED
+      source: w7b s2.2
+      atlas: 'no'
+      atlas_where: not read
+    - name: exttime
+      where: 'after name and optional salt: uint16 LE flags; nibbles: mtime = bits 12-15, ctime = 8-11, atime = 4-7, arctime = 0-3. Per nibble: 0x8 present, 0x4 add 1 s, low 2 bits =
+        count of remainder bytes. ctime and atime first read a uint32 LE DOS time, then count remainder bytes. mtime uses the FILE header DOS time and no DOS word. arctime consumes nothing
+        (arcread.cpp:392-423)'
+      type: record
+      read_from: first_article
+      use: sub-second precision; build fingerprint
+      proves: tool
+      leak: true
+      status: VERIFIED
+      source: w2c s3; w8c a
+      check: 'Layout incomplete. ctime and atime each carry a uint32 DOS time before their remainder bytes. mtime uses the FILE header DOS time. The arctime nibble consumes no bytes.
+        Prototype rar_meta.rs:373 reads a DOS time plus remainder for arctime too: wrong. Source arcread.cpp:392-423.'
+      atlas: 'no'
+      atlas_where: not read (prototype rar_meta.rs:364 only)
+    - name: exttime_remainder
+      where: 0-3 bytes per time (count from the nibble). They form the high end of a 24-bit LE value at shift (J+3-count)*8 (count=1 fills bits 16-23). Unit 100 ns (arcread.cpp:415-423)
+      type: uint24
+      read_from: first_article
+      use: sub-second offset
+      proves: tool
+      leak: true
+      status: VERIFIED
+      source: w8c a
+      check: 'Remainder bytes fill the high end of the 24-bit value, not the low end: shift = (J+3-count)*8. Unit is 100 ns. Source arcread.cpp:415-423.'
+      atlas: 'no'
+      atlas_where: not read
+    - name: file_flags
+      where: '@hdr+3 uint16: 0x1 SPLIT_BEFORE, 0x2 SPLIT_AFTER, 0x4 PASSWORD, 0x8 COMMENT, 0x10 SOLID, 0xE0 window/dir mask, 0x100 LARGE, 0x200 UNICODE, 0x400 SALT, 0x800 VERSION, 0x1000
+        EXTTIME, 0x2000 (no unrar define: UNVERIFIED), 0x8000 LONG_BLOCK. 0x4000 = SKIP_IF_UNKNOWN (headers.hpp:67)'
+      type: uint16
+      read_from: first_article
+      use: split chain, encryption, solid, naming
+      proves: tool
+      leak: true
+      status: VERIFIED
+      source: w5b s2
+      check: Bit 0x2000 "EXTFLAGS" is not defined in unrar (headers.hpp:39-68). 0x4000 is SKIP_IF_UNKNOWN (headers.hpp:67). Marked UNVERIFIED for 0x2000.
+      atlas: parsed
+      atlas_where: head_flags bit 0x04 -> encrypted (archive/rar.rs:104-107, stored); 0x02 -> continues (probe/archive.rs:85, serde-skip); 0x8000 used to skip (archive/rar.rs:65-71);
+        other bits not read
+    - name: file_dict_window
+      where: 'flags 0xE0: dict = 64 KiB << (value>>5); 0xE0 = directory'
+      type: derived
+      read_from: first_article
+      use: -md dictionary setting
+      proves: tool
+      leak: true
+      status: VERIFIED
+      source: w5b s2; w1a s10
+      atlas: 'no'
+      atlas_where: not read
+    - name: file_is_directory
+      where: (flags & 0xE0) == 0xE0; or (unp_ver < 20 and file_attr & 0x10) (arcread.cpp:286-288)
+      type: derived
+      read_from: first_article
+      use: directory detection
+      proves: none
+      leak: false
+      status: VERIFIED
+      source: w5b s2
+      check: 'Missing the RAR 1.5 rule: UnpVer < 20 and attr & 0x10 is a directory. Source arcread.cpp:286-288. Prototype rar_meta.rs:552 also misses it.'
+      atlas: 'no'
+      atlas_where: not stored; archive/rar.rs has no RAR4 dir check
+    - name: solid_dependency
+      where: solid member needs its predecessors decoded first
+      type: derived
+      read_from: full
+      use: later files unreachable from first article
+      proves: none
+      leak: false
+      status: VERIFIED
+      source: w1a s10
+      atlas: 'no'
+      atlas_where: not read
+    newsub_service:
+    - name: sub_name
+      where: 'NEWSUB name in file layout: CMT, QO, ACL, STM, UOW, AV, RR, EA2'
+      type: utf8
+      read_from: first_article or last_article
+      use: selects service decoder
+      proves: none
+      leak: false
+      status: VERIFIED
+      source: w3c s2.2
+      atlas: 'no'
+      atlas_where: NEWSUB skipped by ADD_SIZE (archive/rar.rs:65-71)
+    - name: sub_data
+      where: SubData = HEAD_SIZE - NAME_SIZE - 32 (minus 8 if salt) bytes after name
+      type: bytes
+      read_from: first_article or last_article
+      use: service-specific payload
+      proves: tool
+      leak: true
+      status: VERIFIED
+      source: w3c s2.2
+      atlas: 'no'
+      atlas_where: skipped (archive/rar.rs:65-71)
+    - name: sub_stm
+      where: 'STM: stream name + UnpSize + StreamCRC in SubData (Zone.Identifier)'
+      type: record
+      read_from: last_article
+      use: NTFS stream name and body (MOTW)
+      proves: alt
+      leak: true
+      status: VERIFIED
+      source: w8c d; w1a
+      atlas: 'no'
+      atlas_where: skipped
+    - name: sub_uow
+      where: 'UOW: owner name (256), group name (256), uid, gid'
+      type: record
+      read_from: first_article
+      use: Unix owner leak
+      proves: same_uploader
+      leak: true
+      status: VERIFIED
+      source: w5c s3.3
+      atlas: 'no'
+      atlas_where: skipped
+    - name: sub_acl_qo_av_layouts
+      where: ACL (SD payload), QO and AV subheader payloads
+      type: record
+      read_from: last_article
+      use: ACL owner; QO list; -qo leak
+      proves: same_uploader
+      leak: true
+      status: UNVERIFIED
+      source: w5c s3.2; w3c s2.2
+      atlas: 'no'
+      atlas_where: skipped
+    protect_block:
+    - name: protect_data_size
+      where: 'PROTECT 0x78: uint32 @+7 = recovery bytes after header (skip)'
+      type: uint32
+      read_from: last_article
+      use: recovery record size
+      proves: tool
+      leak: true
+      status: VERIFIED
+      source: w3c s2.1
+      atlas: 'no'
+      atlas_where: PROTECT skipped by ADD_SIZE (archive/rar.rs:65-71)
+    - name: protect_version
+      where: '@+11 byte: RR format version'
+      type: uint8
+      read_from: last_article
+      use: RR format
+      proves: tool
+      leak: true
+      status: VERIFIED
+      source: w3c s2.1
+      atlas: 'no'
+      atlas_where: skipped
+    - name: protect_sectors_total
+      where: '@+12 uint16 RecSectors; @+14 uint32 TotalBlocks'
+      type: uint16
+      read_from: last_article
+      use: recovery sectors and protected blocks
+      proves: tool
+      leak: true
+      status: VERIFIED
+      source: w3c s2.1
+      atlas: 'no'
+      atlas_where: skipped; recovery percent not stored
+    - name: protect_mark
+      where: '@+18 8 bytes Mark (read at arcread.cpp:472, not compared)'
+      type: bytes8
+      read_from: last_article
+      use: identifies PROTECT block
+      proves: none
+      leak: false
+      status: UNVERIFIED
+      source: w3c s2.1; w8c b
+      check: unrar reads 8 bytes into Mark and does not compare them (arcread.cpp:466-473). The literal "Protect!" is not in the copies.
+      atlas: 'no'
+      atlas_where: skipped
+    - name: protect_percent
+      where: RecSectors / TotalBlocks (formula not in unrar copies; prototype rr_percent_estimate only)
+      type: derived
+      read_from: last_article
+      use: -rr percentage
+      proves: tool
+      leak: true
+      status: UNVERIFIED
+      source: w8c b
+      check: Formula not in unrar copies; only the prototype estimate (rar_meta.rs:~465-470). Stays UNVERIFIED.
+      atlas: 'no'
+      atlas_where: not computed
+    comment_old:
+    - name: old_cmt_block
+      where: 'CMT 0x75: uint16 UnpSize @7, UnpVer @9, Method @10, CRC16 @11 (header 13 bytes; arcread.cpp:459-463)'
+      type: record
+      read_from: first_article
+      use: legacy RAR 2.x comment
+      proves: same_uploader
+      leak: true
+      status: VERIFIED
+      source: w3c s2.3
+      check: 'Confirmed: UnpSize u16 @7, UnpVer @9, Method @10, CRC16 @11 (arcread.cpp:459-463).'
+      atlas: 'no'
+      atlas_where: not read
+    end_of_archive:
+    - name: endarc_flags
+      where: '@hdr+3 uint16: 0x1 NEXT_VOLUME, 0x2 DATACRC, 0x4 REVSPACE, 0x8 VOLNUMBER'
+      type: uint16
+      read_from: last_article
+      use: next-part test
+      proves: none
+      leak: false
+      status: VERIFIED
+      source: w1a s12
+      atlas: parsed
+      atlas_where: archive/rar.rs:60-63 sets complete=true (steps.rs:129); flags and volume number dropped
+    - name: endarc_crc_volnum
+      where: 'if flag 0x0002 (DATACRC): uint32 LE at @hdr+7. If flag 0x0008 (VOLNUMBER): uint16 LE at @hdr+7 (+4 if DATACRC present) (arcread.cpp:447-456)'
+      type: uint32
+      read_from: last_article
+      use: whole-volume CRC; part number
+      proves: twin
+      leak: false
+      status: VERIFIED
+      source: w1a s12
+      check: 'Layout wrong in YAML and in prototype. DATACRC (uint32) comes first, then VOLNUMBER (uint16), both LE, at fixed offsets. Prototype rar_meta.rs ENDARC arm (line 483) reads
+        u32 at @+7 gated on 0x8 only: wrong when 0x2 is set. Source arcread.cpp:447-456.'
+      atlas: 'no'
+      atlas_where: not read
+    encryption_hp:
+    - name: hp_block_salt
+      where: 8 clear bytes before each encrypted block (-hp)
+      type: bytes8
+      read_from: first_article
+      use: per-block KDF salt; cannot link volumes
+      proves: none
+      leak: false
+      status: VERIFIED
+      source: w7b s2.2
+      atlas: 'no'
+      atlas_where: not read
+    - name: hp_kdf
+      where: SHA-1 over UTF-16LE password + 8-byte salt, 262144 rounds (0x40000, crypt3.cpp:32-46); AES-128 key and IV from digest (crypt3.cpp:46)
+      type: derived
+      read_from: first_article
+      use: password test cost about 4-20 ms
+      proves: none
+      leak: false
+      status: VERIFIED
+      source: w7b s2.3; w8c g
+      check: 'Confirmed: HashRounds = 0x40000 (262144), SHA-1 over password and salt (crypt3.cpp:32-46).'
+      atlas: 'no'
+      atlas_where: not implemented in Atlas copy; encryption presence stored as archive_release.encryption=1 (archive/mod.rs:129; steps.rs:142-152)
+    - name: hp_kdf_rar29_variant
+      where: sha1_process_rar29 vs standard SHA-1 difference
+      type: derived
+      read_from: first_article
+      use: exact KDF body
+      proves: none
+      leak: false
+      status: UNVERIFIED
+      source: w8c g
+      atlas: 'no'
+      atlas_where: not implemented
+    - name: hp_password_test
+      where: decrypt first block, check HEAD_CRC (GetCRC15); no check value stored
+      type: derived
+      read_from: first_article
+      use: password test
+      proves: none
+      leak: false
+      status: VERIFIED
+      source: w7b s2.4
+      atlas: 'no'
+      atlas_where: not implemented; password state stored only (store.rs:70)
+  partial_decode:
+    codec: RAR 2.9 LZ and PPMd (rar29); RAR 1.5 and 2.0 separate
+    crate: rars 0.12.3 codec::rar29 Unpack29
+    result: about 1:1 prefix at 1 MiB granularity; RAR 2.0 eager read (needs patch); solid members need predecessors
+  rust:
+    parse: hand-written (proto/rar_meta.rs)
+    decode: rars 0.12.3 codec::rar29 direct
+    crypto: sha1 (rar29 KDF) + aes-128 cbc
+rev:
+  detect:
+    magic: 52 61 72 21 1A 52 65 76
+    offset: 0
+    note: 'RAR3 new-style has no magic: trailer at EOF'
+  structures:
+    rev:
+    - name: rev5_signature
+      where: 'bytes 0..7: 52 61 72 21 1A 52 65 76 ("Rar!" 1A "Rev") (recvol.hpp:4-5)'
+      type: bytes8
+      read_from: separate_file
+      use: identify RAR5 recovery volume
+      proves: none
+      leak: false
+      status: VERIFIED
+      source: w8c c
+      check: 'Confirmed: REV5_SIGN "Rar!\x1aRev", 8 bytes (w8c recvol.hpp:4-5).'
+      atlas: 'no'
+      atlas_where: w9a does not cover .rev files; no .rev parser in the Atlas src/ copy
+    - name: rev5_header
+      where: 'file offset 0: 8-byte signature (recvol.hpp:4-5). @8 uint32 LE block CRC32 over @12..end of body. @12 uint32 LE header size (must be 6..0x100000). @16 body; body byte 0
+        = version (must be 1) (recvol5.cpp:444-472)'
+      type: record
+      read_from: separate_file
+      use: trust header from head of .rev
+      proves: none
+      leak: false
+      status: VERIFIED
+      source: w3c s3.2; w8c c
+      check: Offsets were missing. Confirmed from recvol5.cpp:444-472. Signature (8 bytes) at 0; CRC at 8; header size at 12; body at 16. CRC covers the size field and body.
+      atlas: 'no'
+      atlas_where: w9a does not cover .rev files; no .rev parser in the Atlas src/ copy
+    - name: rev5_counts_recnum
+      where: 'body (file @16): byte version = 1 (@16), uint16 LE DataCount (@17), uint16 LE RecCount (@19), uint16 LE RecNum (@21, must be < DataCount+RecCount) (recvol5.cpp:462-478)'
+      type: uint16
+      read_from: separate_file
+      use: data and recovery volume counts
+      proves: none
+      leak: false
+      status: VERIFIED
+      source: w3c s3.2
+      check: Field offsets added. Version byte sits before the counts (recvol5.cpp:462-478).
+      atlas: 'no'
+      atlas_where: w9a does not cover .rev files; no .rev parser in the Atlas src/ copy
+    - name: rev5_rev_crc
+      where: 'uint32 LE at file @23: CRC32 of the whole .rev file (checked by unrar via CalcFileSum: recvol5.cpp:264-266, 527-529)'
+      type: uint32
+      read_from: separate_file
+      use: integrity of rev file
+      proves: none
+      leak: false
+      status: VERIFIED
+      source: w3c s3.2
+      check: Offset added. Compared to CalcFileSum of the whole .rev file (recvol5.cpp:264-266, 527-529).
+      atlas: 'no'
+      atlas_where: w9a does not cover .rev files; no .rev parser in the Atlas src/ copy
+    - name: rev5_data_volume_table
+      where: 'first rev file only, file @27: DataCount entries of uint64 LE size + uint32 LE CRC32 (recvol5.cpp:483-493)'
+      type: record
+      read_from: separate_file
+      use: whole-volume CRC of every .rar without download
+      proves: twin
+      leak: false
+      status: VERIFIED
+      source: w3c s3.2
+      check: Offset added. Table exists only in the first rev file, after RevCRC (file @27). Source recvol5.cpp:483-493.
+      atlas: 'no'
+      atlas_where: w9a does not cover .rev files; no .rev parser in the Atlas src/ copy
+    - name: rev3_new_trailer
+      where: 'last 7 bytes of file: 3 ordinal bytes + CRC32 LE over the rest (7-byte read at EOF: recvol3.cpp:178-184,454-455; layout not checked)'
+      type: record
+      read_from: last_article
+      use: RAR3 .rev identity and check
+      proves: none
+      leak: false
+      status: UNVERIFIED
+      source: w3c s3.1
+      check: Only the 7-byte EOF read is confirmed (recvol3.cpp:178-184, 454-455). The 3-ordinal and CRC layout was not checked here.
+      atlas: 'no'
+      atlas_where: w9a does not cover .rev files; no .rev parser in the Atlas src/ copy
+    - name: rev3_old_naming
+      where: name.arc_N_N.rev (no trailer) vs name.rev (new style)
+      type: derived
+      read_from: separate_file
+      use: old vs new RR naming
+      proves: tool
+      leak: true
+      status: VERIFIED
+      source: w3c s3.1
+      atlas: 'no'
+      atlas_where: w9a does not cover .rev files; no .rev parser in the Atlas src/ copy
+    - name: rev_percent_derived
+      where: RecCount / DataCount as recovery percent
+      type: derived
+      read_from: separate_file
+      use: RR percentage
+      proves: tool
+      leak: true
+      status: UNVERIFIED
+      source: w3c s3.3
+      atlas: 'no'
+      atlas_where: w9a does not cover .rev files; no .rev parser in the Atlas src/ copy
+  partial_decode:
+    codec: none
+    crate: none
+    result: not applicable
+  rust:
+    parse: hand-written (rev5 header; rev3 trailer)
+    decode: none
+    crypto: crc32fast

@@ -1,0 +1,43 @@
+items (largest file >=100MB payloads): 44623
+  Microsoft - Xbox 360             N=  3954  with companion file(s): 0.000
+  Nintendo - GameCube              N=  2237  with companion file(s): 0.000
+  Nintendo - Wii                   N=  3817  with companion file(s): 0.000
+  Sony - PlayStation 2             N= 13313  with companion file(s): 0.000
+  Sony - PlayStation 3             N=  5682  with companion file(s): 0.000
+  Sony - PlayStation Portable      N=  4029  with companion file(s): 0.000
+  Sony - PlayStation               N= 11591  with companion file(s): 0.000
+
+distinct images N=36215; distinct sizes=22910; images sharing exact U with another distinct image: 0.441
+top shared sizes: [(4699979776, 3590), (1459978240, 1985), (7838695424, 1554), (7835492352, 923), (8738846720, 782), (7834892288, 325)]
+pairs with identical U (irreducible for any size-only key): 10441608 p_identU=1.59e-02
+
+REAL  ngPost auto V                            N= 36215 false pairs= 2133868 p=3.25e-03 (-log2 p=8.3 bits) H=12.85b
+REAL  ngPost auto V (unique-U only)            N= 20243 false pairs=       0 p=0.00e+00 (-log2 p=inf bits) H=14.31b
+LOGU  ngPost auto V                            N= 36215 false pairs=       5 p=7.62e-09 (-log2 p=27.0 bits) H=15.14b
+REAL+-1MB jitter ngPost auto V                 N= 36215 false pairs=      81 p=1.24e-07 (-log2 p=22.9 bits) H=15.14b
+REAL  V=50MB fixed                             N= 36215 false pairs= 2130573 p=3.25e-03 (-log2 p=8.3 bits) H=12.85b
+REAL  V=50MB fixed (unique-U only)             N= 20243 false pairs=       1 p=4.88e-09 (-log2 p=27.6 bits) H=14.31b
+LOGU  V=50MB fixed                             N= 36215 false pairs=       7 p=1.07e-08 (-log2 p=26.5 bits) H=15.14b
+REAL+-1MB jitter V=50MB fixed                  N= 36215 false pairs=      76 p=1.16e-07 (-log2 p=23.0 bits) H=15.14b
+REAL  V=100MiB fixed                           N= 36215 false pairs= 2145298 p=3.27e-03 (-log2 p=8.3 bits) H=12.85b
+REAL  V=100MiB fixed (unique-U only)           N= 20243 false pairs=       2 p=9.76e-09 (-log2 p=26.6 bits) H=14.30b
+LOGU  V=100MiB fixed                           N= 36215 false pairs=       3 p=4.57e-09 (-log2 p=27.7 bits) H=15.14b
+REAL+-1MB jitter V=100MiB fixed                N= 36215 false pairs=      83 p=1.27e-07 (-log2 p=22.9 bits) H=15.14b
+REAL  V=42MiB fixed                            N= 36215 false pairs= 2142975 p=3.27e-03 (-log2 p=8.3 bits) H=12.85b
+REAL  V=42MiB fixed (unique-U only)            N= 20243 false pairs=       0 p=0.00e+00 (-log2 p=inf bits) H=14.31b
+LOGU  V=42MiB fixed                            N= 36215 false pairs=       4 p=6.10e-09 (-log2 p=27.3 bits) H=15.14b
+REAL+-1MB jitter V=42MiB fixed                 N= 36215 false pairs=      79 p=1.20e-07 (-log2 p=23.0 bits) H=15.14b
+
+distinct images with companion file(s): 0/36215 = 0.000
+
+(no real companions in libretro DATs: one rom per game) -> modeled companion sizes:
+REAL key + modeled nfo size (1-20KB), ngPost V N= 36215 false pairs=     134 p=2.04e-07 (-log2 p=22.2 bits) H=15.14b
+REAL key + modeled sample size (5-80MB), ngPost V N= 36215 false pairs=       0 p=0.00e+00 (-log2 p=inf bits) H=15.14b
+
+Microsoft - Xbox 360           shareU=0.998  ngPost V                                       N=  3591 false pairs=  411904 p=6.39e-02 (-log2 p=4.0 bits) H=4.19b
+Nintendo - GameCube            shareU=1.000  ngPost V                                       N=  1982 false pairs=  401748 p=2.05e-01 (-log2 p=2.3 bits) H=2.38b
+Nintendo - Wii                 shareU=1.000  ngPost V                                       N=  3637 false pairs= 1321208 p=2.00e-01 (-log2 p=2.3 bits) H=2.48b
+Sony - PlayStation             shareU=0.158  ngPost V                                       N=  8480 false pairs=     175 p=4.87e-06 (-log2 p=17.6 bits) H=13.01b
+Sony - PlayStation 2           shareU=0.264  ngPost V                                       N= 10797 false pairs=    7204 p=1.24e-04 (-log2 p=13.0 bits) H=13.08b
+Sony - PlayStation 3           shareU=0.281  ngPost V                                       N=  4436 false pairs=     353 p=3.59e-05 (-log2 p=14.8 bits) H=12.01b
+Sony - PlayStation Portable    shareU=0.286  ngPost V                                       N=  3292 false pairs=     583 p=1.08e-04 (-log2 p=13.2 bits) H=11.52b

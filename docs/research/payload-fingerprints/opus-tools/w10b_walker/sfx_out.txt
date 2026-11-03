@@ -1,0 +1,10 @@
+  RAR5 sig_off=128000 main_flags=0x0 vol=None locator=Some((Some(0), None)) end=true more_vols=Some(false) hdr_enc=false trunc=false bad_hdr_crc=0
+  ENTRY SVC name="CMT" unp=20 pack=20 crc=95a5ea86 os=1 ver=0 meth=0 dict=0 solid=false dir=false sb=false sa=false unpver=0 enc=false
+  ENTRY FILE name="stest1.txt" unp=2048 pack=55 crc=c5b7e6a2 os=1 ver=0 meth=3 dict=0 solid=false dir=false sb=false sa=false unpver=0 enc=false
+  ENTRY FILE name="stest2.txt" unp=2048 pack=2048 crc=c5b7e6a2 os=1 ver=0 meth=0 dict=0 solid=false dir=false sb=false sa=false unpver=0 enc=false
+  RAR4 sig_off=728000 main_flags=0x0 vol=None locator=None end=true more_vols=Some(false) hdr_enc=false trunc=false bad_hdr_crc=0
+  ENTRY FILE name="stest1.txt" unp=2048 pack=90 crc=c5b7e6a2 os=3 ver=0 meth=53 dict=0 solid=false dir=false sb=false sa=false unpver=29 enc=false
+  ENTRY FILE name="stest2.txt" unp=2048 pack=2048 crc=c5b7e6a2 os=3 ver=0 meth=48 dict=0 solid=false dir=false sb=false sa=false unpver=20 enc=false
+  RAR4 sig_off=0 main_flags=0x0 vol=None locator=None end=true more_vols=Some(false) hdr_enc=false trunc=false bad_hdr_crc=0
+  ENTRY FILE name="????????.txt" unp=2 pack=2 crc=6751fc53 os=2 ver=0 meth=48 dict=0 solid=false dir=false sb=false sa=false unpver=29 enc=false
+  ENTRY FILE name="?????????.txt" unp=2 pack=2 crc=6751fc53 os=2 ver=0 meth=48 dict=0 solid=false dir=false sb=false sa=false unpver=29 enc=false

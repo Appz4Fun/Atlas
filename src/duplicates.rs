@@ -550,7 +550,15 @@ mod tests {
     }
 
     fn par2(size: u64, md5: u8) -> Par2File {
-        Par2File { set_id: [0; 16], file_id: [0; 16], md5: [md5; 16], md5_16k: [0; 16], size, name: "x".into() }
+        Par2File {
+            set_id: [0; 16],
+            file_id: [0; 16],
+            md5: [md5; 16],
+            md5_16k: [0; 16],
+            size,
+            name: "x".into(),
+            bound: true,
+        }
     }
 
     #[test]

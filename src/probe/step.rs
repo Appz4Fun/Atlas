@@ -12,8 +12,8 @@ use crate::release_info;
 use crate::store::{FileInfo, SegmentPick};
 
 use super::{
-    ProbeInfo, SET_PROBE, agent_of, derive, imdb_ids, keep_headers, media, moviehash, nfo_text, parse_sfv, xref_groups,
-    yenc,
+    DROP_COVER, ProbeInfo, SET_COVER, SET_PROBE, agent_of, derive, imdb_ids, keep_headers, media, moviehash, nest,
+    nfo_text, parse_sfv, xref_groups, yenc,
 };
 
 pub const PROBE_STEP: StepId = StepId(4);
@@ -37,7 +37,7 @@ fn is_small_text(name: &str) -> bool {
 
 /// The file the probe's about: the one with the most parts, and of those, the first by name, soo a set of RAR
 /// volumes gives its first volume.
-fn main_file(files: &[FileInfo]) -> Option<&FileInfo> {
+pub(crate) fn main_file(files: &[FileInfo]) -> Option<&FileInfo> {
     let parts = |f: &FileInfo| f.expected.unwrap_or(f.parts_seen);
     let candidates: Vec<&FileInfo> =
         files.iter().filter(|f| !is_par2(&f.filename) && !is_small_text(&f.filename)).collect();
@@ -52,7 +52,7 @@ fn first_volume_key(name: &str) -> (u8, String) {
     (rank, lower)
 }
 
-fn fetch_raw(ctx: &mut StepCtx<'_>, message_id: &str, file: &str) -> Result<Got, StepError> {
+pub(super) fn fetch_raw(ctx: &mut StepCtx<'_>, message_id: &str, file: &str) -> Result<Got, StepError> {
     let wanted = BodyRequest {
         message_id: message_id.to_string(),
         file: file.to_string(),
@@ -94,9 +94,10 @@ impl Step for ProbeStep {
         Reruns { on_rename: false, on_growth: true }
     }
     /// What a probe reads, a bit per version, soo a release probed before a version gets probed again. Bit 1:
-    /// chapters, commentary, more than one article of a header, and the OpenSubtitles hash.
+    /// chapters, commentary, more than one article of a header, and the OpenSubtitles hash. Bit 2: archives inside
+    /// archives, followed down. Bit 4: attachments, cover art, when it was muxed, MaxCLL and MaxFALL.
     fn config_stamp(&self) -> u64 {
-        1
+        1 | 2 | 4
     }
     fn run(&self, ctx: &mut StepCtx<'_>) -> Result<Outcome, StepError> {
         let retry = |e: rusqlite::Error| StepError::Retry(e.to_string());
@@ -180,10 +181,15 @@ impl Step for ProbeStep {
             }
             derive(&mut info, wire_bytes, file.expected, last_lines.as_ref());
             let known_last = last_part(&info, last_lines.as_ref(), last_body);
-            info.moviehash = moviehash_of(ctx, file, &files, &front, &info, known_last)?;
+            info.moviehash = moviehash_of(ctx, file, &files, &front, &info, known_last.clone())?;
             // last, being the most it may read: a release's article budget goes to the checks above first
             if !front.is_empty() {
+                let before = info.layers.clone();
                 read_more_front(ctx, file, total, &mut front, &mut info)?;
+                // more of the front can show a bigger file than the one hashed
+                if info.layers != before {
+                    info.moviehash = moviehash_of(ctx, file, &files, &front, &info, known_last)?;
+                }
             }
         }
 
@@ -191,6 +197,14 @@ impl Step for ProbeStep {
         if empty {
             return Ok(Outcome { writes, ..Outcome::default() });
         }
+        // a look that finds no cover drops one an earlier look kept
+        let cover = info.media.as_mut().and_then(|m| m.cover.take());
+        writes.push(match cover.and_then(|c| super::keep_cover(&c.bytes).map(|sha256| (c.mime, sha256))) {
+            Some((mime, sha256)) => {
+                StepWrite::new(SET_COVER, vec![release_id.into(), mime.to_string().into(), sha256.into()])
+            }
+            None => StepWrite::new(DROP_COVER, vec![release_id.into()]),
+        });
         let crc = info.file_crc32.map(i64::from);
         let agent = agent_of(&info.headers).map(str::to_string);
         let hash = info.moviehash.clone();
@@ -232,7 +246,12 @@ fn read_more_front(
 }
 
 /// One part of a file, decoded, when it holds the file's bytes from `offset` (0 based) on.
-fn read_part(ctx: &mut StepCtx<'_>, file: &FileInfo, part: i64, offset: u64) -> Result<Option<Vec<u8>>, StepError> {
+pub(super) fn read_part(
+    ctx: &mut StepCtx<'_>,
+    file: &FileInfo,
+    part: i64,
+    offset: u64,
+) -> Result<Option<Vec<u8>>, StepError> {
     let segs = ctx.segments(file.id, &SegmentPick::Parts(vec![part])).map_err(|e| StepError::Retry(e.to_string()))?;
     let Some(seg) = segs.into_iter().next().filter(|s| s.part.is_none_or(|p| p == part)) else { return Ok(None) };
     let Got::Body(raw) = fetch_raw(ctx, &seg.message_id, &file.filename)? else { return Ok(None) };
@@ -297,6 +316,11 @@ fn moviehash_of(
     if info.media.is_none() {
         return Ok(None);
     }
+    // the walk follows the biggest file, which needn't be the first one the old way reads
+    let other_file = info.layers.first().is_some_and(|l| info.archive.as_ref().is_none_or(|a| a.name != l.name));
+    if info.layers.len() > 1 || other_file {
+        return chain_moviehash(ctx, file, files, front, info.segment_size, known_last);
+    }
     let Some(head) = &info.archive else {
         let Some(size) = info.yenc.as_ref().and_then(|y| y.file_size) else { return Ok(None) };
         if size < 2 * CHUNK {
@@ -350,15 +374,44 @@ fn moviehash_of(
     Ok(tail.and_then(|tail| moviehash::moviehash(size, inner_front, &tail)))
 }
 
-/// What the first bytes are. A stored file in an archive is read as itself.
-fn inspect(body: &[u8], info: &mut ProbeInfo) {
-    info.media = media::parse(body);
-    if let Some(head) = super::archive::parse(body) {
-        if let Some(inner) = head.stored_at.and_then(|at| body.get(at..)) {
-            info.media = media::parse(inner);
-        }
-        info.archive = Some(head);
+/// The hash of a video under more than one layer, or under a tar or the like: only when every layer is stored,
+/// soo the video's end is a known place in this one file, and the file is all there is.
+fn chain_moviehash(
+    ctx: &mut StepCtx<'_>,
+    file: &FileInfo,
+    files: &[FileInfo],
+    front: &[u8],
+    segment: Option<u64>,
+    known_last: Option<(i64, Vec<u8>)>,
+) -> Result<Option<String>, StepError> {
+    const CHUNK: u64 = moviehash::CHUNK as u64;
+    let nest = nest::unwrap(front);
+    let (Some(at), Some(last)) = (nest.outer_at, nest.layers.last()) else { return Ok(None) };
+    if nest.layers.iter().any(|l| !l.stored || l.continues || l.stop.is_some()) {
+        return Ok(None);
     }
+    let Some(size) = last.unpacked.filter(|s| *s >= 2 * CHUNK) else { return Ok(None) };
+    // the volumes after this one would hold the end: not followed yet
+    if moviehash::last_volume(&file.filename, files).is_some_and(|v| v.id != file.id) {
+        return Ok(None);
+    }
+    let end = at as u64 + size;
+    let tail = match usize::try_from(end).ok().and_then(|e| front.get(e - moviehash::CHUNK..e)) {
+        Some(tail) => Some(tail.to_vec()),
+        None => match segment {
+            Some(segment) => file_range(ctx, file, segment, end - CHUNK, end, known_last.as_ref())?,
+            None => None,
+        },
+    };
+    Ok(tail.and_then(|tail| moviehash::moviehash(size, front.get(at..)?, &tail)))
+}
+
+/// What the first bytes are. A file in an archive, or in an archive in that, and soo on down, is read as itself.
+fn inspect(body: &[u8], info: &mut ProbeInfo) {
+    info.archive = super::archive::parse(body);
+    let nest = nest::unwrap(body);
+    info.media = media::parse(&nest.inner);
+    info.layers = nest.layers;
 }
 
 #[cfg(test)]

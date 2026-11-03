@@ -1,0 +1,15 @@
+# Wave 3 B: upload-session shape (07:52-08:01Z; provider pages unreachable, tool facts from source)
+
+1. Nyuu ms timestamp in Message-ID; --date now = one value for the whole run; else (msgid ts - arrival) is a near-constant offset with slow drift (Kohno 2005 clock skew). XOVER. (4, high)
+2. Other leaks: GoPostStuff UnixNano; NewsUP sec+usec.rand@base36(time).newsup (one of several styles); ngPost From/Message-ID share signature, Subject = 32hex; postie full: Date random up to 6h back (always <= arrival). (3, high)
+3. Files tile the timeline (ngPost README "sequentially one by one", 2 articles buffered per connection; Nyuu series). Overlap at each boundary ~N x S s (N connections, S s per article); constant rate. (4, high mechanism / medium practice)
+4. Equal RAR volumes -> identical part counts and last-part sizes (50 MiB / 716800 = 74 parts, last 102,400 B). Last-article :bytes is a cross-group key. Article sizes: Nyuu/ngPost 716800, postie 750000, NewsUP 768000. (3, high)
+5. File order: ngPost sorts QDir::Name -> x.par2 (index) -> part01..NN.rar -> x.volA+B.par2; Nyuu = command-line order; postie 2 files at once (postPipelineDepth=2) + wait_for_par2; ParPar --slice-dist pow2 -> recovery vols double in size at the session end. (3, high)
+6. No tool pipelines POSTs (POST/340/article/240). Nyuu queue min(round(N/2)+2, 25); ngPost refills per dequeue. Reorder width in part-number vs article-number ~2N -> estimates N. Needs part numbers (BODY head). (4, medium)
+7. Retries: ngPost 441 -> up to 5 retries same connection, new UUID; Nyuu post-check reposts at 5 s / 30 s with new ID unless keepMessageId: late stragglers of finished files. (4, medium)
+8. Throttles: Nyuu throttleRate, postie throttle_rate -> strictly periodic arrivals; ISP per-thread caps (KPN community thread). Flat bytes/s, one autocorrelation peak. (3, medium)
+
+Methods for N and throughput: time maps (Watson IEEE BigData 2015, doi 10.1109/BIGDATA.2015.7363824); radar pulse deinterleaving (sequential/cumulative difference histograms, aj.tubitak.gov.tr elk-26-3-8-1710-169); superposed renewal process estimation (Bernoulli 27(4) BEJ1331); Katabi shared-bottleneck entropy (dspace.mit.edu 1721.1/149295); DeepCorr (arXiv 1808.07285); Little's law: rate ~ N x size / S.
+
+Shape vector per candidate cluster (+-2 min across groups): [tool_class, msgid_ts_offset_median, offset_drift_ppm, bytes_per_s median+IQR, est_N (p95 reorder width), S, part_size_mode, tail_size_set, parts_per_file_mode, file_boundary_overlap_s, file_order_pattern, straggler_rate, periodicity_peak]. Link: same tool_class + part_size_mode, at least one hard key (shared ms ts or @sig, same tail size, clean file chain), rest scored by Mahalanobis distance. Streaming: per-group ring buffer (arrival, artnum, bytes, msgid_ts), robust line fit of offset vs time.
+Next: canary sessions with ngPost/Nyuu at N=4/20/50 to measure reorder width, rate stability, boundary overlap; server-side headers (Path ingest host, Highwinds X-Trace DXC= is encrypted, hashcat thread 6281); more poster Message-ID formats.

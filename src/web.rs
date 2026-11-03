@@ -3,7 +3,7 @@
 //! The api key never reaches a page. Signing in with it sets a cookie derived from it,
 //! and the server does the searching and the NZB downloads itself.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use std::sync::LazyLock;
 
@@ -13,6 +13,7 @@ use crate::api::{ApiResponse, escape, find_releases, get_nzb, parse_query};
 use crate::archive::Password;
 use crate::category::{TABLE, UNCATEGORIZED, label, parse_filter};
 use crate::field_search::{self, Fields};
+use crate::gemini;
 use crate::media::query::MediaAttrs;
 use crate::media::title::Kind;
 use crate::search::{ReleaseRow, get_release};
@@ -61,18 +62,31 @@ pub fn get(path: &str, query: &str, cookies: Option<&str>, base: &str, api_key: 
         "/ui/duplicates" if signed_in => duplicates_page(&args),
         "/ui/details" if signed_in => details_panel(&args),
         "/ui/poster" if signed_in => poster(&args),
+        "/ui/cover" if signed_in => cover(&args),
+        "/ui/still" if signed_in => still(&args),
+        "/ui/meta" if signed_in => crate::web_meta::fragment(&args),
+        "/ui/row" if signed_in => crate::web_meta::row_panel(&args),
+        "/ui/settings" if signed_in => html(200, settings_page(None)),
         "/ui/nzb" if signed_in && args.get("fill").is_some_and(|v| v == "1") => filled_nzb(&args),
         "/ui/nzb" if signed_in => get_nzb(&args),
-        "/ui/details" | "/ui/poster" => {
+        "/ui/details" | "/ui/poster" | "/ui/cover" | "/ui/still" | "/ui/meta" | "/ui/row" => {
             ApiResponse { headers: vec![("HX-Redirect".into(), "/".into())], ..html(401, String::new()) }
         }
-        "/ui/nzb" | "/ui/release" | "/ui/duplicates" => redirect(Vec::new()),
+        "/ui/nzb" | "/ui/release" | "/ui/duplicates" | "/ui/settings" => redirect(Vec::new()),
         _ => return None,
     })
 }
 
-/// A POST the ui answers. None: not ours.
-pub fn post(path: &str, body: &str, base: &str, api_key: &str) -> Option<ApiResponse> {
+/// A POST the ui answers. None: not ours. `htmx`: htmx sent it, and swaps in what comes back.
+pub fn post(
+    path: &str,
+    body: &str,
+    cookies: Option<&str>,
+    htmx: bool,
+    base: &str,
+    api_key: &str,
+) -> Option<ApiResponse> {
+    let signed_in = signed_in(cookies, api_key);
     match path {
         "/login" => {
             let args = parse_query(body);
@@ -85,13 +99,19 @@ pub fn post(path: &str, body: &str, base: &str, api_key: &str) -> Option<ApiResp
             })
         }
         "/logout" => Some(redirect(vec![cookie_header("", 0)])),
+        "/ui/ask" if signed_in => Some(ask(body, htmx)),
+        "/ui/settings" if signed_in => Some(save_settings(body)),
+        "/ui/ask" if htmx => {
+            Some(ApiResponse { headers: vec![("HX-Redirect".into(), "/".into())], ..html(401, String::new()) })
+        }
+        "/ui/ask" | "/ui/settings" => Some(redirect(Vec::new())),
         _ => None,
     }
 }
 
 /// The ui reads a request body only on these paths.
 pub fn takes_post(path: &str) -> bool {
-    matches!(path, "/login" | "/logout")
+    matches!(path, "/login" | "/logout" | "/ui/ask" | "/ui/settings")
 }
 
 fn cookie_header(value: &str, max_age: i64) -> (String, String) {
@@ -118,7 +138,7 @@ fn asset(content_type: &'static str, body: &str) -> ApiResponse {
     }
 }
 
-fn html(status: u16, body: String) -> ApiResponse {
+pub(crate) fn html(status: u16, body: String) -> ApiResponse {
     ApiResponse {
         status,
         content_type: Some("text/html; charset=utf-8"),
@@ -153,11 +173,11 @@ fn same(a: &str, b: &str) -> bool {
 }
 
 /// `escape`, and safe inside a quoted attribute too
-fn attr(s: &str) -> String {
+pub(crate) fn attr(s: &str) -> String {
     escape(s).replace('"', "&quot;").replace('\'', "&#39;")
 }
 
-fn url_encode(s: &str) -> String {
+pub(crate) fn url_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
@@ -510,8 +530,8 @@ impl Search {
                 if sort == SortBy::Size
                     && let Ok(conn) = crate::db::open()
                 {
-                    for r in found.iter_mut().filter(|r| !r.complete) {
-                        if let Ok(Some(post)) = release_info::split_post_with(&conn, r) {
+                    for r in found.iter_mut() {
+                        if let Ok(Some(post)) = release_info::whole_post_with(&conn, r) {
                             r.size = Some(post.size);
                         }
                     }
@@ -535,23 +555,33 @@ impl Search {
         let mut split = HashMap::new();
         let conn = crate::db::open().ok();
         let one_group = !self.fields.group.is_empty();
-        let post_of = |r: &ReleaseRow| {
-            if r.complete {
-                return None;
-            }
-            conn.as_ref().and_then(|conn| release_info::split_post_with(conn, r).ok().flatten())
+        let post_of =
+            |r: &ReleaseRow| conn.as_ref().and_then(|conn| release_info::whole_post_with(conn, r).ok().flatten());
+        // an upload linked by its PAR2 set is in one group, soo it stays one row whatever the search
+        let folded = |r: &ReleaseRow, post: &release_info::SplitPost| {
+            (!one_group || post.lead.is_some()) && post.listed_id() != r.id
         };
-        let folded = |r: &ReleaseRow, post: &release_info::SplitPost| !one_group && post.listed_id() != r.id;
-        found.retain_mut(|r| {
-            let Some(post) = post_of(r) else { return true };
-            if folded(r, &post) {
-                return false;
-            }
-            r.size = Some(post.size);
-            r.complete = post.complete;
-            split.insert(r.id, post.groups.len());
-            true
-        });
+        // a row folded into one that isn't on this page brings that one here in its place: a page of nothing but an
+        // upload's recovery rows would show none of it
+        let on_page: HashSet<i64> = found.iter().map(|r| r.id).collect();
+        let mut brought = HashSet::new();
+        found = std::mem::take(&mut found)
+            .into_iter()
+            .filter_map(|mut r| {
+                let Some(post) = post_of(&r) else { return Some(r) };
+                if folded(&r, &post) {
+                    let listed = post.listed_id();
+                    if on_page.contains(&listed) || !brought.insert(listed) {
+                        return None;
+                    }
+                    r = conn.as_ref().and_then(|conn| crate::search::get_release_with(conn, listed).ok().flatten())?;
+                }
+                r.size = Some(post.size);
+                r.complete = post.complete;
+                split.insert(r.id, post);
+                Some(r)
+            })
+            .collect();
         if hide_copies {
             // a copy of something on an earlier page is a copy too
             if !windowed && self.offset > 0 {
@@ -568,7 +598,10 @@ impl Search {
         let categories = crate::category::categories_of(&ids).unwrap_or_default();
         let passwords = crate::archive::store::passwords(&ids);
         let media = crate::media::query::attrs_of(&ids).unwrap_or_default();
+        // a post spread over several groups is all its rows together, whatever one of them holds
+        let single: Vec<i64> = ids.iter().copied().filter(|id| !split.contains_key(id)).collect();
         let extras = RowExtras {
+            recovery: release_info::recovery_only_of(&single),
             split,
             copies: crate::duplicates::counts(&ids).unwrap_or_default(),
             details: crate::media::details::kept_for(media.iter().map(|(id, m)| (*id, m.kind, &m.ids))),
@@ -682,17 +715,69 @@ impl Search {
 /// What a result shows beyond its own row.
 #[derive(Default)]
 struct RowExtras {
-    /// groups, for a post spread over several
-    split: HashMap<i64, usize>,
+    /// all of the post a row lists: spread over several groups, or linked by its PAR2 set
+    split: HashMap<i64, release_info::SplitPost>,
     copies: HashMap<i64, crate::duplicates::CopyCount>,
     details: HashMap<i64, crate::media::details::Details>,
+    /// rows with nothing but PAR2 data in them
+    recovery: HashMap<i64, release_info::RecoveryOnly>,
 }
 
 /// Columns of the results table.
-const COLUMNS: usize = 6;
+pub(crate) const COLUMNS: usize = 6;
 
-fn tag(class: &str, text: &str) -> String {
+pub(crate) fn tag(class: &str, text: &str) -> String {
     format!(" <span class=\"tag {class}\">{}</span>", escape(text))
+}
+
+/// What a row's size is, for its tooltip.
+fn size_note(size: Option<i64>, recovery: Option<&release_info::RecoveryOnly>) -> String {
+    let bytes = format!("{} bytes", thousands(size.unwrap_or(0)));
+    match recovery {
+        None => bytes,
+        Some(recovery) => match recovery.repairs_bytes() {
+            Some(whole) => {
+                format!("{bytes} of PAR2 recovery data only. The files it repairs are {}", fmt_size(Some(whole)))
+            }
+            None => format!("{bytes} of PAR2 recovery data only"),
+        },
+    }
+}
+
+/// Says a release is an upload's rows put back together.
+fn linked_tag(rows: usize) -> String {
+    let title = format!("{rows} files posted under random names, joined by their PAR2 set");
+    format!(" <span class=\"tag tag-ref\" title=\"{}\">LINKED</span>", attr(&title))
+}
+
+/// Why a PAR2-only row's download isn't the release it's named after.
+fn recovery_warning(recovery: &release_info::RecoveryOnly) -> String {
+    let files: Vec<&str> = recovery.repairs.iter().map(|(name, _)| name.as_str()).collect();
+    let body = match (recovery.repairs_bytes(), files.as_slice()) {
+        (Some(whole), [one]) => format!(
+            "Its NZB holds PAR2 recovery data only. The file it repairs, {one} ({}), was posted under another name, and Atlas hasn't linked the two yet.",
+            fmt_size(Some(whole))
+        ),
+        (Some(whole), _) => format!(
+            "Its NZB holds PAR2 recovery data only. The {} files it repairs ({}) were posted under other names, and Atlas hasn't linked them yet.",
+            files.len(),
+            fmt_size(Some(whole))
+        ),
+        (None, _) => "Its NZB holds PAR2 recovery data only. The files it repairs aren't in this release.".to_string(),
+    };
+    diag("caution", "this is not the whole release", &body)
+}
+
+/// Says a row is only PAR2 data, and what it repairs.
+fn recovery_tag(recovery: &release_info::RecoveryOnly) -> String {
+    let title = match recovery.repairs_bytes() {
+        Some(whole) => format!(
+            "Only PAR2 recovery data. The files it repairs ({}) were posted under other names",
+            fmt_size(Some(whole))
+        ),
+        None => "Only PAR2 recovery data".to_string(),
+    };
+    format!(" <span class=\"tag tag-warn\" title=\"{}\">PAR2 ONLY</span>", attr(&title))
 }
 
 fn password_tag(password: Option<&Password>) -> String {
@@ -766,7 +851,12 @@ fn row(
             d.kind, d.tmdb_id
         )
     });
-    if let Some(count) = extras.copies.get(&r.id) {
+    let recovery = extras.recovery.get(&r.id);
+    if let Some(recovery) = recovery {
+        tags.push_str(&recovery_tag(recovery));
+    }
+    // a recovery volume is no copy of the others of its set, whatever the set's list makes them look like
+    if let Some(count) = extras.copies.get(&r.id).filter(|_| recovery.is_none()) {
         if count.twins > 0 {
             tags.push_str(&tag("tag-ok", &format!("{} TWIN{}", count.twins, if count.twins == 1 { "" } else { "S" })));
         }
@@ -774,35 +864,41 @@ fn row(
             tags.push_str(&tag("tag-ref", &format!("{} ALT{}", count.alts, if count.alts == 1 { "" } else { "S" })));
         }
     }
-    if let Some(groups) = extras.split.get(&r.id) {
-        tags.push_str(&tag("tag-ref", &format!("{groups} GROUPS")));
+    if let Some(post) = extras.split.get(&r.id) {
+        if post.groups.len() > 1 {
+            tags.push_str(&tag("tag-ref", &format!("{} GROUPS", post.groups.len())));
+        }
+        if post.lead.is_some() {
+            tags.push_str(&linked_tag(post.ids.len()));
+        }
     }
     tags.push_str(&password_tag(passwords.get(&r.id)));
     if !r.complete {
         tags.push_str(&tag("tag-warn", "INCOMPLETE"));
     }
+    tags.push_str(&crate::web_meta::drawer_trigger(r.id));
     let meta = [category.as_str(), size.as_str(), posted.as_str()]
         .into_iter()
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>()
         .join(" · ");
     format!(
-        "<tr><td class=\"name\">{thumb}<a href=\"/ui/release?id={id}\">{name}</a>{tags}<div class=\"row-meta\">{meta}</div></td><td class=\"col-cat dim\">{category}</td><td class=\"num col-size\" title=\"{bytes} bytes\">{size}</td><td class=\"dim col-posted\">{posted}</td><td class=\"dim col-group\"><a class=\"quiet\" href=\"/?group={group_link}\">{group}</a></td><td><a class=\"button small primary\" href=\"/ui/nzb?id={id}\">NZB</a></td></tr>",
+        "<tr><td class=\"name\">{thumb}<a href=\"/ui/release?id={id}\">{name}</a>{tags}<div class=\"row-meta\">{meta}</div></td><td class=\"col-cat dim\">{category}</td><td class=\"num col-size\" title=\"{size_note}\">{size}</td><td class=\"dim col-posted\">{posted}</td><td class=\"dim col-group\"><a class=\"quiet\" href=\"/?group={group_link}\">{group}</a></td><td><a class=\"button small primary\" href=\"/ui/nzb?id={id}\">NZB</a></td></tr>",
         id = r.id,
         name = escape(&r.name),
         group = escape(&r.group_name),
         group_link = attr(&url_encode(&r.group_name)),
-        bytes = thousands(r.size.unwrap_or(0)),
+        size_note = attr(&size_note(r.size, recovery)),
     )
 }
 
 /// A link to search on a value, showing other words than the value.
-fn search_link_to(param: &str, value: &str, shown: &str) -> String {
+pub(crate) fn search_link_to(param: &str, value: &str, shown: &str) -> String {
     format!("<a href=\"/?{param}={}\">{}</a>", attr(&url_encode(value)), escape(shown))
 }
 
 /// 2684354560 as 2,684,354,560
-fn thousands(n: i64) -> String {
+pub(crate) fn thousands(n: i64) -> String {
     let digits = n.unsigned_abs().to_string();
     let mut out = String::new();
     for (i, c) in digits.chars().enumerate() {
@@ -847,14 +943,18 @@ fn results(args: &HashMap<String, String>) -> ApiResponse {
     if search.offset > 0 {
         return html(200, search.body());
     }
-    // the sidebar and the form follow the search too
+    first_page(&search, &ask_note("", " hx-swap-oob=\"true\""))
+}
+
+/// A new search's results, with the sidebar and the form following it. `more` goes in too, for out of band swaps.
+fn first_page(search: &Search, more: &str) -> ApiResponse {
     let oob = " hx-swap-oob=\"true\"";
     let body = format!(
-        "{}{}{}{}",
-        results_html(&search),
-        category_nav(&search, oob),
+        "{}{}{}{}{more}",
+        results_html(search),
+        category_nav(search, oob),
         category_input(&search.cat, oob),
-        scope_inputs(&search, oob),
+        scope_inputs(search, oob),
     );
     let mut resp = html(200, body);
     // the address bar follows the search, and reloads the full page
@@ -948,7 +1048,7 @@ fn page(title: &str, content: &str) -> String {
 
 fn masthead(signed_in: bool) -> String {
     let tools = if signed_in {
-        "<a class=\"button\" href=\"/ui/duplicates\">Duplicates</a><form method=\"post\" action=\"/logout\"><button class=\"button\">Sign out</button></form>"
+        "<a class=\"button\" href=\"/ui/duplicates\">Duplicates</a><a class=\"button\" href=\"/ui/settings\">Settings</a><form method=\"post\" action=\"/logout\"><button class=\"button\">Sign out</button></form>"
     } else {
         ""
     };
@@ -967,16 +1067,18 @@ fn search_page(args: &HashMap<String, String>, base: &str) -> String {
 <div class="layout"><aside class="sidebar"><details class="navigation" open><summary>Categories</summary>{nav}</details></aside>
 <main>
 <form id="search" class="searchbar" role="search" action="/" method="get" hx-get="/ui/results" hx-target="#results" hx-sync="this:replace" hx-indicator="#busy" hx-trigger="submit, input changed delay:300ms from:#q, change target:.scope-field">
-<div class="search-field"><input id="q" name="q" type="search" placeholder="Search releases" value="{q}" autocomplete="off" spellcheck="false" autofocus aria-label="Search releases"><kbd>/</kbd></div>
+<div class="search-field">{q}<kbd>/</kbd></div>
 {cat}<button class="button primary">Search</button><span id="busy" class="busy">searching…</span>
 {scope}</form>
+{ask}
 <div id="failure"></div>
 <div id="results">{results}</div>
 <footer class="footer">Newznab API: <code>{base}/api</code></footer>
 </main></div>"##,
             masthead = masthead(true),
             nav = category_nav(&search, ""),
-            q = attr(&search.q),
+            q = q_input(&search.q),
+            ask = ask_box(&gemini::load()),
             cat = category_input(&search.cat, ""),
             scope = scope_inputs(&search, ""),
             results = results_html(&search),
@@ -998,22 +1100,33 @@ fn release_page(args: &HashMap<String, String>) -> ApiResponse {
     };
     let ids = [id];
     let category = crate::category::categories_of(&ids).unwrap_or_default().get(&id).copied();
-    let inner = crate::archive::store::view(id);
+    let mut inner = crate::archive::store::view(id);
     let media = crate::media::query::attrs_of(&ids).unwrap_or_default().remove(&id);
     let names = release_info::names(id).unwrap_or_default();
     let mut contents = release_info::contents(id).unwrap_or_default();
     let mut release = release;
-    // a post spread over several groups is shown whole
-    if !release.complete
-        && let Ok(conn) = crate::db::open()
-        && let Ok(Some(post)) = release_info::split_post_with(&conn, &release)
+    let mut whole_post = false;
+    // a post spread over several groups, or linked by its PAR2 set, is shown whole
+    if let Ok(conn) = crate::db::open()
+        && let Ok(Some(post)) = release_info::whole_post_with(&conn, &release)
     {
         contents = release_info::contents_of_split(&conn, &post).unwrap_or(contents);
         release.size = Some(post.size);
         release.complete = post.complete;
         release.parts = Some(contents.articles_seen);
+        whole_post = true;
+        // a linked upload's file list is its set's, read from a volume
+        if inner.files.is_empty()
+            && let Some(listed) =
+                post.recovery.iter().map(|id| crate::archive::store::view(*id)).find(|v| !v.files.is_empty())
+        {
+            inner.files = listed.files;
+        }
     }
-    html(200, release_html(&release, category, &inner, media.as_ref(), names.as_ref(), &contents))
+    let recovery = (!whole_post)
+        .then(|| crate::db::open().ok().and_then(|conn| release_info::recovery_only_with(&conn, id).ok().flatten()))
+        .flatten();
+    html(200, release_html(&release, category, &inner, media.as_ref(), names.as_ref(), &contents, recovery.as_ref()))
 }
 
 fn release_problem(status: u16, level: &str, title: &str, body: &str) -> ApiResponse {
@@ -1032,11 +1145,15 @@ fn release_html(
     media: Option<&MediaAttrs>,
     names: Option<&release_info::Names>,
     contents: &release_info::Contents,
+    recovery: Option<&release_info::RecoveryOnly>,
 ) -> String {
     let category = category.unwrap_or(UNCATEGORIZED);
     let mut tags = String::new();
     if let Some(text) = media.and_then(media_label) {
         tags.push_str(&tag("tag-ref", &text));
+    }
+    if let Some(recovery) = recovery {
+        tags.push_str(&recovery_tag(recovery));
     }
     tags.push_str(&password_tag(inner.password.as_ref()));
     tags.push_str(&if r.complete { tag("tag-ok", "COMPLETE") } else { tag("tag-warn", "INCOMPLETE") });
@@ -1059,9 +1176,17 @@ fn release_html(
         fact("Title", search_link("q", &parsed.title));
     }
     if let Some(size) = r.size {
+        let repairs = recovery.map_or(String::new(), |recovery| match recovery.repairs_bytes() {
+            Some(whole) => format!(
+                "<br>PAR2 recovery data only. The files it repairs are {} · {} bytes",
+                escape(&fmt_size(Some(whole))),
+                thousands(whole)
+            ),
+            None => "<br>PAR2 recovery data only".to_string(),
+        });
         fact(
             "Size",
-            format!("{} · <a href=\"/?size={size}\">{} bytes</a>", escape(&fmt_size(r.size)), thousands(size)),
+            format!("{} · <a href=\"/?size={size}\">{} bytes</a>{repairs}", escape(&fmt_size(r.size)), thousands(size)),
         );
     }
     fact("Posted", escape(&fmt_date(r.posted_date.as_deref())));
@@ -1141,6 +1266,7 @@ fn release_html(
         fact("Links", links);
     }
 
+    let nzb_files = nzb_files_html(contents);
     let files = if inner.files.is_empty() {
         String::new()
     } else {
@@ -1155,19 +1281,30 @@ fn release_html(
                 )
             })
             .collect();
+        let heading = if recovery.is_some() { "Files its PAR2 set repairs" } else { "Files inside the archives" };
         format!(
-            "<h2>Files inside</h2><div class=\"table-wrap\"><table><thead><tr><th>Name</th><th class=\"num\">Size</th></tr></thead><tbody>{rows}</tbody></table></div>"
+            "<h2>{heading}</h2><div class=\"table-wrap\"><table><thead><tr><th>Name</th><th class=\"num\">Size</th></tr></thead><tbody>{rows}</tbody></table></div>"
         )
     };
 
-    let probe = crate::db::open()
-        .ok()
-        .and_then(|conn| {
-            let found = crate::probe::read(&conn, r.id)?;
-            let matched = crate::probe::opensubtitles::read(&conn, r.id);
-            Some(probe_html(&found, matched.as_ref()))
-        })
-        .unwrap_or_default();
+    // the probe row is decoded once: the panels below read the same one
+    let conn = crate::db::open().ok();
+    let stills =
+        conn.as_ref().map(|conn| stills_html(r.id, &crate::probe::stills::stills(conn, r.id))).unwrap_or_default();
+    let found = conn.as_ref().and_then(|c| crate::probe::read(c, r.id));
+    let probe = match (conn.as_ref(), found.as_ref()) {
+        (Some(c), Some(found)) => probe_html(
+            found,
+            crate::probe::opensubtitles::read(c, r.id).as_ref(),
+            crate::probe::has_cover(c, r.id).then_some(r.id),
+            crate::web_meta::salt_of(Some(c)),
+        ),
+        _ => String::new(),
+    };
+    let meta = crate::web_meta::meta_html(
+        conn.as_ref(),
+        &crate::web_meta::MetaInputs { release: r, inner, names, contents, probe: found.as_ref() },
+    );
     let copies = crate::duplicates::copies(r.id).unwrap_or_default();
     let has_twin = crate::duplicates::can_fill(&copies);
     let fill = if has_twin && contents.articles_seen < contents.articles_expected {
@@ -1178,7 +1315,9 @@ fn release_html(
     } else {
         String::new()
     };
-    let copies = copies_html(&copies);
+    // the other volumes of its set aren't copies of the release, whatever the set's list makes them look like
+    let copies = if recovery.is_some() { String::new() } else { copies_html(&copies) };
+    let warning = recovery.map_or(String::new(), recovery_warning);
 
     page(
         &format!("{} · Atlas", r.name),
@@ -1187,16 +1326,53 @@ fn release_html(
 <p class="path"><a href="/">atlas::releases</a>::<b>{id}</b></p>
 <h1>{name}</h1><p>{tags}</p>
 <div class="actions"><a class="button primary" href="/ui/nzb?id={id}">Download NZB</a>{fill}<a class="button" href="/?cat={category}">More in this category</a></div>
-<div id="title-details" hx-get="/ui/details?id={id}" hx-trigger="load" hx-swap="outerHTML"></div>
+{warning}<div id="title-details" hx-get="/ui/details?id={id}" hx-trigger="load" hx-swap="outerHTML"></div>
 <div class="panel"><dl class="facts">{facts}</dl></div>
+{stills}
 {copies}
+{meta}
 {probe}
+{nzb_files}
 {files}
 </main></div>"#,
             masthead = masthead(true),
             id = r.id,
             name = escape(&r.name),
         ),
+    )
+}
+
+/// The files the NZB lists, with how many of each one's articles were seen.
+fn nzb_files_html(contents: &release_info::Contents) -> String {
+    if contents.list.is_empty() {
+        return String::new();
+    }
+    let rows: String = contents
+        .list
+        .iter()
+        .map(|f| {
+            let state = if f.seen >= f.expected {
+                tag("tag-ok", "COMPLETE")
+            } else {
+                tag("tag-warn", &format!("{} MISSING", thousands(f.expected - f.seen)))
+            };
+            format!(
+                "<tr><td class=\"name\">{}</td><td class=\"num col-size\" title=\"{} bytes\">{}</td><td class=\"num\">{} / {}</td><td class=\"col-state\">{state}</td></tr>",
+                escape(&f.name),
+                f.bytes,
+                escape(&fmt_size(Some(f.bytes))),
+                thousands(f.seen),
+                thousands(f.expected),
+            )
+        })
+        .collect();
+    let more = if (contents.files as usize) > contents.list.len() {
+        format!("<p class=\"note\">The first {} of {} files.</p>", contents.list.len(), thousands(contents.files))
+    } else {
+        String::new()
+    };
+    format!(
+        "<h2>Files in the NZB</h2><div class=\"table-wrap\"><table><thead><tr><th>Name</th><th class=\"num col-size\">Posted size</th><th class=\"num\">Articles</th><th class=\"col-state\">State</th></tr></thead><tbody>{rows}</tbody></table></div>{more}"
     )
 }
 
@@ -1224,7 +1400,7 @@ fn filled_nzb(args: &HashMap<String, String>) -> ApiResponse {
     }
 }
 
-fn verdict(ok: Option<bool>, good: &str, bad: &str) -> String {
+pub(crate) fn verdict(ok: Option<bool>, good: &str, bad: &str) -> String {
     match ok {
         Some(true) => tag("tag-ok", good),
         Some(false) => tag("tag-bad", bad),
@@ -1232,7 +1408,7 @@ fn verdict(ok: Option<bool>, good: &str, bad: &str) -> String {
     }
 }
 
-fn panel(title: &str, facts: &str) -> String {
+pub(crate) fn panel(title: &str, facts: &str) -> String {
     if facts.is_empty() {
         return String::new();
     }
@@ -1240,7 +1416,12 @@ fn panel(title: &str, facts: &str) -> String {
 }
 
 /// What reading a release's articles found, without downloading it.
-fn probe_html(p: &crate::probe::ProbeInfo, matched: Option<&crate::probe::opensubtitles::Stored>) -> String {
+fn probe_html(
+    p: &crate::probe::ProbeInfo,
+    matched: Option<&crate::probe::opensubtitles::Stored>,
+    cover: Option<i64>,
+    salt: Option<i64>,
+) -> String {
     let dd = |out: &mut String, name: &str, value: String| {
         if !value.is_empty() {
             let _ = write!(out, "<dt>{name}</dt><dd>{value}</dd>");
@@ -1293,7 +1474,8 @@ fn probe_html(p: &crate::probe::ProbeInfo, matched: Option<&crate::probe::opensu
     }
     for (name, value) in &p.headers {
         if !matches!(name.as_str(), "User-Agent" | "X-Newsreader" | "X-Newsposter" | "Xref") {
-            dd(&mut posted, &escape(name), escape(value));
+            // the posting account, host and IP are shown as salted keys, as the Headers fold-out shows them
+            dd(&mut posted, &escape(name), crate::web_meta::redact_header(name, value, salt));
         }
     }
     if !p.crossposted_to.is_empty() {
@@ -1323,6 +1505,9 @@ fn probe_html(p: &crate::probe::ProbeInfo, matched: Option<&crate::probe::opensu
         }
         dd(&mut packed, "File CRC32", a.crc32.map_or(String::new(), |c| format!("{c:08x}")));
     }
+    if p.layers.len() > 1 || (p.archive.is_none() && !p.layers.is_empty()) {
+        dd(&mut packed, "Layers", nested_chain(&p.layers));
+    }
 
     let mut tracks = String::new();
     if let Some(m) = &p.media {
@@ -1330,6 +1515,13 @@ fn probe_html(p: &crate::probe::ProbeInfo, matched: Option<&crate::probe::opensu
         dd(&mut tracks, "Written by", m.writing_app.as_deref().map_or(String::new(), escape));
         dd(&mut tracks, "Muxed by", m.muxing_app.as_deref().map_or(String::new(), escape));
         dd(&mut tracks, "Title", m.title.as_deref().map_or(String::new(), escape));
+        dd(
+            &mut tracks,
+            "Muxed",
+            m.muxed_at
+                .and_then(|t| chrono::DateTime::from_timestamp(t, 0))
+                .map_or(String::new(), |t| t.format("%Y-%m-%d %H:%M UTC").to_string()),
+        );
         dd(
             &mut tracks,
             "Duration",
@@ -1342,6 +1534,9 @@ fn probe_html(p: &crate::probe::ProbeInfo, matched: Option<&crate::probe::opensu
             let mut parts = vec![v.codec.clone()];
             if let (Some(w), Some(h)) = (v.width, v.height) {
                 parts.push(format!("{w}×{h}"));
+                if let Some(aspect) = display_aspect(w, h, v.display_width, v.display_height) {
+                    parts.push(aspect);
+                }
             }
             if let Some(rate) = v.frame_rate {
                 parts.push(format!("{rate:.3} fps"));
@@ -1350,13 +1545,21 @@ fn probe_html(p: &crate::probe::ProbeInfo, matched: Option<&crate::probe::opensu
                 parts.push(format!("{depth}-bit"));
             }
             parts.extend(v.hdr.clone());
+            parts.extend(v.primaries.and_then(primaries_name).map(str::to_string));
+            if v.hdr.is_none() {
+                parts.extend(v.transfer.and_then(transfer_name).map(str::to_string));
+            }
             if let Some(profile) = v.dv_profile {
+                let level = v.dv_level.filter(|l| *l > 0).map_or(String::new(), |l| format!(" level {l}"));
                 let layer = match v.dv_enhancement_layer {
                     Some(true) => ", enhancement layer",
                     _ => "",
                 };
-                parts.push(format!("Dolby Vision profile {profile}{layer}"));
+                parts.push(format!("Dolby Vision profile {profile}{level}{layer}"));
             }
+            parts.extend(v.max_cll.filter(|n| *n > 0).map(|n| format!("MaxCLL {n} nits")));
+            parts.extend(v.max_fall.filter(|n| *n > 0).map(|n| format!("MaxFALL {n} nits")));
+            parts.extend(v.language.clone().filter(|l| l != "und"));
             dd(&mut tracks, "Video", escape(&parts.join(", ")));
         }
         for a in &m.audio {
@@ -1419,6 +1622,31 @@ fn probe_html(p: &crate::probe::ProbeInfo, matched: Option<&crate::probe::opensu
         }
     }
 
+    let attachments = p.media.as_ref().map_or(String::new(), |m| {
+        if m.attachments.is_empty() {
+            return String::new();
+        }
+        let rows: String = m
+            .attachments
+            .iter()
+            .map(|a| {
+                format!(
+                    "<tr><td class=\"name\">{}</td><td class=\"dim\">{}</td><td class=\"num\">{}</td></tr>",
+                    escape(&a.name),
+                    escape(a.description.as_deref().or(a.mime.as_deref()).unwrap_or("")),
+                    fmt_size(Some(a.size as i64))
+                )
+            })
+            .collect();
+        format!(
+            "<h2>Attachments</h2><div class=\"table-wrap\"><table><thead><tr><th>Name</th><th>Type</th><th class=\"num\">Size</th></tr></thead><tbody>{rows}</tbody></table></div>"
+        )
+    });
+    let cover = cover.map_or(String::new(), |id| {
+        format!(
+            "<h2>Cover art</h2><div class=\"panel cover-panel\"><a href=\"/ui/cover?id={id}\"><img class=\"cover\" src=\"/ui/cover?id={id}\" alt=\"Cover art attached to the video\" loading=\"lazy\"></a></div>"
+        )
+    });
     let imdb: Vec<String> = p
         .imdb_ids
         .iter()
@@ -1440,7 +1668,7 @@ fn probe_html(p: &crate::probe::ProbeInfo, matched: Option<&crate::probe::opensu
         format!("<h2>SFV</h2><div class=\"table-wrap\"><table><tbody>{rows}</tbody></table></div>")
     };
     format!(
-        "{}{}{}{}{}{nfo}{sfv}",
+        "{cover}{}{}{attachments}{}{}{}{nfo}{sfv}",
         panel("Tracks", &tracks),
         panel("Chapters", &chapters),
         panel("yEnc", &yenc),
@@ -1538,14 +1766,22 @@ fn copy_card(conn: &rusqlite::Connection, badge: &str, r: &ReleaseRow) -> String
         )
     });
     format!(
-        "<article class=\"panel copy\">{thumb}<div class=\"copy-body\"><div class=\"copy-head\"><div class=\"name\"><a href=\"/ui/release?id={id}\">{name}</a>{tags}</div><a class=\"button small primary\" href=\"/ui/nzb?id={id}\">NZB</a></div><dl class=\"facts facts-wide\">{facts}</dl></div></article>",
+        "<article class=\"panel copy\">{thumb}<div class=\"copy-body\"><div class=\"copy-head\"><div class=\"name\"><a href=\"/ui/release?id={id}\">{name}</a>{tags}{more}</div><a class=\"button small primary\" href=\"/ui/nzb?id={id}\">NZB</a></div><dl class=\"facts facts-wide\">{facts}</dl></div></article>",
         id = r.id,
         name = escape(&r.name),
+        more = crate::web_meta::card_trigger(r.id, "closest .copy-body"),
     )
 }
 
+/// A copy past the first few: its name, badge and size, with the `+` that opens its drawer in place.
 fn copy_link(badge: &str, r: &ReleaseRow) -> String {
-    format!("<li><a href=\"/ui/release?id={}\">{}</a>{badge} {}</li>", r.id, escape(&r.name), escape(&fmt_size(r.size)))
+    format!(
+        "<li><a href=\"/ui/release?id={}\">{}</a>{badge} {}{}</li>",
+        r.id,
+        escape(&r.name),
+        escape(&fmt_size(r.size)),
+        crate::web_meta::card_trigger(r.id, "closest li")
+    )
 }
 
 /// Other postings of this release's content.
@@ -1711,6 +1947,54 @@ fn details_html(d: &crate::media::details::Details) -> String {
     )
 }
 
+/// Stills from the video, in order: each a link to the full size JPEG, with where in the film it's from.
+fn stills_html(id: i64, stills: &[(u8, Option<i64>, u32, u32)]) -> String {
+    if stills.is_empty() {
+        return String::new();
+    }
+    let figures: String = stills
+        .iter()
+        .map(|&(position, at_ms, width, height)| {
+            let src = format!("/ui/still?id={id}&amp;at={position}");
+            let when = at_ms.map_or(format!("{position}%"), |ms| format!("{position}% · {}", clock(ms)));
+            format!(
+                "<figure><a href=\"{src}\"><img src=\"{src}\" width=\"{width}\" height=\"{height}\" loading=\"lazy\" alt=\"Still at {when}\"></a><figcaption>{when}</figcaption></figure>"
+            )
+        })
+        .collect();
+    format!("<h2>Stills</h2><div class=\"stills\">{figures}</div>")
+}
+
+/// A time into the film as h:mm:ss, or m:ss under an hour.
+fn clock(ms: i64) -> String {
+    let secs = ms.max(0) / 1000;
+    let (h, m, s) = (secs / 3600, secs / 60 % 60, secs % 60);
+    if h > 0 { format!("{h}:{m:02}:{s:02}") } else { format!("{m}:{s:02}") }
+}
+
+/// One still's JPEG.
+fn still(args: &HashMap<String, String>) -> ApiResponse {
+    let number = |key: &str| args.get(key).and_then(|v| v.trim().parse::<i64>().ok()).unwrap_or(0);
+    let (id, at) = (number("id"), number("at"));
+    let found = u8::try_from(at)
+        .ok()
+        .and_then(|at| crate::db::open().ok().and_then(|conn| crate::probe::stills::still(&conn, id, at)));
+    let Some(bytes) = found else {
+        return ApiResponse::not_found();
+    };
+    ApiResponse {
+        status: 200,
+        content_type: Some("image/jpeg"),
+        body: String::new(),
+        headers: vec![
+            ("Cache-Control".into(), "private, max-age=86400".into()),
+            ("X-Content-Type-Options".into(), "nosniff".into()),
+        ],
+        bytes: Some(bytes),
+        failed: false,
+    }
+}
+
 fn poster(args: &HashMap<String, String>) -> ApiResponse {
     let number = |key: &str| args.get(key).and_then(|v| v.trim().parse::<i64>().ok()).unwrap_or(0);
     let cfg = crate::config::media_config();
@@ -1728,6 +2012,56 @@ fn poster(args: &HashMap<String, String>) -> ApiResponse {
         body: String::new(),
         headers: vec![
             ("Cache-Control".into(), "private, max-age=2592000".into()),
+            ("X-Content-Type-Options".into(), "nosniff".into()),
+        ],
+        bytes: Some(bytes),
+        failed: false,
+    }
+}
+
+/// The shape it's shown in, when that's not the shape it's stored in: anamorphic video.
+fn display_aspect(w: u64, h: u64, dw: Option<u64>, dh: Option<u64>) -> Option<String> {
+    let (dw, dh) = (dw?, dh.unwrap_or(h));
+    if dw == 0 || dh == 0 || dw * h == dh * w {
+        return None;
+    }
+    Some(format!("shown at {:.2}:1", dw as f64 / dh as f64))
+}
+
+/// ITU-T H.273 colour primaries, as Matroska stores them.
+fn primaries_name(code: u64) -> Option<&'static str> {
+    match code {
+        1 => Some("BT.709"),
+        5 | 6 => Some("BT.601"),
+        9 => Some("BT.2020"),
+        11 => Some("DCI-P3"),
+        12 => Some("Display P3"),
+        _ => None,
+    }
+}
+
+/// The transfer, when it isn't already named as HDR.
+fn transfer_name(code: u64) -> Option<&'static str> {
+    match code {
+        16 => Some("PQ"),
+        18 => Some("HLG"),
+        _ => None,
+    }
+}
+
+/// The cover art attached to a release's video.
+fn cover(args: &HashMap<String, String>) -> ApiResponse {
+    let id = args.get("id").and_then(|v| v.trim().parse::<i64>().ok()).unwrap_or(0);
+    let Some((mime, bytes)) = crate::db::open().ok().and_then(|conn| crate::probe::cover(&conn, id)) else {
+        return ApiResponse::not_found();
+    };
+    let content_type = if mime == "image/png" { "image/png" } else { "image/jpeg" };
+    ApiResponse {
+        status: 200,
+        content_type: Some(content_type),
+        body: String::new(),
+        headers: vec![
+            ("Cache-Control".into(), "private, max-age=86400".into()),
             ("X-Content-Type-Options".into(), "nosniff".into()),
         ],
         bytes: Some(bytes),
@@ -1808,6 +2142,207 @@ fn id_links(kind: i64, ids: &crate::media::resolve::Ids) -> String {
 }
 
 /// Also what someone pointing a browser at the bare address gets, soo it says how to set up a client.
+fn q_input(q: &str) -> String {
+    format!(
+        "<input id=\"q\" name=\"q\" type=\"search\" placeholder=\"Search releases\" value=\"{}\" autocomplete=\"off\" spellcheck=\"false\" autofocus aria-label=\"Search releases\">",
+        attr(q)
+    )
+}
+
+/// Where what Gemini made of a question goes: always on the page, soo a plain search can empty it.
+fn ask_note(content: &str, oob: &str) -> String {
+    format!("<div id=\"ask-note\" aria-live=\"polite\"{oob}>{content}</div>")
+}
+
+/// The plain words box, or where to turn it on.
+fn ask_box(settings: &gemini::Settings) -> String {
+    let note = ask_note("", "");
+    if !settings.has_key() {
+        return format!(
+            "<p class=\"ask-off\">Search in plain words with Gemini: <a href=\"/ui/settings\">add a key in Settings</a>.</p>{note}"
+        );
+    }
+    format!(
+        r##"<form id="ask" class="searchbar askbar" action="/ui/ask" method="post" hx-post="/ui/ask" hx-target="#results" hx-sync="#search:replace" hx-indicator="#asking" hx-disabled-elt="find button">
+<div class="search-field"><input id="ask-q" name="ask" type="search" maxlength="{max}" placeholder="Ask in plain words: 4K Dolby Vision remuxes of Dune, biggest first" autocomplete="off" aria-label="Ask in plain words"></div>
+<button class="button">Ask AI</button><span id="asking" class="busy">asking Gemini…</span></form>
+{note}"##,
+        max = gemini::MAX_QUESTION,
+    )
+}
+
+/// The search page's arguments for what Gemini read a question as, keeping only what the page knows.
+fn plan_args(plan: &gemini::Plan) -> HashMap<String, String> {
+    let mut args = HashMap::new();
+    let mut put = |k: &str, v: &str| {
+        if !v.is_empty() {
+            args.insert(k.to_string(), v.to_string());
+        }
+    };
+    put("q", &plan.q);
+    if category_name(&plan.cat).is_some() {
+        put("cat", &plan.cat);
+    }
+    put("filters", &plan.filters.join(","));
+    put("group", &plan.group);
+    put("poster", &plan.poster);
+    put("team", &plan.team);
+    if SortBy::from_word(&plan.sort).is_some() {
+        put("sort", &plan.sort);
+        put("dir", if plan.dir == "asc" { "asc" } else { "desc" });
+    }
+    args
+}
+
+/// "“dune” in Movies / UHD, 2160p and DV, biggest first": the search a question became, in words.
+fn described(search: &Search) -> String {
+    let mut what =
+        if search.q.is_empty() { "the newest releases".to_string() } else { format!("\u{201c}{}\u{201d}", search.q) };
+    if let Some(name) = category_name(&search.cat) {
+        what.push_str(&format!(" in {name}"));
+    }
+    let mut parts = vec![what];
+    if !search.filters.is_empty() {
+        parts.push(search.filters.join(", "));
+    }
+    for (name, value) in search.fields.chosen() {
+        parts.push(format!("{} {value}", name.to_lowercase()));
+    }
+    if let Some(by) = search.sort {
+        let way = match (by, search.descending) {
+            (SortBy::Posted, true) => "newest first".to_string(),
+            (SortBy::Posted, false) => "oldest first".to_string(),
+            (SortBy::Size, true) => "biggest first".to_string(),
+            (SortBy::Size, false) => "smallest first".to_string(),
+            (SortBy::Rating, true) => "best rated first".to_string(),
+            (by, true) => format!("by {}, Z to A", by.word()),
+            (by, false) => format!("by {}, A to Z", by.word()),
+        };
+        parts.push(way);
+    }
+    parts.join(", ")
+}
+
+/// Plain words to a search: Gemini reads them, the page searches with what it read.
+fn ask(body: &str, htmx: bool) -> ApiResponse {
+    let args = parse_query(body);
+    let question: String = args.get("ask").map_or("", |q| q.trim()).chars().take(gemini::MAX_QUESTION).collect();
+    let failed = |title: &str, why: &str| {
+        let mut resp = html(200, diag("caution", title, why));
+        resp.headers.push(("HX-Retarget".into(), "#ask-note".into()));
+        resp.headers.push(("HX-Reswap".into(), "innerHTML".into()));
+        resp
+    };
+    if question.is_empty() {
+        return failed("ask something first", "Type what you want in the Ask AI box, like 4K remuxes of Dune.");
+    }
+    let sorts: Vec<&str> = std::iter::once("relevance").chain(SortBy::ALL.iter().map(|(_, word)| *word)).collect();
+    let choices = gemini::Choices { filters: FILTERS, sorts: &sorts };
+    let settings = gemini::load();
+    let plan = match gemini::plan(&settings, &question, &choices) {
+        Ok(plan) => plan,
+        Err(why) => return failed("Gemini did not answer", &why),
+    };
+    let search = Search::from_args(&plan_args(&plan));
+    let query = search.query(&search.cat, 0);
+    if !htmx {
+        let to = if query.is_empty() { "/".to_string() } else { format!("/?{query}") };
+        return ApiResponse {
+            status: 303,
+            content_type: None,
+            body: String::new(),
+            headers: vec![("Location".into(), to)],
+            bytes: None,
+            failed: false,
+        };
+    }
+    let said = if plan.note.is_empty() { String::new() } else { format!(" {}", escape(&plan.note)) };
+    let note = format!(
+        "<div class=\"ask-read\" data-q=\"{}\"><p><span class=\"tag tag-ref\">GEMINI</span>{said}</p><p class=\"path\">Searched {}{}</p></div>",
+        attr(&search.q),
+        escape(&described(&search)),
+        if plan.model.is_empty() || plan.model == settings.model() {
+            String::new()
+        } else {
+            format!(". Answered by {}, as {} was busy", escape(&plan.model), escape(settings.model()))
+        },
+    );
+    // the search box takes the words from `data-q` (web.js): swapping the box would drop the form's listener on it
+    first_page(&search, &ask_note(&note, " hx-swap-oob=\"true\""))
+}
+
+fn settings_page(message: Option<(&str, &str, String)>) -> String {
+    let settings = gemini::load();
+    let masked = escape(&gemini::masked(&settings.api_key));
+    let status = if settings.from_env {
+        format!(
+            "Atlas uses the key in <code>GEMINI_API_KEY</code>, <code>{masked}</code>. A key saved here takes its place."
+        )
+    } else if settings.has_key() {
+        format!("A key is saved: <code>{masked}</code>. Paste another to replace it.")
+    } else {
+        "No key yet. Make one in <a href=\"https://aistudio.google.com/apikey\" target=\"_blank\" rel=\"noreferrer noopener\">Google AI Studio</a>, then paste it here.".to_string()
+    };
+    let forget = if settings.has_key() && !settings.from_env {
+        "<button class=\"button\" name=\"do\" value=\"forget\">Remove key</button>"
+    } else {
+        ""
+    };
+    let message = message.map_or(String::new(), |(level, title, body)| diag(level, title, &body));
+    page(
+        "Atlas settings",
+        &format!(
+            r#"{masthead}<main class="detail settings">
+<p class="path"><a href="/">Atlas</a> › Settings</p><h1>Settings</h1>{message}
+<section class="panel"><h2>Ask AI with Gemini</h2>
+<p>Ask AI, on the search page, sends what you type to Google's Gemini with the list of categories and filters, then searches with the fields Gemini sends back. Nothing from your index goes to Google.</p>
+<p>{status}</p>
+<form class="settings-form" method="post" action="/ui/settings">
+<label for="gemini-key">Gemini API key</label>
+<input id="gemini-key" name="key" type="password" autocomplete="off" spellcheck="false" placeholder="{placeholder}">
+<label for="gemini-model">Model</label>
+<input id="gemini-model" name="model" type="text" value="{model}" placeholder="{default}" autocomplete="off" spellcheck="false">
+<p class="hint">Leave it empty for <code>{default}</code>, which follows Google's newest Flash model.</p>
+<div class="actions"><button class="button primary" name="do" value="save">Save</button>{forget}</div>
+</form></section></main>"#,
+            masthead = masthead(true),
+            placeholder = if settings.has_key() { "Paste a new key to replace it" } else { "Paste your key" },
+            model = attr(&settings.model),
+            default = gemini::DEFAULT_MODEL,
+        ),
+    )
+}
+
+fn save_settings(body: &str) -> ApiResponse {
+    let args = parse_query(body);
+    let get = |k: &str| args.get(k).map_or("", |v| v.trim());
+    let message = if get("do") == "forget" {
+        match gemini::forget() {
+            Ok(()) => ("help", "the key is removed", "Ask AI is off until you add another.".to_string()),
+            Err(e) => ("caution", "could not remove the key", e.to_string()),
+        }
+    } else {
+        let (key, model) = (get("key"), get("model"));
+        if !key.is_empty() && !gemini::looks_like_key(key) {
+            ("caution", "that is not a Gemini key", "A key is one line of letters, digits, - and _.".to_string())
+        } else if !model.is_empty()
+            && let Err(why) = gemini::model_path(model)
+        {
+            ("caution", "that is not a model name", why)
+        } else {
+            match gemini::save(key, model) {
+                Err(e) => ("caution", "could not save", e.to_string()),
+                Ok(saved) if !saved.has_key() => ("note", "saved", "Paste a key to turn Ask AI on.".to_string()),
+                Ok(saved) => match gemini::check(&saved) {
+                    Ok(()) => ("help", "saved", format!("Gemini took the key, and knows {}.", saved.model())),
+                    Err(why) => ("caution", "saved, but Gemini did not take it", why),
+                },
+            }
+        }
+    };
+    html(200, settings_page(Some(message)))
+}
+
 fn login_page(base: &str, wrong_key: bool) -> String {
     let error = if wrong_key {
         diag("caution", "that is not the API key", "Check api_key in config.toml.")
@@ -1833,6 +2368,23 @@ fn login_page(base: &str, wrong_key: bool) -> String {
     )
 }
 
+/// Each layer an archive was followed down through, outermost first: `RAR5 m0 › 7z copy › movie.mkv`.
+fn nested_chain(layers: &[crate::probe::nest::Layer]) -> String {
+    let mut parts: Vec<String> = layers
+        .iter()
+        .map(|l| {
+            let method = l.method.as_deref().map(|m| format!(" {m}")).unwrap_or_default();
+            let stop =
+                l.stop.as_deref().map(|why| format!(" {}", tag("tag-bad", &why.to_uppercase()))).unwrap_or_default();
+            format!("{}{}{stop}", escape(&l.format), escape(&method))
+        })
+        .collect();
+    if let Some(name) = layers.last().filter(|l| l.stop.is_none()).and_then(|l| l.name.as_deref()) {
+        parts.push(escape(name));
+    }
+    parts.join(" › ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1849,21 +2401,30 @@ mod tests {
 
     #[test]
     fn signing_in_takes_the_key_and_the_cookie_is_not_the_key() {
-        let wrong = post("/login", "key=nope", "http://x", KEY).unwrap();
+        let wrong = post("/login", "key=nope", None, false, "http://x", KEY).unwrap();
         assert_eq!(wrong.status, 401);
         assert!(header(&wrong, "Set-Cookie").is_none());
         assert!(wrong.body.contains("not the API key"));
 
-        let right = post("/login", &format!("key={KEY}"), "http://x", KEY).unwrap();
+        let right = post("/login", &format!("key={KEY}"), None, false, "http://x", KEY).unwrap();
         assert_eq!(right.status, 303);
         assert_eq!(header(&right, "Location"), Some("/"));
         let set = header(&right, "Set-Cookie").unwrap();
         assert!(set.contains("HttpOnly") && set.contains("SameSite=Strict"), "{set}");
         assert!(!set.contains(KEY), "{set}");
 
-        let out = post("/logout", "", "http://x", KEY).unwrap();
+        let out = post("/logout", "", None, false, "http://x", KEY).unwrap();
         assert!(header(&out, "Set-Cookie").unwrap().contains("Max-Age=0"));
-        assert!(post("/api", "", "http://x", KEY).is_none());
+        assert!(post("/api", "", None, false, "http://x", KEY).is_none());
+    }
+
+    #[test]
+    fn stills_link_their_jpeg_and_say_where_they_are() {
+        assert_eq!(stills_html(7, &[]), "");
+        let html = stills_html(7, &[(25, Some(1_834_500), 960, 540), (50, None, 960, 540)]);
+        assert!(html.contains("<img src=\"/ui/still?id=7&amp;at=25\" width=\"960\" height=\"540\""), "{html}");
+        assert!(html.contains("<figcaption>25% · 30:34</figcaption>") && html.contains("<figcaption>50%</figcaption>"));
+        assert_eq!(clock(3_725_000), "1:02:05");
     }
 
     #[test]
@@ -1875,6 +2436,7 @@ mod tests {
             assert_eq!(header(&results, "HX-Redirect"), Some("/"));
             assert_eq!(get("/ui/details", "id=1", bad, "http://x", KEY).unwrap().status, 401, "{bad:?}");
             assert_eq!(get("/ui/poster", "kind=2&tmdb=1", bad, "http://x", KEY).unwrap().status, 401, "{bad:?}");
+            assert_eq!(get("/ui/still", "id=1&at=50", bad, "http://x", KEY).unwrap().status, 401, "{bad:?}");
             let nzb = get("/ui/nzb", "id=1", bad, "http://x", KEY).unwrap();
             assert_eq!(nzb.status, 303, "{bad:?}");
             assert_eq!(get("/ui/release", "id=1", bad, "http://x", KEY).unwrap().status, 303, "{bad:?}");
@@ -1930,6 +2492,70 @@ mod tests {
         assert!(html.contains("TV/HD") && html.contains("2.0 KB"), "{html}");
         assert!(html.contains("PASSWORD?") && html.contains("INCOMPLETE"), "{html}");
         assert!(html.contains("/ui/nzb?id=7") && html.contains("/ui/release?id=7"), "{html}");
+    }
+
+    #[test]
+    fn a_row_carries_the_drawer_trigger() {
+        let release = ReleaseRow {
+            id: 7,
+            name: "Some.Show.S01E01-GRP".into(),
+            group_name: "alt.binaries.g".into(),
+            poster: None,
+            posted_date: Some("2026-10-03 17:41:49".into()),
+            size: Some(2048),
+            complete: false,
+            parts: None,
+        };
+        let html = row(&release, &HashMap::new(), &HashMap::new(), &HashMap::new(), &RowExtras::default());
+        assert_eq!(html.matches("class=\"icon-button drawer-toggle\"").count(), 1, "{html}");
+        // after the tags, before the row's second line
+        let toggle = html.find("drawer-toggle").unwrap();
+        assert!(
+            html.find("INCOMPLETE").unwrap() < toggle && toggle < html.find("<div class=\"row-meta\">").unwrap(),
+            "{html}"
+        );
+        assert!(html.contains("hx-get=\"/ui/row?id=7\"") && html.contains("hx-target=\"closest tr\""), "{html}");
+        assert!(html.contains("<td class=\"num col-size\" title=\"2,048 bytes\">2.0 KB</td>"), "{html}");
+    }
+
+    #[test]
+    fn a_copy_carries_the_drawer_trigger_as_a_card() {
+        let release = ReleaseRow {
+            id: 7,
+            name: "Some.Show.S01E01-GRP".into(),
+            group_name: "alt.binaries.g".into(),
+            poster: Some("poster <p@example.com>".into()),
+            posted_date: Some("2026-10-03 17:41:49".into()),
+            size: Some(2048),
+            complete: true,
+            parts: None,
+        };
+        // a link opens its drawer inside its own list item
+        let link = copy_link(&tag("tag-ok", "TWIN"), &release);
+        assert!(
+            link.starts_with("<li><a href=\"/ui/release?id=7\">Some.Show.S01E01-GRP</a>") && link.ends_with("</li>")
+        );
+        assert_eq!(link.matches("drawer-toggle").count(), 1, "{link}");
+        assert!(
+            link.contains("hx-get=\"/ui/row?id=7&amp;as=card\"")
+                && link.contains("hx-target=\"closest li\"")
+                && link.contains("hx-swap=\"beforeend\""),
+            "{link}"
+        );
+        // a card opens it under its facts, inside the card's body
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        crate::db::create_db_at(&main).unwrap();
+        let conn = crate::db::open_with_shards(&main).unwrap();
+        let card = copy_card(&conn, &tag("tag-ok", "TWIN"), &release);
+        assert_eq!(card.matches("drawer-toggle").count(), 1, "{card}");
+        let toggle = card.find("drawer-toggle").unwrap();
+        assert!(card.find("TWIN").unwrap() < toggle && toggle < card.find("href=\"/ui/nzb?id=7\"").unwrap(), "{card}");
+        assert!(
+            card.contains("hx-get=\"/ui/row?id=7&amp;as=card\"") && card.contains("hx-target=\"closest .copy-body\""),
+            "{card}"
+        );
+        assert!(card.contains("<dt>Poster</dt>") && card.contains("<dt>Email</dt>"), "{card}");
     }
 
     #[test]

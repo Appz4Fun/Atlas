@@ -418,7 +418,22 @@ impl Step for ListStep {
                     if listing.files.is_empty() {
                         continue;
                     }
-                    return finish(ctx, SOURCE_PAR2, listing, &limits);
+                    let listed = listing.files.len();
+                    let mut outcome = finish(ctx, SOURCE_PAR2, listing, &limits)?;
+                    // finish counts files by name, and this one is PAR2 under another name: the set speaks for the
+                    // release only when the rest of its files are the set's. A recovery volume posted on its own, as a
+                    // fully obfuscated upload does, would otherwise claim the content of the files it repairs
+                    let data_files = files
+                        .iter()
+                        .filter(|f| f.id != head.file.id && !f.filename.to_ascii_lowercase().ends_with(".par2"))
+                        .count();
+                    if data_files != listed {
+                        let id = ctx.release().id;
+                        for write in outcome.writes.iter_mut().filter(|w| w.sql == duplicates::SET_CONTENT) {
+                            *write = StepWrite::new(duplicates::CLEAR_CONTENT, vec![id.into()]);
+                        }
+                    }
+                    return Ok(outcome);
                 }
                 // images: stop, with at most a prefix read
                 Format::Image => return Ok(Outcome::default()),

@@ -214,7 +214,8 @@ pub struct Outcome {
     pub rerun: StepMask,
     /// For later steps in the same run (their database writes are not visible yet).
     pub facts: Vec<(&'static str, String)>,
-    /// Not finished, nothing wrong: look again then. Uses no attempt, sets no bit.
+    /// Not finished, nothing wrong: look again then. Uses no attempt, sets no bit. Its `writes` are still applied,
+    /// soo a step can keep how far it got.
     pub wait_until: Option<i64>,
     /// Kept by the stage until the writer has answered for this outcome's batch,
     /// then dropped, on any path. So a step can hold something for exactly as

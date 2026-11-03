@@ -12,9 +12,15 @@ Stdlib only. Mirrors tests/common/mod.rs (the Rust mock the test suite uses).
 """
 import argparse
 import email.utils
+import hashlib
+import io
+import random
 import socketserver
 import struct
+import tarfile
 import time
+import zipfile
+import zlib
 
 GROUP = "alt.binaries.test"
 PASSWORD = "secret"
@@ -47,16 +53,86 @@ def par2_filedesc(name, size):
     return p
 
 
+def par2_packet(set_id, kind, body):
+    body += b"\0" * (-len(body) % 4)
+    return b"PAR2\0PKT" + struct.pack("<Q", 64 + len(body)) + b"\0" * 16 + set_id + kind + body
+
+
+def par2_set(files, block=65536):
+    """A whole PAR2 set's critical packets (Main, then a FileDesc per file) for (name, data) pairs."""
+    descs = []
+    for name, data in files:
+        md5, md5_16k = hashlib.md5(data).digest(), hashlib.md5(data[:16384]).digest()
+        file_id = hashlib.md5(md5_16k + struct.pack("<Q", len(data)) + name.encode()).digest()
+        descs.append((file_id, md5 + md5_16k + struct.pack("<Q", len(data)) + name.encode()))
+    main = struct.pack("<QI", block, len(descs)) + b"".join(sorted(f for f, _ in descs))
+    set_id = hashlib.md5(main).digest()
+    out = par2_packet(set_id, b"PAR 2.0\0Main\0\0\0\0", main)
+    for file_id, rest in descs:
+        out += par2_packet(set_id, b"PAR 2.0\0FileDesc", file_id + rest)
+    return out
+
+
+def yenc_part(name, data, part, total, size):
+    """One article of a file posted in parts: `data` is that part's bytes."""
+    lines = yenc(name, data)
+    lines[0] = f"=ybegin part={part} total={total} line=128 size={size} name={name}".encode()
+    begin = (part - 1) * len(data) + 1
+    lines.insert(1, f"=ypart begin={begin} end={begin + len(data) - 1}".encode())
+    return lines
+
+
+def nested_archive(name):
+    """A RAR5 (stored) holding a 7z (copy) holding a zip (deflate) holding a tar holding a Matroska file."""
+    rng = random.Random(5)
+    mkv = b"\x1a\x45\xdf\xa3\x9f\x42\x86\x81\x01\x42\xf7\x81\x01\x42\xf2\x81\x04\x42\xf3\x81\x08\x42\x82\x88matroska"
+    mkv += bytes(rng.getrandbits(8) for _ in range(20_000))
+    t = io.BytesIO()
+    with tarfile.open(fileobj=t, mode="w", format=tarfile.USTAR_FORMAT) as tf:
+        info = tarfile.TarInfo(f"{name}.mkv")
+        info.size = len(mkv)
+        tf.addfile(info, io.BytesIO(mkv))
+    z = io.BytesIO()
+    with zipfile.ZipFile(z, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(f"{name}.tar", t.getvalue())
+    packed, nxt = z.getvalue(), b"\0" * 8
+    start = struct.pack("<QQI", len(packed), len(nxt), zlib.crc32(nxt))
+    sz = b"7z\xbc\xaf\x27\x1c\x00\x04" + struct.pack("<I", zlib.crc32(start)) + start + packed + nxt
+
+    def vint(n):
+        out = bytearray()
+        while True:
+            b, n = n & 0x7F, n >> 7
+            out.append(b | (0x80 if n else 0))
+            if not n:
+                return bytes(out)
+
+    def block(ty, fields, data=None):
+        inner = vint(ty) + vint(2 if data is not None else 0) + (vint(len(data)) if data is not None else b"") + fields
+        body = vint(len(inner)) + inner
+        return struct.pack("<I", zlib.crc32(body)) + body + (data or b"")
+
+    fname = f"{name}.7z".encode()
+    fields = vint(0) + vint(len(sz)) + vint(0x20) + vint(0) + vint(0) + vint(len(fname)) + fname
+    return b"Rar!\x1a\x07\x01\x00" + block(1, vint(0)) + block(2, fields, sz) + block(5, vint(0))
+
+
 def build_posts():
-    # dated a few hours back so post-processing's settle time has passed
-    when = email.utils.formatdate(time.time() - 4 * 3600)
+    # dated a few hours back so post-processing's settle time has passed; GMT, as Nyuu writes it
+    posted = time.time() - 4 * 3600
+    when = email.utils.formatdate(posted, usegmt=True)
     posts = []
+
+    def nyuu_id(n):
+        # Nyuu's grammar: 24 letters in alternating case, a dash, the millisecond clock
+        letters = "".join(chr((65 if i % 2 == 0 else 97) + (n * 7 + i * 5) % 26) for i in range(24))
+        return f"<{letters}-{int(posted * 1000) + n * 1500}@nyuu>"
 
     def add(subject, body, author="poster <p@mock.example>", size=None):
         n = len(posts) + 1
         raw = sum(len(l) + 2 for l in body)
         posts.append(dict(n=n, subject=subject, author=author, date=when,
-                          msgid=f"<msg{n}@mock.example>", bytes=size or raw, body=body))
+                          msgid=nyuu_id(n), bytes=size or raw, body=body))
 
     # a movie: 2 rar volumes (2 articles each), an nfo and a par2 index
     movie = "Cool.Movie.2024.1080p.WEB-DL.DDP5.1.H.264-GRP"
@@ -84,6 +160,41 @@ def build_posts():
     add(f'[1/2] - "{obf}.part1.rar" yEnc (1/1)', yenc(f"{obf}.part1.rar", b"x" * 4000), size=2_000_000)
     add(f'[2/2] - "{obf}.par2" yEnc (1/1)',
         yenc(f"{obf}.par2", par2_filedesc("Hidden.Name.2022.2160p.UHD.BluRay.x265-HDR.mkv", 2_000_000)))
+
+    # a fully obfuscated upload: every file under its own random subject and poster, soo each is a release of its own.
+    # The PAR2 index and recovery volumes name it; the mkv itself has no name anywhere
+    rng = random.Random(7)
+    real = "Linked.Movie.2025.2160p.BluRay.x265-LINK"
+    part = 1_000_000
+    mkv = b"\x1a\x45\xdf\xa3" + bytes(rng.getrandbits(8) for _ in range(3 * part - 4))
+    packets = par2_set([(f"{real}.mkv", mkv)])
+
+    def random_name(n):
+        return "".join(rng.choice("abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ0123456789") for _ in range(n))
+
+    def random_poster():
+        return f"{random_name(9)} <{random_name(12)}@{random_name(8)}.example>"
+
+    hidden = random_name(24)
+    poster = random_poster()
+    for seg in (1, 2, 3):
+        add(f'"{hidden}" yEnc ({seg}/3)', yenc_part(hidden, mkv[(seg - 1) * part:seg * part], seg, 3, len(mkv)),
+            author=poster, size=1_032_000)
+    # three articles each, and over 1 MiB: smaller is never looked inside
+    for padding in (1_200_000, 2_400_000, 4_800_000):
+        name, author = random_name(20), random_poster()
+        volume = packets + b"\0" * padding
+        third = -(-len(volume) // 3)
+        for seg in (1, 2, 3):
+            add(f'"{name}" yEnc ({seg}/3)', yenc_part(name, volume[(seg - 1) * third:seg * third], seg, 3, len(volume)),
+                author=author, size=third + 600)
+
+    # archives inside archives: RAR5 > 7z > zip > tar > mkv
+    nest = "Nested.Movie.2021.1080p.BluRay.x264-NEST"
+    data = nested_archive(nest)
+    for seg in (1, 2, 3):
+        add(f'"{nest}.rar" yEnc ({seg}/3)', yenc(f"{nest}.rar", data), size=900_000,
+            author="nester <n@mock.example>")
     return posts
 
 
@@ -155,8 +266,13 @@ class Handler(socketserver.StreamRequestHandler):
                     continue
                 if verb == "ARTICLE":
                     self.send(f"220 0 {arg}")
-                    for h in (f"From: {p['author']}", f"Subject: {p['subject']}", f"Message-ID: {arg}",
-                              f"Newsgroups: {GROUP}", "User-Agent: Nyuu/0.4.2", ""):
+                    # the headers a provider adds on injection, so the release page has them to show
+                    for h in (f"Path: news.mock.example!feeder.mock.example!not-for-mail",
+                              f"From: {p['author']}", f"Subject: {p['subject']}", f"Message-ID: {arg}",
+                              f"Newsgroups: {GROUP}", f"Date: {p['date']}", f"Injection-Date: {p['date']}",
+                              'Injection-Info: news.mock.example; posting-account="u-1234"; '
+                              'posting-host="203.0.113.7"; logging-data="4242"; mail-complaints-to="abuse@mock.example"',
+                              "Organization: Mock Usenet", "User-Agent: Nyuu/0.4.2", ""):
                         self.send(h)
                 else:
                     self.send(f"222 0 {arg}")
