@@ -222,6 +222,48 @@ fn the_web_ui_end_to_end() {
     assert_eq!(locked.header("HX-Redirect").as_deref(), Some("/"));
     assert!(found.body.contains("drawer-toggle"), "{}", found.body);
 
+    // the timing facts come from the overview's dates, numbers and lines, kept at ingest
+    let timed = |part: i64, number: u64, date: &str| Article {
+        number,
+        date: date.into(),
+        lines: 4_000,
+        ..article("timed.bin", part, 3, &format!("<timed{part}@x>"))
+    };
+    store::save(
+        &main,
+        &[Release {
+            name: "Timed.Findword.2024-GRP".into(),
+            group: "alt.binaries.g1".into(),
+            size: 2_100_000,
+            complete: true,
+            articles: vec![
+                timed(1, 500, "2026-10-02 10:00:00"),
+                timed(2, 501, "2026-10-02 10:02:00"),
+                timed(3, 502, "2026-10-02 10:05:00"),
+            ],
+            ..Default::default()
+        }],
+    )
+    .unwrap();
+    let timed_id: i64 =
+        shard.query_row("select id from releases where name = 'Timed.Findword.2024-GRP'", [], |r| r.get(0)).unwrap();
+    let timed_page = fetch(port, &format!("/ui/release?id={timed_id}"), &cookie);
+    for fact in [
+        "<dt>First and last article</dt><dd>2026-10-02 10:00 to 2026-10-02 10:05 by the poster's clock, 5 min</dd>",
+        "<dt>Posting rate</dt><dd>0.6 articles a minute, 6.8 KB/s</dd>",
+        "<dt>Article numbers</dt><dd>500–502 where it was read, adjacent</dd>",
+        "<dt>Threaded replies</dt><dd>none</dd>",
+        "<dt>From variants</dt><dd>one From throughout</dd>",
+        "<dt>Lines per article</dt><dd>4,000 lines an article, 175 bytes a line</dd>",
+        "<dt>Late articles</dt><dd>none</dd>",
+        "<dt>Lines key</dt>",
+    ] {
+        assert!(timed_page.body.contains(fact), "{fact}\n{}", timed_page.body);
+    }
+    // the drawer keeps to its ten facts, and a release without rows says nothing about timing
+    assert!(!fetch(port, &format!("/ui/row?id={timed_id}"), &cookie).body.contains("First and last article"));
+    assert!(!release.body.contains("First and last article"), "{}", release.body);
+
     // one post spread over two groups: one row, whole, and an NZB with all of it
     let posted = |name: &str, group: &str, one: Article, date: &str| {
         let size = one.bytes;

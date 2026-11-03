@@ -97,6 +97,8 @@ pub struct Overview {
     pub references: String,
     pub bytes: i64,
     pub lines: i64,
+    /// the groups field 8 names when it is an `Xref:` line, which only a server with `Xref:full` sends
+    pub xref_groups: Option<u16>,
 }
 
 impl Overview {
@@ -110,6 +112,7 @@ impl Overview {
             references: self.references,
             bytes: self.bytes,
             lines: self.lines,
+            xref_groups: self.xref_groups,
             ..Default::default()
         }
     }
@@ -2723,7 +2726,19 @@ fn parse_overview(line: &[u8]) -> Option<Overview> {
         references: field(5),
         bytes: int(6),
         lines: int(7),
+        xref_groups: fields.get(8).and_then(|f| xref_groups(f)),
     })
+}
+
+/// The groups an overview's `Xref:` field names: `Xref: host group:number group:number`, the full-header form
+/// a server with `Xref:full` in its OVERVIEW.FMT sends. None when the field is something else, or missing.
+fn xref_groups(field: &str) -> Option<u16> {
+    let field = field.trim_start();
+    if field.len() < 5 || !field.as_bytes()[..5].eq_ignore_ascii_case(b"xref:") {
+        return None;
+    }
+    let groups = field[5..].split_whitespace().skip(1).filter(|t| t.contains(':')).count();
+    Some(groups.min(usize::from(u16::MAX)) as u16)
 }
 
 /// fnmatch-ish match supporting `*` and `?`
@@ -2743,9 +2758,10 @@ pub fn wildmatch(name: &str, pattern: &str) -> bool {
 /// Decode a yEnc article body. None when there is no `=ybegin` line.
 pub fn yenc_decode(lines: &[Vec<u8>]) -> Option<Vec<u8>> {
     let start = lines.iter().position(|l| l.starts_with(b"=ybegin "))?;
-    let mut out = Vec::new();
+    let body = &lines[start + 1..];
+    let mut payload = Vec::with_capacity(body.iter().map(|l| l.len() + 1).sum());
 
-    for line in &lines[start + 1..] {
+    for line in body {
         if line.starts_with(b"=ypart ") {
             continue;
         }
@@ -2754,20 +2770,200 @@ pub fn yenc_decode(lines: &[Vec<u8>]) -> Option<Vec<u8>> {
             break;
         }
 
-        let mut escaped = false;
-        for &b in line {
-            if escaped {
-                out.push(b.wrapping_sub(64).wrapping_sub(42));
-                escaped = false;
-            } else if b == b'=' {
-                escaped = true;
-            } else if b != b'\r' && b != b'\n' {
-                out.push(b.wrapping_sub(42));
+        push_yenc_line(&mut payload, line);
+    }
+
+    Some(nntmux_yenc::decoder::decode(&payload))
+}
+
+/// One line's bytes for the shared decoder, which sees the lines as one buffer and drops CR and LF
+/// even after an escape. Here an escape never reaches past its line, and an escaped CR or LF is a byte.
+fn push_yenc_line(payload: &mut Vec<u8>, line: &[u8]) {
+    let trailing = line.iter().rev().take_while(|&&b| b == b'=').count();
+    let line = &line[..line.len() - trailing % 2];
+
+    if !line.iter().any(|&b| b == b'\r' || b == b'\n') {
+        payload.extend_from_slice(line);
+        return;
+    }
+
+    let mut escaped = false;
+    for &b in line {
+        if escaped {
+            if b == b'\r' || b == b'\n' {
+                payload.push(b.wrapping_sub(64));
+            } else {
+                payload.extend_from_slice(&[b'=', b]);
+            }
+            escaped = false;
+        } else if b == b'=' {
+            escaped = true;
+        } else {
+            payload.push(b);
+        }
+    }
+}
+
+#[cfg(test)]
+mod yenc_decode_tests {
+    use super::yenc_decode;
+
+    /// The decoder this one replaced, line by line, which `yenc_decode` has to keep matching.
+    fn scalar(lines: &[Vec<u8>]) -> Option<Vec<u8>> {
+        let start = lines.iter().position(|l| l.starts_with(b"=ybegin "))?;
+        let mut out = Vec::new();
+
+        for line in &lines[start + 1..] {
+            if line.starts_with(b"=ypart ") {
+                continue;
+            }
+
+            if line.starts_with(b"=yend") {
+                break;
+            }
+
+            let mut escaped = false;
+            for &b in line {
+                if escaped {
+                    out.push(b.wrapping_sub(64).wrapping_sub(42));
+                    escaped = false;
+                } else if b == b'=' {
+                    escaped = true;
+                } else if b != b'\r' && b != b'\n' {
+                    out.push(b.wrapping_sub(42));
+                }
+            }
+        }
+
+        Some(out)
+    }
+
+    fn lines(text: &[&[u8]]) -> Vec<Vec<u8>> {
+        text.iter().map(|l| l.to_vec()).collect()
+    }
+
+    fn same(lines: &[Vec<u8>]) {
+        assert_eq!(yenc_decode(lines), scalar(lines), "{lines:?}");
+    }
+
+    #[test]
+    fn matches_the_old_decoder_on_each_broken_form() {
+        let begin: &[u8] = b"=ybegin part=1 line=128 size=9 name=x";
+        let cases: &[&[&[u8]]] = &[
+            // no =ybegin, or one without the space
+            &[b"plain text"],
+            &[b"=ybegin"],
+            &[b"=ybeginning", b"abc"],
+            &[],
+            // lines before =ybegin are ignored
+            &[b"junk", begin, b"abc", b"=yend size=3"],
+            // a wrong or missing CRC doesn't matter, and no =yend keeps what decoded
+            &[begin, b"abc", b"=yend size=3 pcrc32=deadbeef"],
+            &[begin, b"abc", b"def"],
+            &[begin],
+            // only the first =yend counts, and =ypart is skipped anywhere
+            &[begin, b"abc", b"=yend", b"def", b"=yend"],
+            &[begin, b"=ypart begin=1 end=3", b"abc", b"=ypart begin=4 end=6", b"def"],
+            &[begin, b"=ybegin part=2", b"abc"],
+            // an escape at the end of a line goes with that line
+            &[begin, b"abc=", b"def"],
+            &[begin, b"abc==", b"def"],
+            &[begin, b"abc===", b"def"],
+            &[begin, b"=", b"="],
+            &[begin, b"abc=", b"=yend"],
+            // stray CR and LF inside a line, plain and escaped
+            &[begin, b"a\rb\nc", b"d\r"],
+            &[begin, b"a=\rb", b"c=\nd"],
+            &[begin, b"a=\r", b"b"],
+            &[begin, b"a=\r=", b"b"],
+            // every value an escape can hold, and dots the caller has already unstuffed
+            &[begin, b"=\x00=\xff=@=="],
+            &[begin, b".abc", b"..def", b"."],
+            &[begin, b"", b"", b"abc"],
+        ];
+        for case in cases {
+            same(&lines(case));
+        }
+    }
+
+    #[test]
+    fn matches_the_old_decoder_at_every_length_and_position() {
+        // the kernels work in blocks, soo walk an escape and a CR across them
+        for len in 0..130 {
+            for at in 0..len {
+                for special in [&b"="[..], b"=\r", b"\r", b"\n", b"=="] {
+                    let mut line: Vec<u8> = (0..len as u8).map(|b| b.wrapping_mul(7).wrapping_add(65)).collect();
+                    line.splice(at..at, special.iter().copied());
+                    same(&[b"=ybegin x".to_vec(), line, b"abc".to_vec(), b"=yend".to_vec()]);
+                }
             }
         }
     }
 
-    Some(out)
+    #[test]
+    fn matches_the_old_decoder_on_random_bytes() {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..20_000 {
+            let mut article = Vec::new();
+            if next() % 8 != 0 {
+                article.push(b"=ybegin part=1 name=x".to_vec());
+            }
+            for _ in 0..next() % 6 {
+                let len = (next() % 300) as usize;
+                let line: Vec<u8> = (0..len)
+                    .map(|_| match next() % 8 {
+                        0 => b'=',
+                        1 => [b'\r', b'\n', b'.', 0][(next() % 4) as usize],
+                        _ => next() as u8,
+                    })
+                    .collect();
+                article.push(line);
+                match next() % 16 {
+                    0 => article.push(b"=yend size=1".to_vec()),
+                    1 => article.push(b"=ypart begin=1".to_vec()),
+                    _ => {}
+                }
+            }
+            same(&article);
+        }
+    }
+
+    /// Run with `cargo test --release yenc_decode_speed -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn yenc_decode_speed() {
+        let mut state = 1u64;
+        let mut article = vec![b"=ybegin part=1 line=128 size=716800 name=x".to_vec()];
+        for _ in 0..5600 {
+            let mut line = Vec::with_capacity(132);
+            for _ in 0..128 {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                let raw = (state >> 56) as u8;
+                if matches!(raw, 0 | 10 | 13 | b'=') {
+                    line.push(b'=');
+                    line.push(raw.wrapping_add(64));
+                } else {
+                    line.push(raw);
+                }
+            }
+            article.push(line);
+        }
+        let bytes: usize = article.iter().map(Vec::len).sum();
+        for (name, decode) in [("old", scalar as fn(&[Vec<u8>]) -> Option<Vec<u8>>), ("new", yenc_decode)] {
+            let started = std::time::Instant::now();
+            for _ in 0..200 {
+                std::hint::black_box(decode(std::hint::black_box(&article)));
+            }
+            let mb = (bytes * 200) as f64 / 1e6;
+            println!("{name}: {:.0} MB/s", mb / started.elapsed().as_secs_f64());
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2878,6 +3074,13 @@ mod tests {
         assert_eq!(o.bytes, 1234);
         let a = o.into_article();
         assert_eq!(a.date, "2026-10-02 10:11:12");
+        assert_eq!(a.xref_groups, None, "seven fields: no Xref");
+        let full = b"42\tsubj\tme@x\tFri, 02 Oct 2026 10:11:12 +0000\t<id@x>\t\t1234\t10\tXref: news.example alt.binaries.a:42 alt.binaries.b:7";
+        assert_eq!(parse_overview(full).unwrap().xref_groups, Some(2));
+        let other = b"42\tsubj\tme@x\tFri, 02 Oct 2026 10:11:12 +0000\t<id@x>\t\t1234\t10\tBytes: 1234";
+        assert_eq!(parse_overview(other).unwrap().xref_groups, None, "another header in field 8");
+        assert_eq!(xref_groups("xref: host"), Some(0));
+        assert_eq!(xref_groups(""), None);
     }
 
     fn run<F: Future>(f: F) -> F::Output {

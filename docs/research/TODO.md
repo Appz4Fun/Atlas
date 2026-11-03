@@ -39,12 +39,18 @@ Source: [container-metadata/FINAL-REPORT.md](container-metadata/FINAL-REPORT.md)
 
 Source: [archive-metadata/FINAL-REPORT.md](archive-metadata/FINAL-REPORT.md), [archive-metadata/raw/w10c-atlas-bugs.md](archive-metadata/raw/w10c-atlas-bugs.md) (checked at `ad111a0`; recheck lines). Nested and compressed decoding already shipped in #52 #56 #58 #61 #62 #63.
 
-- [ ] Keep per-file CRC32, unpacked size, mtime and host OS in `archive_inner_files` (RAR5 skips it at rar.rs, RAR4 never reads it, zip CD offset 16 unread, 7z substream digests discarded). This is the exact alt key.
+- [ ] Keep per-file CRC32, unpacked size, mtime and host OS in `archive_inner_files` (RAR5 skips it at rar.rs, RAR4 never reads it, zip CD offset 16 unread, 7z substream digests discarded). Inner CRC32 + unpacked size is the exact alt key (same file, different container); the timestamps help tell a twin from a re-RAR.
 - [ ] Persist PAR2 FileDesc MD5, 16 KB MD5 and the Creator string per file; parse IFSC slice CRCs.
 - [ ] Packer fingerprint from article 1: RAR host OS, method, dictionary, HTIME, owner record; zip version-made-by and extras; 7z version bytes and coders.
 - [ ] Per-archive random values as twin keys: RAR5 `-hp` salt and check value (byte-identical across volumes with rars; check WinRAR), 7z AES IV, 7z start header NextHeaderCRC.
 - [ ] RAR5 `.rev` first file: size and CRC32 of every data volume. SRR/SRS parse for scene posts.
 - [ ] Bugs: RAR4 Unicode names ASCII-only in the probe; stale encryption columns on upsert; zip encrypted flag ignores 0x0040/0x2000; zip non-UTF-8 names decoded as Latin-1 not CP437; SFV probe takes only the first three small text files; 7z header without names counts as complete with zero files; view cap 256 rows vs 4096 stored, with PAR2 rows sorting first; `probes_per_minute` cast to 0 can divide by zero.
+- [ ] Bug: the 7z encoded (compressed) header is decoded with `lzma-rs` as plain LZMA only (`src/archive/sevenz.rs` `decode`), so a header packed with LZMA2, or with BCJ/Delta in front, reads as no file list. Atlas already has its own decoders under `src/probe/codec/`; reuse them here, or use `lzma-rust2` (`Lzma2Reader`, `filter::bcj`, `filter::delta`) if it meets the crate rule.
+- [ ] Encryption facts per format, stored and never shown: RAR5 `-hp` HEAD_CRYPT (KDF count, salt, check value; PswCheck is PBKDF2-HMAC-SHA256 with 2^N+32 rounds folded to 8 bytes), RAR5 file crypt extra flag 0x02 = HASHMAC, RAR4 `-hp` 8-byte salt before each block (no check value), 7z AES props (default 0x53 0x0F, no salt by default since 7-Zip's `ResetSalt` is commented out, so the 16-byte IV is the per-archive key).
+- [ ] Uploader leak fields, stored for linking only and never displayed: RAR5 Unix owner extra 0x06 (user, group, uid, gid), zip DOS local time vs the 0x5455/0x000a UTC extra (gives the uploader's UTC offset), RAR STM `Zone.Identifier` stream (HostUrl), sub-second time precision (reveals the packing OS).
+- [ ] Posting-tool defaults as fingerprints: ngPost runs `rar a -idp -ep1 -m0 [-v<N>m -hp<pass>]` and `7z -mx0 -mhe=on`; ParPar writes Creator `ParPar v<ver> <arch> [url]`, par2cmdline writes `Created by par2cmdline version X`. RAR5 quick open (QO) is per volume; 7-Zip does not sort solid archives by type by default (`-mqs` off).
+- [ ] RAR 2.0 (`rar20`) partial decode: check that a truncated member still yields its decoded prefix (the `rars` crate's rar20 returned nothing on truncated input in the research). Check the inner output for EBML magic `1A45DFA3` before parsing it as MKV.
+- [ ] Run the prototypes in [archive-metadata/proto/](archive-metadata/proto/) against real Usenet samples (only synthetic and public fixtures were used). Prototype bugs to fix first: `rar_meta.rs` lines 373, 483-496, 549, 552, 660, 862, 883; `sevenz_zip_meta.rs` maps zip host 11 to VFAT (it is MVS) and lacks 14 (VFAT).
 - [ ] 13 RAR and some 7z catalog entries are still unverified; prototype extractors in [archive-metadata/proto/](archive-metadata/proto/) list known bugs in `raw/w10a-rar-check.md`.
 
 ## 4. Payload fingerprints (twins and alts)
@@ -91,4 +97,7 @@ Source: [metadata-visibility/MAP.md](metadata-visibility/MAP.md) section 4 (visi
 - Is Highwinds S/K per upload or per connection, and is K ever reused?
 - Does any provider allow `XHDR X-Received-Body-CRC`?
 - Does WinRAR repeat the same `-hp` salt in every volume?
+- What default dictionary size does each RAR and 7-Zip version write? (Needed for the packer-version fingerprint.)
+- What Creator strings do MultiPar and QuickPar write in PAR2?
+- What is the RAR4 recovery-record percent formula, and what are the RAR5 ACL and QO flag layouts?
 - Real samples of E-AC-3 JOC, E-AC-3 7.1, DTS-HD MA and DTS:X were not reachable; run streamprobe on a few real releases on the Mac.
