@@ -18,7 +18,7 @@ use common::{Server, post, spawn_server, yenc_encode};
 
 const GROUP: &str = "alt.binaries.test";
 const SEGMENT: usize = 20_000;
-/// what each article claims to be, soo the releases are big enough to want stills
+/// what each article claims to be, soo most releases look like full size films
 const CLAIMED: u64 = 12_000_000;
 
 fn clip(codec: &str) -> Vec<u8> {
@@ -82,8 +82,8 @@ fn split_in_a_keyframe(name: &str, inner: &[u8]) -> usize {
     panic!("no keyframe to split in")
 }
 
-/// A file's posts, `SEGMENT` bytes each.
-fn posts_of(first_number: u64, index: usize, count: usize, name: &str, data: &[u8]) -> Vec<common::Post> {
+/// A file's posts, `SEGMENT` bytes each, each claiming `claimed` bytes.
+fn posts_of(first_number: u64, index: usize, count: usize, name: &str, data: &[u8], claimed: u64) -> Vec<common::Post> {
     let total = data.len().div_ceil(SEGMENT);
     data.chunks(SEGMENT)
         .enumerate()
@@ -97,7 +97,7 @@ fn posts_of(first_number: u64, index: usize, count: usize, name: &str, data: &[u
                 format!("=yend size={} part={n} pcrc32={:08x}", chunk.len(), crc32(chunk)).into_bytes(),
             ];
             let subject = format!("[{index}/{count}] \"{name}\" yEnc ({n}/{total})");
-            post(first_number + i as u64, &subject, CLAIMED, body)
+            post(first_number + i as u64, &subject, claimed, body)
         })
         .collect()
 }
@@ -113,24 +113,25 @@ fn video_releases_get_three_stills_from_their_middles() {
     }
     let inner = clip("hevc");
     let plain = "Plain.Film.2001.1080p.WEB-DL.x265-GRP";
-    let mut posts = posts_of(1, 1, 1, &format!("{plain}.mkv"), &inner);
+    let mut posts = posts_of(1, 1, 1, &format!("{plain}.mkv"), &inner, CLAIMED);
     let avc = "Avc.Film.2003.720p.HDTV.x264-GRP";
     let next = posts.len() as u64 + 1;
-    posts.extend(posts_of(next, 1, 1, &format!("{avc}.mkv"), &clip("h264")));
+    // a small release, a few hundred KB, gets stills too
+    posts.extend(posts_of(next, 1, 1, &format!("{avc}.mkv"), &clip("h264"), SEGMENT as u64 + 200));
     let set = "Stored.Film.2002.1080p.BluRay.x265-GRP";
     let (first, last) = volumes(&format!("{set}.mkv"), &inner, inner.len() / 2);
     let next = posts.len() as u64 + 1;
-    posts.extend(posts_of(next, 1, 2, &format!("{set}.rar"), &first));
+    posts.extend(posts_of(next, 1, 2, &format!("{set}.rar"), &first, CLAIMED));
     let next = posts.len() as u64 + 1;
-    posts.extend(posts_of(next, 2, 2, &format!("{set}.r00"), &last));
+    posts.extend(posts_of(next, 2, 2, &format!("{set}.r00"), &last, CLAIMED));
     // a still whose keyframe runs on into the next volume
     let split_set = "Split.Film.2003.1080p.BluRay.x265-GRP";
     let at = split_in_a_keyframe(&format!("{split_set}.mkv"), &inner);
     let (first, last) = volumes(&format!("{split_set}.mkv"), &inner, at);
     let next = posts.len() as u64 + 1;
-    posts.extend(posts_of(next, 1, 2, &format!("{split_set}.rar"), &first));
+    posts.extend(posts_of(next, 1, 2, &format!("{split_set}.rar"), &first, CLAIMED));
     let next = posts.len() as u64 + 1;
-    posts.extend(posts_of(next, 2, 2, &format!("{split_set}.r00"), &last));
+    posts.extend(posts_of(next, 2, 2, &format!("{split_set}.r00"), &last, CLAIMED));
     let port = spawn_server(Server::new(posts));
 
     let config = serde_json::json!({
