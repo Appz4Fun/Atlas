@@ -1,0 +1,13 @@
+[package]
+name = "crc32gf2"
+version = "0.1.0"
+edition = "2021"
+description = "CRC-32 (IEEE, reflected) GF(2) toolkit: combine, remove prefix/suffix, zero pad/unpad, yEnc part folding, PAR2 slice folding"
+
+[dependencies]
+
+[dev-dependencies]
+crc32fast = "1.4"
+
+[profile.test]
+opt-level = 3

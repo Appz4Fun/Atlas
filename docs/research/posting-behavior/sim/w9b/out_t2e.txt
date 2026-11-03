@@ -1,0 +1,8 @@
+nyuu NZBs 80 consecutive files with equal segment count 590 / 939
+| penalty s | precision | recall |
+| 0 | 0.619 | 0.568 |
+| 0.25 | 0.755 | 0.709 |
+| 0.5 | 0.778 | 0.724 |
+| 1.0 | 0.801 | 0.728 |
+| 2.0 | 0.817 | 0.712 |
+| hard (equal only) | 0.817 | 0.712 |

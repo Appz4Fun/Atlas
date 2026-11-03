@@ -1,0 +1,7 @@
+# W6A streaming/downloader deobfuscation heuristics (Haiku, ~09:28Z)
+- Type by magic: PAR2 "PAR2\0PKT" (sabnzbd par2file.is_par2_file), puremagic for others (sabnzbd utils/file_extension.py), RAR5 sig, StreamNZB recognises PAR2/RAR/7z/MKV/MP4/AVI from article 1.
+- Real name: NZB subject -> PAR2 FileDesc (hash16k+length) -> yEnc name= (StreamNZB tiers; SABnzbd decode_par2; NZBGet ParRenamer.cpp).
+- RAR volume order: RAR5 main header VOLUME_NUMBER flag 0x0002 (absent only on vol 1); NZBGet RarRenamer.cpp MakeSets chains volumes by version + SplitBefore filename == previous SplitAfter filename, renames to .partNN.rar | orders an obfuscated set from headers | 1 article per file. https://raw.githubusercontent.com/nzbgetcom/nzbget/develop/daemon/postprocess/RarRenamer.cpp
+- SABnzbd deobfuscate: is_probably_obfuscated (32-hex, 40+ hex/dots, abc.xyz prefix, case/digit heuristics), >=10 MiB only, biggest-file ratio, -sample siblings. sabnzbd/deobfuscate_filenames.py
+- AltMount duplicate lookup key: sample-sha256-v1 = SHA-256("sample-sha256-v1\0" || size u64le || three 64 KiB samples at 0, mid, end with offset/len), whole file if <=196608 B; matched with name+size; has test vectors | twin key for unarchived files | 3 ranges (start, middle, end articles). https://raw.githubusercontent.com/javi11/altmount/HEAD/docs/docs/4.%20API/duplicate-lookup.md
+- Note: helper accidentally posted a stray "noop" message in the thread (edited).

@@ -2,6 +2,10 @@
 
 Deliberately not done, with why, so it can be picked up later.
 
+## Research findings not built yet
+
+The 2026-11-02 metadata and linking research lives in [research/](research/README.md). Its own list of what is left to build (probe fixes, archive and container facts, twin and alt keys, linking split posts) is [research/TODO.md](research/TODO.md).
+
 ## Per-article obfuscated uploads
 
 Atlas gathers these into one release per upload (`filters::gather_per_article`).

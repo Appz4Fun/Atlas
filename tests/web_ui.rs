@@ -8,9 +8,9 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 
 use atlas::config::Config;
-use atlas::parser::Release;
+use atlas::parser::{Article, Release};
 use atlas::{api, db, store};
-use common::stage::release_of;
+use common::stage::{article, release_of};
 
 const KEY: &str = "web-ui-key";
 
@@ -198,6 +198,212 @@ fn the_web_ui_end_to_end() {
     assert_eq!(fetch(port, "/ui/release?id=999999999", &cookie).status(), 404);
     assert_eq!(fetch(port, &format!("/ui/release?id={id}"), "").status(), 303);
 
+    // every catalog fact: the panels, their lazy fold-outs, and the drawer under a result row
+    assert!(
+        release.body.contains("<h2>Keys</h2>") && release.body.contains("hx-get=\"/ui/meta?id="),
+        "{}",
+        release.body
+    );
+    let parts = fetch(port, &format!("/ui/meta?id={id}&part=parts"), &cookie);
+    assert_eq!(parts.status(), 200);
+    assert!(parts.body.contains("<table") && parts.body.contains("x.bin"), "{}", parts.body);
+    assert_eq!(fetch(port, &format!("/ui/meta?id={id}&part=nope"), &cookie).status(), 400);
+    // the fragments go through the same filtered reader as the page: no release, no fragment
+    assert_eq!(fetch(port, "/ui/meta?id=999999999&part=parts", &cookie).status(), 404);
+    let drawer = fetch(port, &format!("/ui/row?id={id}"), &cookie);
+    assert_eq!(drawer.status(), 200);
+    assert!(
+        drawer.body.starts_with("<tr class=\"drawer-row\">") && drawer.body.contains("Full page"),
+        "{}",
+        drawer.body
+    );
+    let locked = fetch(port, &format!("/ui/row?id={id}"), "");
+    assert_eq!(locked.status(), 401);
+    assert_eq!(locked.header("HX-Redirect").as_deref(), Some("/"));
+    assert!(found.body.contains("drawer-toggle"), "{}", found.body);
+
+    // one post spread over two groups: one row, whole, and an NZB with all of it
+    let posted = |name: &str, group: &str, one: Article, date: &str| {
+        let size = one.bytes;
+        store::save(
+            &main,
+            &[Release {
+                name: name.into(),
+                group: group.into(),
+                date: date.into(),
+                articles: vec![one],
+                size,
+                complete: false,
+                ..Default::default()
+            }],
+        )
+        .unwrap();
+    };
+    const DAY: &str = "2026-10-03 17:41:49";
+    for (group, part) in [("alt.binaries.g1", 1), ("alt.binaries.g2", 2)] {
+        let one = article("split.bin", part, 2, &format!("<split.{part}@x>"));
+        posted("Spread.Post.S01E01-GRP", group, one, DAY);
+    }
+    let spread = fetch(port, "/ui/results?q=Spread", &cookie);
+    assert_eq!(spread.body.matches("Spread.Post.S01E01-GRP</a>").count(), 1, "{}", spread.body);
+    assert!(spread.body.contains("2 GROUPS") && !spread.body.contains("INCOMPLETE"), "{}", spread.body);
+    let both = fetch(port, "/ui/results?group=alt.binaries.g2&q=Spread", &cookie);
+    assert_eq!(both.body.matches("Spread.Post.S01E01-GRP</a>").count(), 1, "{}", both.body);
+    let spread_id = spread.body.split("/ui/release?id=").nth(1).unwrap().split('"').next().unwrap().to_string();
+    let whole = fetch(port, &format!("/ui/nzb?id={spread_id}"), &cookie);
+    assert!(whole.body.contains("split.1@x") && whole.body.contains("split.2@x"), "{}", whole.body);
+    assert!(
+        whole.body.contains("<group>alt.binaries.g1</group>") && whole.body.contains("<group>alt.binaries.g2</group>"),
+        "{}",
+        whole.body
+    );
+    let opened = fetch(port, &format!("/ui/release?id={spread_id}"), &cookie);
+    assert!(opened.body.contains("COMPLETE") && !opened.body.contains("INCOMPLETE"), "{}", opened.body);
+    assert!(opened.body.contains("2 of 2"), "{}", opened.body);
+    let one_file = fetch(port, &format!("/api?t=get&id={spread_id}&file=1&apikey={KEY}"), "");
+    assert!(one_file.body.contains("split.1@x") && one_file.body.contains("split.2@x"), "{}", one_file.body);
+
+    // its rows can share a fingerprint, and hiding copies doesn't lose the post
+    let spread_shards: Vec<_> = ["alt.binaries.g1", "alt.binaries.g2"]
+        .map(|group| db::open_shard(&store::shard_path(&main, store::shard_of(group))).unwrap())
+        .into_iter()
+        .collect();
+    for shard in &spread_shards {
+        shard
+            .execute(
+                "insert into release_fingerprint (release_id, posted)
+                 select id, x'01' from releases where name = 'Spread.Post.S01E01-GRP'",
+                [],
+            )
+            .unwrap();
+    }
+    let hiding = fetch(port, "/ui/results?q=Spread&filters=Hide%20copies&sort=group&dir=asc", &cookie);
+    assert_eq!(hiding.body.matches("Spread.Post.S01E01-GRP</a>").count(), 1, "{}", hiding.body);
+    for shard in &spread_shards {
+        shard.execute("delete from release_fingerprint", []).unwrap();
+    }
+
+    // it sorts by the size it shows
+    for (group, part) in [("alt.binaries.g1", 1), ("alt.binaries.g2", 2)] {
+        posted("Sized.Spread.S01E01-GRP", group, article("sized.bin", part, 2, &format!("<sized.{part}@x>")), DAY);
+    }
+    let mut bigger = article("alone.bin", 1, 2, "<alone@x>");
+    bigger.bytes = 1_000_000;
+    posted("Sized.Alone.S01E01-GRP", "alt.binaries.g1", bigger, DAY);
+    let sized = fetch(port, "/ui/results?q=Sized&sort=size", &cookie);
+    let spot = |name: &str| sized.body.find(name).unwrap();
+    assert!(spot("Sized.Spread.S01E01-GRP") < spot("Sized.Alone.S01E01-GRP"), "{}", sized.body);
+
+    // a space in the part counter is still the same subject
+    for (group, part) in [("alt.binaries.g1", 1), ("alt.binaries.g2", 2)] {
+        let mut one = article("spaced.bin", part, 2, &format!("<spaced.{part}@x>"));
+        one.subject = format!("\"spaced.bin\" yEnc ({part} /2)");
+        posted("Spaced.Post.S01E01-GRP", group, one, DAY);
+    }
+    let spaced = fetch(port, "/ui/results?q=Spaced", &cookie);
+    assert!(spaced.body.contains("2 GROUPS") && !spaced.body.contains("INCOMPLETE"), "{}", spaced.body);
+
+    // and one whose bracket counter is the part number
+    for (group, part) in [("alt.binaries.g1", 1), ("alt.binaries.g2", 2)] {
+        let mut one = article("bracket.bin", part, 2, &format!("<bracket.{part}@x>"));
+        one.subject = format!("[{part}/2] \"bracket.bin\" yEnc (1/1)");
+        posted("Bracket.Post.S01E01-GRP", group, one, DAY);
+    }
+    let bracket = fetch(port, "/ui/results?q=Bracket", &cookie);
+    assert!(bracket.body.contains("2 GROUPS") && !bracket.body.contains("INCOMPLETE"), "{}", bracket.body);
+
+    // but not a bracket counter that counts files
+    for (group, part) in [("alt.binaries.g1", 1), ("alt.binaries.g2", 2)] {
+        let mut one = article("indexed.bin", part, 2, &format!("<indexed.{part}@x>"));
+        one.subject = format!("[{part}/2] \"indexed.bin\" yEnc ({part}/2)");
+        posted("Indexed.Post.S01E01-GRP", group, one, DAY);
+    }
+    let indexed = fetch(port, "/ui/results?q=Indexed", &cookie);
+    assert!(indexed.body.contains("INCOMPLETE") && !indexed.body.contains(" GROUPS"), "{}", indexed.body);
+
+    // with no count of files, a file only one group has doesn't join
+    posted("Extra.File.S01E01-GRP", "alt.binaries.g1", article("x.bin", 1, 2, "<extra.1@x>"), DAY);
+    posted("Extra.File.S01E01-GRP", "alt.binaries.g2", article("x.bin", 2, 2, "<extra.2@x>"), DAY);
+    posted("Extra.File.S01E01-GRP", "alt.binaries.g2", article("y.bin", 1, 1, "<extra.y@evil>"), DAY);
+    let extra = fetch(port, "/ui/results?q=Extra.File", &cookie);
+    assert!(extra.body.contains("INCOMPLETE") && !extra.body.contains(" GROUPS"), "{}", extra.body);
+
+    // it isn't whole until the missing part comes
+    for (group, part) in [("alt.binaries.g1", 1), ("alt.binaries.g2", 2)] {
+        posted("Gapped.Post.S01E01-GRP", group, article("gap.bin", part, 3, &format!("<gap.{part}@x>")), DAY);
+    }
+    let gapped = fetch(port, "/ui/results?q=Gapped", &cookie);
+    assert!(gapped.body.contains("INCOMPLETE") && gapped.body.contains("2 GROUPS"), "{}", gapped.body);
+    let gap_id = gapped.body.split("/ui/release?id=").nth(1).unwrap().split('"').next().unwrap().to_string();
+    let opened = fetch(port, &format!("/ui/release?id={gap_id}"), &cookie);
+    assert!(opened.body.contains("2 of 3"), "{}", opened.body);
+
+    // the NZB with gaps filled from a twin has all of it too
+    posted("Gap.Twin.S01E01-GRP", "alt.binaries.g3", article("gap.bin", 1, 3, "<twin.1@x>"), DAY);
+    posted("Gap.Twin.S01E01-GRP", "alt.binaries.g3", article("gap.bin", 3, 3, "<twin.3@x>"), DAY);
+    let twin_shards: Vec<_> = ["alt.binaries.g1", "alt.binaries.g2", "alt.binaries.g3"]
+        .map(|group| db::open_shard(&store::shard_path(&main, store::shard_of(group))).unwrap())
+        .into_iter()
+        .collect();
+    for shard in &twin_shards {
+        shard
+            .execute(
+                "insert or ignore into release_fingerprint (release_id, posted)
+                 select id, x'02' from releases where name in ('Gapped.Post.S01E01-GRP', 'Gap.Twin.S01E01-GRP')",
+                [],
+            )
+            .unwrap();
+    }
+    let filled = fetch(port, &format!("/ui/nzb?id={gap_id}&fill=1"), &cookie);
+    assert!(filled.body.contains("gap.1@x") && filled.body.contains("gap.2@x"), "{}", filled.body);
+    assert!(filled.body.contains("<group>alt.binaries.g1</group>"), "{}", filled.body);
+    assert!(filled.body.contains("<group>alt.binaries.g2</group>"), "{}", filled.body);
+    for shard in &twin_shards {
+        shard.execute("delete from release_fingerprint", []).unwrap();
+    }
+
+    // too many groups to be a real post
+    for at in 1..=17 {
+        let one = article("many.bin", at, 17, &format!("<many.{at}@x>"));
+        posted("Many.Groups.S01E01-GRP", &format!("alt.binaries.many{at}"), one, DAY);
+    }
+    let many = fetch(port, "/ui/results?q=Many.Groups", &cookie);
+    assert!(!many.body.contains(" GROUPS"), "{}", many.body);
+
+    // a name and poster anyone can copy aren't enough: what doesn't fit one upload stays in its own group
+    let other_part = |file: &str, id: &str, subject: Option<&str>, parts: i64| {
+        let mut one = article(file, 2, parts, id);
+        if let Some(subject) = subject {
+            one.subject = subject.into();
+        }
+        one
+    };
+    for (name, one, date) in [
+        // a part the other group has too, under another message id
+        ("Same.Part", article("x.bin", 1, 2, "<swap@evil>"), DAY),
+        // another subject for the same file
+        ("New.Subject", other_part("x.bin", "<subject@evil>", Some("\"x.bin\" yEnc (2/2) other"), 2), DAY),
+        // another count of parts
+        ("New.Count", other_part("x.bin", "<count@evil>", None, 3), DAY),
+        // no file in common
+        ("New.File", other_part("y.bin", "<file@evil>", None, 2), DAY),
+        // long after
+        ("Much.Later", other_part("x.bin", "<later@evil>", None, 2), "2026-10-05 17:41:49"),
+        // no date to go by
+        ("No.Date", other_part("x.bin", "<nodate@evil>", None, 2), ""),
+    ] {
+        let name = format!("{name}.Fake.S01E01-GRP");
+        posted(&name, "alt.binaries.g1", article("x.bin", 1, 2, &format!("<{name}@x>")), DAY);
+        posted(&name, "alt.binaries.g2", one, date);
+        let found = fetch(port, &format!("/ui/results?q=%22{name}%22"), &cookie);
+        assert_eq!(found.body.matches(&format!("{name}</a>")).count(), 2, "{}", found.body);
+        assert!(found.body.contains("INCOMPLETE") && !found.body.contains(" GROUPS"), "{}", found.body);
+        let id = found.body.split("/ui/release?id=").nth(1).unwrap().split('"').next().unwrap().to_string();
+        let nzb = fetch(port, &format!("/ui/nzb?id={id}"), &cookie);
+        assert_eq!(nzb.body.matches("<group>").count(), 1, "{}", nzb.body);
+        assert!(!nzb.body.contains("@evil") || !nzb.body.contains(&format!("{name}@x")), "{}", nzb.body);
+    }
+
     // copies, listed together, with what tells them apart
     assert_eq!(fetch(port, "/ui/duplicates", "").status(), 303);
     assert!(fetch(port, "/ui/duplicates", &cookie).body.contains("no twins found yet"));
@@ -213,9 +419,23 @@ fn the_web_ui_end_to_end() {
     assert!(twins.body.contains("Twins 1") && twins.body.contains("Tv.Findword"), "{}", twins.body);
     assert!(twins.body.contains("/ui/release?id=") && twins.body.contains("TWIN"), "{}", twins.body);
     assert!(!twins.body.contains("<script>alert"), "{}", twins.body);
+    // every copy card has the + that opens its facts in place, as a card rather than a table row
+    assert_eq!(twins.body.matches("drawer-toggle").count(), 2, "{}", twins.body);
+    assert!(twins.body.contains(&format!("hx-get=\"/ui/row?id={id}&amp;as=card\"")), "{}", twins.body);
+    let card = fetch(port, &format!("/ui/row?id={id}&as=card"), &cookie);
+    assert_eq!(card.status(), 200);
+    assert!(card.body.starts_with("<div class=\"drawer-card\">") && card.body.ends_with("</div>"), "{}", card.body);
+    assert!(card.body.contains("<dl class=\"facts facts-wide\">") && card.body.contains("Full page"), "{}", card.body);
+    // the drawer reads through the same filtered reader as the page: an unknown id gets no facts, in either shape
+    for shape in ["", "&as=card"] {
+        let none = fetch(port, &format!("/ui/row?id=999999999{shape}"), &cookie);
+        assert_eq!(none.status(), 200);
+        assert!(none.body.contains("There is no such release.") && !none.body.contains("<dl"), "{}", none.body);
+    }
     assert!(fetch(port, "/ui/duplicates?kind=alts", &cookie).body.contains("no alts found yet"));
     let opened = fetch(port, &format!("/ui/release?id={script}"), &cookie);
     assert!(opened.body.contains("Other copies") && opened.body.contains("Tv.Findword"), "{}", opened.body);
+    assert!(opened.body.contains(&format!("hx-get=\"/ui/row?id={id}&amp;as=card\"")), "{}", opened.body);
 
     let nzb = fetch(port, &format!("/ui/nzb?id={id}"), &cookie);
     assert_eq!(nzb.status(), 200);

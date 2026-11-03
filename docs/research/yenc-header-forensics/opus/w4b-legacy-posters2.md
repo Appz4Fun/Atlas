@@ -1,0 +1,8 @@
+# Wave 4B: remaining legacy posters (Opus subagent)
+- TyEncoder 0.1.3/0.1.4 (sourceforge yenc32 "TyEncoder-01x.zip", yEncoder.pas): =ybegin [part total] line=128 size name + TRAILING SPACE (:221-227); =ypart 1-based (:260); =yend multipart size part pcrc32=%.8x (+crc32 last) (:238-241); single =yend size crc32 (:244); blank line before =yend when data ends on a line boundary (:234,:378-382); escapes NUL TAB LF CR = and EVERY '.' (:60-65,:370); lines 128/129; hex uppercase by inference (FPC HexStr uppercase).
+- JBinUp (Java, closed): msgid <{19-20 alnum}_{fileNo}o{fileTotal}@JBinUp.local> e.g. soXvvugGNV0CFTMIg5P3_2o17@JBinUp.local; older 20-char without _NoM. nzb-monkey src/nzbmonkey.py:113 regex _(\d{1,5})o(\d{1,5})@. Jar md5 5bf9be6ce120fac6c6f2d398905a0b51 (AUR jbinup PKGBUILD), host dead.
+- JBinDown: <...\.{seg}-{segTotal}@JBinDown.local> (nzbmonkey.py:112).
+- PowerPost 2000 A&A real: <part{seg}of{total}.{20 chars incl & $}@powerpost2000AA.local> (hellanzb Protocol.py:632-635; urd nntp.class.php; node-nntp sample.nzb). @camelsystem-powerpost.local seen only in NewsUP imitation.
+- NewsUP impostor tells (Utils.pm:743-790): jbinup 32 chars no _NoM; jbindown usec+rand too long; powerpost N,M independent so N>M possible (real capture part52of36...@powerpost2000AA.local poster NewsUP in ngPost NntpFile.cpp:107-115); 22-char body vs real 20.
+- Surprise: counter-bearing msgids (partNofM, .N-M, _NoM) self-check vs NZB segment numbers; impostors fail N<=M.
+Leads: yEncBin Poster NZB stamp (nzbfast crates/nzbkit-base/src/nzb.rs:520); go-while/nntp-overview rescan_overview.go:633-644 known msgid suffix list; JBinUp jar by md5.

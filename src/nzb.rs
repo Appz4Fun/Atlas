@@ -59,6 +59,11 @@ fn is_xml_char(c: char) -> bool {
 }
 
 pub fn render_nzb(release: &ReleaseRow, articles: &[ArticleRow]) -> String {
+    render_nzb_in(release, articles, std::slice::from_ref(&release.group_name))
+}
+
+/// The same, for articles found in any of `groups`.
+pub(crate) fn render_nzb_in(release: &ReleaseRow, articles: &[ArticleRow], groups: &[String]) -> String {
     let mut x = String::new();
     x.push_str("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n");
     x.push_str(
@@ -82,7 +87,11 @@ pub fn render_nzb(release: &ReleaseRow, articles: &[ArticleRow]) -> String {
             article_timestamp(first.posted_date.as_deref().unwrap_or("")),
             escape_attr(first.subject.as_deref().unwrap_or("")),
         );
-        let _ = writeln!(x, "    <groups>\n      <group>{}</group>\n    </groups>", escape_text(&release.group_name));
+        x.push_str("    <groups>\n");
+        for group in groups {
+            let _ = writeln!(x, "      <group>{}</group>", escape_text(group));
+        }
+        x.push_str("    </groups>\n");
         x.push_str("    <segments>\n");
 
         for a in file_articles {
@@ -107,15 +116,32 @@ pub fn build_nzb(release_id: i64) -> Result<Option<String>> {
     crate::metrics::timed("nzb.build", || whole_nzb(release_id))
 }
 
+/// A release's articles and groups. For a post spread over several groups, that's all of them: it only makes its files
+/// with all of them.
+pub(crate) fn inventory(release: &ReleaseRow) -> crate::db::Result<(Vec<ArticleRow>, Vec<String>)> {
+    if !release.complete {
+        let conn = crate::db::open()?;
+        if let Some(post) = crate::release_info::split_post_with(&conn, release)? {
+            let mut all = Vec::new();
+            for id in &post.ids {
+                all.extend(crate::store::articles(&conn, *id)?);
+            }
+            all.sort_by(|a, b| (&a.filename, a.part, &a.message_id).cmp(&(&b.filename, b.part, &b.message_id)));
+            return Ok((all, post.groups));
+        }
+    }
+    Ok((get_articles(release.id)?, vec![release.group_name.clone()]))
+}
+
 fn whole_nzb(release_id: i64) -> Result<Option<String>> {
     let Some(release) = get_release(release_id)? else { return Ok(None) };
-    let articles = get_articles(release_id)?;
+    let (articles, groups) = inventory(&release)?;
 
     if articles.is_empty() {
         return Ok(None);
     }
 
-    Ok(Some(render_nzb(&release, &articles)))
+    Ok(Some(render_nzb_in(&release, &articles, &groups)))
 }
 
 /// One file of a release as its own NZB: `file` counts from 1, in the order the release's whole NZB lists them.
@@ -125,11 +151,11 @@ pub fn build_nzb_file(release_id: i64, file: usize) -> Result<Option<String>> {
 
 fn one_file_nzb(release_id: i64, file: usize) -> Result<Option<String>> {
     let Some(release) = get_release(release_id)? else { return Ok(None) };
-    let articles = get_articles(release_id)?;
+    let (articles, groups) = inventory(&release)?;
     // sorted by filename, soo each file's articles are one run
     let mut runs = articles.chunk_by(|a, b| a.filename == b.filename);
     let Some(one) = file.checked_sub(1).and_then(|at| runs.nth(at)) else { return Ok(None) };
-    Ok(Some(render_nzb(&release, one)))
+    Ok(Some(render_nzb_in(&release, one, &groups)))
 }
 
 /// Write the nzb for a release, into `output_dir` or the current dir.
