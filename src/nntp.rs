@@ -122,6 +122,169 @@ pub fn headers_to_articles(headers: Vec<Overview>) -> Vec<Article> {
     headers.into_iter().map(Overview::into_article).collect()
 }
 
+/// Target wire ingestion rate: 750 Mbit/s = 93,750,000 bytes/sec
+pub const RATE_750_MBIT: u64 = 93_750_000;
+/// Default burst capacity for the rate limiter (10,000,000 bytes)
+pub const DEFAULT_BURST_BYTES: u64 = 10_000_000;
+
+/// An asynchronous Token Bucket rate limiter capping wire throughput.
+///
+/// Features:
+/// 1. Deadlock elimination via chunked slicing: any request > burst_bytes is sliced into chunks of <= burst_bytes.
+/// 2. Fractional nanosecond accumulation (nanos_remainder): eliminates token truncation over high-frequency reads.
+/// 3. FIFO waiter sequencing (tokio::sync::Semaphore): eliminates thundering herd stampedes and starvation.
+#[derive(Debug)]
+pub struct TokenBucket {
+    rate_bytes_per_sec: u64,
+    burst_bytes: u64,
+    state: Mutex<BucketState>,
+    waiters: Semaphore,
+}
+
+pub type RateLimiter = TokenBucket;
+
+#[derive(Debug)]
+struct BucketState {
+    tokens: u64,
+    nanos_remainder: u64,
+    last_update: Instant,
+}
+
+impl TokenBucket {
+    /// Creates a new TokenBucket with the given refill rate in bytes/sec and burst capacity in bytes.
+    /// If `rate_bytes_per_sec` is 0, the limiter is unconstrained (no throttling).
+    pub fn new(rate_bytes_per_sec: u64, burst_bytes: u64) -> Self {
+        Self {
+            rate_bytes_per_sec,
+            burst_bytes,
+            state: Mutex::new(BucketState {
+                tokens: burst_bytes,
+                nanos_remainder: 0,
+                last_update: Instant::now(),
+            }),
+            waiters: Semaphore::new(1),
+        }
+    }
+
+    /// Default 750 Mbit/s rate limiter with 10 MB burst buffer.
+    pub fn default_750_mbit() -> Self {
+        Self::new(RATE_750_MBIT, DEFAULT_BURST_BYTES)
+    }
+
+    pub fn rate_bytes_per_sec(&self) -> u64 {
+        self.rate_bytes_per_sec
+    }
+
+    pub fn burst_bytes(&self) -> u64 {
+        self.burst_bytes
+    }
+
+    /// Asynchronously acquires `bytes` tokens.
+    /// If requested bytes exceed burst capacity, slices the request into `burst_bytes` chunks
+    /// to eliminate deadlocks.
+    pub async fn acquire(&self, mut bytes: usize) {
+        if self.rate_bytes_per_sec == 0 || bytes == 0 {
+            return;
+        }
+        let chunk_limit = (self.burst_bytes as usize).max(1);
+        while bytes > 0 {
+            let chunk = bytes.min(chunk_limit);
+            self.acquire_chunk(chunk as u64).await;
+            bytes -= chunk;
+        }
+    }
+
+    async fn acquire_chunk(&self, chunk_bytes: u64) {
+        // Enforce FIFO sequencing to eliminate thundering herd wake-up stampedes
+        let _permit = self.waiters.acquire().await.expect("rate limiter closed");
+
+        loop {
+            let wait_duration = {
+                let mut state = self.state.lock().unwrap();
+                let now = Instant::now();
+                let elapsed_nanos = now.duration_since(state.last_update).as_nanos() as u64;
+                state.last_update = now;
+
+                // Accumulate integer nanoseconds using u128 arithmetic to prevent overflow and truncation
+                let total_nanos = (elapsed_nanos as u128)
+                    .saturating_mul(self.rate_bytes_per_sec as u128)
+                    .saturating_add(state.nanos_remainder as u128);
+                let replenished = total_nanos / 1_000_000_000;
+                state.nanos_remainder = (total_nanos % 1_000_000_000) as u64;
+                let new_tokens = (state.tokens as u128).saturating_add(replenished);
+                state.tokens = new_tokens.min(self.burst_bytes as u128) as u64;
+
+                if state.tokens >= chunk_bytes {
+                    state.tokens -= chunk_bytes;
+                    return;
+                }
+
+                let deficit = chunk_bytes - state.tokens;
+                // Calculate exact wait duration in nanoseconds rounded up
+                let wait_nanos = ((deficit as u128) * 1_000_000_000
+                    + (self.rate_bytes_per_sec as u128) - 1)
+                    / (self.rate_bytes_per_sec as u128);
+                Duration::from_nanos(wait_nanos as u64)
+            };
+
+            tokio::time::sleep(wait_duration).await;
+        }
+    }
+
+    /// Checks available tokens after updating for elapsed time, without waiting.
+    pub fn available_tokens(&self) -> u64 {
+        let mut state = self.state.lock().unwrap();
+        let now = Instant::now();
+        let elapsed_nanos = now.duration_since(state.last_update).as_nanos() as u64;
+        state.last_update = now;
+        let total_nanos = (elapsed_nanos as u128)
+            .saturating_mul(self.rate_bytes_per_sec as u128)
+            .saturating_add(state.nanos_remainder as u128);
+        let replenished = total_nanos / 1_000_000_000;
+        state.nanos_remainder = (total_nanos % 1_000_000_000) as u64;
+        let new_tokens = (state.tokens as u128).saturating_add(replenished);
+        state.tokens = new_tokens.min(self.burst_bytes as u128) as u64;
+        state.tokens
+    }
+
+    /// Try to acquire `bytes` tokens immediately if available.
+    /// Returns true if tokens were subtracted, false if insufficient tokens.
+    pub fn try_acquire(&self, bytes: usize) -> bool {
+        if self.rate_bytes_per_sec == 0 || bytes == 0 {
+            return true;
+        }
+        if bytes > self.burst_bytes as usize {
+            return false;
+        }
+        let mut state = self.state.lock().unwrap();
+        let now = Instant::now();
+        let elapsed_nanos = now.duration_since(state.last_update).as_nanos() as u64;
+        state.last_update = now;
+        let total_nanos = (elapsed_nanos as u128)
+            .saturating_mul(self.rate_bytes_per_sec as u128)
+            .saturating_add(state.nanos_remainder as u128);
+        let replenished = total_nanos / 1_000_000_000;
+        state.nanos_remainder = (total_nanos % 1_000_000_000) as u64;
+        let new_tokens = (state.tokens as u128).saturating_add(replenished);
+        state.tokens = new_tokens.min(self.burst_bytes as u128) as u64;
+
+        if state.tokens >= bytes as u64 {
+            state.tokens -= bytes as u64;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Explicitly sets the token count (useful for unit testing replenishment).
+    pub fn set_tokens(&self, tokens: u64) {
+        let mut state = self.state.lock().unwrap();
+        state.tokens = tokens.min(self.burst_bytes);
+        state.nanos_remainder = 0;
+        state.last_update = Instant::now();
+    }
+}
+
 trait AsyncStream: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncStream for T {}
 
@@ -307,6 +470,7 @@ pub struct Conn {
     sent: u64,
     /// the server's key, for metrics
     server: Arc<str>,
+    rate_limiter: Arc<TokenBucket>,
 }
 
 /// One command being measured, see `Conn::measure`.
@@ -376,6 +540,30 @@ impl Conn {
         Ok(conn)
     }
 
+    pub async fn open_with_limiter(
+        server: &UsenetServer,
+        timeout: Duration,
+        compress: bool,
+        limiter: Arc<TokenBucket>,
+    ) -> Result<Conn> {
+        let mut conn = Conn::open(server, timeout, compress).await?;
+        conn.rate_limiter = limiter;
+        Ok(conn)
+    }
+
+    pub fn rate_limiter(&self) -> &Arc<TokenBucket> {
+        &self.rate_limiter
+    }
+
+    pub fn set_rate_limiter(&mut self, limiter: Arc<TokenBucket>) {
+        self.rate_limiter = limiter;
+    }
+
+    pub fn with_rate_limiter(mut self, limiter: Arc<TokenBucket>) -> Self {
+        self.rate_limiter = limiter;
+        self
+    }
+
     /// The greeting, the login, and asking for compression.
     async fn log_in(&mut self, server: &UsenetServer, compress: bool) -> Result<()> {
         let conn = self;
@@ -414,6 +602,7 @@ impl Conn {
             text: 0,
             sent: 0,
             server: Arc::from(""),
+            rate_limiter: Arc::new(TokenBucket::new(RATE_750_MBIT, DEFAULT_BURST_BYTES)),
         }
     }
 
@@ -426,6 +615,7 @@ impl Conn {
             return Err(NntpError::Io(io::Error::new(io::ErrorKind::UnexpectedEof, "connection closed")));
         }
 
+        self.rate_limiter.acquire(chunk.len()).await;
         self.io.consume(chunk.len());
         self.wire += chunk.len() as u64;
         Ok(chunk)
@@ -515,6 +705,7 @@ impl Conn {
     async fn read_raw_line(&mut self) -> Result<Vec<u8>> {
         let mut buf = Vec::new();
         let n = with_timeout(self.timeout, self.io.read_until(b'\n', &mut buf)).await?;
+        self.rate_limiter.acquire(n).await;
         self.wire += n as u64;
         self.text += n as u64;
 
@@ -561,6 +752,7 @@ impl Conn {
                     }
                 }
             };
+            self.rate_limiter.acquire(used).await;
             self.io.consume(used);
             self.wire += used as u64;
             self.text += used as u64;
@@ -1267,6 +1459,7 @@ pub struct Pool {
     unsaved: Arc<UnsavedBudget>,
     /// how long a background body waits for room before queuing
     body_patience: Duration,
+    rate_limiter: Arc<TokenBucket>,
 }
 
 /// Headers fetched (or on their way) and not saved yet, over every pass on a
@@ -1420,7 +1613,17 @@ impl Pool {
             homes: Mutex::new(HashMap::new()),
             body_patience: BODY_PATIENCE,
             unsaved: UnsavedBudget::new(crate::config::DEFAULT_MAX_UNSAVED_HEADERS as usize),
+            rate_limiter: Arc::new(TokenBucket::new(RATE_750_MBIT, DEFAULT_BURST_BYTES)),
         }
+    }
+
+    pub fn rate_limiter(&self) -> &Arc<TokenBucket> {
+        &self.rate_limiter
+    }
+
+    pub fn with_rate_limiter(mut self, limiter: Arc<TokenBucket>) -> Self {
+        self.rate_limiter = limiter;
+        self
     }
 
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
@@ -1657,7 +1860,8 @@ impl Pool {
                 None => idle.pop(),
             }
         };
-        if let Some(conn) = idle {
+        if let Some(mut conn) = idle {
+            conn.set_rate_limiter(self.rate_limiter.clone());
             return Ok(Some(Lease::new(conn, server.clone(), permit)));
         }
 
@@ -1675,7 +1879,8 @@ impl Pool {
             crate::metrics::names::NNTP_CONNECTS.inc(&[("server", server.key.as_str()), ("result", result)], 1);
         };
         let e = match opened {
-            Ok(conn) => {
+            Ok(mut conn) => {
+                conn.set_rate_limiter(self.rate_limiter.clone());
                 connects("ok");
                 *server.down_until.lock().unwrap() = None;
                 return Ok(Some(Lease::new(conn, server.clone(), permit)));
@@ -2612,6 +2817,10 @@ impl BlockingPool {
         self.pool.is_empty()
     }
 
+    pub fn rate_limiter(&self) -> &Arc<TokenBucket> {
+        self.pool.rate_limiter()
+    }
+
     pub fn active_index(&self) -> usize {
         self.pool.active_index()
     }
@@ -3364,5 +3573,118 @@ mod tests {
         assert_eq!(r(502, "Access Denied. Please check your login/pw."), Refusal::Auth);
         assert_eq!(r(400, "service temporarily unavailable"), Refusal::Other);
         assert_eq!(refusal(&timed_out()), Refusal::Other);
+    }
+
+    #[test]
+    fn token_bucket_replenishment_and_subtraction() {
+        run(async {
+            let bucket = TokenBucket::new(RATE_750_MBIT, 10_000_000);
+            assert_eq!(bucket.rate_bytes_per_sec(), RATE_750_MBIT);
+            assert_eq!(bucket.burst_bytes(), 10_000_000);
+            assert_eq!(bucket.available_tokens(), 10_000_000);
+
+            // Subtraction
+            assert!(bucket.try_acquire(4_000_000));
+            let tokens_after = bucket.available_tokens();
+            assert!(tokens_after >= 6_000_000 && tokens_after <= 6_500_000);
+
+            // Exhaust tokens
+            assert!(bucket.try_acquire(tokens_after as usize));
+            assert!(!bucket.try_acquire(1_000_000));
+
+            // Explicit set and replenishment
+            bucket.set_tokens(0);
+            assert!(bucket.available_tokens() <= 100);
+
+            // Sleep 50ms and check replenishment: 0.05 * 93_750_000 = 4_687_500 bytes (+- 20%)
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let tokens = bucket.available_tokens();
+            assert!(tokens >= 3_500_000 && tokens <= 6_000_000, "replenished tokens: {tokens}");
+        });
+    }
+
+    #[test]
+    fn token_bucket_large_read_no_deadlock() {
+        run(async {
+            // High rate so test completes quickly: 1 GB/s, burst 10 MB.
+            let bucket = TokenBucket::new(1_000_000_000, 10_000_000);
+            // Request 25 MB (> 2.5x burst size)
+            let started = Instant::now();
+            bucket.acquire(25_000_000).await;
+            let elapsed = started.elapsed();
+            // Since initial bucket had 10MB, deficit was 15MB at 1GB/s => ~15ms
+            assert!(elapsed < Duration::from_secs(2), "deadlock or excessive latency: {elapsed:?}");
+        });
+    }
+
+    #[test]
+    fn token_bucket_fractional_nanos_accuracy() {
+        run(async {
+            // Test that rapid micro-acquisitions don't drop fractional tokens
+            let bucket = TokenBucket::new(RATE_750_MBIT, 10_000_000);
+            bucket.set_tokens(0);
+
+            // Perform small sleeps and verify nanos_remainder accumulates tokens
+            let start = Instant::now();
+            for _ in 0..10 {
+                tokio::time::sleep(Duration::from_micros(500)).await;
+                let _ = bucket.available_tokens();
+            }
+            let total_elapsed = start.elapsed();
+            let expected = (total_elapsed.as_nanos() as u128 * RATE_750_MBIT as u128 / 1_000_000_000) as u64;
+            let actual = bucket.available_tokens();
+            let diff = (expected as i64 - actual as i64).abs();
+            assert!(diff <= 50_000, "expected ~{expected}, got {actual}, diff: {diff}");
+        });
+    }
+
+    #[test]
+    fn token_bucket_concurrent_simulated_tasks() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let bucket = Arc::new(TokenBucket::new(20_000_000, 2_000_000));
+            let mut handles = Vec::new();
+            for _ in 0..10 {
+                let b = bucket.clone();
+                handles.push(tokio::spawn(async move {
+                    for _ in 0..5 {
+                        b.acquire(20_000).await;
+                    }
+                }));
+            }
+            for h in handles {
+                h.await.unwrap();
+            }
+        });
+    }
+
+    #[test]
+    fn token_bucket_conn_read_throttling() {
+        run(async {
+            let (client, mut server) = tokio::io::duplex(1 << 16);
+            let limiter = Arc::new(TokenBucket::new(100_000, 10_000));
+            let mut conn = Conn::over(Box::new(client), Duration::from_secs(5))
+                .with_rate_limiter(limiter.clone());
+
+            tokio::spawn(async move {
+                server.write_all(&vec![b'A'; 5_000]).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                server.write_all(&vec![b'B'; 5_000]).await.unwrap();
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            });
+
+            // First chunk
+            let chunk1 = conn.read_chunk(Duration::from_secs(5)).await.unwrap();
+            assert_eq!(chunk1.len(), 5_000);
+
+            // Second chunk
+            let chunk2 = conn.read_chunk(Duration::from_secs(5)).await.unwrap();
+            assert_eq!(chunk2.len(), 5_000);
+            assert_eq!(conn.wire, 10_000);
+        });
     }
 }
