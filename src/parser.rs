@@ -85,7 +85,9 @@ pub fn is_obfuscated(name: &str) -> bool {
 }
 
 pub fn parse_subject(subject: &str) -> Option<ParsedSubject> {
-    if subject.is_empty() {
+    // every pattern needs a `(` or a `[`: obfuscated subjects (a bare hash,
+    // `{...}`), most of some groups, skip all ten regexes
+    if !subject.contains(['(', '[']) {
         return None;
     }
 

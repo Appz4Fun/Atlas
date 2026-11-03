@@ -178,7 +178,7 @@ compress = false
 | `category` | see below | How releases get a category. See [Categories](#categories). |
 | `media` | see below | TV and movie IDs, with every provider off. See [TV and movie IDs](#tv-and-movie-ids). |
 | `metrics` | see below | Prometheus metrics, off by default. See [Metrics](#metrics). |
-| `max_unsaved_headers` | `500000` | Headers the indexer fetches ahead of saving them, over all groups at once. This bounds its memory: 500,000 headers take about 0.3 GB. A header request waits for room before it goes out, and its room comes back once its slice is saved. Raise it if the Bottleneck page shows it full while the database writers and connections have time to spare. Set below `request_size`, header requests are cut down to it, which makes them small and slow. |
+| `max_unsaved_headers` | `500000` | Headers the indexer fetches ahead of saving them, over all groups at once. This bounds its memory: 500,000 headers take about 0.3 GB. A header request waits for room before it goes out, and its room comes back once its slice is saved. One group holds room for at most 8 requests at a time, so a single group can't take the whole budget. Raise it if the Bottleneck page shows it full while the database writers and connections have time to spare. Set below `request_size`, header requests are cut down to it, which makes them small and slow. |
 
 Atlas keeps any other keys you add to the file when it saves it.
 
