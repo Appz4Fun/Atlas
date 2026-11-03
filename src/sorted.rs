@@ -16,7 +16,7 @@ use crate::release_info::LINKED_ROWS;
 use crate::search::{Bounds, COLUMNS, ReleaseRow, VISIBLE_RELEASE, newest_in_categories_with, probe_sql, release_row};
 use crate::store;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Column {
     Size,
     Posted,
@@ -74,6 +74,34 @@ struct Limits {
 }
 
 const LIMITS: Limits = Limits { few: 20_000, some: 200_000, slack: 50_000 };
+
+/// How long a look for the indexes is believed: `--search-indexes` adds them while Atlas runs.
+const INDEXES_CHECKED_FOR: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Whether every shard has the index a sort by `by` walks. Without it, ranking a big category reads and sorts all of
+/// it on every click, soo the page sorts its newest releases instead until `--search-indexes --apply` has run.
+pub fn ready(by: Column) -> bool {
+    use std::sync::{LazyLock, Mutex};
+    use std::time::Instant;
+    // the category sort reads each category newest first, and the group index is made with the shard
+    if matches!(by, Column::Category | Column::Group) {
+        return true;
+    }
+    static CHECKED: LazyLock<Mutex<HashMap<Column, (Instant, bool)>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+    let mut checked = CHECKED.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&(at, ready)) = checked.get(&by)
+        && at.elapsed() < INDEXES_CHECKED_FOR
+    {
+        return ready;
+    }
+    let ready = db::open().is_ok_and(|conn| all_indexed(&conn, by));
+    checked.insert(by, (Instant::now(), ready));
+    ready
+}
+
+fn all_indexed(conn: &Connection, by: Column) -> bool {
+    (0..store::SHARDS).all(|s| has_index(conn, s, by.index()))
+}
 
 /// The first `want` releases in `filter` by `by`, over all of them. Releases with nothing in the column come last
 /// either way, and among equals the newest comes first.
@@ -666,6 +694,16 @@ mod tests {
                 "every upload as big as Big, newest first"
             );
         }
+    }
+
+    #[test]
+    fn a_column_is_ready_to_rank_once_every_shard_has_its_index() {
+        let f = fixture();
+        let conn = db::open_with_shards(&f.main).unwrap();
+        assert!(!all_indexed(&conn, Column::Size), "made without `--search-indexes`");
+        f.index_all();
+        assert!(all_indexed(&conn, Column::Size));
+        assert!(ready(Column::Group) && ready(Column::Category), "these need no index of their own");
     }
 
     #[test]

@@ -473,14 +473,16 @@ impl Search {
         if !self.q.is_empty() || self.fields.any() {
             return None;
         }
-        match self.sort? {
-            SortBy::Size => Some(Column::Size),
-            SortBy::Posted => Some(Column::Posted),
-            SortBy::Name => Some(Column::Name),
-            SortBy::Group => Some(Column::Group),
-            SortBy::Category => Some(Column::Category),
-            SortBy::Rating => None,
-        }
+        let column = match self.sort? {
+            SortBy::Size => Column::Size,
+            SortBy::Posted => Column::Posted,
+            SortBy::Name => Column::Name,
+            SortBy::Group => Column::Group,
+            SortBy::Category => Column::Category,
+            SortBy::Rating => return None,
+        };
+        // without its index a whole category is read and sorted on every click: the newest are sorted instead
+        crate::sorted::ready(column).then_some(column)
     }
 
     /// The search itself: one, whatever the filters.
@@ -3759,9 +3761,10 @@ mod tests {
 
     #[test]
     fn a_sort_over_a_category_ranks_all_of_it() {
-        let size = Search::from_args(&parse_query("cat=2000&sort=size&dir=desc"));
-        assert_eq!(size.ranked_by(), Some(crate::sorted::Column::Size));
-        assert!(size.summary().contains("By size descending, over all of them"), "{}", size.summary());
+        // by group: its index is made with the shard, soo it ranks whatever `--search-indexes` has done
+        let size = Search::from_args(&parse_query("cat=2000&sort=group&dir=desc"));
+        assert_eq!(size.ranked_by(), Some(crate::sorted::Column::Group));
+        assert!(size.summary().contains("By group descending, over all of them"), "{}", size.summary());
         // its own window, not the newest releases': a window for each column and way
         let asc = Search { descending: false, ..size.clone() };
         let plain = Search { sort: None, ..size.clone() };
@@ -3781,13 +3784,13 @@ mod tests {
 
     #[test]
     fn only_a_ranked_window_with_more_behind_it_grows() {
-        let ranked = Search::from_args(&parse_query("cat=2000&sort=size&dir=desc"));
+        let ranked = Search::from_args(&parse_query("cat=2000&sort=group&dir=desc"));
         let full = Window { more_in_db: true, ..window_of_rows(Vec::new()) };
         assert!(full.can_grow(&ranked), "a page past 2000 reads further");
         assert!(!window_of_rows(Vec::new()).can_grow(&ranked), "all of them were read");
         let words = Search::from_args(&parse_query("q=batman&sort=size"));
         assert!(!full.can_grow(&words), "a word search sorts what it found");
-        let tags = Search::from_args(&parse_query("cat=2000&sort=size&filters=DV"));
+        let tags = Search::from_args(&parse_query("cat=2000&sort=group&filters=DV"));
         assert!(full.can_grow(&tags));
         let far = Window { asked: GROW_WITH_TAGS, more_in_db: true, ..window_of_rows(Vec::new()) };
         assert!(!far.can_grow(&tags), "tags are read a name at a time, soo they stop somewhere");
