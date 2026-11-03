@@ -1028,6 +1028,59 @@ fn prune_probes(conn: &Connection, incoming_bytes: i64, max_rows: i64, max_bytes
     Ok(())
 }
 
+fn upsert_nfo_password(
+    conn: &Connection,
+    name: &str,
+    group_name: &str,
+    content_id: &[u8],
+    pw: &str,
+) -> rusqlite::Result<()> {
+    let exists: bool = conn
+        .prepare_cached("SELECT EXISTS(SELECT 1 FROM raw_nfo_passwords WHERE name = ?1 AND group_name = ?2)")?
+        .query_row(params![name, group_name], |r| r.get(0))?;
+    if !exists {
+        let count: i64 = conn.query_row("SELECT count(*) FROM raw_nfo_passwords", [], |r| r.get(0))?;
+        if count >= MAX_RAW_PROBES_ROWS {
+            let to_drop = (count - MAX_RAW_PROBES_ROWS + 1).max(64);
+            conn.execute(
+                "DELETE FROM raw_nfo_passwords WHERE (name, group_name) IN (
+                    SELECT name, group_name FROM raw_nfo_passwords LIMIT ?1
+                )",
+                params![to_drop],
+            )?;
+        }
+    }
+    conn.prepare_cached(
+        "INSERT OR REPLACE INTO raw_nfo_passwords (name, group_name, content_id, password) VALUES (?1, ?2, ?3, ?4)",
+    )?
+    .execute(params![name, group_name, content_id, pw])?;
+    Ok(())
+}
+
+/// Looks up a cached NFO password for `(name, group_name)` verified against `content_id` in `raw_nfo_passwords`,
+/// independent of whether `raw_probes` has a reusable probe result.
+pub fn get_nfo_password(name: &str, group_name: &str, content_id: &[u8]) -> Option<String> {
+    if content_id.is_empty() {
+        return None;
+    }
+    with_raw(|conn| {
+        conn.prepare_cached(
+            "SELECT password FROM raw_nfo_passwords WHERE name = ?1 AND group_name = ?2 AND content_id = ?3",
+        )?
+        .query_row(params![name, group_name, content_id], |r| r.get(0))
+        .optional()
+    })
+    .flatten()
+}
+
+/// Persists an NFO password for `(name, group_name)` and `content_id` into `raw_nfo_passwords`.
+pub fn put_nfo_password(name: &str, group_name: &str, content_id: &[u8], password: &str) {
+    if content_id.is_empty() || password.len() > 256 {
+        return;
+    }
+    let _ = with_raw(|conn| upsert_nfo_password(conn, name, group_name, content_id, password));
+}
+
 /// Persists a probed release's `ProbeInfo` JSON, completeness/stamp metadata, optional NFO password, and
 /// optional cover reference into `raw_probes`, `raw_nfo_passwords`, and `raw_covers`.
 pub fn put_probe(rec: &ProbeRecord<'_>) {
@@ -1062,25 +1115,7 @@ pub fn put_probe(rec: &ProbeRecord<'_>) {
             now
         ])?;
         if let Some(pw) = rec.nfo_password.filter(|pw| pw.len() <= 256) {
-            let exists: bool = conn
-                .prepare_cached("SELECT EXISTS(SELECT 1 FROM raw_nfo_passwords WHERE name = ?1 AND group_name = ?2)")?
-                .query_row(params![rec.name, rec.group_name], |r| r.get(0))?;
-            if !exists {
-                let count: i64 = conn.query_row("SELECT count(*) FROM raw_nfo_passwords", [], |r| r.get(0))?;
-                if count >= MAX_RAW_PROBES_ROWS {
-                    let to_drop = (count - MAX_RAW_PROBES_ROWS + 1).max(64);
-                    conn.execute(
-                        "DELETE FROM raw_nfo_passwords WHERE (name, group_name) IN (
-                            SELECT name, group_name FROM raw_nfo_passwords LIMIT ?1
-                        )",
-                        params![to_drop],
-                    )?;
-                }
-            }
-            conn.prepare_cached(
-                "INSERT OR REPLACE INTO raw_nfo_passwords (name, group_name, content_id, password) VALUES (?1, ?2, ?3, ?4)",
-            )?
-            .execute(params![rec.name, rec.group_name, rec.content_id, pw])?;
+            upsert_nfo_password(conn, rec.name, rec.group_name, rec.content_id, pw)?;
         }
         match rec.cover {
             Some((mime, sha256)) => {
@@ -2490,6 +2525,11 @@ mod tests {
         // Probe step config_stamp gained a new bit -> invalidated!
         assert_eq!(get_probe("Some.Release-GRP", "alt.binaries.test", cid_a, 20, false, stamp | 16), None);
 
+        // Standalone NFO password roundtrip (independent of raw_probes, verified by content_id)
+        put_nfo_password("Nfo.Only-GRP", "alt.binaries.test", cid_a, "nfopass123");
+        assert_eq!(get_nfo_password("Nfo.Only-GRP", "alt.binaries.test", cid_a).as_deref(), Some("nfopass123"));
+        assert_eq!(get_nfo_password("Nfo.Only-GRP", "alt.binaries.test", cid_b), None);
+
         // Stills roundtrip (bound to content_id)
         let stills = vec![SavedStill {
             position: 25,
@@ -2618,9 +2658,9 @@ mod tests {
             prune_probes(&conn, MAX_RAW_PROBES_BYTES, MAX_RAW_PROBES_ROWS, MAX_RAW_PROBES_BYTES).unwrap();
             assert_eq!(raw_meta_get(&conn, "probe_rows").unwrap(), 0);
             assert_eq!(raw_meta_get(&conn, "probe_bytes").unwrap(), 0);
-            let pw_count: i64 = conn.query_row("SELECT count(*) FROM raw_nfo_passwords", [], |r| r.get(0)).unwrap();
+            assert_eq!(get_nfo_password("Some.Release-GRP", "alt.binaries.test", cid_a), None);
+            assert_eq!(get_nfo_password("Nfo.Only-GRP", "alt.binaries.test", cid_a).as_deref(), Some("nfopass123"));
             let cov_count: i64 = conn.query_row("SELECT count(*) FROM raw_covers", [], |r| r.get(0)).unwrap();
-            assert_eq!(pw_count, 0, "dependent raw_nfo_passwords row must be pruned with parent probe");
             assert_eq!(cov_count, 0, "dependent raw_covers row must be pruned with parent probe");
             let now = chrono::Utc::now().timestamp();
             prune_http_cache(&conn, MAX_HTTP_CACHE_BYTES, MAX_HTTP_CACHE_ROWS, MAX_HTTP_CACHE_BYTES, now).unwrap();

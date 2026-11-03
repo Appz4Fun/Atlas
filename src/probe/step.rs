@@ -140,7 +140,13 @@ impl Step for ProbeStep {
         let files = ctx.files().map_err(retry)?;
         let mut info = ProbeInfo::default();
         let mut writes = Vec::new();
-        let mut found_nfo_password: Option<String> = None;
+        let mut found_nfo_password = crate::raw_store::get_nfo_password(&rel_name, &rel_group, &content_id);
+        if let Some(ref pw) = found_nfo_password {
+            writes.push(StepWrite::new(
+                archive::store::SET_NFO_PASSWORD,
+                vec![release_id.into(), pw.clone().into()],
+            ));
+        }
 
         // the NFO and SFV come first, being the smallest: a budget that runs out still leaves them
         for file in files.iter().filter(|f| is_small_text(&f.filename)).take(3) {
@@ -155,7 +161,9 @@ impl Step for ProbeStep {
                 info.sfv = parse_sfv(&text);
             } else if info.nfo.is_none() {
                 info.imdb_ids = imdb_ids(&text);
-                if let Some(password) = release_info::find_password(&text) {
+                if found_nfo_password.is_none()
+                    && let Some(password) = release_info::find_password(&text)
+                {
                     found_nfo_password = Some(password.clone());
                     writes.push(StepWrite::new(
                         archive::store::SET_NFO_PASSWORD,

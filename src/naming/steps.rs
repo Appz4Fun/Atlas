@@ -97,23 +97,31 @@ impl Step for NfoName {
     }
     fn run(&self, ctx: &mut StepCtx<'_>) -> Result<Outcome, StepError> {
         let retry = |e: rusqlite::Error| StepError::Retry(e.to_string());
+        let rel_id = ctx.release().id;
+        let rel_name = ctx.release().name.clone();
+        let rel_group = ctx.release().group.clone();
+        let content_id = crate::raw_store::release_content_id(ctx.conn(), rel_id).unwrap_or_default();
+        let mut writes = Vec::new();
+        if let Some(saved_pw) = crate::raw_store::get_nfo_password(&rel_name, &rel_group, &content_id) {
+            writes.push(StepWrite::new(archive::store::SET_NFO_PASSWORD, vec![rel_id.into(), saved_pw.into()]));
+        }
         // an inline name stays as it is until the user opts in, as in the naming step. `applies` can't read this
         let r = ctx.release();
         if r.display_name.is_some()
             && r.name_source.is_none()
             && !rename_named_is_on(ctx.conn(), &r.group).map_err(retry)?
         {
-            return Ok(Outcome::default());
+            return Ok(Outcome { writes, ..Outcome::default() });
         }
         let files = ctx.files().map_err(retry)?;
-        let mut writes = Vec::new();
         for file in archive::select::nfo_sources(&files) {
             let Some(seg) = first_article(ctx, file)? else { continue };
             let Some(body) = fetch_one(ctx, &seg, &file.filename)? else { continue };
             if writes.is_empty()
                 && let Some(password) = release_info::find_password(&String::from_utf8_lossy(&body))
             {
-                let params = vec![ctx.release().id.into(), password.into()];
+                crate::raw_store::put_nfo_password(&rel_name, &rel_group, &content_id, &password);
+                let params = vec![rel_id.into(), password.into()];
                 writes.push(StepWrite::new(archive::store::SET_NFO_PASSWORD, params));
             }
             let found = nfo::name_candidates(&body).into_iter().find(|n| improves(ctx.release(), n, NameSource::Nfo));
