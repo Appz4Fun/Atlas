@@ -1606,7 +1606,13 @@ fn probe_html(
             if s.forced {
                 parts.push("forced".into());
             }
-            if s.hearing_impaired {
+            // a name that says so already
+            if s.hearing_impaired
+                && !s.name.as_deref().is_some_and(|n| {
+                    let n = n.to_ascii_lowercase();
+                    n.contains("sdh") || n.contains("hearing")
+                })
+            {
                 parts.push("SDH".into());
             }
             if s.default {
@@ -2772,6 +2778,20 @@ mod tests {
         assert_eq!(runtime_note(136, None), "");
         assert!(runtime_note(136, Some(152.0 * 60.0)).contains("16 min longer"));
         assert!(runtime_note(136, Some(44.0 * 60.0)).contains("92 min shorter"));
+    }
+
+    #[test]
+    fn a_subtitle_named_sdh_doesnt_say_it_twice() {
+        use crate::probe::media::{MediaInfo, SubtitleTrack};
+        let sub = |name: Option<&str>| SubtitleTrack {
+            codec: "SRT".into(),
+            name: name.map(str::to_string),
+            hearing_impaired: true,
+            ..Default::default()
+        };
+        let media = MediaInfo { subtitles: vec![sub(Some("SDH")), sub(None)], ..Default::default() };
+        let html = probe_html(&crate::probe::ProbeInfo { media: Some(media), ..Default::default() }, None, None, None);
+        assert_eq!(html.matches("SDH").count(), 2, "{html}");
     }
 
     #[test]
