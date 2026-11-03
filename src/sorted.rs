@@ -6,10 +6,11 @@
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::time::Instant;
 
 use rusqlite::{Connection, OptionalExtension};
 
-use crate::category::{CatFilter, TABLE, UNCATEGORIZED, label};
+use crate::category::{CatFilter, TABLE, UNCATEGORIZED, label, uncategorized};
 use crate::db::{self, Result};
 use crate::field_search::{NAME_INDEX, POSTED_INDEX, SIZE_INDEX, has_index};
 use crate::release_info::LINKED_ROWS;
@@ -71,36 +72,44 @@ struct Limits {
     some: i64,
     /// index entries a walk may pass besides those the category's share says it should
     slack: i64,
+    /// the fewest rows a shard is asked for first
+    share: i64,
 }
 
-const LIMITS: Limits = Limits { few: 20_000, some: 200_000, slack: 50_000 };
+const LIMITS: Limits = Limits { few: 20_000, some: 200_000, slack: 50_000, share: 256 };
 
 /// How long a look for the indexes is believed: `--search-indexes` adds them while Atlas runs.
 const INDEXES_CHECKED_FOR: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// Whether every shard has the index a sort by `by` walks. Without it, ranking a big category reads and sorts all of
-/// it on every click, soo the page sorts its newest releases instead until `--search-indexes --apply` has run.
+/// Whether every shard has the index a sort by `by` walks, and its list of releases with no category. Without them,
+/// ranking a big category, or one that takes what has no category, reads and sorts all of a shard on every click, soo
+/// the page sorts its newest releases instead until `--search-indexes --apply` has run. The group index is made with
+/// the shard, and the category sort reads each category newest first.
 pub fn ready(by: Column) -> bool {
-    use std::sync::{LazyLock, Mutex};
-    use std::time::Instant;
-    // the category sort reads each category newest first, and the group index is made with the shard
-    if matches!(by, Column::Category | Column::Group) {
-        return true;
-    }
-    static CHECKED: LazyLock<Mutex<HashMap<Column, (Instant, bool)>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
     let mut checked = CHECKED.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(&(at, ready)) = checked.get(&by)
         && at.elapsed() < INDEXES_CHECKED_FOR
     {
         return ready;
     }
-    let ready = db::open().is_ok_and(|conn| all_indexed(&conn, by));
+    let ready = db::open().is_ok_and(|conn| all_ready(&conn, by));
     checked.insert(by, (Instant::now(), ready));
     ready
 }
 
-fn all_indexed(conn: &Connection, by: Column) -> bool {
-    (0..store::SHARDS).all(|s| has_index(conn, s, by.index()))
+/// What `ready` found, and when.
+static CHECKED: std::sync::LazyLock<std::sync::Mutex<HashMap<Column, (Instant, bool)>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// `ready` says yes for a while, for a test with no database.
+#[cfg(test)]
+pub(crate) fn assume_ready(by: Column) {
+    CHECKED.lock().unwrap_or_else(|e| e.into_inner()).insert(by, (Instant::now(), true));
+}
+
+fn all_ready(conn: &Connection, by: Column) -> bool {
+    let indexed = |s| matches!(by, Column::Category | Column::Group) || has_index(conn, s, by.index());
+    (0..store::SHARDS).all(|s| uncategorized::listed(conn, s) && indexed(s))
 }
 
 /// The first `want` releases in `filter` by `by`, over all of them. Releases with nothing in the column come last
@@ -116,6 +125,11 @@ pub fn top(filter: Option<&CatFilter>, by: Column, descending: bool, want: i64) 
 type ShardTop = (Vec<ReleaseRow>, HashMap<i64, i64>);
 
 /// `top`, on connections from `open`: one for each shard, read at once.
+///
+/// Each shard is first asked for its share of `want` and a quarter more. A shard that gave all it was asked for and
+/// whose last row still made the top may have more that belong there, soo it is asked again, twice as far. The rows
+/// held at once stay a few times `want` (a shard is asked at most twice as far as its part of the top, or its first
+/// share), never `want` from every shard.
 fn top_with(
     open: &(dyn Fn() -> Result<Connection> + Sync),
     filter: Option<&CatFilter>,
@@ -127,32 +141,63 @@ fn top_with(
     if by == Column::Category {
         return by_category(&open()?, filter, descending, want);
     }
-    // on a cold disk most of the time is waiting for reads
-    let tops: Vec<Result<ShardTop>> = std::thread::scope(|scope| {
-        let shards: Vec<_> = (0..store::SHARDS)
-            .map(|s| {
-                scope.spawn(move || {
-                    let conn = open()?;
-                    let mut rows = shard_top(&conn, s, filter, by, descending, want, limits)?;
-                    let whole = if by == Column::Size && descending {
-                        linked_sizes(&conn, s, filter, &mut rows, want)?
-                    } else {
-                        HashMap::new()
-                    };
-                    Ok((rows, whole))
+    let keep = usize::try_from(want).unwrap_or(usize::MAX);
+    let first = (want / store::SHARDS as i64).saturating_mul(5) / 4;
+    let mut asked = [first.max(limits.share).min(want); store::SHARDS];
+    let mut tops: Vec<ShardTop> = (0..store::SHARDS).map(|_| (Vec::new(), HashMap::new())).collect();
+    let mut todo: Vec<usize> = (0..store::SHARDS).collect();
+    while !todo.is_empty() {
+        // on a cold disk most of the time is waiting for reads
+        let read: Vec<(usize, Result<ShardTop>)> = std::thread::scope(|scope| {
+            let shards: Vec<_> = todo
+                .iter()
+                .map(|&s| {
+                    let ask = asked[s];
+                    let top = scope.spawn(move || {
+                        let conn = open()?;
+                        let mut rows = shard_top(&conn, s, filter, by, descending, ask, limits)?;
+                        let whole = if by == Column::Size && descending {
+                            linked_sizes(&conn, s, filter, &mut rows, ask)?
+                        } else {
+                            HashMap::new()
+                        };
+                        Ok((rows, whole))
+                    });
+                    (s, top)
                 })
+                .collect();
+            shards.into_iter().map(|(s, t)| (s, t.join().unwrap_or_else(|e| std::panic::resume_unwind(e)))).collect()
+        });
+        for (s, top) in read {
+            tops[s] = top?;
+        }
+        let whole: HashMap<i64, i64> = tops.iter().flat_map(|(_, w)| w.iter().map(|(&k, &v)| (k, v))).collect();
+        let mut order: Vec<&ReleaseRow> = tops.iter().flat_map(|(rows, _)| rows).collect();
+        order.sort_by(|a, b| compare(a, b, by, descending, &whole));
+        let cutoff = order.get(keep.saturating_sub(1)).copied();
+        // what a shard hasn't given comes after its last row: only a last row ahead of the cutoff leaves room
+        todo = (0..store::SHARDS)
+            .filter(|&s| {
+                let rows = &tops[s].0;
+                asked[s] < want
+                    && rows.len() as i64 >= asked[s]
+                    && match (rows.last(), cutoff) {
+                        (Some(last), Some(cut)) => compare(last, cut, by, descending, &whole) == Ordering::Less,
+                        _ => true,
+                    }
             })
             .collect();
-        shards.into_iter().map(|t| t.join().unwrap_or_else(|e| std::panic::resume_unwind(e))).collect()
-    });
+        for &s in &todo {
+            asked[s] = asked[s].saturating_mul(2).min(want);
+        }
+    }
     let (mut rows, mut whole) = (Vec::new(), HashMap::new());
-    for top in tops {
-        let (top, sizes) = top?;
+    for (top, sizes) in tops {
         rows.extend(top);
         whole.extend(sizes);
     }
     rows.sort_by(|a, b| compare(a, b, by, descending, &whole));
-    rows.truncate(usize::try_from(want).unwrap_or(usize::MAX));
+    rows.truncate(keep);
     // the size it was ranked by, which is the one the page shows: a row the page hasn't worked out yet sorts by it too
     for row in &mut rows {
         if let Some(&total) = whole.get(&row.id) {
@@ -200,16 +245,16 @@ fn shard_top(
     limits: Limits,
 ) -> Result<Vec<ReleaseRow>> {
     let indexed = has_index(conn, s, by.index());
-    let leaves = filter.filter(|f| !f.uncategorized).map(|f| f.leaves.as_slice());
-    let Some(leaves) = leaves else {
-        // everything, or what has no category too: only the index can tell what's first without reading it all
+    // everything, or what has no category in a shard from before its list: only the index can tell what's first
+    // without reading it all
+    let Some(f) = filter.filter(|f| !f.uncategorized || uncategorized::listed(conn, s)) else {
         return if indexed {
             walk(conn, s, filter, by, descending, want, None).map(Option::unwrap_or_default)
         } else {
             read_all(conn, s, filter, by, descending, want)
         };
     };
-    let in_category = count_in(conn, s, leaves, limits.some.saturating_add(1))?;
+    let in_category = count_in(conn, s, f, limits.some.saturating_add(1))?;
     if in_category <= limits.few || !indexed {
         return read_all(conn, s, filter, by, descending, want);
     }
@@ -227,13 +272,22 @@ fn shard_top(
     }
 }
 
-/// How many releases of `leaves` the shard has, counting no further than `cap`.
-fn count_in(conn: &Connection, s: usize, leaves: &[i64], cap: i64) -> Result<i64> {
-    let sql = format!(
-        "select count(*) from (select 1 from s{s}.release_category where category in ({}) limit ?1)",
-        list(leaves)
-    );
+/// How many releases in `filter` the shard has, counting no further than `cap`.
+fn count_in(conn: &Connection, s: usize, filter: &CatFilter, cap: i64) -> Result<i64> {
+    let sql = format!("select count(*) from ({} limit ?1)", ids_in(s, filter));
     conn.query_row(&sql, [cap], |r| r.get(0))
+}
+
+/// The ids of the releases in `filter`, as SQL, off the category table and the list of those with none: never the
+/// whole shard. Only for a shard that has the list, if `filter` takes those.
+fn ids_in(s: usize, filter: &CatFilter) -> String {
+    let categorized =
+        format!("select release_id from s{s}.release_category where category in ({})", list(&filter.leaves));
+    if filter.uncategorized {
+        format!("{categorized} union all select release_id from s{s}.release_uncategorized")
+    } else {
+        categorized
+    }
 }
 
 /// ids come from the category table, never from the request, soo inlining them is safe
@@ -257,6 +311,11 @@ fn read_all(
             format!("s{s}.release_category c cross join s{s}.releases r on r.id = c.release_id"),
             format!("c.category in ({})", list(&f.leaves)),
         ),
+        // what has no category too, off its list
+        Some(f) if uncategorized::listed(conn, s) => {
+            (format!("({}) x cross join s{s}.releases r on r.id = x.release_id", ids_in(s, f)), String::from("1"))
+        }
+        // a shard from before the list
         Some(f) => (
             format!("s{s}.releases r left join s{s}.release_category c on c.release_id = r.id"),
             format!("(c.category in ({}) or c.release_id is null)", list(&f.leaves)),
@@ -541,7 +600,11 @@ mod tests {
         }
 
         fn shard(&self, group: &str) -> Connection {
-            db::open_shard(&store::shard_path(&self.main, store::shard_of(group))).unwrap()
+            self.shard_at(store::shard_of(group))
+        }
+
+        fn shard_at(&self, s: usize) -> Connection {
+            db::open_shard(&store::shard_path(&self.main, s)).unwrap()
         }
 
         fn index_all(&self) {
@@ -569,11 +632,11 @@ mod tests {
     const HD: i64 = 2040;
     const TV_HD: i64 = 5040;
     /// every shard reads its category whole
-    const READ_ALL: Limits = Limits { few: i64::MAX, some: i64::MAX, slack: 0 };
+    const READ_ALL: Limits = Limits { few: i64::MAX, some: i64::MAX, slack: 0, share: 1 };
     /// every shard walks the index, with all the time it needs
-    const WALK: Limits = Limits { few: 0, some: 0, slack: i64::MAX / 8 };
+    const WALK: Limits = Limits { few: 0, some: 0, slack: i64::MAX / 8, share: 1 };
     /// a walk gives up at once, and the category is read whole
-    const GIVE_UP: Limits = Limits { few: 0, some: i64::MAX, slack: i64::MIN / 2 };
+    const GIVE_UP: Limits = Limits { few: 0, some: i64::MAX, slack: i64::MIN / 2, share: 1 };
 
     /// An old, big UHD release, many newer small ones in a parent category, and big ones outside it.
     fn library(f: &Fixture) -> (i64, Vec<i64>) {
@@ -750,10 +813,36 @@ mod tests {
     fn a_column_is_ready_to_rank_once_every_shard_has_its_index() {
         let f = fixture();
         let conn = db::open_with_shards(&f.main).unwrap();
-        assert!(!all_indexed(&conn, Column::Size), "made without `--search-indexes`");
+        assert!(!all_ready(&conn, Column::Size), "made without `--search-indexes`");
         f.index_all();
-        assert!(all_indexed(&conn, Column::Size));
-        assert!(ready(Column::Group) && ready(Column::Category), "these need no index of their own");
+        assert!(all_ready(&conn, Column::Size));
+        assert!(all_ready(&conn, Column::Group) && all_ready(&conn, Column::Category), "no index of their own");
+        // a shard from before the list of releases with no category: no sort ranks until it's listed
+        conn.execute("delete from s3.meta where key = 'uncategorized_listed'", []).unwrap();
+        assert!(!all_ready(&conn, Column::Size) && !all_ready(&conn, Column::Group));
+        crate::category::uncategorized::fill(&f.shard_at(3)).unwrap();
+        assert!(all_ready(&conn, Column::Size) && all_ready(&conn, Column::Group));
+    }
+
+    #[test]
+    fn a_shard_with_most_of_the_top_is_read_again_until_it_has_given_its_part() {
+        let f = fixture();
+        let groups = groups();
+        // the ten biggest all in one shard, and one small row in each of the others
+        let mut big: Vec<i64> =
+            (0..10).map(|i| f.add(&format!("Big.{i}"), &groups[0], Some(1_000 + i), "2024-01-01", Some(UHD))).collect();
+        big.reverse();
+        for g in &groups[1..] {
+            f.add(&format!("Small.{g}"), g, Some(5), "2024-01-01", Some(UHD));
+        }
+        f.index_all();
+        let movies = crate::category::parse_filter(MOVIES).unwrap();
+        for limits in [READ_ALL, WALK] {
+            // each shard is asked for one row first, soo the first shard has to be asked four more times
+            assert_eq!(f.top(Some(&movies), Column::Size, true, 10, limits), big);
+            assert_eq!(f.top(None, Column::Size, true, 10, limits), big);
+            assert_eq!(f.top(Some(&movies), Column::Size, true, 3, limits), big[..3]);
+        }
     }
 
     #[test]

@@ -366,7 +366,9 @@ pub fn run(args: &[String]) -> i32 {
     if !apply {
         for (s, path) in store::shard_paths(&main).iter().enumerate() {
             let size = std::fs::metadata(path).map_or(0, |m| m.len());
-            println!("shard {s}: {path:?}, {size} bytes, would index poster, size, posted date and name");
+            println!(
+                "shard {s}: {path:?}, {size} bytes, would index poster, size, posted date and name, and list what has no category"
+            );
         }
         println!("add --apply to build them");
         return 0;
@@ -386,7 +388,13 @@ pub fn run(args: &[String]) -> i32 {
                  create index if not exists {SIZE_INDEX} on releases(size);
                  create index if not exists {POSTED_INDEX} on releases(posted_date);
                  create index if not exists {NAME_INDEX} on releases(lower(coalesce(display_name, name)));"
-            ))
+            ))?;
+            // what a shard from before the list has with no category, which a sort over a category reads
+            if crate::category::uncategorized::listed(&conn, 0) {
+                Ok(())
+            } else {
+                crate::category::uncategorized::fill(&conn)
+            }
         });
         if let Err(e) = built {
             println!("{}: {e}", path.display());

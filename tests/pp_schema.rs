@@ -43,7 +43,11 @@ fn an_old_shard_gets_the_new_tables_without_a_rewrite() {
     let (_dir, main, shard) = fixture();
     store::save(&main, &[release("a", 1, 1), release("b", 1, 1), release("c", 1, 1)]).unwrap();
     let conn = db::open_shard(&shard).unwrap();
-    conn.execute_batch("drop trigger archive_names_give_back").unwrap();
+    conn.execute_batch(
+        "drop trigger archive_names_give_back; drop trigger uncategorized_added; drop trigger uncategorized_gone;
+         drop table release_uncategorized; delete from meta where key = 'uncategorized_listed';",
+    )
+    .unwrap();
     for table in SHARD_TABLES {
         conn.execute_batch(&format!("drop trigger if exists gc_{0}; drop table {0};", table.name)).unwrap();
     }
@@ -76,6 +80,11 @@ fn an_old_shard_gets_the_new_tables_without_a_rewrite() {
         }
     }
     conn.query_row("select name_source from releases limit 1", [], |r| r.get::<_, Option<i64>>(0)).unwrap();
+    // the list of releases with no category is made, and filled only by `--search-indexes`, which reads every release
+    assert!(in_master(&conn, "table", "release_uncategorized"));
+    let listed: i64 =
+        conn.query_row("select count(*) from meta where key = 'uncategorized_listed'", [], |r| r.get(0)).unwrap();
+    assert_eq!(listed, 0);
     assert_eq!(names(&conn), before_names);
     assert!(pages(&conn) - before <= 4 * objects + 8, "{} pages grew to {}", before, pages(&conn));
 }

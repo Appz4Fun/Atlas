@@ -3761,7 +3761,8 @@ mod tests {
 
     #[test]
     fn a_sort_over_a_category_ranks_all_of_it() {
-        // by group: its index is made with the shard, soo it ranks whatever `--search-indexes` has done
+        crate::sorted::assume_ready(crate::sorted::Column::Group);
+        // by group, once its shards are ready to rank
         let size = Search::from_args(&parse_query("cat=2000&sort=group&dir=desc"));
         assert_eq!(size.ranked_by(), Some(crate::sorted::Column::Group));
         assert!(size.summary().contains("By group descending, over all of them"), "{}", size.summary());
@@ -3784,6 +3785,7 @@ mod tests {
 
     #[test]
     fn only_a_ranked_window_with_more_behind_it_grows() {
+        crate::sorted::assume_ready(crate::sorted::Column::Group);
         let ranked = Search::from_args(&parse_query("cat=2000&sort=group&dir=desc"));
         let full = Window { more_in_db: true, ..window_of_rows(Vec::new()) };
         assert!(full.can_grow(&ranked), "a page past 2000 reads further");

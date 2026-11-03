@@ -455,6 +455,8 @@ fn compact_shard(
          pragma cache_size = -262144;
          pragma temp_store = memory;
          drop trigger releases_ai; drop trigger releases_ad; drop trigger releases_au;
+         drop trigger uncategorized_added; drop trigger uncategorized_gone;
+         drop trigger uncategorized_categorized; drop trigger uncategorized_uncategorized;
          drop index idx_release_unique; drop index idx_release_group; drop index files_key;",
     )?;
     conn.execute("attach database ? as old", [path.to_string_lossy()])?;
@@ -750,6 +752,8 @@ fn compact_shard(
         let cols = copied_columns(&conn, table.name)?;
         conn.execute_batch(&format!("insert into main.{0} ({cols}) select {cols} from old.{0}", table.name))?;
     }
+    // the copy's list of releases with no category, from what it now holds, whether or not the original had one
+    crate::category::uncategorized::fill(&conn)?;
 
     halt(stop, shard)?;
     say("building indexes and the search index");
@@ -876,6 +880,8 @@ const CORE_TABLES: &[(&str, &str)] = &[
     ("release_ids", "release_id, id_hash, file_id"),
     ("meta", "key, value"),
     ("collections", "key, release_id"),
+    // made again from the copy's releases and categories, as the copy's triggers would
+    ("release_uncategorized", "release_id"),
 ];
 
 /// `table`'s columns in the original, comma joined, for a copy by name. One

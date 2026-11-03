@@ -4,6 +4,7 @@ pub mod lists;
 pub mod rules;
 pub mod step;
 pub mod table;
+pub mod uncategorized;
 
 use std::collections::{BTreeMap, HashMap};
 

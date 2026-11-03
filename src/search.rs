@@ -337,6 +337,12 @@ fn no_row_cursor_sql(s: usize) -> String {
     )
 }
 
+/// `no_row_cursor_sql` off the shard's list of them, which holds all of them. Like a leaf's, its hidden rows are
+/// rejected as they're read
+fn uncategorized_cursor_sql(s: usize) -> String {
+    format!("select release_id from s{s}.release_uncategorized order by release_id desc")
+}
+
 pub(crate) fn probe_sql(s: usize) -> String {
     format!("select {COLUMNS} from s{s}.releases r where r.id = ?1 and {VISIBLE_RELEASE}")
 }
@@ -361,18 +367,23 @@ pub fn newest_in_categories_with(
     }
     let want = offset + limit;
     let no_row = bounds.no_row.max(4 * want);
-    let mut stmts: Vec<(rusqlite::Statement<'_>, i64)> = Vec::new();
+    let mut stmts: Vec<(rusqlite::Statement<'_>, Option<i64>)> = Vec::new();
     for s in 0..store::SHARDS {
         for &leaf in &f.leaves {
-            stmts.push((conn.prepare(&leaf_cursor_sql(s))?, leaf));
+            stmts.push((conn.prepare(&leaf_cursor_sql(s))?, Some(leaf)));
         }
         if f.uncategorized {
-            stmts.push((conn.prepare(&no_row_cursor_sql(s))?, no_row));
+            // the list of releases with no category is read like a category, as far back as it goes
+            stmts.push(if crate::category::uncategorized::listed(conn, s) {
+                (conn.prepare(&uncategorized_cursor_sql(s))?, None)
+            } else {
+                (conn.prepare(&no_row_cursor_sql(s))?, Some(no_row))
+            });
         }
     }
     let mut cursors = Vec::with_capacity(stmts.len());
     for (stmt, value) in stmts.iter_mut() {
-        cursors.push(stmt.query([*value])?);
+        cursors.push(stmt.query(rusqlite::params_from_iter(value.iter()))?);
     }
     let mut heap = std::collections::BinaryHeap::new();
     for (i, c) in cursors.iter_mut().enumerate() {
@@ -392,7 +403,7 @@ pub fn newest_in_categories_with(
         }
         last = Some(id);
         scanned += 1;
-        // the no-row cursor filters on VISIBLE_RELEASE itself, soo only leaf rows get rejected here
+        // the no-row cursor filters on VISIBLE_RELEASE itself, soo only leaf and listed rows get rejected here
         let Some(hit) = probes[store::shard_of_id(id)].query_row([id], release_row).optional()? else {
             rejected += 1;
             if rejected > bounds.rejects {
@@ -815,6 +826,10 @@ mod tests {
         shard.execute("insert into release_category (release_id, category) select id, 5040 from releases where name like 'Cat.%'", []).unwrap();
         let filter = CatFilter { leaves: vec![], uncategorized: true };
         let tight = Bounds { no_row: 100, ..Bounds::DEFAULT };
+        // the shard's list of releases with no category has it, however far back
+        assert_eq!(ids(&f.newest(&filter, 0, 10, &tight)), [old]);
+        // a shard from before the list reads only as far back as the bound
+        shard.execute("delete from meta where key = 'uncategorized_listed'", []).unwrap();
         assert!(f.newest(&filter, 0, 10, &tight).rows.is_empty());
         assert_eq!(ids(&f.newest(&filter, 0, 10, &Bounds::DEFAULT)), [old]);
     }
