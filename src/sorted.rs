@@ -318,11 +318,20 @@ fn linked_sizes(
         _ => None,
     };
     if let Some(cutoff) = cutoff {
+        // only uploads with a row the page can list count towards the limit: bigger ones elsewhere don't crowd them out
+        let clause = match filter {
+            None => String::from("1"),
+            Some(f) if !f.uncategorized => format!("c.category in ({})", list(&f.leaves)),
+            Some(f) => format!("(c.category in ({}) or c.release_id is null)", list(&f.leaves)),
+        };
         let bigger = format!(
             "select l.lead_id from s{s}.upload_link l join s{s}.releases r on r.id = l.release_id
              group by l.lead_id
              having count(*) between 2 and {LINKED_ROWS} and sum(coalesce(r.size, 0)) > ?1
                 and exists (select 1 from s{s}.releases x where x.id = l.lead_id)
+                and exists (select 1 from s{s}.upload_link m join s{s}.releases r on r.id = m.release_id
+                            left join s{s}.release_category c on c.release_id = r.id
+                            where m.lead_id = l.lead_id and {VISIBLE_RELEASE} and {clause})
              order by sum(coalesce(r.size, 0)) desc limit ?2"
         );
         let leads: Vec<i64> = conn.prepare(&bigger)?.query_map([cutoff, want], |r| r.get(0))?.collect::<Result<_>>()?;
@@ -580,9 +589,24 @@ mod tests {
                 assert_eq!(up, [small], "indexed {indexed}");
             }
         }
+        // bigger uploads outside the category don't use up the uploads read in
+        let tv: Vec<i64> =
+            (0..3).map(|i| f.add(&format!("tv{i}a"), group, Some(5_000), "2026-10-03", Some(TV_HD))).collect();
+        for (i, &lead) in tv.iter().enumerate() {
+            let piece = f.add(&format!("tv{i}b"), group, Some(5_000), "2026-10-03", Some(TV_HD));
+            shard
+                .execute(
+                    "insert into upload_link (release_id, lead_id) values (?1, ?1), (?2, ?1)",
+                    rusqlite::params![lead, piece],
+                )
+                .unwrap();
+        }
+        for limits in [READ_ALL, WALK] {
+            assert_eq!(f.top(Some(&movies), Column::Size, true, 1, limits), [piece]);
+        }
         // a lead that's gone leaves its pieces on their own, as the page does
         shard.execute("delete from releases where id = ?", [lead]).unwrap();
-        assert_eq!(f.top(None, Column::Size, true, 2, READ_ALL), [big[2], big[1]]);
+        assert_eq!(f.top(Some(&movies), Column::Size, true, 2, READ_ALL), [big[2], big[1]]);
     }
 
     #[test]
