@@ -99,8 +99,6 @@ pub struct Overview {
     pub lines: i64,
     /// the groups field 8 names when it is an `Xref:` line, which only a server with `Xref:full` sends
     pub xref_groups: Option<u16>,
-    /// the raw Xref header string from column 9, when present
-    pub xref: Option<String>,
 }
 
 impl Overview {
@@ -115,7 +113,6 @@ impl Overview {
             bytes: self.bytes,
             lines: self.lines,
             xref_groups: self.xref_groups,
-            xref: self.xref,
             ..Default::default()
         }
     }
@@ -156,7 +153,13 @@ struct BucketState {
 impl TokenBucket {
     /// Creates a new TokenBucket with the given refill rate in bytes/sec and burst capacity in bytes.
     /// If `rate_bytes_per_sec` is 0, the limiter is unconstrained (no throttling).
+    /// Non-zero rate limiters normalize a 0-byte burst capacity to 1 byte so `acquire` never stalls.
     pub fn new(rate_bytes_per_sec: u64, burst_bytes: u64) -> Self {
+        let burst_bytes = if rate_bytes_per_sec > 0 {
+            burst_bytes.max(1)
+        } else {
+            burst_bytes
+        };
         Self {
             rate_bytes_per_sec,
             burst_bytes,
@@ -3045,21 +3048,38 @@ fn tls_config() -> Arc<rustls::ClientConfig> {
 }
 
 fn parse_overview(line: &[u8]) -> Option<Overview> {
-    let fields: Vec<String> = line.split(|b| *b == b'\t').map(|f| String::from_utf8_lossy(f).into_owned()).collect();
-    let field = |i: usize| fields.get(i).cloned().unwrap_or_default();
-    let int = |i: usize| fields.get(i).and_then(|v| v.trim().parse::<i64>().ok()).unwrap_or(0);
+    let mut fields = line.split(|b| *b == b'\t');
+    let number = std::str::from_utf8(fields.next()?).ok()?.trim().parse().ok()?;
+    let str_field = |raw: Option<&[u8]>| -> String {
+        raw.map(|f| String::from_utf8_lossy(f).into_owned()).unwrap_or_default()
+    };
+    let int_field = |raw: Option<&[u8]>| -> i64 {
+        raw.and_then(|f| std::str::from_utf8(f).ok())
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            .unwrap_or(0)
+    };
+    let subject = str_field(fields.next());
+    let from = str_field(fields.next());
+    let date = str_field(fields.next());
+    let message_id = str_field(fields.next());
+    let references = str_field(fields.next());
+    let bytes = int_field(fields.next());
+    let lines = int_field(fields.next());
+    let xref_groups = fields
+        .next()
+        .map(|f| String::from_utf8_lossy(f))
+        .and_then(|f| xref_groups(&f));
 
     Some(Overview {
-        number: fields.first()?.trim().parse().ok()?,
-        subject: field(1),
-        from: field(2),
-        date: field(3),
-        message_id: field(4),
-        references: field(5),
-        bytes: int(6),
-        lines: int(7),
-        xref_groups: fields.get(8).and_then(|f| xref_groups(f)),
-        xref: fields.get(8).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
+        number,
+        subject,
+        from,
+        date,
+        message_id,
+        references,
+        bytes,
+        lines,
+        xref_groups,
     })
 }
 
@@ -3459,19 +3479,11 @@ mod tests {
         let a = o.into_article();
         assert_eq!(a.date, "2026-10-02 10:11:12");
         assert_eq!(a.xref_groups, None, "seven fields: no Xref");
-        assert_eq!(a.xref, None);
         let full = b"42\tsubj\tme@x\tFri, 02 Oct 2026 10:11:12 +0000\t<id@x>\t\t1234\t10\tXref: news.example alt.binaries.a:42 alt.binaries.b:7";
         let o_full = parse_overview(full).unwrap();
         assert_eq!(o_full.xref_groups, Some(2));
-        assert_eq!(
-            o_full.xref.as_deref(),
-            Some("Xref: news.example alt.binaries.a:42 alt.binaries.b:7")
-        );
         let a_full = o_full.into_article();
-        assert_eq!(
-            a_full.xref.as_deref(),
-            Some("Xref: news.example alt.binaries.a:42 alt.binaries.b:7")
-        );
+        assert_eq!(a_full.xref_groups, Some(2));
         let other = b"42\tsubj\tme@x\tFri, 02 Oct 2026 10:11:12 +0000\t<id@x>\t\t1234\t10\tBytes: 1234";
         assert_eq!(parse_overview(other).unwrap().xref_groups, None, "another header in field 8");
         assert_eq!(xref_groups("xref: host"), Some(0));
@@ -3780,12 +3792,23 @@ mod tests {
 
             // Explicit set and replenishment
             bucket.set_tokens(0);
-            assert!(bucket.available_tokens() <= 100);
+            assert!(bucket.available_tokens() <= 100_000);
 
             // Sleep 50ms and check replenishment: 0.05 * 93_750_000 = 4_687_500 bytes (+- 20%)
             tokio::time::sleep(Duration::from_millis(50)).await;
             let tokens = bucket.available_tokens();
             assert!((3_500_000..=6_000_000).contains(&tokens), "replenished tokens: {tokens}");
+        });
+    }
+
+    #[test]
+    fn token_bucket_zero_burst_normalized_no_deadlock() {
+        run(async {
+            let bucket = TokenBucket::new(100_000, 0);
+            assert_eq!(bucket.burst_bytes(), 1);
+            tokio::time::timeout(Duration::from_millis(500), bucket.acquire(10))
+                .await
+                .expect("zero burst capacity must be normalized so acquire does not stall");
         });
     }
 

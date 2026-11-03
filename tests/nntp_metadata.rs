@@ -259,7 +259,7 @@ fn tc_t1_f22_1_dolby_vision_dvcc_dvvc_profile7_fel() {
     // dvvC/dvcC atom payload: version=1, profile=7 (byte 2 >> 1 = 7), level=6, el_present=1.
     // The configuration record preserves el_present=true while leaving fel=false until RPU/NLQ is inspected.
     let dv_box = [1, 0, (7 << 1), (6 << 3) | 0b011];
-    let dv_info = DolbyVisionInfo::parse_rpu(&dv_box).expect("must parse dvvC record");
+    let dv_info = DolbyVisionInfo::from_dvcc_dvvc(&dv_box).expect("must parse dvvC record");
     assert_eq!(dv_info.profile, 7);
     assert_eq!(dv_info.level, Some(6));
     assert!(dv_info.el_present);
@@ -270,7 +270,7 @@ fn tc_t1_f22_1_dolby_vision_dvcc_dvvc_profile7_fel() {
 fn tc_t1_f22_2_dolby_vision_dvcc_dvvc_profile8_cm29() {
     // dvvC atom payload: version=1, profile=8, level=6, el_present=0
     let dv_box = [1, 0, (8 << 1), (6 << 3) | 0b101];
-    let dv_info = DolbyVisionInfo::parse_rpu(&dv_box).expect("must parse dvvC record");
+    let dv_info = DolbyVisionInfo::from_dvcc_dvvc(&dv_box).expect("must parse dvvC record");
     assert_eq!(dv_info.profile, 8);
     assert_eq!(dv_info.level, Some(6));
     assert!(!dv_info.fel);
@@ -285,6 +285,13 @@ fn tc_t1_f22_3_dolby_vision_level253_crash_immunity() {
 
     let empty = &[];
     assert!(DolbyVisionInfo::parse_rpu(empty).is_none());
+
+    // Ordinary length-prefixed HEVC type-19 (IDR_W_RADL) sample of 2,560 bytes (`00 00 0A 00`)
+    // must not be misinterpreted as a Dolby Vision Profile 5 configuration record.
+    let mut idr_sample = vec![0x00, 0x00, 0x0A, 0x00, 19 << 1, 0x01];
+    idr_sample.resize(4 + 2_560, 0x55);
+    assert!(DolbyVisionInfo::parse_rpu(&idr_sample).is_none());
+    assert!(DolbyVisionInfo::parse_rpu_with_length_size(&idr_sample, 4).is_none());
 }
 
 // ============================================================================
@@ -356,6 +363,14 @@ fn tc_t1_f24_2_mp4_extended_size_mdat_offset() {
     let prefix = [ftyp.clone(), mdat_head].concat();
     let moov_offset = Mp4Prober::find_moov_offset(&prefix).expect("must calculate extended moov offset");
     assert_eq!(moov_offset, ftyp.len() as u64 + 500_000_000);
+
+    // Malformed extended-size box with u64::MAX must return None without arithmetic overflow
+    let mut overflow_free = vec![0u8; 16];
+    overflow_free[0..4].copy_from_slice(&1u32.to_be_bytes());
+    overflow_free[4..8].copy_from_slice(b"free");
+    overflow_free[8..16].copy_from_slice(&u64::MAX.to_be_bytes());
+    assert!(Mp4Prober::find_moov_offset(&overflow_free).is_none());
+    assert!(Mp4Prober::probe_tail_moov(&overflow_free).is_none());
 }
 
 // ============================================================================

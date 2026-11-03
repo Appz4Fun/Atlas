@@ -692,14 +692,20 @@ fn add_track(t: Track, info: &mut MediaInfo) {
 
 fn boxes(b: &[u8], each: &mut dyn FnMut(&[u8; 4], &[u8])) {
     let mut at = 0usize;
-    while let Some(head) = b.get(at..at + 8) {
+    while let Some(head_end) = at.checked_add(8)
+        && let Some(head) = b.get(at..head_end)
+    {
         let mut size = u32::from_be_bytes([head[0], head[1], head[2], head[3]]) as usize;
         let kind: [u8; 4] = [head[4], head[5], head[6], head[7]];
-        let mut start = at + 8;
+        let mut start = head_end;
         if size == 1 {
-            let Some(long) = b.get(at + 8..at + 16) else { return };
-            size = u64::from_be_bytes(long.try_into().unwrap_or([0; 8])) as usize;
-            start = at + 16;
+            let Some(ext_end) = at.checked_add(16) else { return };
+            let Some(long) = b.get(head_end..ext_end) else { return };
+            let Ok(long_size) = usize::try_from(u64::from_be_bytes(long.try_into().unwrap_or([0; 8]))) else {
+                return;
+            };
+            size = long_size;
+            start = ext_end;
         } else if size == 0 {
             size = b.len() - at;
         }
@@ -734,20 +740,28 @@ fn mp4(data: &[u8]) -> MediaInfo {
 /// Whether a top level `moov` is all there.
 fn has_whole_moov(data: &[u8]) -> bool {
     let mut at = 0usize;
-    while let Some(head) = data.get(at..at + 8) {
+    while let Some(head_end) = at.checked_add(8)
+        && let Some(head) = data.get(at..head_end)
+    {
         let mut size = u64::from(u32::from_be_bytes([head[0], head[1], head[2], head[3]]));
+        let mut head_size = 8u64;
         if size == 1 {
-            let Some(long) = data.get(at + 8..at + 16) else { return false };
+            let Some(ext_end) = at.checked_add(16) else { return false };
+            let Some(long) = data.get(head_end..ext_end) else { return false };
             size = u64::from_be_bytes(long.try_into().unwrap_or([0; 8]));
+            head_size = 16;
         } else if size == 0 {
             size = (data.len() - at) as u64;
         }
-        if size < 8 {
+        if size < head_size {
             return false;
         }
         let Some(end) = usize::try_from(size).ok().and_then(|s| at.checked_add(s)) else { return false };
         if &head[4..8] == b"moov" {
             return end <= data.len();
+        }
+        if end > data.len() {
+            return false;
         }
         at = end;
     }
@@ -755,11 +769,11 @@ fn has_whole_moov(data: &[u8]) -> bool {
 }
 
 fn be32(b: &[u8], at: usize) -> Option<u32> {
-    Some(u32::from_be_bytes(b.get(at..at + 4)?.try_into().ok()?))
+    Some(u32::from_be_bytes(b.get(at..at.checked_add(4)?)?.try_into().ok()?))
 }
 
 fn be16(b: &[u8], at: usize) -> Option<u16> {
-    Some(u16::from_be_bytes(b.get(at..at + 2)?.try_into().ok()?))
+    Some(u16::from_be_bytes(b.get(at..at.checked_add(2)?)?.try_into().ok()?))
 }
 
 fn moov(body: &[u8], full_data: &[u8], info: &mut MediaInfo) {
@@ -1166,13 +1180,6 @@ impl DolbyVisionInfo {
 
         if let Some(nal_payload) = Self::extract_rpu_nal(data)
             && let Some(info) = Self::parse_rpu_payload(nal_payload)
-        {
-            return Some(info);
-        }
-
-        if data.len() >= 4 && (data[0] == 1 || data[0] == 0) && data[1] == 0 && (data[2] >> 1) <= 10
-            && let Some(info) = Self::from_dvcc_dvvc(data)
-            && [4, 5, 7, 8].contains(&info.profile)
         {
             return Some(info);
         }
@@ -1883,12 +1890,15 @@ pub struct Mp4Prober;
 impl Mp4Prober {
     pub fn find_moov_offset(data: &[u8]) -> Option<u64> {
         let mut at = 0usize;
-        while let Some(head) = data.get(at..at + 8) {
+        while let Some(head_end) = at.checked_add(8)
+            && let Some(head) = data.get(at..head_end)
+        {
             let mut size = u64::from(u32::from_be_bytes([head[0], head[1], head[2], head[3]]));
             let kind = &head[4..8];
             let mut head_size = 8u64;
             if size == 1 {
-                let long = data.get(at + 8..at + 16)?;
+                let ext_end = at.checked_add(16)?;
+                let long = data.get(head_end..ext_end)?;
                 size = u64::from_be_bytes(long.try_into().unwrap_or([0; 8]));
                 head_size = 16;
             } else if size == 0 {
@@ -1898,9 +1908,13 @@ impl Mp4Prober {
                 return None;
             }
             if kind == b"mdat" {
-                return Some(at as u64 + size);
+                return (at as u64).checked_add(size);
             }
-            let end = at.checked_add(size as usize)?;
+            let step = usize::try_from(size).ok()?;
+            let end = at.checked_add(step)?;
+            if end > data.len() {
+                return None;
+            }
             at = end;
         }
         None
@@ -1916,7 +1930,9 @@ impl Mp4Prober {
 
     fn has_moov_box(data: &[u8]) -> bool {
         let mut at = 0usize;
-        while let Some(head) = data.get(at..at + 8) {
+        while let Some(head_end) = at.checked_add(8)
+            && let Some(head) = data.get(at..head_end)
+        {
             let mut size = u64::from(u32::from_be_bytes([head[0], head[1], head[2], head[3]]));
             let kind = &head[4..8];
             if !kind.iter().all(|b| b.is_ascii_graphic() || *b == b' ') {
@@ -1924,7 +1940,8 @@ impl Mp4Prober {
             }
             let mut head_size = 8u64;
             if size == 1 {
-                let Some(long) = data.get(at + 8..at + 16) else { return false };
+                let Some(ext_end) = at.checked_add(16) else { return false };
+                let Some(long) = data.get(head_end..ext_end) else { return false };
                 size = u64::from_be_bytes(long.try_into().unwrap_or([0; 8]));
                 head_size = 16;
             } else if size == 0 {

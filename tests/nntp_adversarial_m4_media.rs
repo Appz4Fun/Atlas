@@ -366,9 +366,10 @@ fn test_dovi_rpu_level253_crash_immunity() {
 
     // Extreme out-of-bounds level in dvvC/dvcC container box (e.g. level=63)
     let extreme_box = [1, 0, (8 << 1), (63 << 3) | 0b101];
-    let info_box = DolbyVisionInfo::parse_rpu(&extreme_box);
+    let info_box = DolbyVisionInfo::from_dvcc_dvvc(&extreme_box);
     assert!(info_box.is_some());
     assert_eq!(info_box.unwrap().profile, 8);
+    assert!(DolbyVisionInfo::parse_rpu(&extreme_box).is_none());
 
     // Fuzz with truncated payloads
     for len in 0..10 {

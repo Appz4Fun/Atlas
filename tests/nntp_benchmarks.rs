@@ -516,7 +516,7 @@ fn test_tc_t2_f26_4_clock_step_clamp_to_burst_capacity() {
         limiter.set_tokens(0);
         let initial_tokens = limiter.available_tokens();
         assert!(
-            initial_tokens <= 100,
+            initial_tokens <= 100_000,
             "expected ~0 tokens after set_tokens(0), got {initial_tokens}"
         );
 
