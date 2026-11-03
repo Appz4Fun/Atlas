@@ -1539,6 +1539,11 @@ pub fn get_par2(
             return Ok(None);
         }
         let covers = covers_all != 0;
+        if posted.as_ref().is_some_and(|p| p.len() != 21)
+            || (posted.is_none() && (par2_block.is_some() || par2_blocks.is_some()))
+        {
+            return Ok(None);
+        }
         if covers && (posted.is_none() || par2_block.is_none() || par2_blocks.is_none()) {
             return Ok(None);
         }
@@ -2121,8 +2126,10 @@ fn harvest_attached_release_tables(tx: &rusqlite::Transaction<'_>, schema: &str)
                  (name, group_name, content_id, covers_all, posted, par2_block, par2_blocks, parts, complete, content_fp)
              SELECT r.name, r.group_name,
                     CASE WHEN {par2_verified} THEN hcid.content_id ELSE NULL END,
-                    CASE WHEN fp.posted IS NOT NULL AND fp.par2_block IS NOT NULL THEN 1 ELSE 0 END,
-                    fp.posted, fp.par2_block, fp.par2_blocks,
+                    CASE WHEN length(fp.posted) = 21 AND fp.par2_block IS NOT NULL AND fp.par2_blocks IS NOT NULL THEN 1 ELSE 0 END,
+                    CASE WHEN length(fp.posted) = 21 THEN fp.posted ELSE NULL END,
+                    CASE WHEN length(fp.posted) = 21 THEN fp.par2_block ELSE NULL END,
+                    CASE WHEN length(fp.posted) = 21 THEN fp.par2_blocks ELSE NULL END,
                     CASE WHEN {par2_verified} THEN coalesce(r.parts, 0) ELSE 0 END,
                     CASE WHEN {par2_verified} THEN coalesce(r.complete, 0) ELSE 0 END,
                     fp.content
@@ -2130,7 +2137,7 @@ fn harvest_attached_release_tables(tx: &rusqlite::Transaction<'_>, schema: &str)
              JOIN {schema}.releases r ON r.id = fp.release_id
              LEFT JOIN temp.harvest_content_ids hcid ON hcid.release_id = r.id
              WHERE r.name IS NOT NULL AND r.group_name IS NOT NULL
-               AND (fp.posted IS NOT NULL OR fp.par2_block IS NOT NULL OR fp.content IS NOT NULL)
+               AND ((length(fp.posted) = 21 AND fp.par2_block IS NOT NULL AND fp.par2_blocks IS NOT NULL) OR fp.content IS NOT NULL)
              ORDER BY r.id DESC LIMIT {MAX_RAW_ARCHIVES_ROWS}
              ON CONFLICT(name, group_name) DO UPDATE SET
                 content_id = excluded.content_id,
@@ -2637,6 +2644,19 @@ mod tests {
         assert_eq!(saved_par2.content_fp.as_deref(), Some(&[7; 20][..]));
         assert_eq!(get_par2("Some.Release-GRP", "alt.binaries.test", cid_a, 25, true), None);
         assert_eq!(get_par2("Some.Release-GRP", "alt.binaries.test", cid_b, 20, true), None);
+        // Legacy 20-byte twin fingerprints are rejected by get_par2 (matching duplicates::forget_old_twins)
+        put_par2(&Par2Record {
+            name: "Legacy.Par2-GRP",
+            group_name: "alt.binaries.test",
+            content_id: cid_a,
+            covers_all: true,
+            posted: Some(&[1; 20]),
+            sizes: Some((384_000, 4_000)),
+            parts: 20,
+            complete: true,
+            content_fp: Some(&[7; 20]),
+        });
+        assert_eq!(get_par2("Legacy.Par2-GRP", "alt.binaries.test", cid_a, 20, true), None);
 
         // raw_meta counters match live table sizes (including UTF-8 byte length for CP437/box-drawing NFOs) and update on prune
         let non_ascii_info = r#"{"nfo":"██▓▒░ hi ░▒▓██"}"#;
