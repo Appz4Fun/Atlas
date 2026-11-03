@@ -131,6 +131,11 @@ impl Client {
 
     /// `url` holds any key, soo it's never logged and never in a `Trouble`.
     pub fn get(&self, url: &str, headers: &[(&str, &str)]) -> Result<Reply, Trouble> {
+        if let Some((200, cached_body)) = crate::raw_store::get_http_cache(self.name, url)
+            && let Ok(json) = serde_json::from_str::<Value>(&cached_body)
+        {
+            return Ok(Reply::Json(json));
+        }
         self.ready()?;
         let span = crate::metrics::span("media.request");
         let mut request = self.agent.get(url);
@@ -138,7 +143,7 @@ impl Client {
             request = request.header(*name, *value);
         }
         let sent = request.call();
-        self.counted(&span, is_outage(&sent), self.answer(sent))
+        self.counted(&span, is_outage(&sent), self.answer(sent, Some(url)))
     }
 
     /// As `get`, with a body that can hold a key.
@@ -146,7 +151,7 @@ impl Client {
         self.ready()?;
         let span = crate::metrics::span("media.request");
         let sent = self.agent.post(url).send_json(body);
-        self.counted(&span, is_outage(&sent), self.answer(sent))
+        self.counted(&span, is_outage(&sent), self.answer(sent, None))
     }
 
     fn counted(
@@ -179,7 +184,11 @@ impl Client {
         self.take_token()
     }
 
-    fn answer(&self, sent: Result<ureq::http::Response<ureq::Body>, ureq::Error>) -> Result<Reply, Trouble> {
+    fn answer(
+        &self,
+        sent: Result<ureq::http::Response<ureq::Body>, ureq::Error>,
+        cache_url: Option<&str>,
+    ) -> Result<Reply, Trouble> {
         let Ok(mut resp) = sent else { return Err(self.outage()) };
         match resp.status().as_u16() {
             200 => {
@@ -187,6 +196,12 @@ impl Client {
                 let Ok(json) = body else {
                     return Err(Trouble::Bad(format!("{}: a body that doesnt parse", self.name)));
                 };
+                if let Some(url) = cache_url
+                    && !crate::raw_store::is_empty_media_json(&json)
+                    && let Ok(text) = serde_json::to_string(&json)
+                {
+                    crate::raw_store::put_http_cache(self.name, url, 200, &text);
+                }
                 *self.pause.lock().unwrap() = Pause::default();
                 Ok(Reply::Json(json))
             }

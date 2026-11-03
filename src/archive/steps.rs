@@ -82,17 +82,31 @@ fn name_may_change(release: &ReleaseInfo, source: u8) -> bool {
 /// What a read comes to: its rows, unless the shard's names are over their total,
 /// and a name when the release has none better.
 fn finish(ctx: &StepCtx<'_>, source: i64, listing: Listing, limits: &ArchiveConfig) -> Result<Outcome, StepError> {
+    finish_with_override(ctx, source, listing, None, None, true, limits)
+}
+
+fn finish_with_override(
+    ctx: &StepCtx<'_>,
+    source: i64,
+    listing: Listing,
+    password_override: Option<super::Password>,
+    content_override: Option<Option<Vec<u8>>>,
+    persist_raw: bool,
+    limits: &ArchiveConfig,
+) -> Result<Outcome, StepError> {
     let release = ctx.release();
     let id = release.id;
     let mut writes = Vec::new();
     let rows = collapse_volumes(&listing.files);
+    let pw = password_override.unwrap_or_else(|| listing.password());
     let old: i64 = ctx
         .conn()
         .prepare_cached(archive_store::BYTES_OF_SOURCE)
         .and_then(|mut stmt| stmt.query_row(params![id, source], |r| r.get(0)))
         .map_err(retry)?;
     let used = store::get_meta(ctx.conn(), "archive_name_bytes").map_err(retry)?.unwrap_or(0);
-    let quota = limits.max_names_mb.saturating_mul(1 << 20) / store::SHARDS as i64;
+    let total_quota_bytes = limits.max_names_mb.saturating_mul(1 << 20);
+    let quota = total_quota_bytes / store::SHARDS as i64;
     let mut stored = false;
     // what this release already holds comes back when it's replaced
     if rows.is_empty() || used.saturating_sub(old) < quota {
@@ -126,9 +140,33 @@ fn finish(ctx: &StepCtx<'_>, source: i64, listing: Listing, limits: &ArchiveConf
     } else {
         duplicates::one_archive_set(files.iter().map(|f| f.filename.as_str()))
     };
-    let content = (listing.complete && !listing.damaged && speaks_for_release)
-        .then(|| duplicates::content_fingerprint(listing.files.iter().map(|f| (f.name.as_str(), f.size))))
-        .flatten();
+    let content = match content_override {
+        Some(fp) => fp,
+        None => (listing.complete && !listing.damaged && speaks_for_release)
+            .then(|| duplicates::content_fingerprint(listing.files.iter().map(|f| (f.name.as_str(), f.size))))
+            .flatten(),
+    };
+    if persist_raw {
+        let content_id = crate::raw_store::release_content_id(ctx.conn(), id).unwrap_or_default();
+        let check_bytes = listing.password_check.map(|c| c.to_bytes());
+        crate::raw_store::put_archive(&crate::raw_store::ArchiveRecord {
+            name: &release.name,
+            group_name: &release.group,
+            content_id: &content_id,
+            source,
+            files: &rows,
+            password: (source != SOURCE_PAR2).then(|| pw.code()),
+            encryption: listing.encryption.map(super::Encryption::code),
+            names_hidden: listing.headers_encrypted,
+            password_check: check_bytes.as_deref(),
+            parts: release.parts,
+            complete: release.complete,
+            listing_complete: listing.complete,
+            listing_damaged: listing.damaged,
+            content_fp: (source != SOURCE_PAR2).then_some(content.as_deref()).flatten(),
+            max_names_bytes: total_quota_bytes,
+        });
+    }
     // a PAR2 set of archive volumes says nothing about what's inside them: that's the archive step's to say
     let leaves_it = source == SOURCE_PAR2 && duplicates::lists_archives(listing.files.iter().map(|f| f.name.as_str()));
     if !leaves_it {
@@ -138,13 +176,13 @@ fn finish(ctx: &StepCtx<'_>, source: i64, listing: Listing, limits: &ArchiveConf
         });
     }
     if source != SOURCE_PAR2 {
-        writes.push(StepWrite::new(archive_store::UPSERT_RELEASE, vec![id.into(), listing.password().code().into()]));
-        if let Some(encryption) = listing.encryption {
+        writes.push(StepWrite::new(archive_store::UPSERT_RELEASE, vec![id.into(), pw.code().into()]));
+        if listing.encryption.is_some() || listing.headers_encrypted || listing.password_check.is_some() {
             writes.push(StepWrite::new(
                 archive_store::SET_ENCRYPTION,
                 vec![
                     id.into(),
-                    encryption.code().into(),
+                    listing.encryption.map(super::Encryption::code).into(),
                     i64::from(listing.headers_encrypted).into(),
                     listing.password_check.map(|check| check.to_bytes()).into(),
                 ],
@@ -164,12 +202,82 @@ fn finish(ctx: &StepCtx<'_>, source: i64, listing: Listing, limits: &ArchiveConf
         .map(|n| NameChange { display_name: Some(n), obfuscated: Some(release.is_obfuscated), source: name_source });
 
     Ok(Outcome {
-        matched: stored || listing.password() == super::Password::Yes,
+        matched: stored || pw == super::Password::Yes,
         writes,
         name,
         rerun: if stored { RERUN_ON_INNER_FILES } else { 0 },
         ..Default::default()
     })
+}
+
+fn restore_archive(
+    ctx: &StepCtx<'_>,
+    saved: crate::raw_store::SavedArchive,
+    limits: &ArchiveConfig,
+) -> Result<Outcome, StepError> {
+    let source = saved.files.first().map(|f| f.source).unwrap_or_else(|| {
+        match saved.encryption.and_then(super::Encryption::from_code) {
+            Some(super::Encryption::SevenZipAes256) => SOURCE_7Z,
+            Some(super::Encryption::ZipCrypto | super::Encryption::ZipAes) => SOURCE_ZIP,
+            _ => SOURCE_RAR,
+        }
+    });
+    let files: Vec<InnerFile> = saved.files.into_iter().map(|f| InnerFile { name: f.name, size: f.size }).collect();
+    let password_override = saved.password.and_then(super::Password::from_code);
+    let encrypted =
+        password_override == Some(super::Password::Yes) || saved.encryption.is_some() || saved.names_hidden;
+    let listing = Listing {
+        files,
+        encrypted,
+        headers_encrypted: saved.names_hidden,
+        encryption: saved.encryption.and_then(super::Encryption::from_code),
+        password_check: saved.password_check.as_deref().and_then(super::PasswordTest::from_bytes),
+        complete: saved.listing_complete,
+        damaged: saved.listing_damaged,
+        need_more_tail: false,
+    };
+    finish_with_override(ctx, source, listing, password_override, Some(saved.content_fp), false, limits)
+}
+
+fn restore_par2(
+    ctx: &StepCtx<'_>,
+    saved_files: Vec<crate::raw_store::SavedArchiveFile>,
+    meta: Option<crate::raw_store::SavedPar2>,
+    limits: &ArchiveConfig,
+) -> Result<Outcome, StepError> {
+    let restored: Vec<InnerFile> =
+        saved_files.into_iter().map(|f| InnerFile { name: f.name, size: f.size }).collect();
+    let covers_all = meta.as_ref().is_some_and(|m| m.covers_all);
+    let content_fp = meta.as_ref().and_then(|m| m.content_fp.clone());
+    let mut outcome = finish_with_override(
+        ctx,
+        SOURCE_PAR2,
+        Listing { files: restored, complete: covers_all, ..Default::default() },
+        None,
+        Some(content_fp),
+        false,
+        limits,
+    )?;
+    let id = ctx.release().id;
+    if !covers_all {
+        outcome.writes.retain(|write| write.sql != duplicates::SET_CONTENT);
+        outcome.writes.push(StepWrite::new(duplicates::CLEAR_POSTED, vec![id.into()]));
+    }
+    if let Some(m) = meta {
+        if let Some(inv) = &m.inventory {
+            outcome.writes.extend(archive_store::par2_file_writes(id, inv));
+        }
+        if let Some(posted) = m.posted {
+            outcome.writes.push(StepWrite::new(duplicates::SET_POSTED, vec![id.into(), posted.into()]));
+        }
+        if let Some((block, blocks)) = m.sizes {
+            outcome.writes.push(StepWrite::new(
+                duplicates::SET_PAR2_SIZES,
+                vec![id.into(), block.into(), blocks.into()],
+            ));
+        }
+    }
+    Ok(outcome)
 }
 
 macro_rules! limits_from_enabled {
@@ -212,9 +320,36 @@ impl Step for Par2Step {
     fn run(&self, ctx: &mut StepCtx<'_>) -> Result<Outcome, StepError> {
         let files = ctx.files().map_err(retry)?;
         let Some(file) = select::par2_source(&files) else { return Ok(Outcome::default()) };
+        let rel_id = ctx.release().id;
+        let rel_name = ctx.release().name.clone();
+        let rel_group = ctx.release().group.clone();
+        let rel_parts = ctx.release().parts;
+        let rel_complete = ctx.release().complete;
+        let content_id = crate::raw_store::release_content_id(ctx.conn(), rel_id).unwrap_or_default();
+        let saved_par2 = crate::raw_store::get_archive_files(&rel_name, &rel_group, &content_id, SOURCE_PAR2);
+        let par2_meta = crate::raw_store::get_par2(&rel_name, &rel_group, &content_id, rel_parts, rel_complete);
+        if !crate::raw_store::is_explicit_rerun(ctx.conn(), rel_id, PAR2_STEP)
+            && !saved_par2.is_empty()
+            && let Some(meta) = par2_meta.as_ref().filter(|m| m.inventory.is_some())
+        {
+            let limits = self.limits.lock().unwrap().clone();
+            return restore_par2(ctx, saved_par2, Some(meta.clone()), &limits);
+        }
         let is_base = select::classify(&file.filename) == Kind::Par2Base;
-        let Some(seg) = first_article(ctx, file)? else { return Ok(Outcome::default()) };
-        let Some(mut body) = fetch_one(ctx, &seg, &file.filename)? else { return Ok(Outcome::default()) };
+        let Some(seg) = first_article(ctx, file)? else {
+            if !saved_par2.is_empty() {
+                let limits = self.limits.lock().unwrap().clone();
+                return restore_par2(ctx, saved_par2, par2_meta, &limits);
+            }
+            return Ok(Outcome::default());
+        };
+        let Some(mut body) = fetch_one(ctx, &seg, &file.filename)? else {
+            if !saved_par2.is_empty() {
+                let limits = self.limits.lock().unwrap().clone();
+                return restore_par2(ctx, saved_par2, par2_meta, &limits);
+            }
+            return Ok(Outcome::default());
+        };
         let mut inventory = par2::inventory(&body);
         if !inventory.complete {
             // a base's next article, or a volume's last: a volume can start with a recovery slice
@@ -251,6 +386,22 @@ impl Step for Par2Step {
             let blocks: u64 = inventory.files.iter().map(|f| f.size.div_ceil(block)).sum();
             (block as i64, blocks as i64)
         });
+        let leaves_content = duplicates::lists_archives(inventory.files.iter().map(|f| f.name.as_str()));
+        let content_fp = (covers_all && !leaves_content)
+            .then(|| duplicates::content_fingerprint(inventory.files.iter().map(|f| (f.name.as_str(), Some(f.size)))))
+            .flatten();
+        crate::raw_store::put_par2(&crate::raw_store::Par2Record {
+            name: &rel_name,
+            group_name: &rel_group,
+            content_id: &content_id,
+            covers_all,
+            posted: posted.as_deref(),
+            sizes,
+            parts: rel_parts,
+            complete: rel_complete,
+            content_fp: content_fp.as_deref(),
+            inventory: Some(&inventory),
+        });
         // the set's files, hashes and all: what the link step and twin fill go by without reading the set again
         let kept = archive_store::par2_file_writes(ctx.release().id, &inventory);
         let mut outcome = finish(ctx, SOURCE_PAR2, listing_of(inventory), &limits)?;
@@ -282,6 +433,8 @@ pub fn next_probe_slot(next: &mut Option<Instant>, now: Instant, gap: Duration) 
 }
 
 /// Reads an archive's list of files.
+pub const LIST_STEP: StepId = StepId(2);
+
 #[derive(Default)]
 pub struct ListStep {
     limits: Mutex<ArchiveConfig>,
@@ -369,7 +522,7 @@ fn seven_list(
 
 impl Step for ListStep {
     fn id(&self) -> StepId {
-        StepId(2)
+        LIST_STEP
     }
     fn name(&self) -> &'static str {
         "archive_list"
@@ -390,6 +543,38 @@ impl Step for ListStep {
     fn run(&self, ctx: &mut StepCtx<'_>) -> Result<Outcome, StepError> {
         let limits = self.limits.lock().unwrap().clone();
         let files = ctx.files().map_err(retry)?;
+        let rel = ctx.release();
+        let rel_id = rel.id;
+        let rel_name = rel.name.clone();
+        let rel_group = rel.group.clone();
+        let content_id = crate::raw_store::release_content_id(ctx.conn(), rel_id).unwrap_or_default();
+        if !crate::raw_store::is_explicit_rerun(ctx.conn(), rel_id, LIST_STEP) {
+            if let Some(saved) =
+                crate::raw_store::get_archive(&rel_name, &rel_group, &content_id, rel.parts, rel.complete)
+            {
+                return restore_archive(ctx, saved, &limits);
+            }
+            if select::par2_source(&files).is_none() {
+                let saved_par2 = crate::raw_store::get_archive_files(&rel_name, &rel_group, &content_id, SOURCE_PAR2);
+                if !saved_par2.is_empty()
+                    && let Some(inv) =
+                        crate::raw_store::get_par2_files(&rel_name, &rel_group, &content_id).filter(|i| i.complete)
+                {
+                    let restored = saved_par2.into_iter().map(|f| InnerFile { name: f.name, size: f.size }).collect();
+                    let mut outcome = finish_with_override(
+                        ctx,
+                        SOURCE_PAR2,
+                        Listing { files: restored, complete: false, ..Default::default() },
+                        None,
+                        Some(None),
+                        false,
+                        &limits,
+                    )?;
+                    outcome.writes.extend(archive_store::par2_file_writes(rel_id, &inv));
+                    return Ok(outcome);
+                }
+            }
+        }
         let mut left = limits.max_bodies_per_release.max(0) as usize;
         let gap = Duration::from_secs(60) / limits.probes_per_minute.max(1) as u32;
         for head in select::plan(&files, limits.probe_files.max(0) as usize) {
@@ -418,11 +603,12 @@ impl Step for ListStep {
                 Format::Par2 => {
                     // a PAR2 under another name: without a list, it cant replace the rows of one that had
                     let inventory = par2::inventory(&body);
-                    let kept = archive_store::par2_file_writes(ctx.release().id, &inventory);
-                    let listing = listing_of(inventory);
-                    if listing.files.is_empty() {
+                    if inventory.files.is_empty() {
                         continue;
                     }
+                    crate::raw_store::put_par2_files(&rel_name, &rel_group, &content_id, &inventory);
+                    let kept = archive_store::par2_file_writes(ctx.release().id, &inventory);
+                    let listing = listing_of(inventory);
                     let listed = listing.files.len();
                     let mut outcome = finish(ctx, SOURCE_PAR2, listing, &limits)?;
                     outcome.writes.extend(kept);
@@ -444,6 +630,29 @@ impl Step for ListStep {
                 // images: stop, with at most a prefix read
                 Format::Image => return Ok(Outcome::default()),
                 Format::Media | Format::Unknown => continue,
+            }
+        }
+        let rel = ctx.release();
+        if let Some(saved) = crate::raw_store::get_archive(&rel.name, &rel.group, &content_id, 0, false) {
+            return restore_archive(ctx, saved, &limits);
+        }
+        if select::par2_source(&files).is_none() {
+            let saved_par2 = crate::raw_store::get_archive_files(&rel_name, &rel_group, &content_id, SOURCE_PAR2);
+            if !saved_par2.is_empty() {
+                let restored = saved_par2.into_iter().map(|f| InnerFile { name: f.name, size: f.size }).collect();
+                let mut outcome = finish_with_override(
+                    ctx,
+                    SOURCE_PAR2,
+                    Listing { files: restored, complete: false, ..Default::default() },
+                    None,
+                    Some(None),
+                    false,
+                    &limits,
+                )?;
+                if let Some(inv) = crate::raw_store::get_par2_files(&rel_name, &rel_group, &content_id) {
+                    outcome.writes.extend(archive_store::par2_file_writes(rel_id, &inv));
+                }
+                return Ok(outcome);
             }
         }
         Ok(Outcome::default())

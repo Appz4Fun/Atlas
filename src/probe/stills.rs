@@ -374,6 +374,31 @@ impl Step for StillsStep {
         {
             return Ok(Outcome { matched: true, ..Outcome::default() });
         }
+        let rel_name = ctx.release().name.clone();
+        let rel_group = ctx.release().group.clone();
+        let content_id = crate::raw_store::release_content_id(ctx.conn(), release_id).unwrap_or_default();
+        let saved_stills = crate::raw_store::get_stills(&rel_name, &rel_group, &content_id);
+        if !crate::raw_store::is_explicit_rerun(ctx.conn(), release_id, STILLS_STEP)
+            && saved_stills.len() == POSITIONS.len()
+            && saved_stills.iter().all(|s| s.phash.is_some() && still_file(&s.sha256).is_some_and(|f| f.exists()))
+        {
+            let mut writes = vec![StepWrite::new(DROP_STILLS, vec![release_id.into()])];
+            for s in saved_stills {
+                writes.push(StepWrite::new(
+                    SET_STILL,
+                    vec![
+                        release_id.into(),
+                        i64::from(s.position).into(),
+                        s.at_ms.into(),
+                        s.sha256.into(),
+                        i64::from(s.width).into(),
+                        i64::from(s.height).into(),
+                        s.phash.into(),
+                    ],
+                ));
+            }
+            return Ok(Outcome { matched: true, writes, ..Outcome::default() });
+        }
         let info: Option<String> = ctx
             .conn()
             .query_row("select info from release_probe where release_id = ?1", [release_id], |r| r.get(0))
@@ -404,24 +429,38 @@ impl Step for StillsStep {
         };
         let mut writes = vec![StepWrite::new(DROP_STILLS, vec![release_id.into()])];
         let mut made = 0;
+        let mut raw_saved = Vec::new();
         for percent in POSITIONS {
             let Some((file, part)) = part_at(&layout, percent) else { continue };
             let Some((frame, at)) = keyframe_from(ctx, &layout, file, part, track.number)? else { continue };
             let Some((jpeg, w, h, phash)) = still_of(&track, &frame) else { continue };
             let Some(sha256) = keep(&jpeg) else { continue };
+            let at_ms = track.millis(at);
+            let phash_i64 = phash.map(|p| p as i64);
             made += 1;
+            raw_saved.push(crate::raw_store::SavedStill {
+                position: percent,
+                at_ms: Some(at_ms),
+                sha256: sha256.clone(),
+                width: w,
+                height: h,
+                phash: phash_i64,
+            });
             writes.push(StepWrite::new(
                 SET_STILL,
                 vec![
                     release_id.into(),
                     i64::from(percent).into(),
-                    track.millis(at).into(),
+                    at_ms.into(),
                     sha256.into(),
                     i64::from(w).into(),
                     i64::from(h).into(),
-                    phash.map(|p| p as i64).into(),
+                    phash_i64.into(),
                 ],
             ));
+        }
+        if !raw_saved.is_empty() {
+            crate::raw_store::put_stills(&rel_name, &rel_group, &content_id, &raw_saved);
         }
         Ok(Outcome { matched: made > 0, writes, ..Outcome::default() })
     }

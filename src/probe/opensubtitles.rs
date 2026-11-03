@@ -198,15 +198,26 @@ impl Step for OpenSubtitlesStep {
         if Self::already_asked(ctx, &hash)? {
             return Ok(Outcome::default());
         }
-        let Some((key, base, client)) = self.client() else { return Ok(Outcome::default()) };
-        let url = format!("{base}/subtitles?moviehash={}", encode(&hash));
-        let reply = match client.get(&url, &[("Api-Key", &key), ("Accept", "application/json")]) {
-            Ok(Reply::Json(json)) => best_match(&json),
-            Ok(Reply::NotFound) => None,
-            Err(Trouble::Paused(until) | Trouble::BadKey(until)) => {
-                return Ok(Outcome { wait_until: Some(until), ..Outcome::default() });
+        let reply = if let Some(cached) = crate::raw_store::get_opensubtitles(&hash) {
+            cached
+        } else {
+            let Some((key, base, client)) = self.client() else { return Ok(Outcome::default()) };
+            let url = format!("{base}/subtitles?moviehash={}", encode(&hash));
+            match client.get(&url, &[("Api-Key", &key), ("Accept", "application/json")]) {
+                Ok(Reply::Json(json)) => {
+                    let matched = best_match(&json);
+                    crate::raw_store::put_opensubtitles(&hash, matched.as_ref());
+                    matched
+                }
+                Ok(Reply::NotFound) => {
+                    crate::raw_store::put_opensubtitles(&hash, None);
+                    None
+                }
+                Err(Trouble::Paused(until) | Trouble::BadKey(until)) => {
+                    return Ok(Outcome { wait_until: Some(until), ..Outcome::default() });
+                }
+                Err(Trouble::Bad(why)) => return Err(StepError::Retry(why)),
             }
-            Err(Trouble::Bad(why)) => return Err(StepError::Retry(why)),
         };
         let id = ctx.release().id;
         let f = reply.clone().unwrap_or_default();
