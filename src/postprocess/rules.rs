@@ -13,7 +13,7 @@ use rusqlite::{Connection, params};
 use crate::config::PostprocessConfig;
 use crate::filters::{self, StoredPost};
 
-static PAR2: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\.(vol[0-9]+\+[0-9]+\.par2|par2)$").unwrap());
+pub(crate) static PAR2: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\.(vol[0-9]+[+-][0-9]+\.par2|par2)$").unwrap());
 /// a file nothing should fetch a body of
 pub(crate) static IMAGE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\.(jpe?g|png|gif|webp|bmp|tiff?)$").unwrap());
@@ -177,7 +177,7 @@ pub fn judge_files(rules: &Rules, row: &RowFacts<'_>, s: &FileSummary, now: i64)
     if s.files < rules.min_files(row.group) {
         return Verdict::Reject(Reason::TooFewFiles);
     }
-    if rules.config.reject_par2_only && s.all_par2 {
+    if rules.config.reject_par2_only && s.all_par2 && !crate::parser::is_obfuscated(row.name) {
         return Verdict::Reject(Reason::Par2Only);
     }
     Verdict::Pass
@@ -189,6 +189,9 @@ pub fn permille(row: &RowFacts<'_>, s: &FileSummary) -> i64 {
         return 1000;
     }
     let by_parts = if s.wanted > 0 { s.present * 1000 / s.wanted } else { 0 };
+    if s.files == 1 && crate::parser::is_obfuscated(row.name) {
+        return by_parts;
+    }
     match row.file_total {
         Some(total) if total > s.files => by_parts.min(s.files * 1000 / total),
         _ => by_parts,
@@ -198,7 +201,7 @@ pub fn permille(row: &RowFacts<'_>, s: &FileSummary) -> i64 {
 /// Whether a release may have a body fetched: only these decide on size, type and completeness.
 pub fn body_gate(rules: &Rules, row: &RowFacts<'_>, s: &FileSummary) -> BodyGate {
     let c = &rules.config;
-    if row.size < c.body_min_size_bytes
+    if (row.size < c.body_min_size_bytes && !s.all_par2)
         || (c.body_max_size_bytes > 0 && row.size > c.body_max_size_bytes)
         || s.all_images
     {
@@ -296,6 +299,11 @@ mod tests {
             judge(&row(10, 2, true), &FileSummary { all_par2: true, ..summary() }),
             Verdict::Reject(Reason::Par2Only)
         );
+        // an obfuscated par2-only row is kept so Par2Step and LinkStep can name and link its upload
+        assert_eq!(
+            judge(&RowFacts { name: TOKEN, ..row(10, 2, true) }, &FileSummary { all_par2: true, ..summary() }),
+            Verdict::Pass
+        );
         let off = PostprocessConfig { reject_par2_only: false, ..Default::default() };
         assert_eq!(
             judge_files(&Rules::new(&off), &row(10, 2, true), &FileSummary { all_par2: true, ..summary() }, NOW),
@@ -338,6 +346,15 @@ mod tests {
         let short = RowFacts { file_total: Some(4), ..row(big, 100, false) };
         assert_eq!(permille(&short, &parts(100)), 500, "two files of four");
         assert_eq!(body_gate(&r, &short, &parts(100)), BodyGate::NotYet);
+        let one_missing = RowFacts { file_total: Some(3), ..row(big, 100, false) };
+        assert_eq!(permille(&one_missing, &parts(100)), 666, "two files of three");
+        assert_eq!(body_gate(&r, &one_missing, &parts(100)), BodyGate::NotYet);
+        // an obfuscated single-file row with a post-wide counter and a small par2 row open the gate
+        let obf_one = RowFacts { name: TOKEN, file_total: Some(10), ..row(big, 100, false) };
+        let one_whole = FileSummary { files: 1, present: 100, wanted: 100, ..summary() };
+        assert_eq!(body_gate(&r, &obf_one, &one_whole), BodyGate::Open);
+        let small_par2 = FileSummary { files: 1, present: 1, wanted: 1, all_par2: true, ..summary() };
+        assert_eq!(body_gate(&r, &RowFacts { name: TOKEN, ..row(50_000, 1, true) }, &small_par2), BodyGate::Open);
     }
 
     #[test]

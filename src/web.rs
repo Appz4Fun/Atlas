@@ -621,7 +621,7 @@ impl Search {
     /// unless the search is about one of its groups, or an upload linked by its PAR2 set, which is in one group soo it
     /// stays one row whatever the search.
     fn folds(&self, r: &ReleaseRow, post: &release_info::SplitPost) -> bool {
-        (self.fields.group.is_empty() || post.lead.is_some()) && post.listed_id() != r.id
+        (self.fields.group.is_empty() || post.lead.is_some() || post.groups.len() == 1) && post.listed_id() != r.id
     }
 
     /// Makes a row of a post say what all of the post comes to. When another row stands for it, that row's id: the
@@ -632,9 +632,20 @@ impl Search {
         r: &mut ReleaseRow,
         split: &mut HashMap<i64, release_info::SplitPost>,
     ) -> Option<i64> {
-        let post = conn.and_then(|conn| release_info::whole_post_with(conn, r).ok().flatten())?;
+        let Some(post) = conn.and_then(|conn| release_info::whole_post_with(conn, r).ok().flatten()) else {
+            if !r.complete
+                && let Some(conn) = conn
+                && release_info::single_post_complete(conn, r.id).unwrap_or(false)
+            {
+                r.complete = true;
+            }
+            return None;
+        };
         if self.folds(r, &post) {
             return Some(post.listed_id());
+        }
+        if post.lead.is_none() || !crate::parser::is_obfuscated(&r.name) {
+            r.name = release_info::post_stem(&r.name);
         }
         r.size = Some(post.size);
         r.complete = post.complete;
@@ -1196,9 +1207,27 @@ pub(crate) fn keep_sort_windows_warm(running: impl Fn() -> bool) {
 /// Each row's HTML, with what it shows beyond itself read for all of them at once.
 fn rows_html(found: &[ReleaseRow], split: HashMap<i64, release_info::SplitPost>) -> Vec<String> {
     let ids: Vec<i64> = found.iter().map(|r| r.id).collect();
-    let categories = crate::category::categories_of(&ids).unwrap_or_default();
+    let mut all_ids = ids.clone();
+    for post in split.values() {
+        all_ids.extend_from_slice(&post.ids);
+    }
+    all_ids.sort_unstable();
+    all_ids.dedup();
+    let mut categories = crate::category::categories_of(&all_ids).unwrap_or_default();
     let passwords = crate::archive::store::passwords(&ids);
-    let media = crate::media::query::attrs_of(&ids).unwrap_or_default();
+    let mut media = crate::media::query::attrs_of(&all_ids).unwrap_or_default();
+    for (&id, post) in &split {
+        if categories.get(&id).copied().unwrap_or(UNCATEGORIZED) == UNCATEGORIZED
+            && let Some(cat) = post.ids.iter().filter_map(|i| categories.get(i).copied()).find(|c| *c != UNCATEGORIZED)
+        {
+            categories.insert(id, cat);
+        }
+        if !media.contains_key(&id)
+            && let Some(m) = post.ids.iter().find_map(|i| media.get(i).cloned())
+        {
+            media.insert(id, m);
+        }
+    }
     // a post spread over several groups is all its rows together, whatever one of them holds
     let single: Vec<i64> = ids.iter().copied().filter(|id| !split.contains_key(id)).collect();
     let extras = RowExtras {
@@ -1624,34 +1653,73 @@ fn release_page(args: &HashMap<String, String>) -> ApiResponse {
         }
     };
     let ids = [id];
-    let category = crate::category::categories_of(&ids).unwrap_or_default().get(&id).copied();
+    let mut category = crate::category::categories_of(&ids).unwrap_or_default().get(&id).copied();
     let mut inner = crate::archive::store::view(id);
-    let media = crate::media::query::attrs_of(&ids).unwrap_or_default().remove(&id);
-    let names = release_info::names(id).unwrap_or_default();
+    let mut media = crate::media::query::attrs_of(&ids).unwrap_or_default().remove(&id);
+    let mut names = release_info::names(id).unwrap_or_default();
     let mut contents = release_info::contents(id).unwrap_or_default();
     let mut release = release;
     let mut whole_post = false;
+    let mut split_groups = None;
     // a post spread over several groups, or linked by its PAR2 set, is shown whole
     if let Ok(conn) = crate::db::open()
         && let Ok(Some(post)) = release_info::whole_post_with(&conn, &release)
     {
         contents = release_info::contents_of_split(&conn, &post).unwrap_or(contents);
+        split_groups = release_info::groups_of_ids(&conn, &post.ids).ok();
+        if post.lead.is_none() || !crate::parser::is_obfuscated(&release.name) {
+            release.name = release_info::post_stem(&release.name);
+            if let Some(names) = &mut names {
+                names.posted = release_info::post_stem(&names.posted);
+            }
+        }
         release.size = Some(post.size);
         release.complete = post.complete;
         release.parts = Some(contents.articles_seen);
         whole_post = true;
-        // a linked upload's file list is its set's, read from a volume
+        if category.unwrap_or(UNCATEGORIZED) == UNCATEGORIZED {
+            let cats = crate::category::categories_of(&post.ids).unwrap_or_default();
+            if let Some(found) = post.ids.iter().filter_map(|i| cats.get(i).copied()).find(|c| *c != UNCATEGORIZED) {
+                category = Some(found);
+            }
+        }
+        if media.is_none() {
+            let mut all_media = crate::media::query::attrs_of(&post.ids).unwrap_or_default();
+            media = post.ids.iter().find_map(|i| all_media.remove(i));
+        }
+        // a linked or split upload's file list may live on its recovery or base row
         if inner.files.is_empty()
-            && let Some(listed) =
-                post.recovery.iter().map(|id| crate::archive::store::view(*id)).find(|v| !v.files.is_empty())
+            && let Some(listed) = post
+                .recovery
+                .iter()
+                .chain(&post.ids)
+                .map(|id| crate::archive::store::view(*id))
+                .find(|v| !v.files.is_empty())
         {
             inner.files = listed.files;
         }
+    } else if !release.complete
+        && let Ok(conn) = crate::db::open()
+        && release_info::single_post_complete(&conn, release.id).unwrap_or(false)
+    {
+        release.complete = true;
     }
     let recovery = (!whole_post)
         .then(|| crate::db::open().ok().and_then(|conn| release_info::recovery_only_with(&conn, id).ok().flatten()))
         .flatten();
-    html(200, release_html(&release, category, &inner, media.as_ref(), names.as_ref(), &contents, recovery.as_ref()))
+    html(
+        200,
+        release_html(
+            &release,
+            category,
+            &inner,
+            media.as_ref(),
+            names.as_ref(),
+            &contents,
+            recovery.as_ref(),
+            split_groups.as_deref(),
+        ),
+    )
 }
 
 fn release_problem(status: u16, level: &str, title: &str, body: &str) -> ApiResponse {
@@ -1663,6 +1731,7 @@ fn release_problem(status: u16, level: &str, title: &str, body: &str) -> ApiResp
     html(status, page("Atlas", &content))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn release_html(
     r: &ReleaseRow,
     category: Option<i64>,
@@ -1671,6 +1740,7 @@ fn release_html(
     names: Option<&release_info::Names>,
     contents: &release_info::Contents,
     recovery: Option<&release_info::RecoveryOnly>,
+    split_groups: Option<&[release_info::GroupPosting]>,
 ) -> String {
     let category = category.unwrap_or(UNCATEGORIZED);
     let mut tags = String::new();
@@ -1716,7 +1786,9 @@ fn release_html(
     }
     fact("Posted", escape(&fmt_date(r.posted_date.as_deref())));
     let posted_name = names.map_or(r.name.as_str(), |n| n.posted.as_str());
-    let groups = release_info::groups_of(posted_name).unwrap_or_default();
+    let groups = split_groups
+        .map(<[release_info::GroupPosting]>::to_vec)
+        .unwrap_or_else(|| release_info::groups_of(posted_name).unwrap_or_default());
     if groups.len() > 1 {
         let list: Vec<String> = groups
             .iter()

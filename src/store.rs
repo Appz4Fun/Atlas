@@ -904,9 +904,10 @@ pub(crate) fn index_release(conn: &Connection, key: &IdKey, release_id: i64) -> 
 /// a release is complete when every file has exactly its parts, and there are
 /// as many files as the post said
 fn release_complete(conn: &Connection, release_id: i64, file_total: Option<i64>) -> Result<bool> {
-    let mut stmt = conn.prepare_cached("select expected, seen from files where release_id = ?")?;
+    let mut stmt = conn.prepare_cached("select expected, seen, subject from files where release_id = ?")?;
     let mut rows = stmt.query([release_id])?;
     let mut files = 0;
+    let mut zero_indexed = false;
     while let Some(row) = rows.next()? {
         files += 1;
         let expected: Option<i64> = row.get(0)?;
@@ -914,8 +915,28 @@ fn release_complete(conn: &Connection, release_id: i64, file_total: Option<i64>)
         if !expected.is_some_and(|e| is_exactly(&seen, e)) {
             return Ok(false);
         }
+        if !zero_indexed && let Some(subject) = row.get::<_, Option<String>>(2)? {
+            zero_indexed = crate::parser::has_zero_file_index(&subject);
+        }
     }
-    Ok(files > 0 && file_total.is_none_or(|ft| files == ft))
+    let wanted = file_total.map(|ft| ft + i64::from(zero_indexed));
+    Ok(files > 0 && wanted.is_none_or(|w| files == w))
+}
+
+/// Marks `complete = 1` on existing 0-indexed `[00/N]`..`[N/N]` releases whose `N + 1` files are all complete.
+pub fn repair_zero_indexed_complete(conn: &Connection) -> Result<usize> {
+    let mut stmt = conn.prepare(
+        "select id, file_total from releases where complete = 0 and file_total is not null and file_total > 0",
+    )?;
+    let candidates: Vec<(i64, i64)> = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_>>()?;
+    let mut fixed = 0;
+    let mut update = conn.prepare_cached("update releases set complete = 1 where id = ?1")?;
+    for (id, file_total) in candidates {
+        if release_complete(conn, id, Some(file_total))? {
+            fixed += update.execute([id])?;
+        }
+    }
+    Ok(fixed)
 }
 
 // ---------------------------------------------------------------- sealing
@@ -4225,5 +4246,28 @@ mod tests {
         let total: Option<i64> =
             conn.query_row("select file_total from releases where name = 'a.mkv'", [], |r| r.get(0)).unwrap();
         assert_eq!(total, None);
+    }
+
+    #[test]
+    fn zero_indexed_complete_repair_marks_existing_rows() {
+        let (_dir, main, conn) = fresh_shard_db();
+        let mut r = in_collection("k", "Show.S01E01", "a.nfo", "<a0@x>", "p");
+        r.articles[0].subject = "[00/02] - \"a.nfo\" yEnc (1/1)".into();
+        r.articles[0].file_total = Some(2);
+        let mut r1 = in_collection("k", "Show.S01E01", "b.par2", "<a1@x>", "p");
+        r1.articles[0].subject = "[01/02] - \"b.par2\" yEnc (1/1)".into();
+        r1.articles[0].file_total = Some(2);
+        let mut r2 = in_collection("k", "Show.S01E01", "c.mkv", "<a2@x>", "p");
+        r2.articles[0].subject = "[02/02] - \"c.mkv\" yEnc (1/1)".into();
+        r2.articles[0].file_total = Some(2);
+        r.articles.extend(r1.articles);
+        r.articles.extend(r2.articles);
+        save(&main, &[r]).unwrap();
+        let complete: i64 = conn.query_row("select complete from releases", [], |row| row.get(0)).unwrap();
+        assert_eq!(complete, 1);
+        conn.execute("update releases set complete = 0", []).unwrap();
+        assert_eq!(repair_zero_indexed_complete(&conn).unwrap(), 1);
+        let complete: i64 = conn.query_row("select complete from releases", [], |row| row.get(0)).unwrap();
+        assert_eq!(complete, 1);
     }
 }

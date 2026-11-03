@@ -81,11 +81,22 @@ fn apply_shard(
         shard_commits: 0,
     };
     let picked = |c: &Connection, after: i64| candidates(c, after);
+    let redo_mask = crate::postprocess::step::mask(crate::naming::NAMING)
+        | crate::postprocess::step::mask(crate::archive::steps::PAR2_STEP)
+        | crate::postprocess::step::mask(crate::archive::link::LINK_STEP);
     let write = |tx: &Connection, batch: &[(i64, String)]| -> rusqlite::Result<()> {
         let mut update = tx.prepare_cached("update releases set is_obfuscated = 1 where id = ?")?;
+        let mut clear_done =
+            tx.prepare_cached("update pp_state set done = done & ~?2, failed = failed & ~?2 where release_id = ?1")?;
+        let mut enqueue = tx.prepare_cached(
+            "insert into pp_queue (release_id, due_at) values (?1, 0)
+             on conflict(release_id) do update set due_at = min(pp_queue.due_at, excluded.due_at)",
+        )?;
         for (id, name) in batch {
             if flags(name) {
                 update.execute([id])?;
+                clear_done.execute(params![id, redo_mask])?;
+                enqueue.execute([id])?;
                 flagged.fetch_add(1, Relaxed);
             }
         }
