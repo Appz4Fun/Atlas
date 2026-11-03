@@ -224,11 +224,11 @@ struct Search {
 const SORT_WINDOW: i64 = 2_000;
 /// How far a window grows to fill a page when it also filters on tags, which are read from each name.
 const GROW_WITH_TAGS: i64 = 64_000;
-/// The deepest a ranked window reads: 20,000 pages of Load more, and a url asking for more can't make the server read
-/// a whole database into memory.
-const MAX_WINDOW: i64 = 1_000_000;
+/// The deepest a ranked window reads: 2,000 pages of Load more. Each shard reads up to this many before they're merged,
+/// soo a url asking for more can't make the server hold eight times a whole database at once.
+const MAX_WINDOW: i64 = 100_000;
 /// Rows kept across every window: past it, the grown windows of searches not used lately go back to their first pages.
-const ROWS_KEPT: usize = 2_000_000;
+const ROWS_KEPT: usize = 500_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum SortBy {
