@@ -206,6 +206,10 @@ fn block_head(b: &[u8]) -> Option<(u64, i16, u8, usize)> {
 
 /// The first keyframe of `track` in a cluster that starts in `data`.
 pub fn find_keyframe(data: &[u8], track: u64) -> Found {
+    // Each element is at least two bytes, so one pass over real clusters reads at most half as many elements as
+    // there are bytes. Cluster ids hidden in Void bodies would each start a walk to the data's end: the budget keeps
+    // that linear rather than quadratic.
+    let mut budget = data.len() / 2 + 4096;
     let mut from = 0;
     while let Some(pos) = memchr_cluster(data, from) {
         from = pos + 1;
@@ -213,6 +217,8 @@ pub fn find_keyframe(data: &[u8], track: u64) -> Found {
         let end = end.unwrap_or(usize::MAX);
         // the cluster's blocks, in order, until it ends or the data does
         while at < end {
+            let Some(left) = budget.checked_sub(1) else { return Found::None };
+            budget = left;
             let Some((id, size, start)) = element(data, at) else { break };
             let Some(size) = size.and_then(|s| usize::try_from(s).ok()) else { break };
             match id {
@@ -226,6 +232,8 @@ pub fn find_keyframe(data: &[u8], track: u64) -> Found {
                         let mut block = None;
                         let mut referenced = false;
                         for (cid, v) in children(body) {
+                            let Some(left) = budget.checked_sub(1) else { return Found::None };
+                            budget = left;
                             if cid == BLOCK && block.is_none() {
                                 block = Some((offset_of(body, v), v));
                             }
@@ -292,6 +300,21 @@ mod tests {
         let t = video_track(&fixture()).unwrap();
         assert_eq!((t.number, &t.codec), (1, &Codec::Hevc));
         assert_eq!(t.private[0], 1, "hvcC version");
+    }
+
+    #[test]
+    fn cluster_ids_hidden_in_voids_cost_linear_work() {
+        // a real looking cluster start, then Void elements each holding another one: every hidden cluster would
+        // start a walk over all the Voids after it
+        let start = [0x1F, 0x43, 0xB6, 0x75, 0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xE7, 0x81, 0x00];
+        let mut data = start.to_vec();
+        for _ in 0..40_000 {
+            data.extend([0xEC, 0x80 | start.len() as u8]);
+            data.extend(start);
+        }
+        let began = std::time::Instant::now();
+        assert_eq!(find_keyframe(&data, 1), Found::None);
+        assert!(began.elapsed() < std::time::Duration::from_secs(1), "{:?}", began.elapsed());
     }
 
     #[test]
