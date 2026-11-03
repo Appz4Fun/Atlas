@@ -337,7 +337,7 @@ fn no_row_cursor_sql(s: usize) -> String {
     )
 }
 
-fn probe_sql(s: usize) -> String {
+pub(crate) fn probe_sql(s: usize) -> String {
     format!("select {COLUMNS} from s{s}.releases r where r.id = ?1 and {VISIBLE_RELEASE}")
 }
 

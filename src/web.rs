@@ -219,7 +219,8 @@ struct Search {
     descending: bool,
 }
 
-/// Up to this many results get sorted: the newest or best matching ones.
+/// Up to this many results get sorted: the top ones by the column when the database can order by it, otherwise the
+/// newest or best matching ones.
 const SORT_WINDOW: i64 = 2_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -457,6 +458,23 @@ impl Search {
         kept
     }
 
+    /// The column a sort reads in from the database over the whole category, best first: with no words and no fields
+    /// asked, for every column but the rating, which comes from the providers and isn't in the database.
+    fn ranked_by(&self) -> Option<crate::sorted::Column> {
+        use crate::sorted::Column;
+        if !self.q.is_empty() || self.fields.any() {
+            return None;
+        }
+        match self.sort? {
+            SortBy::Size => Some(Column::Size),
+            SortBy::Posted => Some(Column::Posted),
+            SortBy::Name => Some(Column::Name),
+            SortBy::Group => Some(Column::Group),
+            SortBy::Category => Some(Column::Category),
+            SortBy::Rating => None,
+        }
+    }
+
     /// The search itself: one, whatever the filters.
     fn search(
         &self,
@@ -464,6 +482,11 @@ impl Search {
         from: i64,
         count: i64,
     ) -> Result<Vec<ReleaseRow>, String> {
+        if let Some(by) = self.ranked_by() {
+            let mut rows = crate::sorted::top(filter, by, self.descending, from + count).map_err(|e| e.to_string())?;
+            rows.drain(..usize::try_from(from).unwrap_or(0).min(rows.len()));
+            return Ok(rows);
+        }
         if self.fields.any() {
             field_search::find(&self.fields, &self.q, filter, from, count).map_err(|e| e.to_string())
         } else {
@@ -734,6 +757,11 @@ impl Search {
             }
         }
         let sort = match self.sort {
+            Some(by) if self.ranked_by().is_some() => format!(
+                "By {} {}, the top {SORT_WINDOW}",
+                by.word(),
+                if self.descending { "descending" } else { "ascending" }
+            ),
             Some(by) => format!(
                 "By {} {}, among the first {SORT_WINDOW}",
                 by.word(),
@@ -801,7 +829,7 @@ const WINDOW_IDLE_FRESH: Duration = Duration::from_secs(15 * 60);
 /// What counts as lately.
 const WINDOW_IN_USE: Duration = Duration::from_secs(10 * 60);
 /// Searches with a window: a filled one is a few MB.
-const WINDOWS_KEPT: usize = 24;
+const WINDOWS_KEPT: usize = 32;
 /// How long a click sorting by size waits for a new window's split posts, the most that a size can depend on. Past it
 /// the page goes by the sizes known so far, and the next click has them all.
 const SIZES_WAIT: Duration = Duration::from_secs(1);
@@ -1085,7 +1113,12 @@ fn still_kept(slot: &Arc<WindowSlot>) -> bool {
 }
 
 fn slot_of(search: &Search, always: bool) -> Arc<WindowSlot> {
-    let plain = Search { offset: 0, sort: None, descending: true, ..search.clone() };
+    // a sort read from the database in its own order has a window of its own; any other reads the newest
+    let plain = if search.ranked_by().is_some() {
+        Search { offset: 0, ..search.clone() }
+    } else {
+        Search { offset: 0, sort: None, descending: true, ..search.clone() }
+    };
     let key = plain.query(&plain.cat, 0);
     let mut windows = lock(&WINDOWS);
     if !windows.contains_key(&key) && windows.len() >= WINDOWS_KEPT {
@@ -3599,6 +3632,28 @@ mod tests {
         let other = s.sort_link(SortBy::Name, "Name");
         assert!(other.contains("sort=name&amp;dir=asc") && !other.contains("▼"), "{other}");
         assert_eq!(thousands(2_684_354_560), "2,684,354,560");
+    }
+
+    #[test]
+    fn a_sort_over_a_category_ranks_all_of_it() {
+        let size = Search::from_args(&parse_query("cat=2000&sort=size&dir=desc"));
+        assert_eq!(size.ranked_by(), Some(crate::sorted::Column::Size));
+        assert!(size.summary().contains("By size descending, the top 2000"), "{}", size.summary());
+        // its own window, not the newest releases': a window for each column and way
+        let asc = Search { descending: false, ..size.clone() };
+        let plain = Search { sort: None, ..size.clone() };
+        let keys: HashSet<String> =
+            [&size, &asc, &plain].iter().map(|s| slot_of(s, false).search.query("2000", 0)).collect();
+        assert_eq!(keys.len(), 3, "{keys:?}");
+        // the rating isn't in the database, and words and fields are ranked by the search
+        for query in ["cat=2000&sort=rating", "q=batman&sort=size", "poster=x&sort=size"] {
+            let s = Search::from_args(&parse_query(query));
+            assert_eq!(s.ranked_by(), None, "{query}");
+            if !s.fields.any() {
+                assert!(s.summary().contains("among the first 2000"), "{query}: {}", s.summary());
+            }
+            assert_eq!(slot_of(&s, false).search.sort, None, "{query}");
+        }
     }
 
     #[test]
