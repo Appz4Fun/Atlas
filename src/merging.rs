@@ -321,8 +321,10 @@ impl Par2Bridge {
                 }
 
                 // Step 3: RAR5 volume number vint fallback
-                if let Some(vol_num) = Self::parse_rar5_volume_num(&article_head.payload) {
-                    run.rar_volume_idx = Some(vol_num as u32);
+                if let Some(vol_num) = Self::parse_rar5_volume_num(&article_head.payload)
+                    && let Ok(vol_idx) = u32::try_from(vol_num)
+                {
+                    run.rar_volume_idx = Some(vol_idx);
                     let vol_p0 = format!("part{:03}.", vol_num);
                     let vol_p1 = format!("part{:02}.", vol_num);
                     let vol_p2 = format!("part{}.", vol_num);
@@ -404,7 +406,8 @@ impl Par2Bridge {
         // Archive flag 0x0002 = Volume number field present (0-based for volumes >= 2; absent on volume 1)
         if (archive_flags & 0x0002) != 0 {
             let (vol_num, _) = Self::read_vint(payload, pos)?;
-            Some(vol_num + 1)
+            let one_based = vol_num.checked_add(1)?;
+            u32::try_from(one_based).ok().map(u64::from)
         } else {
             Some(1)
         }
@@ -416,6 +419,9 @@ impl Par2Bridge {
         while pos < bytes.len() {
             let b = bytes[pos];
             pos += 1;
+            if shift == 63 && b > 1 {
+                return None;
+            }
             val |= ((b & 0x7F) as u64) << shift;
             if (b & 0x80) == 0 {
                 return Some((val, pos));
@@ -729,7 +735,8 @@ impl InterReleaseDeduplication {
                 (Some(ha), Some(hb)) => ha == hb && a.size == b.size,
                 _ => false,
             };
-            let lcm_match = a.lcm_matched_intervals >= 4 || b.lcm_matched_intervals >= 4;
+            let lcm_match = a.size == b.size
+                && (a.lcm_matched_intervals >= 4 || b.lcm_matched_intervals >= 4);
 
             if md5_match || lcm_match {
                 return ReleasePartition::Twin;
@@ -1272,5 +1279,49 @@ mod tests {
         let calibrated = ReleaseAssembler::join_runs(&[run1, giga_runs[0].clone()], None);
         assert_eq!(calibrated.len(), 1, "skew-calibrated Giganews run must join cleanly");
         assert_eq!(calibrated[0].runs.len(), 2);
+    }
+
+    #[test]
+    fn rar5_volume_num_rejects_overflow_and_out_of_range() {
+        // RAR5 signature + CRC32 + size vint (12) + type vint (1) + header_flags (0) + archive_flags (0x02) + vol_num = u64::MAX
+        let mut max_vint_payload = b"Rar!\x1A\x07\x01\x00\x00\x00\x00\x00\x0C\x01\x00\x02".to_vec();
+        max_vint_payload.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01]);
+        assert_eq!(Par2Bridge::parse_rar5_volume_num(&max_vint_payload), None);
+
+        // Volume number u32::MAX (0-based) -> one-based u32::MAX + 1 -> out of u32 range -> None
+        let mut u32_max_payload = b"Rar!\x1A\x07\x01\x00\x00\x00\x00\x00\x08\x01\x00\x02".to_vec();
+        u32_max_payload.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF, 0x0F]);
+        assert_eq!(Par2Bridge::parse_rar5_volume_num(&u32_max_payload), None);
+    }
+
+    #[test]
+    fn lcm_twin_classification_requires_equal_file_size() {
+        let a = ReleaseCandidate {
+            name: "Movie.1080p.PostA".into(),
+            full_md5: None,
+            size: 100_000_000,
+            unpacked_crc32: None,
+            yenc_total: Some(150),
+            creation_salt: None,
+            segment_uid: None,
+            lcm_matched_intervals: 4,
+            yenc_part_size: Some(750_000),
+        };
+        let mut b = a.clone();
+        b.name = "Movie.1080p.PostB".into();
+        b.yenc_total = Some(300);
+        b.yenc_part_size = Some(384_000);
+        assert_eq!(
+            InterReleaseDeduplication::partition_releases(&a, &b),
+            ReleasePartition::Twin,
+            "equal-sized candidates with >= 4 matched LCM intervals are Twin"
+        );
+
+        b.size = 200_000_000;
+        assert_eq!(
+            InterReleaseDeduplication::partition_releases(&a, &b),
+            ReleasePartition::Distinct,
+            "differing file sizes must not be classified as Twin via LCM intervals"
+        );
     }
 }

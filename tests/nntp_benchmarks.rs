@@ -156,9 +156,9 @@ fn test_tc_t1_f26_2_cpu_overhead_under_750mbit_load() {
             "expected wall time pacing of ~106ms, got {wall_elapsed:?}"
         );
 
-        // Now benchmark raw non-sleeping token manipulation CPU cost for the same operations
+        // Now benchmark non-sleeping token manipulation CPU cost on the enabled acquisition path
+        let raw_limiter = TokenBucket::new(RATE_750_MBIT, total_bytes as u64);
         let cpu_bench_start = Instant::now();
-        let raw_limiter = TokenBucket::new(0, DEFAULT_BURST_BYTES); // unconstrained
         for _ in 0..iterations {
             raw_limiter.acquire(chunk_size).await;
         }

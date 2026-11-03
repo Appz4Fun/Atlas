@@ -5,7 +5,9 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
-use std::sync::LazyLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use sha1::{Digest, Sha1};
 
@@ -64,12 +66,13 @@ pub fn get(path: &str, query: &str, cookies: Option<&str>, base: &str, api_key: 
         "/ui/poster" if signed_in => poster(&args),
         "/ui/cover" if signed_in => cover(&args),
         "/ui/still" if signed_in => still(&args),
+        "/ui/samefilm" if signed_in => same_film_panel(&args),
         "/ui/meta" if signed_in => crate::web_meta::fragment(&args),
         "/ui/row" if signed_in => crate::web_meta::row_panel(&args),
         "/ui/settings" if signed_in => html(200, settings_page(None)),
         "/ui/nzb" if signed_in && args.get("fill").is_some_and(|v| v == "1") => filled_nzb(&args),
         "/ui/nzb" if signed_in => get_nzb(&args),
-        "/ui/details" | "/ui/poster" | "/ui/cover" | "/ui/still" | "/ui/meta" | "/ui/row" => {
+        "/ui/details" | "/ui/poster" | "/ui/cover" | "/ui/still" | "/ui/samefilm" | "/ui/meta" | "/ui/row" => {
             ApiResponse { headers: vec![("HX-Redirect".into(), "/".into())], ..html(401, String::new()) }
         }
         "/ui/nzb" | "/ui/release" | "/ui/duplicates" | "/ui/settings" => redirect(Vec::new()),
@@ -204,6 +207,7 @@ fn search_query(q: &str, cat: &str, offset: i64) -> String {
     parts.join("&")
 }
 
+#[derive(Clone)]
 struct Search {
     q: String,
     cat: String,
@@ -218,7 +222,7 @@ struct Search {
 /// Up to this many results get sorted: the newest or best matching ones.
 const SORT_WINDOW: i64 = 2_000;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum SortBy {
     Name,
     Category,
@@ -255,8 +259,19 @@ fn sort_rows(
     categories: &HashMap<i64, i64>,
     scores: &HashMap<i64, i64>,
 ) {
+    rows.sort_by(|a, b| row_order(a, b, by, descending, categories, scores));
+}
+
+fn row_order(
+    a: &ReleaseRow,
+    b: &ReleaseRow,
+    by: SortBy,
+    descending: bool,
+    categories: &HashMap<i64, i64>,
+    scores: &HashMap<i64, i64>,
+) -> std::cmp::Ordering {
     let flip = |o: std::cmp::Ordering| if descending { o.reverse() } else { o };
-    rows.sort_by(|a, b| match by {
+    match by {
         SortBy::Name => flip(a.name.to_lowercase().cmp(&b.name.to_lowercase())),
         SortBy::Category => {
             let of =
@@ -283,7 +298,7 @@ fn sort_rows(
             (None, Some(_)) => std::cmp::Ordering::Greater,
             (None, None) => std::cmp::Ordering::Equal,
         },
-    });
+    }
 }
 
 /// How far back "Hide copies" looks for what a page's copies are copies of.
@@ -482,21 +497,16 @@ impl Search {
 
     /// The table rows, or a full-width diagnostic when the first page has none.
     fn body(&self) -> String {
+        if self.sorts_from_a_window() {
+            return self.body_from_window();
+        }
         let filter = parse_filter(&self.cat);
         let windowed = self.windowed();
         let (from, count) = if windowed { (0, SORT_WINDOW) } else { (self.offset, PAGE_SIZE) };
         let searched = self.search(filter.as_ref(), from, count);
         let found = match searched {
             Ok(found) => found,
-            Err(e) => {
-                eprintln!("web search failed: {e}");
-                let message = "Atlas couldn't read its database. The error is in its log. Search again in a moment.";
-                return if self.offset == 0 {
-                    diag("caution", "the search failed", message)
-                } else {
-                    format!("<tr><td colspan=\"{COLUMNS}\" class=\"note\">{}</td></tr>", escape(message))
-                };
-            }
+            Err(e) => return self.search_failed(&e),
         };
         let read = found.len() as i64;
         let tagged = |r: &ReleaseRow| self.has_tags(r);
@@ -554,32 +564,21 @@ impl Search {
         // hidden: its rows can look like copies of each other
         let mut split = HashMap::new();
         let conn = crate::db::open().ok();
-        let one_group = !self.fields.group.is_empty();
         let post_of =
             |r: &ReleaseRow| conn.as_ref().and_then(|conn| release_info::whole_post_with(conn, r).ok().flatten());
-        // an upload linked by its PAR2 set is in one group, soo it stays one row whatever the search
-        let folded = |r: &ReleaseRow, post: &release_info::SplitPost| {
-            (!one_group || post.lead.is_some()) && post.listed_id() != r.id
-        };
+        let folded = |r: &ReleaseRow, post: &release_info::SplitPost| self.folds(r, post);
         // a row folded into one that isn't on this page brings that one here in its place: a page of nothing but an
         // upload's recovery rows would show none of it
         let on_page: HashSet<i64> = found.iter().map(|r| r.id).collect();
         let mut brought = HashSet::new();
         found = std::mem::take(&mut found)
             .into_iter()
-            .filter_map(|mut r| {
-                let Some(post) = post_of(&r) else { return Some(r) };
-                if folded(&r, &post) {
-                    let listed = post.listed_id();
-                    if on_page.contains(&listed) || !brought.insert(listed) {
-                        return None;
-                    }
-                    r = conn.as_ref().and_then(|conn| crate::search::get_release_with(conn, listed).ok().flatten())?;
+            .filter_map(|mut r| match self.fold_split_post(conn.as_ref(), &mut r, &mut split) {
+                None => Some(r),
+                Some(listed) if !on_page.contains(&listed) && brought.insert(listed) => {
+                    self.bring(conn.as_ref(), listed, &mut split)
                 }
-                r.size = Some(post.size);
-                r.complete = post.complete;
-                split.insert(r.id, post);
-                Some(r)
+                Some(_) => None,
             })
             .collect();
         if hide_copies {
@@ -594,27 +593,91 @@ impl Search {
             let hidden = crate::duplicates::later_copies(&ids).unwrap_or_default();
             found.retain(|r| !hidden.contains(&r.id));
         }
-        let ids: Vec<i64> = found.iter().map(|r| r.id).collect();
-        let categories = crate::category::categories_of(&ids).unwrap_or_default();
-        let passwords = crate::archive::store::passwords(&ids);
-        let media = crate::media::query::attrs_of(&ids).unwrap_or_default();
-        // a post spread over several groups is all its rows together, whatever one of them holds
-        let single: Vec<i64> = ids.iter().copied().filter(|id| !split.contains_key(id)).collect();
-        let extras = RowExtras {
-            recovery: release_info::recovery_only_of(&single),
-            split,
-            copies: crate::duplicates::counts(&ids).unwrap_or_default(),
-            details: crate::media::details::kept_for(media.iter().map(|(id, m)| (*id, m.kind, &m.ids))),
-        };
-
-        let mut out: String = found.iter().map(|r| row(r, &categories, &passwords, &media, &extras)).collect();
+        let mut out = rows_html(&found, split).concat();
         if page_was_full {
-            let next = self.query(&self.cat, self.offset + PAGE_SIZE);
-            let next = attr(&next);
-            let _ = write!(
-                out,
-                "<tr><td colspan=\"{COLUMNS}\" class=\"note\"><a class=\"button\" href=\"/?{next}\" hx-get=\"/ui/results?{next}\" hx-target=\"closest tr\" hx-swap=\"outerHTML\">Load more</a></td></tr>"
-            );
+            out.push_str(&self.load_more());
+        }
+        out
+    }
+
+    fn search_failed(&self, error: &str) -> String {
+        eprintln!("web search failed: {error}");
+        let message = "Atlas couldn't read its database. The error is in its log. Search again in a moment.";
+        if self.offset == 0 {
+            diag("caution", "the search failed", message)
+        } else {
+            format!("<tr><td colspan=\"{COLUMNS}\" class=\"note\">{}</td></tr>", escape(message))
+        }
+    }
+
+    fn load_more(&self) -> String {
+        let next = attr(&self.query(&self.cat, self.offset + PAGE_SIZE));
+        format!(
+            "<tr><td colspan=\"{COLUMNS}\" class=\"note\"><a class=\"button\" href=\"/?{next}\" hx-get=\"/ui/results?{next}\" hx-target=\"closest tr\" hx-swap=\"outerHTML\">Load more</a></td></tr>"
+        )
+    }
+
+    /// Whether a row of a post is left out for the row that stands for the post: a post spread over several groups,
+    /// unless the search is about one of its groups, or an upload linked by its PAR2 set, which is in one group soo it
+    /// stays one row whatever the search.
+    fn folds(&self, r: &ReleaseRow, post: &release_info::SplitPost) -> bool {
+        (self.fields.group.is_empty() || post.lead.is_some()) && post.listed_id() != r.id
+    }
+
+    /// Makes a row of a post say what all of the post comes to. When another row stands for it, that row's id: the
+    /// row is left out for it.
+    fn fold_split_post(
+        &self,
+        conn: Option<&rusqlite::Connection>,
+        r: &mut ReleaseRow,
+        split: &mut HashMap<i64, release_info::SplitPost>,
+    ) -> Option<i64> {
+        let post = conn.and_then(|conn| release_info::whole_post_with(conn, r).ok().flatten())?;
+        if self.folds(r, &post) {
+            return Some(post.listed_id());
+        }
+        r.size = Some(post.size);
+        r.complete = post.complete;
+        split.insert(r.id, post);
+        None
+    }
+
+    /// The row that stands for a post, read to show in place of one folded into it.
+    fn bring(
+        &self,
+        conn: Option<&rusqlite::Connection>,
+        listed: i64,
+        split: &mut HashMap<i64, release_info::SplitPost>,
+    ) -> Option<ReleaseRow> {
+        let mut r = conn.and_then(|conn| crate::search::get_release_with(conn, listed).ok().flatten())?;
+        // it stands for its post, soo it isn't folded itself
+        self.fold_split_post(conn, &mut r, split);
+        Some(r)
+    }
+
+    /// A sort takes its page from the search's window, with no database in the way once the window has been filled.
+    /// "Hide copies" depends on what's before the page, soo it still works the page out each time.
+    fn sorts_from_a_window(&self) -> bool {
+        self.sort.is_some() && !self.filters.contains(&HIDE_COPIES)
+    }
+
+    fn body_from_window(&self) -> String {
+        let window = match window_of(self) {
+            Ok(window) => window,
+            Err(e) => return self.search_failed(&e),
+        };
+        let Some(by) = self.sort else { return String::new() };
+        let (rows, more) = window.page(self, by);
+        if rows.is_empty() {
+            return if self.offset == 0 {
+                self.nothing_found()
+            } else {
+                format!("<tr><td colspan=\"{COLUMNS}\" class=\"note dim\">That's all of them.</td></tr>")
+            };
+        }
+        let mut out = rows.concat();
+        if more {
+            out.push_str(&self.load_more());
         }
         out
     }
@@ -692,17 +755,14 @@ impl Search {
             );
         }
         // the count goes by words and fields only, soo with tags filtering the page it would count rows it hides
-        let total = if self.fields.any() && !self.filters_by_tags() {
-            let filter = parse_filter(&self.cat);
-            match field_search::count_any(&self.fields, std::slice::from_ref(&self.q), filter.as_ref()) {
-                Ok(total) => format!("<strong class=\"total\">{}</strong>", escape(&total.describe())),
-                Err(e) => {
-                    eprintln!("web count failed: {e}");
-                    String::new()
-                }
-            }
-        } else {
+        let total = if !self.fields.any() || self.filters_by_tags() {
             String::new()
+        } else if self.sorts_from_a_window()
+            && let Ok(window) = window_of(self)
+        {
+            window.total.get_or_init(|| self.total()).clone()
+        } else {
+            self.total()
         };
         format!(
             "<div class=\"summary\"><span class=\"path\">{path}</span>{total}<span class=\"sort\">{}</span></div>{}",
@@ -710,6 +770,444 @@ impl Search {
             if scope.is_empty() { String::new() } else { format!("<div class=\"chips\">{scope}</div>") },
         )
     }
+
+    fn total(&self) -> String {
+        let filter = parse_filter(&self.cat);
+        match field_search::count_any(&self.fields, std::slice::from_ref(&self.q), filter.as_ref()) {
+            Ok(total) => format!("<strong class=\"total\">{}</strong>", escape(&total.describe())),
+            Err(e) => {
+                eprintln!("web count failed: {e}");
+                String::new()
+            }
+        }
+    }
+}
+
+/// How old a window can get before a click on it starts a new one. The click still gets the old one straight away.
+const WINDOW_FRESH: Duration = Duration::from_secs(60);
+/// How often the windows nobody has clicked lately are made again, soo the first click of the day finds one.
+const WINDOW_IDLE_FRESH: Duration = Duration::from_secs(15 * 60);
+/// What counts as lately.
+const WINDOW_IN_USE: Duration = Duration::from_secs(10 * 60);
+/// Searches with a window: a filled one is a few MB.
+const WINDOWS_KEPT: usize = 24;
+/// How long a click sorting by size waits for a new window's split posts, the most that a size can depend on. Past it
+/// the page goes by the sizes known so far, and the next click has them all.
+const SIZES_WAIT: Duration = Duration::from_secs(1);
+/// Threads rendering a window's rows.
+const FILL_THREADS: usize = 4;
+
+/// Places in a window's rows, in the order a column and direction put them.
+type Order = Arc<Vec<usize>>;
+
+/// One row as a results page shows it.
+struct ShownRow {
+    html: String,
+    /// what it sorts by: all of a post spread over several groups
+    size: Option<i64>,
+    /// another row stands for its post
+    folded: bool,
+}
+
+/// The first `SORT_WINDOW` results of one search, whatever the sort, kept in memory: choosing a column only puts these
+/// in another order. Rows are rendered in the background, each the first time something needs it.
+struct Window {
+    built: Instant,
+    rows: Vec<ReleaseRow>,
+    /// by release, for the columns that need them, read once
+    categories: OnceLock<HashMap<i64, i64>>,
+    scores: OnceLock<HashMap<i64, i64>>,
+    total: OnceLock<String>,
+    shown: Mutex<HashMap<i64, ShownRow>>,
+    /// rows brought in for a post whose own row isn't in the window: once each
+    brought: Mutex<HashSet<i64>>,
+    orders: Mutex<HashMap<(SortBy, bool), Order>>,
+    /// every row rendered, soo every size is final: a size order is kept only from then on
+    sized: AtomicBool,
+    /// bumped, under `shown`, each time rows are kept: a size order read from older sizes isn't kept
+    shown_gen: std::sync::atomic::AtomicU64,
+    filled: AtomicBool,
+}
+
+impl Window {
+    fn read(search: &Search) -> Result<Window, String> {
+        let filter = parse_filter(&search.cat);
+        let rows = search.search(filter.as_ref(), 0, SORT_WINDOW)?;
+        Ok(Window {
+            built: Instant::now(),
+            rows: search.keep_tagged(rows, usize::MAX),
+            categories: OnceLock::new(),
+            scores: OnceLock::new(),
+            total: OnceLock::new(),
+            shown: Mutex::new(HashMap::new()),
+            brought: Mutex::new(HashSet::new()),
+            orders: Mutex::new(HashMap::new()),
+            sized: AtomicBool::new(false),
+            shown_gen: std::sync::atomic::AtomicU64::new(0),
+            filled: AtomicBool::new(false),
+        })
+    }
+
+    fn ids(&self) -> Vec<i64> {
+        self.rows.iter().map(|r| r.id).collect()
+    }
+
+    fn categories(&self) -> &HashMap<i64, i64> {
+        self.categories.get_or_init(|| crate::category::categories_of(&self.ids()).unwrap_or_default())
+    }
+
+    /// Only the scores already kept: fetching them for a whole search would use up the providers' limits.
+    fn scores(&self) -> &HashMap<i64, i64> {
+        self.scores.get_or_init(|| {
+            let media = crate::media::query::attrs_of(&self.ids()).unwrap_or_default();
+            crate::media::details::kept_for(media.iter().map(|(id, m)| (*id, m.kind, &m.ids)))
+                .into_iter()
+                .filter_map(|(id, d)| Some((id, score_value(&d)?)))
+                .collect()
+        })
+    }
+
+    fn order(&self, by: SortBy, descending: bool) -> Order {
+        if let Some(order) = lock(&self.orders).get(&(by, descending)) {
+            return order.clone();
+        }
+        let none = HashMap::new();
+        let categories = if by == SortBy::Category { self.categories() } else { &none };
+        let scores = if by == SortBy::Rating { self.scores() } else { &none };
+        let mut sized = None;
+        // read before the sizes: an order from sizes that aren't final yet is answered with but never kept, soo it
+        // can't outlive the fill
+        let keep = by != SortBy::Size || self.sized.load(Ordering::Acquire);
+        let mut gen_read = None;
+        if by == SortBy::Size {
+            let shown = lock(&self.shown);
+            gen_read = Some(self.shown_gen.load(Ordering::Acquire));
+            let mut rows = self.rows.clone();
+            for r in &mut rows {
+                if let Some(row) = shown.get(&r.id) {
+                    r.size = row.size;
+                }
+            }
+            sized = Some(rows);
+        }
+        let rows = sized.as_ref().unwrap_or(&self.rows);
+        let mut order: Vec<usize> = (0..rows.len()).collect();
+        order.sort_by(|&a, &b| row_order(&rows[a], &rows[b], by, descending, categories, scores));
+        let order = Arc::new(order);
+        if keep {
+            let mut orders = lock(&self.orders);
+            // a render that published since may have changed a size: then this order is answered with, not kept
+            if gen_read.is_none_or(|read| read == self.shown_gen.load(Ordering::Acquire)) {
+                orders.insert((by, descending), order.clone());
+            }
+        }
+        order
+    }
+
+    /// Renders rows that aren't yet.
+    fn render(&self, search: &Search, rows: &[ReleaseRow]) {
+        let conn = crate::db::open().ok();
+        // each kept row under the id of the window row it shows in
+        let mut places = Vec::with_capacity(rows.len());
+        let mut kept = Vec::with_capacity(rows.len());
+        let mut split = HashMap::new();
+        let mut done = Vec::with_capacity(rows.len());
+        for r in rows {
+            let place = r.id;
+            let mut r = r.clone();
+            match search.fold_split_post(conn.as_ref(), &mut r, &mut split) {
+                None => {
+                    places.push(place);
+                    kept.push(r);
+                }
+                // a row folded into one that isn't in the window brings that one in its place, once
+                Some(listed)
+                    if !self.rows.iter().any(|w| w.id == listed)
+                        && lock(&self.brought).insert(listed)
+                        && let Some(shown) = search.bring(conn.as_ref(), listed, &mut split) =>
+                {
+                    places.push(place);
+                    kept.push(shown);
+                }
+                Some(_) => done.push((place, ShownRow { html: String::new(), size: r.size, folded: true })),
+            }
+        }
+        for ((place, r), html) in places.into_iter().zip(&kept).zip(rows_html(&kept, split)) {
+            done.push((place, ShownRow { html, size: r.size, folded: false }));
+        }
+        self.publish(done);
+    }
+
+    /// Keeps rendered rows, each under its place.
+    fn publish(&self, done: Vec<(i64, ShownRow)>) {
+        let mut shown = lock(&self.shown);
+        for (place, row) in done {
+            // two renders of one place can race for the row it brings in: the one that lost says folded, and mustn't
+            // hide the row the other one shows there
+            if row.folded && shown.get(&place).is_some_and(|r| !r.folded) {
+                continue;
+            }
+            shown.insert(place, row);
+        }
+        // a render can publish after the fill finished (a page's, that won the race for a brought row): a size order
+        // kept from before it may be wrong now
+        self.shown_gen.fetch_add(1, Ordering::AcqRel);
+        drop(shown);
+        lock(&self.orders).retain(|(by, _), _| *by != SortBy::Size);
+    }
+
+    /// A page's rows, and whether more follow. Renders only what the page reaches and nothing has rendered yet.
+    fn page(&self, search: &Search, by: SortBy) -> (Vec<String>, bool) {
+        if by == SortBy::Size {
+            let started = Instant::now();
+            while !self.filled.load(Ordering::Acquire) && started.elapsed() < SIZES_WAIT {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        let order = self.order(by, search.descending);
+        let skip = usize::try_from(search.offset).unwrap_or(0);
+        let wanted = PAGE_SIZE as usize + 1;
+        loop {
+            let mut page = Vec::with_capacity(wanted);
+            let mut missing = Vec::new();
+            {
+                let shown = lock(&self.shown);
+                let mut passed = 0;
+                for &place in order.iter() {
+                    let r = &self.rows[place];
+                    match shown.get(&r.id) {
+                        Some(row) if row.folded => continue,
+                        Some(row) => {
+                            if passed >= skip {
+                                page.push(row.html.clone());
+                            }
+                            passed += 1;
+                        }
+                        None => missing.push(r.clone()),
+                    }
+                    if page.len() == wanted || missing.len() == PAGE_SIZE as usize {
+                        break;
+                    }
+                }
+            }
+            if missing.is_empty() {
+                let more = page.len() == wanted;
+                page.truncate(PAGE_SIZE as usize);
+                return (page, more);
+            }
+            self.render(search, &missing);
+        }
+    }
+
+    /// Renders every row and works out every order, soo no click has any of it left to do.
+    fn fill(&self, search: &Search) {
+        let shown = lock(&self.shown);
+        let missing: Vec<ReleaseRow> = self.rows.iter().filter(|r| !shown.contains_key(&r.id)).cloned().collect();
+        drop(shown);
+        let slices: Vec<&[ReleaseRow]> = missing.chunks(PAGE_SIZE as usize).collect();
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..FILL_THREADS {
+                scope.spawn(|| {
+                    while let Some(slice) = slices.get(next.fetch_add(1, Ordering::Relaxed)) {
+                        self.render(search, slice);
+                    }
+                });
+            }
+        });
+        // sizes may have changed with the split posts
+        self.sized.store(true, Ordering::Release);
+        lock(&self.orders).clear();
+        for (by, _) in SortBy::ALL {
+            self.order(by, false);
+            self.order(by, true);
+        }
+        self.filled.store(true, Ordering::Release);
+    }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// A search's window, and what keeps two clicks from each reading one.
+struct WindowSlot {
+    /// the search, with no sort or page
+    search: Search,
+    window: Mutex<Option<Arc<Window>>>,
+    reading: Mutex<()>,
+    replacing: AtomicBool,
+    used: Mutex<Instant>,
+    /// a category's own page, kept warm whether or not anyone has clicked it
+    always: bool,
+}
+
+static WINDOWS: LazyLock<Mutex<HashMap<String, Arc<WindowSlot>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// One background read at a time, on a machine that's indexing.
+static BACKGROUND: Mutex<()> = Mutex::new(());
+
+/// Background fills and replacements waiting for their turn: no more than there are windows kept.
+static WAITING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// A turn at `BACKGROUND` once one comes, or None when as many are waiting as there are windows kept.
+fn background_turn() -> Option<Waiting> {
+    if WAITING.fetch_add(1, Ordering::AcqRel) >= WINDOWS_KEPT {
+        WAITING.fetch_sub(1, Ordering::AcqRel);
+        return None;
+    }
+    Some(Waiting)
+}
+
+/// One of `WAITING`, given back however the work ends.
+struct Waiting;
+
+impl Drop for Waiting {
+    fn drop(&mut self) {
+        WAITING.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Whether a slot is still kept: one dropped from `WINDOWS` while its work waited has no one to show it to.
+fn still_kept(slot: &Arc<WindowSlot>) -> bool {
+    lock(&WINDOWS).values().any(|kept| Arc::ptr_eq(kept, slot))
+}
+
+fn slot_of(search: &Search, always: bool) -> Arc<WindowSlot> {
+    let plain = Search { offset: 0, sort: None, descending: true, ..search.clone() };
+    let key = plain.query(&plain.cat, 0);
+    let mut windows = lock(&WINDOWS);
+    if !windows.contains_key(&key) && windows.len() >= WINDOWS_KEPT {
+        let oldest = windows
+            .iter()
+            .filter(|(_, slot)| !slot.always)
+            .min_by_key(|(_, slot)| *lock(&slot.used))
+            .map(|(k, _)| k.clone());
+        if let Some(oldest) = oldest {
+            windows.remove(&oldest);
+        }
+    }
+    windows
+        .entry(key)
+        .or_insert_with(|| {
+            Arc::new(WindowSlot {
+                search: plain,
+                window: Mutex::new(None),
+                reading: Mutex::new(()),
+                replacing: AtomicBool::new(false),
+                // nobody has clicked it yet
+                used: Mutex::new(Instant::now().checked_sub(WINDOW_IN_USE).unwrap_or_else(Instant::now)),
+                always,
+            })
+        })
+        .clone()
+}
+
+/// The window to answer with now: the one there is, however old, or a new one when there's none.
+fn window_of(search: &Search) -> Result<Arc<Window>, String> {
+    let slot = slot_of(search, false);
+    *lock(&slot.used) = Instant::now();
+    if let Some(window) = lock(&slot.window).clone() {
+        if window.built.elapsed() > WINDOW_FRESH {
+            replace_in_background(&slot);
+        }
+        return Ok(window);
+    }
+    let _reading = lock(&slot.reading);
+    if let Some(window) = lock(&slot.window).clone() {
+        return Ok(window);
+    }
+    let window = Arc::new(Window::read(&slot.search)?);
+    *lock(&slot.window) = Some(window.clone());
+    // the window answers clicks without it, rendering what a page needs; filled, a click has nothing left to do.
+    // Waiting, it holds neither the window nor its slot, soo a window dropped meanwhile is gone, and isn't filled
+    if let Some(waiting) = background_turn() {
+        let (filling, for_fill) = (Arc::downgrade(&window), Arc::downgrade(&slot));
+        std::thread::spawn(move || {
+            let _waiting = waiting;
+            let _turn = lock(&BACKGROUND);
+            let (Some(window), Some(slot)) = (filling.upgrade(), for_fill.upgrade()) else { return };
+            let current = lock(&slot.window).as_ref().is_some_and(|w| Arc::ptr_eq(w, &window));
+            if current && still_kept(&slot) {
+                window.fill(&slot.search);
+            }
+        });
+    }
+    Ok(window)
+}
+
+/// Clears `replacing` however the work ends.
+struct Replacing(Arc<WindowSlot>);
+
+impl Drop for Replacing {
+    fn drop(&mut self) {
+        self.0.replacing.store(false, Ordering::Release);
+    }
+}
+
+fn replace_in_background(slot: &Arc<WindowSlot>) {
+    if slot.replacing.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let replacing = Replacing(slot.clone());
+    let Some(waiting) = background_turn() else { return };
+    std::thread::spawn(move || {
+        let _waiting = waiting;
+        replace(replacing);
+    });
+}
+
+/// A new window takes over only once it's filled, soo a click never finds a worse one than the last.
+fn replace(replacing: Replacing) {
+    let slot = &replacing.0;
+    let _turn = lock(&BACKGROUND);
+    if !still_kept(slot) {
+        return;
+    }
+    let Ok(window) = Window::read(&slot.search) else { return };
+    window.fill(&slot.search);
+    *lock(&slot.window) = Some(Arc::new(window));
+}
+
+/// Keeps a window ready for each category's page and for what was clicked lately. Doesn't return.
+pub(crate) fn keep_sort_windows_warm(running: impl Fn() -> bool) {
+    let plain = Search::from_args(&HashMap::new());
+    slot_of(&plain, true);
+    for root in TABLE {
+        slot_of(&Search { cat: root.id.to_string(), ..plain.clone() }, true);
+    }
+    loop {
+        if running() {
+            let slots: Vec<Arc<WindowSlot>> = lock(&WINDOWS).values().cloned().collect();
+            for slot in slots {
+                let in_use = lock(&slot.used).elapsed() < WINDOW_IN_USE;
+                let fresh_for = if in_use { WINDOW_FRESH } else { WINDOW_IDLE_FRESH };
+                let current = lock(&slot.window).clone();
+                let stale = current.is_none_or(|window| window.built.elapsed() > fresh_for);
+                if stale && !slot.replacing.swap(true, Ordering::AcqRel) {
+                    replace(Replacing(slot.clone()));
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_secs(5));
+    }
+}
+
+/// Each row's HTML, with what it shows beyond itself read for all of them at once.
+fn rows_html(found: &[ReleaseRow], split: HashMap<i64, release_info::SplitPost>) -> Vec<String> {
+    let ids: Vec<i64> = found.iter().map(|r| r.id).collect();
+    let categories = crate::category::categories_of(&ids).unwrap_or_default();
+    let passwords = crate::archive::store::passwords(&ids);
+    let media = crate::media::query::attrs_of(&ids).unwrap_or_default();
+    // a post spread over several groups is all its rows together, whatever one of them holds
+    let single: Vec<i64> = ids.iter().copied().filter(|id| !split.contains_key(id)).collect();
+    let extras = RowExtras {
+        recovery: release_info::recovery_only_of(&single),
+        split,
+        copies: crate::duplicates::counts(&ids).unwrap_or_default(),
+        details: crate::media::details::kept_for(media.iter().map(|(id, m)| (*id, m.kind, &m.ids))),
+    };
+    found.iter().map(|r| row(r, &categories, &passwords, &media, &extras)).collect()
 }
 
 /// What a result shows beyond its own row.
@@ -1037,11 +1535,38 @@ fn category_nav(search: &Search, oob: &str) -> String {
     out
 }
 
+pub(crate) const BUILD_VERSION: &str = env!("ATLAS_BUILD_VERSION");
+pub(crate) const GIT_SHA: &str = env!("ATLAS_GIT_SHA");
+pub(crate) const GIT_SHORT_SHA: &str = env!("ATLAS_GIT_SHORT_SHA");
+pub(crate) const BUILD_YEAR: &str = env!("ATLAS_BUILD_YEAR");
+pub(crate) const RUSTC_VERSION: &str = env!("ATLAS_RUSTC_VERSION");
+pub(crate) const BUILD_DATE: &str = env!("ATLAS_BUILD_DATE");
+
+fn site_footer() -> String {
+    let commit = if GIT_SHA.is_empty() || GIT_SHA == "unknown" {
+        format!("<code>{}</code>", escape(GIT_SHORT_SHA))
+    } else {
+        format!(
+            "<a href=\"https://github.com/Appz4Fun/Atlas/commit/{}\" target=\"_blank\" rel=\"noreferrer noopener\"><code>{}</code></a>",
+            attr(GIT_SHA),
+            escape(GIT_SHORT_SHA),
+        )
+    };
+    format!(
+        r#"<footer class="site-footer" role="contentinfo"><div class="site-footer-inner"><span><strong>Atlas - Rust Edition.</strong> Authored by: <a href="https://github.com/Eraxty" target="_blank" rel="noreferrer noopener">Eraxty</a> &amp; Forked and ported to Rust by: <a href="https://github.com/xbmc4lyfe" target="_blank" rel="noreferrer noopener">xbmc4lyfe</a></span><span>Version: <code>{version}</code> · last git commit: {commit}</span><span>&copy; {year} · License: <a href="https://www.gnu.org/licenses/gpl-3.0.txt" target="_blank" rel="noreferrer noopener">GPL v3 (GNU General Public License v3.0)</a></span><span>Rust Version: <code>{rustc}</code> · Compilation Date: <code>{date}</code></span><span>Donate to my Patreon to help with AI token cost and get prioritized features and personal support: <a class="patreon-link" href="https://www.patreon.com/cw/xbmc4lyfe" target="_blank" rel="noreferrer noopener"><svg class="patreon-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="14.5" cy="9.5" r="6.5" fill="currentColor"/><rect x="3" y="3" width="3.5" height="18" fill="currentColor"/></svg><span>Patreon · xbmc4lyfe</span></a></span></div></footer>"#,
+        version = escape(BUILD_VERSION),
+        year = escape(BUILD_YEAR),
+        rustc = escape(RUSTC_VERSION),
+        date = escape(BUILD_DATE),
+    )
+}
+
 fn page(title: &str, content: &str) -> String {
     format!(
-        "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><meta name=\"color-scheme\" content=\"light dark\"><meta name=\"htmx-config\" content=\"{}\"><title>{}</title><link rel=\"icon\" href=\"/static/atlas.svg?v={v}\" type=\"image/svg+xml\"><link rel=\"stylesheet\" href=\"/static/atlas.css?v={v}\"><script src=\"/static/atlas.js?v={v}\"></script><script src=\"/static/htmx.min.js?v={v}\"></script></head><body>{content}</body></html>",
+        "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><meta name=\"color-scheme\" content=\"light dark\"><meta name=\"htmx-config\" content=\"{}\"><title>{}</title><link rel=\"icon\" href=\"/static/atlas.svg?v={v}\" type=\"image/svg+xml\"><link rel=\"stylesheet\" href=\"/static/atlas.css?v={v}\"><script src=\"/static/atlas.js?v={v}\"></script><script src=\"/static/htmx.min.js?v={v}\"></script></head><body>{content}{}</body></html>",
         attr(HTMX_CONFIG),
         escape(title),
+        site_footer(),
         v = *ASSET_VERSION,
     )
 }
@@ -1073,7 +1598,7 @@ fn search_page(args: &HashMap<String, String>, base: &str) -> String {
 {ask}
 <div id="failure"></div>
 <div id="results">{results}</div>
-<footer class="footer">Newznab API: <code>{base}/api</code></footer>
+<div class="footer">Newznab API: <code>{base}/api</code></div>
 </main></div>"##,
             masthead = masthead(true),
             nav = category_nav(&search, ""),
@@ -1515,6 +2040,26 @@ fn probe_html(
         dd(&mut tracks, "Written by", m.writing_app.as_deref().map_or(String::new(), escape));
         dd(&mut tracks, "Muxed by", m.muxing_app.as_deref().map_or(String::new(), escape));
         dd(&mut tracks, "Title", m.title.as_deref().map_or(String::new(), escape));
+        dd(&mut tracks, "HDR", m.video.first().map_or(String::new(), |v| escape(&hdr_summary(v))));
+        if let Some(encoder) = &m.encoder {
+            let settings = m.encoder_options.as_deref().map_or(String::new(), |o| {
+                let key = key_options(o);
+                let key = if key.is_empty() { String::new() } else { format!(" · {}", escape(&key)) };
+                format!(
+                    "{key}<details class=\"settings\"><summary>All settings</summary><code>{}</code></details>",
+                    escape(o)
+                )
+            });
+            dd(&mut tracks, "Encoder", format!("{}{settings}", escape(encoder)));
+        }
+        if m.editions > 1 {
+            dd(&mut tracks, "Editions", format!("{} (often a seamless branching cut)", m.editions));
+        }
+        dd(
+            &mut tracks,
+            "SegmentUID",
+            m.segment_uid.as_deref().map_or(String::new(), |u| format!("<code>{}</code>", escape(u))),
+        );
         dd(
             &mut tracks,
             "Muxed",
@@ -1570,6 +2115,9 @@ fn probe_html(
             if a.atmos {
                 parts.push("Atmos".into());
             }
+            if a.default {
+                parts.push("default".into());
+            }
             // a name that says so already
             if a.commentary && !a.name.as_deref().is_some_and(|n| n.to_ascii_lowercase().contains("commentary")) {
                 parts.push("commentary".into());
@@ -1583,8 +2131,17 @@ fn probe_html(
             if s.forced {
                 parts.push("forced".into());
             }
-            if s.hearing_impaired {
+            // a name that says so already
+            if s.hearing_impaired
+                && !s.name.as_deref().is_some_and(|n| {
+                    let n = n.to_ascii_lowercase();
+                    n.contains("sdh") || n.contains("hearing")
+                })
+            {
                 parts.push("SDH".into());
+            }
+            if s.default {
+                parts.push("default".into());
             }
             // a name that says so already
             if s.commentary && !s.name.as_deref().is_some_and(|n| n.to_ascii_lowercase().contains("commentary")) {
@@ -1892,7 +2449,23 @@ fn details_panel(args: &HashMap<String, String>) -> ApiResponse {
     let media = crate::media::query::attrs_of(&[id]).unwrap_or_default().remove(&id);
     let details =
         media.as_ref().and_then(|m| crate::media::details::for_title(&crate::config::media_config(), m.kind, &m.ids));
-    html(200, details.map(|d| details_html(&d)).unwrap_or_default())
+    let file_secs = crate::db::open()
+        .ok()
+        .and_then(|conn| crate::probe::read(&conn, id))
+        .and_then(|p| p.media.and_then(|m| m.duration_secs));
+    html(200, details.map(|d| details_html(&d, file_secs)).unwrap_or_default())
+}
+
+/// How this file's length compares with the title's, when they differ by more than credits and logos do.
+fn runtime_note(minutes: i64, file_secs: Option<f64>) -> String {
+    let Some(secs) = file_secs.filter(|s| *s > 60.0) else { return String::new() };
+    let file_minutes = (secs / 60.0).round() as i64;
+    let diff = file_minutes - minutes;
+    if diff.abs() < 4 || minutes <= 0 {
+        return String::new();
+    }
+    let what = if diff > 0 { "longer: maybe an extended cut" } else { "shorter: maybe a cut version, or not the film" };
+    format!(" · this file is {file_minutes} min, {} min {what}", diff.abs())
 }
 
 fn scores_html(d: &crate::media::details::Details) -> String {
@@ -1909,7 +2482,7 @@ fn scores_html(d: &crate::media::details::Details) -> String {
     .collect()
 }
 
-fn details_html(d: &crate::media::details::Details) -> String {
+fn details_html(d: &crate::media::details::Details, file_secs: Option<f64>) -> String {
     let mut lines = String::new();
     let mut line = |name: &str, value: Option<String>| {
         if let Some(value) = value {
@@ -1919,7 +2492,9 @@ fn details_html(d: &crate::media::details::Details) -> String {
     line("Released", d.released.clone());
     line("Blu-ray", d.bluray.clone());
     line("Genres", d.genres.clone());
-    line("Runtime", d.runtime.map(|minutes| format!("{minutes} min")));
+    // a show's runtime is the series' usual one, so a long premiere or a double episode isn't a cut
+    let file_secs = file_secs.filter(|_| d.kind == crate::media::title::Kind::Movie as i64);
+    line("Runtime", d.runtime.map(|minutes| format!("{minutes} min{}", runtime_note(minutes, file_secs))));
     line("Network", d.network.clone());
     line("Status", d.status.clone());
     line("Cast", d.cast.clone());
@@ -1962,7 +2537,41 @@ fn stills_html(id: i64, stills: &[(u8, Option<i64>, u32, u32)]) -> String {
             )
         })
         .collect();
-    format!("<h2>Stills</h2><div class=\"stills\">{figures}</div>")
+    // the releases showing the same pictures, looked up after the page is up: it reads every shard
+    format!(
+        "<h2>Stills</h2><div class=\"stills\">{figures}</div><div id=\"same-film\" hx-get=\"/ui/samefilm?id={id}\" hx-trigger=\"load\" hx-swap=\"outerHTML\"></div>"
+    )
+}
+
+/// Other releases whose stills match this one's: the same film, from another source or encode.
+fn same_film_panel(args: &HashMap<String, String>) -> ApiResponse {
+    let id = args.get("id").and_then(|v| v.trim().parse::<i64>().ok()).unwrap_or(0);
+    let Ok(conn) = crate::db::open() else { return html(200, String::new()) };
+    let rows: Vec<ReleaseRow> = crate::probe::stills::same_film(&conn, id)
+        .into_iter()
+        .filter_map(|other| crate::search::get_release_with(&conn, other).ok().flatten())
+        .collect();
+    html(200, same_film_html(&rows))
+}
+
+fn same_film_html(rows: &[ReleaseRow]) -> String {
+    if rows.is_empty() {
+        return String::new();
+    }
+    let items: String = rows
+        .iter()
+        .map(|r| {
+            format!(
+                "<tr><td><a href=\"/ui/release?id={}\">{}</a></td><td class=\"num\">{}</td></tr>",
+                r.id,
+                escape(&r.name),
+                escape(&fmt_size(r.size))
+            )
+        })
+        .collect();
+    format!(
+        "<h2>Same film</h2><div class=\"table-wrap\"><table><thead><tr><th>Name</th><th class=\"num\">Size</th></tr></thead><tbody>{items}</tbody></table></div><p class=\"sort\">Releases whose stills show the same pictures: another encode, a remux or a different cut. Not twins.</p>"
+    )
 }
 
 /// A time into the film as h:mm:ss, or m:ss under an hour.
@@ -2017,6 +2626,32 @@ fn poster(args: &HashMap<String, String>) -> ApiResponse {
         bytes: Some(bytes),
         failed: false,
     }
+}
+
+/// SDR, HDR10, HLG, PQ, DV, or DV with the layer it falls back to: `DV HDR10`. Empty when nothing says which.
+fn hdr_summary(v: &crate::probe::media::VideoTrack) -> String {
+    // PQ with no mastering data is HDR10 whose static metadata wasn't carried into the container
+    let base = v.hdr.clone().map(|h| if h == "PQ" { "HDR10 (no mastering data)".to_string() } else { h });
+    match (v.dv_profile, base) {
+        // profile 5 has no fallback, whatever the container says: its colour only DV players get right
+        (Some(5), _) => "DV P5".into(),
+        (Some(p), Some(base)) => format!("DV P{p} + {base}"),
+        (Some(p), None) => format!("DV P{p}"),
+        (None, Some(base)) => base,
+        // SDR only when the container says what the transfer is: MP4 and many MKVs don't, and that's not SDR
+        (None, None) if v.transfer.is_some_and(|t| t != 2) => "SDR".into(),
+        (None, None) => String::new(),
+    }
+}
+
+/// What most decides how an encode looks: rate control and its value, and x265's preset when it's written.
+fn key_options(options: &str) -> String {
+    let wanted = ["preset", "crf", "bitrate", "qp", "rc", "tune"];
+    options
+        .split_whitespace()
+        .filter(|kv| kv.split_once('=').is_some_and(|(k, _)| wanted.contains(&k)))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// The shape it's shown in, when that's not the shape it's stored in: anamorphic video.
@@ -2387,6 +3022,66 @@ fn nested_chain(layers: &[crate::probe::nest::Layer]) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    fn window_of_rows(rows: Vec<ReleaseRow>) -> Window {
+        Window {
+            built: Instant::now(),
+            rows,
+            categories: OnceLock::new(),
+            scores: OnceLock::new(),
+            total: OnceLock::new(),
+            shown: Mutex::new(HashMap::new()),
+            brought: Mutex::new(HashSet::new()),
+            orders: Mutex::new(HashMap::new()),
+            sized: AtomicBool::new(false),
+            shown_gen: std::sync::atomic::AtomicU64::new(0),
+            filled: AtomicBool::new(false),
+        }
+    }
+
+    fn shown(html: &str, size: i64, folded: bool) -> ShownRow {
+        ShownRow { html: html.into(), size: Some(size), folded }
+    }
+
+    #[test]
+    fn a_render_that_lost_the_race_for_a_brought_row_doesnt_hide_it() {
+        let window = window_of_rows(Vec::new());
+        window.publish(vec![(7, shown("<tr>lead</tr>", 10, false))]);
+        window.publish(vec![(7, shown("", 1, true))]);
+        assert_eq!(lock(&window.shown)[&7].html, "<tr>lead</tr>");
+        // the other way round the row still wins
+        window.publish(vec![(8, shown("", 1, true))]);
+        window.publish(vec![(8, shown("<tr>8</tr>", 2, false))]);
+        assert!(!lock(&window.shown)[&8].folded);
+    }
+
+    #[test]
+    fn a_size_order_from_sizes_not_final_yet_isnt_kept() {
+        let row = |id: i64, size: i64| ReleaseRow { id, size: Some(size), ..Default::default() };
+        let window = window_of_rows(vec![row(1, 1), row(2, 2)]);
+        window.order(SortBy::Size, true);
+        assert!(lock(&window.orders).is_empty(), "the fill hasn't rendered every row yet");
+        window.order(SortBy::Name, true);
+        assert_eq!(lock(&window.orders).len(), 1, "a name order doesn't wait on sizes");
+        window.sized.store(true, Ordering::Release);
+        window.order(SortBy::Size, true);
+        assert!(lock(&window.orders).contains_key(&(SortBy::Size, true)));
+        // a row published after the fill, with another size: the size order kept goes, the name order stays
+        window.publish(vec![(1, shown("<tr>1</tr>", 50, false))]);
+        assert!(!lock(&window.orders).contains_key(&(SortBy::Size, true)));
+        assert!(lock(&window.orders).contains_key(&(SortBy::Name, true)));
+        assert_eq!(*window.order(SortBy::Size, true), vec![0, 1], "the bigger size comes first now");
+    }
+
+    #[test]
+    fn background_work_waits_no_more_than_the_windows_kept() {
+        let turns: Vec<_> = std::iter::from_fn(background_turn).take(WINDOWS_KEPT + 5).collect();
+        assert!(turns.len() <= WINDOWS_KEPT);
+        assert!(background_turn().is_none());
+        drop(turns);
+        assert!(background_turn().is_some(), "a turn given back makes room");
+    }
+
     use super::*;
 
     const KEY: &str = "secret-key";
@@ -2420,6 +3115,10 @@ mod tests {
 
     #[test]
     fn stills_link_their_jpeg_and_say_where_they_are() {
+        assert_eq!(same_film_html(&[]), "");
+        let other = ReleaseRow { id: 9, name: "<A>.Film".into(), size: Some(1 << 30), ..Default::default() };
+        let html = same_film_html(&[other]);
+        assert!(html.contains("/ui/release?id=9") && html.contains("&lt;A&gt;.Film"), "{html}");
         assert_eq!(stills_html(7, &[]), "");
         let html = stills_html(7, &[(25, Some(1_834_500), 960, 540), (50, None, 960, 540)]);
         assert!(html.contains("<img src=\"/ui/still?id=7&amp;at=25\" width=\"960\" height=\"540\""), "{html}");
@@ -2437,6 +3136,7 @@ mod tests {
             assert_eq!(get("/ui/details", "id=1", bad, "http://x", KEY).unwrap().status, 401, "{bad:?}");
             assert_eq!(get("/ui/poster", "kind=2&tmdb=1", bad, "http://x", KEY).unwrap().status, 401, "{bad:?}");
             assert_eq!(get("/ui/still", "id=1&at=50", bad, "http://x", KEY).unwrap().status, 401, "{bad:?}");
+            assert_eq!(get("/ui/samefilm", "id=1", bad, "http://x", KEY).unwrap().status, 401, "{bad:?}");
             let nzb = get("/ui/nzb", "id=1", bad, "http://x", KEY).unwrap();
             assert_eq!(nzb.status, 303, "{bad:?}");
             assert_eq!(get("/ui/release", "id=1", bad, "http://x", KEY).unwrap().status, 303, "{bad:?}");
@@ -2691,14 +3391,61 @@ mod tests {
             bluray: Some("1999-09-21".into()),
             ..Default::default()
         };
-        let html = details_html(&d);
+        let html = details_html(&d, None);
         assert!(!html.contains("<b>") && !html.contains("<i>"), "{html}");
         assert!(html.contains("IMDB 87") && !html.contains("Metacritic"), "{html}");
         assert!(html.contains("<dt>Blu-ray</dt><dd>1999-09-21</dd>"), "{html}");
         assert!(html.contains("/ui/poster?kind=2&amp;tmdb=603"), "{html}");
         assert!(!html.contains("art=backdrop"), "{html}");
-        let wide = details_html(&crate::media::details::Details { backdrop: Some("/b.jpg".into()), ..d.clone() });
+        let wide = details_html(&crate::media::details::Details { backdrop: Some("/b.jpg".into()), ..d.clone() }, None);
         assert!(wide.contains("art=backdrop"), "{wide}");
+        let film = crate::media::details::Details { runtime: Some(136), ..d.clone() };
+        assert!(details_html(&film, Some(152.0 * 60.0)).contains("16 min longer"));
+        // a show's runtime is the series' usual one: a double episode isn't a cut
+        let show = crate::media::details::Details { kind: 1, ..film };
+        assert!(!details_html(&show, Some(152.0 * 60.0)).contains("longer"));
+    }
+
+    #[test]
+    fn a_file_much_longer_or_shorter_than_the_title_says_so() {
+        assert_eq!(runtime_note(136, Some(136.0 * 60.0 + 100.0)), "");
+        assert_eq!(runtime_note(136, None), "");
+        assert!(runtime_note(136, Some(152.0 * 60.0)).contains("16 min longer"));
+        assert!(runtime_note(136, Some(44.0 * 60.0)).contains("92 min shorter"));
+    }
+
+    #[test]
+    fn a_subtitle_named_sdh_doesnt_say_it_twice() {
+        use crate::probe::media::{MediaInfo, SubtitleTrack};
+        let sub = |name: Option<&str>| SubtitleTrack {
+            codec: "SRT".into(),
+            name: name.map(str::to_string),
+            hearing_impaired: true,
+            ..Default::default()
+        };
+        let media = MediaInfo { subtitles: vec![sub(Some("SDH")), sub(None)], ..Default::default() };
+        let html = probe_html(&crate::probe::ProbeInfo { media: Some(media), ..Default::default() }, None, None, None);
+        assert_eq!(html.matches("SDH").count(), 2, "{html}");
+    }
+
+    #[test]
+    fn hdr_is_summed_up_and_the_key_settings_picked() {
+        use crate::probe::media::VideoTrack;
+        let v = |hdr: Option<&str>, dv: Option<u8>| VideoTrack {
+            hdr: hdr.map(str::to_string),
+            dv_profile: dv,
+            ..VideoTrack::default()
+        };
+        assert_eq!(hdr_summary(&v(None, None)), "");
+        assert_eq!(hdr_summary(&VideoTrack { transfer: Some(1), ..v(None, None) }), "SDR");
+        assert_eq!(hdr_summary(&VideoTrack { transfer: Some(2), ..v(None, None) }), "");
+        assert_eq!(hdr_summary(&v(Some("HDR10"), None)), "HDR10");
+        assert_eq!(hdr_summary(&v(Some("HDR10"), Some(7))), "DV P7 + HDR10");
+        assert_eq!(hdr_summary(&v(None, Some(5))), "DV P5");
+        assert_eq!(hdr_summary(&v(Some("PQ"), Some(5))), "DV P5");
+        assert_eq!(hdr_summary(&v(Some("HLG"), None)), "HLG");
+        assert_eq!(hdr_summary(&v(Some("PQ"), Some(8))), "DV P8 + HDR10 (no mastering data)");
+        assert_eq!(key_options("cpuid=1 preset=slow crf=18.0 aq-mode=3 rc=crf"), "preset=slow crf=18.0 rc=crf");
     }
 
     #[test]
@@ -2819,5 +3566,27 @@ mod tests {
         assert!(id_links(Kind::Tv as i64, &ids).contains("https://www.themoviedb.org/tv/603"));
         let trakt = crate::media::resolve::Ids { trakt: Some(9), ..Default::default() };
         assert!(id_links(Kind::Tv as i64, &trakt).contains("trakt.tv/search/trakt/9?id_type=show"));
+    }
+
+    #[test]
+    fn every_page_has_the_persistent_build_footer() {
+        let sign_in = get("/", "", None, "http://127.0.0.1:9090", KEY).unwrap().body;
+        let settings = get("/ui/settings", "", Some(&cookie()), "http://127.0.0.1:9090", KEY).unwrap().body;
+        for html in [&sign_in, &settings] {
+            assert!(html.contains("class=\"site-footer\""), "{html}");
+            assert!(html.contains("Atlas - Rust Edition."), "{html}");
+            assert!(html.contains("https://github.com/Eraxty") && html.contains(">Eraxty<"), "{html}");
+            assert!(html.contains("https://github.com/xbmc4lyfe") && html.contains(">xbmc4lyfe<"), "{html}");
+            assert!(html.contains(&format!("Version: <code>{BUILD_VERSION}</code>")), "{html}");
+            if !GIT_SHA.is_empty() && GIT_SHA != "unknown" {
+                assert!(html.contains(&format!("https://github.com/Appz4Fun/Atlas/commit/{GIT_SHA}")), "{html}");
+            }
+            assert!(html.contains(&format!("<code>{GIT_SHORT_SHA}</code>")), "{html}");
+            assert!(html.contains(&format!("&copy; {BUILD_YEAR}")), "{html}");
+            assert!(html.contains("https://www.gnu.org/licenses/gpl-3.0.txt"), "{html}");
+            assert!(html.contains(&format!("Rust Version: <code>{RUSTC_VERSION}</code>")), "{html}");
+            assert!(html.contains(&format!("Compilation Date: <code>{BUILD_DATE}</code>")), "{html}");
+            assert!(html.contains("https://www.patreon.com/cw/xbmc4lyfe"), "{html}");
+        }
     }
 }
