@@ -2067,7 +2067,7 @@ fn poster(args: &HashMap<String, String>) -> ApiResponse {
     }
 }
 
-/// SDR, HDR10, HLG, PQ, DV, or DV with the layer it falls back to: `DV HDR10`.
+/// SDR, HDR10, HLG, PQ, DV, or DV with the layer it falls back to: `DV HDR10`. Empty when nothing says which.
 fn hdr_summary(v: &crate::probe::media::VideoTrack) -> String {
     // PQ with no mastering data is HDR10 whose static metadata wasn't carried into the container
     let base = v.hdr.clone().map(|h| if h == "PQ" { "HDR10 (no mastering data)".to_string() } else { h });
@@ -2076,7 +2076,9 @@ fn hdr_summary(v: &crate::probe::media::VideoTrack) -> String {
         // profile 5 has no fallback: its colour only DV players get right
         (Some(p), None) => format!("DV P{p}"),
         (None, Some(base)) => base,
-        (None, None) => "SDR".into(),
+        // SDR only when the container says what the transfer is: MP4 and many MKVs don't, and that's not SDR
+        (None, None) if v.transfer.is_some_and(|t| t != 2) => "SDR".into(),
+        (None, None) => String::new(),
     }
 }
 
@@ -2802,7 +2804,9 @@ mod tests {
             dv_profile: dv,
             ..VideoTrack::default()
         };
-        assert_eq!(hdr_summary(&v(None, None)), "SDR");
+        assert_eq!(hdr_summary(&v(None, None)), "");
+        assert_eq!(hdr_summary(&VideoTrack { transfer: Some(1), ..v(None, None) }), "SDR");
+        assert_eq!(hdr_summary(&VideoTrack { transfer: Some(2), ..v(None, None) }), "");
         assert_eq!(hdr_summary(&v(Some("HDR10"), None)), "HDR10");
         assert_eq!(hdr_summary(&v(Some("HDR10"), Some(7))), "DV P7 + HDR10");
         assert_eq!(hdr_summary(&v(None, Some(5))), "DV P5");

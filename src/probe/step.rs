@@ -247,7 +247,11 @@ fn read_more_front(
     let wants_encoder = info.media.as_ref().is_some_and(|m| {
         m.header_complete
             && m.encoder.is_none()
-            && m.video.iter().any(|v| v.codec.contains("AVC") || v.codec.contains("HEVC") || v.codec.contains("H264"))
+            && m.video.iter().any(|v| {
+                // Matroska's codec ids, and MP4's sample entry fourccs
+                let c = v.codec.to_ascii_lowercase();
+                ["avc", "hevc", "h264", "hvc1", "hev1"].iter().any(|k| c.contains(k))
+            })
     });
     if wants_encoder
         && part <= total.min(FRONT_ARTICLES)
