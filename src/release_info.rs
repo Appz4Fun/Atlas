@@ -478,9 +478,11 @@ pub fn linked_post_with(conn: &Connection, id: i64) -> Result<Option<SplitPost>>
 /// All of the post a row is part of: an upload linked by its PAR2 set, or the same post cut across groups or files.
 pub fn whole_post_with(conn: &Connection, release: &crate::search::ReleaseRow) -> Result<Option<SplitPost>> {
     if let Some(post) = linked_post_with(conn, release.id)? {
-        if let Ok(Some(split)) = split_post_with(conn, release)
+        if let Ok(Some(mut split)) = split_post_with(conn, release)
+            && post.ids.iter().all(|id| split.ids.binary_search(id).is_ok())
             && (split.ids.len() > post.ids.len() || (split.complete && !post.complete))
         {
+            split.recovery = post.recovery;
             return Ok(Some(split));
         }
         return Ok(Some(post));
@@ -600,17 +602,10 @@ fn split_stem_post(conn: &Connection, posted: &str, release: &crate::search::Rel
     };
     let close: Vec<StemCandidate> =
         all.into_iter().filter(|c| c.date.is_some_and(|d| (d - anchor_date).abs() <= SPLIT_POST_DAYS)).collect();
-    if let Some(linked) = linked_stem_candidates(conn, release.id, &close)?
-        && let Some(post) = try_stem_subset(conn, &stem, &linked, true)?
-    {
-        return Ok(Some(post));
-    }
-    let same_poster: Vec<StemCandidate> = close.iter().filter(|c| c.poster == release.poster).cloned().collect();
-    if let Some(post) = try_stem_subset(conn, &stem, &same_poster, false)? {
-        return Ok(Some(post));
-    }
-    let same_group: Vec<StemCandidate> = same_poster.into_iter().filter(|c| c.group == release.group_name).collect();
-    try_stem_subset(conn, &stem, &same_group, false)
+    let Some(linked) = linked_stem_candidates(conn, release.id, &close)? else {
+        return Ok(None);
+    };
+    try_stem_subset(conn, &stem, &linked)
 }
 
 fn candidate_lead(conn: &Connection, id: i64) -> Result<Option<i64>> {
@@ -674,21 +669,12 @@ fn linked_stem_candidates(
     Ok(Some(subset))
 }
 
-fn try_stem_subset(
-    conn: &Connection,
-    stem: &str,
-    subset: &[StemCandidate],
-    has_provenance: bool,
-) -> Result<Option<SplitPost>> {
+fn try_stem_subset(conn: &Connection, stem: &str, subset: &[StemCandidate]) -> Result<Option<SplitPost>> {
     if !(2..=LINKED_ROWS).contains(&subset.len()) {
         return Ok(None);
     }
     let dates: Vec<Option<f64>> = subset.iter().map(|c| c.date).collect();
     if !close_together(&dates) {
-        return Ok(None);
-    }
-    let same_poster = subset.windows(2).all(|w| w[0].poster == w[1].poster);
-    if !same_poster && !has_provenance {
         return Ok(None);
     }
     let mut ids: Vec<i64> = subset.iter().map(|c| c.id).collect();
@@ -701,7 +687,7 @@ fn try_stem_subset(
         return Ok(None);
     }
     let files = union_files(conn, &ids)?;
-    if !files.one_stem_upload(stem, same_poster, has_provenance) {
+    if !files.one_stem_upload(stem) {
         return Ok(None);
     }
     Ok(Some(SplitPost { ids, groups, size, complete: files.complete(), lead: None, recovery: Vec::new() }))
@@ -769,8 +755,8 @@ impl UnionFiles {
         !self.conflict && total_fits && self.linked()
     }
 
-    fn one_stem_upload(&self, stem: &str, same_poster: bool, has_provenance: bool) -> bool {
-        if self.conflict || self.files.is_empty() || (!same_poster && !has_provenance) {
+    fn one_stem_upload(&self, stem: &str) -> bool {
+        if self.conflict || self.files.is_empty() || self.file_totals.contains(&None) {
             return false;
         }
         if !self.files.keys().all(|f| post_stem(f).eq_ignore_ascii_case(stem)) {
@@ -780,11 +766,8 @@ impl UnionFiles {
         match non_null.as_slice() {
             [total] if *total >= 2 => {
                 let want = *total + i64::from(self.zero_indexed);
-                (self.files.len() as i64) <= want
-                    && (self.files.len() >= 2 || (same_poster && self.linked()))
-                    && (!self.file_totals.contains(&None) || same_poster)
+                self.files.len() >= 2 && (self.files.len() as i64) <= want
             }
-            [] => same_poster && self.files.len() >= 2 && !self.linked(),
             _ => false,
         }
     }
