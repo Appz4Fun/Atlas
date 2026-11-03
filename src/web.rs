@@ -219,9 +219,11 @@ struct Search {
     descending: bool,
 }
 
-/// Up to this many results get sorted: the top ones by the column when the database can order by it, otherwise the
-/// newest or best matching ones.
+/// Up to this many results get sorted, the newest or best matching ones, unless the database orders by the column: then
+/// a window starts with this many of the top ones, and pages past it read a bigger one.
 const SORT_WINDOW: i64 = 2_000;
+/// How far a window grows to fill a page when it also filters on tags, which are read from each name.
+const GROW_WITH_TAGS: i64 = 64_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum SortBy {
@@ -526,7 +528,8 @@ impl Search {
         }
         let filter = parse_filter(&self.cat);
         let windowed = self.windowed();
-        let (from, count) = if windowed { (0, SORT_WINDOW) } else { (self.offset, PAGE_SIZE) };
+        let count = if self.ranked_by().is_some() { SORT_WINDOW.max(self.offset + PAGE_SIZE + 1) } else { SORT_WINDOW };
+        let (from, count) = if windowed { (0, count) } else { (self.offset, PAGE_SIZE) };
         let searched = self.search(filter.as_ref(), from, count);
         let found = match searched {
             Ok(found) => found,
@@ -697,12 +700,20 @@ impl Search {
     }
 
     fn body_from_window(&self) -> String {
-        let window = match window_of(self) {
-            Ok(window) => window,
-            Err(e) => return self.search_failed(&e),
-        };
         let Some(by) = self.sort else { return String::new() };
-        let (rows, more) = window.page(self, by);
+        let mut at_least = self.offset + PAGE_SIZE + 1;
+        let (rows, more) = loop {
+            let window = match window_of(self, at_least) {
+                Ok(window) => window,
+                Err(e) => return self.search_failed(&e),
+            };
+            let (rows, more) = window.page(self, by);
+            // short of a page past the end of what was read: folded rows or filters left too few, soo read further
+            if more || !window.can_grow(self) {
+                break (rows, more);
+            }
+            at_least = window.asked.saturating_mul(2);
+        };
         if rows.is_empty() {
             return if self.offset == 0 {
                 self.nothing_found()
@@ -759,7 +770,7 @@ impl Search {
         }
         let sort = match self.sort {
             Some(by) if self.ranked_by().is_some() => format!(
-                "By {} {}, the top {SORT_WINDOW}",
+                "By {} {}, over all of them",
                 by.word(),
                 if self.descending { "descending" } else { "ascending" }
             ),
@@ -798,7 +809,7 @@ impl Search {
         let total = if !self.fields.any() || self.filters_by_tags() {
             String::new()
         } else if self.sorts_from_a_window()
-            && let Ok(window) = window_of(self)
+            && let Ok(window) = window_of(self, 0)
         {
             window.total.get_or_init(|| self.total()).clone()
         } else {
@@ -867,14 +878,21 @@ struct Window {
     /// bumped, under `shown`, each time rows are kept: a size order read from older sizes isn't kept
     shown_gen: std::sync::atomic::AtomicU64,
     filled: AtomicBool,
+    /// how many results it was read with
+    asked: i64,
+    /// the search had that many, soo it may have more: a sort over a whole category reads a bigger window when a page
+    /// goes past this one
+    more_in_db: bool,
 }
 
 impl Window {
-    fn read(search: &Search) -> Result<Window, String> {
+    fn read(search: &Search, asked: i64) -> Result<Window, String> {
         let filter = parse_filter(&search.cat);
-        let rows = search.search(filter.as_ref(), 0, SORT_WINDOW)?;
+        let rows = search.search(filter.as_ref(), 0, asked)?;
         Ok(Window {
             built: Instant::now(),
+            asked,
+            more_in_db: rows.len() as i64 >= asked,
             rows: search.keep_tagged(rows, usize::MAX),
             categories: OnceLock::new(),
             scores: OnceLock::new(),
@@ -886,6 +904,11 @@ impl Window {
             shown_gen: std::sync::atomic::AtomicU64::new(0),
             filled: AtomicBool::new(false),
         })
+    }
+
+    /// Whether a page that ends past it needs a bigger one: only a sort over a whole category grows.
+    fn can_grow(&self, search: &Search) -> bool {
+        self.more_in_db && search.ranked_by().is_some() && (!search.filters_by_tags() || self.asked < GROW_WITH_TAGS)
     }
 
     fn ids(&self) -> Vec<i64> {
@@ -1042,7 +1065,9 @@ impl Window {
     /// Renders every row and works out every order, soo no click has any of it left to do.
     fn fill(&self, search: &Search) {
         let shown = lock(&self.shown);
-        let missing: Vec<ReleaseRow> = self.rows.iter().filter(|r| !shown.contains_key(&r.id)).cloned().collect();
+        // the top of a big window: further down a page renders what it reaches
+        let missing: Vec<ReleaseRow> =
+            self.rows.iter().take(SORT_WINDOW as usize).filter(|r| !shown.contains_key(&r.id)).cloned().collect();
         drop(shown);
         let slices: Vec<&[ReleaseRow]> = missing.chunks(PAGE_SIZE as usize).collect();
         let next = std::sync::atomic::AtomicUsize::new(0);
@@ -1148,21 +1173,28 @@ fn slot_of(search: &Search, always: bool) -> Arc<WindowSlot> {
         .clone()
 }
 
-/// The window to answer with now: the one there is, however old, or a new one when there's none.
-fn window_of(search: &Search) -> Result<Arc<Window>, String> {
+/// The window to answer with now: the one there is, however old, or a new one when there's none or the one there is
+/// was read with fewer than `at_least` results and could have more.
+fn window_of(search: &Search, at_least: i64) -> Result<Arc<Window>, String> {
     let slot = slot_of(search, false);
     *lock(&slot.used) = Instant::now();
-    if let Some(window) = lock(&slot.window).clone() {
+    let big_enough = |w: &Window| w.asked >= at_least || !w.can_grow(search);
+    if let Some(window) = lock(&slot.window).clone()
+        && big_enough(&window)
+    {
         if window.built.elapsed() > WINDOW_FRESH {
             replace_in_background(&slot);
         }
         return Ok(window);
     }
     let _reading = lock(&slot.reading);
-    if let Some(window) = lock(&slot.window).clone() {
-        return Ok(window);
-    }
-    let window = Arc::new(Window::read(&slot.search)?);
+    let asked = match lock(&slot.window).clone() {
+        Some(window) if big_enough(&window) => return Ok(window),
+        // twice as many each time, soo paging on reads the database a few times, not a page at a time
+        Some(window) => at_least.max(window.asked.saturating_mul(2)),
+        None => at_least.max(SORT_WINDOW),
+    };
+    let window = Arc::new(Window::read(&slot.search, asked)?);
     *lock(&slot.window) = Some(window.clone());
     // the window answers clicks without it, rendering what a page needs; filled, a click has nothing left to do.
     // Waiting, it holds neither the window nor its slot, soo a window dropped meanwhile is gone, and isn't filled
@@ -1209,7 +1241,8 @@ fn replace(replacing: Replacing) {
     if !still_kept(slot) {
         return;
     }
-    let Ok(window) = Window::read(&slot.search) else { return };
+    let asked = lock(&slot.window).as_ref().map_or(SORT_WINDOW, |w| w.asked);
+    let Ok(window) = Window::read(&slot.search, asked) else { return };
     window.fill(&slot.search);
     *lock(&slot.window) = Some(Arc::new(window));
 }
@@ -3142,6 +3175,8 @@ mod tests {
             sized: AtomicBool::new(false),
             shown_gen: std::sync::atomic::AtomicU64::new(0),
             filled: AtomicBool::new(false),
+            asked: SORT_WINDOW,
+            more_in_db: false,
         }
     }
 
@@ -3639,7 +3674,7 @@ mod tests {
     fn a_sort_over_a_category_ranks_all_of_it() {
         let size = Search::from_args(&parse_query("cat=2000&sort=size&dir=desc"));
         assert_eq!(size.ranked_by(), Some(crate::sorted::Column::Size));
-        assert!(size.summary().contains("By size descending, the top 2000"), "{}", size.summary());
+        assert!(size.summary().contains("By size descending, over all of them"), "{}", size.summary());
         // its own window, not the newest releases': a window for each column and way
         let asc = Search { descending: false, ..size.clone() };
         let plain = Search { sort: None, ..size.clone() };
@@ -3655,6 +3690,21 @@ mod tests {
             }
             assert_eq!(slot_of(&s, false).search.sort, None, "{query}");
         }
+    }
+
+    #[test]
+    fn only_a_ranked_window_with_more_behind_it_grows() {
+        let ranked = Search::from_args(&parse_query("cat=2000&sort=size&dir=desc"));
+        let full = Window { more_in_db: true, ..window_of_rows(Vec::new()) };
+        assert!(full.can_grow(&ranked), "a page past 2000 reads further");
+        assert!(!window_of_rows(Vec::new()).can_grow(&ranked), "all of them were read");
+        let words = Search::from_args(&parse_query("q=batman&sort=size"));
+        assert!(!full.can_grow(&words), "a word search sorts what it found");
+        let tags = Search::from_args(&parse_query("cat=2000&sort=size&filters=DV"));
+        assert!(full.can_grow(&tags));
+        let far = Window { asked: GROW_WITH_TAGS, more_in_db: true, ..window_of_rows(Vec::new()) };
+        assert!(!far.can_grow(&tags), "tags are read a name at a time, soo they stop somewhere");
+        assert!(far.can_grow(&ranked));
     }
 
     #[test]
