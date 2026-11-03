@@ -1616,8 +1616,12 @@ impl ShardWriter {
                     let mut timing = Timing::default();
                     for a in articles {
                         if add_segment(&tx, domains, &f, index, a, &mut sealed)? {
-                            timing.fold(a, &key);
                             let unsure = f.sealed && sealed.guessed;
+                            // an article that may be a copy of one in the blob isn't timed: sealing again can drop
+                            // it, and nothing takes it back out of the timing row, so its counts would stay
+                            if !unsure {
+                                timing.fold(a, &key);
+                            }
                             if unsure {
                                 // maybe a copy of what the blob has: only its part
                                 // counts, the rest is held back till sealing the file

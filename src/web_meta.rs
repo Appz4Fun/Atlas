@@ -161,6 +161,8 @@ struct FileTiming {
     xref_groups_max: Option<i64>,
     /// runs of one From in arrival order: 1 is one From throughout
     from_variants: i64,
+    /// the file's last From, hashed: with one run, the file's only From
+    from_hash: Option<i64>,
     encoded_subject: bool,
     late_articles: i64,
     /// the articles the row covers
@@ -238,7 +240,7 @@ fn look(conn: Option<&Connection>, release_id: i64) -> Looked {
 fn read_timing(s: &Connection, release_id: i64) -> rusqlite::Result<Vec<FileTiming>> {
     s.prepare_cached(
         "select t.first_date, t.last_date, t.number_first, t.number_last, t.lines, t.references_seen, t.xref_groups_max,
-                t.from_variants, t.encoded_subject, t.late_articles, t.articles
+                t.from_variants, t.encoded_subject, t.late_articles, t.articles, t.from_hash
          from file_timing t join files f on f.id = t.file_id
          where f.release_id = ?1 order by f.filename limit ?2",
     )?
@@ -255,6 +257,7 @@ fn read_timing(s: &Connection, release_id: i64) -> rusqlite::Result<Vec<FileTimi
             encoded_subject: r.get::<_, i64>(8)? != 0,
             late_articles: r.get(9)?,
             articles: r.get(10)?,
+            from_hash: r.get(11)?,
         })
     })?
     .collect()
@@ -973,17 +976,22 @@ fn crossposts(timing: &[FileTiming]) -> Option<String> {
     Some(if most <= 1 { "one group, by Xref".into() } else { format!("{most} groups at most, by Xref") })
 }
 
-/// "one From throughout" or "From changed 5 times between articles (rotating identity)".
+/// "one From throughout", "3 Froms, one a file" or "From changed 5 times within files (rotating identity)".
+/// The rows count changes inside each file; across files, a file with one run has one From, its hash, soo files
+/// that each keep to theirs are told apart by those.
 fn from_variants(timing: &[FileTiming]) -> Option<String> {
     if timing.is_empty() {
         return None;
     }
     let changes: i64 = timing.iter().map(|t| (t.from_variants - 1).max(0)).sum();
-    Some(if changes == 0 {
-        "one From throughout".into()
-    } else {
-        format!("From changed {changes} time{} between articles (rotating identity)", plural(changes as usize))
-    })
+    if changes > 0 {
+        return Some(format!(
+            "From changed {changes} time{} within files (rotating identity)",
+            plural(changes as usize)
+        ));
+    }
+    let froms: std::collections::HashSet<i64> = timing.iter().filter_map(|t| t.from_hash).collect();
+    Some(if froms.len() > 1 { format!("{} Froms, one a file", froms.len()) } else { "one From throughout".into() })
 }
 
 /// "128 lines an article, 4,096 bytes a line"; `size` is the bytes the rows cover.
@@ -1007,8 +1015,12 @@ fn late_articles(timing: &[FileTiming]) -> String {
 }
 
 /// A key over the per-file Lines sums in file name order: a post made again with the same line length keys
-/// the same, whatever its subjects say. None unless every file has lines.
-fn lines_key(timing: &[FileTiming]) -> Option<String> {
+/// the same, whatever its subjects say. None unless the rows cover every article of the release (`parts`) and
+/// every file has lines: a sum over part of a file, or a file with no row, would key a different post.
+fn lines_key(timing: &[FileTiming], parts: Option<i64>) -> Option<String> {
+    if parts != Some(timed(timing)) {
+        return None;
+    }
     let lines: Vec<String> =
         timing.iter().map(|t| t.lines.filter(|l| *l > 0).map(|l| l.to_string())).collect::<Option<_>>()?;
     if lines.is_empty() {
@@ -1914,7 +1926,7 @@ fn keys_panel(i: &MetaInputs<'_>, l: &Looked, compact: bool) -> Facts {
     {
         f.key("NZBLNK", Some(nzblnk(&i.release.name, subject, &i.release.group_name)));
     }
-    f.key("Lines key", lines_key(&l.timing));
+    f.key("Lines key", lines_key(&l.timing, i.release.parts));
     f
 }
 
@@ -3291,7 +3303,18 @@ mod tests {
         );
         assert_eq!(lines_per_article(&rows, None).as_deref(), Some("100 lines an article"));
         assert_eq!(late_articles(&rows), "none");
-        assert_eq!(lines_key(&rows).as_deref(), Some(key16(b"1000,1000,1000").as_str()));
+        assert_eq!(lines_key(&rows, Some(30)).as_deref(), Some(key16(b"1000,1000,1000").as_str()));
+        assert_eq!(lines_key(&rows, Some(31)), None, "an article saved before timing was kept: no key");
+        assert_eq!(lines_key(&rows, None), None);
+
+        // files that each keep to one From, but not the same one
+        let mut two = rows.clone();
+        two[0].from_hash = Some(1);
+        two[1].from_hash = Some(2);
+        two[2].from_hash = Some(1);
+        assert_eq!(from_variants(&two).as_deref(), Some("2 Froms, one a file"));
+        two[1].from_hash = Some(1);
+        assert_eq!(from_variants(&two).as_deref(), Some("one From throughout"));
 
         // a minute or less: no rate, and the span says so
         let quick = vec![timed(TEN, TEN + 30, 3, (1, 3))];
@@ -3318,9 +3341,9 @@ mod tests {
         assert_eq!(threaded_replies(&busy), "3 articles carried References");
         assert_eq!(crossposts(&busy).as_deref(), Some("3 groups at most, by Xref"));
         assert_eq!(crossposts(&busy[..1]).as_deref(), Some("one group, by Xref"));
-        assert_eq!(from_variants(&busy).as_deref(), Some("From changed 3 times between articles (rotating identity)"));
+        assert_eq!(from_variants(&busy).as_deref(), Some("From changed 3 times within files (rotating identity)"));
         assert_eq!(late_articles(&busy), "2 arrived after the file sealed");
-        assert_eq!(lines_key(&busy), None, "a file without lines keys nothing");
+        assert_eq!(lines_key(&busy, Some(20)), None, "a file without lines keys nothing");
         assert_eq!(lines_per_article(&busy, Some(1)).as_deref(), Some("50 lines an article, 0 bytes a line"));
 
         // rows without dates or numbers say nothing about them
@@ -3350,11 +3373,11 @@ mod tests {
             "<dt>From variants</dt><dd>one From throughout</dd>",
             "<dt>Lines per article</dt><dd>100 lines an article</dd>",
             "<dt>Late articles</dt><dd>none</dd>",
-            "<dt>Lines key</dt>",
         ] {
             assert!(page.contains(fact), "{fact}\n{page}");
         }
         assert!(!page.contains("Crossposts per article") && !page.contains("Encoded subjects"), "{page}");
+        assert!(!page.contains("Lines key"), "part of the release timed: no Lines key\n{page}");
         // the whole release timed: the rates carry bytes too
         l.timing[1].articles = 1350;
         l.timing[1].encoded_subject = true;
@@ -3365,6 +3388,7 @@ mod tests {
             "<dt>Lines per article</dt><dd>85 lines an article, 12,320 bytes a line</dd>",
             "<dt>Crossposts per article</dt><dd>2 groups at most, by Xref</dd>",
             "<dt>Encoded subjects</dt><dd>1 of 2 files posted with RFC 2047 words</dd>",
+            "<dt>Lines key</dt>",
         ] {
             assert!(page.contains(fact), "{fact}\n{page}");
         }
