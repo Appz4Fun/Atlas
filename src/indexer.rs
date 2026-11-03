@@ -191,7 +191,7 @@ const MAX_BATCH: usize = 8;
 #[derive(Clone)]
 pub struct Db {
     conn: Arc<Mutex<Connection>>,
-    saves: Vec<std::sync::mpsc::Sender<WriterJob>>,
+    saves: Vec<std::sync::mpsc::SyncSender<WriterJob>>,
     /// last field: dropping the final clone closes the queues above, then waits
     /// for the writer threads to finish what they were doing
     _writers: Arc<Writers>,
@@ -243,7 +243,7 @@ fn shared_db_idling(conn: Connection, every: Duration) -> Db {
     let ids = Arc::new(crate::store::Ids::new(&main));
     let (saves, writers): (Vec<_>, Vec<_>) = (0..crate::store::SHARDS)
         .map(|shard| {
-            let (saves, jobs) = std::sync::mpsc::channel();
+            let (saves, jobs) = std::sync::mpsc::sync_channel(1024);
             let (path, ids) = (crate::store::shard_path(&main, shard), ids.clone());
             let handle = std::thread::Builder::new()
                 .name(format!("atlas-db-writer-{shard}"))

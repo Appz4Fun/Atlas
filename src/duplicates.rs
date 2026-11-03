@@ -558,6 +558,7 @@ mod tests {
             size,
             name: "x".into(),
             bound: true,
+            crc32: None,
         }
     }
 

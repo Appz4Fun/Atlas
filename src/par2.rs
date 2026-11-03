@@ -25,6 +25,7 @@ pub fn is_base_par2(subject: &str) -> bool {
 const MAX_FILES: usize = 4_096;
 const MAIN: &[u8; 16] = b"PAR 2.0\0Main\0\0\0\0";
 const UNICODE: &[u8; 16] = b"PAR 2.0\0UniFileN";
+const IFSC: &[u8; 16] = b"PAR 2.0\0IFSC\0\0\0\0";
 
 /// A file a PAR2 set describes.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -38,6 +39,8 @@ pub struct Par2File {
     /// its file id is the MD5 of its first-16-KiB hash, size and name, as PAR2 makes it, soo a Main that lists the id
     /// vouches for this size and hash too
     pub bound: bool,
+    /// whole-file CRC32 computed by folding IFSC slice checksums with last slice unpadded
+    pub crc32: Option<u32>,
 }
 
 /// What a set's packets say.
@@ -63,13 +66,21 @@ fn u64_at(b: &[u8], at: usize) -> Option<u64> {
     Some(u64::from_le_bytes(b.get(at..at.checked_add(8)?)?.try_into().ok()?))
 }
 
+type SliceChecksum = ([u8; 16], u32);
+type SetFileKey = ([u8; 16], [u8; 16]);
+
 /// Every file in `data`'s packets, per recovery set soo a file id cant merge two
 /// sets. Volumes repeat these packets, soo a repeat collapses. Any bytes will do.
 pub fn inventory(data: &[u8]) -> Inventory {
+    const MAX_TOTAL_IFSC_SLICES: usize = 16_384;
+
     let mut inv = Inventory::default();
     let mut mains: Vec<([u8; 16], [u8; 16])> = Vec::new();
+    let mut block_sizes: std::collections::HashMap<[u8; 16], Option<u64>> = std::collections::HashMap::new();
     let mut saw_main = false;
     let mut unicode: Vec<([u8; 16], [u8; 16], String)> = Vec::new();
+    let mut ifsc_slices: std::collections::HashMap<SetFileKey, Vec<SliceChecksum>> = std::collections::HashMap::new();
+    let mut total_ifsc_slices = 0usize;
     let mut pos = 0usize;
     while let Some(head) = data.get(pos..pos.saturating_add(HEADER_LEN)) {
         if !head.starts_with(MAGIC) {
@@ -99,7 +110,16 @@ pub fn inventory(data: &[u8]) -> Inventory {
         };
         if &kind == MAIN {
             saw_main = true;
-            inv.block_size = inv.block_size.or(u64_at(body, 0).filter(|size| *size > 0));
+            if let Some(bs) = u64_at(body, 0).filter(|size| *size > 0) {
+                inv.block_size = inv.block_size.or(Some(bs));
+                if let Some(existing) = block_sizes.get_mut(&set_id) {
+                    if *existing != Some(bs) {
+                        *existing = None;
+                    }
+                } else if block_sizes.len() < MAX_FILES {
+                    block_sizes.insert(set_id, Some(bs));
+                }
+            }
             let ids = body.get(12..).unwrap_or(&[]);
             let sealed = <[u8; 16]>::from(md5::Md5::digest(body)) == set_id;
             for id in ids.as_chunks::<16>().0.iter().take(MAX_FILES) {
@@ -129,7 +149,7 @@ pub fn inventory(data: &[u8]) -> Inventory {
             let Some(name) = clean_name(&name) else { continue };
             let there = inv.files.iter().any(|f| f.set_id == set_id && f.file_id == file_id && f.name == name);
             if !there && inv.files.len() < MAX_FILES {
-                inv.files.push(Par2File { set_id, file_id, md5, md5_16k, size, name, bound });
+                inv.files.push(Par2File { set_id, file_id, md5, md5_16k, size, name, bound, crc32: None });
             }
         } else if &kind == UNICODE {
             let (Some(file_id), Some(raw)) = (id_at(body, 0), body.get(16..)) else { continue };
@@ -140,6 +160,32 @@ pub fn inventory(data: &[u8]) -> Inventory {
             {
                 unicode.push((set_id, file_id, name));
             }
+        } else if &kind == IFSC {
+            if ifsc_slices.len() >= MAX_FILES {
+                continue;
+            }
+            let (Some(file_id), Some(slice_bytes)) = (id_at(body, 0), body.get(16..)) else { continue };
+            if ifsc_slices.contains_key(&(set_id, file_id)) {
+                continue;
+            }
+            let (chunks, rem) = slice_bytes.as_chunks::<20>();
+            if chunks.is_empty()
+                || !rem.is_empty()
+                || chunks.len() > MAX_FILES
+                || total_ifsc_slices.saturating_add(chunks.len()) > MAX_TOTAL_IFSC_SLICES
+            {
+                continue;
+            }
+            let mut slices = Vec::with_capacity(chunks.len());
+            for chunk in chunks.iter().take(MAX_FILES) {
+                let Some(md5) = chunk.get(0..16).and_then(|s| s.try_into().ok()) else { continue };
+                let Some(crc_bytes) = chunk.get(16..20).and_then(|s| s.try_into().ok()) else { continue };
+                slices.push((md5, u32::from_le_bytes(crc_bytes)));
+            }
+            if !slices.is_empty() {
+                total_ifsc_slices += slices.len();
+                ifsc_slices.insert((set_id, file_id), slices);
+            }
         }
     }
     // a clean unicode name replaces its file's, in either order
@@ -147,6 +193,36 @@ pub fn inventory(data: &[u8]) -> Inventory {
         for f in inv.files.iter_mut().filter(|f| f.set_id == set_id && f.file_id == file_id) {
             f.name.clone_from(&name);
         }
+    }
+    // calculate whole-file CRC32 by folding IFSC slice checksums with last slice unpadded
+    for f in &mut inv.files {
+        let Some(&Some(block_size)) = block_sizes.get(&f.set_id) else {
+            continue;
+        };
+        let Some(slices) = ifsc_slices.get(&(f.set_id, f.file_id)) else {
+            continue;
+        };
+        if block_size == 0 || slices.is_empty() || f.size == 0 {
+            continue;
+        }
+        let expected_slices = f.size.div_ceil(block_size);
+        let num_slices = slices.len() as u64;
+        if num_slices != expected_slices {
+            continue;
+        }
+        let last_slice_unpadded_len = f.size.saturating_sub(num_slices.saturating_sub(1) * block_size);
+        let zero_padding_len = block_size.saturating_sub(last_slice_unpadded_len);
+
+        let mut combined_crc = 0u32;
+        for (i, &(_md5, slice_crc)) in slices.iter().enumerate() {
+            let (slice_crc_unpadded, len) = if i + 1 == slices.len() && zero_padding_len > 0 {
+                (crate::gf2::crc32_unzero(slice_crc, zero_padding_len as usize), last_slice_unpadded_len as usize)
+            } else {
+                (slice_crc, block_size as usize)
+            };
+            combined_crc = crate::gf2::crc32_combine(combined_crc, slice_crc_unpadded, len);
+        }
+        f.crc32 = Some(combined_crc);
     }
     inv.complete =
         saw_main && mains.iter().all(|(set, id)| inv.files.iter().any(|f| f.set_id == *set && f.file_id == *id));
@@ -407,5 +483,77 @@ mod tests {
             let part: Vec<String> = inventory(&data[..cut]).files.into_iter().map(|f| f.name).collect();
             assert!(full.starts_with(&part), "cut {cut}");
         }
+    }
+
+    #[test]
+    fn ifsc_incomplete_or_capped_slices_leave_crc_unknown() {
+        let block_size = 1024u64;
+        let mut main_body = block_size.to_le_bytes().to_vec();
+        main_body.extend(1u32.to_le_bytes());
+        main_body.extend([1u8; 16]);
+        while !main_body.len().is_multiple_of(4) {
+            main_body.push(0);
+        }
+        let main = packet(1, MAIN, &main_body);
+
+        // 1. File with 4,097 blocks (> MAX_FILES = 4,096): must leave crc32 as None
+        let capped_blocks = (MAX_FILES + 1) as u64;
+        let desc_capped = desc(1, 1, "huge.bin", capped_blocks * block_size);
+        let mut ifsc_capped_body = vec![1u8; 16];
+        for _ in 0..=MAX_FILES {
+            ifsc_capped_body.extend([0xAAu8; 16]);
+            ifsc_capped_body.extend(0x1234_5678u32.to_le_bytes());
+        }
+        let ifsc_capped = packet(1, IFSC, &ifsc_capped_body);
+        let inv_capped = inventory(&[main.clone(), desc_capped, ifsc_capped].concat());
+        assert_eq!(inv_capped.files[0].crc32, None, "exceeding MAX_FILES must leave CRC unknown");
+
+        // 2. File requiring 3 blocks but IFSC only supplies 2 slices: must leave crc32 as None
+        let desc_short = desc(1, 1, "short_ifsc.bin", 3 * block_size);
+        let mut ifsc_short_body = vec![1u8; 16];
+        for _ in 0..2 {
+            ifsc_short_body.extend([0xBBu8; 16]);
+            ifsc_short_body.extend(0x1111_2222u32.to_le_bytes());
+        }
+        let ifsc_short = packet(1, IFSC, &ifsc_short_body);
+        let inv_short = inventory(&[main, desc_short, ifsc_short].concat());
+        assert_eq!(inv_short.files[0].crc32, None, "incomplete slice list must leave CRC unknown");
+    }
+
+    #[test]
+    fn ifsc_crc_folding_uses_recovery_set_own_block_size() {
+        // Set 1 has block_size = 4096; Set 2 has block_size = 2048
+        let mut main1_body = 4096u64.to_le_bytes().to_vec();
+        main1_body.extend(1u32.to_le_bytes());
+        main1_body.extend([1u8; 16]);
+        let main1 = packet(1, MAIN, &main1_body);
+
+        let mut main2_body = 2048u64.to_le_bytes().to_vec();
+        main2_body.extend(1u32.to_le_bytes());
+        main2_body.extend([2u8; 16]);
+        let main2 = packet(2, MAIN, &main2_body);
+
+        // Set 2 has a 2048-byte file (1 full block in Set 2 -> 0 padding bytes, so folded CRC == slice_crc2).
+        // If Set 1's block_size (4096) had overwritten Set 2's, unpadding 2048 zero bytes would corrupt the CRC.
+        let slice_crc2 = 0xCAFE_BABEu32;
+        let desc2 = desc(2, 2, "set2.bin", 2048);
+        let mut ifsc2_body = vec![2u8; 16];
+        ifsc2_body.extend([0u8; 16]);
+        ifsc2_body.extend(slice_crc2.to_le_bytes());
+        let ifsc2 = packet(2, IFSC, &ifsc2_body);
+
+        // Set 3 has no Main packet: its IFSC must not borrow Set 1 or Set 2's block_size
+        let desc3 = desc(3, 3, "set3.bin", 2048);
+        let mut ifsc3_body = vec![3u8; 16];
+        ifsc3_body.extend([0u8; 16]);
+        ifsc3_body.extend(slice_crc2.to_le_bytes());
+        let ifsc3 = packet(3, IFSC, &ifsc3_body);
+
+        // Put main1 after main2 so a single global block_size variable would be overwritten by 4096
+        let inv = inventory(&[main2, main1, desc2, ifsc2, desc3, ifsc3].concat());
+        let f2 = inv.files.iter().find(|f| f.name == "set2.bin").unwrap();
+        let f3 = inv.files.iter().find(|f| f.name == "set3.bin").unwrap();
+        assert_eq!(f2.crc32, Some(slice_crc2));
+        assert_eq!(f3.crc32, None);
     }
 }

@@ -19,6 +19,12 @@ use serde::{Deserialize, Serialize};
 use crate::postprocess::schema::ShardTable;
 use crate::store;
 
+pub use archive::{ArchiveFormat, ArchiveHead, ArchiveStream, DecompressError};
+pub use media::{
+    AudioBitstream, AudioProbeResult, AudioTrack, AvcDepth, Chapter, DiscInfo, DiscProber, DolbyVisionInfo,
+    H265Sps, HevcDepth, MediaInfo, MediaProber, MkvMetadata, Mp4Prober, VideoTrack, VuiInfo,
+};
+pub use nest::{Layer, Nest, unwrap as unwrap_nested};
 pub use step::ProbeStep;
 
 /// What a probe found, kept as JSON: it's only ever read whole. The columns are what can be searched on.

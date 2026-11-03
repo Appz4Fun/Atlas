@@ -99,23 +99,26 @@ Cut from v1: per-connection fragment stitching, Fellegi-Sunter with EM (use a ru
 
 ## 3. Providers
 
-Command support is from source and old dumps; no live matrix exists. `nntp-probe/nntp_probe.py` (read-only, tested on fake servers) settles it per account.
+Live provider probe completed on 2026-11-03 (`nntp-probe/results-2026-11-03.md`) across 9 configured logins:
 
-| Provider family | Server ID | Decodable fields | Commands known | Unknowns |
+| Provider family | Server ID | Decodable fields | Commands & empirical probe results (2026-11-03) | Remaining unknowns |
 |---|---|---|---|---|
-| Highwinds (UsenetServer, Newshosting, Easynews; same shape seen @giganews.com; Eweka in 2014-22 samples) | `T.N$S.R@fxNN.dc` | T time (base64 0-9a-zA-Z_%, +876,645,500), N front-end counter, S session, fxNN front-end | XZVER, XZHDR, XFEATURE COMPRESS GZIP (sends zlib), XHDR, LIST COUNTS; Lines empty, 2-digit-year Date; HEAD: X-Received-Bytes/Body-CRC, Org, NNTP-Posting-Date (not Easynews) | R field; NEWNEWS; share of uploads given server IDs |
-| Giganews (+ white labels; Supernews numbering shared) | 32 b64 `@giganews.com` | XOR 0x9D → 6 LE u32: w2 time; w0 PID?, w1 counter?, w4 box? | XFEATURE COMPRESS GZIP; X-Trace, X-Usenet-Provider; 451 = DMCA | w0/w1/w4 on a multi-segment upload; NEWNEWS |
-| Diablo (Astraweb, UsenetServer upload, free.fr, Eweka uploadreader) | `hex$seq$pid$hosthash[$x]` | time, per-second seq, pid, front-end hash | NEWNEWS off by default; XZVER (Astraweb origin); gzip; engines don't sync numbers | Astraweb `$x` varies per article (hash of IP/account/body?); UsenetServer +3600 s skew |
-| INN | `radix32(t)$radix32(pid)$count` | time, pid, counter | NEWNEWS on; OVERVIEW.FMT extras; adds Injection-Date | coverage on binary backbones |
+| Highwinds (`news.eweka.nl`, `news.newshosting.com` — identical counters) | `T.N$S.R@fxNN.dc` | T time (base64 0-9a-zA-Z_%, +876,645,500), N front-end counter, S session, fxNN front-end | `NEWNEWS` 400; `XHDR` non-overview returns `221` with no values; `Lines` empty on 55-64% of rows; 2-digit `Date` years on 55-64%; `DATE` skew `-0.56..-0.78 s`; `XFEATURE COMPRESS GZIP` 290; `XZVER` listed in `HELP` but hangs (timeout) | R field; share of uploads given server IDs |
+| Giganews (`super.newsgroupdirect.com`, `news.frugalusenet.com` close numbering) | 32 b64 `@giganews.com` | XOR 0x9D → 6 LE u32: w2 time; w0 PID?, w1 counter?, w4 box? | `NEWNEWS` 502 (frugal 500); `XHDR` non-overview 501; `Lines` empty 0%; 2-digit `Date` years 41-46%; **`DATE` skew +5.74 s on Giganews** (`-0.36 s` on frugal); `XFEATURE COMPRESS GZIP` 290; `XZVER` 440/500 | w0/w1/w4 on a multi-segment upload |
+| Newsgroupdirect / Viper (`news` / `viper.newsgroupdirect.com` — identical counters) | — | — | `NEWNEWS` 400; `XHDR` non-overview 400; `Lines` empty 0%; 2-digit `Date` years 60-68%; `DATE` skew `-0.33..-0.81 s`; `XFEATURE COMPRESS GZIP` 290; `XZVER` 400 | Server-assigned ID shape on binary groups |
+| Diablo (Astraweb, UsenetServer upload, free.fr, Eweka uploadreader) | `hex$seq$pid$hosthash[$x]` | time, per-second seq, pid, front-end hash | `NEWNEWS` off; `XZVER` (Astraweb origin); gzip; engines don't sync numbers | Astraweb `$x` varies per article; UsenetServer +3600 s skew |
+| INN | `radix32(t)$radix32(pid)$count` | time, pid, counter | OVERVIEW.FMT extras; adds Injection-Date | coverage on binary backbones |
 | Supernews | base32 0-9a-v | first 7 chars = time | — | rest of ID; 13-char form |
-| Usenet.Farm | 32 random letters | none | XZVER; XFEATURE 500; X-Ufhash, X-Received-* | — |
-| Abavia/nntpswitch (XS News, TorBox, Cheapnews, UseNeXT) | normalized | — | OVER/HDR/XZVER/XZHDR; non-overview HDR blocked (assumed from nntpswitch); NEWNEWS single group | ID format; whether synthesized numbers follow arrival |
-| Omicron (Tweaknews), UsenetExpress | none found | — | Omicron Path ends path-stripped; UE opened IHAVE | ID formats; everything else (run `nntp-probe/`) |
+| Usenet.Farm (`farm.newsgroupdirect.com`, nntpd) | 32 random letters | none | `NEWNEWS` 500; `XHDR` non-overview `221` with no values (`HDR` in `CAPABILITIES`); `Lines` empty 13%; 2-digit `Date` years 13%; `DATE` skew `-0.25 s`; **`XZVER` 224**; `XFEATURE COMPRESS GZIP` 500 | — |
+| Abavia/nntpswitch2 (`reader.xsnews.nl`) | normalized | — | `NEWNEWS` 500; `XHDR` non-overview 503; `Lines` `"0"` on 64% of rows; 2-digit `Date` years 64%; `DATE` skew `-0.67 s`; **`XZVER` 224**; `XFEATURE COMPRESS GZIP` 500; synthesized ~400M article window | ID format; whether synthesized numbers follow arrival |
+| Fill / bonus (`bonus.frugalusenet.com`) | — | — | `GROUP` 501, `LIST` 511 (cannot select or list groups; article-by-Message-ID lookup only); `DATE` skew `-0.87 s`; `XFEATURE COMPRESS GZIP` 290 | — |
 
 ## 4. Dead ends
 
 | Idea | Why dropped |
 |---|---|
+| `NEWNEWS` single-group bisection | Disabled (`400`/`500`/`502`) on all 9 probed provider logins (2026-11-03 probe) |
+| `XHDR`/`HDR` for `NNTP-Posting-Date`, `Injection-Info`, `Path`, or `X-Received-Body-CRC` | Every provider returns `221` with no values or `400`/`501`/`503` (2026-11-03 probe); costs one `HEAD` per article |
 | Arrival from high-water-mark interpolation | ±10 s errors under bursts (sim 1) |
 | Simultaneous-burst join across groups | Tools post files in series; join end-to-start |
 | Cutting file runs from XOVER alone | Last part arrives early; runs .07-.65 exact, 0 whole |
@@ -131,7 +134,10 @@ Command support is from source and old dumps; no live matrix exists. `nntp-probe
 | PAR2 Recovery Set ID as link key | Changes on rename |
 | STAT/HEAD or LISTGROUP gaps for takedowns | Say present after BODY is gone (451); use BODY |
 | Lumen notices as ground truth | No Usenet Message-IDs |
-| Overview Lines on Highwinds | Empty; use :bytes |
+| Overview `Lines` field on any provider | Empty on 55-64% of Highwinds and 13% of Usenet.Farm rows, and `"0"` on 64% of XSNews rows (2026-11-03 probe); always use `:bytes` |
+| Assuming 4-digit years in `Date` headers | 13-68% of overview rows on every provider use 2-digit years (2026-11-03 probe) |
+| Uncalibrated cross-provider time joins | Giganews (`super.newsgroupdirect.com`) runs **+5.74 s** ahead on `DATE`; calibrate per-provider skew before joining |
+| Sending `XZVER` to Highwinds servers | Listed in `HELP` on `news.eweka.nl` and `news.newshosting.com` but hangs (timeout); use `XFEATURE COMPRESS GZIP` (`290`) on Highwinds and `XZVER` (`224`) on XSNews / Usenet.Farm |
 | yEnc `line=128` as tool tell | Default in all main tools |
 | newsmangler-style `float.n@provider` as server IDs | Client-generated, not server |
 | yEnc-name stitching for postie full | Name is random per article; use size + begin/end + hash16k |
@@ -145,18 +151,15 @@ Full plan: `wave-10-B-live-calibration.md`.
 - **Phase 2, fit thresholds** on 80% of the ground truth: clear-subject uploads with labels masked, external NZBs, postie PAR2 real names, and Nyuu ms. The other 20% is held out.
 - **Phase 3, promote one confidence level at a time**, after 7 days at precision ≥.98 (Proven ≥.995), recall at least 5 points above the current grouping on obfuscated labels, 0 Proven retractions, and ≤1 body per linked file.
 
-## What the owner can do
+## What the owner did & next probe step
 
-- **Run the read-only provider probe** (`nntp-probe/nntp_probe.py`, README alongside) once per provider account, and paste the summary table back.
-  - It settles: NEWNEWS support (exact arrival time), whether HDR works on NNTP-Posting-Date, whether Lines is empty, clock skew, and each provider's server-ID shape.
-  - It only reads, refuses write verbs, and takes the password from an environment variable.
-  - It has not been run against any real server yet.
-- Nothing else is blocked on the owner. The v1 build can start from the spec plus the red-team fixes.
+- **Completed (2026-11-03):** The read-only provider probe (`nntp-probe/nntp_probe.py`) was run across all 9 configured provider logins (`nntp-probe/results-2026-11-03.md`), settling `NEWNEWS` (disabled everywhere), `XHDR`/`HDR` on non-overview headers (empty/refused everywhere), `Lines` (empty or `"0"` on up to 64% of rows), 2-digit `Date` years (13–68% of rows), `DATE` clock skew (**+5.74 s** on Giganews), and `XZVER` vs `XFEATURE COMPRESS GZIP`.
+- **Optional follow-up:** `alt.binaries.test` was mostly Nyuu client-generated Message-IDs, so re-running the read-only probe on a busy obfuscated binaries group will sample server-assigned Message-IDs in the wild.
 
 ## Open questions
 
 - Is Highwinds S per upload or per connection? 7 real NZBs suggest per upload, maybe single-connection posts. Verify on Atlas's own header log.
-- Server-ID formats for UsenetExpress, Omicron, Abavia and Easynews: no public samples (the probe collects shapes).
+- Server-ID formats for UsenetExpress, Omicron, Abavia and Easynews: `alt.binaries.test` in the 2026-11-03 probe contained mostly Nyuu client IDs; re-run on a busy obfuscated binary group to sample server-assigned IDs.
 - Giganews w0/w1/w4 meaning on a multi-segment upload.
 - Does the RAR5 `-hp` salt repeat across the volumes of one set? If yes, it is a set key for encrypted uploads without PAR2.
 - Conflicting notes: whether Nyuu writes PAR2 by default (ParPar is separate), the nxg-upper From shape, and whether the X-Nxg value is constant.
