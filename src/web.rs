@@ -529,17 +529,31 @@ impl Search {
         let filter = parse_filter(&self.cat);
         let windowed = self.windowed();
         let count = if self.ranked_by().is_some() { SORT_WINDOW.max(self.offset + PAGE_SIZE + 1) } else { SORT_WINDOW };
-        let (from, count) = if windowed { (0, count) } else { (self.offset, PAGE_SIZE) };
-        let searched = self.search(filter.as_ref(), from, count);
-        let found = match searched {
-            Ok(found) => found,
-            Err(e) => return self.search_failed(&e),
-        };
-        let read = found.len() as i64;
+        let (from, mut count) = if windowed { (0, count) } else { (self.offset, PAGE_SIZE) };
         let tagged = |r: &ReleaseRow| self.has_tags(r);
         // a sort needs every match in the window, a page only up to one past its end
         let enough = if self.sort.is_some() { usize::MAX } else { (self.offset + PAGE_SIZE) as usize + 1 };
-        let mut found = self.keep_tagged(found, enough);
+        let (mut found, read) = loop {
+            let found = match self.search(filter.as_ref(), from, count) {
+                Ok(found) => found,
+                Err(e) => return self.search_failed(&e),
+            };
+            let read = found.len() as i64;
+            let found = self.keep_tagged(found, enough);
+            // a whole category ranked, with tags leaving too few for the page: read further, as far as a window would
+            let short = (found.len() as i64) <= self.offset + PAGE_SIZE;
+            if windowed
+                && self.ranked_by().is_some()
+                && self.filters_by_tags()
+                && short
+                && read >= count
+                && count < GROW_WITH_TAGS
+            {
+                count = count.saturating_mul(2).min(GROW_WITH_TAGS);
+                continue;
+            }
+            break (found, read);
+        };
         if found.is_empty() {
             return if self.offset == 0 {
                 self.nothing_found()
