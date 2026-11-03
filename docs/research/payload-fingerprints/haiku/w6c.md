@@ -1,0 +1,6 @@
+# W6C re-packer marker files (Haiku, ~09:25Z)
+- RARBG_DO_NOT_MIRROR.exe (text despite .exe) in RARBG video torrents | RARBG origin | free from RAR name list. torrentfreak 190126; filebot forum p=41613. YTS/YIFYStatus.com.txt, TGx txt, "Torrent Downloaded From X.txt" (KAT/h33t) exist; byte-identity UNVERIFIED -> test: if (size, CRC32) of a marker is constant, it is a zero-download origin fingerprint.
+- Scene allowed set: RAR set + group NFO + SFV + Sample/ + Proof/ + Subs/ (torrentfreak p=31565; wikipedia Warez_scene). Any extra file (.txt/.jpg/.exe/.url) => re-pack/non-scene | origin | free from name list.
+- Sonarr Parser.cs CleanReleaseGroupRegex re-uploader suffixes: -RP, -1, -NZBGeek, -Obfuscated, -Scrambled, -sample, -Pre, -postbot, -xpost, -Rakuv*, -WhiteRev, -BUYMORE, -AsRequested, -AlternativeToRequested, -GEROV, -Z0iDS3N, -Chamele0n, -4P, -4Planet, -AlteZachen, -RePACKPOST; torrent tags [ettv] [rartv] [rarbg] [cttv] [publichd] | re-uploader identity | free (name). raw.githubusercontent.com/Sonarr/Sonarr/develop/src/NzbDrone.Core/Parser/Parser.cs
+- -Obfuscated posts use 32-hex volume names (hash.NN) | re-uploader convention | free. newsbin p=221348, p=229299
+- pyReScene: SRR + sample from a different source errors, showing SRR can expose mixed sources.

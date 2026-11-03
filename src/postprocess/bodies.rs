@@ -15,6 +15,9 @@ use super::rules::IMAGE;
 use super::stats::Stats;
 use super::step::{BodyRequest, Got, ReleaseInfo, StepError};
 
+/// The refusal of a body past the release's share of this run, which a later run has again.
+pub const PAST_BUDGET: &str = "past bodies_per_release";
+
 /// Tokens by the clock, at most `cap`.
 pub(crate) struct TokenBucket {
     tokens: f64,
@@ -93,7 +96,7 @@ impl BodyFetcher {
         } else if IMAGE.is_match(file) {
             Some("an image")
         } else if used >= c.bodies_per_release {
-            Some("past bodies_per_release")
+            Some(PAST_BUDGET)
         } else {
             None
         }

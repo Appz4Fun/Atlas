@@ -1,0 +1,8 @@
+3 nzbs
+1 | none | 1.0 | ('xmlns=\\"http://www.newzbin.com/DTD/2003/nzb\\"',) | ('poster', 'date', 'subject') | ('bytes', 'number') | absen | oneline | False | same-line | dom [(')', 1)] | meta [((), 1)] | ex %a%a%a?%a=%" aaaa99 ":%a@(no @) | src [('nzbget', 1)] | cmt []
+1 | version="1.0" encoding="UTF-8" | 1.0 | ('xmlns',) | ('poster', 'date', 'subject') | ('bytes', 'number') | unix | '' | False | same-line | dom [('news.astraweb.com', 1)] | meta [((), 1)] | ex 9a9a9a9a$9$99999$a9a9aa9$99a99@news.astraweb.com | src [('nzbget', 1)] | cmt []
+1 | version="1.0" encoding="UTF-8" | 1.1 | ('xmlns',) | ('poster', 'date', 'subject') | ('bytes', 'number') | unix | '' | False | same-line | dom [('ngroups.net', 1)] | meta [((), 1)] | ex 9@ngroups.net | src [('nzbget', 1)] | cmt []
+1 nzbs
+1 | BOM+version="1.0" encoding="UTF-8" | 1.1 | ('xmlns',) | ('date', 'poster', 'subject') | ('bytes', 'number') | unix | '  ' | False | same-line | dom [('2894t-767038L.Pg7769', 1)] | meta [((), 1)] | ex aa9a999a999999999a9a9a9-99a9a9@2894t-767038L.Pg7769 | src [('Sonarr', 1)] | cmt []
+1 nzbs
+1 | BOM+version="1.0" encoding="UTF-8" | 1.1 | ('xmlns',) | ('date', 'poster', 'subject') | ('bytes', 'number') | unix | '  ' | False | same-line | dom [('2894t-767038L.Pg7769', 1)] | meta [((), 1)] | ex aa9a999a999999999a9a9a9-99a9a9@2894t-767038L.Pg7769 | src [('Prowlarr', 1)] | cmt []

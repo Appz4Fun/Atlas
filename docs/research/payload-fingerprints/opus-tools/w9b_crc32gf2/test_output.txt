@@ -1,0 +1,30 @@
+    Finished `release` profile [optimized] target(s) in 0.88s
+     Running unittests src/lib.rs (target/release/deps/crc32gf2-a9cc981e3f7647ce)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/props.rs (target/release/deps/props-454d6c6f5f39363a)
+
+running 8 tests
+test algebra_facts ... ok
+LARGE 5e9 zeros direct crc = aaa80f40 (matches)
+test large_n_direct_over_4gib ... ok
+test slices_from_parts_props ... ok
+test reference_matches_crc32fast ... ok
+BENCH fold 14000 yEnc parts (~10GB) 341.774µs; slices_from_parts m=4 -> 3500 slices 252.193µs [200c69d1]
+BENCH n~1e10: combine 368 ns/op, remove_suffix 465 ns/op, zero_unpad 397 ns/op; fold 9537 x 1MiB PAR2 slices (~10GB) 217.018µs [93e51473 cccf7fcc]
+test bench_large_n ... ok
+test yenc_par2_fold_props ... ok
+test combine_remove_props ... ok
+test zero_pad_unpad_props ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.43s
+
+   Doc-tests crc32gf2
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

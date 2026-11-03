@@ -1,0 +1,22 @@
+| NZB | articles | fx hosts | distinct S | distinct (fx,S) | S constant | N range | N steps | N monotone vs article order | T span s | T-date med s |
+| c7c1206442 | 4 | fx09.am4 | 1 | 1 | True | 546176-546182 | {2: 3} | 3/3 | 2 | 1 |
+| 49e9826bc0 | 1 | fx02.iad | 1 | 1 | True | 8588-8588 | {} | 0/0 | 0 | 0 |
+| c857a4ff7e | 655 | fx33.iad | 1 | 1 | True | 251076-251937 | {1: 447, 2: 207} | 654/654 | 501 | -614 |
+| f5fb8db749 | 11 | fx31.am4 | 1 | 1 | True | 55279-55289 | {1: 8, 4: 1, -3: 1} | 9/10 | 6 | 3 |
+| a81258bd56 | 2 | fx21.am4 | 1 | 1 | True | 38814-38815 | {1: 1} | 1/1 | 1 | 1 |
+| 3fedd762a4 | 185 | fx30.am4 | 1 | 1 | True | 288222-288406 | {1: 184} | 184/184 | 268 | 17 |
+| 939b1d73d5 | 11 | fx45.am4 | 1 | 1 | True | 117908-117918 | {1: 10} | 10/10 | 7 | 4 |
+c7c1206442 sorted by N: T decreases 0 of 3 ; R field monotone in N? 1 / 3
+49e9826bc0 sorted by N: T decreases 0 of 0 ; R field monotone in N? 0 / 0
+c857a4ff7e sorted by N: T decreases 0 of 654 ; R field monotone in N? 327 / 654
+f5fb8db749 sorted by N: T decreases 0 of 10 ; R field monotone in N? 6 / 10
+a81258bd56 sorted by N: T decreases 0 of 1 ; R field monotone in N? 0 / 1
+3fedd762a4 sorted by N: T decreases 0 of 184 ; R field monotone in N? 91 / 184
+939b1d73d5 sorted by N: T decreases 0 of 10 ; R field monotone in N? 3 / 10
+c7c1206442 row order N increasing 3 / 3 distinct dates 1
+49e9826bc0 row order N increasing 0 / 0 distinct dates 1
+c857a4ff7e row order N increasing 654 / 654 distinct dates 1
+f5fb8db749 row order N increasing 9 / 10 distinct dates 1
+a81258bd56 row order N increasing 1 / 1 distinct dates 1
+3fedd762a4 row order N increasing 184 / 184 distinct dates 13
+939b1d73d5 row order N increasing 10 / 10 distinct dates 1

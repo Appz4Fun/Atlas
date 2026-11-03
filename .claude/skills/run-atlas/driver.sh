@@ -81,11 +81,17 @@ EOF
   echo "atlas up: web $BASE/  api key $KEY  home $ATLAS_HOME  releases $(count)"
   ;;
 keys) shift; tmux send-keys -t "$SESSION" "$@" ;;
-screen) tmux capture-pane -pt "$SESSION" ;;
+# the pane is 50 rows and menus draw at the top, so `screen | tail` would show
+# only blank lines: drop trailing blank lines here
+screen) tmux capture-pane -pt "$SESSION" | sed -e :a -e '/^[[:space:]]*$/{$d;N;ba' -e '}' ;;
 api) shift; curl -s "$BASE/api?${1:-t=caps}&apikey=$KEY" ;;
 shot) shift; node "$HERE/shot.cjs" "$BASE" "$KEY" "$@" ;;
 status)
-  tmux has-session -t "$SESSION" 2>/dev/null && echo "menu: running (tmux $SESSION)" || echo "menu: stopped"
+  # after Exit the tmux session stays up (sleep 600, so the last screen can be read),
+  # so ask tmux whether atlas is still the pane's process
+  if ! tmux has-session -t "$SESSION" 2>/dev/null; then echo "menu: stopped"
+  elif tmux capture-pane -pt "$SESSION" | grep -q '\[atlas exited\]'; then echo "menu: exited (api down; run up again)"
+  else echo "menu: running (tmux $SESSION)"; fi
   [ -f "$ATLAS_HOME/bg_indexer.pid" ] && kill -0 "$(cat "$ATLAS_HOME/bg_indexer.pid")" 2>/dev/null \
     && echo "indexer: running" || echo "indexer: stopped"
   (echo >/dev/tcp/127.0.0.1/"$NNTP_PORT") 2>/dev/null && echo "mock nntp: running :$NNTP_PORT" || echo "mock nntp: stopped"
