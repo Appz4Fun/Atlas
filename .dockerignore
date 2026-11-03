@@ -1,9 +1,14 @@
 # build context is the repo root, the image only needs Cargo.toml, Cargo.lock,
-# build.rs, assets/, data/, sealed-log/, src/ and the entrypoint
+# build.rs, .git metadata, assets/, data/, sealed-log/, src/ and the entrypoint
 *
 !Cargo.toml
 !Cargo.lock
 !build.rs
+!.git/HEAD
+!.git/commondir
+!.git/packed-refs
+!.git/refs/
+!.git/objects/
 !assets/
 !data/
 !sealed-log/

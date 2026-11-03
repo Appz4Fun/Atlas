@@ -1,5 +1,7 @@
+use std::collections::BTreeMap;
 use std::env;
-use std::path::Path;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -24,23 +26,184 @@ fn non_empty_env(name: &str) -> Option<String> {
     env::var(name).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
 }
 
-fn emit_git_rerun_hints() {
-    let Some(git_dir) = run_cmd("git", &["rev-parse", "--git-dir"]) else {
+fn is_hex_sha(value: &str) -> bool {
+    value.len() >= 7 && value.len() <= 64 && value.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+fn find_git_dirs() -> Option<(PathBuf, PathBuf)> {
+    if let Some(git_dir) = run_cmd("git", &["rev-parse", "--git-dir"]) {
+        let common_dir = run_cmd("git", &["rev-parse", "--git-common-dir"]).unwrap_or_else(|| git_dir.clone());
+        return Some((PathBuf::from(git_dir), PathBuf::from(common_dir)));
+    }
+
+    let dotgit = Path::new(".git");
+    let git_dir = if dotgit.is_dir() {
+        dotgit.to_path_buf()
+    } else if dotgit.is_file() {
+        let raw = fs::read_to_string(dotgit).ok()?;
+        let rel = raw.trim().strip_prefix("gitdir:")?.trim();
+        PathBuf::from(rel)
+    } else {
+        return None;
+    };
+
+    let common_dir = fs::read_to_string(git_dir.join("commondir"))
+        .ok()
+        .map(|rel| git_dir.join(rel.trim()))
+        .unwrap_or_else(|| git_dir.clone());
+
+    Some((git_dir, common_dir))
+}
+
+fn read_git_ref(git_dir: &Path, common_dir: &Path, ref_name: &str) -> Option<String> {
+    for base in [git_dir, common_dir] {
+        let ref_path = base.join(ref_name);
+        if let Ok(contents) = fs::read_to_string(ref_path) {
+            let trimmed = contents.trim();
+            if let Some(target) = trimmed.strip_prefix("ref:") {
+                return read_git_ref(git_dir, common_dir, target.trim());
+            }
+            if is_hex_sha(trimmed) {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+
+    for base in [common_dir, git_dir] {
+        let packed_path = base.join("packed-refs");
+        if let Ok(packed) = fs::read_to_string(packed_path) {
+            for line in packed.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') || line.starts_with('^') {
+                    continue;
+                }
+                let mut parts = line.split_whitespace();
+                if let (Some(sha), Some(name)) = (parts.next(), parts.next())
+                    && name == ref_name
+                    && is_hex_sha(sha)
+                {
+                    return Some(sha.to_string());
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn resolve_git_sha_from_dotgit() -> Option<String> {
+    let (git_dir, common_dir) = find_git_dirs()?;
+    let head = fs::read_to_string(git_dir.join("HEAD")).ok()?;
+    let trimmed = head.trim();
+    if let Some(symref) = trimmed.strip_prefix("ref:") {
+        read_git_ref(&git_dir, &common_dir, symref.trim())
+    } else if is_hex_sha(trimmed) {
+        Some(trimmed.to_string())
+    } else {
+        None
+    }
+}
+
+fn collect_loose_tags(dir: &Path, prefix: &str, out: &mut BTreeMap<String, String>) {
+    let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
-    let common_dir = run_cmd("git", &["rev-parse", "--git-common-dir"]).unwrap_or_else(|| git_dir.clone());
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        let tag_name = if prefix.is_empty() { name } else { format!("{prefix}/{name}") };
+        if path.is_dir() {
+            collect_loose_tags(&path, &tag_name, out);
+        } else if let Ok(contents) = fs::read_to_string(&path) {
+            let sha = contents.trim();
+            if is_hex_sha(sha) {
+                out.insert(tag_name, sha.to_string());
+            }
+        }
+    }
+}
+
+fn version_sort_key(tag: &str) -> (Vec<u64>, String) {
+    let nums = tag
+        .trim_start_matches('v')
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| s.parse::<u64>().ok())
+        .collect::<Vec<_>>();
+    (nums, tag.to_string())
+}
+
+fn resolve_version_from_dotgit(head_sha: &str) -> Option<String> {
+    let (git_dir, common_dir) = find_git_dirs()?;
+    let mut tags = BTreeMap::<String, String>::new();
+
+    for base in [&common_dir, &git_dir] {
+        let packed_path = base.join("packed-refs");
+        if let Ok(packed) = fs::read_to_string(packed_path) {
+            let mut last_tag: Option<String> = None;
+            for line in packed.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                if let Some(peeled) = line.strip_prefix('^') {
+                    let peeled = peeled.trim();
+                    if let Some(tag) = &last_tag
+                        && is_hex_sha(peeled)
+                    {
+                        tags.insert(tag.clone(), peeled.to_string());
+                    }
+                    continue;
+                }
+                last_tag = None;
+                let mut parts = line.split_whitespace();
+                if let (Some(sha), Some(ref_name)) = (parts.next(), parts.next())
+                    && let Some(tag) = ref_name.strip_prefix("refs/tags/")
+                    && is_hex_sha(sha)
+                {
+                    tags.insert(tag.to_string(), sha.to_string());
+                    last_tag = Some(tag.to_string());
+                }
+            }
+        }
+        collect_loose_tags(&base.join("refs/tags"), "", &mut tags);
+    }
+
+    tags.retain(|tag, sha| !LEGACY_PYTHON_TAGS.contains(&tag.as_str()) && sha != PYTHON_LAST_COMMIT);
+    if tags.is_empty() {
+        return None;
+    }
+    if let Some((tag, _)) = tags.iter().filter(|(_, sha)| *sha == head_sha).max_by_key(|(tag, _)| version_sort_key(tag))
+    {
+        return Some(tag.clone());
+    }
+    tags.keys().max_by_key(|tag| version_sort_key(tag)).cloned()
+}
+
+fn emit_git_rerun_hints() {
+    println!("cargo:rerun-if-changed=build.rs");
+    let Some((git_dir, common_dir)) = find_git_dirs() else {
+        return;
+    };
 
     for base in [&git_dir, &common_dir] {
         for sub in ["HEAD", "packed-refs", "refs/heads", "refs/tags"] {
-            let path = Path::new(base).join(sub);
+            let path = base.join(sub);
             if path.exists() {
                 println!("cargo:rerun-if-changed={}", path.display());
             }
         }
     }
-    if let Some(symref) = run_cmd("git", &["symbolic-ref", "-q", "HEAD"]) {
+    let symref = run_cmd("git", &["symbolic-ref", "-q", "HEAD"]).or_else(|| {
+        fs::read_to_string(git_dir.join("HEAD"))
+            .ok()
+            .and_then(|s| s.trim().strip_prefix("ref:").map(|r| r.trim().to_string()))
+    });
+    if let Some(symref) = symref {
         for base in [&git_dir, &common_dir] {
-            let ref_path = Path::new(base).join(&symref);
+            let ref_path = base.join(&symref);
             if ref_path.exists() {
                 println!("cargo:rerun-if-changed={}", ref_path.display());
             }
@@ -48,7 +211,7 @@ fn emit_git_rerun_hints() {
     }
 }
 
-fn resolve_version() -> String {
+fn resolve_version(head_sha: &str) -> String {
     if let Some(version) = non_empty_env("ATLAS_BUILD_VERSION") {
         return version;
     }
@@ -64,12 +227,16 @@ fn resolve_version() -> String {
             return tag;
         }
     }
+    if let Some(tag) = resolve_version_from_dotgit(head_sha) {
+        return tag;
+    }
     "v0.0.0.1".to_string()
 }
 
 fn resolve_git_sha() -> String {
     non_empty_env("ATLAS_GIT_SHA")
         .or_else(|| run_cmd("git", &["rev-parse", "HEAD"]))
+        .or_else(resolve_git_sha_from_dotgit)
         .unwrap_or_else(|| "unknown".to_string())
 }
 
@@ -118,9 +285,9 @@ fn utc_ymdhms(secs: u64) -> (i64, u32, u32, u32, u32, u32) {
 fn main() {
     emit_git_rerun_hints();
 
-    let version = resolve_version();
     let git_sha = resolve_git_sha();
     let git_short_sha = resolve_git_short_sha(&git_sha);
+    let version = resolve_version(&git_sha);
     let rustc_version = resolve_rustc_version();
 
     let now_secs = non_empty_env("SOURCE_DATE_EPOCH")

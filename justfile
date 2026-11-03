@@ -84,9 +84,18 @@ _remote profile:
         ./ "$host:$dir/"
 
     echo "==> cargo build --locked $flag on $host"
+    git_ver="${ATLAS_BUILD_VERSION:-}"
+    if [ -z "$git_ver" ]; then
+        tag="$(git describe --tags --abbrev=0 2>/dev/null || true)"
+        if [ -n "$tag" ] && ! git merge-base --is-ancestor "$tag" 95b5b3e383d792ee53415c9798b9522f1aac4075 2>/dev/null; then
+            git_ver="$tag"
+        else
+            git_ver="v0.0.0.1"
+        fi
+    fi
     git_sha="$(git rev-parse HEAD 2>/dev/null || true)"
     git_short="$(git rev-parse --short=7 HEAD 2>/dev/null || true)"
-    ssh "$host" "cd '$dir' && if [ -f \"\$HOME/.cargo/env\" ]; then . \"\$HOME/.cargo/env\"; fi && ATLAS_GIT_SHA='$git_sha' ATLAS_GIT_SHORT_SHA='$git_short' cargo build --locked $flag"
+    ssh "$host" "cd '$dir' && if [ -f \"\$HOME/.cargo/env\" ]; then . \"\$HOME/.cargo/env\"; fi && ATLAS_BUILD_VERSION='$git_ver' ATLAS_GIT_SHA='$git_sha' ATLAS_GIT_SHORT_SHA='$git_short' cargo build --locked $flag"
 
     mkdir -p "$out"
     scp -q "$host:$dir/target/{{ profile }}/atlas" "$out/atlas"
