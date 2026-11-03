@@ -4,7 +4,7 @@
 
 mod common;
 
-use atlas::duplicates::{Copy, copies, file_twins_with, fill_from_copies_with};
+use atlas::duplicates::{Copy, copies, file_twins_with, fill_from_copies_of, fill_from_copies_with};
 use atlas::parser::Release;
 use atlas::{db, store};
 use common::stage::{article, release_of};
@@ -209,4 +209,26 @@ fn a_file_twin_in_another_shard_fills_the_gaps() {
     assert_eq!(fill_from_copies_with(&conn, base, &mut articles).unwrap(), 1, "B's part 2 only");
     assert!(articles.iter().any(|a| a.message_id == "<DonB.Base.mkv.2@x>"));
     assert!(!articles.iter().any(|a| a.message_id.contains("DonC")), "C's part 2 differs from the part now held");
+
+    // a part that came from another row of the same post (one cut across groups) is checked the same way: what that
+    // row was read to hold counts against the donors, whether or not that row is a donor itself
+    let split = Release {
+        group: in_shard(2).into(),
+        articles: vec![article("base.bin", 2, 3, "<Split.base.bin.2@x>")],
+        ..release_of("Split", "base.bin", 1, 3)
+    };
+    store::save(&main, &[split]).unwrap();
+    let split = id(2, "Split");
+    shard(2).execute(crc, rusqlite::params![split, "<Split.base.bin.2@x>", 700_000, 7]).unwrap();
+    let gathered = || {
+        let mut all = store::articles(&conn, base).unwrap();
+        all.extend(store::articles(&conn, split).unwrap());
+        all
+    };
+    // the other row's part 2 holds other bytes than B's and C's: neither lends anything
+    let mut articles = gathered();
+    assert_eq!(fill_from_copies_of(&conn, base, &[base, split], &mut articles).unwrap(), 0);
+    // without that row's CRCs the conflict goes unseen and C lends part 3
+    let mut articles = gathered();
+    assert_eq!(fill_from_copies_with(&conn, base, &mut articles).unwrap(), 1);
 }

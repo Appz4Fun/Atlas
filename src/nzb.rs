@@ -118,7 +118,8 @@ pub fn build_nzb(release_id: i64) -> Result<Option<String>> {
 
 /// A release's articles and groups. For a post spread over several groups, or an upload linked by its PAR2 set, that's
 /// all of them: it only makes its files with all of them.
-pub(crate) fn inventory(release: &ReleaseRow) -> crate::db::Result<(Vec<ArticleRow>, Vec<String>)> {
+/// Also returns the rows the articles came from: the release's own, or every row of its post.
+pub(crate) fn inventory(release: &ReleaseRow) -> crate::db::Result<(Vec<ArticleRow>, Vec<String>, Vec<i64>)> {
     let conn = crate::db::open()?;
     if let Some(post) = crate::release_info::whole_post_with(&conn, release)? {
         let mut rows = Vec::new();
@@ -131,9 +132,9 @@ pub(crate) fn inventory(release: &ReleaseRow) -> crate::db::Result<(Vec<ArticleR
         }
         let mut all: Vec<ArticleRow> = rows.into_iter().flat_map(|(_, articles)| articles).collect();
         all.sort_by(|a, b| (&a.filename, a.part, &a.message_id).cmp(&(&b.filename, b.part, &b.message_id)));
-        return Ok((all, post.groups));
+        return Ok((all, post.groups, post.ids));
     }
-    Ok((get_articles(release.id)?, vec![release.group_name.clone()]))
+    Ok((get_articles(release.id)?, vec![release.group_name.clone()], vec![release.id]))
 }
 
 /// A file whose name another row already has keeps its own <file>: the name the NZB groups it by gets its row's id.
@@ -151,10 +152,10 @@ fn keep_files_apart(rows: &mut [(i64, Vec<ArticleRow>)]) {
 /// A release's articles with its gaps filled from its twins and file twins (`duplicates`): an article the same bytes
 /// were posted as, by anyone, stands in for one this posting lost.
 fn filled_inventory(release: &ReleaseRow) -> Result<(Vec<ArticleRow>, Vec<String>)> {
-    let (mut articles, groups) = inventory(release)?;
+    let (mut articles, groups, rows) = inventory(release)?;
     if !articles.is_empty() {
         let conn = crate::db::open()?;
-        let added = crate::duplicates::fill_from_copies_with(&conn, release.id, &mut articles)?;
+        let added = crate::duplicates::fill_from_copies_of(&conn, release.id, &rows, &mut articles)?;
         if added > 0 {
             crate::metrics::names::NZB_FILLED.inc(&[], added as u64);
         }

@@ -604,10 +604,19 @@ pub fn fill_gaps_from(
 /// A file twin lends only the files its set vouches for, under the names the sets map; a twin by the posted
 /// fingerprint lends every file by its posted name. `conn` has the shards attached.
 pub fn fill_from_copies_with(conn: &Connection, id: i64, own: &mut Vec<ArticleRow>) -> db::Result<usize> {
+    fill_from_copies_of(conn, id, &[id], own)
+}
+
+/// `fill_from_copies_with` for articles gathered from several rows (`rows`: a post cut across groups, or a linked
+/// upload), soo what each row's articles were read to hold is checked against the donors too.
+pub fn fill_from_copies_of(conn: &Connection, id: i64, rows: &[i64], own: &mut Vec<ArticleRow>) -> db::Result<usize> {
     let mut added = 0;
     // what every posting seen soo far was read to hold: an article borrowed from one donor keeps its CRC, soo the
     // next donor's copy of that part is checked against it too
     let mut known = crate::archive::store::segment_crcs_with(conn, id);
+    for row in rows.iter().filter(|row| **row != id) {
+        known.extend(crate::archive::store::segment_crcs_with(conn, *row));
+    }
     for twin in file_twins_with(conn, id) {
         known.extend(crate::archive::store::segment_crcs_with(conn, twin.id));
         added += fill_gaps_from(own, &store::articles(conn, twin.id)?, &twin.names, twin.one_file, &known);
