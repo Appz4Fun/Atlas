@@ -248,6 +248,17 @@ pub(crate) fn find_releases(
     offset: i64,
     limit: i64,
 ) -> rusqlite::Result<Vec<crate::search::ReleaseRow>> {
+    if !q.trim().is_empty()
+        && let Some(index) = crate::word_index::ready()
+    {
+        // every match ranked, not the newest few thousand of each shard
+        let (from, count) = (usize::try_from(offset).unwrap_or(0), usize::try_from(limit).unwrap_or(0));
+        return db::with_reader(|conn| {
+            Ok(index.search(conn, q, filter, &[], crate::word_index::By::Relevance, true, from, count))
+        })?
+        .map(|hits| hits.rows)
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()));
+    }
     match (filter, q.trim().is_empty()) {
         (None, true) => all_releases(offset / limit, limit),
         (None, false) => search_all_releases(q, offset / limit, limit),
@@ -538,6 +549,7 @@ pub fn start(config: &mut Config) -> bool {
         .collect();
 
     *RUNNING.lock().unwrap() = Some(Running { server, workers });
+    crate::word_index::start(crate::paths::database());
     start_warming();
     true
 }

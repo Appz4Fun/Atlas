@@ -244,7 +244,8 @@ pub fn migrate_shard(conn: &Connection) -> Result<()> {
         }
     }
     crate::postprocess::schema::migrate(conn)?;
-    crate::category::uncategorized::migrate(conn)
+    crate::category::uncategorized::migrate(conn)?;
+    crate::word_index::migrate(conn)
 }
 
 /// How long a release has to be quiet before the stage looks at it, seconds.

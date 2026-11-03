@@ -54,3 +54,4 @@ pub mod ui;
 pub mod video;
 pub mod web;
 mod web_meta;
+pub mod word_index;

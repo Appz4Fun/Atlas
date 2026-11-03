@@ -20,7 +20,7 @@ use crate::media::query::MediaAttrs;
 use crate::media::title::Kind;
 use crate::search::{ReleaseRow, get_release};
 use crate::ui::{fmt_date, fmt_size};
-use crate::{release_info, release_tags};
+use crate::{release_info, release_tags, word_index};
 
 const HTMX: &str = include_str!("../assets/htmx-2.0.11.min.js");
 const CSS: &str = include_str!("../assets/web.css");
@@ -429,12 +429,13 @@ impl Search {
 
     /// Whether the page is cut from the first `SORT_WINDOW` results, sorted or filtered, instead of read by offset.
     fn windowed(&self) -> bool {
-        self.sort.is_some() || self.filters_by_tags()
+        self.sort.is_some() || (self.filters_by_tags() && self.indexed().is_none())
     }
 
     /// Whether a name's tags say what every filter asks.
     fn has_tags(&self, row: &ReleaseRow) -> bool {
-        if !self.filters_by_tags() {
+        // the word index found only what has them
+        if !self.filters_by_tags() || self.indexed().is_some() {
             return true;
         }
         let tags = release_tags::parse(&row.name);
@@ -444,7 +445,7 @@ impl Search {
     /// The rows `has_tags` keeps, in order, until there are `enough`. Reading a name's tags takes about a millisecond,
     /// soo they are read a slice at a time, on every core.
     fn keep_tagged(&self, rows: Vec<ReleaseRow>, enough: usize) -> Vec<ReleaseRow> {
-        if !self.filters_by_tags() {
+        if !self.filters_by_tags() || self.indexed().is_some() {
             return rows;
         }
         let cores = std::thread::available_parallelism().map_or(4, |n| n.get()).min(16);
@@ -485,6 +486,35 @@ impl Search {
         crate::sorted::ready(column).then_some(column)
     }
 
+    /// The word index and the order it reads words in, once it's built: every match ranked, sorted and filtered by tag,
+    /// not the newest few thousand. None: no words, fields (which the database looks up), or no index yet.
+    fn indexed(&self) -> Option<(std::sync::Arc<word_index::WordIndex>, word_index::By)> {
+        use word_index::By;
+        if self.q.trim().is_empty() || self.fields.any() {
+            return None;
+        }
+        let by = match self.sort {
+            None | Some(SortBy::Rating) => By::Relevance,
+            Some(SortBy::Size) => By::Size,
+            Some(SortBy::Posted) => By::Posted,
+            Some(SortBy::Name) => By::Name,
+            Some(SortBy::Group) => By::Group,
+            Some(SortBy::Category) => By::Category,
+        };
+        Some((word_index::ready()?, by))
+    }
+
+    /// Whether the rows come in the page's order over all of them, soo a page past the window reads further: a sort
+    /// with no words from the database, and words from their index, but for the rating, which isn't in either.
+    fn in_order(&self) -> bool {
+        self.ranked_by().is_some() || (self.indexed().is_some() && self.sort != Some(SortBy::Rating))
+    }
+
+    /// The tag filters on, as the word index has them.
+    fn tag_filters(&self) -> Vec<&'static str> {
+        self.filters.iter().copied().filter(|f| *f != HIDE_COPIES).collect()
+    }
+
     /// The search itself: one, whatever the filters.
     fn search(
         &self,
@@ -496,6 +526,16 @@ impl Search {
             let mut rows = crate::sorted::top(filter, by, self.descending, from + count).map_err(|e| e.to_string())?;
             rows.drain(..usize::try_from(from).unwrap_or(0).min(rows.len()));
             return Ok(rows);
+        }
+        if let Some((index, by)) = self.indexed() {
+            let (from, count) = (usize::try_from(from).unwrap_or(0), usize::try_from(count).unwrap_or(0));
+            let tags = self.tag_filters();
+            return crate::db::with_reader(|conn| {
+                Ok(index.search(conn, &self.q, filter, &tags, by, self.descending, from, count))
+            })
+            .map_err(|e| e.to_string())?
+            .map(|hits| hits.rows)
+            .map_err(|e| e.to_string());
         }
         if self.fields.any() {
             field_search::find(&self.fields, &self.q, filter, from, count).map_err(|e| e.to_string())
@@ -535,11 +575,8 @@ impl Search {
         }
         let filter = parse_filter(&self.cat);
         let windowed = self.windowed();
-        let count = if self.ranked_by().is_some() {
-            SORT_WINDOW.max(self.offset + PAGE_SIZE + 1).min(MAX_WINDOW)
-        } else {
-            SORT_WINDOW
-        };
+        let count =
+            if self.in_order() { SORT_WINDOW.max(self.offset + PAGE_SIZE + 1).min(MAX_WINDOW) } else { SORT_WINDOW };
         let (from, mut count) = if windowed { (0, count) } else { (self.offset, PAGE_SIZE) };
         let tagged = |r: &ReleaseRow| self.has_tags(r);
         // a sort needs every match in the window, a page only up to one past its end
@@ -777,7 +814,7 @@ impl Search {
                 "<a href=\"/?{everywhere}\" hx-get=\"/ui/results?{everywhere}\" hx-target=\"#results\">Look in all categories</a>. "
             );
         }
-        if self.filters_by_tags() {
+        if self.filters_by_tags() && self.indexed().is_none() {
             let _ = write!(hint, "The filters look through the first {SORT_WINDOW} results. ");
         }
         if !self.q.is_empty() {
@@ -800,7 +837,7 @@ impl Search {
             }
         }
         let sort = match self.sort {
-            Some(by) if self.ranked_by().is_some() => format!(
+            Some(by) if self.in_order() => format!(
                 "By {} {}, over all of them",
                 by.word(),
                 if self.descending { "descending" } else { "ascending" }
@@ -810,7 +847,7 @@ impl Search {
                 by.word(),
                 if self.descending { "descending" } else { "ascending" }
             ),
-            None if self.filters_by_tags() => format!(
+            None if self.filters_by_tags() && self.indexed().is_none() => format!(
                 "{} first, filtered among the first {SORT_WINDOW}",
                 if self.q.is_empty() { "Newest" } else { "Best or newest matches" }
             ),
@@ -836,8 +873,9 @@ impl Search {
                 escape(&value)
             );
         }
-        // the count goes by words and fields only, soo with tags filtering the page it would count rows it hides
-        let total = if !self.fields.any() || self.filters_by_tags() {
+        // the count goes by words and fields only, soo with tags filtering the page it would count rows it hides; the word
+        // index counts every match, tags and all
+        let total = if self.indexed().is_none() && (!self.fields.any() || self.filters_by_tags()) {
             String::new()
         } else if self.sorts_from_a_window()
             && let Ok(window) = window_of(self, 0)
@@ -855,6 +893,18 @@ impl Search {
 
     fn total(&self) -> String {
         let filter = parse_filter(&self.cat);
+        if let Some((index, _)) = self.indexed() {
+            return match index.count(&self.q, filter.as_ref(), &self.tag_filters()) {
+                Ok(total) => format!(
+                    "<strong class=\"total\">{}</strong>",
+                    escape(&field_search::Total { count: total as i64, exact: true }.describe())
+                ),
+                Err(e) => {
+                    eprintln!("web count failed: {e}");
+                    String::new()
+                }
+            };
+        }
         match field_search::count_any(&self.fields, std::slice::from_ref(&self.q), filter.as_ref()) {
             Ok(total) => format!("<strong class=\"total\">{}</strong>", escape(&total.describe())),
             Err(e) => {
@@ -943,8 +993,8 @@ impl Window {
     fn can_grow(&self, search: &Search) -> bool {
         self.more_in_db
             && self.asked < MAX_WINDOW
-            && search.ranked_by().is_some()
-            && (!search.filters_by_tags() || self.asked < GROW_WITH_TAGS)
+            && search.in_order()
+            && (!search.filters_by_tags() || search.indexed().is_some() || self.asked < GROW_WITH_TAGS)
     }
 
     /// Takes in what a smaller window of the same search showed, soo growing it moves nothing already paged past. A
@@ -1201,7 +1251,7 @@ fn still_kept(slot: &Arc<WindowSlot>) -> bool {
 
 fn slot_of(search: &Search, always: bool) -> Arc<WindowSlot> {
     // a sort read from the database in its own order has a window of its own; any other reads the newest
-    let plain = if search.ranked_by().is_some() {
+    let plain = if search.in_order() {
         Search { offset: 0, ..search.clone() }
     } else {
         Search { offset: 0, sort: None, descending: true, ..search.clone() }
