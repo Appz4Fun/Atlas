@@ -325,21 +325,24 @@ fn linked_sizes(
         _ => None,
     };
     if let Some(cutoff) = cutoff {
-        // only uploads with a row the page can list count towards the limit: bigger ones elsewhere don't crowd them out
+        // only uploads with a row the page can list count towards the limit: bigger ones elsewhere don't crowd them out.
+        // A tie goes to the newest of those rows, as the rows' own ties do, not to a row the page leaves out
         let clause = match filter {
             None => String::from("1"),
             Some(f) if !f.uncategorized => format!("c.category in ({})", list(&f.leaves)),
             Some(f) => format!("(c.category in ({}) or c.release_id is null)", list(&f.leaves)),
         };
         let bigger = format!(
-            "select l.lead_id from s{s}.upload_link l join s{s}.releases r on r.id = l.release_id
+            "select l.lead_id,
+                    (select max(r.id) from s{s}.upload_link m join s{s}.releases r on r.id = m.release_id
+                     left join s{s}.release_category c on c.release_id = r.id
+                     where m.lead_id = l.lead_id and {VISIBLE_RELEASE} and {clause}) as newest
+             from s{s}.upload_link l join s{s}.releases r on r.id = l.release_id
              group by l.lead_id
              having count(*) between 2 and {LINKED_ROWS} and sum(coalesce(r.size, 0)) >= ?1
                 and exists (select 1 from s{s}.releases x where x.id = l.lead_id)
-                and exists (select 1 from s{s}.upload_link m join s{s}.releases r on r.id = m.release_id
-                            left join s{s}.release_category c on c.release_id = r.id
-                            where m.lead_id = l.lead_id and {VISIBLE_RELEASE} and {clause})
-             order by sum(coalesce(r.size, 0)) desc, max(r.id) desc limit ?2"
+                and newest is not null
+             order by sum(coalesce(r.size, 0)) desc, newest desc limit ?2"
         );
         let leads: Vec<i64> = conn.prepare(&bigger)?.query_map([cutoff, want], |r| r.get(0))?.collect::<Result<_>>()?;
         let mut members = conn.prepare(&format!("select release_id from s{s}.upload_link where lead_id = ?1"))?;
@@ -632,6 +635,37 @@ mod tests {
         // a lead that's gone leaves its pieces on their own, as the page does
         shard.execute("delete from releases where id = ?", [lead]).unwrap();
         assert_eq!(f.top(Some(&movies), Column::Size, true, 2, READ_ALL), [big[2], big[1]]);
+    }
+
+    #[test]
+    fn linked_uploads_tied_on_size_go_newest_first_by_the_rows_the_page_lists() {
+        let f = fixture();
+        let group = &groups()[0];
+        let shard = f.shard(group);
+        shard.execute_batch(crate::archive::link::UPLOAD_LINK.create).unwrap();
+        let big = f.add("Big", group, Some(6_000), "2026-09-01", Some(UHD));
+        let link = |lead: i64, rest: &[i64]| {
+            for id in std::iter::once(lead).chain(rest.iter().copied()) {
+                shard.execute("insert into upload_link (release_id, lead_id) values (?1, ?2)", [id, lead]).unwrap();
+            }
+        };
+        let a_lead = f.add("a1a1a1", group, Some(3_000), "2026-10-01", Some(UHD));
+        let a_piece = f.add("a2a2a2", group, Some(3_000), "2026-10-01", Some(UHD));
+        let b_lead = f.add("b1b1b1", group, Some(3_000), "2026-10-02", Some(UHD));
+        let b_piece = f.add("b2b2b2", group, Some(3_000), "2026-10-02", Some(UHD));
+        // the newest row of all is in the older upload, but in TV, which a Movies page doesn't list
+        let a_tv = f.add("a3a3a3", group, Some(0), "2026-10-03", Some(TV_HD));
+        link(a_lead, &[a_piece, a_tv]);
+        link(b_lead, &[b_piece]);
+        let movies = crate::category::parse_filter(MOVIES).unwrap();
+        for limits in [READ_ALL, WALK] {
+            assert_eq!(f.top(Some(&movies), Column::Size, true, 1, limits), [b_piece]);
+            assert_eq!(
+                f.top(Some(&movies), Column::Size, true, 5, limits),
+                [b_piece, b_lead, a_piece, a_lead, big],
+                "every upload as big as Big, newest first"
+            );
+        }
     }
 
     #[test]
