@@ -105,11 +105,20 @@ impl Step for ProbeStep {
         let release_id = ctx.release().id;
         let rel_name = ctx.release().name.clone();
         let rel_group = ctx.release().group.clone();
-        if let Some(saved) = crate::raw_store::get_probe(&rel_name, &rel_group) {
+        let rel_parts = ctx.release().parts;
+        let rel_complete = ctx.release().complete;
+        let stamp = self.config_stamp();
+        if let Some(saved) = crate::raw_store::get_probe(&rel_name, &rel_group, rel_parts, rel_complete, stamp) {
             let mut writes = Vec::new();
             if let Some(pw) = saved.nfo_password {
                 writes.push(StepWrite::new(archive::store::SET_NFO_PASSWORD, vec![release_id.into(), pw.into()]));
             }
+            writes.push(match saved.cover {
+                Some((mime, sha256)) => {
+                    StepWrite::new(SET_COVER, vec![release_id.into(), mime.into(), sha256.into()])
+                }
+                None => StepWrite::new(DROP_COVER, vec![release_id.into()]),
+            });
             let hash = saved.moviehash.clone();
             writes.push(StepWrite::new(
                 SET_PROBE,
@@ -218,9 +227,10 @@ impl Step for ProbeStep {
         }
         // a look that finds no cover drops one an earlier look kept
         let cover = info.media.as_mut().and_then(|m| m.cover.take());
-        writes.push(match cover.and_then(|c| super::keep_cover(&c.bytes).map(|sha256| (c.mime, sha256))) {
+        let saved_cover = cover.and_then(|c| super::keep_cover(&c.bytes).map(|sha256| (c.mime.to_string(), sha256)));
+        writes.push(match &saved_cover {
             Some((mime, sha256)) => {
-                StepWrite::new(SET_COVER, vec![release_id.into(), mime.to_string().into(), sha256.into()])
+                StepWrite::new(SET_COVER, vec![release_id.into(), mime.clone().into(), sha256.clone().into()])
             }
             None => StepWrite::new(DROP_COVER, vec![release_id.into()]),
         });
@@ -228,15 +238,19 @@ impl Step for ProbeStep {
         let agent = agent_of(&info.headers).map(str::to_string);
         let hash = info.moviehash.clone();
         let json = serde_json::to_string(&info).map_err(|e| StepError::Permanent(e.to_string()))?;
-        crate::raw_store::put_probe(
-            &rel_name,
-            &rel_group,
-            crc,
-            agent.as_deref(),
-            &json,
-            hash.as_deref(),
-            found_nfo_password.as_deref(),
-        );
+        crate::raw_store::put_probe(&crate::raw_store::ProbeRecord {
+            name: &rel_name,
+            group_name: &rel_group,
+            crc32: crc,
+            agent: agent.as_deref(),
+            info: &json,
+            moviehash: hash.as_deref(),
+            parts: rel_parts,
+            complete: rel_complete,
+            config_stamp: stamp,
+            nfo_password: found_nfo_password.as_deref(),
+            cover: saved_cover.as_ref().map(|(m, s)| (m.as_str(), s.as_str())),
+        });
         writes.push(StepWrite::new(
             SET_PROBE,
             vec![release_id.into(), crc.into(), agent.into(), json.into(), hash.clone().into()],
