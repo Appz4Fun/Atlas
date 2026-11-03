@@ -629,6 +629,8 @@ impl Inner {
                 Ran::Outcome(mut o) => {
                     batch.holds.extend(o.hold.take());
                     if let Some(until) = o.wait_until {
+                        // what it got as far as is kept, for the run that picks it up again
+                        a.writes.extend(std::mem::take(&mut o.writes).into_iter().map(|w| (bit, w)));
                         soonest(until);
                         continue;
                     }
@@ -964,6 +966,7 @@ impl Inner {
                     self.net_troubles.store(0, Relaxed);
                     batch.holds.extend(o.hold.take());
                     if let Some(until) = o.wait_until {
+                        a.writes.extend(std::mem::take(&mut o.writes).into_iter().map(|w| (bit, w)));
                         // what it waits for needn't hold up the steps after it
                         waiting = Some(waiting.map_or(until, |w: i64| w.min(until)));
                         a.net_attempts = Some(attempts_before);

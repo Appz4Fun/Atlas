@@ -2,7 +2,7 @@
 //! and how much of it is there. Read when the page opens, soo nothing here is stored.
 
 use std::collections::btree_map::Entry;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::LazyLock;
 
 use regex::Regex;
@@ -154,12 +154,23 @@ pub fn contents(id: i64) -> Result<Contents> {
 }
 
 pub fn contents_with(conn: &Connection, id: i64) -> Result<Contents> {
-    contents_of(conn, &[id])
+    contents_of(conn, &[id], &[])
 }
 
-fn contents_of(conn: &Connection, ids: &[i64]) -> Result<Contents> {
+/// `recovery`: rows whose files are all recovery volumes, whatever they're called.
+fn contents_of(conn: &Connection, ids: &[i64], recovery: &[i64]) -> Result<Contents> {
     let mut totals = Contents::default();
     let union = union_files(conn, ids)?;
+    let mut volumes: BTreeSet<String> = BTreeSet::new();
+    for id in recovery {
+        let s = store::shard_of_id(*id);
+        let mut stmt = conn.prepare_cached(&format!("select filename from s{s}.files where release_id = ?"))?;
+        for name in stmt.query_map([id], |r| r.get::<_, String>(0))? {
+            volumes.insert(name?);
+        }
+    }
+    let is_recovery_volume = |name: &str| volumes.contains(name) || is_recovery_volume(name);
+    let is_par2 = |name: &str| volumes.contains(name) || is_par2(name);
     for (filename, file) in &union.files {
         let seen = store::seen_count(&file.seen);
         totals.files += 1;
@@ -198,6 +209,65 @@ fn contents_of(conn: &Connection, ids: &[i64]) -> Result<Contents> {
         totals.par2_blocks = Some(blocks);
     }
     Ok(totals)
+}
+
+/// A row that holds nothing but PAR2 data. A fully obfuscated upload posts every file under its own random subject and
+/// poster, soo each file is a row of its own, and the recovery volumes are the ones that get the release's name, from the
+/// set they belong to. Their size is only theirs: the files they repair are rows of their own, under other names.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RecoveryOnly {
+    /// what the set says the release's files are, with their sizes. Empty: no set has been read
+    pub repairs: Vec<(String, Option<i64>)>,
+}
+
+impl RecoveryOnly {
+    /// The size of the files the set repairs, when it gives every one.
+    pub fn repairs_bytes(&self) -> Option<i64> {
+        if self.repairs.is_empty() {
+            return None;
+        }
+        self.repairs.iter().try_fold(0i64, |sum, (_, size)| Some(sum.saturating_add((*size)?)))
+    }
+}
+
+/// The most files a row can have and still be read here: PAR2-only rows have one, or a few named .par2.
+const RECOVERY_ONLY_FILES: usize = 64;
+
+/// Whether a row's files are all PAR2, and what its set repairs. A file counts as PAR2 by its name, or, for a row of one
+/// file, by its set's list having been read from it: nothing else in the row could have given it.
+pub fn recovery_only_with(conn: &Connection, id: i64) -> Result<Option<RecoveryOnly>> {
+    let s = store::shard_of_id(id);
+    let names: Vec<String> = conn
+        .prepare_cached(&format!(
+            "select filename from s{s}.files where release_id = ? limit {}",
+            RECOVERY_ONLY_FILES + 1
+        ))?
+        .query_map([id], |r| r.get(0))?
+        .collect::<Result<_>>()?;
+    if names.is_empty() || names.len() > RECOVERY_ONLY_FILES {
+        return Ok(None);
+    }
+    // a shard that hasn't got the table yet has read no set
+    let repairs: Vec<(String, Option<i64>)> = conn
+        .prepare_cached(&format!(
+            "select name, size from s{s}.archive_inner_files where release_id = ? and source = ? order by seq"
+        ))
+        .and_then(|mut stmt| {
+            stmt.query_map(rusqlite::params![id, crate::archive::store::SOURCE_PAR2], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<Result<_>>()
+        })
+        .unwrap_or_default();
+    let all_named_par2 = names.iter().all(|name| is_par2(name));
+    let one_sniffed = names.len() == 1 && !repairs.is_empty() && !repairs.iter().any(|(name, _)| *name == names[0]);
+    Ok((all_named_par2 || one_sniffed).then_some(RecoveryOnly { repairs }))
+}
+
+/// `recovery_only_with` for a page of results. Any failure reads as not known.
+pub fn recovery_only_of(ids: &[i64]) -> HashMap<i64, RecoveryOnly> {
+    db::with_reader(|conn| {
+        Ok(ids.iter().filter_map(|id| Some((*id, recovery_only_with(conn, *id).ok().flatten()?))).collect())
+    })
+    .unwrap_or_default()
 }
 
 /// A posting of this name in one group. The same post in several groups is a release per group.
@@ -244,13 +314,89 @@ pub struct SplitPost {
     pub size: i64,
     /// every file has all its parts, across the groups
     pub complete: bool,
+    /// for an upload linked by its PAR2 set (`archive::link`): the row of the file it repairs, the one with its name
+    pub lead: Option<i64>,
+    /// of a linked upload, the rows of recovery data: their files' names don't say so
+    pub recovery: Vec<i64>,
 }
 
 impl SplitPost {
     /// The one to list. A search that isn't about one group shows only this.
     pub fn listed_id(&self) -> i64 {
-        self.ids.iter().copied().max().unwrap_or(0)
+        self.lead.unwrap_or_else(|| self.ids.iter().copied().max().unwrap_or(0))
     }
+}
+
+/// The most rows a linked upload is read with: a set of a few hundred volumes, each posted on its own, is about the most.
+/// One with more isn't shown as one upload, rather than as part of one.
+const LINKED_ROWS: usize = 1_024;
+
+/// The upload a row is linked into, all its rows together. None: it isn't linked, or its lead is gone.
+pub fn linked_post_with(conn: &Connection, id: i64) -> Result<Option<SplitPost>> {
+    let s = store::shard_of_id(id);
+    // a shard that hasn't got the table yet has linked nothing
+    let Ok(mut stmt) = conn.prepare_cached(&format!("select lead_id from s{s}.upload_link where release_id = ?"))
+    else {
+        return Ok(None);
+    };
+    let Some(lead) = stmt.query_row([id], |r| r.get::<_, i64>(0)).optional()? else { return Ok(None) };
+    let sql = format!(
+        "select r.id, r.group_name, coalesce(r.size, 0), l.recovery, coalesce(l.wanted, 0), l.par2_file
+         from s{s}.upload_link l join s{s}.releases r on r.id = l.release_id where l.lead_id = ?1 order by r.id
+         limit {}",
+        LINKED_ROWS + 1
+    );
+    let (mut ids, mut groups, mut size, mut has_lead, mut recovery) = (Vec::new(), Vec::new(), 0, false, Vec::new());
+    // the files its sets look for, and those found: a file posted twice is still one file
+    let (mut wanted, mut files) = (0, HashSet::new());
+    let mut stmt = conn.prepare_cached(&sql)?;
+    let rows = stmt.query_map([lead], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, Option<String>>(1)?,
+            r.get::<_, i64>(2)?,
+            r.get::<_, i64>(3)? != 0,
+            r.get::<_, i64>(4)?,
+            r.get::<_, Option<Vec<u8>>>(5)?,
+        ))
+    })?;
+    for row in rows {
+        let (row_id, group, bytes, repairs, looks_for, file) = row?;
+        has_lead |= row_id == lead;
+        if repairs {
+            recovery.push(row_id);
+            wanted = wanted.max(looks_for);
+        } else {
+            files.insert(file.unwrap_or_else(|| row_id.to_le_bytes().to_vec()));
+        }
+        ids.push(row_id);
+        groups.push(group.unwrap_or_default());
+        size += bytes;
+    }
+    if !has_lead || ids.len() < 2 || ids.len() > LINKED_ROWS {
+        return Ok(None);
+    }
+    groups.sort_unstable();
+    groups.dedup();
+    // a file of the set that hasn't turned up is missing from the download, however whole the rest is
+    // each row is a file of its own, soo each is checked alone: rows sharing a name must not fill each other's gaps
+    let mut each_whole = true;
+    for row in &ids {
+        each_whole &= union_files(conn, &[*row])?.complete_by_files();
+    }
+    let complete = files.len() as i64 >= wanted && each_whole;
+    Ok(Some(SplitPost { ids, groups, size, complete, lead: Some(lead), recovery }))
+}
+
+/// All of the post a row is part of: an upload linked by its PAR2 set, or the same post cut across groups.
+pub fn whole_post_with(conn: &Connection, release: &crate::search::ReleaseRow) -> Result<Option<SplitPost>> {
+    if let Some(post) = linked_post_with(conn, release.id)? {
+        return Ok(Some(post));
+    }
+    if release.complete {
+        return Ok(None);
+    }
+    split_post_with(conn, release)
 }
 
 /// How far apart a split post's groups can have got their articles, in days. Each row keeps its newest article's date,
@@ -294,7 +440,7 @@ pub fn split_post_with(conn: &Connection, release: &crate::search::ReleaseRow) -
     if !files.one_upload() {
         return Ok(None);
     }
-    Ok(Some(SplitPost { ids, groups, size, complete: files.complete() }))
+    Ok(Some(SplitPost { ids, groups, size, complete: files.complete(), lead: None, recovery: Vec::new() }))
 }
 
 /// A shard's rows of one name and poster. `+poster` keeps the lookup on the name index: with no statistics SQLite
@@ -355,6 +501,13 @@ impl UnionFiles {
             reached.extend(left.swap_remove(at).iter().cloned());
         }
         left.is_empty()
+    }
+
+    /// Whether every file is there with exactly its parts, whatever the subjects say the post has: a linked upload's
+    /// files each came with a subject of their own.
+    fn complete_by_files(&self) -> bool {
+        !self.files.is_empty()
+            && self.files.values().all(|f| f.expected.is_some_and(|want| store::is_exactly(&f.seen, want)))
     }
 
     /// Whether every file the post says it has is there with exactly its parts.
@@ -437,7 +590,7 @@ fn union_files(conn: &Connection, ids: &[i64]) -> Result<UnionFiles> {
 
 /// What's in the whole post: each file once, whichever groups have its parts.
 pub fn contents_of_split(conn: &Connection, post: &SplitPost) -> Result<Contents> {
-    contents_of(conn, &post.ids)
+    contents_of(conn, &post.ids, &post.recovery)
 }
 
 /// A From header, split up.
@@ -588,6 +741,102 @@ mod tests {
             .unwrap();
         let plan = plan.join(" | ");
         assert!(plan.contains("idx_release_unique") && !plan.contains("idx_release_poster"), "{plan}");
+    }
+
+    /// `parts` 1..=n seen
+    fn seen(n: i64) -> Vec<u8> {
+        let mut bits = vec![0u8; (n as usize) / 8 + 1];
+        for p in 1..=n as usize {
+            bits[p / 8] |= 1 << (p % 8);
+        }
+        bits
+    }
+
+    /// A real shard's tables, attached as s0 the way `db::open` does, with an upload of one file and two volumes.
+    fn linked_shard() -> (tempfile::TempDir, Connection) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("atlas.s0.db");
+        store::create_shard(&path).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute("attach database ?1 as s0", [path.to_string_lossy()]).unwrap();
+        // the file, all 3 parts of it, and two volumes posted under names of their own
+        for (id, size, parts) in [(8, 3_096_000, 3), (16, 900, 1), (24, 200_900, 1)] {
+            conn.execute(
+                "insert into s0.releases (id, name, group_name, poster, posted_date, size, complete, parts)
+                 values (?1, ?2, 'a.b.test', 'p', '2026-08-22', ?3, 1, ?4)",
+                rusqlite::params![id, format!("random{id}"), size, parts],
+            )
+            .unwrap();
+            conn.execute(
+                "insert into s0.files (id, release_id, filename, subject, expected, seen) values (?1, ?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![id, format!("random{id}"), format!("\"random{id}\" yEnc (1/{parts})"), parts, seen(parts)],
+            )
+            .unwrap();
+        }
+        (dir, conn)
+    }
+
+    #[test]
+    fn a_linked_upload_is_all_its_rows() {
+        let (_dir, conn) = linked_shard();
+        assert_eq!(linked_post_with(&conn, 16).unwrap(), None, "nothing linked yet");
+        conn.execute_batch(
+            "insert into s0.upload_link (release_id, lead_id, recovery, wanted) values (8, 8, 0, null), (16, 8, 1, 1), (24, 8, 1, 1);",
+        )
+        .unwrap();
+        for id in [8, 16, 24] {
+            let post = linked_post_with(&conn, id).unwrap().unwrap();
+            assert_eq!(post.ids, [8, 16, 24]);
+            assert_eq!(post.size, 3_096_000 + 900 + 200_900);
+            assert_eq!((post.listed_id(), post.lead), (8, Some(8)));
+            assert!(post.complete);
+            assert_eq!(post.recovery, [16, 24]);
+        }
+        let contents = contents_of_split(&conn, &linked_post_with(&conn, 8).unwrap().unwrap()).unwrap();
+        assert_eq!((contents.files, contents.par2_files, contents.recovery_volumes), (3, 2, 2));
+        assert_eq!(contents.data_articles_expected, 3);
+        // a row that's linked is whole whatever it says of itself
+        let row = crate::search::ReleaseRow { id: 16, complete: true, ..Default::default() };
+        assert_eq!(whole_post_with(&conn, &row).unwrap().unwrap().lead, Some(8));
+        // a set that looks for two files, with one found, isn't all there
+        conn.execute_batch("update s0.upload_link set wanted = 2 where release_id = 24").unwrap();
+        assert!(!linked_post_with(&conn, 16).unwrap().unwrap().complete);
+    }
+
+    #[test]
+    fn a_file_posted_twice_counts_once() {
+        let (_dir, conn) = linked_shard();
+        conn.execute_batch(
+            "insert into s0.upload_link (release_id, lead_id, recovery, wanted, par2_file)
+             values (8, 8, 0, null, x'01'), (16, 8, 0, null, x'01'), (24, 8, 1, 2, null);",
+        )
+        .unwrap();
+        assert!(!linked_post_with(&conn, 8).unwrap().unwrap().complete, "two copies of one file of two");
+        conn.execute_batch("update s0.upload_link set par2_file = x'02' where release_id = 16").unwrap();
+        assert!(linked_post_with(&conn, 8).unwrap().unwrap().complete);
+    }
+
+    #[test]
+    fn same_named_files_of_a_linked_upload_do_not_fill_each_others_gaps() {
+        let (_dir, conn) = linked_shard();
+        conn.execute_batch(
+            "insert into s0.upload_link (release_id, lead_id, recovery, wanted) values (8, 8, 0, null), (16, 8, 1, 1), (24, 8, 1, 1);
+             update s0.files set filename = 'same.bin' where id in (8, 16);",
+        )
+        .unwrap();
+        conn.execute("update s0.files set expected = 3, seen = ?1 where id = 8", [vec![0b011u8]]).unwrap();
+        conn.execute("update s0.files set expected = 3, seen = ?1 where id = 16", [vec![0b101u8]]).unwrap();
+        assert!(!linked_post_with(&conn, 8).unwrap().unwrap().complete);
+    }
+
+    #[test]
+    fn a_link_whose_file_is_gone_is_no_link() {
+        let (_dir, conn) = linked_shard();
+        conn.execute_batch(
+            "insert into s0.upload_link (release_id, lead_id, recovery) values (16, 8, 1), (24, 8, 1); delete from s0.releases where id = 8;",
+        )
+        .unwrap();
+        assert_eq!(linked_post_with(&conn, 16).unwrap(), None);
     }
 
     #[test]
