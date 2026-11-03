@@ -90,6 +90,7 @@ fn the_web_ui_end_to_end() {
     let root = fetch(port, "/", "");
     assert_eq!(root.status(), 200);
     assert!(root.body.contains("action=\"/login\""));
+    assert!(root.body.contains("class=\"site-footer\"") && root.body.contains("https://www.patreon.com/cw/xbmc4lyfe"));
     assert!(!root.body.contains("Findword"));
     assert_eq!(fetch(port, "/ui/results?q=Findword", "").status(), 401);
     assert_eq!(fetch(port, &format!("/ui/nzb?id={id}"), "").status(), 303);
@@ -106,6 +107,12 @@ fn the_web_ui_end_to_end() {
     // the full page, and never the key
     let page = fetch(port, "/", &cookie);
     assert!(page.body.contains("Findword"), "{}", page.body);
+    assert!(
+        page.body.contains("class=\"site-footer\"") && page.body.contains("Atlas - Rust Edition."),
+        "{}",
+        page.body
+    );
+    assert!(page.body.contains("last git commit:"), "{}", page.body);
     assert!(page.body.contains("TV/HD"), "{}", page.body);
     assert!(!page.body.contains(KEY));
     assert!(page.body.contains("&lt;script&gt;alert(1)"), "{}", page.body);

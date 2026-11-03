@@ -6,11 +6,14 @@ FROM rust:1.99.0-slim-trixie AS build
 WORKDIR /src
 
 # deps first soo they stay cached while only src/ changes
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml Cargo.lock build.rs ./
+COPY sealed-log ./sealed-log
 RUN mkdir src && echo 'fn main() {}' > src/main.rs && touch src/lib.rs \
     && cargo build --release --locked \
     && rm -rf src
 
+COPY assets ./assets
+COPY data ./data
 COPY src ./src
 RUN touch src/main.rs src/lib.rs && cargo build --release --locked
 

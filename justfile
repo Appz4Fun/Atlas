@@ -84,7 +84,9 @@ _remote profile:
         ./ "$host:$dir/"
 
     echo "==> cargo build --locked $flag on $host"
-    ssh "$host" "cd '$dir' && if [ -f \"\$HOME/.cargo/env\" ]; then . \"\$HOME/.cargo/env\"; fi && cargo build --locked $flag"
+    git_sha="$(git rev-parse HEAD 2>/dev/null || true)"
+    git_short="$(git rev-parse --short=7 HEAD 2>/dev/null || true)"
+    ssh "$host" "cd '$dir' && if [ -f \"\$HOME/.cargo/env\" ]; then . \"\$HOME/.cargo/env\"; fi && ATLAS_GIT_SHA='$git_sha' ATLAS_GIT_SHORT_SHA='$git_short' cargo build --locked $flag"
 
     mkdir -p "$out"
     scp -q "$host:$dir/target/{{ profile }}/atlas" "$out/atlas"
