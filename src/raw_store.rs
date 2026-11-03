@@ -1330,6 +1330,9 @@ pub fn get_archive(
             ),
             None => (None, None, false, None, None, None, false, false, None),
         };
+        if files.is_empty() && !names_hidden {
+            return Ok(None);
+        }
         let inconclusive = !listing_complete
             || listing_damaged
             || (files.is_empty() && password == Some(crate::archive::Password::Maybe.code()));
@@ -1388,26 +1391,35 @@ pub fn put_archive(rec: &ArchiveRecord<'_>) {
             let incoming_bytes: i64 = rec.files.iter().map(|r| r.name.len() as i64 + 32).sum();
             let effective_quota = rec.max_names_bytes.clamp(0, MAX_RAW_ARCHIVE_NAME_BYTES);
             let used_bytes = raw_meta_get(conn, "archive_name_bytes")?;
-            if used_bytes + incoming_bytes <= effective_quota {
-                let mut insert_file = conn.prepare_cached(
-                    "INSERT OR REPLACE INTO raw_archive_inner_files
-                     (release_name, group_name, seq, content_id, name, size, source)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                )?;
-                for (i, row) in rec.files.iter().enumerate() {
-                    let size = row.size.and_then(|s| i64::try_from(s).ok());
-                    let seq = rec.source * 65_536 + i as i64;
-                    insert_file.execute(params![
-                        rec.name,
-                        rec.group_name,
-                        seq,
-                        rec.content_id,
-                        row.name,
-                        size,
-                        rec.source
-                    ])?;
+            if used_bytes + incoming_bytes > effective_quota {
+                if rec.password.is_some() {
+                    conn.prepare_cached("DELETE FROM raw_archives WHERE name = ?1 AND group_name = ?2")?
+                        .execute(params![rec.name, rec.group_name])?;
                 }
+                return Ok(());
             }
+            let mut insert_file = conn.prepare_cached(
+                "INSERT OR REPLACE INTO raw_archive_inner_files
+                 (release_name, group_name, seq, content_id, name, size, source)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            )?;
+            for (i, row) in rec.files.iter().enumerate() {
+                let size = row.size.and_then(|s| i64::try_from(s).ok());
+                let seq = rec.source * 65_536 + i as i64;
+                insert_file.execute(params![
+                    rec.name,
+                    rec.group_name,
+                    seq,
+                    rec.content_id,
+                    row.name,
+                    size,
+                    rec.source
+                ])?;
+            }
+        } else if rec.password.is_some() && !rec.names_hidden {
+            conn.prepare_cached("DELETE FROM raw_archives WHERE name = ?1 AND group_name = ?2")?
+                .execute(params![rec.name, rec.group_name])?;
+            return Ok(());
         }
         if let Some(pw) = rec.password {
             let exists: bool = conn
@@ -2196,25 +2208,29 @@ pub fn replay_predb_at(main: &Path, apply: bool, log: &dyn Fn(&str)) -> anyhow::
     let raw_conn = create(&raw_path).with_context(|| format!("opening {}", raw_path.display()))?;
     let mut predb_conn =
         crate::predb::db::create(&predb_path).with_context(|| format!("opening {}", predb_path.display()))?;
-    let rows: Vec<(i64, i64, String, i64, Vec<u8>, i64)> = raw_conn
-        .prepare(
-            "SELECT l.id, l.source_id, l.source_key, e.page, l.body_zst, e.fetched_at
-             FROM raw_predb_events e
-             JOIN raw_predb_log l ON l.id = e.log_id
-             ORDER BY e.seq ASC",
-        )?
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))?
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .context("reading raw_predb_events")?;
+    let mut stmt = raw_conn.prepare(
+        "SELECT l.id, l.source_id, l.source_key, e.page, l.body_zst, e.fetched_at
+         FROM raw_predb_events e
+         JOIN raw_predb_log l ON l.id = e.log_id
+         ORDER BY e.seq ASC",
+    )?;
+    let mut rows = stmt.query([]).context("reading raw_predb_events")?;
+    let mut replayed_payloads = 0usize;
     let mut parsed_entries = 0usize;
     let mut inserted = 0u64;
     let mut updated = 0u64;
-    for (id, source_id, key, page, zst, fetched_at) in &rows {
-        let spec = crate::predb::feeds::spec(key)
+    while let Some(r) = rows.next().context("stepping raw_predb_events")? {
+        let id: i64 = r.get(0)?;
+        let source_id: i64 = r.get(1)?;
+        let key: String = r.get(2)?;
+        let page: i64 = r.get(3)?;
+        let zst: Vec<u8> = r.get(4)?;
+        let fetched_at: i64 = r.get(5)?;
+        let spec = crate::predb::feeds::spec(&key)
             .ok_or_else(|| anyhow::anyhow!("unknown predb source '{key}' in raw_predb_log id={id}"))?;
-        let body = decompress(zst)
+        let body = decompress(&zst)
             .ok_or_else(|| anyhow::anyhow!("corrupt zstd payload in raw_predb_log id={id} ({key})"))?;
-        let page_num = u32::try_from(*page).unwrap_or(1).max(1);
+        let page_num = u32::try_from(page).unwrap_or(1).max(1);
         let entries = match spec.parse {
             crate::predb::feeds::Parser::Json(parse) => {
                 let val: Value = serde_json::from_str(&body)
@@ -2225,9 +2241,10 @@ pub fn replay_predb_at(main: &Path, apply: bool, log: &dyn Fn(&str)) -> anyhow::
                 parse(&body).map_err(|e| anyhow::anyhow!("parse error in raw_predb_log id={id} ({key}): {e:?}"))?
             }
         };
+        replayed_payloads += 1;
         parsed_entries += entries.len();
         if apply {
-            let c = crate::predb::import::import(&mut predb_conn, *source_id, &entries, *fetched_at, None)
+            let c = crate::predb::import::import(&mut predb_conn, source_id, &entries, fetched_at, None)
                 .with_context(|| format!("importing raw_predb_log id={id} ({key}) into {}", predb_path.display()))?;
             inserted += c.inserted;
             updated += c.updated;
@@ -2236,7 +2253,7 @@ pub fn replay_predb_at(main: &Path, apply: bool, log: &dyn Fn(&str)) -> anyhow::
     if apply {
         log(&format!(
             "replayed {} raw predb payloads ({} entries): {} inserted, {} updated",
-            rows.len(),
+            replayed_payloads,
             parsed_entries,
             inserted,
             updated
@@ -2244,7 +2261,7 @@ pub fn replay_predb_at(main: &Path, apply: bool, log: &dyn Fn(&str)) -> anyhow::
     } else {
         log(&format!(
             "dry run (pass --apply to write): {} raw predb payloads yield {} parsed entries",
-            rows.len(),
+            replayed_payloads,
             parsed_entries
         ));
     }
@@ -2519,6 +2536,26 @@ mod tests {
         assert_eq!(saved_arch.files.len(), 1);
         assert_eq!(saved_arch.files[0].name, "Movie.2026.1080p.mkv");
         assert_eq!(get_archive("Some.Release-GRP", "alt.binaries.test", cid_b, 20, true), None);
+
+        // Quota-dropped archive listings (max_names_bytes = 0) are treated as cache misses
+        put_archive(&ArchiveRecord {
+            name: "Quota.Dropped-GRP",
+            group_name: "alt.binaries.test",
+            content_id: cid_a,
+            source: crate::archive::store::SOURCE_RAR,
+            files: &archive_files,
+            password: Some(crate::archive::Password::No.code()),
+            encryption: None,
+            names_hidden: false,
+            password_check: None,
+            parts: 20,
+            complete: true,
+            listing_complete: true,
+            listing_damaged: false,
+            content_fp: Some(&[9; 20]),
+            max_names_bytes: 0,
+        });
+        assert_eq!(get_archive("Quota.Dropped-GRP", "alt.binaries.test", cid_a, 20, true), None);
 
         // PAR2 twin fingerprint, full-list content_fp, & block metadata roundtrip
         put_par2(&Par2Record {

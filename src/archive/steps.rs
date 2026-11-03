@@ -154,7 +154,7 @@ fn finish_with_override(
             group_name: &release.group,
             content_id: &content_id,
             source,
-            files: if stored { &rows } else { &[] },
+            files: &rows,
             password: (source != SOURCE_PAR2).then(|| pw.code()),
             encryption: listing.encryption.map(super::Encryption::code),
             names_hidden: listing.headers_encrypted,
