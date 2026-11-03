@@ -2201,7 +2201,8 @@ fn harvest_attached_main(conn: &Connection, schema: &str) -> rusqlite::Result<()
     let tx = conn.unchecked_transaction()?;
     if has_table(&tx, schema, "backfill_deepest")? {
         tx.execute_batch(&format!(
-            "INSERT OR REPLACE INTO main.raw_backfill_deepest (grp, server, oldest_at, runner_up_at)
+            "DELETE FROM main.raw_backfill_deepest;
+             INSERT OR REPLACE INTO main.raw_backfill_deepest (grp, server, oldest_at, runner_up_at)
              SELECT grp, server, oldest_at, runner_up_at FROM {schema}.backfill_deepest;"
         ))?;
     }
@@ -2826,10 +2827,23 @@ mod tests {
         let old_main = main.with_file_name("atlas.old.db");
         std::fs::write(&old_main, b"old").unwrap();
 
+        let raw_conn = create(&path_for(&main)).unwrap();
+        raw_conn
+            .execute(
+                "INSERT INTO raw_backfill_deepest (grp, server, oldest_at, runner_up_at) VALUES ('alt.binaries.stale', 's1', 100, 200)",
+                [],
+            )
+            .unwrap();
+        drop(raw_conn);
+
         reset_shards_at(&main, &|_| {}).unwrap();
         assert!(!main.exists());
         assert!(!old_main.exists());
         assert!(!precompact_s1.exists());
         assert!(path_for(&main).exists(), "atlas.raw.db must be preserved");
+        let raw_conn = create(&path_for(&main)).unwrap();
+        let bd_count: i64 =
+            raw_conn.query_row("SELECT count(*) FROM raw_backfill_deepest", [], |r| r.get(0)).unwrap();
+        assert_eq!(bd_count, 0, "harvest must replace stale raw_backfill_deepest snapshot");
     }
 }
