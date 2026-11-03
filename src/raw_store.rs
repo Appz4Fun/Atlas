@@ -612,17 +612,12 @@ pub fn record_predb_page(source_id: i64, source_key: &str, url: &str, page: u32,
             .query_row(params![source_id, page_i64], |r| r.get(0))
             .optional()?;
         if last_event_log_id != Some(log_id) {
-            let max_events = MAX_PREDB_LOG_ROWS * 2;
-            let event_count: i64 = conn.query_row("SELECT count(*) FROM raw_predb_events", [], |r| r.get(0))?;
-            if event_count >= max_events {
-                let drop_events = (event_count - max_events + 1).max(64);
-                conn.execute(
-                    "DELETE FROM raw_predb_events WHERE seq IN (
-                        SELECT seq FROM raw_predb_events ORDER BY seq ASC LIMIT ?1
-                    )",
-                    params![drop_events],
-                )?;
-            }
+            conn.prepare_cached(
+                "DELETE FROM raw_predb_events
+                 WHERE log_id = ?1
+                   AND seq > (SELECT MIN(e2.seq) FROM raw_predb_events e2 WHERE e2.log_id = ?1)",
+            )?
+            .execute(params![log_id])?;
             conn.prepare_cached("INSERT INTO raw_predb_events (log_id, page, fetched_at) VALUES (?1, ?2, ?3)")?
                 .execute(params![log_id, page_i64, now])?;
         }
@@ -2664,7 +2659,8 @@ mod tests {
             let conn = create(&raw_path).unwrap();
             assert_eq!(raw_meta_get(&conn, "probe_rows").unwrap(), 1);
             assert_eq!(raw_meta_get(&conn, "probe_bytes").unwrap(), non_ascii_info.len() as i64);
-            // Recording A -> B -> A preserves observation order in raw_predb_events while deduplicating raw_predb_log
+            // Recording A -> B -> A preserves observation order in raw_predb_events while deduplicating raw_predb_log,
+            // and alternating observations of B and C never orphan A's baseline event or grow raw_predb_events unboundedly
             conn.execute_batch("DELETE FROM raw_predb_log; DELETE FROM raw_predb_events;").unwrap();
             record_predb_page(1, "predb_club", "https://predb.club/api/v1/?page=1", 1, r#"{"state":"A"}"#);
             record_predb_page(1, "predb_club", "https://predb.club/api/v1/?page=1", 1, r#"{"state":"B"}"#);
@@ -2673,13 +2669,25 @@ mod tests {
             let ev_count: i64 = conn.query_row("SELECT count(*) FROM raw_predb_events", [], |r| r.get(0)).unwrap();
             assert_eq!(pre_count, 2, "raw_predb_log stores unique payloads");
             assert_eq!(ev_count, 3, "raw_predb_events records A -> B -> A transitions");
+            for _ in 0..10 {
+                record_predb_page(1, "predb_club", "https://predb.club/api/v1/?page=1", 1, r#"{"state":"B"}"#);
+                record_predb_page(1, "predb_club", "https://predb.club/api/v1/?page=1", 1, r#"{"state":"C"}"#);
+            }
+            let distinct_reachable: i64 = conn
+                .query_row("SELECT count(DISTINCT log_id) FROM raw_predb_events", [], |r| r.get(0))
+                .unwrap();
+            let total_logs: i64 = conn.query_row("SELECT count(*) FROM raw_predb_log", [], |r| r.get(0)).unwrap();
+            let bounded_ev_count: i64 = conn.query_row("SELECT count(*) FROM raw_predb_events", [], |r| r.get(0)).unwrap();
+            assert_eq!(total_logs, 3);
+            assert_eq!(distinct_reachable, 3, "all retained raw_predb_log payloads remain reachable in raw_predb_events");
+            assert!(bounded_ev_count <= total_logs * 2, "raw_predb_events bounded to at most 2 events per payload");
             // Recording the same payload consecutively at MAX_PREDB_LOG_ROWS must not evict existing rows or add duplicate events
             conn.execute("UPDATE raw_meta SET value = ?1 WHERE key = 'predb_rows'", [MAX_PREDB_LOG_ROWS]).unwrap();
-            record_predb_page(1, "predb_club", "https://predb.club/api/v1/?page=1", 1, r#"{"state":"A"}"#);
+            record_predb_page(1, "predb_club", "https://predb.club/api/v1/?page=1", 1, r#"{"state":"C"}"#);
             let post_count: i64 = conn.query_row("SELECT count(*) FROM raw_predb_log", [], |r| r.get(0)).unwrap();
             let post_ev_count: i64 = conn.query_row("SELECT count(*) FROM raw_predb_events", [], |r| r.get(0)).unwrap();
-            assert_eq!(post_count, 2, "duplicate PreDB payload must not trigger eviction");
-            assert_eq!(post_ev_count, 3, "consecutive identical payload on same page must not append redundant event");
+            assert_eq!(post_count, 3, "duplicate PreDB payload must not trigger eviction");
+            assert_eq!(post_ev_count, bounded_ev_count, "consecutive identical payload on same page must not append redundant event");
 
             prune_probes(&conn, MAX_RAW_PROBES_BYTES, MAX_RAW_PROBES_ROWS, MAX_RAW_PROBES_BYTES).unwrap();
             assert_eq!(raw_meta_get(&conn, "probe_rows").unwrap(), 0);
