@@ -378,7 +378,13 @@ fn linked_sizes(
             conn.prepare(&format!("select category from s{s}.release_category where release_id = ?1"))?;
         let mut probe = conn.prepare(&probe_sql(s))?;
         let mut have: std::collections::HashSet<i64> = rows.iter().map(|r| r.id).collect();
+        // biggest first: once `want` rows are in, the uploads after them come after them on the page too, soo reading
+        // their rows (up to a set each) would only make the shard's answer longer before it's cut
+        let mut added = 0i64;
         for lead in leads {
+            if added >= want {
+                break;
+            }
             let ids: Vec<i64> = members.query_map([lead], |r| r.get(0))?.collect::<Result<_>>()?;
             for id in ids {
                 if !have.insert(id) {
@@ -395,6 +401,7 @@ fn linked_sizes(
                 }
                 if let Some(row) = probe.query_row([id], release_row).optional()? {
                     rows.push(row);
+                    added += 1;
                 }
             }
         }
@@ -694,6 +701,30 @@ mod tests {
                 "every upload as big as Big, newest first"
             );
         }
+    }
+
+    #[test]
+    fn linked_uploads_stop_being_read_in_once_the_shard_has_enough() {
+        let f = fixture();
+        let group = &groups()[0];
+        let shard = f.shard(group);
+        shard.execute_batch(crate::archive::link::UPLOAD_LINK.create).unwrap();
+        let bigs: Vec<i64> =
+            (0..2).map(|i| f.add(&format!("Big.{i}"), group, Some(6_000), "2026-09-01", Some(UHD))).collect();
+        // five uploads of three pieces, each bigger together than the Bigs
+        for u in 0..5 {
+            let ids: Vec<i64> =
+                (0..3).map(|p| f.add(&format!("u{u}p{p}x"), group, Some(3_000), "2026-10-01", Some(UHD))).collect();
+            for &id in &ids {
+                shard.execute("insert into upload_link (release_id, lead_id) values (?1, ?2)", [id, ids[0]]).unwrap();
+            }
+        }
+        let conn = db::open_with_shards(&f.main).unwrap();
+        // the shard's own first two, which it had more than
+        let mut rows: Vec<ReleaseRow> =
+            bigs.iter().map(|&id| ReleaseRow { id, size: Some(6_000), ..Default::default() }).collect();
+        linked_sizes(&conn, store::shard_of(group), None, &mut rows, 2).unwrap();
+        assert_eq!(rows.len(), 2 + 3, "one upload's rows make the two wanted: the others aren't read in");
     }
 
     #[test]
