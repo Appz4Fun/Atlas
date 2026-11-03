@@ -552,9 +552,7 @@ fn exact_split_post(conn: &Connection, posted: &str, poster: &Option<String>) ->
 #[derive(Clone)]
 struct StemCandidate {
     id: i64,
-    name: String,
     group: String,
-    poster: Option<String>,
     bytes: i64,
     date: Option<f64>,
 }
@@ -574,9 +572,8 @@ fn split_stem_post(conn: &Connection, posted: &str, release: &crate::search::Rel
                 r.get::<_, i64>(0)?,
                 r.get::<_, String>(1)?,
                 r.get::<_, Option<String>>(2)?.unwrap_or_default(),
-                r.get::<_, Option<String>>(3)?,
-                r.get::<_, i64>(4)?,
-                r.get::<_, Option<f64>>(5)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, Option<f64>>(4)?,
             ))
         })?;
         let mut shard_rows = 0;
@@ -585,9 +582,9 @@ fn split_stem_post(conn: &Connection, posted: &str, release: &crate::search::Rel
             if shard_rows > LINKED_ROWS {
                 return Ok(None);
             }
-            let (id, name, group, poster, bytes, date) = row?;
+            let (id, name, group, bytes, date) = row?;
             if post_stem(&name).eq_ignore_ascii_case(&stem) {
-                all.push(StemCandidate { id, name, group, poster, bytes, date });
+                all.push(StemCandidate { id, group, bytes, date });
                 if all.len() > LINKED_ROWS {
                     return Ok(None);
                 }
@@ -622,47 +619,15 @@ fn linked_stem_candidates(
     anchor_id: i64,
     close: &[StemCandidate],
 ) -> Result<Option<Vec<StemCandidate>>> {
-    let Some(anchor) = close.iter().find(|c| c.id == anchor_id) else {
+    let Some(lead) = candidate_lead(conn, anchor_id)? else {
         return Ok(None);
     };
-    let mut leads = HashMap::new();
+    let mut subset = Vec::new();
     for c in close {
-        if let Some(lead) = candidate_lead(conn, c.id)? {
-            leads.insert(c.id, lead);
+        if candidate_lead(conn, c.id)? == Some(lead) {
+            subset.push(c.clone());
         }
     }
-    let lead = match leads.get(&anchor_id).copied() {
-        Some(lead) => lead,
-        None => {
-            let mut sib_leads: Vec<i64> = close
-                .iter()
-                .filter(|c| c.name == anchor.name && c.poster == anchor.poster)
-                .filter_map(|c| leads.get(&c.id).copied())
-                .collect();
-            sib_leads.sort_unstable();
-            sib_leads.dedup();
-            let [lead] = sib_leads.as_slice() else { return Ok(None) };
-            *lead
-        }
-    };
-    let linked_pairs: HashSet<(&str, &Option<String>)> = close
-        .iter()
-        .filter(|c| leads.get(&c.id) == Some(&lead))
-        .map(|c| (c.name.as_str(), &c.poster))
-        .collect();
-    let mut valid_pairs = HashSet::new();
-    for pair in &linked_pairs {
-        let pair_ids: Vec<i64> =
-            close.iter().filter(|c| (c.name.as_str(), &c.poster) == *pair).map(|c| c.id).collect();
-        if pair_ids.len() == 1 || union_files(conn, &pair_ids)?.one_upload() {
-            valid_pairs.insert(*pair);
-        }
-    }
-    let subset: Vec<StemCandidate> = close
-        .iter()
-        .filter(|c| leads.get(&c.id) == Some(&lead) || valid_pairs.contains(&(c.name.as_str(), &c.poster)))
-        .cloned()
-        .collect();
     if subset.len() < 2 || !subset.iter().any(|c| c.id == anchor_id) {
         return Ok(None);
     }
@@ -707,7 +672,7 @@ fn split_post_sql(s: usize) -> String {
 /// Parameters: ?1 the stem, ?2 `stem.`, ?3 `stem/`.
 fn split_stem_sql(s: usize) -> String {
     format!(
-        "select id, name, group_name, poster, coalesce(size, 0), julianday(posted_date) from s{s}.releases
+        "select id, name, group_name, coalesce(size, 0), julianday(posted_date) from s{s}.releases
          where (name = ?1 or (name >= ?2 and name < ?3)) and not atlas_blocked(group_name) limit {}",
         LINKED_ROWS + 1
     )
@@ -1327,10 +1292,10 @@ mod tests {
         };
         assert_eq!(whole_post_with(&conn, &unlinked_row).unwrap(), None);
 
-        // Link the per-file rows via upload_link (row 32 joins via its same-(name, poster) sibling row 24)
+        // Link every row of the upload via upload_link
         conn.execute_batch(
             "insert into s0.upload_link (release_id, lead_id, recovery, wanted)
-             values (40, 40, 0, null), (8, 40, 1, 1), (16, 40, 1, 1), (24, 40, 1, 1);",
+             values (40, 40, 0, null), (8, 40, 1, 1), (16, 40, 1, 1), (24, 40, 1, 1), (32, 40, 1, 1);",
         )
         .unwrap();
 
