@@ -64,12 +64,13 @@ pub fn get(path: &str, query: &str, cookies: Option<&str>, base: &str, api_key: 
         "/ui/poster" if signed_in => poster(&args),
         "/ui/cover" if signed_in => cover(&args),
         "/ui/still" if signed_in => still(&args),
+        "/ui/samefilm" if signed_in => same_film_panel(&args),
         "/ui/meta" if signed_in => crate::web_meta::fragment(&args),
         "/ui/row" if signed_in => crate::web_meta::row_panel(&args),
         "/ui/settings" if signed_in => html(200, settings_page(None)),
         "/ui/nzb" if signed_in && args.get("fill").is_some_and(|v| v == "1") => filled_nzb(&args),
         "/ui/nzb" if signed_in => get_nzb(&args),
-        "/ui/details" | "/ui/poster" | "/ui/cover" | "/ui/still" | "/ui/meta" | "/ui/row" => {
+        "/ui/details" | "/ui/poster" | "/ui/cover" | "/ui/still" | "/ui/samefilm" | "/ui/meta" | "/ui/row" => {
             ApiResponse { headers: vec![("HX-Redirect".into(), "/".into())], ..html(401, String::new()) }
         }
         "/ui/nzb" | "/ui/release" | "/ui/duplicates" | "/ui/settings" => redirect(Vec::new()),
@@ -2012,7 +2013,41 @@ fn stills_html(id: i64, stills: &[(u8, Option<i64>, u32, u32)]) -> String {
             )
         })
         .collect();
-    format!("<h2>Stills</h2><div class=\"stills\">{figures}</div>")
+    // the releases showing the same pictures, looked up after the page is up: it reads every shard
+    format!(
+        "<h2>Stills</h2><div class=\"stills\">{figures}</div><div id=\"same-film\" hx-get=\"/ui/samefilm?id={id}\" hx-trigger=\"load\" hx-swap=\"outerHTML\"></div>"
+    )
+}
+
+/// Other releases whose stills match this one's: the same film, from another source or encode.
+fn same_film_panel(args: &HashMap<String, String>) -> ApiResponse {
+    let id = args.get("id").and_then(|v| v.trim().parse::<i64>().ok()).unwrap_or(0);
+    let Ok(conn) = crate::db::open() else { return html(200, String::new()) };
+    let rows: Vec<ReleaseRow> = crate::probe::stills::same_film(&conn, id)
+        .into_iter()
+        .filter_map(|other| crate::search::get_release_with(&conn, other).ok().flatten())
+        .collect();
+    html(200, same_film_html(&rows))
+}
+
+fn same_film_html(rows: &[ReleaseRow]) -> String {
+    if rows.is_empty() {
+        return String::new();
+    }
+    let items: String = rows
+        .iter()
+        .map(|r| {
+            format!(
+                "<tr><td><a href=\"/ui/release?id={}\">{}</a></td><td class=\"num\">{}</td></tr>",
+                r.id,
+                escape(&r.name),
+                escape(&fmt_size(r.size))
+            )
+        })
+        .collect();
+    format!(
+        "<h2>Same film</h2><div class=\"table-wrap\"><table><thead><tr><th>Name</th><th class=\"num\">Size</th></tr></thead><tbody>{items}</tbody></table></div><p class=\"sort\">Releases whose stills show the same pictures: another encode, a remux or a different cut. Not twins.</p>"
+    )
 }
 
 /// A time into the film as h:mm:ss, or m:ss under an hour.
@@ -2496,6 +2531,10 @@ mod tests {
 
     #[test]
     fn stills_link_their_jpeg_and_say_where_they_are() {
+        assert_eq!(same_film_html(&[]), "");
+        let other = ReleaseRow { id: 9, name: "<A>.Film".into(), size: Some(1 << 30), ..Default::default() };
+        let html = same_film_html(&[other]);
+        assert!(html.contains("/ui/release?id=9") && html.contains("&lt;A&gt;.Film"), "{html}");
         assert_eq!(stills_html(7, &[]), "");
         let html = stills_html(7, &[(25, Some(1_834_500), 960, 540), (50, None, 960, 540)]);
         assert!(html.contains("<img src=\"/ui/still?id=7&amp;at=25\" width=\"960\" height=\"540\""), "{html}");
@@ -2513,6 +2552,7 @@ mod tests {
             assert_eq!(get("/ui/details", "id=1", bad, "http://x", KEY).unwrap().status, 401, "{bad:?}");
             assert_eq!(get("/ui/poster", "kind=2&tmdb=1", bad, "http://x", KEY).unwrap().status, 401, "{bad:?}");
             assert_eq!(get("/ui/still", "id=1&at=50", bad, "http://x", KEY).unwrap().status, 401, "{bad:?}");
+            assert_eq!(get("/ui/samefilm", "id=1", bad, "http://x", KEY).unwrap().status, 401, "{bad:?}");
             let nzb = get("/ui/nzb", "id=1", bad, "http://x", KEY).unwrap();
             assert_eq!(nzb.status, 303, "{bad:?}");
             assert_eq!(get("/ui/release", "id=1", bad, "http://x", KEY).unwrap().status, 303, "{bad:?}");
