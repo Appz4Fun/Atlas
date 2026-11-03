@@ -296,8 +296,8 @@ fn tc_t1_f23_1_audio_bitstream_truehd_atmos() {
     let mut data = vec![0u8; 64];
     // TrueHD major sync word: 0xF8726FBA
     data[10..14].copy_from_slice(&[0xF8, 0x72, 0x6F, 0xBA]);
-    // Atmos bit set at offset pos + 7
-    data[17] = 0x80;
+    // Atmos 4th substream flag in substream_info at offset pos + 17
+    data[10 + 17] = 0x80;
 
     let probe = AudioBitstream::probe(&data);
     assert!(probe.has_atmos);

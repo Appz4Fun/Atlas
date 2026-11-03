@@ -88,7 +88,10 @@ impl PostingTool {
 
         // 2. GoPostStuff grammar (checked before Nyuu timestamp since gps-<id>-<ts>@... is a subset)
         if let Some(caps) = GOPOSTSTUFF_RE.captures(mid).or_else(|| GOPOSTSTUFF_ALT_RE.captures(mid)) {
-            let ts: Option<u64> = caps.get(1).and_then(|m| m.as_str().parse().ok());
+            let ts: Option<u64> = caps
+                .get(1)
+                .and_then(|m| m.as_str().parse::<u64>().ok())
+                .map(Self::normalize_timestamp_to_ms);
             return ToolInfo {
                 tool: ToolType::GoPostStuff,
                 version: None,
@@ -100,7 +103,8 @@ impl PostingTool {
             let ts = NYUU_TIMESTAMP_RE
                 .captures(mid)
                 .and_then(|caps| caps.get(1))
-                .and_then(|m| m.as_str().parse().ok());
+                .and_then(|m| m.as_str().parse::<u64>().ok())
+                .map(Self::normalize_timestamp_to_ms);
             return ToolInfo {
                 tool: ToolType::GoPostStuff,
                 version: None,
@@ -167,11 +171,72 @@ impl PostingTool {
             deterministic: false,
         }
     }
+
+    /// Normalize a 10–19 digit Unix timestamp (seconds, milliseconds, microseconds,
+    /// or nanoseconds) into Unix milliseconds for `embedded_time_ms`.
+    pub fn normalize_timestamp_to_ms(raw: u64) -> u64 {
+        if raw >= 100_000_000_000_000_000 {
+            // 18–19 digits: Unix nanoseconds -> milliseconds
+            raw / 1_000_000
+        } else if raw >= 100_000_000_000_000 {
+            // 15–17 digits: Unix microseconds -> milliseconds
+            raw / 1_000
+        } else if raw < 100_000_000_000 {
+            // 10–11 digits: Unix seconds -> milliseconds
+            raw.saturating_mul(1_000)
+        } else {
+            // 12–14 digits: Unix milliseconds
+            raw
+        }
+    }
 }
 
 pub struct ServerClock;
 
 impl ServerClock {
+    /// Parse an NNTP `DATE` response (`111 YYYYMMDDhhmmss` or raw `YYYYMMDDhhmmss`) into UTC.
+    ///
+    /// Empirical probe (2026-11-03): all 8 commercial providers support `DATE` (`111`),
+    /// whereas `NEWNEWS` is disabled everywhere (`400`/`500`/`502`) and `XHDR`/`HDR`
+    /// returns no values for `NNTP-Posting-Date` or `Injection-Info`.
+    pub fn parse_nntp_date(response: &str) -> Option<DateTime<Utc>> {
+        use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
+        let trimmed = response.trim();
+        let token = match trimmed.strip_prefix("111") {
+            Some(rest) => rest.split_whitespace().next()?,
+            None => trimmed.split_whitespace().next()?,
+        };
+        if token.len() != 14 || !token.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let year: i32 = token[0..4].parse().ok()?;
+        let month: u32 = token[4..6].parse().ok()?;
+        let day: u32 = token[6..8].parse().ok()?;
+        let hour: u32 = token[8..10].parse().ok()?;
+        let min: u32 = token[10..12].parse().ok()?;
+        let sec: u32 = token[12..14].parse().ok()?;
+
+        let date = NaiveDate::from_ymd_opt(year, month, day)?;
+        let time = NaiveTime::from_hms_opt(hour, min, sec)?;
+        Some(NaiveDateTime::new(date, time).and_utc())
+    }
+
+    /// Measure per-provider clock skew in fractional seconds (`server_utc - local_utc`).
+    ///
+    /// Positive values indicate the server clock runs ahead of UTC (e.g., Giganews
+    /// `super.newsgroupdirect.com` measured at `+5.74 s` ahead on 2026-11-03).
+    pub fn measure_skew_seconds(nntp_date_response: &str, local_utc: DateTime<Utc>) -> Option<f64> {
+        let server_dt = Self::parse_nntp_date(nntp_date_response)?;
+        let server_sec = server_dt.timestamp() as f64 + f64::from(server_dt.timestamp_subsec_nanos()) * 1e-9;
+        let local_sec = local_utc.timestamp() as f64 + f64::from(local_utc.timestamp_subsec_nanos()) * 1e-9;
+        Some(server_sec - local_sec)
+    }
+
+    /// Correct a server-derived arrival timestamp (seconds) by subtracting the provider's clock skew.
+    pub fn correct_skew(server_timestamp_sec: f64, skew_seconds: f64) -> f64 {
+        server_timestamp_sec - skew_seconds
+    }
+
     /// Decode server-assigned injection timestamps from Message-ID local parts.
     pub fn decode(message_id: &str) -> Option<DateTime<Utc>> {
         let mid = message_id.trim().trim_start_matches('<').trim_end_matches('>');
@@ -409,15 +474,40 @@ mod tests {
     }
 
     #[test]
-    fn gopoststuff_10_to_13_digit_timestamp_classification() {
+    fn gopoststuff_10_to_19_digit_timestamp_normalization_to_ms() {
         let headers = HeaderMap::new();
-        let info = PostingTool::classify("<gps-abc-1729000000000@example.org>", &headers);
-        assert_eq!(info.tool, ToolType::GoPostStuff);
-        assert_eq!(info.embedded_time_ms, Some(1729000000000));
+        // 13-digit milliseconds
+        let info_13 = PostingTool::classify("<gps-abc-1729000000000@example.org>", &headers);
+        assert_eq!(info_13.tool, ToolType::GoPostStuff);
+        assert_eq!(info_13.embedded_time_ms, Some(1_729_000_000_000));
 
+        // 10-digit seconds -> normalized to milliseconds
         let info_10 = PostingTool::classify("<gps-xyz123-1729000000@gopoststuff.local>", &headers);
         assert_eq!(info_10.tool, ToolType::GoPostStuff);
-        assert_eq!(info_10.embedded_time_ms, Some(1729000000));
+        assert_eq!(info_10.embedded_time_ms, Some(1_729_000_000_000));
+
+        // 16-digit microseconds -> normalized to milliseconds
+        let info_16 = PostingTool::classify("<1729000000123456$gps@gopoststuff>", &headers);
+        assert_eq!(info_16.tool, ToolType::GoPostStuff);
+        assert_eq!(info_16.embedded_time_ms, Some(1_729_000_000_123));
+
+        // 19-digit nanoseconds -> normalized to milliseconds
+        let info_19 = PostingTool::classify("<1729000000123456789$gps@gopoststuff>", &headers);
+        assert_eq!(info_19.tool, ToolType::GoPostStuff);
+        assert_eq!(info_19.embedded_time_ms, Some(1_729_000_000_123));
+    }
+
+    #[test]
+    fn nntp_date_skew_calibration_and_giganews_offset() {
+        // Empirical probe (2026-11-03): Giganews (`super.newsgroupdirect.com`) returned
+        // `111 20260419205543` when local UTC was 5.74s behind (`2026-04-19T20:55:37.260Z`).
+        let local = DateTime::from_timestamp(1_776_632_137, 260_000_000).unwrap();
+        let skew = ServerClock::measure_skew_seconds("111 20260419205543", local)
+            .expect("must parse NNTP 111 DATE response");
+        assert!((skew - 5.74).abs() < 1e-3, "expected +5.74s skew, got {skew}");
+
+        let corrected = ServerClock::correct_skew(1_776_632_143.0, skew);
+        assert!((corrected - 1_776_632_137.26).abs() < 1e-3);
     }
 
     #[test]

@@ -458,25 +458,26 @@ fn test_audio_bitstream_truehd_atmos_sync_variations() {
     // Big-Endian sync word: 0xF8726FBA
     let mut be_data = vec![0x11u8; 32];
     be_data[4..8].copy_from_slice(&[0xF8, 0x72, 0x6F, 0xBA]);
-    // Bit 7 at offset 4 + 7 = 11:
-    be_data[11] = 0x80;
+    // Bit 7 in substream_info at offset 4 + 17 = 21:
+    be_data[4 + 17] = 0x80;
     let res_be = AudioBitstream::probe(&be_data);
-    assert!(res_be.has_atmos, "Big-endian TrueHD sync with bit 7 must detect Atmos");
+    assert!(res_be.has_atmos, "Big-endian TrueHD sync with bit 7 at +17 must detect Atmos");
     assert_eq!(res_be.format.as_deref(), Some("TrueHD Atmos"));
 
     // Little-Endian sync word: 0xBA6F72F8
     let mut le_data = vec![0x22u8; 32];
     le_data[8..12].copy_from_slice(&[0xBA, 0x6F, 0x72, 0xF8]);
-    le_data[8 + 7] = 0x80;
+    le_data[8 + 17] = 0x80;
     let res_le = AudioBitstream::probe(&le_data);
-    assert!(res_le.has_atmos, "Little-endian TrueHD sync with bit 7 must detect Atmos");
+    assert!(res_le.has_atmos, "Little-endian TrueHD sync with bit 7 at +17 must detect Atmos");
 
-    // TrueHD sync with bit 7 UNSET (standard TrueHD 7.1 without Atmos)
+    // TrueHD sync with bit 7 UNSET at +17, even if channel assignment byte at +7 has bit 7 set
     let mut no_atmos_data = vec![0x33u8; 32];
     no_atmos_data[4..8].copy_from_slice(&[0xF8, 0x72, 0x6F, 0xBA]);
-    no_atmos_data[11] = 0x7F; // Bit 7 is 0
+    no_atmos_data[4 + 7] = 0x80; // Channel assignment byte must not false-trigger Atmos
+    no_atmos_data[4 + 17] = 0x7F; // Bit 7 is 0 in substream_info
     let res_no_atmos = AudioBitstream::probe(&no_atmos_data);
-    assert!(!res_no_atmos.has_atmos, "TrueHD with bit 7 unset must NOT flag Atmos");
+    assert!(!res_no_atmos.has_atmos, "TrueHD with substream_info bit 7 unset must NOT flag Atmos");
 }
 
 #[test]
