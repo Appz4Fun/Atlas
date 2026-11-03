@@ -28,6 +28,8 @@ pub const MAX_PREDB_LOG_ROWS: i64 = 10_000;
 pub const MAX_PREDB_LOG_BYTES: i64 = 512 << 20;
 /// Maximum rows kept in `raw_http_cache` before oldest entries are pruned.
 pub const MAX_HTTP_CACHE_ROWS: i64 = 100_000;
+/// Maximum compressed bytes kept in `raw_http_cache` (512 MiB).
+pub const MAX_HTTP_CACHE_BYTES: i64 = 512 << 20;
 /// Freshness window for live metadata HTTP cache hits (12 hours: shorter than `media::resolve`'s 1-day
 /// negative retry and `media::details`'s 30-day refresh, while covering same-day schema-test resets).
 pub const LIVE_HTTP_CACHE_TTL_SECS: i64 = 12 * 3_600;
@@ -97,6 +99,8 @@ CREATE TABLE IF NOT EXISTS raw_archives (
     encryption     INTEGER,
     names_hidden   INTEGER,
     password_check BLOB,
+    parts          INTEGER,
+    complete       INTEGER,
     PRIMARY KEY (name, group_name)
 ) WITHOUT ROWID;
 
@@ -172,6 +176,8 @@ pub fn create(path: &Path) -> rusqlite::Result<Connection> {
     ensure_column(&conn, "raw_probes", "parts", "INTEGER")?;
     ensure_column(&conn, "raw_probes", "complete", "INTEGER")?;
     ensure_column(&conn, "raw_probes", "config_stamp", "INTEGER")?;
+    ensure_column(&conn, "raw_archives", "parts", "INTEGER")?;
+    ensure_column(&conn, "raw_archives", "complete", "INTEGER")?;
     Ok(conn)
 }
 
@@ -289,8 +295,31 @@ fn get_http_cache_with_ttl(source: &str, url: &str, max_age_secs: Option<i64>) -
     .flatten()
 }
 
-fn prune_http_cache(conn: &Connection, max_rows: i64) -> rusqlite::Result<()> {
-    let count: i64 = conn.query_row("SELECT count(*) FROM raw_http_cache", [], |r| r.get(0))?;
+fn prune_http_cache(
+    conn: &Connection,
+    incoming_bytes: i64,
+    max_rows: i64,
+    max_bytes: i64,
+    now: i64,
+) -> rusqlite::Result<()> {
+    let (mut count, mut bytes): (i64, i64) = conn.query_row(
+        "SELECT count(*), coalesce(sum(length(body_zst)), 0) FROM raw_http_cache",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    if count >= max_rows || bytes + incoming_bytes > max_bytes {
+        conn.execute(
+            "DELETE FROM raw_http_cache
+             WHERE source NOT IN ('nzedb_archive', 'dats_pciso_1998')
+               AND fetched_at < ?1",
+            params![now.saturating_sub(LIVE_HTTP_CACHE_TTL_SECS)],
+        )?;
+        (count, bytes) = conn.query_row(
+            "SELECT count(*), coalesce(sum(length(body_zst)), 0) FROM raw_http_cache",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+    }
     if count >= max_rows {
         let to_drop = (count - max_rows + 1).max(64);
         conn.execute(
@@ -300,17 +329,37 @@ fn prune_http_cache(conn: &Connection, max_rows: i64) -> rusqlite::Result<()> {
             params![to_drop],
         )?;
     }
+    if bytes + incoming_bytes > max_bytes {
+        let mut total: i64 =
+            conn.query_row("SELECT coalesce(sum(length(body_zst)), 0) FROM raw_http_cache", [], |r| r.get(0))?;
+        while total + incoming_bytes > max_bytes {
+            let deleted = conn.execute(
+                "DELETE FROM raw_http_cache WHERE cache_key IN (
+                    SELECT cache_key FROM raw_http_cache ORDER BY fetched_at ASC LIMIT 64
+                )",
+                [],
+            )?;
+            if deleted == 0 {
+                break;
+            }
+            total = conn.query_row("SELECT coalesce(sum(length(body_zst)), 0) FROM raw_http_cache", [], |r| r.get(0))?;
+        }
+    }
     Ok(())
 }
 
-/// Saves an HTTP response in `raw_http_cache`, enforcing `MAX_HTTP_CACHE_ROWS`.
+/// Saves an HTTP response in `raw_http_cache`, enforcing `MAX_HTTP_CACHE_ROWS` and `MAX_HTTP_CACHE_BYTES`.
 pub fn put_http_cache(source: &str, url: &str, status: u16, body: &str) {
     let Some(zst) = compress(body) else { return };
+    let incoming_bytes = zst.len() as i64;
+    if incoming_bytes > MAX_HTTP_CACHE_BYTES {
+        return;
+    }
     let clean_url = canonical_cache_url(url);
     let cache_key = format!("GET:{source}:{clean_url}");
     let now = chrono::Utc::now().timestamp();
     let _ = with_raw(|conn| {
-        prune_http_cache(conn, MAX_HTTP_CACHE_ROWS)?;
+        prune_http_cache(conn, incoming_bytes, MAX_HTTP_CACHE_ROWS, MAX_HTTP_CACHE_BYTES, now)?;
         conn.prepare_cached(
             "INSERT OR REPLACE INTO raw_http_cache (cache_key, source, url, status, body_zst, fetched_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -636,6 +685,188 @@ pub fn put_stills(name: &str, group_name: &str, stills: &[SavedStill]) {
     });
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SavedArchiveFile {
+    pub seq: i64,
+    pub name: String,
+    pub size: Option<u64>,
+    pub source: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SavedArchive {
+    pub password: Option<i64>,
+    pub encryption: Option<i64>,
+    pub names_hidden: bool,
+    pub password_check: Option<Vec<u8>>,
+    pub files: Vec<SavedArchiveFile>,
+}
+
+/// Looks up cached inner files for `(release_name, group_name)` and `source` in `raw_archive_inner_files`.
+pub fn get_archive_files(release_name: &str, group_name: &str, source: i64) -> Vec<SavedArchiveFile> {
+    with_raw(|conn| {
+        let rows = conn
+            .prepare_cached(
+                "SELECT seq, name, size, coalesce(source, ?3)
+                 FROM raw_archive_inner_files
+                 WHERE release_name = ?1 AND group_name = ?2 AND coalesce(source, 2) = ?3
+                 ORDER BY seq",
+            )?
+            .query_map(params![release_name, group_name, source], |r| {
+                Ok(SavedArchiveFile {
+                    seq: r.get(0)?,
+                    name: r.get(1)?,
+                    size: r.get::<_, Option<i64>>(2)?.and_then(|s| u64::try_from(s).ok()),
+                    source: r.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    })
+    .unwrap_or_default()
+}
+
+/// Looks up a previously inspected archive for `(name, group_name)` in `raw_archives` and `raw_archive_inner_files`.
+/// If the previous inspection was an inconclusive `Password::Maybe` (2) with no listed files on a smaller/incomplete
+/// release and the release has since grown, returns `None` so `ListStep` can inspect the newly arrived articles.
+pub fn get_archive(
+    name: &str,
+    group_name: &str,
+    current_parts: i64,
+    current_complete: bool,
+) -> Option<SavedArchive> {
+    with_raw(|conn| {
+        type RawArchiveRow = (i64, Option<i64>, Option<i64>, Option<Vec<u8>>, Option<i64>, Option<i64>);
+        let row: Option<RawArchiveRow> = conn
+            .prepare_cached(
+                "SELECT password, encryption, names_hidden, password_check, parts, complete
+                 FROM raw_archives WHERE name = ?1 AND group_name = ?2",
+            )?
+            .query_row(params![name, group_name], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
+            })
+            .optional()?;
+        let files = conn
+            .prepare_cached(
+                "SELECT seq, name, size, coalesce(source, 2)
+                 FROM raw_archive_inner_files
+                 WHERE release_name = ?1 AND group_name = ?2 AND coalesce(source, 2) != 1
+                 ORDER BY seq",
+            )?
+            .query_map(params![name, group_name], |r| {
+                Ok(SavedArchiveFile {
+                    seq: r.get(0)?,
+                    name: r.get(1)?,
+                    size: r.get::<_, Option<i64>>(2)?.and_then(|s| u64::try_from(s).ok()),
+                    source: r.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if row.is_none() && files.is_empty() {
+            return Ok(None);
+        }
+        let (password, encryption, names_hidden, password_check, saved_parts, saved_complete) = match row {
+            Some((pw, enc, hidden, check, parts, complete)) => {
+                (Some(pw), enc, hidden.unwrap_or(0) != 0, check, parts, complete)
+            }
+            None => (None, None, false, None, None, None),
+        };
+        if files.is_empty()
+            && password == Some(crate::archive::Password::Maybe.code())
+            && let Some(had_parts) = saved_parts
+        {
+            let was_complete = saved_complete.unwrap_or(0) != 0;
+            if (current_complete && !was_complete) || current_parts > had_parts {
+                return Ok(None);
+            }
+        }
+        Ok(Some(SavedArchive { password, encryption, names_hidden, password_check, files }))
+    })
+    .flatten()
+}
+
+pub struct ArchiveRecord<'a> {
+    pub name: &'a str,
+    pub group_name: &'a str,
+    pub source: i64,
+    pub files: &'a [crate::archive::InnerFile],
+    pub password: Option<i64>,
+    pub encryption: Option<i64>,
+    pub names_hidden: bool,
+    pub password_check: Option<&'a [u8]>,
+    pub parts: i64,
+    pub complete: bool,
+}
+
+/// Persists an archive or PAR2 inspection result into `raw_archives` and `raw_archive_inner_files`.
+pub fn put_archive(rec: &ArchiveRecord<'_>) {
+    let _ = with_raw(|conn| {
+        conn.prepare_cached(
+            "DELETE FROM raw_archive_inner_files
+             WHERE release_name = ?1 AND group_name = ?2 AND coalesce(source, 2) = ?3",
+        )?
+        .execute(params![rec.name, rec.group_name, rec.source])?;
+        let mut insert_file = conn.prepare_cached(
+            "INSERT OR REPLACE INTO raw_archive_inner_files (release_name, group_name, seq, name, size, source)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )?;
+        for (i, row) in rec.files.iter().enumerate() {
+            let size = row.size.and_then(|s| i64::try_from(s).ok());
+            let seq = rec.source * 65_536 + i as i64;
+            insert_file.execute(params![rec.name, rec.group_name, seq, row.name, size, rec.source])?;
+        }
+        if let Some(pw) = rec.password {
+            conn.prepare_cached(
+                "INSERT OR REPLACE INTO raw_archives
+                 (name, group_name, password, encryption, names_hidden, password_check, parts, complete)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            )?
+            .execute(params![
+                rec.name,
+                rec.group_name,
+                pw,
+                rec.encryption,
+                i64::from(rec.names_hidden),
+                rec.password_check,
+                rec.parts,
+                i64::from(rec.complete),
+            ])?;
+        }
+        Ok(())
+    });
+}
+
+/// Restores harvested `raw_backfill_deepest` rows from `atlas.raw.db` into `main_conn`'s `backfill_deepest` table.
+pub fn restore_backfill_deepest(main: &Path, main_conn: &Connection) {
+    let raw_path = path_for(main);
+    if !raw_path.exists() {
+        return;
+    }
+    let Ok(raw_conn) = create(&raw_path) else { return };
+    let Ok(mut stmt) = raw_conn.prepare("SELECT grp, server, oldest_at, runner_up_at FROM raw_backfill_deepest")
+    else {
+        return;
+    };
+    let Ok(rows) = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, Option<i64>>(2)?,
+            r.get::<_, Option<i64>>(3)?,
+        ))
+    }) else {
+        return;
+    };
+    let Ok(mut insert) = main_conn.prepare_cached(
+        "INSERT OR IGNORE INTO backfill_deepest (grp, server, oldest_at, runner_up_at) VALUES (?1, ?2, ?3, ?4)",
+    ) else {
+        return;
+    };
+    for row in rows.flatten() {
+        let _ = insert.execute(params![row.0, row.1, row.2, row.3]);
+    }
+}
+
 fn has_table(conn: &Connection, schema: &str, table: &str) -> rusqlite::Result<bool> {
     conn.prepare(&format!("SELECT 1 FROM {schema}.sqlite_master WHERE type = 'table' AND name = ?1"))?
         .exists([table])
@@ -710,8 +941,9 @@ fn harvest_attached_shard(conn: &Connection) -> rusqlite::Result<()> {
     }
     if has_table(&tx, "sh", "archive_release")? {
         tx.execute_batch(
-            "INSERT OR REPLACE INTO main.raw_archives (name, group_name, password, encryption, names_hidden, password_check)
-             SELECT r.name, r.group_name, a.password, a.encryption, a.names_hidden, a.password_check
+            "INSERT OR REPLACE INTO main.raw_archives (name, group_name, password, encryption, names_hidden, password_check, parts, complete)
+             SELECT r.name, r.group_name, a.password, a.encryption, a.names_hidden, a.password_check,
+                    coalesce(r.parts, 0), coalesce(r.complete, 0)
              FROM sh.archive_release a JOIN sh.releases r ON r.id = a.release_id
              WHERE r.name IS NOT NULL AND r.group_name IS NOT NULL;",
         )?;
@@ -1059,6 +1291,42 @@ mod tests {
         }];
         put_stills("Some.Release-GRP", "alt.binaries.test", &stills);
         assert_eq!(get_stills("Some.Release-GRP", "alt.binaries.test"), stills);
+
+        // Archive & PAR2 inner-files roundtrip
+        let archive_files = vec![crate::archive::InnerFile {
+            name: "Movie.2026.1080p.mkv".to_string(),
+            size: Some(1_500_000_000),
+        }];
+        put_archive(&ArchiveRecord {
+            name: "Some.Release-GRP",
+            group_name: "alt.binaries.test",
+            source: crate::archive::store::SOURCE_RAR,
+            files: &archive_files,
+            password: Some(crate::archive::Password::Yes.code()),
+            encryption: Some(crate::archive::Encryption::Rar5Aes256.code()),
+            names_hidden: true,
+            password_check: Some(&[1, 2, 3, 4]),
+            parts: 20,
+            complete: true,
+        });
+        let saved_arch = get_archive("Some.Release-GRP", "alt.binaries.test", 20, true).unwrap();
+        assert_eq!(saved_arch.password, Some(crate::archive::Password::Yes.code()));
+        assert_eq!(saved_arch.encryption, Some(crate::archive::Encryption::Rar5Aes256.code()));
+        assert!(saved_arch.names_hidden);
+        assert_eq!(saved_arch.password_check.as_deref(), Some(&[1, 2, 3, 4][..]));
+        assert_eq!(saved_arch.files.len(), 1);
+        assert_eq!(saved_arch.files[0].name, "Movie.2026.1080p.mkv");
+
+        // HTTP cache byte quota pruning
+        {
+            let conn = create(&raw_path).unwrap();
+            let now = chrono::Utc::now().timestamp();
+            prune_http_cache(&conn, MAX_HTTP_CACHE_BYTES, MAX_HTTP_CACHE_ROWS, MAX_HTTP_CACHE_BYTES, now).unwrap();
+            let total: i64 = conn
+                .query_row("SELECT coalesce(sum(length(body_zst)), 0) FROM raw_http_cache", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(total, 0);
+        }
 
         set_test_raw_path(None);
     }

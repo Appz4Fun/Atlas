@@ -82,10 +82,37 @@ fn name_may_change(release: &ReleaseInfo, source: u8) -> bool {
 /// What a read comes to: its rows, unless the shard's names are over their total,
 /// and a name when the release has none better.
 fn finish(ctx: &StepCtx<'_>, source: i64, listing: Listing, limits: &ArchiveConfig) -> Result<Outcome, StepError> {
+    finish_with_override(ctx, source, listing, None, true, limits)
+}
+
+fn finish_with_override(
+    ctx: &StepCtx<'_>,
+    source: i64,
+    listing: Listing,
+    password_override: Option<super::Password>,
+    persist_raw: bool,
+    limits: &ArchiveConfig,
+) -> Result<Outcome, StepError> {
     let release = ctx.release();
     let id = release.id;
     let mut writes = Vec::new();
     let rows = collapse_volumes(&listing.files);
+    let pw = password_override.unwrap_or_else(|| listing.password());
+    if persist_raw {
+        let check_bytes = listing.password_check.map(|c| c.to_bytes());
+        crate::raw_store::put_archive(&crate::raw_store::ArchiveRecord {
+            name: &release.name,
+            group_name: &release.group,
+            source,
+            files: &rows,
+            password: (source != SOURCE_PAR2).then(|| pw.code()),
+            encryption: listing.encryption.map(super::Encryption::code),
+            names_hidden: listing.headers_encrypted,
+            password_check: check_bytes.as_deref(),
+            parts: release.parts,
+            complete: release.complete,
+        });
+    }
     let old: i64 = ctx
         .conn()
         .prepare_cached(archive_store::BYTES_OF_SOURCE)
@@ -138,13 +165,13 @@ fn finish(ctx: &StepCtx<'_>, source: i64, listing: Listing, limits: &ArchiveConf
         });
     }
     if source != SOURCE_PAR2 {
-        writes.push(StepWrite::new(archive_store::UPSERT_RELEASE, vec![id.into(), listing.password().code().into()]));
-        if let Some(encryption) = listing.encryption {
+        writes.push(StepWrite::new(archive_store::UPSERT_RELEASE, vec![id.into(), pw.code().into()]));
+        if listing.encryption.is_some() || listing.headers_encrypted || listing.password_check.is_some() {
             writes.push(StepWrite::new(
                 archive_store::SET_ENCRYPTION,
                 vec![
                     id.into(),
-                    encryption.code().into(),
+                    listing.encryption.map(super::Encryption::code).into(),
                     i64::from(listing.headers_encrypted).into(),
                     listing.password_check.map(|check| check.to_bytes()).into(),
                 ],
@@ -164,12 +191,42 @@ fn finish(ctx: &StepCtx<'_>, source: i64, listing: Listing, limits: &ArchiveConf
         .map(|n| NameChange { display_name: Some(n), obfuscated: Some(release.is_obfuscated), source: name_source });
 
     Ok(Outcome {
-        matched: stored || listing.password() == super::Password::Yes,
+        matched: stored || pw == super::Password::Yes,
         writes,
         name,
         rerun: if stored { RERUN_ON_INNER_FILES } else { 0 },
         ..Default::default()
     })
+}
+
+fn restore_archive(
+    ctx: &StepCtx<'_>,
+    saved: crate::raw_store::SavedArchive,
+    limits: &ArchiveConfig,
+) -> Result<Outcome, StepError> {
+    let source = saved.files.first().map(|f| f.source).unwrap_or_else(|| {
+        match saved.encryption.and_then(super::Encryption::from_code) {
+            Some(super::Encryption::SevenZipAes256) => SOURCE_7Z,
+            Some(super::Encryption::ZipCrypto | super::Encryption::ZipAes) => SOURCE_ZIP,
+            _ => SOURCE_RAR,
+        }
+    });
+    let files: Vec<InnerFile> = saved.files.into_iter().map(|f| InnerFile { name: f.name, size: f.size }).collect();
+    let password_override = saved.password.and_then(super::Password::from_code);
+    let encrypted =
+        password_override == Some(super::Password::Yes) || saved.encryption.is_some() || saved.names_hidden;
+    let complete = password_override == Some(super::Password::No) || !files.is_empty();
+    let listing = Listing {
+        files,
+        encrypted,
+        headers_encrypted: saved.names_hidden,
+        encryption: saved.encryption.and_then(super::Encryption::from_code),
+        password_check: saved.password_check.as_deref().and_then(super::PasswordTest::from_bytes),
+        complete,
+        damaged: false,
+        need_more_tail: false,
+    };
+    finish_with_override(ctx, source, listing, password_override, false, limits)
 }
 
 macro_rules! limits_from_enabled {
@@ -212,6 +269,23 @@ impl Step for Par2Step {
     fn run(&self, ctx: &mut StepCtx<'_>) -> Result<Outcome, StepError> {
         let files = ctx.files().map_err(retry)?;
         let Some(file) = select::par2_source(&files) else { return Ok(Outcome::default()) };
+        let saved_par2 = crate::raw_store::get_archive_files(
+            &ctx.release().name,
+            &ctx.release().group,
+            SOURCE_PAR2,
+        );
+        if !saved_par2.is_empty() {
+            let limits = self.limits.lock().unwrap().clone();
+            let restored = saved_par2.into_iter().map(|f| InnerFile { name: f.name, size: f.size }).collect();
+            return finish_with_override(
+                ctx,
+                SOURCE_PAR2,
+                Listing { files: restored, complete: true, ..Default::default() },
+                None,
+                false,
+                &limits,
+            );
+        }
         let is_base = select::classify(&file.filename) == Kind::Par2Base;
         let Some(seg) = first_article(ctx, file)? else { return Ok(Outcome::default()) };
         let Some(mut body) = fetch_one(ctx, &seg, &file.filename)? else { return Ok(Outcome::default()) };
@@ -387,6 +461,24 @@ impl Step for ListStep {
     fn run(&self, ctx: &mut StepCtx<'_>) -> Result<Outcome, StepError> {
         let limits = self.limits.lock().unwrap().clone();
         let files = ctx.files().map_err(retry)?;
+        let rel = ctx.release();
+        if let Some(saved) = crate::raw_store::get_archive(&rel.name, &rel.group, rel.parts, rel.complete) {
+            return restore_archive(ctx, saved, &limits);
+        }
+        if select::par2_source(&files).is_none() {
+            let saved_par2 = crate::raw_store::get_archive_files(&rel.name, &rel.group, SOURCE_PAR2);
+            if !saved_par2.is_empty() {
+                let restored = saved_par2.into_iter().map(|f| InnerFile { name: f.name, size: f.size }).collect();
+                return finish_with_override(
+                    ctx,
+                    SOURCE_PAR2,
+                    Listing { files: restored, complete: true, ..Default::default() },
+                    None,
+                    false,
+                    &limits,
+                );
+            }
+        }
         let mut left = limits.max_bodies_per_release.max(0) as usize;
         let gap = Duration::from_secs(60) / limits.probes_per_minute.max(1) as u32;
         for head in select::plan(&files, limits.probe_files.max(0) as usize) {
@@ -439,6 +531,10 @@ impl Step for ListStep {
                 Format::Image => return Ok(Outcome::default()),
                 Format::Media | Format::Unknown => continue,
             }
+        }
+        let rel = ctx.release();
+        if let Some(saved) = crate::raw_store::get_archive(&rel.name, &rel.group, 0, false) {
+            return restore_archive(ctx, saved, &limits);
         }
         Ok(Outcome::default())
     }

@@ -349,7 +349,9 @@ pub fn create_db_at(path: &Path) -> anyhow::Result<()> {
     // new install, whatever shards are there
     let used = has_progress(&conn)?;
     store::create_main(&conn)?;
-    create_shards(path, used)
+    create_shards(path, used)?;
+    crate::raw_store::restore_backfill_deepest(path, &conn);
+    Ok(())
 }
 
 /// Refuses shards with something in them when their main database `main`
