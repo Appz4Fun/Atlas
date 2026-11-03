@@ -209,6 +209,8 @@ td.dim { color: var(--muted); font-size: .82rem; }
 .title-details h2 { margin-top: 0; }
 .poster { flex: none; width: 171px; height: 256px; object-fit: cover; background: var(--sunken); border-radius: var(--radius-sm); }
 .poster:not([src]) { display: none; }
+.cover-panel { display: flex; justify-content: flex-start; }
+.cover { display: block; max-width: 100%; max-height: 360px; width: auto; height: auto; background: var(--sunken); border-radius: var(--radius-sm); }
 .backdrop { display: block; width: 100%; max-height: 240px; margin-bottom: 14px; object-fit: cover; background: var(--sunken); border-radius: var(--radius); }
 
 .copies { display: flex; flex-direction: column; gap: 10px; }
@@ -291,7 +293,7 @@ tr.drawer-row code.key, .drawer-card code.key { background: var(--surface); }
   .navigation nav { max-height: 50vh; padding: 0 6px 6px; overflow-y: auto; }
   main { padding: 14px 16px 24px; }
   .search-field kbd { display: none; }
-  .col-cat, .col-size, .col-posted { display: none; }
+  .col-cat, .col-size, .col-posted, .col-state { display: none; }
   .row-meta { display: block; }
   th, td { padding: 10px; }
   .title-details { flex-direction: column; }

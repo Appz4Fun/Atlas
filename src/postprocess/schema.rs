@@ -86,6 +86,7 @@ pub const SHARD_TABLES: &[&ShardTable] = &[
     &crate::archive::link::UPLOAD_LINK,
     &crate::archive::link::UPLOAD_LINK_TRIED,
     &crate::probe::PROBE,
+    &crate::probe::COVER,
     &crate::probe::opensubtitles::OPENSUBTITLES,
     &crate::probe::stills::STILLS,
     &crate::predb::step::MATCH,
