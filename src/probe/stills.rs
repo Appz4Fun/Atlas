@@ -376,7 +376,8 @@ impl Step for StillsStep {
         }
         let rel_name = ctx.release().name.clone();
         let rel_group = ctx.release().group.clone();
-        let saved_stills = crate::raw_store::get_stills(&rel_name, &rel_group);
+        let content_id = crate::raw_store::release_content_id(ctx.conn(), release_id).unwrap_or_default();
+        let saved_stills = crate::raw_store::get_stills(&rel_name, &rel_group, &content_id);
         if saved_stills.len() == POSITIONS.len()
             && saved_stills.iter().all(|s| s.phash.is_some() && still_file(&s.sha256).is_some_and(|f| f.exists()))
         {
@@ -458,7 +459,7 @@ impl Step for StillsStep {
             ));
         }
         if !raw_saved.is_empty() {
-            crate::raw_store::put_stills(&rel_name, &rel_group, &raw_saved);
+            crate::raw_store::put_stills(&rel_name, &rel_group, &content_id, &raw_saved);
         }
         Ok(Outcome { matched: made > 0, writes, ..Outcome::default() })
     }

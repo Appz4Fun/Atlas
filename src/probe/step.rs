@@ -108,7 +108,10 @@ impl Step for ProbeStep {
         let rel_parts = ctx.release().parts;
         let rel_complete = ctx.release().complete;
         let stamp = self.config_stamp();
-        if let Some(saved) = crate::raw_store::get_probe(&rel_name, &rel_group, rel_parts, rel_complete, stamp) {
+        let content_id = crate::raw_store::release_content_id(ctx.conn(), release_id).unwrap_or_default();
+        if let Some(saved) =
+            crate::raw_store::get_probe(&rel_name, &rel_group, &content_id, rel_parts, rel_complete, stamp)
+        {
             let mut writes = Vec::new();
             if let Some(pw) = saved.nfo_password {
                 writes.push(StepWrite::new(archive::store::SET_NFO_PASSWORD, vec![release_id.into(), pw.into()]));
@@ -241,6 +244,7 @@ impl Step for ProbeStep {
         crate::raw_store::put_probe(&crate::raw_store::ProbeRecord {
             name: &rel_name,
             group_name: &rel_group,
+            content_id: &content_id,
             crc32: crc,
             agent: agent.as_deref(),
             info: &json,
