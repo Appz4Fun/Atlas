@@ -192,8 +192,6 @@ const MAX_BATCH: usize = 8;
 pub struct Db {
     conn: Arc<Mutex<Connection>>,
     saves: Vec<std::sync::mpsc::Sender<WriterJob>>,
-    /// slices being named at once, over every pass (see `name_releases`)
-    naming: Arc<tokio::sync::Semaphore>,
     /// last field: dropping the final clone closes the queues above, then waits
     /// for the writer threads to finish what they were doing
     _writers: Arc<Writers>,
@@ -212,8 +210,6 @@ impl Drop for Writers {
 
 struct SaveJob {
     releases: Vec<Release>,
-    /// `(name, group, display name)` of releases saved before
-    names: Vec<crate::store::FoundName>,
     done: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
 }
 
@@ -256,12 +252,7 @@ fn shared_db_idling(conn: Connection, every: Duration) -> Db {
             (saves, handle)
         })
         .unzip();
-    Db {
-        conn: Arc::new(Mutex::new(conn)),
-        saves,
-        naming: Arc::new(tokio::sync::Semaphore::new(NAMING_SLICES)),
-        _writers: Arc::new(Writers(writers)),
-    }
+    Db { conn: Arc::new(Mutex::new(conn)), saves, _writers: Arc::new(Writers(writers)) }
 }
 
 /// A shard's writer: saves what comes in, and between saves (or after
@@ -333,19 +324,11 @@ fn writer(
 
         let t = std::time::Instant::now();
         let span = crate::metrics::span("db.save_batch");
-        let (result, named) = match &mut opened {
+        let result = match &mut opened {
             Ok(conn) => {
-                let saved = store.save(conn, ids, batch.iter().map(|job| job.releases.as_slice()));
-                // names of releases saved before, in their own transaction: a
-                // failure there isnt the slices'
-                let names: Vec<_> = batch.iter().flat_map(|job| job.names.iter().cloned()).collect();
-                let named = if names.is_empty() { Ok(()) } else { store.set_names(conn, &names) };
-                (saved.map_err(|e| e.to_string()), named.map_err(|e| e.to_string()))
+                store.save(conn, ids, batch.iter().map(|job| job.releases.as_slice())).map_err(|e| e.to_string())
             }
-            Err(e) => {
-                let e = format!("couldnt open {}: {e}", path.display());
-                (Err(e.clone()), Err(e))
-            }
+            Err(e) => Err(format!("couldnt open {}: {e}", path.display())),
         };
         if result.is_err() {
             span.failed();
@@ -359,7 +342,7 @@ fn writer(
         // the save is committed by now: the slices dont wait for the housekeeping
         let saved = result.is_ok();
         for job in batch {
-            let _ = job.done.send(if job.names.is_empty() { result.clone() } else { named.clone() });
+            let _ = job.done.send(result.clone());
         }
         run_stage_jobs(&mut opened, path, &mut stage, Some(STAGE_BUDGET_BUSY));
 
@@ -481,80 +464,14 @@ impl Db {
     async fn save(&self, releases: Vec<Release>) -> Result<()> {
         // a slice is one group, soo one shard
         let Some(shard) = releases.first().map(|r| crate::store::shard_of(&r.group)) else { return Ok(()) };
-        self.send(shard, releases, Vec::new()).await
-    }
-
-    async fn send(&self, shard: usize, releases: Vec<Release>, names: Vec<crate::store::FoundName>) -> Result<()> {
         let (done, saved) = tokio::sync::oneshot::channel();
         crate::profile::LOAD.writer_queued.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if self.saves[shard].send(WriterJob::Save(SaveJob { releases, names, done })).is_err() {
+        if self.saves[shard].send(WriterJob::Save(SaveJob { releases, done })).is_err() {
             crate::profile::LOAD.writer_queued.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             return Err(anyhow!("db writer stopped"));
         }
         saved.await.map_err(|_| anyhow!("db writer stopped"))?.map_err(|e| anyhow!("saving releases: {e}"))
     }
-}
-
-/// slices whose releases are being named at once at most, over every pass
-const NAMING_SLICES: usize = 256;
-/// slices of one pass waiting on their names at most: past it the pass
-/// waits before it saves another, soo slow bodies dont pile up name lookups
-const PASS_NAMING: usize = crate::nntp::STREAM_SLICES;
-
-/// What a pass's name lookup came to: its slice, and whether the names were
-/// saved (see `name_releases`).
-type Named = std::result::Result<(u64, u64, Result<()>), tokio::task::JoinError>;
-
-/// Take a finished name lookup into its pass: names that couldnt be saved
-/// mean their slice isnt done, soo the cursor stays before it and the names
-/// are looked up again.
-fn settle_names(named: Named, finished: &mut Finished, done: &mut usize, error: &mut Option<anyhow::Error>) {
-    match named {
-        Ok((_, _, Ok(()))) => {}
-        Ok((start, end, Err(e))) => {
-            if finished.remove(start, end) {
-                *done -= 1;
-            }
-            error.get_or_insert(e);
-        }
-        // which slice it was is lost with it: the cursor moves past none
-        Err(e) => {
-            *finished = Finished::default();
-            error.get_or_insert(anyhow!("naming task failed: {e}"));
-        }
-    }
-}
-
-/// Releases of a slice, as their name and collection, and the bodies that may name them (see `name_sources`).
-type NameJobs = Vec<((String, Option<String>), Vec<(String, Extract)>)>;
-
-/// Look up real names for releases of `group` that are saved already, and
-/// save the ones found. A pass runs these alongside its next slices and waits
-/// for them before its cursor moves: one cut short (stopping) or whose names
-/// couldnt be saved is redone with its slice. A body that names nothing is
-/// no failure.
-async fn name_releases(
-    pool: Arc<Pool>,
-    db: Db,
-    group: String,
-    jobs: NameJobs,
-    _permit: tokio::sync::OwnedSemaphorePermit,
-) -> Result<()> {
-    let t = Instant::now();
-    let (releases, sources): (Vec<_>, Vec<_>) = jobs.into_iter().unzip();
-    let found = first_names(pool, sources).await;
-    crate::profile::NAMES.add_since(t);
-    let names: Vec<_> = releases
-        .into_iter()
-        .zip(found)
-        .filter_map(|((name, collection), found)| {
-            Some(crate::store::FoundName { name, collection, group: group.clone(), display: found? })
-        })
-        .collect();
-    if names.is_empty() {
-        return Ok(());
-    }
-    db.send(crate::store::shard_of(&group), Vec::new(), names).await.map_err(|e| anyhow!("saving names: {e}"))
 }
 
 async fn on_db<T: Send + 'static>(db: &Db, f: impl FnOnce(&mut Connection) -> Result<T> + Send + 'static) -> Result<T> {
@@ -1729,15 +1646,10 @@ impl Pass<'_> {
         let mut error: Option<anyhow::Error> = None;
         // a failed save stops the saving, a failed fetch only stops the fetching
         let mut save_failed = false;
-        // name lookups of the slices saved so far (see `name_releases`)
-        let mut naming = tokio::task::JoinSet::new();
         // dated ends of what this pass saved, for the stats dashboard's history numbers
         let (mut low, mut high): (Option<db::Dated>, Option<db::Dated>) = (None, None);
 
         while let Some(slice) = rx.recv().await {
-            while let Some(named) = naming.try_join_next() {
-                settle_names(named, &mut finished, &mut done, &mut error);
-            }
             // the slice's room in the unsaved budget goes back once it's parsed
             // (or skipped)
             let unsaved = slice.unsaved;
@@ -1773,20 +1685,8 @@ impl Pass<'_> {
                     .count() as i64;
             }
             let dated = slice_date(&headers);
-            match save_slice(self.db, group, headers, unsaved).await {
-                Ok((p, names)) => {
-                    if !names.is_empty() {
-                        while naming.len() >= PASS_NAMING
-                            && let Some(named) = naming.join_next().await
-                        {
-                            settle_names(named, &mut finished, &mut done, &mut error);
-                        }
-                        let permit = self.db.naming.clone().acquire_owned().await.expect("naming semaphore closed");
-                        let naming_done =
-                            name_releases(pool.clone(), self.db.clone(), group.to_string(), names, permit);
-                        let (start, end) = (slice.start, slice.end);
-                        naming.spawn(async move { (start, end, naming_done.await) });
-                    }
+            match save_slice(pool, self.db, group, headers, unsaved).await {
+                Ok(p) => {
                     if let Some(d) = dated {
                         low = low.filter(|l| l.0 <= d.0).or(Some(d));
                         high = high.filter(|h| h.0 >= d.0).or(Some(d));
@@ -1801,13 +1701,6 @@ impl Pass<'_> {
                     error.get_or_insert(e);
                 }
             }
-        }
-
-        // the names of what this pass saved are in before its cursor moves;
-        // dropping the pass (stopping) drops them too, and they are redone
-        // with their slices
-        while let Some(named) = naming.join_next().await {
-            settle_names(named, &mut finished, &mut done, &mut error);
         }
 
         if let (Some(low), Some(high)) = (low, high) {
@@ -1874,13 +1767,6 @@ impl Finished {
         self.0.push((start, end));
     }
 
-    /// not done after all; false when it wasnt
-    fn remove(&mut self, start: u64, end: u64) -> bool {
-        let before = self.0.len();
-        self.0.retain(|&s| s != (start, end));
-        self.0.len() != before
-    }
-
     /// How far `start..=end` is done from each end: the last number of the
     /// done run starting at `start`, the first of the one ending at `end`.
     fn ends(&self, start: u64, end: u64) -> (Option<u64>, Option<u64>) {
@@ -1933,21 +1819,21 @@ fn slice_date(headers: &[Overview]) -> Option<db::Dated> {
 }
 
 /// Parse one slice into releases, look up real names, save.
-/// `unsaved` is the slice's room in the unsaved budget: it goes back once the
-/// slice is saved, before its names are looked up, soo slow name lookups dont
-/// hold the budget but releases waiting on the writer still count in it.
+/// `unsaved` is the slice's room in the unsaved budget: the parsed releases
+/// stand for its headers until they are committed, soo it goes back only then.
 async fn save_slice(
+    pool: &Arc<Pool>,
     db: &Db,
     group: &str,
     headers: Vec<Overview>,
     unsaved: crate::nntp::Unsaved,
-) -> Result<(Progress, NameJobs)> {
+) -> Result<Progress> {
     let articles = headers.len() as i64;
     if crate::filters::group_blocked(group) {
-        return Ok((Progress { articles, ..Progress::default() }, Vec::new()));
+        return Ok(Progress { articles, ..Progress::default() });
     }
     let span = crate::metrics::span("indexer.save_slice");
-    let saved = parse_and_save(db, group, headers, unsaved).await;
+    let saved = parse_and_save(pool, db, group, headers, unsaved).await;
     if saved.is_err() {
         span.failed();
     }
@@ -1955,11 +1841,12 @@ async fn save_slice(
 }
 
 async fn parse_and_save(
+    pool: &Arc<Pool>,
     db: &Db,
     group: &str,
     headers: Vec<Overview>,
     unsaved: crate::nntp::Unsaved,
-) -> Result<(Progress, NameJobs)> {
+) -> Result<Progress> {
     let articles = headers.len() as i64;
     crate::profile::SLICES.add(1);
     crate::profile::HEADERS.add(articles as u64);
@@ -1982,21 +1869,21 @@ async fn parse_and_save(
     crate::profile::PARSE.add_since(t);
     crate::profile::Load::add_since(&crate::profile::LOAD.parse_ns, t);
 
-    // real names from par2/nfo bodies come after the save, alongside the
-    // pass's next slices: a slow body doesnt hold up the pass. Once the
-    // naming stage has a body budget it reads them, not the save path.
-    let names: Vec<_> = if crate::archive::inline_lookups() {
-        releases
-            .iter()
-            .map(|r| ((r.name.clone(), r.collection.clone()), name_sources(r)))
-            .filter(|(_, sources)| !sources.is_empty())
-            .collect()
+    // real names from par2/nfo bodies, every release looked up concurrently,
+    // a few first segments each (see `name_sources`)
+    let t = std::time::Instant::now();
+    // once the stage has a body budget it reads them, not the save path
+    let names = if crate::archive::inline_lookups() {
+        let _span = crate::metrics::span("indexer.first_names");
+        first_names(pool.clone(), releases.iter().map(name_sources).collect()).await
     } else {
         Vec::new()
     };
+    crate::profile::NAMES.add_since(t);
 
     let mut bytes = 0;
-    for release in releases.iter_mut() {
+    for (i, release) in releases.iter_mut().enumerate() {
+        release.display_name = names.get(i).cloned().flatten();
         release.complete = is_complete(&release.articles);
         release.group = group.to_string();
         release.poster = release.articles[0].author.clone();
@@ -2018,7 +1905,7 @@ async fn parse_and_save(
     // slices waiting on a slow writer stay inside `max_unsaved_headers`
     drop(unsaved);
 
-    Ok((Progress { articles, bytes, releases: count, skipped }, names))
+    Ok(Progress { articles, bytes, releases: count, skipped })
 }
 
 /// bodies a release's name lookup tries at most
@@ -2210,10 +2097,6 @@ mod tests {
         assert_eq!(f.ends(1, 40), (Some(10), Some(21)), "11-20 missing");
         f.add(11, 20);
         assert_eq!(f.ends(1, 40), (Some(40), Some(1)));
-        // a slice whose names couldnt be saved isnt done after all
-        assert!(f.remove(21, 30));
-        assert!(!f.remove(21, 30));
-        assert_eq!(f.ends(1, 40), (Some(20), Some(31)));
         let mut top = Finished::default();
         top.add(u64::MAX - 9, u64::MAX);
         assert_eq!(top.ends(0, u64::MAX), (None, Some(u64::MAX - 9)));
@@ -2507,9 +2390,7 @@ mod tests {
         drop(gone);
         crate::profile::LOAD.writer_queued.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let shard = crate::store::shard_of("alt.binaries.t");
-        shared.saves[shard]
-            .send(WriterJob::Save(SaveJob { releases: vec![release("dropped")], names: Vec::new(), done }))
-            .unwrap();
+        shared.saves[shard].send(WriterJob::Save(SaveJob { releases: vec![release("dropped")], done })).unwrap();
         let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
         rt.block_on(shared.save(vec![release("kept")])).unwrap();
         drop(shared);

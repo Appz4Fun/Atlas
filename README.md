@@ -955,7 +955,6 @@ CI (`.github/workflows/ci.yml`) checks formatting, runs clippy, and runs the tes
 - A pack merges only when each file's `[n/m]` equals its own number, so a pack with an nfo first stays by file.
 - Album tracks named with the track number first stay by file.
 - Deobfuscation works only when a release has a usable name in a par2 file, an nfo file, or the first article of an archive. A 7z or a ZIP needs its last article too.
-- With the naming stage off, names from par2 and nfo files are looked up in the background after a release is saved, so a new release can show its posted name for a moment first.
 - Searches by ID need a provider, or a body budget for a movie's IMDb ID. A title no provider knows has no IDs.
 
 ## Credits
