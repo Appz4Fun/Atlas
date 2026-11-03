@@ -273,7 +273,8 @@ fn row_order(
 ) -> std::cmp::Ordering {
     let flip = |o: std::cmp::Ordering| if descending { o.reverse() } else { o };
     match by {
-        SortBy::Name => flip(a.name.to_lowercase().cmp(&b.name.to_lowercase())),
+        // as SQLite's lower(), which only knows ASCII: a sort over a whole category picks its rows that way
+        SortBy::Name => flip(a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase())),
         SortBy::Category => {
             let of =
                 |r: &ReleaseRow| label(categories.get(&r.id).copied().unwrap_or(UNCATEGORIZED)).unwrap_or_default();

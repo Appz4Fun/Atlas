@@ -34,6 +34,22 @@ impl Column {
         }
     }
 
+    /// Rows with a value, as SQL that walks the index: an empty posted date is none, as the page counts it.
+    fn valued(self) -> String {
+        match self {
+            Column::Posted => "r.posted_date > ''".into(),
+            _ => format!("{} is not null", self.expr()),
+        }
+    }
+
+    /// Rows with no value, as SQL that walks the index.
+    fn unvalued(self) -> String {
+        match self {
+            Column::Posted => "(r.posted_date is null or r.posted_date = '')".into(),
+            _ => format!("{} is null", self.expr()),
+        }
+    }
+
     fn index(self) -> &'static str {
         match self {
             Column::Size => SIZE_INDEX,
@@ -112,7 +128,8 @@ fn compare(a: &ReleaseRow, b: &ReleaseRow, by: Column, descending: bool) -> Orde
             b.posted_date.as_deref().filter(|d| !d.is_empty()),
             descending,
         ),
-        Column::Name => last_if_none(Some(a.name.to_lowercase()), Some(b.name.to_lowercase()), descending),
+        // as SQLite's lower(), which only knows ASCII, soo the order is the one the database picked the rows in
+        Column::Name => last_if_none(Some(a.name.to_ascii_lowercase()), Some(b.name.to_ascii_lowercase()), descending),
         Column::Group | Column::Category => last_if_none(Some(&a.group_name), Some(&b.group_name), descending),
     };
     by_value.then(b.id.cmp(&a.id))
@@ -191,10 +208,10 @@ fn read_all(
             format!("(c.category in ({}) or c.release_id is null)", list(&f.leaves)),
         ),
     };
-    let (expr, order) = (by.expr(), if descending { "desc" } else { "asc" });
+    let (expr, order, unvalued) = (by.expr(), if descending { "desc" } else { "asc" }, by.unvalued());
     let sql = format!(
         "select {COLUMNS} from {from} where {VISIBLE_RELEASE} and {clause}
-         order by ({expr} is null), {expr} {order}, r.id desc limit ?1"
+         order by {unvalued}, {expr} {order}, r.id desc limit ?1"
     );
     conn.prepare(&sql)?.query_map([want], release_row)?.collect()
 }
@@ -211,10 +228,14 @@ fn walk(
     budget: Option<i64>,
 ) -> Result<Option<Vec<ReleaseRow>>> {
     let (expr, index, order) = (by.expr(), by.index(), if descending { "desc" } else { "asc" });
-    let valued =
-        format!("select r.id from s{s}.releases r indexed by {index} where {expr} is not null order by {expr} {order}");
+    // the newest first among equals, before the walk stops: going up the index they come oldest first, and SQLite
+    // sorts each run of equals by itself as the walk reaches it
+    let valued = format!(
+        "select r.id from s{s}.releases r indexed by {index} where {} order by {expr} {order}, r.id desc",
+        by.valued()
+    );
     let unvalued =
-        format!("select r.id from s{s}.releases r indexed by {index} where {expr} is null order by r.id desc");
+        format!("select r.id from s{s}.releases r indexed by {index} where {} order by r.id desc", by.unvalued());
     let mut category = conn.prepare(&format!("select category from s{s}.release_category where release_id = ?1"))?;
     let mut probe = conn.prepare(&probe_sql(s))?;
     let want = usize::try_from(want).unwrap_or(usize::MAX);
@@ -248,6 +269,9 @@ fn walk(
     Ok(Some(rows))
 }
 
+/// A category read as far back as it goes: a sort over all of it can't stop at its newest releases.
+const WHOLE: Bounds = Bounds { rejects: usize::MAX, no_row: i64::MAX, ..Bounds::DEFAULT };
+
 /// By category name, as the page writes it: a category at a time in that order, newest first within each.
 fn by_category(conn: &Connection, filter: Option<&CatFilter>, descending: bool, want: i64) -> Result<Vec<ReleaseRow>> {
     let (leaves, uncategorized) = match filter {
@@ -271,7 +295,7 @@ fn by_category(conn: &Connection, filter: Option<&CatFilter>, descending: bool, 
         if left <= 0 {
             break;
         }
-        rows.extend(newest_in_categories_with(conn, &part, 0, left, &Bounds::DEFAULT)?.rows);
+        rows.extend(newest_in_categories_with(conn, &part, 0, left, &WHOLE)?.rows);
     }
     Ok(rows)
 }
@@ -460,6 +484,27 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_date_is_no_date_and_equals_are_newest_first_both_ways() {
+        let f = fixture();
+        let groups = groups();
+        let group = &groups[0];
+        let empty: Vec<i64> = (0..4).map(|i| f.add(&format!("Empty.{i}"), group, Some(1), "", Some(UHD))).collect();
+        let dated = f.add("Dated", group, Some(1), "2020-01-01", Some(UHD));
+        let uhd = crate::category::parse_filter(&UHD.to_string()).unwrap();
+        for (limits, indexed) in [(READ_ALL, false), (WALK, true)] {
+            if indexed {
+                f.index_all();
+            }
+            assert_eq!(f.top(Some(&uhd), Column::Posted, false, 2, limits), [dated, empty[3]], "indexed {indexed}");
+            // five in one group: the newest of them, whichever way
+            for descending in [false, true] {
+                let top = f.top(Some(&uhd), Column::Group, descending, 2, limits);
+                assert_eq!(top, [dated, empty[3]], "indexed {indexed}, descending {descending}");
+            }
+        }
+    }
+
+    #[test]
     fn by_category_goes_a_category_at_a_time_in_name_order() {
         let f = fixture();
         let (_, newer) = library(&f);
@@ -497,13 +542,27 @@ mod tests {
         for by in [Column::Size, Column::Posted, Column::Name, Column::Group] {
             for order in ["asc", "desc"] {
                 let (expr, index) = (by.expr(), by.index());
-                let sql = format!(
-                    "explain query plan select r.id from s0.releases r indexed by {index} where {expr} is not null order by {expr} {order}"
-                );
-                let plan: Vec<String> =
-                    conn.prepare(&sql).unwrap().query_map([], |r| r.get(3)).unwrap().map(Result::unwrap).collect();
-                let plan = plan.join(" / ");
-                assert!(plan.contains(index) && !plan.contains("TEMP B-TREE"), "{by:?} {order}: {plan}");
+                let (valued, unvalued) = (by.valued(), by.unvalued());
+                let plan = |sql: String| {
+                    let rows: Vec<String> = conn
+                        .prepare(&format!("explain query plan {sql}"))
+                        .unwrap()
+                        .query_map([], |r| r.get(3))
+                        .unwrap()
+                        .map(Result::unwrap)
+                        .collect();
+                    rows.join(" / ")
+                };
+                let walk = plan(format!(
+                    "select r.id from s0.releases r indexed by {index} where {valued} order by {expr} {order}, r.id desc"
+                ));
+                // runs of equals sorted as they come, never the whole index first
+                assert!(walk.contains(&format!("COVERING INDEX {index}")), "{by:?} {order}: {walk}");
+                assert!(!walk.contains("TEMP B-TREE FOR ORDER BY"), "{by:?} {order}: {walk}");
+                let rest = plan(format!(
+                    "select r.id from s0.releases r indexed by {index} where {unvalued} order by r.id desc"
+                ));
+                assert!(rest.contains(index), "{by:?}: {rest}");
             }
         }
     }
