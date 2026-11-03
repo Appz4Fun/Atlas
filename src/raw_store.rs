@@ -1776,6 +1776,10 @@ fn prune_archive_inner_files(
         };
         conn.prepare_cached("DELETE FROM raw_archive_inner_files WHERE release_name = ?1 AND group_name = ?2")?
             .execute(params![&v_name, &v_group])?;
+        conn.prepare_cached(
+            "DELETE FROM raw_archives WHERE name = ?1 AND group_name = ?2 AND coalesce(names_hidden, 0) = 0",
+        )?
+        .execute(params![&v_name, &v_group])?;
         conn.prepare_cached("UPDATE raw_archives SET listing_complete = 0 WHERE name = ?1 AND group_name = ?2")?
             .execute(params![&v_name, &v_group])?;
     }
@@ -2015,24 +2019,38 @@ fn harvest_attached_release_tables(tx: &rusqlite::Transaction<'_>, schema: &str)
     }
     if has_inner {
         let select_inner_sql = format!(
-            "SELECT r_name, group_name, seq, cid, f_name, size, source
+            "SELECT r_id, r_name, group_name, seq, cid, f_name, size, source
              FROM (
-                 SELECT r.name AS r_name, r.group_name AS group_name, f.seq AS seq,
-                        CASE WHEN (CASE WHEN coalesce(f.source, 2) = 1 THEN ({par2_verified} OR {list_verified}) ELSE {list_verified} END)
-                             THEN hcid.content_id ELSE NULL END AS cid,
-                        f.name AS f_name, f.size AS size, f.source AS source,
-                        SUM(length(cast(f.name as blob)) + 32) OVER (ORDER BY r.id DESC RANGE UNBOUNDED PRECEDING) AS cum_bytes
-                 FROM {schema}.archive_inner_files f
-                 JOIN {schema}.releases r ON r.id = f.release_id
-                 LEFT JOIN temp.harvest_content_ids hcid ON hcid.release_id = r.id
-                 WHERE r.name IS NOT NULL AND r.group_name IS NOT NULL
-                   AND length(cast(f.name as blob)) <= 4096
-                 ORDER BY r.id DESC, f.seq ASC LIMIT {MAX_RAW_ARCHIVES_ROWS}
+                 SELECT r_id, r_name, group_name, seq, cid, f_name, size, source,
+                        SUM(length(cast(f_name as blob)) + 32) OVER (ORDER BY r_id DESC RANGE UNBOUNDED PRECEDING) AS cum_bytes,
+                        COUNT(*) OVER (ORDER BY r_id DESC RANGE UNBOUNDED PRECEDING) AS cum_rows
+                 FROM (
+                     SELECT r.id AS r_id, r.name AS r_name, r.group_name AS group_name, f.seq AS seq,
+                            CASE WHEN (CASE WHEN coalesce(f.source, 2) = 1 THEN ({par2_verified} OR {list_verified}) ELSE {list_verified} END)
+                                 THEN hcid.content_id ELSE NULL END AS cid,
+                            f.name AS f_name, f.size AS size, f.source AS source
+                     FROM {schema}.archive_inner_files f
+                     JOIN {schema}.releases r ON r.id = f.release_id
+                     LEFT JOIN temp.harvest_content_ids hcid ON hcid.release_id = r.id
+                     WHERE r.name IS NOT NULL AND r.group_name IS NOT NULL
+                       AND NOT EXISTS (
+                           SELECT 1 FROM {schema}.archive_inner_files f2
+                           WHERE f2.release_id = r.id AND length(cast(f2.name as blob)) > 4096
+                       )
+                     ORDER BY r.id DESC, f.seq ASC LIMIT ({MAX_RAW_ARCHIVES_ROWS} + 1)
+                 )
              )
-             WHERE cum_bytes <= {MAX_RAW_ARCHIVE_NAME_BYTES}"
+             WHERE cum_bytes <= {MAX_RAW_ARCHIVE_NAME_BYTES}
+               AND cum_rows <= {MAX_RAW_ARCHIVES_ROWS}
+             ORDER BY r_id DESC, seq ASC"
         );
         let mut stmt = tx.prepare(&select_inner_sql)?;
         let mut rows = stmt.query([])?;
+        let mut clear_source = tx.prepare_cached(
+            "DELETE FROM main.raw_archive_inner_files
+             WHERE release_name = ?1 AND group_name = ?2
+               AND coalesce(source, 2) = ?3",
+        )?;
         let mut upsert_inner = tx.prepare_cached(
             "INSERT INTO main.raw_archive_inner_files (release_name, group_name, seq, content_id, name, size, source)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
@@ -2048,14 +2066,29 @@ fn harvest_attached_release_tables(tx: &rusqlite::Transaction<'_>, schema: &str)
              FROM main.raw_archive_inner_files
              WHERE release_name = ?1 AND group_name = ?2 AND seq = ?3",
         )?;
+        let mut winner_rel_id: std::collections::HashMap<(String, String, i64), i64> =
+            std::collections::HashMap::new();
         while let Some(r) = rows.next()? {
-            let r_name: String = r.get(0)?;
-            let group_name: String = r.get(1)?;
-            let seq: i64 = r.get(2)?;
-            let cid: Option<Vec<u8>> = r.get(3)?;
-            let f_name: String = r.get(4)?;
-            let size: Option<i64> = r.get(5)?;
-            let source: Option<i64> = r.get(6)?;
+            let r_id: i64 = r.get(0)?;
+            let r_name: String = r.get(1)?;
+            let group_name: String = r.get(2)?;
+            let seq: i64 = r.get(3)?;
+            let cid: Option<Vec<u8>> = r.get(4)?;
+            let f_name: String = r.get(5)?;
+            let size: Option<i64> = r.get(6)?;
+            let source: Option<i64> = r.get(7)?;
+            let src_key = source.unwrap_or(2);
+            let key = (r_name.clone(), group_name.clone(), src_key);
+            match winner_rel_id.get(&key) {
+                Some(&win_id) if win_id != r_id => continue,
+                Some(_) => {}
+                None => {
+                    winner_rel_id.insert(key, r_id);
+                    if cid.is_some() {
+                        clear_source.execute(params![&r_name, &group_name, src_key])?;
+                    }
+                }
+            }
             let row_bytes = f_name.len() as i64 + 32;
             let existing_bytes: Option<i64> = check_existing_inner
                 .query_row(params![&r_name, &group_name, seq], |row| row.get(0))
@@ -2072,27 +2105,20 @@ fn harvest_attached_release_tables(tx: &rusqlite::Transaction<'_>, schema: &str)
             prune_archive_inner_files(tx, net_bytes, Some((&r_name, &group_name)))?;
             upsert_inner.execute(params![r_name, group_name, seq, cid, f_name, size, source])?;
         }
-        if has_table(tx, schema, "archive_release")? {
-            tx.execute_batch(&format!(
-                "UPDATE main.raw_archives
-                 SET listing_complete = 0
-                 WHERE listing_complete != 0
-                   AND EXISTS (
-                       SELECT 1 FROM {schema}.releases r
-                       JOIN {schema}.archive_inner_files f ON f.release_id = r.id
-                       WHERE r.name = main.raw_archives.name
-                         AND r.group_name = main.raw_archives.group_name
-                         AND coalesce(f.source, 2) != 1
-                         AND NOT EXISTS (
-                             SELECT 1 FROM main.raw_archive_inner_files rf
-                             WHERE rf.release_name = r.name
-                               AND rf.group_name = r.group_name
-                               AND rf.seq = f.seq
-                               AND rf.content_id IS NOT NULL
-                         )
-                   );"
-            ))?;
-        }
+        tx.execute_batch(
+            "DELETE FROM main.raw_archives
+             WHERE coalesce(names_hidden, 0) = 0
+               AND (
+                   content_id IS NULL
+                   OR NOT EXISTS (
+                       SELECT 1 FROM main.raw_archive_inner_files rf
+                       WHERE rf.release_name = main.raw_archives.name
+                         AND rf.group_name = main.raw_archives.group_name
+                         AND rf.content_id = main.raw_archives.content_id
+                         AND coalesce(rf.source, 2) != 1
+                   )
+               );",
+        )?;
     }
     if has_fp {
         tx.execute_batch(&format!(
@@ -2124,7 +2150,7 @@ fn harvest_attached_release_tables(tx: &rusqlite::Transaction<'_>, schema: &str)
         ))?;
     }
     if has_table(tx, schema, "release_nfo_password")? {
-        let nfo_mask = crate::postprocess::step::mask(crate::postprocess::step::StepId(3));
+        let nfo_mask = crate::postprocess::step::mask(crate::naming::NFO);
         let nfo_verified = format!("({probe_verified} OR {})", verified_step_sql(schema, nfo_mask, has_pp_state, has_pp_walks));
         tx.execute_batch(&format!(
             "INSERT INTO main.raw_nfo_passwords (name, group_name, content_id, password)
