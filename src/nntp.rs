@@ -3172,6 +3172,9 @@ pub fn decode_xzver_lines(lines: &[Vec<u8>]) -> Result<Vec<Overview>> {
     let mut inflater = Inflater::default();
     let mut inflated = Vec::new();
     inflater.feed(&compressed, &mut inflated)?;
+    if !inflater.finished() {
+        return Err(NntpError::Decompress("truncated XZVER deflate stream".into()));
+    }
     Ok(inflated
         .split(|&b| b == b'\n')
         .map(|mut l| {
@@ -3932,6 +3935,34 @@ mod tests {
         assert_eq!(overviews[0].bytes, 791_848);
         assert_eq!(overviews[1].number, 101);
         assert_eq!(overviews[1].bytes, 384_000);
+
+        // A non-final stored DEFLATE block (BFINAL=0, BTYPE=00) truncated before a final block must error
+        let row = b"100\tsubj 1\tfrom@test\t03 Nov 26 03:20:38 GMT\t<id1@test>\t\t791848\t0\r\n";
+        let len = row.len() as u16;
+        let nlen = !len;
+        let mut non_final_deflate = vec![0x00]; // BFINAL=0, BTYPE=00 (stored block)
+        non_final_deflate.extend_from_slice(&len.to_le_bytes());
+        non_final_deflate.extend_from_slice(&nlen.to_le_bytes());
+        non_final_deflate.extend_from_slice(row);
+        let mut truncated_yenc = Vec::new();
+        for &b in &non_final_deflate {
+            let shifted = b.wrapping_add(42);
+            if matches!(shifted, 0x00 | 0x0A | 0x0D | b'=' | b'.') {
+                truncated_yenc.push(b'=');
+                truncated_yenc.push(shifted.wrapping_add(64));
+            } else {
+                truncated_yenc.push(shifted);
+            }
+        }
+        let truncated_lines = vec![
+            format!("=ybegin line=128 size={} name=xzver", non_final_deflate.len()).into_bytes(),
+            truncated_yenc,
+            format!("=yend size={}", non_final_deflate.len()).into_bytes(),
+        ];
+        assert!(
+            matches!(decode_xzver_lines(&truncated_lines), Err(NntpError::Decompress(_))),
+            "truncated XZVER stream without BFINAL=1 must return NntpError::Decompress"
+        );
     }
 
     #[test]

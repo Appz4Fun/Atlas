@@ -721,13 +721,11 @@ fn mp4(data: &[u8]) -> MediaInfo {
     });
     info.header_complete = has_whole_moov(data);
 
-    if let Some(dv) = DolbyVisionInfo::parse_rpu(data) && let Some(v) = info.video.first_mut() {
-        if v.dv_profile.is_none() {
-            v.dv_profile = Some(dv.profile);
-            v.dv_level = dv.level;
-            v.dv_enhancement_layer = Some(dv.el_present);
-        }
-        v.dolby_vision = Some(dv);
+    if let Some(v) = info.video.first_mut()
+        && v.dolby_vision.as_ref().is_none_or(|d| !d.rpu_present || (d.profile == 7 && !d.fel))
+        && let Some(dv) = DolbyVisionInfo::parse_rpu(data)
+    {
+        apply_rpu_to_video_track(v, dv);
     }
 
     info
@@ -1036,15 +1034,14 @@ fn probe_block(
     if let Some(&(_, video_idx, nal_length_size)) =
         video_tracks.iter().find(|&&(num, _, _)| num == track_num)
     {
-        if video_rpu_found.get(video_idx).copied() == Some(false) {
-            let frames = skip_matroska_lace_header(flags, payload).unwrap_or(payload);
-            if let Some(dv) = DolbyVisionInfo::parse_rpu_with_length_size(frames, nal_length_size)
-                && let Some(track) = info.video.get_mut(video_idx)
-            {
-                apply_rpu_to_video_track(track, dv);
-                if let Some(found) = video_rpu_found.get_mut(video_idx) {
-                    *found = true;
-                }
+        if video_rpu_found.get(video_idx).copied() == Some(false)
+            && let Some(frames) = skip_matroska_lace_header(flags, payload)
+            && let Some(dv) = DolbyVisionInfo::parse_rpu_with_length_size(frames, nal_length_size)
+            && let Some(track) = info.video.get_mut(video_idx)
+        {
+            apply_rpu_to_video_track(track, dv);
+            if let Some(found) = video_rpu_found.get_mut(video_idx) {
+                *found = true;
             }
         }
         return;
@@ -1055,9 +1052,10 @@ fn probe_block(
     if track.atmos {
         return;
     }
+    let Some(frames) = skip_matroska_lace_header(flags, payload) else { return };
     let has_atmos = match track.codec.as_str() {
-        "A_TRUEHD" | "A_MLP" => AudioBitstream::has_truehd_atmos(payload),
-        "A_EAC3" => AudioBitstream::has_eac3_atmos_frame(payload),
+        "A_TRUEHD" | "A_MLP" => AudioBitstream::has_truehd_atmos(frames),
+        "A_EAC3" => AudioBitstream::has_eac3_atmos_frame(frames),
         _ => false,
     };
     if has_atmos {
@@ -1260,34 +1258,72 @@ impl DolbyVisionInfo {
 
     fn parse_rpu_payload(payload: &[u8]) -> Option<Self> {
         let rbsp = crate::video::bits::rbsp(payload);
-        if rbsp.len() < 3 {
+        let trimmed_len = rbsp.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
+        let rbsp = &rbsp[..trimmed_len];
+        if rbsp.len() < 4 {
             return None;
         }
 
-        let mut r = crate::video::bits::BitReader::new(&rbsp);
-        let _rpu_type = r.bits(6).ok()?;
-        let rpu_format = r.bits(11).ok()?;
+        let mut r = crate::video::bits::BitReader::new(rbsp);
+        let rpu_prefix = r.bits(8).ok()? as u8;
+        if rpu_prefix != 0x19 {
+            return None;
+        }
+
+        let rpu_type = r.bits(6).ok()? as u8;
+        if rpu_type != 2 {
+            return None;
+        }
+        let rpu_format = r.bits(11).ok()? as u16;
         let vdr_rpu_profile = r.bits(4).ok()? as u8;
         let vdr_rpu_level = r.bits(4).ok()? as u8;
 
-        let bl_video_full_range_flag = false;
+        let mut coefficient_data_type = 0u8;
+        let mut coeff_log2_denom_len = 0u32;
+        let mut bl_video_full_range_flag = false;
+        let mut bl_bit_depth_minus8 = 2u32;
+        let mut el_bit_depth_minus8 = 2u32;
+        let mut vdr_bit_depth_minus8 = 2u32;
+        let mut reserved_zero_3bits = 0u8;
         let mut el_spatial_resampling_filter_flag = false;
         let mut disable_residual_flag = false;
-        let mut vdr_bit_depth_minus8 = 2u32;
 
-        let vdr_seq_info_present = r.flag().unwrap_or(false);
+        let vdr_seq_info_present = r.flag().ok()?;
         if vdr_seq_info_present {
-            let _chroma_resample = r.flag().ok()?;
-            let _coeff_data_type = r.bits(2).ok()?;
+            let _chroma_resampling_explicit_filter_flag = r.flag().ok()?;
+            coefficient_data_type = r.bits(2).ok()? as u8;
+            let coefficient_log2_denom = if coefficient_data_type == 0 {
+                r.ue().ok()?
+            } else {
+                0
+            };
+            let _vdr_rpu_normalized_idc = r.bits(2).ok()?;
+            bl_video_full_range_flag = r.flag().ok()?;
             if (rpu_format & 0x700) == 0 {
-                let _bl_depth = r.ue().ok()?;
-                let _el_depth = r.ue().ok()?;
-                vdr_bit_depth_minus8 = r.ue().unwrap_or(2);
+                bl_bit_depth_minus8 = r.ue().ok()?;
+                el_bit_depth_minus8 = r.ue().ok()? & 0xFF;
+                vdr_bit_depth_minus8 = r.ue().ok()?;
+                let _spatial_resampling_filter_flag = r.flag().ok()?;
+                reserved_zero_3bits = r.bits(3).ok()? as u8;
+                el_spatial_resampling_filter_flag = r.flag().ok()?;
+                disable_residual_flag = r.flag().ok()?;
             }
-            let _spatial_resample = r.flag().ok()?;
-            let _reserved = r.bits(3).ok()?;
-            el_spatial_resampling_filter_flag = r.flag().unwrap_or(false);
-            disable_residual_flag = r.flag().unwrap_or(false);
+            coeff_log2_denom_len = match coefficient_data_type {
+                0 => {
+                    if coefficient_log2_denom > 32 {
+                        return None;
+                    }
+                    coefficient_log2_denom
+                }
+                1 => 32,
+                _ => return None,
+            };
+        }
+
+        let vdr_dm_metadata_present_flag = r.flag().unwrap_or(false);
+        let use_prev_vdr_rpu_flag = r.flag().unwrap_or(false);
+        if use_prev_vdr_rpu_flag {
+            let _prev_vdr_rpu_id = r.ue().ok()?;
         }
 
         let profile = if vdr_rpu_profile == 0 && bl_video_full_range_flag {
@@ -1306,27 +1342,33 @@ impl DolbyVisionInfo {
 
         let el_present = profile == 7 || profile == 4;
 
-        let mut is_fel = profile == 7;
-        let has_nlq = (rpu_format & 0x700) == 0 && !disable_residual_flag;
-        if has_nlq && profile == 7 {
-            let is_mel = rbsp.windows(4).any(|w| w == [0, 0, 0, 0]) && rbsp.len() < 128;
-            if is_mel {
-                is_fel = false;
+        let mut is_fel = false;
+        let mut mapping_ok = use_prev_vdr_rpu_flag;
+        if !use_prev_vdr_rpu_flag
+            && let Some(parsed_fel) = Self::parse_rpu_mapping_and_nlq(
+                &mut r,
+                rpu_format,
+                disable_residual_flag,
+                coefficient_data_type,
+                coeff_log2_denom_len,
+                bl_bit_depth_minus8,
+                el_bit_depth_minus8,
+            )
+        {
+            mapping_ok = true;
+            if profile == 7
+                && let Some(fel) = parsed_fel
+            {
+                is_fel = fel;
             }
         }
 
         let mut has_cm4 = false;
-
-        // Skip the fixed 3-byte RPU header and parsed sequence info so that
-        // Byte 2, which encodes (vdr_rpu_profile << 3) | (vdr_rpu_level >> 1) and
-        // evaluates to 8..11 for standard Profile 4/7/8 streams, is not
-        // falsely matched as a CM v4.0 extension block marker.
-        let search_start = (r.position() / 8).max(3).min(rbsp.len());
-        for &byte in &rbsp[search_start..] {
-            if [3, 8, 9, 10, 11, 254].contains(&byte) {
-                has_cm4 = true;
-                break;
-            }
+        if mapping_ok
+            && vdr_dm_metadata_present_flag
+            && let Some(cm4) = Self::parse_vdr_dm_data(&mut r, reserved_zero_3bits == 1)
+        {
+            has_cm4 = cm4;
         }
 
         let cm_version = if has_cm4 {
@@ -1343,6 +1385,202 @@ impl DolbyVisionInfo {
             fel: is_fel,
             cm_version,
         })
+    }
+
+    fn parse_rpu_mapping_and_nlq(
+        r: &mut crate::video::bits::BitReader<'_>,
+        rpu_format: u16,
+        disable_residual_flag: bool,
+        coefficient_data_type: u8,
+        coeff_log2_denom_len: u32,
+        bl_bit_depth_minus8: u32,
+        el_bit_depth_minus8: u32,
+    ) -> Option<Option<bool>> {
+        const NUM_COMPONENTS: usize = 3;
+        const NLQ_NUM_PIVOTS: usize = 2;
+        const MMR_MAX_COEFFS: usize = 7;
+
+        let _vdr_rpu_id = r.ue().ok()?;
+        let _mapping_color_space = r.ue().ok()?;
+        let _mapping_chroma_format_idc = r.ue().ok()?;
+
+        let bl_bit_depth = bl_bit_depth_minus8.checked_add(8)?;
+        if bl_bit_depth > 32 {
+            return None;
+        }
+
+        let mut num_pivots_minus2 = [0u32; NUM_COMPONENTS];
+        for num_pm2 in &mut num_pivots_minus2 {
+            let npm2 = r.ue().ok()?;
+            if npm2 > 64 {
+                return None;
+            }
+            *num_pm2 = npm2;
+            let num_pivots = (npm2 as usize) + 2;
+            for _ in 0..num_pivots {
+                let _pivot = r.bits(bl_bit_depth).ok()?;
+            }
+        }
+
+        let has_nlq = (rpu_format & 0x700) == 0 && !disable_residual_flag;
+        let mut nlq_method_idc = None;
+        if has_nlq {
+            let method = r.bits(3).ok()? as u8;
+            if method != 0 {
+                return None;
+            }
+            nlq_method_idc = Some(method);
+            for _ in 0..NLQ_NUM_PIVOTS {
+                let _pv = r.bits(bl_bit_depth).ok()?;
+            }
+        }
+
+        let _num_x_partitions_minus1 = r.ue().ok()?;
+        let _num_y_partitions_minus1 = r.ue().ok()?;
+
+        for &npm2 in &num_pivots_minus2 {
+            let num_pieces = (npm2 as usize) + 1;
+            for pivot_idx in 0..num_pieces {
+                let mapping_idc = r.ue().ok()?;
+                match mapping_idc {
+                    0 => {
+                        let poly_order_minus1 = r.ue().ok()?;
+                        if poly_order_minus1 > 1 {
+                            return None;
+                        }
+                        let linear_interp_flag = if poly_order_minus1 == 0 {
+                            r.flag().ok()?
+                        } else {
+                            false
+                        };
+                        if poly_order_minus1 == 0 && linear_interp_flag {
+                            if coefficient_data_type == 0 {
+                                let _ = r.ue().ok()?;
+                            }
+                            let _ = r.bits(coeff_log2_denom_len).ok()?;
+                            if pivot_idx as u32 == npm2 {
+                                if coefficient_data_type == 0 {
+                                    let _ = r.ue().ok()?;
+                                }
+                                let _ = r.bits(coeff_log2_denom_len).ok()?;
+                            }
+                        } else {
+                            let poly_coef_count = (poly_order_minus1 as usize) + 2;
+                            for _ in 0..poly_coef_count {
+                                if coefficient_data_type == 0 {
+                                    let _ = r.se().ok()?;
+                                }
+                                let _ = r.bits(coeff_log2_denom_len).ok()?;
+                            }
+                        }
+                    }
+                    1 => {
+                        let mmr_order_minus1 = r.bits(2).ok()? as usize;
+                        if mmr_order_minus1 > 2 {
+                            return None;
+                        }
+                        if coefficient_data_type == 0 {
+                            let _ = r.se().ok()?;
+                        }
+                        let _ = r.bits(coeff_log2_denom_len).ok()?;
+                        for _ in 0..(mmr_order_minus1 + 1) {
+                            for _ in 0..MMR_MAX_COEFFS {
+                                if coefficient_data_type == 0 {
+                                    let _ = r.se().ok()?;
+                                }
+                                let _ = r.bits(coeff_log2_denom_len).ok()?;
+                            }
+                        }
+                    }
+                    _ => return None,
+                }
+            }
+        }
+
+        if let Some(0) = nlq_method_idc {
+            let el_bit_depth = el_bit_depth_minus8.checked_add(8)?;
+            if el_bit_depth > 32 {
+                return None;
+            }
+            let mut nlq_offset = [0u32; NUM_COMPONENTS];
+            let mut vdr_in_max_int = [0u32; NUM_COMPONENTS];
+            let mut vdr_in_max = [0u32; NUM_COMPONENTS];
+            let mut linear_deadzone_slope_int = [0u32; NUM_COMPONENTS];
+            let mut linear_deadzone_slope = [0u32; NUM_COMPONENTS];
+            let mut linear_deadzone_threshold_int = [0u32; NUM_COMPONENTS];
+            let mut linear_deadzone_threshold = [0u32; NUM_COMPONENTS];
+
+            for cmp in 0..NUM_COMPONENTS {
+                nlq_offset[cmp] = r.bits(el_bit_depth).ok()?;
+                if coefficient_data_type == 0 {
+                    vdr_in_max_int[cmp] = r.ue().ok()?;
+                }
+                vdr_in_max[cmp] = r.bits(coeff_log2_denom_len).ok()?;
+                if coefficient_data_type == 0 {
+                    linear_deadzone_slope_int[cmp] = r.ue().ok()?;
+                }
+                linear_deadzone_slope[cmp] = r.bits(coeff_log2_denom_len).ok()?;
+                if coefficient_data_type == 0 {
+                    linear_deadzone_threshold_int[cmp] = r.ue().ok()?;
+                }
+                linear_deadzone_threshold[cmp] = r.bits(coeff_log2_denom_len).ok()?;
+            }
+
+            let is_mel = nlq_offset == [0; 3]
+                && vdr_in_max_int == [1; 3]
+                && vdr_in_max == [0; 3]
+                && linear_deadzone_slope_int == [0; 3]
+                && linear_deadzone_slope == [0; 3]
+                && linear_deadzone_threshold_int == [0; 3]
+                && linear_deadzone_threshold == [0; 3];
+            return Some(Some(!is_mel));
+        }
+
+        Some(None)
+    }
+
+    fn parse_dm_ext_blocks(
+        r: &mut crate::video::bits::BitReader<'_>,
+        has_cm4: &mut bool,
+    ) -> Option<()> {
+        let num_ext_blocks = r.ue().ok()?;
+        if num_ext_blocks > 256 {
+            return None;
+        }
+        while !r.is_byte_aligned() {
+            if r.flag().ok()? {
+                return None;
+            }
+        }
+        for _ in 0..num_ext_blocks {
+            let ext_block_length = r.ue().ok()? as usize;
+            let ext_block_level = r.bits(8).ok()? as u8;
+            if matches!(ext_block_level, 3 | 8 | 9 | 10 | 11 | 254) {
+                *has_cm4 = true;
+            }
+            r.skip(ext_block_length.checked_mul(8)?).ok()?;
+        }
+        Some(())
+    }
+
+    fn parse_vdr_dm_data(
+        r: &mut crate::video::bits::BitReader<'_>,
+        compressed_dm_data: bool,
+    ) -> Option<bool> {
+        const DM_DATA_PAYLOAD2_MIN_BITS: usize = 56;
+
+        let _affected_dm_metadata_id = r.ue().ok()?;
+        let _current_dm_metadata_id = r.ue().ok()?;
+        let _scene_refresh_flag = r.ue().ok()?;
+        if !compressed_dm_data {
+            r.skip(509).ok()?;
+        }
+        let mut has_cm4 = false;
+        Self::parse_dm_ext_blocks(r, &mut has_cm4)?;
+        if r.bits_left() >= DM_DATA_PAYLOAD2_MIN_BITS {
+            let _ = Self::parse_dm_ext_blocks(r, &mut has_cm4);
+        }
+        Some(has_cm4)
     }
 }
 
@@ -1772,12 +2010,9 @@ impl DiscProber {
     pub fn dvd_disc_id(video_ts: &[u8], vts: &[u8]) -> [u8; 16] {
         use md5::{Digest, Md5};
         let mut hasher = Md5::new();
-        let chunk1 = &video_ts[..video_ts.len().min(16384)];
-        let chunk2 = &vts[..vts.len().min(16384)];
-        hasher.update(chunk1);
-        hasher.update(chunk2);
-        let result = hasher.finalize();
-        result.into()
+        hasher.update(video_ts);
+        hasher.update(vts);
+        hasher.finalize().into()
     }
 
     pub fn dvd_disc_id_hex(video_ts: &[u8], vts: &[u8]) -> String {
@@ -2271,10 +2506,99 @@ mod tests {
 
         // Build a SimpleBlock for Track 1 containing two 4-byte length-prefixed HEVC NAL units:
         // 1. IDR slice NAL (type 19 -> header 0x26, 0x01) of 6 bytes
-        // 2. Dolby Vision RPU NAL (type 62 -> header 0x7C, 0x01) with Profile 7 FEL + CM v4.0 payload
-        let rpu_rbsp = [0x18u8, 0x00, 0x0B, 0x46, 0x50, 0x80, 0xFE];
+        // 2. Dolby Vision RPU NAL (type 62 -> header 0x7C, 0x01) with 0x19 prefix + Profile 7 FEL + CM v4.0
+        let push_bits = |bits: &mut Vec<bool>, val: u32, count: u32| {
+            for i in (0..count).rev() {
+                bits.push(((val >> i) & 1) != 0);
+            }
+        };
+        let push_ue = |bits: &mut Vec<bool>, val: u32| {
+            let v = val + 1;
+            let lz = 31 - v.leading_zeros();
+            for _ in 0..lz {
+                bits.push(false);
+            }
+            push_bits(bits, v, lz + 1);
+        };
+        let mut rpu_bits = Vec::new();
+        push_bits(&mut rpu_bits, 0x19, 8); // rpu_nal_prefix = 25
+        push_bits(&mut rpu_bits, 2, 6); // rpu_type = 2
+        push_bits(&mut rpu_bits, 18, 11); // rpu_format = 18
+        push_bits(&mut rpu_bits, 1, 4); // vdr_rpu_profile = 1
+        push_bits(&mut rpu_bits, 6, 4); // vdr_rpu_level = 6
+        rpu_bits.push(true); // vdr_seq_info_present_flag
+        rpu_bits.push(false); // chroma_resampling_explicit_filter_flag
+        push_bits(&mut rpu_bits, 0, 2); // coefficient_data_type = 0
+        push_ue(&mut rpu_bits, 0); // coefficient_log2_denom = 0
+        push_bits(&mut rpu_bits, 1, 2); // vdr_rpu_normalized_idc = 1
+        rpu_bits.push(false); // bl_video_full_range_flag = false
+        push_ue(&mut rpu_bits, 2); // bl_bit_depth_minus8 = 2
+        push_ue(&mut rpu_bits, 2); // el_bit_depth_minus8 = 2
+        push_ue(&mut rpu_bits, 4); // vdr_bit_depth_minus8 = 4 (Profile 7)
+        rpu_bits.push(false); // spatial_resampling_filter_flag
+        push_bits(&mut rpu_bits, 1, 3); // reserved_zero_3bits = 1 (compressed_dm_data)
+        rpu_bits.push(true); // el_spatial_resampling_filter_flag = true
+        rpu_bits.push(false); // disable_residual_flag = false
+        rpu_bits.push(true); // vdr_dm_metadata_present_flag = true
+        rpu_bits.push(false); // use_prev_vdr_rpu_flag = false
+        // RpuDataMapping
+        push_ue(&mut rpu_bits, 0); // vdr_rpu_id
+        push_ue(&mut rpu_bits, 0); // mapping_color_space
+        push_ue(&mut rpu_bits, 0); // mapping_chroma_format_idc
+        for _ in 0..3 {
+            push_ue(&mut rpu_bits, 0); // num_pivots_minus2 = 0
+            push_bits(&mut rpu_bits, 0, 10);
+            push_bits(&mut rpu_bits, 1023, 10);
+        }
+        push_bits(&mut rpu_bits, 0, 3); // nlq_method_idc = 0
+        push_bits(&mut rpu_bits, 0, 10); // nlq_pred_pivot_value[0]
+        push_bits(&mut rpu_bits, 1023, 10); // nlq_pred_pivot_value[1]
+        push_ue(&mut rpu_bits, 0); // num_x_partitions_minus1
+        push_ue(&mut rpu_bits, 0); // num_y_partitions_minus1
+        for _ in 0..3 {
+            push_ue(&mut rpu_bits, 0); // mapping_idc = 0 (Polynomial)
+            push_ue(&mut rpu_bits, 0); // poly_order_minus1 = 0
+            rpu_bits.push(false); // linear_interp_flag = false
+            push_ue(&mut rpu_bits, 0); // poly_coef_int[0] = 0 (se(0) == ue(0))
+            push_ue(&mut rpu_bits, 1); // poly_coef_int[1] = 1 (se(1) == ue(1))
+        }
+        // RpuDataNlq (FEL: non-zero nlq_offset)
+        for _ in 0..3 {
+            push_bits(&mut rpu_bits, 512, 10); // nlq_offset = 512 (non-MEL -> FEL)
+            push_ue(&mut rpu_bits, 1); // vdr_in_max_int = 1
+            push_ue(&mut rpu_bits, 1); // linear_deadzone_slope_int = 1
+            push_ue(&mut rpu_bits, 0); // linear_deadzone_threshold_int = 0
+        }
+        // VdrDmData (compressed_dm_data = true + 1 CM v4.0 Level 254 block + CRC32 + 0x80)
+        push_ue(&mut rpu_bits, 0); // affected_dm_metadata_id
+        push_ue(&mut rpu_bits, 0); // current_dm_metadata_id
+        push_ue(&mut rpu_bits, 0); // scene_refresh_flag
+        push_ue(&mut rpu_bits, 0); // cmv29 num_ext_blocks = 0
+        while rpu_bits.len() % 8 != 0 {
+            rpu_bits.push(false);
+        }
+        push_ue(&mut rpu_bits, 1); // cmv40 num_ext_blocks = 1
+        while rpu_bits.len() % 8 != 0 {
+            rpu_bits.push(false);
+        }
+        push_ue(&mut rpu_bits, 2); // ext_block_length = 2 bytes
+        push_bits(&mut rpu_bits, 254, 8); // ext_block_level = 254 (CM v4.0)
+        push_bits(&mut rpu_bits, 0x0001, 16); // Level 254 payload
+        while rpu_bits.len() % 8 != 0 {
+            rpu_bits.push(false);
+        }
+        push_bits(&mut rpu_bits, 0x1234_5678, 32); // CRC32
+        push_bits(&mut rpu_bits, 0x80, 8); // 0x80 terminator
         let mut rpu_nal = vec![0x7C, 0x01];
-        rpu_nal.extend_from_slice(&rpu_rbsp);
+        for chunk in rpu_bits.chunks(8) {
+            let mut b = 0u8;
+            for (idx, &bit) in chunk.iter().enumerate() {
+                if bit {
+                    b |= 1 << (7 - idx);
+                }
+            }
+            rpu_nal.push(b);
+        }
         let idr_nal = [0x26u8, 0x01, 0xAA, 0xBB, 0xCC, 0xDD];
 
         let mut simple_block_body = vec![0x81, 0x00, 0x00, 0x80]; // Track 1, pts=0, keyframe, no lacing

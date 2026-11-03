@@ -395,6 +395,26 @@ fn tc_t1_f25_3_disc_prober_dvd_disc_id_md5() {
 
     let disc_id_hex = DiscProber::dvd_disc_id_hex(&video_ts, &vts);
     assert_eq!(disc_id_hex.len(), 32, "DVD Disc ID must be 32-character hex");
+    assert_eq!(
+        disc_id_hex, "732ca863c2a0e85d17bdf1de2a09813e",
+        "DVDDiscID must hash the complete VIDEO_TS.IFO and VTS_01_0.IFO files without 16 KiB truncation"
+    );
+
+    let mut video_ts_tail_modified = video_ts.clone();
+    video_ts_tail_modified[19_999] ^= 0xFF;
+    assert_ne!(
+        DiscProber::dvd_disc_id_hex(&video_ts_tail_modified, &vts),
+        disc_id_hex,
+        "bytes past 16 KiB in VIDEO_TS.IFO must contribute to DVDDiscID"
+    );
+
+    let mut vts_tail_modified = vts.clone();
+    vts_tail_modified[19_999] ^= 0xFF;
+    assert_ne!(
+        DiscProber::dvd_disc_id_hex(&video_ts, &vts_tail_modified),
+        disc_id_hex,
+        "bytes past 16 KiB in VTS_01_0.IFO must contribute to DVDDiscID"
+    );
 
     let marker_disc = [vec![0u8; 100], b"VIDEO_TS.IFO".to_vec(), vec![0u8; 100]].concat();
     let info = DiscProber::probe(&marker_disc).expect("must identify DVD marker");

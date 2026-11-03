@@ -64,6 +64,12 @@ impl BitWriter {
         self.write_bits(num, bits);
     }
 
+    fn byte_align(&mut self) {
+        while self.bit_pos != 0 {
+            self.write_bit(0);
+        }
+    }
+
     fn into_bytes(self) -> Vec<u8> {
         self.bytes
     }
@@ -97,40 +103,125 @@ fn mp4_box(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
 // 1. Dolby Vision RPU Bitstream Parsing Stress Tests
 // ============================================================================
 
+#[allow(clippy::too_many_arguments)]
 fn build_dovi_rpu_rbsp(
     rpu_profile: u8,
     rpu_level: u8,
     bit_depth_minus8: u32,
     el_spatial: bool,
     disable_residual: bool,
-    extra_bytes: &[u8],
+    is_mel_nlq: bool,
+    v29_blocks: &[(u8, &[u8])],
+    v40_blocks: &[(u8, &[u8])],
 ) -> Vec<u8> {
     let mut w = BitWriter::new();
-    w.write_bits(0x19, 6);   // rpu_type = 25 (0x19)
-    w.write_bits(0, 11);     // rpu_format = 0
+    w.write_bits(0x19, 8);               // rpu_nal_prefix = 25 (0x19)
+    w.write_bits(2, 6);                  // rpu_type = 2
+    w.write_bits(18, 11);                // rpu_format = 18 (rpu_format & 0x700 == 0)
     w.write_bits(rpu_profile as u32, 4); // vdr_rpu_profile
     w.write_bits(rpu_level as u32, 4);   // vdr_rpu_level
-    w.write_flag(true);      // vdr_seq_info_present
-    w.write_flag(false);     // chroma_resample
-    w.write_bits(0, 2);      // coeff_data_type
+    w.write_flag(true);                  // vdr_seq_info_present_flag
+    w.write_flag(false);                 // chroma_resampling_explicit_filter_flag
+    w.write_bits(0, 2);                  // coefficient_data_type = 0
+    w.write_ue(0);                       // coefficient_log2_denom = 0
+    w.write_bits(1, 2);                  // vdr_rpu_normalized_idc = 1
+    w.write_flag(rpu_profile == 0);      // bl_video_full_range_flag
     // rpu_format & 0x700 == 0:
-    w.write_ue(0);           // bl_depth
-    w.write_ue(0);           // el_depth
-    w.write_ue(bit_depth_minus8); // vdr_bit_depth_minus8
-    w.write_flag(false);     // spatial_resample
-    w.write_bits(0, 3);      // reserved
-    w.write_flag(el_spatial); // el_spatial_resampling_filter_flag
-    w.write_flag(disable_residual); // disable_residual_flag
+    w.write_ue(2);                       // bl_bit_depth_minus8 = 2 (10-bit)
+    w.write_ue(2);                       // el_bit_depth_minus8 = 2 (10-bit)
+    w.write_ue(bit_depth_minus8);        // vdr_bit_depth_minus8
+    w.write_flag(false);                 // spatial_resampling_filter_flag
+    w.write_bits(0, 3);                  // reserved_zero_3bits = 0 (uncompressed VdrDmData)
+    w.write_flag(el_spatial);            // el_spatial_resampling_filter_flag
+    w.write_flag(disable_residual);      // disable_residual_flag
 
-    let mut bytes = w.into_bytes();
-    bytes.extend_from_slice(extra_bytes);
-    bytes
+    let has_dm = !v29_blocks.is_empty() || !v40_blocks.is_empty();
+    w.write_flag(has_dm);                // vdr_dm_metadata_present_flag
+    w.write_flag(false);                 // use_prev_vdr_rpu_flag = false
+
+    // RpuDataMapping
+    w.write_ue(0);                       // vdr_rpu_id
+    w.write_ue(0);                       // mapping_color_space
+    w.write_ue(0);                       // mapping_chroma_format_idc
+    for _ in 0..3 {
+        w.write_ue(0);                   // num_pivots_minus2 = 0 (2 pivots)
+        w.write_bits(0, 10);             // pivot[0] = 0
+        w.write_bits(1023, 10);          // pivot[1] = 1023
+    }
+    if !disable_residual {
+        w.write_bits(0, 3);              // nlq_method_idc = 0 (LinearDeadzone)
+        w.write_bits(0, 10);             // nlq_pred_pivot_value[0] = 0
+        w.write_bits(1023, 10);          // nlq_pred_pivot_value[1] = 1023
+    }
+    w.write_ue(0);                       // num_x_partitions_minus1
+    w.write_ue(0);                       // num_y_partitions_minus1
+    for _ in 0..3 {
+        w.write_ue(0);                   // mapping_idc = 0 (Polynomial)
+        w.write_ue(0);                   // poly_order_minus1 = 0
+        w.write_flag(false);             // linear_interp_flag = false
+        w.write_ue(0);                   // poly_coef_int[0] = 0 (se(0) -> ue(0))
+        w.write_ue(1);                   // poly_coef_int[1] = 1 (se(1) -> ue(1))
+    }
+
+    // RpuDataNlq
+    if !disable_residual {
+        for _ in 0..3 {
+            if is_mel_nlq {
+                w.write_bits(0, 10);     // nlq_offset = 0
+                w.write_ue(1);           // vdr_in_max_int = 1
+                w.write_ue(0);           // linear_deadzone_slope_int = 0
+                w.write_ue(0);           // linear_deadzone_threshold_int = 0
+            } else {
+                w.write_bits(512, 10);   // nlq_offset = 512 (non-MEL -> FEL)
+                w.write_ue(1);           // vdr_in_max_int = 1
+                w.write_ue(1);           // linear_deadzone_slope_int = 1
+                w.write_ue(1);           // linear_deadzone_threshold_int = 1
+            }
+        }
+    }
+
+    // VdrDmData
+    if has_dm {
+        w.write_ue(0);                   // affected_dm_metadata_id
+        w.write_ue(0);                   // current_dm_metadata_id
+        w.write_ue(0);                   // scene_refresh_flag
+        for _ in 0..509 {
+            w.write_bit(0);              // uncompressed 509-bit VdrDmData fixed matrix/signal header
+        }
+        w.write_ue(v29_blocks.len() as u32);
+        w.byte_align();
+        for &(level, payload) in v29_blocks {
+            w.write_ue(payload.len() as u32);
+            w.write_bits(level as u32, 8);
+            for &b in payload {
+                w.write_bits(b as u32, 8);
+            }
+        }
+        if !v40_blocks.is_empty() {
+            w.write_ue(v40_blocks.len() as u32);
+            w.byte_align();
+            for &(level, payload) in v40_blocks {
+                w.write_ue(payload.len() as u32);
+                w.write_bits(level as u32, 8);
+                for &b in payload {
+                    w.write_bits(b as u32, 8);
+                }
+            }
+        }
+    }
+
+    w.byte_align();
+    // Embed bytes 0x03, 0x08, 0x09, 0xFE inside the CRC32 trailer so any naive
+    // raw-byte scan would falsely report CM v4.0 on CM v2.9 RPUs.
+    w.write_bits(0x0308_09FE, 32);
+    w.write_bits(0x80, 8);
+    w.into_bytes()
 }
 
 #[test]
 fn test_dovi_rpu_bitstream_profile4() {
     // Profile 4: vdr_rpu_profile=1, el_spatial=true, disable_residual=false, bit_depth_minus8 != 4 (e.g. 2 for 10-bit)
-    let rbsp = build_dovi_rpu_rbsp(1, 6, 2, true, false, &[]);
+    let rbsp = build_dovi_rpu_rbsp(1, 6, 2, true, false, false, &[], &[]);
     // Wrap in NAL type 62 (0x7C is 62 << 1)
     let mut nal = vec![0x7C, 0x01];
     nal.extend_from_slice(&rbsp);
@@ -145,7 +236,7 @@ fn test_dovi_rpu_bitstream_profile4() {
 #[test]
 fn test_dovi_rpu_bitstream_profile5() {
     // Profile 5: vdr_rpu_profile=0
-    let rbsp = build_dovi_rpu_rbsp(0, 4, 2, false, false, &[]);
+    let rbsp = build_dovi_rpu_rbsp(0, 4, 2, false, true, false, &[], &[]);
     let mut nal = vec![0x7C, 0x01];
     nal.extend_from_slice(&rbsp);
 
@@ -158,14 +249,13 @@ fn test_dovi_rpu_bitstream_profile5() {
 
 #[test]
 fn test_dovi_rpu_bitstream_profile7_fel() {
-    // Profile 7 FEL: vdr_rpu_profile=1, el_spatial=true, disable_residual=false, bit_depth_minus8=4 (12-bit)
-    // Extra bytes: non-zero payload >= 128 bytes to ensure not MEL
-    let mut extra = vec![0xAA; 140];
-    // Avoid CM v4 markers (3, 8, 9, 10, 11, 254) to keep v2.9
-    for b in extra.iter_mut() {
-        *b = 0x55;
-    }
-    let rbsp = build_dovi_rpu_rbsp(1, 6, 4, true, false, &extra);
+    // Profile 7 FEL: vdr_rpu_profile=1, el_spatial=true, disable_residual=false, bit_depth_minus8=4 (12-bit).
+    // Include a short (< 128 byte) FEL RPU containing [0, 0, 0, 0] in the uncompressed VdrDmData header
+    // to prove FEL is determined from parsed NLQ coefficients rather than payload length or zero runs.
+    let l6_payload = [0x03, 0xE8, 0x00, 0x32, 0x03, 0xE8, 0x01, 0x90]; // 1000 nits L6 (contains 0x03)
+    let rbsp = build_dovi_rpu_rbsp(1, 6, 4, true, false, false, &[(6, &l6_payload)], &[]);
+    assert!(rbsp.len() < 128, "short FEL RPU must be < 128 bytes");
+    assert!(rbsp.windows(4).any(|w| w == [0, 0, 0, 0]), "short FEL RPU contains [0, 0, 0, 0]");
     let mut nal = vec![0x7C, 0x01];
     nal.extend_from_slice(&rbsp);
 
@@ -173,29 +263,33 @@ fn test_dovi_rpu_bitstream_profile7_fel() {
     assert_eq!(info.profile, 7, "12-bit depth with EL must be Profile 7");
     assert_eq!(info.level, Some(6));
     assert!(info.el_present);
-    assert!(info.fel, "Full enhancement layer must have fel=true");
+    assert!(info.fel, "Full enhancement layer must have fel=true even when < 128 bytes with zero runs");
+    assert_eq!(info.cm_version, "v2.9");
 }
 
 #[test]
 fn test_dovi_rpu_bitstream_profile7_mel() {
-    // Profile 7 MEL: vdr_rpu_profile=1, el_spatial=true, disable_residual=false, bit_depth_minus8=4 (12-bit)
-    // MEL signature: rbsp length < 128 bytes with 4 consecutive zeros [0, 0, 0, 0]
-    let extra = vec![0x00, 0x00, 0x00, 0x00, 0x01, 0x02];
-    let rbsp = build_dovi_rpu_rbsp(1, 6, 4, true, false, &extra);
-    assert!(rbsp.len() < 128, "MEL test requires rbsp.len() < 128");
+    // Profile 7 MEL: vdr_rpu_profile=1, el_spatial=true, disable_residual=false, bit_depth_minus8=4 (12-bit).
+    // Include multiple CM v2.9 Level 2 trim blocks so that rbsp.len() > 128 bytes, proving MEL is
+    // determined from parsed NLQ coefficients (is_mel) rather than rbsp.len() < 128.
+    let l2_trim = [0x08, 0x09, 0x0A, 0x0B, 0xFE, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
+    let v29_blocks: Vec<(u8, &[u8])> = vec![(2, &l2_trim); 8];
+    let rbsp = build_dovi_rpu_rbsp(1, 6, 4, true, false, true, &v29_blocks, &[]);
+    assert!(rbsp.len() >= 128, "MEL RPU with multiple L2 trims must be >= 128 bytes");
     let mut nal = vec![0x7C, 0x01];
     nal.extend_from_slice(&rbsp);
 
     let info = DolbyVisionInfo::parse_rpu(&nal).expect("must parse Profile 7 MEL RPU");
     assert_eq!(info.profile, 7);
     assert!(info.el_present);
-    assert!(!info.fel, "Minimal enhancement layer (MEL) must have fel=false");
+    assert!(!info.fel, "Minimal enhancement layer (MEL) must have fel=false even when >= 128 bytes");
+    assert_eq!(info.cm_version, "v2.9");
 }
 
 #[test]
 fn test_dovi_rpu_bitstream_profile8() {
     // Profile 8: vdr_rpu_profile=1, el_spatial=false (no enhancement layer)
-    let rbsp = build_dovi_rpu_rbsp(1, 6, 2, false, true, &[]);
+    let rbsp = build_dovi_rpu_rbsp(1, 6, 2, false, true, false, &[], &[]);
     let mut nal = vec![0x7C, 0x01];
     nal.extend_from_slice(&rbsp);
 
@@ -208,16 +302,38 @@ fn test_dovi_rpu_bitstream_profile8() {
 
 #[test]
 fn test_dovi_rpu_cm_v29_vs_v40() {
-    // CM v4.0: contains Level 11 or Level 254 extension block marker (0xFE = 254)
-    let extra_v4 = vec![0xFE];
-    let rbsp_v4 = build_dovi_rpu_rbsp(0, 4, 2, false, true, &extra_v4);
+    // CM v4.0: contains parsed Level 254 and Level 11 extension blocks in cmv40_metadata
+    let l1_payload = [0x00, 0x10, 0x03, 0xE8, 0x01, 0x00];
+    let l254_payload = [0x00, 0x01];
+    let l11_payload = [0x01, 0x02, 0x03, 0x04];
+    let rbsp_v4 = build_dovi_rpu_rbsp(
+        0,
+        4,
+        2,
+        false,
+        true,
+        false,
+        &[(1, &l1_payload)],
+        &[(254, &l254_payload), (11, &l11_payload)],
+    );
     let mut nal_v4 = vec![0x7C, 0x01];
     nal_v4.extend_from_slice(&rbsp_v4);
     let info_v4 = DolbyVisionInfo::parse_rpu(&nal_v4).expect("must parse CM v4.0 RPU");
     assert_eq!(info_v4.cm_version, "v4.0");
 
-    // CM v2.9: payload without CM4 marker bytes (e.g. Profile 5 Level 4 where byte 2 is 2, not 3/8/9/10/11)
-    let rbsp_v29 = build_dovi_rpu_rbsp(0, 4, 2, false, true, &[0x01, 0x02, 0x04, 0x05, 0x06, 0x07]);
+    // CM v2.9: contains Level 1, Level 2, and Level 6 blocks whose interior payload bytes
+    // include [3, 8, 9, 10, 11, 254], but no CM v4.0 extension block levels.
+    let noisy_l2_payload = [3u8, 8, 9, 10, 11, 254, 1, 2, 4, 5, 6];
+    let rbsp_v29 = build_dovi_rpu_rbsp(
+        0,
+        4,
+        2,
+        false,
+        true,
+        false,
+        &[(1, &l1_payload), (2, &noisy_l2_payload)],
+        &[],
+    );
     let mut nal_v29 = vec![0x7C, 0x01];
     nal_v29.extend_from_slice(&rbsp_v29);
     let info_v29 = DolbyVisionInfo::parse_rpu(&nal_v29).expect("must parse CM v2.9 RPU");
@@ -227,12 +343,10 @@ fn test_dovi_rpu_cm_v29_vs_v40() {
 #[test]
 fn test_dovi_rpu_cm_v40_false_positive_on_profile7_8_standard_levels() {
     // Adversarial empirical verification:
-    // In any RPU bitstream with vdr_rpu_profile = 1 (Profiles 4, 7, 8):
-    // bits 16..23 (byte 2) = (vdr_rpu_profile << 3) | (vdr_rpu_level >> 1).
-    // For UHD Blu-ray level 6 (standard for 2160p): byte 2 = (1 << 3) | (6 >> 1) = 8 | 3 = 11 (0x0B).
-    // When the RPU header is properly skipped, Profile 7 / Profile 8 streams without v4 extension blocks
-    // are correctly classified as CM v2.9 instead of falsely triggering CM v4.0.
-    let rbsp_p7_cm29 = build_dovi_rpu_rbsp(1, 6, 4, true, false, &[0x55; 140]);
+    // Profile 7 level 6 RPU with CM v2.9 Level 6 block (1000 nits = 0x03E8) and [3, 8, 9, 254]
+    // in payload/CRC32 bytes must be classified as CM v2.9 when no v4.0 extension block levels exist.
+    let l6_payload = [0x03, 0xE8, 0x00, 0x32, 0x03, 0xE8, 0x01, 0x90];
+    let rbsp_p7_cm29 = build_dovi_rpu_rbsp(1, 6, 4, true, false, false, &[(6, &l6_payload)], &[]);
     let mut nal = vec![0x7C, 0x01];
     nal.extend_from_slice(&rbsp_p7_cm29);
     let info = DolbyVisionInfo::parse_rpu(&nal).expect("must parse Profile 7");
@@ -242,8 +356,8 @@ fn test_dovi_rpu_cm_v40_false_positive_on_profile7_8_standard_levels() {
 #[test]
 fn test_dovi_rpu_level253_crash_immunity() {
     // Level 253 extension block (0xFD) or out-of-bounds level payloads must not panic
-    let extra_l253 = vec![0xFD, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
-    let rbsp_l253 = build_dovi_rpu_rbsp(1, 15, 2, false, true, &extra_l253);
+    let l253_payload = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+    let rbsp_l253 = build_dovi_rpu_rbsp(1, 15, 2, false, true, false, &[(253, &l253_payload)], &[]);
     let mut nal = vec![0x7C, 0x01];
     nal.extend_from_slice(&rbsp_l253);
 
