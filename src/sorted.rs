@@ -346,66 +346,7 @@ fn linked_sizes(
          having count(*) between 2 and {LINKED_ROWS}"
     );
     let mut total_of = conn.prepare(&total_sql)?;
-    // the shard read its first `want` and there were more: what's as big as its last row as a whole or bigger can come
-    // first, a newer one of the same size too
-    let cutoff = match rows.last() {
-        Some(last) if rows.len() as i64 >= want => last.size,
-        _ => None,
-    };
-    if let Some(cutoff) = cutoff {
-        // only uploads with a row the page can list count towards the limit: bigger ones elsewhere don't crowd them out.
-        // A tie goes to the newest of those rows, as the rows' own ties do, not to a row the page leaves out
-        let clause = match filter {
-            None => String::from("1"),
-            Some(f) if !f.uncategorized => format!("c.category in ({})", list(&f.leaves)),
-            Some(f) => format!("(c.category in ({}) or c.release_id is null)", list(&f.leaves)),
-        };
-        let bigger = format!(
-            "select l.lead_id,
-                    (select max(r.id) from s{s}.upload_link m join s{s}.releases r on r.id = m.release_id
-                     left join s{s}.release_category c on c.release_id = r.id
-                     where m.lead_id = l.lead_id and {VISIBLE_RELEASE} and {clause}) as newest
-             from s{s}.upload_link l join s{s}.releases r on r.id = l.release_id
-             group by l.lead_id
-             having count(*) between 2 and {LINKED_ROWS} and sum(coalesce(r.size, 0)) >= ?1
-                and exists (select 1 from s{s}.releases x where x.id = l.lead_id)
-                and newest is not null
-             order by sum(coalesce(r.size, 0)) desc, newest desc limit ?2"
-        );
-        let leads: Vec<i64> = conn.prepare(&bigger)?.query_map([cutoff, want], |r| r.get(0))?.collect::<Result<_>>()?;
-        let mut members = conn.prepare(&format!("select release_id from s{s}.upload_link where lead_id = ?1"))?;
-        let mut category =
-            conn.prepare(&format!("select category from s{s}.release_category where release_id = ?1"))?;
-        let mut probe = conn.prepare(&probe_sql(s))?;
-        let mut have: std::collections::HashSet<i64> = rows.iter().map(|r| r.id).collect();
-        // biggest first: once `want` rows are in, the uploads after them come after them on the page too, soo reading
-        // their rows (up to a set each) would only make the shard's answer longer before it's cut
-        let mut added = 0i64;
-        for lead in leads {
-            if added >= want {
-                break;
-            }
-            let ids: Vec<i64> = members.query_map([lead], |r| r.get(0))?.collect::<Result<_>>()?;
-            for id in ids {
-                if !have.insert(id) {
-                    continue;
-                }
-                if let Some(f) = filter {
-                    let kept = match category.query_row([id], |r| r.get::<_, i64>(0)).optional()? {
-                        Some(c) => f.leaves.contains(&c),
-                        None => f.uncategorized,
-                    };
-                    if !kept {
-                        continue;
-                    }
-                }
-                if let Some(row) = probe.query_row([id], release_row).optional()? {
-                    rows.push(row);
-                    added += 1;
-                }
-            }
-        }
-    }
+    // each row read that is part of a linked upload goes by the upload's whole size
     let (mut whole, mut totals) = (HashMap::new(), HashMap::new());
     for row in rows.iter() {
         let Some(lead) = lead_of.query_row([row.id], |r| r.get::<_, i64>(0)).optional()? else { continue };
@@ -419,6 +360,73 @@ fn linked_sizes(
         };
         if let Some(total) = total {
             whole.insert(row.id, total);
+        }
+    }
+    rows.sort_by(|a, b| compare(a, b, Column::Size, true, &whole));
+    // the shard read its first `want` and there were more: what's as big as its last row as a whole or bigger can come
+    // first, a newer one of the same size too
+    let cutoff = match rows.last() {
+        Some(last) if rows.len() as i64 >= want => last.size,
+        _ => None,
+    };
+    let Some(cutoff) = cutoff else { return Ok(whole) };
+    // only uploads with a row the page can list count towards the limit: bigger ones elsewhere don't crowd them out.
+    // A tie goes to the newest of those rows, as the rows' own ties do, not to a row the page leaves out
+    let clause = match filter {
+        None => String::from("1"),
+        Some(f) if !f.uncategorized => format!("c.category in ({})", list(&f.leaves)),
+        Some(f) => format!("(c.category in ({}) or c.release_id is null)", list(&f.leaves)),
+    };
+    let bigger = format!(
+        "select l.lead_id, sum(coalesce(r.size, 0)) as total,
+                (select max(r.id) from s{s}.upload_link m join s{s}.releases r on r.id = m.release_id
+                 left join s{s}.release_category c on c.release_id = r.id
+                 where m.lead_id = l.lead_id and {VISIBLE_RELEASE} and {clause}) as newest
+         from s{s}.upload_link l join s{s}.releases r on r.id = l.release_id
+         group by l.lead_id
+         having count(*) between 2 and {LINKED_ROWS} and total >= ?1
+            and exists (select 1 from s{s}.releases x where x.id = l.lead_id)
+            and newest is not null
+         order by total desc, newest desc limit ?2"
+    );
+    let leads: Vec<(i64, i64)> =
+        conn.prepare(&bigger)?.query_map([cutoff, want], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_>>()?;
+    let mut members = conn.prepare(&format!("select release_id from s{s}.upload_link where lead_id = ?1"))?;
+    let mut category = conn.prepare(&format!("select category from s{s}.release_category where release_id = ?1"))?;
+    let mut probe = conn.prepare(&probe_sql(s))?;
+    let mut have: std::collections::HashSet<i64> = rows.iter().map(|r| r.id).collect();
+    let keep = usize::try_from(want).unwrap_or(usize::MAX);
+    for (lead, total) in leads {
+        // the shard's answer is cut to `want` after each upload, soo it never holds more than that and one set. Uploads
+        // come biggest first: once one is smaller than the last row kept, none after it gets in. One as big can still
+        // have newer rows, which go first among equals
+        if rows.len() >= keep
+            && rows.last().and_then(|r| whole.get(&r.id).copied().or(r.size)).is_some_and(|last| total < last)
+        {
+            break;
+        }
+        let ids: Vec<i64> = members.query_map([lead], |r| r.get(0))?.collect::<Result<_>>()?;
+        for id in ids {
+            if !have.insert(id) {
+                continue;
+            }
+            if let Some(f) = filter {
+                let kept = match category.query_row([id], |r| r.get::<_, i64>(0)).optional()? {
+                    Some(c) => f.leaves.contains(&c),
+                    None => f.uncategorized,
+                };
+                if !kept {
+                    continue;
+                }
+            }
+            if let Some(row) = probe.query_row([id], release_row).optional()? {
+                whole.insert(row.id, total);
+                rows.push(row);
+            }
+        }
+        if rows.len() > keep {
+            rows.sort_by(|a, b| compare(a, b, Column::Size, true, &whole));
+            rows.truncate(keep);
         }
     }
     Ok(whole)
@@ -711,20 +719,31 @@ mod tests {
         shard.execute_batch(crate::archive::link::UPLOAD_LINK.create).unwrap();
         let bigs: Vec<i64> =
             (0..2).map(|i| f.add(&format!("Big.{i}"), group, Some(6_000), "2026-09-01", Some(UHD))).collect();
-        // five uploads of three pieces, each bigger together than the Bigs
-        for u in 0..5 {
-            let ids: Vec<i64> =
-                (0..3).map(|p| f.add(&format!("u{u}p{p}x"), group, Some(3_000), "2026-10-01", Some(UHD))).collect();
-            for &id in &ids {
+        let link = |ids: &[i64]| {
+            for &id in ids {
                 shard.execute("insert into upload_link (release_id, lead_id) values (?1, ?2)", [id, ids[0]]).unwrap();
             }
-        }
+        };
+        let piece = |name: &str| f.add(name, group, Some(3_000), "2026-10-01", Some(UHD));
+        // the second upload has the newest row of all, soo it's read first; the first ties it and has the next newest
+        let a_lead = piece("aaa111");
+        let middle: Vec<i64> = (0..2).map(|i| piece(&format!("bbb{i}"))).collect();
+        let a_rest: Vec<i64> = (0..2).map(|i| piece(&format!("aaa2{i}"))).collect();
+        let mut a = vec![a_lead];
+        a.extend(&a_rest);
+        link(&a);
+        let mut b = middle.clone();
+        b.push(piece("bbb2"));
+        link(&b);
         let conn = db::open_with_shards(&f.main).unwrap();
-        // the shard's own first two, which it had more than
         let mut rows: Vec<ReleaseRow> =
             bigs.iter().map(|&id| ReleaseRow { id, size: Some(6_000), ..Default::default() }).collect();
-        linked_sizes(&conn, store::shard_of(group), None, &mut rows, 2).unwrap();
-        assert_eq!(rows.len(), 2 + 3, "one upload's rows make the two wanted: the others aren't read in");
+        let whole = linked_sizes(&conn, store::shard_of(group), None, &mut rows, 2).unwrap();
+        let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
+        // all 9,000 as a whole: the newest two rows of either, read past the first upload as the second ties it
+        // read on past the second upload, which made two, as the first ties it: its newer row beats the second's older one
+        assert_eq!(ids, [b[2], a_rest[1]], "cut to the two wanted after each upload");
+        assert!(ids.iter().all(|id| whole[id] == 9_000));
     }
 
     #[test]
