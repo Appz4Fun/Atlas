@@ -1,16 +1,21 @@
 <div align="center">
 
-# Atlas
+# Atlas — Rust Edition
 
-A self-hosted Usenet indexer and Newznab server that runs in your terminal
+A high-performance, self-hosted Usenet indexer, Web UI, and Newznab server written in Rust
 
 [![Rust 1.99.0](https://img.shields.io/badge/Rust-1.99.0-orange?logo=rust&logoColor=white)](https://www.rust-lang.org)
 ![Edition 2024](https://img.shields.io/badge/edition-2024-orange?logo=rust&logoColor=white)
-[![License: GPL-3.0](https://img.shields.io/badge/license-GPL--3.0-blue.svg)](LICENSE)
+[![License: GPL-3.0](https://img.shields.io/badge/license-GPL--3.0-blue.svg)](https://www.gnu.org/licenses/gpl-3.0.txt)
 ![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-informational)
 ![Hackatime](https://hackatime.hackclub.com/api/v1/badge/U09JP15EVQU/Eraxty/Atlas)
 
-[Features](#features) • [Rust](#built-with-rust) • [Install](#installation) • [config.toml](#configure-atlas-configtoml) • [Usage](#usage) • [Stats dashboard](#stats-dashboard) • [Web UI](#web-ui) • [Newznab API](#newznab-api) • [Development](#development)
+[![Support xbmc4lyfe on Patreon](https://img.shields.io/badge/Patreon-Donate%20to%20xbmc4lyfe-F96854?style=for-the-badge&logo=patreon&logoColor=white)](https://www.patreon.com/cw/xbmc4lyfe)
+
+**Authored by:** [Eraxty](https://github.com/Eraxty) & **Forked and ported to Rust by:** [xbmc4lyfe](https://github.com/xbmc4lyfe)  
+**Version:** `v0.0.0.1` • **Last git commit:** [`7bdc024`](https://github.com/Appz4Fun/Atlas/commit/7bdc024d067171e8594288b113fc5d71fd0b582d) • **© 2026** • **License:** [GNU GPL v3.0](https://www.gnu.org/licenses/gpl-3.0.txt) • **Rust Version:** `1.99.0`
+
+[Support on Patreon](#support-development) • [Features](#features) • [Latest Features](#latest-features) • [Deviations from Python](#deviations-from-the-original-python-implementation) • [Built with Rust](#built-with-rust) • [Install](#installation) • [config.toml](#configure-atlas-configtoml) • [Usage](#usage) • [Stats dashboard](#stats-dashboard) • [Web UI](#web-ui) • [Newznab API](#newznab-api) • [Development](#development)
 
 ![Atlas main menu](img/main-menu.png)
 
@@ -18,11 +23,20 @@ A self-hosted Usenet indexer and Newznab server that runs in your terminal
 
 ---
 
+## Support Development
+
+> [!TIP]
+> **Donate to my Patreon to help with AI token costs and get prioritized features and personal support:**  
+> 👉 **[https://www.patreon.com/cw/xbmc4lyfe](https://www.patreon.com/cw/xbmc4lyfe)**  
+> [![Support xbmc4lyfe on Patreon](https://img.shields.io/badge/Patreon-Support%20Development%20%26%20AI%20Token%20Costs-F96854?style=flat-square&logo=patreon&logoColor=white)](https://www.patreon.com/cw/xbmc4lyfe)
+
+---
+
 ## Why Atlas
 
 Many Usenet indexers charge a fee. Atlas is a free, open source alternative that you run yourself. It reads headers from your Usenet provider, works out which posts belong together, stores them in a local database, and builds an NZB file, which a Usenet downloader uses to fetch a release, when you find one you want.
 
-Use Atlas from the terminal, or point Prowlarr, NZBHydra2, Sonarr, Radarr, or any other Newznab client at its API to search releases and download NZB files.
+Use Atlas from the terminal, browse its built-in Web UI, or point Prowlarr, NZBHydra2, Sonarr, Radarr, or any other Newznab client at its API to search releases and download NZB files.
 
 ## Built with Rust
 
@@ -37,7 +51,9 @@ The Rust version replaces the original Python version. It keeps the same menus, 
 | Async network I/O | [`tokio`](https://tokio.rs) with [`rustls`](https://github.com/rustls/rustls) for Transport Layer Security (TLS) |
 | Terminal UI | [`ratatui`](https://ratatui.rs) |
 | Database | [`rusqlite`](https://github.com/rusqlite/rusqlite) with bundled SQLite, Write-Ahead Logging (WAL), and an FTS5 search index |
-| Newznab API | [`tiny_http`](https://github.com/tiny-http/tiny-http) |
+| Web UI & Newznab API | [`tiny_http`](https://github.com/tiny-http/tiny-http) + embedded [`htmx`](https://htmx.org) and Oxide CSS |
+| Compression & archives | [`zstd`](https://github.com/gyscos/zstd-rs), [`flate2`](https://github.com/rust-lang/flate2-rs), [`lzma-rs`](https://github.com/gendx/lzma-rs), and native RAR/7z/ZIP/PPMd/bzip2/lz4 decoders |
+| yEnc decoding | [`nntmux-yenc`](https://github.com/xbmc4lyfe/newznab-tmux) shared with `newznab-tmux` |
 | System stats | [`sysinfo`](https://github.com/GuillaumeGomez/sysinfo) |
 
 rustup installs the pinned toolchain the first time you build, and the `just` recipes always use it, even when another Rust installation, such as Homebrew's, comes first on your `PATH`.
@@ -48,15 +64,51 @@ rustup installs the pinned toolchain the first time you build, and the `just` re
 - **Use all your Usenet servers at once.** List as many providers as you like in `config.toml`. Every server indexes in parallel and keeps its connections busy. For example, 4 servers with 25 connections each keep 100 requests in flight.
 - **Index fast.** Atlas splits header requests into slices that stream over all connections, saves each slice the moment it arrives, and indexes many groups at the same time. When the server supports it, Atlas requests compressed header listings with `XFEATURE COMPRESS GZIP`.
 - **Handle real providers.** Atlas detects fill and bonus servers that only serve articles, lowers its own connection count when a provider refuses more, and pauses servers that reject the login instead of retrying them constantly.
-- **Real categories.** Atlas gives each release a Newznab category and honors `cat`, parents included.
-- **TV and movie IDs.** Atlas stores each release's title, season, and episode, and answers searches by TVDB, IMDb, TMDB, TVMaze, and Trakt ID once you turn on a provider. Every provider is off by default.
-- **Group posts into releases.** Atlas parses subjects into releases, marks incomplete sets, and recovers the real names of obfuscated posts from their par2 or nfo files.
-- **Serve a Newznab API** for Prowlarr, NZBHydra2, Sonarr, and Radarr: `search`, `tvsearch`, `movie`, `music`, `book`, `caps`, and `get`, which downloads an NZB.
+- **Built-in Oxide Web UI.** Search, filter by quality tags (`2160p`, `1080p`, `DV`, `HDR`, `Remux`, `WEB-DL`, `BluRay`, `Hide copies`), sort any column instantly from warm in-memory windows, inspect deep release forensics, view extracted video stills and cover art, browse duplicate clusters (**twins** and **alts**), and query in plain language with **Ask AI** (Google Gemini).
+- **Real categories.** Atlas gives each release a Newznab category (`1000`–`8000`) and honors `cat`, parents included.
+- **TV and movie IDs.** Atlas stores each release's title, season, and episode, and answers searches by TVDB, IMDb, TMDB, TVMaze, and Trakt ID once you turn on a provider. Fetches posters, backdrops, cast, runtimes, and IMDb/Rotten Tomatoes/Metacritic/TMDB/Trakt scores.
+- **Group posts into releases.** Atlas parses subjects into releases, merges cross-group posts and PAR2-linked obfuscated multi-file uploads, marks incomplete sets, and recovers the real names of obfuscated posts from their PAR2, archive, or NFO files and 30+ PreDB feeds.
+- **Deep article & container probes.** Without downloading the release, Atlas inspects yEnc headers, RAR4/RAR5/7z/ZIP archives (up to 10 nested compressed layers), MKV/MP4 video/audio/subtitle streams, HDR10/HLG/Dolby Vision profiles, x264/x265 encoder settings, chapters, cover art, H.264/HEVC video stills, and OpenSubtitles hashes.
+- **Serve a Newznab API** for Prowlarr, NZBHydra2, Sonarr, and Radarr: `search`, `tvsearch`, `movie`, `music`, `book`, `caps`, and `get`, which downloads an NZB (or a single file with `file=N`, or gap-filled from a twin).
 - **Search from the terminal** in one group or all groups, or use **AI search**, which turns a request like `find me 4k hdr movies` into groups and keywords with a local [Ollama](https://ollama.com) model.
-- **Watch progress** on the live dashboard, and dig into CPU, memory, backfill, content, and per-server numbers on the stats dashboard.
-- **Keep everything local** in a SQLite database with a full-text index.
+- **Watch progress** on the live dashboard, dig into CPU, memory, backfill, content, post-processing, and per-server numbers on the 6-page terminal stats dashboard, or scrape Prometheus metrics with the 6 included Grafana dashboards.
+- **Keep everything local** in an 8-shard SQLite database with zstd-sealed article blobs and an FTS5 full-text index.
 
 ![Atlas live dashboard](img/live-dashboard.png)
+
+## Latest Features
+
+Recent additions to the Rust Edition include:
+
+- **Faster backfill & bounded name lookups (`#2`):** Unblocks the `max_unsaved_headers` budget so active groups never stall behind slow slices, and bounds inline name lookups during backfill.
+- **Perceptual hashing (`pHash`) & "Same film" detection (`#73`):** Computes our own DCT perceptual hashes over extracted video stills and surfaces a **Same film** table on the release page linking different encodes, remuxes, or cuts of the same movie across all 8 shards.
+- **Rich container & stream metadata on the release page (`#72`, `#48`, `#36`):** Displays a concise HDR summary (`SDR`, `HDR10`, `HLG`, `DV P5`, `DV P7 + HDR10`, `DV P8`), key `x264`/`x265` encoder settings (`preset`, `crf`, `bitrate`, `qp`, `rc`, `tune`) with a fold-out for all options, Matroska `SegmentUID`, multi-edition indicators (seamless branching cuts), default/commentary/SDH track flags, runtime comparison against TMDB (flagging extended or cut versions), attached cover art (`/ui/cover`), attachment tables, chapter listings, and OpenSubtitles moviehash matching.
+- **Pure-Rust H.264 & HEVC intra keyframe decoders for video stills (`#50`, `#51`, `#54`, `#60`, `#71`):** Extracts JPEG stills at 25%, 50%, and 75% through Matroska video releases (decoding H.264 and HEVC keyframes directly in Rust without ffmpeg) and displays them with timestamps on the release page.
+- **Overview timing forensics at ingest (`#67`):** Records `file_timing` during overview ingestion and derives 13 timing and posting-behavior facts on the release page (first/last article by poster's clock, posting rate in articles/min and KB/s, sequential vs. interleaved file upload order, session count, article number adjacency, threaded replies, crossposts, `From` header consistency, and per-article line keys).
+- **Six forensic catalog panels & inline `+` drawers (`#65`, `#66`):** Every release page presents six detailed panels (**Names**, **Where and when**, **Posted by**, **Inside**, **Health**, and **Keys**) plus lazy fold-outs (**Headers**, **Parts**, **Hashes**), with salted privacy hashes for poster accounts/IPs. Every search result row and duplicate card/link includes a `+` toggle that opens a 10-fact summary drawer inline.
+- **Link fully obfuscated multi-file uploads & cross-group split posts (`#64`, `#53`, `#46`):** Reconstructs multi-file uploads where every file was posted under a separate random name by joining them through their PAR2 set (`LINKED` badge), and folds posts spread across multiple Usenet groups into a single complete release row and unified NZB.
+- **10-layer nested & compressed archive probing (`#52`, `#56`, `#58`, `#61`, `#62`, `#63`):** Follows archives inside archives up to 10 layers deep, decoding compressed RAR5 layers, RAR4 (RAR 2.9 with bytecode filters and PPMd, RAR 2.0, RAR 1.5), 7z LZMA2 with xz Delta and BCJ branch filters, ZIP Deflate/Deflate64/PPMd (method 98)/bzip2/lz4, and LZW `compress`.
+- **Instant in-memory sort windows (`#57`, `#40`):** Keeps the first 2,000 results of active and category searches warm in memory with pre-rendered rows and precomputed sort orders so clicking any column header (`Name`, `Category`, `Size`, `Posted`, `Group`, `Best rated`) sorts in milliseconds.
+- **Ask AI natural language search with Google Gemini (`#59`, `#69`):** Translates plain-English queries in the Web UI (e.g., *"4K Dolby Vision remuxes of Dune, biggest first"*) into structured search terms, categories, quality chips, and sort orders using Google Gemini, with automatic retry and fallback across Gemini Flash models when a model is busy.
+- **Compile-time build footer across all Web UI pages:** Embeds the latest git tag/version, git commit hash link, copyright year, GPL v3.0 license link, compiled `rustc` version, UTC compilation date, and Patreon support link in the footer of every Web UI page at compile time (`build.rs`).
+
+## Deviations from the Original Python Implementation
+
+Atlas was originally created in Python by [Eraxty](https://github.com/Eraxty) (`v5.2.1`) and subsequently forked and ported to Rust by [xbmc4lyfe](https://github.com/xbmc4lyfe) in [`Appz4Fun/Atlas`](https://github.com/Appz4Fun/Atlas). Major architectural and feature deviations from the original Python implementation include:
+
+| Area | Original Python Implementation (`v5.2.1`) | Rust Edition (`Appz4Fun/Atlas`) |
+|---|---|---|
+| **Runtime & Binary** | Python 3.10+ interpreter, virtualenv, and `pip` dependencies | Single native Rust **1.99.0** (edition 2024) binary with zero runtime dependencies |
+| **Configuration & Paths** | `config.json` in the working directory; single Usenet server only | `config.toml` (auto-migrates `config.json` with comment preservation); defaults to `~/.atlas`; supports unlimited parallel `[[usenet_servers]]` with priorities and `index = false` fill servers |
+| **NNTP Engine & Backfill** | Sequential single-server header fetching | Async `tokio` + `rustls` connection pools across all servers simultaneously, `XFEATURE COMPRESS GZIP`, UTC day-chunk backfill splitting across providers, automatic connection-limit step-down, and `max_unsaved_headers` memory backpressure |
+| **Database Architecture** | Single `atlas.db` SQLite file storing raw article rows | `atlas.db` + **8 parallel shard files** (`atlas.s0.db`–`atlas.s7.db`), custom alphabet-packed message IDs (~4× smaller), zstd-compressed sealed file blobs, online/foreground `--compact`, and optional remote `sealed-log` offload service |
+| **Web Interface** | None (terminal UI only) | Built-in **Oxide Web UI** (`src/web.rs`, `src/web_meta.rs`) with htmx, derived cookie auth, instant in-memory sorting, quality filter chips, field search, duplicates browser, 6 forensic panels, `+` inline drawers, video stills, cover art, and **Ask AI** (Google Gemini) |
+| **Release Grouping & Linking** | Basic subject grouping; per-article obfuscated spam created millions of 1-part rows | 1,154 per-group collection & naming regexes (ported from `newznab-tmux`), PAR2-set linking of fully obfuscated uploads, cross-group post folding, per-article obfuscated upload gathering/filtering, and automatic minor-labeled group blocking |
+| **Post-Processing & Probing** | Inline PAR2/NFO deobfuscation during save only | Persistent two-lane post-processing stage (`src/postprocess/`) with rate-budgeted article probes, 10-layer nested archive decompression (RAR4/5, 7z, ZIP, PPMd, LZMA2, bzip2, lz4), MKV/MP4 stream inspection, H.264/HEVC keyframe still extraction, and `pHash` same-film matching |
+| **PreDB & Naming** | None | Dedicated `atlas.predb.db` polling 30+ scene/P2P feeds (RSS, JSON APIs, dumps) plus `--predb-import`, strict name grading, `--reflag-obfuscated`, and `--unname` |
+| **Categories & Media IDs** | Hardcoded single category `7000` (`Other`) for all releases; no TV/movie IDs | Full Newznab category tree (`1000`–`8000`, with `7000` properly assigned to **Books** and `8000` to **Other**), TV/movie title parser, and ID resolution via TVMaze, TMDB, Trakt, TheTVDB, OMDb, and NFO IMDb IDs |
+| **Duplicate Detection** | None | Cryptographic fingerprinting of **Twins** (identical postings that can fill each other's missing articles via `fill=1`) and **Alts** (same unpacked file sizes packed differently) |
+| **Observability** | Basic terminal progress screen | 6-page Ratatui **Stats Dashboard** (Overview, Backfill, Content, Servers, Bottleneck, Post-processing) + Prometheus `/metrics` & `/healthz` endpoints and 6 **Grafana dashboards** as code |
 
 ## Installation
 
@@ -91,6 +143,21 @@ usage: atlas [--selftest | --bg-indexer | --convert]
   --bg-indexer  run the indexing loop headless (the menu starts this for you)
   --convert     move a database from before the shards into them, then exit
                 (the indexer does this on its own when it starts)
+  --compact     rewrite the shards smaller (stop indexing first), then exit
+  --purge       delete what no step can help, a dry run unless --apply. Alone it takes
+                fragments only: [--fragments] [--blocked] [--too-small [--below BYTES]]
+                [--image-only] [--rejected] [--dead] [--sample N] [--apply]
+  --reprocess   look at stored releases again, a dry run unless --apply:
+                [--step NAME]... [--group NAME]... [--failed] [--apply]
+  --reflag-obfuscated  flag old rows the current check calls random, a dry run unless
+                --apply: [--sample N] [--apply]
+  --unname      clear names taken from subjects and posted files, a dry run unless
+                --apply: [--sample N] [--apply]
+  --sealed-log-move  move sealed articles to the sealed log at full speed (stop indexing first)
+  --predb-import  read PreDB titles from a local file, a dry run unless --apply:
+                FILE [--apply]
+  --search-indexes  index poster and size, for searching on them (stop indexing first),
+                a dry run unless --apply: [--apply]
 ```
 
 ### Prebuilt binaries
@@ -374,7 +441,8 @@ Each release gets a look at a few of its articles, without being downloaded: `AR
 
 - **yEnc:** the real file name and size, parts, line length, article size and the file's CRC32, from the `=ybegin`, `=ypart` and `=yend` lines.
 - **Checks:** whether the parts cover every byte, whether the first part's size and checksum are right, the share of overhead, and whether a server still has the first, middle and last articles.
-- **What's in it:** MKV and MP4 tracks, with resolution, codecs, bit depth, HDR, Dolby Vision, languages and subtitle flags, read through a RAR that only stores its files. For an archive, its format, method and encryption, and its first file's name, size and CRC32.
+- **What's in it:** MKV and MP4 tracks, with resolution, display aspect ratio, codecs, bit depth, HDR summary (`SDR`, `HDR10`, `HLG`, `DV P5`, `DV P7 + HDR10`, `DV P8`), Dolby Vision profile/level/enhancement layer, colour primaries (`BT.709`, `BT.2020`, `DCI-P3`, `Display P3`), `x264`/`x265` encoder settings, `SegmentUID`, editions, Atmos, languages, default/commentary/SDH subtitle flags, chapters, attached cover art, attachments, and OpenSubtitles moviehash matches. Archives are followed up to 10 nested layers deep across uncompressed and compressed RAR5, RAR4 (RAR 2.9 with bytecode filters and PPMd, RAR 2.0, RAR 1.5), 7z LZMA2 (with xz Delta and BCJ branch filters), ZIP (Deflate, Deflate64, PPMd method 98, bzip2, lz4), and LZW `compress`.
+- **Stills & Same film:** pure-Rust H.264 and HEVC intra keyframe decoders extract JPEG stills at 25%, 50%, and 75% of Matroska video releases, compute DCT perceptual hashes (`pHash`), and list other releases of the **Same film** across all shards.
 - **How it was posted:** the posting tool, dates, path, organization, injection info and crossposted groups, from the article's headers.
 - **NFO and SFV:** the NFO's text, IMDb ids and any password in it, and the SFV's checksums.
 
@@ -617,7 +685,11 @@ A quick filter also finds the other ways its word is written, such as `4k` and `
 
 Below a release's facts, six panels show everything else Atlas knows about it, from what it already stored: **Names** (the subject as posted, decoded and as a template, whether the subject, yEnc and archive names agree, what was obfuscated and where the real name came from, REPACK and PROPER tells, subjects posted with RFC 2047 words, the NFO's links, fields, shape and pasted reports, the PreDB match), **Where and when** (the Date header's form, the weekday and hour in the poster's zone, clock skews between the date headers, the time a message-id carries, and, for releases indexed from now on, the first and last article by the poster's clock, the posting rate, whether the files went up one after another or interleaved and in how many sessions, the article numbers read and whether they were adjacent, threaded replies, crossposts by Xref and whether the From changed between articles), **Posted by** (the From header's shape, the injecting host and its backbone, which Injection-Info parts are present, the message-id grammar, the posting tool against its defaults; a **Headers** fold-out lists the kept headers), **Inside** (the type mix and volume sizes, the volume scheme, what it unpacks to, the packed ratio, packer tells, where the inner names came from, the PAR2 slice and repair capacity), **Health** (the yEnc control lines, subject and yEnc numbering, the last arrival, lines an article and the articles that came after a file sealed; a **Parts** fold-out maps every file's parts with its first and last ids and article sizes) and **Keys** (keys over the first message-id, the collection key, the twin and alt fingerprints, a structural key over the tracks, the archive's password check, an NZBLNK, a key over the per-file line counts; a **Hashes** fold-out digests the segment set). Posting accounts and hosts are never printed: they appear as salted keys only, so two posts from one account can be lined up without reading it. Every result row has a **+** that opens a drawer with ten of these facts, without leaving the list, and so has every copy on the duplicates page and under a release's other copies, cards and links alike.
 
-The search box's More fields searches on Usenet group, poster, email, size (`1234567890`, or `1.5 GB` as the pages write it, which finds every size written that way), release group, CRC32 and posting tool. Clicking any of those on a release's page does the same, and the results show a total. Each column heading sorts, both ways.
+The search box's More fields searches on Usenet group, poster, email, size (`1234567890`, or `1.5 GB` as the pages write it, which finds every size written that way), release group, CRC32 and posting tool. Clicking any of those on a release's page does the same, and the results show a total. Each column heading sorts, both ways, instantly from an in-memory window of the first 2,000 results kept warm in the background.
+
+With a Google Gemini API key configured in **Settings** (or via `GEMINI_API_KEY`), the **Ask AI** search bar translates natural-language queries (for example, `4K Dolby Vision remuxes of Dune, biggest first`) into search terms, categories, quality filters, and sort order. Nothing from your index is sent to Google—only your question and the list of available categories and filter names. If the configured Gemini model is busy (`503`/`429`), Atlas retries and automatically falls back across Gemini Flash models.
+
+Every page in the Web UI includes a persistent footer displaying the compile-time build metadata (`Atlas - Rust Edition`, authors, latest tag/version, git commit link, copyright year, GPL v3.0 license link, compiled Rust version, UTC compilation timestamp, and Patreon support link).
 
 [htmx](https://htmx.org) (0BSD) is built into the binary from `assets/`, so the page needs no internet access. The look is [Oxide](https://appz4fun.github.io/RustyGet/design-system.html), the design system of RustyGet, in light and dark.
 
@@ -874,6 +946,7 @@ The screenshots come from a real instance, with its address, host name and news 
 | `ATLAS_API_PORT` | API port. See `api_port`. |
 | `OLLAMA_HOST` | Ollama server for AI search. Default: `127.0.0.1:11434`. |
 | `ATLAS_AI_MODEL` | Ollama model for AI search. Default: `qwen3:4b`. |
+| `GEMINI_API_KEY` | Google Gemini API key for **Ask AI** in the Web UI (can also be saved in **Settings** in the Web UI). |
 | `ATLAS_NO_KEYRING` | Skips the OS keyring and keeps passwords in `config.toml`. |
 | `ATLAS_PROFILE` | Set to `1` to log a timing breakdown of the indexer every 30 seconds. |
 | `ATLAS_SAB_HOST`, `ATLAS_SAB_PORT`, `ATLAS_SAB_DIR`, `ATLAS_PYTHON` | Optional SABnzbd handoff. See [Direct downloads](#direct-downloads-with-sabnzbd). |
@@ -918,6 +991,7 @@ CI (`.github/workflows/ci.yml`) checks formatting, runs clippy, and runs the tes
 
 | Path | Contents |
 |---|---|
+| `build.rs` | Compile-time build metadata (`ATLAS_BUILD_VERSION`, `ATLAS_GIT_SHA`, `ATLAS_GIT_SHORT_SHA`, `ATLAS_RUSTC_VERSION`, `ATLAS_BUILD_DATE`, `ATLAS_BUILD_YEAR`) embedded in the Web UI footer. |
 | `src/nntp.rs` | Async NNTP client, per-server connection pools built on tokio and rustls, compression, and failover. |
 | `src/indexer.rs` | One indexing pass over a group: slices, parsing, naming, and saving. |
 | `src/bg_indexer.rs` | The background scheduler: workers per server, live config reload, and status and stats files. |
@@ -926,16 +1000,18 @@ CI (`.github/workflows/ci.yml`) checks formatting, runs clippy, and runs the tes
 | `data/`, `scripts/` | The regex tables built into the binary, and the scripts that convert them from upstream. |
 | `src/predb/` | The PreDB file, its feeds and polling, matching, the late path, and `--predb-import`. |
 | `src/category/` | The category table, the rules, and the step that stores them. |
-| `src/media/` | Titles from names, the ID providers, the title cache, the steps, and ID searches. |
-| `src/archive/` | Reading file lists from RAR, ZIP, 7z, and PAR2 headers, and the steps that store them. |
+| `src/media/`, `src/ptt/` | Titles from names, the ID providers, the title cache, posters/ratings, the steps, and ID searches. |
+| `src/archive/`, `src/probe/`, `src/video/` | Reading file lists and media tracks from up to 10 nested compressed layers (RAR4/5, ZIP, 7z, PPMd, LZMA2, bzip2, lz4), MKV/MP4 stream inspection, cover art, OpenSubtitles moviehash, H.264/HEVC intra keyframe decoders, video stills, and `pHash` same-film matching. |
 | `src/collections.rs`, `data/collection_regexes.tsv` | Which articles belong to one post: per-group regexes and a generic cleaner. `scripts/collection_regexes_to_tsv.py` makes the data file from the upstream seeder. |
 | `src/filters.rs` | What Atlas refuses to index: posts obfuscated per article and blocked groups. |
 | `src/db.rs` | The main database: group cursors, connections, and checkpoints. |
-| `src/store.rs` | The 8 shard files: compact layout, release IDs, saving, and reading articles back. |
+| `src/store.rs`, `src/blob.rs`, `src/compact.rs`, `src/sealed_store.rs` | The 8 shard files: compact layout, release IDs, zstd sealed blobs, `--compact`, and remote `sealed-log` offload. |
 | `src/convert.rs` | The one-time conversion of an older database. |
-| `src/search.rs` | Search across the shards. |
+| `src/search.rs`, `src/field_search.rs`, `src/dates.rs` | Search across the shards, field search (`--search-indexes`), and overview timing forensics. |
+| `src/duplicates.rs`, `src/release_info.rs`, `src/release_tags.rs` | Twin and alt duplicate clustering, gap-filled NZBs, cross-group and PAR2-linked post merging, release metadata, and tag parsing. |
 | `src/postprocess/` | The stage releases go through after saving: rules, steps, the two lanes, purge, and reprocess. |
 | `src/api.rs`, `src/nzb.rs` | Newznab API and NZB building. |
+| `src/web.rs`, `src/web_meta.rs`, `src/gemini.rs`, `assets/` | Built-in Oxide Web UI, in-memory sort windows, six forensic release panels, `+` inline drawers, and Google Gemini **Ask AI** search. |
 | `src/metrics/` | The registry, every metric's name, the `/metrics` listener, and the catalog walk. |
 | `deploy/` | The scrape config and the Grafana dashboards. |
 | `grafana/` | The dashboards exported for import, their screenshots and the GitHub Pages site. |
@@ -950,7 +1026,7 @@ CI (`.github/workflows/ci.yml`) checks formatting, runs clippy, and runs the tes
 ## Limitations
 
 - An upload obfuscated per article is recognized only with 16 of its middle parts in one slice, so files under 18 parts and stragglers at a slice's edge become releases as before.
-- Files merge into one release only when a counter or a collection regex of the group says they belong together.
+- Files merge into one release only when a counter, a collection regex of the group, or a PAR2 set says they belong together.
 - Two same-day posts by one poster with the same shape and file count merge, and that release stays incomplete.
 - A pack merges only when each file's `[n/m]` equals its own number, so a pack with an nfo first stays by file.
 - Album tracks named with the track number first stay by file.
@@ -959,16 +1035,23 @@ CI (`.github/workflows/ci.yml`) checks formatting, runs clippy, and runs the tes
 
 ## Credits
 
-[Eraxty](https://github.com/Eraxty) built Atlas over 60 days and more than 100 hours. It's their biggest project so far, and they thank the Hack Club community for the push to build it.
-
-AI helped with bug fixes, refactoring, SABnzbd integration, the background indexer, terminal UI polish, testing, and a few smaller tasks.
-
-The Rust port, with multi-server parallel indexing, the async NNTP client, the stats dashboard, and the extended Newznab API, lives in the [Appz4Fun fork](https://github.com/Appz4Fun/Atlas).
-
-The rule for articles obfuscated per article, the collection regexes and cleaner, the release rules, the rules for choosing what to read in a release, the naming regexes and name fixing, the PreDB feeds and matching rules, and the category rules and lists are ported from [newznab-tmux](https://github.com/xbmc4lyfe/newznab-tmux), GPLv3. 7z headers are decoded with [lzma-rs](https://github.com/gendx/lzma-rs), MIT.
-
-The title parsing, the candidate scoring, and the order of ID providers are ported from [newznab-tmux](https://github.com/NNTmux/newznab-tmux), GPLv3. This product uses the TMDB API but is not endorsed or certified by TMDB. TV data comes from [TVMaze](https://www.tvmaze.com), CC BY-SA, from [Trakt](https://trakt.tv), and from [TheTVDB](https://thetvdb.com): metadata provided by TheTVDB, please consider adding missing information or subscribing.
+- **Original Author:** [Eraxty](https://github.com/Eraxty) built the original Python version of Atlas over 60 days and more than 100 hours, thanking the Hack Club community for the push to build it.
+- **Rust Port & Continued Development:** Forked and ported to Rust by [xbmc4lyfe](https://github.com/xbmc4lyfe) in the [Appz4Fun/Atlas](https://github.com/Appz4Fun/Atlas) repository, introducing the multi-server async NNTP engine, 8-shard compact SQLite storage, Oxide Web UI, 10-layer archive and media stream probing, pure-Rust H.264/HEVC keyframe still decoders, `pHash` same-film matching, twin/alt duplicate clustering, 6-page stats dashboard, Prometheus/Grafana observability, and extended Newznab API.
+- **Upstream Ports & Libraries:** The rule for articles obfuscated per article, collection regexes and cleaner, release rules, naming regexes and name fixing, PreDB feeds and matching rules, category rules, title parsing, candidate scoring, ID provider ordering, and `nntmux-yenc` are ported/shared from [newznab-tmux](https://github.com/xbmc4lyfe/newznab-tmux) / [NNTmux](https://github.com/NNTmux/newznab-tmux), GPLv3. 7z headers are decoded with [lzma-rs](https://github.com/gendx/lzma-rs), MIT.
+- **Media Metadata:** This product uses the TMDB API but is not endorsed or certified by TMDB. TV data comes from [TVMaze](https://www.tvmaze.com) (CC BY-SA), [Trakt](https://trakt.tv), and [TheTVDB](https://thetvdb.com) (please consider adding missing information or subscribing).
 
 ## License
 
-[GNU General Public License v3.0](LICENSE). The bundled SABnzbd uses GPL-2.0 or later and keeps its own license.
+[GNU General Public License v3.0](https://www.gnu.org/licenses/gpl-3.0.txt) ([local copy](LICENSE)). The bundled SABnzbd uses GPL-2.0 or later and keeps its own license.
+
+---
+
+<div align="center">
+
+**Atlas - Rust Edition.** Authored by: [Eraxty](https://github.com/Eraxty) & Forked and ported to Rust by: [xbmc4lyfe](https://github.com/xbmc4lyfe)  
+Version: `v0.0.0.1` · last git commit: [`7bdc024`](https://github.com/Appz4Fun/Atlas/commit/7bdc024d067171e8594288b113fc5d71fd0b582d) · © 2026 · License: [GPL v3 (GNU General Public License v3.0)](https://www.gnu.org/licenses/gpl-3.0.txt) · Rust Version: `1.99.0`  
+Donate to my Patreon to help with AI token cost and get prioritized features and personal support:  
+[![Patreon - xbmc4lyfe](https://img.shields.io/badge/Patreon-xbmc4lyfe-F96854?style=for-the-badge&logo=patreon&logoColor=white)](https://www.patreon.com/cw/xbmc4lyfe)  
+**[https://www.patreon.com/cw/xbmc4lyfe](https://www.patreon.com/cw/xbmc4lyfe)**
+
+</div>
