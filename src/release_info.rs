@@ -379,7 +379,12 @@ pub fn linked_post_with(conn: &Connection, id: i64) -> Result<Option<SplitPost>>
     groups.sort_unstable();
     groups.dedup();
     // a file of the set that hasn't turned up is missing from the download, however whole the rest is
-    let complete = files.len() as i64 >= wanted && union_files(conn, &ids)?.complete_by_files();
+    // each row is a file of its own, soo each is checked alone: rows sharing a name must not fill each other's gaps
+    let mut each_whole = true;
+    for row in &ids {
+        each_whole &= union_files(conn, &[*row])?.complete_by_files();
+    }
+    let complete = files.len() as i64 >= wanted && each_whole;
     Ok(Some(SplitPost { ids, groups, size, complete, lead: Some(lead), recovery }))
 }
 
@@ -809,6 +814,19 @@ mod tests {
         assert!(!linked_post_with(&conn, 8).unwrap().unwrap().complete, "two copies of one file of two");
         conn.execute_batch("update s0.upload_link set par2_file = x'02' where release_id = 16").unwrap();
         assert!(linked_post_with(&conn, 8).unwrap().unwrap().complete);
+    }
+
+    #[test]
+    fn same_named_files_of_a_linked_upload_do_not_fill_each_others_gaps() {
+        let (_dir, conn) = linked_shard();
+        conn.execute_batch(
+            "insert into s0.upload_link (release_id, lead_id, recovery, wanted) values (8, 8, 0, null), (16, 8, 1, 1), (24, 8, 1, 1);
+             update s0.files set filename = 'same.bin' where id in (8, 16);",
+        )
+        .unwrap();
+        conn.execute("update s0.files set expected = 3, seen = ?1 where id = 8", [vec![0b011u8]]).unwrap();
+        conn.execute("update s0.files set expected = 3, seen = ?1 where id = 16", [vec![0b101u8]]).unwrap();
+        assert!(!linked_post_with(&conn, 8).unwrap().unwrap().complete);
     }
 
     #[test]
