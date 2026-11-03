@@ -409,9 +409,7 @@ fn the_web_ui_end_to_end() {
         )
         .unwrap();
     }
-    let heart = fetch(port, "/ui/results?q=Heartsplit", &cookie);
-    assert_eq!(heart.body.matches("Heartsplit.1981.2160p-GRP</a>").count(), 1, "{}", heart.body);
-    assert!(heart.body.contains("4 GROUPS") && !heart.body.contains("INCOMPLETE"), "{}", heart.body);
+    let mut heart_ids = Vec::new();
     for (name, group) in [
         ("Heartsplit.1981.2160p-GRP", "alt.binaries.g1"),
         ("Heartsplit.1981.2160p-GRP.vol001-003", "alt.binaries.g2"),
@@ -420,6 +418,23 @@ fn the_web_ui_end_to_end() {
     ] {
         let g_shard = db::open_shard(&store::shard_path(&main, store::shard_of(group))).unwrap();
         let row_id: i64 = g_shard.query_row("select id from releases where name = ?1", [name], |r| r.get(0)).unwrap();
+        heart_ids.push((row_id, name, group));
+    }
+    let heart_lead = heart_ids[0].0;
+    for &(row_id, name, group) in &heart_ids {
+        let g_shard = db::open_shard(&store::shard_path(&main, store::shard_of(group))).unwrap();
+        let recovery = i64::from(!name.ends_with(".mkv"));
+        g_shard
+            .execute(
+                "insert into upload_link (release_id, lead_id, recovery, wanted) values (?1, ?2, ?3, 1)",
+                rusqlite::params![row_id, heart_lead, recovery],
+            )
+            .unwrap();
+    }
+    let heart = fetch(port, "/ui/results?q=Heartsplit", &cookie);
+    assert_eq!(heart.body.matches("Heartsplit.1981.2160p-GRP</a>").count(), 1, "{}", heart.body);
+    assert!(heart.body.contains("4 GROUPS") && !heart.body.contains("INCOMPLETE"), "{}", heart.body);
+    for (row_id, name, _) in heart_ids {
         let page = fetch(port, &format!("/ui/release?id={row_id}"), &cookie);
         assert!(page.body.contains("COMPLETE") && !page.body.contains("INCOMPLETE"), "{name}: {}", page.body);
         assert!(page.body.contains("<h1>Heartsplit.1981.2160p-GRP</h1>"), "{name}: {}", page.body);

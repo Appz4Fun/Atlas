@@ -79,7 +79,7 @@ static FILE_COUNT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\[(\d+)\s*
 
 static RELEASE_SUFFIX_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"(?i)\.(part\d*|r\d+|s\d\d|z\d{2,3}|vol\d+[+-]\d+|par[23]|nfo|sfv|srr|srs|nzb|rar|7z\.\d{2,3}|(?:rar|zip)\.\d{2,3}|0\d\d|iby\d+[+-]\d+|cne[27]|cneg\d*|ene)$",
+        r"(?i)\.(part\d*|r\d+|z\d{2,3}|vol\d+[+-]\d+|par[23]|nfo|sfv|srr|srs|nzb|rar|7z\.\d{2,3}|(?:rar|zip)\.\d{2,3}|0\d\d|iby\d+[+-]\d+|cne[27]|cneg\d*|ene)$",
     )
     .unwrap()
 });
@@ -429,5 +429,12 @@ mod tests {
         let parts: Vec<_> = r.articles.iter().map(|a| (a.part, a.total_parts, a.file_total)).collect();
         assert_eq!(parts, vec![(Some(1), Some(3), None), (Some(2), Some(3), None), (Some(3), Some(3), None)]);
         assert!(is_complete(&r.articles));
+    }
+
+    #[test]
+    fn season_identifiers_survive_suffix_stripping() {
+        assert_eq!(strip_release_suffixes("Example.Show.S01.part1.rar"), "Example.Show.S01");
+        assert_eq!(strip_release_suffixes("Example.Show.S02.vol000-001.par2"), "Example.Show.S02");
+        assert_eq!(strip_release_suffixes("Example.Show.S01.7z.001"), "Example.Show.S01");
     }
 }

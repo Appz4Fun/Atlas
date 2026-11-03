@@ -478,10 +478,12 @@ pub fn linked_post_with(conn: &Connection, id: i64) -> Result<Option<SplitPost>>
 /// All of the post a row is part of: an upload linked by its PAR2 set, or the same post cut across groups or files.
 pub fn whole_post_with(conn: &Connection, release: &crate::search::ReleaseRow) -> Result<Option<SplitPost>> {
     if let Some(post) = linked_post_with(conn, release.id)? {
+        if let Ok(Some(split)) = split_post_with(conn, release)
+            && (split.ids.len() > post.ids.len() || (split.complete && !post.complete))
+        {
+            return Ok(Some(split));
+        }
         return Ok(Some(post));
-    }
-    if release.complete && crate::parser::strip_release_suffixes(&release.name) == release.name {
-        return Ok(None);
     }
     split_post_with(conn, release)
 }
@@ -504,10 +506,9 @@ const SPLIT_POST_GROUPS: usize = 16;
 pub fn split_post_with(conn: &Connection, release: &crate::search::ReleaseRow) -> Result<Option<SplitPost>> {
     let posted = names_with(conn, release.id)?.map_or(release.name.clone(), |n| n.posted);
     let exact = exact_split_post(conn, &posted, &release.poster)?;
-    if exact.as_ref().is_some_and(|p| p.complete) && crate::parser::strip_release_suffixes(&posted) == posted {
-        return Ok(exact);
-    }
-    if let Some(stem_post) = split_stem_post(conn, &posted, release)? {
+    if let Some(stem_post) = split_stem_post(conn, &posted, release)?
+        && exact.as_ref().is_none_or(|e| stem_post.ids.len() > e.ids.len())
+    {
         return Ok(Some(stem_post));
     }
     Ok(exact)
@@ -549,6 +550,7 @@ fn exact_split_post(conn: &Connection, posted: &str, poster: &Option<String>) ->
 #[derive(Clone)]
 struct StemCandidate {
     id: i64,
+    name: String,
     group: String,
     poster: Option<String>,
     bytes: i64,
@@ -575,30 +577,109 @@ fn split_stem_post(conn: &Connection, posted: &str, release: &crate::search::Rel
                 r.get::<_, Option<f64>>(5)?,
             ))
         })?;
+        let mut shard_rows = 0;
         for row in rows {
+            shard_rows += 1;
+            if shard_rows > LINKED_ROWS {
+                return Ok(None);
+            }
             let (id, name, group, poster, bytes, date) = row?;
             if post_stem(&name).eq_ignore_ascii_case(&stem) {
-                all.push(StemCandidate { id, group, poster, bytes, date });
+                all.push(StemCandidate { id, name, group, poster, bytes, date });
+                if all.len() > LINKED_ROWS {
+                    return Ok(None);
+                }
             }
         }
+    }
+    if all.len() < 2 {
+        return Ok(None);
     }
     let Some(anchor_date) = all.iter().find(|c| c.id == release.id).and_then(|c| c.date) else {
         return Ok(None);
     };
     let close: Vec<StemCandidate> =
         all.into_iter().filter(|c| c.date.is_some_and(|d| (d - anchor_date).abs() <= SPLIT_POST_DAYS)).collect();
-    if let Some(post) = try_stem_subset(conn, &stem, &close)? {
+    if let Some(linked) = linked_stem_candidates(conn, release.id, &close)?
+        && let Some(post) = try_stem_subset(conn, &stem, &linked, true)?
+    {
         return Ok(Some(post));
     }
     let same_poster: Vec<StemCandidate> = close.iter().filter(|c| c.poster == release.poster).cloned().collect();
-    if let Some(post) = try_stem_subset(conn, &stem, &same_poster)? {
+    if let Some(post) = try_stem_subset(conn, &stem, &same_poster, false)? {
         return Ok(Some(post));
     }
     let same_group: Vec<StemCandidate> = same_poster.into_iter().filter(|c| c.group == release.group_name).collect();
-    try_stem_subset(conn, &stem, &same_group)
+    try_stem_subset(conn, &stem, &same_group, false)
 }
 
-fn try_stem_subset(conn: &Connection, stem: &str, subset: &[StemCandidate]) -> Result<Option<SplitPost>> {
+fn candidate_lead(conn: &Connection, id: i64) -> Result<Option<i64>> {
+    let s = store::shard_of_id(id);
+    let Ok(mut stmt) = conn.prepare_cached(&format!("select lead_id from s{s}.upload_link where release_id = ?1"))
+    else {
+        return Ok(None);
+    };
+    stmt.query_row([id], |r| r.get::<_, i64>(0)).optional()
+}
+
+fn linked_stem_candidates(
+    conn: &Connection,
+    anchor_id: i64,
+    close: &[StemCandidate],
+) -> Result<Option<Vec<StemCandidate>>> {
+    let Some(anchor) = close.iter().find(|c| c.id == anchor_id) else {
+        return Ok(None);
+    };
+    let mut leads = HashMap::new();
+    for c in close {
+        if let Some(lead) = candidate_lead(conn, c.id)? {
+            leads.insert(c.id, lead);
+        }
+    }
+    let lead = match leads.get(&anchor_id).copied() {
+        Some(lead) => lead,
+        None => {
+            let mut sib_leads: Vec<i64> = close
+                .iter()
+                .filter(|c| c.name == anchor.name && c.poster == anchor.poster)
+                .filter_map(|c| leads.get(&c.id).copied())
+                .collect();
+            sib_leads.sort_unstable();
+            sib_leads.dedup();
+            let [lead] = sib_leads.as_slice() else { return Ok(None) };
+            *lead
+        }
+    };
+    let linked_pairs: HashSet<(&str, &Option<String>)> = close
+        .iter()
+        .filter(|c| leads.get(&c.id) == Some(&lead))
+        .map(|c| (c.name.as_str(), &c.poster))
+        .collect();
+    let mut valid_pairs = HashSet::new();
+    for pair in &linked_pairs {
+        let pair_ids: Vec<i64> =
+            close.iter().filter(|c| (c.name.as_str(), &c.poster) == *pair).map(|c| c.id).collect();
+        if pair_ids.len() == 1 || union_files(conn, &pair_ids)?.one_upload() {
+            valid_pairs.insert(*pair);
+        }
+    }
+    let subset: Vec<StemCandidate> = close
+        .iter()
+        .filter(|c| leads.get(&c.id) == Some(&lead) || valid_pairs.contains(&(c.name.as_str(), &c.poster)))
+        .cloned()
+        .collect();
+    if subset.len() < 2 || !subset.iter().any(|c| c.id == anchor_id) {
+        return Ok(None);
+    }
+    Ok(Some(subset))
+}
+
+fn try_stem_subset(
+    conn: &Connection,
+    stem: &str,
+    subset: &[StemCandidate],
+    has_provenance: bool,
+) -> Result<Option<SplitPost>> {
     if !(2..=LINKED_ROWS).contains(&subset.len()) {
         return Ok(None);
     }
@@ -606,10 +687,13 @@ fn try_stem_subset(conn: &Connection, stem: &str, subset: &[StemCandidate]) -> R
     if !close_together(&dates) {
         return Ok(None);
     }
+    let same_poster = subset.windows(2).all(|w| w[0].poster == w[1].poster);
+    if !same_poster && !has_provenance {
+        return Ok(None);
+    }
     let mut ids: Vec<i64> = subset.iter().map(|c| c.id).collect();
     let mut groups: Vec<String> = subset.iter().map(|c| c.group.clone()).collect();
     let size: i64 = subset.iter().map(|c| c.bytes).sum();
-    let same_poster = subset.windows(2).all(|w| w[0].poster == w[1].poster);
     ids.sort_unstable();
     groups.sort_unstable();
     groups.dedup();
@@ -617,7 +701,7 @@ fn try_stem_subset(conn: &Connection, stem: &str, subset: &[StemCandidate]) -> R
         return Ok(None);
     }
     let files = union_files(conn, &ids)?;
-    if !files.one_stem_upload(stem, same_poster) {
+    if !files.one_stem_upload(stem, same_poster, has_provenance) {
         return Ok(None);
     }
     Ok(Some(SplitPost { ids, groups, size, complete: files.complete(), lead: None, recovery: Vec::new() }))
@@ -638,7 +722,8 @@ fn split_post_sql(s: usize) -> String {
 fn split_stem_sql(s: usize) -> String {
     format!(
         "select id, name, group_name, poster, coalesce(size, 0), julianday(posted_date) from s{s}.releases
-         where (name = ?1 or (name >= ?2 and name < ?3)) and not atlas_blocked(group_name) limit 128"
+         where (name = ?1 or (name >= ?2 and name < ?3)) and not atlas_blocked(group_name) limit {}",
+        LINKED_ROWS + 1
     )
 }
 
@@ -684,8 +769,8 @@ impl UnionFiles {
         !self.conflict && total_fits && self.linked()
     }
 
-    fn one_stem_upload(&self, stem: &str, same_poster: bool) -> bool {
-        if self.conflict || self.files.is_empty() {
+    fn one_stem_upload(&self, stem: &str, same_poster: bool, has_provenance: bool) -> bool {
+        if self.conflict || self.files.is_empty() || (!same_poster && !has_provenance) {
             return false;
         }
         if !self.files.keys().all(|f| post_stem(f).eq_ignore_ascii_case(stem)) {
@@ -723,7 +808,7 @@ impl UnionFiles {
 
     /// Whether every file the post says it has is there with exactly its parts.
     fn complete(&self) -> bool {
-        let total = self.file_totals.iter().next().copied().flatten();
+        let total = self.file_totals.iter().copied().flatten().next();
         !self.files.is_empty()
             && total.is_none_or(|total| self.files.len() as i64 == total + i64::from(self.zero_indexed))
             && self.files.values().all(|f| f.expected.is_some_and(|want| store::is_exactly(&f.seen, want)))
@@ -1245,13 +1330,51 @@ mod tests {
             )
             .unwrap();
         }
-        for id in [8, 16, 24, 32, 40] {
+        // Without upload_link provenance, cross-poster rows must not merge across different posters
+        let unlinked_row = crate::search::ReleaseRow {
+            id: 16,
+            name: format!("{stem}.vol001-003"),
+            group_name: "alt.binaries.multimedia.alias".into(),
+            poster: Some("p2@nyuu".into()),
+            complete: false,
+            ..Default::default()
+        };
+        assert_eq!(whole_post_with(&conn, &unlinked_row).unwrap(), None);
+
+        // Link the per-file rows via upload_link (row 32 joins via its same-(name, poster) sibling row 24)
+        conn.execute_batch(
+            "insert into s0.upload_link (release_id, lead_id, recovery, wanted)
+             values (40, 40, 0, null), (8, 40, 1, 1), (16, 40, 1, 1), (24, 40, 1, 1);",
+        )
+        .unwrap();
+
+        // An unlinked third-party row sharing the stem is rejected and cannot poison the merged post
+        conn.execute(
+            "insert into s0.releases (id, name, group_name, poster, posted_date, size, complete, parts, file_total)
+             values (48, ?1, 'alt.binaries.multimedia.alias', 'evil@attacker', '2025-11-28 02:30:00', 999, 1, 1, 4)",
+            rusqlite::params![format!("{stem}.exe")],
+        )
+        .unwrap();
+        conn.execute(
+            "insert into s0.files (id, release_id, filename, subject, expected, file_total, seen)
+             values (48, 48, ?1, ?2, 1, 4, ?3)",
+            rusqlite::params![format!("{stem}.exe"), format!("[04/04] - \"{stem}.exe\" yEnc (1/1)"), vec![0b10u8]],
+        )
+        .unwrap();
+
+        for (id, rname, poster, complete) in [
+            (8, stem.to_string(), "p1@nyuu", true),
+            (16, format!("{stem}.vol001-003"), "p2@nyuu", false),
+            (24, format!("{stem}.vol003-007"), "p3@nyuu", false),
+            (32, format!("{stem}.vol003-007"), "p3@nyuu", false),
+            (40, format!("{stem}.mkv"), "p4@nyuu", true),
+        ] {
             let row = crate::search::ReleaseRow {
                 id,
-                name: format!("{stem}.vol001-003"),
+                name: rname,
                 group_name: "alt.binaries.multimedia.alias".into(),
-                poster: Some("p2@nyuu".into()),
-                complete: false,
+                poster: Some(poster.into()),
+                complete,
                 ..Default::default()
             };
             let post = whole_post_with(&conn, &row).unwrap().unwrap();
@@ -1260,6 +1383,53 @@ mod tests {
             assert_eq!(post.size, 1000 + 2000 + 3000 + 3000 + 50_000);
             assert!(post.complete);
         }
+        let attacker_row = crate::search::ReleaseRow {
+            id: 48,
+            name: format!("{stem}.exe"),
+            group_name: "alt.binaries.multimedia.alias".into(),
+            poster: Some("evil@attacker".into()),
+            complete: true,
+            ..Default::default()
+        };
+        assert_eq!(whole_post_with(&conn, &attacker_row).unwrap(), None);
+    }
+
+    #[test]
+    fn union_files_complete_honors_non_null_file_total_and_stem_overflow_returns_none() {
+        let mut uf = UnionFiles::default();
+        uf.file_totals.insert(None);
+        uf.file_totals.insert(Some(3));
+        uf.files.insert("a.par2".into(), UnionFile { expected: Some(1), seen: vec![0b10], subject: None });
+        uf.files.insert("a.mkv".into(), UnionFile { expected: Some(1), seen: vec![0b10], subject: None });
+        assert!(!uf.complete(), "2 files when a non-null file_total says 3 must not be complete");
+
+        let dir = tempfile::tempdir().unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        crate::filters::register_sql(&conn).unwrap();
+        for s in 0..store::SHARDS {
+            let path = dir.path().join(format!("atlas.s{s}.db"));
+            store::create_shard(&path).unwrap();
+            conn.execute(&format!("attach database ?1 as s{s}"), [path.to_string_lossy()]).unwrap();
+        }
+        let stem = "Overflow.Stem.2026.1080p-GRP";
+        for i in 0..=(LINKED_ROWS + 1) {
+            let id = (i as i64 + 1) * 8;
+            conn.execute(
+                "insert into s0.releases (id, name, group_name, poster, posted_date, size, complete, parts, file_total)
+                 values (?1, ?2, ?3, 'same@poster', '2025-11-28 02:30:00', 100, 0, 1, 2000)",
+                rusqlite::params![id, format!("{stem}.part{i:04}"), format!("alt.binaries.g{i}")],
+            )
+            .unwrap();
+        }
+        let row = crate::search::ReleaseRow {
+            id: 8,
+            name: format!("{stem}.part0000"),
+            group_name: "alt.binaries.g0".into(),
+            poster: Some("same@poster".into()),
+            complete: false,
+            ..Default::default()
+        };
+        assert_eq!(whole_post_with(&conn, &row).unwrap(), None);
     }
 
     #[test]

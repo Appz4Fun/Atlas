@@ -193,7 +193,7 @@ pub fn permille(row: &RowFacts<'_>, s: &FileSummary) -> i64 {
         return by_parts;
     }
     match row.file_total {
-        Some(total) if total > s.files + 1 => by_parts.min(s.files * 1000 / total),
+        Some(total) if total > s.files => by_parts.min(s.files * 1000 / total),
         _ => by_parts,
     }
 }
@@ -346,6 +346,9 @@ mod tests {
         let short = RowFacts { file_total: Some(4), ..row(big, 100, false) };
         assert_eq!(permille(&short, &parts(100)), 500, "two files of four");
         assert_eq!(body_gate(&r, &short, &parts(100)), BodyGate::NotYet);
+        let one_missing = RowFacts { file_total: Some(3), ..row(big, 100, false) };
+        assert_eq!(permille(&one_missing, &parts(100)), 666, "two files of three");
+        assert_eq!(body_gate(&r, &one_missing, &parts(100)), BodyGate::NotYet);
         // an obfuscated single-file row with a post-wide counter and a small par2 row open the gate
         let obf_one = RowFacts { name: TOKEN, file_total: Some(10), ..row(big, 100, false) };
         let one_whole = FileSummary { files: 1, present: 100, wanted: 100, ..summary() };
