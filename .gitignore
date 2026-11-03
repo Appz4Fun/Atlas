@@ -31,8 +31,12 @@ Thumbs.db
 # --- atlas runtime data (lives in ATLAS_HOME, the repo root for `cargo run`) ---
 # config.json holds usenet passwords, never commit it or its backups.
 # leading / = repo root only (the docker stack has its own rules below)
+/config.toml
+/config.toml.tmp
 /config.json
 /config.json.bak*
+# the Gemini API key, from the web UI's Settings
+/gemini.json
 # usenet logins to merge into config.json
 /news.txt
 /stats_cache.json

@@ -16,13 +16,13 @@ set -e
 mkdir -p "$ATLAS_HOME"
 
 # docker bind mounts a missing host file as an empty directory
-if [ ! -f "$ATLAS_HOME/config.json" ] && [ -d /app/config.json ]; then
+if [ ! -f "$ATLAS_HOME/config.toml" ] && [ ! -f "$ATLAS_HOME/config.json" ] && [ -d /app/config.json ]; then
     echo "warning: /app/config.json is a directory, the config file to seed from is missing on the host." >&2
     echo "         remove the empty docker/config.json folder docker made, then:" >&2
     echo "         cp docker/config.example.json docker/config.json   (and fill in the logins)" >&2
 fi
 
-if [ ! -f "$ATLAS_HOME/config.json" ] && [ -f /app/config.json ]; then
+if [ ! -f "$ATLAS_HOME/config.toml" ] && [ ! -f "$ATLAS_HOME/config.json" ] && [ -f /app/config.json ]; then
     cp /app/config.json "$ATLAS_HOME/config.json"
     chmod 600 "$ATLAS_HOME/config.json"
     echo "seeded $ATLAS_HOME/config.json from /app/config.json"

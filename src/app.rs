@@ -28,6 +28,11 @@ const LOGO: &str = r"
         ╚═╝  ╚═╝   ╚═╝    ╚══════╝ ╚═╝  ╚═╝ ╚══════╝
 ";
 
+/// The category it's known to be in. The terminal says what's known, and only the API reports the default number.
+fn category_cell(cats: &std::collections::HashMap<i64, i64>, id: i64) -> String {
+    cats.get(&id).and_then(|c| crate::category::label(*c)).unwrap_or_else(|| "-".into())
+}
+
 fn show_results(releases: &[ReleaseRow], query: &str, page: i64, total_pages: i64, total: i64, page_size: i64) {
     ui::clear();
 
@@ -44,18 +49,22 @@ fn show_results(releases: &[ReleaseRow], query: &str, page: i64, total_pages: i6
         Column::new("#").width(4).right(),
         Column::new("Name").flex(),
         Column::new("Size").width(10).right(),
+        Column::new("Category").width(20),
         Column::new("Parts").width(8).right(),
         Column::new("Date").width(12),
         Column::new("Status").width(10),
     ]);
 
-    let width = ui::term_size().0.saturating_sub(40).max(20);
+    let width = ui::term_size().0.saturating_sub(61).max(20);
+    let ids: Vec<i64> = releases.iter().map(|r| r.id).collect();
+    let cats = crate::category::categories_of(&ids).unwrap_or_default();
 
     for (i, r) in releases.iter().enumerate() {
         table.add_row(vec![
             Line::plain((i + 1).to_string()),
             Line::plain(ui::ellipsize(&r.name, width)),
             Line::plain(fmt_size(r.size)),
+            Line::plain(category_cell(&cats, r.id)),
             Line::plain(r.parts.map(|p| p.to_string()).unwrap_or_else(|| "None".into())),
             Line::plain(fmt_date(r.posted_date.as_deref())),
             if r.complete { Line::default() } else { Line::styled("[broken]", "red") },
@@ -74,7 +83,7 @@ fn show_results(releases: &[ReleaseRow], query: &str, page: i64, total_pages: i6
     ui::print("[cyan]g.[/cyan] Go to Page");
 }
 
-fn show_release(release: &ReleaseRow, articles: &[ArticleRow]) {
+fn show_release(release: &ReleaseRow, articles: &[ArticleRow], inner: &crate::archive::store::InnerView) {
     let mut info = vec![
         Line::styled(format!("Release: {}", release.name), "bold"),
         Line::styled(
@@ -96,6 +105,9 @@ fn show_release(release: &ReleaseRow, articles: &[ArticleRow]) {
         summary.push("complete", "green");
     } else {
         summary.push("incomplete", "red");
+    }
+    if let Some((text, style)) = password_text(inner.password) {
+        summary.push(text, style);
     }
     info.push(summary);
     ui::print_lines(&ui::panel(&info, "blue"));
@@ -126,6 +138,34 @@ fn show_release(release: &ReleaseRow, articles: &[ArticleRow]) {
     if files.len() > 30 {
         ui::print(&format!("  [dim]... and {} more[/dim]", files.len() - 30));
     }
+
+    if let Some(table) = inner_table(inner, width) {
+        table.print();
+    }
+}
+
+fn password_text(password: Option<crate::archive::Password>) -> Option<(&'static str, &'static str)> {
+    use crate::archive::Password;
+    match password {
+        Some(Password::Yes) => Some((" - passworded", "red")),
+        Some(Password::Maybe) => Some((" - maybe passworded", "yellow")),
+        Some(Password::No) | None => None,
+    }
+}
+
+/// What the release holds, as far as its archives say. `Line::plain`, soo a hostile name isnt read as markup.
+fn inner_table(inner: &crate::archive::store::InnerView, width: usize) -> Option<Table> {
+    if inner.files.is_empty() {
+        return None;
+    }
+    let mut table = Table::new(vec![Column::new("name").style("white").flex(), Column::new("size").style("dim")])
+        .title(format!("inner files ({})", inner.files.len()))
+        .no_header();
+    table.gap = 1;
+    for file in inner.files.iter().take(30) {
+        table.add_row(vec![Line::plain(ui::ellipsize(&file.name, width)), Line::plain(fmt_size(file.size))]);
+    }
+    Some(table)
 }
 
 /// First run: ask for a server. A blank host quits without writing anything.
@@ -135,7 +175,7 @@ fn setup(existing: Option<Config>) -> bool {
 
     ui::print_panel(
         &format!(
-            "[red]{} {why}[/red]\n[dim]already have a config.json somewhere else? quit and point ATLAS_HOME at its folder\nor enter a server below (blank host to quit)[/dim]",
+            "[red]{} {why}[/red]\n[dim]already have a config.toml somewhere else? quit and point ATLAS_HOME at its folder\nor enter a server below (blank host to quit)[/dim]",
             path.display()
         ),
         "red",
@@ -151,7 +191,7 @@ fn setup(existing: Option<Config>) -> bool {
     let password = prompt("Password: ");
     let port = ask("Port (563): ", Some(563)).clamp(1, 65535) as u16;
 
-    // keep groups / api key from a config.json that just lacked servers
+    // keep groups / api key from a config.toml that just lacked servers
     let mut cfg = existing.unwrap_or_default();
     cfg.servers = vec![UsenetServer::new(&host, &username, &password, port)];
 
@@ -168,11 +208,12 @@ fn setup(existing: Option<Config>) -> bool {
 
 fn release_actions(release: &ReleaseRow) {
     let articles = get_articles(release.id).unwrap_or_default();
+    let inner = crate::archive::store::view(release.id);
 
     loop {
         ui::clear();
         // actions for the picked release
-        show_release(release, &articles);
+        show_release(release, &articles, &inner);
         Table::menu(&[("1.", "Download"), ("2.", "Save NZB"), ("0.", "Back")]).print();
 
         match prompt("\nChoice: ").trim() {
@@ -555,6 +596,9 @@ fn do_settings() {
             let _ = create_db();
 
             ui::success("wiped db and cache");
+            if paths::predb_database().exists() {
+                ui::dim("kept atlas.predb.db, the PreDB titles. Delete it by hand to drop them");
+            }
             ui::pause();
         }
         5 => {
@@ -723,7 +767,7 @@ pub fn main_menu() -> i32 {
         }
     }
 
-    // a config.json that's there but broken isnt missing: setup would write over it
+    // a config.toml that's there but broken isnt missing: setup would write over it
     if let Some(problem) = crate::config::file_problem() {
         ui::error(&format!("{problem}. fix it and start atlas again"));
         return 1;
@@ -755,6 +799,7 @@ pub fn main_menu() -> i32 {
     );
 
     api::start(&mut config);
+    crate::metrics::start(&config, crate::metrics::Role::Api);
 
     loop {
         ui::clear();
@@ -885,4 +930,42 @@ pub fn selftest() -> i32 {
 
     println!("selftest: {ok}/{} servers OK", cfg.servers.len());
     if ok > 0 { 0 } else { 1 }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::archive::Password;
+    use crate::archive::store::{InnerFileRow, InnerView};
+
+    fn row(i: i64, name: &str) -> InnerFileRow {
+        InnerFileRow { seq: i, name: name.into(), size: Some(10), source: 2 }
+    }
+
+    #[test]
+    fn category_cell_shows_a_label_or_a_dash() {
+        let cats = std::collections::HashMap::from([(1, 5040)]);
+        assert_eq!(category_cell(&cats, 1), "TV/HD");
+        assert_eq!(category_cell(&cats, 2), "-");
+    }
+
+    #[test]
+    fn inner_table_lists_rows_and_marks_password() {
+        assert!(inner_table(&InnerView::default(), 80).is_none());
+
+        let files: Vec<InnerFileRow> = (0..40).map(|i| row(i, &format!("file{i}.mkv"))).collect();
+        let table = inner_table(&InnerView { password: None, files, ..InnerView::default() }, 80).unwrap();
+        assert_eq!(table.rows.len(), 30);
+        assert_eq!(table.title.as_deref(), Some("inner files (40)"));
+
+        let hostile =
+            inner_table(&InnerView { password: None, files: vec![row(0, "[red]x.mkv")], ..InnerView::default() }, 80)
+                .unwrap();
+        assert_eq!(hostile.rows[0][0].text(), "[red]x.mkv");
+
+        assert_eq!(password_text(Some(Password::Yes)), Some((" - passworded", "red")));
+        assert_eq!(password_text(Some(Password::Maybe)), Some((" - maybe passworded", "yellow")));
+        assert_eq!(password_text(Some(Password::No)), None);
+        assert_eq!(password_text(None), None);
+    }
 }

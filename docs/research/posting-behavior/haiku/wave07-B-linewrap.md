@@ -1,0 +1,5 @@
+# Wave 7 B: per-tool yEnc line wrap -> can overview tell tools apart? (Haiku; node-yencode, ngPost Yenc.cpp, rapidyenc, NewsUP yEnc.pm; sim scratchpad w7b/sim/yenc_sim.py)
+Rules: node-yencode (Nyuu) and rapidyenc (Postie) escape NUL LF CR = always, TAB/SPACE/. at line start, TAB/SPACE (+critical) at line END (encoder.cc:37-45,105-112; rapidyenc encoder_generic.go:36-120). ngPost (src/utils/Yenc.cpp:71-136) and NewsUP (yEnc.pm:80-130) escape TAB/SPACE/. only at column 0, not at line end.
+Framing: Nyuu =yend has part= and crc32= on last part, pcrc32 8-digit padded (lib/article.js); ngPost =yend "size= pcrc32=" unpadded std::hex, no part=.
+Sim (716800, 200 trials): Nyuu/rapidyenc lines 5690.9±0.83 bytes 751018±107; ngPost/NewsUP lines 5690.9±0.82 bytes 750974±107. Paired diff rapidyenc - ngPost = +43.5 B (sd 6.7). Postie 750000: 5954.3 lines; 768000: 6097.0.
+Verdict: :lines cannot separate Nyuu from ngPost. :bytes differs by ~44 B/article (0.4 sd) only for binary data; needs ~100 articles per file-mean for a 3-sigma split. Not a practical single-article classifier; tool ID comes from Message-ID/header order instead.

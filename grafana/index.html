@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Atlas dashboards</title>
+<meta name="description" content="Grafana dashboards for Atlas, a self-hosted Usenet indexer and Newznab server.">
+<style>
+  :root { color-scheme: dark; --bg: #111217; --text: #d8d9da; --muted: #9a9ca3; --line: #2c2e36; --link: #6e9fff; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 16px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header, main { max-width: 1240px; margin: 0 auto; padding: 0 16px; }
+  header { padding-top: 40px; }
+  h1 { margin: 0 0 8px; font-size: 32px; }
+  h2 { margin: 0 0 4px; font-size: 22px; }
+  p { margin: 0 0 12px; color: var(--muted); }
+  a { color: var(--link); }
+  nav { position: sticky; top: 0; z-index: 1; margin-top: 16px; background: var(--bg); border-bottom: 1px solid var(--line); }
+  nav ul { display: flex; flex-wrap: wrap; gap: 4px 20px; max-width: 1240px; margin: 0 auto; padding: 10px 16px; list-style: none; }
+  section { padding: 32px 0 8px; scroll-margin-top: 56px; }
+  img { display: block; width: 100%; height: auto; border: 1px solid var(--line); border-radius: 6px; }
+  footer { max-width: 1240px; margin: 0 auto; padding: 24px 16px 48px; color: var(--muted); font-size: 14px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Atlas dashboards</h1>
+  <p>Grafana dashboards for <a href="https://github.com/Appz4Fun/Atlas">Atlas</a>, a self-hosted Usenet indexer and Newznab server. Select a dashboard to see it full size.</p>
+</header>
+<nav aria-label="Dashboards">
+  <ul>
+    <li><a href="#overview">Overview</a></li>
+    <li><a href="#system">Database and process</a></li>
+    <li><a href="#functions">Functions</a></li>
+    <li><a href="#nntp">NNTP servers</a></li>
+    <li><a href="#pipeline">Pipeline</a></li>
+    <li><a href="#content">Releases and content</a></li>
+  </ul>
+</nav>
+<main>
+  <section id="overview">
+    <h2>Overview</h2>
+    <p>How Atlas is doing at a glance. <a href="atlas-overview.json">JSON</a></p>
+    <a href="screenshots/atlas-overview.png"><img src="screenshots/atlas-overview.png" width="1600" height="1902" alt="Atlas overview dashboard: uptime, bandwidth, releases stored and activity per server"></a>
+  </section>
+  <section id="system">
+    <h2>Database and process</h2>
+    <p>Scrape health, the processes, the database files and the Newznab API. <a href="atlas-system.json">JSON</a></p>
+    <a href="screenshots/atlas-system.png"><img src="screenshots/atlas-system.png" width="1600" height="2472" loading="lazy" alt="Atlas system dashboard: CPU, memory, disk, database file sizes and API requests"></a>
+  </section>
+  <section id="functions">
+    <h2>Functions</h2>
+    <p>Every timed operation: what takes longest, what runs most, what moves the most bytes, what fails. <a href="atlas-functions.json">JSON</a></p>
+    <a href="screenshots/atlas-functions.png"><img src="screenshots/atlas-functions.png" width="1600" height="2970" loading="lazy" alt="Atlas functions dashboard: time, calls, errors and bytes for each function"></a>
+  </section>
+  <section id="nntp">
+    <h2>NNTP servers</h2>
+    <p>Connections, bandwidth, latency and failures, in total and per server. <a href="atlas-nntp.json">JSON</a></p>
+    <a href="screenshots/atlas-nntp.png"><img src="screenshots/atlas-nntp.png" width="1600" height="3540" loading="lazy" alt="Atlas NNTP dashboard: connections, bandwidth, latency and failures per server"></a>
+  </section>
+  <section id="pipeline">
+    <h2>Pipeline</h2>
+    <p>From headers to named, categorized releases: indexing, the processing stage, the PreDB and ID providers. <a href="atlas-pipeline.json">JSON</a></p>
+    <a href="screenshots/atlas-pipeline.png"><img src="screenshots/atlas-pipeline.png" width="1600" height="3388" loading="lazy" alt="Atlas pipeline dashboard: indexing rates, processing steps, PreDB feeds and ID providers"></a>
+  </section>
+  <section id="content">
+    <h2>Releases and content</h2>
+    <p>What Atlas has stored: categories, sizes, groups, release groups and the PreDB. <a href="atlas-content.json">JSON</a></p>
+    <a href="screenshots/atlas-content.png"><img src="screenshots/atlas-content.png" width="1600" height="5066" loading="lazy" alt="Atlas content dashboard: releases by category, sizes, biggest groups and release groups"></a>
+  </section>
+</main>
+<footer>Screenshots cover 50 minutes of a real instance, 03:25 to 04:15 UTC on 2 November 2026. Addresses and server names are placeholders.</footer>
+</body>
+</html>

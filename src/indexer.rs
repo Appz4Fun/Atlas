@@ -11,7 +11,7 @@ use crate::db;
 use crate::nfo;
 use crate::nntp::{BlockingPool, Extract, Overview, Pool, Retention, first_names, headers_to_articles};
 use crate::par2;
-use crate::parser::{Release, group_articles, is_complete};
+use crate::parser::{Release, is_complete};
 
 /// What one finished XOVER slice added, reported as it lands.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -19,6 +19,8 @@ pub struct Progress {
     pub articles: i64,
     pub bytes: i64,
     pub releases: i64,
+    /// articles left out as obfuscated per article, also in `articles`
+    pub skipped: i64,
 }
 
 impl Progress {
@@ -26,6 +28,7 @@ impl Progress {
         self.articles += other.articles;
         self.bytes += other.bytes;
         self.releases += other.releases;
+        self.skipped += other.skipped;
     }
 }
 
@@ -188,7 +191,7 @@ const MAX_BATCH: usize = 8;
 #[derive(Clone)]
 pub struct Db {
     conn: Arc<Mutex<Connection>>,
-    saves: Vec<std::sync::mpsc::Sender<SaveJob>>,
+    saves: Vec<std::sync::mpsc::Sender<WriterJob>>,
     /// slices being named at once, over every pass (see `name_releases`)
     naming: Arc<tokio::sync::Semaphore>,
     /// last field: dropping the final clone closes the queues above, then waits
@@ -213,6 +216,23 @@ struct SaveJob {
     names: Vec<(String, String, String)>,
     done: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
 }
+
+/// a write of the processing stage's, in one transaction on the shard's writer
+pub(crate) type StageWork = Box<dyn FnOnce(&Connection) -> rusqlite::Result<()> + Send>;
+
+pub(crate) struct StageJob {
+    work: StageWork,
+    done: std::sync::mpsc::SyncSender<std::result::Result<(), String>>,
+}
+
+enum WriterJob {
+    Save(SaveJob),
+    Stage(StageJob),
+}
+
+/// time a writer spends on stage work after each save, and with no save waiting
+const STAGE_BUDGET_BUSY: Duration = Duration::from_millis(10);
+const STAGE_BUDGET_IDLE: Duration = Duration::from_millis(100);
 
 /// `conn` is the main database. The writer threads end once every clone of
 /// the `Db` is gone, and the last clone to go waits for them.
@@ -250,7 +270,7 @@ fn writer(
     shard: usize,
     path: &std::path::Path,
     ids: &crate::store::Ids,
-    jobs: std::sync::mpsc::Receiver<SaveJob>,
+    jobs: std::sync::mpsc::Receiver<WriterJob>,
     idle: Duration,
 ) {
     use crate::profile::{LOAD, Load};
@@ -261,16 +281,34 @@ fn writer(
     let mut store = crate::store::ShardWriter::new(shard);
     // a job taken off the queue to see if more were waiting
     let mut next: Option<SaveJob> = None;
+    // stage work waits here, between saves
+    let mut stage: std::collections::VecDeque<StageJob> = Default::default();
+    let mut last_housekeeping = std::time::Instant::now();
 
     loop {
         let first = match next.take() {
             Some(job) => job,
-            None => match jobs.recv_timeout(idle) {
-                Ok(job) => job,
+            None => match jobs.recv_timeout(if stage.is_empty() { idle } else { Duration::ZERO }) {
+                Ok(WriterJob::Save(job)) => job,
+                Ok(WriterJob::Stage(job)) => {
+                    stage.push_back(job);
+                    continue;
+                }
                 // nothing to save: files still come due as they go stale
-                Err(RecvTimeoutError::Timeout) => {
+                Err(RecvTimeoutError::Timeout) if stage.is_empty() => {
                     if let Ok(conn) = &mut opened {
                         housekeeping(conn, &mut store, true);
+                    }
+                    last_housekeeping = std::time::Instant::now();
+                    continue;
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    run_stage_jobs(&mut opened, path, &mut stage, Some(STAGE_BUDGET_IDLE));
+                    if last_housekeeping.elapsed() >= Duration::from_secs(1) {
+                        if let Ok(conn) = &mut opened {
+                            housekeeping(conn, &mut store, true);
+                        }
+                        last_housekeeping = std::time::Instant::now();
                     }
                     continue;
                 }
@@ -280,7 +318,8 @@ fn writer(
         let mut batch = vec![first];
         while batch.len() < MAX_BATCH {
             match jobs.try_recv() {
-                Ok(job) => batch.push(job),
+                Ok(WriterJob::Save(job)) => batch.push(job),
+                Ok(WriterJob::Stage(job)) => stage.push_back(job),
                 Err(_) => break,
             }
         }
@@ -293,6 +332,7 @@ fn writer(
         }
 
         let t = std::time::Instant::now();
+        let span = crate::metrics::span("db.save_batch");
         let (result, named) = match &mut opened {
             Ok(conn) => {
                 let saved = store.save(conn, ids, batch.iter().map(|job| job.releases.as_slice()));
@@ -307,6 +347,10 @@ fn writer(
                 (Err(e.clone()), Err(e))
             }
         };
+        if result.is_err() {
+            span.failed();
+        }
+        drop(span);
         Load::add_since(&LOAD.writer_busy_ns, t);
         LOAD.writer_batches.fetch_add(1, Relaxed);
         LOAD.writer_slices.fetch_add(batch.len() as u64, Relaxed);
@@ -317,20 +361,75 @@ fn writer(
         for job in batch {
             let _ = job.done.send(if job.names.is_empty() { result.clone() } else { named.clone() });
         }
+        run_stage_jobs(&mut opened, path, &mut stage, Some(STAGE_BUDGET_BUSY));
 
         // housekeeping between transactions
         if let Ok(conn) = &mut opened {
             // more slices waiting: saving them comes first. a closed queue
             // means the indexer is stopping, it waits for this thread
-            let seal = match jobs.try_recv() {
-                Ok(job) => {
-                    next = Some(job);
-                    false
+            let mut seal = saved;
+            loop {
+                match jobs.try_recv() {
+                    Ok(WriterJob::Save(job)) => {
+                        next = Some(job);
+                        seal = false;
+                        break;
+                    }
+                    Ok(WriterJob::Stage(job)) => stage.push_back(job),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        seal = false;
+                        break;
+                    }
                 }
-                Err(TryRecvError::Empty) => saved,
-                Err(TryRecvError::Disconnected) => false,
-            };
+            }
             housekeeping(conn, &mut store, seal);
+            last_housekeeping = std::time::Instant::now();
+        }
+    }
+    // stopping: whoever queued these is told
+    run_stage_jobs(&mut opened, path, &mut stage, None);
+}
+
+/// Stage jobs, each in one transaction, for at most `budget` (None: all of them).
+fn run_stage_jobs(
+    opened: &mut rusqlite::Result<Connection>,
+    path: &std::path::Path,
+    stage: &mut std::collections::VecDeque<StageJob>,
+    budget: Option<Duration>,
+) {
+    use crate::profile::{LOAD, Load};
+    use std::sync::atomic::Ordering::Relaxed;
+
+    let start = std::time::Instant::now();
+    while let Some(job) = stage.pop_front() {
+        let t = std::time::Instant::now();
+        let span = crate::metrics::span("db.stage_transaction");
+        let result = match opened {
+            Ok(conn) => stage_transaction(conn, job.work).map_err(|e| e.to_string()),
+            Err(e) => Err(format!("couldnt open {}: {e}", path.display())),
+        };
+        if result.is_err() {
+            span.failed();
+        }
+        drop(span);
+        let _ = job.done.send(result);
+        Load::add_since(&LOAD.writer_stage_ns, t);
+        Load::add_since(&LOAD.writer_busy_ns, t);
+        LOAD.writer_stage_jobs.fetch_add(1, Relaxed);
+        if budget.is_some_and(|b| start.elapsed() >= b) {
+            break;
+        }
+    }
+}
+
+fn stage_transaction(conn: &Connection, work: StageWork) -> rusqlite::Result<()> {
+    conn.execute_batch("begin immediate")?;
+    match work(conn) {
+        Ok(()) => conn.execute_batch("commit"),
+        Err(e) => {
+            let _ = conn.execute_batch("rollback");
+            Err(e)
         }
     }
 }
@@ -344,18 +443,37 @@ fn housekeeping(conn: &mut Connection, store: &mut crate::store::ShardWriter, se
     let t = std::time::Instant::now();
     if seal {
         let sealing = std::time::Instant::now();
+        let span = crate::metrics::span("db.seal");
         if store.seal_some(conn, chrono::Utc::now().timestamp()).is_err() {
+            span.failed();
             LOAD.writer_seal_errors.fetch_add(1, Relaxed);
         }
+        drop(span);
         Load::add_since(&LOAD.writer_seal_ns, sealing);
     }
     let checkpointing = std::time::Instant::now();
-    let _ = db::finish_checkpoint(conn);
+    let span = crate::metrics::span("db.checkpoint");
+    if db::finish_checkpoint(conn).is_err() {
+        span.failed();
+    }
+    drop(span);
     Load::add_since(&LOAD.writer_checkpoint_ns, checkpointing);
     Load::add_since(&LOAD.writer_busy_ns, t);
 }
 
 impl Db {
+    /// Run `work` in one transaction on `shard`'s writer, between saves. The
+    /// answer comes when it has committed; jobs queued when the writer stops still run.
+    pub(crate) fn on_writer(
+        &self,
+        shard: usize,
+        work: StageWork,
+    ) -> Result<std::sync::mpsc::Receiver<std::result::Result<(), String>>> {
+        let (done, answer) = std::sync::mpsc::sync_channel(1);
+        self.saves[shard].send(WriterJob::Stage(StageJob { work, done })).map_err(|_| anyhow!("db writer stopped"))?;
+        Ok(answer)
+    }
+
     /// Save one slice's releases. Returns once they are committed. Dropping
     /// the future before the writer gets to the slice drops the slice too
     /// (its pass didnt finish, soo the cursor didnt move past it); once the
@@ -369,7 +487,7 @@ impl Db {
     async fn send(&self, shard: usize, releases: Vec<Release>, names: Vec<(String, String, String)>) -> Result<()> {
         let (done, saved) = tokio::sync::oneshot::channel();
         crate::profile::LOAD.writer_queued.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if self.saves[shard].send(SaveJob { releases, names, done }).is_err() {
+        if self.saves[shard].send(WriterJob::Save(SaveJob { releases, names, done })).is_err() {
             crate::profile::LOAD.writer_queued.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             return Err(anyhow!("db writer stopped"));
         }
@@ -574,6 +692,9 @@ pub async fn run_pass<P>(
 where
     P: FnMut(&Progress) + ?Sized,
 {
+    if crate::filters::group_blocked(group) {
+        return Ok(Progress::default());
+    }
     let (server, (_count, first, last, _name)) = ctx.pool.select_group_on(prefer, group).await?;
     let (first, last) = (first as i64, last as i64);
     let key = cursor_key(&ctx.pool, server, group);
@@ -976,6 +1097,9 @@ pub async fn run_sweep<P>(
 where
     P: FnMut(&Progress) + ?Sized,
 {
+    if crate::filters::group_blocked(group) {
+        return Ok(Progress::default());
+    }
     let (g, host) = (group.to_string(), ctx.pool.host(server));
     // noted as swept only if the split hasnt reached back since (see `set_swept`)
     let generation = {
@@ -1575,6 +1699,18 @@ impl Pass<'_> {
     {
         let mut in_window = 0i64;
         let (pool, group) = (&self.ctx.pool, self.group);
+        if crate::filters::group_blocked(group) {
+            let (start, end) = (start.max(0) as u64, end.max(0) as u64);
+            let saved = Progress::default();
+            return Ranged {
+                saved,
+                complete: true,
+                in_window,
+                low_done: Some(end),
+                high_done: Some(start),
+                error: None,
+            };
+        }
         // no slice bigger than the whole unsaved budget: it would hold more
         // headers than the cap allows
         let size = self.settings.request_size.min(pool.max_unsaved() as u64);
@@ -1678,6 +1814,10 @@ impl Pass<'_> {
 
         if error.is_none() && saved.articles == 0 && done == total {
             println!("[{kind}] {group} {start}-{end} empty, skipping");
+        }
+
+        if saved.skipped > 0 {
+            println!("[{kind}] {group} {start}-{end} gathered {} articles obfuscated per article", saved.skipped);
         }
 
         if saved.articles > 0 {
@@ -1798,23 +1938,54 @@ async fn save_slice(
     unsaved: crate::nntp::Unsaved,
 ) -> Result<(Progress, NameJobs)> {
     let articles = headers.len() as i64;
+    if crate::filters::group_blocked(group) {
+        return Ok((Progress { articles, ..Progress::default() }, Vec::new()));
+    }
+    let span = crate::metrics::span("indexer.save_slice");
+    let saved = parse_and_save(db, group, headers, unsaved).await;
+    if saved.is_err() {
+        span.failed();
+    }
+    saved
+}
+
+async fn parse_and_save(
+    db: &Db,
+    group: &str,
+    headers: Vec<Overview>,
+    unsaved: crate::nntp::Unsaved,
+) -> Result<(Progress, NameJobs)> {
+    let articles = headers.len() as i64;
     crate::profile::SLICES.add(1);
     crate::profile::HEADERS.add(articles as u64);
 
     // parsing is cpu work, keep it off the async threads
     let t = std::time::Instant::now();
-    let mut releases: Vec<Release> =
-        tokio::task::spawn_blocking(move || group_articles(headers_to_articles(headers)).into_values().collect())
-            .await
-            .map_err(|e| anyhow!("parse task failed: {e}"))?;
+    let parsing = {
+        let group = group.to_string();
+        move || {
+            let _span = crate::metrics::span("indexer.parse_slice");
+            let (articles, uploads, skipped) = crate::filters::gather_per_article(&group, headers_to_articles(headers));
+            let mut releases: Vec<Release> =
+                crate::collections::group_articles(&group, articles).into_values().collect();
+            releases.extend(uploads);
+            (releases, skipped)
+        }
+    };
+    let (mut releases, skipped) =
+        tokio::task::spawn_blocking(parsing).await.map_err(|e| anyhow!("parse task failed: {e}"))?;
     crate::profile::PARSE.add_since(t);
     crate::profile::Load::add_since(&crate::profile::LOAD.parse_ns, t);
     drop(unsaved);
 
     // real names from par2/nfo bodies come after the save, alongside the
-    // pass's next slices: a slow body doesnt hold up the pass
-    let names: Vec<_> =
-        releases.iter().map(|r| (r.name.clone(), name_sources(r))).filter(|(_, sources)| !sources.is_empty()).collect();
+    // pass's next slices: a slow body doesnt hold up the pass. Once the
+    // naming stage has a body budget it reads them, not the save path.
+    let names: Vec<_> = if crate::archive::inline_lookups() {
+        releases.iter().map(|r| (r.name.clone(), name_sources(r))).filter(|(_, sources)| !sources.is_empty()).collect()
+    } else {
+        Vec::new()
+    };
 
     let mut bytes = 0;
     for release in releases.iter_mut() {
@@ -1827,9 +1998,16 @@ async fn save_slice(
     }
 
     let count = releases.len() as i64;
-    db.save(releases).await?;
+    {
+        let span = crate::metrics::span("indexer.wait_for_save");
+        let saved = db.save(releases).await;
+        if saved.is_err() {
+            span.failed();
+        }
+        saved?;
+    }
 
-    Ok((Progress { articles, bytes, releases: count }, names))
+    Ok((Progress { articles, bytes, releases: count, skipped }, names))
 }
 
 /// bodies a release's name lookup tries at most
@@ -1837,7 +2015,7 @@ const MAX_NAME_BODIES: usize = 3;
 
 /// Bodies worth fetching for a real name: base par2 files first, then nfos,
 /// only their first segment (where par2 and nfo files keep what names a
-/// release, and it comes once per file, soo a release is looked up once
+/// release, and it comes once per file, so a release is looked up once
 /// however many slices it spans) and `MAX_NAME_BODIES` at most. A big
 /// obfuscated par2 comes in thousands of segments of most of a MB each;
 /// trying them one after another held a slice for minutes.
@@ -1945,6 +2123,9 @@ impl Indexer {
         self.last_batch_articles = 0;
         self.last_batch_bytes = 0;
         self.last_batch_releases = 0;
+        if crate::filters::group_blocked(group) {
+            return Ok(());
+        }
 
         let ctx = PassContext {
             pool: self.client.pool.clone(),
@@ -2315,7 +2496,9 @@ mod tests {
         drop(gone);
         crate::profile::LOAD.writer_queued.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let shard = crate::store::shard_of("alt.binaries.t");
-        shared.saves[shard].send(SaveJob { releases: vec![release("dropped")], names: Vec::new(), done }).unwrap();
+        shared.saves[shard]
+            .send(WriterJob::Save(SaveJob { releases: vec![release("dropped")], names: Vec::new(), done }))
+            .unwrap();
         let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
         rt.block_on(shared.save(vec![release("kept")])).unwrap();
         drop(shared);
@@ -2364,5 +2547,92 @@ mod tests {
         }
         assert_eq!(sealed(), 1, "the idle writer sealed the stale file");
         drop(shared);
+    }
+
+    #[test]
+    fn a_release_looks_at_a_few_bodies_for_its_name() {
+        let article = |i: usize, name: &str| crate::parser::Article {
+            subject: format!(r#""{name}" yEnc (1/1)"#),
+            message_id: format!("<{i}@x>"),
+            ..Default::default()
+        };
+        let mut articles: Vec<_> = (0..40).map(|i| article(i, &format!("n{i}.nfo"))).collect();
+        articles.push(article(99, "base.par2"));
+        let sources = name_sources(&Release { articles, ..Default::default() });
+        assert_eq!(sources.len(), MAX_NAME_BODIES);
+        assert_eq!(sources[0].0, "<99@x>", "the par2 first");
+    }
+
+    fn stage_db() -> (tempfile::TempDir, Db, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        db::create_db_at(&main).unwrap();
+        let conn = db::open_at(&main).unwrap();
+        let shard = crate::store::shard_path(&main, 0);
+        (dir, shared_db(conn), shard)
+    }
+
+    #[test]
+    fn a_stage_job_runs_on_the_writer_and_answers() {
+        let (_dir, db, shard) = stage_db();
+        let answer = db
+            .on_writer(
+                0,
+                Box::new(|conn| {
+                    conn.execute("insert into pp_queue (release_id, due_at) values (1, 2)", [])?;
+                    Ok(())
+                }),
+            )
+            .unwrap();
+        answer.recv().unwrap().unwrap();
+        let rows: i64 =
+            db::open_shard(&shard).unwrap().query_row("select count(*) from pp_queue", [], |r| r.get(0)).unwrap();
+        assert_eq!(rows, 1);
+    }
+
+    #[test]
+    fn stage_jobs_dont_hold_up_saves() {
+        let (_dir, db, _shard) = stage_db();
+        let group = (0..).map(|i| format!("alt.binaries.g{i}")).find(|g| crate::store::shard_of(g) == 0).unwrap();
+        let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let answers: Vec<_> = (0..500)
+            .map(|_| {
+                let ran = ran.clone();
+                db.on_writer(
+                    0,
+                    Box::new(move |_| {
+                        std::thread::sleep(Duration::from_millis(2));
+                        ran.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        Ok(())
+                    }),
+                )
+                .unwrap()
+            })
+            .collect();
+        let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let article = crate::parser::Article {
+            message_id: "<a@x>".into(),
+            filename: Some("a".into()),
+            part: Some(1),
+            total_parts: Some(1),
+            ..Default::default()
+        };
+        runtime
+            .block_on(db.save(vec![Release { name: "a".into(), group, articles: vec![article], ..Default::default() }]))
+            .unwrap();
+        assert!(ran.load(std::sync::atomic::Ordering::SeqCst) < 250);
+        for answer in answers {
+            answer.recv().unwrap().unwrap();
+        }
+    }
+
+    #[test]
+    fn queued_stage_jobs_run_before_the_writer_stops() {
+        let (_dir, db, _shard) = stage_db();
+        let answers: Vec<_> = (0..50).map(|_| db.on_writer(0, Box::new(|_| Ok(()))).unwrap()).collect();
+        drop(db);
+        for answer in answers {
+            answer.recv().unwrap().unwrap();
+        }
     }
 }

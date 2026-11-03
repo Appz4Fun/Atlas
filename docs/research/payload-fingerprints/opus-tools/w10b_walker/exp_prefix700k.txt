@@ -1,0 +1,52 @@
+ctime0.rar                       entries=  1 pass=  3 fail= 0 missing= 0 
+ctime1.rar                       entries=  1 pass=  3 fail= 0 missing= 0 
+ctime2.rar                       entries=  1 pass=  3 fail= 0 missing= 0 
+ctime3.rar                       entries=  1 pass=  3 fail= 0 missing= 0 
+ctime4.rar                       entries=  1 pass=  3 fail= 0 missing= 0 
+ctime5.rar                       entries=  1 pass=  3 fail= 0 missing= 0 
+rar15-comment-lock.rar           entries=  2 pass=  6 fail= 0 missing= 0 
+rar15-comment.rar                entries=  2 pass=  6 fail= 0 missing= 0 
+rar2-unix-owner.rar              entries=  1 pass=  3 fail= 0 missing= 0 
+rar202-comment-nopsw.rar         entries=  2 pass=  6 fail= 0 missing= 0 
+rar202-comment-psw.rar           entries=  2 pass=  6 fail= 0 missing= 0 
+rar3-comment-hpsw.rar            entries=  2 pass=  0 fail= 0 missing= 2 HDR_ENCRYPTED missing:file1.txt; missing:file2.txt
+rar3-comment-plain.rar           entries=  2 pass=  6 fail= 0 missing= 0 
+rar3-comment-psw.rar             entries=  2 pass=  6 fail= 0 missing= 0 
+rar3-old.rar                     entries=  2 pass=  6 fail= 0 missing= 0 
+rar3-owner.rar                   entries=  2 pass=  6 fail= 0 missing= 0 
+rar3-readonly-unix.rar           entries=  2 pass=  6 fail= 0 missing= 0 
+rar3-readonly-win.rar            entries=  2 pass=  6 fail= 0 missing= 0 
+rar3-solid.rar                   entries=  2 pass=  6 fail= 0 missing= 0 
+rar3-subdirs.rar                 entries= 10 pass= 30 fail= 0 missing= 0 
+rar3-symlink-unix.rar            entries=  3 pass=  9 fail= 0 missing= 0 
+rar3-versions.rar                entries=  1 pass=  3 fail= 0 missing= 0 
+rar3-vols.part1.rar              entries=  2 pass=  6 fail= 0 missing= 0 
+rar3-vols.part2.rar              entries=  0 pass=  0 fail= 0 missing= 0 
+rar3-vols.part3.rar              entries=  0 pass=  0 fail= 0 missing= 0 
+rar5-blake.rar                   entries=  2 pass=  4 fail= 0 missing= 0 
+rar5-crc.rar                     entries=  2 pass=  6 fail= 0 missing= 0 
+rar5-dups.rar                    entries=  9 pass= 27 fail= 0 missing= 0 
+rar5-evil-symlink-traversal.rar  entries=  2 pass=  6 fail= 0 missing= 0 
+rar5-hlink.rar                   entries=  3 pass=  9 fail= 0 missing= 0 
+rar5-hpsw.rar                    entries=  2 pass=  0 fail= 0 missing= 2 HDR_ENCRYPTED missing:stest1.txt; missing:stest2.txt
+rar5-owner.rar                   entries=  2 pass=  6 fail= 0 missing= 0 
+rar5-psw-blake.rar               entries=  2 pass=  4 fail= 0 missing= 0 
+rar5-psw.rar                     entries=  2 pass=  6 fail= 0 missing= 0 
+rar5-quick-open.rar              entries=  2 pass=  6 fail= 0 missing= 0 
+rar5-readonly-unix.rar           entries=  2 pass=  6 fail= 0 missing= 0 
+rar5-readonly-win.rar            entries=  2 pass=  6 fail= 0 missing= 0 
+rar5-solid-qo.rar                entries=  4 pass= 12 fail= 0 missing= 0 
+rar5-solid.rar                   entries=  2 pass=  6 fail= 0 missing= 0 
+rar5-subdirs.rar                 entries= 10 pass= 30 fail= 0 missing= 0 
+rar5-symlink-unix.rar            entries=  3 pass=  9 fail= 0 missing= 0 
+rar5-symlink-win.rar             entries=  9 pass= 27 fail= 0 missing= 0 
+rar5-times.rar                   entries=  1 pass=  3 fail= 0 missing= 0 
+rar5-times2.rar                  entries=  1 pass=  3 fail= 0 missing= 0 
+rar5-versions.rar                entries=  1 pass=  3 fail= 0 missing= 0 
+rar5-vols.part1.rar              entries=  2 pass=  6 fail= 0 missing= 0 
+rar5-vols.part2.rar              entries=  0 pass=  0 fail= 0 missing= 0 
+rar5-vols.part3.rar              entries=  0 pass=  0 fail= 0 missing= 0 
+seektest.rar                     entries=  2 pass=  6 fail= 0 missing= 0 
+unicode.rar                      entries=  2 pass=  6 fail= 0 missing= 0 
+unicode2.rar                     entries=  2 pass=  0 fail= 0 missing= 2 missing:𝐀𝐁𝐁𝐂.txt; missing:уииоотивл.txt
+TOTAL {'pass_': 332, 'fail': 0, 'missing': 6}

@@ -83,6 +83,7 @@ fn draw(f: &mut Frame, s: &Value) {
     let totals = vec![
         kv("articles  ", s["total_articles"].as_i64().unwrap_or(0).to_string(), Color::Cyan),
         kv("releases  ", s["total_releases"].as_i64().unwrap_or(0).to_string(), Color::Cyan),
+        kv("skipped   ", s["total_skipped"].as_i64().unwrap_or(0).to_string(), Color::Cyan),
         kv("indexed   ", human_bytes(s["total_bytes"].as_f64().unwrap_or(0.0)), Color::Cyan),
         kv("db size   ", human_bytes(s["db_size"].as_f64().unwrap_or(0.0)), Color::Cyan),
     ];
@@ -235,6 +236,7 @@ mod tests {
         let text: String = term.backend().buffer().content().iter().map(|c| c.symbol()).collect();
         assert!(text.contains("alt.binaries.test"));
         assert!(text.contains("running"));
+        assert!(text.contains("skipped"), "{text}");
 
         // headers/s from the 10s rate bins, not bytes between history points
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64 / 10 * 10;

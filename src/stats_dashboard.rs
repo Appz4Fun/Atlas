@@ -24,7 +24,7 @@ use crate::dashboard::{human_bytes, human_time};
 use crate::db;
 use crate::paths;
 
-const PAGES: [&str; 5] = ["Overview", "Backfill", "Content", "Servers", "Bottleneck"];
+const PAGES: [&str; 6] = ["Overview", "Backfill", "Content", "Servers", "Bottleneck", "Post-processing"];
 /// file types counted on the content page
 const FILE_TYPES: [&str; 12] = ["mkv", "mp4", "avi", "m4v", "iso", "m4a", "flac", "mp3", "epub", "pdf", "exe", "nzb"];
 
@@ -151,10 +151,27 @@ struct Content {
     biggest: Option<(String, i64, String)>,
     file_types: Vec<(String, i64)>,
     framestor: i64,
+    /// (root, releases)
+    #[serde(default)]
+    categories: Vec<(i64, i64)>,
 }
 
 fn cache_path() -> std::path::PathBuf {
     paths::app_dir().join("stats_cache.json")
+}
+
+/// Releases per category root: one covering index scan per shard.
+fn content_categories(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<(i64, i64)>> {
+    let sql =
+        crate::store::each_shard(|i| format!("select category, count(*) from s{i}.release_category group by category"));
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?;
+    let mut by_root = std::collections::BTreeMap::new();
+    for row in rows {
+        let (category, n) = row?;
+        *by_root.entry(crate::category::root_of(category)).or_insert(0) += n;
+    }
+    Ok(by_root.into_iter().collect())
 }
 
 fn compute_content() -> rusqlite::Result<Content> {
@@ -167,9 +184,9 @@ fn compute_content() -> rusqlite::Result<Content> {
     let mut stmt = conn.prepare(&crate::store::each_shard(|i| {
         format!(
             "select group_name, count(*), coalesce(sum(size), 0), coalesce(sum(complete), 0),
-                coalesce(sum(is_obfuscated), 0), count(display_name), coalesce(sum(parts), 0),
+                coalesce(sum(is_obfuscated = 1 and display_name is null), 0), count(display_name), coalesce(sum(parts), 0),
                 coalesce(sum(parts > 0), 0), coalesce(sum(parts > 0 and complete = 1), 0)
-             from s{i}.releases group by group_name"
+             from s{i}.releases group by group_name having not atlas_blocked(group_name)"
         )
     }))?;
     let mut groups: Vec<(String, i64, i64)> = Vec::new();
@@ -197,7 +214,8 @@ fn compute_content() -> rusqlite::Result<Content> {
     let biggest = format!(
         "select * from ({}) order by 1 desc limit 1",
         crate::store::each_shard(|i| format!(
-            "select * from (select max(size), coalesce(display_name, name), group_name from s{i}.releases)"
+            "select * from (select max(size), coalesce(display_name, name), group_name from s{i}.releases
+             where not atlas_blocked(group_name))"
         ))
     );
     c.biggest = conn
@@ -220,6 +238,7 @@ fn compute_content() -> rusqlite::Result<Content> {
     let fts = |q: &str| -> i64 { conn.query_row(&fts_sql, [q], |r| r.get(0)).unwrap_or(0) };
     c.file_types = FILE_TYPES.iter().map(|t| (t.to_string(), fts(&format!("\"{t}\"")))).collect();
     c.framestor = fts("\"framestor\"*");
+    c.categories = content_categories(&conn)?;
 
     c.computed_at = now();
     c.took_secs = started.elapsed().as_secs_f64();
@@ -553,13 +572,14 @@ fn draw(f: &mut Frame, app: &App) {
         1 => draw_backfill(f, app, body),
         2 => draw_content(f, app, body),
         3 => draw_servers(f, app, body),
-        _ => draw_bottleneck(f, app, body),
+        4 => draw_bottleneck(f, app, body),
+        _ => draw_postprocess(f, app, body),
     }
 
     let keys = match app.page {
-        0 => "  ←/→ or 1-5 pages   w 30m/6h graph   q back",
-        2 => "  ←/→ or 1-5 pages   r recount   q back",
-        _ => "  ←/→ or 1-5 pages   q back",
+        0 => "  ←/→ or 1-6 pages   w 30m/6h graph   q back",
+        2 => "  ←/→ or 1-6 pages   r recount   q back",
+        _ => "  ←/→ or 1-6 pages   q back",
     };
     f.render_widget(Paragraph::new(Line::raw(keys).dim()), foot);
 }
@@ -584,6 +604,7 @@ fn draw_overview(f: &mut Frame, app: &App, area: Rect) {
         kv("mode", s["mode"].as_str().unwrap_or("-")),
         kv("uptime", human_time(s["uptime"].as_i64().unwrap_or(0))),
         kv("groups", format!("{} configured", count(s["groups_configured"].as_i64().unwrap_or(0)))),
+        kv("groups blocked", count(s["groups_blocked"].as_i64().unwrap_or(0))),
         kv("indexing at once", count(s["workers"].as_i64().unwrap_or(0))),
         kv("errors this run", count(s["error_count"].as_i64().unwrap_or(0))),
     ];
@@ -598,6 +619,7 @@ fn draw_overview(f: &mut Frame, app: &App, area: Rect) {
         kv("average (graph)", format!("{} headers/s", count(avg as i64))),
         kv("peak (10s)", format!("{} headers/s", count(peak as i64))),
         kv("this run", count(s["total_articles"].as_i64().unwrap_or(0))),
+        kv("skipped, per article", count(s["total_skipped"].as_i64().unwrap_or(0))),
         kv("per day at this", count((run_avg * 86_400.0) as i64)),
         kv("all time ≈", count(quick.articles_approx)),
         kv("releases ≈", count(quick.releases_approx)),
@@ -900,8 +922,20 @@ fn draw_content(f: &mut Frame, app: &App, area: Rect) {
     let Some(c) = state.data.clone() else { return };
     drop(state);
 
-    let [left, mid, right] = Layout::horizontal([Constraint::Ratio(1, 3); 3]).areas(body);
+    let [left, mid, cats, right] = Layout::horizontal([Constraint::Ratio(1, 4); 4]).areas(body);
     let r = c.releases as f64;
+    let mut categories: Vec<Line> = c
+        .categories
+        .iter()
+        .map(|(root, n)| {
+            let name = crate::category::label(*root).unwrap_or_else(|| root.to_string());
+            kv(&name, format!("{} ({:.1}%)", count(*n), pct(*n as f64, r)))
+        })
+        .collect();
+    let with_row: i64 = c.categories.iter().map(|(_, n)| n).sum();
+    categories.push(kv("no category yet", count((c.releases - with_row).max(0))));
+    categories.push(note("those show as 8000 in the API"));
+    f.render_widget(Paragraph::new(categories).block(panel("categories")), cats);
     let configured =
         app.stats["groups_configured"].as_i64().or_else(|| load_config().map(|c| c.tracked_groups().len() as i64));
     let releases = vec![
@@ -1020,7 +1054,7 @@ fn draw_servers(f: &mut Frame, app: &App, area: Rect) {
         note("conns: in use / allowed now / configured. allowed drops when a provider refuses more"),
         note("saved: traffic compression saved (XFEATURE COMPRESS GZIP)"),
         note("resting: couldnt connect, retried within a minute. article only: no GROUP support"),
-        note("login rejected: fix the username/password in config.json"),
+        note("login rejected: fix the username/password in config.toml"),
     ];
     f.render_widget(Paragraph::new(help_text).block(panel("key")), help);
 }
@@ -1029,6 +1063,86 @@ fn draw_servers(f: &mut Frame, app: &App, area: Rect) {
 fn bar_text(share: f64, width: usize) -> String {
     let filled = ((share.clamp(0.0, 1.0) * width as f64).round() as usize).min(width);
     format!("{}{}", "█".repeat(filled), "░".repeat(width - filled))
+}
+
+/// a bounded count: at its bound there may be more
+fn bounded(n: i64, bound: i64) -> String {
+    if n >= bound { format!("{}k+", bound / 1000) } else { count(n) }
+}
+
+/// The processing stage, from stats.json alone.
+fn draw_postprocess(f: &mut Frame, app: &App, area: Rect) {
+    let p = &app.stats["postprocess"];
+    let n = |key: &str| p[key].as_i64().unwrap_or(0);
+    let predb = &app.stats["predb"];
+    let predb_height = if predb.is_object() { 6 + predb["sources"].as_array().map_or(0, Vec::len) as u16 } else { 0 };
+    let [top, bottom, predb_area] =
+        Layout::vertical([Constraint::Length(9), Constraint::Min(8), Constraint::Length(predb_height)]).areas(area);
+    if predb.is_object() {
+        draw_predb(f, predb, predb_area);
+    }
+    let [a, b] = Layout::horizontal([Constraint::Ratio(1, 2); 2]).areas(top);
+    let [c, d] = Layout::horizontal([Constraint::Ratio(1, 2); 2]).areas(bottom);
+
+    let backlog = vec![
+        kv("due now", bounded(n("queue_due"), 100_000)),
+        kv("waiting for network", bounded(n("net_wanted"), 1_000_000)),
+        kv("failed", bounded(n("failed"), 100_000)),
+        kv("errors", count(n("errors"))),
+        kv("names over quota", count(n("archive_names_over_quota"))),
+    ];
+    f.render_widget(Paragraph::new(backlog).block(panel("backlog")), a);
+
+    let (walked, total) = (p["walk"]["done"].as_i64().unwrap_or(0), p["walk"]["total"].as_i64().unwrap_or(0));
+    let per_second = n("backlog_per_second");
+    let walk_done = if total > 0 { format!("{:.1}%", walked as f64 * 100.0 / total as f64) } else { "-".into() };
+    // ids run about a shard count apart
+    let rows_left = (total - walked).max(0) / crate::store::SHARDS as i64;
+    let walks = vec![
+        kv("walk", walk_done),
+        kv("rows looked at", count(p["walk"]["rows"].as_i64().unwrap_or(0))),
+        kv("rows/s allowed", count(per_second)),
+        kv(
+            "time left at that",
+            if per_second > 0 && total > 0 { human_time(rows_left / per_second) } else { "-".into() },
+        ),
+    ];
+    f.render_widget(Paragraph::new(walks).block(panel("walks")), b);
+
+    let steps = vec![
+        kv("steps done", count(n("steps_done"))),
+        kv("matched", count(n("matched"))),
+        kv("no match", count(n("unmatched"))),
+        kv("retries", count(n("retries"))),
+        kv("bodies", count(n("bodies"))),
+        kv("body bytes", human_bytes(n("body_bytes") as f64)),
+        kv("budget per minute", count(n("budget_per_minute"))),
+    ];
+    f.render_widget(Paragraph::new(steps).block(panel("steps")), c);
+
+    let reasons = ["blocked", "empty", "too_small", "fragment", "too_few_files", "par2_only"];
+    let rejected: Vec<Line> = reasons.iter().map(|r| kv(r, count(p["rejected"][*r].as_i64().unwrap_or(0)))).collect();
+    f.render_widget(Paragraph::new(rejected).block(panel("rejected")), d);
+}
+
+/// The catalogue of titles, off unless `predb.enabled`. Only what stats.json says.
+fn draw_predb(f: &mut Frame, p: &Value, area: Rect) {
+    let n = |key: &str| p[key].as_i64().unwrap_or(0);
+    let now = chrono::Utc::now().timestamp();
+    let mut lines = vec![
+        kv("titles", count(n("titles"))),
+        kv("file", human_bytes(p["file_bytes"].as_f64().unwrap_or(0.0))),
+        kv("late queue behind", count(n("late_behind"))),
+        kv("late reruns", count(p["late"]["reruns"].as_i64().unwrap_or(0))),
+    ];
+    for source in p["sources"].as_array().map_or(&[][..], Vec::as_slice) {
+        let ago = source["last_ok_at"].as_i64().map_or("never".to_string(), |t| format!("{} ago", human_time(now - t)));
+        let next = human_time((source["next_poll_at"].as_i64().unwrap_or(now) - now).max(0));
+        let error = source["last_error"].as_str().map_or(String::new(), |e| format!(", {e}"));
+        let key = source["key"].as_str().unwrap_or("?");
+        lines.push(kv(key, format!("ok {ago}, next in {next}{error}")));
+    }
+    f.render_widget(Paragraph::new(lines).block(panel("PreDB")), area);
 }
 
 fn draw_bottleneck(f: &mut Frame, app: &App, area: Rect) {
@@ -1230,7 +1344,7 @@ pub fn run() -> std::io::Result<()> {
                     KeyCode::Left | KeyCode::BackTab | KeyCode::Char('h') => {
                         app.page = (app.page + PAGES.len() - 1) % PAGES.len()
                     }
-                    KeyCode::Char(c @ '1'..='5') => app.page = c as usize - '1' as usize,
+                    KeyCode::Char(c @ '1'..='6') => app.page = c as usize - '1' as usize,
                     KeyCode::Char('w') => app.long_graph = !app.long_graph,
                     KeyCode::Char('r') if app.page == 2 => start_content(&app.content),
                     _ => {}
@@ -1468,6 +1582,19 @@ mod tests {
     }
 
     #[test]
+    fn content_categories_sums_by_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        db::create_db_at(&main).unwrap();
+        for (id, category) in [(8, 5030), (16, 5040), (24, 2040)] {
+            let shard = db::open_shard(&crate::store::shard_path(&main, crate::store::shard_of_id(id))).unwrap();
+            shard.execute("insert into release_category (release_id, category) values (?, ?)", [id, category]).unwrap();
+        }
+        let conn = db::open_with_shards(&main).unwrap();
+        assert_eq!(content_categories(&conn).unwrap(), [(2000, 1), (5000, 2)]);
+    }
+
+    #[test]
     fn pages_render() {
         let backend = ratatui::backend::TestBackend::new(160, 50);
         let mut term = ratatui::Terminal::new(backend).unwrap();
@@ -1475,6 +1602,10 @@ mod tests {
             page: 0,
             long_graph: false,
             stats: serde_json::json!({
+                "postprocess": {"queue_due": 3, "net_wanted": 1, "failed": 0, "walk": {"done": 5, "total": 20, "rows": 2},
+                    "rejected": {"fragment": 2}, "backlog_per_second": 2000},
+                "predb": {"titles": 1234, "file_bytes": 1000, "late_behind": 2, "late": {"reruns": 1},
+                    "sources": [{"key": "predb_club", "last_ok_at": 5, "next_poll_at": 9, "last_error": null}]},
                 "mode": "backfill", "uptime": 3600, "total_articles": 1_000_000, "rate_bin": 10,
                 "rate": [[now() as i64 / 10 * 10 - 10, 50_000, 0]],
                 "servers": [{"host": "news.x", "priority": 1, "state": "ok", "indexing": true, "in_use": 3,
@@ -1489,6 +1620,7 @@ mod tests {
                     nzb_ready: 9,
                     nzb_complete: 5,
                     file_types: vec![("mkv".into(), 3)],
+                    categories: vec![(5000, 4)],
                     ..Content::default()
                 }),
                 ..ContentState::default()
@@ -1515,8 +1647,11 @@ mod tests {
                     text.contains(".mkv")
                         && text.contains("NZBs available    9 (90.0%)")
                         && text.contains("complete NZBs     5 (50.0%)")
+                        && text.contains("no category yet")
+                        && text.contains("TV")
                 ),
                 3 => assert!(text.contains("news.x") && text.contains("75%")),
+                5 => assert!(text.contains("walk") && text.contains("due now") && text.contains("25.0%")),
                 _ => {}
             }
         }

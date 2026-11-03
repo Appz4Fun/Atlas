@@ -20,22 +20,31 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 flate2 = "1"
 getrandom = "0.3"
 indexmap = "2"
+lzma-rs = "0.3"
+md-5 = "0.10"
 ratatui = "0.30"
 regex = "1"
-rusqlite = { version = "0.40", features = ["bundled", "hooks"] }
+fancy-regex = "0.17"
+rusqlite = { version = "0.40", features = ["bundled", "functions", "hooks"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustyline = "18"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
+sha1 = "0.10"
+hmac = "0.12"
+sha2 = "0.10"
 sysinfo = { version = "0.39", default-features = false, features = ["system"] }
 tiny_http = "0.12"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "sync"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+toml_edit = { version = "0.25", features = ["serde"] }
 unicode-width = "0.2"
 ureq = { version = "3", default-features = false, features = ["json", "rustls"] }
 webbrowser = "1"
 webpki-roots = "1"
 zstd = "0.13"
+sealed-log = { path = "sealed-log" }
+nntmux-yenc = { git = "https://github.com/xbmc4lyfe/newznab-tmux", rev = "8dade08ca0372e046af2bd9d3040e23a47379bd4" }
 
 [target.'cfg(unix)'.dependencies]
 signal-hook = "0.4"

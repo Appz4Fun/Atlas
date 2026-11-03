@@ -59,6 +59,7 @@ fn corpus(path: &str, limit: usize) -> Vec<Post> {
             bytes: f[6].parse().unwrap_or(0),
             body,
             date: f[3].to_string(),
+            author: f[2].to_string(),
         });
         if posts.len() >= limit {
             break;

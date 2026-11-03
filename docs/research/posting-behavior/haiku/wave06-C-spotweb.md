@@ -1,0 +1,8 @@
+# Wave 6 C: Spotnet ground-truth harvester recipe (Haiku; spotweb/spotweb cloned)
+Groups (lib/services/Upgrade/Services_Upgrade_Settings.php:233-236): hdr free.pt, nzb alt.binaries.ftd, comments free.usenet, reports free.willey.
+1. List: XOVER on free.pt (Services_Nntp_PipelinedTransport.php getOverview). Parse From `[Nick] <[PUBKEY.USERSIG]@[CAT][KEYID][SUBCAT].[SIZE].[RANDOM].[DATE]....[SIG]>` (Services_Format_Parsing.php parseHeader:238): category=int(f0[0])-1, keyid=f0[1], filesize=f1, Subject "title|tag". keyid 7 = self-signed V2, needs sha1('<msgid>') starting '0000' (hashcash); else V1 verify against moderator key; toCheck = title . header . poster (Services_Signing_Base.php:137). Unverified spots skipped (Services_Retriever_Spots.php:359).
+2. Full spot: HEAD <msgid>; concat X-XML lines minus "X-XML: " (SpotReader.php:25); reject >50 KB; parse /Spotnet/Posting/NZB/Segment.
+3. NZB: BODY each Segment MID (carrier articles in alt.binaries.ftd), concat with no separator, unescape =C->\n, =B->\r, =A->\0, =D->= (Services_Format_Util::unspecialZipStr), then raw DEFLATE (gzinflate). NOT yEnc. IMPORTANT: Segment MIDs are the NZB carriers, not the binary post; per-file groups + segment MIDs come from the inflated NZB XML.
+4. Full-spot verify: RSA (openssl_verify default, likely PKCS1 v1.5 SHA-1, inference) of '<msgid>' or xml-signature with X-User-Key (per-spot key) (Services_Signing_Base::verifyFullSpot).
+5. Retention default 0 (unlimited); no volume figures.
+Ground truth per verified spot: poster nick, stamp, filesize, category, title/tag, and from the NZB: per-file groups, segment MIDs, subjects, sizes -> labelled multi-group posts.

@@ -162,6 +162,9 @@ pub fn groups_menu(config: &mut Config) {
         ui::print_panel("[bold cyan]Groups[/bold cyan]", "cyan");
         ui::print("[dim]Search for newsgroups to add.[/dim]\n");
         ui::print("[dim]0. Back[/dim]\n");
+        for g in config.blocked_groups() {
+            ui::warn(&format!("{g} is blocked and wont be indexed: its name labels it for minors"));
+        }
 
         let query = prompt("Search: ").trim().to_string();
         if query.is_empty() || query == "0" {
@@ -195,6 +198,11 @@ pub fn groups_menu(config: &mut Config) {
                 g.contains(&q) && g.contains(".binaries.")
             })
             .collect();
+        let found = groups.len();
+        let groups: Vec<String> = groups.into_iter().filter(|g| !crate::filters::group_blocked(g)).collect();
+        if groups.len() < found {
+            ui::warn(&format!("{} blocked groups not shown\n", found - groups.len()));
+        }
 
         if groups.is_empty() {
             ui::error("No matching groups found\n");

@@ -81,7 +81,7 @@ fn index_search_nzb_api() {
     let hidden = search::search_all_releases("Hidden.Show", 0, 10).unwrap();
     assert_eq!(hidden.len(), 1, "{hidden:?}");
     assert_eq!(hidden[0].name, "Hidden.Show.S01E01.mkv");
-    assert_eq!(search::count_obfuscated().unwrap(), 1);
+    assert_eq!(search::count_obfuscated().unwrap(), 0, "its one flagged release has a recovered name");
 
     let broken = search::search_all_releases("broken upload", 0, 10).unwrap();
     assert_eq!(broken.len(), 1);

@@ -1,0 +1,8 @@
+# Wave 5 merged (08:55-09:00Z)
+1. Highwinds server-assigned Message-IDs DECODED (INFERRED from 658 real IDs): `T1.N$K.R@fxNN.site`. N is a server-wide article counter on that front end that runs across the whole post with gaps from other users. K is constant per upload session. T1 is a clock-like base-64 counter. R is random. So same K + host + interleaved N = one session across groups. Read from overview.
+2. Nyuu also adopts a server-returned Message-ID if one comes back (lib/nntp.js:866-875). ngPost does not.
+3. More fingerprints: ngPost IDs are 32 hex with no dashes. mbruel ngPost uses unpadded pcrc32 and the Hydro74000 fork %08x (a version marker). Both write =yend with no part=, like NewsUP, so tell them apart by Message-ID and From. postie writes headers in a random order (Go map), RFC1123Z "+0000" dates and `{32}@{8}.{3}` IDs. newspost sends no Message-ID or Date, so the server sets both.
+4. Rust: yenc 0.2.2 always dot-unstuffs, so it will drop bytes if the NNTP layer already unstuffed (a probable false pcrc32 mismatch). It rejects unknown keys and keeps no raw lines. Recommendation: Atlas keeps the raw =y lines and line stats with its own scanner. crc32fast has combine().
+
+## Correction (09:10Z)
+T1 is NOT the alphabet my agent guessed. Per the posting-behavior Opus thread, and VERIFIED here on BigBuck.nzb: T1 is little-endian base-64 over `0-9a-zA-Z` (the other 2 symbols are unknown), and unix time = value + 876,645,500. BigBuck decodes to 2016-12-06 04:00:26 and rises ~1 s per article (04:00:26 -> 04:01:58 over 133 articles), which makes it a second-exact injection time from XOVER.

@@ -177,6 +177,14 @@ pub fn article_timestamp(value: &str) -> i64 {
     posted_timestamp(value).unwrap_or_else(|| Utc::now().timestamp())
 }
 
+/// A header or stored date as the poster's wall clock in seconds, the zone dropped: the scale
+/// `to_iso_date` kept, soo the articles of one release compare on it whatever zone they or the
+/// install are in. None when it cant be read.
+pub fn naive_timestamp(value: &str) -> Option<i64> {
+    let dt = parse_iso(value).or_else(|| parse_rfc2822(value).map(|(dt, _)| dt))?;
+    Some(dt.and_utc().timestamp())
+}
+
 /// A header or stored date -> unix timestamp, None when it cant be read.
 /// Naive dates are local time, same as python's datetime.timestamp().
 pub fn posted_timestamp(value: &str) -> Option<i64> {
@@ -196,6 +204,19 @@ pub fn posted_timestamp(value: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn naive_timestamps_drop_the_zone() {
+        assert_eq!(naive_timestamp("2026-10-02 10:11:12"), Some(1_790_935_872));
+        assert_eq!(
+            naive_timestamp("Fri, 02 Oct 2026 10:11:12 +0200"),
+            Some(1_790_935_872),
+            "the clock, not the instant"
+        );
+        assert_eq!(naive_timestamp("2026-10-02 10:11:12"), naive_timestamp("2 Oct 2026 10:11:12 GMT"));
+        assert_eq!(naive_timestamp("not a date"), None);
+        assert_eq!(naive_timestamp(""), None);
+    }
 
     #[test]
     fn rfc2822_variants() {

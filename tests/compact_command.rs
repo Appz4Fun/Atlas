@@ -70,3 +70,10 @@ fn a_compact_command_finishes_a_conversion_swap_cut_short_first() {
     let conn = atlas::db::open_at(&main).unwrap();
     assert!(atlas::store::get_meta(&conn, "last_compact").unwrap().is_some());
 }
+
+#[test]
+fn help_lists_purge_and_reprocess() {
+    let out = Command::new(env!("CARGO_BIN_EXE_atlas")).arg("--help").output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("--purge") && text.contains("--reprocess"), "{text}");
+}

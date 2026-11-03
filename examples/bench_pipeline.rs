@@ -37,6 +37,7 @@ pub fn load(path: &str) -> Vec<(String, u64, Vec<Overview>)> {
             references: f[5].into(),
             bytes: f[6].parse().unwrap_or(0),
             lines: f[7].parse().unwrap_or(0),
+            xref_groups: None,
         });
     }
     slices.retain(|s| !s.2.is_empty());
