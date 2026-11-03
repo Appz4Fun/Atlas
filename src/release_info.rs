@@ -442,20 +442,18 @@ fn lead_of(conn: &Connection, id: i64) -> Result<Option<i64>> {
     };
     let sets: Vec<Vec<u8>> = sets.query_map([id], |r| r.get(0))?.collect::<Result<_>>()?;
     // the set's packets are public: a volume sealed by a repost of its Main packet is only this upload's when the
-    // same poster put it up
+    // same poster put it up. The lead and its link rows share a shard, soo its poster is read there
     let Some(poster) = poster_of(conn, id)? else { return Ok(None) };
     for set in sets {
         for other in 0..store::SHARDS {
             let Ok(mut stmt) = conn.prepare_cached(&format!(
-                "select lead_id from s{other}.upload_link where set_id = ?1 and recovery = 1 limit 8"
+                "select l.lead_id from s{other}.upload_link l join s{other}.releases r on r.id = l.lead_id
+                 where l.set_id = ?1 and l.recovery = 1 and r.poster = ?2 limit 1"
             )) else {
                 continue;
             };
-            let leads: Vec<i64> = stmt.query_map([&set], |r| r.get::<_, i64>(0))?.collect::<Result<_>>()?;
-            for lead in leads {
-                if poster_of(conn, lead)?.as_deref() == Some(poster.as_str()) {
-                    return Ok(Some(lead));
-                }
+            if let Some(lead) = stmt.query_row(rusqlite::params![&set, &poster], |r| r.get::<_, i64>(0)).optional()? {
+                return Ok(Some(lead));
             }
         }
     }

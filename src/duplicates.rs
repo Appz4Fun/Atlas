@@ -605,19 +605,18 @@ pub fn fill_gaps_from(
 /// fingerprint lends every file by its posted name. `conn` has the shards attached.
 pub fn fill_from_copies_with(conn: &Connection, id: i64, own: &mut Vec<ArticleRow>) -> db::Result<usize> {
     let mut added = 0;
-    let mine = crate::archive::store::segment_crcs_with(conn, id);
-    let with = |other: i64| -> KnownCrcs {
-        let mut known = mine.clone();
-        known.extend(crate::archive::store::segment_crcs_with(conn, other));
-        known
-    };
+    // what every posting seen soo far was read to hold: an article borrowed from one donor keeps its CRC, soo the
+    // next donor's copy of that part is checked against it too
+    let mut known = crate::archive::store::segment_crcs_with(conn, id);
     for twin in file_twins_with(conn, id) {
-        added += fill_gaps_from(own, &store::articles(conn, twin.id)?, &twin.names, twin.one_file, &with(twin.id));
+        known.extend(crate::archive::store::segment_crcs_with(conn, twin.id));
+        added += fill_gaps_from(own, &store::articles(conn, twin.id)?, &twin.names, twin.one_file, &known);
     }
     let mut seen: HashSet<i64> = HashSet::new();
     for twin in twins_with(conn, id)? {
         if seen.insert(twin) {
-            added += fill_gaps_checked(own, &store::articles(conn, twin)?, &with(twin));
+            known.extend(crate::archive::store::segment_crcs_with(conn, twin));
+            added += fill_gaps_checked(own, &store::articles(conn, twin)?, &known);
         }
     }
     Ok(added)

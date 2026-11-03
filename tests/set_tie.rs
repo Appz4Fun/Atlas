@@ -54,6 +54,19 @@ fn a_volume_in_another_shard_joins_its_poster_s_upload_only() {
     let (lead, vol1, vol2, forged) = (id(0, "Lead"), id(0, "Vol1"), id(3, "Vol2"), id(5, "Forged"));
     let set = vec![7u8; 16];
     let shard0 = shard(0);
+    // someone else's whole upload of the same set first, in the lead's shard: eight volumes linked under their own
+    // lead, soo a lookup by set that stopped at the first few rows would never reach the uploader's
+    let other_lead = Release {
+        group: in_shard(0).into(),
+        poster: "someone else <e@x>".into(),
+        ..release_of("OtherLead", "Movie.mkv", 3, 3)
+    };
+    store::save(&main, &[other_lead]).unwrap();
+    let other_lead = id(0, "OtherLead");
+    shard0.execute(LINK_LEAD, rusqlite::params![other_lead]).unwrap();
+    for n in 1..=8 {
+        shard0.execute(LINK_RECOVERY, rusqlite::params![other_lead + 8 * 1000 * n, other_lead, 1, set]).unwrap();
+    }
     shard0.execute(LINK_LEAD, rusqlite::params![lead]).unwrap();
     shard0.execute(LINK_RECOVERY, rusqlite::params![vol1, lead, 1, set]).unwrap();
     for (s, row, file_id) in [(0, vol1, 1u8), (3, vol2, 1u8), (5, forged, 1u8)] {

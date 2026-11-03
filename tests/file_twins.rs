@@ -160,4 +160,53 @@ fn a_file_twin_in_another_shard_fills_the_gaps() {
         )
         .unwrap();
     assert!(!file_twins_with(&conn, short)[0].one_file);
+
+    // an article borrowed from one donor keeps what it was read to hold: a later donor whose copy of that part
+    // differs is another file, and lends nothing, even though this posting never had the part itself
+    let base = Release { group: in_shard(6).into(), ..release_of("Base", "base.bin", 1, 3) };
+    let donb = Release { group: in_shard(1).into(), ..release_of("DonB", "Base.mkv", 2, 3) };
+    let donc = Release {
+        group: in_shard(7).into(),
+        articles: vec![
+            article("Base.mkv", 2, 3, "<DonC.Base.mkv.2@x>"),
+            article("Base.mkv", 3, 3, "<DonC.Base.mkv.3@x>"),
+        ],
+        ..release_of("DonC", "Base.mkv", 3, 3)
+    };
+    for release in [base, donb, donc] {
+        store::save(&main, &[release]).unwrap();
+    }
+    let shard = |s: usize| db::open_shard(&store::shard_path(&main, s)).unwrap();
+    let id = |s: usize, name: &str| -> i64 {
+        shard(s).query_row("select id from releases where name = ?", [name], |r| r.get(0)).unwrap()
+    };
+    let (base, donb, donc) = (id(6, "Base"), id(1, "DonB"), id(7, "DonC"));
+    assert!(donb < donc, "file twins lend in id order: B first");
+    let base_md5 = (vec![8u8; 16], vec![8u8; 16], size);
+    for (s, row, set) in [(6, base, 21u8), (1, donb, 22u8), (7, donc, 23u8)] {
+        shard(s)
+            .execute(
+                insert,
+                rusqlite::params![
+                    row,
+                    vec![4u8; 16],
+                    vec![set; 16],
+                    base_md5.0,
+                    base_md5.1,
+                    base_md5.2,
+                    "Base.mkv",
+                    9,
+                    1,
+                    1,
+                    1
+                ],
+            )
+            .unwrap();
+    }
+    shard(1).execute(crc, rusqlite::params![donb, "<DonB.Base.mkv.2@x>", 700_000, 5]).unwrap();
+    shard(7).execute(crc, rusqlite::params![donc, "<DonC.Base.mkv.2@x>", 700_000, 6]).unwrap();
+    let mut articles = store::articles(&conn, base).unwrap();
+    assert_eq!(fill_from_copies_with(&conn, base, &mut articles).unwrap(), 1, "B's part 2 only");
+    assert!(articles.iter().any(|a| a.message_id == "<DonB.Base.mkv.2@x>"));
+    assert!(!articles.iter().any(|a| a.message_id.contains("DonC")), "C's part 2 differs from the part now held");
 }
