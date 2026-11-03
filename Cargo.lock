@@ -221,6 +221,7 @@ dependencies = [
  "keyring",
  "lzma-rs",
  "md-5",
+ "nntmux-yenc",
  "ratatui",
  "regex",
  "rusqlite",
@@ -1696,6 +1697,20 @@ dependencies = [
  "cfg-if",
  "cfg_aliases",
  "libc",
+]
+
+[[package]]
+name = "nntmux-yenc"
+version = "0.1.0"
+source = "git+https://github.com/xbmc4lyfe/newznab-tmux?rev=8dade08ca0372e046af2bd9d3040e23a47379bd4#8dade08ca0372e046af2bd9d3040e23a47379bd4"
+dependencies = [
+ "crc32fast",
+ "hex",
+ "md-5",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
