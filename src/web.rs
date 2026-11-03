@@ -823,6 +823,8 @@ struct Window {
     orders: Mutex<HashMap<(SortBy, bool), Order>>,
     /// every row rendered, soo every size is final: a size order is kept only from then on
     sized: AtomicBool,
+    /// bumped, under `shown`, each time rows are kept: a size order read from older sizes isn't kept
+    shown_gen: std::sync::atomic::AtomicU64,
     filled: AtomicBool,
 }
 
@@ -840,6 +842,7 @@ impl Window {
             brought: Mutex::new(HashSet::new()),
             orders: Mutex::new(HashMap::new()),
             sized: AtomicBool::new(false),
+            shown_gen: std::sync::atomic::AtomicU64::new(0),
             filled: AtomicBool::new(false),
         })
     }
@@ -874,8 +877,10 @@ impl Window {
         // read before the sizes: an order from sizes that aren't final yet is answered with but never kept, soo it
         // can't outlive the fill
         let keep = by != SortBy::Size || self.sized.load(Ordering::Acquire);
+        let mut gen_read = None;
         if by == SortBy::Size {
             let shown = lock(&self.shown);
+            gen_read = Some(self.shown_gen.load(Ordering::Acquire));
             let mut rows = self.rows.clone();
             for r in &mut rows {
                 if let Some(row) = shown.get(&r.id) {
@@ -889,7 +894,11 @@ impl Window {
         order.sort_by(|&a, &b| row_order(&rows[a], &rows[b], by, descending, categories, scores));
         let order = Arc::new(order);
         if keep {
-            lock(&self.orders).insert((by, descending), order.clone());
+            let mut orders = lock(&self.orders);
+            // a render that published since may have changed a size: then this order is answered with, not kept
+            if gen_read.is_none_or(|read| read == self.shown_gen.load(Ordering::Acquire)) {
+                orders.insert((by, descending), order.clone());
+            }
         }
         order
     }
@@ -939,6 +948,11 @@ impl Window {
             }
             shown.insert(place, row);
         }
+        // a render can publish after the fill finished (a page's, that won the race for a brought row): a size order
+        // kept from before it may be wrong now
+        self.shown_gen.fetch_add(1, Ordering::AcqRel);
+        drop(shown);
+        lock(&self.orders).retain(|(by, _), _| *by != SortBy::Size);
     }
 
     /// A page's rows, and whether more follow. Renders only what the page reaches and nothing has rendered yet.
@@ -2882,6 +2896,7 @@ mod tests {
             brought: Mutex::new(HashSet::new()),
             orders: Mutex::new(HashMap::new()),
             sized: AtomicBool::new(false),
+            shown_gen: std::sync::atomic::AtomicU64::new(0),
             filled: AtomicBool::new(false),
         }
     }
@@ -2913,6 +2928,11 @@ mod tests {
         window.sized.store(true, Ordering::Release);
         window.order(SortBy::Size, true);
         assert!(lock(&window.orders).contains_key(&(SortBy::Size, true)));
+        // a row published after the fill, with another size: the size order kept goes, the name order stays
+        window.publish(vec![(1, shown("<tr>1</tr>", 50, false))]);
+        assert!(!lock(&window.orders).contains_key(&(SortBy::Size, true)));
+        assert!(lock(&window.orders).contains_key(&(SortBy::Name, true)));
+        assert_eq!(*window.order(SortBy::Size, true), vec![0, 1], "the bigger size comes first now");
     }
 
     #[test]
