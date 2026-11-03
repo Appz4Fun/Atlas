@@ -71,7 +71,7 @@ rustup installs the pinned toolchain the first time you build, and the `just` re
 - **Deep article & container probes.** Without downloading the release, Atlas inspects yEnc headers, RAR4/RAR5/7z/ZIP archives (up to 10 nested compressed layers), MKV/MP4 video/audio/subtitle streams, HDR10/HLG/Dolby Vision profiles, x264/x265 encoder settings, chapters, cover art, H.264/HEVC video stills, and OpenSubtitles hashes.
 - **Serve a Newznab API** for Prowlarr, NZBHydra2, Sonarr, and Radarr: `search`, `tvsearch`, `movie`, `music`, `book`, `caps`, and `get`, which downloads an NZB (or a single file with `file=N`), its gaps filled from any twin of the same bytes.
 - **Search from the terminal** in one group or all groups, or use **AI search**, which turns a request like `find me 4k hdr movies` into groups and keywords with a local [Ollama](https://ollama.com) model.
-- **Watch progress** on the live dashboard, dig into CPU, memory, backfill, content, post-processing, and per-server numbers on the 6-page terminal stats dashboard, or scrape Prometheus metrics with the 6 included Grafana dashboards.
+- **Watch progress** on the live dashboard, dig into CPU, memory, backfill, content, post-processing, and per-server numbers on the 6-page terminal stats dashboard, or scrape Prometheus metrics with the 7 included Grafana dashboards.
 - **Keep everything local** in an 8-shard SQLite database with zstd-sealed article blobs and an FTS5 full-text index.
 
 ![Atlas live dashboard](img/live-dashboard.png)
@@ -108,7 +108,7 @@ Atlas was originally created in Python by [Eraxty](https://github.com/Eraxty) (`
 | **PreDB & Naming** | None | Dedicated `atlas.predb.db` polling 30+ scene/P2P feeds (RSS, JSON APIs, dumps) plus `--predb-import`, strict name grading, `--reflag-obfuscated`, and `--unname` |
 | **Categories & Media IDs** | Hardcoded single category `7000` (`Other`) for all releases; no TV/movie IDs | Full Newznab category tree (`1000`–`8000`, with `7000` properly assigned to **Books** and `8000` to **Other**), TV/movie title parser, and ID resolution via TVMaze, TMDB, Trakt, TheTVDB, OMDb, and NFO IMDb IDs |
 | **Duplicate Detection** | None | Cryptographic fingerprinting of **Twins** (identical postings, and file twins by PAR2 hashes, that fill each other's missing articles in every NZB served) and **Alts** (same unpacked file sizes packed differently) |
-| **Observability** | Basic terminal progress screen | 6-page Ratatui **Stats Dashboard** (Overview, Backfill, Content, Servers, Bottleneck, Post-processing) + Prometheus `/metrics` & `/healthz` endpoints and 6 **Grafana dashboards** as code |
+| **Observability** | Basic terminal progress screen | 6-page Ratatui **Stats Dashboard** (Overview, Backfill, Content, Servers, Bottleneck, Post-processing) + Prometheus `/metrics` & `/healthz` endpoints and 7 **Grafana dashboards** as code |
 
 ## Installation
 
@@ -395,6 +395,17 @@ Atlas seals each file that is complete, or untouched for three days, into one zs
 A release ID tells Atlas which file holds the release, and IDs keep counting up across all 8 files in the order releases are added, so the newest releases still come first.
 
 Sealed articles can live on another machine, on a big disk. Run the service in `sealed-log/` with `docker compose up -d --build` there, and set `sealed_log.addr` and `sealed_log.offload = true` in `config.toml`. The indexer then moves blobs of 1 KB or more from files untouched for a day: it appends them, reads each back and compares, and only then swaps the blob in `files.blob` for its place in the log. With the indexer stopped, `atlas --sealed-log-move` does the same at full speed. An NZB needs the service up to read those articles, and indexing goes on without it. A shard with articles there can't be compacted, because that would pull them all back, so turn `auto_run_compact` off and reclaim the freed pages with `VACUUM` while the indexer is stopped.
+
+### Measuring the sealed log
+
+Both ends report numbers. The service serves Prometheus text on port 7712 (`SEALED_LOG_METRICS` in `sealed-log/compose.yml`; empty turns it off): requests, bytes and values in and out, time in the service per request, the group commit and its `fdatasync`, appends waiting for the writer, reading a value off disk, open connections, and the data disk's size and free space. Atlas times its side as the functions `sealed_log.fetch`, `sealed_log.append`, `sealed_log.verify`, `sealed_log.swap` and `sealed_log.offload_batch`, and counts the offload in `atlas_sealed_log_*`. What Atlas waits less what the service spends is the network: the wire, both TCP stacks and connecting.
+
+To see it:
+
+1. Rebuild the service on its machine so it serves the metrics: `docker compose up -d --build` in `sealed-log/`. `curl -s http://127.0.0.1:7712/metrics | head` there should print `sealed_log_up 1`.
+2. Add the `sealed-log` job from `deploy/victoriametrics/atlas-scrape.yml` to VictoriaMetrics or Prometheus. Its target, `127.0.0.1:7712`, is for one running on the same machine; otherwise use the machine's address.
+3. Push the dashboards with `dashboards.py push` as below and open **Atlas: Sealed log**.
+4. For numbers to paste somewhere, `python3 deploy/victoriametrics/sealed_log_report.py http://victoriametrics:8428 6h` prints throughput, latency on both ends, the disk and failures over the last 6 hours as a Markdown table. A `-` means no data: the service or Atlas wasn't running a build with metrics, or nothing moved in that window.
 
 PreDB titles, if you turn them on, live apart in `atlas.predb.db`. Compaction and conversion never touch it. It takes about 153 MB per million titles, and grows by under 2 MB a day.
 
@@ -886,14 +897,14 @@ The indexer and the menu are separate processes, so each has its own port. A pro
 
 Totals about what is stored, such as categories, sizes, groups, release groups, and PreDB matches, take a walk over every release. The walk runs in short reads that hold no WAL. Its last result is saved in `metrics_catalog.json` and read back at a start, so a restart doesnt blank them, and the next walk waits out the rest of its interval. Blocked groups are left out of every metric.
 
-`deploy/victoriametrics/atlas-scrape.yml` is the scrape config. `deploy/grafana/dashboards.py` holds six Grafana dashboards as code. To put them in an Atlas folder:
+`deploy/victoriametrics/atlas-scrape.yml` is the scrape config. `deploy/grafana/dashboards.py` holds seven Grafana dashboards as code. To put them in an Atlas folder:
 
 ```sh
 python3 deploy/grafana/dashboards.py build
 GRAFANA_USER=admin GRAFANA_PASSWORD=... python3 deploy/grafana/dashboards.py push http://grafana:3000
 ```
 
-You can also import them by hand from [`grafana/`](grafana/). The [dashboards page](https://appz4fun.github.io/Atlas/) shows all six.
+You can also import them by hand from [`grafana/`](grafana/); `python3 deploy/grafana/dashboards.py export` writes those copies again after a change. The [dashboards page](https://appz4fun.github.io/Atlas/) shows six of them. The seventh, **Atlas: Sealed log**, has no screenshot yet; see [Measuring the sealed log](#measuring-the-sealed-log).
 
 The screenshots come from a real instance, with its address, host name and news server names replaced by placeholders.
 

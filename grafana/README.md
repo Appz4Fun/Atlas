@@ -1,10 +1,10 @@
 # Grafana dashboards
 
-Six dashboards for Atlas's [Prometheus metrics](../README.md#metrics), exported from Grafana for sharing. They're also on the [dashboards page](https://appz4fun.github.io/Atlas/).
+Seven dashboards for Atlas's [Prometheus metrics](../README.md#metrics), exported for sharing. Six are also on the [dashboards page](https://appz4fun.github.io/Atlas/); the sealed log's has no screenshot yet.
 
 To import one, go to Dashboards, then New, then Import, upload its JSON and pick your Prometheus or VictoriaMetrics data source.
 
-`deploy/grafana/dashboards.py` is the source of these dashboards and can push them all at once. After changing it, export these again so they match.
+`deploy/grafana/dashboards.py` is the source of these dashboards and can push them all at once. After changing it, run `python3 deploy/grafana/dashboards.py export` so these match.
 
 ## Screenshots
 
