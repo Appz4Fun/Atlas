@@ -1044,7 +1044,12 @@ impl DolbyVisionInfo {
 
         let mut has_cm4 = false;
 
-        for &byte in &rbsp {
+        // Skip the fixed 3-byte RPU header and parsed sequence info so that
+        // Byte 2, which encodes (vdr_rpu_profile << 3) | (vdr_rpu_level >> 1) and
+        // evaluates to 8..11 for standard Profile 4/7/8 streams, is not
+        // falsely matched as a CM v4.0 extension block marker.
+        let search_start = (r.position() / 8).max(3).min(rbsp.len());
+        for &byte in &rbsp[search_start..] {
             if [3, 8, 9, 10, 11, 254].contains(&byte) {
                 has_cm4 = true;
                 break;

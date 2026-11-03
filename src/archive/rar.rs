@@ -359,7 +359,11 @@ impl Rar5Header {
             None => return EncryptionMode::None,
         };
 
-        if nominal_match && tail == nominal {
+        if !nominal_match {
+            return EncryptionMode::Indeterminate;
+        }
+
+        if tail == nominal {
             return EncryptionMode::IndeterminateIncomplete;
         }
 

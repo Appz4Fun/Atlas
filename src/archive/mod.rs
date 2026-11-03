@@ -332,25 +332,35 @@ impl PasswordHarvester {
             }
         }
 
-        let mut seen = std::collections::HashSet::new();
-        let mut clean = Vec::new();
-        for c in candidates {
-            let trimmed = c.trim().to_string();
-            if trimmed.is_empty() {
+        let mut counts: std::collections::HashMap<&str, (usize, usize)> =
+            std::collections::HashMap::new();
+        let mut arrival_order = 0;
+        for c in &candidates {
+            let trimmed = c.trim();
+            if trimmed.is_empty() || Self::is_negative_phrase(trimmed) {
                 continue;
             }
-            if Self::is_negative_phrase(&trimmed) {
-                continue;
-            }
-            if seen.insert(trimmed.clone()) {
-                clean.push(trimmed);
-                if clean.len() >= 5 {
-                    break;
-                }
-            }
+            let entry = counts.entry(trimmed).or_insert_with(|| {
+                let idx = arrival_order;
+                arrival_order += 1;
+                (0, idx)
+            });
+            entry.0 += 1;
         }
 
-        clean
+        let mut ranked: Vec<(&str, usize, usize)> = counts
+            .into_iter()
+            .map(|(pw, (count, arrival))| (pw, count, arrival))
+            .collect();
+
+        // Sort primarily by frequency descending, tie-breaking by arrival order ascending
+        ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.2.cmp(&b.2)));
+
+        ranked
+            .into_iter()
+            .take(5)
+            .map(|(pw, _, _)| pw.to_string())
+            .collect()
     }
 
     pub fn extract(
@@ -412,10 +422,18 @@ impl PasswordHarvester {
             || l == "nil"
             || l == "n/a"
             || l == "false"
-            || l == "no password"
-            || l.starts_with("no password")
             || l.starts_with("none")
-            || l.contains("no password needed")
+            || l.starts_with("no pass")
+            || l.contains("no password")
+            || l.contains("password protected")
+            || l.contains("see inside")
+            || l.contains("see nfo")
+            || l.contains("check inside")
+            || l.contains("check nfo")
+            || l.contains("inside nfo")
+            || l.contains("in comments")
+            || l.contains("check comments")
+            || l.contains("see comments")
     }
 }
 
