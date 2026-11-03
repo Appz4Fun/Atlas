@@ -200,6 +200,7 @@ fn text(b: &[u8]) -> String {
 
 #[derive(Default)]
 struct Track {
+    number: Option<u64>,
     kind: u64,
     codec: String,
     language: Option<String>,
@@ -250,6 +251,7 @@ fn track_entry(b: &[u8]) -> Track {
     let mut t = Track::default();
     walk(b, &mut |id, v| {
         match id {
+            0xD7 => t.number = Some(uint(v)),
             0x83 => t.kind = uint(v),
             0x86 => t.codec = text(v),
             0x63A2 => t.codec_private = Some(v.to_vec()),
@@ -315,25 +317,31 @@ fn track_entry(b: &[u8]) -> Track {
     });
 
     if t.kind == 1 && let Some(cp) = &t.codec_private {
-        if t.bit_depth.is_none() {
-            if let Some(d) = HevcDepth::from_hvcc(cp) {
-                t.bit_depth = Some(u64::from(d));
-            } else if let Some(d) = AvcDepth::from_avcc(cp) {
+        let codec = t.codec.as_str();
+        if codec.starts_with("V_MPEGH/ISO/HEVC") {
+            if t.bit_depth.is_none()
+                && let Some(d) = HevcDepth::from_hvcc(cp)
+            {
                 t.bit_depth = Some(u64::from(d));
             }
-        }
-        if let Some(sps) = extract_sps_from_hvcc(cp)
-            && let Some(vui) = H265Sps::parse_vui(&sps)
+            if let Some(sps) = extract_sps_from_hvcc(cp)
+                && let Some(vui) = H265Sps::parse_vui(&sps)
+            {
+                if t.primaries.is_none() && vui.colour_primaries > 0 {
+                    t.primaries = Some(u64::from(vui.colour_primaries));
+                }
+                if t.transfer.is_none() && vui.transfer_characteristics > 0 {
+                    t.transfer = Some(u64::from(vui.transfer_characteristics));
+                }
+                if t.bit_depth.is_none() && vui.bit_depth > 0 {
+                    t.bit_depth = Some(u64::from(vui.bit_depth));
+                }
+            }
+        } else if codec.starts_with("V_MPEG4/ISO/AVC")
+            && t.bit_depth.is_none()
+            && let Some(d) = AvcDepth::from_avcc(cp)
         {
-            if t.primaries.is_none() && vui.colour_primaries > 0 {
-                t.primaries = Some(u64::from(vui.colour_primaries));
-            }
-            if t.transfer.is_none() && vui.transfer_characteristics > 0 {
-                t.transfer = Some(u64::from(vui.transfer_characteristics));
-            }
-            if t.bit_depth.is_none() && vui.bit_depth > 0 {
-                t.bit_depth = Some(u64::from(vui.bit_depth));
-            }
+            t.bit_depth = Some(u64::from(d));
         }
     }
 
@@ -359,6 +367,8 @@ fn matroska(data: &[u8]) -> MediaInfo {
 }
 
 fn segment(body: &[u8], info: &mut MediaInfo) {
+    let mut audio_tracks: Vec<(u64, usize)> = Vec::new();
+    let mut next_track_num = 1u64;
     walk(body, &mut |id, v| {
         match id {
             0x1549_A966 => {
@@ -382,7 +392,13 @@ fn segment(body: &[u8], info: &mut MediaInfo) {
             }
             0x1654_AE6B => walk(v, &mut |id, v| {
                 if id == 0xAE {
-                    add_track(track_entry(v), info);
+                    let t = track_entry(v);
+                    let track_num = t.number.unwrap_or(next_track_num);
+                    next_track_num = track_num.saturating_add(1);
+                    if t.kind == 2 && !is_full(info) {
+                        audio_tracks.push((track_num, info.audio.len()));
+                    }
+                    add_track(t, info);
                 }
                 true
             }),
@@ -419,7 +435,7 @@ fn segment(body: &[u8], info: &mut MediaInfo) {
             // what's after the first cluster is the video itself
             0x1F43_B675 => {
                 info.header_complete = true;
-                probe_cluster(v, info);
+                probe_cluster(v, &audio_tracks, info);
                 return false;
             }
             _ => {}
@@ -681,15 +697,11 @@ fn mp4(data: &[u8]) -> MediaInfo {
     let mut info = MediaInfo { container: "mp4".into(), ..MediaInfo::default() };
     boxes(data, &mut |kind, body| {
         if kind == b"moov" {
-            moov(body, &mut info);
+            moov(body, data, &mut info);
         }
     });
     info.header_complete = has_whole_moov(data);
 
-    let audio_probe = AudioBitstream::probe(data);
-    if audio_probe.has_atmos && let Some(a) = info.audio.first_mut() {
-        a.atmos = true;
-    }
     if let Some(dv) = DolbyVisionInfo::parse_rpu(data) && let Some(v) = info.video.first_mut() {
         if v.dv_profile.is_none() {
             v.dv_profile = Some(dv.profile);
@@ -733,7 +745,7 @@ fn be16(b: &[u8], at: usize) -> Option<u16> {
     Some(u16::from_be_bytes(b.get(at..at + 2)?.try_into().ok()?))
 }
 
-fn moov(body: &[u8], info: &mut MediaInfo) {
+fn moov(body: &[u8], full_data: &[u8], info: &mut MediaInfo) {
     boxes(body, &mut |kind, v| match kind {
         b"mvhd" => {
             let (scale, duration) = if v.first() == Some(&1) {
@@ -747,7 +759,7 @@ fn moov(body: &[u8], info: &mut MediaInfo) {
                 info.duration_secs = Some(duration as f64 / f64::from(scale));
             }
         }
-        b"trak" => trak(v, info),
+        b"trak" => trak(v, full_data, info),
         _ => {}
     });
 }
@@ -758,11 +770,39 @@ fn mp4_language(code: u16) -> Option<String> {
     (lang.chars().all(|ch| ch.is_ascii_lowercase()) && lang != "und").then_some(lang)
 }
 
-fn trak(body: &[u8], info: &mut MediaInfo) {
+/// Checks ETSI TS 102 366 Annex F `EC3SpecificBox` (`dec3`) for Dolby Atmos (JOC) extension flag.
+fn parse_dec3_atmos(v: &[u8]) -> bool {
+    if v.len() < 5 {
+        return false;
+    }
+    let header = u16::from_be_bytes([v[0], v[1]]);
+    let num_ind_sub = (header & 0x07) as usize;
+    let mut pos = 2usize;
+    for _ in 0..=num_ind_sub {
+        let Some(sub) = v.get(pos..pos + 3) else { return false };
+        let num_dep_sub = (sub[2] >> 1) & 0x0f;
+        pos += if num_dep_sub > 0 { 4 } else { 3 };
+    }
+    let Some(&ext_flags) = v.get(pos) else { return false };
+    (ext_flags & 0x01) != 0 && v.get(pos + 1).is_none_or(|&joc_objects| (1..=16).contains(&joc_objects))
+}
+
+/// Checks `MLPConfigBox` (`dmlp`) for TrueHD Atmos substream/channel configuration.
+fn parse_dmlp_atmos(v: &[u8]) -> bool {
+    if v.len() >= 10 {
+        let substreams = (v[6] >> 4) & 0x0f;
+        (v[6] & 0x80) != 0 || (substreams >= 1 && (v[7] & 0x01) != 0)
+    } else {
+        false
+    }
+}
+
+fn trak(body: &[u8], full_data: &[u8], info: &mut MediaInfo) {
     if is_full(info) {
         return;
     }
     let (mut handler, mut language, mut entry): ([u8; 4], Option<String>, Option<Vec<u8>>) = ([0; 4], None, None);
+    let mut chunk_offsets: Vec<usize> = Vec::new();
     boxes(body, &mut |kind, v| {
         if kind == b"mdia" {
             boxes(v, &mut |kind, v| match kind {
@@ -777,10 +817,30 @@ fn trak(body: &[u8], info: &mut MediaInfo) {
                 }
                 b"minf" => boxes(v, &mut |kind, v| {
                     if kind == b"stbl" {
-                        boxes(v, &mut |kind, v| {
-                            if kind == b"stsd" {
+                        boxes(v, &mut |kind, v| match kind {
+                            b"stsd" => {
                                 entry = v.get(8..).map(<[u8]>::to_vec);
                             }
+                            b"stco" => {
+                                let count = be32(v, 4).unwrap_or(0).min(64) as usize;
+                                for i in 0..count {
+                                    if let Some(off) = be32(v, 8 + i * 4) {
+                                        chunk_offsets.push(off as usize);
+                                    }
+                                }
+                            }
+                            b"co64" => {
+                                let count = be32(v, 4).unwrap_or(0).min(64) as usize;
+                                for i in 0..count {
+                                    if let Some(bytes) = v.get(8 + i * 8..16 + i * 8)
+                                        && let Ok(arr) = <[u8; 8]>::try_from(bytes)
+                                        && let Ok(off) = usize::try_from(u64::from_be_bytes(arr))
+                                    {
+                                        chunk_offsets.push(off);
+                                    }
+                                }
+                            }
+                            _ => {}
                         });
                     }
                 }),
@@ -838,13 +898,36 @@ fn trak(body: &[u8], info: &mut MediaInfo) {
             }
             info.video.push(track);
         }
-        b"soun" => info.audio.push(AudioTrack {
-            codec,
-            channels: be16(&entry, 24).map(u64::from),
-            sample_rate: be32(&entry, 32).map(|rate| f64::from(rate >> 16)),
-            language,
-            ..AudioTrack::default()
-        }),
+        b"soun" => {
+            let mut atmos = false;
+            boxes(entry.get(36..).unwrap_or(&[]), &mut |kind, v| {
+                if (kind == b"dec3" && parse_dec3_atmos(v)) || (kind == b"dmlp" && parse_dmlp_atmos(v)) {
+                    atmos = true;
+                }
+            });
+            if !atmos {
+                for &off in &chunk_offsets {
+                    let Some(chunk) = full_data.get(off..) else { continue };
+                    let chunk_has_atmos = match codec.as_str() {
+                        "ec-3" => AudioBitstream::has_eac3_atmos_frame(chunk),
+                        "mlpa" => AudioBitstream::has_truehd_atmos(chunk),
+                        _ => false,
+                    };
+                    if chunk_has_atmos {
+                        atmos = true;
+                        break;
+                    }
+                }
+            }
+            info.audio.push(AudioTrack {
+                codec,
+                channels: be16(&entry, 24).map(u64::from),
+                sample_rate: be32(&entry, 32).map(|rate| f64::from(rate >> 16)),
+                language,
+                atmos,
+                ..AudioTrack::default()
+            });
+        }
         b"subt" | b"text" | b"sbtl" => {
             info.subtitles.push(SubtitleTrack { codec, language, ..SubtitleTrack::default() });
         }
@@ -852,11 +935,38 @@ fn trak(body: &[u8], info: &mut MediaInfo) {
     }
 }
 
-fn probe_cluster(data: &[u8], info: &mut MediaInfo) {
-    let audio_probe = AudioBitstream::probe(data);
-    if audio_probe.has_atmos && let Some(a) = info.audio.first_mut() {
-        a.atmos = true;
+fn probe_block(block: &[u8], audio_tracks: &[(u64, usize)], info: &mut MediaInfo) {
+    let Some((Some(track_num), vint_len)) = element_size(block) else { return };
+    let Some(payload) = block.get(vint_len + 3..) else { return };
+    let Some(&(_, audio_idx)) = audio_tracks.iter().find(|&&(num, _)| num == track_num) else { return };
+    let Some(track) = info.audio.get_mut(audio_idx) else { return };
+    if track.atmos {
+        return;
     }
+    let has_atmos = match track.codec.as_str() {
+        "A_TRUEHD" | "A_MLP" => AudioBitstream::has_truehd_atmos(payload),
+        "A_EAC3" => AudioBitstream::has_eac3_atmos_frame(payload),
+        _ => false,
+    };
+    if has_atmos {
+        track.atmos = true;
+    }
+}
+
+fn probe_cluster(data: &[u8], audio_tracks: &[(u64, usize)], info: &mut MediaInfo) {
+    walk(data, &mut |id, body| {
+        match id {
+            0xA3 => probe_block(body, audio_tracks, info),
+            0xA0 => walk(body, &mut |sub_id, sub_body| {
+                if sub_id == 0xA1 {
+                    probe_block(sub_body, audio_tracks, info);
+                }
+                true
+            }),
+            _ => {}
+        }
+        true
+    });
 
     if let Some(dv) = DolbyVisionInfo::parse_rpu(data) && let Some(v) = info.video.first_mut() {
         if v.dv_profile.is_none() {
@@ -1194,19 +1304,88 @@ pub struct AudioProbeResult {
 pub struct AudioBitstream;
 
 impl AudioBitstream {
+    pub fn has_truehd_atmos(data: &[u8]) -> bool {
+        let mut offset = 0usize;
+        while let Some(slice) = data.get(offset..) {
+            let pos = match (
+                find_subsequence(slice, &[0xF8, 0x72, 0x6F, 0xBA]),
+                find_subsequence(slice, &[0xBA, 0x6F, 0x72, 0xF8]),
+            ) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (Some(a), None) => Some(a),
+                (None, Some(b)) => Some(b),
+                (None, None) => None,
+            };
+            let Some(pos) = pos else { break };
+            if slice.get(pos + 7).is_some_and(|&b| b & 0x80 != 0) {
+                return true;
+            }
+            offset = offset.saturating_add(pos + 4);
+        }
+        false
+    }
+
+    pub fn has_eac3_atmos_frame(data: &[u8]) -> bool {
+        let mut offset = 0usize;
+        while let Some(slice) = data.get(offset..) {
+            let Some(pos) = find_subsequence(slice, &[0x0B, 0x77]) else { break };
+            let frame = &slice[pos..];
+            if frame.len() >= 8 {
+                let strmtyp = (frame[2] >> 6) & 0x03;
+                let frmsiz = ((usize::from(frame[2] & 0x07)) << 8) | usize::from(frame[3]);
+                let frame_size = (frmsiz + 1) * 2;
+                let bsid = (frame[5] >> 3) & 0x1F;
+                if strmtyp != 3 && frmsiz >= 3 && (11..=16).contains(&bsid) {
+                    let body = &frame[6..frame.len().min(frame_size)];
+                    let mut emdf_off = 0usize;
+                    while let Some(emdf_slice) = body.get(emdf_off..) {
+                        let Some(emdf_pos) = find_subsequence(emdf_slice, &[0x58, 0x38]) else { break };
+                        if let Some(&hdr) = emdf_slice.get(emdf_pos + 2)
+                            && emdf_slice.get(emdf_pos + 3).is_some()
+                            && (hdr & 0xF8) == 0
+                        {
+                            return true;
+                        }
+                        emdf_off = emdf_off.saturating_add(emdf_pos + 2);
+                    }
+                }
+            }
+            offset = offset.saturating_add(pos + 2);
+        }
+        false
+    }
+
+    fn has_raw_emdf_payload(data: &[u8]) -> bool {
+        if data.len() > 256 || is_matroska(data) || is_mp4(data) || find_subsequence(data, &[0x0B, 0x77]).is_some() {
+            return false;
+        }
+        if let Some(pos) = find_subsequence(data, &[0x58, 0x38]) {
+            data[..pos].iter().all(|&b| b == 0) && data.get(pos + 2..pos + 6) == Some(&[0, 0, 0, 0])
+        } else {
+            false
+        }
+    }
+
     pub fn probe(data: &[u8]) -> AudioProbeResult {
         let mut result = AudioProbeResult::default();
 
-        if let Some(pos) = find_subsequence(data, &[0xF8, 0x72, 0x6F, 0xBA])
-            .or_else(|| find_subsequence(data, &[0xBA, 0x6F, 0x72, 0xF8]))
-            && let Some(&b) = data.get(pos + 7)
-            && b & 0x80 != 0
-        {
-            result.has_atmos = true;
-            result.format = Some("TrueHD Atmos".to_string());
+        if is_matroska(data) || is_mp4(data) {
+            if let Some(info) = parse(data)
+                && let Some(track) = info.audio.iter().find(|a| a.atmos)
+            {
+                result.has_atmos = true;
+                result.format = Some(match track.codec.as_str() {
+                    "A_TRUEHD" | "A_MLP" | "mlpa" => "TrueHD Atmos".to_string(),
+                    _ => "E-AC-3 Atmos".to_string(),
+                });
+            }
+            return result;
         }
 
-        if !result.has_atmos && let Some(_pos) = find_subsequence(data, &[0x58, 0x38]) {
+        if Self::has_truehd_atmos(data) {
+            result.has_atmos = true;
+            result.format = Some("TrueHD Atmos".to_string());
+        } else if Self::has_eac3_atmos_frame(data) || Self::has_raw_emdf_payload(data) {
             result.has_atmos = true;
             result.format = Some("E-AC-3 Atmos".to_string());
         }
@@ -1225,7 +1404,7 @@ impl AudioBitstream {
     }
 
     pub fn probe_truehd_atmos(data: &[u8]) -> bool {
-        Self::probe(data).has_atmos
+        Self::has_truehd_atmos(data)
     }
 
     pub fn probe_dtsx(data: &[u8]) -> bool {
@@ -1598,5 +1777,84 @@ mod tests {
         assert_eq!(cover_of(&huge), None);
         assert_eq!(cover_rank("Cover.JPG"), Some(0));
         assert_eq!(cover_rank("font.otf"), None);
+    }
+
+    #[test]
+    fn avc_track_with_23_byte_codec_private_uses_avcc_parser() {
+        // 28-byte avcC record: High10 profile (110) -> bit_depth_luma_minus8 = 2 (10-bit),
+        // while byte 17 has lower 3 bits = 7 (which HevcDepth::from_hvcc would misread as 15-bit).
+        let mut avcc = vec![0u8; 28];
+        avcc[0] = 1;
+        avcc[1] = 110; // High 10 profile
+        avcc[6] = 0xF8 | 2; // 10-bit
+        avcc[17] = 0xFF; // Would yield 15 if parsed as hvcC
+
+        let t1 = [
+            el(&[0x83], &[1]),
+            el(&[0x86], b"V_MPEG4/ISO/AVC"),
+            el(&[0x63, 0xA2], &avcc),
+        ]
+        .concat();
+        let tracks = el(&[0x16, 0x54, 0xAE, 0x6B], &el(&[0xAE], &t1));
+        let segment = el(&[0x18, 0x53, 0x80, 0x67], &tracks);
+        let mkv = [el(&[0x1A, 0x45, 0xDF, 0xA3], &el(&[0x42, 0x82], b"matroska")), segment].concat();
+
+        let info = parse(&mkv).unwrap();
+        assert_eq!(info.video[0].codec, "V_MPEG4/ISO/AVC");
+        assert_eq!(info.video[0].bit_depth, Some(10));
+    }
+
+    #[test]
+    fn atmos_is_validated_within_matching_audio_track_not_video_or_first_track() {
+        // Track 1: Video (containing accidental 0x58 0x38 in its block)
+        let t1 = [el(&[0xD7], &[1]), el(&[0x83], &[1]), el(&[0x86], b"V_MPEGH/ISO/HEVC")].concat();
+        // Track 2: First audio track (stereo AC-3, non-Atmos)
+        let t2 = [el(&[0xD7], &[2]), el(&[0x83], &[2]), el(&[0x86], b"A_AC3")].concat();
+        // Track 3: Second audio track (E-AC-3 with Atmos frame)
+        let t3 = [el(&[0xD7], &[3]), el(&[0x83], &[2]), el(&[0x86], b"A_EAC3")].concat();
+        let tracks = [el(&[0xAE], &t1), el(&[0xAE], &t2), el(&[0xAE], &t3)].concat();
+
+        // Cluster 1: only video block with 0x58 0x38 -> neither audio track should be marked Atmos
+        let video_block = el(&[0xA3], &[0x81, 0x00, 0x00, 0x80, 0x11, 0x58, 0x38, 0x22]);
+        let seg_video_only = [
+            el(&[0x16, 0x54, 0xAE, 0x6B], &tracks),
+            el(&[0x1F, 0x43, 0xB6, 0x75], &video_block),
+        ]
+        .concat();
+        let mkv_video_only = [
+            el(&[0x1A, 0x45, 0xDF, 0xA3], &el(&[0x42, 0x82], b"matroska")),
+            el(&[0x18, 0x53, 0x80, 0x67], &seg_video_only),
+        ]
+        .concat();
+        let info_no_atmos = parse(&mkv_video_only).unwrap();
+        assert!(!info_no_atmos.audio[0].atmos);
+        assert!(!info_no_atmos.audio[1].atmos);
+
+        // Cluster 2: valid E-AC-3 Atmos syncframe on Track 3 (second audio track)
+        // Sync 0x0B77, strmtyp=0, frmsiz=15 (32 bytes), fscod=0, bsid=16 (16 << 3 = 0x80), EMDF 0x5838 + version/key=0
+        let mut eac3_frame = vec![0u8; 32];
+        eac3_frame[0] = 0x0B;
+        eac3_frame[1] = 0x77;
+        eac3_frame[2] = 0x00;
+        eac3_frame[3] = 15;
+        eac3_frame[4] = 0x00;
+        eac3_frame[5] = 16 << 3;
+        eac3_frame[10..14].copy_from_slice(&[0x58, 0x38, 0x02, 0x0E]);
+        let mut audio_block_body = vec![0x83, 0x00, 0x00, 0x80]; // TrackNumber = 3
+        audio_block_body.extend_from_slice(&eac3_frame);
+        let cluster_with_atmos = [video_block, el(&[0xA3], &audio_block_body)].concat();
+        let seg_with_atmos = [
+            el(&[0x16, 0x54, 0xAE, 0x6B], &tracks),
+            el(&[0x1F, 0x43, 0xB6, 0x75], &cluster_with_atmos),
+        ]
+        .concat();
+        let mkv_with_atmos = [
+            el(&[0x1A, 0x45, 0xDF, 0xA3], &el(&[0x42, 0x82], b"matroska")),
+            el(&[0x18, 0x53, 0x80, 0x67], &seg_with_atmos),
+        ]
+        .concat();
+        let info_atmos = parse(&mkv_with_atmos).unwrap();
+        assert!(!info_atmos.audio[0].atmos, "first audio track must remain non-Atmos");
+        assert!(info_atmos.audio[1].atmos, "second audio track must be marked Atmos");
     }
 }

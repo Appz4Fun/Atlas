@@ -366,6 +366,11 @@ impl ArchiveStream {
         let max_allowed = limit.min(crate::probe::nest::MAX_DECODED);
         let max_ratio_limit = input.len().saturating_mul(crate::probe::nest::MAX_RATIO);
         let effective_limit = max_allowed.min(max_ratio_limit);
+        let limit_err = if max_ratio_limit <= max_allowed {
+            DecompressError::ExpansionRatioBreached
+        } else {
+            DecompressError::LimitReached
+        };
 
         match format {
             ArchiveFormat::Zip => {
@@ -379,7 +384,7 @@ impl ArchiveStream {
                     if to_read == 0 {
                         let mut test_chunk = [0u8; 1];
                         if let Ok(1) = decoder.read(&mut test_chunk) {
-                            return Err(DecompressError::ExpansionRatioBreached);
+                            return Err(limit_err);
                         }
                         break;
                     }
@@ -387,7 +392,7 @@ impl ArchiveStream {
                         Ok(0) => break,
                         Ok(n) => {
                             buf.extend_from_slice(&chunk[..n]);
-                            if buf.len() > input.len().saturating_mul(crate::probe::nest::MAX_RATIO) {
+                            if buf.len() > max_ratio_limit {
                                 return Err(DecompressError::ExpansionRatioBreached);
                             }
                         }
@@ -402,9 +407,9 @@ impl ArchiveStream {
                 Ok(buf)
             }
             ArchiveFormat::SevenZip => {
-                let (buf, end) = crate::probe::lzma::lzma2(input, effective_limit);
-                if buf.len() > input.len().saturating_mul(crate::probe::nest::MAX_RATIO) {
-                    return Err(DecompressError::ExpansionRatioBreached);
+                let (buf, end) = crate::probe::lzma::lzma2(input, effective_limit.saturating_add(1));
+                if end == crate::probe::lzma::End::Limit || buf.len() > effective_limit {
+                    return Err(limit_err);
                 }
                 if buf.is_empty() && end != crate::probe::lzma::End::Done {
                     return Err(DecompressError::DecodeError("lzma2 decode failed".into()));
@@ -412,9 +417,10 @@ impl ArchiveStream {
                 Ok(buf)
             }
             ArchiveFormat::Rar5 => {
-                let (buf, end) = crate::probe::codec::rar5::rar5(input, false, None, effective_limit);
-                if buf.len() > input.len().saturating_mul(crate::probe::nest::MAX_RATIO) {
-                    return Err(DecompressError::ExpansionRatioBreached);
+                let (buf, end) =
+                    crate::probe::codec::rar5::rar5(input, false, None, effective_limit.saturating_add(1));
+                if end == crate::probe::lzma::End::Limit || buf.len() > effective_limit {
+                    return Err(limit_err);
                 }
                 if buf.is_empty() && end != crate::probe::lzma::End::Done {
                     return Err(DecompressError::DecodeError("rar5 decode failed".into()));
@@ -547,5 +553,28 @@ mod tests {
         assert_eq!((head.method.as_deref(), head.crc32, head.name.as_deref()), (Some("store"), Some(7), Some("a")));
         assert_eq!(&z[head.stored_at.unwrap()..], b"inner");
         assert_eq!(parse(b"plain"), None);
+    }
+
+    #[test]
+    fn seven_zip_reports_limit_and_expansion_ratio_breach() {
+        // 10,000 bytes of b'A' compressed with LZMA2 (51 bytes -> ~196:1 expansion ratio)
+        let bomb_lzma2: [u8; 51] = [
+            224, 39, 15, 0, 43, 93, 0, 32, 239, 251, 191, 254, 163, 177, 94, 229, 248, 63, 178, 170, 38, 85, 248, 104,
+            112, 65, 112, 21, 15, 141, 253, 30, 76, 27, 138, 66, 183, 25, 244, 105, 24, 113, 174, 102, 35, 134, 188,
+            244, 42, 0, 0,
+        ];
+
+        // 1. Explicit limit smaller than 100x input (64 < 5,100): must return LimitReached
+        let res_limit = ArchiveStream::decompress(ArchiveFormat::SevenZip, &bomb_lzma2, 64);
+        assert_eq!(res_limit, Err(DecompressError::LimitReached));
+
+        // 2. Stream expanding beyond 100:1 input ratio (10,000 > 5,100): must return ExpansionRatioBreached
+        let res_ratio = ArchiveStream::decompress(ArchiveFormat::SevenZip, &bomb_lzma2, 100_000);
+        assert_eq!(res_ratio, Err(DecompressError::ExpansionRatioBreached));
+
+        // 3. Valid LZMA2 stream within limit and ratio: must succeed
+        let small_lzma2 = [0x01, 0x00, 0x03, b't', b'e', b's', b't', 0x00];
+        let res_ok = ArchiveStream::decompress(ArchiveFormat::SevenZip, &small_lzma2, 64);
+        assert_eq!(res_ok.as_deref(), Ok(&b"test"[..]));
     }
 }

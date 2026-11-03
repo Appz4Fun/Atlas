@@ -86,7 +86,30 @@ impl PostingTool {
             };
         }
 
-        // 2. Nyuu timestamp grammar
+        // 2. GoPostStuff grammar (checked before Nyuu timestamp since gps-<id>-<ts>@... is a subset)
+        if let Some(caps) = GOPOSTSTUFF_RE.captures(mid).or_else(|| GOPOSTSTUFF_ALT_RE.captures(mid)) {
+            let ts: Option<u64> = caps.get(1).and_then(|m| m.as_str().parse().ok());
+            return ToolInfo {
+                tool: ToolType::GoPostStuff,
+                version: None,
+                embedded_time_ms: ts,
+                deterministic: false,
+            };
+        }
+        if domain.to_ascii_lowercase().contains("gopoststuff") {
+            let ts = NYUU_TIMESTAMP_RE
+                .captures(mid)
+                .and_then(|caps| caps.get(1))
+                .and_then(|m| m.as_str().parse().ok());
+            return ToolInfo {
+                tool: ToolType::GoPostStuff,
+                version: None,
+                embedded_time_ms: ts,
+                deterministic: false,
+            };
+        }
+
+        // 3. Nyuu timestamp grammar
         if let Some(caps) = NYUU_TIMESTAMP_RE.captures(mid) {
             let ms: Option<u64> = caps.get(1).and_then(|m| m.as_str().parse().ok());
             return ToolInfo {
@@ -107,7 +130,7 @@ impl PostingTool {
             };
         }
 
-        // 3. ngPost UUIDv4 grammar
+        // 4. ngPost UUIDv4 grammar
         if NGPOST_UUID_RE.is_match(mid) || domain.eq_ignore_ascii_case("ngpost") || domain.eq_ignore_ascii_case("ngpost.com") {
             return ToolInfo {
                 tool: ToolType::NgPost,
@@ -117,29 +140,10 @@ impl PostingTool {
             };
         }
 
-        // 4. Postie grammar
+        // 5. Postie grammar
         if POSTIE_RE.is_match(mid) {
             return ToolInfo {
                 tool: ToolType::Postie,
-                version: None,
-                embedded_time_ms: None,
-                deterministic: false,
-            };
-        }
-
-        // 5. GoPostStuff grammar
-        if let Some(caps) = GOPOSTSTUFF_RE.captures(mid).or_else(|| GOPOSTSTUFF_ALT_RE.captures(mid)) {
-            let ts: Option<u64> = caps.get(1).and_then(|m| m.as_str().parse().ok());
-            return ToolInfo {
-                tool: ToolType::GoPostStuff,
-                version: None,
-                embedded_time_ms: ts,
-                deterministic: false,
-            };
-        }
-        if domain.to_ascii_lowercase().contains("gopoststuff") {
-            return ToolInfo {
-                tool: ToolType::GoPostStuff,
                 version: None,
                 embedded_time_ms: None,
                 deterministic: false,
@@ -390,10 +394,9 @@ impl XrefSync {
     /// Parse `Xref: host group1:num1 group2:num2 ...` and return group-to-article mappings.
     pub fn parse_xref_pairs(xref_str: &str) -> Vec<(String, u64)> {
         let field = xref_str.trim_start();
-        let payload = if field.len() >= 5 && field[..5].eq_ignore_ascii_case("xref:") {
-            &field[5..]
-        } else {
-            field
+        let payload = match field.get(..5) {
+            Some(prefix) if prefix.eq_ignore_ascii_case("xref:") => field.get(5..).unwrap_or(field),
+            _ => field,
         };
         payload
             .split_whitespace()
@@ -438,6 +441,30 @@ mod tests {
         let info = PostingTool::classify("<AbCdEfGhIjKl-1729000000000@nyuu>", &headers);
         assert_eq!(info.tool, ToolType::Nyuu);
         assert_eq!(info.embedded_time_ms, Some(1729000000000));
+    }
+
+    #[test]
+    fn gopoststuff_10_to_13_digit_timestamp_classification() {
+        let headers = HeaderMap::new();
+        let info = PostingTool::classify("<gps-abc-1729000000000@example.org>", &headers);
+        assert_eq!(info.tool, ToolType::GoPostStuff);
+        assert_eq!(info.embedded_time_ms, Some(1729000000000));
+
+        let info_10 = PostingTool::classify("<gps-xyz123-1729000000@gopoststuff.local>", &headers);
+        assert_eq!(info_10.tool, ToolType::GoPostStuff);
+        assert_eq!(info_10.embedded_time_ms, Some(1729000000));
+    }
+
+    #[test]
+    fn xref_multibyte_utf8_prefix_does_not_panic() {
+        let pairs = XrefSync::parse_xref_pairs("hosté alt.binaries.test:42 alt.binaries.movies:99");
+        assert_eq!(
+            pairs,
+            vec![
+                ("alt.binaries.test".to_string(), 42),
+                ("alt.binaries.movies".to_string(), 99),
+            ]
+        );
     }
 
     #[test]

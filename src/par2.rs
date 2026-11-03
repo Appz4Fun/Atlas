@@ -149,8 +149,12 @@ pub fn inventory(data: &[u8]) -> Inventory {
             }
         } else if &kind == IFSC {
             let (Some(file_id), Some(slice_bytes)) = (id_at(body, 0), body.get(16..)) else { continue };
+            let (chunks, rem) = slice_bytes.as_chunks::<20>();
+            if !rem.is_empty() || chunks.len() > MAX_FILES {
+                continue;
+            }
             let mut slices = Vec::new();
-            for chunk in slice_bytes.as_chunks::<20>().0.iter().take(MAX_FILES) {
+            for chunk in chunks.iter().take(MAX_FILES) {
                 let Some(md5) = chunk.get(0..16).and_then(|s| s.try_into().ok()) else { continue };
                 let Some(crc_bytes) = chunk.get(16..20).and_then(|s| s.try_into().ok()) else { continue };
                 slices.push((md5, u32::from_le_bytes(crc_bytes)));
@@ -172,10 +176,14 @@ pub fn inventory(data: &[u8]) -> Inventory {
     {
         for (set_id, file_id, slices) in ifsc_slices {
             for f in inv.files.iter_mut().filter(|f| f.set_id == set_id && f.file_id == file_id) {
-                if slices.is_empty() {
+                if slices.is_empty() || f.size == 0 {
                     continue;
                 }
+                let expected_slices = f.size.div_ceil(block_size);
                 let num_slices = slices.len() as u64;
+                if num_slices != expected_slices {
+                    continue;
+                }
                 let last_slice_unpadded_len = f.size.saturating_sub(num_slices.saturating_sub(1) * block_size);
                 let zero_padding_len = block_size.saturating_sub(last_slice_unpadded_len);
 
@@ -451,5 +459,40 @@ mod tests {
             let part: Vec<String> = inventory(&data[..cut]).files.into_iter().map(|f| f.name).collect();
             assert!(full.starts_with(&part), "cut {cut}");
         }
+    }
+
+    #[test]
+    fn ifsc_incomplete_or_capped_slices_leave_crc_unknown() {
+        let block_size = 1024u64;
+        let mut main_body = block_size.to_le_bytes().to_vec();
+        main_body.extend(1u32.to_le_bytes());
+        main_body.extend([1u8; 16]);
+        while !main_body.len().is_multiple_of(4) {
+            main_body.push(0);
+        }
+        let main = packet(1, MAIN, &main_body);
+
+        // 1. File with 4,097 blocks (> MAX_FILES = 4,096): must leave crc32 as None
+        let capped_blocks = (MAX_FILES + 1) as u64;
+        let desc_capped = desc(1, 1, "huge.bin", capped_blocks * block_size);
+        let mut ifsc_capped_body = vec![1u8; 16];
+        for _ in 0..=MAX_FILES {
+            ifsc_capped_body.extend([0xAAu8; 16]);
+            ifsc_capped_body.extend(0x1234_5678u32.to_le_bytes());
+        }
+        let ifsc_capped = packet(1, IFSC, &ifsc_capped_body);
+        let inv_capped = inventory(&[main.clone(), desc_capped, ifsc_capped].concat());
+        assert_eq!(inv_capped.files[0].crc32, None, "exceeding MAX_FILES must leave CRC unknown");
+
+        // 2. File requiring 3 blocks but IFSC only supplies 2 slices: must leave crc32 as None
+        let desc_short = desc(1, 1, "short_ifsc.bin", 3 * block_size);
+        let mut ifsc_short_body = vec![1u8; 16];
+        for _ in 0..2 {
+            ifsc_short_body.extend([0xBBu8; 16]);
+            ifsc_short_body.extend(0x1111_2222u32.to_le_bytes());
+        }
+        let ifsc_short = packet(1, IFSC, &ifsc_short_body);
+        let inv_short = inventory(&[main, desc_short, ifsc_short].concat());
+        assert_eq!(inv_short.files[0].crc32, None, "incomplete slice list must leave CRC unknown");
     }
 }

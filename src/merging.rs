@@ -114,7 +114,9 @@ impl ReleaseAssembler {
             if let Some(last) = current_runs.last() {
                 let delta_t = run.t_start - last.t_end;
                 let within_window = delta_t >= lower_bound && delta_t <= upper_bound;
-                let can_group = IntraReleaseGrouping::can_group(last, &run).is_ok();
+                let can_group = current_runs
+                    .iter()
+                    .all(|existing| IntraReleaseGrouping::can_group(existing, &run).is_ok());
 
                 if within_window && can_group {
                     current_runs.push(run);
@@ -256,14 +258,17 @@ impl Par2Bridge {
                 // Step 3: RAR5 volume number vint fallback
                 if let Some(vol_num) = Self::parse_rar5_volume_num(&article_head.payload) {
                     run.rar_volume_idx = Some(vol_num as u32);
-                    let vol_p1 = format!("part{:02}", vol_num);
-                    let vol_p2 = format!("part{}", vol_num);
+                    let vol_p0 = format!("part{:03}.", vol_num);
+                    let vol_p1 = format!("part{:02}.", vol_num);
+                    let vol_p2 = format!("part{}.", vol_num);
                     let vol_p3 = format!(".r{:02}", vol_num.saturating_sub(1));
                     if let Some(f) = inv.files.iter().find(|pf| {
+                        let lower = pf.name.to_ascii_lowercase();
                         !matched_file_ids.contains(&pf.file_id)
-                            && (pf.name.to_ascii_lowercase().contains(&vol_p1)
-                                || pf.name.to_ascii_lowercase().contains(&vol_p2)
-                                || pf.name.to_ascii_lowercase().contains(&vol_p3))
+                            && (lower.contains(&vol_p0)
+                                || lower.contains(&vol_p1)
+                                || lower.contains(&vol_p2)
+                                || lower.contains(&vol_p3))
                     }) {
                         run.filename = f.name.clone();
                         run.full_md5 = Some(f.md5);
@@ -310,17 +315,31 @@ impl Par2Bridge {
             return None;
         }
 
-        // Read header flags vint
-        let (flags, next_pos) = Self::read_vint(payload, pos)?;
+        // Read common header flags vint
+        let (header_flags, next_pos) = Self::read_vint(payload, pos)?;
         pos = next_pos;
 
-        // Flag 0x0002 = Volume Number Present
-        if (flags & 0x0002) != 0 {
+        // Common flag 0x0001 = Extra area size present
+        if (header_flags & 0x0001) != 0 {
+            let (_extra_size, next_pos) = Self::read_vint(payload, pos)?;
+            pos = next_pos;
+        }
+        // Common flag 0x0002 = Data area size present
+        if (header_flags & 0x0002) != 0 {
+            let (_data_size, next_pos) = Self::read_vint(payload, pos)?;
+            pos = next_pos;
+        }
+
+        // Read main header archive flags vint
+        let (archive_flags, next_pos) = Self::read_vint(payload, pos)?;
+        pos = next_pos;
+
+        // Archive flag 0x0002 = Volume number field present (0-based for volumes >= 2; absent on volume 1)
+        if (archive_flags & 0x0002) != 0 {
             let (vol_num, _) = Self::read_vint(payload, pos)?;
-            // RAR5 encodes volume index starting at 0 or 1; canonicalize to 1-based index
             Some(vol_num + 1)
         } else {
-            None
+            Some(1)
         }
     }
 
@@ -426,6 +445,7 @@ pub enum MergeResult<E> {
 pub struct VetoDsu<T> {
     parent: Vec<usize>,
     rank: Vec<usize>,
+    members: Vec<Vec<usize>>,
     pub elements: Vec<T>,
 }
 
@@ -435,6 +455,7 @@ impl<T> VetoDsu<T> {
         Self {
             parent: (0..n).collect(),
             rank: vec![0; n],
+            members: (0..n).map(|idx| vec![idx]).collect(),
             elements,
         }
     }
@@ -464,16 +485,30 @@ impl<T> VetoDsu<T> {
             return MergeResult::AlreadyMerged;
         }
 
-        if let Err(e) = veto(&self.elements[root_i], &self.elements[root_j]) {
-            return MergeResult::Vetoed(e);
+        for &a in &self.members[root_i] {
+            for &b in &self.members[root_j] {
+                if let Err(e) = veto(&self.elements[a], &self.elements[b]) {
+                    return MergeResult::Vetoed(e);
+                }
+            }
         }
 
         match self.rank[root_i].cmp(&self.rank[root_j]) {
-            std::cmp::Ordering::Less => self.parent[root_i] = root_j,
-            std::cmp::Ordering::Greater => self.parent[root_j] = root_i,
+            std::cmp::Ordering::Less => {
+                self.parent[root_i] = root_j;
+                let moved = std::mem::take(&mut self.members[root_i]);
+                self.members[root_j].extend(moved);
+            }
+            std::cmp::Ordering::Greater => {
+                self.parent[root_j] = root_i;
+                let moved = std::mem::take(&mut self.members[root_j]);
+                self.members[root_i].extend(moved);
+            }
             std::cmp::Ordering::Equal => {
                 self.parent[root_j] = root_i;
                 self.rank[root_i] += 1;
+                let moved = std::mem::take(&mut self.members[root_j]);
+                self.members[root_i].extend(moved);
             }
         }
 
@@ -847,5 +882,104 @@ mod tests {
             yenc_part_size: Some(750_000),
         };
         assert_eq!(InterReleaseDeduplication::partition_releases(&rel1, &rel3), ReleasePartition::Alt);
+    }
+
+    #[test]
+    fn join_runs_rejects_non_adjacent_duplicate_volume() {
+        let base = CandidateFileRun {
+            filename: "part01.rar".into(),
+            group: "g".into(),
+            poster: "p".into(),
+            size: 50_000_000,
+            yenc_total: Some(50),
+            yenc_part_size: Some(750_000),
+            file_index: Some(1),
+            rar_volume_idx: Some(1),
+            archive_format: Some("rar5".into()),
+            member_id: None,
+            byte_offset: 0,
+            t_start: 10.0,
+            t_end: 20.0,
+            file_crc: Some(1),
+            md5_16k: None,
+            full_md5: None,
+            unpacked_crc32: None,
+            creation_salt: None,
+            is_obfuscated: false,
+        };
+        let mut vol2 = base.clone();
+        vol2.filename = "part02.rar".into();
+        vol2.file_index = Some(2);
+        vol2.rar_volume_idx = Some(2);
+        vol2.t_start = 20.1;
+        vol2.t_end = 30.0;
+
+        let mut vol1_dup = base.clone();
+        vol1_dup.filename = "part01_dup.rar".into();
+        vol1_dup.file_index = Some(3);
+        vol1_dup.rar_volume_idx = Some(1);
+        vol1_dup.t_start = 30.1;
+        vol1_dup.t_end = 40.0;
+
+        let releases = ReleaseAssembler::join_runs(&[base, vol2, vol1_dup], None);
+        assert_eq!(releases.len(), 2, "runs 1, 2, 1 must split before the second volume 1");
+        assert_eq!(releases[0].runs.len(), 2);
+        assert_eq!(releases[1].runs.len(), 1);
+    }
+
+    #[test]
+    fn veto_dsu_enforces_constraints_across_all_component_members() {
+        let base = CandidateFileRun {
+            filename: "part01.rar".into(),
+            group: "g".into(),
+            poster: "p".into(),
+            size: 50_000_000,
+            yenc_total: Some(50),
+            yenc_part_size: Some(750_000),
+            file_index: Some(1),
+            rar_volume_idx: Some(1),
+            archive_format: Some("rar5".into()),
+            member_id: None,
+            byte_offset: 0,
+            t_start: 0.0,
+            t_end: 1.0,
+            file_crc: None,
+            md5_16k: None,
+            full_md5: None,
+            unpacked_crc32: None,
+            creation_salt: None,
+            is_obfuscated: false,
+        };
+        let mut vol2 = base.clone();
+        vol2.rar_volume_idx = Some(2);
+        vol2.file_index = Some(2);
+
+        let mut vol2_dup = base.clone();
+        vol2_dup.rar_volume_idx = Some(2);
+        vol2_dup.file_index = Some(3);
+
+        let mut dsu = VetoDsu::new(vec![base, vol2, vol2_dup]);
+
+        assert_eq!(dsu.union(0, 1, IntraReleaseGrouping::can_group), MergeResult::Merged);
+        assert_eq!(
+            dsu.union(0, 2, IntraReleaseGrouping::can_group),
+            MergeResult::Vetoed(IntraReleaseVeto::DuplicateVolumeIndex),
+            "non-root member volume 2 must veto duplicate volume 2"
+        );
+    }
+
+    #[test]
+    fn rar5_volume_number_parses_archive_flags_and_optional_common_fields() {
+        // Volume 1: common header_flags = 0x01 (extra area present, size=4), archive_flags = 0x01 (volume attribute, no vol num)
+        let mut vol1 = b"Rar!\x1A\x07\x01\x00".to_vec();
+        vol1.extend([0u8; 4]); // CRC32
+        vol1.extend([8, 1, 0x01, 4, 0x01]); // size=8, type=1 (Main), common_flags=0x01, extra_size=4, archive_flags=0x01
+        assert_eq!(Par2Bridge::parse_rar5_volume_num(&vol1), Some(1));
+
+        // Volume 3 (encoded as 0-based 2): common header_flags = 0x01 (extra_size=2), archive_flags = 0x03 (volume + vol_num present), vol_num = 2
+        let mut vol3 = b"Rar!\x1A\x07\x01\x00".to_vec();
+        vol3.extend([0u8; 4]); // CRC32
+        vol3.extend([9, 1, 0x01, 2, 0x03, 2]);
+        assert_eq!(Par2Bridge::parse_rar5_volume_num(&vol3), Some(3));
     }
 }
