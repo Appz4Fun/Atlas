@@ -685,13 +685,22 @@ pub fn start_backfill(stop: Arc<AtomicBool>) {
     });
 }
 
+/// What a cached image counts as against its folder's limit: its size in 4 KiB blocks, and never less than 16 KiB.
+/// A tiny file still takes a whole block on disk, and the floor caps how many files a folder can hold at its
+/// limit over 16 KiB, so a flood of tiny ones can't fill the disk or make every trim sort millions of names.
+const MIN_CHARGE: u64 = 16 << 10;
+
+fn charge(len: u64) -> u64 {
+    len.div_ceil(4096).saturating_mul(4096).max(MIN_CHARGE)
+}
+
 pub(crate) fn trim_posters(dir: &Path, limit: u64) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     let mut files: Vec<(std::time::SystemTime, u64, PathBuf)> = entries
         .filter_map(Result::ok)
         .filter_map(|e| {
             let meta = e.metadata().ok()?;
-            Some((meta.modified().ok()?, meta.len(), e.path()))
+            Some((meta.modified().ok()?, charge(meta.len()), e.path()))
         })
         .collect();
     let mut total: u64 = files.iter().map(|(_, size, _)| size).sum();
@@ -790,8 +799,21 @@ mod tests {
             let when = std::time::SystemTime::now() - Duration::from_secs(age);
             std::fs::File::options().write(true).open(&path).unwrap().set_modified(when).unwrap();
         }
-        trim_posters(dir.path(), 10);
+        // room for one
+        trim_posters(dir.path(), 2 * MIN_CHARGE - 1);
         assert!(!dir.path().join("old.jpg").exists());
         assert!(dir.path().join("new.jpg").exists());
+    }
+
+    #[test]
+    fn tiny_files_count_as_whole_blocks_so_their_number_is_capped() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..40 {
+            std::fs::write(dir.path().join(format!("{i}")), [i as u8; 9]).unwrap();
+        }
+        // 40 nine-byte files are far under 160 KiB by length, but only ten fit
+        trim_posters(dir.path(), 10 * MIN_CHARGE);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 10);
+        assert_eq!((charge(1), charge(20_000), charge(40_000)), (MIN_CHARGE, 20_480, 40_960));
     }
 }
