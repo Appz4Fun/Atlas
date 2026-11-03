@@ -2074,8 +2074,9 @@ fn hdr_summary(v: &crate::probe::media::VideoTrack) -> String {
     // PQ with no mastering data is HDR10 whose static metadata wasn't carried into the container
     let base = v.hdr.clone().map(|h| if h == "PQ" { "HDR10 (no mastering data)".to_string() } else { h });
     match (v.dv_profile, base) {
+        // profile 5 has no fallback, whatever the container says: its colour only DV players get right
+        (Some(5), _) => "DV P5".into(),
         (Some(p), Some(base)) => format!("DV P{p} + {base}"),
-        // profile 5 has no fallback: its colour only DV players get right
         (Some(p), None) => format!("DV P{p}"),
         (None, Some(base)) => base,
         // SDR only when the container says what the transfer is: MP4 and many MKVs don't, and that's not SDR
@@ -2817,6 +2818,7 @@ mod tests {
         assert_eq!(hdr_summary(&v(Some("HDR10"), None)), "HDR10");
         assert_eq!(hdr_summary(&v(Some("HDR10"), Some(7))), "DV P7 + HDR10");
         assert_eq!(hdr_summary(&v(None, Some(5))), "DV P5");
+        assert_eq!(hdr_summary(&v(Some("PQ"), Some(5))), "DV P5");
         assert_eq!(hdr_summary(&v(Some("HLG"), None)), "HLG");
         assert_eq!(hdr_summary(&v(Some("PQ"), Some(8))), "DV P8 + HDR10 (no mastering data)");
         assert_eq!(key_options("cpuid=1 preset=slow crf=18.0 aq-mode=3 rc=crf"), "preset=slow crf=18.0 rc=crf");
