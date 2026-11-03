@@ -44,7 +44,14 @@ fn slice(group: &str, start: u64, size: u64, per_release: u64, seed: u64) -> Vec
         })
         .collect();
 
-    let mut releases: Vec<Release> = group_articles(headers_to_articles(headers)).into_values().collect();
+    // `--by-name`: the file name grouping from before collections
+    let articles = headers_to_articles(headers);
+    let grouped = if std::env::args().any(|a| a == "--by-name") {
+        group_articles(articles)
+    } else {
+        atlas::collections::group_articles(group, articles)
+    };
+    let mut releases: Vec<Release> = grouped.into_values().collect();
     for r in &mut releases {
         r.group = group.to_string();
         r.poster = r.articles[0].author.clone();
@@ -67,6 +74,15 @@ fn main() {
 
     let main = std::path::Path::new(&path);
     db::create_db_at(main).unwrap();
+    // `--old-rows`: a shard from before collections, each file name looked up
+    if std::env::args().any(|a| a == "--old-rows") {
+        for i in 0..store::SHARDS {
+            db::open_at(&store::shard_path(main, i))
+                .unwrap()
+                .execute("insert or replace into meta (key, value) values ('grouping_from', 2)", [])
+                .unwrap();
+        }
+    }
     let ids = store::Ids::new(main);
     let mut shards: Vec<(rusqlite::Connection, store::ShardWriter)> = (0..store::SHARDS)
         .map(|i| {

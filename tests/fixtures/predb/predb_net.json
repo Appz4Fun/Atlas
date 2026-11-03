@@ -1,0 +1,7 @@
+{"status": "success", "data": [
+  {"release": "Delta.Epsilon.Zeta.2024.720p.WEB-OTHER", "section": "X264", "size": "100", "files": 20, "pretime": 1700000001, "status": 0, "reason": ""},
+  {"release": "Nuked.Release.Name.2024.WEB-OTHER", "section": "X264", "size": null, "files": null, "pretime": "1700000002", "status": 3, "reason": "dupe"},
+  {"release": "", "section": "X264"},
+  {"section": "no title key"},
+  {"release": "Unnuked.Release.Name.2024.WEB-OTHER", "section": "X265", "status": 2}
+]}

@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Atlas">
+  <path d="M32 3.5 56.7 17.75v28.5L32 60.5 7.3 46.25v-28.5Z" fill="#a8400f"/>
+  <path d="M32 9.3 51.7 20.65v22.7L32 54.7 12.3 43.35v-22.7Z" fill="none" stroke="#f7e6dc" stroke-opacity=".35" stroke-width="1.5"/>
+  <path d="M32 17v20m-9-9 9 9 9-9M21.5 45h21" fill="none" stroke="#ffffff" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -17,6 +17,7 @@ use crate::db;
 use crate::indexer::{Db, NotCarried, PassContext, PassSettings, Progress, RunStates, TooOld, run_pass, shared_db};
 use crate::nntp::{Pool, unless_stopped};
 use crate::paths;
+use crate::postprocess::{Stage, StageParams};
 use crate::sab;
 use crate::ui;
 
@@ -25,7 +26,7 @@ const HISTORY_LEN: f64 = 60.0;
 const FAILED_RETRY: Duration = Duration::from_secs(300);
 /// an idle group (nothing new) is looked at again after this long
 const IDLE_RECHECK: Duration = Duration::from_secs(10);
-/// how often config.json is re-read while indexing
+/// how often config.toml is re-read while indexing
 const CONFIG_RELOAD: Duration = Duration::from_secs(5);
 
 /// how often auto_run_compact compacts the database
@@ -53,6 +54,7 @@ fn write_status(running: bool, group: &str, mode: &str, idle: bool, status: &str
         "status": status,
         "error_count": errors,
         "pid": std::process::id(),
+        "postprocess_backlog": crate::postprocess::stats::backlog(),
     });
 
     if let Err(e) = write_atomic(&paths::status_file(), data.to_string()) {
@@ -74,6 +76,7 @@ struct HistoryPoint {
 struct GroupStats {
     articles: i64,
     releases: i64,
+    skipped: i64,
     last_indexed: f64,
 }
 
@@ -82,6 +85,7 @@ struct Stats {
     total_articles: i64,
     total_bytes: i64,
     total_releases: i64,
+    total_skipped: i64,
     start_time: f64,
     groups_indexed: HashSet<String>,
     error_count: u32,
@@ -104,6 +108,7 @@ impl Stats {
             total_articles: 0,
             total_bytes: 0,
             total_releases: 0,
+            total_skipped: 0,
             start_time: now(),
             groups_indexed: HashSet::new(),
             error_count: 0,
@@ -113,7 +118,8 @@ impl Stats {
         }
     }
 
-    fn tick(&mut self, articles: i64, bytes: i64, releases: i64, group: &str) {
+    fn tick(&mut self, p: &Progress, group: &str) {
+        let Progress { articles, bytes, releases, skipped } = *p;
         let t = now();
 
         let bin = t as i64 / RATE_BIN * RATE_BIN;
@@ -131,13 +137,25 @@ impl Stats {
         self.total_articles += articles;
         self.total_bytes += bytes;
         self.total_releases += releases;
+        self.total_skipped += skipped;
         self.history.push(HistoryPoint { t, a: articles, b: bytes });
 
         if !group.is_empty() {
+            use crate::metrics::names::{ARTICLE_BYTES, ARTICLES, ARTICLES_SKIPPED, GROUP_LAST_INDEXED, RELEASES_SEEN};
+            // a blocked group's name never becomes a series
+            if !crate::filters::group_blocked(group) {
+                let labels = [("group", group)];
+                ARTICLES.inc(&labels, articles.max(0) as u64);
+                ARTICLE_BYTES.inc(&labels, bytes.max(0) as u64);
+                RELEASES_SEEN.inc(&labels, releases.max(0) as u64);
+                ARTICLES_SKIPPED.inc(&labels, skipped.max(0) as u64);
+                GROUP_LAST_INDEXED.set(&labels, t);
+            }
             self.groups_indexed.insert(group.to_string());
             let gs = self.group_stats.entry(group.to_string()).or_default();
             gs.articles += articles;
             gs.releases += releases;
+            gs.skipped += skipped;
             gs.last_indexed = t;
         }
 
@@ -175,7 +193,7 @@ impl Stats {
             .group_stats
             .iter()
             .map(|(name, g)| {
-                (name.clone(), json!({"articles": g.articles, "releases": g.releases, "last_indexed": g.last_indexed}))
+                (name.clone(), json!({"articles": g.articles, "releases": g.releases, "skipped": g.skipped, "last_indexed": g.last_indexed}))
             })
             .collect();
 
@@ -188,6 +206,7 @@ impl Stats {
             "total_articles": self.total_articles,
             "total_bytes": self.total_bytes,
             "total_releases": self.total_releases,
+            "total_skipped": self.total_skipped,
             "history": self.history,
             "groups_indexed": self.groups_indexed.len(),
             "error_count": self.error_count,
@@ -242,7 +261,7 @@ fn settings_of(config: &Config) -> PassSettings {
 
 /// `alt.binaries.a, alt.binaries.b` or `3197 groups, 20 at once`
 /// Groups indexed at once on each indexing server, as (server index, workers),
-/// from config.json alone (pool indexes follow `usable_servers` order). Runtime
+/// from config.toml alone (pool indexes follow `usable_servers` order). Runtime
 /// changes, like a server found to be article only or a lowered connection
 /// limit, dont change the plan, soo they never trigger a rebuild.
 fn plan_workers(config: &Config) -> Vec<(usize, usize)> {
@@ -259,11 +278,25 @@ fn groups_label(groups: &[String], workers: usize) -> String {
     if groups.len() <= 3 { groups.join(", ") } else { format!("{} groups, {workers} at once", groups.len()) }
 }
 
+/// Say which configured groups wont be indexed (`filters::group_blocked`).
+fn say_blocked(blocked: &[String]) {
+    if !blocked.is_empty() {
+        println!("blocked and not indexed, their names label them for minors: {}", blocked.join(", "));
+    }
+}
+
 /// State shared by the scheduler's workers for one set of servers.
 struct Scheduler {
     ctx: PassContext,
     settings: RwLock<PassSettings>,
     groups: RwLock<Vec<String>>,
+    /// configured groups left out of `groups`, see `filters::group_blocked`
+    blocked: Mutex<Vec<String>>,
+    /// the processing stage, when it's on
+    stage: OnceLock<Arc<Stage>>,
+    predb: OnceLock<Arc<crate::predb::Service>>,
+    /// what the stage was started with: its threads and body permits are fixed then
+    stage_shape: StageShape,
     /// (server, groups at once) for every indexing server
     plan: Vec<(usize, usize)>,
     workers: usize,
@@ -291,7 +324,7 @@ struct Scheduler {
     compact_due: AtomicBool,
     /// no compaction before this (one couldnt take the lock)
     compact_after: Option<SystemTime>,
-    /// auto_run_compact as config.json has it now
+    /// auto_run_compact as config.toml has it now
     auto_compact: AtomicBool,
     passes: AtomicUsize,
 }
@@ -442,19 +475,37 @@ impl Scheduler {
 
         write_status(true, &groups_label(&groups, self.workers), &mode, idle, status, false, errors);
         let mut stats = self.stats.lock().unwrap();
-        stats.extra.insert("servers".into(), json!(self.ctx.pool.server_stats()));
+        let servers = self.ctx.pool.server_stats();
+        crate::metrics::report_servers(&servers);
+        stats.extra.insert("servers".into(), json!(servers));
         stats.extra.insert("groups_configured".into(), json!(groups.len()));
+        stats.extra.insert("groups_blocked".into(), json!(self.blocked.lock().unwrap().len()));
+        if let Some(stage) = self.stage.get() {
+            stats.extra.insert("postprocess".into(), stage.snapshot());
+        }
+        if let Some(predb) = self.predb.get() {
+            stats.extra.insert("predb".into(), predb.snapshot());
+        }
+        if self.stage_shape.4 {
+            stats.extra.insert("media".into(), crate::media::shared().snapshot());
+        }
         stats.extra.insert("workers".into(), json!(self.workers));
         stats.extra.insert("pid".into(), json!(std::process::id()));
         let mut load = crate::profile::LOAD.snapshot();
         load["unsaved_headers"] = json!(self.ctx.pool.unsaved_headers());
         load["max_unsaved_headers"] = json!(self.ctx.pool.max_unsaved());
         stats.extra.insert("load".into(), load);
+        let live = crate::metrics::Live {
+            pool: self.ctx.pool.id(),
+            stage: self.stage.get().is_some(),
+            predb: self.predb.get().is_some(),
+        };
+        crate::metrics::report_indexer(&stats.extra, stats.error_count, idle, live);
         stats.write("", &mode, true, idle);
     }
 }
 
-/// The groups whose day chunks a worker may take: ones still in config.json,
+/// The groups whose day chunks a worker may take: ones still in config.toml,
 /// except `skip`, and none when the mode never backfills.
 fn chunk_groups(mode: &str, groups: &[String], skip: &HashSet<String>) -> HashSet<String> {
     if mode == "live" {
@@ -571,7 +622,7 @@ async fn worker(sched: Arc<Scheduler>, server: usize, db: Db) {
                 let settings = sched.settings.read().unwrap().clone();
                 let stats = sched.stats.clone();
                 let group = chunk.group.clone();
-                let mut progress = |p: &Progress| stats.lock().unwrap().tick(p.articles, p.bytes, p.releases, &group);
+                let mut progress = |p: &Progress| stats.lock().unwrap().tick(p, &group);
                 let run = crate::indexer::run_chunk(&sched.ctx, &settings, &db, &chunk, server, &mut progress);
                 let Some(result) = unless_stopped(&sched.ctx.stop, run).await else { break };
                 sched.finish_chunk(chunk.group, server, result);
@@ -580,7 +631,7 @@ async fn worker(sched: Arc<Scheduler>, server: usize, db: Db) {
             Some(Work::Sweep(group)) => {
                 let settings = sched.settings.read().unwrap().clone();
                 let stats = sched.stats.clone();
-                let mut progress = |p: &Progress| stats.lock().unwrap().tick(p.articles, p.bytes, p.releases, &group);
+                let mut progress = |p: &Progress| stats.lock().unwrap().tick(p, &group);
                 let run = crate::indexer::run_sweep(&sched.ctx, &settings, &db, &group, server, &mut progress);
                 let result = unless_stopped(&sched.ctx.stop, run).await;
                 sched.sweeping.lock().unwrap().remove(&server);
@@ -596,7 +647,7 @@ async fn worker(sched: Arc<Scheduler>, server: usize, db: Db) {
 
         let settings = sched.settings.read().unwrap().clone();
         let stats = sched.stats.clone();
-        let mut progress = |p: &Progress| stats.lock().unwrap().tick(p.articles, p.bytes, p.releases, &group);
+        let mut progress = |p: &Progress| stats.lock().unwrap().tick(p, &group);
 
         // stopping drops a pass stuck on the network too (GROUP, a login, a name
         // lookup). safe: db writes run whole on their own thread and the cursor
@@ -607,7 +658,23 @@ async fn worker(sched: Arc<Scheduler>, server: usize, db: Db) {
     }
 }
 
-/// Re-read config.json while indexing: new groups / mode / batch settings /
+/// on, database threads, net threads, and whether PreDB's service and the media fan-out run
+type StageShape = (bool, usize, usize, bool, bool);
+
+fn stage_shape(config: &Config) -> StageShape {
+    let p = &config.postprocess;
+    (p.enabled, p.workers, p.body_connections, config.predb.enabled, config.media.any_provider())
+}
+
+/// a config the running indexer cant take on as it is
+fn needs_rebuild(sched: &Scheduler, config: &Config, servers: &[UsenetServer]) -> bool {
+    usable_servers(config) != servers
+        || plan_workers(config) != sched.plan
+        || config.max_unsaved_headers() != sched.ctx.pool.max_unsaved()
+        || stage_shape(config) != sched.stage_shape
+}
+
+/// Re-read config.toml while indexing: new groups / mode / batch settings /
 /// auto compaction apply right away. Returns when servers, the parallelism or
 /// the unsaved headers cap changed (the caller rebuilds) or when stopping.
 async fn watch_config(sched: Arc<Scheduler>, servers: Vec<UsenetServer>) {
@@ -619,13 +686,18 @@ async fn watch_config(sched: Arc<Scheduler>, servers: Vec<UsenetServer>) {
 
         let Some(config) = load_config() else { continue };
 
-        if usable_servers(&config) != servers
-            || plan_workers(&config) != sched.plan
-            || config.max_unsaved_headers() != sched.ctx.pool.max_unsaved()
-        {
+        if needs_rebuild(&sched, &config, &servers) {
             println!("config changed, restarting the indexer");
             sched.wind_down.store(true, Ordering::Relaxed);
             return;
+        }
+        crate::archive::sync_inline_lookups(&config);
+        if let Some(stage) = sched.stage.get() {
+            let (stage, config) = (stage.clone(), config.clone());
+            let _ = tokio::task::spawn_blocking(move || stage.set_config(&config)).await;
+        }
+        if let Some(predb) = sched.predb.get() {
+            predb.set_config(&config);
         }
 
         let auto = config.auto_run_compact;
@@ -644,6 +716,14 @@ async fn watch_config(sched: Arc<Scheduler>, servers: Vec<UsenetServer>) {
             *current = settings;
         }
 
+        let blocked = config.blocked_groups();
+        let mut known = sched.blocked.lock().unwrap();
+        if *known != blocked {
+            say_blocked(&blocked);
+            *known = blocked;
+        }
+        drop(known);
+
         let groups = config.tracked_groups();
         let mut current = sched.groups.write().unwrap();
         if *current != groups {
@@ -653,7 +733,7 @@ async fn watch_config(sched: Arc<Scheduler>, servers: Vec<UsenetServer>) {
     }
 }
 
-/// While auto_run_compact is on (looked at every second, config.json can
+/// While auto_run_compact is on (looked at every second, config.toml can
 /// change it): once the interval has passed since the last compaction (or
 /// since the indexer started, when there was none), wind down so `supervise`
 /// can compact.
@@ -701,6 +781,7 @@ async fn run_servers(
 ) -> bool {
     let servers = usable_servers(config);
     let groups = config.tracked_groups();
+    say_blocked(&config.blocked_groups());
     let plan = plan_workers(config);
     let workers: usize = plan.iter().map(|(_, w)| w).sum();
 
@@ -714,6 +795,10 @@ async fn run_servers(
         ctx: PassContext { pool, states, stop, verbose: false },
         settings: RwLock::new(settings_of(config)),
         groups: RwLock::new(groups),
+        blocked: Mutex::new(config.blocked_groups()),
+        stage: OnceLock::new(),
+        predb: OnceLock::new(),
+        stage_shape: stage_shape(config),
         plan: plan.clone(),
         workers,
         next: Mutex::new(HashMap::new()),
@@ -734,6 +819,10 @@ async fn run_servers(
 
     let db = match db::open().and_then(|conn| db::tune_for_writing(&conn).map(|_| conn)) {
         Ok(conn) => {
+            // before any pass: what is there so far was saved by file name
+            if let Err(e) = crate::store::start_grouping(&paths::database()) {
+                ui::warn(&format!("couldnt note where collections start: {e:#}"));
+            }
             // before any pass: whose the plain cursors are (see claim_plain_cursors)
             if let Err(e) = crate::indexer::claim_plain_cursors(&conn, &sched.ctx.pool) {
                 ui::warn(&format!("couldnt record whose the group cursors are: {e:#}"));
@@ -750,7 +839,48 @@ async fn run_servers(
     let checkpoint_stop = Arc::new(AtomicBool::new(false));
     let checkpointer = db::checkpointer(checkpoint_stop.clone());
 
+    crate::archive::sync_inline_lookups(config);
     let mut tasks = tokio::task::JoinSet::new();
+    // before the stage: its step reads this file, and a missing one is an error it would spend attempts on
+    if config.predb.enabled
+        && let Err(e) = crate::predb::db::create(&paths::predb_database())
+    {
+        eprintln!("predb: {e}");
+    }
+    if config.postprocess.enabled {
+        let stage = Stage::start(StageParams {
+            main: paths::database(),
+            db: db.clone(),
+            pool: sched.ctx.pool.clone(),
+            config: config.clone(),
+            steps: crate::postprocess::steps_to_run(),
+            handle: tokio::runtime::Handle::current(),
+        });
+        let _ = sched.stage.set(stage.clone());
+        let s = sched.clone();
+        tasks.spawn(crate::postprocess::run(stage, move || s.stopping()));
+    }
+    if config.predb.enabled {
+        let started = crate::predb::Service::start(crate::predb::ServiceParams {
+            main: paths::database(),
+            config: config.predb.clone(),
+            stage: sched.stage.get().cloned(),
+            fetch: crate::predb::test_fetch(),
+        });
+        match started {
+            Ok(service) => {
+                let _ = sched.predb.set(service.clone());
+                let s = sched.clone();
+                // in `tasks`: no connection of its outlives this, soo a compaction's checkpoint never meets one
+                tasks.spawn(crate::predb::run(service, move || s.stopping()));
+            }
+            Err(e) => eprintln!("predb: {e:#}"),
+        }
+    }
+    if config.postprocess.enabled && config.media.any_provider() {
+        let s = sched.clone();
+        tasks.spawn(crate::media::run(crate::media::shared(), db.clone(), move || s.stopping()));
+    }
     for &(server, count) in &plan {
         for _ in 0..count {
             tasks.spawn(worker(sched.clone(), server, db.clone()));
@@ -851,7 +981,7 @@ async fn supervise(stop: Arc<AtomicBool>, stats: Arc<Mutex<Stats>>, writing: Opt
 
     while !stopping() {
         let Some(config) = load_config() else {
-            let why = crate::config::file_problem().unwrap_or_else(|| "config.json not found".into());
+            let why = crate::config::file_problem().unwrap_or_else(|| "config.toml not found".into());
             ui::error(&format!("error with config, stopped: {why}"));
             break;
         };
@@ -884,7 +1014,14 @@ async fn supervise(stop: Arc<AtomicBool>, stats: Arc<Mutex<Stats>>, writing: Opt
         // at least one server has to answer before spinning everything up
         if let Err(e) = pool.connect().await {
             ui::error(&format!("couldnt reach any usenet server: {e}"));
-            stats.lock().unwrap().error_count += 1;
+            let errors = {
+                let mut stats = stats.lock().unwrap();
+                stats.error_count += 1;
+                stats.error_count
+            };
+            // no scheduler to report them: this is when they matter most
+            crate::metrics::report_servers(&pool.server_stats());
+            crate::metrics::report_errors(errors);
             write_status(true, "", &config.index_mode, false, "warning", false, 1);
             nap(Duration::from_secs(30), stopping).await;
             continue;
@@ -893,6 +1030,8 @@ async fn supervise(stop: Arc<AtomicBool>, stats: Arc<Mutex<Stats>>, writing: Opt
         let compact_due =
             run_servers(&config, pool.clone(), states.clone(), stats.clone(), stop.clone(), compact_after).await;
         pool.close().await;
+        // its last totals, and no connections while there's no pool
+        crate::metrics::report_servers(&pool.server_stats());
 
         if compact_due && !stopping() {
             writing = None;
@@ -971,6 +1110,12 @@ pub fn run() -> i32 {
         let _ = signal_hook::flag::register(signal_hook::consts::SIGINT, stop.clone());
     }
 
+    crate::metrics::start(&config, crate::metrics::Role::Indexer);
+    crate::sealed_store::spawn_offload(&config.sealed_log, stop.clone());
+    if config.metrics.enabled {
+        crate::metrics::catalog::spawn(Duration::from_secs(config.metrics.catalog_every_secs), stop.clone());
+    }
+
     index(config, stop, Some(writing))
 }
 
@@ -1024,6 +1169,12 @@ fn index(config: Config, stop: Arc<AtomicBool>, writing: Option<WriteGuard>) -> 
         }
     };
 
+    crate::media::details::start_backfill(stop.clone());
+
+    if let Ok(conn) = crate::db::open() {
+        crate::duplicates::forget_old_twins(&conn);
+    }
+
     let stats = Arc::new(Mutex::new(Stats::new()));
     write_status(true, &groups_label(&config.tracked_groups(), 0), &config.index_mode, false, "running", false, 0);
 
@@ -1040,6 +1191,16 @@ fn index(config: Config, stop: Arc<AtomicBool>, writing: Option<WriteGuard>) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn skipped_articles_are_counted_per_group_and_in_all() {
+        let mut stats = Stats::new();
+        stats.tick(&Progress { articles: 10, bytes: 5, releases: 2, skipped: 4 }, "alt.binaries.a");
+        stats.tick(&Progress { articles: 10, bytes: 5, releases: 2, skipped: 1 }, "alt.binaries.a");
+        assert_eq!(stats.total_skipped, 5);
+        assert_eq!(stats.group_stats["alt.binaries.a"].skipped, 5);
+        assert_eq!(stats.total_articles, 20, "they still count as received");
+    }
 
     #[test]
     fn chunks_only_for_tracked_groups_in_a_backfilling_mode() {
@@ -1060,6 +1221,10 @@ mod tests {
             },
             settings: RwLock::new(PassSettings { mode: "backfill".into(), ..PassSettings::default() }),
             groups: RwLock::new(groups),
+            blocked: Mutex::new(Vec::new()),
+            stage: OnceLock::new(),
+            predb: OnceLock::new(),
+            stage_shape: stage_shape(&Config::default()),
             plan: vec![],
             workers: 2,
             next: Default::default(),
@@ -1131,6 +1296,23 @@ mod tests {
         });
     }
 
+    #[test]
+    fn a_provider_turning_on_or_off_rebuilds() {
+        let mut config = Config::default();
+        config.media.tvmaze.enabled = false;
+        let before = stage_shape(&config);
+        config.media.tvmaze.enabled = true;
+        assert_ne!(stage_shape(&config), before);
+    }
+
+    #[test]
+    fn predb_turning_on_or_off_rebuilds() {
+        let mut config = Config::default();
+        let before = stage_shape(&config);
+        config.predb.enabled = true;
+        assert_ne!(stage_shape(&config), before);
+    }
+
     /// a worker alone on its server alternates a due sweep with its home group
     #[test]
     fn a_lone_worker_alternates_a_due_sweep_with_its_home_group() {
@@ -1155,5 +1337,24 @@ mod tests {
             // and the sweep again after the group
             assert!(matches!(next_work(&sched, server, &db, false).await, Some(Work::Sweep(g)) if g == "done"));
         });
+    }
+
+    #[test]
+    fn a_stage_turning_on_or_off_rebuilds() {
+        let sched = scheduler(Pool::new(&[]), vec![]);
+        let mut config = Config::default();
+        let servers = usable_servers(&config);
+        config.max_unsaved_headers = Some(sched.ctx.pool.max_unsaved() as u64);
+        let plan_same = plan_workers(&config) == sched.plan;
+        assert!(plan_same);
+        assert!(!needs_rebuild(&sched, &config, &servers));
+        config.postprocess.enabled = false;
+        assert!(needs_rebuild(&sched, &config, &servers));
+        config.postprocess.enabled = true;
+        config.postprocess.workers += 1;
+        assert!(needs_rebuild(&sched, &config, &servers), "its thread counts are fixed when it starts");
+        config.postprocess.workers -= 1;
+        config.postprocess.body_connections += 1;
+        assert!(needs_rebuild(&sched, &config, &servers));
     }
 }

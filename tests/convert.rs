@@ -218,6 +218,19 @@ fn old_databases_convert_without_losing_anything() {
     let newest: String =
         conn.query_row("select name from releases order by id desc limit 1", [], |r| r.get(0)).unwrap();
     assert_eq!(newest, "Brand.New");
+
+    // no collections yet, and it's the first indexer's to say where they start
+    for path in store::shard_paths(&main) {
+        let conn = db::open_shard(&path).unwrap();
+        let (collections, from): (i64, Option<i64>) = conn
+            .query_row(
+                "select (select count(*) from collections), (select value from meta where key = 'grouping_from')",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((collections, from), (0, None));
+    }
 }
 
 #[test]
@@ -641,4 +654,36 @@ fn a_huge_sparse_release_id_converts_without_a_slot_per_id() {
         let now = atlas::search::get_release_with(&conn, id).unwrap().unwrap();
         assert_eq!(&nzb::render_nzb(&now, &store::articles(&conn, id).unwrap()), nzb_before, "{name}");
     }
+}
+
+#[test]
+fn converted_shards_have_empty_stage_tables() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = dir.path().join("atlas.db");
+    old_database(&main);
+    convert::run(&main, &|_| {}).unwrap();
+    for path in store::shard_paths(&main) {
+        let conn = db::open_shard(&path).unwrap();
+        let rows: i64 = conn
+            .query_row(
+                "select (select count(*) from pp_queue) + (select count(*) from pp_walks)
+                 + (select count(*) from releases where name_source is not null)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 0);
+    }
+}
+
+#[test]
+fn a_convert_leaves_the_media_cache_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = dir.path().join("atlas.db");
+    old_database(&main);
+    db::create_db_at(&main).unwrap();
+    let cache = atlas::media::store::path_for(&main);
+    std::fs::write(&cache, b"known bytes").unwrap();
+    convert::run(&main, &|_| {}).unwrap();
+    assert_eq!(std::fs::read(&cache).unwrap(), b"known bytes");
 }

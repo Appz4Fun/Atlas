@@ -1,0 +1,9 @@
+# Wave 5 / Agent C: Rust crate readiness (Haiku). The orchestrator corrected the bug claim.
+- yenc 0.2.2: parsed fields only, raw lines not kept. Unknown =y keys are a HARD ERROR (is_known_keyword, decode.rs ~492), so tools that add extra keys fail to parse. No escape or line stats.
+- yenc 0.2.1 vs 0.2.2: decode_buffer is identical. 0.2.2 only swaps in crc32fast.
+- BUG (corrected): the agent said `..` at col 0 drops both dots. That is WRONG. decode_buffer is called per line (decode.rs:116 after read_until LF), and the `..` arm correctly emits one 0x04 (its own test at decode.rs:626). Real defects: (1) it ALWAYS dot-unstuffs, so if the NNTP layer already unstuffed the body (most NNTP clients do), a data line starting with two encoded dots (0x04 0x04) loses a byte, which is a false pcrc32 mismatch; (2) a 1-char line "." followed by CRLF pushes '.'-42 and then decodes CR as data; NUL/CR/LF are silently skipped. Likely explanation of the "false pcrc32 mismatch" another thread saw: double unstuffing. Verify which layer unstuffs in Atlas.
+- yencoding 0.3.0: metadata + DecodedPart only. It also strips one dot from a leading `..`, so it has the same double-unstuff risk.
+- nntp-rs 0.3.0: has an NNTP client + yenc, parsed only, no dot-unstuffing in the decoder, CR skipped anywhere, and line 0 must be =ybegin.
+- nzb-rs 0.6.0: spec parser with segment size/number/message_id.
+- crc32fast 1.5.4: Hasher::combine (lib.rs:169) + new_with_initial_len (lib.rs:96), so whole-file CRCs come from part CRCs.
+- Design: a custom pass over the body Atlas already downloads, storing about 60 B per article: xxh3 of the verbatim =ybegin/=ypart/=yend lines (or store them raw, ~150 B), first/last data line lengths, CRLF flag, blank line before =yend, counts of escaped '.', ' ', '\t' at BOL/EOL, and pcrc32. Under 10% extra CPU (unmeasured). Store the raw lines rather than only a hash, so new quirks can be mined later.

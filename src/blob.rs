@@ -70,9 +70,35 @@ pub fn encode(segs: &[Seg]) -> Vec<u8> {
     zstd::bulk::compress(&raw, LEVEL).expect("zstd compress of an in memory buffer")
 }
 
+/// The blob itself, fetched when what's stored is its place in the sealed log.
+fn resolved(blob: &[u8]) -> Result<std::borrow::Cow<'_, [u8]>> {
+    match sealed_log::Locator::from_ref(blob) {
+        Some(at) => crate::sealed_store::fetch(at).map(std::borrow::Cow::Owned),
+        None => Ok(std::borrow::Cow::Borrowed(blob)),
+    }
+}
+
+/// Whether this is a place in the sealed log rather than a blob.
+pub fn is_remote(blob: &[u8]) -> bool {
+    sealed_log::Locator::from_ref(blob).is_some()
+}
+
 /// Unpacks a blob made by `encode`. Truncated or corrupt input is an error.
 pub fn decode(blob: &[u8]) -> Result<Vec<Seg>> {
-    parse(&zstd::stream::decode_all(blob)?, usize::MAX)
+    parse(&zstd::stream::decode_all(&*resolved(blob)?)?, usize::MAX)
+}
+
+/// How many segments a blob holds, unpacking only its start.
+pub fn count(blob: &[u8]) -> Result<usize> {
+    use std::io::Read;
+    let blob = resolved(blob)?;
+    let mut start = Vec::with_capacity(16);
+    zstd::stream::read::Decoder::new(&*blob)?.take(16).read_to_end(&mut start)?;
+    if start.first() != Some(&VERSION) {
+        return Err(Error::new(ErrorKind::InvalidData, "unknown blob version"));
+    }
+    let mut pos = 1;
+    Ok(get_varint(&start, &mut pos)? as usize)
 }
 
 /// the most local bytes a segment may have to be sealed: a file with a longer
@@ -94,7 +120,8 @@ pub fn decode_capped(blob: &[u8], max: usize) -> Result<Vec<Seg>> {
     use std::io::Read;
     let limit = (max as u64).saturating_mul(MAX_SEG_RAW as u64).saturating_add(16);
     let mut raw = Vec::new();
-    zstd::stream::read::Decoder::new(blob)?.take(limit).read_to_end(&mut raw)?;
+    let blob = resolved(blob)?;
+    zstd::stream::read::Decoder::new(&*blob)?.take(limit).read_to_end(&mut raw)?;
     if raw.len() as u64 >= limit {
         return Err(Error::new(ErrorKind::InvalidData, "blob unpacks to more than its cap"));
     }
@@ -223,5 +250,15 @@ mod tests {
     fn extreme_values_survive() {
         let segs = vec![seg(Some(0), i64::MAX, i64::MAX, b"a"), seg(Some(1), 0, 0, b"b"), seg(Some(2), -5, 1, b"c")];
         assert_eq!(decode(&encode(&segs)).unwrap(), segs);
+    }
+
+    #[test]
+    fn count_matches_decode() {
+        for n in [0usize, 1, 50_000] {
+            let segs: Vec<Seg> =
+                (0..n).map(|i| Seg { part: Some(i as i64), bytes: 10, domain: 0, local: vec![1, 2, 3] }).collect();
+            let blob = encode(&segs);
+            assert_eq!(count(&blob).unwrap(), decode(&blob).unwrap().len());
+        }
     }
 }

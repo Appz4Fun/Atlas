@@ -11,6 +11,9 @@ use std::time::Duration;
 use atlas::config::UsenetServer;
 use atlas::indexer::Indexer;
 
+pub mod http;
+pub mod stage;
+
 pub const GROUP: &str = "alt.binaries.test";
 
 #[derive(Clone)]
@@ -22,6 +25,7 @@ pub struct Post {
     pub body: Vec<Vec<u8>>,
     /// the Date header, rfc 2822
     pub date: String,
+    pub author: String,
 }
 
 pub struct Server {
@@ -29,6 +33,8 @@ pub struct Server {
     pub password: &'static str,
     /// false = BODY always 430s, like a provider missing the article
     pub bodies: bool,
+    /// BODY answers 502, like a provider in trouble
+    pub body_trouble: bool,
     pub xover_delay: Duration,
     /// answer XFEATURE COMPRESS GZIP and send zlib compressed XOVER
     pub compress: bool,
@@ -75,6 +81,7 @@ impl Server {
             posts: Mutex::new(posts),
             password: "secret",
             bodies: true,
+            body_trouble: false,
             xover_delay: Duration::ZERO,
             compress: false,
             compress_broken: false,
@@ -131,6 +138,14 @@ pub fn yenc_body(name: &str, data: &[u8]) -> Vec<Vec<u8>> {
     ]
 }
 
+/// `yenc_body` as real posts send it: each 100 bytes its own line
+pub fn yenc_lined(name: &str, data: &[u8]) -> Vec<Vec<u8>> {
+    let mut lines = vec![format!("=ybegin line=128 size={} name={name}", data.len()).into_bytes()];
+    lines.extend(data.chunks(100).map(yenc_encode));
+    lines.push(format!("=yend size={}", data.len()).into_bytes());
+    lines
+}
+
 pub fn par2_file_desc(name: &str, size: u64) -> Vec<u8> {
     let mut name_bytes = name.as_bytes().to_vec();
     while !name_bytes.len().is_multiple_of(4) {
@@ -155,6 +170,7 @@ pub fn post(number: u64, subject: &str, bytes: u64, body: Vec<Vec<u8>>) -> Post 
         bytes,
         body,
         date: "Fri, 02 Oct 2026 10:11:12 +0000".into(),
+        author: "poster <p@mock>".into(),
     }
 }
 
@@ -246,8 +262,8 @@ pub fn serve(stream: TcpStream, state: &Server, over_limit: bool) {
                 let hits = || posts[lo..].iter().take_while(|p| p.number <= b);
                 let row = |p: &Post| {
                     format!(
-                        "{}\t{}\tposter <p@mock>\t{}\t{}\t\t{}\t10\r\n",
-                        p.number, p.subject, p.date, p.message_id, p.bytes
+                        "{}\t{}\t{}\t{}\t{}\t\t{}\t10\r\n",
+                        p.number, p.subject, p.author, p.date, p.message_id, p.bytes
                     )
                 };
                 if hits().next().is_none() && state.empty_is_420 {
@@ -287,6 +303,30 @@ pub fn serve(stream: TcpStream, state: &Server, over_limit: bool) {
                     }
                 }
             }
+            "STAT" => {
+                let there = posts_lock().iter().any(|p| p.message_id == arg);
+                send(&mut out, if there { &b"223 0 there"[..] } else { &b"430 no such article"[..] });
+            }
+            "ARTICLE" => match posts_lock().iter().find(|p| p.message_id == arg).filter(|_| state.bodies) {
+                Some(post) => {
+                    send(&mut out, b"220 0 article");
+                    send(&mut out, b"From: tester@example.org");
+                    send(&mut out, b"User-Agent: Nyuu/0.4.2");
+                    send(&mut out, b"Path: news.example!not-for-mail");
+                    send(&mut out, b"Xref: news alt.binaries.test:1 alt.binaries.other:2");
+                    send(&mut out, b"");
+                    for line in &post.body {
+                        let mut line = line.clone();
+                        if line.first() == Some(&b'.') {
+                            line.insert(0, b'.');
+                        }
+                        send(&mut out, &line);
+                    }
+                    send(&mut out, b".");
+                }
+                None => send(&mut out, b"430 no such article"),
+            },
+            "BODY" if state.body_trouble => send(&mut out, b"502 try later"),
             "BODY" => match posts_lock().iter().find(|p| p.message_id == arg).filter(|_| state.bodies) {
                 Some(p) => {
                     thread::sleep(state.body_delay);
@@ -359,4 +399,76 @@ pub fn index_until_idle(indexer: &mut Indexer) {
         }
     }
     panic!("indexer never went idle");
+}
+
+/// A process `procs::indexer_alive` takes for the indexer, with bg_indexer.pid written.
+/// Killed when dropped.
+#[cfg(unix)]
+pub struct FakeIndexer(std::process::Child);
+
+#[cfg(unix)]
+impl Drop for FakeIndexer {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// `sysinfo` must see `--bg-indexer` in its arguments. `sleep 60; true`, because
+/// `sh -c 'sleep 60'` execs straight into sleep and loses it.
+#[cfg(unix)]
+pub fn fake_indexer(home: &std::path::Path) -> FakeIndexer {
+    let child = std::process::Command::new("sh").args(["-c", "sleep 60; true", "--bg-indexer"]).spawn().unwrap();
+    std::fs::write(home.join("bg_indexer.pid"), child.id().to_string()).unwrap();
+    FakeIndexer(child)
+}
+
+/// Every shard's inode: a compaction rewrites them all.
+#[cfg(unix)]
+pub fn shard_inodes(main: &std::path::Path) -> Vec<u64> {
+    use std::os::unix::fs::MetadataExt;
+    atlas::store::shard_paths(main).iter().map(|p| std::fs::metadata(p).unwrap().ino()).collect()
+}
+
+/// A `Fetch` that opens no socket: replies are queued per URL, every URL is recorded, and a URL with no reply left is an `Err`.
+pub struct Scripted {
+    pub urls: Mutex<Vec<String>>,
+    replies: Mutex<std::collections::HashMap<String, std::collections::VecDeque<atlas::predb::poll::HttpReply>>>,
+    /// when every other URL has run out, answered to every request
+    pub always: Mutex<Option<String>>,
+}
+
+impl Scripted {
+    pub fn new() -> Arc<Scripted> {
+        Arc::new(Scripted { urls: Mutex::default(), replies: Mutex::default(), always: Mutex::default() })
+    }
+
+    pub fn reply(&self, url: &str, status: u16, body: &str) {
+        self.reply_with(
+            url,
+            atlas::predb::poll::HttpReply { status, retry_after: None, rate_reset: None, body: body.to_string() },
+        );
+    }
+
+    pub fn reply_with(&self, url: &str, reply: atlas::predb::poll::HttpReply) {
+        self.replies.lock().unwrap().entry(url.to_string()).or_default().push_back(reply);
+    }
+}
+
+impl atlas::predb::poll::Fetch for Scripted {
+    fn get(&self, url: &str) -> Result<atlas::predb::poll::HttpReply, String> {
+        self.urls.lock().unwrap().push(url.to_string());
+        if let Some(reply) = self.replies.lock().unwrap().get_mut(url).and_then(|q| q.pop_front()) {
+            return Ok(reply);
+        }
+        match &*self.always.lock().unwrap() {
+            Some(body) => Ok(atlas::predb::poll::HttpReply {
+                status: 200,
+                retry_after: None,
+                rate_reset: None,
+                body: body.clone(),
+            }),
+            None => Err(format!("no reply scripted for {url}")),
+        }
+    }
 }

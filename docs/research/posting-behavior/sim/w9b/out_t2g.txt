@@ -1,0 +1,3 @@
+nyuu NZBs 80 consecutive files with equal segment count 590 / 939
+penalty 0 P mean 0.605 sd 0.029 | R mean 0.558 sd 0.027
+penalty 1.0 P mean 0.802 sd 0.017 | R mean 0.724 sd 0.018

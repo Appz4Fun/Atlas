@@ -1,0 +1,21 @@
+[package]
+name = "sealed-log"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+description = "Append-only store for Atlas's sealed articles, kept on a big disk"
+license = "GPL-3.0-only"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "sealed-log"
+path = "src/main.rs"
+
+[dependencies]
+crc32fast = "1"
+libc = "0.2"
+
+[profile.release]
+lto = "thin"

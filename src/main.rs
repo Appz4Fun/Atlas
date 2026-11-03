@@ -1,6 +1,6 @@
 use std::process::ExitCode;
 
-use atlas::{app, bg_indexer, compact, convert, db, paths, procs, store};
+use atlas::{app, bg_indexer, compact, convert, db, paths, postprocess, procs, store};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -13,16 +13,38 @@ fn main() -> ExitCode {
 
     if has("--help") || has("-h") {
         println!(
-            "atlas {}\n\nusage: atlas [--selftest | --bg-indexer | --convert]\n\n  (no args)     interactive menu\n  --selftest    check the login on every usenet server and exit\n  --bg-indexer  run the indexing loop headless (the menu starts this for you)\n  --convert     move a database from before the shards into them, then exit\n                (the indexer does this on its own when it starts)\n  --compact     rewrite the shards smaller (stop indexing first), then exit",
+            "atlas {}\n\nusage: atlas [--selftest | --bg-indexer | --convert]\n\n  (no args)     interactive menu\n  --selftest    check the login on every usenet server and exit\n  --bg-indexer  run the indexing loop headless (the menu starts this for you)\n  --convert     move a database from before the shards into them, then exit\n                (the indexer does this on its own when it starts)\n  --compact     rewrite the shards smaller (stop indexing first), then exit\n  --purge       delete what no step can help, a dry run unless --apply. Alone it takes\n                fragments only: [--fragments] [--blocked] [--too-small [--below BYTES]]\n                [--image-only] [--rejected] [--dead] [--sample N] [--apply]\n  --reprocess   look at stored releases again, a dry run unless --apply:\n                [--step NAME]... [--group NAME]... [--failed] [--apply]\n  --reflag-obfuscated  flag old rows the current check calls random, a dry run unless\n                --apply: [--sample N] [--apply]\n  --unname      clear names taken from subjects and posted files, a dry run unless\n                --apply: [--sample N] [--apply]\n  --sealed-log-move  move sealed articles to the sealed log at full speed (stop indexing first)\n  --predb-import  read PreDB titles from a local file, a dry run unless --apply:\n                FILE [--apply]\n  --search-indexes  index poster and size, for searching on them (stop indexing first),\n                a dry run unless --apply: [--apply]",
             env!("CARGO_PKG_VERSION")
         );
         return ExitCode::SUCCESS;
     }
 
+    match atlas::config::migrate_to_toml() {
+        Ok(Some(path)) => eprintln!("config.json is now {}, and the old file is config.json.bak-toml", path.display()),
+        Ok(None) => {}
+        Err(e) => eprintln!("couldnt convert config.json to config.toml, still using it: {e}"),
+    }
+
+    atlas::sealed_store::configure(&atlas::config::sealed_log_config().addr);
+
     let code = if has("--convert") {
         run_convert()
     } else if has("--compact") {
         run_compact()
+    } else if has("--purge") {
+        postprocess::purge::main(&args)
+    } else if has("--reprocess") {
+        postprocess::reprocess::main(&args)
+    } else if has("--predb-import") {
+        atlas::predb::file_import::run(&args)
+    } else if has("--reflag-obfuscated") {
+        atlas::naming::reflag::run(&args)
+    } else if has("--unname") {
+        atlas::naming::unname::run(&args)
+    } else if has("--sealed-log-move") {
+        atlas::sealed_store::run_move()
+    } else if has("--search-indexes") {
+        atlas::field_search::run(&args)
     } else if has("--selftest") {
         app::selftest()
     } else if has(procs::BG_FLAG) {

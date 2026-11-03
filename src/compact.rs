@@ -63,6 +63,24 @@ pub(crate) fn checkpoint(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// how long a compaction waits for a reader on its way out
+const CHECKPOINT_PATIENCE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// `checkpoint`, trying again for up to `patience`: only a reader held back by
+/// a thread that is stopping can be waited out, one that stays is an error.
+fn checkpoint_patiently(conn: &Connection, patience: std::time::Duration) -> Result<()> {
+    conn.busy_timeout(std::time::Duration::ZERO)?;
+    let deadline = std::time::Instant::now() + patience;
+    let result = loop {
+        match checkpoint(conn) {
+            Err(_) if std::time::Instant::now() < deadline => std::thread::sleep(std::time::Duration::from_millis(100)),
+            result => break result,
+        }
+    };
+    conn.busy_timeout(std::time::Duration::from_secs(30))?;
+    result
+}
+
 /// Rename the database `from` to `to`, its -wal and -shm with it (those
 /// there are): the WAL can hold committed pages of it.
 pub(crate) fn rename_db(from: &Path, to: &Path) -> std::io::Result<()> {
@@ -316,6 +334,10 @@ fn interruptible(conn: &Connection, stop: &Arc<AtomicBool>) -> Result<()> {
 /// Compact every shard of `main`. Returns the total before and after. Once
 /// `stop` is set, shards not done are left as they were (and an error says so).
 pub fn run(main: &Path, progress: &(dyn Fn(&str) + Sync), stop: &Arc<AtomicBool>) -> Result<Shrunk> {
+    crate::metrics::timed("db.compact", || run_locked(main, progress, stop))
+}
+
+fn run_locked(main: &Path, progress: &(dyn Fn(&str) + Sync), stop: &Arc<AtomicBool>) -> Result<Shrunk> {
     let _lock = Lock::take(main)?;
     // a conversion's swap cut short is finished (or undone) like at a start;
     // shards with no main database at all are refused: the main database
@@ -413,11 +435,14 @@ fn compact_shard(
     // fold the WAL in soo the original is whole on its own
     {
         let conn = db::open_at(&path)?;
-        checkpoint(&conn).context("folding the original's WAL in")?;
+        // a stopping thread may have its last read open for a moment
+        checkpoint_patiently(&conn, CHECKPOINT_PATIENCE).context("folding the original's WAL in")?;
         // a shard from before sealing gets its (empty) seal columns and tables
         store::migrate_shard(&conn)?;
     }
     let before = size(&path);
+    // built by hand, soo a fresh shard wouldn't have them
+    let optional_indexes = crate::field_search::optional_indexes(&db::open_at(&path)?)?;
 
     // a fresh shard, filled without its indexes and triggers (built at the end)
     remove_db(&copy);
@@ -433,6 +458,12 @@ fn compact_shard(
          drop index idx_release_unique; drop index idx_release_group; drop index files_key;",
     )?;
     conn.execute("attach database ? as old", [path.to_string_lossy()])?;
+    refuse_what_wouldnt_be_copied(&conn, shard)?;
+    if crate::sealed_store::has_places(&conn)? {
+        anyhow::bail!(
+            "shard {shard} has articles in the sealed log: compacting would pull them all back. VACUUM it instead, and turn auto_run_compact off"
+        );
+    }
 
     // how many articles use each domain, as rows and inside sealed blobs
     say("counting domains");
@@ -441,10 +472,11 @@ fn compact_shard(
 
     halt(stop, shard)?;
     say("copying releases");
-    conn.execute_batch(
-        "insert into releases select * from old.releases order by id;
-         insert or replace into meta select * from old.meta;",
-    )?;
+    let cols = copied_columns(&conn, "releases")?;
+    conn.execute_batch(&format!(
+        "insert into releases ({cols}) select {cols} from old.releases order by id;
+         insert or replace into meta select * from old.meta;"
+    ))?;
 
     // the shared domains, keeping their ids
     let (mut kept, mut dropped) = (0i64, 0i64);
@@ -702,11 +734,22 @@ fn compact_shard(
         // the releases' message-id index: its files and their ids are the same
         tx.execute_batch(
             "insert into release_ids select * from old.release_ids
-             where file_id = 0 or file_id in (select id from files)",
+             where file_id = 0 or file_id in (select id from files);
+             insert into collections select * from old.collections
+             where release_id in (select id from releases);",
         )?;
         tx.commit()?;
     }
     say(&format!("sealed {sealed} files"));
+
+    for table in crate::postprocess::schema::SHARD_TABLES {
+        halt(stop, shard)?;
+        for (index, _) in table.indexes {
+            conn.execute_batch(&format!("drop index if exists {index}"))?;
+        }
+        let cols = copied_columns(&conn, table.name)?;
+        conn.execute_batch(&format!("insert into main.{0} ({cols}) select {cols} from old.{0}", table.name))?;
+    }
 
     halt(stop, shard)?;
     say("building indexes and the search index");
@@ -722,6 +765,9 @@ fn compact_shard(
         let conn = db::open_at(&copy)?;
         interruptible(&conn, stop)?;
         store::build_shard(&conn)?;
+        for index in &optional_indexes {
+            conn.execute_batch(index)?;
+        }
     }
 
     // the check: same rows, same NZBs
@@ -819,6 +865,65 @@ fn attached(conn: &Connection) -> Vec<String> {
 /// the files table's columns, blob last
 const FILE_COLUMNS: &str =
     "id, release_id, filename, subject, subject_part, subject_mid, expected, file_total, seen, touched_at, blob";
+
+/// the tables `compact_shard` copies its own way, with their exact columns.
+/// A new column on one of them would vanish, soo it stops the shard.
+const CORE_TABLES: &[(&str, &str)] = &[
+    ("files", FILE_COLUMNS),
+    ("segments", "file_id, local, domain, part, bytes"),
+    ("domains", "id, suffix"),
+    ("held_back", "file_id, message_id, subject, part, total_parts, file_total"),
+    ("release_ids", "release_id, id_hash, file_id"),
+    ("meta", "key, value"),
+    ("collections", "key, release_id"),
+];
+
+/// `table`'s columns in the original, comma joined, for a copy by name. One
+/// this build doesnt have stops the shard.
+fn copied_columns(conn: &Connection, table: &str) -> Result<String> {
+    let names = |schema: &str| -> Result<Vec<String>> {
+        Ok(conn
+            .prepare("select name from pragma_table_info(?1, ?2)")?
+            .query_map([table, schema], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?)
+    };
+    let here = names("main")?;
+    let old = names("old")?;
+    if let Some(c) = old.iter().find(|c| !here.contains(c)) {
+        bail!("`{table}` has a column `{c}` this build doesnt know; the original was kept");
+    }
+    Ok(old.join(", "))
+}
+
+/// Anything in the original a copy would lose stops the shard: a table this
+/// build doesnt know, or a column the copy of a core table wouldnt carry.
+fn refuse_what_wouldnt_be_copied(conn: &Connection, shard: usize) -> Result<()> {
+    let registered = crate::postprocess::schema::SHARD_TABLES;
+    let tables: Vec<String> = conn
+        .prepare(
+            r"select name from old.sqlite_master where type = 'table'
+              and name not like 'sqlite\_%' escape '\' and name not like 'releases\_fts%' escape '\'",
+        )?
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    for table in &tables {
+        if table == "releases" || registered.iter().any(|t| t.name == table) {
+            continue;
+        }
+        let Some((_, known)) = CORE_TABLES.iter().find(|(t, _)| t == table) else {
+            bail!("shard {shard}: a table `{table}` this build doesnt know; the original was kept");
+        };
+        let known: Vec<&str> = known.split(", ").collect();
+        let cols: Vec<String> = conn
+            .prepare("select name from pragma_table_info(?1, 'old')")?
+            .query_map([table], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        if let Some(c) = cols.iter().find(|c| !known.contains(&c.as_str())) {
+            bail!("shard {shard}: `{table}` has a column `{c}` this build doesnt know; the original was kept");
+        }
+    }
+    Ok(())
+}
 
 /// A sealed file's articles. A blob that wont decode stops the shard: copying
 /// on without it would lose the file's articles.
@@ -941,7 +1046,8 @@ fn check(original: &Path, copy: &Path, shard: usize, copied: i64, copies: i64, s
     let count = |conn: &Connection, table: &str| -> Result<i64> {
         Ok(conn.query_row(&format!("select count(*) from s{shard}.{table}"), [], |r| r.get(0))?)
     };
-    for table in ["releases", "files"] {
+    let registered = crate::postprocess::schema::SHARD_TABLES.iter().map(|t| t.name);
+    for table in ["releases", "files"].into_iter().chain(registered) {
         let (a, b) = (count(&old, table)?, count(&new, table)?);
         if a != b {
             bail!("shard {shard}: {table} has {b} rows in the copy, {a} in the original; the original was kept");
@@ -1061,6 +1167,18 @@ mod tests {
             err.contains("shard 3") && err.contains("<Nyu1Q2z@ngPost>") && err.contains("original was kept"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn the_search_indexes_outlast_a_compact() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        db::create_db_at(&main).unwrap();
+        let shard = store::shard_path(&main, 0);
+        db::open_at(&shard).unwrap().execute_batch("create index idx_release_size on releases(size)").unwrap();
+        run(&main, &|_| {}, &no_stop()).unwrap();
+        let indexes = crate::field_search::optional_indexes(&db::open_at(&shard).unwrap()).unwrap();
+        assert_eq!(indexes.len(), 1, "{indexes:?}");
     }
 
     fn busy(r: Result<Shrunk>) -> bool {
@@ -1197,6 +1315,78 @@ mod tests {
     /// releases over several groups, 6 articles each, three with the shared
     /// ngPost domain (their locals stored as text) and three with a made up
     /// domain each, every domain in the table
+    #[test]
+    fn a_category_filter_works_after_a_compaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        legacy_fixture(&main);
+        let group = "alt.binaries.g0";
+        let shard = db::open_shard(&store::shard_path(&main, store::shard_of(group))).unwrap();
+        let id: i64 =
+            shard.query_row("select id from releases where group_name = ? limit 1", [group], |r| r.get(0)).unwrap();
+        shard.execute("insert into release_category (release_id, category) values (?, 5040)", [id]).unwrap();
+        drop(shard);
+        run(&main, &|_| {}, &no_stop()).unwrap();
+        let conn = db::open_with_shards(&main).unwrap();
+        let filter = crate::category::parse_filter("5040").unwrap();
+        let page =
+            crate::search::newest_in_categories_with(&conn, &filter, 0, 10, &crate::search::Bounds::DEFAULT).unwrap();
+        assert_eq!(page.rows.iter().map(|r| r.id).collect::<Vec<_>>(), [id]);
+        let shard = db::open_shard(&store::shard_path(&main, store::shard_of(group))).unwrap();
+        let indexed: bool = shard
+            .prepare("select 1 from sqlite_master where type = 'index' and name = 'category_release'")
+            .unwrap()
+            .exists([])
+            .unwrap();
+        assert!(indexed);
+    }
+
+    #[test]
+    fn an_id_search_works_after_a_compaction() {
+        use crate::media::query::{IdColumn, IdQuery, find_with};
+        use crate::media::title::Kind;
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        legacy_fixture(&main);
+        let group = "alt.binaries.g0";
+        let shard = db::open_shard(&store::shard_path(&main, store::shard_of(group))).unwrap();
+        let id: i64 =
+            shard.query_row("select id from releases where group_name = ? limit 1", [group], |r| r.get(0)).unwrap();
+        shard
+            .execute(
+                "insert into media_release (release_id, kind, title_key, quality, tvdb_id) values (?, 1, 5, 0, 3001)",
+                [id],
+            )
+            .unwrap();
+        drop(shard);
+        run(&main, &|_| {}, &no_stop()).unwrap();
+        let conn = db::open_with_shards(&main).unwrap();
+        let q = IdQuery { kind: Kind::Tv, ids: vec![(IdColumn::Tvdb, 3001)], season: None, episode: None };
+        let page = find_with(&conn, &q, None, 0, 10, &crate::search::Bounds::DEFAULT, 100).unwrap();
+        assert_eq!(page.rows.iter().map(|r| r.id).collect::<Vec<_>>(), [id]);
+        let shard = db::open_shard(&store::shard_path(&main, store::shard_of(group))).unwrap();
+        for (name, _) in crate::media::MEDIA_RELEASE.indexes {
+            let found = shard
+                .prepare("select 1 from sqlite_master where type = 'index' and name = ?")
+                .unwrap()
+                .exists([name])
+                .unwrap();
+            assert!(found, "{name}");
+        }
+        assert_eq!(crate::media::MEDIA_RELEASE.indexes.len(), 7);
+    }
+
+    #[test]
+    fn a_compaction_leaves_the_media_cache_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        legacy_fixture(&main);
+        let cache = crate::media::store::path_for(&main);
+        std::fs::write(&cache, b"known bytes").unwrap();
+        run(&main, &|_| {}, &no_stop()).unwrap();
+        assert_eq!(std::fs::read(&cache).unwrap(), b"known bytes");
+    }
+
     fn legacy_fixture(main: &Path) {
         db::create_db_at(main).unwrap();
         let releases: Vec<Release> = (0..40)
@@ -2365,5 +2555,246 @@ mod tests {
         let late: i64 = db::open_at(&path).unwrap().query_row("select x from late", [], |r| r.get(0)).unwrap();
         assert_eq!(late, 7, "the write in the WAL came back too");
         assert!(!Path::new(&format!("{}-wal", backup.display())).exists());
+    }
+
+    #[test]
+    fn compacting_keeps_collections_and_where_they_started() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        db::create_db_at(&main).unwrap();
+        let group = "alt.binaries.g0";
+        let path = store::shard_path(&main, store::shard_of(group));
+        let release = |file: &str, id: &str| Release {
+            name: file.into(),
+            group: group.into(),
+            collection: Some("k".into()),
+            articles: vec![Article {
+                message_id: id.into(),
+                subject: format!("\"{file}\" yEnc (1/1)"),
+                filename: Some(file.into()),
+                release_name: Some(file.into()),
+                part: Some(1),
+                total_parts: Some(1),
+                bytes: 10,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        store::save(&main, &[release("a.jpg", "<a@x>")]).unwrap();
+        store::start_grouping(&main).unwrap();
+        // left behind by a purge: compaction drops it
+        db::open_at(&path)
+            .unwrap()
+            .execute("insert into collections (key, release_id) values (7, 999999)", [])
+            .unwrap();
+        let from = store::grouping_from(&db::open_at(&path).unwrap()).unwrap();
+        assert!(from > 1);
+
+        run(&main, &|_| {}, &Default::default()).unwrap();
+
+        let conn = db::open_at(&path).unwrap();
+        assert_eq!(store::grouping_from(&conn).unwrap(), from);
+        let rows: i64 = conn.query_row("select count(*) from collections", [], |r| r.get(0)).unwrap();
+        assert_eq!(rows, 1, "the row with a release, not the one left behind");
+        // the hash key came with meta: the collection finds its release
+        store::save(&main, &[release("b.jpg", "<b@x>")]).unwrap();
+        let (releases, files): (i64, i64) = conn
+            .query_row("select (select count(*) from releases), (select count(*) from files)", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!((releases, files), (1, 2));
+    }
+
+    /// the shards that hold a release, with their first release's id
+    fn with_releases(main: &Path) -> Vec<(PathBuf, i64)> {
+        store::shard_paths(main)
+            .into_iter()
+            .filter_map(|p| {
+                let conn = db::open_at(&p).unwrap();
+                let first: Option<i64> = conn.query_row("select min(id) from releases", [], |r| r.get(0)).unwrap();
+                first.map(|id| (p.clone(), id))
+            })
+            .collect()
+    }
+
+    fn dump(conn: &Connection, table: &str) -> Vec<String> {
+        let mut stmt = conn.prepare(&format!("select * from {table} order by 1")).unwrap();
+        let n = stmt.column_count();
+        stmt.query_map([], |r| Ok((0..n).map(|i| format!("{:?}", r.get_ref(i).unwrap())).collect::<Vec<_>>().join("|")))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn every_registered_table_and_column_survives_compaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        legacy_fixture(&main);
+        let tables = crate::postprocess::schema::SHARD_TABLES;
+        let mut before = Vec::new();
+        for (path, id) in with_releases(&main) {
+            let conn = db::open_at(&path).unwrap();
+            conn.execute("update releases set name_source = 7 where id = ?", [id]).unwrap();
+            for table in tables {
+                conn.execute(&format!("delete from {}", table.name), []).unwrap();
+                crate::postprocess::schema::sample_row(&conn, table, id).unwrap();
+                before.push((path.clone(), table.name, dump(&conn, table.name)));
+            }
+        }
+        let nzbs: Vec<_> = with_releases(&main)
+            .iter()
+            .map(|(_, id)| {
+                let conn = db::open_with_shards(&main).unwrap();
+                store::articles(&conn, *id).unwrap()
+            })
+            .collect();
+
+        run(&main, &|_| {}, &Default::default()).unwrap();
+
+        for (path, name, rows) in before {
+            let conn = db::open_at(&path).unwrap();
+            assert_eq!(dump(&conn, name), rows, "{name}");
+        }
+        for ((path, id), articles) in with_releases(&main).iter().zip(nzbs) {
+            let conn = db::open_at(path).unwrap();
+            let source: Option<i64> =
+                conn.query_row("select name_source from releases where id = ?", [id], |r| r.get(0)).unwrap();
+            assert_eq!(source, Some(7));
+            let has = |kind: &str, name: &str| -> bool {
+                conn.prepare("select 1 from sqlite_master where type = ? and name = ?")
+                    .unwrap()
+                    .exists([kind, name])
+                    .unwrap()
+            };
+            for table in tables {
+                for (index, _) in table.indexes {
+                    assert!(has("index", index), "{index}");
+                }
+                if table.release_key.is_some() {
+                    assert!(has("trigger", &format!("gc_{}", table.name)));
+                }
+            }
+            let mut read = store::articles(&db::open_with_shards(&main).unwrap(), *id).unwrap();
+            let mut want = articles;
+            read.sort_by(|a, b| a.message_id.cmp(&b.message_id));
+            want.sort_by(|a, b| a.message_id.cmp(&b.message_id));
+            assert_eq!(read, want);
+        }
+    }
+
+    #[test]
+    fn a_column_out_of_order_lands_in_the_right_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        legacy_fixture(&main);
+        for path in store::shard_paths(&main) {
+            db::open_at(&path)
+                .unwrap()
+                .execute_batch(
+                    "alter table releases drop column poster; alter table releases add column poster TEXT;
+                     update releases set poster = 'p'",
+                )
+                .unwrap();
+        }
+        run(&main, &|_| {}, &Default::default()).unwrap();
+        for (path, id) in with_releases(&main) {
+            let poster: String = db::open_at(&path)
+                .unwrap()
+                .query_row("select poster from releases where id = ?", [id], |r| r.get(0))
+                .unwrap();
+            assert_eq!(poster, "p");
+        }
+    }
+
+    #[test]
+    fn a_table_this_build_doesnt_know_stops_the_shard() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        legacy_fixture(&main);
+        let (path, _) = with_releases(&main).remove(0);
+        db::open_at(&path).unwrap().execute_batch("create table later_part (x)").unwrap();
+        let err = format!("{:#}", run(&main, &|_| {}, &Default::default()).unwrap_err());
+        assert!(err.contains("later_part") || err.contains("not compacted"), "{err}");
+        let still: i64 = db::open_at(&path)
+            .unwrap()
+            .query_row("select count(*) from sqlite_master where name = 'later_part'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(still, 1);
+    }
+
+    #[test]
+    fn refusing_names_what_it_wont_carry() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        db::create_db_at(&main).unwrap();
+        let path = store::shard_path(&main, 0);
+        let copy = dir.path().join("copy.db");
+        store::create_shard(&copy).unwrap();
+        let conn = db::open_at(&copy).unwrap();
+        conn.execute("attach database ? as old", [path.to_string_lossy()]).unwrap();
+        refuse_what_wouldnt_be_copied(&conn, 0).unwrap();
+        let other = db::open_at(&path).unwrap();
+        other.execute_batch("alter table files add column extra").unwrap();
+        let err = format!("{:#}", refuse_what_wouldnt_be_copied(&conn, 0).unwrap_err());
+        assert!(err.contains("extra") && err.contains("the original was kept"), "{err}");
+        other.execute_batch("alter table files drop column extra; create table later_part (x)").unwrap();
+        let err = format!("{:#}", refuse_what_wouldnt_be_copied(&conn, 0).unwrap_err());
+        assert!(err.contains("later_part") && err.contains("the original was kept"), "{err}");
+    }
+
+    #[test]
+    fn collections_is_a_core_table() {
+        assert!(CORE_TABLES.iter().any(|(t, _)| *t == "collections"));
+        assert!(crate::postprocess::schema::SHARD_TABLES.iter().all(|t| t.name != "collections"));
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        legacy_fixture(&main);
+        run(&main, &|_| {}, &Default::default()).unwrap();
+    }
+
+    #[test]
+    fn the_check_counts_every_registered_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        legacy_fixture(&main);
+        let (shard, path) = store::shard_paths(&main)
+            .into_iter()
+            .enumerate()
+            .find(|(_, p)| store::article_count(&db::open_at(p).unwrap(), "main").unwrap() > 0)
+            .unwrap();
+        let conn = db::open_at(&path).unwrap();
+        let id: i64 = conn.query_row("select min(id) from releases", [], |r| r.get(0)).unwrap();
+        conn.execute("insert or replace into pp_queue (release_id, due_at) values (?, 1)", [id]).unwrap();
+        checkpoint(&conn).unwrap();
+        let n = store::article_count(&conn, "main").unwrap();
+        drop(conn);
+        let copy = with_suffix(&path, "compact");
+        std::fs::copy(&path, &copy).unwrap();
+        check(&path, &copy, shard, n, 0, &no_stop()).unwrap();
+        db::open_at(&copy).unwrap().execute("delete from pp_queue", []).unwrap();
+        let err = format!("{:#}", check(&path, &copy, shard, n, 0, &no_stop()).unwrap_err());
+        assert!(err.contains("pp_queue"), "{err}");
+    }
+
+    #[test]
+    fn a_compaction_waits_a_moment_for_a_reader_on_its_way_out() {
+        use std::time::Duration;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.db");
+        let writer = db::create_at(&path).unwrap();
+        writer.execute_batch("pragma journal_mode = wal; pragma wal_autocheckpoint = 0; create table t (x)").unwrap();
+        let reader = db::open_at(&path).unwrap();
+        reader.execute_batch("begin; select count(*) from t").unwrap();
+        writer.execute("insert into t values (1)", []).unwrap();
+
+        assert!(checkpoint_patiently(&writer, Duration::from_millis(300)).is_err());
+        let letting_go = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(500));
+            reader.execute_batch("commit").unwrap();
+        });
+        checkpoint_patiently(&writer, Duration::from_secs(10)).unwrap();
+        letting_go.join().unwrap();
     }
 }
