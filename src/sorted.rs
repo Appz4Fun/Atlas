@@ -318,7 +318,8 @@ fn linked_sizes(
          having count(*) between 2 and {LINKED_ROWS}"
     );
     let mut total_of = conn.prepare(&total_sql)?;
-    // the shard read its first `want` and there were more: what's bigger than its last row as a whole comes first
+    // the shard read its first `want` and there were more: what's as big as its last row as a whole or bigger can come
+    // first, a newer one of the same size too
     let cutoff = match rows.last() {
         Some(last) if rows.len() as i64 >= want => last.size,
         _ => None,
@@ -333,12 +334,12 @@ fn linked_sizes(
         let bigger = format!(
             "select l.lead_id from s{s}.upload_link l join s{s}.releases r on r.id = l.release_id
              group by l.lead_id
-             having count(*) between 2 and {LINKED_ROWS} and sum(coalesce(r.size, 0)) > ?1
+             having count(*) between 2 and {LINKED_ROWS} and sum(coalesce(r.size, 0)) >= ?1
                 and exists (select 1 from s{s}.releases x where x.id = l.lead_id)
                 and exists (select 1 from s{s}.upload_link m join s{s}.releases r on r.id = m.release_id
                             left join s{s}.release_category c on c.release_id = r.id
                             where m.lead_id = l.lead_id and {VISIBLE_RELEASE} and {clause})
-             order by sum(coalesce(r.size, 0)) desc limit ?2"
+             order by sum(coalesce(r.size, 0)) desc, max(r.id) desc limit ?2"
         );
         let leads: Vec<i64> = conn.prepare(&bigger)?.query_map([cutoff, want], |r| r.get(0))?.collect::<Result<_>>()?;
         let mut members = conn.prepare(&format!("select release_id from s{s}.upload_link where lead_id = ?1"))?;
@@ -599,6 +600,20 @@ mod tests {
                 assert_eq!(up, [small], "indexed {indexed}");
             }
         }
+        // as big as the last row read, and newer: ahead of it
+        let same = f.add("g7h8i9", group, Some(3_000), "2026-10-04", Some(UHD));
+        let same_piece = f.add("j1k2l3", group, Some(3_000), "2026-10-04", Some(UHD));
+        shard
+            .execute(
+                "insert into upload_link (release_id, lead_id) values (?1, ?1), (?2, ?1)",
+                rusqlite::params![same, same_piece],
+            )
+            .unwrap();
+        for limits in [READ_ALL, WALK] {
+            assert_eq!(f.top(Some(&movies), Column::Size, true, 4, limits), [piece, lead, same_piece, same]);
+        }
+        shard.execute("delete from upload_link where lead_id = ?", [same]).unwrap();
+        shard.execute("delete from releases where id in (?, ?)", [same, same_piece]).unwrap();
         // bigger uploads outside the category don't use up the uploads read in
         let tv: Vec<i64> =
             (0..3).map(|i| f.add(&format!("tv{i}a"), group, Some(5_000), "2026-10-03", Some(TV_HD))).collect();
