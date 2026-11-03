@@ -534,34 +534,48 @@ fn test_mkv_segment_uid_exactness_and_malformed() {
 
 #[test]
 fn test_sps_vui_colour_space_recovery_modes() {
+    let build_hevc_sps = |primaries: u8, transfer: u8, matrix: u8| -> Vec<u8> {
+        vec![
+            0x42, 0x01, // NAL header (type 33 = SPS_NUT)
+            0x01,       // vps_id=0, max_sub_layers_minus1=0, temporal_id_nesting_flag=1
+            0x02, 0x20, 0x40, 0x08, 0x01, 0xB0, 0x01, 0x01, 0x01, 0x01, 0x01, 0x99, // Main 10, Level 5.1
+            0x22, 0x12, 0x24, 0xDA, 0x7A, 0xAC, 0x22, 0xB5, // SPS fields up to colour_description_present_flag=1
+            primaries, transfer, matrix, 0x80,
+        ]
+    };
+
     // 1. HDR10: Primaries 9 (BT.2020), Transfer 16 (PQ), Matrix 9
-    let sps_hdr10 = [0x42, 0x01, 0x01, 0x02, 9, 16, 9, 0x00];
+    let sps_hdr10 = build_hevc_sps(9, 16, 9);
     let vui_hdr10 = H265Sps::parse_vui(&sps_hdr10).expect("must parse HDR10");
     assert_eq!(vui_hdr10.hdr.as_deref(), Some("HDR10"));
     assert_eq!(vui_hdr10.colour_primaries, 9);
     assert_eq!(vui_hdr10.transfer_characteristics, 16);
 
     // 2. HLG: Primaries 9, Transfer 18, Matrix 9
-    let sps_hlg = [0x42, 0x01, 0x01, 0x02, 9, 18, 9, 0x00];
+    let sps_hlg = build_hevc_sps(9, 18, 9);
     let vui_hlg = H265Sps::parse_vui(&sps_hlg).expect("must parse HLG");
     assert_eq!(vui_hlg.hdr.as_deref(), Some("HLG"));
     assert_eq!(vui_hlg.colour_primaries, 9);
     assert_eq!(vui_hlg.transfer_characteristics, 18);
 
     // 3. Annex B 3-byte prefix [0, 0, 1]
-    let sps_3byte = [0x00, 0x00, 0x01, 0x42, 0x01, 0x01, 0x02, 9, 16, 9, 0x00];
+    let mut sps_3byte = vec![0x00, 0x00, 0x01];
+    sps_3byte.extend_from_slice(&sps_hdr10);
     let vui_3byte = H265Sps::parse_vui(&sps_3byte).expect("must parse 3-byte Annex B prefix");
     assert_eq!(vui_3byte.hdr.as_deref(), Some("HDR10"));
 
     // 4. Annex B 4-byte prefix [0, 0, 0, 1]
-    let sps_4byte = [0x00, 0x00, 0x00, 0x01, 0x42, 0x01, 0x01, 0x02, 9, 18, 9, 0x00];
+    let mut sps_4byte = vec![0x00, 0x00, 0x00, 0x01];
+    sps_4byte.extend_from_slice(&sps_hlg);
     let vui_4byte = H265Sps::parse_vui(&sps_4byte).expect("must parse 4-byte Annex B prefix");
     assert_eq!(vui_4byte.hdr.as_deref(), Some("HLG"));
 
-    // 5. Malformed/truncated inputs: zero panics
+    // 5. Malformed/truncated inputs (including coincidental `09 10` / `09 12` bytes): return None without panicking
     assert!(H265Sps::parse_vui(&[]).is_none());
     assert!(H265Sps::parse_vui(&[0]).is_none());
     assert!(H265Sps::parse_vui(&[0, 0, 0, 1]).is_none());
+    assert!(H265Sps::parse_vui(&[0x42, 0x01, 0x09, 0x10]).is_none());
+    assert!(H265Sps::parse_vui(&[0x42, 0x01, 0x09, 0x12]).is_none());
 }
 
 // ============================================================================

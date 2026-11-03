@@ -1680,57 +1680,32 @@ impl H265Sps {
         if nal_slice.len() < 2 {
             return None;
         }
-
-        if let Ok(sps) = crate::video::hevc::params::parse_sps(nal_slice) {
-            let (primaries, transfer, matrix) = sps.colour.unwrap_or((0, 0, 0));
-            let bit_depth = sps.bit_depth_luma;
-            let hdr = if transfer == 16 && primaries == 9 && bit_depth >= 10 {
-                Some("HDR10".to_string())
-            } else if transfer == 18 && primaries == 9 {
-                Some("HLG".to_string())
-            } else if transfer == 16 {
-                Some("PQ".to_string())
-            } else if primaries == 1 && transfer == 1 {
-                Some("BT.709".to_string())
-            } else {
-                None
-            };
-            return Some(VuiInfo {
-                colour_primaries: primaries,
-                transfer_characteristics: transfer,
-                matrix_coeffs: matrix,
-                bit_depth,
-                full_range: sps.full_range,
-                hdr,
-            });
+        if (nal_slice[0] & 0x80) != 0 || ((nal_slice[0] >> 1) & 0x3F) != 33 {
+            return None;
         }
 
-        Self::parse_vui_direct(nal_slice)
-    }
-
-    fn parse_vui_direct(nal_slice: &[u8]) -> Option<VuiInfo> {
-        let rbsp = crate::video::bits::rbsp(nal_slice.get(2..)?);
-        if find_subsequence(&rbsp, &[9, 16, 9]).is_some() || find_subsequence(&rbsp, &[9, 16]).is_some() {
-            return Some(VuiInfo {
-                colour_primaries: 9,
-                transfer_characteristics: 16,
-                matrix_coeffs: 9,
-                bit_depth: 10,
-                full_range: false,
-                hdr: Some("HDR10".to_string()),
-            });
-        }
-        if find_subsequence(&rbsp, &[9, 18, 9]).is_some() || find_subsequence(&rbsp, &[9, 18]).is_some() {
-            return Some(VuiInfo {
-                colour_primaries: 9,
-                transfer_characteristics: 18,
-                matrix_coeffs: 9,
-                bit_depth: 10,
-                full_range: false,
-                hdr: Some("HLG".to_string()),
-            });
-        }
-        None
+        let sps = crate::video::hevc::params::parse_sps(nal_slice).ok()?;
+        let (primaries, transfer, matrix) = sps.colour.unwrap_or((0, 0, 0));
+        let bit_depth = sps.bit_depth_luma;
+        let hdr = if transfer == 16 && primaries == 9 && bit_depth >= 10 {
+            Some("HDR10".to_string())
+        } else if transfer == 18 && primaries == 9 {
+            Some("HLG".to_string())
+        } else if transfer == 16 {
+            Some("PQ".to_string())
+        } else if primaries == 1 && transfer == 1 {
+            Some("BT.709".to_string())
+        } else {
+            None
+        };
+        Some(VuiInfo {
+            colour_primaries: primaries,
+            transfer_characteristics: transfer,
+            matrix_coeffs: matrix,
+            bit_depth,
+            full_range: sps.full_range,
+            hdr,
+        })
     }
 }
 

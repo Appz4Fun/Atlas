@@ -168,33 +168,50 @@ fn tc_t1_f19_4_mkv_metadata_parse_wrapper() {
 // Feature 20: SPS VUI Colour Space & HDR10/HLG Recovery from CodecPrivate
 // ============================================================================
 
+fn build_hevc_10bit_sps_nal(primaries: u8, transfer: u8, matrix: u8) -> Vec<u8> {
+    vec![
+        0x42, 0x01, // NAL header (type 33 = SPS_NUT)
+        0x01,       // vps_id=0, max_sub_layers_minus1=0, temporal_id_nesting_flag=1
+        0x02, 0x20, 0x40, 0x08, 0x01, 0xB0, 0x01, 0x01, 0x01, 0x01, 0x01, 0x99, // profile_tier_level (Main 10, Level 5.1)
+        0x22, 0x12, 0x24, 0xDA, 0x7A, 0xAC, 0x22, 0xB5, // SPS fields up to colour_description_present_flag=1
+        primaries, transfer, matrix, 0x80,
+    ]
+}
+
 #[test]
 fn tc_t1_f20_1_sps_vui_hdr10_recovery() {
-    // Synthetic HEVC SPS NAL unit (NAL type 33: 0x42, 0x01) containing HDR10 VUI parameters
+    // Valid ITU-T H.265 Main 10 SPS NAL unit (NAL type 33: 0x42, 0x01) containing HDR10 VUI parameters:
     // colour_primaries = 9 (BT.2020), transfer_characteristics = 16 (SMPTE ST 2084 / PQ), matrix_coeffs = 9
-    let sps_nal = [0x42, 0x01, 0x01, 0x02, 9, 16, 9, 0x00];
+    let sps_nal = build_hevc_10bit_sps_nal(9, 16, 9);
     let vui = H265Sps::parse_vui(&sps_nal).expect("must parse VUI parameters");
     assert_eq!(vui.colour_primaries, 9);
     assert_eq!(vui.transfer_characteristics, 16);
     assert_eq!(vui.matrix_coeffs, 9);
+    assert_eq!(vui.bit_depth, 10);
     assert_eq!(vui.hdr.as_deref(), Some("HDR10"));
+
+    // Truncated SPS payloads that merely contain `09 10` bytes must return None
+    assert!(H265Sps::parse_vui(&[0x42, 0x01, 0x09, 0x10]).is_none());
+    assert!(H265Sps::parse_vui(&[0x42, 0x01, 0x01, 0x02, 9, 16, 9, 0x00]).is_none());
 }
 
 #[test]
 fn tc_t1_f20_2_sps_vui_hlg_recovery() {
-    // Synthetic HEVC SPS NAL unit with HLG transfer characteristics = 18 (ARIB STD-B67), colour_primaries = 9
-    let sps_nal = [0x42, 0x01, 0x01, 0x02, 9, 18, 9, 0x00];
+    // Valid ITU-T H.265 Main 10 SPS NAL unit with HLG transfer characteristics = 18 (ARIB STD-B67), colour_primaries = 9
+    let sps_nal = build_hevc_10bit_sps_nal(9, 18, 9);
     let vui = H265Sps::parse_vui(&sps_nal).expect("must parse HLG VUI");
     assert_eq!(vui.colour_primaries, 9);
     assert_eq!(vui.transfer_characteristics, 18);
     assert_eq!(vui.matrix_coeffs, 9);
+    assert_eq!(vui.bit_depth, 10);
     assert_eq!(vui.hdr.as_deref(), Some("HLG"));
 }
 
 #[test]
 fn tc_t1_f20_3_sps_vui_annex_b_prefix_support() {
     // Same SPS with 4-byte Annex B prefix [0, 0, 0, 1]
-    let sps_annex_b = [0x00, 0x00, 0x00, 0x01, 0x42, 0x01, 0x01, 0x02, 9, 16, 9, 0x00];
+    let mut sps_annex_b = vec![0x00, 0x00, 0x00, 0x01];
+    sps_annex_b.extend_from_slice(&build_hevc_10bit_sps_nal(9, 16, 9));
     let vui = H265Sps::parse_vui(&sps_annex_b).expect("must strip Annex B prefix and parse VUI");
     assert_eq!(vui.hdr.as_deref(), Some("HDR10"));
 }
