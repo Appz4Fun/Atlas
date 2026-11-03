@@ -1564,11 +1564,38 @@ fn category_nav(search: &Search, oob: &str) -> String {
     out
 }
 
+pub(crate) const BUILD_VERSION: &str = env!("ATLAS_BUILD_VERSION");
+pub(crate) const GIT_SHA: &str = env!("ATLAS_GIT_SHA");
+pub(crate) const GIT_SHORT_SHA: &str = env!("ATLAS_GIT_SHORT_SHA");
+pub(crate) const BUILD_YEAR: &str = env!("ATLAS_BUILD_YEAR");
+pub(crate) const RUSTC_VERSION: &str = env!("ATLAS_RUSTC_VERSION");
+pub(crate) const BUILD_DATE: &str = env!("ATLAS_BUILD_DATE");
+
+fn site_footer() -> String {
+    let commit = if GIT_SHA.is_empty() || GIT_SHA == "unknown" {
+        format!("<code>{}</code>", escape(GIT_SHORT_SHA))
+    } else {
+        format!(
+            "<a href=\"https://github.com/Appz4Fun/Atlas/commit/{}\" target=\"_blank\" rel=\"noreferrer noopener\"><code>{}</code></a>",
+            attr(GIT_SHA),
+            escape(GIT_SHORT_SHA),
+        )
+    };
+    format!(
+        r#"<footer class="site-footer" role="contentinfo"><div class="site-footer-inner"><span><strong>Atlas - Rust Edition.</strong> Authored by: <a href="https://github.com/Eraxty" target="_blank" rel="noreferrer noopener">Eraxty</a> &amp; Forked and ported to Rust by: <a href="https://github.com/xbmc4lyfe" target="_blank" rel="noreferrer noopener">xbmc4lyfe</a></span><span>Version: <code>{version}</code> · last git commit: {commit}</span><span>&copy; {year} · License: <a href="https://www.gnu.org/licenses/gpl-3.0.txt" target="_blank" rel="noreferrer noopener">GPL v3 (GNU General Public License v3.0)</a></span><span>Rust Version: <code>{rustc}</code> · Compilation Date: <code>{date}</code></span><span>Donate to my Patreon to help with AI token cost and get prioritized features and personal support: <a class="patreon-link" href="https://www.patreon.com/cw/xbmc4lyfe" target="_blank" rel="noreferrer noopener"><svg class="patreon-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="14.5" cy="9.5" r="6.5" fill="currentColor"/><rect x="3" y="3" width="3.5" height="18" fill="currentColor"/></svg><span>Patreon · xbmc4lyfe</span></a></span></div></footer>"#,
+        version = escape(BUILD_VERSION),
+        year = escape(BUILD_YEAR),
+        rustc = escape(RUSTC_VERSION),
+        date = escape(BUILD_DATE),
+    )
+}
+
 fn page(title: &str, content: &str) -> String {
     format!(
-        "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><meta name=\"color-scheme\" content=\"light dark\"><meta name=\"htmx-config\" content=\"{}\"><title>{}</title><link rel=\"icon\" href=\"/static/atlas.svg?v={v}\" type=\"image/svg+xml\"><link rel=\"stylesheet\" href=\"/static/atlas.css?v={v}\"><script src=\"/static/atlas.js?v={v}\"></script><script src=\"/static/htmx.min.js?v={v}\"></script></head><body>{content}</body></html>",
+        "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><meta name=\"color-scheme\" content=\"light dark\"><meta name=\"htmx-config\" content=\"{}\"><title>{}</title><link rel=\"icon\" href=\"/static/atlas.svg?v={v}\" type=\"image/svg+xml\"><link rel=\"stylesheet\" href=\"/static/atlas.css?v={v}\"><script src=\"/static/atlas.js?v={v}\"></script><script src=\"/static/htmx.min.js?v={v}\"></script></head><body>{content}{}</body></html>",
         attr(HTMX_CONFIG),
         escape(title),
+        site_footer(),
         v = *ASSET_VERSION,
     )
 }
@@ -1600,7 +1627,7 @@ fn search_page(args: &HashMap<String, String>, base: &str) -> String {
 {ask}
 <div id="failure"></div>
 <div id="results">{results}</div>
-<footer class="footer">Newznab API: <code>{base}/api</code></footer>
+<div class="footer">Newznab API: <code>{base}/api</code></div>
 </main></div>"##,
             masthead = masthead(true),
             nav = category_nav(&search, ""),
@@ -3611,5 +3638,27 @@ mod tests {
         assert!(id_links(Kind::Tv as i64, &ids).contains("https://www.themoviedb.org/tv/603"));
         let trakt = crate::media::resolve::Ids { trakt: Some(9), ..Default::default() };
         assert!(id_links(Kind::Tv as i64, &trakt).contains("trakt.tv/search/trakt/9?id_type=show"));
+    }
+
+    #[test]
+    fn every_page_has_the_persistent_build_footer() {
+        let sign_in = get("/", "", None, "http://127.0.0.1:9090", KEY).unwrap().body;
+        let settings = get("/ui/settings", "", Some(&cookie()), "http://127.0.0.1:9090", KEY).unwrap().body;
+        for html in [&sign_in, &settings] {
+            assert!(html.contains("class=\"site-footer\""), "{html}");
+            assert!(html.contains("Atlas - Rust Edition."), "{html}");
+            assert!(html.contains("https://github.com/Eraxty") && html.contains(">Eraxty<"), "{html}");
+            assert!(html.contains("https://github.com/xbmc4lyfe") && html.contains(">xbmc4lyfe<"), "{html}");
+            assert!(html.contains(&format!("Version: <code>{BUILD_VERSION}</code>")), "{html}");
+            if !GIT_SHA.is_empty() && GIT_SHA != "unknown" {
+                assert!(html.contains(&format!("https://github.com/Appz4Fun/Atlas/commit/{GIT_SHA}")), "{html}");
+            }
+            assert!(html.contains(&format!("<code>{GIT_SHORT_SHA}</code>")), "{html}");
+            assert!(html.contains(&format!("&copy; {BUILD_YEAR}")), "{html}");
+            assert!(html.contains("https://www.gnu.org/licenses/gpl-3.0.txt"), "{html}");
+            assert!(html.contains(&format!("Rust Version: <code>{RUSTC_VERSION}</code>")), "{html}");
+            assert!(html.contains(&format!("Compilation Date: <code>{BUILD_DATE}</code>")), "{html}");
+            assert!(html.contains("https://www.patreon.com/cw/xbmc4lyfe"), "{html}");
+        }
     }
 }
