@@ -1620,14 +1620,15 @@ fn upsert_par2_files_in_tx(
     content_id: &[u8],
     inv: &crate::par2::Inventory,
 ) -> rusqlite::Result<()> {
-    if content_id.is_empty() || inv.files.is_empty() || inv.files.len() > 4096 {
-        return Ok(());
-    }
-    if inv.files.iter().any(|f| f.name.len() > 4096) {
-        return Ok(());
-    }
     conn.prepare_cached("DELETE FROM raw_par2_files WHERE name = ?1 AND group_name = ?2")?
         .execute(params![name, group_name])?;
+    if content_id.is_empty()
+        || inv.files.is_empty()
+        || inv.files.len() > 4096
+        || inv.files.iter().any(|f| f.name.len() > 4096)
+    {
+        return Ok(());
+    }
     let exists_in_par2: bool = conn
         .prepare_cached("SELECT EXISTS(SELECT 1 FROM raw_par2 WHERE name = ?1 AND group_name = ?2)")?
         .query_row(params![name, group_name], |r| r.get(0))?;
@@ -2365,21 +2366,34 @@ fn harvest_attached_release_tables(tx: &rusqlite::Transaction<'_>, schema: &str)
     }
     if has_table(tx, schema, "par2_files")? {
         let select_pf_sql = format!(
-            "SELECT r.id, r.name, r.group_name,
-                    CASE WHEN ({par2_verified} OR {list_verified}) THEN hcid.content_id ELSE NULL END AS cid,
-                    pf.file_id, pf.set_id, pf.md5, pf.md5_16k, pf.size, pf.name, pf.crc32,
-                    coalesce(pf.bound, 1), coalesce(pf.sealed, 0), coalesce(pf.complete, 0)
-             FROM {schema}.par2_files pf
-             JOIN {schema}.releases r ON r.id = pf.release_id
-             LEFT JOIN temp.harvest_content_ids hcid ON hcid.release_id = r.id
-             WHERE r.name IS NOT NULL AND r.group_name IS NOT NULL
-               AND length(pf.file_id) = 16 AND length(pf.set_id) = 16
-               AND length(pf.md5) = 16 AND length(pf.md5_16k) = 16
-               AND NOT EXISTS (
-                   SELECT 1 FROM {schema}.par2_files pf2
-                   WHERE pf2.release_id = r.id AND length(cast(pf2.name as blob)) > 4096
-               )
-             ORDER BY r.id DESC, pf.name ASC, pf.file_id ASC LIMIT ({MAX_RAW_ARCHIVES_ROWS} * 4)"
+            "SELECT r_id, r_name, group_name, cid, file_id, set_id, md5, md5_16k, size, f_name, crc32, bound, sealed, complete
+             FROM (
+                 SELECT r_id, r_name, group_name, cid, file_id, set_id, md5, md5_16k, size, f_name, crc32, bound, sealed, complete,
+                        COUNT(*) OVER (PARTITION BY r_id) AS rel_rows,
+                        COUNT(*) OVER (ORDER BY r_id DESC RANGE UNBOUNDED PRECEDING) AS cum_rows
+                 FROM (
+                     SELECT r.id AS r_id, r.name AS r_name, r.group_name AS group_name,
+                            CASE WHEN ({par2_verified} OR {list_verified}) THEN hcid.content_id ELSE NULL END AS cid,
+                            pf.file_id AS file_id, pf.set_id AS set_id, pf.md5 AS md5, pf.md5_16k AS md5_16k,
+                            pf.size AS size, pf.name AS f_name, pf.crc32 AS crc32,
+                            coalesce(pf.bound, 1) AS bound, coalesce(pf.sealed, 0) AS sealed, coalesce(pf.complete, 0) AS complete
+                     FROM {schema}.par2_files pf
+                     JOIN {schema}.releases r ON r.id = pf.release_id
+                     LEFT JOIN temp.harvest_content_ids hcid ON hcid.release_id = r.id
+                     WHERE r.name IS NOT NULL AND r.group_name IS NOT NULL
+                       AND NOT EXISTS (
+                           SELECT 1 FROM {schema}.par2_files pf2
+                           WHERE pf2.release_id = r.id
+                             AND (length(pf2.file_id) != 16 OR length(pf2.set_id) != 16
+                                  OR length(pf2.md5) != 16 OR length(pf2.md5_16k) != 16
+                                  OR length(cast(pf2.name as blob)) > 4096)
+                       )
+                     ORDER BY r.id DESC, pf.name ASC, pf.file_id ASC LIMIT ({MAX_RAW_ARCHIVES_ROWS} * 4 + 1)
+                 )
+             )
+             WHERE rel_rows <= 4096
+               AND cum_rows <= ({MAX_RAW_ARCHIVES_ROWS} * 4)
+             ORDER BY r_id DESC, f_name ASC, file_id ASC"
         );
         let mut stmt = tx.prepare(&select_pf_sql)?;
         let mut rows = stmt.query([])?;
@@ -2401,7 +2415,7 @@ fn harvest_attached_release_tables(tx: &rusqlite::Transaction<'_>, schema: &str)
                 complete = excluded.complete
              WHERE excluded.content_id IS NOT NULL",
         )?;
-        let mut winner_pf_rel: std::collections::HashMap<(String, String), (i64, usize)> =
+        let mut winner_pf_rel: std::collections::HashMap<(String, String), i64> =
             std::collections::HashMap::new();
         while let Some(r) = rows.next()? {
             let r_id: i64 = r.get(0)?;
@@ -2410,16 +2424,11 @@ fn harvest_attached_release_tables(tx: &rusqlite::Transaction<'_>, schema: &str)
             let cid: Option<Vec<u8>> = r.get(3)?;
             let Some(cid) = cid else { continue };
             let key = (r_name.clone(), group_name.clone());
-            match winner_pf_rel.get_mut(&key) {
-                Some((win_id, _)) if *win_id != r_id => continue,
-                Some((_, count)) => {
-                    if *count >= 4096 {
-                        continue;
-                    }
-                    *count += 1;
-                }
+            match winner_pf_rel.get(&key) {
+                Some(&win_id) if win_id != r_id => continue,
+                Some(_) => {}
                 None => {
-                    winner_pf_rel.insert(key, (r_id, 1));
+                    winner_pf_rel.insert(key, r_id);
                     clear_pf.execute(params![&r_name, &group_name])?;
                 }
             }
@@ -2438,6 +2447,16 @@ fn harvest_attached_release_tables(tx: &rusqlite::Transaction<'_>, schema: &str)
                 complete
             ])?;
         }
+        tx.execute_batch(
+            "DELETE FROM main.raw_par2_files
+             WHERE content_id IS NULL
+                OR EXISTS (
+                    SELECT 1 FROM main.raw_par2 p
+                    WHERE p.name = main.raw_par2_files.name
+                      AND p.group_name = main.raw_par2_files.group_name
+                      AND (p.content_id IS NULL OR p.content_id != main.raw_par2_files.content_id)
+                );",
+        )?;
     }
     if has_table(tx, schema, "release_nfo_password")? {
         let nfo_mask = crate::postprocess::step::mask(crate::naming::NFO);
