@@ -224,6 +224,11 @@ struct Search {
 const SORT_WINDOW: i64 = 2_000;
 /// How far a window grows to fill a page when it also filters on tags, which are read from each name.
 const GROW_WITH_TAGS: i64 = 64_000;
+/// The deepest a ranked window reads: 20,000 pages of Load more, and a url asking for more can't make the server read
+/// a whole database into memory.
+const MAX_WINDOW: i64 = 1_000_000;
+/// Rows kept across every window: past it, the grown windows of searches not used lately go back to their first pages.
+const ROWS_KEPT: usize = 2_000_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum SortBy {
@@ -528,7 +533,11 @@ impl Search {
         }
         let filter = parse_filter(&self.cat);
         let windowed = self.windowed();
-        let count = if self.ranked_by().is_some() { SORT_WINDOW.max(self.offset + PAGE_SIZE + 1) } else { SORT_WINDOW };
+        let count = if self.ranked_by().is_some() {
+            SORT_WINDOW.max(self.offset + PAGE_SIZE + 1).min(MAX_WINDOW)
+        } else {
+            SORT_WINDOW
+        };
         let (from, mut count) = if windowed { (0, count) } else { (self.offset, PAGE_SIZE) };
         let tagged = |r: &ReleaseRow| self.has_tags(r);
         // a sort needs every match in the window, a page only up to one past its end
@@ -731,6 +740,12 @@ impl Search {
         if rows.is_empty() {
             return if self.offset == 0 {
                 self.nothing_found()
+            } else if self.offset + PAGE_SIZE >= MAX_WINDOW {
+                format!(
+                    "<tr><td colspan=\"{COLUMNS}\" class=\"note dim\">Paging stops {} results in. Narrow the search to \
+                     see further.</td></tr>",
+                    thousands(MAX_WINDOW)
+                )
             } else {
                 format!("<tr><td colspan=\"{COLUMNS}\" class=\"note dim\">That's all of them.</td></tr>")
             };
@@ -872,6 +887,8 @@ struct ShownRow {
     size: Option<i64>,
     /// another row stands for its post
     folded: bool,
+    /// the row brought in to show here, for a post whose own row wasn't in the window
+    brings: Option<i64>,
 }
 
 /// The first `SORT_WINDOW` results of one search, whatever the sort, kept in memory: choosing a column only puts these
@@ -922,7 +939,32 @@ impl Window {
 
     /// Whether a page that ends past it needs a bigger one: only a sort over a whole category grows.
     fn can_grow(&self, search: &Search) -> bool {
-        self.more_in_db && search.ranked_by().is_some() && (!search.filters_by_tags() || self.asked < GROW_WITH_TAGS)
+        self.more_in_db
+            && self.asked < MAX_WINDOW
+            && search.ranked_by().is_some()
+            && (!search.filters_by_tags() || self.asked < GROW_WITH_TAGS)
+    }
+
+    /// Takes in what a smaller window of the same search showed, soo growing it moves nothing already paged past. A
+    /// post brought in where one of its files was stays there once its own row is read in too: that row is folded.
+    fn carry_from(&self, old: &Window) {
+        let places: HashSet<i64> = self.rows.iter().map(|r| r.id).collect();
+        let old_shown = lock(&old.shown);
+        let mut shown = lock(&self.shown);
+        let mut brought = lock(&self.brought);
+        for (&place, row) in old_shown.iter() {
+            if !places.contains(&place) {
+                continue;
+            }
+            let carried = ShownRow { html: row.html.clone(), size: row.size, folded: row.folded, brings: row.brings };
+            shown.insert(place, carried);
+            if let Some(listed) = row.brings.filter(|_| !row.folded) {
+                brought.insert(listed);
+                if places.contains(&listed) {
+                    shown.insert(listed, ShownRow { html: String::new(), size: row.size, folded: true, brings: None });
+                }
+            }
+        }
     }
 
     fn ids(&self) -> Vec<i64> {
@@ -1006,11 +1048,14 @@ impl Window {
                     places.push(place);
                     kept.push(shown);
                 }
-                Some(_) => done.push((place, ShownRow { html: String::new(), size: r.size, folded: true })),
+                Some(_) => {
+                    done.push((place, ShownRow { html: String::new(), size: r.size, folded: true, brings: None }))
+                }
             }
         }
         for ((place, r), html) in places.into_iter().zip(&kept).zip(rows_html(&kept, split)) {
-            done.push((place, ShownRow { html, size: r.size, folded: false }));
+            let brings = (r.id != place).then_some(r.id);
+            done.push((place, ShownRow { html, size: r.size, folded: false, brings }));
         }
         self.publish(done);
     }
@@ -1202,14 +1247,23 @@ fn window_of(search: &Search, at_least: i64) -> Result<Arc<Window>, String> {
         return Ok(window);
     }
     let _reading = lock(&slot.reading);
-    let asked = match lock(&slot.window).clone() {
-        Some(window) if big_enough(&window) => return Ok(window),
+    let previous = lock(&slot.window).clone();
+    let asked = match &previous {
+        Some(window) if big_enough(window) => return Ok(window.clone()),
         // twice as many each time, soo paging on reads the database a few times, not a page at a time
         Some(window) => at_least.max(window.asked.saturating_mul(2)),
         None => at_least.max(SORT_WINDOW),
-    };
-    let window = Arc::new(Window::read(&slot.search, asked)?);
+    }
+    .min(MAX_WINDOW);
+    let window = Window::read(&slot.search, asked)?;
+    if let Some(previous) = &previous {
+        window.carry_from(previous);
+    }
+    let window = Arc::new(window);
     *lock(&slot.window) = Some(window.clone());
+    if window.rows.len() > SORT_WINDOW as usize {
+        shrink_others(&slot);
+    }
     // the window answers clicks without it, rendering what a page needs; filled, a click has nothing left to do.
     // Waiting, it holds neither the window nor its slot, soo a window dropped meanwhile is gone, and isn't filled
     if let Some(waiting) = background_turn() {
@@ -1225,6 +1279,24 @@ fn window_of(search: &Search, at_least: i64) -> Result<Arc<Window>, String> {
         });
     }
     Ok(window)
+}
+
+/// Past `ROWS_KEPT` rows in all, the grown windows of other searches go, the one used longest ago first. Each is read
+/// again at its first size by the next click or warm-up.
+fn shrink_others(keep: &Arc<WindowSlot>) {
+    let slots: Vec<Arc<WindowSlot>> = lock(&WINDOWS).values().cloned().collect();
+    let rows = |slot: &WindowSlot| lock(&slot.window).as_ref().map_or(0, |w| w.rows.len());
+    let mut total: usize = slots.iter().map(|slot| rows(slot)).sum();
+    let mut grown: Vec<&Arc<WindowSlot>> =
+        slots.iter().filter(|slot| !Arc::ptr_eq(slot, keep) && rows(slot) > SORT_WINDOW as usize).collect();
+    grown.sort_by_key(|slot| *lock(&slot.used));
+    for slot in grown {
+        if total <= ROWS_KEPT {
+            break;
+        }
+        total -= rows(slot);
+        *lock(&slot.window) = None;
+    }
 }
 
 /// Clears `replacing` however the work ends.
@@ -3195,7 +3267,7 @@ mod tests {
     }
 
     fn shown(html: &str, size: i64, folded: bool) -> ShownRow {
-        ShownRow { html: html.into(), size: Some(size), folded }
+        ShownRow { html: html.into(), size: Some(size), folded, brings: None }
     }
 
     #[test]
@@ -3719,6 +3791,26 @@ mod tests {
         let far = Window { asked: GROW_WITH_TAGS, more_in_db: true, ..window_of_rows(Vec::new()) };
         assert!(!far.can_grow(&tags), "tags are read a name at a time, soo they stop somewhere");
         assert!(far.can_grow(&ranked));
+        let deepest = Window { asked: MAX_WINDOW, more_in_db: true, ..window_of_rows(Vec::new()) };
+        assert!(!deepest.can_grow(&ranked), "a url can't have a whole database read into memory");
+    }
+
+    #[test]
+    fn a_grown_window_keeps_a_brought_post_where_it_was_shown() {
+        let row = |id: i64| ReleaseRow { id, size: Some(id), ..Default::default() };
+        // the first window showed post 9 in the place of its file 2, before 9's own row was read
+        let old = window_of_rows(vec![row(1), row(2)]);
+        old.publish(vec![
+            (1, shown("<tr>1</tr>", 1, false)),
+            (2, ShownRow { html: "<tr>9</tr>".into(), size: Some(20), folded: false, brings: Some(9) }),
+        ]);
+        let grown = window_of_rows(vec![row(1), row(2), row(9), row(3)]);
+        grown.carry_from(&old);
+        let shown = lock(&grown.shown);
+        assert_eq!(shown[&2].html, "<tr>9</tr>", "still where the earlier page had it");
+        assert!(shown[&9].folded, "its own row, read in now, doesn't show it a second time");
+        assert!(!shown.contains_key(&3), "new rows are rendered when a page reaches them");
+        assert!(lock(&grown.brought).contains(&9));
     }
 
     #[test]
