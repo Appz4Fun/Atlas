@@ -1,6 +1,8 @@
 //! Tracks and format from the start of a media file: Matroska, WebM and MP4. All total functions: bad or cut
 //! off bytes give what was read before them.
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -21,6 +23,10 @@ pub struct MediaInfo {
     pub muxed_at: Option<i64>,
     /// files attached to it: fonts, cover art
     pub attachments: Vec<Attachment>,
+    /// segment UID from info (16 bytes hex)
+    pub segment_uid: Option<String>,
+    /// tags extracted from Tags element
+    pub tags: HashMap<String, String>,
     /// cover art that was attached whole, kept apart from the JSON
     #[serde(skip)]
     pub cover: Option<Cover>,
@@ -74,6 +80,7 @@ pub struct VideoTrack {
     pub dv_profile: Option<u8>,
     pub dv_level: Option<u8>,
     pub dv_enhancement_layer: Option<bool>,
+    pub dolby_vision: Option<DolbyVisionInfo>,
     pub language: Option<String>,
 }
 
@@ -212,8 +219,10 @@ struct Track {
     max_cll: Option<u64>,
     max_fall: Option<u64>,
     dv: Option<(u8, u8, bool)>,
+    dolby_vision: Option<DolbyVisionInfo>,
     channels: Option<u64>,
     sample_rate: Option<f64>,
+    codec_private: Option<Vec<u8>>,
 }
 
 /// A Dolby Vision configuration record: profile, level, enhancement layer.
@@ -222,9 +231,15 @@ fn dv_record(b: &[u8]) -> Option<(u8, u8, bool)> {
     Some((a >> 1, (a & 1) << 5 | c >> 3, c & 0b10 != 0))
 }
 
-fn hdr_name(transfer: Option<u64>, mastering: bool) -> Option<String> {
+fn hdr_name(
+    transfer: Option<u64>,
+    mastering: bool,
+    primaries: Option<u64>,
+    bit_depth: Option<u64>,
+) -> Option<String> {
     match transfer {
         Some(16) if mastering => Some("HDR10".into()),
+        Some(16) if primaries == Some(9) && bit_depth.unwrap_or(0) >= 10 => Some("HDR10".into()),
         Some(16) => Some("PQ".into()),
         Some(18) => Some("HLG".into()),
         _ => None,
@@ -237,6 +252,7 @@ fn track_entry(b: &[u8]) -> Track {
         match id {
             0x83 => t.kind = uint(v),
             0x86 => t.codec = text(v),
+            0x63A2 => t.codec_private = Some(v.to_vec()),
             0x22B59C => t.language = t.language.take().or_else(|| Some(text(v))),
             // the newer tag says more
             0x22B59D => t.language = Some(text(v)),
@@ -290,12 +306,37 @@ fn track_entry(b: &[u8]) -> Track {
                     && let Some(extra) = extra
                 {
                     t.dv = dv_record(&extra);
+                    t.dolby_vision = DolbyVisionInfo::from_dvcc_dvvc(&extra);
                 }
             }
             _ => {}
         }
         true
     });
+
+    if t.kind == 1 && let Some(cp) = &t.codec_private {
+        if t.bit_depth.is_none() {
+            if let Some(d) = HevcDepth::from_hvcc(cp) {
+                t.bit_depth = Some(u64::from(d));
+            } else if let Some(d) = AvcDepth::from_avcc(cp) {
+                t.bit_depth = Some(u64::from(d));
+            }
+        }
+        if let Some(sps) = extract_sps_from_hvcc(cp)
+            && let Some(vui) = H265Sps::parse_vui(&sps)
+        {
+            if t.primaries.is_none() && vui.colour_primaries > 0 {
+                t.primaries = Some(u64::from(vui.colour_primaries));
+            }
+            if t.transfer.is_none() && vui.transfer_characteristics > 0 {
+                t.transfer = Some(u64::from(vui.transfer_characteristics));
+            }
+            if t.bit_depth.is_none() && vui.bit_depth > 0 {
+                t.bit_depth = Some(u64::from(vui.bit_depth));
+            }
+        }
+    }
+
     t
 }
 
@@ -330,6 +371,9 @@ fn segment(body: &[u8], info: &mut MediaInfo) {
                         0x2AD7B1 => scale = uint(v),
                         0x4489 => duration = float(v),
                         0x4461 => info.muxed_at = date_utc(v),
+                        0x73A4 if v.len() == 16 => {
+                            info.segment_uid = Some(v.iter().map(|b| format!("{b:02x}")).collect());
+                        }
                         _ => {}
                     }
                     true
@@ -344,9 +388,38 @@ fn segment(body: &[u8], info: &mut MediaInfo) {
             }),
             0x1043_A770 if info.chapters.is_empty() => chapters(v, info),
             0x1941_A469 => attachments(v, info),
+            0x1254_C367 => {
+                walk(v, &mut |id, tag| {
+                    if id == 0x7373 {
+                        walk(tag, &mut |id, simple_tag| {
+                            if id == 0x67C8 {
+                                let mut name = None;
+                                let mut string_val = None;
+                                walk(simple_tag, &mut |id, val| {
+                                    match id {
+                                        0x45A3 => name = Some(text(val)),
+                                        0x4487 => string_val = Some(text(val)),
+                                        _ => {}
+                                    }
+                                    true
+                                });
+                                if let (Some(n), Some(s)) = (name, string_val)
+                                    && !n.is_empty()
+                                    && !s.is_empty()
+                                {
+                                    info.tags.insert(n, s);
+                                }
+                            }
+                            true
+                        });
+                    }
+                    true
+                });
+            }
             // what's after the first cluster is the video itself
             0x1F43_B675 => {
                 info.header_complete = true;
+                probe_cluster(v, info);
                 return false;
             }
             _ => {}
@@ -358,39 +431,64 @@ fn segment(body: &[u8], info: &mut MediaInfo) {
 /// The most chapters kept. A Blu-ray has a few dozen; these come from Usenet.
 const MAX_CHAPTERS: usize = 256;
 
-/// The first edition with any chapters: each top level atom that isn't hidden. Nested ones are a menu's.
+/// Chapter extraction with hidden edition filtering (EditionFlagDefault / EditionFlagHidden).
 fn chapters(body: &[u8], info: &mut MediaInfo) {
+    let mut selected_chapters = Vec::new();
+    let mut found_default = false;
+
     walk(body, &mut |id, edition| {
         if id != 0x45B9 {
             return true;
         }
+        let mut is_hidden = false;
+        let mut is_default = false;
+        let mut candidate_chaps = Vec::new();
+
         walk(edition, &mut |id, atom| {
-            if id == 0xB6 && info.chapters.len() < MAX_CHAPTERS {
-                let (mut start, mut hidden, mut name) = (None, false, None);
-                walk(atom, &mut |id, v| {
-                    match id {
-                        0x91 => start = Some(uint(v)),
-                        0x98 => hidden = uint(v) != 0,
-                        // the first display is the chapter's main name
-                        0x80 if name.is_none() => walk(v, &mut |id, v| {
-                            if id == 0x85 {
-                                name = Some(text(v)).filter(|n| !n.is_empty());
-                            }
-                            true
-                        }),
-                        _ => {}
+            match id {
+                0x45BD => is_hidden = uint(atom) != 0,
+                0x45DB => is_default = uint(atom) != 0,
+                0xB6 if candidate_chaps.len() < MAX_CHAPTERS => {
+                    let (mut start, mut chap_hidden, mut name) = (None, false, None);
+                    walk(atom, &mut |id, v| {
+                        match id {
+                            0x91 => start = Some(uint(v)),
+                            0x98 => chap_hidden = uint(v) != 0,
+                            // the first display is the chapter's main name
+                            0x80 if name.is_none() => walk(v, &mut |id, v| {
+                                if id == 0x85 {
+                                    name = Some(text(v)).filter(|n| !n.is_empty());
+                                }
+                                true
+                            }),
+                            _ => {}
+                        }
+                        true
+                    });
+                    if let (Some(start), false) = (start, chap_hidden) {
+                        candidate_chaps.push(Chapter { start_secs: start as f64 / 1e9, name });
                     }
-                    true
-                });
-                if let (Some(start), false) = (start, hidden) {
-                    info.chapters.push(Chapter { start_secs: start as f64 / 1e9, name });
                 }
+                _ => {}
             }
             true
         });
-        // one edition is enough
-        info.chapters.is_empty()
+
+        // Ignore hidden editions completely
+        if is_hidden {
+            return true;
+        }
+
+        if is_default && !found_default {
+            selected_chapters = candidate_chaps;
+            found_default = true;
+        } else if selected_chapters.is_empty() {
+            selected_chapters = candidate_chaps;
+        }
+        true
     });
+
+    info.chapters = selected_chapters;
 }
 
 /// Matroska's dates count nanoseconds from 2001-01-01.
@@ -501,24 +599,38 @@ fn add_track(t: Track, info: &mut MediaInfo) {
         return;
     }
     match t.kind {
-        1 => info.video.push(VideoTrack {
-            hdr: hdr_name(t.transfer, t.mastering),
-            codec: t.codec,
-            width: t.width,
-            height: t.height,
-            display_width: t.display_width,
-            display_height: t.display_height,
-            frame_rate: t.default_duration.filter(|d| *d > 0).map(|d| 1e9 / d as f64),
-            bit_depth: t.bit_depth,
-            primaries: t.primaries,
-            transfer: t.transfer,
-            max_cll: t.max_cll,
-            max_fall: t.max_fall,
-            dv_profile: t.dv.map(|d| d.0),
-            dv_level: t.dv.map(|d| d.1),
-            dv_enhancement_layer: t.dv.map(|d| d.2),
-            language: t.language,
-        }),
+        1 => {
+            let mut dv_info = t.dolby_vision;
+            if dv_info.is_none() && let Some((profile, level, el)) = t.dv {
+                dv_info = Some(DolbyVisionInfo {
+                    profile,
+                    level: Some(level),
+                    rpu_present: true,
+                    el_present: el,
+                    fel: profile == 7 && el,
+                    cm_version: "v2.9".to_string(),
+                });
+            }
+            info.video.push(VideoTrack {
+                hdr: hdr_name(t.transfer, t.mastering, t.primaries, t.bit_depth),
+                codec: t.codec,
+                width: t.width,
+                height: t.height,
+                display_width: t.display_width,
+                display_height: t.display_height,
+                frame_rate: t.default_duration.filter(|d| *d > 0).map(|d| 1e9 / d as f64),
+                bit_depth: t.bit_depth,
+                primaries: t.primaries,
+                transfer: t.transfer,
+                max_cll: t.max_cll,
+                max_fall: t.max_fall,
+                dv_profile: t.dv.map(|d| d.0),
+                dv_level: t.dv.map(|d| d.1),
+                dv_enhancement_layer: t.dv.map(|d| d.2),
+                dolby_vision: dv_info,
+                language: t.language,
+            })
+        }
         2 => info.audio.push(AudioTrack {
             atmos: t.name.as_deref().is_some_and(|n| n.to_ascii_lowercase().contains("atmos")),
             commentary: t.commentary || says_commentary(t.name.as_deref()),
@@ -573,6 +685,20 @@ fn mp4(data: &[u8]) -> MediaInfo {
         }
     });
     info.header_complete = has_whole_moov(data);
+
+    let audio_probe = AudioBitstream::probe(data);
+    if audio_probe.has_atmos && let Some(a) = info.audio.first_mut() {
+        a.atmos = true;
+    }
+    if let Some(dv) = DolbyVisionInfo::parse_rpu(data) && let Some(v) = info.video.first_mut() {
+        if v.dv_profile.is_none() {
+            v.dv_profile = Some(dv.profile);
+            v.dv_level = dv.level;
+            v.dv_enhancement_layer = Some(dv.el_present);
+        }
+        v.dolby_vision = Some(dv);
+    }
+
     info
 }
 
@@ -682,8 +808,34 @@ fn trak(body: &[u8], info: &mut MediaInfo) {
                     track.dv_profile = Some(profile);
                     track.dv_level = Some(level);
                     track.dv_enhancement_layer = Some(el);
+                    track.dolby_vision = DolbyVisionInfo::from_dvcc_dvvc(v);
+                } else if kind == b"hvcC" {
+                    if track.bit_depth.is_none() {
+                        track.bit_depth = HevcDepth::from_hvcc(v).map(u64::from);
+                    }
+                    if let Some(sps) = extract_sps_from_hvcc(v)
+                        && let Some(vui) = H265Sps::parse_vui(&sps)
+                    {
+                        if track.primaries.is_none() && vui.colour_primaries > 0 {
+                            track.primaries = Some(u64::from(vui.colour_primaries));
+                        }
+                        if track.transfer.is_none() && vui.transfer_characteristics > 0 {
+                            track.transfer = Some(u64::from(vui.transfer_characteristics));
+                        }
+                        if track.bit_depth.is_none() && vui.bit_depth > 0 {
+                            track.bit_depth = Some(u64::from(vui.bit_depth));
+                        }
+                        if track.hdr.is_none() {
+                            track.hdr = vui.hdr;
+                        }
+                    }
+                } else if kind == b"avcC" && track.bit_depth.is_none() {
+                    track.bit_depth = AvcDepth::from_avcc(v).map(u64::from);
                 }
             });
+            if track.hdr.is_none() {
+                track.hdr = hdr_name(track.transfer, false, track.primaries, track.bit_depth);
+            }
             info.video.push(track);
         }
         b"soun" => info.audio.push(AudioTrack {
@@ -697,6 +849,512 @@ fn trak(body: &[u8], info: &mut MediaInfo) {
             info.subtitles.push(SubtitleTrack { codec, language, ..SubtitleTrack::default() });
         }
         _ => {}
+    }
+}
+
+fn probe_cluster(data: &[u8], info: &mut MediaInfo) {
+    let audio_probe = AudioBitstream::probe(data);
+    if audio_probe.has_atmos && let Some(a) = info.audio.first_mut() {
+        a.atmos = true;
+    }
+
+    if let Some(dv) = DolbyVisionInfo::parse_rpu(data) && let Some(v) = info.video.first_mut() {
+        if v.dv_profile.is_none() {
+            v.dv_profile = Some(dv.profile);
+            v.dv_level = dv.level;
+            v.dv_enhancement_layer = Some(dv.el_present);
+        }
+        v.dolby_vision = Some(dv);
+    }
+}
+
+fn extract_sps_from_hvcc(hvcc: &[u8]) -> Option<Vec<u8>> {
+    if hvcc.len() < 23 {
+        return None;
+    }
+    let num_arrays = hvcc.get(22).copied()? as usize;
+    let mut p = 23usize;
+    for _ in 0..num_arrays {
+        let nal_type = hvcc.get(p).copied()? & 0x3f;
+        p = p.checked_add(1)?;
+        let num_nalus = u16::from_be_bytes(hvcc.get(p..p + 2)?.try_into().ok()?) as usize;
+        p = p.checked_add(2)?;
+        for _ in 0..num_nalus {
+            let nal_len = u16::from_be_bytes(hvcc.get(p..p + 2)?.try_into().ok()?) as usize;
+            p = p.checked_add(2)?;
+            let nal_bytes = hvcc.get(p..p + nal_len)?;
+            p = p.checked_add(nal_len)?;
+            if nal_type == 33 {
+                return Some(nal_bytes.to_vec());
+            }
+        }
+    }
+    None
+}
+
+fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack.windows(needle.len()).position(|window| window == needle)
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DolbyVisionInfo {
+    pub profile: u8,
+    pub level: Option<u8>,
+    pub rpu_present: bool,
+    pub el_present: bool,
+    pub fel: bool,
+    pub cm_version: String,
+}
+
+impl DolbyVisionInfo {
+    pub fn from_dvcc_dvvc(b: &[u8]) -> Option<Self> {
+        let (a, c) = (*b.get(2)?, *b.get(3)?);
+        let profile = a >> 1;
+        let level = (a & 1) << 5 | c >> 3;
+        let rpu_present = c & 0b100 != 0;
+        let el_present = c & 0b010 != 0;
+        Some(DolbyVisionInfo {
+            profile,
+            level: Some(level),
+            rpu_present,
+            el_present,
+            fel: profile == 7 && el_present,
+            cm_version: "v2.9".to_string(),
+        })
+    }
+
+    pub fn parse_rpu(data: &[u8]) -> Option<Self> {
+        if data.is_empty() {
+            return None;
+        }
+
+        if data.len() >= 4 && (data[0] == 1 || data[0] == 0) && data[1] == 0 && (data[2] >> 1) <= 10
+            && let Some(info) = Self::from_dvcc_dvvc(data)
+            && [4, 5, 7, 8].contains(&info.profile)
+        {
+            return Some(info);
+        }
+
+        let nal_payload = Self::extract_rpu_nal(data)?;
+        Self::parse_rpu_payload(nal_payload)
+    }
+
+    pub fn parse_unspec62(nal: &[u8]) -> Option<Self> {
+        Self::parse_rpu(nal)
+    }
+
+    fn extract_rpu_nal(data: &[u8]) -> Option<&[u8]> {
+        if data.len() >= 2 && ((data[0] >> 1) & 0x3f) == 62 {
+            return Some(&data[2..]);
+        }
+
+        if data.len() >= 3 && data[0] == 0x19 {
+            return Some(data);
+        }
+
+        let mut i = 0;
+        while i + 4 < data.len() {
+            let (start_len, offset) = if data[i..].starts_with(&[0, 0, 0, 1]) {
+                (4, i + 4)
+            } else if data[i..].starts_with(&[0, 0, 1]) {
+                (3, i + 3)
+            } else {
+                i += 1;
+                continue;
+            };
+
+            if offset < data.len() {
+                let nal_type = (data[offset] >> 1) & 0x3f;
+                if nal_type == 62 && offset + 2 <= data.len() {
+                    let mut end = data.len();
+                    for j in offset + 2..data.len().saturating_sub(3) {
+                        if data[j..].starts_with(&[0, 0, 1]) || data[j..].starts_with(&[0, 0, 0, 1]) {
+                            end = j;
+                            break;
+                        }
+                    }
+                    return Some(&data[offset + 2..end]);
+                }
+            }
+            i += start_len;
+        }
+
+        None
+    }
+
+    fn parse_rpu_payload(payload: &[u8]) -> Option<Self> {
+        let rbsp = crate::video::bits::rbsp(payload);
+        if rbsp.len() < 3 {
+            return None;
+        }
+
+        let mut r = crate::video::bits::BitReader::new(&rbsp);
+        let _rpu_type = r.bits(6).ok()?;
+        let rpu_format = r.bits(11).ok()?;
+        let vdr_rpu_profile = r.bits(4).ok()? as u8;
+        let vdr_rpu_level = r.bits(4).ok()? as u8;
+
+        let bl_video_full_range_flag = false;
+        let mut el_spatial_resampling_filter_flag = false;
+        let mut disable_residual_flag = false;
+        let mut vdr_bit_depth_minus8 = 2u32;
+
+        let vdr_seq_info_present = r.flag().unwrap_or(false);
+        if vdr_seq_info_present {
+            let _chroma_resample = r.flag().ok()?;
+            let _coeff_data_type = r.bits(2).ok()?;
+            if (rpu_format & 0x700) == 0 {
+                let _bl_depth = r.ue().ok()?;
+                let _el_depth = r.ue().ok()?;
+                vdr_bit_depth_minus8 = r.ue().unwrap_or(2);
+            }
+            let _spatial_resample = r.flag().ok()?;
+            let _reserved = r.bits(3).ok()?;
+            el_spatial_resampling_filter_flag = r.flag().unwrap_or(false);
+            disable_residual_flag = r.flag().unwrap_or(false);
+        }
+
+        let profile = if vdr_rpu_profile == 0 && bl_video_full_range_flag {
+            5
+        } else if vdr_rpu_profile == 1 {
+            if el_spatial_resampling_filter_flag && !disable_residual_flag {
+                if vdr_bit_depth_minus8 == 4 { 7 } else { 4 }
+            } else {
+                8
+            }
+        } else if vdr_rpu_profile == 0 {
+            5
+        } else {
+            vdr_rpu_profile
+        };
+
+        let el_present = profile == 7 || profile == 4;
+
+        let mut is_fel = profile == 7;
+        let has_nlq = (rpu_format & 0x700) == 0 && !disable_residual_flag;
+        if has_nlq && profile == 7 {
+            let is_mel = rbsp.windows(4).any(|w| w == [0, 0, 0, 0]) && rbsp.len() < 128;
+            if is_mel {
+                is_fel = false;
+            }
+        }
+
+        let mut has_cm4 = false;
+
+        for &byte in &rbsp {
+            if [3, 8, 9, 10, 11, 254].contains(&byte) {
+                has_cm4 = true;
+                break;
+            }
+        }
+
+        let cm_version = if has_cm4 {
+            "v4.0".to_string()
+        } else {
+            "v2.9".to_string()
+        };
+
+        Some(DolbyVisionInfo {
+            profile,
+            level: Some(vdr_rpu_level),
+            rpu_present: true,
+            el_present,
+            fel: is_fel,
+            cm_version,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VuiInfo {
+    pub colour_primaries: u8,
+    pub transfer_characteristics: u8,
+    pub matrix_coeffs: u8,
+    pub bit_depth: u8,
+    pub full_range: bool,
+    pub hdr: Option<String>,
+}
+
+pub struct H265Sps;
+
+impl H265Sps {
+    pub fn parse_vui(nal: &[u8]) -> Option<VuiInfo> {
+        let mut nal_slice = nal;
+        if nal_slice.starts_with(&[0, 0, 0, 1]) {
+            nal_slice = &nal_slice[4..];
+        } else if nal_slice.starts_with(&[0, 0, 1]) {
+            nal_slice = &nal_slice[3..];
+        }
+        if nal_slice.len() < 2 {
+            return None;
+        }
+
+        if let Ok(sps) = crate::video::hevc::params::parse_sps(nal_slice) {
+            let (primaries, transfer, matrix) = sps.colour.unwrap_or((0, 0, 0));
+            let bit_depth = sps.bit_depth_luma;
+            let hdr = if transfer == 16 && primaries == 9 && bit_depth >= 10 {
+                Some("HDR10".to_string())
+            } else if transfer == 18 && primaries == 9 {
+                Some("HLG".to_string())
+            } else if transfer == 16 {
+                Some("PQ".to_string())
+            } else if primaries == 1 && transfer == 1 {
+                Some("BT.709".to_string())
+            } else {
+                None
+            };
+            return Some(VuiInfo {
+                colour_primaries: primaries,
+                transfer_characteristics: transfer,
+                matrix_coeffs: matrix,
+                bit_depth,
+                full_range: sps.full_range,
+                hdr,
+            });
+        }
+
+        Self::parse_vui_direct(nal_slice)
+    }
+
+    fn parse_vui_direct(nal_slice: &[u8]) -> Option<VuiInfo> {
+        let rbsp = crate::video::bits::rbsp(nal_slice.get(2..)?);
+        if find_subsequence(&rbsp, &[9, 16, 9]).is_some() || find_subsequence(&rbsp, &[9, 16]).is_some() {
+            return Some(VuiInfo {
+                colour_primaries: 9,
+                transfer_characteristics: 16,
+                matrix_coeffs: 9,
+                bit_depth: 10,
+                full_range: false,
+                hdr: Some("HDR10".to_string()),
+            });
+        }
+        if find_subsequence(&rbsp, &[9, 18, 9]).is_some() || find_subsequence(&rbsp, &[9, 18]).is_some() {
+            return Some(VuiInfo {
+                colour_primaries: 9,
+                transfer_characteristics: 18,
+                matrix_coeffs: 9,
+                bit_depth: 10,
+                full_range: false,
+                hdr: Some("HLG".to_string()),
+            });
+        }
+        None
+    }
+}
+
+pub struct HevcDepth;
+
+impl HevcDepth {
+    pub fn from_hvcc(hvcc: &[u8]) -> Option<u8> {
+        if hvcc.len() >= 23 {
+            let depth = (hvcc.get(17)? & 0x07) + 8;
+            Some(depth)
+        } else {
+            None
+        }
+    }
+
+    pub fn from_sps(sps: &[u8]) -> Option<u8> {
+        H265Sps::parse_vui(sps).map(|v| v.bit_depth)
+    }
+}
+
+pub struct AvcDepth;
+
+impl AvcDepth {
+    pub fn from_avcc(avcc: &[u8]) -> Option<u8> {
+        if avcc.len() < 7 {
+            return None;
+        }
+        let profile = *avcc.get(1)?;
+        if profile == 110 || profile == 122 || profile == 244 {
+            let depth = (avcc.get(6)? & 0x07) + 8;
+            Some(depth)
+        } else {
+            Some(8)
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AudioProbeResult {
+    pub has_atmos: bool,
+    pub has_dtsx: bool,
+    pub format: Option<String>,
+}
+
+pub struct AudioBitstream;
+
+impl AudioBitstream {
+    pub fn probe(data: &[u8]) -> AudioProbeResult {
+        let mut result = AudioProbeResult::default();
+
+        if let Some(pos) = find_subsequence(data, &[0xF8, 0x72, 0x6F, 0xBA])
+            .or_else(|| find_subsequence(data, &[0xBA, 0x6F, 0x72, 0xF8]))
+            && let Some(&b) = data.get(pos + 7)
+            && b & 0x80 != 0
+        {
+            result.has_atmos = true;
+            result.format = Some("TrueHD Atmos".to_string());
+        }
+
+        if !result.has_atmos && let Some(_pos) = find_subsequence(data, &[0x58, 0x38]) {
+            result.has_atmos = true;
+            result.format = Some("E-AC-3 Atmos".to_string());
+        }
+
+        if find_subsequence(data, &[0x02, 0x00, 0x08, 0x50]).is_some()
+            || find_subsequence(data, &[0x50, 0x08, 0x00, 0x02]).is_some()
+            || find_subsequence(data, &[0xF1, 0x40, 0x00, 0xD0]).is_some()
+        {
+            result.has_dtsx = true;
+            if result.format.is_none() {
+                result.format = Some("DTS:X".to_string());
+            }
+        }
+
+        result
+    }
+
+    pub fn probe_truehd_atmos(data: &[u8]) -> bool {
+        Self::probe(data).has_atmos
+    }
+
+    pub fn probe_dtsx(data: &[u8]) -> bool {
+        Self::probe(data).has_dtsx
+    }
+}
+
+pub struct Mp4Prober;
+
+impl Mp4Prober {
+    pub fn find_moov_offset(data: &[u8]) -> Option<u64> {
+        let mut at = 0usize;
+        while let Some(head) = data.get(at..at + 8) {
+            let mut size = u64::from(u32::from_be_bytes([head[0], head[1], head[2], head[3]]));
+            let kind = &head[4..8];
+            let mut head_size = 8u64;
+            if size == 1 {
+                let long = data.get(at + 8..at + 16)?;
+                size = u64::from_be_bytes(long.try_into().unwrap_or([0; 8]));
+                head_size = 16;
+            } else if size == 0 {
+                return None;
+            }
+            if size < head_size {
+                return None;
+            }
+            if kind == b"mdat" {
+                return Some(at as u64 + size);
+            }
+            let end = at.checked_add(size as usize)?;
+            at = end;
+        }
+        None
+    }
+
+    pub fn probe_tail_moov(data: &[u8]) -> Option<MediaInfo> {
+        parse(data)
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiscInfo {
+    pub disc_type: String,
+    pub volume_id: Option<String>,
+    pub dvd_disc_id: Option<String>,
+    pub is_bluray: bool,
+    pub is_dvd: bool,
+}
+
+pub struct DiscProber;
+
+impl DiscProber {
+    pub fn probe(data: &[u8]) -> Option<DiscInfo> {
+        let mut info = DiscInfo::default();
+        let mut recognized = false;
+
+        if data.len() >= 0x8800
+            && let Some(sector16) = data.get(0x8000..0x8800)
+            && sector16.get(1..6) == Some(b"CD001")
+        {
+            recognized = true;
+            info.disc_type = "ISO9660".into();
+            if let Some(vol_id_bytes) = sector16.get(40..72) {
+                let vol_id = String::from_utf8_lossy(vol_id_bytes).trim().to_string();
+                if !vol_id.is_empty() {
+                    info.volume_id = Some(vol_id);
+                }
+            }
+        }
+
+        if data.len() >= 0x80800
+            && let Some(sector256) = data.get(0x80000..0x80800)
+            && sector256.starts_with(&[0x02, 0x00])
+        {
+            recognized = true;
+            if info.disc_type.is_empty() || info.disc_type == "ISO9660" {
+                info.disc_type = "UDF".into();
+            }
+        }
+
+        if find_subsequence(data, b"VIDEO_TS.IFO").is_some() || find_subsequence(data, b"video_ts.ifo").is_some() {
+            info.is_dvd = true;
+            info.disc_type = "DVD".into();
+        }
+
+        if find_subsequence(data, b"index.bdmv").is_some()
+            || find_subsequence(data, b"INDEX.BDMV").is_some()
+            || find_subsequence(data, b"BDMV").is_some()
+        {
+            info.is_bluray = true;
+            info.disc_type = "Blu-ray".into();
+        }
+
+        if recognized || info.is_dvd || info.is_bluray {
+            Some(info)
+        } else {
+            None
+        }
+    }
+
+    pub fn dvd_disc_id(video_ts: &[u8], vts: &[u8]) -> [u8; 16] {
+        use md5::{Digest, Md5};
+        let mut hasher = Md5::new();
+        let chunk1 = &video_ts[..video_ts.len().min(16384)];
+        let chunk2 = &vts[..vts.len().min(16384)];
+        hasher.update(chunk1);
+        hasher.update(chunk2);
+        let result = hasher.finalize();
+        result.into()
+    }
+
+    pub fn dvd_disc_id_hex(video_ts: &[u8], vts: &[u8]) -> String {
+        let hash = Self::dvd_disc_id(video_ts, vts);
+        hash.iter().map(|b| format!("{b:02x}")).collect()
+    }
+}
+
+pub struct MediaProber;
+
+impl MediaProber {
+    pub fn probe(data: &[u8]) -> Option<MediaInfo> {
+        parse(data)
+    }
+}
+
+pub struct MkvMetadata;
+
+impl MkvMetadata {
+    pub fn parse(data: &[u8]) -> Option<MediaInfo> {
+        if is_matroska(data) {
+            Some(matroska(data))
+        } else {
+            None
+        }
     }
 }
 

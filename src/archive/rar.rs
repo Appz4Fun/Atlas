@@ -299,10 +299,138 @@ pub struct PasswordCheck {
     pub check: [u8; 8],
 }
 
-/// More rounds than this take too long to run while a page waits.
-const MAX_KDF: u8 = 20;
+pub type Rar5PswCheck = PasswordCheck;
+
+/// More rounds than this take too long to run while a page waits. Capped at 2^16 (65,536 rounds) to prevent DoS.
+pub const MAX_KDF: u8 = 16;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum EncryptionMode {
+    None,
+    HeaderEncryptedHp,
+    CandidateHp,
+    IndeterminateIncomplete,
+    Indeterminate,
+}
+
+impl EncryptionMode {
+    pub fn is_encrypted(self) -> bool {
+        matches!(self, EncryptionMode::HeaderEncryptedHp | EncryptionMode::CandidateHp)
+    }
+
+    pub fn is_candidate(self) -> bool {
+        matches!(self, EncryptionMode::HeaderEncryptedHp | EncryptionMode::CandidateHp)
+    }
+}
+
+pub struct Rar5Header;
+
+impl Rar5Header {
+    /// Zero-download RAR5 -hp archive encryption detection candidate heuristic from NZB/overview volume sizes.
+    pub fn detect_encryption(volume_sizes: &[i64]) -> EncryptionMode {
+        let valid: Vec<i64> = volume_sizes.iter().copied().filter(|&s| s > 0).collect();
+        if valid.is_empty() {
+            return EncryptionMode::None;
+        }
+        if valid.len() == 1 {
+            let s = match valid.first() {
+                Some(v) => *v,
+                None => return EncryptionMode::None,
+            };
+            let rem = s.rem_euclid(16);
+            if rem == 14 || rem == 10 {
+                return EncryptionMode::CandidateHp;
+            }
+            return EncryptionMode::None;
+        }
+
+        let n = valid.len();
+        let nominal = match valid.first() {
+            Some(v) => *v,
+            None => return EncryptionMode::None,
+        };
+        let nominal_slice = match valid.get(..n.saturating_sub(1)) {
+            Some(slice) => slice,
+            None => return EncryptionMode::None,
+        };
+        let nominal_match = nominal_slice.iter().all(|&v| v == nominal);
+        let tail = match valid.get(n.saturating_sub(1)) {
+            Some(v) => *v,
+            None => return EncryptionMode::None,
+        };
+
+        if nominal_match && tail == nominal {
+            return EncryptionMode::IndeterminateIncomplete;
+        }
+
+        let rem = tail.rem_euclid(16);
+        if rem == 14 || rem == 10 {
+            EncryptionMode::HeaderEncryptedHp
+        } else {
+            EncryptionMode::None
+        }
+    }
+
+    /// Article 1 Block Type 4 inspection:
+    /// Inspects article 1 prefix for RAR5 magic and checks if the following block header type is 4 (Encryption Header).
+    pub fn verify_article1(bytes: &[u8]) -> bool {
+        if !bytes.starts_with(MARK5) {
+            return false;
+        }
+        let pos = MARK5.len();
+        let Some(rest) = bytes.get(pos..) else { return false };
+        if rest.len() < 4 {
+            return false;
+        }
+        let mut size_len = 0usize;
+        let mut size = 0usize;
+        loop {
+            let Some(byte) = rest.get(4 + size_len).copied() else { return false };
+            size |= usize::from(byte & 0x7f) << (7 * size_len);
+            size_len += 1;
+            if byte & 0x80 == 0 {
+                break;
+            }
+            if size_len == 3 {
+                return false;
+            }
+        }
+        if size == 0 {
+            return false;
+        }
+        let Some(end) = (4 + size_len).checked_add(size) else { return false };
+        let Some(body) = rest.get(4..end) else { return false };
+        if le32(rest, 0) != Some(crc32(body)) {
+            return false;
+        }
+        let Some(inner) = body.get(size_len..) else { return false };
+        let mut p = 0usize;
+        let Some(ty) = vint(inner, &mut p) else { return false };
+        ty == 4
+    }
+
+    pub fn inspect_article1_block4(bytes: &[u8]) -> bool {
+        Self::verify_article1(bytes)
+    }
+}
 
 impl PasswordCheck {
+    pub fn new(kdf: u8, salt: [u8; 16], check: [u8; 8]) -> Self {
+        PasswordCheck { kdf, salt, check }
+    }
+
+    pub fn verify(&self, candidate: &str) -> bool {
+        self.accepts(candidate).unwrap_or(false)
+    }
+
+    pub async fn verify_async(&self, candidate: &str) -> bool {
+        let check = *self;
+        let cand = candidate.to_string();
+        tokio::task::spawn_blocking(move || check.verify(&cand))
+            .await
+            .unwrap_or(false)
+    }
+
     /// Stored as kdf, salt, check.
     pub fn to_bytes(self) -> Vec<u8> {
         let mut out = vec![self.kdf];
@@ -312,6 +440,9 @@ impl PasswordCheck {
     }
 
     pub fn from_bytes(b: &[u8]) -> Option<PasswordCheck> {
+        if b.len() < 25 {
+            return None;
+        }
         Some(PasswordCheck {
             kdf: *b.first()?,
             salt: b.get(1..17)?.try_into().ok()?,

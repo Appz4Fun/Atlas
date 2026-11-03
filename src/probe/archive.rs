@@ -340,6 +340,91 @@ pub fn zip_method(method: u16) -> &'static str {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArchiveFormat {
+    Rar5,
+    SevenZip,
+    Zip,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DecompressError {
+    ExpansionRatioBreached,
+    DecodeError(String),
+    LimitReached,
+    UnexpectedEof,
+}
+
+pub struct ArchiveStream;
+
+impl ArchiveStream {
+    pub fn decompress(
+        format: ArchiveFormat,
+        input: &[u8],
+        limit: usize,
+    ) -> Result<Vec<u8>, DecompressError> {
+        let max_allowed = limit.min(crate::probe::nest::MAX_DECODED);
+        let max_ratio_limit = input.len().saturating_mul(crate::probe::nest::MAX_RATIO);
+        let effective_limit = max_allowed.min(max_ratio_limit);
+
+        match format {
+            ArchiveFormat::Zip => {
+                use flate2::read::DeflateDecoder;
+                use std::io::Read;
+                let mut decoder = DeflateDecoder::new(input);
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 8192];
+                loop {
+                    let to_read = chunk.len().min(effective_limit.saturating_sub(buf.len()));
+                    if to_read == 0 {
+                        let mut test_chunk = [0u8; 1];
+                        if let Ok(1) = decoder.read(&mut test_chunk) {
+                            return Err(DecompressError::ExpansionRatioBreached);
+                        }
+                        break;
+                    }
+                    match decoder.read(&mut chunk[..to_read]) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            buf.extend_from_slice(&chunk[..n]);
+                            if buf.len() > input.len().saturating_mul(crate::probe::nest::MAX_RATIO) {
+                                return Err(DecompressError::ExpansionRatioBreached);
+                            }
+                        }
+                        Err(e) => {
+                            if buf.is_empty() {
+                                return Err(DecompressError::DecodeError(e.to_string()));
+                            }
+                            break;
+                        }
+                    }
+                }
+                Ok(buf)
+            }
+            ArchiveFormat::SevenZip => {
+                let (buf, end) = crate::probe::lzma::lzma2(input, effective_limit);
+                if buf.len() > input.len().saturating_mul(crate::probe::nest::MAX_RATIO) {
+                    return Err(DecompressError::ExpansionRatioBreached);
+                }
+                if buf.is_empty() && end != crate::probe::lzma::End::Done {
+                    return Err(DecompressError::DecodeError("lzma2 decode failed".into()));
+                }
+                Ok(buf)
+            }
+            ArchiveFormat::Rar5 => {
+                let (buf, end) = crate::probe::codec::rar5::rar5(input, false, None, effective_limit);
+                if buf.len() > input.len().saturating_mul(crate::probe::nest::MAX_RATIO) {
+                    return Err(DecompressError::ExpansionRatioBreached);
+                }
+                if buf.is_empty() && end != crate::probe::lzma::End::Done {
+                    return Err(DecompressError::DecodeError("rar5 decode failed".into()));
+                }
+                Ok(buf)
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

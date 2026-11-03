@@ -205,6 +205,26 @@ impl PasswordTest {
     pub fn certain(&self) -> bool {
         !matches!(self, PasswordTest::Zip(zip::PasswordCheck::Crypto { .. }))
     }
+
+    /// Fast verification of candidate password.
+    pub fn verify(&self, candidate: &str) -> bool {
+        match self {
+            PasswordTest::Rar5(check) => check.verify(candidate),
+            PasswordTest::Zip(check) => check.accepts(candidate),
+        }
+    }
+
+    /// Asynchronous offload of verification to spawn_blocking.
+    pub async fn verify_async(&self, candidate: &str) -> bool {
+        match self {
+            PasswordTest::Rar5(check) => check.verify_async(candidate).await,
+            PasswordTest::Zip(check) => {
+                let check = *check;
+                let cand = candidate.to_string();
+                tokio::task::spawn_blocking(move || check.accepts(&cand)).await.unwrap_or(false)
+            }
+        }
+    }
 }
 
 /// What a parser read. Total functions: bad bytes give a listing that says so.
@@ -281,3 +301,121 @@ pub fn sync_inline_lookups(cfg: &Config) {
 pub fn set_inline_lookups(on: bool) {
     INLINE.store(on, Ordering::Relaxed);
 }
+
+pub use rar::{EncryptionMode, PasswordCheck, PasswordCheck as Rar5PswCheck, Rar5Header};
+
+pub struct PasswordHarvester;
+
+impl PasswordHarvester {
+    pub fn extract_candidates(
+        subject: &str,
+        nfo: Option<&str>,
+        nzb_meta: &std::collections::HashMap<String, String>,
+    ) -> Vec<String> {
+        let mut candidates = Vec::new();
+
+        Self::harvest_subject(subject, &mut candidates);
+
+        if let Some(nfo_text) = nfo {
+            Self::harvest_nfo(nfo_text, &mut candidates);
+        }
+
+        for (k, v) in nzb_meta {
+            let k_lower = k.to_lowercase();
+            if k_lower == "password"
+                || k_lower == "meta:password"
+                || k_lower == "x-dnzb-password"
+                || k_lower.contains("password")
+                || k_lower == "pwd"
+            {
+                Self::push_candidate(v, &mut candidates);
+            }
+        }
+
+        let mut seen = std::collections::HashSet::new();
+        let mut clean = Vec::new();
+        for c in candidates {
+            let trimmed = c.trim().to_string();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if Self::is_negative_phrase(&trimmed) {
+                continue;
+            }
+            if seen.insert(trimmed.clone()) {
+                clean.push(trimmed);
+                if clean.len() >= 5 {
+                    break;
+                }
+            }
+        }
+
+        clean
+    }
+
+    pub fn extract(
+        subject: &str,
+        nfo: Option<&str>,
+        nzb_meta: &std::collections::HashMap<String, String>,
+    ) -> Vec<String> {
+        Self::extract_candidates(subject, nfo, nzb_meta)
+    }
+
+    fn harvest_subject(subject: &str, out: &mut Vec<String>) {
+        static RE_BRACES: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\{\{([^}]+)\}\}").unwrap());
+        static RE_BRACKETS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\[pw:\s*([^\]]+)\]").unwrap());
+        static RE_PASS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\bpass(?:word)?[:=]\s*(\S+)").unwrap());
+
+        for cap in RE_BRACES.captures_iter(subject) {
+            if let Some(m) = cap.get(1) {
+                out.push(m.as_str().to_string());
+            }
+        }
+        for cap in RE_BRACKETS.captures_iter(subject) {
+            if let Some(m) = cap.get(1) {
+                out.push(m.as_str().to_string());
+            }
+        }
+        for cap in RE_PASS.captures_iter(subject) {
+            if let Some(m) = cap.get(1) {
+                out.push(m.as_str().to_string());
+            }
+        }
+    }
+
+    fn harvest_nfo(nfo: &str, out: &mut Vec<String>) {
+        static RE_NFO: LazyLock<Regex> = LazyLock::new(|| {
+            Regex::new(r"(?i)(?:password|pwd|pass|passwort)\s*[:=]\s*([^\r\n]+)").unwrap()
+        });
+
+        for cap in RE_NFO.captures_iter(nfo) {
+            if let Some(m) = cap.get(1) {
+                let s = m.as_str().trim();
+                out.push(s.to_string());
+            }
+        }
+    }
+
+    fn push_candidate(val: &str, out: &mut Vec<String>) {
+        let trimmed = val.trim();
+        if !trimmed.is_empty() {
+            out.push(trimmed.to_string());
+        }
+    }
+
+    fn is_negative_phrase(s: &str) -> bool {
+        let lower = s.to_lowercase();
+        let l = lower.trim();
+        l == "none"
+            || l == "no"
+            || l == "null"
+            || l == "nil"
+            || l == "n/a"
+            || l == "false"
+            || l == "no password"
+            || l.starts_with("no password")
+            || l.starts_with("none")
+            || l.contains("no password needed")
+    }
+}
+
