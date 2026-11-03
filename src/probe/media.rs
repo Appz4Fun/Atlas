@@ -36,6 +36,9 @@ pub struct MediaInfo {
     /// more of the file's start would say more.
     #[serde(skip)]
     pub header_complete: bool,
+    /// The encoder's settings ran to their end in what was read, not to the end of the read.
+    #[serde(skip)]
+    pub encoder_complete: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -131,9 +134,10 @@ pub fn parse(data: &[u8]) -> Option<MediaInfo> {
     } else {
         return None;
     };
-    if let Some((encoder, options)) = encoder_settings(data) {
+    if let Some((encoder, options, complete)) = encoder_settings(data) {
         info.encoder = Some(encoder);
         info.encoder_options = options;
+        info.encoder_complete = complete;
     }
     Some(info)
 }
@@ -144,12 +148,15 @@ const MAX_ENCODER_OPTIONS: usize = 6000;
 /// What x264 and x265 write as text into an SEI of the first frame: `x264 - core 164 r3095 baee400 - H.264/MPEG-4
 /// AVC codec - ... - options: cabac=1 ref=4 ...`, or `x265 (build 199) - 3.5+1-f0c1022b6:[Linux][GCC 10.2.1][64
 /// bit] 10bit - H.265/HEVC codec - ... - options: cpuid=1111039 ...`. The encoder with its version, and the options.
-fn encoder_settings(data: &[u8]) -> Option<(String, Option<String>)> {
+/// The encoder, its settings, and whether they ended before the data did: false when they may go on in the next article.
+fn encoder_settings(data: &[u8]) -> Option<(String, Option<String>, bool)> {
     let (at, x265) = [(b"x264 - core ".as_slice(), false), (b"x265 (build ".as_slice(), true)]
         .into_iter()
         .find_map(|(needle, x265)| data.windows(needle.len()).position(|w| w == needle).map(|at| (at, x265)))?;
     let rest = &data[at..];
-    let end = rest.iter().position(|b| *b == 0 || !(b.is_ascii_graphic() || *b == b' ')).unwrap_or(rest.len());
+    let stop = rest.iter().position(|b| *b == 0 || !(b.is_ascii_graphic() || *b == b' '));
+    let end = stop.unwrap_or(rest.len());
+    let complete = stop.is_some() || end >= MAX_ENCODER_OPTIONS + 512;
     let line = String::from_utf8_lossy(&rest[..end.min(MAX_ENCODER_OPTIONS + 512)]).into_owned();
     let mut parts = line.split(" - ");
     parts.next()?;
@@ -166,7 +173,7 @@ fn encoder_settings(data: &[u8]) -> Option<(String, Option<String>)> {
         .split_once("options: ")
         .map(|(_, o)| o.trim().chars().take(MAX_ENCODER_OPTIONS).collect::<String>())
         .filter(|o| !o.is_empty());
-    Some((encoder.trim().to_string(), options))
+    Some((encoder.trim().to_string(), options, complete))
 }
 
 // ---- EBML
@@ -991,13 +998,18 @@ mod tests {
     #[test]
     fn encoder_settings_come_from_the_first_frame() {
         let x265 = b"\x00\x00\x01\x4e\x01\x05x265 (build 199) - 3.5+1-f0c1022b6:[Linux][GCC 10.2.1][64 bit] 10bit - H.265/HEVC codec - Copyright 2013-2018 (c) Multicoreware, Inc - http://x265.org - options: cpuid=1111039 crf=18.0 preset=slow\x00\x80";
-        let (encoder, options) = encoder_settings(x265).unwrap();
+        let (encoder, options, complete) = encoder_settings(x265).unwrap();
+        assert!(complete);
         assert_eq!(encoder, "x265 3.5+1-f0c1022b6");
         assert_eq!(options.as_deref(), Some("cpuid=1111039 crf=18.0 preset=slow"));
         let x264 = b"junk x264 - core 164 r3095 baee400 - H.264/MPEG-4 AVC codec - Copyleft 2003-2022 - http://www.videolan.org/x264.html - options: cabac=1 ref=4 crf=16.0\x00";
-        let (encoder, options) = encoder_settings(x264).unwrap();
+        let (encoder, options, _) = encoder_settings(x264).unwrap();
         assert_eq!(encoder, "x264 core 164 r3095 baee400");
         assert_eq!(options.as_deref(), Some("cabac=1 ref=4 crf=16.0"));
+        // cut off by the end of the article: it may go on in the next
+        let (_, cut, complete) = encoder_settings(&x264[..x264.len() - 4]).unwrap();
+        assert_eq!(cut.as_deref(), Some("cabac=1 ref=4 crf=1"));
+        assert!(!complete);
         assert_eq!(encoder_settings(b"nothing here"), None);
     }
 

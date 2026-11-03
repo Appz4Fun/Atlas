@@ -246,7 +246,7 @@ fn read_more_front(
     // the encoder's settings are in the first frame, just past the header: one more article when they're not here yet
     let wants_encoder = info.media.as_ref().is_some_and(|m| {
         m.header_complete
-            && m.encoder.is_none()
+            && !m.encoder_complete
             && m.video.iter().any(|v| {
                 // Matroska's codec ids, and MP4's sample entry fourccs
                 let c = v.codec.to_ascii_lowercase();
