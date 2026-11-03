@@ -1,0 +1,5 @@
+# Wave 6 merged (09:25-09:29Z)
+- Overview-only: :lines identifies article size (716800 / 750000 / 768000 bands don't overlap) and estimates each file's size to ~±300 B from the last article. Equal-size RAR volumes match on last-article :lines within ±2 lines 97% of the time with ~0.1% false pairs. Cheap pre-filter before any BODY fetch.
+- RAR chain from the FIRST article (RAR5): main header volume number (flag 0x0002; absent = volume 0), split flags, inner name, unpacked size. Group by (version, inner name, unpacked size), order by volume number. RAR4 keeps the volume number in the END block (needs the tail article). -hp kills it. NZBGet RarRenamer is working prior art (RarRenamer.cpp).
+- Volume sizes: ngPost 42 MB but raised to post/99 when >99 volumes (47.8 GiB -> ~494 MiB); nxg-upper >=153.6 MB, max 150 volumes; Postie doesn't RAR.
+- Spotnet harvester recipe confirmed from Spotweb: XOVER free.pt, verify, HEAD for X-XML, BODY the NZB carriers in alt.binaries.ftd, unescape + raw DEFLATE. The spot's Segment IDs are NZB carriers, not the binary; per-file groups come from the inflated NZB.

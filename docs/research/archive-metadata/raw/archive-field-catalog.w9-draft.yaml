@@ -1,0 +1,2528 @@
+meta:
+  version: 1
+  date: '2026-11-02'
+  scope: 'RAR4/RAR5, 7z, ZIP/ZIP64, PAR2, SFV, SRR, SRS, RAR .rev, raw split volumes: header fields, leaks, encryption, partial-decode feasibility'
+  read_from_values:
+  - first_article
+  - last_article
+  - first_and_last
+  - separate_file
+  - full
+  verified_values:
+  - VERIFIED
+  - UNVERIFIED
+  proves_values:
+  - twin
+  - alt
+  - same_uploader
+  - tool
+  - none
+  corrections:
+  - '7z AES: IV per coder, no salt by default (IV is the per-archive key)'
+  - RAR5 QO is per volume, not a set-wide file list
+  - 'ZIP 0x9901 actual method is uint16 at +5 (libarchive reads 1 byte: bug)'
+  - 'RAR4 EXTTIME remainder: 24-bit LE in 100 ns units'
+  - 'REV5 signature is 8 bytes: Rar!1A Rev'
+  - 'RAR5 -hp salt identical across volumes: rars writer only, WinRAR unverified'
+formats:
+  rar5:
+    detect:
+      magic: 52 61 72 21 1A 07 01 00
+      offset: 0
+      sfx: scan first ~1 MB for signature; offsets relative to signature
+    structures:
+      block_prefix:
+      - name: hdr_crc
+        where: '@hdr+0 uint32 LE; CRC32 of size..extra end'
+        type: uint32
+        read_from: first_article
+        use: trust header parse on partial read
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1a s1; w3c s1.1
+      - name: hdr_size
+        where: '@hdr+4 vint; counts type..extra end (not CRC)'
+        type: vint
+        read_from: first_article
+        use: next data at hdr+4+len(vint)+size
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1a s1
+      - name: hdr_type
+        where: 'vint: 1 MAIN 2 FILE 3 SERVICE 4 CRYPT 5 ENDARC'
+        type: vint
+        read_from: first_article
+        use: block dispatch
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1a s1
+      - name: hdr_flags
+        where: 'vint: 0x1 extra, 0x2 data, 0x4 skip-unknown, 0x8 split-before, 0x10 split-after, 0x20 child, 0x40 inherited'
+        type: vint
+        read_from: first_article
+        use: split chain without names
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1a s1; w3c s1.1
+      - name: data_area_start
+        where: 'derived: block+4+len(size vint)+hdr_size; not CRC-covered'
+        type: derived
+        read_from: first_article
+        use: byte map of stored or packed data
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1a s1, s16b
+      main_header:
+      - name: main_extra_size
+        where: vint, present if hdr_flags 0x1
+        type: vint
+        read_from: first_article
+        use: skip or parse main extras
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1a s2
+      - name: archive_flags
+        where: 'vint: 0x1 VOLUME, 0x2 volume-number present, 0x4 SOLID, 0x8 RECOVERY, 0x10 LOCKED'
+        type: vint
+        read_from: first_article
+        use: multi-volume, solid, RR presence
+        proves: tool
+        leak: true
+        status: VERIFIED
+        source: w1a s2; w3c s1.5
+      - name: volume_number
+        where: vint, present if archive_flags 0x2 (absent in part 1)
+        type: vint
+        read_from: first_article
+        use: exact part index; absence marks part 1
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1a s2
+      - name: locator_qlist_offset
+        where: 'extra 0x01: flags 0x1, vint offset to QO from main header start (0 = absent)'
+        type: vint
+        read_from: first_article
+        use: jump to QO cache (target at tail)
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w3c s1.5
+      - name: locator_rr_offset
+        where: 'extra 0x01: flags 0x2, vint offset to RR block (0 = absent)'
+        type: vint
+        read_from: first_article
+        use: jump to recovery block (target at tail)
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w3c s1.5
+      - name: main_archive_name_time
+        where: 'extra 0x02: flags 0x1 orig name, 0x2 creation time, 0x4 unix, 0x8 ns'
+        type: record
+        read_from: first_article
+        use: original archive name and creation time
+        proves: same_uploader
+        leak: true
+        status: VERIFIED
+        source: w1a s2
+      crypt_header:
+      - name: crypt_version
+        where: 'HEAD_CRYPT vint: 0 = AES-256'
+        type: vint
+        read_from: first_article
+        use: headers encrypted; no listing without password
+        proves: none
+        leak: true
+        status: VERIFIED
+        source: w7b s1.1
+      - name: crypt_flags
+        where: 'HEAD_CRYPT vint: 0x1 PSWCHECK present'
+        type: vint
+        read_from: first_article
+        use: reject wrong password before decrypt
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w7b s1.1
+      - name: crypt_lg2_count
+        where: '1 byte: KDF iterations = 2^N (default 15, max 24)'
+        type: uint8
+        read_from: first_article
+        use: KDF cost; reveals -hp setting
+        proves: tool
+        leak: true
+        status: VERIFIED
+        source: w7b s1.1
+      - name: crypt_salt
+        where: '16 bytes: archive-level header salt'
+        type: bytes16
+        read_from: first_article
+        use: key derivation; grouping candidate
+        proves: twin
+        leak: true
+        status: VERIFIED
+        source: w7b s1.1
+      - name: crypt_salt_same_across_volumes
+        where: same HEAD_CRYPT salt in every volume of one set (rars writer)
+        type: bytes16
+        read_from: first_article
+        use: group encrypted volumes without names
+        proves: twin
+        leak: true
+        status: UNVERIFIED
+        source: log W8A; WinRAR not checked
+      - name: crypt_pswcheck_csum
+        where: 8-byte PswCheck + 4-byte csum (first 4 bytes of SHA-256(PswCheck))
+        type: bytes12
+        read_from: first_article
+        use: password test without decrypting
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w7b s1.1
+      - name: crypt_pswcheck_algo
+        where: PBKDF2-HMAC-SHA256 at 2^N+32 iterations, XOR-folded to 8 bytes
+        type: derived
+        read_from: first_article
+        use: password test algorithm
+        proves: none
+        leak: false
+        status: UNVERIFIED
+        source: w7b s1.3 (vectors only)
+      - name: encrypted_header_iv
+        where: 16-byte IV before each later header (AES-256-CBC)
+        type: bytes16
+        read_from: first_article
+        use: per-block IV; header lengths stay hidden
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w7b s1.2
+      - name: header_contents_hidden
+        where: 'with -hp: names, sizes, header count, volume number, flags inside ciphertext'
+        type: record
+        read_from: first_article
+        use: listing needs the key
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w7b s1.6
+      file_header:
+      - name: file_extra_size
+        where: vint, present if hdr_flags 0x1
+        type: vint
+        read_from: first_article
+        use: bounds extra records
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1a s4
+      - name: file_data_size
+        where: vint, present if hdr_flags 0x2; packed bytes of this part
+        type: vint
+        read_from: first_article
+        use: packed size; split files sum over volumes
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1a s4
+      - name: file_flags
+        where: 'vint: 0x1 DIRECTORY, 0x2 UTIME, 0x4 CRC32 present, 0x8 unknown unpacked size'
+        type: vint
+        read_from: first_article
+        use: dir vs file; CRC and size trust
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w3c s1.1
+      - name: file_unpacked_size
+        where: 'vint: full unpacked size (ignore if flag 0x8)'
+        type: vint
+        read_from: first_article
+        use: is the MKV complete
+        proves: none
+        leak: false
+        status: UNVERIFIED
+        source: w1a s4 (split parts unverified)
+      - name: file_mtime_unix
+        where: uint32 LE if UTIME flag; UTC Unix seconds
+        type: uint32
+        read_from: first_article
+        use: UTC mtime; clock and zone leak
+        proves: same_uploader
+        leak: true
+        status: VERIFIED
+        source: w3c s1.1; w5c s1
+      - name: file_crc32
+        where: uint32 LE if CRC32 flag; unsplit or last part = unpacked CRC
+        type: uint32
+        read_from: first_article
+        use: content fingerprint (not a key for first split parts)
+        proves: twin
+        leak: false
+        status: VERIFIED
+        source: w3c s1.1; w1a s4
+      - name: comp_info
+        where: 'vint bits: 1-6 version, 7 solid, 8-10 method, 11-15 dict exp, 16-20 frac dict, 21 v1 flag'
+        type: vint
+        read_from: first_article
+        use: 'packer fingerprint: method, dict, version'
+        proves: tool
+        leak: true
+        status: VERIFIED
+        source: w1a s4; w3c s1.1
+      - name: comp_method
+        where: 'comp_info bits 8-10: 0 = store (-m0), 1-5 compressed'
+        type: derived
+        read_from: first_article
+        use: 'store: inner MKV readable with no decoder'
+        proves: tool
+        leak: true
+        status: VERIFIED
+        source: w1a s17
+      - name: comp_dict_exponent
+        where: 'comp_info bits 11-15: dict = 128 KiB << N'
+        type: derived
+        read_from: first_article
+        use: -md setting and packer default
+        proves: tool
+        leak: true
+        status: VERIFIED
+        source: w1a s4
+      - name: comp_version
+        where: 'comp_info bits 1-6: 0 = RAR 5.0, 1 = RAR 7.0+'
+        type: derived
+        read_from: first_article
+        use: RAR 7.x packer detection
+        proves: tool
+        leak: true
+        status: VERIFIED
+        source: w1a s4; w3c s1.1
+      - name: file_host_os
+        where: 'vint: 0 Windows, 1 Unix'
+        type: vint
+        read_from: first_article
+        use: packer OS; decides attribute meaning
+        proves: tool
+        leak: true
+        status: VERIFIED
+        source: w3c s1.1; w8c i
+      - name: file_attributes
+        where: 'vint: Windows attrs (host 0) or POSIX st_mode (host 1)'
+        type: vint
+        read_from: first_article
+        use: dir, symlink, uploader mode and umask
+        proves: tool
+        leak: true
+        status: VERIFIED
+        source: w1a s4
+      - name: file_name
+        where: vint length + UTF-8, '/' separator; U+E080-E0FF + U+FFFE = non-portable Unix name
+        type: utf8
+        read_from: first_article
+        use: file path; non-portable name flag
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1a s4
+      extras:
+      - name: extra_encryption
+        where: 'file extra 0x01: version, flags (0x1 pswcheck, 0x2 TWEAKED), KDF count, salt16, IV16, check12'
+        type: record
+        read_from: first_article
+        use: per-file encryption; TWEAKED makes CRC key-dependent
+        proves: none
+        leak: true
+        status: VERIFIED
+        source: w1a s5
+      - name: extra_hash_blake2sp
+        where: 'file extra 0x02: hash_type 0 + 32-byte BLAKE2sp'
+        type: record
+        read_from: first_article
+        use: content identity for unsplit files
+        proves: twin
+        leak: false
+        status: VERIFIED
+        source: w1a s5
+      - name: extra_time_htime
+        where: 'file extra 0x03: flags (0x1 unix, 0x2 mtime, 0x4 ctime, 0x8 atime, 0x10 ns) + values'
+        type: record
+        read_from: first_article
+        use: ns timestamps; OS and clock fingerprint
+        proves: tool
+        leak: true
+        status: VERIFIED
+        source: w5c s1.6; w8c f
+      - name: extra_version
+        where: 'file extra 0x04: flags, version number; name gets ;N'
+        type: record
+        read_from: first_article
+        use: file versioning (rare)
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1a s5
+      - name: extra_redirection
+        where: 'file extra 0x05: type (1 unix symlink, 2 win symlink, 3 junction, 4 hard, 5 copy), flags, target UTF-8'
+        type: record
+        read_from: first_article
+        use: symlink target leaks packer paths; breaks largest-file rule
+        proves: same_uploader
+        leak: true
+        status: VERIFIED
+        source: w5c s4.1
+      - name: extra_unix_owner
+        where: 'file extra 0x06: flags, user name, group name, uid, gid'
+        type: record
+        read_from: first_article
+        use: Unix account and numeric ids of packer
+        proves: same_uploader
+        leak: true
+        status: VERIFIED
+        source: w5c s3.4
+      - name: extra_subdata
+        where: 'file extra 0x07: service payload (RR percent vint, CMT text, QO cache)'
+        type: bytes
+        read_from: first_article or last_article
+        use: service payload
+        proves: tool
+        leak: true
+        status: VERIFIED
+        source: w3c s1.4
+      service_headers:
+      - name: service_name
+        where: 'service name: CMT, QO, ACL, STM, UOW, AV, RR, EA2'
+        type: utf8
+        read_from: first_article or last_article
+        use: selects service decoder
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w3c s1.1
+      - name: service_cmt
+        where: 'CMT: archive comment in data area; method 0-5; CRC-checked; 16 MiB cap'
+        type: text
+        read_from: first_article if near main header, else full
+        use: poster notes, group tags, URLs
+        proves: same_uploader
+        leak: true
+        status: VERIFIED
+        source: w3c s1.2
+      - name: service_qo
+        where: 'QO: raw cached headers; entries = CRC32, size vint, flags, backward offset, header bytes'
+        type: record
+        read_from: last_article
+        use: file list without data; -qo leak
+        proves: tool
+        leak: true
+        status: VERIFIED
+        source: w3c s1.3
+      - name: qo_scope_per_volume
+        where: QO caches only its own volume's headers; normally at end of volume
+        type: record
+        read_from: last_article
+        use: per-volume list, not set-wide
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: log W4B correction
+      - name: qo_entry_flags
+        where: 'QO entry flags vint: bit meanings'
+        type: vint
+        read_from: last_article
+        use: not needed for listing
+        proves: none
+        leak: false
+        status: UNVERIFIED
+        source: w3c s1.3
+      - name: service_rr
+        where: 'RR: recovery sectors in data area; found via locator RR offset'
+        type: bytes
+        read_from: last_article
+        use: recovery presence (-rr) and size
+        proves: tool
+        leak: true
+        status: VERIFIED
+        source: w3c s1.4
+      - name: rr_percent
+        where: SUBDATA vint on RR block (1 byte before RAR 6.10)
+        type: vint
+        read_from: last_article
+        use: -rr percentage
+        proves: tool
+        leak: true
+        status: VERIFIED
+        source: w8c d; w3c s1.4
+      - name: rr_bytes_from_percent
+        where: percent to recovery byte count
+        type: derived
+        read_from: last_article
+        use: size of recovery data
+        proves: tool
+        leak: false
+        status: UNVERIFIED
+        source: w3c s1.4 (not in sources)
+      - name: service_acl
+        where: 'ACL: NTFS SECURITY_DESCRIPTOR (owner, group, DACL), compressed; written with -ow'
+        type: record
+        read_from: first_article
+        use: owner SID = Windows account fingerprint
+        proves: same_uploader
+        leak: true
+        status: VERIFIED
+        source: w8c d; w5c s3.1
+      - name: acl_owner_sid
+        where: owner SID inside the ACL descriptor (S-1-5-21-...-RID)
+        type: derived
+        read_from: first_article
+        use: same Windows account across posts
+        proves: same_uploader
+        leak: true
+        status: UNVERIFIED
+        source: w5c s3.1 (layout)
+      - name: service_stm_zone
+        where: STM ':Zone.Identifier' child service; name in SubData (UTF-8); body text
+        type: record
+        read_from: first_article
+        use: mark-of-the-web; origin download host
+        proves: alt
+        leak: true
+        status: VERIFIED
+        source: w8c d; w5c s2.1
+      - name: stm_zone_id
+        where: ZoneId=0-4 in Zone.Identifier body (3 = Internet zone)
+        type: text
+        read_from: first_article
+        use: download zone (value meaning unconfirmed)
+        proves: none
+        leak: true
+        status: VERIFIED
+        source: w5c s2.5
+      - name: stm_host_url
+        where: HostUrl / ReferrerUrl lines in Zone.Identifier (only when packed with -os)
+        type: text
+        read_from: first_article
+        use: exact origin URL
+        proves: alt
+        leak: true
+        status: UNVERIFIED
+        source: w5c s2.4
+      - name: service_uow_av_ea2
+        where: UOW, AV, EA2 service names (layouts not read)
+        type: record
+        read_from: first_article
+        use: Unix owner name; other service data
+        proves: same_uploader
+        leak: true
+        status: UNVERIFIED
+        source: w3c s1.7
+      end_of_archive:
+      - name: endarc_flags
+        where: 'ENDARC vint: 0x1 = not last volume (next part exists)'
+        type: vint
+        read_from: last_article
+        use: cheap next-part test
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1a s6
+      - name: endarc_trailer
+        where: nothing read after ENDARC; appended data (signatures, tags) lives after it
+        type: bytes
+        read_from: last_article
+        use: tail-append data from third-party tools
+        proves: same_uploader
+        leak: true
+        status: VERIFIED
+        source: w1a s6
+    partial_decode:
+      codec: RAR5 LZ (methods 1-5); store (method 0) needs no decoder
+      crate: rars 0.12.3 codec::rar50 Unpack50Decoder
+      result: about 1:1 prefix on truncated packed data (10% -> 786 KB); 64 KiB flush loss on last block
+    rust:
+      parse: hand-written (proto/rar_meta.rs)
+      decode: rars 0.12.3 codec::rar50 direct
+      crypto: pbkdf2+hmac+sha2
+  rar4:
+    detect:
+      magic: 52 61 72 21 1A 07 00
+      offset: 0
+    structures:
+      block_base:
+      - name: head_crc
+        where: '@hdr+0 uint16 LE; CRC16 of rest of block'
+        type: uint16
+        read_from: first_article
+        use: header integrity
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1a s8
+      - name: head_type
+        where: '@hdr+2 byte: 72 MARK 73 MAIN 74 FILE 75 CMT 76 AV 77 OLDSUB 78 PROTECT 79 SIGN 7A NEWSUB 7B ENDARC'
+        type: uint8
+        read_from: first_article
+        use: block dispatch
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1a s8; w5b s1
+      - name: head_flags
+        where: '@hdr+3 uint16; 0x8000 LONG_BLOCK, 0x4000 SKIP_IF_UNKNOWN'
+        type: uint16
+        read_from: first_article
+        use: drives every flag test
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1a s8
+      - name: head_size
+        where: '@hdr+5 uint16; total header length; data starts at block+HEAD_SIZE'
+        type: uint16
+        read_from: first_article
+        use: locates data and next block
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1a s8
+      - name: add_size
+        where: '@hdr+7 uint32 if LONG_BLOCK; packed size low 32 bits on FILE/NEWSUB'
+        type: uint32
+        read_from: first_article
+        use: packed size
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1a s8
+      main_header:
+      - name: main_reserved_av
+        where: '@hdr+7 HighPosAV uint16 + PosAV uint32 (legacy)'
+        type: uint16
+        read_from: first_article
+        use: ignore
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1a s9
+      - name: main_flags
+        where: '@hdr+3: 0x1 VOLUME, 0x2 COMMENT, 0x4 LOCK, 0x8 SOLID, 0x10 NEWNUMBERING, 0x20 AV, 0x40 PROTECT, 0x80 PASSWORD (-hp), 0x100 FIRSTVOLUME, 0x200 ENCRYPTVER'
+        type: uint16
+        read_from: first_article
+        use: solid, RR, -hp, naming (.partNN vs .rNN)
+        proves: tool
+        leak: true
+        status: VERIFIED
+        source: w5b s2
+      - name: main_comment_inline
+        where: 'MHD_COMMENT: old inline RAR 2.x comment after main header'
+        type: record
+        read_from: first_article
+        use: legacy comment
+        proves: same_uploader
+        leak: true
+        status: VERIFIED
+        source: w3c s2.3
+      file_header:
+      - name: pack_size_low
+        where: '@hdr+7 uint32 (= add_size on FILE)'
+        type: uint32
+        read_from: first_article
+        use: packed size low 32 bits
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1a s10
+      - name: unp_size_low
+        where: '@hdr+11 uint32; 0xFFFFFFFF = unknown'
+        type: uint32
+        read_from: first_article
+        use: unpacked size low 32 bits
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1a s10
+      - name: file_host_os
+        where: '@hdr+15 byte: 0 MSDOS 1 OS2 2 WIN32 3 UNIX 4 MACOS 5 BEOS'
+        type: uint8
+        read_from: first_article
+        use: packer OS; attribute meaning
+        proves: tool
+        leak: true
+        status: VERIFIED
+        source: w8c i
+      - name: file_crc32
+        where: '@hdr+16 uint32: CRC32 of unpacked file'
+        type: uint32
+        read_from: first_article
+        use: content fingerprint (unsplit)
+        proves: twin
+        leak: false
+        status: VERIFIED
+        source: w1a s10
+      - name: dos_time
+        where: '@hdr+20 uint32: time low (h<<11|m<<5|s/2), date high; local clock, 2 s'
+        type: uint32
+        read_from: first_article
+        use: local clock, no zone
+        proves: same_uploader
+        leak: true
+        status: VERIFIED
+        source: w1a s10; w5c s1.1
+      - name: unp_ver
+        where: '@hdr+24 byte: 15, 20 or 29'
+        type: uint8
+        read_from: first_article
+        use: minimum RAR version to extract
+        proves: tool
+        leak: true
+        status: VERIFIED
+        source: w1a s10
+      - name: method
+        where: '@hdr+25 byte: 0x30 store, 0x31-0x35 compressed'
+        type: uint8
+        read_from: first_article
+        use: 'store: inner media readable'
+        proves: tool
+        leak: true
+        status: VERIFIED
+        source: w5b s2
+      - name: name_size
+        where: '@hdr+26 uint16'
+        type: uint16
+        read_from: first_article
+        use: length of name field
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1a s10
+      - name: file_attr
+        where: '@hdr+28 uint32: Windows attrs; host 3: high 16 bits = st_mode'
+        type: uint32
+        read_from: first_article
+        use: dir, symlink (0xA000), Unix mode
+        proves: tool
+        leak: true
+        status: VERIFIED
+        source: w1a s10; w5c s6.2
+      - name: high_sizes
+        where: 'if LHD_LARGE: high pack uint32 @+32, then high unp uint32'
+        type: uint32
+        read_from: first_article
+        use: 64-bit sizes over 4 GiB
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1a s10
+      - name: file_name
+        where: 'name_size bytes: ASCII; with LHD_UNICODE an encoded stream after NUL; backslash separator'
+        type: bytes
+        read_from: first_article
+        use: file path
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w2c s2
+      - name: unicode_name_codes
+        where: '2-bit selectors: 0 plain byte, 1 high-byte fill, 2 word pair, 3 copy run'
+        type: derived
+        read_from: first_article
+        use: decode Unicode name
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w2c s2
+      - name: file_salt
+        where: '8 bytes after name if LHD_SALT (0x400): per-file -p salt'
+        type: bytes8
+        read_from: first_article
+        use: per-file key salt; no check value
+        proves: twin
+        leak: false
+        status: VERIFIED
+        source: w7b s2.2
+      - name: exttime
+        where: 'if LHD_EXTTIME: uint16 flags, 4 nibbles (mtime, ctime, atime, arctime): 0x8 present, 0x4 +1 s, 0x3 extra bytes'
+        type: record
+        read_from: first_article
+        use: sub-second precision; build fingerprint
+        proves: tool
+        leak: true
+        status: VERIFIED
+        source: w2c s3; w8c a
+      - name: exttime_remainder
+        where: 'extra bytes: 24-bit LE in 100 ns units (under 2 s)'
+        type: uint24
+        read_from: first_article
+        use: sub-second offset
+        proves: tool
+        leak: true
+        status: VERIFIED
+        source: w8c a
+      - name: file_flags
+        where: '@hdr+3: 0x1 SPLIT_BEFORE, 0x2 SPLIT_AFTER, 0x4 PASSWORD, 0x8 COMMENT, 0x10 SOLID, 0x100 LARGE, 0x200 UNICODE, 0x400 SALT, 0x800 VERSION, 0x1000 EXTTIME, 0x2000 EXTFLAGS, 0x8000 LONG_BLOCK'
+        type: uint16
+        read_from: first_article
+        use: split chain, encryption, solid, naming
+        proves: tool
+        leak: true
+        status: VERIFIED
+        source: w5b s2
+      - name: file_dict_window
+        where: 'flags 0xE0: dict = 64 KiB << (value>>5); 0xE0 = directory'
+        type: derived
+        read_from: first_article
+        use: -md dictionary setting
+        proves: tool
+        leak: true
+        status: VERIFIED
+        source: w5b s2; w1a s10
+      - name: file_is_directory
+        where: (flags & 0xE0) == 0xE0
+        type: derived
+        read_from: first_article
+        use: directory detection
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w5b s2
+      - name: solid_dependency
+        where: solid member needs its predecessors decoded first
+        type: derived
+        read_from: full
+        use: later files unreachable from first article
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1a s10
+      newsub_service:
+      - name: sub_name
+        where: 'NEWSUB name in file layout: CMT, QO, ACL, STM, UOW, AV, RR, EA2'
+        type: utf8
+        read_from: first_article or last_article
+        use: selects service decoder
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w3c s2.2
+      - name: sub_data
+        where: SubData = HEAD_SIZE - NAME_SIZE - 32 (minus 8 if salt) bytes after name
+        type: bytes
+        read_from: first_article or last_article
+        use: service-specific payload
+        proves: tool
+        leak: true
+        status: VERIFIED
+        source: w3c s2.2
+      - name: sub_stm
+        where: 'STM: stream name + UnpSize + StreamCRC in SubData (Zone.Identifier)'
+        type: record
+        read_from: last_article
+        use: NTFS stream name and body (MOTW)
+        proves: alt
+        leak: true
+        status: VERIFIED
+        source: w8c d; w1a
+      - name: sub_uow
+        where: 'UOW: owner name (256), group name (256), uid, gid'
+        type: record
+        read_from: first_article
+        use: Unix owner leak
+        proves: same_uploader
+        leak: true
+        status: VERIFIED
+        source: w5c s3.3
+      - name: sub_acl_qo_av_layouts
+        where: ACL (SD payload), QO and AV subheader payloads
+        type: record
+        read_from: last_article
+        use: ACL owner; QO list; -qo leak
+        proves: same_uploader
+        leak: true
+        status: UNVERIFIED
+        source: w5c s3.2; w3c s2.2
+      protect_block:
+      - name: protect_data_size
+        where: 'PROTECT 0x78: uint32 @+7 = recovery bytes after header (skip)'
+        type: uint32
+        read_from: last_article
+        use: recovery record size
+        proves: tool
+        leak: true
+        status: VERIFIED
+        source: w3c s2.1
+      - name: protect_version
+        where: '@+11 byte: RR format version'
+        type: uint8
+        read_from: last_article
+        use: RR format
+        proves: tool
+        leak: true
+        status: VERIFIED
+        source: w3c s2.1
+      - name: protect_sectors_total
+        where: '@+12 uint16 RecSectors; @+14 uint32 TotalBlocks'
+        type: uint16
+        read_from: last_article
+        use: recovery sectors and protected blocks
+        proves: tool
+        leak: true
+        status: VERIFIED
+        source: w3c s2.1
+      - name: protect_mark
+        where: '@+18 8 bytes Mark; literal ''Protect!'' not confirmed'
+        type: bytes8
+        read_from: last_article
+        use: identifies PROTECT block
+        proves: none
+        leak: false
+        status: UNVERIFIED
+        source: w3c s2.1; w8c b
+      - name: protect_percent
+        where: RecSectors / TotalBlocks as percent (formula not confirmed)
+        type: derived
+        read_from: last_article
+        use: -rr percentage
+        proves: tool
+        leak: true
+        status: UNVERIFIED
+        source: w8c b
+      comment_old:
+      - name: old_cmt_block
+        where: 'CMT 0x75: uint16 UnpSize, UnpVer byte, Method byte, CRC16; body follows 13-byte header'
+        type: record
+        read_from: first_article
+        use: legacy RAR 2.x comment
+        proves: same_uploader
+        leak: true
+        status: VERIFIED
+        source: w3c s2.3
+      end_of_archive:
+      - name: endarc_flags
+        where: '@hdr+3 uint16: 0x1 NEXT_VOLUME, 0x2 DATACRC, 0x4 REVSPACE, 0x8 VOLNUMBER'
+        type: uint16
+        read_from: last_article
+        use: next-part test
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1a s12
+      - name: endarc_crc_volnum
+        where: DATACRC uint32 (volume CRC to end block) and VOLNUMBER uint16 (byte order not confirmed)
+        type: uint32
+        read_from: last_article
+        use: whole-volume CRC; part number
+        proves: twin
+        leak: false
+        status: UNVERIFIED
+        source: w1a s12
+      encryption_hp:
+      - name: hp_block_salt
+        where: 8 clear bytes before each encrypted block (-hp)
+        type: bytes8
+        read_from: first_article
+        use: per-block KDF salt; cannot link volumes
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w7b s2.2
+      - name: hp_kdf
+        where: SHA-1 over UTF-16LE password + salt, 262144 rounds; AES-128-CBC key and IV
+        type: derived
+        read_from: first_article
+        use: password test cost about 4-20 ms
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w7b s2.3; w8c g
+      - name: hp_kdf_rar29_variant
+        where: sha1_process_rar29 vs standard SHA-1 difference
+        type: derived
+        read_from: first_article
+        use: exact KDF body
+        proves: none
+        leak: false
+        status: UNVERIFIED
+        source: w8c g
+      - name: hp_password_test
+        where: decrypt first block, check HEAD_CRC (GetCRC15); no check value stored
+        type: derived
+        read_from: first_article
+        use: password test
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w7b s2.4
+    partial_decode:
+      codec: RAR 2.9 LZ and PPMd (rar29); RAR 1.5 and 2.0 separate
+      crate: rars 0.12.3 codec::rar29 Unpack29
+      result: about 1:1 prefix at 1 MiB granularity; RAR 2.0 eager read (needs patch); solid members need predecessors
+    rust:
+      parse: hand-written (proto/rar_meta.rs)
+      decode: rars 0.12.3 codec::rar29 direct
+      crypto: sha1 (rar29 KDF) + aes-128 cbc
+  sevenz:
+    detect:
+      magic: 37 7A BC AF 27 1C
+      offset: 0
+    structures:
+      start_header:
+      - name: signature
+        where: 'bytes 0-5: 37 7A BC AF 27 1C'
+        type: bytes6
+        read_from: first_article
+        use: format detection; SFX search key
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1b s2
+      - name: version
+        where: byte 6 major (0; reader checks), byte 7 minor (0x04 = 7-Zip 9.x+ writer)
+        type: uint8
+        read_from: first_article
+        use: writer hint
+        proves: tool
+        leak: true
+        status: VERIFIED
+        source: w1b s2
+      - name: start_header_crc
+        where: '@8 uint32 CRC32 over bytes 12-31'
+        type: uint32
+        read_from: first_article
+        use: validates start header from article 1
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1b s2
+      - name: next_header_offset
+        where: '@12 uint64 LE; relative to byte 32 (absolute = 32 + value)'
+        type: uint64
+        read_from: first_article
+        use: points at tail header (last article)
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1b s2
+      - name: next_header_size
+        where: '@20 uint64 LE; length of next-header block'
+        type: uint64
+        read_from: first_article
+        use: exact tail fetch length
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1b s2
+      - name: next_header_crc
+        where: '@28 uint32 CRC32 of next-header block'
+        type: uint32
+        read_from: first_article
+        use: verify tail fetch; fingerprint
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1b s2
+      - name: start_header_zeroed_recovery
+        where: 'zeroed start header: reader scans last 512 bytes for header markers'
+        type: derived
+        read_from: last_article
+        use: recover damaged posts
+        proves: none
+        leak: false
+        status: UNVERIFIED
+        source: w1b s2 (partial)
+      - name: sfx_signature_search
+        where: signature at non-zero offset with valid start CRC = SFX or prefixed
+        type: derived
+        read_from: first_article
+        use: prefixed or obfuscated posts
+        proves: none
+        leak: false
+        status: UNVERIFIED
+        source: w1b s2 (partial)
+      next_header:
+      - name: next_header_first_byte
+        where: 0x01 kHeader (plain) or 0x17 kEncodedHeader
+        type: uint8
+        read_from: last_article
+        use: plain or packed header branch
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1b s3
+      - name: encoded_header_streams
+        where: 'kEncodedHeader: one-folder StreamsInfo; decoded output must start 0x01'
+        type: record
+        read_from: last_article
+        use: header decode pipeline
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1b s3
+      - name: encoded_header_plain_aes
+        where: 'with -mhe=on: AES coder 06F10701 and its props visible in plaintext'
+        type: record
+        read_from: last_article
+        use: encrypted-header archive without password
+        proves: tool
+        leak: true
+        status: VERIFIED
+        source: w1b s3; w7b s3.5
+      - name: encoded_header_folder_crc
+        where: CRC32 of decoded header (folder digest)
+        type: uint32
+        read_from: last_article
+        use: per-archive key across reposts
+        proves: twin
+        leak: false
+        status: VERIFIED
+        source: w1b s10
+      streams_info:
+      - name: pack_pos
+        where: 'kPackInfo PackPos: first packed stream offset, relative to byte 32'
+        type: uint64
+        read_from: last_article
+        use: absolute packed data position
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1b s5.3
+      - name: pack_sizes
+        where: kSize per packed stream
+        type: uint64
+        read_from: last_article
+        use: byte range per folder input -> articles
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1b s5.3
+      - name: pack_crcs
+        where: kCRC Digests of packed streams
+        type: uint32
+        read_from: last_article
+        use: integrity only with the full stream
+        proves: twin
+        leak: false
+        status: VERIFIED
+        source: w1b s5.3
+      - name: folder_list
+        where: 'kFolder: NumFolders; External byte must be 0'
+        type: record
+        read_from: last_article
+        use: coder graph per folder
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1b s5.4
+      - name: coder_flags_and_id
+        where: coder flags byte (id size, complex, props bit) + method id bytes
+        type: record
+        read_from: last_article
+        use: decode pipeline
+        proves: tool
+        leak: true
+        status: VERIFIED
+        source: w1b s5.5
+      - name: bind_pairs_packed_streams
+        where: NumBindPairs = out-1; packed stream indices
+        type: record
+        read_from: last_article
+        use: coder chain wiring
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1b s5.5
+      - name: coders_unpack_size
+        where: kCodersUnPackSize per coder output
+        type: uint64
+        read_from: last_article
+        use: unpacked size of each coder output
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1b s5.4
+      - name: folder_crc
+        where: kCRC of each folder final output
+        type: uint32
+        read_from: last_article
+        use: folder integrity; twin key
+        proves: twin
+        leak: false
+        status: VERIFIED
+        source: w1b s5.4
+      - name: substream_counts
+        where: kNumUnPackStream per folder (files in solid block)
+        type: uint64
+        read_from: last_article
+        use: files per solid block
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1b s5.6
+      - name: substream_sizes
+        where: 'kSize: N-1 sizes per folder; last = folder size minus sum'
+        type: uint64
+        read_from: last_article
+        use: per-file offsets in folder
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1b s5.6
+      - name: substream_crcs
+        where: per-file CRC32 (single-substream folder inherits folder CRC)
+        type: uint32
+        read_from: last_article
+        use: per-file CRC (needs full file)
+        proves: twin
+        leak: false
+        status: VERIFIED
+        source: w1b s5.6
+      - name: file_order_in_header
+        where: dirs, then empty files, then data files in add order; no type sort by default
+        type: derived
+        read_from: last_article
+        use: which files sit in solid block 1
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: log W4B (7zHandlerOut)
+      files_info:
+      - name: files_num
+        where: 'NUMBER: NumFiles'
+        type: uint64
+        read_from: last_article
+        use: file count
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1b s5.7
+      - name: empty_stream
+        where: 'kEmptyStream bitfield: no data stream (dir or empty file)'
+        type: bitfield
+        read_from: last_article
+        use: separates dirs and empty entries
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1b s5.7
+      - name: empty_file
+        where: 'kEmptyFile bitfield over empty-stream entries: empty file vs dir'
+        type: bitfield
+        read_from: last_article
+        use: directory vs empty file
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1b s5.7
+      - name: anti_items
+        where: 'kAnti bitfield: deletion marker (update archives)'
+        type: bitfield
+        read_from: last_article
+        use: rare; deletion flag
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1b s5.7
+      - name: names
+        where: 'kName: external byte, then NUL-terminated UTF-16LE per file; ''/'' separator'
+        type: utf16le
+        read_from: last_article
+        use: file path and packer directory tree
+        proves: same_uploader
+        leak: true
+        status: VERIFIED
+        source: w1b s5.7; w5c s4.4
+      - name: ctime_atime
+        where: 'kCTime / kATime: fixed 8-byte FILETIME per defined file (UTC); presence follows -mtc/-mta'
+        type: filetime
+        read_from: last_article
+        use: UTC times; presence reflects packer flags
+        proves: same_uploader
+        leak: true
+        status: VERIFIED
+        source: w1b s5.7
+      - name: mtime
+        where: 'kMTime: fixed 8-byte FILETIME per file (UTC)'
+        type: filetime
+        read_from: last_article
+        use: UTC mtime; compare to Usenet Date
+        proves: same_uploader
+        leak: true
+        status: VERIFIED
+        source: w5c s1.9
+      - name: win_attributes
+        where: 'kWinAttrib: UINT32 per file; low 16 bits Windows attrs'
+        type: uint32
+        read_from: last_article
+        use: dir, hidden, archive bits
+        proves: tool
+        leak: true
+        status: VERIFIED
+        source: w1b s5.7; w5c s6.6
+      - name: attr_unix_mode
+        where: bit 0x8000 = Unix extension; high 16 bits = st_mode
+        type: derived
+        read_from: last_article
+        use: symlink, permissions, umask
+        proves: tool
+        leak: true
+        status: VERIFIED
+        source: w5c s3.8
+      - name: start_pos
+        where: kStartPos per defined file (rare)
+        type: uint64
+        read_from: last_article
+        use: rare; ignore unless seen
+        proves: none
+        leak: false
+        status: UNVERIFIED
+        source: w1b s5.7
+      - name: dummy_padding
+        where: 'kDummy 0x19: zero padding; nonzero bytes = header error'
+        type: bytes
+        read_from: last_article
+        use: 7-Zip-style writer fingerprint
+        proves: tool
+        leak: true
+        status: VERIFIED
+        source: w8c h; w5c s6.7
+      - name: comment_record
+        where: 'kComment 0x16: skipped as unknown property'
+        type: record
+        read_from: last_article
+        use: not parsed
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w8c h
+      - name: archive_properties
+        where: 'kArchiveProperties 0x02 and kAdditionalStreamsInfo 0x03: skip or external data'
+        type: record
+        read_from: last_article
+        use: rare external names and times
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1b s5.1-5.2
+      - name: external_flag
+        where: External byte (0 inline) on name, time and attribute vectors
+        type: uint8
+        read_from: last_article
+        use: 7-Zip writes 0
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1b s5.7
+      coders:
+      - name: lzma_props
+        where: 'LZMA 030101: byte0 = (pb*5+lp)*9+lc (0x5D default); dict uint32 LE'
+        type: record
+        read_from: last_article
+        use: lc/lp/pb and dict = settings fingerprint
+        proves: tool
+        leak: true
+        status: VERIFIED
+        source: w1b s6.2
+      - name: lzma2_props
+        where: 'LZMA2 21: 1 byte dictionary code'
+        type: uint8
+        read_from: last_article
+        use: dict size (formula not confirmed)
+        proves: tool
+        leak: true
+        status: VERIFIED
+        source: w1b s6
+      - name: ppmd_props
+        where: 'PPMd 030401: order byte + memSize uint32 LE'
+        type: record
+        read_from: last_article
+        use: PPMd order and memory
+        proves: tool
+        leak: true
+        status: VERIFIED
+        source: w1b s6
+      - name: copy_method
+        where: 'COPY 00: store (-mx0); packed == unpacked'
+        type: derived
+        read_from: first_article
+        use: 'file i at 32+PackPos+sum(prior sizes): inner MKV readable'
+        proves: tool
+        leak: true
+        status: VERIFIED
+        source: w1b s8
+      - name: branch_filters
+        where: BCJ x86 03030103, PPC 03030205, IA64 03030401, ARM 03030501, ARMT 03030701, SPARC 03030805, ARM64 0A, RISC-V 0B
+        type: derived
+        read_from: last_article
+        use: filter chain; newer 7-Zip versions add ARM64 and RISC-V
+        proves: tool
+        leak: true
+        status: VERIFIED
+        source: w1b s6; log W8A
+      - name: bcj2_and_delta
+        where: 'BCJ2 0303011B (4 in-streams); Delta 03 (1 byte: distance-1)'
+        type: derived
+        read_from: full
+        use: partial decode harder for BCJ2
+        proves: tool
+        leak: true
+        status: VERIFIED
+        source: w1b s6
+      - name: deflate_bzip2_ids
+        where: Deflate 040108, BZip2 040202, Deflate64 040109 (footnotes disagree)
+        type: derived
+        read_from: last_article
+        use: method ids
+        proves: tool
+        leak: true
+        status: VERIFIED
+        source: w1b s6
+      - name: fork_codec_ids
+        where: ZSTD 04F71101, Brotli 04F71102, LZ4 04F71104, LZS 04F71105, Lizard 04F71106 (fork ids)
+        type: derived
+        read_from: last_article
+        use: non-stock codecs
+        proves: tool
+        leak: true
+        status: UNVERIFIED
+        source: w1b s6
+      - name: aes_props
+        where: '06F10701 props: byte0 bits 0-5 cycles power, 0x40 IV, 0x80 salt; byte1 nibbles; then salt, IV'
+        type: record
+        read_from: last_article
+        use: encryption detect without password
+        proves: tool
+        leak: true
+        status: VERIFIED
+        source: w1b s6.1; w7b s3.1
+      - name: aes_cycles_power
+        where: NumCyclesPower (7-Zip default 19 = 2^19 SHA-256 rounds)
+        type: derived
+        read_from: last_article
+        use: KDF cost; default fingerprint
+        proves: tool
+        leak: true
+        status: VERIFIED
+        source: w7b s3.1
+      - name: aes_iv
+        where: 16-byte random IV per AES coder; no salt by default (7-Zip encoder)
+        type: bytes16
+        read_from: last_article
+        use: per-archive twin key across volumes
+        proves: twin
+        leak: true
+        status: VERIFIED
+        source: w7b s3.1, s3.3
+      - name: aes_password_encoding
+        where: password encoded as UTF-16LE bytes, no BOM
+        type: derived
+        read_from: last_article
+        use: password test input encoding
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w8c h
+      - name: other_crypto_ids
+        where: ZipCrypto 06F10101, RAR29 crypto 06F10303
+        type: derived
+        read_from: last_article
+        use: legacy encryption ids
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1b s6
+      - name: multivolume_logical_offsets
+        where: '7z split (.7z.001...): offsets in logical stream; equal volume size assumed'
+        type: derived
+        read_from: last_article
+        use: locate the volume holding the header
+        proves: none
+        leak: false
+        status: UNVERIFIED
+        source: w1b s7
+    partial_decode:
+      codec: LZMA2 and LZMA1 from offset 32 (+ BCJ and Delta chains)
+      crate: lzma-rust2 0.25 Lzma2Reader (64 MiB dict)
+      result: 'SOLVED for first folder: 10% packed -> 786 KB correct; MKV magic check; BCJ2 untested'
+    rust:
+      parse: hand-written (proto/sevenz_zip_meta.rs)
+      decode: lzma-rust2 0.25 Lzma2Reader + filter::bcj/delta
+      crypto: sha2 (7z KDF) + aes-256 cbc
+  zip:
+    detect:
+      magic: 50 4B 03 04
+      offset: 0
+      variants: 50 4B 05 06 (empty), 50 4B 07 08 (spanned marker)
+    structures:
+      local_file_header:
+      - name: lfh_version_needed
+        where: '@4 uint16: 20, 45 (zip64), 46 (bzip2), 51 (AES), 63 (LZMA/PPMd)'
+        type: uint16
+        read_from: first_article
+        use: feature check (zip64, AES)
+        proves: tool
+        leak: true
+        status: VERIFIED
+        source: w1c s1.1
+      - name: lfh_gp_flags
+        where: '@6 uint16: bit0 encrypted, bit3 data descriptor, bit6 strong, bit11 UTF-8, bit13 CD masking; bits1-2 deflate mode'
+        type: uint16
+        read_from: first_article
+        use: encryption, streaming writer, name encoding
+        proves: tool
+        leak: true
+        status: VERIFIED
+        source: w1c s1.7
+      - name: lfh_method
+        where: '@8 uint16: 0 store, 8 deflate, 9 deflate64, 12 bzip2, 14 LZMA, 93 zstd, 95 xz, 98 PPMd, 99 AE-x'
+        type: uint16
+        read_from: first_article
+        use: codec; 99 = real method in 0x9901
+        proves: tool
+        leak: true
+        status: VERIFIED
+        source: w1c s1.8
+      - name: lfh_dos_time_date
+        where: '@10 time (h<<11|m<<5|s/2), @12 date; local clock, 2 s'
+        type: uint32
+        read_from: first_article
+        use: local clock (no zone)
+        proves: same_uploader
+        leak: true
+        status: VERIFIED
+        source: w5c s1.3
+      - name: lfh_crc32
+        where: '@14 uint32; 0 when data descriptor bit set'
+        type: uint32
+        read_from: first_article
+        use: content fingerprint
+        proves: twin
+        leak: false
+        status: VERIFIED
+        source: w1c s1.1
+      - name: lfh_sizes
+        where: '@18 compressed, @22 uncompressed (0xFFFFFFFF = see zip64 extra)'
+        type: uint32
+        read_from: first_article
+        use: file size without download
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1c s1.1
+      - name: lfh_name_extra_len
+        where: '@26 uint16 name length; @28 uint16 extra length'
+        type: uint16
+        read_from: first_article
+        use: bounds name and extra
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1c s1.1
+      - name: lfh_name
+        where: '@30 name: CP437 unless UTF-8 bit or 0x7075 present'
+        type: bytes
+        read_from: first_article
+        use: entry path
+        proves: same_uploader
+        leak: true
+        status: VERIFIED
+        source: w1c s1.1
+      - name: lfh_encryption_header
+        where: 'after extra: ZipCrypto 12-byte header, or AE-x salt + 2-byte verifier'
+        type: bytes
+        read_from: first_article
+        use: encryption present; password test input
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w7b s4
+      - name: data_descriptor
+        where: 'after data when bit 3: sig 0x08074B50 + CRC + comp + uncomp (12 B without sig)'
+        type: record
+        read_from: last_article
+        use: real CRC and sizes for bit-3 entries
+        proves: twin
+        leak: false
+        status: VERIFIED
+        source: w1c s1.2
+      - name: data_descriptor_zip64
+        where: 'zip64 variant: 24 B with sig, 20 B without (8-byte sizes)'
+        type: record
+        read_from: last_article
+        use: zip64 real sizes
+        proves: none
+        leak: false
+        status: UNVERIFIED
+        source: w1c s1.2
+      extras:
+      - name: extra_zip64_0001
+        where: '0x0001: uncompressed, compressed, offset, disk (only where base field is 0xFFFFFFFF)'
+        type: record
+        read_from: first_article (local) / last_article (CD)
+        use: true sizes and offsets over 4 GiB
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1c s1.5
+      - name: extra_ntfs_000a
+        where: '0x000a: reserved 4, tag 0x0001 size 24: mtime, atime, ctime as FILETIME (100 ns, UTC)'
+        type: record
+        read_from: first_article
+        use: high-precision UTC; Windows writer fingerprint
+        proves: tool
+        leak: true
+        status: VERIFIED
+        source: w2c s1
+      - name: extra_ut_5455
+        where: '0x5455: flags byte (bit0 mtime, bit1 atime, bit2 ctime), Unix seconds; CD may carry mtime only'
+        type: record
+        read_from: first_article (local) / last_article (CD)
+        use: UTC time; pairs with DOS time for tz offset
+        proves: same_uploader
+        leak: true
+        status: VERIFIED
+        source: w2c s1
+      - name: extra_ux_7875
+        where: '0x7875: version 1, UID size + UID, GID size + GID (2 or 4 bytes)'
+        type: record
+        read_from: first_article / last_article
+        use: numeric uid and gid of packer
+        proves: same_uploader
+        leak: true
+        status: VERIFIED
+        source: w2c s1
+      - name: extra_ux_5855
+        where: '0x5855: atime, mtime (LE32), uid and gid LE16 if size >= 12'
+        type: record
+        read_from: first_article / last_article
+        use: UTC times and ids (old Info-ZIP)
+        proves: same_uploader
+        leak: true
+        status: VERIFIED
+        source: w2c s1
+      - name: extra_unix_000d
+        where: '0x000d PKWARE Unix: atime, mtime, uid (LE16), gid (LE16), optional tail'
+        type: record
+        read_from: first_article
+        use: UTC times and ids
+        proves: same_uploader
+        leak: true
+        status: VERIFIED
+        source: w2c s1
+      - name: extra_unicode_path_7075
+        where: '0x7075: version 1, CRC32 of header name, UTF-8 name; ignore on CRC mismatch'
+        type: record
+        read_from: first_article / last_article
+        use: true UTF-8 name
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w2c s1
+      - name: extra_unicode_comment_6375
+        where: '0x6375: version 1, CRC32 of CD comment, UTF-8 comment; ignore on CRC mismatch'
+        type: record
+        read_from: last_article
+        use: Unicode comment
+        proves: same_uploader
+        leak: true
+        status: VERIFIED
+        source: w8c e
+      - name: aes_vendor_version
+        where: '0x9901 at +0 uint16 LE: 1 = AE-1 (CRC kept), 2 = AE-2 (CRC zero)'
+        type: uint16
+        read_from: first_article (local) / last_article (CD)
+        use: AE-1 vs AE-2 (CRC availability)
+        proves: tool
+        leak: true
+        status: VERIFIED
+        source: w8c e
+      - name: aes_vendor_id
+        where: '0x9901 at +2: ASCII ''AE'''
+        type: ascii2
+        read_from: first_article
+        use: confirms WinZip AES extra
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w2c s1
+      - name: aes_strength
+        where: '0x9901 at +4: 1 = AES-128 (salt 8), 2 = AES-192 (salt 12), 3 = AES-256 (salt 16)'
+        type: uint8
+        read_from: first_article
+        use: key and salt sizes
+        proves: tool
+        leak: true
+        status: VERIFIED
+        source: w7b s4.2
+      - name: aes_actual_method
+        where: '0x9901 at +5 uint16 LE: real compression method (libarchive reads 1 byte: bug)'
+        type: uint16
+        read_from: first_article
+        use: real codec behind method 99
+        proves: tool
+        leak: true
+        status: VERIFIED
+        source: w8c e
+      - name: ae2_crc_zero
+        where: AE-2 stores CRC32 = 0; CRC is not checked
+        type: derived
+        read_from: first_article
+        use: no CRC fingerprint for AE-2
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w2c s1
+      - name: extra_strong_encryption_0017
+        where: 0x0017 strong encryption header (GP bit 6)
+        type: record
+        read_from: first_article
+        use: strong encryption detect (rare)
+        proves: none
+        leak: false
+        status: UNVERIFIED
+        source: w1c s1.6
+      - name: extra_other_ids
+        where: 'other IDs: 0x0007, 0x0009, 0x000C, 0x0014-0x0023, 0x0065-0x0066, 0x4453, 0x4690, 0x4B46, 0x5855, 0x6375, 0x7855, 0x9902, 0xA11E, 0xCAFE'
+        type: record
+        read_from: first_article
+        use: platform fingerprints
+        proves: tool
+        leak: true
+        status: VERIFIED
+        source: w1c s1.6
+      central_directory:
+      - name: cd_version_made_by
+        where: 'CD @4 uint16: upper byte host OS (3 UNIX, 10 NTFS, 11 MVS, 14 VFAT, 19 OS X), lower byte spec version'
+        type: uint16
+        read_from: last_article
+        use: strongest zip packer fingerprint
+        proves: tool
+        leak: true
+        status: VERIFIED
+        source: w1c s1.9; w5c s6.4
+      - name: cd_external_attr
+        where: 'CD @38 uint32: low byte DOS attrs; host 3: high 16 bits = st_mode'
+        type: uint32
+        read_from: last_article
+        use: unix mode, symlink, dir
+        proves: tool
+        leak: true
+        status: VERIFIED
+        source: w5c s6.5
+      - name: cd_internal_attr_disk_start
+        where: CD @36 internal attrs (bit0 text); @34 disk start (0xFFFF = zip64)
+        type: uint16
+        read_from: last_article
+        use: text flag; which disk holds entry
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1c s1.3
+      - name: cd_relative_offset
+        where: CD @42 uint32 local header offset (0xFFFFFFFF = zip64 extra)
+        type: uint32
+        read_from: last_article
+        use: locate local header and data
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1c s1.3
+      - name: cd_entry_comment
+        where: 'CD comment: length @32 uint16; text after name and extra'
+        type: bytes
+        read_from: last_article
+        use: per-entry note
+        proves: same_uploader
+        leak: true
+        status: VERIFIED
+        source: w1c s1.3
+      eocd_and_zip64:
+      - name: eocd_record
+        where: 'EOCD 0x06054B50 (22 B): disk numbers, entries, CD size @12, CD offset @16, comment length @20'
+        type: record
+        read_from: last_article
+        use: CD location; entry count; spanned disk
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1c s1.4
+      - name: eocd_comment
+        where: 'EOCD comment after 22 B: packer name or release note'
+        type: bytes
+        read_from: last_article
+        use: packer name, group note
+        proves: same_uploader
+        leak: true
+        status: VERIFIED
+        source: w1c s1.4; w5c s5.4
+      - name: zip64_eocd
+        where: Zip64 EOCD 0x06064B50 (56 B) and locator 0x07064B50 (20 B, just before EOCD)
+        type: record
+        read_from: last_article
+        use: CD in zip64 archives; locator is the cheap entry point
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1c s1.5
+      - name: split_disk_fields
+        where: 'EOCD and locator disk fields: total disks and CD disk (spanned zips)'
+        type: derived
+        read_from: last_article
+        use: volume count for spanned zip
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1c s1.12
+      - name: split_raw_zip001
+        where: 'raw slices of one zip (7-Zip -tzip -v): concatenate before parsing'
+        type: derived
+        read_from: separate_file
+        use: reassemble zip from .001 parts
+        proves: none
+        leak: false
+        status: UNVERIFIED
+        source: w1c s2.1
+      - name: split_z01_naming
+        where: PKWARE spanned .z01..zNN plus final .zip naming
+        type: derived
+        read_from: separate_file
+        use: spanned naming
+        proves: none
+        leak: false
+        status: UNVERIFIED
+        source: w1c s1.12
+      - name: tz_offset_dos_vs_ut
+        where: 'DOS local time minus UT or NTFS UTC: packer UTC offset (about 2 s, DST ambiguous)'
+        type: derived
+        read_from: first_article
+        use: uploader timezone
+        proves: same_uploader
+        leak: true
+        status: UNVERIFIED
+        source: w5c s1.11
+      encryption:
+      - name: zipcrypto_check_byte
+        where: 12-byte header last byte = crc>>8 (or DOS time high byte with bit 3); 1/256 false positive
+        type: uint8
+        read_from: first_article
+        use: cheap password test
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w7b s4.1
+      - name: winzip_aes_salt_verifier
+        where: salt 8/12/16 bytes by strength, then 2-byte verifier; PBKDF2-SHA1 x1000
+        type: bytes
+        read_from: first_article
+        use: per-entry salt; password test
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w7b s4.2
+    partial_decode:
+      codec: deflate (method 8); stored (0)
+      crate: flate2 1.1.10
+      result: about 1:1 prefix from first articles; LZMA and zstd entries untested
+    rust:
+      parse: hand-written (proto/sevenz_zip_meta.rs); rc-zip is the sans-io option
+      decode: flate2 1.1.10
+      crypto: pbkdf2+hmac+sha1 (WinZip AES); ZipCrypto by hand
+  par2:
+    detect:
+      magic: 50 41 52 32 00 50 4B 54
+      offset: 0
+      note: per packet
+    structures:
+      packet_header:
+      - name: packet_magic
+        where: '@0 8 bytes: ''PAR2'' NUL ''PKT'' = 50 41 52 32 00 50 4B 54 (every packet)'
+        type: bytes8
+        read_from: first_article or separate_file
+        use: find packets anywhere
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1c s3.1
+      - name: packet_length
+        where: '@8 uint64 LE; multiple of 4; includes 64-byte header'
+        type: uint64
+        read_from: first_article
+        use: packet bounds
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1c s3.1
+      - name: packet_md5
+        where: '@16 MD5 over bytes 32..end of packet'
+        type: bytes16
+        read_from: first_article
+        use: validate each packet on its own
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1c s3.1
+      - name: recovery_set_id
+        where: '@32 16 bytes: MD5 of Main packet body'
+        type: bytes16
+        read_from: first_article
+        use: joins packets of one set
+        proves: twin
+        leak: false
+        status: VERIFIED
+        source: w1c s3.1
+      - name: packet_type
+        where: '@48 16 bytes ASCII: Main, FileDesc, IFSC, RecvSlic, Creator, UniFileN, CommASCI, CommUni, FileSlic, RFSC, PkdMain, PkdRecvS'
+        type: ascii16
+        read_from: first_article
+        use: packet dispatch
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1c s3.2
+      packets:
+      - name: main_slice_size
+        where: 'Main body @0 uint64: block size (multiple of 4)'
+        type: uint64
+        read_from: first_article
+        use: needed for every slice calculation
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1c s3.3
+      - name: main_file_ids
+        where: 'Main body: N recovery-set file IDs (sorted), then non-recovery IDs'
+        type: bytes16 list
+        read_from: first_article
+        use: set membership
+        proves: alt
+        leak: false
+        status: VERIFIED
+        source: w1c s3.3
+      - name: fd_file_id
+        where: FileDesc @0 16 bytes = MD5(MD5-16k || length LE8 || name)
+        type: bytes16
+        read_from: first_article
+        use: join packets to a file
+        proves: alt
+        leak: false
+        status: VERIFIED
+        source: w1c s3.3
+      - name: fd_file_md5
+        where: FileDesc @16 MD5 of entire file
+        type: bytes16
+        read_from: full
+        use: whole-file verify
+        proves: twin
+        leak: false
+        status: VERIFIED
+        source: w1c s3.3
+      - name: fd_md5_16k
+        where: FileDesc @32 MD5 of first 16 KiB; matches article 1
+        type: bytes16
+        read_from: first_article
+        use: identify file from first article
+        proves: twin
+        leak: false
+        status: VERIFIED
+        source: w1c s3.3
+      - name: fd_file_length
+        where: FileDesc @48 uint64 file length
+        type: uint64
+        read_from: first_article
+        use: file size without the file
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1c s3.3
+      - name: fd_file_name
+        where: FileDesc @56 ASCII name, zero padded; directories with '/'
+        type: ascii
+        read_from: first_article
+        use: file name and directory layout
+        proves: same_uploader
+        leak: true
+        status: VERIFIED
+        source: w1c s3.3; w5c s4.5
+      - name: ifsc_slice_checksums
+        where: 'IFSC: file ID, then per slice MD5 (16) + CRC32 (4); last slice zero-filled'
+        type: record
+        read_from: first_article per slice
+        use: per-slice match of a partial file
+        proves: twin
+        leak: false
+        status: VERIFIED
+        source: w1c s3.3
+      - name: ifsc_whole_file_crc32
+        where: whole-file CRC32 from IFSC CRCs via crc32 combine and zero-unpad algebra
+        type: derived
+        read_from: full (IFSC packet)
+        use: content CRC without the file
+        proves: twin
+        leak: false
+        status: VERIFIED
+        source: log W6C
+      - name: recovery_slice
+        where: 'RecvSlic: uint32 exponent + recovery data (large; skip)'
+        type: record
+        read_from: separate_file
+        use: recovery block count and index
+        proves: tool
+        leak: false
+        status: VERIFIED
+        source: w1c s3.3
+      - name: creator_text
+        where: 'Creator packet: ASCII text naming client and contact'
+        type: ascii
+        read_from: first_article
+        use: packer fingerprint
+        proves: tool
+        leak: true
+        status: VERIFIED
+        source: w1c s3.3
+      - name: creator_par2cmdline
+        where: '''Created by PACKAGE version VERSION.'' (one copy per recovery volume)'
+        type: ascii
+        read_from: first_article
+        use: par2cmdline version
+        proves: tool
+        leak: true
+        status: VERIFIED
+        source: log W2B
+      - name: creator_parpar
+        where: '''ParPar v<ver> <arch> [url]'': leaks CPU arch'
+        type: ascii
+        read_from: first_article
+        use: ParPar version and CPU arch
+        proves: tool
+        leak: true
+        status: VERIFIED
+        source: log W2B
+      - name: creator_other_clients
+        where: MultiPar, QuickPar, phpar2, turbo creator strings
+        type: ascii
+        read_from: first_article
+        use: client fingerprint
+        proves: tool
+        leak: true
+        status: UNVERIFIED
+        source: w1c s3.5
+      - name: uni_file_name
+        where: 'UniFileN packet: Unicode name (ParPar writes it only for non-ASCII names)'
+        type: utf8
+        read_from: first_article
+        use: non-ASCII name
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: log W2B
+      - name: comm_ascii
+        where: 'CommASCI packet: ASCII comment text'
+        type: ascii
+        read_from: first_article
+        use: packer note
+        proves: same_uploader
+        leak: true
+        status: VERIFIED
+        source: w5c s5.7
+      - name: comm_unicode
+        where: 'CommUni packet: MD5 of ASCII comment + UTF-8 text'
+        type: record
+        read_from: first_article
+        use: edited comment detection
+        proves: same_uploader
+        leak: true
+        status: VERIFIED
+        source: w5c s5.8
+      - name: file_slice_packet
+        where: 'FileSlic: file ID, slice index, slice data (large)'
+        type: record
+        read_from: separate_file
+        use: raw data slice
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1c s3.3
+      - name: rfsc_packet
+        where: 'RFSC: per-recovery-slice checksums (spec says never used)'
+        type: record
+        read_from: separate_file
+        use: rarely present
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1c s3.3
+      - name: packed_packets
+        where: 'PkdMain / PkdRecvS: packed forms of Main and RecvSlic'
+        type: record
+        read_from: separate_file
+        use: rarely produced
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1c s3.3
+      - name: par3_draft
+        where: PAR3 magic 'PAR3' NUL 'PKT', BLAKE3 fingerprints, 8-byte types (alpha draft)
+        type: record
+        read_from: separate_file
+        use: rare; detect only
+        proves: tool
+        leak: true
+        status: UNVERIFIED
+        source: w1c s3.7
+      - name: par2_naming
+        where: index 'name.par2' (no recovery data) vs 'name.volNNN+MM.par2' (recovery)
+        type: derived
+        read_from: separate_file
+        use: index vs recovery sidecar
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1c s3.6
+    partial_decode:
+      codec: none
+      crate: none
+      result: not applicable; packets are plain
+    rust:
+      parse: hand-written (proto/par2_sfv_srr_meta.rs)
+      decode: none
+      crypto: md-5 + crc32fast
+  sfv:
+    detect:
+      magic: none (text)
+      offset: 0
+      note: 'lines: NAME CRC32'
+    structures:
+      lines:
+      - name: sfv_entry
+        where: '''FILENAME'' + one or more spaces + 8 hex CRC32 per line'
+        type: ascii
+        read_from: separate_file
+        use: file names and CRC32 (same CRC as zip and IFSC)
+        proves: twin
+        leak: false
+        status: VERIFIED
+        source: w1c s4.1
+      - name: sfv_comment
+        where: lines starting with ';' (e.g. '; This is a comment')
+        type: ascii
+        read_from: separate_file
+        use: comments
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1c s4.1
+      - name: sfv_generator_header
+        where: '''; Generated by <tool> ... on <date>'' (QuickSFV, cksfv, RapidCRC, pyReScene)'
+        type: ascii
+        read_from: separate_file
+        use: generator, version, local clock
+        proves: tool
+        leak: true
+        status: UNVERIFIED
+        source: w1c s4.1; w5c s5.9
+      - name: sfv_md5_sha1_variants
+        where: .md5 (HEX32, two spaces) and .sha1 (40 hex) sidecar variants
+        type: ascii
+        read_from: separate_file
+        use: alt checksum sidecars
+        proves: none
+        leak: false
+        status: UNVERIFIED
+        source: w1c s4.1
+      - name: nfo_sidecar
+        where: NFO release text (CP437, ANSI art); inside archive or as sidecar
+        type: text
+        read_from: full or separate_file
+        use: group, date, tool, URLs
+        proves: same_uploader
+        leak: true
+        status: UNVERIFIED
+        source: w1c s4.2; w5c s5.11
+    partial_decode:
+      codec: none
+      crate: none
+      result: not applicable
+    rust:
+      parse: hand-written (proto/par2_sfv_srr_meta.rs)
+      decode: none
+      crypto: crc32fast
+  srr:
+    detect:
+      magic: 69 69 69
+      offset: 0
+      note: CRC 0x6969 then type 0x69
+    structures:
+      blocks:
+      - name: srr_header_block
+        where: '0x69 SRR header: HEAD_CRC 0x6969; flag 0x0001 app name; APNS uint16 + app name'
+        type: record
+        read_from: separate_file
+        use: generator app name
+        proves: tool
+        leak: true
+        status: VERIFIED
+        source: w5b s7
+      - name: srr_stored_file
+        where: '0x6A stored file: CRC 0x6A6A, flag 0x8000; ADD_SIZE = file size; NAME_SIZE; name; data (nfo, sfv)'
+        type: record
+        read_from: separate_file
+        use: nfo, sfv and sample names and bodies
+        proves: same_uploader
+        leak: true
+        status: VERIFIED
+        source: w5b s7
+      - name: srr_rar_file
+        where: '0x71 RAR file name: CRC 0x7171; flag 0x0001 = recovery removed; NAME_SIZE; name'
+        type: record
+        read_from: separate_file
+        use: RAR volume names of the set
+        proves: alt
+        leak: false
+        status: VERIFIED
+        source: w5b s7
+      - name: srr_oso_hash
+        where: '0x6B OSO hash: file size uint64, 64-bit hash, NAME_SIZE, file name (no path)'
+        type: record
+        read_from: separate_file
+        use: size + hash per video file
+        proves: twin
+        leak: false
+        status: VERIFIED
+        source: w5b s7
+      - name: srr_padding
+        where: '0x6C padding after RAR end block: ADD_SIZE bytes (existing parser has no branch)'
+        type: record
+        read_from: separate_file
+        use: padding length
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w5b s7
+      - name: srr_rar_block_stream
+        where: RAR blocks 0x72-0x7B follow each SRR RAR block in the stream
+        type: record
+        read_from: separate_file
+        use: RAR headers stored inside SRR
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w5b s7
+    partial_decode:
+      codec: none
+      crate: none
+      result: not applicable
+    rust:
+      parse: hand-written (proto/par2_sfv_srr_meta.rs)
+      decode: none
+      crypto: none
+  srs:
+    detect:
+      magic: 53 52 53 46
+      offset: 0
+      note: SRSF in MP3/stream; MKV uses EBML elements
+    structures:
+      containers_and_tracks:
+      - name: srs_detect_srsf
+        where: '''SRSF'' = 53 52 53 46 marker (MP3 and stream; RIFF and MOV chunks)'
+        type: bytes4
+        read_from: full or separate_file
+        use: identify SRS container
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w5b s8
+      - name: srs_mkv_elements
+        where: EBML 0x6A75 ReSampleFile, 0x6B75 ReSampleTrack
+        type: record
+        read_from: separate_file
+        use: MKV sample tracks
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w5b s8
+      - name: srs_container_wrappers
+        where: RIFF chunk SRSF + LE32; MOV atom BE32 + SRSF; FLAC block 0x73; ASF GUID (name only)
+        type: record
+        read_from: separate_file
+        use: wrapper per container
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w5b s8
+      - name: srs_file_flags
+        where: 'FileData uint16: 0x1 SIMPLE_BLOCK_FIX, 0x2 ATTACHMENTS_REMOVED'
+        type: uint16
+        read_from: separate_file
+        use: rebuild mode
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w5b s8
+      - name: srs_app_and_sample_name
+        where: app name (uint16 length + UTF-8); sample basename (uint16 length + UTF-8)
+        type: utf8
+        read_from: separate_file
+        use: which tool; sample name
+        proves: alt
+        leak: false
+        status: VERIFIED
+        source: w5b s8
+      - name: srs_sample_size_crc
+        where: sample size uint64 LE and CRC32 uint32 LE (rebuild must match)
+        type: record
+        read_from: separate_file
+        use: full-sample CRC check
+        proves: twin
+        leak: false
+        status: VERIFIED
+        source: w5b s8
+      - name: srs_track_header
+        where: 'TrackData: flags (0x4 big file, 0x8 big track no), track no, data length, match offset uint64'
+        type: record
+        read_from: separate_file
+        use: locate each track in full file
+        proves: twin
+        leak: false
+        status: VERIFIED
+        source: w5b s8
+      - name: srs_track_signature
+        where: 'signature bytes (length uint16 + bytes): first bytes of the track'
+        type: bytes
+        read_from: separate_file
+        use: find track by content
+        proves: twin
+        leak: false
+        status: VERIFIED
+        source: w5b s8
+      - name: srs_match_offset_sentinel
+        where: match offset 0 is legal for MP3 and stream; -1 = failure
+        type: uint64
+        read_from: separate_file
+        use: interpret offsets
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w5b s8
+      - name: srs_codec_not_stored
+        where: codec, compression and check bytes are not serialized
+        type: derived
+        read_from: separate_file
+        use: codec must come from the sample
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w5b s8
+      - name: srs_vob_rar_signature
+        where: 'VOB sample: track 1 signature starts with ''Rar!'''
+        type: bytes
+        read_from: separate_file
+        use: RAR volume sample
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w5b s8
+      - name: srs_fingerprint_srsp
+        where: SRSP fingerprint sub-block (music)
+        type: record
+        read_from: separate_file
+        use: audio fingerprint
+        proves: none
+        leak: false
+        status: UNVERIFIED
+        source: w5b s8
+    partial_decode:
+      codec: none
+      crate: none
+      result: not applicable
+    rust:
+      parse: hand-written (EBML, RIFF, MOV readers per pyrescene)
+      decode: none
+      crypto: none
+  rev:
+    detect:
+      magic: 52 61 72 21 1A 52 65 76
+      offset: 0
+      note: 'RAR3 new-style has no magic: trailer at EOF'
+    structures:
+      rev:
+      - name: rev5_signature
+        where: '8 bytes: 52 61 72 21 1A 52 65 76 (''Rar!'' 1A ''Rev'')'
+        type: bytes8
+        read_from: separate_file
+        use: identify RAR5 recovery volume
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w8c c
+      - name: rev5_header
+        where: block CRC32 (over size + header); header size u32 (5 < size <= 1 MiB); version byte = 1
+        type: record
+        read_from: separate_file
+        use: trust header from head of .rev
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w3c s3.2; w8c c
+      - name: rev5_counts_recnum
+        where: DataCount u16, RecCount u16, RecNum u16 (index of this rev file)
+        type: uint16
+        read_from: separate_file
+        use: data and recovery volume counts
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w3c s3.2
+      - name: rev5_rev_crc
+        where: 'RevCRC uint32: CRC32 of the whole .rev file'
+        type: uint32
+        read_from: separate_file
+        use: integrity of rev file
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w3c s3.2
+      - name: rev5_data_volume_table
+        where: 'first rev file only: per data volume uint64 size + uint32 CRC32'
+        type: record
+        read_from: separate_file
+        use: whole-volume CRC of every .rar without download
+        proves: twin
+        leak: false
+        status: VERIFIED
+        source: w3c s3.2
+      - name: rev3_new_trailer
+        where: 'last 7 bytes: 3 ordinal bytes (value+1) + CRC32 LE over the rest'
+        type: record
+        read_from: last_article
+        use: RAR3 .rev identity and check
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w3c s3.1
+      - name: rev3_old_naming
+        where: name.arc_N_N.rev (no trailer) vs name.rev (new style)
+        type: derived
+        read_from: separate_file
+        use: old vs new RR naming
+        proves: tool
+        leak: true
+        status: VERIFIED
+        source: w3c s3.1
+      - name: rev_percent_derived
+        where: RecCount / DataCount as recovery percent
+        type: derived
+        read_from: separate_file
+        use: RR percentage
+        proves: tool
+        leak: true
+        status: UNVERIFIED
+        source: w3c s3.3
+    partial_decode:
+      codec: none
+      crate: none
+      result: not applicable
+    rust:
+      parse: hand-written (rev5 header; rev3 trailer)
+      decode: none
+      crypto: crc32fast
+  split_raw:
+    detect:
+      magic: none (classify joined stream)
+      offset: 0
+      note: never classify by extension
+    structures:
+      layout:
+      - name: raw_numeric_suffix_order
+        where: '''.001'', ''.002'' ...: order = numeric suffix; no header'
+        type: derived
+        read_from: separate_file
+        use: volume order
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1c s2.1
+      - name: raw_last_part_shorter
+        where: last part shorter than nominal size; total count = number of parts
+        type: derived
+        read_from: separate_file
+        use: completeness and count
+        proves: none
+        leak: false
+        status: UNVERIFIED
+        source: w1c s2.3
+      - name: raw_classify_by_magic
+        where: 'classify joined stream by magic, not extension: ZIP 50 4B 03 04, 7z, RAR, EBML 1A 45 DF A3, PAR2, gzip 1F 8B, bzip2 42 5A 68, xz FD 37 7A 58 5A 00, zstd 28 B5 2F FD'
+        type: bytes
+        read_from: first_article
+        use: inner format of .001
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1c s2.2; log W8B
+      - name: raw_iso_pvd
+        where: ISO 9660 'CD001' at 0x8001, 0x8801, 0x9001
+        type: ascii
+        read_from: first_article or last_article
+        use: ISO volume detect
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: log W8B
+      - name: raw_mp4_ftyp
+        where: MP4 'ftyp' at offset 4 (sniff row)
+        type: ascii4
+        read_from: first_article
+        use: MP4 detect
+        proves: none
+        leak: false
+        status: UNVERIFIED
+        source: w8b (MP4 row); w1c s2.2
+      - name: raw_nested_offset
+        where: 'nested store archive: inner offset = outer data offset + inner offset; compressed stops at first decoder'
+        type: derived
+        read_from: first_article
+        use: nesting depth rules
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: log W8B
+      - name: raw_par2_only_for_missing
+        where: a missing middle volume is recoverable only via PAR2
+        type: derived
+        read_from: separate_file
+        use: gap handling
+        proves: none
+        leak: false
+        status: VERIFIED
+        source: w1c s2.3
+      - name: sevenz_logical_split
+        where: '7z split (.7z.001...): logical offsets; header in last volume'
+        type: derived
+        read_from: last_article
+        use: locate header volume
+        proves: none
+        leak: false
+        status: UNVERIFIED
+        source: w1b s7
+      - name: rar_newnumbering_names
+        where: RAR .partNN.rar (MHD_NEWNUMBERING) vs old .rNN naming
+        type: derived
+        read_from: first_article
+        use: naming scheme
+        proves: tool
+        leak: true
+        status: VERIFIED
+        source: w5b s2
+    partial_decode:
+      codec: depends on inner format
+      crate: see inner formats
+      result: not applicable at split level
+    rust:
+      parse: magic classifier (hand table); infer crate as cross-check (usage UNVERIFIED)
+      decode: none
+      crypto: none

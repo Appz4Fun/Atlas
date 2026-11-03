@@ -1,0 +1,18 @@
+[package]
+name = "streamprobe"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+matroska-demuxer = "=0.8.1"
+scuffle-h265 = "=0.2.2"
+scuffle-av1 = "=0.1.4"
+h264-reader = "=0.9.0"
+bytes = "1"
+dolby_vision = "=3.4.0"
+hdr10plus = "=2.1.5"
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+debug = false
