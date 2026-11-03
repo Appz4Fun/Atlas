@@ -798,6 +798,9 @@ fn parse_dmlp_atmos(v: &[u8]) -> bool {
 }
 
 fn trak(body: &[u8], full_data: &[u8], info: &mut MediaInfo) {
+    const MAX_CHUNK_OFFSETS: usize = 16;
+    const MAX_AUDIO_CHUNK_PROBE: usize = 4096;
+
     if is_full(info) {
         return;
     }
@@ -822,19 +825,28 @@ fn trak(body: &[u8], full_data: &[u8], info: &mut MediaInfo) {
                                 entry = v.get(8..).map(<[u8]>::to_vec);
                             }
                             b"stco" => {
-                                let count = be32(v, 4).unwrap_or(0).min(64) as usize;
+                                let count = be32(v, 4).unwrap_or(0).min(MAX_CHUNK_OFFSETS as u32) as usize;
                                 for i in 0..count {
-                                    if let Some(off) = be32(v, 8 + i * 4) {
-                                        chunk_offsets.push(off as usize);
+                                    if chunk_offsets.len() >= MAX_CHUNK_OFFSETS {
+                                        break;
+                                    }
+                                    if let Some(off) = be32(v, 8 + i * 4).map(|o| o as usize)
+                                        && !chunk_offsets.contains(&off)
+                                    {
+                                        chunk_offsets.push(off);
                                     }
                                 }
                             }
                             b"co64" => {
-                                let count = be32(v, 4).unwrap_or(0).min(64) as usize;
+                                let count = be32(v, 4).unwrap_or(0).min(MAX_CHUNK_OFFSETS as u32) as usize;
                                 for i in 0..count {
+                                    if chunk_offsets.len() >= MAX_CHUNK_OFFSETS {
+                                        break;
+                                    }
                                     if let Some(bytes) = v.get(8 + i * 8..16 + i * 8)
                                         && let Ok(arr) = <[u8; 8]>::try_from(bytes)
                                         && let Ok(off) = usize::try_from(u64::from_be_bytes(arr))
+                                        && !chunk_offsets.contains(&off)
                                     {
                                         chunk_offsets.push(off);
                                     }
@@ -907,7 +919,8 @@ fn trak(body: &[u8], full_data: &[u8], info: &mut MediaInfo) {
             });
             if !atmos {
                 for &off in &chunk_offsets {
-                    let Some(chunk) = full_data.get(off..) else { continue };
+                    let end = off.saturating_add(MAX_AUDIO_CHUNK_PROBE).min(full_data.len());
+                    let Some(chunk) = full_data.get(off..end) else { continue };
                     let chunk_has_atmos = match codec.as_str() {
                         "ec-3" => AudioBitstream::has_eac3_atmos_frame(chunk),
                         "mlpa" => AudioBitstream::has_truehd_atmos(chunk),
@@ -1284,10 +1297,77 @@ impl AvcDepth {
         if avcc.len() < 7 {
             return None;
         }
+        if let Ok(parsed) = crate::video::h264::parse_avcc(avcc) {
+            for unit in &parsed.units {
+                if unit.first().is_some_and(|&h| (h & 0x1F) == 7)
+                    && let Some(depth) = Self::from_sps(unit)
+                {
+                    return Some(depth);
+                }
+            }
+        }
+
         let profile = *avcc.get(1)?;
-        if profile == 110 || profile == 122 || profile == 244 {
-            let depth = (avcc.get(6)? & 0x07) + 8;
-            Some(depth)
+        if !matches!(profile, 100 | 110 | 122 | 144 | 244) {
+            return Some(8);
+        }
+
+        let mut at = 5usize;
+        let num_sps = usize::from(*avcc.get(at)? & 0x1F);
+        at += 1;
+        for _ in 0..num_sps {
+            let len = usize::from(u16::from_be_bytes([*avcc.get(at)?, *avcc.get(at + 1)?]));
+            at = at.checked_add(2)?.checked_add(len)?;
+            let sps = avcc.get(at - len..at)?;
+            if sps.first().is_some_and(|&h| (h & 0x1F) == 7)
+                && let Some(depth) = Self::from_sps(sps)
+            {
+                return Some(depth);
+            }
+        }
+        let num_pps = usize::from(*avcc.get(at)?);
+        at += 1;
+        for _ in 0..num_pps {
+            let len = usize::from(u16::from_be_bytes([*avcc.get(at)?, *avcc.get(at + 1)?]));
+            at = at.checked_add(2)?.checked_add(len)?;
+            avcc.get(at - len..at)?;
+        }
+
+        if let Some(&depth_byte) = avcc.get(at + 1) {
+            let depth = (depth_byte & 0x07) + 8;
+            if (8..=14).contains(&depth) {
+                return Some(depth);
+            }
+        }
+        if profile == 100 {
+            Some(8)
+        } else {
+            None
+        }
+    }
+
+    pub fn from_sps(nal: &[u8]) -> Option<u8> {
+        let mut nal_slice = nal;
+        if nal_slice.starts_with(&[0, 0, 0, 1]) {
+            nal_slice = &nal_slice[4..];
+        } else if nal_slice.starts_with(&[0, 0, 1]) {
+            nal_slice = &nal_slice[3..];
+        }
+        if let Ok(sps) = crate::video::h264::params::parse_sps(nal_slice) {
+            return Some(sps.bit_depth_luma);
+        }
+        let data = crate::video::bits::rbsp(nal_slice.get(1..)?);
+        let mut r = crate::video::bits::BitReader::new(&data);
+        let profile = r.bits(8).ok()? as u8;
+        r.skip(16).ok()?;
+        let _id = r.ue_max(31, "SPS id").ok()?;
+        if matches!(profile, 100 | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128 | 138 | 139 | 134 | 135) {
+            let chroma_format = r.ue_max(3, "chroma format").ok()?;
+            if chroma_format == 3 {
+                let _ = r.flag().ok()?;
+            }
+            let depth_luma = r.ue_max(6, "bit depth").ok()? as u8 + 8;
+            Some(depth_luma)
         } else {
             Some(8)
         }
@@ -1441,7 +1521,43 @@ impl Mp4Prober {
     }
 
     pub fn probe_tail_moov(data: &[u8]) -> Option<MediaInfo> {
-        parse(data)
+        if is_mp4(data) || Self::has_moov_box(data) {
+            Some(mp4(data))
+        } else {
+            None
+        }
+    }
+
+    fn has_moov_box(data: &[u8]) -> bool {
+        let mut at = 0usize;
+        while let Some(head) = data.get(at..at + 8) {
+            let mut size = u64::from(u32::from_be_bytes([head[0], head[1], head[2], head[3]]));
+            let kind = &head[4..8];
+            if !kind.iter().all(|b| b.is_ascii_graphic() || *b == b' ') {
+                return false;
+            }
+            let mut head_size = 8u64;
+            if size == 1 {
+                let Some(long) = data.get(at + 8..at + 16) else { return false };
+                size = u64::from_be_bytes(long.try_into().unwrap_or([0; 8]));
+                head_size = 16;
+            } else if size == 0 {
+                size = (data.len() - at) as u64;
+            }
+            if size < head_size {
+                return false;
+            }
+            if kind == b"moov" {
+                return true;
+            }
+            let Some(step) = usize::try_from(size).ok() else { return false };
+            let Some(end) = at.checked_add(step) else { return false };
+            if end > data.len() {
+                return false;
+            }
+            at = end;
+        }
+        false
     }
 }
 
@@ -1781,13 +1897,19 @@ mod tests {
 
     #[test]
     fn avc_track_with_23_byte_codec_private_uses_avcc_parser() {
-        // 28-byte avcC record: High10 profile (110) -> bit_depth_luma_minus8 = 2 (10-bit),
-        // while byte 17 has lower 3 bits = 7 (which HevcDepth::from_hvcc would misread as 15-bit).
-        let mut avcc = vec![0u8; 28];
-        avcc[0] = 1;
-        avcc[1] = 110; // High 10 profile
-        avcc[6] = 0xF8 | 2; // 10-bit
-        avcc[17] = 0xFF; // Would yield 15 if parsed as hvcC
+        // 27-byte ISO/IEC 14496-15 High 10 avcC record:
+        // 1 SPS (8 bytes -> byte 6 is 0x00), 1 PPS (4 bytes -> byte 17 is 0x00 so
+        // HevcDepth::from_hvcc would misread it as 8-bit), plus 4-byte configuration extension.
+        let sps = [0x67, 110, 0x00, 0x28, 0xA6, 0xCE, 0x9E, 0x40];
+        let pps = [0x68, 0xEE, 0x3C, 0x80];
+        let mut avcc = vec![1, 110, 0x00, 0x28, 0xFF, 0xE1, 0x00, sps.len() as u8];
+        avcc.extend_from_slice(&sps);
+        avcc.extend_from_slice(&[0x01, 0x00, pps.len() as u8]);
+        avcc.extend_from_slice(&pps);
+        avcc.extend_from_slice(&[0xFD, 0xFA, 0xFA, 0x00]);
+        assert!(avcc.len() >= 23);
+        assert_eq!(avcc[6], 0);
+        assert_eq!(avcc[17], 0);
 
         let t1 = [
             el(&[0x83], &[1]),
@@ -1802,6 +1924,69 @@ mod tests {
         let info = parse(&mkv).unwrap();
         assert_eq!(info.video[0].codec, "V_MPEG4/ISO/AVC");
         assert_eq!(info.video[0].bit_depth, Some(10));
+    }
+
+    #[test]
+    fn probe_tail_moov_parses_standalone_moov_without_ftyp() {
+        let mut entry = vec![0u8; 86];
+        entry[4..8].copy_from_slice(b"hvc1");
+        entry[32..34].copy_from_slice(&3840u16.to_be_bytes());
+        entry[34..36].copy_from_slice(&2160u16.to_be_bytes());
+        let mut stsd = vec![0u8; 8];
+        stsd.extend(&entry);
+        let stbl = mp4_box(b"stbl", &mp4_box(b"stsd", &stsd));
+        let mut hdlr = vec![0u8; 8];
+        hdlr.extend(b"vide");
+        hdlr.extend([0u8; 12]);
+        let mdia = [mp4_box(b"hdlr", &hdlr), mp4_box(b"minf", &stbl)].concat();
+        let mut mvhd = vec![0u8; 20];
+        mvhd[12..16].copy_from_slice(&1000u32.to_be_bytes());
+        mvhd[16..20].copy_from_slice(&90_000u32.to_be_bytes());
+        let moov = mp4_box(b"moov", &[mp4_box(b"mvhd", &mvhd), mp4_box(b"trak", &mp4_box(b"mdia", &mdia))].concat());
+
+        // Whole file with ftyp + mdat + moov: slice at find_moov_offset starts with `moov`
+        let file = [mp4_box(b"ftyp", b"isom"), mp4_box(b"mdat", &[0u8; 64]), moov.clone()].concat();
+        let moov_off = Mp4Prober::find_moov_offset(&file).expect("must find moov offset") as usize;
+        let tail_slice = &file[moov_off..];
+        assert_eq!(&tail_slice[4..8], b"moov");
+
+        let info = Mp4Prober::probe_tail_moov(tail_slice).expect("standalone moov tail slice must parse");
+        assert_eq!(info.container, "mp4");
+        assert!(info.header_complete);
+        assert_eq!(info.duration_secs, Some(90.0));
+        assert_eq!(info.video[0].codec, "hvc1");
+        assert_eq!((info.video[0].width, info.video[0].height), (Some(3840), Some(2160)));
+        assert!(Mp4Prober::probe_tail_moov(b"not a moov box").is_none());
+    }
+
+    #[test]
+    fn repeated_mp4_stco_boxes_are_deduplicated_and_bounded() {
+        let mut entry = vec![0u8; 36];
+        entry[4..8].copy_from_slice(b"ec-3");
+        entry[24..26].copy_from_slice(&6u16.to_be_bytes());
+        entry[32..36].copy_from_slice(&(48000u32 << 16).to_be_bytes());
+        let mut stsd = vec![0u8; 8];
+        stsd.extend(&entry);
+
+        // Build 256 repeated stco boxes each containing 64 duplicate zero offsets
+        let mut stco_body = vec![0u8; 8 + 64 * 4];
+        stco_body[4..8].copy_from_slice(&64u32.to_be_bytes());
+        let stco = mp4_box(b"stco", &stco_body);
+        let mut stbl_children = mp4_box(b"stsd", &stsd);
+        for _ in 0..256 {
+            stbl_children.extend_from_slice(&stco);
+        }
+        let stbl = mp4_box(b"stbl", &stbl_children);
+        let mut hdlr = vec![0u8; 8];
+        hdlr.extend(b"soun");
+        hdlr.extend([0u8; 12]);
+        let mdia = [mp4_box(b"hdlr", &hdlr), mp4_box(b"minf", &stbl)].concat();
+        let moov = mp4_box(b"moov", &mp4_box(b"trak", &mp4_box(b"mdia", &mdia)));
+        let file = [mp4_box(b"ftyp", b"isom"), moov, mp4_box(b"mdat", &vec![0u8; 65_536])].concat();
+
+        let info = parse(&file).expect("mp4 with repeated stco must parse quickly");
+        assert_eq!(info.audio.len(), 1);
+        assert!(!info.audio[0].atmos);
     }
 
     #[test]

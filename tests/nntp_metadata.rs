@@ -223,12 +223,22 @@ fn tc_t1_f21_2_hevc_8bit_depth_from_hvcc() {
 
 #[test]
 fn tc_t1_f21_3_avc_10bit_depth_from_avcc_high10() {
-    // avcC record with profile_idc = 110 (High 10). Byte 6 holds bit_depth_luma_minus8 (bottom 3 bits)
-    let mut avcc = vec![0u8; 10];
-    avcc[1] = 110; // High 10 profile
-    avcc[6] = 2;   // 2 + 8 = 10 bits
-    let depth = AvcDepth::from_avcc(&avcc).expect("must extract AVC High10 depth");
+    // Standard ISO/IEC 14496-15 High 10 avcC record with 1 SPS (8 bytes, so byte 6 is 0x00),
+    // 1 PPS, and the post-PPS High profile configuration extension.
+    let sps = [0x67, 110, 0x00, 0x28, 0xA6, 0xCE, 0x9E, 0x40];
+    let pps = [0x68, 0xEE, 0x3C, 0x80];
+    let mut avcc = vec![1, 110, 0x00, 0x28, 0xFF, 0xE1, 0x00, sps.len() as u8];
+    avcc.extend_from_slice(&sps);
+    avcc.extend_from_slice(&[0x01, 0x00, pps.len() as u8]);
+    avcc.extend_from_slice(&pps);
+    avcc.extend_from_slice(&[0xFD, 0xFA, 0xFA, 0x00]);
+    assert_eq!(avcc[6], 0, "byte 6 is the high byte of the first SPS length");
+    let depth = AvcDepth::from_avcc(&avcc).expect("must extract AVC High10 depth from SPS");
     assert_eq!(depth, 10);
+
+    // High 10 avcC record without inline SPS, relying on the post-PPS configuration extension
+    let avcc_ext_only = [1, 110, 0x00, 0x28, 0xFF, 0xE0, 0x00, 0xFD, 0xFA, 0xFA, 0x00];
+    assert_eq!(AvcDepth::from_avcc(&avcc_ext_only), Some(10));
 }
 
 #[test]

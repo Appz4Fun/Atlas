@@ -62,11 +62,9 @@ fn tc_t1_f08_5_newsup_lcg_identifier() {
 
 #[test]
 fn tc_t1_f09_1_highwinds_base64_le_decoder() {
-    let mid = "<QUJDRA.123$456.789@fx01.iad>";
-    let dt = ServerClock::decode(mid);
-    assert!(dt.is_some(), "Highwinds LE base64 must decode to a valid timestamp");
-    let ts = dt.unwrap().timestamp();
-    assert!(ts >= 876_645_500, "Timestamp must be after Highwinds epoch");
+    let mid = "<EaPmB.546176$JP7.228032@fx09.am4>";
+    let dt = ServerClock::decode(mid).expect("Highwinds LE base64 must decode to a valid timestamp");
+    assert_eq!(dt.timestamp(), 1_503_379_236);
 }
 
 #[test]

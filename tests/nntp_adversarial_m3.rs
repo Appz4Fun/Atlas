@@ -837,23 +837,22 @@ fn test_par2_inventory_ifsc_unzero_end_to_end() {
 fn test_server_clock_exact_decoding_known_vectors() {
     use base64::Engine;
 
-    // 1. Highwinds: verify epoch offset and standard base64 decoding
-    // Epoch: 876_645_500. Let delta = 100_000_000 -> target = 976_645_500
-    // 100_000_000 in base64 LE:
-    // 100_000_000 = 0 + 34 * 64 + 4 * 64^2 + 6 * 64^3 = 0 + 2176 + 16384 + 1572864 = 1,591,424
-    // 100_000_000 = 0 + 44*64 + 11*64^2 + 59*64^3 = ...
-    // Let's compute LE base64 for value 10_000_000:
+    // 1. Highwinds: verify epoch offset and custom base64 LE decoding
     let mut val = 10_000_000u64;
-    let b64_alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let hw_alphabet = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_%";
     let mut le_chars = String::new();
     while val > 0 {
         let sym = (val % 64) as usize;
-        le_chars.push(b64_alphabet.chars().nth(sym).unwrap());
+        le_chars.push(hw_alphabet.chars().nth(sym).unwrap());
         val /= 64;
     }
     let hw_mid = format!("<{}.123$456.789@fx01.iad>", le_chars);
     let hw_dt = ServerClock::decode(&hw_mid).expect("Highwinds LE base64 must decode");
     assert_eq!(hw_dt.timestamp(), 876_645_500 + 10_000_000);
+
+    let hw_doc_dt = ServerClock::decode("<EaPmB.546176$JP7.228032@fx09.am4>")
+        .expect("Documented Highwinds vector must decode");
+    assert_eq!(hw_doc_dt.timestamp(), 1_503_379_236);
 
     // 2. Giganews: verify XOR-0x9D unpacked base64
     let target_ts = 1729000000u32;

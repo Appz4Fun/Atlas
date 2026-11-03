@@ -227,19 +227,7 @@ impl ServerClock {
             return None;
         }
 
-        // Try standard base64 symbol values in little-endian order: val = sum(sym * 64^i)
-        let decode_symbol_std = |c: char| -> Option<u64> {
-            match c {
-                'A'..='Z' => Some((c as u64) - ('A' as u64)),
-                'a'..='z' => Some((c as u64) - ('a' as u64) + 26),
-                '0'..='9' => Some((c as u64) - ('0' as u64) + 52),
-                '+' | '-' => Some(62),
-                '/' | '_' => Some(63),
-                _ => None,
-            }
-        };
-
-        // Try Highwinds empirical symbol values: 0-9 (0..9), a-z (10..35), A-Z (36..61), _ (62), % (63)
+        // Highwinds custom alphabet: 0-9 (0..9), a-z (10..35), A-Z (36..61), _ (62), % (63)
         let decode_symbol_hw = |c: char| -> Option<u64> {
             match c {
                 '0'..='9' => Some((c as u64) - ('0' as u64)),
@@ -253,38 +241,15 @@ impl ServerClock {
 
         const HW_EPOCH: i64 = 876_645_500; // Oct 12, 1997
 
-        // Evaluate standard base64 LE
-        let mut std_val = 0u64;
-        let mut factor = 1u64;
-        let mut std_ok = true;
-        for c in t_str.chars() {
-            if let Some(sym) = decode_symbol_std(c) {
-                std_val = std_val.wrapping_add(sym.wrapping_mul(factor));
-                factor = factor.wrapping_mul(64);
-            } else {
-                std_ok = false;
-                break;
-            }
-        }
-
-        if std_ok {
-            let ts = HW_EPOCH.wrapping_add(std_val as i64);
-            // Check if plausible (1997..2040)
-            if (HW_EPOCH..=2_200_000_000).contains(&ts) {
-                return DateTime::from_timestamp(ts, 0);
-            }
-        }
-
-        // Evaluate HW custom alphabet LE
         let mut hw_val = 0u64;
-        factor = 1u64;
+        let mut factor = 1u64;
         for c in t_str.chars() {
             let sym = decode_symbol_hw(c)?;
-            hw_val = hw_val.wrapping_add(sym.wrapping_mul(factor));
-            factor = factor.wrapping_mul(64);
+            hw_val = hw_val.checked_add(sym.checked_mul(factor)?)?;
+            factor = factor.saturating_mul(64);
         }
 
-        let ts = HW_EPOCH.wrapping_add(hw_val as i64);
+        let ts = HW_EPOCH.checked_add(i64::try_from(hw_val).ok()?)?;
         if (HW_EPOCH..=2_200_000_000).contains(&ts) {
             DateTime::from_timestamp(ts, 0)
         } else {
@@ -479,6 +444,13 @@ mod tests {
         let headers = HeaderMap::new();
         let info = PostingTool::classify("<1234567890abcdef1234567890abcdef@12345678.90a>", &headers);
         assert_eq!(info.tool, ToolType::Postie);
+    }
+
+    #[test]
+    fn highwinds_custom_alphabet_decodes_documented_vector() {
+        let mid = "<EaPmB.546176$JP7.228032@fx09.am4>";
+        let dt = ServerClock::decode(mid).expect("highwinds decoded");
+        assert_eq!(dt.timestamp(), 1_503_379_236);
     }
 
     #[test]
