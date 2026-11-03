@@ -74,8 +74,9 @@ _remote profile:
     if [ "{{ profile }}" = "release" ]; then flag="--release"; fi
     out="target/remote/{{ profile }}"
 
+    q_dir="'${dir//\'/\'\\\'\'}'"
     echo "==> syncing source to $host:$dir"
-    ssh "$host" "mkdir -p '$dir'"
+    ssh "$host" "mkdir -p $q_dir"
     # never ship local data or secrets (config.toml holds usenet passwords)
     rsync -az --delete \
         --exclude '/target/' --exclude '/.git/' --exclude '/SABnzbd-5.0.4/' --exclude '/img/' \
@@ -93,9 +94,21 @@ _remote profile:
             git_ver="v0.0.0.1"
         fi
     fi
-    git_sha="$(git rev-parse HEAD 2>/dev/null || true)"
-    git_short="$(git rev-parse --short=7 HEAD 2>/dev/null || true)"
-    ssh "$host" "cd '$dir' && if [ -f \"\$HOME/.cargo/env\" ]; then . \"\$HOME/.cargo/env\"; fi && ATLAS_BUILD_VERSION='$git_ver' ATLAS_GIT_SHA='$git_sha' ATLAS_GIT_SHORT_SHA='$git_short' cargo build --locked $flag"
+    if [[ ! "$git_ver" =~ ^[A-Za-z0-9._+-]+$ ]]; then
+        git_ver="v0.0.0.1"
+    fi
+    git_sha="$(git rev-parse --verify HEAD 2>/dev/null || true)"
+    if [[ ! "$git_sha" =~ ^[0-9a-fA-F]{7,64}$ ]]; then
+        git_sha=""
+    fi
+    git_short="$(git rev-parse --verify --short=7 HEAD 2>/dev/null || true)"
+    if [[ ! "$git_short" =~ ^[0-9a-fA-F]{7,64}$ ]]; then
+        git_short=""
+    fi
+    q_ver="'${git_ver//\'/\'\\\'\'}'"
+    q_sha="'${git_sha//\'/\'\\\'\'}'"
+    q_short="'${git_short//\'/\'\\\'\'}'"
+    ssh "$host" "cd $q_dir && if [ -f \"\$HOME/.cargo/env\" ]; then . \"\$HOME/.cargo/env\"; fi && ATLAS_BUILD_VERSION=$q_ver ATLAS_GIT_SHA=$q_sha ATLAS_GIT_SHORT_SHA=$q_short cargo build --locked $flag"
 
     mkdir -p "$out"
     scp -q "$host:$dir/target/{{ profile }}/atlas" "$out/atlas"
