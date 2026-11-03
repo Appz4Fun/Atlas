@@ -39,12 +39,14 @@ pub const STILLS: ShardTable = ShardTable {
     )",
     indexes: &[],
     release_key: Some("release_id"),
-    added: &[],
+    // a 64-bit perceptual hash, stored as its bits in an i64: "the same film" across releases
+    added: &[("phash", "INTEGER")],
 };
 
 const DROP_STILLS: &str = "delete from release_stills where release_id = ?1";
-const SET_STILL: &str = "insert or replace into release_stills (release_id, position, at_ms, sha256, width, height)
-    values (?1, ?2, ?3, ?4, ?5, ?6)";
+const SET_STILL: &str =
+    "insert or replace into release_stills (release_id, position, at_ms, sha256, width, height, phash)
+    values (?1, ?2, ?3, ?4, ?5, ?6, ?7)";
 
 /// Past this, the oldest stills go. One is 50 to 150 KB.
 const MAX_STILL_CACHE: u64 = 2 << 30;
@@ -84,6 +86,67 @@ pub fn stills(conn: &rusqlite::Connection, release_id: i64) -> Vec<(u8, Option<i
     q.query_map([release_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
         .map(|rows| rows.filter_map(Result::ok).collect())
         .unwrap_or_default()
+}
+
+/// The most releases listed as the same film.
+const MAX_SAME_FILM: usize = 50;
+
+/// How far apart in the film two stills may be and still be compared: each encode puts its keyframes in its own
+/// places, soo the one nearest a quarter of the way in is seconds off from another's.
+const SAME_FILM_WINDOW_MS: i64 = 15_000;
+
+/// Other releases whose stills show the same pictures as this one's: at least two of its stills each within
+/// `MATCH_BITS` of one of theirs taken near the same time, newest first. Only ever "the same film" (another encode,
+/// a remux, a cut), never a twin.
+pub fn same_film(conn: &rusqlite::Connection, release_id: i64) -> Vec<i64> {
+    let s = store::shard_of_id(release_id);
+    let own: Vec<(u8, Option<i64>, u64)> = conn
+        .prepare(&format!(
+            "select position, at_ms, phash from s{s}.release_stills where release_id = ? and phash is not null"
+        ))
+        .and_then(|mut q| {
+            q.query_map([release_id], |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, i64>(2)? as u64)))?.collect()
+        })
+        .unwrap_or_default();
+    if own.len() < 2 {
+        return Vec::new();
+    }
+    // per release: which of our stills found a match, one bit each
+    let mut hits: std::collections::HashMap<i64, u8> = std::collections::HashMap::new();
+    for shard in 0..store::SHARDS {
+        let sql = format!(
+            "select release_id, position, at_ms, phash from s{shard}.release_stills
+             where phash is not null and release_id != ?"
+        );
+        // a shard that hasn't got the table yet has none
+        let Ok(mut q) = conn.prepare(&sql) else { continue };
+        let Ok(rows) = q.query_map([release_id], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, u8>(1)?, r.get::<_, Option<i64>>(2)?, r.get::<_, i64>(3)?))
+        }) else {
+            continue;
+        };
+        for (other, position, at, hash) in rows.filter_map(Result::ok) {
+            let matched = own.iter().enumerate().filter(|(_, mine)| still_matches(**mine, (position, at, hash as u64)));
+            for (i, _) in matched {
+                *hits.entry(other).or_default() |= 1 << i;
+            }
+        }
+    }
+    let mut found: Vec<i64> = hits.into_iter().filter(|&(_, bits)| bits.count_ones() >= 2).map(|(id, _)| id).collect();
+    // ids grow with time, within a shard and across them closely enough
+    found.sort_unstable_by(|a, b| b.cmp(a));
+    found.truncate(MAX_SAME_FILM);
+    found
+}
+
+/// Two stills, (position, time, hash), show the same picture: taken near the same time (or at the same position,
+/// when a time is missing) and close in hash.
+fn still_matches(a: (u8, Option<i64>, u64), b: (u8, Option<i64>, u64)) -> bool {
+    let near = match (a.1, b.1) {
+        (Some(x), Some(y)) => (x - y).abs() <= SAME_FILM_WINDOW_MS,
+        _ => a.0 == b.0,
+    };
+    near && crate::video::phash::distance(a.2, b.2) <= crate::video::phash::MATCH_BITS
 }
 
 /// One still's JPEG, while the folder still has it.
@@ -244,8 +307,8 @@ fn track_of(ctx: &mut StepCtx<'_>, first: &FileInfo) -> Result<Option<(VideoTrac
     Ok(None)
 }
 
-/// A still from a keyframe: JPEG bytes, width and height.
-fn still_of(track: &VideoTrack, frame: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
+/// A still from a keyframe: JPEG bytes, width, height, and its perceptual hash when it has one.
+fn still_of(track: &VideoTrack, frame: &[u8]) -> Option<(Vec<u8>, u32, u32, Option<u64>)> {
     let picture = match track.codec {
         Codec::Hevc => {
             let hvcc = hevc::nal::parse_hvcc(&track.private).ok()?;
@@ -265,7 +328,7 @@ fn still_of(track: &VideoTrack, frame: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
         return None;
     }
     let jpeg = jpeg::encode(&y.data, &cb.data, &cr.data, y.width, y.height, QUALITY);
-    Some((jpeg, y.width as u32, y.height as u32))
+    Some((jpeg, y.width as u32, y.height as u32, crate::video::phash::phash(&y)))
 }
 
 #[derive(Default)]
@@ -292,21 +355,23 @@ impl Step for StillsStep {
         cfg.archive.enabled
     }
     /// Bit 1: every Matroska video gets stills, not only those of 100 MiB or more, soo smaller ones already
-    /// processed are looked at again.
+    /// processed are looked at again. Bit 2: each still has a perceptual hash.
     fn config_stamp(&self) -> u64 {
-        1
+        1 | 2
     }
     fn run(&self, ctx: &mut StepCtx<'_>) -> Result<Outcome, StepError> {
         let retry = |e: rusqlite::Error| StepError::Retry(e.to_string());
         let release_id = ctx.release().id;
-        // a release whose stills are all still on disk keeps them: the walk for a new stamp bit fetches nothing.
-        // One trimmed from the folder is made again.
-        let kept: Vec<String> = ctx
+        // a release whose stills are all still on disk, and hashed, keeps them: the walk for a new stamp bit fetches
+        // nothing. One trimmed from the folder, or from before hashes, is made again.
+        let kept: Vec<(String, bool)> = ctx
             .conn()
-            .prepare("select sha256 from release_stills where release_id = ?1")
-            .and_then(|mut q| q.query_map([release_id], |r| r.get(0))?.collect())
+            .prepare("select sha256, phash is not null from release_stills where release_id = ?1")
+            .and_then(|mut q| q.query_map([release_id], |r| Ok((r.get(0)?, r.get(1)?)))?.collect())
             .map_err(retry)?;
-        if kept.len() == POSITIONS.len() && kept.iter().all(|h| still_file(h).is_some_and(|f| f.exists())) {
+        if kept.len() == POSITIONS.len()
+            && kept.iter().all(|(h, hashed)| *hashed && still_file(h).is_some_and(|f| f.exists()))
+        {
             return Ok(Outcome { matched: true, ..Outcome::default() });
         }
         let info: Option<String> = ctx
@@ -342,7 +407,7 @@ impl Step for StillsStep {
         for percent in POSITIONS {
             let Some((file, part)) = part_at(&layout, percent) else { continue };
             let Some((frame, at)) = keyframe_from(ctx, &layout, file, part, track.number)? else { continue };
-            let Some((jpeg, w, h)) = still_of(&track, &frame) else { continue };
+            let Some((jpeg, w, h, phash)) = still_of(&track, &frame) else { continue };
             let Some(sha256) = keep(&jpeg) else { continue };
             made += 1;
             writes.push(StepWrite::new(
@@ -354,6 +419,7 @@ impl Step for StillsStep {
                     sha256.into(),
                     i64::from(w).into(),
                     i64::from(h).into(),
+                    phash.map(|p| p as i64).into(),
                 ],
             ));
         }
@@ -406,13 +472,24 @@ mod tests {
     }
 
     #[test]
+    fn stills_match_near_in_time_and_hash() {
+        let hash = 0x86c7_6333_7078_7875;
+        assert!(still_matches((25, Some(4_000), hash), (25, Some(12_000), hash ^ 0b111)));
+        assert!(!still_matches((25, Some(4_000), hash), (25, Some(40_000), hash)), "too far apart");
+        assert!(!still_matches((25, Some(4_000), hash), (50, Some(4_000), !hash)), "another picture");
+        assert!(still_matches((25, None, hash), (25, Some(4_000), hash)), "no time: by position");
+        assert!(!still_matches((25, None, hash), (50, Some(4_000), hash)));
+    }
+
+    #[test]
     fn a_keyframe_makes_a_jpeg_still() {
         let data = std::fs::read(format!("{}/tests/fixtures/hevc/clip.mkv", env!("CARGO_MANIFEST_DIR"))).unwrap();
         let track = mkv::video_track(&data).unwrap();
         let chunk = &data[data.len() / 2..];
         let Found::Frame { start, len, .. } = mkv::find_keyframe(chunk, track.number) else { panic!() };
-        let (jpeg, w, h) = still_of(&track, &chunk[start..start + len]).unwrap();
+        let (jpeg, w, h, phash) = still_of(&track, &chunk[start..start + len]).unwrap();
         assert_eq!((w, h), (320, 180));
+        assert!(phash.is_some());
         assert_eq!(&jpeg[..2], &[0xff, 0xd8]);
     }
 }

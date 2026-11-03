@@ -186,6 +186,21 @@ fn video_releases_get_three_stills_from_their_middles() {
         let times: Vec<i64> = mine.iter().map(|r| r.2).collect();
         assert!(times.windows(2).all(|w| w[0] < w[1]) && times[0] >= 1000 && times[2] <= 11_000, "{times:?}");
     }
+    // the three postings of one clip show the same pictures: the same film, each to the others
+    let conn = db::open().unwrap();
+    let id_of = |name: &str| -> i64 {
+        db::open_shard(&shard)
+            .unwrap()
+            .query_row("select id from releases where name like ?1", [format!("{}%", &name[..10])], |r| r.get(0))
+            .unwrap()
+    };
+    // (the H.264 clip is the same footage encoded again; the clip moves fast, soo a keyframe a second off is
+    // sometimes another picture)
+    let same = atlas::probe::stills::same_film(&conn, id_of(set));
+    for other in [plain, split_set, avc] {
+        assert!(same.contains(&id_of(other)), "{other}: {same:?}");
+    }
+    assert!(!same.contains(&id_of(set)), "not itself");
     // the JPEGs are kept by their hash
     let stills: Vec<_> = std::fs::read_dir(home.path().join("stills")).unwrap().filter_map(Result::ok).collect();
     assert!(!stills.is_empty());
