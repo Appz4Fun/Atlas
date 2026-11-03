@@ -5,7 +5,7 @@ use sha2::Digest;
 
 use crate::config::Config;
 use crate::postprocess::schema::ShardTable;
-use crate::postprocess::step::{Got, Needs, Outcome, ReleaseInfo, Reruns, Step, StepCtx, StepError, StepId, StepWrite};
+use crate::postprocess::step::{Got, Needs, Outcome, Reruns, Step, StepCtx, StepError, StepId, StepWrite};
 use crate::store::{self, FileInfo, SegmentPick};
 use crate::video::mkv::{self, Codec, Found, VideoTrack};
 use crate::video::{h264, hevc, jpeg};
@@ -291,13 +291,24 @@ impl Step for StillsStep {
     fn enabled(&self, cfg: &Config) -> bool {
         cfg.archive.enabled
     }
-    fn applies(&self, release: &ReleaseInfo) -> bool {
-        // a video worth a still is at least this big
-        release.size >= 100 << 20
+    /// Bit 1: every Matroska video gets stills, not only those of 100 MiB or more, soo smaller ones already
+    /// processed are looked at again.
+    fn config_stamp(&self) -> u64 {
+        1
     }
     fn run(&self, ctx: &mut StepCtx<'_>) -> Result<Outcome, StepError> {
         let retry = |e: rusqlite::Error| StepError::Retry(e.to_string());
         let release_id = ctx.release().id;
+        // a release whose stills are all still on disk keeps them: the walk for a new stamp bit fetches nothing.
+        // One trimmed from the folder is made again.
+        let kept: Vec<String> = ctx
+            .conn()
+            .prepare("select sha256 from release_stills where release_id = ?1")
+            .and_then(|mut q| q.query_map([release_id], |r| r.get(0))?.collect())
+            .map_err(retry)?;
+        if kept.len() == POSITIONS.len() && kept.iter().all(|h| still_file(h).is_some_and(|f| f.exists())) {
+            return Ok(Outcome { matched: true, ..Outcome::default() });
+        }
         let info: Option<String> = ctx
             .conn()
             .query_row("select info from release_probe where release_id = ?1", [release_id], |r| r.get(0))
