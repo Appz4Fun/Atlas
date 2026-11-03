@@ -256,13 +256,14 @@ fn tc_t1_f21_4_avc_8bit_depth_from_avcc_high() {
 
 #[test]
 fn tc_t1_f22_1_dolby_vision_dvcc_dvvc_profile7_fel() {
-    // dvvC/dvcC atom payload: version=1, profile=7 (byte 2 >> 1 = 7), level=6, el_present=1 -> fel=true
+    // dvvC/dvcC atom payload: version=1, profile=7 (byte 2 >> 1 = 7), level=6, el_present=1.
+    // The configuration record preserves el_present=true while leaving fel=false until RPU/NLQ is inspected.
     let dv_box = [1, 0, (7 << 1), (6 << 3) | 0b011];
     let dv_info = DolbyVisionInfo::parse_rpu(&dv_box).expect("must parse dvvC record");
     assert_eq!(dv_info.profile, 7);
     assert_eq!(dv_info.level, Some(6));
-    assert!(dv_info.fel, "Profile 7 with EL present must be classified as FEL");
     assert!(dv_info.el_present);
+    assert!(!dv_info.fel, "dvvC configuration record alone must not assume FEL before RPU inspection");
 }
 
 #[test]

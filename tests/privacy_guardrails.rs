@@ -60,13 +60,28 @@ fn run_git(args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
+/// Returns `Some("origin/main..HEAD")` when `origin/main` exists and `HEAD` has unmerged
+/// PR commits ahead of `origin/main`, or `None` on `main` / shallow checkouts.
+fn pr_commit_range() -> Option<&'static str> {
+    if run_git(&["rev-parse", "--verify", "origin/main"]).is_err() {
+        return None;
+    }
+    let count = run_git(&["rev-list", "--count", "origin/main..HEAD"])
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    (count > 0).then_some("origin/main..HEAD")
+}
+
 /// TC-T1-F28-1: Repository Git Log Cleanliness
-/// Scans commit messages in the PR branch (origin/main..HEAD) to verify zero occurrences
-/// of barred personal names or host absolute paths.
+/// Scans commit messages in the PR branch (origin/main..HEAD, or HEAD on main checkouts)
+/// to verify zero occurrences of barred personal names or host absolute paths.
 #[test]
 fn test_tc_t1_f28_1_repository_git_log_cleanliness() {
-    let log_messages = run_git(&["log", "origin/main..HEAD", "--format=%B"])
-        .expect("git log command failed");
+    let log_messages = match pr_commit_range() {
+        Some(range) => run_git(&["log", range, "--format=%B"]).expect("git log command failed"),
+        None => run_git(&["log", "-n", "1", "HEAD", "--format=%B"]).expect("git log HEAD failed"),
+    };
 
     let name_re = barred_name_regex();
     let path_re = barred_path_regex();
@@ -93,7 +108,18 @@ fn test_tc_t1_f28_1_repository_git_log_cleanliness() {
 /// `xbmc4lyfe <273732874+xbmc4lyfe@users.noreply.github.com>`
 #[test]
 fn test_tc_t1_f28_2_commit_author_and_email_compliance() {
-    let authors = run_git(&["log", "origin/main..HEAD", "--format=%an <%ae>"])
+    let Some(range) = pr_commit_range() else {
+        let head_author = run_git(&["log", "-n", "1", "HEAD", "--format=%an <%ae>"])
+            .expect("git log HEAD author failed");
+        let name_re = barred_name_regex();
+        for line in head_author.lines().filter(|l| !l.trim().is_empty()) {
+            assert!(!name_re.is_match(line), "Barred personal name in HEAD author: {line}");
+            assert!(line.is_ascii(), "HEAD author contains non-ASCII characters: {line}");
+        }
+        return;
+    };
+
+    let authors = run_git(&["log", range, "--format=%an <%ae>"])
         .expect("git log authors failed");
 
     let expected_author = "xbmc4lyfe <273732874+xbmc4lyfe@users.noreply.github.com>";
@@ -112,12 +138,14 @@ fn test_tc_t1_f28_2_commit_author_and_email_compliance() {
 }
 
 /// TC-T1-F28-3: PR Commit Diffs Privacy
-/// Scans git diff origin/main..HEAD to verify that zero occurrences of barred patterns
-/// were introduced anywhere in the changes.
+/// Scans git diff origin/main..HEAD (or HEAD on non-PR checkouts) to verify that zero
+/// occurrences of barred patterns were introduced anywhere in the changes.
 #[test]
 fn test_tc_t1_f28_3_commit_diffs_privacy() {
-    let diff_output = run_git(&["diff", "origin/main..HEAD"])
-        .expect("git diff command failed");
+    let diff_output = match pr_commit_range() {
+        Some(range) => run_git(&["diff", range]).expect("git diff command failed"),
+        None => run_git(&["show", "--format=", "HEAD"]).expect("git show HEAD failed"),
+    };
 
     let name_re = barred_name_regex();
     let path_re = barred_path_regex();
@@ -147,19 +175,38 @@ fn test_tc_t1_f28_3_commit_diffs_privacy() {
 /// corresponding to key xbmc4lyfe.
 #[test]
 fn test_tc_t1_f28_4_commit_signatures_verified() {
-    let sig_output = run_git(&["log", "origin/main..HEAD", "--show-signature"])
-        .expect("git log show-signature failed");
+    let Some(range) = pr_commit_range() else {
+        return;
+    };
 
-    assert!(
-        sig_output.contains("Good \"git\" signature for 273732874+xbmc4lyfe@users.noreply.github.com with ED25519 key"),
-        "Missing or invalid OpenSSH signature in commit history: {sig_output}"
-    );
+    let has_allowed_signers = run_git(&["config", "--get", "gpg.ssh.allowedSignersFile"])
+        .ok()
+        .is_some_and(|p| Path::new(p.trim()).exists());
 
-    // Verify there are no 'BAD signature' or 'Can't check signature' warnings in PR commits
-    assert!(
-        !sig_output.contains("BAD signature"),
-        "Commit signature verification reported BAD signature!"
-    );
+    if has_allowed_signers {
+        let sig_output = run_git(&["log", range, "--show-signature"])
+            .expect("git log show-signature failed");
+
+        assert!(
+            sig_output.contains(
+                "Good \"git\" signature for 273732874+xbmc4lyfe@users.noreply.github.com with ED25519 key"
+            ),
+            "Missing or invalid OpenSSH signature in commit history: {sig_output}"
+        );
+        assert!(
+            !sig_output.contains("BAD signature"),
+            "Commit signature verification reported BAD signature!"
+        );
+    } else {
+        let shas = run_git(&["rev-list", range]).expect("git rev-list failed");
+        for sha in shas.lines().filter(|s| !s.trim().is_empty()) {
+            let raw = run_git(&["cat-file", "commit", sha]).expect("git cat-file commit failed");
+            assert!(
+                raw.contains("-----BEGIN SSH SIGNATURE-----"),
+                "Commit {sha} is missing an OpenSSH signature header"
+            );
+        }
+    }
 }
 
 /// TC-T1-F28-5: Tracked Files Privacy Audit
