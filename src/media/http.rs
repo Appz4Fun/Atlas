@@ -131,14 +131,10 @@ impl Client {
 
     /// `url` holds any key, soo it's never logged and never in a `Trouble`.
     pub fn get(&self, url: &str, headers: &[(&str, &str)]) -> Result<Reply, Trouble> {
-        if let Some((status, cached_body)) = crate::raw_store::get_http_cache(self.name, url) {
-            if status == 200
-                && let Ok(json) = serde_json::from_str::<Value>(&cached_body)
-            {
-                return Ok(Reply::Json(json));
-            } else if status == 404 {
-                return Ok(Reply::NotFound);
-            }
+        if let Some((200, cached_body)) = crate::raw_store::get_http_cache(self.name, url)
+            && let Ok(json) = serde_json::from_str::<Value>(&cached_body)
+        {
+            return Ok(Reply::Json(json));
         }
         self.ready()?;
         let span = crate::metrics::span("media.request");
@@ -201,6 +197,7 @@ impl Client {
                     return Err(Trouble::Bad(format!("{}: a body that doesnt parse", self.name)));
                 };
                 if let Some(url) = cache_url
+                    && !crate::raw_store::is_empty_media_json(&json)
                     && let Ok(text) = serde_json::to_string(&json)
                 {
                     crate::raw_store::put_http_cache(self.name, url, 200, &text);
@@ -209,9 +206,6 @@ impl Client {
                 Ok(Reply::Json(json))
             }
             404 => {
-                if let Some(url) = cache_url {
-                    crate::raw_store::put_http_cache(self.name, url, 404, "");
-                }
                 *self.pause.lock().unwrap() = Pause::default();
                 Ok(Reply::NotFound)
             }

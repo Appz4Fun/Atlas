@@ -137,20 +137,18 @@ impl Poller<'_> {
     fn page(&mut self, page: i64) -> Result<Vec<Entry>, Trouble> {
         let page_num = u32::try_from(page).unwrap_or(u32::MAX);
         let url = page_url(self.spec, page_num, self.page_size);
-        let reply = if let Some(cached_body) = crate::raw_store::get_predb_page_cache(self.spec.key, &url, page_num) {
-            self.first = false;
-            HttpReply { status: 200, retry_after: None, rate_reset: None, body: cached_body }
-        } else {
-            if !self.first && !(self.pause)(self.delay) {
-                return Err(Trouble::Stopped);
-            }
-            self.first = false;
-            let fetched = self.fetch.get(&url).map_err(Trouble::Failed)?;
-            if fetched.status == 200 {
-                crate::raw_store::record_predb_page(self.spec.id, self.spec.key, &url, page_num, &fetched.body);
-            }
-            fetched
-        };
+        let (reply, from_cache) =
+            if let Some(cached_body) = crate::raw_store::get_predb_page_cache(self.spec.key, &url, page_num) {
+                self.first = false;
+                (HttpReply { status: 200, retry_after: None, rate_reset: None, body: cached_body }, true)
+            } else {
+                if !self.first && !(self.pause)(self.delay) {
+                    return Err(Trouble::Stopped);
+                }
+                self.first = false;
+                let fetched = self.fetch.get(&url).map_err(Trouble::Failed)?;
+                (fetched, false)
+            };
         let page = page_num;
         if reply.status == 429 {
             return Err(Trouble::RateLimited(wait_seconds(&reply, self.now_after(), RATE_LIMIT_DEFAULT)));
@@ -178,6 +176,12 @@ impl Poller<'_> {
         // however a source reads its body, one answer is at most this much work for the writer
         if entries.as_ref().is_ok_and(|e| e.len() > MAX_ENTRIES) {
             return Err(Trouble::Failed("too many titles in one answer".into()));
+        }
+        if !from_cache
+            && let Ok(found) = &entries
+            && !found.is_empty()
+        {
+            crate::raw_store::record_predb_page(self.spec.id, self.spec.key, &url, page_num, &reply.body);
         }
         if let (None, Ok(found)) = (self.rows, &entries) {
             self.rows = Some(found.len() as i64);

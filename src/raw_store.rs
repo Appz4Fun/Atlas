@@ -1,14 +1,15 @@
 //! `atlas.raw.db`: permanent, schema-independent raw HTTP & probe archive next to the shards.
 //!
 //! Stores:
-//! - Every unique PreDB feed payload (`raw_predb_log`, Zstd-compressed) so ephemeral page-1 RSS/HTML/JSON
-//!   and rolling paged feeds can be re-parsed into any future schema without historical loss.
-//! - Forever-cached HTTP responses (`raw_http_cache`, Zstd-compressed) for static PreDB dumps
+//! - Every unique non-empty PreDB feed payload (`raw_predb_log`, Zstd-compressed and bounded by quota) so
+//!   ephemeral page-1 RSS/HTML/JSON and rolling paged feeds can be re-parsed into any future schema without
+//!   historical loss.
+//! - Cached HTTP responses (`raw_http_cache`, Zstd-compressed) for static PreDB archive dumps
 //!   and external metadata APIs (`tmdb`, `tvdb`, `tvmaze`, `trakt`, `omdb`, `opensubtitles`).
 //! - Natural-keyed Usenet & hash enrichments (`raw_opensubtitles` by `moviehash`, `raw_probes`, `raw_covers`,
 //!   `raw_archives`, `raw_archive_inner_files`, `raw_nfo_passwords`, `raw_stills` by `(name, group_name)`, and
 //!   `raw_backfill_deepest` / `raw_group_bounds`) so shard resets never require re-querying OpenSubtitles or
-//!   re-downloading probed Usenet article bodies.
+//!   re-downloading probed Usenet article bodies or video stills.
 
 use std::path::{Path, PathBuf};
 #[cfg(not(test))]
@@ -16,9 +17,20 @@ use std::sync::{Mutex, OnceLock};
 
 use anyhow::Context;
 use rusqlite::{Connection, OptionalExtension, params};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::probe::opensubtitles::Feature;
+
+/// Maximum rows kept in `raw_predb_log` before oldest payloads are pruned.
+pub const MAX_PREDB_LOG_ROWS: i64 = 10_000;
+/// Maximum compressed bytes kept in `raw_predb_log` (512 MiB).
+pub const MAX_PREDB_LOG_BYTES: i64 = 512 << 20;
+/// Maximum rows kept in `raw_http_cache` before oldest entries are pruned.
+pub const MAX_HTTP_CACHE_ROWS: i64 = 100_000;
+/// Freshness window for live metadata HTTP cache hits (12 hours: shorter than `media::resolve`'s 1-day
+/// negative retry and `media::details`'s 30-day refresh, while covering same-day schema-test resets).
+pub const LIVE_HTTP_CACHE_TTL_SECS: i64 = 12 * 3_600;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS raw_http_cache (
@@ -224,27 +236,81 @@ pub fn canonical_cache_url(url: &str) -> String {
     }
 }
 
-/// Looks up a forever-cached HTTP response for `source` and `url`.
+/// True when a media JSON response represents an empty search result that should not be cached,
+/// so negative-lookup retries can discover newly added titles upstream.
+pub fn is_empty_media_json(json: &Value) -> bool {
+    if json.as_array().is_some_and(Vec::is_empty) {
+        return true;
+    }
+    let Some(obj) = json.as_object() else {
+        return false;
+    };
+    if obj.get("Response").and_then(Value::as_str).is_some_and(|r| r.eq_ignore_ascii_case("false")) {
+        return true;
+    }
+    for key in ["results", "data", "movie_results", "tv_results", "tv_episode_results"] {
+        if let Some(arr) = obj.get(key).and_then(Value::as_array)
+            && arr.is_empty()
+            && obj.len() <= 4
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Looks up a cached HTTP response for `source` and `url` within `LIVE_HTTP_CACHE_TTL_SECS`.
 pub fn get_http_cache(source: &str, url: &str) -> Option<(u16, String)> {
+    get_http_cache_with_ttl(source, url, Some(LIVE_HTTP_CACHE_TTL_SECS))
+}
+
+fn get_http_cache_with_ttl(source: &str, url: &str, max_age_secs: Option<i64>) -> Option<(u16, String)> {
     let clean_url = canonical_cache_url(url);
     let cache_key = format!("GET:{source}:{clean_url}");
+    let now = chrono::Utc::now().timestamp();
     with_raw(|conn| {
-        let row: Option<(i64, Vec<u8>)> = conn
-            .prepare_cached("SELECT status, body_zst FROM raw_http_cache WHERE cache_key = ?1")?
-            .query_row(params![cache_key], |r| Ok((r.get(0)?, r.get(1)?)))
+        let row: Option<(i64, Vec<u8>, i64)> = conn
+            .prepare_cached("SELECT status, body_zst, fetched_at FROM raw_http_cache WHERE cache_key = ?1")?
+            .query_row(params![cache_key], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
             .optional()?;
-        Ok(row.and_then(|(status, zst)| Some((u16::try_from(status).ok()?, decompress(&zst)?))))
+        let Some((status, zst, fetched_at)) = row else {
+            return Ok(None);
+        };
+        if let Some(ttl) = max_age_secs
+            && now.saturating_sub(fetched_at) > ttl
+        {
+            return Ok(None);
+        }
+        let (Some(code), Some(body)) = (u16::try_from(status).ok(), decompress(&zst)) else {
+            return Ok(None);
+        };
+        Ok(Some((code, body)))
     })
     .flatten()
 }
 
-/// Saves an HTTP response in `raw_http_cache`.
+fn prune_http_cache(conn: &Connection, max_rows: i64) -> rusqlite::Result<()> {
+    let count: i64 = conn.query_row("SELECT count(*) FROM raw_http_cache", [], |r| r.get(0))?;
+    if count >= max_rows {
+        let to_drop = (count - max_rows + 1).max(64);
+        conn.execute(
+            "DELETE FROM raw_http_cache WHERE cache_key IN (
+                SELECT cache_key FROM raw_http_cache ORDER BY fetched_at ASC LIMIT ?1
+            )",
+            params![to_drop],
+        )?;
+    }
+    Ok(())
+}
+
+/// Saves an HTTP response in `raw_http_cache`, enforcing `MAX_HTTP_CACHE_ROWS`.
 pub fn put_http_cache(source: &str, url: &str, status: u16, body: &str) {
     let Some(zst) = compress(body) else { return };
     let clean_url = canonical_cache_url(url);
     let cache_key = format!("GET:{source}:{clean_url}");
     let now = chrono::Utc::now().timestamp();
     let _ = with_raw(|conn| {
+        prune_http_cache(conn, MAX_HTTP_CACHE_ROWS)?;
         conn.prepare_cached(
             "INSERT OR REPLACE INTO raw_http_cache (cache_key, source, url, status, body_zst, fetched_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -254,11 +320,11 @@ pub fn put_http_cache(source: &str, url: &str, status: u16, body: &str) {
     });
 }
 
-/// True if a PreDB feed URL is a static archive dump whose contents do not roll over as new releases arrive.
-/// Rolling numbered pages (`predb_club`, `predb_net`, `xrel`, etc.) are always fetched live during polling
-/// and archived in `raw_predb_log` for replay.
+/// True only for static historical PreDB archive snapshots (`nzedb_archive` and `dats_pciso_1998`).
+/// Live catalogues (`nswdb`, `3dsdb`) and rolling numbered feeds (`predb_club`, `predb_net`, `xrel`, etc.)
+/// are fetched live according to their poll intervals and archived in `raw_predb_log` for replay.
 pub fn is_immutable_predb_page(source_key: &str, _page: u32) -> bool {
-    matches!(source_key, "nswdb" | "3dsdb" | "nzedb_archive" | "dats_pciso_1998")
+    matches!(source_key, "nzedb_archive" | "dats_pciso_1998")
 }
 
 /// Returns a forever-cached PreDB response if `is_immutable_predb_page(source_key, page)` is true.
@@ -266,18 +332,54 @@ pub fn get_predb_page_cache(source_key: &str, url: &str, page: u32) -> Option<St
     if !is_immutable_predb_page(source_key, page) {
         return None;
     }
-    get_http_cache(source_key, url).and_then(|(status, body)| (status == 200).then_some(body))
+    get_http_cache_with_ttl(source_key, url, None).and_then(|(status, body)| (status == 200).then_some(body))
 }
 
-/// Archives every HTTP 200 PreDB payload in `raw_predb_log` (deduplicated by SHA-256) and, if it is a
-/// static dump, also caches it in `raw_http_cache`.
+fn prune_predb_log(conn: &Connection, incoming_bytes: i64, max_rows: i64, max_bytes: i64) -> rusqlite::Result<()> {
+    let (rows, bytes): (i64, i64) = conn.query_row(
+        "SELECT count(*), coalesce(sum(length(body_zst)), 0) FROM raw_predb_log",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    if rows >= max_rows {
+        let drop_rows = (rows - max_rows + 1).max(1);
+        conn.execute(
+            "DELETE FROM raw_predb_log WHERE id IN (SELECT id FROM raw_predb_log ORDER BY id ASC LIMIT ?1)",
+            params![drop_rows],
+        )?;
+    }
+    if bytes + incoming_bytes > max_bytes {
+        let mut total: i64 =
+            conn.query_row("SELECT coalesce(sum(length(body_zst)), 0) FROM raw_predb_log", [], |r| r.get(0))?;
+        while total + incoming_bytes > max_bytes {
+            let deleted = conn.execute(
+                "DELETE FROM raw_predb_log WHERE id IN (SELECT id FROM raw_predb_log ORDER BY id ASC LIMIT 16)",
+                [],
+            )?;
+            if deleted == 0 {
+                break;
+            }
+            total =
+                conn.query_row("SELECT coalesce(sum(length(body_zst)), 0) FROM raw_predb_log", [], |r| r.get(0))?;
+        }
+    }
+    Ok(())
+}
+
+/// Archives a validated, non-empty PreDB payload in `raw_predb_log` (deduplicated by SHA-256 and bounded
+/// by `MAX_PREDB_LOG_ROWS` / `MAX_PREDB_LOG_BYTES`) and, if it is a static archive snapshot, also caches it
+/// in `raw_http_cache`.
 pub fn record_predb_page(source_id: i64, source_key: &str, url: &str, page: u32, body: &str) {
     let Some(zst) = compress(body) else { return };
+    if zst.len() as i64 > MAX_PREDB_LOG_BYTES {
+        return;
+    }
     let sha256 = Sha256::digest(body.as_bytes()).to_vec();
     let clean_url = canonical_cache_url(url);
     let now = chrono::Utc::now().timestamp();
     let cache_forever = is_immutable_predb_page(source_key, page);
     let _ = with_raw(|conn| {
+        prune_predb_log(conn, zst.len() as i64, MAX_PREDB_LOG_ROWS, MAX_PREDB_LOG_BYTES)?;
         conn.prepare_cached(
             "INSERT OR IGNORE INTO raw_predb_log (source_id, source_key, url, page, body_sha256, body_zst, fetched_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -475,6 +577,65 @@ pub fn put_probe(rec: &ProbeRecord<'_>) {
     });
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SavedStill {
+    pub position: u8,
+    pub at_ms: Option<i64>,
+    pub sha256: String,
+    pub width: u32,
+    pub height: u32,
+    pub phash: Option<i64>,
+}
+
+/// Looks up previously extracted stills for `(name, group_name)` in `raw_stills`.
+pub fn get_stills(name: &str, group_name: &str) -> Vec<SavedStill> {
+    with_raw(|conn| {
+        let rows = conn
+            .prepare_cached(
+                "SELECT position, at_ms, sha256, width, height, phash
+                 FROM raw_stills WHERE name = ?1 AND group_name = ?2 ORDER BY position",
+            )?
+            .query_map(params![name, group_name], |r| {
+                Ok(SavedStill {
+                    position: r.get::<_, i64>(0)?.clamp(0, 255) as u8,
+                    at_ms: r.get(1)?,
+                    sha256: r.get(2)?,
+                    width: r.get::<_, Option<i64>>(3)?.unwrap_or(0).max(0) as u32,
+                    height: r.get::<_, Option<i64>>(4)?.unwrap_or(0).max(0) as u32,
+                    phash: r.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    })
+    .unwrap_or_default()
+}
+
+/// Persists extracted stills for `(name, group_name)` in `raw_stills`.
+pub fn put_stills(name: &str, group_name: &str, stills: &[SavedStill]) {
+    let _ = with_raw(|conn| {
+        conn.prepare_cached("DELETE FROM raw_stills WHERE name = ?1 AND group_name = ?2")?
+            .execute(params![name, group_name])?;
+        let mut insert = conn.prepare_cached(
+            "INSERT OR REPLACE INTO raw_stills (name, group_name, position, at_ms, sha256, width, height, phash)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        )?;
+        for s in stills {
+            insert.execute(params![
+                name,
+                group_name,
+                i64::from(s.position),
+                s.at_ms,
+                s.sha256,
+                i64::from(s.width),
+                i64::from(s.height),
+                s.phash
+            ])?;
+        }
+        Ok(())
+    });
+}
+
 fn has_table(conn: &Connection, schema: &str, table: &str) -> rusqlite::Result<bool> {
     conn.prepare(&format!("SELECT 1 FROM {schema}.sqlite_master WHERE type = 'table' AND name = ?1"))?
         .exists([table])
@@ -616,67 +777,87 @@ pub fn harvest_from_shards(main: &Path, log: &dyn Fn(&str)) -> anyhow::Result<()
 }
 
 /// Replays all raw HTTP payloads in `raw_predb_log` through current PreDB parsers into `atlas.predb.db`.
-pub fn run_replay_predb(args: &[String]) -> i32 {
-    let apply = args.iter().any(|a| a == "--apply");
-    let main = crate::paths::database();
-    let raw_path = path_for(&main);
-    let predb_path = crate::predb::db::path_for(&main);
-    let Ok(raw_conn) = create(&raw_path) else {
-        println!("couldnt open {}", raw_path.display());
-        return 1;
-    };
-    let Ok(mut predb_conn) = crate::predb::db::create(&predb_path) else {
-        println!("couldnt open {}", predb_path.display());
-        return 1;
-    };
-    let rows: Vec<(i64, String, i64, Vec<u8>, i64)> = raw_conn
-        .prepare("SELECT source_id, source_key, page, body_zst, fetched_at FROM raw_predb_log ORDER BY id")
-        .and_then(|mut s| {
-            s.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?
-                .collect::<rusqlite::Result<Vec<_>>>()
-        })
-        .unwrap_or_default();
+pub fn replay_predb_at(main: &Path, apply: bool, log: &dyn Fn(&str)) -> anyhow::Result<()> {
+    let raw_path = path_for(main);
+    let predb_path = crate::predb::db::path_for(main);
+    let raw_conn = create(&raw_path).with_context(|| format!("opening {}", raw_path.display()))?;
+    let mut predb_conn =
+        crate::predb::db::create(&predb_path).with_context(|| format!("opening {}", predb_path.display()))?;
+    let rows: Vec<(i64, i64, String, i64, Vec<u8>, i64)> = raw_conn
+        .prepare("SELECT id, source_id, source_key, page, body_zst, fetched_at FROM raw_predb_log ORDER BY id")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("reading raw_predb_log")?;
     let mut parsed_entries = 0usize;
     let mut inserted = 0u64;
     let mut updated = 0u64;
-    for (source_id, key, page, zst, fetched_at) in &rows {
-        let Some(spec) = crate::predb::feeds::spec(key) else { continue };
-        let Some(body) = decompress(zst) else { continue };
+    for (id, source_id, key, page, zst, fetched_at) in &rows {
+        let spec = crate::predb::feeds::spec(key)
+            .ok_or_else(|| anyhow::anyhow!("unknown predb source '{key}' in raw_predb_log id={id}"))?;
+        let body = decompress(zst)
+            .ok_or_else(|| anyhow::anyhow!("corrupt zstd payload in raw_predb_log id={id} ({key})"))?;
         let page_num = u32::try_from(*page).unwrap_or(1).max(1);
         let entries = match spec.parse {
             crate::predb::feeds::Parser::Json(parse) => {
-                serde_json::from_str::<serde_json::Value>(&body).ok().and_then(|v| parse(&v, page_num).ok())
+                let val: Value = serde_json::from_str(&body)
+                    .with_context(|| format!("bad JSON in raw_predb_log id={id} ({key})"))?;
+                parse(&val, page_num).map_err(|e| anyhow::anyhow!("parse error in raw_predb_log id={id} ({key}): {e:?}"))?
             }
-            crate::predb::feeds::Parser::Text(parse) => parse(&body).ok(),
+            crate::predb::feeds::Parser::Text(parse) => {
+                parse(&body).map_err(|e| anyhow::anyhow!("parse error in raw_predb_log id={id} ({key}): {e:?}"))?
+            }
         };
-        let Some(entries) = entries else { continue };
         parsed_entries += entries.len();
-        if apply && let Ok(c) = crate::predb::import::import(&mut predb_conn, *source_id, &entries, *fetched_at, None) {
+        if apply {
+            let c = crate::predb::import::import(&mut predb_conn, *source_id, &entries, *fetched_at, None)
+                .with_context(|| format!("importing raw_predb_log id={id} ({key}) into {}", predb_path.display()))?;
             inserted += c.inserted;
             updated += c.updated;
         }
     }
     if apply {
-        println!(
+        log(&format!(
             "replayed {} raw predb payloads ({} entries): {} inserted, {} updated",
             rows.len(),
             parsed_entries,
             inserted,
             updated
-        );
+        ));
     } else {
-        println!(
+        log(&format!(
             "dry run (pass --apply to write): {} raw predb payloads yield {} parsed entries",
             rows.len(),
             parsed_entries
-        );
+        ));
+    }
+    Ok(())
+}
+
+pub fn run_replay_predb(args: &[String]) -> i32 {
+    let apply = args.iter().any(|a| a == "--apply");
+    let main = crate::paths::database();
+    if let Err(e) = replay_predb_at(&main, apply, &|msg| println!("{msg}")) {
+        println!("couldnt replay raw predb payloads: {e:#}");
+        return 1;
     }
     0
 }
 
-/// Safely harvests natural-keyed shard data into `atlas.raw.db` and resets only `atlas.db` and `atlas.s0..s7.db`,
-/// keeping `atlas.raw.db`, `atlas.predb.db`, `atlas.media.db`, `atlas.details.db`, `posters/`, `covers/`, and `stills/`.
+/// Safely holds the exclusive database lock, resolves any interrupted conversion/compaction swaps,
+/// harvests natural-keyed shard data into `atlas.raw.db`, and removes `atlas.db`, `atlas.s0..s7.db`,
+/// and compaction/conversion scratch files while keeping `atlas.raw.db`, `atlas.predb.db`,
+/// `atlas.media.db`, `atlas.details.db`, `posters/`, `covers/`, and `stills/`.
 pub fn reset_shards_at(main: &Path, log: &dyn Fn(&str)) -> anyhow::Result<()> {
+    let _exclusive = crate::compact::Lock::take(main)?;
+    if (!main.try_exists()? || crate::convert::is_empty_interloper(main))
+        && let Some(msg) = crate::convert::recover_cut_swap(main)?
+    {
+        log(&msg);
+    }
+    for msg in crate::compact::recover_cut_swaps(main)? {
+        log(&msg);
+    }
+    crate::compact::refuse_unresolved_backups(main)?;
     harvest_from_shards(main, log)?;
     let media_path = crate::compact::with_suffix(main, "media");
     if media_path.exists() {
@@ -695,7 +876,7 @@ pub fn reset_shards_at(main: &Path, log: &dyn Fn(&str)) -> anyhow::Result<()> {
         }
     }
     let remove_db_family = |base: &Path| -> anyhow::Result<()> {
-        for suffix in ["", "-wal", "-shm", ".sealed-log-cursor"] {
+        for suffix in ["", "-wal", "-shm", "-journal", ".sealed-log-cursor"] {
             let p = PathBuf::from(format!("{}{suffix}", base.display()));
             match std::fs::remove_file(&p) {
                 Ok(()) => {}
@@ -705,9 +886,16 @@ pub fn reset_shards_at(main: &Path, log: &dyn Fn(&str)) -> anyhow::Result<()> {
         }
         Ok(())
     };
-    for i in 0..crate::store::SHARDS {
-        remove_db_family(&crate::store::shard_path(main, i))?;
+    for shard in crate::store::shard_paths(main) {
+        let copy = crate::compact::with_suffix(&shard, "compact");
+        remove_db_family(&crate::compact::with_suffix(&copy, "check"))?;
+        remove_db_family(&copy)?;
+        remove_db_family(&crate::compact::with_suffix(&shard, "domains"))?;
+        remove_db_family(&crate::compact::with_suffix(&shard, "precompact"))?;
+        remove_db_family(&shard)?;
     }
+    remove_db_family(&main.with_file_name("atlas.old.db"))?;
+    remove_db_family(&main.with_file_name("atlas.new.db"))?;
     remove_db_family(main)?;
     if let Some(dir) = main.parent()
         && let Ok(entries) = std::fs::read_dir(dir)
@@ -774,24 +962,49 @@ mod tests {
     }
 
     #[test]
-    fn raw_store_roundtrips_http_predb_opensubtitles_and_probes() {
+    fn raw_store_roundtrips_http_predb_opensubtitles_probes_and_stills() {
         let dir = tempfile::tempdir().unwrap();
         let raw_path = dir.path().join("atlas.raw.db");
-        set_test_raw_path(Some(raw_path));
+        set_test_raw_path(Some(raw_path.clone()));
 
         put_http_cache("tmdb", "https://api.themoviedb.org/3/movie/603?api_key=SECRET", 200, r#"{"id":603}"#);
         assert_eq!(
             get_http_cache("tmdb", "https://api.themoviedb.org/3/movie/603?api_key=OTHER_KEY"),
             Some((200, r#"{"id":603}"#.to_string()))
         );
+        // Expired HTTP cache entries are not served live so 24h negative retries and 30d refreshes reach upstream.
+        assert_eq!(
+            get_http_cache_with_ttl("tmdb", "https://api.themoviedb.org/3/movie/603", Some(-1)),
+            None
+        );
 
-        // Rolling PreDB feeds are logged in raw_predb_log for replay, never served as immutable HTTP cache hits.
+        // Empty media search results are detected so negative lookups aren't pinned in raw_http_cache.
+        assert!(is_empty_media_json(&serde_json::from_str("[]").unwrap()));
+        assert!(is_empty_media_json(&serde_json::from_str(r#"{"page":1,"results":[]}"#).unwrap()));
+        assert!(is_empty_media_json(&serde_json::from_str(r#"{"Response":"False","Error":"Movie not found!"}"#).unwrap()));
+        assert!(!is_empty_media_json(&serde_json::from_str(r#"{"id":603,"title":"The Matrix"}"#).unwrap()));
+
+        // Rolling PreDB feeds and live catalogues (nswdb, 3dsdb) are logged in raw_predb_log for replay,
+        // never served as immutable HTTP cache hits.
         record_predb_page(1, "predb_club", "https://predb.club/api/v1/?page=2", 2, r#"{"status":"success"}"#);
         assert_eq!(get_predb_page_cache("predb_club", "https://predb.club/api/v1/?page=2", 2), None);
-
-        // Static archive dumps are cached forever in raw_http_cache.
         record_predb_page(30, "nswdb", "https://nswdb.com/xml", 1, "<releases/>");
-        assert_eq!(get_predb_page_cache("nswdb", "https://nswdb.com/xml", 1), Some("<releases/>".to_string()));
+        assert_eq!(get_predb_page_cache("nswdb", "https://nswdb.com/xml", 1), None);
+
+        // Static historical archive snapshots (nzedb_archive, dats_pciso_1998) are cached in raw_http_cache.
+        record_predb_page(33, "nzedb_archive", "https://example.invalid/nzedb.tsv", 1, "title\tcat\n");
+        assert_eq!(
+            get_predb_page_cache("nzedb_archive", "https://example.invalid/nzedb.tsv", 1),
+            Some("title\tcat\n".to_string())
+        );
+
+        // Quota pruning on raw_predb_log keeps row count and byte usage bounded.
+        {
+            let conn = create(&raw_path).unwrap();
+            prune_predb_log(&conn, 100, 1, MAX_PREDB_LOG_BYTES).unwrap();
+            let count: i64 = conn.query_row("SELECT count(*) FROM raw_predb_log", [], |r| r.get(0)).unwrap();
+            assert!(count <= 1);
+        }
 
         let feat = Feature {
             imdb_id: Some(133093),
@@ -820,7 +1033,6 @@ mod tests {
             nfo_password: Some("secretpw"),
             cover: Some(("image/jpeg", "deadbeef")),
         });
-        // Matching completeness, parts, and stamp -> cache hit with cover and NFO password restored.
         let saved = get_probe("Some.Release-GRP", "alt.binaries.test", 20, false, stamp).unwrap();
         assert_eq!(saved.crc32, Some(12345));
         assert_eq!(saved.agent.as_deref(), Some("Nyuu"));
@@ -836,15 +1048,34 @@ mod tests {
         // Probe step config_stamp gained a new bit -> invalidated!
         assert_eq!(get_probe("Some.Release-GRP", "alt.binaries.test", 20, false, stamp | 16), None);
 
+        // Stills roundtrip
+        let stills = vec![SavedStill {
+            position: 25,
+            at_ms: Some(120_000),
+            sha256: "a".repeat(64),
+            width: 960,
+            height: 540,
+            phash: Some(42),
+        }];
+        put_stills("Some.Release-GRP", "alt.binaries.test", &stills);
+        assert_eq!(get_stills("Some.Release-GRP", "alt.binaries.test"), stills);
+
         set_test_raw_path(None);
     }
 
     #[test]
-    fn reset_shards_aborts_without_deleting_when_a_shard_harvest_fails() {
+    fn reset_shards_holds_lock_recovers_or_cleans_compaction_artifacts_and_aborts_on_failure() {
         let dir = tempfile::tempdir().unwrap();
         let main = dir.path().join("atlas.db");
         crate::db::create_db_at(&main).unwrap();
-        // Corrupt shard s0 by replacing its releases table so harvesting fails.
+
+        // 1. If a writer/compaction lock is held, reset_shards_at refuses immediately.
+        let guard = crate::compact::try_hold_off_compaction(&main).unwrap().unwrap();
+        let busy_err = reset_shards_at(&main, &|_| {}).expect_err("must refuse while lock is held");
+        assert!(busy_err.downcast_ref::<crate::compact::Busy>().is_some(), "{busy_err:#}");
+        drop(guard);
+
+        // 2. If a shard is corrupt (missing releases table), reset_shards_at aborts without deleting anything.
         let s0 = crate::store::shard_path(&main, 0);
         let conn = Connection::open(&s0).unwrap();
         conn.execute_batch("DROP TABLE releases;").unwrap();
@@ -854,5 +1085,19 @@ mod tests {
         assert!(format!("{err:#}").contains("s0"), "{err:#}");
         assert!(main.exists(), "main db must not be deleted on failed harvest");
         assert!(s0.exists(), "shard s0 must not be deleted on failed harvest");
+
+        // 3. Restore valid s0, plant compaction/conversion leftovers, and verify clean reset.
+        std::fs::copy(crate::store::shard_path(&main, 1), &s0).unwrap();
+        let precompact_s1 = crate::compact::with_suffix(&crate::store::shard_path(&main, 1), "precompact");
+        std::fs::remove_file(crate::store::shard_path(&main, 1)).unwrap();
+        std::fs::copy(crate::store::shard_path(&main, 2), &precompact_s1).unwrap();
+        let old_main = main.with_file_name("atlas.old.db");
+        std::fs::write(&old_main, b"old").unwrap();
+
+        reset_shards_at(&main, &|_| {}).unwrap();
+        assert!(!main.exists());
+        assert!(!old_main.exists());
+        assert!(!precompact_s1.exists());
+        assert!(path_for(&main).exists(), "atlas.raw.db must be preserved");
     }
 }
