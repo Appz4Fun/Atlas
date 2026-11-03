@@ -1061,11 +1061,12 @@ where
     // that is the home's
     let start = first.max(cursor - settings.batch_size.max(1) + 1);
     let pass = Pass { ctx, settings, db, group, server, key: key.clone() };
-    let (saved, complete) = pass.process_range(start, cursor, "SWEEP", progress).await?;
-    if complete {
-        on_db(db, move |conn| Ok(db::update_backfill_cursor(conn, &key, start - 1)?)).await?;
+    let ranged = pass.process_range(start, cursor, "SWEEP", progress).await;
+    // done down from the cursor: the cursor moves past it, failed or not
+    if let Some(high) = ranged.high_done {
+        on_db(db, move |conn| Ok(db::update_backfill_cursor(conn, &key, high as i64 - 1)?)).await?;
     }
-    Ok(saved)
+    ranged.into_result()
 }
 
 /// a day chunk also takes this much on each side: post dates are only
@@ -1384,16 +1385,17 @@ where
 
     let pass = Pass { ctx, settings, db, group, server, key: cursor_key(&ctx.pool, server, group) };
     let window = alone.then_some((day * 86_400, (day + 1) * 86_400));
-    match pass.process_range_dated(start as i64, end as i64, "CHUNK", window, progress).await {
-        Ok((saved, true, dated_in_day)) => {
-            finish_chunk(db, chunk, (alone, floor, oldest), dated_in_day).await?;
+    let ranged = pass.process_range_dated(start as i64, end as i64, "CHUNK", window, progress).await;
+    match ranged {
+        Ranged { error: Some(e), .. } => failed(e).await,
+        Ranged { saved, complete: true, in_window, .. } => {
+            finish_chunk(db, chunk, (alone, floor, oldest), in_window).await?;
             Ok(saved)
         }
-        Ok((saved, false, _)) => {
+        Ranged { saved, .. } => {
             release().await?;
             Ok(saved)
         }
-        Err(e) => failed(e).await,
     }
 }
 
@@ -1536,13 +1538,14 @@ impl Pass<'_> {
         }
 
         let end = last.min(start + self.settings.batch_size.max(1) - 1);
-        let (saved, complete) = self.process_range(start, end, "LIVE", progress).await?;
+        let ranged = self.process_range(start, end, "LIVE", progress).await;
 
-        if complete {
+        // done up from the cursor: the cursor moves past it, failed or not
+        if let Some(low) = ranged.low_done {
             let key = self.key.clone();
-            on_db(self.db, move |conn| Ok(db::update_live_cursor(conn, &key, end)?)).await?;
+            on_db(self.db, move |conn| Ok(db::update_live_cursor(conn, &key, low as i64)?)).await?;
         }
-        Ok(saved)
+        ranged.into_result()
     }
 
     async fn backfill<P>(&self, state: db::GroupState, first: i64, last: i64, progress: &mut P) -> Result<Progress>
@@ -1576,12 +1579,14 @@ impl Pass<'_> {
 
         // grab a chunk going backwards from the cursor
         let start = first.max(end - self.settings.batch_size.max(1) + 1);
-        let (saved, complete) = self.process_range(start, end, "BACKFILL", progress).await?;
+        let ranged = self.process_range(start, end, "BACKFILL", progress).await;
 
-        if complete {
+        // done down from the cursor: the cursor moves past it, failed or not
+        if let Some(high) = ranged.high_done {
             let key = self.key.clone();
-            on_db(self.db, move |conn| Ok(db::update_backfill_cursor(conn, &key, start - 1)?)).await?;
+            on_db(self.db, move |conn| Ok(db::update_backfill_cursor(conn, &key, high as i64 - 1)?)).await?;
         }
+        let saved = ranged.into_result()?;
         self.ctx.states.with(group, |st| st.backfilling = true);
         Ok(saved)
     }
@@ -1591,14 +1596,14 @@ impl Pass<'_> {
     /// saved as soon as it lands while the rest keep downloading. Backfill takes
     /// the newest slices first.
     ///
-    /// The bool is true when the whole range is done and its cursor can move,
-    /// false when `stop` cut it short (what was saved stays, the range gets redone).
-    async fn process_range<P>(&self, start: i64, end: i64, kind: &str, progress: &mut P) -> Result<(Progress, bool)>
+    /// A slice failing stops new ones from starting, but the ones that made it
+    /// are still saved, and `Ranged` says how far the range is done from
+    /// either end, soo a cursor can move past them and they arent fetched again.
+    async fn process_range<P>(&self, start: i64, end: i64, kind: &str, progress: &mut P) -> Ranged
     where
         P: FnMut(&Progress) + ?Sized,
     {
-        let (saved, complete, _) = self.process_range_dated(start, end, kind, None, progress).await?;
-        Ok((saved, complete))
+        self.process_range_dated(start, end, kind, None, progress).await
     }
 
     /// `process_range`, also how many articles retrieved are dated within
@@ -1610,14 +1615,23 @@ impl Pass<'_> {
         kind: &str,
         window: Option<(i64, i64)>,
         progress: &mut P,
-    ) -> Result<(Progress, bool, i64)>
+    ) -> Ranged
     where
         P: FnMut(&Progress) + ?Sized,
     {
         let mut in_window = 0i64;
         let (pool, group) = (&self.ctx.pool, self.group);
         if crate::filters::group_blocked(group) {
-            return Ok((Progress::default(), true, 0));
+            let (start, end) = (start.max(0) as u64, end.max(0) as u64);
+            let saved = Progress::default();
+            return Ranged {
+                saved,
+                complete: true,
+                in_window,
+                low_done: Some(end),
+                high_done: Some(start),
+                error: None,
+            };
         }
         // no slice bigger than the whole unsaved budget: it would hold more
         // headers than the cap allows
@@ -1628,25 +1642,30 @@ impl Pass<'_> {
         let mut rx = pool.stream_headers(group, self.server, slices, self.ctx.stop.clone());
         let mut saved = Progress::default();
         let mut done = 0;
+        let mut finished = Finished::default();
         let mut error: Option<anyhow::Error> = None;
+        // a failed save stops the saving, a failed fetch only stops the fetching
+        let mut save_failed = false;
         // dated ends of what this pass saved, for the stats dashboard's history numbers
         let (mut low, mut high): (Option<db::Dated>, Option<db::Dated>) = (None, None);
 
         while let Some(slice) = rx.recv().await {
-            // the slice's room in the unsaved budget goes back once it's saved
-            // (or skipped), at the end of this loop
-            let _unsaved = slice.unsaved;
+            // the slice's room in the unsaved budget goes back once it's parsed
+            // (or skipped)
+            let unsaved = slice.unsaved;
             let headers: Vec<Overview> = match slice.result {
                 Ok(h) => h,
                 // 423 (or 420) = no articles in that slice
                 Err(e) if e.is_empty_range() => {
                     done += 1;
+                    finished.add(slice.start, slice.end);
                     continue;
                 }
                 Err(e) if e.is_permanent() => {
                     let code = e.code().unwrap_or(0);
                     println!("[{kind}] {group} {}-{} not available ({code}), skipping", slice.start, slice.end);
                     done += 1;
+                    finished.add(slice.start, slice.end);
                     continue;
                 }
                 Err(e) => {
@@ -1655,8 +1674,7 @@ impl Pass<'_> {
                 }
             };
 
-            // the pass is failing anyway, dont save half of it
-            if error.is_some() {
+            if save_failed {
                 continue;
             }
 
@@ -1667,7 +1685,7 @@ impl Pass<'_> {
                     .count() as i64;
             }
             let dated = slice_date(&headers);
-            match save_slice(pool, self.db, group, headers).await {
+            match save_slice(pool, self.db, group, headers, unsaved).await {
                 Ok(p) => {
                     if let Some(d) = dated {
                         low = low.filter(|l| l.0 <= d.0).or(Some(d));
@@ -1675,9 +1693,11 @@ impl Pass<'_> {
                     }
                     saved.add(&p);
                     done += 1;
+                    finished.add(slice.start, slice.end);
                     progress(&p);
                 }
                 Err(e) => {
+                    save_failed = true;
                     error.get_or_insert(e);
                 }
             }
@@ -1685,14 +1705,12 @@ impl Pass<'_> {
 
         if let (Some(low), Some(high)) = (low, high) {
             let key = self.key.clone();
-            on_db(self.db, move |conn| Ok(db::save_group_dates(conn, &key, low, high)?)).await?;
+            if let Err(e) = on_db(self.db, move |conn| Ok(db::save_group_dates(conn, &key, low, high)?)).await {
+                error.get_or_insert(e);
+            }
         }
 
-        if let Some(e) = error {
-            return Err(e);
-        }
-
-        if saved.articles == 0 && done == total {
+        if error.is_none() && saved.articles == 0 && done == total {
             println!("[{kind}] {group} {start}-{end} empty, skipping");
         }
 
@@ -1708,8 +1726,79 @@ impl Pass<'_> {
             println!("[{kind}] {group} {} headers in {done}/{total} slices", saved.articles);
         }
 
-        // stopped early: what got saved stays, the cursor waits for the rest
-        Ok((saved, done == total, in_window))
+        // failed or stopped early: what got saved stays, the cursor moves past
+        // the done run next to it and waits for the rest
+        let (low_done, high_done) = finished.ends(start.max(0) as u64, end.max(0) as u64);
+        Ranged { saved, complete: done == total, in_window, low_done, high_done, error }
+    }
+}
+
+/// How a range pass went. `low_done` / `high_done`: the range is done from
+/// its start up to `low_done`, and from `high_done` up to its end (None when
+/// its first, or its last, slice isnt done): what a cursor going up, or going
+/// down, can move past even when the pass failed or was stopped.
+struct Ranged {
+    saved: Progress,
+    /// every slice done: the whole range, and its cursor can move
+    complete: bool,
+    in_window: i64,
+    low_done: Option<u64>,
+    high_done: Option<u64>,
+    /// the first failure; what got saved before and after it stays saved
+    error: Option<anyhow::Error>,
+}
+
+impl Ranged {
+    /// the progress, or the failure (once the caller moved its cursor)
+    fn into_result(self) -> Result<Progress> {
+        match self.error {
+            Some(e) => Err(e),
+            None => Ok(self.saved),
+        }
+    }
+}
+
+/// The slices of a range that are done (saved, empty or not available).
+#[derive(Default)]
+struct Finished(Vec<(u64, u64)>);
+
+impl Finished {
+    fn add(&mut self, start: u64, end: u64) {
+        self.0.push((start, end));
+    }
+
+    /// How far `start..=end` is done from each end: the last number of the
+    /// done run starting at `start`, the first of the one ending at `end`.
+    fn ends(&self, start: u64, end: u64) -> (Option<u64>, Option<u64>) {
+        let mut done = self.0.clone();
+        done.sort_unstable();
+
+        let mut low = None;
+        let mut next = start;
+        for &(a, b) in &done {
+            if a != next {
+                break;
+            }
+            low = Some(b);
+            match b.checked_add(1) {
+                Some(n) => next = n,
+                None => break,
+            }
+        }
+
+        let mut high = None;
+        let mut prev = end;
+        for &(a, b) in done.iter().rev() {
+            if b != prev {
+                break;
+            }
+            high = Some(a);
+            match a.checked_sub(1) {
+                Some(n) => prev = n,
+                None => break,
+            }
+        }
+        (low, high)
     }
 }
 
@@ -1730,20 +1819,34 @@ fn slice_date(headers: &[Overview]) -> Option<db::Dated> {
 }
 
 /// Parse one slice into releases, look up real names, save.
-async fn save_slice(pool: &Arc<Pool>, db: &Db, group: &str, headers: Vec<Overview>) -> Result<Progress> {
+/// `unsaved` is the slice's room in the unsaved budget: the parsed releases
+/// stand for its headers until they are committed, soo it goes back only then.
+async fn save_slice(
+    pool: &Arc<Pool>,
+    db: &Db,
+    group: &str,
+    headers: Vec<Overview>,
+    unsaved: crate::nntp::Unsaved,
+) -> Result<Progress> {
     let articles = headers.len() as i64;
     if crate::filters::group_blocked(group) {
         return Ok(Progress { articles, ..Progress::default() });
     }
     let span = crate::metrics::span("indexer.save_slice");
-    let saved = parse_and_save(pool, db, group, headers).await;
+    let saved = parse_and_save(pool, db, group, headers, unsaved).await;
     if saved.is_err() {
         span.failed();
     }
     saved
 }
 
-async fn parse_and_save(pool: &Arc<Pool>, db: &Db, group: &str, headers: Vec<Overview>) -> Result<Progress> {
+async fn parse_and_save(
+    pool: &Arc<Pool>,
+    db: &Db,
+    group: &str,
+    headers: Vec<Overview>,
+    unsaved: crate::nntp::Unsaved,
+) -> Result<Progress> {
     let articles = headers.len() as i64;
     crate::profile::SLICES.add(1);
     crate::profile::HEADERS.add(articles as u64);
@@ -1766,7 +1869,8 @@ async fn parse_and_save(pool: &Arc<Pool>, db: &Db, group: &str, headers: Vec<Ove
     crate::profile::PARSE.add_since(t);
     crate::profile::Load::add_since(&crate::profile::LOAD.parse_ns, t);
 
-    // real names from par2/nfo bodies, every release looked up concurrently
+    // real names from par2/nfo bodies, every release looked up concurrently,
+    // a few first segments each (see `name_sources`)
     let t = std::time::Instant::now();
     // once the stage has a body budget it reads them, not the save path
     let names = if crate::archive::inline_lookups() {
@@ -1797,15 +1901,22 @@ async fn parse_and_save(pool: &Arc<Pool>, db: &Db, group: &str, headers: Vec<Ove
         }
         saved?;
     }
+    // the parsed releases stood for these headers until they were committed: the room goes back only now, soo
+    // slices waiting on a slow writer stay inside `max_unsaved_headers`
+    drop(unsaved);
 
     Ok(Progress { articles, bytes, releases: count, skipped })
 }
 
-/// a release needs one name, and `first_names` tries a release's sources one
-/// after another: a post of thousands of nfos must not stall a slice
-const NAME_SOURCES_MAX: usize = 8;
+/// bodies a release's name lookup tries at most
+const MAX_NAME_BODIES: usize = 3;
 
-/// Bodies worth fetching for a real name: base par2 files first, then nfos.
+/// Bodies worth fetching for a real name: base par2 files first, then nfos,
+/// only their first segment (where par2 and nfo files keep what names a
+/// release, and it comes once per file, so a release is looked up once
+/// however many slices it spans) and `MAX_NAME_BODIES` at most. A big
+/// obfuscated par2 comes in thousands of segments of most of a MB each;
+/// trying them one after another held a slice for minutes.
 fn name_sources(release: &Release) -> Vec<(String, Extract)> {
     type Matches = fn(&str) -> bool;
     let sources: [(Matches, Extract); 2] = [(par2::is_base_par2, par2::display_name), (nfo::is_nfo, nfo::display_name)];
@@ -1813,9 +1924,13 @@ fn name_sources(release: &Release) -> Vec<(String, Extract)> {
     sources
         .iter()
         .flat_map(|(matches, extract)| {
-            release.articles.iter().filter(|a| matches(&a.subject)).map(|a| (a.message_id.clone(), *extract))
+            release
+                .articles
+                .iter()
+                .filter(|a| a.part.unwrap_or(1) == 1 && matches(&a.subject))
+                .map(|a| (a.message_id.clone(), *extract))
         })
-        .take(NAME_SOURCES_MAX)
+        .take(MAX_NAME_BODIES)
         .collect()
 }
 
@@ -1941,6 +2056,54 @@ impl Indexer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parser::Article;
+
+    #[test]
+    fn a_name_lookup_tries_first_segments_only_and_a_few_bodies_at_most() {
+        let article = |n: u64, file: &str, part: i64| Article {
+            number: n,
+            subject: format!(r#""{file}" yEnc ({part}/900)"#),
+            message_id: format!("<{n}>"),
+            filename: Some(file.into()),
+            part: Some(part),
+            ..Default::default()
+        };
+        let ids = |r: &Release| name_sources(r).into_iter().map(|(id, _)| id).collect::<Vec<_>>();
+
+        // a big par2 with its first segment, and an nfo
+        let mut big = Release {
+            articles: (0..900).map(|i| article(i, "x.par2", 900 - i as i64)).collect(),
+            ..Default::default()
+        };
+        big.articles.push(article(1000, "x.nfo", 1));
+        assert_eq!(ids(&big), ["<899>", "<1000>"]);
+        // seen part way, without its first segment: nothing worth a body
+        big.articles.retain(|a| a.part != Some(1));
+        assert!(ids(&big).is_empty());
+
+        // many par2 files: no more than MAX_NAME_BODIES of them
+        let many =
+            Release { articles: (0..10).map(|i| article(i, &format!("f{i}.par2"), 1)).collect(), ..Default::default() };
+        assert_eq!(ids(&many).len(), MAX_NAME_BODIES);
+    }
+
+    #[test]
+    fn finished_slices_count_from_either_end_up_to_the_first_gap() {
+        let mut f = Finished::default();
+        assert_eq!(f.ends(1, 40), (None, None));
+        f.add(31, 40);
+        f.add(1, 10);
+        f.add(21, 30);
+        assert_eq!(f.ends(1, 40), (Some(10), Some(21)), "11-20 missing");
+        f.add(11, 20);
+        assert_eq!(f.ends(1, 40), (Some(40), Some(1)));
+        let mut top = Finished::default();
+        top.add(u64::MAX - 9, u64::MAX);
+        assert_eq!(top.ends(0, u64::MAX), (None, Some(u64::MAX - 9)));
+        let mut bottom = Finished::default();
+        bottom.add(0, 9);
+        assert_eq!(bottom.ends(0, u64::MAX), (Some(9), None));
+    }
 
     /// `#key`s that differ by case are two servers, and the host in a key is
     /// lowercased as before
@@ -2288,7 +2451,7 @@ mod tests {
         let mut articles: Vec<_> = (0..40).map(|i| article(i, &format!("n{i}.nfo"))).collect();
         articles.push(article(99, "base.par2"));
         let sources = name_sources(&Release { articles, ..Default::default() });
-        assert_eq!(sources.len(), NAME_SOURCES_MAX);
+        assert_eq!(sources.len(), MAX_NAME_BODIES);
         assert_eq!(sources[0].0, "<99@x>", "the par2 first");
     }
 

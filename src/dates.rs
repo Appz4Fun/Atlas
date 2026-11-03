@@ -1,6 +1,6 @@
 //! Lenient RFC 2822 date handling, close to python's email.utils.
 
-use chrono::{DateTime, FixedOffset, Local, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
+use chrono::{DateTime, Datelike, FixedOffset, Local, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Timelike, Utc};
 
 const MONTHS: [&str; 12] = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
 
@@ -131,7 +131,16 @@ fn parse_iso(value: &str) -> Option<NaiveDateTime> {
 /// the raw value when it cant be parsed.
 pub fn to_iso_date(value: &str) -> String {
     match parse_rfc2822(value) {
-        Some((dt, _)) => dt.format("%Y-%m-%d %H:%M:%S").to_string(),
+        // what "%Y-%m-%d %H:%M:%S" gives, without parsing the format per call
+        Some((dt, _)) => format!(
+            "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+            dt.year(),
+            dt.month(),
+            dt.day(),
+            dt.hour(),
+            dt.minute(),
+            dt.second()
+        ),
         None => value.to_string(),
     }
 }

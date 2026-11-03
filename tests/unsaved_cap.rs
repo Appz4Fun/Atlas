@@ -127,3 +127,46 @@ fn many_passes_share_a_budget_of_two_slices() {
 fn a_budget_smaller_than_a_slice_still_gets_through() {
     index_everything(7, 4);
 }
+
+/// One pass on a server of many connections, with a budget far bigger than
+/// its batch and slow name lookups: it holds room for no more than
+/// `STREAM_SLICES` slices at once, the rest of the budget stays free for
+/// other passes.
+#[test]
+fn one_pass_holds_no_more_than_its_slices() {
+    let mut server = busy_server();
+    Arc::get_mut(&mut server).unwrap().body_delay = Duration::from_millis(20);
+    let port = spawn_server(server.clone());
+    let pool = Arc::new(Pool::new(&[mock(port, "secret", 40, 1)]).with_max_unsaved(1_000_000));
+
+    let dir = tempfile::tempdir().unwrap();
+    let main = dir.path().join("atlas.db");
+    atlas::db::create_db_at(&main).unwrap();
+    let db = shared_db(atlas::db::open_at(&main).unwrap());
+    let ctx = PassContext {
+        pool: pool.clone(),
+        states: RunStates::default(),
+        stop: Arc::new(AtomicBool::new(false)),
+        verbose: false,
+    };
+    let settings = PassSettings {
+        mode: "backfill".into(),
+        batch_size: POSTS as i64,
+        request_size: REQUEST,
+        split_min_backlog: i64::MAX,
+        ..Default::default()
+    };
+
+    let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().unwrap();
+    let saved = rt.block_on(async {
+        pool.connect().await.unwrap();
+        run_pass(&ctx, &settings, &db, "alt.binaries.one", 0, &mut |_| {}).await.unwrap().articles
+    });
+
+    assert_eq!(saved, POSTS as i64);
+    let peak = pool.unsaved_peak();
+    let most = atlas::nntp::STREAM_SLICES * REQUEST as usize;
+    assert!(peak <= most, "{peak} headers unsaved at once, one pass should hold {most} at most");
+    assert!(peak >= REQUEST as usize, "nothing was ever unsaved ({peak})");
+    assert_eq!(pool.unsaved_headers(), 0);
+}
