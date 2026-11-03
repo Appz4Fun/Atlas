@@ -110,7 +110,13 @@ impl Step for ProbeStep {
         let stamp = self.config_stamp();
         let content_id = crate::raw_store::release_content_id(ctx.conn(), release_id).unwrap_or_default();
         if let Some(saved) =
-            crate::raw_store::get_probe(&rel_name, &rel_group, &content_id, rel_parts, rel_complete, stamp)
+            crate::raw_store::get_probe(&rel_name, &rel_group, &content_id, rel_parts, rel_complete, stamp).filter(
+                |s| {
+                    s.cover
+                        .as_ref()
+                        .is_none_or(|(_, sha)| super::cover_file(sha).is_some_and(|p| p.exists()))
+                },
+            )
         {
             let mut writes = Vec::new();
             if let Some(pw) = saved.nfo_password {

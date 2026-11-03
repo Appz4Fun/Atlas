@@ -81,7 +81,7 @@ fn cover_dir() -> std::path::PathBuf {
     crate::paths::app_dir().join("covers")
 }
 
-fn cover_file(sha256: &str) -> Option<std::path::PathBuf> {
+pub(crate) fn cover_file(sha256: &str) -> Option<std::path::PathBuf> {
     (sha256.len() == 64 && sha256.bytes().all(|b| b.is_ascii_hexdigit())).then(|| cover_dir().join(sha256))
 }
 

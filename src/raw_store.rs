@@ -1613,13 +1613,123 @@ fn populate_harvest_content_ids(tx: &rusqlite::Transaction<'_>, schema: &str) ->
     Ok(())
 }
 
+fn verified_step_sql(schema: &str, step_bit: i64, has_pp_state: bool, has_pp_walks: bool) -> String {
+    if !has_pp_state {
+        return "0".to_string();
+    }
+    let walk_guard = if has_pp_walks {
+        format!(
+            " AND NOT EXISTS (
+                SELECT 1 FROM {schema}.pp_walks w
+                WHERE (w.redo_mask = 0 OR (w.redo_mask & {step_bit}) != 0)
+                  AND r.id < w.before_id
+                  AND (w.group_name IS NULL OR w.group_name = r.group_name)
+            )"
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        "(EXISTS (
+            SELECT 1 FROM {schema}.pp_state ps
+            WHERE ps.release_id = r.id
+              AND (ps.done & {step_bit}) != 0
+              AND (ps.failed & {step_bit}) = 0
+              AND ps.parts_seen = coalesce(r.parts, 0)
+        ){walk_guard})"
+    )
+}
+
+fn enforce_harvest_quotas(conn: &Connection) -> rusqlite::Result<()> {
+    let os_count: i64 = conn.query_row("SELECT count(*) FROM raw_opensubtitles", [], |r| r.get(0))?;
+    if os_count > MAX_OPENSUBTITLES_ROWS {
+        conn.execute(
+            "DELETE FROM raw_opensubtitles WHERE moviehash IN (
+                SELECT moviehash FROM raw_opensubtitles ORDER BY checked_at ASC LIMIT ?1
+            )",
+            params![os_count - MAX_OPENSUBTITLES_ROWS],
+        )?;
+    }
+    prune_probes(conn, 0, MAX_RAW_PROBES_ROWS + 1, MAX_RAW_PROBES_BYTES)?;
+    let pw_count: i64 = conn.query_row("SELECT count(*) FROM raw_nfo_passwords", [], |r| r.get(0))?;
+    if pw_count > MAX_RAW_PROBES_ROWS {
+        conn.execute(
+            "DELETE FROM raw_nfo_passwords WHERE (name, group_name) IN (
+                SELECT name, group_name FROM raw_nfo_passwords LIMIT ?1
+            )",
+            params![pw_count - MAX_RAW_PROBES_ROWS],
+        )?;
+    }
+    let cov_count: i64 = conn.query_row("SELECT count(*) FROM raw_covers", [], |r| r.get(0))?;
+    if cov_count > MAX_RAW_PROBES_ROWS {
+        conn.execute(
+            "DELETE FROM raw_covers WHERE (name, group_name) IN (
+                SELECT name, group_name FROM raw_covers LIMIT ?1
+            )",
+            params![cov_count - MAX_RAW_PROBES_ROWS],
+        )?;
+    }
+    let arch_count: i64 = conn.query_row("SELECT count(*) FROM raw_archives", [], |r| r.get(0))?;
+    if arch_count > MAX_RAW_ARCHIVES_ROWS {
+        let to_drop = arch_count - MAX_RAW_ARCHIVES_ROWS;
+        let victims: Vec<(String, String)> = conn
+            .prepare_cached("SELECT name, group_name FROM raw_archives LIMIT ?1")?
+            .query_map(params![to_drop], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut del_arch = conn.prepare_cached("DELETE FROM raw_archives WHERE name = ?1 AND group_name = ?2")?;
+        let mut del_files =
+            conn.prepare_cached("DELETE FROM raw_archive_inner_files WHERE release_name = ?1 AND group_name = ?2")?;
+        for (name, group) in &victims {
+            del_arch.execute(params![name, group])?;
+            del_files.execute(params![name, group])?;
+        }
+    }
+    while raw_meta_get(conn, "archive_name_bytes")? > MAX_RAW_ARCHIVE_NAME_BYTES {
+        let deleted = conn.execute(
+            "DELETE FROM raw_archive_inner_files WHERE (release_name, group_name, seq) IN (
+                SELECT release_name, group_name, seq FROM raw_archive_inner_files LIMIT 256
+            )",
+            [],
+        )?;
+        if deleted == 0 {
+            break;
+        }
+    }
+    let par2_count: i64 = conn.query_row("SELECT count(*) FROM raw_par2", [], |r| r.get(0))?;
+    if par2_count > MAX_RAW_ARCHIVES_ROWS {
+        conn.execute(
+            "DELETE FROM raw_par2 WHERE (name, group_name) IN (
+                SELECT name, group_name FROM raw_par2 LIMIT ?1
+            )",
+            params![par2_count - MAX_RAW_ARCHIVES_ROWS],
+        )?;
+    }
+    let stills_count: i64 = conn.query_row("SELECT count(*) FROM raw_stills", [], |r| r.get(0))?;
+    if stills_count > MAX_RAW_STILLS_ROWS {
+        conn.execute(
+            "DELETE FROM raw_stills WHERE (name, group_name, position) IN (
+                SELECT name, group_name, position FROM raw_stills LIMIT ?1
+            )",
+            params![stills_count - MAX_RAW_STILLS_ROWS],
+        )?;
+    }
+    Ok(())
+}
+
 fn harvest_attached_release_tables(tx: &rusqlite::Transaction<'_>, schema: &str) -> rusqlite::Result<()> {
+    enforce_harvest_quotas(tx)?;
     populate_harvest_content_ids(tx, schema)?;
+    let has_pp_state = has_table(tx, schema, "pp_state")?;
+    let has_pp_walks = has_table(tx, schema, "pp_walks")?;
+    let probe_verified = verified_step_sql(schema, 1 << 4, has_pp_state, has_pp_walks);
+    let list_verified = verified_step_sql(schema, 1 << 1, has_pp_state, has_pp_walks);
+    let par2_verified = verified_step_sql(schema, 1 << 0, has_pp_state, has_pp_walks);
     if has_table(tx, schema, "release_opensubtitles")? {
         tx.execute_batch(&format!(
             "INSERT INTO main.raw_opensubtitles (moviehash, imdb_id, tmdb_id, kind, title, year, season, episode, release_name, checked_at)
              SELECT moviehash, imdb_id, tmdb_id, kind, title, year, season, episode, release_name, checked_at
              FROM {schema}.release_opensubtitles WHERE moviehash IS NOT NULL AND moviehash != ''
+             ORDER BY checked_at DESC LIMIT {MAX_OPENSUBTITLES_ROWS}
              ON CONFLICT(moviehash) DO UPDATE SET
                  imdb_id = coalesce(main.raw_opensubtitles.imdb_id, excluded.imdb_id),
                  tmdb_id = coalesce(main.raw_opensubtitles.tmdb_id, excluded.tmdb_id),
@@ -1641,26 +1751,50 @@ fn harvest_attached_release_tables(tx: &rusqlite::Transaction<'_>, schema: &str)
         };
         tx.execute(
             &format!(
-                "INSERT OR REPLACE INTO main.raw_probes
+                "INSERT INTO main.raw_probes
                  (name, group_name, content_id, crc32, agent, info, moviehash, parts, complete, config_stamp)
-                 SELECT r.name, r.group_name, hcid.content_id, p.crc32, p.agent, p.info, p.moviehash,
-                        coalesce(r.parts, 0), coalesce(r.complete, 0), ?1
+                 SELECT r.name, r.group_name,
+                        CASE WHEN {probe_verified} THEN hcid.content_id ELSE NULL END,
+                        p.crc32, p.agent, p.info, p.moviehash,
+                        CASE WHEN {probe_verified} THEN coalesce(r.parts, 0) ELSE 0 END,
+                        CASE WHEN {probe_verified} THEN coalesce(r.complete, 0) ELSE 0 END,
+                        CASE WHEN {probe_verified} THEN ?1 ELSE NULL END
                  FROM {schema}.release_probe p
                  JOIN {schema}.releases r ON r.id = p.release_id
                  LEFT JOIN temp.harvest_content_ids hcid ON hcid.release_id = r.id
-                 WHERE r.name IS NOT NULL AND r.group_name IS NOT NULL"
+                 WHERE r.name IS NOT NULL AND r.group_name IS NOT NULL
+                   AND length(p.info) <= {MAX_RAW_PROBES_BYTES}
+                 ORDER BY r.id DESC LIMIT {MAX_RAW_PROBES_ROWS}
+                 ON CONFLICT(name, group_name) DO UPDATE SET
+                    content_id = excluded.content_id,
+                    crc32 = excluded.crc32,
+                    agent = excluded.agent,
+                    info = excluded.info,
+                    moviehash = excluded.moviehash,
+                    parts = excluded.parts,
+                    complete = excluded.complete,
+                    config_stamp = excluded.config_stamp
+                 WHERE excluded.content_id IS NOT NULL AND excluded.config_stamp IS NOT NULL"
             ),
             params![probe_stamp],
         )?;
     }
     if has_table(tx, schema, "release_cover")? {
         tx.execute_batch(&format!(
-            "INSERT OR REPLACE INTO main.raw_covers (name, group_name, content_id, mime, sha256)
-             SELECT r.name, r.group_name, hcid.content_id, c.mime, c.sha256
+            "INSERT INTO main.raw_covers (name, group_name, content_id, mime, sha256)
+             SELECT r.name, r.group_name,
+                    CASE WHEN {probe_verified} THEN hcid.content_id ELSE NULL END,
+                    c.mime, c.sha256
              FROM {schema}.release_cover c
              JOIN {schema}.releases r ON r.id = c.release_id
              LEFT JOIN temp.harvest_content_ids hcid ON hcid.release_id = r.id
-             WHERE r.name IS NOT NULL AND r.group_name IS NOT NULL;"
+             WHERE r.name IS NOT NULL AND r.group_name IS NOT NULL
+             ORDER BY r.id DESC LIMIT {MAX_RAW_PROBES_ROWS}
+             ON CONFLICT(name, group_name) DO UPDATE SET
+                content_id = excluded.content_id,
+                mime = excluded.mime,
+                sha256 = excluded.sha256
+             WHERE excluded.content_id IS NOT NULL;"
         ))?;
     }
     let has_fp = has_table(tx, schema, "release_fingerprint")?;
@@ -1668,8 +1802,8 @@ fn harvest_attached_release_tables(tx: &rusqlite::Transaction<'_>, schema: &str)
     if has_table(tx, schema, "archive_release")? {
         let listing_complete_expr = match (has_fp, has_inner) {
             (true, true) => format!(
-                "CASE WHEN (a.password = 0 AND NOT EXISTS (SELECT 1 FROM {schema}.archive_inner_files f WHERE f.release_id = a.release_id AND coalesce(f.source, 2) != 1))
-                           OR EXISTS (SELECT 1 FROM {schema}.release_fingerprint fp WHERE fp.release_id = a.release_id AND fp.content IS NOT NULL)
+                "CASE WHEN {list_verified} AND ((a.password = 0 AND NOT EXISTS (SELECT 1 FROM {schema}.archive_inner_files f WHERE f.release_id = a.release_id AND coalesce(f.source, 2) != 1))
+                           OR EXISTS (SELECT 1 FROM {schema}.release_fingerprint fp WHERE fp.release_id = a.release_id AND fp.content IS NOT NULL))
                       THEN 1 ELSE 0 END"
             ),
             _ => "0".to_string(),
@@ -1680,61 +1814,124 @@ fn harvest_attached_release_tables(tx: &rusqlite::Transaction<'_>, schema: &str)
             "NULL".to_string()
         };
         tx.execute_batch(&format!(
-            "INSERT OR REPLACE INTO main.raw_archives
+            "INSERT INTO main.raw_archives
                  (name, group_name, content_id, password, encryption, names_hidden, password_check, parts, complete, listing_complete, listing_damaged, content_fp)
-             SELECT r.name, r.group_name, hcid.content_id, a.password, a.encryption, a.names_hidden, a.password_check,
-                    coalesce(r.parts, 0), coalesce(r.complete, 0), {listing_complete_expr}, 0, {content_fp_expr}
+             SELECT r.name, r.group_name,
+                    CASE WHEN {list_verified} THEN hcid.content_id ELSE NULL END,
+                    a.password, a.encryption, a.names_hidden, a.password_check,
+                    CASE WHEN {list_verified} THEN coalesce(r.parts, 0) ELSE 0 END,
+                    CASE WHEN {list_verified} THEN coalesce(r.complete, 0) ELSE 0 END,
+                    {listing_complete_expr}, 0, {content_fp_expr}
              FROM {schema}.archive_release a
              JOIN {schema}.releases r ON r.id = a.release_id
              LEFT JOIN temp.harvest_content_ids hcid ON hcid.release_id = r.id
-             WHERE r.name IS NOT NULL AND r.group_name IS NOT NULL;"
+             WHERE r.name IS NOT NULL AND r.group_name IS NOT NULL
+             ORDER BY r.id DESC LIMIT {MAX_RAW_ARCHIVES_ROWS}
+             ON CONFLICT(name, group_name) DO UPDATE SET
+                content_id = excluded.content_id,
+                password = excluded.password,
+                encryption = excluded.encryption,
+                names_hidden = excluded.names_hidden,
+                password_check = excluded.password_check,
+                parts = excluded.parts,
+                complete = excluded.complete,
+                listing_complete = excluded.listing_complete,
+                listing_damaged = excluded.listing_damaged,
+                content_fp = excluded.content_fp
+             WHERE excluded.content_id IS NOT NULL;"
         ))?;
     }
     if has_inner {
         tx.execute_batch(&format!(
-            "INSERT OR REPLACE INTO main.raw_archive_inner_files (release_name, group_name, seq, content_id, name, size, source)
-             SELECT r.name, r.group_name, f.seq, hcid.content_id, f.name, f.size, f.source
+            "INSERT INTO main.raw_archive_inner_files (release_name, group_name, seq, content_id, name, size, source)
+             SELECT r.name, r.group_name, f.seq,
+                    CASE WHEN (CASE WHEN coalesce(f.source, 2) = 1 THEN {par2_verified} ELSE {list_verified} END)
+                         THEN hcid.content_id ELSE NULL END,
+                    f.name, f.size, f.source
              FROM {schema}.archive_inner_files f
              JOIN {schema}.releases r ON r.id = f.release_id
              LEFT JOIN temp.harvest_content_ids hcid ON hcid.release_id = r.id
-             WHERE r.name IS NOT NULL AND r.group_name IS NOT NULL;"
+             WHERE r.name IS NOT NULL AND r.group_name IS NOT NULL
+               AND length(cast(f.name as blob)) <= 4096
+             ORDER BY r.id DESC LIMIT {MAX_RAW_ARCHIVES_ROWS}
+             ON CONFLICT(release_name, group_name, seq) DO UPDATE SET
+                content_id = excluded.content_id,
+                name = excluded.name,
+                size = excluded.size,
+                source = excluded.source
+             WHERE excluded.content_id IS NOT NULL;"
         ))?;
     }
     if has_fp {
         tx.execute_batch(&format!(
-            "INSERT OR REPLACE INTO main.raw_par2
+            "INSERT INTO main.raw_par2
                  (name, group_name, content_id, covers_all, posted, par2_block, par2_blocks, parts, complete, content_fp)
-             SELECT r.name, r.group_name, hcid.content_id,
+             SELECT r.name, r.group_name,
+                    CASE WHEN {par2_verified} THEN hcid.content_id ELSE NULL END,
                     CASE WHEN fp.posted IS NOT NULL AND fp.par2_block IS NOT NULL THEN 1 ELSE 0 END,
                     fp.posted, fp.par2_block, fp.par2_blocks,
-                    coalesce(r.parts, 0), coalesce(r.complete, 0), fp.content
+                    CASE WHEN {par2_verified} THEN coalesce(r.parts, 0) ELSE 0 END,
+                    CASE WHEN {par2_verified} THEN coalesce(r.complete, 0) ELSE 0 END,
+                    fp.content
              FROM {schema}.release_fingerprint fp
              JOIN {schema}.releases r ON r.id = fp.release_id
              LEFT JOIN temp.harvest_content_ids hcid ON hcid.release_id = r.id
              WHERE r.name IS NOT NULL AND r.group_name IS NOT NULL
-               AND (fp.posted IS NOT NULL OR fp.par2_block IS NOT NULL OR fp.content IS NOT NULL);"
+               AND (fp.posted IS NOT NULL OR fp.par2_block IS NOT NULL OR fp.content IS NOT NULL)
+             ORDER BY r.id DESC LIMIT {MAX_RAW_ARCHIVES_ROWS}
+             ON CONFLICT(name, group_name) DO UPDATE SET
+                content_id = excluded.content_id,
+                covers_all = excluded.covers_all,
+                posted = excluded.posted,
+                par2_block = excluded.par2_block,
+                par2_blocks = excluded.par2_blocks,
+                parts = excluded.parts,
+                complete = excluded.complete,
+                content_fp = excluded.content_fp
+             WHERE excluded.content_id IS NOT NULL;"
         ))?;
     }
     if has_table(tx, schema, "release_nfo_password")? {
         tx.execute_batch(&format!(
-            "INSERT OR REPLACE INTO main.raw_nfo_passwords (name, group_name, content_id, password)
-             SELECT r.name, r.group_name, hcid.content_id, np.password
+            "INSERT INTO main.raw_nfo_passwords (name, group_name, content_id, password)
+             SELECT r.name, r.group_name,
+                    CASE WHEN {probe_verified} THEN hcid.content_id ELSE NULL END,
+                    np.password
              FROM {schema}.release_nfo_password np
              JOIN {schema}.releases r ON r.id = np.release_id
              LEFT JOIN temp.harvest_content_ids hcid ON hcid.release_id = r.id
-             WHERE r.name IS NOT NULL AND r.group_name IS NOT NULL;"
+             WHERE r.name IS NOT NULL AND r.group_name IS NOT NULL
+               AND length(np.password) <= 256
+             ORDER BY r.id DESC LIMIT {MAX_RAW_PROBES_ROWS}
+             ON CONFLICT(name, group_name) DO UPDATE SET
+                content_id = excluded.content_id,
+                password = excluded.password
+             WHERE excluded.content_id IS NOT NULL;"
         ))?;
     }
     if has_table(tx, schema, "release_stills")? {
+        let stills_verified = verified_step_sql(schema, 1 << 7, has_pp_state, has_pp_walks);
         tx.execute_batch(&format!(
-            "INSERT OR REPLACE INTO main.raw_stills (name, group_name, position, content_id, at_ms, sha256, width, height, phash)
-             SELECT r.name, r.group_name, s.position, hcid.content_id, s.at_ms, s.sha256, s.width, s.height, s.phash
+            "INSERT INTO main.raw_stills (name, group_name, position, content_id, at_ms, sha256, width, height, phash)
+             SELECT r.name, r.group_name, s.position,
+                    CASE WHEN {stills_verified} THEN hcid.content_id ELSE NULL END,
+                    s.at_ms, s.sha256, s.width, s.height, s.phash
              FROM {schema}.release_stills s
              JOIN {schema}.releases r ON r.id = s.release_id
              LEFT JOIN temp.harvest_content_ids hcid ON hcid.release_id = r.id
-             WHERE r.name IS NOT NULL AND r.group_name IS NOT NULL;"
+             WHERE r.name IS NOT NULL AND r.group_name IS NOT NULL
+             ORDER BY r.id DESC LIMIT {MAX_RAW_STILLS_ROWS}
+             ON CONFLICT(name, group_name, position) DO UPDATE SET
+                content_id = excluded.content_id,
+                at_ms = excluded.at_ms,
+                sha256 = excluded.sha256,
+                width = excluded.width,
+                height = excluded.height,
+                phash = excluded.phash
+             WHERE excluded.content_id IS NOT NULL;"
         ))?;
     }
+    enforce_harvest_quotas(tx)?;
     Ok(())
 }
 
