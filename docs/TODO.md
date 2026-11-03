@@ -6,6 +6,10 @@ Deliberately not done, with why, so it can be picked up later.
 
 The 2026-11-02 metadata and linking research lives in [research/](research/README.md). Its own list of what is left to build (probe fixes, archive and container facts, twin and alt keys, linking split posts) is [research/TODO.md](research/TODO.md).
 
+## Lent articles are not yet checked against the set
+
+An NZB's gaps are filled from twins and file twins by name, part count, part sizes and, where both sides were read, each shared part's decoded length and CRC32 (`segment_crc`). A lent part nobody has read is taken on the set's word: the donor's descriptor matches by `(size, md5_16k, md5)`, but nothing proves the donor's articles decode to that file. A poster who copies a set's public FileDesc packets and posts other bytes under the same names and cut would get them into the victim's NZB (the download's PAR2 check catches it, Atlas doesn't). Fix: before lending a part, read it and fold its CRC32 against the set's IFSC slice checksums (`par2_files.crc32` is the whole-file fold; the per-slice CRCs are in the IFSC packet and would have to be kept), or at least read one shared part on each side first. The same-poster rule for set ties (`release_info::linked_post_with`) closes the recovery-volume version of this.
+
 ## Linking across shards
 
 The link step (`archive/link.rs`) finds the files of a fully obfuscated upload among the rows of its own shard, in any group. A row in another shard can't be linked from it: a step's writes go to its shard's writer only, and `upload_link` rows for a lead live in the lead's shard. Fix: let a `StepWrite` name the shard it goes to, and have the engine hand it to that shard's writer; then drop the `between ?1 and ?2` id window and look in every shard. Until then, recovery volumes of one set in several shards are tied by `par2_files.set_id` at read time only (`release_info::linked_post_with`), and a data file posted to another shard's group than its set's volumes stays unlinked.

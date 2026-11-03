@@ -242,22 +242,40 @@ pub fn par2_files_with(conn: &Connection, release_id: i64) -> Vec<crate::par2::P
     rows.flatten().collect()
 }
 
-/// The releases in every shard whose sealed set is this one: the recovery volumes of one upload, each posted on its own,
-/// wherever its group's shard is. `conn` has the shards attached.
-pub fn releases_of_set_with(conn: &Connection, set_id: &[u8], not: i64) -> Vec<i64> {
+/// The releases in every shard whose sealed set is this one and whose poster is `poster`: the recovery volumes of one
+/// upload, each posted on its own, wherever its group's shard is. A set's packets are public, soo anyone can repost
+/// its Main packet under their own name and seal a volume of their own; only the uploader's rows are the upload.
+/// `conn` has the shards attached.
+pub fn releases_of_set_with(conn: &Connection, set_id: &[u8], not: i64, poster: &str) -> Vec<i64> {
     let mut out = Vec::new();
     for s in 0..store::SHARDS {
         let sql = format!(
-            "select distinct release_id from s{s}.par2_files where set_id = ?1 and sealed = 1 and release_id != ?2
-             limit 1024"
+            "select distinct p.release_id from s{s}.par2_files p join s{s}.releases r on r.id = p.release_id
+             where p.set_id = ?1 and p.sealed = 1 and p.release_id != ?2 and r.poster = ?3 limit 1024"
         );
         let Ok(mut stmt) = conn.prepare_cached(&sql) else { continue };
-        let Ok(rows) = stmt.query_map(rusqlite::params![set_id, not], |r| r.get::<_, i64>(0)) else { continue };
+        let Ok(rows) = stmt.query_map(rusqlite::params![set_id, not, poster], |r| r.get::<_, i64>(0)) else {
+            continue;
+        };
         out.extend(rows.flatten());
     }
     out.sort_unstable();
     out.dedup();
     out
+}
+
+/// What a release's articles were found to hold, by message-id: the decoded length and CRC32 of each body a step
+/// read whole. Empty when none was, or the shard has no table yet. `conn` has the shards attached.
+pub fn segment_crcs_with(conn: &Connection, release_id: i64) -> std::collections::HashMap<String, (i64, i64)> {
+    let s = store::shard_of_id(release_id);
+    let sql = format!("select message_id, decoded, crc32 from s{s}.segment_crc where release_id = ?");
+    let Ok(mut stmt) = conn.prepare_cached(&sql) else { return Default::default() };
+    let Ok(rows) =
+        stmt.query_map([release_id], |r| Ok((r.get::<_, String>(0)?, (r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))))
+    else {
+        return Default::default();
+    };
+    rows.flatten().collect()
 }
 
 pub const DELETE_SOURCE: &str = "delete from archive_inner_files where release_id = ?1 and source = ?2";

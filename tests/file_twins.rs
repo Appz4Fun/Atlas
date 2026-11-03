@@ -62,6 +62,18 @@ fn a_file_twin_in_another_shard_fills_the_gaps() {
     // the NZB the API serves has the borrowed article in it
     let nzb = atlas::nzb::build_nzb(mine).unwrap().unwrap();
     assert!(nzb.contains("Theirs.Movie.mkv.3@x"), "{nzb}");
+    // once a part both have was read on both sides and the bytes differ, the other posting is another file, whatever
+    // its set says: it lends nothing
+    let crc = atlas::archive::store::SET_SEGMENT_CRC;
+    shard_a.execute(crc, rusqlite::params![mine, "<Mine.x9k2.bin.1@x>", 700_000, 11]).unwrap();
+    shard_b.execute(crc, rusqlite::params![theirs, "<Theirs.Movie.mkv.1@x>", 700_000, 22]).unwrap();
+    let mut articles = store::articles(&conn, mine).unwrap();
+    assert_eq!(fill_from_copies_with(&conn, mine, &mut articles).unwrap(), 0, "other bytes in part 1");
+    assert!(!atlas::nzb::build_nzb(mine).unwrap().unwrap().contains("Theirs"));
+    // the same bytes, and it lends again
+    shard_b.execute(crc, rusqlite::params![theirs, "<Theirs.Movie.mkv.1@x>", 700_000, 11]).unwrap();
+    let mut articles = store::articles(&conn, mine).unwrap();
+    assert_eq!(fill_from_copies_with(&conn, mine, &mut articles).unwrap(), 1);
 
     // two postings that share only an NFO hold different archives under the same name, cut up the same way: the
     // other's archive parts must not fill this one's gaps, and its NFO (not posted here) maps to nothing
