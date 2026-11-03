@@ -756,7 +756,7 @@ fn add_track(t: Track, info: &mut MediaInfo) {
 
 // ---- MP4
 
-fn boxes(b: &[u8], each: &mut dyn FnMut(&[u8; 4], &[u8])) {
+fn boxes<'a>(b: &'a [u8], each: &mut dyn FnMut(&[u8; 4], &'a [u8])) {
     let mut at = 0usize;
     while let Some(head_end) = at.checked_add(8)
         && let Some(head) = b.get(at..head_end)
@@ -842,7 +842,159 @@ fn be16(b: &[u8], at: usize) -> Option<u16> {
     Some(u16::from_be_bytes(b.get(at..at.checked_add(2)?)?.try_into().ok()?))
 }
 
+fn collect_moov_chunk_offsets(moov_body: &[u8]) -> Vec<usize> {
+    const MAX_CHUNK_OFFSETS: usize = 16;
+    let mut all_offsets = Vec::new();
+    let mut traks_seen = 0usize;
+    boxes(moov_body, &mut |kind, trak_v| {
+        if kind != b"trak" || traks_seen >= MAX_TRACKS {
+            return;
+        }
+        traks_seen += 1;
+        boxes(trak_v, &mut |kind, mdia_v| {
+            if kind == b"mdia" {
+                boxes(mdia_v, &mut |kind, minf_v| {
+                    if kind == b"minf" {
+                        boxes(minf_v, &mut |kind, stbl_v| {
+                            if kind == b"stbl" {
+                                let mut track_offsets = 0usize;
+                                boxes(stbl_v, &mut |kind, v| match kind {
+                                    b"stco" => {
+                                        let count = be32(v, 4).unwrap_or(0).min(MAX_CHUNK_OFFSETS as u32) as usize;
+                                        for i in 0..count {
+                                            if track_offsets >= MAX_CHUNK_OFFSETS {
+                                                break;
+                                            }
+                                            if let Some(off) = be32(v, 8 + i * 4).map(|o| o as usize) {
+                                                all_offsets.push(off);
+                                                track_offsets += 1;
+                                            }
+                                        }
+                                    }
+                                    b"co64" => {
+                                        let count = be32(v, 4).unwrap_or(0).min(MAX_CHUNK_OFFSETS as u32) as usize;
+                                        for i in 0..count {
+                                            if track_offsets >= MAX_CHUNK_OFFSETS {
+                                                break;
+                                            }
+                                            if let Some(bytes) = v.get(8 + i * 8..16 + i * 8)
+                                                && let Ok(arr) = <[u8; 8]>::try_from(bytes)
+                                                && let Ok(off) = usize::try_from(u64::from_be_bytes(arr))
+                                            {
+                                                all_offsets.push(off);
+                                                track_offsets += 1;
+                                            }
+                                        }
+                                    }
+                                    _ => {}
+                                });
+                            }
+                        });
+                    }
+                });
+            }
+        });
+    });
+    all_offsets.sort_unstable();
+    all_offsets.dedup();
+    all_offsets
+}
+
+fn mp4_chunk_byte_len(
+    chunk_idx_1based: u32,
+    stsc: &[(u32, u32)],
+    stsz: Option<&[u8]>,
+    stz2: Option<&[u8]>,
+    max_probe: usize,
+) -> Option<usize> {
+    if stsz.is_none() && stz2.is_none() {
+        return None;
+    }
+    let chunk_idx = chunk_idx_1based.max(1);
+    let (first_sample, samples_in_chunk) = if stsc.is_empty() {
+        ((chunk_idx - 1) as usize, 1usize)
+    } else {
+        let samples_for_chunk = |c: u32| -> usize {
+            stsc.iter()
+                .rev()
+                .find(|&&(first_chunk, _)| first_chunk <= c)
+                .or_else(|| stsc.first())
+                .map(|&(_, spc)| spc as usize)
+                .unwrap_or(1)
+        };
+        let mut first = 0usize;
+        for c in 1..chunk_idx {
+            first = first.saturating_add(samples_for_chunk(c));
+        }
+        (first, samples_for_chunk(chunk_idx))
+    };
+
+    if samples_in_chunk == 0 {
+        return Some(0);
+    }
+
+    if let Some(v) = stsz {
+        let default_size = be32(v, 4)? as usize;
+        let sample_count = be32(v, 8)? as usize;
+        if default_size > 0 {
+            if sample_count > 0 && first_sample >= sample_count {
+                return Some(0);
+            }
+            let count = if sample_count > 0 {
+                samples_in_chunk.min(sample_count - first_sample)
+            } else {
+                samples_in_chunk
+            };
+            return Some(count.saturating_mul(default_size).min(max_probe));
+        }
+        if first_sample >= sample_count {
+            return Some(0);
+        }
+        let count = samples_in_chunk.min(sample_count - first_sample).min(256);
+        let mut total = 0usize;
+        for s in 0..count {
+            let entry_off = 12usize.checked_add(first_sample.checked_add(s)?.checked_mul(4)?)?;
+            let sz = be32(v, entry_off)? as usize;
+            total = total.saturating_add(sz);
+            if total >= max_probe {
+                return Some(max_probe);
+            }
+        }
+        return Some(total);
+    }
+
+    if let Some(v) = stz2 {
+        let field_size = usize::from(*v.get(7)?);
+        let sample_count = be32(v, 8)? as usize;
+        if first_sample >= sample_count {
+            return Some(0);
+        }
+        let count = samples_in_chunk.min(sample_count - first_sample).min(256);
+        let mut total = 0usize;
+        for s in 0..count {
+            let idx = first_sample.checked_add(s)?;
+            let sz = match field_size {
+                4 => {
+                    let b = *v.get(12 + idx / 2)?;
+                    usize::from(if idx % 2 == 0 { b >> 4 } else { b & 0x0F })
+                }
+                8 => usize::from(*v.get(12 + idx)?),
+                16 => usize::from(be16(v, 12 + idx.checked_mul(2)?)?),
+                _ => return None,
+            };
+            total = total.saturating_add(sz);
+            if total >= max_probe {
+                return Some(max_probe);
+            }
+        }
+        return Some(total);
+    }
+
+    None
+}
+
 fn moov(body: &[u8], full_data: &[u8], info: &mut MediaInfo) {
+    let all_chunk_offsets = collect_moov_chunk_offsets(body);
     boxes(body, &mut |kind, v| match kind {
         b"mvhd" => {
             let (scale, duration) = if v.first() == Some(&1) {
@@ -856,7 +1008,7 @@ fn moov(body: &[u8], full_data: &[u8], info: &mut MediaInfo) {
                 info.duration_secs = Some(duration as f64 / f64::from(scale));
             }
         }
-        b"trak" => trak(v, full_data, info),
+        b"trak" => trak(v, full_data, &all_chunk_offsets, info),
         _ => {}
     });
 }
@@ -894,7 +1046,7 @@ fn parse_dmlp_atmos(v: &[u8]) -> bool {
     }
 }
 
-fn trak(body: &[u8], full_data: &[u8], info: &mut MediaInfo) {
+fn trak(body: &[u8], full_data: &[u8], all_chunk_offsets: &[usize], info: &mut MediaInfo) {
     const MAX_CHUNK_OFFSETS: usize = 16;
     const MAX_AUDIO_CHUNK_PROBE: usize = 4096;
 
@@ -902,7 +1054,10 @@ fn trak(body: &[u8], full_data: &[u8], info: &mut MediaInfo) {
         return;
     }
     let (mut handler, mut language, mut entry): ([u8; 4], Option<String>, Option<Vec<u8>>) = ([0; 4], None, None);
-    let mut chunk_offsets: Vec<usize> = Vec::new();
+    let mut chunk_offsets: Vec<(u32, usize)> = Vec::new();
+    let mut stsc_entries: Vec<(u32, u32)> = Vec::new();
+    let mut stsz_box: Option<&[u8]> = None;
+    let mut stz2_box: Option<&[u8]> = None;
     boxes(body, &mut |kind, v| {
         if kind == b"mdia" {
             boxes(v, &mut |kind, v| match kind {
@@ -928,9 +1083,9 @@ fn trak(body: &[u8], full_data: &[u8], info: &mut MediaInfo) {
                                         break;
                                     }
                                     if let Some(off) = be32(v, 8 + i * 4).map(|o| o as usize)
-                                        && !chunk_offsets.contains(&off)
+                                        && !chunk_offsets.iter().any(|&(_, existing)| existing == off)
                                     {
-                                        chunk_offsets.push(off);
+                                        chunk_offsets.push((i as u32 + 1, off));
                                     }
                                 }
                             }
@@ -943,11 +1098,30 @@ fn trak(body: &[u8], full_data: &[u8], info: &mut MediaInfo) {
                                     if let Some(bytes) = v.get(8 + i * 8..16 + i * 8)
                                         && let Ok(arr) = <[u8; 8]>::try_from(bytes)
                                         && let Ok(off) = usize::try_from(u64::from_be_bytes(arr))
-                                        && !chunk_offsets.contains(&off)
+                                        && !chunk_offsets.iter().any(|&(_, existing)| existing == off)
                                     {
-                                        chunk_offsets.push(off);
+                                        chunk_offsets.push((i as u32 + 1, off));
                                     }
                                 }
+                            }
+                            b"stsc" if stsc_entries.is_empty() => {
+                                let count = be32(v, 4).unwrap_or(0).min(MAX_CHUNK_OFFSETS as u32) as usize;
+                                for i in 0..count {
+                                    let Some(first_chunk) = be32(v, 8 + i * 12) else { break };
+                                    let Some(samples_per_chunk) = be32(v, 12 + i * 12) else { break };
+                                    if first_chunk >= 1 {
+                                        stsc_entries.push((first_chunk, samples_per_chunk));
+                                    }
+                                    if first_chunk > MAX_CHUNK_OFFSETS as u32 {
+                                        break;
+                                    }
+                                }
+                            }
+                            b"stsz" if stsz_box.is_none() && v.len() >= 12 => {
+                                stsz_box = Some(v);
+                            }
+                            b"stz2" if stz2_box.is_none() && v.len() >= 12 => {
+                                stz2_box = Some(v);
                             }
                             _ => {}
                         });
@@ -957,6 +1131,18 @@ fn trak(body: &[u8], full_data: &[u8], info: &mut MediaInfo) {
             });
         }
     });
+    let chunk_slice = |chunk_idx: u32, off: usize| -> Option<&[u8]> {
+        let mut end = off.saturating_add(MAX_AUDIO_CHUNK_PROBE).min(full_data.len());
+        if let Some(chunk_len) =
+            mp4_chunk_byte_len(chunk_idx, &stsc_entries, stsz_box, stz2_box, MAX_AUDIO_CHUNK_PROBE)
+        {
+            end = end.min(off.saturating_add(chunk_len));
+        }
+        if let Some(&next_off) = all_chunk_offsets.iter().find(|&&o| o > off) {
+            end = end.min(next_off);
+        }
+        full_data.get(off..end)
+    };
     let Some(entry) = entry else { return };
     let Some(fourcc) = entry.get(4..8) else { return };
     let codec = String::from_utf8_lossy(fourcc).to_string();
@@ -1006,9 +1192,8 @@ fn trak(body: &[u8], full_data: &[u8], info: &mut MediaInfo) {
                     track.bit_depth = AvcDepth::from_avcc(v).map(u64::from);
                 }
             });
-            for &off in &chunk_offsets {
-                let end = off.saturating_add(MAX_AUDIO_CHUNK_PROBE).min(full_data.len());
-                let Some(chunk) = full_data.get(off..end) else { continue };
+            for &(chunk_idx, off) in &chunk_offsets {
+                let Some(chunk) = chunk_slice(chunk_idx, off) else { continue };
                 if let Some(dv) = DolbyVisionInfo::parse_rpu_with_length_size(chunk, nal_length_size) {
                     apply_rpu_to_video_track(&mut track, dv);
                     break;
@@ -1027,9 +1212,8 @@ fn trak(body: &[u8], full_data: &[u8], info: &mut MediaInfo) {
                 }
             });
             if !atmos {
-                for &off in &chunk_offsets {
-                    let end = off.saturating_add(MAX_AUDIO_CHUNK_PROBE).min(full_data.len());
-                    let Some(chunk) = full_data.get(off..end) else { continue };
+                for &(chunk_idx, off) in &chunk_offsets {
+                    let Some(chunk) = chunk_slice(chunk_idx, off) else { continue };
                     let chunk_has_atmos = match codec.as_str() {
                         "ec-3" => AudioBitstream::has_eac3_atmos_frame(chunk),
                         "mlpa" => AudioBitstream::has_truehd_atmos(chunk),
@@ -2726,5 +2910,85 @@ mod tests {
         assert!(dv.el_present);
         assert!(dv.fel, "in-band length-prefixed RPU must upgrade Profile 7 FEL flag");
         assert_eq!(dv.cm_version, "v4.0");
+    }
+
+    #[test]
+    fn interleaved_mp4_short_audio_chunks_do_not_bleed_atmos_across_tracks() {
+        // Track 1: 32-byte non-Atmos E-AC-3 frame at mdat offset 0
+        let mut non_atmos_frame = vec![0u8; 32];
+        non_atmos_frame[0] = 0x0B;
+        non_atmos_frame[1] = 0x77;
+        non_atmos_frame[2] = 0x00;
+        non_atmos_frame[3] = 15; // frmsiz=15 -> 32 bytes
+        non_atmos_frame[4] = 0x00;
+        non_atmos_frame[5] = 16 << 3; // bsid=16
+
+        // Immediately following at mdat offset 32: 32-byte Atmos E-AC-3 frame
+        let mut atmos_frame = non_atmos_frame.clone();
+        atmos_frame[10..14].copy_from_slice(&[0x58, 0x38, 0x02, 0x0E]);
+
+        let mut mdat_payload = Vec::new();
+        mdat_payload.extend_from_slice(&non_atmos_frame);
+        mdat_payload.extend_from_slice(&atmos_frame);
+
+        let ftyp = mp4_box(b"ftyp", b"isom");
+
+        // Build an audio trak helper with stsd + stsc (1 sample/chunk) + stsz (sample_size = 32) + stco
+        let make_audio_trak = |chunk_off: u32| -> Vec<u8> {
+            let mut entry = vec![0u8; 36];
+            entry[4..8].copy_from_slice(b"ec-3");
+            entry[24..26].copy_from_slice(&6u16.to_be_bytes());
+            entry[32..36].copy_from_slice(&(48000u32 << 16).to_be_bytes());
+            let mut stsd = vec![0u8; 8];
+            stsd.extend(&entry);
+
+            let mut stsc = vec![0u8; 8];
+            stsc[4..8].copy_from_slice(&1u32.to_be_bytes());
+            stsc.extend_from_slice(&1u32.to_be_bytes()); // first_chunk = 1
+            stsc.extend_from_slice(&1u32.to_be_bytes()); // samples_per_chunk = 1
+            stsc.extend_from_slice(&1u32.to_be_bytes()); // sample_description_index = 1
+
+            let mut stsz = vec![0u8; 12];
+            stsz[4..8].copy_from_slice(&32u32.to_be_bytes()); // sample_size = 32
+            stsz[8..12].copy_from_slice(&1u32.to_be_bytes()); // sample_count = 1
+
+            let mut stco = vec![0u8; 12];
+            stco[4..8].copy_from_slice(&1u32.to_be_bytes());
+            stco[8..12].copy_from_slice(&chunk_off.to_be_bytes());
+
+            let stbl = mp4_box(
+                b"stbl",
+                &[
+                    mp4_box(b"stsd", &stsd),
+                    mp4_box(b"stsc", &stsc),
+                    mp4_box(b"stsz", &stsz),
+                    mp4_box(b"stco", &stco),
+                ]
+                .concat(),
+            );
+            let mut hdlr = vec![0u8; 8];
+            hdlr.extend(b"soun");
+            hdlr.extend([0u8; 12]);
+            let mdia = [mp4_box(b"hdlr", &hdlr), mp4_box(b"minf", &stbl)].concat();
+            mp4_box(b"trak", &mp4_box(b"mdia", &mdia))
+        };
+
+        // Dummy placeholder so we can compute exact file offsets for mdat
+        let placeholder_moov = mp4_box(b"moov", &[make_audio_trak(0), make_audio_trak(0)].concat());
+        let mdat_data_start = (ftyp.len() + placeholder_moov.len() + 8) as u32;
+        let moov = mp4_box(
+            b"moov",
+            &[
+                make_audio_trak(mdat_data_start),
+                make_audio_trak(mdat_data_start + 32),
+            ]
+            .concat(),
+        );
+        let file = [ftyp, moov, mp4_box(b"mdat", &mdat_payload)].concat();
+
+        let info = parse(&file).expect("interleaved mp4 must parse");
+        assert_eq!(info.audio.len(), 2);
+        assert!(!info.audio[0].atmos, "first non-Atmos track must not read into adjacent track's chunk");
+        assert!(info.audio[1].atmos, "second Atmos track must be detected");
     }
 }
