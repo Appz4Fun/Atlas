@@ -69,7 +69,7 @@ rustup installs the pinned toolchain the first time you build, and the `just` re
 - **TV and movie IDs.** Atlas stores each release's title, season, and episode, and answers searches by TVDB, IMDb, TMDB, TVMaze, and Trakt ID once you turn on a provider. Fetches posters, backdrops, cast, runtimes, and IMDb/Rotten Tomatoes/Metacritic/TMDB/Trakt scores.
 - **Group posts into releases.** Atlas parses subjects into releases, merges cross-group posts and PAR2-linked obfuscated multi-file uploads, marks incomplete sets, and recovers the real names of obfuscated posts from their PAR2, archive, or NFO files and 30+ PreDB feeds.
 - **Deep article & container probes.** Without downloading the release, Atlas inspects yEnc headers, RAR4/RAR5/7z/ZIP archives (up to 10 nested compressed layers), MKV/MP4 video/audio/subtitle streams, HDR10/HLG/Dolby Vision profiles, x264/x265 encoder settings, chapters, cover art, H.264/HEVC video stills, and OpenSubtitles hashes.
-- **Serve a Newznab API** for Prowlarr, NZBHydra2, Sonarr, and Radarr: `search`, `tvsearch`, `movie`, `music`, `book`, `caps`, and `get`, which downloads an NZB (or a single file with `file=N`, or gap-filled from a twin).
+- **Serve a Newznab API** for Prowlarr, NZBHydra2, Sonarr, and Radarr: `search`, `tvsearch`, `movie`, `music`, `book`, `caps`, and `get`, which downloads an NZB (or a single file with `file=N`), its gaps filled from any twin of the same bytes.
 - **Search from the terminal** in one group or all groups, or use **AI search**, which turns a request like `find me 4k hdr movies` into groups and keywords with a local [Ollama](https://ollama.com) model.
 - **Watch progress** on the live dashboard, dig into CPU, memory, backfill, content, post-processing, and per-server numbers on the 6-page terminal stats dashboard, or scrape Prometheus metrics with the 6 included Grafana dashboards.
 - **Keep everything local** in an 8-shard SQLite database with zstd-sealed article blobs and an FTS5 full-text index.
@@ -107,7 +107,7 @@ Atlas was originally created in Python by [Eraxty](https://github.com/Eraxty) (`
 | **Post-Processing & Probing** | Inline PAR2/NFO deobfuscation during save only | Persistent two-lane post-processing stage (`src/postprocess/`) with rate-budgeted article probes, 10-layer nested archive decompression (RAR4/5, 7z, ZIP, PPMd, LZMA2, bzip2, lz4), MKV/MP4 stream inspection, H.264/HEVC keyframe still extraction, and `pHash` same-film matching |
 | **PreDB & Naming** | None | Dedicated `atlas.predb.db` polling 30+ scene/P2P feeds (RSS, JSON APIs, dumps) plus `--predb-import`, strict name grading, `--reflag-obfuscated`, and `--unname` |
 | **Categories & Media IDs** | Hardcoded single category `7000` (`Other`) for all releases; no TV/movie IDs | Full Newznab category tree (`1000`–`8000`, with `7000` properly assigned to **Books** and `8000` to **Other**), TV/movie title parser, and ID resolution via TVMaze, TMDB, Trakt, TheTVDB, OMDb, and NFO IMDb IDs |
-| **Duplicate Detection** | None | Cryptographic fingerprinting of **Twins** (identical postings that can fill each other's missing articles via `fill=1`) and **Alts** (same unpacked file sizes packed differently) |
+| **Duplicate Detection** | None | Cryptographic fingerprinting of **Twins** (identical postings, and file twins by PAR2 hashes, that fill each other's missing articles in every NZB served) and **Alts** (same unpacked file sizes packed differently) |
 | **Observability** | Basic terminal progress screen | 6-page Ratatui **Stats Dashboard** (Overview, Backfill, Content, Servers, Bottleneck, Post-processing) + Prometheus `/metrics` & `/healthz` endpoints and 6 **Grafana dashboards** as code |
 
 ## Installation
@@ -261,16 +261,16 @@ All of these go in a `postprocess` object, and each has a default. See [Post-pro
 | `complete_settle_secs` | `900` | The same for a complete release. |
 | `min_size_bytes` | `0` | Reject anything smaller. `0` is off. |
 | `min_files` | `1` | Reject anything with fewer files. |
-| `reject_par2_only` | `true` | Reject a post whose files are all par2. |
+| `reject_par2_only` | `false` | Reject a post whose files are all par2. Off, so a recovery volume posted on its own gets read and linked to the files it repairs. |
 | `group_rules` | `{}` | `{"group": {"min_size_bytes": n, "min_files": n}}`. The larger of a group's value and the global one counts. |
 | `backlog_per_second` | `2000` | Existing releases looked at, over all shards. `0` stops it. |
-| `body_fetches_per_minute` | `600` | Body budget. At `0`, nothing fetches bodies. |
-| `body_connections` | `2` | Bodies in flight at once. |
-| `body_min_size_bytes` | `1048576` | A smaller release gets no body. |
-| `body_max_size_bytes` | `107374182400` | A larger release gets no body. `0` is no limit. |
+| `body_fetches_per_minute` | `3000` | Body budget. At `0`, nothing fetches bodies. |
+| `body_connections` | `4` | Bodies in flight at once. |
+| `body_min_size_bytes` | `0` | A smaller release gets no body. `0` is no floor. |
+| `body_max_size_bytes` | `0` | A larger release gets no body. `0` is no limit. |
 | `body_max_bytes` | `16777216` | Largest article read. |
-| `bodies_per_release` | `8` | Bodies per run of a step. |
-| `min_completion_percent` | `95` | Below this a release gets no body, and `--purge --dead` can take it. |
+| `bodies_per_release` | `64` | Bodies per run of a step. |
+| `min_completion_percent` | `0` | Below this a release gets no body, and `--purge --dead` can take it. At `0` every release, however incomplete, is read, so a post cut across groups or an upload whose files were posted one by one gets its names, hashes and links before the rest of it arrives. |
 | `dead_after_secs` | `172800` | Quiet time before purge may delete anything but a blocked group's rows. |
 | `max_attempts` | `5` | Failed attempts before a step gives up on a release. |
 
@@ -431,7 +431,9 @@ The indexer takes every saved release through a stage that survives restarts. Up
 - It's **rejected** when no step can help it: a fragment of an upload obfuscated per article, a blocked group, an empty row, or a post of only par2 files. A rejection writes nothing, and a late article judges it again.
 - It's **done** when it's settled, passed, and every step that applies has finished or given up. A new article brings it back.
 
-Size, file type, and completeness never reject a release. They only decide whether it gets article bodies fetched.
+Size, file type, and completeness never reject a release. They only decide whether it gets article bodies fetched, and by default nothing is kept out: every release gets its bodies read, down to a lone recovery volume, so the links below have everything to work with.
+
+Every article body a step reads whole leaves its CRC32 and decoded length in `segment_crc`, keyed by message-id, and every PAR2 set a step reads leaves each file's size, whole-file MD5, first-16-KiB MD5, name and CRC32 in `par2_files`. The link step and the twin fill below read those back instead of fetching the set again.
 
 Steps run in two lanes. Database steps never wait on the network. Body and outside steps run within a budget, one per claim, and an outage costs them no attempts. Bodies are on by default, and `postprocess.body_fetches_per_minute = 0` turns them off. Your existing releases enter newest first at `backlog_per_second`, and the Post-processing page of the stats dashboard shows how far along that is.
 
@@ -461,9 +463,9 @@ It runs on the body budget, `postprocess.body_fetches_per_minute`. All of these 
 | Key | Default | What it does |
 |---|---|---|
 | `enabled` | `true` | Read archives, PAR2 sets, and NFOs. It does nothing until there's a body budget. |
-| `max_bodies_per_release` | `4` | Articles the archive step may read per release, from 1 to 16. |
-| `probe_files` | `2` | Random-named files to probe per release, from 0 to 8. |
-| `probes_per_minute` | `60` | Probes per minute, from 12 to 600. |
+| `max_bodies_per_release` | `16` | Articles the archive step may read per release, from 1 to 16. |
+| `probe_files` | `8` | Random-named files to probe per release, from 0 to 8. |
+| `probes_per_minute` | `600` | Probes per minute, from 12 to 600. |
 | `max_names_mb` | `16384` | Total MiB of stored file names, split between the shards. Past it, passwords and names still work, but no more inner files are stored. The stats dashboard counts what went unstored. |
 
 With a budget set and `archive.enabled` on, names stop being looked up while a release saves, so saving no longer waits on article bodies. A new release has no real name until its step runs, which takes 15 minutes to 2 hours of settling plus the queue. Until then, search hides it if it's obfuscated. A release outside `body_min_size_bytes` and `body_max_size_bytes` gets no body, so it gets no name from these steps, where the lookup while saving would have named it. If you take the budget away, or turn `archive.enabled` off, the lookups come back.
@@ -677,13 +679,13 @@ Open `http://HOST:PORT/` in a browser to search and browse releases, filter by c
 
 Sign in with the `api_key` from `config.toml`. The browser keeps a cookie for 30 days, derived from the key rather than the key itself, and changing the key signs everyone out. Traffic is plain HTTP, like the API, so keep it on a network you trust.
 
-A release's page lists its other copies, once Atlas has read both: a **twin** is the same posting, with the same files, PAR2 set, recovery volumes and article counts, and an **alt** holds files of the same exact sizes packed differently, such as RAR5 and 7z. A release needs its archive or PAR2 set read to take part.
+A release's page lists its other copies, once Atlas has read both: a **twin** is the same posting, with the same files, PAR2 set, recovery volumes and article counts, and an **alt** holds files of the same exact sizes packed differently, such as RAR5 and 7z. A release needs its archive or PAR2 set read to take part. A **file twin** is another posting, by anyone, under any names, whose PAR2 set describes one or more of this release's files the same way (the same size, first-16-KiB MD5 and whole-file MD5): it counts as a twin on the page, file by file. Every NZB Atlas serves, from the API's `t=get` and the web UI alike, has its gaps filled from its twins and file twins where their articles fit (the same part count, and the same size for every part both have), under this release's own names, so a download of an incomplete posting borrows what another posting of the same bytes still has. Check such a download with its PAR2 set.
 
 Duplicates, at the top of each page, lists every set of copies at once. Each copy shows its poster, email, PAR2 files, repair, health, encryption, password, tags, scores and links, so you can choose between them. The scores and posters are the ones already fetched, when someone opened the title.
 
 A quick filter also finds the other ways its word is written, such as `4k` and `UHD` for 2160p, or `DoVi` for DV.
 
-Below a release's facts, six panels show everything else Atlas knows about it, from what it already stored: **Names** (the subject as posted, decoded and as a template, whether the subject, yEnc and archive names agree, what was obfuscated and where the real name came from, REPACK and PROPER tells, subjects posted with RFC 2047 words, the NFO's links, fields, shape and pasted reports, the PreDB match), **Where and when** (the Date header's form, the weekday and hour in the poster's zone, clock skews between the date headers, the time a message-id carries, and, for releases indexed from now on, the first and last article by the poster's clock, the posting rate, whether the files went up one after another or interleaved and in how many sessions, the article numbers read and whether they were adjacent, threaded replies, crossposts by Xref and whether the From changed between articles), **Posted by** (the From header's shape, the injecting host and its backbone, which Injection-Info parts are present, the message-id grammar, the posting tool against its defaults; a **Headers** fold-out lists the kept headers), **Inside** (the type mix and volume sizes, the volume scheme, what it unpacks to, the packed ratio, packer tells, where the inner names came from, the PAR2 slice and repair capacity), **Health** (the yEnc control lines, subject and yEnc numbering, the last arrival, lines an article and the articles that came after a file sealed; a **Parts** fold-out maps every file's parts with its first and last ids and article sizes) and **Keys** (keys over the first message-id, the collection key, the twin and alt fingerprints, a structural key over the tracks, the archive's password check, an NZBLNK, a key over the per-file line counts; a **Hashes** fold-out digests the segment set). Posting accounts and hosts are never printed: they appear as salted keys only, so two posts from one account can be lined up without reading it. Every result row has a **+** that opens a drawer with ten of these facts, without leaving the list, and so has every copy on the duplicates page and under a release's other copies, cards and links alike.
+Below a release's facts, six panels show everything else Atlas knows about it, from what it already stored: **Names** (the subject as posted, decoded and as a template, whether the subject, yEnc and archive names agree, what was obfuscated and where the real name came from, REPACK and PROPER tells, subjects posted with RFC 2047 words, the NFO's links, fields, shape and pasted reports, the PreDB match), **Where and when** (the Date header's form, the weekday and hour in the poster's zone, clock skews between the date headers, the time a message-id carries, and, for releases indexed from now on, the first and last article by the poster's clock, the posting rate, whether the files went up one after another or interleaved and in how many sessions, the article numbers read and whether they were adjacent, threaded replies, crossposts by Xref, whether the From changed between articles, the posting tool the message-ids name, the ids' own clock in milliseconds where the tool or the server wrote one, and the Highwinds session the articles came through), **Posted by** (the From header's shape, the injecting host and its backbone, which Injection-Info parts are present, the message-id grammar, the posting tool against its defaults; a **Headers** fold-out lists the kept headers), **Inside** (the type mix and volume sizes, the volume scheme, what it unpacks to, the packed ratio, packer tells, where the inner names came from, the PAR2 slice and repair capacity), **Health** (the yEnc control lines, subject and yEnc numbering, the last arrival, lines an article and the articles that came after a file sealed; a **Parts** fold-out maps every file's parts with its first and last ids and article sizes) and **Keys** (keys over the first message-id, the collection key, the twin and alt fingerprints, a structural key over the tracks, the archive's password check, an NZBLNK, a key over the per-file line counts; a **Hashes** fold-out digests the segment set). Posting accounts and hosts are never printed: they appear as salted keys only, so two posts from one account can be lined up without reading it. Every result row has a **+** that opens a drawer with ten of these facts, without leaving the list, and so has every copy on the duplicates page and under a release's other copies, cards and links alike.
 
 The search box's More fields searches on Usenet group, poster, email, size (`1234567890`, or `1.5 GB` as the pages write it, which finds every size written that way), release group, CRC32 and posting tool. Clicking any of those on a release's page does the same, and the results show a total. Each column heading sorts, both ways, instantly from an in-memory window of the first 2,000 results kept warm in the background.
 

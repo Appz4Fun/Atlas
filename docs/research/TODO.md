@@ -40,7 +40,7 @@ Source: [container-metadata/FINAL-REPORT.md](container-metadata/FINAL-REPORT.md)
 Source: [archive-metadata/FINAL-REPORT.md](archive-metadata/FINAL-REPORT.md), [archive-metadata/raw/w10c-atlas-bugs.md](archive-metadata/raw/w10c-atlas-bugs.md) (checked at `ad111a0`; recheck lines). Nested and compressed decoding already shipped in #52 #56 #58 #61 #62 #63.
 
 - [ ] Keep per-file CRC32, unpacked size, mtime and host OS in `archive_inner_files` (RAR5 skips it at rar.rs, RAR4 never reads it, zip CD offset 16 unread, 7z substream digests discarded). Inner CRC32 + unpacked size is the exact alt key (same file, different container); the timestamps help tell a twin from a re-RAR.
-- [ ] Persist PAR2 FileDesc MD5, 16 KB MD5 and the Creator string per file; parse IFSC slice CRCs.
+- [x] Persist PAR2 FileDesc MD5, 16 KB MD5 per file (`par2_files`, every set a step reads, with the IFSC CRC32 fold; the Creator string is still not kept).
 - [ ] Packer fingerprint from article 1: RAR host OS, method, dictionary, HTIME, owner record; zip version-made-by and extras; 7z version bytes and coders.
 - [ ] Per-archive random values as twin keys: RAR5 `-hp` salt and check value (byte-identical across volumes with rars; check WinRAR), 7z AES IV, 7z start header NextHeaderCRC.
 - [ ] RAR5 `.rev` first file: size and CRC32 of every data volume. SRR/SRS parse for scene posts.
@@ -57,8 +57,8 @@ Source: [archive-metadata/FINAL-REPORT.md](archive-metadata/FINAL-REPORT.md), [a
 
 Source: [payload-fingerprints/final-report.md](payload-fingerprints/final-report.md). Prototypes: [opus-tools/w9b_crc32gf2/](payload-fingerprints/opus-tools/w9b_crc32gf2/) (CRC32 GF(2) toolkit, std only), [opus-tools/w10b_walker/](payload-fingerprints/opus-tools/w10b_walker/) (PAR2 + RAR4/5 partial-buffer walker, 332/332 vs rarfile).
 
-- [ ] Store yEnc `pcrc32` per part and fold it into a whole-file (size, CRC32) with the GF(2) toolkit.
-- [ ] PAR2 index per set: full MD5 + length, 16 KB MD5 + length, IFSC fold bound to the pcrc32 fold.
+- [ ] Store yEnc `pcrc32` per part and fold it into a whole-file (size, CRC32) with the GF(2) toolkit. Stored: every article a step reads whole leaves `(decoded length, CRC32)` in `segment_crc`. Not yet: the fold to a whole-file CRC, since only a few articles of a file are ever read.
+- [x] PAR2 index per set: full MD5 + length, 16 KB MD5 + length (`par2_files`, indexed on `(size, md5_16k)` and on `set_id`; it finds file twins across shards). The IFSC fold is kept per file; binding it to a pcrc32 fold waits on the item above.
 - [ ] Last RAR volume's first article: inner file (name, size, CRC32) as the alt key.
 - [ ] Encrypted reposts: `(V, n, S_last)` size tuple from the exact `-hp` size model, as a blocking key only.
 - [ ] NZB escape-count segment-size index (Nyuu-style NZBs only).
@@ -68,10 +68,10 @@ Source: [payload-fingerprints/final-report.md](payload-fingerprints/final-report
 
 Sources: [posting-behavior/FINAL-REPORT.md](posting-behavior/FINAL-REPORT.md) (v1 pipeline spec [wave-09-A-pipeline-spec.md](posting-behavior/wave-09-A-pipeline-spec.md) with fixes in [wave-10-A-redteam.md](posting-behavior/wave-10-A-redteam.md)), [yenc-header-forensics/opus/FINAL-yenc-header-forensics.md](yenc-header-forensics/opus/FINAL-yenc-header-forensics.md) (rollout P1-P6 in [w9b-atlas-rust-spec.md](yenc-header-forensics/opus/w9b-atlas-rust-spec.md)). Open PR #64 links the files of fully obfuscated uploads; #67 keeps per-file timing.
 
-- [ ] P1: posting-tool classifier and per-segment fields (`tool_label`, nyuu_ms, Highwinds T1/N/K, host); Highwinds (host, K) session key with T1 within 1 h and monotone N.
+- [x] P1: posting-tool classifier and per-file fields (`file_timing.tool`, `clock_first`/`clock_last` in ms from Nyuu or the server's id, Highwinds `hw_host`, `hw_key`, `hw_n_first`/`hw_n_last`), folded at ingest by `discovery::id_facts` and shown on the release page. Not yet: using the (host, K) key to join files across rows.
 - [ ] P2: Nyuu Message-ID stream linker (Node 12+ xorshift128+, solver in [nyuu-id-solver/](yenc-header-forensics/opus/nyuu-id-solver/)); links every article of one upload from two IDs.
 - [ ] P3-P6: ms-continuity placement, NewsUP drand48, size-vector twin key with entropy gate, X-Received-Body-CRC twin key, offline seed searches.
-- [ ] End-to-start file join by the right clock (Nyuu ms, server-ID time, article rank), then PAR2 file-size match and 16 KB MD5 tie-break; veto-aware union-find (~80 lines, our own).
+- [x] End-to-start file join by the right clock, then PAR2 file-size match and 16 KB MD5 tie-break: the link step (`archive/link.rs`) now takes candidates from every group of its shard, orders them by `merging::ReleaseAssembler`'s end-to-start window over `file_timing`'s clocks, and links on size + first-16-KiB MD5 against the stored set. Not yet: candidates in other shards (the stage's writes are per shard), and the veto DSU over more than one set at a time.
 - [ ] Validate on Atlas's own XOVER/HEAD data (everything so far was measured on public NZBs). Needs the owner's go.
 - [x] Run the read-only provider probe [posting-behavior/nntp-probe/](posting-behavior/nntp-probe/) once per provider account (completed 2026-11-03 in [posting-behavior/nntp-probe/results-2026-11-03.md](posting-behavior/nntp-probe/results-2026-11-03.md), PR #74): `NEWNEWS` is disabled everywhere (`400`/`500`/`502`), non-overview `XHDR`/`HDR` returns `221` with no values or `400`/`501`/`503`, `Lines` is empty/`"0"` on up to 64% of rows, 2-digit `Date` years appear on 13–68% of rows, Giganews (`super.newsgroupdirect.com`) runs **+5.74 s** ahead on `DATE`, and `XZVER` works on XSNews/Usenet.Farm while hanging on Highwinds (`XFEATURE COMPRESS GZIP` 290). Follow-up: re-run on a busy obfuscated binaries group to sample server-assigned Message-IDs.
 

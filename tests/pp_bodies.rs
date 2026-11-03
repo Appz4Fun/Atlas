@@ -154,7 +154,8 @@ fn an_incomplete_release_gets_no_body_until_a_late_article_opens_it() {
     let mut h = fresh();
     let step = TestStep::new(1, "body", 100, Needs::Bodies, &log).reruns(false, true);
     let db_step = TestStep::new(9, "db", 200, Needs::Database, &log);
-    with_server(&mut h, &[release_of("Rel.One", "rel.bin", 1, 3)], vec![step.arc(), db_step.arc()], budget(6000));
+    let floor = PostprocessConfig { min_completion_percent: 95, ..budget(6000) };
+    with_server(&mut h, &[release_of("Rel.One", "rel.bin", 1, 3)], vec![step.arc(), db_step.arc()], floor);
     wait_for("the database step", || runs_of(&log, "db") == 1);
     wait_for("its row", || h.bits("Rel.One").is_some());
     let (done, _, wanted) = h.bits("Rel.One").unwrap();

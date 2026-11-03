@@ -6,6 +6,14 @@ Deliberately not done, with why, so it can be picked up later.
 
 The 2026-11-02 metadata and linking research lives in [research/](research/README.md). Its own list of what is left to build (probe fixes, archive and container facts, twin and alt keys, linking split posts) is [research/TODO.md](research/TODO.md).
 
+## Linking across shards
+
+The link step (`archive/link.rs`) finds the files of a fully obfuscated upload among the rows of its own shard, in any group. A row in another shard can't be linked from it: a step's writes go to its shard's writer only, and `upload_link` rows for a lead live in the lead's shard. Fix: let a `StepWrite` name the shard it goes to, and have the engine hand it to that shard's writer; then drop the `between ?1 and ?2` id window and look in every shard. Until then, recovery volumes of one set in several shards are tied by `par2_files.set_id` at read time only (`release_info::linked_post_with`), and a data file posted to another shard's group than its set's volumes stays unlinked.
+
+## Nyuu stream linker
+
+`docs/research` has a solver that links every article of one Nyuu upload from two message-ids (Node 12+ xorshift128+). It isn't ported: it's a search over the generator's state that takes seconds per upload, and the tool's clock in the id already orders files well enough for the link step. Fix: port `nyuu-id-solver` to Rust behind the body budget, run it only for uploads the clock can't place.
+
 ## Per-article obfuscated uploads
 
 Atlas gathers these into one release per upload (`filters::gather_per_article`).

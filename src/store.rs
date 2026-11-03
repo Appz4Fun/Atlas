@@ -586,7 +586,17 @@ pub const FILE_TIMING: ShardTable = ShardTable {
     )",
     indexes: &[("file_timing_release", "create index if not exists file_timing_release on file_timing(release_id)")],
     release_key: Some("release_id"),
-    added: &[],
+    // what the message-ids say (`discovery::id_facts`): the posting tool, the first and last millisecond the tool
+    // or the server wrote into an id, and on Highwinds the host, session key and the first and last counter
+    added: &[
+        ("tool", "INTEGER"),
+        ("clock_first", "INTEGER"),
+        ("clock_last", "INTEGER"),
+        ("hw_host", "TEXT"),
+        ("hw_key", "TEXT"),
+        ("hw_n_first", "INTEGER"),
+        ("hw_n_last", "INTEGER"),
+    ],
 };
 
 /// One save's articles of one file, as `file_timing` keeps them. `from_variants`
@@ -607,6 +617,13 @@ struct Timing {
     from_last: Option<i64>,
     from_runs: i64,
     encoded_subject: bool,
+    tool: Option<i64>,
+    clock_first: Option<i64>,
+    clock_last: Option<i64>,
+    hw_host: Option<String>,
+    hw_key: Option<String>,
+    hw_n_first: Option<i64>,
+    hw_n_last: Option<i64>,
 }
 
 impl Timing {
@@ -615,6 +632,20 @@ impl Timing {
         if let Some(ts) = crate::dates::naive_timestamp(&a.date) {
             self.first_date = Some(self.first_date.map_or(ts, |f| f.min(ts)));
             self.last_date = Some(self.last_date.map_or(ts, |l| l.max(ts)));
+        }
+        let facts = crate::discovery::id_facts(&a.message_id);
+        if let Some(tool) = facts.tool {
+            self.tool.get_or_insert(tool.code());
+        }
+        if let Some(ms) = facts.clock_ms {
+            self.clock_first = Some(self.clock_first.map_or(ms, |f| f.min(ms)));
+            self.clock_last = Some(self.clock_last.map_or(ms, |l| l.max(ms)));
+        }
+        if let (Some(host), Some(hw_key), Some(n)) = (facts.hw_host, facts.hw_key, facts.hw_n) {
+            self.hw_host.get_or_insert(host);
+            self.hw_key.get_or_insert(hw_key);
+            self.hw_n_first = Some(self.hw_n_first.map_or(n, |f| f.min(n)));
+            self.hw_n_last = Some(self.hw_n_last.map_or(n, |l| l.max(n)));
         }
         // 0 is what a header without a number parses to
         if a.number > 0 {
@@ -649,10 +680,22 @@ impl Timing {
         conn.prepare_cached(
             "insert into file_timing (file_id, release_id, first_date, last_date, number_first, number_last, lines,
                                       references_seen, xref_groups_max, from_hash, from_variants, encoded_subject,
-                                      late_articles, articles)
-             values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                                      late_articles, articles, tool, clock_first, clock_last, hw_host, hw_key,
+                                      hw_n_first, hw_n_last)
+             values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?16, ?17, ?18, ?19, ?20, ?21, ?22)
              on conflict(file_id) do update set
                 release_id = excluded.release_id,
+                tool = coalesce(file_timing.tool, excluded.tool),
+                clock_first = min(coalesce(file_timing.clock_first, excluded.clock_first),
+                                  coalesce(excluded.clock_first, file_timing.clock_first)),
+                clock_last = max(coalesce(file_timing.clock_last, excluded.clock_last),
+                                 coalesce(excluded.clock_last, file_timing.clock_last)),
+                hw_host = coalesce(file_timing.hw_host, excluded.hw_host),
+                hw_key = coalesce(file_timing.hw_key, excluded.hw_key),
+                hw_n_first = min(coalesce(file_timing.hw_n_first, excluded.hw_n_first),
+                                 coalesce(excluded.hw_n_first, file_timing.hw_n_first)),
+                hw_n_last = max(coalesce(file_timing.hw_n_last, excluded.hw_n_last),
+                                coalesce(excluded.hw_n_last, file_timing.hw_n_last)),
                 first_date = min(coalesce(file_timing.first_date, excluded.first_date),
                                  coalesce(excluded.first_date, file_timing.first_date)),
                 last_date = max(coalesce(file_timing.last_date, excluded.last_date),
@@ -688,6 +731,13 @@ impl Timing {
             if late { self.articles } else { 0 },
             self.articles,
             self.from_first,
+            self.tool,
+            self.clock_first,
+            self.clock_last,
+            self.hw_host,
+            self.hw_key,
+            self.hw_n_first,
+            self.hw_n_last,
         ])?;
         Ok(())
     }
@@ -2703,6 +2753,64 @@ mod tests {
         save(&main, &[release(vec![art("<a5@x>", 4, 104, "2026-10-02 10:07:00", "B <b@x>", 7)])]).unwrap();
         let sealed = row();
         assert_eq!((sealed.late, sealed.articles, sealed.lines, sealed.from_variants), (1, 5, Some(42), 2));
+    }
+
+    #[test]
+    fn file_timing_keeps_what_the_ids_say() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        db::create_db_at(&main).unwrap();
+        let art = |id: &str, part: i64| Article {
+            message_id: id.into(),
+            subject: format!("\"a.rar\" yEnc ({part}/4)"),
+            author: "A <a@x>".into(),
+            date: "2026-10-02 10:00:00".into(),
+            number: 100 + part as u64,
+            filename: Some("a.rar".into()),
+            part: Some(part),
+            total_parts: Some(4),
+            bytes: 100,
+            ..Default::default()
+        };
+        let release = |articles: Vec<Article>| Release {
+            name: "Rel".into(),
+            group: "alt.binaries.t".into(),
+            articles,
+            ..Default::default()
+        };
+        let conn = db::open_at(&shard_path(&main, shard_of("alt.binaries.t"))).unwrap();
+        type Facts = (Option<i64>, Option<i64>, Option<i64>, Option<String>, Option<String>, Option<i64>, Option<i64>);
+        let row = || -> Facts {
+            conn.query_row(
+                "select tool, clock_first, clock_last, hw_host, hw_key, hw_n_first, hw_n_last from file_timing",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
+            )
+            .unwrap()
+        };
+        // two Highwinds ids of one session: the server's clock, host, key and counters
+        save(
+            &main,
+            &[release(vec![
+                art("<EaPmB.546176$JP7.228032@fx09.am4>", 1),
+                art("<EaPmC.546180$JP7.228040@fx09.am4>", 2),
+            ])],
+        )
+        .unwrap();
+        let (tool, first, last, host, key, n_first, n_last) = row();
+        assert_eq!(tool, None);
+        assert_eq!(first, Some(1_503_379_236_000));
+        assert!(last >= first);
+        assert_eq!((host.as_deref(), key.as_deref(), n_first, n_last), (Some("fx09.am4"), Some("JP7"), Some(546_176), Some(546_180)));
+        // a Nyuu id of the same file: the tool, and its own clock widens the span
+        save(&main, &[release(vec![art("<ZjPsQyLgOjNtQvXbHeKaXyCm1730295651235@nyuu>", 3)])]).unwrap();
+        let (tool, first, last, host, key, _, _) = row();
+        assert_eq!(tool, Some(crate::discovery::ToolType::Nyuu.code()));
+        assert_eq!((first, last), (Some(1_503_379_236_000), Some(1_730_295_651_235)));
+        assert_eq!((host.as_deref(), key.as_deref()), (Some("fx09.am4"), Some("JP7")), "the session stays");
+        // an id that says nothing changes nothing
+        save(&main, &[release(vec![art("<a4@x>", 4)])]).unwrap();
+        assert_eq!(row().0, Some(1));
     }
 
     #[test]

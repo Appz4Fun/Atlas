@@ -148,9 +148,23 @@ fn keep_files_apart(rows: &mut [(i64, Vec<ArticleRow>)]) {
     }
 }
 
+/// A release's articles with its gaps filled from its twins and file twins (`duplicates`): an article the same bytes
+/// were posted as, by anyone, stands in for one this posting lost.
+fn filled_inventory(release: &ReleaseRow) -> Result<(Vec<ArticleRow>, Vec<String>)> {
+    let (mut articles, groups) = inventory(release)?;
+    if !articles.is_empty() {
+        let conn = crate::db::open()?;
+        let added = crate::duplicates::fill_from_copies_with(&conn, release.id, &mut articles)?;
+        if added > 0 {
+            crate::metrics::names::NZB_FILLED.inc(&[], added as u64);
+        }
+    }
+    Ok((articles, groups))
+}
+
 fn whole_nzb(release_id: i64) -> Result<Option<String>> {
     let Some(release) = get_release(release_id)? else { return Ok(None) };
-    let (articles, groups) = inventory(&release)?;
+    let (articles, groups) = filled_inventory(&release)?;
 
     if articles.is_empty() {
         return Ok(None);
@@ -166,7 +180,7 @@ pub fn build_nzb_file(release_id: i64, file: usize) -> Result<Option<String>> {
 
 fn one_file_nzb(release_id: i64, file: usize) -> Result<Option<String>> {
     let Some(release) = get_release(release_id)? else { return Ok(None) };
-    let (articles, groups) = inventory(&release)?;
+    let (articles, groups) = filled_inventory(&release)?;
     // sorted by filename, soo each file's articles are one run
     let mut runs = articles.chunk_by(|a, b| a.filename == b.filename);
     let Some(one) = file.checked_sub(1).and_then(|at| runs.nth(at)) else { return Ok(None) };

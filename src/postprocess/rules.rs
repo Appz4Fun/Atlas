@@ -294,19 +294,21 @@ mod tests {
             judge_files(&Rules::new(&c), &row(10, 2, true), &summary(), NOW),
             Verdict::Reject(Reason::TooFewFiles)
         );
-        // par2 only, and a mixed list
+        // par2 only: kept by default, so Par2Step and LinkStep can name and link its upload; rejected when asked
+        assert_eq!(judge(&row(10, 2, true), &FileSummary { all_par2: true, ..summary() }), Verdict::Pass);
+        let on = PostprocessConfig { reject_par2_only: true, ..Default::default() };
         assert_eq!(
-            judge(&row(10, 2, true), &FileSummary { all_par2: true, ..summary() }),
+            judge_files(&Rules::new(&on), &row(10, 2, true), &FileSummary { all_par2: true, ..summary() }, NOW),
             Verdict::Reject(Reason::Par2Only)
         );
-        // an obfuscated par2-only row is kept so Par2Step and LinkStep can name and link its upload
+        // an obfuscated par2-only row is kept even then
         assert_eq!(
-            judge(&RowFacts { name: TOKEN, ..row(10, 2, true) }, &FileSummary { all_par2: true, ..summary() }),
-            Verdict::Pass
-        );
-        let off = PostprocessConfig { reject_par2_only: false, ..Default::default() };
-        assert_eq!(
-            judge_files(&Rules::new(&off), &row(10, 2, true), &FileSummary { all_par2: true, ..summary() }, NOW),
+            judge_files(
+                &Rules::new(&on),
+                &RowFacts { name: TOKEN, ..row(10, 2, true) },
+                &FileSummary { all_par2: true, ..summary() },
+                NOW
+            ),
             Verdict::Pass
         );
 
@@ -328,13 +330,27 @@ mod tests {
 
     #[test]
     fn the_body_gate() {
-        let r = rules();
+        // the defaults keep nothing out: the bounds and the completion floor are what a config can set
+        let open = rules();
         let big = 10 << 20;
         let whole = summary();
+        assert_eq!(body_gate(&open, &row(1024, 1, true), &whole), BodyGate::Open, "no floor by default");
+        assert_eq!(body_gate(&open, &row(200 << 30, 1, true), &whole), BodyGate::Open, "no ceiling by default");
+        assert_eq!(
+            body_gate(&open, &row(big, 100, false), &FileSummary { present: 1, wanted: 100, ..summary() }),
+            BodyGate::Open,
+            "however incomplete"
+        );
+        let r = Rules::new(&PostprocessConfig {
+            body_min_size_bytes: 1 << 20,
+            body_max_size_bytes: 100 << 30,
+            min_completion_percent: 95,
+            ..Default::default()
+        });
         assert_eq!(body_gate(&r, &row(1024, 1, true), &whole), BodyGate::Outside, "below the bounds");
         assert_eq!(body_gate(&r, &row(big, 1, true), &whole), BodyGate::Open);
         assert_eq!(body_gate(&r, &row(200 << 30, 1, true), &whole), BodyGate::Outside, "above the bounds");
-        let no_limit = PostprocessConfig { body_max_size_bytes: 0, ..Default::default() };
+        let no_limit = PostprocessConfig { body_min_size_bytes: 1 << 20, body_max_size_bytes: 0, ..Default::default() };
         assert_eq!(body_gate(&Rules::new(&no_limit), &row(200 << 30, 1, true), &whole), BodyGate::Open);
         assert_eq!(
             body_gate(&r, &row(big, 1, true), &FileSummary { all_images: true, ..summary() }),

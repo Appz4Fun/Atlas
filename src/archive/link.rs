@@ -39,7 +39,11 @@ pub const UPLOAD_LINK: ShardTable = ShardTable {
         wanted     INTEGER,
         set_id     BLOB
     )",
-    indexes: &[("upload_link_lead", "create index if not exists upload_link_lead on upload_link(lead_id)")],
+    indexes: &[
+        ("upload_link_lead", "create index if not exists upload_link_lead on upload_link(lead_id)"),
+        // a volume in another shard finds its upload by its sealed set (`release_info::linked_post_with`)
+        ("upload_link_set", "create index if not exists upload_link_set on upload_link(set_id) where set_id is not null"),
+    ],
     release_key: Some("release_id"),
     added: &[],
 };
@@ -105,20 +109,25 @@ const MIN_LINKED: u64 = 1 << 20;
 /// Without the first 16 KiB, a file is known by its exact size alone, which only a big one makes safe.
 const MIN_SIZE_ONLY: u64 = 64 << 20;
 /// How far apart, in ids of this shard, an upload's rows can be: they're read from one run of articles, but other
-/// groups' saves come in between.
-const ID_WINDOW: i64 = 400_000;
-/// How far apart in days an upload's files can say they were posted. Real ones are an hour or two.
-const DAY_WINDOW: f64 = 1.0;
+/// groups' saves come in between, and an upload cut across groups lands in each group's own run.
+const ID_WINDOW: i64 = 2_000_000;
+/// How far apart in days an upload's files can say they were posted. Real ones are an hour or two; a slow or resumed
+/// upload a day or two.
+const DAY_WINDOW: f64 = 3.0;
 /// Rows looked at, at most, and articles fetched to check them, per run.
-const MAX_CANDIDATES: usize = 5_000;
-const MAX_CHECKS: usize = 16;
+const MAX_CANDIDATES: usize = 20_000;
+const MAX_CHECKS: usize = 64;
 /// A volume whose files haven't turned up looks again this often, while it's this new.
-const LOOK_AGAIN_SECS: i64 = 6 * 3600;
-const LOOK_AGAIN_FOR_DAYS: f64 = 3.0;
+const LOOK_AGAIN_SECS: i64 = 3 * 3600;
+const LOOK_AGAIN_FOR_DAYS: f64 = 14.0;
 /// A volume that ran out of articles to fetch before it ran out of rows to check goes on this soon, until it has
 /// checked this many.
-const RESUME_SECS: i64 = 600;
-const MAX_TRIED: i64 = 200;
+const RESUME_SECS: i64 = 300;
+const MAX_TRIED: i64 = 2_000;
+/// How long after one file's last article the next file of the same upload may start, for the end-to-start join that
+/// puts a set's rows ahead of the rest. Tools post files in series, and on real uploads nearly every gap is under two
+/// seconds; this allows a connection that stalled.
+const JOIN_GAP_SECS: f64 = 60.0;
 
 /// The steps a rename runs again, database ones and network ones.
 static ON_RENAME: LazyLock<(StepMask, StepMask)> = LazyLock::new(|| {
@@ -188,6 +197,72 @@ impl Seen {
     }
 }
 
+/// When a file's articles were posted, by the best clock its headers had: the posting tool's own milliseconds or the
+/// server's, as `file_timing` keeps them, or else the poster's Date header. Seconds since the epoch.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Clock {
+    pub start: f64,
+    pub end: f64,
+}
+
+impl Clock {
+    /// `clock_first`/`clock_last` are milliseconds, `first_date`/`last_date` seconds.
+    pub fn of(first_date: Option<i64>, last_date: Option<i64>, first: Option<i64>, last: Option<i64>) -> Option<Clock> {
+        match (first, last) {
+            (Some(first), Some(last)) if first > 0 && last >= first => {
+                Some(Clock { start: first as f64 / 1000.0, end: last as f64 / 1000.0 })
+            }
+            _ => match (first_date, last_date) {
+                (Some(first), Some(last)) if first > 0 && last >= first => {
+                    Some(Clock { start: first as f64, end: last as f64 })
+                }
+                _ => None,
+            },
+        }
+    }
+
+    /// How many seconds apart two files were posted, end to start either way: 0 when they overlap.
+    pub fn gap(&self, other: &Clock) -> f64 {
+        if self.end <= other.start {
+            other.start - self.end
+        } else if other.end <= self.start {
+            self.start - other.end
+        } else {
+            0.0
+        }
+    }
+
+    /// Whether `other` is a file of the same run of posting as this one: the one before or after it, within
+    /// `JOIN_GAP_SECS`, by `merging`'s end-to-start window.
+    pub fn joins(&self, other: &Clock) -> bool {
+        use crate::merging::{CandidateFileRun, JoinOptions, ReleaseAssembler};
+        let run = |name: &str, clock: &Clock| CandidateFileRun {
+            filename: name.to_string(),
+            group: String::new(),
+            poster: String::new(),
+            size: 0,
+            yenc_total: None,
+            yenc_part_size: None,
+            file_index: None,
+            rar_volume_idx: None,
+            archive_format: None,
+            member_id: None,
+            byte_offset: 0,
+            t_start: clock.start,
+            t_end: clock.end,
+            file_crc: None,
+            md5_16k: None,
+            full_md5: None,
+            unpacked_crc32: None,
+            creation_salt: None,
+            is_obfuscated: false,
+        };
+        let options = JoinOptions { max_gap_seconds: JOIN_GAP_SECS, ..JoinOptions::default() };
+        let joined = ReleaseAssembler::join_runs(&[run("a", self), run("b", other)], Some(&options));
+        joined.len() == 1
+    }
+}
+
 /// A row that may hold one of the set's files.
 #[derive(Clone, Debug)]
 struct Candidate {
@@ -197,6 +272,17 @@ struct Candidate {
     file: FileInfo,
     /// days from the volume's own date
     apart: f64,
+    clock: Option<Clock>,
+}
+
+/// A file's clock, from its timing row.
+fn clock_of(ctx: &StepCtx<'_>, file_id: i64) -> Option<Clock> {
+    ctx.conn()
+        .prepare_cached("select first_date, last_date, clock_first, clock_last from file_timing where file_id = ?")
+        .ok()?
+        .query_row([file_id], |r| Ok(Clock::of(r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+        .ok()
+        .flatten()
 }
 
 #[derive(Default)]
@@ -221,9 +307,18 @@ impl LinkStep {
         Ok(listed.then(|| files[0].clone()))
     }
 
-    /// The set's list of files, from the volume's first article and, when that doesn't hold all of it or can't be
-    /// read, its last: a set repeats its descriptions there.
-    fn inventory(&self, ctx: &mut StepCtx<'_>, file: &FileInfo) -> Result<par2::Inventory, StepError> {
+    /// The set's list of files: as the PAR2 step kept it, when it read the whole set, or else from the volume's first
+    /// article and, when that doesn't hold all of it or can't be read, its last: a set repeats its descriptions there.
+    /// With it, the writes that keep what was read, soo the next run reads nothing.
+    fn inventory(
+        &self,
+        ctx: &mut StepCtx<'_>,
+        file: &FileInfo,
+    ) -> Result<(par2::Inventory, Vec<StepWrite>), StepError> {
+        let id = ctx.release().id;
+        if let Some(kept) = super::store::par2_inventory(ctx.conn(), "main", id) {
+            return Ok((kept, Vec::new()));
+        }
         let mut body = Vec::new();
         let first = first_article(ctx, file)?;
         if let Some(seg) = &first
@@ -241,14 +336,16 @@ impl LinkStep {
                 inventory = par2::inventory(&body);
             }
         }
-        Ok(inventory)
+        let kept = if inventory.files.is_empty() { Vec::new() } else { super::store::par2_file_writes(id, &inventory) };
+        Ok((inventory, kept))
     }
 
-    /// Single-file rows near this one that could hold a file of between `sizes` bytes, nearest in time first. Only
-    /// rows with no readable name, or that lead an upload already: a PAR2 set is anyone's to post, and a made-up one mustn't
-    /// add its files to a release people download by its name. What the article count must be for those sizes is
-    /// weighed here too, roughly, soo a busy group's other rows don't crowd the real one out of the limit; `parts_fit`
-    /// then weighs each closely.
+    /// Single-file rows near this one, in any group of this shard, that could hold a file of between `sizes` bytes,
+    /// nearest in time first. Only rows that nothing has named, or that lead an upload already: the row's file is
+    /// checked against the set's size and first 16 KiB before anything links, which is what makes a file that file,
+    /// whoever posted it and under whatever subject. What the article count must be for those sizes is weighed here
+    /// too, roughly, soo a busy shard's other rows don't crowd the real one out of the limit; `parts_fit` then weighs
+    /// each closely.
     fn candidates(
         &self,
         ctx: &StepCtx<'_>,
@@ -262,20 +359,22 @@ impl LinkStep {
             .conn()
             .prepare_cached(
                 "select r.id, coalesce(r.size, 0), coalesce(r.parts, 0), f.id, f.filename, f.expected,
-                        abs(julianday(r.posted_date) - julianday(?5))
+                        abs(julianday(r.posted_date) - julianday(?4)),
+                        t.first_date, t.last_date, t.clock_first, t.clock_last
                  from releases r join files f on f.release_id = r.id
-                 where r.id between ?1 and ?2 and r.id != ?3 and r.group_name = ?4
-                   and abs(julianday(r.posted_date) - julianday(?5)) <= ?6
+                 left join file_timing t on t.file_id = f.id
+                 where r.id between ?1 and ?2 and r.id != ?3
+                   and abs(julianday(r.posted_date) - julianday(?4)) <= ?5
                    and not exists (select 1 from files g where g.release_id = r.id and g.id != f.id)
                    and not exists (select 1 from upload_link l where l.release_id = r.id and l.lead_id != r.id)
                    and not exists (select 1 from upload_link_tried t where t.release_id = ?3 and t.candidate_id = r.id)
                    and r.size > 0 and r.parts > 0
-                   and ((r.is_obfuscated = 1 and r.display_name is null)
+                   and (r.display_name is null
                         or exists (select 1 from upload_link m where m.lead_id = r.id and m.recovery = 1
-                                   and m.set_id = ?10))
-                   and f.expected between ?8 * 1.005 * r.parts / r.size - 2 and ?9 * 1.08 * r.parts / r.size + 2
-                 order by abs(julianday(r.posted_date) - julianday(?5))
-                 limit ?7",
+                                   and m.set_id = ?9))
+                   and f.expected between ?7 * 1.005 * r.parts / r.size - 2 and ?8 * 1.08 * r.parts / r.size + 2
+                 order by abs(julianday(r.posted_date) - julianday(?4))
+                 limit ?6",
             )
             .map_err(retry)?;
         let rows = stmt
@@ -284,7 +383,6 @@ impl LinkStep {
                     me.id - span,
                     me.id + span,
                     me.id,
-                    me.group,
                     posted,
                     DAY_WINDOW,
                     MAX_CANDIDATES as i64,
@@ -309,6 +407,7 @@ impl LinkStep {
                             sealed: false,
                         },
                         apart: r.get::<_, Option<f64>>(6)?.unwrap_or(DAY_WINDOW),
+                        clock: Clock::of(r.get(7)?, r.get(8)?, r.get(9)?, r.get(10)?),
                     })
                 },
             )
@@ -402,12 +501,11 @@ impl Step for LinkStep {
         *self.limits.lock().unwrap() = cfg.archive.clone();
         cfg.archive.enabled
     }
-    /// Only a row its PAR2 set named: the volumes of an upload like this are the ones that get a name. PreDB may confirm
-    /// that name later and take over as its source; the volume still links (run only goes on for a row of PAR2 files).
+    /// Any row: `run` goes on only for a row of PAR2 files, whether or not its set gave it a name. A set whose names
+    /// looked random named nothing, and its volumes link all the same.
     fn applies(&self, release: &ReleaseInfo) -> bool {
-        release.name_source.is_some_and(|source| {
-            source == i64::from(NAME_SOURCE_PAR2) || source == i64::from(crate::naming::NameSource::PreDb.value())
-        })
+        let _ = release;
+        true
     }
     /// A volume gets its name in the same run, from an earlier step, soo the name is what brings this back.
     fn reruns(&self) -> Reruns {
@@ -435,14 +533,14 @@ impl Step for LinkStep {
                 have.extend(file);
             }
         }
-        let inventory = self.inventory(ctx, &par2_file)?;
+        let (inventory, kept) = self.inventory(ctx, &par2_file)?;
         let young = age_days(ctx, ctx.release()).is_some_and(|days| days < LOOK_AGAIN_FOR_DAYS);
         let now = chrono::Utc::now().timestamp();
         let wanted = wanted(&inventory.files);
         if wanted.is_empty() {
             // a set that couldn't be read at all may be readable later
             let wait_until = (inventory.files.is_empty() && young).then_some(now + LOOK_AGAIN_SECS);
-            return Ok(Outcome { matched: mine.is_some(), wait_until, ..Default::default() });
+            return Ok(Outcome { matched: mine.is_some(), wait_until, writes: kept, ..Default::default() });
         }
         // a set read only in part may have more files than it shows: the link can't call itself whole, and it looks
         // again for the rest of the list
@@ -460,14 +558,23 @@ impl Step for LinkStep {
                     })
             });
             // rows whose first article is indexed go first: those can tell apart files of the same size, where a later
-            // article only gives the size
+            // article only gives the size. Among those, the files posted right before or after this volume, by the
+            // best clock there is: an upload's files go up one after the other
+            let my_clock = clock_of(ctx, par2_file.id);
             let mut ordered = Vec::with_capacity(candidates.len());
             for candidate in candidates {
-                ordered.push((first_article(ctx, &candidate.file)?.is_none(), candidate));
+                let later = first_article(ctx, &candidate.file)?.is_none();
+                let (joined, gap) = match (my_clock, candidate.clock) {
+                    (Some(mine), Some(theirs)) => (mine.joins(&theirs), mine.gap(&theirs)),
+                    _ => (false, candidate.apart * 86_400.0),
+                };
+                ordered.push((later, !joined, gap, candidate));
             }
-            ordered.sort_by(|(a_later, a), (b_later, b)| a_later.cmp(b_later).then(a.apart.total_cmp(&b.apart)));
+            ordered.sort_by(|(a_later, a_apart, a_gap, _), (b_later, b_apart, b_gap, _)| {
+                a_later.cmp(b_later).then(a_apart.cmp(b_apart)).then(a_gap.total_cmp(b_gap))
+            });
             let mut checks = 0;
-            for (_, candidate) in ordered {
+            for (_, _, _, candidate) in ordered {
                 if missing.is_empty() {
                     break;
                 }
@@ -513,8 +620,8 @@ impl Step for LinkStep {
         };
         // a row that isn't one of the files read so far may be one of those not read yet
         let tried = if unknown == 0 { tried } else { Vec::new() };
-        let mut writes: Vec<StepWrite> =
-            tried.iter().map(|other| StepWrite::new(TRIED, vec![id.into(), (*other).into()])).collect();
+        let mut writes: Vec<StepWrite> = kept;
+        writes.extend(tried.iter().map(|other| StepWrite::new(TRIED, vec![id.into(), (*other).into()])));
         // every file of the set, the ones too small or too alike to look for too: the upload isn't whole without them
         let looks_for = inventory.files.len() as i64 + unknown;
         if found.is_empty() {
@@ -693,6 +800,55 @@ mod tests {
         write(&conn, LINK_DATA, vec![sample.into(), sample.into(), vec![1u8; 16].into()]);
         write(&conn, LINK_RECOVERY, vec![vol_a.into(), sample.into(), 2i64.into(), rusqlite::types::Value::Null]);
         assert_eq!(links(&conn), [(sample, mkv), (mkv, mkv), (vol_a, mkv), (vol_b, mkv)]);
+    }
+
+    #[test]
+    fn files_posted_one_after_another_join_by_the_clock() {
+        let a = Clock { start: 1_000.0, end: 1_600.0 };
+        let next = Clock { start: 1_601.5, end: 2_200.0 };
+        let later = Clock { start: 1_600.0 + JOIN_GAP_SECS + 5.0, end: 3_000.0 };
+        assert!(a.joins(&next));
+        assert!(next.joins(&a), "either way round");
+        assert!(!a.joins(&later));
+        assert_eq!(a.gap(&next), 1.5);
+        assert_eq!(a.gap(&Clock { start: 1_200.0, end: 1_300.0 }), 0.0, "overlapping");
+        assert_eq!(Clock::of(Some(10), Some(20), Some(5_000), Some(9_000)), Some(Clock { start: 5.0, end: 9.0 }));
+        assert_eq!(Clock::of(Some(10), Some(20), None, None), Some(Clock { start: 10.0, end: 20.0 }));
+        assert_eq!(Clock::of(None, Some(20), None, None), None);
+    }
+
+    #[test]
+    fn a_set_read_once_is_kept_and_read_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("atlas.s0.db");
+        crate::store::create_shard(&path).unwrap();
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let mut a = file(2 << 20, 1);
+        a.name = "a.mkv".into();
+        a.crc32 = Some(7);
+        let mut b = file(3 << 20, 2);
+        b.name = "b.mkv".into();
+        let inventory = par2::Inventory {
+            files: vec![a.clone(), b.clone()],
+            block_size: Some(1024),
+            complete: true,
+            truncated: false,
+            sealed: vec![(a.set_id, a.file_id)],
+        };
+        for w in super::super::store::par2_file_writes(8, &inventory) {
+            write(&conn, w.sql, w.params);
+        }
+        let back = super::super::store::par2_inventory(&conn, "main", 8).expect("read back");
+        assert_eq!(back.files, vec![a.clone(), b]);
+        assert_eq!(back.sealed, vec![(a.set_id, a.file_id)]);
+        assert!(back.complete);
+        assert_eq!(sealed_set(&back, &wanted(&back.files)), None, "b was not sealed");
+        // a set read only in part isn't read back: the next run reads the rest
+        let partial = par2::Inventory { complete: false, ..inventory };
+        for w in super::super::store::par2_file_writes(16, &partial) {
+            write(&conn, w.sql, w.params);
+        }
+        assert!(super::super::store::par2_inventory(&conn, "main", 16).is_none());
     }
 
     #[test]

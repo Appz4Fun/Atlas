@@ -90,6 +90,8 @@ pub struct StepCtx<'a> {
     pub(crate) used_bodies: i64,
     pub(crate) deadline: Instant,
     pub(crate) lane_can_fetch: bool,
+    /// the CRC of each article body read whole this run, written with the step's outcome (`archive::store::SEGMENT_CRC`)
+    pub(crate) crcs: Vec<StepWrite>,
 }
 
 impl StepCtx<'_> {
@@ -132,6 +134,11 @@ impl StepCtx<'_> {
                 self.deadline,
                 BackgroundRead::Capped,
             )?;
+            if let Got::Body(body) = &got
+                && request.max_bytes.is_none_or(|cap| body.len() < cap)
+            {
+                self.keep_crc(&request.message_id, body.len(), crate::gf2::crc32(body));
+            }
             results.push(BodyResult { message_id: request.message_id.clone(), got });
         }
         Ok(results)
@@ -155,7 +162,30 @@ impl StepCtx<'_> {
         }
         let got =
             self.bodies.fetch(&self.release, wanted, &mut self.used_bodies, self.deadline, BackgroundRead::Raw)?;
+        if let Got::Body(raw) = &got {
+            // what the trailer says of the part: its CRC, and how many bytes it decodes to
+            let article = crate::probe::yenc::split_article(raw);
+            if let Some(y) = crate::probe::yenc::parse(&article.lines)
+                && let Some(crc) = y.pcrc32.or(y.crc32)
+            {
+                let decoded = match (y.begin, y.end) {
+                    (Some(begin), Some(end)) if end >= begin => end - begin + 1,
+                    _ => y.yend_size.or(y.file_size).unwrap_or(0),
+                };
+                if decoded > 0 {
+                    self.keep_crc(&wanted.message_id, decoded as usize, crc);
+                }
+            }
+        }
         Ok(BodyResult { message_id: wanted.message_id.clone(), got })
+    }
+
+    /// An article's CRC, kept with this run's writes.
+    fn keep_crc(&mut self, message_id: &str, decoded: usize, crc: u32) {
+        self.crcs.push(StepWrite::new(
+            crate::archive::store::SET_SEGMENT_CRC,
+            vec![self.release.id.into(), message_id.to_string().into(), (decoded as i64).into(), i64::from(crc).into()],
+        ));
     }
 
     /// Whether a server still has an article, with nothing transferred. None: it wasn't asked.

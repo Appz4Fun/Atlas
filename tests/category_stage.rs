@@ -188,7 +188,9 @@ fn a_rejected_release_gets_no_row() {
     let name = "Only.Par2.Files.2024-GRP";
     h.save(&[in_group(name, "x.par2", MOVIES)]);
     let id = id_in(&h, MOVIES, name);
-    start(&mut h, config(), vec![step()], Pool::new(&[]));
+    let mut rejecting = config();
+    rejecting.postprocess.reject_par2_only = true;
+    start(&mut h, rejecting, vec![step()], Pool::new(&[]));
     wait_for("its queue row to go", || {
         shard_of(&h, MOVIES)
             .query_row("select count(*) from pp_queue where release_id = ?", [id], |r| r.get::<_, i64>(0))

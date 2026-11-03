@@ -251,7 +251,10 @@ impl Step for Par2Step {
             let blocks: u64 = inventory.files.iter().map(|f| f.size.div_ceil(block)).sum();
             (block as i64, blocks as i64)
         });
+        // the set's files, hashes and all: what the link step and twin fill go by without reading the set again
+        let kept = archive_store::par2_file_writes(ctx.release().id, &inventory);
         let mut outcome = finish(ctx, SOURCE_PAR2, listing_of(inventory), &limits)?;
+        outcome.writes.extend(kept);
         // one set's files are only some of the release's, soo they don't say what the release holds
         if !covers_all {
             outcome.writes.retain(|write| write.sql != duplicates::SET_CONTENT);
@@ -414,12 +417,15 @@ impl Step for ListStep {
                 }
                 Format::Par2 => {
                     // a PAR2 under another name: without a list, it cant replace the rows of one that had
-                    let listing = listing_of(par2::inventory(&body));
+                    let inventory = par2::inventory(&body);
+                    let kept = archive_store::par2_file_writes(ctx.release().id, &inventory);
+                    let listing = listing_of(inventory);
                     if listing.files.is_empty() {
                         continue;
                     }
                     let listed = listing.files.len();
                     let mut outcome = finish(ctx, SOURCE_PAR2, listing, &limits)?;
+                    outcome.writes.extend(kept);
                     // finish counts files by name, and this one is PAR2 under another name: the set speaks for the
                     // release only when the rest of its files are the set's. A recovery volume posted on its own, as a
                     // fully obfuscated upload does, would otherwise claim the content of the files it repairs
