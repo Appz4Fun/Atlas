@@ -299,12 +299,14 @@ impl Step for StillsStep {
     fn run(&self, ctx: &mut StepCtx<'_>) -> Result<Outcome, StepError> {
         let retry = |e: rusqlite::Error| StepError::Retry(e.to_string());
         let release_id = ctx.release().id;
-        // a release that already has all its stills keeps them: the walk for a new stamp bit fetches nothing
-        let have: i64 = ctx
+        // a release whose stills are all still on disk keeps them: the walk for a new stamp bit fetches nothing.
+        // One trimmed from the folder is made again.
+        let kept: Vec<String> = ctx
             .conn()
-            .query_row("select count(*) from release_stills where release_id = ?1", [release_id], |r| r.get(0))
+            .prepare("select sha256 from release_stills where release_id = ?1")
+            .and_then(|mut q| q.query_map([release_id], |r| r.get(0))?.collect())
             .map_err(retry)?;
-        if have == POSITIONS.len() as i64 {
+        if kept.len() == POSITIONS.len() && kept.iter().all(|h| still_file(h).is_some_and(|f| f.exists())) {
             return Ok(Outcome { matched: true, ..Outcome::default() });
         }
         let info: Option<String> = ctx
