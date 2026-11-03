@@ -425,6 +425,8 @@ pub fn next_probe_slot(next: &mut Option<Instant>, now: Instant, gap: Duration) 
 }
 
 /// Reads an archive's list of files.
+pub const LIST_STEP: StepId = StepId(2);
+
 #[derive(Default)]
 pub struct ListStep {
     limits: Mutex<ArchiveConfig>,
@@ -512,7 +514,7 @@ fn seven_list(
 
 impl Step for ListStep {
     fn id(&self) -> StepId {
-        StepId(2)
+        LIST_STEP
     }
     fn name(&self) -> &'static str {
         "archive_list"

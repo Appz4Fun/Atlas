@@ -89,6 +89,14 @@ CREATE TABLE IF NOT EXISTS raw_predb_log (
     UNIQUE(source_id, body_sha256)
 );
 
+CREATE TABLE IF NOT EXISTS raw_predb_events (
+    seq        INTEGER PRIMARY KEY,
+    log_id     INTEGER NOT NULL,
+    page       INTEGER NOT NULL DEFAULT 1,
+    fetched_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_raw_predb_events_log_id ON raw_predb_events(log_id);
+
 CREATE TRIGGER IF NOT EXISTS raw_predb_log_ai AFTER INSERT ON raw_predb_log BEGIN
     INSERT INTO raw_meta (key, value) VALUES ('predb_rows', 1)
         ON CONFLICT(key) DO UPDATE SET value = value + 1;
@@ -98,6 +106,7 @@ END;
 CREATE TRIGGER IF NOT EXISTS raw_predb_log_ad AFTER DELETE ON raw_predb_log BEGIN
     UPDATE raw_meta SET value = max(0, value - 1) WHERE key = 'predb_rows';
     UPDATE raw_meta SET value = max(0, value - length(old.body_zst)) WHERE key = 'predb_bytes';
+    DELETE FROM raw_predb_events WHERE log_id = old.id;
 END;
 CREATE TRIGGER IF NOT EXISTS raw_predb_log_au AFTER UPDATE ON raw_predb_log BEGIN
     UPDATE raw_meta SET value = max(0, value + length(new.body_zst) - length(old.body_zst)) WHERE key = 'predb_bytes';
@@ -136,15 +145,15 @@ CREATE INDEX IF NOT EXISTS idx_raw_probes_probed_at ON raw_probes(probed_at);
 CREATE TRIGGER IF NOT EXISTS raw_probes_ai AFTER INSERT ON raw_probes BEGIN
     INSERT INTO raw_meta (key, value) VALUES ('probe_rows', 1)
         ON CONFLICT(key) DO UPDATE SET value = value + 1;
-    INSERT INTO raw_meta (key, value) VALUES ('probe_bytes', length(new.info))
+    INSERT INTO raw_meta (key, value) VALUES ('probe_bytes', length(cast(new.info as blob)))
         ON CONFLICT(key) DO UPDATE SET value = value + excluded.value;
 END;
 CREATE TRIGGER IF NOT EXISTS raw_probes_ad AFTER DELETE ON raw_probes BEGIN
     UPDATE raw_meta SET value = max(0, value - 1) WHERE key = 'probe_rows';
-    UPDATE raw_meta SET value = max(0, value - length(old.info)) WHERE key = 'probe_bytes';
+    UPDATE raw_meta SET value = max(0, value - length(cast(old.info as blob))) WHERE key = 'probe_bytes';
 END;
 CREATE TRIGGER IF NOT EXISTS raw_probes_au AFTER UPDATE ON raw_probes BEGIN
-    UPDATE raw_meta SET value = max(0, value + length(new.info) - length(old.info)) WHERE key = 'probe_bytes';
+    UPDATE raw_meta SET value = max(0, value + length(cast(new.info as blob)) - length(cast(old.info as blob))) WHERE key = 'probe_bytes';
 END;
 
 CREATE TABLE IF NOT EXISTS raw_covers (
@@ -293,13 +302,39 @@ pub fn create(path: &Path) -> rusqlite::Result<Connection> {
     ensure_column(&conn, "raw_archive_inner_files", "content_id", "BLOB")?;
     ensure_column(&conn, "raw_nfo_passwords", "content_id", "BLOB")?;
     ensure_column(&conn, "raw_stills", "content_id", "BLOB")?;
-    let seeded: bool = conn.prepare("SELECT 1 FROM raw_meta WHERE key = 'seeded'")?.exists([])?;
-    if !seeded {
+    let seeded = raw_meta_get(&conn, "seeded")?;
+    if seeded < 2 {
         conn.execute_batch(
-            "INSERT OR REPLACE INTO raw_meta (key, value)
+            "DROP TRIGGER IF EXISTS raw_predb_log_ad;
+             CREATE TRIGGER raw_predb_log_ad AFTER DELETE ON raw_predb_log BEGIN
+                 UPDATE raw_meta SET value = max(0, value - 1) WHERE key = 'predb_rows';
+                 UPDATE raw_meta SET value = max(0, value - length(old.body_zst)) WHERE key = 'predb_bytes';
+                 DELETE FROM raw_predb_events WHERE log_id = old.id;
+             END;
+             DROP TRIGGER IF EXISTS raw_probes_ai;
+             CREATE TRIGGER raw_probes_ai AFTER INSERT ON raw_probes BEGIN
+                 INSERT INTO raw_meta (key, value) VALUES ('probe_rows', 1)
+                     ON CONFLICT(key) DO UPDATE SET value = value + 1;
+                 INSERT INTO raw_meta (key, value) VALUES ('probe_bytes', length(cast(new.info as blob)))
+                     ON CONFLICT(key) DO UPDATE SET value = value + excluded.value;
+             END;
+             DROP TRIGGER IF EXISTS raw_probes_ad;
+             CREATE TRIGGER raw_probes_ad AFTER DELETE ON raw_probes BEGIN
+                 UPDATE raw_meta SET value = max(0, value - 1) WHERE key = 'probe_rows';
+                 UPDATE raw_meta SET value = max(0, value - length(cast(old.info as blob))) WHERE key = 'probe_bytes';
+             END;
+             DROP TRIGGER IF EXISTS raw_probes_au;
+             CREATE TRIGGER raw_probes_au AFTER UPDATE ON raw_probes BEGIN
+                 UPDATE raw_meta SET value = max(0, value + length(cast(new.info as blob)) - length(cast(old.info as blob))) WHERE key = 'probe_bytes';
+             END;
+             INSERT INTO raw_predb_events (log_id, page, fetched_at)
+                 SELECT l.id, l.page, l.fetched_at FROM raw_predb_log l
+                 WHERE NOT EXISTS (SELECT 1 FROM raw_predb_events e WHERE e.log_id = l.id)
+                 ORDER BY l.id ASC;
+             INSERT OR REPLACE INTO raw_meta (key, value)
                  SELECT 'probe_rows', count(*) FROM raw_probes;
              INSERT OR REPLACE INTO raw_meta (key, value)
-                 SELECT 'probe_bytes', coalesce(sum(length(info)), 0) FROM raw_probes;
+                 SELECT 'probe_bytes', coalesce(sum(length(cast(info as blob))), 0) FROM raw_probes;
              INSERT OR REPLACE INTO raw_meta (key, value)
                  SELECT 'http_rows', count(*) FROM raw_http_cache;
              INSERT OR REPLACE INTO raw_meta (key, value)
@@ -310,7 +345,7 @@ pub fn create(path: &Path) -> rusqlite::Result<Connection> {
                  SELECT 'predb_bytes', coalesce(sum(length(body_zst)), 0) FROM raw_predb_log;
              INSERT OR REPLACE INTO raw_meta (key, value)
                  SELECT 'archive_name_bytes', coalesce(sum(length(cast(name as blob)) + 32), 0) FROM raw_archive_inner_files;
-             INSERT OR REPLACE INTO raw_meta (key, value) VALUES ('seeded', 1);",
+             INSERT OR REPLACE INTO raw_meta (key, value) VALUES ('seeded', 2);",
         )?;
     }
     Ok(conn)
@@ -537,8 +572,8 @@ fn prune_predb_log(conn: &Connection, incoming_bytes: i64, max_rows: i64, max_by
 }
 
 /// Archives a validated, non-empty PreDB payload in `raw_predb_log` (deduplicated by SHA-256 and bounded
-/// by `MAX_PREDB_LOG_ROWS` / `MAX_PREDB_LOG_BYTES`) and, if it is a static archive snapshot, also caches it
-/// in `raw_http_cache`.
+/// by `MAX_PREDB_LOG_ROWS` / `MAX_PREDB_LOG_BYTES`), records its polling observation order in `raw_predb_events`
+/// whenever the page's payload changes, and, if it is a static archive snapshot, also caches it in `raw_http_cache`.
 pub fn record_predb_page(source_id: i64, source_key: &str, url: &str, page: u32, body: &str) {
     let Some(zst) = compress(body) else { return };
     let incoming_bytes = zst.len() as i64;
@@ -548,18 +583,48 @@ pub fn record_predb_page(source_id: i64, source_key: &str, url: &str, page: u32,
     let sha256 = Sha256::digest(body.as_bytes()).to_vec();
     let clean_url = canonical_cache_url(url);
     let now = chrono::Utc::now().timestamp();
+    let page_i64 = i64::from(page);
     let cache_forever = is_immutable_predb_page(source_key, page);
     let _ = with_raw(|conn| {
-        let already_archived: bool = conn
-            .prepare_cached("SELECT EXISTS(SELECT 1 FROM raw_predb_log WHERE source_id = ?1 AND body_sha256 = ?2)")?
-            .query_row(params![source_id, &sha256], |r| r.get(0))?;
-        if !already_archived {
-            prune_predb_log(conn, incoming_bytes, MAX_PREDB_LOG_ROWS, MAX_PREDB_LOG_BYTES)?;
-            conn.prepare_cached(
-                "INSERT OR IGNORE INTO raw_predb_log (source_id, source_key, url, page, body_sha256, body_zst, fetched_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        let existing_id: Option<i64> = conn
+            .prepare_cached("SELECT id FROM raw_predb_log WHERE source_id = ?1 AND body_sha256 = ?2")?
+            .query_row(params![source_id, &sha256], |r| r.get(0))
+            .optional()?;
+        let log_id = match existing_id {
+            Some(id) => id,
+            None => {
+                prune_predb_log(conn, incoming_bytes, MAX_PREDB_LOG_ROWS, MAX_PREDB_LOG_BYTES)?;
+                conn.prepare_cached(
+                    "INSERT INTO raw_predb_log (source_id, source_key, url, page, body_sha256, body_zst, fetched_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                )?
+                .execute(params![source_id, source_key, &clean_url, page_i64, &sha256, &zst, now])?;
+                conn.last_insert_rowid()
+            }
+        };
+        let last_event_log_id: Option<i64> = conn
+            .prepare_cached(
+                "SELECT e.log_id FROM raw_predb_events e
+                 JOIN raw_predb_log l ON l.id = e.log_id
+                 WHERE l.source_id = ?1 AND e.page = ?2
+                 ORDER BY e.seq DESC LIMIT 1",
             )?
-            .execute(params![source_id, source_key, &clean_url, i64::from(page), &sha256, &zst, now])?;
+            .query_row(params![source_id, page_i64], |r| r.get(0))
+            .optional()?;
+        if last_event_log_id != Some(log_id) {
+            let max_events = MAX_PREDB_LOG_ROWS * 2;
+            let event_count: i64 = conn.query_row("SELECT count(*) FROM raw_predb_events", [], |r| r.get(0))?;
+            if event_count >= max_events {
+                let drop_events = (event_count - max_events + 1).max(64);
+                conn.execute(
+                    "DELETE FROM raw_predb_events WHERE seq IN (
+                        SELECT seq FROM raw_predb_events ORDER BY seq ASC LIMIT ?1
+                    )",
+                    params![drop_events],
+                )?;
+            }
+            conn.prepare_cached("INSERT INTO raw_predb_events (log_id, page, fetched_at) VALUES (?1, ?2, ?3)")?
+                .execute(params![log_id, page_i64, now])?;
         }
         if cache_forever && incoming_bytes <= MAX_HTTP_CACHE_BYTES {
             let cache_key = format!("GET:{source_key}:{clean_url}");
@@ -1640,6 +1705,36 @@ fn verified_step_sql(schema: &str, step_bit: i64, has_pp_state: bool, has_pp_wal
     )
 }
 
+fn prune_archive_inner_files(
+    conn: &Connection,
+    incoming_bytes: i64,
+    keep_release: Option<(&str, &str)>,
+) -> rusqlite::Result<()> {
+    while raw_meta_get(conn, "archive_name_bytes")? + incoming_bytes > MAX_RAW_ARCHIVE_NAME_BYTES {
+        let victim: Option<(String, String)> = match keep_release {
+            Some((k_name, k_group)) => conn
+                .prepare_cached(
+                    "SELECT release_name, group_name FROM raw_archive_inner_files
+                     WHERE release_name != ?1 OR group_name != ?2 LIMIT 1",
+                )?
+                .query_row(params![k_name, k_group], |r| Ok((r.get(0)?, r.get(1)?)))
+                .optional()?,
+            None => conn
+                .prepare_cached("SELECT release_name, group_name FROM raw_archive_inner_files LIMIT 1")?
+                .query_row([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .optional()?,
+        };
+        let Some((v_name, v_group)) = victim else {
+            break;
+        };
+        conn.prepare_cached("DELETE FROM raw_archive_inner_files WHERE release_name = ?1 AND group_name = ?2")?
+            .execute(params![&v_name, &v_group])?;
+        conn.prepare_cached("UPDATE raw_archives SET listing_complete = 0 WHERE name = ?1 AND group_name = ?2")?
+            .execute(params![&v_name, &v_group])?;
+    }
+    Ok(())
+}
+
 fn enforce_harvest_quotas(conn: &Connection) -> rusqlite::Result<()> {
     let os_count: i64 = conn.query_row("SELECT count(*) FROM raw_opensubtitles", [], |r| r.get(0))?;
     if os_count > MAX_OPENSUBTITLES_ROWS {
@@ -1684,17 +1779,7 @@ fn enforce_harvest_quotas(conn: &Connection) -> rusqlite::Result<()> {
             del_files.execute(params![name, group])?;
         }
     }
-    while raw_meta_get(conn, "archive_name_bytes")? > MAX_RAW_ARCHIVE_NAME_BYTES {
-        let deleted = conn.execute(
-            "DELETE FROM raw_archive_inner_files WHERE (release_name, group_name, seq) IN (
-                SELECT release_name, group_name, seq FROM raw_archive_inner_files LIMIT 256
-            )",
-            [],
-        )?;
-        if deleted == 0 {
-            break;
-        }
-    }
+    prune_archive_inner_files(conn, 0, None)?;
     let par2_count: i64 = conn.query_row("SELECT count(*) FROM raw_par2", [], |r| r.get(0))?;
     if par2_count > MAX_RAW_ARCHIVES_ROWS {
         conn.execute(
@@ -1721,9 +1806,13 @@ fn harvest_attached_release_tables(tx: &rusqlite::Transaction<'_>, schema: &str)
     populate_harvest_content_ids(tx, schema)?;
     let has_pp_state = has_table(tx, schema, "pp_state")?;
     let has_pp_walks = has_table(tx, schema, "pp_walks")?;
-    let probe_verified = verified_step_sql(schema, 1 << 4, has_pp_state, has_pp_walks);
-    let list_verified = verified_step_sql(schema, 1 << 1, has_pp_state, has_pp_walks);
-    let par2_verified = verified_step_sql(schema, 1 << 0, has_pp_state, has_pp_walks);
+    let probe_mask = crate::postprocess::step::mask(crate::probe::step::PROBE_STEP);
+    let list_mask = crate::postprocess::step::mask(crate::archive::steps::LIST_STEP);
+    let par2_mask = crate::postprocess::step::mask(crate::archive::steps::PAR2_STEP);
+    let stills_mask = crate::postprocess::step::mask(crate::probe::stills::STILLS_STEP);
+    let probe_verified = verified_step_sql(schema, probe_mask, has_pp_state, has_pp_walks);
+    let list_verified = verified_step_sql(schema, list_mask, has_pp_state, has_pp_walks);
+    let par2_verified = verified_step_sql(schema, par2_mask, has_pp_state, has_pp_walks);
     if has_table(tx, schema, "release_opensubtitles")? {
         tx.execute_batch(&format!(
             "INSERT INTO main.raw_opensubtitles (moviehash, imdb_id, tmdb_id, kind, title, year, season, episode, release_name, checked_at)
@@ -1749,35 +1838,71 @@ fn harvest_attached_release_tables(tx: &rusqlite::Transaction<'_>, schema: &str)
         } else {
             None
         };
-        tx.execute(
-            &format!(
-                "INSERT INTO main.raw_probes
-                 (name, group_name, content_id, crc32, agent, info, moviehash, parts, complete, config_stamp)
-                 SELECT r.name, r.group_name,
-                        CASE WHEN {probe_verified} THEN hcid.content_id ELSE NULL END,
-                        p.crc32, p.agent, p.info, p.moviehash,
-                        CASE WHEN {probe_verified} THEN coalesce(r.parts, 0) ELSE 0 END,
-                        CASE WHEN {probe_verified} THEN coalesce(r.complete, 0) ELSE 0 END,
-                        CASE WHEN {probe_verified} THEN ?1 ELSE NULL END
+        let select_sql = format!(
+            "SELECT name, group_name, cid, crc32, agent, info, moviehash, parts, complete, stamp
+             FROM (
+                 SELECT r.name AS name, r.group_name AS group_name,
+                        CASE WHEN {probe_verified} THEN hcid.content_id ELSE NULL END AS cid,
+                        p.crc32 AS crc32, p.agent AS agent, p.info AS info, p.moviehash AS moviehash,
+                        CASE WHEN {probe_verified} THEN coalesce(r.parts, 0) ELSE 0 END AS parts,
+                        CASE WHEN {probe_verified} THEN coalesce(r.complete, 0) ELSE 0 END AS complete,
+                        CASE WHEN {probe_verified} THEN ?1 ELSE NULL END AS stamp,
+                        SUM(length(cast(p.info as blob))) OVER (ORDER BY r.id DESC ROWS UNBOUNDED PRECEDING) AS cum_bytes
                  FROM {schema}.release_probe p
                  JOIN {schema}.releases r ON r.id = p.release_id
                  LEFT JOIN temp.harvest_content_ids hcid ON hcid.release_id = r.id
                  WHERE r.name IS NOT NULL AND r.group_name IS NOT NULL
-                   AND length(p.info) <= {MAX_RAW_PROBES_BYTES}
+                   AND length(cast(p.info as blob)) <= {MAX_RAW_PROBES_BYTES}
                  ORDER BY r.id DESC LIMIT {MAX_RAW_PROBES_ROWS}
-                 ON CONFLICT(name, group_name) DO UPDATE SET
-                    content_id = excluded.content_id,
-                    crc32 = excluded.crc32,
-                    agent = excluded.agent,
-                    info = excluded.info,
-                    moviehash = excluded.moviehash,
-                    parts = excluded.parts,
-                    complete = excluded.complete,
-                    config_stamp = excluded.config_stamp
-                 WHERE excluded.content_id IS NOT NULL AND excluded.config_stamp IS NOT NULL"
-            ),
-            params![probe_stamp],
+             )
+             WHERE cum_bytes <= {MAX_RAW_PROBES_BYTES}"
+        );
+        let mut stmt = tx.prepare(&select_sql)?;
+        let mut rows = stmt.query(params![probe_stamp])?;
+        let mut upsert = tx.prepare_cached(
+            "INSERT INTO main.raw_probes
+             (name, group_name, content_id, crc32, agent, info, moviehash, parts, complete, config_stamp)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             ON CONFLICT(name, group_name) DO UPDATE SET
+                content_id = excluded.content_id,
+                crc32 = excluded.crc32,
+                agent = excluded.agent,
+                info = excluded.info,
+                moviehash = excluded.moviehash,
+                parts = excluded.parts,
+                complete = excluded.complete,
+                config_stamp = excluded.config_stamp
+             WHERE excluded.content_id IS NOT NULL AND excluded.config_stamp IS NOT NULL",
         )?;
+        let mut check_existing = tx.prepare_cached(
+            "SELECT length(cast(info as blob)), content_id IS NOT NULL AND config_stamp IS NOT NULL
+             FROM main.raw_probes WHERE name = ?1 AND group_name = ?2",
+        )?;
+        while let Some(r) = rows.next()? {
+            let name: String = r.get(0)?;
+            let group_name: String = r.get(1)?;
+            let cid: Option<Vec<u8>> = r.get(2)?;
+            let crc32: Option<i64> = r.get(3)?;
+            let agent: Option<String> = r.get(4)?;
+            let info: String = r.get(5)?;
+            let moviehash: Option<String> = r.get(6)?;
+            let parts: i64 = r.get(7)?;
+            let complete: i64 = r.get(8)?;
+            let stamp: Option<i64> = r.get(9)?;
+            let existing: Option<(i64, bool)> = check_existing
+                .query_row(params![&name, &group_name], |row| Ok((row.get(0)?, row.get(1)?)))
+                .optional()?;
+            if let Some((old_bytes, _)) = existing {
+                if cid.is_none() || stamp.is_none() {
+                    continue;
+                }
+                let net_bytes = (info.len() as i64 - old_bytes).max(0);
+                prune_probes(tx, net_bytes, MAX_RAW_PROBES_ROWS + 1, MAX_RAW_PROBES_BYTES)?;
+            } else {
+                prune_probes(tx, info.len() as i64, MAX_RAW_PROBES_ROWS, MAX_RAW_PROBES_BYTES)?;
+            }
+            upsert.execute(params![name, group_name, cid, crc32, agent, info, moviehash, parts, complete, stamp])?;
+        }
     }
     if has_table(tx, schema, "release_cover")? {
         tx.execute_batch(&format!(
@@ -1842,25 +1967,85 @@ fn harvest_attached_release_tables(tx: &rusqlite::Transaction<'_>, schema: &str)
         ))?;
     }
     if has_inner {
-        tx.execute_batch(&format!(
+        let select_inner_sql = format!(
+            "SELECT r_name, group_name, seq, cid, f_name, size, source
+             FROM (
+                 SELECT r.name AS r_name, r.group_name AS group_name, f.seq AS seq,
+                        CASE WHEN (CASE WHEN coalesce(f.source, 2) = 1 THEN ({par2_verified} OR {list_verified}) ELSE {list_verified} END)
+                             THEN hcid.content_id ELSE NULL END AS cid,
+                        f.name AS f_name, f.size AS size, f.source AS source,
+                        SUM(length(cast(f.name as blob)) + 32) OVER (ORDER BY r.id DESC RANGE UNBOUNDED PRECEDING) AS cum_bytes
+                 FROM {schema}.archive_inner_files f
+                 JOIN {schema}.releases r ON r.id = f.release_id
+                 LEFT JOIN temp.harvest_content_ids hcid ON hcid.release_id = r.id
+                 WHERE r.name IS NOT NULL AND r.group_name IS NOT NULL
+                   AND length(cast(f.name as blob)) <= 4096
+                 ORDER BY r.id DESC, f.seq ASC LIMIT {MAX_RAW_ARCHIVES_ROWS}
+             )
+             WHERE cum_bytes <= {MAX_RAW_ARCHIVE_NAME_BYTES}"
+        );
+        let mut stmt = tx.prepare(&select_inner_sql)?;
+        let mut rows = stmt.query([])?;
+        let mut upsert_inner = tx.prepare_cached(
             "INSERT INTO main.raw_archive_inner_files (release_name, group_name, seq, content_id, name, size, source)
-             SELECT r.name, r.group_name, f.seq,
-                    CASE WHEN (CASE WHEN coalesce(f.source, 2) = 1 THEN {par2_verified} ELSE {list_verified} END)
-                         THEN hcid.content_id ELSE NULL END,
-                    f.name, f.size, f.source
-             FROM {schema}.archive_inner_files f
-             JOIN {schema}.releases r ON r.id = f.release_id
-             LEFT JOIN temp.harvest_content_ids hcid ON hcid.release_id = r.id
-             WHERE r.name IS NOT NULL AND r.group_name IS NOT NULL
-               AND length(cast(f.name as blob)) <= 4096
-             ORDER BY r.id DESC LIMIT {MAX_RAW_ARCHIVES_ROWS}
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(release_name, group_name, seq) DO UPDATE SET
                 content_id = excluded.content_id,
                 name = excluded.name,
                 size = excluded.size,
                 source = excluded.source
-             WHERE excluded.content_id IS NOT NULL;"
-        ))?;
+             WHERE excluded.content_id IS NOT NULL",
+        )?;
+        let mut check_existing_inner = tx.prepare_cached(
+            "SELECT length(cast(name as blob)) + 32
+             FROM main.raw_archive_inner_files
+             WHERE release_name = ?1 AND group_name = ?2 AND seq = ?3",
+        )?;
+        while let Some(r) = rows.next()? {
+            let r_name: String = r.get(0)?;
+            let group_name: String = r.get(1)?;
+            let seq: i64 = r.get(2)?;
+            let cid: Option<Vec<u8>> = r.get(3)?;
+            let f_name: String = r.get(4)?;
+            let size: Option<i64> = r.get(5)?;
+            let source: Option<i64> = r.get(6)?;
+            let row_bytes = f_name.len() as i64 + 32;
+            let existing_bytes: Option<i64> = check_existing_inner
+                .query_row(params![&r_name, &group_name, seq], |row| row.get(0))
+                .optional()?;
+            let net_bytes = match existing_bytes {
+                Some(old_bytes) => {
+                    if cid.is_none() {
+                        continue;
+                    }
+                    (row_bytes - old_bytes).max(0)
+                }
+                None => row_bytes,
+            };
+            prune_archive_inner_files(tx, net_bytes, Some((&r_name, &group_name)))?;
+            upsert_inner.execute(params![r_name, group_name, seq, cid, f_name, size, source])?;
+        }
+        if has_table(tx, schema, "archive_release")? {
+            tx.execute_batch(&format!(
+                "UPDATE main.raw_archives
+                 SET listing_complete = 0
+                 WHERE listing_complete != 0
+                   AND EXISTS (
+                       SELECT 1 FROM {schema}.releases r
+                       JOIN {schema}.archive_inner_files f ON f.release_id = r.id
+                       WHERE r.name = main.raw_archives.name
+                         AND r.group_name = main.raw_archives.group_name
+                         AND coalesce(f.source, 2) != 1
+                         AND NOT EXISTS (
+                             SELECT 1 FROM main.raw_archive_inner_files rf
+                             WHERE rf.release_name = r.name
+                               AND rf.group_name = r.group_name
+                               AND rf.seq = f.seq
+                               AND rf.content_id IS NOT NULL
+                         )
+                   );"
+            ))?;
+        }
     }
     if has_fp {
         tx.execute_batch(&format!(
@@ -1892,16 +2077,18 @@ fn harvest_attached_release_tables(tx: &rusqlite::Transaction<'_>, schema: &str)
         ))?;
     }
     if has_table(tx, schema, "release_nfo_password")? {
+        let nfo_mask = crate::postprocess::step::mask(crate::postprocess::step::StepId(3));
+        let nfo_verified = format!("({probe_verified} OR {})", verified_step_sql(schema, nfo_mask, has_pp_state, has_pp_walks));
         tx.execute_batch(&format!(
             "INSERT INTO main.raw_nfo_passwords (name, group_name, content_id, password)
              SELECT r.name, r.group_name,
-                    CASE WHEN {probe_verified} THEN hcid.content_id ELSE NULL END,
+                    CASE WHEN {nfo_verified} THEN hcid.content_id ELSE NULL END,
                     np.password
              FROM {schema}.release_nfo_password np
              JOIN {schema}.releases r ON r.id = np.release_id
              LEFT JOIN temp.harvest_content_ids hcid ON hcid.release_id = r.id
              WHERE r.name IS NOT NULL AND r.group_name IS NOT NULL
-               AND length(np.password) <= 256
+               AND length(cast(np.password as blob)) <= 256
              ORDER BY r.id DESC LIMIT {MAX_RAW_PROBES_ROWS}
              ON CONFLICT(name, group_name) DO UPDATE SET
                 content_id = excluded.content_id,
@@ -1910,7 +2097,7 @@ fn harvest_attached_release_tables(tx: &rusqlite::Transaction<'_>, schema: &str)
         ))?;
     }
     if has_table(tx, schema, "release_stills")? {
-        let stills_verified = verified_step_sql(schema, 1 << 7, has_pp_state, has_pp_walks);
+        let stills_verified = verified_step_sql(schema, stills_mask, has_pp_state, has_pp_walks);
         tx.execute_batch(&format!(
             "INSERT INTO main.raw_stills (name, group_name, position, content_id, at_ms, sha256, width, height, phash)
              SELECT r.name, r.group_name, s.position,
@@ -2010,10 +2197,15 @@ pub fn replay_predb_at(main: &Path, apply: bool, log: &dyn Fn(&str)) -> anyhow::
     let mut predb_conn =
         crate::predb::db::create(&predb_path).with_context(|| format!("opening {}", predb_path.display()))?;
     let rows: Vec<(i64, i64, String, i64, Vec<u8>, i64)> = raw_conn
-        .prepare("SELECT id, source_id, source_key, page, body_zst, fetched_at FROM raw_predb_log ORDER BY id")?
+        .prepare(
+            "SELECT l.id, l.source_id, l.source_key, e.page, l.body_zst, e.fetched_at
+             FROM raw_predb_events e
+             JOIN raw_predb_log l ON l.id = e.log_id
+             ORDER BY e.seq ASC",
+        )?
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))?
         .collect::<rusqlite::Result<Vec<_>>>()
-        .context("reading raw_predb_log")?;
+        .context("reading raw_predb_events")?;
     let mut parsed_entries = 0usize;
     let mut inserted = 0u64;
     let mut updated = 0u64;
@@ -2348,19 +2540,43 @@ mod tests {
         assert_eq!(get_par2("Some.Release-GRP", "alt.binaries.test", cid_a, 25, true), None);
         assert_eq!(get_par2("Some.Release-GRP", "alt.binaries.test", cid_b, 20, true), None);
 
-        // raw_meta counters match live table sizes and update on prune
+        // raw_meta counters match live table sizes (including UTF-8 byte length for CP437/box-drawing NFOs) and update on prune
+        let non_ascii_info = r#"{"nfo":"██▓▒░ hi ░▒▓██"}"#;
+        assert!(non_ascii_info.len() > non_ascii_info.chars().count());
+        put_probe(&ProbeRecord {
+            name: "Some.Release-GRP",
+            group_name: "alt.binaries.test",
+            content_id: cid_a,
+            crc32: Some(12345),
+            agent: Some("Nyuu"),
+            info: non_ascii_info,
+            moviehash: Some("8e245d9679d31e12"),
+            parts: 20,
+            complete: false,
+            config_stamp: stamp,
+            nfo_password: Some("secretpw"),
+            cover: Some(("image/jpeg", "deadbeef")),
+        });
         {
             let conn = create(&raw_path).unwrap();
             assert_eq!(raw_meta_get(&conn, "probe_rows").unwrap(), 1);
-            assert_eq!(raw_meta_get(&conn, "probe_bytes").unwrap(), r#"{"nfo":"hi"}"#.len() as i64);
-            // Recording a duplicate PreDB payload at MAX_PREDB_LOG_ROWS must not evict existing rows
-            record_predb_page(1, "predb_club", "https://predb.club/api/v1/?page=2", 2, r#"{"data":{"rows":[]}}"#);
+            assert_eq!(raw_meta_get(&conn, "probe_bytes").unwrap(), non_ascii_info.len() as i64);
+            // Recording A -> B -> A preserves observation order in raw_predb_events while deduplicating raw_predb_log
+            conn.execute_batch("DELETE FROM raw_predb_log; DELETE FROM raw_predb_events;").unwrap();
+            record_predb_page(1, "predb_club", "https://predb.club/api/v1/?page=1", 1, r#"{"state":"A"}"#);
+            record_predb_page(1, "predb_club", "https://predb.club/api/v1/?page=1", 1, r#"{"state":"B"}"#);
+            record_predb_page(1, "predb_club", "https://predb.club/api/v1/?page=1", 1, r#"{"state":"A"}"#);
             let pre_count: i64 = conn.query_row("SELECT count(*) FROM raw_predb_log", [], |r| r.get(0)).unwrap();
-            assert_eq!(pre_count, 1);
+            let ev_count: i64 = conn.query_row("SELECT count(*) FROM raw_predb_events", [], |r| r.get(0)).unwrap();
+            assert_eq!(pre_count, 2, "raw_predb_log stores unique payloads");
+            assert_eq!(ev_count, 3, "raw_predb_events records A -> B -> A transitions");
+            // Recording the same payload consecutively at MAX_PREDB_LOG_ROWS must not evict existing rows or add duplicate events
             conn.execute("UPDATE raw_meta SET value = ?1 WHERE key = 'predb_rows'", [MAX_PREDB_LOG_ROWS]).unwrap();
-            record_predb_page(1, "predb_club", "https://predb.club/api/v1/?page=2", 2, r#"{"data":{"rows":[]}}"#);
+            record_predb_page(1, "predb_club", "https://predb.club/api/v1/?page=1", 1, r#"{"state":"A"}"#);
             let post_count: i64 = conn.query_row("SELECT count(*) FROM raw_predb_log", [], |r| r.get(0)).unwrap();
-            assert_eq!(post_count, 1, "duplicate PreDB payload must not trigger eviction");
+            let post_ev_count: i64 = conn.query_row("SELECT count(*) FROM raw_predb_events", [], |r| r.get(0)).unwrap();
+            assert_eq!(post_count, 2, "duplicate PreDB payload must not trigger eviction");
+            assert_eq!(post_ev_count, 3, "consecutive identical payload on same page must not append redundant event");
 
             prune_probes(&conn, MAX_RAW_PROBES_BYTES, MAX_RAW_PROBES_ROWS, MAX_RAW_PROBES_BYTES).unwrap();
             assert_eq!(raw_meta_get(&conn, "probe_rows").unwrap(), 0);
