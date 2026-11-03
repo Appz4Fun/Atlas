@@ -685,7 +685,7 @@ pub fn start_backfill(stop: Arc<AtomicBool>) {
     });
 }
 
-fn trim_posters(dir: &Path, limit: u64) {
+pub(crate) fn trim_posters(dir: &Path, limit: u64) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     let mut files: Vec<(std::time::SystemTime, u64, PathBuf)> = entries
         .filter_map(Result::ok)

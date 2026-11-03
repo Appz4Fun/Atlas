@@ -108,6 +108,9 @@ pub fn parse_hvcc(data: &[u8]) -> Result<HvcC<'_>> {
         let head = data.get(at..at + 3).ok_or(DecodeError::Truncated)?;
         let count = usize::from(head[1]) << 8 | usize::from(head[2]);
         at += 3;
+        if units.len() + count > crate::video::MAX_UNITS {
+            return Err(DecodeError::Invalid("too many parameter sets"));
+        }
         for _ in 0..count {
             let len = data.get(at..at + 2).ok_or(DecodeError::Truncated)?;
             let len = usize::from(len[0]) << 8 | usize::from(len[1]);
@@ -130,6 +133,15 @@ mod tests {
         assert_eq!(units, [&[0x40, 1, 9][..], &[0x42, 1, 7][..]]);
         assert_eq!(header(units[0]).unwrap(), NalHeader { kind: VPS, layer: 0, temporal_id: 0 });
         assert_eq!(header(units[1]).unwrap().kind, SPS);
+    }
+
+    #[test]
+    fn an_hvcc_of_endless_empty_parameter_sets_is_refused() {
+        let mut data = vec![0u8; 23];
+        data[22] = 1;
+        data.extend([0x20, 0xFF, 0xFF]);
+        data.extend(std::iter::repeat_n([0u8, 0], 0xFFFF).flatten());
+        assert_eq!(parse_hvcc(&data).err(), Some(DecodeError::Invalid("too many parameter sets")));
     }
 
     #[test]
