@@ -150,7 +150,7 @@ fn test_rate_limiter_reset_and_refill() {
         // In 100ms at 93,750,000 B/s: expected refill = 9,375,000 bytes (+- 15%)
         let tokens = limiter.available_tokens();
         assert!(
-            tokens >= 7_500_000 && tokens <= 10_000_000,
+            (7_500_000..=10_000_000).contains(&tokens),
             "refill did not match expected rate: got {tokens}"
         );
     });
@@ -194,7 +194,7 @@ fn test_fractional_nanosecond_accumulation_integrity() {
             let _ = limiter.available_tokens();
         }
         let total_elapsed = start.elapsed();
-        let expected_tokens = (total_elapsed.as_nanos() as u128 * RATE_750_MBIT as u128 / 1_000_000_000) as u64;
+        let expected_tokens = (total_elapsed.as_nanos() * RATE_750_MBIT as u128 / 1_000_000_000) as u64;
         let actual_tokens = limiter.available_tokens();
 
         let diff = (expected_tokens as i64 - actual_tokens as i64).abs();
@@ -339,7 +339,7 @@ fn test_adversarial_microsecond_precision_fractional_accumulation() {
             tokio::task::yield_now().await;
             observed_tokens = limiter.available_tokens();
         }
-        let total_nanos = start.elapsed().as_nanos() as u128;
+        let total_nanos = start.elapsed().as_nanos();
         let expected_tokens = (total_nanos * RATE_750_MBIT as u128 / 1_000_000_000) as u64;
 
         // Verify fractional nanoseconds preserved exact rate without truncation drift

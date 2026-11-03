@@ -41,6 +41,7 @@ fn slice(group: &str, start: u64, size: u64, per_release: u64, seed: u64) -> Vec
                 bytes: 750_000,
                 lines: 5000,
                 xref_groups: None,
+                xref: None,
             }
         })
         .collect();

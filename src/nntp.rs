@@ -99,6 +99,8 @@ pub struct Overview {
     pub lines: i64,
     /// the groups field 8 names when it is an `Xref:` line, which only a server with `Xref:full` sends
     pub xref_groups: Option<u16>,
+    /// the raw Xref header string from column 9, when present
+    pub xref: Option<String>,
 }
 
 impl Overview {
@@ -113,6 +115,7 @@ impl Overview {
             bytes: self.bytes,
             lines: self.lines,
             xref_groups: self.xref_groups,
+            xref: self.xref,
             ..Default::default()
         }
     }
@@ -221,9 +224,7 @@ impl TokenBucket {
 
                 let deficit = chunk_bytes - state.tokens;
                 // Calculate exact wait duration in nanoseconds rounded up
-                let wait_nanos = ((deficit as u128) * 1_000_000_000
-                    + (self.rate_bytes_per_sec as u128) - 1)
-                    / (self.rate_bytes_per_sec as u128);
+                let wait_nanos = ((deficit as u128) * 1_000_000_000).div_ceil(self.rate_bytes_per_sec as u128);
                 Duration::from_nanos(wait_nanos as u64)
             };
 
@@ -1462,6 +1463,14 @@ pub struct Pool {
     rate_limiter: Arc<TokenBucket>,
 }
 
+/// A partition of the unsaved budget dedicated to one storage shard.
+pub struct ShardBudget {
+    pub permits: Arc<Semaphore>,
+    pub cap: usize,
+    pub now: AtomicUsize,
+    pub peak: AtomicUsize,
+}
+
 /// Headers fetched (or on their way) and not saved yet, over every pass on a
 /// pool: what bounds the indexer's memory. A slice takes its article numbers
 /// from it before its XOVER goes out, gives back what didnt come (gaps, an
@@ -1472,6 +1481,8 @@ struct UnsavedBudget {
     /// held right now, and the most ever held at once
     now: AtomicUsize,
     peak: AtomicUsize,
+    /// per-shard partitioned budgets (crate::store::SHARDS = 8)
+    shards: Vec<Arc<ShardBudget>>,
 }
 
 /// The unsaved headers cap a pool takes for `headers`: at least one, at
@@ -1484,11 +1495,23 @@ pub fn unsaved_cap(headers: usize) -> usize {
 impl UnsavedBudget {
     fn new(cap: usize) -> Arc<Self> {
         let cap = unsaved_cap(cap);
+        let per_shard = (cap / crate::store::SHARDS).max(1);
+        let shards = (0..crate::store::SHARDS)
+            .map(|_| {
+                Arc::new(ShardBudget {
+                    permits: Arc::new(Semaphore::new(per_shard)),
+                    cap: per_shard,
+                    now: AtomicUsize::new(0),
+                    peak: AtomicUsize::new(0),
+                })
+            })
+            .collect();
         Arc::new(UnsavedBudget {
             permits: Arc::new(Semaphore::new(cap)),
             cap,
             now: AtomicUsize::new(0),
             peak: AtomicUsize::new(0),
+            shards,
         })
     }
 }
@@ -1497,6 +1520,7 @@ impl UnsavedBudget {
 pub struct Unsaved {
     permit: OwnedSemaphorePermit,
     budget: Arc<UnsavedBudget>,
+    shard_info: Option<(Arc<ShardBudget>, OwnedSemaphorePermit)>,
     /// headers held past the room (a slice bigger than the whole budget),
     /// counted soo `now` and `peak` show what is really held
     over: usize,
@@ -1512,10 +1536,23 @@ impl Unsaved {
             self.budget.now.fetch_sub(extra, Ordering::Relaxed);
             drop(back);
         }
+        if let Some((ref sb, ref mut sp)) = self.shard_info {
+            let s_extra = sp.num_permits().saturating_sub(headers);
+            if s_extra > 0
+                && let Some(back) = sp.split(s_extra)
+            {
+                sb.now.fetch_sub(s_extra, Ordering::Relaxed);
+                drop(back);
+            }
+        }
         self.over = headers.saturating_sub(self.permit.num_permits());
         if self.over > 0 {
             let now = self.budget.now.fetch_add(self.over, Ordering::Relaxed) + self.over;
             self.budget.peak.fetch_max(now, Ordering::Relaxed);
+            if let Some((ref sb, _)) = self.shard_info {
+                let s_now = sb.now.fetch_add(self.over, Ordering::Relaxed) + self.over;
+                sb.peak.fetch_max(s_now, Ordering::Relaxed);
+            }
         }
     }
 }
@@ -1525,6 +1562,9 @@ impl Drop for Unsaved {
         // counted down before the permit goes back (right after this), soo
         // `now` never shows more than is held
         self.budget.now.fetch_sub(self.permit.num_permits() + self.over, Ordering::Relaxed);
+        if let Some((ref sb, ref sp)) = self.shard_info {
+            sb.now.fetch_sub(sp.num_permits() + self.over, Ordering::Relaxed);
+        }
     }
 }
 
@@ -1657,6 +1697,46 @@ impl Pool {
         self.unsaved.peak.load(Ordering::Relaxed)
     }
 
+    /// the cap on headers for a specific shard
+    pub fn shard_max_unsaved(&self, shard: usize) -> usize {
+        self.unsaved.shards.get(shard).map(|s| s.cap).unwrap_or(0)
+    }
+
+    /// headers currently held in a specific shard's budget
+    pub fn shard_unsaved_headers(&self, shard: usize) -> usize {
+        self.unsaved.shards.get(shard).map(|s| s.now.load(Ordering::Relaxed)).unwrap_or(0)
+    }
+
+    /// the most headers ever held in a specific shard's budget at once
+    pub fn shard_unsaved_peak(&self, shard: usize) -> usize {
+        self.unsaved.shards.get(shard).map(|s| s.peak.load(Ordering::Relaxed)).unwrap_or(0)
+    }
+
+    /// Room for a slice of `numbers` article numbers partitioned for `shard`.
+    pub async fn reserve_unsaved_shard(&self, shard: usize, numbers: u64) -> Unsaved {
+        let budget = self.unsaved.clone();
+        let shard_idx = shard % crate::store::SHARDS;
+        if let Some(sb) = budget.shards.get(shard_idx).cloned() {
+            let n = usize::try_from(numbers).unwrap_or(usize::MAX).clamp(1, sb.cap);
+            let shard_permit = sb.permits.clone().acquire_many_owned(n as u32).await.expect("semaphore closed");
+            let s_now = sb.now.fetch_add(n, Ordering::Relaxed) + n;
+            sb.peak.fetch_max(s_now, Ordering::Relaxed);
+
+            let global_n = usize::try_from(numbers).unwrap_or(usize::MAX).clamp(1, budget.cap);
+            let permit = budget.permits.clone().acquire_many_owned(global_n as u32).await.expect("semaphore closed");
+            let now = budget.now.fetch_add(global_n, Ordering::Relaxed) + global_n;
+            budget.peak.fetch_max(now, Ordering::Relaxed);
+            Unsaved {
+                permit,
+                budget,
+                shard_info: Some((sb, shard_permit)),
+                over: 0,
+            }
+        } else {
+            self.reserve_unsaved(numbers).await
+        }
+    }
+
     /// Room for a slice of `numbers` article numbers in the unsaved budget,
     /// waiting until there is. A slice bigger than the whole budget waits for
     /// all of it.
@@ -1666,7 +1746,7 @@ impl Pool {
         let permit = budget.permits.clone().acquire_many_owned(n as u32).await.expect("semaphore closed");
         let now = budget.now.fetch_add(n, Ordering::Relaxed) + n;
         budget.peak.fetch_max(now, Ordering::Relaxed);
-        Unsaved { permit, budget, over: 0 }
+        Unsaved { permit, budget, shard_info: None, over: 0 }
     }
 
     pub fn len(&self) -> usize {
@@ -2936,6 +3016,7 @@ fn parse_overview(line: &[u8]) -> Option<Overview> {
         bytes: int(6),
         lines: int(7),
         xref_groups: fields.get(8).and_then(|f| xref_groups(f)),
+        xref: fields.get(8).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
     })
 }
 
@@ -3284,8 +3365,19 @@ mod tests {
         let a = o.into_article();
         assert_eq!(a.date, "2026-10-02 10:11:12");
         assert_eq!(a.xref_groups, None, "seven fields: no Xref");
+        assert_eq!(a.xref, None);
         let full = b"42\tsubj\tme@x\tFri, 02 Oct 2026 10:11:12 +0000\t<id@x>\t\t1234\t10\tXref: news.example alt.binaries.a:42 alt.binaries.b:7";
-        assert_eq!(parse_overview(full).unwrap().xref_groups, Some(2));
+        let o_full = parse_overview(full).unwrap();
+        assert_eq!(o_full.xref_groups, Some(2));
+        assert_eq!(
+            o_full.xref.as_deref(),
+            Some("Xref: news.example alt.binaries.a:42 alt.binaries.b:7")
+        );
+        let a_full = o_full.into_article();
+        assert_eq!(
+            a_full.xref.as_deref(),
+            Some("Xref: news.example alt.binaries.a:42 alt.binaries.b:7")
+        );
         let other = b"42\tsubj\tme@x\tFri, 02 Oct 2026 10:11:12 +0000\t<id@x>\t\t1234\t10\tBytes: 1234";
         assert_eq!(parse_overview(other).unwrap().xref_groups, None, "another header in field 8");
         assert_eq!(xref_groups("xref: host"), Some(0));
@@ -3586,7 +3678,7 @@ mod tests {
             // Subtraction
             assert!(bucket.try_acquire(4_000_000));
             let tokens_after = bucket.available_tokens();
-            assert!(tokens_after >= 6_000_000 && tokens_after <= 6_500_000);
+            assert!((6_000_000..=6_500_000).contains(&tokens_after));
 
             // Exhaust tokens
             assert!(bucket.try_acquire(tokens_after as usize));
@@ -3599,7 +3691,7 @@ mod tests {
             // Sleep 50ms and check replenishment: 0.05 * 93_750_000 = 4_687_500 bytes (+- 20%)
             tokio::time::sleep(Duration::from_millis(50)).await;
             let tokens = bucket.available_tokens();
-            assert!(tokens >= 3_500_000 && tokens <= 6_000_000, "replenished tokens: {tokens}");
+            assert!((3_500_000..=6_000_000).contains(&tokens), "replenished tokens: {tokens}");
         });
     }
 
@@ -3631,7 +3723,7 @@ mod tests {
                 let _ = bucket.available_tokens();
             }
             let total_elapsed = start.elapsed();
-            let expected = (total_elapsed.as_nanos() as u128 * RATE_750_MBIT as u128 / 1_000_000_000) as u64;
+            let expected = (total_elapsed.as_nanos() * RATE_750_MBIT as u128 / 1_000_000_000) as u64;
             let actual = bucket.available_tokens();
             let diff = (expected as i64 - actual as i64).abs();
             assert!(diff <= 50_000, "expected ~{expected}, got {actual}, diff: {diff}");

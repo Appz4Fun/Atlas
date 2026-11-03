@@ -25,6 +25,7 @@ pub fn is_base_par2(subject: &str) -> bool {
 const MAX_FILES: usize = 4_096;
 const MAIN: &[u8; 16] = b"PAR 2.0\0Main\0\0\0\0";
 const UNICODE: &[u8; 16] = b"PAR 2.0\0UniFileN";
+const IFSC: &[u8; 16] = b"PAR 2.0\0IFSC\0\0\0\0";
 
 /// A file a PAR2 set describes.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -38,6 +39,8 @@ pub struct Par2File {
     /// its file id is the MD5 of its first-16-KiB hash, size and name, as PAR2 makes it, soo a Main that lists the id
     /// vouches for this size and hash too
     pub bound: bool,
+    /// whole-file CRC32 computed by folding IFSC slice checksums with last slice unpadded
+    pub crc32: Option<u32>,
 }
 
 /// What a set's packets say.
@@ -63,6 +66,9 @@ fn u64_at(b: &[u8], at: usize) -> Option<u64> {
     Some(u64::from_le_bytes(b.get(at..at.checked_add(8)?)?.try_into().ok()?))
 }
 
+type SliceChecksum = ([u8; 16], u32);
+type IfscEntry = ([u8; 16], [u8; 16], Vec<SliceChecksum>);
+
 /// Every file in `data`'s packets, per recovery set soo a file id cant merge two
 /// sets. Volumes repeat these packets, soo a repeat collapses. Any bytes will do.
 pub fn inventory(data: &[u8]) -> Inventory {
@@ -70,6 +76,7 @@ pub fn inventory(data: &[u8]) -> Inventory {
     let mut mains: Vec<([u8; 16], [u8; 16])> = Vec::new();
     let mut saw_main = false;
     let mut unicode: Vec<([u8; 16], [u8; 16], String)> = Vec::new();
+    let mut ifsc_slices: Vec<IfscEntry> = Vec::new();
     let mut pos = 0usize;
     while let Some(head) = data.get(pos..pos.saturating_add(HEADER_LEN)) {
         if !head.starts_with(MAGIC) {
@@ -129,7 +136,7 @@ pub fn inventory(data: &[u8]) -> Inventory {
             let Some(name) = clean_name(&name) else { continue };
             let there = inv.files.iter().any(|f| f.set_id == set_id && f.file_id == file_id && f.name == name);
             if !there && inv.files.len() < MAX_FILES {
-                inv.files.push(Par2File { set_id, file_id, md5, md5_16k, size, name, bound });
+                inv.files.push(Par2File { set_id, file_id, md5, md5_16k, size, name, bound, crc32: None });
             }
         } else if &kind == UNICODE {
             let (Some(file_id), Some(raw)) = (id_at(body, 0), body.get(16..)) else { continue };
@@ -140,12 +147,49 @@ pub fn inventory(data: &[u8]) -> Inventory {
             {
                 unicode.push((set_id, file_id, name));
             }
+        } else if &kind == IFSC {
+            let (Some(file_id), Some(slice_bytes)) = (id_at(body, 0), body.get(16..)) else { continue };
+            let mut slices = Vec::new();
+            for chunk in slice_bytes.as_chunks::<20>().0.iter().take(MAX_FILES) {
+                let Some(md5) = chunk.get(0..16).and_then(|s| s.try_into().ok()) else { continue };
+                let Some(crc_bytes) = chunk.get(16..20).and_then(|s| s.try_into().ok()) else { continue };
+                slices.push((md5, u32::from_le_bytes(crc_bytes)));
+            }
+            if !slices.is_empty() {
+                ifsc_slices.push((set_id, file_id, slices));
+            }
         }
     }
     // a clean unicode name replaces its file's, in either order
     for (set_id, file_id, name) in unicode {
         for f in inv.files.iter_mut().filter(|f| f.set_id == set_id && f.file_id == file_id) {
             f.name.clone_from(&name);
+        }
+    }
+    // calculate whole-file CRC32 by folding IFSC slice checksums with last slice unpadded
+    if let Some(block_size) = inv.block_size
+        && block_size > 0
+    {
+        for (set_id, file_id, slices) in ifsc_slices {
+            for f in inv.files.iter_mut().filter(|f| f.set_id == set_id && f.file_id == file_id) {
+                if slices.is_empty() {
+                    continue;
+                }
+                let num_slices = slices.len() as u64;
+                let last_slice_unpadded_len = f.size.saturating_sub(num_slices.saturating_sub(1) * block_size);
+                let zero_padding_len = block_size.saturating_sub(last_slice_unpadded_len);
+
+                let mut combined_crc = 0u32;
+                for (i, &(_md5, slice_crc)) in slices.iter().enumerate() {
+                    let (slice_crc_unpadded, len) = if i + 1 == slices.len() && zero_padding_len > 0 {
+                        (crate::gf2::crc32_unzero(slice_crc, zero_padding_len as usize), last_slice_unpadded_len as usize)
+                    } else {
+                        (slice_crc, block_size as usize)
+                    };
+                    combined_crc = crate::gf2::crc32_combine(combined_crc, slice_crc_unpadded, len);
+                }
+                f.crc32 = Some(combined_crc);
+            }
         }
     }
     inv.complete =
