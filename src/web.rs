@@ -644,7 +644,7 @@ impl Search {
         if self.folds(r, &post) {
             return Some(post.listed_id());
         }
-        if post.lead.is_none() {
+        if post.lead.is_none() || !crate::parser::is_obfuscated(&r.name) {
             r.name = release_info::post_stem(&r.name);
         }
         r.size = Some(post.size);
@@ -1667,7 +1667,7 @@ fn release_page(args: &HashMap<String, String>) -> ApiResponse {
     {
         contents = release_info::contents_of_split(&conn, &post).unwrap_or(contents);
         split_groups = release_info::groups_of_ids(&conn, &post.ids).ok();
-        if post.lead.is_none() {
+        if post.lead.is_none() || !crate::parser::is_obfuscated(&release.name) {
             release.name = release_info::post_stem(&release.name);
             if let Some(names) = &mut names {
                 names.posted = release_info::post_stem(&names.posted);

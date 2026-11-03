@@ -11,7 +11,7 @@ use crate::config::PostprocessConfig;
 use crate::filters;
 use crate::nntp::{BackgroundBody, BackgroundRead, NntpError, Pool, unless_stopped};
 
-use super::rules::IMAGE;
+use super::rules::{IMAGE, PAR2};
 use super::stats::Stats;
 use super::step::{BodyRequest, Got, ReleaseInfo, StepError};
 
@@ -89,7 +89,7 @@ impl BodyFetcher {
         let c = self.config.read().unwrap();
         if filters::group_blocked(&release.group) {
             Some("blocked group")
-        } else if release.size < c.body_min_size_bytes
+        } else if (release.size < c.body_min_size_bytes && !PAR2.is_match(file))
             || (c.body_max_size_bytes > 0 && release.size > c.body_max_size_bytes)
         {
             Some("outside the size bounds")

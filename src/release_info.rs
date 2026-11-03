@@ -482,6 +482,7 @@ pub fn whole_post_with(conn: &Connection, release: &crate::search::ReleaseRow) -
             && post.ids.iter().all(|id| split.ids.binary_search(id).is_ok())
             && (split.ids.len() > post.ids.len() || (split.complete && !post.complete))
         {
+            split.lead = post.lead;
             split.recovery = post.recovery;
             return Ok(Some(split));
         }

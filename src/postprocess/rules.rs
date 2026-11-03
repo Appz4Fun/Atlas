@@ -13,7 +13,7 @@ use rusqlite::{Connection, params};
 use crate::config::PostprocessConfig;
 use crate::filters::{self, StoredPost};
 
-static PAR2: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\.(vol[0-9]+[+-][0-9]+\.par2|par2)$").unwrap());
+pub(crate) static PAR2: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\.(vol[0-9]+[+-][0-9]+\.par2|par2)$").unwrap());
 /// a file nothing should fetch a body of
 pub(crate) static IMAGE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\.(jpe?g|png|gif|webp|bmp|tiff?)$").unwrap());
