@@ -1,0 +1,16 @@
+other dedup overlapping pairs 175 Counter({('fixture-like', 'small'): 144, ('plausible', 'small'): 13, ('fixture-like', 'both>=3 dates'): 10, ('plausible', 'both>=3 dates'): 8})
+0186c51090 889339dd70 (1071674882, 1071674882) (1071674882, 1071675100) 1 3 0
+0186c51090 efe8c5dc2d (1071674882, 1071674882) (1071674882, 1071676000) 1 2 0
+0c1ed48732 7d052b2d61 (1760313600, 1760313600) (1760313600, 1760313600) 1 1 1
+0c1ed48732 c9fc8219ba (1760313600, 1760313600) (1760313600, 1760313600) 1 1 0
+0c1ed48732 cf8e4047a1 (1760313600, 1760313600) (1760313600, 1760313600) 1 1 0
+10e0849fd3 e50dcbaf88 (1224233256, 1224233256) (1224233256, 1224233256) 1 1 0
+plausible pairs with >=3 dates each:
+2e36e7691e 375cc7ba58 (1469191674, 1469191694) (1469191674, 1469191694) 21 21 shared ids 993 same date set True 1469191673.72423Zpw5X4f2SWSuEd 1469191673.73366j2ZZTZEsTPGqzA
+7c903d0f7a 88c5f3e8d7 (1690000000, 1690000002) (1690000000, 1690000003) 3 4 shared ids 0 same date set False news.example news.example
+7c903d0f7a 931f5b2fbb (1690000000, 1690000002) (1690000000, 1690000002) 3 3 shared ids 0 same date set True news.example news.example
+7c903d0f7a cf25f8cf31 (1690000000, 1690000002) (1690000000, 1690000013) 3 5 shared ids 0 same date set False news.example news.example
+88c5f3e8d7 931f5b2fbb (1690000000, 1690000003) (1690000000, 1690000002) 4 3 shared ids 0 same date set False news.example news.example
+88c5f3e8d7 cf25f8cf31 (1690000000, 1690000003) (1690000000, 1690000013) 4 5 shared ids 0 same date set False news.example news.example
+931f5b2fbb cf25f8cf31 (1690000000, 1690000002) (1690000000, 1690000013) 3 5 shared ids 0 same date set False news.example news.example
+de7cbcbe83 f2dee72b8c (1455050059, 1455050090) (1455050059, 1455050107) 14 28 shared ids 351 same date set False news.astraweb.com news.astraweb.com

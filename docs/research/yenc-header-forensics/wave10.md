@@ -1,0 +1,7 @@
+# Wave 10 (11:28Z to 11:33Z): per-file From, duplicate segments, orphan articles
+
+1. **Per-file random From has no public source.** Nyuu's From is one config string, and `${rand(N)}` is fixed-length A-Za-z0-9 (bin/nyuu.js:227-233). ngPost's random From is a fixed 13 chars and `--gen_from` applies per post (NgPost.cpp:1489-1496). postie uses fixed-length "rand14 <rand14@rand5.rand3>" per article under full obfuscation (article.go:162-200, poster.go:1446-1472). None uses '_' and '-' or random lengths. So cf32b14460 comes from a custom poster. raw/w10-a-from-rotation.md.
+2. **Duplicate segment numbers give no fallback.** SABnzbd keeps the first entry and logs "Duplicate part ... different ID-s" (nzbparser.py ~455). NZBGet overwrites by part number, so the last entry wins (daemon/queue/NzbFile.cpp:60). Both verified by orchestrator. Neither tries the alternate ID. Gaps are accepted silently. For Atlas merges (#46), alternate IDs in the NZB are not backups, and the client choice depends on entry order. raw/w10-b-dup-segments.md.
+3. **Orphan retry articles.** Nyuu retries with a new ID after post timeout, a reset after the body, 441, or a post-check STAT miss. ngPost does the same on reconnect and resend. Neither treats 441/435 as success. Detection: group XOVER by (Subject, From, Bytes, Lines) and flag groups with more than one Message-ID where only one is in an NZB. That proves the same session and uploader. Frequency is unknown, with no public reports. raw/w10-c-orphans.md.
+
+Final report: FINAL-REPORT.md.

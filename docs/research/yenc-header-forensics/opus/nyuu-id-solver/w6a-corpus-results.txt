@@ -1,0 +1,92 @@
+ | 1G_toobigarticle.bin.nzb | IDs 0 unique prefixes 0 NO SOLUTION (pairs tried) secs 0.0 
+ | reftestnzb uuencoded 1MB 4f77b411e66e.nzb | IDs 0 unique prefixes 0 NO SOLUTION (pairs tried) secs 0.0 
+ | reftestnzb_subtitles_non-obfusctated_mainfile_72ebd3e079da.nzb | IDs 0 unique prefixes 0 NO SOLUTION (pairs tried) secs 0.0 
+ | test_download_1050MB-pw.nzb | IDs 0 unique prefixes 0 NO SOLUTION (pairs tried) secs 0.0 
+ | ubuntu-mate-16.04.2-desktop-amd64---Feb2017.iso.nzb | IDs 0 unique prefixes 0 NO SOLUTION (pairs tried) secs 0.0 
+2017-07-28 | reftestnzb-666MB-78ab78722---plus-nonsense.nzb | IDs 1105 unique prefixes 1105 NO SOLUTION (pairs tried) secs 3.0 
+2018-03-11 | ASCII-Japanese---iso8859-and-HTML-in-nzb.nzb | IDs 168 unique prefixes 168 NO SOLUTION (pairs tried) secs 3.1 
+2018-03-11 | ASCII-Japanese---utf-in-nzb---made-by-nyuu.nzb | IDs 168 unique prefixes 168 NO SOLUTION (pairs tried) secs 4.0 
+2018-03-12 | ecoji.nzb | IDs 168 unique prefixes 168 NO SOLUTION (pairs tried) secs 3.9 
+2018-04-17 | my_nzb_100MB_in_129_rar_files.nzb | IDs 279 unique prefixes 279 NO SOLUTION (pairs tried) secs 3.3 
+2018-04-17 | my_nzb_1282_rar_files.nzb | IDs 1323 unique prefixes 1323 NO SOLUTION (pairs tried) secs 3.4 
+2018-08-30 | chinese-chars-in-rar-par-filenames-reftestnzb-87cbb544fdb4.nzb | IDs 13 unique prefixes 13 NO SOLUTION (pairs tried) secs 3.8 
+2018-09-14 | reftestnzb-subdirs-93e54f08d9eb.nzb | IDs 288 unique prefixes 288 NO SOLUTION (pairs tried) secs 4.3 
+2018-12-26 | reftestnzb 1GB - broken third rar.nzb | IDs 1655 unique prefixes 1655 NO SOLUTION (pairs tried) secs 3.5 
+2019-02-06 | chinese-chars-only-in-resulting-file-2b5683434096.nzb | IDs 88 unique prefixes 88 NO SOLUTION (pairs tried) secs 3.9 
+2019-02-15 | with-passsssword.nzb | IDs 604 unique prefixes 604 NO SOLUTION (pairs tried) secs 3.9 
+2019-02-16 | long-dirfilename-1000plus.nzb | IDs 170 unique prefixes 170 NO SOLUTION (pairs tried) secs 3.4 
+2019-02-23 | obfuscated-stuff-200MB-a30c5a07bb1a.nzb | IDs 297 unique prefixes 297 NO SOLUTION (pairs tried) secs 3.8 
+2019-06-15 | article-with-10GB-size-reftestnzb.nzb | IDs 172 unique prefixes 172 NO SOLUTION (pairs tried) secs 3.5 
+2019-06-15 | test-negative-segment-bytes-reftestnzb.nzb | IDs 172 unique prefixes 172 NO SOLUTION (pairs tried) secs 3.2 
+2019-06-15 | test-too-small-segment-bytes-reftestnzb.nzb | IDs 172 unique prefixes 172 NO SOLUTION (pairs tried) secs 3.2 
+2019-06-21 | ExclamationMarkInResultingFile.nzb | IDs 48 unique prefixes 48 NO SOLUTION (pairs tried) secs 4.6 
+2019-06-21 | reftestnzb-7z-instead-of-rar-ea5b7e8fcddd.nzb | IDs 172 unique prefixes 172 NO SOLUTION (pairs tried) secs 2.8 
+2019-06-22 | reftestnzb-questionmark-in-resulting-file.nzb | IDs 172 unique prefixes 172 NO SOLUTION (pairs tried) secs 3.2 
+2019-07-06 | post-with-5GB-rarfile---reftestnzb-28ee98de5f62.nzb | IDs 8047 unique prefixes 8047 NO SOLUTION (pairs tried) secs 3.6 
+2019-07-26 | reftestnzb-obfuscated-rar-files-no-par-073afc9c3cb0.nzb | IDs 152 unique prefixes 152 NO SOLUTION (pairs tried) secs 3.0 
+2019-09-15 | 你好世界.nzb | IDs 172 unique prefixes 172 NO SOLUTION (pairs tried) secs 3.4 
+2019-09-16 | no_par2---fake-extra-article.nzb | IDs 45 unique prefixes 45 NO SOLUTION (pairs tried) secs 3.1 
+2019-09-20 | reftestnzb-with-SFV-no-PAR2.nzb | IDs 47 unique prefixes 47 NO SOLUTION (pairs tried) secs 3.2 
+2019-10-06 | german-umlauts-10MB.nzb | IDs 24 unique prefixes 24 NO SOLUTION (pairs tried) secs 3.4 
+2019-10-06 | reftestnzb-German-Umlauts-ea6f31c1c39c.nzb | IDs 171 unique prefixes 171 NO SOLUTION (pairs tried) secs 3.3 
+2020-01-03 | nzb-50MB-one-missing-article-but-repairable.nzb | IDs 90 unique prefixes 90 NO SOLUTION (pairs tried) secs 3.3 
+2020-02-05 | reftestnzb-password-is-secret-ff17139db320{{secret}}.nzb.nzb | IDs 168 unique prefixes 168 NO SOLUTION (pairs tried) secs 3.8 
+2020-03-21 | aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaabbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccddddddddddddddddddddddddddddddddddddddddddddddddddddddddeeeeeeeeeeeeeeeeeeeeeee.nzb | IDs 168 unique prefixes 168 NO SOLUTION (pairs tried) secs 3.5 
+2020-03-21 | all-missing.nzb | IDs 168 unique prefixes 168 NO SOLUTION (pairs tried) secs 3.3 
+2020-05-26 | reftestnzb-one-complete-rarset-one-half-rarset-f7cea3b99a21.nzb | IDs 85 unique prefixes 85 NO SOLUTION (pairs tried) secs 3.5 
+2020-06-07 | reftestnzb_question_mark_7573885742dc.nzb | IDs 10 unique prefixes 10 NO SOLUTION (pairs tried) secs 3.6 
+2020-06-09 | reftestnzb_unicoded_rar_and_payload_9d9b4cc5258f.nzb | IDs 12 unique prefixes 12 NO SOLUTION (pairs tried) secs 2.9 
+2020-06-19 | reftestnzb_small_post_with_EXE_as_plain_file.nzb | IDs 12 unique prefixes 12 NO SOLUTION (pairs tried) secs 3.2 
+2020-06-27 | aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.nzb | IDs 161 unique prefixes 161 NO SOLUTION (pairs tried) secs 3
+2020-07-20 | reftestnzb-fun-with-obfuscated-case-sensitive-aaaaAaaaaaaaaaaaaaaaaaaaaaaaaaa-6e8b8f1d46c6.nzb | IDs 46 unique prefixes 46 NO SOLUTION (pairs tried) secs 3.5 
+2020-07-21 | Very Useful Subject (2020).nzb | IDs 90 unique prefixes 90 NO SOLUTION (pairs tried) secs 3.9 
+2020-07-30 | reftestnzb_passworded-rar-password-in-NZB_71f1386a5a02.nzb | IDs 36 unique prefixes 36 NO SOLUTION (pairs tried) secs 3.5 
+2020-08-06 | testing_kenpsx_e06a02a5b080.nzb | IDs 23 unique prefixes 23 NO SOLUTION (pairs tried) secs 3.3 
+2020-08-14 | reftestnzb_illegal_char_HEX_1A_in_filename_0cf049082ecd.nzb | IDs 25 unique prefixes 25 NO SOLUTION (pairs tried) secs 3.4 
+2020-09-18 | reftestnzb_fake_m2ts_files_subdirs_de14d9f97663.nzb | IDs 214 unique prefixes 214 NO SOLUTION (pairs tried) secs 3.4 
+2020-09-23 | reftestnzb_unicode_rar_par2_and_final_6e69267a08ea.nzb | IDs 168 unique prefixes 168 NO SOLUTION (pairs tried) secs 3.1 
+2020-11-30 | reftestnzb_100MB_obfuscated_rars_rar-only_missing_first_rar_bf1664007a71.nzb | IDs 125 unique prefixes 125 NO SOLUTION (pairs tried) secs 3.7 
+2021-02-19 | OK-with-subdir-5a62fa7a2982.nzb | IDs 105 unique prefixes 105 NO SOLUTION (pairs tried) secs 4.0 
+2021-02-19 | unique_files_with_subdir_ee0fba9604e5.nzb | IDs 89 unique prefixes 89 NO SOLUTION (pairs tried) secs 3.5 
+2021-02-20 | unique_files_with_subdir_in_subdir_73698be2fe48.nzb | IDs 89 unique prefixes 89 NO SOLUTION (pairs tried) secs 4.3 
+2021-03-05 | no_rar_Big.Buck.Bunny.2008.1080p.x264-60fps__no_rar__66ede03376e6.nzb | IDs 555 unique prefixes 555 NO SOLUTION (pairs tried) secs 3.7 
+2021-03-05 | no_rar__repair_needed__Big.Buck.Bunny.2008.1080p.x264-60fps__no_rar__repair_needed_00fd918c1e00.nzb | IDs 555 unique prefixes 555 NO SOLUTION (pairs tried) secs 3.3 
+2021-03-14 | My Super ISO 2021.nzb | IDs 144 unique prefixes 144 NO SOLUTION (pairs tried) secs 3.4 
+2021-03-14 | Some_Flac_Stuff_2021.nzb | IDs 154 unique prefixes 154 NO SOLUTION (pairs tried) secs 3.5 
+2021-05-12 | reftestnzb_bin_and_exe_855f226eccae.nzb | IDs 26 unique prefixes 26 NO SOLUTION (pairs tried) secs 3.6 
+2021-06-11 | hidden_exe_ab71988b62c3.nzb | IDs 48 unique prefixes 48 NO SOLUTION (pairs tried) secs 3.4 
+2021-06-18 | reftestnzb__No_Extensions__062d817b1907.nzb | IDs 11 unique prefixes 11 NO SOLUTION (pairs tried) secs 3.2 
+2021-07-18 | My Very Very Important Download 2021.nzb | IDs 57 unique prefixes 57 NO SOLUTION (pairs tried) secs 4.3 
+2022-03-28 | reftestnzb_4f00cdd7d42f_with_xxx_extension.nzb | IDs 14 unique prefixes 14 NO SOLUTION (pairs tried) secs 3.0 
+2022-04-29 | reftestnzb__special_chars__545ddc9be613.nzb | IDs 173 unique prefixes 173 NO SOLUTION (pairs tried) secs 3.2 
+2022-07-17 | Nice MP3 Set 5678.nzb | IDs 69 unique prefixes 69 NO SOLUTION (pairs tried) secs 3.4 
+2022-07-17 | Very Nice System 1234.nzb | IDs 149 unique prefixes 149 NO SOLUTION (pairs tried) secs 3.8 
+2022-07-24 | 1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890.nzb | IDs 173 unique prefixes 173 NO SOLUTION (pairs tried) secs 3
+2022-07-24 | all_missing_1000MB.nzb | IDs 1658 unique prefixes 1658 NO SOLUTION (pairs tried) secs 3.7 
+2022-07-24 | hello world 你好世界 hello world 你好世界 hello world 你好世界 hello world 你好世界 hello world 你好世界 hello world 你好世界 hello world 你好世界 hello world 你好世界 hello world 你好世界 hello world 你好世界.nzb | IDs 173 unique prefixes 173 NO SOLUTION (pairs tried) secs 4.
+2022-08-06 | reftestnzb__fully_encrypted__meta_password__46d021b78b44.nzb | IDs 152 unique prefixes 152 NO SOLUTION (pairs tried) secs 3.2 
+2022-12-27 | 100MB_r__400.nzb | IDs 164 unique prefixes 164 NO SOLUTION (pairs tried) secs 4.2 
+2022-12-27 | rwx_all_on_777.nzb | IDs 164 unique prefixes 164 NO SOLUTION (pairs tried) secs 3.5 
+2023-02-18 | Ugly_Char_Direct_In_Post.nzb | IDs 15 unique prefixes 15 NO SOLUTION (pairs tried) secs 3.4 
+2023-02-18 | reftestnzb_weird_0x1f_in_filename_4fdcb05d2b4f.nzb | IDs 33 unique prefixes 33 NO SOLUTION (pairs tried) secs 3.4 
+2023-04-03 | reftestnzb_brokenrar_93e4dd5e7771.nzb | IDs 25 unique prefixes 25 NO SOLUTION (pairs tried) secs 3.2 
+2023-05-26 | Unicode_Mix_2023_⌛🚦🐞🍞🌞🕥🍁.nzb | IDs 172 unique prefixes 172 solved from IDs #0,#1 offset 56 state=06692efe25a557bc 92e81233dd4f0e9f secs 0.0 linked 164/172 IDs into one stream; draw-index range 0..7824 gap histogram (draws between consecutive IDs): [(48, 159), (24, 2), (72, 2)] 
+2023-07-05 | reftestnzb_10GB_no-rar___dddf62d5d4fe.nzb | IDs 16486 unique prefixes 16486 solved from IDs #2,#3 offset 0 state=42f1c45cd67fffeb 14e27beca451669f secs 0.6 linked 8324/16486 IDs into one stream; draw-index range -48..399456 gap histogram (draws between consecutive IDs): [(48, 8223), (24, 51), (72, 48), (120, 1)] 
+2023-08-06 | RefTestNZB_1234_Brackets[fake.re]MoreMore.nzb | IDs 182 unique prefixes 182 solved from IDs #2,#3 offset 48 state=4461b35f224f2fd1 10f1f4ed80d5b4b1 secs 1.0 linked 172/182 IDs into one stream; draw-index range -96..8112 gap histogram (draws between consecutive IDs): [(48, 154), (24, 10), (72, 5), (120, 1), (96, 1)] 
+2023-08-06 | RefTestNZB_1234_Brackets[fake.re]MoreMore_e9620ce8067b.nzb | IDs 182 unique prefixes 182 solved from IDs #2,#3 offset 48 state=4461b35f224f2fd1 10f1f4ed80d5b4b1 secs 1.2 linked 172/182 IDs into one stream; draw-index range -96..8112 gap histogram (draws between consecutive IDs): [(48, 154), (24, 10), (72, 5), (120, 
+2023-08-06 | RefTestNZB_2023_Brackets[fake.re]MoreStuff.nzb | IDs 168 unique prefixes 168 solved from IDs #1,#2 offset 0 state=772aee3ac6b02c96 798a06c5b46a1fea secs 0.1 linked 81/168 IDs into one stream; draw-index range 0..7824 gap histogram (draws between consecutive IDs): [(48, 39), (144, 38), (24, 1), (264, 1), (192, 1)] 
+2024-07-06 | Reftestnzb_Subtitles_Obfuscated_Mainfile_405938efd30b.nzb | IDs 176 unique prefixes 176 NO SOLUTION (pairs tried) secs 4.1 
+2024-08-09 | Reftestnzb_Some_Subtitles_1234_ebcb671ed6f6.nzb | IDs 33 unique prefixes 33 solved from IDs #1,#2 offset 40 state=7bc30c0e7b7a688d b5b80b3cf08489f6 secs 0.4 linked 33/33 IDs into one stream; draw-index range -48..1392 gap histogram (draws between consecutive IDs): [(48, 24), (24, 6), (72, 2)] predicted next 3 IDs af
+2025-07-02 | reftestnzb_starrySTARnight_PLAIN_ba362df7362d.nzb | IDs 30 unique prefixes 30 solved from IDs #1,#2 offset 0 state=147725428fb6613a 87fb809db23d3c0e secs 0.4 linked 30/30 IDs into one stream; draw-index range -48..1224 gap histogram (draws between consecutive IDs): [(48, 22), (24, 6), (72, 1)] predicted next 3 IDs a
+2025-07-02 | reftestnzb_starrySTARnight_inside_RARs_ebac39d9132e.nzb | IDs 30 unique prefixes 30 solved from IDs #23,#24 offset 48 state=fc923637b446f375 b8e94b3433908829 secs 0.9 linked 30/30 IDs into one stream; draw-index range -96..1176 gap histogram (draws between consecutive IDs): [(48, 22), (24, 6), (72, 1)] predicted nex
+2025-09-30 | windows_hate_but_unrar_OK_b428875007ed.nzb | IDs 9 unique prefixes 9 solved from IDs #0,#5 offset 0 state=7f18bb7b4eaea430 a6cf7d07ade7f604 secs 0.1 linked 5/9 IDs into one stream; draw-index range 0..264 gap histogram (draws between consecutive IDs): [(48, 2), (24, 1), (144, 1)] predicted next 3 IDs after last: ['K
+2025-09-30 | windows_user_hate_this_bcd5d4654b69_reftestnzb.nzb | IDs 9 unique prefixes 9 solved from IDs #0,#1 offset 0 state=cb68132564c0ea13 d89b4e627c6bea3c secs 0.1 linked 5/9 IDs into one stream; draw-index range 0..264 gap histogram (draws between consecutive IDs): [(48, 2), (24, 1), (144, 1)] predicted next 3 IDs after l
+2025-10-24 | DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD.nzb | IDs 815 unique prefixes 815 solved from IDs #0,#1 offset 0 state=2a2dc7593d59a66e 69d5ea14a280a474 secs 0.0 linked 245/815 IDs into one stream; draw-index range
+2025-10-24 | EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE.nzb | IDs 815 unique prefixes 815 solved from IDs #0,#1 offset 0 state=2a2dc7593d59a66e 69d5ea14a280a474 secs 0.1 linked 245/815 IDs into one stream; draw-index range 0..23232 gap histogram (draws between consecutive IDs): [(48, 120), (144, 117),
+2025-10-26 | RRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRR.nzb | IDs 169 unique prefixes 169 solved from IDs #3,#4 offset 32 state=7a23965005c13101 ef67206b20d83e4b secs 1.3 linked 167/169 IDs into one stream; draw-index range -144..7800 gap histogram (draws between consecutive IDs): 
+2025-11-21 | testfile-10GB-no-rar.nzb | IDs 16488 unique prefixes 16488 solved from IDs #0,#1 offset 0 state=4599bc0fa0bb41a3 37208c28b3e1c28f secs 0.0 linked 4165/16488 IDs into one stream; draw-index range 0..399504 gap histogram (draws between consecutive IDs): [(48, 2065), (144, 2048), (72, 18), (192, 15), (24, 9), (120, 9)]
+2025-11-22 | back_from_future_test_download_100MB.nzb | IDs 163 unique prefixes 163 solved from IDs #0,#1 offset 39 state=34e451256b88cc03 21192934b6c20aac secs 0.0 linked 114/163 IDs into one stream; draw-index range 0..7224 gap histogram (draws between consecutive IDs): [(48, 64), (96, 23), (24, 10), (72, 8), (144, 7), (120, 1
+2026-03-22 | hp-passworded.nzb | IDs 1654 unique prefixes 1654 solved from IDs #0,#1 offset 40 state=2ff5ada9992455b8 ffdefd0ccf6b7cdf secs 0.0 linked 906/1654 IDs into one stream; draw-index range 0..43440 gap histogram (draws between consecutive IDs): [(48, 808), (24, 63), (72, 30), (96, 1), (192, 1), (576, 1)] 
+2026-03-22 | one-missing-article-part21-hp-passworded.nzb | IDs 1654 unique prefixes 1654 solved from IDs #0,#1 offset 40 state=2ff5ada9992455b8 ffdefd0ccf6b7cdf secs 0.0 
+2026-03-22 | only-p-passworded.nzb | IDs 1654 unique prefixes 1654 solved from IDs #0,#1 offset 40 state=a8935c0ee00d654b 96e7d4683238dd4e secs 0.0 linked 906/1654 IDs into one stream; draw-index range 0..43440 gap histogram (draws between consecutive IDs): [(48, 789), (24, 67), (72, 40), (96, 5), (144, 2), (192, 1)] 
+2026-11-02 | reftestnzb 100MB vb QUIRINIUS d28ceff2.nzb | IDs 352 unique prefixes 352 solved from IDs #0,#1 offset 40 state=cb69c8ce0a980496 2489d5eaeb004030 secs 0.0 linked 255/352 IDs into one stream; draw-index range 0..12192 gap histogram (draws between consecutive IDs): [(48, 146), (24, 74), (72, 18), (96, 12), (120, 2), (5
