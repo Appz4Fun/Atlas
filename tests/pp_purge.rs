@@ -22,8 +22,9 @@ fn home() -> Home {
     let main = dir.path().join("atlas.db");
     db::create_db_at(&main).unwrap();
     // nothing has to wait to be old enough, unless a test says so
-    let config =
-        serde_json::json!({"postprocess": {"dead_after_secs": 0, "settle_secs": 1, "complete_settle_secs": 1}});
+    // the rejected and dead classes go by the rules, which keep nothing out by default: set the old limits
+    let config = serde_json::json!({"postprocess": {"dead_after_secs": 0, "settle_secs": 1, "complete_settle_secs": 1,
+        "reject_par2_only": true, "min_completion_percent": 95, "body_min_size_bytes": 1048576}});
     std::fs::write(dir.path().join("config.json"), config.to_string()).unwrap();
     Home { dir, main }
 }
@@ -186,7 +187,8 @@ fn no_flag_means_fragments_only() {
 fn a_fresh_post_is_not_purged() {
     let h = home();
     every_class(&h);
-    let config = serde_json::json!({"postprocess": {"dead_after_secs": 3600}});
+    let config = serde_json::json!({"postprocess": {"dead_after_secs": 3600, "reject_par2_only": true,
+        "min_completion_percent": 95, "body_min_size_bytes": 1048576}});
     std::fs::write(h.dir.path().join("config.json"), config.to_string()).unwrap();
     h.ok(&[
         "--apply",

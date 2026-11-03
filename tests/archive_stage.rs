@@ -341,7 +341,9 @@ fn probing_stops_at_its_cap() {
     for i in 0..5 {
         s = s.add(&format!("r{i}a8Z3q9W7"), 1, 900 - i, yenc_lined("x", b"no magic here"));
     }
-    let state = serve(&mut h, &s, config());
+    let mut two = config();
+    two.archive.probe_files = 2;
+    let state = serve(&mut h, &s, two);
     settled(&h, &s.name);
     assert_eq!(bodies(&state), 2);
     assert!(rows(&h, &s.name).is_empty());
@@ -455,7 +457,7 @@ fn a_release_named_as_an_image_runs_no_step() {
 fn a_release_under_the_body_minimum_gets_no_body() {
     let mut h = fresh();
     let mut under = config();
-    under.postprocess.body_min_size_bytes = PostprocessConfig::default().body_min_size_bytes;
+    under.postprocess.body_min_size_bytes = 1 << 20;
     let s = shape("x").one("x.rar", &a_rar5("Inner.mkv"));
     let state = serve(&mut h, &s, under);
     settled(&h, "x");

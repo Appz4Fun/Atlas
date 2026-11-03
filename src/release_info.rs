@@ -418,17 +418,71 @@ impl SplitPost {
 /// One with more isn't shown as one upload, rather than as part of one.
 const LINKED_ROWS: usize = 1_024;
 
-/// The upload a row is linked into, all its rows together. None: it isn't linked, or its lead is gone.
-pub fn linked_post_with(conn: &Connection, id: i64) -> Result<Option<SplitPost>> {
+/// The lead of the upload a row is linked into: by its own link row, or, for a recovery volume in another shard than
+/// the upload's (the stage links within a shard only), by its sealed set, which some volume of the upload's own shard
+/// linked under. None: nothing links it.
+fn lead_of(conn: &Connection, id: i64) -> Result<Option<i64>> {
     let s = store::shard_of_id(id);
     // a shard that hasn't got the table yet has linked nothing
     let Ok(mut stmt) = conn.prepare_cached(&format!("select lead_id from s{s}.upload_link where release_id = ?"))
     else {
         return Ok(None);
     };
-    let Some(lead) = stmt.query_row([id], |r| r.get::<_, i64>(0)).optional()? else { return Ok(None) };
+    if let Some(lead) = stmt.query_row([id], |r| r.get::<_, i64>(0)).optional()? {
+        return Ok(Some(lead));
+    }
+    // only a row of nothing but PAR2: a data file with the set's id is its own posting of the set, maybe a twin's
+    if !par2_only(conn, id)? {
+        return Ok(None);
+    }
+    let Ok(mut sets) = conn.prepare_cached(&format!(
+        "select distinct set_id from s{s}.par2_files where release_id = ? and sealed = 1 limit 8"
+    )) else {
+        return Ok(None);
+    };
+    let sets: Vec<Vec<u8>> = sets.query_map([id], |r| r.get(0))?.collect::<Result<_>>()?;
+    for set in sets {
+        for other in 0..store::SHARDS {
+            let Ok(mut stmt) = conn.prepare_cached(&format!(
+                "select lead_id from s{other}.upload_link where set_id = ?1 and recovery = 1 limit 1"
+            )) else {
+                continue;
+            };
+            if let Some(lead) = stmt.query_row([&set], |r| r.get::<_, i64>(0)).optional()? {
+                return Ok(Some(lead));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Whether every file of a release is a PAR2 file: a recovery volume posted on its own.
+fn par2_only(conn: &Connection, id: i64) -> Result<bool> {
+    let s = store::shard_of_id(id);
+    let data: i64 = conn
+        .prepare_cached(&format!(
+            "select count(*) from s{s}.files where release_id = ?1 and lower(filename) not like '%.par2'"
+        ))?
+        .query_row([id], |r| r.get(0))?;
+    let any: i64 =
+        conn.prepare_cached(&format!("select count(*) from s{s}.files where release_id = ?1"))?.query_row([id], |r| r.get(0))?;
+    Ok(data == 0 && any > 0)
+}
+
+/// A release's group and size, from its shard. None: it's gone.
+fn group_and_size(conn: &Connection, id: i64) -> Result<Option<(String, i64)>> {
+    let s = store::shard_of_id(id);
+    conn.prepare_cached(&format!("select coalesce(group_name, ''), coalesce(size, 0) from s{s}.releases where id = ?"))?
+        .query_row([id], |r| Ok((r.get(0)?, r.get(1)?)))
+        .optional()
+}
+
+/// The upload a row is linked into, all its rows together. None: it isn't linked, or its lead is gone.
+pub fn linked_post_with(conn: &Connection, id: i64) -> Result<Option<SplitPost>> {
+    let Some(lead) = lead_of(conn, id)? else { return Ok(None) };
+    let s = store::shard_of_id(lead);
     let sql = format!(
-        "select r.id, r.group_name, coalesce(r.size, 0), l.recovery, coalesce(l.wanted, 0), l.par2_file
+        "select r.id, r.group_name, coalesce(r.size, 0), l.recovery, coalesce(l.wanted, 0), l.par2_file, l.set_id
          from s{s}.upload_link l join s{s}.releases r on r.id = l.release_id where l.lead_id = ?1 order by r.id
          limit {}",
         LINKED_ROWS + 1
@@ -436,7 +490,8 @@ pub fn linked_post_with(conn: &Connection, id: i64) -> Result<Option<SplitPost>>
     let (mut ids, mut groups, mut size, mut has_lead, mut recovery) = (Vec::new(), Vec::new(), 0, false, Vec::new());
     // the files its sets look for, and those found: a file posted twice is still one file
     let (mut wanted, mut files) = (0, HashSet::new());
-    let mut stmt = conn.prepare_cached(&sql)?;
+    let mut sets: Vec<Vec<u8>> = Vec::new();
+    let Ok(mut stmt) = conn.prepare_cached(&sql) else { return Ok(None) };
     let rows = stmt.query_map([lead], |r| {
         Ok((
             r.get::<_, i64>(0)?,
@@ -445,14 +500,18 @@ pub fn linked_post_with(conn: &Connection, id: i64) -> Result<Option<SplitPost>>
             r.get::<_, i64>(3)? != 0,
             r.get::<_, i64>(4)?,
             r.get::<_, Option<Vec<u8>>>(5)?,
+            r.get::<_, Option<Vec<u8>>>(6)?,
         ))
     })?;
     for row in rows {
-        let (row_id, group, bytes, repairs, looks_for, file) = row?;
+        let (row_id, group, bytes, repairs, looks_for, file, set) = row?;
         has_lead |= row_id == lead;
         if repairs {
             recovery.push(row_id);
             wanted = wanted.max(looks_for);
+            if let Some(set) = set.filter(|set| !sets.contains(set)) {
+                sets.push(set);
+            }
         } else {
             files.insert(file.unwrap_or_else(|| row_id.to_le_bytes().to_vec()));
         }
@@ -460,9 +519,24 @@ pub fn linked_post_with(conn: &Connection, id: i64) -> Result<Option<SplitPost>>
         groups.push(group.unwrap_or_default());
         size += bytes;
     }
+    // the set's other volumes, posted to groups of other shards: the same sealed set is the same upload
+    for set in &sets {
+        for other in crate::archive::store::releases_of_set_with(conn, set, 0) {
+            if ids.contains(&other) || ids.len() > LINKED_ROWS || !par2_only(conn, other)? {
+                continue;
+            }
+            let Some((group, bytes)) = group_and_size(conn, other)? else { continue };
+            recovery.push(other);
+            ids.push(other);
+            groups.push(group);
+            size += bytes;
+        }
+    }
     if !has_lead || ids.len() < 2 || ids.len() > LINKED_ROWS {
         return Ok(None);
     }
+    ids.sort_unstable();
+    recovery.sort_unstable();
     groups.sort_unstable();
     groups.dedup();
     // a file of the set that hasn't turned up is missing from the download, however whole the rest is
@@ -954,15 +1028,34 @@ pub fn password_hint_with(conn: &Connection, id: i64, names: Option<&Names>) -> 
         .ok()?;
     let files: Vec<(String, Option<String>)> =
         stmt.query_map([id], |r| Ok((r.get(0)?, r.get(1)?))).ok()?.filter_map(|row| row.ok()).collect();
-    for (filename, subject) in files {
-        if let Some(password) = find_password(&filename) {
+    for (filename, subject) in &files {
+        if let Some(password) = find_password(filename) {
             return hint(password, "a file name");
         }
         if let Some(password) = subject.as_deref().and_then(find_password) {
             return hint(password, "the subject");
         }
     }
+    // the harvester's other spellings: `{{pass}}`, `[pw: x]`, `pass=x`, in the names and every subject
+    let texts = names
+        .into_iter()
+        .flat_map(|n| [Some(n.posted.clone()), n.display.clone()])
+        .flatten()
+        .chain(files.into_iter().filter_map(|(_, subject)| subject));
+    for text in texts {
+        if let Some(password) = harvested_password(&text) {
+            return hint(password, "the subject");
+        }
+    }
     None
+}
+
+/// The likeliest password `archive::PasswordHarvester` reads out of one line, if any.
+pub fn harvested_password(text: &str) -> Option<String> {
+    let none = std::collections::HashMap::new();
+    crate::archive::PasswordHarvester::extract_candidates(text, None, &none)
+        .into_iter()
+        .find(|p| !p.is_empty() && p.len() <= 128)
 }
 
 #[cfg(test)]

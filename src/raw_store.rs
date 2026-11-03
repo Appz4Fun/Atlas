@@ -195,6 +195,23 @@ CREATE TABLE IF NOT EXISTS raw_par2 (
     PRIMARY KEY (name, group_name)
 ) WITHOUT ROWID;
 
+CREATE TABLE IF NOT EXISTS raw_par2_files (
+    name       TEXT NOT NULL,
+    group_name TEXT NOT NULL,
+    content_id BLOB,
+    file_id    BLOB NOT NULL,
+    set_id     BLOB NOT NULL,
+    md5        BLOB NOT NULL,
+    md5_16k    BLOB NOT NULL,
+    size       INTEGER NOT NULL,
+    file_name  TEXT NOT NULL,
+    crc32      INTEGER,
+    bound      INTEGER NOT NULL DEFAULT 1,
+    sealed     INTEGER NOT NULL DEFAULT 0,
+    complete   INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (name, group_name, file_id)
+) WITHOUT ROWID;
+
 CREATE TABLE IF NOT EXISTS raw_archive_inner_files (
     release_name TEXT NOT NULL,
     group_name   TEXT NOT NULL,
@@ -352,10 +369,11 @@ pub fn create(path: &Path) -> rusqlite::Result<Connection> {
 }
 
 #[cfg(not(test))]
-static GLOBAL_CONN: OnceLock<Option<Mutex<Connection>>> = OnceLock::new();
+static GLOBAL_CONN: OnceLock<Mutex<Option<(PathBuf, Connection)>>> = OnceLock::new();
 
-#[cfg(test)]
 thread_local! {
+    static SHARD_RAW_PATH: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+    #[cfg(test)]
     static TEST_RAW_PATH: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
 }
 
@@ -364,23 +382,41 @@ pub fn set_test_raw_path(path: Option<PathBuf>) {
     TEST_RAW_PATH.with(|cell| *cell.borrow_mut() = path);
 }
 
+/// Derives the sibling `atlas.raw.db` path from a shard or main database path (`.../atlas.s3.db` -> `.../atlas.raw.db`).
+pub fn raw_path_from_shard(shard: &Path) -> Option<PathBuf> {
+    let file = shard.file_name()?.to_str()?;
+    let stem = file.strip_suffix(".db")?;
+    if let Some((base, shard_no)) = stem.rsplit_once(".s")
+        && !shard_no.is_empty()
+        && shard_no.bytes().all(|c| c.is_ascii_digit())
+    {
+        return Some(shard.with_file_name(format!("{base}.raw.db")));
+    }
+    Some(shard.with_file_name(format!("{stem}.raw.db")))
+}
+
 fn with_raw<T>(f: impl FnOnce(&Connection) -> rusqlite::Result<T>) -> Option<T> {
     #[cfg(test)]
     {
-        let path = TEST_RAW_PATH.with(|cell| cell.borrow().clone())?;
+        let path = TEST_RAW_PATH
+            .with(|cell| cell.borrow().clone())
+            .or_else(|| SHARD_RAW_PATH.with(|cell| cell.borrow().clone()))?;
         let conn = create(&path).ok()?;
         return f(&conn).ok();
     }
     #[cfg(not(test))]
     {
-        let mutex = GLOBAL_CONN
-            .get_or_init(|| {
-                let path = path_for(&crate::paths::database());
-                create(&path).ok().map(Mutex::new)
-            })
-            .as_ref()?;
-        let guard = mutex.lock().unwrap_or_else(|e| e.into_inner());
-        f(&guard).ok()
+        let path = SHARD_RAW_PATH
+            .with(|cell| cell.borrow().clone())
+            .unwrap_or_else(|| path_for(&crate::paths::database()));
+        let mutex = GLOBAL_CONN.get_or_init(|| Mutex::new(None));
+        let mut guard = mutex.lock().unwrap_or_else(|e| e.into_inner());
+        let needs_open = guard.as_ref().is_none_or(|(cached_path, _)| cached_path != &path);
+        if needs_open {
+            *guard = create(&path).ok().map(|conn| (path, conn));
+        }
+        let (_, conn) = guard.as_ref()?;
+        f(conn).ok()
     }
 }
 
@@ -825,9 +861,24 @@ pub fn release_content_id_in(conn: &Connection, schema: &str, release_id: i64) -
     None
 }
 
-/// Computes the deterministic SHA-256 content identity for `release_id` in `main` (`conn`).
+/// Computes the deterministic SHA-256 content identity for `release_id` in `main` (`conn`),
+/// and binds the calling thread's raw store path to the shard's sibling `atlas.raw.db` when `conn` is on disk.
 pub fn release_content_id(conn: &Connection, release_id: i64) -> Option<Vec<u8>> {
+    let shard_raw = conn
+        .path()
+        .filter(|p| !p.is_empty())
+        .and_then(|p| raw_path_from_shard(Path::new(p)));
+    SHARD_RAW_PATH.with(|cell| *cell.borrow_mut() = shard_raw);
     release_content_id_in(conn, "main", release_id)
+}
+
+/// Returns `true` when `release_id` is being explicitly re-run for `step` (`pp_state.rerun_mask & mask(step) != 0`),
+/// so the step re-fetches from the server instead of short-circuiting from `atlas.raw.db`.
+pub fn is_explicit_rerun(conn: &Connection, release_id: i64, step: crate::postprocess::step::StepId) -> bool {
+    let bit = crate::postprocess::step::mask(step);
+    conn.prepare_cached("SELECT (rerun_mask & ?2) != 0 FROM pp_state WHERE release_id = ?1")
+        .and_then(|mut s| s.query_row(params![release_id, bit], |r| r.get::<_, bool>(0)))
+        .unwrap_or(false)
 }
 
 /// Looks up a previously resolved OpenSubtitles `moviehash` in `raw_opensubtitles`.
@@ -1494,6 +1545,140 @@ pub struct SavedPar2 {
     pub posted: Option<Vec<u8>>,
     pub sizes: Option<(i64, i64)>,
     pub content_fp: Option<Vec<u8>>,
+    pub inventory: Option<crate::par2::Inventory>,
+}
+
+fn read_par2_files_in(
+    conn: &Connection,
+    name: &str,
+    group_name: &str,
+    content_id: &[u8],
+) -> rusqlite::Result<Option<crate::par2::Inventory>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT file_id, set_id, md5, md5_16k, size, file_name, crc32, bound, sealed, complete
+         FROM raw_par2_files
+         WHERE name = ?1 AND group_name = ?2 AND content_id = ?3
+         ORDER BY file_name, file_id",
+    )?;
+    let mut rows = stmt.query(params![name, group_name, content_id])?;
+    let mut inv = crate::par2::Inventory::default();
+    let mut any = false;
+    while let Some(r) = rows.next()? {
+        let Ok(file_id): Result<[u8; 16], _> = r.get::<_, Vec<u8>>(0)?.try_into() else {
+            return Ok(None);
+        };
+        let Ok(set_id): Result<[u8; 16], _> = r.get::<_, Vec<u8>>(1)?.try_into() else {
+            return Ok(None);
+        };
+        let Ok(md5): Result<[u8; 16], _> = r.get::<_, Vec<u8>>(2)?.try_into() else {
+            return Ok(None);
+        };
+        let Ok(md5_16k): Result<[u8; 16], _> = r.get::<_, Vec<u8>>(3)?.try_into() else {
+            return Ok(None);
+        };
+        let size = u64::try_from(r.get::<_, i64>(4)?).unwrap_or(0);
+        let file_name: String = r.get(5)?;
+        let crc32 = r.get::<_, Option<i64>>(6)?.and_then(|c| u32::try_from(c).ok());
+        let bound = r.get::<_, i64>(7)? != 0;
+        let sealed = r.get::<_, i64>(8)? != 0;
+        let complete = r.get::<_, i64>(9)? != 0;
+        if !any {
+            inv.complete = complete;
+            any = true;
+        } else {
+            inv.complete &= complete;
+        }
+        if sealed && bound {
+            inv.sealed.push((set_id, file_id));
+        }
+        inv.files.push(crate::par2::Par2File {
+            file_id,
+            set_id,
+            md5,
+            md5_16k,
+            size,
+            name: file_name,
+            bound,
+            crc32,
+        });
+    }
+    Ok(any.then_some(inv))
+}
+
+/// Looks up cached PAR2 file descriptors for `(name, group_name)` and `content_id` in `raw_par2_files`.
+pub fn get_par2_files(name: &str, group_name: &str, content_id: &[u8]) -> Option<crate::par2::Inventory> {
+    if content_id.is_empty() {
+        return None;
+    }
+    with_raw(|conn| read_par2_files_in(conn, name, group_name, content_id)).flatten()
+}
+
+fn upsert_par2_files_in_tx(
+    conn: &Connection,
+    name: &str,
+    group_name: &str,
+    content_id: &[u8],
+    inv: &crate::par2::Inventory,
+) -> rusqlite::Result<()> {
+    if content_id.is_empty() || inv.files.is_empty() || inv.files.len() > 4096 {
+        return Ok(());
+    }
+    if inv.files.iter().any(|f| f.name.len() > 4096) {
+        return Ok(());
+    }
+    conn.prepare_cached("DELETE FROM raw_par2_files WHERE name = ?1 AND group_name = ?2")?
+        .execute(params![name, group_name])?;
+    let exists_in_par2: bool = conn
+        .prepare_cached("SELECT EXISTS(SELECT 1 FROM raw_par2 WHERE name = ?1 AND group_name = ?2)")?
+        .query_row(params![name, group_name], |r| r.get(0))?;
+    if !exists_in_par2 {
+        let distinct: i64 = conn.query_row(
+            "SELECT count(*) FROM (SELECT DISTINCT name, group_name FROM raw_par2_files)",
+            [],
+            |r| r.get(0),
+        )?;
+        if distinct >= MAX_RAW_ARCHIVES_ROWS {
+            let to_drop = (distinct - MAX_RAW_ARCHIVES_ROWS + 1).max(64);
+            conn.execute(
+                "DELETE FROM raw_par2_files WHERE (name, group_name) IN (
+                    SELECT DISTINCT name, group_name FROM raw_par2_files LIMIT ?1
+                )",
+                params![to_drop],
+            )?;
+        }
+    }
+    let mut ins = conn.prepare_cached(
+        "INSERT OR REPLACE INTO raw_par2_files
+         (name, group_name, content_id, file_id, set_id, md5, md5_16k, size, file_name, crc32, bound, sealed, complete)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+    )?;
+    for f in &inv.files {
+        let sealed = inv.sealed.contains(&(f.set_id, f.file_id)) && f.bound;
+        ins.execute(params![
+            name,
+            group_name,
+            content_id,
+            &f.file_id[..],
+            &f.set_id[..],
+            &f.md5[..],
+            &f.md5_16k[..],
+            i64::try_from(f.size).unwrap_or(i64::MAX),
+            &f.name,
+            f.crc32.map(i64::from),
+            i64::from(f.bound),
+            i64::from(sealed),
+            i64::from(inv.complete),
+        ])?;
+    }
+    Ok(())
+}
+
+/// Persists a PAR2 set's file descriptors (`par2_files`) for `(name, group_name)` and `content_id`.
+pub fn put_par2_files(name: &str, group_name: &str, content_id: &[u8], inv: &crate::par2::Inventory) {
+    if content_id.is_empty() || inv.files.is_empty() {
+        return;
+    }
+    let _ = with_raw_tx(|conn| upsert_par2_files_in_tx(conn, name, group_name, content_id, inv));
 }
 
 /// Looks up cached PAR2 twin-fingerprint and repair-block metadata for `(name, group_name)` and `content_id`
@@ -1538,7 +1723,14 @@ pub fn get_par2(
         if covers && (posted.is_none() || par2_block.is_none() || par2_blocks.is_none()) {
             return Ok(None);
         }
-        Ok(Some(SavedPar2 { covers_all: covers, posted, sizes: par2_block.zip(par2_blocks), content_fp }))
+        let inventory = read_par2_files_in(conn, name, group_name, content_id)?;
+        Ok(Some(SavedPar2 {
+            covers_all: covers,
+            posted,
+            sizes: par2_block.zip(par2_blocks),
+            content_fp,
+            inventory,
+        }))
     })
     .flatten()
 }
@@ -1553,9 +1745,11 @@ pub struct Par2Record<'a> {
     pub parts: i64,
     pub complete: bool,
     pub content_fp: Option<&'a [u8]>,
+    pub inventory: Option<&'a crate::par2::Inventory>,
 }
 
-/// Persists PAR2 twin-fingerprint and block-size metadata into `raw_par2`, bounded by `MAX_RAW_ARCHIVES_ROWS`.
+/// Persists PAR2 twin-fingerprint, block-size, and file-descriptor metadata into `raw_par2` and
+/// `raw_par2_files`, bounded by `MAX_RAW_ARCHIVES_ROWS`.
 pub fn put_par2(rec: &Par2Record<'_>) {
     if rec.content_id.is_empty() {
         return;
@@ -1568,12 +1762,17 @@ pub fn put_par2(rec: &Par2Record<'_>) {
             let count: i64 = conn.query_row("SELECT count(*) FROM raw_par2", [], |r| r.get(0))?;
             if count >= MAX_RAW_ARCHIVES_ROWS {
                 let to_drop = (count - MAX_RAW_ARCHIVES_ROWS + 1).max(64);
-                conn.execute(
-                    "DELETE FROM raw_par2 WHERE (name, group_name) IN (
-                        SELECT name, group_name FROM raw_par2 LIMIT ?1
-                    )",
-                    params![to_drop],
-                )?;
+                let victims: Vec<(String, String)> = conn
+                    .prepare_cached("SELECT name, group_name FROM raw_par2 LIMIT ?1")?
+                    .query_map(params![to_drop], |r| Ok((r.get(0)?, r.get(1)?)))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                let mut del_par2 = conn.prepare_cached("DELETE FROM raw_par2 WHERE name = ?1 AND group_name = ?2")?;
+                let mut del_files =
+                    conn.prepare_cached("DELETE FROM raw_par2_files WHERE name = ?1 AND group_name = ?2")?;
+                for (name, group) in &victims {
+                    del_par2.execute(params![name, group])?;
+                    del_files.execute(params![name, group])?;
+                }
             }
         }
         conn.prepare_cached(
@@ -1593,6 +1792,9 @@ pub fn put_par2(rec: &Par2Record<'_>) {
             i64::from(rec.complete),
             rec.content_fp,
         ])?;
+        if let Some(inv) = rec.inventory {
+            upsert_par2_files_in_tx(conn, rec.name, rec.group_name, rec.content_id, inv)?;
+        }
         Ok(())
     });
 }
@@ -1650,6 +1852,7 @@ fn populate_harvest_content_ids(tx: &rusqlite::Transaction<'_>, schema: &str) ->
         "release_cover",
         "archive_release",
         "archive_inner_files",
+        "par2_files",
         "release_fingerprint",
         "release_nfo_password",
         "release_stills",
@@ -1824,11 +2027,29 @@ fn enforce_harvest_quotas(conn: &Connection) -> rusqlite::Result<()> {
     prune_archive_inner_files(conn, 0, None)?;
     let par2_count: i64 = conn.query_row("SELECT count(*) FROM raw_par2", [], |r| r.get(0))?;
     if par2_count > MAX_RAW_ARCHIVES_ROWS {
+        let to_drop = par2_count - MAX_RAW_ARCHIVES_ROWS;
+        let victims: Vec<(String, String)> = conn
+            .prepare_cached("SELECT name, group_name FROM raw_par2 LIMIT ?1")?
+            .query_map(params![to_drop], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut del_par2 = conn.prepare_cached("DELETE FROM raw_par2 WHERE name = ?1 AND group_name = ?2")?;
+        let mut del_files = conn.prepare_cached("DELETE FROM raw_par2_files WHERE name = ?1 AND group_name = ?2")?;
+        for (name, group) in &victims {
+            del_par2.execute(params![name, group])?;
+            del_files.execute(params![name, group])?;
+        }
+    }
+    let pf_distinct: i64 = conn.query_row(
+        "SELECT count(*) FROM (SELECT DISTINCT name, group_name FROM raw_par2_files)",
+        [],
+        |r| r.get(0),
+    )?;
+    if pf_distinct > MAX_RAW_ARCHIVES_ROWS {
         conn.execute(
-            "DELETE FROM raw_par2 WHERE (name, group_name) IN (
-                SELECT name, group_name FROM raw_par2 LIMIT ?1
+            "DELETE FROM raw_par2_files WHERE (name, group_name) IN (
+                SELECT DISTINCT name, group_name FROM raw_par2_files LIMIT ?1
             )",
-            params![par2_count - MAX_RAW_ARCHIVES_ROWS],
+            params![pf_distinct - MAX_RAW_ARCHIVES_ROWS],
         )?;
     }
     let stills_count: i64 = conn.query_row("SELECT count(*) FROM raw_stills", [], |r| r.get(0))?;
@@ -2141,6 +2362,82 @@ fn harvest_attached_release_tables(tx: &rusqlite::Transaction<'_>, schema: &str)
                 content_fp = excluded.content_fp
              WHERE excluded.content_id IS NOT NULL;"
         ))?;
+    }
+    if has_table(tx, schema, "par2_files")? {
+        let select_pf_sql = format!(
+            "SELECT r.id, r.name, r.group_name,
+                    CASE WHEN ({par2_verified} OR {list_verified}) THEN hcid.content_id ELSE NULL END AS cid,
+                    pf.file_id, pf.set_id, pf.md5, pf.md5_16k, pf.size, pf.name, pf.crc32,
+                    coalesce(pf.bound, 1), coalesce(pf.sealed, 0), coalesce(pf.complete, 0)
+             FROM {schema}.par2_files pf
+             JOIN {schema}.releases r ON r.id = pf.release_id
+             LEFT JOIN temp.harvest_content_ids hcid ON hcid.release_id = r.id
+             WHERE r.name IS NOT NULL AND r.group_name IS NOT NULL
+               AND length(pf.file_id) = 16 AND length(pf.set_id) = 16
+               AND length(pf.md5) = 16 AND length(pf.md5_16k) = 16
+               AND NOT EXISTS (
+                   SELECT 1 FROM {schema}.par2_files pf2
+                   WHERE pf2.release_id = r.id AND length(cast(pf2.name as blob)) > 4096
+               )
+             ORDER BY r.id DESC, pf.name ASC, pf.file_id ASC LIMIT ({MAX_RAW_ARCHIVES_ROWS} * 4)"
+        );
+        let mut stmt = tx.prepare(&select_pf_sql)?;
+        let mut rows = stmt.query([])?;
+        let mut clear_pf = tx.prepare_cached("DELETE FROM main.raw_par2_files WHERE name = ?1 AND group_name = ?2")?;
+        let mut upsert_pf = tx.prepare_cached(
+            "INSERT INTO main.raw_par2_files
+             (name, group_name, content_id, file_id, set_id, md5, md5_16k, size, file_name, crc32, bound, sealed, complete)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+             ON CONFLICT(name, group_name, file_id) DO UPDATE SET
+                content_id = excluded.content_id,
+                set_id = excluded.set_id,
+                md5 = excluded.md5,
+                md5_16k = excluded.md5_16k,
+                size = excluded.size,
+                file_name = excluded.file_name,
+                crc32 = excluded.crc32,
+                bound = excluded.bound,
+                sealed = excluded.sealed,
+                complete = excluded.complete
+             WHERE excluded.content_id IS NOT NULL",
+        )?;
+        let mut winner_pf_rel: std::collections::HashMap<(String, String), (i64, usize)> =
+            std::collections::HashMap::new();
+        while let Some(r) = rows.next()? {
+            let r_id: i64 = r.get(0)?;
+            let r_name: String = r.get(1)?;
+            let group_name: String = r.get(2)?;
+            let cid: Option<Vec<u8>> = r.get(3)?;
+            let Some(cid) = cid else { continue };
+            let key = (r_name.clone(), group_name.clone());
+            match winner_pf_rel.get_mut(&key) {
+                Some((win_id, _)) if *win_id != r_id => continue,
+                Some((_, count)) => {
+                    if *count >= 4096 {
+                        continue;
+                    }
+                    *count += 1;
+                }
+                None => {
+                    winner_pf_rel.insert(key, (r_id, 1));
+                    clear_pf.execute(params![&r_name, &group_name])?;
+                }
+            }
+            let file_id: Vec<u8> = r.get(4)?;
+            let set_id: Vec<u8> = r.get(5)?;
+            let md5: Vec<u8> = r.get(6)?;
+            let md5_16k: Vec<u8> = r.get(7)?;
+            let size: i64 = r.get(8)?;
+            let file_name: String = r.get(9)?;
+            let crc32: Option<i64> = r.get(10)?;
+            let bound: i64 = r.get(11)?;
+            let sealed: i64 = r.get(12)?;
+            let complete: i64 = r.get(13)?;
+            upsert_pf.execute(params![
+                r_name, group_name, cid, file_id, set_id, md5, md5_16k, size, file_name, crc32, bound, sealed,
+                complete
+            ])?;
+        }
     }
     if has_table(tx, schema, "release_nfo_password")? {
         let nfo_mask = crate::postprocess::step::mask(crate::naming::NFO);
@@ -2617,7 +2914,22 @@ mod tests {
         });
         assert_eq!(get_archive("Quota.Dropped-GRP", "alt.binaries.test", cid_a, 20, true), None);
 
-        // PAR2 twin fingerprint, full-list content_fp, & block metadata roundtrip
+        // PAR2 twin fingerprint, full-list content_fp, & block metadata + par2_files roundtrip
+        let par2_inv = crate::par2::Inventory {
+            files: vec![crate::par2::Par2File {
+                file_id: [3; 16],
+                set_id: [4; 16],
+                md5: [5; 16],
+                md5_16k: [6; 16],
+                size: 1_500_000_000,
+                name: "Movie.2026.1080p.mkv".to_string(),
+                bound: true,
+                crc32: Some(0x1234_5678),
+            }],
+            sealed: vec![([4; 16], [3; 16])],
+            complete: true,
+            ..Default::default()
+        };
         put_par2(&Par2Record {
             name: "Some.Release-GRP",
             group_name: "alt.binaries.test",
@@ -2628,12 +2940,14 @@ mod tests {
             parts: 20,
             complete: true,
             content_fp: Some(&[7; 20]),
+            inventory: Some(&par2_inv),
         });
         let saved_par2 = get_par2("Some.Release-GRP", "alt.binaries.test", cid_a, 20, true).unwrap();
         assert!(saved_par2.covers_all);
         assert_eq!(saved_par2.posted.as_deref(), Some(&[2; 21][..]));
         assert_eq!(saved_par2.sizes, Some((384_000, 4_000)));
         assert_eq!(saved_par2.content_fp.as_deref(), Some(&[7; 20][..]));
+        assert_eq!(saved_par2.inventory, Some(par2_inv));
         assert_eq!(get_par2("Some.Release-GRP", "alt.binaries.test", cid_a, 25, true), None);
         assert_eq!(get_par2("Some.Release-GRP", "alt.binaries.test", cid_b, 20, true), None);
         // Legacy 20-byte twin fingerprints are rejected by get_par2 (matching duplicates::forget_old_twins)
@@ -2647,6 +2961,7 @@ mod tests {
             parts: 20,
             complete: true,
             content_fp: Some(&[7; 20]),
+            inventory: None,
         });
         assert_eq!(get_par2("Legacy.Par2-GRP", "alt.binaries.test", cid_a, 20, true), None);
 

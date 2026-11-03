@@ -176,9 +176,19 @@ struct Batch {
 fn run_step(step: &dyn Step, ctx: &mut StepCtx<'_>) -> Ran {
     let span = crate::metrics::span(crate::metrics::step_function(step.name()));
     let ran = match catch_unwind(AssertUnwindSafe(|| step.run(ctx))) {
-        Ok(Ok(outcome)) => Ran::Outcome(outcome),
-        Ok(Err(e)) => Ran::Error(e),
-        Err(panic) => Ran::Error(StepError::Retry(panic_text(panic))),
+        Ok(Ok(mut outcome)) => {
+            // the CRCs of the articles it read go with whatever it found, waiting or done
+            outcome.writes.append(&mut ctx.crcs);
+            Ran::Outcome(outcome)
+        }
+        Ok(Err(e)) => {
+            ctx.crcs.clear();
+            Ran::Error(e)
+        }
+        Err(panic) => {
+            ctx.crcs.clear();
+            Ran::Error(StepError::Retry(panic_text(panic)))
+        }
     };
     let result = match &ran {
         Ran::Outcome(o) if o.wait_until.is_some() => "waiting",
@@ -610,6 +620,7 @@ impl Inner {
             used_bodies: 0,
             deadline: Instant::now() + STEP_DEADLINE,
             lane_can_fetch: false,
+            crcs: Vec::new(),
         };
         let mut failure = false;
         let mut queue_at: Option<i64> = None;
@@ -957,6 +968,7 @@ impl Inner {
                 used_bodies: 0,
                 deadline: Instant::now() + STEP_DEADLINE,
                 lane_can_fetch: step.needs() == Needs::Bodies,
+                crcs: Vec::new(),
             };
             let ran = run_step(step.as_ref(), &mut ctx);
             let now = chrono::Utc::now().timestamp();

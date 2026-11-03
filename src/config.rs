@@ -555,9 +555,9 @@ impl Default for ArchiveConfig {
     fn default() -> Self {
         ArchiveConfig {
             enabled: true,
-            max_bodies_per_release: 4,
-            probe_files: 2,
-            probes_per_minute: 60,
+            max_bodies_per_release: 16,
+            probe_files: 8,
+            probes_per_minute: 600,
             max_names_mb: 16_384,
         }
     }
@@ -623,16 +623,16 @@ impl Default for PostprocessConfig {
             complete_settle_secs: 900,
             min_size_bytes: 0,
             min_files: 1,
-            reject_par2_only: true,
+            reject_par2_only: false,
             group_rules: HashMap::new(),
             backlog_per_second: 2000,
-            body_fetches_per_minute: 600,
-            body_connections: 2,
-            body_min_size_bytes: 1 << 20,
-            body_max_size_bytes: 100 << 30,
+            body_fetches_per_minute: 3000,
+            body_connections: 4,
+            body_min_size_bytes: 0,
+            body_max_size_bytes: 0,
             body_max_bytes: 16 << 20,
-            bodies_per_release: 8,
-            min_completion_percent: 95,
+            bodies_per_release: 64,
+            min_completion_percent: 0,
             dead_after_secs: 172_800,
             max_attempts: 5,
         }
@@ -1504,7 +1504,7 @@ mod tests {
     fn archive_defaults_when_absent() {
         let c = ArchiveConfig::from_value(None);
         assert!(c.enabled);
-        assert_eq!((c.max_bodies_per_release, c.probe_files, c.probes_per_minute, c.max_names_mb), (4, 2, 60, 16_384));
+        assert_eq!((c.max_bodies_per_release, c.probe_files, c.probes_per_minute, c.max_names_mb), (16, 8, 600, 16_384));
     }
 
     #[test]
@@ -1534,8 +1534,8 @@ mod tests {
     fn a_bad_archive_value_falls_back() {
         let c = ArchiveConfig::from_value(Some(&serde_json::json!({"enabled": "maybe", "probe_files": "many"})));
         assert!(c.enabled);
-        assert_eq!(c.probe_files, 2);
-        assert_eq!(ArchiveConfig::from_value(Some(&serde_json::json!(7))).probe_files, 2);
+        assert_eq!(c.probe_files, 8);
+        assert_eq!(ArchiveConfig::from_value(Some(&serde_json::json!(7))).probe_files, 8);
     }
 
     #[test]
@@ -1727,7 +1727,9 @@ mod tests {
         let c = Config::from_value(&json!({}));
         assert_eq!(c.postprocess, PostprocessConfig::default());
         assert!(c.postprocess.enabled);
-        assert_eq!(c.postprocess.body_fetches_per_minute, 600, "everything on unless turned off");
+        assert_eq!(c.postprocess.body_fetches_per_minute, 3000, "everything on unless turned off");
+        assert_eq!((c.postprocess.min_completion_percent, c.postprocess.bodies_per_release), (0, 64));
+        assert!(!c.postprocess.reject_par2_only);
     }
 
     #[test]
@@ -1760,7 +1762,7 @@ mod tests {
         assert_eq!(c.workers, 2);
         assert_eq!(c.settle_secs, 1, "floored");
         assert_eq!(c.complete_settle_secs, 900);
-        assert_eq!(c.body_fetches_per_minute, 600);
+        assert_eq!(c.body_fetches_per_minute, 3000);
         assert_eq!(c.min_completion_percent, 100);
         assert_eq!(c.max_attempts, 5);
         assert!(c.group_rules.is_empty());

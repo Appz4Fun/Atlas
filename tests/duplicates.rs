@@ -106,3 +106,4 @@ fn copies_are_found_across_shards_and_go_with_their_release() {
     assert_eq!(found, [(Copy::Alt, alt)]);
     assert_eq!(cluster_count_with(&db::open().unwrap(), ClusterKind::Twins).unwrap(), 0, "its cluster goes too");
 }
+

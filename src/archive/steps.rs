@@ -264,6 +264,9 @@ fn restore_par2(
         outcome.writes.push(StepWrite::new(duplicates::CLEAR_POSTED, vec![id.into()]));
     }
     if let Some(m) = meta {
+        if let Some(inv) = &m.inventory {
+            outcome.writes.extend(archive_store::par2_file_writes(id, inv));
+        }
         if let Some(posted) = m.posted {
             outcome.writes.push(StepWrite::new(duplicates::SET_POSTED, vec![id.into(), posted.into()]));
         }
@@ -324,25 +327,26 @@ impl Step for Par2Step {
         let rel_complete = ctx.release().complete;
         let content_id = crate::raw_store::release_content_id(ctx.conn(), rel_id).unwrap_or_default();
         let saved_par2 = crate::raw_store::get_archive_files(&rel_name, &rel_group, &content_id, SOURCE_PAR2);
-        if !saved_par2.is_empty()
-            && let Some(par2_meta) =
-                crate::raw_store::get_par2(&rel_name, &rel_group, &content_id, rel_parts, rel_complete)
+        let par2_meta = crate::raw_store::get_par2(&rel_name, &rel_group, &content_id, rel_parts, rel_complete);
+        if !crate::raw_store::is_explicit_rerun(ctx.conn(), rel_id, PAR2_STEP)
+            && !saved_par2.is_empty()
+            && let Some(meta) = par2_meta.as_ref().filter(|m| m.inventory.is_some())
         {
             let limits = self.limits.lock().unwrap().clone();
-            return restore_par2(ctx, saved_par2, Some(par2_meta), &limits);
+            return restore_par2(ctx, saved_par2, Some(meta.clone()), &limits);
         }
         let is_base = select::classify(&file.filename) == Kind::Par2Base;
         let Some(seg) = first_article(ctx, file)? else {
             if !saved_par2.is_empty() {
                 let limits = self.limits.lock().unwrap().clone();
-                return restore_par2(ctx, saved_par2, None, &limits);
+                return restore_par2(ctx, saved_par2, par2_meta, &limits);
             }
             return Ok(Outcome::default());
         };
         let Some(mut body) = fetch_one(ctx, &seg, &file.filename)? else {
             if !saved_par2.is_empty() {
                 let limits = self.limits.lock().unwrap().clone();
-                return restore_par2(ctx, saved_par2, None, &limits);
+                return restore_par2(ctx, saved_par2, par2_meta, &limits);
             }
             return Ok(Outcome::default());
         };
@@ -396,8 +400,12 @@ impl Step for Par2Step {
             parts: rel_parts,
             complete: rel_complete,
             content_fp: content_fp.as_deref(),
+            inventory: Some(&inventory),
         });
+        // the set's files, hashes and all: what the link step and twin fill go by without reading the set again
+        let kept = archive_store::par2_file_writes(ctx.release().id, &inventory);
         let mut outcome = finish(ctx, SOURCE_PAR2, listing_of(inventory), &limits)?;
+        outcome.writes.extend(kept);
         // one set's files are only some of the release's, soo they don't say what the release holds
         if !covers_all {
             outcome.writes.retain(|write| write.sql != duplicates::SET_CONTENT);
@@ -536,24 +544,35 @@ impl Step for ListStep {
         let limits = self.limits.lock().unwrap().clone();
         let files = ctx.files().map_err(retry)?;
         let rel = ctx.release();
-        let content_id = crate::raw_store::release_content_id(ctx.conn(), rel.id).unwrap_or_default();
-        if let Some(saved) = crate::raw_store::get_archive(&rel.name, &rel.group, &content_id, rel.parts, rel.complete)
-        {
-            return restore_archive(ctx, saved, &limits);
-        }
-        if select::par2_source(&files).is_none() {
-            let saved_par2 = crate::raw_store::get_archive_files(&rel.name, &rel.group, &content_id, SOURCE_PAR2);
-            if !saved_par2.is_empty() {
-                let restored = saved_par2.into_iter().map(|f| InnerFile { name: f.name, size: f.size }).collect();
-                return finish_with_override(
-                    ctx,
-                    SOURCE_PAR2,
-                    Listing { files: restored, complete: false, ..Default::default() },
-                    None,
-                    Some(None),
-                    false,
-                    &limits,
-                );
+        let rel_id = rel.id;
+        let rel_name = rel.name.clone();
+        let rel_group = rel.group.clone();
+        let content_id = crate::raw_store::release_content_id(ctx.conn(), rel_id).unwrap_or_default();
+        if !crate::raw_store::is_explicit_rerun(ctx.conn(), rel_id, LIST_STEP) {
+            if let Some(saved) =
+                crate::raw_store::get_archive(&rel_name, &rel_group, &content_id, rel.parts, rel.complete)
+            {
+                return restore_archive(ctx, saved, &limits);
+            }
+            if select::par2_source(&files).is_none() {
+                let saved_par2 = crate::raw_store::get_archive_files(&rel_name, &rel_group, &content_id, SOURCE_PAR2);
+                if !saved_par2.is_empty()
+                    && let Some(inv) =
+                        crate::raw_store::get_par2_files(&rel_name, &rel_group, &content_id).filter(|i| i.complete)
+                {
+                    let restored = saved_par2.into_iter().map(|f| InnerFile { name: f.name, size: f.size }).collect();
+                    let mut outcome = finish_with_override(
+                        ctx,
+                        SOURCE_PAR2,
+                        Listing { files: restored, complete: false, ..Default::default() },
+                        None,
+                        Some(None),
+                        false,
+                        &limits,
+                    )?;
+                    outcome.writes.extend(archive_store::par2_file_writes(rel_id, &inv));
+                    return Ok(outcome);
+                }
             }
         }
         let mut left = limits.max_bodies_per_release.max(0) as usize;
@@ -583,12 +602,16 @@ impl Step for ListStep {
                 }
                 Format::Par2 => {
                     // a PAR2 under another name: without a list, it cant replace the rows of one that had
-                    let listing = listing_of(par2::inventory(&body));
-                    if listing.files.is_empty() {
+                    let inventory = par2::inventory(&body);
+                    if inventory.files.is_empty() {
                         continue;
                     }
+                    crate::raw_store::put_par2_files(&rel_name, &rel_group, &content_id, &inventory);
+                    let kept = archive_store::par2_file_writes(ctx.release().id, &inventory);
+                    let listing = listing_of(inventory);
                     let listed = listing.files.len();
                     let mut outcome = finish(ctx, SOURCE_PAR2, listing, &limits)?;
+                    outcome.writes.extend(kept);
                     // finish counts files by name, and this one is PAR2 under another name: the set speaks for the
                     // release only when the rest of its files are the set's. A recovery volume posted on its own, as a
                     // fully obfuscated upload does, would otherwise claim the content of the files it repairs
@@ -612,6 +635,25 @@ impl Step for ListStep {
         let rel = ctx.release();
         if let Some(saved) = crate::raw_store::get_archive(&rel.name, &rel.group, &content_id, 0, false) {
             return restore_archive(ctx, saved, &limits);
+        }
+        if select::par2_source(&files).is_none() {
+            let saved_par2 = crate::raw_store::get_archive_files(&rel_name, &rel_group, &content_id, SOURCE_PAR2);
+            if !saved_par2.is_empty() {
+                let restored = saved_par2.into_iter().map(|f| InnerFile { name: f.name, size: f.size }).collect();
+                let mut outcome = finish_with_override(
+                    ctx,
+                    SOURCE_PAR2,
+                    Listing { files: restored, complete: false, ..Default::default() },
+                    None,
+                    Some(None),
+                    false,
+                    &limits,
+                )?;
+                if let Some(inv) = crate::raw_store::get_par2_files(&rel_name, &rel_group, &content_id) {
+                    outcome.writes.extend(archive_store::par2_file_writes(rel_id, &inv));
+                }
+                return Ok(outcome);
+            }
         }
         Ok(Outcome::default())
     }

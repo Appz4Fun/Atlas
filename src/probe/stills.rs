@@ -378,7 +378,8 @@ impl Step for StillsStep {
         let rel_group = ctx.release().group.clone();
         let content_id = crate::raw_store::release_content_id(ctx.conn(), release_id).unwrap_or_default();
         let saved_stills = crate::raw_store::get_stills(&rel_name, &rel_group, &content_id);
-        if saved_stills.len() == POSITIONS.len()
+        if !crate::raw_store::is_explicit_rerun(ctx.conn(), release_id, STILLS_STEP)
+            && saved_stills.len() == POSITIONS.len()
             && saved_stills.iter().all(|s| s.phash.is_some() && still_file(&s.sha256).is_some_and(|f| f.exists()))
         {
             let mut writes = vec![StepWrite::new(DROP_STILLS, vec![release_id.into()])];
