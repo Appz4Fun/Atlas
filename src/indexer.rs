@@ -73,6 +73,9 @@ pub struct Refused {
     pub end: u64,
     pub since: Instant,
     pub tries: u32,
+    /// passed over, last asked at: kept while it is still asked, soo a day
+    /// chunk read again whole passes over it again instead of starting its hour over
+    pub passed: Option<Instant>,
 }
 
 /// A slice refused with a 5xx is asked again on later passes, and only once it
@@ -81,8 +84,11 @@ pub struct Refused {
 /// for a while must not cost the articles in it for good.
 pub const REFUSED_FOR: Duration = Duration::from_secs(3600);
 pub const REFUSED_TRIES: u32 = 3;
-/// refused slices noted per group at most; past it a refusal isnt noted until there is room
-const REFUSED_KEPT: usize = 64;
+/// refused slices still asked again noted per group at most; past it a
+/// refusal isnt noted until there is room
+const REFUSED_KEPT: usize = 1024;
+/// passed over ones kept per group at most, the longest not asked go first
+const PASSED_KEPT: usize = 4096;
 
 /// the days of a split only its deepest server has that are chunks at once
 /// (see `chunks::Speculative`), and the articles a day those done have to
@@ -171,20 +177,28 @@ impl RunStates {
 
     /// `start..=end` of `key` (a cursor key of `group`) was refused with a 5xx
     /// at `now`. True: it has been, for `REFUSED_FOR` and `REFUSED_TRIES` times,
-    /// soo it is passed over now (and forgotten). False: it is asked again later.
-    /// Slice bounds move between passes, soo a refusal overlapping an earlier
-    /// one of the same key counts as the same.
+    /// soo it is passed over now. False: it is asked again later. Slice bounds
+    /// move between passes, soo a refusal overlapping an earlier one of the same
+    /// key counts as the same. A range passed over stays passed over while it
+    /// is asked again (a day chunk is read again whole until every slice of it
+    /// is done) and is forgotten once not asked for `REFUSED_FOR`.
     pub fn refused(&self, group: &str, key: &str, (start, end): (u64, u64), now: Instant) -> bool {
         self.with(group, |st| {
-            let same = |r: &Refused| r.key == key && r.start <= end && start <= r.end;
+            st.refused.retain(|r| r.passed.is_none_or(|at| now.saturating_duration_since(at) < REFUSED_FOR));
+            let passed = |r: &Refused| r.passed.is_some() && r.key == key && r.start <= start && end <= r.end;
+            if let Some(r) = st.refused.iter_mut().find(|r| passed(r)) {
+                r.passed = Some(now);
+                return true;
+            }
+            let same = |r: &Refused| r.passed.is_none() && r.key == key && r.start <= end && start <= r.end;
             let Some(at) = st.refused.iter().position(same) else {
                 // full: this one waits for room and is asked again meanwhile. Dropping
                 // an older one would start its hour over, and with more refused slices
                 // a pass than room none would ever reach it.
-                if st.refused.len() >= REFUSED_KEPT {
+                if st.refused.iter().filter(|r| r.passed.is_none()).count() >= REFUSED_KEPT {
                     return false;
                 }
-                st.refused.push(Refused { key: key.to_string(), start, end, since: now, tries: 1 });
+                st.refused.push(Refused { key: key.to_string(), start, end, since: now, tries: 1, passed: None });
                 return false;
             };
             let r = &mut st.refused[at];
@@ -192,7 +206,15 @@ impl RunStates {
             (r.start, r.end) = (r.start.min(start), r.end.max(end));
             let give_up = r.tries >= REFUSED_TRIES && now.saturating_duration_since(r.since) >= REFUSED_FOR;
             if give_up {
-                st.refused.remove(at);
+                r.passed = Some(now);
+                let passed = st.refused.iter().filter(|r| r.passed.is_some()).count();
+                if passed > PASSED_KEPT
+                    && let Some(oldest) = (0..st.refused.len())
+                        .filter(|i| st.refused[*i].passed.is_some())
+                        .min_by_key(|i| st.refused[*i].passed)
+                {
+                    st.refused.remove(oldest);
+                }
             }
             give_up
         })
@@ -2190,7 +2212,9 @@ mod tests {
         assert!(!states.refused("g", "g@b", (100, 199), t0 + REFUSED_FOR), "another server's numbers count apart");
         assert!(!refused((300, 399), REFUSED_FOR), "a range not refused before starts over");
         assert!(refused((120, 130), REFUSED_FOR), "an hour after the first, overlapping ranges are passed over");
-        assert!(!refused((100, 199), REFUSED_FOR), "and forgotten once passed over");
+        assert!(refused((100, 199), REFUSED_FOR + REFUSED_FOR / 2), "and stay passed over while asked again");
+        assert!(!refused((90, 199), REFUSED_FOR * 2), "but not past what was passed over");
+        assert!(!refused((100, 199), REFUSED_FOR * 3), "and forgotten once not asked for the hour");
 
         // a read in between ends it
         assert!(!refused((300, 399), REFUSED_FOR + Duration::from_secs(1)));
@@ -2205,13 +2229,15 @@ mod tests {
         let slices = REFUSED_KEPT as u64 * 2;
         let pass =
             |at: Duration| (0..slices).filter(|i| states.refused("g", "g@a", (i * 100, i * 100 + 99), t0 + at)).count();
-        // every pass refuses them all: the first ones keep their history
+        // every pass asks them all again, as a day chunk read again whole does:
+        // the first ones keep their history
         assert_eq!(pass(Duration::ZERO), 0);
         assert_eq!(pass(Duration::from_secs(60)), 0);
         assert_eq!(pass(REFUSED_FOR), REFUSED_KEPT, "the ones kept are passed over after the hour");
-        // the rest were noted as room freed: their hour runs from then
-        assert_eq!(pass(REFUSED_FOR + Duration::from_secs(60)), 0);
-        assert_eq!(pass(REFUSED_FOR * 2), REFUSED_KEPT, "and they are passed over an hour later");
+        // the rest were noted as room freed: their hour runs from then, and
+        // the ones passed over stay passed over meanwhile
+        assert_eq!(pass(REFUSED_FOR + Duration::from_secs(60)), REFUSED_KEPT);
+        assert_eq!(pass(REFUSED_FOR * 2), 2 * REFUSED_KEPT, "an hour later every slice is passed over");
     }
 
     #[test]
