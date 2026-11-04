@@ -344,8 +344,8 @@ struct Scheduler {
 struct Parked {
     since: Instant,
     servers: Vec<usize>,
-    /// servers that ran a pass standing in for these, soo the first starts at the newest article (see
-    /// `PassSettings::from_top`)
+    /// servers that ran a pass standing in for these to its end, soo the first starts at the newest article (see
+    /// `PassSettings::from_top`); one that failed before its cursor was set doesnt count
     stood_in: Vec<usize>,
 }
 
@@ -385,20 +385,18 @@ impl Scheduler {
 
         failed.retain(|_, parked| parked.since.elapsed() < FAILED_RETRY);
         wait.retain(|_, until| *until > now);
-        let free = |g: &String| {
-            !busy.contains(g)
-                && !wait.contains_key(g)
-                && match failed.get(g) {
-                    None => pool.pick_server_in(&tier, g) == server,
-                    Some(parked) => pool.fallback_in(&tier, g, &parked.servers) == Some(server),
-                }
+        // the server a group's passes go to: a parked one's stand-in
+        let on = |g: &String| match failed.get(g) {
+            None => Some(pool.pick_server_in(&tier, g)),
+            Some(parked) => pool.fallback_in(&tier, g, &parked.servers),
         };
+        let free = |g: &String| !busy.contains(g) && !wait.contains_key(g) && on(g) == Some(server);
 
         // a group big releases come from goes as soon as it's due, so it keeps up with what's posted while the round
         // robin goes through all the others; one worker at a time on each, like any group, and at most half of the
         // server's workers on them, so the round robin always moves
         let media = self.media.read().unwrap();
-        let on_media = media.iter().filter(|g| busy.contains(*g) && pool.pick_server_in(&tier, g) == server).count();
+        let on_media = media.iter().filter(|g| busy.contains(*g) && on(g) == Some(server)).count();
         if on_media < self.media_share(server)
             && let Some(g) = media.iter().find(|g| groups.contains(g) && free(g))
         {
@@ -423,22 +421,27 @@ impl Scheduler {
     }
 
     /// For a pass of `group` on `server`: whether it stands in for the group's own server (parked, see `Parked`), and
-    /// whether it is the first on `server` since.
+    /// whether none on `server` finished since.
     fn stand_in(&self, group: &str, server: usize) -> Option<bool> {
-        let mut failed = self.failed.lock().unwrap();
-        let parked = failed.get_mut(group)?;
-        let first = !parked.stood_in.contains(&server);
-        if first {
-            parked.stood_in.push(server);
-        }
-        Some(first)
+        let failed = self.failed.lock().unwrap();
+        Some(!failed.get(group)?.stood_in.contains(&server))
     }
 
     fn finish(&self, group: &str, server: usize, result: anyhow::Result<Progress>) {
         let states = &self.ctx.states;
+        // while parked only stand-ins run, on the server they were given; any other pass may have moved the group
+        // (see `Pool::select_group_known`), and what failed is where it is now
+        let stood_in = self.failed.lock().unwrap().contains_key(group);
+        let server = if stood_in { server } else { self.ctx.pool.pick_server(group) };
 
         match result {
             Ok(_) => {
+                if stood_in
+                    && let Some(parked) = self.failed.lock().unwrap().get_mut(group)
+                    && !parked.stood_in.contains(&server)
+                {
+                    parked.stood_in.push(server);
+                }
                 self.errors.lock().unwrap().remove(group);
                 // caught up: give it a rest instead of hammering GROUP every loop
                 if states.is_idle(group) && !states.is_backfilling(group) {
@@ -459,8 +462,11 @@ impl Scheduler {
                     self.errors.lock().unwrap().remove(group);
                     let pool = &self.ctx.pool;
                     let mut failed = self.failed.lock().unwrap();
-                    let parked =
-                        failed.entry(group.to_string()).or_insert_with(|| Parked { since: Instant::now(), servers: vec![], stood_in: vec![] });
+                    let parked = failed.entry(group.to_string()).or_insert_with(|| Parked {
+                        since: Instant::now(),
+                        servers: vec![],
+                        stood_in: vec![],
+                    });
                     if !parked.servers.contains(&server) {
                         parked.servers.push(server);
                     }
@@ -1376,8 +1382,12 @@ mod tests {
         assert_eq!(sched.take_group(home), None, "parked on its own server");
         assert_eq!(sched.take_group(other).as_deref(), Some("g"), "the next server stands in");
         assert_eq!(sched.stand_in("g", other), Some(true), "its first pass starts at the newest article");
-        assert_eq!(sched.stand_in("g", other), Some(false));
+        sched.finish("g", other, Err(anyhow::anyhow!("timed out")));
+        sched.wait_until.lock().unwrap().clear();
+        assert_eq!(sched.take_group(other).as_deref(), Some("g"));
+        assert_eq!(sched.stand_in("g", other), Some(true), "a failed one doesnt count");
         sched.finish("g", other, Ok(Progress::default()));
+        assert_eq!(sched.stand_in("g", other), Some(false), "once one finished");
         sched.wait_until.lock().unwrap().clear();
 
         // the stand-in fails too: nothing left to try
