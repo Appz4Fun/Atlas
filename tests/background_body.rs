@@ -135,6 +135,28 @@ fn failed_forwarding_on_one_server_takes_the_body_from_another() {
     assert!(matches!(rt.block_on(pool.background_body("<msg1@mock>", MIB)).unwrap(), BackgroundBody::Body(_)));
 }
 
+/// A body that takes past its deadline on one server comes from the next: a server trickling bytes held it for good.
+#[test]
+fn a_body_past_its_deadline_comes_from_the_next_server() {
+    let rt = runtime();
+    let servers: Vec<Arc<Server>> = (0..2)
+        .map(|i| {
+            let mut s = Server::new(vec![post(1, r#""a.bin" yEnc (1/1)"#, 10, vec![b"hello".to_vec()])]);
+            if i == 0 {
+                Arc::get_mut(&mut s).unwrap().body_delay = Duration::from_millis(1500);
+            }
+            s
+        })
+        .collect();
+    let ports: Vec<u16> = servers.iter().map(|s| spawn_server(s.clone())).collect();
+    let pool = Pool::new(&[mock(ports[0], "secret", 2, 1), mock(ports[1], "secret", 2, 2)])
+        .with_deadlines(Duration::from_secs(5), Duration::from_millis(200));
+    let start = std::time::Instant::now();
+    let got = rt.block_on(pool.background_body("<msg1@mock>", MIB)).unwrap();
+    assert!(matches!(got, BackgroundBody::Body(_)), "{got:?}");
+    assert!(start.elapsed() < Duration::from_millis(1200), "didnt wait for the slow one: {:?}", start.elapsed());
+}
+
 #[test]
 fn a_server_that_cant_be_reached_is_an_error_not_missing() {
     let rt = runtime();

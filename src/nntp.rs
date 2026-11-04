@@ -312,6 +312,25 @@ trait AsyncStream: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncStream for T {}
 
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+/// The longest one XOVER and one BODY may take in all. `DEFAULT_TIMEOUT` is per read, soo a server trickling a few
+/// bytes now and then held a slice (or a body) for as long as it liked: on prod 28 of 78,000 XOVERs took over 5
+/// minutes and one over 30. Past these the connection goes and the work is the next try's (a slice is read again
+/// later, a body tries the next server).
+const XOVER_DEADLINE: Duration = Duration::from_secs(300);
+const BODY_DEADLINE: Duration = Duration::from_secs(60);
+
+/// The error for a command that ran past its deadline.
+fn past_deadline(command: &str, deadline: Duration) -> NntpError {
+    NntpError::Io(io::Error::new(
+        io::ErrorKind::TimedOut,
+        format!("{command} took longer than {}s in all", deadline.as_secs_f64()),
+    ))
+}
+
+/// `command`, or a timeout error once it ran past `deadline`.
+async fn within<T>(deadline: Duration, what: &str, command: impl std::future::Future<Output = Result<T>>) -> Result<T> {
+    tokio::time::timeout(deadline, command).await.unwrap_or_else(|_| Err(past_deadline(what, deadline)))
+}
 /// smallest XOVER slice handed to one connection
 const MIN_CHUNK: u64 = 250;
 /// a server whose login was rejected `AUTH_REFUSALS` times in a row is left alone this long
@@ -1657,6 +1676,9 @@ pub struct Pool {
     unsaved: Arc<UnsavedBudget>,
     /// how long a background body waits for room before queuing
     body_patience: Duration,
+    /// `XOVER_DEADLINE` and `BODY_DEADLINE`, shorter in tests
+    xover_deadline: Duration,
+    body_deadline: Duration,
     rate_limiter: Arc<TokenBucket>,
 }
 
@@ -1860,6 +1882,8 @@ impl Pool {
             limit_heal: LIMIT_HEAL,
             compress_retry: COMPRESS_RETRY,
             body_patience: BODY_PATIENCE,
+            xover_deadline: XOVER_DEADLINE,
+            body_deadline: BODY_DEADLINE,
             unsaved: UnsavedBudget::new(crate::config::DEFAULT_MAX_UNSAVED_HEADERS as usize),
             rate_limiter: Arc::new(TokenBucket::new(0, 0)),
         }
@@ -1903,6 +1927,13 @@ impl Pool {
     /// At most `headers` fetched and not saved yet, over every pass at once.
     pub fn with_body_patience(mut self, patience: Duration) -> Self {
         self.body_patience = patience;
+        self
+    }
+
+    /// how long one XOVER and one BODY may take in all (`XOVER_DEADLINE`, `BODY_DEADLINE`)
+    pub fn with_deadlines(mut self, xover: Duration, body: Duration) -> Self {
+        self.xover_deadline = xover;
+        self.body_deadline = body;
         self
     }
 
@@ -2384,18 +2415,21 @@ impl Pool {
                     }
                 };
                 // the body, and whether it was read to its end
-                let r = match read {
-                    BackgroundRead::Capped => {
-                        lease.begin().body_capped(message_id, max_bytes).await.map(|b| (b.is_some(), b))
+                let r = within(self.body_deadline, "BODY", async {
+                    match read {
+                        BackgroundRead::Capped => {
+                            lease.begin().body_capped(message_id, max_bytes).await.map(|b| (b.is_some(), b))
+                        }
+                        BackgroundRead::Prefix => {
+                            lease.begin().body_prefix(message_id, max_bytes).await.map(|(b, whole)| (whole, Some(b)))
+                        }
+                        BackgroundRead::Raw => {
+                            lease.begin().article_raw(message_id, max_bytes).await.map(|b| (b.is_some(), b))
+                        }
+                        BackgroundRead::Stat => lease.begin().stat(message_id).await.map(|()| (true, Some(Vec::new()))),
                     }
-                    BackgroundRead::Prefix => {
-                        lease.begin().body_prefix(message_id, max_bytes).await.map(|(b, whole)| (whole, Some(b)))
-                    }
-                    BackgroundRead::Raw => {
-                        lease.begin().article_raw(message_id, max_bytes).await.map(|b| (b.is_some(), b))
-                    }
-                    BackgroundRead::Stat => lease.begin().stat(message_id).await.map(|()| (true, Some(Vec::new()))),
-                };
+                })
+                .await;
                 match r {
                     Ok((whole, Some(body))) => {
                         if whole {
@@ -2986,7 +3020,7 @@ impl Pool {
         }
 
         let sent = Instant::now();
-        let r = lease.begin().xover(start, end).await;
+        let r = within(self.xover_deadline, "XOVER", lease.begin().xover(start, end)).await;
         crate::profile::Load::add_since(&crate::profile::LOAD.xover_ns, sent);
         crate::profile::LOAD.xovers.fetch_add(1, Ordering::Relaxed);
         if let Ok(rows) = &r {
@@ -3190,7 +3224,7 @@ impl Pool {
                 }
             };
 
-            let r = lease.begin().body(message_id).await;
+            let r = within(self.body_deadline, "BODY", lease.begin().body(message_id)).await;
             match lease.check(r) {
                 Ok(body) => return Ok(body),
                 Err(e) => last_err = e,

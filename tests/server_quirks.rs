@@ -327,3 +327,21 @@ fn compression_is_tried_again_after_a_while() {
     assert_eq!(pool.fetch_headers(GROUP, 1, 20).unwrap().len(), 20);
     assert_eq!(asked(), retried, "off again after one more broken listing");
 }
+
+/// An XOVER that takes past its deadline fails (its slice is read again later) instead of holding the slice for as
+/// long as the server likes.
+#[test]
+fn an_xover_past_its_deadline_fails() {
+    let mut state = Server::new(posts(20));
+    Arc::get_mut(&mut state).unwrap().xover_delay = Duration::from_millis(1500);
+    let port = spawn_server(state.clone());
+    let pool = BlockingPool::from_pool(
+        atlas::nntp::Pool::new(&[mock(port, "secret", 2, 1)])
+            .with_deadlines(Duration::from_millis(200), Duration::from_secs(5)),
+    );
+    pool.connect().unwrap();
+    let start = std::time::Instant::now();
+    let err = pool.fetch_headers(GROUP, 1, 20).unwrap_err();
+    assert!(err.to_string().contains("took longer"), "{err}");
+    assert!(start.elapsed() < Duration::from_millis(1200), "{:?}", start.elapsed());
+}
