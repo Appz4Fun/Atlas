@@ -1082,6 +1082,12 @@ pub fn permille_of(conn: &Connection, ids: &[i64]) -> Result<i64> {
     Ok(if want == 0 { 0 } else { have * 1000 / want })
 }
 
+/// Whether these rows hold the whole post: every file its counter says it has, each with every part (unlike
+/// `permille_of`, which counts the parts of the files that are there).
+pub fn whole_of(conn: &Connection, ids: &[i64]) -> Result<bool> {
+    Ok(union_files(conn, ids)?.complete())
+}
+
 fn union_files(conn: &Connection, ids: &[i64]) -> Result<UnionFiles> {
     let mut union = UnionFiles::default();
     for id in ids {

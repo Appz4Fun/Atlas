@@ -184,12 +184,11 @@ async fn round(
     Ok(())
 }
 
-/// Whether the post of these rows has every part now.
+/// Whether the post of these rows is whole now: every file, each with every part (`release_info::whole_of`).
 async fn whole(ids: &[i64]) -> bool {
     let ids = ids.to_vec();
-    let permille =
-        tokio::task::spawn_blocking(move || db::with_reader(|conn| crate::release_info::permille_of(conn, &ids)));
-    matches!(permille.await, Ok(Ok(p)) if p >= 1000)
+    let whole = tokio::task::spawn_blocking(move || db::with_reader(|conn| crate::release_info::whole_of(conn, &ids)));
+    matches!(whole.await, Ok(Ok(true)))
 }
 
 /// Asks for `days` of their groups' backfill first, and marks the releases in `tried` as looked at (with the share
