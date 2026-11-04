@@ -400,26 +400,22 @@ fn stored(shard: &Connection, release_id: i64) -> rusqlite::Result<Option<Keys>>
 }
 
 /// The query over one shard (`s{shard}.`) for the releases other than `?1` sharing `kind`, newest first, with the
-/// values bound from `?3` on, at most `?2`; and how many values it takes.
+/// values bound from `?3` on, at most `?2`; and how many values it takes. Only releases the pages would show count:
+/// one deleted or in a blocked group (`atlas_blocked`) is left out before the limit, soo the count and the list agree.
 fn others_sql(kind: Kind, shard: usize, sets: usize) -> String {
-    match kind.column() {
-        Some(col) => format!(
-            "select release_id from s{shard}.release_keys where {col} = ?3 and release_id != ?1
-             order by release_id desc limit ?2"
-        ),
+    let (from, matches) = match kind.column() {
+        Some(col) => (format!("s{shard}.release_keys k"), format!("k.{col} = ?3")),
         None if kind == Kind::Par2 => {
             let marks: Vec<String> = (0..sets).map(|i| format!("?{}", i + 3)).collect();
-            format!(
-                "select distinct release_id from s{shard}.par2_files where set_id in ({}) and bound = 1
-                 and release_id != ?1 order by release_id desc limit ?2",
-                marks.join(", ")
-            )
+            (format!("s{shard}.par2_files k"), format!("k.set_id in ({}) and k.bound = 1", marks.join(", ")))
         }
-        None => format!(
-            "select release_id from s{shard}.release_probe where moviehash = ?3 and release_id != ?1
-             order by release_id desc limit ?2"
-        ),
-    }
+        None => (format!("s{shard}.release_probe k"), "k.moviehash = ?3".to_string()),
+    };
+    format!(
+        "select distinct k.release_id from {from} join s{shard}.releases r on r.id = k.release_id
+         where {matches} and k.release_id != ?1 and not atlas_blocked(r.group_name)
+         order by k.release_id desc limit ?2"
+    )
 }
 
 fn values(lookup: &Lookup, kind: Kind) -> Vec<rusqlite::types::Value> {
@@ -611,28 +607,44 @@ mod tests {
     #[test]
     fn par2_lookups_bind_each_set() {
         let sql = others_sql(Kind::Par2, 3, 2);
-        assert!(sql.contains("s3.par2_files") && sql.contains("set_id in (?3, ?4)"), "{sql}");
-        assert!(others_sql(Kind::Lines, 0, 1).contains("s0.release_keys where lines = ?3"));
-        assert!(others_sql(Kind::MovieHash, 7, 1).contains("s7.release_probe where moviehash = ?3"));
+        assert!(sql.contains("s3.par2_files k") && sql.contains("set_id in (?3, ?4)"), "{sql}");
+        assert!(sql.contains("join s3.releases r") && sql.contains("not atlas_blocked(r.group_name)"), "{sql}");
+        assert!(others_sql(Kind::Lines, 0, 1).contains("s0.release_keys k join s0.releases r"));
+        assert!(others_sql(Kind::Lines, 0, 1).contains("k.lines = ?3"));
+        assert!(others_sql(Kind::MovieHash, 7, 1).contains("k.moviehash = ?3"));
     }
 
     #[test]
-    fn an_unbound_par2_file_matches_nothing() {
+    fn only_bound_par2_files_of_shown_releases_match() {
         let conn = Connection::open_in_memory().unwrap();
+        crate::filters::register_sql(&conn).unwrap();
         conn.execute("attach ':memory:' as s0", []).unwrap();
         conn.execute_batch(&crate::archive::store::PAR2_FILES.create.replace("par2_files (", "s0.par2_files ("))
             .unwrap();
+        conn.execute_batch("create table s0.releases (id integer primary key, group_name text not null)").unwrap();
+        let blocked = "alt.binaries.pictures.erotica.teen";
+        assert!(crate::filters::group_blocked(blocked));
         let set = vec![7u8; 16];
-        for (release, file, bound) in [(1, 1u8, 1), (2, 2, 1), (3, 3, 0)] {
+        // 1 asks; 2 shares it; 3 only holds an unbound copy; 4 is in a blocked group; 5 has no release row
+        for (release, bound, group) in
+            [(1, 1, Some("a.b.c")), (2, 1, Some("a.b.c")), (3, 0, Some("a.b.c")), (4, 1, Some(blocked)), (5, 1, None)]
+        {
+            if let Some(group) = group {
+                conn.execute(
+                    "insert into s0.releases (id, group_name) values (?1, ?2)",
+                    rusqlite::params![release, group],
+                )
+                .unwrap();
+            }
             conn.execute(
                 "insert into s0.par2_files (release_id, file_id, set_id, md5, md5_16k, size, name, bound)
                  values (?1, ?2, ?3, x'', x'', 1, 'a.mkv', ?4)",
-                rusqlite::params![release, vec![file], set, bound],
+                rusqlite::params![release, vec![release as u8], set, bound],
             )
             .unwrap();
         }
         let lookup = Lookup { keys: Keys::default(), par2_sets: vec![set], moviehash: None };
-        assert_eq!(others(&conn, 1, &lookup, Kind::Par2, 10), vec![2], "release 3 only holds an unbound copy");
+        assert_eq!(others(&conn, 1, &lookup, Kind::Par2, 1), vec![2], "the limit counts only the shown ones");
         assert_eq!(count_others(&conn, 1, &lookup, Kind::Par2), 1);
     }
 }
