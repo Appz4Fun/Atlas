@@ -139,6 +139,11 @@ impl RunStates {
         groups.iter().all(|g| states.get(g).is_some_and(|s| s.idle))
     }
 
+    /// the groups passes ran for since the indexer started
+    pub fn groups(&self) -> std::collections::HashSet<String> {
+        self.0.lock().unwrap().keys().cloned().collect()
+    }
+
     /// The oldest day the server `host` keeps of `group`, `i64::MIN` when not known.
     pub fn keeps_from(&self, group: &str, host: &str) -> i64 {
         let now = Instant::now();
@@ -858,14 +863,25 @@ where
         )
         .await?
     {
-        // a split group's backfill is day chunks, this server takes the next one
+        // a split group's backfill is day chunks, this server takes the next one: a day asked for, or one of the
+        // newest month any split group running here still has to do (see `chunks::claim_turn`), else none
         let host = ctx.pool.host(server);
-        let wanted = [(group.to_string(), ctx.states.keeps_from(group, &host))];
+        let wanted = (group.to_string(), ctx.states.keeps_from(group, &host));
+        let (kept, running) = (ctx.states.kept_days(&host), ctx.states.groups());
         // the split's generation as of the claim: a sweep noted after the split reached back isnt
         let g = group.to_string();
         let (claimed, generation) = on_db(db, move |conn| {
             let generation = crate::chunks::sweep_generation(conn, &g)?;
-            Ok((crate::chunks::claim(conn, &wanted, &host, chrono::Utc::now().timestamp())?, generation))
+            let split: Vec<(String, i64)> = crate::chunks::split_groups(conn)?
+                .into_iter()
+                .filter(|s| *s == g || running.contains(s))
+                .map(|s| {
+                    let day = kept.get(&s).copied().unwrap_or(i64::MIN);
+                    (s, day)
+                })
+                .collect();
+            let now = chrono::Utc::now().timestamp();
+            Ok((crate::chunks::claim_turn(conn, wanted, &split, &host, now)?, generation))
         })
         .await?;
         let r = match claimed {
