@@ -36,6 +36,8 @@ pub(crate) struct Applied {
     pub names: Vec<(StepMask, NameChange)>,
     pub db_attempts: Option<i64>,
     pub net_attempts: Option<i64>,
+    /// transient net failures in a row (see `engine::transient_wait`)
+    pub net_transient: Option<i64>,
     pub net_next_at: Option<i64>,
     pub parts_seen: Option<i64>,
     pub error: Option<String>,
@@ -184,9 +186,9 @@ fn write(conn: &Connection, mut a: Applied, now: i64, renames: &mut Renames) -> 
     if !a.no_state {
         conn.prepare_cached(
             "insert into pp_state (release_id, done, failed, net_wanted, db_attempts, net_attempts, net_next_at, parts_seen,
-                                   last_error, rerun_gen, rerun_mask)
+                                   last_error, rerun_gen, rerun_mask, net_transient)
              values (?1, ?2 & ~?4, ?3 & ~?2 & ~?4, case when (?5 & ~(?2 & ~?4) & ~(?3 & ~?4)) != 0 then 1 end,
-                     coalesce(?6, 0), coalesce(?7, 0), coalesce(?8, 0), coalesce(?9, 0), ?10, ?4 != 0, ?4)
+                     coalesce(?6, 0), coalesce(?7, 0), coalesce(?8, 0), coalesce(?9, 0), ?10, ?4 != 0, ?4, ?11)
              on conflict(release_id) do update set
                 done = (done | ?2) & ~?4,
                 failed = (failed | ?3) & ~?2 & ~?4,
@@ -197,7 +199,8 @@ fn write(conn: &Connection, mut a: Applied, now: i64, renames: &mut Renames) -> 
                 parts_seen = coalesce(?9, parts_seen),
                 last_error = ?10,
                 rerun_gen = rerun_gen + (?4 != 0),
-                rerun_mask = rerun_mask | ?4",
+                rerun_mask = rerun_mask | ?4,
+                net_transient = coalesce(?11, net_transient)",
         )?
         .execute(params![
             a.release_id,
@@ -210,6 +213,7 @@ fn write(conn: &Connection, mut a: Applied, now: i64, renames: &mut Renames) -> 
             a.net_next_at,
             a.parts_seen,
             a.error,
+            a.net_transient,
         ])?;
     }
 

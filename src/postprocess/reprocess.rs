@@ -51,7 +51,7 @@ fn retry_failed(tx: &Connection, group: Option<&str>, now: i64) -> rusqlite::Res
         .collect::<rusqlite::Result<_>>()?;
     for id in &ids {
         tx.prepare_cached(
-            "update pp_state set failed = 0, db_attempts = 0, net_attempts = 0, net_next_at = 0, last_error = null
+            "update pp_state set failed = 0, db_attempts = 0, net_attempts = 0, net_transient = 0, net_next_at = 0, last_error = null
              where release_id = ?1",
         )?
         .execute([id])?;
