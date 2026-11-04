@@ -341,6 +341,12 @@ impl Scheduler {
     /// Next group due on `server`: one that maps to this server and isnt being
     /// indexed, resting or parked. Each server pulls its own groups soo every
     /// server's connections stay busy.
+    /// How many of `server`'s workers may be on the groups big releases come from at once: half, and one at least.
+    fn media_share(&self, server: usize) -> usize {
+        let workers = self.plan.iter().find(|(s, _)| *s == server).map_or(self.workers, |(_, n)| *n);
+        (workers / 2).max(1)
+    }
+
     fn take_group(&self, server: usize) -> Option<String> {
         let groups = self.groups.read().unwrap();
         if groups.is_empty() {
@@ -371,9 +377,13 @@ impl Scheduler {
         };
 
         // a group big releases come from goes as soon as it's due, so it keeps up with what's posted while the round
-        // robin goes through all the others; one worker at a time on each, like any group
+        // robin goes through all the others; one worker at a time on each, like any group, and at most half of the
+        // server's workers on them, so the round robin always moves
         let media = self.media.read().unwrap();
-        if let Some(g) = media.iter().find(|g| groups.contains(g) && free(g)) {
+        let on_media = media.iter().filter(|g| busy.contains(*g) && pool.pick_server_in(&tier, g) == server).count();
+        if on_media < self.media_share(server)
+            && let Some(g) = media.iter().find(|g| groups.contains(g) && free(g))
+        {
             busy.insert(g.clone());
             return Some(g.clone());
         }
@@ -1289,7 +1299,8 @@ mod tests {
     fn groups_big_releases_come_from_go_first() {
         let pool = Pool::new(&[UsenetServer::new("a.test", "u", "p", 119)]);
         let groups: Vec<String> = ["a", "b", "c", "m"].iter().map(|g| g.to_string()).collect();
-        let sched = scheduler(pool, groups);
+        let mut sched = scheduler(pool, groups);
+        sched.plan = vec![(0, 3)];
         *sched.media.write().unwrap() = vec!["m".into(), "gone".into()];
         let take = || sched.take_group(0);
         assert_eq!(take().as_deref(), Some("m"));
@@ -1300,6 +1311,22 @@ mod tests {
         assert_eq!(take().as_deref(), Some("b"));
         assert_eq!(take().as_deref(), Some("c"));
         assert_eq!(take(), None, "a group no longer indexed is never taken");
+    }
+
+    /// with more media groups than its share of workers, the round robin still moves
+    #[test]
+    fn the_groups_big_releases_come_from_take_half_the_workers() {
+        let pool = Pool::new(&[UsenetServer::new("a.test", "u", "p", 119)]);
+        let groups: Vec<String> = ["m1", "m2", "m3", "a", "b"].iter().map(|g| g.to_string()).collect();
+        let mut sched = scheduler(pool, groups);
+        sched.plan = vec![(0, 4)];
+        *sched.media.write().unwrap() = vec!["m1".into(), "m2".into(), "m3".into()];
+        // two jump the queue; past that m3 waits for the round robin, which goes on from where it was to a and b
+        let taken: Vec<String> = (0..5).filter_map(|_| sched.take_group(0)).collect();
+        assert_eq!(taken, ["m1", "m2", "m3", "a", "b"]);
+        // with the round robin past them, a media group done goes straight back to the front
+        sched.busy.lock().unwrap().retain(|g| g != "m1" && g != "m3");
+        assert_eq!(sched.take_group(0).as_deref(), Some("m1"));
     }
 
     /// a sweep due on a server comes before another group's day chunks
