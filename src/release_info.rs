@@ -600,7 +600,7 @@ const SPLIT_POST_GROUPS: usize = 16;
 /// another group, soo any doubt leaves every row on its own, and every row of a post gets the same answer.
 pub fn split_post_with(conn: &Connection, release: &crate::search::ReleaseRow) -> Result<Option<SplitPost>> {
     let posted = names_with(conn, release.id)?.map_or(release.name.clone(), |n| n.posted);
-    let exact = exact_split_post(conn, &posted, &release.poster)?;
+    let exact = exact_split_post(conn, &posted, release)?;
     if let Some(stem_post) = split_stem_post(conn, &posted, release)?
         && exact.as_ref().is_none_or(|e| stem_post.ids.len() > e.ids.len())
     {
@@ -609,29 +609,54 @@ pub fn split_post_with(conn: &Connection, release: &crate::search::ReleaseRow) -
     Ok(exact)
 }
 
-fn exact_split_post(conn: &Connection, posted: &str, poster: &Option<String>) -> Result<Option<SplitPost>> {
-    let (mut ids, mut groups, mut size, mut dates) = (Vec::new(), Vec::new(), 0, Vec::new());
+/// A row named as a post, in some shard.
+struct Named {
+    id: i64,
+    group: String,
+    bytes: i64,
+    date: Option<f64>,
+    poster: Option<String>,
+}
+
+fn exact_split_post(conn: &Connection, posted: &str, release: &crate::search::ReleaseRow) -> Result<Option<SplitPost>> {
+    let mut named = Vec::new();
     for s in 0..store::SHARDS {
         let mut stmt = conn.prepare_cached(&split_post_sql(s))?;
-        let rows = stmt.query_map(rusqlite::params![posted, poster], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, Option<String>>(1)?.unwrap_or_default(),
-                r.get::<_, i64>(2)?,
-                r.get::<_, Option<f64>>(3)?,
-            ))
+        let rows = stmt.query_map(rusqlite::params![posted], |r| {
+            Ok(Named {
+                id: r.get(0)?,
+                group: r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                bytes: r.get(2)?,
+                date: r.get(3)?,
+                poster: r.get(4)?,
+            })
         })?;
         for row in rows {
-            let (id, group, bytes, date) = row?;
-            ids.push(id);
-            groups.push(group);
-            size += bytes;
-            dates.push(date);
+            named.push(row?);
         }
     }
-    if !(2..=SPLIT_POST_GROUPS).contains(&ids.len()) || !close_together(&dates) {
+    let same: Vec<&Named> = named.iter().filter(|n| n.poster == release.poster).collect();
+    let by_poster = same_poster_post(conn, &same)?;
+    // one poster can have several of the groups: the post across posters is taken only if it holds all of those
+    match (by_poster, across_posters(conn, release.id, &named)?) {
+        (Some(one), Some(across))
+            if across.ids.len() > one.ids.len() && one.ids.iter().all(|id| across.ids.binary_search(id).is_ok()) =>
+        {
+            Ok(Some(across))
+        }
+        (Some(one), _) => Ok(Some(one)),
+        (None, across) => Ok(across),
+    }
+}
+
+fn same_poster_post(conn: &Connection, rows: &[&Named]) -> Result<Option<SplitPost>> {
+    let dates: Vec<Option<f64>> = rows.iter().map(|n| n.date).collect();
+    if !(2..=SPLIT_POST_GROUPS).contains(&rows.len()) || !close_together(&dates) {
         return Ok(None);
     }
+    let mut ids: Vec<i64> = rows.iter().map(|n| n.id).collect();
+    let mut groups: Vec<String> = rows.iter().map(|n| n.group.clone()).collect();
+    let size = rows.iter().map(|n| n.bytes).sum();
     ids.sort_unstable();
     groups.sort_unstable();
     groups.dedup();
@@ -640,6 +665,72 @@ fn exact_split_post(conn: &Connection, posted: &str, poster: &Option<String>) ->
         return Ok(None);
     }
     Ok(Some(SplitPost { ids, groups, size, complete: files.complete(), lead: None, recovery: Vec::new() }))
+}
+
+/// The most rows of one name looked at for a post whose groups each got a poster of their own.
+const ACROSS_POSTERS_ROWS: usize = 32;
+
+/// One post whose groups each got another made-up poster (Nyuu and ngPost can give every connection its own From): the
+/// rows share the post's files, and each holds parts of them no other row has. A name and a subject are only headers,
+/// soo rows join only where they fill each other's gaps, file by file, under the same subject, and a row that is a
+/// crosspost of another (the same parts of the same files) is left out of the post, its group kept. Rows are taken
+/// lowest id first whichever row asks, soo every row of the post gets the same answer.
+fn across_posters(conn: &Connection, anchor: i64, named: &[Named]) -> Result<Option<SplitPost>> {
+    let Some(anchor_date) = named.iter().find(|n| n.id == anchor).and_then(|n| n.date) else { return Ok(None) };
+    let mut close: Vec<&Named> =
+        named.iter().filter(|n| n.date.is_some_and(|d| (d - anchor_date).abs() <= SPLIT_POST_DAYS)).collect();
+    if close.len() < 2 || close.iter().all(|n| n.poster == close[0].poster) {
+        return Ok(None);
+    }
+    close.sort_by_key(|n| n.id);
+    close.truncate(ACROSS_POSTERS_ROWS);
+    // each row alone, to tell a crosspost from a part
+    let mut kept: Vec<(&Named, UnionFiles)> = Vec::new();
+    let mut copies: Vec<(&Named, i64)> = Vec::new();
+    for n in close {
+        let files = union_files(conn, &[n.id])?;
+        if files.files.is_empty() {
+            continue;
+        }
+        match kept.iter().find(|(_, k)| k.same_parts(&files)) {
+            Some((of, _)) => copies.push((n, of.id)),
+            None => kept.push((n, files)),
+        }
+    }
+    let mut chosen: Vec<i64> = Vec::new();
+    let mut union = UnionFiles::default();
+    for (n, files) in &kept {
+        if chosen.is_empty() {
+            chosen.push(n.id);
+            union = union_files(conn, &chosen)?;
+            continue;
+        }
+        let shares = files.files.keys().any(|f| union.files.contains_key(f));
+        if !shares || !union.fills_gaps(files) {
+            continue;
+        }
+        chosen.push(n.id);
+        union = union_files(conn, &chosen)?;
+    }
+    let anchor_in = chosen.contains(&anchor) || copies.iter().any(|(n, of)| n.id == anchor && chosen.contains(of));
+    if chosen.len() < 2 || !anchor_in || !union.one_upload() {
+        return Ok(None);
+    }
+    let rows: Vec<&Named> = kept.iter().map(|(n, _)| *n).filter(|n| chosen.contains(&n.id)).collect();
+    let dates: Vec<Option<f64>> = rows.iter().map(|n| n.date).collect();
+    if !close_together(&dates) {
+        return Ok(None);
+    }
+    let mut groups: Vec<String> = rows.iter().map(|n| n.group.clone()).collect();
+    groups.extend(copies.iter().filter(|(_, of)| chosen.contains(of)).map(|(n, _)| n.group.clone()));
+    groups.sort_unstable();
+    groups.dedup();
+    if groups.len() > SPLIT_POST_GROUPS {
+        return Ok(None);
+    }
+    let size = rows.iter().map(|n| n.bytes).sum();
+    chosen.sort_unstable();
+    Ok(Some(SplitPost { ids: chosen, groups, size, complete: union.complete(), lead: None, recovery: Vec::new() }))
 }
 
 #[derive(Clone)]
@@ -751,13 +842,12 @@ fn try_stem_subset(conn: &Connection, stem: &str, subset: &[StemCandidate]) -> R
     Ok(Some(SplitPost { ids, groups, size, complete: files.complete(), lead: None, recovery: Vec::new() }))
 }
 
-/// A shard's rows of one name and poster. `+poster` keeps the lookup on the name index: with no statistics SQLite
-/// would rather walk `idx_release_poster`, every row a busy poster ever posted, and a page of results took minutes.
-/// Parameters: ?1 the posted name, ?2 the poster.
+/// A shard's rows of one name, by the name index: a lookup by poster would walk `idx_release_poster`, every row a busy
+/// poster ever posted, and a page of results took minutes. Parameters: ?1 the posted name.
 fn split_post_sql(s: usize) -> String {
     format!(
-        "select id, group_name, coalesce(size, 0), julianday(posted_date) from s{s}.releases
-         where name = ?1 and +poster is ?2 and not atlas_blocked(group_name) limit 64"
+        "select id, group_name, coalesce(size, 0), julianday(posted_date), poster from s{s}.releases
+         where name = ?1 and not atlas_blocked(group_name) limit 64"
     )
 }
 
@@ -830,6 +920,38 @@ impl UnionFiles {
         }
     }
 
+    /// Whether `other` holds the very parts this does of the very same files: a crosspost, not a part of the post.
+    fn same_parts(&self, other: &UnionFiles) -> bool {
+        self.files.len() == other.files.len()
+            && self.files.iter().all(|(name, f)| {
+                other.files.get(name).is_some_and(|o| {
+                    o.expected == f.expected && o.subject == f.subject && trimmed(&o.seen) == trimmed(&f.seen)
+                })
+            })
+    }
+
+    /// Whether `other` only adds what this lacks: every file both have is the same file under the same subject, no part
+    /// is in both, and they say the same of how many files the post has.
+    fn fills_gaps(&self, other: &UnionFiles) -> bool {
+        if other.conflict || self.conflict {
+            return false;
+        }
+        let mut totals = self.file_totals.union(&other.file_totals);
+        if totals.next().is_some() && totals.next().is_some() {
+            return false;
+        }
+        other.files.iter().all(|(name, o)| match self.files.get(name) {
+            None => true,
+            Some(f) => {
+                f.expected.is_some()
+                    && f.expected == o.expected
+                    && f.subject.is_some()
+                    && f.subject == o.subject
+                    && f.seen.iter().zip(&o.seen).all(|(a, b)| a & b == 0)
+            }
+        })
+    }
+
     fn linked(&self) -> bool {
         let Some((first, rest)) = self.rows.split_first() else { return false };
         let mut reached = first.clone();
@@ -857,6 +979,12 @@ impl UnionFiles {
             && total.is_none_or(|total| self.files.len() as i64 == total + i64::from(self.zero_indexed))
             && self.files.values().all(|f| f.expected.is_some_and(|want| store::is_exactly(&f.seen, want)))
     }
+}
+
+/// A `seen` bitmap without its trailing empty bytes, soo two of different lengths compare by their bits.
+fn trimmed(bits: &[u8]) -> &[u8] {
+    let end = bits.iter().rposition(|b| *b != 0).map_or(0, |at| at + 1);
+    &bits[..end]
 }
 
 /// A subject without the number that changes from part to part: the N in `(N/M)`, or in `[N/M]` for a post where
@@ -1095,7 +1223,7 @@ mod tests {
         let plan: Vec<String> = conn
             .prepare(&format!("explain query plan {}", split_post_sql(0)))
             .unwrap()
-            .query_map(["a.name", "someone"], |r| r.get(3))
+            .query_map(["a.name"], |r| r.get(3))
             .unwrap()
             .collect::<rusqlite::Result<_>>()
             .unwrap();
@@ -1521,5 +1649,124 @@ mod tests {
         assert_eq!(name_source_label(10), Some("the NFO"));
         assert_eq!(name_source_label(100), Some("PreDB"));
         assert_eq!(name_source_label(0), None);
+    }
+
+    /// Every shard attached, as `db::open` does.
+    fn all_shards() -> (tempfile::TempDir, Connection) {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        crate::filters::register_sql(&conn).unwrap();
+        for s in 0..store::SHARDS {
+            let path = dir.path().join(format!("atlas.s{s}.db"));
+            store::create_shard(&path).unwrap();
+            conn.execute(&format!("attach database ?1 as s{s}"), [path.to_string_lossy()]).unwrap();
+        }
+        (dir, conn)
+    }
+
+    /// A row in its group's shard with one file per (name, parts held, of how many).
+    fn put_row(conn: &Connection, id: i64, name: &str, group: &str, poster: &str, files: &[(&str, &[i64], i64)]) {
+        let s = store::shard_of(group);
+        let id = store::global_id(id, s);
+        conn.execute(
+            &format!(
+                "insert into s{s}.releases (id, name, group_name, poster, posted_date, size, complete, parts, file_total)
+                 values (?1, ?2, ?3, ?4, '2026-11-03 07:36:18', ?5, 0, ?6, 2)"
+            ),
+            rusqlite::params![
+                id,
+                name,
+                group,
+                poster,
+                files.iter().map(|f| f.1.len() as i64 * 100).sum::<i64>(),
+                files.iter().map(|f| f.1.len() as i64).sum::<i64>()
+            ],
+        )
+        .unwrap();
+        for (at, (file, parts, of)) in files.iter().enumerate() {
+            let mut bits = vec![0u8; (*of as usize) / 8 + 1];
+            for p in *parts {
+                bits[*p as usize / 8] |= 1 << (*p as usize % 8);
+            }
+            conn.execute(
+                &format!(
+                    "insert into s{s}.files (id, release_id, filename, subject, expected, file_total, seen)
+                     values (?1, ?2, ?3, ?4, ?5, 2, ?6)"
+                ),
+                rusqlite::params![
+                    id * 16 + at as i64,
+                    id,
+                    file,
+                    format!("[{}/2] - \"{file}\" yEnc ({}/{of})", at + 1, parts[0]),
+                    of,
+                    bits
+                ],
+            )
+            .unwrap();
+        }
+    }
+
+    fn row_of(conn: &Connection, id: i64, group: &str) -> crate::search::ReleaseRow {
+        let id = store::global_id(id, store::shard_of(group));
+        let s = store::shard_of(group);
+        let (name, poster): (String, String) = conn
+            .query_row(&format!("select name, poster from s{s}.releases where id = ?"), [id], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        crate::search::ReleaseRow { id, name, group_name: group.into(), poster: Some(poster), ..Default::default() }
+    }
+
+    #[test]
+    fn a_post_with_a_poster_for_each_group_is_one_post() {
+        let (_dir, conn) = all_shards();
+        let name = "Some.Film.2007.2160p.UHD.BluRay.REMUX.DV.HDR.HEVC.Atmos-GRP";
+        let (mkv, vol) = ("Some.Film.mkv", "Some.Film.vol00+01.par2");
+        let (a, b, c, d) = ("alt.binaries.a", "alt.binaries.b", "alt.binaries.c", "alt.binaries.d");
+        // the film's 8 parts across three groups, each with its own poster, and the group b row crossposted to d
+        put_row(&conn, 1, name, a, "x1@nyuu", &[(mkv, &[1, 4, 7], 8), (vol, &[1], 2)]);
+        put_row(&conn, 2, name, b, "x2@nyuu", &[(mkv, &[2, 5, 8], 8), (vol, &[2], 2)]);
+        put_row(&conn, 3, name, c, "x3@nyuu", &[(mkv, &[3, 6], 8)]);
+        put_row(&conn, 4, name, d, "x2@nyuu", &[(mkv, &[2, 5, 8], 8), (vol, &[2], 2)]);
+        let ids: Vec<i64> = [(1, a), (2, b), (3, c)].iter().map(|(i, g)| row_of(&conn, *i, g).id).collect();
+        let mut want = ids.clone();
+        want.sort_unstable();
+        for (i, g) in [(1, a), (2, b), (3, c), (4, d)] {
+            let post = whole_post_with(&conn, &row_of(&conn, i, g)).unwrap().unwrap_or_else(|| panic!("row {i}"));
+            assert_eq!(post.ids, want, "row {i} gets the same answer");
+            assert!(post.complete);
+            assert_eq!(post.groups, [a, b, c, d]);
+        }
+    }
+
+    #[test]
+    fn a_poster_with_two_of_the_groups_still_gets_the_whole_post() {
+        let (_dir, conn) = all_shards();
+        let name = "Some.Show.S01E01.2160p.WEB-DL.DV.HDR.H.265-GRP";
+        let mkv = "Some.Show.S01E01.mkv";
+        let (a, b, c) = ("alt.binaries.a", "alt.binaries.b", "alt.binaries.c");
+        put_row(&conn, 1, name, a, "x1@nyuu", &[(mkv, &[1, 4], 6)]);
+        put_row(&conn, 2, name, b, "x1@nyuu", &[(mkv, &[2, 5], 6)]);
+        put_row(&conn, 3, name, c, "x3@nyuu", &[(mkv, &[3, 6], 6)]);
+        for (i, g) in [(1, a), (2, b), (3, c)] {
+            let post = whole_post_with(&conn, &row_of(&conn, i, g)).unwrap().unwrap();
+            assert_eq!(post.ids.len(), 3, "row {i}");
+        }
+    }
+
+    #[test]
+    fn rows_of_another_poster_join_only_where_they_fill_gaps_under_the_same_subject() {
+        let (_dir, conn) = all_shards();
+        let name = "Some.Film.2007.2160p.UHD.BluRay.REMUX.DV.HDR.HEVC.Atmos-GRP";
+        let mkv = "Some.Film.mkv";
+        let (a, b, c) = ("alt.binaries.a", "alt.binaries.b", "alt.binaries.c");
+        put_row(&conn, 1, name, a, "x1@nyuu", &[(mkv, &[1, 3], 4)]);
+        // a whole upload of its own, by someone else: it has parts the first has too
+        put_row(&conn, 2, name, b, "other@else", &[(mkv, &[1, 2, 3, 4], 4)]);
+        assert_eq!(whole_post_with(&conn, &row_of(&conn, 1, a)).unwrap(), None);
+        assert_eq!(whole_post_with(&conn, &row_of(&conn, 2, b)).unwrap(), None);
+        // the missing parts, but under another subject: not shown to be the same file
+        put_row(&conn, 3, name, c, "x3@nyuu", &[("Some.Film.mp4", &[2, 4], 4)]);
+        assert_eq!(whole_post_with(&conn, &row_of(&conn, 1, a)).unwrap(), None);
     }
 }
