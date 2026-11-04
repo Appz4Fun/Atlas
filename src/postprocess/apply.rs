@@ -641,6 +641,42 @@ mod tests {
     }
 
     #[test]
+    fn net_claims_of_a_shard_run_at_once_on_different_releases() {
+        use crate::postprocess::engine::net_take;
+        let (_dir, conn, _id) = shard();
+        for n in 100..200i64 {
+            conn.execute("insert into pp_state (release_id, net_wanted, net_rank) values (?, 1, ?)", params![n, n % 5])
+                .unwrap();
+        }
+        let claimed = std::sync::Mutex::new(crate::postprocess::engine::NetClaims::default());
+        let order = "net_rank desc, release_id desc";
+        let mut taken = Vec::new();
+        for _ in 0..8 {
+            let ids = net_take(&conn, &claimed, order, 5).unwrap();
+            assert_eq!(ids.len(), 4);
+            taken.extend(ids);
+        }
+        let distinct: std::collections::HashSet<i64> = taken.iter().copied().collect();
+        assert_eq!(distinct.len(), 32, "no release in two claims");
+        assert_eq!(&taken[..4], &[199, 194, 189, 184], "the first claim takes the top of the order");
+        assert!(net_take(&conn, &claimed, order, 5).unwrap().is_empty(), "eight claims at most");
+        claimed.lock().unwrap().give_back(&taken[..4]);
+        assert_eq!(net_take(&conn, &claimed, order, 5).unwrap(), &taken[..4], "given back, they are taken again");
+        // a claim of fewer than NET_BATCH (few were due) still counts as one
+        for ids in taken.chunks(4) {
+            claimed.lock().unwrap().give_back(ids);
+        }
+        conn.execute("update pp_state set net_next_at = 10", []).unwrap();
+        let due = |id: i64| conn.execute("update pp_state set net_next_at = 0 where release_id = ?", [id]).unwrap();
+        for id in 100..108 {
+            due(id);
+            assert_eq!(net_take(&conn, &claimed, order, 5).unwrap(), [id]);
+        }
+        due(108);
+        assert!(net_take(&conn, &claimed, order, 5).unwrap().is_empty(), "eight claims, however few they hold");
+    }
+
+    #[test]
     fn the_net_lane_claims_by_rank_from_an_index() {
         let (_dir, conn, _id) = shard();
         for (claims, order) in [(0, "net_rank desc, release_id desc"), (3, "release_id desc"), (7, "release_id asc")] {
