@@ -28,14 +28,14 @@ const SMALL_BLOB: usize = 1024;
 /// How many times a swap waits out the writers (`db::open_at`'s 30 seconds each)
 /// before its batch is tried again from the start.
 const SWAP_TRIES: usize = 20;
-const BATCH_FILES: usize = 2000;
-const BATCH_BYTES: usize = 32 << 20;
+const BATCH_FILES: usize = 10_000;
+const BATCH_BYTES: usize = 128 << 20;
 /// How long a finished sweep waits before looking for newly sealed files.
-const SWEEP_EVERY: Duration = Duration::from_secs(600);
+const SWEEP_EVERY: Duration = Duration::from_secs(10);
 /// A file stays put this long after its last article. New files are what's still
 /// merged, filtered and deleted, and those want their blob at hand.
-const SETTLE_SECS: i64 = 86_400;
-const RETRY: Duration = Duration::from_secs(30);
+const SETTLE_SECS: i64 = 60;
+const RETRY: Duration = Duration::from_secs(5);
 
 thread_local! {
     static CLIENT: RefCell<Option<(String, Client)>> = const { RefCell::new(None) };
