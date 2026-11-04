@@ -774,7 +774,9 @@ impl Inner {
         a.clear = clear & !(a.set_done | a.set_failed);
         a.queue_at = queue_at;
         if a.clear & net_steps != 0 {
+            // run again from the start: the streak was the old run's
             a.net_next_at = Some(0);
+            a.net_transient = Some(0);
         }
         a.no_state = !row.has_state
             && a.set_done == 0

@@ -181,6 +181,7 @@ fn write(conn: &Connection, mut a: Applied, now: i64, renames: &mut Renames) -> 
         a.net_mask |= a.net_steps & dropped;
         if a.lane == Lane::Net {
             a.net_next_at = Some(0);
+            a.net_transient = Some(0);
         }
     }
     if !a.no_state {
