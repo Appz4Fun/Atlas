@@ -43,10 +43,12 @@ impl NntpError {
         }
     }
 
-    /// an XOVER range with no articles in it: 423, 420 ("No Articles
-    /// Selected"), 430 ("No such article" / "Failed forwarding."), or 403 ("Operation failed")
+    /// an XOVER range with no articles in it: 423, or 420 ("No Articles
+    /// Selected") from some providers. Not 430 ("Failed forwarding") or 403
+    /// ("Operation failed"): those say the server couldn't answer, and a range
+    /// taken for empty is never read again
     pub fn is_empty_range(&self) -> bool {
-        matches!(self.code(), Some(403 | 420 | 423 | 430))
+        matches!(self.code(), Some(420 | 423))
     }
 
     /// 4xx

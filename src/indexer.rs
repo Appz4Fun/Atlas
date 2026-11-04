@@ -918,14 +918,9 @@ fn split_bounds(newest: &Newest, home_oldest: i64, oldest_at: i64, today: i64) -
 /// forever and the split never completes (its sweeps never run). Best
 /// effort: a failure is only logged.
 async fn drop_unkept_days(ctx: &PassContext, db: &Db, group: &str) {
-    let total_conns = ctx.pool.indexing_connections();
-    let first = ctx
-        .pool
-        .indexing_servers()
-        .into_iter()
-        .filter(|&i| total_conns < 50 || ctx.pool.connections(i) * 20 >= total_conns)
-        .map(|i| ctx.states.first_post_day(group, &ctx.pool.host(i)))
-        .min();
+    // every server: a small one can still have the older days, and what this finds gets deleted
+    let first =
+        ctx.pool.indexing_servers().into_iter().map(|i| ctx.states.first_post_day(group, &ctx.pool.host(i))).min();
     // i64::MIN: a server not asked yet (or a while ago)
     let Some(first) = first.filter(|&d| d != i64::MIN) else { return };
     let g = group.to_string();
@@ -1044,7 +1039,8 @@ where
     // this server alone, like a day chunk
     let (_count, first, last, _name) = match ctx.pool.group_on(server, group).await {
         Ok(info) => info,
-        Err(e) if matches!(e.code(), Some(403 | 411 | 430 | 500 | 501)) => {
+        // only 411 says the server doesnt carry it: a 403 or 430 is a failure to retry
+        Err(e) if matches!(e.code(), Some(411 | 500 | 501)) => {
             swept().await?;
             return Err(NotCarried { group: g, host }.into());
         }
@@ -1248,7 +1244,7 @@ where
     // lives, and only a 411 means the server doesnt carry it
     let found = match ctx.pool.group_on(server, group).await {
         Ok(info) => info,
-        Err(e) if matches!(e.code(), Some(403 | 411 | 430 | 500 | 501)) => {
+        Err(e) if matches!(e.code(), Some(411 | 500 | 501)) => {
             // it has no post of it (see `drop_unkept_days`)
             ctx.states.not_carrying(group, &ctx.pool.host(server));
             // if it was noted as going back furthest, the oldest day goes to the next one
