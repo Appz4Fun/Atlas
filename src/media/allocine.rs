@@ -13,7 +13,7 @@ use serde_json::Value;
 
 use crate::config::AllocineConfig;
 
-use super::http::{Client, Memo, Reply, encode};
+use super::http::{Client, Reply, encode};
 use super::query::MAX_TITLE;
 use super::resolve::{Ids, Trouble, imdb_of, int_of};
 use super::title::Kind;
@@ -48,7 +48,6 @@ pub struct Allocine {
     site: String,
     wikidata: Client,
     pages: Client,
-    decoded: Memo<Option<Decoded>>,
 }
 
 impl Allocine {
@@ -60,7 +59,6 @@ impl Allocine {
             pages: Client::new("allocine", &site, cfg.requests_per_minute),
             wikidata_url,
             site,
-            decoded: Memo::new(),
         }
     }
 
@@ -70,19 +68,17 @@ impl Allocine {
     }
 
     /// None: neither knows this id as this kind.
+    /// Nothing is kept here: both answers sit in the raw HTTP cache for its 12 hours, soo a title asked again after
+    /// its miss has waited sees what Wikidata and the page say by then.
     pub fn decode(&self, kind: Kind, id: u64) -> Result<Option<Decoded>, Trouble> {
-        let key = format!("{kind:?}|{id}");
-        if let Some(known) = self.decoded.get(&key) {
-            return Ok(known);
-        }
         let (ids, label) = self.wikidata(kind, id)?;
-        let (page, page_failed) = if label.is_some() && ids.any() {
-            (None, false)
+        let page = if label.is_some() && ids.any() {
+            None
         } else {
             match self.page(kind, id) {
-                Ok(page) => (page, false),
+                Ok(page) => page,
                 // Wikidata's ids are good without the page's name: they aren't held back by it
-                Err(_) if ids.any() => (None, true),
+                Err(_) if ids.any() => None,
                 Err(e) => return Err(e),
             }
         };
@@ -93,10 +89,6 @@ impl Allocine {
             (None, None) if ids.any() => Some(Decoded { title: format!("AC{id}"), year: None, ids }),
             (None, None) => None,
         };
-        // a miss isn't kept here: the title's own miss waits its time, and Wikidata may have it by then
-        if decoded.is_some() && !page_failed {
-            self.decoded.put(&key, decoded.clone());
-        }
         Ok(decoded)
     }
 
