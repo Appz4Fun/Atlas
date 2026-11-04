@@ -68,7 +68,7 @@ impl Column {
 struct Limits {
     /// at most this many releases of a category in a shard, and they are all read and sorted
     few: i64,
-    /// up to this many, reading them all is what's left when walking the column's index finds them too seldom
+    /// how far a category is counted, to tell how far down the column's index its rows should lie
     some: i64,
     /// index entries a walk may pass besides those the category's share says it should
     slack: i64,
@@ -265,10 +265,11 @@ fn shard_top(
         .unwrap_or(0);
     let expected = want.saturating_mul(total.max(in_category)) / in_category.max(1);
     let budget = expected.saturating_mul(4).saturating_add(limits.slack);
+    // a walk that finds the category too seldom gives way to reading the category's own rows: never more than the
+    // category has in the shard, where a walk with no end could pass every release in it
     match walk(conn, s, filter, by, descending, want, Some(budget))? {
         Some(rows) => Ok(rows),
-        None if in_category <= limits.some => read_all(conn, s, filter, by, descending, want),
-        None => walk(conn, s, filter, by, descending, want, None).map(Option::unwrap_or_default),
+        None => read_all(conn, s, filter, by, descending, want),
     }
 }
 
@@ -640,8 +641,8 @@ mod tests {
     const READ_ALL: Limits = Limits { few: i64::MAX, some: i64::MAX, slack: 0, share: 1 };
     /// every shard walks the index, with all the time it needs
     const WALK: Limits = Limits { few: 0, some: 0, slack: i64::MAX / 8, share: 1 };
-    /// a walk gives up at once, and the category is read whole
-    const GIVE_UP: Limits = Limits { few: 0, some: i64::MAX, slack: i64::MIN / 2, share: 1 };
+    /// a walk gives up at once, and the category is read whole, however big it counts
+    const GIVE_UP: Limits = Limits { few: 0, some: 0, slack: i64::MIN / 2, share: 1 };
 
     /// An old, big UHD release, many newer small ones in a parent category, and big ones outside it.
     fn library(f: &Fixture) -> (i64, Vec<i64>) {
