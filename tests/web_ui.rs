@@ -370,6 +370,38 @@ fn the_web_ui_end_to_end() {
     let indexed = fetch(port, "/ui/results?q=Indexed", &cookie);
     assert!(indexed.body.contains("INCOMPLETE") && !indexed.body.contains(" GROUPS"), "{}", indexed.body);
 
+    // hiding incomplete releases goes by what a row shows: the spread post's rows are each incomplete in the database
+    // but whole together, and the bracket-counted one isn't whole
+    let hide = fetch(port, "/ui/results?q=Spread&incomplete=hide", &cookie);
+    assert_eq!(hide.body.matches("Spread.Post.S01E01-GRP</a>").count(), 1, "{}", hide.body);
+    assert!(hide.body.contains("aria-current=\"true\">Hide incomplete<"), "the chip shows it's on: {}", hide.body);
+    assert_eq!(hide.header("HX-Push-Url").as_deref(), Some("/?q=Spread&incomplete=hide"));
+    let kept = hide.header("Set-Cookie").unwrap();
+    assert!(kept.starts_with("atlas_incomplete=hide;") && kept.contains("HttpOnly"), "{kept}");
+    // the cookie keeps it on with no word of it in the url
+    let remembered = format!("{cookie}; atlas_incomplete=hide");
+    let gone = fetch(port, "/ui/results?q=Indexed", &remembered);
+    assert!(!gone.body.contains("Indexed.Post.S01E01-GRP"), "{}", gone.body);
+    assert!(gone.body.contains("Incomplete releases are hidden"), "{}", gone.body);
+    assert!(gone.header("Set-Cookie").is_none(), "nothing new to keep");
+    for browse in ["/ui/results", "/ui/results?sort=name&dir=asc", "/ui/results?sort=size"] {
+        let page = fetch(port, browse, &remembered);
+        assert!(page.body.contains("Spread.Post.S01E01-GRP</a>"), "{browse}: {}", page.body);
+        assert!(
+            !page.body.contains("Indexed.Post.S01E01-GRP") && !page.body.contains("INCOMPLETE"),
+            "{browse}: {}",
+            page.body
+        );
+        assert!(page.body.contains("incomplete hidden"), "{browse}: {}", page.body);
+    }
+    let full = fetch(port, "/", &remembered);
+    assert!(full.body.contains("name=\"incomplete\" value=\"hide\""), "typing keeps it: {}", full.body);
+    // and turning it off drops the cookie
+    let shown = fetch(port, "/ui/results?q=Indexed&incomplete=show", &remembered);
+    assert!(shown.body.contains("Indexed.Post.S01E01-GRP"), "{}", shown.body);
+    assert!(shown.header("Set-Cookie").unwrap().starts_with("atlas_incomplete=; "), "{:?}", shown.header("Set-Cookie"));
+    assert_eq!(shown.header("HX-Push-Url").as_deref(), Some("/?q=Indexed"));
+
     // a multi-file upload split by file across groups and suffix-tainted rows with per-file random posters folds into one whole release
     for (name, group, file_idx, file_name, poster) in [
         ("Heartsplit.1981.2160p-GRP", "alt.binaries.g1", 1, "Heartsplit.1981.2160p-GRP.par2", "a@rand.local"),
