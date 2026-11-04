@@ -849,12 +849,10 @@ impl Inner {
 
     fn net_claim(&self, conn: &Connection, db: &Db, shard: usize) -> anyhow::Result<bool> {
         let now = chrono::Utc::now().timestamp();
-        // new posts are worth most, and every 8th claim keeps history moving
-        let oldest = self.claims[shard].load(Relaxed) % 8 == 7;
-        let order = if oldest { "asc" } else { "desc" };
+        let order = claim_order(self.claims[shard].load(Relaxed));
         let ids: Vec<i64> = conn
             .prepare_cached(&format!(
-                "select release_id from pp_state where net_wanted = 1 and net_next_at <= ?1 order by release_id {order} limit ?2"
+                "select release_id from pp_state where net_wanted = 1 and net_next_at <= ?1 order by {order} limit ?2"
             ))?
             .query_map(params![now, NET_BATCH], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?;
@@ -869,6 +867,29 @@ impl Inner {
             self.net_one(conn, db, shard, id)?;
         }
         Ok(true)
+    }
+
+    /// Gives each release the net lane wants a `net_rank`, newest first, a slice per shard at a time: rows from
+    /// before ranks existed, and the few a rerun adds without a visit. A visit ranks its own release.
+    pub(crate) fn rank_lane(self: Arc<Self>, db: Db) {
+        let mut conns = Conns::new(self.main.clone());
+        while !self.stopping() {
+            let mut ranked = 0usize;
+            for shard in 0..SHARDS {
+                if self.stopping() {
+                    return;
+                }
+                match conns.get(shard).map_err(anyhow::Error::from).and_then(|conn| rank_slice(conn, &db, shard)) {
+                    Ok(n) => ranked += n,
+                    Err(e) => {
+                        println!("processing stage, ranking shard {shard}: {e}");
+                        self.nap(Duration::from_secs(30));
+                    }
+                }
+            }
+            // a slice per shard leaves the writers to saves most of the time
+            self.nap(Duration::from_secs(if ranked == 0 { 60 } else { 1 }));
+        }
     }
 
     /// Run one net step of one release: its attempt is counted first, soo a release
@@ -1197,6 +1218,50 @@ fn seed_shard(conn: &Connection, enabled: StepMask, stamps: &[(u8, StepMask, i64
         if stored != Some(*stamp) {
             set(&key, *stamp)?;
         }
+    }
+    Ok(())
+}
+
+/// The net lane's order for a shard's `claims`-th claim. Mostly by `net_rank`, biggest video first, as the owner
+/// wants movies and TV most; every 8th claim the newest posts whatever their size, and every 8th the oldest, soo
+/// neither waits on a backlog of big ones.
+pub(crate) fn claim_order(claims: i64) -> &'static str {
+    match claims % 8 {
+        7 => "release_id asc",
+        3 => "release_id desc",
+        _ => "net_rank desc, release_id desc",
+    }
+}
+
+/// Releases ranked per slice, at most.
+const RANK_SLICE: i64 = 2_000;
+
+/// Ranks up to `RANK_SLICE` of a shard's unranked releases, newest first, on its writer. Their ids are read here.
+fn rank_slice(conn: &Connection, db: &Db, shard: usize) -> anyhow::Result<usize> {
+    let ids: Vec<i64> = conn
+        .prepare_cached(
+            "select release_id from pp_state where net_wanted = 1 and net_rank is null order by release_id desc limit ?1",
+        )?
+        .query_map([RANK_SLICE], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    let n = ids.len();
+    if n == 0 {
+        return Ok(0);
+    }
+    let answer = db.on_writer(shard, "db.stage.net_rank", Box::new(move |tx| rank_ids(tx, &ids)))?;
+    answer.recv()?.map_err(anyhow::Error::msg)?;
+    Ok(n)
+}
+
+/// Ranks these releases where they are still unranked.
+pub(crate) fn rank_ids(conn: &Connection, ids: &[i64]) -> rusqlite::Result<()> {
+    let sql = format!(
+        "update pp_state set net_rank = {} where release_id = ?1 and net_rank is null",
+        super::schema::NET_RANK
+    );
+    let mut update = conn.prepare_cached(&sql)?;
+    for id in ids {
+        update.execute([id])?;
     }
     Ok(())
 }

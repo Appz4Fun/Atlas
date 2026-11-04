@@ -51,11 +51,32 @@ pub const PP_STATE: ShardTable = ShardTable {
             "create index if not exists pp_state_net on pp_state(release_id, net_next_at) where net_wanted = 1",
         ),
         ("pp_state_failed", "create index if not exists pp_state_failed on pp_state(release_id) where failed != 0"),
+        // the net lane's usual order: biggest video first, newest first within a rank. The unranked are together too,
+        // for `engine::rank_lane`
+        (
+            "pp_state_net_rank",
+            "create index if not exists pp_state_net_rank on pp_state(net_rank desc, release_id desc) where net_wanted = 1",
+        ),
     ],
     release_key: Some("release_id"),
-    // transient net failures in a row (see `engine::transient_wait`), apart from `net_attempts`
-    added: &[("net_transient", "INTEGER")],
+    // transient net failures in a row (see `engine::transient_wait`), apart from `net_attempts`; `net_rank`, see
+    // `NET_RANK`: NULL, not ranked yet
+    added: &[("net_transient", "INTEGER"), ("net_rank", "INTEGER")],
 };
+
+/// How soon the net lane gets to release `?1`, higher first: what the owner wants most is big movies and TV, and a
+/// fully obfuscated upload of one looks like a big release with no category or an Other one until the net lane
+/// reads it. 1 from 1 GiB, 2 from 4 GiB, 3 from 15 GiB (UHD remuxes), 4 from 40 GiB. 0: smaller, or a category
+/// that is neither movies, TV nor Other.
+pub const NET_RANK: &str = "coalesce((select case
+        when c.category is not null and c.category not between 2000 and 2999 and c.category not between 5000 and 5999
+            and c.category not between 8000 and 8999 then 0
+        when r.size >= 42949672960 then 4
+        when r.size >= 16106127360 then 3
+        when r.size >= 4294967296 then 2
+        when r.size >= 1073741824 then 1
+        else 0 end
+    from releases r left join release_category c on c.release_id = r.id where r.id = ?1), 0)";
 
 /// a resumable pass over existing releases, newest first
 pub const PP_WALKS: ShardTable = ShardTable {
