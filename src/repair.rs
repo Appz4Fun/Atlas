@@ -109,15 +109,18 @@ async fn round(
     let found = tokio::task::spawn_blocking(move || db::with_reader(|conn| find(conn, now))).await??;
     let pool = &ctx.pool;
     let (to_read, looked) = plan(&found.posts, PER_ROUND);
-    // a post with nothing to read was looked at; one with windows is marked once all of them were read
+    // a post with nothing to read was looked at; one with windows is marked once all of them were read, right then:
+    // a round can take an hour, and one cut short by a restart had marked nothing, soo the next did it all again
     let posts = &found.posts;
-    let mut tried: Vec<(i64, i64)> = looked
+    let tried: Vec<(i64, i64)> = looked
         .iter()
         .flat_map(|&i| {
             let post = &posts[i];
             post.ids.iter().map(move |id| (*id, post.permille))
         })
         .collect();
+    let days: Vec<(String, i64)> = found.posts.iter().flat_map(|p| p.days.iter().cloned()).collect();
+    mark(db, now, days, tried).await?;
     for post in to_read.iter().map(|&i| &posts[i]) {
         if stopping() {
             break;
@@ -174,9 +177,14 @@ async fn round(
                 }
             }
         }
-        tried.extend(post.ids.iter().map(|id| (*id, post.permille)));
+        mark(db, now, Vec::new(), post.ids.iter().map(|id| (*id, post.permille)).collect()).await?;
     }
-    let days: Vec<(String, i64)> = found.posts.iter().flat_map(|p| p.days.iter().cloned()).collect();
+    Ok(())
+}
+
+/// Asks for `days` of their groups' backfill first, and marks the releases in `tried` as looked at (with the share
+/// their post had).
+async fn mark(db: &Db, now: i64, days: Vec<(String, i64)>, tried: Vec<(i64, i64)>) -> anyhow::Result<()> {
     on_db(db, move |conn| {
         let tx = conn.transaction()?;
         for (group, day) in &days {
