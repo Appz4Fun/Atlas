@@ -416,7 +416,7 @@ impl SplitPost {
 
 /// The most rows a linked upload is read with: a set of a few hundred volumes, each posted on its own, is about the most.
 /// One with more isn't shown as one upload, rather than as part of one.
-const LINKED_ROWS: usize = 1_024;
+pub(crate) const LINKED_ROWS: usize = 1_024;
 
 /// The lead of the upload a row is linked into: by its own link row, or, for a recovery volume in another shard than
 /// the upload's (the stage links within a shard only), by its sealed set, which some volume of the upload's own shard

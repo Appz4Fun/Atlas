@@ -20,7 +20,7 @@ use crate::media::query::MediaAttrs;
 use crate::media::title::Kind;
 use crate::search::{ReleaseRow, get_release};
 use crate::ui::{fmt_date, fmt_size};
-use crate::{release_info, release_tags};
+use crate::{release_info, release_tags, word_index};
 
 const HTMX: &str = include_str!("../assets/htmx-2.0.11.min.js");
 const CSS: &str = include_str!("../assets/web.css");
@@ -219,8 +219,16 @@ struct Search {
     descending: bool,
 }
 
-/// Up to this many results get sorted: the newest or best matching ones.
+/// Up to this many results get sorted, the newest or best matching ones, unless the database orders by the column: then
+/// a window starts with this many of the top ones, and pages past it read a bigger one.
 const SORT_WINDOW: i64 = 2_000;
+/// How far a window grows to fill a page when it also filters on tags, which are read from each name.
+const GROW_WITH_TAGS: i64 = 64_000;
+/// The deepest a ranked window reads: 2,000 pages of Load more. Each shard reads up to this many before they're merged,
+/// soo a url asking for more can't make the server hold eight times a whole database at once.
+const MAX_WINDOW: i64 = 100_000;
+/// Rows kept across every window: past it, the grown windows of searches not used lately go back to their first pages.
+const ROWS_KEPT: usize = 500_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum SortBy {
@@ -272,7 +280,8 @@ fn row_order(
 ) -> std::cmp::Ordering {
     let flip = |o: std::cmp::Ordering| if descending { o.reverse() } else { o };
     match by {
-        SortBy::Name => flip(a.name.to_lowercase().cmp(&b.name.to_lowercase())),
+        // as SQLite's lower(), which only knows ASCII: a sort over a whole category picks its rows that way
+        SortBy::Name => flip(a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase())),
         SortBy::Category => {
             let of =
                 |r: &ReleaseRow| label(categories.get(&r.id).copied().unwrap_or(UNCATEGORIZED)).unwrap_or_default();
@@ -420,12 +429,13 @@ impl Search {
 
     /// Whether the page is cut from the first `SORT_WINDOW` results, sorted or filtered, instead of read by offset.
     fn windowed(&self) -> bool {
-        self.sort.is_some() || self.filters_by_tags()
+        self.sort.is_some() || (self.filters_by_tags() && self.indexed().is_none())
     }
 
     /// Whether a name's tags say what every filter asks.
     fn has_tags(&self, row: &ReleaseRow) -> bool {
-        if !self.filters_by_tags() {
+        // the word index found only what has them
+        if !self.filters_by_tags() || self.indexed().is_some() {
             return true;
         }
         let tags = release_tags::parse(&row.name);
@@ -435,7 +445,7 @@ impl Search {
     /// The rows `has_tags` keeps, in order, until there are `enough`. Reading a name's tags takes about a millisecond,
     /// soo they are read a slice at a time, on every core.
     fn keep_tagged(&self, rows: Vec<ReleaseRow>, enough: usize) -> Vec<ReleaseRow> {
-        if !self.filters_by_tags() {
+        if !self.filters_by_tags() || self.indexed().is_some() {
             return rows;
         }
         let cores = std::thread::available_parallelism().map_or(4, |n| n.get()).min(16);
@@ -457,6 +467,54 @@ impl Search {
         kept
     }
 
+    /// The column a sort reads in from the database over the whole category, best first: with no words and no fields
+    /// asked, for every column but the rating, which comes from the providers and isn't in the database.
+    fn ranked_by(&self) -> Option<crate::sorted::Column> {
+        use crate::sorted::Column;
+        if !self.q.is_empty() || self.fields.any() {
+            return None;
+        }
+        let column = match self.sort? {
+            SortBy::Size => Column::Size,
+            SortBy::Posted => Column::Posted,
+            SortBy::Name => Column::Name,
+            SortBy::Group => Column::Group,
+            SortBy::Category => Column::Category,
+            SortBy::Rating => return None,
+        };
+        // without its index a whole category is read and sorted on every click: the newest are sorted instead
+        crate::sorted::ready(column).then_some(column)
+    }
+
+    /// The word index and the order it reads words in, once it's built: every match ranked, sorted and filtered by tag,
+    /// not the newest few thousand. None: no words, fields (which the database looks up), or no index yet.
+    fn indexed(&self) -> Option<(std::sync::Arc<word_index::WordIndex>, word_index::By)> {
+        use word_index::By;
+        if !word_index::searchable(&self.q) || self.fields.any() {
+            return None;
+        }
+        let by = match self.sort {
+            None | Some(SortBy::Rating) => By::Relevance,
+            Some(SortBy::Size) => By::Size,
+            Some(SortBy::Posted) => By::Posted,
+            Some(SortBy::Name) => By::Name,
+            Some(SortBy::Group) => By::Group,
+            Some(SortBy::Category) => By::Category,
+        };
+        Some((word_index::ready()?, by))
+    }
+
+    /// Whether the rows come in the page's order over all of them, soo a page past the window reads further: a sort
+    /// with no words from the database, and words from their index, but for the rating, which isn't in either.
+    fn in_order(&self) -> bool {
+        self.ranked_by().is_some() || (self.indexed().is_some() && self.sort != Some(SortBy::Rating))
+    }
+
+    /// The tag filters on, as the word index has them.
+    fn tag_filters(&self) -> Vec<&'static str> {
+        self.filters.iter().copied().filter(|f| *f != HIDE_COPIES).collect()
+    }
+
     /// The search itself: one, whatever the filters.
     fn search(
         &self,
@@ -464,6 +522,21 @@ impl Search {
         from: i64,
         count: i64,
     ) -> Result<Vec<ReleaseRow>, String> {
+        if let Some(by) = self.ranked_by() {
+            let mut rows = crate::sorted::top(filter, by, self.descending, from + count).map_err(|e| e.to_string())?;
+            rows.drain(..usize::try_from(from).unwrap_or(0).min(rows.len()));
+            return Ok(rows);
+        }
+        if let Some((index, by)) = self.indexed() {
+            let (from, count) = (usize::try_from(from).unwrap_or(0), usize::try_from(count).unwrap_or(0));
+            let tags = self.tag_filters();
+            return crate::db::with_reader(|conn| {
+                Ok(index.search(conn, &self.q, filter, &tags, by, self.descending, from, count))
+            })
+            .map_err(|e| e.to_string())?
+            .map(|hits| hits.rows)
+            .map_err(|e| e.to_string());
+        }
         if self.fields.any() {
             field_search::find(&self.fields, &self.q, filter, from, count).map_err(|e| e.to_string())
         } else {
@@ -502,17 +575,33 @@ impl Search {
         }
         let filter = parse_filter(&self.cat);
         let windowed = self.windowed();
-        let (from, count) = if windowed { (0, SORT_WINDOW) } else { (self.offset, PAGE_SIZE) };
-        let searched = self.search(filter.as_ref(), from, count);
-        let found = match searched {
-            Ok(found) => found,
-            Err(e) => return self.search_failed(&e),
-        };
-        let read = found.len() as i64;
+        let count =
+            if self.in_order() { SORT_WINDOW.max(self.offset + PAGE_SIZE + 1).min(MAX_WINDOW) } else { SORT_WINDOW };
+        let (from, mut count) = if windowed { (0, count) } else { (self.offset, PAGE_SIZE) };
         let tagged = |r: &ReleaseRow| self.has_tags(r);
         // a sort needs every match in the window, a page only up to one past its end
         let enough = if self.sort.is_some() { usize::MAX } else { (self.offset + PAGE_SIZE) as usize + 1 };
-        let mut found = self.keep_tagged(found, enough);
+        let (mut found, read) = loop {
+            let found = match self.search(filter.as_ref(), from, count) {
+                Ok(found) => found,
+                Err(e) => return self.search_failed(&e),
+            };
+            let read = found.len() as i64;
+            let found = self.keep_tagged(found, enough);
+            // a whole category ranked, with tags leaving too few for the page: read further, as far as a window would
+            let short = (found.len() as i64) <= self.offset + PAGE_SIZE;
+            if windowed
+                && self.ranked_by().is_some()
+                && self.filters_by_tags()
+                && short
+                && read >= count
+                && count < GROW_WITH_TAGS
+            {
+                count = count.saturating_mul(2).min(GROW_WITH_TAGS);
+                continue;
+            }
+            break (found, read);
+        };
         if found.is_empty() {
             return if self.offset == 0 {
                 self.nothing_found()
@@ -673,15 +762,29 @@ impl Search {
     }
 
     fn body_from_window(&self) -> String {
-        let window = match window_of(self) {
-            Ok(window) => window,
-            Err(e) => return self.search_failed(&e),
-        };
         let Some(by) = self.sort else { return String::new() };
-        let (rows, more) = window.page(self, by);
+        let mut at_least = self.offset + PAGE_SIZE + 1;
+        let (rows, more) = loop {
+            let window = match window_of(self, at_least) {
+                Ok(window) => window,
+                Err(e) => return self.search_failed(&e),
+            };
+            let (rows, more) = window.page(self, by);
+            // short of a page past the end of what was read: folded rows or filters left too few, soo read further
+            if more || !window.can_grow(self) {
+                break (rows, more);
+            }
+            at_least = window.asked.saturating_mul(2);
+        };
         if rows.is_empty() {
             return if self.offset == 0 {
                 self.nothing_found()
+            } else if self.offset + PAGE_SIZE >= MAX_WINDOW {
+                format!(
+                    "<tr><td colspan=\"{COLUMNS}\" class=\"note dim\">Paging stops {} results in. Narrow the search to \
+                     see further.</td></tr>",
+                    thousands(MAX_WINDOW)
+                )
             } else {
                 format!("<tr><td colspan=\"{COLUMNS}\" class=\"note dim\">That's all of them.</td></tr>")
             };
@@ -711,7 +814,7 @@ impl Search {
                 "<a href=\"/?{everywhere}\" hx-get=\"/ui/results?{everywhere}\" hx-target=\"#results\">Look in all categories</a>. "
             );
         }
-        if self.filters_by_tags() {
+        if self.filters_by_tags() && self.indexed().is_none() {
             let _ = write!(hint, "The filters look through the first {SORT_WINDOW} results. ");
         }
         if !self.q.is_empty() {
@@ -734,12 +837,17 @@ impl Search {
             }
         }
         let sort = match self.sort {
+            Some(by) if self.in_order() => format!(
+                "By {} {}, over all of them",
+                by.word(),
+                if self.descending { "descending" } else { "ascending" }
+            ),
             Some(by) => format!(
                 "By {} {}, among the first {SORT_WINDOW}",
                 by.word(),
                 if self.descending { "descending" } else { "ascending" }
             ),
-            None if self.filters_by_tags() => format!(
+            None if self.filters_by_tags() && self.indexed().is_none() => format!(
                 "{} first, filtered among the first {SORT_WINDOW}",
                 if self.q.is_empty() { "Newest" } else { "Best or newest matches" }
             ),
@@ -765,11 +873,12 @@ impl Search {
                 escape(&value)
             );
         }
-        // the count goes by words and fields only, soo with tags filtering the page it would count rows it hides
-        let total = if !self.fields.any() || self.filters_by_tags() {
+        // the count goes by words and fields only, soo with tags filtering the page it would count rows it hides; the word
+        // index counts every match, tags and all
+        let total = if self.indexed().is_none() && (!self.fields.any() || self.filters_by_tags()) {
             String::new()
         } else if self.sorts_from_a_window()
-            && let Ok(window) = window_of(self)
+            && let Ok(window) = window_of(self, 0)
         {
             window.total.get_or_init(|| self.total()).clone()
         } else {
@@ -784,6 +893,18 @@ impl Search {
 
     fn total(&self) -> String {
         let filter = parse_filter(&self.cat);
+        if let Some((index, _)) = self.indexed() {
+            return match index.count(&self.q, filter.as_ref(), &self.tag_filters()) {
+                Ok(total) => format!(
+                    "<strong class=\"total\">{}</strong>",
+                    escape(&field_search::Total { count: total as i64, exact: true }.describe())
+                ),
+                Err(e) => {
+                    eprintln!("web count failed: {e}");
+                    String::new()
+                }
+            };
+        }
         match field_search::count_any(&self.fields, std::slice::from_ref(&self.q), filter.as_ref()) {
             Ok(total) => format!("<strong class=\"total\">{}</strong>", escape(&total.describe())),
             Err(e) => {
@@ -801,7 +922,7 @@ const WINDOW_IDLE_FRESH: Duration = Duration::from_secs(15 * 60);
 /// What counts as lately.
 const WINDOW_IN_USE: Duration = Duration::from_secs(10 * 60);
 /// Searches with a window: a filled one is a few MB.
-const WINDOWS_KEPT: usize = 24;
+const WINDOWS_KEPT: usize = 32;
 /// How long a click sorting by size waits for a new window's split posts, the most that a size can depend on. Past it
 /// the page goes by the sizes known so far, and the next click has them all.
 const SIZES_WAIT: Duration = Duration::from_secs(1);
@@ -818,6 +939,8 @@ struct ShownRow {
     size: Option<i64>,
     /// another row stands for its post
     folded: bool,
+    /// the row brought in to show here, for a post whose own row wasn't in the window
+    brings: Option<i64>,
 }
 
 /// The first `SORT_WINDOW` results of one search, whatever the sort, kept in memory: choosing a column only puts these
@@ -838,14 +961,21 @@ struct Window {
     /// bumped, under `shown`, each time rows are kept: a size order read from older sizes isn't kept
     shown_gen: std::sync::atomic::AtomicU64,
     filled: AtomicBool,
+    /// how many results it was read with
+    asked: i64,
+    /// the search had that many, soo it may have more: a sort over a whole category reads a bigger window when a page
+    /// goes past this one
+    more_in_db: bool,
 }
 
 impl Window {
-    fn read(search: &Search) -> Result<Window, String> {
+    fn read(search: &Search, asked: i64) -> Result<Window, String> {
         let filter = parse_filter(&search.cat);
-        let rows = search.search(filter.as_ref(), 0, SORT_WINDOW)?;
+        let rows = search.search(filter.as_ref(), 0, asked)?;
         Ok(Window {
             built: Instant::now(),
+            asked,
+            more_in_db: rows.len() as i64 >= asked,
             rows: search.keep_tagged(rows, usize::MAX),
             categories: OnceLock::new(),
             scores: OnceLock::new(),
@@ -857,6 +987,36 @@ impl Window {
             shown_gen: std::sync::atomic::AtomicU64::new(0),
             filled: AtomicBool::new(false),
         })
+    }
+
+    /// Whether a page that ends past it needs a bigger one: only a sort over a whole category grows.
+    fn can_grow(&self, search: &Search) -> bool {
+        self.more_in_db
+            && self.asked < MAX_WINDOW
+            && search.in_order()
+            && (!search.filters_by_tags() || search.indexed().is_some() || self.asked < GROW_WITH_TAGS)
+    }
+
+    /// Takes in what a smaller window of the same search showed, soo growing it moves nothing already paged past. A
+    /// post brought in where one of its files was stays there once its own row is read in too: that row is folded.
+    fn carry_from(&self, old: &Window) {
+        let places: HashSet<i64> = self.rows.iter().map(|r| r.id).collect();
+        let old_shown = lock(&old.shown);
+        let mut shown = lock(&self.shown);
+        let mut brought = lock(&self.brought);
+        for (&place, row) in old_shown.iter() {
+            if !places.contains(&place) {
+                continue;
+            }
+            let carried = ShownRow { html: row.html.clone(), size: row.size, folded: row.folded, brings: row.brings };
+            shown.insert(place, carried);
+            if let Some(listed) = row.brings.filter(|_| !row.folded) {
+                brought.insert(listed);
+                if places.contains(&listed) {
+                    shown.insert(listed, ShownRow { html: String::new(), size: row.size, folded: true, brings: None });
+                }
+            }
+        }
     }
 
     fn ids(&self) -> Vec<i64> {
@@ -940,11 +1100,14 @@ impl Window {
                     places.push(place);
                     kept.push(shown);
                 }
-                Some(_) => done.push((place, ShownRow { html: String::new(), size: r.size, folded: true })),
+                Some(_) => {
+                    done.push((place, ShownRow { html: String::new(), size: r.size, folded: true, brings: None }))
+                }
             }
         }
         for ((place, r), html) in places.into_iter().zip(&kept).zip(rows_html(&kept, split)) {
-            done.push((place, ShownRow { html, size: r.size, folded: false }));
+            let brings = (r.id != place).then_some(r.id);
+            done.push((place, ShownRow { html, size: r.size, folded: false, brings }));
         }
         self.publish(done);
     }
@@ -1013,7 +1176,9 @@ impl Window {
     /// Renders every row and works out every order, soo no click has any of it left to do.
     fn fill(&self, search: &Search) {
         let shown = lock(&self.shown);
-        let missing: Vec<ReleaseRow> = self.rows.iter().filter(|r| !shown.contains_key(&r.id)).cloned().collect();
+        // the top of a big window: further down a page renders what it reaches
+        let missing: Vec<ReleaseRow> =
+            self.rows.iter().take(SORT_WINDOW as usize).filter(|r| !shown.contains_key(&r.id)).cloned().collect();
         drop(shown);
         let slices: Vec<&[ReleaseRow]> = missing.chunks(PAGE_SIZE as usize).collect();
         let next = std::sync::atomic::AtomicUsize::new(0);
@@ -1085,8 +1250,14 @@ fn still_kept(slot: &Arc<WindowSlot>) -> bool {
 }
 
 fn slot_of(search: &Search, always: bool) -> Arc<WindowSlot> {
-    let plain = Search { offset: 0, sort: None, descending: true, ..search.clone() };
-    let key = plain.query(&plain.cat, 0);
+    // a sort read from the database in its own order has a window of its own; any other reads the newest
+    let plain = if search.in_order() {
+        Search { offset: 0, ..search.clone() }
+    } else {
+        Search { offset: 0, sort: None, descending: true, ..search.clone() }
+    };
+    // by the categories the filter comes to, not how the url spells them: `8000,x1` and `8000,x2` are one window
+    let key = format!("{}|{:?}", plain.query("", 0), parse_filter(&plain.cat));
     let mut windows = lock(&WINDOWS);
     if !windows.contains_key(&key) && windows.len() >= WINDOWS_KEPT {
         let oldest = windows
@@ -1114,22 +1285,38 @@ fn slot_of(search: &Search, always: bool) -> Arc<WindowSlot> {
         .clone()
 }
 
-/// The window to answer with now: the one there is, however old, or a new one when there's none.
-fn window_of(search: &Search) -> Result<Arc<Window>, String> {
+/// The window to answer with now: the one there is, however old, or a new one when there's none or the one there is
+/// was read with fewer than `at_least` results and could have more.
+fn window_of(search: &Search, at_least: i64) -> Result<Arc<Window>, String> {
     let slot = slot_of(search, false);
     *lock(&slot.used) = Instant::now();
-    if let Some(window) = lock(&slot.window).clone() {
+    let big_enough = |w: &Window| w.asked >= at_least || !w.can_grow(search);
+    if let Some(window) = lock(&slot.window).clone()
+        && big_enough(&window)
+    {
         if window.built.elapsed() > WINDOW_FRESH {
             replace_in_background(&slot);
         }
         return Ok(window);
     }
     let _reading = lock(&slot.reading);
-    if let Some(window) = lock(&slot.window).clone() {
-        return Ok(window);
+    let previous = lock(&slot.window).clone();
+    let asked = match &previous {
+        Some(window) if big_enough(window) => return Ok(window.clone()),
+        // twice as many each time, soo paging on reads the database a few times, not a page at a time
+        Some(window) => at_least.max(window.asked.saturating_mul(2)),
+        None => at_least.max(SORT_WINDOW),
     }
-    let window = Arc::new(Window::read(&slot.search)?);
+    .min(MAX_WINDOW);
+    let window = Window::read(&slot.search, asked)?;
+    if let Some(previous) = &previous {
+        window.carry_from(previous);
+    }
+    let window = Arc::new(window);
     *lock(&slot.window) = Some(window.clone());
+    if window.rows.len() > SORT_WINDOW as usize {
+        shrink_others(&slot);
+    }
     // the window answers clicks without it, rendering what a page needs; filled, a click has nothing left to do.
     // Waiting, it holds neither the window nor its slot, soo a window dropped meanwhile is gone, and isn't filled
     if let Some(waiting) = background_turn() {
@@ -1145,6 +1332,24 @@ fn window_of(search: &Search) -> Result<Arc<Window>, String> {
         });
     }
     Ok(window)
+}
+
+/// Past `ROWS_KEPT` rows in all, the grown windows of other searches go, the one used longest ago first. Each is read
+/// again at its first size by the next click or warm-up.
+fn shrink_others(keep: &Arc<WindowSlot>) {
+    let slots: Vec<Arc<WindowSlot>> = lock(&WINDOWS).values().cloned().collect();
+    let rows = |slot: &WindowSlot| lock(&slot.window).as_ref().map_or(0, |w| w.rows.len());
+    let mut total: usize = slots.iter().map(|slot| rows(slot)).sum();
+    let mut grown: Vec<&Arc<WindowSlot>> =
+        slots.iter().filter(|slot| !Arc::ptr_eq(slot, keep) && rows(slot) > SORT_WINDOW as usize).collect();
+    grown.sort_by_key(|slot| *lock(&slot.used));
+    for slot in grown {
+        if total <= ROWS_KEPT {
+            break;
+        }
+        total -= rows(slot);
+        *lock(&slot.window) = None;
+    }
 }
 
 /// Clears `replacing` however the work ends.
@@ -1175,7 +1380,8 @@ fn replace(replacing: Replacing) {
     if !still_kept(slot) {
         return;
     }
-    let Ok(window) = Window::read(&slot.search) else { return };
+    let asked = lock(&slot.window).as_ref().map_or(SORT_WINDOW, |w| w.asked);
+    let Ok(window) = Window::read(&slot.search, asked) else { return };
     window.fill(&slot.search);
     *lock(&slot.window) = Some(Arc::new(window));
 }
@@ -3108,11 +3314,13 @@ mod tests {
             sized: AtomicBool::new(false),
             shown_gen: std::sync::atomic::AtomicU64::new(0),
             filled: AtomicBool::new(false),
+            asked: SORT_WINDOW,
+            more_in_db: false,
         }
     }
 
     fn shown(html: &str, size: i64, folded: bool) -> ShownRow {
-        ShownRow { html: html.into(), size: Some(size), folded }
+        ShownRow { html: html.into(), size: Some(size), folded, brings: None }
     }
 
     #[test]
@@ -3599,6 +3807,69 @@ mod tests {
         let other = s.sort_link(SortBy::Name, "Name");
         assert!(other.contains("sort=name&amp;dir=asc") && !other.contains("▼"), "{other}");
         assert_eq!(thousands(2_684_354_560), "2,684,354,560");
+    }
+
+    #[test]
+    fn a_sort_over_a_category_ranks_all_of_it() {
+        crate::sorted::assume_ready(crate::sorted::Column::Group);
+        // by group, once its shards are ready to rank
+        let size = Search::from_args(&parse_query("cat=2000&sort=group&dir=desc"));
+        assert_eq!(size.ranked_by(), Some(crate::sorted::Column::Group));
+        assert!(size.summary().contains("By group descending, over all of them"), "{}", size.summary());
+        // its own window, not the newest releases': a window for each column and way
+        let asc = Search { descending: false, ..size.clone() };
+        let plain = Search { sort: None, ..size.clone() };
+        let keys: HashSet<String> =
+            [&size, &asc, &plain].iter().map(|s| slot_of(s, false).search.query("2000", 0)).collect();
+        assert_eq!(keys.len(), 3, "{keys:?}");
+        // the rating isn't in the database, and words and fields are ranked by the search
+        for query in ["cat=2000&sort=rating", "q=batman&sort=size", "poster=x&sort=size"] {
+            let s = Search::from_args(&parse_query(query));
+            assert_eq!(s.ranked_by(), None, "{query}");
+            if !s.fields.any() {
+                assert!(s.summary().contains("among the first 2000"), "{query}: {}", s.summary());
+            }
+            assert_eq!(slot_of(&s, false).search.sort, None, "{query}");
+        }
+    }
+
+    #[test]
+    fn only_a_ranked_window_with_more_behind_it_grows() {
+        crate::sorted::assume_ready(crate::sorted::Column::Group);
+        let ranked = Search::from_args(&parse_query("cat=2000&sort=group&dir=desc"));
+        let full = Window { more_in_db: true, ..window_of_rows(Vec::new()) };
+        assert!(full.can_grow(&ranked), "a page past 2000 reads further");
+        assert!(!window_of_rows(Vec::new()).can_grow(&ranked), "all of them were read");
+        let words = Search::from_args(&parse_query("q=batman&sort=size"));
+        assert!(!full.can_grow(&words), "a word search sorts what it found");
+        let tags = Search::from_args(&parse_query("cat=2000&sort=group&filters=DV"));
+        assert!(full.can_grow(&tags));
+        let far = Window { asked: GROW_WITH_TAGS, more_in_db: true, ..window_of_rows(Vec::new()) };
+        assert!(!far.can_grow(&tags), "tags are read a name at a time, soo they stop somewhere");
+        assert!(far.can_grow(&ranked));
+        let spelled = |cat: &str| Search::from_args(&parse_query(&format!("cat={cat}&sort=category")));
+        assert!(Arc::ptr_eq(&slot_of(&spelled("8000,x1"), false), &slot_of(&spelled("8000,x2"), false)));
+        assert!(!Arc::ptr_eq(&slot_of(&spelled("8000"), false), &slot_of(&spelled("2000"), false)));
+        let deepest = Window { asked: MAX_WINDOW, more_in_db: true, ..window_of_rows(Vec::new()) };
+        assert!(!deepest.can_grow(&ranked), "a url can't have a whole database read into memory");
+    }
+
+    #[test]
+    fn a_grown_window_keeps_a_brought_post_where_it_was_shown() {
+        let row = |id: i64| ReleaseRow { id, size: Some(id), ..Default::default() };
+        // the first window showed post 9 in the place of its file 2, before 9's own row was read
+        let old = window_of_rows(vec![row(1), row(2)]);
+        old.publish(vec![
+            (1, shown("<tr>1</tr>", 1, false)),
+            (2, ShownRow { html: "<tr>9</tr>".into(), size: Some(20), folded: false, brings: Some(9) }),
+        ]);
+        let grown = window_of_rows(vec![row(1), row(2), row(9), row(3)]);
+        grown.carry_from(&old);
+        let shown = lock(&grown.shown);
+        assert_eq!(shown[&2].html, "<tr>9</tr>", "still where the earlier page had it");
+        assert!(shown[&9].folded, "its own row, read in now, doesn't show it a second time");
+        assert!(!shown.contains_key(&3), "new rows are rendered when a page reaches them");
+        assert!(lock(&grown.brought).contains(&9));
     }
 
     #[test]

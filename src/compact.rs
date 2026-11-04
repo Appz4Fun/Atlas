@@ -455,6 +455,10 @@ fn compact_shard(
          pragma cache_size = -262144;
          pragma temp_store = memory;
          drop trigger releases_ai; drop trigger releases_ad; drop trigger releases_au;
+         drop trigger uncategorized_added; drop trigger uncategorized_gone;
+         drop trigger uncategorized_categorized; drop trigger uncategorized_uncategorized;
+         drop trigger word_queue_ai; drop trigger word_queue_ad; drop trigger word_queue_au;
+         drop trigger word_queue_ci; drop trigger word_queue_cd; drop trigger word_queue_cu;
          drop index idx_release_unique; drop index idx_release_group; drop index files_key;",
     )?;
     conn.execute("attach database ? as old", [path.to_string_lossy()])?;
@@ -750,6 +754,16 @@ fn compact_shard(
         let cols = copied_columns(&conn, table.name)?;
         conn.execute_batch(&format!("insert into main.{0} ({cols}) select {cols} from old.{0}", table.name))?;
     }
+    // the copy's list of releases with no category, from what it now holds, whether or not the original had one
+    crate::category::uncategorized::fill(&conn)?;
+    // what the word index still has to take in: the ids stay the same
+    conn.execute_batch(
+        "insert into main.word_queue (release_id, n) select release_id, n from old.word_queue;
+         -- and what the copy changed: dropping copies of articles takes their bytes off a release's size
+         insert into main.word_queue (release_id, n)
+         select r.id, 1 from main.releases r join old.releases o on o.id = r.id where r.size is not o.size
+         on conflict (release_id) do update set n = n + 1;",
+    )?;
 
     halt(stop, shard)?;
     say("building indexes and the search index");
@@ -876,6 +890,8 @@ const CORE_TABLES: &[(&str, &str)] = &[
     ("release_ids", "release_id, id_hash, file_id"),
     ("meta", "key, value"),
     ("collections", "key, release_id"),
+    // made again from the copy's releases and categories, as the copy's triggers would
+    ("release_uncategorized", "release_id"),
 ];
 
 /// `table`'s columns in the original, comma joined, for a copy by name. One
@@ -907,7 +923,7 @@ fn refuse_what_wouldnt_be_copied(conn: &Connection, shard: usize) -> Result<()> 
         .query_map([], |r| r.get(0))?
         .collect::<rusqlite::Result<_>>()?;
     for table in &tables {
-        if table == "releases" || registered.iter().any(|t| t.name == table) {
+        if table == "releases" || table == "word_queue" || registered.iter().any(|t| t.name == table) {
             continue;
         }
         let Some((_, known)) = CORE_TABLES.iter().find(|(t, _)| t == table) else {

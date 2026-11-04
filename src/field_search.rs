@@ -16,7 +16,10 @@ const SCAN_LIMIT: i64 = 200_000;
 /// Counting stops here in each shard.
 const COUNT_LIMIT: i64 = 1_000_000;
 const POSTER_INDEX: &str = "idx_release_poster";
-const SIZE_INDEX: &str = "idx_release_size";
+pub(crate) const SIZE_INDEX: &str = "idx_release_size";
+/// For sorting a whole category by when it was posted, or by name.
+pub(crate) const POSTED_INDEX: &str = "idx_release_posted";
+pub(crate) const NAME_INDEX: &str = "idx_release_shown_name";
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Fields {
@@ -122,7 +125,7 @@ impl Total {
     }
 }
 
-fn has_index(conn: &Connection, shard: usize, name: &str) -> bool {
+pub(crate) fn has_index(conn: &Connection, shard: usize, name: &str) -> bool {
     conn.query_row(&format!("select 1 from s{shard}.sqlite_master where type = 'index' and name = ?"), [name], |_| {
         Ok(())
     })
@@ -246,9 +249,10 @@ impl Plan {
 
 /// How to build the optional indexes this shard has, for compaction to build them again.
 pub fn optional_indexes(conn: &Connection) -> rusqlite::Result<Vec<String>> {
-    let mut stmt =
-        conn.prepare("select sql from sqlite_master where type = 'index' and name in (?1, ?2) and sql is not null")?;
-    stmt.query_map([POSTER_INDEX, SIZE_INDEX], |r| r.get(0))?.collect()
+    let mut stmt = conn.prepare(
+        "select sql from sqlite_master where type = 'index' and name in (?1, ?2, ?3, ?4) and sql is not null",
+    )?;
+    stmt.query_map([POSTER_INDEX, SIZE_INDEX, POSTED_INDEX, NAME_INDEX], |r| r.get(0))?.collect()
 }
 
 /// Whether an index can answer this search in this shard.
@@ -354,14 +358,17 @@ fn count_plan(conn: &Connection, fields: &Fields, plan: &Plan) -> Result<Total> 
     Ok(total)
 }
 
-/// `atlas --search-indexes [--apply]`: what lets poster, email and size searches see every release.
+/// `atlas --search-indexes [--apply]`: what lets poster, email and size searches see every release, and a sort by size,
+/// posted date or name walk a big category in order instead of reading all of it.
 pub fn run(args: &[String]) -> i32 {
     let apply = args.iter().any(|a| a == "--apply");
     let main = crate::naming::walk::main_path();
     if !apply {
         for (s, path) in store::shard_paths(&main).iter().enumerate() {
             let size = std::fs::metadata(path).map_or(0, |m| m.len());
-            println!("shard {s}: {path:?}, {size} bytes, would index poster and size");
+            println!(
+                "shard {s}: {path:?}, {size} bytes, would index poster, size, posted date and name, and list what has no category"
+            );
         }
         println!("add --apply to build them");
         return 0;
@@ -378,8 +385,16 @@ pub fn run(args: &[String]) -> i32 {
         let built = db::open_shard(&path).and_then(|conn| {
             conn.execute_batch(&format!(
                 "create index if not exists {POSTER_INDEX} on releases(poster);
-                 create index if not exists {SIZE_INDEX} on releases(size);"
-            ))
+                 create index if not exists {SIZE_INDEX} on releases(size);
+                 create index if not exists {POSTED_INDEX} on releases(posted_date);
+                 create index if not exists {NAME_INDEX} on releases(lower(coalesce(display_name, name)));"
+            ))?;
+            // what a shard from before the list has with no category, which a sort over a category reads
+            if crate::category::uncategorized::listed(&conn, 0) {
+                Ok(())
+            } else {
+                crate::category::uncategorized::fill(&conn)
+            }
         });
         if let Err(e) = built {
             println!("{}: {e}", path.display());

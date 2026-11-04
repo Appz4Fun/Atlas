@@ -870,7 +870,7 @@ mod tests {
 
         let before = changes(&conn);
         conn.execute("update releases set size = 5, parts = 1, complete = 1 where name = 'Some.Thing'", []).unwrap();
-        assert_eq!(changes(&conn) - before, 1, "only the release row changes, no fts rows");
+        assert_eq!(changes(&conn) - before, 2, "the release row and its place in the word index's queue, no fts rows");
 
         conn.execute("update releases set display_name = 'Real.Name' where name = 'Some.Thing'", []).unwrap();
         assert_eq!(hits("\"Real\"*"), 1);

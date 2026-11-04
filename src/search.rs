@@ -337,7 +337,16 @@ fn no_row_cursor_sql(s: usize) -> String {
     )
 }
 
-fn probe_sql(s: usize) -> String {
+/// `no_row_cursor_sql` off the shard's list of them, which holds all of them. Like that cursor, it skips hidden rows
+/// itself, soo they never count towards the merge's rejects
+fn uncategorized_cursor_sql(s: usize) -> String {
+    format!(
+        "select r.id from s{s}.release_uncategorized u cross join s{s}.releases r on r.id = u.release_id
+         where {VISIBLE_RELEASE} order by u.release_id desc"
+    )
+}
+
+pub(crate) fn probe_sql(s: usize) -> String {
     format!("select {COLUMNS} from s{s}.releases r where r.id = ?1 and {VISIBLE_RELEASE}")
 }
 
@@ -361,18 +370,23 @@ pub fn newest_in_categories_with(
     }
     let want = offset + limit;
     let no_row = bounds.no_row.max(4 * want);
-    let mut stmts: Vec<(rusqlite::Statement<'_>, i64)> = Vec::new();
+    let mut stmts: Vec<(rusqlite::Statement<'_>, Option<i64>)> = Vec::new();
     for s in 0..store::SHARDS {
         for &leaf in &f.leaves {
-            stmts.push((conn.prepare(&leaf_cursor_sql(s))?, leaf));
+            stmts.push((conn.prepare(&leaf_cursor_sql(s))?, Some(leaf)));
         }
         if f.uncategorized {
-            stmts.push((conn.prepare(&no_row_cursor_sql(s))?, no_row));
+            // the list of releases with no category is read like a category, as far back as it goes
+            stmts.push(if crate::category::uncategorized::listed(conn, s) {
+                (conn.prepare(&uncategorized_cursor_sql(s))?, None)
+            } else {
+                (conn.prepare(&no_row_cursor_sql(s))?, Some(no_row))
+            });
         }
     }
     let mut cursors = Vec::with_capacity(stmts.len());
     for (stmt, value) in stmts.iter_mut() {
-        cursors.push(stmt.query([*value])?);
+        cursors.push(stmt.query(rusqlite::params_from_iter(value.iter()))?);
     }
     let mut heap = std::collections::BinaryHeap::new();
     for (i, c) in cursors.iter_mut().enumerate() {
@@ -392,7 +406,7 @@ pub fn newest_in_categories_with(
         }
         last = Some(id);
         scanned += 1;
-        // the no-row cursor filters on VISIBLE_RELEASE itself, soo only leaf rows get rejected here
+        // the no-row cursors filter on VISIBLE_RELEASE themselves, soo only leaf rows get rejected here
         let Some(hit) = probes[store::shard_of_id(id)].query_row([id], release_row).optional()? else {
             rejected += 1;
             if rejected > bounds.rejects {
@@ -802,6 +816,22 @@ mod tests {
             8
         };
         assert!(!ids(&f.newest(&filter, 0, 10, &Bounds::DEFAULT)).contains(&id));
+        // hidden rows on the list are skipped by the cursor, not rejected: a few rejects allowed still find what's
+        // past them
+        let visible = f.add("Visible.Row", "alt.binaries.t0", None);
+        let shard = db::open_shard(&store::shard_path(&f.main, store::shard_of(blocked))).unwrap();
+        for i in 0..5 {
+            // newer than it, in the blocked group's shard
+            let id = store::global_id(visible + 100 + i, store::shard_of(blocked));
+            shard
+                .execute(
+                    "insert into releases (id, name, group_name, size, complete, parts) values (?, ?, ?, 1, 1, 1)",
+                    rusqlite::params![id, format!("Blocked.{i}"), blocked],
+                )
+                .unwrap();
+        }
+        let strict = Bounds { rejects: 1, ..Bounds::DEFAULT };
+        assert!(ids(&f.newest(&filter, 0, 10, &strict)).contains(&visible));
     }
 
     #[test]
@@ -815,6 +845,10 @@ mod tests {
         shard.execute("insert into release_category (release_id, category) select id, 5040 from releases where name like 'Cat.%'", []).unwrap();
         let filter = CatFilter { leaves: vec![], uncategorized: true };
         let tight = Bounds { no_row: 100, ..Bounds::DEFAULT };
+        // the shard's list of releases with no category has it, however far back
+        assert_eq!(ids(&f.newest(&filter, 0, 10, &tight)), [old]);
+        // a shard from before the list reads only as far back as the bound
+        shard.execute("delete from meta where key = 'uncategorized_listed'", []).unwrap();
         assert!(f.newest(&filter, 0, 10, &tight).rows.is_empty());
         assert_eq!(ids(&f.newest(&filter, 0, 10, &Bounds::DEFAULT)), [old]);
     }
