@@ -18,7 +18,7 @@ use rusqlite::{Connection, OptionalExtension};
 use tantivy::collector::sort_key::{SortBySimilarityScore, SortByStaticFastValue, SortByString};
 use tantivy::collector::{Collector, Count, TopDocs};
 use tantivy::directory::MmapDirectory;
-use tantivy::query::{AllQuery, BooleanQuery, Occur, Query, RegexQuery, TermQuery, TermSetQuery};
+use tantivy::query::{AllQuery, BooleanQuery, EmptyQuery, Occur, Query, RegexQuery, TermQuery, TermSetQuery};
 use tantivy::schema::{FAST, Field, INDEXED, IndexRecordOption, STRING, Schema, TextFieldIndexing, TextOptions};
 use tantivy::tokenizer::{AsciiFoldingFilter, LowerCaser, RemoveLongFilter, SimpleTokenizer, TextAnalyzer};
 use tantivy::{DocAddress, Index, IndexReader, IndexWriter, Order, ReloadPolicy, Searcher, TantivyDocument, Term};
@@ -92,9 +92,23 @@ fn schema() -> (Schema, Fields) {
     (b.build(), fields)
 }
 
+/// Whether the index can answer a search for `words`: every word in it is one it keeps. Words that are only
+/// punctuation, or one as long as the analyzer drops, go to the database, which matches them as before; read here
+/// they would lose the word and match everything.
+pub fn searchable(words: &str) -> bool {
+    let parts: Vec<&str> = words.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect();
+    !parts.is_empty() && parts.iter().all(|w| w.len() < LONGEST_WORD)
+}
+
+/// a word this long in bytes, or longer, isn't indexed
+const LONGEST_WORD: usize = 64;
+
+/// The deepest a search pages, as the web page's own window: what's past it would have the collector hold it all.
+pub const MAX_HITS: usize = 100_000;
+
 fn analyzer() -> TextAnalyzer {
     TextAnalyzer::builder(SimpleTokenizer::default())
-        .filter(RemoveLongFilter::limit(64))
+        .filter(RemoveLongFilter::limit(LONGEST_WORD))
         .filter(LowerCaser)
         .filter(AsciiFoldingFilter)
         .build()
@@ -369,6 +383,10 @@ impl WordIndex {
         }
         tokens.sort();
         tokens.dedup();
+        // words with nothing in them the index keeps match nothing, not everything in the filter
+        if tokens.is_empty() && !words.trim().is_empty() {
+            return Box::new(EmptyQuery);
+        }
         // each word from its start, as fts5's prefix search: a whole word scores, a longer one only matches
         for token in tokens {
             let exact = TermQuery::new(Term::from_field_text(f.words, &token), IndexRecordOption::WithFreqs);
@@ -411,6 +429,10 @@ impl WordIndex {
         offset: usize,
         limit: usize,
     ) -> anyhow::Result<(Vec<i64>, usize)> {
+        if offset >= MAX_HITS {
+            return Ok((Vec::new(), searcher.search(query, &Count)?));
+        }
+        let limit = limit.min(MAX_HITS - offset);
         let order = if descending { Order::Desc } else { Order::Asc };
         let page = TopDocs::with_limit(limit.max(1)).and_offset(offset);
         let newest = (SortByStaticFastValue::<u64>::for_field("id"), Order::Desc);
@@ -728,6 +750,14 @@ mod tests {
         // newest first among equals, and by name
         let by_name = index.search(&conn, "show", None, &[], By::Name, false, 0, 2).unwrap();
         assert_eq!(ids(&by_name), [newer[0], newer[1]]);
+        // words with nothing the index keeps match nothing here, and go to the database instead
+        assert_eq!(index.count("---", Some(&movies), &[]).unwrap(), 0);
+        assert!(!searchable("---") && !searchable("") && !searchable(&"a".repeat(64)));
+        assert!(searchable("batman 1080p") && searchable(&"a".repeat(63)));
+        // past the deepest page: nothing, and the count still
+        let far = index.search(&conn, "batman", None, &[], By::Relevance, true, usize::MAX / 2, 50).unwrap();
+        assert!(far.rows.is_empty());
+        assert_eq!(far.total, 31);
     }
 
     #[test]

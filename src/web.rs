@@ -490,7 +490,7 @@ impl Search {
     /// not the newest few thousand. None: no words, fields (which the database looks up), or no index yet.
     fn indexed(&self) -> Option<(std::sync::Arc<word_index::WordIndex>, word_index::By)> {
         use word_index::By;
-        if self.q.trim().is_empty() || self.fields.any() {
+        if !word_index::searchable(&self.q) || self.fields.any() {
             return None;
         }
         let by = match self.sort {

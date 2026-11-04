@@ -757,7 +757,13 @@ fn compact_shard(
     // the copy's list of releases with no category, from what it now holds, whether or not the original had one
     crate::category::uncategorized::fill(&conn)?;
     // what the word index still has to take in: the ids stay the same
-    conn.execute_batch("insert into main.word_queue (release_id, n) select release_id, n from old.word_queue")?;
+    conn.execute_batch(
+        "insert into main.word_queue (release_id, n) select release_id, n from old.word_queue;
+         -- and what the copy changed: dropping copies of articles takes their bytes off a release's size
+         insert into main.word_queue (release_id, n)
+         select r.id, 1 from main.releases r join old.releases o on o.id = r.id where r.size is not o.size
+         on conflict (release_id) do update set n = n + 1;",
+    )?;
 
     halt(stop, shard)?;
     say("building indexes and the search index");

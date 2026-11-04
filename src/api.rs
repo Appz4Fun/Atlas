@@ -248,7 +248,7 @@ pub(crate) fn find_releases(
     offset: i64,
     limit: i64,
 ) -> rusqlite::Result<Vec<crate::search::ReleaseRow>> {
-    if !q.trim().is_empty()
+    if crate::word_index::searchable(q)
         && let Some(index) = crate::word_index::ready()
     {
         // every match ranked, not the newest few thousand of each shard

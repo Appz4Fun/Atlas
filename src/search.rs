@@ -337,10 +337,13 @@ fn no_row_cursor_sql(s: usize) -> String {
     )
 }
 
-/// `no_row_cursor_sql` off the shard's list of them, which holds all of them. Like a leaf's, its hidden rows are
-/// rejected as they're read
+/// `no_row_cursor_sql` off the shard's list of them, which holds all of them. Like that cursor, it skips hidden rows
+/// itself, soo they never count towards the merge's rejects
 fn uncategorized_cursor_sql(s: usize) -> String {
-    format!("select release_id from s{s}.release_uncategorized order by release_id desc")
+    format!(
+        "select r.id from s{s}.release_uncategorized u cross join s{s}.releases r on r.id = u.release_id
+         where {VISIBLE_RELEASE} order by u.release_id desc"
+    )
 }
 
 pub(crate) fn probe_sql(s: usize) -> String {
@@ -403,7 +406,7 @@ pub fn newest_in_categories_with(
         }
         last = Some(id);
         scanned += 1;
-        // the no-row cursor filters on VISIBLE_RELEASE itself, soo only leaf and listed rows get rejected here
+        // the no-row cursors filter on VISIBLE_RELEASE themselves, soo only leaf rows get rejected here
         let Some(hit) = probes[store::shard_of_id(id)].query_row([id], release_row).optional()? else {
             rejected += 1;
             if rejected > bounds.rejects {
@@ -813,6 +816,22 @@ mod tests {
             8
         };
         assert!(!ids(&f.newest(&filter, 0, 10, &Bounds::DEFAULT)).contains(&id));
+        // hidden rows on the list are skipped by the cursor, not rejected: a few rejects allowed still find what's
+        // past them
+        let visible = f.add("Visible.Row", "alt.binaries.t0", None);
+        let shard = db::open_shard(&store::shard_path(&f.main, store::shard_of(blocked))).unwrap();
+        for i in 0..5 {
+            // newer than it, in the blocked group's shard
+            let id = store::global_id(visible + 100 + i, store::shard_of(blocked));
+            shard
+                .execute(
+                    "insert into releases (id, name, group_name, size, complete, parts) values (?, ?, ?, 1, 1, 1)",
+                    rusqlite::params![id, format!("Blocked.{i}"), blocked],
+                )
+                .unwrap();
+        }
+        let strict = Bounds { rejects: 1, ..Bounds::DEFAULT };
+        assert!(ids(&f.newest(&filter, 0, 10, &strict)).contains(&visible));
     }
 
     #[test]
