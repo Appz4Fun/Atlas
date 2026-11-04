@@ -284,7 +284,8 @@ pub fn set_media(conn: &Connection, counts: &[(String, i64)]) -> Result<()> {
     tx.commit()
 }
 
-fn media_groups(conn: &Connection) -> Result<std::collections::HashSet<String>> {
+/// The groups of `MEDIA_GROUPS`, most big releases first.
+pub fn media_groups(conn: &Connection) -> Result<Vec<String>> {
     conn.prepare_cached("select grp from backfill_media where releases >= ?1 order by releases desc limit ?2")?
         .query_map(params![MEDIA_MIN, MEDIA_GROUPS as i64], |r| r.get(0))?
         .collect()
@@ -595,7 +596,7 @@ mod tests {
         assert!(got.iter().skip(6).all(|(g, _)| g != "media"));
         // noted again from scratch
         set_media(&c, &[("plain".into(), 30)]).unwrap();
-        assert_eq!(media_groups(&c).unwrap(), ["plain".to_string()].into());
+        assert_eq!(media_groups(&c).unwrap(), ["plain"]);
     }
 
     #[test]

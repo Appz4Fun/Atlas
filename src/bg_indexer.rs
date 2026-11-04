@@ -28,6 +28,8 @@ const FAILED_RETRY: Duration = Duration::from_secs(300);
 const IDLE_RECHECK: Duration = Duration::from_secs(10);
 /// how often config.toml is re-read while indexing
 const CONFIG_RELOAD: Duration = Duration::from_secs(5);
+/// how often the groups big releases come from are read again (`follow_media`)
+const MEDIA_EVERY: Duration = Duration::from_secs(600);
 
 /// how often auto_run_compact compacts the database
 pub const COMPACT_EVERY: Duration = Duration::from_secs(24 * 3600);
@@ -302,6 +304,8 @@ struct Scheduler {
     workers: usize,
     /// round robin position in `groups`, per server
     next: Mutex<HashMap<usize, usize>>,
+    /// the groups big releases come from (`chunks::media_groups`), taken before the round robin's next
+    media: RwLock<Vec<String>>,
     /// groups a worker is on right now
     busy: Mutex<HashSet<String>>,
     /// (group, server) pairs whose day chunks the server leaves alone: for
@@ -359,16 +363,26 @@ impl Scheduler {
 
         failed.retain(|_, since| since.elapsed() < FAILED_RETRY);
         wait.retain(|_, until| *until > now);
+        let free = |g: &String| {
+            !busy.contains(g)
+                && !wait.contains_key(g)
+                && !failed.contains_key(g)
+                && pool.pick_server_in(&tier, g) == server
+        };
+
+        // a group big releases come from goes as soon as it's due, so it keeps up with what's posted while the round
+        // robin goes through all the others; one worker at a time on each, like any group
+        let media = self.media.read().unwrap();
+        if let Some(g) = media.iter().find(|g| groups.contains(g) && free(g)) {
+            busy.insert(g.clone());
+            return Some(g.clone());
+        }
 
         for step in 0..groups.len() {
             let idx = (*next + step) % groups.len();
             let g = &groups[idx];
 
-            if busy.contains(g)
-                || wait.contains_key(g)
-                || failed.contains_key(g)
-                || pool.pick_server_in(&tier, g) != server
-            {
+            if !free(g) {
                 continue;
             }
 
@@ -658,6 +672,17 @@ async fn worker(sched: Arc<Scheduler>, server: usize, db: Db) {
     }
 }
 
+/// Keeps `Scheduler::media` to what the counts say (see `repair::count_media_every`).
+async fn follow_media(sched: Arc<Scheduler>, db: Db) {
+    while !sched.stopping() {
+        match crate::indexer::on_db(&db, |conn| Ok(crate::chunks::media_groups(conn)?)).await {
+            Ok(media) => *sched.media.write().unwrap() = media,
+            Err(e) => ui::warn(&format!("couldnt read which groups big releases come from: {e:#}")),
+        }
+        nap(MEDIA_EVERY, || sched.stopping()).await;
+    }
+}
+
 /// on, database threads, net threads, and whether PreDB's service and the media fan-out run
 type StageShape = (bool, usize, usize, bool, bool);
 
@@ -802,6 +827,7 @@ async fn run_servers(
         plan: plan.clone(),
         workers,
         next: Mutex::new(HashMap::new()),
+        media: RwLock::new(Vec::new()),
         busy: Mutex::new(HashSet::new()),
         skip: Mutex::new(HashMap::new()),
         chunk_errors: Mutex::new(HashMap::new()),
@@ -886,10 +912,11 @@ async fn run_servers(
             tasks.spawn(worker(sched.clone(), server, db.clone()));
         }
     }
-    // which groups the big releases come from, for the backfill to take first
+    // which groups the big releases come from, for the backfill to take first, and the live passes
     {
         let s = sched.clone();
         tasks.spawn(crate::repair::count_media_every(db.clone(), move || s.stopping()));
+        tasks.spawn(follow_media(sched.clone(), db.clone()));
     }
     // parts one server's listing left out, read again from another (see `repair`)
     if sched.ctx.pool.indexing_servers().len() > 1 {
@@ -1240,6 +1267,7 @@ mod tests {
             plan: vec![],
             workers: 2,
             next: Default::default(),
+            media: Default::default(),
             busy: Default::default(),
             skip: Default::default(),
             chunk_errors: Default::default(),
@@ -1254,6 +1282,24 @@ mod tests {
             auto_compact: AtomicBool::new(false),
             passes: AtomicUsize::new(0),
         }
+    }
+
+    /// a group big releases come from is taken whenever it's free, the others in turn
+    #[test]
+    fn groups_big_releases_come_from_go_first() {
+        let pool = Pool::new(&[UsenetServer::new("a.test", "u", "p", 119)]);
+        let groups: Vec<String> = ["a", "b", "c", "m"].iter().map(|g| g.to_string()).collect();
+        let sched = scheduler(pool, groups);
+        *sched.media.write().unwrap() = vec!["m".into(), "gone".into()];
+        let take = || sched.take_group(0);
+        assert_eq!(take().as_deref(), Some("m"));
+        // busy now: the round robin has the rest
+        assert_eq!(take().as_deref(), Some("a"));
+        sched.busy.lock().unwrap().remove("m");
+        assert_eq!(take().as_deref(), Some("m"), "free again, before b");
+        assert_eq!(take().as_deref(), Some("b"));
+        assert_eq!(take().as_deref(), Some("c"));
+        assert_eq!(take(), None, "a group no longer indexed is never taken");
     }
 
     /// a sweep due on a server comes before another group's day chunks
