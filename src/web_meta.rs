@@ -1917,7 +1917,7 @@ fn listing_source(inner: &InnerView) -> Option<String> {
             SOURCE_RAR => Some("the RAR headers"),
             SOURCE_7Z => Some("the 7z headers"),
             SOURCE_ZIP => Some("the ZIP headers"),
-            SOURCE_NZB => Some("the posted NZB"),
+            SOURCE_NZB => Some("an NZB's file list"),
             _ => None,
         })
         .collect();
