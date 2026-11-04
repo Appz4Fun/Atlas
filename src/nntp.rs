@@ -379,6 +379,12 @@ fn refusal(e: &NntpError) -> Refusal {
     }
 }
 
+/// A GROUP reply that says the server lacks the group: 411, or 500/501 from a
+/// server without GROUP. Not 403 or 430, which say it couldnt answer right now.
+pub fn carries_not(e: &NntpError) -> bool {
+    matches!(e.code(), Some(411 | 500 | 501))
+}
+
 /// how long to wait for the end of a compressed stream once its last line arrived
 const STREAM_END_WAIT: Duration = Duration::from_secs(2);
 /// after a failed connect a server is skipped for this long (connect() still tries it)
@@ -2316,12 +2322,16 @@ impl Pool {
     }
 
     /// GROUP on server `prefer`, falling over to an indexing server that
-    /// carries it. Returns the server used.
+    /// carries it. Returns the server used. The server found becomes the
+    /// group's home for as long as the pool lives, soo only a reply that says
+    /// `prefer` lacks the group moves it: 411 (no such group) or 500/501 (no
+    /// GROUP at all). A 403 ("operation failed") or 430 ("failed forwarding")
+    /// says the server couldnt answer just now: it fails this pass, which is
+    /// tried again on the same server, the one whose cursors the group has.
     pub async fn select_group_on(&self, prefer: usize, group: &str) -> Result<(usize, (u64, u64, u64, String))> {
         let first_err = match self.select_on(prefer, group).await {
             Ok(r) => return Ok((prefer, r)),
-            // 403/411/430 = this provider doesnt carry the group, 500/501 = no GROUP at all
-            Err(e) if matches!(e.code(), Some(403 | 411 | 430 | 500 | 501)) => e,
+            Err(e) if carries_not(&e) => e,
             Err(e) => return Err(e),
         };
 

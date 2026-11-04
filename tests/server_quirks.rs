@@ -89,6 +89,32 @@ fn one_rejected_group_doesnt_take_a_server_out() {
     assert_eq!(pool.pool.indexing_servers(), vec![0]);
 }
 
+/// A home server answering GROUP with 403 or 430 (`Failed forwarding`) only
+/// couldnt answer just now: the pass fails and is tried again there, the group
+/// doesnt move to another server (whose cursors it doesnt have). Only 411 moves it.
+#[test]
+fn a_failed_group_reply_doesnt_move_the_group() {
+    let home = Server::new(posts(50));
+    let other = Server::new(posts(50));
+    let (ph, po) = (spawn_server(home.clone()), spawn_server(other.clone()));
+    let pool = BlockingPool::new(&[mock(ph, "secret", 4, 1), mock(po, "secret", 4, 1)]);
+
+    for reply in ["430 Failed forwarding", "403 Operation failed"] {
+        home.group_replies.lock().unwrap().push_back(reply.to_string());
+        let code = reply[..3].parse::<u16>().unwrap();
+        let err = pool.block_on(pool.pool.select_group_on(0, GROUP)).unwrap_err();
+        assert_eq!(err.code(), Some(code), "{reply}: the pass fails with the home's reply");
+        let (server, _) = pool.block_on(pool.pool.select_group_on(0, GROUP)).unwrap();
+        assert_eq!(server, 0, "{reply}: the group stays on its home");
+    }
+    assert!(other.groups_seen.lock().unwrap().is_empty(), "nothing was listed on the other server");
+
+    // a home that lacks the group still hands it over
+    home.group_replies.lock().unwrap().push_back("411 no such group".to_string());
+    let (server, _) = pool.block_on(pool.pool.select_group_on(0, GROUP)).unwrap();
+    assert_eq!(server, 1, "411 moves the group to a server that carries it");
+}
+
 /// A provider answering an empty range with `420 No Articles Selected`
 /// instead of 423: the range is empty, the pass goes on and finishes.
 #[test]

@@ -1043,7 +1043,7 @@ where
     let (_count, first, last, _name) = match ctx.pool.group_on(server, group).await {
         Ok(info) => info,
         // only 411 says the server doesnt carry it: a 403 or 430 is a failure to retry
-        Err(e) if matches!(e.code(), Some(411 | 500 | 501)) => {
+        Err(e) if crate::nntp::carries_not(&e) => {
             swept().await?;
             return Err(NotCarried { group: g, host }.into());
         }
@@ -1247,7 +1247,7 @@ where
     // lives, and only a 411 means the server doesnt carry it
     let found = match ctx.pool.group_on(server, group).await {
         Ok(info) => info,
-        Err(e) if matches!(e.code(), Some(411 | 500 | 501)) => {
+        Err(e) if crate::nntp::carries_not(&e) => {
             // it has no post of it (see `drop_unkept_days`)
             ctx.states.not_carrying(group, &ctx.pool.host(server));
             // if it was noted as going back furthest, the oldest day goes to the next one

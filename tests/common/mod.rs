@@ -79,6 +79,9 @@ pub struct Server {
     /// build each uncompressed listing before sending it, soo the posts
     /// arent locked while a slow client reads (benchmarks with many connections)
     pub buffer_listing: bool,
+    /// replies the next GROUPs get instead of the usual one, like a provider
+    /// answering `430 Failed forwarding` for a while
+    pub group_replies: Mutex<std::collections::VecDeque<String>>,
 }
 
 impl Server {
@@ -113,6 +116,7 @@ impl Server {
             dropped: Default::default(),
             drop_xover_at: Mutex::new(None),
             buffer_listing: false,
+            group_replies: Mutex::new(Default::default()),
         })
     }
 }
@@ -227,6 +231,10 @@ pub fn serve(stream: TcpStream, state: &Server, over_limit: bool) {
             "AUTHINFO" => {
                 let ok = arg == format!("PASS {}", state.password);
                 send(&mut out, if ok { b"281 ok".as_slice() } else { b"481 nope" })
+            }
+            "GROUP" if let Some(reply) = state.group_replies.lock().unwrap().pop_front() => {
+                selected = None;
+                send(&mut out, reply.as_bytes())
             }
             "GROUP" if state.no_group => send(&mut out, b"501 GROUP command error"),
             "GROUP" if state.dropped.load(Ordering::SeqCst) => send(&mut out, b"411 no such group"),
