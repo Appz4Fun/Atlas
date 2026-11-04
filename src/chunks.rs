@@ -248,7 +248,13 @@ pub fn want(conn: &Connection, group: &str, day: i64, now: i64) -> Result<bool> 
 
 /// Atomically claim the newest chunk that is pending or whose claim went
 /// stale, of `groups`: (group, oldest day the server keeps), `i64::MIN` when
-/// any day will do. A day asked for (`want`) goes first.
+/// any day will do. A day asked for (`want`) goes first. The rest go a
+/// calendar month (UTC) at a time, newest month first: every group's days of
+/// one month are done before any group goes back into the month before it,
+/// soo the spare workers fill the recent past across all groups instead of
+/// taking one group all the way back to its oldest day first. Within a month
+/// the groups big releases come from (`media_groups`) go first, then the
+/// newest day.
 pub fn claim(conn: &Connection, groups: &[(String, i64)], host: &str, now: i64) -> Result<Option<Claim>> {
     if groups.is_empty() {
         return Ok(None);
@@ -257,13 +263,7 @@ pub fn claim(conn: &Connection, groups: &[(String, i64)], host: &str, now: i64) 
         return Ok(Some(claim));
     }
     let media = media_groups(conn)?;
-    let first: Vec<(String, i64)> = groups.iter().filter(|(g, _)| media.contains(g)).cloned().collect();
-    if !first.is_empty()
-        && let Some(claim) = claim_newest(conn, &first, host, now)?
-    {
-        return Ok(Some(claim));
-    }
-    claim_newest(conn, groups, host, now)
+    claim_newest(conn, groups, &media, host, now)
 }
 
 /// Groups the big releases the indexer is after mostly come from, at least `MEDIA_MIN` each: their backfill goes
@@ -319,12 +319,20 @@ fn claim_wanted(conn: &Connection, groups: &[(String, i64)], host: &str, now: i6
     Ok(found.map(|(group, day)| Claim { group, day, server: host.to_string(), claimed_at: now }))
 }
 
-fn claim_newest(conn: &Connection, groups: &[(String, i64)], host: &str, now: i64) -> Result<Option<Claim>> {
-    let rows = vec!["(?, ?)"; groups.len()].join(", ");
+/// The chunk `claim` takes after the days asked for: of each group its newest day pending or with a stale claim, then
+/// of those the newest month's (see `claim`), a group of `media` first, the newest day.
+fn claim_newest(
+    conn: &Connection,
+    groups: &[(String, i64)],
+    media: &[String],
+    host: &str,
+    now: i64,
+) -> Result<Option<Claim>> {
+    let rows = vec!["(?, ?, ?)"; groups.len()].join(", ");
     let sql = format!(
-        "with wanted (g, oldest) as (values {rows}),
-              candidates (grp, p_day, s_day) as materialized (
-                  select w.g,
+        "with wanted (g, oldest, media) as (values {rows}),
+              candidates (grp, media, p_day, s_day) as materialized (
+                  select w.g, w.media,
                          (select c.day from backfill_chunks c
                           where c.grp = w.g and c.state = {PENDING} and c.day >= w.oldest
                           order by c.day desc limit 1),
@@ -333,8 +341,8 @@ fn claim_newest(conn: &Connection, groups: &[(String, i64)], host: &str, now: i6
                           order by c.day desc limit 1)
                   from wanted w
               ),
-              best (grp, day) as (
-                  select grp, case
+              best (grp, media, day) as (
+                  select grp, media, case
                       when p_day is null then s_day
                       when s_day is null then p_day
                       when p_day >= s_day then p_day
@@ -343,13 +351,16 @@ fn claim_newest(conn: &Connection, groups: &[(String, i64)], host: &str, now: i6
                   from candidates
               )
          update backfill_chunks set state = ?, server = ?, claimed_at = ?
-         where (grp, day) = (select grp, day from best where day is not null order by day desc limit 1)
+         where (grp, day) = (
+             select grp, day from best where day is not null
+             order by date(day * 86400, 'unixepoch', 'start of month') desc, media desc, day desc limit 1)
          returning grp, day"
     );
-    let mut values: Vec<rusqlite::types::Value> = Vec::with_capacity(groups.len() * 2 + 4);
+    let mut values: Vec<rusqlite::types::Value> = Vec::with_capacity(groups.len() * 3 + 4);
     for (g, oldest) in groups {
         values.push(g.clone().into());
         values.push((*oldest).into());
+        values.push(i64::from(media.contains(g)).into());
     }
     values.push((now - CLAIM_TIMEOUT).into());
     values.extend([CLAIMED.into(), host.to_string().into(), now.into()]);
@@ -579,12 +590,13 @@ mod tests {
     #[test]
     fn the_groups_big_releases_come_from_are_backfilled_first() {
         let c = conn();
-        add(&c, "plain", 20_000, 19_990).unwrap();
-        add(&c, "media", 20_000, 19_990).unwrap();
-        add(&c, "few", 20_000, 19_990).unwrap();
-        let groups: Vec<(String, i64)> = ["plain", "media", "few"].iter().map(|g| (g.to_string(), 19_995)).collect();
+        // days 20_000..=20_010 are 2024-10-04..=14, one month
+        add(&c, "plain", 20_010, 20_000).unwrap();
+        add(&c, "media", 20_010, 20_000).unwrap();
+        add(&c, "few", 20_010, 20_000).unwrap();
+        let groups: Vec<(String, i64)> = ["plain", "media", "few"].iter().map(|g| (g.to_string(), 20_005)).collect();
         // ties go by group name, `media` before `plain`: start where that wouldn't show
-        assert_eq!(claim(&c, &groups, "a", 0).unwrap().unwrap().day, 20_000);
+        assert_eq!(claim(&c, &groups, "a", 0).unwrap().unwrap().day, 20_010);
         set_media(&c, &[("media".into(), 500), ("few".into(), MEDIA_MIN - 1)]).unwrap();
         let mut got = Vec::new();
         while let Some(claim) = claim(&c, &groups, "a", 0).unwrap() {
@@ -597,6 +609,58 @@ mod tests {
         // noted again from scratch
         set_media(&c, &[("plain".into(), 30)]).unwrap();
         assert_eq!(media_groups(&c).unwrap(), ["plain"]);
+    }
+
+    /// the month (`YYYY-MM`, UTC) of a unix day
+    fn month(day: i64) -> String {
+        chrono::DateTime::from_timestamp(day * 86_400, 0).unwrap().format("%Y-%m").to_string()
+    }
+
+    /// Spare workers fill a month of every group before any group goes back into the month before it, a group big
+    /// releases come from first within each month, rather than one group all the way back to its oldest day first.
+    #[test]
+    fn months_are_backfilled_newest_first_over_every_group() {
+        let c = conn();
+        // `deep` (a media group) 2024-08-25..=10-24, `recent` 2024-10-04..=11-03
+        add(&c, "deep", 20_020, 19_960).unwrap();
+        add(&c, "recent", 20_030, 20_000).unwrap();
+        set_media(&c, &[("deep".into(), 500)]).unwrap();
+        let groups: Vec<(String, i64)> = ["deep", "recent"].iter().map(|g| (g.to_string(), i64::MIN)).collect();
+        let mut got = Vec::new();
+        while let Some(claim) = claim(&c, &groups, "a", 0).unwrap() {
+            got.push((claim.group, claim.day));
+        }
+        assert_eq!(got.len(), 61 + 31);
+        // runs of (group, month) in the order they were claimed
+        let mut runs: Vec<(String, String)> = Vec::new();
+        for (g, d) in &got {
+            let run = (g.clone(), month(*d));
+            if runs.last() != Some(&run) {
+                runs.push(run);
+            }
+        }
+        let want: Vec<(String, String)> = [
+            ("recent", "2024-11"),
+            ("deep", "2024-10"),
+            ("recent", "2024-10"),
+            ("deep", "2024-09"),
+            ("deep", "2024-08"),
+        ]
+        .iter()
+        .map(|(g, m)| (g.to_string(), m.to_string()))
+        .collect();
+        assert_eq!(runs, want, "{got:?}");
+        // newest day first within each run
+        assert!(got.windows(2).filter(|w| w[0].0 == w[1].0).all(|w| w[0].1 > w[1].1), "{got:?}");
+        // a stale claim in the newest month is taken over before an older month
+        let c = conn();
+        add(&c, "g", 20_030, 20_026).unwrap();
+        let groups = vec![("g".to_string(), i64::MIN)];
+        let first = claim(&c, &groups, "a", 1000).unwrap().unwrap();
+        assert_eq!(month(first.day), "2024-11");
+        while claim(&c, &groups, "a", 1000).unwrap().is_some_and(|c| month(c.day) == "2024-11") {}
+        let late = claim(&c, &groups, "b", 1000 + CLAIM_TIMEOUT + 1).unwrap().unwrap();
+        assert_eq!(late.day, first.day, "the stale claim of the newest month first");
     }
 
     #[test]
