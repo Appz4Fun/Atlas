@@ -49,6 +49,7 @@ fn pass(media: &Media, db: &Db, key: i64, ids: Ids, stopping: &dyn Fn() -> bool)
             let out = reached.clone();
             let job = db.on_writer(
                 shard,
+                "db.stage.media_fanout",
                 Box::new(move |conn: &Connection| {
                     *out.lock().unwrap() = chunk(conn, key, after, &ids)?;
                     Ok(())

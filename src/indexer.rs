@@ -342,6 +342,8 @@ struct SaveJob {
 pub(crate) type StageWork = Box<dyn FnOnce(&Connection) -> rusqlite::Result<()> + Send>;
 
 pub(crate) struct StageJob {
+    /// what the job is, for its own `atlas_function_duration_seconds` series (`db.stage.*`)
+    kind: &'static str,
     work: StageWork,
     done: std::sync::mpsc::SyncSender<std::result::Result<(), String>>,
 }
@@ -541,14 +543,16 @@ fn run_stage_jobs(
     while let Some(job) = stage.pop_front() {
         let t = std::time::Instant::now();
         let span = crate::metrics::span("db.stage_transaction");
+        let by_kind = crate::metrics::span(job.kind);
         let result = match opened {
             Ok(conn) => stage_transaction(conn, job.work).map_err(|e| e.to_string()),
             Err(e) => Err(format!("couldnt open {}: {e}", path.display())),
         };
         if result.is_err() {
             span.failed();
+            by_kind.failed();
         }
-        drop(span);
+        drop((span, by_kind));
         let _ = job.done.send(result);
         Load::add_since(&LOAD.writer_stage_ns, t);
         Load::add_since(&LOAD.writer_busy_ns, t);
@@ -601,13 +605,17 @@ fn housekeeping(conn: &mut Connection, store: &mut crate::store::ShardWriter, se
 impl Db {
     /// Run `work` in one transaction on `shard`'s writer, between saves. The
     /// answer comes when it has committed; jobs queued when the writer stops still run.
+    /// `kind` (`db.stage.*`) times it apart from the other kinds: one job can hold the writer for minutes.
     pub(crate) fn on_writer(
         &self,
         shard: usize,
+        kind: &'static str,
         work: StageWork,
     ) -> Result<std::sync::mpsc::Receiver<std::result::Result<(), String>>> {
         let (done, answer) = std::sync::mpsc::sync_channel(1);
-        self.saves[shard].send(WriterJob::Stage(StageJob { work, done })).map_err(|_| anyhow!("db writer stopped"))?;
+        self.saves[shard]
+            .send(WriterJob::Stage(StageJob { kind, work, done }))
+            .map_err(|_| anyhow!("db writer stopped"))?;
         Ok(answer)
     }
 
@@ -2846,6 +2854,7 @@ mod tests {
         let answer = db
             .on_writer(
                 0,
+                "db.stage.test",
                 Box::new(|conn| {
                     conn.execute("insert into pp_queue (release_id, due_at) values (1, 2)", [])?;
                     Ok(())
@@ -2868,6 +2877,7 @@ mod tests {
                 let ran = ran.clone();
                 db.on_writer(
                     0,
+                    "db.stage.test",
                     Box::new(move |_| {
                         std::thread::sleep(Duration::from_millis(2));
                         ran.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -2915,6 +2925,7 @@ mod tests {
             .map(|_| {
                 db.on_writer(
                     0,
+                    "db.stage.test",
                     Box::new(|_| {
                         std::thread::sleep(Duration::from_millis(50));
                         Ok(())
@@ -2932,7 +2943,8 @@ mod tests {
     #[test]
     fn queued_stage_jobs_run_before_the_writer_stops() {
         let (_dir, db, _shard) = stage_db();
-        let answers: Vec<_> = (0..50).map(|_| db.on_writer(0, Box::new(|_| Ok(()))).unwrap()).collect();
+        let answers: Vec<_> =
+            (0..50).map(|_| db.on_writer(0, "db.stage.test", Box::new(|_| Ok(()))).unwrap()).collect();
         drop(db);
         for answer in answers {
             answer.recv().unwrap().unwrap();

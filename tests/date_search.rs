@@ -732,6 +732,7 @@ fn a_split_reaches_back_when_a_deeper_server_joins() {
         request_size: 10,
         split_min_backlog: 10,
         chunk_safety: 0,
+        ..Default::default()
     };
     pool.block_on(atlas::indexer::run_pass(&ctx, &settings, &db, GROUP, 0, &mut |_| {})).unwrap();
 
@@ -810,6 +811,7 @@ fn a_split_reaches_back_when_home_no_longer_keeps_its_cursor() {
         request_size: 10,
         split_min_backlog: 10,
         chunk_safety: 0,
+        ..Default::default()
     };
     pool.block_on(atlas::indexer::run_pass(&ctx, &settings, &db, GROUP, 0, &mut |_| {})).unwrap();
 
@@ -860,6 +862,7 @@ fn a_split_reaches_a_carrier_whose_low_mark_lags() {
         request_size: 10,
         split_min_backlog: 10,
         chunk_safety: 0,
+        ..Default::default()
     };
     pool.block_on(atlas::indexer::run_pass(&ctx, &settings, &db, GROUP, 0, &mut |_| {})).unwrap();
 
@@ -911,6 +914,7 @@ fn a_forged_old_date_at_the_cursor_doesnt_split() {
         request_size: 10,
         split_min_backlog: 10,
         chunk_safety: 0,
+        ..Default::default()
     };
     let saved = pool.block_on(atlas::indexer::run_pass(&ctx, &settings, &db, GROUP, 0, &mut |_| {})).unwrap();
 
@@ -958,6 +962,7 @@ fn a_split_redoes_its_oldest_day_when_a_server_goes_back_further_in_it() {
         request_size: 10,
         split_min_backlog: 10,
         chunk_safety: 0,
+        ..Default::default()
     };
     let conn = atlas::db::open_at(&main).unwrap();
     let day0 = atlas::chunks::unix_day(start.timestamp());
