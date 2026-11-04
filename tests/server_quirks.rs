@@ -115,6 +115,42 @@ fn a_failed_group_reply_doesnt_move_the_group() {
     assert_eq!(server, 1, "411 moves the group to a server that carries it");
 }
 
+/// A slice answered with a 5xx (an overview in trouble for a while) is asked
+/// again on the next passes instead of being taken for gone: every article
+/// still gets indexed and the backfill reaches the bottom.
+#[test]
+fn a_refused_slice_is_read_again_later() {
+    let state = Server::new(posts(400));
+    *state.refuse_xover.lock().unwrap() = Some((120, 2));
+    let port = spawn_server(state.clone());
+
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("atlas.db");
+    atlas::db::create_db_at(&db_path).unwrap();
+    let pool = BlockingPool::new(&[mock(port, "secret", 2, 1)]);
+    pool.connect().unwrap();
+    let mut indexer = Indexer::new(pool, "backfill", atlas::db::open_at(&db_path).unwrap());
+    indexer.request_size = 50;
+    let mut failed = 0;
+    for _ in 0..20 {
+        if indexer.index_group(GROUP).is_err() {
+            failed += 1;
+        }
+        if indexer.is_idle(GROUP) {
+            break;
+        }
+    }
+    assert_eq!(failed, 2, "each refusal fails its pass");
+    assert!(state.refuse_xover.lock().unwrap().is_none(), "both refusals were used");
+
+    let conn = atlas::db::open_with_shards(&db_path).unwrap();
+    let (_, articles) = atlas::store::totals(&conn).unwrap();
+    assert_eq!(articles, 400, "the refused slice was read once the server answered");
+    let cursor: i64 =
+        conn.query_row("select backfill_cursor from groups where name = ?", [GROUP], |r| r.get(0)).unwrap();
+    assert_eq!(cursor, 0, "the backfill went all the way down");
+}
+
 /// A provider answering an empty range with `420 No Articles Selected`
 /// instead of 423: the range is empty, the pass goes on and finishes.
 #[test]

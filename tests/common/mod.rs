@@ -82,6 +82,9 @@ pub struct Server {
     /// replies the next GROUPs get instead of the usual one, like a provider
     /// answering `430 Failed forwarding` for a while
     pub group_replies: Mutex<std::collections::VecDeque<String>>,
+    /// the next `.1` XOVERs over a range holding article `.0` answer 503,
+    /// like a provider whose overview is in trouble for a while
+    pub refuse_xover: Mutex<Option<(u64, usize)>>,
 }
 
 impl Server {
@@ -117,6 +120,7 @@ impl Server {
             drop_xover_at: Mutex::new(None),
             buffer_listing: false,
             group_replies: Mutex::new(Default::default()),
+            refuse_xover: Mutex::new(None),
         })
     }
 }
@@ -273,6 +277,16 @@ pub fn serve(stream: TcpStream, state: &Server, over_limit: bool) {
                 state.xovers_in_flight.fetch_sub(1, Ordering::SeqCst);
                 let (a, b) = arg.split_once('-').unwrap();
                 let (a, b): (u64, u64) = (a.parse().unwrap(), b.parse().unwrap());
+                {
+                    let mut refuse = state.refuse_xover.lock().unwrap();
+                    if let Some((at, left)) = *refuse
+                        && (a..=b).contains(&at)
+                    {
+                        *refuse = left.checked_sub(1).filter(|n| *n > 0).map(|n| (at, n));
+                        send(&mut out, b"503 overview database trouble");
+                        continue;
+                    }
+                }
                 {
                     let mut drop_at = state.drop_xover_at.lock().unwrap();
                     if *drop_at == Some(a) {

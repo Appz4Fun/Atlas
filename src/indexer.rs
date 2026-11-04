@@ -60,7 +60,29 @@ pub struct GroupRunState {
     /// the group is noted for good (no expiry): the scheduler skips it for
     /// good too
     pub first_post_days: HashMap<String, (i64, Option<Instant>)>,
+    /// XOVER slices a server refused with a 5xx, still being tried again (see `RunStates::refused`)
+    pub refused: Vec<Refused>,
 }
+
+/// A slice of `key`'s numbers (a cursor key, soo one server's) its server
+/// answered XOVER with a 5xx: when that was first, and how many times since.
+#[derive(Clone, Debug)]
+pub struct Refused {
+    pub key: String,
+    pub start: u64,
+    pub end: u64,
+    pub since: Instant,
+    pub tries: u32,
+}
+
+/// A slice refused with a 5xx is asked again on later passes, and only once it
+/// was refused at least `REFUSED_TRIES` times over at least `REFUSED_FOR` is it
+/// taken for unavailable and passed over: a provider's overview having trouble
+/// for a while must not cost the articles in it for good.
+pub const REFUSED_FOR: Duration = Duration::from_secs(3600);
+pub const REFUSED_TRIES: u32 = 3;
+/// refused slices noted per group at most, the oldest go first
+const REFUSED_KEPT: usize = 64;
 
 /// the days of a split only its deepest server has that are chunks at once
 /// (see `chunks::Speculative`), and the articles a day those done have to
@@ -78,6 +100,7 @@ impl Default for GroupRunState {
             reach_back_after: None,
             keeps_from: HashMap::new(),
             first_post_days: HashMap::new(),
+            refused: Vec::new(),
         }
     }
 }
@@ -144,6 +167,42 @@ impl RunStates {
             .iter()
             .filter_map(|(g, s)| s.keeps_from.get(host).filter(|(_, until)| *until > now).map(|(d, _)| (g.clone(), *d)))
             .collect()
+    }
+
+    /// `start..=end` of `key` (a cursor key of `group`) was refused with a 5xx
+    /// at `now`. True: it has been, for `REFUSED_FOR` and `REFUSED_TRIES` times,
+    /// soo it is passed over now (and forgotten). False: it is asked again later.
+    /// Slice bounds move between passes, soo a refusal overlapping an earlier
+    /// one of the same key counts as the same.
+    pub fn refused(&self, group: &str, key: &str, (start, end): (u64, u64), now: Instant) -> bool {
+        self.with(group, |st| {
+            let same = |r: &Refused| r.key == key && r.start <= end && start <= r.end;
+            let Some(at) = st.refused.iter().position(same) else {
+                if st.refused.len() >= REFUSED_KEPT {
+                    st.refused.remove(0);
+                }
+                st.refused.push(Refused { key: key.to_string(), start, end, since: now, tries: 1 });
+                return false;
+            };
+            let r = &mut st.refused[at];
+            r.tries += 1;
+            (r.start, r.end) = (r.start.min(start), r.end.max(end));
+            let give_up = r.tries >= REFUSED_TRIES && now.saturating_duration_since(r.since) >= REFUSED_FOR;
+            if give_up {
+                st.refused.remove(at);
+            }
+            give_up
+        })
+    }
+
+    /// `start..=end` of `key` was read: refusals of it are over.
+    pub fn read(&self, group: &str, key: &str, (start, end): (u64, u64)) {
+        let mut states = self.0.lock().unwrap();
+        if let Some(st) = states.get_mut(group)
+            && !st.refused.is_empty()
+        {
+            st.refused.retain(|r| !(r.key == key && r.start <= end && start <= r.end));
+        }
     }
 
     /// switching modes starts every group over in the backfill phase
@@ -1666,18 +1725,34 @@ impl Pass<'_> {
             // (or skipped)
             let unsaved = slice.unsaved;
             let headers: Vec<Overview> = match slice.result {
-                Ok(h) => h,
+                Ok(h) => {
+                    self.ctx.states.read(group, &self.key, (slice.start, slice.end));
+                    h
+                }
                 // 423 (or 420) = no articles in that slice
                 Err(e) if e.is_empty_range() => {
+                    self.ctx.states.read(group, &self.key, (slice.start, slice.end));
                     done += 1;
                     finished.add(slice.start, slice.end);
                     continue;
                 }
+                // a 5xx: passed over only once refused for a while (see `REFUSED_FOR`), until then
+                // the slice fails the pass like any other failure and is asked again later
                 Err(e) if e.is_permanent() => {
-                    let code = e.code().unwrap_or(0);
-                    println!("[{kind}] {group} {}-{} not available ({code}), skipping", slice.start, slice.end);
-                    done += 1;
-                    finished.add(slice.start, slice.end);
+                    let range = (slice.start, slice.end);
+                    if self.ctx.states.refused(group, &self.key, range, Instant::now()) {
+                        println!(
+                            "[{kind}] {group} {}-{} refused for over {}m ({e}), skipping",
+                            slice.start,
+                            slice.end,
+                            REFUSED_FOR.as_secs() / 60
+                        );
+                        done += 1;
+                        finished.add(slice.start, slice.end);
+                    } else {
+                        println!("[{kind}] {group} {}-{} refused ({e}), trying it again later", slice.start, slice.end);
+                        error.get_or_insert_with(|| anyhow::Error::new(e));
+                    }
                     continue;
                 }
                 Err(e) => {
@@ -2100,6 +2175,25 @@ impl Indexer {
 mod tests {
     use super::*;
     use crate::parser::Article;
+
+    #[test]
+    fn a_refused_slice_is_passed_over_only_after_an_hour_and_three_refusals() {
+        let states = RunStates::default();
+        let t0 = Instant::now();
+        let refused = |range, at| states.refused("g", "g@a", range, t0 + at);
+        assert!(!refused((100, 199), Duration::ZERO), "the first refusal is tried again");
+        assert!(!refused((100, 199), Duration::from_secs(10)));
+        assert!(!refused((150, 249), Duration::from_secs(20)), "three refusals, but not an hour yet");
+        assert!(!states.refused("g", "g@b", (100, 199), t0 + REFUSED_FOR), "another server's numbers count apart");
+        assert!(!refused((300, 399), REFUSED_FOR), "a range not refused before starts over");
+        assert!(refused((120, 130), REFUSED_FOR), "an hour after the first, overlapping ranges are passed over");
+        assert!(!refused((100, 199), REFUSED_FOR), "and forgotten once passed over");
+
+        // a read in between ends it
+        assert!(!refused((300, 399), REFUSED_FOR + Duration::from_secs(1)));
+        states.read("g", "g@a", (350, 360));
+        assert!(!refused((300, 399), REFUSED_FOR * 3), "read since: counted from the start again");
+    }
 
     #[test]
     fn a_name_lookup_tries_first_segments_only_and_a_few_bodies_at_most() {
