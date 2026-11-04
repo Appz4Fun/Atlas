@@ -87,6 +87,10 @@ pub struct Server {
     pub refuse_xover: Mutex<Option<(u64, usize)>>,
     /// the first XOVER starting at this number sits on its reply for `stall`
     pub stall_at: Mutex<Option<u64>>,
+    /// this many logins are answered "481 Authentication failed" first, the right password or not
+    pub reject_logins: AtomicUsize,
+    /// XFEATURE COMPRESS GZIP asked for
+    pub compress_asked: AtomicUsize,
 }
 
 impl Server {
@@ -124,6 +128,8 @@ impl Server {
             group_replies: Mutex::new(Default::default()),
             refuse_xover: Mutex::new(None),
             stall_at: Mutex::new(None),
+            reject_logins: AtomicUsize::new(0),
+            compress_asked: AtomicUsize::new(0),
         })
     }
 }
@@ -235,6 +241,12 @@ pub fn serve(stream: TcpStream, state: &Server, over_limit: bool) {
                 send(&mut out, b"502 Too many connections.");
                 return;
             }
+            "AUTHINFO"
+                if state.reject_logins.try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok() =>
+            {
+                send(&mut out, b"481 Authentication failed");
+                return;
+            }
             "AUTHINFO" => {
                 let ok = arg == format!("PASS {}", state.password);
                 send(&mut out, if ok { b"281 ok".as_slice() } else { b"481 nope" })
@@ -262,6 +274,7 @@ pub fn serve(stream: TcpStream, state: &Server, over_limit: bool) {
                 send(&mut out, b".");
             }
             "XFEATURE" if state.compress && arg.eq_ignore_ascii_case("COMPRESS GZIP") => {
+                state.compress_asked.fetch_add(1, Ordering::SeqCst);
                 compressed = true;
                 send(&mut out, b"290 feature enabled");
             }

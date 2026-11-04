@@ -308,8 +308,15 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncStream for T {}
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 /// smallest XOVER slice handed to one connection
 const MIN_CHUNK: u64 = 250;
-/// a server whose login was rejected is left alone this long
+/// a server whose login was rejected `AUTH_REFUSALS` times in a row is left alone this long
 const AUTH_REST: Duration = Duration::from_secs(30 * 60);
+/// Rejected logins in a row before `AUTH_REST`; one alone waits `DOWN_FOR` like any failed connect. Some providers
+/// answer a connection limit or a backend hiccup with the same 481/502 text as a bad password, and one such reply
+/// benched the server for 30 minutes.
+const AUTH_REFUSALS: usize = 2;
+/// A server whose compressed headers couldnt be read gets compressed ones asked for again after this long, on
+/// probation: the first unreadable listing turns it off again. Compression stayed off until a restart.
+const COMPRESS_RETRY: Duration = Duration::from_secs(60 * 60);
 
 #[derive(Debug, PartialEq, Eq)]
 enum Refusal {
@@ -1373,6 +1380,8 @@ struct Server {
     no_compress: AtomicBool,
     /// consecutive compressed header failures
     compress_refusals: AtomicUsize,
+    /// when `no_compress` was set (see `COMPRESS_RETRY`)
+    compress_off: Mutex<Option<Instant>>,
     /// server answered GROUP with 500/501: an article only server (fill / bonus),
     /// used for article lookups but not for indexing
     no_index: AtomicBool,
@@ -1380,6 +1389,8 @@ struct Server {
     group_refusals: AtomicUsize,
     /// until when `no_index` holds, and how long the next time does (see `ARTICLE_ONLY_REST`)
     article_only: Mutex<(Option<Instant>, Duration)>,
+    /// logins rejected in a row (see `AUTH_REFUSALS`)
+    auth_refusals: AtomicUsize,
     /// login rejected or limit shrunk messages already printed
     warned_auth: AtomicBool,
     warned_limit: AtomicBool,
@@ -1434,8 +1445,25 @@ impl Drop for Waiting<'_> {
 }
 
 impl Server {
-    fn compress(&self) -> bool {
-        self.cfg.compress.unwrap_or(true) && !self.no_compress.load(Ordering::Relaxed)
+    /// Whether a new connection asks for compressed headers: as configured, unless they couldnt be read lately (see
+    /// `COMPRESS_RETRY`).
+    fn compress(&self, retry: Duration) -> bool {
+        if !self.cfg.compress.unwrap_or(true) {
+            return false;
+        }
+        if !self.no_compress.load(Ordering::Relaxed) {
+            return true;
+        }
+        let mut off = self.compress_off.lock().unwrap();
+        if off.is_some_and(|t| t.elapsed() >= retry) {
+            *off = None;
+            // on probation: one more unreadable listing turns it off again
+            self.compress_refusals.store(GROUP_REFUSALS - 1, Ordering::Relaxed);
+            self.no_compress.store(false, Ordering::Relaxed);
+            println!("{}: asking for compressed headers again", self.cfg.host);
+            return true;
+        }
+        false
     }
 }
 
@@ -1464,6 +1492,14 @@ impl Lease {
 
     fn group(&self) -> Option<&str> {
         self.conn.as_ref().and_then(|c| c.group.as_deref())
+    }
+
+    /// A listing came back whole on this connection: compressed, that clears the server's compression failures
+    /// (a plain one says nothing about them).
+    fn listing_read(&self) {
+        if self.conn.as_ref().is_some_and(|c| c.compressed) {
+            self.server.compress_refusals.store(0, Ordering::Relaxed);
+        }
     }
 
     /// end the request: drop the connection when `r` broke it
@@ -1610,6 +1646,8 @@ pub struct Pool {
     home_retry: Duration,
     /// `LIMIT_HEAL`, shorter in tests
     limit_heal: Duration,
+    /// `COMPRESS_RETRY`, shorter in tests
+    compress_retry: Duration,
     unsaved: Arc<UnsavedBudget>,
     /// how long a background body waits for room before queuing
     body_patience: Duration,
@@ -1790,9 +1828,11 @@ impl Pool {
                         down_until: Mutex::new(None),
                         no_compress: AtomicBool::new(false),
                         compress_refusals: AtomicUsize::new(0),
+                        compress_off: Mutex::new(None),
                         no_index: AtomicBool::new(false),
                         group_refusals: AtomicUsize::new(0),
                         article_only: Mutex::new((None, ARTICLE_ONLY_REST)),
+                        auth_refusals: AtomicUsize::new(0),
                         warned_auth: AtomicBool::new(false),
                         warned_limit: AtomicBool::new(false),
                         limit: AtomicUsize::new(cfg.connections().max(1) as usize),
@@ -1812,6 +1852,7 @@ impl Pool {
             misses: Mutex::new(HashMap::new()),
             home_retry: HOME_RETRY,
             limit_heal: LIMIT_HEAL,
+            compress_retry: COMPRESS_RETRY,
             body_patience: BODY_PATIENCE,
             unsaved: UnsavedBudget::new(crate::config::DEFAULT_MAX_UNSAVED_HEADERS as usize),
             rate_limiter: Arc::new(TokenBucket::new(0, 0)),
@@ -1830,6 +1871,12 @@ impl Pool {
     /// how long a group stays off a home it left before going back (`HOME_RETRY`)
     pub fn with_home_retry(mut self, after: Duration) -> Self {
         self.home_retry = after;
+        self
+    }
+
+    /// how long compressed headers stay off after they couldnt be read (`COMPRESS_RETRY`)
+    pub fn with_compress_retry(mut self, after: Duration) -> Self {
+        self.compress_retry = after;
         self
     }
 
@@ -2155,7 +2202,7 @@ impl Pool {
         }
 
         let connecting = crate::metrics::span("nntp.connect");
-        let opened = Conn::open(&server.cfg, self.timeout, server.compress()).await;
+        let opened = Conn::open(&server.cfg, self.timeout, server.compress(self.compress_retry)).await;
         let connects = |result: &'static str| {
             crate::metrics::names::NNTP_CONNECTS.inc(&[("server", server.key.as_str()), ("result", result)], 1);
         };
@@ -2164,6 +2211,7 @@ impl Pool {
                 conn.set_rate_limiter(self.rate_limiter.clone());
                 connects("ok");
                 *server.down_until.lock().unwrap() = None;
+                server.auth_refusals.store(0, Ordering::Relaxed);
                 {
                     // a step back up held; at the configured count, the next lowering waits the shortest again
                     let mut heal = server.heal.lock().unwrap();
@@ -2202,6 +2250,11 @@ impl Pool {
                     println!("{}: provider refused more connections ({e}), lowering to {now} for now", server.cfg.host);
                 }
                 Ok(None)
+            }
+            Refusal::Auth if server.auth_refusals.fetch_add(1, Ordering::Relaxed) + 1 < AUTH_REFUSALS => {
+                // once could be a limit or a hiccup worded like a bad login: a short rest, like any failed connect
+                *server.down_until.lock().unwrap() = Some(Instant::now() + DOWN_FOR);
+                Err(e)
             }
             Refusal::Auth => {
                 *server.down_until.lock().unwrap() = Some(Instant::now() + AUTH_REST);
@@ -2564,7 +2617,7 @@ impl Pool {
         crate::profile::LOAD.xovers.fetch_add(1, Ordering::Relaxed);
         match r {
             Ok(ends) => {
-                lease.server.compress_refusals.store(0, Ordering::Relaxed);
+                lease.listing_read();
                 lease.server.headers.fetch_add(ends.rows as u64, Ordering::Relaxed);
                 // the rest of a listing cut short is still coming: the lease
                 // stays busy, soo the connection is thrown away
@@ -2871,6 +2924,7 @@ impl Pool {
         let refusals = server.compress_refusals.fetch_add(1, Ordering::Relaxed) + 1;
         if server.headers.load(Ordering::Relaxed) == 0 || refusals >= GROUP_REFUSALS {
             if !server.no_compress.swap(true, Ordering::Relaxed) {
+                *server.compress_off.lock().unwrap() = Some(Instant::now());
                 println!("{}: couldnt read compressed headers ({e}), turning compression off", server.cfg.host);
             }
             server.idle.lock().unwrap().retain(|c| !c.compressed);
@@ -2908,7 +2962,7 @@ impl Pool {
         crate::profile::Load::add_since(&crate::profile::LOAD.xover_ns, sent);
         crate::profile::LOAD.xovers.fetch_add(1, Ordering::Relaxed);
         if let Ok(rows) = &r {
-            lease.server.compress_refusals.store(0, Ordering::Relaxed);
+            lease.listing_read();
             lease.server.headers.fetch_add(rows.len() as u64, Ordering::Relaxed);
         }
         lease.check(r)
@@ -2926,7 +2980,7 @@ impl Pool {
                 let down = s.down_until.lock().unwrap().is_some_and(|t| Instant::now() < t);
                 let state = if s.no_index.load(Ordering::Relaxed) {
                     "article only"
-                } else if down && s.warned_auth.load(Ordering::Relaxed) {
+                } else if down && s.auth_refusals.load(Ordering::Relaxed) >= AUTH_REFUSALS {
                     "login rejected"
                 } else if down {
                     "resting"
