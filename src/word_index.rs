@@ -106,6 +106,29 @@ const LONGEST_WORD: usize = 64;
 /// The deepest a search pages, as the web page's own window: what's past it would have the collector hold it all.
 pub const MAX_HITS: usize = 100_000;
 
+/// Postings the words a search word starts may hold, all told, for it to match them too: past it, the word alone.
+const PREFIX_POSTINGS: u64 = 200_000;
+
+/// How many postings the words starting with `token` hold across the index, counting no further than `cap`: walks
+/// the term dictionaries, never a posting list, and stops at `cap` terms at the most, each holding one or more.
+fn prefix_postings(searcher: &Searcher, field: Field, token: &str, cap: u64) -> u64 {
+    // no word's UTF-8 has the byte 0xFF, soo every word starting with `token` sorts below this
+    let mut past = token.as_bytes().to_vec();
+    past.push(0xFF);
+    let mut total = 0u64;
+    for segment in searcher.segment_readers() {
+        let Ok(inverted) = segment.inverted_index(field) else { return cap };
+        let Ok(mut terms) = inverted.terms().range().ge(token.as_bytes()).lt(&past).into_stream() else { return cap };
+        while terms.advance() {
+            total = total.saturating_add(u64::from(terms.value().doc_freq));
+            if total >= cap {
+                return cap;
+            }
+        }
+    }
+    total
+}
+
 fn analyzer() -> TextAnalyzer {
     TextAnalyzer::builder(SimpleTokenizer::default())
         .filter(RemoveLongFilter::limit(LONGEST_WORD))
@@ -420,7 +443,13 @@ impl WordIndex {
     }
 
     fn query(&self, words: &str, filter: Option<&CatFilter>, tags: &[&str]) -> Box<dyn Query> {
+        self.query_with(words, filter, tags, PREFIX_POSTINGS)
+    }
+
+    /// `query`, where a word is matched from its start only while the words it starts hold fewer than `cap` postings.
+    fn query_with(&self, words: &str, filter: Option<&CatFilter>, tags: &[&str], cap: u64) -> Box<dyn Query> {
         let f = &self.fields;
+        let searcher = self.reader.searcher();
         let mut must: Vec<(Occur, Box<dyn Query>)> = Vec::new();
         let mut tokens = Vec::new();
         let mut analyzer = analyzer();
@@ -434,16 +463,21 @@ impl WordIndex {
         if tokens.is_empty() && !words.trim().is_empty() {
             return Box::new(EmptyQuery);
         }
-        // each word from its start, as fts5's prefix search: a whole word scores, a longer one only matches
+        // each word from its start, as fts5's prefix search: a whole word scores, a longer one only matches. A start
+        // so common that reading every word it starts would be the work of seconds, as `a` is, is the word alone, as
+        // the database's search takes a common word
         for token in tokens {
             let exact = TermQuery::new(Term::from_field_text(f.words, &token), IndexRecordOption::WithFreqs);
             let pattern = format!("{}.*", regex_escape(&token));
-            let either: Box<dyn Query> = match RegexQuery::from_pattern(&pattern, f.words) {
-                Ok(prefix) => Box::new(BooleanQuery::new(vec![
+            let prefix = (prefix_postings(&searcher, f.words, &token, cap) < cap)
+                .then(|| RegexQuery::from_pattern(&pattern, f.words).ok())
+                .flatten();
+            let either: Box<dyn Query> = match prefix {
+                Some(prefix) => Box::new(BooleanQuery::new(vec![
                     (Occur::Should, Box::new(exact) as Box<dyn Query>),
                     (Occur::Should, Box::new(prefix)),
                 ])),
-                Err(_) => Box::new(exact),
+                None => Box::new(exact),
             };
             must.push((Occur::Must, either));
         }
@@ -804,6 +838,15 @@ mod tests {
         assert_eq!(index.count("---", Some(&movies), &[]).unwrap(), 0);
         assert!(!searchable("---") && !searchable("") && !searchable(&"a".repeat(64)));
         assert!(searchable("batman 1080p") && searchable(&"a".repeat(63)));
+        // a start too common to read every word of is the word alone: `bat` starts 31 releases' words and is none
+        let count_with = |words: &str, cap| {
+            index.reader.searcher().search(index.query_with(words, None, &[], cap).as_ref(), &Count).unwrap()
+        };
+        assert_eq!(prefix_postings(&index.reader.searcher(), index.fields.words, "bat", 100), 31);
+        assert_eq!(prefix_postings(&index.reader.searcher(), index.fields.words, "bat", 5), 5);
+        assert_eq!(count_with("bat", 100), 31);
+        assert_eq!(count_with("bat", 5), 0);
+        assert_eq!(count_with("batman", 5), 31, "the word itself is still found");
         // past the deepest page: nothing, and the count still
         let far = index.search(&conn, "batman", None, &[], By::Relevance, true, usize::MAX / 2, 50).unwrap();
         assert!(far.rows.is_empty());

@@ -6,7 +6,8 @@
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
-use std::time::Instant;
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 use rusqlite::{Connection, OptionalExtension};
 
@@ -74,9 +75,12 @@ struct Limits {
     slack: i64,
     /// the fewest rows a shard is asked for first
     share: i64,
+    /// how long a shard's linked uploads, biggest first, are kept before they're read again
+    linked_for: Duration,
 }
 
-const LIMITS: Limits = Limits { few: 20_000, some: 200_000, slack: 50_000, share: 256 };
+const LIMITS: Limits =
+    Limits { few: 20_000, some: 200_000, slack: 50_000, share: 256, linked_for: Duration::from_secs(60) };
 
 /// How long a look for the indexes is believed: `--search-indexes` adds them while Atlas runs.
 const INDEXES_CHECKED_FOR: std::time::Duration = std::time::Duration::from_secs(60);
@@ -157,7 +161,7 @@ fn top_with(
                         let conn = open()?;
                         let mut rows = shard_top(&conn, s, filter, by, descending, ask, limits)?;
                         let whole = if by == Column::Size && descending {
-                            linked_sizes(&conn, s, filter, &mut rows, ask)?
+                            linked_sizes(&conn, s, filter, &mut rows, ask, limits.linked_for)?
                         } else {
                             HashMap::new()
                         };
@@ -394,6 +398,7 @@ fn linked_sizes(
     filter: Option<&CatFilter>,
     rows: &mut Vec<ReleaseRow>,
     want: i64,
+    linked_for: Duration,
 ) -> Result<HashMap<i64, i64>> {
     // a shard that hasn't got the table yet has linked nothing
     let Ok(mut lead_of) = conn.prepare(&format!("select lead_id from s{s}.upload_link where release_id = ?1")) else {
@@ -437,20 +442,31 @@ fn linked_sizes(
         Some(f) if !f.uncategorized => format!("c.category in ({})", list(&f.leaves)),
         Some(f) => format!("(c.category in ({}) or c.release_id is null)", list(&f.leaves)),
     };
-    let bigger = format!(
-        "select l.lead_id, sum(coalesce(r.size, 0)) as total,
-                (select max(r.id) from s{s}.upload_link m join s{s}.releases r on r.id = m.release_id
-                 left join s{s}.release_category c on c.release_id = r.id
-                 where m.lead_id = l.lead_id and {VISIBLE_RELEASE} and {clause}) as newest
-         from s{s}.upload_link l join s{s}.releases r on r.id = l.release_id
-         group by l.lead_id
-         having count(*) between 2 and {LINKED_ROWS} and total >= ?1
-            and exists (select 1 from s{s}.releases x where x.id = l.lead_id)
-            and newest is not null
-         order by total desc, newest desc limit ?2"
-    );
-    let leads: Vec<(i64, i64)> =
-        conn.prepare(&bigger)?.query_map([cutoff, want], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_>>()?;
+    let mut newest = conn.prepare(&format!(
+        "select max(r.id) from s{s}.upload_link m join s{s}.releases r on r.id = m.release_id
+         left join s{s}.release_category c on c.release_id = r.id
+         where m.lead_id = ?1 and {VISIBLE_RELEASE} and {clause}"
+    ))?;
+    // the shard's uploads biggest first, as last summed: each one taken is summed again, soo only what's linked since
+    // can be missing from the order, never a size that's wrong
+    let mut leads: Vec<(i64, i64, i64)> = Vec::new();
+    for &(lead, was) in linked_by_size(conn, s, linked_for)?.iter() {
+        if was < cutoff || (leads.len() as i64 >= want && leads.last().is_some_and(|&(_, total, _)| was < total)) {
+            break;
+        }
+        let Some(total) = total_of.query_row([lead], |r| r.get::<_, Option<i64>>(0)).optional()?.flatten() else {
+            continue;
+        };
+        if total < cutoff {
+            continue;
+        }
+        if let Some(id) = newest.query_row([lead], |r| r.get::<_, Option<i64>>(0))? {
+            leads.push((lead, total, id));
+        }
+    }
+    leads.sort_by(|a, b| b.1.cmp(&a.1).then(b.2.cmp(&a.2)));
+    leads.truncate(usize::try_from(want).unwrap_or(usize::MAX));
+    let leads: Vec<(i64, i64)> = leads.into_iter().map(|(lead, total, _)| (lead, total)).collect();
     let mut members = conn.prepare(&format!("select release_id from s{s}.upload_link where lead_id = ?1"))?;
     let mut category = conn.prepare(&format!("select category from s{s}.release_category where release_id = ?1"))?;
     let mut probe = conn.prepare(&probe_sql(s))?;
@@ -495,6 +511,39 @@ fn linked_sizes(
         }
     }
     Ok(whole)
+}
+
+/// Each shard's linked uploads, biggest first, by its file: one read at a time for a shard, and kept a while.
+type LinkedBySize = Arc<Vec<(i64, i64)>>;
+type LinkedSlot = Arc<Mutex<Option<(Instant, LinkedBySize)>>>;
+static LINKED: LazyLock<Mutex<HashMap<String, LinkedSlot>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Shard `s`'s linked uploads, as `(lead, whole size)` biggest first, as `linked_post_with` counts them. Summing them
+/// all reads every link, soo it's done once for every request in `fresh`, one request at a time for the shard.
+fn linked_by_size(conn: &Connection, s: usize, fresh: Duration) -> Result<LinkedBySize> {
+    let read = || -> Result<LinkedBySize> {
+        let sql = format!(
+            "select l.lead_id, sum(coalesce(r.size, 0)) as total
+             from s{s}.upload_link l join s{s}.releases r on r.id = l.release_id
+             group by l.lead_id
+             having count(*) between 2 and {LINKED_ROWS} and exists (select 1 from s{s}.releases x where x.id = l.lead_id)
+             order by total desc"
+        );
+        Ok(Arc::new(conn.prepare(&sql)?.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_>>()?))
+    };
+    if fresh.is_zero() {
+        return read();
+    }
+    let file: String =
+        conn.query_row("select file from pragma_database_list where name = ?1", [format!("s{s}")], |r| r.get(0))?;
+    let slot = LINKED.lock().unwrap_or_else(|e| e.into_inner()).entry(file).or_default().clone();
+    let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, leads)) = slot.as_ref().filter(|(at, _)| at.elapsed() < fresh) {
+        return Ok(leads.clone());
+    }
+    let leads = read()?;
+    *slot = Some((Instant::now(), leads.clone()));
+    Ok(leads)
 }
 
 /// A category read as far back as it goes: a sort over all of it can't stop at its newest releases.
@@ -638,11 +687,11 @@ mod tests {
     const HD: i64 = 2040;
     const TV_HD: i64 = 5040;
     /// every shard reads its category whole
-    const READ_ALL: Limits = Limits { few: i64::MAX, some: i64::MAX, slack: 0, share: 1 };
+    const READ_ALL: Limits = Limits { few: i64::MAX, some: i64::MAX, slack: 0, share: 1, linked_for: Duration::ZERO };
     /// every shard walks the index, with all the time it needs
-    const WALK: Limits = Limits { few: 0, some: 0, slack: i64::MAX / 8, share: 1 };
+    const WALK: Limits = Limits { few: 0, some: 0, slack: i64::MAX / 8, share: 1, linked_for: Duration::ZERO };
     /// a walk gives up at once, and the category is read whole, however big it counts
-    const GIVE_UP: Limits = Limits { few: 0, some: 0, slack: i64::MIN / 2, share: 1 };
+    const GIVE_UP: Limits = Limits { few: 0, some: 0, slack: i64::MIN / 2, share: 1, linked_for: Duration::ZERO };
 
     /// An old, big UHD release, many newer small ones in a parent category, and big ones outside it.
     fn library(f: &Fixture) -> (i64, Vec<i64>) {
@@ -715,6 +764,15 @@ mod tests {
                 assert_eq!(up, [small], "indexed {indexed}");
             }
         }
+        // the shard's uploads summed once, and taken from there while they're fresh
+        let kept = Limits { linked_for: Duration::from_secs(600), ..WALK };
+        assert_eq!(f.top(Some(&movies), Column::Size, true, 2, kept), [piece, lead]);
+        let conn = db::open_with_shards(&f.main).unwrap();
+        let s = store::shard_of(group);
+        let once = linked_by_size(&conn, s, kept.linked_for).unwrap();
+        assert_eq!(*once, [(lead, 8_000)]);
+        assert!(Arc::ptr_eq(&once, &linked_by_size(&conn, s, kept.linked_for).unwrap()));
+        assert!(!Arc::ptr_eq(&once, &linked_by_size(&conn, s, Duration::ZERO).unwrap()));
         // as big as the last row read, and newer: ahead of it
         let same = f.add("g7h8i9", group, Some(3_000), "2026-10-04", Some(UHD));
         let same_piece = f.add("j1k2l3", group, Some(3_000), "2026-10-04", Some(UHD));
@@ -807,7 +865,7 @@ mod tests {
         let conn = db::open_with_shards(&f.main).unwrap();
         let mut rows: Vec<ReleaseRow> =
             bigs.iter().map(|&id| ReleaseRow { id, size: Some(6_000), ..Default::default() }).collect();
-        let whole = linked_sizes(&conn, store::shard_of(group), None, &mut rows, 2).unwrap();
+        let whole = linked_sizes(&conn, store::shard_of(group), None, &mut rows, 2, Duration::ZERO).unwrap();
         let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
         // all 9,000 as a whole: the newest two rows of either, read past the first upload as the second ties it
         // read on past the second upload, which made two, as the first ties it: its newer row beats the second's older one
