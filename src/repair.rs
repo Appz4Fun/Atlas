@@ -33,6 +33,8 @@ const PER_ROUND: usize = 20;
 const SERVERS: usize = 2;
 /// around a post's first and last article
 const MARGIN: i64 = 300;
+/// articles below a group's last number two servers are compared over, to tell whether they are one backend
+const SAME_IDS_LOOK: u64 = 50;
 /// a window bigger than this is a busy group's hours, not a post's minutes
 const MAX_ARTICLES: u64 = 3_000_000;
 
@@ -114,7 +116,7 @@ async fn round(
                 if indexing.iter().any(|h| machine(h) == machine(&pool.host(server)))
                     && let Ok((_, first, last, _)) = pool.group_on(server, &w.group).await
                 {
-                    spools.push((first, last));
+                    spools.push((server, (first, last)));
                 }
             }
             let mut read_from = 0;
@@ -130,13 +132,22 @@ async fn round(
                         continue;
                     }
                 };
-                if spools.iter().any(|s| same_spool(*s, spool)) {
+                let mut shared = false;
+                for &(other, numbers) in &spools {
+                    if same_spool(numbers, spool)
+                        && same_ids(pool, other, server, &w.group, numbers.1.min(spool.1)).await
+                    {
+                        shared = true;
+                        break;
+                    }
+                }
+                if shared {
                     continue;
                 }
                 match reread_window(ctx, settings, db, &w.group, server, (w.from, w.to), MAX_ARTICLES).await {
                     Ok(p) => {
                         read_from += 1;
-                        spools.push(spool);
+                        spools.push((server, spool));
                         println!("[repair] {} {}..{} on {host}: {} headers", w.group, w.from, w.to, p.articles);
                     }
                     // a failure leaves its share to the next server
@@ -172,6 +183,31 @@ fn machine(host: &str) -> String {
 /// moment of posting apart. Two backends number a group on their own, millions apart.
 fn same_spool(a: (u64, u64), b: (u64, u64)) -> bool {
     a.0 == b.0 && a.1.abs_diff(b.1) <= (a.1.max(b.1) / 100_000).max(1_000)
+}
+
+/// Whether servers `a` and `b` list the same Message-IDs under the same numbers just below `last`: GROUP numbers
+/// alike only say two backends may be one. False when either can't say.
+async fn same_ids(pool: &crate::nntp::Pool, a: usize, b: usize, group: &str, last: u64) -> bool {
+    let start = last.saturating_sub(SAME_IDS_LOOK);
+    let (Ok(ours), Ok(theirs)) = (pool.ids_on(a, group, start, last).await, pool.ids_on(b, group, start, last).await)
+    else {
+        return false;
+    };
+    ids_agree(&ours, &theirs)
+}
+
+/// At least one number with the same Message-ID on both, and none with two different ones.
+fn ids_agree(a: &[(u64, String)], b: &[(u64, String)]) -> bool {
+    let a: std::collections::HashMap<u64, &str> = a.iter().map(|(n, id)| (*n, id.as_str())).collect();
+    let mut same = 0;
+    for (n, id) in b {
+        match a.get(n) {
+            Some(other) if *other == id => same += 1,
+            Some(_) => return false,
+            None => {}
+        }
+    }
+    same > 0
 }
 
 /// The servers that index `group` already, by its cursors (`group@server`): reading it there again finds the same.
@@ -279,5 +315,15 @@ mod tests {
         assert!(!same_spool(eweka, xsnews));
         assert!(!same_spool((1, 5_000_000), (1, 9_000_000)), "two backends that both start at 1");
         assert!(same_spool((1, 900), (1, 1_500)), "a small group");
+    }
+
+    #[test]
+    fn one_backend_lists_the_same_ids_under_the_same_numbers() {
+        let ids = |v: &[(u64, &str)]| v.iter().map(|(n, s)| (*n, s.to_string())).collect::<Vec<_>>();
+        let a = ids(&[(10, "<a@x>"), (11, "<b@x>"), (12, "<c@x>")]);
+        assert!(ids_agree(&a, &ids(&[(11, "<b@x>"), (12, "<c@x>"), (13, "<d@x>")])));
+        assert!(!ids_agree(&a, &ids(&[(11, "<b@x>"), (12, "<z@x>")])), "a number with another article");
+        assert!(!ids_agree(&a, &ids(&[(20, "<b@x>")])), "nothing to compare");
+        assert!(!ids_agree(&a, &[]));
     }
 }
