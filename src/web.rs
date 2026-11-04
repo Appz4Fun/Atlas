@@ -765,6 +765,13 @@ impl Search {
                 before = self.search(filter.as_ref(), start, earlier).unwrap_or_default();
             }
             before.retain(|r| !post_of(r).is_some_and(|post| folded(r, &post)));
+            // an earlier row left out for being incomplete hides nothing: it isn't there to stand for its copies
+            if self.hide_incomplete {
+                before.retain_mut(|r| {
+                    self.fold_split_post(conn.as_ref(), r, &mut HashMap::new());
+                    !self.hides(r)
+                });
+            }
             let ids: Vec<i64> = before.iter().filter(|r| tagged(r)).chain(found.iter()).map(|r| r.id).collect();
             let hidden = crate::duplicates::later_copies(&ids).unwrap_or_default();
             found.retain(|r| !hidden.contains(&r.id));
