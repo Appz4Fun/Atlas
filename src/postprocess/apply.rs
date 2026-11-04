@@ -618,6 +618,29 @@ mod tests {
     }
 
     #[test]
+    fn the_queue_takes_the_latest_due_first_from_its_index() {
+        let (_dir, conn, _id) = shard();
+        let orders: Vec<&str> = (0..8).map(crate::postprocess::engine::queue_order).collect();
+        assert_eq!(orders.iter().filter(|o| **o == "due_at").count(), 2, "every 4th batch the longest waiting");
+        for (n, due) in [(1i64, 100i64), (2, 300), (3, 200)] {
+            conn.execute("insert into pp_queue (release_id, due_at) values (?, ?)", params![n, due]).unwrap();
+        }
+        for (order, first) in [("due_at desc", 2i64), ("due_at", 1)] {
+            let sql = format!("select release_id from pp_queue where due_at <= 1000 order by {order} limit 256");
+            let got: i64 = conn.query_row(&sql, [], |r| r.get(0)).unwrap();
+            assert_eq!(got, first, "{order}");
+            let plan: Vec<String> = conn
+                .prepare(&format!("explain query plan {sql}"))
+                .unwrap()
+                .query_map([], |r| r.get(3))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert!(!plan.iter().any(|p| p.contains("TEMP B-TREE")), "{order}: {plan:?}");
+        }
+    }
+
+    #[test]
     fn the_net_lane_claims_by_rank_from_an_index() {
         let (_dir, conn, _id) = shard();
         for (claims, order) in [(0, "net_rank desc, release_id desc"), (3, "release_id desc"), (7, "release_id asc")] {

@@ -85,6 +85,8 @@ pub(crate) struct Inner {
     net_troubles: AtomicI64,
     /// per shard: every 8th claim of a shard takes its oldest
     claims: [AtomicI64; SHARDS],
+    /// per shard: queue batches taken, for `queue_order`
+    queue_batches: [AtomicI64; SHARDS],
     tokens: Mutex<Vec<TokenBucket>>,
 }
 
@@ -249,6 +251,7 @@ impl Inner {
             net_paused_until: AtomicI64::new(0),
             net_troubles: AtomicI64::new(0),
             claims: std::array::from_fn(|_| AtomicI64::new(0)),
+            queue_batches: std::array::from_fn(|_| AtomicI64::new(0)),
             tokens: Mutex::new((0..SHARDS).map(|_| TokenBucket::new()).collect()),
         };
         inner.set_config(&p.config);
@@ -400,10 +403,11 @@ impl Inner {
 
     fn queue_batch(&self, conn: &Connection, db: &Db, shard: usize) -> anyhow::Result<bool> {
         let now = chrono::Utc::now().timestamp();
+        let order = queue_order(self.queue_batches[shard].fetch_add(1, Relaxed));
         let rows: Vec<(i64, i64, Option<Row>)> = conn
             .prepare_cached(&format!(
                 "select q.release_id, q.due_at, r.id is not null, {ROW_COLUMNS}
-                 from (select release_id, due_at from pp_queue where due_at <= ?1 order by due_at limit ?2) q
+                 from (select release_id, due_at from pp_queue where due_at <= ?1 order by {order} limit ?2) q
                  left join releases r on r.id = q.release_id
                  left join pp_state s on s.release_id = q.release_id"
             ))?
@@ -1228,6 +1232,13 @@ pub(crate) fn claim_order(claims: i64) -> &'static str {
         3 => "release_id desc",
         _ => "net_rank desc, release_id desc",
     }
+}
+
+/// The database lane's order for a shard's `batches`-th queue batch: mostly the latest due, soo a post just saved is
+/// named, sorted and linked with its other parts within a minute however long the queue is; every 4th batch the
+/// longest waiting, soo the backlog drains too.
+pub(crate) fn queue_order(batches: i64) -> &'static str {
+    if batches % 4 == 3 { "due_at" } else { "due_at desc" }
 }
 
 /// Releases ranked per slice, at most.
