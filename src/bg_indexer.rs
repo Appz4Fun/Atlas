@@ -14,7 +14,7 @@ use crate::atomic::write_atomic;
 use crate::compact::WriteGuard;
 use crate::config::{Config, UsenetServer, load_config};
 use crate::db;
-use crate::indexer::{Db, NotCarried, PassContext, PassSettings, Progress, RunStates, TooOld, run_pass, shared_db};
+use crate::indexer::{Db, NotCarried, PassContext, PassSettings, Progress, RunStates, TooOld, run_pass_on, shared_db};
 use crate::nntp::{Pool, unless_stopped};
 use crate::paths;
 use crate::postprocess::{Stage, StageParams};
@@ -432,12 +432,10 @@ impl Scheduler {
         Some(!failed.get(group)?.stood_in.contains(&server))
     }
 
-    /// After a pass of `group` on `server`; `stood_in`: it stood in for the group's own server (see `stand_in`).
+    /// After a pass of `group` that ran on `server` (see `run_pass_on`); `stood_in`: it stood in for the group's own
+    /// server (see `stand_in`).
     fn finish(&self, group: &str, server: usize, stood_in: bool, result: anyhow::Result<Progress>) {
         let states = &self.ctx.states;
-        // a stand-in ran on the server it was given; any other pass may have moved the group (see
-        // `Pool::select_group_known`), and what failed is where it is now
-        let server = if stood_in { server } else { self.ctx.pool.pick_server(group) };
         // the group went back home while a stand-in ran: its failure says nothing about the home, nor parks it
         let stand_in_late = stood_in && !self.failed.lock().unwrap().contains_key(group);
 
@@ -741,9 +739,10 @@ async fn worker(sched: Arc<Scheduler>, server: usize, db: Db) {
         // stopping drops a pass stuck on the network too (GROUP, a login, a name
         // lookup). safe: db writes run whole on their own thread and the cursor
         // only moves past slices that are saved
-        let pass = run_pass(&sched.ctx, &settings, &db, &group, server, &mut progress);
+        let mut ran_on = server;
+        let pass = run_pass_on(&sched.ctx, &settings, &db, &group, server, &mut progress, &mut ran_on);
         let Some(result) = unless_stopped(&sched.ctx.stop, pass).await else { break };
-        sched.finish(&group, server, stood_in.is_some(), result);
+        sched.finish(&group, ran_on, stood_in.is_some(), result);
     }
 }
 

@@ -742,6 +742,25 @@ pub async fn run_pass<P>(
 where
     P: FnMut(&Progress) + ?Sized,
 {
+    let mut ran_on = prefer;
+    run_pass_on(ctx, settings, db, group, prefer, progress, &mut ran_on).await
+}
+
+/// `run_pass`, saying in `ran_on` which server the pass went to: `prefer`, or the one a GROUP there moved the group
+/// to (see `Pool::select_group_known`), soo a failure counts against the server it happened on.
+pub async fn run_pass_on<P>(
+    ctx: &PassContext,
+    settings: &PassSettings,
+    db: &Db,
+    group: &str,
+    prefer: usize,
+    progress: &mut P,
+    ran_on: &mut usize,
+) -> Result<Progress>
+where
+    P: FnMut(&Progress) + ?Sized,
+{
+    *ran_on = prefer;
     if crate::filters::group_blocked(group) {
         return Ok(Progress::default());
     }
@@ -753,6 +772,7 @@ where
         let known = load_cursors(ctx, db, &cursor_key(&ctx.pool, prefer, group), group, prefer).await?.is_some();
         ctx.pool.select_group_known(prefer, group, known).await?
     };
+    *ran_on = server;
     let (first, last) = (first as i64, last as i64);
     let key = cursor_key(&ctx.pool, server, group);
 
