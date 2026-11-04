@@ -420,6 +420,11 @@ impl Scheduler {
         None
     }
 
+    #[cfg(test)]
+    fn parked(&self, group: &str) -> bool {
+        self.failed.lock().unwrap().contains_key(group)
+    }
+
     /// For a pass of `group` on `server`: whether it stands in for the group's own server (parked, see `Parked`), and
     /// whether none on `server` finished since.
     fn stand_in(&self, group: &str, server: usize) -> Option<bool> {
@@ -427,12 +432,14 @@ impl Scheduler {
         Some(!failed.get(group)?.stood_in.contains(&server))
     }
 
-    fn finish(&self, group: &str, server: usize, result: anyhow::Result<Progress>) {
+    /// After a pass of `group` on `server`; `stood_in`: it stood in for the group's own server (see `stand_in`).
+    fn finish(&self, group: &str, server: usize, stood_in: bool, result: anyhow::Result<Progress>) {
         let states = &self.ctx.states;
-        // while parked only stand-ins run, on the server they were given; any other pass may have moved the group
-        // (see `Pool::select_group_known`), and what failed is where it is now
-        let stood_in = self.failed.lock().unwrap().contains_key(group);
+        // a stand-in ran on the server it was given; any other pass may have moved the group (see
+        // `Pool::select_group_known`), and what failed is where it is now
         let server = if stood_in { server } else { self.ctx.pool.pick_server(group) };
+        // the group went back home while a stand-in ran: its failure says nothing about the home, nor parks it
+        let stand_in_late = stood_in && !self.failed.lock().unwrap().contains_key(group);
 
         match result {
             Ok(_) => {
@@ -449,6 +456,10 @@ impl Scheduler {
                 }
             }
             Err(_) if self.ctx.stop.load(Ordering::Relaxed) => {}
+            Err(e) if stand_in_late => {
+                self.stats.lock().unwrap().error_count += 1;
+                ui::error(&format!("Indexing error ({group} on {}, standing in): {e}", self.ctx.pool.host(server)));
+            }
             Err(e) => {
                 self.stats.lock().unwrap().error_count += 1;
                 let count = {
@@ -717,7 +728,8 @@ async fn worker(sched: Arc<Scheduler>, server: usize, db: Db) {
         };
 
         let mut settings = sched.settings.read().unwrap().clone();
-        if let Some(first) = sched.stand_in(&group, server) {
+        let stood_in = sched.stand_in(&group, server);
+        if let Some(first) = stood_in {
             // its own server is in trouble: this one reads what is new, on its own cursor, and nothing more
             settings.mode = "live".into();
             settings.fallback = true;
@@ -731,7 +743,7 @@ async fn worker(sched: Arc<Scheduler>, server: usize, db: Db) {
         // only moves past slices that are saved
         let pass = run_pass(&sched.ctx, &settings, &db, &group, server, &mut progress);
         let Some(result) = unless_stopped(&sched.ctx.stop, pass).await else { break };
-        sched.finish(&group, server, result);
+        sched.finish(&group, server, stood_in.is_some(), result);
     }
 }
 
@@ -1376,24 +1388,24 @@ mod tests {
         let sched = scheduler(pool, vec!["g".into()]);
         for _ in 0..3 {
             assert_eq!(sched.take_group(home).as_deref(), Some("g"));
-            sched.finish("g", home, Err(anyhow::anyhow!("430 Failed forwarding")));
+            sched.finish("g", home, false, Err(anyhow::anyhow!("430 Failed forwarding")));
             sched.wait_until.lock().unwrap().clear();
         }
         assert_eq!(sched.take_group(home), None, "parked on its own server");
         assert_eq!(sched.take_group(other).as_deref(), Some("g"), "the next server stands in");
         assert_eq!(sched.stand_in("g", other), Some(true), "its first pass starts at the newest article");
-        sched.finish("g", other, Err(anyhow::anyhow!("timed out")));
+        sched.finish("g", other, true, Err(anyhow::anyhow!("timed out")));
         sched.wait_until.lock().unwrap().clear();
         assert_eq!(sched.take_group(other).as_deref(), Some("g"));
         assert_eq!(sched.stand_in("g", other), Some(true), "a failed one doesnt count");
-        sched.finish("g", other, Ok(Progress::default()));
+        sched.finish("g", other, true, Ok(Progress::default()));
         assert_eq!(sched.stand_in("g", other), Some(false), "once one finished");
         sched.wait_until.lock().unwrap().clear();
 
         // the stand-in fails too: nothing left to try
         for _ in 0..3 {
             assert_eq!(sched.take_group(other).as_deref(), Some("g"));
-            sched.finish("g", other, Err(anyhow::anyhow!("timed out")));
+            sched.finish("g", other, true, Err(anyhow::anyhow!("timed out")));
             sched.wait_until.lock().unwrap().clear();
         }
         assert_eq!((sched.take_group(home), sched.take_group(other)), (None, None));
@@ -1402,6 +1414,12 @@ mod tests {
         sched.failed.lock().unwrap().get_mut("g").unwrap().since -= FAILED_RETRY;
         assert_eq!(sched.take_group(home).as_deref(), Some("g"));
         assert_eq!(sched.stand_in("g", home), None);
+
+        // a stand-in still running then fails: the home isnt blamed or parked for it
+        for _ in 0..3 {
+            sched.finish("g", other, true, Err(anyhow::anyhow!("timed out")));
+        }
+        assert!(!sched.parked("g"));
     }
 
     /// with more media groups than its share of workers, the round robin still moves
