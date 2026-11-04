@@ -2266,7 +2266,7 @@ fn release_html(
     let conn = crate::db::open().ok();
     let stills =
         conn.as_ref().map(|conn| stills_html(r.id, &crate::probe::stills::stills(conn, r.id))).unwrap_or_default();
-    let found = conn.as_ref().and_then(|c| crate::probe::read(c, r.id));
+    let found = conn.as_ref().and_then(|c| crate::probe::read(c, r.id)).map(|p| seven_z_first_file(p, inner, contents));
     let probe = match (conn.as_ref(), found.as_ref()) {
         (Some(c), Some(found)) => probe_html(
             found,
@@ -3527,21 +3527,59 @@ fn login_page(base: &str, wrong_key: bool) -> String {
     )
 }
 
-/// Each layer an archive was followed down through, outermost first: `RAR5 m0 › 7z copy › movie.mkv`.
+/// Each layer an archive was followed down through, outermost first, with the file each one holds where it names
+/// it: `RAR5 m0 › movie.7z › 7z copy › movie.mkv`. A layer that stopped still names the file it couldn't open.
 fn nested_chain(layers: &[crate::probe::nest::Layer]) -> String {
-    let mut parts: Vec<String> = layers
-        .iter()
-        .map(|l| {
-            let method = l.method.as_deref().map(|m| format!(" {m}")).unwrap_or_default();
-            let stop =
-                l.stop.as_deref().map(|why| format!(" {}", tag("tag-bad", &why.to_uppercase()))).unwrap_or_default();
-            format!("{}{}{stop}", escape(&l.format), escape(&method))
-        })
-        .collect();
-    if let Some(name) = layers.last().filter(|l| l.stop.is_none()).and_then(|l| l.name.as_deref()) {
-        parts.push(escape(name));
+    let mut parts = Vec::new();
+    for l in layers {
+        let method = l.method.as_deref().map(|m| format!(" {m}")).unwrap_or_default();
+        let stop = l.stop.as_deref().map(|why| format!(" {}", tag("tag-bad", &why.to_uppercase()))).unwrap_or_default();
+        parts.push(format!("{}{}{stop}", escape(&l.format), escape(&method)));
+        if let Some(name) = l.name.as_deref() {
+            parts.push(escape(name));
+        }
     }
     parts.join(" › ")
+}
+
+/// A 7z keeps its names in its end header, soo a probe of its front can't name the file it found at byte 32. The
+/// listing read from that end header can: its first file with any bytes is the one the packed streams open with.
+/// Only when the release has one 7z set and the probe read it, as the listing and the probe each pick their own
+/// archive; and not when the listing found encryption, which the front can't see: "not encrypted" would be wrong.
+fn seven_z_first_file(
+    mut p: crate::probe::ProbeInfo,
+    inner: &crate::archive::store::InnerView,
+    contents: &release_info::Contents,
+) -> crate::probe::ProbeInfo {
+    use crate::archive::names::strip_volume_suffix;
+    use crate::archive::select::{Kind, classify};
+    if inner.encryption.is_some() || inner.names_hidden {
+        return p;
+    }
+    let set_of =
+        |name: &str| matches!(classify(name), Kind::SevenZip(_)).then(|| strip_volume_suffix(name).to_lowercase());
+    let Some(probed) = p.file.as_deref().and_then(set_of) else { return p };
+    let all_listed = usize::try_from(contents.files).is_ok_and(|n| n <= contents.list.len());
+    if !all_listed || contents.list.iter().filter_map(|f| set_of(&f.name)).any(|set| set != probed) {
+        return p;
+    }
+    let first =
+        inner.files.iter().find(|f| f.source == crate::archive::store::SOURCE_7Z && f.size.is_some_and(|s| s > 0));
+    let Some(first) = first else { return p };
+    // a volume set inside is kept as one row, its volumes' sizes summed: not the size of the file at byte 32
+    let one_file = strip_volume_suffix(&first.name) == first.name;
+    let size = first.size.and_then(|s| u64::try_from(s).ok()).filter(|_| one_file);
+    let method = p.layers.first().filter(|l| l.format == "7z").and_then(|l| l.method.clone());
+    if let Some(a) = p.archive.as_mut().filter(|a| a.format == "7z" && a.name.is_none()) {
+        a.name = Some(first.name.clone());
+        a.unpacked = a.unpacked.or(size);
+        a.method = a.method.take().or(method);
+    }
+    if let Some(l) = p.layers.first_mut().filter(|l| l.format == "7z" && l.name.is_none()) {
+        l.name = Some(first.name.clone());
+        l.unpacked = l.unpacked.or(size);
+    }
+    p
 }
 
 #[cfg(test)]
@@ -3567,6 +3605,86 @@ mod tests {
 
     fn shown(html: &str, size: i64, folded: bool) -> ShownRow {
         ShownRow { html: html.into(), size: Some(size), folded, brings: None }
+    }
+
+    #[test]
+    fn a_nested_chain_names_each_file_it_holds() {
+        use crate::probe::nest::Layer;
+        let layers = vec![
+            Layer { format: "RAR5".into(), method: Some("m0".into()), name: Some("x.7z".into()), ..Default::default() },
+            Layer {
+                format: "7z".into(),
+                method: Some("copy".into()),
+                name: Some("a.zip".into()),
+                ..Default::default()
+            },
+            Layer {
+                format: "ZIP".into(),
+                name: Some("movie.mkv".into()),
+                stop: Some("encrypted".into()),
+                ..Default::default()
+            },
+        ];
+        let chain = super::nested_chain(&layers);
+        assert!(chain.starts_with("RAR5 m0 › x.7z › 7z copy › a.zip › ZIP "), "{chain}");
+        assert!(chain.ends_with(" › movie.mkv"), "a stopped layer still names its file: {chain}");
+    }
+
+    #[test]
+    fn a_7z_probe_takes_its_first_file_from_the_listing() {
+        use crate::archive::store::{InnerFileRow, InnerView, SOURCE_7Z, SOURCE_PAR2};
+        use crate::probe::archive::ArchiveHead;
+        use crate::probe::nest::Layer;
+        let probe = crate::probe::ProbeInfo {
+            file: Some("Show.S01E04.7z.001".into()),
+            archive: Some(ArchiveHead { format: "7z".into(), ..Default::default() }),
+            layers: vec![Layer { format: "7z".into(), method: Some("copy".into()), ..Default::default() }],
+            ..Default::default()
+        };
+        let row = |seq, name: &str, size, source| InnerFileRow { seq, name: name.into(), size, source };
+        let inner = InnerView {
+            files: vec![
+                row(0, "Show.S01E04.7z.026", Some(9), SOURCE_PAR2),
+                row(1, "Show", Some(0), SOURCE_7Z),
+                row(2, "Show/Show.S01E04.mkv", Some(8_000_000_000), SOURCE_7Z),
+            ],
+            ..Default::default()
+        };
+        let listed = |names: &[&str]| crate::release_info::Contents {
+            files: names.len() as i64,
+            list: names
+                .iter()
+                .map(|n| crate::release_info::NzbFile { name: (*n).into(), bytes: 1, seen: 1, expected: 1 })
+                .collect(),
+            ..Default::default()
+        };
+        let one_set = listed(&["Show.S01E04.7z.001", "Show.S01E04.7z.002", "Show.S01E04.par2"]);
+        let named = super::seven_z_first_file(probe.clone(), &inner, &one_set);
+        assert_eq!(named.archive.as_ref().unwrap().name.as_deref(), Some("Show/Show.S01E04.mkv"));
+        assert_eq!(named.archive.as_ref().unwrap().unpacked, Some(8_000_000_000));
+        assert_eq!(named.archive.as_ref().unwrap().method.as_deref(), Some("copy"), "as the front found it");
+        assert_eq!(named.layers[0].name.as_deref(), Some("Show/Show.S01E04.mkv"));
+
+        let encrypted = InnerView { encryption: Some(crate::archive::Encryption::SevenZipAes256), ..inner.clone() };
+        let left = super::seven_z_first_file(probe.clone(), &encrypted, &one_set);
+        assert_eq!(
+            left.archive.unwrap().name,
+            None,
+            "the front can't tell it is encrypted: no name, no 'not encrypted'"
+        );
+
+        let two_sets = listed(&["Show.S01E04.7z.001", "Extras.7z"]);
+        let left = super::seven_z_first_file(probe.clone(), &inner, &two_sets);
+        assert_eq!(left.archive.unwrap().name, None, "the listing may be of the other set");
+
+        let rar_set = InnerView {
+            files: vec![row(1, "Show/movie.part01.rar", Some(9_000_000_000), SOURCE_7Z)],
+            ..Default::default()
+        };
+        let named = super::seven_z_first_file(probe, &rar_set, &one_set);
+        let a = named.archive.unwrap();
+        assert_eq!(a.name.as_deref(), Some("Show/movie.part01.rar"));
+        assert_eq!(a.unpacked, None, "a volume row's size is the whole set's");
     }
 
     #[test]
