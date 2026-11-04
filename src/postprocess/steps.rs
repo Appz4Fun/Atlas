@@ -24,6 +24,7 @@ pub fn all() -> Vec<Arc<dyn Step>> {
         lookup,
         nfo,
         Arc::new(crate::probe::opensubtitles::OpenSubtitlesImdb),
+        Arc::new(crate::keys::KeysStep::default()),
     ]
 }
 
@@ -36,8 +37,14 @@ mod tests {
     #[test]
     fn steps_have_unique_ids_ranks_names_within_their_ranges() {
         // (ids, ranks) a part owns
-        let ranges =
-            [(1..=7, 100..=199), (8..=15, 200..=299), (16..=23, 300..=399), (24..=31, 400..=499), (32..=39, 500..=599)];
+        let ranges = [
+            (1..=7, 100..=199),
+            (8..=15, 200..=299),
+            (16..=23, 300..=399),
+            (24..=31, 400..=499),
+            (32..=39, 500..=599),
+            (40..=47, 600..=699),
+        ];
         let (mut ids, mut ranks, mut names) = (HashSet::new(), HashSet::new(), HashSet::new());
         for step in all() {
             assert!(ids.insert(step.id().0), "id {}", step.id().0);

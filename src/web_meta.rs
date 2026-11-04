@@ -15,11 +15,12 @@ use std::sync::LazyLock;
 
 use chrono::Datelike;
 use regex::Regex;
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 
 use crate::api::{ApiResponse, escape};
 use crate::archive::store::{InnerFileRow, InnerView, SOURCE_7Z, SOURCE_PAR2, SOURCE_RAR, SOURCE_ZIP};
+use crate::keys::Kind;
 use crate::naming::NameSource;
 use crate::release_info::{self, Contents, Names};
 use crate::search::{ArticleRow, ReleaseRow};
@@ -52,7 +53,47 @@ pub(crate) struct MetaInputs<'a> {
 /// The six panels in reading order; a panel with nothing to say is left out. `conn` serves the facts that
 /// need a query (files, segments, fingerprints, PreDB, keys); without one they are skipped.
 pub(crate) fn meta_html(conn: Option<&Connection>, i: &MetaInputs<'_>) -> String {
-    panels_html(i, &look(conn, i.release.id))
+    let mut l = look(conn, i.release.id);
+    if let Some(conn) = conn {
+        l.same = same_counts(conn, i, &l);
+    }
+    panels_html(i, &l)
+}
+
+/// What the release can be looked up by, from what the page already read: the keys `release_keys` keeps (worked
+/// out here too, soo a release the keys step hasn't reached yet counts the same), its PAR2 sets and its
+/// OpenSubtitles hash.
+fn lookup_of(i: &MetaInputs<'_>, l: &Looked) -> crate::keys::Lookup {
+    let timing: Vec<(Option<i64>, i64)> = l.timing.iter().map(|t| (t.lines, t.articles)).collect();
+    crate::keys::Lookup {
+        keys: crate::keys::keys_of(i.probe, &timing, i.release.parts, l.salt),
+        par2_sets: shard_conn(i.release.id)
+            .map(|s| crate::keys::par2_sets(&s, i.release.id).unwrap_or_default())
+            .unwrap_or_default(),
+        moviehash: i.probe.and_then(|p| p.moviehash.clone()),
+    }
+}
+
+/// How many other releases share each key the release has, the kinds with none left out.
+fn same_counts(conn: &Connection, i: &MetaInputs<'_>, l: &Looked) -> Vec<(crate::keys::Kind, i64)> {
+    let lookup = lookup_of(i, l);
+    crate::keys::Kind::ALL
+        .into_iter()
+        .filter(|kind| lookup.has(*kind))
+        .map(|kind| (kind, crate::keys::count_others(conn, i.release.id, &lookup, kind)))
+        .filter(|(_, n)| *n > 0)
+        .collect()
+}
+
+/// " · in 12 other releases", linking to them, when other releases share the key.
+fn same_link(l: &Looked, id: i64, kind: crate::keys::Kind) -> String {
+    let Some((_, n)) = l.same.iter().find(|(k, _)| *k == kind) else { return String::new() };
+    let count = if *n >= crate::keys::COUNT_CAP {
+        format!("{} or more other releases", thousands(*n))
+    } else {
+        format!("{} other release{}", thousands(*n), plural(*n as usize))
+    };
+    format!(" · <a href=\"/ui/same?id={id}&amp;kind={}\">in {count}</a>", kind.word())
 }
 
 /// The six panels over what was looked up.
@@ -145,6 +186,8 @@ struct Looked {
     id_key: Option<store::IdKey>,
     /// one row a file, in file name order; empty for a release saved before Atlas kept timing
     timing: Vec<FileTiming>,
+    /// how many other releases share each key, full page only; a kind with none is left out
+    same: Vec<(crate::keys::Kind, i64)>,
 }
 
 /// One `file_timing` row (`store::FILE_TIMING`): what the overview said about a file's articles, folded at
@@ -288,20 +331,7 @@ pub(crate) fn salt_of(conn: Option<&Connection>) -> Option<i64> {
 }
 
 fn salt(conn: &Connection) -> Option<i64> {
-    let read = || {
-        conn.query_row("select value from s0.meta where key = 'key_salt'", [], |r| r.get::<_, i64>(0))
-            .optional()
-            .ok()
-            .flatten()
-    };
-    if let Some(found) = read() {
-        return Some(found);
-    }
-    let mut bytes = [0u8; 8];
-    getrandom::fill(&mut bytes).ok()?;
-    let fresh = i64::from_le_bytes(bytes);
-    let _ = conn.execute("insert or ignore into s0.meta (key, value) values ('key_salt', ?1)", [fresh]);
-    read()
+    crate::keys::salt(conn)
 }
 
 // ---------------------------------------------------------------- a panel under construction
@@ -1092,15 +1122,8 @@ fn late_articles(timing: &[FileTiming]) -> String {
 /// the same, whatever its subjects say. None unless the rows cover every article of the release (`parts`) and
 /// every file has lines: a sum over part of a file, or a file with no row, would key a different post.
 fn lines_key(timing: &[FileTiming], parts: Option<i64>) -> Option<String> {
-    if parts != Some(timed(timing)) {
-        return None;
-    }
-    let lines: Vec<String> =
-        timing.iter().map(|t| t.lines.filter(|l| *l > 0).map(|l| l.to_string())).collect::<Option<_>>()?;
-    if lines.is_empty() {
-        return None;
-    }
-    Some(key16(lines.join(",").as_bytes()))
+    let files: Vec<(Option<i64>, i64)> = timing.iter().map(|t| (t.lines, t.articles)).collect();
+    crate::keys::lines_text(&files, parts).map(|t| key16(t.as_bytes()))
 }
 
 const MONTHS: [&str; 12] = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
@@ -1338,33 +1361,7 @@ fn path_facts(path: &str) -> Option<PathFacts> {
     Some(PathFacts { hops: hosts.len(), injector, backbone })
 }
 
-#[derive(Default)]
-struct InjectionParts {
-    account: Option<String>,
-    host: Option<String>,
-    logging_data: bool,
-    complaints: bool,
-}
-
-/// The `key=value;` parts of an Injection-Info header. The values stay here: the panels print the keys only.
-fn injection_parts(info: &str) -> InjectionParts {
-    let mut out = InjectionParts::default();
-    for part in info.split(';') {
-        let Some((key, value)) = part.split_once('=') else { continue };
-        let value = value.trim().trim_matches('"').trim();
-        if value.is_empty() {
-            continue;
-        }
-        match key.trim().to_ascii_lowercase().as_str() {
-            "posting-account" => out.account = Some(value.to_string()),
-            "posting-host" => out.host = Some(value.to_string()),
-            "logging-data" => out.logging_data = true,
-            "mail-complaints-to" => out.complaints = true,
-            _ => {}
-        }
-    }
-    out
-}
+use crate::keys::injection_parts;
 
 /// The grammar of a message-id: the tool that minted it, or the server that did.
 fn id_grammar(message_id: &str) -> Option<&'static str> {
@@ -1967,10 +1964,12 @@ fn keys_panel(i: &MetaInputs<'_>, l: &Looked, compact: bool) -> Facts {
     f.key("First-id key", l.first_id.as_deref().map(|id| key16(id.as_bytes())));
     let parts = headers.and_then(|h| h.get("Injection-Info")).map(|info| injection_parts(info)).unwrap_or_default();
     let host = parts.host.as_deref().or_else(|| headers.and_then(|h| h.get("NNTP-Posting-Host")).map(String::as_str));
+    let id = i.release.id;
+    let with_link = |text: String, kind| format!("{}{}", key_code(&text), same_link(l, id, kind));
     if let Some(salt) = l.salt {
-        f.key("Account key", parts.account.as_deref().map(|a| key12(salt, a)));
+        f.add_html("Account key", parts.account.as_deref().map(|a| with_link(key12(salt, a), Kind::Account)));
         if !compact {
-            f.key("Host key", host.map(|h| key12(salt, h)));
+            f.add_html("Host key", host.map(|h| with_link(key12(salt, h), Kind::Host)));
         }
     }
     if compact {
@@ -1993,14 +1992,28 @@ fn keys_panel(i: &MetaInputs<'_>, l: &Looked, compact: bool) -> Facts {
     }
     f.key("Posted fingerprint", l.posted_fp.as_deref().map(hex));
     f.key("Content fingerprint", l.content_fp.as_deref().map(hex));
-    f.key("Structural key", i.probe.and_then(|p| p.media.as_ref()).and_then(structural_key));
+    f.add_html(
+        "Structural key",
+        i.probe.and_then(|p| p.media.as_ref()).and_then(structural_key).map(|k| with_link(k, Kind::Layout)),
+    );
     f.key("Password check", i.inner.password_check.as_ref().map(password_check));
     if let Some(main) = &l.main
         && let Some(subject) = main.subject.as_deref()
     {
         f.key("NZBLNK", Some(nzblnk(&i.release.name, subject, &i.release.group_name)));
     }
-    f.key("Lines key", lines_key(&l.timing, i.release.parts));
+    f.add_html("Lines key", lines_key(&l.timing, i.release.parts).map(|k| with_link(k, Kind::Lines)));
+    // counted from the tables the twin and probe work keep, shown here only when another release shares them
+    if !same_link(l, id, Kind::Par2).is_empty() {
+        f.add_html("PAR2 set", Some(format!("PAR2 recovery set{}", same_link(l, id, Kind::Par2))));
+    }
+    f.add_html(
+        "OpenSubtitles hash",
+        i.probe
+            .and_then(|p| p.moviehash.as_deref())
+            .filter(|_| !same_link(l, id, Kind::MovieHash).is_empty())
+            .map(|h| with_link(h.to_string(), Kind::MovieHash)),
+    );
     f
 }
 
@@ -2010,15 +2023,12 @@ fn hex(bytes: &[u8]) -> String {
 
 /// SHA-256, first 8 bytes, lowercase hex.
 fn key16(bytes: &[u8]) -> String {
-    hex(&Sha256::digest(bytes)[..8])
+    crate::keys::hex16(crate::keys::as_key(crate::keys::digest8(bytes)))
 }
 
 /// SHA-256 over the salt and the value, first 6 bytes: lines two postings up without naming the account.
 fn key12(salt: i64, value: &str) -> String {
-    let mut h = Sha256::new();
-    h.update(salt.to_le_bytes());
-    h.update(value.as_bytes());
-    hex(&h.finalize()[..6])
+    crate::keys::hex12(crate::keys::as_key(crate::keys::salted8(salt, value)))
 }
 
 /// The ingest's own collection key, rebuilt from the row: `Collections::of` over the subject, then the shard's
@@ -2050,19 +2060,7 @@ fn is_weak(collection: &str) -> bool {
 /// A key over the track layout, the chapter count and the duration: the same encode across remuxes and
 /// renames. The fields themselves are the media thread's to show.
 fn structural_key(media: &crate::probe::media::MediaInfo) -> Option<String> {
-    if media.video.is_empty() && media.audio.is_empty() && media.subtitles.is_empty() && media.duration_secs.is_none() {
-        return None;
-    }
-    let codecs = |list: Vec<&str>| list.join(",");
-    let text = format!(
-        "v:{}|a:{}|s:{}|c:{}|d:{}",
-        codecs(media.video.iter().map(|t| t.codec.as_str()).collect()),
-        codecs(media.audio.iter().map(|t| t.codec.as_str()).collect()),
-        codecs(media.subtitles.iter().map(|t| t.codec.as_str()).collect()),
-        media.chapters.len(),
-        media.duration_secs.map_or(0, |d| d.round() as i64)
-    );
-    Some(key16(text.as_bytes()))
+    crate::keys::layout_text(media).map(|t| key16(t.as_bytes()))
 }
 
 /// The archive's stored password test, as hex: what a password has to fold down to.
@@ -2564,6 +2562,7 @@ mod tests {
             salt: Some(7),
             id_key: None,
             timing: Vec::new(),
+            same: Vec::new(),
         }
     }
 

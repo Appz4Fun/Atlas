@@ -134,7 +134,9 @@ impl Step for ProbeStep {
                 SET_PROBE,
                 vec![release_id.into(), saved.crc32.into(), saved.agent.into(), saved.info.into(), hash.clone().into()],
             ));
-            let rerun = if hash.is_some() { mask(super::opensubtitles::OPENSUBTITLES_STEP) } else { 0 };
+            // the account, host and layout keys come from what the probe holds
+            let rerun = mask(crate::keys::KEYS_STEP)
+                | if hash.is_some() { mask(super::opensubtitles::OPENSUBTITLES_STEP) } else { 0 };
             let facts = hash.map(|h| vec![(MOVIEHASH_FACT, h)]).unwrap_or_default();
             return Ok(Outcome { matched: true, writes, facts, rerun, ..Outcome::default() });
         }
@@ -275,7 +277,8 @@ impl Step for ProbeStep {
             vec![release_id.into(), crc.into(), agent.into(), json.into(), hash.clone().into()],
         ));
         // a hash found on a later look is asked about then too
-        let rerun = if hash.is_some() { mask(super::opensubtitles::OPENSUBTITLES_STEP) } else { 0 };
+        let rerun = mask(crate::keys::KEYS_STEP)
+            | if hash.is_some() { mask(super::opensubtitles::OPENSUBTITLES_STEP) } else { 0 };
         let facts = hash.map(|h| vec![(MOVIEHASH_FACT, h)]).unwrap_or_default();
         Ok(Outcome { matched: true, writes, facts, rerun, ..Outcome::default() })
     }
