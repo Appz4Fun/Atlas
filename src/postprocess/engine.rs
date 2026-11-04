@@ -611,6 +611,8 @@ impl Inner {
         if let Ok(Some(reason)) = crate::junk::inner_or_pc(conn, row.info.id, summary.has_video) {
             return Some(Applied { junk: Some(reason), ..base_copy(&base) });
         }
+        // a PC row from before there was no PC, on a release its video keeps: it goes uncategorized
+        let stale_pc = crate::junk::stale_pc(conn, row.info.id, summary.has_video).unwrap_or(false);
 
         let enabled = self.enabled();
         let mut clear = redo;
@@ -619,6 +621,9 @@ impl Inner {
         }
         let (mut done, mut failed) = (row.done & !clear, row.failed & !clear);
         let mut a = base;
+        if stale_pc {
+            a.writes.push((0, super::step::StepWrite::new(crate::junk::DROP_CATEGORY, vec![row.info.id.into()])));
+        }
         a.parts_seen = Some(row.info.parts);
         let mut ctx = StepCtx {
             release: row.info.clone(),

@@ -97,6 +97,7 @@ pub const SHARD_TABLES: &[&ShardTable] = &[
     &crate::media::MEDIA_RELEASE,
     &crate::store::FILE_TIMING,
     &crate::junk::JUNK_RELEASES,
+    &crate::junk::JUNK_COLLECTIONS,
 ];
 
 /// nullable columns on `releases`, append only. `name_source`: NULL, the name came from

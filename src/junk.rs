@@ -21,6 +21,16 @@ pub const JUNK_RELEASES: ShardTable = ShardTable {
     added: &[],
 };
 
+/// The collection keys of removed posts (`collections.rs`): a post's later slices can carry another name, and find
+/// their release by its key, which a removed release no longer answers to.
+pub const JUNK_COLLECTIONS: ShardTable = ShardTable {
+    name: "junk_collections",
+    create: "create table if not exists junk_collections (key INTEGER PRIMARY KEY) without rowid",
+    indexes: &[],
+    release_key: None,
+    added: &[],
+};
+
 pub const EXECUTABLE: &str = "executable";
 pub const EXECUTABLE_INSIDE: &str = "executable_inside";
 pub const PC: &str = "pc_category";
@@ -99,6 +109,42 @@ pub fn is_junk(conn: &Connection, name: &str, group: &str) -> Result<bool> {
     conn.prepare_cached("select 1 from junk_releases where name = ?1 and group_name = ?2")?.exists(params![name, group])
 }
 
+/// Whether a save must leave this collection alone.
+pub fn is_junk_collection(conn: &Connection, key: i64) -> Result<bool> {
+    conn.prepare_cached("select 1 from junk_collections where key = ?1")?.exists([key])
+}
+
+pub fn remember_collection(conn: &Connection, key: i64) -> Result<()> {
+    conn.prepare_cached("insert or ignore into junk_collections (key) values (?1)")?.execute([key])?;
+    Ok(())
+}
+
+/// Whether the release has a video file now, as its stored files say.
+pub fn has_video(conn: &Connection, release_id: i64) -> Result<bool> {
+    let mut stmt = conn.prepare_cached("select filename from files where release_id = ?")?;
+    let mut rows = stmt.query([release_id])?;
+    while let Some(r) = rows.next()? {
+        if is_video(r.get_ref(0)?.as_str()?) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// A PC category row left on a release that has video: there is no PC any more, see the category step.
+pub fn stale_pc(conn: &Connection, release_id: i64, has_video: bool) -> Result<bool> {
+    if !has_video {
+        return Ok(false);
+    }
+    let category: Option<i64> = conn
+        .prepare_cached("select category from release_category where release_id = ?")?
+        .query_row([release_id], |r| r.get(0))
+        .optional()?;
+    Ok(category.is_some_and(is_pc))
+}
+
+pub const DROP_CATEGORY: &str = "delete from release_category where release_id = ?1";
+
 /// Whether a PC match keeps its release: only one with a video file.
 pub fn pc_is_junk(filenames: impl IntoIterator<Item = impl AsRef<str>>) -> bool {
     !filenames.into_iter().any(|f| is_video(f.as_ref()))
@@ -119,11 +165,17 @@ pub fn stored_reason(conn: &Connection, release_id: i64) -> Result<Option<&'stat
 
 /// The part of `stored_reason` past the posted files, for a caller that has read those.
 pub fn inner_or_pc(conn: &Connection, release_id: i64, has_video: bool) -> Result<Option<&'static str>> {
-    let mut inner = conn.prepare_cached("select name from archive_inner_files where release_id = ?")?;
-    let mut rows = inner.query([release_id])?;
-    while let Some(r) = rows.next()? {
-        if is_executable(r.get_ref(0)?.as_str()?) {
-            return Ok(Some(EXECUTABLE_INSIDE));
+    // what archives list, and what a PAR2 set describes: past the names quota only the set's rows are kept
+    for sql in [
+        "select name from archive_inner_files where release_id = ?",
+        "select name from par2_files where release_id = ?",
+    ] {
+        let mut inner = conn.prepare_cached(sql)?;
+        let mut rows = inner.query([release_id])?;
+        while let Some(r) = rows.next()? {
+            if is_executable(r.get_ref(0)?.as_str()?) {
+                return Ok(Some(EXECUTABLE_INSIDE));
+            }
         }
     }
     let category: Option<i64> = conn
@@ -151,7 +203,15 @@ pub fn remove(conn: &Connection, release_id: i64, reason: &str, now: i64) -> Res
         .query_row([release_id], |r| Ok((r.get(0)?, r.get(1)?)))
         .optional()?;
     let Some((name, group)) = key else { return Ok(false) };
+    // a PC verdict rests on there being no video, and one may have come since the step looked
+    if reason == PC && has_video(conn, release_id)? {
+        return Ok(false);
+    }
     remember(conn, &name, &group, reason, now)?;
+    conn.prepare_cached(
+        "insert or ignore into junk_collections (key) select key from collections where release_id = ?",
+    )?
+    .execute([release_id])?;
     let deleted = crate::store::delete_release(conn, release_id)?;
     let mut less = conn.prepare_cached("update meta set value = max(value - ?, 0) where key = ?")?;
     less.execute(params![deleted.articles, "articles"])?;
@@ -263,7 +323,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(stored_reason(&conn, film).unwrap(), Some(EXECUTABLE_INSIDE));
+        assert!(stale_pc(&conn, film, true).unwrap());
+        assert!(!stale_pc(&conn, packed, false).unwrap());
+        assert!(!remove(&conn, film, PC, 5).unwrap(), "video that came since the step looked keeps it");
+        conn.execute("insert into collections (key, release_id) values (77, ?)", [film]).unwrap();
         assert!(remove(&conn, film, EXECUTABLE_INSIDE, 5).unwrap());
+        assert!(is_junk_collection(&conn, 77).unwrap(), "its later slices find it by key");
         assert!(!remove(&conn, film, EXECUTABLE_INSIDE, 5).unwrap());
         assert_eq!(counts(&conn), (1, 1, 1));
         let inner: i64 = conn.query_row("select count(*) from archive_inner_files", [], |r| r.get(0)).unwrap();
@@ -306,6 +371,21 @@ mod tests {
         ] {
             assert!(!is_executable(name), "{name}");
         }
+    }
+
+    #[test]
+    fn a_program_a_par2_set_describes_is_junk() {
+        let (_dir, main) = shard();
+        store::save(&main, &[post("Hidden", &["a1b2c3.part01.rar", "a1b2c3.par2"])]).unwrap();
+        let conn = open(&main);
+        let id: i64 = conn.query_row("select id from releases", [], |r| r.get(0)).unwrap();
+        conn.execute(
+            "insert into par2_files (release_id, file_id, set_id, md5, md5_16k, size, name)
+             values (?, x'01', x'02', x'03', x'04', 5, 'Keygen.EXE')",
+            [id],
+        )
+        .unwrap();
+        assert_eq!(stored_reason(&conn, id).unwrap(), Some(EXECUTABLE_INSIDE));
     }
 
     #[test]

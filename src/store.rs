@@ -1629,11 +1629,17 @@ impl ShardWriter {
                 // what the row's name is, not what this slice's files happen to be called
                 let is_obfuscated = collection.as_ref().map_or(release.is_obfuscated, |c| c.is_obfuscated);
                 // a program in it: the release goes, with what it had, and so does all that comes for it later
-                if crate::junk::is_junk(&tx, name, &release.group)? {
+                if crate::junk::is_junk(&tx, name, &release.group)?
+                    || collection.as_ref().map(|c| crate::junk::is_junk_collection(&tx, c.key)).transpose()?
+                        == Some(true)
+                {
                     continue;
                 }
                 if release.articles.iter().any(|a| a.filename.as_deref().is_some_and(crate::junk::is_executable)) {
                     crate::junk::remember(&tx, name, &release.group, crate::junk::EXECUTABLE, now)?;
+                    if let Some(c) = &collection {
+                        crate::junk::remember_collection(&tx, c.key)?;
+                    }
                     // its row goes after the loop: ids this save still holds must not be freed for reuse under it
                     junk_rows.push((name.to_string(), release.group.clone()));
                     continue;
