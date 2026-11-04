@@ -48,6 +48,12 @@ pub fn create(conn: &Connection) -> Result<()> {
             days INTEGER NOT NULL,
             articles INTEGER NOT NULL
         ) without rowid;
+        create table if not exists backfill_wanted (
+            grp TEXT NOT NULL,
+            day INTEGER NOT NULL,
+            at INTEGER NOT NULL,
+            primary key (grp, day)
+        ) without rowid;
         create index if not exists idx_backfill_chunks_grp_state_day
             on backfill_chunks (grp, state, day desc, claimed_at);",
     )?;
@@ -223,13 +229,61 @@ pub struct Claim {
     pub claimed_at: i64,
 }
 
+/// Ask for a day of a group's backfill before the others: one a post found
+/// in part was posted on. A day that's done or has no chunk is left as it is.
+pub fn want(conn: &Connection, group: &str, day: i64, now: i64) -> Result<bool> {
+    let n = conn.execute(
+        &format!(
+            "insert or ignore into backfill_wanted (grp, day, at)
+             select grp, day, ?3 from backfill_chunks where grp = ?1 and day = ?2 and state != {DONE}"
+        ),
+        params![group, day, now],
+    )?;
+    Ok(n > 0)
+}
+
 /// Atomically claim the newest chunk that is pending or whose claim went
 /// stale, of `groups`: (group, oldest day the server keeps), `i64::MIN` when
-/// any day will do.
+/// any day will do. A day asked for (`want`) goes first.
 pub fn claim(conn: &Connection, groups: &[(String, i64)], host: &str, now: i64) -> Result<Option<Claim>> {
     if groups.is_empty() {
         return Ok(None);
     }
+    match claim_wanted(conn, groups, host, now)? {
+        Some(claim) => Ok(Some(claim)),
+        None => claim_newest(conn, groups, host, now),
+    }
+}
+
+/// The newest day asked for of `groups`, pending or with a stale claim: read from the few asked for, not the backlog.
+fn claim_wanted(conn: &Connection, groups: &[(String, i64)], host: &str, now: i64) -> Result<Option<Claim>> {
+    if !conn.prepare_cached("select 1 from backfill_wanted limit 1")?.exists([])? {
+        return Ok(None);
+    }
+    let rows = vec!["(?, ?)"; groups.len()].join(", ");
+    let sql = format!(
+        "with wanted (g, oldest) as (values {rows})
+         update backfill_chunks set state = ?, server = ?, claimed_at = ?
+         where (grp, day) = (
+             select c.grp, c.day from backfill_wanted r
+             join wanted w on w.g = r.grp
+             join backfill_chunks c on c.grp = r.grp and c.day = r.day
+             where c.day >= w.oldest and (c.state = {PENDING} or (c.state = {CLAIMED} and c.claimed_at < ?))
+             order by c.day desc limit 1)
+         returning grp, day"
+    );
+    let mut values: Vec<rusqlite::types::Value> = Vec::with_capacity(groups.len() * 2 + 4);
+    for (g, oldest) in groups {
+        values.push(g.clone().into());
+        values.push((*oldest).into());
+    }
+    values.extend([CLAIMED.into(), host.to_string().into(), now.into(), (now - CLAIM_TIMEOUT).into()]);
+    let found: Option<(String, i64)> =
+        conn.prepare(&sql)?.query_row(rusqlite::params_from_iter(values), |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+    Ok(found.map(|(group, day)| Claim { group, day, server: host.to_string(), claimed_at: now }))
+}
+
+fn claim_newest(conn: &Connection, groups: &[(String, i64)], host: &str, now: i64) -> Result<Option<Claim>> {
     let rows = vec!["(?, ?)"; groups.len()].join(", ");
     let sql = format!(
         "with wanted (g, oldest) as (values {rows}),
@@ -277,6 +331,9 @@ pub fn finish(conn: &Connection, claim: &Claim, now: i64) -> Result<bool> {
         ),
         params![DONE, now, claim.group, claim.day, claim.server, claim.claimed_at],
     )?;
+    if n > 0 {
+        conn.execute("delete from backfill_wanted where grp = ?1 and day = ?2", params![claim.group, claim.day])?;
+    }
     Ok(n > 0)
 }
 
@@ -481,6 +538,27 @@ mod tests {
         assert_eq!(day(claim(&c, &groups, "a", 1000)), Some(19_998));
         assert_eq!(claim(&c, &groups, "a", 1000).unwrap(), None);
         assert_eq!(progress(&c, "g").unwrap(), (1, 3));
+    }
+
+    #[test]
+    fn a_day_asked_for_is_claimed_first() {
+        let c = conn();
+        add(&c, "g", 20_000, 19_990).unwrap();
+        add(&c, "h", 20_000, 19_990).unwrap();
+        let groups = vec![("g".to_string(), i64::MIN), ("h".to_string(), i64::MIN)];
+        assert!(want(&c, "h", 19_993, 500).unwrap());
+        assert!(!want(&c, "h", 18_000, 500).unwrap(), "no chunk for that day");
+        let a = claim(&c, &groups, "a", 1000).unwrap().unwrap();
+        assert_eq!((a.group.as_str(), a.day), ("h", 19_993));
+        // claimed by another: the rest go newest first again
+        assert_eq!(day(claim(&c, &groups, "b", 1000)), Some(20_000));
+        // a claim gone stale is taken over before the rest, and a day once done isn't asked for again
+        let late = claim(&c, &groups, "c", 1000 + CLAIM_TIMEOUT + 1).unwrap().unwrap();
+        assert_eq!((late.group.as_str(), late.day), ("h", 19_993));
+        assert!(finish(&c, &late, 5000).unwrap());
+        assert!(!want(&c, "h", 19_993, 6000).unwrap());
+        let left: i64 = c.query_row("select count(*) from backfill_wanted", [], |r| r.get(0)).unwrap();
+        assert_eq!(left, 0);
     }
 
     #[test]

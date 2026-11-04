@@ -33,6 +33,8 @@ const PER_ROUND: usize = 20;
 const SERVERS: usize = 2;
 /// around a post's first and last article
 const MARGIN: i64 = 300;
+/// a post's span past which its days aren't asked for (see `days_of`)
+const MAX_SPAN_DAYS: i64 = 2;
 /// articles below a group's last number two servers are compared over, to tell whether they are one backend
 const SAME_IDS_LOOK: u64 = 50;
 /// a window bigger than this is a busy group's hours, not a post's minutes
@@ -49,12 +51,14 @@ pub struct Window {
     pub to: i64,
 }
 
-/// A post looked at: its rows, its share then, and the windows it wants read (none: nothing to do for it).
+/// A post looked at: its rows, its share then, the windows it wants read (none: nothing to do for it), and the days of
+/// its groups' backfill to take first.
 #[derive(Debug, Default)]
 pub struct Looked {
     pub ids: Vec<i64>,
     pub permille: i64,
     pub windows: Vec<Window>,
+    pub days: Vec<(String, i64)>,
 }
 
 /// What a round found, post by post.
@@ -158,8 +162,12 @@ async fn round(
         read += post.windows.len();
         tried.extend(post.ids.iter().map(|id| (*id, post.permille)));
     }
+    let days: Vec<(String, i64)> = found.posts.iter().flat_map(|p| p.days.iter().cloned()).collect();
     on_db(db, move |conn| {
         let tx = conn.transaction()?;
+        for (group, day) in &days {
+            crate::chunks::want(&tx, group, *day, now)?;
+        }
         {
             let mut mark = tx
                 .prepare_cached("insert or replace into repair_tried (release_id, at, permille) values (?1, ?2, ?3)")?;
@@ -266,10 +274,29 @@ pub fn find(conn: &Connection, now: i64) -> rusqlite::Result<Found> {
             let permille = crate::release_info::permille_of(conn, &ids).unwrap_or(0);
             let worth = size >= MIN_BYTES && (MIN_PERMILLE..1000).contains(&permille);
             let windows = if worth { windows_of(conn, &ids)? } else { Vec::new() };
-            found.posts.push(Looked { ids, permille, windows });
+            // further from whole, what's missing is more likely in days of its groups the backfill hasn't read
+            let days = if size >= MIN_BYTES && permille < MIN_PERMILLE {
+                days_of(&windows_of(conn, &ids)?)
+            } else {
+                Vec::new()
+            };
+            found.posts.push(Looked { ids, permille, windows, days });
         }
     }
     Ok(found)
+}
+
+/// The days the whole post spans, from its first article in any group to its last, in each of its groups. None for
+/// one spread over more than `MAX_SPAN_DAYS`: a post takes hours, and a date that far off is wrong.
+fn days_of(windows: &[Window]) -> Vec<(String, i64)> {
+    let (Some(from), Some(to)) = (windows.iter().map(|w| w.from).min(), windows.iter().map(|w| w.to).max()) else {
+        return Vec::new();
+    };
+    if to - from > MAX_SPAN_DAYS * 86_400 {
+        return Vec::new();
+    }
+    let days = crate::chunks::unix_day(from)..=crate::chunks::unix_day(to);
+    windows.iter().flat_map(|w| days.clone().map(move |d| (w.group.clone(), d))).collect()
 }
 
 /// Each group's span of these rows' articles, with a margin.
@@ -305,6 +332,18 @@ mod tests {
         assert_eq!(machine("news.newshosting.com"), "news.newshosting.com");
         assert_eq!(machine("News.Newshosting.com#second"), "news.newshosting.com");
         assert_ne!(machine("127.0.0.1:1190"), machine("127.0.0.1:1191"), "a port is another server");
+    }
+
+    #[test]
+    fn a_post_wants_the_days_it_spans_in_each_of_its_groups() {
+        let w = |g: &str, from: i64, to: i64| Window { group: g.into(), from, to };
+        // posted across midnight UTC in one group, before it in the other
+        let day = 20_759 * 86_400;
+        let days = days_of(&[w("a", day - 600, day - 100), w("b", day - 300, day + 200)]);
+        let want = |g: &str, d: i64| (g.to_string(), d);
+        assert_eq!(days, [want("a", 20_758), want("a", 20_759), want("b", 20_758), want("b", 20_759)]);
+        assert!(days_of(&[]).is_empty());
+        assert!(days_of(&[w("a", day, day + 600), w("b", day, 99_999 * 86_400)]).is_empty(), "a date far off");
     }
 
     #[test]
