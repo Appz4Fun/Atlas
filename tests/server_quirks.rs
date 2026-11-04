@@ -115,6 +115,32 @@ fn a_failed_group_reply_doesnt_move_the_group() {
     assert_eq!(server, 1, "411 moves the group to a server that carries it");
 }
 
+/// A home that indexed the group before and answers 411 once (a backend in trouble) keeps it: the pass fails and is
+/// tried there again. Only replies in a row that it lacks the group move it.
+#[test]
+fn a_home_that_indexed_a_group_loses_it_only_after_misses_in_a_row() {
+    let home = Server::new(posts(50));
+    let other = Server::new(posts(50));
+    let (ph, po) = (spawn_server(home.clone()), spawn_server(other.clone()));
+    let pool = BlockingPool::new(&[mock(ph, "secret", 4, 1), mock(po, "secret", 4, 1)]);
+    let select = |known| pool.block_on(pool.pool.select_group_known(0, GROUP, known));
+
+    // one miss, then the home answers again: it stays, and the count starts over
+    home.group_replies.lock().unwrap().push_back("411 no such group".to_string());
+    assert_eq!(select(true).unwrap_err().code(), Some(411));
+    assert_eq!(select(true).unwrap().0, 0);
+    // two in a row still fail the pass on the home; the third hands it over
+    for _ in 0..3 {
+        home.group_replies.lock().unwrap().push_back("411 no such group".to_string());
+    }
+    assert_eq!(select(true).unwrap_err().code(), Some(411));
+    assert_eq!(select(true).unwrap_err().code(), Some(411));
+    assert_eq!(select(true).unwrap().0, 1, "the third miss in a row moves the group");
+    // a group the home never indexed moves on the first
+    home.group_replies.lock().unwrap().push_back("411 no such group".to_string());
+    assert_eq!(select(false).unwrap().0, 1);
+}
+
 /// A slice answered with a 5xx (an overview in trouble for a while) is asked
 /// again on the next passes instead of being taken for gone: every article
 /// still gets indexed and the backfill reaches the bottom.
