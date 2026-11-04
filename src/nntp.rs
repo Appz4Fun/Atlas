@@ -47,6 +47,11 @@ impl NntpError {
     /// Selected") from some providers. Not 430 ("Failed forwarding") or 403
     /// ("Operation failed"): those say the server couldn't answer, and a range
     /// taken for empty is never read again
+    /// The server closed the connection: nothing came back on it.
+    pub fn is_closed(&self) -> bool {
+        matches!(self, NntpError::Io(e) if e.kind() == io::ErrorKind::UnexpectedEof)
+    }
+
     pub fn is_empty_range(&self) -> bool {
         matches!(self.code(), Some(420 | 423))
     }
@@ -389,6 +394,13 @@ pub fn carries_not(e: &NntpError) -> bool {
 const STREAM_END_WAIT: Duration = Duration::from_secs(2);
 /// after a failed connect a server is skipped for this long (connect() still tries it)
 const DOWN_FOR: Duration = Duration::from_secs(60);
+/// An idle connection older than this is closed rather than used again: providers drop idle connections (frugal says
+/// "400 Idle timeout"), and on prod passes failed with "connection closed" on them, hundreds of times an hour.
+const STALE_IDLE: Duration = Duration::from_secs(30);
+
+fn is_stale(idle_since: Option<Instant>) -> bool {
+    idle_since.is_some_and(|t| t.elapsed() >= STALE_IDLE)
+}
 /// GROUPs refused with 500/501 in a row before a server counts as article only
 const GROUP_REFUSALS: usize = 3;
 /// how often a request in flight looks at the stop flag
@@ -496,6 +508,8 @@ pub struct Conn {
     /// the server's key, for metrics
     server: Arc<str>,
     rate_limiter: Arc<TokenBucket>,
+    /// when it went back to the pool unused, see `STALE_IDLE`
+    idle_since: Option<Instant>,
 }
 
 /// One command being measured, see `Conn::measure`.
@@ -629,6 +643,7 @@ impl Conn {
             sent: 0,
             server: Arc::from(""),
             rate_limiter: Arc::new(TokenBucket::new(0, 0)),
+            idle_since: None,
         }
     }
 
@@ -1438,7 +1453,8 @@ impl Drop for Lease {
     fn drop(&mut self) {
         self.collect_traffic();
         // half a reply left unread would be the next request's answer
-        if let Some(conn) = self.conn.take().filter(|c| !self.busy && !c.poisoned) {
+        if let Some(mut conn) = self.conn.take().filter(|c| !self.busy && !c.poisoned) {
+            conn.idle_since = Some(Instant::now());
             self.server.idle.lock().unwrap().push(conn);
         }
     }
@@ -2030,6 +2046,8 @@ impl Pool {
     ) -> Result<Option<Lease>> {
         let idle = {
             let mut idle = server.idle.lock().unwrap();
+            // a server closes a connection that sat idle a while, and the next request on it would fail the pass
+            idle.retain(|c| !is_stale(c.idle_since));
             let on_group = group.and_then(|g| idle.iter().rposition(|c| c.group.as_deref() == Some(g)));
             match on_group {
                 Some(pos) => Some(idle.swap_remove(pos)),
@@ -2707,6 +2725,8 @@ impl Pool {
                 self.no_compression(i, &e);
                 self.xover_once(i, group, start, end).await
             }
+            // the server closed the connection before answering: once more, on another one
+            Err(e) if e.is_closed() => self.xover_once(i, group, start, end).await,
             r => r,
         }
     }
@@ -3505,6 +3525,61 @@ mod tests {
 
     use super::*;
     use tokio::io::AsyncWriteExt;
+
+    #[test]
+    fn a_connection_idle_a_while_is_stale() {
+        assert!(!is_stale(None), "in use, or new");
+        assert!(!is_stale(Some(Instant::now())));
+        assert!(is_stale(Instant::now().checked_sub(STALE_IDLE)));
+    }
+
+    /// A server that drops each connection's first XOVER without a word, as one does an idle connection it timed
+    /// out, and answers on the next connection.
+    #[test]
+    fn an_xover_the_server_hangs_up_on_is_asked_again_on_another_connection() {
+        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let connections = Arc::new(AtomicUsize::new(0));
+            let seen = connections.clone();
+            tokio::spawn(async move {
+                loop {
+                    let Ok((sock, _)) = listener.accept().await else { return };
+                    let first = seen.fetch_add(1, Ordering::SeqCst) == 0;
+                    tokio::spawn(async move {
+                        let (read, mut write) = sock.into_split();
+                        let mut lines = tokio::io::BufReader::new(read);
+                        let _ = write.write_all(b"200 hi\r\n").await;
+                        loop {
+                            let mut line = String::new();
+                            if tokio::io::AsyncBufReadExt::read_line(&mut lines, &mut line).await.unwrap_or(0) == 0 {
+                                return;
+                            }
+                            let reply: &[u8] = match line.split_whitespace().next().unwrap_or("") {
+                                "AUTHINFO" if line.contains("USER") => b"381 more\r\n",
+                                "AUTHINFO" => b"281 ok\r\n",
+                                "GROUP" => b"211 2 1 2 g\r\n",
+                                "XOVER" if first => return,
+                                "XOVER" => {
+                                    b"224 ok\r\n1\ta\tp\tdate\t<1@x>\t\t10\t1\r\n2\tb\tp\tdate\t<2@x>\t\t10\t1\r\n.\r\n"
+                                }
+                                _ => b"500 what\r\n",
+                            };
+                            let _ = write.write_all(reply).await;
+                        }
+                    });
+                }
+            });
+            let mut server = UsenetServer::new("127.0.0.1", "u", "p", port);
+            server.ssl = Some(false);
+            server.compress = Some(false);
+            let pool = Pool::new(&[server]);
+            let rows = pool.xover_on(0, "g", 1, 2).await.unwrap();
+            assert_eq!(rows.iter().map(|o| o.number).collect::<Vec<_>>(), [1, 2]);
+            assert_eq!(connections.load(Ordering::SeqCst), 2);
+        });
+    }
 
     fn yenc_encode(data: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
