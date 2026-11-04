@@ -233,3 +233,43 @@ fn category_off_writes_nothing() {
     std::thread::sleep(Duration::from_millis(300));
     assert_eq!(category(&h, MOVIES, id), None);
 }
+
+fn exists(h: &Harness, group: &str, name: &str) -> bool {
+    shard_of(h, group).query_row("select 1 from releases where name = ?", [name], |_| Ok(())).is_ok()
+}
+
+fn junk(h: &Harness, group: &str, name: &str) -> Option<String> {
+    shard_of(h, group).query_row("select reason from junk_releases where name = ?", [name], |r| r.get(0)).ok()
+}
+
+#[test]
+fn a_pc_release_is_deleted_as_junk_but_one_with_video_stays() {
+    let mut h = fresh();
+    let software = "Some.Tool.v2.1.Incl.Keygen-CORE";
+    let film = "Some.Tool.v2.1.Incl.Keygen-FILM";
+    h.save(&[in_group(software, "core.rar", MISC), in_group(film, "film.mkv", MISC)]);
+    let id = id_in(&h, MISC, film);
+    start(&mut h, config(), vec![step()], Pool::new(&[]));
+    wait_for("the software gone", || !exists(&h, MISC, software));
+    assert_eq!(junk(&h, MISC, software).as_deref(), Some("pc_category"));
+    wait_for("the film looked at", || done(&h, MISC, id) & BIT != 0);
+    assert!(exists(&h, MISC, film));
+    assert_eq!(category(&h, MISC, id), None, "no PC row");
+}
+
+#[test]
+fn a_stored_program_inside_an_archive_deletes_the_release() {
+    let mut h = fresh();
+    let name = "Some.Movie.2019.1080p.BluRay.x264-GRP";
+    h.save(&[in_group(name, "x.part01.rar", MOVIES)]);
+    let id = id_in(&h, MOVIES, name);
+    shard_of(&h, MOVIES)
+        .execute(
+            "insert into archive_inner_files (release_id, seq, name, size, source) values (?, 0, 'Codec.Setup.exe', 1, 1)",
+            [id],
+        )
+        .unwrap();
+    start(&mut h, config(), vec![step()], Pool::new(&[]));
+    wait_for("it gone", || !exists(&h, MOVIES, name));
+    assert_eq!(junk(&h, MOVIES, name).as_deref(), Some("executable_inside"));
+}

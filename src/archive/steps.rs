@@ -96,6 +96,10 @@ fn finish_with_override(
 ) -> Result<Outcome, StepError> {
     let release = ctx.release();
     let id = release.id;
+    // a program inside: the release goes, see `junk`
+    if listing.files.iter().any(|f| crate::junk::is_executable(&f.name)) {
+        return Ok(Outcome { junk: Some(crate::junk::EXECUTABLE_INSIDE), ..Default::default() });
+    }
     let mut writes = Vec::new();
     let rows = collapse_volumes(&listing.files);
     let pw = password_override.unwrap_or_else(|| listing.password());
@@ -224,8 +228,7 @@ fn restore_archive(
     });
     let files: Vec<InnerFile> = saved.files.into_iter().map(|f| InnerFile { name: f.name, size: f.size }).collect();
     let password_override = saved.password.and_then(super::Password::from_code);
-    let encrypted =
-        password_override == Some(super::Password::Yes) || saved.encryption.is_some() || saved.names_hidden;
+    let encrypted = password_override == Some(super::Password::Yes) || saved.encryption.is_some() || saved.names_hidden;
     let listing = Listing {
         files,
         encrypted,
@@ -245,8 +248,7 @@ fn restore_par2(
     meta: Option<crate::raw_store::SavedPar2>,
     limits: &ArchiveConfig,
 ) -> Result<Outcome, StepError> {
-    let restored: Vec<InnerFile> =
-        saved_files.into_iter().map(|f| InnerFile { name: f.name, size: f.size }).collect();
+    let restored: Vec<InnerFile> = saved_files.into_iter().map(|f| InnerFile { name: f.name, size: f.size }).collect();
     let covers_all = meta.as_ref().is_some_and(|m| m.covers_all);
     let content_fp = meta.as_ref().and_then(|m| m.content_fp.clone());
     let mut outcome = finish_with_override(
@@ -271,10 +273,9 @@ fn restore_par2(
             outcome.writes.push(StepWrite::new(duplicates::SET_POSTED, vec![id.into(), posted.into()]));
         }
         if let Some((block, blocks)) = m.sizes {
-            outcome.writes.push(StepWrite::new(
-                duplicates::SET_PAR2_SIZES,
-                vec![id.into(), block.into(), blocks.into()],
-            ));
+            outcome
+                .writes
+                .push(StepWrite::new(duplicates::SET_PAR2_SIZES, vec![id.into(), block.into(), blocks.into()]));
         }
     }
     Ok(outcome)

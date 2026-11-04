@@ -251,6 +251,8 @@ pub struct Outcome {
     /// then dropped, on any path. So a step can hold something for exactly as
     /// long as its result isnt committed.
     pub hold: Option<Box<dyn std::any::Any + Send>>,
+    /// what it found makes the release junk: it is deleted in place of these writes, see `junk`
+    pub junk: Option<&'static str>,
 }
 
 pub struct StepWrite {

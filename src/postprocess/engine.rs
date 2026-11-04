@@ -587,6 +587,9 @@ impl Inner {
         };
         let reject = |reason: rules::Reason| {
             self.stats.rejected(reason);
+            if reason == rules::Reason::Executable {
+                return Some(Applied { junk: Some(crate::junk::EXECUTABLE), ..base_copy(&base) });
+            }
             // a queue row goes, a state row is no longer wanted by the net lane, a walk row writes nothing
             (due.is_some() || row.has_state).then(|| Applied { no_state: !row.has_state, ..base_copy(&base) })
         };
@@ -602,6 +605,11 @@ impl Inner {
                 return Some(Applied { queue_at: Some(until), clear, no_state: clear == 0, ..base_copy(&base) });
             }
             Verdict::Pass => {}
+        }
+        // what earlier runs stored can make it junk too: a program inside, or PC
+        // (a read that fails only puts it off to the next visit)
+        if let Ok(Some(reason)) = crate::junk::inner_or_pc(conn, row.info.id, summary.has_video) {
+            return Some(Applied { junk: Some(reason), ..base_copy(&base) });
         }
 
         let enabled = self.enabled();
@@ -639,6 +647,9 @@ impl Inner {
             match ran {
                 Ran::Outcome(mut o) => {
                     batch.holds.extend(o.hold.take());
+                    if let Some(reason) = o.junk {
+                        return Some(Applied { junk: Some(reason), ..base_copy(&a) });
+                    }
                     if let Some(until) = o.wait_until {
                         // what it got as far as is kept, for the run that picks it up again
                         a.writes.extend(std::mem::take(&mut o.writes).into_iter().map(|w| (bit, w)));
@@ -875,6 +886,9 @@ impl Inner {
             Verdict::Reject(reason) => {
                 self.stats.rejected(reason);
                 a.net_mask = 0;
+                if reason == rules::Reason::Executable {
+                    a.junk = Some(crate::junk::EXECUTABLE);
+                }
             }
             // not settled: it stays wanted, and its lane comes back then
             Verdict::Wait(until) => {
@@ -977,6 +991,10 @@ impl Inner {
                 Ran::Outcome(mut o) => {
                     self.net_troubles.store(0, Relaxed);
                     batch.holds.extend(o.hold.take());
+                    if let Some(reason) = o.junk {
+                        batch.applied.push(Applied { junk: Some(reason), ..base_copy(&a) });
+                        return self.send(db, shard, batch, now, |_| Ok(()));
+                    }
                     if let Some(until) = o.wait_until {
                         a.writes.extend(std::mem::take(&mut o.writes).into_iter().map(|w| (bit, w)));
                         // what it waits for needn't hold up the steps after it
@@ -1106,6 +1124,13 @@ fn seed_shard(conn: &Connection, enabled: StepMask, stamps: &[(u8, StepMask, i64
         // it visits every row, soo no `steps` walk beside it
         walk("backlog", 0)?;
         set("pp_walk_seeded", now)?;
+    }
+    // once, for the rows from before junk was deleted: every visit looks for it (see `junk`)
+    if meta("pp_junk_walk")?.is_none() {
+        if seeded {
+            walk("junk", 0)?;
+        }
+        set("pp_junk_walk", now)?;
     }
     let seen = meta("pp_steps_seen")?.unwrap_or(0);
     let new = if seeded { enabled & !seen } else { enabled };

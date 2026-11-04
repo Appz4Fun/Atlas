@@ -13,7 +13,8 @@ use rusqlite::{Connection, params};
 use crate::config::PostprocessConfig;
 use crate::filters::{self, StoredPost};
 
-pub(crate) static PAR2: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\.(vol[0-9]+[+-][0-9]+\.par2|par2)$").unwrap());
+pub(crate) static PAR2: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\.(vol[0-9]+[+-][0-9]+\.par2|par2)$").unwrap());
 /// a file nothing should fetch a body of
 pub(crate) static IMAGE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\.(jpe?g|png|gif|webp|bmp|tiff?)$").unwrap());
@@ -26,6 +27,8 @@ pub enum Reason {
     Fragment,
     TooFewFiles,
     Par2Only,
+    /// a program among its files: the release is deleted, see `junk`
+    Executable,
 }
 
 impl Reason {
@@ -37,6 +40,7 @@ impl Reason {
             Reason::Fragment => "fragment",
             Reason::TooFewFiles => "too_few_files",
             Reason::Par2Only => "par2_only",
+            Reason::Executable => "executable",
         }
     }
 }
@@ -75,6 +79,10 @@ pub struct FileSummary {
     pub wanted: i64,
     pub all_par2: bool,
     pub all_images: bool,
+    /// a file that is a program
+    pub executable: bool,
+    /// a video file: what keeps a PC match, see `junk`
+    pub has_video: bool,
     pub single_part: Option<i64>,
     pub single_expected: Option<i64>,
     pub single_subject: Option<String>,
@@ -140,6 +148,8 @@ pub fn file_summaries(conn: &Connection, ids: &[i64]) -> rusqlite::Result<HashMa
             }
             s.all_par2 &= PAR2.is_match(&filename);
             s.all_images &= IMAGE.is_match(&filename);
+            s.executable |= crate::junk::is_executable(&filename);
+            s.has_video |= crate::junk::is_video(&filename);
             if s.files == 1 {
                 s.single_part = part;
                 s.single_expected = expected;
@@ -158,6 +168,10 @@ pub fn file_summaries(conn: &Connection, ids: &[i64]) -> rusqlite::Result<HashMa
 pub fn judge_files(rules: &Rules, row: &RowFacts<'_>, s: &FileSummary, now: i64) -> Verdict {
     if s.files == 0 {
         return Verdict::Reject(Reason::Empty);
+    }
+    // nothing still to come can make it wanted
+    if s.executable {
+        return Verdict::Reject(Reason::Executable);
     }
     let quiet = if row.complete { rules.config.complete_settle_secs } else { rules.config.settle_secs };
     if now - s.last_touch < quiet {
@@ -265,6 +279,11 @@ mod tests {
         assert_eq!(judge(&row(10, 1, false), &fresh), Verdict::Wait(NOW - 10 + 7200));
         // no touch recorded: old
         assert_eq!(judge(&row(10, 2, true), &FileSummary { last_touch: 0, ..summary() }), Verdict::Pass);
+        // a program goes at once, settled or not
+        assert_eq!(
+            judge(&row(10, 1, false), &FileSummary { executable: true, ..fresh.clone() }),
+            Verdict::Reject(Reason::Executable)
+        );
 
         // a settled fragment, with no wait past settling
         let subject = format!(r#""{TOKEN}" yEnc (7/9)"#);

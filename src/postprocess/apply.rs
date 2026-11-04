@@ -43,6 +43,8 @@ pub(crate) struct Applied {
     pub queue_at: Option<i64>,
     /// nothing worth a `pp_state` row
     pub no_state: bool,
+    /// deleted, with why, in place of all else here (see `junk`)
+    pub junk: Option<&'static str>,
 }
 
 /// Names a transaction wrote: each one's source, and whether it was the first
@@ -121,6 +123,10 @@ fn write(conn: &Connection, mut a: Applied, now: i64, renames: &mut Renames) -> 
         // gone while it ran. the trigger took its rows
         return Ok(());
     };
+    if let Some(reason) = a.junk {
+        crate::junk::remove(conn, a.release_id, reason, now)?;
+        return Ok(());
+    }
 
     // bits cleared since the claim may include a step that just ran, on input older
     // than the request: all of its result is dropped, and it runs again

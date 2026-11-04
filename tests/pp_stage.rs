@@ -248,6 +248,7 @@ fn walkable(h: &Harness, n: usize) {
          insert into pp_walks (kind, top_id, before_id, created_at)
          select 'test', t, t, 1 from (select max(id) + 1 as t from releases);
          insert or replace into meta (key, value) values ('pp_walk_seeded', 1);
+         insert or replace into meta (key, value) values ('pp_junk_walk', 1);
          insert or replace into meta (key, value) values ('pp_steps_seen', 512);",
     )
     .unwrap();

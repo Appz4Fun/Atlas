@@ -30,6 +30,7 @@ pub struct Stats {
     pub fragment: AtomicU64,
     pub too_few_files: AtomicU64,
     pub par2_only: AtomicU64,
+    pub executable: AtomicU64,
     pub bodies: AtomicU64,
     pub body_bytes: AtomicU64,
     /// bounded counts, refreshed every 30 s
@@ -53,6 +54,7 @@ impl Stats {
             Reason::Fragment => &self.fragment,
             Reason::TooFewFiles => &self.too_few_files,
             Reason::Par2Only => &self.par2_only,
+            Reason::Executable => &self.executable,
         };
         counter.fetch_add(1, Relaxed);
     }
@@ -76,6 +78,7 @@ impl Stats {
                 Reason::Fragment.name(): n(&self.fragment),
                 Reason::TooFewFiles.name(): n(&self.too_few_files),
                 Reason::Par2Only.name(): n(&self.par2_only),
+                Reason::Executable.name(): n(&self.executable),
             },
             "archive_names_over_quota": i(&self.names_over_quota),
             "bodies": n(&self.bodies),
