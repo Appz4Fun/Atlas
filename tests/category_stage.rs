@@ -273,3 +273,21 @@ fn a_stored_program_inside_an_archive_deletes_the_release() {
     wait_for("it gone", || !exists(&h, MOVIES, name));
     assert_eq!(junk(&h, MOVIES, name).as_deref(), Some("executable_inside"));
 }
+
+#[test]
+fn stored_junk_goes_even_when_the_rules_reject_the_row() {
+    let mut h = fresh();
+    let name = "Some.Movie.2019.1080p.BluRay.x264-GRP";
+    h.save(&[in_group(name, "x.part01.rar", MOVIES)]);
+    let id = id_in(&h, MOVIES, name);
+    shard_of(&h, MOVIES)
+        .execute(
+            "insert into archive_inner_files (release_id, seq, name, size, source) values (?, 0, 'Setup.exe', 1, 1)",
+            [id],
+        )
+        .unwrap();
+    let config =
+        Config { postprocess: PostprocessConfig { min_size_bytes: 1 << 40, ..quick_config() }, ..Config::default() };
+    start(&mut h, config, vec![step()], Pool::new(&[]));
+    wait_for("it gone", || !exists(&h, MOVIES, name));
+}

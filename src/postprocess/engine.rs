@@ -590,6 +590,10 @@ impl Inner {
             if reason == rules::Reason::Executable {
                 return Some(Applied { junk: Some(crate::junk::EXECUTABLE), ..base_copy(&base) });
             }
+            // what is stored can make a row junk whatever else rejects it (a failed read puts it off to the next visit)
+            if let Ok(Some(junk)) = crate::junk::stored_reason(conn, row.info.id) {
+                return Some(Applied { junk: Some(junk), ..base_copy(&base) });
+            }
             // a queue row goes, a state row is no longer wanted by the net lane, a walk row writes nothing
             (due.is_some() || row.has_state).then(|| Applied { no_state: !row.has_state, ..base_copy(&base) })
         };
@@ -893,6 +897,8 @@ impl Inner {
                 a.net_mask = 0;
                 if reason == rules::Reason::Executable {
                     a.junk = Some(crate::junk::EXECUTABLE);
+                } else if let Ok(Some(junk)) = crate::junk::stored_reason(conn, id) {
+                    a.junk = Some(junk);
                 }
             }
             // not settled: it stays wanted, and its lane comes back then

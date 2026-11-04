@@ -123,10 +123,6 @@ fn write(conn: &Connection, mut a: Applied, now: i64, renames: &mut Renames) -> 
         // gone while it ran. the trigger took its rows
         return Ok(());
     };
-    if let Some(reason) = a.junk {
-        crate::junk::remove(conn, a.release_id, reason, now)?;
-        return Ok(());
-    }
 
     // bits cleared since the claim may include a step that just ran, on input older
     // than the request: all of its result is dropped, and it runs again
@@ -136,6 +132,14 @@ fn write(conn: &Connection, mut a: Applied, now: i64, renames: &mut Renames) -> 
         .optional()?;
     let dropped = stale.filter(|(differs, _)| *differs).map(|(_, mask)| mask);
     let is_stale = dropped.is_some();
+    // a program stays a program, but a PC verdict rests on the name and files the run saw: a rerun asked for since (a
+    // rename) drops it, and `junk::remove` looks for a video that came meanwhile
+    if let Some(reason) = a.junk {
+        if !(is_stale && reason == crate::junk::PC) {
+            crate::junk::remove(conn, a.release_id, reason, now)?;
+        }
+        return Ok(());
+    }
     let dropped = dropped.unwrap_or(0);
 
     for (step, w) in a.writes.drain(..) {
