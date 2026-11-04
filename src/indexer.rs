@@ -354,6 +354,14 @@ enum WriterJob {
 /// time a writer spends on stage work after each save, and with no save waiting
 const STAGE_BUDGET_BUSY: Duration = Duration::from_millis(25);
 const STAGE_BUDGET_IDLE: Duration = Duration::from_millis(200);
+/// While saves come in, stage work gets this much of a writer's time per second it spent saving, banked up to
+/// `STAGE_BANK` seconds. A stage job can take seconds and saves queue behind it: on prod the stage took about 80% of
+/// the writers' time while slices waited 88 s on average to be saved, with the unsaved headers budget full, and
+/// indexing waited for that budget.
+const STAGE_SHARE: f64 = 0.5;
+const STAGE_BANK: f64 = 10.0;
+/// with no save for this long, stage work runs as much as it likes
+const STAGE_QUIET: Duration = Duration::from_secs(1);
 
 /// `conn` is the main database. The writer threads end once every clone of
 /// the `Db` is gone, and the last clone to go waits for them.
@@ -400,11 +408,23 @@ fn writer(
     // stage work waits here, between saves
     let mut stage: std::collections::VecDeque<StageJob> = Default::default();
     let mut last_housekeeping = std::time::Instant::now();
+    // stage time owed while saves come in (see `STAGE_SHARE`), and when the last save was
+    let mut bank = 0.0f64;
+    let mut last_save: Option<std::time::Instant> = None;
 
     loop {
+        let since_save = last_save.map_or(STAGE_QUIET, |t| t.elapsed());
+        let wait = if stage.is_empty() {
+            idle
+        } else if bank > 0.0 || since_save >= STAGE_QUIET {
+            Duration::ZERO
+        } else {
+            // saves are coming and stage work has had its share: give a save the chance to come first
+            STAGE_QUIET - since_save
+        };
         let first = match next.take() {
             Some(job) => job,
-            None => match jobs.recv_timeout(if stage.is_empty() { idle } else { Duration::ZERO }) {
+            None => match jobs.recv_timeout(wait) {
                 Ok(WriterJob::Save(job)) => job,
                 Ok(WriterJob::Stage(job)) => {
                     stage.push_back(job);
@@ -419,7 +439,11 @@ fn writer(
                     continue;
                 }
                 Err(RecvTimeoutError::Timeout) => {
-                    run_stage_jobs(&mut opened, path, &mut stage, Some(STAGE_BUDGET_IDLE));
+                    let quiet = last_save.is_none_or(|t| t.elapsed() >= STAGE_QUIET);
+                    let spent = run_stage_jobs(&mut opened, path, &mut stage, Some(STAGE_BUDGET_IDLE));
+                    if !quiet {
+                        bank -= spent;
+                    }
                     if last_housekeeping.elapsed() >= Duration::from_secs(1) {
                         if let Ok(conn) = &mut opened {
                             housekeeping(conn, &mut store, true);
@@ -469,7 +493,11 @@ fn writer(
         for job in batch {
             let _ = job.done.send(result.clone());
         }
-        run_stage_jobs(&mut opened, path, &mut stage, Some(STAGE_BUDGET_BUSY));
+        bank = (bank + t.elapsed().as_secs_f64() * STAGE_SHARE).min(STAGE_BANK);
+        last_save = Some(std::time::Instant::now());
+        if bank > 0.0 {
+            bank -= run_stage_jobs(&mut opened, path, &mut stage, Some(STAGE_BUDGET_BUSY));
+        }
 
         // housekeeping between transactions
         if let Ok(conn) = &mut opened {
@@ -499,13 +527,13 @@ fn writer(
     run_stage_jobs(&mut opened, path, &mut stage, None);
 }
 
-/// Stage jobs, each in one transaction, for at most `budget` (None: all of them).
+/// Stage jobs, each in one transaction, for at most `budget` (None: all of them). Returns the seconds they took.
 fn run_stage_jobs(
     opened: &mut rusqlite::Result<Connection>,
     path: &std::path::Path,
     stage: &mut std::collections::VecDeque<StageJob>,
     budget: Option<Duration>,
-) {
+) -> f64 {
     use crate::profile::{LOAD, Load};
     use std::sync::atomic::Ordering::Relaxed;
 
@@ -529,6 +557,7 @@ fn run_stage_jobs(
             break;
         }
     }
+    start.elapsed().as_secs_f64()
 }
 
 fn stage_transaction(conn: &Connection, work: StageWork) -> rusqlite::Result<()> {
@@ -2863,6 +2892,41 @@ mod tests {
         for answer in answers {
             answer.recv().unwrap().unwrap();
         }
+    }
+
+    /// right after a save, stage work waits its share or a quiet moment, and then runs
+    #[test]
+    fn stage_jobs_run_once_saves_go_quiet() {
+        let (_dir, db, _shard) = stage_db();
+        let group = (0..).map(|i| format!("alt.binaries.g{i}")).find(|g| crate::store::shard_of(g) == 0).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let article = crate::parser::Article {
+            message_id: "<a@x>".into(),
+            filename: Some("a".into()),
+            part: Some(1),
+            total_parts: Some(1),
+            ..Default::default()
+        };
+        runtime
+            .block_on(db.save(vec![Release { name: "a".into(), group, articles: vec![article], ..Default::default() }]))
+            .unwrap();
+        let start = std::time::Instant::now();
+        let answers: Vec<_> = (0..20)
+            .map(|_| {
+                db.on_writer(
+                    0,
+                    Box::new(|_| {
+                        std::thread::sleep(Duration::from_millis(50));
+                        Ok(())
+                    }),
+                )
+                .unwrap()
+            })
+            .collect();
+        for answer in answers {
+            answer.recv_timeout(Duration::from_secs(10)).unwrap().unwrap();
+        }
+        assert!(start.elapsed() < STAGE_QUIET + Duration::from_secs(3), "{:?}", start.elapsed());
     }
 
     #[test]
