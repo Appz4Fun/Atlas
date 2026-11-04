@@ -320,7 +320,7 @@ impl Inner {
         let answers: Vec<_> = (0..SHARDS)
             .filter_map(|shard| {
                 let stamps = stamps.clone();
-                db.on_writer(shard, Box::new(move |conn| seed_shard(conn, enabled, &stamps, now))).ok()
+                db.on_writer(shard, "db.stage.seed", Box::new(move |conn| seed_shard(conn, enabled, &stamps, now))).ok()
             })
             .collect();
         for answer in answers {
@@ -526,6 +526,7 @@ impl Inner {
         let filling = written.clone();
         let answer = db.on_writer(
             shard,
+            "db.stage.apply",
             Box::new(move |conn| {
                 let mut renames = filling.lock().unwrap();
                 for a in applied {
@@ -993,6 +994,7 @@ impl Inner {
             let begin_at = now + NET_CRASH_RETRY;
             let answer = db.on_writer(
                 shard,
+                "db.stage.net_begin",
                 Box::new(move |tx| {
                     tx.prepare_cached(
                         "update pp_state set net_attempts = net_attempts + 1, net_next_at = ? where release_id = ?",

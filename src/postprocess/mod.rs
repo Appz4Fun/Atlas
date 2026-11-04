@@ -117,8 +117,11 @@ impl Stage {
     pub fn rerun(&self, release_id: i64, clear: StepMask) -> anyhow::Result<()> {
         let db = self.db.lock().unwrap().clone().ok_or_else(|| anyhow::anyhow!("the stage has stopped"))?;
         let now = chrono::Utc::now().timestamp();
-        let answer =
-            db.on_writer(store::shard_of_id(release_id), Box::new(move |conn| rerun_on(conn, release_id, clear, now)))?;
+        let answer = db.on_writer(
+            store::shard_of_id(release_id),
+            "db.stage.rerun",
+            Box::new(move |conn| rerun_on(conn, release_id, clear, now)),
+        )?;
         answer.recv()?.map_err(anyhow::Error::msg)
     }
 
