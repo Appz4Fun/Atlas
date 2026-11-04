@@ -205,6 +205,8 @@ pub fn migrate_shard(conn: &Connection) -> Result<()> {
         -- which release a collection's articles go to, by its keyed hash
         -- (`collections.rs`): a post's files share a release whatever they are called
         create table if not exists collections (key INTEGER PRIMARY KEY, release_id INTEGER NOT NULL) without rowid;
+        -- a release's keys, for `junk::remove` (a scan of the table each, minutes for a batch of junk)
+        create index if not exists collections_release on collections(release_id);
 
         -- what a row a save couldnt tell from a copy of its sealed file's
         -- article said about the file, folded in when sealing tells (`seal_rows`)
