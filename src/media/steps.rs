@@ -286,10 +286,15 @@ impl Step for MediaLookup {
         let decoded = match (allocine_id(title), self.0.allocine()) {
             (Some(ac), Some(allocine)) => match allocine.decode(kind, ac) {
                 Ok(found) => found,
+                // as `resolve` does on its way out: another release of the title may ask it next
                 Err(Trouble::Paused(t) | Trouble::BadKey(t)) => {
+                    self.0.clear_claim(key);
                     return Ok(Outcome { wait_until: Some(t + id.rem_euclid(30)), ..Outcome::default() });
                 }
-                Err(Trouble::Bad(e)) => return Err(StepError::Retry(e)),
+                Err(Trouble::Bad(e)) => {
+                    self.0.clear_claim(key);
+                    return Err(StepError::Retry(e));
+                }
             },
             _ => None,
         };

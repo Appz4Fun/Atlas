@@ -984,3 +984,15 @@ fn wikidatas_ids_land_when_the_page_cant_be_read() {
     assert_eq!(row(&h, name).unwrap().imdb, Some(16_358_384));
     assert!(s.requests().iter().any(|q| q.contains("ficheserie_gen_cserie=30890")), "{:?}", s.requests());
 }
+
+#[test]
+fn a_decode_that_fails_lets_the_titles_next_release_ask() {
+    let mut h = fresh();
+    let name = "AC30890.S04E01.MULTi.1080p.WEB.H264-GL0P";
+    h.save(&[complete(name)]);
+    let s = FixtureServer::start(vec![route("/sparql", "not json".into())]);
+    let (media, _db) = start(&mut h, allocine_on(maze(&s), &s));
+    let k = key(Kind::Tv, "AC30890", None);
+    wait_for("the failed decode", || s.requests().iter().any(|q| q.starts_with("/sparql")));
+    wait_for("the claim let go", || media.wants(Kind::Tv, k, i64::MAX - 1, chrono::Utc::now().timestamp()));
+}
