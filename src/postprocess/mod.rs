@@ -102,13 +102,15 @@ impl Stage {
                         .expect("couldnt start a processing thread"),
                 );
             }
-            let (inner, db) = (inner.clone(), p.db.clone());
-            threads.push(
-                std::thread::Builder::new()
-                    .name("atlas-pp-rank".into())
-                    .spawn(move || inner.rank_lane(db))
-                    .expect("couldnt start a processing thread"),
-            );
+            for shard in 0..store::SHARDS {
+                let (inner, db) = (inner.clone(), p.db.clone());
+                threads.push(
+                    std::thread::Builder::new()
+                        .name(format!("atlas-pp-rank-{shard}"))
+                        .spawn(move || inner.rank_lane(db, shard))
+                        .expect("couldnt start a processing thread"),
+                );
+            }
         }
         Arc::new(Stage { inner, db: Mutex::new(Some(p.db)), threads: Mutex::new(threads) })
     }
