@@ -192,7 +192,34 @@ fn remap_bracket_parts(articles: &mut [Article]) {
 /// Bucket articles into releases by their parsed release name, keeping
 /// first-seen order. What was there before collections, and what they fall back on.
 pub fn group_articles(articles: Vec<Article>) -> IndexMap<String, Release> {
-    group_articles_by(articles, |_, _| None)
+    group_articles_by(articles, |_, _| None, &mut Unparsable::default())
+}
+
+/// The articles of a slice no subject rule reads, by what their subject looks like, with their bytes: most are
+/// uploads obfuscated per article, which nothing links yet (see `docs/research/posting-behavior`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Unparsable {
+    /// ngPost `-x`: the subject is the Message-ID's local part
+    pub id_subject: (u64, i64),
+    /// one random token of 16+ letters and digits, and nothing else
+    pub token: (u64, i64),
+    pub other: (u64, i64),
+}
+
+impl Unparsable {
+    pub fn note(&mut self, article: &Article) {
+        let subject = article.subject.trim();
+        let local = article.message_id.trim_matches(|c| c == '<' || c == '>').split('@').next().unwrap_or("");
+        let slot = if !subject.is_empty() && subject == local {
+            &mut self.id_subject
+        } else if subject.len() >= 16 && subject.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+            &mut self.token
+        } else {
+            &mut self.other
+        };
+        slot.0 += 1;
+        slot.1 += article.bytes.max(0);
+    }
 }
 
 /// Bucket articles into releases by what `collection_of` says, or their parsed
@@ -200,6 +227,7 @@ pub fn group_articles(articles: Vec<Article>) -> IndexMap<String, Release> {
 pub fn group_articles_by(
     articles: Vec<Article>,
     mut collection_of: impl FnMut(&Article, &ParsedSubject) -> Option<String>,
+    unparsable: &mut Unparsable,
 ) -> IndexMap<String, Release> {
     let total = articles.len();
     let mut releases: IndexMap<String, Release> = IndexMap::new();
@@ -208,6 +236,7 @@ pub fn group_articles_by(
     for mut article in articles {
         let Some(parsed) = parse_subject(&article.subject) else {
             dropped += 1;
+            unparsable.note(&article);
             continue;
         };
 
@@ -372,6 +401,23 @@ mod tests {
     fn short_names_get_file_total() {
         let p = parse_subject(r#"[1/4] "a.rar" yEnc (1/1)"#).unwrap();
         assert_eq!(p.release_name, "a [4]");
+    }
+
+    #[test]
+    fn unparsable_subjects_are_told_by_their_shape() {
+        let a = |subject: &str, id: &str| Article {
+            subject: subject.into(),
+            message_id: id.into(),
+            bytes: 740_000,
+            ..Default::default()
+        };
+        let mut u = Unparsable::default();
+        u.note(&a("22f3651d2b664749bcac60fc56a9dd1f", "<22f3651d2b664749bcac60fc56a9dd1f@ngPost>"));
+        u.note(&a("auQaSojX0x9zXS0sp4fFntDBfD", "<xGeu35HP6VZvsBVKPualFQjF@ejJwrvMhTwXI.1at>"));
+        u.note(&a("hello there", "<x@y>"));
+        assert_eq!(u.id_subject, (1, 740_000));
+        assert_eq!(u.token, (1, 740_000));
+        assert_eq!(u.other, (1, 740_000));
     }
 
     #[test]

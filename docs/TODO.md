@@ -30,6 +30,15 @@ Atlas gathers these into one release per upload (`filters::gather_per_article`).
 - **`t=get&file=N` isn't advertised.** It isn't in the Newznab spec, and results don't list a release's files. Fix: a files attribute on results, or a `t=files` listing.
 - **AI search still drops them** (`src/ai.rs`), since it has no use for a release it can't name.
 
+## Uploads obfuscated per article, with no counter
+
+`parse_subject` drops articles whose subject has no `(n/m)`, and `gather_per_article` only gathers ones that have it. In a 3,000-header sample of each of several movie groups on 2026-11-04 these were most of the traffic: `alt.binaries.hdtv` 95% of bytes, `movies` 94%, `misc` 71%, `multimedia.aviation` and `sleazemovies` 100% for that window. `atlas_articles_unparsable_total` and `atlas_article_bytes_unparsable_total` now count them per group and subject shape. Two shapes dominate:
+
+- ngPost `-x`: Subject is the Message-ID's local part (32 hex), From `<random13>@ngPost.com`, every article on its own.
+- One random token of 26 to 64 letters and digits, From `<random12>@<random8>.<random3>` that stays the same over a run of consecutive articles, Message-ID `<random24>@<random12>.<random3>`.
+
+Articles are 716,800 bytes of payload (about 740 KB on the wire) except each file's last, which is smaller. Without a counter, which file an article belongs to is only in its body's yEnc header, and a downloader places an article by its `=ypart begin`, so an NZB needs the right files but not the right segment order. Next steps, in order: store the second shape as runs keyed by group, From and day (its From repeats), cut runs into files at the short last articles, then name and check them through a PAR2 index body (`docs/research/posting-behavior/FINAL-REPORT.md`, stages 2 to 4). This needs room for about as many more articles again in those groups, and so a storage decision first.
+
 ## Posts crossing midnight UTC
 
 A post with a weak name, such as numbered files, has its poster and day in its key, so one crossing midnight UTC becomes two releases. Each part keeps its articles, and nothing is lost. Dropping the day would merge unrelated posts like a poster's daily `IMG_` sets. Fix: join a post to the previous day's release when the counter's file numbers carry on and the gap is small, which needs the release's last post time at save.

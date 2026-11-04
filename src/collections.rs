@@ -309,12 +309,25 @@ pub(crate) fn unread_file_total(base: &str) -> Option<i64> {
     c[2].parse().ok()
 }
 
+fn count_unparsable(group: &str, u: &crate::parser::Unparsable) {
+    use crate::metrics::names::{UNPARSABLE_ARTICLES, UNPARSABLE_BYTES};
+    for (kind, (n, bytes)) in [("id_subject", u.id_subject), ("token", u.token), ("other", u.other)] {
+        if n > 0 {
+            let labels = [("group", group), ("subject", kind)];
+            UNPARSABLE_ARTICLES.inc(&labels, n);
+            UNPARSABLE_BYTES.inc(&labels, bytes as u64);
+        }
+    }
+}
+
 /// Bucket a slice's articles of `group` into releases by their collection,
 /// or their parsed name when they have none (`Collections::of`), keeping
 /// first-seen order.
 pub fn group_articles(group: &str, articles: Vec<Article>) -> IndexMap<String, Release> {
     let mut collections = Collections::new(group);
-    let mut releases = group_articles_by(articles, |article, parsed| collections.of(article, parsed));
+    let mut unparsable = crate::parser::Unparsable::default();
+    let mut releases = group_articles_by(articles, |article, parsed| collections.of(article, parsed), &mut unparsable);
+    count_unparsable(group, &unparsable);
     // `parse_subject` reads `[n/m]` only: from a `(1 of 50)` it can't say the post has 50
     // files, and the release would pass for complete with the first one
     for release in releases.values_mut().filter(|r| r.collection.is_some()) {
