@@ -526,7 +526,8 @@ impl Search {
     /// asked, for every column but the rating, which comes from the providers and isn't in the database.
     fn ranked_by(&self) -> Option<crate::sorted::Column> {
         use crate::sorted::Column;
-        if !self.q.is_empty() || self.fields.any() {
+        // tags filtered by the word index: it sorts what it filters
+        if !self.q.is_empty() || self.fields.any() || self.indexed().is_some() {
             return None;
         }
         let column = match self.sort? {
@@ -542,13 +543,17 @@ impl Search {
     }
 
     /// The word index and the order it reads words in, once it's built: every match ranked, sorted and filtered by tag,
-    /// not the newest few thousand. None: no words, fields (which the database looks up), or no index yet.
+    /// not the newest few thousand. None: neither words nor tag filters, fields (which the database looks up), or no
+    /// index yet.
     fn indexed(&self) -> Option<(std::sync::Arc<word_index::WordIndex>, word_index::By)> {
         use word_index::By;
-        if !word_index::searchable(&self.q) || self.fields.any() {
+        let words = word_index::searchable(&self.q);
+        // with no words, only tags need it: a category's newest, or its sorts, come from the database
+        if !(words || (self.q.is_empty() && self.filters_by_tags())) || self.fields.any() {
             return None;
         }
         let by = match self.sort {
+            None | Some(SortBy::Rating) if !words => By::Newest,
             None | Some(SortBy::Rating) => By::Relevance,
             Some(SortBy::Size) => By::Size,
             Some(SortBy::Posted) => By::Posted,
@@ -984,19 +989,13 @@ impl Search {
                 escape(&value)
             );
         }
-        // the count goes by words and fields only, soo with tags filtering the page it would count rows it hides; the word
-        // index counts every match, tags and all
-        // nor does it know which are incomplete: that's the whole post each row stands for
-        let total =
-            if self.hide_incomplete || (self.indexed().is_none() && (!self.fields.any() || self.filters_by_tags())) {
-                String::new()
-            } else if self.sorts_from_a_window()
-                && let Ok(window) = window_of(self, 0)
-            {
-                window.total.get_or_init(|| self.total()).clone()
-            } else {
-                self.total()
-            };
+        let total = if self.sorts_from_a_window()
+            && let Ok(window) = window_of(self, 0)
+        {
+            window.total.get_or_init(|| self.total()).clone()
+        } else {
+            self.total()
+        };
         format!(
             "<div class=\"summary\"><span class=\"path\">{path}</span>{total}<span class=\"sort\">{}</span></div>{}",
             escape(&sort),
@@ -1004,27 +1003,69 @@ impl Search {
         )
     }
 
+    /// How many releases the search has, for every page and search: a category's, a filter's, words', fields'. The
+    /// word index counts words, categories and tags, and the database counts fields. What the page leaves out of what
+    /// was counted makes the count a most: copies and incomplete releases, which only the rows themselves tell, and tags
+    /// when the database counted.
     fn total(&self) -> String {
         let filter = parse_filter(&self.cat);
-        if let Some((index, _)) = self.indexed() {
-            return match index.count(&self.q, filter.as_ref(), &self.tag_filters()) {
-                Ok(total) => format!(
-                    "<strong class=\"total\">{}</strong>",
-                    escape(&field_search::Total { count: total as i64, exact: true }.describe())
-                ),
-                Err(e) => {
-                    eprintln!("web count failed: {e}");
-                    String::new()
+        let mut left_out = Vec::new();
+        let counted = match self.counted_by_index() {
+            Some(index) => index
+                .count(&self.q, filter.as_ref(), &self.tag_filters())
+                .map(|n| field_search::Total { count: n as i64, exact: true })
+                .map_err(|e| e.to_string()),
+            None => {
+                if self.filters_by_tags() {
+                    left_out.push("releases without the chosen tags");
                 }
-            };
+                field_search::count_any(&self.fields, std::slice::from_ref(&self.q), filter.as_ref())
+                    .map_err(|e| e.to_string())
+            }
+        };
+        if self.filters.contains(&HIDE_COPIES) {
+            left_out.push("copies");
         }
-        match field_search::count_any(&self.fields, std::slice::from_ref(&self.q), filter.as_ref()) {
-            Ok(total) => format!("<strong class=\"total\">{}</strong>", escape(&total.describe())),
+        if self.hide_incomplete {
+            left_out.push("incomplete releases");
+        }
+        match counted {
+            Ok(total) if left_out.is_empty() => {
+                format!("<strong class=\"total\" title=\"{ROWS_FOLDED}\">{}</strong>", escape(&total.describe()))
+            }
+            // at least some, of which some are left out: no number to give
+            Ok(total) if !total.exact => String::new(),
+            Ok(total) => format!(
+                "<strong class=\"total\" title=\"{}\">Up to {}</strong>",
+                attr(&format!("Counted before {} are left out. {ROWS_FOLDED}", list_of(&left_out))),
+                escape(&field_search::Total { count: total.count, exact: true }.describe())
+            ),
             Err(e) => {
                 eprintln!("web count failed: {e}");
                 String::new()
             }
         }
+    }
+
+    /// The word index, when it can count this search: no fields, and words it keeps or none.
+    fn counted_by_index(&self) -> Option<std::sync::Arc<word_index::WordIndex>> {
+        if self.fields.any() || !(self.q.is_empty() || word_index::searchable(&self.q)) {
+            return None;
+        }
+        word_index::ready()
+    }
+}
+
+/// What a total counts that the rows don't show one by one.
+const ROWS_FOLDED: &str =
+    "Every release counts once. A post spread over several groups, or an upload linked by its PAR2 set, is one row.";
+
+/// `a`, `a and b`, `a, b and c`.
+fn list_of(items: &[&str]) -> String {
+    match items {
+        [] => String::new(),
+        [one] => (*one).to_string(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
     }
 }
 
