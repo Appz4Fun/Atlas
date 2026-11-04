@@ -813,6 +813,8 @@ Search results in the [web UI](#web-ui) have quick filters for resolution, HDR a
 
 Opening a release in the [web UI](#web-ui) also shows its overview, cast, dates and poster from TMDB, its ratings from OMDb when `media.omdb.api_key` is set (a free key from omdbapi.com), and its Trakt rating when Trakt is on. These are fetched when the page opens, and the indexer also fetches them in the background for every title with an id, at `media.details_per_minute` titles a minute (120 by default, 0 turns it off). So results show thumbnails and scores without anyone opening a release. They're kept for 30 days in `atlas.details.db`, with posters in `posters/`, at most 4 GB. A show TMDB has no record of comes from TheTVDB when `media.tvdb.api_key` is set, and the page has a backdrop where TMDB has one. With neither key, the page leaves all this out. In results, Best rated sorts by the scores already kept, with the rest last. Any provider's `requests_per_minute` can be `-1` for no limit, for a plan that has none.
 
+**AlloCiné numbers are read as titles.** French groups (FRQC, GL0P, SUPPLY, BYOR and others) name a release after its AlloCiné page, as in `AC31594.2024.S02E05.Love.and.Be.Loved.MULTi…-BYOR` for series 31594, Dark Matter, or `AC317772.2026.MULTi.VFF…-FRQC` for film 317772, Matchbox: The Movie. A name with an episode is a series, and one without is a film: AlloCiné numbers the two apart. Atlas asks Wikidata, which lists most AlloCiné numbers beside their IMDb, TMDB and TVDB IDs, and those IDs go on the release with no search. Where Wikidata has no entry, the AlloCiné page gives the title (the original one where it shows it) and the year. Either way the providers are then asked by that title, never by the number. `media.allocine.enabled: false` turns it off. Each number is asked once, like any title.
+
 **An NFO needs no provider.** With a body budget, `media.nfo` reads a movie's IMDb ID from its NFO: one body of at most 64 KiB, and only for a movie with no IMDb ID yet. That also adds `imdbid` to `movie-search`.
 
 **Sonarr and Radarr cache `caps` for 7 days**, so press Test on the indexer after turning a provider on.
@@ -840,6 +842,7 @@ client_id = "your-id"
 | `tmdb.requests_per_minute` | `240` | At most 3,000. |
 | `trakt.requests_per_minute` | `120` | At most 200. |
 | `tvdb.requests_per_minute` | `120` | At most 600. |
+| `allocine.requests_per_minute` | `30` | For Wikidata and for allocine.fr, each. At most 120. |
 
 A provider that's down or over its limit pauses for its own wait, up to an hour. Nothing else stops, and no title is marked as missing. Its answers live in `atlas.media.db`, next to the shards, and the IDs live on the releases, so deleting that file loses no search. To correct a wrong match, stop the indexer, delete the title's row from `media_titles`, start it, and run `atlas --reprocess --step media_lookup`.
 
@@ -1051,7 +1054,7 @@ CI (`.github/workflows/ci.yml`) checks formatting, runs clippy, and runs the tes
 - **Original Author:** [Eraxty](https://github.com/Eraxty) built the original Python version of Atlas over 60 days and more than 100 hours, thanking the Hack Club community for the push to build it.
 - **Rust Port & Continued Development:** Forked and ported to Rust by [xbmc4lyfe](https://github.com/xbmc4lyfe) in the [Appz4Fun/Atlas](https://github.com/Appz4Fun/Atlas) repository, introducing the multi-server async NNTP engine, 8-shard compact SQLite storage, Oxide Web UI, 10-layer archive and media stream probing, pure-Rust H.264/HEVC keyframe still decoders, `pHash` same-film matching, twin/alt duplicate clustering, 6-page stats dashboard, Prometheus/Grafana observability, and extended Newznab API.
 - **Upstream Ports & Libraries:** The rule for articles obfuscated per article, collection regexes and cleaner, release rules, naming regexes and name fixing, PreDB feeds and matching rules, category rules, title parsing, candidate scoring, ID provider ordering, and `nntmux-yenc` are ported/shared from [newznab-tmux](https://github.com/xbmc4lyfe/newznab-tmux) / [NNTmux](https://github.com/NNTmux/newznab-tmux), GPLv3. 7z headers are decoded with [lzma-rs](https://github.com/gendx/lzma-rs), MIT.
-- **Media Metadata:** This product uses the TMDB API but is not endorsed or certified by TMDB. TV data comes from [TVMaze](https://www.tvmaze.com) (CC BY-SA), [Trakt](https://trakt.tv), and [TheTVDB](https://thetvdb.com) (please consider adding missing information or subscribing).
+- **Media Metadata:** This product uses the TMDB API but is not endorsed or certified by TMDB. TV data comes from [TVMaze](https://www.tvmaze.com) (CC BY-SA), [Wikidata](https://www.wikidata.org) (CC0), [AlloCiné](https://www.allocine.fr), [Trakt](https://trakt.tv), and [TheTVDB](https://thetvdb.com) (please consider adding missing information or subscribing).
 
 ## License
 

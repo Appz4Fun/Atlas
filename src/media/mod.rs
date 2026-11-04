@@ -1,5 +1,6 @@
 //! TV and movie IDs: each release's title, each title resolved once, and searches by ID.
 
+pub mod allocine;
 pub mod details;
 pub mod fanout;
 pub mod http;
@@ -50,6 +51,7 @@ pub struct Media {
     config: RwLock<MediaConfig>,
     options: RwLock<category::Options>,
     providers: RwLock<Vec<Arc<dyn Provider>>>,
+    allocine: RwLock<Option<Arc<allocine::Allocine>>>,
     conn: Mutex<Option<Connection>>,
     open_failed: AtomicBool,
     known: RwLock<HashMap<i64, Known>>,
@@ -118,6 +120,7 @@ impl Media {
             config: RwLock::new(MediaConfig::default()),
             options: RwLock::new(category::Options::default()),
             providers: RwLock::new(Vec::new()),
+            allocine: RwLock::new(None),
             conn: Mutex::new(None),
             open_failed: AtomicBool::new(false),
             known: RwLock::new(HashMap::new()),
@@ -153,6 +156,8 @@ impl Media {
         };
         if changed || (cfg.media.any_provider() && self.providers.read().unwrap().is_empty()) {
             *self.providers.write().unwrap() = build_providers(&cfg.media);
+            *self.allocine.write().unwrap() =
+                cfg.media.allocine.enabled.then(|| Arc::new(allocine::Allocine::new(&cfg.media.allocine)));
         }
         if cfg.media.any_provider() {
             self.open();
@@ -189,6 +194,11 @@ impl Media {
         let conn = self.conn.lock().unwrap();
         let conn = conn.as_ref().ok_or_else(|| "the title cache isnt open".to_string())?;
         read(conn).map_err(|e| e.to_string())
+    }
+
+    /// What reads `AC<id>` titles, while it's on.
+    pub fn allocine(&self) -> Option<Arc<allocine::Allocine>> {
+        self.allocine.read().unwrap().clone()
     }
 
     pub(crate) fn providers(&self) -> Vec<Arc<dyn Provider>> {

@@ -904,3 +904,95 @@ fn the_update_uses_its_index() {
     let plan: Vec<String> = stmt.query_map(params, |r| r.get(3)).unwrap().map(Result::unwrap).collect();
     assert!(plan.join("\n").contains("media_release_title"), "{plan:?}");
 }
+
+fn allocine_on(mut c: MediaConfig, s: &FixtureServer) -> MediaConfig {
+    c.allocine.requests_per_minute = FAST;
+    c.allocine.wikidata_url = Some(format!("{}/sparql", s.base));
+    c.allocine.base_url = Some(s.base.clone());
+    c
+}
+
+#[test]
+fn an_allocine_id_takes_its_ids_from_wikidata() {
+    let mut h = fresh();
+    let name = "AC1000000194.2026.S01E04.MULTi.VFF.DV.HDR.2160p.WEB.AC3.5.1.H265-FRQC";
+    h.save(&[complete(name)]);
+    let wikidata = r#"{"results":{"bindings":[{"item":{"type":"uri","value":"http://www.wikidata.org/entity/Q131378846"},
+        "imdb":{"type":"literal","value":"tt34866681"},"tmdb":{"type":"literal","value":"278624"},
+        "tvdb":{"type":"literal","value":"457437"},"label":{"xml:lang":"en","type":"literal","value":"Lucky"}}]}}"#;
+    let s = FixtureServer::start(vec![route("/sparql", wikidata.into())]);
+    let (media, db) = start(&mut h, allocine_on(maze(&s), &s));
+    let _fan = fan_out(&media, &db);
+    wait_for("the ids", || row(&h, name).is_some_and(|r| r.tvdb == Some(457_437)));
+    let r = row(&h, name).unwrap();
+    assert_eq!((r.imdb, r.tmdb, r.season, r.episode), (Some(34_866_681), Some(278_624), Some(1), Some(4)));
+    let asked = s.requests();
+    assert!(asked[0].starts_with("/sparql?format=json&query="), "{asked:?}");
+    assert!(asked[0].contains("P1267") && asked[0].contains("1000000194"), "a series' id: {}", asked[0]);
+    // the name it has there is what the providers are asked, not the number
+    assert!(asked.iter().any(|q| q.contains("q=Lucky")), "{asked:?}");
+    assert!(!asked.iter().any(|q| q.contains("ficheserie")), "Wikidata had it all: {asked:?}");
+}
+
+#[test]
+fn an_allocine_id_wikidata_lacks_is_searched_by_its_pages_title() {
+    let mut h = fresh();
+    let name = "AC31594.S02E05.Love.and.Be.Loved.MULTi.1080p.WEB.H264-BYOR";
+    h.save(&[complete(name)]);
+    let page = r#"<html><head><title>Some Show - Série TV 2015 - AlloCiné</title>
+        <script type="application/ld+json">{"@context":"http://schema.org","@type":"TVSeries","name":"Some Show"}</script>
+        </head></html>"#;
+    let s = FixtureServer::start(vec![
+        route("/sparql", r#"{"results":{"bindings":[]}}"#.into()),
+        route("/series/ficheserie_gen_cserie=31594.html", page.into()),
+        single(),
+    ]);
+    let (media, db) = start(&mut h, allocine_on(maze(&s), &s));
+    let _fan = fan_out(&media, &db);
+    wait_for("the ids", || row(&h, name).is_some_and(|r| r.tvdb == Some(3001)));
+    let asked = s.requests();
+    assert!(asked.iter().any(|q| q.starts_with("/singlesearch/shows?q=Some%20Show")), "{asked:?}");
+    assert!(!asked.iter().any(|q| q.contains("AC31594")), "the number is never searched: {asked:?}");
+}
+
+#[test]
+fn a_film_number_is_not_read_as_a_series() {
+    let mut h = fresh();
+    let name = "AC317772.2026.MULTi.VFF.AD.2160p.HDR.DV.WEB.EAC3.5.1.Atmos.H265-FRQC";
+    h.save(&[complete(name)]);
+    let s = FixtureServer::start(vec![route("/sparql", r#"{"results":{"bindings":[]}}"#.into())]);
+    let (media, db) = start(&mut h, allocine_on(with_tmdb(no_providers(), &s), &s));
+    let _fan = fan_out(&media, &db);
+    wait_parsed(&h, name);
+    wait_for("the film page asked", || s.requests().iter().any(|q| q.contains("fichefilm_gen_cfilm=317772")));
+    let asked = s.requests();
+    assert!(asked.iter().any(|q| q.contains("P1265")), "{asked:?}");
+    assert!(!asked.iter().any(|q| q.contains("ficheserie") || q.contains("P1267")), "{asked:?}");
+}
+
+#[test]
+fn wikidatas_ids_land_when_the_page_cant_be_read() {
+    let mut h = fresh();
+    let name = "AC30890.S04E01.MULTi.1080p.WEB.H264-GL0P";
+    h.save(&[complete(name)]);
+    let wikidata = r#"{"results":{"bindings":[{"item":{"type":"uri","value":"http://www.wikidata.org/entity/Q111967146"},
+        "imdb":{"type":"literal","value":"tt16358384"},"tvdb":{"type":"literal","value":"413215"}}]}}"#;
+    let s = FixtureServer::start(vec![route("/sparql", wikidata.into()), status("/series/", 503)]);
+    let (media, db) = start(&mut h, allocine_on(maze(&s), &s));
+    let _fan = fan_out(&media, &db);
+    wait_for("the ids", || row(&h, name).is_some_and(|r| r.tvdb == Some(413_215)));
+    assert_eq!(row(&h, name).unwrap().imdb, Some(16_358_384));
+    assert!(s.requests().iter().any(|q| q.contains("ficheserie_gen_cserie=30890")), "{:?}", s.requests());
+}
+
+#[test]
+fn a_decode_that_fails_lets_the_titles_next_release_ask() {
+    let mut h = fresh();
+    let name = "AC30890.S04E01.MULTi.1080p.WEB.H264-GL0P";
+    h.save(&[complete(name)]);
+    let s = FixtureServer::start(vec![route("/sparql", "not json".into())]);
+    let (media, _db) = start(&mut h, allocine_on(maze(&s), &s));
+    let k = key(Kind::Tv, "AC30890", None);
+    wait_for("the failed decode", || s.requests().iter().any(|q| q.starts_with("/sparql")));
+    wait_for("the claim let go", || media.wants(Kind::Tv, k, i64::MAX - 1, chrono::Utc::now().timestamp()));
+}

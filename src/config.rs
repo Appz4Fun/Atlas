@@ -216,6 +216,18 @@ pub struct MediaConfig {
     pub trakt: TraktConfig,
     pub tvdb: TvdbConfig,
     pub opensubtitles: OpenSubtitlesConfig,
+    pub allocine: AllocineConfig,
+}
+
+/// French groups name a release `AC<id>` after its AlloCiné page: Wikidata, then that page, say what it is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AllocineConfig {
+    pub enabled: bool,
+    pub requests_per_minute: i64,
+    /// Wikidata's SPARQL endpoint
+    pub wikidata_url: Option<String>,
+    /// allocine.fr
+    pub base_url: Option<String>,
 }
 
 /// What a probed video's hash matches: opensubtitles.com's REST API.
@@ -240,6 +252,7 @@ impl Default for MediaConfig {
             trakt: TraktConfig { client_id: String::new(), requests_per_minute: 120, base_url: None },
             tvdb: TvdbConfig { api_key: String::new(), pin: String::new(), requests_per_minute: 120, base_url: None },
             opensubtitles: OpenSubtitlesConfig { api_key: String::new(), requests_per_minute: 60, base_url: None },
+            allocine: AllocineConfig { enabled: true, requests_per_minute: 30, wikidata_url: None, base_url: None },
         }
     }
 }
@@ -309,6 +322,13 @@ impl MediaConfig {
         // their published limit is 40 in 10 s
         rate(opensubtitles, 240, &mut c.opensubtitles.requests_per_minute);
         c.opensubtitles.base_url = text(opensubtitles, "base_url").filter(|u| !u.is_empty());
+        let allocine = v.get("allocine");
+        if let Some(b) = allocine.and_then(|o| o.get("enabled")).and_then(as_bool) {
+            c.allocine.enabled = b;
+        }
+        rate(allocine, 120, &mut c.allocine.requests_per_minute);
+        c.allocine.wikidata_url = text(allocine, "wikidata_url").filter(|u| !u.is_empty());
+        c.allocine.base_url = text(allocine, "base_url").filter(|u| !u.is_empty());
         c
     }
 }
@@ -1319,6 +1339,14 @@ mod tests {
         let c = Config::from_value(&json!({})).media;
         assert!(c.any_provider());
         assert!(c.parse);
+    }
+
+    #[test]
+    fn allocine_is_on_unless_turned_off() {
+        assert!(MediaConfig::default().allocine.enabled);
+        let off = MediaConfig::from_value(Some(&json!({"allocine": {"enabled": false, "requests_per_minute": 9000}})));
+        assert!(!off.allocine.enabled);
+        assert_eq!(off.allocine.requests_per_minute, 120);
     }
 
     #[test]
