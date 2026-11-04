@@ -70,8 +70,9 @@ fn a_part_one_listing_lacks_comes_from_the_other_server() {
     )
     .unwrap();
     let found = repair::find(&conn, chrono::Utc::now().timestamp()).unwrap();
-    assert_eq!(found.windows.len(), 1, "{found:?}");
-    let w = &found.windows[0];
+    let windows: Vec<_> = found.windows().collect();
+    assert_eq!(windows.len(), 1, "{found:?}");
+    let w = windows[0];
     assert_eq!(w.group, GROUP);
     assert!(w.from <= posted + 1 && w.to >= posted + 10);
 

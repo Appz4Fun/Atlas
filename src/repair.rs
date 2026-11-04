@@ -16,8 +16,9 @@ use crate::store;
 
 /// how often a round looks for posts to repair
 const EVERY: Duration = Duration::from_secs(600);
-/// what is worth the reads: media, not small posts
+/// what is worth the reads: media, not small posts. A post's rows can each be a part of it, soo a row needs less
 const MIN_BYTES: i64 = 1 << 30;
+const MIN_ROW_BYTES: i64 = 64 << 20;
 /// nearly whole: a post with much more missing lacks whole groups, which another server's copy of these won't add
 const MIN_PERMILLE: i64 = 900;
 /// posts younger than this may still be arriving
@@ -46,11 +47,24 @@ pub struct Window {
     pub to: i64,
 }
 
-/// What a round found: the windows, and the rows looked at (each with its share then).
+/// A post looked at: its rows, its share then, and the windows it wants read (none: nothing to do for it).
+#[derive(Debug, Default)]
+pub struct Looked {
+    pub ids: Vec<i64>,
+    pub permille: i64,
+    pub windows: Vec<Window>,
+}
+
+/// What a round found, post by post.
 #[derive(Debug, Default)]
 pub struct Found {
-    pub windows: Vec<Window>,
-    pub tried: Vec<(i64, i64)>,
+    pub posts: Vec<Looked>,
+}
+
+impl Found {
+    pub fn windows(&self) -> impl Iterator<Item = &Window> {
+        self.posts.iter().flat_map(|p| p.windows.iter())
+    }
 }
 
 pub async fn run(ctx: PassContext, settings: PassSettings, db: Db, stopping: impl Fn() -> bool) {
@@ -81,29 +95,34 @@ async fn round(
     let now = chrono::Utc::now().timestamp();
     let found = tokio::task::spawn_blocking(move || db::with_reader(|conn| find(conn, now))).await??;
     let pool = &ctx.pool;
-    for w in found.windows.iter().take(PER_ROUND) {
-        if stopping() {
-            return Ok(());
+    // a post is marked once all its windows were read; the ones past this round's share wait for the next
+    let (mut read, mut tried) = (0usize, Vec::new());
+    for post in &found.posts {
+        if stopping() || (read > 0 && read + post.windows.len() > PER_ROUND) {
+            break;
         }
-        let indexing: HashSet<String> = {
-            let g = w.group.clone();
-            on_db(db, move |conn| Ok(indexed_from(conn, &g)?)).await?
-        };
-        let others: Vec<usize> = pool
-            .indexing_servers()
-            .into_iter()
-            .filter(|&i| !indexing.contains(&pool.host(i).to_lowercase()))
-            .take(SERVERS)
-            .collect();
-        for server in others {
-            let host = pool.host(server);
-            match reread_window(ctx, settings, db, &w.group, server, (w.from, w.to), MAX_ARTICLES).await {
-                Ok(p) => println!("[repair] {} {}..{} on {host}: {} headers", w.group, w.from, w.to, p.articles),
-                Err(e) => println!("[repair] {} {}..{} on {host}: {e:#}", w.group, w.from, w.to),
+        for w in &post.windows {
+            let indexing: HashSet<String> = {
+                let g = w.group.clone();
+                on_db(db, move |conn| Ok(indexed_from(conn, &g)?)).await?
+            };
+            let others: Vec<usize> = pool
+                .indexing_servers()
+                .into_iter()
+                .filter(|&i| !indexing.contains(&identity(&pool.host(i))))
+                .take(SERVERS)
+                .collect();
+            for server in others {
+                let host = pool.host(server);
+                match reread_window(ctx, settings, db, &w.group, server, (w.from, w.to), MAX_ARTICLES).await {
+                    Ok(p) => println!("[repair] {} {}..{} on {host}: {} headers", w.group, w.from, w.to, p.articles),
+                    Err(e) => println!("[repair] {} {}..{} on {host}: {e:#}", w.group, w.from, w.to),
+                }
             }
         }
+        read += post.windows.len();
+        tried.extend(post.ids.iter().map(|id| (*id, post.permille)));
     }
-    let tried = found.tried;
     on_db(db, move |conn| {
         let tx = conn.transaction()?;
         {
@@ -119,17 +138,22 @@ async fn round(
     .await
 }
 
-/// The hosts that index `group` already, by its cursors (`group@host`): reading it there again finds the same.
+/// A server as its cursors name it (`indexer::cursor_key`): the host in lower case, an explicit `#key` as it is.
+fn identity(host: &str) -> String {
+    match host.split_once('#') {
+        Some((h, k)) => format!("{}#{k}", h.to_lowercase()),
+        None => host.to_lowercase(),
+    }
+}
+
+/// The servers that index `group` already, by its cursors (`group@server`): reading it there again finds the same.
 fn indexed_from(conn: &Connection, group: &str) -> rusqlite::Result<HashSet<String>> {
     let prefix = format!("{group}@");
     let names: Vec<String> = conn
         .prepare("select name from groups where name >= ?1 and name < ?2")?
         .query_map(params![prefix, format!("{group}A")], |r| r.get(0))?
         .collect::<rusqlite::Result<_>>()?;
-    Ok(names
-        .into_iter()
-        .filter_map(|n| n.strip_prefix(&prefix).map(|h| h.split('#').next().unwrap_or(h).to_lowercase()))
-        .collect())
+    Ok(names.into_iter().filter_map(|n| n.strip_prefix(&prefix).map(str::to_string)).collect())
 }
 
 /// The posts worth a second read, on a reader with every shard attached and `repair_tried` in main. A post is all
@@ -153,7 +177,7 @@ pub fn find(conn: &Connection, now: i64) -> rusqlite::Result<Found> {
         );
         let rows: Vec<ReleaseRow> = conn
             .prepare(&sql)?
-            .query_map(params![MIN_BYTES, now - DAYS * 86_400, now - SETTLED_SECS, CANDIDATES], |r| {
+            .query_map(params![MIN_ROW_BYTES, now - DAYS * 86_400, now - SETTLED_SECS, CANDIDATES], |r| {
                 Ok(ReleaseRow {
                     id: r.get(0)?,
                     name: r.get(1)?,
@@ -170,17 +194,15 @@ pub fn find(conn: &Connection, now: i64) -> rusqlite::Result<Found> {
             if seen.contains(&row.id) {
                 continue;
             }
-            let ids = match crate::release_info::whole_post_with(conn, &row) {
-                Ok(Some(post)) => post.ids,
-                _ => vec![row.id],
+            let (ids, size) = match crate::release_info::whole_post_with(conn, &row) {
+                Ok(Some(post)) => (post.ids, post.size),
+                _ => (vec![row.id], row.size.unwrap_or(0)),
             };
             seen.extend(ids.iter().copied());
             let permille = crate::release_info::permille_of(conn, &ids).unwrap_or(0);
-            found.tried.extend(ids.iter().map(|id| (*id, permille)));
-            if !(MIN_PERMILLE..1000).contains(&permille) {
-                continue;
-            }
-            found.windows.extend(windows_of(conn, &ids)?);
+            let worth = size >= MIN_BYTES && (MIN_PERMILLE..1000).contains(&permille);
+            let windows = if worth { windows_of(conn, &ids)? } else { Vec::new() };
+            found.posts.push(Looked { ids, permille, windows });
         }
     }
     Ok(found)
