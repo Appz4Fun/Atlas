@@ -648,7 +648,7 @@ mod tests {
             conn.execute("insert into pp_state (release_id, net_wanted, net_rank) values (?, 1, ?)", params![n, n % 5])
                 .unwrap();
         }
-        let claimed = std::sync::Mutex::new(std::collections::HashSet::new());
+        let claimed = std::sync::Mutex::new(crate::postprocess::engine::NetClaims::default());
         let order = "net_rank desc, release_id desc";
         let mut taken = Vec::new();
         for _ in 0..8 {
@@ -660,10 +660,20 @@ mod tests {
         assert_eq!(distinct.len(), 32, "no release in two claims");
         assert_eq!(&taken[..4], &[199, 194, 189, 184], "the first claim takes the top of the order");
         assert!(net_take(&conn, &claimed, order, 5).unwrap().is_empty(), "eight claims at most");
-        for id in &taken[..4] {
-            claimed.lock().unwrap().remove(id);
-        }
+        claimed.lock().unwrap().give_back(&taken[..4]);
         assert_eq!(net_take(&conn, &claimed, order, 5).unwrap(), &taken[..4], "given back, they are taken again");
+        // a claim of fewer than NET_BATCH (few were due) still counts as one
+        for ids in taken.chunks(4) {
+            claimed.lock().unwrap().give_back(ids);
+        }
+        conn.execute("update pp_state set net_next_at = 10", []).unwrap();
+        let due = |id: i64| conn.execute("update pp_state set net_next_at = 0 where release_id = ?", [id]).unwrap();
+        for id in 100..108 {
+            due(id);
+            assert_eq!(net_take(&conn, &claimed, order, 5).unwrap(), [id]);
+        }
+        due(108);
+        assert!(net_take(&conn, &claimed, order, 5).unwrap().is_empty(), "eight claims, however few they hold");
     }
 
     #[test]

@@ -77,8 +77,8 @@ pub(crate) struct Inner {
     settings: RwLock<Settings>,
     pub(crate) stop: Arc<AtomicBool>,
     db_busy: [AtomicBool; SHARDS],
-    /// per shard: the releases its net claims hold, `NET_CLAIMS_PER_SHARD` claims at most
-    net_claimed: [Mutex<HashSet<i64>>; SHARDS],
+    /// per shard: what its running net claims hold, `NET_CLAIMS_PER_SHARD` claims at most
+    net_claimed: [Mutex<NetClaims>; SHARDS],
     fetcher: BodyFetcher,
     stats: Arc<Stats>,
     /// no net claims before this
@@ -247,7 +247,7 @@ impl Inner {
             settings: RwLock::new(Settings { full: p.config.clone(), rules: Rules::new(&config), config, enabled: 0 }),
             stop,
             db_busy: std::array::from_fn(|_| AtomicBool::new(false)),
-            net_claimed: std::array::from_fn(|_| Mutex::new(HashSet::new())),
+            net_claimed: std::array::from_fn(|_| Mutex::new(NetClaims::default())),
             fetcher,
             stats,
             net_paused_until: AtomicI64::new(0),
@@ -869,10 +869,7 @@ impl Inner {
                 break;
             }
         }
-        let mut claimed = self.net_claimed[shard].lock().unwrap();
-        for id in &ids {
-            claimed.remove(id);
-        }
+        self.net_claimed[shard].lock().unwrap().give_back(&ids);
         result.map(|()| true)
     }
 
@@ -1246,21 +1243,46 @@ pub(crate) fn queue_order(batches: i64) -> &'static str {
 /// provider lookup one at a time, ~600 a minute over all eight shards, however many net workers there were.
 const NET_CLAIMS_PER_SHARD: usize = 8;
 
-/// The next `NET_BATCH` releases the net lane wants, in `order`, that no other claim of the shard holds: none
-/// when `NET_CLAIMS_PER_SHARD` claims hold some already. They are held in `claimed` till the claim gives them back.
-pub(crate) fn net_take(conn: &Connection, claimed: &Mutex<HashSet<i64>>, order: &str, now: i64) -> rusqlite::Result<Vec<i64>> {
+/// A shard's running net claims, and the releases they hold.
+#[derive(Default)]
+pub(crate) struct NetClaims {
+    held: HashSet<i64>,
+    claims: usize,
+}
+
+impl NetClaims {
+    /// what a claim took, given back when it's done
+    pub(crate) fn give_back(&mut self, ids: &[i64]) {
+        for id in ids {
+            self.held.remove(id);
+        }
+        self.claims -= 1;
+    }
+}
+
+/// The next `NET_BATCH` releases the net lane wants, in `order`, that no other claim of the shard holds, as a claim
+/// of its own: none when `NET_CLAIMS_PER_SHARD` claims are running. They are held till `give_back`.
+pub(crate) fn net_take(
+    conn: &Connection,
+    claimed: &Mutex<NetClaims>,
+    order: &str,
+    now: i64,
+) -> rusqlite::Result<Vec<i64>> {
     let mut claimed = claimed.lock().unwrap();
-    if claimed.len() >= NET_CLAIMS_PER_SHARD * NET_BATCH as usize {
+    if claimed.claims >= NET_CLAIMS_PER_SHARD {
         return Ok(Vec::new());
     }
     let ids: Vec<i64> = conn
         .prepare_cached(&format!(
             "select release_id from pp_state where net_wanted = 1 and net_next_at <= ?1 order by {order} limit ?2"
         ))?
-        .query_map(params![now, NET_BATCH + claimed.len() as i64], |r| r.get(0))?
+        .query_map(params![now, NET_BATCH + claimed.held.len() as i64], |r| r.get(0))?
         .collect::<rusqlite::Result<_>>()?;
-    let ids: Vec<i64> = ids.into_iter().filter(|id| !claimed.contains(id)).take(NET_BATCH as usize).collect();
-    claimed.extend(&ids);
+    let ids: Vec<i64> = ids.into_iter().filter(|id| !claimed.held.contains(id)).take(NET_BATCH as usize).collect();
+    if !ids.is_empty() {
+        claimed.held.extend(&ids);
+        claimed.claims += 1;
+    }
     Ok(ids)
 }
 
