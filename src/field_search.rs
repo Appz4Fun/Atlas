@@ -382,21 +382,7 @@ pub fn run(args: &[String]) -> i32 {
     };
     for path in store::shard_paths(&main) {
         let started = std::time::Instant::now();
-        let built = db::open_shard(&path).and_then(|conn| {
-            conn.execute_batch(&format!(
-                "create index if not exists {POSTER_INDEX} on releases(poster);
-                 create index if not exists {SIZE_INDEX} on releases(size);
-                 create index if not exists {POSTED_INDEX} on releases(posted_date);
-                 create index if not exists {NAME_INDEX} on releases(lower(coalesce(display_name, name)));"
-            ))?;
-            // what a shard from before the list has with no category, which a sort over a category reads
-            if crate::category::uncategorized::listed(&conn, 0) {
-                Ok(())
-            } else {
-                crate::category::uncategorized::fill(&conn)
-            }
-        });
-        if let Err(e) = built {
+        if let Err(e) = build(&path) {
             println!("{}: {e}", path.display());
             return 1;
         }
@@ -405,9 +391,45 @@ pub fn run(args: &[String]) -> i32 {
     0
 }
 
+/// One shard's indexes and list. A deploy runs this right after stopping the old build, before anything of the new
+/// one has opened the shard, soo its tables are made first.
+fn build(path: &std::path::Path) -> db::Result<()> {
+    db::open_shard(path).and_then(|conn| {
+        store::migrate_shard(&conn)?;
+        conn.execute_batch(&format!(
+            "create index if not exists {POSTER_INDEX} on releases(poster);
+                 create index if not exists {SIZE_INDEX} on releases(size);
+                 create index if not exists {POSTED_INDEX} on releases(posted_date);
+                 create index if not exists {NAME_INDEX} on releases(lower(coalesce(display_name, name)));"
+        ))?;
+        // what a shard from before the list has with no category, which a sort over a category reads
+        if crate::category::uncategorized::listed(&conn, 0) {
+            Ok(())
+        } else {
+            crate::category::uncategorized::fill(&conn)
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_shard_no_new_build_has_opened_gets_its_tables_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("atlas.s0.db");
+        store::create_shard(&path).unwrap();
+        db::open_shard(&path).unwrap().execute_batch("drop table release_uncategorized").unwrap();
+        build(&path).unwrap();
+        let has: bool = db::open_shard(&path)
+            .unwrap()
+            .prepare("select 1 from sqlite_master where name = 'release_uncategorized'")
+            .unwrap()
+            .exists([])
+            .unwrap();
+        assert!(has);
+    }
 
     #[test]
     fn fields_name_what_is_asked() {
