@@ -2,6 +2,8 @@
 """Atlas's Grafana dashboards, as code.
 
     dashboards.py build             write dashboards/*.json
+    dashboards.py export            write the shareable copies in grafana/*.json at the top of the repo,
+                                    which ask for a data source on import
     dashboards.py push URL          create the Atlas folder and import them
                                     (GRAFANA_USER / GRAFANA_PASSWORD, default admin / admin;
                                     GRAFANA_DATASOURCE, the data source uid, default victoriametrics)
@@ -624,6 +626,29 @@ def build():
         print(f"{board['uid']}: {len(board['panels'])} panels")
 
 
+EXPORT_INPUTS = {
+    "__inputs": [{"name": "DS_PROMETHEUS", "label": "Prometheus or VictoriaMetrics", "description": "", "type": "datasource",
+                  "pluginId": "prometheus", "pluginName": "Prometheus"}],
+    "__requires": [{"type": "datasource", "id": "prometheus", "name": "Prometheus", "version": "1.0.0"}],
+}
+
+
+def exported(board):
+    """A board as Grafana's "Export for sharing externally" writes it: keys sorted, the data source an input."""
+    text = json.dumps(board, sort_keys=True).replace(json.dumps(DATASOURCE["uid"]), '"${DS_PROMETHEUS}"')
+    board = json.loads(text)
+    board["id"] = None
+    return json.dumps({**EXPORT_INPUTS, **json.loads(json.dumps(board, sort_keys=True))}, indent=2) + "\n"
+
+
+def export():
+    out = HERE.parent.parent / "grafana"
+    for make in BOARDS:
+        board = make().build()
+        (out / f"{board['uid']}.json").write_text(exported(board))
+        print(f"grafana/{board['uid']}.json")
+
+
 def call(url, method, path, body=None):
     token = base64.b64encode(f"{os.environ.get('GRAFANA_USER', 'admin')}:{os.environ.get('GRAFANA_PASSWORD', 'admin')}".encode())
     request = urllib.request.Request(
@@ -651,6 +676,8 @@ def push(url):
 if __name__ == "__main__":
     if sys.argv[1:2] == ["build"]:
         build()
+    elif sys.argv[1:2] == ["export"]:
+        export()
     elif sys.argv[1:2] == ["push"] and len(sys.argv) == 3:
         push(sys.argv[2])
     else:
