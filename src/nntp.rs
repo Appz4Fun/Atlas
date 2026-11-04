@@ -410,6 +410,21 @@ const MOVE_AFTER: u32 = 3;
 const STREAM_END_WAIT: Duration = Duration::from_secs(2);
 /// after a failed connect a server is skipped for this long (connect() still tries it)
 const DOWN_FOR: Duration = Duration::from_secs(60);
+/// A server's connection limit lowered by "too many connections" climbs back one connection at a time towards what
+/// config.toml gives it, the first after this long; each refusal on the way doubles the wait (up to
+/// `LIMIT_HEAL_MAX`), and reaching the configured count starts it over. A provider refuses for a while (another app on
+/// the account, a reconnect storm), and the limit only ever shrank, until a restart.
+const LIMIT_HEAL: Duration = Duration::from_secs(30);
+const LIMIT_HEAL_MAX: Duration = Duration::from_secs(15 * 60);
+
+/// When a lowered connection limit next goes up one, and how long the step after that waits (see `LIMIT_HEAL`).
+#[derive(Debug)]
+struct Heal {
+    next: Option<Instant>,
+    every: Duration,
+    /// a step up was taken since the last refusal: one now says that step was too far
+    climbed: bool,
+}
 /// An idle connection older than this is closed rather than used again: providers drop idle connections (frugal says
 /// "400 Idle timeout"), and on prod passes failed with "connection closed" on them, hundreds of times an hour.
 const STALE_IDLE: Duration = Duration::from_secs(30);
@@ -1369,8 +1384,9 @@ struct Server {
     warned_auth: AtomicBool,
     warned_limit: AtomicBool,
     /// connections atlas currently allows itself (starts at `connections`,
-    /// shrinks when the provider refuses more)
+    /// shrinks when the provider refuses more, and climbs back, see `LIMIT_HEAL`)
     limit: AtomicUsize,
+    heal: Mutex<Heal>,
     /// requests waiting for a free connection right now
     waiting: AtomicUsize,
     /// for the stats dashboard
@@ -1592,6 +1608,8 @@ pub struct Pool {
     misses: Mutex<HashMap<(String, usize), u32>>,
     /// `HOME_RETRY`, shorter in tests
     home_retry: Duration,
+    /// `LIMIT_HEAL`, shorter in tests
+    limit_heal: Duration,
     unsaved: Arc<UnsavedBudget>,
     /// how long a background body waits for room before queuing
     body_patience: Duration,
@@ -1778,6 +1796,7 @@ impl Pool {
                         warned_auth: AtomicBool::new(false),
                         warned_limit: AtomicBool::new(false),
                         limit: AtomicUsize::new(cfg.connections().max(1) as usize),
+                        heal: Mutex::new(Heal { next: None, every: LIMIT_HEAL, climbed: false }),
                         waiting: AtomicUsize::new(0),
                         headers: AtomicU64::new(0),
                         wire: AtomicU64::new(0),
@@ -1792,6 +1811,7 @@ impl Pool {
             homes: Mutex::new(HashMap::new()),
             misses: Mutex::new(HashMap::new()),
             home_retry: HOME_RETRY,
+            limit_heal: LIMIT_HEAL,
             body_patience: BODY_PATIENCE,
             unsaved: UnsavedBudget::new(crate::config::DEFAULT_MAX_UNSAVED_HEADERS as usize),
             rate_limiter: Arc::new(TokenBucket::new(0, 0)),
@@ -1810,6 +1830,15 @@ impl Pool {
     /// how long a group stays off a home it left before going back (`HOME_RETRY`)
     pub fn with_home_retry(mut self, after: Duration) -> Self {
         self.home_retry = after;
+        self
+    }
+
+    /// how long a lowered connection limit waits before it climbs back a step (`LIMIT_HEAL`)
+    pub fn with_limit_heal(mut self, after: Duration) -> Self {
+        self.limit_heal = after;
+        for s in &self.servers {
+            s.heal.lock().unwrap().every = after;
+        }
         self
     }
 
@@ -2079,6 +2108,7 @@ impl Pool {
         let server = self.servers.get(i).cloned().ok_or_else(Self::no_servers)?;
 
         loop {
+            self.heal_limit(&server);
             let waited = Instant::now();
             let permit = {
                 let _waiting = Waiting::on(&server.waiting);
@@ -2134,6 +2164,14 @@ impl Pool {
                 conn.set_rate_limiter(self.rate_limiter.clone());
                 connects("ok");
                 *server.down_until.lock().unwrap() = None;
+                {
+                    // a step back up held; at the configured count, the next lowering waits the shortest again
+                    let mut heal = server.heal.lock().unwrap();
+                    heal.climbed = false;
+                    if heal.next.is_none() {
+                        heal.every = self.limit_heal;
+                    }
+                }
                 return Ok(Some(Lease::new(conn, server.clone(), permit)));
             }
             Err(e) => e,
@@ -2152,8 +2190,16 @@ impl Pool {
             Refusal::TooMany if others_open && limit > 1 => {
                 permit.forget();
                 let now = server.limit.fetch_sub(1, Ordering::Relaxed) - 1;
+                {
+                    // refused right after a step back up: the next step waits twice as long
+                    let mut heal = server.heal.lock().unwrap();
+                    if std::mem::take(&mut heal.climbed) {
+                        heal.every = (heal.every * 2).min(LIMIT_HEAL_MAX.max(self.limit_heal));
+                    }
+                    heal.next = Some(Instant::now() + heal.every);
+                }
                 if !server.warned_limit.swap(true, Ordering::Relaxed) {
-                    println!("{}: provider refused more connections ({e}), lowering to {now}", server.cfg.host);
+                    println!("{}: provider refused more connections ({e}), lowering to {now} for now", server.cfg.host);
                 }
                 Ok(None)
             }
@@ -2177,10 +2223,33 @@ impl Pool {
         }
     }
 
+    /// One more connection for a server whose limit a refusal lowered, when it is due (see `LIMIT_HEAL`).
+    fn heal_limit(&self, server: &Server) {
+        let configured = server.cfg.connections().max(1) as usize;
+        let mut heal = server.heal.lock().unwrap();
+        let Some(next) = heal.next else { return };
+        if Instant::now() < next {
+            return;
+        }
+        if server.limit.load(Ordering::Relaxed) < configured {
+            server.permits.add_permits(1);
+            server.limit.fetch_add(1, Ordering::Relaxed);
+            heal.climbed = true;
+        }
+        if server.limit.load(Ordering::Relaxed) >= configured {
+            // back at the configured count; the wait starts over once a connection there opens (see `connect_with_permit`)
+            heal.next = None;
+            server.warned_limit.store(false, Ordering::Relaxed);
+        } else {
+            heal.next = Some(Instant::now() + heal.every);
+        }
+    }
+
     /// A connection to server `i` for background work: only when nobody waits
     /// for one and more than a quarter of its connections are free. None: no room.
     async fn background_lease(&self, i: usize) -> Result<Option<Lease>> {
         let server = self.servers[i].clone();
+        self.heal_limit(&server);
         let limit = server.limit.load(Ordering::Relaxed);
         if self.is_down(i)
             || server.waiting.load(Ordering::Relaxed) > 0
