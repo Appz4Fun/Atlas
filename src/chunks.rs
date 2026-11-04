@@ -48,6 +48,10 @@ pub fn create(conn: &Connection) -> Result<()> {
             days INTEGER NOT NULL,
             articles INTEGER NOT NULL
         ) without rowid;
+        create table if not exists backfill_media (
+            grp TEXT PRIMARY KEY,
+            releases INTEGER NOT NULL
+        ) without rowid;
         create table if not exists backfill_wanted (
             grp TEXT NOT NULL,
             day INTEGER NOT NULL,
@@ -249,10 +253,41 @@ pub fn claim(conn: &Connection, groups: &[(String, i64)], host: &str, now: i64) 
     if groups.is_empty() {
         return Ok(None);
     }
-    match claim_wanted(conn, groups, host, now)? {
-        Some(claim) => Ok(Some(claim)),
-        None => claim_newest(conn, groups, host, now),
+    if let Some(claim) = claim_wanted(conn, groups, host, now)? {
+        return Ok(Some(claim));
     }
+    let media = media_groups(conn)?;
+    let first: Vec<(String, i64)> = groups.iter().filter(|(g, _)| media.contains(g)).cloned().collect();
+    if !first.is_empty()
+        && let Some(claim) = claim_newest(conn, &first, host, now)?
+    {
+        return Ok(Some(claim));
+    }
+    claim_newest(conn, groups, host, now)
+}
+
+/// Groups the big releases the indexer is after mostly come from, at least `MEDIA_MIN` each: their backfill goes
+/// before the rest.
+pub const MEDIA_GROUPS: usize = 16;
+pub const MEDIA_MIN: i64 = 20;
+
+/// Notes how many big releases each group holds (see `MEDIA_GROUPS`), in place of what was noted before.
+pub fn set_media(conn: &Connection, counts: &[(String, i64)]) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute("delete from backfill_media", [])?;
+    {
+        let mut add = tx.prepare_cached("insert or replace into backfill_media (grp, releases) values (?1, ?2)")?;
+        for (group, n) in counts {
+            add.execute(params![group, n])?;
+        }
+    }
+    tx.commit()
+}
+
+fn media_groups(conn: &Connection) -> Result<std::collections::HashSet<String>> {
+    conn.prepare_cached("select grp from backfill_media where releases >= ?1 order by releases desc limit ?2")?
+        .query_map(params![MEDIA_MIN, MEDIA_GROUPS as i64], |r| r.get(0))?
+        .collect()
 }
 
 /// The newest day asked for of `groups`, pending or with a stale claim: read from the few asked for, not the backlog.
@@ -538,6 +573,29 @@ mod tests {
         assert_eq!(day(claim(&c, &groups, "a", 1000)), Some(19_998));
         assert_eq!(claim(&c, &groups, "a", 1000).unwrap(), None);
         assert_eq!(progress(&c, "g").unwrap(), (1, 3));
+    }
+
+    #[test]
+    fn the_groups_big_releases_come_from_are_backfilled_first() {
+        let c = conn();
+        add(&c, "plain", 20_000, 19_990).unwrap();
+        add(&c, "media", 20_000, 19_990).unwrap();
+        add(&c, "few", 20_000, 19_990).unwrap();
+        let groups: Vec<(String, i64)> = ["plain", "media", "few"].iter().map(|g| (g.to_string(), 19_995)).collect();
+        // ties go by group name, `media` before `plain`: start where that wouldn't show
+        assert_eq!(claim(&c, &groups, "a", 0).unwrap().unwrap().day, 20_000);
+        set_media(&c, &[("media".into(), 500), ("few".into(), MEDIA_MIN - 1)]).unwrap();
+        let mut got = Vec::new();
+        while let Some(claim) = claim(&c, &groups, "a", 0).unwrap() {
+            got.push((claim.group, claim.day));
+        }
+        let media: Vec<i64> = got.iter().take_while(|(g, _)| g == "media").map(|(_, d)| *d).collect();
+        assert_eq!(media.len(), 6, "every day of `media` the server keeps, first: {got:?}");
+        assert!(media.windows(2).all(|w| w[0] > w[1]), "newest first");
+        assert!(got.iter().skip(6).all(|(g, _)| g != "media"));
+        // noted again from scratch
+        set_media(&c, &[("plain".into(), 30)]).unwrap();
+        assert_eq!(media_groups(&c).unwrap(), ["plain".to_string()].into());
     }
 
     #[test]
