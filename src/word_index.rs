@@ -4,8 +4,8 @@
 //!
 //! The database stays what's true. Triggers in each shard put the id of a release that changed, or whose category did,
 //! in `word_queue`, and the web server's process takes them from there into the index every few seconds. An index
-//! that's missing, or made by another version of this file, is built again from the shards in the background, and
-//! searches go to the database as before until it's ready. Each hit is read from the database again before it's shown,
+//! that's missing, or made by another version of this file, is built again from the shards in the background, going
+//! on from its last commit after a restart, and searches go to the database as before until it's ready. Each hit is read from the database again before it's shown,
 //! soo an index a few seconds behind never shows a release a client may no longer see.
 
 use std::collections::HashMap;
@@ -39,6 +39,8 @@ const DRAIN_EVERY: Duration = Duration::from_secs(3);
 const DRAIN_BATCH: usize = 20_000;
 /// Releases read from a shard at a time when building: short reads, soo the indexer's writes don't wait on one.
 const BUILD_BATCH: i64 = 5_000;
+/// Releases a build adds between its commits: about what a restart in the middle of one has to read again.
+const BUILD_COMMIT_EVERY: usize = 1_000_000;
 const WRITER_HEAP: usize = 256 * 1024 * 1024;
 
 /// What a search sorts its matches by.
@@ -264,10 +266,13 @@ impl WordIndex {
         // as SQLite's lower(), which the sort over a category without words goes by
         doc.add_text(f.name_key, shown.to_ascii_lowercase());
         doc.add_text(f.group, &row.group);
-        let tags = crate::release_tags::parse(shown);
-        for tag in TAGS {
-            if tag_matches(tag, &tags) {
-                doc.add_text(f.tags, tag);
+        // most names have no word a tag could come from, and parsing one is most of what indexing it costs
+        if may_have_tags(shown) {
+            let tags = crate::release_tags::parse(shown);
+            for tag in TAGS {
+                if tag_matches(tag, &tags) {
+                    doc.add_text(f.tags, tag);
+                }
             }
         }
         doc
@@ -275,6 +280,19 @@ impl WordIndex {
 
     /// Everything again from the shards. What changes meanwhile is queued, and taken in by the next drain.
     pub fn build(&self, conn: &Connection) -> anyhow::Result<usize> {
+        self.build_in(conn, BUILD_BATCH, BUILD_COMMIT_EVERY, || true)
+    }
+
+    /// `build`, reading `batch` releases at a time and committing about every `every` of them, with where it got to
+    /// in the commit's payload: a build cut short by a restart goes on from its last commit instead of starting again.
+    /// It stops after a commit when `go_on` says so.
+    fn build_in(
+        &self,
+        conn: &Connection,
+        batch: i64,
+        every: usize,
+        mut go_on: impl FnMut() -> bool,
+    ) -> anyhow::Result<usize> {
         let mut guard = lock(&self.writer);
         let Some(writer) = guard.as_mut() else { anyhow::bail!("another process keeps the word index") };
         let _ = std::fs::remove_file(self.dir.join("atlas-built"));
@@ -285,25 +303,44 @@ impl WordIndex {
              insert or ignore into main.meta (key, value) values ('word_index', random());",
         )?;
         let token = database_token(conn)?.unwrap_or_default();
-        // forgotten first: whatever changes from here on is queued again
-        for s in 0..store::SHARDS {
-            conn.execute(&format!("delete from s{s}.word_queue"), [])?;
-        }
-        writer.delete_all_documents()?;
+        // what an attempt that failed added after its last commit: the cursor below is from before it
+        writer.rollback()?;
+        let resumed = self.index.load_metas()?.payload.as_deref().and_then(|p| building_at(p, token));
+        let (first, mut after) = match resumed {
+            Some(at) => at,
+            None => {
+                // forgotten first: whatever changes from here on is queued again
+                for s in 0..store::SHARDS {
+                    conn.execute(&format!("delete from s{s}.word_queue"), [])?;
+                }
+                writer.delete_all_documents()?;
+                commit_with(writer, &building(token, 0, 0))?;
+                (0, 0)
+            }
+        };
         let mut added = 0;
-        for s in 0..store::SHARDS {
-            let mut after = 0i64;
+        let mut since_commit = 0;
+        for s in first..store::SHARDS {
             loop {
-                let rows = read_rows(conn, s, &format!("r.id > ?1 order by r.id limit {BUILD_BATCH}"), after)?;
+                let rows = read_rows(conn, s, &format!("r.id > ?1 order by r.id limit {batch}"), after)?;
                 let Some(last) = rows.last() else { break };
                 after = last.id;
                 for doc in self.docs(&rows) {
                     writer.add_document(doc)?;
                 }
                 added += rows.len();
+                since_commit += rows.len();
+                if since_commit >= every {
+                    commit_with(writer, &building(token, s, after))?;
+                    since_commit = 0;
+                    if !go_on() {
+                        return Ok(added);
+                    }
+                }
             }
+            after = 0;
         }
-        writer.commit()?;
+        commit_with(writer, &format!("built {token}"))?;
         std::fs::write(self.dir.join("atlas-built"), token.to_string())?;
         self.reader.reload()?;
         self.built_from.store(token, Ordering::Release);
@@ -313,7 +350,7 @@ impl WordIndex {
 
     /// The documents of `rows`, worked out on every core: reading a name's tags is the slow part.
     fn docs(&self, rows: &[Indexed]) -> Vec<TantivyDocument> {
-        let cores = std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(1, 8);
+        let cores = std::thread::available_parallelism().map_or(4, |n| n.get()).max(1);
         let per = rows.len().div_ceil(cores).max(1);
         std::thread::scope(|scope| {
             let parts: Vec<_> = rows
@@ -558,6 +595,29 @@ where
 }
 
 /// The tag filters, as the page has always told them from a name.
+/// Whether `name` holds anything `ptt` makes one of `TAGS` from: a resolution of 1080 or 2160 lines however it's
+/// written, a `WxH` size, BluRay, BD, BR or UHD, a remux, WEB, HDR or Dolby Vision. False is certain; true only means
+/// the name is worth parsing.
+fn may_have_tags(name: &str) -> bool {
+    const WORDS: &[&str] = &[
+        "1080", "2160", "4k", "fhd", "full hd", "1920", "3840", "4096", "blu", "bd", "br", "uhd", "remux", "web",
+        "hdr", "dv", "dolby", "dovi",
+    ];
+    let lower = name.to_ascii_lowercase();
+    if WORDS.iter().any(|w| lower.contains(w)) {
+        return true;
+    }
+    // a frame size, `1998x1080`: the size ptt reads a resolution from
+    let b = lower.as_bytes();
+    b.iter().enumerate().any(|(i, &c)| {
+        c == b'x'
+            && i >= 3
+            && b[i - 3..i].iter().all(u8::is_ascii_digit)
+            && b.get(i + 3).is_some()
+            && b[i + 1..i + 4].iter().all(u8::is_ascii_digit)
+    })
+}
+
 pub fn tag_matches(filter: &str, tags: &crate::release_tags::Tags) -> bool {
     let quality = tags.quality.as_deref().unwrap_or_default();
     match filter {
@@ -654,6 +714,29 @@ fn database_token(conn: &Connection) -> rusqlite::Result<Option<i64>> {
         return Ok(None);
     }
     conn.query_row("select value from main.meta where key = 'word_index'", [], |r| r.get(0)).optional()
+}
+
+/// A build's commit payload: the database it's built from, and the shard and last release id it got to.
+fn building(token: i64, shard: usize, after: i64) -> String {
+    format!("building {token} {shard} {after}")
+}
+
+/// Where a build left off, when `payload` is one of `building`'s for the database of `token`.
+fn building_at(payload: &str, token: i64) -> Option<(usize, i64)> {
+    let mut words = payload.strip_prefix("building ")?.split(' ');
+    if words.next()?.parse::<i64>().ok()? != token {
+        return None;
+    }
+    let shard = words.next()?.parse().ok()?;
+    let after = words.next()?.parse().ok()?;
+    Some((shard, after))
+}
+
+fn commit_with(writer: &mut IndexWriter, payload: &str) -> tantivy::Result<()> {
+    let mut commit = writer.prepare_commit()?;
+    commit.set_payload(payload);
+    commit.commit()?;
+    Ok(())
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -803,6 +886,71 @@ mod tests {
 
     const UHD: i64 = 2045;
     const HD: i64 = 2040;
+
+    #[test]
+    fn names_without_a_tag_word_skip_parsing_and_lose_no_tag() {
+        let tagged = [
+            "Movie.2020.2160p.UHD.BluRay.REMUX.DV.HDR.HEVC-X",
+            "Movie 2020 1080p WEB-DL DDP5 1 H 264-Y",
+            "Movie.2020.4K.HDR10+.WEB.h265",
+            "Movie.2020.1920x800.BRRip",
+            "Movie.2020.3840x1600.HEVC",
+            "Movie.2020.1998x1080.x264",
+            "Movie.2020.FHD.WEBRip",
+            "Movie 2020 Full HD x264",
+            "Movie.2020.BDRemux",
+            "Movie.2020.Dolby.Vision.mkv",
+            "Movie.2020.DoVi.mkv",
+            "Movie [BD] 2020",
+            "Movie.2020.10800p.mkv",
+        ];
+        let mut with_tags = 0;
+        for name in tagged {
+            let tags = crate::release_tags::parse(name);
+            with_tags += usize::from(TAGS.iter().any(|t| tag_matches(t, &tags)));
+            assert!(may_have_tags(name), "{name}");
+        }
+        assert!(with_tags >= 10, "{with_tags}");
+        for name in ["Some.Show.S01E02.720p.HDTV", "a8f3c1d2e4b5", "Album - Artist (2001) [FLAC]", "IMG_0042.jpg"] {
+            assert!(!may_have_tags(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_build_cut_short_goes_on_from_its_last_commit() {
+        let f = fixture();
+        for i in 0..40 {
+            f.add(&format!("Show.S01E{i:02}.1080p.WEB-DL-G{i}"), &format!("alt.binaries.g{}", i % 5), 10, Some(HD));
+        }
+        let conn = f.conn();
+        {
+            let index = f.index();
+            let mut commits = 0;
+            let added = index
+                .build_in(&conn, 3, 6, || {
+                    commits += 1;
+                    commits < 2
+                })
+                .unwrap();
+            assert!(added > 0 && added < 40, "{added}");
+            assert!(!index.ready());
+        }
+        // the process restarts: a new index on the same folder, which isn't ready
+        let index = f.index();
+        assert!(!index.ready());
+        // an attempt that failed after adding some, past its last commit
+        let rows = read_rows(&conn, 0, "r.id > ?1 order by r.id limit 3", 0).unwrap();
+        for doc in index.docs(&rows) {
+            lock(&index.writer).as_mut().unwrap().add_document(doc).unwrap();
+        }
+        let rest = index.build_in(&conn, 3, 6, || true).unwrap();
+        assert!(rest < 40, "it went on rather than starting again: {rest}");
+        assert!(index.ready());
+        assert_eq!(index.count("show", None, &[]).unwrap(), 40, "each release once");
+        // a finished build starts again from nothing the next time it's asked for
+        assert_eq!(index.build(&conn).unwrap(), 40);
+        assert_eq!(index.count("show", None, &[]).unwrap(), 40);
+    }
 
     #[test]
     fn a_search_sorts_every_match_and_counts_them() {
