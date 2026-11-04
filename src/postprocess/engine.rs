@@ -43,6 +43,20 @@ fn net_pause_secs(in_a_row: i64) -> i64 {
 const NET_CRASH_RETRY: i64 = 900;
 const STEP_DEADLINE: Duration = Duration::from_secs(120);
 
+/// Transient failures in a row of a release's net step (every server timed out on its body, say) retried after 5
+/// minutes; past these they back off like a retry (`backoff`). They were retried every 5 minutes for good, asking
+/// every server again each time.
+const TRANSIENT_FREE: i64 = 3;
+
+/// For a net step's transient failure after `attempts_before` attempts: the attempts it leaves, and the seconds until
+/// it runs again. Transient failures alone never fail a release (that is for `max_attempts` retries), soo the count
+/// stops one short of it.
+fn transient_retry(attempts_before: i64, max_attempts: i64, release_id: i64) -> (i64, i64) {
+    let attempt = (attempts_before + 1).min((max_attempts - 1).max(attempts_before));
+    let wait = if attempt <= TRANSIENT_FREE { 300 } else { backoff(attempt - TRANSIENT_FREE, release_id) };
+    (attempt, wait)
+}
+
 /// seconds until an attempt's retry, and a little per release soo they dont bunch
 fn backoff(attempt: i64, release_id: i64) -> i64 {
     let shift = (attempt.max(1) - 1).min(16) as u32;
@@ -1057,8 +1071,9 @@ impl Inner {
                     a.error = Some(e);
                 }
                 Ran::Error(StepError::Transient(e)) => {
-                    a.net_attempts = Some(attempts_before);
-                    a.net_next_at = Some(now + 300);
+                    let (attempt, wait) = transient_retry(attempts_before, max_attempts, id);
+                    a.net_attempts = Some(attempt);
+                    a.net_next_at = Some(now + wait);
                     a.error = Some(e);
                     self.pause_net_after_trouble(now);
                 }
@@ -1178,6 +1193,16 @@ fn seed_shard(conn: &Connection, enabled: StepMask, stamps: &[(u8, StepMask, i64
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transient_failures_back_off_after_a_few_and_never_fail_a_release() {
+        let waits: Vec<(i64, i64)> = (0..6).map(|n| transient_retry(n, 20, 0)).collect();
+        assert_eq!(waits[..3], [(1, 300), (2, 300), (3, 300)]);
+        assert_eq!(waits[3..], [(4, 900), (5, 3600), (6, 14400)]);
+        assert_eq!(transient_retry(19, 20, 0).0, 19, "one short of max_attempts");
+        assert_eq!(transient_retry(25, 20, 0).0, 25, "never lowers what retries left");
+        assert_eq!(transient_retry(0, 1, 0), (0, 300));
+    }
 
     #[test]
     fn a_few_bad_articles_dont_rest_the_net_lane_but_a_run_of_them_does() {
