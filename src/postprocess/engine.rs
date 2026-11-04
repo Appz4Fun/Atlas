@@ -2,6 +2,7 @@
 //! outside steps run within their budget. All writes go through the shard's
 //! writer, and a batch is one job, soo a crash repeats it whole.
 
+use std::collections::HashSet;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering::Relaxed};
@@ -76,7 +77,8 @@ pub(crate) struct Inner {
     settings: RwLock<Settings>,
     pub(crate) stop: Arc<AtomicBool>,
     db_busy: [AtomicBool; SHARDS],
-    net_busy: [AtomicBool; SHARDS],
+    /// per shard: the releases its net claims hold, `NET_CLAIMS_PER_SHARD` claims at most
+    net_claimed: [Mutex<HashSet<i64>>; SHARDS],
     fetcher: BodyFetcher,
     stats: Arc<Stats>,
     /// no net claims before this
@@ -245,7 +247,7 @@ impl Inner {
             settings: RwLock::new(Settings { full: p.config.clone(), rules: Rules::new(&config), config, enabled: 0 }),
             stop,
             db_busy: std::array::from_fn(|_| AtomicBool::new(false)),
-            net_busy: std::array::from_fn(|_| AtomicBool::new(false)),
+            net_claimed: std::array::from_fn(|_| Mutex::new(HashSet::new())),
             fetcher,
             stats,
             net_paused_until: AtomicI64::new(0),
@@ -831,12 +833,8 @@ impl Inner {
                     if self.stopping() {
                         break;
                     }
-                    if self.net_busy[shard].swap(true, Relaxed) {
-                        continue;
-                    }
                     let result =
                         conns.get(shard).map_err(anyhow::Error::from).and_then(|conn| self.net_claim(conn, &db, shard));
-                    self.net_busy[shard].store(false, Relaxed);
                     match result {
                         Ok(did) => worked |= did,
                         Err(e) => {
@@ -856,23 +854,26 @@ impl Inner {
     fn net_claim(&self, conn: &Connection, db: &Db, shard: usize) -> anyhow::Result<bool> {
         let now = chrono::Utc::now().timestamp();
         let order = claim_order(self.claims[shard].load(Relaxed));
-        let ids: Vec<i64> = conn
-            .prepare_cached(&format!(
-                "select release_id from pp_state where net_wanted = 1 and net_next_at <= ?1 order by {order} limit ?2"
-            ))?
-            .query_map(params![now, NET_BATCH], |r| r.get(0))?
-            .collect::<rusqlite::Result<_>>()?;
+        let ids = net_take(conn, &self.net_claimed[shard], order, now)?;
         if ids.is_empty() {
             return Ok(false);
         }
         self.claims[shard].fetch_add(1, Relaxed);
-        for id in ids {
+        let mut result = Ok(());
+        for id in &ids {
             if self.stopping() {
                 break;
             }
-            self.net_one(conn, db, shard, id)?;
+            result = self.net_one(conn, db, shard, *id);
+            if result.is_err() {
+                break;
+            }
         }
-        Ok(true)
+        let mut claimed = self.net_claimed[shard].lock().unwrap();
+        for id in &ids {
+            claimed.remove(id);
+        }
+        result.map(|()| true)
     }
 
     /// Gives each release of `shard` the net lane wants a `net_rank`, newest first, a slice at a time: rows from
@@ -1239,6 +1240,28 @@ pub(crate) fn claim_order(claims: i64) -> &'static str {
 /// longest waiting, soo the backlog drains too.
 pub(crate) fn queue_order(batches: i64) -> &'static str {
     if batches % 4 == 3 { "due_at" } else { "due_at desc" }
+}
+
+/// Net claims of one shard running at once. They were one: a shard's releases went through a body fetch or a
+/// provider lookup one at a time, ~600 a minute over all eight shards, however many net workers there were.
+const NET_CLAIMS_PER_SHARD: usize = 8;
+
+/// The next `NET_BATCH` releases the net lane wants, in `order`, that no other claim of the shard holds: none
+/// when `NET_CLAIMS_PER_SHARD` claims hold some already. They are held in `claimed` till the claim gives them back.
+pub(crate) fn net_take(conn: &Connection, claimed: &Mutex<HashSet<i64>>, order: &str, now: i64) -> rusqlite::Result<Vec<i64>> {
+    let mut claimed = claimed.lock().unwrap();
+    if claimed.len() >= NET_CLAIMS_PER_SHARD * NET_BATCH as usize {
+        return Ok(Vec::new());
+    }
+    let ids: Vec<i64> = conn
+        .prepare_cached(&format!(
+            "select release_id from pp_state where net_wanted = 1 and net_next_at <= ?1 order by {order} limit ?2"
+        ))?
+        .query_map(params![now, NET_BATCH + claimed.len() as i64], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    let ids: Vec<i64> = ids.into_iter().filter(|id| !claimed.contains(id)).take(NET_BATCH as usize).collect();
+    claimed.extend(&ids);
+    Ok(ids)
 }
 
 /// Releases ranked per slice, at most.
