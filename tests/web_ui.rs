@@ -155,7 +155,36 @@ fn the_web_ui_end_to_end() {
     let by_group = fetch(port, "/ui/results?group=alt.binaries.g1", &cookie);
     assert!(by_group.body.contains("Findword") && by_group.body.contains("1 release"), "{}", by_group.body);
     let by_group_uhd = fetch(port, "/ui/results?group=alt.binaries.g1&filters=2160p", &cookie);
-    assert!(!by_group_uhd.body.contains("1 release"), "no total that counts hidden rows: {}", by_group_uhd.body);
+    // the database counts the group's rows, not their tags: a most, said so
+    assert!(by_group_uhd.body.contains(">Up to 1 release<"), "a total that counts hidden rows: {}", by_group_uhd.body);
+    assert!(by_group_uhd.body.contains("Counted before releases without the chosen tags are left out. "));
+
+    // every page has a total, once the word index can count it
+    let waited = std::time::Instant::now();
+    while atlas::word_index::ready().is_none() {
+        assert!(waited.elapsed() < std::time::Duration::from_secs(60), "the word index never got built");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let total = |path: &str| {
+        let body = fetch(port, path, &cookie).body;
+        let start = body.find("class=\"total\"").unwrap_or_else(|| panic!("no total on {path}: {body}"));
+        let end = body[start..].find("</strong>").unwrap() + start;
+        body[body[..end].rfind('>').unwrap() + 1..end].to_string()
+    };
+    assert_eq!(total("/ui/results"), "3 releases");
+    assert_eq!(total("/ui/results?cat=5000"), "1 release");
+    assert_eq!(total("/ui/results?cat=5000&sort=size&dir=desc"), "1 release");
+    assert_eq!(total("/ui/results?cat=2000"), "0 releases");
+    assert_eq!(total("/ui/results?filters=2160p"), "1 release");
+    assert_eq!(total("/ui/results?filters=2160p&sort=name&dir=asc"), "1 release");
+    assert_eq!(total("/ui/results?q=Findword&filters=DV"), "1 release");
+    assert_eq!(total("/ui/results?filters=Hide%20copies"), "Up to 3 releases");
+    // a window of its own: the pages further on keep theirs a minute
+    assert_eq!(total("/ui/results?cat=5000&incomplete=hide"), "Up to 1 release");
+    assert_eq!(total("/ui/results?q=Findword&incomplete=hide&filters=Hide%20copies"), "Up to 2 releases");
+    let tagged = fetch(port, "/ui/results?filters=2160p", &cookie).body;
+    assert!(tagged.contains("Film.Findword") && !tagged.contains("Tv.Findword"), "{tagged}");
+    assert!(tagged.contains("Newest first<"), "every release filtered, not the newest few: {tagged}");
     assert!(!by_group.body.contains("alert(1)"), "{}", by_group.body);
     assert_eq!(by_group.header("HX-Push-Url").as_deref(), Some("/?group=alt.binaries.g1"));
 

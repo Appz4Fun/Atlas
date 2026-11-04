@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rusqlite::{Connection, OptionalExtension};
 use tantivy::collector::sort_key::{SortBySimilarityScore, SortByStaticFastValue, SortByString};
@@ -48,6 +48,8 @@ const WRITER_HEAP: usize = 256 * 1024 * 1024;
 pub enum By {
     /// best match first
     Relevance,
+    /// the newest first, as a list with no words has it: what the filters leave of every release
+    Newest,
     Size,
     Posted,
     Name,
@@ -180,6 +182,8 @@ pub struct WordIndex {
     /// How a search asks `keep_up` to drain now, and sees when it has.
     pulse: Mutex<Pulse>,
     pulsed: Condvar,
+    /// Counts that took a while, kept a moment: a click through a big category counts it once, not on every page.
+    counts: Mutex<HashMap<String, (Instant, usize)>>,
 }
 
 /// `keep_up`'s steps: asked for, begun, and done, counted.
@@ -189,6 +193,13 @@ struct Pulse {
     begun: u64,
     done: u64,
 }
+
+/// How long a count with no words that took `COUNT_SLOW` or more is kept.
+const COUNT_KEPT: Duration = Duration::from_secs(30);
+/// A count this slow is kept: the quick ones are counted again each time.
+const COUNT_SLOW: Duration = Duration::from_millis(50);
+/// Counts kept at the most, one for each category and filters asked lately.
+const COUNTS_KEPT: usize = 256;
 
 /// The longest a search waits for `keep_up` to take in what's queued: past that it reads what's indexed.
 const CATCH_UP_WAIT: Duration = Duration::from_millis(500);
@@ -222,6 +233,7 @@ impl WordIndex {
             keeping: AtomicBool::new(false),
             pulse: Mutex::new(Pulse::default()),
             pulsed: Condvar::new(),
+            counts: Mutex::new(HashMap::new()),
         })
     }
 
@@ -481,13 +493,39 @@ impl WordIndex {
         self.pulsed.notify_all();
     }
 
-    /// How many releases match, as `search` counts them.
+    /// How many releases match, as `search` counts them. A count with no words, a category's or a filter's, may be up
+    /// to `COUNT_KEPT` old: a big one reads millions of documents, and a few seconds' new releases don't change it much.
     pub fn count(&self, words: &str, filter: Option<&CatFilter>, tags: &[&str]) -> anyhow::Result<usize> {
-        let _ = crate::db::with_reader(|conn| {
-            self.catch_up(conn);
-            Ok(())
-        });
-        Ok(self.reader.searcher().search(self.query(words, filter, tags).as_ref(), &Count)?)
+        let browsing = words.trim().is_empty();
+        if !browsing {
+            // what was saved a moment ago is found, soo it's counted too
+            let _ = crate::db::with_reader(|conn| {
+                self.catch_up(conn);
+                Ok(())
+            });
+        }
+        let searcher = self.reader.searcher();
+        if browsing && filter.is_none() && tags.is_empty() {
+            // every release: what the index holds, with no document read
+            return Ok(searcher.num_docs() as usize);
+        }
+        let key = format!("{words}\u{1f}{filter:?}\u{1f}{tags:?}");
+        if browsing
+            && let Some(&(at, n)) = lock(&self.counts).get(&key)
+            && at.elapsed() < COUNT_KEPT
+        {
+            return Ok(n);
+        }
+        let began = Instant::now();
+        let n = searcher.search(self.query(words, filter, tags).as_ref(), &Count)?;
+        if browsing && began.elapsed() >= COUNT_SLOW {
+            let mut counts = lock(&self.counts);
+            counts.retain(|_, (at, _)| at.elapsed() < COUNT_KEPT);
+            if counts.len() < COUNTS_KEPT {
+                counts.insert(key, (Instant::now(), n));
+            }
+        }
+        Ok(n)
     }
 
     fn query(&self, words: &str, filter: Option<&CatFilter>, tags: &[&str]) -> Box<dyn Query> {
@@ -567,6 +605,7 @@ impl WordIndex {
         let newest = (SortByStaticFastValue::<u64>::for_field("id"), Order::Desc);
         let (found, total) = match by {
             By::Relevance => run(searcher, query, page.order_by(((SortBySimilarityScore, Order::Desc), newest)))?,
+            By::Newest => run(searcher, query, page.order_by(newest))?,
             By::Size => {
                 run(searcher, query, page.order_by(((SortByStaticFastValue::<u64>::for_field("size"), order), newest)))?
             }
@@ -990,6 +1029,13 @@ mod tests {
         assert_eq!(index.count("", Some(&movies), &["WEB-DL"]).unwrap(), 31);
         let uhd = crate::category::parse_filter("2045").unwrap();
         assert_eq!(index.count("batman", Some(&uhd), &[]).unwrap(), 1);
+        // with no words: a category's, every release's, and its newest filtered by tag over all of them
+        assert_eq!(index.count("", Some(&movies), &[]).unwrap(), 32);
+        assert_eq!(index.count("", Some(&uhd), &[]).unwrap(), 1);
+        assert_eq!(index.count("", None, &[]).unwrap(), 32);
+        let newest = index.search(&conn, "", Some(&movies), &["WEB-DL"], By::Newest, true, 0, 3).unwrap();
+        assert_eq!((newest.total, newest.rows.len()), (31, 3));
+        assert!(newest.rows.windows(2).all(|w| w[0].id > w[1].id), "newest first: {:?}", ids(&newest));
         // newest first among equals, and by name
         let by_name = index.search(&conn, "show", None, &[], By::Name, false, 0, 2).unwrap();
         assert_eq!(ids(&by_name), [newer[0], newer[1]]);
