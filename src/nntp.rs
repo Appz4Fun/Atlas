@@ -47,13 +47,19 @@ impl NntpError {
     /// Selected") from some providers. Not 430 ("Failed forwarding") or 403
     /// ("Operation failed"): those say the server couldn't answer, and a range
     /// taken for empty is never read again
+    pub fn is_empty_range(&self) -> bool {
+        matches!(self.code(), Some(420 | 423))
+    }
+
     /// The server closed the connection: nothing came back on it.
     pub fn is_closed(&self) -> bool {
         matches!(self, NntpError::Io(e) if e.kind() == io::ErrorKind::UnexpectedEof)
     }
 
-    pub fn is_empty_range(&self) -> bool {
-        matches!(self.code(), Some(420 | 423))
+    /// "430 Failed forwarding": a reseller's front end couldnt ask its backend for the article just now. It says
+    /// nothing about whether the article is there, unlike a plain 430 ("No Such Article").
+    pub fn failed_forwarding(&self) -> bool {
+        matches!(self, NntpError::Reply { code: 430, message } if message.to_lowercase().contains("forward"))
     }
 
     /// 4xx
@@ -2402,6 +2408,8 @@ impl Pool {
                     // the rest is unread: the lease stays busy, soo the connection is thrown away
                     Ok((_, None)) => return Ok(BackgroundBody::TooBig),
                     Err(e) => match lease.check::<()>(Err(e)) {
+                        // couldnt ask: if no server has it, it isnt Missing yet, and it's read again later
+                        Err(e) if e.failed_forwarding() => unreachable = Some(e),
                         // this server doesnt have it
                         Err(NntpError::Reply { code: 423 | 430, .. }) | Ok(()) => {}
                         // anything else says nothing about the article

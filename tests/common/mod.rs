@@ -35,6 +35,8 @@ pub struct Server {
     pub bodies: bool,
     /// BODY answers 502, like a provider in trouble
     pub body_trouble: bool,
+    /// BODY answers "430 Failed forwarding.", like a reseller whose backend didnt answer
+    pub forwarding_fails: bool,
     pub xover_delay: Duration,
     /// answer XFEATURE COMPRESS GZIP and send zlib compressed XOVER
     pub compress: bool,
@@ -100,6 +102,7 @@ impl Server {
             password: "secret",
             bodies: true,
             body_trouble: false,
+            forwarding_fails: false,
             xover_delay: Duration::ZERO,
             compress: false,
             compress_broken: false,
@@ -400,6 +403,7 @@ pub fn serve(stream: TcpStream, state: &Server, over_limit: bool) {
                 None => send(&mut out, b"430 no such article"),
             },
             "BODY" if state.body_trouble => send(&mut out, b"502 try later"),
+            "BODY" if state.forwarding_fails => send(&mut out, b"430 Failed forwarding."),
             "BODY" => {
                 // the lock goes before the reply, not at the end of the match
                 let found =

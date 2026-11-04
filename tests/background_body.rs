@@ -93,6 +93,48 @@ fn every_server_saying_no_is_missing() {
     assert_eq!(rt.block_on(pool.background_body("<msg1@mock>", MIB)).unwrap(), BackgroundBody::Missing);
 }
 
+/// "430 Failed forwarding" says the server couldnt ask its backend: with the others saying no, the body isnt Missing
+/// but an error, read again later; with another one having it, that one's body comes back.
+#[test]
+fn failed_forwarding_is_an_error_not_missing() {
+    let rt = runtime();
+    let servers: Vec<Arc<Server>> = (0..2)
+        .map(|i| {
+            let mut s = Server::new(vec![post(1, r#""a.bin" yEnc (1/1)"#, 10, vec![b"hello".to_vec()])]);
+            let s2 = Arc::get_mut(&mut s).unwrap();
+            if i == 0 {
+                s2.forwarding_fails = true;
+            } else {
+                s2.bodies = false;
+            }
+            s
+        })
+        .collect();
+    let ports: Vec<u16> = servers.iter().map(|s| spawn_server(s.clone())).collect();
+    let pool = Pool::new(&[mock(ports[0], "secret", 2, 1), mock(ports[1], "secret", 2, 2)]);
+    let got = rt.block_on(pool.background_body("<msg1@mock>", MIB));
+    assert!(got.as_ref().is_err_and(|e| e.failed_forwarding()), "{got:?}");
+
+    // a plain 430 is still just "not here"
+    let pool = Pool::new(&[mock(ports[1], "secret", 2, 1)]);
+    assert_eq!(rt.block_on(pool.background_body("<msg1@mock>", MIB)).unwrap(), BackgroundBody::Missing);
+}
+
+#[test]
+fn failed_forwarding_on_one_server_takes_the_body_from_another() {
+    let rt = runtime();
+    let servers: Vec<Arc<Server>> = (0..2)
+        .map(|i| {
+            let mut s = Server::new(vec![post(1, r#""a.bin" yEnc (1/1)"#, 10, vec![])]);
+            Arc::get_mut(&mut s).unwrap().forwarding_fails = i == 0;
+            s
+        })
+        .collect();
+    let ports: Vec<u16> = servers.iter().map(|s| spawn_server(s.clone())).collect();
+    let pool = Pool::new(&[mock(ports[0], "secret", 2, 1), mock(ports[1], "secret", 2, 2)]);
+    assert!(matches!(rt.block_on(pool.background_body("<msg1@mock>", MIB)).unwrap(), BackgroundBody::Body(_)));
+}
+
 #[test]
 fn a_server_that_cant_be_reached_is_an_error_not_missing() {
     let rt = runtime();
