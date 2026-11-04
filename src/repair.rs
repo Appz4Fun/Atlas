@@ -56,13 +56,16 @@ pub struct Window {
 }
 
 /// A post looked at: its rows, its share then, the windows it wants read (none: nothing to do for it), and the days of
-/// its groups' backfill to take first.
+/// its groups' backfill to take first. `media`: its name says what the indexer is after (`is_media`), `size`: of all
+/// its rows.
 #[derive(Debug, Default)]
 pub struct Looked {
     pub ids: Vec<i64>,
     pub permille: i64,
     pub windows: Vec<Window>,
     pub days: Vec<(String, i64)>,
+    pub media: bool,
+    pub size: i64,
 }
 
 /// What a round found, post by post.
@@ -105,10 +108,18 @@ async fn round(
     let now = chrono::Utc::now().timestamp();
     let found = tokio::task::spawn_blocking(move || db::with_reader(|conn| find(conn, now))).await??;
     let pool = &ctx.pool;
-    // a post is marked once all its windows were read; the ones past this round's share wait for the next
-    let (mut read, mut tried) = (0usize, Vec::new());
-    for post in &found.posts {
-        if stopping() || (read > 0 && read + post.windows.len() > PER_ROUND) {
+    let (to_read, looked) = plan(&found.posts, PER_ROUND);
+    // a post with nothing to read was looked at; one with windows is marked once all of them were read
+    let posts = &found.posts;
+    let mut tried: Vec<(i64, i64)> = looked
+        .iter()
+        .flat_map(|&i| {
+            let post = &posts[i];
+            post.ids.iter().map(move |id| (*id, post.permille))
+        })
+        .collect();
+    for post in to_read.iter().map(|&i| &posts[i]) {
+        if stopping() {
             break;
         }
         for w in &post.windows {
@@ -163,7 +174,6 @@ async fn round(
                 }
             }
         }
-        read += post.windows.len();
         tried.extend(post.ids.iter().map(|id| (*id, post.permille)));
     }
     let days: Vec<(String, i64)> = found.posts.iter().flat_map(|p| p.days.iter().cloned()).collect();
@@ -273,6 +283,40 @@ fn indexed_from(conn: &Connection, group: &str) -> rusqlite::Result<HashSet<Stri
     Ok(names.into_iter().filter_map(|n| n.strip_prefix(&prefix).map(str::to_string)).collect())
 }
 
+/// What a round does with `posts` (in their order): the ones it reads, within `per_round` windows (the first that
+/// fit; once one doesn't, the rest wait for the next round, though one alone bigger than that still goes), and the ones
+/// with nothing to read, marked looked at whatever the share: they cost nothing, and left unmarked they would be found
+/// first again every round.
+fn plan(posts: &[Looked], per_round: usize) -> (Vec<usize>, Vec<usize>) {
+    let (mut read, mut full) = (0usize, false);
+    let (mut to_read, mut looked) = (Vec::new(), Vec::new());
+    for (i, post) in posts.iter().enumerate() {
+        if post.windows.is_empty() {
+            looked.push(i);
+            continue;
+        }
+        if full || (read > 0 && read + post.windows.len() > per_round) {
+            full = true;
+            continue;
+        }
+        read += post.windows.len();
+        to_read.push(i);
+    }
+    (to_read, looked)
+}
+
+/// Whether a release's name says what the indexer is after most: 2160p, a remux or Dolby Vision (like `media_counts`).
+fn is_media(name: &str) -> bool {
+    let name = name.to_lowercase();
+    ["2160p", "remux", ".dv.", "dovi"].iter().any(|w| name.contains(w))
+}
+
+/// What the indexer is after first, then the biggest, from every shard alike: in shard order, a round's share went to
+/// shard 0's posts, and the other shards' waited.
+fn by_worth(posts: &mut [Looked]) {
+    posts.sort_by_key(|p| (!p.media, std::cmp::Reverse(p.size)));
+}
+
 /// The posts worth a second read, on a reader with every shard attached and `repair_tried` in main. A post is all
 /// its rows (`release_info::whole_post_with`), and each of its groups gets one window around its rows' articles.
 pub fn find(conn: &Connection, now: i64) -> rusqlite::Result<Found> {
@@ -325,9 +369,10 @@ pub fn find(conn: &Connection, now: i64) -> rusqlite::Result<Found> {
             } else {
                 Vec::new()
             };
-            found.posts.push(Looked { ids, permille, windows, days });
+            found.posts.push(Looked { ids, permille, windows, days, media: is_media(&row.name), size });
         }
     }
+    by_worth(&mut found.posts);
     Ok(found)
 }
 
@@ -371,6 +416,33 @@ fn windows_of(conn: &Connection, ids: &[i64]) -> rusqlite::Result<Vec<Window>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn looked(windows: usize, media: bool, size: i64) -> Looked {
+        let window = Window { group: "g".into(), from: 0, to: 1 };
+        Looked { ids: vec![size], windows: vec![window; windows], media, size, ..Default::default() }
+    }
+
+    #[test]
+    fn a_round_reads_what_fits_and_marks_what_has_nothing_to_read() {
+        let posts =
+            [looked(3, true, 9), looked(0, false, 8), looked(2, true, 7), looked(1, false, 6), looked(0, true, 5)];
+        // 3 + 2 fit in 5; the next doesn't, and nothing after it is read, but the empty ones are all marked
+        assert_eq!(plan(&posts, 5), (vec![0, 2], vec![1, 4]));
+        // one bigger than the share on its own still goes
+        assert_eq!(plan(&[looked(8, true, 1), looked(1, true, 1)], 5), (vec![0], vec![]));
+    }
+
+    #[test]
+    fn media_names_are_what_a_round_reads_first() {
+        assert!(is_media("Resident.Evil.2026.DV.2160p.WEB.H265-SLOT"));
+        assert!(is_media("Film.2007.1080p.BluRay.REMUX.AVC-X"));
+        assert!(is_media("Show.S01E01.DoVi.1080p-Y"));
+        assert!(!is_media("Show.S01E01.1080p.WEB-DL-Z"));
+        assert!(!is_media("DVDRip.Collection"));
+        let mut posts = vec![looked(1, false, 90), looked(1, true, 10), looked(1, true, 50), looked(1, false, 99)];
+        by_worth(&mut posts);
+        assert_eq!(posts.iter().map(|p| p.size).collect::<Vec<_>>(), [50, 10, 99, 90]);
+    }
 
     #[test]
     fn accounts_on_one_provider_are_one_machine() {
