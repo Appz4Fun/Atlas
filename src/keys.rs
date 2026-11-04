@@ -410,8 +410,8 @@ fn others_sql(kind: Kind, shard: usize, sets: usize) -> String {
         None if kind == Kind::Par2 => {
             let marks: Vec<String> = (0..sets).map(|i| format!("?{}", i + 3)).collect();
             format!(
-                "select distinct release_id from s{shard}.par2_files where set_id in ({}) and release_id != ?1
-                 order by release_id desc limit ?2",
+                "select distinct release_id from s{shard}.par2_files where set_id in ({}) and bound = 1
+                 and release_id != ?1 order by release_id desc limit ?2",
                 marks.join(", ")
             )
         }
@@ -614,5 +614,25 @@ mod tests {
         assert!(sql.contains("s3.par2_files") && sql.contains("set_id in (?3, ?4)"), "{sql}");
         assert!(others_sql(Kind::Lines, 0, 1).contains("s0.release_keys where lines = ?3"));
         assert!(others_sql(Kind::MovieHash, 7, 1).contains("s7.release_probe where moviehash = ?3"));
+    }
+
+    #[test]
+    fn an_unbound_par2_file_matches_nothing() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute("attach ':memory:' as s0", []).unwrap();
+        conn.execute_batch(&crate::archive::store::PAR2_FILES.create.replace("par2_files (", "s0.par2_files ("))
+            .unwrap();
+        let set = vec![7u8; 16];
+        for (release, file, bound) in [(1, 1u8, 1), (2, 2, 1), (3, 3, 0)] {
+            conn.execute(
+                "insert into s0.par2_files (release_id, file_id, set_id, md5, md5_16k, size, name, bound)
+                 values (?1, ?2, ?3, x'', x'', 1, 'a.mkv', ?4)",
+                rusqlite::params![release, vec![file], set, bound],
+            )
+            .unwrap();
+        }
+        let lookup = Lookup { keys: Keys::default(), par2_sets: vec![set], moviehash: None };
+        assert_eq!(others(&conn, 1, &lookup, Kind::Par2, 10), vec![2], "release 3 only holds an unbound copy");
+        assert_eq!(count_others(&conn, 1, &lookup, Kind::Par2), 1);
     }
 }
