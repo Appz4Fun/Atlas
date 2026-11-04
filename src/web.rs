@@ -40,6 +40,15 @@ const PAGE_SIZE: i64 = 50;
 const COOKIE: &str = "atlas_session";
 const COOKIE_DAYS: i64 = 30;
 
+/// Whether the results leave out incomplete releases: `incomplete=hide` or `incomplete=show` in a url, and the last one
+/// asked for kept in this cookie, soo it holds across visits until it's turned off again.
+const INCOMPLETE_ARG: &str = "incomplete";
+const INCOMPLETE_COOKIE: &str = "atlas_incomplete";
+const HIDE: &str = "hide";
+const SHOW: &str = "show";
+/// how long the choice is kept
+const INCOMPLETE_DAYS: i64 = 365;
+
 /// Everything comes from this origin, soo a release name that got past escaping still can't run.
 const CSP: &str = "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'";
 
@@ -50,15 +59,20 @@ const HTMX_CONFIG: &str =
 /// A GET the ui answers. None: not ours, the api decides.
 pub fn get(path: &str, query: &str, cookies: Option<&str>, base: &str, api_key: &str) -> Option<ApiResponse> {
     let signed_in = signed_in(cookies, api_key);
-    let args = parse_query(query);
+    let mut args = parse_query(query);
+    let remember = incomplete_choice(&mut args, cookies);
+    let remembered = |mut resp: ApiResponse| {
+        resp.headers.extend(remember.clone());
+        resp
+    };
     Some(match path {
         "/static/htmx.min.js" => asset("text/javascript; charset=utf-8", HTMX),
         "/static/atlas.css" => asset("text/css; charset=utf-8", CSS),
         "/static/atlas.js" => asset("text/javascript; charset=utf-8", JS),
         "/static/atlas.svg" => asset("image/svg+xml", MARK),
-        "/" | "" if signed_in => html(200, search_page(&args, base)),
+        "/" | "" if signed_in => remembered(html(200, search_page(&args, base))),
         "/" | "" => html(200, login_page(base, false)),
-        "/ui/results" if signed_in => results(&args),
+        "/ui/results" if signed_in => remembered(results(&args)),
         "/ui/results" => ApiResponse { headers: vec![("HX-Redirect".into(), "/".into())], ..html(401, String::new()) },
         "/ui/release" if signed_in => release_page(&args),
         "/ui/duplicates" if signed_in => duplicates_page(&args),
@@ -102,7 +116,7 @@ pub fn post(
             })
         }
         "/logout" => Some(redirect(vec![cookie_header("", 0)])),
-        "/ui/ask" if signed_in => Some(ask(body, htmx)),
+        "/ui/ask" if signed_in => Some(ask(body, htmx, cookie_value(cookies, INCOMPLETE_COOKIE) == Some(HIDE))),
         "/ui/settings" if signed_in => Some(save_settings(body)),
         "/ui/ask" if htmx => {
             Some(ApiResponse { headers: vec![("HX-Redirect".into(), "/".into())], ..html(401, String::new()) })
@@ -115,6 +129,40 @@ pub fn post(
 /// The ui reads a request body only on these paths.
 pub fn takes_post(path: &str) -> bool {
     matches!(path, "/login" | "/logout" | "/ui/ask" | "/ui/settings")
+}
+
+/// Whether to hide incomplete releases, put in `args` as `incomplete=hide` when the url doesn't say but the cookie does,
+/// and the cookie to set when the url asks for something else than it holds.
+fn incomplete_choice(args: &mut HashMap<String, String>, cookies: Option<&str>) -> Option<(String, String)> {
+    let saved = cookie_value(cookies, INCOMPLETE_COOKIE) == Some(HIDE);
+    let asked = args.get(INCOMPLETE_ARG).map(|v| v.trim().to_string());
+    let cookie = |value: &str, days: i64| {
+        let max_age = days * 86_400;
+        (
+            "Set-Cookie".to_string(),
+            format!("{INCOMPLETE_COOKIE}={value}; Path=/; HttpOnly; SameSite=Strict; Max-Age={max_age}"),
+        )
+    };
+    match asked.as_deref() {
+        Some(HIDE) => (!saved).then(|| cookie(HIDE, INCOMPLETE_DAYS)),
+        Some(SHOW) => saved.then(|| cookie("", 0)),
+        _ => {
+            if saved {
+                args.insert(INCOMPLETE_ARG.into(), HIDE.into());
+            }
+            None
+        }
+    }
+}
+
+/// A cookie's value, as the browser sent it.
+fn cookie_value<'a>(cookies: Option<&'a str>, name: &str) -> Option<&'a str> {
+    cookies
+        .into_iter()
+        .flat_map(|c| c.split(';'))
+        .filter_map(|c| c.trim().split_once('='))
+        .find(|(n, _)| *n == name)
+        .map(|(_, v)| v)
 }
 
 fn cookie_header(value: &str, max_age: i64) -> (String, String) {
@@ -217,6 +265,8 @@ struct Search {
     fields: Fields,
     sort: Option<SortBy>,
     descending: bool,
+    /// leaves out what shows as INCOMPLETE: the whole post a row stands for, as the row shows it
+    hide_incomplete: bool,
 }
 
 /// Up to this many results get sorted, the newest or best matching ones, unless the database orders by the column: then
@@ -361,6 +411,7 @@ impl Search {
             fields,
             sort,
             descending,
+            hide_incomplete: text(INCOMPLETE_ARG) == HIDE,
         }
     }
 
@@ -376,6 +427,9 @@ impl Search {
         let mut more = self.fields.query();
         if let Some(sort) = self.sort {
             more.push(format!("sort={}&dir={}", sort.word(), if self.descending { "desc" } else { "asc" }));
+        }
+        if self.hide_incomplete {
+            more.push(format!("{INCOMPLETE_ARG}={HIDE}"));
         }
         for part in more {
             if !query.is_empty() {
@@ -401,6 +455,7 @@ impl Search {
             } else {
                 matches!(by, SortBy::Size | SortBy::Posted | SortBy::Rating)
             },
+            hide_incomplete: self.hide_incomplete,
         };
         let query = attr(&flipped.query(&self.cat, 0));
         let arrow = match (current, descending) {
@@ -563,9 +618,33 @@ impl Search {
                 escape(filter)
             );
         }
+        out.push_str(&self.incomplete_link());
         out.push_str(&self.sort_link(SortBy::Rating, "Best rated"));
         out.push_str("</div>");
         out
+    }
+
+    /// This search's first page with incomplete releases hidden, or shown again. Showing them says so in the url, soo
+    /// the cookie that keeps them hidden goes too.
+    fn incomplete_toggled(&self) -> String {
+        let toggled = Search { offset: 0, hide_incomplete: !self.hide_incomplete, ..self.clone() };
+        let mut query = toggled.query(&self.cat, 0);
+        if self.hide_incomplete {
+            if !query.is_empty() {
+                query.push('&');
+            }
+            query.push_str(&format!("{INCOMPLETE_ARG}={SHOW}"));
+        }
+        query
+    }
+
+    /// The chip that hides incomplete releases, or shows them again.
+    fn incomplete_link(&self) -> String {
+        let query = attr(&self.incomplete_toggled());
+        let pressed = if self.hide_incomplete { " aria-current=\"true\"" } else { "" };
+        format!(
+            "<a class=\"chip\" href=\"/?{query}\" hx-get=\"/ui/results?{query}\" hx-target=\"#results\" hx-sync=\"#search:replace\" hx-indicator=\"#busy\" title=\"Leave out releases missing parts. Kept on until you turn it off.\"{pressed}>Hide incomplete</a>"
+        )
     }
 
     /// The table rows, or a full-width diagnostic when the first page has none.
@@ -669,7 +748,15 @@ impl Search {
                 }
                 Some(_) => None,
             })
+            .filter(|r| !self.hides(r))
             .collect();
+        if found.is_empty() && self.hide_incomplete {
+            // every row of this page was incomplete: there may be complete ones further on
+            let note = format!(
+                "<tr><td colspan=\"{COLUMNS}\" class=\"note dim\">Nothing complete in these {PAGE_SIZE}.</td></tr>"
+            );
+            return if page_was_full { note + &self.load_more() } else { note };
+        }
         if hide_copies {
             // a copy of something on an earlier page is a copy too
             if !windowed && self.offset > 0 {
@@ -678,6 +765,13 @@ impl Search {
                 before = self.search(filter.as_ref(), start, earlier).unwrap_or_default();
             }
             before.retain(|r| !post_of(r).is_some_and(|post| folded(r, &post)));
+            // an earlier row left out for being incomplete hides nothing: it isn't there to stand for its copies
+            if self.hide_incomplete {
+                before.retain_mut(|r| {
+                    self.fold_split_post(conn.as_ref(), r, &mut HashMap::new());
+                    !self.hides(r)
+                });
+            }
             let ids: Vec<i64> = before.iter().filter(|r| tagged(r)).chain(found.iter()).map(|r| r.id).collect();
             let hidden = crate::duplicates::later_copies(&ids).unwrap_or_default();
             found.retain(|r| !hidden.contains(&r.id));
@@ -711,6 +805,12 @@ impl Search {
     /// stays one row whatever the search.
     fn folds(&self, r: &ReleaseRow, post: &release_info::SplitPost) -> bool {
         (self.fields.group.is_empty() || post.lead.is_some() || post.groups.len() == 1) && post.listed_id() != r.id
+    }
+
+    /// Whether a row is left out for being incomplete: once `fold_split_post` has made it say what all of its post comes
+    /// to, the way it would show.
+    fn hides(&self, r: &ReleaseRow) -> bool {
+        self.hide_incomplete && !r.complete
     }
 
     /// Makes a row of a post say what all of the post comes to. When another row stands for it, that row's id: the
@@ -757,12 +857,14 @@ impl Search {
 
     /// A sort takes its page from the search's window, with no database in the way once the window has been filled.
     /// "Hide copies" depends on what's before the page, soo it still works the page out each time.
+    /// Hiding incomplete releases goes by the whole post each row stands for, which only rendering a row works out,
+    /// soo those pages come from a window too, in the search's own order when there's no sort.
     fn sorts_from_a_window(&self) -> bool {
-        self.sort.is_some() && !self.filters.contains(&HIDE_COPIES)
+        (self.sort.is_some() || self.hide_incomplete) && !self.filters.contains(&HIDE_COPIES)
     }
 
     fn body_from_window(&self) -> String {
-        let Some(by) = self.sort else { return String::new() };
+        let by = self.sort;
         let mut at_least = self.offset + PAGE_SIZE + 1;
         let (rows, more) = loop {
             let window = match window_of(self, at_least) {
@@ -817,6 +919,13 @@ impl Search {
         if self.filters_by_tags() && self.indexed().is_none() {
             let _ = write!(hint, "The filters look through the first {SORT_WINDOW} results. ");
         }
+        if self.hide_incomplete {
+            let shown = attr(&self.incomplete_toggled());
+            let _ = write!(
+                hint,
+                "Incomplete releases are hidden. <a href=\"/?{shown}\" hx-get=\"/ui/results?{shown}\" hx-target=\"#results\">Show them</a>. "
+            );
+        }
         if !self.q.is_empty() {
             hint.push_str("A search matches every word you type, from the start of a word in the release name.");
         } else {
@@ -854,6 +963,7 @@ impl Search {
             None if self.q.is_empty() => "Newest first".to_string(),
             None => "Best or newest matches first".to_string(),
         };
+        let sort = if self.hide_incomplete { format!("{sort}, incomplete hidden") } else { sort };
         let mut scope = String::new();
         for (name, value) in self.fields.chosen() {
             let without = Search {
@@ -864,6 +974,7 @@ impl Search {
                 fields: self.fields.without(name),
                 sort: self.sort,
                 descending: self.descending,
+                hide_incomplete: self.hide_incomplete,
             };
             let query = attr(&without.query(&self.cat, 0));
             let _ = write!(
@@ -875,15 +986,17 @@ impl Search {
         }
         // the count goes by words and fields only, soo with tags filtering the page it would count rows it hides; the word
         // index counts every match, tags and all
-        let total = if self.indexed().is_none() && (!self.fields.any() || self.filters_by_tags()) {
-            String::new()
-        } else if self.sorts_from_a_window()
-            && let Ok(window) = window_of(self, 0)
-        {
-            window.total.get_or_init(|| self.total()).clone()
-        } else {
-            self.total()
-        };
+        // nor does it know which are incomplete: that's the whole post each row stands for
+        let total =
+            if self.hide_incomplete || (self.indexed().is_none() && (!self.fields.any() || self.filters_by_tags())) {
+                String::new()
+            } else if self.sorts_from_a_window()
+                && let Ok(window) = window_of(self, 0)
+            {
+                window.total.get_or_init(|| self.total()).clone()
+            } else {
+                self.total()
+            };
         format!(
             "<div class=\"summary\"><span class=\"path\">{path}</span>{total}<span class=\"sort\">{}</span></div>{}",
             escape(&sort),
@@ -989,11 +1102,12 @@ impl Window {
         })
     }
 
-    /// Whether a page that ends past it needs a bigger one: only a sort over a whole category grows.
+    /// Whether a page that ends past it needs a bigger one: a sort over a whole category grows, and so does the search's
+    /// own order, newest or best first, which has no sort to stop at the first ones.
     fn can_grow(&self, search: &Search) -> bool {
         self.more_in_db
             && self.asked < MAX_WINDOW
-            && search.in_order()
+            && (search.in_order() || search.sort.is_none())
             && (!search.filters_by_tags() || search.indexed().is_some() || self.asked < GROW_WITH_TAGS)
     }
 
@@ -1083,10 +1197,13 @@ impl Window {
         let mut kept = Vec::with_capacity(rows.len());
         let mut split = HashMap::new();
         let mut done = Vec::with_capacity(rows.len());
+        let left_out = |r: &ReleaseRow| ShownRow { html: String::new(), size: r.size, folded: true, brings: None };
         for r in rows {
             let place = r.id;
             let mut r = r.clone();
             match search.fold_split_post(conn.as_ref(), &mut r, &mut split) {
+                // incomplete as the row shows it, all of its post together: left out like a folded row
+                None if search.hides(&r) => done.push((place, left_out(&r))),
                 None => {
                     places.push(place);
                     kept.push(r);
@@ -1097,12 +1214,14 @@ impl Window {
                         && lock(&self.brought).insert(listed)
                         && let Some(shown) = search.bring(conn.as_ref(), listed, &mut split) =>
                 {
-                    places.push(place);
-                    kept.push(shown);
+                    if search.hides(&shown) {
+                        done.push((place, left_out(&shown)));
+                    } else {
+                        places.push(place);
+                        kept.push(shown);
+                    }
                 }
-                Some(_) => {
-                    done.push((place, ShownRow { html: String::new(), size: r.size, folded: true, brings: None }))
-                }
+                Some(_) => done.push((place, left_out(&r))),
             }
         }
         for ((place, r), html) in places.into_iter().zip(&kept).zip(rows_html(&kept, split)) {
@@ -1131,16 +1250,22 @@ impl Window {
     }
 
     /// A page's rows, and whether more follow. Renders only what the page reaches and nothing has rendered yet.
-    fn page(&self, search: &Search, by: SortBy) -> (Vec<String>, bool) {
-        if by == SortBy::Size {
+    fn page(&self, search: &Search, by: Option<SortBy>) -> (Vec<String>, bool) {
+        if by == Some(SortBy::Size) {
             let started = Instant::now();
             while !self.filled.load(Ordering::Acquire) && started.elapsed() < SIZES_WAIT {
                 std::thread::sleep(Duration::from_millis(5));
             }
         }
-        let order = self.order(by, search.descending);
+        let order = match by {
+            Some(by) => self.order(by, search.descending),
+            // as the search read them
+            None => Arc::new((0..self.rows.len()).collect()),
+        };
         let skip = usize::try_from(search.offset).unwrap_or(0);
         let wanted = PAGE_SIZE as usize + 1;
+        // hiding incomplete ones, a page can pass many rows it leaves out: they're rendered several pages at a time
+        let batch = if search.hide_incomplete { PAGE_SIZE as usize * FILL_THREADS } else { PAGE_SIZE as usize };
         loop {
             let mut page = Vec::with_capacity(wanted);
             let mut missing = Vec::new();
@@ -1159,7 +1284,7 @@ impl Window {
                         }
                         None => missing.push(r.clone()),
                     }
-                    if page.len() == wanted || missing.len() == PAGE_SIZE as usize {
+                    if page.len() == wanted || missing.len() == batch {
                         break;
                     }
                 }
@@ -1169,7 +1294,11 @@ impl Window {
                 page.truncate(PAGE_SIZE as usize);
                 return (page, more);
             }
-            self.render(search, &missing);
+            std::thread::scope(|scope| {
+                for slice in missing.chunks(PAGE_SIZE as usize) {
+                    scope.spawn(|| self.render(search, slice));
+                }
+            });
         }
     }
 
@@ -1723,7 +1852,7 @@ fn scope_inputs(search: &Search, oob: &str) -> String {
     };
     let hidden = |name: &str, value: &str| format!("<input type=\"hidden\" name=\"{name}\" value=\"{}\">", attr(value));
     format!(
-        "<details id=\"scope\" class=\"more-fields\"{open}{oob}><summary>More fields</summary><div class=\"field-grid\">{}{}{}{}{}{}{}</div>{}{}{}</details>",
+        "<details id=\"scope\" class=\"more-fields\"{open}{oob}><summary>More fields</summary><div class=\"field-grid\">{}{}{}{}{}{}{}</div>{}{}{}{}</details>",
         field("group", "Usenet group", &search.fields.group),
         field("poster", "Poster", &search.fields.poster),
         field("email", "Email", &search.fields.email),
@@ -1732,6 +1861,7 @@ fn scope_inputs(search: &Search, oob: &str) -> String {
         field("crc", "CRC32", &search.fields.crc),
         field("agent", "Posted with", &search.fields.agent),
         hidden("filters", &search.filters.join(",")),
+        hidden(INCOMPLETE_ARG, if search.hide_incomplete { HIDE } else { "" }),
         hidden("sort", search.sort.map_or("", SortBy::word)),
         hidden(
             "dir",
@@ -3137,7 +3267,7 @@ fn described(search: &Search) -> String {
 }
 
 /// Plain words to a search: Gemini reads them, the page searches with what it read.
-fn ask(body: &str, htmx: bool) -> ApiResponse {
+fn ask(body: &str, htmx: bool, hide_incomplete: bool) -> ApiResponse {
     let args = parse_query(body);
     let question: String = args.get("ask").map_or("", |q| q.trim()).chars().take(gemini::MAX_QUESTION).collect();
     let failed = |title: &str, why: &str| {
@@ -3156,7 +3286,8 @@ fn ask(body: &str, htmx: bool) -> ApiResponse {
         Ok(plan) => plan,
         Err(why) => return failed("Gemini did not answer", &why),
     };
-    let search = Search::from_args(&plan_args(&plan));
+    // what's hidden is the reader's choice, not Gemini's
+    let search = Search { hide_incomplete, ..Search::from_args(&plan_args(&plan)) };
     let query = search.query(&search.cat, 0);
     if !htmx {
         let to = if query.is_empty() { "/".to_string() } else { format!("/?{query}") };
@@ -3559,6 +3690,7 @@ mod tests {
             fields: Fields::default(),
             sort: None,
             descending: true,
+            hide_incomplete: false,
         };
         let nav = category_nav(&search, "");
         assert_eq!(nav.matches("aria-current").count(), 1, "{nav}");
@@ -3574,6 +3706,7 @@ mod tests {
             fields: Fields::default(),
             sort: None,
             descending: true,
+            hide_incomplete: false,
         };
         assert_eq!(category_nav(&unknown, "").matches("aria-current").count(), 0);
         assert!(!category_input("\"><x>", "").contains("<x>"));
@@ -3589,6 +3722,7 @@ mod tests {
             fields: Fields::default(),
             sort: None,
             descending: true,
+            hide_incomplete: false,
         }
         .nothing_found();
         assert!(hd.contains("nothing is in Movies / HD yet"), "{hd}");
@@ -3601,6 +3735,7 @@ mod tests {
             fields: Fields::default(),
             sort: None,
             descending: true,
+            hide_incomplete: false,
         }
         .nothing_found();
         assert!(word.contains("&lt;b&gt;") && !word.contains("<b>"), "{word}");
@@ -3617,6 +3752,7 @@ mod tests {
             fields: Fields::default(),
             sort: None,
             descending: true,
+            hide_incomplete: false,
         }
         .summary();
         assert!(path.contains("atlas::releases::<b>movies</b>::<b>hd</b>"), "{path}");
@@ -3629,7 +3765,8 @@ mod tests {
                 filters: Vec::new(),
                 fields: Fields::default(),
                 sort: None,
-                descending: true
+                descending: true,
+                hide_incomplete: false,
             }
             .summary()
             .contains("Best or newest matches first")
@@ -3870,6 +4007,57 @@ mod tests {
         assert!(shown[&9].folded, "its own row, read in now, doesn't show it a second time");
         assert!(!shown.contains_key(&3), "new rows are rendered when a page reaches them");
         assert!(lock(&grown.brought).contains(&9));
+    }
+
+    #[test]
+    fn hiding_incomplete_is_kept_in_links_and_a_cookie() {
+        let s = Search::from_args(&parse_query("q=x&cat=2040&incomplete=hide"));
+        assert!(s.hide_incomplete && s.sorts_from_a_window(), "a page needs its rows rendered to know");
+        assert_eq!(s.query("2040", 0), "q=x&cat=2040&incomplete=hide");
+        assert_eq!(s.incomplete_toggled(), "q=x&cat=2040&incomplete=show", "turning it off says so");
+        let off = Search::from_args(&parse_query("q=x"));
+        assert!(!off.hide_incomplete && !off.sorts_from_a_window());
+        assert_eq!(off.incomplete_toggled(), "q=x&incomplete=hide");
+        assert!(s.filter_links().contains("aria-current=\"true\">Hide incomplete<"));
+        assert!(!off.filter_links().contains("aria-current=\"true\">Hide incomplete<"));
+        assert!(s.hides(&ReleaseRow { complete: false, ..Default::default() }));
+        assert!(!s.hides(&ReleaseRow { complete: true, ..Default::default() }));
+        assert!(!off.hides(&ReleaseRow { complete: false, ..Default::default() }));
+        // copies hidden still go a page at a time
+        assert!(!Search::from_args(&parse_query("incomplete=hide&filters=Hide%20copies")).sorts_from_a_window());
+
+        let saved = Some("atlas_session=abc; atlas_incomplete=hide");
+        let mut args = parse_query("q=x");
+        assert_eq!(incomplete_choice(&mut args, saved), None);
+        assert_eq!(args.get("incomplete").map(String::as_str), Some("hide"), "the cookie stands in for the url");
+        let mut args = parse_query("q=x");
+        assert_eq!(incomplete_choice(&mut args, Some("atlas_session=abc")), None);
+        assert!(!args.contains_key("incomplete"), "shown, as before, with no cookie");
+        let set = incomplete_choice(&mut parse_query("incomplete=hide"), None).unwrap();
+        assert!(set.1.starts_with("atlas_incomplete=hide;") && set.1.contains("Max-Age=31536000"), "{set:?}");
+        assert_eq!(incomplete_choice(&mut parse_query("incomplete=hide"), saved), None, "already kept");
+        let cleared = incomplete_choice(&mut parse_query("incomplete=show"), saved).unwrap();
+        assert!(cleared.1.starts_with("atlas_incomplete=;") && cleared.1.contains("Max-Age=0"), "{cleared:?}");
+        let mut args = parse_query("incomplete=show");
+        assert_eq!(incomplete_choice(&mut args, None), None);
+        assert!(!Search::from_args(&args).hide_incomplete);
+    }
+
+    #[test]
+    fn a_window_with_no_sort_grows_in_the_searchs_own_order() {
+        let newest = Search::from_args(&parse_query("cat=2000&incomplete=hide"));
+        let full = Window { more_in_db: true, ..window_of_rows(Vec::new()) };
+        assert!(full.can_grow(&newest), "the newest over all of them, not the first 2000");
+        let row = |id: i64| ReleaseRow { id, ..Default::default() };
+        let window = window_of_rows(vec![row(3), row(1), row(2)]);
+        window.publish(vec![
+            (3, shown("<tr>3</tr>", 3, false)),
+            (1, shown("", 1, true)),
+            (2, shown("<tr>2</tr>", 2, false)),
+        ]);
+        let (page, more) = window.page(&newest, None);
+        assert_eq!(page, ["<tr>3</tr>", "<tr>2</tr>"], "as read, and left out rows aren't shown");
+        assert!(!more);
     }
 
     #[test]
