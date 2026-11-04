@@ -390,6 +390,22 @@ pub fn carries_not(e: &NntpError) -> bool {
     matches!(e.code(), Some(411 | 500 | 501))
 }
 
+/// A group's home other than its first choice (see `Pool::select_group_known`): the server it was found on, since
+/// when, and the home it left for a while, one that had indexed it before (asked again after `HOME_RETRY`).
+#[derive(Clone, Copy, Debug)]
+struct Home {
+    server: usize,
+    since: Instant,
+    back: Option<usize>,
+}
+
+/// How long a group stays on the server it fell over to before its first choice, which indexed it before, is asked
+/// again: a provider can answer 411 for a while (a backend in trouble), and a group that never moved back kept its
+/// live indexing on another provider until the next restart.
+const HOME_RETRY: Duration = Duration::from_secs(30 * 60);
+/// GROUPs in a row a server that indexed a group before has to say it doesnt carry it before the group moves
+const MOVE_AFTER: u32 = 3;
+
 /// how long to wait for the end of a compressed stream once its last line arrived
 const STREAM_END_WAIT: Duration = Duration::from_secs(2);
 /// after a failed connect a server is skipped for this long (connect() still tries it)
@@ -1564,7 +1580,11 @@ pub struct Pool {
     failed_over_at: Mutex<Option<Instant>>,
     timeout: Duration,
     /// groups their first choice server doesnt carry: the server that does
-    homes: Mutex<HashMap<String, usize>>,
+    homes: Mutex<HashMap<String, Home>>,
+    /// (group, server): GROUPs in a row the server said it doesnt carry the group although it indexed it before
+    misses: Mutex<HashMap<(String, usize), u32>>,
+    /// `HOME_RETRY`, shorter in tests
+    home_retry: Duration,
     unsaved: Arc<UnsavedBudget>,
     /// how long a background body waits for room before queuing
     body_patience: Duration,
@@ -1762,6 +1782,8 @@ impl Pool {
             failed_over_at: Mutex::new(None),
             timeout: DEFAULT_TIMEOUT,
             homes: Mutex::new(HashMap::new()),
+            misses: Mutex::new(HashMap::new()),
+            home_retry: HOME_RETRY,
             body_patience: BODY_PATIENCE,
             unsaved: UnsavedBudget::new(crate::config::DEFAULT_MAX_UNSAVED_HEADERS as usize),
             rate_limiter: Arc::new(TokenBucket::new(0, 0)),
@@ -1774,6 +1796,12 @@ impl Pool {
 
     pub fn with_rate_limiter(mut self, limiter: Arc<TokenBucket>) -> Self {
         self.rate_limiter = limiter;
+        self
+    }
+
+    /// how long a group stays off a home it left before going back (`HOME_RETRY`)
+    pub fn with_home_retry(mut self, after: Duration) -> Self {
+        self.home_retry = after;
         self
     }
 
@@ -1928,11 +1956,21 @@ impl Pool {
     /// in proportion to each server's connections, and a group keeps its
     /// server (its cursors are per server) as long as that server is healthy.
     pub fn pick_server_in(&self, tier: &[usize], group: &str) -> usize {
-        // a group its first choice doesnt carry lives where it was found
-        if let Some(&home) = self.homes.lock().unwrap().get(group)
-            && tier.contains(&home)
+        // a group its first choice doesnt carry lives where it was found, and goes back to a home it left for a while
+        // (one that indexed it before) once that is due to be asked again
         {
-            return home;
+            let mut homes = self.homes.lock().unwrap();
+            if let Some(mut home) = homes.get(group).copied() {
+                if let Some(back) = home.back
+                    && home.since.elapsed() >= self.home_retry
+                {
+                    home = Home { server: back, since: Instant::now(), back: None };
+                    homes.insert(group.to_string(), home);
+                }
+                if tier.contains(&home.server) {
+                    return home.server;
+                }
+            }
         }
 
         // a server that is down only moves its own groups: the others keep the
@@ -2347,11 +2385,36 @@ impl Pool {
     /// says the server couldnt answer just now: it fails this pass, which is
     /// tried again on the same server, the one whose cursors the group has.
     pub async fn select_group_on(&self, prefer: usize, group: &str) -> Result<(usize, (u64, u64, u64, String))> {
+        self.select_group_known(prefer, group, false).await
+    }
+
+    /// `select_group_on`, where `known` says `prefer` indexed the group before (it has cursors for it). Then one
+    /// reply that it lacks the group doesnt move it: that fails the pass, and only `MOVE_AFTER` in a row hand it
+    /// over, to come back after `HOME_RETRY`. A group `prefer` never indexed moves on the first, for good.
+    pub async fn select_group_known(
+        &self,
+        prefer: usize,
+        group: &str,
+        known: bool,
+    ) -> Result<(usize, (u64, u64, u64, String))> {
+        let key = (group.to_string(), prefer);
         let first_err = match self.select_on(prefer, group).await {
-            Ok(r) => return Ok((prefer, r)),
+            Ok(r) => {
+                self.misses.lock().unwrap().remove(&key);
+                return Ok((prefer, r));
+            }
             Err(e) if carries_not(&e) => e,
             Err(e) => return Err(e),
         };
+        if known {
+            let mut misses = self.misses.lock().unwrap();
+            let n = misses.entry(key.clone()).or_insert(0);
+            *n += 1;
+            if *n < MOVE_AFTER {
+                return Err(first_err);
+            }
+            misses.remove(&key);
+        }
 
         // indexing servers only: one with `index: false` (a metered block
         // account) is for article lookups, never a group's home
@@ -2359,7 +2422,13 @@ impl Pool {
         for i in self.ranked(&indexing, group) {
             if let Ok(r) = self.select_on(i, group).await {
                 println!("{group} not on {}, using {}", self.servers[prefer].cfg.host, self.servers[i].cfg.host);
-                self.homes.lock().unwrap().insert(group.to_string(), i);
+                let mut homes = self.homes.lock().unwrap();
+                // leaving a home it was only on for a while, it still goes back to the one it left first
+                let back = match homes.get(group) {
+                    Some(h) if h.server == prefer && h.back.is_some() => h.back,
+                    _ => known.then_some(prefer),
+                };
+                homes.insert(group.to_string(), Home { server: i, since: Instant::now(), back });
                 return Ok((i, r));
             }
         }
@@ -3853,7 +3922,24 @@ mod tests {
         assert_eq!(pool.ranked(&[1, 2], "alt.binaries.x"), pool.ranked(&[1, 2], "alt.binaries.x"), "stable order");
 
         // once found elsewhere, a group is picked there
-        pool.homes.lock().unwrap().insert("alt.binaries.moved".into(), 1);
+        let home = Home { server: 1, since: Instant::now(), back: None };
+        pool.homes.lock().unwrap().insert("alt.binaries.moved".into(), home);
+        assert_eq!(pool.pick_server("alt.binaries.moved"), 1);
+        // one that left a home which indexed it goes back there once that is due to be asked again: to that home,
+        // not to its first choice (a home it was found on for good)
+        let first = pool.pick_server("alt.binaries.back");
+        let (left, other) = ((first + 1) % 3, (first + 2) % 3);
+        let since = Instant::now() - HOME_RETRY;
+        let away = Home { server: other, since, back: Some(left) };
+        pool.homes.lock().unwrap().insert("alt.binaries.back".into(), away);
+        assert_eq!(pool.pick_server("alt.binaries.back"), left, "back on the home it left");
+        assert_eq!(pool.pick_server("alt.binaries.back"), left, "and it stays there");
+        // not before
+        let recent = Home { since: Instant::now(), ..away };
+        pool.homes.lock().unwrap().insert("alt.binaries.back".into(), recent);
+        assert_eq!(pool.pick_server("alt.binaries.back"), other);
+        // one found elsewhere for good stays, however long ago
+        pool.homes.lock().unwrap().insert("alt.binaries.moved".into(), Home { since, ..home });
         assert_eq!(pool.pick_server("alt.binaries.moved"), 1);
     }
 
