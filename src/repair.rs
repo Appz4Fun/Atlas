@@ -108,15 +108,35 @@ async fn round(
             };
             // one provider's accounts share its overview: the group's own, and each one read, rule out their machine
             let mut seen: HashSet<String> = indexing.iter().map(|h| machine(h)).collect();
+            // and so do two providers that resell one backend (eweka and newshosting), told apart by their numbers
+            let mut spools = Vec::new();
+            for server in pool.indexing_servers() {
+                if indexing.iter().any(|h| machine(h) == machine(&pool.host(server)))
+                    && let Ok((_, first, last, _)) = pool.group_on(server, &w.group).await
+                {
+                    spools.push((first, last));
+                }
+            }
             let mut read_from = 0;
             for server in pool.indexing_servers() {
                 let host = pool.host(server);
                 if read_from >= SERVERS || !seen.insert(machine(&host)) {
                     continue;
                 }
+                let spool = match pool.group_on(server, &w.group).await {
+                    Ok((_, first, last, _)) => (first, last),
+                    Err(e) => {
+                        println!("[repair] {} on {host}: {e:#}", w.group);
+                        continue;
+                    }
+                };
+                if spools.iter().any(|s| same_spool(*s, spool)) {
+                    continue;
+                }
                 match reread_window(ctx, settings, db, &w.group, server, (w.from, w.to), MAX_ARTICLES).await {
                     Ok(p) => {
                         read_from += 1;
+                        spools.push(spool);
                         println!("[repair] {} {}..{} on {host}: {} headers", w.group, w.from, w.to, p.articles);
                     }
                     // a failure leaves its share to the next server
@@ -146,6 +166,12 @@ async fn round(
 /// provider have the same.
 fn machine(host: &str) -> String {
     host.split('#').next().unwrap_or(host).to_lowercase()
+}
+
+/// Whether two servers' GROUP numbers, (first, last), are one backend's: the same first article, and last ones a
+/// moment of posting apart. Two backends number a group on their own, millions apart.
+fn same_spool(a: (u64, u64), b: (u64, u64)) -> bool {
+    a.0 == b.0 && a.1.abs_diff(b.1) <= (a.1.max(b.1) / 100_000).max(1_000)
 }
 
 /// The servers that index `group` already, by its cursors (`group@server`): reading it there again finds the same.
@@ -243,5 +269,15 @@ mod tests {
         assert_eq!(machine("news.newshosting.com"), "news.newshosting.com");
         assert_eq!(machine("News.Newshosting.com#second"), "news.newshosting.com");
         assert_ne!(machine("127.0.0.1:1190"), machine("127.0.0.1:1191"), "a port is another server");
+    }
+
+    #[test]
+    fn resellers_of_one_backend_are_one_spool() {
+        // alt.binaries.newznzb.sierra on eweka and newshosting a few seconds apart, and on xsnews
+        let (eweka, newshosting, xsnews) = ((2, 1_010_645_689), (2, 1_010_645_691), (619_650_000, 1_019_663_750));
+        assert!(same_spool(eweka, newshosting));
+        assert!(!same_spool(eweka, xsnews));
+        assert!(!same_spool((1, 5_000_000), (1, 9_000_000)), "two backends that both start at 1");
+        assert!(same_spool((1, 900), (1, 1_500)), "a small group");
     }
 }
