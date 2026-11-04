@@ -403,6 +403,11 @@ fn is_stale(idle_since: Option<Instant>) -> bool {
 }
 /// GROUPs refused with 500/501 in a row before a server counts as article only
 const GROUP_REFUSALS: usize = 3;
+/// A server taken for article only is tried for indexing again after this long, and twice as long each time it
+/// turns out article only again (up to `ARTICLE_ONLY_MAX`): a provider can refuse GROUP for a while, and the
+/// server stayed out of indexing until a restart.
+const ARTICLE_ONLY_REST: Duration = Duration::from_secs(30 * 60);
+const ARTICLE_ONLY_MAX: Duration = Duration::from_secs(12 * 3600);
 /// how often a request in flight looks at the stop flag
 const STOP_POLL: Duration = Duration::from_millis(50);
 /// fetched slices a pass lets wait for it to save them, besides the ones its
@@ -1342,6 +1347,8 @@ struct Server {
     no_index: AtomicBool,
     /// GROUPs answered 500/501 in a row; a real server can reject one odd group name
     group_refusals: AtomicUsize,
+    /// until when `no_index` holds, and how long the next time does (see `ARTICLE_ONLY_REST`)
+    article_only: Mutex<(Option<Instant>, Duration)>,
     /// login rejected or limit shrunk messages already printed
     warned_auth: AtomicBool,
     warned_limit: AtomicBool,
@@ -1747,6 +1754,7 @@ impl Pool {
                         compress_refusals: AtomicUsize::new(0),
                         no_index: AtomicBool::new(false),
                         group_refusals: AtomicUsize::new(0),
+                        article_only: Mutex::new((None, ARTICLE_ONLY_REST)),
                         warned_auth: AtomicBool::new(false),
                         warned_limit: AtomicBool::new(false),
                         limit: AtomicUsize::new(cfg.connections().max(1) as usize),
@@ -1900,6 +1908,17 @@ impl Pool {
     /// Servers that take part in indexing (`index` not turned off), in config
     /// order. Falls back to every server when all of them opted out.
     pub fn indexing_servers(&self) -> Vec<usize> {
+        for s in &self.servers {
+            if s.no_index.load(Ordering::Relaxed) {
+                let mut rest = s.article_only.lock().unwrap();
+                if rest.0.is_some_and(|t| Instant::now() >= t) {
+                    rest.0 = None;
+                    s.group_refusals.store(0, Ordering::Relaxed);
+                    s.no_index.store(false, Ordering::Relaxed);
+                    println!("{}: trying it for indexing again", s.cfg.host);
+                }
+            }
+        }
         let enabled: Vec<usize> = (0..self.servers.len())
             .filter(|&i| self.servers[i].cfg.indexes() && !self.servers[i].no_index.load(Ordering::Relaxed))
             .collect();
@@ -2313,7 +2332,14 @@ impl Pool {
             Err(e) if matches!(e.code(), Some(500 | 501)) => {
                 let refusals = server.group_refusals.fetch_add(1, Ordering::Relaxed) + 1;
                 if refusals >= GROUP_REFUSALS && !server.no_index.swap(true, Ordering::Relaxed) {
-                    println!("{}: doesnt support GROUP ({e}), using it for article lookups only", server.cfg.host);
+                    let mut rest = server.article_only.lock().unwrap();
+                    let wait = rest.1;
+                    *rest = (Some(Instant::now() + wait), (wait * 2).min(ARTICLE_ONLY_MAX));
+                    println!(
+                        "{}: doesnt support GROUP ({e}), using it for article lookups only for {}m",
+                        server.cfg.host,
+                        wait.as_secs() / 60
+                    );
                 }
             }
             Ok(_) => server.group_refusals.store(0, Ordering::Relaxed),
@@ -3855,6 +3881,20 @@ mod tests {
         // once found elsewhere, a group is picked there
         pool.homes.lock().unwrap().insert("alt.binaries.moved".into(), 1);
         assert_eq!(pool.pick_server("alt.binaries.moved"), 1);
+    }
+
+    #[test]
+    fn an_article_only_server_is_tried_for_indexing_again() {
+        let pool = Pool::new(&[UsenetServer::new("a", "u", "p", 563), UsenetServer::new("fill", "u", "p", 563)]);
+        let fill = &pool.servers[1];
+        fill.no_index.store(true, Ordering::Relaxed);
+        *fill.article_only.lock().unwrap() = (Some(Instant::now() + ARTICLE_ONLY_REST), ARTICLE_ONLY_REST * 2);
+        assert_eq!(pool.indexing_servers(), vec![0], "resting from indexing");
+        fill.group_refusals.store(GROUP_REFUSALS, Ordering::Relaxed);
+        fill.article_only.lock().unwrap().0 = Some(Instant::now() - Duration::from_secs(1));
+        assert_eq!(pool.indexing_servers(), vec![0, 1], "its rest is over");
+        assert_eq!(fill.group_refusals.load(Ordering::Relaxed), 0, "refusals count from nothing again");
+        assert_eq!(fill.article_only.lock().unwrap().1, ARTICLE_ONLY_REST * 2, "the next rest is longer");
     }
 
     #[test]
