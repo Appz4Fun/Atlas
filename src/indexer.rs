@@ -759,7 +759,14 @@ where
     let k = key.clone();
     on_db(db, move |conn| Ok(db::save_group_bounds(conn, &k, first, last)?)).await?;
 
-    let phase = ctx.states.with(group, |st| st.phase);
+    let mut phase = ctx.states.with(group, |st| st.phase);
+    let split = settings.mode != "live" && settings.mode != "backfill" && {
+        let g = group.to_string();
+        on_db(db, move |conn| Ok(crate::chunks::is_split(conn, &g)?)).await?
+    };
+    if live_first(&settings.mode, phase, split, last - state.live_cursor, settings.request_size) {
+        phase = Phase::Live;
+    }
     let backfilling = settings.mode == "backfill" || (settings.mode != "live" && phase == Phase::Backfill);
     if backfilling
         && maybe_split(
@@ -835,6 +842,14 @@ where
             r
         }
     }
+}
+
+/// Whether a dynamic mode pass whose turn is backfill goes live instead: a split group's whose live side is more than
+/// a slice behind. Its day chunks are taken by any server's free workers too (`take_chunk`), and one can hold its home's
+/// worker for over an hour, while its new posts waited: after a restart every group's first turn is backfill, and on
+/// prod alias and rail claimed a day chunk each and their live cursors stood still for hours.
+fn live_first(mode: &str, phase: Phase, split: bool, behind: i64, slice: u64) -> bool {
+    mode != "live" && mode != "backfill" && phase == Phase::Backfill && split && behind > slice as i64
 }
 
 /// Whether split `group`'s cursor backfill on `host` may sweep: no day
@@ -2523,6 +2538,20 @@ mod tests {
         now.claimed_at = 99;
         finish_chunk(&db, &now, (true, None, Some(0)), 0).await.unwrap();
         assert_eq!(days().await.unwrap(), 1, "the older days went to the sweeps");
+    }
+
+    #[test]
+    fn a_split_group_behind_on_its_live_side_goes_live_first() {
+        // behind by more than a slice: live, whatever the turn
+        assert!(live_first("dynamic", Phase::Backfill, true, 100_001, 100_000));
+        // a slice or less behind (a busy group always is a little): its turn
+        assert!(!live_first("dynamic", Phase::Backfill, true, 100_000, 100_000));
+        // not split: its backfill has no other takers, turns as before
+        assert!(!live_first("dynamic", Phase::Backfill, false, 10_000_000, 100_000));
+        // the modes that do one side only, and a live turn anyway
+        assert!(!live_first("backfill", Phase::Backfill, true, 10_000_000, 100_000));
+        assert!(!live_first("live", Phase::Backfill, true, 10_000_000, 100_000));
+        assert!(!live_first("dynamic", Phase::Live, true, 10_000_000, 100_000));
     }
 
     #[test]
