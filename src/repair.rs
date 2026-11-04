@@ -33,8 +33,6 @@ const DAYS: i64 = 3;
 const CANDIDATES: i64 = 200;
 /// windows read per round
 const PER_ROUND: usize = 20;
-/// servers asked per window
-const SERVERS: usize = 2;
 /// around a post's first and last article
 const MARGIN: i64 = 300;
 /// a post's span past which its days aren't asked for (see `days_of`)
@@ -125,7 +123,9 @@ async fn round(
         if stopping() {
             break;
         }
-        for w in &post.windows {
+        // every backend that doesnt share another's overview is asked, one after another, until the post is whole:
+        // only an incomplete post gets these reads, and none past the one that completes it
+        'windows: for w in &post.windows {
             let indexing: HashSet<String> = {
                 let g = w.group.clone();
                 on_db(db, move |conn| Ok(indexed_from(conn, &g)?)).await?
@@ -141,10 +141,9 @@ async fn round(
                     spools.push((server, (first, last)));
                 }
             }
-            let mut read_from = 0;
             for server in pool.indexing_servers() {
                 let host = pool.host(server);
-                if read_from >= SERVERS || !seen.insert(machine(&host)) {
+                if !seen.insert(machine(&host)) {
                     continue;
                 }
                 let spool = match pool.group_on(server, &w.group).await {
@@ -168,9 +167,12 @@ async fn round(
                 }
                 match reread_window(ctx, settings, db, &w.group, server, (w.from, w.to), MAX_ARTICLES).await {
                     Ok(p) => {
-                        read_from += 1;
                         spools.push((server, spool));
                         println!("[repair] {} {}..{} on {host}: {} headers", w.group, w.from, w.to, p.articles);
+                        if p.articles > 0 && whole(&post.ids).await {
+                            println!("[repair] {} is whole now", w.group);
+                            break 'windows;
+                        }
                     }
                     // a failure leaves its share to the next server
                     Err(e) => println!("[repair] {} {}..{} on {host}: {e:#}", w.group, w.from, w.to),
@@ -180,6 +182,13 @@ async fn round(
         mark(db, now, Vec::new(), post.ids.iter().map(|id| (*id, post.permille)).collect()).await?;
     }
     Ok(())
+}
+
+/// Whether the post of these rows is whole now: every file, each with every part (`release_info::whole_of`).
+async fn whole(ids: &[i64]) -> bool {
+    let ids = ids.to_vec();
+    let whole = tokio::task::spawn_blocking(move || db::with_reader(|conn| crate::release_info::whole_of(conn, &ids)));
+    matches!(whole.await, Ok(Ok(true)))
 }
 
 /// Asks for `days` of their groups' backfill first, and marks the releases in `tried` as looked at (with the share
