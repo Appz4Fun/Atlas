@@ -118,6 +118,16 @@ fn collapse_keeps_the_first_volume_and_sums() {
 }
 
 #[test]
+fn collapse_names_a_set_after_its_first_volume_in_any_order() {
+    let file = |name: &str| InnerFile { name: name.into(), size: Some(10) };
+    let as_par2_lists = [file("Show.S01E04.7z.026"), file("Show.S01E04.7z.001"), file("Show.S01E04.7z.097")];
+    let rows = collapse_volumes(&as_par2_lists);
+    assert_eq!((rows[0].name.as_str(), rows[0].size), ("Show.S01E04.7z.001", Some(30)));
+    let rows = collapse_volumes(&[file("x.r00"), file("x.r01"), file("x.rar")]);
+    assert_eq!(rows[0].name, "x.rar", "an old-style set starts at its .rar");
+}
+
+#[test]
 fn password_table() {
     let with = |names: &[&str]| Listing {
         files: names.iter().map(|n| InnerFile { name: (*n).into(), size: None }).collect(),

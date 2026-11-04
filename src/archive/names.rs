@@ -99,8 +99,18 @@ pub fn best_name<'a>(files: impl Iterator<Item = (&'a str, u64)>) -> Option<Stri
         .map(|(_, _, display)| display)
 }
 
-/// One row per set of volumes, the first of them with their sizes summed. Other
-/// files once per name. In order of first appearance, at most `MAX_STORED`.
+/// A volume's place in its set, first lowest: `.rar` before `.r00`, `.7z.001` before `.7z.026`.
+fn volume_order(name: &str) -> u32 {
+    use super::select::{Kind, classify};
+    match classify(name) {
+        Kind::Rar(n) | Kind::SevenZip(n) | Kind::Zip(n) | Kind::Numbered(n) | Kind::Par2Vol(n) => n,
+        _ => u32::MAX,
+    }
+}
+
+/// One row per set of volumes, named after its first volume, with their sizes summed: a PAR2 set lists its files
+/// in no useful order, soo the first one seen can be any volume. Other files once per name. In order of first
+/// appearance, at most `MAX_STORED`.
 pub fn collapse_volumes(files: &[InnerFile]) -> Vec<InnerFile> {
     let mut out: Vec<InnerFile> = Vec::new();
     let mut sets: HashMap<&str, usize> = HashMap::new();
@@ -113,6 +123,9 @@ pub fn collapse_volumes(files: &[InnerFile]) -> Vec<InnerFile> {
                     (Some(a), Some(b)) => Some(a.saturating_add(b)),
                     (a, b) => a.or(b),
                 };
+                if volume_order(&file.name) < volume_order(&row.name) {
+                    row.name.clone_from(&file.name);
+                }
                 continue;
             }
             if out.len() >= MAX_STORED {
