@@ -53,7 +53,8 @@ pub const PP_STATE: ShardTable = ShardTable {
         ("pp_state_failed", "create index if not exists pp_state_failed on pp_state(release_id) where failed != 0"),
     ],
     release_key: Some("release_id"),
-    added: &[],
+    // transient net failures in a row (see `engine::transient_wait`), apart from `net_attempts`
+    added: &[("net_transient", "INTEGER")],
 };
 
 /// a resumable pass over existing releases, newest first

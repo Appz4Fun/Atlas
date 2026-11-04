@@ -184,6 +184,35 @@ fn a_transient_error_in_the_db_lane_uses_no_attempt_and_no_pause() {
     assert_eq!(h.bits("Rel.One").unwrap().0, mask(StepId(16)), "the same run's next step finished");
 }
 
+/// A net step's transient failures are counted apart from its attempts: they back off after 3 in a row and leave the
+/// retries `max_attempts` allows alone.
+#[test]
+fn transient_net_failures_back_off_and_spend_no_attempt() {
+    let log = log();
+    let mut h = fresh();
+    h.save(&[complete("Rel.One")]);
+    let flaky = TestStep::new(32, "flaky", 500, Needs::External, &log)
+        .runs(|_| Err(StepError::Transient("timed out on every server".into())));
+    h.start(vec![flaky.arc()], PostprocessConfig { max_attempts: 2, ..quick_config() });
+    let conn = h.shard();
+    let id = h.id_of("Rel.One");
+    wait_for("its row", || h.bits("Rel.One").is_some());
+    let wait_after = |n: i64| {
+        wait_for("its next transient failure", || h.field("Rel.One", "coalesce(net_transient, 0)") == n);
+        let next: i64 =
+            conn.query_row("select net_next_at from pp_state where release_id = ?", [id], |r| r.get(0)).unwrap();
+        next - chrono::Utc::now().timestamp()
+    };
+    for n in 1..=3 {
+        assert!((wait_after(n) - 300).abs() <= 5, "5 minutes after failure {n}");
+        assert_eq!(h.field("Rel.One", "net_attempts"), 0, "no attempt spent");
+        conn.execute("update pp_state set net_next_at = 1 where release_id = ?", [id]).unwrap();
+    }
+    let fourth = wait_after(4);
+    assert!((fourth - 900).abs() <= 65, "backing off after 3: {fourth}");
+    assert_eq!(h.bits("Rel.One").unwrap().1, 0, "never failed");
+}
+
 #[test]
 fn a_rename_runs_later_steps_once_on_the_new_name() {
     let log = log();

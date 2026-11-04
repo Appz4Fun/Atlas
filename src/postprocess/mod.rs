@@ -65,7 +65,7 @@ pub(crate) fn rerun_on(conn: &Connection, release_id: i64, clear: StepMask, now:
         "insert into pp_state (release_id, rerun_gen, rerun_mask)
          select ?1, 1, ?2 where exists (select 1 from releases where id = ?1)
          on conflict(release_id) do update set
-            done = done & ~?2, failed = failed & ~?2, db_attempts = 0, net_attempts = 0, net_next_at = 0,
+            done = done & ~?2, failed = failed & ~?2, db_attempts = 0, net_attempts = 0, net_transient = 0, net_next_at = 0,
             rerun_gen = rerun_gen + 1, rerun_mask = rerun_mask | ?2",
     )?
     .execute(params![release_id, clear])?;

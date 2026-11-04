@@ -43,6 +43,18 @@ fn net_pause_secs(in_a_row: i64) -> i64 {
 const NET_CRASH_RETRY: i64 = 900;
 const STEP_DEADLINE: Duration = Duration::from_secs(120);
 
+/// Transient failures in a row of a release's net step (every server timed out on its body, say) retried after 5
+/// minutes; past these they back off like a retry (`backoff`). They were retried every 5 minutes for good, asking
+/// every server again each time.
+const TRANSIENT_FREE: i64 = 3;
+
+/// Seconds until a net step runs again after its `in_a_row`th transient failure. They are counted apart from
+/// `net_attempts` (in `net_transient`), soo they never spend the retries `max_attempts` allows, and never fail a
+/// release.
+fn transient_wait(in_a_row: i64, release_id: i64) -> i64 {
+    if in_a_row <= TRANSIENT_FREE { 300 } else { backoff(in_a_row - TRANSIENT_FREE, release_id) }
+}
+
 /// seconds until an attempt's retry, and a little per release soo they dont bunch
 fn backoff(attempt: i64, release_id: i64) -> i64 {
     let shift = (attempt.max(1) - 1).min(16) as u32;
@@ -86,12 +98,14 @@ struct Row {
     net_attempts: i64,
     parts_seen: i64,
     rerun_gen: i64,
+    /// transient net failures in a row
+    net_transient: i64,
 }
 
 const ROW_COLUMNS: &str = "r.id, r.name, r.display_name, r.group_name, r.poster, r.posted_date, coalesce(r.size, 0),
     coalesce(r.complete, 0), coalesce(r.parts, 0), r.file_total, coalesce(r.is_obfuscated, 0), r.name_source,
     s.release_id is not null, coalesce(s.done, 0), coalesce(s.failed, 0), coalesce(s.db_attempts, 0),
-    coalesce(s.net_attempts, 0), coalesce(s.parts_seen, 0), coalesce(s.rerun_gen, 0)";
+    coalesce(s.net_attempts, 0), coalesce(s.parts_seen, 0), coalesce(s.rerun_gen, 0), coalesce(s.net_transient, 0)";
 
 fn read_row(r: &SqlRow<'_>, at: usize, shard: usize) -> rusqlite::Result<Row> {
     let col = |i: usize| at + i;
@@ -118,6 +132,7 @@ fn read_row(r: &SqlRow<'_>, at: usize, shard: usize) -> rusqlite::Result<Row> {
         net_attempts: r.get(col(16))?,
         parts_seen: r.get(col(17))?,
         rerun_gen: r.get(col(18))?,
+        net_transient: r.get(col(19))?,
     })
 }
 
@@ -759,7 +774,9 @@ impl Inner {
         a.clear = clear & !(a.set_done | a.set_failed);
         a.queue_at = queue_at;
         if a.clear & net_steps != 0 {
+            // run again from the start: the streak was the old run's
             a.net_next_at = Some(0);
+            a.net_transient = Some(0);
         }
         a.no_state = !row.has_state
             && a.set_done == 0
@@ -962,6 +979,7 @@ impl Inner {
         if row.net_attempts >= max_attempts {
             a.set_failed |= bit;
             a.net_attempts = Some(0);
+            a.net_transient = Some(0);
             a.net_next_at = Some(0);
             a.error = Some("interrupted".into());
             return self.send(db, shard, one(a), now, |_| Ok(()));
@@ -1018,6 +1036,7 @@ impl Inner {
                         a.set_done |= bit;
                         a.net_mask &= !bit;
                         a.net_attempts = Some(0);
+                        a.net_transient = Some(0);
                         a.net_next_at = Some(0);
                         a.writes.extend(std::mem::take(&mut o.writes).into_iter().map(|w| (bit, w)));
                         // later steps run again: this lane's come back to it, the database's through the queue
@@ -1043,9 +1062,11 @@ impl Inner {
                     if attempt >= max_attempts {
                         a.set_failed |= bit;
                         a.net_attempts = Some(0);
+                        a.net_transient = Some(0);
                         a.net_next_at = Some(0);
                     } else {
                         a.net_attempts = Some(attempt);
+                        a.net_transient = Some(0);
                         a.net_next_at = Some(now + backoff(attempt, id));
                     }
                     a.error = Some(e);
@@ -1053,12 +1074,15 @@ impl Inner {
                 Ran::Error(StepError::Permanent(e)) => {
                     a.set_failed |= bit;
                     a.net_attempts = Some(0);
+                    a.net_transient = Some(0);
                     a.net_next_at = Some(0);
                     a.error = Some(e);
                 }
                 Ran::Error(StepError::Transient(e)) => {
+                    let in_a_row = row.net_transient + 1;
                     a.net_attempts = Some(attempts_before);
-                    a.net_next_at = Some(now + 300);
+                    a.net_transient = Some(in_a_row);
+                    a.net_next_at = Some(now + transient_wait(in_a_row, id));
                     a.error = Some(e);
                     self.pause_net_after_trouble(now);
                 }
@@ -1178,6 +1202,13 @@ fn seed_shard(conn: &Connection, enabled: StepMask, stamps: &[(u8, StepMask, i64
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transient_failures_back_off_after_a_few() {
+        let waits: Vec<i64> = (1..=7).map(|n| transient_wait(n, 0)).collect();
+        assert_eq!(waits, [300, 300, 300, 900, 3600, 14400, 57600]);
+        assert_eq!(transient_wait(40, 0), 604_800, "a week at most");
+    }
 
     #[test]
     fn a_few_bad_articles_dont_rest_the_net_lane_but_a_run_of_them_does() {
