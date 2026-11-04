@@ -390,13 +390,24 @@ impl WordIndex {
         writer.commit()?;
         // searched straight after, not once the reader looks again
         self.reader.reload()?;
-        // a release queued again since it was read keeps its place: its count went up
-        let tx = conn.unchecked_transaction()?;
-        for &(s, id, n) in &taken {
-            tx.prepare_cached(&format!("delete from s{s}.word_queue where release_id = ?1 and n = ?2"))?
-                .execute([id, n])?;
+        // a release queued again since it was read keeps its place: its count went up. One shard at a time, each in
+        // its own transaction: one over them all would keep the shards it already wrote locked while it waits for
+        // the next one's writer, and their writers out (shard 0's saves failed as locked). What a failure leaves
+        // queued is read and indexed again the next time
+        for s in 0..store::SHARDS {
+            if !taken.iter().any(|t| t.0 == s) {
+                continue;
+            }
+            let tx = conn.unchecked_transaction()?;
+            {
+                let mut delete =
+                    tx.prepare_cached(&format!("delete from s{s}.word_queue where release_id = ?1 and n = ?2"))?;
+                for &(_, id, n) in taken.iter().filter(|t| t.0 == s) {
+                    delete.execute([id, n])?;
+                }
+            }
+            tx.commit()?;
         }
-        tx.commit()?;
         Ok(taken.len())
     }
 
@@ -999,6 +1010,38 @@ mod tests {
         let far = index.search(&conn, "batman", None, &[], By::Relevance, true, usize::MAX / 2, 50).unwrap();
         assert!(far.rows.is_empty());
         assert_eq!(far.total, 31);
+    }
+
+    #[test]
+    fn a_drain_writes_one_shard_at_a_time() {
+        let f = fixture();
+        // alt.binaries.c is in shard 0, alt.binaries.b in shard 3
+        assert_eq!((store::shard_of("alt.binaries.c"), store::shard_of("alt.binaries.b")), (0, 3));
+        let index = f.index();
+        let conn = f.conn();
+        index.build(&conn).unwrap();
+        f.add("Gamma.Movie.2020.1080p-X", "alt.binaries.c", 5, Some(HD));
+        f.add("Delta.Movie.2021.1080p-X", "alt.binaries.b", 9, Some(HD));
+        let queued = |group: &str| -> i64 {
+            f.shard(group).query_row("select count(*) from word_queue", [], |r| r.get(0)).unwrap()
+        };
+        // shard 3's writer is in a save: the drain waits for it, and fails
+        let busy = f.shard("alt.binaries.b");
+        busy.execute_batch("begin immediate").unwrap();
+        conn.busy_timeout(Duration::ZERO).unwrap();
+        assert!(index.drain(&conn).is_err());
+        // shard 0 was done and committed before: its writer isn't kept waiting for shard 3's
+        assert_eq!((queued("alt.binaries.c"), queued("alt.binaries.b")), (0, 1));
+        let other = f.shard("alt.binaries.c");
+        other.busy_timeout(Duration::ZERO).unwrap();
+        other.execute_batch("begin immediate; commit").unwrap();
+        busy.execute_batch("commit").unwrap();
+        // the rest is taken in the next time
+        assert_eq!(index.drain(&conn).unwrap(), 1);
+        assert_eq!(queued("alt.binaries.b"), 0);
+        index.reader.reload().unwrap();
+        assert_eq!(index.count("delta", None, &[]).unwrap(), 1);
+        assert_eq!(index.count("gamma", None, &[]).unwrap(), 1);
     }
 
     #[test]
