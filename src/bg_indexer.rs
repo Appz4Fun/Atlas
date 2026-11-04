@@ -886,6 +886,11 @@ async fn run_servers(
             tasks.spawn(worker(sched.clone(), server, db.clone()));
         }
     }
+    // which groups the big releases come from, for the backfill to take first
+    {
+        let s = sched.clone();
+        tasks.spawn(crate::repair::count_media_every(db.clone(), move || s.stopping()));
+    }
     // parts one server's listing left out, read again from another (see `repair`)
     if sched.ctx.pool.indexing_servers().len() > 1 {
         let s = sched.clone();

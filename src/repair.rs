@@ -82,14 +82,7 @@ pub async fn run(ctx: PassContext, settings: PassSettings, db: Db, stopping: imp
         eprintln!("repair: {e:#}");
         return;
     }
-    let mut counted: Option<Instant> = None;
     loop {
-        if counted.is_none_or(|t| t.elapsed() >= COUNT_EVERY) && !stopping() {
-            counted = Some(Instant::now());
-            if let Err(e) = count_media(&db).await {
-                eprintln!("repair: counting big releases per group: {e:#}");
-            }
-        }
         let deadline = Instant::now() + EVERY;
         while !stopping() && Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(250)).await;
@@ -192,8 +185,21 @@ async fn round(
     .await
 }
 
-/// Notes how many big video releases each group holds, for the backfill to take those groups first
-/// (`chunks::MEDIA_GROUPS`).
+/// Counts each group's big video releases now and then, for the backfill to take those groups first
+/// (`chunks::MEDIA_GROUPS`). With one server or many: it doesn't read from any.
+pub async fn count_media_every(db: Db, stopping: impl Fn() -> bool) {
+    while !stopping() {
+        if let Err(e) = count_media(&db).await {
+            eprintln!("counting big releases per group: {e:#}");
+        }
+        let next = Instant::now() + COUNT_EVERY;
+        while !stopping() && Instant::now() < next {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+}
+
+/// Notes how many big video releases each group holds.
 async fn count_media(db: &Db) -> anyhow::Result<()> {
     let counts = tokio::task::spawn_blocking(|| db::with_reader(media_counts)).await??;
     on_db(db, move |conn| Ok(crate::chunks::set_media(conn, &counts)?)).await
