@@ -75,6 +75,8 @@ families! {
     ARTICLE_BYTES "atlas_article_bytes_total" Counter &[], "Post bytes indexed, per group.";
     RELEASES_SEEN "atlas_releases_seen_total" Counter &[], "Releases in the slices saved, per group: one release in many slices counts each time. New ones are in atlas_db_rows.";
     ARTICLES_SKIPPED "atlas_articles_skipped_total" Counter &[], "Articles the indexer skipped, per group.";
+    UNPARSABLE_ARTICLES "atlas_articles_unparsable_total" Counter &[], "Articles no subject rule reads, per group and subject shape (id_subject: ngPost -x, token: one random token).";
+    UNPARSABLE_BYTES "atlas_article_bytes_unparsable_total" Counter &[], "Bytes of the articles no subject rule reads, per group and subject shape.";
     GROUP_LAST_INDEXED "atlas_group_last_indexed_timestamp_seconds" Gauge &[], "When each group last indexed something.";
     INDEXER_ERRORS "atlas_indexer_errors_total" Counter &[], "Errors the indexing loop has counted.";
     INDEXER_RUNNING "atlas_indexer_up" Gauge &[], "1 while the indexing loop is running.";
