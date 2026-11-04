@@ -940,6 +940,28 @@ impl Conn {
         }
     }
 
+    /// `article_raw`'s first `max_bytes` or so, in whole lines. False: the rest is left unread, soo the connection
+    /// cant take another request.
+    pub async fn article_raw_prefix(&mut self, message_id: &str, max_bytes: usize) -> Result<(Vec<u8>, bool)> {
+        let (code, message) = self.command("ARTICLE", Some(message_id)).await?;
+        if code != 220 {
+            return Err(NntpError::Reply { code, message });
+        }
+        let mut out = Vec::new();
+        while out.len() < max_bytes {
+            let Some(mut l) = self.read_line_capped(max_bytes).await? else { break };
+            if l == b"." {
+                return Ok((out, true));
+            }
+            if l.starts_with(b"..") {
+                l.remove(0);
+            }
+            out.extend_from_slice(&l);
+            out.push(b'\n');
+        }
+        Ok((out, false))
+    }
+
     /// Whether a server has the article, with nothing transferred.
     pub async fn stat(&mut self, message_id: &str) -> Result<()> {
         let (code, message) = self.command("STAT", Some(message_id)).await?;
@@ -1445,6 +1467,8 @@ pub enum BackgroundRead {
     Prefix,
     /// the whole article undecoded, headers too
     Raw,
+    /// `Raw`'s first `max_bytes` or so: a cut one is `Body`, never `TooBig`
+    RawPrefix,
     /// nothing read: an empty `Body` says a server has it
     Stat,
 }
@@ -2426,6 +2450,11 @@ impl Pool {
                         BackgroundRead::Raw => {
                             lease.begin().article_raw(message_id, max_bytes).await.map(|b| (b.is_some(), b))
                         }
+                        BackgroundRead::RawPrefix => lease
+                            .begin()
+                            .article_raw_prefix(message_id, max_bytes)
+                            .await
+                            .map(|(b, whole)| (whole, Some(b))),
                         BackgroundRead::Stat => lease.begin().stat(message_id).await.map(|()| (true, Some(Vec::new()))),
                     }
                 })

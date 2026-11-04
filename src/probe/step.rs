@@ -53,12 +53,17 @@ fn first_volume_key(name: &str) -> (u8, String) {
 }
 
 pub(super) fn fetch_raw(ctx: &mut StepCtx<'_>, message_id: &str, file: &str) -> Result<Got, StepError> {
-    let wanted = BodyRequest {
-        message_id: message_id.to_string(),
-        file: file.to_string(),
-        max_bytes: Some(archive::ARTICLE_CAP),
-    };
-    Ok(ctx.fetch_article(&wanted)?.got)
+    Ok(ctx.fetch_article(&capped(message_id, file))?.got)
+}
+
+/// A file's first article, or its first `ARTICLE_CAP` when it's bigger: some posters put 40 MB in an article, and
+/// a media header is in the first few hundred KB of it.
+fn fetch_head(ctx: &mut StepCtx<'_>, message_id: &str, file: &str) -> Result<Got, StepError> {
+    Ok(ctx.fetch_article_prefix(&capped(message_id, file))?.got)
+}
+
+fn capped(message_id: &str, file: &str) -> BodyRequest {
+    BodyRequest { message_id: message_id.to_string(), file: file.to_string(), max_bytes: Some(archive::ARTICLE_CAP) }
 }
 
 /// Whether a server has it. None: this doesn't say, as when the article's too big to read, or the budget's gone.
@@ -186,7 +191,7 @@ impl Step for ProbeStep {
             let wire_bytes = first.as_ref().map_or(0, |f| f.bytes);
             let mut front = Vec::new();
             if let Some(first) = &first {
-                let got = fetch_raw(ctx, &first.message_id, &file.filename)?;
+                let got = fetch_head(ctx, &first.message_id, &file.filename)?;
                 if let Some(there) = there(&got) {
                     info.health.insert("first".into(), there);
                 }

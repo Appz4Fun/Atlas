@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use atlas::archive::PROBE_PREFIX;
 use atlas::config::PostprocessConfig;
-use atlas::nntp::{BackgroundBody, Pool};
+use atlas::nntp::{BackgroundBody, BackgroundRead, Pool};
 use atlas::postprocess::step::{BodyRequest, Got, Needs, Outcome};
 use common::stage::*;
 use common::{Server, mock, post, spawn_server, yenc_lined};
@@ -59,6 +59,30 @@ fn a_short_body_comes_back_whole_and_the_connection_stays() {
     let next = rt.block_on(pool.background_prefix("<msg2@mock>", PROBE_PREFIX)).unwrap();
     assert_eq!(next, BackgroundBody::Body(b"next".to_vec()));
     assert_eq!(state.accepted.load(Ordering::SeqCst), before, "it kept its connection");
+}
+
+#[test]
+fn an_article_too_big_to_read_whole_gives_its_start_with_its_headers() {
+    let rt = runtime();
+    let whole = data(MIB);
+    let (state, pool) = serving(yenc_lined("a.bin", &whole));
+    let raw = |id: &str, read| rt.block_on(pool.background_read(id, PROBE_PREFIX, read)).unwrap();
+    assert_eq!(raw("<msg1@mock>", BackgroundRead::Raw), BackgroundBody::TooBig, "the whole read gives up");
+    let BackgroundBody::Body(cut) = raw("<msg1@mock>", BackgroundRead::RawPrefix) else { panic!() };
+    assert!(cut.len() >= PROBE_PREFIX && cut.len() < PROBE_PREFIX + 1024, "{}", cut.len());
+    let article = atlas::probe::yenc::split_article(&cut);
+    assert!(!article.headers.is_empty(), "the headers come first");
+    let body = atlas::nntp::yenc_decode(&article.lines).unwrap();
+    assert!(body.len() > PROBE_PREFIX / 2 && whole.starts_with(&body), "{}", body.len());
+
+    let before = state.accepted.load(Ordering::SeqCst);
+    let BackgroundBody::Body(next) = raw("<msg2@mock>", BackgroundRead::RawPrefix) else { panic!() };
+    let next = atlas::probe::yenc::split_article(&next);
+    assert_eq!(atlas::nntp::yenc_decode(&next.lines).unwrap(), b"next", "read whole");
+    assert_eq!(state.accepted.load(Ordering::SeqCst), before + 1, "the cut connection was thrown away");
+    let after = state.accepted.load(Ordering::SeqCst);
+    raw("<msg2@mock>", BackgroundRead::RawPrefix);
+    assert_eq!(state.accepted.load(Ordering::SeqCst), after, "a whole one keeps its connection");
 }
 
 #[test]
