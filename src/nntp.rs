@@ -2052,6 +2052,11 @@ impl Pool {
         tier[0]
     }
 
+    /// The server `group`'s cursors live on: where `pick_server_in` puts it with every indexing server up.
+    pub fn home_of(&self, group: &str) -> usize {
+        self.pick_server_in(&self.indexing_servers(), group)
+    }
+
     /// The server `group`'s passes go to while the ones in `not` are failing it: the first `ranked` gives among the
     /// rest of `tier`, none when no other is left.
     pub fn fallback_in(&self, tier: &[usize], group: &str, not: &[usize]) -> Option<usize> {

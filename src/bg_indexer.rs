@@ -320,8 +320,8 @@ struct Scheduler {
     sweeping: Mutex<HashSet<usize>>,
     /// groups resting after going idle or after an error
     wait_until: Mutex<HashMap<String, Instant>>,
-    /// consecutive errors per group
-    errors: Mutex<HashMap<String, u32>>,
+    /// consecutive errors per group, on each server
+    errors: Mutex<HashMap<(String, usize), u32>>,
     /// groups parked after 3 errors in a row, retried after FAILED_RETRY
     failed: Mutex<HashMap<String, Parked>>,
     stats: Arc<Mutex<Stats>>,
@@ -426,10 +426,16 @@ impl Scheduler {
     }
 
     /// For a pass of `group` on `server`: whether it stands in for the group's own server (parked, see `Parked`), and
-    /// whether none on `server` finished since.
+    /// whether none on `server` finished since. Never on the group's home (`Pool::home_of`): it can be the one to
+    /// take a group parked on a server it was only on while the home was down, and that pass is the home's own, on
+    /// its own cursor, which a stand-in's start at the newest article would skip past.
     fn stand_in(&self, group: &str, server: usize) -> Option<bool> {
         let failed = self.failed.lock().unwrap();
-        Some(!failed.get(group)?.stood_in.contains(&server))
+        let parked = failed.get(group)?;
+        if server == self.ctx.pool.home_of(group) {
+            return None;
+        }
+        Some(!parked.stood_in.contains(&server))
     }
 
     /// After a pass of `group` that ran on `server` (see `run_pass_on`); `stood_in`: it stood in for the group's own
@@ -447,7 +453,7 @@ impl Scheduler {
                 {
                     parked.stood_in.push(server);
                 }
-                self.errors.lock().unwrap().remove(group);
+                self.errors.lock().unwrap().remove(&(group.to_string(), server));
                 // caught up: give it a rest instead of hammering GROUP every loop
                 if states.is_idle(group) && !states.is_backfilling(group) {
                     self.wait_until.lock().unwrap().insert(group.to_string(), Instant::now() + IDLE_RECHECK);
@@ -462,13 +468,13 @@ impl Scheduler {
                 self.stats.lock().unwrap().error_count += 1;
                 let count = {
                     let mut errors = self.errors.lock().unwrap();
-                    let c = errors.entry(group.to_string()).or_insert(0);
+                    let c = errors.entry((group.to_string(), server)).or_insert(0);
                     *c += 1;
                     *c
                 };
 
                 if count >= 3 {
-                    self.errors.lock().unwrap().remove(group);
+                    self.errors.lock().unwrap().remove(&(group.to_string(), server));
                     let pool = &self.ctx.pool;
                     let mut failed = self.failed.lock().unwrap();
                     let parked = failed.entry(group.to_string()).or_insert_with(|| Parked {
@@ -1413,6 +1419,15 @@ mod tests {
         sched.failed.lock().unwrap().get_mut("g").unwrap().since -= FAILED_RETRY;
         assert_eq!(sched.take_group(home).as_deref(), Some("g"));
         assert_eq!(sched.stand_in("g", home), None);
+
+        // parked on a server it was on only while its home was down: the home takes it back as its own, no stand-in
+        sched
+            .failed
+            .lock()
+            .unwrap()
+            .insert("g".into(), Parked { since: Instant::now(), servers: vec![other], stood_in: vec![] });
+        assert_eq!(sched.stand_in("g", home), None);
+        sched.failed.lock().unwrap().clear();
 
         // a stand-in still running then fails: the home isnt blamed or parked for it
         for _ in 0..3 {
