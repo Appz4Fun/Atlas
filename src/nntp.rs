@@ -112,12 +112,18 @@ impl Overview {
             date: to_iso_date(&self.date),
             message_id: self.message_id,
             references: self.references,
-            bytes: self.bytes,
+            bytes: if self.bytes > 0 { self.bytes } else { bytes_from_lines(self.lines) },
             lines: self.lines,
             xref_groups: self.xref_groups,
             ..Default::default()
         }
     }
+}
+
+/// An article's size when the server's overview gives none (some list `0` for every article of a group) but its line
+/// count: a yEnc line is 128 encoded bytes and its CRLF. Sizes, size filters and NZB segments go by this.
+pub fn bytes_from_lines(lines: i64) -> i64 {
+    lines.max(0).saturating_mul(130)
 }
 
 pub fn headers_to_articles(headers: Vec<Overview>) -> Vec<Article> {
@@ -3425,6 +3431,14 @@ mod yenc_decode_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_overview_with_no_size_gets_one_from_its_lines() {
+        let o = |bytes, lines| Overview { bytes, lines, ..Default::default() }.into_article().bytes;
+        assert_eq!(o(740_604, 5_690), 740_604, "a size given stays");
+        assert_eq!(o(0, 33_281), 4_326_530, "about a 4.3 MB yEnc part");
+        assert_eq!(o(0, 0), 0);
+    }
+
     /// the dates the first windows count by judge a server's retention: the earliest
     /// answers, and one more than a day older than an earlier one is unsure
     #[test]
