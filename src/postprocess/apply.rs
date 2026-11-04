@@ -64,6 +64,30 @@ pub(crate) fn count_names(renames: &[(u8, bool)]) {
     }
 }
 
+/// A visit's `pp_state` row, its net rank worked out again each time: a category or a size can change
+static UPSERT_STATE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!(
+        "insert into pp_state (release_id, done, failed, net_wanted, db_attempts, net_attempts, net_next_at, parts_seen,
+                                   last_error, rerun_gen, rerun_mask, net_transient, net_rank)
+             values (?1, ?2 & ~?4, ?3 & ~?2 & ~?4, case when (?5 & ~(?2 & ~?4) & ~(?3 & ~?4)) != 0 then 1 end,
+                     coalesce(?6, 0), coalesce(?7, 0), coalesce(?8, 0), coalesce(?9, 0), ?10, ?4 != 0, ?4, ?11, {rank})
+             on conflict(release_id) do update set
+                done = (done | ?2) & ~?4,
+                failed = (failed | ?3) & ~?2 & ~?4,
+                net_wanted = case when (?5 & ~((done | ?2) & ~?4) & ~((failed | ?3) & ~?4)) != 0 then 1 end,
+                db_attempts = coalesce(?6, db_attempts),
+                net_attempts = coalesce(?7, net_attempts),
+                net_next_at = coalesce(?8, net_next_at),
+                parts_seen = coalesce(?9, parts_seen),
+                last_error = ?10,
+                rerun_gen = rerun_gen + (?4 != 0),
+                rerun_mask = rerun_mask | ?4,
+                net_transient = coalesce(?11, net_transient),
+                net_rank = {rank}",
+        rank = super::schema::NET_RANK,
+    )
+});
+
 /// One release's visit in a savepoint: a write that fails undoes this release
 /// alone, which then counts as a failure of the lane that ran it.
 pub(crate) fn apply_one(
@@ -185,25 +209,7 @@ fn write(conn: &Connection, mut a: Applied, now: i64, renames: &mut Renames) -> 
         }
     }
     if !a.no_state {
-        conn.prepare_cached(
-            "insert into pp_state (release_id, done, failed, net_wanted, db_attempts, net_attempts, net_next_at, parts_seen,
-                                   last_error, rerun_gen, rerun_mask, net_transient)
-             values (?1, ?2 & ~?4, ?3 & ~?2 & ~?4, case when (?5 & ~(?2 & ~?4) & ~(?3 & ~?4)) != 0 then 1 end,
-                     coalesce(?6, 0), coalesce(?7, 0), coalesce(?8, 0), coalesce(?9, 0), ?10, ?4 != 0, ?4, ?11)
-             on conflict(release_id) do update set
-                done = (done | ?2) & ~?4,
-                failed = (failed | ?3) & ~?2 & ~?4,
-                net_wanted = case when (?5 & ~((done | ?2) & ~?4) & ~((failed | ?3) & ~?4)) != 0 then 1 end,
-                db_attempts = coalesce(?6, db_attempts),
-                net_attempts = coalesce(?7, net_attempts),
-                net_next_at = coalesce(?8, net_next_at),
-                parts_seen = coalesce(?9, parts_seen),
-                last_error = ?10,
-                rerun_gen = rerun_gen + (?4 != 0),
-                rerun_mask = rerun_mask | ?4,
-                net_transient = coalesce(?11, net_transient)",
-        )?
-        .execute(params![
+        conn.prepare_cached(&UPSERT_STATE)?.execute(params![
             a.release_id,
             set_done,
             set_failed,
@@ -569,6 +575,72 @@ mod tests {
         assert_eq!(state(&conn, id).2, Some(1), "clear takes it back");
         run(&conn, Applied { release_id: id, claimed_gen: 1, net_mask: A, set_failed: A, ..Default::default() });
         assert_eq!(state(&conn, id).2, None, "failed");
+    }
+
+    fn rank(conn: &Connection, id: i64) -> Option<i64> {
+        conn.query_row("select net_rank from pp_state where release_id = ?", [id], |r| r.get(0)).unwrap()
+    }
+
+    #[test]
+    fn a_visit_ranks_big_video_first() {
+        let (_dir, conn, id) = shard();
+        let gib = 1i64 << 30;
+        let ranked = |size: i64, category: Option<i64>| {
+            conn.execute("update releases set size = ? where id = ?", params![size, id]).unwrap();
+            conn.execute("delete from release_category", []).unwrap();
+            if let Some(c) = category {
+                conn.execute("insert into release_category (release_id, category) values (?, ?)", params![id, c])
+                    .unwrap();
+            }
+            run(&conn, Applied { release_id: id, net_mask: A, ..Default::default() });
+            rank(&conn, id)
+        };
+        assert_eq!(ranked(100 << 20, None), Some(0), "small");
+        assert_eq!(ranked(2 * gib, None), Some(1), "no category yet, as an obfuscated upload");
+        assert_eq!(ranked(8 * gib, Some(5040)), Some(2), "TV");
+        assert_eq!(ranked(20 * gib, Some(2045)), Some(3), "a UHD movie");
+        assert_eq!(ranked(60 * gib, Some(8010)), Some(4), "a hashed upload");
+        assert_eq!(ranked(60 * gib, Some(3010)), Some(0), "audio, however big");
+        assert_eq!(ranked(60 * gib, Some(6000)), Some(0), "nor XXX");
+    }
+
+    #[test]
+    fn the_rank_lane_ranks_only_the_unranked() {
+        let (_dir, conn, id) = shard();
+        conn.execute("update releases set size = ? where id = ?", params![5i64 << 30, id]).unwrap();
+        conn.execute("insert into pp_state (release_id, net_wanted) values (?, 1)", [id]).unwrap();
+        assert_eq!(rank(&conn, id), None, "from before ranks, or a rerun");
+        crate::postprocess::engine::rank_ids(&conn, &[id]).unwrap();
+        assert_eq!(rank(&conn, id), Some(2));
+        conn.execute("update pp_state set net_rank = 4", []).unwrap();
+        crate::postprocess::engine::rank_ids(&conn, &[id]).unwrap();
+        assert_eq!(rank(&conn, id), Some(4), "a ranked one is left as it is");
+    }
+
+    #[test]
+    fn the_net_lane_claims_by_rank_from_an_index() {
+        let (_dir, conn, _id) = shard();
+        for (claims, order) in [(0, "net_rank desc, release_id desc"), (3, "release_id desc"), (7, "release_id asc")] {
+            assert_eq!(crate::postprocess::engine::claim_order(claims), order);
+            let plan: Vec<String> = conn
+                .prepare(&format!(
+                    "explain query plan select release_id from pp_state where net_wanted = 1 and net_next_at <= 5 order by {order} limit 4"
+                ))
+                .unwrap()
+                .query_map([], |r| r.get(3))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert!(!plan.iter().any(|p| p.contains("TEMP B-TREE")), "{order}: {plan:?}");
+        }
+        let plan: String = conn
+            .query_row(
+                "explain query plan select release_id from pp_state where net_wanted = 1 and net_rank is null order by release_id desc limit 5",
+                [],
+                |r| r.get(3),
+            )
+            .unwrap();
+        assert!(plan.contains("pp_state_net_rank") && !plan.contains("TEMP B-TREE"), "{plan}");
     }
 
     #[test]
