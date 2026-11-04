@@ -69,24 +69,64 @@ fn fetch_start(ctx: &mut StepCtx<'_>, seg: &SegmentRef, file: &str) -> Result<Op
     })
 }
 
-/// A small file's every article, decoded and joined in order, within the budget. None: one isnt indexed or
-/// came to nothing, or the file is more than a list should be.
+/// A small file's every part, decoded and joined in order, within the budget: a part's repost stands in when its
+/// first copy comes to nothing. None: a part isnt indexed or none of its copies came, or the file is more than a
+/// list should be.
 fn whole_file(ctx: &mut StepCtx<'_>, file: &FileInfo, left: &mut usize) -> Result<Option<Vec<u8>>, StepError> {
     let parts = file.expected.unwrap_or(0).max(file.parts_seen);
-    let segs = ctx.segments(file.id, &SegmentPick::First(parts.max(0) as usize)).map_err(retry)?;
-    let in_order = segs.iter().enumerate().all(|(i, s)| s.part.is_none_or(|p| p == i as i64 + 1));
-    if segs.is_empty() || segs.len() as i64 != parts || !in_order || segs.len() > *left {
+    if parts < 1 || parts as usize > *left {
+        return Ok(None);
+    }
+    let mut by_part: std::collections::BTreeMap<i64, Vec<SegmentRef>> = std::collections::BTreeMap::new();
+    for seg in ctx.segments(file.id, &SegmentPick::Parts((1..=parts).collect())).map_err(retry)? {
+        if let Some(part) = seg.part {
+            by_part.entry(part).or_default().push(seg);
+        }
+    }
+    // one article posted with no counter has no part number to pick it by
+    if parts == 1 && by_part.is_empty() {
+        by_part.insert(1, ctx.segments(file.id, &SegmentPick::First(1)).map_err(retry)?);
+    }
+    if by_part.len() as i64 != parts || by_part.values().any(Vec::is_empty) {
         return Ok(None);
     }
     let mut whole = Vec::new();
-    for seg in &segs {
-        let Some(body) = budgeted(ctx, seg, &file.filename, left)? else { return Ok(None) };
+    for copies in by_part.values() {
+        let mut body = None;
+        for seg in copies {
+            body = budgeted(ctx, seg, &file.filename, left)?;
+            if body.is_some() {
+                break;
+            }
+        }
+        let Some(body) = body else { return Ok(None) };
         whole.extend(body);
         if whole.len() > nzb::MAX_NZB_BYTES {
             return Ok(None);
         }
     }
     Ok(Some(whole))
+}
+
+/// The list a posted NZB gave before, kept in the raw store, when nothing else in the release is to be read: no
+/// articles fetched for it. Not an archive, soo it has no `raw_archives` row for `get_archive` to find.
+fn restore_nzb(
+    ctx: &StepCtx<'_>,
+    files: &[FileInfo],
+    content_id: &[u8],
+    limits: &ArchiveConfig,
+) -> Result<Option<Outcome>, StepError> {
+    if select::nzb_sources(files).is_empty() || !select::plan(files, limits.probe_files.max(0) as usize).is_empty() {
+        return Ok(None);
+    }
+    let rel = ctx.release();
+    let saved = crate::raw_store::get_archive_files(&rel.name, &rel.group, content_id, SOURCE_NZB);
+    if saved.is_empty() {
+        return Ok(None);
+    }
+    let files = saved.into_iter().map(|f| InnerFile { name: f.name, size: f.size }).collect();
+    let listing = Listing { files, complete: true, ..Default::default() };
+    finish_with_override(ctx, SOURCE_NZB, listing, None, Some(None), false, limits).map(Some)
 }
 
 fn listing_of(inventory: par2::Inventory) -> Listing {
@@ -579,6 +619,9 @@ impl Step for ListStep {
             {
                 return restore_archive(ctx, saved, &limits);
             }
+            if let Some(outcome) = restore_nzb(ctx, &files, &content_id, &limits)? {
+                return Ok(outcome);
+            }
             if select::par2_source(&files).is_none() {
                 let saved_par2 = crate::raw_store::get_archive_files(&rel_name, &rel_group, &content_id, SOURCE_PAR2);
                 if !saved_par2.is_empty()
@@ -668,6 +711,10 @@ impl Step for ListStep {
         let rel = ctx.release();
         if let Some(saved) = crate::raw_store::get_archive(&rel.name, &rel.group, &content_id, 0, false) {
             return restore_archive(ctx, saved, &limits);
+        }
+        // its articles may be gone since
+        if let Some(outcome) = restore_nzb(ctx, &files, &content_id, &limits)? {
+            return Ok(outcome);
         }
         if select::par2_source(&files).is_none() {
             let saved_par2 = crate::raw_store::get_archive_files(&rel_name, &rel_group, &content_id, SOURCE_PAR2);

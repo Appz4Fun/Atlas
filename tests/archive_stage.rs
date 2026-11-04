@@ -834,3 +834,37 @@ fn an_archive_is_read_before_a_posted_nzb() {
     assert_eq!(bodies(&state), 1);
     assert_eq!(rows(&h, "x")[0].source, 2);
 }
+
+#[test]
+fn a_posted_nzb_with_a_reposted_part_is_read_from_the_part_it_needs() {
+    let mut h = fresh();
+    let whole = an_nzb(POINTED_AT);
+    let (head, tail) = whole.split_at(whole.len() / 2);
+    // part 1 twice: the repost sorts before part 2 by message-id, and must not stand in for it
+    let s = shape("x").add("x.nzb", 1, 2, yenc_body("x.nzb", head)).add("x.nzb", 1, 2, yenc_body("x.nzb", head)).add(
+        "x.nzb",
+        2,
+        2,
+        yenc_body("x.nzb", tail),
+    );
+    let state = serve(&mut h, &s, config());
+    settled(&h, "x");
+    assert_eq!(bodies(&state), 2);
+    assert_eq!(rows(&h, "x").len(), 1);
+}
+
+#[test]
+fn a_posted_nzbs_list_comes_back_from_the_raw_store_once_its_articles_are_gone() {
+    let mut h = fresh();
+    let s = shape("x").one("x.nzb", &an_nzb(POINTED_AT));
+    let state = serve(&mut h, &s, config());
+    settled(&h, "x");
+    let before = rows(&h, "x");
+    assert_eq!(before.len(), 1);
+    let id = h.id_of("x");
+    h.shard().execute("delete from archive_inner_files where release_id = ?", [id]).unwrap();
+    state.posts.lock().unwrap().clear();
+    h.stage.as_ref().unwrap().rerun(id, LIST_DONE).unwrap();
+    wait_for("the list back", || rows(&h, "x") == before);
+    assert_eq!(bodies(&state), 1);
+}
