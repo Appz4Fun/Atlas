@@ -652,16 +652,16 @@ mod tests {
         let order = "net_rank desc, release_id desc";
         let mut taken = Vec::new();
         for _ in 0..8 {
-            let ids = net_take(&conn, &claimed, order, 5).unwrap();
+            let ids = net_take(&conn, &claimed, order, 5, 8).unwrap();
             assert_eq!(ids.len(), 4);
             taken.extend(ids);
         }
         let distinct: std::collections::HashSet<i64> = taken.iter().copied().collect();
         assert_eq!(distinct.len(), 32, "no release in two claims");
         assert_eq!(&taken[..4], &[199, 194, 189, 184], "the first claim takes the top of the order");
-        assert!(net_take(&conn, &claimed, order, 5).unwrap().is_empty(), "eight claims at most");
+        assert!(net_take(&conn, &claimed, order, 5, 8).unwrap().is_empty(), "eight claims at most");
         claimed.lock().unwrap().give_back(&taken[..4]);
-        assert_eq!(net_take(&conn, &claimed, order, 5).unwrap(), &taken[..4], "given back, they are taken again");
+        assert_eq!(net_take(&conn, &claimed, order, 5, 8).unwrap(), &taken[..4], "given back, they are taken again");
         // a claim of fewer than NET_BATCH (few were due) still counts as one
         for ids in taken.chunks(4) {
             claimed.lock().unwrap().give_back(ids);
@@ -670,10 +670,10 @@ mod tests {
         let due = |id: i64| conn.execute("update pp_state set net_next_at = 0 where release_id = ?", [id]).unwrap();
         for id in 100..108 {
             due(id);
-            assert_eq!(net_take(&conn, &claimed, order, 5).unwrap(), [id]);
+            assert_eq!(net_take(&conn, &claimed, order, 5, 8).unwrap(), [id]);
         }
         due(108);
-        assert!(net_take(&conn, &claimed, order, 5).unwrap().is_empty(), "eight claims, however few they hold");
+        assert!(net_take(&conn, &claimed, order, 5, 8).unwrap().is_empty(), "eight claims, however few they hold");
     }
 
     #[test]
