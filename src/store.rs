@@ -838,16 +838,21 @@ pub(crate) fn add_segment(
     a: &Article,
     sealed: &mut SealedCache,
 ) -> Result<bool> {
-    // the release's index has every id of its other files, sealed or not: no guess
+    // the release's index has every id of its files, sealed or not: no guess,
+    // and no blob decoded for an article its own sealed file already has (a
+    // save past its decode budget would keep that one as a row, counted twice
+    // in the release's parts and size till the file seals again)
     let hash = index.map(|(_, key)| key.hash(&a.message_id));
     #[cfg(test)]
     if hash.is_some() {
         LOOKUPS.set(LOOKUPS.get() + 1);
     }
     if let (Some((release_id, _)), Some(hash)) = (index, hash)
-        && conn
-            .prepare_cached("select 1 from release_ids where release_id = ? and id_hash = ? and file_id != ?")?
-            .exists(params![release_id, hash, f.id])?
+        && let Some(file_id) = conn
+            .prepare_cached("select file_id from release_ids where release_id = ? and id_hash = ?")?
+            .query_row(params![release_id, hash], |r| r.get::<_, i64>(0))
+            .optional()?
+        && (file_id != f.id || f.sealed)
     {
         return Ok(false);
     }
@@ -3448,6 +3453,8 @@ mod tests {
             bytes: 100 + part,
             ..Default::default()
         };
+        // as for a release with one file, no index to tell them by: the save past its budget can only guess
+        conn.execute("delete from release_ids where id_hash != 0", []).unwrap();
         let mut writer = ShardWriter::new(shard);
         writer.decode_budget = 0;
         let release = Release {
@@ -3520,6 +3527,53 @@ mod tests {
         assert_eq!(held, 0);
     }
 
+    /// A save past its decode budget that reads a release's articles again
+    /// (a pass read twice after a restart) tells them from the release's
+    /// index, not by guessing: no row, nothing held back, and its parts and
+    /// size stay as they were (they doubled till the files sealed again).
+    #[test]
+    fn a_reread_past_the_decode_budget_is_known_from_the_index() {
+        let (_dir, main) = sealed_fixture();
+        let shard = shard_of("alt.binaries.t");
+        let mut conn = db::open_at(&shard_path(&main, shard)).unwrap();
+        for id in conn.prepare("select id from files").unwrap().query_map([], |r| r.get(0)).unwrap() {
+            seal_file(&conn, id.unwrap()).unwrap();
+        }
+        let totals = |conn: &Connection| -> (i64, i64) {
+            conn.query_row("select parts, size from releases", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap()
+        };
+        let before = totals(&conn);
+        let again = |id: &str, name: &str, part: i64, total: i64| Article {
+            message_id: id.into(),
+            subject: format!("\"{name}\" yEnc ({part}/{total})"),
+            filename: Some(name.into()),
+            part: Some(part),
+            total_parts: Some(total),
+            bytes: 100 + part,
+            ..Default::default()
+        };
+        let mut writer = ShardWriter::new(shard);
+        writer.decode_budget = 0;
+        let release = Release {
+            name: "Rel".into(),
+            group: "alt.binaries.t".into(),
+            articles: vec![
+                again("<a1@x>", "a.rar", 1, 3),
+                again("<0abc12def34@ngPost>", "a.rar", 2, 3),
+                again("<a3@x>", "a.rar", 3, 3),
+                again("<b1@x>", "b.rar", 1, 2),
+            ],
+            ..Default::default()
+        };
+        writer.save(&mut conn, &Ids::new(&main), [std::slice::from_ref(&release)]).unwrap();
+        let count = |conn: &Connection, table: &str| -> i64 {
+            conn.query_row(&format!("select count(*) from {table}"), [], |r| r.get(0)).unwrap()
+        };
+        assert_eq!(count(&conn, "segments"), 0, "every one is in a blob already");
+        assert_eq!(count(&conn, "held_back"), 0);
+        assert_eq!(totals(&conn), before, "parts and size not counted twice");
+    }
+
     /// A file past the most a blob takes never seals, but what a save past
     /// its decode budget held back for it is still settled: a copy of a
     /// sealed article goes with what it said, a new one's totals count.
@@ -3546,6 +3600,8 @@ mod tests {
             bytes: 100 + part,
             ..Default::default()
         };
+        // as for a release with one file, no index to tell them by: the save past its budget can only guess
+        conn.execute("delete from release_ids where id_hash != 0", []).unwrap();
         let mut writer = ShardWriter::new(shard);
         writer.decode_budget = 0;
         // a repost of a1 claiming 5 parts, and a genuinely new 4th of 4
