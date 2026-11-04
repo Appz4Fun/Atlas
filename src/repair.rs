@@ -187,10 +187,11 @@ fn machine(host: &str) -> String {
     host.split('#').next().unwrap_or(host).to_lowercase()
 }
 
-/// Whether two servers' GROUP numbers, (first, last), are one backend's: the same first article, and last ones a
-/// moment of posting apart. Two backends number a group on their own, millions apart.
+/// Whether two servers' GROUP numbers, (first, last), may be one backend's: last ones a moment of posting apart. Two
+/// backends number a group on their own, millions apart. The first can differ: resellers of one backend each keep
+/// it as long as their retention, so it takes `same_ids` to say.
 fn same_spool(a: (u64, u64), b: (u64, u64)) -> bool {
-    a.0 == b.0 && a.1.abs_diff(b.1) <= (a.1.max(b.1) / 100_000).max(1_000)
+    a.1.abs_diff(b.1) <= (a.1.max(b.1) / 100_000).max(1_000)
 }
 
 /// Whether servers `a` and `b` list the same Message-IDs under the same numbers just below `last`: GROUP numbers
@@ -353,6 +354,8 @@ mod tests {
         assert!(same_spool(eweka, newshosting));
         assert!(!same_spool(eweka, xsnews));
         assert!(!same_spool((1, 5_000_000), (1, 9_000_000)), "two backends that both start at 1");
+        // alt.binaries.german.movies on eweka and newshosting: their retention differs, the numbers don't
+        assert!(same_spool((1_153_539_032, 1_153_563_359), (1_153_540_197, 1_153_563_359)));
         assert!(same_spool((1, 900), (1, 1_500)), "a small group");
     }
 
