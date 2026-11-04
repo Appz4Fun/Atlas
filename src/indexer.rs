@@ -283,6 +283,13 @@ pub struct PassSettings {
     pub split_min_backlog: i64,
     /// article numbers a day chunk reaches past its ends (`CHUNK_SAFETY`)
     pub chunk_safety: u64,
+    /// a pass on a server standing in for the group's own one while that is in trouble: GROUP there only (the group's
+    /// home doesnt move), and a cursor started there leaves the group's phase alone
+    pub fallback: bool,
+    /// with `fallback`: the first such pass on this server since the group's own one got into trouble. Its live
+    /// cursor starts at the newest article, since what came before was read on the group's own server (or will be
+    /// once it is back), and a cursor left from an earlier stand-in would read all of it again
+    pub from_top: bool,
 }
 
 impl Default for PassSettings {
@@ -293,6 +300,8 @@ impl Default for PassSettings {
             request_size: DEFAULT_REQUEST_SIZE,
             split_min_backlog: crate::config::SPLIT_MIN_BACKLOG,
             chunk_safety: CHUNK_SAFETY,
+            fallback: false,
+            from_top: false,
         }
     }
 }
@@ -733,24 +742,56 @@ pub async fn run_pass<P>(
 where
     P: FnMut(&Progress) + ?Sized,
 {
+    let mut ran_on = prefer;
+    run_pass_on(ctx, settings, db, group, prefer, progress, &mut ran_on).await
+}
+
+/// `run_pass`, saying in `ran_on` which server the pass went to: `prefer`, or the one a GROUP there moved the group
+/// to (see `Pool::select_group_known`), soo a failure counts against the server it happened on.
+pub async fn run_pass_on<P>(
+    ctx: &PassContext,
+    settings: &PassSettings,
+    db: &Db,
+    group: &str,
+    prefer: usize,
+    progress: &mut P,
+    ran_on: &mut usize,
+) -> Result<Progress>
+where
+    P: FnMut(&Progress) + ?Sized,
+{
+    *ran_on = prefer;
     if crate::filters::group_blocked(group) {
         return Ok(Progress::default());
     }
     // a server that indexed the group before loses it only after several replies in a row that it lacks it
     // (cursors it kept under a key of an earlier build count too, see `cursors_or_adopted`)
-    let known = load_cursors(ctx, db, &cursor_key(&ctx.pool, prefer, group), group, prefer).await?.is_some();
-    let (server, (_count, first, last, _name)) = ctx.pool.select_group_known(prefer, group, known).await?;
+    let (server, (_count, first, last, _name)) = if settings.fallback {
+        (prefer, ctx.pool.select_group_only(prefer, group).await?)
+    } else {
+        let known = load_cursors(ctx, db, &cursor_key(&ctx.pool, prefer, group), group, prefer).await?.is_some();
+        ctx.pool.select_group_known(prefer, group, known).await?
+    };
+    *ran_on = server;
     let (first, last) = (first as i64, last as i64);
     let key = cursor_key(&ctx.pool, server, group);
 
     let state = match load_cursors(ctx, db, &key, group, server).await? {
+        Some(mut s) if settings.fallback && settings.from_top && last >= s.live_cursor => {
+            let k = key.clone();
+            on_db(db, move |conn| Ok(db::update_live_cursor(conn, &k, last)?)).await?;
+            s.live_cursor = last;
+            s
+        }
         Some(s) if last >= s.live_cursor => s,
         // first time both cursors start at the top. if the server renumbered
         // (last went backwards) the group got reset soo start over the same way
         _ => {
             let k = key.clone();
             on_db(db, move |conn| Ok(db::init_group_state(conn, &k, last)?)).await?;
-            ctx.states.with(group, |st| st.phase = Phase::Backfill);
+            if !settings.fallback {
+                ctx.states.with(group, |st| st.phase = Phase::Backfill);
+            }
             db::GroupState { live_cursor: last, backfill_cursor: last }
         }
     };

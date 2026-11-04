@@ -2099,6 +2099,21 @@ impl Pool {
         tier[0]
     }
 
+    /// The servers whose cursors on `group` are its own: where `pick_server_in` puts it with every indexing server up,
+    /// and the home it left for a while and goes back to (`Home::back`).
+    pub fn homes_of(&self, group: &str) -> Vec<usize> {
+        let home = self.pick_server_in(&self.indexing_servers(), group);
+        let back = self.homes.lock().unwrap().get(group).and_then(|h| h.back);
+        std::iter::once(home).chain(back.filter(|&b| b != home)).collect()
+    }
+
+    /// The server `group`'s passes go to while the ones in `not` are failing it: the first `ranked` gives among the
+    /// rest of `tier`, none when no other is left.
+    pub fn fallback_in(&self, tier: &[usize], group: &str, not: &[usize]) -> Option<usize> {
+        let rest: Vec<usize> = tier.iter().copied().filter(|i| !not.contains(i)).collect();
+        self.ranked(&rest, group).first().copied()
+    }
+
     /// `candidates` in the order a group should try them: rendezvous hashing
     /// weighted by connections, soo groups that need another server spread
     /// over all of them in proportion (not all onto the first in the list),
@@ -2512,6 +2527,11 @@ impl Pool {
     /// GROUP on server `i` alone, for probing a server: no falling over to
     /// another server, soo where the group lives stays as it is.
     pub async fn group_on(&self, i: usize, group: &str) -> Result<(u64, u64, u64, String)> {
+        self.select_on(i, group).await
+    }
+
+    /// GROUP on server `i` alone: no falling over, and the group's home stays where it is.
+    pub async fn select_group_only(&self, i: usize, group: &str) -> Result<(u64, u64, u64, String)> {
         self.select_on(i, group).await
     }
 
