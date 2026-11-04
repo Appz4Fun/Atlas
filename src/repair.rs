@@ -106,16 +106,20 @@ async fn round(
                 let g = w.group.clone();
                 on_db(db, move |conn| Ok(indexed_from(conn, &g)?)).await?
             };
-            let others: Vec<usize> = pool
-                .indexing_servers()
-                .into_iter()
-                .filter(|&i| !indexing.contains(&identity(&pool.host(i))))
-                .take(SERVERS)
-                .collect();
-            for server in others {
+            // one provider's accounts share its overview: the group's own, and each one read, rule out their machine
+            let mut seen: HashSet<String> = indexing.iter().map(|h| machine(h)).collect();
+            let mut read_from = 0;
+            for server in pool.indexing_servers() {
                 let host = pool.host(server);
+                if read_from >= SERVERS || !seen.insert(machine(&host)) {
+                    continue;
+                }
                 match reread_window(ctx, settings, db, &w.group, server, (w.from, w.to), MAX_ARTICLES).await {
-                    Ok(p) => println!("[repair] {} {}..{} on {host}: {} headers", w.group, w.from, w.to, p.articles),
+                    Ok(p) => {
+                        read_from += 1;
+                        println!("[repair] {} {}..{} on {host}: {} headers", w.group, w.from, w.to, p.articles);
+                    }
+                    // a failure leaves its share to the next server
                     Err(e) => println!("[repair] {} {}..{} on {host}: {e:#}", w.group, w.from, w.to),
                 }
             }
@@ -138,12 +142,10 @@ async fn round(
     .await
 }
 
-/// A server as its cursors name it (`indexer::cursor_key`): the host in lower case, an explicit `#key` as it is.
-fn identity(host: &str) -> String {
-    match host.split_once('#') {
-        Some((h, k)) => format!("{}#{k}", h.to_lowercase()),
-        None => host.to_lowercase(),
-    }
+/// The machine behind a server's name: host and port, without an explicit `#key`, in lower case. Two accounts at one
+/// provider have the same.
+fn machine(host: &str) -> String {
+    host.split('#').next().unwrap_or(host).to_lowercase()
 }
 
 /// The servers that index `group` already, by its cursors (`group@server`): reading it there again finds the same.
@@ -230,4 +232,16 @@ fn windows_of(conn: &Connection, ids: &[i64]) -> rusqlite::Result<Vec<Window>> {
         .filter(|(group, _)| !group.is_empty())
         .map(|(group, (first, last))| Window { group, from: first - MARGIN, to: last + MARGIN })
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accounts_on_one_provider_are_one_machine() {
+        assert_eq!(machine("news.newshosting.com"), "news.newshosting.com");
+        assert_eq!(machine("News.Newshosting.com#second"), "news.newshosting.com");
+        assert_ne!(machine("127.0.0.1:1190"), machine("127.0.0.1:1191"), "a port is another server");
+    }
 }
