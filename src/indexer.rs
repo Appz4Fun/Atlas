@@ -73,6 +73,9 @@ pub struct Refused {
     pub end: u64,
     pub since: Instant,
     pub tries: u32,
+    /// refused last at: one not asked again for `REFUSED_IDLE` is out of reach
+    /// (past retention, or the group gone) and forgotten
+    pub last: Instant,
     /// passed over, last asked at: kept while it is still asked, soo a day
     /// chunk read again whole passes over it again instead of starting its hour over
     pub passed: Option<Instant>,
@@ -87,6 +90,9 @@ pub const REFUSED_TRIES: u32 = 3;
 /// refused slices still asked again noted per group at most; past it a
 /// refusal isnt noted until there is room
 const REFUSED_KEPT: usize = 1024;
+/// a refusal not asked again this long is forgotten: anything still being
+/// read asks again well within it
+pub const REFUSED_IDLE: Duration = Duration::from_secs(6 * 3600);
 /// passed over ones kept per group at most, the longest not asked go first
 const PASSED_KEPT: usize = 4096;
 
@@ -184,7 +190,10 @@ impl RunStates {
     /// is done) and is forgotten once not asked for `REFUSED_FOR`.
     pub fn refused(&self, group: &str, key: &str, (start, end): (u64, u64), now: Instant) -> bool {
         self.with(group, |st| {
-            st.refused.retain(|r| r.passed.is_none_or(|at| now.saturating_duration_since(at) < REFUSED_FOR));
+            st.refused.retain(|r| match r.passed {
+                Some(at) => now.saturating_duration_since(at) < REFUSED_FOR,
+                None => now.saturating_duration_since(r.last) < REFUSED_IDLE,
+            });
             let passed = |r: &Refused| r.passed.is_some() && r.key == key && r.start <= start && end <= r.end;
             if let Some(r) = st.refused.iter_mut().find(|r| passed(r)) {
                 r.passed = Some(now);
@@ -198,11 +207,20 @@ impl RunStates {
                 if st.refused.iter().filter(|r| r.passed.is_none()).count() >= REFUSED_KEPT {
                     return false;
                 }
-                st.refused.push(Refused { key: key.to_string(), start, end, since: now, tries: 1, passed: None });
+                st.refused.push(Refused {
+                    key: key.to_string(),
+                    start,
+                    end,
+                    since: now,
+                    tries: 1,
+                    last: now,
+                    passed: None,
+                });
                 return false;
             };
             let r = &mut st.refused[at];
             r.tries += 1;
+            r.last = now;
             (r.start, r.end) = (r.start.min(start), r.end.max(end));
             let give_up = r.tries >= REFUSED_TRIES && now.saturating_duration_since(r.since) >= REFUSED_FOR;
             if give_up {
@@ -2242,6 +2260,11 @@ mod tests {
         states.read("g", "g@a", (950, 1049));
         assert!(refused((1050, 1149), REFUSED_FOR), "the rest kept its hour");
         assert!(!refused((1000, 1049), REFUSED_FOR), "the part read starts over");
+
+        // one never asked again (past retention) doesnt keep its room for good
+        assert!(!refused((5000, 5099), REFUSED_FOR));
+        assert!(!refused((5000, 5099), REFUSED_FOR * 2));
+        assert!(!refused((5000, 5099), REFUSED_FOR * 2 + REFUSED_IDLE), "forgotten: starts over");
     }
 
     #[test]
