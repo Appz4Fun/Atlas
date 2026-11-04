@@ -85,6 +85,8 @@ pub struct Server {
     /// the next `.1` XOVERs over a range holding article `.0` answer 503,
     /// like a provider whose overview is in trouble for a while
     pub refuse_xover: Mutex<Option<(u64, usize)>>,
+    /// the first XOVER starting at this number sits on its reply for `stall`
+    pub stall_at: Mutex<Option<u64>>,
 }
 
 impl Server {
@@ -121,6 +123,7 @@ impl Server {
             buffer_listing: false,
             group_replies: Mutex::new(Default::default()),
             refuse_xover: Mutex::new(None),
+            stall_at: Mutex::new(None),
         })
     }
 }
@@ -274,9 +277,18 @@ pub fn serve(stream: TcpStream, state: &Server, over_limit: bool) {
                     thread::sleep(state.stall);
                     state.stalled.fetch_sub(1, Ordering::SeqCst);
                 }
-                state.xovers_in_flight.fetch_sub(1, Ordering::SeqCst);
                 let (a, b) = arg.split_once('-').unwrap();
                 let (a, b): (u64, u64) = (a.parse().unwrap(), b.parse().unwrap());
+                let stall_here = {
+                    let mut at = state.stall_at.lock().unwrap();
+                    *at == Some(a) && at.take().is_some()
+                };
+                if stall_here {
+                    state.stalled.fetch_add(1, Ordering::SeqCst);
+                    thread::sleep(state.stall);
+                    state.stalled.fetch_sub(1, Ordering::SeqCst);
+                }
+                state.xovers_in_flight.fetch_sub(1, Ordering::SeqCst);
                 {
                     let mut refuse = state.refuse_xover.lock().unwrap();
                     if let Some((at, left)) = *refuse

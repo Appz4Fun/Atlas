@@ -1,7 +1,7 @@
 //! Stopping while a request is stuck: a provider that stops answering mid
 //! XOVER must not hold up stopping (SIGTERM / "Stop Indexing") for the read
 //! timeout, the stuck connection must never be handed out again, and the
-//! unfinished pass must not move its cursor.
+//! unfinished pass's cursor must not move past the stuck slice.
 //!
 //! One test, and the environment is set before any thread starts.
 
@@ -105,10 +105,10 @@ fn stop_does_not_wait_for_a_stuck_request() {
     let waited = stopped_at.elapsed();
     assert!(waited < PROMPT, "indexer took {waited:?} to stop with a request stuck");
 
-    // the pass never finished: what was saved stays, the cursor didnt move
+    // the pass never finished: what was saved stays, the cursor didnt move past the stuck top slice
     let db = atlas::db::open().unwrap();
     let cursor: i64 = db.query_row("select backfill_cursor from groups where name = ?", [GROUP], |r| r.get(0)).unwrap();
-    assert_eq!(cursor, 200, "an unfinished pass moved the backfill cursor");
+    assert_eq!(cursor, 200, "the backfill cursor moved past the stuck slice");
     let saved: i64 = db.query_row("select count(*) from releases", [], |r| r.get(0)).unwrap();
     assert!(saved > 0, "the slices that came back were saved");
 

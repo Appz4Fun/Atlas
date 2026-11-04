@@ -1735,6 +1735,34 @@ impl Pass<'_> {
         self.process_range_dated(start, end, kind, None, progress).await
     }
 
+    /// Moves the cursor of `side` past what `finished` holds done of `start..=end` next to it (see `Finished::ends`),
+    /// when that is further than `moved`, the last place this pass moved it to. One that can't be written now is
+    /// moved by the next slice or once the pass ends.
+    async fn advance(&self, side: Side, finished: &Finished, (start, end): (i64, i64), moved: &mut Option<u64>) {
+        let (low, high) = finished.ends(start.max(0) as u64, end.max(0) as u64);
+        let Some(to) = (match side {
+            Side::Up => low,
+            Side::Down => high,
+        }) else {
+            return;
+        };
+        if *moved == Some(to) {
+            return;
+        }
+        let key = self.key.clone();
+        let saved = on_db(self.db, move |conn| {
+            match side {
+                Side::Up => db::update_live_cursor(conn, &key, to as i64)?,
+                Side::Down => db::update_backfill_cursor(conn, &key, to as i64 - 1)?,
+            }
+            Ok(())
+        })
+        .await;
+        if saved.is_ok() {
+            *moved = Some(to);
+        }
+    }
+
     /// `process_range`, also how many articles retrieved are dated within
     /// `window` (unix seconds, from up to before), 0 when there is none.
     async fn process_range_dated<P>(
@@ -1778,7 +1806,19 @@ impl Pass<'_> {
         // dated ends of what this pass saved, for the stats dashboard's history numbers
         let (mut low, mut high): (Option<db::Dated>, Option<db::Dated>) = (None, None);
 
-        while let Some(slice) = rx.recv().await {
+        // the cursor this pass moves goes on past what's done as the slices come in, not only once the pass ends: with
+        // the writers busy a pass can take longer than prod runs between restarts, and one cut short kept nothing
+        let side = match kind {
+            "LIVE" => Some(Side::Up),
+            "BACKFILL" | "SWEEP" => Some(Side::Down),
+            _ => None,
+        };
+        let mut moved = None;
+        loop {
+            if let Some(side) = side {
+                self.advance(side, &finished, (start, end), &mut moved).await;
+            }
+            let Some(slice) = rx.recv().await else { break };
             // the slice's room in the unsaved budget goes back once it's parsed
             // (or skipped)
             let unsaved = slice.unsaved;
@@ -1907,6 +1947,13 @@ pub async fn reread_window(
     let pass = Pass { ctx, settings, db, group, server, key };
     let mut quiet = no_progress;
     pass.process_range(start as i64, end as i64, "repair", &mut quiet).await.into_result()
+}
+
+/// Which way a pass's cursor goes: up (live, from the cursor to the newest) or down (backfill and sweeps).
+#[derive(Clone, Copy)]
+enum Side {
+    Up,
+    Down,
 }
 
 /// How a range pass went. `low_done` / `high_done`: the range is done from
