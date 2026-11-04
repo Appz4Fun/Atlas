@@ -47,6 +47,40 @@ fn lowers_connections_to_what_the_provider_allows() {
     assert!(pool.pool.connections(0) >= 1);
 }
 
+/// A limit lowered by refusals climbs back towards the configured count: a provider refuses for a while, and the
+/// configured connections are what atlas should get back to.
+#[test]
+fn a_lowered_connection_limit_climbs_back() {
+    let mut state = Server::new(posts(400));
+    {
+        let s = Arc::get_mut(&mut state).unwrap();
+        s.max_conns = 3;
+        s.xover_delay = Duration::from_millis(50);
+    }
+    let port = spawn_server(state.clone());
+    let pool = BlockingPool::from_pool(
+        atlas::nntp::Pool::new(&[mock(port, "secret", 8, 1)]).with_limit_heal(Duration::from_millis(100)),
+    );
+    pool.connect().unwrap();
+    let slices: Vec<(u64, u64)> = (0..20).map(|i| (i * 20 + 1, i * 20 + 20)).collect();
+    let ok = pool.block_on(async {
+        let mut rx = pool.pool.stream_headers(GROUP, 0, slices, Arc::new(AtomicBool::new(false)));
+        let mut ok = 0;
+        while let Some(slice) = rx.recv().await {
+            ok += slice.result.is_ok() as usize;
+        }
+        ok
+    });
+    assert_eq!(ok, 20);
+    let lowered = pool.pool.connections(0);
+    assert!(lowered <= 3, "lowered to the provider's limit, got {lowered}");
+
+    // once due, the next request takes one more permit back
+    std::thread::sleep(Duration::from_millis(250));
+    assert_eq!(pool.fetch_headers(GROUP, 1, 20).unwrap().len(), 20);
+    assert_eq!(pool.pool.connections(0), lowered + 1, "a step back up");
+}
+
 /// A server that answers GROUP with 501 (fill / bonus servers) is switched to
 /// article lookups only and its groups go to a server that can index.
 #[test]
