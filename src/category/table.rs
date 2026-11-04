@@ -69,19 +69,7 @@ pub const TABLE: &[Root] = &[
             s(3999, "Other"),
         ],
     },
-    Root {
-        id: 4000,
-        name: "PC",
-        subs: &[
-            s(4010, "0day"),
-            s(4020, "ISO"),
-            s(4030, "Mac"),
-            s(4040, "Phone-Other"),
-            s(4050, "Games"),
-            s(4060, "Phone-IOS"),
-            s(4070, "Phone-Android"),
-        ],
-    },
+    // no PC (4000): what the rules call PC is junk and deleted, see `junk`
     Root {
         id: 5000,
         name: "TV",
@@ -233,8 +221,15 @@ mod tests {
     }
 
     #[test]
-    fn the_table_has_70_leaves() {
-        assert_eq!(TABLE.iter().map(|r| r.subs.len()).sum::<usize>(), 70);
+    fn the_table_has_63_leaves() {
+        assert_eq!(TABLE.iter().map(|r| r.subs.len()).sum::<usize>(), 63);
+    }
+
+    #[test]
+    fn there_is_no_pc() {
+        assert_eq!(label(4010), None);
+        assert_eq!(parse_filter("4000"), Some(CatFilter { leaves: vec![], uncategorized: false }));
+        assert!(!caps_xml().contains("id=\"4000\""));
     }
 
     #[test]

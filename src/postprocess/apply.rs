@@ -43,6 +43,8 @@ pub(crate) struct Applied {
     pub queue_at: Option<i64>,
     /// nothing worth a `pp_state` row
     pub no_state: bool,
+    /// deleted, with why, in place of all else here (see `junk`)
+    pub junk: Option<&'static str>,
 }
 
 /// Names a transaction wrote: each one's source, and whether it was the first
@@ -130,6 +132,14 @@ fn write(conn: &Connection, mut a: Applied, now: i64, renames: &mut Renames) -> 
         .optional()?;
     let dropped = stale.filter(|(differs, _)| *differs).map(|(_, mask)| mask);
     let is_stale = dropped.is_some();
+    // a program stays a program, but a PC verdict rests on the name and files the run saw: a rerun asked for since (a
+    // rename) drops it, and `junk::remove` looks for a video that came meanwhile
+    if let Some(reason) = a.junk {
+        if !(is_stale && reason == crate::junk::PC) {
+            crate::junk::remove(conn, a.release_id, reason, now)?;
+        }
+        return Ok(());
+    }
     let dropped = dropped.unwrap_or(0);
 
     for (step, w) in a.writes.drain(..) {

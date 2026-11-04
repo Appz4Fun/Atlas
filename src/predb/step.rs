@@ -267,6 +267,7 @@ impl Step for PredbMatch {
             facts,
             wait_until: None,
             hold: Some(Box::new(hold)),
+            junk: None,
         })
     }
 }

@@ -1474,7 +1474,8 @@ mod tests {
     fn only_leaves_are_stored() {
         for (name, group, _) in TABLE {
             let d = category(name, group);
-            if stores(&d) {
+            // PC has no leaves left: the step deletes what lands there, see `junk`
+            if stores(&d) && !crate::junk::is_pc(d.category) {
                 assert!(super::super::table::is_leaf(d.category), "{name}: {}", d.category);
             }
         }

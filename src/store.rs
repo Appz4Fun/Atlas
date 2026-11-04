@@ -1595,6 +1595,7 @@ impl ShardWriter {
         let (mut new_releases, mut new_articles) = (0i64, 0i64);
         // inline names this save changes, for the metrics once it's committed
         let mut renames = crate::postprocess::apply::Renames::new();
+        let mut junk_rows: Vec<(String, String)> = Vec::new();
         {
             let mut upsert = tx.prepare_cached(
                 "insert into releases
@@ -1627,6 +1628,22 @@ impl ShardWriter {
                 let name = collection.as_ref().map_or(release.name.as_str(), |c| c.name.as_str());
                 // what the row's name is, not what this slice's files happen to be called
                 let is_obfuscated = collection.as_ref().map_or(release.is_obfuscated, |c| c.is_obfuscated);
+                // a program in it: the release goes, with what it had, and so does all that comes for it later
+                if crate::junk::is_junk(&tx, name, &release.group)?
+                    || collection.as_ref().map(|c| crate::junk::is_junk_collection(&tx, c.key)).transpose()?
+                        == Some(true)
+                {
+                    continue;
+                }
+                if release.articles.iter().any(|a| a.filename.as_deref().is_some_and(crate::junk::is_executable)) {
+                    crate::junk::remember(&tx, name, &release.group, crate::junk::EXECUTABLE, now)?;
+                    if let Some(c) = &collection {
+                        crate::junk::remember_collection(&tx, c.key)?;
+                    }
+                    // its row goes after the loop: ids this save still holds must not be freed for reuse under it
+                    junk_rows.push((name.to_string(), release.group.clone()));
+                    continue;
+                }
                 let id = global_id(ids.next()?, shard);
                 if let Some(first) = release
                     .display_name
@@ -1770,6 +1787,9 @@ impl ShardWriter {
             }
 
             add_totals(&tx, new_releases, new_articles)?;
+            for (name, group) in &junk_rows {
+                crate::junk::remove_by_key(&tx, name, group, crate::junk::EXECUTABLE, now)?;
+            }
         }
 
         let t = Instant::now();
@@ -2803,7 +2823,10 @@ mod tests {
         assert_eq!(tool, None);
         assert_eq!(first, Some(1_503_379_236_000));
         assert!(last >= first);
-        assert_eq!((host.as_deref(), key.as_deref(), n_first, n_last), (Some("fx09.am4"), Some("JP7"), Some(546_176), Some(546_180)));
+        assert_eq!(
+            (host.as_deref(), key.as_deref(), n_first, n_last),
+            (Some("fx09.am4"), Some("JP7"), Some(546_176), Some(546_180))
+        );
         // a Nyuu id of the same file: the tool, and its own clock widens the span
         save(&main, &[release(vec![art("<ZjPsQyLgOjNtQvXbHeKaXyCm1730295651235@nyuu>", 3)])]).unwrap();
         let (tool, first, last, host, key, _, _) = row();

@@ -71,7 +71,15 @@ impl Step for CategoryStep {
     }
     fn run(&self, ctx: &mut StepCtx<'_>) -> Result<Outcome, StepError> {
         let id = ctx.release().id;
-        let d = classify_release(ctx.release(), &self.options.read().unwrap());
+        let mut d = classify_release(ctx.release(), &self.options.read().unwrap());
+        // there is no PC category: a PC match is junk, unless it has video, which then goes uncategorized
+        if crate::junk::is_pc(d.category) {
+            let files = ctx.files().map_err(|e| StepError::Retry(e.to_string()))?;
+            if crate::junk::pc_is_junk(files.iter().map(|f| f.filename.as_str())) {
+                return Ok(Outcome { junk: Some(crate::junk::PC), ..Outcome::default() });
+            }
+            d = super::Decision { category: super::UNCATEGORIZED, confidence: 0, rule: "no_match" };
+        }
         if stores(&d) {
             let category = super::label(d.category).unwrap_or_else(|| d.category.to_string());
             let root = super::label(super::root_of(d.category)).unwrap_or_else(|| "Other".into());
