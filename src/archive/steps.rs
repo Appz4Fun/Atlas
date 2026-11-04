@@ -18,10 +18,10 @@ use crate::store::{self, FileInfo, SegmentPick, SegmentRef};
 
 use super::names::{best_name, collapse_volumes, looks_random, stem};
 use super::select::{self, Head, Kind};
-use super::store::{self as archive_store, SOURCE_7Z, SOURCE_PAR2, SOURCE_RAR, SOURCE_ZIP};
+use super::store::{self as archive_store, SOURCE_7Z, SOURCE_NZB, SOURCE_PAR2, SOURCE_RAR, SOURCE_ZIP};
 use super::{
     ARTICLE_CAP, Format, InnerFile, Listing, NAME_SOURCE_INNER, NAME_SOURCE_PAR2, PROBE_PREFIX, RERUN_ON_INNER_FILES,
-    identify, rar, sevenz, zip,
+    identify, nzb, rar, sevenz, zip,
 };
 
 fn retry(e: impl std::fmt::Display) -> StepError {
@@ -67,6 +67,26 @@ fn fetch_start(ctx: &mut StepCtx<'_>, seg: &SegmentRef, file: &str) -> Result<Op
         Got::Body(body) => Some(body),
         Got::Missing | Got::TooBig | Got::Refused(_) => None,
     })
+}
+
+/// A small file's every article, decoded and joined in order, within the budget. None: one isnt indexed or
+/// came to nothing, or the file is more than a list should be.
+fn whole_file(ctx: &mut StepCtx<'_>, file: &FileInfo, left: &mut usize) -> Result<Option<Vec<u8>>, StepError> {
+    let parts = file.expected.unwrap_or(0).max(file.parts_seen);
+    let segs = ctx.segments(file.id, &SegmentPick::First(parts.max(0) as usize)).map_err(retry)?;
+    let in_order = segs.iter().enumerate().all(|(i, s)| s.part.is_none_or(|p| p == i as i64 + 1));
+    if segs.is_empty() || segs.len() as i64 != parts || !in_order || segs.len() > *left {
+        return Ok(None);
+    }
+    let mut whole = Vec::new();
+    for seg in &segs {
+        let Some(body) = budgeted(ctx, seg, &file.filename, left)? else { return Ok(None) };
+        whole.extend(body);
+        if whole.len() > nzb::MAX_NZB_BYTES {
+            return Ok(None);
+        }
+    }
+    Ok(Some(whole))
 }
 
 fn listing_of(inventory: par2::Inventory) -> Listing {
@@ -145,6 +165,8 @@ fn finish_with_override(
         duplicates::one_archive_set(files.iter().map(|f| f.filename.as_str()))
     };
     let content = match content_override {
+        // what a posted NZB lists is another post's files, not what this one holds
+        _ if source == SOURCE_NZB => None,
         Some(fp) => fp,
         None => (listing.complete && !listing.damaged && speaks_for_release)
             .then(|| duplicates::content_fingerprint(listing.files.iter().map(|f| (f.name.as_str(), f.size))))
@@ -159,7 +181,7 @@ fn finish_with_override(
             content_id: &content_id,
             source,
             files: &rows,
-            password: (source != SOURCE_PAR2).then(|| pw.code()),
+            password: (source != SOURCE_PAR2 && source != SOURCE_NZB).then(|| pw.code()),
             encryption: listing.encryption.map(super::Encryption::code),
             names_hidden: listing.headers_encrypted,
             password_check: check_bytes.as_deref(),
@@ -172,14 +194,16 @@ fn finish_with_override(
         });
     }
     // a PAR2 set of archive volumes says nothing about what's inside them: that's the archive step's to say
-    let leaves_it = source == SOURCE_PAR2 && duplicates::lists_archives(listing.files.iter().map(|f| f.name.as_str()));
+    let leaves_it = source == SOURCE_NZB
+        || source == SOURCE_PAR2 && duplicates::lists_archives(listing.files.iter().map(|f| f.name.as_str()));
     if !leaves_it {
         writes.push(match content {
             Some(content) => StepWrite::new(duplicates::SET_CONTENT, vec![id.into(), content.into()]),
             None => StepWrite::new(duplicates::CLEAR_CONTENT, vec![id.into()]),
         });
     }
-    if source != SOURCE_PAR2 {
+    // no archive was read, soo no password to tell
+    if source != SOURCE_PAR2 && source != SOURCE_NZB {
         writes.push(StepWrite::new(archive_store::UPSERT_RELEASE, vec![id.into(), pw.code().into()]));
         if listing.encryption.is_some() || listing.headers_encrypted || listing.password_check.is_some() {
             writes.push(StepWrite::new(
@@ -630,7 +654,15 @@ impl Step for ListStep {
                 }
                 // images: stop, with at most a prefix read
                 Format::Image => return Ok(Outcome::default()),
-                Format::Media | Format::Unknown => continue,
+                // as a planned head it's an archive's name on something else: what a posted NZB lists is below
+                Format::Nzb | Format::Media | Format::Unknown => continue,
+            }
+        }
+        // no archive told what this is: a posted NZB can, by the files of the post it points to
+        for file in select::nzb_sources(&files) {
+            let Some(body) = whole_file(ctx, file, &mut left)? else { continue };
+            if identify(&body) == Format::Nzb {
+                return finish(ctx, SOURCE_NZB, nzb::list(&body), &limits);
             }
         }
         let rel = ctx.release();

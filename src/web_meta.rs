@@ -19,7 +19,7 @@ use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 
 use crate::api::{ApiResponse, escape};
-use crate::archive::store::{InnerFileRow, InnerView, SOURCE_7Z, SOURCE_PAR2, SOURCE_RAR, SOURCE_ZIP};
+use crate::archive::store::{InnerFileRow, InnerView, SOURCE_7Z, SOURCE_NZB, SOURCE_PAR2, SOURCE_RAR, SOURCE_ZIP};
 use crate::keys::Kind;
 use crate::naming::NameSource;
 use crate::release_info::{self, Contents, Names};
@@ -56,6 +56,7 @@ pub(crate) fn meta_html(conn: Option<&Connection>, i: &MetaInputs<'_>) -> String
     let mut l = look(conn, i.release.id);
     if let Some(conn) = conn {
         l.same = same_counts(conn, i, &l);
+        l.points_to = nzb_targets(conn, i);
     }
     panels_html(i, &l)
 }
@@ -188,6 +189,8 @@ struct Looked {
     timing: Vec<FileTiming>,
     /// how many other releases share each key, full page only; a kind with none is left out
     same: Vec<(crate::keys::Kind, i64)>,
+    /// a posted NZB's: the names its files give, each with the releases of that name, full page only
+    points_to: Vec<(String, Vec<ReleaseRow>)>,
 }
 
 /// One `file_timing` row (`store::FILE_TIMING`): what the overview said about a file's articles, folded at
@@ -1529,8 +1532,70 @@ fn inside_panel(i: &MetaInputs<'_>, l: &Looked, compact: bool) -> Facts {
         f.add("Packed by", Some(tells.join("; ")));
     }
     f.add("Listed from", listing_source(i.inner));
+    f.add_html("Points to", points_to_html(&l.points_to));
     f.add("PAR2", repair_capacity(i.contents));
     f
+}
+
+/// The names of the files a posted NZB lists, as a save would name their release, PAR2 files last. At most 3.
+fn nzb_release_names(inner: &InnerView) -> Vec<String> {
+    let mut rows: Vec<&InnerFileRow> = inner.files.iter().filter(|r| r.source == SOURCE_NZB).collect();
+    rows.sort_by_key(|r| r.name.to_ascii_lowercase().ends_with(".par2"));
+    let mut names: Vec<String> = Vec::new();
+    for row in rows {
+        let name = crate::parser::strip_release_suffixes(crate::archive::names::base_name(&row.name));
+        if !name.is_empty() && !names.iter().any(|n| n.eq_ignore_ascii_case(&name)) && names.len() < 3 {
+            names.push(name);
+        }
+    }
+    names
+}
+
+/// The releases a posted NZB points to, by name in every shard, not this one: up to 5 a name.
+fn nzb_targets(conn: &Connection, i: &MetaInputs<'_>) -> Vec<(String, Vec<ReleaseRow>)> {
+    let own = i.release.id;
+    nzb_release_names(i.inner)
+        .into_iter()
+        .map(|name| {
+            let mut found = Vec::new();
+            for shard in 0..store::SHARDS {
+                let sql = format!("select id from s{shard}.releases where name = ?1 and id != ?2 order by id limit 5");
+                let ids: Vec<i64> = conn
+                    .prepare(&sql)
+                    .and_then(|mut stmt| stmt.query_map(rusqlite::params![name, own], |r| r.get(0))?.collect())
+                    .unwrap_or_default();
+                found.extend(ids.into_iter().filter_map(|id| crate::search::get_release_with(conn, id).ok().flatten()));
+            }
+            found.truncate(5);
+            (name, found)
+        })
+        .collect()
+}
+
+/// each name a posted NZB gives, linked to the releases of that name, or said not to be here
+fn points_to_html(targets: &[(String, Vec<ReleaseRow>)]) -> Option<String> {
+    let lines: Vec<String> = targets
+        .iter()
+        .map(|(name, found)| {
+            if found.is_empty() {
+                return format!("{} <span class=\"dim\">(not indexed here)</span>", escape(name));
+            }
+            let links: Vec<String> = found
+                .iter()
+                .map(|r| {
+                    let state = if r.complete { "complete" } else { "incomplete" };
+                    format!(
+                        "<a href=\"/ui/release?id={}\">{}</a> <span class=\"dim\">in {}, {state}</span>",
+                        r.id,
+                        escape(&r.name),
+                        escape(&r.group_name)
+                    )
+                })
+                .collect();
+            links.join("<br>")
+        })
+        .collect();
+    (!lines.is_empty()).then(|| lines.join("<br>"))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -1849,6 +1914,7 @@ fn listing_source(inner: &InnerView) -> Option<String> {
             SOURCE_RAR => Some("the RAR headers"),
             SOURCE_7Z => Some("the 7z headers"),
             SOURCE_ZIP => Some("the ZIP headers"),
+            SOURCE_NZB => Some("the posted NZB"),
             _ => None,
         })
         .collect();
@@ -2563,7 +2629,38 @@ mod tests {
             id_key: None,
             timing: Vec::new(),
             same: Vec::new(),
+            points_to: Vec::new(),
         }
+    }
+
+    #[test]
+    fn a_posted_nzb_points_to_releases_by_the_names_its_files_give() {
+        let row = |seq, name: &str, source| InnerFileRow { seq, name: name.into(), size: Some(1), source };
+        let inner = InnerView {
+            files: vec![
+                row(0, "Some.Movie.2016-GRP.par2", SOURCE_NZB),
+                row(1, "Some.Movie.2016-GRP.part01.rar", SOURCE_NZB),
+                row(2, "Other.Thing.mkv", SOURCE_RAR),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(nzb_release_names(&inner), ["Some.Movie.2016-GRP"]);
+        assert!(nzb_release_names(&self::inner()).is_empty());
+        let found = ReleaseRow {
+            id: 9,
+            name: "Some.Movie.2016-GRP".into(),
+            group_name: "alt.binaries.x".into(),
+            complete: true,
+            ..Default::default()
+        };
+        let html = points_to_html(&[("Some.Movie.2016-GRP".into(), vec![found]), ("<b>".into(), vec![])]).unwrap();
+        assert!(html.contains("<a href=\"/ui/release?id=9\">Some.Movie.2016-GRP</a>"), "{html}");
+        assert!(
+            html.contains("in alt.binaries.x, complete")
+                && html.contains("&lt;b&gt; <span class=\"dim\">(not indexed here)"),
+            "{html}"
+        );
+        assert_eq!(points_to_html(&[]), None);
     }
 
     /// What the release page hands over: a well-posted scene movie, probed down to its media.

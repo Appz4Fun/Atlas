@@ -748,3 +748,89 @@ fn a_rerun_past_the_quota_keeps_what_was_stored() {
     assert_eq!(rows(&h, "x"), before);
     assert_eq!(meta(&h, "archive_names_over_quota"), Some(1));
 }
+
+/// an NZB of `files`, each `(subject, [segment bytes])`
+fn an_nzb(files: &[(&str, &[u64])]) -> Vec<u8> {
+    let mut out = String::from(
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\">\n",
+    );
+    for (subject, segments) in files {
+        out.push_str(&format!(
+            "<file poster=\"p\" date=\"1\" subject=\"{subject}\"><groups><group>a.b</group></groups><segments>"
+        ));
+        for (i, bytes) in segments.iter().enumerate() {
+            out.push_str(&format!("<segment bytes=\"{bytes}\" number=\"{}\">{i}@x</segment>", i + 1));
+        }
+        out.push_str("</segments></file>\n");
+    }
+    out.push_str("</nzb>\n");
+    out.into_bytes()
+}
+
+const POINTED_AT: &[(&str, &[u64])] = &[
+    ("Pointed.At.2016.2160p-GRP.part1.rar (1/2)", &[640_000, 640_000]),
+    ("Pointed.At.2016.2160p-GRP.part2.rar (1/1)", &[1_000]),
+    ("Pointed.At.2016.2160p-GRP.par2 (1/1)", &[8_600]),
+];
+
+#[test]
+fn a_posted_nzb_lists_the_files_it_points_to() {
+    let mut h = fresh();
+    let s = shape("x").one("x.nzb", &an_nzb(POINTED_AT));
+    let state = serve(&mut h, &s, config());
+    settled(&h, "x");
+    assert_eq!(bodies(&state), 1);
+    let found: Vec<(String, Option<i64>, i64)> =
+        rows(&h, "x").into_iter().map(|r| (r.name, r.size, r.source)).collect();
+    // one row a set, as every listing keeps them: its volumes and PAR2 files summed
+    assert_eq!(found, [("Pointed.At.2016.2160p-GRP.part1.rar".to_string(), Some(1_289_600), 5)]);
+    // not an archive: no password to tell, and not what this post holds
+    assert_eq!(pass(&h, "x"), None);
+    let content: Option<Vec<u8>> = h
+        .shard()
+        .query_row("select content from release_fingerprint where release_id = ?", [h.id_of("x")], |r| r.get(0))
+        .unwrap_or(None);
+    assert_eq!(content, None);
+}
+
+#[test]
+fn a_posted_nzb_of_two_articles_is_read_whole() {
+    let mut h = fresh();
+    let whole = an_nzb(POINTED_AT);
+    let (head, tail) = whole.split_at(whole.len() / 2);
+    let s = shape("x").add("x.nzb", 1, 2, yenc_body("x.nzb", head)).add("x.nzb", 2, 2, yenc_body("x.nzb", tail));
+    let state = serve(&mut h, &s, config());
+    settled(&h, "x");
+    assert_eq!(bodies(&state), 2);
+    assert_eq!(rows(&h, "x").len(), 1);
+}
+
+#[test]
+fn a_posted_nzb_missing_an_article_is_not_read() {
+    let mut h = fresh();
+    let whole = an_nzb(POINTED_AT);
+    let s = shape("x").add("x.nzb", 1, 2, yenc_body("x.nzb", &whole));
+    let state = serve(&mut h, &s, config());
+    settled(&h, "x");
+    assert_eq!(bodies(&state), 0);
+    assert!(rows(&h, "x").is_empty());
+}
+
+#[test]
+fn an_obfuscated_post_of_an_nzb_is_named_after_what_it_points_to() {
+    let mut h = fresh();
+    let s = shape("Xk3Mz9PqL").obfuscated().one("Xk3Mz9PqL.nzb", &an_nzb(POINTED_AT));
+    serve(&mut h, &s, config());
+    settled(&h, &s.name);
+    assert_eq!(naming(&h, &s.name), (Some("Pointed.At.2016.2160p-GRP".into()), Some(15)));
+}
+
+#[test]
+fn an_archive_is_read_before_a_posted_nzb() {
+    let mut h = fresh();
+    let s = shape("x").one("x.rar", &a_rar5("Inner.mkv")).dark("x.nzb", 1, 1);
+    let state = serve(&mut h, &s, config());
+    settled(&h, "x");
+    assert_eq!(bodies(&state), 1);
+    assert_eq!(rows(&h, "x")[0].source, 2);
+}
