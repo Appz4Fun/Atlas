@@ -266,3 +266,64 @@ fn an_empty_range_answered_420_is_just_empty() {
         conn.query_row("select backfill_cursor from groups where name = ?", [GROUP], |r| r.get(0)).unwrap();
     assert_eq!(cursor, 0, "the backfill went all the way down");
 }
+
+/// One rejected login is a short rest like any failed connect: some providers word a connection limit or a hiccup
+/// like a bad password. Two in a row are the long rest, and a login that works clears the count.
+#[test]
+fn one_rejected_login_is_only_a_short_rest() {
+    let state = Server::new(posts(20));
+    state.reject_logins.store(1, Ordering::SeqCst);
+    let port = spawn_server(state.clone());
+    let pool = BlockingPool::new(&[mock(port, "secret", 2, 1)]);
+    let status = || pool.pool.server_stats()[0].state;
+
+    assert!(pool.connect().is_err());
+    assert_eq!(status(), "resting", "one rejection: a short rest");
+    pool.connect().unwrap();
+    assert_eq!(status(), "ok");
+
+    // a login that worked started the count over: one more is short again, a second in a row is the long rest
+    state.reject_logins.store(2, Ordering::SeqCst);
+    pool.pool.disconnect();
+    assert!(pool.connect().is_err());
+    assert_eq!(status(), "resting");
+    assert!(pool.connect().is_err());
+    assert_eq!(status(), "login rejected", "two in a row: the long rest");
+}
+
+/// Compressed headers that couldnt be read are asked for again after a while, on probation: one more unreadable
+/// listing turns them off again, and the slice still comes back plain.
+#[test]
+fn compression_is_tried_again_after_a_while() {
+    let mut state = Server::new(posts(40));
+    {
+        let s = Arc::get_mut(&mut state).unwrap();
+        s.compress = true;
+        s.compress_broken = true;
+    }
+    let port = spawn_server(state.clone());
+    let pool = BlockingPool::from_pool(
+        atlas::nntp::Pool::new(&[mock(port, "secret", 2, 1)]).with_compress_retry(Duration::from_millis(200)),
+    );
+    pool.connect().unwrap();
+    let asked = || state.compress_asked.load(Ordering::SeqCst);
+
+    assert_eq!(pool.fetch_headers(GROUP, 1, 20).unwrap().len(), 20, "read plain after the broken listing");
+    let before = asked();
+    assert!(before >= 1);
+
+    // off: new connections are plain
+    pool.pool.disconnect();
+    assert_eq!(pool.fetch_headers(GROUP, 1, 20).unwrap().len(), 20);
+    assert_eq!(asked(), before, "still off");
+
+    // after the rest it is asked for again; one broken listing turns it off again, and the slice still comes back
+    std::thread::sleep(Duration::from_millis(300));
+    pool.pool.disconnect();
+    assert_eq!(pool.fetch_headers(GROUP, 21, 40).unwrap().len(), 20);
+    let retried = asked();
+    assert!(retried > before, "asked for compression again");
+    pool.pool.disconnect();
+    assert_eq!(pool.fetch_headers(GROUP, 1, 20).unwrap().len(), 20);
+    assert_eq!(asked(), retried, "off again after one more broken listing");
+}
