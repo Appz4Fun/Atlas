@@ -79,7 +79,7 @@ async fn round(
     stopping: &impl Fn() -> bool,
 ) -> anyhow::Result<()> {
     let now = chrono::Utc::now().timestamp();
-    let found = tokio::task::spawn_blocking(move || db::with_reader(|conn| Ok(find(conn, now)?))).await??;
+    let found = tokio::task::spawn_blocking(move || db::with_reader(|conn| find(conn, now))).await??;
     let pool = &ctx.pool;
     for w in found.windows.iter().take(PER_ROUND) {
         if stopping() {
