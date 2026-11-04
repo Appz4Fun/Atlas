@@ -639,13 +639,14 @@ fn exact_split_post(conn: &Connection, posted: &str, release: &crate::search::Re
     let by_poster = same_poster_post(conn, &same)?;
     // one poster can have several of the groups: the post across posters is taken only if it holds all of those
     match (by_poster, across_posters(conn, release.id, &named)?) {
-        (Some(one), Some(across))
-            if across.ids.len() > one.ids.len() && one.ids.iter().all(|id| across.ids.binary_search(id).is_ok()) =>
+        // a row of the poster's post may be in the other as a crosspost of it
+        (Some(one), Some((across, covers)))
+            if one.ids.iter().all(|id| covers.contains(id)) && covers.len() > one.ids.len() =>
         {
             Ok(Some(across))
         }
         (Some(one), _) => Ok(Some(one)),
-        (None, across) => Ok(across),
+        (None, across) => Ok(across.map(|(post, _)| post)),
     }
 }
 
@@ -675,7 +676,7 @@ const ACROSS_POSTERS_ROWS: usize = 32;
 /// soo rows join only where they fill each other's gaps, file by file, under the same subject, and a row that is a
 /// crosspost of another (the same parts of the same files) is left out of the post, its group kept. Rows are taken
 /// lowest id first whichever row asks, soo every row of the post gets the same answer.
-fn across_posters(conn: &Connection, anchor: i64, named: &[Named]) -> Result<Option<SplitPost>> {
+fn across_posters(conn: &Connection, anchor: i64, named: &[Named]) -> Result<Option<(SplitPost, Vec<i64>)>> {
     let Some(anchor_date) = named.iter().find(|n| n.id == anchor).and_then(|n| n.date) else { return Ok(None) };
     let mut close: Vec<&Named> =
         named.iter().filter(|n| n.date.is_some_and(|d| (d - anchor_date).abs() <= SPLIT_POST_DAYS)).collect();
@@ -699,18 +700,24 @@ fn across_posters(conn: &Connection, anchor: i64, named: &[Named]) -> Result<Opt
     }
     let mut chosen: Vec<i64> = Vec::new();
     let mut union = UnionFiles::default();
-    for (n, files) in &kept {
-        if chosen.is_empty() {
+    // again over the rows left whenever one joins: a row can share a file only with one that comes later
+    let mut grew = true;
+    while grew {
+        grew = false;
+        for (n, files) in &kept {
+            if chosen.contains(&n.id) {
+                continue;
+            }
+            if !chosen.is_empty() {
+                let shares = files.files.keys().any(|f| union.files.contains_key(f));
+                if !shares || !union.fills_gaps(files) {
+                    continue;
+                }
+            }
             chosen.push(n.id);
             union = union_files(conn, &chosen)?;
-            continue;
+            grew = true;
         }
-        let shares = files.files.keys().any(|f| union.files.contains_key(f));
-        if !shares || !union.fills_gaps(files) {
-            continue;
-        }
-        chosen.push(n.id);
-        union = union_files(conn, &chosen)?;
     }
     let anchor_in = chosen.contains(&anchor) || copies.iter().any(|(n, of)| n.id == anchor && chosen.contains(of));
     if chosen.len() < 2 || !anchor_in || !union.one_upload() {
@@ -730,7 +737,11 @@ fn across_posters(conn: &Connection, anchor: i64, named: &[Named]) -> Result<Opt
     }
     let size = rows.iter().map(|n| n.bytes).sum();
     chosen.sort_unstable();
-    Ok(Some(SplitPost { ids: chosen, groups, size, complete: union.complete(), lead: None, recovery: Vec::new() }))
+    // what the post stands for: its rows and their crossposts
+    let mut covers = chosen.clone();
+    covers.extend(copies.iter().filter(|(_, of)| chosen.contains(of)).map(|(n, _)| n.id));
+    let post = SplitPost { ids: chosen, groups, size, complete: union.complete(), lead: None, recovery: Vec::new() };
+    Ok(Some((post, covers)))
 }
 
 #[derive(Clone)]
@@ -1697,7 +1708,8 @@ mod tests {
                     id * 16 + at as i64,
                     id,
                     file,
-                    format!("[{}/2] - \"{file}\" yEnc ({}/{of})", at + 1, parts[0]),
+                    // the post's counter: the film first, its volumes second, whichever row has them
+                    format!("[{}/2] - \"{file}\" yEnc ({}/{of})", if file.ends_with(".mkv") { 1 } else { 2 }, parts[0]),
                     of,
                     bits
                 ],
@@ -1752,6 +1764,41 @@ mod tests {
             let post = whole_post_with(&conn, &row_of(&conn, i, g)).unwrap().unwrap();
             assert_eq!(post.ids.len(), 3, "row {i}");
         }
+    }
+
+    #[test]
+    fn a_row_that_only_a_later_row_links_still_joins() {
+        let (_dir, conn) = all_shards();
+        let name = "Some.Film.2007.2160p.UHD.BluRay.REMUX.DV.HDR.HEVC.Atmos-GRP";
+        let (mkv, vol) = ("Some.Film.mkv", "Some.Film.vol00+01.par2");
+        let (a, b, c) = ("alt.binaries.a", "alt.binaries.b", "alt.binaries.c");
+        put_row(&conn, 1, name, a, "x1@nyuu", &[(mkv, &[1, 2], 4)]);
+        put_row(&conn, 2, name, b, "x2@nyuu", &[(vol, &[1], 2)]);
+        put_row(&conn, 3, name, c, "x3@nyuu", &[(mkv, &[3, 4], 4), (vol, &[2], 2)]);
+        for (i, g) in [(1, a), (2, b), (3, c)] {
+            let post = whole_post_with(&conn, &row_of(&conn, i, g)).unwrap().unwrap_or_else(|| panic!("row {i}"));
+            assert_eq!(post.ids.len(), 3, "row {i}");
+            assert!(post.complete, "row {i}");
+        }
+    }
+
+    #[test]
+    fn a_crosspost_under_another_poster_doesnt_split_the_answer() {
+        let (_dir, conn) = all_shards();
+        let name = "Some.Film.2007.2160p.UHD.BluRay.REMUX.DV.HDR.HEVC.Atmos-GRP";
+        let mkv = "Some.Film.mkv";
+        let (a, b, c, d) = ("alt.binaries.a", "alt.binaries.b", "alt.binaries.c", "alt.binaries.d");
+        // C (lowest id) is A crossposted under another poster; A and B share a poster; D has the last part
+        put_row(&conn, 1, name, c, "copy@nyuu", &[(mkv, &[1], 3)]);
+        put_row(&conn, 2, name, a, "x1@nyuu", &[(mkv, &[1], 3)]);
+        put_row(&conn, 3, name, b, "x1@nyuu", &[(mkv, &[2], 3)]);
+        put_row(&conn, 4, name, d, "x4@nyuu", &[(mkv, &[3], 3)]);
+        let answers: Vec<Vec<i64>> = [(1, c), (2, a), (3, b), (4, d)]
+            .iter()
+            .map(|(i, g)| whole_post_with(&conn, &row_of(&conn, *i, g)).unwrap().unwrap().ids)
+            .collect();
+        assert!(answers.windows(2).all(|w| w[0] == w[1]), "{answers:?}");
+        assert_eq!(answers[0].len(), 3);
     }
 
     #[test]
