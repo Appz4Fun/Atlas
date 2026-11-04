@@ -485,7 +485,12 @@ fn linked_sizes(
         }
         if rows.len() > keep {
             rows.sort_by(|a, b| compare(a, b, Column::Size, true, &whole));
-            rows.truncate(keep);
+            // what's cut goes from the bookkeeping too, soo it stays the size of what's kept. A release is in one
+            // upload only, soo one cut isn't met again
+            for cut in rows.drain(keep..) {
+                whole.remove(&cut.id);
+                have.remove(&cut.id);
+            }
         }
     }
     Ok(whole)
@@ -807,6 +812,8 @@ mod tests {
         // read on past the second upload, which made two, as the first ties it: its newer row beats the second's older one
         assert_eq!(ids, [b[2], a_rest[1]], "cut to the two wanted after each upload");
         assert!(ids.iter().all(|id| whole[id] == 9_000));
+        // the rows cut aren't kept track of
+        assert_eq!(whole.len(), 2, "{whole:?}");
     }
 
     #[test]
