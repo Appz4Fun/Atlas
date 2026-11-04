@@ -752,7 +752,13 @@ fn grow_post(
                 continue;
             }
             chosen.push(n.id);
-            union = union_files(conn, &chosen)?;
+            let grown = union_files(conn, &chosen)?;
+            // a row that would make the rest no one upload (a counter-less post of other files) stays out
+            if !grown.one_upload() {
+                chosen.pop();
+                continue;
+            }
+            union = grown;
             span = (lo, hi);
             grew = true;
         }
