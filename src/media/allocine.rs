@@ -76,7 +76,16 @@ impl Allocine {
             return Ok(known);
         }
         let (ids, label) = self.wikidata(kind, id)?;
-        let page = if label.is_some() && ids.any() { None } else { self.page(kind, id)? };
+        let (page, page_failed) = if label.is_some() && ids.any() {
+            (None, false)
+        } else {
+            match self.page(kind, id) {
+                Ok(page) => (page, false),
+                // Wikidata's ids are good without the page's name: they aren't held back by it
+                Err(_) if ids.any() => (None, true),
+                Err(e) => return Err(e),
+            }
+        };
         let decoded = match (page, label) {
             (Some((title, year)), _) => Some(Decoded { title, year, ids }),
             (None, Some(title)) => Some(Decoded { title, year: None, ids }),
@@ -85,7 +94,7 @@ impl Allocine {
             (None, None) => None,
         };
         // a miss isn't kept here: the title's own miss waits its time, and Wikidata may have it by then
-        if decoded.is_some() {
+        if decoded.is_some() && !page_failed {
             self.decoded.put(&key, decoded.clone());
         }
         Ok(decoded)

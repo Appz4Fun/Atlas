@@ -969,3 +969,18 @@ fn a_film_number_is_not_read_as_a_series() {
     assert!(asked.iter().any(|q| q.contains("P1265")), "{asked:?}");
     assert!(!asked.iter().any(|q| q.contains("ficheserie") || q.contains("P1267")), "{asked:?}");
 }
+
+#[test]
+fn wikidatas_ids_land_when_the_page_cant_be_read() {
+    let mut h = fresh();
+    let name = "AC30890.S04E01.MULTi.1080p.WEB.H264-GL0P";
+    h.save(&[complete(name)]);
+    let wikidata = r#"{"results":{"bindings":[{"item":{"type":"uri","value":"http://www.wikidata.org/entity/Q111967146"},
+        "imdb":{"type":"literal","value":"tt16358384"},"tvdb":{"type":"literal","value":"413215"}}]}}"#;
+    let s = FixtureServer::start(vec![route("/sparql", wikidata.into()), status("/series/", 503)]);
+    let (media, db) = start(&mut h, allocine_on(maze(&s), &s));
+    let _fan = fan_out(&media, &db);
+    wait_for("the ids", || row(&h, name).is_some_and(|r| r.tvdb == Some(413_215)));
+    assert_eq!(row(&h, name).unwrap().imdb, Some(16_358_384));
+    assert!(s.requests().iter().any(|q| q.contains("ficheserie_gen_cserie=30890")), "{:?}", s.requests());
+}
