@@ -300,6 +300,8 @@ impl WordIndex {
              insert or ignore into main.meta (key, value) values ('word_index', random());",
         )?;
         let token = database_token(conn)?.unwrap_or_default();
+        // what an attempt that failed added after its last commit: the cursor below is from before it
+        writer.rollback()?;
         let resumed = self.index.load_metas()?.payload.as_deref().and_then(|p| building_at(p, token));
         let (first, mut after) = match resumed {
             Some(at) => at,
@@ -881,6 +883,11 @@ mod tests {
         // the process restarts: a new index on the same folder, which isn't ready
         let index = f.index();
         assert!(!index.ready());
+        // an attempt that failed after adding some, past its last commit
+        let rows = read_rows(&conn, 0, "r.id > ?1 order by r.id limit 3", 0).unwrap();
+        for doc in index.docs(&rows) {
+            lock(&index.writer).as_mut().unwrap().add_document(doc).unwrap();
+        }
         let rest = index.build_in(&conn, 3, 6, || true).unwrap();
         assert!(rest < 40, "it went on rather than starting again: {rest}");
         assert!(index.ready());
