@@ -714,7 +714,7 @@ mod tests {
         assert_eq!(late.day, first.day, "the stale claim of the newest month first");
     }
 
-    /// A split group's own backfill turn takes a day of the newest month any running split group has left, or a day
+    /// A split group's own backfill turn takes a day of the newest month any tracked split group has left, or a day
     /// asked for, and otherwise nothing: one whose days left are years old waits for the newer months of the others.
     #[test]
     fn a_groups_own_turn_waits_for_the_newest_month() {

@@ -834,6 +834,7 @@ async fn watch_config(sched: Arc<Scheduler>, servers: Vec<UsenetServer>) {
         let mut current = sched.groups.write().unwrap();
         if *current != groups {
             println!("groups changed: {} -> {}", current.len(), groups.len());
+            sched.ctx.states.set_tracked(&groups);
             *current = groups;
         }
     }
@@ -896,6 +897,7 @@ async fn run_servers(
         .map(|&(i, w)| format!("{} ({} connections, {w} groups at once)", pool.host(i), pool.connections(i)))
         .collect();
     println!("indexing {} groups on {}", groups.len(), per_server.join(" + "));
+    states.set_tracked(&groups);
 
     let sched = Arc::new(Scheduler {
         ctx: PassContext { pool, states, stop, verbose: false },
