@@ -362,6 +362,19 @@ mod tests {
         assert!(is_junk(&conn, "Film", G).unwrap());
     }
 
+    /// Removing a release finds its collection keys by an index: a scan of
+    /// `collections` for each (millions of rows a shard) held prod's writers
+    /// for minutes on a batch of junk.
+    #[test]
+    fn a_removed_release_finds_its_collection_keys_by_index() {
+        let (_dir, main) = shard();
+        let conn = open(&main);
+        let plan: String = conn
+            .query_row("explain query plan select key from collections where release_id = 1", [], |r| r.get(3))
+            .unwrap();
+        assert!(plan.contains("collections_release"), "{plan}");
+    }
+
     #[test]
     fn programs_are_told_by_their_last_extension() {
         for name in [
