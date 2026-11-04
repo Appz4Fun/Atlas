@@ -2052,9 +2052,12 @@ impl Pool {
         tier[0]
     }
 
-    /// The server `group`'s cursors live on: where `pick_server_in` puts it with every indexing server up.
-    pub fn home_of(&self, group: &str) -> usize {
-        self.pick_server_in(&self.indexing_servers(), group)
+    /// The servers whose cursors on `group` are its own: where `pick_server_in` puts it with every indexing server up,
+    /// and the home it left for a while and goes back to (`Home::back`).
+    pub fn homes_of(&self, group: &str) -> Vec<usize> {
+        let home = self.pick_server_in(&self.indexing_servers(), group);
+        let back = self.homes.lock().unwrap().get(group).and_then(|h| h.back);
+        std::iter::once(home).chain(back.filter(|&b| b != home)).collect()
     }
 
     /// The server `group`'s passes go to while the ones in `not` are failing it: the first `ranked` gives among the

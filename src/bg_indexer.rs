@@ -426,13 +426,14 @@ impl Scheduler {
     }
 
     /// For a pass of `group` on `server`: whether it stands in for the group's own server (parked, see `Parked`), and
-    /// whether none on `server` finished since. Never on the group's home (`Pool::home_of`): it can be the one to
-    /// take a group parked on a server it was only on while the home was down, and that pass is the home's own, on
-    /// its own cursor, which a stand-in's start at the newest article would skip past.
+    /// whether none on `server` finished since. Never on one of the group's homes (`Pool::homes_of`): one can be the
+    /// one to take a group parked on a server it was only on for a while (its home down, or moved there until it goes
+    /// back), and that pass is the home's own, on its own cursor, which a stand-in's start at the newest article would
+    /// skip past.
     fn stand_in(&self, group: &str, server: usize) -> Option<bool> {
         let failed = self.failed.lock().unwrap();
         let parked = failed.get(group)?;
-        if server == self.ctx.pool.home_of(group) {
+        if self.ctx.pool.homes_of(group).contains(&server) {
             return None;
         }
         Some(!parked.stood_in.contains(&server))
