@@ -1205,6 +1205,11 @@ fn seed_shard(conn: &Connection, enabled: StepMask, stamps: &[(u8, StepMask, i64
         rerank_small_video(conn)?;
         set("pp_net_rank_small_video", now)?;
     }
+    // once, for the probes from before a too big first article was read in part
+    if meta("pp_probe_big_heads")?.is_none() {
+        crate::probe::step::rerun_big_heads(conn, now)?;
+        set("pp_probe_big_heads", now)?;
+    }
     let seen = meta("pp_steps_seen")?.unwrap_or(0);
     let new = if seeded { enabled & !seen } else { enabled };
     if seeded && new != 0 {
