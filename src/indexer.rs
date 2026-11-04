@@ -81,7 +81,7 @@ pub struct Refused {
 /// for a while must not cost the articles in it for good.
 pub const REFUSED_FOR: Duration = Duration::from_secs(3600);
 pub const REFUSED_TRIES: u32 = 3;
-/// refused slices noted per group at most, the oldest go first
+/// refused slices noted per group at most; past it a refusal isnt noted until there is room
 const REFUSED_KEPT: usize = 64;
 
 /// the days of a split only its deepest server has that are chunks at once
@@ -178,8 +178,11 @@ impl RunStates {
         self.with(group, |st| {
             let same = |r: &Refused| r.key == key && r.start <= end && start <= r.end;
             let Some(at) = st.refused.iter().position(same) else {
+                // full: this one waits for room and is asked again meanwhile. Dropping
+                // an older one would start its hour over, and with more refused slices
+                // a pass than room none would ever reach it.
                 if st.refused.len() >= REFUSED_KEPT {
-                    st.refused.remove(0);
+                    return false;
                 }
                 st.refused.push(Refused { key: key.to_string(), start, end, since: now, tries: 1 });
                 return false;
@@ -2193,6 +2196,22 @@ mod tests {
         assert!(!refused((300, 399), REFUSED_FOR + Duration::from_secs(1)));
         states.read("g", "g@a", (350, 360));
         assert!(!refused((300, 399), REFUSED_FOR * 3), "read since: counted from the start again");
+    }
+
+    #[test]
+    fn more_refused_slices_than_are_kept_still_reach_the_hour() {
+        let states = RunStates::default();
+        let t0 = Instant::now();
+        let slices = REFUSED_KEPT as u64 * 2;
+        let pass =
+            |at: Duration| (0..slices).filter(|i| states.refused("g", "g@a", (i * 100, i * 100 + 99), t0 + at)).count();
+        // every pass refuses them all: the first ones keep their history
+        assert_eq!(pass(Duration::ZERO), 0);
+        assert_eq!(pass(Duration::from_secs(60)), 0);
+        assert_eq!(pass(REFUSED_FOR), REFUSED_KEPT, "the ones kept are passed over after the hour");
+        // the rest were noted as room freed: their hour runs from then
+        assert_eq!(pass(REFUSED_FOR + Duration::from_secs(60)), 0);
+        assert_eq!(pass(REFUSED_FOR * 2), REFUSED_KEPT, "and they are passed over an hour later");
     }
 
     #[test]
