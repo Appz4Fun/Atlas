@@ -81,6 +81,7 @@ pub fn get(path: &str, query: &str, cookies: Option<&str>, base: &str, api_key: 
         "/ui/cover" if signed_in => cover(&args),
         "/ui/still" if signed_in => still(&args),
         "/ui/samefilm" if signed_in => same_film_panel(&args),
+        "/ui/same" if signed_in => same_key_page(&args),
         "/ui/meta" if signed_in => crate::web_meta::fragment(&args),
         "/ui/row" if signed_in => crate::web_meta::row_panel(&args),
         "/ui/settings" if signed_in => html(200, settings_page(None)),
@@ -89,7 +90,7 @@ pub fn get(path: &str, query: &str, cookies: Option<&str>, base: &str, api_key: 
         "/ui/details" | "/ui/poster" | "/ui/cover" | "/ui/still" | "/ui/samefilm" | "/ui/meta" | "/ui/row" => {
             ApiResponse { headers: vec![("HX-Redirect".into(), "/".into())], ..html(401, String::new()) }
         }
-        "/ui/nzb" | "/ui/release" | "/ui/duplicates" | "/ui/settings" => redirect(Vec::new()),
+        "/ui/nzb" | "/ui/release" | "/ui/duplicates" | "/ui/same" | "/ui/settings" => redirect(Vec::new()),
         _ => return None,
     })
 }
@@ -3021,6 +3022,79 @@ fn same_film_html(rows: &[ReleaseRow]) -> String {
     format!(
         "<h2>Same film</h2><div class=\"table-wrap\"><table><thead><tr><th>Name</th><th class=\"num\">Size</th></tr></thead><tbody>{items}</tbody></table></div><p class=\"sort\">Releases whose stills show the same pictures: another encode, a remux or a different cut. Not twins.</p>"
     )
+}
+
+/// `/ui/same?id=&kind=`: the other releases that share one of a release's keys (`keys::Kind`), newest first. The
+/// key is worked out from the release, never taken from the address, and the release is read the way the release
+/// page reads it, soo one in a blocked group, or none, is not served.
+fn same_key_page(args: &HashMap<String, String>) -> ApiResponse {
+    use crate::keys::{self, Kind};
+    let id = args.get("id").and_then(|v| v.trim().parse::<i64>().ok()).unwrap_or(0);
+    let Some(kind) = args.get("kind").and_then(|k| Kind::parse(k)) else {
+        return release_problem(400, "caution", "no such key", "The link names a key Atlas doesn't keep.");
+    };
+    let read = crate::db::open().and_then(|conn| {
+        let Some(release) = crate::search::get_release_with(&conn, id)? else { return Ok(None) };
+        let main = crate::paths::database();
+        let shard = crate::db::open_shard(&crate::store::shard_path(&main, crate::store::shard_of_id(id)))?;
+        let lookup = keys::read_lookup(&shard, id, release.parts, keys::salt(&conn))?;
+        let rows: Vec<ReleaseRow> = keys::others(&conn, id, &lookup, kind, keys::LIST_CAP)
+            .into_iter()
+            .filter_map(|other| crate::search::get_release_with(&conn, other).ok().flatten())
+            .collect();
+        Ok(Some((release, lookup.has(kind), rows)))
+    });
+    let (release, has, rows) = match read {
+        Ok(Some(found)) => found,
+        Ok(None) => {
+            return release_problem(
+                404,
+                "caution",
+                "no such release",
+                "It may have been deleted, or its group blocked.",
+            );
+        }
+        Err(e) => {
+            eprintln!("web same-key list failed: {e}");
+            return release_problem(500, "caution", "the list could not be read", "The error is in Atlas's log.");
+        }
+    };
+    let body = if !has {
+        diag("note", "this release has no such key", "Its probe, PAR2 set or article timing doesn't give one.")
+    } else if rows.is_empty() {
+        diag("note", "no other release shares it", "Releases indexed later that share it will be listed here.")
+    } else {
+        let items: String = rows
+            .iter()
+            .map(|r| {
+                let incomplete = if r.complete { String::new() } else { format!(" {}", tag("tag-warn", "INCOMPLETE")) };
+                format!(
+                    "<tr><td class=\"name\"><a href=\"/ui/release?id={}\">{}</a>{incomplete}</td><td class=\"num\">{}</td><td class=\"dim col-posted\">{}</td><td class=\"dim col-group\">{}</td></tr>",
+                    r.id,
+                    escape(&r.name),
+                    escape(&fmt_size(r.size)),
+                    escape(&fmt_date(r.posted_date.as_deref())),
+                    escape(&r.group_name)
+                )
+            })
+            .collect();
+        let capped = if rows.len() as i64 >= keys::LIST_CAP {
+            format!("<p class=\"sort\">The newest {} are listed.</p>", keys::LIST_CAP)
+        } else {
+            String::new()
+        };
+        format!(
+            "<div class=\"table-wrap\"><table><thead><tr><th>Name</th><th class=\"num\">Size</th><th class=\"col-posted\">Posted</th><th class=\"col-group\">Group</th></tr></thead><tbody>{items}</tbody></table></div>{capped}"
+        )
+    };
+    let content = format!(
+        "{masthead}<div class=\"release\"><main><h1>{heading}</h1><p class=\"sort\">Other releases that share this key with <a href=\"/ui/release?id={id}\">{name}</a>. {about}</p>{body}</main></div>",
+        masthead = masthead(true),
+        heading = escape(kind.heading()),
+        name = escape(&release.name),
+        about = escape(kind.about()),
+    );
+    html(200, self::page(&format!("{} · Atlas", kind.heading()), &content))
 }
 
 /// A time into the film as h:mm:ss, or m:ss under an hour.

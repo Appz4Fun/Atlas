@@ -395,6 +395,8 @@ pub fn raw_path_from_shard(shard: &Path) -> Option<PathBuf> {
     Some(shard.with_file_name(format!("{stem}.raw.db")))
 }
 
+// the test build returns early from its own block, which clippy reads as a needless return
+#[allow(clippy::needless_return)]
 fn with_raw<T>(f: impl FnOnce(&Connection) -> rusqlite::Result<T>) -> Option<T> {
     #[cfg(test)]
     {

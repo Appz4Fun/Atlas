@@ -97,6 +97,7 @@ pub const SHARD_TABLES: &[&ShardTable] = &[
     &crate::category::RELEASE_CATEGORY,
     &crate::media::MEDIA_RELEASE,
     &crate::store::FILE_TIMING,
+    &crate::keys::RELEASE_KEYS,
     &crate::junk::JUNK_RELEASES,
     &crate::junk::JUNK_COLLECTIONS,
 ];

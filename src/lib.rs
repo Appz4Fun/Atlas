@@ -26,6 +26,7 @@ pub mod gf2;
 pub mod groups_menu;
 pub mod indexer;
 pub mod junk;
+pub mod keys;
 pub mod media;
 pub mod merging;
 pub mod metrics;
