@@ -871,26 +871,21 @@ impl Inner {
         Ok(true)
     }
 
-    /// Gives each release the net lane wants a `net_rank`, newest first, a slice per shard at a time: rows from
-    /// before ranks existed, and the few a rerun adds without a visit. A visit ranks its own release.
-    pub(crate) fn rank_lane(self: Arc<Self>, db: Db) {
+    /// Gives each release of `shard` the net lane wants a `net_rank`, newest first, a slice at a time: rows from
+    /// before ranks existed, and the few a rerun adds without a visit. A visit ranks its own release. One thread per
+    /// shard, as each slice waits for its shard's writer and one busy writer shouldn't hold up the other shards.
+    pub(crate) fn rank_lane(self: Arc<Self>, db: Db, shard: usize) {
         let mut conns = Conns::new(self.main.clone());
         while !self.stopping() {
-            let mut ranked = 0usize;
-            for shard in 0..SHARDS {
-                if self.stopping() {
-                    return;
-                }
-                match conns.get(shard).map_err(anyhow::Error::from).and_then(|conn| rank_slice(conn, &db, shard)) {
-                    Ok(n) => ranked += n,
-                    Err(e) => {
-                        println!("processing stage, ranking shard {shard}: {e}");
-                        self.nap(Duration::from_secs(30));
-                    }
+            match conns.get(shard).map_err(anyhow::Error::from).and_then(|conn| rank_slice(conn, &db, shard)) {
+                // another slice as soon as its writer is free: the writer puts saves first either way
+                Ok(n) if n > 0 => {}
+                Ok(_) => self.nap(Duration::from_secs(60)),
+                Err(e) => {
+                    println!("processing stage, ranking shard {shard}: {e}");
+                    self.nap(Duration::from_secs(30));
                 }
             }
-            // a slice per shard leaves the writers to saves most of the time
-            self.nap(Duration::from_secs(if ranked == 0 { 60 } else { 1 }));
         }
     }
 
@@ -1236,7 +1231,7 @@ pub(crate) fn claim_order(claims: i64) -> &'static str {
 }
 
 /// Releases ranked per slice, at most.
-const RANK_SLICE: i64 = 2_000;
+const RANK_SLICE: i64 = 20_000;
 
 /// Ranks up to `RANK_SLICE` of a shard's unranked releases, newest first, on its writer. Their ids are read here.
 fn rank_slice(conn: &Connection, db: &Db, shard: usize) -> anyhow::Result<usize> {
