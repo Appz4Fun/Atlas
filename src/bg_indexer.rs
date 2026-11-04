@@ -22,7 +22,8 @@ use crate::sab;
 use crate::ui;
 
 const HISTORY_LEN: f64 = 60.0;
-/// a group that failed 3 times in a row gets another go after this long
+/// a group that failed 3 times in a row on its server gets another go there after this long; its new posts are read
+/// from the next server meanwhile (see `Parked`)
 const FAILED_RETRY: Duration = Duration::from_secs(300);
 /// an idle group (nothing new) is looked at again after this long
 const IDLE_RECHECK: Duration = Duration::from_secs(10);
@@ -258,6 +259,8 @@ fn settings_of(config: &Config) -> PassSettings {
         request_size: config.request_size(),
         split_min_backlog: config.split_min_backlog(),
         chunk_safety: crate::indexer::CHUNK_SAFETY,
+        fallback: false,
+        from_top: false,
     }
 }
 
@@ -320,7 +323,7 @@ struct Scheduler {
     /// consecutive errors per group
     errors: Mutex<HashMap<String, u32>>,
     /// groups parked after 3 errors in a row, retried after FAILED_RETRY
-    failed: Mutex<HashMap<String, Instant>>,
+    failed: Mutex<HashMap<String, Parked>>,
     stats: Arc<Mutex<Stats>>,
     /// wind down (servers changed or stopping): finish current passes, start no new ones
     wind_down: AtomicBool,
@@ -331,6 +334,19 @@ struct Scheduler {
     /// auto_run_compact as config.toml has it now
     auto_compact: AtomicBool,
     passes: AtomicUsize,
+}
+
+/// A group whose passes failed 3 times in a row: since when, and on which servers. Until `FAILED_RETRY` is up its
+/// live passes run on the next server that `Pool::fallback_in` gives, on that server's own cursor, soo posts that
+/// land while the home is in trouble arent left unread for hours; the home's cursor stays where it was and picks up
+/// from there when the group goes back.
+#[derive(Debug)]
+struct Parked {
+    since: Instant,
+    servers: Vec<usize>,
+    /// servers that ran a pass standing in for these, soo the first starts at the newest article (see
+    /// `PassSettings::from_top`)
+    stood_in: Vec<usize>,
 }
 
 impl Scheduler {
@@ -367,13 +383,15 @@ impl Scheduler {
         let mut next = self.next.lock().unwrap();
         let next = next.entry(server).or_insert(0);
 
-        failed.retain(|_, since| since.elapsed() < FAILED_RETRY);
+        failed.retain(|_, parked| parked.since.elapsed() < FAILED_RETRY);
         wait.retain(|_, until| *until > now);
         let free = |g: &String| {
             !busy.contains(g)
                 && !wait.contains_key(g)
-                && !failed.contains_key(g)
-                && pool.pick_server_in(&tier, g) == server
+                && match failed.get(g) {
+                    None => pool.pick_server_in(&tier, g) == server,
+                    Some(parked) => pool.fallback_in(&tier, g, &parked.servers) == Some(server),
+                }
         };
 
         // a group big releases come from goes as soon as it's due, so it keeps up with what's posted while the round
@@ -404,7 +422,19 @@ impl Scheduler {
         None
     }
 
-    fn finish(&self, group: &str, result: anyhow::Result<Progress>) {
+    /// For a pass of `group` on `server`: whether it stands in for the group's own server (parked, see `Parked`), and
+    /// whether it is the first on `server` since.
+    fn stand_in(&self, group: &str, server: usize) -> Option<bool> {
+        let mut failed = self.failed.lock().unwrap();
+        let parked = failed.get_mut(group)?;
+        let first = !parked.stood_in.contains(&server);
+        if first {
+            parked.stood_in.push(server);
+        }
+        Some(first)
+    }
+
+    fn finish(&self, group: &str, server: usize, result: anyhow::Result<Progress>) {
         let states = &self.ctx.states;
 
         match result {
@@ -426,12 +456,23 @@ impl Scheduler {
                 };
 
                 if count >= 3 {
-                    ui::error(&format!(
-                        "Too many errors on {group}, parking it for {}m: {e}",
-                        FAILED_RETRY.as_secs() / 60
-                    ));
                     self.errors.lock().unwrap().remove(group);
-                    self.failed.lock().unwrap().insert(group.to_string(), Instant::now());
+                    let pool = &self.ctx.pool;
+                    let mut failed = self.failed.lock().unwrap();
+                    let parked =
+                        failed.entry(group.to_string()).or_insert_with(|| Parked { since: Instant::now(), servers: vec![], stood_in: vec![] });
+                    if !parked.servers.contains(&server) {
+                        parked.servers.push(server);
+                    }
+                    let instead = match pool.fallback_in(&pool.indexing_tier(), group, &parked.servers) {
+                        Some(i) => format!(", reading its new posts from {} meanwhile", pool.host(i)),
+                        None => String::new(),
+                    };
+                    ui::error(&format!(
+                        "Too many errors on {group} on {}, parking it there for {}m{instead}: {e}",
+                        pool.host(server),
+                        FAILED_RETRY.saturating_sub(parked.since.elapsed()).as_secs().div_ceil(60)
+                    ));
                 } else {
                     ui::error(&format!("Indexing error ({group}): {e}"));
                     self.wait_until.lock().unwrap().insert(group.to_string(), Instant::now() + backoff(count));
@@ -669,7 +710,13 @@ async fn worker(sched: Arc<Scheduler>, server: usize, db: Db) {
             }
         };
 
-        let settings = sched.settings.read().unwrap().clone();
+        let mut settings = sched.settings.read().unwrap().clone();
+        if let Some(first) = sched.stand_in(&group, server) {
+            // its own server is in trouble: this one reads what is new, on its own cursor, and nothing more
+            settings.mode = "live".into();
+            settings.fallback = true;
+            settings.from_top = first;
+        }
         let stats = sched.stats.clone();
         let mut progress = |p: &Progress| stats.lock().unwrap().tick(p, &group);
 
@@ -678,7 +725,7 @@ async fn worker(sched: Arc<Scheduler>, server: usize, db: Db) {
         // only moves past slices that are saved
         let pass = run_pass(&sched.ctx, &settings, &db, &group, server, &mut progress);
         let Some(result) = unless_stopped(&sched.ctx.stop, pass).await else { break };
-        sched.finish(&group, result);
+        sched.finish(&group, server, result);
     }
 }
 
@@ -1311,6 +1358,40 @@ mod tests {
         assert_eq!(take().as_deref(), Some("b"));
         assert_eq!(take().as_deref(), Some("c"));
         assert_eq!(take(), None, "a group no longer indexed is never taken");
+    }
+
+    /// a group that failed 3 times in a row on its server has its passes on the next one meanwhile, the first of them
+    /// from the newest article, and goes back once `FAILED_RETRY` is up
+    #[test]
+    fn a_parked_groups_passes_go_to_the_next_server() {
+        let pool = Pool::new(&[UsenetServer::new("a.test", "u", "p", 119), UsenetServer::new("b.test", "u", "p", 119)]);
+        let home = pool.pick_server("g");
+        let other = 1 - home;
+        let sched = scheduler(pool, vec!["g".into()]);
+        for _ in 0..3 {
+            assert_eq!(sched.take_group(home).as_deref(), Some("g"));
+            sched.finish("g", home, Err(anyhow::anyhow!("430 Failed forwarding")));
+            sched.wait_until.lock().unwrap().clear();
+        }
+        assert_eq!(sched.take_group(home), None, "parked on its own server");
+        assert_eq!(sched.take_group(other).as_deref(), Some("g"), "the next server stands in");
+        assert_eq!(sched.stand_in("g", other), Some(true), "its first pass starts at the newest article");
+        assert_eq!(sched.stand_in("g", other), Some(false));
+        sched.finish("g", other, Ok(Progress::default()));
+        sched.wait_until.lock().unwrap().clear();
+
+        // the stand-in fails too: nothing left to try
+        for _ in 0..3 {
+            assert_eq!(sched.take_group(other).as_deref(), Some("g"));
+            sched.finish("g", other, Err(anyhow::anyhow!("timed out")));
+            sched.wait_until.lock().unwrap().clear();
+        }
+        assert_eq!((sched.take_group(home), sched.take_group(other)), (None, None));
+
+        // the rest is up: back home, and passes there arent stand-ins
+        sched.failed.lock().unwrap().get_mut("g").unwrap().since -= FAILED_RETRY;
+        assert_eq!(sched.take_group(home).as_deref(), Some("g"));
+        assert_eq!(sched.stand_in("g", home), None);
     }
 
     /// with more media groups than its share of workers, the round robin still moves
