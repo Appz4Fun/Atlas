@@ -33,6 +33,8 @@ const PER_ROUND: usize = 20;
 const SERVERS: usize = 2;
 /// around a post's first and last article
 const MARGIN: i64 = 300;
+/// a post's span past which its days aren't asked for (see `days_of`)
+const MAX_SPAN_DAYS: i64 = 2;
 /// articles below a group's last number two servers are compared over, to tell whether they are one backend
 const SAME_IDS_LOOK: u64 = 50;
 /// a window bigger than this is a busy group's hours, not a post's minutes
@@ -284,11 +286,15 @@ pub fn find(conn: &Connection, now: i64) -> rusqlite::Result<Found> {
     Ok(found)
 }
 
-/// The days the whole post spans, from its first article in any group to its last, in each of its groups.
+/// The days the whole post spans, from its first article in any group to its last, in each of its groups. None for
+/// one spread over more than `MAX_SPAN_DAYS`: a post takes hours, and a date that far off is wrong.
 fn days_of(windows: &[Window]) -> Vec<(String, i64)> {
     let (Some(from), Some(to)) = (windows.iter().map(|w| w.from).min(), windows.iter().map(|w| w.to).max()) else {
         return Vec::new();
     };
+    if to - from > MAX_SPAN_DAYS * 86_400 {
+        return Vec::new();
+    }
     let days = crate::chunks::unix_day(from)..=crate::chunks::unix_day(to);
     windows.iter().flat_map(|w| days.clone().map(move |d| (w.group.clone(), d))).collect()
 }
@@ -337,6 +343,7 @@ mod tests {
         let want = |g: &str, d: i64| (g.to_string(), d);
         assert_eq!(days, [want("a", 20_758), want("a", 20_759), want("b", 20_758), want("b", 20_759)]);
         assert!(days_of(&[]).is_empty());
+        assert!(days_of(&[w("a", day, day + 600), w("b", day, 99_999 * 86_400)]).is_empty(), "a date far off");
     }
 
     #[test]

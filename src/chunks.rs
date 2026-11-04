@@ -249,25 +249,51 @@ pub fn claim(conn: &Connection, groups: &[(String, i64)], host: &str, now: i64) 
     if groups.is_empty() {
         return Ok(None);
     }
-    let wanted = "and exists (select 1 from backfill_wanted w where w.grp = c.grp and w.day = c.day)";
-    match claim_where(conn, groups, host, now, wanted)? {
+    match claim_wanted(conn, groups, host, now)? {
         Some(claim) => Ok(Some(claim)),
-        None => claim_where(conn, groups, host, now, ""),
+        None => claim_newest(conn, groups, host, now),
     }
 }
 
-fn claim_where(conn: &Connection, groups: &[(String, i64)], host: &str, now: i64, also: &str) -> Result<Option<Claim>> {
+/// The newest day asked for of `groups`, pending or with a stale claim: read from the few asked for, not the backlog.
+fn claim_wanted(conn: &Connection, groups: &[(String, i64)], host: &str, now: i64) -> Result<Option<Claim>> {
+    if !conn.prepare_cached("select 1 from backfill_wanted limit 1")?.exists([])? {
+        return Ok(None);
+    }
+    let rows = vec!["(?, ?)"; groups.len()].join(", ");
+    let sql = format!(
+        "with wanted (g, oldest) as (values {rows})
+         update backfill_chunks set state = ?, server = ?, claimed_at = ?
+         where (grp, day) = (
+             select c.grp, c.day from backfill_wanted r
+             join wanted w on w.g = r.grp
+             join backfill_chunks c on c.grp = r.grp and c.day = r.day
+             where c.day >= w.oldest and (c.state = {PENDING} or (c.state = {CLAIMED} and c.claimed_at < ?))
+             order by c.day desc limit 1)
+         returning grp, day"
+    );
+    let mut values: Vec<rusqlite::types::Value> = Vec::with_capacity(groups.len() * 2 + 4);
+    for (g, oldest) in groups {
+        values.push(g.clone().into());
+        values.push((*oldest).into());
+    }
+    values.extend([CLAIMED.into(), host.to_string().into(), now.into(), (now - CLAIM_TIMEOUT).into()]);
+    let found: Option<(String, i64)> =
+        conn.prepare(&sql)?.query_row(rusqlite::params_from_iter(values), |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+    Ok(found.map(|(group, day)| Claim { group, day, server: host.to_string(), claimed_at: now }))
+}
+
+fn claim_newest(conn: &Connection, groups: &[(String, i64)], host: &str, now: i64) -> Result<Option<Claim>> {
     let rows = vec!["(?, ?)"; groups.len()].join(", ");
     let sql = format!(
         "with wanted (g, oldest) as (values {rows}),
               candidates (grp, p_day, s_day) as materialized (
                   select w.g,
                          (select c.day from backfill_chunks c
-                          where c.grp = w.g and c.state = {PENDING} and c.day >= w.oldest {also}
+                          where c.grp = w.g and c.state = {PENDING} and c.day >= w.oldest
                           order by c.day desc limit 1),
                          (select c.day from backfill_chunks c
                           where c.grp = w.g and c.state = {CLAIMED} and c.day >= w.oldest and c.claimed_at < ?
-                                {also}
                           order by c.day desc limit 1)
                   from wanted w
               ),
