@@ -424,7 +424,7 @@ impl Inner {
         let visits: Vec<(Row, Option<i64>)> =
             present.into_iter().map(|(_, due, row)| (row.unwrap(), Some(due))).collect();
         self.visit_all(conn, visits, 0, now, &mut batch)?;
-        self.send(db, shard, batch, now, move |tx| {
+        self.send(db, shard, "db.stage.apply_queue", batch, now, move |tx| {
             for (id, due) in gone {
                 tx.prepare_cached("delete from pp_queue where release_id = ? and due_at = ?")?
                     .execute(params![id, due])?;
@@ -474,7 +474,7 @@ impl Inner {
         drop(stmt);
         let now = chrono::Utc::now().timestamp();
         if rows.is_empty() {
-            self.send(db, shard, Batch::default(), now, move |tx| {
+            self.send(db, shard, "db.stage.apply_walk", Batch::default(), now, move |tx| {
                 tx.execute("delete from pp_walks where id = ?", [walk_id])?;
                 Ok(())
             })?;
@@ -496,13 +496,13 @@ impl Inner {
         // the cursor goes no further than the visits did: nothing else brings a walked row back
         let finished = !batch.stopped && !self.stopping();
         let Some(next) = (if finished { order.last().copied() } else { batch.through }) else {
-            self.send(db, shard, batch, now, |_| Ok(()))?;
+            self.send(db, shard, "db.stage.apply_walk", batch, now, |_| Ok(()))?;
             return Ok(true);
         };
         let seen = order.iter().position(|id| *id == next).map_or(0, |at| at as i64 + 1);
         let ran = batch.applied.len() as i64;
         self.stats.rows_walked.fetch_add(seen as u64, Relaxed);
-        self.send(db, shard, batch, now, move |tx| {
+        self.send(db, shard, "db.stage.apply_walk", batch, now, move |tx| {
             tx.prepare_cached("update pp_walks set before_id = ?, seen = seen + ?, ran = ran + ? where id = ?")?
                 .execute(params![next, seen, ran, walk_id])?;
             Ok(())
@@ -512,10 +512,12 @@ impl Inner {
 
     /// One job for the shard's writer: each release in its savepoint, and `also`
     /// with them. Waits for the answer, and what the outcomes hold goes with it.
+    /// `kind`: which lane's results these are, for the writer's timing (`db.stage.apply_*`)
     fn send(
         &self,
         db: &Db,
         shard: usize,
+        kind: &'static str,
         batch: Batch,
         now: i64,
         also: impl FnOnce(&Connection) -> rusqlite::Result<()> + Send + 'static,
@@ -526,7 +528,7 @@ impl Inner {
         let filling = written.clone();
         let answer = db.on_writer(
             shard,
-            "db.stage.apply",
+            kind,
             Box::new(move |conn| {
                 let mut renames = filling.lock().unwrap();
                 for a in applied {
@@ -947,7 +949,7 @@ impl Inner {
             }
             Verdict::Pass => {}
         }
-        self.send(db, shard, one(a), now, |_| Ok(()))
+        self.send(db, shard, "db.stage.apply_net", one(a), now, |_| Ok(()))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -992,7 +994,7 @@ impl Inner {
         }
         let Some(step) = left.first().copied() else {
             a.net_mask = 0;
-            return self.send(db, shard, one(a), now, |_| Ok(()));
+            return self.send(db, shard, "db.stage.apply_net", one(a), now, |_| Ok(()));
         };
         let bit = mask(step.id());
         a.net_mask = left.iter().fold(0, |m, s| m | mask(s.id()));
@@ -1004,7 +1006,7 @@ impl Inner {
             a.net_transient = Some(0);
             a.net_next_at = Some(0);
             a.error = Some("interrupted".into());
-            return self.send(db, shard, one(a), now, |_| Ok(()));
+            return self.send(db, shard, "db.stage.apply_net", one(a), now, |_| Ok(()));
         }
 
         let mut batch = Batch::default();
@@ -1045,7 +1047,7 @@ impl Inner {
                     batch.holds.extend(o.hold.take());
                     if let Some(reason) = o.junk {
                         batch.applied.push(Applied { junk: Some(reason), ..base_copy(&a) });
-                        return self.send(db, shard, batch, now, |_| Ok(()));
+                        return self.send(db, shard, "db.stage.apply_net", batch, now, |_| Ok(()));
                     }
                     if let Some(until) = o.wait_until {
                         a.writes.extend(std::mem::take(&mut o.writes).into_iter().map(|w| (bit, w)));
@@ -1123,7 +1125,7 @@ impl Inner {
             });
         }
         batch.applied.push(a);
-        self.send(db, shard, batch, now, |_| Ok(()))
+        self.send(db, shard, "db.stage.apply_net", batch, now, |_| Ok(()))
     }
 }
 

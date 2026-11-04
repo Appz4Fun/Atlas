@@ -189,25 +189,60 @@ impl Client {
         sent: Result<ureq::http::Response<ureq::Body>, ureq::Error>,
         cache_url: Option<&str>,
     ) -> Result<Reply, Trouble> {
+        let read = |resp: &mut ureq::http::Response<ureq::Body>| {
+            let Ok(json) = resp.body_mut().with_config().limit(MAX_BODY).read_json::<Value>() else {
+                return Err(Trouble::Bad(format!("{}: a body that doesnt parse", self.name)));
+            };
+            if let Some(url) = cache_url
+                && !crate::raw_store::is_empty_media_json(&json)
+                && let Ok(text) = serde_json::to_string(&json)
+            {
+                crate::raw_store::put_http_cache(self.name, url, 200, &text);
+            }
+            Ok(json)
+        };
+        Ok(self.answered(sent, read)?.map_or(Reply::NotFound, Reply::Json))
+    }
+
+    /// A web page's text, None on a 404. Paced and paused as `get` is, and not cached: the caller keeps what it took.
+    pub fn get_page(&self, url: &str) -> Result<Option<String>, Trouble> {
+        self.ready()?;
+        let span = crate::metrics::span("media.request");
+        let sent = self.agent.get(url).call();
+        let outage = is_outage(&sent);
+        let read = |resp: &mut ureq::http::Response<ureq::Body>| {
+            resp.body_mut()
+                .with_config()
+                .limit(MAX_BODY)
+                .read_to_string()
+                .map_err(|_| Trouble::Bad(format!("{}: a page that cant be read", self.name)))
+        };
+        let page = self.answered(sent, read);
+        let as_reply = match &page {
+            Ok(Some(_)) => Ok(Reply::Json(Value::Null)),
+            Ok(None) => Ok(Reply::NotFound),
+            Err(t) => Err(t.clone()),
+        };
+        let _ = self.counted(&span, outage, as_reply);
+        page
+    }
+
+    /// 200 is `read`'s, 404 is None, and the rest pause or fail as each says.
+    fn answered<T>(
+        &self,
+        sent: Result<ureq::http::Response<ureq::Body>, ureq::Error>,
+        read: impl FnOnce(&mut ureq::http::Response<ureq::Body>) -> Result<T, Trouble>,
+    ) -> Result<Option<T>, Trouble> {
         let Ok(mut resp) = sent else { return Err(self.outage()) };
         match resp.status().as_u16() {
             200 => {
-                let body = resp.body_mut().with_config().limit(MAX_BODY).read_json::<Value>();
-                let Ok(json) = body else {
-                    return Err(Trouble::Bad(format!("{}: a body that doesnt parse", self.name)));
-                };
-                if let Some(url) = cache_url
-                    && !crate::raw_store::is_empty_media_json(&json)
-                    && let Ok(text) = serde_json::to_string(&json)
-                {
-                    crate::raw_store::put_http_cache(self.name, url, 200, &text);
-                }
+                let body = read(&mut resp)?;
                 *self.pause.lock().unwrap() = Pause::default();
-                Ok(Reply::Json(json))
+                Ok(Some(body))
             }
             404 => {
                 *self.pause.lock().unwrap() = Pause::default();
-                Ok(Reply::NotFound)
+                Ok(None)
             }
             429 => {
                 let wait = resp

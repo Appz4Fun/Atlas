@@ -104,6 +104,10 @@ api_key = ""
 [media.trakt]
 client_id = ""
 
+# reads `AC31594`-style names (AlloCiné numbers) through Wikidata and allocine.fr
+[media.allocine]
+enabled = true
+
 # names a probed video from its OpenSubtitles hash, see opensubtitles.com/consumers
 [media.opensubtitles]
 api_key = ""
