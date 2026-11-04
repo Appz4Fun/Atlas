@@ -408,7 +408,9 @@ fn names_panel(i: &MetaInputs<'_>, l: &Looked, compact: bool) -> Facts {
         .probe
         .and_then(|p| p.archive.as_ref())
         .and_then(|a| a.name.as_deref())
-        .or_else(|| i.inner.files.iter().find(|r| r.source != SOURCE_PAR2).map(|r| r.name.as_str()));
+        .or_else(|| {
+            i.inner.files.iter().find(|r| r.source != SOURCE_PAR2 && r.source != SOURCE_NZB).map(|r| r.name.as_str())
+        });
     if !compact {
         f.add("Subject", subject);
         f.add("Subject decoded", subject.and_then(decode_encoded_words));
@@ -1823,8 +1825,9 @@ fn unpacked_estimate(
     };
     // the archive's own listing when there is one. A PAR2 inventory lists the posted files, which are the
     // contents only when none of them is an archive; added to the archive's listing it would count the volumes
-    // and what is inside them both
-    let listed: Vec<&InnerFileRow> = inner.files.iter().filter(|r| r.source != SOURCE_PAR2).collect();
+    // and what is inside them both. A posted NZB lists another post's files, which say nothing of this one
+    let listed: Vec<&InnerFileRow> =
+        inner.files.iter().filter(|r| r.source != SOURCE_PAR2 && r.source != SOURCE_NZB).collect();
     if !listed.is_empty() {
         if listed.iter().all(|r| r.size.is_some()) {
             return Some(against_posted(listed.iter().filter_map(|r| r.size).sum()));

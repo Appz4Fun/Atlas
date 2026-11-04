@@ -868,3 +868,24 @@ fn a_posted_nzbs_list_comes_back_from_the_raw_store_once_its_articles_are_gone()
     wait_for("the list back", || rows(&h, "x") == before);
     assert_eq!(bodies(&state), 1);
 }
+
+#[test]
+fn an_archive_restored_from_the_raw_store_leaves_a_posted_nzbs_list_out() {
+    let mut h = fresh();
+    let s = shape("x").one("x.rar", &a_rar5("Inner.mkv")).one("x.nzb", &an_nzb(POINTED_AT));
+    let state = serve(&mut h, &s, config());
+    settled(&h, "x");
+    assert_eq!(rows(&h, "x")[0].source, 2);
+    // the NZB's list kept in the raw store beside the archive's, as a read with the archive missing would leave it
+    let id = h.id_of("x");
+    h.stage.as_ref().unwrap().rerun(id, LIST_DONE).unwrap();
+    state.posts.lock().unwrap().retain(|p| !p.subject.contains("x.rar"));
+    wait_for("the NZB read", || rows(&h, "x").iter().any(|r| r.source == 5));
+    settled(&h, "x");
+    h.shard().execute("delete from archive_inner_files where release_id = ?", [id]).unwrap();
+    h.shard().execute("delete from pp_state where release_id = ?", [id]).unwrap();
+    h.shard().execute("insert into pp_queue (release_id, due_at) values (?, 0)", [id]).unwrap();
+    wait_for("a restore", || !rows(&h, "x").is_empty());
+    settled(&h, "x");
+    assert!(rows(&h, "x").iter().all(|r| r.source == 5 || r.name != "Pointed.At.2016.2160p-GRP.part1.rar"));
+}
