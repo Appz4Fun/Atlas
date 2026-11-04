@@ -2685,6 +2685,11 @@ impl Pool {
         }
     }
 
+    /// The Message-IDs numbered `start..=end` in `group` on server `i`, by number.
+    pub async fn ids_on(&self, i: usize, group: &str, start: u64, end: u64) -> Result<Vec<(u64, String)>> {
+        Ok(self.xover_on(i, group, start, end).await?.into_iter().map(|o| (o.number, o.message_id)).collect())
+    }
+
     async fn xover_on(&self, i: usize, group: &str, start: u64, end: u64) -> Result<Vec<Overview>> {
         match self.xover_once(i, group, start, end).await {
             Err(NntpError::Decompress(e)) => {
