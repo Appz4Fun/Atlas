@@ -67,11 +67,17 @@ static SUBJECT_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
         r#"\[\d+\s*/\s*\d+\]\s+(?:-\s+)?([^\s"]+\.[^\s"]+)\s+\("#,
         // python had a (?=\s|$) lookahead here, consuming it is equivalent for a search
         r#"\[\d+\s*/\s*\d+\]\s+(?:-\s+)?["]([^"]+)["](?:\s|$)"#,
+        // `"name" - 26,35 GB - yEnc (p/t)`: a size with a decimal comma, and a dash before yEnc
+        r#""(.+?)"\s+-\s+[\d.,]+\s*\w+\s+-\s+yEnc\s+\((\d+)\s*/\s*(\d+)\)"#,
     ]
     .iter()
     .map(|p| Regex::new(&format!("(?i){p}")).unwrap())
     .collect()
 });
+
+/// `<name> [p/t]` and nothing else: one file of t parts under a random name, the bracket counting its parts
+static BRACKET_PARTS_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^([A-Za-z0-9][A-Za-z0-9._-]{15,})\s+\[(\d+)\s*/\s*(\d+)\]$").unwrap());
 
 static FILE_COUNT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\[(\d+)\s*/\s*(\d+)\]").unwrap());
 
@@ -108,6 +114,22 @@ pub fn parse_subject(subject: &str) -> Option<ParsedSubject> {
     // `{...}`), most of some groups, skip all ten regexes
     if !subject.contains(['(', '[']) {
         return None;
+    }
+
+    if let Some(c) = BRACKET_PARTS_RE.captures(subject.trim()) {
+        let (part, total): (i64, i64) = (c[2].parse().ok()?, c[3].parse().ok()?);
+        if part < 1 || total < 2 || part > total || total > MAX_PARTS {
+            return None;
+        }
+        let filename = c[1].to_string();
+        return Some(ParsedSubject {
+            release_name: strip_release_suffixes(&filename),
+            filename,
+            part,
+            total_parts: total,
+            file_index: None,
+            file_total: None,
+        });
     }
 
     let caps = SUBJECT_PATTERNS.iter().find_map(|re| re.captures(subject))?;
@@ -418,6 +440,25 @@ mod tests {
         assert_eq!(u.id_subject, (1, 740_000));
         assert_eq!(u.token, (1, 740_000));
         assert_eq!(u.other, (1, 740_000));
+    }
+
+    #[test]
+    fn a_random_name_with_a_bracket_counting_its_parts() {
+        let p = parse_subject("nPqvAL8CUApDXfZwfDu53AHf [515/3054]").unwrap();
+        assert_eq!(
+            (p.filename.as_str(), p.part, p.total_parts, p.file_index),
+            ("nPqvAL8CUApDXfZwfDu53AHf", 515, 3054, None)
+        );
+        assert!(parse_subject("short [1/2]").is_none(), "a short name can be a file counter of anything");
+        assert!(parse_subject("nPqvAL8CUApDXfZwfDu53AHf [9/3]").is_none());
+        assert!(parse_subject("nPqvAL8CUApDXfZwfDu53AHf [1/1]").is_none());
+    }
+
+    #[test]
+    fn a_size_with_a_decimal_comma_before_yenc() {
+        let p = parse_subject(r#"(49/57)  "zwPUQNgU9KW7SKN3.vol062+62.par2" - 26,35 GB - yEnc (543/1273)"#).unwrap();
+        assert_eq!((p.filename.as_str(), p.part, p.total_parts), ("zwPUQNgU9KW7SKN3.vol062+62.par2", 543, 1273));
+        assert_eq!(p.release_name, "zwPUQNgU9KW7SKN3");
     }
 
     #[test]
