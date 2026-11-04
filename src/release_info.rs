@@ -1070,6 +1070,18 @@ fn subject_of_file(subject: &str, expected: Option<i64>) -> String {
     subject
 }
 
+/// How much of what these rows' files say they have is there, out of 1000, across all of them.
+pub fn permille_of(conn: &Connection, ids: &[i64]) -> Result<i64> {
+    let union = union_files(conn, ids)?;
+    let (mut have, mut want) = (0i64, 0i64);
+    for f in union.files.values() {
+        let Some(expected) = f.expected.filter(|e| *e > 0) else { continue };
+        have += store::seen_count(&f.seen).min(expected);
+        want += expected;
+    }
+    Ok(if want == 0 { 0 } else { have * 1000 / want })
+}
+
 fn union_files(conn: &Connection, ids: &[i64]) -> Result<UnionFiles> {
     let mut union = UnionFiles::default();
     for id in ids {

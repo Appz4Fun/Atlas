@@ -473,7 +473,10 @@ impl Db {
     }
 }
 
-async fn on_db<T: Send + 'static>(db: &Db, f: impl FnOnce(&mut Connection) -> Result<T> + Send + 'static) -> Result<T> {
+pub(crate) async fn on_db<T: Send + 'static>(
+    db: &Db,
+    f: impl FnOnce(&mut Connection) -> Result<T> + Send + 'static,
+) -> Result<T> {
     let conn = db.conn.clone();
     tokio::task::spawn_blocking(move || {
         let t = std::time::Instant::now();
@@ -1740,6 +1743,37 @@ impl Pass<'_> {
         let (low_done, high_done) = finished.ends(start.max(0) as u64, end.max(0) as u64);
         Ranged { saved, complete: done == total, in_window, low_done, high_done, error }
     }
+}
+
+/// `group`'s articles posted from `from` to `to` (unix seconds) on `server`, read and saved like any pass: the
+/// headers of a time window another server's listing left out (see `repair`). No cursor moves. A window of more than
+/// `max_articles` isn't read.
+pub async fn reread_window(
+    ctx: &PassContext,
+    settings: &PassSettings,
+    db: &Db,
+    group: &str,
+    server: usize,
+    (from, to): (i64, i64),
+    max_articles: u64,
+) -> Result<Progress> {
+    let (_, first, last, _) = ctx.pool.group_on(server, group).await?;
+    if last < first {
+        return Ok(Progress::default());
+    }
+    let start = ctx.pool.article_at(server, group, first, last, from).await?;
+    let end = ctx.pool.article_at(server, group, first, last, to).await?.saturating_sub(1).min(last);
+    if end < start {
+        return Ok(Progress::default());
+    }
+    if end - start + 1 > max_articles {
+        anyhow::bail!("{group}: {} articles from {start} to {end}, more than a window takes", end - start + 1);
+    }
+    // a key no cursor has: the dates this pass finds are noted nowhere
+    let key = format!("repair:{group}@{}", ctx.pool.host(server));
+    let pass = Pass { ctx, settings, db, group, server, key };
+    let mut quiet = no_progress;
+    pass.process_range(start as i64, end as i64, "repair", &mut quiet).await.into_result()
 }
 
 /// How a range pass went. `low_done` / `high_done`: the range is done from

@@ -886,6 +886,12 @@ async fn run_servers(
             tasks.spawn(worker(sched.clone(), server, db.clone()));
         }
     }
+    // parts one server's listing left out, read again from another (see `repair`)
+    if sched.ctx.pool.indexing_servers().len() > 1 {
+        let s = sched.clone();
+        let settings = settings_of(config);
+        tasks.spawn(crate::repair::run(sched.ctx.clone(), settings, db.clone(), move || s.stopping()));
+    }
     tasks.spawn(watch_config(sched.clone(), servers));
     tasks.spawn(report(sched.clone()));
     tasks.spawn(compact_timer(sched.clone()));
