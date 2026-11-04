@@ -14,6 +14,10 @@ use crate::indexer::{Db, PassContext, PassSettings, on_db, reread_window};
 use crate::search::ReleaseRow;
 use crate::store;
 
+/// how often the big releases of each group are counted again (`count_media`)
+const COUNT_EVERY: Duration = Duration::from_secs(24 * 3600);
+/// a release this big is what the indexer is after, when its name says so (`media_counts`)
+const MEDIA_BYTES: i64 = 4 << 30;
 /// how often a round looks for posts to repair
 const EVERY: Duration = Duration::from_secs(600);
 /// what is worth the reads: media, not small posts. A post's rows can each be a part of it, soo a row needs less
@@ -181,6 +185,46 @@ async fn round(
     .await
 }
 
+/// Counts each group's big video releases now and then, for the backfill to take those groups first
+/// (`chunks::MEDIA_GROUPS`). With one server or many: it doesn't read from any.
+pub async fn count_media_every(db: Db, stopping: impl Fn() -> bool) {
+    while !stopping() {
+        if let Err(e) = count_media(&db).await {
+            eprintln!("counting big releases per group: {e:#}");
+        }
+        let next = Instant::now() + COUNT_EVERY;
+        while !stopping() && Instant::now() < next {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+}
+
+/// Notes how many big video releases each group holds.
+async fn count_media(db: &Db) -> anyhow::Result<()> {
+    let counts = tokio::task::spawn_blocking(|| db::with_reader(media_counts)).await??;
+    on_db(db, move |conn| Ok(crate::chunks::set_media(conn, &counts)?)).await
+}
+
+/// Each group's releases of `MEDIA_BYTES` or more whose name says 2160p, remux or Dolby Vision.
+pub fn media_counts(conn: &Connection) -> rusqlite::Result<Vec<(String, i64)>> {
+    let mut counts = Vec::new();
+    for s in 0..store::SHARDS {
+        let sql = format!(
+            "select r.group_name, count(*) from s{s}.releases r
+             where r.size >= ?1 and r.group_name is not null and (
+                 lower(coalesce(r.display_name, r.name)) like '%2160p%'
+                 or lower(coalesce(r.display_name, r.name)) like '%remux%'
+                 or lower(coalesce(r.display_name, r.name)) like '%.dv.%'
+                 or lower(coalesce(r.display_name, r.name)) like '%dovi%')
+             group by r.group_name"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map([MEDIA_BYTES], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        counts.extend(rows.collect::<rusqlite::Result<Vec<(String, i64)>>>()?);
+    }
+    Ok(counts)
+}
+
 /// The machine behind a server's name: host and port, without an explicit `#key`, in lower case. Two accounts at one
 /// provider have the same.
 fn machine(host: &str) -> String {
@@ -333,6 +377,44 @@ mod tests {
         assert_eq!(machine("news.newshosting.com"), "news.newshosting.com");
         assert_eq!(machine("News.Newshosting.com#second"), "news.newshosting.com");
         assert_ne!(machine("127.0.0.1:1190"), machine("127.0.0.1:1191"), "a port is another server");
+    }
+
+    #[test]
+    fn big_video_releases_are_counted_per_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        db::create_db_at(&main).unwrap();
+        let release = |name: &str, group: &str, size: i64| {
+            let article = crate::parser::Article {
+                message_id: format!("<{name}@x>"),
+                subject: format!("\"{name}\" yEnc (1/1)"),
+                author: "p <p@x>".into(),
+                filename: Some(format!("{name}.mkv")),
+                part: Some(1),
+                total_parts: Some(1),
+                bytes: 10,
+                ..Default::default()
+            };
+            let r = crate::parser::Release {
+                name: name.into(),
+                group: group.into(),
+                articles: vec![article],
+                ..Default::default()
+            };
+            store::save(&main, &[r]).unwrap();
+            let shard = db::open_shard(&store::shard_path(&main, store::shard_of(group))).unwrap();
+            shard.execute("update releases set size = ?2 where name = ?1", rusqlite::params![name, size]).unwrap();
+        };
+        let big = MEDIA_BYTES + 1;
+        release("Film.2020.2160p.WEB-DL-X", "alt.binaries.a", big);
+        release("Film.2021.1080p.BluRay.REMUX-Y", "alt.binaries.a", big);
+        release("Film.2022.2160p.WEB-DL-Z", "alt.binaries.a", MEDIA_BYTES - 1);
+        release("Show.S01E01.DV.HDR.2160p-W", "alt.binaries.b", big);
+        release("Album.2020.FLAC-V", "alt.binaries.b", big);
+        let conn = db::open_with_shards(&main).unwrap();
+        let mut got = media_counts(&conn).unwrap();
+        got.sort();
+        assert_eq!(got, [("alt.binaries.a".to_string(), 2), ("alt.binaries.b".to_string(), 1)]);
     }
 
     #[test]
