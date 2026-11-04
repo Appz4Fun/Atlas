@@ -40,7 +40,7 @@ const DRAIN_BATCH: usize = 20_000;
 /// Releases read from a shard at a time when building: short reads, soo the indexer's writes don't wait on one.
 const BUILD_BATCH: i64 = 5_000;
 /// Releases a build adds between its commits: about what a restart in the middle of one has to read again.
-const BUILD_COMMIT_EVERY: usize = 250_000;
+const BUILD_COMMIT_EVERY: usize = 1_000_000;
 const WRITER_HEAP: usize = 256 * 1024 * 1024;
 
 /// What a search sorts its matches by.
@@ -266,10 +266,13 @@ impl WordIndex {
         // as SQLite's lower(), which the sort over a category without words goes by
         doc.add_text(f.name_key, shown.to_ascii_lowercase());
         doc.add_text(f.group, &row.group);
-        let tags = crate::release_tags::parse(shown);
-        for tag in TAGS {
-            if tag_matches(tag, &tags) {
-                doc.add_text(f.tags, tag);
+        // most names have no word a tag could come from, and parsing one is most of what indexing it costs
+        if may_have_tags(shown) {
+            let tags = crate::release_tags::parse(shown);
+            for tag in TAGS {
+                if tag_matches(tag, &tags) {
+                    doc.add_text(f.tags, tag);
+                }
             }
         }
         doc
@@ -347,7 +350,7 @@ impl WordIndex {
 
     /// The documents of `rows`, worked out on every core: reading a name's tags is the slow part.
     fn docs(&self, rows: &[Indexed]) -> Vec<TantivyDocument> {
-        let cores = std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(1, 8);
+        let cores = std::thread::available_parallelism().map_or(4, |n| n.get()).max(1);
         let per = rows.len().div_ceil(cores).max(1);
         std::thread::scope(|scope| {
             let parts: Vec<_> = rows
@@ -592,6 +595,29 @@ where
 }
 
 /// The tag filters, as the page has always told them from a name.
+/// Whether `name` holds anything `ptt` makes one of `TAGS` from: a resolution of 1080 or 2160 lines however it's
+/// written, a `WxH` size, BluRay, BD, BR or UHD, a remux, WEB, HDR or Dolby Vision. False is certain; true only means
+/// the name is worth parsing.
+fn may_have_tags(name: &str) -> bool {
+    const WORDS: &[&str] = &[
+        "1080", "2160", "4k", "fhd", "full hd", "1920", "3840", "4096", "blu", "bd", "br", "uhd", "remux", "web",
+        "hdr", "dv", "dolby", "dovi",
+    ];
+    let lower = name.to_ascii_lowercase();
+    if WORDS.iter().any(|w| lower.contains(w)) {
+        return true;
+    }
+    // a frame size, `1998x1080`: the size ptt reads a resolution from
+    let b = lower.as_bytes();
+    b.iter().enumerate().any(|(i, &c)| {
+        c == b'x'
+            && i >= 3
+            && b[i - 3..i].iter().all(u8::is_ascii_digit)
+            && b.get(i + 3).is_some()
+            && b[i + 1..i + 4].iter().all(u8::is_ascii_digit)
+    })
+}
+
 pub fn tag_matches(filter: &str, tags: &crate::release_tags::Tags) -> bool {
     let quality = tags.quality.as_deref().unwrap_or_default();
     match filter {
@@ -860,6 +886,35 @@ mod tests {
 
     const UHD: i64 = 2045;
     const HD: i64 = 2040;
+
+    #[test]
+    fn names_without_a_tag_word_skip_parsing_and_lose_no_tag() {
+        let tagged = [
+            "Movie.2020.2160p.UHD.BluRay.REMUX.DV.HDR.HEVC-X",
+            "Movie 2020 1080p WEB-DL DDP5 1 H 264-Y",
+            "Movie.2020.4K.HDR10+.WEB.h265",
+            "Movie.2020.1920x800.BRRip",
+            "Movie.2020.3840x1600.HEVC",
+            "Movie.2020.1998x1080.x264",
+            "Movie.2020.FHD.WEBRip",
+            "Movie 2020 Full HD x264",
+            "Movie.2020.BDRemux",
+            "Movie.2020.Dolby.Vision.mkv",
+            "Movie.2020.DoVi.mkv",
+            "Movie [BD] 2020",
+            "Movie.2020.10800p.mkv",
+        ];
+        let mut with_tags = 0;
+        for name in tagged {
+            let tags = crate::release_tags::parse(name);
+            with_tags += usize::from(TAGS.iter().any(|t| tag_matches(t, &tags)));
+            assert!(may_have_tags(name), "{name}");
+        }
+        assert!(with_tags >= 10, "{with_tags}");
+        for name in ["Some.Show.S01E02.720p.HDTV", "a8f3c1d2e4b5", "Album - Artist (2001) [FLAC]", "IMG_0042.jpg"] {
+            assert!(!may_have_tags(name), "{name}");
+        }
+    }
 
     #[test]
     fn a_build_cut_short_goes_on_from_its_last_commit() {
