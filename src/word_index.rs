@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::Duration;
 
 use rusqlite::{Connection, OptionalExtension};
@@ -150,7 +150,23 @@ pub struct WordIndex {
     /// The database's `word_index` token the index was built from: another one means a new database.
     built_from: AtomicI64,
     writer: Mutex<Option<IndexWriter>>,
+    /// Whether this process keeps the index up to date (`keep_up` runs here).
+    keeping: AtomicBool,
+    /// How a search asks `keep_up` to drain now, and sees when it has.
+    pulse: Mutex<Pulse>,
+    pulsed: Condvar,
 }
+
+/// `keep_up`'s steps: asked for, begun, and done, counted.
+#[derive(Default)]
+struct Pulse {
+    asked: bool,
+    begun: u64,
+    done: u64,
+}
+
+/// The longest a search waits for `keep_up` to take in what's queued: past that it reads what's indexed.
+const CATCH_UP_WAIT: Duration = Duration::from_millis(500);
 
 impl WordIndex {
     /// The index in `dir`, made empty when it's missing or another version made it.
@@ -178,6 +194,9 @@ impl WordIndex {
             ready: AtomicBool::new(built_from.is_some()),
             built_from: AtomicI64::new(built_from.unwrap_or(0)),
             writer: Mutex::new(None),
+            keeping: AtomicBool::new(false),
+            pulse: Mutex::new(Pulse::default()),
+            pulsed: Condvar::new(),
         })
     }
 
@@ -349,18 +368,46 @@ impl WordIndex {
     }
 
     /// What's queued taken in before a search, soo a release saved a moment ago is found and not only once the
-    /// background drain comes round. Only in the process that keeps the index; a failure leaves it to that drain.
+    /// background drain comes round. The search only asks `keep_up` to drain now and waits a moment for it: the
+    /// drain itself, its reads and its commit, never runs on a request's thread or holds the writer for one.
     fn catch_up(&self, conn: &Connection) {
-        if lock(&self.writer).is_none() {
+        if !self.keeping.load(Ordering::Acquire) {
             return;
         }
         let queued = (0..store::SHARDS).any(|s| {
             conn.query_row(&format!("select exists (select 1 from s{s}.word_queue)"), [], |r| r.get::<_, bool>(0))
                 .unwrap_or(false)
         });
-        if queued && let Err(e) = self.drain(conn) {
-            eprintln!("word index: {e}");
+        if !queued {
+            return;
         }
+        let mut pulse = lock(&self.pulse);
+        // a step already begun may have read the queue before this release was in it: the next one has it
+        let wanted = pulse.begun + 1;
+        pulse.asked = true;
+        self.pulsed.notify_all();
+        let _ = self.pulsed.wait_timeout_while(pulse, CATCH_UP_WAIT, |p| p.done < wanted);
+    }
+
+    /// `keep_up` waits here between steps: `every`, or until a search asks.
+    fn pause(&self, every: Duration) {
+        let pulse = lock(&self.pulse);
+        let (mut pulse, _) =
+            self.pulsed.wait_timeout_while(pulse, every, |p| !p.asked).unwrap_or_else(|e| e.into_inner());
+        pulse.asked = false;
+    }
+
+    /// A `keep_up` step begins; the number it gets is the one `finished` takes.
+    fn begin(&self) -> u64 {
+        let mut pulse = lock(&self.pulse);
+        pulse.asked = false;
+        pulse.begun += 1;
+        pulse.begun
+    }
+
+    fn finished(&self, step: u64) {
+        lock(&self.pulse).done = step;
+        self.pulsed.notify_all();
     }
 
     /// How many releases match, as `search` counts them.
@@ -619,7 +666,9 @@ pub fn start(main: PathBuf) {
 fn keep_up(index: &WordIndex, main: &Path) {
     // said once, not every few seconds while it lasts
     let mut last_error = String::new();
+    index.keeping.store(true, Ordering::Release);
     loop {
+        let begun = index.begin();
         let step = crate::db::open_with_shards(main).map_err(anyhow::Error::from).and_then(|conn| {
             if index.ready() && !index.built_from(&conn)? {
                 // the database was wiped and started again: what's in the index belongs to the old one
@@ -632,6 +681,7 @@ fn keep_up(index: &WordIndex, main: &Path) {
                 index.build(&conn).map(|_| 0)
             }
         });
+        index.finished(begun);
         match step {
             // more queued than one batch: straight on
             Ok(n) if n >= DRAIN_BATCH => continue,
@@ -644,7 +694,7 @@ fn keep_up(index: &WordIndex, main: &Path) {
                 }
             }
         }
-        std::thread::sleep(DRAIN_EVERY);
+        index.pause(DRAIN_EVERY);
     }
 }
 
