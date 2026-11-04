@@ -677,18 +677,17 @@ const ACROSS_POSTERS_ROWS: usize = 32;
 /// crosspost of another (the same parts of the same files) is left out of the post, its group kept. Rows are taken
 /// lowest id first whichever row asks, soo every row of the post gets the same answer.
 fn across_posters(conn: &Connection, anchor: i64, named: &[Named]) -> Result<Option<(SplitPost, Vec<i64>)>> {
-    let Some(anchor_date) = named.iter().find(|n| n.id == anchor).and_then(|n| n.date) else { return Ok(None) };
-    let mut close: Vec<&Named> =
-        named.iter().filter(|n| n.date.is_some_and(|d| (d - anchor_date).abs() <= SPLIT_POST_DAYS)).collect();
-    if close.len() < 2 || close.iter().all(|n| n.poster == close[0].poster) {
+    // every row of the name, whichever asks: a dated one, lowest ids first
+    let mut rows: Vec<&Named> = named.iter().filter(|n| n.date.is_some()).collect();
+    if rows.len() < 2 || rows.iter().all(|n| n.poster == rows[0].poster) || !rows.iter().any(|n| n.id == anchor) {
         return Ok(None);
     }
-    close.sort_by_key(|n| n.id);
-    close.truncate(ACROSS_POSTERS_ROWS);
+    rows.sort_by_key(|n| n.id);
+    rows.truncate(ACROSS_POSTERS_ROWS);
     // each row alone, to tell a crosspost from a part
     let mut kept: Vec<(&Named, UnionFiles)> = Vec::new();
     let mut copies: Vec<(&Named, i64)> = Vec::new();
-    for n in close {
+    for n in rows {
         let files = union_files(conn, &[n.id])?;
         if files.files.is_empty() {
             continue;
@@ -698,50 +697,74 @@ fn across_posters(conn: &Connection, anchor: i64, named: &[Named]) -> Result<Opt
             None => kept.push((n, files)),
         }
     }
-    let mut chosen: Vec<i64> = Vec::new();
-    let mut union = UnionFiles::default();
-    // again over the rows left whenever one joins: a row can share a file only with one that comes later
+    // the rows fall into posts, each grown from its lowest row left: the same posts whoever asks
+    let mut taken: HashSet<i64> = HashSet::new();
+    for seed in 0..kept.len() {
+        if taken.contains(&kept[seed].0.id) {
+            continue;
+        }
+        let (chosen, union) = grow_post(conn, &kept, seed, &taken)?;
+        taken.extend(chosen.iter().copied());
+        let anchor_in = chosen.contains(&anchor) || copies.iter().any(|(n, of)| n.id == anchor && chosen.contains(of));
+        if !anchor_in {
+            continue;
+        }
+        if chosen.len() < 2 || !union.one_upload() {
+            return Ok(None);
+        }
+        return Ok(post_of(kept.iter().map(|(n, _)| *n).filter(|n| chosen.contains(&n.id)).collect(), &copies, union));
+    }
+    Ok(None)
+}
+
+/// The rows not `taken` that join `kept[seed]`, looked at again whenever one joins (a row can share a file only with
+/// one that comes later): each fills the others' gaps, and they stay within `SPLIT_POST_DAYS` of each other.
+fn grow_post(
+    conn: &Connection,
+    kept: &[(&Named, UnionFiles)],
+    seed: usize,
+    taken: &HashSet<i64>,
+) -> Result<(Vec<i64>, UnionFiles)> {
+    let mut chosen = vec![kept[seed].0.id];
+    let mut union = union_files(conn, &chosen)?;
+    let mut span = kept[seed].0.date.map_or((0.0, 0.0), |d| (d, d));
     let mut grew = true;
     while grew {
         grew = false;
-        for (n, files) in &kept {
-            if chosen.contains(&n.id) {
+        for (n, files) in kept {
+            let Some(date) = n.date else { continue };
+            if chosen.contains(&n.id) || taken.contains(&n.id) {
                 continue;
             }
-            if !chosen.is_empty() {
-                let shares = files.files.keys().any(|f| union.files.contains_key(f));
-                if !shares || !union.fills_gaps(files) {
-                    continue;
-                }
+            let (lo, hi) = (span.0.min(date), span.1.max(date));
+            let shares = files.files.keys().any(|f| union.files.contains_key(f));
+            if hi - lo > SPLIT_POST_DAYS || !shares || !union.fills_gaps(files) {
+                continue;
             }
             chosen.push(n.id);
             union = union_files(conn, &chosen)?;
+            span = (lo, hi);
             grew = true;
         }
     }
-    let anchor_in = chosen.contains(&anchor) || copies.iter().any(|(n, of)| n.id == anchor && chosen.contains(of));
-    if chosen.len() < 2 || !anchor_in || !union.one_upload() {
-        return Ok(None);
-    }
-    let rows: Vec<&Named> = kept.iter().map(|(n, _)| *n).filter(|n| chosen.contains(&n.id)).collect();
-    let dates: Vec<Option<f64>> = rows.iter().map(|n| n.date).collect();
-    if !close_together(&dates) {
-        return Ok(None);
-    }
+    Ok((chosen, union))
+}
+
+/// A post of these rows, with what it stands for: its rows and their crossposts.
+fn post_of(rows: Vec<&Named>, copies: &[(&Named, i64)], union: UnionFiles) -> Option<(SplitPost, Vec<i64>)> {
+    let mut ids: Vec<i64> = rows.iter().map(|n| n.id).collect();
     let mut groups: Vec<String> = rows.iter().map(|n| n.group.clone()).collect();
-    groups.extend(copies.iter().filter(|(_, of)| chosen.contains(of)).map(|(n, _)| n.group.clone()));
+    groups.extend(copies.iter().filter(|(_, of)| ids.contains(of)).map(|(n, _)| n.group.clone()));
     groups.sort_unstable();
     groups.dedup();
     if groups.len() > SPLIT_POST_GROUPS {
-        return Ok(None);
+        return None;
     }
     let size = rows.iter().map(|n| n.bytes).sum();
-    chosen.sort_unstable();
-    // what the post stands for: its rows and their crossposts
-    let mut covers = chosen.clone();
-    covers.extend(copies.iter().filter(|(_, of)| chosen.contains(of)).map(|(n, _)| n.id));
-    let post = SplitPost { ids: chosen, groups, size, complete: union.complete(), lead: None, recovery: Vec::new() };
-    Ok(Some((post, covers)))
+    ids.sort_unstable();
+    let mut covers = ids.clone();
+    covers.extend(copies.iter().filter(|(_, of)| ids.contains(of)).map(|(n, _)| n.id));
+    Some((SplitPost { ids, groups, size, complete: union.complete(), lead: None, recovery: Vec::new() }, covers))
 }
 
 #[derive(Clone)]
@@ -1677,12 +1700,24 @@ mod tests {
 
     /// A row in its group's shard with one file per (name, parts held, of how many).
     fn put_row(conn: &Connection, id: i64, name: &str, group: &str, poster: &str, files: &[(&str, &[i64], i64)]) {
+        put_row_at(conn, id, name, group, poster, files, "2026-11-03 07:36:18");
+    }
+
+    fn put_row_at(
+        conn: &Connection,
+        id: i64,
+        name: &str,
+        group: &str,
+        poster: &str,
+        files: &[(&str, &[i64], i64)],
+        posted: &str,
+    ) {
         let s = store::shard_of(group);
         let id = store::global_id(id, s);
         conn.execute(
             &format!(
                 "insert into s{s}.releases (id, name, group_name, poster, posted_date, size, complete, parts, file_total)
-                 values (?1, ?2, ?3, ?4, '2026-11-03 07:36:18', ?5, 0, ?6, 2)"
+                 values (?1, ?2, ?3, ?4, ?7, ?5, 0, ?6, 2)"
             ),
             rusqlite::params![
                 id,
@@ -1690,7 +1725,8 @@ mod tests {
                 group,
                 poster,
                 files.iter().map(|f| f.1.len() as i64 * 100).sum::<i64>(),
-                files.iter().map(|f| f.1.len() as i64).sum::<i64>()
+                files.iter().map(|f| f.1.len() as i64).sum::<i64>(),
+                posted
             ],
         )
         .unwrap();
@@ -1799,6 +1835,43 @@ mod tests {
             .collect();
         assert!(answers.windows(2).all(|w| w[0] == w[1]), "{answers:?}");
         assert_eq!(answers[0].len(), 3);
+    }
+
+    #[test]
+    fn an_unrelated_upload_with_a_lower_id_doesnt_hide_the_post() {
+        let (_dir, conn) = all_shards();
+        let name = "Some.Film.2007.2160p.UHD.BluRay.REMUX.DV.HDR.HEVC.Atmos-GRP";
+        let (a, b, c) = ("alt.binaries.a", "alt.binaries.b", "alt.binaries.c");
+        // a whole upload of its own under other files, then the split one
+        put_row(&conn, 1, name, a, "whole@else", &[("Some.Film.mkv", &[1, 2, 3, 4], 4)]);
+        put_row(&conn, 2, name, b, "x2@nyuu", &[("Some.Film.REMUX.mkv", &[1, 2], 4)]);
+        put_row(&conn, 3, name, c, "x3@nyuu", &[("Some.Film.REMUX.mkv", &[3, 4], 4)]);
+        assert_eq!(whole_post_with(&conn, &row_of(&conn, 1, a)).unwrap(), None);
+        for (i, g) in [(2, b), (3, c)] {
+            let post = whole_post_with(&conn, &row_of(&conn, i, g)).unwrap().unwrap_or_else(|| panic!("row {i}"));
+            assert_eq!(post.ids.len(), 2, "row {i}");
+        }
+    }
+
+    #[test]
+    fn rows_spread_past_a_day_get_one_answer_each() {
+        let (_dir, conn) = all_shards();
+        let name = "Some.Film.2007.2160p.UHD.BluRay.REMUX.DV.HDR.HEVC.Atmos-GRP";
+        let mkv = "Some.Film.mkv";
+        let (a, b, c) = ("alt.binaries.a", "alt.binaries.b", "alt.binaries.c");
+        put_row_at(&conn, 1, name, a, "x1@nyuu", &[(mkv, &[1], 3)], "2026-11-01 00:00:00");
+        put_row_at(&conn, 2, name, b, "x2@nyuu", &[(mkv, &[2], 3)], "2026-11-01 18:00:00");
+        put_row_at(&conn, 3, name, c, "x3@nyuu", &[(mkv, &[3], 3)], "2026-11-02 12:00:00");
+        let answers: Vec<Option<Vec<i64>>> = [(1, a), (2, b), (3, c)]
+            .iter()
+            .map(|(i, g)| whole_post_with(&conn, &row_of(&conn, *i, g)).unwrap().map(|p| p.ids))
+            .collect();
+        let (one, two) = (row_of(&conn, 1, a).id, row_of(&conn, 2, b).id);
+        let mut first = vec![one, two];
+        first.sort_unstable();
+        assert_eq!(answers[0].as_ref(), Some(&first));
+        assert_eq!(answers[1].as_ref(), Some(&first), "the row in the middle goes with the first post");
+        assert_eq!(answers[2], None, "too far from it, and alone");
     }
 
     #[test]
