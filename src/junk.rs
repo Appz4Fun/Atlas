@@ -188,6 +188,27 @@ pub fn inner_or_pc(conn: &Connection, release_id: i64, has_video: bool) -> Resul
     Ok(None)
 }
 
+/// The releases a shard's stored facts already call junk, without reading `files`: a PC category, or a program among
+/// the names inside archives and PAR2 sets. For queueing; each visit decides again.
+pub fn known_junk(conn: &Connection) -> Result<Vec<i64>> {
+    let mut ids: Vec<i64> = conn
+        .prepare("select release_id from release_category where category between 4000 and 4999")?
+        .query_map([], |r| r.get(0))?
+        .collect::<Result<_>>()?;
+    for sql in ["select release_id, name from archive_inner_files", "select release_id, name from par2_files"] {
+        let mut stmt = conn.prepare(sql)?;
+        let mut rows = stmt.query([])?;
+        while let Some(r) = rows.next()? {
+            if is_executable(r.get_ref(1)?.as_str()?) {
+                ids.push(r.get(0)?);
+            }
+        }
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    Ok(ids)
+}
+
 /// Note `name` in `group` as junk, in the caller's transaction.
 pub fn remember(conn: &Connection, name: &str, group: &str, reason: &str, now: i64) -> Result<()> {
     conn.prepare_cached("insert or ignore into junk_releases (name, group_name, reason, at) values (?1, ?2, ?3, ?4)")?
@@ -323,6 +344,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(stored_reason(&conn, film).unwrap(), Some(EXECUTABLE_INSIDE));
+        assert_eq!(known_junk(&conn).unwrap(), {
+            let mut both = vec![packed, film];
+            both.sort_unstable();
+            both
+        });
         assert!(stale_pc(&conn, film, true).unwrap());
         assert!(!stale_pc(&conn, packed, false).unwrap());
         assert!(!remove(&conn, film, PC, 5).unwrap(), "video that came since the step looked keeps it");

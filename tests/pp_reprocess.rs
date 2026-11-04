@@ -74,7 +74,7 @@ fn the_walk_clears_the_mask_and_the_step_runs_again() {
     let bit = mask(StepId(9));
     let id = h.id_of("Rel.One");
     conn.execute_batch(
-        "delete from pp_queue; insert or replace into meta (key, value) values ('pp_walk_seeded', 1), ('pp_junk_walk', 1), ('pp_steps_seen', 512);",
+        "delete from pp_queue; insert or replace into meta (key, value) values ('pp_walk_seeded', 1), ('pp_junk_walk', 1), ('pp_junk_queued', 1), ('pp_steps_seen', 512);",
     )
     .unwrap();
     conn.execute("insert into pp_state (release_id, done, parts_seen) values (?, ?, 2)", rusqlite::params![id, bit])
@@ -185,7 +185,7 @@ fn a_walks_request_waits_for_a_release_still_settling() {
     let bit = mask(StepId(9));
     let id = h.id_of("Rel.One");
     conn.execute_batch(
-        "insert or replace into meta (key, value) values ('pp_walk_seeded', 1), ('pp_junk_walk', 1), ('pp_steps_seen', 512);",
+        "insert or replace into meta (key, value) values ('pp_walk_seeded', 1), ('pp_junk_walk', 1), ('pp_junk_queued', 1), ('pp_steps_seen', 512);",
     )
     .unwrap();
     // done, not growing, and touched just now: the walk finds it before it settles

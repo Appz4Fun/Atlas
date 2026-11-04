@@ -1143,6 +1143,17 @@ fn seed_shard(conn: &Connection, enabled: StepMask, stamps: &[(u8, StepMask, i64
         }
         set("pp_junk_walk", now)?;
     }
+    // and the rows whose stored facts already say junk, through the queue at once: the walk takes days on a big shard
+    if meta("pp_junk_queued")?.is_none() {
+        let known = crate::junk::known_junk(conn)?;
+        let mut queue = conn.prepare_cached(
+            "insert into pp_queue (release_id, due_at) values (?1, ?2) on conflict(release_id) do update set due_at = ?2",
+        )?;
+        for id in known {
+            queue.execute(params![id, now])?;
+        }
+        set("pp_junk_queued", now)?;
+    }
     let seen = meta("pp_steps_seen")?.unwrap_or(0);
     let new = if seeded { enabled & !seen } else { enabled };
     if seeded && new != 0 {
