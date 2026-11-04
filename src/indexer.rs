@@ -220,13 +220,28 @@ impl RunStates {
         })
     }
 
-    /// `start..=end` of `key` was read: refusals of it are over.
+    /// `start..=end` of `key` was read: refusals of it are over. Only of it:
+    /// slice bounds move, soo what of a refused range is left either side
+    /// keeps its history.
     pub fn read(&self, group: &str, key: &str, (start, end): (u64, u64)) {
         let mut states = self.0.lock().unwrap();
         if let Some(st) = states.get_mut(group)
             && !st.refused.is_empty()
         {
-            st.refused.retain(|r| !(r.key == key && r.start <= end && start <= r.end));
+            let mut left = Vec::new();
+            st.refused.retain(|r| {
+                if r.key != key || end < r.start || r.end < start {
+                    return true;
+                }
+                if r.start < start {
+                    left.push(Refused { end: start - 1, key: r.key.clone(), ..*r });
+                }
+                if end < r.end {
+                    left.push(Refused { start: end + 1, key: r.key.clone(), ..*r });
+                }
+                false
+            });
+            st.refused.extend(left);
         }
     }
 
@@ -2218,8 +2233,15 @@ mod tests {
 
         // a read in between ends it
         assert!(!refused((300, 399), REFUSED_FOR + Duration::from_secs(1)));
-        states.read("g", "g@a", (350, 360));
+        states.read("g", "g@a", (250, 449));
         assert!(!refused((300, 399), REFUSED_FOR * 3), "read since: counted from the start again");
+
+        // a read of part of a refused range ends only that part
+        assert!(!refused((1000, 1099), Duration::ZERO));
+        assert!(!refused((1000, 1099), Duration::from_secs(10)));
+        states.read("g", "g@a", (950, 1049));
+        assert!(refused((1050, 1149), REFUSED_FOR), "the rest kept its hour");
+        assert!(!refused((1000, 1049), REFUSED_FOR), "the part read starts over");
     }
 
     #[test]
