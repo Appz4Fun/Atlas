@@ -1200,6 +1200,11 @@ fn seed_shard(conn: &Connection, enabled: StepMask, stamps: &[(u8, StepMask, i64
         }
         set("pp_junk_queued", now)?;
     }
+    // once, for the movies and TV ranked before `SMALL_VIDEO` counted: ranked again, soo they leave the 0s
+    if meta("pp_net_rank_small_video")?.is_none() {
+        rerank_small_video(conn)?;
+        set("pp_net_rank_small_video", now)?;
+    }
     let seen = meta("pp_steps_seen")?.unwrap_or(0);
     let new = if seeded { enabled & !seen } else { enabled };
     if seeded && new != 0 {
@@ -1219,6 +1224,19 @@ fn seed_shard(conn: &Connection, enabled: StepMask, stamps: &[(u8, StepMask, i64
         }
     }
     Ok(())
+}
+
+/// Ranks again the movie and TV releases of `SMALL_VIDEO` or more the net lane still wants at 0, the rank they had
+/// before it counted. Through the category index: a shard has tens of millions of 0s and ~150,000 movies and TV.
+pub(crate) fn rerank_small_video(conn: &Connection) -> rusqlite::Result<usize> {
+    let sql = format!(
+        "update pp_state set net_rank = {} where net_wanted = 1 and net_rank = 0 and release_id in (
+             select c.release_id from release_category c join releases r on r.id = c.release_id
+             where (c.category between 2000 and 2999 or c.category between 5000 and 5999) and r.size >= {})",
+        super::schema::NET_RANK.replace("?1", "pp_state.release_id"),
+        super::schema::SMALL_VIDEO,
+    );
+    conn.execute(&sql, [])
 }
 
 /// The net lane's order for a shard's `claims`-th claim. Mostly by `net_rank`, biggest video first, as the owner
