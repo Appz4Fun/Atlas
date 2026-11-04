@@ -141,6 +141,35 @@ fn a_home_that_indexed_a_group_loses_it_only_after_misses_in_a_row() {
     assert_eq!(select(false).unwrap().0, 1);
 }
 
+/// A group that left its home for a while, and then left that server too, still goes back to the home it left first.
+#[test]
+fn a_group_moved_twice_goes_back_to_the_home_it_left_first() {
+    let servers: Vec<_> = (0..3).map(|_| Server::new(posts(50))).collect();
+    let ports: Vec<u16> = servers.iter().map(|s| spawn_server(s.clone())).collect();
+    let cfgs: Vec<_> = ports.iter().map(|&p| mock(p, "secret", 4, 1)).collect();
+    let pool = BlockingPool::from_pool(atlas::nntp::Pool::new(&cfgs).with_home_retry(std::time::Duration::ZERO));
+    let miss = |i: usize, n: usize| {
+        for _ in 0..n {
+            servers[i].group_replies.lock().unwrap().push_back("411 no such group".to_string());
+        }
+    };
+    let select = |prefer| pool.block_on(pool.pool.select_group_known(prefer, GROUP, true));
+
+    // the home, 0, misses 3 times in a row: the group goes to one of the others
+    miss(0, 3);
+    assert!(select(0).is_err() && select(0).is_err());
+    let first = select(0).unwrap().0;
+    assert_ne!(first, 0);
+    // that one misses too; the home still can't answer, so the group goes to the third
+    miss(first, 3);
+    miss(0, 1);
+    assert!(select(first).is_err() && select(first).is_err());
+    let second = select(first).unwrap().0;
+    assert_eq!(second, 3 - first, "neither the home nor the server it just left");
+    // once it is due, back to the home it left first, not the one in between
+    assert_eq!(pool.pool.pick_server(GROUP), 0);
+}
+
 /// A slice answered with a 5xx (an overview in trouble for a while) is asked
 /// again on the next passes instead of being taken for gone: every article
 /// still gets indexed and the backfill reaches the bottom.

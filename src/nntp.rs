@@ -1583,6 +1583,8 @@ pub struct Pool {
     homes: Mutex<HashMap<String, Home>>,
     /// (group, server): GROUPs in a row the server said it doesnt carry the group although it indexed it before
     misses: Mutex<HashMap<(String, usize), u32>>,
+    /// `HOME_RETRY`, shorter in tests
+    home_retry: Duration,
     unsaved: Arc<UnsavedBudget>,
     /// how long a background body waits for room before queuing
     body_patience: Duration,
@@ -1781,6 +1783,7 @@ impl Pool {
             timeout: DEFAULT_TIMEOUT,
             homes: Mutex::new(HashMap::new()),
             misses: Mutex::new(HashMap::new()),
+            home_retry: HOME_RETRY,
             body_patience: BODY_PATIENCE,
             unsaved: UnsavedBudget::new(crate::config::DEFAULT_MAX_UNSAVED_HEADERS as usize),
             rate_limiter: Arc::new(TokenBucket::new(0, 0)),
@@ -1793,6 +1796,12 @@ impl Pool {
 
     pub fn with_rate_limiter(mut self, limiter: Arc<TokenBucket>) -> Self {
         self.rate_limiter = limiter;
+        self
+    }
+
+    /// how long a group stays off a home it left before going back (`HOME_RETRY`)
+    pub fn with_home_retry(mut self, after: Duration) -> Self {
+        self.home_retry = after;
         self
     }
 
@@ -1953,7 +1962,7 @@ impl Pool {
             let mut homes = self.homes.lock().unwrap();
             if let Some(mut home) = homes.get(group).copied() {
                 if let Some(back) = home.back
-                    && home.since.elapsed() >= HOME_RETRY
+                    && home.since.elapsed() >= self.home_retry
                 {
                     home = Home { server: back, since: Instant::now(), back: None };
                     homes.insert(group.to_string(), home);
@@ -2413,8 +2422,13 @@ impl Pool {
         for i in self.ranked(&indexing, group) {
             if let Ok(r) = self.select_on(i, group).await {
                 println!("{group} not on {}, using {}", self.servers[prefer].cfg.host, self.servers[i].cfg.host);
-                let home = Home { server: i, since: Instant::now(), back: known.then_some(prefer) };
-                self.homes.lock().unwrap().insert(group.to_string(), home);
+                let mut homes = self.homes.lock().unwrap();
+                // leaving a home it was only on for a while, it still goes back to the one it left first
+                let back = match homes.get(group) {
+                    Some(h) if h.server == prefer && h.back.is_some() => h.back,
+                    _ => known.then_some(prefer),
+                };
+                homes.insert(group.to_string(), Home { server: i, since: Instant::now(), back });
                 return Ok((i, r));
             }
         }
