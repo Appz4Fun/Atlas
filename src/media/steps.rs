@@ -16,10 +16,11 @@ use crate::postprocess::step::{
 use crate::store::SegmentPick;
 
 use super::Media;
+use super::allocine::allocine_id;
 use super::http::now_secs;
 use super::parse::{Parsed, parse_movie, parse_tv};
 use super::query::MAX_TITLE;
-use super::resolve::{Ids, Resolved, TitleQuery};
+use super::resolve::{Ids, Resolved, TitleQuery, Trouble};
 use super::title::{Kind, normalize, split_country, title_key};
 
 pub const MEDIA_RELEASE: ShardTable = ShardTable {
@@ -281,10 +282,25 @@ impl Step for MediaLookup {
         let Some((kind, p)) = target_of(&self.0, ctx.release()) else { return Ok(Outcome::default()) };
         let key = key_of(kind, &p);
         let (title, country) = split_country(&p.title);
-        let q = TitleQuery { kind, title, year: p.year, country };
+        // `AC31594` is AlloCiné's: what it is, by name and by whatever ids Wikidata has, before any provider
+        let decoded = match (allocine_id(title), self.0.allocine()) {
+            (Some(ac), Some(allocine)) => match allocine.decode(kind, ac) {
+                Ok(found) => found,
+                Err(Trouble::Paused(t) | Trouble::BadKey(t)) => {
+                    return Ok(Outcome { wait_until: Some(t + id.rem_euclid(30)), ..Outcome::default() });
+                }
+                Err(Trouble::Bad(e)) => return Err(StepError::Retry(e)),
+            },
+            _ => None,
+        };
+        let q = match &decoded {
+            Some(d) => TitleQuery { kind, title: &d.title, year: p.year.or(d.year), country: None },
+            None => TitleQuery { kind, title, year: p.year, country },
+        };
+        let seed = decoded.as_ref().map(|d| (&d.ids, d.title.as_str()));
         let resolved = {
             let ctx_ref = &*ctx;
-            self.0.resolve_until(&q, key, now_secs(), &|| ctx_ref.stopping())
+            self.0.resolve_seeded(&q, key, now_secs(), &|| ctx_ref.stopping(), seed)
         };
         match resolved.map_err(StepError::Retry)? {
             Resolved::Found(ids) => {

@@ -56,7 +56,7 @@ pub enum Answer {
     NotFound,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Trouble {
     /// can't be asked until then
     Paused(i64),
@@ -119,6 +119,19 @@ impl Media {
         now: i64,
         stopping: &dyn Fn() -> bool,
     ) -> Result<Resolved, String> {
+        self.resolve_seeded(q, key, now, stopping, None)
+    }
+
+    /// As `resolve_until`, with ids already known some other way, as an AlloCiné id's from Wikidata. They come first,
+    /// soo a provider's answer for another title of the same name is passed over.
+    pub(crate) fn resolve_seeded(
+        &self,
+        q: &TitleQuery<'_>,
+        key: i64,
+        now: i64,
+        stopping: &dyn Fn() -> bool,
+        seed: Option<(&Ids, &str)>,
+    ) -> Result<Resolved, String> {
         let providers = self.providers();
         let existing = self.with_store(|c| store::get(c, key))?;
         let mut row = existing.clone().unwrap_or(TitleRow {
@@ -135,14 +148,21 @@ impl Media {
             row.checked_mask = 0;
             row.ids = Ids::default();
         }
+        let before = row.ids;
+        if let Some((ids, title)) = seed.filter(|(ids, _)| ids.any() && row.ids.consistent(ids)) {
+            row.ids.merge(ids);
+            if row.found_title.is_none() {
+                row.found_title = Some(title.to_string());
+            }
+        }
+        let seeded = row.ids.any() && row.state != STATE_FOUND;
         let ask: Vec<_> =
             providers.iter().filter(|p| p.asks(q.kind) && i64::from(p.bit()) & row.checked_mask == 0).collect();
-        if ask.is_empty() {
+        if ask.is_empty() && !seeded {
             self.clear_claim(key);
             return Ok(if row.state == STATE_FOUND { Resolved::Found(row.ids) } else { Resolved::NotFound });
         }
 
-        let before = row.ids;
         let (mut later, mut bad, mut stopped): (Option<i64>, Option<String>, bool) = (None, None, false);
         for provider in ask {
             if stopping() {
