@@ -619,23 +619,31 @@ struct Named {
 }
 
 fn exact_split_post(conn: &Connection, posted: &str, release: &crate::search::ReleaseRow) -> Result<Option<SplitPost>> {
-    let mut named = Vec::new();
-    for s in 0..store::SHARDS {
-        let mut stmt = conn.prepare_cached(&split_post_sql(s))?;
-        let rows = stmt.query_map(rusqlite::params![posted], |r| {
-            Ok(Named {
-                id: r.get(0)?,
-                group: r.get::<_, Option<String>>(1)?.unwrap_or_default(),
-                bytes: r.get(2)?,
-                date: r.get(3)?,
-                poster: r.get(4)?,
-            })
-        })?;
-        for row in rows {
-            named.push(row?);
+    let named_rows = |sql: fn(usize) -> String, poster: Option<&Option<String>>| -> Result<Vec<Named>> {
+        let mut out = Vec::new();
+        for s in 0..store::SHARDS {
+            let mut stmt = conn.prepare_cached(&sql(s))?;
+            let read = |r: &rusqlite::Row<'_>| {
+                Ok(Named {
+                    id: r.get(0)?,
+                    group: r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                    bytes: r.get(2)?,
+                    date: r.get(3)?,
+                    poster: r.get(4)?,
+                })
+            };
+            let rows: Vec<Named> = match poster {
+                Some(p) => stmt.query_map(rusqlite::params![posted, p], read)?.collect::<Result<_>>()?,
+                None => stmt.query_map(rusqlite::params![posted], read)?.collect::<Result<_>>()?,
+            };
+            out.extend(rows);
         }
-    }
-    let same: Vec<&Named> = named.iter().filter(|n| n.poster == release.poster).collect();
+        Ok(out)
+    };
+    // the poster's own rows by a lookup of their own: other posters' rows mustn't use up its limit
+    let same = named_rows(split_post_sql, Some(&release.poster))?;
+    let named = named_rows(named_rows_sql, None)?;
+    let same: Vec<&Named> = same.iter().collect();
     let by_poster = same_poster_post(conn, &same)?;
     // one poster can have several of the groups: the post across posters is taken only if it holds all of those
     match (by_poster, across_posters(conn, release.id, &named)?) {
@@ -692,7 +700,9 @@ fn across_posters(conn: &Connection, anchor: i64, named: &[Named]) -> Result<Opt
         if files.files.is_empty() {
             continue;
         }
-        match kept.iter().find(|(_, k)| k.same_parts(&files)) {
+        // a crosspost is posted with what it copies: an older upload of the same parts is a post of its own
+        let near = |of: &Named| matches!((of.date, n.date), (Some(a), Some(b)) if (a - b).abs() <= SPLIT_POST_DAYS);
+        match kept.iter().find(|(of, k)| near(of) && k.same_parts(&files)) {
             Some((of, _)) => copies.push((n, of.id)),
             None => kept.push((n, files)),
         }
@@ -876,9 +886,18 @@ fn try_stem_subset(conn: &Connection, stem: &str, subset: &[StemCandidate]) -> R
     Ok(Some(SplitPost { ids, groups, size, complete: files.complete(), lead: None, recovery: Vec::new() }))
 }
 
-/// A shard's rows of one name, by the name index: a lookup by poster would walk `idx_release_poster`, every row a busy
-/// poster ever posted, and a page of results took minutes. Parameters: ?1 the posted name.
+/// A shard's rows of one name and poster. `+poster` keeps the lookup on the name index: with no statistics SQLite
+/// would rather walk `idx_release_poster`, every row a busy poster ever posted, and a page of results took minutes.
+/// Parameters: ?1 the posted name, ?2 the poster.
 fn split_post_sql(s: usize) -> String {
+    format!(
+        "select id, group_name, coalesce(size, 0), julianday(posted_date), poster from s{s}.releases
+         where name = ?1 and +poster is ?2 and not atlas_blocked(group_name) limit 64"
+    )
+}
+
+/// A shard's rows of one name, whoever posted them, by the name index. Parameters: ?1 the posted name.
+fn named_rows_sql(s: usize) -> String {
     format!(
         "select id, group_name, coalesce(size, 0), julianday(posted_date), poster from s{s}.releases
          where name = ?1 and not atlas_blocked(group_name) limit 64"
@@ -1257,7 +1276,7 @@ mod tests {
         let plan: Vec<String> = conn
             .prepare(&format!("explain query plan {}", split_post_sql(0)))
             .unwrap()
-            .query_map(["a.name"], |r| r.get(3))
+            .query_map(["a.name", "someone"], |r| r.get(3))
             .unwrap()
             .collect::<rusqlite::Result<_>>()
             .unwrap();
@@ -1872,6 +1891,43 @@ mod tests {
         assert_eq!(answers[0].as_ref(), Some(&first));
         assert_eq!(answers[1].as_ref(), Some(&first), "the row in the middle goes with the first post");
         assert_eq!(answers[2], None, "too far from it, and alone");
+    }
+
+    #[test]
+    fn an_older_upload_of_the_same_parts_isnt_a_crosspost() {
+        let (_dir, conn) = all_shards();
+        let name = "Some.Film.2007.2160p.UHD.BluRay.REMUX.DV.HDR.HEVC.Atmos-GRP";
+        let mkv = "Some.Film.mkv";
+        let (a, b, c) = ("alt.binaries.a", "alt.binaries.b", "alt.binaries.c");
+        put_row_at(&conn, 1, name, a, "old@else", &[(mkv, &[1], 2)], "2026-10-20 00:00:00");
+        put_row_at(&conn, 2, name, b, "x2@nyuu", &[(mkv, &[1], 2)], "2026-10-30 00:00:00");
+        put_row_at(&conn, 3, name, c, "x3@nyuu", &[(mkv, &[2], 2)], "2026-10-30 00:10:00");
+        for (i, g) in [(2, b), (3, c)] {
+            let post = whole_post_with(&conn, &row_of(&conn, i, g)).unwrap().unwrap_or_else(|| panic!("row {i}"));
+            assert_eq!(post.ids.len(), 2, "row {i}");
+        }
+    }
+
+    #[test]
+    fn a_name_in_many_groups_still_finds_the_posters_own_rows() {
+        let (_dir, conn) = all_shards();
+        let name = "Some.Film.2007.2160p.UHD.BluRay.REMUX.DV.HDR.HEVC.Atmos-GRP";
+        let mkv = "Some.Film.mkv";
+        let shard = store::shard_of("alt.binaries.zz.a");
+        let groups: Vec<String> = (0..2000)
+            .map(|n| format!("alt.binaries.g{n:04}"))
+            .filter(|g| store::shard_of(g) == shard)
+            .take(70)
+            .collect();
+        // other posters' rows of the name come first in the name index
+        for (n, g) in groups.iter().take(68).enumerate() {
+            put_row(&conn, 100 + n as i64, name, g, &format!("other{n}@else"), &[(mkv, &[1, 2], 2)]);
+        }
+        let (a, b) = (groups[68].as_str(), groups[69].as_str());
+        put_row(&conn, 1, name, a, "x1@nyuu", &[(mkv, &[1], 2)]);
+        put_row(&conn, 2, name, b, "x1@nyuu", &[(mkv, &[2], 2)]);
+        let post = whole_post_with(&conn, &row_of(&conn, 1, a)).unwrap().unwrap();
+        assert_eq!(post.ids.len(), 2);
     }
 
     #[test]
