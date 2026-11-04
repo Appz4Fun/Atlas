@@ -38,12 +38,12 @@ static READERS: Mutex<Vec<Reader>> = Mutex::new(Vec::new());
 static READER_SWEEP: Once = Once::new();
 
 /// one per api worker
-const MAX_READERS: usize = 4;
+const MAX_READERS: usize = 16;
 const READER_IDLE: Duration = Duration::from_secs(600);
 const READER_SWEEP_EVERY: Duration = Duration::from_secs(30);
 /// All the page cache kept readers may hold together, however many searches run at once, which is split
 /// evenly per reader per shard. A shard's default is 2MB.
-const READERS_CACHE_KIB: i64 = 128 * 1024;
+const READERS_CACHE_KIB: i64 = 2 * 1024 * 1024;
 const READER_CACHE_KIB: i64 = READERS_CACHE_KIB / (MAX_READERS as i64 * store::SHARDS as i64);
 
 /// What identifies the main database and each shard's file right now. None where that can't be told, and
@@ -182,10 +182,10 @@ fn set_up(conn: Connection) -> Result<Connection> {
 /// cut back to 256MB whenever it starts over.
 pub fn tune_for_writing(conn: &Connection) -> Result<()> {
     conn.execute_batch(
-        "pragma cache_size = -262144;
+        "pragma cache_size = -1048576;
          pragma temp_store = memory;
          pragma wal_autocheckpoint = 0;
-         pragma journal_size_limit = 268435456;",
+         pragma journal_size_limit = 1073741824;",
     )
 }
 

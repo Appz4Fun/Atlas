@@ -47,7 +47,9 @@ pub fn create(conn: &Connection) -> Result<()> {
             reach INTEGER NOT NULL,
             days INTEGER NOT NULL,
             articles INTEGER NOT NULL
-        ) without rowid;",
+        ) without rowid;
+        create index if not exists idx_backfill_chunks_grp_state_day
+            on backfill_chunks (grp, state, day desc, claimed_at);",
     )?;
     add_column(conn, "backfill_chunks", "done_at")?;
     add_column(conn, "backfill_deepest", "oldest_at")?;
@@ -230,21 +232,37 @@ pub fn claim(conn: &Connection, groups: &[(String, i64)], host: &str, now: i64) 
     }
     let rows = vec!["(?, ?)"; groups.len()].join(", ");
     let sql = format!(
-        "with wanted (g, oldest) as (values {rows})
+        "with wanted (g, oldest) as (values {rows}),
+              candidates (grp, p_day, s_day) as materialized (
+                  select w.g,
+                         (select c.day from backfill_chunks c
+                          where c.grp = w.g and c.state = {PENDING} and c.day >= w.oldest
+                          order by c.day desc limit 1),
+                         (select c.day from backfill_chunks c
+                          where c.grp = w.g and c.state = {CLAIMED} and c.day >= w.oldest and c.claimed_at < ?
+                          order by c.day desc limit 1)
+                  from wanted w
+              ),
+              best (grp, day) as (
+                  select grp, case
+                      when p_day is null then s_day
+                      when s_day is null then p_day
+                      when p_day >= s_day then p_day
+                      else s_day
+                  end
+                  from candidates
+              )
          update backfill_chunks set state = ?, server = ?, claimed_at = ?
-         where (grp, day) = (select c.grp, c.day from backfill_chunks c join wanted w on w.g = c.grp
-                             where c.day >= w.oldest
-                               and (c.state = {PENDING} or (c.state = {CLAIMED} and c.claimed_at < ?))
-                             order by c.day desc limit 1)
+         where (grp, day) = (select grp, day from best where day is not null order by day desc limit 1)
          returning grp, day"
     );
-    let mut values: Vec<rusqlite::types::Value> = Vec::new();
+    let mut values: Vec<rusqlite::types::Value> = Vec::with_capacity(groups.len() * 2 + 4);
     for (g, oldest) in groups {
         values.push(g.clone().into());
         values.push((*oldest).into());
     }
-    values.extend([CLAIMED.into(), host.to_string().into(), now.into()]);
     values.push((now - CLAIM_TIMEOUT).into());
+    values.extend([CLAIMED.into(), host.to_string().into(), now.into()]);
     let found: Option<(String, i64)> =
         conn.prepare(&sql)?.query_row(rusqlite::params_from_iter(values), |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
     Ok(found.map(|(group, day)| Claim { group, day, server: host.to_string(), claimed_at: now }))

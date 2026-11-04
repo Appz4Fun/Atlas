@@ -1156,8 +1156,9 @@ fn index(config: Config, stop: Arc<AtomicBool>, writing: Option<WriteGuard>) -> 
         });
     }
 
+    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(10).max(8);
     let runtime = match tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
+        .worker_threads(threads)
         .thread_name("atlas-indexer")
         .enable_all()
         .build()

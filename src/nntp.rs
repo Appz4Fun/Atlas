@@ -44,7 +44,9 @@ impl NntpError {
     }
 
     /// an XOVER range with no articles in it: 423, or 420 ("No Articles
-    /// Selected") from some providers
+    /// Selected") from some providers. Not 430 ("Failed forwarding") or 403
+    /// ("Operation failed"): those say the server couldn't answer, and a range
+    /// taken for empty is never read again
     pub fn is_empty_range(&self) -> bool {
         matches!(self.code(), Some(420 | 423))
     }
@@ -471,6 +473,8 @@ pub struct Conn {
     pub group: Option<String>,
     /// server agreed to XFEATURE COMPRESS GZIP on this connection
     pub compressed: bool,
+    /// set when a compressed response timed out waiting for its stream end trailer
+    poisoned: bool,
     /// bytes received off the socket, and the same after decompression,
     /// since the pool last collected them
     wire: u64,
@@ -603,15 +607,16 @@ impl Conn {
 
     fn over(stream: Box<dyn AsyncStream>, timeout: Duration) -> Conn {
         Conn {
-            io: BufReader::with_capacity(64 * 1024, stream),
+            io: BufReader::with_capacity(256 * 1024, stream),
             timeout,
             group: None,
             compressed: false,
+            poisoned: false,
             wire: 0,
             text: 0,
             sent: 0,
             server: Arc::from(""),
-            rate_limiter: Arc::new(TokenBucket::new(RATE_750_MBIT, DEFAULT_BURST_BYTES)),
+            rate_limiter: Arc::new(TokenBucket::new(0, 0)),
         }
     }
 
@@ -678,7 +683,10 @@ impl Conn {
                 // all lines are in, only the end of the compressed stream is missing.
                 // a server that never closes the stream properly sends nothing more
                 match self.read_chunk(STREAM_END_WAIT).await {
-                    Err(NntpError::Io(e)) if e.kind() == io::ErrorKind::TimedOut => return Ok(true),
+                    Err(NntpError::Io(e)) if e.kind() == io::ErrorKind::TimedOut => {
+                        self.poisoned = true;
+                        return Ok(true);
+                    }
                     r => r?,
                 }
             } else {
@@ -1173,9 +1181,24 @@ impl Inflater {
             self.head.extend_from_slice(input);
             let head = std::mem::take(&mut self.head);
 
-            if head.len() < 2 {
+            if head.len() < 2
+                || (head[0] == b'.' && head.len() < 3 && !head.ends_with(b"\n"))
+                || (head.iter().all(|b| b.is_ascii_digit()) && head.len() < 20)
+            {
                 self.head = head;
                 return Ok(Vec::new());
+            }
+
+            // Some providers send a plain ".\r\n" terminator on an empty range or
+            // plain "<number>\t..." overview lines even when the 224 banner advertises
+            // [COMPRESS=GZIP].
+            let digits = head.iter().take_while(|b| b.is_ascii_digit()).count();
+            if head.starts_with(b".\r\n")
+                || head.starts_with(b".\n")
+                || (digits > 0 && head.get(digits) == Some(&b'\t'))
+            {
+                self.state = InflateState::Done;
+                return Ok(head);
             }
 
             let (decompress, gzip, skip) = if head[0] == 0x1f && head[1] == 0x8b {
@@ -1187,7 +1210,11 @@ impl Inflater {
                     Some(Err(e)) => return Err(e),
                     Some(Ok(n)) => (flate2::Decompress::new(false), true, n),
                 }
-            } else if head[0] & 0x0f == 8 && (u16::from(head[0]) << 8 | u16::from(head[1])) % 31 == 0 {
+            } else if head[0] & 0x0f == 8
+                && (head[0] >> 4) <= 7
+                && (head[1] & 0x20) == 0
+                && (u16::from(head[0]) << 8 | u16::from(head[1])) % 31 == 0
+            {
                 (flate2::Decompress::new(true), false, 0)
             } else {
                 (flate2::Decompress::new(false), false, 0)
@@ -1281,6 +1308,8 @@ struct Server {
     down_until: Mutex<Option<Instant>>,
     /// set when the server's compressed headers couldnt be read
     no_compress: AtomicBool,
+    /// consecutive compressed header failures
+    compress_refusals: AtomicUsize,
     /// server answered GROUP with 500/501: an article only server (fill / bonus),
     /// used for article lookups but not for indexing
     no_index: AtomicBool,
@@ -1397,7 +1426,7 @@ impl Drop for Lease {
     fn drop(&mut self) {
         self.collect_traffic();
         // half a reply left unread would be the next request's answer
-        if let Some(conn) = self.conn.take().filter(|_| !self.busy) {
+        if let Some(conn) = self.conn.take().filter(|c| !self.busy && !c.poisoned) {
             self.server.idle.lock().unwrap().push(conn);
         }
     }
@@ -1687,6 +1716,7 @@ impl Pool {
                         permits: Arc::new(Semaphore::new(cfg.connections().max(1) as usize)),
                         down_until: Mutex::new(None),
                         no_compress: AtomicBool::new(false),
+                        compress_refusals: AtomicUsize::new(0),
                         no_index: AtomicBool::new(false),
                         group_refusals: AtomicUsize::new(0),
                         warned_auth: AtomicBool::new(false),
@@ -1706,7 +1736,7 @@ impl Pool {
             homes: Mutex::new(HashMap::new()),
             body_patience: BODY_PATIENCE,
             unsaved: UnsavedBudget::new(crate::config::DEFAULT_MAX_UNSAVED_HEADERS as usize),
-            rate_limiter: Arc::new(TokenBucket::new(RATE_750_MBIT, DEFAULT_BURST_BYTES)),
+            rate_limiter: Arc::new(TokenBucket::new(0, 0)),
         }
     }
 
@@ -2284,8 +2314,8 @@ impl Pool {
     pub async fn select_group_on(&self, prefer: usize, group: &str) -> Result<(usize, (u64, u64, u64, String))> {
         let first_err = match self.select_on(prefer, group).await {
             Ok(r) => return Ok((prefer, r)),
-            // 411 = this provider doesnt carry the group, 500/501 = no GROUP at all
-            Err(e) if matches!(e.code(), Some(411 | 500 | 501)) => e,
+            // 403/411/430 = this provider doesnt carry the group, 500/501 = no GROUP at all
+            Err(e) if matches!(e.code(), Some(403 | 411 | 430 | 500 | 501)) => e,
             Err(e) => return Err(e),
         };
 
@@ -2336,6 +2366,7 @@ impl Pool {
         crate::profile::LOAD.xovers.fetch_add(1, Ordering::Relaxed);
         match r {
             Ok(ends) => {
+                lease.server.compress_refusals.store(0, Ordering::Relaxed);
                 lease.server.headers.fetch_add(ends.rows as u64, Ordering::Relaxed);
                 // the rest of a listing cut short is still coming: the lease
                 // stays busy, soo the connection is thrown away
@@ -2635,13 +2666,17 @@ impl Pool {
         Ok(rows.iter().find(|o| plausible_post_time(&o.date).is_some_and(|t| t >= when)).map(|o| o.number))
     }
 
-    /// Compressed listings from server `i` couldnt be read: it gets plain ones from now on.
+    /// Compressed listings from server `i` couldnt be read: it gets plain ones from now on
+    /// when it has never delivered headers or failed `GROUP_REFUSALS` times in a row.
     fn no_compression(&self, i: usize, e: &str) {
         let server = &self.servers[i];
-        if !server.no_compress.swap(true, Ordering::Relaxed) {
-            println!("{}: couldnt read compressed headers ({e}), turning compression off", server.cfg.host);
+        let refusals = server.compress_refusals.fetch_add(1, Ordering::Relaxed) + 1;
+        if server.headers.load(Ordering::Relaxed) == 0 || refusals >= GROUP_REFUSALS {
+            if !server.no_compress.swap(true, Ordering::Relaxed) {
+                println!("{}: couldnt read compressed headers ({e}), turning compression off", server.cfg.host);
+            }
+            server.idle.lock().unwrap().retain(|c| !c.compressed);
         }
-        server.idle.lock().unwrap().retain(|c| !c.compressed);
     }
 
     async fn xover_on(&self, i: usize, group: &str, start: u64, end: u64) -> Result<Vec<Overview>> {
@@ -2668,6 +2703,7 @@ impl Pool {
         crate::profile::Load::add_since(&crate::profile::LOAD.xover_ns, sent);
         crate::profile::LOAD.xovers.fetch_add(1, Ordering::Relaxed);
         if let Ok(rows) = &r {
+            lease.server.compress_refusals.store(0, Ordering::Relaxed);
             lease.server.headers.fetch_add(rows.len() as u64, Ordering::Relaxed);
         }
         lease.check(r)
@@ -2941,8 +2977,9 @@ impl BlockingPool {
     }
 
     pub fn from_pool(pool: Pool) -> Self {
+        let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8).max(4);
         let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
+            .worker_threads(threads)
             .thread_name("atlas-nntp")
             .enable_all()
             .build()
@@ -3562,6 +3599,7 @@ mod tests {
         for (name, wire) in [
             ("zlib", zlib(&plain)),
             ("gzip", gzip(&plain)),
+            ("plain overview", plain.clone()),
             ("zlib + plain terminator", {
                 let mut w = zlib(&plain[..plain.len() - 3]);
                 w.extend_from_slice(b".\r\n");
@@ -3574,6 +3612,10 @@ mod tests {
                 assert_eq!(lines.last().unwrap(), b".dot stuffed", "{name}");
                 assert!(parse_overview(&lines[0]).is_some());
             }
+        }
+        for piece in [1, 2, 3, 4096] {
+            let empty = read_compressed(b".\r\n".to_vec(), piece);
+            assert!(empty.is_empty(), "empty plain terminator piece {piece}");
         }
     }
 

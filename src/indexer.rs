@@ -180,9 +180,8 @@ impl Default for PassSettings {
     }
 }
 
-/// slices saved together in one transaction at most. bigger batches measured
-/// no faster on a 98GB database and risk spilling the page cache mid transaction
-const MAX_BATCH: usize = 8;
+/// slices saved together in one transaction at most.
+const MAX_BATCH: usize = 32;
 
 /// The indexer's database, shared by every pass. Small writes (cursors) run on
 /// the main database's connection directly. Slices go to the writer thread of
@@ -227,8 +226,8 @@ enum WriterJob {
 }
 
 /// time a writer spends on stage work after each save, and with no save waiting
-const STAGE_BUDGET_BUSY: Duration = Duration::from_millis(10);
-const STAGE_BUDGET_IDLE: Duration = Duration::from_millis(100);
+const STAGE_BUDGET_BUSY: Duration = Duration::from_millis(25);
+const STAGE_BUDGET_IDLE: Duration = Duration::from_millis(200);
 
 /// `conn` is the main database. The writer threads end once every clone of
 /// the `Db` is gone, and the last clone to go waits for them.
@@ -243,7 +242,7 @@ fn shared_db_idling(conn: Connection, every: Duration) -> Db {
     let ids = Arc::new(crate::store::Ids::new(&main));
     let (saves, writers): (Vec<_>, Vec<_>) = (0..crate::store::SHARDS)
         .map(|shard| {
-            let (saves, jobs) = std::sync::mpsc::sync_channel(1024);
+            let (saves, jobs) = std::sync::mpsc::sync_channel(4096);
             let (path, ids) = (crate::store::shard_path(&main, shard), ids.clone());
             let handle = std::thread::Builder::new()
                 .name(format!("atlas-db-writer-{shard}"))
@@ -854,7 +853,11 @@ async fn split_days(
     // other servers are best effort: one that fails is left out. one that
     // carries the group counts, its oldest date only if it has one
     let mut carriers = 1;
+    let total_conns = ctx.pool.indexing_connections();
     for other in ctx.pool.indexing_servers().into_iter().filter(|&s| s != home) {
+        if total_conns >= 50 && ctx.pool.connections(other) * 20 < total_conns {
+            continue;
+        }
         let Ok((_, low, high, _)) = ctx.pool.group_on(other, group).await else { continue };
         carriers += 1;
         match ctx.pool.retention(other, group, low, high).await {
@@ -915,6 +918,7 @@ fn split_bounds(newest: &Newest, home_oldest: i64, oldest_at: i64, today: i64) -
 /// forever and the split never completes (its sweeps never run). Best
 /// effort: a failure is only logged.
 async fn drop_unkept_days(ctx: &PassContext, db: &Db, group: &str) {
+    // every server: a small one can still have the older days, and what this finds gets deleted
     let first =
         ctx.pool.indexing_servers().into_iter().map(|i| ctx.states.first_post_day(group, &ctx.pool.host(i))).min();
     // i64::MIN: a server not asked yet (or a while ago)
@@ -1035,7 +1039,8 @@ where
     // this server alone, like a day chunk
     let (_count, first, last, _name) = match ctx.pool.group_on(server, group).await {
         Ok(info) => info,
-        Err(e) if e.code() == Some(411) => {
+        // only 411 says the server doesnt carry it: a 403 or 430 is a failure to retry
+        Err(e) if matches!(e.code(), Some(411 | 500 | 501)) => {
             swept().await?;
             return Err(NotCarried { group: g, host }.into());
         }
@@ -1239,7 +1244,7 @@ where
     // lives, and only a 411 means the server doesnt carry it
     let found = match ctx.pool.group_on(server, group).await {
         Ok(info) => info,
-        Err(e) if e.code() == Some(411) => {
+        Err(e) if matches!(e.code(), Some(411 | 500 | 501)) => {
             // it has no post of it (see `drop_unkept_days`)
             ctx.states.not_carrying(group, &ctx.pool.host(server));
             // if it was noted as going back furthest, the oldest day goes to the next one
@@ -1472,12 +1477,16 @@ async fn goes_back_furthest(
         return Ok((deepest == host, runner_up));
     }
 
+    let total_conns = ctx.pool.indexing_connections();
     // every carrier's (whether unsure, since, host)
     let mut found = vec![(!oldest.1, oldest.0, host.clone())];
     for other in servers.into_iter().filter(|&i| i != server) {
+        if total_conns >= 50 && ctx.pool.connections(other) * 20 < total_conns {
+            continue;
+        }
         let (_, low, high, _) = match ctx.pool.group_on(other, group).await {
             Ok(info) => info,
-            Err(e) if e.code() == Some(411) => continue,
+            Err(e) if matches!(e.code(), Some(403 | 411 | 430 | 500 | 501)) => continue,
             Err(e) => return Err(e.into()),
         };
         match ctx.pool.retention(other, group, low, high).await? {
