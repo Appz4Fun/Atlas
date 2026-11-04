@@ -2164,6 +2164,14 @@ impl Pool {
                 conn.set_rate_limiter(self.rate_limiter.clone());
                 connects("ok");
                 *server.down_until.lock().unwrap() = None;
+                {
+                    // a step back up held; at the configured count, the next lowering waits the shortest again
+                    let mut heal = server.heal.lock().unwrap();
+                    heal.climbed = false;
+                    if heal.next.is_none() {
+                        heal.every = self.limit_heal;
+                    }
+                }
                 return Ok(Some(Lease::new(conn, server.clone(), permit)));
             }
             Err(e) => e,
@@ -2229,7 +2237,8 @@ impl Pool {
             heal.climbed = true;
         }
         if server.limit.load(Ordering::Relaxed) >= configured {
-            *heal = Heal { next: None, every: self.limit_heal, climbed: false };
+            // back at the configured count; the wait starts over once a connection there opens (see `connect_with_permit`)
+            heal.next = None;
             server.warned_limit.store(false, Ordering::Relaxed);
         } else {
             heal.next = Some(Instant::now() + heal.every);
