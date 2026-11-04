@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -117,9 +117,10 @@ impl Default for GroupRunState {
     }
 }
 
-/// Run state of every group, shared by passes running at the same time.
+/// Run state of every group, shared by passes running at the same time, and the groups config.toml tracks now (see
+/// `groups`).
 #[derive(Clone, Default)]
-pub struct RunStates(Arc<Mutex<HashMap<String, GroupRunState>>>);
+pub struct RunStates(Arc<Mutex<HashMap<String, GroupRunState>>>, Arc<Mutex<Option<HashSet<String>>>>);
 
 impl RunStates {
     fn with<R>(&self, group: &str, f: impl FnOnce(&mut GroupRunState) -> R) -> R {
@@ -137,6 +138,20 @@ impl RunStates {
     pub fn all_idle(&self, groups: &[String]) -> bool {
         let states = self.0.lock().unwrap();
         groups.iter().all(|g| states.get(g).is_some_and(|s| s.idle))
+    }
+
+    /// Note `groups` as the ones config.toml tracks now.
+    pub fn set_tracked(&self, groups: &[String]) {
+        *self.1.lock().unwrap() = Some(groups.iter().cloned().collect());
+    }
+
+    /// The groups config.toml tracks now (`set_tracked`), or until those are noted the ones passes ran for: a group
+    /// taken out keeps its run state, but no longer counts here.
+    pub fn groups(&self) -> HashSet<String> {
+        if let Some(tracked) = self.1.lock().unwrap().as_ref() {
+            return tracked.clone();
+        }
+        self.0.lock().unwrap().keys().cloned().collect()
     }
 
     /// The oldest day the server `host` keeps of `group`, `i64::MIN` when not known.
@@ -858,14 +873,25 @@ where
         )
         .await?
     {
-        // a split group's backfill is day chunks, this server takes the next one
+        // a split group's backfill is day chunks, this server takes the next one: a day asked for, or one of the
+        // newest month any tracked split group still has to do (see `chunks::claim_turn`), else none
         let host = ctx.pool.host(server);
-        let wanted = [(group.to_string(), ctx.states.keeps_from(group, &host))];
+        let wanted = (group.to_string(), ctx.states.keeps_from(group, &host));
+        let (kept, running) = (ctx.states.kept_days(&host), ctx.states.groups());
         // the split's generation as of the claim: a sweep noted after the split reached back isnt
         let g = group.to_string();
         let (claimed, generation) = on_db(db, move |conn| {
             let generation = crate::chunks::sweep_generation(conn, &g)?;
-            Ok((crate::chunks::claim(conn, &wanted, &host, chrono::Utc::now().timestamp())?, generation))
+            let split: Vec<(String, i64)> = crate::chunks::split_groups(conn)?
+                .into_iter()
+                .filter(|s| *s == g || running.contains(s))
+                .map(|s| {
+                    let day = kept.get(&s).copied().unwrap_or(i64::MIN);
+                    (s, day)
+                })
+                .collect();
+            let now = chrono::Utc::now().timestamp();
+            Ok((crate::chunks::claim_turn(conn, wanted, &split, &host, now)?, generation))
         })
         .await?;
         let r = match claimed {
@@ -2616,6 +2642,17 @@ mod tests {
         now.claimed_at = 99;
         finish_chunk(&db, &now, (true, None, Some(0)), 0).await.unwrap();
         assert_eq!(days().await.unwrap(), 1, "the older days went to the sweeps");
+    }
+
+    /// a group taken out of config.toml keeps its run state, but stops counting among the tracked groups
+    #[test]
+    fn the_tracked_groups_are_the_ones_config_tracks_now() {
+        let states = RunStates::default();
+        states.with("gone", |st| st.idle = true);
+        assert_eq!(states.groups(), HashSet::from(["gone".to_string()]), "until noted: the groups passes ran for");
+        states.set_tracked(&["kept".to_string()]);
+        assert_eq!(states.groups(), HashSet::from(["kept".to_string()]));
+        assert!(states.is_idle("gone"));
     }
 
     #[test]
