@@ -737,8 +737,8 @@ where
         return Ok(Progress::default());
     }
     // a server that indexed the group before loses it only after several replies in a row that it lacks it
-    let prefer_key = cursor_key(&ctx.pool, prefer, group);
-    let known = on_db(db, move |conn| Ok(db::get_group_state(conn, &prefer_key)?.is_some())).await?;
+    // (cursors it kept under a key of an earlier build count too, see `cursors_or_adopted`)
+    let known = load_cursors(ctx, db, &cursor_key(&ctx.pool, prefer, group), group, prefer).await?.is_some();
     let (server, (_count, first, last, _name)) = ctx.pool.select_group_known(prefer, group, known).await?;
     let (first, last) = (first as i64, last as i64);
     let key = cursor_key(&ctx.pool, server, group);

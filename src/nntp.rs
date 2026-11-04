@@ -391,12 +391,12 @@ pub fn carries_not(e: &NntpError) -> bool {
 }
 
 /// A group's home other than its first choice (see `Pool::select_group_known`): the server it was found on, since
-/// when, and whether the first choice had indexed it before (then it is asked again after `HOME_RETRY`).
+/// when, and the home it left for a while, one that had indexed it before (asked again after `HOME_RETRY`).
 #[derive(Clone, Copy, Debug)]
 struct Home {
     server: usize,
     since: Instant,
-    back: bool,
+    back: Option<usize>,
 }
 
 /// How long a group stays on the server it fell over to before its first choice, which indexed it before, is asked
@@ -1947,14 +1947,18 @@ impl Pool {
     /// in proportion to each server's connections, and a group keeps its
     /// server (its cursors are per server) as long as that server is healthy.
     pub fn pick_server_in(&self, tier: &[usize], group: &str) -> usize {
-        // a group its first choice doesnt carry lives where it was found, and goes back once a first choice that
-        // indexed it before is due to be asked again
+        // a group its first choice doesnt carry lives where it was found, and goes back to a home it left for a while
+        // (one that indexed it before) once that is due to be asked again
         {
             let mut homes = self.homes.lock().unwrap();
-            if let Some(home) = homes.get(group).copied() {
-                if home.back && home.since.elapsed() >= HOME_RETRY {
-                    homes.remove(group);
-                } else if tier.contains(&home.server) {
+            if let Some(mut home) = homes.get(group).copied() {
+                if let Some(back) = home.back
+                    && home.since.elapsed() >= HOME_RETRY
+                {
+                    home = Home { server: back, since: Instant::now(), back: None };
+                    homes.insert(group.to_string(), home);
+                }
+                if tier.contains(&home.server) {
                     return home.server;
                 }
             }
@@ -2409,7 +2413,7 @@ impl Pool {
         for i in self.ranked(&indexing, group) {
             if let Ok(r) = self.select_on(i, group).await {
                 println!("{group} not on {}, using {}", self.servers[prefer].cfg.host, self.servers[i].cfg.host);
-                let home = Home { server: i, since: Instant::now(), back: known };
+                let home = Home { server: i, since: Instant::now(), back: known.then_some(prefer) };
                 self.homes.lock().unwrap().insert(group.to_string(), home);
                 return Ok((i, r));
             }
@@ -3904,16 +3908,22 @@ mod tests {
         assert_eq!(pool.ranked(&[1, 2], "alt.binaries.x"), pool.ranked(&[1, 2], "alt.binaries.x"), "stable order");
 
         // once found elsewhere, a group is picked there
-        let home = Home { server: 1, since: Instant::now(), back: false };
+        let home = Home { server: 1, since: Instant::now(), back: None };
         pool.homes.lock().unwrap().insert("alt.binaries.moved".into(), home);
         assert_eq!(pool.pick_server("alt.binaries.moved"), 1);
-        // one whose first choice indexed it before goes back once that is due to be asked again
+        // one that left a home which indexed it goes back there once that is due to be asked again: to that home,
+        // not to its first choice (a home it was found on for good)
         let first = pool.pick_server("alt.binaries.back");
-        let other = (first + 1) % 3;
+        let (left, other) = ((first + 1) % 3, (first + 2) % 3);
         let since = Instant::now() - HOME_RETRY;
-        pool.homes.lock().unwrap().insert("alt.binaries.back".into(), Home { server: other, since, back: true });
-        assert_eq!(pool.pick_server("alt.binaries.back"), first, "back on its first choice");
-        assert!(!pool.homes.lock().unwrap().contains_key("alt.binaries.back"));
+        let away = Home { server: other, since, back: Some(left) };
+        pool.homes.lock().unwrap().insert("alt.binaries.back".into(), away);
+        assert_eq!(pool.pick_server("alt.binaries.back"), left, "back on the home it left");
+        assert_eq!(pool.pick_server("alt.binaries.back"), left, "and it stays there");
+        // not before
+        let recent = Home { since: Instant::now(), ..away };
+        pool.homes.lock().unwrap().insert("alt.binaries.back".into(), recent);
+        assert_eq!(pool.pick_server("alt.binaries.back"), other);
         // one found elsewhere for good stays, however long ago
         pool.homes.lock().unwrap().insert("alt.binaries.moved".into(), Home { since, ..home });
         assert_eq!(pool.pick_server("alt.binaries.moved"), 1);
