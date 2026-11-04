@@ -4,8 +4,8 @@
 //!
 //! The database stays what's true. Triggers in each shard put the id of a release that changed, or whose category did,
 //! in `word_queue`, and the web server's process takes them from there into the index every few seconds. An index
-//! that's missing, or made by another version of this file, is built again from the shards in the background, and
-//! searches go to the database as before until it's ready. Each hit is read from the database again before it's shown,
+//! that's missing, or made by another version of this file, is built again from the shards in the background, going
+//! on from its last commit after a restart, and searches go to the database as before until it's ready. Each hit is read from the database again before it's shown,
 //! soo an index a few seconds behind never shows a release a client may no longer see.
 
 use std::collections::HashMap;
@@ -39,6 +39,8 @@ const DRAIN_EVERY: Duration = Duration::from_secs(3);
 const DRAIN_BATCH: usize = 20_000;
 /// Releases read from a shard at a time when building: short reads, soo the indexer's writes don't wait on one.
 const BUILD_BATCH: i64 = 5_000;
+/// Releases a build adds between its commits: about what a restart in the middle of one has to read again.
+const BUILD_COMMIT_EVERY: usize = 250_000;
 const WRITER_HEAP: usize = 256 * 1024 * 1024;
 
 /// What a search sorts its matches by.
@@ -275,6 +277,19 @@ impl WordIndex {
 
     /// Everything again from the shards. What changes meanwhile is queued, and taken in by the next drain.
     pub fn build(&self, conn: &Connection) -> anyhow::Result<usize> {
+        self.build_in(conn, BUILD_BATCH, BUILD_COMMIT_EVERY, || true)
+    }
+
+    /// `build`, reading `batch` releases at a time and committing about every `every` of them, with where it got to
+    /// in the commit's payload: a build cut short by a restart goes on from its last commit instead of starting again.
+    /// It stops after a commit when `go_on` says so.
+    fn build_in(
+        &self,
+        conn: &Connection,
+        batch: i64,
+        every: usize,
+        mut go_on: impl FnMut() -> bool,
+    ) -> anyhow::Result<usize> {
         let mut guard = lock(&self.writer);
         let Some(writer) = guard.as_mut() else { anyhow::bail!("another process keeps the word index") };
         let _ = std::fs::remove_file(self.dir.join("atlas-built"));
@@ -285,25 +300,42 @@ impl WordIndex {
              insert or ignore into main.meta (key, value) values ('word_index', random());",
         )?;
         let token = database_token(conn)?.unwrap_or_default();
-        // forgotten first: whatever changes from here on is queued again
-        for s in 0..store::SHARDS {
-            conn.execute(&format!("delete from s{s}.word_queue"), [])?;
-        }
-        writer.delete_all_documents()?;
+        let resumed = self.index.load_metas()?.payload.as_deref().and_then(|p| building_at(p, token));
+        let (first, mut after) = match resumed {
+            Some(at) => at,
+            None => {
+                // forgotten first: whatever changes from here on is queued again
+                for s in 0..store::SHARDS {
+                    conn.execute(&format!("delete from s{s}.word_queue"), [])?;
+                }
+                writer.delete_all_documents()?;
+                commit_with(writer, &building(token, 0, 0))?;
+                (0, 0)
+            }
+        };
         let mut added = 0;
-        for s in 0..store::SHARDS {
-            let mut after = 0i64;
+        let mut since_commit = 0;
+        for s in first..store::SHARDS {
             loop {
-                let rows = read_rows(conn, s, &format!("r.id > ?1 order by r.id limit {BUILD_BATCH}"), after)?;
+                let rows = read_rows(conn, s, &format!("r.id > ?1 order by r.id limit {batch}"), after)?;
                 let Some(last) = rows.last() else { break };
                 after = last.id;
                 for doc in self.docs(&rows) {
                     writer.add_document(doc)?;
                 }
                 added += rows.len();
+                since_commit += rows.len();
+                if since_commit >= every {
+                    commit_with(writer, &building(token, s, after))?;
+                    since_commit = 0;
+                    if !go_on() {
+                        return Ok(added);
+                    }
+                }
             }
+            after = 0;
         }
-        writer.commit()?;
+        commit_with(writer, &format!("built {token}"))?;
         std::fs::write(self.dir.join("atlas-built"), token.to_string())?;
         self.reader.reload()?;
         self.built_from.store(token, Ordering::Release);
@@ -656,6 +688,29 @@ fn database_token(conn: &Connection) -> rusqlite::Result<Option<i64>> {
     conn.query_row("select value from main.meta where key = 'word_index'", [], |r| r.get(0)).optional()
 }
 
+/// A build's commit payload: the database it's built from, and the shard and last release id it got to.
+fn building(token: i64, shard: usize, after: i64) -> String {
+    format!("building {token} {shard} {after}")
+}
+
+/// Where a build left off, when `payload` is one of `building`'s for the database of `token`.
+fn building_at(payload: &str, token: i64) -> Option<(usize, i64)> {
+    let mut words = payload.strip_prefix("building ")?.split(' ');
+    if words.next()?.parse::<i64>().ok()? != token {
+        return None;
+    }
+    let shard = words.next()?.parse().ok()?;
+    let after = words.next()?.parse().ok()?;
+    Some((shard, after))
+}
+
+fn commit_with(writer: &mut IndexWriter, payload: &str) -> tantivy::Result<()> {
+    let mut commit = writer.prepare_commit()?;
+    commit.set_payload(payload);
+    commit.commit()?;
+    Ok(())
+}
+
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -803,6 +858,37 @@ mod tests {
 
     const UHD: i64 = 2045;
     const HD: i64 = 2040;
+
+    #[test]
+    fn a_build_cut_short_goes_on_from_its_last_commit() {
+        let f = fixture();
+        for i in 0..40 {
+            f.add(&format!("Show.S01E{i:02}.1080p.WEB-DL-G{i}"), &format!("alt.binaries.g{}", i % 5), 10, Some(HD));
+        }
+        let conn = f.conn();
+        {
+            let index = f.index();
+            let mut commits = 0;
+            let added = index
+                .build_in(&conn, 3, 6, || {
+                    commits += 1;
+                    commits < 2
+                })
+                .unwrap();
+            assert!(added > 0 && added < 40, "{added}");
+            assert!(!index.ready());
+        }
+        // the process restarts: a new index on the same folder, which isn't ready
+        let index = f.index();
+        assert!(!index.ready());
+        let rest = index.build_in(&conn, 3, 6, || true).unwrap();
+        assert!(rest < 40, "it went on rather than starting again: {rest}");
+        assert!(index.ready());
+        assert_eq!(index.count("show", None, &[]).unwrap(), 40, "each release once");
+        // a finished build starts again from nothing the next time it's asked for
+        assert_eq!(index.build(&conn).unwrap(), 40);
+        assert_eq!(index.count("show", None, &[]).unwrap(), 40);
+    }
 
     #[test]
     fn a_search_sorts_every_match_and_counts_them() {
