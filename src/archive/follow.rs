@@ -51,13 +51,13 @@ pub struct Whole {
 
 impl Whole {
     /// None: a file that may not or can't be read: posted to no group Atlas may fetch from (none named, or every one
-    /// blocked, `filters::group_blocked`), or with a segment that has no message-id.
+    /// blocked, `filters::group_blocked`), or with a segment whose message-id isn't one (`valid_id`).
     fn of(file: &NzbFile) -> Option<Whole> {
         if !file.groups.iter().any(|g| !crate::filters::group_blocked(g)) {
             return None;
         }
         let mut segments: Vec<_> = file.segments.iter().collect();
-        if segments.iter().any(|s| s.message_id.is_empty()) {
+        if !segments.iter().all(|s| valid_id(&s.message_id)) {
             return None;
         }
         segments.sort_by_key(|s| s.number);
@@ -65,6 +65,12 @@ impl Whole {
         let ids = segments.iter().map(|s| format!("<{}>", s.message_id)).collect();
         Some(Whole { name: file.name.clone(), ids, trusted: false })
     }
+}
+
+/// A message-id as RFC 3977 has them, without its brackets: 1 to 248 printable ASCII characters, no space, no `<`
+/// or `>`. Anything else would be a broken command, not a lookup.
+fn valid_id(id: &str) -> bool {
+    (1..=248).contains(&id.len()) && id.bytes().all(|b| (0x21..=0x7e).contains(&b) && b != b'<' && b != b'>')
 }
 
 /// Whether a post of these files is small enough to read whole.
@@ -408,8 +414,14 @@ mod tests {
         let blocked = NzbFile { groups: vec!["alt.binaries.cp".into()], ..file.clone() };
         assert!(crate::filters::group_blocked("alt.binaries.cp") == Whole::of(&blocked).is_none());
         assert!(Whole::of(&NzbFile { groups: vec![], ..file.clone() }).is_none(), "no group named");
-        let nameless =
-            NzbFile { segments: vec![nzb::Segment { number: 1, bytes: 1, message_id: String::new() }], ..file };
-        assert!(Whole::of(&nameless).is_none(), "an id dropped as overlong");
+        let with_id = |id: &str| NzbFile {
+            segments: vec![nzb::Segment { number: 1, bytes: 1, message_id: id.into() }],
+            ..file.clone()
+        };
+        assert!(Whole::of(&with_id("")).is_none(), "an id dropped as overlong");
+        assert!(Whole::of(&with_id("a\nb")).is_none(), "a line break");
+        assert!(Whole::of(&with_id("a b")).is_none(), "a space");
+        assert!(Whole::of(&with_id("a>b")).is_none(), "a bracket");
+        assert!(Whole::of(&with_id("part1of26.kd8SVOZST6uf6W9pvM$&@powerpost.local")).is_some());
     }
 }
