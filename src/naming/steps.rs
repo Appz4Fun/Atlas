@@ -107,7 +107,10 @@ impl Step for NfoName {
             .query_row(
                 "select 1 from archive_release ar
                  where ar.release_id = ?1 and ar.names_hidden = 1
-                   and not exists (select 1 from archive_inner_files f where f.release_id = ar.release_id)",
+                   and not exists (
+                       select 1 from archive_inner_files f
+                       where f.release_id = ar.release_id and f.source in (1, 2, 3)
+                   )",
                 [rel_id],
                 |_| Ok(true),
             )

@@ -228,7 +228,10 @@ pub(crate) fn rerun_encrypted_with_password(conn: &rusqlite::Connection, now: i6
             "select ar.release_id from archive_release ar
              join release_nfo_password pw on pw.release_id = ar.release_id
              where ar.names_hidden = 1
-               and not exists (select 1 from archive_inner_files f where f.release_id = ar.release_id)",
+               and not exists (
+                   select 1 from archive_inner_files f
+                   where f.release_id = ar.release_id and f.source in (1, 2, 3)
+               )",
         )?
         .query_map([], |r| r.get(0))?
         .collect::<rusqlite::Result<_>>()?;
@@ -572,13 +575,17 @@ impl Step for ProbeStep {
         ));
         // a hash found on a later look is asked about then too
         let needs_list_decrypt = found_nfo_password.is_some()
-            && existing_db_pw != found_nfo_password
+            && (existing_db_pw != found_nfo_password
+                || info.archive.as_ref().is_some_and(|a| a.name.is_some()))
             && ctx
                 .conn()
                 .query_row(
                     "select 1 from archive_release ar
                      where ar.release_id = ?1 and ar.names_hidden = 1
-                       and not exists (select 1 from archive_inner_files f where f.release_id = ar.release_id)",
+                       and not exists (
+                           select 1 from archive_inner_files f
+                           where f.release_id = ar.release_id and f.source in (1, 2, 3)
+                       )",
                     [release_id],
                     |_| Ok(true),
                 )
