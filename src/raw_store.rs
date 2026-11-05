@@ -1010,6 +1010,34 @@ pub struct SavedProbe {
     pub cover: Option<(String, String)>,
 }
 
+/// The group whose saved rows answer for `name` in `group_name` with `content_id`: its own when it has them, or else
+/// another group's. The content id hashes every file's first message-id, parts and which of them came, soo a crosspost
+/// (the same articles in several groups, likely in several shards) has the same one in each group, and what one copy's
+/// articles showed holds for every copy: a post is read once, not once a group. `sql` selects `group_name` by name ?1
+/// and content ?3, its own group (?2) first.
+fn saved_group(
+    conn: &Connection,
+    sql: &str,
+    name: &str,
+    group_name: &str,
+    content_id: &[u8],
+) -> rusqlite::Result<Option<String>> {
+    conn.prepare_cached(sql)?.query_row(params![name, group_name, content_id], |r| r.get(0)).optional()
+}
+
+const PROBE_GROUP: &str = "SELECT group_name FROM raw_probes WHERE name = ?1 AND content_id = ?3
+     ORDER BY group_name != ?2, group_name LIMIT 1";
+const NFO_PASSWORD_GROUP: &str = "SELECT group_name FROM raw_nfo_passwords WHERE name = ?1 AND content_id = ?3
+     ORDER BY group_name != ?2, group_name LIMIT 1";
+const STILLS_GROUP: &str = "SELECT group_name FROM raw_stills WHERE name = ?1 AND content_id = ?3
+     ORDER BY group_name != ?2, group_name LIMIT 1";
+const ARCHIVE_GROUP: &str = "SELECT group_name FROM raw_archives WHERE name = ?1 AND content_id = ?3
+     ORDER BY group_name != ?2, group_name LIMIT 1";
+const PAR2_GROUP: &str = "SELECT group_name FROM raw_par2 WHERE name = ?1 AND content_id = ?3
+     ORDER BY group_name != ?2, group_name LIMIT 1";
+const PAR2_FILES_GROUP: &str = "SELECT group_name FROM raw_par2_files WHERE name = ?1 AND content_id = ?3
+     ORDER BY group_name != ?2, group_name LIMIT 1";
+
 /// Looks up a previously probed release by `(name, group_name)` and `content_id` in `raw_probes`,
 /// returning `Some` only if `content_id` matches, the saved probe's `config_stamp` covers `required_stamp`,
 /// and its completeness/part count is not stale relative to the release's current `(parts, complete)`.
@@ -1025,6 +1053,11 @@ pub fn get_probe(
         return None;
     }
     with_raw(|conn| {
+        // the probe's nfo password and cover were saved with it, under its group
+        let Some(group_name) = saved_group(conn, PROBE_GROUP, name, group_name, content_id)? else {
+            return Ok(None);
+        };
+        let group_name = group_name.as_str();
         type ProbeRow = (Option<i64>, Option<String>, String, Option<String>, Option<i64>, Option<i64>, Option<i64>);
         let probe: Option<ProbeRow> = conn
             .prepare_cached(
@@ -1153,6 +1186,9 @@ pub fn get_nfo_password(name: &str, group_name: &str, content_id: &[u8]) -> Opti
         return None;
     }
     with_raw(|conn| {
+        let Some(group_name) = saved_group(conn, NFO_PASSWORD_GROUP, name, group_name, content_id)? else {
+            return Ok(None);
+        };
         conn.prepare_cached(
             "SELECT password FROM raw_nfo_passwords WHERE name = ?1 AND group_name = ?2 AND content_id = ?3",
         )?
@@ -1253,6 +1289,9 @@ pub fn get_stills(name: &str, group_name: &str, content_id: &[u8]) -> Vec<SavedS
         return Vec::new();
     }
     with_raw(|conn| {
+        let Some(group_name) = saved_group(conn, STILLS_GROUP, name, group_name, content_id)? else {
+            return Ok(Vec::new());
+        };
         let rows = conn
             .prepare_cached(
                 "SELECT position, at_ms, sha256, width, height, phash
@@ -1344,6 +1383,16 @@ pub fn get_archive_files(
         return Vec::new();
     }
     with_raw(|conn| {
+        // as `saved_group`, among the groups with files from `source`
+        let group_name: Option<String> = conn
+            .prepare_cached(
+                "SELECT group_name FROM raw_archive_inner_files
+                 WHERE release_name = ?1 AND content_id = ?3 AND coalesce(source, 2) = ?4
+                 ORDER BY group_name != ?2, group_name LIMIT 1",
+            )?
+            .query_row(params![release_name, group_name, content_id, source], |r| r.get(0))
+            .optional()?;
+        let Some(group_name) = group_name else { return Ok(Vec::new()) };
         let rows = conn
             .prepare_cached(
                 "SELECT seq, name, size, coalesce(source, ?4)
@@ -1381,6 +1430,11 @@ pub fn get_archive(
         return None;
     }
     with_raw(|conn| {
+        // its inner files were saved with it, under its group
+        let Some(group_name) = saved_group(conn, ARCHIVE_GROUP, name, group_name, content_id)? else {
+            return Ok(None);
+        };
+        let group_name = group_name.as_str();
         type RawArchiveRow = (
             i64,
             Option<i64>,
@@ -1645,7 +1699,13 @@ pub fn get_par2_files(name: &str, group_name: &str, content_id: &[u8]) -> Option
     if content_id.is_empty() {
         return None;
     }
-    with_raw(|conn| read_par2_files_in(conn, name, group_name, content_id)).flatten()
+    with_raw(|conn| {
+        let Some(group_name) = saved_group(conn, PAR2_FILES_GROUP, name, group_name, content_id)? else {
+            return Ok(None);
+        };
+        read_par2_files_in(conn, name, &group_name, content_id)
+    })
+    .flatten()
 }
 
 fn upsert_par2_files_in_tx(
@@ -1731,6 +1791,11 @@ pub fn get_par2(
         return None;
     }
     with_raw(|conn| {
+        // its file descriptors were saved with it, under its group
+        let Some(group_name) = saved_group(conn, PAR2_GROUP, name, group_name, content_id)? else {
+            return Ok(None);
+        };
+        let group_name = group_name.as_str();
         type RawPar2Row =
             (i64, Option<Vec<u8>>, Option<i64>, Option<i64>, Option<i64>, Option<i64>, Option<Vec<u8>>);
         let row: Option<RawPar2Row> = conn
@@ -3083,6 +3148,114 @@ mod tests {
             assert_eq!(raw_meta_get(&conn, "http_bytes").unwrap(), 0);
         }
 
+        set_test_raw_path(None);
+    }
+
+    #[test]
+    fn a_crosspost_is_read_once_for_all_its_groups() {
+        let dir = tempfile::tempdir().unwrap();
+        set_test_raw_path(Some(dir.path().join("atlas.raw.db")));
+        let (name, a, b, c) = ("Cross.Posted.2026.1080p-GRP", "alt.binaries.a", "alt.binaries.b", "alt.binaries.c");
+        let (same, other) = (&b"content-identity-of-the-post"[..], &b"content-identity-of-another"[..]);
+        let stamp = 1 | 2 | 4 | 8;
+        let probe = |group, content, crc32, info| ProbeRecord {
+            name,
+            group_name: group,
+            content_id: content,
+            crc32: Some(crc32),
+            agent: Some("Nyuu"),
+            info,
+            moviehash: None,
+            parts: 20,
+            complete: true,
+            config_stamp: stamp,
+            nfo_password: Some("pw-of-a"),
+            cover: Some(("image/jpeg", "cover-of-a")),
+        };
+        put_probe(&probe(a, same, 1, r#"{"from":"a"}"#));
+
+        // the copy in another group has the same articles: a's probe, password and cover answer for it
+        let got = get_probe(name, b, same, 20, true, stamp).unwrap();
+        assert_eq!((got.crc32, got.info.as_str()), (Some(1), r#"{"from":"a"}"#));
+        assert_eq!(got.nfo_password.as_deref(), Some("pw-of-a"));
+        assert_eq!(got.cover, Some(("image/jpeg".to_string(), "cover-of-a".to_string())));
+        // other articles under the same name are another post, and a later stamp or more parts still read again
+        assert_eq!(get_probe(name, b, other, 20, true, stamp), None);
+        assert_eq!(get_probe(name, b, same, 20, true, stamp | 16), None);
+        assert_eq!(get_probe(name, b, same, 25, true, stamp), None);
+        assert_eq!(get_probe("Another.Name-GRP", b, same, 20, true, stamp), None);
+
+        // a group's own result comes first, and one of its own for other articles doesn't hide the post's
+        put_probe(&probe(b, same, 2, r#"{"from":"b"}"#));
+        assert_eq!(get_probe(name, b, same, 20, true, stamp).unwrap().crc32, Some(2));
+        put_probe(&probe(c, other, 3, r#"{"from":"c"}"#));
+        assert_eq!(get_probe(name, c, same, 20, true, stamp).unwrap().crc32, Some(1));
+        assert_eq!(get_probe(name, c, other, 20, true, stamp).unwrap().crc32, Some(3));
+
+        put_nfo_password(name, a, same, "nfo-pw");
+        assert_eq!(get_nfo_password(name, c, same).as_deref(), Some("nfo-pw"));
+        assert_eq!(get_nfo_password(name, c, b"no such post"), None);
+
+        let stills =
+            vec![SavedStill { position: 25, at_ms: Some(1), sha256: "a".repeat(64), width: 9, height: 9, phash: None }];
+        put_stills(name, a, same, &stills);
+        assert_eq!(get_stills(name, b, same), stills);
+        assert!(get_stills(name, b, other).is_empty());
+
+        let files = vec![crate::archive::InnerFile { name: "Movie.mkv".into(), size: Some(9) }];
+        put_archive(&ArchiveRecord {
+            name,
+            group_name: a,
+            content_id: same,
+            source: crate::archive::store::SOURCE_RAR,
+            files: &files,
+            password: Some(crate::archive::Password::No.code()),
+            encryption: None,
+            names_hidden: false,
+            password_check: None,
+            parts: 20,
+            complete: true,
+            listing_complete: true,
+            listing_damaged: false,
+            content_fp: None,
+            max_names_bytes: 16 << 20,
+        });
+        assert_eq!(get_archive(name, b, same, 20, true).unwrap().files[0].name, "Movie.mkv");
+        assert_eq!(get_archive_files(name, b, same, crate::archive::store::SOURCE_RAR)[0].name, "Movie.mkv");
+        assert_eq!(get_archive(name, b, other, 20, true), None);
+        assert!(get_archive_files(name, b, same, crate::archive::store::SOURCE_PAR2).is_empty());
+
+        let inventory = crate::par2::Inventory {
+            files: vec![crate::par2::Par2File {
+                file_id: [3; 16],
+                set_id: [4; 16],
+                md5: [5; 16],
+                md5_16k: [6; 16],
+                size: 9,
+                name: "Movie.mkv".into(),
+                bound: true,
+                crc32: None,
+            }],
+            sealed: vec![([4; 16], [3; 16])],
+            complete: true,
+            ..Default::default()
+        };
+        put_par2(&Par2Record {
+            name,
+            group_name: a,
+            content_id: same,
+            covers_all: true,
+            posted: Some(&[2; 21]),
+            sizes: Some((384_000, 4_000)),
+            parts: 20,
+            complete: true,
+            content_fp: None,
+            inventory: Some(&inventory),
+        });
+        assert_eq!(get_par2(name, b, same, 20, true).unwrap().inventory, Some(inventory.clone()));
+        assert_eq!(get_par2_files(name, b, same), Some(inventory));
+        assert_eq!(get_par2(name, b, other, 20, true), None);
+        assert_eq!(get_par2_files(name, b, other), None);
         set_test_raw_path(None);
     }
 
