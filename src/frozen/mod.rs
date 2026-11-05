@@ -730,10 +730,24 @@ pub fn thaw(conn: &Connection, id: i64, exempt: bool, now: i64) -> Result<Thawed
     Ok(outcome)
 }
 
-/// The frozen releases an incoming post belongs to: by its collection key, its name, and the names its articles were
-/// grouped under. Each is thawed, in a savepoint of its own: one that can't be (a payload that wont read) stays
-/// frozen, and the post is saved as new rather than the save failing. In the save's transaction.
-pub fn thaw_incoming(conn: &Connection, key: Option<i64>, names: &[&str], group: &str, now: i64) -> Result<usize> {
+/// the most frozen releases one incoming release thaws by the names its articles carry: a save joins articles to an
+/// older row only by its own name and poster, and a post naming many can't unfreeze many
+const THAW_BY_ARTICLES: usize = 8;
+
+/// The frozen releases an incoming post belongs to, the ones its save will update: by its collection key, its name,
+/// and the names its articles were grouped under where the frozen row has the article's poster too (as a save joins
+/// them to an older row), `THAW_BY_ARTICLES` of those at most. Each is thawed, in a savepoint of its own: one that
+/// can't be (a payload that wont read) stays frozen, and the post is saved as new rather than the save failing. Each
+/// thawed one is queued again if a rule still matches it, soo one the save leaves as it was goes back after its wait.
+/// In the save's transaction.
+pub fn thaw_incoming(
+    conn: &Connection,
+    key: Option<i64>,
+    name: &str,
+    articles: &[(&str, &str)],
+    group: &str,
+    now: i64,
+) -> Result<usize> {
     let mut ids: BTreeSet<i64> = BTreeSet::new();
     if let Some(k) = key
         && let Some(id) = conn
@@ -743,18 +757,31 @@ pub fn thaw_incoming(conn: &Connection, key: Option<i64>, names: &[&str], group:
     {
         ids.insert(id);
     }
-    let mut seen: HashSet<&str> = HashSet::new();
-    let mut by_name =
-        conn.prepare_cached("select id from frozen.frozen_releases where name = ?1 and group_name = ?2")?;
-    for name in names.iter().filter(|n| seen.insert(**n)) {
-        if let Some(id) = by_name.query_row(params![name, group], |r| r.get(0)).optional()? {
-            ids.insert(id);
+    if let Some(id) = conn
+        .prepare_cached("select id from frozen.frozen_releases where name = ?1 and group_name = ?2")?
+        .query_row(params![name, group], |r| r.get(0))
+        .optional()?
+    {
+        ids.insert(id);
+    }
+    let mut seen: HashSet<(&str, &str)> = HashSet::new();
+    let mut by_article = conn
+        .prepare_cached("select id from frozen.frozen_releases where name = ?1 and group_name = ?2 and poster = ?3")?;
+    let mut by_articles = 0;
+    for (name, poster) in articles.iter().filter(|a| seen.insert(**a)) {
+        if by_articles >= THAW_BY_ARTICLES {
+            break;
+        }
+        if let Some(id) = by_article.query_row(params![name, group, poster], |r| r.get(0)).optional()?
+            && ids.insert(id)
+        {
+            by_articles += 1;
         }
     }
     let mut thawed = 0;
     for id in ids {
         conn.execute_batch("savepoint thaw")?;
-        match thaw(conn, id, false, now) {
+        match thaw(conn, id, false, now).and_then(|t| rules::evaluate(conn, id, now).map(|_| t)) {
             Ok(_) => {
                 conn.execute_batch("release thaw")?;
                 thawed += 1;

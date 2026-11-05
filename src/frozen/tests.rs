@@ -526,3 +526,43 @@ fn a_frozen_file_that_wont_read_stops_a_reset() {
     assert!(unfrozen_copy(&f.main, shard).is_err());
     assert!(crate::raw_store::harvest_from_shards(&f.main, &|_| {}).is_err(), "and the reset with it");
 }
+
+#[test]
+fn a_post_naming_frozen_releases_thaws_only_what_its_save_joins_and_few_of_those() {
+    let f = Fixture::new();
+    let victims: Vec<Release> = (0..10)
+        .map(|n| {
+            let mut r = post(&format!("Victim.{n}"), &["a.rar"], 1, 100);
+            r.poster = "owner <o@x>".into();
+            r
+        })
+        .collect();
+    f.save(&victims);
+    let conn = f.writer();
+    for n in 0..10 {
+        let id = f.id(&conn, &format!("Victim.{n}"));
+        conn.execute("insert into freeze_pending (release_id, reason, at) values (?1, 'test', 1)", [id]).unwrap();
+    }
+    assert_eq!(freeze_all(&conn).frozen, 10);
+    let frozen = || count(&conn, "select count(*) from frozen.frozen_releases");
+    let naming = |author: &str| -> Release {
+        let mut r = post("Crafted", &["x.rar"], 10, 100);
+        for (n, a) in r.articles.iter_mut().enumerate() {
+            a.release_name = Some(format!("Victim.{n}"));
+            a.author = author.into();
+        }
+        r
+    };
+    let tx = conn.unchecked_transaction().unwrap();
+    let crafted = naming("someone <s@x>");
+    let articles: Vec<(&str, &str)> =
+        crafted.articles.iter().map(|a| (a.release_name.as_deref().unwrap(), a.author.as_str())).collect();
+    assert_eq!(thaw_incoming(&tx, None, &crafted.name, &articles, G, NOW).unwrap(), 0, "not their poster");
+    let theirs = naming("owner <o@x>");
+    let articles: Vec<(&str, &str)> =
+        theirs.articles.iter().map(|a| (a.release_name.as_deref().unwrap(), a.author.as_str())).collect();
+    assert_eq!(thaw_incoming(&tx, None, &theirs.name, &articles, G, NOW).unwrap(), 8, "a few at most");
+    tx.commit().unwrap();
+    assert_eq!(frozen(), 2);
+    assert_eq!(count(&conn, "select count(*) from freeze_pending"), 8, "queued again, to go back after their wait");
+}

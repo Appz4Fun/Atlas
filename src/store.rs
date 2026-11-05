@@ -1633,10 +1633,12 @@ impl ShardWriter {
             for release in batches.into_iter().flatten().filter(|r| !crate::filters::group_blocked(&r.group)) {
                 if frozen {
                     let collection = release.collection.as_deref().map(|c| key.hash(c));
-                    let names: Vec<&str> = std::iter::once(release.name.as_str())
-                        .chain(release.articles.iter().filter_map(|a| a.release_name.as_deref()))
+                    let articles: Vec<(&str, &str)> = release
+                        .articles
+                        .iter()
+                        .filter_map(|a| a.release_name.as_deref().map(|n| (n, a.author.as_str())))
                         .collect();
-                    crate::frozen::thaw_incoming(&tx, collection, &names, &release.group, now)?;
+                    crate::frozen::thaw_incoming(&tx, collection, &release.name, &articles, &release.group, now)?;
                 }
                 releases.extend(split_old_rows(&tx, grouping_from, release)?);
             }
