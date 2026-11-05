@@ -60,8 +60,9 @@ pub const PP_STATE: ShardTable = ShardTable {
     ],
     release_key: Some("release_id"),
     // transient net failures in a row (see `engine::transient_wait`), apart from `net_attempts`; `net_rank`, see
-    // `NET_RANK`: NULL, not ranked yet
-    added: &[("net_transient", "INTEGER"), ("net_rank", "INTEGER")],
+    // `NET_RANK`: NULL, not ranked yet; `net_left`: the net steps left, a bit each, with `net_wanted` (NULL with it,
+    // and on rows last written before it), for the release page
+    added: &[("net_transient", "INTEGER"), ("net_rank", "INTEGER"), ("net_left", "INTEGER")],
 };
 
 /// How soon the net lane gets to release `?1`, higher first: what the owner wants most is big movies and TV, and a
