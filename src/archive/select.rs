@@ -162,12 +162,207 @@ pub fn par2_source(files: &[FileInfo]) -> Option<&FileInfo> {
     })
 }
 
+/// All filenames stored in `par2_files` for `release_id` (and any upload linked via `upload_link`).
+pub fn par2_file_names(conn: &rusqlite::Connection, release_id: i64) -> Vec<String> {
+    let mut names = Vec::new();
+    if let Ok(mut stmt) = conn.prepare_cached("select name from par2_files where release_id = ?1")
+        && let Ok(rows) = stmt.query_map([release_id], |r| r.get::<_, String>(0))
+    {
+        for name in rows.flatten() {
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+    }
+    if let Ok(mut stmt) = conn.prepare_cached(
+        "select pf.name
+         from upload_link ul
+         join upload_link rec on rec.lead_id = ul.lead_id
+         join par2_files pf on pf.release_id = rec.release_id
+         where ul.release_id = ?1",
+    ) && let Ok(rows) = stmt.query_map([release_id], |r| r.get::<_, String>(0))
+    {
+        for name in rows.flatten() {
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+    }
+    names
+}
+
+fn file_fits_par2(parts: i64, wire_bytes: u64, pf_size: u64) -> bool {
+    if parts <= 0 {
+        return false;
+    }
+    if parts == 1 {
+        if wire_bytes > 0 {
+            wire_bytes >= pf_size && wire_bytes <= pf_size.saturating_mul(108) / 100 + 4096
+        } else {
+            pf_size <= super::ARTICLE_CAP as u64
+        }
+    } else if wire_bytes > 0 {
+        super::link::parts_fit(pf_size, parts, wire_bytes as i64, parts)
+    } else {
+        pf_size > super::ARTICLE_CAP as u64 / 2
+    }
+}
+
+/// Map from posted `FileInfo.filename` to `par2_files.name` for a release, derived from `upload_link` and `par2_files`.
+pub fn par2_name_map(
+    conn: &rusqlite::Connection,
+    release_id: i64,
+    files: &[FileInfo],
+) -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    if let Ok(mut stmt) = conn.prepare_cached(
+        "select f.filename, pf.name
+         from upload_link ul
+         join files f on f.release_id = ul.release_id
+         join par2_files pf on pf.file_id = ul.par2_file
+         where ul.release_id = ?1 and ul.par2_file is not null",
+    ) && let Ok(rows) = stmt.query_map([release_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+    {
+        for (posted, par2_name) in rows.flatten() {
+            out.insert(posted, par2_name);
+        }
+    }
+    let Ok(mut stmt) = conn.prepare_cached("select name, size from par2_files where release_id = ?1") else {
+        return out;
+    };
+    let Ok(rows) = stmt.query_map([release_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64))) else {
+        return out;
+    };
+    let is_par2 = |name: &str| matches!(classify(name), Kind::Par2Base | Kind::Par2Vol(_));
+    let mut unmatched_par2: Vec<(String, u64)> =
+        rows.flatten().filter(|(name, _)| !is_par2(name)).collect();
+    if unmatched_par2.is_empty() {
+        return out;
+    }
+    let mut unmatched_files: Vec<&FileInfo> = files
+        .iter()
+        .filter(|f| !is_par2(&f.filename) && !out.contains_key(&f.filename))
+        .collect();
+    unmatched_files.retain(|f| {
+        if let Some(pos) = unmatched_par2.iter().position(|(name, _)| name.eq_ignore_ascii_case(&f.filename)) {
+            let (par2_name, _) = unmatched_par2.remove(pos);
+            if f.filename != par2_name {
+                out.insert(f.filename.clone(), par2_name);
+            }
+            false
+        } else {
+            true
+        }
+    });
+    if unmatched_files.is_empty() || unmatched_par2.is_empty() {
+        return out;
+    }
+    let mut wire_sizes: std::collections::HashMap<i64, u64> = std::collections::HashMap::new();
+    if let Ok(mut wstmt) = conn.prepare_cached(
+        "select id, coalesce((select sum(bytes) from segments where file_id = files.id), 0), blob
+         from files where release_id = ?1",
+    ) && let Ok(wrows) = wstmt.query_map([release_id], |r| {
+        Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, Option<Vec<u8>>>(2)?))
+    }) {
+        for (fid, seg_bytes, blob) in wrows.flatten() {
+            let bytes = if seg_bytes > 0 {
+                seg_bytes as u64
+            } else if let Some(b) = blob.filter(|b| !crate::blob::is_remote(b)) {
+                crate::blob::decode(&b)
+                    .map(|segs| segs.iter().map(|s| s.bytes.max(0) as u64).sum())
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            wire_sizes.insert(fid, bytes);
+        }
+    }
+    let wire_of = |f: &FileInfo| wire_sizes.get(&f.id).copied().unwrap_or(0);
+    loop {
+        let mut progressed = false;
+        let mut p_idx = 0;
+        while p_idx < unmatched_par2.len() {
+            let (_, pf_size) = unmatched_par2[p_idx];
+            let mut fit_idx = None;
+            let mut fits = 0usize;
+            for (fi, f) in unmatched_files.iter().enumerate() {
+                if file_fits_par2(parts(f), wire_of(f), pf_size) {
+                    fit_idx = Some(fi);
+                    fits += 1;
+                }
+            }
+            if fits == 1
+                && let Some(fi) = fit_idx
+            {
+                let f = unmatched_files.remove(fi);
+                let (par2_name, _) = unmatched_par2.remove(p_idx);
+                out.insert(f.filename.clone(), par2_name);
+                progressed = true;
+            } else {
+                p_idx += 1;
+            }
+        }
+        let mut f_idx = 0;
+        while f_idx < unmatched_files.len() {
+            let f = unmatched_files[f_idx];
+            let f_parts = parts(f);
+            let f_wire = wire_of(f);
+            let mut fit_idx = None;
+            let mut fits = 0usize;
+            for (pi, (_, pf_size)) in unmatched_par2.iter().enumerate() {
+                if file_fits_par2(f_parts, f_wire, *pf_size) {
+                    fit_idx = Some(pi);
+                    fits += 1;
+                }
+            }
+            if fits == 1
+                && let Some(pi) = fit_idx
+            {
+                let f = unmatched_files.remove(f_idx);
+                let (par2_name, _) = unmatched_par2.remove(pi);
+                out.insert(f.filename.clone(), par2_name);
+                progressed = true;
+            } else {
+                f_idx += 1;
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
+    if !unmatched_files.is_empty() && unmatched_files.len() == unmatched_par2.len() {
+        unmatched_files.sort_by_key(|f| (parts(f), wire_of(f), f.filename.clone()));
+        unmatched_par2.sort_by_key(|(name, size)| (*size, name.clone()));
+        if unmatched_files
+            .iter()
+            .zip(unmatched_par2.iter())
+            .all(|(f, (_, pf_size))| file_fits_par2(parts(f), wire_of(f), *pf_size))
+        {
+            for (f, (par2_name, _)) in unmatched_files.into_iter().zip(unmatched_par2) {
+                out.insert(f.filename.clone(), par2_name);
+            }
+        }
+    }
+    out
+}
+
 /// Posted NZBs to read: at most 2, fewest parts first, and only one whose every article is indexed and few enough
 /// to take whole.
 pub fn nzb_sources(files: &[FileInfo]) -> Vec<&FileInfo> {
+    nzb_sources_with_par2(files, &std::collections::HashMap::new())
+}
+
+/// Like [`nzb_sources`], also matching files whose PAR2-verified name ends in `.nzb`.
+pub fn nzb_sources_with_par2<'a>(
+    files: &'a [FileInfo],
+    par2_names: &std::collections::HashMap<String, String>,
+) -> Vec<&'a FileInfo> {
     let mut found: Vec<&FileInfo> = files
         .iter()
-        .filter(|f| classify(&f.filename) == Kind::Nzb)
+        .filter(|f| {
+            classify(&f.filename) == Kind::Nzb
+                || par2_names.get(&f.filename).is_some_and(|p| classify(p) == Kind::Nzb)
+        })
         .filter(|f| (1..=super::nzb::MAX_NZB_PARTS).contains(&parts(f)) && f.parts_seen >= parts(f))
         .collect();
     found.sort_by_key(|f| (parts(f), f.filename.clone()));
@@ -177,9 +372,21 @@ pub fn nzb_sources(files: &[FileInfo]) -> Vec<&FileInfo> {
 
 /// NFOs to read: at most 2, fewest parts first.
 pub fn nfo_sources(files: &[FileInfo]) -> Vec<&FileInfo> {
+    nfo_sources_with_par2(files, &std::collections::HashMap::new())
+}
+
+/// Like [`nfo_sources`], also matching files whose PAR2-verified name is `.nfo` or `.txt`.
+pub fn nfo_sources_with_par2<'a>(
+    files: &'a [FileInfo],
+    par2_names: &std::collections::HashMap<String, String>,
+) -> Vec<&'a FileInfo> {
     let mut found: Vec<&FileInfo> = files
         .iter()
-        .filter(|f| classify(&f.filename) == Kind::Nfo || f.subject.as_deref().is_some_and(nfo::is_nfo))
+        .filter(|f| {
+            classify(&f.filename) == Kind::Nfo
+                || f.subject.as_deref().is_some_and(nfo::is_nfo)
+                || par2_names.get(&f.filename).is_some_and(|p| classify(p) == Kind::Nfo)
+        })
         .collect();
     found.sort_by_key(|f| (parts(f), f.filename.clone()));
     found.truncate(2);

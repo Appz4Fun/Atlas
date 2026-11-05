@@ -9,10 +9,15 @@ const MARK5: &[u8] = b"Rar!\x1a\x07\x01\x00";
 
 /// By its marker. No marker: damaged.
 pub fn list(data: &[u8]) -> Listing {
+    list_with_password(data, None)
+}
+
+/// By its marker, decrypting `-hp` encrypted headers when `password` is given and matches.
+pub fn list_with_password(data: &[u8], password: Option<&str>) -> Listing {
     if data.starts_with(MARK5) {
-        list5(data)
+        list5_with_password(data, password)
     } else if data.starts_with(MARK4) {
-        list4(data)
+        list4_with_password(data, password)
     } else {
         Listing { damaged: true, ..Default::default() }
     }
@@ -27,9 +32,44 @@ fn le32(b: &[u8], at: usize) -> Option<u32> {
 }
 
 pub fn list4(data: &[u8]) -> Listing {
+    list4_with_password(data, None)
+}
+
+pub fn list4_with_password(data: &[u8], password: Option<&str>) -> Listing {
     let mut l = Listing::default();
     let mut pos = 7usize;
+    let mut encrypted_headers = false;
+    let mut salt_cache = Rar4KeyCache::default();
     for _ in 0..MAX_BLOCKS {
+        if encrypted_headers {
+            let Some(pw) = password else { return l };
+            let Some((hdr_bytes, header, _)) = decrypt_rar4_header(data, pos, pw, &mut salt_cache) else {
+                return l;
+            };
+            let (Some(ty), Some(flags)) = (header.get(2).copied(), le16(&header, 3)) else { return l };
+            if ty == 0x7b {
+                l.complete = true;
+                return l;
+            }
+            let mut add = 0u64;
+            if flags & 0x8000 != 0 {
+                let Some(low) = le32(&header, 7) else { return l };
+                add = u64::from(low);
+            }
+            if ty == 0x74 {
+                let Some(high_pack) = file4(&mut l, &header, flags) else { return l };
+                add |= high_pack << 32;
+                if l.files.len() >= super::MAX_ENTRIES {
+                    return l;
+                }
+            }
+            let next = (pos as u64).saturating_add(hdr_bytes as u64).saturating_add(add);
+            match usize::try_from(next).ok().filter(|n| *n <= data.len()) {
+                Some(n) => pos = n,
+                None => return l,
+            }
+            continue;
+        }
         // what isnt there yet is truncation, not damage
         let Some(start) = data.get(pos..).filter(|rest| rest.len() >= 7) else { return l };
         let (Some(ty), Some(flags), Some(size)) = (start.get(2).copied(), le16(start, 3), le16(start, 5)) else {
@@ -55,7 +95,12 @@ pub fn list4(data: &[u8]) -> Listing {
             l.encrypted = true;
             l.encryption = Some(Encryption::Rar4Aes128);
             l.headers_encrypted = true;
-            return l;
+            let Some(pw) = password.filter(|pw| !pw.is_empty()) else { return l };
+            let _ = pw;
+            let Some(next) = pos.checked_add(size).filter(|n| *n <= data.len()) else { return l };
+            pos = next;
+            encrypted_headers = true;
+            continue;
         }
         if ty == 0x7b {
             l.complete = true;
@@ -190,9 +235,39 @@ fn vint(b: &[u8], pos: &mut usize) -> Option<u64> {
 }
 
 pub fn list5(data: &[u8]) -> Listing {
+    list5_with_password(data, None)
+}
+
+pub fn list5_with_password(data: &[u8], password: Option<&str>) -> Listing {
     let mut l = Listing::default();
     let mut pos = 8usize;
+    let mut hdr_key: Option<[u8; 32]> = None;
     for _ in 0..MAX_BLOCKS {
+        if let Some(key) = &hdr_key {
+            let (hdr_bytes, inner) = match decrypt_rar5_header(data, pos, key) {
+                Ok(Some(v)) => v,
+                Ok(None) => return l,
+                Err(()) => {
+                    if l.password_check.is_some() {
+                        l.damaged = true;
+                    }
+                    return l;
+                }
+            };
+            let Some(block) = block5(&mut l, &inner, password, &mut hdr_key) else {
+                l.damaged = true;
+                return l;
+            };
+            if l.complete || l.files.len() >= super::MAX_ENTRIES {
+                return l;
+            }
+            let next = (pos as u64).saturating_add(hdr_bytes as u64).saturating_add(block);
+            match usize::try_from(next).ok().filter(|n| *n <= data.len()) {
+                Some(n) => pos = n,
+                None => return l,
+            }
+            continue;
+        }
         let Some(rest) = data.get(pos..).filter(|rest| rest.len() >= 4) else { return l };
         // the header's size: 3 bytes at most, and running out is truncation
         let (mut size, mut size_len) = (0usize, 0usize);
@@ -218,11 +293,11 @@ pub fn list5(data: &[u8]) -> Listing {
             return l;
         }
         let Some(inner) = body.get(size_len..) else { return l };
-        let Some(block) = block5(&mut l, inner) else {
+        let Some(block) = block5(&mut l, inner, password, &mut hdr_key) else {
             l.damaged = true;
             return l;
         };
-        if l.complete || l.headers_encrypted || l.files.len() >= super::MAX_ENTRIES {
+        if l.complete || (l.headers_encrypted && hdr_key.is_none()) || l.files.len() >= super::MAX_ENTRIES {
             return l;
         }
         let next = (pos as u64).saturating_add((4 + size_len + size) as u64).saturating_add(block);
@@ -236,7 +311,12 @@ pub fn list5(data: &[u8]) -> Listing {
 
 /// One verified header: what it says goes in `l`, and its data size comes back.
 /// None: a read failed inside a header whose CRC was right, soo it's damaged.
-fn block5(l: &mut Listing, inner: &[u8]) -> Option<u64> {
+fn block5(
+    l: &mut Listing,
+    inner: &[u8],
+    password: Option<&str>,
+    hdr_key: &mut Option<[u8; 32]>,
+) -> Option<u64> {
     let mut p = 0usize;
     let ty = vint(inner, &mut p)?;
     let flags = vint(inner, &mut p)?;
@@ -251,8 +331,16 @@ fn block5(l: &mut Listing, inner: &[u8]) -> Option<u64> {
             l.encrypted = true;
             l.encryption = Some(Encryption::Rar5Aes256);
             l.headers_encrypted = true;
+            let body = inner.get(p..end)?;
             // the header's own: version, flags, kdf, salt, check
-            l.password_check = password_check(inner.get(p..end)?, false).map(PasswordTest::Rar5).or(l.password_check);
+            let check = password_check(body, false);
+            l.password_check = check.map(PasswordTest::Rar5).or(l.password_check);
+            if hdr_key.is_none()
+                && let Some(pw) = password.filter(|pw| !pw.is_empty())
+                && let Some((kdf, salt, _)) = crypt_kdf_salt_iv(body, false)
+            {
+                *hdr_key = derive_rar5_key(pw, kdf, &salt, check);
+            }
         }
         5 => l.complete = true,
         2 | 3 => {
@@ -538,4 +626,153 @@ fn encrypted_record(area: &[u8]) -> bool {
         p = end;
     }
     false
+}
+
+/// Parses `(kdf, salt, iv)` from a RAR5 encryption header (`has_iv = false`) or file crypt record (`has_iv = true`).
+pub(crate) fn crypt_kdf_salt_iv(body: &[u8], has_iv: bool) -> Option<(u8, [u8; 16], Option<[u8; 16]>)> {
+    let mut p = 0usize;
+    let version = vint(body, &mut p)?;
+    if version != 0 {
+        return None;
+    }
+    let _flags = vint(body, &mut p)?;
+    let kdf = *body.get(p)?;
+    p += 1;
+    let salt: [u8; 16] = body.get(p..p + 16)?.try_into().ok()?;
+    p += 16;
+    let iv = if has_iv { Some(body.get(p..p + 16)?.try_into().ok()?) } else { None };
+    Some((kdf, salt, iv))
+}
+
+/// `(kdf, salt, iv, check)` from a RAR5 file block's encryption record.
+pub type Rar5CryptParams = (u8, [u8; 16], [u8; 16], Option<PasswordCheck>);
+
+/// Extracts `(kdf, salt, iv, check)` from a RAR5 file block's extra area (record type 1).
+pub(crate) fn rar5_record_params(area: &[u8]) -> Option<Rar5CryptParams> {
+    let mut p = 0usize;
+    while p < area.len() {
+        let size = usize::try_from(vint(area, &mut p)?).ok().filter(|s| *s > 0)?;
+        let end = p.checked_add(size).filter(|e| *e <= area.len())?;
+        let mut at = p;
+        if vint(area, &mut at) == Some(1) {
+            let body = area.get(at..end)?;
+            let (kdf, salt, Some(iv)) = crypt_kdf_salt_iv(body, true)? else { return None };
+            let check = password_check(body, true);
+            return Some((kdf, salt, iv, check));
+        }
+        p = end;
+    }
+    None
+}
+
+/// Derives RAR5's 32-byte AES-256 key, verifying `check` in the same PBKDF2 pass when present.
+pub(crate) fn derive_rar5_key(
+    password: &str,
+    kdf: u8,
+    salt: &[u8; 16],
+    check: Option<PasswordCheck>,
+) -> Option<[u8; 32]> {
+    if kdf > MAX_KDF {
+        return None;
+    }
+    let chk = check.map(|c| (c.check, sha256_first4(&c.check)));
+    zipfast::crypto::derive_rar5_key(password, kdf, salt, chk)
+}
+
+fn sha256_first4(data: &[u8]) -> [u8; 4] {
+    use sha2::{Digest, Sha256};
+    let d = Sha256::digest(data);
+    let mut out = [0u8; 4];
+    if let Some(s) = d.get(..4) {
+        out.copy_from_slice(s);
+    }
+    out
+}
+
+/// Decrypts one RAR5 `-hp` encrypted block header at `pos` (where the 16-byte IV sits).
+/// Returns `Ok(Some((16 + enc_hdr_len, inner_header_bytes)))`, `Ok(None)` on truncation, or `Err(())` on CRC/format failure.
+pub(crate) fn decrypt_rar5_header(
+    data: &[u8],
+    pos: usize,
+    key: &[u8; 32],
+) -> Result<Option<(usize, Vec<u8>)>, ()> {
+    let Some(first_end) = pos.checked_add(32) else { return Ok(None) };
+    let (Some(iv_slice), Some(first_ct)) = (data.get(pos..pos + 16), data.get(pos + 16..first_end)) else {
+        return Ok(None);
+    };
+    let Ok(iv): Result<[u8; 16], _> = iv_slice.try_into() else { return Ok(None) };
+    let Some(first_dec) = super::aes::decrypt_cbc(key, &iv, first_ct) else { return Err(()) };
+    let (mut size, mut size_len) = (0usize, 0usize);
+    loop {
+        let Some(byte) = first_dec.get(4 + size_len).copied() else { return Err(()) };
+        size |= usize::from(byte & 0x7f) << (7 * size_len);
+        size_len += 1;
+        if byte & 0x80 == 0 {
+            break;
+        }
+        if size_len == 3 {
+            return Err(());
+        }
+    }
+    if size == 0 {
+        return Err(());
+    }
+    let Some(raw_len) = (4 + size_len).checked_add(size) else { return Err(()) };
+    let Some(enc_len) = raw_len.checked_add(15).map(|n| n & !15) else { return Err(()) };
+    let Some(total_hdr) = 16usize.checked_add(enc_len) else { return Err(()) };
+    let Some(hdr_end) = pos.checked_add(total_hdr) else { return Ok(None) };
+    let Some(enc_hdr) = data.get(pos + 16..hdr_end) else { return Ok(None) };
+    let Some(dec) = super::aes::decrypt_cbc(key, &iv, enc_hdr) else { return Err(()) };
+    let Some(body) = dec.get(4..raw_len) else { return Err(()) };
+    if le32(&dec, 0) != Some(crc32(body)) {
+        return Err(());
+    }
+    let Some(inner) = body.get(size_len..) else { return Err(()) };
+    Ok(Some((total_hdr, inner.to_vec())))
+}
+
+/// RAR3 / RAR4 key and IV derivation (`SetKey30`: 262,144 SHA-1 rounds over UTF-16LE password + 8-byte salt).
+pub(crate) fn derive_rar4_key_iv(password: &str, salt: &[u8; 8]) -> ([u8; 16], [u8; 16]) {
+    zipfast::crypto::derive_rar4_key_iv(password, salt)
+}
+
+const MAX_RAR4_KDF_DERIVATIONS: usize = 8;
+const MAX_RAR4_ENCRYPTED_HEADERS: usize = 4_096;
+
+/// Bounded salt-to-(key, iv) cache and per-archive header/KDF budget for RAR4 `-hp` headers and entries.
+#[derive(Default)]
+pub(crate) struct Rar4KeyCache {
+    entries: Vec<([u8; 8], [u8; 16], [u8; 16])>,
+    headers: usize,
+}
+
+impl Rar4KeyCache {
+    pub(crate) fn derive(&mut self, password: &str, salt: &[u8; 8]) -> Option<([u8; 16], [u8; 16])> {
+        if let Some((_, k, i)) = self.entries.iter().find(|(s, _, _)| s == salt) {
+            return Some((*k, *i));
+        }
+        if self.entries.len() >= MAX_RAR4_KDF_DERIVATIONS {
+            return None;
+        }
+        let (k, i) = derive_rar4_key_iv(password, salt);
+        self.entries.push((*salt, k, i));
+        Some((k, i))
+    }
+}
+
+/// Decrypts one RAR4 `-hp` encrypted block header at `pos` (where the 8-byte salt sits).
+pub(crate) fn decrypt_rar4_header(
+    data: &[u8],
+    pos: usize,
+    password: &str,
+    cache: &mut Rar4KeyCache,
+) -> Option<(usize, Vec<u8>, [u8; 8])> {
+    if cache.headers >= MAX_RAR4_ENCRYPTED_HEADERS {
+        return None;
+    }
+    cache.headers += 1;
+    let salt: [u8; 8] = data.get(pos..pos.checked_add(8)?)?.try_into().ok()?;
+    let (key, iv) = cache.derive(password, &salt)?;
+    let (header, enc_len) = zipfast::crypto::decrypt_rar4_header(data, pos + 8, &key, &iv)?;
+    Some((8 + enc_len, header, salt))
 }

@@ -101,8 +101,51 @@ impl Step for NfoName {
         let rel_name = ctx.release().name.clone();
         let rel_group = ctx.release().group.clone();
         let content_id = crate::raw_store::release_content_id(ctx.conn(), rel_id).unwrap_or_default();
+        let existing_db_pw = archive::store::nfo_password(ctx.conn(), rel_id);
+        let names_hidden: bool = ctx
+            .conn()
+            .query_row(
+                "select 1 from archive_release ar
+                 where ar.release_id = ?1
+                   and (
+                       (ar.names_hidden = 1
+                        and not exists (
+                            select 1 from archive_inner_files f
+                            where f.release_id = ar.release_id and f.source in (1, 2, 3)
+                        ))
+                       or (ar.password = 1
+                           and exists (
+                               select 1 from archive_inner_files f
+                               where f.release_id = ar.release_id and f.source in (1, 2, 3) and lower(f.name) like '%.nzb'
+                           )
+                           and not exists (
+                               select 1 from archive_inner_files f
+                               where f.release_id = ar.release_id and f.source = 5
+                           ))
+                   )",
+                [rel_id],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        let probe_encrypted: bool = ctx
+            .conn()
+            .query_row(
+                "select 1 from release_probe where release_id = ?1 and info like '%\"encrypted\":true%'",
+                [rel_id],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
         let mut writes = Vec::new();
+        let mut rerun = 0;
         if let Some(saved_pw) = crate::raw_store::get_nfo_password(&rel_name, &rel_group, &content_id) {
+            if existing_db_pw.as_deref() != Some(saved_pw.as_str()) {
+                if names_hidden {
+                    rerun |= mask(archive::steps::LIST_STEP);
+                }
+                if probe_encrypted {
+                    rerun |= mask(crate::probe::step::PROBE_STEP);
+                }
+            }
             writes.push(StepWrite::new(archive::store::SET_NFO_PASSWORD, vec![rel_id.into(), saved_pw.into()]));
         }
         // an inline name stays as it is until the user opts in, as in the naming step. `applies` can't read this
@@ -111,16 +154,27 @@ impl Step for NfoName {
             && r.name_source.is_none()
             && !rename_named_is_on(ctx.conn(), &r.group).map_err(retry)?
         {
-            return Ok(Outcome { writes, ..Outcome::default() });
+            return Ok(Outcome { writes, rerun, ..Outcome::default() });
         }
         let files = ctx.files().map_err(retry)?;
-        for file in archive::select::nfo_sources(&files) {
+        let par2_names = archive::select::par2_name_map(ctx.conn(), rel_id, &files);
+        let check = archive::store::local_password_check(ctx.conn(), rel_id);
+        for file in archive::select::nfo_sources_with_par2(&files, &par2_names) {
             let Some(seg) = first_article(ctx, file)? else { continue };
             let Some(body) = fetch_one(ctx, &seg, &file.filename)? else { continue };
+            let decoded = crate::probe::nfo_text(&body);
             if writes.is_empty()
-                && let Some(password) = release_info::find_password(&String::from_utf8_lossy(&body))
+                && let Some(password) = release_info::find_verified_password([decoded.as_str()], &[], check.as_ref())
             {
                 crate::raw_store::put_nfo_password(&rel_name, &rel_group, &content_id, &password);
+                if existing_db_pw.as_deref() != Some(password.as_str()) {
+                    if names_hidden {
+                        rerun |= mask(archive::steps::LIST_STEP);
+                    }
+                    if probe_encrypted {
+                        rerun |= mask(crate::probe::step::PROBE_STEP);
+                    }
+                }
                 let params = vec![rel_id.into(), password.into()];
                 writes.push(StepWrite::new(archive::store::SET_NFO_PASSWORD, params));
             }
@@ -128,9 +182,9 @@ impl Step for NfoName {
             if let Some(name) = found {
                 let change =
                     NameChange { display_name: Some(name), obfuscated: Some(false), source: NameSource::Nfo.value() };
-                return Ok(Outcome { matched: true, name: Some(change), writes, ..Outcome::default() });
+                return Ok(Outcome { matched: true, name: Some(change), writes, rerun, ..Outcome::default() });
             }
         }
-        Ok(Outcome { writes, ..Outcome::default() })
+        Ok(Outcome { writes, rerun, ..Outcome::default() })
     }
 }

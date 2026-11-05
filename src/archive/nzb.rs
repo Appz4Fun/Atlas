@@ -216,6 +216,67 @@ fn attribute(e: &BytesStart<'_>, key: &str) -> Option<String> {
     Some(attr.normalized_value(XmlVersion::Implicit1_0).map_or_else(|_| attr.value.to_string(), |v| v.into_owned()))
 }
 
+/// Extracts a password from an NZB's `<head><meta type="password">...</meta></head>` or `<file subject="...">`.
+pub fn meta_password(body: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(body);
+    let mut reader = Reader::from_str(&text);
+    let mut in_password_meta = false;
+    let mut meta_buf = String::new();
+    let mut subject_hit: Option<String> = None;
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(e)) => match e.local_name().as_ref() {
+                "meta" => {
+                    let ty = attribute(&e, "type").unwrap_or_default().to_ascii_lowercase();
+                    in_password_meta = ty == "password"
+                        || ty == "pwd"
+                        || ty == "x-dnzb-password"
+                        || ty.contains("password");
+                    meta_buf.clear();
+                }
+                "file" if subject_hit.is_none() => {
+                    if let Some(subj) = attribute(&e, "subject") {
+                        subject_hit = crate::release_info::find_password(&subj)
+                            .or_else(|| crate::release_info::harvested_password(&subj));
+                    }
+                }
+                _ => {}
+            },
+            Ok(Event::Text(t)) if in_password_meta => {
+                meta_buf.push_str(&t.xml10_content());
+            }
+            Ok(Event::GeneralRef(r)) if in_password_meta => {
+                if let Ok(Some(ch)) = r.resolve_char_ref() {
+                    meta_buf.push(ch);
+                } else if let Some(val) = quick_xml::escape::resolve_xml_entity(r.as_ref()) {
+                    meta_buf.push_str(val);
+                }
+            }
+            Ok(Event::CData(c)) if in_password_meta => {
+                meta_buf.push_str(c.as_ref());
+            }
+            Ok(Event::End(e)) => match e.local_name().as_ref() {
+                "meta" if in_password_meta => {
+                    in_password_meta = false;
+                    let trimmed = meta_buf.trim();
+                    if !trimmed.is_empty()
+                        && trimmed.len() <= 128
+                        && !super::PasswordHarvester::is_negative_phrase(trimmed)
+                        && !crate::release_info::is_false_positive_password(trimmed)
+                    {
+                        return Some(trimmed.to_string());
+                    }
+                }
+                "nzb" => break,
+                _ => {}
+            },
+            Ok(Event::Eof) | Err(_) => break,
+            Ok(_) => {}
+        }
+    }
+    subject_hit
+}
+
 /// The release names an NZB's files give, as a save names a release from a file (`strip_release_suffixes`), PAR2
 /// files last, each once. At most 3.
 pub fn release_names<'a>(files: impl Iterator<Item = &'a str>) -> Vec<String> {

@@ -745,4 +745,203 @@ mod select_tests {
         assert_eq!(heads[0].file.filename, "x.01");
         assert_eq!(heads[0].tail.filename, "x.03");
     }
+
+    #[test]
+    fn rar5_header_and_stream_decryption_with_password() {
+        let hpsw = std::fs::read("tests/fixtures/rar5/rar5-hpsw.rar").unwrap();
+        let without = rar::list(&hpsw);
+        assert!(without.encrypted && without.headers_encrypted && without.files.is_empty());
+        let wrong = rar::list_with_password(&hpsw, Some("wrong"));
+        assert!(wrong.encrypted && wrong.headers_encrypted && wrong.files.is_empty() && !wrong.damaged);
+        let psw = std::fs::read("tests/fixtures/rar5/rar5-psw.rar").unwrap();
+        let right = rar::list_with_password(&hpsw, Some("password"));
+        assert!(right.encrypted && right.headers_encrypted && !right.damaged);
+        assert_eq!(right.files, rar::list(&psw).files);
+
+        let nest_no_pw = crate::probe::nest::unwrap(&psw);
+        assert_eq!(nest_no_pw.layers[0].stop.as_deref(), Some("encrypted"));
+        let nest_wrong = crate::probe::nest::unwrap_with_password(&psw, Some("wrong"));
+        assert_eq!(nest_wrong.layers[0].stop.as_deref(), Some("encrypted"));
+        let nest_right = crate::probe::nest::unwrap_with_password(&psw, Some("password"));
+        assert!(nest_right.layers[0].stop.is_none(), "{:?}", nest_right.layers);
+        assert!(!nest_right.inner.is_empty());
+
+        let nest_hp = crate::probe::nest::unwrap_with_password(&hpsw, Some("password"));
+        assert!(nest_hp.layers[0].stop.is_none(), "{:?}", nest_hp.layers);
+        assert_eq!(nest_hp.inner.as_ref(), nest_right.inner.as_ref());
+    }
+
+    #[test]
+    fn release_161580499_password_check_and_verified_harvester() {
+        // Exact password_check blob from Release 161580499 (6GTX0B5E4O2GARHV9KPW on shard 3)
+        let raw_check: [u8; 25] = [
+            0x0f, 0xcc, 0xf5, 0x00, 0x61, 0xff, 0xba, 0xd4, 0x3d, 0xcf, 0x68, 0x42, 0xb1, 0x49, 0xd5, 0xf5, 0xa2,
+            0xe7, 0x82, 0x9b, 0x3a, 0xab, 0xe0, 0x37, 0xb0,
+        ];
+        let test = super::PasswordTest::from_bytes(&raw_check).unwrap();
+        assert_eq!(test.accepts("F-UnK-NZBNF"), Some(true));
+        assert_eq!(test.accepts("wrong"), Some(false));
+
+        // NFO with false positives before the real password, or bare line password verified by PasswordTest
+        let noisy_nfo = "Encoding settings: cabac=1 / pass=2 / crf=18\nPasswort: keins\nTemplate {{password}}\n\nF-UnK-NZBNF\n";
+        assert_eq!(crate::release_info::find_password("Encoding settings: pass=2"), None);
+        assert_eq!(crate::release_info::find_password("Template {{password}}"), None);
+        assert_eq!(crate::release_info::find_password("Passwort: keins"), None);
+        assert_eq!(crate::release_info::find_password("Passwort: Datum"), None);
+        assert_eq!(
+            crate::release_info::find_verified_password([noisy_nfo], &[], Some(&test)).as_deref(),
+            Some("F-UnK-NZBNF")
+        );
+    }
+
+    #[test]
+    fn nzb_meta_password_and_rar4_and_zip_decryption() {
+        let nzb_xml = br#"<?xml version="1.0" encoding="utf-8"?>
+            <nzb><head><meta type="password">JFB9hbdCrue7m4XA391gNYM50</meta></head>
+            <file poster="a@b" date="1" subject="zDwd4n3PFKu1gLc5RL4M.part01.rar (1/2)">
+              <groups><group>alt.binaries.boneless</group></groups>
+              <segments><segment bytes="100" number="1">m1@x</segment></segments>
+            </file></nzb>"#;
+        assert_eq!(super::nzb::meta_password(nzb_xml).as_deref(), Some("JFB9hbdCrue7m4XA391gNYM50"));
+
+        // RAR4 encrypted stored file decryption
+        let plain = b"RAR4 secret payload for probe test!";
+        let salt = [1u8, 2, 3, 4, 5, 6, 7, 8];
+        let (key, iv) = rar::derive_rar4_key_iv("rar4pass", &salt);
+        // Encrypt `plain` (padded to 48 bytes) with AES-128-CBC:
+        let aes = super::aes::Aes::new(&key).unwrap();
+        let mut padded = plain.to_vec();
+        padded.resize(48, 0);
+        let mut ct = Vec::new();
+        let mut prev = iv;
+        for chunk in padded.as_chunks::<16>().0 {
+            let mut blk = [0u8; 16];
+            for i in 0..16 {
+                blk[i] = chunk[i] ^ prev[i];
+            }
+            aes.encrypt_block(&mut blk);
+            prev = blk;
+            ct.extend_from_slice(&blk);
+        }
+        // Build RAR4 file block with LHD_PASSWORD (0x04) and LHD_SALT (0x400), method 0x30 (stored)
+        let mut body = Vec::new();
+        body.extend_from_slice(&(plain.len() as u32).to_le_bytes()); // unp_size
+        body.push(2); // host_os
+        body.extend_from_slice(&super::crc32(plain).to_le_bytes()); // file_crc
+        body.extend_from_slice(&0u32.to_le_bytes()); // ftime
+        body.push(29); // unp_ver
+        body.push(0x30); // method = m0 (stored)
+        let fname = b"secret.bin";
+        body.extend_from_slice(&(fname.len() as u16).to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes()); // attr
+        body.extend_from_slice(fname);
+        body.extend_from_slice(&salt);
+        let file_blk = [
+            super::testkit::r4_block(0x74, 0x0004 | 0x0400, &body, Some(ct.len() as u32)),
+            ct,
+        ]
+        .concat();
+        let r4 = super::testkit::rar4(&[super::testkit::r4_main(0), file_blk]);
+        assert_eq!(crate::probe::nest::unwrap(&r4).layers[0].stop.as_deref(), Some("encrypted"));
+        assert_eq!(
+            crate::probe::nest::unwrap_with_password(&r4, Some("wrong")).layers[0].stop.as_deref(),
+            Some("encrypted")
+        );
+        let dec_r4 = crate::probe::nest::unwrap_with_password(&r4, Some("rar4pass"));
+        assert!(dec_r4.layers[0].stop.is_none());
+        assert_eq!(dec_r4.inner.as_ref(), plain);
+
+        let nzb_ent = br#"<nzb><head><meta type="password">abc&amp;123&#33;</meta></head></nzb>"#;
+        assert_eq!(super::nzb::meta_password(nzb_ent).as_deref(), Some("abc&123!"));
+        assert_eq!(crate::release_info::find_password("Movie.{{!@#$}}.nzb").as_deref(), Some("!@#$"));
+        let z_chk = super::PasswordTest::Zip(super::zip::PasswordCheck::Crypto { header: [0; 12], check: 0x99 });
+        assert_eq!(crate::release_info::find_verified_password(["password: wrong"], &[], Some(&z_chk)), None);
+    }
+
+    #[test]
+    fn par2_name_map_matches_actual_shard_schema() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::store::build_shard(&conn).unwrap();
+        let rel_id = 42i64;
+        conn.execute(
+            "insert into files (id, release_id, filename, expected, seen) values (1, ?1, 'a.part01.rar', 50, x'01')",
+            [rel_id],
+        )
+        .unwrap();
+        conn.execute(
+            "insert into files (id, release_id, filename, expected, seen) values (2, ?1, 'obf_nfo_999', 1, x'01')",
+            [rel_id],
+        )
+        .unwrap();
+        conn.execute(
+            "insert into files (id, release_id, filename, expected, seen) values (3, ?1, 'obf_nzb_888', 1, x'01')",
+            [rel_id],
+        )
+        .unwrap();
+        conn.execute(
+            "insert into segments (file_id, local, domain, part, bytes) values (2, x'01', 1, 1, 900)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "insert into segments (file_id, local, domain, part, bytes) values (3, x'02', 1, 1, 42000)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            super::store::INSERT_PAR2_FILE,
+            rusqlite::params![rel_id, vec![1u8; 16], vec![9u8; 16], vec![0u8; 16], vec![0u8; 16], 50_000_000i64, "a.part01.rar", None::<i64>, 1i64, 0i64, 1i64],
+        )
+        .unwrap();
+        conn.execute(
+            super::store::INSERT_PAR2_FILE,
+            rusqlite::params![rel_id, vec![2u8; 16], vec![9u8; 16], vec![0u8; 16], vec![0u8; 16], 850i64, "secret.nfo", None::<i64>, 1i64, 0i64, 1i64],
+        )
+        .unwrap();
+        conn.execute(
+            super::store::INSERT_PAR2_FILE,
+            rusqlite::params![rel_id, vec![3u8; 16], vec![9u8; 16], vec![0u8; 16], vec![0u8; 16], 40_000i64, "pointer-{{pw}}.nzb", None::<i64>, 1i64, 0i64, 1i64],
+        )
+        .unwrap();
+        let files = vec![
+            FileInfo {
+                id: 1,
+                filename: "a.part01.rar".into(),
+                subject: None,
+                subject_part: None,
+                expected: Some(50),
+                file_total: None,
+                parts_seen: 50,
+                touched_at: None,
+                sealed: false,
+            },
+            FileInfo {
+                id: 2,
+                filename: "obf_nfo_999".into(),
+                subject: None,
+                subject_part: None,
+                expected: Some(1),
+                file_total: None,
+                parts_seen: 1,
+                touched_at: None,
+                sealed: false,
+            },
+            FileInfo {
+                id: 3,
+                filename: "obf_nzb_888".into(),
+                subject: None,
+                subject_part: None,
+                expected: Some(1),
+                file_total: None,
+                parts_seen: 1,
+                touched_at: None,
+                sealed: false,
+            },
+        ];
+        let map = select::par2_name_map(&conn, rel_id, &files);
+        assert_eq!(map.get("obf_nfo_999").map(String::as_str), Some("secret.nfo"));
+        assert_eq!(map.get("obf_nzb_888").map(String::as_str), Some("pointer-{{pw}}.nzb"));
+        let all_names = select::par2_file_names(&conn, rel_id);
+        assert!(all_names.iter().any(|n| n == "pointer-{{pw}}.nzb"));
+    }
 }

@@ -47,163 +47,34 @@ fn is_directory(name: &str) -> bool {
 
 /// the ZIP64 extra's sizes where a 32-bit field is saturated: uncompressed, compressed
 pub(crate) fn zip64_sizes(extra: &[u8], uncompressed: u32, compressed: u32) -> (u64, u64) {
-    let (mut unp, mut packed) = (u64::from(uncompressed), u64::from(compressed));
-    let mut p = 0usize;
-    while let (Some(id), Some(size)) = (le16(extra, p), le16(extra, p + 2)) {
-        let Some(data) = p.checked_add(4).and_then(|at| extra.get(at..at.checked_add(size)?)) else { break };
-        if id == 1 {
-            let mut at = 0;
-            if uncompressed == SATURATED {
-                if let Some(v) = le64(data, at) {
-                    unp = v;
-                }
-                at += 8;
-            }
-            if compressed == SATURATED
-                && let Some(v) = le64(data, at)
-            {
-                packed = v;
-            }
-            break;
-        }
-        p += 4 + size;
-    }
-    (unp, packed)
+    zipview::zip64_sizes(extra, uncompressed, compressed)
 }
 
-/// The entries at the start of an archive. `complete` stays false: only the
-/// directory proves the whole list.
-/// What a ZIP keeps at the start of an encrypted file's data to test a password.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PasswordCheck {
-    /// 12 bytes that decrypt to end in `check`
-    Crypto { header: [u8; 12], check: u8 },
-    /// AES: `salt` is `strength * 4 + 4` long, and the key's last two bytes have to be `verifier`
-    Aes { strength: u8, salt: [u8; 16], verifier: [u8; 2] },
+pub use zipview::PasswordCheck;
+
+/// Decrypts a ZipCrypto entry starting at `data` (12-byte encryption header + payload) if `check` matches.
+pub(crate) fn decrypt_zipcrypto(password: &str, check: u8, data: &[u8]) -> Option<Vec<u8>> {
+    zipview::decrypt_zipcrypto(password, check, data)
 }
 
-impl PasswordCheck {
-    pub fn to_bytes(self) -> Vec<u8> {
-        match self {
-            PasswordCheck::Crypto { header, check } => {
-                let mut out = vec![0, check];
-                out.extend(header);
-                out
-            }
-            PasswordCheck::Aes { strength, salt, verifier } => {
-                let mut out = vec![strength];
-                out.extend(salt);
-                out.extend(verifier);
-                out
-            }
-        }
-    }
-
-    pub fn from_bytes(b: &[u8]) -> Option<PasswordCheck> {
-        match *b.first()? {
-            0 => Some(PasswordCheck::Crypto { check: *b.get(1)?, header: b.get(2..14)?.try_into().ok()? }),
-            strength => Some(PasswordCheck::Aes {
-                strength,
-                salt: b.get(1..17)?.try_into().ok()?,
-                verifier: b.get(17..19)?.try_into().ok()?,
-            }),
-        }
-    }
-
-    pub fn accepts(&self, password: &str) -> bool {
-        match self {
-            PasswordCheck::Crypto { header, check } => crypto_check(password.as_bytes(), header) == *check,
-            PasswordCheck::Aes { strength, salt, verifier } => {
-                let salt_len = usize::from(*strength) * 4 + 4;
-                let key_len = (usize::from(*strength) + 1) * 8;
-                salt.get(..salt_len)
-                    .and_then(|salt| aes_verifier(password.as_bytes(), salt, key_len))
-                    .is_some_and(|found| found == *verifier)
-            }
-        }
-    }
+/// Decrypts a WinZip AES (method 99) entry starting at `data` (`salt + verifier + ciphertext [+ 10-byte auth]`).
+pub(crate) fn decrypt_winzip_aes(
+    password: &str,
+    strength: u8,
+    data: &[u8],
+    full_packed: Option<u64>,
+) -> Option<Vec<u8>> {
+    zipview::decrypt_winzip_aes(password, strength, data, full_packed)
 }
 
-/// The traditional cipher: what the last of the 12 header bytes decrypts to.
-fn crypto_check(password: &[u8], header: &[u8; 12]) -> u8 {
-    fn crc_byte(crc: u32, b: u8) -> u32 {
-        let mut c = (crc ^ u32::from(b)) & 0xff;
-        for _ in 0..8 {
-            c = if c & 1 != 0 { (c >> 1) ^ 0xedb8_8320 } else { c >> 1 };
-        }
-        (crc >> 8) ^ c
-    }
-    let mut keys = [0x1234_5678u32, 0x2345_6789, 0x3456_7890];
-    let update = |keys: &mut [u32; 3], b: u8| {
-        keys[0] = crc_byte(keys[0], b);
-        keys[1] = keys[1].wrapping_add(keys[0] & 0xff).wrapping_mul(134_775_813).wrapping_add(1);
-        keys[2] = crc_byte(keys[2], (keys[1] >> 24) as u8);
-    };
-    for b in password {
-        update(&mut keys, *b);
-    }
-    let mut last = 0;
-    for cipher in header {
-        let t = keys[2] | 2;
-        last = cipher ^ (t.wrapping_mul(t ^ 1) >> 8) as u8;
-        update(&mut keys, last);
-    }
-    last
-}
-
-/// PBKDF2 over HMAC-SHA1, 1000 rounds, as WinZip's AES has it: the two bytes after both keys.
-fn aes_verifier(password: &[u8], salt: &[u8], key_len: usize) -> Option<[u8; 2]> {
-    use hmac::{Hmac, Mac};
-    let keyed = Hmac::<sha1::Sha1>::new_from_slice(password).ok()?;
-    let wanted = key_len * 2 + 2;
-    let mut derived = Vec::with_capacity(wanted + 20);
-    let mut block = 1u32;
-    while derived.len() < wanted {
-        let mut mac = keyed.clone();
-        mac.update(salt);
-        mac.update(&block.to_be_bytes());
-        let mut u: [u8; 20] = mac.finalize().into_bytes().into();
-        let mut out = u;
-        for _ in 1..1000 {
-            let mut mac = keyed.clone();
-            mac.update(&u);
-            u = mac.finalize().into_bytes().into();
-            for (slot, b) in out.iter_mut().zip(u) {
-                *slot ^= b;
-            }
-        }
-        derived.extend(out);
-        block += 1;
-    }
-    derived.get(wanted - 2..wanted)?.try_into().ok()
-}
-
-/// AES's own extra field, 0x9901: the key strength, from 1 to 3.
-fn aes_strength(extra: &[u8]) -> Option<u8> {
-    let mut p = 0usize;
-    while let (Some(id), Some(size)) = (le16(extra, p), le16(extra, p + 2)) {
-        if id == 0x9901 {
-            return extra.get(p + 8).copied().filter(|s| (1..=3).contains(s));
-        }
-        p = p.checked_add(4 + size)?;
-    }
-    None
+/// AES's own extra field, 0x9901: `(strength, actual_method)`.
+pub(crate) fn aes_extra(extra: &[u8]) -> Option<(u8, u16)> {
+    zipview::aes_extra(extra)
 }
 
 /// The test an encrypted file's first bytes hold, if they were read.
 fn password_check(entry: &[u8], flags: usize, method: usize, extra: &[u8], data_at: usize) -> Option<PasswordCheck> {
-    let data = entry.get(data_at..)?;
-    if method == 99 {
-        let strength = aes_strength(extra)?;
-        let salt_len = usize::from(strength) * 4 + 4;
-        let mut salt = [0; 16];
-        salt.get_mut(..salt_len)?.copy_from_slice(data.get(..salt_len)?);
-        Some(PasswordCheck::Aes { strength, salt, verifier: data.get(salt_len..salt_len + 2)?.try_into().ok()? })
-    } else {
-        // with sizes after the data, the check is the time's high byte instead of the CRC's
-        let check = if flags & 0x0008 != 0 { *entry.get(11)? } else { *entry.get(17)? };
-        Some(PasswordCheck::Crypto { header: data.get(..12)?.try_into().ok()?, check })
-    }
+    zipview::password_check_at(entry, flags, method, extra, data_at)
 }
 
 pub fn list_head(data: &[u8]) -> Listing {

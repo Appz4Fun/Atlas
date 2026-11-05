@@ -92,17 +92,31 @@ pub fn small(files: &[NzbFile]) -> bool {
 /// found in. Stops at a post too big to read whole, one with no NZB in it, an article gone, `MAX_HOPS`, or when
 /// `left`, what the whole following may fetch and unpack, runs out.
 pub fn follow(ctx: &mut StepCtx<'_>, first: Vec<u8>, left: &mut Budget) -> Result<Vec<InnerFile>, StepError> {
+    follow_with_password(ctx, first, left).map(|(files, _)| files)
+}
+
+/// Like [`follow`], also returning any `<meta type="password">` or `{{password}}` found in the followed NZBs or
+/// the archives unwrapped along the way (preferring the last hop's password).
+pub fn follow_with_password(
+    ctx: &mut StepCtx<'_>,
+    first: Vec<u8>,
+    left: &mut Budget,
+) -> Result<(Vec<InnerFile>, Option<String>), StepError> {
     // each hop's rows: the names inside the archive its NZB came out of, then its files
     let mut hops: Vec<Vec<InnerFile>> = Vec::new();
+    let mut passwords: Vec<Option<String>> = Vec::new();
     let mut inside: Vec<InnerFile> = Vec::new();
     let mut body = first;
     for hop in 1..=MAX_HOPS {
         if body.len() > MAX_FOLLOWED_NZB {
             break;
         }
+        let meta_pw = nzb::meta_password(&body);
         let parsed = nzb::parse(&body);
         let mut rows = std::mem::take(&mut inside);
         rows.extend(parsed.files.iter().map(|f| InnerFile { name: f.name.clone(), size: Some(f.bytes()) }));
+        let name_pw = rows.iter().find_map(|f| crate::release_info::find_password(&f.name));
+        passwords.push(meta_pw.or(name_pw));
         hops.push(rows);
         // a cut NZB doesn't say what all of its post is; and past the last hop nothing more would be listed
         if !parsed.complete || !small(&parsed.files) || hop == MAX_HOPS {
@@ -115,10 +129,14 @@ pub fn follow(ctx: &mut StepCtx<'_>, first: Vec<u8>, left: &mut Budget) -> Resul
         }
     }
     if let Some(last) = hops.last_mut() {
+        if let Some(pw) = inside.iter().find_map(|f| crate::release_info::find_password(&f.name)) {
+            passwords.push(Some(pw));
+        }
         last.append(&mut inside);
     }
+    let pw = passwords.into_iter().rev().flatten().next();
     // where the chain ends first: what's kept and what a name is taken from favour it
-    Ok(hops.into_iter().rev().flatten().collect())
+    Ok((hops.into_iter().rev().flatten().collect(), pw))
 }
 
 /// The next NZB in these files: one posted as a file, or one an archive set of them holds, read whole. `first` is a

@@ -42,13 +42,30 @@ pub struct ArchiveHead {
     /// RAR: this file's data began in the volume before
     #[serde(skip)]
     pub split_before: bool,
+    /// RAR5 file encryption parameters: `(kdf, salt, iv, check)`
+    #[serde(skip)]
+    pub rar5_crypt: Option<crate::archive::rar::Rar5CryptParams>,
+    /// RAR4 file encryption salt (from the file header or the encrypted block header)
+    #[serde(skip)]
+    pub rar4_salt: Option<[u8; 8]>,
+    /// ZIP WinZip AES parameters: `(strength, actual_method)`
+    #[serde(skip)]
+    pub zip_aes: Option<(u8, u16)>,
+    /// ZIP ZipCrypto check byte
+    #[serde(skip)]
+    pub zip_crypto_check: Option<u8>,
 }
 
 pub fn parse(data: &[u8]) -> Option<ArchiveHead> {
+    parse_with_password(data, None)
+}
+
+pub fn parse_with_password(data: &[u8], password: Option<&str>) -> Option<ArchiveHead> {
     if data.starts_with(RAR5) {
-        Some(first(rar5(data, 1), "RAR5"))
+        Some(first(rar5(data, 1, password), "RAR5"))
     } else if data.starts_with(RAR4) {
-        Some(first(rar4(data, 1), "RAR4"))
+        let mut cache = crate::archive::rar::Rar4KeyCache::default();
+        Some(first(rar4(data, 1, password, &mut cache), "RAR4"))
     } else if data.starts_with(SEVEN_Z) {
         Some(ArchiveHead { format: "7z".into(), ..ArchiveHead::default() })
     } else if data.starts_with(ZIP) {
@@ -61,10 +78,23 @@ pub fn parse(data: &[u8]) -> Option<ArchiveHead> {
 /// Every file whose header is in `data`, in order, at most [`MAX_ENTRIES`]. A RAR with encrypted headers gives
 /// one entry that says so. Empty for anything but RAR and ZIP.
 pub fn entries(data: &[u8]) -> Vec<ArchiveHead> {
+    entries_with_password(data, None)
+}
+
+pub fn entries_with_password(data: &[u8], password: Option<&str>) -> Vec<ArchiveHead> {
+    let mut cache = crate::archive::rar::Rar4KeyCache::default();
+    entries_with_password_and_cache(data, password, &mut cache)
+}
+
+pub(crate) fn entries_with_password_and_cache(
+    data: &[u8],
+    password: Option<&str>,
+    rar4_cache: &mut crate::archive::rar::Rar4KeyCache,
+) -> Vec<ArchiveHead> {
     if data.starts_with(RAR5) {
-        rar5(data, MAX_ENTRIES)
+        rar5(data, MAX_ENTRIES, password)
     } else if data.starts_with(RAR4) {
-        rar4(data, MAX_ENTRIES)
+        rar4(data, MAX_ENTRIES, password, rar4_cache)
     } else if data.starts_with(ZIP) {
         zip(data, MAX_ENTRIES)
     } else {
@@ -92,64 +122,87 @@ fn le32(b: &[u8], at: usize) -> Option<u32> {
     Some(u32::from_le_bytes(b.get(at..at + 4)?.try_into().ok()?))
 }
 
-fn rar4(data: &[u8], max: usize) -> Vec<ArchiveHead> {
+fn rar4(
+    data: &[u8],
+    max: usize,
+    password: Option<&str>,
+    salt_cache: &mut crate::archive::rar::Rar4KeyCache,
+) -> Vec<ArchiveHead> {
     let mut out = Vec::new();
     let mut at = RAR4.len();
     let mut solid_archive = false;
     let mut files = 0;
-    while let (Some(kind), Some(flags), Some(size)) = (data.get(at + 2), le16(data, at + 3), le16(data, at + 5)) {
+    let mut encrypted_headers = false;
+    while out.len() < max {
+        if encrypted_headers {
+            let Some(pw) = password.filter(|pw| !pw.is_empty()) else { break };
+            let Some((hdr_bytes, hdr, block_salt)) =
+                crate::archive::rar::decrypt_rar4_header(data, at, pw, salt_cache)
+            else {
+                break;
+            };
+            let (Some(&kind), Some(flags), Some(size)) = (hdr.get(2), le16(&hdr, 3), le16(&hdr, 5)) else {
+                break;
+            };
+            let size = usize::from(size);
+            let Some(data_at) = at.checked_add(hdr_bytes) else { break };
+            let high_word = |offset: usize| {
+                if flags & 0x0100 != 0 { u64::from(le32(&hdr, offset).unwrap_or(0)) << 32 } else { 0 }
+            };
+            if kind == 0x74 {
+                let head = rar4_file(&hdr, size, flags, solid_archive, files, data_at, true, Some(block_salt));
+                files += 1;
+                out.push(head);
+            } else if kind == 0x7b {
+                break;
+            }
+            let add = if flags & 0x8000 != 0 {
+                u64::from(le32(&hdr, 7).unwrap_or(0)) | if kind == 0x74 { high_word(32) } else { 0 }
+            } else {
+                0
+            };
+            let Some(next) = usize::try_from(add).ok().and_then(|add| data_at.checked_add(add)) else { break };
+            at = next;
+            if at >= data.len() {
+                break;
+            }
+            continue;
+        }
+        let (Some(&kind), Some(flags), Some(size)) = (data.get(at + 2), le16(data, at + 3), le16(data, at + 5)) else {
+            break;
+        };
         let size = usize::from(size);
-        if size < 7 || out.len() >= max {
+        if size < 7 {
             break;
         }
         let high_word = |offset: usize| {
             if flags & 0x0100 != 0 { u64::from(le32(data, at + offset).unwrap_or(0)) << 32 } else { 0 }
         };
-        match *kind {
+        match kind {
             0x73 => {
                 solid_archive = flags & 0x0008 != 0;
                 if flags & 0x0080 != 0 {
-                    out.push(ArchiveHead {
-                        format: "RAR4".into(),
-                        encrypted: true,
-                        headers_encrypted: true,
-                        ..ArchiveHead::default()
-                    });
+                    encrypted_headers = true;
+                    if password.is_some_and(|pw| !pw.is_empty())
+                        && let Some(next) = at.checked_add(size).filter(|n| *n < data.len())
+                    {
+                        at = next;
+                        continue;
+                    }
                     break;
                 }
             }
             0x74 => {
-                let mut head = ArchiveHead { format: "RAR4".into(), ..ArchiveHead::default() };
-                // past 4 GiB, the high words sit before the name
-                head.packed = le32(data, at + 7).map(|low| u64::from(low) | high_word(32));
-                head.unpacked = le32(data, at + 11).map(|low| u64::from(low) | high_word(36));
-                head.crc32 = le32(data, at + 16);
-                let method = data.get(at + 25).copied();
-                head.method = method.map(|m| format!("m{}", m.saturating_sub(0x30)));
-                head.rar_version = data.get(at + 24).copied().unwrap_or(0);
-                // before 2.0 a file's own flag isn't read: every file after the first in a solid archive is solid
-                head.solid = if head.rar_version < 20 { solid_archive && files > 0 } else { flags & 0x0010 != 0 };
-                head.split_before = flags & 0x0001 != 0;
+                let Some(hdr) = data.get(at..at + size) else { break };
+                let head = rar4_file(hdr, size, flags, solid_archive, files, at + size, false, None);
                 files += 1;
-                let name_len = usize::from(le16(data, at + 26).unwrap_or(0));
-                let high = if flags & 0x0100 != 0 { 8 } else { 0 };
-                // within this header, and no longer than a name needs
-                head.name = data
-                    .get(at + 32 + high..(at + 32 + high + name_len).min(at + size))
-                    .map(|n| name_of(n.split(|b| *b == 0).next().unwrap_or(n)));
-                head.encrypted = flags & 0x0004 != 0;
-                head.continues = flags & 0x0002 != 0;
-                head.dir = flags & 0x00e0 == 0x00e0;
-                head.data_at = Some(at + size);
-                if method == Some(0x30) && !head.encrypted {
-                    head.stored_at = Some(at + size);
-                }
                 out.push(head);
             }
+            0x7b => break,
             _ => {}
         }
         let add = if flags & 0x8000 != 0 {
-            u64::from(le32(data, at + 7).unwrap_or(0)) | if *kind == 0x74 { high_word(32) } else { 0 }
+            u64::from(le32(data, at + 7).unwrap_or(0)) | if kind == 0x74 { high_word(32) } else { 0 }
         } else {
             0
         };
@@ -161,7 +214,64 @@ fn rar4(data: &[u8], max: usize) -> Vec<ArchiveHead> {
             break;
         }
     }
+    if encrypted_headers && out.is_empty() {
+        out.push(ArchiveHead {
+            format: "RAR4".into(),
+            encrypted: true,
+            headers_encrypted: true,
+            ..ArchiveHead::default()
+        });
+    }
     out
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rar4_file(
+    hdr: &[u8],
+    size: usize,
+    flags: u16,
+    solid_archive: bool,
+    files: usize,
+    data_at: usize,
+    headers_encrypted: bool,
+    block_salt: Option<[u8; 8]>,
+) -> ArchiveHead {
+    let mut head = ArchiveHead { format: "RAR4".into(), ..ArchiveHead::default() };
+    let high_word = |offset: usize| {
+        if flags & 0x0100 != 0 { u64::from(le32(hdr, offset).unwrap_or(0)) << 32 } else { 0 }
+    };
+    // past 4 GiB, the high words sit before the name
+    head.packed = le32(hdr, 7).map(|low| u64::from(low) | high_word(32));
+    head.unpacked = le32(hdr, 11).map(|low| u64::from(low) | high_word(36));
+    head.crc32 = le32(hdr, 16);
+    let method = hdr.get(25).copied();
+    head.method = method.map(|m| format!("m{}", m.saturating_sub(0x30)));
+    head.rar_version = hdr.get(24).copied().unwrap_or(0);
+    // before 2.0 a file's own flag isn't read: every file after the first in a solid archive is solid
+    head.solid = if head.rar_version < 20 { solid_archive && files > 0 } else { flags & 0x0010 != 0 };
+    head.split_before = flags & 0x0001 != 0;
+    let name_len = usize::from(le16(hdr, 26).unwrap_or(0));
+    let high = if flags & 0x0100 != 0 { 8 } else { 0 };
+    let name_end = 32 + high + name_len;
+    // within this header, and no longer than a name needs
+    head.name = hdr
+        .get(32 + high..name_end.min(size))
+        .map(|n| name_of(n.split(|b| *b == 0).next().unwrap_or(n)));
+    head.encrypted = flags & 0x0004 != 0 || headers_encrypted;
+    head.headers_encrypted = headers_encrypted;
+    if flags & 0x0400 != 0 {
+        head.rar4_salt = hdr.get(name_end..name_end + 8).and_then(|s| s.try_into().ok());
+    }
+    if head.rar4_salt.is_none() {
+        head.rar4_salt = block_salt;
+    }
+    head.continues = flags & 0x0002 != 0;
+    head.dir = flags & 0x00e0 == 0x00e0;
+    head.data_at = Some(data_at);
+    if method == Some(0x30) && !head.encrypted {
+        head.stored_at = Some(data_at);
+    }
+    head
 }
 
 fn vint(b: &[u8], at: &mut usize) -> Option<u64> {
@@ -177,10 +287,39 @@ fn vint(b: &[u8], at: &mut usize) -> Option<u64> {
     None
 }
 
-fn rar5(data: &[u8], max: usize) -> Vec<ArchiveHead> {
+fn rar5(data: &[u8], max: usize, password: Option<&str>) -> Vec<ArchiveHead> {
     let mut out = Vec::new();
     let mut at = RAR5.len();
+    let mut hdr_key: Option<[u8; 32]> = None;
+    let mut encrypted_headers = false;
     while out.len() < max {
+        if let Some(key) = &hdr_key {
+            let Ok(Some((hdr_bytes, inner))) = crate::archive::rar::decrypt_rar5_header(data, at, key) else {
+                break;
+            };
+            let mut p = 0usize;
+            let Some(kind) = vint(&inner, &mut p) else { break };
+            let Some(flags) = vint(&inner, &mut p) else { break };
+            let extra = if flags & 1 != 0 { vint(&inner, &mut p).unwrap_or(0) } else { 0 };
+            let packed = if flags & 2 != 0 { vint(&inner, &mut p).unwrap_or(0) } else { 0 };
+            let Some(data_at) = at.checked_add(hdr_bytes) else { break };
+            match kind {
+                2 => {
+                    let Some(head) = rar5_file(&inner, p, inner.len(), extra, packed, flags, data_at, true) else {
+                        break;
+                    };
+                    out.push(head);
+                }
+                5 => break,
+                _ => {}
+            }
+            let Some(next) = usize::try_from(packed).ok().and_then(|pk| data_at.checked_add(pk)) else { break };
+            at = next;
+            if at >= data.len() {
+                break;
+            }
+            continue;
+        }
         let start = at + 4;
         let mut p = start;
         let Some(size) = vint(data, &mut p) else { break };
@@ -196,16 +335,26 @@ fn rar5(data: &[u8], max: usize) -> Vec<ArchiveHead> {
         };
         match kind {
             4 => {
-                out.push(ArchiveHead {
-                    format: "RAR5".into(),
-                    encrypted: true,
-                    headers_encrypted: true,
-                    ..ArchiveHead::default()
-                });
-                break;
+                encrypted_headers = true;
+                let extra_len = usize::try_from(extra).unwrap_or(0);
+                let body_end = end.saturating_sub(extra_len);
+                if let Some(pw) = password.filter(|pw| !pw.is_empty())
+                    && let Some(crypt_body) = data.get(p..body_end)
+                    && let Some((kdf, salt, _)) = crate::archive::rar::crypt_kdf_salt_iv(crypt_body, false)
+                {
+                    let listing = crate::archive::rar::list(data.get(..end).unwrap_or(data));
+                    let check = match listing.password_check {
+                        Some(crate::archive::PasswordTest::Rar5(c)) => Some(c),
+                        _ => None,
+                    };
+                    hdr_key = crate::archive::rar::derive_rar5_key(pw, kdf, &salt, check);
+                }
+                if hdr_key.is_none() {
+                    break;
+                }
             }
             2 => {
-                let Some(head) = rar5_file(data, p, end, extra, packed, flags) else { break };
+                let Some(head) = rar5_file(data, p, end, extra, packed, flags, end, false) else { break };
                 out.push(head);
             }
             5 => break,
@@ -217,10 +366,28 @@ fn rar5(data: &[u8], max: usize) -> Vec<ArchiveHead> {
             break;
         }
     }
+    if encrypted_headers && out.is_empty() {
+        out.push(ArchiveHead {
+            format: "RAR5".into(),
+            encrypted: true,
+            headers_encrypted: true,
+            ..ArchiveHead::default()
+        });
+    }
     out
 }
 
-fn rar5_file(data: &[u8], mut p: usize, end: usize, extra: u64, packed: u64, flags: u64) -> Option<ArchiveHead> {
+#[allow(clippy::too_many_arguments)]
+fn rar5_file(
+    data: &[u8],
+    mut p: usize,
+    end: usize,
+    extra: u64,
+    packed: u64,
+    flags: u64,
+    data_at: usize,
+    headers_encrypted: bool,
+) -> Option<ArchiveHead> {
     let mut head = ArchiveHead { format: "RAR5".into(), ..ArchiveHead::default() };
     head.packed = Some(packed);
     // the block header's "data goes on in the next volume"
@@ -253,10 +420,12 @@ fn rar5_file(data: &[u8], mut p: usize, end: usize, extra: u64, packed: u64, fla
     head.rar_version = (info & 0x3f) as u8;
     head.solid = info & 0x40 != 0;
     let extra_area = usize::try_from(extra).ok().and_then(|e| end.checked_sub(e)).and_then(|from| data.get(from..end));
+    head.rar5_crypt = extra_area.and_then(crate::archive::rar::rar5_record_params);
     head.encrypted = extra_area.is_some_and(has_crypt_record);
-    head.data_at = Some(end);
+    head.headers_encrypted = headers_encrypted;
+    head.data_at = Some(data_at);
     if method == 0 && !head.encrypted {
-        head.stored_at = Some(end);
+        head.stored_at = Some(data_at);
     }
     Some(head)
 }
@@ -307,12 +476,19 @@ fn zip_entry(data: &[u8]) -> ArchiveHead {
     head.crc32 = le32(data, 14).filter(|_| !later);
     let name_len = usize::from(le16(data, 26).unwrap_or(0));
     let extra_len = usize::from(le16(data, 28).unwrap_or(0));
+    let extra = data.get(30 + name_len..30 + name_len + extra_len).unwrap_or_default();
     if let (Some(packed), Some(unpacked), false) = (le32(data, 18), le32(data, 22), later) {
         // past 4 GiB these are markers, and the extra field has the sizes. Without it they stay unknown.
-        let extra = data.get(30 + name_len..30 + name_len + extra_len).unwrap_or_default();
         let (long_unpacked, long_packed) = crate::archive::zip::zip64_sizes(extra, unpacked, packed);
         head.unpacked = Some(long_unpacked).filter(|size| *size != u64::from(u32::MAX));
         head.packed = Some(long_packed).filter(|size| *size != u64::from(u32::MAX));
+    }
+    if head.encrypted {
+        if method == 99 {
+            head.zip_aes = crate::archive::zip::aes_extra(extra);
+        } else {
+            head.zip_crypto_check = if later { data.get(11).copied() } else { data.get(17).copied() };
+        }
     }
     head.name = data.get(30..30 + name_len).map(name_of);
     head.dir = head.name.as_deref().is_some_and(|n| n.ends_with('/'));

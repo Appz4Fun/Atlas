@@ -1182,6 +1182,15 @@ fn upsert_nfo_password(
 /// Looks up a cached NFO password for `(name, group_name)` verified against `content_id` in `raw_nfo_passwords`,
 /// independent of whether `raw_probes` has a reusable probe result.
 pub fn get_nfo_password(name: &str, group_name: &str, content_id: &[u8]) -> Option<String> {
+    raw_nfo_password_entry(name, group_name, content_id).filter(|s| !s.is_empty())
+}
+
+/// True when `raw_nfo_passwords` holds a row (even an empty-string negative sentinel) for `(name, group_name, content_id)`.
+pub fn has_nfo_password_record(name: &str, group_name: &str, content_id: &[u8]) -> bool {
+    raw_nfo_password_entry(name, group_name, content_id).is_some()
+}
+
+fn raw_nfo_password_entry(name: &str, group_name: &str, content_id: &[u8]) -> Option<String> {
     if content_id.is_empty() {
         return None;
     }
@@ -1204,6 +1213,25 @@ pub fn put_nfo_password(name: &str, group_name: &str, content_id: &[u8], passwor
         return;
     }
     let _ = with_raw_tx(|conn| upsert_nfo_password(conn, name, group_name, content_id, password));
+}
+
+fn nested_nzb_pw_key(name: &str) -> String {
+    format!("{name}\0nzb")
+}
+
+/// Looks up a cached target password extracted from a nested `.nzb` inside an archive release.
+pub fn get_nested_nzb_password(name: &str, group_name: &str, content_id: &[u8]) -> Option<String> {
+    get_nfo_password(&nested_nzb_pw_key(name), group_name, content_id)
+}
+
+/// True when `raw_nfo_passwords` holds a nested-NZB target password record (including empty negative sentinel).
+pub fn has_nested_nzb_password_record(name: &str, group_name: &str, content_id: &[u8]) -> bool {
+    has_nfo_password_record(&nested_nzb_pw_key(name), group_name, content_id)
+}
+
+/// Persists a target password (or `""` negative sentinel) extracted from a nested `.nzb` inside an archive release.
+pub fn put_nested_nzb_password(name: &str, group_name: &str, content_id: &[u8], password: &str) {
+    put_nfo_password(&nested_nzb_pw_key(name), group_name, content_id, password);
 }
 
 /// Persists a probed release's `ProbeInfo` JSON, completeness/stamp metadata, optional NFO password, and

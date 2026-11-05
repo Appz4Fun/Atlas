@@ -254,6 +254,8 @@ dependencies = [
  "ureq",
  "webbrowser",
  "webpki-roots",
+ "zipfast",
+ "zipview",
  "zstd 0.13.3",
 ]
 
@@ -424,6 +426,15 @@ name = "bytes"
 version = "1.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
+
+[[package]]
+name = "bzip2"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f3a53fac24f34a81bc9954b5d6cfce0c21e18ec6959f44f56e8e90e4bb7c346c"
+dependencies = [
+ "libbz2-rs-sys",
+]
 
 [[package]]
 name = "castaway"
@@ -1637,6 +1648,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c2cdeb66e45e9f36bfad5bbdb4d2384e70936afbee843c6f6543f0c551ebb25"
 
 [[package]]
+name = "libbz2-rs-sys"
+version = "0.2.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32f454fd6831a29c0e827ed075bca2a15be201bd57f4168f0fd1041124eab17e"
+
+[[package]]
 name = "libc"
 version = "0.2.190"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1648,6 +1665,26 @@ version = "0.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "328c4789d42200f1eeec05bd86c9c13c7f091d2ba9a6ea35acdf51f31bc0f043"
 dependencies = [
+ "pkg-config",
+]
+
+[[package]]
+name = "liblzma"
+version = "0.4.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aa980ea6744074a5b5e0ac6b164aca94fc970121869b3e78ae12a2b0097dbea7"
+dependencies = [
+ "liblzma-sys",
+]
+
+[[package]]
+name = "liblzma-sys"
+version = "0.4.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7c7e3581f367a78d7b7e7ae948d023310556f0cfc13156c2e4e00e25616492b9"
+dependencies = [
+ "cc",
+ "libc",
  "pkg-config",
 ]
 
@@ -4483,6 +4520,26 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.6",
+]
+
+[[package]]
+name = "zipfast"
+version = "0.1.0"
+source = "git+https://github.com/xbmc4lyfe/zipfast?rev=f0274b2e7fb4b024b25afdfa31878fd135e12849#f0274b2e7fb4b024b25afdfa31878fd135e12849"
+dependencies = [
+ "bzip2",
+ "crc32fast",
+ "flate2",
+ "liblzma",
+ "zstd 0.14.3",
+]
+
+[[package]]
+name = "zipview"
+version = "0.1.0"
+source = "git+https://github.com/xbmc4lyfe/zipview?rev=a1c381b93b92d5eac51adb5e177c5394c2ca20bb#a1c381b93b92d5eac51adb5e177c5394c2ca20bb"
+dependencies = [
+ "flate2",
 ]
 
 [[package]]
