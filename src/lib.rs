@@ -54,6 +54,7 @@ pub mod search;
 pub mod sorted;
 pub mod stats_dashboard;
 pub mod store;
+pub mod trash_name;
 pub mod ui;
 pub mod video;
 pub mod web;
