@@ -11,6 +11,7 @@ pub mod lzma;
 pub mod media;
 pub mod moviehash;
 pub mod mpegps;
+pub mod mpegts;
 pub mod nest;
 pub mod opensubtitles;
 pub mod step;
