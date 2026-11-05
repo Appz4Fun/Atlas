@@ -2,6 +2,8 @@
 //! worth fetching, and how far the overview has been read. Each shard has `spots`, the spot a release came from:
 //! its tag, and what the spot says that a release row doesn't (IMDb id, spotter, Spotnet categories).
 
+use std::collections::{BTreeMap, HashMap};
+
 use rusqlite::{Connection, OptionalExtension, Result, params};
 
 use crate::postprocess::schema::ShardTable;
@@ -326,6 +328,63 @@ fn put(conn: &Connection, release_id: i64, row: &SpotRow) -> Result<()> {
     Ok(())
 }
 
+/// What a release's spot says, for its page, its row and the API.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Tagged {
+    pub message_id: String,
+    pub kind: String,
+    pub title: String,
+    pub poster: String,
+    pub tag: String,
+    pub spotter_id: Option<String>,
+    pub imdb_id: Option<String>,
+    pub subcats: String,
+}
+
+/// The spots of these releases, by release id, from each one's shard.
+pub fn spots_of(ids: &[i64]) -> Result<HashMap<i64, Tagged>> {
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    crate::db::with_reader(|conn| spots_of_with(conn, ids))
+}
+
+pub fn spots_of_with(conn: &Connection, ids: &[i64]) -> Result<HashMap<i64, Tagged>> {
+    let mut by_shard: BTreeMap<usize, Vec<String>> = BTreeMap::new();
+    for id in ids {
+        by_shard.entry(crate::store::shard_of_id(*id)).or_default().push(id.to_string());
+    }
+    let mut out = HashMap::new();
+    for (shard, list) in by_shard {
+        let sql = format!(
+            "select release_id, message_id, kind, title, coalesce(poster, ''), coalesce(tag, ''), spotter_id, imdb_id,
+                coalesce(subcats, '') from s{shard}.spots where release_id in ({})",
+            list.join(",")
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                Tagged {
+                    message_id: r.get(1)?,
+                    kind: r.get(2)?,
+                    title: r.get(3)?,
+                    poster: r.get(4)?,
+                    tag: r.get(5)?,
+                    spotter_id: r.get(6)?,
+                    imdb_id: r.get(7)?,
+                    subcats: r.get(8)?,
+                },
+            ))
+        })?;
+        for row in rows {
+            let (id, tagged) = row?;
+            out.insert(id, tagged);
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -553,5 +612,22 @@ mod tests {
         )
         .unwrap();
         assert_eq!(placement(&conn, "Title", "alt.binaries.g", "k", &[]).unwrap(), Placement::SamePost(id));
+    }
+
+    #[test]
+    fn spots_of_reads_each_shard() {
+        let conn = Connection::open_in_memory().unwrap();
+        let (a, b) = (crate::store::global_id(1, 0), crate::store::global_id(1, 3));
+        for shard in [0, 3] {
+            conn.execute(&format!("attach ':memory:' as s{shard}"), []).unwrap();
+            conn.execute_batch(&SPOTS.create.replace("exists spots", &format!("exists s{shard}.spots"))).unwrap();
+        }
+        conn.execute("insert into s0.spots (release_id, message_id, kind, title, poster) values (?, 'a@spot.net', 'movie', 'A', 'p')", [a]).unwrap();
+        conn.execute("insert into s3.spots (release_id, message_id, kind, title, imdb_id) values (?, 'b@spot.net', 'series', 'B', 'tt1')", [b]).unwrap();
+        let found = spots_of_with(&conn, &[a, b, crate::store::global_id(2, 0)]).unwrap();
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[&a].poster, "p");
+        assert_eq!(found[&b].imdb_id.as_deref(), Some("tt1"));
+        assert_eq!(found[&b].kind, "series");
     }
 }

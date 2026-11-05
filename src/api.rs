@@ -355,7 +355,11 @@ fn search(q: &str, args: &HashMap<String, String>, base: &str, api_key: &str) ->
 
 /// What a name says and how many copies a release has, as Newznab attributes. Words other indexers use where
 /// they exist: `team` for the group, `video` and `audio` for codecs.
-fn release_attrs(r: &crate::search::ReleaseRow, copies: Option<&crate::duplicates::CopyCount>) -> String {
+fn release_attrs(
+    r: &crate::search::ReleaseRow,
+    copies: Option<&crate::duplicates::CopyCount>,
+    spot: Option<&crate::spotnet::store::Tagged>,
+) -> String {
     let tags = crate::release_tags::parse(&r.name);
     let mut out = String::new();
     let mut add = |name: &str, value: &str| {
@@ -379,6 +383,11 @@ fn release_attrs(r: &crate::search::ReleaseRow, copies: Option<&crate::duplicate
         add("twins", &copies.twins.to_string());
         add("alts", &copies.alts.to_string());
     }
+    // a release saved from a Spotnet spot: `tag` is the attribute indexers flag releases with
+    if let Some(spot) = spot {
+        add("tag", "spot");
+        add("spotter", spot.spotter_id.as_deref().unwrap_or_default());
+    }
     out
 }
 
@@ -395,6 +404,7 @@ fn rss(
 ) -> ApiResponse {
     let ids: Vec<i64> = releases.iter().map(|r| r.id).collect();
     let copies = crate::duplicates::counts(&ids).unwrap_or_default();
+    let spots = crate::spotnet::store::spots_of(&ids).unwrap_or_default();
     // what the NZB holds: all of a post cut across groups, or of an upload linked by its PAR2 set
     let conn = crate::db::open().ok();
     let items: String = releases
@@ -408,7 +418,7 @@ fn rss(
                 .map_or(String::new(), |p| format!("<newznab:attr name=\"password\" value=\"{}\"/>", p.code()));
             let category = categories.get(&r.id).copied().unwrap_or(crate::category::UNCATEGORIZED);
             let attrs = media.get(&r.id).map_or(String::new(), |a| a.xml(on));
-            let attrs = format!("{attrs}{}", release_attrs(r, copies.get(&r.id)));
+            let attrs = format!("{attrs}{}", release_attrs(r, copies.get(&r.id), spots.get(&r.id)));
             format!(
                 "    <item>      <title>{}</title>      <guid isPermaLink=\"false\">{}</guid>      <link>{}</link>      <size>{size}</size>      <pubDate>{}</pubDate>      <enclosure url=\"{}\" type=\"application/x-nzb\" length=\"{size}\"/>      <newznab:attr name=\"category\" value=\"{category}\"/>{attrs}{password}    </item>",
                 escape(&r.name),
@@ -737,6 +747,16 @@ mod tests {
         for kind in ["<search ", "<tv-search ", "<movie-search ", "<audio-search ", "<book-search "] {
             assert!(caps.contains(&format!(r#"{kind}available="yes""#)), "{kind} in {caps}");
         }
+    }
+
+    #[test]
+    fn a_spot_release_is_tagged_spot() {
+        let row = crate::search::ReleaseRow { id: 1, name: "Movie (2026)".into(), ..Default::default() };
+        let spot = crate::spotnet::store::Tagged { spotter_id: Some("baTFcw".into()), ..Default::default() };
+        let attrs = release_attrs(&row, None, Some(&spot));
+        assert!(attrs.contains(r#"<newznab:attr name="tag" value="spot"/>"#), "{attrs}");
+        assert!(attrs.contains(r#"<newznab:attr name="spotter" value="baTFcw"/>"#), "{attrs}");
+        assert!(!release_attrs(&row, None, None).contains("spot"));
     }
 
     #[test]
