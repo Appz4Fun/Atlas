@@ -94,6 +94,10 @@ pub struct VideoTrack {
     pub dv_enhancement_layer: Option<bool>,
     pub dolby_vision: Option<DolbyVisionInfo>,
     pub language: Option<String>,
+    /// The first keyframe's picture data, hashed: SHA-256 over its coded slices (no parameter sets, SEI or Dolby
+    /// Vision NAL units, which muxers add and drop), first 8 bytes as 16 hex digits. A remux of the same video
+    /// stream has the same; another encode doesn't. None unless that whole frame was in what was read.
+    pub keyframe_key: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -470,10 +474,12 @@ fn segment(body: &[u8], info: &mut MediaInfo) {
                     let track_num = t.number.unwrap_or(next_track_num);
                     next_track_num = track_num.saturating_add(1);
                     if t.kind == 1 && !is_full(info) {
+                        // lengthSizeMinusOne: byte 4 of an avcC record, byte 21 of an hvcC one
+                        let at = if t.codec.contains("AVC") { 4 } else { 21 };
                         let nal_length_size = t
                             .codec_private
                             .as_deref()
-                            .and_then(|cp| cp.get(21))
+                            .and_then(|cp| cp.get(at))
                             .map(|&b| usize::from(b & 0x03) + 1)
                             .unwrap_or(4);
                         video_tracks.push((track_num, info.video.len(), nal_length_size));
@@ -745,6 +751,7 @@ fn add_track(t: Track, info: &mut MediaInfo) {
                 dv_enhancement_layer: t.dv.map(|d| d.2),
                 dolby_vision: dv_info,
                 language: t.language,
+                keyframe_key: None,
             })
         }
         2 => info.audio.push(AudioTrack {
@@ -806,10 +813,16 @@ fn boxes<'a>(b: &'a [u8], each: &mut dyn FnMut(&[u8; 4], &'a [u8])) {
 }
 
 fn mp4(data: &[u8]) -> MediaInfo {
+    mp4_with(data, data)
+}
+
+/// `mp4`, with `file_start` the bytes the sample offsets count from: `data` itself for a file read from its start,
+/// the file's front for a moov read alone from its end.
+fn mp4_with(data: &[u8], file_start: &[u8]) -> MediaInfo {
     let mut info = MediaInfo { container: "mp4".into(), ..MediaInfo::default() };
     boxes(data, &mut |kind, body| {
         if kind == b"moov" {
-            moov(body, data, &mut info);
+            moov(body, data, file_start, &mut info);
         }
     });
     info.header_complete = has_whole_moov(data);
@@ -921,6 +934,28 @@ fn collect_moov_chunk_offsets(moov_body: &[u8]) -> Vec<usize> {
     all_offsets
 }
 
+/// The first sample's size, from `stsz` or `stz2`.
+fn first_sample_size(stsz: Option<&[u8]>, stz2: Option<&[u8]>) -> Option<usize> {
+    if let Some(v) = stsz {
+        let default_size = be32(v, 4)? as usize;
+        if be32(v, 8)? == 0 {
+            return None;
+        }
+        return Some(if default_size > 0 { default_size } else { be32(v, 12)? as usize }).filter(|n| *n > 0);
+    }
+    let v = stz2?;
+    if be32(v, 8)? == 0 {
+        return None;
+    }
+    let size = match *v.get(7)? {
+        8 => usize::from(*v.get(12)?),
+        16 => usize::from(be16(v, 12)?),
+        // 4-bit sizes are for tiny samples, never a keyframe
+        _ => return None,
+    };
+    Some(size).filter(|n| *n > 0)
+}
+
 fn mp4_chunk_byte_len(
     chunk_idx_1based: u32,
     stsc: &[(u32, u32)],
@@ -1014,7 +1049,7 @@ fn mp4_chunk_byte_len(
     None
 }
 
-fn moov(body: &[u8], full_data: &[u8], info: &mut MediaInfo) {
+fn moov(body: &[u8], full_data: &[u8], file_start: &[u8], info: &mut MediaInfo) {
     let all_chunk_offsets = collect_moov_chunk_offsets(body);
     boxes(body, &mut |kind, v| match kind {
         b"mvhd" => {
@@ -1029,7 +1064,7 @@ fn moov(body: &[u8], full_data: &[u8], info: &mut MediaInfo) {
                 info.duration_secs = Some(duration as f64 / f64::from(scale));
             }
         }
-        b"trak" => trak(v, full_data, &all_chunk_offsets, info),
+        b"trak" => trak(v, full_data, file_start, &all_chunk_offsets, info),
         _ => {}
     });
 }
@@ -1067,7 +1102,7 @@ fn parse_dmlp_atmos(v: &[u8]) -> bool {
     }
 }
 
-fn trak(body: &[u8], full_data: &[u8], all_chunk_offsets: &[usize], info: &mut MediaInfo) {
+fn trak(body: &[u8], full_data: &[u8], file_start: &[u8], all_chunk_offsets: &[usize], info: &mut MediaInfo) {
     const MAX_CHUNK_OFFSETS: usize = 16;
     const MAX_AUDIO_CHUNK_PROBE: usize = 4096;
 
@@ -1209,8 +1244,13 @@ fn trak(body: &[u8], full_data: &[u8], all_chunk_offsets: &[usize], info: &mut M
                             track.hdr = vui.hdr;
                         }
                     }
-                } else if kind == b"avcC" && track.bit_depth.is_none() {
-                    track.bit_depth = AvcDepth::from_avcc(v).map(u64::from);
+                } else if kind == b"avcC" {
+                    if let Some(&len_byte) = v.get(4) {
+                        nal_length_size = usize::from(len_byte & 0x03) + 1;
+                    }
+                    if track.bit_depth.is_none() {
+                        track.bit_depth = AvcDepth::from_avcc(v).map(u64::from);
+                    }
                 }
             });
             for &(chunk_idx, off) in &chunk_offsets {
@@ -1219,6 +1259,14 @@ fn trak(body: &[u8], full_data: &[u8], all_chunk_offsets: &[usize], info: &mut M
                     apply_rpu_to_video_track(&mut track, dv);
                     break;
                 }
+            }
+            // the first sample, the first keyframe of a playable track, starts the first chunk
+            if let Some(&(_, off)) = chunk_offsets.iter().find(|&&(chunk, _)| chunk == 1)
+                && let Some(size) = first_sample_size(stsz_box, stz2_box)
+                && let Some(frame) = file_start.get(off..off.saturating_add(size))
+                && frame.len() == size
+            {
+                track.keyframe_key = keyframe_key(&track.codec, frame, nal_length_size);
             }
             if track.hdr.is_none() {
                 track.hdr = hdr_name(track.transfer, false, track.primaries, track.bit_depth);
@@ -1313,8 +1361,47 @@ fn skip_matroska_lace_header(flags: u8, payload: &[u8]) -> Option<&[u8]> {
     }
 }
 
+/// SHA-256 over a frame's coded slice NAL units, each as it's stored without its length, first 8 bytes in hex.
+/// `frame` is `nal_length_size`-prefixed NAL units that must end exactly at its end, soo a frame cut off where the
+/// read stopped gives None. HEVC slices are NAL types 0 to 31, H.264's 1 to 5; anything else gives None.
+pub(super) fn keyframe_key(codec: &str, frame: &[u8], nal_length_size: usize) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let lower = codec.to_ascii_lowercase();
+    // Matroska's V_MPEGH/ISO/HEVC and V_MPEG4/ISO/AVC; MP4's hvc1, hev1, avc1, avc3 and the Dolby Vision ones
+    let hevc =
+        lower.contains("hevc") || lower.contains("h265") || ["hvc1", "hev1", "dvh1", "dvhe"].contains(&lower.as_str());
+    let avc = !hevc && (lower.contains("avc") || lower.contains("h264") || ["dva1", "dvav"].contains(&lower.as_str()));
+    if !(hevc || avc) || !(1..=4).contains(&nal_length_size) {
+        return None;
+    }
+    let mut h = Sha256::new();
+    let (mut at, mut slices) = (0usize, 0usize);
+    while at < frame.len() {
+        let len = frame.get(at..at + nal_length_size)?.iter().fold(0usize, |n, b| n << 8 | usize::from(*b));
+        let nal = frame.get(at + nal_length_size..(at + nal_length_size).checked_add(len)?)?;
+        let first = *nal.first()?;
+        // HEVC: base layer only (nuh_layer_id 0), soo a dual-layer Dolby Vision frame keys as its base layer does
+        let slice = if hevc {
+            let layer = (first & 1) << 5 | nal.get(1)? >> 3;
+            (first >> 1) & 0x3f < 32 && layer == 0
+        } else {
+            (1..=5).contains(&(first & 0x1f))
+        };
+        if slice {
+            h.update(nal);
+            slices += 1;
+        }
+        at += nal_length_size + len;
+    }
+    if slices == 0 {
+        return None;
+    }
+    Some(h.finalize()[..8].iter().map(|b| format!("{b:02x}")).collect())
+}
+
 fn probe_block(
     block: &[u8],
+    complete: bool,
     video_tracks: &[(u64, usize, usize)],
     audio_tracks: &[(u64, usize)],
     video_rpu_found: &mut [bool],
@@ -1327,6 +1414,15 @@ fn probe_block(
     if let Some(&(_, video_idx, nal_length_size)) =
         video_tracks.iter().find(|&&(num, _, _)| num == track_num)
     {
+        // a SimpleBlock's keyframe flag, no lacing, and all of it read
+        if complete
+            && flags & 0x80 != 0
+            && flags & 0x06 == 0
+            && let Some(track) = info.video.get_mut(video_idx)
+            && track.keyframe_key.is_none()
+        {
+            track.keyframe_key = keyframe_key(&track.codec, payload, nal_length_size);
+        }
         if video_rpu_found.get(video_idx).copied() == Some(false)
             && let Some(frames) = skip_matroska_lace_header(flags, payload)
             && let Some(dv) = DolbyVisionInfo::parse_rpu_with_length_size(frames, nal_length_size)
@@ -1369,12 +1465,16 @@ fn probe_cluster(
     info: &mut MediaInfo,
 ) {
     let mut video_rpu_found = vec![false; info.video.len()];
-    walk(data, &mut |id, body| {
+    walk_sized(data, &mut |id, body, size| {
         match id {
-            0xA3 => probe_block(body, video_tracks, audio_tracks, &mut video_rpu_found, info),
+            0xA3 => {
+                let complete = size == Some(body.len() as u64);
+                probe_block(body, complete, video_tracks, audio_tracks, &mut video_rpu_found, info)
+            }
             0xA0 => walk(body, &mut |sub_id, sub_body| {
+                // a Block's flags have no keyframe bit: it's never taken for the keyframe key
                 if sub_id == 0xA1 {
-                    probe_block(sub_body, video_tracks, audio_tracks, &mut video_rpu_found, info);
+                    probe_block(sub_body, false, video_tracks, audio_tracks, &mut video_rpu_found, info);
                 }
                 true
             }),
@@ -2243,8 +2343,14 @@ impl Mp4Prober {
     }
 
     pub fn probe_tail_moov(data: &[u8]) -> Option<MediaInfo> {
+        Self::probe_tail_moov_with(data, &[])
+    }
+
+    /// `probe_tail_moov`, with `front` the file's first bytes, which its sample offsets count from: the first
+    /// keyframe is read from there.
+    pub fn probe_tail_moov_with(data: &[u8], front: &[u8]) -> Option<MediaInfo> {
         if is_mp4(data) || Self::has_moov_box(data) {
-            Some(mp4(data))
+            Some(mp4_with(data, front))
         } else {
             None
         }
@@ -2383,6 +2489,66 @@ impl MkvMetadata {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Length-prefixed (4 bytes) HEVC NAL units, each a two-byte header of `kind` and then `body`.
+    fn hevc_frame(nals: &[(u8, &[u8])]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for (kind, body) in nals {
+            out.extend(((body.len() + 2) as u32).to_be_bytes());
+            out.extend([kind << 1, 1]);
+            out.extend(*body);
+        }
+        out
+    }
+
+    #[test]
+    fn the_keyframe_key_is_over_its_slices_alone() {
+        let slice: &[u8] = &[0xAF, 0x01, 0x02, 0x03];
+        let plain = hevc_frame(&[(19, slice)]);
+        let muxed =
+            hevc_frame(&[(32, b"vps"), (33, b"sps"), (34, b"pps"), (39, b"x265 info"), (19, slice), (62, b"rpu")]);
+        let key = keyframe_key("V_MPEGH/ISO/HEVC", &plain, 4).unwrap();
+        assert_eq!(key.len(), 16);
+        assert_eq!(keyframe_key("hvc1", &muxed, 4).as_deref(), Some(key.as_str()), "SEI, parameter sets, RPU left out");
+        assert_ne!(
+            keyframe_key("hvc1", &hevc_frame(&[(19, &[0xAF, 0x01, 0x02, 0x04])]), 4).as_deref(),
+            Some(key.as_str())
+        );
+        assert_eq!(keyframe_key("hvc1", &muxed[..muxed.len() - 1], 4), None, "a frame cut off gives none");
+        assert_eq!(keyframe_key("hvc1", &hevc_frame(&[(39, b"sei only")]), 4), None);
+        // an enhancement layer slice (nuh_layer_id 1) beside the same base layer slice: the same key
+        let mut el = hevc_frame(&[(19, slice)]);
+        el.extend(5u32.to_be_bytes());
+        el.extend([19 << 1, 1 << 3 | 1, 0xAA, 0xBB, 0xCC]);
+        assert_eq!(keyframe_key("hvc1", &el, 4).as_deref(), Some(key.as_str()), "enhancement layer left out");
+        assert_eq!(keyframe_key("V_MPEG4/ISO/AVC", &[0, 0, 0, 2, 0x65, 0x88], 4).map(|k| k.len()), Some(16));
+        assert_eq!(keyframe_key("V_AV1", &plain, 4), None);
+    }
+
+    #[test]
+    fn a_matroska_keyframe_read_whole_gives_the_key() {
+        let frame = hevc_frame(&[(39, b"sei"), (19, &[0xAF, 9, 9])]);
+        let block = |flags: u8, declared_extra: usize| {
+            let mut body = vec![0x81, 0, 0, flags];
+            body.extend(&frame);
+            let mut out = vec![0xA3, 0x80 | (body.len() + declared_extra) as u8];
+            out.extend(body);
+            out
+        };
+        let probe = |cluster: Vec<u8>| {
+            let mut info = MediaInfo {
+                video: vec![VideoTrack { codec: "V_MPEGH/ISO/HEVC".into(), ..Default::default() }],
+                ..Default::default()
+            };
+            probe_cluster(&cluster, &[(1, 0, 4)], &[], &mut info);
+            info.video[0].keyframe_key.clone()
+        };
+        let want = keyframe_key("V_MPEGH/ISO/HEVC", &frame, 4);
+        assert!(want.is_some());
+        assert_eq!(probe(block(0x80, 0)), want);
+        assert_eq!(probe(block(0x00, 0)), None, "not a keyframe");
+        assert_eq!(probe(block(0x80, 5)), None, "the block runs past what was read");
+    }
 
     #[test]
     fn hdr_names_follow_the_transfer_and_mastering_data() {
@@ -2686,12 +2852,18 @@ mod tests {
         ]
         .concat();
         let tracks = el(&[0x16, 0x54, 0xAE, 0x6B], &el(&[0xAE], &t1));
-        let segment = el(&[0x18, 0x53, 0x80, 0x67], &tracks);
+        // a keyframe with 4-byte NAL lengths, as avcC byte 4 (0xFF) says: an IDR slice
+        let frame = [0, 0, 0, 3, 0x65, 0x88, 0x84];
+        let block = [&[0x81u8, 0, 0, 0x80][..], &frame].concat();
+        let cluster = el(&[0x1F, 0x43, 0xB6, 0x75], &el(&[0xA3], &block));
+        let segment = el(&[0x18, 0x53, 0x80, 0x67], &[tracks, cluster].concat());
         let mkv = [el(&[0x1A, 0x45, 0xDF, 0xA3], &el(&[0x42, 0x82], b"matroska")), segment].concat();
 
         let info = parse(&mkv).unwrap();
         assert_eq!(info.video[0].codec, "V_MPEG4/ISO/AVC");
         assert_eq!(info.video[0].bit_depth, Some(10));
+        assert_eq!(info.video[0].keyframe_key, keyframe_key("V_MPEG4/ISO/AVC", &frame, 4));
+        assert!(info.video[0].keyframe_key.is_some(), "the NAL length width comes from avcC byte 4");
     }
 
     #[test]
@@ -2725,6 +2897,36 @@ mod tests {
         assert_eq!(info.video[0].codec, "hvc1");
         assert_eq!((info.video[0].width, info.video[0].height), (Some(3840), Some(2160)));
         assert!(Mp4Prober::probe_tail_moov(b"not a moov box").is_none());
+    }
+
+    #[test]
+    fn a_tail_moov_finds_its_first_keyframe_in_the_front() {
+        let frame = [0u8, 0, 0, 4, 19 << 1, 1, 0xAF, 0x07];
+        // ftyp (12 bytes), then mdat's header (8): the first sample starts at 20
+        let front = [mp4_box(b"ftyp", b"isom"), mp4_box(b"mdat", &frame)].concat();
+        let mut entry = vec![0u8; 86];
+        entry[4..8].copy_from_slice(b"hvc1");
+        let mut stsd = vec![0u8; 8];
+        stsd.extend(&entry);
+        let stco = [&[0u8; 4][..], &1u32.to_be_bytes(), &20u32.to_be_bytes()].concat();
+        let stsz =
+            [&[0u8; 4][..], &0u32.to_be_bytes(), &1u32.to_be_bytes(), &(frame.len() as u32).to_be_bytes()].concat();
+        let stbl =
+            mp4_box(b"stbl", &[mp4_box(b"stsd", &stsd), mp4_box(b"stco", &stco), mp4_box(b"stsz", &stsz)].concat());
+        let mut hdlr = vec![0u8; 8];
+        hdlr.extend(b"vide");
+        hdlr.extend([0u8; 12]);
+        let mdia = [mp4_box(b"hdlr", &hdlr), mp4_box(b"minf", &stbl)].concat();
+        let moov = mp4_box(b"moov", &mp4_box(b"trak", &mp4_box(b"mdia", &mdia)));
+
+        let want = keyframe_key("hvc1", &frame, 4);
+        assert!(want.is_some());
+        let with_front = Mp4Prober::probe_tail_moov_with(&moov, &front).unwrap();
+        assert_eq!(with_front.video[0].keyframe_key, want);
+        // without the front the offsets point at nothing it has
+        assert_eq!(Mp4Prober::probe_tail_moov(&moov).unwrap().video[0].keyframe_key, None);
+        // and a whole file reads it from itself
+        assert_eq!(mp4(&[front, moov].concat()).video[0].keyframe_key, want);
     }
 
     #[test]

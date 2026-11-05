@@ -64,14 +64,19 @@ pub const RELEASE_KEYS: ShardTable = ShardTable {
             "release_keys_body_crc",
             "create index if not exists release_keys_body_crc on release_keys(body_crc) where body_crc is not null",
         ),
+        (
+            "release_keys_video",
+            "create index if not exists release_keys_video on release_keys(video) where video is not null",
+        ),
     ],
     release_key: Some("release_id"),
-    added: &[("file_crc", "INTEGER"), ("body_crc", "INTEGER")],
+    // `video`: the first keyframe's key, from the probe's `keyframe_key`
+    added: &[("file_crc", "INTEGER"), ("body_crc", "INTEGER"), ("video", "INTEGER")],
 };
 
 const UPSERT: &str =
-    "insert or replace into release_keys (release_id, account, host, layout, lines, file_crc, body_crc)
-    values (?1, ?2, ?3, ?4, ?5, ?6, ?7)";
+    "insert or replace into release_keys (release_id, account, host, layout, lines, file_crc, body_crc, video)
+    values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)";
 const DELETE: &str = "delete from release_keys where release_id = ?1";
 
 pub const KEYS_STEP: StepId = StepId(40);
@@ -100,10 +105,11 @@ pub enum Kind {
     MovieHash,
     FileCrc,
     BodyCrc,
+    Video,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 8] = [
+    pub const ALL: [Kind; 9] = [
         Kind::Account,
         Kind::Host,
         Kind::Layout,
@@ -112,6 +118,7 @@ impl Kind {
         Kind::MovieHash,
         Kind::FileCrc,
         Kind::BodyCrc,
+        Kind::Video,
     ];
 
     /// The word in `/ui/same?kind=`.
@@ -125,6 +132,7 @@ impl Kind {
             Kind::MovieHash => "moviehash",
             Kind::FileCrc => "file",
             Kind::BodyCrc => "article",
+            Kind::Video => "video",
         }
     }
 
@@ -143,6 +151,7 @@ impl Kind {
             Kind::MovieHash => "Same OpenSubtitles hash",
             Kind::FileCrc => "Same file, by size and CRC32",
             Kind::BodyCrc => "Same first article, by the server's body CRC",
+            Kind::Video => "Same video stream",
         }
     }
 
@@ -171,6 +180,9 @@ impl Kind {
             Kind::BodyCrc => {
                 "The main file's first article as the server received it: the same CRC32 over the posted body (yEnc name and cut included), the same part number and size. The same post made again, under any poster, subject or Message-ID. Kept for releases probed since Atlas began keeping the header."
             }
+            Kind::Video => {
+                "The same first keyframe, to the bit: the same encode or the same disc's video, remuxed, renamed or in another container, whoever posted it and in whatever group. Another encode of the same film has another."
+            }
         }
     }
 
@@ -182,6 +194,7 @@ impl Kind {
             Kind::Layout => Some("layout"),
             Kind::Lines => Some("lines"),
             Kind::BodyCrc => Some("body_crc"),
+            Kind::Video => Some("video"),
             Kind::Par2 | Kind::MovieHash | Kind::FileCrc => None,
         }
     }
@@ -196,6 +209,7 @@ pub struct Keys {
     pub lines: Option<i64>,
     pub file_crc: Option<i64>,
     pub body_crc: Option<i64>,
+    pub video: Option<i64>,
 }
 
 impl Keys {
@@ -210,6 +224,7 @@ impl Keys {
             Kind::Layout => self.layout,
             Kind::Lines => self.lines,
             Kind::BodyCrc => self.body_crc,
+            Kind::Video => self.video,
             Kind::Par2 | Kind::MovieHash | Kind::FileCrc => None,
         }
     }
@@ -327,6 +342,12 @@ pub(crate) fn account_and_host(probe: &ProbeInfo) -> (Option<String>, Option<Str
     (parts.account, host.filter(|h| !h.is_empty()))
 }
 
+/// The first video track's keyframe key, as the integer `release_keys` stores: its 16 hex digits read back.
+pub(crate) fn video_key(media: &crate::probe::media::MediaInfo) -> Option<i64> {
+    let hex = media.video.first()?.keyframe_key.as_deref()?;
+    (hex.len() == 16).then(|| u64::from_str_radix(hex, 16).ok()).flatten().map(|k| k as i64)
+}
+
 /// What the layout key is taken over: the codecs in track order, the chapter count and the duration to the
 /// second. None for a probe that found no tracks and no duration.
 pub(crate) fn layout_text(media: &crate::probe::media::MediaInfo) -> Option<String> {
@@ -407,6 +428,7 @@ pub fn keys_of(
         keys.layout = p.media.as_ref().and_then(layout_text).map(|t| as_key(digest8(t.as_bytes())));
         keys.file_crc = probe_file(p).map(FileCrc::key);
         keys.body_crc = body_text(p).map(|t| as_key(digest8(t.as_bytes())));
+        keys.video = p.media.as_ref().and_then(video_key);
     }
     keys.lines = lines_text(timing, parts).map(|t| as_key(digest8(t.as_bytes())));
     keys
@@ -527,7 +549,7 @@ pub fn par2_sets(shard: &Connection, release_id: i64) -> rusqlite::Result<Vec<Ve
 fn stored(shard: &Connection, release_id: i64) -> rusqlite::Result<Option<Keys>> {
     shard
         .prepare_cached(
-            "select account, host, layout, lines, file_crc, body_crc from release_keys where release_id = ?1",
+            "select account, host, layout, lines, file_crc, body_crc, video from release_keys where release_id = ?1",
         )?
         .query_row([release_id], |r| {
             Ok(Keys {
@@ -537,6 +559,7 @@ fn stored(shard: &Connection, release_id: i64) -> rusqlite::Result<Option<Keys>>
                 lines: r.get(3)?,
                 file_crc: r.get(4)?,
                 body_crc: r.get(5)?,
+                video: r.get(6)?,
             })
         })
         .optional()
@@ -809,6 +832,7 @@ impl Step for KeysStep {
                     keys.lines.into(),
                     keys.file_crc.into(),
                     keys.body_crc.into(),
+                    keys.video.into(),
                 ],
             )],
         };
@@ -857,6 +881,27 @@ mod tests {
         assert_eq!(keys_of(None, &files, None, None).lines, None);
         assert_eq!(keys_of(None, &[(None, 10), (Some(500), 5)], Some(15), None).lines, None);
         assert!(keys_of(None, &[], Some(0), None).is_empty());
+    }
+
+    #[test]
+    fn the_video_key_is_the_first_keyframes() {
+        use crate::probe::media::{MediaInfo, VideoTrack};
+        let probe = |key: Option<&str>| ProbeInfo {
+            media: Some(MediaInfo {
+                video: vec![VideoTrack { keyframe_key: key.map(str::to_string), ..Default::default() }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let keys = keys_of(Some(&probe(Some("ba7816bf8f01cfea"))), &[], None, None);
+        assert_eq!(keys.video, Some(as_key(digest8(b"abc"))));
+        assert_eq!(hex16(keys.video.unwrap()), "ba7816bf8f01cfea", "the page prints what the probe kept");
+        assert_eq!(keys_of(Some(&probe(None)), &[], None, None).video, None);
+        assert_eq!(keys_of(Some(&probe(Some("nothex"))), &[], None, None).video, None);
+        assert!(
+            others_sql(Kind::Video, 2, 1).contains("s2.release_keys k")
+                && others_sql(Kind::Video, 2, 1).contains("k.video = ?3")
+        );
     }
 
     #[test]
