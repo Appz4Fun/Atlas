@@ -106,8 +106,9 @@ struct State {
     due_at: Option<i64>,
     /// the first walk that will get to it, in the order walks run
     walk: Option<WalkCover>,
-    /// the steps the walks that will get to it run again, done or not
-    walk_redo: i64,
+    /// the walks that will get to it and run steps again, done or not, in the order they run: (those steps,
+    /// whether it's the walk in progress)
+    redo_walks: Vec<(i64, bool)>,
 }
 
 /// A walk that will visit a release (see `engine::walk_tick`).
@@ -189,7 +190,9 @@ fn read_state(conn: &Connection, s: usize, id: i64) -> rusqlite::Result<State> {
         if before <= id || walk_group.as_deref().is_some_and(|g| Some(g) != group) {
             continue;
         }
-        state.walk_redo |= redo;
+        if redo != 0 {
+            state.redo_walks.push((redo, at == 0));
+        }
         if state.walk.is_none() {
             state.walk = Some(WalkCover { before, group: walk_group, active: at == 0 });
         }
@@ -241,6 +244,9 @@ enum Wait {
     About(f64, i64),
     /// at least this long: more than `AHEAD_CAP` are ahead in every order
     AtLeast(f64),
+    /// somewhere between: an order counted to the end gives the longer, one that stopped at `AHEAD_CAP` could still
+    /// beat it; with how many are ahead in the one counted
+    Between(f64, f64, i64),
     /// the lane hasn't gone fast enough lately to tell; how many are ahead in its main order, if counted
     Unknown(Option<(i64, bool)>),
     /// a walk that waits for the one in progress
@@ -284,6 +290,7 @@ fn wait_in(per_minute: Option<f64>, orders: &[Order<'_>]) -> rusqlite::Result<Wa
         }
     }
     Ok(match best {
+        Some((minutes, ahead)) if floor < minutes => Wait::Between(floor, minutes, ahead),
         Some((minutes, ahead)) => Wait::About(minutes, ahead),
         None if floor.is_finite() => Wait::AtLeast(floor),
         None => Wait::Unknown(None),
@@ -423,10 +430,11 @@ fn standings(state: &State, pace: &Pace, waits: &Waits, now: i64) -> Vec<(&'stat
     let mut out = Vec::new();
     for step in step_list() {
         let b = bit(step.id);
-        let walk_redoes = state.walk_redo & b != 0 && enabled & b != 0;
-        let standing = if let (true, Some(wait)) = (walk_redoes, &waits.walk) {
-            // a reprocess asked for it again, done or not
-            Standing::Queued { wait: *wait, after: 0.0, next: !step.net, lane: "walk" }
+        // a reprocess asked for it again, done or not: the walk in progress gets there in its time, another after it
+        let redo = state.redo_walks.iter().find(|(redo, _)| redo & b != 0).filter(|_| enabled & b != 0);
+        let standing = if let Some((_, active)) = redo {
+            let wait = if *active { waits.walk.unwrap_or(Wait::Unknown(None)) } else { Wait::Later };
+            Standing::Queued { wait, after: 0.0, next: !step.net, lane: "walk" }
         } else if state.done & b != 0 {
             Standing::Done
         } else if state.failed & b != 0 {
@@ -454,7 +462,7 @@ fn standings(state: &State, pace: &Pace, waits: &Waits, now: i64) -> Vec<(&'stat
                 let why = if state.net_transient > 0 {
                     format!("servers didn't answer ({} in a row)", state.net_transient)
                 } else if state.net_attempts > 0 {
-                    format!("retry after {} failed attempts", state.net_attempts)
+                    format!("a retry ({} attempts so far), or a run that's still going", state.net_attempts)
                 } else {
                     "waiting for more of its files or a run in progress".to_string()
                 };
@@ -525,6 +533,12 @@ fn when(wait: &Wait, after: f64, lane: &str, shard: usize) -> String {
         Wait::About(minutes, ahead) => {
             format!("in about {} · {} {line}", span(minutes + after), thousands(*ahead))
         }
+        Wait::Between(soonest, latest, ahead) => format!(
+            "in {} to {} · {} {line} in the order that's sure to get there",
+            span(soonest + after),
+            span(latest + after),
+            thousands(*ahead)
+        ),
         Wait::AtLeast(minutes) => {
             format!("in more than {} · over {} {line}", span(minutes + after), thousands(AHEAD_CAP))
         }
@@ -588,7 +602,7 @@ fn render(id: i64, state: &State, pace: &Pace, rows: &[(&'static StepMeta, Stand
         let soonest = pending
             .iter()
             .filter_map(|(_, s)| match s {
-                Standing::Queued { wait: Wait::About(m, _), after, .. } => Some(m + after),
+                Standing::Queued { wait: Wait::About(m, _) | Wait::Between(m, ..), after, .. } => Some(m + after),
                 Standing::Until(at, _) => Some((at - now) as f64 / 60.0),
                 Standing::Running(_) => Some(0.0),
                 _ => None,
@@ -650,7 +664,7 @@ pub(crate) fn fragment(args: &HashMap<String, String>) -> ApiResponse {
         if let Some(due) = state.due_at.filter(|d| *d <= now) {
             waits.queue = Some(queue_wait(conn, s, id, due, rate(pace.queue_taken), now)?);
         }
-        if let Some(walk) = state.walk.as_ref().filter(|_| state.due_at.is_none() || state.walk_redo != 0) {
+        if let Some(walk) = state.walk.as_ref().filter(|_| state.due_at.is_none() || !state.redo_walks.is_empty()) {
             waits.walk = Some(walk_wait(conn, s, id, walk, rate(pace.walk_rows))?);
         }
         Ok((state, waits))
@@ -705,6 +719,14 @@ mod tests {
         let far = counted(AHEAD_CAP * 4);
         let wait = wait_in(Some(1000.0), &[(0.5, &far), (0.5, &far)]).unwrap();
         assert_eq!(wait, Wait::AtLeast(AHEAD_CAP as f64 / 500.0));
+    }
+
+    #[test]
+    fn an_order_stopped_at_the_cap_keeps_the_wait_a_range() {
+        // at 1,000 a minute: rank and newest stop at the cap (at least 667 and 4,000 min), oldest says 3,200 min
+        let (rank, newest, oldest) = (counted(600_000), counted(600_000), counted(400_000));
+        let wait = wait_in(Some(1000.0), &[(0.75, &rank), (0.125, &newest), (0.125, &oldest)]).unwrap();
+        assert_eq!(wait, Wait::Between(AHEAD_CAP as f64 / 750.0, 3200.0, 400_000));
     }
 
     #[test]
@@ -783,7 +805,10 @@ mod tests {
         };
         let pace = Pace { enabled: Some(!bit(step("stills").id)), ..pace() };
         let rows = standings(&state, &pace, &Waits::default(), 1_000);
-        assert_eq!(*standing_of(&rows, "probe"), Standing::Until(5_000, "retry after 2 failed attempts".into()));
+        assert_eq!(
+            *standing_of(&rows, "probe"),
+            Standing::Until(5_000, "a retry (2 attempts so far), or a run that's still going".into())
+        );
         assert_eq!(*standing_of(&rows, "naming"), Standing::Until(4_000, "waiting for the post to settle".into()));
         assert_eq!(*standing_of(&rows, "stills"), Standing::Off);
     }
@@ -804,12 +829,16 @@ mod tests {
             has_state: true,
             done: -1,
             walk: Some(WalkCover { before: 100, group: None, active: false }),
-            walk_redo: bit(naming.id),
+            redo_walks: vec![(bit(step("probe").id), true), (bit(naming.id), false)],
             ..Default::default()
         };
-        let waits = Waits { walk: Some(Wait::Later), ..Default::default() };
-        let rows = standings(&state, &pace(), &waits, 0);
+        let rows = standings(&state, &pace(), &Waits::default(), 0);
         assert!(matches!(standing_of(&rows, "naming"), Standing::Queued { lane: "walk", wait: Wait::Later, .. }));
+        // the walk in progress asked for the probe again, and gets there at its own pace
+        let waits = Waits { walk: Some(Wait::About(30.0, 900)), ..Default::default() };
+        let rows = standings(&state, &pace(), &waits, 0);
+        assert!(matches!(standing_of(&rows, "probe"), Standing::Queued { wait: Wait::About(..), .. }));
+        assert!(matches!(standing_of(&rows, "naming"), Standing::Queued { wait: Wait::Later, .. }));
         assert_eq!(*standing_of(&rows, "category"), Standing::Done);
         assert!(render(8, &state, &pace(), &rows, 0).contains("by a later walk"));
     }
@@ -829,7 +858,7 @@ mod tests {
         assert_eq!(*standing_of(&rows, "probe"), Standing::Running(1_000 + NET_CRASH_RETRY - 5));
         let later = State { net_next_at: 1_000 + 3_600, ..state };
         let rows = standings(&later, &pace(), &Waits::default(), 1_000);
-        assert!(matches!(standing_of(&rows, "probe"), Standing::Until(_, why) if why.starts_with("retry")));
+        assert!(matches!(standing_of(&rows, "probe"), Standing::Until(_, why) if why.starts_with("a retry")));
     }
 
     #[test]
