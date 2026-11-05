@@ -286,6 +286,7 @@ fn restore_nzb(
     ctx: &StepCtx<'_>,
     files: &[FileInfo],
     content_id: &[u8],
+    require_checked: bool,
     limits: &ArchiveConfig,
 ) -> Result<Option<Outcome>, StepError> {
     if select::nzb_sources(files).is_empty() || !select::plan(files, limits.probe_files.max(0) as usize).is_empty() {
@@ -296,9 +297,17 @@ fn restore_nzb(
     if saved.is_empty() {
         return Ok(None);
     }
-    let files = saved.into_iter().map(|f| InnerFile { name: f.name, size: f.size }).collect();
-    let listing = Listing { files, complete: true, ..Default::default() };
-    finish_with_override(ctx, SOURCE_NZB, listing, None, Some(None), false, limits).map(Some)
+    let pw = known_or_post_password(ctx, files, None);
+    if require_checked && pw.is_none() && !crate::raw_store::has_nfo_password_record(&rel.name, &rel.group, content_id) {
+        return Ok(None);
+    }
+    let inner_files = saved.into_iter().map(|f| InnerFile { name: f.name, size: f.size }).collect();
+    let listing = Listing { files: inner_files, complete: true, ..Default::default() };
+    let mut outcome = finish_with_override(ctx, SOURCE_NZB, listing, None, Some(None), false, limits)?;
+    if let Some(pw) = pw {
+        add_pointed_password_writes(ctx, &mut outcome.writes, &pw, true);
+    }
+    Ok(Some(outcome))
 }
 
 fn listing_of(inventory: par2::Inventory) -> Listing {
@@ -819,7 +828,7 @@ impl Step for ListStep {
             {
                 return restore_archive(ctx, saved, &content_id, &limits);
             }
-            if let Some(outcome) = restore_nzb(ctx, &files, &content_id, &limits)? {
+            if let Some(outcome) = restore_nzb(ctx, &files, &content_id, true, &limits)? {
                 return Ok(outcome);
             }
             if select::par2_source(&files).is_none() {
@@ -964,6 +973,8 @@ impl Step for ListStep {
                 let mut outcome = finish(ctx, SOURCE_NZB, nzb::list(&body), &limits)?;
                 if let Some(pw) = meta_pw.or_else(|| known_or_post_password(ctx, &files, None)) {
                     add_pointed_password_writes(ctx, &mut outcome.writes, &pw, true);
+                } else {
+                    crate::raw_store::put_nfo_password(&rel_name, &rel_group, &content_id, "");
                 }
                 return Ok(outcome);
             }
@@ -973,7 +984,7 @@ impl Step for ListStep {
             return restore_archive(ctx, saved, &content_id, &limits);
         }
         // its articles may be gone since
-        if let Some(outcome) = restore_nzb(ctx, &files, &content_id, &limits)? {
+        if let Some(outcome) = restore_nzb(ctx, &files, &content_id, false, &limits)? {
             return Ok(outcome);
         }
         if select::par2_source(&files).is_none() {

@@ -1182,6 +1182,15 @@ fn upsert_nfo_password(
 /// Looks up a cached NFO password for `(name, group_name)` verified against `content_id` in `raw_nfo_passwords`,
 /// independent of whether `raw_probes` has a reusable probe result.
 pub fn get_nfo_password(name: &str, group_name: &str, content_id: &[u8]) -> Option<String> {
+    raw_nfo_password_entry(name, group_name, content_id).filter(|s| !s.is_empty())
+}
+
+/// True when `raw_nfo_passwords` holds a row (even an empty-string negative sentinel) for `(name, group_name, content_id)`.
+pub fn has_nfo_password_record(name: &str, group_name: &str, content_id: &[u8]) -> bool {
+    raw_nfo_password_entry(name, group_name, content_id).is_some()
+}
+
+fn raw_nfo_password_entry(name: &str, group_name: &str, content_id: &[u8]) -> Option<String> {
     if content_id.is_empty() {
         return None;
     }

@@ -1253,7 +1253,9 @@ pub fn is_false_positive_password(found: &str) -> bool {
     if crate::archive::PasswordHarvester::is_negative_phrase(f) {
         return true;
     }
-    !f.chars().any(|c| c.is_alphanumeric())
+    !f.is_empty()
+        && f.bytes()
+            .all(|b| matches!(b, b'-' | b'=' | b'*' | b'_' | b'.' | b':' | b'/' | b'\\' | b'|' | b'+' | b'~'))
 }
 
 /// All candidate passwords matched by [`PASSWORD`] in `text`, in order of appearance.
@@ -1334,11 +1336,7 @@ pub fn find_verified_password<'a>(
                     fallback = Some(cand.clone());
                 }
             }
-            Some(false) => {
-                if !chk.certain() && fallback.is_none() {
-                    fallback = Some(cand.clone());
-                }
-            }
+            Some(false) => {}
         }
     }
     if chk.accepts("").is_none() {

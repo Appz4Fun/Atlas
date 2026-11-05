@@ -853,5 +853,8 @@ mod select_tests {
 
         let nzb_ent = br#"<nzb><head><meta type="password">abc&amp;123&#33;</meta></head></nzb>"#;
         assert_eq!(super::nzb::meta_password(nzb_ent).as_deref(), Some("abc&123!"));
+        assert_eq!(crate::release_info::find_password("Movie.{{!@#$}}.nzb").as_deref(), Some("!@#$"));
+        let z_chk = super::PasswordTest::Zip(super::zip::PasswordCheck::Crypto { header: [0; 12], check: 0x99 });
+        assert_eq!(crate::release_info::find_verified_password(["password: wrong"], &[], Some(&z_chk)), None);
     }
 }
