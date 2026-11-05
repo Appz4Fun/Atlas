@@ -631,13 +631,15 @@ mod tests {
         assert_eq!(ranked(60 * gib, Some(6000)), Some(0), "nor XXX");
         conn.execute("insert into files (release_id, filename, seen) values (?, 'Some.Post.NZB', x'01')", [id])
             .unwrap();
-        assert_eq!(ranked(6_226, Some(2045)), Some(2), "a post of an NZB, however small");
-        assert_eq!(ranked(6_226, Some(3010)), Some(2), "and whatever it's filed as");
+        assert_eq!(ranked(6_226, Some(2045)), Some(5), "a post of an NZB: first of all");
+        assert_eq!(ranked(6_226, Some(3010)), Some(5), "and whatever it's filed as");
+        assert_eq!(ranked(64 << 20, Some(3010)), Some(5), "up to 64 MiB");
+        assert_eq!(ranked((64 << 20) + 1, Some(3010)), Some(3), "past that, an NZB beside more costs more");
         assert_eq!(ranked(60 * gib, Some(2045)), Some(4), "a big one with an NZB beside it stays where it was");
         conn.execute("delete from files where filename = 'Some.Post.NZB'", []).unwrap();
         assert_eq!(ranked(16 << 20, Some(2045)), Some(0));
         conn.execute("insert into nzb_pointed (release_id) values (?)", [id]).unwrap();
-        assert_eq!(ranked(16 << 20, Some(2045)), Some(2), "what an NZB read here points to");
+        assert_eq!(ranked(16 << 20, Some(2045)), Some(3), "what an NZB read here points to");
     }
 
     #[test]
@@ -657,7 +659,7 @@ mod tests {
             conn.execute(RANK_POINTED.as_str(), params![name, id + 8]).unwrap();
             self::rank(&conn, id)
         };
-        assert_eq!(point(16 << 20, Some(0)), Some(2), "a small one, ranked 0");
+        assert_eq!(point(16 << 20, Some(0)), Some(3), "a small one, ranked 0");
         assert_eq!(point(60 << 30, None), Some(4), "a big one not ranked yet gets its own rank, not 2");
         conn.execute(MARK_POINTED, params![name, id]).unwrap();
         assert_eq!(conn.query_row("select count(*) from nzb_pointed", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
@@ -844,9 +846,8 @@ mod tests {
         conn.execute(RERUN_POINTED_LIST.as_str(), params![name, pointer_id]).unwrap();
         conn.execute(RERUN_POINTED_PROBE.as_str(), params![name, pointer_id]).unwrap();
         conn.execute(MARK_POINTED_PASSWORD, params![name, pointer_id, "JFB9hbdCrue7m4XA391gNYM50"]).unwrap();
-        let got: Option<String> = conn
-            .query_row("select password from release_nfo_password where release_id = ?", [id], |r| r.get(0))
-            .ok();
+        let got: Option<String> =
+            conn.query_row("select password from release_nfo_password where release_id = ?", [id], |r| r.get(0)).ok();
         assert_eq!(got.as_deref(), Some("JFB9hbdCrue7m4XA391gNYM50"));
         let (done, net_wanted, net_left): (i64, i64, i64) = conn
             .query_row("select done, net_wanted, net_left from pp_state where release_id = ?", [id], |r| {
