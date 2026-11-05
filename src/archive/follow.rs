@@ -53,6 +53,10 @@ impl Whole {
     /// None: a file that may not or can't be read: posted to no group Atlas may fetch from (none named, or every one
     /// blocked, `filters::group_blocked`), or with a segment whose message-id isn't one (`valid_id`).
     fn of(file: &NzbFile) -> Option<Whole> {
+        // nothing to read, so no group of it is looked at: a crafted NZB of empty files names groups by the thousand
+        if file.segments.is_empty() {
+            return None;
+        }
         if !file.groups.iter().any(|g| !crate::filters::group_blocked(g)) {
             return None;
         }
@@ -424,6 +428,7 @@ mod tests {
             ..file.clone()
         };
         assert!(Whole::of(&with_id("")).is_none(), "an id dropped as overlong");
+        assert!(Whole::of(&NzbFile { segments: vec![], ..with_id("a@b") }).is_none(), "no segments");
         assert!(Whole::of(&with_id("a\nb")).is_none(), "a line break");
         assert!(Whole::of(&with_id("a b")).is_none(), "a space");
         assert!(Whole::of(&with_id("a>b")).is_none(), "a bracket");
