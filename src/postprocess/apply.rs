@@ -68,13 +68,15 @@ pub(crate) fn count_names(renames: &[(u8, bool)]) {
 static UPSERT_STATE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     format!(
         "insert into pp_state (release_id, done, failed, net_wanted, db_attempts, net_attempts, net_next_at, parts_seen,
-                                   last_error, rerun_gen, rerun_mask, net_transient, net_rank)
+                                   last_error, rerun_gen, rerun_mask, net_transient, net_rank, net_left)
              values (?1, ?2 & ~?4, ?3 & ~?2 & ~?4, case when (?5 & ~(?2 & ~?4) & ~(?3 & ~?4)) != 0 then 1 end,
-                     coalesce(?6, 0), coalesce(?7, 0), coalesce(?8, 0), coalesce(?9, 0), ?10, ?4 != 0, ?4, ?11, {rank})
+                     coalesce(?6, 0), coalesce(?7, 0), coalesce(?8, 0), coalesce(?9, 0), ?10, ?4 != 0, ?4, ?11, {rank},
+                     nullif(?5 & ~(?2 & ~?4) & ~(?3 & ~?4), 0))
              on conflict(release_id) do update set
                 done = (done | ?2) & ~?4,
                 failed = (failed | ?3) & ~?2 & ~?4,
                 net_wanted = case when (?5 & ~((done | ?2) & ~?4) & ~((failed | ?3) & ~?4)) != 0 then 1 end,
+                net_left = nullif(?5 & ~((done | ?2) & ~?4) & ~((failed | ?3) & ~?4), 0),
                 db_attempts = coalesce(?6, db_attempts),
                 net_attempts = coalesce(?7, net_attempts),
                 net_next_at = coalesce(?8, net_next_at),
@@ -575,6 +577,22 @@ mod tests {
         assert_eq!(state(&conn, id).2, Some(1), "clear takes it back");
         run(&conn, Applied { release_id: id, claimed_gen: 1, net_mask: A, set_failed: A, ..Default::default() });
         assert_eq!(state(&conn, id).2, None, "failed");
+    }
+
+    #[test]
+    fn net_left_holds_the_net_steps_still_to_run() {
+        let (_dir, conn, id) = shard();
+        let left = |conn: &Connection| -> Option<i64> {
+            conn.query_row("select net_left from pp_state where release_id = ?", [id], |r| r.get(0)).unwrap()
+        };
+        run(&conn, Applied { release_id: id, net_mask: A | B, ..Default::default() });
+        assert_eq!(left(&conn), Some(A | B));
+        run(&conn, Applied { release_id: id, net_mask: A | B, set_done: A, ..Default::default() });
+        assert_eq!(left(&conn), Some(B), "one done");
+        run(&conn, Applied { release_id: id, net_mask: B, set_failed: B, ..Default::default() });
+        assert_eq!(left(&conn), None, "none left, as net_wanted");
+        run(&conn, Applied { release_id: id, claimed_gen: 1, net_mask: A | C, clear: A, ..Default::default() });
+        assert_eq!(left(&conn), Some(A | C), "a cleared step is back");
     }
 
     fn rank(conn: &Connection, id: i64) -> Option<i64> {
