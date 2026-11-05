@@ -966,3 +966,68 @@ fn what_a_read_nzb_points_to_is_marked_and_ranked_up() {
         .unwrap();
     assert_eq!(rank, Some(2));
 }
+
+/// an NZB of `files`, each `(subject, [(segment bytes, message-id)])`
+fn an_nzb_of(files: &[(&str, &[(u64, &str)])]) -> Vec<u8> {
+    let mut out = String::from("<?xml version=\"1.0\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\">\n");
+    for (subject, segments) in files {
+        out.push_str(&format!("<file poster=\"p\" date=\"1\" subject=\"{subject}\"><segments>"));
+        for (i, (bytes, id)) in segments.iter().enumerate() {
+            out.push_str(&format!("<segment bytes=\"{bytes}\" number=\"{}\">{id}</segment>", i + 1));
+        }
+        out.push_str("</segments></file>\n");
+    }
+    out.push_str("</nzb>\n");
+    out.into_bytes()
+}
+
+/// a post on the server under its own message-id, outside any release
+fn loose(number: u64, id: &str, file: &str, data: &[u8]) -> Post {
+    Post {
+        message_id: format!("<{id}>"),
+        ..post(number, &format!("\"{file}\" yEnc (1/1)"), 700_000, yenc_body(file, data))
+    }
+}
+
+#[test]
+fn a_posted_nzb_is_followed_through_a_small_post_whose_rar_holds_the_next_nzb() {
+    let mut h = fresh();
+    // the last hop: a big upload, listed and not read
+    let last =
+        an_nzb_of(&[("Final.Movie.2024.2160p-GRP.part01.rar (1/2)", &[(700_000_000, "f1@x"), (700_000_000, "f2@x")])]);
+    let rar = rar4(&[r4_main(0), r4_file(0, b"Final-{{s3cret}}.nzb", &last), r4_end()]);
+    // the first: a small post of that RAR, read whole
+    let first = an_nzb_of(&[("Hop.Post.rar (1/1)", &[(rar.len() as u64, "hop1@x")])]);
+    let s = shape("x").one("x.nzb", &first);
+    h.save(&[s.release()]);
+    let mut posts = s.posts.clone();
+    posts.push(loose(90, "hop1@x", "Hop.Post.rar", &rar));
+    let state = Server::new(posts);
+    start_with(&mut h, spawn_server(state.clone()), config(), steps::all());
+    settled(&h, "x");
+    assert_eq!(bodies(&state), 2, "the NZB and the hop's one article, not the big upload");
+    let found: Vec<(String, i64)> = rows(&h, "x").into_iter().map(|r| (r.name, r.source)).collect();
+    assert_eq!(
+        found,
+        [
+            ("Hop.Post.rar".to_string(), 5),
+            ("Final-{{s3cret}}.nzb".to_string(), 5),
+            ("Final.Movie.2024.2160p-GRP.part01.rar".to_string(), 5)
+        ]
+    );
+}
+
+#[test]
+fn a_small_rars_nzb_is_read_whole_not_only_its_first_article() {
+    let mut h = fresh();
+    let mut files: Vec<(&str, &[u64])> = POINTED_AT.to_vec();
+    files.push(("Other.Thing.2024.mkv (1/1)", &[5_000]));
+    let rar = rar4(&[r4_main(0), r4_file(0, b"Pointed.At.nzb", &an_nzb(&files)), r4_end()]);
+    let (head, tail) = rar.split_at(rar.len() / 2);
+    let s = shape("x").add("x.rar", 1, 2, yenc_body("x.rar", head)).add("x.rar", 2, 2, yenc_body("x.rar", tail));
+    let state = serve(&mut h, &s, config());
+    settled(&h, "x");
+    assert_eq!(bodies(&state), 2, "the head, then the article after it");
+    let nzb_rows: Vec<String> = rows(&h, "x").into_iter().filter(|r| r.source == 5).map(|r| r.name).collect();
+    assert!(nzb_rows.contains(&"Other.Thing.2024.mkv".to_string()), "{nzb_rows:?}");
+}
