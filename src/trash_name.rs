@@ -241,8 +241,9 @@ fn specs(release: &str, tags: &Tags) -> String {
 
 /// Radarr's quality, `Bluray-1080p`, `Remux-2160p`, with how the name spells WEB-DL
 fn quality(tags: &Tags) -> String {
-    let resolution = tags.resolution.as_deref().filter(|r| r.ends_with('p'));
-    let height = resolution.and_then(|r| r.trim_end_matches('p').parse::<u32>().ok());
+    // `1080p` or an interlaced `1080i`
+    let resolution = tags.resolution.as_deref().filter(|r| r.ends_with(['p', 'i']));
+    let height = resolution.and_then(|r| r[..r.len() - 1].parse::<u32>().ok());
     let source = tags.quality.as_deref().map(|q| match q {
         "WEB" | "WEB-DL" | "WEBMux" => ("WEB-DL", true),
         "WEBRip" | "WEB-DLRip" | "UHDRip" => ("WEBRip", true),
@@ -548,6 +549,14 @@ mod tests {
         assert_eq!(
             shown("Movie.2020.1080p.BluRay.TrueHD.Atmos.7.1.AC3.2.0.x264-GRP", MOVIES_HD, movie("Movie", 2020)),
             "Movie (2020) [Bluray-1080p][TrueHD Atmos 7.1][x264]-GRP"
+        );
+    }
+
+    #[test]
+    fn an_interlaced_hd_episode_stays_hd() {
+        assert_eq!(
+            shown("Show.S01E01.1080i.HDTV.H264-GRP", TV_HD, show("Show", "2020-01-01", 1, Some(1))),
+            "Show (2020) - S01E01 [HDTV-1080i][H264]-GRP"
         );
     }
 
