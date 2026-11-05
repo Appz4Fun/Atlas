@@ -15,13 +15,15 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use rusqlite::{Connection, OptionalExtension};
-use tantivy::collector::sort_key::{SortBySimilarityScore, SortByStaticFastValue, SortByString};
-use tantivy::collector::{Collector, Count, TopDocs};
+use tantivy::collector::sort_key::{NaturalComparator, SortByStaticFastValue, SortByString};
+use tantivy::collector::{Collector, Count, SegmentSortKeyComputer, SortKeyComputer, TopDocs};
 use tantivy::directory::MmapDirectory;
 use tantivy::query::{AllQuery, BooleanQuery, EmptyQuery, Occur, Query, RegexQuery, TermQuery, TermSetQuery};
 use tantivy::schema::{FAST, Field, INDEXED, IndexRecordOption, STRING, Schema, TextFieldIndexing, TextOptions};
 use tantivy::tokenizer::{AsciiFoldingFilter, LowerCaser, RemoveLongFilter, SimpleTokenizer, TextAnalyzer};
-use tantivy::{DocAddress, Index, IndexReader, IndexWriter, Order, ReloadPolicy, Searcher, TantivyDocument, Term};
+use tantivy::{
+    DocAddress, Index, IndexReader, IndexWriter, Order, ReloadPolicy, Score, Searcher, TantivyDocument, Term,
+};
 
 use crate::category::{CatFilter, TABLE, UNCATEGORIZED, label};
 use crate::search::{ReleaseRow, VISIBLE_RELEASE, visible_release};
@@ -609,7 +611,7 @@ impl WordIndex {
         let page = TopDocs::with_limit(limit.max(1)).and_offset(offset);
         let newest = (SortByStaticFastValue::<u64>::for_field("id"), Order::Desc);
         let (found, total) = match by {
-            By::Relevance => run(searcher, query, page.order_by(((SortBySimilarityScore, Order::Desc), newest)))?,
+            By::Relevance => run(searcher, query, page.order_by(((ShownFirst, Order::Desc), newest)))?,
             By::Newest => run(searcher, query, page.order_by(newest))?,
             By::Size => {
                 run(searcher, query, page.order_by(((SortByStaticFastValue::<u64>::for_field("size"), order), newest)))?
@@ -638,6 +640,51 @@ impl WordIndex {
             }
         }
         Ok((ids, total))
+    }
+}
+
+/// How much more a match counts when it's a movie or an episode: the releases this index is kept for. Enough that
+/// one matching about as well comes first, as `Matchbox the Movie` over a `Matchbox Twenty` album whose shorter name
+/// scores a little higher on the same word, and not soo much that a name matching more of the words loses to it.
+const SHOWN_FIRST: f32 = 1.5;
+
+/// Whether `category` is one of Movies' or TV's.
+fn shown_first(category: u64) -> bool {
+    matches!(category / 1000, 2 | 5)
+}
+
+/// The best matches first, movies and episodes ahead of what matches about as well (`SHOWN_FIRST`).
+#[derive(Clone, Copy, Debug)]
+struct ShownFirst;
+
+impl SortKeyComputer for ShownFirst {
+    type SortKey = Score;
+    type Child = ShownFirstIn;
+    type Comparator = NaturalComparator;
+
+    fn requires_scoring(&self) -> bool {
+        true
+    }
+
+    fn segment_sort_key_computer(&self, segment: &tantivy::SegmentReader) -> tantivy::Result<ShownFirstIn> {
+        Ok(ShownFirstIn(segment.fast_fields().u64("category")?))
+    }
+}
+
+/// `ShownFirst` over one segment, with its categories.
+struct ShownFirstIn(tantivy::columnar::Column<u64>);
+
+impl SegmentSortKeyComputer for ShownFirstIn {
+    type SortKey = Score;
+    type SegmentSortKey = Score;
+    type SegmentComparator = NaturalComparator;
+
+    fn segment_sort_key(&mut self, doc: tantivy::DocId, score: Score) -> Score {
+        if self.0.first(doc).is_some_and(shown_first) { score * SHOWN_FIRST } else { score }
+    }
+
+    fn convert_segment_sort_key(&self, score: Score) -> Score {
+        score
     }
 }
 
@@ -1199,6 +1246,28 @@ mod tests {
         index.build(&conn).unwrap();
         assert_eq!(found("matchbox"), vec![ac]);
         assert_eq!(found("coyote acme"), vec![old]);
+    }
+
+    #[test]
+    fn movies_and_episodes_come_first_among_matches_about_as_good() {
+        let f = fixture();
+        let index = f.index();
+        let conn = f.conn();
+        let g = "alt.binaries.sounds";
+        let mp3 = f.add("Matchbox.Twenty-Mad.Season-2000-MP3-320", g, 5, Some(3010));
+        let flac = f.add("Matchbox_Twenty-Yourself_or_Someone_Like_You-1996-FLAC", g, 5, Some(3040));
+        let film =
+            f.add("Matchbox.The.Movie.2026.MULTi.VFF.AD.2160p.HDR.DV.WEB.EAC3.5.1.Atmos.H265-FRQC", g, 5, Some(UHD));
+        let episode = f.add("Matchbox.Show.S01E02.Second.Episode.Title.1080p.WEB.H264-GRP", g, 5, Some(5040));
+        let exact = f.add("Match.Point.Soundtrack.2005.MP3", g, 5, Some(3010));
+        index.build(&conn).unwrap();
+        let found = |words: &str| ids(&index.search(&conn, words, None, &[], By::Relevance, true, 0, 10).unwrap());
+        // the albums' shorter names score a little higher on the word alone: the film and the episode still lead
+        let first = found("matchbox");
+        assert_eq!(first[..2].iter().copied().collect::<std::collections::HashSet<_>>(), [film, episode].into());
+        assert_eq!(found("matchbox twenty"), vec![mp3, flac], "only the albums have both words");
+        // a whole word scores well past what the boost gives a word it only starts
+        assert_eq!(found("match")[0], exact, "the word itself is a better match than a longer one starting with it");
     }
 
     #[test]
