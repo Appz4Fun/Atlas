@@ -494,7 +494,7 @@ pub struct MetricsConfig {
     pub host: String,
     pub indexer_port: u16,
     pub api_port: u16,
-    /// seconds between walks over every release
+    /// seconds between walks over every release, at least 4 times as long as the last walk took
     pub catalog_every_secs: u64,
 }
 

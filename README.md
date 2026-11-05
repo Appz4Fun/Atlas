@@ -895,7 +895,7 @@ host = "0.0.0.0"
 | `host` | `127.0.0.1` | Address to listen on. The metrics have no login, and they name your groups and servers, so keep them off the internet. They never hold a password or API key. |
 | `indexer_port` | `9092` | Port of the background indexer's numbers. |
 | `api_port` | `9093` | Port of the menu and API process's numbers. |
-| `catalog_every_secs` | `1800` | Seconds between walks over every release, at least 60. |
+| `catalog_every_secs` | `1800` | Seconds between walks over every release, at least 60. A walk reads every release off the disk, so the rest after one is also at least 4 times as long as it took. |
 
 The indexer and the menu are separate processes, so each has its own port. A process's counters start over when it does, which Prometheus rate functions expect. If its port is still held when it starts, for example by the old process on its way out, it keeps trying every 5 seconds and indexing goes on meanwhile.
 
