@@ -92,6 +92,10 @@ pub struct VideoTrack {
     pub dv_enhancement_layer: Option<bool>,
     pub dolby_vision: Option<DolbyVisionInfo>,
     pub language: Option<String>,
+    /// The first keyframe's picture data, hashed: SHA-256 over its coded slices (no parameter sets, SEI or Dolby
+    /// Vision NAL units, which muxers add and drop), first 8 bytes as 16 hex digits. A remux of the same video
+    /// stream has the same; another encode doesn't. None unless that whole frame was in what was read.
+    pub keyframe_key: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -743,6 +747,7 @@ fn add_track(t: Track, info: &mut MediaInfo) {
                 dv_enhancement_layer: t.dv.map(|d| d.2),
                 dolby_vision: dv_info,
                 language: t.language,
+                keyframe_key: None,
             })
         }
         2 => info.audio.push(AudioTrack {
@@ -917,6 +922,28 @@ fn collect_moov_chunk_offsets(moov_body: &[u8]) -> Vec<usize> {
     all_offsets.sort_unstable();
     all_offsets.dedup();
     all_offsets
+}
+
+/// The first sample's size, from `stsz` or `stz2`.
+fn first_sample_size(stsz: Option<&[u8]>, stz2: Option<&[u8]>) -> Option<usize> {
+    if let Some(v) = stsz {
+        let default_size = be32(v, 4)? as usize;
+        if be32(v, 8)? == 0 {
+            return None;
+        }
+        return Some(if default_size > 0 { default_size } else { be32(v, 12)? as usize }).filter(|n| *n > 0);
+    }
+    let v = stz2?;
+    if be32(v, 8)? == 0 {
+        return None;
+    }
+    let size = match *v.get(7)? {
+        8 => usize::from(*v.get(12)?),
+        16 => usize::from(be16(v, 12)?),
+        // 4-bit sizes are for tiny samples, never a keyframe
+        _ => return None,
+    };
+    Some(size).filter(|n| *n > 0)
 }
 
 fn mp4_chunk_byte_len(
@@ -1218,6 +1245,14 @@ fn trak(body: &[u8], full_data: &[u8], all_chunk_offsets: &[usize], info: &mut M
                     break;
                 }
             }
+            // the first sample, the first keyframe of a playable track, starts the first chunk
+            if let Some(&(_, off)) = chunk_offsets.iter().find(|&&(chunk, _)| chunk == 1)
+                && let Some(size) = first_sample_size(stsz_box, stz2_box)
+                && let Some(frame) = full_data.get(off..off.saturating_add(size))
+                && frame.len() == size
+            {
+                track.keyframe_key = keyframe_key(&track.codec, frame, nal_length_size);
+            }
             if track.hdr.is_none() {
                 track.hdr = hdr_name(track.transfer, false, track.primaries, track.bit_depth);
             }
@@ -1311,8 +1346,41 @@ fn skip_matroska_lace_header(flags: u8, payload: &[u8]) -> Option<&[u8]> {
     }
 }
 
+/// SHA-256 over a frame's coded slice NAL units, each as it's stored without its length, first 8 bytes in hex.
+/// `frame` is `nal_length_size`-prefixed NAL units that must end exactly at its end, soo a frame cut off where the
+/// read stopped gives None. HEVC slices are NAL types 0 to 31, H.264's 1 to 5; anything else gives None.
+pub(super) fn keyframe_key(codec: &str, frame: &[u8], nal_length_size: usize) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let lower = codec.to_ascii_lowercase();
+    // Matroska's V_MPEGH/ISO/HEVC and V_MPEG4/ISO/AVC; MP4's hvc1, hev1, avc1, avc3 and the Dolby Vision ones
+    let hevc =
+        lower.contains("hevc") || lower.contains("h265") || ["hvc1", "hev1", "dvh1", "dvhe"].contains(&lower.as_str());
+    let avc = !hevc && (lower.contains("avc") || lower.contains("h264") || ["dva1", "dvav"].contains(&lower.as_str()));
+    if !(hevc || avc) || !(1..=4).contains(&nal_length_size) {
+        return None;
+    }
+    let mut h = Sha256::new();
+    let (mut at, mut slices) = (0usize, 0usize);
+    while at < frame.len() {
+        let len = frame.get(at..at + nal_length_size)?.iter().fold(0usize, |n, b| n << 8 | usize::from(*b));
+        let nal = frame.get(at + nal_length_size..(at + nal_length_size).checked_add(len)?)?;
+        let first = *nal.first()?;
+        let slice = if hevc { (first >> 1) & 0x3f < 32 } else { (1..=5).contains(&(first & 0x1f)) };
+        if slice {
+            h.update(nal);
+            slices += 1;
+        }
+        at += nal_length_size + len;
+    }
+    if slices == 0 {
+        return None;
+    }
+    Some(h.finalize()[..8].iter().map(|b| format!("{b:02x}")).collect())
+}
+
 fn probe_block(
     block: &[u8],
+    complete: bool,
     video_tracks: &[(u64, usize, usize)],
     audio_tracks: &[(u64, usize)],
     video_rpu_found: &mut [bool],
@@ -1325,6 +1393,15 @@ fn probe_block(
     if let Some(&(_, video_idx, nal_length_size)) =
         video_tracks.iter().find(|&&(num, _, _)| num == track_num)
     {
+        // a SimpleBlock's keyframe flag, no lacing, and all of it read
+        if complete
+            && flags & 0x80 != 0
+            && flags & 0x06 == 0
+            && let Some(track) = info.video.get_mut(video_idx)
+            && track.keyframe_key.is_none()
+        {
+            track.keyframe_key = keyframe_key(&track.codec, payload, nal_length_size);
+        }
         if video_rpu_found.get(video_idx).copied() == Some(false)
             && let Some(frames) = skip_matroska_lace_header(flags, payload)
             && let Some(dv) = DolbyVisionInfo::parse_rpu_with_length_size(frames, nal_length_size)
@@ -1367,12 +1444,16 @@ fn probe_cluster(
     info: &mut MediaInfo,
 ) {
     let mut video_rpu_found = vec![false; info.video.len()];
-    walk(data, &mut |id, body| {
+    walk_sized(data, &mut |id, body, size| {
         match id {
-            0xA3 => probe_block(body, video_tracks, audio_tracks, &mut video_rpu_found, info),
+            0xA3 => {
+                let complete = size == Some(body.len() as u64);
+                probe_block(body, complete, video_tracks, audio_tracks, &mut video_rpu_found, info)
+            }
             0xA0 => walk(body, &mut |sub_id, sub_body| {
+                // a Block's flags have no keyframe bit: it's never taken for the keyframe key
                 if sub_id == 0xA1 {
-                    probe_block(sub_body, video_tracks, audio_tracks, &mut video_rpu_found, info);
+                    probe_block(sub_body, false, video_tracks, audio_tracks, &mut video_rpu_found, info);
                 }
                 true
             }),
@@ -2381,6 +2462,61 @@ impl MkvMetadata {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Length-prefixed (4 bytes) HEVC NAL units, each a two-byte header of `kind` and then `body`.
+    fn hevc_frame(nals: &[(u8, &[u8])]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for (kind, body) in nals {
+            out.extend(((body.len() + 2) as u32).to_be_bytes());
+            out.extend([kind << 1, 1]);
+            out.extend(*body);
+        }
+        out
+    }
+
+    #[test]
+    fn the_keyframe_key_is_over_its_slices_alone() {
+        let slice: &[u8] = &[0xAF, 0x01, 0x02, 0x03];
+        let plain = hevc_frame(&[(19, slice)]);
+        let muxed =
+            hevc_frame(&[(32, b"vps"), (33, b"sps"), (34, b"pps"), (39, b"x265 info"), (19, slice), (62, b"rpu")]);
+        let key = keyframe_key("V_MPEGH/ISO/HEVC", &plain, 4).unwrap();
+        assert_eq!(key.len(), 16);
+        assert_eq!(keyframe_key("hvc1", &muxed, 4).as_deref(), Some(key.as_str()), "SEI, parameter sets, RPU left out");
+        assert_ne!(
+            keyframe_key("hvc1", &hevc_frame(&[(19, &[0xAF, 0x01, 0x02, 0x04])]), 4).as_deref(),
+            Some(key.as_str())
+        );
+        assert_eq!(keyframe_key("hvc1", &muxed[..muxed.len() - 1], 4), None, "a frame cut off gives none");
+        assert_eq!(keyframe_key("hvc1", &hevc_frame(&[(39, b"sei only")]), 4), None);
+        assert_eq!(keyframe_key("V_MPEG4/ISO/AVC", &[0, 0, 0, 2, 0x65, 0x88], 4).map(|k| k.len()), Some(16));
+        assert_eq!(keyframe_key("V_AV1", &plain, 4), None);
+    }
+
+    #[test]
+    fn a_matroska_keyframe_read_whole_gives_the_key() {
+        let frame = hevc_frame(&[(39, b"sei"), (19, &[0xAF, 9, 9])]);
+        let block = |flags: u8, declared_extra: usize| {
+            let mut body = vec![0x81, 0, 0, flags];
+            body.extend(&frame);
+            let mut out = vec![0xA3, 0x80 | (body.len() + declared_extra) as u8];
+            out.extend(body);
+            out
+        };
+        let probe = |cluster: Vec<u8>| {
+            let mut info = MediaInfo {
+                video: vec![VideoTrack { codec: "V_MPEGH/ISO/HEVC".into(), ..Default::default() }],
+                ..Default::default()
+            };
+            probe_cluster(&cluster, &[(1, 0, 4)], &[], &mut info);
+            info.video[0].keyframe_key.clone()
+        };
+        let want = keyframe_key("V_MPEGH/ISO/HEVC", &frame, 4);
+        assert!(want.is_some());
+        assert_eq!(probe(block(0x80, 0)), want);
+        assert_eq!(probe(block(0x00, 0)), None, "not a keyframe");
+        assert_eq!(probe(block(0x80, 5)), None, "the block runs past what was read");
+    }
 
     #[test]
     fn hdr_names_follow_the_transfer_and_mastering_data() {

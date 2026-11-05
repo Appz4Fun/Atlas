@@ -176,6 +176,18 @@ pub(crate) fn rerun_dv_without_rpu(conn: &rusqlite::Connection, now: i64) -> rus
 const DV_WITHOUT_RPU: &str = "json_extract(info, '$.media.video[0].dv_profile') is not null
      and json_type(info, '$.media.video[0].dolby_vision.from_rpu') is null";
 
+/// Asks for the probe again on Dolby Vision video probed before the first keyframe was keyed, soo the remuxes the
+/// owner looks for most can be found by their video stream. One front read a release, Dolby Vision only: other
+/// releases get the key from their next probe. Once, from the stage's seed.
+pub(crate) fn rerun_dv_without_keyframe_key(conn: &rusqlite::Connection, now: i64) -> rusqlite::Result<usize> {
+    rerun_probes(conn, DV_WITHOUT_KEYFRAME_KEY, now)
+}
+
+/// A probe row whose first video track is Dolby Vision, saved before `keyframe_key` was kept (a probe since keeps
+/// it, null when it found no whole keyframe).
+const DV_WITHOUT_KEYFRAME_KEY: &str = "json_extract(info, '$.media.video[0].dv_profile') is not null
+     and json_type(info, '$.media.video[0].keyframe_key') is null";
+
 /// The same for MPEG transport streams, before `mpegts` read their program map: a capture's `.ts` or `.mts`, or a
 /// Blu-ray's `.m2ts`.
 pub(crate) fn rerun_mpeg_ts(conn: &rusqlite::Connection, now: i64) -> rusqlite::Result<usize> {
@@ -980,6 +992,31 @@ mod tests {
         assert!(stale_saved(r#"{"media":{"video":[{"dv_profile":7}]}}"#));
         assert!(!stale_saved(r#"{"media":{"video":[{"dv_profile":8,"dolby_vision":{"from_rpu":false}}]}}"#));
         assert!(!stale_saved(r#"{"media":{"video":[{"hdr":"HDR10"}]}}"#));
+    }
+
+    #[test]
+    fn dolby_vision_probes_from_before_the_keyframe_key_are_asked_for_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        crate::db::create_db_at(&main).unwrap();
+        let conn = crate::db::open_shard(&crate::store::shard_path(&main, 0)).unwrap();
+        for (id, info) in [
+            (1i64, r#"{"media":{"video":[{"dv_profile":8}]}}"#),
+            (2, r#"{"media":{"video":[{"dv_profile":8,"keyframe_key":null}]}}"#),
+            (3, r#"{"media":{"video":[{"dv_profile":7,"keyframe_key":"0123456789abcdef"}]}}"#),
+            (4, r#"{"media":{"video":[{"codec":"V_MPEGH/ISO/HEVC"}]}}"#),
+        ] {
+            conn.execute("insert into releases (id, name, group_name) values (?, ?, 'g')", rusqlite::params![id, id])
+                .unwrap();
+            conn.execute(
+                "insert into pp_state (release_id, done) values (?, ?)",
+                rusqlite::params![id, mask(PROBE_STEP)],
+            )
+            .unwrap();
+            conn.execute("insert into release_probe (release_id, info) values (?, ?)", rusqlite::params![id, info])
+                .unwrap();
+        }
+        assert_eq!(rerun_dv_without_keyframe_key(&conn, 100).unwrap(), 1);
     }
 
     #[test]

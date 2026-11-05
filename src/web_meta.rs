@@ -2063,6 +2063,14 @@ fn keys_panel(i: &MetaInputs<'_>, l: &Looked, compact: bool) -> Facts {
         f.key("NZBLNK", Some(nzblnk(&i.release.name, subject, &i.release.group_name)));
     }
     f.add_html("Lines key", lines_key(&l.timing, i.release.parts).map(|k| with_link(k, Kind::Lines)));
+    f.add_html(
+        "Video stream key",
+        i.probe
+            .and_then(|p| p.media.as_ref())
+            .and_then(|m| m.video.first())
+            .and_then(|v| v.keyframe_key.clone())
+            .map(|k| with_link(k, Kind::Video)),
+    );
     // counted from the tables the twin and probe work keep, shown here only when another release shares them
     if !same_link(l, id, Kind::Par2).is_empty() {
         f.add_html("PAR2 set", Some(format!("PAR2 recovery set{}", same_link(l, id, Kind::Par2))));

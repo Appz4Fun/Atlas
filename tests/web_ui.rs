@@ -306,14 +306,15 @@ fn the_web_ui_end_to_end() {
         store::save(&main, &[Release { group: "alt.binaries.g2".into(), ..release_of(name, "k.bin", 2, 2) }]).unwrap();
         let s = db::open_shard(&store::shard_path(&main, store::shard_of("alt.binaries.g2"))).unwrap();
         let id: i64 = s.query_row("select id from releases where name = ?", [name], |r| r.get(0)).unwrap();
-        let info = r#"{"health":{},"crossposted_to":[],"imdb_ids":[],"sfv":{},"headers":{"Injection-Info":"news.example; posting-account=\"same-uploader\""}}"#;
+        // one uploader, and the same first keyframe: the same video stream, posted twice
+        let info = r#"{"health":{},"crossposted_to":[],"imdb_ids":[],"sfv":{},"headers":{"Injection-Info":"news.example; posting-account=\"same-uploader\""},"media":{"container":"matroska","video":[{"codec":"V_MPEGH/ISO/HEVC","keyframe_key":"0123456789abcdef"}]}}"#;
         s.execute("insert into release_probe (release_id, info) values (?, ?)", rusqlite::params![id, info]).unwrap();
         // what the keys step writes, with the salt the pages use
         let salt = atlas::keys::salt(&db::open_with_shards(&main).unwrap());
         let k = atlas::keys::read_keys(&s, id, Some(2), salt).unwrap();
         s.execute(
-            "insert into release_keys (release_id, account, host, layout, lines) values (?, ?, ?, ?, ?)",
-            rusqlite::params![id, k.account, k.host, k.layout, k.lines],
+            "insert into release_keys (release_id, account, host, layout, lines, video) values (?, ?, ?, ?, ?, ?)",
+            rusqlite::params![id, k.account, k.host, k.layout, k.lines, k.video],
         )
         .unwrap();
         keyed.push(id);
@@ -333,7 +334,22 @@ fn the_web_ui_end_to_end() {
         "{}",
         same.body
     );
-    let none = fetch(port, &format!("/ui/same?id={one}&kind=layout"), &cookie);
+    assert!(
+        keyed_page.body.contains("<dt>Video stream key</dt>")
+            && keyed_page
+                .body
+                .contains(&format!("<a href=\"/ui/same?id={one}&amp;kind=video\">in 1 other release</a>")),
+        "{}",
+        keyed_page.body
+    );
+    let same_video = fetch(port, &format!("/ui/same?id={one}&kind=video"), &cookie);
+    assert!(
+        same_video.body.contains("Same video stream")
+            && same_video.body.contains(&format!("<a href=\"/ui/release?id={two}\">Keyed.Two.2024-GRP</a>")),
+        "{}",
+        same_video.body
+    );
+    let none = fetch(port, &format!("/ui/same?id={one}&kind=lines"), &cookie);
     assert!(none.status() == 200 && none.body.contains("this release has no such key"), "{}", none.body);
     assert_eq!(fetch(port, &format!("/ui/same?id={one}&kind=raw"), &cookie).status(), 400);
     assert_eq!(fetch(port, "/ui/same?id=999999999&kind=account", &cookie).status(), 404);
