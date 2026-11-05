@@ -46,7 +46,8 @@ pub fn mpeg_ts(data: &[u8]) -> MediaInfo {
     let mut pmt_pids: Vec<u16> = Vec::new();
     let mut streams: Option<Vec<Es>> = None;
     // a table's section as its packets come, from its pointer field on: a map can run over several packets
-    let (mut pat_buf, mut pmt_buf): (Option<Vec<u8>>, Option<(u16, Vec<u8>)>) = (None, None);
+    let mut pat_buf: Option<Vec<u8>> = None;
+    let mut pmt_buf: Option<(u16, Vec<u8>)> = None;
     let mut at = first;
     while let Some(packet) = data.get(at..at + 188) {
         at += size;
