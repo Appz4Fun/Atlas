@@ -52,6 +52,7 @@ pub mod sab;
 pub mod sealed_store;
 pub mod search;
 pub mod sorted;
+pub mod spotnet;
 pub mod stats_dashboard;
 pub mod store;
 pub mod trash_name;
