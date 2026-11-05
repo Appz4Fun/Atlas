@@ -39,7 +39,7 @@ pub fn list4_with_password(data: &[u8], password: Option<&str>) -> Listing {
     let mut l = Listing::default();
     let mut pos = 7usize;
     let mut encrypted_headers = false;
-    let mut salt_cache: Option<([u8; 8], [u8; 16], [u8; 16])> = None;
+    let mut salt_cache = Rar4KeyCache::default();
     for _ in 0..MAX_BLOCKS {
         if encrypted_headers {
             let Some(pw) = password else { return l };
@@ -335,7 +335,8 @@ fn block5(
             // the header's own: version, flags, kdf, salt, check
             let check = password_check(body, false);
             l.password_check = check.map(PasswordTest::Rar5).or(l.password_check);
-            if let Some(pw) = password.filter(|pw| !pw.is_empty())
+            if hdr_key.is_none()
+                && let Some(pw) = password.filter(|pw| !pw.is_empty())
                 && let Some((kdf, salt, _)) = crypt_kdf_salt_iv(body, false)
             {
                 *hdr_key = derive_rar5_key(pw, kdf, &salt, check);
@@ -735,21 +736,37 @@ pub(crate) fn derive_rar4_key_iv(password: &str, salt: &[u8; 8]) -> ([u8; 16], [
     zipfast::crypto::derive_rar4_key_iv(password, salt)
 }
 
+const MAX_RAR4_KDF_DERIVATIONS: usize = 8;
+const MAX_RAR4_ENCRYPTED_HEADERS: usize = 4_096;
+
+/// Bounded salt-to-(key, iv) cache and per-archive header/KDF budget for RAR4 `-hp` headers.
+#[derive(Default)]
+pub(crate) struct Rar4KeyCache {
+    entries: Vec<([u8; 8], [u8; 16], [u8; 16])>,
+    headers: usize,
+}
+
 /// Decrypts one RAR4 `-hp` encrypted block header at `pos` (where the 8-byte salt sits).
 pub(crate) fn decrypt_rar4_header(
     data: &[u8],
     pos: usize,
     password: &str,
-    cache: &mut Option<([u8; 8], [u8; 16], [u8; 16])>,
+    cache: &mut Rar4KeyCache,
 ) -> Option<(usize, Vec<u8>, [u8; 8])> {
+    if cache.headers >= MAX_RAR4_ENCRYPTED_HEADERS {
+        return None;
+    }
+    cache.headers += 1;
     let salt: [u8; 8] = data.get(pos..pos.checked_add(8)?)?.try_into().ok()?;
-    let (key, iv) = match cache {
-        Some((s, k, i)) if *s == salt => (*k, *i),
-        _ => {
-            let (k, i) = derive_rar4_key_iv(password, &salt);
-            *cache = Some((salt, k, i));
-            (k, i)
+    let (key, iv) = if let Some((_, k, i)) = cache.entries.iter().find(|(s, _, _)| *s == salt) {
+        (*k, *i)
+    } else {
+        if cache.entries.len() >= MAX_RAR4_KDF_DERIVATIONS {
+            return None;
         }
+        let (k, i) = derive_rar4_key_iv(password, &salt);
+        cache.entries.push((salt, k, i));
+        (k, i)
     };
     let (header, enc_len) = zipfast::crypto::decrypt_rar4_header(data, pos + 8, &key, &iv)?;
     Some((8 + enc_len, header, salt))

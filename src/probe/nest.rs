@@ -127,12 +127,21 @@ pub fn unwrap(data: &[u8]) -> Nest<'_> {
 
 /// Like [`unwrap`], decrypting RAR4/RAR5/ZIP headers and entries with `password` when present.
 pub fn unwrap_with_password<'a>(data: &'a [u8], password: Option<&str>) -> Nest<'a> {
+    unwrap_inner(data, password, false)
+}
+
+/// Like [`unwrap_with_password`], preferring an `.nzb` entry when an archive holds multiple files.
+pub fn unwrap_nzb_with_password<'a>(data: &'a [u8], password: Option<&str>) -> Nest<'a> {
+    unwrap_inner(data, password, true)
+}
+
+fn unwrap_inner<'a>(data: &'a [u8], password: Option<&str>, prefer_nzb: bool) -> Nest<'a> {
     let mut layers = Vec::new();
     let mut buf: Cow<'_, [u8]> = Cow::Borrowed(data);
     let (mut lo, mut hi) = (0usize, data.len());
     let mut outer_at = Some(0usize);
     let mut budget = MAX_DECODED;
-    while let Some(Opened { mut layer, view }) = open(&buf[lo..hi], password, budget) {
+    while let Some(Opened { mut layer, view }) = open(&buf[lo..hi], password, budget, prefer_nzb) {
         // a name comes from the poster's bytes: keep what a name needs
         layer.name = layer.name.map(|n| cap_name(&n));
         if layers.len() == MAX_DEPTH {
@@ -264,10 +273,10 @@ fn decode(codec: Codec, input: &[u8], limit: usize) -> (Vec<u8>, End) {
 }
 
 /// What `data` starts with, when it's an archive or a compressed stream.
-fn open(data: &[u8], password: Option<&str>, budget: usize) -> Option<Opened> {
+fn open(data: &[u8], password: Option<&str>, budget: usize, prefer_nzb: bool) -> Option<Opened> {
     let layer = |format: &str| Layer { format: format.into(), ..Layer::default() };
     if data.starts_with(b"Rar!\x1a\x07") || data.starts_with(b"PK\x03\x04") {
-        return Some(from_entries(data, password, budget));
+        return Some(from_entries(data, password, budget, prefer_nzb));
     }
     if data.starts_with(b"7z\xbc\xaf\x27\x1c") {
         return Some(seven_z(data));
@@ -318,8 +327,8 @@ fn open(data: &[u8], password: Option<&str>, budget: usize) -> Option<Opened> {
     None
 }
 
-/// RAR and zip: the biggest file whose bytes start in what was read.
-fn from_entries(data: &[u8], password: Option<&str>, budget: usize) -> Opened {
+/// RAR and zip: the biggest file whose bytes start in what was read (or the `.nzb` entry when `prefer_nzb` is set).
+fn from_entries(data: &[u8], password: Option<&str>, budget: usize, prefer_nzb: bool) -> Opened {
     let heads = archive::entries_with_password(data, password);
     let format = if data.starts_with(b"PK") {
         "ZIP"
@@ -329,8 +338,20 @@ fn from_entries(data: &[u8], password: Option<&str>, budget: usize) -> Opened {
         "RAR4"
     };
     let reachable = heads.iter().filter(|h| !h.dir && h.data_at.is_some_and(|at| at < data.len()));
-    let Some(head) = reachable.max_by_key(|h| (h.unpacked.or(h.packed).unwrap_or(0), std::cmp::Reverse(h.data_at)))
-    else {
+    let head = if prefer_nzb {
+        reachable
+            .clone()
+            .filter(|h| {
+                h.name
+                    .as_deref()
+                    .is_some_and(|n| crate::archive::select::classify(n) == crate::archive::select::Kind::Nzb)
+            })
+            .max_by_key(|h| (h.unpacked.or(h.packed).unwrap_or(0), std::cmp::Reverse(h.data_at)))
+            .or_else(|| reachable.max_by_key(|h| (h.unpacked.or(h.packed).unwrap_or(0), std::cmp::Reverse(h.data_at))))
+    } else {
+        reachable.max_by_key(|h| (h.unpacked.or(h.packed).unwrap_or(0), std::cmp::Reverse(h.data_at)))
+    };
+    let Some(head) = head else {
         let mut layer = Layer { format: format.into(), ..Layer::default() };
         let encrypted = heads.iter().any(|h| h.headers_encrypted);
         layer.encrypted = encrypted;

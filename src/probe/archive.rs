@@ -118,7 +118,7 @@ fn rar4(data: &[u8], max: usize, password: Option<&str>) -> Vec<ArchiveHead> {
     let mut solid_archive = false;
     let mut files = 0;
     let mut encrypted_headers = false;
-    let mut salt_cache: Option<([u8; 8], [u8; 16], [u8; 16])> = None;
+    let mut salt_cache = crate::archive::rar::Rar4KeyCache::default();
     while out.len() < max {
         if encrypted_headers {
             let Some(pw) = password.filter(|pw| !pw.is_empty()) else { break };

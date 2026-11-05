@@ -131,7 +131,7 @@ fn nzb_stored_in(listing: &Listing, body: &[u8], password: Option<&str>) -> Opti
             return Some((inside, pw));
         }
     }
-    let unwrapped = crate::probe::nest::unwrap_with_password(body, password);
+    let unwrapped = crate::probe::nest::unwrap_nzb_with_password(body, password);
     if !nzb::is_nzb(&unwrapped.inner) {
         return None;
     }
@@ -154,8 +154,13 @@ fn with_nzb(
         return Ok(outcome);
     }
     let mut nested = finish(ctx, SOURCE_NZB, inside, limits)?;
+    let rel = ctx.release();
+    let content_id = crate::raw_store::release_content_id(ctx.conn(), rel.id).unwrap_or_default();
     if let Some(pw) = nzb_pw {
+        crate::raw_store::put_nested_nzb_password(&rel.name, &rel.group, &content_id, &pw);
         add_pointed_password_writes(ctx, &mut nested.writes, &pw, !wrapper_encrypted);
+    } else {
+        crate::raw_store::put_nested_nzb_password(&rel.name, &rel.group, &content_id, "");
     }
     Ok(merge_nzb(outcome, nested))
 }
@@ -471,8 +476,9 @@ fn restore_archive(
     ctx: &StepCtx<'_>,
     saved: crate::raw_store::SavedArchive,
     content_id: &[u8],
+    require_password_inspected: bool,
     limits: &ArchiveConfig,
-) -> Result<Outcome, StepError> {
+) -> Result<Option<Outcome>, StepError> {
     let source = saved.files.first().map(|f| f.source).unwrap_or_else(|| {
         match saved.encryption.and_then(super::Encryption::from_code) {
             Some(super::Encryption::SevenZipAes256) => SOURCE_7Z,
@@ -483,12 +489,13 @@ fn restore_archive(
     let files: Vec<InnerFile> = saved.files.into_iter().map(|f| InnerFile { name: f.name, size: f.size }).collect();
     let password_override = saved.password.and_then(super::Password::from_code);
     let encrypted = password_override == Some(super::Password::Yes) || saved.encryption.is_some() || saved.names_hidden;
+    let wrapper_check = saved.password_check.as_deref().and_then(super::PasswordTest::from_bytes);
     let listing = Listing {
         files,
         encrypted,
         headers_encrypted: saved.names_hidden,
         encryption: saved.encryption.and_then(super::Encryption::from_code),
-        password_check: saved.password_check.as_deref().and_then(super::PasswordTest::from_bytes),
+        password_check: wrapper_check,
         complete: saved.listing_complete,
         damaged: saved.listing_damaged,
         need_more_tail: false,
@@ -498,20 +505,38 @@ fn restore_archive(
         .iter()
         .filter(|f| select::classify(&f.name) == Kind::Nzb)
         .find_map(|f| crate::release_info::find_password(&f.name));
-    let outcome = finish_with_override(ctx, source, listing, password_override, Some(saved.content_fp), false, limits)?;
+    let mut outcome =
+        finish_with_override(ctx, source, listing, password_override, Some(saved.content_fp), false, limits)?;
+    let posted_files = ctx.files().unwrap_or_default();
+    if encrypted
+        && let Some(wrapper_pw) = known_or_post_password(ctx, &posted_files, wrapper_check.as_ref())
+    {
+        outcome.writes.push(StepWrite::new(
+            archive_store::SET_NFO_PASSWORD,
+            vec![ctx.release().id.into(), wrapper_pw.into()],
+        ));
+    }
     let rel = ctx.release();
     let nested = crate::raw_store::get_archive_files(&rel.name, &rel.group, content_id, SOURCE_NZB);
     if nested.is_empty() {
-        return Ok(outcome);
+        return Ok(Some(outcome));
+    }
+    if require_password_inspected
+        && inner_nzb_pw.is_none()
+        && !crate::raw_store::has_nested_nzb_password_record(&rel.name, &rel.group, content_id)
+    {
+        return Ok(None);
     }
     let files = nested.into_iter().map(|f| InnerFile { name: f.name, size: f.size }).collect();
     let listing = Listing { files, complete: true, ..Default::default() };
     let mut nested = finish_with_override(ctx, SOURCE_NZB, listing, None, Some(None), false, limits)?;
-    let posted_files = ctx.files().unwrap_or_default();
-    if let Some(pw) = inner_nzb_pw.or_else(|| if !encrypted { known_or_post_password(ctx, &posted_files, None) } else { None }) {
+    let nzb_pw = crate::raw_store::get_nested_nzb_password(&rel.name, &rel.group, content_id)
+        .or(inner_nzb_pw)
+        .or_else(|| if !encrypted { known_or_post_password(ctx, &posted_files, None) } else { None });
+    if let Some(pw) = nzb_pw {
         add_pointed_password_writes(ctx, &mut nested.writes, &pw, !encrypted);
     }
-    Ok(merge_nzb(outcome, nested))
+    Ok(Some(merge_nzb(outcome, nested)))
 }
 
 fn restore_par2(
@@ -825,8 +850,9 @@ impl Step for ListStep {
             if let Some(saved) =
                 crate::raw_store::get_archive(&rel_name, &rel_group, &content_id, rel.parts, rel.complete)
                 && !(saved.names_hidden && saved.files.is_empty())
+                && let Some(outcome) = restore_archive(ctx, saved, &content_id, true, &limits)?
             {
-                return restore_archive(ctx, saved, &content_id, &limits);
+                return Ok(outcome);
             }
             if let Some(outcome) = restore_nzb(ctx, &files, &content_id, true, &limits)? {
                 return Ok(outcome);
@@ -980,8 +1006,10 @@ impl Step for ListStep {
             }
         }
         let rel = ctx.release();
-        if let Some(saved) = crate::raw_store::get_archive(&rel.name, &rel.group, &content_id, 0, false) {
-            return restore_archive(ctx, saved, &content_id, &limits);
+        if let Some(saved) = crate::raw_store::get_archive(&rel.name, &rel.group, &content_id, 0, false)
+            && let Some(outcome) = restore_archive(ctx, saved, &content_id, false, &limits)?
+        {
+            return Ok(outcome);
         }
         // its articles may be gone since
         if let Some(outcome) = restore_nzb(ctx, &files, &content_id, false, &limits)? {

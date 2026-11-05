@@ -1215,6 +1215,25 @@ pub fn put_nfo_password(name: &str, group_name: &str, content_id: &[u8], passwor
     let _ = with_raw_tx(|conn| upsert_nfo_password(conn, name, group_name, content_id, password));
 }
 
+fn nested_nzb_pw_key(name: &str) -> String {
+    format!("{name}\0nzb")
+}
+
+/// Looks up a cached target password extracted from a nested `.nzb` inside an archive release.
+pub fn get_nested_nzb_password(name: &str, group_name: &str, content_id: &[u8]) -> Option<String> {
+    get_nfo_password(&nested_nzb_pw_key(name), group_name, content_id)
+}
+
+/// True when `raw_nfo_passwords` holds a nested-NZB target password record (including empty negative sentinel).
+pub fn has_nested_nzb_password_record(name: &str, group_name: &str, content_id: &[u8]) -> bool {
+    has_nfo_password_record(&nested_nzb_pw_key(name), group_name, content_id)
+}
+
+/// Persists a target password (or `""` negative sentinel) extracted from a nested `.nzb` inside an archive release.
+pub fn put_nested_nzb_password(name: &str, group_name: &str, content_id: &[u8], password: &str) {
+    put_nfo_password(&nested_nzb_pw_key(name), group_name, content_id, password);
+}
+
 /// Persists a probed release's `ProbeInfo` JSON, completeness/stamp metadata, optional NFO password, and
 /// optional cover reference into `raw_probes`, `raw_nfo_passwords`, and `raw_covers`.
 pub fn put_probe(rec: &ProbeRecord<'_>) {
