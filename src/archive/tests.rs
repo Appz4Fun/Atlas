@@ -857,4 +857,91 @@ mod select_tests {
         let z_chk = super::PasswordTest::Zip(super::zip::PasswordCheck::Crypto { header: [0; 12], check: 0x99 });
         assert_eq!(crate::release_info::find_verified_password(["password: wrong"], &[], Some(&z_chk)), None);
     }
+
+    #[test]
+    fn par2_name_map_matches_actual_shard_schema() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::store::build_shard(&conn).unwrap();
+        let rel_id = 42i64;
+        conn.execute(
+            "insert into files (id, release_id, filename, expected, seen) values (1, ?1, 'a.part01.rar', 50, x'01')",
+            [rel_id],
+        )
+        .unwrap();
+        conn.execute(
+            "insert into files (id, release_id, filename, expected, seen) values (2, ?1, 'obf_nfo_999', 1, x'01')",
+            [rel_id],
+        )
+        .unwrap();
+        conn.execute(
+            "insert into files (id, release_id, filename, expected, seen) values (3, ?1, 'obf_nzb_888', 1, x'01')",
+            [rel_id],
+        )
+        .unwrap();
+        conn.execute(
+            "insert into segments (file_id, local, domain, part, bytes) values (2, x'01', 1, 1, 900)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "insert into segments (file_id, local, domain, part, bytes) values (3, x'02', 1, 1, 42000)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            super::store::INSERT_PAR2_FILE,
+            rusqlite::params![rel_id, vec![1u8; 16], vec![9u8; 16], vec![0u8; 16], vec![0u8; 16], 50_000_000i64, "a.part01.rar", None::<i64>, 1i64, 0i64, 1i64],
+        )
+        .unwrap();
+        conn.execute(
+            super::store::INSERT_PAR2_FILE,
+            rusqlite::params![rel_id, vec![2u8; 16], vec![9u8; 16], vec![0u8; 16], vec![0u8; 16], 850i64, "secret.nfo", None::<i64>, 1i64, 0i64, 1i64],
+        )
+        .unwrap();
+        conn.execute(
+            super::store::INSERT_PAR2_FILE,
+            rusqlite::params![rel_id, vec![3u8; 16], vec![9u8; 16], vec![0u8; 16], vec![0u8; 16], 40_000i64, "pointer-{{pw}}.nzb", None::<i64>, 1i64, 0i64, 1i64],
+        )
+        .unwrap();
+        let files = vec![
+            FileInfo {
+                id: 1,
+                filename: "a.part01.rar".into(),
+                subject: None,
+                subject_part: None,
+                expected: Some(50),
+                file_total: None,
+                parts_seen: 50,
+                touched_at: None,
+                sealed: false,
+            },
+            FileInfo {
+                id: 2,
+                filename: "obf_nfo_999".into(),
+                subject: None,
+                subject_part: None,
+                expected: Some(1),
+                file_total: None,
+                parts_seen: 1,
+                touched_at: None,
+                sealed: false,
+            },
+            FileInfo {
+                id: 3,
+                filename: "obf_nzb_888".into(),
+                subject: None,
+                subject_part: None,
+                expected: Some(1),
+                file_total: None,
+                parts_seen: 1,
+                touched_at: None,
+                sealed: false,
+            },
+        ];
+        let map = select::par2_name_map(&conn, rel_id, &files);
+        assert_eq!(map.get("obf_nfo_999").map(String::as_str), Some("secret.nfo"));
+        assert_eq!(map.get("obf_nzb_888").map(String::as_str), Some("pointer-{{pw}}.nzb"));
+        let all_names = select::par2_file_names(&conn, rel_id);
+        assert!(all_names.iter().any(|n| n == "pointer-{{pw}}.nzb"));
+    }
 }

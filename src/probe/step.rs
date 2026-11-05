@@ -398,7 +398,8 @@ impl Step for ProbeStep {
             return Ok(Outcome { matched: true, writes, facts, rerun, ..Outcome::default() });
         }
         let files = ctx.files().map_err(retry)?;
-        let par2_names = archive::select::par2_name_map(ctx.conn(), release_id);
+        let par2_names = archive::select::par2_name_map(ctx.conn(), release_id, &files);
+        let par2_all = archive::select::par2_file_names(ctx.conn(), release_id);
         let mut check = archive::store::local_password_check(ctx.conn(), release_id);
         let mut info = ProbeInfo::default();
         let mut writes = Vec::new();
@@ -408,6 +409,7 @@ impl Step for ProbeStep {
                 .chain(rel.display_name.as_deref())
                 .chain(files.iter().map(|f| f.filename.as_str()))
                 .chain(files.iter().filter_map(|f| f.subject.as_deref()))
+                .chain(par2_all.iter().map(String::as_str))
                 .chain(par2_names.values().map(String::as_str));
             release_info::find_verified_password(texts, &[], check.as_ref())
         });

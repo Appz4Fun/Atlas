@@ -145,7 +145,7 @@ impl Step for NfoName {
             return Ok(Outcome { writes, rerun, ..Outcome::default() });
         }
         let files = ctx.files().map_err(retry)?;
-        let par2_names = archive::select::par2_name_map(ctx.conn(), rel_id);
+        let par2_names = archive::select::par2_name_map(ctx.conn(), rel_id, &files);
         let check = archive::store::local_password_check(ctx.conn(), rel_id);
         for file in archive::select::nfo_sources_with_par2(&files, &par2_names) {
             let Some(seg) = first_article(ctx, file)? else { continue };

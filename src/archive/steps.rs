@@ -152,7 +152,7 @@ fn deep_nzb(
     head_file: &FileInfo,
     known: Option<(&str, &[u8])>,
     mut left: follow::Budget,
-) -> Result<Option<Listing>, StepError> {
+) -> Result<Option<(Listing, Option<String>)>, StepError> {
     if listing.encrypted || !listing.files.iter().any(|f| select::classify(&f.name) == Kind::Nzb) {
         return Ok(None);
     }
@@ -180,8 +180,14 @@ fn deep_nzb(
     if found.len() > follow::MAX_FOLLOWED_NZB {
         return Ok(None);
     }
+    let name_pw = listing
+        .files
+        .iter()
+        .filter(|f| select::classify(&f.name) == Kind::Nzb)
+        .find_map(|f| crate::release_info::find_password(&f.name));
     let complete = nzb::parse(&found).complete;
-    Ok(Some(Listing { files: follow::follow(ctx, found, &mut left)?, complete, ..Default::default() }))
+    let (followed, hop_pw) = follow::follow_with_password(ctx, found, &mut left)?;
+    Ok(Some((Listing { files: followed, complete, ..Default::default() }, hop_pw.or(name_pw))))
 }
 
 /// A file of this release to read whole: one article a part, the first copy. None: a part isnt indexed.
@@ -305,8 +311,9 @@ fn harvest_password_from_bodies(
         return Ok(Some(pw));
     }
     let rel_id = ctx.release().id;
-    let par2_names = select::par2_name_map(ctx.conn(), rel_id);
-    for par2_name in par2_names.values() {
+    let par2_names = select::par2_name_map(ctx.conn(), rel_id, files);
+    let par2_all = select::par2_file_names(ctx.conn(), rel_id);
+    for par2_name in par2_all.iter().chain(par2_names.values()) {
         if let Some(pw) = crate::release_info::find_verified_password([par2_name.as_str()], &[], check) {
             return Ok(Some(pw));
         }
@@ -989,10 +996,6 @@ impl Step for ListStep {
                         (!head.probe).then_some((seg.message_id.as_str(), &body[..])),
                         follow::Budget::of(limits.max_bodies_per_release),
                     )?
-                    .map(|l| {
-                        let pw = l.files.iter().find_map(|f| crate::release_info::find_password(&f.name));
-                        (l, pw)
-                    })
                     .or_else(|| nzb_stored_in(&listing, &body, pw_found.as_deref()));
                     let mut outcome = finish(ctx, SOURCE_RAR, listing, &limits)?;
                     if let Some(pw) = pw_found {
@@ -1020,10 +1023,6 @@ impl Step for ListStep {
                         (!head.probe).then_some((seg.message_id.as_str(), &body[..])),
                         follow::Budget::of(limits.max_bodies_per_release),
                     )?
-                    .map(|l| {
-                        let pw = l.files.iter().find_map(|f| crate::release_info::find_password(&f.name));
-                        (l, pw)
-                    })
                     .or_else(|| nzb_stored_in(&listing, &body, pw_found.as_deref()));
                     let mut outcome = finish(ctx, SOURCE_ZIP, listing, &limits)?;
                     if let Some(pw) = pw_found {
@@ -1051,10 +1050,7 @@ impl Step for ListStep {
                         (!head.probe).then_some((seg.message_id.as_str(), &body[..])),
                         follow::Budget::of(limits.max_bodies_per_release),
                     )?
-                    .map(|l| {
-                        let pw = l.files.iter().find_map(|f| crate::release_info::find_password(&f.name));
-                        (l, pw)
-                    });
+                    .or_else(|| nzb_stored_in(&listing, &body, pw_found.as_deref()));
                     let mut outcome = finish(ctx, SOURCE_7Z, listing, &limits)?;
                     if let Some(pw) = pw_found {
                         crate::raw_store::put_nfo_password(&rel_name, &rel_group, &content_id, &pw);
@@ -1099,22 +1095,20 @@ impl Step for ListStep {
             }
         }
         // no archive told what this is: a posted NZB can, by the files of the post it points to
-        let par2_names = select::par2_name_map(ctx.conn(), rel_id);
+        let par2_names = select::par2_name_map(ctx.conn(), rel_id, &files);
         for file in select::nzb_sources_with_par2(&files, &par2_names) {
             let Some(body) = whole_file(ctx, file, &mut left)? else { continue };
             if identify(&body) == Format::Nzb {
-                let meta_pw = nzb::meta_password(&body);
                 let complete = nzb::parse(&body).complete;
                 let mut budget = follow::Budget::of(limits.max_bodies_per_release);
-                let followed_files = follow::follow(ctx, body, &mut budget)?;
-                let hop_pw = followed_files.iter().find_map(|f| crate::release_info::find_password(&f.name));
+                let (followed_files, hop_pw) = follow::follow_with_password(ctx, body, &mut budget)?;
                 let mut outcome = finish(
                     ctx,
                     SOURCE_NZB,
                     Listing { files: followed_files, complete, ..Default::default() },
                     &limits,
                 )?;
-                if let Some(pw) = meta_pw.or(hop_pw).or_else(|| known_or_post_password(ctx, &files, None)) {
+                if let Some(pw) = hop_pw.or_else(|| known_or_post_password(ctx, &files, None)) {
                     add_pointed_password_writes(ctx, &mut outcome.writes, &pw, true);
                 } else {
                     crate::raw_store::put_nfo_password(&rel_name, &rel_group, &content_id, "");
