@@ -238,6 +238,11 @@ impl StepCtx<'_> {
         self.bodies.stopping()
     }
 
+    /// Fetches this run may still make before `postprocess.bodies_per_release` refuses them.
+    pub fn bodies_left(&self) -> i64 {
+        (self.bodies.per_release() - self.used_bodies).max(0)
+    }
+
     /// run start + 120 s
     pub fn deadline(&self) -> Instant {
         self.deadline

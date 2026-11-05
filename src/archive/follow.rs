@@ -250,10 +250,13 @@ fn download_set(
             let body = match known.filter(|(known, _)| known == id) {
                 Some((_, body)) => body.to_vec(),
                 None => {
-                    if left.articles == 0 {
+                    // a hop's article is two requests, its headers and its body: both counted, and both must fit what
+                    // this run may still fetch, soo following ends where its limits say, never on a refusal midway
+                    let requests = if file.trusted { 1 } else { 2 };
+                    if left.articles < requests || ctx.bodies_left() < requests as i64 {
                         return Ok(None);
                     }
-                    left.articles -= 1;
+                    left.articles -= requests;
                     let wanted =
                         BodyRequest { message_id: id.clone(), file: file.name.clone(), max_bytes: Some(ARTICLE_CAP) };
                     let fetched = if file.trusted {

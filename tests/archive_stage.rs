@@ -1139,3 +1139,22 @@ fn a_next_nzb_posted_as_plain_text_is_followed() {
     settled(&h, "x");
     assert!(names_of(&h).contains(&"Final.Movie.2024.2160p-GRP.part01.rar".to_string()), "{:?}", names_of(&h));
 }
+
+#[test]
+fn following_stops_before_the_runs_body_cap_and_asks_for_nothing_past_it() {
+    let mut h = fresh();
+    let rar = rar4(&[r4_main(0), r4_file(0, b"Next.nzb", &last_hop()), r4_end()]);
+    let first = an_nzb_of(&[("Hop.Post.rar (1/1)", &[(rar.len() as u64, "cap1@x")])]);
+    let s = shape("x").one("x.nzb", &first);
+    h.save(&[s.release()]);
+    let mut posts = s.posts.clone();
+    posts.push(loose(92, "cap1@x", "Hop.Post.rar", &rar));
+    let state = Server::new(posts);
+    let mut tight = config();
+    // the NZB itself, then one request left: not enough for a hop's headers and body
+    tight.postprocess.bodies_per_release = 2;
+    start_with(&mut h, spawn_server(state.clone()), tight, vec![Arc::new(atlas::archive::steps::ListStep::default())]);
+    settled(&h, "x");
+    assert_eq!((bodies(&state), state.heads_sent.load(Ordering::SeqCst)), (1, 0));
+    assert_eq!(names_of(&h), ["Hop.Post.rar"]);
+}
