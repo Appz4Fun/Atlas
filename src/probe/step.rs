@@ -132,6 +132,18 @@ pub(crate) fn rerun_asf(conn: &rusqlite::Connection, now: i64) -> rusqlite::Resu
     rerun_unread(conn, &["wmv", "asf"], now)
 }
 
+/// Asks for the probe again on MP4s posted whole whose front gave no tracks, before `read_tail_moov` read the end
+/// of the file. Once, from the stage's seed.
+pub(crate) fn rerun_mp4_tail(conn: &rusqlite::Connection, now: i64) -> rusqlite::Result<usize> {
+    rerun_probes(conn, MP4_WITHOUT_TRACKS, now)
+}
+
+/// A probe row of an MP4 posted whole with no tracks.
+const MP4_WITHOUT_TRACKS: &str = "json_extract(info, '$.media.container') = 'mp4'
+     and json_extract(info, '$.archive') is null
+     and coalesce(json_array_length(json_extract(info, '$.media.video')), 0) = 0
+     and coalesce(json_array_length(json_extract(info, '$.media.audio')), 0) = 0";
+
 /// The same for MPEG program streams, before `mpegps` read them.
 pub(crate) fn rerun_mpeg_ps(conn: &rusqlite::Connection, now: i64) -> rusqlite::Result<usize> {
     rerun_unread(conn, &["mpg", "mpeg", "vob"], now)
@@ -177,8 +189,12 @@ fn rerun_unread(conn: &rusqlite::Connection, exts: &[&str], now: i64) -> rusqlit
 fn stale_saved(info: &str) -> bool {
     let Ok(p) = serde_json::from_str::<serde_json::Value>(info) else { return false };
     let newly_read = |name: Option<&str>| name.is_some_and(|n| NEWLY_READ.iter().any(|e| named(n, e)));
-    p["media"].is_null()
-        && (newly_read(p["file"].as_str())
+    let empty = |k: &str| p["media"][k].as_array().is_none_or(Vec::is_empty);
+    let mp4_without_tracks =
+        p["media"]["container"] == "mp4" && p["archive"].is_null() && empty("video") && empty("audio");
+    mp4_without_tracks
+        || p["media"].is_null()
+            && (newly_read(p["file"].as_str())
             || newly_read(p["archive"]["name"].as_str())
             || p["file"].as_str().is_some_and(later_volume))
 }
@@ -394,6 +410,7 @@ impl Step for ProbeStep {
                 if info.layers != before {
                     info.moviehash = moviehash_of(ctx, file, &files, &front, &info, known_last)?;
                 }
+                read_tail_moov(ctx, file, &front, &mut info)?;
             }
         }
 
@@ -478,6 +495,43 @@ fn read_more_front(
     {
         front.extend(body);
         inspect(front, info);
+    }
+    Ok(())
+}
+
+/// The most of an MP4's `moov` read from the end of the file: a feature film's sample tables are a few MB.
+const MAX_TAIL_MOOV: u64 = 8 << 20;
+
+/// An MP4 posted whole whose `moov` comes after its `mdat` (not made for streaming): the front has no tracks, soo
+/// the parts holding the `moov` are read, from where the `mdat` ends to the end of the file.
+fn read_tail_moov(
+    ctx: &mut StepCtx<'_>,
+    file: &FileInfo,
+    front: &[u8],
+    info: &mut ProbeInfo,
+) -> Result<(), StepError> {
+    let wants = info.media.as_ref().is_some_and(|m| m.container == "mp4" && m.video.is_empty() && m.audio.is_empty());
+    // a bare file only: in an archive the moov's place in the post would depend on the volumes
+    if !wants || info.archive.is_some() || !info.layers.is_empty() {
+        return Ok(());
+    }
+    let segment = info.segment_size.filter(|s| *s > 0);
+    let (Some(segment), Some(size)) = (segment, info.yenc.as_ref().and_then(|y| y.file_size)) else { return Ok(()) };
+    let Some(moov_at) = media::Mp4Prober::find_moov_offset(front).filter(|at| *at < size) else { return Ok(()) };
+    let end = size.min(moov_at.saturating_add(MAX_TAIL_MOOV));
+    let first = moov_at / segment + 1;
+    let last = (end - 1) / segment + 1;
+    let mut tail = Vec::new();
+    for part in first..=last {
+        let Ok(part_no) = i64::try_from(part) else { return Ok(()) };
+        let Some(body) = read_part(ctx, file, part_no, (part - 1) * segment)? else { return Ok(()) };
+        tail.extend(body);
+    }
+    let skip = usize::try_from(moov_at - (first - 1) * segment).unwrap_or(usize::MAX);
+    let Some(moov) = tail.get(skip..) else { return Ok(()) };
+    let found = media::Mp4Prober::probe_tail_moov(moov);
+    if let Some(found) = found.filter(|m| !m.video.is_empty() || !m.audio.is_empty()) {
+        info.media = Some(found);
     }
     Ok(())
 }
@@ -722,6 +776,14 @@ mod tests {
         conn.execute("insert into release_probe (release_id, info) values (10, '{\"file\":\"Clip.wmv\"}')", [])
             .unwrap();
         assert_eq!(rerun_asf(&conn, 100).unwrap(), 1);
+        conn.execute("insert into releases (id, name, group_name) values (12, '12', 'g')", []).unwrap();
+        conn.execute("insert into pp_state (release_id, done) values (12, ?)", [mask(PROBE_STEP)]).unwrap();
+        conn.execute(
+            "insert into release_probe (release_id, info) values (12, '{\"media\":{\"container\":\"mp4\"}}')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(rerun_mp4_tail(&conn, 100).unwrap(), 1);
         conn.execute("insert into releases (id, name, group_name) values (11, '11', 'g')", []).unwrap();
         conn.execute("insert into pp_state (release_id, done) values (11, ?)", [mask(PROBE_STEP)]).unwrap();
         conn.execute(
@@ -740,7 +802,7 @@ mod tests {
         assert_eq!(state(2), (mask(PROBE_STEP), 0), "read");
         assert_eq!(state(3), (mask(PROBE_STEP), 0), "missing");
         let queued: i64 = conn.query_row("select count(*) from pp_queue", [], |r| r.get(0)).unwrap();
-        assert_eq!(queued, 7);
+        assert_eq!(queued, 8);
         assert_eq!(state(7), (mask(PROBE_STEP), 0), "read already");
     }
 
@@ -751,6 +813,8 @@ mod tests {
         assert!(stale_saved(r#"{"file":"Movie.avi.001"}"#));
         assert!(stale_saved(r#"{"file":"Clip.WMV","media":null}"#));
         assert!(!stale_saved(r#"{"file":"Clip.navi","media":null}"#), "not an avi");
+        assert!(stale_saved(r#"{"file":"Film.mp4","media":{"container":"mp4","video":[],"audio":[]}}"#));
+        assert!(!stale_saved(r#"{"file":"Film.mp4","media":{"container":"mp4","video":[{"codec":"avc1"}]}}"#));
         assert!(!stale_saved(r#"{"file":"Movie.avi","media":{"container":"avi"}}"#), "read");
         assert!(!stale_saved(r#"{"file":"Movie.mkv","media":null}"#));
     }
