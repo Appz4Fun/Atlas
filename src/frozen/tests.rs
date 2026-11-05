@@ -22,9 +22,13 @@ fn article(file: &str, n: i64, of: i64, bytes: i64) -> Article {
     }
 }
 
-/// a post of `files`, each `parts` articles of `bytes`
+/// a post of `files`, each `parts` articles of `bytes`, its subjects counting its files (`[n/N]`)
 fn post(name: &str, files: &[&str], parts: i64, bytes: i64) -> Release {
-    let articles = files.iter().flat_map(|f| (1..=parts).map(move |n| article(f, n, parts, bytes))).collect();
+    let total = files.len() as i64;
+    let articles = files
+        .iter()
+        .flat_map(|f| (1..=parts).map(move |n| Article { file_total: Some(total), ..article(f, n, parts, bytes) }))
+        .collect();
     Release { name: name.into(), group: G.into(), articles, complete: true, ..Default::default() }
 }
 
@@ -167,7 +171,10 @@ fn only_what_the_small_rule_says_freezes() {
     ]);
     let mut half = post("Half", &["i.rar"], 2, 10);
     half.articles.pop();
-    f.save(&[half]);
+    // every file it has so far is whole, but its subjects don't say how many files there are: more may come
+    let mut uncounted = post("Uncounted", &["j.part1.rar"], 1, 10);
+    uncounted.articles.iter_mut().for_each(|a| a.file_total = None);
+    f.save(&[half, uncounted]);
     let conn = f.writer();
     let id = |n: &str| f.id(&conn, n);
     conn.execute("update releases set is_obfuscated = 1 where name = 'Hidden.Upload'", []).unwrap();
@@ -178,6 +185,8 @@ fn only_what_the_small_rule_says_freezes() {
     assert!(!queued("Big"), "1.2 GB");
     assert!(queued("Small"));
     assert!(!queued("Half"), "incomplete");
+    assert_eq!(count(&conn, "select complete from releases where name = 'Uncounted'"), 1);
+    assert!(!queued("Uncounted"), "no file count: it can still grow");
     for n in ["Hidden.Upload", "Pointer", "Pointed", "Linked", "Lead"] {
         assert!(!queued(n), "{n}");
     }

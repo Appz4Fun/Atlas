@@ -9,13 +9,15 @@ use rusqlite::{Connection, Result, params};
 pub const SMALL_COMPLETE: &str = "small_complete";
 
 /// ?1 the release, ?2 now, ?3 the small rule's size (0: off), ?4 1 when the small rule leaves movies and TV alone.
+/// Complete means every file it says it has (its subjects' `[n/N]`), each with all its parts: a release whose subjects
+/// give no file count is complete as far as it has come, and can still grow past the size, soo it stays live.
 /// Never an obfuscated row (the files of one upload sit in rows of their own until the link step joins them), a row of
 /// a linked upload, one with an NZB among its files or one a stored NZB points to (the NZB chain needs them), nor one
 /// thawed by hand.
 const QUEUE: &str = "insert into freeze_pending (release_id, reason, at)
     select id, reason, ?2 from (
         select r.id as id, case
-            when ?3 > 0 and r.complete = 1 and r.size > 0 and r.size < ?3
+            when ?3 > 0 and r.complete = 1 and coalesce(r.file_total, 0) > 0 and r.size > 0 and r.size < ?3
                 and (?4 = 0 or c.category is null
                      or (c.category not between 2000 and 2999 and c.category not between 5000 and 5999))
                 then 'small_complete'
