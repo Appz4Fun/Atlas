@@ -12,6 +12,11 @@ const VMG: &[u8] = b"DVDVIDEO-VMG";
 /// The most title set IFOs looked at in one front: a disc has at most 99, and each has a `.BUP` copy.
 const MAX_SETS: usize = 64;
 
+/// Whether `data` holds a title set's IFO.
+pub fn has_title_set(data: &[u8]) -> bool {
+    find(data, VTS).is_some()
+}
+
 /// Whether `data` is a DVD-Video's: a title set or manager IFO in it, or an ISO 9660 image naming `VIDEO_TS`.
 pub fn is_dvd(data: &[u8]) -> bool {
     find(data, VTS).is_some() || find(data, VMG).is_some() || iso_with_video_ts(data)
@@ -53,6 +58,8 @@ fn title_set(ifo: &[u8]) -> Option<MediaInfo> {
         info.subtitles.push(subpicture(attrs.get(0x56 + n * 6..0x5C + n * 6)?));
     }
     info.duration_secs = longest_program(ifo);
+    // the attributes without the program chains (cut before them) want more of the front, for the playing time
+    info.header_complete = info.duration_secs.is_some();
     Some(info)
 }
 
@@ -62,7 +69,8 @@ fn video(a: u8, b: u8) -> VideoTrack {
     let pal = (a >> 4) & 3 == 1;
     let wide = (a >> 2) & 3 == 3;
     let lines = if pal { 576 } else { 480 };
-    let (width, height) = match (b >> 3) & 7 {
+    // the second byte: two caption bits, one unused, the bit rate mode, then the picture size
+    let (width, height) = match (b >> 2) & 3 {
         0 => (720, lines),
         1 => (704, lines),
         2 => (352, lines),
@@ -154,7 +162,7 @@ fn be32(b: &[u8], at: usize) -> Option<u32> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// A PAL 16:9 title set IFO: English 5.1 AC-3, a German stereo AC-3 commentary, a French DTS; English and
@@ -219,6 +227,19 @@ mod tests {
             info.subtitles.iter().map(|s| (s.language.as_deref(), s.forced)).collect();
         assert_eq!(subs, [(Some("en"), false), (Some("de"), true)]);
         assert_eq!(info.duration_secs, Some(6750.0));
+    }
+
+    #[test]
+    fn the_picture_size_is_its_two_bits_and_a_cut_table_wants_more() {
+        let mut data = ifo();
+        // 704 wide, variable bit rate
+        data[0x201] = 0x14;
+        assert_eq!(dvd(&data).video[0].width, Some(704));
+        data[0x201] = 0x10;
+        assert_eq!(dvd(&data).video[0].width, Some(720), "the bit rate bit isn't the size");
+        let cut = dvd(&data[..0x400]);
+        assert_eq!(cut.audio.len(), 3, "the attributes are read");
+        assert!(!cut.header_complete, "the playing time is in the next sector");
     }
 
     #[test]

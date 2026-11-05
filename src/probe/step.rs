@@ -708,6 +708,14 @@ fn inspect(body: &[u8], info: &mut ProbeInfo) {
     info.archive = super::archive::parse(body);
     let nest = nest::unwrap(body);
     info.media = media::parse(&nest.inner);
+    // a DVD folder in a stored archive: the walk follows its biggest file, a VOB, but the title set's IFO, with the
+    // languages and the playing time, is beside it in what was read
+    if !nest.inner.is_empty()
+        && info.media.as_ref().is_none_or(|m| m.container != "dvd-video")
+        && super::dvd::has_title_set(body)
+    {
+        info.media = Some(super::dvd::dvd(body));
+    }
     info.layers = nest.layers;
 }
 
@@ -860,6 +868,24 @@ mod tests {
         }
         assert!(stale_saved(r#"{"file":"x.7z.002","media":null}"#), "a later volume with no media");
         assert!(!stale_saved(r#"{"file":"x.7z.002","media":{"container":"matroska"}}"#));
+    }
+
+    #[test]
+    fn a_dvd_folder_in_a_stored_archive_is_read_from_its_ifo_not_its_vob() {
+        use crate::archive::testkit::{r4_file, r4_main, rar4};
+        let mut vob = vec![0, 0, 1, 0xBA, 0x44, 0, 4, 0, 4, 1, 0x01, 0x89, 0xC3, 0xF8];
+        vob.resize(200_000, 0);
+        let body = rar4(&[
+            r4_main(0),
+            r4_file(0, b"VIDEO_TS\\VTS_01_0.IFO", &super::super::dvd::tests::ifo()),
+            r4_file(0, b"VIDEO_TS\\VTS_01_1.VOB", &vob),
+        ]);
+        let mut info = ProbeInfo::default();
+        inspect(&body, &mut info);
+        let media = info.media.expect("a dvd");
+        assert_eq!(media.container, "dvd-video");
+        assert_eq!(media.audio.len(), 3);
+        assert_eq!(media.duration_secs, Some(6750.0));
     }
 
     #[test]
