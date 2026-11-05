@@ -146,6 +146,7 @@ fn with_nzb(
     ctx: &StepCtx<'_>,
     outcome: Outcome,
     inside: Option<(Listing, Option<String>)>,
+    wrapper_encrypted: bool,
     limits: &ArchiveConfig,
 ) -> Result<Outcome, StepError> {
     let Some((inside, nzb_pw)) = inside else { return Ok(outcome) };
@@ -154,17 +155,19 @@ fn with_nzb(
     }
     let mut nested = finish(ctx, SOURCE_NZB, inside, limits)?;
     if let Some(pw) = nzb_pw {
-        add_pointed_password_writes(ctx, &mut nested.writes, &pw);
+        add_pointed_password_writes(ctx, &mut nested.writes, &pw, !wrapper_encrypted);
     }
     Ok(merge_nzb(outcome, nested))
 }
 
-fn add_pointed_password_writes(ctx: &StepCtx<'_>, writes: &mut Vec<StepWrite>, pw: &str) {
+fn add_pointed_password_writes(ctx: &StepCtx<'_>, writes: &mut Vec<StepWrite>, pw: &str, set_self: bool) {
     let rel = ctx.release();
     let id = rel.id;
-    let content_id = crate::raw_store::release_content_id(ctx.conn(), id).unwrap_or_default();
-    crate::raw_store::put_nfo_password(&rel.name, &rel.group, &content_id, pw);
-    writes.push(StepWrite::new(archive_store::SET_NFO_PASSWORD, vec![id.into(), pw.to_string().into()]));
+    if set_self {
+        let content_id = crate::raw_store::release_content_id(ctx.conn(), id).unwrap_or_default();
+        crate::raw_store::put_nfo_password(&rel.name, &rel.group, &content_id, pw);
+        writes.push(StepWrite::new(archive_store::SET_NFO_PASSWORD, vec![id.into(), pw.to_string().into()]));
+    }
     let target_names: Vec<String> = writes
         .iter()
         .filter(|w| w.sql == archive_store::MARK_POINTED)
@@ -175,8 +178,20 @@ fn add_pointed_password_writes(ctx: &StepCtx<'_>, writes: &mut Vec<StepWrite>, p
         .collect();
     for name in target_names {
         writes.push(StepWrite::new(
+            archive_store::RERUN_POINTED_LIST.as_str(),
+            vec![name.clone().into(), id.into()],
+        ));
+        writes.push(StepWrite::new(
+            archive_store::RERUN_POINTED_PROBE.as_str(),
+            vec![name.clone().into(), id.into()],
+        ));
+        writes.push(StepWrite::new(
             archive_store::MARK_POINTED_PASSWORD,
-            vec![name.into(), id.into(), pw.to_string().into()],
+            vec![name.clone().into(), id.into(), pw.to_string().into()],
+        ));
+        writes.push(StepWrite::new(
+            archive_store::RANK_POINTED.as_str(),
+            vec![name.into(), id.into()],
         ));
     }
 }
@@ -484,8 +499,8 @@ fn restore_archive(
     let listing = Listing { files, complete: true, ..Default::default() };
     let mut nested = finish_with_override(ctx, SOURCE_NZB, listing, None, Some(None), false, limits)?;
     let posted_files = ctx.files().unwrap_or_default();
-    if let Some(pw) = inner_nzb_pw.or_else(|| known_or_post_password(ctx, &posted_files, None)) {
-        add_pointed_password_writes(ctx, &mut nested.writes, &pw);
+    if let Some(pw) = inner_nzb_pw.or_else(|| if !encrypted { known_or_post_password(ctx, &posted_files, None) } else { None }) {
+        add_pointed_password_writes(ctx, &mut nested.writes, &pw, !encrypted);
     }
     Ok(merge_nzb(outcome, nested))
 }
@@ -859,6 +874,7 @@ impl Step for ListStep {
                             }
                         }
                     }
+                    let wrapper_encrypted = listing.encrypted;
                     let inside = nzb_stored_in(&listing, &body, pw_found.as_deref());
                     let mut outcome = finish(ctx, SOURCE_RAR, listing, &limits)?;
                     if let Some(pw) = pw_found {
@@ -868,10 +884,11 @@ impl Step for ListStep {
                             vec![rel_id.into(), pw.into()],
                         ));
                     }
-                    return with_nzb(ctx, outcome, inside, &limits);
+                    return with_nzb(ctx, outcome, inside, wrapper_encrypted, &limits);
                 }
                 Format::Zip => {
                     let listing = zip_list(ctx, &head, &body, &mut left)?;
+                    let wrapper_encrypted = listing.encrypted;
                     let pw_found = if listing.encrypted {
                         harvest_password_from_bodies(ctx, &files, &mut left, listing.password_check.as_ref())?
                     } else {
@@ -886,7 +903,7 @@ impl Step for ListStep {
                             vec![rel_id.into(), pw.into()],
                         ));
                     }
-                    return with_nzb(ctx, outcome, inside, &limits);
+                    return with_nzb(ctx, outcome, inside, wrapper_encrypted, &limits);
                 }
                 Format::SevenZip => {
                     let listing = seven_list(ctx, &head, &seg, &body, &mut left)?;
@@ -946,7 +963,7 @@ impl Step for ListStep {
                 let meta_pw = nzb::meta_password(&body);
                 let mut outcome = finish(ctx, SOURCE_NZB, nzb::list(&body), &limits)?;
                 if let Some(pw) = meta_pw.or_else(|| known_or_post_password(ctx, &files, None)) {
-                    add_pointed_password_writes(ctx, &mut outcome.writes, &pw);
+                    add_pointed_password_writes(ctx, &mut outcome.writes, &pw, true);
                 }
                 return Ok(outcome);
             }

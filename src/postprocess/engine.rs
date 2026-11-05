@@ -1084,11 +1084,11 @@ impl Inner {
                         a.net_transient = Some(0);
                         a.net_next_at = Some(0);
                         a.writes.extend(std::mem::take(&mut o.writes).into_iter().map(|w| (bit, w)));
-                        // later steps run again: this lane's come back to it, the database's through the queue
-                        let later =
-                            self.steps.iter().filter(|s| s.rank() > step.rank()).fold(0, |m, s| m | mask(s.id()));
-                        a.clear |= o.rerun & later;
-                        a.net_mask |= o.rerun & later & a.net_steps;
+                        // requested reruns clear and re-arm any other step: this lane's come back to it, the database's through the queue
+                        let other =
+                            self.steps.iter().filter(|s| s.id() != step.id()).fold(0, |m, s| m | mask(s.id()));
+                        a.clear |= o.rerun & other;
+                        a.net_mask |= o.rerun & other & a.net_steps;
                         if let Some(name) = o.name.take() {
                             let on_rename = self.step_mask(|s| s.rank() > step.rank() && s.reruns().on_rename);
                             a.rename_clears |= on_rename;

@@ -115,6 +115,13 @@ pub fn meta_password(body: &[u8]) -> Option<String> {
             Ok(Event::Text(t)) if in_password_meta => {
                 meta_buf.push_str(&t.xml10_content());
             }
+            Ok(Event::GeneralRef(r)) if in_password_meta => {
+                if let Ok(Some(ch)) = r.resolve_char_ref() {
+                    meta_buf.push(ch);
+                } else if let Some(val) = quick_xml::escape::resolve_xml_entity(r.as_ref()) {
+                    meta_buf.push_str(val);
+                }
+            }
             Ok(Event::CData(c)) if in_password_meta => {
                 meta_buf.push_str(c.as_ref());
             }

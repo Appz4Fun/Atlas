@@ -850,5 +850,8 @@ mod select_tests {
         let dec_r4 = crate::probe::nest::unwrap_with_password(&r4, Some("rar4pass"));
         assert!(dec_r4.layers[0].stop.is_none());
         assert_eq!(dec_r4.inner.as_ref(), plain);
+
+        let nzb_ent = br#"<nzb><head><meta type="password">abc&amp;123&#33;</meta></head></nzb>"#;
+        assert_eq!(super::nzb::meta_password(nzb_ent).as_deref(), Some("abc&123!"));
     }
 }

@@ -1323,6 +1323,9 @@ pub fn find_verified_password<'a>(
     const MAX_CHECK_CANDIDATES: usize = 24;
     let mut fallback: Option<String> = None;
     for cand in &priority {
+        if tested >= MAX_CHECK_CANDIDATES {
+            break;
+        }
         tested += 1;
         match chk.accepts(cand) {
             Some(true) => return Some(cand.clone()),

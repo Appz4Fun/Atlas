@@ -520,7 +520,14 @@ fn decrypt_entry(
                 return Err("encrypted");
             };
             match actual_method {
-                "store" | "xz" => finish_stored(dec),
+                "store" => finish_stored(dec),
+                "xz" => {
+                    if dec.is_empty() {
+                        Err("nothing decoded")
+                    } else {
+                        Ok((dec, false))
+                    }
+                }
                 "deflate" | "deflate64" | "bzip2" | "zstd" | "ppmd" | "lzma" => {
                     let limit = budget.min(dec.len().saturating_mul(MAX_RATIO));
                     if limit == 0 {

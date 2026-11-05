@@ -296,6 +296,56 @@ pub const MARK_POINTED: &str =
 /// `?1` a release name, `?2` the pointer release id, `?3` the password from the pointer NZB
 pub const MARK_POINTED_PASSWORD: &str =
     "insert or ignore into release_nfo_password (release_id, password) select id, ?3 from releases where name = ?1 and id != ?2";
+/// Clears `LIST_STEP | PROBE_STEP | KEYS_STEP` and re-arms `net_wanted` on pointed-to releases with hidden header names
+/// that did not yet have a password in `release_nfo_password`. Must run before `MARK_POINTED_PASSWORD`.
+pub static RERUN_POINTED_LIST: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    let net_clear = crate::postprocess::step::mask(super::steps::LIST_STEP)
+        | crate::postprocess::step::mask(crate::probe::step::PROBE_STEP);
+    let all_clear = net_clear | crate::postprocess::step::mask(crate::keys::KEYS_STEP);
+    format!(
+        "update pp_state set
+            done = done & ~{all_clear},
+            failed = failed & ~{all_clear},
+            net_wanted = 1,
+            net_left = coalesce(net_left, 0) | {net_clear},
+            net_next_at = 0,
+            net_attempts = 0,
+            net_transient = 0,
+            rerun_gen = rerun_gen + 1,
+            rerun_mask = rerun_mask | {all_clear}
+         where release_id in (select id from releases where name = ?1 and id != ?2)
+           and not exists (select 1 from release_nfo_password p where p.release_id = pp_state.release_id)
+           and exists (
+               select 1 from archive_release ar
+               where ar.release_id = pp_state.release_id and ar.names_hidden = 1
+                 and not exists (select 1 from archive_inner_files f where f.release_id = ar.release_id)
+           )"
+    )
+});
+/// Clears `PROBE_STEP | KEYS_STEP` and re-arms `net_wanted` on pointed-to releases whose saved probe was encrypted
+/// without media and that did not yet have a password in `release_nfo_password`. Must run before `MARK_POINTED_PASSWORD`.
+pub static RERUN_POINTED_PROBE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    let net_clear = crate::postprocess::step::mask(crate::probe::step::PROBE_STEP);
+    let all_clear = net_clear | crate::postprocess::step::mask(crate::keys::KEYS_STEP);
+    format!(
+        "update pp_state set
+            done = done & ~{all_clear},
+            failed = failed & ~{all_clear},
+            net_wanted = 1,
+            net_left = coalesce(net_left, 0) | {net_clear},
+            net_next_at = 0,
+            net_attempts = 0,
+            net_transient = 0,
+            rerun_gen = rerun_gen + 1,
+            rerun_mask = rerun_mask | {all_clear}
+         where release_id in (select id from releases where name = ?1 and id != ?2)
+           and not exists (select 1 from release_nfo_password p where p.release_id = pp_state.release_id)
+           and exists (
+               select 1 from release_probe rp
+               where rp.release_id = pp_state.release_id and rp.json like '%\"encrypted\":true%'
+           )"
+    )
+});
 /// and its rank worked out now, after `MARK_POINTED`, for one the net lane already waits on: 2 at least, or what its
 /// size and category give when that's more, ranked or not yet. A visit works it out the same way
 pub static RANK_POINTED: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {

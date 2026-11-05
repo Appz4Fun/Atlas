@@ -671,46 +671,21 @@ pub(crate) fn derive_rar5_key(
     salt: &[u8; 16],
     check: Option<PasswordCheck>,
 ) -> Option<[u8; 32]> {
-    use hmac::{Hmac, Mac};
     if kdf > MAX_KDF {
         return None;
     }
-    let rounds = 1u32 << kdf;
-    let keyed = Hmac::<sha2::Sha256>::new_from_slice(password.as_bytes()).ok()?;
-    let mut mac = keyed.clone();
-    mac.update(salt);
-    mac.update(&1u32.to_be_bytes());
-    let mut u: [u8; 32] = mac.finalize().into_bytes().into();
-    let mut out = u;
-    for _ in 1..rounds {
-        let mut mac = keyed.clone();
-        mac.update(&u);
-        u = mac.finalize().into_bytes().into();
-        for (o, b) in out.iter_mut().zip(u) {
-            *o ^= b;
-        }
+    let chk = check.map(|c| (c.check, sha256_first4(&c.check)));
+    zipfast::crypto::derive_rar5_key(password, kdf, salt, chk)
+}
+
+fn sha256_first4(data: &[u8]) -> [u8; 4] {
+    use sha2::{Digest, Sha256};
+    let d = Sha256::digest(data);
+    let mut out = [0u8; 4];
+    if let Some(s) = d.get(..4) {
+        out.copy_from_slice(s);
     }
-    let aes_key = out;
-    if let Some(chk) = check {
-        for _ in 0..32 {
-            let mut mac = keyed.clone();
-            mac.update(&u);
-            u = mac.finalize().into_bytes().into();
-            for (o, b) in out.iter_mut().zip(u) {
-                *o ^= b;
-            }
-        }
-        let mut folded = [0u8; 8];
-        for (i, b) in out.iter().enumerate() {
-            if let Some(slot) = folded.get_mut(i % 8) {
-                *slot ^= b;
-            }
-        }
-        if folded != chk.check {
-            return None;
-        }
-    }
-    Some(aes_key)
+    out
 }
 
 /// Decrypts one RAR5 `-hp` encrypted block header at `pos` (where the 16-byte IV sits).
@@ -757,36 +732,7 @@ pub(crate) fn decrypt_rar5_header(
 
 /// RAR3 / RAR4 key and IV derivation (`SetKey30`: 262,144 SHA-1 rounds over UTF-16LE password + 8-byte salt).
 pub(crate) fn derive_rar4_key_iv(password: &str, salt: &[u8; 8]) -> ([u8; 16], [u8; 16]) {
-    use sha1::{Digest, Sha1};
-    let mut raw = Vec::with_capacity(password.len() * 2 + 8);
-    for ch in password.encode_utf16() {
-        raw.extend_from_slice(&ch.to_le_bytes());
-    }
-    raw.extend_from_slice(salt);
-    let mut sha = Sha1::new();
-    let mut iv = [0u8; 16];
-    const ROUNDS: u32 = 0x40000;
-    const STEP: u32 = ROUNDS / 16;
-    for i in 0..ROUNDS {
-        sha.update(&raw);
-        sha.update([i as u8, (i >> 8) as u8, (i >> 16) as u8]);
-        if i % STEP == 0 {
-            let d = sha.clone().finalize();
-            if let (Some(slot), Some(b)) = (iv.get_mut((i / STEP) as usize), d.get(19).copied()) {
-                *slot = b;
-            }
-        }
-    }
-    let final_d = sha.finalize();
-    let mut key = [0u8; 16];
-    for i in 0..4 {
-        for j in 0..4 {
-            if let (Some(dst), Some(src)) = (key.get_mut(i * 4 + j), final_d.get(i * 4 + (3 - j)).copied()) {
-                *dst = src;
-            }
-        }
-    }
-    (key, iv)
+    zipfast::crypto::derive_rar4_key_iv(password, salt)
 }
 
 /// Decrypts one RAR4 `-hp` encrypted block header at `pos` (where the 8-byte salt sits).
@@ -796,9 +742,7 @@ pub(crate) fn decrypt_rar4_header(
     password: &str,
     cache: &mut Option<([u8; 8], [u8; 16], [u8; 16])>,
 ) -> Option<(usize, Vec<u8>, [u8; 8])> {
-    let first_end = pos.checked_add(24)?;
-    let salt: [u8; 8] = data.get(pos..pos + 8)?.try_into().ok()?;
-    let first_ct = data.get(pos + 8..first_end)?;
+    let salt: [u8; 8] = data.get(pos..pos.checked_add(8)?)?.try_into().ok()?;
     let (key, iv) = match cache {
         Some((s, k, i)) if *s == salt => (*k, *i),
         _ => {
@@ -807,21 +751,6 @@ pub(crate) fn decrypt_rar4_header(
             (k, i)
         }
     };
-    let first_dec = super::aes::decrypt_cbc(&key, &iv, first_ct)?;
-    let (ty, flags, size) = (*first_dec.get(2)?, le16(&first_dec, 3)?, usize::from(le16(&first_dec, 5)?));
-    if size < 7 || !matches!(ty, 0x72..=0x7b) {
-        return None;
-    }
-    let enc_len = size.checked_add(15)? & !15;
-    let total_hdr = 8usize.checked_add(enc_len)?;
-    let enc_hdr = data.get(pos + 8..pos.checked_add(total_hdr)?)?;
-    let dec = super::aes::decrypt_cbc(&key, &iv, enc_hdr)?;
-    let header = dec.get(..size)?;
-    if matches!(ty, 0x73 | 0x74 | 0x7a | 0x7b) {
-        let covered = if ty == 0x73 && flags & 0x0002 != 0 { header.get(2..13) } else { header.get(2..) };
-        if covered.is_none_or(|c| Some(crc32(c) as u16) != le16(header, 0)) {
-            return None;
-        }
-    }
-    Some((total_hdr, header.to_vec(), salt))
+    let (header, enc_len) = zipfast::crypto::decrypt_rar4_header(data, pos + 8, &key, &iv)?;
+    Some((8 + enc_len, header, salt))
 }

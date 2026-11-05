@@ -356,7 +356,9 @@ impl Step for ProbeStep {
         let rel_complete = ctx.release().complete;
         let stamp = self.config_stamp();
         let content_id = crate::raw_store::release_content_id(ctx.conn(), release_id).unwrap_or_default();
-        let known_pw = archive::store::nfo_password(ctx.conn(), release_id)
+        let existing_db_pw = archive::store::nfo_password(ctx.conn(), release_id);
+        let known_pw = existing_db_pw
+            .clone()
             .or_else(|| crate::raw_store::get_nfo_password(&rel_name, &rel_group, &content_id));
         if !crate::raw_store::is_explicit_rerun(ctx.conn(), release_id, PROBE_STEP)
             && let Some(saved) =
@@ -570,6 +572,7 @@ impl Step for ProbeStep {
         ));
         // a hash found on a later look is asked about then too
         let needs_list_decrypt = found_nfo_password.is_some()
+            && existing_db_pw != found_nfo_password
             && ctx
                 .conn()
                 .query_row(
