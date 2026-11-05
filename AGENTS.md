@@ -50,5 +50,7 @@ Only delete the main header database, the 8 release shards, and sealed-log segme
 rm -f ~/.atlas/atlas.db ~/.atlas/atlas.db-wal ~/.atlas/atlas.db-shm \
       ~/.atlas/atlas.s[0-7].db ~/.atlas/atlas.s[0-7].db-wal ~/.atlas/atlas.s[0-7].db-shm \
       ~/.atlas/atlas.s[0-7].db.sealed-log-cursor \
+      ~/.atlas/atlas.s[0-7].frozen.db ~/.atlas/atlas.s[0-7].frozen.db-wal ~/.atlas/atlas.s[0-7].frozen.db-shm \
       ~/.atlas/segment-*.log
 ```
+The frozen files (`atlas.s{N}.frozen.db`) hold releases moved out of their shard with the shard's release ids, so they go with the shards: a new shard would hand the same ids out again. `--reset-shards` removes them.

@@ -419,6 +419,12 @@ fn writer(
     use std::sync::mpsc::{RecvTimeoutError, TryRecvError};
 
     let mut opened = db::open_shard(path).and_then(|conn| db::tune_for_writing(&conn).map(|_| conn));
+    // the frozen file, which only this writer has: without it nothing freezes and nothing thaws here
+    if let Ok(conn) = &opened
+        && let Err(e) = crate::frozen::attach(conn, path)
+    {
+        eprintln!("couldnt open the frozen file of {}: {e}", path.display());
+    }
     let mut store = crate::store::ShardWriter::new(shard);
     // a job taken off the queue to see if more were waiting
     let mut next: Option<SaveJob> = None;
@@ -607,6 +613,13 @@ fn housekeeping(conn: &mut Connection, store: &mut crate::store::ShardWriter, se
         drop(span);
         Load::add_since(&LOAD.writer_seal_ns, sealing);
     }
+    // what the freezing rules queued, a little at a time (`frozen::Ticker`)
+    let span = crate::metrics::span("db.freeze");
+    if let Err(e) = store.freezer.tick(conn, chrono::Utc::now().timestamp()) {
+        span.failed();
+        eprintln!("freezing in shard {} failed: {e}", store.shard);
+    }
+    drop(span);
     let checkpointing = std::time::Instant::now();
     let span = crate::metrics::span("db.checkpoint");
     if db::finish_checkpoint(conn).is_err() {

@@ -47,6 +47,8 @@ pub(crate) struct Applied {
     pub no_state: bool,
     /// deleted, with why, in place of all else here (see `junk`)
     pub junk: Option<&'static str>,
+    /// a database-lane visit that settled it: the freezing rules look at it once all else here is written
+    pub freeze_check: bool,
 }
 
 /// Names a transaction wrote: each one's source, and whether it was the first
@@ -243,6 +245,9 @@ fn write(conn: &Connection, mut a: Applied, now: i64, renames: &mut Renames) -> 
             "insert into pp_queue (release_id, due_at) values (?, ?) on conflict(release_id) do nothing",
         )?
         .execute(params![a.release_id, now])?;
+    }
+    if a.freeze_check {
+        crate::frozen::rules::evaluate(conn, a.release_id, now)?;
     }
     Ok(())
 }

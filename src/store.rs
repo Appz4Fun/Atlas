@@ -1460,6 +1460,8 @@ pub struct ShardWriter {
     walked_at: Option<i64>,
     /// segments of sealed files a save decodes at most (see `SealedCache`)
     decode_budget: usize,
+    /// moving what the freezing rules queued into the frozen file, between saves
+    pub freezer: crate::frozen::Ticker,
 }
 
 /// files sealed per writer tick at most
@@ -1484,6 +1486,7 @@ impl ShardWriter {
             seal_after: 0,
             walked_at: None,
             decode_budget: SEALED_DECODE_BUDGET,
+            freezer: crate::frozen::Ticker::default(),
         }
     }
 
@@ -1587,6 +1590,8 @@ impl ShardWriter {
         batches: impl IntoIterator<Item = &'a [Release]>,
     ) -> Result<()> {
         let shard = self.shard;
+        // late articles of a frozen release thaw it first (`frozen::thaw_incoming`)
+        let frozen_attached = self.freezer.attached(conn);
         let domains = &mut self.domains;
         // blobs of sealed files that get late articles, decoded once each
         let mut sealed = SealedCache::with_limits(SEALED_CACHE_MAX_SEGMENTS, self.decode_budget);
@@ -1624,7 +1629,15 @@ impl ShardWriter {
 
             // nothing is ever saved for a blocked group, whichever path it came by
             let mut releases: Vec<Cow<'_, Release>> = Vec::new();
+            let frozen = frozen_attached && crate::frozen::any(&tx)?;
             for release in batches.into_iter().flatten().filter(|r| !crate::filters::group_blocked(&r.group)) {
+                if frozen {
+                    let collection = release.collection.as_deref().map(|c| key.hash(c));
+                    let names: Vec<&str> = std::iter::once(release.name.as_str())
+                        .chain(release.articles.iter().filter_map(|a| a.release_name.as_deref()))
+                        .collect();
+                    crate::frozen::thaw_incoming(&tx, collection, &names, &release.group, now)?;
+                }
                 releases.extend(split_old_rows(&tx, grouping_from, release)?);
             }
 
@@ -1990,7 +2003,12 @@ pub fn save(main: &Path, releases: &[Release]) -> Result<()> {
         by_shard[shard_of(&r.group)].push(r.clone());
     }
     for (shard, list) in by_shard.iter().enumerate().filter(|(_, l)| !l.is_empty()) {
-        let mut conn = db::open_shard(&shard_path(main, shard))?;
+        let path = shard_path(main, shard);
+        let mut conn = db::open_shard(&path)?;
+        // late articles of a frozen release thaw it here too, rather than starting a second copy
+        if crate::frozen::path(&path).exists() {
+            crate::frozen::attach(&conn, &path)?;
+        }
         ShardWriter::new(shard).save(&mut conn, &ids, [list.as_slice()])?;
     }
     Ok(())
@@ -2037,6 +2055,23 @@ pub fn seen_count(bits: &[u8]) -> i64 {
 /// What deleting a release took.
 pub(crate) struct Deleted {
     pub articles: i64,
+}
+
+/// `delete_release` without counting its articles: a sealed blob in the sealed log is
+/// read to count it, and freezing knows the count already (`frozen::remove_live`).
+pub(crate) fn delete_release_rows(tx: &Connection, release_id: i64) -> Result<()> {
+    let files: Vec<i64> = tx
+        .prepare_cached("select id from files where release_id = ?")?
+        .query_map([release_id], |r| r.get(0))?
+        .collect::<Result<_>>()?;
+    for file in files {
+        tx.prepare_cached("delete from segments where file_id = ?")?.execute([file])?;
+        tx.prepare_cached("delete from held_back where file_id = ?")?.execute([file])?;
+    }
+    tx.prepare_cached("delete from release_ids where release_id = ?")?.execute([release_id])?;
+    tx.prepare_cached("delete from files where release_id = ?")?.execute([release_id])?;
+    tx.prepare_cached("delete from releases where id = ?")?.execute([release_id])?;
+    Ok(())
 }
 
 /// A release and everything of its, in the caller's transaction: triggers take
