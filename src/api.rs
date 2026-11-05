@@ -297,7 +297,8 @@ pub(crate) fn deep_releases(
             (Some(f), false) => search_in_categories(q, f, 0, want)?,
         }
     };
-    let frozen = crate::frozen::search(&crate::paths::database(), q, filter, want as usize)?;
+    let frozen =
+        crate::frozen::search(&crate::paths::database(), q, filter, &crate::frozen::Narrow::default(), want as usize)?;
     let mut categories = HashMap::new();
     let mut seen = std::collections::HashSet::new();
     let mut all: Vec<crate::search::ReleaseRow> = Vec::with_capacity(live.len() + frozen.len());

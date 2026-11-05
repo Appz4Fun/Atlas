@@ -64,6 +64,8 @@ fn a_frozen_release_is_found_downloaded_and_thawed_from_the_web_ui() {
     shard.execute("insert into release_category (release_id, category) values (?1, 5040)", [show]).unwrap();
     assert!(frozen::rules::evaluate(&shard, album, 1).unwrap(), "music: not movies or TV");
     assert!(!frozen::rules::evaluate(&shard, show, 1).unwrap());
+    // an album still missing files: the rule takes it all the same
+    shard.execute("update releases set complete = 0 where id = ?1", [album]).unwrap();
     assert_eq!(frozen::freeze_some(&shard, 10, Duration::from_secs(60), i64::MAX, 1).unwrap().frozen, 1);
     drop(shard);
 
@@ -88,6 +90,14 @@ fn a_frozen_release_is_found_downloaded_and_thawed_from_the_web_ui() {
     assert!(head.contains("deep=1"), "the address keeps it: {head}");
     let (_, _, other) = fetch(port, "/ui/results?q=Coldword&deep=1&cat=5000", &cookie);
     assert!(!other.contains("Some.Album"), "the category filters frozen ones too: {other}");
+    // and so do the fields, the tags and "Hide incomplete"
+    let lists = |query: &str| fetch(port, &format!("/ui/results?deep=1&{query}"), &cookie).2.contains("Some.Album");
+    assert!(lists(&format!("group={GROUP}")) && !lists("group=alt.binaries.other"), "by group");
+    assert!(lists("q=Coldword&team=GRP") && !lists("q=Coldword&team=NOPE"), "by release group");
+    assert!(!lists("q=Coldword&filters=2160p"), "by tag");
+    assert!(!lists("q=Coldword&incomplete=hide"), "hide incomplete");
+    let (_, _, crc) = fetch(port, "/ui/results?q=Coldword&deep=1&crc=deadbeef", &cookie);
+    assert!(!crc.contains("Some.Album") && crc.contains("Not searched"), "probe fields can't reach them: {crc}");
 
     // its page: what it is, its NZB, a thaw
     let (status, _, page) = fetch(port, &format!("/ui/release?id={album}"), &cookie);

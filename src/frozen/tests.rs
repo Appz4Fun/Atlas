@@ -120,9 +120,9 @@ fn a_small_complete_release_freezes_whole_and_thaws_back_as_it_was() {
     assert!(count(&conn, "select count(*) from word_queue") > 0, "the word index drops it");
 
     // deep search and its NZB, without thawing it
-    let hits = search(&f.main, "small", None, 10).unwrap();
+    let hits = search(&f.main, "small", None, &Narrow::default(), 10).unwrap();
     assert_eq!(hits.iter().map(|h| h.row.id).collect::<Vec<_>>(), vec![id]);
-    assert!(search(&f.main, "nothing", None, 10).unwrap().is_empty());
+    assert!(search(&f.main, "nothing", None, &Narrow::default(), 10).unwrap().is_empty());
     let (row, nzb_body) = nzb(&f.main, id).unwrap().unwrap();
     assert_eq!(row.name, "Small.Thing");
     assert_eq!(nzb_body, crate::nzb::render_nzb(&row, &articles));
@@ -380,7 +380,7 @@ fn deep_search_filters_by_category() {
     assert_eq!(freeze_all(&conn).frozen, 2);
     let books = crate::category::CatFilter { leaves: vec![7020], uncategorized: false };
     let names = |filter: Option<&crate::category::CatFilter>| -> Vec<String> {
-        search(&f.main, "some", filter, 10).unwrap().into_iter().map(|h| h.row.name).collect()
+        search(&f.main, "some", filter, &Narrow::default(), 10).unwrap().into_iter().map(|h| h.row.name).collect()
     };
     assert_eq!(names(Some(&books)), vec!["Some.Book".to_string()]);
     assert_eq!(
@@ -388,7 +388,7 @@ fn deep_search_filters_by_category() {
         vec!["Some.Song".to_string()]
     );
     assert_eq!(names(None).len(), 2);
-    assert_eq!(search(&f.main, "", None, 1).unwrap().len(), 1, "newest first, the limit holds");
+    assert_eq!(search(&f.main, "", None, &Narrow::default(), 1).unwrap().len(), 1, "newest first, the limit holds");
     let stats = stats(&f.main).unwrap();
     assert_eq!(stats.iter().map(|s| s.2).sum::<i64>(), 2);
 }

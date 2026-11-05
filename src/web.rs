@@ -1858,8 +1858,42 @@ const FROZEN_LISTED: usize = 200;
 
 /// A deep search's frozen releases: the newest matching ones, each to its own page (where it can be thawed).
 fn frozen_section(search: &Search) -> String {
+    let f = &search.fields;
+    if !f.crc.is_empty() || !f.agent.is_empty() {
+        return format!(
+            "<section class=\"frozen-results\"><h2>Frozen releases</h2><p class=\"note dim\">{}</p></section>",
+            "Not searched: CRC32 and Posted with come from probe results, which a frozen release keeps packed away."
+        );
+    }
+    let size = match f.size.parse::<i64>() {
+        _ if f.size.is_empty() => None,
+        Ok(n) => Some((n, n)),
+        Err(_) => Some(crate::field_search::size_range(&f.size).unwrap_or((1, 0))),
+    };
+    let narrow = crate::frozen::Narrow {
+        group: f.group.clone(),
+        poster: f.poster.clone(),
+        email: f.email.clone(),
+        size,
+        team: f.team.clone(),
+        complete_only: search.hide_incomplete,
+    };
+    // tags are read from each name: a wider window, soo the newest ones that have them still come to the limit
+    let tags = search.tag_filters();
+    let window = if tags.is_empty() { FROZEN_LISTED } else { FROZEN_LISTED * 20 };
     let filter = parse_filter(&search.cat);
-    let hits = match crate::frozen::search(&crate::paths::database(), &search.q, filter.as_ref(), FROZEN_LISTED) {
+    let found = crate::frozen::search(&crate::paths::database(), &search.q, filter.as_ref(), &narrow, window);
+    let hits = match found.map(|hits| {
+        let mut hits: Vec<_> = hits
+            .into_iter()
+            .filter(|h| {
+                let parsed = release_tags::parse(&h.row.name);
+                tags.iter().all(|t| filter_matches(t, &parsed))
+            })
+            .collect();
+        hits.truncate(FROZEN_LISTED);
+        hits
+    }) {
         Ok(hits) => hits,
         Err(e) => {
             eprintln!("web frozen search failed: {e}");
@@ -1895,7 +1929,9 @@ fn frozen_section(search: &Search) -> String {
             "<div class=\"table-wrap\"><table><thead><tr><th>Name</th><th class=\"col-cat\">Category</th><th class=\"num col-size\">Size</th><th class=\"col-posted\">Posted</th><th class=\"col-group\">Group</th><th><span class=\"sr-only\">Download</span></th></tr></thead><tbody>{rows}</tbody></table></div>"
         )
     };
-    format!("<section class=\"frozen-results\"><h2>Frozen releases</h2><p class=\"note dim\">{note}</p>{table}</section>")
+    format!(
+        "<section class=\"frozen-results\"><h2>Frozen releases</h2><p class=\"note dim\">{note}</p>{table}</section>"
+    )
 }
 
 /// What htmx swaps in: the whole result area for a new search, more rows for "Load more".
@@ -2215,7 +2251,8 @@ fn thaw_release(body: &str) -> ApiResponse {
     let args = parse_query(body);
     let id = args.get("id").and_then(|v| v.trim().parse::<i64>().ok()).unwrap_or(0);
     let main = crate::paths::database();
-    let done = crate::compact::hold_off_compaction(&main).and_then(|_writing| Ok(crate::frozen::thaw_by_hand(&main, id)?));
+    let done =
+        crate::compact::hold_off_compaction(&main).and_then(|_writing| Ok(crate::frozen::thaw_by_hand(&main, id)?));
     match done {
         Ok(crate::frozen::Thawed::Restored | crate::frozen::Thawed::AlreadyLive) => ApiResponse {
             status: 303,

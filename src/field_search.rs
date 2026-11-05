@@ -135,7 +135,7 @@ pub(crate) fn has_index(conn: &Connection, shard: usize, name: &str) -> bool {
 /// One shard's search: its `from` clause, and whether that covers the whole shard.
 /// `1.5 GB`, as the pages write sizes, in binary units: every size that would be written that way, soo a size read off
 /// a page finds its release. Spaces and commas are already gone.
-fn size_range(text: &str) -> Option<(i64, i64)> {
+pub(crate) fn size_range(text: &str) -> Option<(i64, i64)> {
     let lower = text.to_ascii_lowercase();
     let digits = lower.find(|c: char| !c.is_ascii_digit() && c != '.')?;
     let (number, unit) = lower.split_at(digits);
@@ -151,6 +151,22 @@ fn size_range(text: &str) -> Option<(i64, i64)> {
     let decimals = number.split_once('.').map_or(0, |(_, after)| after.len());
     let half = 0.5 / 10f64.powi(decimals as i32);
     Some((((value - half) * scale).ceil() as i64, ((value + half) * scale).floor() as i64))
+}
+
+/// Release group `team` as a LIKE value for `team_condition`.
+pub(crate) fn team_pattern(team: &str) -> String {
+    team.replace('\\', r"\\").replace('%', r"\%").replace('_', r"\_")
+}
+
+/// Whether the name in `name` ends in release group `param` (a `team_pattern`): at the end of the name, or before an
+/// extension or a tag, with PTT's space after the hyphen allowed.
+pub(crate) fn team_condition(name: &str, param: &str) -> String {
+    let shapes: Vec<String> = ["'%-'", "'%- '"]
+        .into_iter()
+        .flat_map(|head| ["''", "'.%'", "' %'", "'[%'"].map(|tail| (head, tail)))
+        .map(|(head, tail)| format!(r"{name} like {head} || {param} || {tail} escape '\'"))
+        .collect();
+    format!("({})", shapes.join(" or "))
 }
 
 struct Plan {
@@ -182,14 +198,7 @@ fn plan(fields: &Fields, words: &str, filter: Option<&CatFilter>) -> Plan {
         p.conditions.push("0".into());
     }
     if !fields.team.is_empty() {
-        let team = fields.team.replace('\\', r"\\").replace('%', r"\%").replace('_', r"\_");
-        // at the end of the name, or before an extension or a tag, with PTT's space after the hyphen allowed
-        let shapes: Vec<String> = ["'%-'", "'%- '"]
-            .into_iter()
-            .flat_map(|head| ["''", "'.%'", "' %'", "'[%'"].map(|tail| (head, tail)))
-            .map(|(head, tail)| format!(r"coalesce(r.display_name, r.name) like {head} || {{}} || {tail} escape '\'"))
-            .collect();
-        add(&mut p, &format!("({})", shapes.join(" or ")), Value::Text(team));
+        add(&mut p, &team_condition("coalesce(r.display_name, r.name)", "{}"), Value::Text(team_pattern(&fields.team)));
     }
     if let Ok(crc) = u32::from_str_radix(fields.crc.trim_start_matches("0x"), 16) {
         add(&mut p, "@probe:crc32:{}", Value::Integer(i64::from(crc)));
