@@ -233,7 +233,7 @@ fn sets(files: &[Whole]) -> Vec<Set> {
 /// a file a stream compressor or tar made, by its name
 fn compressed(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
-    [".tar", ".gz", ".tgz", ".xz", ".txz", ".lzma", ".bz2", ".tbz2", ".zst", ".lz4"]
+    [".tar", ".gz", ".tgz", ".xz", ".txz", ".lzma", ".lz", ".bz2", ".tbz2", ".zst", ".lz4", ".z"]
         .iter()
         .any(|ext| lower.ends_with(ext))
 }
@@ -376,6 +376,24 @@ mod tests {
         assert_eq!(split_zip_marker_off(b"PK\x07\x08PK\x03\x04rest".to_vec()), b"PK\x03\x04rest");
         assert_eq!(split_zip_marker_off(b"PK00PK\x03\x04rest".to_vec()), b"PK\x03\x04rest");
         assert_eq!(split_zip_marker_off(b"PK\x07\x08junk".to_vec()), b"PK\x07\x08junk");
+    }
+
+    #[test]
+    fn every_stream_nest_unwraps_is_a_candidate_by_its_name() {
+        for name in [
+            "n.nzb.gz",
+            "n.nzb.xz",
+            "n.nzb.lzma",
+            "n.nzb.lz",
+            "n.nzb.bz2",
+            "n.nzb.zst",
+            "n.nzb.lz4",
+            "n.nzb.Z",
+            "n.tar",
+        ] {
+            assert!(compressed(name), "{name}");
+        }
+        assert!(!compressed("n.nfo"));
     }
 
     #[test]
