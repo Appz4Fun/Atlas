@@ -68,8 +68,10 @@ pub const PP_STATE: ShardTable = ShardTable {
 /// fully obfuscated upload of one looks like a big release with no category or an Other one until the net lane
 /// reads it. 1 from 1 GiB, 2 from 4 GiB, 3 from 15 GiB (UHD remuxes), 4 from 40 GiB. A movie or TV release of
 /// `SMALL_VIDEO` or more is 1 too: an SD or 720p episode is under 1 GiB, and at 0 it waits behind every small post
-/// of every kind, soo it was never probed. 0: smaller, or a category that is neither movies, TV nor Other.
-pub const NET_RANK: &str = "coalesce((select case
+/// of every kind, soo it was never probed. 0: smaller, or a category that is neither movies, TV nor Other. A release
+/// with an NZB among its files is 2 at least, whatever its size or category: one small article that says what a whole
+/// other post is (`archive::nzb`), the first hop to it.
+pub const NET_RANK: &str = "coalesce((select max(case
         when c.category is not null and c.category not between 2000 and 2999 and c.category not between 5000 and 5999
             and c.category not between 8000 and 8999 then 0
         when r.size >= 42949672960 then 4
@@ -77,7 +79,8 @@ pub const NET_RANK: &str = "coalesce((select case
         when r.size >= 4294967296 then 2
         when r.size >= 1073741824 then 1
         when r.size >= 52428800 and (c.category between 2000 and 2999 or c.category between 5000 and 5999) then 1
-        else 0 end
+        else 0 end,
+        case when exists (select 1 from files f where f.release_id = r.id and f.filename like '%.nzb') then 2 else 0 end)
     from releases r left join release_category c on c.release_id = r.id where r.id = ?1), 0)";
 
 /// The smallest movie or TV release `NET_RANK` puts with the 1 GiB ones: 50 MiB, past samples and the odd file of a

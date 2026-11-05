@@ -606,6 +606,11 @@ mod tests {
         assert_eq!(ranked(60 * gib, Some(8010)), Some(4), "a hashed upload");
         assert_eq!(ranked(60 * gib, Some(3010)), Some(0), "audio, however big");
         assert_eq!(ranked(60 * gib, Some(6000)), Some(0), "nor XXX");
+        conn.execute("insert into files (release_id, filename, seen) values (?, 'Some.Post.NZB', x'01')", [id])
+            .unwrap();
+        assert_eq!(ranked(6_226, Some(2045)), Some(2), "a post of an NZB, however small");
+        assert_eq!(ranked(6_226, Some(3010)), Some(2), "and whatever it's filed as");
+        assert_eq!(ranked(60 * gib, Some(2045)), Some(4), "a big one with an NZB beside it stays where it was");
     }
 
     #[test]
