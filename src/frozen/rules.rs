@@ -1,16 +1,18 @@
 //! Which releases freeze, as one statement the writer runs for a release at the end of each database-lane visit
 //! (`postprocess::apply`): what the visit wrote is already there, and what an earlier visit queued is taken back
-//! when the release no longer matches (it grew past the size, or a rename moved its category).
+//! when the release no longer matches (it grew past the size, or a rename moved its category). Releases no visit is
+//! coming back to are walked by the writer a chunk a tick (`backlog_some`).
 
 use std::sync::atomic::Ordering::Relaxed;
 
-use rusqlite::{Connection, Result, params};
+use rusqlite::{Connection, OptionalExtension, Result, params};
 
 pub const SMALL_COMPLETE: &str = "small_complete";
 pub const NOT_TV_MOVIES: &str = "not_tv_movies";
 
-/// Release ?1 with the rule that matches it now as its reason, null when none does. ?2 now (for `QUEUE`), ?3 the small
-/// rule's size (0: off), ?4 1 when the small rule leaves movies and TV alone, ?5 1 when the not-TV/movies rule is on.
+/// Releases ?1 to ?6 with the rule that matches each now as its reason, null when none does. ?2 now (for `QUEUE`), ?3
+/// the small rule's size (0: off), ?4 1 when the small rule leaves movies and TV alone, ?5 1 when the not-TV/movies
+/// rule is on.
 /// Small: complete means every file it says it has (its subjects' `[n/N]`), each with all its parts: a release whose
 /// subjects give no file count is complete as far as it has come, and can still grow past the size, soo it stays live.
 /// Not TV/movies: a categorized release outside Movies (2000s), TV (5000s) and Other (8000s, where Misc and Hashed
@@ -32,7 +34,7 @@ macro_rules! matching {
                 then 'not_tv_movies'
             end as reason
         from releases r left join release_category c on c.release_id = r.id
-        where r.id = ?1 and coalesce(r.is_obfuscated, 0) = 0
+        where r.id between ?1 and ?6 and coalesce(r.is_obfuscated, 0) = 0
             and not exists (select 1 from freeze_exempt e where e.release_id = r.id)
             and not exists (select 1 from upload_link u where u.release_id = r.id)
             and not exists (select 1 from upload_link u where u.lead_id = r.id)
@@ -42,7 +44,7 @@ macro_rules! matching {
 }
 
 const QUEUE: &str = concat!(
-    "insert into freeze_pending (release_id, reason, at) select id, reason, ?2 from (",
+    "insert or ignore into freeze_pending (release_id, reason, at) select id, reason, ?2 from (",
     matching!(),
     ") where reason is not null"
 );
@@ -61,10 +63,83 @@ pub fn evaluate(conn: &Connection, id: i64, now: i64) -> Result<bool> {
     if !any_on() {
         return Ok(false);
     }
-    let small = super::SMALL_BYTES.load(Relaxed);
-    let keep_video = super::SMALL_KEEPS_TV_MOVIES.load(Relaxed) as i64;
-    let not_tv = super::NOT_TV_MOVIES.load(Relaxed) as i64;
-    Ok(conn.prepare_cached(QUEUE)?.execute(params![id, now, small, keep_video, not_tv])? > 0)
+    Ok(queue(conn, id, id, now)? > 0)
+}
+
+/// The rules' settings now: the small rule's size, whether it keeps movies and TV, whether not-TV/movies is on.
+fn settings() -> (i64, i64, i64) {
+    (
+        super::SMALL_BYTES.load(Relaxed),
+        super::SMALL_KEEPS_TV_MOVIES.load(Relaxed) as i64,
+        super::NOT_TV_MOVIES.load(Relaxed) as i64,
+    )
+}
+
+/// Queue what matches among releases `lo..=hi`, leaving queued ones as they are. Returns how many it queued.
+fn queue(conn: &Connection, lo: i64, hi: i64, now: i64) -> Result<usize> {
+    let (small, keep_video, not_tv) = settings();
+    conn.prepare_cached(QUEUE)?.execute(params![lo, now, small, keep_video, not_tv, hi])
+}
+
+/// meta key: the backlog has looked at every release from here up; 0 once it got to the bottom
+const BACKLOG_BELOW: &str = "freeze_backlog_below";
+/// meta key: the rules the backlog walk is for (`signature`); other rules start it over from the top
+const BACKLOG_RULES: &str = "freeze_backlog_rules";
+
+/// The rules as they are now, as one number.
+fn signature() -> i64 {
+    let (small, keep_video, not_tv) = settings();
+    small.wrapping_mul(4).wrapping_add(keep_video * 2 + not_tv)
+}
+
+fn meta(conn: &Connection, key: &str) -> Result<Option<i64>> {
+    conn.prepare_cached("select value from main.meta where key = ?1")?.query_row([key], |r| r.get(0)).optional()
+}
+
+fn set_meta(conn: &Connection, key: &str, value: i64) -> Result<()> {
+    conn.prepare_cached("insert or replace into main.meta (key, value) values (?1, ?2)")?
+        .execute(params![key, value])?;
+    Ok(())
+}
+
+/// What one backlog step did.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Backlog {
+    pub looked_at: usize,
+    pub queued: usize,
+}
+
+/// One step of the walk over releases no visit is coming back to: the next `limit` releases down from where the last
+/// step stopped, newest first, queued where a rule matches (one queued already keeps its place). Starts over from the
+/// top when the rules change, and does nothing once it got to the bottom. In the caller's transaction, on the shard's
+/// writer.
+pub fn backlog_some(conn: &Connection, limit: usize, now: i64) -> Result<Backlog> {
+    if !any_on() || limit == 0 {
+        return Ok(Backlog::default());
+    }
+    let sig = signature();
+    let mut below = meta(conn, BACKLOG_BELOW)?;
+    if meta(conn, BACKLOG_RULES)? != Some(sig) {
+        set_meta(conn, BACKLOG_RULES, sig)?;
+        below = None;
+    }
+    let below = match below {
+        Some(0) => return Ok(Backlog::default()),
+        Some(b) => b,
+        None => i64::MAX,
+    };
+    let (lo, n): (Option<i64>, i64) = conn
+        .prepare_cached(
+            "select min(id), count(*) from (select id from releases where id < ?1 order by id desc limit ?2)",
+        )?
+        .query_row(params![below, limit as i64], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    let Some(lo) = lo else {
+        set_meta(conn, BACKLOG_BELOW, 0)?;
+        return Ok(Backlog::default());
+    };
+    let queued = queue(conn, lo, below - 1, now)?;
+    set_meta(conn, BACKLOG_BELOW, lo)?;
+    Ok(Backlog { looked_at: n as usize, queued })
 }
 
 /// Whether a rule matches release `id` as it is now, for a release about to move.
@@ -72,8 +147,6 @@ pub fn still(conn: &Connection, id: i64) -> Result<bool> {
     if !any_on() {
         return Ok(false);
     }
-    let small = super::SMALL_BYTES.load(Relaxed);
-    let keep_video = super::SMALL_KEEPS_TV_MOVIES.load(Relaxed) as i64;
-    let not_tv = super::NOT_TV_MOVIES.load(Relaxed) as i64;
-    conn.prepare_cached(STILL)?.query_row(params![id, 0, small, keep_video, not_tv], |r| r.get(0))
+    let (small, keep_video, not_tv) = settings();
+    conn.prepare_cached(STILL)?.query_row(params![id, 0, small, keep_video, not_tv, id], |r| r.get(0))
 }

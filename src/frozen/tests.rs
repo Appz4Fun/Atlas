@@ -566,3 +566,37 @@ fn a_post_naming_frozen_releases_thaws_only_what_its_save_joins_and_few_of_those
     assert_eq!(frozen(), 2);
     assert_eq!(count(&conn, "select count(*) from freeze_pending"), 8, "queued again, to go back after their wait");
 }
+
+#[test]
+fn the_backlog_walk_queues_what_no_visit_comes_back_to_a_chunk_at_a_time() {
+    let f = Fixture::new();
+    let names: Vec<String> = (0..5).map(|n| format!("Old.{n}")).collect();
+    f.save(&names.iter().map(|n| post(n, &["a.rar"], 1, 100)).collect::<Vec<_>>());
+    f.save(&[post("Big", &["b.mkv"], 2, 600 << 20)]);
+    let conn = f.writer();
+    let queued_at = |n: &str| -> Option<i64> {
+        conn.query_row("select at from freeze_pending where release_id = ?1", [f.id(&conn, n)], |r| r.get(0))
+            .optional()
+            .unwrap()
+    };
+    assert!(rules::evaluate(&conn, f.id(&conn, "Old.0"), 7).unwrap(), "a visit queued it earlier");
+
+    let step = || rules::backlog_some(&conn, 2, NOW).unwrap();
+    // newest first: Big (too big), then Old.4 and Old.3
+    assert_eq!(step(), rules::Backlog { looked_at: 2, queued: 1 });
+    assert_eq!(queued_at("Old.4"), Some(NOW));
+    assert_eq!(queued_at("Old.2"), None);
+    assert_eq!(step(), rules::Backlog { looked_at: 2, queued: 2 });
+    assert_eq!(step(), rules::Backlog { looked_at: 2, queued: 1 });
+    assert_eq!(queued_at("Old.0"), Some(7), "one queued already keeps its place");
+    assert_eq!(queued_at("Big"), None);
+    assert_eq!(step(), rules::Backlog::default(), "at the bottom");
+    assert_eq!(meta(&conn, "freeze_backlog_below"), 0);
+    assert_eq!(step(), rules::Backlog::default(), "and done");
+
+    // the rules changed since (as a walk made under other ones has them): it starts over from the top
+    conn.execute("delete from freeze_pending", []).unwrap();
+    conn.execute("update meta set value = value + 1 where key = 'freeze_backlog_rules'", []).unwrap();
+    assert_eq!(step(), rules::Backlog { looked_at: 2, queued: 1 });
+    assert_eq!(queued_at("Old.4"), Some(NOW));
+}

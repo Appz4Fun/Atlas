@@ -59,6 +59,8 @@ pub static SMALL_KEEPS_TV_MOVIES: AtomicBool = AtomicBool::new(false);
 pub static NOT_TV_MOVIES: AtomicBool = AtomicBool::new(true);
 /// `[freeze] per_tick`: releases a writer moves at most a tick
 pub static PER_TICK: AtomicI64 = AtomicI64::new(200);
+/// `[freeze] backlog_per_tick`: releases the backlog walk looks at a tick, 0 turns it off
+pub static BACKLOG_PER_TICK: AtomicI64 = AtomicI64::new(2_000);
 /// `[freeze] tick_ms`: how long a tick may hold the writer
 pub static TICK_MS: AtomicI64 = AtomicI64::new(50);
 /// `[freeze] min_free_gb`, in bytes: below this much free disk nothing is moved
@@ -79,6 +81,7 @@ pub fn configure(cfg: &crate::config::FreezeConfig) {
     SMALL_KEEPS_TV_MOVIES.store(cfg.small_keeps_tv_movies, Relaxed);
     NOT_TV_MOVIES.store(cfg.not_tv_movies, Relaxed);
     PER_TICK.store(cfg.per_tick.max(1), Relaxed);
+    BACKLOG_PER_TICK.store(cfg.backlog_per_tick.max(0), Relaxed);
     TICK_MS.store(cfg.tick_ms.max(1), Relaxed);
     MIN_FREE_BYTES.store(cfg.min_free_gb.max(0).saturating_mul(1 << 30), Relaxed);
     WAIT_SECS.store(cfg.wait_hours.max(0).saturating_mul(3600), Relaxed);
@@ -361,6 +364,8 @@ pub struct Moved {
     pub dropped: usize,
     /// changed between the copy and the delete: copied again next tick
     pub changed: usize,
+    /// queued by the backlog walk
+    pub backlog: usize,
 }
 
 /// A release a tick copied into the frozen file: its id, and its size and parts as copied.
@@ -528,12 +533,19 @@ impl Ticker {
             return Ok(Moved::default());
         }
         self.last = Some(Instant::now());
+        // queueing takes no room: the walk goes on while the disk is short
+        let walk = BACKLOG_PER_TICK.load(Relaxed).max(0) as usize;
+        let tx = conn.unchecked_transaction()?;
+        let backlog = rules::backlog_some(&tx, walk, now)?.queued;
+        tx.commit()?;
+        crate::metrics::names::FROZEN.inc(&[("event", "backlog_queued")], backlog as u64);
         if !self.disk_ok(conn) {
-            return Ok(Moved::default());
+            return Ok(Moved { backlog, ..Moved::default() });
         }
         let limit = PER_TICK.load(Relaxed).max(1) as usize;
         let budget = Duration::from_millis(TICK_MS.load(Relaxed).max(1) as u64);
-        freeze_some(conn, limit, budget, now.saturating_sub(WAIT_SECS.load(Relaxed)), now)
+        let moved = freeze_some(conn, limit, budget, now.saturating_sub(WAIT_SECS.load(Relaxed)), now)?;
+        Ok(Moved { backlog, ..moved })
     }
 }
 

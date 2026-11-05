@@ -390,6 +390,8 @@ pub struct FreezeConfig {
     pub not_tv_movies: bool,
     /// releases a shard's writer moves at most a tick (a second)
     pub per_tick: i64,
+    /// releases the backlog walk looks at a tick, 0 turns it off
+    pub backlog_per_tick: i64,
     /// how long a tick may hold the writer, milliseconds
     pub tick_ms: i64,
     /// below this much free disk nothing is moved, GB
@@ -406,6 +408,7 @@ impl Default for FreezeConfig {
             small_keeps_tv_movies: false,
             not_tv_movies: true,
             per_tick: 200,
+            backlog_per_tick: 2_000,
             tick_ms: 50,
             min_free_gb: 100,
             wait_hours: 12,
@@ -424,6 +427,7 @@ impl FreezeConfig {
         };
         int("small_bytes", &mut c.small_bytes, 0);
         int("per_tick", &mut c.per_tick, 1);
+        int("backlog_per_tick", &mut c.backlog_per_tick, 0);
         int("tick_ms", &mut c.tick_ms, 1);
         int("min_free_gb", &mut c.min_free_gb, 0);
         int("wait_hours", &mut c.wait_hours, 0);
