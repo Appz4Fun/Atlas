@@ -535,6 +535,120 @@ pub fn crc_files(shard: &Connection, release_id: i64, probe: Option<&ProbeInfo>)
     Ok(out)
 }
 
+/// A file a release knows the whole-file CRC32 of, under a name: the one it was posted as, for the probed file, or the
+/// one its PAR2 set gives it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NamedCrc {
+    pub file: FileCrc,
+    pub name: String,
+    /// the whole-file MD5 a set of this release gives the file, when one does: a donor's set that says another MD5
+    /// for the same size and CRC is another file, a CRC32 collision or a set that lies
+    pub md5: Option<Vec<u8>>,
+}
+
+/// The most releases one file asks for donors from.
+const DONORS_CAP: i64 = 8;
+
+/// `crc_files` with names, for a release in any shard of `conn` (the main database with the shards attached).
+pub fn named_crc_files(conn: &Connection, release_id: i64) -> Vec<NamedCrc> {
+    let s = store::shard_of_id(release_id);
+    let mut out: Vec<NamedCrc> = Vec::new();
+    if let Some(probe) = probe_in(conn, release_id)
+        && let (Some(file), Some(name)) = (probe_file(&probe), probe.file.clone())
+    {
+        out.push(NamedCrc { file, name, md5: None });
+    }
+    let sql = format!(
+        "select size, crc32, name, md5 from s{s}.par2_files
+         where release_id = ?1 and bound = 1 and crc32 is not null and size >= ?2
+         order by size desc, name limit ?3"
+    );
+    if let Ok(mut q) = conn.prepare_cached(&sql)
+        && let Ok(rows) = q.query_map(rusqlite::params![release_id, CRC_MIN_SIZE, CRC_FILES_CAP as i64], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?, r.get::<_, Vec<u8>>(3)?))
+        })
+    {
+        for (size, crc, name, md5) in rows.flatten() {
+            let Some(file) = u32::try_from(crc).ok().and_then(|c| FileCrc::new(size, c)) else { continue };
+            // the probed file, when the set describes it too, takes the set's MD5
+            for probed in out.iter_mut().filter(|n| n.file == file && n.md5.is_none()) {
+                probed.md5 = Some(md5.clone());
+            }
+            if !out.iter().any(|n| n.file == file && n.name == name) {
+                out.push(NamedCrc { file, name, md5: Some(md5) });
+            }
+        }
+    }
+    out.truncate(CRC_FILES_CAP);
+    out
+}
+
+/// Whether a set of `id` gives `file` (by size and CRC) another whole-file MD5 than `md5`.
+fn md5_differs(conn: &Connection, id: i64, file: FileCrc, md5: Option<&[u8]>) -> bool {
+    let Some(md5) = md5 else { return false };
+    let s = store::shard_of_id(id);
+    let sql = format!(
+        "select 1 from s{s}.par2_files where release_id = ?1 and bound = 1 and size = ?2 and crc32 = ?3 and md5 != ?4"
+    );
+    conn.prepare_cached(&sql)
+        .and_then(|mut q| q.exists(rusqlite::params![id, file.size, i64::from(file.crc32), md5]))
+        .unwrap_or(false)
+}
+
+/// A release's probe, read through `conn` with the shards attached.
+fn probe_in(conn: &Connection, release_id: i64) -> Option<ProbeInfo> {
+    let s = store::shard_of_id(release_id);
+    let sql = format!("select info from s{s}.release_probe where release_id = ?1");
+    let info: String = conn.prepare_cached(&sql).ok()?.query_row([release_id], |r| r.get(0)).optional().ok()??;
+    serde_json::from_str(&info).ok()
+}
+
+/// The other releases that hold `file`, each with the name it has there: a probed file of the same size and CRC
+/// (under its posted name), or a file a bound PAR2 set lists with them (under the set's name). Shown releases only,
+/// newest first, at most `DONORS_CAP`.
+pub fn crc_donors(conn: &Connection, own: i64, file: FileCrc, md5: Option<&[u8]>) -> Vec<(i64, String)> {
+    let mut out: Vec<(i64, String)> = Vec::new();
+    for s in 0..store::SHARDS {
+        let probed = format!(
+            "select k.release_id from s{s}.release_keys k join s{s}.releases r on r.id = k.release_id
+             where k.file_crc = ?1 and k.release_id != ?2 and not atlas_blocked(r.group_name)
+             order by k.release_id desc limit ?3"
+        );
+        if let Ok(mut q) = conn.prepare_cached(&probed)
+            && let Ok(rows) = q.query_map(rusqlite::params![file.key(), own, DONORS_CAP], |r| r.get::<_, i64>(0))
+        {
+            for id in rows.flatten().collect::<Vec<_>>() {
+                // the key is a hash: the donor's own probe must say the same size and CRC, and name the file
+                if let Some(probe) = probe_in(conn, id)
+                    && probe_file(&probe) == Some(file)
+                    && !md5_differs(conn, id, file, md5)
+                    && let Some(name) = probe.file
+                {
+                    out.push((id, name));
+                }
+            }
+        }
+        let described = format!(
+            "select distinct p.release_id, p.name from s{s}.par2_files p join s{s}.releases r on r.id = p.release_id
+             where p.bound = 1 and p.size = ?1 and p.crc32 = ?2 and p.release_id != ?3
+               and (?5 is null or p.md5 = ?5) and not atlas_blocked(r.group_name)
+             order by p.release_id desc limit ?4"
+        );
+        if let Ok(mut q) = conn.prepare_cached(&described)
+            && let Ok(rows) = q.query_map(
+                rusqlite::params![file.size, i64::from(file.crc32), own, DONORS_CAP, md5],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+            )
+        {
+            out.extend(rows.flatten());
+        }
+    }
+    out.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    out.dedup();
+    out.truncate(DONORS_CAP as usize);
+    out
+}
+
 /// The PAR2 set ids a release's files are described by, at most `SETS_CAP`; none on a shard without the table yet.
 pub fn par2_sets(shard: &Connection, release_id: i64) -> rusqlite::Result<Vec<Vec<u8>>> {
     let Ok(mut q) = shard.prepare_cached(
@@ -1058,7 +1172,7 @@ mod tests {
             .unwrap();
         }
         for (_, index) in crate::archive::store::PAR2_FILES.indexes {
-            conn.execute_batch(&index.replace(" on par2_files(", " on par2_files(").replacen("exists ", "exists s0.", 1))
+            conn.execute_batch(&index.replacen("exists ", "exists s0.", 1))
                 .unwrap();
         }
         let lookup = Lookup { keys: Keys::default(), par2_sets: Vec::new(), moviehash: None, files: vec![file] };
