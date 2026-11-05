@@ -688,11 +688,11 @@ fn says_commentary(name: Option<&str>) -> bool {
 }
 
 /// The most tracks kept. Real files have a few dozen at most, and these come from Usenet.
-const MAX_TRACKS: usize = 128;
+pub(super) const MAX_TRACKS: usize = 128;
 /// The most characters kept of a track's codec, name or language.
-const MAX_TRACK_TEXT: usize = 256;
+pub(super) const MAX_TRACK_TEXT: usize = 256;
 
-fn is_full(info: &MediaInfo) -> bool {
+pub(super) fn is_full(info: &MediaInfo) -> bool {
     info.video.len() + info.audio.len() + info.subtitles.len() >= MAX_TRACKS
 }
 

@@ -1,7 +1,7 @@
 //! Tracks and format from the start of an AVI file: its `hdrl` list comes first, before the frames. A total
 //! function like the rest of `media`: cut off bytes give what was read before them.
 
-use super::media::{AudioTrack, MediaInfo, SubtitleTrack, VideoTrack};
+use super::media::{AudioTrack, MAX_TRACK_TEXT, MediaInfo, SubtitleTrack, VideoTrack, is_full};
 
 pub fn is_avi(data: &[u8]) -> bool {
     data.len() >= 12 && &data[..4] == b"RIFF" && &data[8..12] == b"AVI "
@@ -77,6 +77,10 @@ impl Avih {
 
 /// One `strl`: its `strh` says what kind of stream, its `strf` the format, its `strn` a name.
 fn stream(body: &[u8], info: &mut MediaInfo, video_length: &mut Option<u32>) {
+    // these come from Usenet: a header of a million stream lists keeps what `media` keeps of a Matroska one
+    if is_full(info) {
+        return;
+    }
     let (mut strh, mut strf, mut name) = (None, None, None);
     chunks(body, &mut |id, body, _| match id {
         b"strh" => strh = Some(body),
@@ -170,7 +174,7 @@ fn fourcc(b: &[u8]) -> Option<String> {
 
 fn text(b: &[u8]) -> Option<String> {
     let s = String::from_utf8_lossy(b.split(|c| *c == 0).next().unwrap_or_default()).trim().to_string();
-    (!s.is_empty()).then_some(s)
+    (!s.is_empty()).then(|| s.chars().take(MAX_TRACK_TEXT).collect())
 }
 
 #[cfg(test)]
@@ -260,6 +264,19 @@ mod tests {
         assert_eq!((a.codec.as_str(), a.channels, a.sample_rate), ("ac3", Some(6), Some(48_000.0)));
         assert_eq!(a.name.as_deref(), Some("English 5.1"));
         assert!((info.duration_secs.unwrap() - 41.708).abs() < 0.001, "{:?}", info.duration_secs);
+    }
+
+    #[test]
+    fn a_header_of_endless_streams_keeps_a_few() {
+        let mut astrh = b"auds\0\0\0\0".to_vec();
+        astrh.extend([0u8; 44]);
+        let strl = list(b"strl", &[chunk(b"strh", &astrh), chunk(b"strn", &[b'x'; 5000])]);
+        let hdrl = list(b"hdrl", &vec![strl; 10_000]);
+        let mut data = b"RIFF\0\0\0\0AVI ".to_vec();
+        data.extend(hdrl);
+        let info = avi(&data);
+        assert_eq!(info.audio.len(), super::super::media::MAX_TRACKS);
+        assert_eq!(info.audio[0].name.as_ref().map(|n| n.chars().count()), Some(MAX_TRACK_TEXT));
     }
 
     #[test]
