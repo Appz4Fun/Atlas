@@ -611,6 +611,10 @@ mod tests {
         assert_eq!(ranked(6_226, Some(2045)), Some(2), "a post of an NZB, however small");
         assert_eq!(ranked(6_226, Some(3010)), Some(2), "and whatever it's filed as");
         assert_eq!(ranked(60 * gib, Some(2045)), Some(4), "a big one with an NZB beside it stays where it was");
+        conn.execute("delete from files where filename = 'Some.Post.NZB'", []).unwrap();
+        assert_eq!(ranked(16 << 20, Some(2045)), Some(0));
+        conn.execute("insert into nzb_pointed (release_id) values (?)", [id]).unwrap();
+        assert_eq!(ranked(16 << 20, Some(2045)), Some(2), "what an NZB read here points to");
     }
 
     #[test]

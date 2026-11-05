@@ -935,3 +935,34 @@ fn an_nzb_in_a_rar_comes_back_with_the_rar_from_the_raw_store() {
     wait_for("both lists back", || rows(&h, "x") == before);
     assert_eq!(bodies(&state), 1);
 }
+
+#[test]
+fn what_a_read_nzb_points_to_is_marked_and_ranked_up() {
+    let mut h = fresh();
+    let post = shape("x").one("x.nzb", &an_nzb(POINTED_AT));
+    let target = shape("Pointed.At.2016.2160p-GRP").dark("Pointed.At.2016.2160p-GRP.part1.rar", 1, 2);
+    h.save(&[post.release(), target.release()]);
+    let state = Server::new(post.posts.clone());
+    start_with(&mut h, spawn_server(state.clone()), config(), steps::all());
+    settled(&h, "x");
+    let pointed: Vec<i64> = h
+        .shard()
+        .prepare("select release_id from nzb_pointed")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(pointed, [h.id_of("Pointed.At.2016.2160p-GRP")]);
+    // its rank, worked out again by a visit, holds
+    let id = h.id_of("Pointed.At.2016.2160p-GRP");
+    let rank: Option<i64> = h
+        .shard()
+        .query_row(
+            &format!("select {}", atlas::postprocess::schema::NET_RANK.replace("?1", &id.to_string())),
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(rank, Some(2));
+}

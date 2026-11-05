@@ -280,6 +280,23 @@ pub fn segment_crcs_with(conn: &Connection, release_id: i64) -> std::collections
     rows.flatten().collect()
 }
 
+/// Releases of this shard an NZB read here points to, by name: the net lane reads them sooner (`NET_RANK`), as
+/// what the NZB was posted for. A release in another shard isn't marked.
+pub const NZB_POINTED: ShardTable = ShardTable {
+    name: "nzb_pointed",
+    create: "create table if not exists nzb_pointed (release_id INTEGER PRIMARY KEY)",
+    indexes: &[],
+    release_key: Some("release_id"),
+    added: &[],
+};
+
+/// `?1` a release name, `?2` the release whose NZB names it
+pub const MARK_POINTED: &str =
+    "insert or ignore into nzb_pointed (release_id) select id from releases where name = ?1 and id != ?2";
+/// and its rank now, for one the net lane already waits on: a visit works it out again from `nzb_pointed`
+pub const RANK_POINTED: &str = "update pp_state set net_rank = max(coalesce(net_rank, 0), 2)
+    where net_wanted = 1 and release_id in (select id from releases where name = ?1 and id != ?2)";
+
 pub const DELETE_SOURCE: &str = "delete from archive_inner_files where release_id = ?1 and source = ?2";
 pub const INSERT_FILE: &str =
     "insert or replace into archive_inner_files (release_id, seq, name, size, source) values (?1, ?2, ?3, ?4, ?5)";
