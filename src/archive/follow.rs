@@ -71,10 +71,14 @@ impl Whole {
     }
 }
 
-/// A message-id as RFC 3977 has them, without its brackets: 1 to 248 printable ASCII characters, no space, no `<`
-/// or `>`. Anything else would be a broken command, not a lookup.
+/// A message-id as RFC 5536 has them, without its brackets: `left@right`, both sides there, 3 to 248 printable
+/// ASCII characters in all, no space, no `<` or `>`. Anything else would be a broken command, not a lookup.
 fn valid_id(id: &str) -> bool {
-    (1..=248).contains(&id.len()) && id.bytes().all(|b| (0x21..=0x7e).contains(&b) && b != b'<' && b != b'>')
+    (3..=248).contains(&id.len())
+        && id.bytes().all(|b| (0x21..=0x7e).contains(&b) && b != b'<' && b != b'>')
+        && id
+            .rsplit_once('@')
+            .is_some_and(|(left, right)| !left.is_empty() && !right.is_empty() && !right.contains('@'))
 }
 
 /// Whether a post of these files is small enough to read whole.
@@ -140,8 +144,14 @@ pub fn nzb_inside(
         let mut found = None;
         for piece in &pieces {
             // as far as an NZB this hop may read goes, not a probe's look at the front
+            // decoding is work the fetch deadline doesn't see: none starts past it
+            if std::time::Instant::now() >= ctx.deadline() {
+                return Err(StepError::OutOfBudget);
+            }
             let limit = usize::try_from(left.bytes).unwrap_or(usize::MAX).min(MAX_FOLLOWED_NZB);
             let unwrapped = nest::unwrap_for(piece, &|name| select::classify(name) == Kind::Nzb, limit);
+            // every byte decoded on the way counts, not only what's kept: a stream can expand to much and select little
+            left.bytes = left.bytes.saturating_sub(unwrapped.decoded as u64);
             if let Some(names) = names.as_deref_mut() {
                 for layer in &unwrapped.layers {
                     if let Some(name) = layer.name.clone().filter(|n| !names.iter().any(|f| &f.name == n)) {
@@ -429,7 +439,7 @@ mod tests {
     fn a_file_is_read_by_its_segments_in_number_order_once_each() {
         let file = NzbFile {
             name: "x.rar".into(),
-            segments: [(2, "b"), (1, "a"), (2, "b2")]
+            segments: [(2, "b@x"), (1, "a@x"), (2, "b2@x")]
                 .into_iter()
                 .map(|(n, id)| nzb::Segment { number: n, bytes: 1, message_id: id.into() })
                 .collect(),
@@ -437,7 +447,7 @@ mod tests {
             total_bytes: 3,
             groups: vec!["alt.binaries.test".into()],
         };
-        assert_eq!(Whole::of(&file).unwrap().ids, ["<a>", "<b>"]);
+        assert_eq!(Whole::of(&file).unwrap().ids, ["<a@x>", "<b@x>"]);
         let blocked = NzbFile { groups: vec!["alt.binaries.cp".into()], ..file.clone() };
         assert!(crate::filters::group_blocked("alt.binaries.cp") == Whole::of(&blocked).is_none());
         assert!(Whole::of(&NzbFile { groups: vec![], ..file.clone() }).is_none(), "no group named");
@@ -450,6 +460,8 @@ mod tests {
         assert!(Whole::of(&with_id("a\nb")).is_none(), "a line break");
         assert!(Whole::of(&with_id("a b")).is_none(), "a space");
         assert!(Whole::of(&with_id("a>b")).is_none(), "a bracket");
+        assert!(Whole::of(&with_id("no-at-sign")).is_none(), "no @");
+        assert!(Whole::of(&with_id("@b")).is_none() && Whole::of(&with_id("a@")).is_none(), "an empty side");
         assert!(Whole::of(&with_id("part1of26.kd8SVOZST6uf6W9pvM$&@powerpost.local")).is_some());
     }
 }

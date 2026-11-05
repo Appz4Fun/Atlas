@@ -639,4 +639,5 @@ fn unwrap_for_decodes_as_far_as_its_own_limit() {
     let whole = unwrap_for(&gz, &|_| false, 2 * MAX_DECODED);
     assert!(!whole.layers[0].capped);
     same(&whole.inner, &text);
+    assert_eq!(whole.decoded, text.len(), "every decoded byte counted");
 }

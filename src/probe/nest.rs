@@ -57,6 +57,8 @@ pub struct Nest<'a> {
     pub inner: Cow<'a, [u8]>,
     /// Where `inner` starts in the outer bytes, when every layer above it is stored.
     pub outer_at: Option<usize>,
+    /// bytes decoded across every layer, kept or not
+    pub decoded: usize,
 }
 
 /// How a layer's file inside is reached.
@@ -185,7 +187,7 @@ pub fn unwrap_for<'a>(data: &'a [u8], want: &dyn Fn(&str) -> bool, max_decoded: 
             Cow::Owned(v)
         }
     };
-    Nest { layers, inner, outer_at }
+    Nest { layers, inner, outer_at, decoded: max_decoded - budget }
 }
 
 /// At most [`crate::archive::MAX_NAME_BYTES`], cut on a character.
