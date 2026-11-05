@@ -23,6 +23,14 @@ pub const UPDATE: &str = "update media_release indexed by media_release_title
    and (tvdb_id is not ?4 or tvmaze_id is not ?5 or trakt_id is not ?6 or tmdb_id is not ?7
         or (imdb_from_nfo = 0 and imdb_id is not ?8) or tvrage_id is not ?9)";
 
+/// The releases of the chunk named by an AlloCiné id, read again into the word index: it finds them by the title the
+/// id decoded to (`word_index::known_as`), which a title with no ids changes no row here for its triggers to see.
+pub const REINDEX: &str = "insert into word_queue (release_id)
+ select m.release_id from media_release m indexed by media_release_title join releases r on r.id = m.release_id
+  where m.title_key = ?1 and m.release_id > ?2 and m.release_id <= ?3
+    and (r.name glob 'AC[0-9][0-9][0-9][0-9]*' or r.display_name glob 'AC[0-9][0-9][0-9][0-9]*')
+ on conflict (release_id) do update set n = n + 1";
+
 /// One chunk: where it reached, and how many rows it looked at.
 fn chunk(conn: &Connection, key: i64, after: i64, ids: &Ids) -> rusqlite::Result<(i64, i64)> {
     let (top, count): (Option<i64>, i64) = conn.query_row(
@@ -34,6 +42,7 @@ fn chunk(conn: &Connection, key: i64, after: i64, ids: &Ids) -> rusqlite::Result
     let Some(top) = top else { return Ok((after, 0)) };
     conn.prepare_cached(UPDATE)?
         .execute(params![key, after, top, ids.tvdb, ids.tvmaze, ids.trakt, ids.tmdb, ids.imdb, ids.tvrage])?;
+    conn.prepare_cached(REINDEX)?.execute(params![key, after, top])?;
     Ok((top, count))
 }
 

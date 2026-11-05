@@ -971,10 +971,14 @@ fn a_film_number_is_not_read_as_a_series() {
 }
 
 #[test]
-fn a_title_decoded_with_no_ids_is_queued_for_the_word_index() {
+fn a_title_decoded_with_no_ids_queues_its_releases_for_the_word_index() {
     let mut h = fresh();
-    let name = "AC317772.2026.MULTi.VFF.AD.2160p.HDR.DV.WEB.EAC3.5.1.Atmos.H265-FRQC";
-    h.save(&[complete(name)]);
+    // two releases of the film: one is looked up, the other waits on its title and then on the miss
+    let names = [
+        "AC317772.2026.MULTi.VFF.AD.2160p.HDR.DV.WEB.EAC3.5.1.Atmos.H265-FRQC",
+        "AC317772.2026.MULTi.VFF.1080p.WEB.H264-FRQC",
+    ];
+    h.save(&names.map(complete));
     let page = r#"<html><head><title>Matchbox: The Movie - film 2026 - AlloCiné</title>
         <script type="application/ld+json">{"@context":"http://schema.org","@type":"Movie","name":"Matchbox: The Movie"}</script>
         </head></html>"#;
@@ -983,24 +987,27 @@ fn a_title_decoded_with_no_ids_is_queued_for_the_word_index() {
         route("/film/fichefilm_gen_cfilm=317772.html", page.into()),
         route("/search/movie", r#"{"page":1,"results":[],"total_results":0}"#.into()),
     ]);
-    let id = h.id_of(name);
-    let queued = |h: &Harness| -> i64 {
+    let ids = names.map(|n| h.id_of(n));
+    let queued = |h: &Harness, id: i64| -> i64 {
         h.shard()
             .query_row("select coalesce(sum(n), 0) from word_queue where release_id = ?", [id], |r| r.get(0))
             .unwrap()
     };
-    let saved = queued(&h);
+    let saved = ids.map(|id| queued(&h, id));
     // the title is decoded, and TMDB doesn't know it
-    start(&mut h, allocine_on(with_tmdb(no_providers(), &s), &s));
-    wait_for("the lookup", || done(&h, name) & LOOKUP != 0);
-    let media = media_store::open(&media_store::path_for(&h.main)).unwrap();
-    let k = row(&h, name).unwrap().key;
-    let cached = media_store::get(&media, k).unwrap().unwrap();
-    assert_eq!(cached.title, "Matchbox: The Movie");
-    assert_eq!(row(&h, name).unwrap().tmdb, None);
-    // once for its category, once for its media row, and once for the decoded title the word index can now add:
-    // with no ids found, nothing else writes to the release again
-    assert_eq!(queued(&h), saved + 3);
+    let (media, db) = start(&mut h, allocine_on(with_tmdb(no_providers(), &s), &s));
+    let _fan = fan_out(&media, &db);
+    wait_for("a lookup", || names.iter().any(|n| done(&h, n) & LOOKUP != 0));
+    let store = media_store::open(&media_store::path_for(&h.main)).unwrap();
+    let k = row(&h, names[0]).unwrap().key;
+    assert_eq!(row(&h, names[1]).unwrap().key, k);
+    assert_eq!(media_store::get(&store, k).unwrap().unwrap().title, "Matchbox: The Movie");
+    assert_eq!(row(&h, names[0]).unwrap().tmdb, None);
+    // each once for its category and once for its media row, and again for the decoded title the word index can
+    // now add, though no ids came for the triggers to see
+    for (id, saved) in ids.into_iter().zip(saved) {
+        wait_for("the release queued for its title", || queued(&h, id) > saved + 2);
+    }
 }
 
 #[test]

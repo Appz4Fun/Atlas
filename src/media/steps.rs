@@ -321,7 +321,9 @@ impl Step for MediaLookup {
             Resolved::NotFound => {
                 // nothing asked a title with IDs in the cache, soo these are from a row deleted by hand: a wrong match
                 let conn = ctx.conn();
-                if stale_ids(conn, key).map_err(|e| StepError::Retry(e.to_string()))? {
+                // and a title decoded from an AlloCiné id: its other releases are found by it too, once fan-out
+                // queues them for the word index
+                if decoded.is_some() || stale_ids(conn, key).map_err(|e| StepError::Retry(e.to_string()))? {
                     self.0.fan_out_again(key).map_err(StepError::Retry)?;
                 }
                 Ok(Outcome { writes: reindex().into_iter().collect(), ..Outcome::default() })
