@@ -301,7 +301,7 @@ fn finish_with_override(
     if source == SOURCE_NZB {
         for name in nzb::release_names(rows.iter().map(|r| r.name.as_str())) {
             writes.push(StepWrite::new(archive_store::MARK_POINTED, vec![name.clone().into(), id.into()]));
-            writes.push(StepWrite::new(archive_store::RANK_POINTED, vec![name.into(), id.into()]));
+            writes.push(StepWrite::new(archive_store::RANK_POINTED.as_str(), vec![name.into(), id.into()]));
         }
     }
     let name_source = if source == SOURCE_PAR2 { NAME_SOURCE_PAR2 } else { NAME_SOURCE_INNER };

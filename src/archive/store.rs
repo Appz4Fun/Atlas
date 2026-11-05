@@ -293,9 +293,15 @@ pub const NZB_POINTED: ShardTable = ShardTable {
 /// `?1` a release name, `?2` the release whose NZB names it
 pub const MARK_POINTED: &str =
     "insert or ignore into nzb_pointed (release_id) select id from releases where name = ?1 and id != ?2";
-/// and its rank now, for one the net lane already waits on: a visit works it out again from `nzb_pointed`
-pub const RANK_POINTED: &str = "update pp_state set net_rank = max(coalesce(net_rank, 0), 2)
-    where net_wanted = 1 and release_id in (select id from releases where name = ?1 and id != ?2)";
+/// and its rank worked out now, after `MARK_POINTED`, for one the net lane already waits on: 2 at least, or what its
+/// size and category give when that's more, ranked or not yet. A visit works it out the same way
+pub static RANK_POINTED: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!(
+        "update pp_state set net_rank = {}
+         where net_wanted = 1 and release_id in (select id from releases where name = ?1 and id != ?2)",
+        crate::postprocess::schema::NET_RANK.replace("?1", "pp_state.release_id")
+    )
+});
 
 pub const DELETE_SOURCE: &str = "delete from archive_inner_files where release_id = ?1 and source = ?2";
 pub const INSERT_FILE: &str =
