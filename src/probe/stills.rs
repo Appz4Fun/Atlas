@@ -326,7 +326,9 @@ struct Share {
 type Fetch<'f> = dyn FnMut(&FileInfo, i64) -> Result<Option<(u64, Vec<u8>)>, StepError> + 'f;
 
 struct FileBytes<'a> {
-    volumes: Vec<&'a FileInfo>,
+    /// by volume number from the first: a volume missing from the post leaves its slot empty, soo the ones after
+    /// it keep their place in the file
+    volumes: Vec<Option<&'a FileInfo>>,
     stored: bool,
     shares: Vec<Option<Share>>,
     /// the stored file's name, from the first volume: a later one must hold the same file
@@ -338,7 +340,7 @@ struct FileBytes<'a> {
 }
 
 impl<'a> FileBytes<'a> {
-    fn new(volumes: Vec<&'a FileInfo>, stored: bool) -> Self {
+    fn new(volumes: Vec<Option<&'a FileInfo>>, stored: bool) -> Self {
         let n = volumes.len();
         FileBytes {
             volumes,
@@ -355,7 +357,8 @@ impl<'a> FileBytes<'a> {
         if let Some(got) = self.parts.get(&(v, part)) {
             return Ok(Some(got.clone()));
         }
-        let Some(got) = fetch(self.volumes[v], part)? else { return Ok(None) };
+        let Some(file) = self.volumes[v] else { return Ok(None) };
+        let Some(got) = fetch(file, part)? else { return Ok(None) };
         if part == 1 {
             if got.0 != 0 {
                 return Ok(None);
@@ -460,6 +463,50 @@ impl<'a> FileBytes<'a> {
     }
 }
 
+/// A RAR volume's number, from 0 for the first: `.part01.rar` is 0 (or whatever number the set starts at, taken
+/// off by the caller), `.rar` is 0 and `.r00` 1, on through `.s00` (101) and later letters.
+fn volume_number(name: &str) -> Option<u32> {
+    let lower = name.to_ascii_lowercase();
+    if let Some(rest) = lower.strip_suffix(".rar") {
+        let digits = rest
+            .rsplit_once(".part")
+            .map(|(_, d)| d)
+            .filter(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()));
+        return match digits {
+            Some(d) => d.parse().ok(),
+            None => Some(0),
+        };
+    }
+    let ext = lower.rsplit_once('.')?.1.as_bytes();
+    match ext {
+        [letter @ b'r'..=b'z', d1, d2] if d1.is_ascii_digit() && d2.is_ascii_digit() => {
+            Some(1 + u32::from(letter - b'r') * 100 + u32::from(d1 - b'0') * 10 + u32::from(d2 - b'0'))
+        }
+        _ => None,
+    }
+}
+
+/// The volumes of a set in slots by their number from the first, a missing one leaving its slot empty. None when a
+/// name doesn't say its number, or two say the same.
+fn volume_slots<'a>(first: &str, volumes: Vec<&'a FileInfo>) -> Option<Vec<Option<&'a FileInfo>>> {
+    let start = volume_number(first)?;
+    let mut slots: Vec<Option<&FileInfo>> = Vec::new();
+    for v in volumes {
+        let slot = usize::try_from(volume_number(&v.filename)?.checked_sub(start)?).ok()?;
+        if slot >= 10_000 {
+            return None;
+        }
+        if slots.len() <= slot {
+            slots.resize(slot + 1, None);
+        }
+        if slots[slot].replace(v).is_some() {
+            return None;
+        }
+    }
+    slots.first().copied().flatten()?;
+    Some(slots)
+}
+
 /// A video track, and the keyframes for the stills as (position, frame, time in ms).
 type Frames = (VideoTrack, Vec<(u8, Vec<u8>, i64)>);
 
@@ -471,7 +518,11 @@ const BOX_HEAD: u64 = 16;
 
 /// The keyframes of an MP4 for the stills, as (position, frame, time in ms), and its video track. The `moov` is
 /// read where the top-level boxes say it is, at the front or after the media, then each keyframe's bytes.
-fn mp4_frames(fetch: &mut Fetch<'_>, volumes: Vec<&FileInfo>, stored: bool) -> Result<Option<Frames>, StepError> {
+fn mp4_frames(
+    fetch: &mut Fetch<'_>,
+    volumes: Vec<Option<&FileInfo>>,
+    stored: bool,
+) -> Result<Option<Frames>, StepError> {
     let mut bytes = FileBytes::new(volumes, stored);
     let Some(mut peek) = bytes.range(fetch, 0, BOX_HEAD)? else { return Ok(None) };
     let mut base = 0;
@@ -665,10 +716,14 @@ impl Step for StillsStep {
             mkv_frames(ctx, &files, first)?
         } else {
             let stored = info.archive.is_some();
-            let volumes = if stored { moviehash::volumes(&first.filename, &files) } else { vec![first] };
-            if volumes.is_empty() {
-                return Ok(Outcome::default());
-            }
+            let volumes = if stored {
+                match volume_slots(&first.filename, moviehash::volumes(&first.filename, &files)) {
+                    Some(slots) => slots,
+                    None => return Ok(Outcome::default()),
+                }
+            } else {
+                vec![Some(first)]
+            };
             mp4_frames(&mut |file: &FileInfo, part: i64| read(ctx, file, part), volumes, stored)?
         };
         let Some((track, frames)) = found else { return Ok(Outcome::default()) };
@@ -850,7 +905,11 @@ mod tests {
             let (_, parts) = files.iter().find(|(file, _)| file.id == f.id).unwrap();
             Ok(parts.iter().find(|(p, ..)| *p == part).map(|(_, begin, body)| (*begin, body.clone())))
         };
-        let volumes: Vec<&FileInfo> = files.iter().map(|(f, _)| f).collect();
+        let volumes: Vec<Option<&FileInfo>> = if stored {
+            volume_slots(&files[0].0.filename, files.iter().map(|(f, _)| f).collect()).unwrap()
+        } else {
+            files.iter().map(|(f, _)| Some(f)).collect()
+        };
         let (track, frames) = mp4_frames(&mut fetch, volumes, stored).unwrap().unwrap();
         let stills = frames
             .iter()
@@ -956,5 +1015,55 @@ mod tests {
             .collect::<rusqlite::Result<_>>()
             .unwrap();
         assert_eq!(done, [0, 0, mask(STILLS_STEP) as i64, mask(STILLS_STEP) as i64]);
+    }
+
+    #[test]
+    fn volumes_keep_their_place_by_number() {
+        assert_eq!(volume_number("Film.part001.rar"), Some(1));
+        assert_eq!(volume_number("film.PART12.RAR"), Some(12));
+        assert_eq!(volume_number("film.rar"), Some(0));
+        assert_eq!(volume_number("film.r00"), Some(1));
+        assert_eq!(volume_number("film.s02"), Some(103));
+        assert_eq!(volume_number("film.mp4"), None);
+        let files: Vec<FileInfo> = [1, 2, 4].iter().map(|n| numbered(*n, &format!("x.part{n:02}.rar"), 10)).collect();
+        let slots = volume_slots("x.part01.rar", files.iter().collect()).unwrap();
+        assert_eq!(slots.iter().map(|s| s.map(|f| f.id)).collect::<Vec<_>>(), [Some(1), Some(2), None, Some(4)]);
+        // the first one missing, or two of one number: no slots to trust
+        assert!(volume_slots("x.part01.rar", files[1..].iter().collect()).is_none());
+        let twice = [numbered(1, "x.part01.rar", 1), numbered(2, "x.part1.rar", 1)];
+        assert!(volume_slots("x.part01.rar", twice.iter().collect()).is_none());
+    }
+
+    #[test]
+    fn a_volume_missing_from_the_post_doesnt_shift_the_ones_after_it() {
+        let (track, keyframe) = fixture_keyframe("hevc");
+        let share = keyframe.len() / 2 + 333;
+        let inner = mp4_file(&track, &keyframe, false);
+        let (_, size, head) = mp4::box_head(&inner[16..]).unwrap();
+        let moov_end = 16 + size.unwrap() as usize;
+        let video = mp4::video_track(&inner[16 + head..moov_end]).unwrap();
+        let wanted: Vec<(usize, usize)> = POSITIONS
+            .iter()
+            .map(|p| video.keyframe_at(*p).unwrap())
+            .map(|s| (s.offset as usize, (s.offset + u64::from(s.size)) as usize))
+            .chain([(0, moov_end)])
+            .collect();
+        let volumes = rar4_volumes(&inner, share);
+        // a volume none of the stills needs, after the second
+        let gone = (2..volumes.len())
+            .find(|i| wanted.iter().all(|(a, b)| *b <= i * share || *a >= (i + 1) * share))
+            .expect("a volume of filler");
+        assert!(wanted.iter().any(|(a, _)| *a >= (gone + 1) * share), "a still is after the gap");
+        let files: Vec<(FileInfo, Parts)> = volumes
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != gone)
+            .map(|(i, v)| {
+                let parts = posted(v, 1_500);
+                (numbered(i as i64 + 1, &format!("x.part{:03}.rar", i + 1), parts.len()), parts)
+            })
+            .collect();
+        let (stills, _) = mp4_stills(&files, true);
+        assert_eq!(stills.iter().map(|s| s.0).collect::<Vec<_>>(), [25, 50, 75]);
     }
 }
