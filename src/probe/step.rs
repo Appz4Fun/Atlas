@@ -124,27 +124,57 @@ pub(crate) fn rerun_big_heads(conn: &rusqlite::Connection, now: i64) -> rusqlite
 /// Asks for the probe again on AVI files it found no tracks in, before `avi` read them: posted bare, split into
 /// `.avi.001` and on, or stored in an archive. Once, from the stage's seed.
 pub(crate) fn rerun_avi(conn: &rusqlite::Connection, now: i64) -> rusqlite::Result<usize> {
-    rerun_probes(
-        conn,
-        "json_extract(info, '$.media') is null
-         and (lower(json_extract(info, '$.file')) like '%.avi' or lower(json_extract(info, '$.file')) like '%.avi.0%'
-              or lower(json_extract(info, '$.archive.name')) like '%.avi')",
-        now,
-    )
+    rerun_unread(conn, &["avi"], now)
 }
 
-/// A saved probe with no media of an AVI, from before `avi` read them, or of a set's later volume, from before
-/// `first_of_set`: probed again rather than reused, as when the shards were made again and the seed's reruns found
-/// nothing to ask for.
+/// The same for WMV and ASF files, before `asf` read them.
+pub(crate) fn rerun_asf(conn: &rusqlite::Connection, now: i64) -> rusqlite::Result<usize> {
+    rerun_unread(conn, &["wmv", "asf"], now)
+}
+
+/// Extensions of the files a probe reads tracks from since it first ran: a saved probe of one with no media is
+/// from before.
+const NEWLY_READ: &[&str] = &["avi", "wmv", "asf"];
+
+/// Whether `name` ends in `.ext`, or is a split piece of one: `.ext.001` and on.
+fn named(name: &str, ext: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.strip_suffix(ext).is_some_and(|s| s.ends_with('.')) || lower.contains(&format!(".{ext}.0"))
+}
+
+/// Asks for the probe again where it found no media in a file with one of these extensions: the file itself, or the
+/// first one of the archive it read.
+fn rerun_unread(conn: &rusqlite::Connection, exts: &[&str], now: i64) -> rusqlite::Result<usize> {
+    let ids: Vec<i64> = conn
+        .prepare(
+            "select release_id, json_extract(info, '$.file'), json_extract(info, '$.archive.name') from release_probe
+             where json_extract(info, '$.media') is null",
+        )?
+        .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, Option<String>>(2)?)))?
+        .filter_map(|row| match row {
+            Ok((id, file, inner)) => [file, inner]
+                .iter()
+                .flatten()
+                .any(|n| exts.iter().any(|e| named(n, e)))
+                .then_some(Ok(id)),
+            Err(e) => Some(Err(e)),
+        })
+        .collect::<rusqlite::Result<_>>()?;
+    for id in &ids {
+        crate::postprocess::rerun_on(conn, *id, mask(PROBE_STEP), now)?;
+    }
+    Ok(ids.len())
+}
+
+/// A saved probe with no media of a file in `NEWLY_READ`, from before its reader, or of a set's later volume, from
+/// before `first_of_set`: probed again rather than reused, as when the shards were made again and the seed's reruns
+/// found nothing to ask for.
 fn stale_saved(info: &str) -> bool {
     let Ok(p) = serde_json::from_str::<serde_json::Value>(info) else { return false };
-    let avi = |name: Option<&str>| {
-        let lower = name.unwrap_or_default().to_ascii_lowercase();
-        lower.ends_with(".avi") || lower.contains(".avi.0")
-    };
+    let newly_read = |name: Option<&str>| name.is_some_and(|n| NEWLY_READ.iter().any(|e| named(n, e)));
     p["media"].is_null()
-        && (avi(p["file"].as_str())
-            || avi(p["archive"]["name"].as_str())
+        && (newly_read(p["file"].as_str())
+            || newly_read(p["archive"]["name"].as_str())
             || p["file"].as_str().is_some_and(later_volume))
 }
 
@@ -682,6 +712,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(rerun_later_volumes(&conn, 100).unwrap(), 1, "the 7z's second volume, not the mkv");
+        conn.execute("insert into releases (id, name, group_name) values (10, '10', 'g')", []).unwrap();
+        conn.execute("insert into pp_state (release_id, done) values (10, ?)", [mask(PROBE_STEP)]).unwrap();
+        conn.execute("insert into release_probe (release_id, info) values (10, '{\"file\":\"Clip.wmv\"}')", [])
+            .unwrap();
+        assert_eq!(rerun_asf(&conn, 100).unwrap(), 1);
         let state = |id: i64| -> (i64, i64) {
             conn.query_row("select done, rerun_mask from pp_state where release_id = ?", [id], |r| {
                 Ok((r.get(0)?, r.get(1)?))
@@ -692,7 +727,7 @@ mod tests {
         assert_eq!(state(2), (mask(PROBE_STEP), 0), "read");
         assert_eq!(state(3), (mask(PROBE_STEP), 0), "missing");
         let queued: i64 = conn.query_row("select count(*) from pp_queue", [], |r| r.get(0)).unwrap();
-        assert_eq!(queued, 5);
+        assert_eq!(queued, 6);
         assert_eq!(state(7), (mask(PROBE_STEP), 0), "read already");
     }
 
@@ -701,6 +736,8 @@ mod tests {
         assert!(stale_saved(r#"{"file":"Show.S01E01.XviD.avi","media":null}"#));
         assert!(stale_saved(r#"{"file":"a.part01.rar","archive":{"name":"Movie.CD1.AVI"},"media":null}"#));
         assert!(stale_saved(r#"{"file":"Movie.avi.001"}"#));
+        assert!(stale_saved(r#"{"file":"Clip.WMV","media":null}"#));
+        assert!(!stale_saved(r#"{"file":"Clip.navi","media":null}"#), "not an avi");
         assert!(!stale_saved(r#"{"file":"Movie.avi","media":{"container":"avi"}}"#), "read");
         assert!(!stale_saved(r#"{"file":"Movie.mkv","media":null}"#));
     }

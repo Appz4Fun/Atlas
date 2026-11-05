@@ -2,6 +2,7 @@
 //! integrity checks, the NNTP headers XOVER leaves out, what the first bytes of the file are, and its NFO and SFV.
 
 pub mod archive;
+pub mod asf;
 pub mod avi;
 pub mod codec;
 pub mod lzma;
