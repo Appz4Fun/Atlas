@@ -221,15 +221,22 @@ fn with_nzb(
     outcome: Outcome,
     inside: Option<(Listing, Option<String>)>,
     wrapper_encrypted: bool,
+    has_inner_nzb: bool,
+    pw_available: bool,
     limits: &ArchiveConfig,
 ) -> Result<Outcome, StepError> {
-    let Some((inside, nzb_pw)) = inside else { return Ok(outcome) };
+    let rel = ctx.release();
+    let content_id = crate::raw_store::release_content_id(ctx.conn(), rel.id).unwrap_or_default();
+    let Some((inside, nzb_pw)) = inside else {
+        if has_inner_nzb && (!wrapper_encrypted || pw_available) {
+            crate::raw_store::put_nested_nzb_password(&rel.name, &rel.group, &content_id, "");
+        }
+        return Ok(outcome);
+    };
     if outcome.junk.is_some() {
         return Ok(outcome);
     }
     let mut nested = finish(ctx, SOURCE_NZB, inside, limits)?;
-    let rel = ctx.release();
-    let content_id = crate::raw_store::release_content_id(ctx.conn(), rel.id).unwrap_or_default();
     if let Some(pw) = nzb_pw {
         crate::raw_store::put_nested_nzb_password(&rel.name, &rel.group, &content_id, &pw);
         add_pointed_password_writes(ctx, &mut nested.writes, &pw, !wrapper_encrypted);
@@ -576,6 +583,7 @@ fn restore_archive(
         damaged: saved.listing_damaged,
         need_more_tail: false,
     };
+    let has_inner_nzb = listing.files.iter().any(|f| select::classify(&f.name) == Kind::Nzb);
     let inner_nzb_pw = listing
         .files
         .iter()
@@ -584,17 +592,25 @@ fn restore_archive(
     let mut outcome =
         finish_with_override(ctx, source, listing, password_override, Some(saved.content_fp), false, limits)?;
     let posted_files = ctx.files().unwrap_or_default();
-    if encrypted
-        && let Some(wrapper_pw) = known_or_post_password(ctx, &posted_files, wrapper_check.as_ref())
-    {
+    let wrapper_pw = encrypted
+        .then(|| known_or_post_password(ctx, &posted_files, wrapper_check.as_ref()))
+        .flatten();
+    if let Some(ref pw) = wrapper_pw {
         outcome.writes.push(StepWrite::new(
             archive_store::SET_NFO_PASSWORD,
-            vec![ctx.release().id.into(), wrapper_pw.into()],
+            vec![ctx.release().id.into(), pw.clone().into()],
         ));
     }
     let rel = ctx.release();
     let nested = crate::raw_store::get_archive_files(&rel.name, &rel.group, content_id, SOURCE_NZB);
     if nested.is_empty() {
+        if require_password_inspected
+            && has_inner_nzb
+            && (!encrypted || wrapper_pw.is_some())
+            && !crate::raw_store::has_nested_nzb_password_record(&rel.name, &rel.group, content_id)
+        {
+            return Ok(None);
+        }
         return Ok(Some(outcome));
     }
     if require_password_inspected
@@ -988,6 +1004,8 @@ impl Step for ListStep {
                         }
                     }
                     let wrapper_encrypted = listing.encrypted;
+                    let has_inner_nzb = listing.files.iter().any(|f| select::classify(&f.name) == Kind::Nzb);
+                    let pw_available = pw_found.is_some();
                     let inside = deep_nzb(
                         ctx,
                         &files,
@@ -1005,16 +1023,18 @@ impl Step for ListStep {
                             vec![rel_id.into(), pw.into()],
                         ));
                     }
-                    return with_nzb(ctx, outcome, inside, wrapper_encrypted, &limits);
+                    return with_nzb(ctx, outcome, inside, wrapper_encrypted, has_inner_nzb, pw_available, &limits);
                 }
                 Format::Zip => {
                     let listing = zip_list(ctx, &head, &body, &mut left)?;
                     let wrapper_encrypted = listing.encrypted;
+                    let has_inner_nzb = listing.files.iter().any(|f| select::classify(&f.name) == Kind::Nzb);
                     let pw_found = if listing.encrypted {
                         harvest_password_from_bodies(ctx, &files, &mut left, listing.password_check.as_ref())?
                     } else {
                         None
                     };
+                    let pw_available = pw_found.is_some();
                     let inside = deep_nzb(
                         ctx,
                         &files,
@@ -1032,16 +1052,18 @@ impl Step for ListStep {
                             vec![rel_id.into(), pw.into()],
                         ));
                     }
-                    return with_nzb(ctx, outcome, inside, wrapper_encrypted, &limits);
+                    return with_nzb(ctx, outcome, inside, wrapper_encrypted, has_inner_nzb, pw_available, &limits);
                 }
                 Format::SevenZip => {
                     let listing = seven_list(ctx, &head, &seg, &body, &mut left)?;
                     let wrapper_encrypted = listing.encrypted;
+                    let has_inner_nzb = listing.files.iter().any(|f| select::classify(&f.name) == Kind::Nzb);
                     let pw_found = if listing.encrypted {
                         harvest_password_from_bodies(ctx, &files, &mut left, listing.password_check.as_ref())?
                     } else {
                         None
                     };
+                    let pw_available = pw_found.is_some();
                     let inside = deep_nzb(
                         ctx,
                         &files,
@@ -1059,7 +1081,7 @@ impl Step for ListStep {
                             vec![rel_id.into(), pw.into()],
                         ));
                     }
-                    return with_nzb(ctx, outcome, inside, wrapper_encrypted, &limits);
+                    return with_nzb(ctx, outcome, inside, wrapper_encrypted, has_inner_nzb, pw_available, &limits);
                 }
                 Format::Par2 => {
                     // a PAR2 under another name: without a list, it cant replace the rows of one that had

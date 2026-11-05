@@ -159,7 +159,14 @@ pub fn unwrap_for_with_password<'a>(
     let (mut lo, mut hi) = (0usize, data.len());
     let mut outer_at = Some(0usize);
     let mut budget = max_decoded;
-    while let Some(Opened { mut layer, view }) = open(&buf[lo..hi], want, password, budget) {
+    let mut rar4_cache = crate::archive::rar::Rar4KeyCache::default();
+    while let Some(Opened { mut layer, view }) = open(
+        &buf[lo..hi],
+        want,
+        if layers.len() >= MAX_DEPTH { None } else { password },
+        budget,
+        &mut rar4_cache,
+    ) {
         // a name comes from the poster's bytes: keep what a name needs
         layer.name = layer.name.map(|n| cap_name(&n));
         if layers.len() == MAX_DEPTH {
@@ -291,10 +298,16 @@ fn decode(codec: Codec, input: &[u8], limit: usize) -> (Vec<u8>, End) {
 }
 
 /// What `data` starts with, when it's an archive or a compressed stream.
-fn open(data: &[u8], want: &dyn Fn(&str) -> bool, password: Option<&str>, budget: usize) -> Option<Opened> {
+fn open(
+    data: &[u8],
+    want: &dyn Fn(&str) -> bool,
+    password: Option<&str>,
+    budget: usize,
+    rar4_cache: &mut crate::archive::rar::Rar4KeyCache,
+) -> Option<Opened> {
     let layer = |format: &str| Layer { format: format.into(), ..Layer::default() };
     if data.starts_with(b"Rar!\x1a\x07") || data.starts_with(b"PK\x03\x04") {
-        return Some(from_entries(data, want, password, budget));
+        return Some(from_entries(data, want, password, budget, rar4_cache));
     }
     if data.starts_with(b"7z\xbc\xaf\x27\x1c") {
         return Some(seven_z(data));
@@ -346,8 +359,14 @@ fn open(data: &[u8], want: &dyn Fn(&str) -> bool, password: Option<&str>, budget
 }
 
 /// RAR and zip: the biggest file whose bytes start in what was read, of those `want` names if any.
-fn from_entries(data: &[u8], want: &dyn Fn(&str) -> bool, password: Option<&str>, budget: usize) -> Opened {
-    let heads = archive::entries_with_password(data, password);
+fn from_entries(
+    data: &[u8],
+    want: &dyn Fn(&str) -> bool,
+    password: Option<&str>,
+    budget: usize,
+    rar4_cache: &mut crate::archive::rar::Rar4KeyCache,
+) -> Opened {
+    let heads = archive::entries_with_password_and_cache(data, password, rar4_cache);
     let format = if data.starts_with(b"PK") {
         "ZIP"
     } else if data.get(6) == Some(&1) {
@@ -379,7 +398,7 @@ fn from_entries(data: &[u8], want: &dyn Fn(&str) -> bool, password: Option<&str>
             return Opened { layer, view: View::Stop("encrypted") };
         };
         let to = end(head.packed);
-        return match decrypt_entry(data, at, to, head, format, pw, budget) {
+        return match decrypt_entry(data, at, to, head, format, pw, budget, rar4_cache) {
             Ok((out, capped)) => Opened { layer, view: View::Decrypted { from: at, out, capped } },
             Err(why) => Opened { layer, view: View::Stop(why) },
         };
@@ -433,6 +452,7 @@ fn from_entries(data: &[u8], want: &dyn Fn(&str) -> bool, password: Option<&str>
     Opened { layer, view }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn decrypt_entry(
     data: &[u8],
     at: usize,
@@ -441,6 +461,7 @@ fn decrypt_entry(
     format: &str,
     pw: &str,
     budget: usize,
+    rar4_cache: &mut crate::archive::rar::Rar4KeyCache,
 ) -> Result<(Vec<u8>, bool), &'static str> {
     let packed_slice = data.get(at..to).filter(|s| !s.is_empty()).ok_or("no file starts in what was read")?;
     let complete_packed = !head.continues && head.packed.is_some_and(|p| p <= packed_slice.len() as u64);
@@ -507,7 +528,7 @@ fn decrypt_entry(
         }
         "RAR4" => {
             let salt = head.rar4_salt.ok_or("encrypted")?;
-            let (key, iv) = crate::archive::rar::derive_rar4_key_iv(pw, &salt);
+            let (key, iv) = rar4_cache.derive(pw, &salt).ok_or("encrypted")?;
             let dec = crate::archive::aes::decrypt_cbc(&key, &iv, packed_slice).ok_or("encrypted")?;
             if method == "m0" {
                 finish_stored(dec)

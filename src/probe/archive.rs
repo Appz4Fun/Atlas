@@ -64,7 +64,8 @@ pub fn parse_with_password(data: &[u8], password: Option<&str>) -> Option<Archiv
     if data.starts_with(RAR5) {
         Some(first(rar5(data, 1, password), "RAR5"))
     } else if data.starts_with(RAR4) {
-        Some(first(rar4(data, 1, password), "RAR4"))
+        let mut cache = crate::archive::rar::Rar4KeyCache::default();
+        Some(first(rar4(data, 1, password, &mut cache), "RAR4"))
     } else if data.starts_with(SEVEN_Z) {
         Some(ArchiveHead { format: "7z".into(), ..ArchiveHead::default() })
     } else if data.starts_with(ZIP) {
@@ -81,10 +82,19 @@ pub fn entries(data: &[u8]) -> Vec<ArchiveHead> {
 }
 
 pub fn entries_with_password(data: &[u8], password: Option<&str>) -> Vec<ArchiveHead> {
+    let mut cache = crate::archive::rar::Rar4KeyCache::default();
+    entries_with_password_and_cache(data, password, &mut cache)
+}
+
+pub(crate) fn entries_with_password_and_cache(
+    data: &[u8],
+    password: Option<&str>,
+    rar4_cache: &mut crate::archive::rar::Rar4KeyCache,
+) -> Vec<ArchiveHead> {
     if data.starts_with(RAR5) {
         rar5(data, MAX_ENTRIES, password)
     } else if data.starts_with(RAR4) {
-        rar4(data, MAX_ENTRIES, password)
+        rar4(data, MAX_ENTRIES, password, rar4_cache)
     } else if data.starts_with(ZIP) {
         zip(data, MAX_ENTRIES)
     } else {
@@ -112,18 +122,22 @@ fn le32(b: &[u8], at: usize) -> Option<u32> {
     Some(u32::from_le_bytes(b.get(at..at + 4)?.try_into().ok()?))
 }
 
-fn rar4(data: &[u8], max: usize, password: Option<&str>) -> Vec<ArchiveHead> {
+fn rar4(
+    data: &[u8],
+    max: usize,
+    password: Option<&str>,
+    salt_cache: &mut crate::archive::rar::Rar4KeyCache,
+) -> Vec<ArchiveHead> {
     let mut out = Vec::new();
     let mut at = RAR4.len();
     let mut solid_archive = false;
     let mut files = 0;
     let mut encrypted_headers = false;
-    let mut salt_cache = crate::archive::rar::Rar4KeyCache::default();
     while out.len() < max {
         if encrypted_headers {
             let Some(pw) = password.filter(|pw| !pw.is_empty()) else { break };
             let Some((hdr_bytes, hdr, block_salt)) =
-                crate::archive::rar::decrypt_rar4_header(data, at, pw, &mut salt_cache)
+                crate::archive::rar::decrypt_rar4_header(data, at, pw, salt_cache)
             else {
                 break;
             };

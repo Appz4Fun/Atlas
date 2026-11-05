@@ -106,10 +106,22 @@ impl Step for NfoName {
             .conn()
             .query_row(
                 "select 1 from archive_release ar
-                 where ar.release_id = ?1 and ar.names_hidden = 1
-                   and not exists (
-                       select 1 from archive_inner_files f
-                       where f.release_id = ar.release_id and f.source in (1, 2, 3)
+                 where ar.release_id = ?1
+                   and (
+                       (ar.names_hidden = 1
+                        and not exists (
+                            select 1 from archive_inner_files f
+                            where f.release_id = ar.release_id and f.source in (1, 2, 3)
+                        ))
+                       or (ar.password = 1
+                           and exists (
+                               select 1 from archive_inner_files f
+                               where f.release_id = ar.release_id and f.source in (1, 2, 3) and lower(f.name) like '%.nzb'
+                           )
+                           and not exists (
+                               select 1 from archive_inner_files f
+                               where f.release_id = ar.release_id and f.source = 5
+                           ))
                    )",
                 [rel_id],
                 |_| Ok(true),

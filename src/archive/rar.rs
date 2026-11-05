@@ -739,11 +739,25 @@ pub(crate) fn derive_rar4_key_iv(password: &str, salt: &[u8; 8]) -> ([u8; 16], [
 const MAX_RAR4_KDF_DERIVATIONS: usize = 8;
 const MAX_RAR4_ENCRYPTED_HEADERS: usize = 4_096;
 
-/// Bounded salt-to-(key, iv) cache and per-archive header/KDF budget for RAR4 `-hp` headers.
+/// Bounded salt-to-(key, iv) cache and per-archive header/KDF budget for RAR4 `-hp` headers and entries.
 #[derive(Default)]
 pub(crate) struct Rar4KeyCache {
     entries: Vec<([u8; 8], [u8; 16], [u8; 16])>,
     headers: usize,
+}
+
+impl Rar4KeyCache {
+    pub(crate) fn derive(&mut self, password: &str, salt: &[u8; 8]) -> Option<([u8; 16], [u8; 16])> {
+        if let Some((_, k, i)) = self.entries.iter().find(|(s, _, _)| s == salt) {
+            return Some((*k, *i));
+        }
+        if self.entries.len() >= MAX_RAR4_KDF_DERIVATIONS {
+            return None;
+        }
+        let (k, i) = derive_rar4_key_iv(password, salt);
+        self.entries.push((*salt, k, i));
+        Some((k, i))
+    }
 }
 
 /// Decrypts one RAR4 `-hp` encrypted block header at `pos` (where the 8-byte salt sits).
@@ -758,16 +772,7 @@ pub(crate) fn decrypt_rar4_header(
     }
     cache.headers += 1;
     let salt: [u8; 8] = data.get(pos..pos.checked_add(8)?)?.try_into().ok()?;
-    let (key, iv) = if let Some((_, k, i)) = cache.entries.iter().find(|(s, _, _)| *s == salt) {
-        (*k, *i)
-    } else {
-        if cache.entries.len() >= MAX_RAR4_KDF_DERIVATIONS {
-            return None;
-        }
-        let (k, i) = derive_rar4_key_iv(password, &salt);
-        cache.entries.push((salt, k, i));
-        (k, i)
-    };
+    let (key, iv) = cache.derive(password, &salt)?;
     let (header, enc_len) = zipfast::crypto::decrypt_rar4_header(data, pos + 8, &key, &iv)?;
     Some((8 + enc_len, header, salt))
 }

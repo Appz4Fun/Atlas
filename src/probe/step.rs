@@ -227,11 +227,20 @@ pub(crate) fn rerun_encrypted_with_password(conn: &rusqlite::Connection, now: i6
         .prepare(
             "select ar.release_id from archive_release ar
              join release_nfo_password pw on pw.release_id = ar.release_id
-             where ar.names_hidden = 1
-               and not exists (
-                   select 1 from archive_inner_files f
-                   where f.release_id = ar.release_id and f.source in (1, 2, 3)
-               )",
+             where (ar.names_hidden = 1
+                    and not exists (
+                        select 1 from archive_inner_files f
+                        where f.release_id = ar.release_id and f.source in (1, 2, 3)
+                    ))
+                or (ar.password = 1
+                    and exists (
+                        select 1 from archive_inner_files f
+                        where f.release_id = ar.release_id and f.source in (1, 2, 3) and lower(f.name) like '%.nzb'
+                    )
+                    and not exists (
+                        select 1 from archive_inner_files f
+                        where f.release_id = ar.release_id and f.source = 5
+                    ))",
         )?
         .query_map([], |r| r.get(0))?
         .collect::<rusqlite::Result<_>>()?;
@@ -583,10 +592,22 @@ impl Step for ProbeStep {
                 .conn()
                 .query_row(
                     "select 1 from archive_release ar
-                     where ar.release_id = ?1 and ar.names_hidden = 1
-                       and not exists (
-                           select 1 from archive_inner_files f
-                           where f.release_id = ar.release_id and f.source in (1, 2, 3)
+                     where ar.release_id = ?1
+                       and (
+                           (ar.names_hidden = 1
+                            and not exists (
+                                select 1 from archive_inner_files f
+                                where f.release_id = ar.release_id and f.source in (1, 2, 3)
+                            ))
+                           or (ar.password = 1
+                               and exists (
+                                   select 1 from archive_inner_files f
+                                   where f.release_id = ar.release_id and f.source in (1, 2, 3) and lower(f.name) like '%.nzb'
+                               )
+                               and not exists (
+                                   select 1 from archive_inner_files f
+                                   where f.release_id = ar.release_id and f.source = 5
+                               ))
                        )",
                     [release_id],
                     |_| Ok(true),
