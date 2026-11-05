@@ -1685,7 +1685,9 @@ fn spot_fact(spot: &crate::spotnet::store::Tagged) -> String {
     if !by.is_empty() {
         let _ = write!(out, "<br>posted by {}", by.join(" "));
     }
-    if let Some(imdb) = spot.imdb_id.as_deref().filter(|id| id.starts_with("tt") && id[2..].bytes().all(|b| b.is_ascii_digit())) {
+    if let Some(imdb) =
+        spot.imdb_id.as_deref().filter(|id| id.starts_with("tt") && id[2..].bytes().all(|b| b.is_ascii_digit()))
+    {
         let _ = write!(out, "<br><a href=\"https://www.imdb.com/title/{imdb}/\" rel=\"noreferrer\">IMDb {imdb}</a>");
     }
     out
