@@ -21,6 +21,22 @@ pub const MAX_POST_ARTICLES: usize = 128;
 /// sets of files of one post read at most, looking for the next NZB
 const MAX_SETS: usize = 3;
 
+/// What a whole following may fetch and unpack: bytes, and articles, the latter scaled from
+/// `archive.max_bodies_per_release`, soo an operator who lowers that lowers this too.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Budget {
+    pub bytes: u64,
+    pub articles: usize,
+}
+
+impl Budget {
+    /// `MAX_POST_BYTES`, and 8 articles for each body an archive listing may read: 128 at its default 16
+    pub fn of(max_bodies_per_release: i64) -> Budget {
+        let articles = usize::try_from(max_bodies_per_release.max(1)).unwrap_or(1).saturating_mul(8);
+        Budget { bytes: MAX_POST_BYTES, articles: articles.min(MAX_POST_ARTICLES) }
+    }
+}
+
 /// A file to read whole: its name, and its articles' message-ids with brackets, in order.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Whole {
@@ -29,11 +45,19 @@ pub struct Whole {
 }
 
 impl Whole {
-    fn of(file: &NzbFile) -> Whole {
+    /// None: a file that may not or can't be read: posted to no group Atlas may fetch from (none named, or every one
+    /// blocked, `filters::group_blocked`), or with a segment that has no message-id.
+    fn of(file: &NzbFile) -> Option<Whole> {
+        if !file.groups.iter().any(|g| !crate::filters::group_blocked(g)) {
+            return None;
+        }
         let mut segments: Vec<_> = file.segments.iter().collect();
+        if segments.iter().any(|s| s.message_id.is_empty()) {
+            return None;
+        }
         segments.sort_by_key(|s| s.number);
         segments.dedup_by_key(|s| s.number);
-        Whole { name: file.name.clone(), ids: segments.iter().map(|s| format!("<{}>", s.message_id)).collect() }
+        Some(Whole { name: file.name.clone(), ids: segments.iter().map(|s| format!("<{}>", s.message_id)).collect() })
     }
 }
 
@@ -46,8 +70,8 @@ pub fn small(files: &[NzbFile]) -> bool {
 
 /// Every hop's files from the first NZB's bytes, the last hop's first, each after the names inside the archive it was
 /// found in. Stops at a post too big to read whole, one with no NZB in it, an article gone, `MAX_HOPS`, or when
-/// `left`, the bytes the whole following may fetch and unpack, runs out.
-pub fn follow(ctx: &mut StepCtx<'_>, first: Vec<u8>, left: &mut u64) -> Result<Vec<InnerFile>, StepError> {
+/// `left`, what the whole following may fetch and unpack, runs out.
+pub fn follow(ctx: &mut StepCtx<'_>, first: Vec<u8>, left: &mut Budget) -> Result<Vec<InnerFile>, StepError> {
     // each hop's rows: the names inside the archive its NZB came out of, then its files
     let mut hops: Vec<Vec<InnerFile>> = Vec::new();
     let mut inside: Vec<InnerFile> = Vec::new();
@@ -61,7 +85,7 @@ pub fn follow(ctx: &mut StepCtx<'_>, first: Vec<u8>, left: &mut u64) -> Result<V
         if !parsed.complete || !small(&parsed.files) {
             break;
         }
-        let wholes: Vec<Whole> = parsed.files.iter().map(Whole::of).collect();
+        let wholes: Vec<Whole> = parsed.files.iter().filter_map(Whole::of).collect();
         match nzb_inside(ctx, None, &wholes, Some(&mut inside), None, left)? {
             Some(next) => body = next,
             None => break,
@@ -84,7 +108,7 @@ pub fn nzb_inside(
     files: &[Whole],
     mut names: Option<&mut Vec<InnerFile>>,
     known: Option<(&str, &[u8])>,
-    left: &mut u64,
+    left: &mut Budget,
 ) -> Result<Option<Vec<u8>>, StepError> {
     for set in first.into_iter().chain(sets(files)) {
         let Some(raw) = download_set(ctx, &set, known, left)? else { continue };
@@ -107,10 +131,10 @@ pub fn nzb_inside(
             if unwrapped.layers.iter().any(|l| l.encrypted) {
                 break;
             }
-            if unwrapped.inner.len() as u64 > *left {
+            if unwrapped.inner.len() as u64 > left.bytes {
                 break;
             }
-            *left -= unwrapped.inner.len() as u64;
+            left.bytes -= unwrapped.inner.len() as u64;
             joined.extend_from_slice(&unwrapped.inner);
             // stored beside a bigger file, or in a solid stream with others: its start is in the bytes all the same
             found = found.or_else(|| nzb_start(piece).map(|at| piece[at..].to_vec()));
@@ -193,13 +217,14 @@ fn compressed(name: &str) -> bool {
         .any(|ext| lower.ends_with(ext))
 }
 
-/// Every file of a set, each its articles decoded and joined, within what's `left` of the bytes. None: an article is
-/// gone or refused, the bytes ran out, or a budget did, which ends the following without failing the step.
+/// Every file of a set, each its articles decoded and joined, within what's `left`. None: an article is gone or
+/// refused, or `left` ran out, which ends the following without failing the step. A server down, a run's budget or
+/// deadline spent, or a shutdown is the step's error: the chain is tried again, not cut short for good.
 fn download_set(
     ctx: &mut StepCtx<'_>,
     set: &Set,
     known: Option<(&str, &[u8])>,
-    left: &mut u64,
+    left: &mut Budget,
 ) -> Result<Option<Vec<Vec<u8>>>, StepError> {
     let mut files = Vec::with_capacity(set.files.len());
     for file in &set.files {
@@ -208,21 +233,27 @@ fn download_set(
             let body = match known.filter(|(known, _)| known == id) {
                 Some((_, body)) => body.to_vec(),
                 None => {
+                    if left.articles == 0 {
+                        return Ok(None);
+                    }
+                    left.articles -= 1;
                     let wanted =
                         [BodyRequest { message_id: id.clone(), file: file.name.clone(), max_bytes: Some(ARTICLE_CAP) }];
                     let got = match ctx.fetch_bodies(&wanted) {
                         Ok(mut got) => got.pop().map(|b| b.got),
-                        Err(StepError::Stopped) => return Err(StepError::Stopped),
+                        Err(e @ (StepError::Stopped | StepError::Transient(_) | StepError::OutOfBudget)) => {
+                            return Err(e);
+                        }
                         Err(_) => return Ok(None),
                     };
                     let Some(Got::Body(body)) = got else { return Ok(None) };
                     body
                 }
             };
-            if body.len() as u64 > *left {
+            if body.len() as u64 > left.bytes {
                 return Ok(None);
             }
-            *left -= body.len() as u64;
+            left.bytes -= body.len() as u64;
             whole.extend(body);
         }
         files.push(whole);
@@ -296,6 +327,7 @@ mod tests {
                 .collect(),
             articles: segments,
             total_bytes: segments as u64 * bytes,
+            groups: vec![],
         };
         assert!(small(&[file(26, 640_000), file(14, 640_000)]));
         assert!(!small(&[file(100, 700_000)]), "70 MB");
@@ -312,7 +344,14 @@ mod tests {
                 .collect(),
             articles: 3,
             total_bytes: 3,
+            groups: vec!["alt.binaries.test".into()],
         };
-        assert_eq!(Whole::of(&file).ids, ["<a>", "<b>"]);
+        assert_eq!(Whole::of(&file).unwrap().ids, ["<a>", "<b>"]);
+        let blocked = NzbFile { groups: vec!["alt.binaries.cp".into()], ..file.clone() };
+        assert!(crate::filters::group_blocked("alt.binaries.cp") == Whole::of(&blocked).is_none());
+        assert!(Whole::of(&NzbFile { groups: vec![], ..file.clone() }).is_none(), "no group named");
+        let nameless =
+            NzbFile { segments: vec![nzb::Segment { number: 1, bytes: 1, message_id: String::new() }], ..file };
+        assert!(Whole::of(&nameless).is_none(), "an id dropped as overlong");
     }
 }

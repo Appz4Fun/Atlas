@@ -132,6 +132,7 @@ fn deep_nzb(
     listing: &Listing,
     head_file: &FileInfo,
     known: Option<(&str, &[u8])>,
+    mut left: follow::Budget,
 ) -> Result<Option<Listing>, StepError> {
     if listing.encrypted || !listing.files.iter().any(|f| select::classify(&f.name) == Kind::Nzb) {
         return Ok(None);
@@ -153,7 +154,6 @@ fn deep_nzb(
         Kind::Rar(_) | Kind::SevenZip(_) | Kind::Zip(_) | Kind::Numbered(_) => None,
         _ => own_whole(ctx, head_file)?.map(|whole| follow::Set { files: vec![whole], headed_volumes: false }),
     };
-    let mut left = follow::MAX_POST_BYTES;
     let Some(found) = follow::nzb_inside(ctx, first, &wholes, None, known, &mut left)? else {
         return Ok(None);
     };
@@ -788,6 +788,7 @@ impl Step for ListStep {
                         &listing,
                         head.file,
                         (!head.probe).then_some((seg.message_id.as_str(), &body[..])),
+                        follow::Budget::of(limits.max_bodies_per_release),
                     )?
                     .or_else(|| nzb_stored_in(&listing, &body));
                     return with_nzb(ctx, finish(ctx, SOURCE_RAR, listing, &limits)?, inside, &limits);
@@ -800,6 +801,7 @@ impl Step for ListStep {
                         &listing,
                         head.file,
                         (!head.probe).then_some((seg.message_id.as_str(), &body[..])),
+                        follow::Budget::of(limits.max_bodies_per_release),
                     )?
                     .or_else(|| nzb_stored_in(&listing, &body));
                     return with_nzb(ctx, finish(ctx, SOURCE_ZIP, listing, &limits)?, inside, &limits);
@@ -812,6 +814,7 @@ impl Step for ListStep {
                         &listing,
                         head.file,
                         (!head.probe).then_some((seg.message_id.as_str(), &body[..])),
+                        follow::Budget::of(limits.max_bodies_per_release),
                     )?;
                     return with_nzb(ctx, finish(ctx, SOURCE_7Z, listing, &limits)?, inside, &limits);
                 }
@@ -853,7 +856,7 @@ impl Step for ListStep {
             let Some(body) = whole_file(ctx, file, &mut left)? else { continue };
             if identify(&body) == Format::Nzb {
                 let complete = nzb::parse(&body).complete;
-                let mut budget = follow::MAX_POST_BYTES;
+                let mut budget = follow::Budget::of(limits.max_bodies_per_release);
                 let files = follow::follow(ctx, body, &mut budget)?;
                 return finish(ctx, SOURCE_NZB, Listing { files, complete, ..Default::default() }, &limits);
             }

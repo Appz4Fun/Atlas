@@ -971,7 +971,9 @@ fn what_a_read_nzb_points_to_is_marked_and_ranked_up() {
 fn an_nzb_of(files: &[(&str, &[(u64, &str)])]) -> Vec<u8> {
     let mut out = String::from("<?xml version=\"1.0\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\">\n");
     for (subject, segments) in files {
-        out.push_str(&format!("<file poster=\"p\" date=\"1\" subject=\"{subject}\"><segments>"));
+        out.push_str(&format!(
+            "<file poster=\"p\" date=\"1\" subject=\"{subject}\"><groups><group>alt.binaries.test</group></groups><segments>"
+        ));
         for (i, (bytes, id)) in segments.iter().enumerate() {
             out.push_str(&format!("<segment bytes=\"{bytes}\" number=\"{}\">{id}</segment>", i + 1));
         }
