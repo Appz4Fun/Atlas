@@ -889,3 +889,49 @@ fn an_archive_restored_from_the_raw_store_leaves_a_posted_nzbs_list_out() {
     settled(&h, "x");
     assert!(rows(&h, "x").iter().all(|r| r.source == 5 || r.name != "Pointed.At.2016.2160p-GRP.part1.rar"));
 }
+
+#[test]
+fn an_nzb_stored_in_a_rar_lists_what_it_points_to_beside_the_rar() {
+    let mut h = fresh();
+    let nzb = an_nzb(POINTED_AT);
+    // the whole archive in one article; its NZB cut short, as a first article of many would have it
+    let cut = &nzb[..nzb.len() * 2 / 3];
+    let rar = rar4(&[r4_main(0), r4_file(0, b"Pointed.At-{{s3cret}}.nzb", cut)]);
+    let s = shape("x").one("x.rar", &rar);
+    let state = serve(&mut h, &s, config());
+    settled(&h, "x");
+    assert_eq!(bodies(&state), 1);
+    let found: Vec<(String, i64)> = rows(&h, "x").into_iter().map(|r| (r.name, r.source)).collect();
+    assert_eq!(
+        found,
+        [("Pointed.At-{{s3cret}}.nzb".to_string(), 2), ("Pointed.At.2016.2160p-GRP.part1.rar".to_string(), 5)]
+    );
+    assert_eq!(pass(&h, "x"), Some(Password::No));
+}
+
+#[test]
+fn an_encrypted_nzb_in_a_rar_lists_nothing_beside_it() {
+    let mut h = fresh();
+    let rar = rar4(&[r4_main(0), r4_file(0x0004, b"Pointed.At.nzb", &an_nzb(POINTED_AT)), r4_end()]);
+    let s = shape("x").one("x.rar", &rar);
+    serve(&mut h, &s, config());
+    settled(&h, "x");
+    assert!(rows(&h, "x").iter().all(|r| r.source != 5), "{:?}", rows(&h, "x"));
+}
+
+#[test]
+fn an_nzb_in_a_rar_comes_back_with_the_rar_from_the_raw_store() {
+    let mut h = fresh();
+    let rar = rar4(&[r4_main(0), r4_file(0, b"Pointed.At.nzb", &an_nzb(POINTED_AT)), r4_end()]);
+    let s = shape("x").one("x.rar", &rar);
+    let state = serve(&mut h, &s, config());
+    settled(&h, "x");
+    let before = rows(&h, "x");
+    assert_eq!(before.iter().map(|r| r.source).collect::<Vec<_>>(), [2, 5]);
+    let id = h.id_of("x");
+    h.shard().execute("delete from archive_inner_files where release_id = ?", [id]).unwrap();
+    h.shard().execute("delete from pp_state where release_id = ?", [id]).unwrap();
+    h.shard().execute("insert into pp_queue (release_id, due_at) values (?, 0)", [id]).unwrap();
+    wait_for("both lists back", || rows(&h, "x") == before);
+    assert_eq!(bodies(&state), 1);
+}

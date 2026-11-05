@@ -1259,6 +1259,12 @@ pub fn password_hint_with(conn: &Connection, id: i64, names: Option<&Names>) -> 
             return hint(password, "the subject");
         }
     }
+    // a name inside: an archive holding `Name-{{secret}}.nzb`, the password for what that NZB points to
+    for row in crate::archive::store::view_with(conn, id).files {
+        if let Some(password) = find_password(&row.name) {
+            return hint(password, "a file inside");
+        }
+    }
     // the harvester's other spellings: `{{pass}}`, `[pw: x]`, `pass=x`, in the names and every subject
     let texts = names
         .into_iter()
@@ -1284,6 +1290,23 @@ pub fn harvested_password(text: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_password_in_a_name_inside_is_a_hint() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "attach ':memory:' as s0;
+             create table s0.files (id INTEGER PRIMARY KEY, release_id INTEGER, filename TEXT, subject TEXT);
+             create table s0.archive_inner_files (release_id INTEGER, seq INTEGER, name TEXT, size INTEGER,
+                 source INTEGER, primary key (release_id, seq));
+             insert into s0.files values (1, 8, 'Some.Post.rar', 'Some.Post.rar (01/26)');
+             insert into s0.archive_inner_files values (8, 131072, 'Some.Post-{{s3cret}}.nzb', 1, 2);",
+        )
+        .unwrap();
+        let hint = password_hint_with(&conn, 8, None).unwrap();
+        assert_eq!((hint.password.as_str(), hint.source), ("s3cret", "a file inside"));
+        assert!(password_hint_with(&conn, 16, None).is_none());
+    }
 
     #[test]
     fn a_split_post_is_looked_up_by_name_not_poster() {
