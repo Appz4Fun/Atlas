@@ -1245,6 +1245,11 @@ fn seed_shard(conn: &Connection, enabled: StepMask, stamps: &[(u8, StepMask, i64
         crate::probe::step::rerun_mp4_tail(conn, now)?;
         set("pp_probe_mp4_tail", now)?;
     }
+    // once, for the DVD-Video discs and folders probed before their title sets were read
+    if meta("pp_probe_dvd")?.is_none() {
+        crate::probe::step::rerun_dvd(conn, now)?;
+        set("pp_probe_dvd", now)?;
+    }
     // once, for the probes that read a set's later volume before its first was looked for
     if meta("pp_probe_first_volume")?.is_none() {
         crate::probe::step::rerun_later_volumes(conn, now)?;

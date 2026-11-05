@@ -149,9 +149,15 @@ pub(crate) fn rerun_mpeg_ps(conn: &rusqlite::Connection, now: i64) -> rusqlite::
     rerun_unread(conn, &["mpg", "mpeg", "vob"], now)
 }
 
+/// The same for DVD-Video discs and folders, before `dvd` read their title sets: an ISO or IMG image, or a
+/// `VIDEO_TS` folder whose first file is an IFO or BUP.
+pub(crate) fn rerun_dvd(conn: &rusqlite::Connection, now: i64) -> rusqlite::Result<usize> {
+    rerun_unread(conn, &["iso", "img", "ifo", "bup"], now)
+}
+
 /// Extensions of the files a probe reads tracks from since it first ran: a saved probe of one with no media is
 /// from before.
-const NEWLY_READ: &[&str] = &["avi", "wmv", "asf", "mpg", "mpeg", "vob"];
+const NEWLY_READ: &[&str] = &["avi", "wmv", "asf", "mpg", "mpeg", "vob", "iso", "img", "ifo", "bup"];
 
 /// Whether `name` ends in `.ext`, or is a split piece of one: `.ext.001` and on.
 fn named(name: &str, ext: &str) -> bool {
@@ -792,6 +798,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(rerun_mpeg_ps(&conn, 100).unwrap(), 1);
+        conn.execute("insert into releases (id, name, group_name) values (13, '13', 'g')", []).unwrap();
+        conn.execute("insert into pp_state (release_id, done) values (13, ?)", [mask(PROBE_STEP)]).unwrap();
+        conn.execute(
+            "insert into release_probe (release_id, info) values (13, '{\"archive\":{\"name\":\"VIDEO_TS.BUP\"}}')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(rerun_dvd(&conn, 100).unwrap(), 1);
         let state = |id: i64| -> (i64, i64) {
             conn.query_row("select done, rerun_mask from pp_state where release_id = ?", [id], |r| {
                 Ok((r.get(0)?, r.get(1)?))
@@ -802,7 +816,7 @@ mod tests {
         assert_eq!(state(2), (mask(PROBE_STEP), 0), "read");
         assert_eq!(state(3), (mask(PROBE_STEP), 0), "missing");
         let queued: i64 = conn.query_row("select count(*) from pp_queue", [], |r| r.get(0)).unwrap();
-        assert_eq!(queued, 8);
+        assert_eq!(queued, 9);
         assert_eq!(state(7), (mask(PROBE_STEP), 0), "read already");
     }
 
