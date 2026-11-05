@@ -9,15 +9,19 @@ use anyhow::{Result, anyhow};
 
 use crate::config::SpotsConfig;
 use crate::indexer::{Db, on_db};
-use crate::nntp::{NntpError, Pool};
+use crate::nntp::{Pool, says_absent};
 
 use super::store::{self, SAVED, SKIPPED, SpotRow};
 use super::{MAX_XML_BYTES, SPOT_GROUP, binary, full, header, release};
 
 /// Overview lines asked for in one XOVER.
 const XOVER_STEP: u64 = 5_000;
-/// The largest article of a spot's NZB read: they are a few hundred KB.
-const MAX_NZB_ARTICLE: usize = 16 * 1024 * 1024;
+/// The largest article of a spot's NZB read, as it comes off the wire: they are a few hundred KB.
+const MAX_NZB_ARTICLE: usize = 4 * 1024 * 1024;
+/// A spot's NZB articles read at most, and their bytes together. A real spot names one or two; past these the
+/// spot is no real one, and nothing more is read.
+const MAX_NZB_ARTICLES: usize = 16;
+const MAX_NZB_POSTED: usize = 16 * 1024 * 1024;
 
 /// What one pass did, for the log.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -121,7 +125,7 @@ async fn fetch(pool: &Pool, db: &Db, message_id: &str) -> Result<Option<i64>> {
     let head = match pool.fetch_head(&format!("<{message_id}>"), MAX_XML_BYTES * 4).await {
         Ok(Some(head)) => head,
         Ok(None) => return Ok(None),
-        Err(e) if gone(&e) => return Ok(None),
+        Err(e) if says_absent(&e) => return Ok(None),
         Err(e) => return Err(e.into()),
     };
     let Some(spot) = full::xml_from_headers(&head).as_deref().and_then(full::parse) else { return Ok(None) };
@@ -129,12 +133,17 @@ async fn fetch(pool: &Pool, db: &Db, message_id: &str) -> Result<Option<i64>> {
     if spot.nzb.is_empty() {
         return Ok(None);
     }
-    let mut bodies = Vec::with_capacity(spot.nzb.len());
+    // an id named twice is no real spot's, and would be read twice
+    if !nzb_ids_usable(&spot.nzb) {
+        return Ok(None);
+    }
+    let mut bodies: Vec<Vec<u8>> = Vec::with_capacity(spot.nzb.len());
     for segment in &spot.nzb {
-        match pool.fetch_body(&format!("<{segment}>")).await {
-            Ok(body) if body.len() <= MAX_NZB_ARTICLE => bodies.push(body),
-            Ok(_) => return Ok(None),
-            Err(e) if gone(&e) => return Ok(None),
+        let left = MAX_NZB_POSTED.saturating_sub(bodies.iter().map(Vec::len).sum::<usize>());
+        match pool.fetch_body_capped(&format!("<{segment}>"), MAX_NZB_ARTICLE.min(left)).await {
+            Ok(Some(body)) => bodies.push(body),
+            Ok(None) => return Ok(None),
+            Err(e) if says_absent(&e) => return Ok(None),
             Err(e) => return Err(e.into()),
         }
     }
@@ -188,9 +197,10 @@ async fn on_shard<T: Send + 'static>(
     value.ok_or_else(|| anyhow!("spots: the writer gave no answer"))
 }
 
-/// The server says the article isn't there: 430 that isn't a failed forward, or 423.
-fn gone(e: &NntpError) -> bool {
-    matches!(e.code(), Some(423 | 430)) && !e.failed_forwarding()
+/// Whether a spot's NZB articles can be read: at most `MAX_NZB_ARTICLES` of them, each named once.
+fn nzb_ids_usable(ids: &[String]) -> bool {
+    let mut seen = std::collections::HashSet::new();
+    ids.len() <= MAX_NZB_ARTICLES && ids.iter().all(|id| seen.insert(id.as_str()))
 }
 
 #[cfg(test)]
@@ -211,11 +221,12 @@ mod tests {
     }
 
     #[test]
-    fn what_counts_as_gone() {
-        let reply = |code, message: &str| NntpError::Reply { code, message: message.into() };
-        assert!(gone(&reply(430, "No Such Article")));
-        assert!(gone(&reply(423, "no such article number")));
-        assert!(!gone(&reply(430, "Failed forwarding")));
-        assert!(!gone(&reply(400, "busy")));
+    fn nzb_ids_are_few_and_named_once() {
+        let ids = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(nzb_ids_usable(&ids(&["a@spot.net", "b@spot.net"])));
+        assert!(!nzb_ids_usable(&ids(&["a@spot.net", "a@spot.net"])));
+        let many: Vec<String> = (0..=MAX_NZB_ARTICLES).map(|n| format!("{n}@spot.net")).collect();
+        assert!(!nzb_ids_usable(&many));
+        assert!(nzb_ids_usable(&many[..MAX_NZB_ARTICLES]));
     }
 }

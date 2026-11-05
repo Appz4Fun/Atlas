@@ -8,16 +8,21 @@ use crate::parser::{Article, Release, is_complete, parse_subject};
 
 use super::full::FullSpot;
 
-/// Segments read out of one spot's NZB at most: about 1.4 TB of 700 KB articles.
-pub const MAX_SEGMENTS: usize = 2_000_000;
+/// Segments read out of one spot's NZB at most: about 200 GB of 700 KB articles. Each becomes an article in
+/// memory until the release is saved, so this bounds what one spot can take.
+pub const MAX_SEGMENTS: usize = 300_000;
 
-/// The release a spot's NZB is, or None when the NZB is cut, damaged, lists no group, or lost segments past
-/// `MAX_SEGMENTS`.
+/// The release a spot's NZB is, or None when the NZB is cut, damaged or left files out, lost segments past
+/// `MAX_SEGMENTS`, or has a file posted only to blocked groups (`filters::group_blocked`), or to none.
 pub fn release_of(spot: &FullSpot, nzb: &Parsed) -> Option<Release> {
-    if !nzb.complete || nzb.damaged || nzb.files.is_empty() {
+    if !nzb.complete || nzb.damaged || nzb.left_out > 0 || nzb.files.is_empty() {
         return None;
     }
-    let group = nzb.files.iter().find_map(|f| f.groups.first())?.clone();
+    // every file in a group that may be saved, the release under the first file's first one
+    if !nzb.files.iter().all(|f| allowed(f).is_some()) {
+        return None;
+    }
+    let group = allowed(&nzb.files[0])?.clone();
     let title = clean_title(&spot.title)?;
     let file_total = i64::try_from(nzb.files.len()).ok()?;
     let mut articles = Vec::new();
@@ -84,6 +89,11 @@ pub fn nzb_key(nzb: &Parsed) -> String {
         hash.update(b"\n");
     }
     hash.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// A group of `file`'s that may be saved, the first one.
+fn allowed(file: &crate::archive::nzb::NzbFile) -> Option<&String> {
+    file.groups.iter().find(|g| !crate::filters::group_blocked(g))
 }
 
 /// The title as a release name: one line, no control characters, at most 255 characters.
@@ -175,6 +185,24 @@ mod tests {
         assert!(release_of(&spot(), &parse_keeping(NZB.as_bytes(), 1)).is_none());
         let no_group = NZB.replace("<group>alt.binaries.example</group>", "");
         assert!(release_of(&spot(), &parse_keeping(no_group.as_bytes(), MAX_SEGMENTS)).is_none());
+        let left_out = Parsed { left_out: 1, ..parse_keeping(NZB.as_bytes(), MAX_SEGMENTS) };
+        assert!(release_of(&spot(), &left_out).is_none());
+        // a file posted only to a blocked group can't ride in under the first file's group
+        let blocked = NZB
+            .replacen("<group>alt.binaries.example</group>", "<group>alt.binaries.14yo</group>", 2)
+            .replacen("<group>alt.binaries.14yo</group>", "<group>alt.binaries.example</group>", 1);
+        assert!(crate::filters::group_blocked("alt.binaries.14yo"));
+        assert!(release_of(&spot(), &parse_keeping(blocked.as_bytes(), MAX_SEGMENTS)).is_none());
+        // one allowed group among blocked ones is enough, and names the release
+        let mixed = NZB.replacen(
+            "<group>alt.binaries.example</group>",
+            "<group>alt.binaries.14yo</group><group>alt.binaries.example</group>",
+            1,
+        );
+        assert_eq!(
+            release_of(&spot(), &parse_keeping(mixed.as_bytes(), MAX_SEGMENTS)).unwrap().group,
+            "alt.binaries.example"
+        );
         let untitled = FullSpot { title: "\t ".into(), ..spot() };
         assert!(release_of(&untitled, &parse_keeping(NZB.as_bytes(), MAX_SEGMENTS)).is_none());
     }
