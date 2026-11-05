@@ -14,8 +14,7 @@ const MAX_ITEMS: usize = 999;
 /// Whether `data` is a Blu-ray's: a playlist or index in it, or a disc image naming `BDMV`.
 pub fn is_bluray(data: &[u8]) -> bool {
     playlists(data).next().is_some()
-        || find(data, b"INDX0200").is_some()
-        || find(data, b"INDX0300").is_some()
+        || [b"INDX0100", b"INDX0200", b"INDX0240", b"INDX0300"].iter().any(|v| find(data, *v).is_some())
         || (find(data, b"BDMV").is_some() && (data.get(0x8001..0x8006) == Some(b"CD001") || udf(data)))
 }
 
@@ -299,6 +298,9 @@ pub(crate) mod tests {
         let info = super::super::media::parse(&iso).unwrap();
         assert_eq!(info.container, "bluray");
         assert!(!info.header_complete);
+        for index in [b"INDX0100", b"INDX0240"] {
+            assert!(is_bluray(&[b"Rar!\x1a\x07\x00 BDMV/index.bdmv ".as_slice(), index].concat()));
+        }
         let data = mpls(2, 60);
         for cut in 0..data.len() {
             let _ = bluray(&data[..cut]);
