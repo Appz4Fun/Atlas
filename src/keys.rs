@@ -1058,7 +1058,7 @@ mod tests {
             .unwrap();
         }
         for (_, index) in crate::archive::store::PAR2_FILES.indexes {
-            conn.execute_batch(&index.replace(" on par2_files(", " on par2_files(").replacen("exists ", "exists s0.", 1))
+            conn.execute_batch(&index.replacen("exists ", "exists s0.", 1))
                 .unwrap();
         }
         let lookup = Lookup { keys: Keys::default(), par2_sets: Vec::new(), moviehash: None, files: vec![file] };
