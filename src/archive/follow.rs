@@ -447,6 +447,7 @@ mod tests {
             articles: segments,
             total_bytes: segments as u64 * bytes,
             groups: vec![],
+            ..NzbFile::default()
         };
         assert!(small(&[file(26, 640_000), file(14, 640_000)]));
         assert!(!small(&[file(100, 700_000)]), "70 MB");
@@ -464,6 +465,7 @@ mod tests {
             articles: 3,
             total_bytes: 3,
             groups: vec!["alt.binaries.test".into()],
+            ..NzbFile::default()
         };
         assert_eq!(Whole::of(&file).unwrap().ids, ["<a@x>", "<b@x>"]);
         let blocked = NzbFile { groups: vec!["alt.binaries.cp".into()], ..file.clone() };

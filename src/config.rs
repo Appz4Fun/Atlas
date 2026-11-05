@@ -156,6 +156,7 @@ pub struct Config {
     pub archive: ArchiveConfig,
     pub naming: NamingConfig,
     pub predb: PredbConfig,
+    pub spots: SpotsConfig,
     pub category: CategoryConfig,
     pub media: MediaConfig,
     pub metrics: MetricsConfig,
@@ -514,6 +515,44 @@ impl PredbConfig {
     }
 }
 
+/// The `spots` object of config.toml: Spotnet spots of movies and TV, read from `free.pt` (`spotnet::ingest`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SpotsConfig {
+    pub enabled: bool,
+    pub poll_minutes: u32,
+    /// how far back the first pass reads, in `free.pt` articles (about 340 a day)
+    pub first_articles: u64,
+    /// spots fetched whole in one pass at most; the rest wait for the next
+    pub per_pass: usize,
+}
+
+impl Default for SpotsConfig {
+    fn default() -> Self {
+        SpotsConfig { enabled: true, poll_minutes: 15, first_articles: 20_000, per_pass: 200 }
+    }
+}
+
+impl SpotsConfig {
+    fn from_value(v: Option<&Value>) -> SpotsConfig {
+        let mut c = SpotsConfig::default();
+        let Some(v) = v else { return c };
+        if let Some(b) = v.get("enabled").and_then(as_bool) {
+            c.enabled = b;
+        }
+        let int = |key: &str, min: i64, max: i64| v.get(key).and_then(as_int).map(|n| n.clamp(min, max));
+        if let Some(n) = int("poll_minutes", 1, 1_440) {
+            c.poll_minutes = n as u32;
+        }
+        if let Some(n) = int("first_articles", 0, 10_000_000) {
+            c.first_articles = n as u64;
+        }
+        if let Some(n) = int("per_pass", 1, 10_000) {
+            c.per_pass = n as usize;
+        }
+        c
+    }
+}
+
 /// The `sealed_log` object of config.toml, see the README. Off unless it has an address.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SealedLogConfig {
@@ -802,6 +841,7 @@ impl Default for Config {
             metrics: MetricsConfig::default(),
             sealed_log: SealedLogConfig::default(),
             predb: PredbConfig::default(),
+            spots: SpotsConfig::default(),
             category: CategoryConfig::default(),
             media: MediaConfig::default(),
             freeze: FreezeConfig::default(),
@@ -992,6 +1032,7 @@ impl Config {
             metrics: MetricsConfig::from_value(v.get("metrics")),
             sealed_log: SealedLogConfig::from_value(v.get("sealed_log")),
             predb: PredbConfig::from_value(v.get("predb")),
+            spots: SpotsConfig::from_value(v.get("spots")),
             category: CategoryConfig::from_value(v.get("category")),
             media: MediaConfig::from_value(v.get("media")),
             freeze: FreezeConfig::from_value(v.get("freeze")),
@@ -1504,6 +1545,17 @@ mod tests {
         );
         let example = parse_config(Path::new("config.toml"), include_str!("../config.example.toml")).unwrap();
         assert_eq!(Config::from_value(&example).category, CategoryConfig::default());
+    }
+
+    #[test]
+    fn spots_keys_parse() {
+        assert_eq!(Config::from_value(&json!({})).spots, SpotsConfig::default());
+        let c = Config::from_value(
+            &json!({"spots": {"enabled": false, "poll_minutes": 0, "first_articles": 500, "per_pass": 20}}),
+        )
+        .spots;
+        assert_eq!(c, SpotsConfig { enabled: false, poll_minutes: 1, first_articles: 500, per_pass: 20 });
+        assert_eq!(Config::from_value(&json!({"spots": "no"})).spots, SpotsConfig::default());
     }
 
     #[test]
