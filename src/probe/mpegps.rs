@@ -1,0 +1,359 @@
+//! Tracks from the start of an MPEG program stream: `.mpg`, `.mpeg`, and a DVD's `.vob`. Unlike the other formats
+//! it has no header listing its streams, soo the packs at the front are walked and each stream is named from its
+//! first payload: an MPEG video sequence header, an MPEG audio frame, or in private stream 1 a DVD substream (AC-3,
+//! DTS, LPCM, subpictures). A total function like the rest of `media`: cut off bytes give what was read before them.
+
+use super::media::{AudioTrack, MediaInfo, SubtitleTrack, VideoTrack, is_full};
+
+/// The most bytes walked: a few MB of packs hold every stream of a DVD or a capture.
+const MAX_WALK: usize = 8 << 20;
+
+pub fn is_mpeg_ps(data: &[u8]) -> bool {
+    // a pack header, MPEG-2 (`01` after it) or MPEG-1 (`0010`)
+    data.len() >= 14 && data[..4] == [0, 0, 1, 0xBA] && (data[4] & 0xC0 == 0x40 || data[4] & 0xF0 == 0x20)
+}
+
+pub fn mpeg_ps(data: &[u8]) -> MediaInfo {
+    let mut info = MediaInfo { container: "mpeg-ps".into(), ..MediaInfo::default() };
+    let data = &data[..data.len().min(MAX_WALK)];
+    // stream ids seen, with the private stream 1 substream: one track each
+    let mut seen: Vec<(u8, u8)> = Vec::new();
+    let mut at = 0usize;
+    while at + 4 <= data.len() {
+        if data[at..at + 3] != [0, 0, 1] {
+            // lost: on to the next start code
+            match data[at + 1..].windows(3).position(|w| w == [0, 0, 1]) {
+                Some(n) => at += 1 + n,
+                None => break,
+            }
+            continue;
+        }
+        let id = data[at + 3];
+        match id {
+            0xBA => {
+                at += if data.get(at + 4).is_some_and(|b| b & 0xC0 == 0x40) {
+                    // MPEG-2: 14 bytes and the stuffing the last says
+                    14 + usize::from(data.get(at + 13).map_or(0, |b| b & 7))
+                } else {
+                    12
+                };
+            }
+            0xB9 => break,
+            0xBB..=0xFF => {
+                let Some(len) = data.get(at + 4..at + 6).map(|l| usize::from(u16::from_be_bytes([l[0], l[1]]))) else {
+                    break;
+                };
+                let end = (at + 6 + len).min(data.len());
+                if matches!(id, 0xBD | 0xC0..=0xEF)
+                    && let Some(payload) = pes_payload(&data[at + 6..end])
+                {
+                    stream(id, payload, &mut seen, &mut info);
+                }
+                at += 6 + len;
+            }
+            _ => at += 4,
+        }
+        if is_full(&info) {
+            break;
+        }
+    }
+    info.header_complete = !info.video.is_empty();
+    info
+}
+
+/// A PES packet's payload, past its header: MPEG-2's, or MPEG-1's stuffing, buffer size and time stamps.
+fn pes_payload(b: &[u8]) -> Option<&[u8]> {
+    if b.first()? & 0xC0 == 0x80 {
+        return b.get(3 + usize::from(*b.get(2)?)..);
+    }
+    let mut at = b.iter().position(|x| *x != 0xFF)?;
+    if b.get(at)? & 0xC0 == 0x40 {
+        at += 2;
+    }
+    let skip = match b.get(at)? >> 4 {
+        0x2 => 5,
+        0x3 => 10,
+        _ => 1,
+    };
+    b.get(at + skip..)
+}
+
+fn stream(id: u8, payload: &[u8], seen: &mut Vec<(u8, u8)>, info: &mut MediaInfo) {
+    let sub = if id == 0xBD { *payload.first().unwrap_or(&0) } else { 0 };
+    if seen.contains(&(id, sub)) {
+        // a stream named from a packet without its header yet gets the header from a later one
+        if let (0xE0..=0xEF, Some(v)) = (id, info.video.last_mut())
+            && v.width.is_none()
+        {
+            video(payload, v);
+        }
+        return;
+    }
+    match id {
+        0xE0..=0xEF => {
+            let mut v = VideoTrack { codec: "mpeg2video".into(), ..VideoTrack::default() };
+            video(payload, &mut v);
+            info.video.push(v);
+        }
+        0xC0..=0xDF => {
+            let mut a = AudioTrack { codec: "mp2".into(), ..AudioTrack::default() };
+            mpeg_audio(payload, &mut a);
+            info.audio.push(a);
+        }
+        _ => match sub {
+            0x20..=0x3F => {
+                info.subtitles.push(SubtitleTrack { codec: "dvd_subtitle".into(), ..SubtitleTrack::default() })
+            }
+            0x80..=0x87 => info.audio.push(ac3(payload.get(4..).unwrap_or_default())),
+            0x88..=0x8F => info.audio.push(dts(payload.get(4..).unwrap_or_default())),
+            0xA0..=0xA7 => info.audio.push(lpcm(payload)),
+            _ => return,
+        },
+    }
+    seen.push((id, sub));
+}
+
+/// From an MPEG-1/2 sequence header: size, aspect and frame rate; MPEG-2 when a sequence extension follows.
+fn video(payload: &[u8], v: &mut VideoTrack) {
+    let Some(at) = payload.windows(4).position(|w| w == [0, 0, 1, 0xB3]) else {
+        if payload.windows(4).any(|w| w == [0, 0, 1, 0x09] || w == [0, 0, 1, 0x67]) {
+            v.codec = "h264".into();
+        }
+        return;
+    };
+    let Some(h) = payload.get(at + 4..at + 8) else { return };
+    let width = (u64::from(h[0]) << 4) | u64::from(h[1] >> 4);
+    let height = (u64::from(h[1] & 0x0F) << 8) | u64::from(h[2]);
+    v.width = (width > 0).then_some(width);
+    v.height = (height > 0).then_some(height);
+    v.frame_rate = match h[3] & 0x0F {
+        1 => Some(24000.0 / 1001.0),
+        2 => Some(24.0),
+        3 => Some(25.0),
+        4 => Some(30000.0 / 1001.0),
+        5 => Some(30.0),
+        6 => Some(50.0),
+        7 => Some(60000.0 / 1001.0),
+        8 => Some(60.0),
+        _ => None,
+    };
+    // the display aspect, as a display size of the same height
+    let aspect = match h[3] >> 4 {
+        2 => Some(4.0 / 3.0),
+        3 => Some(16.0 / 9.0),
+        4 => Some(2.21),
+        _ => None,
+    };
+    if let Some(a) = aspect
+        && height > 0
+    {
+        v.display_width = Some((height as f64 * a).round() as u64);
+        v.display_height = Some(height);
+    }
+    // a sequence extension (id 1) right after says MPEG-2
+    let rest = payload.get(at + 8..).unwrap_or_default();
+    let mpeg2 = rest.windows(5).take(256).any(|w| w[..4] == [0, 0, 1, 0xB5] && w[4] >> 4 == 1);
+    v.codec = if mpeg2 { "mpeg2video" } else { "mpeg1video" }.into();
+}
+
+/// An MPEG audio frame header: layer, rate, mono or not.
+fn mpeg_audio(payload: &[u8], a: &mut AudioTrack) {
+    let Some(at) = payload.windows(2).position(|w| w[0] == 0xFF && w[1] & 0xE0 == 0xE0) else { return };
+    let Some(h) = payload.get(at..at + 4) else { return };
+    let version = (h[1] >> 3) & 3;
+    let layer = (h[1] >> 1) & 3;
+    a.codec = match layer {
+        1 => "mp3",
+        2 => "mp2",
+        3 => "mp1",
+        _ => "mp2",
+    }
+    .into();
+    let rates: [f64; 3] = match version {
+        3 => [44100.0, 48000.0, 32000.0],
+        2 => [22050.0, 24000.0, 16000.0],
+        0 => [11025.0, 12000.0, 8000.0],
+        _ => return,
+    };
+    a.sample_rate = rates.get(usize::from((h[2] >> 2) & 3)).copied();
+    a.channels = Some(if h[3] >> 6 == 3 { 1 } else { 2 });
+}
+
+/// An AC-3 sync frame: rate, and channels from acmod and the LFE flag.
+fn ac3(b: &[u8]) -> AudioTrack {
+    let mut a = AudioTrack { codec: "ac3".into(), ..AudioTrack::default() };
+    let Some(at) = b.windows(2).position(|w| w == [0x0B, 0x77]) else { return a };
+    let Some(f) = b.get(at..at + 8) else { return a };
+    a.sample_rate = [48000.0, 44100.0, 32000.0].get(usize::from(f[4] >> 6)).copied();
+    if (f[5] >> 3) > 10 {
+        a.codec = "eac3".into();
+        return a;
+    }
+    let mut bits = Bits { b: &f[6..], at: 0 };
+    let acmod = bits.take(3);
+    if acmod & 1 != 0 && acmod != 1 {
+        bits.take(2);
+    }
+    if acmod & 4 != 0 {
+        bits.take(2);
+    }
+    if acmod == 2 {
+        bits.take(2);
+    }
+    let lfe = bits.take(1);
+    a.channels = Some(u64::from([2u32, 1, 2, 3, 3, 4, 4, 5][acmod as usize] + lfe));
+    a
+}
+
+/// A DTS core frame: rate, and channels from the arrangement and the LFE field.
+fn dts(b: &[u8]) -> AudioTrack {
+    let mut a = AudioTrack { codec: "dts".into(), ..AudioTrack::default() };
+    let Some(at) = b.windows(4).position(|w| w == [0x7F, 0xFE, 0x80, 0x01]) else { return a };
+    let Some(f) = b.get(at + 4..at + 12) else { return a };
+    let mut bits = Bits { b: f, at: 0 };
+    // frame type 1, deficit 5, crc 1, blocks 7, frame size 14
+    bits.take(28);
+    let amode = bits.take(6);
+    let sfreq = bits.take(4);
+    // rate 5, five flags, extension id 3, extension 1, predictor history 1, then lfe 2
+    bits.take(15);
+    let lfe = bits.take(2);
+    a.sample_rate = match sfreq {
+        1 => Some(8000.0),
+        2 => Some(16000.0),
+        3 => Some(32000.0),
+        6 => Some(11025.0),
+        7 => Some(22050.0),
+        8 => Some(44100.0),
+        11 => Some(12000.0),
+        12 => Some(24000.0),
+        13 => Some(48000.0),
+        _ => None,
+    };
+    let channels = match amode {
+        0 => Some(1),
+        1..=4 => Some(2),
+        5 | 6 => Some(3),
+        7 | 8 => Some(4),
+        9 => Some(5),
+        10..=12 => Some(6),
+        _ => None,
+    };
+    a.channels = channels.map(|c: u64| c + u64::from(lfe != 0));
+    a
+}
+
+/// A DVD LPCM substream header: rate and channels.
+fn lpcm(b: &[u8]) -> AudioTrack {
+    let mut a = AudioTrack { codec: "pcm".into(), ..AudioTrack::default() };
+    if let Some(h) = b.get(5) {
+        a.sample_rate = Some(if (h >> 4) & 3 == 1 { 96000.0 } else { 48000.0 });
+        a.channels = Some(u64::from(h & 7) + 1);
+    }
+    a
+}
+
+/// Big-endian bits, zeros past the end.
+struct Bits<'a> {
+    b: &'a [u8],
+    at: usize,
+}
+
+impl Bits<'_> {
+    fn take(&mut self, n: usize) -> u32 {
+        let mut v = 0;
+        for _ in 0..n {
+            let bit = self.b.get(self.at / 8).map_or(0, |byte| (byte >> (7 - self.at % 8)) & 1);
+            v = (v << 1) | u32::from(bit);
+            self.at += 1;
+        }
+        v
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pack() -> Vec<u8> {
+        // an MPEG-2 pack header, no stuffing
+        vec![0, 0, 1, 0xBA, 0x44, 0, 4, 0, 4, 1, 0x01, 0x89, 0xC3, 0xF8]
+    }
+
+    fn pes(id: u8, payload: &[u8]) -> Vec<u8> {
+        let mut out = vec![0, 0, 1, id];
+        out.extend(((payload.len() + 3) as u16).to_be_bytes());
+        out.extend([0x81, 0x00, 0x00]);
+        out.extend(payload);
+        out
+    }
+
+    /// A PAL DVD's VOB: 720x576 16:9 MPEG-2 at 25 fps, 5.1 AC-3, stereo DTS, 2 channel LPCM, MPEG-1 layer 2 and a
+    /// subpicture stream.
+    fn vob() -> Vec<u8> {
+        let mut seq = vec![0, 0, 1, 0xB3, 0x2D, 0x02, 0x40, 0x33, 0xFF, 0xFF, 0xE0, 0x18];
+        seq.extend([0, 0, 1, 0xB5, 0x14, 0x8A, 0, 1, 0, 0]);
+        // AC-3: 48 kHz, bsid 8, acmod 7 (3/2), lfe on
+        let ac3 = [0x80, 1, 0, 1, 0x0B, 0x77, 0, 0, 0x04, 0x40, 0xE1, 0x10];
+        // DTS: amode 2 (stereo), 48 kHz, no lfe
+        let dts = [0x88, 1, 0, 1, 0x7F, 0xFE, 0x80, 0x01, 0xFC, 0x3C, 0x90, 0x00, 0xB4, 0x00, 0x00, 0x00];
+        let lpcm = [0xA0, 1, 0, 1, 0x00, 0x01, 0x80];
+        let mp2 = [0xFF, 0xFD, 0x84, 0x04];
+        let sub = [0x20, 0, 0];
+        let mut out = pack();
+        for p in [pes(0xE0, &seq), pes(0xBD, &ac3), pes(0xBD, &dts), pes(0xBD, &lpcm), pes(0xC0, &mp2), pes(0xBD, &sub)]
+        {
+            out.extend(p);
+            out.extend(pack());
+        }
+        // the same streams again add nothing
+        out.extend(pes(0xBD, &ac3));
+        out.extend(pes(0xE0, &[0u8; 32]));
+        out
+    }
+
+    #[test]
+    fn a_vobs_packs_name_its_streams() {
+        let data = vob();
+        assert!(is_mpeg_ps(&data));
+        let info = super::super::media::parse(&data).unwrap();
+        assert_eq!(info.container, "mpeg-ps");
+        assert!(info.header_complete);
+        let v = &info.video[0];
+        assert_eq!(
+            (v.codec.as_str(), v.width, v.height, v.frame_rate),
+            ("mpeg2video", Some(720), Some(576), Some(25.0))
+        );
+        assert_eq!((v.display_width, v.display_height), (Some(1024), Some(576)), "16:9");
+        let audio: Vec<(&str, Option<u64>, Option<f64>)> =
+            info.audio.iter().map(|a| (a.codec.as_str(), a.channels, a.sample_rate)).collect();
+        assert_eq!(
+            audio,
+            [
+                ("ac3", Some(6), Some(48000.0)),
+                ("dts", Some(2), Some(48000.0)),
+                ("pcm", Some(2), Some(48000.0)),
+                ("mp2", Some(2), Some(48000.0)),
+            ]
+        );
+        assert_eq!(info.subtitles.len(), 1);
+        assert_eq!(info.subtitles[0].codec, "dvd_subtitle");
+    }
+
+    #[test]
+    fn cut_or_hostile_packs_are_safe() {
+        let data = vob();
+        for cut in 0..data.len() {
+            let _ = mpeg_ps(&data[..cut]);
+        }
+        // packets with every substream id keep media's few tracks
+        let mut many = pack();
+        for _ in 0..1000 {
+            for sub in 0x20u8..0x40 {
+                many.extend(pes(0xBD, &[sub, 0, 0]));
+            }
+        }
+        assert!(mpeg_ps(&many).subtitles.len() <= super::super::media::MAX_TRACKS);
+        assert!(!is_mpeg_ps(b"\0\0\x01\xba"));
+    }
+}

@@ -132,9 +132,14 @@ pub(crate) fn rerun_asf(conn: &rusqlite::Connection, now: i64) -> rusqlite::Resu
     rerun_unread(conn, &["wmv", "asf"], now)
 }
 
+/// The same for MPEG program streams, before `mpegps` read them.
+pub(crate) fn rerun_mpeg_ps(conn: &rusqlite::Connection, now: i64) -> rusqlite::Result<usize> {
+    rerun_unread(conn, &["mpg", "mpeg", "vob"], now)
+}
+
 /// Extensions of the files a probe reads tracks from since it first ran: a saved probe of one with no media is
 /// from before.
-const NEWLY_READ: &[&str] = &["avi", "wmv", "asf"];
+const NEWLY_READ: &[&str] = &["avi", "wmv", "asf", "mpg", "mpeg", "vob"];
 
 /// Whether `name` ends in `.ext`, or is a split piece of one: `.ext.001` and on.
 fn named(name: &str, ext: &str) -> bool {
@@ -717,6 +722,14 @@ mod tests {
         conn.execute("insert into release_probe (release_id, info) values (10, '{\"file\":\"Clip.wmv\"}')", [])
             .unwrap();
         assert_eq!(rerun_asf(&conn, 100).unwrap(), 1);
+        conn.execute("insert into releases (id, name, group_name) values (11, '11', 'g')", []).unwrap();
+        conn.execute("insert into pp_state (release_id, done) values (11, ?)", [mask(PROBE_STEP)]).unwrap();
+        conn.execute(
+            "insert into release_probe (release_id, info) values (11, '{\"archive\":{\"name\":\"VTS_01_1.VOB\"}}')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(rerun_mpeg_ps(&conn, 100).unwrap(), 1);
         let state = |id: i64| -> (i64, i64) {
             conn.query_row("select done, rerun_mask from pp_state where release_id = ?", [id], |r| {
                 Ok((r.get(0)?, r.get(1)?))
@@ -727,7 +740,7 @@ mod tests {
         assert_eq!(state(2), (mask(PROBE_STEP), 0), "read");
         assert_eq!(state(3), (mask(PROBE_STEP), 0), "missing");
         let queued: i64 = conn.query_row("select count(*) from pp_queue", [], |r| r.get(0)).unwrap();
-        assert_eq!(queued, 6);
+        assert_eq!(queued, 7);
         assert_eq!(state(7), (mask(PROBE_STEP), 0), "read already");
     }
 

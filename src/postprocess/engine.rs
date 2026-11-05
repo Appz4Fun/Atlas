@@ -1221,6 +1221,11 @@ fn seed_shard(conn: &Connection, enabled: StepMask, stamps: &[(u8, StepMask, i64
         crate::probe::step::rerun_asf(conn, now)?;
         set("pp_probe_asf", now)?;
     }
+    // once, for the MPEG program streams probed before their packs were read
+    if meta("pp_probe_mpeg_ps")?.is_none() {
+        crate::probe::step::rerun_mpeg_ps(conn, now)?;
+        set("pp_probe_mpeg_ps", now)?;
+    }
     // once, for the probes that read a set's later volume before its first was looked for
     if meta("pp_probe_first_volume")?.is_none() {
         crate::probe::step::rerun_later_volumes(conn, now)?;
