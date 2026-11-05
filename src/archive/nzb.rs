@@ -25,17 +25,35 @@ fn starts_with_ignore_case(bytes: &[u8], prefix: &[u8]) -> bool {
     bytes.get(..prefix.len()).is_some_and(|b| b.eq_ignore_ascii_case(prefix))
 }
 
-/// One `<file>` of an NZB: the name its subject gives and its articles.
+/// Segments an NZB's files keep at most between them: a post with more is listed and not read whole, soo their
+/// message-ids aren't needed, and a crafted NZB of millions can't fill memory with them.
+pub const MAX_KEPT_SEGMENTS: usize = 4_096;
+
+/// One `<file>` of an NZB: the name its subject gives, and its articles: all of them counted, the first ones kept
+/// (`MAX_KEPT_SEGMENTS` across the NZB).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct NzbFile {
     pub name: String,
     pub segments: Vec<Segment>,
+    /// its `<segment>`s, kept or not
+    pub articles: usize,
+    /// and their bytes
+    pub total_bytes: u64,
 }
 
 impl NzbFile {
     /// what its articles count in all
     pub fn bytes(&self) -> u64 {
-        self.segments.iter().map(|s| s.bytes).fold(0, u64::saturating_add)
+        self.total_bytes
+    }
+
+    fn add(&mut self, segment: Segment, kept: &mut usize) {
+        self.articles += 1;
+        self.total_bytes = self.total_bytes.saturating_add(segment.bytes);
+        if *kept < MAX_KEPT_SEGMENTS {
+            *kept += 1;
+            self.segments.push(segment);
+        }
     }
 }
 
@@ -64,30 +82,31 @@ pub fn parse(body: &[u8]) -> Parsed {
     let mut file: Option<NzbFile> = None;
     // the segment being read, its message-id so far
     let mut segment: Option<Segment> = None;
+    let mut kept = 0usize;
     loop {
         match reader.read_event() {
             Ok(Event::Start(e)) => match e.local_name().as_ref() {
-                "file" => file = Some(NzbFile { name: file_name(&e), segments: Vec::new() }),
+                "file" => file = Some(NzbFile { name: file_name(&e), ..NzbFile::default() }),
                 "segment" => segment = Some(segment_of(&e)),
                 _ => {}
             },
             Ok(Event::Empty(e)) if e.local_name().as_ref() == "segment" => {
                 if let Some(f) = file.as_mut() {
-                    f.segments.push(segment_of(&e));
+                    f.add(segment_of(&e), &mut kept);
                 }
             }
             Ok(Event::Text(t)) => {
-                if let Some(s) = segment.as_mut() {
+                if let Some(s) = segment.as_mut().filter(|s| s.message_id.len() < 1024) {
                     s.message_id.push_str(&t);
                 }
             }
             Ok(Event::CData(t)) => {
-                if let Some(s) = segment.as_mut() {
+                if let Some(s) = segment.as_mut().filter(|s| s.message_id.len() < 1024) {
                     s.message_id.push_str(&t);
                 }
             }
             Ok(Event::GeneralRef(r)) => {
-                if let Some(s) = segment.as_mut() {
+                if let Some(s) = segment.as_mut().filter(|s| s.message_id.len() < 1024) {
                     match r.resolve_char_ref() {
                         Ok(Some(c)) => s.message_id.push(c),
                         _ => s.message_id.push_str(resolve_predefined_entity(&r).unwrap_or_default()),
@@ -98,7 +117,7 @@ pub fn parse(body: &[u8]) -> Parsed {
                 "segment" => {
                     if let (Some(mut s), Some(f)) = (segment.take(), file.as_mut()) {
                         s.message_id = s.message_id.trim().trim_matches(['<', '>']).to_string();
-                        f.segments.push(s);
+                        f.add(s, &mut kept);
                     }
                 }
                 "file" => {
@@ -162,7 +181,8 @@ fn attribute(e: &BytesStart<'_>, key: &str) -> Option<String> {
 /// The release names an NZB's files give, as a save names a release from a file (`strip_release_suffixes`), PAR2
 /// files last, each once. At most 3.
 pub fn release_names<'a>(files: impl Iterator<Item = &'a str>) -> Vec<String> {
-    let mut files: Vec<&str> = files.collect();
+    // an NZB on the way is a hop, not where it leads
+    let mut files: Vec<&str> = files.filter(|name| super::select::classify(name) != super::select::Kind::Nzb).collect();
     files.sort_by_key(|name| name.to_ascii_lowercase().ends_with(".par2"));
     let mut names: Vec<String> = Vec::new();
     for file in files {
@@ -231,6 +251,30 @@ mod tests {
         assert_eq!(bracketed.files[0].segments[0].message_id, "a@b");
         let cdata = parse(b"<nzb><file subject=\"a.rar (1/1)\"><segments><segment bytes=\"1\" number=\"1\"><![CDATA[c@d]]></segment></segments></file></nzb>");
         assert_eq!(cdata.files[0].segments[0].message_id, "c@d");
+    }
+
+    #[test]
+    fn segments_past_the_cap_are_counted_not_kept() {
+        let segments: String = (1..=MAX_KEPT_SEGMENTS + 10)
+            .map(|n| format!("<segment bytes=\"2\" number=\"{n}\">{n}@x</segment>"))
+            .collect();
+        let p = parse(
+            format!("<nzb><file subject=\"a.rar (1/1)\"><segments>{segments}</segments></file></nzb>").as_bytes(),
+        );
+        let f = &p.files[0];
+        assert_eq!(
+            (f.segments.len(), f.articles, f.bytes()),
+            (MAX_KEPT_SEGMENTS, MAX_KEPT_SEGMENTS + 10, 2 * (MAX_KEPT_SEGMENTS as u64 + 10))
+        );
+        assert!(!crate::archive::follow::small(&p.files));
+    }
+
+    #[test]
+    fn release_names_leave_nzbs_on_the_way_out() {
+        let names = release_names(
+            ["A.nzb", "B-{{pw}}.nzb", "Final.Movie.2024-GRP.part01.rar", "Final.Movie.2024-GRP.par2"].into_iter(),
+        );
+        assert_eq!(names, ["Final.Movie.2024-GRP"]);
     }
 
     #[test]

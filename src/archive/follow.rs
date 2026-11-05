@@ -40,50 +40,59 @@ impl Whole {
 /// Whether a post of these files is small enough to read whole.
 pub fn small(files: &[NzbFile]) -> bool {
     let bytes = files.iter().map(NzbFile::bytes).fold(0, u64::saturating_add);
-    let articles: usize = files.iter().map(|f| f.segments.len()).sum();
-    bytes <= MAX_POST_BYTES && articles <= MAX_POST_ARTICLES
+    let articles: usize = files.iter().map(|f| f.articles).sum();
+    bytes <= MAX_POST_BYTES && articles <= MAX_POST_ARTICLES && files.iter().all(|f| f.segments.len() == f.articles)
 }
 
-/// Every hop's files from the first NZB's bytes, and the names inside the archives read past it. Stops at a post too
-/// big to read whole, one with no NZB in it, an article gone, a budget spent, or `MAX_HOPS`.
-pub fn follow(ctx: &mut StepCtx<'_>, first: Vec<u8>) -> Result<Vec<InnerFile>, StepError> {
-    let mut rows = Vec::new();
+/// Every hop's files from the first NZB's bytes, the last hop's first, each after the names inside the archive it was
+/// found in. Stops at a post too big to read whole, one with no NZB in it, an article gone, `MAX_HOPS`, or when
+/// `left`, the bytes the whole following may fetch and unpack, runs out.
+pub fn follow(ctx: &mut StepCtx<'_>, first: Vec<u8>, left: &mut u64) -> Result<Vec<InnerFile>, StepError> {
+    // each hop's rows: the names inside the archive its NZB came out of, then its files
+    let mut hops: Vec<Vec<InnerFile>> = Vec::new();
+    let mut inside: Vec<InnerFile> = Vec::new();
     let mut body = first;
     for _ in 0..MAX_HOPS {
         let parsed = nzb::parse(&body);
+        let mut rows = std::mem::take(&mut inside);
         rows.extend(parsed.files.iter().map(|f| InnerFile { name: f.name.clone(), size: Some(f.bytes()) }));
+        hops.push(rows);
         // a cut NZB doesn't say what all of its post is
         if !parsed.complete || !small(&parsed.files) {
             break;
         }
         let wholes: Vec<Whole> = parsed.files.iter().map(Whole::of).collect();
-        match nzb_inside(ctx, None, &wholes, Some(&mut rows), None)? {
+        match nzb_inside(ctx, None, &wholes, Some(&mut inside), None, left)? {
             Some(next) => body = next,
             None => break,
         }
     }
-    Ok(rows)
+    if let Some(last) = hops.last_mut() {
+        last.append(&mut inside);
+    }
+    // where the chain ends first: what's kept and what a name is taken from favour it
+    Ok(hops.into_iter().rev().flatten().collect())
 }
 
 /// The next NZB in these files: one posted as a file, or one an archive set of them holds, read whole. `first` is a
 /// set to try before the rest, as a release's own archive known by its bytes and not its name; `names` takes the names
-/// inside each archive read; `known` is an article already read, by its message-id, not fetched again. All the sets
-/// read share `MAX_POST_BYTES`, fetched and unpacked, whatever the NZB claimed.
+/// inside each archive read; `known` is an article already read, by its message-id, not fetched again. What's fetched
+/// and unpacked comes out of `left`, whatever the NZB claimed.
 pub fn nzb_inside(
     ctx: &mut StepCtx<'_>,
     first: Option<Set>,
     files: &[Whole],
     mut names: Option<&mut Vec<InnerFile>>,
     known: Option<(&str, &[u8])>,
+    left: &mut u64,
 ) -> Result<Option<Vec<u8>>, StepError> {
-    let mut left = MAX_POST_BYTES;
     for set in first.into_iter().chain(sets(files)) {
-        let Some(raw) = download_set(ctx, &set, known, &mut left)? else { continue };
+        let Some(raw) = download_set(ctx, &set, known, left)? else { continue };
         if raw.len() == 1 && nzb::is_nzb(&raw[0]) {
             return Ok(raw.into_iter().next());
         }
         // RAR volumes carry their own headers, each unwrapped; other split archives are one stream cut in pieces
-        let pieces: Vec<Vec<u8>> = if set.headed_volumes { raw } else { vec![raw.concat()] };
+        let pieces: Vec<Vec<u8>> = if set.headed_volumes { raw } else { vec![split_zip_marker_off(raw.concat())] };
         let mut joined = Vec::new();
         let mut found = None;
         for piece in &pieces {
@@ -98,10 +107,10 @@ pub fn nzb_inside(
             if unwrapped.layers.iter().any(|l| l.encrypted) {
                 break;
             }
-            if unwrapped.inner.len() as u64 > left {
+            if unwrapped.inner.len() as u64 > *left {
                 break;
             }
-            left -= unwrapped.inner.len() as u64;
+            *left -= unwrapped.inner.len() as u64;
             joined.extend_from_slice(&unwrapped.inner);
             // stored beside a bigger file, or in a solid stream with others: its start is in the bytes all the same
             found = found.or_else(|| nzb_start(piece).map(|at| piece[at..].to_vec()));
@@ -125,6 +134,15 @@ pub fn nzb_inside(
 pub struct Set {
     pub files: Vec<Whole>,
     pub headed_volumes: bool,
+}
+
+/// A split zip's first volume opens with a spanning marker before its first local header, which nothing that reads a
+/// zip from its front expects: off it comes.
+fn split_zip_marker_off(mut stream: Vec<u8>) -> Vec<u8> {
+    if (stream.starts_with(b"PK\x07\x08") || stream.starts_with(b"PK00")) && stream.get(4..8) == Some(b"PK\x03\x04") {
+        stream.drain(..4);
+    }
+    stream
 }
 
 /// Where an NZB starts in these bytes, if one does, in one pass: at its first `<nzb`, or at an XML prolog or doctype
@@ -250,6 +268,13 @@ mod tests {
     }
 
     #[test]
+    fn a_split_zips_spanning_marker_comes_off() {
+        assert_eq!(split_zip_marker_off(b"PK\x07\x08PK\x03\x04rest".to_vec()), b"PK\x03\x04rest");
+        assert_eq!(split_zip_marker_off(b"PK00PK\x03\x04rest".to_vec()), b"PK\x03\x04rest");
+        assert_eq!(split_zip_marker_off(b"PK\x07\x08junk".to_vec()), b"PK\x07\x08junk");
+    }
+
+    #[test]
     fn an_nzbs_start_is_found_in_one_pass() {
         assert_eq!(nzb_start(b"junk\x00\x01<?xml version=\"1.0\"?>\n<nzb>"), Some(6));
         assert_eq!(nzb_start(b"no prolog <NZB xmlns=\"x\">"), Some(10));
@@ -269,6 +294,8 @@ mod tests {
             segments: (1..=segments)
                 .map(|n| nzb::Segment { number: n as i64, bytes, message_id: format!("{n}@x") })
                 .collect(),
+            articles: segments,
+            total_bytes: segments as u64 * bytes,
         };
         assert!(small(&[file(26, 640_000), file(14, 640_000)]));
         assert!(!small(&[file(100, 700_000)]), "70 MB");
@@ -283,6 +310,8 @@ mod tests {
                 .into_iter()
                 .map(|(n, id)| nzb::Segment { number: n, bytes: 1, message_id: id.into() })
                 .collect(),
+            articles: 3,
+            total_bytes: 3,
         };
         assert_eq!(Whole::of(&file).ids, ["<a>", "<b>"]);
     }

@@ -273,7 +273,7 @@ fn open(data: &[u8], want: &dyn Fn(&str) -> bool) -> Option<Opened> {
     if let Some(opened) = lzma_alone(data) {
         return Some(opened);
     }
-    if let Some(opened) = tar(data) {
+    if let Some(opened) = tar(data, want) {
         return Some(opened);
     }
     let decode = |format: &str, method: &str, codec| {
@@ -628,8 +628,8 @@ fn lzma_alone(data: &[u8]) -> Option<Opened> {
 }
 
 /// tar: 512 byte headers, each file's bytes after its own, stored. The biggest file whose bytes start in what was
-/// read, with GNU and pax long names.
-fn tar(data: &[u8]) -> Option<Opened> {
+/// read, of those `want` names if any, with GNU and pax long names.
+fn tar(data: &[u8], want: &dyn Fn(&str) -> bool) -> Option<Opened> {
     let first = data.get(..512)?;
     if !tar_checksum_ok(first) {
         return None;
@@ -637,7 +637,7 @@ fn tar(data: &[u8]) -> Option<Opened> {
     let mut at = 0usize;
     let mut long_name: Option<String> = None;
     let mut long_size: Option<u64> = None;
-    let mut best: Option<(u64, usize, String)> = None;
+    let mut best: Option<(bool, u64, usize, String)> = None;
     for _ in 0..256 {
         let Some(h) = data.get(at..at + 512) else { break };
         if h.iter().all(|b| *b == 0) || !tar_checksum_ok(h) {
@@ -667,8 +667,9 @@ fn tar(data: &[u8]) -> Option<Opened> {
                     let name = cstr(&h[..100]);
                     if prefix.is_empty() { name } else { format!("{prefix}/{name}") }
                 });
-                if body < data.len() && best.as_ref().is_none_or(|(s, _, _)| size > *s) {
-                    best = Some((size, body, name));
+                let wanted = want(&name);
+                if body < data.len() && best.as_ref().is_none_or(|(w, s, _, _)| (wanted, size) > (*w, *s)) {
+                    best = Some((wanted, size, body, name));
                 }
             }
             _ => {
@@ -682,7 +683,7 @@ fn tar(data: &[u8]) -> Option<Opened> {
         at = next;
     }
     let mut layer = Layer { format: "TAR".into(), method: Some("store".into()), ..Layer::default() };
-    let Some((size, from, name)) = best else {
+    let Some((_, size, from, name)) = best else {
         return Some(Opened { layer, view: View::Stop("no file starts in what was read") });
     };
     layer.name = Some(name);

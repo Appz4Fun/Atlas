@@ -1010,9 +1010,9 @@ fn a_posted_nzb_is_followed_through_a_small_post_whose_rar_holds_the_next_nzb() 
     assert_eq!(
         found,
         [
-            ("Hop.Post.rar".to_string(), 5),
             ("Final-{{s3cret}}.nzb".to_string(), 5),
-            ("Final.Movie.2024.2160p-GRP.part01.rar".to_string(), 5)
+            ("Final.Movie.2024.2160p-GRP.part01.rar".to_string(), 5),
+            ("Hop.Post.rar".to_string(), 5)
         ]
     );
 }

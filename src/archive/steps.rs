@@ -153,11 +153,12 @@ fn deep_nzb(
         Kind::Rar(_) | Kind::SevenZip(_) | Kind::Zip(_) | Kind::Numbered(_) => None,
         _ => own_whole(ctx, head_file)?.map(|whole| follow::Set { files: vec![whole], headed_volumes: false }),
     };
-    let Some(found) = follow::nzb_inside(ctx, first, &wholes, None, known)? else {
+    let mut left = follow::MAX_POST_BYTES;
+    let Some(found) = follow::nzb_inside(ctx, first, &wholes, None, known, &mut left)? else {
         return Ok(None);
     };
     let complete = nzb::parse(&found).complete;
-    Ok(Some(Listing { files: follow::follow(ctx, found)?, complete, ..Default::default() }))
+    Ok(Some(Listing { files: follow::follow(ctx, found, &mut left)?, complete, ..Default::default() }))
 }
 
 /// A file of this release to read whole: one article a part, the first copy. None: a part isnt indexed.
@@ -852,7 +853,8 @@ impl Step for ListStep {
             let Some(body) = whole_file(ctx, file, &mut left)? else { continue };
             if identify(&body) == Format::Nzb {
                 let complete = nzb::parse(&body).complete;
-                let files = follow::follow(ctx, body)?;
+                let mut budget = follow::MAX_POST_BYTES;
+                let files = follow::follow(ctx, body, &mut budget)?;
                 return finish(ctx, SOURCE_NZB, Listing { files, complete, ..Default::default() }, &limits);
             }
         }

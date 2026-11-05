@@ -600,3 +600,25 @@ fn an_xz_filter_with_no_decoder_says_so() {
     assert_eq!(n.layers[0].method.as_deref(), Some("riscv+lzma2"));
     assert_eq!(n.layers[0].stop.as_deref(), Some("no decoder for this filter yet"));
 }
+
+#[test]
+fn unwrap_for_takes_the_wanted_entry_over_a_bigger_one_in_zip_and_tar() {
+    let want = |name: &str| name.ends_with(".nzb");
+    let big = video();
+    let note = b"<nzb>small</nzb>".to_vec();
+    // a deflated zip: the largest entry is decoded unless one is wanted
+    let zip = [zip_entry(8, "big.mkv", &deflate(&big), big.len()), zip_entry(8, "a.nzb", &deflate(&note), note.len())]
+        .concat();
+    assert_eq!(unwrap(&zip).layers[0].name.as_deref(), Some("big.mkv"));
+    let n = unwrap_for(&zip, &want);
+    assert_eq!(n.layers[0].name.as_deref(), Some("a.nzb"));
+    same(&n.inner, &note);
+    // a gzipped tar, two files
+    let mut tar = tar_of("big.mkv", &big);
+    tar.truncate(512 + big.len().div_ceil(512) * 512);
+    tar.extend(tar_of("a.nzb", &note));
+    let gz = gzip_of("x.tar", &tar);
+    let n = unwrap_for(&gz, &want);
+    assert_eq!(n.layers.last().and_then(|l| l.name.as_deref()), Some("a.nzb"));
+    same(&n.inner, &note);
+}
