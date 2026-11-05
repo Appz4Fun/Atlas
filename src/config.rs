@@ -494,7 +494,7 @@ pub struct MetricsConfig {
     pub host: String,
     pub indexer_port: u16,
     pub api_port: u16,
-    /// seconds between walks over every release
+    /// seconds between walks over every release, at least 4 times as long as the last walk took
     pub catalog_every_secs: u64,
 }
 
@@ -625,6 +625,8 @@ pub struct PostprocessConfig {
     pub backlog_per_second: i64,
     pub body_fetches_per_minute: i64,
     pub body_connections: usize,
+    /// net claims of one shard running at once, each a few releases one after another
+    pub net_claims_per_shard: usize,
     pub body_min_size_bytes: i64,
     pub body_max_size_bytes: i64,
     pub body_max_bytes: i64,
@@ -648,6 +650,7 @@ impl Default for PostprocessConfig {
             backlog_per_second: 2000,
             body_fetches_per_minute: 3000,
             body_connections: 4,
+            net_claims_per_shard: 24,
             body_min_size_bytes: 0,
             body_max_size_bytes: 0,
             body_max_bytes: 16 << 20,
@@ -691,6 +694,7 @@ impl PostprocessConfig {
         };
         count("workers", &mut c.workers);
         count("body_connections", &mut c.body_connections);
+        count("net_claims_per_shard", &mut c.net_claims_per_shard);
         if let Some(b) = v.get("enabled").and_then(as_bool) {
             c.enabled = b;
         }
@@ -1765,13 +1769,14 @@ mod tests {
         let c = Config::from_value(&json!({"postprocess": {
             "enabled": false, "workers": 3, "settle_secs": 60, "complete_settle_secs": 30, "min_size_bytes": 5,
             "min_files": 2, "reject_par2_only": false, "backlog_per_second": 10, "body_fetches_per_minute": 300,
-            "body_connections": 4, "body_min_size_bytes": 7, "body_max_size_bytes": 8, "body_max_bytes": 9,
+            "body_connections": 4, "net_claims_per_shard": 6, "body_min_size_bytes": 7, "body_max_size_bytes": 8,
+            "body_max_bytes": 9,
             "bodies_per_release": 2, "min_completion_percent": 90, "dead_after_secs": 11, "max_attempts": 3,
             "group_rules": {"alt.binaries.x": {"min_size_bytes": 100, "min_files": 2}}
         }}))
         .postprocess;
         assert!(!c.enabled && !c.reject_par2_only);
-        assert_eq!((c.workers, c.body_connections), (3, 4));
+        assert_eq!((c.workers, c.body_connections, c.net_claims_per_shard), (3, 4, 6));
         assert_eq!((c.settle_secs, c.complete_settle_secs, c.min_size_bytes, c.min_files), (60, 30, 5, 2));
         assert_eq!((c.backlog_per_second, c.body_fetches_per_minute), (10, 300));
         assert_eq!((c.body_min_size_bytes, c.body_max_size_bytes, c.body_max_bytes), (7, 8, 9));

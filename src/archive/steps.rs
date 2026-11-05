@@ -18,10 +18,10 @@ use crate::store::{self, FileInfo, SegmentPick, SegmentRef};
 
 use super::names::{best_name, collapse_volumes, looks_random, stem};
 use super::select::{self, Head, Kind};
-use super::store::{self as archive_store, SOURCE_7Z, SOURCE_PAR2, SOURCE_RAR, SOURCE_ZIP};
+use super::store::{self as archive_store, SOURCE_7Z, SOURCE_NZB, SOURCE_PAR2, SOURCE_RAR, SOURCE_ZIP};
 use super::{
     ARTICLE_CAP, Format, InnerFile, Listing, NAME_SOURCE_INNER, NAME_SOURCE_PAR2, PROBE_PREFIX, RERUN_ON_INNER_FILES,
-    identify, rar, sevenz, zip,
+    identify, nzb, rar, sevenz, zip,
 };
 
 fn retry(e: impl std::fmt::Display) -> StepError {
@@ -67,6 +67,105 @@ fn fetch_start(ctx: &mut StepCtx<'_>, seg: &SegmentRef, file: &str) -> Result<Op
         Got::Body(body) => Some(body),
         Got::Missing | Got::TooBig | Got::Refused(_) => None,
     })
+}
+
+/// A small file's every part, decoded and joined in order, within the budget: a part's repost stands in when its
+/// first copy comes to nothing. None: a part isnt indexed or none of its copies came, or the file is more than a
+/// list should be.
+fn whole_file(ctx: &mut StepCtx<'_>, file: &FileInfo, left: &mut usize) -> Result<Option<Vec<u8>>, StepError> {
+    let parts = file.expected.unwrap_or(0).max(file.parts_seen);
+    if parts < 1 || parts as usize > *left {
+        return Ok(None);
+    }
+    let mut by_part: std::collections::BTreeMap<i64, Vec<SegmentRef>> = std::collections::BTreeMap::new();
+    for seg in ctx.segments(file.id, &SegmentPick::Parts((1..=parts).collect())).map_err(retry)? {
+        if let Some(part) = seg.part {
+            by_part.entry(part).or_default().push(seg);
+        }
+    }
+    // one article posted with no counter has no part number to pick it by
+    if parts == 1 && by_part.is_empty() {
+        by_part.insert(1, ctx.segments(file.id, &SegmentPick::First(1)).map_err(retry)?);
+    }
+    if by_part.len() as i64 != parts || by_part.values().any(Vec::is_empty) {
+        return Ok(None);
+    }
+    let mut whole = Vec::new();
+    for copies in by_part.values() {
+        let mut body = None;
+        for seg in copies {
+            body = budgeted(ctx, seg, &file.filename, left)?;
+            if body.is_some() {
+                break;
+            }
+        }
+        let Some(body) = body else { return Ok(None) };
+        whole.extend(body);
+        if whole.len() > nzb::MAX_NZB_BYTES {
+            return Ok(None);
+        }
+    }
+    Ok(Some(whole))
+}
+
+/// What an NZB an archive holds lists, from the article read: stored, not compressed or encrypted, its bytes are
+/// there as they are, from its start. Often only the first of its files, as its first article holds only its start.
+fn nzb_stored_in(listing: &Listing, body: &[u8]) -> Option<Listing> {
+    if listing.encrypted || !listing.files.iter().any(|f| select::classify(&f.name) == Kind::Nzb) {
+        return None;
+    }
+    let at = (0..body.len().saturating_sub(4))
+        .filter(|at| body.get(*at) == Some(&b'<'))
+        .find(|at| body.get(*at..).is_some_and(nzb::is_nzb))?;
+    let inside = nzb::list(body.get(at..)?);
+    (!inside.files.is_empty()).then_some(inside)
+}
+
+/// An archive's outcome with the list of the NZB inside it beside its own rows, in the same writes. The archive's
+/// name, password and fingerprint stand; a program the NZB lists makes the release junk as one inside would.
+fn with_nzb(
+    ctx: &StepCtx<'_>,
+    outcome: Outcome,
+    inside: Option<Listing>,
+    limits: &ArchiveConfig,
+) -> Result<Outcome, StepError> {
+    let Some(inside) = inside else { return Ok(outcome) };
+    if outcome.junk.is_some() {
+        return Ok(outcome);
+    }
+    Ok(merge_nzb(outcome, finish(ctx, SOURCE_NZB, inside, limits)?))
+}
+
+/// `with_nzb`'s join: the NZB's rows go with the archive's outcome, or its junk verdict in place of it.
+fn merge_nzb(mut outcome: Outcome, nested: Outcome) -> Outcome {
+    if outcome.junk.is_some() || nested.junk.is_some() {
+        return if outcome.junk.is_some() { outcome } else { nested };
+    }
+    outcome.matched |= nested.matched;
+    outcome.rerun |= nested.rerun;
+    outcome.writes.extend(nested.writes);
+    outcome
+}
+
+/// The list a posted NZB gave before, kept in the raw store, when nothing else in the release is to be read: no
+/// articles fetched for it. Not an archive, soo it has no `raw_archives` row for `get_archive` to find.
+fn restore_nzb(
+    ctx: &StepCtx<'_>,
+    files: &[FileInfo],
+    content_id: &[u8],
+    limits: &ArchiveConfig,
+) -> Result<Option<Outcome>, StepError> {
+    if select::nzb_sources(files).is_empty() || !select::plan(files, limits.probe_files.max(0) as usize).is_empty() {
+        return Ok(None);
+    }
+    let rel = ctx.release();
+    let saved = crate::raw_store::get_archive_files(&rel.name, &rel.group, content_id, SOURCE_NZB);
+    if saved.is_empty() {
+        return Ok(None);
+    }
+    let files = saved.into_iter().map(|f| InnerFile { name: f.name, size: f.size }).collect();
+    let listing = Listing { files, complete: true, ..Default::default() };
+    finish_with_override(ctx, SOURCE_NZB, listing, None, Some(None), false, limits).map(Some)
 }
 
 fn listing_of(inventory: par2::Inventory) -> Listing {
@@ -145,6 +244,8 @@ fn finish_with_override(
         duplicates::one_archive_set(files.iter().map(|f| f.filename.as_str()))
     };
     let content = match content_override {
+        // what a posted NZB lists is another post's files, not what this one holds
+        _ if source == SOURCE_NZB => None,
         Some(fp) => fp,
         None => (listing.complete && !listing.damaged && speaks_for_release)
             .then(|| duplicates::content_fingerprint(listing.files.iter().map(|f| (f.name.as_str(), f.size))))
@@ -159,7 +260,7 @@ fn finish_with_override(
             content_id: &content_id,
             source,
             files: &rows,
-            password: (source != SOURCE_PAR2).then(|| pw.code()),
+            password: (source != SOURCE_PAR2 && source != SOURCE_NZB).then(|| pw.code()),
             encryption: listing.encryption.map(super::Encryption::code),
             names_hidden: listing.headers_encrypted,
             password_check: check_bytes.as_deref(),
@@ -172,14 +273,16 @@ fn finish_with_override(
         });
     }
     // a PAR2 set of archive volumes says nothing about what's inside them: that's the archive step's to say
-    let leaves_it = source == SOURCE_PAR2 && duplicates::lists_archives(listing.files.iter().map(|f| f.name.as_str()));
+    let leaves_it = source == SOURCE_NZB
+        || source == SOURCE_PAR2 && duplicates::lists_archives(listing.files.iter().map(|f| f.name.as_str()));
     if !leaves_it {
         writes.push(match content {
             Some(content) => StepWrite::new(duplicates::SET_CONTENT, vec![id.into(), content.into()]),
             None => StepWrite::new(duplicates::CLEAR_CONTENT, vec![id.into()]),
         });
     }
-    if source != SOURCE_PAR2 {
+    // no archive was read, soo no password to tell
+    if source != SOURCE_PAR2 && source != SOURCE_NZB {
         writes.push(StepWrite::new(archive_store::UPSERT_RELEASE, vec![id.into(), pw.code().into()]));
         if listing.encryption.is_some() || listing.headers_encrypted || listing.password_check.is_some() {
             writes.push(StepWrite::new(
@@ -194,6 +297,13 @@ fn finish_with_override(
         }
     }
 
+    // what an NZB points to, in this shard, is read sooner: the next hop
+    if source == SOURCE_NZB {
+        for name in nzb::release_names(rows.iter().map(|r| r.name.as_str())) {
+            writes.push(StepWrite::new(archive_store::MARK_POINTED, vec![name.clone().into(), id.into()]));
+            writes.push(StepWrite::new(archive_store::RANK_POINTED.as_str(), vec![name.into(), id.into()]));
+        }
+    }
     let name_source = if source == SOURCE_PAR2 { NAME_SOURCE_PAR2 } else { NAME_SOURCE_INNER };
     let name_wanted = name_may_change(release, name_source)
         && (source == SOURCE_PAR2 || release.is_obfuscated || looks_random(stem(&release.name)));
@@ -214,9 +324,11 @@ fn finish_with_override(
     })
 }
 
+/// An archive's list kept in the raw store, and the list of an NZB it holds when that was kept too.
 fn restore_archive(
     ctx: &StepCtx<'_>,
     saved: crate::raw_store::SavedArchive,
+    content_id: &[u8],
     limits: &ArchiveConfig,
 ) -> Result<Outcome, StepError> {
     let source = saved.files.first().map(|f| f.source).unwrap_or_else(|| {
@@ -239,7 +351,16 @@ fn restore_archive(
         damaged: saved.listing_damaged,
         need_more_tail: false,
     };
-    finish_with_override(ctx, source, listing, password_override, Some(saved.content_fp), false, limits)
+    let outcome = finish_with_override(ctx, source, listing, password_override, Some(saved.content_fp), false, limits)?;
+    let rel = ctx.release();
+    let nested = crate::raw_store::get_archive_files(&rel.name, &rel.group, content_id, SOURCE_NZB);
+    if nested.is_empty() {
+        return Ok(outcome);
+    }
+    let files = nested.into_iter().map(|f| InnerFile { name: f.name, size: f.size }).collect();
+    let listing = Listing { files, complete: true, ..Default::default() };
+    let nested = finish_with_override(ctx, SOURCE_NZB, listing, None, Some(None), false, limits)?;
+    Ok(merge_nzb(outcome, nested))
 }
 
 fn restore_par2(
@@ -553,7 +674,10 @@ impl Step for ListStep {
             if let Some(saved) =
                 crate::raw_store::get_archive(&rel_name, &rel_group, &content_id, rel.parts, rel.complete)
             {
-                return restore_archive(ctx, saved, &limits);
+                return restore_archive(ctx, saved, &content_id, &limits);
+            }
+            if let Some(outcome) = restore_nzb(ctx, &files, &content_id, &limits)? {
+                return Ok(outcome);
             }
             if select::par2_source(&files).is_none() {
                 let saved_par2 = crate::raw_store::get_archive_files(&rel_name, &rel_group, &content_id, SOURCE_PAR2);
@@ -592,10 +716,15 @@ impl Step for ListStep {
             };
             let Some(body) = body else { continue };
             match identify(&body) {
-                Format::Rar4 | Format::Rar5 => return finish(ctx, SOURCE_RAR, rar::list(&body), &limits),
+                Format::Rar4 | Format::Rar5 => {
+                    let listing = rar::list(&body);
+                    let inside = nzb_stored_in(&listing, &body);
+                    return with_nzb(ctx, finish(ctx, SOURCE_RAR, listing, &limits)?, inside, &limits);
+                }
                 Format::Zip => {
                     let listing = zip_list(ctx, &head, &body, &mut left)?;
-                    return finish(ctx, SOURCE_ZIP, listing, &limits);
+                    let inside = nzb_stored_in(&listing, &body);
+                    return with_nzb(ctx, finish(ctx, SOURCE_ZIP, listing, &limits)?, inside, &limits);
                 }
                 Format::SevenZip => {
                     let listing = seven_list(ctx, &head, &seg, &body, &mut left)?;
@@ -630,12 +759,24 @@ impl Step for ListStep {
                 }
                 // images: stop, with at most a prefix read
                 Format::Image => return Ok(Outcome::default()),
-                Format::Media | Format::Unknown => continue,
+                // as a planned head it's an archive's name on something else: what a posted NZB lists is below
+                Format::Nzb | Format::Media | Format::Unknown => continue,
+            }
+        }
+        // no archive told what this is: a posted NZB can, by the files of the post it points to
+        for file in select::nzb_sources(&files) {
+            let Some(body) = whole_file(ctx, file, &mut left)? else { continue };
+            if identify(&body) == Format::Nzb {
+                return finish(ctx, SOURCE_NZB, nzb::list(&body), &limits);
             }
         }
         let rel = ctx.release();
         if let Some(saved) = crate::raw_store::get_archive(&rel.name, &rel.group, &content_id, 0, false) {
-            return restore_archive(ctx, saved, &limits);
+            return restore_archive(ctx, saved, &content_id, &limits);
+        }
+        // its articles may be gone since
+        if let Some(outcome) = restore_nzb(ctx, &files, &content_id, &limits)? {
+            return Ok(outcome);
         }
         if select::par2_source(&files).is_none() {
             let saved_par2 = crate::raw_store::get_archive_files(&rel_name, &rel_group, &content_id, SOURCE_PAR2);

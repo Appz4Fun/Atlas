@@ -614,12 +614,55 @@ mod tests {
             rank(&conn, id)
         };
         assert_eq!(ranked(100 << 20, None), Some(0), "small");
+        assert_eq!(ranked(400 << 20, Some(5040)), Some(1), "an SD episode, with the 1 GiB ones");
+        assert_eq!(ranked(300 << 20, Some(2030)), Some(1), "an SD movie");
+        assert_eq!(ranked(10 << 20, Some(5040)), Some(0), "a sample or a piece of a split post");
+        assert_eq!(ranked(400 << 20, Some(8010)), Some(0), "a small Other one");
         assert_eq!(ranked(2 * gib, None), Some(1), "no category yet, as an obfuscated upload");
         assert_eq!(ranked(8 * gib, Some(5040)), Some(2), "TV");
         assert_eq!(ranked(20 * gib, Some(2045)), Some(3), "a UHD movie");
         assert_eq!(ranked(60 * gib, Some(8010)), Some(4), "a hashed upload");
         assert_eq!(ranked(60 * gib, Some(3010)), Some(0), "audio, however big");
         assert_eq!(ranked(60 * gib, Some(6000)), Some(0), "nor XXX");
+        conn.execute("insert into files (release_id, filename, seen) values (?, 'Some.Post.NZB', x'01')", [id])
+            .unwrap();
+        assert_eq!(ranked(6_226, Some(2045)), Some(2), "a post of an NZB, however small");
+        assert_eq!(ranked(6_226, Some(3010)), Some(2), "and whatever it's filed as");
+        assert_eq!(ranked(60 * gib, Some(2045)), Some(4), "a big one with an NZB beside it stays where it was");
+        conn.execute("delete from files where filename = 'Some.Post.NZB'", []).unwrap();
+        assert_eq!(ranked(16 << 20, Some(2045)), Some(0));
+        conn.execute("insert into nzb_pointed (release_id) values (?)", [id]).unwrap();
+        assert_eq!(ranked(16 << 20, Some(2045)), Some(2), "what an NZB read here points to");
+    }
+
+    #[test]
+    fn what_an_nzb_points_to_is_ranked_as_a_visit_would() {
+        use crate::archive::store::{MARK_POINTED, RANK_POINTED};
+        let (_dir, conn, id) = shard();
+        let name: String = conn.query_row("select name from releases where id = ?", [id], |r| r.get(0)).unwrap();
+        let point = |size: i64, rank: Option<i64>| {
+            conn.execute("delete from nzb_pointed", []).unwrap();
+            conn.execute("update releases set size = ? where id = ?", params![size, id]).unwrap();
+            conn.execute(
+                "insert or replace into pp_state (release_id, net_wanted, net_rank) values (?, 1, ?)",
+                params![id, rank],
+            )
+            .unwrap();
+            conn.execute(MARK_POINTED, params![name, id + 8]).unwrap();
+            conn.execute(RANK_POINTED.as_str(), params![name, id + 8]).unwrap();
+            self::rank(&conn, id)
+        };
+        assert_eq!(point(16 << 20, Some(0)), Some(2), "a small one, ranked 0");
+        assert_eq!(point(60 << 30, None), Some(4), "a big one not ranked yet gets its own rank, not 2");
+        conn.execute(MARK_POINTED, params![name, id]).unwrap();
+        assert_eq!(conn.query_row("select count(*) from nzb_pointed", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+        conn.execute("delete from nzb_pointed", []).unwrap();
+        conn.execute(MARK_POINTED, params![name, id]).unwrap();
+        assert_eq!(
+            conn.query_row("select count(*) from nzb_pointed", [], |r| r.get::<_, i64>(0)).unwrap(),
+            0,
+            "not itself"
+        );
     }
 
     #[test]
@@ -633,6 +676,37 @@ mod tests {
         conn.execute("update pp_state set net_rank = 4", []).unwrap();
         crate::postprocess::engine::rank_ids(&conn, &[id]).unwrap();
         assert_eq!(rank(&conn, id), Some(4), "a ranked one is left as it is");
+    }
+
+    #[test]
+    fn small_video_ranked_before_it_counted_is_ranked_again() {
+        let (_dir, conn, id) = shard();
+        let (other, audio, sample) = (id + 1, id + 2, id + 3);
+        for (n, size, category) in [(id, 400i64 << 20, 5040), (other, 400 << 20, 8010), (audio, 400 << 20, 3010)]
+            .into_iter()
+            .chain([(sample, 1 << 20, 2040)])
+        {
+            if n != id {
+                conn.execute(
+                    "insert into releases (id, name, group_name) values (?, ?, 'g')",
+                    params![n, n.to_string()],
+                )
+                .unwrap();
+            }
+            conn.execute("update releases set size = ? where id = ?", params![size, n]).unwrap();
+            conn.execute("insert into release_category (release_id, category) values (?, ?)", params![n, category])
+                .unwrap();
+            conn.execute("insert into pp_state (release_id, net_wanted, net_rank) values (?, 1, 0)", [n]).unwrap();
+        }
+        let floor = crate::postprocess::schema::SMALL_VIDEO.to_string();
+        assert!(crate::postprocess::schema::NET_RANK.contains(&floor), "the rank and the rerank agree on the size");
+        assert_eq!(crate::postprocess::engine::rerank_small_video(&conn).unwrap(), 1);
+        assert_eq!(rank(&conn, id), Some(1), "the episode");
+        for n in [other, audio, sample] {
+            assert_eq!(rank(&conn, n), Some(0), "{n}");
+        }
+        conn.execute("update pp_state set net_rank = 0, net_wanted = null where release_id = ?", [id]).unwrap();
+        assert_eq!(crate::postprocess::engine::rerank_small_video(&conn).unwrap(), 0, "nor one the lane is done with");
     }
 
     #[test]
@@ -670,16 +744,16 @@ mod tests {
         let order = "net_rank desc, release_id desc";
         let mut taken = Vec::new();
         for _ in 0..8 {
-            let ids = net_take(&conn, &claimed, order, 5).unwrap();
+            let ids = net_take(&conn, &claimed, order, 5, 8).unwrap();
             assert_eq!(ids.len(), 4);
             taken.extend(ids);
         }
         let distinct: std::collections::HashSet<i64> = taken.iter().copied().collect();
         assert_eq!(distinct.len(), 32, "no release in two claims");
         assert_eq!(&taken[..4], &[199, 194, 189, 184], "the first claim takes the top of the order");
-        assert!(net_take(&conn, &claimed, order, 5).unwrap().is_empty(), "eight claims at most");
+        assert!(net_take(&conn, &claimed, order, 5, 8).unwrap().is_empty(), "eight claims at most");
         claimed.lock().unwrap().give_back(&taken[..4]);
-        assert_eq!(net_take(&conn, &claimed, order, 5).unwrap(), &taken[..4], "given back, they are taken again");
+        assert_eq!(net_take(&conn, &claimed, order, 5, 8).unwrap(), &taken[..4], "given back, they are taken again");
         // a claim of fewer than NET_BATCH (few were due) still counts as one
         for ids in taken.chunks(4) {
             claimed.lock().unwrap().give_back(ids);
@@ -688,10 +762,10 @@ mod tests {
         let due = |id: i64| conn.execute("update pp_state set net_next_at = 0 where release_id = ?", [id]).unwrap();
         for id in 100..108 {
             due(id);
-            assert_eq!(net_take(&conn, &claimed, order, 5).unwrap(), [id]);
+            assert_eq!(net_take(&conn, &claimed, order, 5, 8).unwrap(), [id]);
         }
         due(108);
-        assert!(net_take(&conn, &claimed, order, 5).unwrap().is_empty(), "eight claims, however few they hold");
+        assert!(net_take(&conn, &claimed, order, 5, 8).unwrap().is_empty(), "eight claims, however few they hold");
     }
 
     #[test]

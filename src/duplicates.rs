@@ -124,14 +124,14 @@ pub fn one_archive_set<'a>(mut names: impl Iterator<Item = &'a str>) -> bool {
     let mut set = None;
     names.all(|name| {
         let family = match classify(name) {
-            Kind::Par2Base | Kind::Par2Vol(_) | Kind::Nfo | Kind::Image => return true,
+            Kind::Par2Base | Kind::Par2Vol(_) | Kind::Nfo | Kind::Nzb | Kind::Image => return true,
             Kind::Rar(_) => "rar",
             Kind::SevenZip(_) => "7z",
             Kind::Zip(_) => "zip",
             Kind::Numbered(_) => "numbered",
             Kind::NotArchive | Kind::Unidentified => {
                 let lower = name.to_ascii_lowercase();
-                return is_sample(&lower) || lower.ends_with(".sfv") || lower.ends_with(".nzb");
+                return is_sample(&lower) || lower.ends_with(".sfv");
             }
         };
         let this = (family, volume_set(name));

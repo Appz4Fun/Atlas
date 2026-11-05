@@ -42,7 +42,56 @@ pub(crate) fn main_file(files: &[FileInfo]) -> Option<&FileInfo> {
     let candidates: Vec<&FileInfo> =
         files.iter().filter(|f| !is_par2(&f.filename) && !is_small_text(&f.filename)).collect();
     let most = candidates.iter().map(|f| parts(f)).max()?;
-    candidates.into_iter().filter(|f| parts(f) >= most.saturating_sub(1)).min_by_key(|f| first_volume_key(&f.filename))
+    let pick = candidates
+        .iter()
+        .copied()
+        .filter(|f| parts(f) >= most.saturating_sub(1))
+        .min_by_key(|f| first_volume_key(&f.filename))?;
+    Some(first_of_set(pick, &candidates))
+}
+
+/// The first volume posted of the set `pick` is in. Only it holds the archive's header, and it can be smaller than
+/// the rest: a 7z `.001` of 220 parts before 120 volumes of 293, or a `.part01.rar` cut shorter, which the size rule
+/// above leaves out.
+fn first_of_set<'a>(pick: &'a FileInfo, candidates: &[&'a FileInfo]) -> &'a FileInfo {
+    let Some((set, _)) = volume(&pick.filename) else { return pick };
+    candidates
+        .iter()
+        .copied()
+        .filter_map(|f| volume(&f.filename).filter(|(s, _)| *s == set).map(|(_, n)| (n, f)))
+        .min_by_key(|(n, _)| *n)
+        .map_or(pick, |(_, f)| f)
+}
+
+/// A volume's set and its place in the set: `x.rar` 0 then `x.r00` on from 1 (and `.s00` past `.r99`), `x.part3.rar`
+/// 3, `x.7z.003` and `x.003` 3. None for a name that isn't a volume.
+fn volume(name: &str) -> Option<(String, u32)> {
+    let lower = name.to_ascii_lowercase();
+    let (stem, ext) = lower.rsplit_once('.')?;
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    if ext.len() == 3 && digits(ext) {
+        return Some((format!("{stem}.#"), ext.parse().ok()?));
+    }
+    if ext == "rar" {
+        if let Some((set, part)) = stem.rsplit_once(".part")
+            && digits(part)
+        {
+            return Some((format!("{set}.part#.rar"), part.parse().ok()?));
+        }
+        return Some((format!("{stem}.r#"), 0));
+    }
+    match ext.as_bytes() {
+        [letter @ b'r'..=b'z', d1, d2] if d1.is_ascii_digit() && d2.is_ascii_digit() => {
+            let n = u32::from(letter - b'r') * 100 + u32::from(d1 - b'0') * 10 + u32::from(d2 - b'0');
+            Some((format!("{stem}.r#"), n + 1))
+        }
+        _ => None,
+    }
+}
+
+/// Whether `name` is a volume after its set's first, which only a probe from before `first_of_set` could have read.
+fn later_volume(name: &str) -> bool {
+    volume(name).is_some_and(|(set, n)| if set.ends_with(".r#") { n > 0 } else { n > 1 })
 }
 
 /// `.rar` and `.part01.rar` and `.001` before the volumes after them.
@@ -53,12 +102,83 @@ fn first_volume_key(name: &str) -> (u8, String) {
 }
 
 pub(super) fn fetch_raw(ctx: &mut StepCtx<'_>, message_id: &str, file: &str) -> Result<Got, StepError> {
-    let wanted = BodyRequest {
-        message_id: message_id.to_string(),
-        file: file.to_string(),
-        max_bytes: Some(archive::ARTICLE_CAP),
+    Ok(ctx.fetch_article(&capped(message_id, file))?.got)
+}
+
+/// A file's first article, or its first `ARTICLE_CAP` when it's bigger: some posters put 40 MB in an article, and
+/// a media header is in the first few hundred KB of it.
+fn fetch_head(ctx: &mut StepCtx<'_>, message_id: &str, file: &str) -> Result<Got, StepError> {
+    Ok(ctx.fetch_article_prefix(&capped(message_id, file))?.got)
+}
+
+fn capped(message_id: &str, file: &str) -> BodyRequest {
+    BodyRequest { message_id: message_id.to_string(), file: file.to_string(), max_bytes: Some(archive::ARTICLE_CAP) }
+}
+
+/// Asks for the probe again on releases whose probe found the main file's first article too big to read, before
+/// `fetch_head`: it saw only that the article was there, no yEnc header. Once, from the stage's seed.
+pub(crate) fn rerun_big_heads(conn: &rusqlite::Connection, now: i64) -> rusqlite::Result<usize> {
+    rerun_probes(conn, "json_extract(info, '$.yenc') is null and json_extract(info, '$.health.first') = 1", now)
+}
+
+/// Asks for the probe again on AVI files it found no tracks in, before `avi` read them: posted bare, split into
+/// `.avi.001` and on, or stored in an archive. Once, from the stage's seed.
+pub(crate) fn rerun_avi(conn: &rusqlite::Connection, now: i64) -> rusqlite::Result<usize> {
+    rerun_probes(
+        conn,
+        "json_extract(info, '$.media') is null
+         and (lower(json_extract(info, '$.file')) like '%.avi' or lower(json_extract(info, '$.file')) like '%.avi.0%'
+              or lower(json_extract(info, '$.archive.name')) like '%.avi')",
+        now,
+    )
+}
+
+/// A saved probe with no media of an AVI, from before `avi` read them, or of a set's later volume, from before
+/// `first_of_set`: probed again rather than reused, as when the shards were made again and the seed's reruns found
+/// nothing to ask for.
+fn stale_saved(info: &str) -> bool {
+    let Ok(p) = serde_json::from_str::<serde_json::Value>(info) else { return false };
+    let avi = |name: Option<&str>| {
+        let lower = name.unwrap_or_default().to_ascii_lowercase();
+        lower.ends_with(".avi") || lower.contains(".avi.0")
     };
-    Ok(ctx.fetch_article(&wanted)?.got)
+    p["media"].is_null()
+        && (avi(p["file"].as_str())
+            || avi(p["archive"]["name"].as_str())
+            || p["file"].as_str().is_some_and(later_volume))
+}
+
+/// Asks for the probe again on releases whose probe read a later volume of a set and found no media, before
+/// `first_of_set`. Once, from the stage's seed.
+pub(crate) fn rerun_later_volumes(conn: &rusqlite::Connection, now: i64) -> rusqlite::Result<usize> {
+    let ids: Vec<i64> = conn
+        .prepare(
+            "select release_id, json_extract(info, '$.file') from release_probe
+             where json_extract(info, '$.media') is null",
+        )?
+        .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?)))?
+        .filter_map(|row| match row {
+            Ok((id, Some(file))) if later_volume(&file) => Some(Ok(id)),
+            Ok(_) => None,
+            Err(e) => Some(Err(e)),
+        })
+        .collect::<rusqlite::Result<_>>()?;
+    for id in &ids {
+        crate::postprocess::rerun_on(conn, *id, mask(PROBE_STEP), now)?;
+    }
+    Ok(ids.len())
+}
+
+/// The probe again, past its saved result, on the releases whose probe row matches `filter`.
+fn rerun_probes(conn: &rusqlite::Connection, filter: &str, now: i64) -> rusqlite::Result<usize> {
+    let ids: Vec<i64> = conn
+        .prepare(&format!("select release_id from release_probe where {filter}"))?
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    for id in &ids {
+        crate::postprocess::rerun_on(conn, *id, mask(PROBE_STEP), now)?;
+    }
+    Ok(ids.len())
 }
 
 /// Whether a server has it. None: this doesn't say, as when the article's too big to read, or the budget's gone.
@@ -116,6 +236,7 @@ impl Step for ProbeStep {
                         s.cover
                             .as_ref()
                             .is_none_or(|(_, sha)| super::cover_file(sha).is_some_and(|p| p.exists()))
+                            && !stale_saved(&s.info)
                     },
                 )
         {
@@ -186,7 +307,7 @@ impl Step for ProbeStep {
             let wire_bytes = first.as_ref().map_or(0, |f| f.bytes);
             let mut front = Vec::new();
             if let Some(first) = &first {
-                let got = fetch_raw(ctx, &first.message_id, &file.filename)?;
+                let got = fetch_head(ctx, &first.message_id, &file.filename)?;
                 if let Some(there) = there(&got) {
                     info.health.insert("first".into(), there);
                 }
@@ -511,6 +632,106 @@ mod tests {
             touched_at: None,
             sealed: false,
         }
+    }
+
+    #[test]
+    fn probes_that_couldnt_read_the_first_article_are_asked_for_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        crate::db::create_db_at(&main).unwrap();
+        let conn = crate::db::open_shard(&crate::store::shard_path(&main, 0)).unwrap();
+        for (id, info) in [
+            (1i64, r#"{"health":{"first":true},"yenc":null}"#),
+            (2, r#"{"health":{"first":true},"yenc":{"part":1}}"#),
+            (3, r#"{"health":{"first":false},"yenc":null}"#),
+        ] {
+            conn.execute("insert into releases (id, name, group_name) values (?, ?, 'g')", rusqlite::params![id, id])
+                .unwrap();
+            conn.execute(
+                "insert into pp_state (release_id, done) values (?, ?)",
+                rusqlite::params![id, mask(PROBE_STEP)],
+            )
+            .unwrap();
+            conn.execute("insert into release_probe (release_id, info) values (?, ?)", rusqlite::params![id, info])
+                .unwrap();
+        }
+        assert_eq!(rerun_big_heads(&conn, 100).unwrap(), 1);
+        for (id, info) in [
+            (4i64, r#"{"file":"Show.S01E01.XviD.avi","media":null}"#),
+            (5, r#"{"file":"Movie.part01.rar","archive":{"name":"Movie.CD1.avi"},"media":null}"#),
+            (6, r#"{"file":"Movie.avi.001","media":null}"#),
+            (7, r#"{"file":"Movie.avi","media":{"container":"avi"}}"#),
+            (8, r#"{"file":"Movie.mkv","media":null}"#),
+        ] {
+            conn.execute("insert into releases (id, name, group_name) values (?, ?, 'g')", rusqlite::params![id, id])
+                .unwrap();
+            conn.execute(
+                "insert into pp_state (release_id, done) values (?, ?)",
+                rusqlite::params![id, mask(PROBE_STEP)],
+            )
+            .unwrap();
+            conn.execute("insert into release_probe (release_id, info) values (?, ?)", rusqlite::params![id, info])
+                .unwrap();
+        }
+        assert_eq!(rerun_avi(&conn, 100).unwrap(), 3, "a bare one, one in an archive, a split one");
+        conn.execute("insert into releases (id, name, group_name) values (9, '9', 'g')", []).unwrap();
+        conn.execute("insert into pp_state (release_id, done) values (9, ?)", [mask(PROBE_STEP)]).unwrap();
+        conn.execute(
+            "insert into release_probe (release_id, info) values (9, '{\"file\":\"x.7z.002\",\"media\":null}')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(rerun_later_volumes(&conn, 100).unwrap(), 1, "the 7z's second volume, not the mkv");
+        let state = |id: i64| -> (i64, i64) {
+            conn.query_row("select done, rerun_mask from pp_state where release_id = ?", [id], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap()
+        };
+        assert_eq!(state(1), (0, mask(PROBE_STEP)), "too big: probed again, past the saved probe");
+        assert_eq!(state(2), (mask(PROBE_STEP), 0), "read");
+        assert_eq!(state(3), (mask(PROBE_STEP), 0), "missing");
+        let queued: i64 = conn.query_row("select count(*) from pp_queue", [], |r| r.get(0)).unwrap();
+        assert_eq!(queued, 5);
+        assert_eq!(state(7), (mask(PROBE_STEP), 0), "read already");
+    }
+
+    #[test]
+    fn a_saved_avi_probe_with_no_tracks_isnt_reused() {
+        assert!(stale_saved(r#"{"file":"Show.S01E01.XviD.avi","media":null}"#));
+        assert!(stale_saved(r#"{"file":"a.part01.rar","archive":{"name":"Movie.CD1.AVI"},"media":null}"#));
+        assert!(stale_saved(r#"{"file":"Movie.avi.001"}"#));
+        assert!(!stale_saved(r#"{"file":"Movie.avi","media":{"container":"avi"}}"#), "read");
+        assert!(!stale_saved(r#"{"file":"Movie.mkv","media":null}"#));
+    }
+
+    #[test]
+    fn a_smaller_first_volume_is_still_the_one_read() {
+        let mut files = vec![file("x.7z.001", 220)];
+        for n in 2..=5 {
+            files.push(file(&format!("x.7z.{n:03}"), 293));
+        }
+        files.push(file("x.par2", 1));
+        assert_eq!(main_file(&files).unwrap().filename, "x.7z.001");
+        let parts = [file("M.part1.rar", 50), file("M.part2.rar", 100), file("M.part3.rar", 100)];
+        assert_eq!(main_file(&parts).unwrap().filename, "M.part1.rar");
+        let old = [file("a.r00", 100), file("a.r01", 100), file("a.rar", 80)];
+        assert_eq!(main_file(&old).unwrap().filename, "a.rar");
+        // a sample beside a bigger file isn't a volume of it
+        let raw = [file("movie.mkv", 3000), file("movie.sample.mkv", 10)];
+        assert_eq!(main_file(&raw).unwrap().filename, "movie.mkv");
+    }
+
+    #[test]
+    fn later_volumes_are_known() {
+        for later in ["x.7z.002", "x.002", "M.part02.rar", "a.r00", "a.s01"] {
+            assert!(later_volume(later), "{later}");
+        }
+        for first in ["x.7z.001", "x.001", "M.part01.rar", "M.part1.rar", "a.rar", "movie.mkv", "x.000"] {
+            assert!(!later_volume(first), "{first}");
+        }
+        assert!(stale_saved(r#"{"file":"x.7z.002","media":null}"#), "a later volume with no media");
+        assert!(!stale_saved(r#"{"file":"x.7z.002","media":{"container":"matroska"}}"#));
     }
 
     #[test]

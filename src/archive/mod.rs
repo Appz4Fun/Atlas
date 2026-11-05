@@ -3,6 +3,7 @@
 
 pub mod link;
 pub mod names;
+pub mod nzb;
 pub mod rar;
 pub mod select;
 pub mod sevenz;
@@ -43,6 +44,8 @@ pub enum Format {
     SevenZip,
     Zip,
     Par2,
+    /// a posted NZB: a list of another post's files
+    Nzb,
     Image,
     Media,
     Unknown,
@@ -83,6 +86,8 @@ pub fn identify(head: &[u8]) -> Format {
         || head.starts_with(b"ID3")
     {
         Format::Media
+    } else if nzb::is_nzb(head) {
+        Format::Nzb
     } else {
         Format::Unknown
     }

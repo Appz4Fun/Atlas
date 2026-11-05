@@ -368,8 +368,38 @@ pub fn create(path: &Path) -> rusqlite::Result<Connection> {
     Ok(conn)
 }
 
+/// Connections to the raw database, each for one caller at a time. It was one: every body step of every net claim
+/// waited on it, ~180 threads at 24 claims a shard. WAL lets the others read while one writes.
 #[cfg(not(test))]
-static GLOBAL_CONN: OnceLock<Mutex<Option<(PathBuf, Connection)>>> = OnceLock::new();
+const RAW_CONNS: usize = 16;
+
+#[cfg(not(test))]
+type RawSlot = Mutex<Option<(PathBuf, Connection)>>;
+
+#[cfg(not(test))]
+static GLOBAL_CONNS: OnceLock<Vec<RawSlot>> = OnceLock::new();
+
+/// One open at a time, soo two connections don't both run the schema's one-time changes.
+#[cfg(not(test))]
+static OPENING: Mutex<()> = Mutex::new(());
+
+/// A free connection, or when all are busy, one by turn to wait on.
+#[cfg(not(test))]
+fn raw_slot() -> std::sync::MutexGuard<'static, Option<(PathBuf, Connection)>> {
+    use std::sync::TryLockError;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static TURN: AtomicUsize = AtomicUsize::new(0);
+    let slots = GLOBAL_CONNS.get_or_init(|| (0..RAW_CONNS).map(|_| Mutex::new(None)).collect());
+    for slot in slots {
+        match slot.try_lock() {
+            Ok(guard) => return guard,
+            Err(TryLockError::Poisoned(e)) => return e.into_inner(),
+            Err(TryLockError::WouldBlock) => {}
+        }
+    }
+    let slot = &slots[TURN.fetch_add(1, Ordering::Relaxed) % RAW_CONNS];
+    slot.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 thread_local! {
     static SHARD_RAW_PATH: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
@@ -411,10 +441,10 @@ fn with_raw<T>(f: impl FnOnce(&Connection) -> rusqlite::Result<T>) -> Option<T> 
         let path = SHARD_RAW_PATH
             .with(|cell| cell.borrow().clone())
             .unwrap_or_else(|| path_for(&crate::paths::database()));
-        let mutex = GLOBAL_CONN.get_or_init(|| Mutex::new(None));
-        let mut guard = mutex.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = raw_slot();
         let needs_open = guard.as_ref().is_none_or(|(cached_path, _)| cached_path != &path);
         if needs_open {
+            let _opening = OPENING.lock().unwrap_or_else(|e| e.into_inner());
             *guard = create(&path).ok().map(|conn| (path, conn));
         }
         let (_, conn) = guard.as_ref()?;
@@ -422,9 +452,11 @@ fn with_raw<T>(f: impl FnOnce(&Connection) -> rusqlite::Result<T>) -> Option<T> 
     }
 }
 
+/// `with_raw` in a transaction that takes the write lock first: with more than one connection, one that read first
+/// and wrote after another's commit would fail at once instead of waiting its turn.
 fn with_raw_tx<T>(f: impl FnOnce(&Connection) -> rusqlite::Result<T>) -> Option<T> {
     with_raw(|conn| {
-        let tx = conn.unchecked_transaction()?;
+        let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
         let out = f(&tx)?;
         tx.commit()?;
         Ok(out)
@@ -1388,11 +1420,12 @@ pub fn get_archive(
         let password_check = check;
         let listing_complete = l_comp.unwrap_or(0) != 0;
         let listing_damaged = l_dmg.unwrap_or(0) != 0;
+        // an archive's rows only: PAR2 (1) and posted NZB (5) lists are kept and restored on their own
         let files = conn
             .prepare_cached(
                 "SELECT seq, name, size, coalesce(source, 2)
                  FROM raw_archive_inner_files
-                 WHERE release_name = ?1 AND group_name = ?2 AND content_id = ?3 AND coalesce(source, 2) != 1
+                 WHERE release_name = ?1 AND group_name = ?2 AND content_id = ?3 AND coalesce(source, 2) NOT IN (1, 5)
                  ORDER BY seq",
             )?
             .query_map(params![name, group_name, content_id], |r| {
@@ -2193,7 +2226,7 @@ fn harvest_attached_release_tables(tx: &rusqlite::Transaction<'_>, schema: &str)
     if has_table(tx, schema, "archive_release")? {
         let listing_complete_expr = match (has_fp, has_inner) {
             (true, true) => format!(
-                "CASE WHEN {list_verified} AND ((a.password = 0 AND NOT EXISTS (SELECT 1 FROM {schema}.archive_inner_files f WHERE f.release_id = a.release_id AND coalesce(f.source, 2) != 1))
+                "CASE WHEN {list_verified} AND ((a.password = 0 AND NOT EXISTS (SELECT 1 FROM {schema}.archive_inner_files f WHERE f.release_id = a.release_id AND coalesce(f.source, 2) NOT IN (1, 5)))
                            OR EXISTS (SELECT 1 FROM {schema}.release_fingerprint fp WHERE fp.release_id = a.release_id AND fp.content IS NOT NULL))
                       THEN 1 ELSE 0 END"
             ),

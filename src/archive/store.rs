@@ -14,6 +14,8 @@ pub const SOURCE_PAR2: i64 = 1;
 pub const SOURCE_RAR: i64 = 2;
 pub const SOURCE_7Z: i64 = 3;
 pub const SOURCE_ZIP: i64 = 4;
+/// the files of the post a posted NZB points to, not what's inside them
+pub const SOURCE_NZB: i64 = 5;
 
 pub const INNER_FILES: ShardTable = ShardTable {
     name: "archive_inner_files",
@@ -277,6 +279,29 @@ pub fn segment_crcs_with(conn: &Connection, release_id: i64) -> std::collections
     };
     rows.flatten().collect()
 }
+
+/// Releases of this shard an NZB read here points to, by name: the net lane reads them sooner (`NET_RANK`), as
+/// what the NZB was posted for. A release in another shard isn't marked.
+pub const NZB_POINTED: ShardTable = ShardTable {
+    name: "nzb_pointed",
+    create: "create table if not exists nzb_pointed (release_id INTEGER PRIMARY KEY)",
+    indexes: &[],
+    release_key: Some("release_id"),
+    added: &[],
+};
+
+/// `?1` a release name, `?2` the release whose NZB names it
+pub const MARK_POINTED: &str =
+    "insert or ignore into nzb_pointed (release_id) select id from releases where name = ?1 and id != ?2";
+/// and its rank worked out now, after `MARK_POINTED`, for one the net lane already waits on: 2 at least, or what its
+/// size and category give when that's more, ranked or not yet. A visit works it out the same way
+pub static RANK_POINTED: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!(
+        "update pp_state set net_rank = {}
+         where net_wanted = 1 and release_id in (select id from releases where name = ?1 and id != ?2)",
+        crate::postprocess::schema::NET_RANK.replace("?1", "pp_state.release_id")
+    )
+});
 
 pub const DELETE_SOURCE: &str = "delete from archive_inner_files where release_id = ?1 and source = ?2";
 pub const INSERT_FILE: &str =

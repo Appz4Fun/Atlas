@@ -77,7 +77,7 @@ pub(crate) struct Inner {
     settings: RwLock<Settings>,
     pub(crate) stop: Arc<AtomicBool>,
     db_busy: [AtomicBool; SHARDS],
-    /// per shard: what its running net claims hold, `NET_CLAIMS_PER_SHARD` claims at most
+    /// per shard: what its running net claims hold, `net_claims_per_shard` claims at most
     net_claimed: [Mutex<NetClaims>; SHARDS],
     fetcher: BodyFetcher,
     stats: Arc<Stats>,
@@ -868,7 +868,8 @@ impl Inner {
     fn net_claim(&self, conn: &Connection, db: &Db, shard: usize) -> anyhow::Result<bool> {
         let now = chrono::Utc::now().timestamp();
         let order = claim_order(self.claims[shard].load(Relaxed));
-        let ids = net_take(conn, &self.net_claimed[shard], order, now)?;
+        let most = self.settings.read().unwrap().config.net_claims_per_shard;
+        let ids = net_take(conn, &self.net_claimed[shard], order, now, most)?;
         if ids.is_empty() {
             return Ok(false);
         }
@@ -1214,6 +1215,26 @@ fn seed_shard(conn: &Connection, enabled: StepMask, stamps: &[(u8, StepMask, i64
         }
         set("pp_junk_queued", now)?;
     }
+    // once, for the movies and TV ranked before `SMALL_VIDEO` counted: ranked again, soo they leave the 0s
+    if meta("pp_net_rank_small_video")?.is_none() {
+        rerank_small_video(conn)?;
+        set("pp_net_rank_small_video", now)?;
+    }
+    // once, for the probes from before a too big first article was read in part
+    if meta("pp_probe_big_heads")?.is_none() {
+        crate::probe::step::rerun_big_heads(conn, now)?;
+        set("pp_probe_big_heads", now)?;
+    }
+    // once, for the AVI files probed before their header was read
+    if meta("pp_probe_avi")?.is_none() {
+        crate::probe::step::rerun_avi(conn, now)?;
+        set("pp_probe_avi", now)?;
+    }
+    // once, for the probes that read a set's later volume before its first was looked for
+    if meta("pp_probe_first_volume")?.is_none() {
+        crate::probe::step::rerun_later_volumes(conn, now)?;
+        set("pp_probe_first_volume", now)?;
+    }
     let seen = meta("pp_steps_seen")?.unwrap_or(0);
     let new = if seeded { enabled & !seen } else { enabled };
     if seeded && new != 0 {
@@ -1233,6 +1254,19 @@ fn seed_shard(conn: &Connection, enabled: StepMask, stamps: &[(u8, StepMask, i64
         }
     }
     Ok(())
+}
+
+/// Ranks again the movie and TV releases of `SMALL_VIDEO` or more the net lane still wants at 0, the rank they had
+/// before it counted. Through the category index: a shard has tens of millions of 0s and ~150,000 movies and TV.
+pub(crate) fn rerank_small_video(conn: &Connection) -> rusqlite::Result<usize> {
+    let sql = format!(
+        "update pp_state set net_rank = {} where net_wanted = 1 and net_rank = 0 and release_id in (
+             select c.release_id from release_category c join releases r on r.id = c.release_id
+             where (c.category between 2000 and 2999 or c.category between 5000 and 5999) and r.size >= {})",
+        super::schema::NET_RANK.replace("?1", "pp_state.release_id"),
+        super::schema::SMALL_VIDEO,
+    );
+    conn.execute(&sql, [])
 }
 
 /// The net lane's order for a shard's `claims`-th claim. Mostly by `net_rank`, biggest video first, as the owner
@@ -1272,10 +1306,6 @@ pub(crate) fn queue_shares() -> (f64, f64) {
     (latest / 4.0, 1.0 - latest / 4.0)
 }
 
-/// Net claims of one shard running at once. They were one: a shard's releases went through a body fetch or a
-/// provider lookup one at a time, ~600 a minute over all eight shards, however many net workers there were.
-const NET_CLAIMS_PER_SHARD: usize = 8;
-
 /// A shard's running net claims, and the releases they hold.
 #[derive(Default)]
 pub(crate) struct NetClaims {
@@ -1294,15 +1324,18 @@ impl NetClaims {
 }
 
 /// The next `NET_BATCH` releases the net lane wants, in `order`, that no other claim of the shard holds, as a claim
-/// of its own: none when `NET_CLAIMS_PER_SHARD` claims are running. They are held till `give_back`.
+/// of its own: none when `most` claims are running (`net_claims_per_shard`). They are held till `give_back`. They
+/// were one at a time, then 8: each claim waits on its server most of the time, and 8 a shard left 448 of 512 net
+/// workers asleep with the bandwidth a quarter used.
 pub(crate) fn net_take(
     conn: &Connection,
     claimed: &Mutex<NetClaims>,
     order: &str,
     now: i64,
+    most: usize,
 ) -> rusqlite::Result<Vec<i64>> {
     let mut claimed = claimed.lock().unwrap();
-    if claimed.claims >= NET_CLAIMS_PER_SHARD {
+    if claimed.claims >= most.max(1) {
         return Ok(Vec::new());
     }
     let ids: Vec<i64> = conn

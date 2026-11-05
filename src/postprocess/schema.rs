@@ -67,17 +67,28 @@ pub const PP_STATE: ShardTable = ShardTable {
 
 /// How soon the net lane gets to release `?1`, higher first: what the owner wants most is big movies and TV, and a
 /// fully obfuscated upload of one looks like a big release with no category or an Other one until the net lane
-/// reads it. 1 from 1 GiB, 2 from 4 GiB, 3 from 15 GiB (UHD remuxes), 4 from 40 GiB. 0: smaller, or a category
-/// that is neither movies, TV nor Other.
-pub const NET_RANK: &str = "coalesce((select case
+/// reads it. 1 from 1 GiB, 2 from 4 GiB, 3 from 15 GiB (UHD remuxes), 4 from 40 GiB. A movie or TV release of
+/// `SMALL_VIDEO` or more is 1 too: an SD or 720p episode is under 1 GiB, and at 0 it waits behind every small post
+/// of every kind, soo it was never probed. 0: smaller, or a category that is neither movies, TV nor Other. A release
+/// with an NZB among its files is 2 at least, whatever its size or category: one small article that says what a whole
+/// other post is (`archive::nzb`), the first hop to it. And a release such an NZB read in this shard points to
+/// (`nzb_pointed`) is 2 at least too: the next hop.
+pub const NET_RANK: &str = "coalesce((select max(case
         when c.category is not null and c.category not between 2000 and 2999 and c.category not between 5000 and 5999
             and c.category not between 8000 and 8999 then 0
         when r.size >= 42949672960 then 4
         when r.size >= 16106127360 then 3
         when r.size >= 4294967296 then 2
         when r.size >= 1073741824 then 1
-        else 0 end
+        when r.size >= 52428800 and (c.category between 2000 and 2999 or c.category between 5000 and 5999) then 1
+        else 0 end,
+        case when exists (select 1 from files f where f.release_id = r.id and f.filename like '%.nzb')
+            or exists (select 1 from nzb_pointed p where p.release_id = r.id) then 2 else 0 end)
     from releases r left join release_category c on c.release_id = r.id where r.id = ?1), 0)";
+
+/// The smallest movie or TV release `NET_RANK` puts with the 1 GiB ones: 50 MiB, past samples and the odd file of a
+/// split post.
+pub const SMALL_VIDEO: i64 = 50 << 20;
 
 /// a resumable pass over existing releases, newest first
 pub const PP_WALKS: ShardTable = ShardTable {
@@ -103,6 +114,7 @@ pub const SHARD_TABLES: &[&ShardTable] = &[
     &PP_STATE,
     &PP_WALKS,
     &crate::archive::store::INNER_FILES,
+    &crate::archive::store::NZB_POINTED,
     &crate::archive::store::RELEASE,
     &crate::archive::store::NFO_PASSWORD,
     &crate::archive::store::PAR2_FILES,

@@ -157,11 +157,21 @@ impl StepCtx<'_> {
 
     /// One article undecoded, with its headers, for what `BODY` leaves out.
     pub fn fetch_article(&mut self, wanted: &BodyRequest) -> Result<BodyResult, StepError> {
+        self.raw(wanted, BackgroundRead::Raw)
+    }
+
+    /// `fetch_article` for one article's start: `wanted.max_bytes` of it, and a hang-up when that cut it short. For
+    /// a file's head in an article too big to read whole.
+    pub fn fetch_article_prefix(&mut self, wanted: &BodyRequest) -> Result<BodyResult, StepError> {
+        self.raw(wanted, BackgroundRead::RawPrefix)
+    }
+
+    fn raw(&mut self, wanted: &BodyRequest, read: BackgroundRead) -> Result<BodyResult, StepError> {
         if !self.lane_can_fetch {
             return Err(StepError::Permanent("a database step cant fetch bodies".into()));
         }
-        let got =
-            self.bodies.fetch(&self.release, wanted, &mut self.used_bodies, self.deadline, BackgroundRead::Raw)?;
+        let got = self.bodies.fetch(&self.release, wanted, &mut self.used_bodies, self.deadline, read)?;
+        // a cut one has no trailer, soo nothing's kept of it
         if let Got::Body(raw) = &got {
             // what the trailer says of the part: its CRC, and how many bytes it decodes to
             let article = crate::probe::yenc::split_article(raw);
