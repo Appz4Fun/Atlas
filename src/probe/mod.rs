@@ -5,6 +5,7 @@ pub mod archive;
 pub mod asf;
 pub mod avi;
 pub mod codec;
+pub mod dvd;
 pub mod lzma;
 pub mod media;
 pub mod moviehash;
