@@ -34,6 +34,8 @@ pub struct MediaInfo {
     pub attachments: Vec<Attachment>,
     /// tags extracted from Tags element
     pub tags: HashMap<String, String>,
+    /// a DVD's ID as libdvdread's `DVDDiscID` makes it (see `dvd::disc_id`): the same disc ripped twice has the same one
+    pub disc_id: Option<String>,
     /// cover art that was attached whole, kept apart from the JSON
     #[serde(skip)]
     pub cover: Option<Cover>,

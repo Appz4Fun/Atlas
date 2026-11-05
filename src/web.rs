@@ -2717,6 +2717,11 @@ fn probe_html(
         );
         dd(
             &mut tracks,
+            "DVD disc ID",
+            m.disc_id.as_deref().map_or(String::new(), |id| format!("<code>{}</code>", escape(id))),
+        );
+        dd(
+            &mut tracks,
             "Muxed",
             m.muxed_at
                 .and_then(|t| chrono::DateTime::from_timestamp(t, 0))
@@ -2834,6 +2839,15 @@ fn probe_html(
         }
     }
 
+    let mut tags = String::new();
+    if let Some(m) = &p.media {
+        let mut shown: Vec<(&String, &String)> = m.tags.iter().filter(|(n, v)| tag_shown(n, v)).collect();
+        shown.sort_by_key(|(n, _)| n.to_ascii_uppercase());
+        for (name, value) in shown {
+            dd(&mut tags, &escape(name), tag_value(name, value));
+        }
+    }
+
     let attachments = p.media.as_ref().map_or(String::new(), |m| {
         if m.attachments.is_empty() {
             return String::new();
@@ -2880,13 +2894,48 @@ fn probe_html(
         format!("<h2>SFV</h2><div class=\"table-wrap\"><table><tbody>{rows}</tbody></table></div>")
     };
     format!(
-        "{cover}{}{}{attachments}{}{}{}{nfo}{sfv}",
+        "{cover}{}{}{}{attachments}{}{}{}{nfo}{sfv}",
         panel("Tracks", &tracks),
         panel("Chapters", &chapters),
+        panel("Tags", &tags),
         panel("yEnc", &yenc),
         panel("Packing", &packed),
         panel("How it was posted", &posted),
     )
+}
+
+/// Matroska tags that can name the person who made or bought the file: kept in the probe, never shown.
+const PRIVATE_TAGS: [&str; 4] = ["ENCODED_BY", "PURCHASE_OWNER", "PURCHASE_INFO", "PURCHASE_ITEM"];
+
+/// Whether a Matroska tag goes on the page: not one that names a person, and no value with an email address in it.
+fn tag_shown(name: &str, value: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    !PRIVATE_TAGS.contains(&upper.as_str()) && !upper.contains("EMAIL") && !value.contains('@')
+}
+
+/// The most of a tag's value shown: a long one is cut.
+const TAG_VALUE_CHARS: usize = 300;
+
+/// A tag's value as the page shows it: an IMDb or TMDB ID links to its title there, the rest is text.
+fn tag_value(name: &str, value: &str) -> String {
+    let value = value.trim();
+    let text = |v: &str| {
+        let cut: String = v.chars().take(TAG_VALUE_CHARS).collect();
+        if cut.len() < v.len() { format!("{}…", escape(&cut)) } else { escape(&cut) }
+    };
+    match name.to_ascii_uppercase().as_str() {
+        "IMDB" if value.len() > 2 && value.starts_with("tt") && value[2..].bytes().all(|b| b.is_ascii_digit()) => {
+            format!("<a href=\"https://www.imdb.com/title/{v}/\" rel=\"noreferrer\">{v}</a>", v = attr(value))
+        }
+        "TMDB"
+            if value.split_once('/').is_some_and(|(kind, id)| {
+                matches!(kind, "movie" | "tv") && !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit())
+            }) =>
+        {
+            format!("<a href=\"https://www.themoviedb.org/{v}\" rel=\"noreferrer\">{v}</a>", v = attr(value))
+        }
+        _ => text(value),
+    }
 }
 
 /// Copies read in full on one page: each reads its articles.
@@ -4320,6 +4369,41 @@ mod tests {
         let media = MediaInfo { subtitles: vec![sub(Some("SDH")), sub(None)], ..Default::default() };
         let html = probe_html(&crate::probe::ProbeInfo { media: Some(media), ..Default::default() }, None, None, None);
         assert_eq!(html.matches("SDH").count(), 2, "{html}");
+    }
+
+    #[test]
+    fn matroska_tags_and_the_dvd_disc_id_show_but_never_a_person() {
+        use crate::probe::media::MediaInfo;
+        let tags = [
+            ("IMDB", "tt0133093"),
+            ("TMDB", "movie/603"),
+            ("BPS", "8123456"),
+            ("ENCODED_BY", "Some Person"),
+            ("COMMENT", "mail me at someone@example.com"),
+            ("DESCRIPTION", "<b>bold</b>"),
+            ("TVDB", "tt<script>"),
+        ];
+        let media = MediaInfo {
+            tags: tags.iter().map(|(n, v)| (n.to_string(), v.to_string())).collect(),
+            disc_id: Some("918d26bab2dcf09adf08a37da9267d21".into()),
+            ..Default::default()
+        };
+        let html = probe_html(&crate::probe::ProbeInfo { media: Some(media), ..Default::default() }, None, None, None);
+        assert!(html.contains("<h2>Tags</h2>"), "{html}");
+        assert!(
+            html.contains("<a href=\"https://www.imdb.com/title/tt0133093/\" rel=\"noreferrer\">tt0133093</a>"),
+            "{html}"
+        );
+        assert!(html.contains("https://www.themoviedb.org/movie/603"), "{html}");
+        assert!(html.contains("<dt>BPS</dt><dd>8123456</dd>"), "{html}");
+        assert!(!html.contains("Some Person") && !html.contains("ENCODED_BY"), "{html}");
+        assert!(!html.contains("example.com"), "{html}");
+        assert!(html.contains("&lt;b&gt;bold&lt;/b&gt;") && !html.contains("<script>"), "{html}");
+        assert!(html.contains("<dt>DVD disc ID</dt><dd><code>918d26bab2dcf09adf08a37da9267d21</code></dd>"), "{html}");
+        // sorted by name
+        assert!(html.find("<dt>BPS</dt>") < html.find("<dt>IMDB</dt>"), "{html}");
+        let long = tag_value("COMMENT", &"x".repeat(1000));
+        assert!(long.ends_with('…') && long.chars().count() == TAG_VALUE_CHARS + 1);
     }
 
     #[test]

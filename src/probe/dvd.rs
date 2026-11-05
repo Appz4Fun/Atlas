@@ -41,7 +41,53 @@ pub fn dvd(data: &[u8]) -> MediaInfo {
         }
         at += n + VTS.len();
     }
-    best.map(|(_, info)| info).unwrap_or_else(|| MediaInfo { container: "dvd-video".into(), ..MediaInfo::default() })
+    let mut info = best
+        .map(|(_, info)| info)
+        .unwrap_or_else(|| MediaInfo { container: "dvd-video".into(), ..MediaInfo::default() });
+    info.disc_id = disc_id(data);
+    info
+}
+
+/// The most IFOs libdvdread's `DVDDiscID` hashes: the manager's and nine title sets'.
+const DISC_ID_FILES: usize = 10;
+
+/// The disc's ID as libdvdread's `DVDDiscID` makes it: the MD5 of `VIDEO_TS.IFO`, then `VTS_01_0.IFO` up to the
+/// manager's count of title sets (at most nine), each file whole, with nothing between, as lowercase hex. Two rips of
+/// one disc have the same one whatever their names. An IFO's length is its own last sector, at byte 28 of both kinds;
+/// the `.BUP` copy of each, the same bytes, is passed over. `None` unless every IFO it takes is whole in `data`, which
+/// for a disc of more than one title set is rare in a front: the second set's IFO comes after the first's videos.
+pub fn disc_id(data: &[u8]) -> Option<String> {
+    use md5::{Digest, Md5};
+    let vmg_at = find(data, VMG)?;
+    let vmg = whole_ifo(&data[vmg_at..])?;
+    let sets = usize::from(be16(vmg, 62)?).min(DISC_ID_FILES - 1);
+    if sets == 0 {
+        return None;
+    }
+    let mut ifos: Vec<&[u8]> = vec![vmg];
+    let mut at = vmg_at + vmg.len();
+    while ifos.len() <= sets {
+        let n = data.get(at..).and_then(|rest| find(rest, VTS))?;
+        let ifo = whole_ifo(&data[at + n..])?;
+        if !ifos.contains(&ifo) {
+            ifos.push(ifo);
+        }
+        at += n + ifo.len();
+    }
+    let mut md5 = Md5::new();
+    for ifo in ifos {
+        md5.update(ifo);
+    }
+    let digest: [u8; 16] = md5.finalize().into();
+    Some(digest.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// An IFO from its start to the end of its last sector (`vmgi_last_sector` or `vtsi_last_sector`, at byte 28), if
+/// all of it is there. An IFO is a few sectors; a length past 4 MiB is a misread.
+fn whole_ifo(ifo: &[u8]) -> Option<&[u8]> {
+    let sectors = usize::try_from(be32(ifo, 28)?).ok()?.checked_add(1)?;
+    let len = sectors.checked_mul(2048).filter(|len| *len <= 4 << 20)?;
+    ifo.get(..len)
 }
 
 /// One title set's IFO from its start.
@@ -170,6 +216,8 @@ pub(crate) mod tests {
     pub(crate) fn ifo() -> Vec<u8> {
         let mut b = vec![0u8; 3 * 2048];
         b[..12].copy_from_slice(VTS);
+        // its last sector, the third
+        b[28..32].copy_from_slice(&2u32.to_be_bytes());
         // the program chain table in sector 1
         b[0xCC..0xD0].copy_from_slice(&1u32.to_be_bytes());
         b[0x200] = 0b0101_1100;
@@ -253,6 +301,57 @@ pub(crate) mod tests {
         let info = dvd(&data);
         assert_eq!(info.audio.len(), 3, "the feature's set, not the extra's");
         assert_eq!(info.duration_secs, Some(6750.0));
+    }
+
+    /// A manager IFO of one sector for `sets` title sets.
+    fn vmg(sets: u16) -> Vec<u8> {
+        let mut b = vec![0u8; 2048];
+        b[..12].copy_from_slice(VMG);
+        b[62..64].copy_from_slice(&sets.to_be_bytes());
+        b
+    }
+
+    fn md5_hex(parts: &[&[u8]]) -> String {
+        use md5::{Digest, Md5};
+        let mut md5 = Md5::new();
+        for p in parts {
+            md5.update(p);
+        }
+        let digest: [u8; 16] = md5.finalize().into();
+        digest.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    #[test]
+    fn the_disc_id_is_the_md5_of_the_manager_and_title_set_ifos() {
+        let (vmg, vts) = (vmg(1), ifo());
+        // an ISO's order: the manager, its menu, the set's IFO, its videos, then the set's .BUP copy
+        let data = [&[0u8; 4096][..], &vmg, &[7u8; 5000], &vts, &[9u8; 3000], &vts].concat();
+        let want = md5_hex(&[&vmg, &vts]);
+        assert_eq!(disc_id(&data), Some(want.clone()));
+        assert_eq!(dvd(&data).disc_id, Some(want.clone()));
+        // a stored archive's order: each .BUP first, the same bytes
+        let folder = [&vmg[..], &vmg, &vts, &vts].concat();
+        assert_eq!(disc_id(&folder), Some(want));
+    }
+
+    #[test]
+    fn a_disc_id_wants_every_ifo_whole() {
+        let (vmg1, vts) = (vmg(1), ifo());
+        let whole = [&vmg1[..], &vts].concat();
+        assert_eq!(disc_id(&whole[..whole.len() - 1]), None, "the set's IFO is cut");
+        assert_eq!(disc_id(&vmg1), None, "no title set yet");
+        // two title sets, only the first read: no ID rather than a wrong one
+        let two = [&vmg(2)[..], &vts].concat();
+        assert_eq!(disc_id(&two), None);
+        let mut second = ifo();
+        second[0x300] = 1;
+        let both = [&vmg(2)[..], &vts, &vts, &second].concat();
+        assert_eq!(disc_id(&both), Some(md5_hex(&[&vmg(2), &vts, &second])));
+        assert_eq!(disc_id(&[&vmg(0)[..], &vts].concat()), None, "a manager with no sets");
+        // cut anywhere: safe
+        for cut in (0..both.len()).step_by(13) {
+            let _ = disc_id(&both[..cut]);
+        }
     }
 
     #[test]
