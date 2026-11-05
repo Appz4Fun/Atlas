@@ -1,4 +1,4 @@
-//! Tracks and format from the start of a media file: Matroska, WebM and MP4. All total functions: bad or cut
+//! Tracks and format from the start of a media file: Matroska, WebM, MP4, AVI and ASF (see `avi`, `asf`). All total functions: bad or cut
 //! off bytes give what was read before them.
 
 use std::collections::HashMap;
@@ -137,6 +137,10 @@ pub fn parse(data: &[u8]) -> Option<MediaInfo> {
         matroska(data)
     } else if is_mp4(data) {
         mp4(data)
+    } else if super::avi::is_avi(data) {
+        super::avi::avi(data)
+    } else if super::asf::is_asf(data) {
+        super::asf::asf(data)
     } else {
         return None;
     };
@@ -686,11 +690,11 @@ fn says_commentary(name: Option<&str>) -> bool {
 }
 
 /// The most tracks kept. Real files have a few dozen at most, and these come from Usenet.
-const MAX_TRACKS: usize = 128;
+pub(super) const MAX_TRACKS: usize = 128;
 /// The most characters kept of a track's codec, name or language.
-const MAX_TRACK_TEXT: usize = 256;
+pub(super) const MAX_TRACK_TEXT: usize = 256;
 
-fn is_full(info: &MediaInfo) -> bool {
+pub(super) fn is_full(info: &MediaInfo) -> bool {
     info.video.len() + info.audio.len() + info.subtitles.len() >= MAX_TRACKS
 }
 

@@ -1541,16 +1541,7 @@ fn inside_panel(i: &MetaInputs<'_>, l: &Looked, compact: bool) -> Facts {
 
 /// The names of the files a posted NZB lists, as a save would name their release, PAR2 files last. At most 3.
 fn nzb_release_names(inner: &InnerView) -> Vec<String> {
-    let mut rows: Vec<&InnerFileRow> = inner.files.iter().filter(|r| r.source == SOURCE_NZB).collect();
-    rows.sort_by_key(|r| r.name.to_ascii_lowercase().ends_with(".par2"));
-    let mut names: Vec<String> = Vec::new();
-    for row in rows {
-        let name = crate::parser::strip_release_suffixes(crate::archive::names::base_name(&row.name));
-        if !name.is_empty() && !names.iter().any(|n| n.eq_ignore_ascii_case(&name)) && names.len() < 3 {
-            names.push(name);
-        }
-    }
-    names
+    crate::archive::nzb::release_names(inner.files.iter().filter(|r| r.source == SOURCE_NZB).map(|r| r.name.as_str()))
 }
 
 /// The releases a posted NZB points to, by name in every shard, not this one: up to 5 a name.
@@ -1917,7 +1908,7 @@ fn listing_source(inner: &InnerView) -> Option<String> {
             SOURCE_RAR => Some("the RAR headers"),
             SOURCE_7Z => Some("the 7z headers"),
             SOURCE_ZIP => Some("the ZIP headers"),
-            SOURCE_NZB => Some("the posted NZB"),
+            SOURCE_NZB => Some("an NZB's file list"),
             _ => None,
         })
         .collect();

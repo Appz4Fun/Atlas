@@ -57,4 +57,5 @@ pub mod ui;
 pub mod video;
 pub mod web;
 mod web_meta;
+mod web_pending;
 pub mod word_index;

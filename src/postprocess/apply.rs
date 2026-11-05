@@ -68,13 +68,15 @@ pub(crate) fn count_names(renames: &[(u8, bool)]) {
 static UPSERT_STATE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     format!(
         "insert into pp_state (release_id, done, failed, net_wanted, db_attempts, net_attempts, net_next_at, parts_seen,
-                                   last_error, rerun_gen, rerun_mask, net_transient, net_rank)
+                                   last_error, rerun_gen, rerun_mask, net_transient, net_rank, net_left)
              values (?1, ?2 & ~?4, ?3 & ~?2 & ~?4, case when (?5 & ~(?2 & ~?4) & ~(?3 & ~?4)) != 0 then 1 end,
-                     coalesce(?6, 0), coalesce(?7, 0), coalesce(?8, 0), coalesce(?9, 0), ?10, ?4 != 0, ?4, ?11, {rank})
+                     coalesce(?6, 0), coalesce(?7, 0), coalesce(?8, 0), coalesce(?9, 0), ?10, ?4 != 0, ?4, ?11, {rank},
+                     nullif(?5 & ~(?2 & ~?4) & ~(?3 & ~?4), 0))
              on conflict(release_id) do update set
                 done = (done | ?2) & ~?4,
                 failed = (failed | ?3) & ~?2 & ~?4,
                 net_wanted = case when (?5 & ~((done | ?2) & ~?4) & ~((failed | ?3) & ~?4)) != 0 then 1 end,
+                net_left = nullif(?5 & ~((done | ?2) & ~?4) & ~((failed | ?3) & ~?4), 0),
                 db_attempts = coalesce(?6, db_attempts),
                 net_attempts = coalesce(?7, net_attempts),
                 net_next_at = coalesce(?8, net_next_at),
@@ -577,6 +579,22 @@ mod tests {
         assert_eq!(state(&conn, id).2, None, "failed");
     }
 
+    #[test]
+    fn net_left_holds_the_net_steps_still_to_run() {
+        let (_dir, conn, id) = shard();
+        let left = |conn: &Connection| -> Option<i64> {
+            conn.query_row("select net_left from pp_state where release_id = ?", [id], |r| r.get(0)).unwrap()
+        };
+        run(&conn, Applied { release_id: id, net_mask: A | B, ..Default::default() });
+        assert_eq!(left(&conn), Some(A | B));
+        run(&conn, Applied { release_id: id, net_mask: A | B, set_done: A, ..Default::default() });
+        assert_eq!(left(&conn), Some(B), "one done");
+        run(&conn, Applied { release_id: id, net_mask: B, set_failed: B, ..Default::default() });
+        assert_eq!(left(&conn), None, "none left, as net_wanted");
+        run(&conn, Applied { release_id: id, claimed_gen: 1, net_mask: A | C, clear: A, ..Default::default() });
+        assert_eq!(left(&conn), Some(A | C), "a cleared step is back");
+    }
+
     fn rank(conn: &Connection, id: i64) -> Option<i64> {
         conn.query_row("select net_rank from pp_state where release_id = ?", [id], |r| r.get(0)).unwrap()
     }
@@ -606,6 +624,45 @@ mod tests {
         assert_eq!(ranked(60 * gib, Some(8010)), Some(4), "a hashed upload");
         assert_eq!(ranked(60 * gib, Some(3010)), Some(0), "audio, however big");
         assert_eq!(ranked(60 * gib, Some(6000)), Some(0), "nor XXX");
+        conn.execute("insert into files (release_id, filename, seen) values (?, 'Some.Post.NZB', x'01')", [id])
+            .unwrap();
+        assert_eq!(ranked(6_226, Some(2045)), Some(2), "a post of an NZB, however small");
+        assert_eq!(ranked(6_226, Some(3010)), Some(2), "and whatever it's filed as");
+        assert_eq!(ranked(60 * gib, Some(2045)), Some(4), "a big one with an NZB beside it stays where it was");
+        conn.execute("delete from files where filename = 'Some.Post.NZB'", []).unwrap();
+        assert_eq!(ranked(16 << 20, Some(2045)), Some(0));
+        conn.execute("insert into nzb_pointed (release_id) values (?)", [id]).unwrap();
+        assert_eq!(ranked(16 << 20, Some(2045)), Some(2), "what an NZB read here points to");
+    }
+
+    #[test]
+    fn what_an_nzb_points_to_is_ranked_as_a_visit_would() {
+        use crate::archive::store::{MARK_POINTED, RANK_POINTED};
+        let (_dir, conn, id) = shard();
+        let name: String = conn.query_row("select name from releases where id = ?", [id], |r| r.get(0)).unwrap();
+        let point = |size: i64, rank: Option<i64>| {
+            conn.execute("delete from nzb_pointed", []).unwrap();
+            conn.execute("update releases set size = ? where id = ?", params![size, id]).unwrap();
+            conn.execute(
+                "insert or replace into pp_state (release_id, net_wanted, net_rank) values (?, 1, ?)",
+                params![id, rank],
+            )
+            .unwrap();
+            conn.execute(MARK_POINTED, params![name, id + 8]).unwrap();
+            conn.execute(RANK_POINTED.as_str(), params![name, id + 8]).unwrap();
+            self::rank(&conn, id)
+        };
+        assert_eq!(point(16 << 20, Some(0)), Some(2), "a small one, ranked 0");
+        assert_eq!(point(60 << 30, None), Some(4), "a big one not ranked yet gets its own rank, not 2");
+        conn.execute(MARK_POINTED, params![name, id]).unwrap();
+        assert_eq!(conn.query_row("select count(*) from nzb_pointed", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+        conn.execute("delete from nzb_pointed", []).unwrap();
+        conn.execute(MARK_POINTED, params![name, id]).unwrap();
+        assert_eq!(
+            conn.query_row("select count(*) from nzb_pointed", [], |r| r.get::<_, i64>(0)).unwrap(),
+            0,
+            "not itself"
+        );
     }
 
     #[test]

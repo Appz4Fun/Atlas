@@ -108,6 +108,45 @@ fn whole_file(ctx: &mut StepCtx<'_>, file: &FileInfo, left: &mut usize) -> Resul
     Ok(Some(whole))
 }
 
+/// What an NZB an archive holds lists, from the article read: stored, not compressed or encrypted, its bytes are
+/// there as they are, from its start. Often only the first of its files, as its first article holds only its start.
+fn nzb_stored_in(listing: &Listing, body: &[u8]) -> Option<Listing> {
+    if listing.encrypted || !listing.files.iter().any(|f| select::classify(&f.name) == Kind::Nzb) {
+        return None;
+    }
+    let at = (0..body.len().saturating_sub(4))
+        .filter(|at| body.get(*at) == Some(&b'<'))
+        .find(|at| body.get(*at..).is_some_and(nzb::is_nzb))?;
+    let inside = nzb::list(body.get(at..)?);
+    (!inside.files.is_empty()).then_some(inside)
+}
+
+/// An archive's outcome with the list of the NZB inside it beside its own rows, in the same writes. The archive's
+/// name, password and fingerprint stand; a program the NZB lists makes the release junk as one inside would.
+fn with_nzb(
+    ctx: &StepCtx<'_>,
+    outcome: Outcome,
+    inside: Option<Listing>,
+    limits: &ArchiveConfig,
+) -> Result<Outcome, StepError> {
+    let Some(inside) = inside else { return Ok(outcome) };
+    if outcome.junk.is_some() {
+        return Ok(outcome);
+    }
+    Ok(merge_nzb(outcome, finish(ctx, SOURCE_NZB, inside, limits)?))
+}
+
+/// `with_nzb`'s join: the NZB's rows go with the archive's outcome, or its junk verdict in place of it.
+fn merge_nzb(mut outcome: Outcome, nested: Outcome) -> Outcome {
+    if outcome.junk.is_some() || nested.junk.is_some() {
+        return if outcome.junk.is_some() { outcome } else { nested };
+    }
+    outcome.matched |= nested.matched;
+    outcome.rerun |= nested.rerun;
+    outcome.writes.extend(nested.writes);
+    outcome
+}
+
 /// The list a posted NZB gave before, kept in the raw store, when nothing else in the release is to be read: no
 /// articles fetched for it. Not an archive, soo it has no `raw_archives` row for `get_archive` to find.
 fn restore_nzb(
@@ -258,6 +297,13 @@ fn finish_with_override(
         }
     }
 
+    // what an NZB points to, in this shard, is read sooner: the next hop
+    if source == SOURCE_NZB {
+        for name in nzb::release_names(rows.iter().map(|r| r.name.as_str())) {
+            writes.push(StepWrite::new(archive_store::MARK_POINTED, vec![name.clone().into(), id.into()]));
+            writes.push(StepWrite::new(archive_store::RANK_POINTED.as_str(), vec![name.into(), id.into()]));
+        }
+    }
     let name_source = if source == SOURCE_PAR2 { NAME_SOURCE_PAR2 } else { NAME_SOURCE_INNER };
     let name_wanted = name_may_change(release, name_source)
         && (source == SOURCE_PAR2 || release.is_obfuscated || looks_random(stem(&release.name)));
@@ -278,9 +324,11 @@ fn finish_with_override(
     })
 }
 
+/// An archive's list kept in the raw store, and the list of an NZB it holds when that was kept too.
 fn restore_archive(
     ctx: &StepCtx<'_>,
     saved: crate::raw_store::SavedArchive,
+    content_id: &[u8],
     limits: &ArchiveConfig,
 ) -> Result<Outcome, StepError> {
     let source = saved.files.first().map(|f| f.source).unwrap_or_else(|| {
@@ -303,7 +351,16 @@ fn restore_archive(
         damaged: saved.listing_damaged,
         need_more_tail: false,
     };
-    finish_with_override(ctx, source, listing, password_override, Some(saved.content_fp), false, limits)
+    let outcome = finish_with_override(ctx, source, listing, password_override, Some(saved.content_fp), false, limits)?;
+    let rel = ctx.release();
+    let nested = crate::raw_store::get_archive_files(&rel.name, &rel.group, content_id, SOURCE_NZB);
+    if nested.is_empty() {
+        return Ok(outcome);
+    }
+    let files = nested.into_iter().map(|f| InnerFile { name: f.name, size: f.size }).collect();
+    let listing = Listing { files, complete: true, ..Default::default() };
+    let nested = finish_with_override(ctx, SOURCE_NZB, listing, None, Some(None), false, limits)?;
+    Ok(merge_nzb(outcome, nested))
 }
 
 fn restore_par2(
@@ -617,7 +674,7 @@ impl Step for ListStep {
             if let Some(saved) =
                 crate::raw_store::get_archive(&rel_name, &rel_group, &content_id, rel.parts, rel.complete)
             {
-                return restore_archive(ctx, saved, &limits);
+                return restore_archive(ctx, saved, &content_id, &limits);
             }
             if let Some(outcome) = restore_nzb(ctx, &files, &content_id, &limits)? {
                 return Ok(outcome);
@@ -659,10 +716,15 @@ impl Step for ListStep {
             };
             let Some(body) = body else { continue };
             match identify(&body) {
-                Format::Rar4 | Format::Rar5 => return finish(ctx, SOURCE_RAR, rar::list(&body), &limits),
+                Format::Rar4 | Format::Rar5 => {
+                    let listing = rar::list(&body);
+                    let inside = nzb_stored_in(&listing, &body);
+                    return with_nzb(ctx, finish(ctx, SOURCE_RAR, listing, &limits)?, inside, &limits);
+                }
                 Format::Zip => {
                     let listing = zip_list(ctx, &head, &body, &mut left)?;
-                    return finish(ctx, SOURCE_ZIP, listing, &limits);
+                    let inside = nzb_stored_in(&listing, &body);
+                    return with_nzb(ctx, finish(ctx, SOURCE_ZIP, listing, &limits)?, inside, &limits);
                 }
                 Format::SevenZip => {
                     let listing = seven_list(ctx, &head, &seg, &body, &mut left)?;
@@ -710,7 +772,7 @@ impl Step for ListStep {
         }
         let rel = ctx.release();
         if let Some(saved) = crate::raw_store::get_archive(&rel.name, &rel.group, &content_id, 0, false) {
-            return restore_archive(ctx, saved, &limits);
+            return restore_archive(ctx, saved, &content_id, &limits);
         }
         // its articles may be gone since
         if let Some(outcome) = restore_nzb(ctx, &files, &content_id, &limits)? {

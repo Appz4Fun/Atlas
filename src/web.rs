@@ -77,6 +77,7 @@ pub fn get(path: &str, query: &str, cookies: Option<&str>, base: &str, api_key: 
         "/ui/release" if signed_in => release_page(&args),
         "/ui/duplicates" if signed_in => duplicates_page(&args),
         "/ui/details" if signed_in => details_panel(&args),
+        "/ui/pending" if signed_in => crate::web_pending::fragment(&args),
         "/ui/poster" if signed_in => poster(&args),
         "/ui/cover" if signed_in => cover(&args),
         "/ui/still" if signed_in => still(&args),
@@ -87,9 +88,8 @@ pub fn get(path: &str, query: &str, cookies: Option<&str>, base: &str, api_key: 
         "/ui/settings" if signed_in => html(200, settings_page(None)),
         "/ui/nzb" if signed_in && args.get("fill").is_some_and(|v| v == "1") => filled_nzb(&args),
         "/ui/nzb" if signed_in => get_nzb(&args),
-        "/ui/details" | "/ui/poster" | "/ui/cover" | "/ui/still" | "/ui/samefilm" | "/ui/meta" | "/ui/row" => {
-            ApiResponse { headers: vec![("HX-Redirect".into(), "/".into())], ..html(401, String::new()) }
-        }
+        "/ui/details" | "/ui/pending" | "/ui/poster" | "/ui/cover" | "/ui/still" | "/ui/samefilm" | "/ui/meta"
+        | "/ui/row" => ApiResponse { headers: vec![("HX-Redirect".into(), "/".into())], ..html(401, String::new()) },
         "/ui/nzb" | "/ui/release" | "/ui/duplicates" | "/ui/same" | "/ui/settings" => redirect(Vec::new()),
         _ => return None,
     })
@@ -2303,6 +2303,7 @@ fn release_html(
 <div class="actions"><a class="button primary" href="/ui/nzb?id={id}">Download NZB</a>{fill}<a class="button" href="/?cat={category}">More in this category</a></div>
 {warning}<div id="title-details" hx-get="/ui/details?id={id}" hx-trigger="load" hx-swap="outerHTML"></div>
 <div class="panel"><dl class="facts">{facts}</dl></div>
+<div id="pending" hx-get="/ui/pending?id={id}" hx-trigger="load" hx-swap="outerHTML"></div>
 {stills}
 {copies}
 {meta}

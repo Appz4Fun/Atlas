@@ -98,10 +98,11 @@ const CLEAR_CONTENT: &str = crate::duplicates::CLEAR_CONTENT;
 const NAME_LEAD: &str = "update releases set display_name = ?2, name_source = ?3
     where id = ?1 and display_name is null and coalesce(name_source, 0) <= ?3";
 /// The lead's steps that go by its name, to run again now it has one.
-const RERUN_LEAD: &str = "insert into pp_state (release_id, net_wanted, rerun_gen, rerun_mask)
-        values (?1, case when ?3 != 0 then 1 end, 1, ?2)
+const RERUN_LEAD: &str = "insert into pp_state (release_id, net_wanted, rerun_gen, rerun_mask, net_left)
+        values (?1, case when ?3 != 0 then 1 end, 1, ?2, nullif(?3, 0))
     on conflict(release_id) do update set done = done & ~?2, failed = failed & ~?2,
         net_wanted = case when ?3 != 0 then 1 else net_wanted end,
+        net_left = case when ?3 != 0 then coalesce(net_left, 0) | ?3 else net_left end,
         net_next_at = case when ?3 != 0 then 0 else net_next_at end,
         rerun_gen = rerun_gen + 1, rerun_mask = rerun_mask | ?2";
 const QUEUE_LEAD: &str = "insert into pp_queue (release_id, due_at) values (?1, ?2)

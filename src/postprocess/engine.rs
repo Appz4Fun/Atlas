@@ -27,7 +27,7 @@ use super::step::{NameChange, Needs, Outcome, ReleaseInfo, Step, StepCtx, StepEr
 
 const DB_BATCH: i64 = 256;
 const WALK_BATCH: i64 = 256;
-const NET_BATCH: i64 = 4;
+pub(crate) const NET_BATCH: i64 = 4;
 /// The longest the net lane rests after transient failures.
 const NET_PAUSE_MAX: i64 = 60;
 /// Transient failures in a row that are just bad articles, not a server in trouble.
@@ -41,8 +41,8 @@ fn net_pause_secs(in_a_row: i64) -> i64 {
     }
     1i64.checked_shl((in_a_row - NET_PAUSE_AFTER).min(6) as u32).unwrap_or(NET_PAUSE_MAX).min(NET_PAUSE_MAX)
 }
-const NET_CRASH_RETRY: i64 = 900;
-const STEP_DEADLINE: Duration = Duration::from_secs(120);
+pub(crate) const NET_CRASH_RETRY: i64 = 900;
+pub(crate) const STEP_DEADLINE: Duration = Duration::from_secs(120);
 
 /// Transient failures in a row of a release's net step (every server timed out on its body, say) retried after 5
 /// minutes; past these they back off like a retry (`backoff`). They were retried every 5 minutes for good, asking
@@ -337,7 +337,7 @@ impl Inner {
 
     pub(crate) fn snapshot(&self) -> Value {
         let s = self.settings.read().unwrap();
-        self.stats.snapshot(s.config.body_fetches_per_minute, s.config.backlog_per_second)
+        self.stats.snapshot(s.config.body_fetches_per_minute, s.config.backlog_per_second, s.enabled)
     }
 
     /// Bounded counts, per shard: an exact count at this size stalls whatever asks.
@@ -421,6 +421,7 @@ impl Inner {
         if rows.is_empty() {
             return Ok(false);
         }
+        self.stats.lanes.queue_taken[shard].fetch_add(rows.len() as u64, Relaxed);
         let mut batch = Batch::default();
         let mut gone = Vec::new();
         let (present, missing): (Vec<_>, Vec<_>) = rows.into_iter().partition(|(_, _, row)| row.is_some());
@@ -508,6 +509,7 @@ impl Inner {
         let seen = order.iter().position(|id| *id == next).map_or(0, |at| at as i64 + 1);
         let ran = batch.applied.len() as i64;
         self.stats.rows_walked.fetch_add(seen as u64, Relaxed);
+        self.stats.lanes.walk_rows[shard].fetch_add(seen as u64, Relaxed);
         self.send(db, shard, "db.stage.apply_walk", batch, now, move |tx| {
             tx.prepare_cached("update pp_walks set before_id = ?, seen = seen + ?, ran = ran + ? where id = ?")?
                 .execute(params![next, seen, ran, walk_id])?;
@@ -551,6 +553,18 @@ impl Inner {
         }
         drop(holds);
         answered
+    }
+
+    /// A net lane's batch, counted for its shard's rates once it's written (see `stats::Lanes`).
+    fn send_net(&self, db: &Db, shard: usize, batch: Batch, now: i64) -> anyhow::Result<()> {
+        let visits = batch.applied.len() as u64;
+        // a step that failed for good leaves its bit in the mask, but not in what's left (see `apply`)
+        let finished = batch.applied.iter().filter(|a| a.net_mask & !(a.set_done | a.set_failed) == 0).count() as u64;
+        self.send(db, shard, "db.stage.apply_net", batch, now, |_| Ok(()))?;
+        let lanes = &self.stats.lanes;
+        lanes.net_visits[shard].fetch_add(visits, Relaxed);
+        lanes.net_finished[shard].fetch_add(finished, Relaxed);
+        Ok(())
     }
 
     fn visit_all(
@@ -947,7 +961,7 @@ impl Inner {
             }
             Verdict::Pass => {}
         }
-        self.send(db, shard, "db.stage.apply_net", one(a), now, |_| Ok(()))
+        self.send_net(db, shard, one(a), now)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -992,7 +1006,7 @@ impl Inner {
         }
         let Some(step) = left.first().copied() else {
             a.net_mask = 0;
-            return self.send(db, shard, "db.stage.apply_net", one(a), now, |_| Ok(()));
+            return self.send_net(db, shard, one(a), now);
         };
         let bit = mask(step.id());
         a.net_mask = left.iter().fold(0, |m, s| m | mask(s.id()));
@@ -1004,7 +1018,7 @@ impl Inner {
             a.net_transient = Some(0);
             a.net_next_at = Some(0);
             a.error = Some("interrupted".into());
-            return self.send(db, shard, "db.stage.apply_net", one(a), now, |_| Ok(()));
+            return self.send_net(db, shard, one(a), now);
         }
 
         let mut batch = Batch::default();
@@ -1045,7 +1059,7 @@ impl Inner {
                     batch.holds.extend(o.hold.take());
                     if let Some(reason) = o.junk {
                         batch.applied.push(Applied { junk: Some(reason), ..base_copy(&a) });
-                        return self.send(db, shard, "db.stage.apply_net", batch, now, |_| Ok(()));
+                        return self.send_net(db, shard, batch, now);
                     }
                     if let Some(until) = o.wait_until {
                         a.writes.extend(std::mem::take(&mut o.writes).into_iter().map(|w| (bit, w)));
@@ -1123,7 +1137,7 @@ impl Inner {
             });
         }
         batch.applied.push(a);
-        self.send(db, shard, "db.stage.apply_net", batch, now, |_| Ok(()))
+        self.send_net(db, shard, batch, now)
     }
 }
 
@@ -1211,6 +1225,21 @@ fn seed_shard(conn: &Connection, enabled: StepMask, stamps: &[(u8, StepMask, i64
         crate::probe::step::rerun_big_heads(conn, now)?;
         set("pp_probe_big_heads", now)?;
     }
+    // once, for the AVI files probed before their header was read
+    if meta("pp_probe_avi")?.is_none() {
+        crate::probe::step::rerun_avi(conn, now)?;
+        set("pp_probe_avi", now)?;
+    }
+    // once, for the WMV and ASF files probed before their header was read
+    if meta("pp_probe_asf")?.is_none() {
+        crate::probe::step::rerun_asf(conn, now)?;
+        set("pp_probe_asf", now)?;
+    }
+    // once, for the probes that read a set's later volume before its first was looked for
+    if meta("pp_probe_first_volume")?.is_none() {
+        crate::probe::step::rerun_later_volumes(conn, now)?;
+        set("pp_probe_first_volume", now)?;
+    }
     let seen = meta("pp_steps_seen")?.unwrap_or(0);
     let new = if seeded { enabled & !seen } else { enabled };
     if seeded && new != 0 {
@@ -1261,6 +1290,25 @@ pub(crate) fn claim_order(claims: i64) -> &'static str {
 /// longest waiting, soo the backlog drains too.
 pub(crate) fn queue_order(batches: i64) -> &'static str {
     if batches % 4 == 3 { "due_at" } else { "due_at desc" }
+}
+
+/// The share of a shard's net claims each order gets, as `claim_order` takes turns: (by rank, newest, oldest).
+pub(crate) fn claim_shares() -> (f64, f64, f64) {
+    let (mut rank, mut newest, mut oldest) = (0.0, 0.0, 0.0);
+    for claims in 0..8 {
+        match claim_order(claims) {
+            "release_id asc" => oldest += 1.0,
+            "release_id desc" => newest += 1.0,
+            _ => rank += 1.0,
+        }
+    }
+    (rank / 8.0, newest / 8.0, oldest / 8.0)
+}
+
+/// The share of a shard's queue batches each order gets, as `queue_order` takes turns: (latest due, longest waiting).
+pub(crate) fn queue_shares() -> (f64, f64) {
+    let latest = (0..4).filter(|b| queue_order(*b) == "due_at desc").count() as f64;
+    (latest / 4.0, 1.0 - latest / 4.0)
 }
 
 /// A shard's running net claims, and the releases they hold.
@@ -1345,6 +1393,12 @@ pub(crate) fn rank_ids(conn: &Connection, ids: &[i64]) -> rusqlite::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn order_shares_follow_the_turns() {
+        assert_eq!(claim_shares(), (0.75, 0.125, 0.125));
+        assert_eq!(queue_shares(), (0.75, 0.25));
+    }
 
     #[test]
     fn transient_failures_back_off_after_a_few() {
