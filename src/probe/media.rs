@@ -1638,6 +1638,7 @@ impl DolbyVisionInfo {
         let el_present = profile == 7 || profile == 4;
 
         let mut is_fel = false;
+        let mut fel_read = profile != 7;
         let mut mapping_ok = use_prev_vdr_rpu_flag;
         if !use_prev_vdr_rpu_flag
             && let Some(parsed_fel) = Self::parse_rpu_mapping_and_nlq(
@@ -1655,15 +1656,18 @@ impl DolbyVisionInfo {
                 && let Some(fel) = parsed_fel
             {
                 is_fel = fel;
+                fel_read = true;
             }
         }
 
         let mut has_cm4 = false;
+        let mut cm_read = false;
         if mapping_ok
             && vdr_dm_metadata_present_flag
             && let Some(cm4) = Self::parse_vdr_dm_data(&mut r, reserved_zero_3bits == 1)
         {
             has_cm4 = cm4;
+            cm_read = true;
         }
 
         let cm_version = if has_cm4 {
@@ -1679,7 +1683,9 @@ impl DolbyVisionInfo {
             el_present,
             fel: is_fel,
             cm_version,
-            from_rpu: true,
+            // only when this RPU's own mapping and display management data were read: a truncated one, or one that
+            // points back at an earlier RPU, leaves fel and cm_version at their defaults
+            from_rpu: !use_prev_vdr_rpu_flag && fel_read && cm_read,
         })
     }
 
@@ -3006,6 +3012,7 @@ mod tests {
         assert!(dv.el_present);
         assert!(dv.fel, "in-band length-prefixed RPU must upgrade Profile 7 FEL flag");
         assert_eq!(dv.cm_version, "v4.0");
+        assert!(dv.from_rpu, "a fully read RPU says its FEL and CM facts are read");
     }
 
     #[test]

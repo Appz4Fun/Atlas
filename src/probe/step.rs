@@ -171,9 +171,10 @@ pub(crate) fn rerun_dv_without_rpu(conn: &rusqlite::Connection, now: i64) -> rus
     rerun_probes(conn, DV_WITHOUT_RPU, now)
 }
 
-/// A probe row whose first video track is Dolby Vision with no RPU read.
+/// A probe row whose first video track is Dolby Vision, saved before `from_rpu` was kept. A row that has it, true
+/// or false, was probed since and isn't asked for again.
 const DV_WITHOUT_RPU: &str = "json_extract(info, '$.media.video[0].dv_profile') is not null
-     and coalesce(json_extract(info, '$.media.video[0].dolby_vision.from_rpu'), 0) = 0";
+     and json_type(info, '$.media.video[0].dolby_vision.from_rpu') is null";
 
 /// The same for MPEG transport streams, before `mpegts` read their program map: a capture's `.ts` or `.mts`, or a
 /// Blu-ray's `.m2ts`.
@@ -290,8 +291,12 @@ fn stale_saved(info: &str) -> bool {
         p["media"]["container"] == "mp4" && p["archive"].is_null() && empty("video") && empty("audio");
     let dvd_folder_as_vob = p["media"]["container"] == "mpeg-ps"
         && p["archive"]["name"].as_str().is_some_and(|n| n.to_ascii_lowercase().contains("video_ts"));
+    // Dolby Vision saved before `from_rpu` was kept, the same rows `DV_WITHOUT_RPU` picks
+    let dv_before_from_rpu = !p["media"]["video"][0]["dv_profile"].is_null()
+        && p["media"]["video"][0]["dolby_vision"].get("from_rpu").is_none();
     mp4_without_tracks
         || dvd_folder_as_vob
+        || dv_before_from_rpu
         || p["media"].is_null()
             && (newly_read(p["file"].as_str())
             || newly_read(p["archive"]["name"].as_str())
@@ -969,7 +974,12 @@ mod tests {
             conn.execute("insert into release_probe (release_id, info) values (?, ?)", rusqlite::params![id, info])
                 .unwrap();
         }
-        assert_eq!(rerun_dv_without_rpu(&conn, 100).unwrap(), 2);
+        // 1 has no from_rpu; 2 and 3 were probed since, whatever they found
+        assert_eq!(rerun_dv_without_rpu(&conn, 100).unwrap(), 1);
+        assert!(stale_saved(r#"{"media":{"video":[{"dv_profile":7,"dolby_vision":{"profile":7,"fel":true}}]}}"#));
+        assert!(stale_saved(r#"{"media":{"video":[{"dv_profile":7}]}}"#));
+        assert!(!stale_saved(r#"{"media":{"video":[{"dv_profile":8,"dolby_vision":{"from_rpu":false}}]}}"#));
+        assert!(!stale_saved(r#"{"media":{"video":[{"hdr":"HDR10"}]}}"#));
     }
 
     #[test]
