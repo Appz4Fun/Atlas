@@ -1283,6 +1283,11 @@ fn seed_shard(conn: &Connection, enabled: StepMask, stamps: &[(u8, StepMask, i64
         crate::probe::step::rerun_dv_without_keyframe_key(conn, now)?;
         set("pp_probe_dv_keyframe", now)?;
     }
+    // once, for Dolby Vision probes from before the first audio track was keyed: the audio stream key
+    if meta("pp_probe_dv_audio_key")?.is_none() {
+        crate::probe::step::rerun_dv_without_audio_key(conn, now)?;
+        set("pp_probe_dv_audio_key", now)?;
+    }
     // once, for the probes that read a set's later volume before its first was looked for
     if meta("pp_probe_first_volume")?.is_none() {
         crate::probe::step::rerun_later_volumes(conn, now)?;

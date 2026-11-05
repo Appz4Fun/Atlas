@@ -115,6 +115,11 @@ pub struct AudioTrack {
     pub commentary: bool,
     /// the player's pick when nothing else says
     pub default: bool,
+    /// The audio stream itself, hashed, 16 hex digits: FLAC's STREAMINFO MD5 of the decoded samples, or the first
+    /// eight different AC-3 or E-AC-3 sync frames, byte for byte (frames repeated, as silence is, count once). A remux
+    /// of the same audio has the same in any container; another encode doesn't. None for other codecs, or when the
+    /// frames read run out first.
+    pub stream_key: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -755,6 +760,9 @@ fn add_track(t: Track, info: &mut MediaInfo) {
             })
         }
         2 => info.audio.push(AudioTrack {
+            stream_key: (t.codec == "A_FLAC")
+                .then(|| t.codec_private.as_deref().and_then(|cp| cp.strip_prefix(b"fLaC")).and_then(flac_key))
+                .flatten(),
             atmos: t.name.as_deref().is_some_and(|n| n.to_ascii_lowercase().contains("atmos")),
             dtsx: t.name.as_deref().is_some_and(|n| {
                 let lower = n.to_ascii_lowercase();
@@ -1277,11 +1285,18 @@ fn trak(body: &[u8], full_data: &[u8], file_start: &[u8], all_chunk_offsets: &[u
             let mut atmos = false;
             let mut dtsx = codec.eq_ignore_ascii_case("dtsx");
             let can_probe_dtsx = codec.is_empty() || codec.to_ascii_lowercase().contains("dts");
+            let mut stream_key = None;
             boxes(entry.get(36..).unwrap_or(&[]), &mut |kind, v| {
                 if (kind == b"dec3" && parse_dec3_atmos(v)) || (kind == b"dmlp" && parse_dmlp_atmos(v)) {
                     atmos = true;
                 }
+                if kind == b"dfLa" && codec == "fLaC" {
+                    stream_key = v.get(4..).and_then(flac_key);
+                }
             });
+            if is_ac3(&codec) {
+                stream_key = mp4_ac3_key(&chunk_offsets, &stsc_entries, stsz_box, stz2_box, all_chunk_offsets, full_data);
+            }
             for &(chunk_idx, off) in &chunk_offsets {
                 if atmos && (dtsx || !can_probe_dtsx) {
                     break;
@@ -1308,6 +1323,7 @@ fn trak(body: &[u8], full_data: &[u8], file_start: &[u8], all_chunk_offsets: &[u
                 language,
                 atmos,
                 dtsx,
+                stream_key,
                 ..AudioTrack::default()
             });
         }
@@ -1316,6 +1332,36 @@ fn trak(body: &[u8], full_data: &[u8], file_start: &[u8], all_chunk_offsets: &[u
         }
         _ => {}
     }
+}
+
+/// The AC-3 audio key of an MP4 track, from its first chunks in order, each read whole, while they're in `data`.
+fn mp4_ac3_key(
+    chunk_offsets: &[(u32, usize)],
+    stsc: &[(u32, u32)],
+    stsz: Option<&[u8]>,
+    stz2: Option<&[u8]>,
+    all_chunk_offsets: &[usize],
+    data: &[u8],
+) -> Option<String> {
+    const MAX_CHUNK: usize = 1 << 20;
+    let mut frame_key = FrameKey::default();
+    for chunk_idx in 1u32.. {
+        let Some(&(_, off)) = chunk_offsets.iter().find(|&&(idx, _)| idx == chunk_idx) else { break };
+        let Some(len) = mp4_chunk_byte_len(chunk_idx, stsc, stsz, stz2, MAX_CHUNK).filter(|&l| l > 0) else { break };
+        // a chunk that runs into the next one's offset isn't what the tables say
+        if all_chunk_offsets.iter().any(|&o| o > off && o < off.saturating_add(len)) {
+            break;
+        }
+        let Some(chunk) = data.get(off..off.saturating_add(len)) else {
+            frame_key.feed(data.get(off..).unwrap_or(&[]));
+            break;
+        };
+        frame_key.feed(chunk);
+        if frame_key.done() {
+            break;
+        }
+    }
+    frame_key.key()
 }
 
 fn apply_rpu_to_video_track(v: &mut VideoTrack, mut dv: DolbyVisionInfo) {
@@ -1399,12 +1445,114 @@ pub(super) fn keyframe_key(codec: &str, frame: &[u8], nal_length_size: usize) ->
     Some(h.finalize()[..8].iter().map(|b| format!("{b:02x}")).collect())
 }
 
+/// Different frames the AC-3 audio key is taken over: a quarter second of 32 ms frames.
+const AUDIO_KEY_FRAMES: usize = 8;
+
+/// An AC-3 or E-AC-3 sync frame's length in bytes, read from its header; None for anything else.
+fn ac3_frame_len(b: &[u8]) -> Option<usize> {
+    // kbit/s by frmsizecod / 2 (A/52 table 5.18)
+    const KBPS: [usize; 19] = [32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384, 448, 512, 576, 640];
+    if b.get(..2)? != [0x0B, 0x77] {
+        return None;
+    }
+    let bsid = b.get(5)? >> 3;
+    let len = match bsid {
+        0..=8 => {
+            let (fscod, frmsizecod) = (b.get(4)? >> 6, usize::from(b.get(4)? & 0x3f));
+            let kbps = *KBPS.get(frmsizecod / 2)?;
+            // 16-bit words a frame at 48, 44.1 and 32 kHz
+            let words = match fscod {
+                0 => 2 * kbps,
+                1 => kbps * 320 / 147 + (frmsizecod & 1),
+                2 => 3 * kbps,
+                _ => return None,
+            };
+            2 * words
+        }
+        11..=16 => 2 * ((usize::from(b.get(2)? & 0x07) << 8 | usize::from(*b.get(3)?)) + 1),
+        _ => return None,
+    };
+    (len >= 6).then_some(len)
+}
+
+/// The AC-3 audio key, taken as the frames come: SHA-256 over the first `AUDIO_KEY_FRAMES` different sync frames.
+/// Fed bytes must start on a frame and run on from the last; it stops at the first that doesn't parse or is cut off.
+#[derive(Default)]
+pub(super) struct FrameKey {
+    hasher: sha2::Sha256,
+    seen: Vec<[u8; 32]>,
+    done: bool,
+}
+
+impl FrameKey {
+    pub(super) fn feed(&mut self, data: &[u8]) {
+        use sha2::{Digest, Sha256};
+        let mut at = 0usize;
+        while !self.done && at < data.len() {
+            let Some(frame) = data.get(at..).and_then(ac3_frame_len).and_then(|len| data.get(at..at + len)) else {
+                self.done = true;
+                return;
+            };
+            let digest: [u8; 32] = Sha256::digest(frame).into();
+            if !self.seen.contains(&digest) {
+                if self.seen.is_empty() {
+                    self.hasher.update(b"ac3");
+                }
+                self.seen.push(digest);
+                self.hasher.update(frame);
+                self.done = self.seen.len() >= AUDIO_KEY_FRAMES;
+            }
+            at += frame.len();
+        }
+    }
+
+    pub(super) fn stop(&mut self) {
+        self.done = true;
+    }
+
+    pub(super) fn done(&self) -> bool {
+        self.done
+    }
+
+    pub(super) fn key(self) -> Option<String> {
+        use sha2::Digest;
+        (self.seen.len() >= AUDIO_KEY_FRAMES).then(|| hex8(&self.hasher.finalize()))
+    }
+}
+
+/// Whether a codec's frames are AC-3 sync frames, as Matroska and MP4 name them.
+fn is_ac3(codec: &str) -> bool {
+    codec.starts_with("A_AC3") || matches!(codec, "A_EAC3" | "ac-3" | "ec-3")
+}
+
+/// The FLAC audio key: its STREAMINFO block's MD5 of the decoded samples, hashed. `blocks` are FLAC metadata
+/// blocks, STREAMINFO first, as Matroska's CodecPrivate has them after `fLaC` and an MP4 `dfLa` box after its version.
+/// None when the encoder left the MD5 unset.
+fn flac_key(blocks: &[u8]) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let header = blocks.get(..4)?;
+    let len = usize::from(header[1]) << 16 | usize::from(header[2]) << 8 | usize::from(header[3]);
+    if header[0] & 0x7f != 0 || len < 34 {
+        return None;
+    }
+    let md5 = blocks.get(4 + 18..4 + 34)?;
+    if md5.iter().all(|&b| b == 0) {
+        return None;
+    }
+    Some(hex8(&Sha256::new().chain_update(b"flac").chain_update(md5).finalize()))
+}
+
+fn hex8(digest: &[u8]) -> String {
+    digest[..8].iter().map(|b| format!("{b:02x}")).collect()
+}
+
 fn probe_block(
     block: &[u8],
     complete: bool,
     video_tracks: &[(u64, usize, usize)],
     audio_tracks: &[(u64, usize)],
     video_rpu_found: &mut [bool],
+    audio_keys: &mut [Option<FrameKey>],
     info: &mut MediaInfo,
 ) {
     let Some((Some(track_num), vint_len)) = element_size(block) else { return };
@@ -1437,6 +1585,14 @@ fn probe_block(
     }
 
     let Some(&(_, audio_idx)) = audio_tracks.iter().find(|&&(num, _)| num == track_num) else { return };
+    if let Some(Some(frame_key)) = audio_keys.get_mut(audio_idx)
+        && !frame_key.done()
+    {
+        match skip_matroska_lace_header(flags, payload) {
+            Some(frames) => frame_key.feed(frames),
+            None => frame_key.stop(),
+        }
+    }
     let Some(track) = info.audio.get_mut(audio_idx) else { return };
     let can_probe_dtsx = track.codec.is_empty() || track.codec.to_ascii_lowercase().contains("dts");
     if track.atmos && (track.dtsx || !can_probe_dtsx) {
@@ -1465,16 +1621,26 @@ fn probe_cluster(
     info: &mut MediaInfo,
 ) {
     let mut video_rpu_found = vec![false; info.video.len()];
+    let mut audio_keys: Vec<Option<FrameKey>> =
+        info.audio.iter().map(|t| (is_ac3(&t.codec) && t.stream_key.is_none()).then(FrameKey::default)).collect();
     walk_sized(data, &mut |id, body, size| {
         match id {
             0xA3 => {
                 let complete = size == Some(body.len() as u64);
-                probe_block(body, complete, video_tracks, audio_tracks, &mut video_rpu_found, info)
+                probe_block(body, complete, video_tracks, audio_tracks, &mut video_rpu_found, &mut audio_keys, info)
             }
             0xA0 => walk(body, &mut |sub_id, sub_body| {
                 // a Block's flags have no keyframe bit: it's never taken for the keyframe key
                 if sub_id == 0xA1 {
-                    probe_block(sub_body, false, video_tracks, audio_tracks, &mut video_rpu_found, info);
+                    probe_block(
+                        sub_body,
+                        false,
+                        video_tracks,
+                        audio_tracks,
+                        &mut video_rpu_found,
+                        &mut audio_keys,
+                        info,
+                    );
                 }
                 true
             }),
@@ -1482,6 +1648,11 @@ fn probe_cluster(
         }
         true
     });
+    for (track, frame_key) in info.audio.iter_mut().zip(audio_keys) {
+        if let Some(key) = frame_key.and_then(FrameKey::key) {
+            track.stream_key = Some(key);
+        }
+    }
 
     if video_rpu_found.first().copied() == Some(false)
         && let Some(dv) = DolbyVisionInfo::parse_rpu(data)
@@ -2523,6 +2694,125 @@ mod tests {
         assert_eq!(keyframe_key("hvc1", &el, 4).as_deref(), Some(key.as_str()), "enhancement layer left out");
         assert_eq!(keyframe_key("V_MPEG4/ISO/AVC", &[0, 0, 0, 2, 0x65, 0x88], 4).map(|k| k.len()), Some(16));
         assert_eq!(keyframe_key("V_AV1", &plain, 4), None);
+    }
+
+    /// An E-AC-3 sync frame of 32 bytes, its payload all `fill`.
+    fn eac3_frame(fill: u8) -> Vec<u8> {
+        let mut f = vec![0x0B, 0x77, 0x00, 15, 0x3F, 16 << 3];
+        f.resize(32, fill);
+        f
+    }
+
+    #[test]
+    fn ac3_frame_lengths_come_from_the_header() {
+        // AC-3, 48 kHz, 448 kbit/s: 1792 bytes; 44.1 kHz at 32 kbit/s, odd frmsizecod: 70 words
+        assert_eq!(ac3_frame_len(&[0x0B, 0x77, 0, 0, 0x1E, 8 << 3]), Some(1792));
+        assert_eq!(ac3_frame_len(&[0x0B, 0x77, 0, 0, 0x40 | 0x01, 8 << 3]), Some(140));
+        assert_eq!(ac3_frame_len(&[0x0B, 0x77, 0, 0, 0xC0, 8 << 3]), None, "fscod 3 is reserved");
+        assert_eq!(ac3_frame_len(&[0x0B, 0x77, 0, 0, 0x26, 8 << 3]), None, "frmsizecod past 37");
+        assert_eq!(ac3_frame_len(&eac3_frame(0)), Some(32));
+        assert_eq!(ac3_frame_len(&[0x0B, 0x78, 0, 15, 0, 16 << 3]), None);
+        assert_eq!(ac3_frame_len(&[0x0B, 0x77, 0, 15, 0, 20 << 3]), None, "no such bsid");
+    }
+
+    #[test]
+    fn the_ac3_key_is_over_eight_different_frames() {
+        let key = |data: &[u8]| {
+            let mut k = FrameKey::default();
+            k.feed(data);
+            k.key()
+        };
+        let frames: Vec<u8> = (1..=8).flat_map(eac3_frame).collect();
+        let want = key(&frames);
+        assert_eq!(want.as_ref().map(String::len), Some(16));
+        // silence first, repeated: counted once, soo the key doesn't need more than was read
+        let silence: Vec<u8> = [eac3_frame(1), eac3_frame(1), eac3_frame(1)].concat();
+        let lead: Vec<u8> = [silence.clone(), (2..=8).flat_map(eac3_frame).collect()].concat();
+        assert_eq!(key(&lead), want);
+        // the same frames fed in other pieces
+        let mut split = FrameKey::default();
+        split.feed(&frames[..64]);
+        split.feed(&frames[64..]);
+        assert_eq!(split.key(), want);
+        assert_eq!(key(&frames[..7 * 32]), None, "seven frames are too few");
+        assert_eq!(key(&frames[..frames.len() - 1]), None, "the eighth cut off");
+        let other: Vec<u8> = (2..=9).flat_map(eac3_frame).collect();
+        assert_ne!(key(&other), want);
+        assert_eq!(key(&silence.repeat(10)), None, "silence alone never makes a key");
+    }
+
+    #[test]
+    fn a_matroska_ac3_track_gives_the_audio_key() {
+        let frames: Vec<Vec<u8>> = (1..=8).map(eac3_frame).collect();
+        let block = |data: &[u8]| {
+            let mut body = vec![0x82, 0, 0, 0x80];
+            body.extend(data);
+            let mut out = vec![0xA3, 0x80 | body.len() as u8];
+            out.extend(body);
+            out
+        };
+        let probe = |cluster: Vec<u8>, codec: &str| {
+            let mut info = MediaInfo {
+                audio: vec![AudioTrack { codec: codec.into(), ..Default::default() }],
+                ..Default::default()
+            };
+            probe_cluster(&cluster, &[], &[(2, 0)], &mut info);
+            info.audio[0].stream_key.clone()
+        };
+        let one_each: Vec<u8> = frames.iter().flat_map(|f| block(f)).collect();
+        let two_each: Vec<u8> = frames.chunks(2).flat_map(|p| block(&p.concat())).collect();
+        let mut k = FrameKey::default();
+        k.feed(&frames.concat());
+        let want = k.key();
+        assert!(want.is_some());
+        assert_eq!(probe(one_each.clone(), "A_EAC3"), want);
+        assert_eq!(probe(two_each, "A_EAC3"), want, "however the frames are put in blocks");
+        assert_eq!(probe(one_each.clone(), "A_DTS"), None);
+        assert_eq!(probe(one_each[..one_each.len() - 3].to_vec(), "A_EAC3"), None, "the last block cut off");
+    }
+
+    #[test]
+    fn the_flac_key_is_its_streaminfo_md5() {
+        let streaminfo = |md5: [u8; 16]| {
+            let mut b = vec![0x80, 0, 0, 34];
+            b.extend([0u8; 18]);
+            b.extend(md5);
+            b
+        };
+        let key = flac_key(&streaminfo([7; 16])).unwrap();
+        assert_eq!(key.len(), 16);
+        assert_ne!(flac_key(&streaminfo([8; 16])), Some(key.clone()));
+        assert_eq!(flac_key(&streaminfo([0; 16])), None, "MD5 left unset");
+        assert_eq!(flac_key(&streaminfo([7; 16])[..30]), None);
+        let mut not_first = streaminfo([7; 16]);
+        not_first[0] = 0x04;
+        assert_eq!(flac_key(&not_first), None, "STREAMINFO comes first");
+        // the same from Matroska's CodecPrivate
+        let mut info = MediaInfo::default();
+        let codec_private = [b"fLaC".to_vec(), streaminfo([7; 16])].concat();
+        add_track(
+            Track { kind: 2, codec: "A_FLAC".into(), codec_private: Some(codec_private), ..Default::default() },
+            &mut info,
+        );
+        assert_eq!(info.audio[0].stream_key.as_deref(), Some(key.as_str()));
+    }
+
+    #[test]
+    fn an_mp4_ac3_track_is_keyed_from_its_chunks_in_order() {
+        // two chunks of four 32-byte samples, the second first in the file
+        let frames: Vec<u8> = (1..=8).flat_map(eac3_frame).collect();
+        let data = [vec![0u8; 16], frames[128..].to_vec(), vec![0u8; 16], frames[..128].to_vec()].concat();
+        let (second, first) = (16usize, 16 + 128 + 16);
+        let stsz = [[0u8; 4], 32u32.to_be_bytes(), 8u32.to_be_bytes()].concat();
+        let stsc = [(1u32, 4u32)];
+        let offsets = [(1u32, first), (2, second)];
+        let mut k = FrameKey::default();
+        k.feed(&frames);
+        let want = k.key();
+        assert!(want.is_some());
+        assert_eq!(mp4_ac3_key(&offsets, &stsc, Some(&stsz), None, &[second, first], &data), want);
+        assert_eq!(mp4_ac3_key(&offsets[..1], &stsc, Some(&stsz), None, &[first], &data), None, "a chunk not read");
+        assert_eq!(mp4_ac3_key(&offsets, &stsc, None, None, &[second, first], &data), None, "no sample sizes");
     }
 
     #[test]

@@ -188,6 +188,21 @@ pub(crate) fn rerun_dv_without_keyframe_key(conn: &rusqlite::Connection, now: i6
 const DV_WITHOUT_KEYFRAME_KEY: &str = "json_extract(info, '$.media.video[0].dv_profile') is not null
      and json_type(info, '$.media.video[0].keyframe_key') is null";
 
+/// Asks for the probe again on Dolby Vision video whose first audio track is AC-3, E-AC-3 or FLAC, probed before
+/// that track's stream was keyed. One front read a release, as for the keyframe key. Once, from the stage's seed.
+pub(crate) fn rerun_dv_without_audio_key(conn: &rusqlite::Connection, now: i64) -> rusqlite::Result<usize> {
+    rerun_probes(conn, DV_WITHOUT_AUDIO_KEY, now)
+}
+
+/// The codecs `stream_key` is taken for, as Matroska and MP4 name them.
+const KEYED_AUDIO: &[&str] = &["A_AC3", "A_EAC3", "A_FLAC", "ac-3", "ec-3", "fLaC"];
+
+/// A probe row whose first video track is Dolby Vision and first audio track a keyed codec, saved before
+/// `stream_key` was kept (a probe since keeps it, null when the frames read ran out).
+const DV_WITHOUT_AUDIO_KEY: &str = "json_extract(info, '$.media.video[0].dv_profile') is not null
+     and json_extract(info, '$.media.audio[0].codec') in ('A_AC3', 'A_EAC3', 'A_FLAC', 'ac-3', 'ec-3', 'fLaC')
+     and json_type(info, '$.media.audio[0].stream_key') is null";
+
 /// The same for MPEG transport streams, before `mpegts` read their program map: a capture's `.ts` or `.mts`, or a
 /// Blu-ray's `.m2ts`.
 pub(crate) fn rerun_mpeg_ts(conn: &rusqlite::Connection, now: i64) -> rusqlite::Result<usize> {
@@ -309,8 +324,13 @@ fn stale_saved(info: &str) -> bool {
     // and before `keyframe_key` was kept, the rows `DV_WITHOUT_KEYFRAME_KEY` picks: a null one was looked for
     let dv_before_keyframe_key =
         !p["media"]["video"][0]["dv_profile"].is_null() && p["media"]["video"][0].get("keyframe_key").is_none();
+    // and before `stream_key` was kept, the rows `DV_WITHOUT_AUDIO_KEY` picks
+    let dv_before_audio_key = !p["media"]["video"][0]["dv_profile"].is_null()
+        && p["media"]["audio"][0]["codec"].as_str().is_some_and(|c| KEYED_AUDIO.contains(&c))
+        && p["media"]["audio"][0].get("stream_key").is_none();
     mp4_without_tracks
         || dvd_folder_as_vob
+        || dv_before_audio_key
         || dv_before_from_rpu
         || dv_before_keyframe_key
         || p["media"].is_null()
@@ -1003,6 +1023,40 @@ mod tests {
             r#"{"media":{"video":[{"dv_profile":8,"dolby_vision":{"from_rpu":false},"keyframe_key":null}]}}"#
         ));
         assert!(!stale_saved(r#"{"media":{"video":[{"hdr":"HDR10"}]}}"#));
+    }
+
+    #[test]
+    fn dolby_vision_probes_from_before_the_audio_key_are_asked_for_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        crate::db::create_db_at(&main).unwrap();
+        let conn = crate::db::open_shard(&crate::store::shard_path(&main, 0)).unwrap();
+        for (id, info) in [
+            (1i64, r#"{"media":{"video":[{"dv_profile":8}],"audio":[{"codec":"A_EAC3"}]}}"#),
+            (2, r#"{"media":{"video":[{"dv_profile":8}],"audio":[{"codec":"A_EAC3","stream_key":null}]}}"#),
+            (3, r#"{"media":{"video":[{"dv_profile":8}],"audio":[{"codec":"A_TRUEHD"}]}}"#),
+            (4, r#"{"media":{"video":[{"codec":"V_MPEGH/ISO/HEVC"}],"audio":[{"codec":"A_AC3"}]}}"#),
+            (5, r#"{"media":{"video":[{"dv_profile":5}],"audio":[{"codec":"fLaC"}]}}"#),
+        ] {
+            conn.execute("insert into releases (id, name, group_name) values (?, ?, 'g')", rusqlite::params![id, id])
+                .unwrap();
+            conn.execute(
+                "insert into pp_state (release_id, done) values (?, ?)",
+                rusqlite::params![id, mask(PROBE_STEP)],
+            )
+            .unwrap();
+            conn.execute("insert into release_probe (release_id, info) values (?, ?)", rusqlite::params![id, info])
+                .unwrap();
+        }
+        assert_eq!(rerun_dv_without_audio_key(&conn, 100).unwrap(), 2, "1 and 5");
+        let saved = |codec: &str, v: &str| {
+            format!(
+                r#"{{"media":{{"video":[{{"dv_profile":8,"dolby_vision":{{"from_rpu":true}},"keyframe_key":null}}],"audio":[{{"codec":"{codec}"{v}}}]}}}}"#
+            )
+        };
+        assert!(stale_saved(&saved("A_AC3", "")), "a restored probe from before the key is probed again");
+        assert!(!stale_saved(&saved("A_AC3", r#","stream_key":null"#)));
+        assert!(!stale_saved(&saved("A_DTS", "")));
     }
 
     #[test]

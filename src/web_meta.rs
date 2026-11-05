@@ -2077,6 +2077,13 @@ fn keys_panel(i: &MetaInputs<'_>, l: &Looked, compact: bool) -> Facts {
             .and_then(|v| v.keyframe_key.clone())
             .map(|k| with_link(k, Kind::Video)),
     );
+    f.add_html(
+        "Audio stream key",
+        i.probe
+            .and_then(|p| p.media.as_ref())
+            .and_then(crate::keys::audio_stream_key)
+            .map(|k| with_link(k.to_string(), Kind::Audio)),
+    );
     // counted from the tables the twin and probe work keep, shown here only when another release shares them
     f.add_html(
         "File CRC",
