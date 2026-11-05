@@ -172,6 +172,10 @@ fn objects<'a>(data: &'a [u8], f: &mut dyn FnMut(&[u8; 16], &'a [u8])) {
         let Some(size) = le64(data, at + 16).and_then(|s| usize::try_from(s).ok()).filter(|s| *s >= 24) else { return };
         let end = at.saturating_add(size);
         f(id, &data[at + 24..end.min(data.len())]);
+        // a cut one is the last
+        if end >= data.len() {
+            return;
+        }
         at = end;
     }
 }
@@ -312,5 +316,15 @@ mod tests {
         data.extend([0u8; 6]);
         data.extend(many);
         assert_eq!(asf(&data).audio.len(), super::super::media::MAX_TRACKS);
+        // a child object claiming to be as big as can be ends the walk
+        let mut huge = HEADER.to_vec();
+        huge.extend(200u64.to_le_bytes());
+        huge.extend([0u8; 6]);
+        huge.extend(FILE_PROPERTIES);
+        huge.extend(u64::MAX.to_le_bytes());
+        huge.extend(STREAM_PROPERTIES);
+        huge.extend(u64::MAX.to_le_bytes());
+        huge.resize(200, 0);
+        assert!(asf(&huge).video.is_empty());
     }
 }
