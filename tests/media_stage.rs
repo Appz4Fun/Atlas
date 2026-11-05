@@ -971,6 +971,39 @@ fn a_film_number_is_not_read_as_a_series() {
 }
 
 #[test]
+fn a_title_decoded_with_no_ids_is_queued_for_the_word_index() {
+    let mut h = fresh();
+    let name = "AC317772.2026.MULTi.VFF.AD.2160p.HDR.DV.WEB.EAC3.5.1.Atmos.H265-FRQC";
+    h.save(&[complete(name)]);
+    let page = r#"<html><head><title>Matchbox: The Movie - film 2026 - AlloCiné</title>
+        <script type="application/ld+json">{"@context":"http://schema.org","@type":"Movie","name":"Matchbox: The Movie"}</script>
+        </head></html>"#;
+    let s = FixtureServer::start(vec![
+        route("/sparql", r#"{"results":{"bindings":[]}}"#.into()),
+        route("/film/fichefilm_gen_cfilm=317772.html", page.into()),
+        route("/search/movie", r#"{"page":1,"results":[],"total_results":0}"#.into()),
+    ]);
+    let id = h.id_of(name);
+    let queued = |h: &Harness| -> i64 {
+        h.shard()
+            .query_row("select coalesce(sum(n), 0) from word_queue where release_id = ?", [id], |r| r.get(0))
+            .unwrap()
+    };
+    let saved = queued(&h);
+    // the title is decoded, and TMDB doesn't know it
+    start(&mut h, allocine_on(with_tmdb(no_providers(), &s), &s));
+    wait_for("the lookup", || done(&h, name) & LOOKUP != 0);
+    let media = media_store::open(&media_store::path_for(&h.main)).unwrap();
+    let k = row(&h, name).unwrap().key;
+    let cached = media_store::get(&media, k).unwrap().unwrap();
+    assert_eq!(cached.title, "Matchbox: The Movie");
+    assert_eq!(row(&h, name).unwrap().tmdb, None);
+    // once for its category, once for its media row, and once for the decoded title the word index can now add:
+    // with no ids found, nothing else writes to the release again
+    assert_eq!(queued(&h), saved + 3);
+}
+
+#[test]
 fn wikidatas_ids_land_when_the_page_cant_be_read() {
     let mut h = fresh();
     let name = "AC30890.S04E01.MULTi.1080p.WEB.H264-GL0P";
