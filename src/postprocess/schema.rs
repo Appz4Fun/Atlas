@@ -69,10 +69,12 @@ pub const PP_STATE: ShardTable = ShardTable {
 /// fully obfuscated upload of one looks like a big release with no category or an Other one until the net lane
 /// reads it. 1 from 1 GiB, 2 from 4 GiB, 3 from 15 GiB (UHD remuxes), 4 from 40 GiB. A movie or TV release of
 /// `SMALL_VIDEO` or more is 1 too: an SD or 720p episode is under 1 GiB, and at 0 it waits behind every small post
-/// of every kind, soo it was never probed. 0: smaller, or a category that is neither movies, TV nor Other. A release
-/// with an NZB among its files is 2 at least, whatever its size or category: one small article that says what a whole
-/// other post is (`archive::nzb`), the first hop to it. And a release such an NZB read in this shard points to
-/// (`nzb_pointed`) is 2 at least too: the next hop.
+/// of every kind, soo it was never probed. 0: smaller, or a category that is neither movies, TV nor Other.
+///
+/// Ahead of all of them, 5: a release of at most 64 MiB (`archive::follow::MAX_POST_BYTES`) with an NZB among its
+/// files, whatever its category. It costs a few small articles, the least the net lane reads for anything, and says
+/// what a whole other post is (`archive::follow`): the owner wants the least data pulled first where it unlocks the
+/// most. A release such an NZB read in this shard points to (`nzb_pointed`) is 3 at least: the next hop.
 pub const NET_RANK: &str = "coalesce((select max(case
         when c.category is not null and c.category not between 2000 and 2999 and c.category not between 5000 and 5999
             and c.category not between 8000 and 8999 then 0
@@ -82,8 +84,12 @@ pub const NET_RANK: &str = "coalesce((select max(case
         when r.size >= 1073741824 then 1
         when r.size >= 52428800 and (c.category between 2000 and 2999 or c.category between 5000 and 5999) then 1
         else 0 end,
-        case when exists (select 1 from files f where f.release_id = r.id and f.filename like '%.nzb')
-            or exists (select 1 from nzb_pointed p where p.release_id = r.id) then 2 else 0 end)
+        case
+            when r.size <= 67108864 and exists (select 1 from files f where f.release_id = r.id and f.filename like '%.nzb')
+                then 5
+            when exists (select 1 from files f where f.release_id = r.id and f.filename like '%.nzb')
+                or exists (select 1 from nzb_pointed p where p.release_id = r.id) then 3
+            else 0 end)
     from releases r left join release_category c on c.release_id = r.id where r.id = ?1), 0)";
 
 /// The smallest movie or TV release `NET_RANK` puts with the 1 GiB ones: 50 MiB, past samples and the odd file of a

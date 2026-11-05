@@ -294,8 +294,7 @@ pub const NZB_POINTED: ShardTable = ShardTable {
 pub const MARK_POINTED: &str =
     "insert or ignore into nzb_pointed (release_id) select id from releases where name = ?1 and id != ?2";
 /// `?1` a release name, `?2` the pointer release id, `?3` the password from the pointer NZB
-pub const MARK_POINTED_PASSWORD: &str =
-    "insert or ignore into release_nfo_password (release_id, password) select id, ?3 from releases where name = ?1 and id != ?2";
+pub const MARK_POINTED_PASSWORD: &str = "insert or ignore into release_nfo_password (release_id, password) select id, ?3 from releases where name = ?1 and id != ?2";
 /// Clears `LIST_STEP | PROBE_STEP | KEYS_STEP` and re-arms `net_wanted` on pointed-to releases with hidden header names
 /// that did not yet have a password in `release_nfo_password`. Must run before `MARK_POINTED_PASSWORD`.
 pub static RERUN_POINTED_LIST: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
@@ -361,7 +360,7 @@ pub static RERUN_POINTED_PROBE: std::sync::LazyLock<String> = std::sync::LazyLoc
            )"
     )
 });
-/// and its rank worked out now, after `MARK_POINTED`, for one the net lane already waits on: 2 at least, or what its
+/// and its rank worked out now, after `MARK_POINTED`, for one the net lane already waits on: 3 at least, or what its
 /// size and category give when that's more, ranked or not yet. A visit works it out the same way
 pub static RANK_POINTED: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     format!(

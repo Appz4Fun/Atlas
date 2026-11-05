@@ -964,7 +964,7 @@ fn what_a_read_nzb_points_to_is_marked_and_ranked_up() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(rank, Some(2));
+    assert_eq!(rank, Some(3));
 }
 
 /// an NZB of `files`, each `(subject, [(segment bytes, message-id)])`
