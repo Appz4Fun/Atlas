@@ -72,6 +72,13 @@ pub static WAIT_SECS: AtomicI64 = AtomicI64::new(12 * 3600);
 
 /// a writer ticks at most this often, soo saves keep the writer
 const TICK_EVERY: Duration = Duration::from_secs(1);
+/// How long a tick waits for another connection's write lock on the shard before it lets the tick go: the writer's
+/// own wait is far longer, and freezing can always come back next tick
+const TICK_BUSY: Duration = Duration::from_secs(2);
+/// what the writer's connection waits otherwise (`db::open_shard`)
+const WRITER_BUSY: Duration = Duration::from_secs(30);
+/// The indexer is stopping: writers do no freezing, soo their queues of saves drain as fast as they did before it.
+pub static STOPPING: AtomicBool = AtomicBool::new(false);
 /// how long a free disk reading is trusted
 const DISK_EVERY: Duration = Duration::from_secs(60);
 
@@ -366,6 +373,8 @@ pub struct Moved {
     pub changed: usize,
     /// queued by the backlog walk
     pub backlog: usize,
+    /// another connection held the shard's write lock: nothing done, the next tick tries again
+    pub busy: bool,
 }
 
 /// A release a tick copied into the frozen file: its id, and its size and parts as copied.
@@ -382,7 +391,8 @@ pub fn freeze_some(conn: &Connection, limit: usize, budget: Duration, ready: i64
     if queued.is_empty() {
         return Ok(Moved::default());
     }
-    let tx = conn.unchecked_transaction()?;
+    // the write lock first: a deferred transaction that reads, then writes, can't wait for it and fails as locked
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
     let (copied, dropped) = copy(&tx, &queued, budget, now)?;
     tx.commit()?;
     // taking the write lock first: a thaw from outside the indexer (`--thaw`) can't come in between the checks and
@@ -527,26 +537,50 @@ impl Ticker {
         ok
     }
 
-    /// One tick on the shard's writer, between its transactions.
+    /// One tick on the shard's writer, between its transactions. Another connection holding the shard's write lock
+    /// past `TICK_BUSY` lets the tick go (`Moved::busy`): what is queued stays queued, the walk keeps its place, and
+    /// the next tick tries again.
     pub fn tick(&mut self, conn: &Connection, now: i64) -> Result<Moved> {
-        if !ENABLED.load(Relaxed) || !self.attached(conn) || self.last.is_some_and(|t| t.elapsed() < TICK_EVERY) {
+        if !ENABLED.load(Relaxed)
+            || STOPPING.load(Relaxed)
+            || !self.attached(conn)
+            || self.last.is_some_and(|t| t.elapsed() < TICK_EVERY)
+        {
             return Ok(Moved::default());
         }
         self.last = Some(Instant::now());
+        conn.busy_timeout(TICK_BUSY)?;
+        let done = self.tick_now(conn, now);
+        conn.busy_timeout(WRITER_BUSY)?;
+        match done {
+            Err(e) if is_busy(&e) => {
+                crate::metrics::names::FROZEN.inc(&[("event", "busy")], 1);
+                Ok(Moved { busy: true, ..Moved::default() })
+            }
+            done => done,
+        }
+    }
+
+    fn tick_now(&mut self, conn: &Connection, now: i64) -> Result<Moved> {
+        let budget = Duration::from_millis(TICK_MS.load(Relaxed).max(1) as u64);
         // queueing takes no room: the walk goes on while the disk is short
         let walk = BACKLOG_PER_TICK.load(Relaxed).max(0) as usize;
-        let tx = conn.unchecked_transaction()?;
-        let backlog = rules::backlog_some(&tx, walk, now)?.queued;
+        let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+        let backlog = rules::backlog_some(&tx, walk, budget, now)?.queued;
         tx.commit()?;
         crate::metrics::names::FROZEN.inc(&[("event", "backlog_queued")], backlog as u64);
         if !self.disk_ok(conn) {
             return Ok(Moved { backlog, ..Moved::default() });
         }
         let limit = PER_TICK.load(Relaxed).max(1) as usize;
-        let budget = Duration::from_millis(TICK_MS.load(Relaxed).max(1) as u64);
         let moved = freeze_some(conn, limit, budget, now.saturating_sub(WAIT_SECS.load(Relaxed)), now)?;
         Ok(Moved { backlog, ..moved })
     }
+}
+
+/// Whether `e` is another connection holding the lock: worth trying again, not a failure.
+fn is_busy(e: &rusqlite::Error) -> bool {
+    matches!(e.sqlite_error_code(), Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked))
 }
 
 // ---------------------------------------------------------------- thawing
