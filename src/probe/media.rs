@@ -971,6 +971,18 @@ fn mp4_chunk_byte_len(
     stz2: Option<&[u8]>,
     max_probe: usize,
 ) -> Option<usize> {
+    mp4_chunk_extent(chunk_idx_1based, stsc, stsz, stz2, max_probe).map(|(len, _)| len)
+}
+
+/// A chunk's length in bytes as `mp4_chunk_byte_len` reads it, and whether that is all of it: false when the
+/// `max_probe` bytes or the 256 samples it sums at most cut it short.
+fn mp4_chunk_extent(
+    chunk_idx_1based: u32,
+    stsc: &[(u32, u32)],
+    stsz: Option<&[u8]>,
+    stz2: Option<&[u8]>,
+    max_probe: usize,
+) -> Option<(usize, bool)> {
     if stsz.is_none() && stz2.is_none() {
         return None;
     }
@@ -994,7 +1006,7 @@ fn mp4_chunk_byte_len(
     };
 
     if samples_in_chunk == 0 {
-        return Some(0);
+        return Some((0, true));
     }
 
     if let Some(v) = stsz {
@@ -1002,38 +1014,41 @@ fn mp4_chunk_byte_len(
         let sample_count = be32(v, 8)? as usize;
         if default_size > 0 {
             if sample_count > 0 && first_sample >= sample_count {
-                return Some(0);
+                return Some((0, true));
             }
             let count = if sample_count > 0 {
                 samples_in_chunk.min(sample_count - first_sample)
             } else {
                 samples_in_chunk
             };
-            return Some(count.saturating_mul(default_size).min(max_probe));
+            let len = count.saturating_mul(default_size);
+            return Some((len.min(max_probe), len <= max_probe));
         }
         if first_sample >= sample_count {
-            return Some(0);
+            return Some((0, true));
         }
-        let count = samples_in_chunk.min(sample_count - first_sample).min(256);
+        let all = samples_in_chunk.min(sample_count - first_sample);
+        let count = all.min(256);
         let mut total = 0usize;
         for s in 0..count {
             let entry_off = 12usize.checked_add(first_sample.checked_add(s)?.checked_mul(4)?)?;
             let sz = be32(v, entry_off)? as usize;
             total = total.saturating_add(sz);
             if total >= max_probe {
-                return Some(max_probe);
+                return Some((max_probe, false));
             }
         }
-        return Some(total);
+        return Some((total, count == all));
     }
 
     if let Some(v) = stz2 {
         let field_size = usize::from(*v.get(7)?);
         let sample_count = be32(v, 8)? as usize;
         if first_sample >= sample_count {
-            return Some(0);
+            return Some((0, true));
         }
-        let count = samples_in_chunk.min(sample_count - first_sample).min(256);
+        let all = samples_in_chunk.min(sample_count - first_sample);
+        let count = all.min(256);
         let mut total = 0usize;
         for s in 0..count {
             let idx = first_sample.checked_add(s)?;
@@ -1048,10 +1063,10 @@ fn mp4_chunk_byte_len(
             };
             total = total.saturating_add(sz);
             if total >= max_probe {
-                return Some(max_probe);
+                return Some((max_probe, false));
             }
         }
-        return Some(total);
+        return Some((total, count == all));
     }
 
     None
@@ -1349,7 +1364,10 @@ fn mp4_ac3_key(
     let mut frame_key = FrameKey::default();
     for chunk_idx in 1u32.. {
         let Some(&(_, off)) = chunk_offsets.iter().find(|&&(idx, _)| idx == chunk_idx) else { break };
-        let Some(len) = mp4_chunk_byte_len(chunk_idx, stsc, stsz, stz2, MAX_CHUNK).filter(|&l| l > 0) else { break };
+        let Some((len, whole)) = mp4_chunk_extent(chunk_idx, stsc, stsz, stz2, MAX_CHUNK).filter(|&(l, _)| l > 0)
+        else {
+            break;
+        };
         // a chunk that runs into the next one's offset isn't what the tables say
         if all_chunk_offsets.iter().any(|&o| o > off && o < off.saturating_add(len)) {
             break;
@@ -1359,7 +1377,8 @@ fn mp4_ac3_key(
             break;
         };
         frame_key.feed(chunk);
-        if frame_key.done() {
+        // a chunk read only in part: what's after it isn't the next frame
+        if frame_key.done() || !whole {
             break;
         }
     }
@@ -1459,7 +1478,8 @@ fn ac3_frame_len(b: &[u8]) -> Option<usize> {
     }
     let bsid = b.get(5)? >> 3;
     let len = match bsid {
-        0..=8 => {
+        // 9 and 10: AC-3 at a half and a quarter of the rate, framed the same
+        0..=10 => {
             let (fscod, frmsizecod) = (b.get(4)? >> 6, usize::from(b.get(4)? & 0x3f));
             let kbps = *KBPS.get(frmsizecod / 2)?;
             // 16-bit words a frame at 48, 44.1 and 32 kHz
@@ -2710,6 +2730,8 @@ mod tests {
         // AC-3, 48 kHz, 448 kbit/s: 1792 bytes; 44.1 kHz at 32 kbit/s, odd frmsizecod: 70 words
         assert_eq!(ac3_frame_len(&[0x0B, 0x77, 0, 0, 0x1E, 8 << 3]), Some(1792));
         assert_eq!(ac3_frame_len(&[0x0B, 0x77, 0, 0, 0x40 | 0x01, 8 << 3]), Some(140));
+        assert_eq!(ac3_frame_len(&[0x0B, 0x77, 0, 0, 0x1E, 9 << 3]), Some(1792), "half rate, framed the same");
+        assert_eq!(ac3_frame_len(&[0x0B, 0x77, 0, 0, 0x1E, 10 << 3]), Some(1792), "quarter rate");
         assert_eq!(ac3_frame_len(&[0x0B, 0x77, 0, 0, 0xC0, 8 << 3]), None, "fscod 3 is reserved");
         assert_eq!(ac3_frame_len(&[0x0B, 0x77, 0, 0, 0x26, 8 << 3]), None, "frmsizecod past 37");
         assert_eq!(ac3_frame_len(&eac3_frame(0)), Some(32));
@@ -2815,6 +2837,17 @@ mod tests {
         assert_eq!(mp4_ac3_key(&offsets, &stsc, Some(&stsz), None, &[second, first], &data), want);
         assert_eq!(mp4_ac3_key(&offsets[..1], &stsc, Some(&stsz), None, &[first], &data), None, "a chunk not read");
         assert_eq!(mp4_ac3_key(&offsets, &stsc, None, None, &[second, first], &data), None, "no sample sizes");
+        // a chunk of 257 samples, past the 256 its length is summed over: the key stops there rather than skip
+        // the 257th frame and go on with the next chunk
+        let long: Vec<u8> = [eac3_frame(1).repeat(256), eac3_frame(2)].concat();
+        let data = [long.clone(), (3..=9).flat_map(eac3_frame).collect()].concat();
+        let mut stsz = [[0u8; 4], 0u32.to_be_bytes(), 264u32.to_be_bytes()].concat();
+        for _ in 0..264 {
+            stsz.extend(32u32.to_be_bytes());
+        }
+        let offsets = [(1u32, 0usize), (2, long.len())];
+        let stsc = [(1u32, 257u32), (2, 7)];
+        assert_eq!(mp4_ac3_key(&offsets, &stsc, Some(&stsz), None, &[0, long.len()], &data), None);
     }
 
     #[test]
