@@ -59,10 +59,24 @@ impl NzbLnk {
     }
 }
 
-/// What a search box or `q=` should look for when it was handed an NZBLNK: the link's header, which the spec
-/// says identifies the post. None when `text` isn't one.
+/// What a search box or `q=` should look for when it was handed an NZBLNK: the release name in the link's
+/// header, which the spec says identifies the post. None when `text` isn't one.
 pub fn search_text(text: &str) -> Option<String> {
-    NzbLnk::parse(text).map(|l| l.header)
+    NzbLnk::parse(text).map(|l| release_name_of(&l.header))
+}
+
+/// The release name a header names, as Atlas groups articles under it: a whole subject's parsed release name, or a
+/// quoted or bare file name without its volume and archive suffixes (`.part01.rar`, `.vol03+04.par2`). A header
+/// that is already a release name comes back as it is.
+fn release_name_of(header: &str) -> String {
+    if let Some(parsed) = crate::parser::parse_subject(header)
+        && !parsed.release_name.trim().is_empty()
+    {
+        return parsed.release_name.trim().to_string();
+    }
+    let name = header.split('"').nth(1).map(str::trim).filter(|s| !s.is_empty()).unwrap_or(header.trim());
+    let stripped = crate::parser::strip_release_suffixes(name);
+    if stripped.trim().is_empty() { name.to_string() } else { stripped.trim().to_string() }
 }
 
 /// The `h` for a post from its subject: the release name the subject parser reads, or else the quoted file name
@@ -180,6 +194,13 @@ mod tests {
         assert_eq!(NzbLnk::parse("nzblnk:?t=100%&h=%zz").unwrap().title, "100%", "a stray % stays");
         assert_eq!(search_text("nzblnk:?t=T&h=The.Film.2024.2160p"), Some("The.Film.2024.2160p".into()));
         assert_eq!(search_text("the film"), None);
+        // a file name or a whole subject as h: the release name Atlas groups those articles under
+        assert_eq!(search_text("nzblnk:?t=Film&h=Some.Film.2024.part01.rar"), Some("Some.Film.2024".into()));
+        assert_eq!(search_text("nzblnk:?t=Film&h=Some.Film.2024.vol03%2B04.par2"), Some("Some.Film.2024".into()));
+        let subject = encode(r#"[01/52] - "Some.Film.2024.part01.rar" yEnc (1/50)"#);
+        assert_eq!(search_text(&format!("nzblnk:?t=Film&h={subject}")), Some("Some.Film.2024".into()));
+        let quoted = encode(r#""Some.Film.2024.r00" yEnc"#);
+        assert_eq!(search_text(&format!("nzblnk:?t=Film&h={quoted}")), Some("Some.Film.2024".into()));
     }
 
     #[test]
