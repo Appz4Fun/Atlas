@@ -7,6 +7,14 @@
 //! tables, not copied here: the PAR2 set id (`par2_files.set_id`) and the OpenSubtitles hash
 //! (`release_probe.moviehash`).
 //!
+//! Two more come from the CRCs posters and servers leave in the article itself. The file key is the main file's
+//! size and whole-file CRC32, as its last part's yEnc trailer gives it: the same bytes whatever the file is called,
+//! the article size it was cut at or the tool that posted it, and matched against the files a PAR2 set describes
+//! (`par2_files.size`, `par2_files.crc32`) as well as other releases' file keys. The first-article key is the CRC32 a
+//! Highwinds-family or Usenet.Farm server stamps on every article (`X-Received-Body-CRC`, over the body as posted
+//! with its trailing dot line), with the part's number and decoded size: the same article posted again byte for
+//! byte, under any Message-ID, poster or subject.
+//!
 //! These are candidates for a reader, never a merge: no key here groups, links or completes anything on its own.
 //! The raw posting account and host are never stored, only their salted digests.
 
@@ -27,7 +35,9 @@ pub const RELEASE_KEYS: ShardTable = ShardTable {
         account    INTEGER,
         host       INTEGER,
         layout     INTEGER,
-        lines      INTEGER
+        lines      INTEGER,
+        file_crc   INTEGER,
+        body_crc   INTEGER
     )",
     indexes: &[
         (
@@ -46,13 +56,22 @@ pub const RELEASE_KEYS: ShardTable = ShardTable {
             "release_keys_lines",
             "create index if not exists release_keys_lines on release_keys(lines) where lines is not null",
         ),
+        (
+            "release_keys_file_crc",
+            "create index if not exists release_keys_file_crc on release_keys(file_crc) where file_crc is not null",
+        ),
+        (
+            "release_keys_body_crc",
+            "create index if not exists release_keys_body_crc on release_keys(body_crc) where body_crc is not null",
+        ),
     ],
     release_key: Some("release_id"),
-    added: &[],
+    added: &[("file_crc", "INTEGER"), ("body_crc", "INTEGER")],
 };
 
 const UPSERT: &str =
-    "insert or replace into release_keys (release_id, account, host, layout, lines) values (?1, ?2, ?3, ?4, ?5)";
+    "insert or replace into release_keys (release_id, account, host, layout, lines, file_crc, body_crc)
+    values (?1, ?2, ?3, ?4, ?5, ?6, ?7)";
 const DELETE: &str = "delete from release_keys where release_id = ?1";
 
 pub const KEYS_STEP: StepId = StepId(40);
@@ -64,6 +83,11 @@ pub const LIST_CAP: i64 = 100;
 const SETS_CAP: usize = 4;
 /// Files a Lines key is taken over, at most: the page reads as many (`web_meta::FILES_CAP`).
 const FILES_CAP: i64 = 5_000;
+/// Files (size, CRC32) a release is looked up by, at most: its probed main file and what its PAR2 sets describe.
+const CRC_FILES_CAP: usize = 8;
+/// Files smaller than this aren't looked up by their CRC: an empty or tiny file (a 0-byte marker, a stock .sfv) is
+/// the same in thousands of unrelated posts.
+pub const CRC_MIN_SIZE: i64 = 1 << 20;
 
 /// What another release can share with this one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -74,10 +98,21 @@ pub enum Kind {
     Lines,
     Par2,
     MovieHash,
+    FileCrc,
+    BodyCrc,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 6] = [Kind::Account, Kind::Host, Kind::Layout, Kind::Lines, Kind::Par2, Kind::MovieHash];
+    pub const ALL: [Kind; 8] = [
+        Kind::Account,
+        Kind::Host,
+        Kind::Layout,
+        Kind::Lines,
+        Kind::Par2,
+        Kind::MovieHash,
+        Kind::FileCrc,
+        Kind::BodyCrc,
+    ];
 
     /// The word in `/ui/same?kind=`.
     pub fn word(self) -> &'static str {
@@ -88,6 +123,8 @@ impl Kind {
             Kind::Lines => "lines",
             Kind::Par2 => "par2",
             Kind::MovieHash => "moviehash",
+            Kind::FileCrc => "file",
+            Kind::BodyCrc => "article",
         }
     }
 
@@ -104,6 +141,8 @@ impl Kind {
             Kind::Lines => "Same Lines per file",
             Kind::Par2 => "Same PAR2 set",
             Kind::MovieHash => "Same OpenSubtitles hash",
+            Kind::FileCrc => "Same file, by size and CRC32",
+            Kind::BodyCrc => "Same first article, by the server's body CRC",
         }
     }
 
@@ -126,6 +165,12 @@ impl Kind {
             Kind::MovieHash => {
                 "The same OpenSubtitles hash over the main file's first and last 64 KB and its size: the same file, as a rule."
             }
+            Kind::FileCrc => {
+                "A file of the same size and whole-file CRC32, from the yEnc trailer of a probed post or from a PAR2 set's file list: the same bytes, as a rule, whatever the file is called or how it was cut into articles. A 32-bit CRC can match by chance, soo check the size and names."
+            }
+            Kind::BodyCrc => {
+                "The main file's first article as the server received it: the same CRC32 over the posted body (yEnc name and cut included), the same part number and size. The same post made again, under any poster, subject or Message-ID. Kept for releases probed since Atlas began keeping the header."
+            }
         }
     }
 
@@ -136,7 +181,8 @@ impl Kind {
             Kind::Host => Some("host"),
             Kind::Layout => Some("layout"),
             Kind::Lines => Some("lines"),
-            Kind::Par2 | Kind::MovieHash => None,
+            Kind::BodyCrc => Some("body_crc"),
+            Kind::Par2 | Kind::MovieHash | Kind::FileCrc => None,
         }
     }
 }
@@ -148,6 +194,8 @@ pub struct Keys {
     pub host: Option<i64>,
     pub layout: Option<i64>,
     pub lines: Option<i64>,
+    pub file_crc: Option<i64>,
+    pub body_crc: Option<i64>,
 }
 
 impl Keys {
@@ -161,17 +209,39 @@ impl Keys {
             Kind::Host => self.host,
             Kind::Layout => self.layout,
             Kind::Lines => self.lines,
-            Kind::Par2 | Kind::MovieHash => None,
+            Kind::BodyCrc => self.body_crc,
+            Kind::Par2 | Kind::MovieHash | Kind::FileCrc => None,
         }
     }
 }
 
-/// What a release can be looked up by: its `release_keys`, its PAR2 set ids and its OpenSubtitles hash.
+/// A file as its whole-file CRC32 knows it: its size in bytes and the CRC.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct FileCrc {
+    pub size: i64,
+    pub crc32: u32,
+}
+
+impl FileCrc {
+    /// One worth looking up: big enough not to match every post that carries the same small file.
+    pub fn new(size: i64, crc32: u32) -> Option<FileCrc> {
+        (size >= CRC_MIN_SIZE).then_some(FileCrc { size, crc32 })
+    }
+
+    /// The `release_keys.file_crc` it is kept under.
+    pub fn key(self) -> i64 {
+        as_key(digest8(format!("file:{}:{:08x}", self.size, self.crc32).as_bytes()))
+    }
+}
+
+/// What a release can be looked up by: its `release_keys`, its PAR2 set ids, its OpenSubtitles hash and the files it
+/// knows the whole-file CRC32 of.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Lookup {
     pub keys: Keys,
     pub par2_sets: Vec<Vec<u8>>,
     pub moviehash: Option<String>,
+    pub files: Vec<FileCrc>,
 }
 
 impl Lookup {
@@ -179,6 +249,7 @@ impl Lookup {
         match kind {
             Kind::Par2 => !self.par2_sets.is_empty(),
             Kind::MovieHash => self.moviehash.is_some(),
+            Kind::FileCrc => !self.files.is_empty(),
             _ => self.keys.get(kind).is_some(),
         }
     }
@@ -286,6 +357,39 @@ pub(crate) fn lines_text(files: &[(Option<i64>, i64)], parts: Option<i64>) -> Op
     Some(lines.join(","))
 }
 
+/// The probed main file's size and whole-file CRC32, from its yEnc trailer: None unless both are known and the file
+/// is big enough to look up.
+pub fn probe_file(probe: &ProbeInfo) -> Option<FileCrc> {
+    let size = probe.yenc.as_ref()?.file_size?;
+    FileCrc::new(i64::try_from(size).ok()?, probe.file_crc32?)
+}
+
+/// The server's body CRC of an article, from its `X-Received-Body-CRC` header: decimal, as Highwinds-family servers
+/// and Usenet.Farm write it, `0x` hex taken too.
+pub fn received_body_crc(value: &str) -> Option<u32> {
+    let v = value.trim();
+    match v.strip_prefix("0x").or_else(|| v.strip_prefix("0X")) {
+        Some(hex) => u32::from_str_radix(hex, 16).ok(),
+        None => v.parse::<u32>().ok(),
+    }
+}
+
+/// What the first-article key is taken over: the server's body CRC of the probed main file's first article, its
+/// part number and its decoded size. None without the header or the part's yEnc lines.
+pub(crate) fn body_text(probe: &ProbeInfo) -> Option<String> {
+    let crc = probe
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(crate::probe::BODY_CRC_HEADER))
+        .and_then(|(_, v)| received_body_crc(v))?;
+    let y = probe.yenc.as_ref()?;
+    let decoded = match (y.begin, y.end) {
+        (Some(begin), Some(end)) if end >= begin => end - begin + 1,
+        _ => y.yend_size.or(y.file_size)?,
+    };
+    Some(format!("body:{crc:08x}:{}:{decoded}", y.part.unwrap_or(1)))
+}
+
 /// The keys over what a release has: its probe and its `file_timing` rows.
 pub fn keys_of(
     probe: Option<&ProbeInfo>,
@@ -301,6 +405,8 @@ pub fn keys_of(
             keys.host = host.map(|h| as_key(salted8(salt, &h)));
         }
         keys.layout = p.media.as_ref().and_then(layout_text).map(|t| as_key(digest8(t.as_bytes())));
+        keys.file_crc = probe_file(p).map(FileCrc::key);
+        keys.body_crc = body_text(p).map(|t| as_key(digest8(t.as_bytes())));
     }
     keys.lines = lines_text(timing, parts).map(|t| as_key(digest8(t.as_bytes())));
     keys
@@ -369,14 +475,42 @@ pub fn read_lookup(
     parts: Option<i64>,
     salt: Option<i64>,
 ) -> rusqlite::Result<Lookup> {
-    let keys = read_keys(shard, release_id, parts, salt)?;
+    let probe = probe_of(shard, release_id)?;
+    let timing = timing_of(shard, release_id)?;
+    let keys = keys_of(probe.as_ref(), &timing, parts, salt);
     let par2_sets = par2_sets(shard, release_id)?;
+    let files = crc_files(shard, release_id, probe.as_ref())?;
     let moviehash = shard
         .prepare_cached("select moviehash from release_probe where release_id = ?1")
         .ok()
         .and_then(|mut q| q.query_row([release_id], |r| r.get::<_, Option<String>>(0)).optional().ok().flatten())
         .flatten();
-    Ok(Lookup { keys, par2_sets, moviehash })
+    Ok(Lookup { keys, par2_sets, moviehash, files })
+}
+
+/// The files a release knows the size and whole-file CRC32 of: the probed main file first, then the biggest ones
+/// its PAR2 sets describe, at most `CRC_FILES_CAP`, each once. None on a shard without `par2_files` yet.
+pub fn crc_files(shard: &Connection, release_id: i64, probe: Option<&ProbeInfo>) -> rusqlite::Result<Vec<FileCrc>> {
+    let mut out: Vec<FileCrc> = probe.and_then(probe_file).into_iter().collect();
+    if let Ok(mut q) = shard.prepare_cached(
+        "select distinct size, crc32 from par2_files
+         where release_id = ?1 and bound = 1 and crc32 is not null and size >= ?2
+         order by size desc limit ?3",
+    ) {
+        let rows = q.query_map(rusqlite::params![release_id, CRC_MIN_SIZE, CRC_FILES_CAP as i64], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+        })?;
+        for row in rows {
+            let (size, crc) = row?;
+            if let Some(f) = u32::try_from(crc).ok().and_then(|c| FileCrc::new(size, c))
+                && !out.contains(&f)
+            {
+                out.push(f);
+            }
+        }
+    }
+    out.truncate(CRC_FILES_CAP);
+    Ok(out)
 }
 
 /// The PAR2 set ids a release's files are described by, at most `SETS_CAP`; none on a shard without the table yet.
@@ -392,9 +526,18 @@ pub fn par2_sets(shard: &Connection, release_id: i64) -> rusqlite::Result<Vec<Ve
 /// The `release_keys` row a release has. None: no row.
 fn stored(shard: &Connection, release_id: i64) -> rusqlite::Result<Option<Keys>> {
     shard
-        .prepare_cached("select account, host, layout, lines from release_keys where release_id = ?1")?
+        .prepare_cached(
+            "select account, host, layout, lines, file_crc, body_crc from release_keys where release_id = ?1",
+        )?
         .query_row([release_id], |r| {
-            Ok(Keys { account: r.get(0)?, host: r.get(1)?, layout: r.get(2)?, lines: r.get(3)? })
+            Ok(Keys {
+                account: r.get(0)?,
+                host: r.get(1)?,
+                layout: r.get(2)?,
+                lines: r.get(3)?,
+                file_crc: r.get(4)?,
+                body_crc: r.get(5)?,
+            })
         })
         .optional()
 }
@@ -403,6 +546,22 @@ fn stored(shard: &Connection, release_id: i64) -> rusqlite::Result<Option<Keys>>
 /// values bound from `?3` on, at most `?2`; and how many values it takes. Only releases the pages would show count:
 /// one deleted or in a blocked group (`atlas_blocked`) is left out before the limit, soo the count and the list agree.
 fn others_sql(kind: Kind, shard: usize, sets: usize) -> String {
+    if kind == Kind::FileCrc {
+        // `sets` files: their keys first (?3..), then each one's size and CRC
+        let keys: Vec<String> = (0..sets).map(|i| format!("?{}", i + 3)).collect();
+        let pairs: Vec<String> =
+            (0..sets).map(|i| format!("(size = ?{} and crc32 = ?{})", sets + 3 + 2 * i, sets + 4 + 2 * i)).collect();
+        return format!(
+            "select distinct k.release_id from (
+                 select release_id from s{shard}.release_keys where file_crc in ({})
+                 union select release_id from s{shard}.par2_files where bound = 1 and ({})
+             ) k join s{shard}.releases r on r.id = k.release_id
+             where k.release_id != ?1 and not atlas_blocked(r.group_name)
+             order by k.release_id desc limit ?2",
+            keys.join(", "),
+            pairs.join(" or ")
+        );
+    }
     let (from, matches) = match kind.column() {
         Some(col) => (format!("s{shard}.release_keys k"), format!("k.{col} = ?3")),
         None if kind == Kind::Par2 => {
@@ -423,8 +582,19 @@ fn values(lookup: &Lookup, kind: Kind) -> Vec<rusqlite::types::Value> {
     match kind {
         Kind::Par2 => lookup.par2_sets.iter().map(|s| Value::Blob(s.clone())).collect(),
         Kind::MovieHash => lookup.moviehash.iter().map(|h| Value::Text(h.clone())).collect(),
+        Kind::FileCrc => lookup
+            .files
+            .iter()
+            .map(|f| Value::Integer(f.key()))
+            .chain(lookup.files.iter().flat_map(|f| [Value::Integer(f.size), Value::Integer(i64::from(f.crc32))]))
+            .collect(),
         _ => lookup.keys.get(kind).map(Value::Integer).into_iter().collect(),
     }
+}
+
+/// What `others_sql` is told it binds: the file kind binds three values a file.
+fn binds(kind: Kind, values: usize) -> usize {
+    if kind == Kind::FileCrc { values / 3 } else { values }
 }
 
 /// The releases other than `own` that share `kind` with it, over every shard of `conn` (the main database with
@@ -436,7 +606,7 @@ pub fn others(conn: &Connection, own: i64, lookup: &Lookup, kind: Kind, limit: i
     }
     let mut found = Vec::new();
     for shard in 0..store::SHARDS {
-        let sql = others_sql(kind, shard, bound.len());
+        let sql = others_sql(kind, shard, binds(kind, bound.len()));
         let Ok(mut q) = conn.prepare(&sql) else { continue };
         let args = [rusqlite::types::Value::Integer(own), rusqlite::types::Value::Integer(limit)]
             .into_iter()
@@ -459,7 +629,7 @@ pub fn count_others(conn: &Connection, own: i64, lookup: &Lookup, kind: Kind) ->
     }
     let mut total = 0;
     for shard in 0..store::SHARDS {
-        let sql = format!("select count(*) from ({})", others_sql(kind, shard, bound.len()));
+        let sql = format!("select count(*) from ({})", others_sql(kind, shard, binds(kind, bound.len())));
         let Ok(mut q) = conn.prepare(&sql) else { continue };
         let args = [rusqlite::types::Value::Integer(own), rusqlite::types::Value::Integer(COUNT_CAP - total)]
             .into_iter()
@@ -470,6 +640,98 @@ pub fn count_others(conn: &Connection, own: i64, lookup: &Lookup, kind: Kind) ->
         }
     }
     total
+}
+
+// ---------------------------------------------------------------- the report
+
+/// What `--crc-links` found over its sample.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct CrcReport {
+    pub sampled: i64,
+    pub with_file: i64,
+    pub file_linked: i64,
+    /// linked by the file key and by no PAR2 set: a link nothing else made
+    pub file_only: i64,
+    pub with_body: i64,
+    pub body_linked: i64,
+}
+
+/// Counts, over the newest `per_shard` probed releases of each shard, how many the file and first-article keys
+/// link to another release, and how many of those no PAR2 set links. Reads only.
+pub fn crc_report(conn: &Connection, main: &std::path::Path, per_shard: i64) -> rusqlite::Result<CrcReport> {
+    let mut r = CrcReport::default();
+    for n in 0..store::SHARDS {
+        let Ok(shard) = crate::db::open_shard(&store::shard_path(main, n)) else { continue };
+        let ids: Vec<i64> = match shard
+            .prepare("select release_id from release_probe order by release_id desc limit ?1")
+        {
+            Ok(mut q) => q.query_map([per_shard], |row| row.get(0))?.collect::<rusqlite::Result<_>>()?,
+            Err(_) => continue,
+        };
+        for id in ids {
+            let lookup = read_lookup(&shard, id, None, None)?;
+            r.sampled += 1;
+            if lookup.has(Kind::FileCrc) {
+                r.with_file += 1;
+                if count_others(conn, id, &lookup, Kind::FileCrc) > 0 {
+                    r.file_linked += 1;
+                    if count_others(conn, id, &lookup, Kind::Par2) == 0 {
+                        r.file_only += 1;
+                    }
+                }
+            }
+            if lookup.has(Kind::BodyCrc) {
+                r.with_body += 1;
+                if count_others(conn, id, &lookup, Kind::BodyCrc) > 0 {
+                    r.body_linked += 1;
+                }
+            }
+        }
+    }
+    Ok(r)
+}
+
+/// `--crc-links [--sample N]`: the report over the newest N probed releases (20,000 by default).
+pub fn run_report(args: &[String]) -> i32 {
+    let sample = args
+        .iter()
+        .position(|a| a == "--sample")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|n| n.parse::<i64>().ok())
+        .unwrap_or(20_000)
+        .max(store::SHARDS as i64);
+    let main = crate::paths::database();
+    let conn = match crate::db::open_with_shards(&main) {
+        Ok(c) => c,
+        Err(e) => {
+            println!("couldnt open {}: {e}", main.display());
+            return 1;
+        }
+    };
+    match crc_report(&conn, &main, sample / store::SHARDS as i64) {
+        Ok(r) => {
+            let pct = |n: i64, of: i64| if of > 0 { 100.0 * n as f64 / of as f64 } else { 0.0 };
+            println!("newest probed releases looked at   {:>10}", r.sampled);
+            println!("  with a file CRC (1 MiB or more)  {:>10}", r.with_file);
+            println!(
+                "  sharing it with another release  {:>10}  ({:.1}% of those with one)",
+                r.file_linked,
+                pct(r.file_linked, r.with_file)
+            );
+            println!("  of those, with no PAR2 set link  {:>10}  (no shared PAR2 set linked them)", r.file_only);
+            println!("  with a first-article body CRC    {:>10}", r.with_body);
+            println!(
+                "  sharing it with another release  {:>10}  ({:.1}% of those with one)",
+                r.body_linked,
+                pct(r.body_linked, r.with_body)
+            );
+            0
+        }
+        Err(e) => {
+            println!("couldnt read the shards: {e}");
+            1
+        }
+    }
 }
 
 // ---------------------------------------------------------------- the step
@@ -521,6 +783,11 @@ impl Step for KeysStep {
     fn reruns(&self) -> Reruns {
         Reruns { on_rename: false, on_growth: true }
     }
+    /// Bit 1: the file and first-article keys, soo every release already keyed is keyed again: the file key comes
+    /// from probes made long before it.
+    fn config_stamp(&self) -> u64 {
+        1
+    }
     fn run(&self, ctx: &mut StepCtx<'_>) -> Result<Outcome, StepError> {
         let retry = |e: rusqlite::Error| StepError::Retry(e.to_string());
         let id = ctx.release().id;
@@ -534,7 +801,15 @@ impl Step for KeysStep {
             (false, Some(old)) if old == keys => Vec::new(),
             (false, _) => vec![StepWrite::new(
                 UPSERT,
-                vec![id.into(), keys.account.into(), keys.host.into(), keys.layout.into(), keys.lines.into()],
+                vec![
+                    id.into(),
+                    keys.account.into(),
+                    keys.host.into(),
+                    keys.layout.into(),
+                    keys.lines.into(),
+                    keys.file_crc.into(),
+                    keys.body_crc.into(),
+                ],
             )],
         };
         Ok(Outcome { matched: !keys.is_empty(), writes, ..Outcome::default() })
@@ -643,8 +918,105 @@ mod tests {
             )
             .unwrap();
         }
-        let lookup = Lookup { keys: Keys::default(), par2_sets: vec![set], moviehash: None };
+        let lookup = Lookup { keys: Keys::default(), par2_sets: vec![set], moviehash: None, files: Vec::new() };
         assert_eq!(others(&conn, 1, &lookup, Kind::Par2, 1), vec![2], "the limit counts only the shown ones");
         assert_eq!(count_others(&conn, 1, &lookup, Kind::Par2), 1);
+    }
+
+    #[test]
+    fn the_server_body_crc_reads_decimal_and_hex() {
+        assert_eq!(received_body_crc(" 3735928559 "), Some(0xdead_beef));
+        assert_eq!(received_body_crc("0xDEADBEEF"), Some(0xdead_beef));
+        assert_eq!(received_body_crc("0"), Some(0));
+        assert_eq!(received_body_crc("4294967296"), None, "past 32 bits");
+        assert_eq!(received_body_crc("-1"), None);
+        assert_eq!(received_body_crc(""), None);
+    }
+
+    #[test]
+    fn the_first_article_key_needs_the_header_and_the_part() {
+        let mut probe = ProbeInfo::default();
+        probe.headers.insert("x-received-body-crc".into(), "3735928559".into());
+        assert_eq!(body_text(&probe), None, "no yEnc lines, no key");
+        probe.yenc = Some(crate::probe::yenc::YencLines {
+            part: Some(1),
+            begin: Some(1),
+            end: Some(716_800),
+            file_size: Some(5_000_000),
+            ..Default::default()
+        });
+        assert_eq!(body_text(&probe).as_deref(), Some("body:deadbeef:1:716800"));
+        let keys = keys_of(Some(&probe), &[], None, None);
+        assert_eq!(keys.body_crc, Some(as_key(digest8(b"body:deadbeef:1:716800"))));
+        probe.headers.clear();
+        assert_eq!(keys_of(Some(&probe), &[], None, None).body_crc, None);
+    }
+
+    #[test]
+    fn the_file_key_skips_small_files() {
+        let mut probe = ProbeInfo::default();
+        probe.file_crc32 = Some(0x1234_5678);
+        probe.yenc = Some(crate::probe::yenc::YencLines { file_size: Some(CRC_MIN_SIZE as u64), ..Default::default() });
+        let file = probe_file(&probe).expect("1 MiB is enough");
+        assert_eq!(file.key(), as_key(digest8(format!("file:{}:12345678", CRC_MIN_SIZE).as_bytes())));
+        assert_eq!(keys_of(Some(&probe), &[], None, None).file_crc, Some(file.key()));
+        probe.yenc =
+            Some(crate::probe::yenc::YencLines { file_size: Some(CRC_MIN_SIZE as u64 - 1), ..Default::default() });
+        assert!(probe_file(&probe).is_none(), "a CRC over a small file says too little");
+        probe.yenc = Some(crate::probe::yenc::YencLines { file_size: Some(5 << 20), ..Default::default() });
+        probe.file_crc32 = None;
+        assert!(probe_file(&probe).is_none());
+    }
+
+    #[test]
+    fn the_body_crc_header_is_kept() {
+        let kept = crate::probe::keep_headers(&[
+            ("X-Received-Body-CRC".into(), "123".into()),
+            ("X-Received-Bytes".into(), "740000".into()),
+            ("X-Something-Else".into(), "1".into()),
+        ]);
+        assert_eq!(kept.get(crate::probe::BODY_CRC_HEADER).map(String::as_str), Some("123"));
+        assert!(kept.contains_key("X-Received-Bytes"));
+        assert_eq!(kept.len(), 2);
+    }
+
+    #[test]
+    fn a_file_matches_by_its_key_or_a_par2_file_list() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::filters::register_sql(&conn).unwrap();
+        conn.execute("attach ':memory:' as s0", []).unwrap();
+        conn.execute_batch(&crate::archive::store::PAR2_FILES.create.replace("par2_files (", "s0.par2_files ("))
+            .unwrap();
+        conn.execute_batch(&RELEASE_KEYS.create.replace("release_keys (", "s0.release_keys (")).unwrap();
+        conn.execute_batch("create table s0.releases (id integer primary key, group_name text not null)").unwrap();
+        let blocked = "alt.binaries.pictures.erotica.teen";
+        for (id, group) in [(1, "a.b.c"), (2, "a.b.c"), (3, "a.b.d"), (4, "a.b.c"), (5, blocked), (6, "a.b.c")] {
+            conn.execute("insert into s0.releases (id, group_name) values (?1, ?2)", rusqlite::params![id, group])
+                .unwrap();
+        }
+        let file = FileCrc::new(8 << 20, 0xfeed_beef).unwrap();
+        // 1 asks; 2 probed the same file; 3's PAR2 set lists it; 4's PAR2 copy is unbound; 5 is blocked;
+        // 6 has the same CRC at another size
+        for (id, key) in [(1, file.key()), (2, file.key()), (5, file.key())] {
+            conn.execute(
+                "insert into s0.release_keys (release_id, file_crc) values (?1, ?2)",
+                rusqlite::params![id, key],
+            )
+            .unwrap();
+        }
+        for (id, size, bound) in [(3, 8i64 << 20, 1), (4, 8 << 20, 0), (6, 9 << 20, 1)] {
+            conn.execute(
+                "insert into s0.par2_files (release_id, file_id, set_id, md5, md5_16k, size, name, crc32, bound)
+                 values (?1, x'01', x'02', x'', x'', ?2, 'a.mkv', ?3, ?4)",
+                rusqlite::params![id, size, i64::from(0xfeed_beef_u32), bound],
+            )
+            .unwrap();
+        }
+        let lookup = Lookup { keys: Keys::default(), par2_sets: Vec::new(), moviehash: None, files: vec![file] };
+        assert!(lookup.has(Kind::FileCrc));
+        assert_eq!(others(&conn, 1, &lookup, Kind::FileCrc, 10), vec![3, 2]);
+        assert_eq!(count_others(&conn, 1, &lookup, Kind::FileCrc), 2);
+        let none = Lookup { keys: Keys::default(), par2_sets: Vec::new(), moviehash: None, files: Vec::new() };
+        assert!(others(&conn, 1, &none, Kind::FileCrc, 10).is_empty());
     }
 }
