@@ -162,7 +162,8 @@ pub fn decode_entities(s: &str) -> String {
     while let Some(at) = rest.find('&') {
         out.push_str(&rest[..at]);
         rest = &rest[at..];
-        let Some(end) = rest[..rest.len().min(12)].find(';') else {
+        // bytes, not chars: the cut can fall inside a character, and `;` is one byte wherever it is
+        let Some(end) = rest.as_bytes()[..rest.len().min(12)].iter().position(|&b| b == b';') else {
             out.push('&');
             rest = &rest[1..];
             continue;
@@ -274,6 +275,9 @@ mod tests {
     #[test]
     fn entities() {
         assert_eq!(decode_entities("a &amp; b &#39;c&#x27; &bogus; & d"), "a & b 'c' &bogus; & d");
+        // a bare & before multibyte text, where the look-ahead ends inside a character
+        assert_eq!(decode_entities("&amp; caf\u{e9}\u{e9}\u{e9}\u{e9}"), "& caf\u{e9}\u{e9}\u{e9}\u{e9}");
+        assert_eq!(decode_entities("& \u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}"), "& \u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}");
     }
 
     #[test]
