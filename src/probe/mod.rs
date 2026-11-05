@@ -8,6 +8,7 @@ pub mod codec;
 pub mod lzma;
 pub mod media;
 pub mod moviehash;
+pub mod mpegps;
 pub mod nest;
 pub mod opensubtitles;
 pub mod step;
