@@ -306,9 +306,13 @@ fn stale_saved(info: &str) -> bool {
     // Dolby Vision saved before `from_rpu` was kept, the same rows `DV_WITHOUT_RPU` picks
     let dv_before_from_rpu = !p["media"]["video"][0]["dv_profile"].is_null()
         && p["media"]["video"][0]["dolby_vision"].get("from_rpu").is_none();
+    // and before `keyframe_key` was kept, the rows `DV_WITHOUT_KEYFRAME_KEY` picks: a null one was looked for
+    let dv_before_keyframe_key =
+        !p["media"]["video"][0]["dv_profile"].is_null() && p["media"]["video"][0].get("keyframe_key").is_none();
     mp4_without_tracks
         || dvd_folder_as_vob
         || dv_before_from_rpu
+        || dv_before_keyframe_key
         || p["media"].is_null()
             && (newly_read(p["file"].as_str())
             || newly_read(p["archive"]["name"].as_str())
@@ -990,7 +994,9 @@ mod tests {
         assert_eq!(rerun_dv_without_rpu(&conn, 100).unwrap(), 1);
         assert!(stale_saved(r#"{"media":{"video":[{"dv_profile":7,"dolby_vision":{"profile":7,"fel":true}}]}}"#));
         assert!(stale_saved(r#"{"media":{"video":[{"dv_profile":7}]}}"#));
-        assert!(!stale_saved(r#"{"media":{"video":[{"dv_profile":8,"dolby_vision":{"from_rpu":false}}]}}"#));
+        assert!(!stale_saved(
+            r#"{"media":{"video":[{"dv_profile":8,"dolby_vision":{"from_rpu":false},"keyframe_key":null}]}}"#
+        ));
         assert!(!stale_saved(r#"{"media":{"video":[{"hdr":"HDR10"}]}}"#));
     }
 
@@ -1017,6 +1023,11 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(rerun_dv_without_keyframe_key(&conn, 100).unwrap(), 1);
+        let saved =
+            |v: &str| format!(r#"{{"media":{{"video":[{{"dv_profile":8,"dolby_vision":{{"from_rpu":true}}{v}}}]}}}}"#);
+        assert!(stale_saved(&saved("")), "a restored probe from before the key is probed again");
+        assert!(!stale_saved(&saved(r#","keyframe_key":null"#)));
+        assert!(!stale_saved(&saved(r#","keyframe_key":"0123456789abcdef""#)));
     }
 
     #[test]

@@ -472,10 +472,12 @@ fn segment(body: &[u8], info: &mut MediaInfo) {
                     let track_num = t.number.unwrap_or(next_track_num);
                     next_track_num = track_num.saturating_add(1);
                     if t.kind == 1 && !is_full(info) {
+                        // lengthSizeMinusOne: byte 4 of an avcC record, byte 21 of an hvcC one
+                        let at = if t.codec.contains("AVC") { 4 } else { 21 };
                         let nal_length_size = t
                             .codec_private
                             .as_deref()
-                            .and_then(|cp| cp.get(21))
+                            .and_then(|cp| cp.get(at))
                             .map(|&b| usize::from(b & 0x03) + 1)
                             .unwrap_or(4);
                         video_tracks.push((track_num, info.video.len(), nal_length_size));
@@ -1234,8 +1236,13 @@ fn trak(body: &[u8], full_data: &[u8], all_chunk_offsets: &[usize], info: &mut M
                             track.hdr = vui.hdr;
                         }
                     }
-                } else if kind == b"avcC" && track.bit_depth.is_none() {
-                    track.bit_depth = AvcDepth::from_avcc(v).map(u64::from);
+                } else if kind == b"avcC" {
+                    if let Some(&len_byte) = v.get(4) {
+                        nal_length_size = usize::from(len_byte & 0x03) + 1;
+                    }
+                    if track.bit_depth.is_none() {
+                        track.bit_depth = AvcDepth::from_avcc(v).map(u64::from);
+                    }
                 }
             });
             for &(chunk_idx, off) in &chunk_offsets {
@@ -2820,12 +2827,18 @@ mod tests {
         ]
         .concat();
         let tracks = el(&[0x16, 0x54, 0xAE, 0x6B], &el(&[0xAE], &t1));
-        let segment = el(&[0x18, 0x53, 0x80, 0x67], &tracks);
+        // a keyframe with 4-byte NAL lengths, as avcC byte 4 (0xFF) says: an IDR slice
+        let frame = [0, 0, 0, 3, 0x65, 0x88, 0x84];
+        let block = [&[0x81u8, 0, 0, 0x80][..], &frame].concat();
+        let cluster = el(&[0x1F, 0x43, 0xB6, 0x75], &el(&[0xA3], &block));
+        let segment = el(&[0x18, 0x53, 0x80, 0x67], &[tracks, cluster].concat());
         let mkv = [el(&[0x1A, 0x45, 0xDF, 0xA3], &el(&[0x42, 0x82], b"matroska")), segment].concat();
 
         let info = parse(&mkv).unwrap();
         assert_eq!(info.video[0].codec, "V_MPEG4/ISO/AVC");
         assert_eq!(info.video[0].bit_depth, Some(10));
+        assert_eq!(info.video[0].keyframe_key, keyframe_key("V_MPEG4/ISO/AVC", &frame, 4));
+        assert!(info.video[0].keyframe_key.is_some(), "the NAL length width comes from avcC byte 4");
     }
 
     #[test]
