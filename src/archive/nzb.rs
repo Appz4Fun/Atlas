@@ -81,6 +81,11 @@ pub fn parse(body: &[u8]) -> Parsed {
                     s.message_id.push_str(&t);
                 }
             }
+            Ok(Event::CData(t)) => {
+                if let Some(s) = segment.as_mut() {
+                    s.message_id.push_str(&t);
+                }
+            }
             Ok(Event::GeneralRef(r)) => {
                 if let Some(s) = segment.as_mut() {
                     match r.resolve_char_ref() {
@@ -224,6 +229,8 @@ mod tests {
         assert_eq!(p.files[1].segments[0].message_id, "x@y");
         let bracketed = parse(b"<nzb><file subject=\"a.rar (1/1)\"><segments><segment bytes=\"1\" number=\"1\"> &lt;a@b&gt; </segment></segments></file></nzb>");
         assert_eq!(bracketed.files[0].segments[0].message_id, "a@b");
+        let cdata = parse(b"<nzb><file subject=\"a.rar (1/1)\"><segments><segment bytes=\"1\" number=\"1\"><![CDATA[c@d]]></segment></segments></file></nzb>");
+        assert_eq!(cdata.files[0].segments[0].message_id, "c@d");
     }
 
     #[test]

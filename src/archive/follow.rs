@@ -8,7 +8,6 @@ use std::collections::BTreeMap;
 use crate::postprocess::step::{BodyRequest, Got, StepCtx, StepError};
 use crate::probe::nest;
 
-use super::names::strip_volume_suffix;
 use super::nzb::{self, NzbFile};
 use super::select::{self, Kind};
 use super::{ARTICLE_CAP, InnerFile};
@@ -128,9 +127,18 @@ pub struct Set {
     pub headed_volumes: bool,
 }
 
-/// Where an NZB starts in these bytes, if one does.
+/// Where an NZB starts in these bytes, if one does, in one pass: at its first `<nzb`, or at an XML prolog or doctype
+/// shortly before it (`nzb::is_nzb` wants the root within 4 KiB of the start).
 fn nzb_start(bytes: &[u8]) -> Option<usize> {
-    bytes.iter().enumerate().filter(|(_, b)| **b == b'<').map(|(at, _)| at).find(|at| nzb::is_nzb(&bytes[*at..]))
+    let root = bytes.windows(4).position(|w| w.eq_ignore_ascii_case(b"<nzb"))?;
+    let window = root.saturating_sub(4096);
+    let before = &bytes[window..root];
+    let prolog = [&b"<?xml"[..], b"<!doctype nzb"]
+        .iter()
+        .filter_map(|p| before.windows(p.len()).position(|w| w.eq_ignore_ascii_case(p)))
+        .min()
+        .map(|at| window + at);
+    Some(prolog.filter(|at| nzb::is_nzb(&bytes[*at..])).unwrap_or(root))
 }
 
 /// What to read for an NZB, first choice first: each NZB on its own, then archive sets with their volumes in order,
@@ -148,7 +156,7 @@ fn sets(files: &[Whole]) -> Vec<Set> {
             Kind::Numbered(n) => (3, n),
             _ => continue,
         };
-        archives.entry((family, strip_volume_suffix(&f.name).to_lowercase())).or_default().push((volume, f));
+        archives.entry((family, select::set_name(&f.name, family == 3).to_lowercase())).or_default().push((volume, f));
     }
     for ((family, _), mut volumes) in archives {
         volumes.sort_by(|a, b| (a.0, &a.1.name).cmp(&(b.0, &b.1.name)));
@@ -235,8 +243,23 @@ mod tests {
                 set(&["b.tar.gz"], false)
             ]
         );
+        let numbered = [whole("d.02"), whole("d.01")];
+        assert_eq!(sets(&numbered)[0], Set { files: vec![whole("d.01"), whole("d.02")], headed_volumes: false });
         let split = [whole("c.7z.002"), whole("c.7z.001")];
         assert_eq!(sets(&split)[0], Set { files: vec![whole("c.7z.001"), whole("c.7z.002")], headed_volumes: false });
+    }
+
+    #[test]
+    fn an_nzbs_start_is_found_in_one_pass() {
+        assert_eq!(nzb_start(b"junk\x00\x01<?xml version=\"1.0\"?>\n<nzb>"), Some(6));
+        assert_eq!(nzb_start(b"no prolog <NZB xmlns=\"x\">"), Some(10));
+        assert_eq!(nzb_start(b"<?xml?><rss></rss>"), None);
+        // a prolog too far before the root doesn't count
+        let far = [&b"<?xml?>"[..], &[b' '; 5000], b"<nzb>"].concat();
+        assert_eq!(nzb_start(&far), Some(5007));
+        // repeated prologs with no root cost one scan
+        let many = b"<?xml ".repeat(3_000_000);
+        assert_eq!(nzb_start(&many), None);
     }
 
     #[test]
