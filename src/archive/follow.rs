@@ -135,7 +135,9 @@ pub fn nzb_inside(
         let mut joined = Vec::new();
         let mut found = None;
         for piece in &pieces {
-            let unwrapped = nest::unwrap_for(piece, &|name| select::classify(name) == Kind::Nzb);
+            // as far as an NZB this hop may read goes, not a probe's look at the front
+            let limit = usize::try_from(left.bytes).unwrap_or(usize::MAX).min(MAX_FOLLOWED_NZB);
+            let unwrapped = nest::unwrap_for(piece, &|name| select::classify(name) == Kind::Nzb, limit);
             if let Some(names) = names.as_deref_mut() {
                 for layer in &unwrapped.layers {
                     if let Some(name) = layer.name.clone().filter(|n| !names.iter().any(|f| &f.name == n)) {

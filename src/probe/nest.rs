@@ -116,16 +116,17 @@ struct Opened {
 
 /// Follows `data` down through every archive and compressed stream it starts with.
 pub fn unwrap(data: &[u8]) -> Nest<'_> {
-    unwrap_for(data, &|_| false)
+    unwrap_for(data, &|_| false, MAX_DECODED)
 }
 
-/// `unwrap`, taking in a RAR or zip the biggest file whose name `want` says yes to, when there is one, over the biggest.
-pub fn unwrap_for<'a>(data: &'a [u8], want: &dyn Fn(&str) -> bool) -> Nest<'a> {
+/// `unwrap`, taking in a RAR, zip or tar the biggest file whose name `want` says yes to, when there is one, over the
+/// biggest, and decoding up to `max_decoded` bytes in all rather than `MAX_DECODED`.
+pub fn unwrap_for<'a>(data: &'a [u8], want: &dyn Fn(&str) -> bool, max_decoded: usize) -> Nest<'a> {
     let mut layers = Vec::new();
     let mut buf: Cow<'_, [u8]> = Cow::Borrowed(data);
     let (mut lo, mut hi) = (0usize, data.len());
     let mut outer_at = Some(0usize);
-    let mut budget = MAX_DECODED;
+    let mut budget = max_decoded;
     while let Some(Opened { mut layer, view }) = open(&buf[lo..hi], want) {
         // a name comes from the poster's bytes: keep what a name needs
         layer.name = layer.name.map(|n| cap_name(&n));

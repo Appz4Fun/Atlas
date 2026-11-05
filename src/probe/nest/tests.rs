@@ -610,7 +610,7 @@ fn unwrap_for_takes_the_wanted_entry_over_a_bigger_one_in_zip_and_tar() {
     let zip = [zip_entry(8, "big.mkv", &deflate(&big), big.len()), zip_entry(8, "a.nzb", &deflate(&note), note.len())]
         .concat();
     assert_eq!(unwrap(&zip).layers[0].name.as_deref(), Some("big.mkv"));
-    let n = unwrap_for(&zip, &want);
+    let n = unwrap_for(&zip, &want, MAX_DECODED);
     assert_eq!(n.layers[0].name.as_deref(), Some("a.nzb"));
     same(&n.inner, &note);
     // a gzipped tar, two files
@@ -618,7 +618,25 @@ fn unwrap_for_takes_the_wanted_entry_over_a_bigger_one_in_zip_and_tar() {
     tar.truncate(512 + big.len().div_ceil(512) * 512);
     tar.extend(tar_of("a.nzb", &note));
     let gz = gzip_of("x.tar", &tar);
-    let n = unwrap_for(&gz, &want);
+    let n = unwrap_for(&gz, &want, MAX_DECODED);
     assert_eq!(n.layers.last().and_then(|l| l.name.as_deref()), Some("a.nzb"));
     same(&n.inner, &note);
+}
+
+#[test]
+fn unwrap_for_decodes_as_far_as_its_own_limit() {
+    // letters at random: packs to about half, well inside the ratio limit
+    let mut seed = 7u32;
+    let text: Vec<u8> = (0..MAX_DECODED + 4096)
+        .map(|_| {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            b'a' + ((seed >> 16) % 26) as u8
+        })
+        .collect();
+    let gz = gzip_of("big.nzb", &text);
+    let short = unwrap(&gz);
+    assert!(short.layers[0].capped && short.inner.len() == MAX_DECODED);
+    let whole = unwrap_for(&gz, &|_| false, 2 * MAX_DECODED);
+    assert!(!whole.layers[0].capped);
+    same(&whole.inner, &text);
 }
