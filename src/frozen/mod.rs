@@ -1,4 +1,4 @@
-//! Releases set aside: small complete ones (`rules`), moved whole out of their shard into the shard's frozen file
+//! Releases set aside: small complete ones and those outside Movies, TV and Other (`rules`), moved whole out of their shard into the shard's frozen file
 //! (`atlas.s3.frozen.db` next to `atlas.s3.db`), where search, the word index and both processing lanes never look.
 //! Nothing is lost: a frozen release is one row holding every row it had (`payload`), a deep search still finds it,
 //! its NZB still builds, and a thaw puts it back as it was.
@@ -55,6 +55,8 @@ pub static ENABLED: AtomicBool = AtomicBool::new(true);
 pub static SMALL_BYTES: AtomicI64 = AtomicI64::new(1 << 30);
 /// `[freeze] small_keeps_tv_movies`: the small rule leaves movies and TV alone
 pub static SMALL_KEEPS_TV_MOVIES: AtomicBool = AtomicBool::new(false);
+/// `[freeze] not_tv_movies`: a release categorized outside Movies, TV and Other freezes, complete or not
+pub static NOT_TV_MOVIES: AtomicBool = AtomicBool::new(true);
 /// `[freeze] per_tick`: releases a writer moves at most a tick
 pub static PER_TICK: AtomicI64 = AtomicI64::new(200);
 /// `[freeze] tick_ms`: how long a tick may hold the writer
@@ -75,6 +77,7 @@ pub fn configure(cfg: &crate::config::FreezeConfig) {
     ENABLED.store(cfg.enabled, Relaxed);
     SMALL_BYTES.store(cfg.small_bytes.max(0), Relaxed);
     SMALL_KEEPS_TV_MOVIES.store(cfg.small_keeps_tv_movies, Relaxed);
+    NOT_TV_MOVIES.store(cfg.not_tv_movies, Relaxed);
     PER_TICK.store(cfg.per_tick.max(1), Relaxed);
     TICK_MS.store(cfg.tick_ms.max(1), Relaxed);
     MIN_FREE_BYTES.store(cfg.min_free_gb.max(0).saturating_mul(1 << 30), Relaxed);
@@ -288,6 +291,8 @@ pub enum Written {
     Written,
     /// another frozen release has the name in the group: this one stays live
     NameTaken,
+    /// its rows come to more than a payload holds (`payload::MAX_RAW`): it stays live
+    TooBig,
 }
 
 /// The frozen row for a collected release, in place of any older copy of it. In the caller's transaction.
@@ -299,6 +304,7 @@ pub fn write(conn: &Connection, s: &Summary, p: &Payload, reason: &str, now: i64
     if other.is_some_and(|o| o != s.id) {
         return Ok(Written::NameTaken);
     }
+    let Some(packed) = payload::encode(p) else { return Ok(Written::TooBig) };
     // a delete then an insert, not a replace: a replace doesnt fire the delete trigger the full text index needs
     conn.prepare_cached("delete from frozen.frozen_releases where id = ?1")?.execute([s.id])?;
     conn.prepare_cached("delete from frozen.frozen_collections where release_id = ?1")?.execute([s.id])?;
@@ -320,7 +326,7 @@ pub fn write(conn: &Connection, s: &Summary, p: &Payload, reason: &str, now: i64
         s.category,
         reason,
         now,
-        payload::encode(p)
+        packed
     ])?;
     if let Some(c) = p.table("collections")
         && let Some(k) = c.column("key")
@@ -418,6 +424,13 @@ pub fn copy(
                 Written::Written => copied.push((*id, s.size, s.parts)),
                 Written::NameTaken => {
                     crate::metrics::names::FROZEN.inc(&[("event", "name_taken")], 1);
+                    dropped.push(*id);
+                }
+                Written::TooBig => {
+                    // it only grows: kept off the rules, soo no visit collects it again
+                    conn.prepare_cached("insert or replace into main.freeze_exempt (release_id, at) values (?1, ?2)")?
+                        .execute(params![id, now])?;
+                    crate::metrics::names::FROZEN.inc(&[("event", "too_big")], 1);
                     dropped.push(*id);
                 }
             },
@@ -717,10 +730,24 @@ pub fn thaw(conn: &Connection, id: i64, exempt: bool, now: i64) -> Result<Thawed
     Ok(outcome)
 }
 
-/// The frozen releases an incoming post belongs to: by its collection key, its name, and the names its articles were
-/// grouped under. Each is thawed, in a savepoint of its own: one that can't be (a payload that wont read) stays
-/// frozen, and the post is saved as new rather than the save failing. In the save's transaction.
-pub fn thaw_incoming(conn: &Connection, key: Option<i64>, names: &[&str], group: &str, now: i64) -> Result<usize> {
+/// the most frozen releases one incoming release thaws by the names its articles carry: a save joins articles to an
+/// older row only by its own name and poster, and a post naming many can't unfreeze many
+const THAW_BY_ARTICLES: usize = 8;
+
+/// The frozen releases an incoming post belongs to, the ones its save will update: by its collection key, its name,
+/// and the names its articles were grouped under where the frozen row has the article's poster too (as a save joins
+/// them to an older row), `THAW_BY_ARTICLES` of those at most. Each is thawed, in a savepoint of its own: one that
+/// can't be (a payload that wont read) stays frozen, and the post is saved as new rather than the save failing. Each
+/// thawed one is queued again if a rule still matches it, soo one the save leaves as it was goes back after its wait.
+/// In the save's transaction.
+pub fn thaw_incoming(
+    conn: &Connection,
+    key: Option<i64>,
+    name: &str,
+    articles: &[(&str, &str)],
+    group: &str,
+    now: i64,
+) -> Result<usize> {
     let mut ids: BTreeSet<i64> = BTreeSet::new();
     if let Some(k) = key
         && let Some(id) = conn
@@ -730,18 +757,31 @@ pub fn thaw_incoming(conn: &Connection, key: Option<i64>, names: &[&str], group:
     {
         ids.insert(id);
     }
-    let mut seen: HashSet<&str> = HashSet::new();
-    let mut by_name =
-        conn.prepare_cached("select id from frozen.frozen_releases where name = ?1 and group_name = ?2")?;
-    for name in names.iter().filter(|n| seen.insert(**n)) {
-        if let Some(id) = by_name.query_row(params![name, group], |r| r.get(0)).optional()? {
-            ids.insert(id);
+    if let Some(id) = conn
+        .prepare_cached("select id from frozen.frozen_releases where name = ?1 and group_name = ?2")?
+        .query_row(params![name, group], |r| r.get(0))
+        .optional()?
+    {
+        ids.insert(id);
+    }
+    let mut seen: HashSet<(&str, &str)> = HashSet::new();
+    let mut by_article = conn
+        .prepare_cached("select id from frozen.frozen_releases where name = ?1 and group_name = ?2 and poster = ?3")?;
+    let mut by_articles = 0;
+    for (name, poster) in articles.iter().filter(|a| seen.insert(**a)) {
+        if by_articles >= THAW_BY_ARTICLES {
+            break;
+        }
+        if let Some(id) = by_article.query_row(params![name, group, poster], |r| r.get(0)).optional()?
+            && ids.insert(id)
+        {
+            by_articles += 1;
         }
     }
     let mut thawed = 0;
     for id in ids {
         conn.execute_batch("savepoint thaw")?;
-        match thaw(conn, id, false, now) {
+        match thaw(conn, id, false, now).and_then(|t| rules::evaluate(conn, id, now).map(|_| t)) {
             Ok(_) => {
                 conn.execute_batch("release thaw")?;
                 thawed += 1;

@@ -204,6 +204,41 @@ fn only_what_the_small_rule_says_freezes() {
 }
 
 #[test]
+fn whatever_is_not_movies_tv_or_other_freezes_complete_or_not() {
+    let f = Fixture::new();
+    let mut music = post("Album", &["a.flac"], 3, 600 << 20);
+    music.articles.pop();
+    f.save(&[
+        music,
+        post("Film", &["b.mkv"], 2, 600 << 20),
+        post("Show", &["c.mkv"], 2, 600 << 20),
+        post("Misc", &["d.bin"], 2, 600 << 20),
+        post("Unknown", &["e.bin"], 2, 600 << 20),
+        post("Clips", &["f.rar"], 2, 600 << 20),
+        post("Book.Pointer", &["g.nzb"], 2, 600 << 20),
+    ]);
+    let conn = f.writer();
+    let id = |n: &str| f.id(&conn, n);
+    for (n, category) in
+        [("Album", 3040), ("Film", 2040), ("Show", 5040), ("Misc", 8010), ("Clips", 6040), ("Book.Pointer", 7020)]
+    {
+        conn.execute("insert into release_category (release_id, category) values (?1, ?2)", params![id(n), category])
+            .unwrap();
+    }
+    conn.execute("update releases set is_obfuscated = 1 where name = 'Clips'", []).unwrap();
+    let queued = |n: &str| rules::evaluate(&conn, id(n), NOW).unwrap();
+    assert!(queued("Album"), "music, incomplete as it is");
+    let reason: String =
+        conn.query_row("select reason from freeze_pending where release_id = ?1", [id("Album")], |r| r.get(0)).unwrap();
+    assert_eq!(reason, rules::NOT_TV_MOVIES);
+    for n in ["Film", "Show", "Misc", "Unknown", "Clips", "Book.Pointer"] {
+        assert!(!queued(n), "{n}");
+    }
+    assert_eq!(freeze_all(&conn).frozen, 1);
+    assert_eq!(count(&conn, "select count(*) from frozen.frozen_releases where reason = 'not_tv_movies'"), 1);
+}
+
+#[test]
 fn a_database_lane_visit_queues_a_release_for_freezing() {
     let f = Fixture::new();
     f.save(&[post("Small", &["b.mkv"], 1, 10)]);
@@ -490,4 +525,44 @@ fn a_frozen_file_that_wont_read_stops_a_reset() {
     std::fs::write(path_of(&f.main, shard), b"not a database, not at all, not even close to one").unwrap();
     assert!(unfrozen_copy(&f.main, shard).is_err());
     assert!(crate::raw_store::harvest_from_shards(&f.main, &|_| {}).is_err(), "and the reset with it");
+}
+
+#[test]
+fn a_post_naming_frozen_releases_thaws_only_what_its_save_joins_and_few_of_those() {
+    let f = Fixture::new();
+    let victims: Vec<Release> = (0..10)
+        .map(|n| {
+            let mut r = post(&format!("Victim.{n}"), &["a.rar"], 1, 100);
+            r.poster = "owner <o@x>".into();
+            r
+        })
+        .collect();
+    f.save(&victims);
+    let conn = f.writer();
+    for n in 0..10 {
+        let id = f.id(&conn, &format!("Victim.{n}"));
+        conn.execute("insert into freeze_pending (release_id, reason, at) values (?1, 'test', 1)", [id]).unwrap();
+    }
+    assert_eq!(freeze_all(&conn).frozen, 10);
+    let frozen = || count(&conn, "select count(*) from frozen.frozen_releases");
+    let naming = |author: &str| -> Release {
+        let mut r = post("Crafted", &["x.rar"], 10, 100);
+        for (n, a) in r.articles.iter_mut().enumerate() {
+            a.release_name = Some(format!("Victim.{n}"));
+            a.author = author.into();
+        }
+        r
+    };
+    let tx = conn.unchecked_transaction().unwrap();
+    let crafted = naming("someone <s@x>");
+    let articles: Vec<(&str, &str)> =
+        crafted.articles.iter().map(|a| (a.release_name.as_deref().unwrap(), a.author.as_str())).collect();
+    assert_eq!(thaw_incoming(&tx, None, &crafted.name, &articles, G, NOW).unwrap(), 0, "not their poster");
+    let theirs = naming("owner <o@x>");
+    let articles: Vec<(&str, &str)> =
+        theirs.articles.iter().map(|a| (a.release_name.as_deref().unwrap(), a.author.as_str())).collect();
+    assert_eq!(thaw_incoming(&tx, None, &theirs.name, &articles, G, NOW).unwrap(), 8, "a few at most");
+    tx.commit().unwrap();
+    assert_eq!(frozen(), 2);
+    assert_eq!(count(&conn, "select count(*) from freeze_pending"), 8, "queued again, to go back after their wait");
 }

@@ -386,6 +386,8 @@ pub struct FreezeConfig {
     pub small_bytes: i64,
     /// the small rule leaves movies and TV alone
     pub small_keeps_tv_movies: bool,
+    /// a release categorized outside Movies, TV and Other freezes, complete or not
+    pub not_tv_movies: bool,
     /// releases a shard's writer moves at most a tick (a second)
     pub per_tick: i64,
     /// how long a tick may hold the writer, milliseconds
@@ -402,6 +404,7 @@ impl Default for FreezeConfig {
             enabled: true,
             small_bytes: 1 << 30,
             small_keeps_tv_movies: false,
+            not_tv_movies: true,
             per_tick: 200,
             tick_ms: 50,
             min_free_gb: 100,
@@ -431,6 +434,7 @@ impl FreezeConfig {
         };
         flag("enabled", &mut c.enabled);
         flag("small_keeps_tv_movies", &mut c.small_keeps_tv_movies);
+        flag("not_tv_movies", &mut c.not_tv_movies);
         c
     }
 }
