@@ -2592,17 +2592,16 @@ pub fn harvest_from_shards(main: &Path, log: &dyn Fn(&str)) -> anyhow::Result<()
     }
     for shard_idx in 0..crate::store::SHARDS {
         let shard_path = crate::store::shard_path(main, shard_idx);
-        if !shard_path.exists() {
-            continue;
+        if shard_path.exists() {
+            log(&format!("harvesting shard s{shard_idx} ({})...", shard_path.display()));
+            conn.execute("ATTACH DATABASE ?1 AS sh", [shard_path.to_string_lossy().as_ref()])
+                .with_context(|| format!("attaching {}", shard_path.display()))?;
+            let res = harvest_attached_shard(&conn);
+            let _ = conn.execute_batch("ROLLBACK");
+            let detach_res = conn.execute("DETACH DATABASE sh", []);
+            res.with_context(|| format!("harvesting {}", shard_path.display()))?;
+            detach_res.with_context(|| format!("detaching {}", shard_path.display()))?;
         }
-        log(&format!("harvesting shard s{shard_idx} ({})...", shard_path.display()));
-        conn.execute("ATTACH DATABASE ?1 AS sh", [shard_path.to_string_lossy().as_ref()])
-            .with_context(|| format!("attaching {}", shard_path.display()))?;
-        let res = harvest_attached_shard(&conn);
-        let _ = conn.execute_batch("ROLLBACK");
-        let detach_res = conn.execute("DETACH DATABASE sh", []);
-        res.with_context(|| format!("harvesting {}", shard_path.display()))?;
-        detach_res.with_context(|| format!("detaching {}", shard_path.display()))?;
         // its frozen releases' rows left the shard: harvested from a shard made of them
         let Some(unfrozen) = crate::frozen::unfrozen_copy(main, shard_idx)
             .with_context(|| format!("reading shard s{shard_idx}'s frozen releases"))?

@@ -374,7 +374,9 @@ pub fn freeze_some(conn: &Connection, limit: usize, budget: Duration, ready: i64
     let tx = conn.unchecked_transaction()?;
     let (copied, dropped) = copy(&tx, &queued, budget, now)?;
     tx.commit()?;
-    let tx = conn.unchecked_transaction()?;
+    // taking the write lock first: a thaw from outside the indexer (`--thaw`) can't come in between the checks and
+    // the delete
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
     let moved = drop_copied(&tx, &copied, &dropped)?;
     tx.commit()?;
     crate::metrics::names::FROZEN.inc(&[("event", "frozen")], moved.frozen as u64);
@@ -425,10 +427,22 @@ pub fn copy(
 }
 
 /// The second step, once the copies are committed: the live rows of each copied release gone, unless it changed
-/// since (it stays queued, and the next tick copies it again).
+/// since (it stays queued, and the next tick copies it again), or a thaw by hand came in between (its frozen copy is
+/// gone, and it stays live).
 pub fn drop_copied(conn: &Connection, copied: &[Copied], dropped: &[i64]) -> Result<Moved> {
     let mut moved = Moved::default();
     for (id, size, parts) in copied {
+        let still_frozen: bool = conn
+            .prepare_cached(
+                "select exists (select 1 from frozen.frozen_releases where id = ?1)
+                    and not exists (select 1 from main.freeze_exempt where release_id = ?1)",
+            )?
+            .query_row([id], |r| r.get(0))?;
+        if !still_frozen {
+            conn.prepare_cached("delete from freeze_pending where release_id = ?1")?.execute([id])?;
+            moved.dropped += 1;
+            continue;
+        }
         let now_is: Option<(Option<i64>, Option<i64>)> = conn
             .prepare_cached("select size, parts from main.releases where id = ?1")?
             .query_row([id], |r| Ok((r.get(0)?, r.get(1)?)))
@@ -449,7 +463,7 @@ pub fn drop_copied(conn: &Connection, copied: &[Copied], dropped: &[i64]) -> Res
     for id in dropped {
         conn.prepare_cached("delete from freeze_pending where release_id = ?1")?.execute([id])?;
     }
-    moved.dropped = dropped.len();
+    moved.dropped += dropped.len();
     Ok(moved)
 }
 
@@ -852,7 +866,13 @@ pub fn nzb(main: &Path, id: i64) -> anyhow::Result<Option<(ReleaseRow, String)>>
 /// a shard's tables: a reset harvests their enrichments from it. Blobs stay as they are. None: no frozen file. A
 /// payload that won't read is an error, soo a reset stops rather than lose what it holds.
 pub fn unfrozen_copy(main: &Path, shard: usize) -> anyhow::Result<Option<PathBuf>> {
-    let Some(frozen) = open_read(main, shard) else { return Ok(None) };
+    // only a file that isn't there is nothing to harvest: one that won't open stops the reset
+    let p = path_of(main, shard);
+    if !p.try_exists()? {
+        return Ok(None);
+    }
+    let frozen = Connection::open_with_flags(&p, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    frozen.busy_timeout(Duration::from_secs(10))?;
     let copy = crate::compact::with_suffix(&crate::store::shard_path(main, shard), "unfrozen");
     remove_family(&copy)?;
     crate::store::create_shard(&copy)?;

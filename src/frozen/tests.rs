@@ -460,3 +460,34 @@ fn a_reset_harvests_what_frozen_releases_hold() {
     assert!(!copy.exists(), "the harvest's copy is gone after");
     assert_eq!(unfrozen_copy(&f.main, (shard + 1) % store::SHARDS).unwrap(), None, "no frozen file, nothing to read");
 }
+
+#[test]
+fn a_thaw_by_hand_between_the_steps_keeps_the_release_live() {
+    let f = Fixture::new();
+    f.save(&[post("Wanted", &["a.rar"], 2, 100)]);
+    let conn = f.writer();
+    let id = f.id(&conn, "Wanted");
+    assert!(rules::evaluate(&conn, id, NOW).unwrap());
+    let tx = conn.unchecked_transaction().unwrap();
+    let (copied, dropped) = copy(&tx, &[(id, "small_complete".into())], Duration::from_secs(60), NOW).unwrap();
+    tx.commit().unwrap();
+    // `atlas --thaw` while the copy is committed and the live rows still there
+    assert_eq!(thaw(&conn, id, true, NOW).unwrap(), Thawed::AlreadyLive);
+    let tx = conn.unchecked_transaction().unwrap();
+    assert_eq!(drop_copied(&tx, &copied, &dropped).unwrap(), Moved { dropped: 1, ..Moved::default() });
+    tx.commit().unwrap();
+    assert_eq!(count(&conn, "select count(*) from releases"), 1, "still live");
+    assert_eq!(live_articles(&f.main, id).len(), 2);
+    assert_eq!(count(&conn, "select count(*) from frozen.frozen_releases"), 0);
+    assert_eq!(count(&conn, "select count(*) from freeze_pending"), 0);
+}
+
+#[test]
+fn a_frozen_file_that_wont_read_stops_a_reset() {
+    let f = Fixture::new();
+    f.save(&[post("Any", &["a.rar"], 1, 100)]);
+    let shard = store::shard_of(G);
+    std::fs::write(path_of(&f.main, shard), b"not a database, not at all, not even close to one").unwrap();
+    assert!(unfrozen_copy(&f.main, shard).is_err());
+    assert!(crate::raw_store::harvest_from_shards(&f.main, &|_| {}).is_err(), "and the reset with it");
+}
