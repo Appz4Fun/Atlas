@@ -126,6 +126,23 @@ impl PasswordCheck {
 
 /// The traditional cipher: what the last of the 12 header bytes decrypts to.
 fn crypto_check(password: &[u8], header: &[u8; 12]) -> u8 {
+    let mut keys = crypto_keys(password);
+    let mut last = 0;
+    for cipher in header {
+        last = crypto_step(&mut keys, *cipher);
+    }
+    last
+}
+
+fn crypto_keys(password: &[u8]) -> [u32; 3] {
+    let mut keys = [0x1234_5678u32, 0x2345_6789, 0x3456_7890];
+    for b in password {
+        crypto_update(&mut keys, *b);
+    }
+    keys
+}
+
+fn crypto_update(keys: &mut [u32; 3], b: u8) {
     fn crc_byte(crc: u32, b: u8) -> u32 {
         let mut c = (crc ^ u32::from(b)) & 0xff;
         for _ in 0..8 {
@@ -133,26 +150,39 @@ fn crypto_check(password: &[u8], header: &[u8; 12]) -> u8 {
         }
         (crc >> 8) ^ c
     }
-    let mut keys = [0x1234_5678u32, 0x2345_6789, 0x3456_7890];
-    let update = |keys: &mut [u32; 3], b: u8| {
-        keys[0] = crc_byte(keys[0], b);
-        keys[1] = keys[1].wrapping_add(keys[0] & 0xff).wrapping_mul(134_775_813).wrapping_add(1);
-        keys[2] = crc_byte(keys[2], (keys[1] >> 24) as u8);
-    };
-    for b in password {
-        update(&mut keys, *b);
-    }
-    let mut last = 0;
-    for cipher in header {
-        let t = keys[2] | 2;
-        last = cipher ^ (t.wrapping_mul(t ^ 1) >> 8) as u8;
-        update(&mut keys, last);
-    }
-    last
+    keys[0] = crc_byte(keys[0], b);
+    keys[1] = keys[1].wrapping_add(keys[0] & 0xff).wrapping_mul(134_775_813).wrapping_add(1);
+    keys[2] = crc_byte(keys[2], (keys[1] >> 24) as u8);
 }
 
-/// PBKDF2 over HMAC-SHA1, 1000 rounds, as WinZip's AES has it: the two bytes after both keys.
-fn aes_verifier(password: &[u8], salt: &[u8], key_len: usize) -> Option<[u8; 2]> {
+fn crypto_step(keys: &mut [u32; 3], cipher: u8) -> u8 {
+    let t = keys[2] | 2;
+    let plain = cipher ^ (t.wrapping_mul(t ^ 1) >> 8) as u8;
+    crypto_update(keys, plain);
+    plain
+}
+
+/// Decrypts a ZipCrypto entry starting at `data` (12-byte encryption header + payload) if `check` matches.
+pub(crate) fn decrypt_zipcrypto(password: &str, check: u8, data: &[u8]) -> Option<Vec<u8>> {
+    let header = data.get(..12)?;
+    let payload = data.get(12..)?;
+    let mut keys = crypto_keys(password.as_bytes());
+    let mut last = 0u8;
+    for b in header {
+        last = crypto_step(&mut keys, *b);
+    }
+    if last != check {
+        return None;
+    }
+    let mut out = Vec::with_capacity(payload.len());
+    for b in payload {
+        out.push(crypto_step(&mut keys, *b));
+    }
+    Some(out)
+}
+
+/// PBKDF2 over HMAC-SHA1, 1000 rounds, as WinZip's AES has it: `2 * key_len + 2` bytes.
+fn aes_derive(password: &[u8], salt: &[u8], key_len: usize) -> Option<Vec<u8>> {
     use hmac::{Hmac, Mac};
     let keyed = Hmac::<sha1::Sha1>::new_from_slice(password).ok()?;
     let wanted = key_len * 2 + 2;
@@ -175,19 +205,61 @@ fn aes_verifier(password: &[u8], salt: &[u8], key_len: usize) -> Option<[u8; 2]>
         derived.extend(out);
         block += 1;
     }
+    derived.truncate(wanted);
+    Some(derived)
+}
+
+/// PBKDF2 over HMAC-SHA1, 1000 rounds, as WinZip's AES has it: the two bytes after both keys.
+fn aes_verifier(password: &[u8], salt: &[u8], key_len: usize) -> Option<[u8; 2]> {
+    let derived = aes_derive(password, salt, key_len)?;
+    let wanted = key_len * 2 + 2;
     derived.get(wanted - 2..wanted)?.try_into().ok()
 }
 
-/// AES's own extra field, 0x9901: the key strength, from 1 to 3.
-fn aes_strength(extra: &[u8]) -> Option<u8> {
+/// Decrypts a WinZip AES (method 99) entry starting at `data` (`salt + verifier + ciphertext [+ 10-byte auth]`).
+pub(crate) fn decrypt_winzip_aes(
+    password: &str,
+    strength: u8,
+    data: &[u8],
+    full_packed: Option<u64>,
+) -> Option<Vec<u8>> {
+    if !(1..=3).contains(&strength) {
+        return None;
+    }
+    let salt_len = usize::from(strength) * 4 + 4;
+    let key_len = (usize::from(strength) + 1) * 8;
+    let salt = data.get(..salt_len)?;
+    let verifier = data.get(salt_len..salt_len + 2)?;
+    let derived = aes_derive(password.as_bytes(), salt, key_len)?;
+    if derived.get(key_len * 2..key_len * 2 + 2) != Some(verifier) {
+        return None;
+    }
+    let key = derived.get(..key_len)?;
+    let ct_end = match full_packed.and_then(|p| usize::try_from(p).ok()) {
+        Some(p) if p >= salt_len + 12 => data.len().min(p - 10),
+        _ => data.len(),
+    };
+    let ct = data.get(salt_len + 2..ct_end)?;
+    super::aes::decrypt_winzip_ctr(key, ct)
+}
+
+/// AES's own extra field, 0x9901: `(strength, actual_method)`.
+pub(crate) fn aes_extra(extra: &[u8]) -> Option<(u8, u16)> {
     let mut p = 0usize;
     while let (Some(id), Some(size)) = (le16(extra, p), le16(extra, p + 2)) {
-        if id == 0x9901 {
-            return extra.get(p + 8).copied().filter(|s| (1..=3).contains(s));
+        if id == 0x9901 && size >= 7 {
+            let strength = extra.get(p + 8).copied().filter(|s| (1..=3).contains(s))?;
+            let method = u16::from_le_bytes(extra.get(p + 9..p + 11)?.try_into().ok()?);
+            return Some((strength, method));
         }
         p = p.checked_add(4 + size)?;
     }
     None
+}
+
+/// AES's own extra field, 0x9901: the key strength, from 1 to 3.
+fn aes_strength(extra: &[u8]) -> Option<u8> {
+    aes_extra(extra).map(|(s, _)| s)
 }
 
 /// The test an encrypted file's first bytes hold, if they were read.

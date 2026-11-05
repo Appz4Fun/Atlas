@@ -65,6 +65,12 @@ enum View {
     Stored { from: usize, to: usize },
     /// decoded from `from` on
     Decode { from: usize, codec: Codec },
+    /// decrypted (and, when compressed, decoded) from `from` on
+    Decrypted {
+        from: usize,
+        out: Vec<u8>,
+        capped: bool,
+    },
     /// not reached: the reason why
     Stop(&'static str),
 }
@@ -116,12 +122,17 @@ struct Opened {
 
 /// Follows `data` down through every archive and compressed stream it starts with.
 pub fn unwrap(data: &[u8]) -> Nest<'_> {
+    unwrap_with_password(data, None)
+}
+
+/// Like [`unwrap`], decrypting RAR4/RAR5/ZIP headers and entries with `password` when present.
+pub fn unwrap_with_password<'a>(data: &'a [u8], password: Option<&str>) -> Nest<'a> {
     let mut layers = Vec::new();
     let mut buf: Cow<'_, [u8]> = Cow::Borrowed(data);
     let (mut lo, mut hi) = (0usize, data.len());
     let mut outer_at = Some(0usize);
     let mut budget = MAX_DECODED;
-    while let Some(Opened { mut layer, view }) = open(&buf[lo..hi]) {
+    while let Some(Opened { mut layer, view }) = open(&buf[lo..hi], password, budget) {
         // a name comes from the poster's bytes: keep what a name needs
         layer.name = layer.name.map(|n| cap_name(&n));
         if layers.len() == MAX_DEPTH {
@@ -163,6 +174,20 @@ pub fn unwrap(data: &[u8]) -> Nest<'_> {
                     break;
                 }
                 layer.capped = end == End::Limit;
+                budget -= out.len().min(budget);
+                outer_at = None;
+                (lo, hi) = (0, out.len());
+                buf = Cow::Owned(out);
+                layers.push(layer);
+            }
+            View::Decrypted { from, out, capped } => {
+                layer.offset = from as u64;
+                if out.is_empty() {
+                    layer.stop = Some("nothing decoded".to_string());
+                    layers.push(layer);
+                    break;
+                }
+                layer.capped = capped;
                 budget -= out.len().min(budget);
                 outer_at = None;
                 (lo, hi) = (0, out.len());
@@ -239,10 +264,10 @@ fn decode(codec: Codec, input: &[u8], limit: usize) -> (Vec<u8>, End) {
 }
 
 /// What `data` starts with, when it's an archive or a compressed stream.
-fn open(data: &[u8]) -> Option<Opened> {
+fn open(data: &[u8], password: Option<&str>, budget: usize) -> Option<Opened> {
     let layer = |format: &str| Layer { format: format.into(), ..Layer::default() };
     if data.starts_with(b"Rar!\x1a\x07") || data.starts_with(b"PK\x03\x04") {
-        return Some(from_entries(data));
+        return Some(from_entries(data, password, budget));
     }
     if data.starts_with(b"7z\xbc\xaf\x27\x1c") {
         return Some(seven_z(data));
@@ -294,8 +319,8 @@ fn open(data: &[u8]) -> Option<Opened> {
 }
 
 /// RAR and zip: the biggest file whose bytes start in what was read.
-fn from_entries(data: &[u8]) -> Opened {
-    let heads = archive::entries(data);
+fn from_entries(data: &[u8], password: Option<&str>, budget: usize) -> Opened {
+    let heads = archive::entries_with_password(data, password);
     let format = if data.starts_with(b"PK") {
         "ZIP"
     } else if data.get(6) == Some(&1) {
@@ -314,15 +339,22 @@ fn from_entries(data: &[u8]) -> Opened {
     };
     let mut layer = layer_of(head);
     let at = head.data_at.unwrap_or(data.len());
-    if head.encrypted {
-        return Opened { layer, view: View::Stop("encrypted") };
-    }
     let end = |packed: Option<u64>| {
         packed
             .and_then(|p| usize::try_from(p).ok())
             .and_then(|p| at.checked_add(p))
             .map_or(data.len(), |e| e.min(data.len()))
     };
+    if head.encrypted {
+        let Some(pw) = password.filter(|pw| !pw.is_empty()) else {
+            return Opened { layer, view: View::Stop("encrypted") };
+        };
+        let to = end(head.packed);
+        return match decrypt_entry(data, at, to, head, format, pw, budget) {
+            Ok((out, capped)) => Opened { layer, view: View::Decrypted { from: at, out, capped } },
+            Err(why) => Opened { layer, view: View::Stop(why) },
+        };
+    }
     if head.stored_at.is_some() {
         layer.stored = true;
         return Opened { layer, view: View::Stored { from: at, to: end(head.packed) } };
@@ -370,6 +402,160 @@ fn from_entries(data: &[u8]) -> Opened {
         layer.stored = true;
     }
     Opened { layer, view }
+}
+
+fn decrypt_entry(
+    data: &[u8],
+    at: usize,
+    to: usize,
+    head: &ArchiveHead,
+    format: &str,
+    pw: &str,
+    budget: usize,
+) -> Result<(Vec<u8>, bool), &'static str> {
+    let packed_slice = data.get(at..to).filter(|s| !s.is_empty()).ok_or("no file starts in what was read")?;
+    let complete_packed = !head.continues && head.packed.is_some_and(|p| p <= packed_slice.len() as u64);
+    let verify_crc = format == "RAR4" || (format == "ZIP" && head.zip_aes.is_none());
+    let check_crc = |out: &[u8], capped: bool| -> Result<(), &'static str> {
+        if verify_crc
+            && complete_packed
+            && !capped
+            && head.unpacked.is_some_and(|u| u == out.len() as u64)
+            && head.crc32.is_some_and(|c| c != crate::archive::crc32(out))
+        {
+            return Err("encrypted");
+        }
+        Ok(())
+    };
+    let finish_stored = |mut dec: Vec<u8>| -> Result<(Vec<u8>, bool), &'static str> {
+        let capped = if let Some(unpacked) = head.unpacked.and_then(|u| usize::try_from(u).ok()) {
+            let cap = unpacked.min(budget);
+            dec.truncate(cap);
+            unpacked > budget
+        } else {
+            let capped = dec.len() > budget;
+            dec.truncate(budget);
+            capped
+        };
+        check_crc(&dec, capped)?;
+        if dec.is_empty() {
+            return Err("nothing decoded");
+        }
+        Ok((dec, capped))
+    };
+    let method = head.method.as_deref().unwrap_or_default();
+    match format {
+        "RAR5" => {
+            let (kdf, salt, iv, check) = head.rar5_crypt.ok_or("encrypted")?;
+            let key = crate::archive::rar::derive_rar5_key(pw, kdf, &salt, check).ok_or("encrypted")?;
+            let dec = crate::archive::aes::decrypt_cbc(&key, &iv, packed_slice).ok_or("encrypted")?;
+            if method == "m0" {
+                finish_stored(dec)
+            } else if head.split_before {
+                Err("starts in the volume before")
+            } else if head.solid {
+                Err("solid: needs the files before it")
+            } else if head.rar_version <= 1 {
+                let limit = budget.min(dec.len().saturating_mul(MAX_RATIO));
+                if limit == 0 {
+                    return Err("decode budget spent");
+                }
+                let codec = Codec::Rar5 {
+                    extra_dist: head.rar_version == 1,
+                    size: head.unpacked,
+                    packed: Some(dec.len() as u64),
+                };
+                let (out, end) = decode(codec, &dec, limit);
+                if out.is_empty() {
+                    return Err("nothing decoded");
+                }
+                let capped = end == End::Limit;
+                check_crc(&out, capped)?;
+                Ok((out, capped))
+            } else {
+                Err("a RAR algorithm newer than this knows")
+            }
+        }
+        "RAR4" => {
+            let salt = head.rar4_salt.ok_or("encrypted")?;
+            let (key, iv) = crate::archive::rar::derive_rar4_key_iv(pw, &salt);
+            let dec = crate::archive::aes::decrypt_cbc(&key, &iv, packed_slice).ok_or("encrypted")?;
+            if method == "m0" {
+                finish_stored(dec)
+            } else if head.split_before {
+                Err("starts in the volume before")
+            } else if head.solid {
+                Err("solid: needs the files before it")
+            } else if matches!(head.rar_version, 15 | 20 | 26 | 29 | 36) {
+                let limit = budget.min(dec.len().saturating_mul(MAX_RATIO));
+                if limit == 0 {
+                    return Err("decode budget spent");
+                }
+                let codec = Codec::Rar4 {
+                    version: head.rar_version,
+                    size: head.unpacked,
+                    packed: Some(dec.len() as u64),
+                    continues: head.continues,
+                };
+                let (out, end) = decode(codec, &dec, limit);
+                if out.is_empty() {
+                    return Err("nothing decoded");
+                }
+                let capped = end == End::Limit;
+                check_crc(&out, capped)?;
+                Ok((out, capped))
+            } else {
+                Err("no decoder for this yet")
+            }
+        }
+        "ZIP" => {
+            let (dec, actual_method) = if let Some((strength, actual)) = head.zip_aes {
+                let d = crate::archive::zip::decrypt_winzip_aes(pw, strength, packed_slice, head.packed)
+                    .ok_or("encrypted")?;
+                (d, archive::zip_method(actual))
+            } else if let Some(check) = head.zip_crypto_check {
+                let d = crate::archive::zip::decrypt_zipcrypto(pw, check, packed_slice).ok_or("encrypted")?;
+                (d, method)
+            } else {
+                return Err("encrypted");
+            };
+            match actual_method {
+                "store" | "xz" => finish_stored(dec),
+                "deflate" | "deflate64" | "bzip2" | "zstd" | "ppmd" | "lzma" => {
+                    let limit = budget.min(dec.len().saturating_mul(MAX_RATIO));
+                    if limit == 0 {
+                        return Err("decode budget spent");
+                    }
+                    let (codec, slice) = match actual_method {
+                        "deflate" => (Codec::Deflate, dec.as_slice()),
+                        "deflate64" => (Codec::Deflate64, dec.as_slice()),
+                        "bzip2" => (Codec::Bzip2, dec.as_slice()),
+                        "zstd" => (Codec::Zstd, dec.as_slice()),
+                        "ppmd" => (
+                            Codec::PpmdZip { size: head.unpacked, packed: Some(dec.len() as u64) },
+                            dec.as_slice(),
+                        ),
+                        "lzma" => {
+                            let (skip, props) = zip_lzma(&dec).ok_or("damaged")?;
+                            (Codec::Lzma { props, size: head.unpacked }, dec.get(skip..).ok_or("damaged")?)
+                        }
+                        _ => return Err("no decoder for this yet"),
+                    };
+                    let (out, end) = decode(codec, slice, limit);
+                    if out.is_empty() {
+                        return Err("nothing decoded");
+                    }
+                    let capped = end == End::Limit;
+                    if head.zip_aes.is_none() {
+                        check_crc(&out, capped)?;
+                    }
+                    Ok((out, capped))
+                }
+                _ => Err("no decoder for this yet"),
+            }
+        }
+        _ => Err("encrypted"),
+    }
 }
 
 fn layer_of(head: &ArchiveHead) -> Layer {

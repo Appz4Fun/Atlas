@@ -114,23 +114,36 @@ impl Step for NfoName {
             return Ok(Outcome { writes, ..Outcome::default() });
         }
         let files = ctx.files().map_err(retry)?;
-        for file in archive::select::nfo_sources(&files) {
+        let par2_names = archive::select::par2_name_map(ctx.conn(), rel_id);
+        let check = archive::store::local_password_check(ctx.conn(), rel_id);
+        let names_hidden: bool = ctx
+            .conn()
+            .query_row("select coalesce(names_hidden, 0) from archive_release where release_id = ?1", [rel_id], |r| {
+                Ok(r.get::<_, i64>(0)? != 0)
+            })
+            .unwrap_or(false);
+        let mut rerun = 0;
+        for file in archive::select::nfo_sources_with_par2(&files, &par2_names) {
             let Some(seg) = first_article(ctx, file)? else { continue };
             let Some(body) = fetch_one(ctx, &seg, &file.filename)? else { continue };
+            let decoded = crate::probe::nfo_text(&body);
             if writes.is_empty()
-                && let Some(password) = release_info::find_password(&String::from_utf8_lossy(&body))
+                && let Some(password) = release_info::find_verified_password([decoded.as_str()], &[], check.as_ref())
             {
                 crate::raw_store::put_nfo_password(&rel_name, &rel_group, &content_id, &password);
                 let params = vec![rel_id.into(), password.into()];
                 writes.push(StepWrite::new(archive::store::SET_NFO_PASSWORD, params));
+                if names_hidden {
+                    rerun |= mask(archive::steps::LIST_STEP);
+                }
             }
             let found = nfo::name_candidates(&body).into_iter().find(|n| improves(ctx.release(), n, NameSource::Nfo));
             if let Some(name) = found {
                 let change =
                     NameChange { display_name: Some(name), obfuscated: Some(false), source: NameSource::Nfo.value() };
-                return Ok(Outcome { matched: true, name: Some(change), writes, ..Outcome::default() });
+                return Ok(Outcome { matched: true, name: Some(change), writes, rerun, ..Outcome::default() });
             }
         }
-        Ok(Outcome { writes, ..Outcome::default() })
+        Ok(Outcome { writes, rerun, ..Outcome::default() })
     }
 }

@@ -1208,20 +1208,194 @@ pub fn looks_made_up(email: &str) -> bool {
 
 static PASSWORD: LazyLock<Regex> = LazyLock::new(|| {
     #[allow(clippy::unwrap_used)]
-    Regex::new(r"(?i)\{\{([^{}\s]{1,128})\}\}|\b(?:password|passwd|passwort|pass|pw)\b\s*(?:is\s*)?[:=]\s*([^\s\[\]\x22']{1,128})").unwrap()
+    Regex::new(r"(?i)\{\{([^{}\s]{1,128})\}\}|\b(?:password|passwd|passwort|pass|pw|pwd|mot\s+de\s+passe|mdp|wachtwoord)\b[\s._-]*(?:is\s*)?[:=]\s*([^\s\[\]\x22']{1,128})").unwrap()
 });
+
+/// Whether a matched token is a known non-password placeholder, negative word, or MediaInfo artifact.
+pub fn is_false_positive_password(found: &str) -> bool {
+    let f = found.trim();
+    if f.is_empty() || f.len() > 128 {
+        return true;
+    }
+    let none = [
+        "none",
+        "no",
+        "n/a",
+        "na",
+        "nil",
+        "null",
+        "false",
+        "-",
+        "free",
+        "not",
+        "yes",
+        "keins",
+        "keine",
+        "kein",
+        "aucun",
+        "geen",
+        "datum",
+        "available",
+        "needed",
+        "required",
+        "protected",
+        "encrypted",
+        "unknown",
+        "see",
+        "check",
+        "inside",
+        "http://",
+        "https://",
+    ];
+    if none.iter().any(|word| f.eq_ignore_ascii_case(word)) {
+        return true;
+    }
+    if crate::archive::PasswordHarvester::is_negative_phrase(f) {
+        return true;
+    }
+    !f.chars().any(|c| c.is_alphanumeric())
+}
+
+/// All candidate passwords matched by [`PASSWORD`] in `text`, in order of appearance.
+pub fn find_all_passwords(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for hit in PASSWORD.captures_iter(text) {
+        let found = if let Some(braced) = hit.get(1) {
+            let s = braced.as_str().trim();
+            if matches!(s.to_ascii_lowercase().as_str(), "password" | "pass" | "pw" | "pwd") {
+                continue;
+            }
+            s
+        } else if let Some(bare) = hit.get(2) {
+            let whole = hit.get(0).map_or("", |m| m.as_str()).to_ascii_lowercase();
+            if matches!(whole.as_str(), "pass=1" | "pass=2" | "pass=3") {
+                continue;
+            }
+            bare.as_str().trim_matches(['.', ','])
+        } else {
+            continue;
+        };
+        if !is_false_positive_password(found) && !out.iter().any(|p| p == found) {
+            out.push(found.to_string());
+        }
+    }
+    out
+}
 
 /// A password a poster left in a name, subject or NFO: `{{secret}}` or `password: secret`.
 /// A guess from text, soo nothing has tried it.
 pub fn find_password(text: &str) -> Option<String> {
-    let hit = PASSWORD.captures(text)?;
-    // the braces say where it ends: only a bare password can have a sentence's punctuation after it
-    let found = match hit.get(1) {
-        Some(braced) => braced.as_str(),
-        None => hit.get(2)?.as_str().trim_matches(|c: char| c == '.' || c == ','),
+    find_all_passwords(text).into_iter().next()
+}
+
+/// Finds a password in `texts` and `extra_candidates`, verifying candidates against `check` when available.
+/// When `check` is present and `check.certain()` is true, an unverified regex match that `check.accepts`
+/// rejects is discarded, and broader tokens/lines/URLs from `texts` are tested against `check`.
+pub fn find_verified_password<'a>(
+    texts: impl IntoIterator<Item = &'a str>,
+    extra_candidates: &[String],
+    check: Option<&crate::archive::PasswordTest>,
+) -> Option<String> {
+    let texts: Vec<&str> = texts.into_iter().collect();
+    let empty_meta = std::collections::HashMap::new();
+    let mut priority = Vec::new();
+    let push_uniq = |vec: &mut Vec<String>, s: &str| {
+        let t = s.trim();
+        if !t.is_empty() && t.len() <= 128 && !is_false_positive_password(t) && !vec.iter().any(|x| x == t) {
+            vec.push(t.to_string());
+        }
     };
-    let none = ["none", "no", "n/a", "na", "nil", "-", "free", "not", "yes", ""];
-    (!none.iter().any(|word| found.eq_ignore_ascii_case(word))).then(|| found.to_string())
+    for c in extra_candidates {
+        push_uniq(&mut priority, c);
+    }
+    for &t in &texts {
+        for c in find_all_passwords(t) {
+            push_uniq(&mut priority, &c);
+        }
+        for c in crate::archive::PasswordHarvester::extract_candidates(t, Some(t), &empty_meta) {
+            push_uniq(&mut priority, &c);
+        }
+    }
+    let Some(chk) = check else {
+        return priority.into_iter().next();
+    };
+    let mut tested = 0usize;
+    const MAX_CHECK_CANDIDATES: usize = 24;
+    let mut fallback: Option<String> = None;
+    for cand in &priority {
+        tested += 1;
+        match chk.accepts(cand) {
+            Some(true) => return Some(cand.clone()),
+            None => {
+                if fallback.is_none() {
+                    fallback = Some(cand.clone());
+                }
+            }
+            Some(false) => {
+                if !chk.certain() && fallback.is_none() {
+                    fallback = Some(cand.clone());
+                }
+            }
+        }
+    }
+    if chk.accepts("").is_none() {
+        return fallback.or_else(|| priority.into_iter().next());
+    }
+    // Broader NFO/subject token scan when explicit regexes didn't yield the password:
+    // test short single-token lines, quoted tokens, values after `:`, and URLs/domains.
+    let mut broad = Vec::new();
+    static RE_URL: LazyLock<Regex> = LazyLock::new(|| {
+        #[allow(clippy::unwrap_used)]
+        Regex::new(r"(?i)\b(?:https?://|www\.)[^\s\x22'<>]{3,96}|\b[a-z0-9][-a-z0-9]{1,48}\.(?:com|net|org|to|cc|info|biz|ws|de|nl|ru|me|tv|io|xyz)\b").unwrap()
+    });
+    for &t in &texts {
+        for m in RE_URL.find_iter(t) {
+            let u = m.as_str().trim_end_matches(['.', ',', ')', ']']);
+            push_uniq(&mut broad, u);
+            if let Some(stripped) = u.strip_prefix("https://").or_else(|| u.strip_prefix("http://")) {
+                push_uniq(&mut broad, stripped.trim_end_matches('/'));
+                if let Some(no_www) = stripped.strip_prefix("www.") {
+                    push_uniq(&mut broad, no_www.trim_end_matches('/'));
+                }
+            } else if let Some(no_www) = u.strip_prefix("www.") {
+                push_uniq(&mut broad, no_www.trim_end_matches('/'));
+            }
+        }
+        for raw_line in t.lines() {
+            let line = raw_line
+                .trim_matches(|c: char| {
+                    c.is_whitespace()
+                        || ('\u{2500}'..='\u{259f}').contains(&c)
+                        || matches!(c, '*' | '#' | '=' | '-' | '|' | ':' | '~')
+                })
+                .trim();
+            if line.is_empty() || line.len() > 80 {
+                continue;
+            }
+            if !line.contains(char::is_whitespace) && (3..=64).contains(&line.len()) {
+                push_uniq(&mut broad, line);
+            }
+            if let Some((_, rhs)) = line.split_once(':').or_else(|| line.split_once('=')) {
+                let val = rhs.trim().trim_matches(['"', '\'', '.', ',']);
+                if !val.contains(char::is_whitespace) && (3..=64).contains(&val.len()) {
+                    push_uniq(&mut broad, val);
+                }
+            }
+        }
+    }
+    for cand in broad {
+        if priority.iter().any(|p| p == &cand) {
+            continue;
+        }
+        if tested >= MAX_CHECK_CANDIDATES {
+            break;
+        }
+        tested += 1;
+        if chk.accepts(&cand) == Some(true) {
+            return Some(cand);
+        }
+    }
+    fallback
 }
 
 /// What the page can say without reading any article.

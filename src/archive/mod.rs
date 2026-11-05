@@ -1,6 +1,7 @@
 //! What is inside a release, without downloading it: inner file names and
 //! whether an archive is passworded, from the first bytes of its articles.
 
+pub mod aes;
 pub mod link;
 pub mod names;
 pub mod nzb;
@@ -383,7 +384,10 @@ impl PasswordHarvester {
 
         for cap in RE_BRACES.captures_iter(subject) {
             if let Some(m) = cap.get(1) {
-                out.push(m.as_str().to_string());
+                let s = m.as_str().trim();
+                if !matches!(s.to_ascii_lowercase().as_str(), "password" | "pass" | "pw" | "pwd") {
+                    out.push(s.to_string());
+                }
             }
         }
         for cap in RE_BRACKETS.captures_iter(subject) {
@@ -392,6 +396,10 @@ impl PasswordHarvester {
             }
         }
         for cap in RE_PASS.captures_iter(subject) {
+            let whole = cap.get(0).map_or("", |m| m.as_str());
+            if matches!(whole.to_ascii_lowercase().as_str(), "pass=1" | "pass=2" | "pass=3") {
+                continue;
+            }
             if let Some(m) = cap.get(1) {
                 out.push(m.as_str().to_string());
             }
@@ -400,10 +408,14 @@ impl PasswordHarvester {
 
     fn harvest_nfo(nfo: &str, out: &mut Vec<String>) {
         static RE_NFO: LazyLock<Regex> = LazyLock::new(|| {
-            Regex::new(r"(?i)(?:password|pwd|pass|passwort)\s*[:=]\s*([^\r\n]+)").unwrap()
+            Regex::new(r"(?i)\b(?:password|passwd|pwd|pass|passwort|pw|mot\s+de\s+passe|mdp|wachtwoord)\b[\s._-]*(?:is\s*)?[:=]\s*([^\r\n]+)").unwrap()
         });
 
         for cap in RE_NFO.captures_iter(nfo) {
+            let whole = cap.get(0).map_or("", |m| m.as_str()).to_ascii_lowercase();
+            if whole.starts_with("pass=1") || whole.starts_with("pass=2") || whole.starts_with("pass=3") {
+                continue;
+            }
             if let Some(m) = cap.get(1) {
                 let s = m.as_str().trim();
                 out.push(s.to_string());
@@ -418,7 +430,7 @@ impl PasswordHarvester {
         }
     }
 
-    fn is_negative_phrase(s: &str) -> bool {
+    pub(crate) fn is_negative_phrase(s: &str) -> bool {
         let lower = s.to_lowercase();
         let l = lower.trim();
         l == "none"
@@ -426,7 +438,18 @@ impl PasswordHarvester {
             || l == "null"
             || l == "nil"
             || l == "n/a"
+            || l == "na"
             || l == "false"
+            || l == "keins"
+            || l == "keine"
+            || l == "kein"
+            || l == "aucun"
+            || l == "geen"
+            || l == "datum"
+            || l == "available"
+            || l == "needed"
+            || l == "http://"
+            || l == "https://"
             || l.starts_with("none")
             || l.starts_with("no pass")
             || l.contains("no password")
@@ -439,6 +462,7 @@ impl PasswordHarvester {
             || l.contains("in comments")
             || l.contains("check comments")
             || l.contains("see comments")
+            || l.chars().any(|c| ('\u{2500}'..='\u{259f}').contains(&c))
     }
 }
 

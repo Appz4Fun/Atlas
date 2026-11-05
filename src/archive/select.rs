@@ -156,12 +156,36 @@ pub fn par2_source(files: &[FileInfo]) -> Option<&FileInfo> {
     })
 }
 
+/// Map from `posted_filename` to `par2_filename` for a release, when PAR2 packets have been matched.
+pub fn par2_name_map(conn: &rusqlite::Connection, release_id: i64) -> std::collections::HashMap<String, String> {
+    let Ok(mut stmt) = conn.prepare_cached(
+        "select posted_filename, par2_filename from par2_files where release_id = ?1 and posted_filename is not null",
+    ) else {
+        return std::collections::HashMap::new();
+    };
+    let Ok(rows) = stmt.query_map([release_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))) else {
+        return std::collections::HashMap::new();
+    };
+    rows.flatten().collect()
+}
+
 /// Posted NZBs to read: at most 2, fewest parts first, and only one whose every article is indexed and few enough
 /// to take whole.
 pub fn nzb_sources(files: &[FileInfo]) -> Vec<&FileInfo> {
+    nzb_sources_with_par2(files, &std::collections::HashMap::new())
+}
+
+/// Like [`nzb_sources`], also matching files whose PAR2-verified name ends in `.nzb`.
+pub fn nzb_sources_with_par2<'a>(
+    files: &'a [FileInfo],
+    par2_names: &std::collections::HashMap<String, String>,
+) -> Vec<&'a FileInfo> {
     let mut found: Vec<&FileInfo> = files
         .iter()
-        .filter(|f| classify(&f.filename) == Kind::Nzb)
+        .filter(|f| {
+            classify(&f.filename) == Kind::Nzb
+                || par2_names.get(&f.filename).is_some_and(|p| classify(p) == Kind::Nzb)
+        })
         .filter(|f| (1..=super::nzb::MAX_NZB_PARTS).contains(&parts(f)) && f.parts_seen >= parts(f))
         .collect();
     found.sort_by_key(|f| (parts(f), f.filename.clone()));
@@ -171,9 +195,21 @@ pub fn nzb_sources(files: &[FileInfo]) -> Vec<&FileInfo> {
 
 /// NFOs to read: at most 2, fewest parts first.
 pub fn nfo_sources(files: &[FileInfo]) -> Vec<&FileInfo> {
+    nfo_sources_with_par2(files, &std::collections::HashMap::new())
+}
+
+/// Like [`nfo_sources`], also matching files whose PAR2-verified name is `.nfo` or `.txt`.
+pub fn nfo_sources_with_par2<'a>(
+    files: &'a [FileInfo],
+    par2_names: &std::collections::HashMap<String, String>,
+) -> Vec<&'a FileInfo> {
     let mut found: Vec<&FileInfo> = files
         .iter()
-        .filter(|f| classify(&f.filename) == Kind::Nfo || f.subject.as_deref().is_some_and(nfo::is_nfo))
+        .filter(|f| {
+            classify(&f.filename) == Kind::Nfo
+                || f.subject.as_deref().is_some_and(nfo::is_nfo)
+                || par2_names.get(&f.filename).is_some_and(|p| classify(p) == Kind::Nfo)
+        })
         .collect();
     found.sort_by_key(|f| (parts(f), f.filename.clone()));
     found.truncate(2);

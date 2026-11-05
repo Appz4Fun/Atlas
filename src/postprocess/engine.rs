@@ -1273,6 +1273,11 @@ fn seed_shard(conn: &Connection, enabled: StepMask, stamps: &[(u8, StepMask, i64
         crate::probe::step::rerun_later_volumes(conn, now)?;
         set("pp_probe_first_volume", now)?;
     }
+    // once, for encrypted archives and probes that already have a known password in release_nfo_password
+    if meta("pp_probe_encrypted_pw")?.is_none() {
+        crate::probe::step::rerun_encrypted_with_password(conn, now)?;
+        set("pp_probe_encrypted_pw", now)?;
+    }
     let seen = meta("pp_steps_seen")?.unwrap_or(0);
     let new = if seeded { enabled & !seen } else { enabled };
     if seeded && new != 0 {

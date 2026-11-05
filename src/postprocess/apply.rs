@@ -822,4 +822,18 @@ mod tests {
         ));
         assert_eq!(state(&conn, id).4, 2);
     }
+
+    #[test]
+    fn pointer_nzb_propagates_password_to_pointed_release() {
+        use crate::archive::store::{MARK_POINTED, MARK_POINTED_PASSWORD};
+        let (_dir, conn, id) = shard();
+        let name: String = conn.query_row("select name from releases where id = ?", [id], |r| r.get(0)).unwrap();
+        let pointer_id = id + 8;
+        conn.execute(MARK_POINTED, params![name, pointer_id]).unwrap();
+        conn.execute(MARK_POINTED_PASSWORD, params![name, pointer_id, "JFB9hbdCrue7m4XA391gNYM50"]).unwrap();
+        let got: Option<String> = conn
+            .query_row("select password from release_nfo_password where release_id = ?", [id], |r| r.get(0))
+            .ok();
+        assert_eq!(got.as_deref(), Some("JFB9hbdCrue7m4XA391gNYM50"));
+    }
 }

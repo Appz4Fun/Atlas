@@ -293,6 +293,9 @@ pub const NZB_POINTED: ShardTable = ShardTable {
 /// `?1` a release name, `?2` the release whose NZB names it
 pub const MARK_POINTED: &str =
     "insert or ignore into nzb_pointed (release_id) select id from releases where name = ?1 and id != ?2";
+/// `?1` a release name, `?2` the pointer release id, `?3` the password from the pointer NZB
+pub const MARK_POINTED_PASSWORD: &str =
+    "insert or ignore into release_nfo_password (release_id, password) select id, ?3 from releases where name = ?1 and id != ?2";
 /// and its rank worked out now, after `MARK_POINTED`, for one the net lane already waits on: 2 at least, or what its
 /// size and category give when that's more, ranked or not yet. A visit works it out the same way
 pub static RANK_POINTED: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
@@ -405,6 +408,23 @@ pub fn nfo_password(conn: &Connection, release_id: i64) -> Option<String> {
         |r| r.get(0),
     )
     .ok()
+    .or_else(|| {
+        conn.query_row("select password from release_nfo_password where release_id = ?", [release_id], |r| r.get(0))
+            .ok()
+    })
+}
+
+/// Reads `password_check` from `archive_release` on a shard-local or multi-shard connection.
+pub fn local_password_check(conn: &Connection, release_id: i64) -> Option<super::PasswordTest> {
+    conn.query_row("select password_check from archive_release where release_id = ?", [release_id], |r| {
+        Ok(r.get::<_, Option<Vec<u8>>>(0)?.as_deref().and_then(super::PasswordTest::from_bytes))
+    })
+    .ok()
+    .flatten()
+    .or_else(|| {
+        let schema = format!("s{}", store::shard_of_id(release_id));
+        read_encryption(conn, &schema, release_id).2
+    })
 }
 
 pub fn view_with(conn: &Connection, release_id: i64) -> InnerView {

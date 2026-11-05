@@ -207,6 +207,55 @@ fn rerun_unread(conn: &rusqlite::Connection, exts: &[&str], now: i64) -> rusqlit
     Ok(ids.len())
 }
 
+/// Whether a saved probe stopped at encryption without extracting media tracks.
+fn encrypted_without_media(info: &str) -> bool {
+    let Ok(p) = serde_json::from_str::<serde_json::Value>(info) else { return false };
+    if !p["media"].is_null() {
+        return false;
+    }
+    p["archive"]["encrypted"] == true
+        || p["layers"]
+            .as_array()
+            .is_some_and(|ls| ls.iter().any(|l| l["encrypted"] == true || l["stop"] == "encrypted"))
+}
+
+/// Asks for `archive_list` and `probe` again on encrypted releases that now have a known password in
+/// `release_nfo_password` (`names_hidden = 1` with no inner files, or a probe that stopped at encryption).
+pub(crate) fn rerun_encrypted_with_password(conn: &rusqlite::Connection, now: i64) -> rusqlite::Result<usize> {
+    let mut count = 0usize;
+    let list_ids: Vec<i64> = conn
+        .prepare(
+            "select ar.release_id from archive_release ar
+             join release_nfo_password pw on pw.release_id = ar.release_id
+             where ar.names_hidden = 1
+               and not exists (select 1 from archive_inner_files f where f.release_id = ar.release_id)",
+        )?
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    for id in &list_ids {
+        crate::postprocess::rerun_on(conn, *id, mask(archive::steps::LIST_STEP), now)?;
+        count += 1;
+    }
+    let probe_ids: Vec<i64> = conn
+        .prepare(
+            "select p.release_id, p.info from release_probe p
+             join release_nfo_password pw on pw.release_id = p.release_id
+             where json_extract(p.info, '$.media') is null",
+        )?
+        .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
+        .filter_map(|row| match row {
+            Ok((id, info)) if encrypted_without_media(&info) => Some(Ok(id)),
+            Ok(_) => None,
+            Err(e) => Some(Err(e)),
+        })
+        .collect::<rusqlite::Result<_>>()?;
+    for id in &probe_ids {
+        crate::postprocess::rerun_on(conn, *id, mask(PROBE_STEP), now)?;
+        count += 1;
+    }
+    Ok(count)
+}
+
 /// A saved probe with no media of a file in `NEWLY_READ`, from before its reader, or of a set's later volume, from
 /// before `first_of_set`: probed again rather than reused, as when the shards were made again and the seed's reruns
 /// found nothing to ask for.
@@ -307,14 +356,18 @@ impl Step for ProbeStep {
         let rel_complete = ctx.release().complete;
         let stamp = self.config_stamp();
         let content_id = crate::raw_store::release_content_id(ctx.conn(), release_id).unwrap_or_default();
+        let known_pw = archive::store::nfo_password(ctx.conn(), release_id)
+            .or_else(|| crate::raw_store::get_nfo_password(&rel_name, &rel_group, &content_id));
         if !crate::raw_store::is_explicit_rerun(ctx.conn(), release_id, PROBE_STEP)
             && let Some(saved) =
                 crate::raw_store::get_probe(&rel_name, &rel_group, &content_id, rel_parts, rel_complete, stamp).filter(
                     |s| {
+                        let has_pw = s.nfo_password.is_some() || known_pw.is_some();
                         s.cover
                             .as_ref()
                             .is_none_or(|(_, sha)| super::cover_file(sha).is_some_and(|p| p.exists()))
                             && !stale_saved(&s.info)
+                            && !(has_pw && encrypted_without_media(&s.info))
                     },
                 )
         {
@@ -340,10 +393,21 @@ impl Step for ProbeStep {
             return Ok(Outcome { matched: true, writes, facts, rerun, ..Outcome::default() });
         }
         let files = ctx.files().map_err(retry)?;
+        let par2_names = archive::select::par2_name_map(ctx.conn(), release_id);
+        let mut check = archive::store::local_password_check(ctx.conn(), release_id);
         let mut info = ProbeInfo::default();
         let mut writes = Vec::new();
-        let mut found_nfo_password = crate::raw_store::get_nfo_password(&rel_name, &rel_group, &content_id);
+        let mut found_nfo_password = known_pw.or_else(|| {
+            let rel = ctx.release();
+            let texts = std::iter::once(rel.name.as_str())
+                .chain(rel.display_name.as_deref())
+                .chain(files.iter().map(|f| f.filename.as_str()))
+                .chain(files.iter().filter_map(|f| f.subject.as_deref()))
+                .chain(par2_names.values().map(String::as_str));
+            release_info::find_verified_password(texts, &[], check.as_ref())
+        });
         if let Some(ref pw) = found_nfo_password {
+            crate::raw_store::put_nfo_password(&rel_name, &rel_group, &content_id, pw);
             writes.push(StepWrite::new(
                 archive::store::SET_NFO_PASSWORD,
                 vec![release_id.into(), pw.clone().into()],
@@ -351,7 +415,12 @@ impl Step for ProbeStep {
         }
 
         // the NFO and SFV come first, being the smallest: a budget that runs out still leaves them
-        for file in files.iter().filter(|f| is_small_text(&f.filename)).take(3) {
+        let is_text_or_par2_text = |f: &FileInfo| {
+            is_small_text(&f.filename)
+                || par2_names.get(&f.filename).is_some_and(|p| is_small_text(p))
+                || f.subject.as_deref().is_some_and(crate::nfo::is_nfo)
+        };
+        for file in files.iter().filter(|f| is_text_or_par2_text(f)).take(3) {
             let Some(seg) = ctx.segments(file.id, &SegmentPick::First(1)).map_err(retry)?.into_iter().next() else {
                 continue;
             };
@@ -359,20 +428,24 @@ impl Step for ProbeStep {
             let article = yenc::split_article(&raw);
             let body = yenc_decode(&article.lines).unwrap_or_else(|| article.lines.join(&b'\n'));
             let text = nfo_text(&body);
-            if file.filename.to_ascii_lowercase().ends_with(".sfv") {
+            let eff_name = par2_names.get(&file.filename).unwrap_or(&file.filename);
+            if eff_name.to_ascii_lowercase().ends_with(".sfv") {
                 info.sfv = parse_sfv(&text);
-            } else if info.nfo.is_none() {
-                info.imdb_ids = imdb_ids(&text);
+            } else {
                 if found_nfo_password.is_none()
-                    && let Some(password) = release_info::find_password(&text)
+                    && let Some(password) = release_info::find_verified_password([text.as_str()], &[], check.as_ref())
                 {
+                    crate::raw_store::put_nfo_password(&rel_name, &rel_group, &content_id, &password);
                     found_nfo_password = Some(password.clone());
                     writes.push(StepWrite::new(
                         archive::store::SET_NFO_PASSWORD,
                         vec![release_id.into(), password.into()],
                     ));
                 }
-                info.nfo = Some(text.chars().take(MAX_NFO).collect());
+                if info.nfo.is_none() {
+                    info.imdb_ids = imdb_ids(&text);
+                    info.nfo = Some(text.chars().take(MAX_NFO).collect());
+                }
             }
         }
 
@@ -401,7 +474,26 @@ impl Step for ProbeStep {
                             info.part_crc_ok = Some(crc32(&body) == expected);
                         }
                         front = body;
-                        inspect(&front, &mut info);
+                        if check.is_none() {
+                            check = match archive::identify(&front) {
+                                archive::Format::Rar4 | archive::Format::Rar5 => archive::rar::list(&front).password_check,
+                                archive::Format::Zip => archive::zip::list_head(&front).password_check,
+                                _ => None,
+                            };
+                        }
+                        if found_nfo_password.is_none()
+                            && check.is_some()
+                            && let Some(ref nfo_s) = info.nfo
+                            && let Some(password) = release_info::find_verified_password([nfo_s.as_str()], &[], check.as_ref())
+                        {
+                            crate::raw_store::put_nfo_password(&rel_name, &rel_group, &content_id, &password);
+                            found_nfo_password = Some(password.clone());
+                            writes.push(StepWrite::new(
+                                archive::store::SET_NFO_PASSWORD,
+                                vec![release_id.into(), password.into()],
+                            ));
+                        }
+                        inspect(&front, found_nfo_password.as_deref(), &mut info);
                     }
                 }
             }
@@ -432,7 +524,7 @@ impl Step for ProbeStep {
             // last, being the most it may read: a release's article budget goes to the checks above first
             if !front.is_empty() {
                 let before = info.layers.clone();
-                read_more_front(ctx, file, total, &mut front, &mut info)?;
+                read_more_front(ctx, file, total, &mut front, found_nfo_password.as_deref(), &mut info)?;
                 // more of the front can show a bigger file than the one hashed
                 if info.layers != before {
                     info.moviehash = moviehash_of(ctx, file, &files, &front, &info, known_last)?;
@@ -477,8 +569,20 @@ impl Step for ProbeStep {
             vec![release_id.into(), crc.into(), agent.into(), json.into(), hash.clone().into()],
         ));
         // a hash found on a later look is asked about then too
+        let needs_list_decrypt = found_nfo_password.is_some()
+            && ctx
+                .conn()
+                .query_row(
+                    "select 1 from archive_release ar
+                     where ar.release_id = ?1 and ar.names_hidden = 1
+                       and not exists (select 1 from archive_inner_files f where f.release_id = ar.release_id)",
+                    [release_id],
+                    |_| Ok(true),
+                )
+                .unwrap_or(false);
         let rerun = mask(crate::keys::KEYS_STEP)
-            | if hash.is_some() { mask(super::opensubtitles::OPENSUBTITLES_STEP) } else { 0 };
+            | if hash.is_some() { mask(super::opensubtitles::OPENSUBTITLES_STEP) } else { 0 }
+            | if needs_list_decrypt { mask(archive::steps::LIST_STEP) } else { 0 };
         let facts = hash.map(|h| vec![(MOVIEHASH_FACT, h)]).unwrap_or_default();
         Ok(Outcome { matched: true, writes, facts, rerun, ..Outcome::default() })
     }
@@ -497,13 +601,14 @@ fn read_more_front(
     file: &FileInfo,
     total: i64,
     front: &mut Vec<u8>,
+    password: Option<&str>,
     info: &mut ProbeInfo,
 ) -> Result<(), StepError> {
     let mut part = 2;
     while info.media.as_ref().is_some_and(|m| !m.header_complete) && part <= total.min(FRONT_ARTICLES) {
         let Some(body) = read_part(ctx, file, part, front.len() as u64)? else { break };
         front.extend(body);
-        inspect(front, info);
+        inspect(front, password, info);
         part += 1;
     }
     // the encoder's settings are in the first frame, just past the header: one more article when they're not here yet
@@ -521,7 +626,7 @@ fn read_more_front(
         && let Some(body) = read_part(ctx, file, part, front.len() as u64)?
     {
         front.extend(body);
-        inspect(front, info);
+        inspect(front, password, info);
     }
     Ok(())
 }
@@ -725,9 +830,9 @@ fn chain_moviehash(
 }
 
 /// What the first bytes are. A file in an archive, or in an archive in that, and soo on down, is read as itself.
-fn inspect(body: &[u8], info: &mut ProbeInfo) {
-    info.archive = super::archive::parse(body);
-    let nest = nest::unwrap(body);
+fn inspect(body: &[u8], password: Option<&str>, info: &mut ProbeInfo) {
+    info.archive = super::archive::parse_with_password(body, password);
+    let nest = nest::unwrap_with_password(body, password);
     info.media = media::parse(&nest.inner);
     // a DVD folder in a stored archive: the walk follows its biggest file, a VOB, but the title set's IFO, with the
     // languages and the playing time, is beside it in what was read; and of several title sets read, the walk's
@@ -940,7 +1045,7 @@ mod tests {
             r4_file(0, b"VIDEO_TS\\VTS_01_1.VOB", &vob),
         ]);
         let mut info = ProbeInfo::default();
-        inspect(&body, &mut info);
+        inspect(&body, None, &mut info);
         let media = info.media.expect("a dvd");
         assert_eq!(media.container, "dvd-video");
         assert_eq!(media.audio.len(), 3);
@@ -963,7 +1068,7 @@ mod tests {
             r4_file(0, b"VIDEO_TS\\VIDEO_TS.VOB", &vob),
         ]);
         let mut info = ProbeInfo::default();
-        inspect(&body, &mut info);
+        inspect(&body, None, &mut info);
         let media = info.media.expect("the menu's stream");
         assert!(!media.header_complete, "a title set may be in the next article");
     }
@@ -982,7 +1087,7 @@ mod tests {
             r4_file(0, b"VIDEO_TS\\VTS_02_0.IFO", &super::super::dvd::tests::ifo()),
         ]);
         let mut info = ProbeInfo::default();
-        inspect(&body, &mut info);
+        inspect(&body, None, &mut info);
         assert_eq!(info.media.expect("a dvd").duration_secs, Some(6750.0));
     }
 
@@ -995,7 +1100,7 @@ mod tests {
             r4_file(0, b"BDMV\\STREAM\\00800.m2ts", &vec![0x47; 300_000]),
         ]);
         let mut info = ProbeInfo::default();
-        inspect(&body, &mut info);
+        inspect(&body, None, &mut info);
         let media = info.media.expect("a blu-ray");
         assert_eq!((media.container.as_str(), media.duration_secs), ("bluray", Some(7_200.0)));
         assert_eq!(media.audio.len(), 2);

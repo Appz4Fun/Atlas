@@ -108,17 +108,36 @@ fn whole_file(ctx: &mut StepCtx<'_>, file: &FileInfo, left: &mut usize) -> Resul
     Ok(Some(whole))
 }
 
-/// What an NZB an archive holds lists, from the article read: stored, not compressed or encrypted, its bytes are
-/// there as they are, from its start. Often only the first of its files, as its first article holds only its start.
-fn nzb_stored_in(listing: &Listing, body: &[u8]) -> Option<Listing> {
-    if listing.encrypted || !listing.files.iter().any(|f| select::classify(&f.name) == Kind::Nzb) {
+/// What an NZB an archive holds lists, from the article read: either stored in `body` or unwrapped/decrypted via
+/// `nest::unwrap_with_password`. Also returns any password found in `<meta type="password">` or the inner `.nzb` name.
+fn nzb_stored_in(listing: &Listing, body: &[u8], password: Option<&str>) -> Option<(Listing, Option<String>)> {
+    if !listing.files.iter().any(|f| select::classify(&f.name) == Kind::Nzb) {
         return None;
     }
-    let at = (0..body.len().saturating_sub(4))
-        .filter(|at| body.get(*at) == Some(&b'<'))
-        .find(|at| body.get(*at..).is_some_and(nzb::is_nzb))?;
-    let inside = nzb::list(body.get(at..)?);
-    (!inside.files.is_empty()).then_some(inside)
+    let name_pw = listing
+        .files
+        .iter()
+        .filter(|f| select::classify(&f.name) == Kind::Nzb)
+        .find_map(|f| crate::release_info::find_password(&f.name));
+    if !listing.encrypted
+        && let Some(at) = (0..body.len().saturating_sub(4))
+            .filter(|at| body.get(*at) == Some(&b'<'))
+            .find(|at| body.get(*at..).is_some_and(nzb::is_nzb))
+        && let Some(slice) = body.get(at..)
+    {
+        let inside = nzb::list(slice);
+        if !inside.files.is_empty() {
+            let pw = nzb::meta_password(slice).or(name_pw);
+            return Some((inside, pw));
+        }
+    }
+    let unwrapped = crate::probe::nest::unwrap_with_password(body, password);
+    if !nzb::is_nzb(&unwrapped.inner) {
+        return None;
+    }
+    let inside = nzb::list(&unwrapped.inner);
+    let pw = nzb::meta_password(&unwrapped.inner).or(name_pw);
+    (!inside.files.is_empty()).then_some((inside, pw))
 }
 
 /// An archive's outcome with the list of the NZB inside it beside its own rows, in the same writes. The archive's
@@ -126,14 +145,113 @@ fn nzb_stored_in(listing: &Listing, body: &[u8]) -> Option<Listing> {
 fn with_nzb(
     ctx: &StepCtx<'_>,
     outcome: Outcome,
-    inside: Option<Listing>,
+    inside: Option<(Listing, Option<String>)>,
     limits: &ArchiveConfig,
 ) -> Result<Outcome, StepError> {
-    let Some(inside) = inside else { return Ok(outcome) };
+    let Some((inside, nzb_pw)) = inside else { return Ok(outcome) };
     if outcome.junk.is_some() {
         return Ok(outcome);
     }
-    Ok(merge_nzb(outcome, finish(ctx, SOURCE_NZB, inside, limits)?))
+    let mut nested = finish(ctx, SOURCE_NZB, inside, limits)?;
+    if let Some(pw) = nzb_pw {
+        add_pointed_password_writes(ctx, &mut nested.writes, &pw);
+    }
+    Ok(merge_nzb(outcome, nested))
+}
+
+fn add_pointed_password_writes(ctx: &StepCtx<'_>, writes: &mut Vec<StepWrite>, pw: &str) {
+    let rel = ctx.release();
+    let id = rel.id;
+    let content_id = crate::raw_store::release_content_id(ctx.conn(), id).unwrap_or_default();
+    crate::raw_store::put_nfo_password(&rel.name, &rel.group, &content_id, pw);
+    writes.push(StepWrite::new(archive_store::SET_NFO_PASSWORD, vec![id.into(), pw.to_string().into()]));
+    let target_names: Vec<String> = writes
+        .iter()
+        .filter(|w| w.sql == archive_store::MARK_POINTED)
+        .filter_map(|w| match w.params.first() {
+            Some(Value::Text(s)) => Some(s.clone()),
+            _ => None,
+        })
+        .collect();
+    for name in target_names {
+        writes.push(StepWrite::new(
+            archive_store::MARK_POINTED_PASSWORD,
+            vec![name.into(), id.into(), pw.to_string().into()],
+        ));
+    }
+}
+
+/// Looks up a password already stored or visible in the release's names/subjects, verified against `check` when given.
+fn known_or_post_password(
+    ctx: &StepCtx<'_>,
+    files: &[FileInfo],
+    check: Option<&super::PasswordTest>,
+) -> Option<String> {
+    let rel = ctx.release();
+    let content_id = crate::raw_store::release_content_id(ctx.conn(), rel.id).unwrap_or_default();
+    let mut extra = Vec::new();
+    if let Some(pw) = archive_store::nfo_password(ctx.conn(), rel.id) {
+        extra.push(pw);
+    }
+    if let Some(pw) = crate::raw_store::get_nfo_password(&rel.name, &rel.group, &content_id)
+        && !extra.contains(&pw)
+    {
+        extra.push(pw);
+    }
+    let texts = std::iter::once(rel.name.as_str())
+        .chain(rel.display_name.as_deref())
+        .chain(files.iter().map(|f| f.filename.as_str()))
+        .chain(files.iter().filter_map(|f| f.subject.as_deref()));
+    crate::release_info::find_verified_password(texts, &extra, check)
+}
+
+/// Harvests a password for an encrypted archive from the post's names/subjects, any posted `.nzb`, or any `.nfo`/`.txt`
+/// (including files identified via `par2_files` or a single-part unidentified NFO), verifying candidates against `check`.
+fn harvest_password_from_bodies(
+    ctx: &mut StepCtx<'_>,
+    files: &[FileInfo],
+    left: &mut usize,
+    check: Option<&super::PasswordTest>,
+) -> Result<Option<String>, StepError> {
+    if let Some(pw) = known_or_post_password(ctx, files, check) {
+        return Ok(Some(pw));
+    }
+    let rel_id = ctx.release().id;
+    let par2_names = select::par2_name_map(ctx.conn(), rel_id);
+    for par2_name in par2_names.values() {
+        if let Some(pw) = crate::release_info::find_verified_password([par2_name.as_str()], &[], check) {
+            return Ok(Some(pw));
+        }
+    }
+    for nzb_file in select::nzb_sources_with_par2(files, &par2_names) {
+        let Some(body) = whole_file(ctx, nzb_file, left)? else { continue };
+        if identify(&body) == Format::Nzb
+            && let Some(meta_pw) = nzb::meta_password(&body)
+            && let Some(pw) = crate::release_info::find_verified_password(std::iter::empty(), &[meta_pw], check)
+        {
+            return Ok(Some(pw));
+        }
+    }
+    let mut nfo_files = select::nfo_sources_with_par2(files, &par2_names);
+    if nfo_files.is_empty()
+        && let Some(unid) = files
+            .iter()
+            .find(|f| select::classify(&f.filename) == Kind::Unidentified && f.expected.unwrap_or(0).max(f.parts_seen) == 1)
+    {
+        nfo_files.push(unid);
+    }
+    for nfo_file in nfo_files {
+        let Some(seg) = first_article(ctx, nfo_file)? else { continue };
+        let Some(body) = budgeted(ctx, &seg, &nfo_file.filename, left)? else { continue };
+        if identify(&body) != Format::Unknown {
+            continue;
+        }
+        let text = crate::probe::nfo_text(&body);
+        if let Some(pw) = crate::release_info::find_verified_password([text.as_str()], &[], check) {
+            return Ok(Some(pw));
+        }
+    }
+    Ok(None)
 }
 
 /// `with_nzb`'s join: the NZB's rows go with the archive's outcome, or its junk verdict in place of it.
@@ -351,6 +469,11 @@ fn restore_archive(
         damaged: saved.listing_damaged,
         need_more_tail: false,
     };
+    let inner_nzb_pw = listing
+        .files
+        .iter()
+        .filter(|f| select::classify(&f.name) == Kind::Nzb)
+        .find_map(|f| crate::release_info::find_password(&f.name));
     let outcome = finish_with_override(ctx, source, listing, password_override, Some(saved.content_fp), false, limits)?;
     let rel = ctx.release();
     let nested = crate::raw_store::get_archive_files(&rel.name, &rel.group, content_id, SOURCE_NZB);
@@ -359,7 +482,11 @@ fn restore_archive(
     }
     let files = nested.into_iter().map(|f| InnerFile { name: f.name, size: f.size }).collect();
     let listing = Listing { files, complete: true, ..Default::default() };
-    let nested = finish_with_override(ctx, SOURCE_NZB, listing, None, Some(None), false, limits)?;
+    let mut nested = finish_with_override(ctx, SOURCE_NZB, listing, None, Some(None), false, limits)?;
+    let posted_files = ctx.files().unwrap_or_default();
+    if let Some(pw) = inner_nzb_pw.or_else(|| known_or_post_password(ctx, &posted_files, None)) {
+        add_pointed_password_writes(ctx, &mut nested.writes, &pw);
+    }
     Ok(merge_nzb(outcome, nested))
 }
 
@@ -673,6 +800,7 @@ impl Step for ListStep {
         if !crate::raw_store::is_explicit_rerun(ctx.conn(), rel_id, LIST_STEP) {
             if let Some(saved) =
                 crate::raw_store::get_archive(&rel_name, &rel_group, &content_id, rel.parts, rel.complete)
+                && !(saved.names_hidden && saved.files.is_empty())
             {
                 return restore_archive(ctx, saved, &content_id, &limits);
             }
@@ -717,18 +845,65 @@ impl Step for ListStep {
             let Some(body) = body else { continue };
             match identify(&body) {
                 Format::Rar4 | Format::Rar5 => {
-                    let listing = rar::list(&body);
-                    let inside = nzb_stored_in(&listing, &body);
-                    return with_nzb(ctx, finish(ctx, SOURCE_RAR, listing, &limits)?, inside, &limits);
+                    let mut listing = rar::list(&body);
+                    let mut pw_found = None;
+                    if listing.encrypted {
+                        pw_found =
+                            harvest_password_from_bodies(ctx, &files, &mut left, listing.password_check.as_ref())?;
+                        if let Some(ref pw) = pw_found
+                            && listing.headers_encrypted
+                        {
+                            let decrypted = rar::list_with_password(&body, Some(pw));
+                            if !decrypted.files.is_empty() {
+                                listing = decrypted;
+                            }
+                        }
+                    }
+                    let inside = nzb_stored_in(&listing, &body, pw_found.as_deref());
+                    let mut outcome = finish(ctx, SOURCE_RAR, listing, &limits)?;
+                    if let Some(pw) = pw_found {
+                        crate::raw_store::put_nfo_password(&rel_name, &rel_group, &content_id, &pw);
+                        outcome.writes.push(StepWrite::new(
+                            archive_store::SET_NFO_PASSWORD,
+                            vec![rel_id.into(), pw.into()],
+                        ));
+                    }
+                    return with_nzb(ctx, outcome, inside, &limits);
                 }
                 Format::Zip => {
                     let listing = zip_list(ctx, &head, &body, &mut left)?;
-                    let inside = nzb_stored_in(&listing, &body);
-                    return with_nzb(ctx, finish(ctx, SOURCE_ZIP, listing, &limits)?, inside, &limits);
+                    let pw_found = if listing.encrypted {
+                        harvest_password_from_bodies(ctx, &files, &mut left, listing.password_check.as_ref())?
+                    } else {
+                        None
+                    };
+                    let inside = nzb_stored_in(&listing, &body, pw_found.as_deref());
+                    let mut outcome = finish(ctx, SOURCE_ZIP, listing, &limits)?;
+                    if let Some(pw) = pw_found {
+                        crate::raw_store::put_nfo_password(&rel_name, &rel_group, &content_id, &pw);
+                        outcome.writes.push(StepWrite::new(
+                            archive_store::SET_NFO_PASSWORD,
+                            vec![rel_id.into(), pw.into()],
+                        ));
+                    }
+                    return with_nzb(ctx, outcome, inside, &limits);
                 }
                 Format::SevenZip => {
                     let listing = seven_list(ctx, &head, &seg, &body, &mut left)?;
-                    return finish(ctx, SOURCE_7Z, listing, &limits);
+                    let pw_found = if listing.encrypted {
+                        harvest_password_from_bodies(ctx, &files, &mut left, listing.password_check.as_ref())?
+                    } else {
+                        None
+                    };
+                    let mut outcome = finish(ctx, SOURCE_7Z, listing, &limits)?;
+                    if let Some(pw) = pw_found {
+                        crate::raw_store::put_nfo_password(&rel_name, &rel_group, &content_id, &pw);
+                        outcome.writes.push(StepWrite::new(
+                            archive_store::SET_NFO_PASSWORD,
+                            vec![rel_id.into(), pw.into()],
+                        ));
+                    }
+                    return Ok(outcome);
                 }
                 Format::Par2 => {
                     // a PAR2 under another name: without a list, it cant replace the rows of one that had
@@ -764,10 +939,16 @@ impl Step for ListStep {
             }
         }
         // no archive told what this is: a posted NZB can, by the files of the post it points to
-        for file in select::nzb_sources(&files) {
+        let par2_names = select::par2_name_map(ctx.conn(), rel_id);
+        for file in select::nzb_sources_with_par2(&files, &par2_names) {
             let Some(body) = whole_file(ctx, file, &mut left)? else { continue };
             if identify(&body) == Format::Nzb {
-                return finish(ctx, SOURCE_NZB, nzb::list(&body), &limits);
+                let meta_pw = nzb::meta_password(&body);
+                let mut outcome = finish(ctx, SOURCE_NZB, nzb::list(&body), &limits)?;
+                if let Some(pw) = meta_pw.or_else(|| known_or_post_password(ctx, &files, None)) {
+                    add_pointed_password_writes(ctx, &mut outcome.writes, &pw);
+                }
+                return Ok(outcome);
             }
         }
         let rel = ctx.release();
