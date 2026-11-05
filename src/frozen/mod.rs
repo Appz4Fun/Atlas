@@ -831,46 +831,108 @@ pub struct Hit {
     pub reason: String,
 }
 
-/// The newest frozen releases matching `words` (all of them when empty) in `filter`, `limit` at most over every
-/// shard, newest first.
-pub fn search(main: &Path, words: &str, filter: Option<&crate::category::CatFilter>, limit: usize) -> Result<Vec<Hit>> {
+/// Frozen release `id` as a search would list it, and when it was frozen. None: it isn't frozen, or its group is one
+/// the filters hide (as a search and a live release's page leave it out).
+pub fn get(main: &Path, id: i64) -> Result<Option<(Hit, i64)>> {
+    let Some(conn) = open_read(main, crate::store::shard_of_id(id)) else { return Ok(None) };
+    let found = conn
+        .query_row(
+            "select f.id, coalesce(f.display_name, f.name), f.group_name, f.poster, f.posted_date, f.size, f.complete,
+             f.parts, f.category, f.reason, f.frozen_at from frozen_releases f where f.id = ?1",
+            [id],
+            |r| Ok((Hit { row: crate::search::release_row(r)?, category: r.get(8)?, reason: r.get(9)? }, r.get(10)?)),
+        )
+        .optional()?;
+    Ok(found.filter(|(h, _)| !crate::filters::group_blocked(&h.row.group_name)))
+}
+
+/// What a deep search narrows frozen releases to besides its words and category: the search page's fields and its
+/// "Hide incomplete". Empty: no narrowing.
+#[derive(Clone, Debug, Default)]
+pub struct Narrow {
+    pub group: String,
+    pub poster: String,
+    /// part of the poster
+    pub email: String,
+    /// smallest and largest size, bytes
+    pub size: Option<(i64, i64)>,
+    /// the release group at the end of the name
+    pub team: String,
+    pub complete_only: bool,
+}
+
+/// The newest frozen releases matching `words` (all of them when empty) in `filter`, narrowed by `narrow`, `limit` at
+/// most over every shard, newest first.
+pub fn search(
+    main: &Path,
+    words: &str,
+    filter: Option<&crate::category::CatFilter>,
+    narrow: &Narrow,
+    limit: usize,
+) -> Result<Vec<Hit>> {
+    use rusqlite::types::Value;
     let mut hits = Vec::new();
     let fts = crate::search::fts_query(words);
-    let cat = match filter {
-        None => String::new(),
-        Some(f) => {
-            let mut parts: Vec<String> = Vec::new();
-            if !f.leaves.is_empty() {
-                let leaves: Vec<String> = f.leaves.iter().map(|l| l.to_string()).collect();
-                parts.push(format!("f.category in ({})", leaves.join(",")));
-            }
-            if f.uncategorized {
-                parts.push("f.category is null".into());
-            }
-            if parts.is_empty() { " and 0".to_string() } else { format!(" and ({})", parts.join(" or ")) }
+    let mut values: Vec<Value> = vec![Value::Integer(limit as i64)];
+    if !fts.trim().is_empty() {
+        values.push(Value::Text(fts.clone()));
+    }
+    let mut cond = String::new();
+    if let Some(f) = filter {
+        let mut parts: Vec<String> = Vec::new();
+        if !f.leaves.is_empty() {
+            let leaves: Vec<String> = f.leaves.iter().map(|l| l.to_string()).collect();
+            parts.push(format!("f.category in ({})", leaves.join(",")));
         }
+        if f.uncategorized {
+            parts.push("f.category is null".into());
+        }
+        cond.push_str(&if parts.is_empty() { " and 0".to_string() } else { format!(" and ({})", parts.join(" or ")) });
+    }
+    let mut add = |condition: String, value: Value| {
+        values.push(value);
+        cond.push_str(&format!(" and {}", condition.replace("{}", &format!("?{}", values.len()))));
     };
+    if !narrow.group.is_empty() {
+        add("f.group_name = {}".into(), Value::Text(narrow.group.clone()));
+    }
+    if !narrow.poster.is_empty() {
+        add("f.poster = {}".into(), Value::Text(narrow.poster.clone()));
+    }
+    if !narrow.email.is_empty() {
+        add(r"f.poster like {} escape '\'".into(), Value::Text(crate::search::like_query(&narrow.email)));
+    }
+    if let Some((low, high)) = narrow.size {
+        add("f.size >= {}".into(), Value::Integer(low));
+        add("f.size <= {}".into(), Value::Integer(high));
+    }
+    if !narrow.team.is_empty() {
+        add(
+            crate::field_search::team_condition("coalesce(f.display_name, f.name)", "{}"),
+            Value::Text(crate::field_search::team_pattern(&narrow.team)),
+        );
+    }
+    if narrow.complete_only {
+        cond.push_str(" and f.complete = 1");
+    }
     let cols = "f.id, coalesce(f.display_name, f.name), f.group_name, f.poster, f.posted_date, f.size, f.complete,
                 f.parts, f.category, f.reason";
     let sql = if fts.trim().is_empty() {
-        format!("select {cols} from frozen_releases f where 1 {cat} order by f.id desc limit ?1")
+        format!("select {cols} from frozen_releases f where 1 {cond} order by f.id desc limit ?1")
     } else {
         format!(
             "select {cols} from frozen_fts join frozen_releases f on f.id = frozen_fts.rowid
-             where frozen_fts match ?2 {cat} order by f.id desc limit ?1"
+             where frozen_fts match ?2 {cond} order by f.id desc limit ?1"
         )
     };
     for shard in 0..crate::store::SHARDS {
         let Some(conn) = open_read(main, shard) else { continue };
         let mut stmt = conn.prepare(&sql)?;
-        let read = |r: &rusqlite::Row<'_>| {
-            Ok(Hit { row: crate::search::release_row(r)?, category: r.get(8)?, reason: r.get(9)? })
-        };
-        let rows = if fts.trim().is_empty() {
-            stmt.query_map(params![limit as i64], read)?.collect::<Result<Vec<_>>>()?
-        } else {
-            stmt.query_map(params![limit as i64, fts], read)?.collect::<Result<Vec<_>>>()?
-        };
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(values.iter()), |r| {
+                Ok(Hit { row: crate::search::release_row(r)?, category: r.get(8)?, reason: r.get(9)? })
+            })?
+            .collect::<Result<Vec<_>>>()?;
         hits.extend(rows.into_iter().filter(|h| !crate::filters::group_blocked(&h.row.group_name)));
     }
     hits.sort_by_key(|h| std::cmp::Reverse(h.row.id));
@@ -967,6 +1029,25 @@ pub fn stats(main: &Path) -> Result<Vec<(usize, String, i64, i64)>> {
     Ok(out)
 }
 
+/// Thaw frozen release `id` by hand, from outside the indexer (the CLI, the web UI): kept off the rules after. The
+/// caller holds off compaction (`compact::hold_off_compaction`), soo a shard swapped in under it can't lose it.
+pub fn thaw_by_hand(main: &Path, id: i64) -> Result<Thawed> {
+    let shard = crate::store::shard_path(main, crate::store::shard_of_id(id));
+    let conn = crate::db::open_shard(&shard)?;
+    attach(&conn, &shard)?;
+    conn.execute_batch("begin immediate")?;
+    match thaw(&conn, id, true, chrono::Utc::now().timestamp()) {
+        Ok(t) => {
+            conn.execute_batch("commit")?;
+            Ok(t)
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("rollback");
+            Err(e)
+        }
+    }
+}
+
 /// `--thaw ID...`: put frozen releases back, each in one transaction on its shard alongside a running indexer.
 pub fn run_thaw(args: &[String]) -> i32 {
     let main = crate::paths::database();
@@ -985,23 +1066,7 @@ pub fn run_thaw(args: &[String]) -> i32 {
     };
     let mut code = 0;
     for id in ids {
-        let shard = crate::store::shard_path(&main, crate::store::shard_of_id(id));
-        let done = (|| -> Result<Thawed> {
-            let conn = crate::db::open_shard(&shard)?;
-            attach(&conn, &shard)?;
-            conn.execute_batch("begin immediate")?;
-            match thaw(&conn, id, true, chrono::Utc::now().timestamp()) {
-                Ok(t) => {
-                    conn.execute_batch("commit")?;
-                    Ok(t)
-                }
-                Err(e) => {
-                    let _ = conn.execute_batch("rollback");
-                    Err(e)
-                }
-            }
-        })();
-        match done {
+        match thaw_by_hand(&main, id) {
             Ok(Thawed::Restored) => println!("{id}: thawed"),
             Ok(Thawed::AlreadyLive) => println!("{id}: was live already, its frozen copy is gone"),
             Ok(Thawed::NameTaken) => {
