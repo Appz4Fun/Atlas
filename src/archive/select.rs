@@ -17,8 +17,8 @@ static KIND: LazyLock<Regex> = LazyLock::new(|| {
         r"(?ix) \.vol(?P<pv>\d{1,9})[+-]\d{1,9}\.par2$ | (?P<pb>\.par2)$
   | \.part(?P<rp>\d{1,6})\.rar$ | (?P<rar>\.rar|\.cbr)$ | \.r(?P<rr>\d{2,3})$ | \.s(?P<rs>\d{2})$
   | \.7z\.(?P<sv>\d{3})$ | (?P<sz>\.7z)$ | \.z(?P<zv>\d{2,3})$ | (?P<zip>\.zipx?|\.cbz)$ | \.(?P<nv>\d{2,3})$
-  | (?P<nfo>\.nfo|\.txt)$ | (?P<img>\.jpe?g|\.png|\.gif|\.webp|\.bmp|\.tiff?)$
-  | (?P<not>\.mkv|\.mp4|\.avi|\.m4v|\.ts|\.wmv|\.mov|\.mpe?g|\.webm|\.mp3|\.flac|\.m4a|\.ogg|\.aac|\.wav|\.iso|\.img|\.bin|\.exe|\.msi|\.dmg|\.pdf|\.epub|\.mobi|\.azw3|\.sfv|\.srr|\.srs|\.nzb|\.url|\.diz|\.md5|\.sha1|\.idx|\.sub|\.srt|\.ass|\.tar|\.gz|\.tgz|\.bz2|\.xz|\.ace|\.cab)$",
+  | (?P<nfo>\.nfo|\.txt)$ | (?P<nzb>\.nzb)$ | (?P<img>\.jpe?g|\.png|\.gif|\.webp|\.bmp|\.tiff?)$
+  | (?P<not>\.mkv|\.mp4|\.avi|\.m4v|\.ts|\.wmv|\.mov|\.mpe?g|\.webm|\.mp3|\.flac|\.m4a|\.ogg|\.aac|\.wav|\.iso|\.img|\.bin|\.exe|\.msi|\.dmg|\.pdf|\.epub|\.mobi|\.azw3|\.sfv|\.srr|\.srs|\.url|\.diz|\.md5|\.sha1|\.idx|\.sub|\.srt|\.ass|\.tar|\.gz|\.tgz|\.bz2|\.xz|\.ace|\.cab)$",
     )
     .unwrap()
 });
@@ -35,6 +35,7 @@ pub enum Kind {
     Zip(u32),
     Numbered(u32),
     Nfo,
+    Nzb,
     Image,
     NotArchive,
     Unidentified,
@@ -70,6 +71,8 @@ pub fn classify(filename: &str) -> Kind {
         Kind::Numbered(n)
     } else if c.name("nfo").is_some() {
         Kind::Nfo
+    } else if c.name("nzb").is_some() {
+        Kind::Nzb
     } else if c.name("img").is_some() {
         Kind::Image
     } else {
@@ -151,6 +154,19 @@ pub fn par2_source(files: &[FileInfo]) -> Option<&FileInfo> {
             .min_by_key(|(n, f)| (*n, parts(f), f.filename.clone()))
             .map(|(_, f)| f)
     })
+}
+
+/// Posted NZBs to read: at most 2, fewest parts first, and only one whose every article is indexed and few enough
+/// to take whole.
+pub fn nzb_sources(files: &[FileInfo]) -> Vec<&FileInfo> {
+    let mut found: Vec<&FileInfo> = files
+        .iter()
+        .filter(|f| classify(&f.filename) == Kind::Nzb)
+        .filter(|f| (1..=super::nzb::MAX_NZB_PARTS).contains(&parts(f)) && f.parts_seen >= parts(f))
+        .collect();
+    found.sort_by_key(|f| (parts(f), f.filename.clone()));
+    found.truncate(2);
+    found
 }
 
 /// NFOs to read: at most 2, fewest parts first.

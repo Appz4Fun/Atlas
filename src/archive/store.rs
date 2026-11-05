@@ -14,6 +14,8 @@ pub const SOURCE_PAR2: i64 = 1;
 pub const SOURCE_RAR: i64 = 2;
 pub const SOURCE_7Z: i64 = 3;
 pub const SOURCE_ZIP: i64 = 4;
+/// the files of the post a posted NZB points to, not what's inside them
+pub const SOURCE_NZB: i64 = 5;
 
 pub const INNER_FILES: ShardTable = ShardTable {
     name: "archive_inner_files",

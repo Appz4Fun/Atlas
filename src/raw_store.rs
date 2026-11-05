@@ -1388,11 +1388,12 @@ pub fn get_archive(
         let password_check = check;
         let listing_complete = l_comp.unwrap_or(0) != 0;
         let listing_damaged = l_dmg.unwrap_or(0) != 0;
+        // an archive's rows only: PAR2 (1) and posted NZB (5) lists are kept and restored on their own
         let files = conn
             .prepare_cached(
                 "SELECT seq, name, size, coalesce(source, 2)
                  FROM raw_archive_inner_files
-                 WHERE release_name = ?1 AND group_name = ?2 AND content_id = ?3 AND coalesce(source, 2) != 1
+                 WHERE release_name = ?1 AND group_name = ?2 AND content_id = ?3 AND coalesce(source, 2) NOT IN (1, 5)
                  ORDER BY seq",
             )?
             .query_map(params![name, group_name, content_id], |r| {
@@ -2193,7 +2194,7 @@ fn harvest_attached_release_tables(tx: &rusqlite::Transaction<'_>, schema: &str)
     if has_table(tx, schema, "archive_release")? {
         let listing_complete_expr = match (has_fp, has_inner) {
             (true, true) => format!(
-                "CASE WHEN {list_verified} AND ((a.password = 0 AND NOT EXISTS (SELECT 1 FROM {schema}.archive_inner_files f WHERE f.release_id = a.release_id AND coalesce(f.source, 2) != 1))
+                "CASE WHEN {list_verified} AND ((a.password = 0 AND NOT EXISTS (SELECT 1 FROM {schema}.archive_inner_files f WHERE f.release_id = a.release_id AND coalesce(f.source, 2) NOT IN (1, 5)))
                            OR EXISTS (SELECT 1 FROM {schema}.release_fingerprint fp WHERE fp.release_id = a.release_id AND fp.content IS NOT NULL))
                       THEN 1 ELSE 0 END"
             ),
