@@ -264,6 +264,7 @@ impl Inner {
         let config = full.postprocess.clone();
         store::SETTLE_SECS.store(config.settle_secs.max(1), Relaxed);
         store::COMPLETE_SETTLE_SECS.store(config.complete_settle_secs.max(1), Relaxed);
+        crate::frozen::configure(&full.freeze);
         let mut enabled = 0;
         for step in &self.steps {
             let on = step.enabled(full);
@@ -618,8 +619,14 @@ impl Inner {
             if let Ok(Some(junk)) = crate::junk::stored_reason(conn, row.info.id) {
                 return Some(Applied { junk: Some(junk), ..base_copy(&base) });
             }
-            // a queue row goes, a state row is no longer wanted by the net lane, a walk row writes nothing
-            (due.is_some() || row.has_state).then(|| Applied { no_state: !row.has_state, ..base_copy(&base) })
+            // a queue row goes, a state row is no longer wanted by the net lane, a walk row writes nothing but what the
+            // freezing rules make of it: a rejected post is still a small complete one
+            let freeze_check = crate::frozen::rules::any_on();
+            (due.is_some() || row.has_state || freeze_check).then(|| Applied {
+                no_state: !row.has_state,
+                freeze_check,
+                ..base_copy(&base)
+            })
         };
         if let Some(reason) = rules::judge_row(rules, &facts(&row)) {
             return reject(reason);
@@ -795,6 +802,7 @@ impl Inner {
             && a.net_mask == 0
             && a.error.is_none()
             && a.names.is_empty();
+        a.freeze_check = crate::frozen::rules::any_on();
         Some(a)
     }
 

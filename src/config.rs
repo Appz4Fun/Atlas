@@ -160,6 +160,7 @@ pub struct Config {
     pub media: MediaConfig,
     pub metrics: MetricsConfig,
     pub sealed_log: SealedLogConfig,
+    pub freeze: FreezeConfig,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -374,6 +375,59 @@ impl CategoryConfig {
 
     pub fn options(&self) -> crate::category::Options {
         crate::category::Options { foreign: self.foreign, web_dl: self.web_dl }
+    }
+}
+
+/// The `freeze` object of the config, see `frozen`: which releases move out of the shards into their frozen files.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FreezeConfig {
+    pub enabled: bool,
+    /// a complete release under this many bytes freezes; 0 turns the rule off
+    pub small_bytes: i64,
+    /// the small rule leaves movies and TV alone
+    pub small_keeps_tv_movies: bool,
+    /// releases a shard's writer moves at most a tick (a second)
+    pub per_tick: i64,
+    /// how long a tick may hold the writer, milliseconds
+    pub tick_ms: i64,
+    /// below this much free disk nothing is moved, GB
+    pub min_free_gb: i64,
+}
+
+impl Default for FreezeConfig {
+    fn default() -> Self {
+        FreezeConfig {
+            enabled: true,
+            small_bytes: 1 << 30,
+            small_keeps_tv_movies: false,
+            per_tick: 200,
+            tick_ms: 50,
+            min_free_gb: 100,
+        }
+    }
+}
+
+impl FreezeConfig {
+    fn from_value(v: Option<&Value>) -> FreezeConfig {
+        let mut c = FreezeConfig::default();
+        let Some(v) = v else { return c };
+        let int = |key: &str, slot: &mut i64, min: i64| {
+            if let Some(n) = v.get(key).and_then(as_int).filter(|n| *n >= min) {
+                *slot = n;
+            }
+        };
+        int("small_bytes", &mut c.small_bytes, 0);
+        int("per_tick", &mut c.per_tick, 1);
+        int("tick_ms", &mut c.tick_ms, 1);
+        int("min_free_gb", &mut c.min_free_gb, 0);
+        let flag = |key: &str, slot: &mut bool| {
+            if let Some(b) = v.get(key).and_then(as_bool) {
+                *slot = b;
+            }
+        };
+        flag("enabled", &mut c.enabled);
+        flag("small_keeps_tv_movies", &mut c.small_keeps_tv_movies);
+        c
     }
 }
 
@@ -738,6 +792,7 @@ impl Default for Config {
             predb: PredbConfig::default(),
             category: CategoryConfig::default(),
             media: MediaConfig::default(),
+            freeze: FreezeConfig::default(),
         }
     }
 }
@@ -927,6 +982,7 @@ impl Config {
             predb: PredbConfig::from_value(v.get("predb")),
             category: CategoryConfig::from_value(v.get("category")),
             media: MediaConfig::from_value(v.get("media")),
+            freeze: FreezeConfig::from_value(v.get("freeze")),
             max_unsaved_headers: v
                 .get("max_unsaved_headers")
                 .and_then(as_int)

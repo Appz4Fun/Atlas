@@ -2733,6 +2733,8 @@ pub fn reset_shards_at(main: &Path, log: &dyn Fn(&str)) -> anyhow::Result<()> {
         remove_db_family(&copy)?;
         remove_db_family(&crate::compact::with_suffix(&shard, "domains"))?;
         remove_db_family(&crate::compact::with_suffix(&shard, "precompact"))?;
+        // frozen releases carry the old shard's ids: a new shard would hand them out again
+        remove_db_family(&crate::frozen::path(&shard))?;
         remove_db_family(&shard)?;
     }
     remove_db_family(&main.with_file_name("atlas.old.db"))?;

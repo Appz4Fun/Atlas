@@ -133,6 +133,8 @@ pub const SHARD_TABLES: &[&ShardTable] = &[
     &crate::keys::RELEASE_KEYS,
     &crate::junk::JUNK_RELEASES,
     &crate::junk::JUNK_COLLECTIONS,
+    &crate::frozen::FREEZE_PENDING,
+    &crate::frozen::FREEZE_EXEMPT,
 ];
 
 /// nullable columns on `releases`, append only. `name_source`: NULL, the name came from

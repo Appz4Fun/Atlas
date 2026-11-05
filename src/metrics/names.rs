@@ -106,6 +106,7 @@ families! {
     CATEGORIZED "atlas_releases_categorized_total" Counter &[], "Releases filed under each category, reruns included.";
     RELEASE_SIZE "atlas_release_size_bytes" Histogram SIZES, "Size of releases as they are categorized, per root category.";
     JUNK_REMOVED "atlas_junk_releases_removed_total" Counter &[], "Releases deleted as junk (a program in them, or PC), by reason.";
+    FROZEN "atlas_frozen_events_total" Counter &[], "Freezing, by event: frozen, thawed, name_taken, thaw_failed, disk_short.";
 
     // predb
     PREDB_LOOKUPS "atlas_predb_lookups_total" Counter &[], "PreDB lookups, by result.";

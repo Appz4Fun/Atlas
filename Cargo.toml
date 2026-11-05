@@ -33,7 +33,7 @@ serde_json = { version = "1", features = ["preserve_order"] }
 sha1 = "0.10"
 hmac = "0.12"
 sha2 = "0.10"
-sysinfo = { version = "0.39", default-features = false, features = ["system"] }
+sysinfo = { version = "0.39", default-features = false, features = ["system", "disk"] }
 tiny_http = "0.12"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "sync"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }

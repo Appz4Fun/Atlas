@@ -267,19 +267,80 @@ pub(crate) fn find_releases(
     }
 }
 
+/// How far a deep search pages, live and frozen together.
+const DEEP_MAX: i64 = 1_000;
+
+/// `deep=1`: the live releases and the frozen ones (`frozen`) together, newest first, with the frozen ones'
+/// categories. A page past `DEEP_MAX` is empty.
+pub(crate) fn deep_releases(
+    q: &str,
+    filter: Option<&crate::category::CatFilter>,
+    offset: i64,
+    limit: i64,
+) -> anyhow::Result<(Vec<crate::search::ReleaseRow>, HashMap<i64, i64>)> {
+    let want = (offset + limit).min(DEEP_MAX);
+    if want <= offset {
+        return Ok((Vec::new(), HashMap::new()));
+    }
+    let live = if crate::word_index::searchable(q)
+        && let Some(index) = crate::word_index::ready()
+    {
+        db::with_reader(|conn| {
+            Ok(index.search(conn, q, filter, &[], crate::word_index::By::Newest, true, 0, want as usize))
+        })??
+        .rows
+    } else {
+        match (filter, q.trim().is_empty()) {
+            (None, true) => all_releases(0, want)?,
+            (None, false) => search_all_releases(q, 0, want)?,
+            (Some(f), true) => newest_in_categories(f, 0, want)?.rows,
+            (Some(f), false) => search_in_categories(q, f, 0, want)?,
+        }
+    };
+    let frozen = crate::frozen::search(&crate::paths::database(), q, filter, want as usize)?;
+    let mut categories = HashMap::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut all: Vec<crate::search::ReleaseRow> = Vec::with_capacity(live.len() + frozen.len());
+    for r in live {
+        if seen.insert(r.id) {
+            all.push(r);
+        }
+    }
+    for h in frozen {
+        // a copy left frozen by a crash mid thaw: the live one stands
+        if seen.insert(h.row.id) {
+            if let Some(c) = h.category {
+                categories.insert(h.row.id, c);
+            }
+            all.push(h.row);
+        }
+    }
+    all.sort_by_key(|r| std::cmp::Reverse(r.id));
+    let page = all.into_iter().skip(offset as usize).take(limit as usize).collect();
+    Ok((page, categories))
+}
+
 fn search(q: &str, args: &HashMap<String, String>, base: &str, api_key: &str) -> ApiResponse {
     let limit = args.get("limit").and_then(|v| v.trim().parse::<i64>().ok()).unwrap_or(100).clamp(1, 100);
     let offset = args.get("offset").and_then(|v| v.trim().parse::<i64>().ok()).unwrap_or(0).max(0);
 
     let filter = args.get("cat").and_then(|c| crate::category::parse_filter(c));
+    // frozen releases only when asked for: `deep` isnt in the Newznab spec
+    let deep = args.get("deep").is_some_and(|v| matches!(v.trim(), "1" | "true" | "yes"));
+    let found = if deep {
+        deep_releases(q, filter.as_ref(), offset, limit)
+    } else {
+        find_releases(q, filter.as_ref(), offset, limit).map(|r| (r, HashMap::new())).map_err(anyhow::Error::from)
+    };
 
-    match find_releases(q, filter.as_ref(), offset, limit) {
-        Ok(r) => {
+    match found {
+        Ok((r, frozen_categories)) => {
             let ids: Vec<i64> = r.iter().map(|release| release.id).collect();
-            let categories = crate::category::categories_of(&ids).unwrap_or_else(|e| {
+            let mut categories = crate::category::categories_of(&ids).unwrap_or_else(|e| {
                 eprintln!("api categories failed: {e}");
                 HashMap::new()
             });
+            categories.extend(frozen_categories);
             let on = crate::media::query::cached_id_params();
             let media = crate::media::query::attrs_of(&ids).unwrap_or_default();
             rss(base, api_key, offset, &r, &crate::archive::store::passwords(&ids), &categories, &media, &on)
@@ -383,7 +444,18 @@ pub(crate) fn get_nzb(args: &HashMap<String, String>) -> ApiResponse {
     let release_id = args.get("id").and_then(|v| v.trim().parse::<i64>().ok()).unwrap_or(0);
 
     let Ok(Some(release)) = get_release(release_id) else {
-        return ApiResponse::not_found();
+        // a frozen release's NZB is built from its frozen row, left frozen (only the whole of it)
+        if args.contains_key("file") {
+            return ApiResponse::not_found();
+        }
+        return match crate::frozen::nzb(&crate::paths::database(), release_id) {
+            Ok(Some((release, content))) => nzb_response(&release, release_id, content),
+            Ok(None) => ApiResponse::not_found(),
+            Err(e) => {
+                eprintln!("api frozen nzb failed: {e}");
+                ApiResponse::not_found()
+            }
+        };
     };
 
     // `file` isnt in the Newznab spec: one file of the release, and one that isnt there is a miss
@@ -395,6 +467,10 @@ pub(crate) fn get_nzb(args: &HashMap<String, String>) -> ApiResponse {
         return ApiResponse::not_found();
     };
 
+    nzb_response(&release, release_id, content)
+}
+
+fn nzb_response(release: &crate::search::ReleaseRow, release_id: i64, content: String) -> ApiResponse {
     let filename = nzb_filename(&release.name, Some(release_id)).replace(['"', '\\'], "_");
 
     ApiResponse {
