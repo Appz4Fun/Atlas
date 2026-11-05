@@ -158,6 +158,10 @@ pub struct ProbeInfo {
     pub moviehash: Option<String>,
 }
 
+/// The CRC32 a Highwinds-family server or Usenet.Farm stamps on an article it received: over the body as posted,
+/// CRLF line ends and the closing dot line included (`keys::received_body_crc` reads it).
+pub const BODY_CRC_HEADER: &str = "X-Received-Body-CRC";
+
 /// The headers worth keeping, under the names they arrive with.
 const KEPT_HEADERS: &[&str] = &[
     "Injection-Date",
@@ -172,6 +176,8 @@ const KEPT_HEADERS: &[&str] = &[
     "Xref",
     "NNTP-Posting-Host",
     "X-Complaints-To",
+    BODY_CRC_HEADER,
+    "X-Received-Bytes",
 ];
 
 pub fn keep_headers(headers: &[(String, String)]) -> BTreeMap<String, String> {
