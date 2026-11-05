@@ -718,10 +718,17 @@ fn inspect(body: &[u8], info: &mut ProbeInfo) {
     // a DVD folder in a stored archive: the walk follows its biggest file, a VOB, but the title set's IFO, with the
     // languages and the playing time, is beside it in what was read; and of several title sets read, the walk's
     // pick needn't be the longest
-    if info.media.as_ref().is_none_or(|m| matches!(m.container.as_str(), "dvd-video" | "mpeg-ps"))
-        && super::dvd::has_title_set(body)
-    {
-        info.media = Some(super::dvd::dvd(body));
+    if info.media.as_ref().is_none_or(|m| matches!(m.container.as_str(), "dvd-video" | "mpeg-ps")) {
+        if super::dvd::has_title_set(body) {
+            info.media = Some(super::dvd::dvd(body));
+        } else if super::dvd::is_dvd(body) {
+            // only the manager IFO or the disc's names so far: what was read stands, and more of the front is read
+            // for a title set
+            match info.media.as_mut() {
+                Some(m) => m.header_complete = false,
+                None => info.media = Some(super::dvd::dvd(body)),
+            }
+        }
     }
     info.layers = nest.layers;
 }
@@ -904,6 +911,27 @@ mod tests {
         assert_eq!(media.container, "dvd-video");
         assert_eq!(media.audio.len(), 3);
         assert_eq!(media.duration_secs, Some(6750.0));
+    }
+
+    #[test]
+    fn a_dvd_folder_with_only_its_manager_ifo_read_wants_more() {
+        use crate::archive::testkit::{r4_file, r4_main, rar4};
+        let mut vmg = b"DVDVIDEO-VMG".to_vec();
+        vmg.resize(4096, 0);
+        // a menu VOB with a whole sequence header
+        let mut vob = vec![0, 0, 1, 0xBA, 0x44, 0, 4, 0, 4, 1, 0x01, 0x89, 0xC3, 0xF8];
+        vob.extend([0, 0, 1, 0xE0, 0, 21, 0x81, 0, 0]);
+        vob.extend([0, 0, 1, 0xB3, 0x2D, 0x02, 0x40, 0x33, 0xFF, 0xFF, 0xE0, 0x18, 0, 0, 1, 0xB5, 0x14, 0x8A]);
+        vob.resize(100_000, 0);
+        let body = rar4(&[
+            r4_main(0),
+            r4_file(0, b"VIDEO_TS\\VIDEO_TS.IFO", &vmg),
+            r4_file(0, b"VIDEO_TS\\VIDEO_TS.VOB", &vob),
+        ]);
+        let mut info = ProbeInfo::default();
+        inspect(&body, &mut info);
+        let media = info.media.expect("the menu's stream");
+        assert!(!media.header_complete, "a title set may be in the next article");
     }
 
     #[test]
