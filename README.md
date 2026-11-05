@@ -266,6 +266,7 @@ All of these go in a `postprocess` object, and each has a default. See [Post-pro
 | `backlog_per_second` | `2000` | Existing releases looked at, over all shards. `0` stops it. |
 | `body_fetches_per_minute` | `3000` | Body budget. At `0`, nothing fetches bodies. |
 | `body_connections` | `4` | Bodies in flight at once. |
+| `net_claims_per_shard` | `24` | Releases of one shard read at once by the body steps, over all `body_connections`. Each waits on its server most of the time, soo this sets how many bodies are really in flight. |
 | `body_min_size_bytes` | `0` | A smaller release gets no body. `0` is no floor. |
 | `body_max_size_bytes` | `0` | A larger release gets no body. `0` is no limit. |
 | `body_max_bytes` | `16777216` | Largest article read. |

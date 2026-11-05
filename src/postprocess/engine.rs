@@ -77,7 +77,7 @@ pub(crate) struct Inner {
     settings: RwLock<Settings>,
     pub(crate) stop: Arc<AtomicBool>,
     db_busy: [AtomicBool; SHARDS],
-    /// per shard: what its running net claims hold, `NET_CLAIMS_PER_SHARD` claims at most
+    /// per shard: what its running net claims hold, `net_claims_per_shard` claims at most
     net_claimed: [Mutex<NetClaims>; SHARDS],
     fetcher: BodyFetcher,
     stats: Arc<Stats>,
@@ -854,7 +854,8 @@ impl Inner {
     fn net_claim(&self, conn: &Connection, db: &Db, shard: usize) -> anyhow::Result<bool> {
         let now = chrono::Utc::now().timestamp();
         let order = claim_order(self.claims[shard].load(Relaxed));
-        let ids = net_take(conn, &self.net_claimed[shard], order, now)?;
+        let most = self.settings.read().unwrap().config.net_claims_per_shard;
+        let ids = net_take(conn, &self.net_claimed[shard], order, now, most)?;
         if ids.is_empty() {
             return Ok(false);
         }
@@ -1257,10 +1258,6 @@ pub(crate) fn queue_order(batches: i64) -> &'static str {
     if batches % 4 == 3 { "due_at" } else { "due_at desc" }
 }
 
-/// Net claims of one shard running at once. They were one: a shard's releases went through a body fetch or a
-/// provider lookup one at a time, ~600 a minute over all eight shards, however many net workers there were.
-const NET_CLAIMS_PER_SHARD: usize = 8;
-
 /// A shard's running net claims, and the releases they hold.
 #[derive(Default)]
 pub(crate) struct NetClaims {
@@ -1279,15 +1276,18 @@ impl NetClaims {
 }
 
 /// The next `NET_BATCH` releases the net lane wants, in `order`, that no other claim of the shard holds, as a claim
-/// of its own: none when `NET_CLAIMS_PER_SHARD` claims are running. They are held till `give_back`.
+/// of its own: none when `most` claims are running (`net_claims_per_shard`). They are held till `give_back`. They
+/// were one at a time, then 8: each claim waits on its server most of the time, and 8 a shard left 448 of 512 net
+/// workers asleep with the bandwidth a quarter used.
 pub(crate) fn net_take(
     conn: &Connection,
     claimed: &Mutex<NetClaims>,
     order: &str,
     now: i64,
+    most: usize,
 ) -> rusqlite::Result<Vec<i64>> {
     let mut claimed = claimed.lock().unwrap();
-    if claimed.claims >= NET_CLAIMS_PER_SHARD {
+    if claimed.claims >= most.max(1) {
         return Ok(Vec::new());
     }
     let ids: Vec<i64> = conn
