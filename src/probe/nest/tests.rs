@@ -600,3 +600,44 @@ fn an_xz_filter_with_no_decoder_says_so() {
     assert_eq!(n.layers[0].method.as_deref(), Some("riscv+lzma2"));
     assert_eq!(n.layers[0].stop.as_deref(), Some("no decoder for this filter yet"));
 }
+
+#[test]
+fn unwrap_for_takes_the_wanted_entry_over_a_bigger_one_in_zip_and_tar() {
+    let want = |name: &str| name.ends_with(".nzb");
+    let big = video();
+    let note = b"<nzb>small</nzb>".to_vec();
+    // a deflated zip: the largest entry is decoded unless one is wanted
+    let zip = [zip_entry(8, "big.mkv", &deflate(&big), big.len()), zip_entry(8, "a.nzb", &deflate(&note), note.len())]
+        .concat();
+    assert_eq!(unwrap(&zip).layers[0].name.as_deref(), Some("big.mkv"));
+    let n = unwrap_for(&zip, &want, MAX_DECODED);
+    assert_eq!(n.layers[0].name.as_deref(), Some("a.nzb"));
+    same(&n.inner, &note);
+    // a gzipped tar, two files
+    let mut tar = tar_of("big.mkv", &big);
+    tar.truncate(512 + big.len().div_ceil(512) * 512);
+    tar.extend(tar_of("a.nzb", &note));
+    let gz = gzip_of("x.tar", &tar);
+    let n = unwrap_for(&gz, &want, MAX_DECODED);
+    assert_eq!(n.layers.last().and_then(|l| l.name.as_deref()), Some("a.nzb"));
+    same(&n.inner, &note);
+}
+
+#[test]
+fn unwrap_for_decodes_as_far_as_its_own_limit() {
+    // letters at random: packs to about half, well inside the ratio limit
+    let mut seed = 7u32;
+    let text: Vec<u8> = (0..MAX_DECODED + 4096)
+        .map(|_| {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            b'a' + ((seed >> 16) % 26) as u8
+        })
+        .collect();
+    let gz = gzip_of("big.nzb", &text);
+    let short = unwrap(&gz);
+    assert!(short.layers[0].capped && short.inner.len() == MAX_DECODED);
+    let whole = unwrap_for(&gz, &|_| false, 2 * MAX_DECODED);
+    assert!(!whole.layers[0].capped);
+    same(&whole.inner, &text);
+    assert_eq!(whole.decoded, text.len(), "every decoded byte counted");
+}

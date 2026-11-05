@@ -155,6 +155,27 @@ impl StepCtx<'_> {
         Ok(BodyResult { message_id: wanted.message_id.clone(), got })
     }
 
+    /// An article's headers alone, as a server keeps them: for what to check before its body is fetched.
+    pub fn fetch_head(&mut self, wanted: &BodyRequest) -> Result<BodyResult, StepError> {
+        if !self.lane_can_fetch {
+            return Err(StepError::Permanent("a database step cant fetch bodies".into()));
+        }
+        let got =
+            self.bodies.fetch(&self.release, wanted, &mut self.used_bodies, self.deadline, BackgroundRead::Head)?;
+        Ok(BodyResult { message_id: wanted.message_id.clone(), got })
+    }
+
+    /// `fetch_bodies` for one article that isn't this release's, as a hop an NZB points to: nothing is kept of it
+    /// with the release, not even its CRC.
+    pub fn fetch_foreign_body(&mut self, wanted: &BodyRequest) -> Result<BodyResult, StepError> {
+        if !self.lane_can_fetch {
+            return Err(StepError::Permanent("a database step cant fetch bodies".into()));
+        }
+        let got =
+            self.bodies.fetch(&self.release, wanted, &mut self.used_bodies, self.deadline, BackgroundRead::Capped)?;
+        Ok(BodyResult { message_id: wanted.message_id.clone(), got })
+    }
+
     /// One article undecoded, with its headers, for what `BODY` leaves out.
     pub fn fetch_article(&mut self, wanted: &BodyRequest) -> Result<BodyResult, StepError> {
         self.raw(wanted, BackgroundRead::Raw)
@@ -215,6 +236,11 @@ impl StepCtx<'_> {
 
     pub fn stopping(&self) -> bool {
         self.bodies.stopping()
+    }
+
+    /// Fetches this run may still make before `postprocess.bodies_per_release` refuses them.
+    pub fn bodies_left(&self) -> i64 {
+        (self.bodies.per_release() - self.used_bodies).max(0)
     }
 
     /// run start + 120 s

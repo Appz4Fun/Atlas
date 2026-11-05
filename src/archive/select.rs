@@ -80,6 +80,12 @@ pub fn classify(filename: &str) -> Kind {
     }
 }
 
+/// A volume's set: its name without what makes it that volume. `numbered`: a `.01`/`.001` volume, as `classify`
+/// reads one; only there are two digits at the end of a name a volume number.
+pub fn set_name(filename: &str, numbered: bool) -> String {
+    if numbered { NUMBERED.replace(filename, "").into_owned() } else { strip_volume_suffix(filename).to_string() }
+}
+
 /// a family and a name without its volume suffix, and that set's files by volume
 type VolumeSet<'a> = ((u8, String), Vec<(u32, &'a FileInfo)>);
 
@@ -108,7 +114,7 @@ pub fn plan(files: &[FileInfo], probe_files: usize) -> Vec<Head<'_>> {
             _ => continue,
         };
         // `.01`, as `classify` reads it. Only here: elsewhere two digits at the end of a name are part of the name
-        let set = if family == 3 { NUMBERED.replace(&f.filename, "") } else { strip_volume_suffix(&f.filename).into() };
+        let set = set_name(&f.filename, family == 3);
         sets.entry((family, set.to_lowercase())).or_default().push((volume, f));
     }
     let mut sets: Vec<VolumeSet<'_>> = sets.into_iter().collect();

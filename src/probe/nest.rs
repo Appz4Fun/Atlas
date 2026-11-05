@@ -57,6 +57,8 @@ pub struct Nest<'a> {
     pub inner: Cow<'a, [u8]>,
     /// Where `inner` starts in the outer bytes, when every layer above it is stored.
     pub outer_at: Option<usize>,
+    /// bytes decoded across every layer, kept or not
+    pub decoded: usize,
 }
 
 /// How a layer's file inside is reached.
@@ -122,26 +124,42 @@ struct Opened {
 
 /// Follows `data` down through every archive and compressed stream it starts with.
 pub fn unwrap(data: &[u8]) -> Nest<'_> {
-    unwrap_with_password(data, None)
+    unwrap_for(data, &|_| false, MAX_DECODED)
 }
 
 /// Like [`unwrap`], decrypting RAR4/RAR5/ZIP headers and entries with `password` when present.
 pub fn unwrap_with_password<'a>(data: &'a [u8], password: Option<&str>) -> Nest<'a> {
-    unwrap_inner(data, password, false)
+    unwrap_for_with_password(data, &|_| false, MAX_DECODED, password)
 }
 
 /// Like [`unwrap_with_password`], preferring an `.nzb` entry when an archive holds multiple files.
 pub fn unwrap_nzb_with_password<'a>(data: &'a [u8], password: Option<&str>) -> Nest<'a> {
-    unwrap_inner(data, password, true)
+    unwrap_for_with_password(
+        data,
+        &|name| crate::archive::select::classify(name) == crate::archive::select::Kind::Nzb,
+        MAX_DECODED,
+        password,
+    )
 }
 
-fn unwrap_inner<'a>(data: &'a [u8], password: Option<&str>, prefer_nzb: bool) -> Nest<'a> {
+/// `unwrap`, taking in a RAR, zip or tar the biggest file whose name `want` says yes to, when there is one, over the
+/// biggest, and decoding up to `max_decoded` bytes in all rather than `MAX_DECODED`.
+pub fn unwrap_for<'a>(data: &'a [u8], want: &dyn Fn(&str) -> bool, max_decoded: usize) -> Nest<'a> {
+    unwrap_for_with_password(data, want, max_decoded, None)
+}
+
+pub fn unwrap_for_with_password<'a>(
+    data: &'a [u8],
+    want: &dyn Fn(&str) -> bool,
+    max_decoded: usize,
+    password: Option<&str>,
+) -> Nest<'a> {
     let mut layers = Vec::new();
     let mut buf: Cow<'_, [u8]> = Cow::Borrowed(data);
     let (mut lo, mut hi) = (0usize, data.len());
     let mut outer_at = Some(0usize);
-    let mut budget = MAX_DECODED;
-    while let Some(Opened { mut layer, view }) = open(&buf[lo..hi], password, budget, prefer_nzb) {
+    let mut budget = max_decoded;
+    while let Some(Opened { mut layer, view }) = open(&buf[lo..hi], want, password, budget) {
         // a name comes from the poster's bytes: keep what a name needs
         layer.name = layer.name.map(|n| cap_name(&n));
         if layers.len() == MAX_DEPTH {
@@ -213,7 +231,7 @@ fn unwrap_inner<'a>(data: &'a [u8], password: Option<&str>, prefer_nzb: bool) ->
             Cow::Owned(v)
         }
     };
-    Nest { layers, inner, outer_at }
+    Nest { layers, inner, outer_at, decoded: max_decoded - budget }
 }
 
 /// At most [`crate::archive::MAX_NAME_BYTES`], cut on a character.
@@ -273,10 +291,10 @@ fn decode(codec: Codec, input: &[u8], limit: usize) -> (Vec<u8>, End) {
 }
 
 /// What `data` starts with, when it's an archive or a compressed stream.
-fn open(data: &[u8], password: Option<&str>, budget: usize, prefer_nzb: bool) -> Option<Opened> {
+fn open(data: &[u8], want: &dyn Fn(&str) -> bool, password: Option<&str>, budget: usize) -> Option<Opened> {
     let layer = |format: &str| Layer { format: format.into(), ..Layer::default() };
     if data.starts_with(b"Rar!\x1a\x07") || data.starts_with(b"PK\x03\x04") {
-        return Some(from_entries(data, password, budget, prefer_nzb));
+        return Some(from_entries(data, want, password, budget));
     }
     if data.starts_with(b"7z\xbc\xaf\x27\x1c") {
         return Some(seven_z(data));
@@ -302,7 +320,7 @@ fn open(data: &[u8], password: Option<&str>, budget: usize, prefer_nzb: bool) ->
     if let Some(opened) = lzma_alone(data) {
         return Some(opened);
     }
-    if let Some(opened) = tar(data) {
+    if let Some(opened) = tar(data, want) {
         return Some(opened);
     }
     let decode = |format: &str, method: &str, codec| {
@@ -327,8 +345,8 @@ fn open(data: &[u8], password: Option<&str>, budget: usize, prefer_nzb: bool) ->
     None
 }
 
-/// RAR and zip: the biggest file whose bytes start in what was read (or the `.nzb` entry when `prefer_nzb` is set).
-fn from_entries(data: &[u8], password: Option<&str>, budget: usize, prefer_nzb: bool) -> Opened {
+/// RAR and zip: the biggest file whose bytes start in what was read, of those `want` names if any.
+fn from_entries(data: &[u8], want: &dyn Fn(&str) -> bool, password: Option<&str>, budget: usize) -> Opened {
     let heads = archive::entries_with_password(data, password);
     let format = if data.starts_with(b"PK") {
         "ZIP"
@@ -338,20 +356,10 @@ fn from_entries(data: &[u8], password: Option<&str>, budget: usize, prefer_nzb: 
         "RAR4"
     };
     let reachable = heads.iter().filter(|h| !h.dir && h.data_at.is_some_and(|at| at < data.len()));
-    let head = if prefer_nzb {
-        reachable
-            .clone()
-            .filter(|h| {
-                h.name
-                    .as_deref()
-                    .is_some_and(|n| crate::archive::select::classify(n) == crate::archive::select::Kind::Nzb)
-            })
-            .max_by_key(|h| (h.unpacked.or(h.packed).unwrap_or(0), std::cmp::Reverse(h.data_at)))
-            .or_else(|| reachable.max_by_key(|h| (h.unpacked.or(h.packed).unwrap_or(0), std::cmp::Reverse(h.data_at))))
-    } else {
-        reachable.max_by_key(|h| (h.unpacked.or(h.packed).unwrap_or(0), std::cmp::Reverse(h.data_at)))
-    };
-    let Some(head) = head else {
+    let wanted = |h: &&archive::ArchiveHead| h.name.as_deref().is_some_and(want);
+    let Some(head) =
+        reachable.max_by_key(|h| (wanted(h), h.unpacked.or(h.packed).unwrap_or(0), std::cmp::Reverse(h.data_at)))
+    else {
         let mut layer = Layer { format: format.into(), ..Layer::default() };
         let encrypted = heads.iter().any(|h| h.headers_encrypted);
         layer.encrypted = encrypted;
@@ -835,8 +843,8 @@ fn lzma_alone(data: &[u8]) -> Option<Opened> {
 }
 
 /// tar: 512 byte headers, each file's bytes after its own, stored. The biggest file whose bytes start in what was
-/// read, with GNU and pax long names.
-fn tar(data: &[u8]) -> Option<Opened> {
+/// read, of those `want` names if any, with GNU and pax long names.
+fn tar(data: &[u8], want: &dyn Fn(&str) -> bool) -> Option<Opened> {
     let first = data.get(..512)?;
     if !tar_checksum_ok(first) {
         return None;
@@ -844,7 +852,7 @@ fn tar(data: &[u8]) -> Option<Opened> {
     let mut at = 0usize;
     let mut long_name: Option<String> = None;
     let mut long_size: Option<u64> = None;
-    let mut best: Option<(u64, usize, String)> = None;
+    let mut best: Option<(bool, u64, usize, String)> = None;
     for _ in 0..256 {
         let Some(h) = data.get(at..at + 512) else { break };
         if h.iter().all(|b| *b == 0) || !tar_checksum_ok(h) {
@@ -874,8 +882,9 @@ fn tar(data: &[u8]) -> Option<Opened> {
                     let name = cstr(&h[..100]);
                     if prefix.is_empty() { name } else { format!("{prefix}/{name}") }
                 });
-                if body < data.len() && best.as_ref().is_none_or(|(s, _, _)| size > *s) {
-                    best = Some((size, body, name));
+                let wanted = want(&name);
+                if body < data.len() && best.as_ref().is_none_or(|(w, s, _, _)| (wanted, size) > (*w, *s)) {
+                    best = Some((wanted, size, body, name));
                 }
             }
             _ => {
@@ -889,7 +898,7 @@ fn tar(data: &[u8]) -> Option<Opened> {
         at = next;
     }
     let mut layer = Layer { format: "TAR".into(), method: Some("store".into()), ..Layer::default() };
-    let Some((size, from, name)) = best else {
+    let Some((_, size, from, name)) = best else {
         return Some(Opened { layer, view: View::Stop("no file starts in what was read") });
     };
     layer.name = Some(name);
