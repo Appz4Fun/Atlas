@@ -78,6 +78,14 @@ pub fn release_of(spot: &FullSpot, nzb: &Parsed) -> Option<Release> {
     })
 }
 
+/// Gives a release, and each of its articles, another name.
+pub fn rename(release: &mut Release, name: &str) {
+    release.name = name.to_string();
+    for article in &mut release.articles {
+        article.release_name = Some(name.to_string());
+    }
+}
+
 /// What an NZB holds, whatever order it lists its files in: a SHA-256 of its message-ids, sorted, hex.
 pub fn nzb_key(nzb: &Parsed) -> String {
     use sha2::{Digest, Sha256};
@@ -164,6 +172,14 @@ mod tests {
             ]
         );
         assert!(r.articles.iter().all(|a| a.release_name.as_deref() == Some("Movie (2026) 1080p")));
+    }
+
+    #[test]
+    fn a_rename_reaches_every_article() {
+        let mut r = release_of(&spot(), &parse_keeping(NZB.as_bytes(), MAX_SEGMENTS)).unwrap();
+        rename(&mut r, "Movie (2026) 1080p [0123abcd]");
+        assert_eq!(r.name, "Movie (2026) 1080p [0123abcd]");
+        assert!(r.articles.iter().all(|a| a.release_name.as_deref() == Some("Movie (2026) 1080p [0123abcd]")));
     }
 
     #[test]

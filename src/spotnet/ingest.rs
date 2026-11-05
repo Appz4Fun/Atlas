@@ -155,7 +155,7 @@ async fn fetch(pool: &Pool, db: &Db, message_id: &str) -> Result<Option<i64>> {
         return Ok(None);
     }
 
-    let (name, group) = (release.name.clone(), release.group.clone());
+    let group = release.group.clone();
     let shard = crate::store::shard_of(&group);
     let spotter_id = header::spotter_id_of_head(&head);
     let nzb_key = release::nzb_key(&parsed);
@@ -167,6 +167,16 @@ async fn fetch(pool: &Pool, db: &Db, message_id: &str) -> Result<Option<i64>> {
     if copy.is_some() {
         return Ok(copy);
     }
+    // another upload already saved under this spot title and group: this one gets a name of its own, rather than
+    // having its articles folded into that release
+    let (check_name, check_group, key) = (release.name.clone(), group.clone(), row.nzb_key.clone());
+    let taken = on_shard(db, shard, move |conn| store::name_taken(conn, &check_name, &check_group, &key)).await?;
+    let mut release = release;
+    if taken {
+        let own = format!("{} [{}]", release.name, &row.nzb_key[..8]);
+        release::rename(&mut release, &own);
+    }
+    let name = release.name.clone();
     db.save(vec![release]).await?;
     // tagged on its shard's writer after the save: the save doesn't say which id the release got
     on_shard(db, shard, move |conn| store::tag(conn, &name, &group, &row)).await

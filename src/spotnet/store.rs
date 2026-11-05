@@ -155,11 +155,32 @@ pub fn tag_copy(conn: &Connection, row: &SpotRow) -> Result<Option<i64>> {
     Ok(Some(id))
 }
 
+/// Whether the release named `name` in `group` came from a spot with another NZB: then a spot of the same title
+/// and group is another upload, and must not be folded into it.
+pub fn name_taken(conn: &Connection, name: &str, group: &str, nzb_key: &str) -> Result<bool> {
+    let other: Option<String> = conn
+        .query_row(
+            "select s.nzb_key from releases r join spots s on s.release_id = r.id
+             where r.name = ? and r.group_name = ? and s.nzb_key is not ?",
+            params![name, group, nzb_key],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(other.is_some())
+}
+
+/// The release's spot row, unless it already has a newer spot (by when the spot was made): spots are fetched
+/// newest first, so an older copy of a spot comes after the edit that replaced it.
 fn put(conn: &Connection, release_id: i64, row: &SpotRow) -> Result<()> {
     let spot = &row.spot;
     conn.execute(
-        "insert or replace into spots (release_id, message_id, kind, title, poster, tag, spotter_id, category,
-            subcats, size, imdb_id, created, nzb_key) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "insert into spots (release_id, message_id, kind, title, poster, tag, spotter_id, category,
+            subcats, size, imdb_id, created, nzb_key) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         on conflict(release_id) do update set message_id = excluded.message_id, kind = excluded.kind,
+            title = excluded.title, poster = excluded.poster, tag = excluded.tag, spotter_id = excluded.spotter_id,
+            category = excluded.category, subcats = excluded.subcats, size = excluded.size,
+            imdb_id = excluded.imdb_id, created = excluded.created, nzb_key = excluded.nzb_key
+         where coalesce(excluded.created, 0) >= coalesce(spots.created, 0)",
         params![
             release_id,
             row.message_id,
@@ -261,5 +282,30 @@ mod tests {
         // a release that went (junk) leaves its spot row behind for the trigger, not for copies
         conn.execute("delete from releases where id = 5", []).unwrap();
         assert_eq!(tag_copy(&conn, &row).unwrap(), None);
+    }
+
+    #[test]
+    fn an_older_copy_keeps_the_newer_spot_and_another_nzb_takes_the_name() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("create table releases (id INTEGER PRIMARY KEY, name TEXT, group_name TEXT)").unwrap();
+        conn.execute("insert into releases values (5, 'Movie (2026)', 'g')", []).unwrap();
+        conn.execute_batch(SPOTS.create).unwrap();
+        let spot = |title: &str, created| FullSpot { title: title.into(), created, ..FullSpot::default() };
+        let row = |id: &str, title, created| SpotRow {
+            message_id: id.into(),
+            kind: Kind::Movie,
+            spot: spot(title, created),
+            spotter_id: None,
+            nzb_key: "k1".into(),
+        };
+        assert!(!name_taken(&conn, "Movie (2026)", "g", "k1").unwrap());
+        assert_eq!(tag(&conn, "Movie (2026)", "g", &row("new@spot.net", "Edited", 200)).unwrap(), Some(5));
+        assert_eq!(tag_copy(&conn, &row("old@spot.net", "Original", 100)).unwrap(), Some(5));
+        let title: String = conn.query_row("select title from spots", [], |r| r.get(0)).unwrap();
+        assert_eq!(title, "Edited");
+        // the same title with another NZB is another upload; the same NZB isn't
+        assert!(name_taken(&conn, "Movie (2026)", "g", "k2").unwrap());
+        assert!(!name_taken(&conn, "Movie (2026)", "g", "k1").unwrap());
+        assert!(!name_taken(&conn, "Movie (2026)", "other", "k2").unwrap());
     }
 }
