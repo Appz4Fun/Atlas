@@ -35,7 +35,7 @@ pub const FREEZE_PENDING: ShardTable = ShardTable {
         reason     TEXT NOT NULL,
         at         INTEGER NOT NULL
     )",
-    indexes: &[],
+    indexes: &[("freeze_pending_at", "create index if not exists freeze_pending_at on freeze_pending(at)")],
     release_key: Some("release_id"),
     added: &[],
 };
@@ -61,6 +61,10 @@ pub static PER_TICK: AtomicI64 = AtomicI64::new(200);
 pub static TICK_MS: AtomicI64 = AtomicI64::new(50);
 /// `[freeze] min_free_gb`, in bytes: below this much free disk nothing is moved
 pub static MIN_FREE_BYTES: AtomicI64 = AtomicI64::new(100 << 30);
+/// `[freeze] wait_hours`, in seconds: how long a release waits queued, untouched, before it moves. Every visit that
+/// still finds it matching queues it afresh, soo it moves once its steps are done and late articles and PreDB titles
+/// have had their time.
+pub static WAIT_SECS: AtomicI64 = AtomicI64::new(12 * 3600);
 
 /// a writer ticks at most this often, soo saves keep the writer
 const TICK_EVERY: Duration = Duration::from_secs(1);
@@ -74,6 +78,7 @@ pub fn configure(cfg: &crate::config::FreezeConfig) {
     PER_TICK.store(cfg.per_tick.max(1), Relaxed);
     TICK_MS.store(cfg.tick_ms.max(1), Relaxed);
     MIN_FREE_BYTES.store(cfg.min_free_gb.max(0).saturating_mul(1 << 30), Relaxed);
+    WAIT_SECS.store(cfg.wait_hours.max(0).saturating_mul(3600), Relaxed);
 }
 
 /// `atlas.s3.db` -> `atlas.s3.frozen.db`
@@ -357,12 +362,13 @@ pub struct Moved {
 /// A release a tick copied into the frozen file: its id, and its size and parts as copied.
 pub type Copied = (i64, Option<i64>, Option<i64>);
 
-/// Move up to `limit` queued releases, newest first, for about `budget`. Two transactions on `conn` (the shard's
-/// writer with its frozen file attached): the frozen rows (`copy`), then the live rows gone (`drop_copied`).
-pub fn freeze_some(conn: &Connection, limit: usize, budget: Duration, now: i64) -> Result<Moved> {
+/// Move up to `limit` releases queued at `ready` or before, longest queued first, for about `budget`. Two
+/// transactions on `conn` (the shard's writer with its frozen file attached): the frozen rows (`copy`), then the live
+/// rows gone (`drop_copied`).
+pub fn freeze_some(conn: &Connection, limit: usize, budget: Duration, ready: i64, now: i64) -> Result<Moved> {
     let queued: Vec<(i64, String)> = conn
-        .prepare_cached("select release_id, reason from freeze_pending order by release_id desc limit ?1")?
-        .query_map([limit as i64], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .prepare_cached("select release_id, reason from freeze_pending where at <= ?1 order by at limit ?2")?
+        .query_map(params![ready, limit as i64], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<Result<_>>()?;
     if queued.is_empty() {
         return Ok(Moved::default());
@@ -487,7 +493,7 @@ impl Ticker {
         }
         let limit = PER_TICK.load(Relaxed).max(1) as usize;
         let budget = Duration::from_millis(TICK_MS.load(Relaxed).max(1) as u64);
-        freeze_some(conn, limit, budget, now)
+        freeze_some(conn, limit, budget, now.saturating_sub(WAIT_SECS.load(Relaxed)), now)
     }
 }
 

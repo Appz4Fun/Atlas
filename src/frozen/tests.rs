@@ -73,7 +73,7 @@ fn meta(conn: &Connection, key: &str) -> i64 {
 }
 
 fn freeze_all(conn: &Connection) -> Moved {
-    freeze_some(conn, 1_000, Duration::from_secs(60), NOW).unwrap()
+    freeze_some(conn, 1_000, Duration::from_secs(60), i64::MAX, NOW).unwrap()
 }
 
 /// the articles of `id` as an NZB lists them, from the live shard
@@ -378,6 +378,21 @@ fn nothing_moves_while_the_disk_is_short() {
     let mut ticker = Ticker { disk: Some((Instant::now(), true)), ..Ticker::default() };
     assert_eq!(ticker.tick(&conn, NOW).unwrap().frozen, 1);
     assert_eq!(ticker.tick(&conn, NOW).unwrap(), Moved::default(), "a tick a second at most");
+}
+
+#[test]
+fn a_release_waits_its_hours_queued_before_it_moves() {
+    let f = Fixture::new();
+    f.save(&[post("Fresh", &["b.mkv"], 1, 10)]);
+    let conn = f.writer();
+    assert!(rules::evaluate(&conn, f.id(&conn, "Fresh"), NOW).unwrap());
+    let tick = |now: i64| Ticker { disk: Some((Instant::now(), true)), ..Ticker::default() }.tick(&conn, now).unwrap();
+    let wait = WAIT_SECS.load(Relaxed);
+    assert_eq!(tick(NOW + wait - 1), Moved::default(), "still in its wait");
+    // a visit that finds it matching still starts its wait again
+    assert!(rules::evaluate(&conn, f.id(&conn, "Fresh"), NOW + wait - 1).unwrap());
+    assert_eq!(tick(NOW + wait), Moved::default());
+    assert_eq!(tick(NOW + 2 * wait).frozen, 1);
 }
 
 #[test]

@@ -392,6 +392,8 @@ pub struct FreezeConfig {
     pub tick_ms: i64,
     /// below this much free disk nothing is moved, GB
     pub min_free_gb: i64,
+    /// how long a release waits queued and untouched before it moves, hours
+    pub wait_hours: i64,
 }
 
 impl Default for FreezeConfig {
@@ -403,6 +405,7 @@ impl Default for FreezeConfig {
             per_tick: 200,
             tick_ms: 50,
             min_free_gb: 100,
+            wait_hours: 12,
         }
     }
 }
@@ -420,6 +423,7 @@ impl FreezeConfig {
         int("per_tick", &mut c.per_tick, 1);
         int("tick_ms", &mut c.tick_ms, 1);
         int("min_free_gb", &mut c.min_free_gb, 0);
+        int("wait_hours", &mut c.wait_hours, 0);
         let flag = |key: &str, slot: &mut bool| {
             if let Some(b) = v.get(key).and_then(as_bool) {
                 *slot = b;
