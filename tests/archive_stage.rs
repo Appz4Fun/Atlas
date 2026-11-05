@@ -1014,9 +1014,9 @@ fn a_posted_nzb_is_followed_through_a_small_post_whose_rar_holds_the_next_nzb() 
     );
     settled(&h, "x");
     assert_eq!(
-        (bodies(&state), state.articles_sent.load(Ordering::SeqCst)),
-        (1, 1),
-        "the NZB, then the hop's one article with its headers, not the big upload"
+        (bodies(&state), state.heads_sent.load(Ordering::SeqCst)),
+        (2, 1),
+        "the NZB, then the hop's one article after its headers, not the big upload"
     );
     let found: Vec<(String, i64)> = rows(&h, "x").into_iter().map(|r| (r.name, r.source)).collect();
     assert_eq!(
@@ -1047,9 +1047,9 @@ fn a_small_rars_nzb_is_read_whole_not_only_its_first_article() {
     );
     settled(&h, "x");
     assert_eq!(
-        (bodies(&state), state.articles_sent.load(Ordering::SeqCst)),
-        (1, 1),
-        "the head, then the article after it"
+        (bodies(&state), state.heads_sent.load(Ordering::SeqCst)),
+        (2, 0),
+        "the head, then the article after it: the release's own, no headers asked for"
     );
     let nzb_rows: Vec<String> = rows(&h, "x").into_iter().filter(|r| r.source == 5).map(|r| r.name).collect();
     assert!(nzb_rows.contains(&"Other.Thing.2024.mkv".to_string()), "{nzb_rows:?}");
@@ -1118,4 +1118,24 @@ fn a_small_release_whose_archive_has_no_name_to_go_by_is_read_whole() {
     settled(&h, &s.name);
     let nzb_rows: Vec<String> = rows(&h, &s.name).into_iter().filter(|r| r.source == 5).map(|r| r.name).collect();
     assert!(nzb_rows.contains(&"Other.Thing.2024.mkv".to_string()), "{nzb_rows:?}");
+}
+
+#[test]
+fn a_next_nzb_posted_as_plain_text_is_followed() {
+    let mut h = fresh();
+    let first = an_nzb_of(&[("Next.nzb (1/1)", &[(2_000, "plain1@x")])]);
+    let s = shape("x").one("x.nzb", &first);
+    h.save(&[s.release()]);
+    let mut posts = s.posts.clone();
+    let lines: Vec<Vec<u8>> = last_hop().split(|b| *b == b'\n').map(<[u8]>::to_vec).collect();
+    posts.push(Post { message_id: "<plain1@x>".into(), ..post(91, "\"Next.nzb\" (1/1)", 2_000, lines) });
+    let state = Server::new(posts);
+    start_with(
+        &mut h,
+        spawn_server(state.clone()),
+        config(),
+        vec![Arc::new(atlas::archive::steps::ListStep::default())],
+    );
+    settled(&h, "x");
+    assert!(names_of(&h).contains(&"Final.Movie.2024.2160p-GRP.part01.rar".to_string()), "{:?}", names_of(&h));
 }

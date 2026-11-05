@@ -157,6 +157,10 @@ fn deep_nzb(
     let Some(found) = follow::nzb_inside(ctx, first, &wholes, None, known, &mut left)? else {
         return Ok(None);
     };
+    // too big to be read as a list here: the first article's part of it still is, by the caller
+    if found.len() > follow::MAX_FOLLOWED_NZB {
+        return Ok(None);
+    }
     let complete = nzb::parse(&found).complete;
     Ok(Some(Listing { files: follow::follow(ctx, found, &mut left)?, complete, ..Default::default() }))
 }
@@ -182,7 +186,7 @@ fn own_whole(ctx: &StepCtx<'_>, file: &FileInfo) -> Result<Option<follow::Whole>
     if ids.len() as i64 != parts {
         return Ok(None);
     }
-    Ok(Some(follow::Whole { name: file.filename.clone(), ids: ids.into_values().collect() }))
+    Ok(Some(follow::Whole { name: file.filename.clone(), ids: ids.into_values().collect(), trusted: true }))
 }
 
 /// An archive's outcome with the list of the NZB inside it beside its own rows, in the same writes. The archive's

@@ -45,6 +45,8 @@ impl Budget {
 pub struct Whole {
     pub name: String,
     pub ids: Vec<String>,
+    /// the release's own file, in its group: read without asking a server which groups its articles are in first
+    pub trusted: bool,
 }
 
 impl Whole {
@@ -60,7 +62,8 @@ impl Whole {
         }
         segments.sort_by_key(|s| s.number);
         segments.dedup_by_key(|s| s.number);
-        Some(Whole { name: file.name.clone(), ids: segments.iter().map(|s| format!("<{}>", s.message_id)).collect() })
+        let ids = segments.iter().map(|s| format!("<{}>", s.message_id)).collect();
+        Some(Whole { name: file.name.clone(), ids, trusted: false })
     }
 }
 
@@ -79,7 +82,7 @@ pub fn follow(ctx: &mut StepCtx<'_>, first: Vec<u8>, left: &mut Budget) -> Resul
     let mut hops: Vec<Vec<InnerFile>> = Vec::new();
     let mut inside: Vec<InnerFile> = Vec::new();
     let mut body = first;
-    for _ in 0..MAX_HOPS {
+    for hop in 1..=MAX_HOPS {
         if body.len() > MAX_FOLLOWED_NZB {
             break;
         }
@@ -87,8 +90,8 @@ pub fn follow(ctx: &mut StepCtx<'_>, first: Vec<u8>, left: &mut Budget) -> Resul
         let mut rows = std::mem::take(&mut inside);
         rows.extend(parsed.files.iter().map(|f| InnerFile { name: f.name.clone(), size: Some(f.bytes()) }));
         hops.push(rows);
-        // a cut NZB doesn't say what all of its post is
-        if !parsed.complete || !small(&parsed.files) {
+        // a cut NZB doesn't say what all of its post is; and past the last hop nothing more would be listed
+        if !parsed.complete || !small(&parsed.files) || hop == MAX_HOPS {
             break;
         }
         let wholes: Vec<Whole> = parsed.files.iter().filter_map(Whole::of).collect();
@@ -243,22 +246,32 @@ fn download_set(
                         return Ok(None);
                     }
                     left.articles -= 1;
-                    // with its headers: the groups an NZB names are the poster's word, the article's are the server's
                     let wanted =
                         BodyRequest { message_id: id.clone(), file: file.name.clone(), max_bytes: Some(ARTICLE_CAP) };
-                    let got = match ctx.fetch_article(&wanted) {
-                        Ok(got) => got.got,
+                    let fetched = if file.trusted {
+                        ctx.fetch_bodies(std::slice::from_ref(&wanted)).map(|mut got| got.pop().map(|b| b.got))
+                    } else {
+                        // its headers first: the groups an NZB names are the poster's word, the article's the server's
+                        match ctx.fetch_head(&wanted) {
+                            Ok(head) => match head.got {
+                                Got::Body(head)
+                                    if posted_where_allowed(&crate::probe::yenc::split_article(&head).headers) =>
+                                {
+                                    ctx.fetch_foreign_body(&wanted).map(|b| Some(b.got))
+                                }
+                                _ => return Ok(None),
+                            },
+                            Err(e) => Err(e),
+                        }
+                    };
+                    let got = match fetched {
+                        Ok(got) => got,
                         Err(e @ (StepError::Stopped | StepError::Transient(_) | StepError::OutOfBudget)) => {
                             return Err(e);
                         }
                         Err(_) => return Ok(None),
                     };
-                    let Got::Body(raw) = got else { return Ok(None) };
-                    let article = crate::probe::yenc::split_article(&raw);
-                    if !posted_where_allowed(&article.headers) {
-                        return Ok(None);
-                    }
-                    let Some(body) = crate::nntp::yenc_decode(&article.lines) else { return Ok(None) };
+                    let Some(Got::Body(body)) = got else { return Ok(None) };
                     body
                 }
             };
@@ -295,7 +308,7 @@ mod tests {
     use super::*;
 
     fn whole(name: &str) -> Whole {
-        Whole { name: name.into(), ids: vec![format!("<{name}@x>")] }
+        Whole { name: name.into(), ids: vec![format!("<{name}@x>")], trusted: false }
     }
 
     #[test]
