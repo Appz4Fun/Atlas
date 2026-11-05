@@ -237,8 +237,8 @@ pub fn collect(conn: &Connection, id: i64) -> Result<Option<(Summary, Payload)>>
         tables.extend(t.filter(|t| !t.rows.is_empty()));
     }
 
-    // the domains its articles use, by their text: loose rows, and blobs kept in the shard (one in the sealed log
-    // keeps its own, read back as it is)
+    // the domains its articles use, by their text: loose rows, and blobs, fetched from the sealed log for one kept
+    // there (its segments hold the shard's domain ids, which the log knows nothing of)
     let mut used: BTreeSet<i64> = BTreeSet::new();
     if let Some(segments) = tables.iter().find(|t| t.name == "segments")
         && let Some(c) = segments.column("domain")
@@ -247,9 +247,7 @@ pub fn collect(conn: &Connection, id: i64) -> Result<Option<(Summary, Payload)>>
     }
     let blob_col = tables[1].column("blob");
     for row in &tables[1].rows {
-        if let Some(Value::Blob(b)) = blob_col.map(|c| &row[c])
-            && !crate::blob::is_remote(b)
-        {
+        if let Some(Value::Blob(b)) = blob_col.map(|c| &row[c]) {
             let segs = crate::blob::decode(b).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
             used.extend(segs.iter().map(|s| s.domain));
         }
@@ -397,7 +395,22 @@ pub fn copy(
         if (!copied.is_empty() || !dropped.is_empty()) && started.elapsed() >= budget {
             break;
         }
-        match collect(conn, *id)? {
+        // what it is now: late articles since it was queued may have taken it out of the rules
+        if !rules::still(conn, *id)? {
+            dropped.push(*id);
+            continue;
+        }
+        let collected = match collect(conn, *id) {
+            Ok(c) => c,
+            // a sealed log that can't be read now: it waits its turn again rather than holding up the rest
+            Err(e) => {
+                eprintln!("couldnt collect release {id} for freezing: {e}");
+                conn.prepare_cached("update freeze_pending set at = ?2 where release_id = ?1")?
+                    .execute(params![id, now])?;
+                continue;
+            }
+        };
+        match collected {
             None => dropped.push(*id),
             Some((s, p)) => match write(conn, &s, &p, reason, now)? {
                 Written::Written => copied.push((*id, s.size, s.parts)),
@@ -556,12 +569,27 @@ fn insert_rows(
     Ok(())
 }
 
-/// A payload's rows into `schema` (`main`, the live shard, or a scratch copy that has only some of the tables):
-/// files get new ids, soo they can't meet files saved since, and the domains its articles use are looked up by their
-/// text. Returns the release's articles for the shard's totals.
-pub fn restore(conn: &Connection, schema: &str, p: &Payload) -> Result<i64> {
+/// How a restore takes a payload's message-id domains.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Domains {
+    /// into a live shard: looked up by their text, and the ids in blobs changed to match (a blob in the sealed log is
+    /// fetched and kept in the shard when they differ)
+    Map,
+    /// into a scratch copy of its own shard: with the ids they had, blobs as they are
+    Keep,
+}
+
+/// A payload's rows into `schema` (`main`, the live shard, or a scratch copy that may have only some of the tables):
+/// files get new ids, soo they can't meet files saved since. Returns the release's articles for the shard's totals.
+pub fn restore(conn: &Connection, schema: &str, p: &Payload, how: Domains) -> Result<i64> {
     let mut domain_of: HashMap<i64, i64> = HashMap::new();
     for (old, suffix) in &p.domains {
+        if how == Domains::Keep {
+            conn.prepare_cached(&format!("insert or ignore into {schema}.domains (id, suffix) values (?1, ?2)"))?
+                .execute(params![old, suffix])?;
+            domain_of.insert(*old, *old);
+            continue;
+        }
         let found: Option<i64> = conn
             .prepare_cached(&format!("select id from {schema}.domains where suffix = ?1"))?
             .query_row([suffix], |r| r.get(0))
@@ -594,7 +622,7 @@ pub fn restore(conn: &Connection, schema: &str, p: &Payload) -> Result<i64> {
             "insert",
             &["id"],
             &mut |c, v| match (c, v) {
-                ("blob", Value::Blob(b)) if !same_domains && !crate::blob::is_remote(&b) => {
+                ("blob", Value::Blob(b)) if !same_domains => {
                     let mut segs =
                         crate::blob::decode(&b).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
                     for s in &mut segs {
@@ -661,7 +689,7 @@ pub fn thaw(conn: &Connection, id: i64, exempt: bool, now: i64) -> Result<Thawed
             return Ok(Thawed::NameTaken);
         }
         let p = payload::decode(&packed).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
-        let parts = restore(conn, "main", &p)?;
+        let parts = restore(conn, "main", &p, Domains::Map)?;
         crate::store::add_totals(conn, 1, parts.max(0))?;
         Thawed::Restored
     };
@@ -810,7 +838,7 @@ pub fn nzb(main: &Path, id: i64) -> anyhow::Result<Option<(ReleaseRow, String)>>
     let conn = Connection::open_in_memory()?;
     conn.execute("attach database ':memory:' as ?1", [&s])?;
     conn.execute_batch(&SCRATCH.replace("{s}", &s))?;
-    restore(&conn, &s, &p)?;
+    restore(&conn, &s, &p, Domains::Keep)?;
     let Some(release) = crate::search::get_release_with(&conn, id)? else { return Ok(None) };
     let articles = crate::store::articles(&conn, id)?;
     if articles.is_empty() {
@@ -818,6 +846,39 @@ pub fn nzb(main: &Path, id: i64) -> anyhow::Result<Option<(ReleaseRow, String)>>
     }
     let body = crate::nzb::render_nzb_in(&release, &articles, std::slice::from_ref(&release.group_name));
     Ok(Some((release, body)))
+}
+
+/// Shard `shard`'s frozen releases back in a shard of their own (`atlas.s3.unfrozen.db`, made afresh), for what reads
+/// a shard's tables: a reset harvests their enrichments from it. Blobs stay as they are. None: no frozen file. A
+/// payload that won't read is an error, soo a reset stops rather than lose what it holds.
+pub fn unfrozen_copy(main: &Path, shard: usize) -> anyhow::Result<Option<PathBuf>> {
+    let Some(frozen) = open_read(main, shard) else { return Ok(None) };
+    let copy = crate::compact::with_suffix(&crate::store::shard_path(main, shard), "unfrozen");
+    remove_family(&copy)?;
+    crate::store::create_shard(&copy)?;
+    let conn = crate::db::open_shard(&copy)?;
+    crate::postprocess::schema::migrate(&conn)?;
+    let tx = conn.unchecked_transaction()?;
+    let mut stmt = frozen.prepare("select id, payload from frozen_releases order by id")?;
+    let mut rows = stmt.query([])?;
+    while let Some(r) = rows.next()? {
+        let (id, packed): (i64, Vec<u8>) = (r.get(0)?, r.get(1)?);
+        let p = payload::decode(&packed).map_err(|e| anyhow::anyhow!("frozen release {id}: {e}"))?;
+        restore(&tx, "main", &p, Domains::Keep)?;
+    }
+    tx.commit()?;
+    Ok(Some(copy))
+}
+
+/// A database file and its journals gone.
+pub fn remove_family(base: &Path) -> std::io::Result<()> {
+    for suffix in ["", "-wal", "-shm", "-journal"] {
+        match std::fs::remove_file(format!("{}{suffix}", base.display())) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 /// Frozen releases per shard and reason.
@@ -842,6 +903,14 @@ pub fn run_thaw(args: &[String]) -> i32 {
         println!("usage: atlas --thaw RELEASE_ID...");
         return 1;
     }
+    // a compaction swapping a shard in under a thaw would lose what it restored
+    let _writing = match crate::compact::hold_off_compaction(&main) {
+        Ok(held) => held,
+        Err(e) => {
+            println!("{e}");
+            return 1;
+        }
+    };
     let mut code = 0;
     for id in ids {
         let shard = crate::store::shard_path(&main, crate::store::shard_of_id(id));

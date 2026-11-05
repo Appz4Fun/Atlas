@@ -218,26 +218,34 @@ fn a_database_lane_visit_queues_a_release_for_freezing() {
 #[test]
 fn late_articles_thaw_their_release_and_join_it() {
     let f = Fixture::new();
-    let mut first = post("Late.Post", &["a.rar"], 3, 100);
-    first.articles.truncate(2);
-    first.complete = false;
-    f.save(&[first]);
+    f.save(&[post("Late.Post", &["a.rar"], 3, 100)]);
     let conn = f.writer();
     let id = f.id(&conn, "Late.Post");
-    conn.execute("insert into freeze_pending (release_id, reason, at) values (?1, 'test', 1)", [id]).unwrap();
+    assert!(rules::evaluate(&conn, id, NOW).unwrap());
     assert_eq!(freeze_all(&conn).frozen, 1);
     assert_eq!(count(&conn, "select count(*) from releases"), 0);
     drop(conn);
 
-    let mut last = post("Late.Post", &["a.rar"], 3, 100);
-    last.articles.drain(..2);
-    f.save(&[last]);
+    // another file of the post, late
+    f.save(&[post("Late.Post", &["b.rar"], 2, 100)]);
     let conn = f.writer();
     assert_eq!(count(&conn, "select count(*) from frozen.frozen_releases"), 0, "thawed");
     assert_eq!(f.id(&conn, "Late.Post"), id, "the same release");
-    assert_eq!(count(&conn, "select parts from releases"), 3);
-    assert_eq!(count(&conn, "select complete from releases"), 1, "complete with what came late");
-    assert_eq!(live_articles(&f.main, id).len(), 3);
+    assert_eq!(count(&conn, "select parts from releases"), 5);
+    assert_eq!(live_articles(&f.main, id).len(), 5);
+}
+
+#[test]
+fn a_release_that_left_the_rules_after_it_was_queued_stays_live() {
+    let f = Fixture::new();
+    f.save(&[post("Grew", &["a.rar"], 1, 100)]);
+    let conn = f.writer();
+    let id = f.id(&conn, "Grew");
+    assert!(rules::evaluate(&conn, id, NOW).unwrap());
+    conn.execute("update releases set size = 2000000000 where id = ?1", [id]).unwrap();
+    assert_eq!(freeze_all(&conn), Moved { dropped: 1, ..Moved::default() });
+    assert_eq!(count(&conn, "select count(*) from releases"), 1);
+    assert_eq!(count(&conn, "select count(*) from freeze_pending"), 0);
 }
 
 #[test]
@@ -258,7 +266,7 @@ fn a_crash_between_the_steps_loses_nothing() {
     assert_eq!(count(&conn, "select count(*) from releases"), 0);
 
     // a thaw cut short leaves both: the live one wins
-    restore(&conn, "main", &collect_frozen(&conn, id)).unwrap();
+    restore(&conn, "main", &collect_frozen(&conn, id), Domains::Map).unwrap();
     assert_eq!(thaw(&conn, id, false, NOW).unwrap(), Thawed::AlreadyLive);
     assert_eq!(count(&conn, "select count(*) from frozen.frozen_releases"), 0);
     assert_eq!(count(&conn, "select count(*) from releases"), 1);
@@ -412,4 +420,43 @@ fn a_shard_without_its_frozen_file_saves_as_before() {
     assert!(!attached(&conn).unwrap());
     assert!(!path(&f.shard_path()).exists(), "only the indexer's writer makes the frozen file");
     assert_eq!(count(&conn, "select count(*) from releases"), 1);
+}
+
+#[test]
+fn a_save_outside_the_indexer_thaws_too() {
+    let f = Fixture::new();
+    f.save(&[post("Fetched", &["a.rar"], 2, 100)]);
+    let conn = f.writer();
+    let id = f.id(&conn, "Fetched");
+    assert!(rules::evaluate(&conn, id, NOW).unwrap());
+    assert_eq!(freeze_all(&conn).frozen, 1);
+    drop(conn);
+    // as a search that fetches headers saves them
+    store::save(&f.main, &[post("Fetched", &["b.rar"], 1, 100)]).unwrap();
+    let conn = f.writer();
+    assert_eq!(count(&conn, "select count(*) from frozen.frozen_releases"), 0, "thawed");
+    assert_eq!(count(&conn, "select count(*) from releases"), 1, "one copy");
+    assert_eq!(count(&conn, "select parts from releases"), 3);
+}
+
+#[test]
+fn a_reset_harvests_what_frozen_releases_hold() {
+    let f = Fixture::new();
+    f.save(&[post("Kept", &["a.rar"], 2, 100), post("Live", &["b.rar"], 1, 100)]);
+    let conn = f.writer();
+    let id = f.id(&conn, "Kept");
+    conn.execute("insert into release_category (release_id, category) values (?1, 7020)", [id]).unwrap();
+    assert!(rules::evaluate(&conn, id, NOW).unwrap());
+    assert_eq!(freeze_all(&conn).frozen, 1);
+    let shard = store::shard_of(G);
+    let copy = unfrozen_copy(&f.main, shard).unwrap().expect("a frozen file");
+    let back = db::open_shard(&copy).unwrap();
+    assert_eq!(count(&back, "select id from releases"), id, "only the frozen ones");
+    assert_eq!(count(&back, "select count(*) from files"), 1);
+    assert_eq!(count(&back, "select category from release_category"), 7020);
+    drop(back);
+    remove_family(&copy).unwrap();
+    crate::raw_store::harvest_from_shards(&f.main, &|_| {}).unwrap();
+    assert!(!copy.exists(), "the harvest's copy is gone after");
+    assert_eq!(unfrozen_copy(&f.main, (shard + 1) % store::SHARDS).unwrap(), None, "no frozen file, nothing to read");
 }

@@ -2603,6 +2603,21 @@ pub fn harvest_from_shards(main: &Path, log: &dyn Fn(&str)) -> anyhow::Result<()
         let detach_res = conn.execute("DETACH DATABASE sh", []);
         res.with_context(|| format!("harvesting {}", shard_path.display()))?;
         detach_res.with_context(|| format!("detaching {}", shard_path.display()))?;
+        // its frozen releases' rows left the shard: harvested from a shard made of them
+        let Some(unfrozen) = crate::frozen::unfrozen_copy(main, shard_idx)
+            .with_context(|| format!("reading shard s{shard_idx}'s frozen releases"))?
+        else {
+            continue;
+        };
+        log(&format!("harvesting shard s{shard_idx}'s frozen releases ({})...", unfrozen.display()));
+        conn.execute("ATTACH DATABASE ?1 AS sh", [unfrozen.to_string_lossy().as_ref()])
+            .with_context(|| format!("attaching {}", unfrozen.display()))?;
+        let res = harvest_attached_shard(&conn);
+        let _ = conn.execute_batch("ROLLBACK");
+        let detach_res = conn.execute("DETACH DATABASE sh", []);
+        res.with_context(|| format!("harvesting {}", unfrozen.display()))?;
+        detach_res.with_context(|| format!("detaching {}", unfrozen.display()))?;
+        crate::frozen::remove_family(&unfrozen).with_context(|| format!("removing {}", unfrozen.display()))?;
     }
     Ok(())
 }
@@ -2735,6 +2750,7 @@ pub fn reset_shards_at(main: &Path, log: &dyn Fn(&str)) -> anyhow::Result<()> {
         remove_db_family(&crate::compact::with_suffix(&shard, "precompact"))?;
         // frozen releases carry the old shard's ids: a new shard would hand them out again
         remove_db_family(&crate::frozen::path(&shard))?;
+        remove_db_family(&crate::compact::with_suffix(&shard, "unfrozen"))?;
         remove_db_family(&shard)?;
     }
     remove_db_family(&main.with_file_name("atlas.old.db"))?;

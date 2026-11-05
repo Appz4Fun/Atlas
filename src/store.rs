@@ -2003,7 +2003,12 @@ pub fn save(main: &Path, releases: &[Release]) -> Result<()> {
         by_shard[shard_of(&r.group)].push(r.clone());
     }
     for (shard, list) in by_shard.iter().enumerate().filter(|(_, l)| !l.is_empty()) {
-        let mut conn = db::open_shard(&shard_path(main, shard))?;
+        let path = shard_path(main, shard);
+        let mut conn = db::open_shard(&path)?;
+        // late articles of a frozen release thaw it here too, rather than starting a second copy
+        if crate::frozen::path(&path).exists() {
+            crate::frozen::attach(&conn, &path)?;
+        }
         ShardWriter::new(shard).save(&mut conn, &ids, [list.as_slice()])?;
     }
     Ok(())
