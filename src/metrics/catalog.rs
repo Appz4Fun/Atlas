@@ -2,8 +2,10 @@
 //! many releases, in which categories, groups and sizes, and what the PreDB
 //! matched. Only a walk over every release knows them, soo one thread walks
 //! the shards every `metrics.catalog_every_secs`, in short reads that pin no
-//! WAL. The last result is saved and read back, soo a restart doesnt blank the
-//! dashboards until the next walk is through.
+//! WAL. A walk reads every release page off the disk, tens of GB, soo the rest
+//! after one is also at least `REST_PER_WALK` times as long as it took. The last
+//! result is saved and read back, soo a restart doesnt blank the dashboards
+//! until the next walk is through.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -28,6 +30,11 @@ const BATCH: i64 = 20_000;
 const NAP: Duration = Duration::from_millis(2);
 /// how often the cheap numbers are read
 const QUICK_EVERY: Duration = Duration::from_secs(30);
+/// the rest after a walk is at least this many times as long as the walk: past 100M releases one
+/// takes 20 minutes, and with a short `catalog_every_secs` they went back to back, reading the disk nonstop
+const REST_PER_WALK: u32 = 4;
+/// and at most this long for the walk's sake, whatever a damaged save says it took
+const LONGEST_REST: Duration = Duration::from_secs(24 * 60 * 60);
 /// a walk that failed (a compaction swapped a file away) goes again after this long
 const RETRY: Duration = Duration::from_secs(5 * 60);
 /// series for groups and release groups: the rest are summed into `(other)`
@@ -518,8 +525,8 @@ fn save(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Bring back a saved walk. When it finished, if there was one.
-fn restore(path: &Path) -> Option<i64> {
+/// Bring back a saved walk. When it finished and how long it took, if there was one.
+fn restore(path: &Path) -> Option<(i64, Duration)> {
     let text = std::fs::read_to_string(path).ok()?;
     let mut rows: BTreeMap<String, Vec<(String, f64)>> = serde_json::from_str(&text).ok()?;
     for family in SAVED {
@@ -527,7 +534,13 @@ fn restore(path: &Path) -> Option<i64> {
             family.replace(found);
         }
     }
-    CATALOG_SCAN_AT.rows().first().map(|(_, at)| *at as i64)
+    let took = CATALOG_SCAN_SECONDS.rows().first().map(|(_, s)| Duration::try_from_secs_f64(*s).unwrap_or_default());
+    CATALOG_SCAN_AT.rows().first().map(|(_, at)| (*at as i64, took.unwrap_or_default()))
+}
+
+/// The rest after a walk that took `took`.
+fn rest_after(every: Duration, took: Duration) -> Duration {
+    every.max(took.saturating_mul(REST_PER_WALK).min(LONGEST_REST))
 }
 
 /// The numbers that take no walk.
@@ -604,21 +617,24 @@ pub fn spawn(every: Duration, stop: Arc<AtomicBool>) {
 }
 
 fn walk_forever(main: &Path, every: Duration, stop: &AtomicBool) {
-    let saved_at = restore(&cache_path());
-    let age = saved_at.map(|at| (chrono::Utc::now().timestamp() - at).max(0) as u64);
-    // no sooner than its interval after the last one, however often atlas restarts
-    nap(age.map_or(Duration::ZERO, |age| every.saturating_sub(Duration::from_secs(age))), stop);
+    // no sooner than its rest after the last one, however often atlas restarts
+    let first = restore(&cache_path()).map_or(Duration::ZERO, |(at, took)| {
+        let age = Duration::from_secs((chrono::Utc::now().timestamp() - at).max(0) as u64);
+        rest_after(every, took).saturating_sub(age)
+    });
+    nap(first, stop);
     while !stop.load(Relaxed) {
         let started = Instant::now();
         let span = super::span("metrics.catalog_scan");
         let wait = match scan(main, stop) {
             Ok(Some(tally)) => {
-                tally.publish(started.elapsed());
+                let took = started.elapsed();
+                tally.publish(took);
                 CATALOG_SCAN_ROWS.set(&[("state", "last")], tally.rows as f64);
                 if let Err(e) = save(&cache_path()) {
                     println!("metrics: couldnt save the catalog numbers: {e:#}");
                 }
-                every
+                rest_after(every, took)
             }
             Ok(None) => return,
             Err(e) => {
@@ -703,14 +719,25 @@ mod tests {
         let path = dir.path().join("saved.json");
         CATALOG_GROUP.replace([(label_key(&[("group", "a.b.c")]), 7.0)]);
         CATALOG_SCAN_AT.replace([(String::new(), 1234.0)]);
+        CATALOG_SCAN_SECONDS.replace([(String::new(), 90.5)]);
         save(&path).unwrap();
         CATALOG_GROUP.replace([]);
         CATALOG_SCAN_AT.replace([]);
-        assert_eq!(restore(&path), Some(1234));
+        CATALOG_SCAN_SECONDS.replace([]);
+        assert_eq!(restore(&path), Some((1234, Duration::from_secs_f64(90.5))));
         assert_eq!(CATALOG_GROUP.rows(), vec![(label_key(&[("group", "a.b.c")]), 7.0)]);
         assert_eq!(restore(&dir.path().join("missing.json")), None);
         std::fs::write(&path, "not json").unwrap();
         assert_eq!(restore(&path), None, "a damaged file is no file");
+    }
+
+    #[test]
+    fn a_long_walk_rests_longer_than_its_interval() {
+        let minutes = |m: u64| Duration::from_secs(m * 60);
+        assert_eq!(rest_after(minutes(30), minutes(2)), minutes(30), "a short walk keeps to the interval");
+        assert_eq!(rest_after(Duration::from_secs(60), minutes(20)), minutes(80), "a long one rests 4 times as long");
+        assert_eq!(rest_after(minutes(30), Duration::ZERO), minutes(30));
+        assert_eq!(rest_after(minutes(30), Duration::MAX), LONGEST_REST, "a damaged save rests a day at most");
     }
 
     #[test]
