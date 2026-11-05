@@ -11,7 +11,7 @@ use rusqlite::{Connection, OptionalExtension, ToSql};
 use serde_json::Value;
 
 use crate::api::{ApiResponse, escape};
-use crate::postprocess::engine::{NET_BATCH, claim_shares, queue_shares};
+use crate::postprocess::engine::{NET_BATCH, NET_CRASH_RETRY, STEP_DEADLINE, claim_shares, queue_shares};
 use crate::postprocess::step::{Needs, ReleaseInfo, Step};
 use crate::store;
 use crate::web::{html, tag, thousands};
@@ -104,8 +104,21 @@ struct State {
     last_error: Option<String>,
     /// its queue row's time
     due_at: Option<i64>,
-    /// the walk in progress will get to it
-    walk_before: Option<i64>,
+    /// the first walk that will get to it, in the order walks run
+    walk: Option<WalkCover>,
+    /// the steps the walks that will get to it run again, done or not
+    walk_redo: i64,
+}
+
+/// A walk that will visit a release (see `engine::walk_tick`).
+#[derive(Clone, Debug, Default, PartialEq)]
+struct WalkCover {
+    /// it goes down the shard's ids from here
+    before: i64,
+    /// only this group's releases
+    group: Option<String>,
+    /// it's the walk in progress: the others wait for it
+    active: bool,
 }
 
 fn read_state(conn: &Connection, s: usize, id: i64) -> rusqlite::Result<State> {
@@ -166,11 +179,21 @@ fn read_state(conn: &Connection, s: usize, id: i64) -> rusqlite::Result<State> {
     state.due_at = conn
         .query_row(&format!("select due_at from s{s}.pp_queue where release_id = ?"), [id], |r| r.get(0))
         .optional()?;
-    // the newest walk goes first (see `engine::walk_tick`)
-    state.walk_before = conn
-        .query_row(&format!("select before_id from s{s}.pp_walks order by id desc limit 1"), [], |r| r.get::<_, i64>(0))
-        .optional()?
-        .filter(|before| *before > id);
+    // the newest walk goes first, then the next newest (see `engine::walk_tick`). There are a few at most
+    let walks: Vec<(i64, i64, Option<String>)> = conn
+        .prepare(&format!("select before_id, redo_mask, group_name from s{s}.pp_walks order by id desc"))?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let group = state.release.as_ref().map(|r| r.group.as_str());
+    for (at, (before, redo, walk_group)) in walks.into_iter().enumerate() {
+        if before <= id || walk_group.as_deref().is_some_and(|g| Some(g) != group) {
+            continue;
+        }
+        state.walk_redo |= redo;
+        if state.walk.is_none() {
+            state.walk = Some(WalkCover { before, group: walk_group, active: at == 0 });
+        }
+    }
     Ok(state)
 }
 
@@ -220,6 +243,8 @@ enum Wait {
     AtLeast(f64),
     /// the lane hasn't gone fast enough lately to tell; how many are ahead in its main order, if counted
     Unknown(Option<(i64, bool)>),
+    /// a walk that waits for the one in progress
+    Later,
 }
 
 /// One of the orders a lane takes turns between: its share of the lane's batches, and a count of the rows ahead of
@@ -321,16 +346,38 @@ fn net_wait(
 
 /// The database lane's wait for a queue row due now: the latest due first, or the longest waiting, as
 /// `engine::queue_order` takes turns.
-fn queue_wait(conn: &Connection, s: usize, due: i64, rate: Option<f64>, now: i64) -> rusqlite::Result<Wait> {
+fn queue_wait(conn: &Connection, s: usize, id: i64, due: i64, rate: Option<f64>, now: i64) -> rusqlite::Result<Wait> {
     let (latest, longest) = queue_shares();
-    let later = |cap| capped(conn, &format!("s{s}.pp_queue where due_at > ?1 and due_at <= ?2"), &[&due, &now], cap);
-    let earlier = |cap| capped(conn, &format!("s{s}.pp_queue where due_at < ?1"), &[&due], cap);
+    // rows due at the same time go by release id, as `pp_queue_due` holds them: down it for the latest due, up it
+    // for the longest waiting
+    let ahead = |strictly: &str, tied: &str, args: &[&dyn ToSql], cap: i64| -> rusqlite::Result<(i64, bool)> {
+        let (n, more) = capped(conn, &format!("s{s}.pp_queue where {strictly}"), args, cap)?;
+        if more {
+            return Ok((n, true));
+        }
+        let (t, more) =
+            capped(conn, &format!("s{s}.pp_queue where due_at = ?1 and release_id {tied} ?2"), &[&due, &id], cap - n)?;
+        Ok((n + t, more))
+    };
+    let later = |cap| ahead("due_at > ?1 and due_at <= ?2", ">", &[&due, &now], cap);
+    let earlier = |cap| ahead("due_at < ?1", "<", &[&due], cap);
     wait_in(rate, &[(latest, &later), (longest, &earlier)])
 }
 
-/// A walk's wait: it goes down the shard's ids from `before`.
-fn walk_wait(conn: &Connection, s: usize, id: i64, before: i64, rate: Option<f64>) -> rusqlite::Result<Wait> {
-    let rows = |cap| capped(conn, &format!("s{s}.releases where id > ?1 and id < ?2"), &[&id, &before], cap);
+/// A walk's wait: it goes down the shard's ids from `before`, through its group's releases when it has one.
+fn walk_wait(conn: &Connection, s: usize, id: i64, walk: &WalkCover, rate: Option<f64>) -> rusqlite::Result<Wait> {
+    if !walk.active {
+        return Ok(Wait::Later);
+    }
+    let rows = |cap| match &walk.group {
+        Some(g) => capped(
+            conn,
+            &format!("s{s}.releases where group_name = ?3 and id > ?1 and id < ?2"),
+            &[&id, &walk.before, g],
+            cap,
+        ),
+        None => capped(conn, &format!("s{s}.releases where id > ?1 and id < ?2"), &[&id, &walk.before], cap),
+    };
     wait_in(rate, &[(1.0, &rows)])
 }
 
@@ -344,6 +391,8 @@ enum Standing {
     Skipped,
     /// out of line until then: a retry, settling
     Until(i64, String),
+    /// a run of it began moments ago; if cut short, it's tried again then
+    Running(i64),
     /// in line; `next`: the first of the release's steps there
     Queued {
         wait: Wait,
@@ -374,7 +423,11 @@ fn standings(state: &State, pace: &Pace, waits: &Waits, now: i64) -> Vec<(&'stat
     let mut out = Vec::new();
     for step in step_list() {
         let b = bit(step.id);
-        let standing = if state.done & b != 0 {
+        let walk_redoes = state.walk_redo & b != 0 && enabled & b != 0;
+        let standing = if let (true, Some(wait)) = (walk_redoes, &waits.walk) {
+            // a reprocess asked for it again, done or not
+            Standing::Queued { wait: *wait, after: 0.0, next: !step.net, lane: "walk" }
+        } else if state.done & b != 0 {
             Standing::Done
         } else if state.failed & b != 0 {
             Standing::Failed
@@ -395,6 +448,8 @@ fn standings(state: &State, pace: &Pace, waits: &Waits, now: i64) -> Vec<(&'stat
                     }
                     _ => Standing::Skipped,
                 }
+            } else if state.net_next_at > now && began_moments_ago(state, now) {
+                Standing::Running(state.net_next_at)
             } else if state.net_next_at > now {
                 let why = if state.net_transient > 0 {
                     format!("servers didn't answer ({} in a row)", state.net_transient)
@@ -434,6 +489,15 @@ fn standings(state: &State, pace: &Pace, waits: &Waits, now: i64) -> Vec<(&'stat
     out
 }
 
+/// Whether the net lane's `net_next_at` is the one a run sets as it begins (`engine::NET_CRASH_RETRY` on, for a run
+/// the process dies in) rather than a retry's backoff. A first retry's backoff is about as long, soo this can be
+/// wrong for a minute or two after a failure.
+fn began_moments_ago(state: &State, now: i64) -> bool {
+    let left = state.net_next_at - now;
+    let deadline = STEP_DEADLINE.as_secs() as i64;
+    state.net_attempts > 0 && left <= NET_CRASH_RETRY && left > NET_CRASH_RETRY - deadline - 60
+}
+
 /// Minutes in words: "4 min", "3 h", "2 days".
 fn span(minutes: f64) -> String {
     if minutes < 1.0 {
@@ -469,13 +533,16 @@ fn when(wait: &Wait, after: f64, lane: &str, shard: usize) -> String {
             format!("{over}{} {line}; too little has gone through lately to tell when", thousands(*ahead))
         }
         Wait::Unknown(None) => "too little has gone through lately to tell when".into(),
+        Wait::Later => format!("once the walk of shard {shard} in progress is done, by a later walk"),
     }
 }
 
 fn render(id: i64, state: &State, pace: &Pace, rows: &[(&'static StepMeta, Standing)], now: i64) -> String {
     let shard = store::shard_of_id(id);
-    let pending: Vec<&(&StepMeta, Standing)> =
-        rows.iter().filter(|(_, s)| matches!(s, Standing::Queued { .. } | Standing::Until(..))).collect();
+    let pending: Vec<&(&StepMeta, Standing)> = rows
+        .iter()
+        .filter(|(_, s)| matches!(s, Standing::Queued { .. } | Standing::Until(..) | Standing::Running(_)))
+        .collect();
     let mut table = String::new();
     for (step, standing) in rows {
         let lane = if step.net { "network" } else { "database" };
@@ -487,6 +554,10 @@ fn render(id: i64, state: &State, pace: &Pace, rows: &[(&'static StepMeta, Stand
             Standing::Until(at, why) => {
                 (tag("tag-warn", "WAITING"), format!("not before {} · {}", escape(&clock(*at)), escape(why)))
             }
+            Standing::Running(retry) => (
+                tag("tag-ref", "RUNNING"),
+                format!("probably running now · if it's cut short, tried again not before {}", escape(&clock(*retry))),
+            ),
             Standing::Queued { wait, after, next, lane } => {
                 let chip = if *next { tag("tag-ref", "NEXT") } else { tag("tag-warn", "QUEUED") };
                 let at = if pace.running {
@@ -505,7 +576,7 @@ fn render(id: i64, state: &State, pace: &Pace, rows: &[(&'static StepMeta, Stand
     }
     let summary = if pending.is_empty() {
         let done = rows.iter().filter(|(_, s)| *s == Standing::Done).count();
-        if !state.has_state && state.due_at.is_none() && state.walk_before.is_none() {
+        if !state.has_state && state.due_at.is_none() && state.walk.is_none() {
             "Nothing is lined up for this release: the stage's rules passed it by (too small, a fragment, junk), or it \
              hasn't been looked at yet."
                 .to_string()
@@ -519,6 +590,7 @@ fn render(id: i64, state: &State, pace: &Pace, rows: &[(&'static StepMeta, Stand
             .filter_map(|(_, s)| match s {
                 Standing::Queued { wait: Wait::About(m, _), after, .. } => Some(m + after),
                 Standing::Until(at, _) => Some((at - now) as f64 / 60.0),
+                Standing::Running(_) => Some(0.0),
                 _ => None,
             })
             .fold(f64::INFINITY, f64::min);
@@ -576,10 +648,10 @@ pub(crate) fn fragment(args: &HashMap<String, String>) -> ApiResponse {
             waits.net = Some(net_wait(conn, s, id, state.net_rank, rate(pace.net_finished), now)?);
         }
         if let Some(due) = state.due_at.filter(|d| *d <= now) {
-            waits.queue = Some(queue_wait(conn, s, due, rate(pace.queue_taken), now)?);
+            waits.queue = Some(queue_wait(conn, s, id, due, rate(pace.queue_taken), now)?);
         }
-        if let (None, Some(before)) = (state.due_at, state.walk_before) {
-            waits.walk = Some(walk_wait(conn, s, id, before, rate(pace.walk_rows))?);
+        if let Some(walk) = state.walk.as_ref().filter(|_| state.due_at.is_none() || state.walk_redo != 0) {
+            waits.walk = Some(walk_wait(conn, s, id, walk, rate(pace.walk_rows))?);
         }
         Ok((state, waits))
     });
@@ -718,11 +790,46 @@ mod tests {
 
     #[test]
     fn a_release_not_looked_at_yet_waits_for_the_walk() {
-        let state = State { walk_before: Some(100), ..Default::default() };
+        let state = State { walk: Some(WalkCover { before: 100, group: None, active: true }), ..Default::default() };
         let waits = Waits { walk: Some(Wait::About(30.0, 9000)), ..Default::default() };
         let rows = standings(&state, &pace(), &waits, 0);
         assert!(matches!(standing_of(&rows, "naming"), Standing::Queued { lane: "walk", .. }));
         assert!(matches!(standing_of(&rows, "probe"), Standing::Queued { lane: "walk", .. }));
+    }
+
+    #[test]
+    fn a_reprocess_walk_shows_its_steps_as_coming_again() {
+        let naming = step("naming");
+        let state = State {
+            has_state: true,
+            done: -1,
+            walk: Some(WalkCover { before: 100, group: None, active: false }),
+            walk_redo: bit(naming.id),
+            ..Default::default()
+        };
+        let waits = Waits { walk: Some(Wait::Later), ..Default::default() };
+        let rows = standings(&state, &pace(), &waits, 0);
+        assert!(matches!(standing_of(&rows, "naming"), Standing::Queued { lane: "walk", wait: Wait::Later, .. }));
+        assert_eq!(*standing_of(&rows, "category"), Standing::Done);
+        assert!(render(8, &state, &pace(), &rows, 0).contains("by a later walk"));
+    }
+
+    #[test]
+    fn a_net_step_that_just_began_is_running_not_a_retry() {
+        let probe = step("probe");
+        let state = State {
+            has_state: true,
+            net_wanted: true,
+            net_left: Some(bit(probe.id)),
+            net_attempts: 1,
+            net_next_at: 1_000 + NET_CRASH_RETRY - 5,
+            ..Default::default()
+        };
+        let rows = standings(&state, &pace(), &Waits::default(), 1_000);
+        assert_eq!(*standing_of(&rows, "probe"), Standing::Running(1_000 + NET_CRASH_RETRY - 5));
+        let later = State { net_next_at: 1_000 + 3_600, ..state };
+        let rows = standings(&later, &pace(), &Waits::default(), 1_000);
+        assert!(matches!(standing_of(&rows, "probe"), Standing::Until(_, why) if why.starts_with("retry")));
     }
 
     #[test]
@@ -759,6 +866,25 @@ mod tests {
         // ahead by rank: the rank 2, and the newer rank 1 (5); by id: 4 and 5 newer, 1 and 2 older
         let wait = net_wait(&conn, s, id, Some(1), Some(8.0), 0).unwrap();
         assert_eq!(wait, Wait::About(2.0 / 6.0, 2));
+        // the queue: rows due together count by release id, as the queue's index holds them
+        for (i, due) in [(1, 50), (2, 100), (3, 100), (4, 100), (5, 200)] {
+            let qid = i * store::SHARDS as i64 + s as i64;
+            conn.execute(&format!("insert into s{s}.pp_queue (release_id, due_at) values (?, ?)"), params![qid, due])
+                .unwrap();
+        }
+        // latest due: 5 (later) and 4 (tied, higher id) at 3/4 of 8 a minute; longest waiting: 1 and 2 at 1/4
+        assert_eq!(queue_wait(&conn, s, id, 100, Some(8.0), 1_000).unwrap(), Wait::About(2.0 / 6.0, 2));
+        // a group's walk counts only that group's releases
+        for (i, group) in [(6, "a"), (7, "b"), (8, "a"), (9, "a")] {
+            conn.execute(
+                &format!("insert into s{s}.releases (id, name, group_name) values (?, ?, ?)"),
+                params![i * store::SHARDS as i64 + s as i64, format!("r{i}"), group],
+            )
+            .unwrap();
+        }
+        let walk = WalkCover { before: 10 * store::SHARDS as i64, group: Some("a".into()), active: true };
+        let from = 6 * store::SHARDS as i64 + s as i64;
+        assert_eq!(walk_wait(&conn, s, from, &walk, Some(60.0)).unwrap(), Wait::About(2.0 / 60.0, 2));
         assert_eq!(capped(&conn, &format!("s{s}.pp_state where net_wanted = 1"), &[], 3).unwrap(), (3, true));
     }
 }

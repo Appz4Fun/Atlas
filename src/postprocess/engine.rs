@@ -41,8 +41,8 @@ fn net_pause_secs(in_a_row: i64) -> i64 {
     }
     1i64.checked_shl((in_a_row - NET_PAUSE_AFTER).min(6) as u32).unwrap_or(NET_PAUSE_MAX).min(NET_PAUSE_MAX)
 }
-const NET_CRASH_RETRY: i64 = 900;
-const STEP_DEADLINE: Duration = Duration::from_secs(120);
+pub(crate) const NET_CRASH_RETRY: i64 = 900;
+pub(crate) const STEP_DEADLINE: Duration = Duration::from_secs(120);
 
 /// Transient failures in a row of a release's net step (every server timed out on its body, say) retried after 5
 /// minutes; past these they back off like a retry (`backoff`). They were retried every 5 minutes for good, asking
@@ -558,7 +558,8 @@ impl Inner {
     /// A net lane's batch, counted for its shard's rates once it's written (see `stats::Lanes`).
     fn send_net(&self, db: &Db, shard: usize, batch: Batch, now: i64) -> anyhow::Result<()> {
         let visits = batch.applied.len() as u64;
-        let finished = batch.applied.iter().filter(|a| a.net_mask == 0).count() as u64;
+        // a step that failed for good leaves its bit in the mask, but not in what's left (see `apply`)
+        let finished = batch.applied.iter().filter(|a| a.net_mask & !(a.set_done | a.set_failed) == 0).count() as u64;
         self.send(db, shard, "db.stage.apply_net", batch, now, |_| Ok(()))?;
         let lanes = &self.stats.lanes;
         lanes.net_visits[shard].fetch_add(visits, Relaxed);
