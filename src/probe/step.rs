@@ -750,7 +750,8 @@ fn read_tail_moov(
     }
     let skip = usize::try_from(moov_at - (first - 1) * segment).unwrap_or(usize::MAX);
     let Some(moov) = tail.get(skip..) else { return Ok(()) };
-    let found = media::Mp4Prober::probe_tail_moov(moov);
+    // the sample offsets count from the file's start, which `front` is
+    let found = media::Mp4Prober::probe_tail_moov_with(moov, front);
     if let Some(found) = found.filter(|m| !m.video.is_empty() || !m.audio.is_empty()) {
         info.media = Some(found);
     }
