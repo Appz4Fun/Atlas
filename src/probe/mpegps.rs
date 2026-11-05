@@ -194,6 +194,11 @@ fn first_start_code(b: &[u8]) -> Option<(u8, u8)> {
     Some((*b.get(at + 3)?, *b.get(at + 4).unwrap_or(&0)))
 }
 
+/// An MPEG-1/2 video stream's size, frame rate and aspect from its first sequence header in `es`.
+pub(super) fn sequence(es: &[u8], v: &mut VideoTrack) {
+    video(es, v);
+}
+
 /// From an MPEG-1/2 sequence header: size, aspect and frame rate; MPEG-2 when a sequence extension follows. The
 /// header when the payload ended before saying which (its extension may start the stream's next packet).
 fn video(payload: &[u8], v: &mut VideoTrack) -> Option<[u8; 4]> {
@@ -250,7 +255,7 @@ fn aspect(v: &mut VideoTrack, h: [u8; 4], mpeg2: bool) {
 }
 
 /// An MPEG audio frame header: layer, rate, mono or not.
-fn mpeg_audio(payload: &[u8], a: &mut AudioTrack) {
+pub(super) fn mpeg_audio(payload: &[u8], a: &mut AudioTrack) {
     let Some(at) = payload.windows(2).position(|w| w[0] == 0xFF && w[1] & 0xE0 == 0xE0) else { return };
     let Some(h) = payload.get(at..at + 4) else { return };
     let version = (h[1] >> 3) & 3;
@@ -273,7 +278,7 @@ fn mpeg_audio(payload: &[u8], a: &mut AudioTrack) {
 }
 
 /// An AC-3 sync frame: rate, and channels from acmod and the LFE flag.
-fn ac3(b: &[u8]) -> AudioTrack {
+pub(super) fn ac3(b: &[u8]) -> AudioTrack {
     const CHANNELS: [u32; 8] = [2, 1, 2, 3, 3, 4, 4, 5];
     let mut a = AudioTrack { codec: "ac3".into(), ..AudioTrack::default() };
     let Some(at) = b.windows(2).position(|w| w == [0x0B, 0x77]) else { return a };
@@ -311,7 +316,7 @@ fn ac3(b: &[u8]) -> AudioTrack {
 }
 
 /// A DTS core frame: rate, and channels from the arrangement and the LFE field.
-fn dts(b: &[u8]) -> AudioTrack {
+pub(super) fn dts(b: &[u8]) -> AudioTrack {
     let mut a = AudioTrack { codec: "dts".into(), ..AudioTrack::default() };
     let Some(at) = b.windows(4).position(|w| w == [0x7F, 0xFE, 0x80, 0x01]) else { return a };
     let Some(f) = b.get(at + 4..at + 12) else { return a };

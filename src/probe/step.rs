@@ -164,10 +164,18 @@ pub(crate) fn rerun_bluray(conn: &rusqlite::Connection, now: i64) -> rusqlite::R
     rerun_unread(conn, &["iso", "img", "bdmv", "clpi", "mpls", "bdjo", "m2ts"], now)
 }
 
+/// The same for MPEG transport streams, before `mpegts` read their program map: a capture's `.ts` or `.mts`, or a
+/// Blu-ray's `.m2ts`.
+pub(crate) fn rerun_mpeg_ts(conn: &rusqlite::Connection, now: i64) -> rusqlite::Result<usize> {
+    rerun_unread(conn, &["ts", "mts", "m2ts"], now)
+}
+
 /// Extensions of the files a probe reads tracks from since it first ran: a saved probe of one with no media is
 /// from before.
-const NEWLY_READ: &[&str] =
-    &["avi", "wmv", "asf", "mpg", "mpeg", "vob", "iso", "img", "ifo", "bup", "bdmv", "clpi", "mpls", "bdjo", "m2ts"];
+const NEWLY_READ: &[&str] = &[
+    "avi", "wmv", "asf", "mpg", "mpeg", "vob", "iso", "img", "ifo", "bup", "bdmv", "clpi", "mpls", "bdjo", "m2ts",
+    "ts", "mts",
+];
 
 /// Whether `name` ends in `.ext`, or is a split piece of one: `.ext.001` and on.
 fn named(name: &str, ext: &str) -> bool {
@@ -736,9 +744,11 @@ fn inspect(body: &[u8], info: &mut ProbeInfo) {
             }
         }
     }
-    // and a BDMV folder's playlists, beside the stream file the walk picked, the longest of all read; with only its
-    // index or the disc's names so far, a Blu-ray whose header is further on
-    if info.media.as_ref().is_none_or(|m| m.container == "bluray") && super::bluray::is_bluray(body) {
+    // and a BDMV folder's playlists, beside the stream file (a transport stream) the walk picked, the longest of all
+    // read; with only its index or the disc's names so far, a Blu-ray whose header is further on
+    if info.media.as_ref().is_none_or(|m| matches!(m.container.as_str(), "bluray" | "m2ts" | "mpeg-ts"))
+        && super::bluray::is_bluray(body)
+    {
         info.media = Some(super::bluray::bluray(body));
     }
     info.layers = nest.layers;
@@ -856,6 +866,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(rerun_bluray(&conn, 100).unwrap(), 1, "the BDMV folder");
+                conn.execute("insert into releases (id, name, group_name) values (16, '16', 'g')", []).unwrap();
+        conn.execute("insert into pp_state (release_id, done) values (16, ?)", [mask(PROBE_STEP)]).unwrap();
+        conn.execute("insert into release_probe (release_id, info) values (16, '{\"file\":\"Match.ts\"}')", [])
+            .unwrap();
+        assert_eq!(rerun_mpeg_ts(&conn, 100).unwrap(), 1);
         let state = |id: i64| -> (i64, i64) {
             conn.query_row("select done, rerun_mask from pp_state where release_id = ?", [id], |r| {
                 Ok((r.get(0)?, r.get(1)?))
@@ -866,7 +881,7 @@ mod tests {
         assert_eq!(state(2), (mask(PROBE_STEP), 0), "read");
         assert_eq!(state(3), (mask(PROBE_STEP), 0), "missing");
         let queued: i64 = conn.query_row("select count(*) from pp_queue", [], |r| r.get(0)).unwrap();
-        assert_eq!(queued, 11);
+        assert_eq!(queued, 12);
         assert_eq!(state(7), (mask(PROBE_STEP), 0), "read already");
     }
 

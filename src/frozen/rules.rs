@@ -4,6 +4,7 @@
 //! coming back to are walked by the writer a chunk a tick (`backlog_some`).
 
 use std::sync::atomic::Ordering::Relaxed;
+use std::time::{Duration, Instant};
 
 use rusqlite::{Connection, OptionalExtension, Result, params};
 
@@ -109,37 +110,51 @@ pub struct Backlog {
     pub queued: usize,
 }
 
-/// One step of the walk over releases no visit is coming back to: the next `limit` releases down from where the last
-/// step stopped, newest first, queued where a rule matches (one queued already keeps its place). Starts over from the
-/// top when the rules change, and does nothing once it got to the bottom. In the caller's transaction, on the shard's
-/// writer.
-pub fn backlog_some(conn: &Connection, limit: usize, now: i64) -> Result<Backlog> {
+/// Releases one step of the walk takes at a time, between looks at the clock and the stop flag.
+const BACKLOG_CHUNK: usize = 250;
+
+/// One step of the walk over releases no visit is coming back to: up to `limit` releases down from where the last
+/// step stopped, newest first, queued where a rule matches (one queued already keeps its place). Goes a chunk at a
+/// time and stops early once `budget` has passed or the indexer is stopping, soo the writer gets back to saves; where
+/// it got to is kept after every chunk. Starts over from the top when the rules change, and does nothing once it got
+/// to the bottom. In the caller's transaction, on the shard's writer.
+pub fn backlog_some(conn: &Connection, limit: usize, budget: Duration, now: i64) -> Result<Backlog> {
     if !any_on() || limit == 0 {
         return Ok(Backlog::default());
     }
+    let started = Instant::now();
     let sig = signature();
     let mut below = meta(conn, BACKLOG_BELOW)?;
     if meta(conn, BACKLOG_RULES)? != Some(sig) {
         set_meta(conn, BACKLOG_RULES, sig)?;
         below = None;
     }
-    let below = match below {
+    let mut below = match below {
         Some(0) => return Ok(Backlog::default()),
         Some(b) => b,
         None => i64::MAX,
     };
-    let (lo, n): (Option<i64>, i64) = conn
-        .prepare_cached(
-            "select min(id), count(*) from (select id from releases where id < ?1 order by id desc limit ?2)",
-        )?
-        .query_row(params![below, limit as i64], |r| Ok((r.get(0)?, r.get(1)?)))?;
-    let Some(lo) = lo else {
-        set_meta(conn, BACKLOG_BELOW, 0)?;
-        return Ok(Backlog::default());
-    };
-    let queued = queue(conn, lo, below - 1, now)?;
-    set_meta(conn, BACKLOG_BELOW, lo)?;
-    Ok(Backlog { looked_at: n as usize, queued })
+    let mut done = Backlog::default();
+    while done.looked_at < limit {
+        let take = (limit - done.looked_at).min(BACKLOG_CHUNK);
+        let (lo, n): (Option<i64>, i64) = conn
+            .prepare_cached(
+                "select min(id), count(*) from (select id from releases where id < ?1 order by id desc limit ?2)",
+            )?
+            .query_row(params![below, take as i64], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        let Some(lo) = lo else {
+            set_meta(conn, BACKLOG_BELOW, 0)?;
+            break;
+        };
+        done.queued += queue(conn, lo, below - 1, now)?;
+        done.looked_at += n as usize;
+        set_meta(conn, BACKLOG_BELOW, lo)?;
+        below = lo;
+        if started.elapsed() >= budget || super::STOPPING.load(Relaxed) {
+            break;
+        }
+    }
+    Ok(done)
 }
 
 /// Whether a rule matches release `id` as it is now, for a release about to move.

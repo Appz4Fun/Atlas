@@ -1258,6 +1258,11 @@ fn seed_shard(conn: &Connection, enabled: StepMask, stamps: &[(u8, StepMask, i64
         crate::probe::step::rerun_dvd(conn, now)?;
         set("pp_probe_dvd", now)?;
     }
+    // once, for the MPEG transport streams probed before their program map was read
+    if meta("pp_probe_mpeg_ts")?.is_none() {
+        crate::probe::step::rerun_mpeg_ts(conn, now)?;
+        set("pp_probe_mpeg_ts", now)?;
+    }
     // once, for the Blu-ray folders probed before their playlists were read
     if meta("pp_probe_bluray")?.is_none() {
         crate::probe::step::rerun_bluray(conn, now)?;
