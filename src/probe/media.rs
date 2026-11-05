@@ -1,4 +1,5 @@
-//! Tracks and format from the start of a media file: Matroska, WebM, MP4, AVI, ASF, MPEG program streams and DVD-Video title sets (see `avi`, `asf`, `mpegps`, `dvd`). All total functions: bad or cut
+//! Tracks and format from the start of a media file: Matroska, WebM, MP4, AVI, ASF, MPEG program streams, DVD-Video
+//! title sets and Blu-ray playlists (see `avi`, `asf`, `mpegps`, `dvd`, `bluray`). All total functions: bad or cut
 //! off bytes give what was read before them.
 
 use std::collections::HashMap;
@@ -145,6 +146,8 @@ pub fn parse(data: &[u8]) -> Option<MediaInfo> {
         super::mpegps::mpeg_ps(data)
     } else if super::dvd::is_dvd(data) {
         super::dvd::dvd(data)
+    } else if super::bluray::is_bluray(data) {
+        super::bluray::bluray(data)
     } else {
         return None;
     };

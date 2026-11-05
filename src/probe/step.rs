@@ -158,10 +158,16 @@ pub(crate) fn rerun_dvd(conn: &rusqlite::Connection, now: i64) -> rusqlite::Resu
 /// A probe row of a `VIDEO_TS` folder in an archive read from its VOB only, before its IFO was looked for.
 const DVD_FOLDER_AS_VOB: &str = "json_extract(info, '$.media.container') = 'mpeg-ps'
      and lower(json_extract(info, '$.archive.name')) like '%video_ts%'";
+/// The same for Blu-ray discs and folders, before `bluray` read their playlists: a disc image, or a `BDMV` folder
+/// whose first file is one of its small ones. Images again too: the DVD step's rerun may have run before this.
+pub(crate) fn rerun_bluray(conn: &rusqlite::Connection, now: i64) -> rusqlite::Result<usize> {
+    rerun_unread(conn, &["iso", "img", "bdmv", "clpi", "mpls", "bdjo", "m2ts"], now)
+}
 
 /// Extensions of the files a probe reads tracks from since it first ran: a saved probe of one with no media is
 /// from before.
-const NEWLY_READ: &[&str] = &["avi", "wmv", "asf", "mpg", "mpeg", "vob", "iso", "img", "ifo", "bup"];
+const NEWLY_READ: &[&str] =
+    &["avi", "wmv", "asf", "mpg", "mpeg", "vob", "iso", "img", "ifo", "bup", "bdmv", "clpi", "mpls", "bdjo", "m2ts"];
 
 /// Whether `name` ends in `.ext`, or is a split piece of one: `.ext.001` and on.
 fn named(name: &str, ext: &str) -> bool {
@@ -730,6 +736,11 @@ fn inspect(body: &[u8], info: &mut ProbeInfo) {
             }
         }
     }
+    // and a BDMV folder's playlists, beside the stream file the walk picked, the longest of all read; with only its
+    // index or the disc's names so far, a Blu-ray whose header is further on
+    if info.media.as_ref().is_none_or(|m| m.container == "bluray") && super::bluray::is_bluray(body) {
+        info.media = Some(super::bluray::bluray(body));
+    }
     info.layers = nest.layers;
 }
 
@@ -837,6 +848,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(rerun_dvd(&conn, 100).unwrap(), 2, "the folder read as a VOB too, and the earlier one again");
+        conn.execute("insert into releases (id, name, group_name) values (14, '14', 'g')", []).unwrap();
+        conn.execute("insert into pp_state (release_id, done) values (14, ?)", [mask(PROBE_STEP)]).unwrap();
+        conn.execute(
+            "insert into release_probe (release_id, info) values (14, '{\"archive\":{\"name\":\"BDMV/index.bdmv\"}}')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(rerun_bluray(&conn, 100).unwrap(), 1, "the BDMV folder");
         let state = |id: i64| -> (i64, i64) {
             conn.query_row("select done, rerun_mask from pp_state where release_id = ?", [id], |r| {
                 Ok((r.get(0)?, r.get(1)?))
@@ -847,7 +866,7 @@ mod tests {
         assert_eq!(state(2), (mask(PROBE_STEP), 0), "read");
         assert_eq!(state(3), (mask(PROBE_STEP), 0), "missing");
         let queued: i64 = conn.query_row("select count(*) from pp_queue", [], |r| r.get(0)).unwrap();
-        assert_eq!(queued, 10);
+        assert_eq!(queued, 11);
         assert_eq!(state(7), (mask(PROBE_STEP), 0), "read already");
     }
 
@@ -950,6 +969,21 @@ mod tests {
         let mut info = ProbeInfo::default();
         inspect(&body, &mut info);
         assert_eq!(info.media.expect("a dvd").duration_secs, Some(6750.0));
+    }
+
+    #[test]
+    fn a_bdmv_folder_in_a_stored_archive_is_read_from_its_playlists() {
+        use crate::archive::testkit::{r4_file, r4_main, rar4};
+        let body = rar4(&[
+            r4_main(0),
+            r4_file(0, b"BDMV\\PLAYLIST\\00800.mpls", &super::super::bluray::tests::mpls(2, 3_600)),
+            r4_file(0, b"BDMV\\STREAM\\00800.m2ts", &vec![0x47; 300_000]),
+        ]);
+        let mut info = ProbeInfo::default();
+        inspect(&body, &mut info);
+        let media = info.media.expect("a blu-ray");
+        assert_eq!((media.container.as_str(), media.duration_secs), ("bluray", Some(7_200.0)));
+        assert_eq!(media.audio.len(), 2);
     }
 
     #[test]
