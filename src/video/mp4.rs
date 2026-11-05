@@ -9,7 +9,7 @@ pub const MAX_MOOV: u64 = 16 << 20;
 /// The most samples a track's tables may list: a day of video at 60 frames a second.
 const MAX_SAMPLES: u32 = 6_000_000;
 /// The biggest one sample may be: a 2160p keyframe is a few MB at most.
-pub const MAX_SAMPLE: u32 = 16 << 20;
+pub const MAX_SAMPLE: u32 = 8 << 20;
 
 /// A box's header at the start of `b`: its type, its whole size (header and body, None: to the end of the file)
 /// and its header's length.

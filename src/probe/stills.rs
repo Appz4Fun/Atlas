@@ -322,6 +322,10 @@ struct Share {
 /// volumes. A volume's share is read from its own header, and the ones between are taken to hold as much as the
 /// second: a set's volumes are all one size but the last. A wrong guess reads bytes that don't decode, never a
 /// wrong still.
+/// The most article bytes one release's stills keep while they're made: a whole `moov`, three keyframes, and the
+/// parts they start and end in.
+const MAX_HELD: u64 = mp4::MAX_MOOV + 3 * mp4::MAX_SAMPLE as u64 + (16 << 20);
+
 /// Reads part `part` of a file, decoded, with what its yEnc header says it starts at (0 based).
 type Fetch<'f> = dyn FnMut(&FileInfo, i64) -> Result<Option<(u64, Vec<u8>)>, StepError> + 'f;
 
@@ -337,6 +341,8 @@ struct FileBytes<'a> {
     segments: Vec<Option<u64>>,
     /// the parts read so far, by (volume, part): what the yEnc header says each starts at, and its bytes
     parts: std::collections::HashMap<(usize, i64), (u64, Vec<u8>)>,
+    /// the bytes of those parts
+    held: u64,
 }
 
 impl<'a> FileBytes<'a> {
@@ -349,6 +355,7 @@ impl<'a> FileBytes<'a> {
             name: None,
             segments: vec![None; n],
             parts: std::collections::HashMap::new(),
+            held: 0,
         }
     }
 
@@ -359,12 +366,24 @@ impl<'a> FileBytes<'a> {
         }
         let Some(file) = self.volumes[v] else { return Ok(None) };
         let Some(got) = fetch(file, part)? else { return Ok(None) };
+        let len = got.1.len() as u64;
         if part == 1 {
             if got.0 != 0 {
                 return Ok(None);
             }
-            self.segments[v] = Some(got.1.len() as u64);
+            self.segments[v] = Some(len);
+        } else {
+            // every part where its number says, and no longer than the first: soo each one read carries a whole
+            // part's worth of the range, and a post can't make the reads hold more than the range they're for
+            let Some(segment) = self.segments[v] else { return Ok(None) };
+            if Some(got.0) != u64::try_from(part - 1).ok().and_then(|p| p.checked_mul(segment)) || len > segment {
+                return Ok(None);
+            }
         }
+        if self.held + len > MAX_HELD {
+            return Ok(None);
+        }
+        self.held += len;
         self.parts.insert((v, part), got.clone());
         Ok(Some(got))
     }
@@ -1065,5 +1084,27 @@ mod tests {
             .collect();
         let (stills, _) = mp4_stills(&files, true);
         assert_eq!(stills.iter().map(|s| s.0).collect::<Vec<_>>(), [25, 50, 75]);
+    }
+
+    #[test]
+    fn a_part_out_of_place_or_short_is_refused() {
+        let (track, keyframe) = fixture_keyframe("hevc");
+        let inner = mp4_file(&track, &keyframe, false);
+        let (_, size, head) = mp4::box_head(&inner[16..]).unwrap();
+        let video = mp4::video_track(&inner[16 + head..16 + size.unwrap() as usize]).unwrap();
+        let part_of = |p: u8| (video.keyframe_at(p).unwrap().offset as usize / 3_000) as i64 + 1;
+        let mut parts = posted(&inner, 3_000);
+        for (n, begin, body) in parts.iter_mut() {
+            // the 25% keyframe's part says it starts a byte early, the 75% one's is cut short
+            if *n == part_of(25) {
+                *begin -= 1;
+            }
+            if *n == part_of(75) && *n != part_of(25) {
+                body.truncate(10);
+            }
+        }
+        let film = numbered(1, "film.mp4", parts.len());
+        let (stills, _) = mp4_stills(&[(film, parts)], false);
+        assert_eq!(stills.iter().map(|s| s.0).collect::<Vec<_>>(), [50]);
     }
 }
