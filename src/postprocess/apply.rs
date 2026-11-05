@@ -825,15 +825,36 @@ mod tests {
 
     #[test]
     fn pointer_nzb_propagates_password_to_pointed_release() {
-        use crate::archive::store::{MARK_POINTED, MARK_POINTED_PASSWORD};
+        use crate::archive::store::{MARK_POINTED, MARK_POINTED_PASSWORD, RERUN_POINTED_LIST, RERUN_POINTED_PROBE};
         let (_dir, conn, id) = shard();
         let name: String = conn.query_row("select name from releases where id = ?", [id], |r| r.get(0)).unwrap();
         let pointer_id = id + 8;
+        let probe_bit = crate::postprocess::step::mask(crate::probe::step::PROBE_STEP);
+        conn.execute(
+            "insert into pp_state (release_id, done, net_wanted, net_left) values (?1, ?2, 0, 0)",
+            params![id, probe_bit],
+        )
+        .unwrap();
+        conn.execute(
+            "insert into release_probe (release_id, info) values (?1, '{\"layers\":[{\"stop\":\"encrypted\"}],\"encrypted\":true}')",
+            [id],
+        )
+        .unwrap();
         conn.execute(MARK_POINTED, params![name, pointer_id]).unwrap();
+        conn.execute(RERUN_POINTED_LIST.as_str(), params![name, pointer_id]).unwrap();
+        conn.execute(RERUN_POINTED_PROBE.as_str(), params![name, pointer_id]).unwrap();
         conn.execute(MARK_POINTED_PASSWORD, params![name, pointer_id, "JFB9hbdCrue7m4XA391gNYM50"]).unwrap();
         let got: Option<String> = conn
             .query_row("select password from release_nfo_password where release_id = ?", [id], |r| r.get(0))
             .ok();
         assert_eq!(got.as_deref(), Some("JFB9hbdCrue7m4XA391gNYM50"));
+        let (done, net_wanted, net_left): (i64, i64, i64) = conn
+            .query_row("select done, net_wanted, net_left from pp_state where release_id = ?", [id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .unwrap();
+        assert_eq!(done & probe_bit, 0);
+        assert_eq!(net_wanted, 1);
+        assert_ne!(net_left & probe_bit, 0);
     }
 }

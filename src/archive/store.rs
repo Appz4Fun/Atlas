@@ -342,7 +342,7 @@ pub static RERUN_POINTED_PROBE: std::sync::LazyLock<String> = std::sync::LazyLoc
            and not exists (select 1 from release_nfo_password p where p.release_id = pp_state.release_id)
            and exists (
                select 1 from release_probe rp
-               where rp.release_id = pp_state.release_id and rp.json like '%\"encrypted\":true%'
+               where rp.release_id = pp_state.release_id and rp.info like '%\"encrypted\":true%'
            )"
     )
 });

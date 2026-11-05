@@ -115,7 +115,7 @@ impl Step for NfoName {
         let probe_encrypted: bool = ctx
             .conn()
             .query_row(
-                "select 1 from release_probe where release_id = ?1 and json like '%\"encrypted\":true%'",
+                "select 1 from release_probe where release_id = ?1 and info like '%\"encrypted\":true%'",
                 [rel_id],
                 |_| Ok(true),
             )
