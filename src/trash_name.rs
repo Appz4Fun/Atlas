@@ -136,9 +136,10 @@ fn year_of(date: Option<&str>) -> Option<i64> {
     date.and_then(|d| d.get(..4)).and_then(|y| y.parse().ok()).filter(|y| (1870..=2100).contains(y))
 }
 
-/// `Matchbox the Movie (2026)`: a movie needs its year, from the lookup or the name
+/// `Matchbox the Movie (2026)`: a movie needs its year, the matched movie's first, as Radarr names it
 fn movie_heading(tags: &Tags, known: &Known, title: &str) -> Option<String> {
-    let year = known.year.or(tags.year.map(i64::from)).or_else(|| year_of(known.released))?;
+    let matched = known.title.and(year_of(known.released));
+    let year = matched.or(known.year).or(tags.year.map(i64::from))?;
     let mut out = format!("{title} ({year})");
     if let Some(edition) = &tags.edition {
         out.push_str(&format!(" {{edition-{edition}}}"));
@@ -174,7 +175,15 @@ fn episode_heading(release: &str, tags: &Tags, known: &Known, title: &str) -> Op
                 out.push_str(&name);
             }
         }
-        None => out.push_str(&format!(" - S{season:02}")),
+        None => {
+            out.push_str(&format!(" - S{season:02}"));
+            // a pack of several seasons: `S01-S03`
+            if tags.seasons.first() == Some(&season)
+                && let Some(last) = tags.seasons.last().filter(|last| **last > season)
+            {
+                out.push_str(&format!("-S{last:02}"));
+            }
+        }
     }
     Some(out)
 }
@@ -293,11 +302,19 @@ fn audio(release: &str, tags: &Tags) -> String {
         None
     };
     let atmos = has("Atmos").then_some("Atmos");
-    let channels = tags.channels.first().map(|c| match c.as_str() {
-        "stereo" => "2.0",
-        "mono" => "1.0",
-        other => other,
-    });
+    // the most channels named: a name lists its best track's with the others', in no order to go by
+    let channels = tags
+        .channels
+        .iter()
+        .map(|c| match c.as_str() {
+            "stereo" => "2.0",
+            "mono" => "1.0",
+            other => other,
+        })
+        .max_by(|a, b| {
+            let n = |c: &str| c.parse::<f64>().unwrap_or(0.0);
+            n(a).total_cmp(&n(b))
+        });
     if codec.is_none() && atmos.is_none() {
         return String::new();
     }
@@ -457,6 +474,29 @@ mod tests {
                 show("The Greatest", "2026-11-04", 1, Some(8))
             ),
             "The Greatest (2026) - S01E08 [WEB-DL-1080p][MULTi][H264]-HiggsBoson"
+        );
+    }
+
+    #[test]
+    fn a_matched_movie_takes_its_own_year_and_a_pack_its_seasons() {
+        let known = Known {
+            kind: Some(Kind::Movie as i64),
+            year: Some(1981),
+            title: Some("Pixote"),
+            released: Some("1980-09-26"),
+            ..Known::default()
+        };
+        assert_eq!(
+            shown("Pixote.1981.iNTERNAL.DVDRip.x264.AAC-OiT", MOVIES_HD, known),
+            "Pixote (1980) [DVD][AAC][x264]-OiT"
+        );
+        assert_eq!(
+            shown("Season.Pack.S01-S03.1080p.AMZN.WEB-DL-GRP", TV_HD, show("Season Pack", "2020-01-01", 1, None)),
+            "Season Pack (2020) - S01-S03 [WEB-DL-1080p]-GRP"
+        );
+        assert_eq!(
+            shown("Movie.2020.1080p.BluRay.TrueHD.7.1.AC3.5.1.x264-GRP", MOVIES_HD, movie("Movie", 2020)),
+            "Movie (2020) [Bluray-1080p][TrueHD 7.1][x264]-GRP"
         );
     }
 
