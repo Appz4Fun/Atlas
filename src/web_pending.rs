@@ -448,6 +448,10 @@ fn standings(state: &State, pace: &Pace, waits: &Waits, now: i64) -> Vec<(&'stat
             if !left {
                 // a release with no row yet gets its net steps once a visit has looked at it
                 match (&waits.queue, &waits.walk) {
+                    _ if !state.has_state && state.due_at.is_some_and(|due| due > now) => Standing::Until(
+                        state.due_at.unwrap_or(now),
+                        "the post settling, then its first look decides which of these it needs".into(),
+                    ),
                     (Some(wait), _) if !state.has_state => {
                         Standing::Queued { wait: *wait, after: 0.0, next: false, lane: "database" }
                     }
@@ -820,6 +824,14 @@ mod tests {
         let rows = standings(&state, &pace(), &waits, 0);
         assert!(matches!(standing_of(&rows, "naming"), Standing::Queued { lane: "walk", .. }));
         assert!(matches!(standing_of(&rows, "probe"), Standing::Queued { lane: "walk", .. }));
+    }
+
+    #[test]
+    fn a_new_release_still_settling_has_its_net_steps_waiting_too() {
+        let state = State { due_at: Some(5_000), ..Default::default() };
+        let rows = standings(&state, &pace(), &Waits::default(), 1_000);
+        assert!(matches!(standing_of(&rows, "probe"), Standing::Until(5_000, _)));
+        assert!(matches!(standing_of(&rows, "naming"), Standing::Until(5_000, _)));
     }
 
     #[test]
