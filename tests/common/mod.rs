@@ -67,6 +67,8 @@ pub struct Server {
     pub accepted: AtomicUsize,
     /// BODYs answered with the article, and how long each takes
     pub bodies_sent: AtomicUsize,
+    /// ARTICLEs answered with the article
+    pub articles_sent: AtomicUsize,
     pub body_delay: Duration,
     /// answer an empty XOVER range with 420 (some providers) instead of 423
     pub empty_is_420: bool,
@@ -122,6 +124,7 @@ impl Server {
             stalled: AtomicUsize::new(0),
             accepted: AtomicUsize::new(0),
             bodies_sent: AtomicUsize::new(0),
+            articles_sent: AtomicUsize::new(0),
             body_delay: Duration::ZERO,
             empty_is_420: false,
             reported_low: None,
@@ -385,6 +388,7 @@ pub fn serve(stream: TcpStream, state: &Server, over_limit: bool) {
             }
             "ARTICLE" => match posts_lock().iter().find(|p| p.message_id == arg).filter(|_| state.bodies) {
                 Some(post) => {
+                    state.articles_sent.fetch_add(1, Ordering::SeqCst);
                     send(&mut out, b"220 0 article");
                     send(&mut out, b"From: tester@example.org");
                     send(&mut out, b"User-Agent: Nyuu/0.4.2");

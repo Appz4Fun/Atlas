@@ -20,6 +20,9 @@ pub const MAX_POST_BYTES: u64 = 64 << 20;
 pub const MAX_POST_ARTICLES: usize = 128;
 /// sets of files of one post read at most, looking for the next NZB
 const MAX_SETS: usize = 3;
+/// An NZB found on the way and bigger than this isn't parsed: a real one this size lists a post of hundreds of GB,
+/// and reading it as text can take a few times its size. The one in the owner's first chain is 16.5 MB.
+pub const MAX_FOLLOWED_NZB: usize = 24 << 20;
 
 /// What a whole following may fetch and unpack: bytes, and articles, the latter scaled from
 /// `archive.max_bodies_per_release`, soo an operator who lowers that lowers this too.
@@ -77,6 +80,9 @@ pub fn follow(ctx: &mut StepCtx<'_>, first: Vec<u8>, left: &mut Budget) -> Resul
     let mut inside: Vec<InnerFile> = Vec::new();
     let mut body = first;
     for _ in 0..MAX_HOPS {
+        if body.len() > MAX_FOLLOWED_NZB {
+            break;
+        }
         let parsed = nzb::parse(&body);
         let mut rows = std::mem::take(&mut inside);
         rows.extend(parsed.files.iter().map(|f| InnerFile { name: f.name.clone(), size: Some(f.bytes()) }));
@@ -237,16 +243,22 @@ fn download_set(
                         return Ok(None);
                     }
                     left.articles -= 1;
+                    // with its headers: the groups an NZB names are the poster's word, the article's are the server's
                     let wanted =
-                        [BodyRequest { message_id: id.clone(), file: file.name.clone(), max_bytes: Some(ARTICLE_CAP) }];
-                    let got = match ctx.fetch_bodies(&wanted) {
-                        Ok(mut got) => got.pop().map(|b| b.got),
+                        BodyRequest { message_id: id.clone(), file: file.name.clone(), max_bytes: Some(ARTICLE_CAP) };
+                    let got = match ctx.fetch_article(&wanted) {
+                        Ok(got) => got.got,
                         Err(e @ (StepError::Stopped | StepError::Transient(_) | StepError::OutOfBudget)) => {
                             return Err(e);
                         }
                         Err(_) => return Ok(None),
                     };
-                    let Some(Got::Body(body)) = got else { return Ok(None) };
+                    let Got::Body(raw) = got else { return Ok(None) };
+                    let article = crate::probe::yenc::split_article(&raw);
+                    if !posted_where_allowed(&article.headers) {
+                        return Ok(None);
+                    }
+                    let Some(body) = crate::nntp::yenc_decode(&article.lines) else { return Ok(None) };
                     body
                 }
             };
@@ -259,6 +271,23 @@ fn download_set(
         files.push(whole);
     }
     Ok(Some(files))
+}
+
+/// Whether an article's own headers, `Newsgroups` or the server's `Xref`, name a group Atlas may fetch from
+/// (`filters::group_blocked`). Neither header: not read.
+fn posted_where_allowed(headers: &[(String, String)]) -> bool {
+    let groups = headers.iter().flat_map(|(name, value)| {
+        let listed: Vec<&str> = if name.eq_ignore_ascii_case("Newsgroups") {
+            value.split(',').map(str::trim).collect()
+        } else if name.eq_ignore_ascii_case("Xref") {
+            // `server group:number group:number`
+            value.split_whitespace().skip(1).filter_map(|g| g.split_once(':').map(|(group, _)| group)).collect()
+        } else {
+            Vec::new()
+        };
+        listed
+    });
+    groups.into_iter().any(|group| !group.is_empty() && !crate::filters::group_blocked(group))
 }
 
 #[cfg(test)]
@@ -296,6 +325,22 @@ mod tests {
         assert_eq!(sets(&numbered)[0], Set { files: vec![whole("d.01"), whole("d.02")], headed_volumes: false });
         let split = [whole("c.7z.002"), whole("c.7z.001")];
         assert_eq!(sets(&split)[0], Set { files: vec![whole("c.7z.001"), whole("c.7z.002")], headed_volumes: false });
+    }
+
+    #[test]
+    fn an_article_is_read_only_from_a_group_it_says_it_is_in() {
+        let h = |v: &str| vec![("Newsgroups".to_string(), v.to_string())];
+        assert!(posted_where_allowed(&h("alt.binaries.test")));
+        assert!(!posted_where_allowed(&[]), "no header");
+        assert!(!posted_where_allowed(&h(" , ")));
+        let xref = vec![("Xref".to_string(), "news alt.binaries.test:1 alt.binaries.other:2".to_string())];
+        assert!(posted_where_allowed(&xref));
+        assert!(!posted_where_allowed(&[("Xref".to_string(), "news".to_string())]));
+        let blocked = "alt.binaries.cp";
+        if crate::filters::group_blocked(blocked) {
+            assert!(!posted_where_allowed(&h(blocked)));
+            assert!(posted_where_allowed(&h("alt.binaries.cp, alt.binaries.test")));
+        }
     }
 
     #[test]

@@ -1005,9 +1005,19 @@ fn a_posted_nzb_is_followed_through_a_small_post_whose_rar_holds_the_next_nzb() 
     let mut posts = s.posts.clone();
     posts.push(loose(90, "hop1@x", "Hop.Post.rar", &rar));
     let state = Server::new(posts);
-    start_with(&mut h, spawn_server(state.clone()), config(), steps::all());
+    // the listing step alone: the probe reads articles with their headers too
+    start_with(
+        &mut h,
+        spawn_server(state.clone()),
+        config(),
+        vec![Arc::new(atlas::archive::steps::ListStep::default())],
+    );
     settled(&h, "x");
-    assert_eq!(bodies(&state), 2, "the NZB and the hop's one article, not the big upload");
+    assert_eq!(
+        (bodies(&state), state.articles_sent.load(Ordering::SeqCst)),
+        (1, 1),
+        "the NZB, then the hop's one article with its headers, not the big upload"
+    );
     let found: Vec<(String, i64)> = rows(&h, "x").into_iter().map(|r| (r.name, r.source)).collect();
     assert_eq!(
         found,
@@ -1027,9 +1037,20 @@ fn a_small_rars_nzb_is_read_whole_not_only_its_first_article() {
     let rar = rar4(&[r4_main(0), r4_file(0, b"Pointed.At.nzb", &an_nzb(&files)), r4_end()]);
     let (head, tail) = rar.split_at(rar.len() / 2);
     let s = shape("x").add("x.rar", 1, 2, yenc_body("x.rar", head)).add("x.rar", 2, 2, yenc_body("x.rar", tail));
-    let state = serve(&mut h, &s, config());
+    h.save(&[s.release()]);
+    let state = Server::new(s.posts.clone());
+    start_with(
+        &mut h,
+        spawn_server(state.clone()),
+        config(),
+        vec![Arc::new(atlas::archive::steps::ListStep::default())],
+    );
     settled(&h, "x");
-    assert_eq!(bodies(&state), 2, "the head, then the article after it");
+    assert_eq!(
+        (bodies(&state), state.articles_sent.load(Ordering::SeqCst)),
+        (1, 1),
+        "the head, then the article after it"
+    );
     let nzb_rows: Vec<String> = rows(&h, "x").into_iter().filter(|r| r.source == 5).map(|r| r.name).collect();
     assert!(nzb_rows.contains(&"Other.Thing.2024.mkv".to_string()), "{nzb_rows:?}");
 }
