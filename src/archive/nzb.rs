@@ -86,6 +86,21 @@ fn attribute(e: &BytesStart<'_>, key: &str) -> Option<String> {
     Some(attr.normalized_value(XmlVersion::Implicit1_0).map_or_else(|_| attr.value.to_string(), |v| v.into_owned()))
 }
 
+/// The release names an NZB's files give, as a save names a release from a file (`strip_release_suffixes`), PAR2
+/// files last, each once. At most 3.
+pub fn release_names<'a>(files: impl Iterator<Item = &'a str>) -> Vec<String> {
+    let mut files: Vec<&str> = files.collect();
+    files.sort_by_key(|name| name.to_ascii_lowercase().ends_with(".par2"));
+    let mut names: Vec<String> = Vec::new();
+    for file in files {
+        let name = crate::parser::strip_release_suffixes(super::names::base_name(file));
+        if !name.is_empty() && !names.iter().any(|n| n.eq_ignore_ascii_case(&name)) && names.len() < 3 {
+            names.push(name);
+        }
+    }
+    names
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

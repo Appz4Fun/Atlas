@@ -611,6 +611,40 @@ mod tests {
         assert_eq!(ranked(6_226, Some(2045)), Some(2), "a post of an NZB, however small");
         assert_eq!(ranked(6_226, Some(3010)), Some(2), "and whatever it's filed as");
         assert_eq!(ranked(60 * gib, Some(2045)), Some(4), "a big one with an NZB beside it stays where it was");
+        conn.execute("delete from files where filename = 'Some.Post.NZB'", []).unwrap();
+        assert_eq!(ranked(16 << 20, Some(2045)), Some(0));
+        conn.execute("insert into nzb_pointed (release_id) values (?)", [id]).unwrap();
+        assert_eq!(ranked(16 << 20, Some(2045)), Some(2), "what an NZB read here points to");
+    }
+
+    #[test]
+    fn what_an_nzb_points_to_is_ranked_as_a_visit_would() {
+        use crate::archive::store::{MARK_POINTED, RANK_POINTED};
+        let (_dir, conn, id) = shard();
+        let name: String = conn.query_row("select name from releases where id = ?", [id], |r| r.get(0)).unwrap();
+        let point = |size: i64, rank: Option<i64>| {
+            conn.execute("delete from nzb_pointed", []).unwrap();
+            conn.execute("update releases set size = ? where id = ?", params![size, id]).unwrap();
+            conn.execute(
+                "insert or replace into pp_state (release_id, net_wanted, net_rank) values (?, 1, ?)",
+                params![id, rank],
+            )
+            .unwrap();
+            conn.execute(MARK_POINTED, params![name, id + 8]).unwrap();
+            conn.execute(RANK_POINTED.as_str(), params![name, id + 8]).unwrap();
+            self::rank(&conn, id)
+        };
+        assert_eq!(point(16 << 20, Some(0)), Some(2), "a small one, ranked 0");
+        assert_eq!(point(60 << 30, None), Some(4), "a big one not ranked yet gets its own rank, not 2");
+        conn.execute(MARK_POINTED, params![name, id]).unwrap();
+        assert_eq!(conn.query_row("select count(*) from nzb_pointed", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+        conn.execute("delete from nzb_pointed", []).unwrap();
+        conn.execute(MARK_POINTED, params![name, id]).unwrap();
+        assert_eq!(
+            conn.query_row("select count(*) from nzb_pointed", [], |r| r.get::<_, i64>(0)).unwrap(),
+            0,
+            "not itself"
+        );
     }
 
     #[test]
