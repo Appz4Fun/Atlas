@@ -24,13 +24,15 @@ Source: [container-metadata/FINAL-REPORT.md](container-metadata/FINAL-REPORT.md)
 Source: [container-metadata/FINAL-REPORT.md](container-metadata/FINAL-REPORT.md), catalogs in [container-metadata/catalog/](container-metadata/catalog/).
 
 - [ ] Store mux identity: SegmentUUID, DateUTC, MuxingApp/WritingApp, Duration float size (twin key and tool fingerprint). Already there: SegmentUID and MuxingApp are read and shown, DateUTC is read. Not yet: the Duration float size, and using any of them as a key.
-- [ ] Matroska Tags: IMDB/TMDB/TVDB IDs (front in Lavf files) and mkvmerge statistics tags BPS, NUMBER_OF_FRAMES at the file end (+1 tail article). Already there: Tags in front of the first Cluster go into the probe's `tags` map. Not yet: shown on the page, used for IDs, or the tail read for mkvmerge stats.
+- [x] Matroska Tags shown on the release page (#165): the Tags in front of the first Cluster, sorted, IMDB/TMDB linked, ENCODED_BY, purchase and e-mail tags never shown.
+- [ ] Matroska Tags, the rest: IMDB/TMDB/TVDB IDs used to identify the title, and mkvmerge statistics tags (BPS, NUMBER_OF_FRAMES) at the file end (+1 tail article).
 - [ ] Subtitle and attachment keys: ASS header hash (strip the Aegisub section), font-set hash, VobSub palette.
 - [ ] ChapterSkipType (intro, credits) and a chapter timing signature.
 - [ ] FLAC STREAMINFO MD5 as an exact audio alt key.
 - [ ] MP4 `colr`/`mdcv`/`clli`, `chpl` chapters, `ilst` title and `cnID`; `stts`/`stsz` for exact frame count and bitrate. Already there: the sample tables are walked for stills (#160). Not yet: the rest.
 - [x] Disc posts: ISO 9660 and UDF walk, DVD IFOs (#151), Blu-ray `index.bdmv`/MPLS/CLPI main playlist (#153).
-- [ ] Disc IDs: DVDDiscID (MD5 of the IFOs) has a function, `dvd_disc_id` in `src/probe/media.rs`, but nothing calls it and the `dvd_disc_id` field is never filled; Blu-ray `id.bdmv` disc_id is not read.
+- [x] DVD disc ID (#165): libdvdread's DVDDiscID (MD5 of VIDEO_TS.IFO and VTS_01..N_0.IFO) in `src/probe/dvd.rs`, stored as the probe's `disc_id` and shown on the page; an ISO's sets found by its directory records, a stored VIDEO_TS folder's by its entry names. Releases probed before need a reprobe to get one.
+- [ ] Blu-ray `id.bdmv` disc_id is not read.
 - [ ] TS broadcast captures: SDT channel, EIT programme, TDT capture time. (#157 reads TS tracks; these tables are not read.)
 - [x] Legacy writers: AVI ISFT and Xvid/DivX strings (#145), ASF/WMV (#148), MPEG-PS/VOB (#149).
 - [ ] Ogg vendor string and FLV onMetaData.
