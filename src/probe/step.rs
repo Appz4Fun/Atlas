@@ -69,11 +69,25 @@ fn capped(message_id: &str, file: &str) -> BodyRequest {
 /// Asks for the probe again on releases whose probe found the main file's first article too big to read, before
 /// `fetch_head`: it saw only that the article was there, no yEnc header. Once, from the stage's seed.
 pub(crate) fn rerun_big_heads(conn: &rusqlite::Connection, now: i64) -> rusqlite::Result<usize> {
+    rerun_probes(conn, "json_extract(info, '$.yenc') is null and json_extract(info, '$.health.first') = 1", now)
+}
+
+/// Asks for the probe again on AVI files it found no tracks in, before `avi` read them: posted bare, split into
+/// `.avi.001` and on, or stored in an archive. Once, from the stage's seed.
+pub(crate) fn rerun_avi(conn: &rusqlite::Connection, now: i64) -> rusqlite::Result<usize> {
+    rerun_probes(
+        conn,
+        "json_extract(info, '$.media') is null
+         and (lower(json_extract(info, '$.file')) like '%.avi' or lower(json_extract(info, '$.file')) like '%.avi.0%'
+              or lower(json_extract(info, '$.archive.name')) like '%.avi')",
+        now,
+    )
+}
+
+/// The probe again, past its saved result, on the releases whose probe row matches `filter`.
+fn rerun_probes(conn: &rusqlite::Connection, filter: &str, now: i64) -> rusqlite::Result<usize> {
     let ids: Vec<i64> = conn
-        .prepare(
-            "select release_id from release_probe
-             where json_extract(info, '$.yenc') is null and json_extract(info, '$.health.first') = 1",
-        )?
+        .prepare(&format!("select release_id from release_probe where {filter}"))?
         .query_map([], |r| r.get(0))?
         .collect::<rusqlite::Result<_>>()?;
     for id in &ids {
@@ -556,6 +570,24 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(rerun_big_heads(&conn, 100).unwrap(), 1);
+        for (id, info) in [
+            (4i64, r#"{"file":"Show.S01E01.XviD.avi","media":null}"#),
+            (5, r#"{"file":"Movie.part01.rar","archive":{"name":"Movie.CD1.avi"},"media":null}"#),
+            (6, r#"{"file":"Movie.avi.001","media":null}"#),
+            (7, r#"{"file":"Movie.avi","media":{"container":"avi"}}"#),
+            (8, r#"{"file":"Movie.mkv","media":null}"#),
+        ] {
+            conn.execute("insert into releases (id, name, group_name) values (?, ?, 'g')", rusqlite::params![id, id])
+                .unwrap();
+            conn.execute(
+                "insert into pp_state (release_id, done) values (?, ?)",
+                rusqlite::params![id, mask(PROBE_STEP)],
+            )
+            .unwrap();
+            conn.execute("insert into release_probe (release_id, info) values (?, ?)", rusqlite::params![id, info])
+                .unwrap();
+        }
+        assert_eq!(rerun_avi(&conn, 100).unwrap(), 3, "a bare one, one in an archive, a split one");
         let state = |id: i64| -> (i64, i64) {
             conn.query_row("select done, rerun_mask from pp_state where release_id = ?", [id], |r| {
                 Ok((r.get(0)?, r.get(1)?))
@@ -566,7 +598,8 @@ mod tests {
         assert_eq!(state(2), (mask(PROBE_STEP), 0), "read");
         assert_eq!(state(3), (mask(PROBE_STEP), 0), "missing");
         let queued: i64 = conn.query_row("select count(*) from pp_queue", [], |r| r.get(0)).unwrap();
-        assert_eq!(queued, 1);
+        assert_eq!(queued, 4);
+        assert_eq!(state(7), (mask(PROBE_STEP), 0), "read already");
     }
 
     #[test]

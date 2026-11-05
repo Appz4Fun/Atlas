@@ -1,4 +1,4 @@
-//! Tracks and format from the start of a media file: Matroska, WebM and MP4. All total functions: bad or cut
+//! Tracks and format from the start of a media file: Matroska, WebM, MP4 and AVI (see `avi`). All total functions: bad or cut
 //! off bytes give what was read before them.
 
 use std::collections::HashMap;
@@ -137,6 +137,8 @@ pub fn parse(data: &[u8]) -> Option<MediaInfo> {
         matroska(data)
     } else if is_mp4(data) {
         mp4(data)
+    } else if super::avi::is_avi(data) {
+        super::avi::avi(data)
     } else {
         return None;
     };
