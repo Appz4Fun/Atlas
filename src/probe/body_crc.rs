@@ -1,6 +1,7 @@
 //! The server's body CRC for probes made before the probe kept it: one HEAD of the probed article, for the movie
-//! and TV releases a one-off seed names (`seed`). A probe since keeps `X-Received-Body-CRC` itself, soo this step
-//! does nothing for a release nobody asked it about.
+//! and TV releases a one-off seed names (`seed`), and for a video probe put back from `atlas.raw.db` without it
+//! (`wants_backfill`). A probe since keeps `X-Received-Body-CRC` itself, soo this step does nothing for a release
+//! nobody asked it about.
 //!
 //! The header is stamped by the server an article was posted through (Highwinds-family servers and eweka), soo most
 //! articles have none: a HEAD that finds none still marks the step done, and the probe is left as it was.
@@ -12,7 +13,8 @@ use crate::store;
 
 use super::{BODY_CRC_HEADER, ProbeInfo};
 
-pub const BODY_CRC_STEP: StepId = StepId(3);
+/// Not 3: that id was the archive NFO step's, and a retired id is never given out again.
+pub const BODY_CRC_STEP: StepId = StepId(10);
 
 /// The headers a HEAD is read for, as `keep_headers` keeps them.
 const WANTED: [&str; 2] = [BODY_CRC_HEADER, "X-Received-Bytes"];
@@ -39,6 +41,15 @@ pub(crate) fn seed(conn: &rusqlite::Connection, now: i64) -> rusqlite::Result<us
         crate::postprocess::rerun_on(conn, *id, mask(BODY_CRC_STEP), now)?;
     }
     Ok(ids.len())
+}
+
+/// Whether a probe put back from the raw cache should ask this step: it read a video and kept no body CRC.
+pub(crate) fn wants_backfill(info: &str) -> bool {
+    serde_json::from_str::<ProbeInfo>(info).is_ok_and(|p| {
+        p.file.is_some()
+            && p.media.as_ref().is_some_and(|m| !m.video.is_empty())
+            && !p.headers.keys().any(|k| k.eq_ignore_ascii_case(BODY_CRC_HEADER))
+    })
 }
 
 /// The wanted headers out of a HEAD reply, under `WANTED`'s spelling. Folded lines join their header.
@@ -68,16 +79,20 @@ pub fn wanted_headers(head: &[u8]) -> Vec<(&'static str, String)> {
     out
 }
 
-/// The message-id of the article the probe read its yEnc lines from: its file's part `yenc.part` (1 when it says
-/// none).
+/// The message-id of the article the probe read its yEnc lines from: its file's part `yenc.part`, or its first
+/// article when that is part 1 or says none (as `archive::steps::first_article` takes it).
 fn probed_article(ctx: &StepCtx<'_>, probe: &ProbeInfo) -> Result<Option<(String, String)>, StepError> {
     let retry = |e: rusqlite::Error| StepError::Retry(e.to_string());
     let Some(name) = probe.file.as_deref() else { return Ok(None) };
     let part = probe.yenc.as_ref().and_then(|y| y.part).map_or(1, i64::from);
     let files = ctx.files().map_err(retry)?;
     let Some(file) = files.iter().find(|f| f.filename == name) else { return Ok(None) };
-    let segments = ctx.segments(file.id, &store::SegmentPick::Parts(vec![part])).map_err(retry)?;
-    Ok(segments.into_iter().next().map(|s| (s.message_id, file.filename.clone())))
+    let segment = if part <= 1 {
+        crate::archive::steps::first_article(ctx, file)?
+    } else {
+        ctx.segments(file.id, &store::SegmentPick::Parts(vec![part])).map_err(retry)?.into_iter().next()
+    };
+    Ok(segment.map(|s| (s.message_id, file.filename.clone())))
 }
 
 impl Step for BodyCrcStep {
@@ -87,9 +102,9 @@ impl Step for BodyCrcStep {
     fn name(&self) -> &'static str {
         "probe_body_crc"
     }
-    /// after the probe, before stills
+    /// after the probe and naming, before the keys read what it found
     fn rank(&self) -> u16 {
-        125
+        220
     }
     fn needs(&self) -> Needs {
         Needs::Bodies
@@ -152,6 +167,26 @@ mod tests {
         );
         assert!(wanted_headers(b"Path: x\nSubject: y\n").is_empty());
         assert_eq!(wanted_headers(b"X-Received-Body-CRC: 1\nX-Received-Body-CRC: 2\n").len(), 1, "the first one");
+    }
+
+    #[test]
+    fn a_restored_video_probe_without_the_header_wants_it() {
+        let info = |video: bool, crc: bool| {
+            let mut p = ProbeInfo { file: Some("a.mkv".into()), ..ProbeInfo::default() };
+            if video {
+                let mut m = super::super::media::MediaInfo::default();
+                m.video.push(super::super::media::VideoTrack::default());
+                p.media = Some(m);
+            }
+            if crc {
+                p.headers.insert(BODY_CRC_HEADER.into(), "1".into());
+            }
+            serde_json::to_string(&p).unwrap()
+        };
+        assert!(wants_backfill(&info(true, false)));
+        assert!(!wants_backfill(&info(true, true)), "it has it");
+        assert!(!wants_backfill(&info(false, false)), "no video");
+        assert!(!wants_backfill("not json"));
     }
 
     #[test]

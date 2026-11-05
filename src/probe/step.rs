@@ -417,6 +417,8 @@ impl Step for ProbeStep {
                     },
                 )
         {
+            // a video probed before the probe kept the server's body CRC gets it from one HEAD
+            let backfill = super::body_crc::wants_backfill(&saved.info);
             let mut writes = Vec::new();
             if let Some(pw) = saved.nfo_password {
                 writes.push(StepWrite::new(archive::store::SET_NFO_PASSWORD, vec![release_id.into(), pw.into()]));
@@ -434,7 +436,8 @@ impl Step for ProbeStep {
             ));
             // the account, host and layout keys come from what the probe holds
             let rerun = mask(crate::keys::KEYS_STEP)
-                | if hash.is_some() { mask(super::opensubtitles::OPENSUBTITLES_STEP) } else { 0 };
+                | if hash.is_some() { mask(super::opensubtitles::OPENSUBTITLES_STEP) } else { 0 }
+                | if backfill { mask(super::body_crc::BODY_CRC_STEP) } else { 0 };
             let facts = hash.map(|h| vec![(MOVIEHASH_FACT, h)]).unwrap_or_default();
             return Ok(Outcome { matched: true, writes, facts, rerun, ..Outcome::default() });
         }
