@@ -1012,8 +1012,20 @@ mod tests {
             )
             .unwrap();
         }
+        for (_, index) in crate::archive::store::PAR2_FILES.indexes {
+            conn.execute_batch(&index.replace(" on par2_files(", " on par2_files(").replacen("exists ", "exists s0.", 1))
+                .unwrap();
+        }
         let lookup = Lookup { keys: Keys::default(), par2_sets: Vec::new(), moviehash: None, files: vec![file] };
         assert!(lookup.has(Kind::FileCrc));
+        let plan: Vec<String> = conn
+            .prepare(&format!("explain query plan {}", others_sql(Kind::FileCrc, 0, 1)))
+            .unwrap()
+            .query_map(rusqlite::params![1, 10, file.key(), file.size, i64::from(file.crc32)], |r| r.get(3))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(plan.iter().any(|p| p.contains("par2_files_crc")), "the PAR2 side seeks size and CRC: {plan:?}");
         assert_eq!(others(&conn, 1, &lookup, Kind::FileCrc, 10), vec![3, 2]);
         assert_eq!(count_others(&conn, 1, &lookup, Kind::FileCrc), 2);
         let none = Lookup { keys: Keys::default(), par2_sets: Vec::new(), moviehash: None, files: Vec::new() };

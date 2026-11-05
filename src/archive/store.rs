@@ -92,6 +92,11 @@ pub const PAR2_FILES: ShardTable = ShardTable {
     indexes: &[
         ("par2_files_hash", "create index if not exists par2_files_hash on par2_files(size, md5_16k)"),
         ("par2_files_set", "create index if not exists par2_files_set on par2_files(set_id)"),
+        (
+            "par2_files_crc",
+            "create index if not exists par2_files_crc on par2_files(size, crc32)
+             where bound = 1 and crc32 is not null",
+        ),
     ],
     release_key: Some("release_id"),
     added: &[],
