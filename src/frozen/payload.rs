@@ -12,6 +12,9 @@ const VERSION: u8 = 1;
 const LEVEL: i32 = 3;
 /// what one payload may unpack to at most: a release with every one of its rows is far smaller
 const MAX_UNPACKED: usize = 1 << 30;
+/// what `encode` packs at most: a release with more rows than this stays live (its value has to fit in a row, and
+/// a thaw holds it all in memory)
+pub const MAX_RAW: usize = 256 << 20;
 
 /// The rows of one table.
 #[derive(Clone, Debug, PartialEq)]
@@ -70,7 +73,8 @@ fn bad(what: &str) -> Error {
     Error::new(ErrorKind::InvalidData, format!("frozen payload: {what}"))
 }
 
-pub fn encode(p: &Payload) -> Vec<u8> {
+/// The packed payload, or None when its rows come to more than `MAX_RAW`.
+pub fn encode(p: &Payload) -> Option<Vec<u8>> {
     let mut raw = vec![VERSION];
     put_varint(&mut raw, p.domains.len() as u64);
     for (id, suffix) in &p.domains {
@@ -109,7 +113,10 @@ pub fn encode(p: &Payload) -> Vec<u8> {
             }
         }
     }
-    zstd::bulk::compress(&raw, LEVEL).expect("zstd compress of an in memory buffer")
+    if raw.len() > MAX_RAW {
+        return None;
+    }
+    Some(zstd::bulk::compress(&raw, LEVEL).expect("zstd compress of an in memory buffer"))
 }
 
 struct Reader<'a> {
@@ -227,13 +234,13 @@ mod tests {
     #[test]
     fn what_goes_in_comes_back() {
         let p = sample();
-        assert_eq!(decode(&encode(&p)).unwrap(), p);
-        assert_eq!(decode(&encode(&Payload::default())).unwrap(), Payload::default());
+        assert_eq!(decode(&encode(&p).unwrap()).unwrap(), p);
+        assert_eq!(decode(&encode(&Payload::default()).unwrap()).unwrap(), Payload::default());
     }
 
     #[test]
     fn a_cut_or_spoilt_payload_is_an_error_not_a_panic() {
-        let packed = encode(&sample());
+        let packed = encode(&sample()).unwrap();
         let raw = zstd::stream::decode_all(&packed[..]).unwrap();
         for cut in 0..raw.len() {
             let short = zstd::bulk::compress(&raw[..cut], 1).unwrap();
@@ -247,5 +254,15 @@ mod tests {
         put_varint(&mut huge, u64::MAX >> 1);
         assert!(decode(&zstd::bulk::compress(&huge, 1).unwrap()).is_err());
         assert!(decode(b"not zstd").is_err());
+    }
+
+    #[test]
+    fn rows_past_the_cap_dont_pack() {
+        let big = Table {
+            name: "files".into(),
+            columns: vec!["blob".into()],
+            rows: vec![vec![Value::Blob(vec![0; MAX_RAW])]],
+        };
+        assert_eq!(encode(&Payload { domains: vec![], tables: vec![big] }), None);
     }
 }

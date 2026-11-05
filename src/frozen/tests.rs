@@ -204,6 +204,41 @@ fn only_what_the_small_rule_says_freezes() {
 }
 
 #[test]
+fn whatever_is_not_movies_tv_or_other_freezes_complete_or_not() {
+    let f = Fixture::new();
+    let mut music = post("Album", &["a.flac"], 3, 600 << 20);
+    music.articles.pop();
+    f.save(&[
+        music,
+        post("Film", &["b.mkv"], 2, 600 << 20),
+        post("Show", &["c.mkv"], 2, 600 << 20),
+        post("Misc", &["d.bin"], 2, 600 << 20),
+        post("Unknown", &["e.bin"], 2, 600 << 20),
+        post("Clips", &["f.rar"], 2, 600 << 20),
+        post("Book.Pointer", &["g.nzb"], 2, 600 << 20),
+    ]);
+    let conn = f.writer();
+    let id = |n: &str| f.id(&conn, n);
+    for (n, category) in
+        [("Album", 3040), ("Film", 2040), ("Show", 5040), ("Misc", 8010), ("Clips", 6040), ("Book.Pointer", 7020)]
+    {
+        conn.execute("insert into release_category (release_id, category) values (?1, ?2)", params![id(n), category])
+            .unwrap();
+    }
+    conn.execute("update releases set is_obfuscated = 1 where name = 'Clips'", []).unwrap();
+    let queued = |n: &str| rules::evaluate(&conn, id(n), NOW).unwrap();
+    assert!(queued("Album"), "music, incomplete as it is");
+    let reason: String =
+        conn.query_row("select reason from freeze_pending where release_id = ?1", [id("Album")], |r| r.get(0)).unwrap();
+    assert_eq!(reason, rules::NOT_TV_MOVIES);
+    for n in ["Film", "Show", "Misc", "Unknown", "Clips", "Book.Pointer"] {
+        assert!(!queued(n), "{n}");
+    }
+    assert_eq!(freeze_all(&conn).frozen, 1);
+    assert_eq!(count(&conn, "select count(*) from frozen.frozen_releases where reason = 'not_tv_movies'"), 1);
+}
+
+#[test]
 fn a_database_lane_visit_queues_a_release_for_freezing() {
     let f = Fixture::new();
     f.save(&[post("Small", &["b.mkv"], 1, 10)]);

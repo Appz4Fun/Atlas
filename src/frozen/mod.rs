@@ -1,4 +1,4 @@
-//! Releases set aside: small complete ones (`rules`), moved whole out of their shard into the shard's frozen file
+//! Releases set aside: small complete ones and those outside Movies, TV and Other (`rules`), moved whole out of their shard into the shard's frozen file
 //! (`atlas.s3.frozen.db` next to `atlas.s3.db`), where search, the word index and both processing lanes never look.
 //! Nothing is lost: a frozen release is one row holding every row it had (`payload`), a deep search still finds it,
 //! its NZB still builds, and a thaw puts it back as it was.
@@ -55,6 +55,8 @@ pub static ENABLED: AtomicBool = AtomicBool::new(true);
 pub static SMALL_BYTES: AtomicI64 = AtomicI64::new(1 << 30);
 /// `[freeze] small_keeps_tv_movies`: the small rule leaves movies and TV alone
 pub static SMALL_KEEPS_TV_MOVIES: AtomicBool = AtomicBool::new(false);
+/// `[freeze] not_tv_movies`: a release categorized outside Movies, TV and Other freezes, complete or not
+pub static NOT_TV_MOVIES: AtomicBool = AtomicBool::new(true);
 /// `[freeze] per_tick`: releases a writer moves at most a tick
 pub static PER_TICK: AtomicI64 = AtomicI64::new(200);
 /// `[freeze] tick_ms`: how long a tick may hold the writer
@@ -75,6 +77,7 @@ pub fn configure(cfg: &crate::config::FreezeConfig) {
     ENABLED.store(cfg.enabled, Relaxed);
     SMALL_BYTES.store(cfg.small_bytes.max(0), Relaxed);
     SMALL_KEEPS_TV_MOVIES.store(cfg.small_keeps_tv_movies, Relaxed);
+    NOT_TV_MOVIES.store(cfg.not_tv_movies, Relaxed);
     PER_TICK.store(cfg.per_tick.max(1), Relaxed);
     TICK_MS.store(cfg.tick_ms.max(1), Relaxed);
     MIN_FREE_BYTES.store(cfg.min_free_gb.max(0).saturating_mul(1 << 30), Relaxed);
@@ -288,6 +291,8 @@ pub enum Written {
     Written,
     /// another frozen release has the name in the group: this one stays live
     NameTaken,
+    /// its rows come to more than a payload holds (`payload::MAX_RAW`): it stays live
+    TooBig,
 }
 
 /// The frozen row for a collected release, in place of any older copy of it. In the caller's transaction.
@@ -299,6 +304,7 @@ pub fn write(conn: &Connection, s: &Summary, p: &Payload, reason: &str, now: i64
     if other.is_some_and(|o| o != s.id) {
         return Ok(Written::NameTaken);
     }
+    let Some(packed) = payload::encode(p) else { return Ok(Written::TooBig) };
     // a delete then an insert, not a replace: a replace doesnt fire the delete trigger the full text index needs
     conn.prepare_cached("delete from frozen.frozen_releases where id = ?1")?.execute([s.id])?;
     conn.prepare_cached("delete from frozen.frozen_collections where release_id = ?1")?.execute([s.id])?;
@@ -320,7 +326,7 @@ pub fn write(conn: &Connection, s: &Summary, p: &Payload, reason: &str, now: i64
         s.category,
         reason,
         now,
-        payload::encode(p)
+        packed
     ])?;
     if let Some(c) = p.table("collections")
         && let Some(k) = c.column("key")
@@ -418,6 +424,13 @@ pub fn copy(
                 Written::Written => copied.push((*id, s.size, s.parts)),
                 Written::NameTaken => {
                     crate::metrics::names::FROZEN.inc(&[("event", "name_taken")], 1);
+                    dropped.push(*id);
+                }
+                Written::TooBig => {
+                    // it only grows: kept off the rules, soo no visit collects it again
+                    conn.prepare_cached("insert or replace into main.freeze_exempt (release_id, at) values (?1, ?2)")?
+                        .execute(params![id, now])?;
+                    crate::metrics::names::FROZEN.inc(&[("event", "too_big")], 1);
                     dropped.push(*id);
                 }
             },
