@@ -1211,6 +1211,11 @@ fn seed_shard(conn: &Connection, enabled: StepMask, stamps: &[(u8, StepMask, i64
         crate::probe::step::rerun_big_heads(conn, now)?;
         set("pp_probe_big_heads", now)?;
     }
+    // once, for the AVI files probed before their header was read
+    if meta("pp_probe_avi")?.is_none() {
+        crate::probe::step::rerun_avi(conn, now)?;
+        set("pp_probe_avi", now)?;
+    }
     let seen = meta("pp_steps_seen")?.unwrap_or(0);
     let new = if seeded { enabled & !seen } else { enabled };
     if seeded && new != 0 {
