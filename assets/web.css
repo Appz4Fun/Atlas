@@ -182,6 +182,8 @@ td { white-space: nowrap; }
 td.name { width: 100%; white-space: normal; overflow-wrap: anywhere; }
 td.name a { color: var(--ink); font-weight: 550; text-decoration: none; }
 td.name a:hover { color: var(--rust); text-decoration: underline; }
+.raw-name { margin-top: 2px; font: .74rem/1.45 var(--font-mono); color: var(--muted); overflow-wrap: anywhere; }
+h1 + .raw-name { margin: -4px 0 8px; font-size: .8rem; }
 td.note { padding: 14px; text-align: center; white-space: normal; }
 td.num, th.num { text-align: right; font-family: var(--font-mono); font-size: .82rem; }
 td.dim { color: var(--muted); font-size: .82rem; }

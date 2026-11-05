@@ -1741,6 +1741,24 @@ fn media_label(media: &MediaAttrs) -> Option<String> {
     }
 }
 
+/// The name a release is shown under, TRaSH's for a movie or an episode, and the name it has when that differs.
+fn shown_names(
+    r: &ReleaseRow,
+    category: i64,
+    media: Option<&MediaAttrs>,
+    details: Option<&crate::media::details::Details>,
+) -> (String, Option<String>) {
+    match crate::trash_name::name(&r.name, category, &crate::trash_name::Known::of(media, details)) {
+        Some(shown) if shown != r.name => (shown, Some(r.name.clone())),
+        _ => (r.name.clone(), None),
+    }
+}
+
+/// The name a release has, under the one it's shown under.
+fn raw_name_html(raw: Option<&str>) -> String {
+    raw.map_or(String::new(), |raw| format!("<div class=\"raw-name\">{}</div>", escape(raw)))
+}
+
 fn row(
     r: &ReleaseRow,
     categories: &HashMap<i64, i64>,
@@ -1748,7 +1766,9 @@ fn row(
     media: &HashMap<i64, MediaAttrs>,
     extras: &RowExtras,
 ) -> String {
-    let category = escape(&label(categories.get(&r.id).copied().unwrap_or(UNCATEGORIZED)).unwrap_or_default());
+    let category_id = categories.get(&r.id).copied().unwrap_or(UNCATEGORIZED);
+    let category = escape(&label(category_id).unwrap_or_default());
+    let (shown, raw) = shown_names(r, category_id, media.get(&r.id), extras.details.get(&r.id));
     let size = fmt_size(r.size);
     let posted = escape(&fmt_date(r.posted_date.as_deref()));
     let mut tags = String::new();
@@ -1798,9 +1818,10 @@ fn row(
         .collect::<Vec<_>>()
         .join(" · ");
     format!(
-        "<tr><td class=\"name\">{thumb}<a href=\"/ui/release?id={id}\">{name}</a>{tags}<div class=\"row-meta\">{meta}</div></td><td class=\"col-cat dim\">{category}</td><td class=\"num col-size\" title=\"{size_note}\">{size}</td><td class=\"dim col-posted\">{posted}</td><td class=\"dim col-group\"><a class=\"quiet\" href=\"/?group={group_link}\">{group}</a></td><td><a class=\"button small primary\" href=\"/ui/nzb?id={id}\">NZB</a></td></tr>",
+        "<tr><td class=\"name\">{thumb}<a href=\"/ui/release?id={id}\">{name}</a>{tags}{raw}<div class=\"row-meta\">{meta}</div></td><td class=\"col-cat dim\">{category}</td><td class=\"num col-size\" title=\"{size_note}\">{size}</td><td class=\"dim col-posted\">{posted}</td><td class=\"dim col-group\"><a class=\"quiet\" href=\"/?group={group_link}\">{group}</a></td><td><a class=\"button small primary\" href=\"/ui/nzb?id={id}\">NZB</a></td></tr>",
         id = r.id,
-        name = escape(&r.name),
+        name = escape(&shown),
+        raw = raw_name_html(raw.as_deref()),
         group = escape(&r.group_name),
         group_link = attr(&url_encode(&r.group_name)),
         size_note = attr(&size_note(r.size, recovery)),
@@ -2299,6 +2320,10 @@ fn release_html(
     split_groups: Option<&[release_info::GroupPosting]>,
 ) -> String {
     let category = category.unwrap_or(UNCATEGORIZED);
+    // only what's kept: the title panel below fetches what isn't
+    let details =
+        media.and_then(|m| crate::media::details::kept_for(std::iter::once((r.id, m.kind, &m.ids))).remove(&r.id));
+    let (shown, raw) = shown_names(r, category, media, details.as_ref());
     let mut tags = String::new();
     if let Some(text) = media.and_then(media_label) {
         tags.push_str(&tag("tag-ref", &text));
@@ -2473,11 +2498,11 @@ fn release_html(
     let warning = recovery.map_or(String::new(), recovery_warning);
 
     page(
-        &format!("{} · Atlas", r.name),
+        &format!("{shown} · Atlas"),
         &format!(
             r#"{masthead}<div class="detail"><main>
 <p class="path"><a href="/">atlas::releases</a>::<b>{id}</b></p>
-<h1>{name}</h1><p>{tags}</p>
+<h1>{name}</h1>{raw}<p>{tags}</p>
 <div class="actions"><a class="button primary" href="/ui/nzb?id={id}">Download NZB</a>{fill}<a class="button" href="/?cat={category}">More in this category</a></div>
 {warning}<div id="title-details" hx-get="/ui/details?id={id}" hx-trigger="load" hx-swap="outerHTML"></div>
 <div class="panel"><dl class="facts">{facts}</dl></div>
@@ -2491,7 +2516,8 @@ fn release_html(
 </main></div>"#,
             masthead = masthead(true),
             id = r.id,
-            name = escape(&r.name),
+            name = escape(&shown),
+            raw = raw_name_html(raw.as_deref()),
         ),
     )
 }
@@ -4039,6 +4065,39 @@ mod tests {
         );
         assert!(html.contains("hx-get=\"/ui/row?id=7\"") && html.contains("hx-target=\"closest tr\""), "{html}");
         assert!(html.contains("<td class=\"num col-size\" title=\"2,048 bytes\">2.0 KB</td>"), "{html}");
+    }
+
+    #[test]
+    fn a_movie_row_is_shown_under_its_trash_name_with_its_own_name_under_it() {
+        let name = "AC317772.2026.MULTi.VFF.AD.2160p.HDR.DV.WEB.EAC3.5.1.Atmos.H265-FRQC";
+        let release = ReleaseRow {
+            id: 7,
+            name: name.into(),
+            group_name: "alt.binaries.r2d2".into(),
+            poster: None,
+            posted_date: None,
+            size: Some(2048),
+            complete: true,
+            parts: None,
+        };
+        let media =
+            HashMap::from([(7, MediaAttrs { kind: Kind::Movie as i64, year: Some(2026), ..MediaAttrs::default() })]);
+        let details = crate::media::details::Details {
+            kind: Kind::Movie as i64,
+            tmdb_id: 1,
+            title: Some("Matchbox the Movie".into()),
+            ..Default::default()
+        };
+        let extras = RowExtras { details: HashMap::from([(7, details)]), ..RowExtras::default() };
+        let html = row(&release, &HashMap::from([(7, 2045)]), &HashMap::new(), &media, &extras);
+        assert!(
+            html.contains(">Matchbox the Movie (2026) [WEB-DL-2160p][DV HDR10][EAC3 Atmos 5.1][MULTi][H265]-FRQC</a>"),
+            "{html}"
+        );
+        assert!(html.contains(&format!("<div class=\"raw-name\">{name}</div>")), "{html}");
+        // anything but a movie or an episode keeps its own name, once
+        let html = row(&release, &HashMap::from([(7, 3040)]), &HashMap::new(), &media, &extras);
+        assert!(html.contains(&format!(">{name}</a>")) && !html.contains("raw-name"), "{html}");
     }
 
     #[test]
