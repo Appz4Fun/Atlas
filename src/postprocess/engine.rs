@@ -1268,6 +1268,11 @@ fn seed_shard(conn: &Connection, enabled: StepMask, stamps: &[(u8, StepMask, i64
         crate::probe::step::rerun_bluray(conn, now)?;
         set("pp_probe_bluray", now)?;
     }
+    // once, for the MP4s with HEVC or H.264 video, which had no stills before their sample tables were read
+    if meta("pp_stills_mp4")?.is_none() {
+        crate::probe::stills::rerun_mp4(conn, now)?;
+        set("pp_stills_mp4", now)?;
+    }
     // once, for the probes that read a set's later volume before its first was looked for
     if meta("pp_probe_first_volume")?.is_none() {
         crate::probe::step::rerun_later_volumes(conn, now)?;

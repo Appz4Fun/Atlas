@@ -1,13 +1,16 @@
 //! Stills: a keyframe from a quarter, half and three quarters of the way into a release's video, decoded by
 //! our own HEVC or H.264 decoder and kept as JPEGs. The articles are read from the middle of the file, a few each.
+//! In Matroska a keyframe is found by its marks in the bytes read; in MP4 the `moov`'s sample tables say where each
+//! one is, soo those are read first.
 
 use sha2::Digest;
 
 use crate::config::Config;
 use crate::postprocess::schema::ShardTable;
-use crate::postprocess::step::{Got, Needs, Outcome, Reruns, Step, StepCtx, StepError, StepId, StepWrite};
+use crate::postprocess::step::{Got, Needs, Outcome, Reruns, Step, StepCtx, StepError, StepId, StepWrite, mask};
 use crate::store::{self, FileInfo, SegmentPick};
 use crate::video::mkv::{self, Codec, Found, VideoTrack};
+use crate::video::mp4;
 use crate::video::{h264, hevc, jpeg};
 
 use super::step::{fetch_raw, main_file};
@@ -307,6 +310,244 @@ fn track_of(ctx: &mut StepCtx<'_>, first: &FileInfo) -> Result<Option<(VideoTrac
     Ok(None)
 }
 
+/// One volume's share of a stored file: where in the file it starts, where in the volume, and how many bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Share {
+    from: u64,
+    at: u64,
+    len: u64,
+}
+
+/// Reads byte ranges of the video file wherever the post keeps them: a file posted whole, or one stored across RAR
+/// volumes. A volume's share is read from its own header, and the ones between are taken to hold as much as the
+/// second: a set's volumes are all one size but the last. A wrong guess reads bytes that don't decode, never a
+/// wrong still.
+/// Reads part `part` of a file, decoded, with what its yEnc header says it starts at (0 based).
+type Fetch<'f> = dyn FnMut(&FileInfo, i64) -> Result<Option<(u64, Vec<u8>)>, StepError> + 'f;
+
+struct FileBytes<'a> {
+    volumes: Vec<&'a FileInfo>,
+    stored: bool,
+    shares: Vec<Option<Share>>,
+    /// the stored file's name, from the first volume: a later one must hold the same file
+    name: Option<String>,
+    /// each volume's article size, from its first part
+    segments: Vec<Option<u64>>,
+    /// the parts read so far, by (volume, part): what the yEnc header says each starts at, and its bytes
+    parts: std::collections::HashMap<(usize, i64), (u64, Vec<u8>)>,
+}
+
+impl<'a> FileBytes<'a> {
+    fn new(volumes: Vec<&'a FileInfo>, stored: bool) -> Self {
+        let n = volumes.len();
+        FileBytes {
+            volumes,
+            stored,
+            shares: vec![None; n],
+            name: None,
+            segments: vec![None; n],
+            parts: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Part `part` of volume `v`, once.
+    fn part(&mut self, fetch: &mut Fetch<'_>, v: usize, part: i64) -> Result<Option<(u64, Vec<u8>)>, StepError> {
+        if let Some(got) = self.parts.get(&(v, part)) {
+            return Ok(Some(got.clone()));
+        }
+        let Some(got) = fetch(self.volumes[v], part)? else { return Ok(None) };
+        if part == 1 {
+            if got.0 != 0 {
+                return Ok(None);
+            }
+            self.segments[v] = Some(got.1.len() as u64);
+        }
+        self.parts.insert((v, part), got.clone());
+        Ok(Some(got))
+    }
+
+    /// Volume `v`'s share, from its header, starting at `from` in the file.
+    fn share(&mut self, fetch: &mut Fetch<'_>, v: usize, from: u64) -> Result<Option<Share>, StepError> {
+        if let Some(share) = self.shares[v] {
+            return Ok(Some(share));
+        }
+        let Some((_, first)) = self.part(fetch, v, 1)? else { return Ok(None) };
+        let share = if self.stored {
+            let Some(head) = archive::parse(&first) else { return Ok(None) };
+            let (Some(at), Some(len)) = (head.stored_at, head.packed) else { return Ok(None) };
+            if v == 0 {
+                self.name = head.name.clone();
+            } else if head.name != self.name || !head.split_before {
+                return Ok(None);
+            }
+            Share { from, at: at as u64, len }
+        } else {
+            Share { from: 0, at: 0, len: u64::MAX }
+        };
+        self.shares[v] = Some(share);
+        Ok(Some(share))
+    }
+
+    /// The volume holding byte `x` of the file, and its share.
+    fn locate(&mut self, fetch: &mut Fetch<'_>, x: u64) -> Result<Option<(usize, Share)>, StepError> {
+        let Some(first) = self.share(fetch, 0, 0)? else { return Ok(None) };
+        if x < first.from.saturating_add(first.len) {
+            return Ok(Some((0, first)));
+        }
+        // a share already read, as when a range runs on from one volume into the next
+        if let Some((v, share)) = self
+            .shares
+            .iter()
+            .enumerate()
+            .find_map(|(v, s)| s.filter(|s| (s.from..s.from + s.len).contains(&x)).map(|s| (v, s)))
+        {
+            return Ok(Some((v, share)));
+        }
+        if self.volumes.len() < 2 {
+            return Ok(None);
+        }
+        let Some(second) = self.share(fetch, 1, first.len)? else { return Ok(None) };
+        if x < second.from + second.len {
+            return Ok(Some((1, second)));
+        }
+        if second.len == 0 {
+            return Ok(None);
+        }
+        let v = 1 + usize::try_from((x - second.from) / second.len).unwrap_or(usize::MAX);
+        if v >= self.volumes.len() {
+            return Ok(None);
+        }
+        let Some(share) = self.share(fetch, v, second.from + (v as u64 - 1) * second.len)? else { return Ok(None) };
+        Ok((x < share.from + share.len).then_some((v, share)))
+    }
+
+    /// The file's bytes `from..to`, or None when a part is missing or doesn't sit where it should.
+    fn range(&mut self, fetch: &mut Fetch<'_>, from: u64, to: u64) -> Result<Option<Vec<u8>>, StepError> {
+        let mut out = Vec::with_capacity(usize::try_from(to.saturating_sub(from)).unwrap_or(0).min(64 << 20));
+        let mut x = from;
+        while x < to {
+            let Some((v, share)) = self.locate(fetch, x)? else { return Ok(None) };
+            let until = to.min(share.from.saturating_add(share.len));
+            // where those bytes are in the volume
+            let (mut at, end) = (share.at + (x - share.from), share.at + (until - share.from));
+            while at < end {
+                let part = match self.segments[v] {
+                    Some(segment) if segment > 0 => i64::try_from(at / segment).unwrap_or(i64::MAX - 1) + 1,
+                    _ => 1,
+                };
+                let Some((begin, body)) = self.part(fetch, v, part)? else { return Ok(None) };
+                if begin > at || begin + body.len() as u64 <= at {
+                    return Ok(None);
+                }
+                let lo = (at - begin) as usize;
+                let hi = (end - begin).min(body.len() as u64) as usize;
+                out.extend_from_slice(&body[lo..hi]);
+                at = begin + hi as u64;
+            }
+            // the next volume's share starts where this one's ends
+            if until < to && self.stored {
+                let next = v + 1;
+                if next >= self.volumes.len() {
+                    return Ok(None);
+                }
+                if self.share(fetch, next, until)?.is_none() {
+                    return Ok(None);
+                }
+            }
+            x = until;
+        }
+        Ok(Some(out))
+    }
+}
+
+/// A video track, and the keyframes for the stills as (position, frame, time in ms).
+type Frames = (VideoTrack, Vec<(u8, Vec<u8>, i64)>);
+
+/// How many top-level boxes are walked past for the `moov`: an MP4 not made for streaming has it after the media,
+/// sometimes after a `free` or `uuid` box too.
+const MOOV_HOPS: usize = 8;
+/// Enough for a box's header, even a 64-bit one.
+const BOX_HEAD: u64 = 16;
+
+/// The keyframes of an MP4 for the stills, as (position, frame, time in ms), and its video track. The `moov` is
+/// read where the top-level boxes say it is, at the front or after the media, then each keyframe's bytes.
+fn mp4_frames(fetch: &mut Fetch<'_>, volumes: Vec<&FileInfo>, stored: bool) -> Result<Option<Frames>, StepError> {
+    let mut bytes = FileBytes::new(volumes, stored);
+    let Some(mut peek) = bytes.range(fetch, 0, BOX_HEAD)? else { return Ok(None) };
+    let mut base = 0;
+    let mut moov = None;
+    for _ in 0..MOOV_HOPS {
+        match mp4::find_moov(&peek, base) {
+            mp4::Moov::At(at, size) => {
+                if size > mp4::MAX_MOOV {
+                    return Ok(None);
+                }
+                // the part of it already here is read again from the parts kept
+                moov = bytes.range(fetch, at, at + size)?;
+                break;
+            }
+            mp4::Moov::After(next) => {
+                let Some(head) = bytes.range(fetch, next, next + BOX_HEAD)? else { return Ok(None) };
+                (peek, base) = (head, next);
+            }
+            mp4::Moov::None => return Ok(None),
+        }
+    }
+    let Some(moov) = moov else { return Ok(None) };
+    let Some((_, _, head)) = mp4::box_head(&moov) else { return Ok(None) };
+    let Some(video) = moov.get(head..).and_then(mp4::video_track) else { return Ok(None) };
+    let mut frames = Vec::new();
+    for percent in POSITIONS {
+        let Some(sample) = video.keyframe_at(percent) else { continue };
+        let Some(frame) = bytes.range(fetch, sample.offset, sample.offset + u64::from(sample.size))? else { continue };
+        frames.push((percent, frame, sample.millis));
+    }
+    Ok(Some((video.track(), frames)))
+}
+
+/// The keyframes of a Matroska video for the stills, as (position, frame, time in ms), and its video track.
+fn mkv_frames(ctx: &mut StepCtx<'_>, files: &[FileInfo], first: &FileInfo) -> Result<Option<Frames>, StepError> {
+    let Some((track, stored)) = track_of(ctx, first)? else { return Ok(None) };
+    let layout = if stored {
+        let volumes = moviehash::volumes(&first.filename, files);
+        if volumes.is_empty() {
+            return Ok(None);
+        }
+        Layout::Stored(volumes)
+    } else {
+        Layout::Plain(first)
+    };
+    let mut frames = Vec::new();
+    for percent in POSITIONS {
+        let Some((file, part)) = part_at(&layout, percent) else { continue };
+        let Some((frame, at)) = keyframe_from(ctx, &layout, file, part, track.number)? else { continue };
+        let at_ms = track.millis(at);
+        frames.push((percent, frame, at_ms));
+    }
+    Ok(Some((track, frames)))
+}
+
+/// MP4 sample entries of the video the decoders read, as the probe names them.
+const MP4_CODECS: [&str; 4] = ["avc1", "avc3", "hvc1", "hev1"];
+
+/// Asks for stills again on every MP4 with HEVC or H.264 video: they had none before `mp4_frames`. Once, from the
+/// stage's seed.
+pub(crate) fn rerun_mp4(conn: &rusqlite::Connection, now: i64) -> rusqlite::Result<usize> {
+    let codecs = MP4_CODECS.map(|c| format!("'{c}'")).join(", ");
+    let ids: Vec<i64> = conn
+        .prepare(&format!(
+            "select release_id from release_probe
+             where json_extract(info, '$.media.container') = 'mp4'
+               and json_extract(info, '$.media.video[0].codec') in ({codecs})"
+        ))?
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    for id in &ids {
+        crate::postprocess::rerun_on(conn, *id, mask(STILLS_STEP), now)?;
+    }
+    Ok(ids.len())
+}
+
 /// A still from a keyframe: JPEG bytes, width, height, and its perceptual hash when it has one.
 fn still_of(track: &VideoTrack, frame: &[u8]) -> Option<(Vec<u8>, u32, u32, Option<u64>)> {
     let picture = match track.codec {
@@ -406,36 +647,37 @@ impl Step for StillsStep {
         let Some(info) = info.and_then(|i| serde_json::from_str::<ProbeInfo>(&i).ok()) else {
             return Ok(Outcome::default());
         };
-        // only video we can decode: HEVC or H.264 in Matroska, for now
+        // only video we can decode: HEVC or H.264, in Matroska or MP4
         let media = info.media.as_ref();
-        let wanted = media.is_some_and(|m| {
-            matches!(m.container.as_str(), "matroska" | "webm")
-                && m.video.first().is_some_and(|v| matches!(v.codec.as_str(), "V_MPEGH/ISO/HEVC" | "V_MPEG4/ISO/AVC"))
-        });
-        if !wanted || info.archive.as_ref().is_some_and(|a| a.encrypted || a.method.as_deref() != Some("m0")) {
+        let codec = media.and_then(|m| m.video.first()).map(|v| v.codec.as_str());
+        let container = media.map(|m| m.container.as_str());
+        let matroska = matches!(container, Some("matroska" | "webm"))
+            && matches!(codec, Some("V_MPEGH/ISO/HEVC" | "V_MPEG4/ISO/AVC"));
+        let is_mp4 = container == Some("mp4") && codec.is_some_and(|c| MP4_CODECS.contains(&c));
+        if !(matroska || is_mp4)
+            || info.archive.as_ref().is_some_and(|a| a.encrypted || a.method.as_deref() != Some("m0"))
+        {
             return Ok(Outcome::default());
         }
         let files = ctx.files().map_err(retry)?;
         let Some(first) = main_file(&files) else { return Ok(Outcome::default()) };
-        let Some((track, stored)) = track_of(ctx, first)? else { return Ok(Outcome::default()) };
-        let layout = if stored {
-            let volumes = moviehash::volumes(&first.filename, &files);
+        let found = if matroska {
+            mkv_frames(ctx, &files, first)?
+        } else {
+            let stored = info.archive.is_some();
+            let volumes = if stored { moviehash::volumes(&first.filename, &files) } else { vec![first] };
             if volumes.is_empty() {
                 return Ok(Outcome::default());
             }
-            Layout::Stored(volumes)
-        } else {
-            Layout::Plain(first)
+            mp4_frames(&mut |file: &FileInfo, part: i64| read(ctx, file, part), volumes, stored)?
         };
+        let Some((track, frames)) = found else { return Ok(Outcome::default()) };
         let mut writes = vec![StepWrite::new(DROP_STILLS, vec![release_id.into()])];
         let mut made = 0;
         let mut raw_saved = Vec::new();
-        for percent in POSITIONS {
-            let Some((file, part)) = part_at(&layout, percent) else { continue };
-            let Some((frame, at)) = keyframe_from(ctx, &layout, file, part, track.number)? else { continue };
+        for (percent, frame, at_ms) in frames {
             let Some((jpeg, w, h, phash)) = still_of(&track, &frame) else { continue };
             let Some(sha256) = keep(&jpeg) else { continue };
-            let at_ms = track.millis(at);
             let phash_i64 = phash.map(|p| p as i64);
             made += 1;
             raw_saved.push(crate::raw_store::SavedStill {
@@ -530,5 +772,189 @@ mod tests {
         assert_eq!((w, h), (320, 180));
         assert!(phash.is_some());
         assert_eq!(&jpeg[..2], &[0xff, 0xd8]);
+    }
+
+    /// A keyframe of a fixture's Matroska video, with the track it decodes with.
+    fn fixture_keyframe(name: &str) -> (VideoTrack, Vec<u8>) {
+        let data = std::fs::read(format!("{}/tests/fixtures/{name}/clip.mkv", env!("CARGO_MANIFEST_DIR"))).unwrap();
+        let track = mkv::video_track(&data).unwrap();
+        let chunk = &data[data.len() / 2..];
+        let Found::Frame { start, len, .. } = mkv::find_keyframe(chunk, track.number) else { panic!() };
+        (track, chunk[start..start + len].to_vec())
+    }
+
+    /// An MP4 of 40 samples, a keyframe every 10th, the rest filler: its `moov` before the media, or after.
+    fn mp4_file(track: &VideoTrack, keyframe: &[u8], moov_last: bool) -> Vec<u8> {
+        use crate::video::mp4::tests::{moov, mp4_box};
+        let entry = match track.codec {
+            Codec::Hevc => b"hvc1",
+            Codec::Avc => b"avc1",
+        };
+        let samples: Vec<Vec<u8>> =
+            (0..40u8).map(|i| if i % 10 == 0 { keyframe.to_vec() } else { vec![i; 700 + usize::from(i)] }).collect();
+        let sizes: Vec<u32> = samples.iter().map(|s| s.len() as u32).collect();
+        let syncs = [1, 11, 21, 31];
+        let ftyp = mp4_box(b"ftyp", b"isom\0\0\0\0");
+        let mdat = mp4_box(b"mdat", &samples.concat());
+        let moov_len = moov(entry, &track.private, &sizes, 4, 0, &syncs).len();
+        if moov_last {
+            let first_at = (ftyp.len() + 8) as u32;
+            [ftyp, mdat, moov(entry, &track.private, &sizes, 4, first_at, &syncs)].concat()
+        } else {
+            let first_at = (ftyp.len() + moov_len + 8) as u32;
+            [ftyp, moov(entry, &track.private, &sizes, 4, first_at, &syncs), mdat].concat()
+        }
+    }
+
+    /// A file's posted parts: (part number, where it starts, its bytes).
+    type Parts = Vec<(i64, u64, Vec<u8>)>;
+
+    /// A file posted in `segment` byte parts.
+    fn posted(bytes: &[u8], segment: usize) -> Parts {
+        bytes.chunks(segment).enumerate().map(|(i, c)| (i as i64 + 1, (i * segment) as u64, c.to_vec())).collect()
+    }
+
+    /// RAR4 volumes storing `inner`, `share` bytes of it in each.
+    fn rar4_volumes(inner: &[u8], share: usize) -> Vec<Vec<u8>> {
+        let name = b"Film.2016.1080p.mp4";
+        let pieces: Vec<&[u8]> = inner.chunks(share).collect();
+        let last = pieces.len() - 1;
+        pieces
+            .iter()
+            .enumerate()
+            .map(|(i, piece)| {
+                let flags: u16 = 0x8000 | if i > 0 { 0x01 } else { 0 } | if i < last { 0x02 } else { 0 };
+                let mut h = vec![0u8, 0, 0x74];
+                h.extend(flags.to_le_bytes());
+                h.extend(((32 + name.len()) as u16).to_le_bytes());
+                h.extend((piece.len() as u32).to_le_bytes());
+                h.extend((inner.len() as u32).to_le_bytes());
+                h.push(3);
+                h.extend(0u32.to_le_bytes());
+                h.extend(0u32.to_le_bytes());
+                h.push(29);
+                h.push(0x30);
+                h.extend((name.len() as u16).to_le_bytes());
+                h.extend(0u32.to_le_bytes());
+                h.extend(name);
+                [b"Rar!\x1a\x07\x00".as_slice(), &[0, 0, 0x73, 0, 0, 13, 0, 0, 0, 0, 0, 0, 0], &h, piece].concat()
+            })
+            .collect()
+    }
+
+    /// The stills an MP4 posted as these files makes, read through `mp4_frames`, and the parts it read.
+    fn mp4_stills(files: &[(FileInfo, Parts)], stored: bool) -> (Vec<(u8, u32, u32, i64)>, usize) {
+        let mut reads = 0;
+        let mut fetch = |f: &FileInfo, part: i64| -> Result<Option<(u64, Vec<u8>)>, StepError> {
+            reads += 1;
+            let (_, parts) = files.iter().find(|(file, _)| file.id == f.id).unwrap();
+            Ok(parts.iter().find(|(p, ..)| *p == part).map(|(_, begin, body)| (*begin, body.clone())))
+        };
+        let volumes: Vec<&FileInfo> = files.iter().map(|(f, _)| f).collect();
+        let (track, frames) = mp4_frames(&mut fetch, volumes, stored).unwrap().unwrap();
+        let stills = frames
+            .iter()
+            .map(|(percent, frame, at_ms)| {
+                let (jpeg, w, h, _) = still_of(&track, frame).expect("the keyframe decodes");
+                assert_eq!(&jpeg[..2], &[0xff, 0xd8]);
+                (*percent, w, h, *at_ms)
+            })
+            .collect();
+        (stills, reads)
+    }
+
+    fn numbered(id: i64, name: &str, parts: usize) -> FileInfo {
+        FileInfo { id, ..file(name, parts as i64) }
+    }
+
+    #[test]
+    fn an_mp4_posted_whole_gives_stills_with_its_moov_first_or_last() {
+        for (fixture, size) in [("hevc", (320, 180)), ("h264", (320, 180))] {
+            let (track, keyframe) = fixture_keyframe(fixture);
+            for moov_last in [false, true] {
+                let parts = posted(&mp4_file(&track, &keyframe, moov_last), 3_000);
+                let film = numbered(1, "film.mp4", parts.len());
+                let (stills, reads) = mp4_stills(&[(film, parts.clone())], false);
+                // 25, 50 and 75% are samples 10, 20 and 30: the keyframes, at 1001/24000 s a sample
+                let times: Vec<i64> = [10, 20, 30].iter().map(|n| n * 1001 * 1000 / 24000).collect();
+                let want: Vec<_> = [25, 50, 75].iter().zip(&times).map(|(p, t)| (*p, size.0, size.1, *t)).collect();
+                let got: Vec<_> = stills.iter().map(|(p, w, h, t)| (*p, (*w, *h), *t)).collect();
+                assert_eq!(got.len(), 3, "{fixture} moov_last={moov_last}");
+                for ((p, (w, h), t), (wp, ww, wh, wt)) in got.iter().zip(&want) {
+                    assert_eq!((*p, *t), (*wp, *wt));
+                    assert!(*w > 0 && *h > 0 && *w <= *ww && *h <= *wh);
+                }
+                // each part read once at most
+                assert!(reads <= parts.len(), "{reads} reads of {} parts", parts.len());
+            }
+        }
+    }
+
+    #[test]
+    fn an_mp4_stored_across_rar_volumes_gives_stills() {
+        let (track, keyframe) = fixture_keyframe("hevc");
+        // shares smaller than a keyframe: frames run across volumes, and across parts within one
+        let share = keyframe.len() / 2 + 333;
+        for moov_last in [false, true] {
+            let inner = mp4_file(&track, &keyframe, moov_last);
+            let files: Vec<(FileInfo, Parts)> = rar4_volumes(&inner, share)
+                .iter()
+                .enumerate()
+                .map(|(i, v)| {
+                    let parts = posted(v, 1_500);
+                    (numbered(i as i64 + 1, &format!("x.part{:03}.rar", i + 1), parts.len()), parts)
+                })
+                .collect();
+            let (stills, _) = mp4_stills(&files, true);
+            assert_eq!(stills.iter().map(|s| s.0).collect::<Vec<_>>(), [25, 50, 75], "moov_last={moov_last}");
+        }
+    }
+
+    #[test]
+    fn a_missing_part_gives_no_still_rather_than_a_wrong_one() {
+        let (track, keyframe) = fixture_keyframe("hevc");
+        let mut parts = posted(&mp4_file(&track, &keyframe, false), 3_000);
+        let film = numbered(1, "film.mp4", parts.len());
+        // the part holding the 50% keyframe is gone
+        let inner = mp4_file(&track, &keyframe, false);
+        let (_, size, head) = mp4::box_head(&inner[16..]).unwrap();
+        let video = mp4::video_track(&inner[16 + head..16 + size.unwrap() as usize]).unwrap();
+        let at = video.keyframe_at(50).unwrap().offset as usize;
+        parts.retain(|(p, ..)| *p != (at / 3_000) as i64 + 1);
+        let (stills, _) = mp4_stills(&[(film, parts)], false);
+        assert_eq!(stills.iter().map(|s| s.0).collect::<Vec<_>>(), [25, 75]);
+    }
+
+    #[test]
+    fn mp4s_with_video_we_decode_are_asked_for_stills_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        crate::db::create_db_at(&main).unwrap();
+        let conn = crate::db::open_shard(&crate::store::shard_path(&main, 0)).unwrap();
+        for (id, info) in [
+            (1i64, r#"{"media":{"container":"mp4","video":[{"codec":"hev1"}]}}"#),
+            (2, r#"{"media":{"container":"mp4","video":[{"codec":"avc1"}]}}"#),
+            (3, r#"{"media":{"container":"mp4","video":[{"codec":"mp4v"}]}}"#),
+            (4, r#"{"media":{"container":"matroska","video":[{"codec":"V_MPEGH/ISO/HEVC"}]}}"#),
+        ] {
+            conn.execute("insert into releases (id, name, group_name) values (?, ?, 'g')", rusqlite::params![id, id])
+                .unwrap();
+            conn.execute(
+                "insert into pp_state (release_id, done) values (?, ?)",
+                rusqlite::params![id, mask(STILLS_STEP)],
+            )
+            .unwrap();
+            conn.execute("insert into release_probe (release_id, info) values (?, ?)", rusqlite::params![id, info])
+                .unwrap();
+        }
+        assert_eq!(rerun_mp4(&conn, 100).unwrap(), 2);
+        let done: Vec<i64> = conn
+            .prepare("select done from pp_state order by release_id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(done, [0, 0, mask(STILLS_STEP) as i64, mask(STILLS_STEP) as i64]);
     }
 }

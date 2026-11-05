@@ -13,5 +13,6 @@ pub mod h264;
 pub mod hevc;
 pub mod jpeg;
 pub mod mkv;
+pub mod mp4;
 pub mod phash;
 pub mod picture;
