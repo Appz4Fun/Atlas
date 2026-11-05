@@ -84,6 +84,17 @@ pub(crate) fn rerun_avi(conn: &rusqlite::Connection, now: i64) -> rusqlite::Resu
     )
 }
 
+/// A saved probe of an AVI with no media, from before `avi` read them: probed again rather than reused, as when
+/// the shards were made again and `rerun_avi` found nothing to ask for.
+fn unread_avi(info: &str) -> bool {
+    let Ok(p) = serde_json::from_str::<serde_json::Value>(info) else { return false };
+    let avi = |name: Option<&str>| {
+        let lower = name.unwrap_or_default().to_ascii_lowercase();
+        lower.ends_with(".avi") || lower.contains(".avi.0")
+    };
+    p["media"].is_null() && (avi(p["file"].as_str()) || avi(p["archive"]["name"].as_str()))
+}
+
 /// The probe again, past its saved result, on the releases whose probe row matches `filter`.
 fn rerun_probes(conn: &rusqlite::Connection, filter: &str, now: i64) -> rusqlite::Result<usize> {
     let ids: Vec<i64> = conn
@@ -151,6 +162,7 @@ impl Step for ProbeStep {
                         s.cover
                             .as_ref()
                             .is_none_or(|(_, sha)| super::cover_file(sha).is_some_and(|p| p.exists()))
+                            && !unread_avi(&s.info)
                     },
                 )
         {
@@ -600,6 +612,15 @@ mod tests {
         let queued: i64 = conn.query_row("select count(*) from pp_queue", [], |r| r.get(0)).unwrap();
         assert_eq!(queued, 4);
         assert_eq!(state(7), (mask(PROBE_STEP), 0), "read already");
+    }
+
+    #[test]
+    fn a_saved_avi_probe_with_no_tracks_isnt_reused() {
+        assert!(unread_avi(r#"{"file":"Show.S01E01.XviD.avi","media":null}"#));
+        assert!(unread_avi(r#"{"file":"a.part01.rar","archive":{"name":"Movie.CD1.AVI"},"media":null}"#));
+        assert!(unread_avi(r#"{"file":"Movie.avi.001"}"#));
+        assert!(!unread_avi(r#"{"file":"Movie.avi","media":{"container":"avi"}}"#), "read");
+        assert!(!unread_avi(r#"{"file":"Movie.mkv","media":null}"#));
     }
 
     #[test]
