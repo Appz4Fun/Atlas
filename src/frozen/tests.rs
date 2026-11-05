@@ -590,7 +590,7 @@ fn the_backlog_walk_queues_what_no_visit_comes_back_to_a_chunk_at_a_time() {
     };
     assert!(rules::evaluate(&conn, f.id(&conn, "Old.0"), 7).unwrap(), "a visit queued it earlier");
 
-    let step = || rules::backlog_some(&conn, 2, NOW).unwrap();
+    let step = || rules::backlog_some(&conn, 2, Duration::from_secs(60), NOW).unwrap();
     // newest first: Big (too big), then Old.4 and Old.3
     assert_eq!(step(), rules::Backlog { looked_at: 2, queued: 1 });
     assert_eq!(queued_at("Old.4"), Some(NOW));
@@ -608,4 +608,32 @@ fn the_backlog_walk_queues_what_no_visit_comes_back_to_a_chunk_at_a_time() {
     conn.execute("update meta set value = value + 1 where key = 'freeze_backlog_rules'", []).unwrap();
     assert_eq!(step(), rules::Backlog { looked_at: 2, queued: 1 });
     assert_eq!(queued_at("Old.4"), Some(NOW));
+}
+
+#[test]
+fn a_tick_lets_go_while_another_connection_holds_the_lock_and_the_next_one_moves() {
+    let f = Fixture::new();
+    f.save(&[post("Small", &["b.mkv"], 1, 10)]);
+    let conn = f.writer();
+    conn.execute_batch("insert into freeze_pending (release_id, reason, at) select id, 'test', 1 from releases")
+        .unwrap();
+    let other = db::open_shard(&f.shard_path()).unwrap();
+    other.execute_batch("begin immediate").unwrap();
+    let tick = || Ticker { disk: Some((Instant::now(), true)), ..Ticker::default() }.tick(&conn, NOW).unwrap();
+    assert_eq!(tick(), Moved { busy: true, ..Moved::default() }, "not an error");
+    assert_eq!(count(&conn, "select count(*) from freeze_pending"), 1, "still queued");
+    other.execute_batch("rollback").unwrap();
+    assert_eq!(tick().frozen, 1);
+}
+
+#[test]
+fn a_backlog_step_stops_after_a_chunk_once_its_time_is_up() {
+    let f = Fixture::new();
+    let names: Vec<String> = (0..300).map(|n| format!("Old.{n}")).collect();
+    f.save(&names.iter().map(|n| post(n, &["a.rar"], 1, 100)).collect::<Vec<_>>());
+    let conn = f.writer();
+    let step = |budget| rules::backlog_some(&conn, 1_000, budget, NOW).unwrap();
+    assert_eq!(step(Duration::ZERO), rules::Backlog { looked_at: 250, queued: 250 });
+    assert_eq!(step(Duration::from_secs(60)), rules::Backlog { looked_at: 50, queued: 50 }, "on from where it got to");
+    assert_eq!(meta(&conn, "freeze_backlog_below"), 0);
 }

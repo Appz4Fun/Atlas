@@ -926,6 +926,8 @@ async fn run_servers(
         passes: AtomicUsize::new(0),
     });
 
+    // a rebuild or a compaction stopped the last run: these writers freeze again
+    crate::frozen::STOPPING.store(false, Ordering::Relaxed);
     let db = match db::open().and_then(|conn| db::tune_for_writing(&conn).map(|_| conn)) {
         Ok(conn) => {
             // before any pass: what is there so far was saved by file name
@@ -1007,6 +1009,14 @@ async fn run_servers(
         let settings = settings_of(config);
         tasks.spawn(crate::repair::run(sched.ctx.clone(), settings, db.clone(), move || s.stopping()));
     }
+    // once stopping, the writers do no freezing: their queues of saves drain as fast as they did before it
+    let s = sched.clone();
+    tasks.spawn(async move {
+        while !s.stopping() {
+            nap(Duration::from_secs(1), || s.stopping()).await;
+        }
+        crate::frozen::STOPPING.store(true, Ordering::Relaxed);
+    });
     tasks.spawn(watch_config(sched.clone(), servers));
     tasks.spawn(report(sched.clone()));
     tasks.spawn(compact_timer(sched.clone()));
