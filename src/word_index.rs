@@ -265,6 +265,9 @@ impl WordIndex {
         if let Some(shown) = &row.display_name {
             doc.add_text(f.words, shown);
         }
+        if let Some(title) = &row.known_as {
+            doc.add_text(f.words, title);
+        }
         let category = row.category.unwrap_or(UNCATEGORIZED);
         doc.add_u64(f.category, category as u64);
         doc.add_u64(f.cat_rank, self.ranks.get(&category).copied().unwrap_or(0));
@@ -334,9 +337,10 @@ impl WordIndex {
         let mut since_commit = 0;
         for s in first..store::SHARDS {
             loop {
-                let rows = read_rows(conn, s, &format!("r.id > ?1 order by r.id limit {batch}"), after)?;
+                let mut rows = read_rows(conn, s, &format!("r.id > ?1 order by r.id limit {batch}"), after)?;
                 let Some(last) = rows.last() else { break };
                 after = last.id;
+                known_as(conn, &mut rows);
                 for doc in self.docs(&rows) {
                     writer.add_document(doc)?;
                 }
@@ -396,6 +400,7 @@ impl WordIndex {
             writer.delete_term(Term::from_field_u64(self.fields.id, id as u64));
             rows.extend(read_rows(conn, s, "r.id = ?1", id)?);
         }
+        known_as(conn, &mut rows);
         for doc in self.docs(&rows) {
             writer.add_document(doc)?;
         }
@@ -701,13 +706,22 @@ struct Indexed {
     posted: Option<String>,
     size: Option<i64>,
     category: Option<i64>,
+    /// The media title key of a release named by an id in place of its title (`AC317772.2026...`, AlloCiné's).
+    title_key: Option<i64>,
+    /// What that id is the title of, as the media lookup decoded it: a search for the title finds the release.
+    known_as: Option<String>,
 }
+
+/// A name that starts with an AlloCiné id in place of the title, as SQLite's `glob` has it.
+const ID_NAMED: &str = "'AC[0-9][0-9][0-9][0-9]*'";
 
 /// The releases of shard `s` that a client may see, picked by `clause` with `?1` bound to `value`.
 fn read_rows(conn: &Connection, s: usize, clause: &str, value: i64) -> rusqlite::Result<Vec<Indexed>> {
     let sql = format!(
-        "select r.id, r.name, r.display_name, r.group_name, r.posted_date, r.size, c.category
+        "select r.id, r.name, r.display_name, r.group_name, r.posted_date, r.size, c.category,
+                iif(r.name glob {ID_NAMED} or r.display_name glob {ID_NAMED}, m.title_key, null)
            from s{s}.releases r left join s{s}.release_category c on c.release_id = r.id
+                left join s{s}.media_release m on m.release_id = r.id
           where {VISIBLE_RELEASE} and {clause}"
     );
     let mut stmt = conn.prepare_cached(&sql)?;
@@ -720,9 +734,41 @@ fn read_rows(conn: &Connection, s: usize, clause: &str, value: i64) -> rusqlite:
             posted: r.get(4)?,
             size: r.get(5)?,
             category: r.get(6)?,
+            title_key: r.get(7)?,
+            known_as: None,
         })
     })?
     .collect()
+}
+
+/// The decoded titles of the `rows` named by an id, from the media lookup's titles beside the main database. One
+/// it hasn't decoded yet, or a media database that can't be read, leaves the release found by its name alone: the
+/// lookup's writes to `media_release` queue it again.
+fn known_as(conn: &Connection, rows: &mut [Indexed]) {
+    if rows.iter().all(|r| r.title_key.is_none()) {
+        return;
+    }
+    let Some(main) = conn.path().filter(|p| !p.is_empty()) else { return };
+    let path = crate::media::store::path_for(Path::new(main));
+    if !path.exists() {
+        return;
+    }
+    let Ok(media) = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY) else { return };
+    let Ok(mut stmt) = media.prepare("select found_title, title from media_titles where title_key = ?1") else {
+        return;
+    };
+    for row in rows.iter_mut() {
+        let Some(key) = row.title_key else { continue };
+        let titles: Option<(Option<String>, String)> =
+            stmt.query_row([key], |r| Ok((r.get(0)?, r.get(1)?))).optional().ok().flatten();
+        let Some((found, asked)) = titles else { continue };
+        // a title cached before ids were decoded is the id itself, which the name already has
+        row.known_as = [found, Some(asked)]
+            .into_iter()
+            .flatten()
+            .map(|t| t.trim().to_string())
+            .find(|t| !t.is_empty() && crate::media::allocine::allocine_id(t).is_none());
+    }
 }
 
 /// The queue and the triggers that fill it, in a shard. Its `releases` and `release_category` are there already.
@@ -745,11 +791,23 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         create trigger if not exists word_queue_ci after insert on release_category begin {new_c} end;
         create trigger if not exists word_queue_cd after delete on release_category begin {old_c} end;
         create trigger if not exists word_queue_cu after update on release_category begin {new_c} {old_c} end;
+        -- a release named by an AlloCiné id is found by the title it decodes to (`known_as`), once the lookup has it
+        create trigger if not exists word_queue_mi after insert on media_release
+        when exists (select 1 from releases where id = new.release_id and {id_named})
+        begin {new_c} end;
+        create trigger if not exists word_queue_mu after update of title_key, tvdb_id, tvmaze_id, trakt_id, tmdb_id,
+            imdb_id on media_release
+        when (old.title_key is not new.title_key or old.tvdb_id is not new.tvdb_id
+            or old.tvmaze_id is not new.tvmaze_id or old.trakt_id is not new.trakt_id
+            or old.tmdb_id is not new.tmdb_id or old.imdb_id is not new.imdb_id)
+            and exists (select 1 from releases where id = new.release_id and {id_named})
+        begin {new_c} end;
         ",
         new = queue("new.id"),
         old = queue("old.id"),
         new_c = queue("new.release_id"),
         old_c = queue("old.release_id"),
+        id_named = format!("(name glob {ID_NAMED} or display_name glob {ID_NAMED})"),
     ))
 }
 
@@ -1088,6 +1146,59 @@ mod tests {
         index.reader.reload().unwrap();
         assert_eq!(index.count("delta", None, &[]).unwrap(), 1);
         assert_eq!(index.count("gamma", None, &[]).unwrap(), 1);
+    }
+
+    #[test]
+    fn a_release_named_by_an_allocine_id_is_found_by_its_decoded_title() {
+        let f = fixture();
+        let index = f.index();
+        let conn = f.conn();
+        let group = "alt.binaries.r2d2";
+        let ac = f.add("AC317772.2026.MULTi.VFF.2160p.DV.WEB.H265-FRQC", group, 5, Some(UHD));
+        let plain = f.add("Other.Movie.2026.2160p.WEB.H265-FRQC", group, 5, Some(UHD));
+        let old = f.add("AC267335.2026.MULTi.1080p.WEB.H264-FRQC", group, 5, Some(HD));
+        index.build(&conn).unwrap();
+        assert_eq!(index.count("matchbox", None, &[]).unwrap(), 0);
+        // the media lookup's titles: one decoded, one cached as the id itself before ids were decoded
+        let media = crate::media::store::open(&crate::media::store::path_for(&f.main)).unwrap();
+        let title = |key: i64, title: &str, found: Option<&str>| crate::media::store::TitleRow {
+            key,
+            kind: 1,
+            title: title.into(),
+            found_title: found.map(str::to_string),
+            ..Default::default()
+        };
+        crate::media::store::put(&media, &title(11, "Matchbox: The Movie", Some("Matchbox the Movie"))).unwrap();
+        crate::media::store::put(&media, &title(22, "AC267335", None)).unwrap();
+        crate::media::store::put(&media, &title(33, "Coyote vs. Acme", None)).unwrap();
+        let shard = f.shard(group);
+        shard.execute("delete from word_queue", []).unwrap();
+        let link = "insert into media_release (release_id, kind, title_key, quality) values (?1, 1, ?2, 0)";
+        for (id, key) in [(ac, 11), (old, 22), (plain, 33)] {
+            shard.execute(link, [id, key]).unwrap();
+        }
+        let queued: Vec<i64> = shard
+            .prepare("select release_id from word_queue order by release_id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(queued, vec![ac, old], "a release named by its title isn't read again for its media row");
+        index.drain(&conn).unwrap();
+        let found = |words: &str| ids(&index.search(&conn, words, None, &[], By::Relevance, true, 0, 10).unwrap());
+        assert_eq!(found("matchbox"), vec![ac]);
+        assert_eq!(found("matchbox movie 2160p"), vec![ac], "with the words of its name too");
+        assert_eq!(found("ac317772"), vec![ac], "and still by the id");
+        assert!(found("coyote").is_empty(), "a title is only added to a release named by an id");
+        // the ids found later queue it again, and a build reads the titles too
+        shard.execute("update media_release set tmdb_id = 1148365 where release_id = ?1", [ac]).unwrap();
+        let n: i64 = shard.query_row("select count(*) from word_queue", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 1);
+        crate::media::store::put(&media, &title(22, "AC267335", Some("Coyote vs. Acme"))).unwrap();
+        index.build(&conn).unwrap();
+        assert_eq!(found("matchbox"), vec![ac]);
+        assert_eq!(found("coyote acme"), vec![old]);
     }
 
     #[test]

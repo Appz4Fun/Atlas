@@ -66,12 +66,18 @@ pub(crate) fn meta_html(conn: Option<&Connection>, i: &MetaInputs<'_>) -> String
 /// OpenSubtitles hash.
 fn lookup_of(i: &MetaInputs<'_>, l: &Looked) -> crate::keys::Lookup {
     let timing: Vec<(Option<i64>, i64)> = l.timing.iter().map(|t| (t.lines, t.articles)).collect();
+    let shard = shard_conn(i.release.id);
     crate::keys::Lookup {
         keys: crate::keys::keys_of(i.probe, &timing, i.release.parts, l.salt),
-        par2_sets: shard_conn(i.release.id)
-            .map(|s| crate::keys::par2_sets(&s, i.release.id).unwrap_or_default())
+        par2_sets: shard
+            .as_ref()
+            .map(|s| crate::keys::par2_sets(s, i.release.id).unwrap_or_default())
             .unwrap_or_default(),
         moviehash: i.probe.and_then(|p| p.moviehash.clone()),
+        files: shard
+            .as_ref()
+            .and_then(|s| crate::keys::crc_files(s, i.release.id, i.probe).ok())
+            .unwrap_or_else(|| i.probe.and_then(crate::keys::probe_file).into_iter().collect()),
     }
 }
 
@@ -2072,6 +2078,31 @@ fn keys_panel(i: &MetaInputs<'_>, l: &Looked, compact: bool) -> Facts {
             .map(|k| with_link(k, Kind::Video)),
     );
     // counted from the tables the twin and probe work keep, shown here only when another release shares them
+    f.add_html(
+        "File CRC",
+        i.probe
+            .and_then(crate::keys::probe_file)
+            .map(|file| {
+                format!(
+                    "{} over {} bytes{}",
+                    key_code(&format!("{:08x}", file.crc32)),
+                    thousands(file.size),
+                    same_link(l, id, Kind::FileCrc)
+                )
+            })
+            .or_else(|| {
+                // no probed file, but a PAR2-described one another release has too
+                let link = same_link(l, id, Kind::FileCrc);
+                (!link.is_empty()).then(|| format!("A file its PAR2 set describes{link}"))
+            }),
+    );
+    f.add_html(
+        "First-article body CRC",
+        i.probe
+            .and_then(|p| p.headers.get(crate::probe::BODY_CRC_HEADER))
+            .and_then(|v| crate::keys::received_body_crc(v))
+            .map(|crc| with_link(format!("{crc:08x}"), Kind::BodyCrc)),
+    );
     if !same_link(l, id, Kind::Par2).is_empty() {
         f.add_html("PAR2 set", Some(format!("PAR2 recovery set{}", same_link(l, id, Kind::Par2))));
     }

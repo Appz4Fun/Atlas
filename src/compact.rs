@@ -459,6 +459,7 @@ fn compact_shard(
          drop trigger uncategorized_categorized; drop trigger uncategorized_uncategorized;
          drop trigger word_queue_ai; drop trigger word_queue_ad; drop trigger word_queue_au;
          drop trigger word_queue_ci; drop trigger word_queue_cd; drop trigger word_queue_cu;
+         drop trigger word_queue_mi; drop trigger word_queue_mu;
          drop index idx_release_unique; drop index idx_release_group; drop index files_key;",
     )?;
     conn.execute("attach database ? as old", [path.to_string_lossy()])?;
