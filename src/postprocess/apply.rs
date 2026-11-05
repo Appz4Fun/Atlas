@@ -596,6 +596,10 @@ mod tests {
             rank(&conn, id)
         };
         assert_eq!(ranked(100 << 20, None), Some(0), "small");
+        assert_eq!(ranked(400 << 20, Some(5040)), Some(1), "an SD episode, with the 1 GiB ones");
+        assert_eq!(ranked(300 << 20, Some(2030)), Some(1), "an SD movie");
+        assert_eq!(ranked(10 << 20, Some(5040)), Some(0), "a sample or a piece of a split post");
+        assert_eq!(ranked(400 << 20, Some(8010)), Some(0), "a small Other one");
         assert_eq!(ranked(2 * gib, None), Some(1), "no category yet, as an obfuscated upload");
         assert_eq!(ranked(8 * gib, Some(5040)), Some(2), "TV");
         assert_eq!(ranked(20 * gib, Some(2045)), Some(3), "a UHD movie");
@@ -615,6 +619,37 @@ mod tests {
         conn.execute("update pp_state set net_rank = 4", []).unwrap();
         crate::postprocess::engine::rank_ids(&conn, &[id]).unwrap();
         assert_eq!(rank(&conn, id), Some(4), "a ranked one is left as it is");
+    }
+
+    #[test]
+    fn small_video_ranked_before_it_counted_is_ranked_again() {
+        let (_dir, conn, id) = shard();
+        let (other, audio, sample) = (id + 1, id + 2, id + 3);
+        for (n, size, category) in [(id, 400i64 << 20, 5040), (other, 400 << 20, 8010), (audio, 400 << 20, 3010)]
+            .into_iter()
+            .chain([(sample, 1 << 20, 2040)])
+        {
+            if n != id {
+                conn.execute(
+                    "insert into releases (id, name, group_name) values (?, ?, 'g')",
+                    params![n, n.to_string()],
+                )
+                .unwrap();
+            }
+            conn.execute("update releases set size = ? where id = ?", params![size, n]).unwrap();
+            conn.execute("insert into release_category (release_id, category) values (?, ?)", params![n, category])
+                .unwrap();
+            conn.execute("insert into pp_state (release_id, net_wanted, net_rank) values (?, 1, 0)", [n]).unwrap();
+        }
+        let floor = crate::postprocess::schema::SMALL_VIDEO.to_string();
+        assert!(crate::postprocess::schema::NET_RANK.contains(&floor), "the rank and the rerank agree on the size");
+        assert_eq!(crate::postprocess::engine::rerank_small_video(&conn).unwrap(), 1);
+        assert_eq!(rank(&conn, id), Some(1), "the episode");
+        for n in [other, audio, sample] {
+            assert_eq!(rank(&conn, n), Some(0), "{n}");
+        }
+        conn.execute("update pp_state set net_rank = 0, net_wanted = null where release_id = ?", [id]).unwrap();
+        assert_eq!(crate::postprocess::engine::rerank_small_video(&conn).unwrap(), 0, "nor one the lane is done with");
     }
 
     #[test]
