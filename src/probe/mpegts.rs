@@ -45,6 +45,8 @@ pub fn mpeg_ts(data: &[u8]) -> MediaInfo {
     let data = &data[..data.len().min(MAX_WALK)];
     let mut pmt_pids: Vec<u16> = Vec::new();
     let mut streams: Option<Vec<Es>> = None;
+    // a table's section as its packets come, from its pointer field on: a map can run over several packets
+    let (mut pat_buf, mut pmt_buf): (Option<Vec<u8>>, Option<(u16, Vec<u8>)>) = (None, None);
     let mut at = first;
     while let Some(packet) = data.get(at..at + 188) {
         at += size;
@@ -54,10 +56,28 @@ pub fn mpeg_ts(data: &[u8]) -> MediaInfo {
         let start = packet[1] & 0x40 != 0;
         let pid = u16::from_be_bytes([packet[1] & 0x1F, packet[2]]);
         let Some(payload) = payload(packet) else { continue };
-        if pid == 0 && start && pmt_pids.is_empty() {
-            pmt_pids = pat(payload);
-        } else if streams.is_none() && start && pmt_pids.contains(&pid) {
-            streams = pmt(payload);
+        if pid == 0 && pmt_pids.is_empty() {
+            if start {
+                pat_buf = Some(Vec::new());
+            }
+            if let Some(buf) = pat_buf.as_mut() {
+                buf.extend_from_slice(payload);
+                if whole(buf) {
+                    pmt_pids = pat(buf);
+                    pat_buf = None;
+                }
+            }
+        } else if streams.is_none() && pmt_pids.contains(&pid) {
+            if start {
+                pmt_buf = Some((pid, Vec::new()));
+            }
+            if let Some((_, buf)) = pmt_buf.as_mut().filter(|(p, _)| *p == pid) {
+                buf.extend_from_slice(payload);
+                if whole(buf) {
+                    streams = pmt(buf);
+                    pmt_buf = None;
+                }
+            }
         } else if let Some(es) = streams.as_mut().and_then(|s| s.iter_mut().find(|e| e.pid == pid))
             && es.payload.len() < MAX_ES
         {
@@ -103,6 +123,16 @@ fn payload(p: &[u8]) -> Option<&[u8]> {
         1 => p.get(4..),
         3 => p.get(5 + usize::from(*p.get(4)?)..),
         _ => None,
+    }
+}
+
+/// Whether a section buffered from its pointer field on has all its declared bytes, or more than any section has.
+fn whole(buf: &[u8]) -> bool {
+    let Some(&pointer) = buf.first() else { return false };
+    let s = &buf[(1 + usize::from(pointer)).min(buf.len())..];
+    match (s.get(1), s.get(2)) {
+        (Some(hi), Some(lo)) => s.len() >= 3 + usize::from(u16::from_be_bytes([hi & 0x0F, *lo])),
+        _ => buf.len() > 4096,
     }
 }
 
@@ -258,7 +288,14 @@ fn video(codec: &str, es: &[u8], v: &mut VideoTrack) {
 
 fn audio(codec: &str, es: &[u8]) -> AudioTrack {
     match codec {
-        "ac3" | "eac3" => super::mpegps::ac3(es),
+        "ac3" | "eac3" => {
+            // the map's codec stands when no frame was read to say otherwise
+            let mut a = super::mpegps::ac3(es);
+            if a.sample_rate.is_none() {
+                a.codec = codec.into();
+            }
+            a
+        }
         "dts" => super::mpegps::dts(es),
         "mp2" => {
             let mut a = AudioTrack { codec: "mp2".into(), ..AudioTrack::default() };
@@ -357,6 +394,26 @@ mod tests {
         assert_eq!(audio, [("mp2", Some(2), Some("deu")), ("ac3", Some(6), Some("eng"))]);
         assert_eq!(info.subtitles[0].codec, "dvb_subtitle");
         assert_eq!(info.subtitles[0].language.as_deref(), Some("ger"));
+    }
+
+    #[test]
+    fn a_map_over_several_packets_is_read_whole_and_eac3_stays_eac3() {
+        let pat = section(0, &[0, 1, 0xE1, 0x00]);
+        let mut map = vec![0xE1, 0x00, 0xF0, 0x00];
+        for n in 0..20u8 {
+            map.extend([0x03, 0xE1, 0x10 + n, 0xF0, 0x06, 0x0A, 0x04, b'e', b'n', b'g', 0]);
+        }
+        // E-AC-3 by type, with no frame read
+        map.extend([0x87, 0xE1, 0x40, 0xF0, 0x00]);
+        let pmt = section(2, &map);
+        assert!(pmt.len() > 184);
+        // and null packets, as a stream has between
+        let data =
+            [packets(0, &pat, true), packets(0x100, &pmt, true), packets(0x1FFF, &[0u8; 184 * 3], false)].concat();
+        assert!(!whole(&[&[0u8][..], &pmt[1..183]].concat()), "the first packet's part isn't the section");
+        let info = mpeg_ts(&data);
+        assert_eq!(info.audio.len(), 21);
+        assert_eq!(info.audio[20].codec, "eac3");
     }
 
     #[test]
