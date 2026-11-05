@@ -116,6 +116,7 @@ pub fn create_main(conn: &Connection) -> Result<()> {
          insert or ignore into meta (key, value) values ('next_seq', 1);",
     )?;
     crate::chunks::create(conn)?;
+    crate::spotnet::store::create_main(conn)?;
     Ok(())
 }
 

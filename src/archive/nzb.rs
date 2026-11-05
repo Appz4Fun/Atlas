@@ -41,6 +41,10 @@ pub struct NzbFile {
     pub total_bytes: u64,
     /// the groups its `<groups>` names, the first `MAX_GROUPS`
     pub groups: Vec<String>,
+    /// its `subject`, `poster` and `date` (unix seconds) attributes, as written
+    pub subject: String,
+    pub poster: String,
+    pub date: i64,
 }
 
 /// Groups of a file kept at most.
@@ -54,10 +58,10 @@ impl NzbFile {
         self.total_bytes
     }
 
-    fn add(&mut self, segment: Segment, kept: &mut usize) {
+    fn add(&mut self, segment: Segment, kept: &mut usize, max_kept: usize) {
         self.articles += 1;
         self.total_bytes = self.total_bytes.saturating_add(segment.bytes);
-        if *kept < MAX_KEPT_SEGMENTS {
+        if *kept < max_kept {
             *kept += 1;
             self.segments.push(segment);
         }
@@ -83,6 +87,12 @@ pub struct Parsed {
 /// Each `<file>` with a name, at most `MAX_ENTRIES`, and its segments. A cut or broken NZB gives what came before
 /// the break. Bytes that aren't UTF-8 are read as replacement characters.
 pub fn parse(body: &[u8]) -> Parsed {
+    parse_keeping(body, MAX_KEPT_SEGMENTS)
+}
+
+/// `parse`, keeping up to `max_kept` segments across the NZB rather than `MAX_KEPT_SEGMENTS`: for an NZB that is
+/// to be saved whole, such as a spot's.
+pub fn parse_keeping(body: &[u8], max_kept: usize) -> Parsed {
     let text = String::from_utf8_lossy(body);
     let mut reader = Reader::from_str(&text);
     let mut parsed = Parsed::default();
@@ -97,7 +107,7 @@ pub fn parse(body: &[u8]) -> Parsed {
     loop {
         match reader.read_event() {
             Ok(Event::Start(e)) => match e.local_name().as_ref() {
-                "file" => file = Some(NzbFile { name: file_name(&e), ..NzbFile::default() }),
+                "file" => file = Some(file_of(&e)),
                 "segment" => {
                     segment = Some(segment_of(&e));
                     overlong = false;
@@ -110,7 +120,7 @@ pub fn parse(body: &[u8]) -> Parsed {
             },
             Ok(Event::Empty(e)) if e.local_name().as_ref() == "segment" => {
                 if let Some(f) = file.as_mut() {
-                    f.add(segment_of(&e), &mut kept);
+                    f.add(segment_of(&e), &mut kept, max_kept);
                 }
             }
             Ok(Event::Text(t)) => append(text_of(&mut segment, &mut group), &t, &mut overlong),
@@ -131,7 +141,7 @@ pub fn parse(body: &[u8]) -> Parsed {
                         } else {
                             s.message_id.trim().trim_matches(['<', '>']).to_string()
                         };
-                        f.add(s, &mut kept);
+                        f.add(s, &mut kept, max_kept);
                     }
                 }
                 "group" => {
@@ -199,6 +209,16 @@ fn file_name(e: &BytesStart<'_>) -> String {
     let subject = attribute(e, "subject").unwrap_or_default();
     let name = crate::parser::parse_subject(&subject).map_or(subject, |p| p.filename);
     clean_name(&name).unwrap_or_default()
+}
+
+fn file_of(e: &BytesStart<'_>) -> NzbFile {
+    NzbFile {
+        name: file_name(e),
+        subject: attribute(e, "subject").unwrap_or_default(),
+        poster: attribute(e, "poster").unwrap_or_default(),
+        date: attribute(e, "date").and_then(|d| d.trim().parse().ok()).unwrap_or(0),
+        ..NzbFile::default()
+    }
 }
 
 fn segment_of(e: &BytesStart<'_>) -> Segment {

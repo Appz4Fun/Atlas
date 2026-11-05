@@ -3056,7 +3056,7 @@ impl Pool {
         Ok(self.xover_on(i, group, start, end).await?.into_iter().map(|o| (o.number, o.message_id)).collect())
     }
 
-    async fn xover_on(&self, i: usize, group: &str, start: u64, end: u64) -> Result<Vec<Overview>> {
+    pub(crate) async fn xover_on(&self, i: usize, group: &str, start: u64, end: u64) -> Result<Vec<Overview>> {
         match self.xover_once(i, group, start, end).await {
             Err(NntpError::Decompress(e)) => {
                 // turn compression off for this server and redo the slice uncompressed
@@ -3289,6 +3289,37 @@ impl Pool {
             }
         }
 
+        Err(last_err)
+    }
+
+    /// HEAD, the way `fetch_body` reads a BODY: least busy indexing server first, then the others until one has
+    /// it. None: past `max_bytes` on the server that had it.
+    pub async fn fetch_head(&self, message_id: &str, max_bytes: usize) -> Result<Option<Vec<u8>>> {
+        let mut order = self.indexing_tier();
+        order.sort_by(|&a, &b| self.busy(a).total_cmp(&self.busy(b)));
+        let rest: Vec<usize> = (0..self.servers.len()).filter(|i| !order.contains(i)).collect();
+        order.extend(rest);
+        let mut last_err = Self::no_servers();
+        for i in order {
+            let mut lease = match self.lease(i, false).await {
+                Ok(l) => l,
+                Err(e) => {
+                    last_err = e;
+                    continue;
+                }
+            };
+            let r = within(self.body_deadline, "HEAD", lease.begin().head(message_id, max_bytes)).await;
+            match lease.check(r) {
+                // a cut read leaves the rest unread: the connection can't take another request
+                Ok(None) => {
+                    lease.collect_traffic();
+                    lease.conn = None;
+                    return Ok(None);
+                }
+                Ok(head) => return Ok(head),
+                Err(e) => last_err = e,
+            }
+        }
         Err(last_err)
     }
 

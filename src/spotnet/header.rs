@@ -107,6 +107,15 @@ pub fn subcats(list: &str) -> Subcats {
     out
 }
 
+/// The spotter id of the spot whose headers these are, from its `From`.
+pub fn spotter_id_of_head(head: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(head);
+    let from = text.lines().find_map(|l| l.get(..5).filter(|p| p.eq_ignore_ascii_case("from:")).map(|_| &l[5..]))?;
+    let address = &from[from.find('<')? + 1..];
+    let local = &address[..address.find('@')?];
+    spotter_id(local.split('.').next()?)
+}
+
 /// Spot base64: `/` written as `-s` and `+` as `-p`, padding dropped.
 pub fn unprepare_base64(s: &str) -> String {
     s.replace("-s", "/").replace("-p", "+")
@@ -208,6 +217,13 @@ mod tests {
             assert_eq!(spotter_id(key).as_deref(), Some(id), "{key}");
         }
         assert_eq!(spotter_id(""), None);
+    }
+
+    #[test]
+    fn spotter_id_from_headers() {
+        let head = b"Path: x\nFrom: Senua <1FNddBgs6c-pMxF9DDUjo9SQmtH-pgI5xOShhXz6EyZ7GHuXXWG-sSKP8sXt2EfOcz9.sig@17a09.1.2.3.4.5.6>\nSubject: s\n";
+        assert_eq!(spotter_id_of_head(head).as_deref(), Some("baTFcw"));
+        assert_eq!(spotter_id_of_head(b"Subject: s\n"), None);
     }
 
     #[test]
