@@ -127,13 +127,15 @@ fn stream(body: &[u8], info: &mut MediaInfo, video_length: &mut Option<u32>) {
 }
 
 /// WAVEFORMATEX format tags as the codec names the other containers' tracks use.
-fn audio_codec(tag: u16) -> String {
+pub(super) fn audio_codec(tag: u16) -> String {
     match tag {
         0x0001 => "pcm".into(),
         0x0050 => "mp2".into(),
         0x0055 => "mp3".into(),
         0x00ff | 0x1610 | 0x706d => "aac".into(),
-        0x0160..=0x0163 => "wma".into(),
+        0x0160 | 0x0161 => "wma".into(),
+        0x0162 => "wma pro".into(),
+        0x0163 => "wma lossless".into(),
         0x2000 => "ac3".into(),
         0x2001 => "dts".into(),
         0x674f | 0x6750 | 0x6751 | 0x676f | 0x6770 | 0x6771 => "vorbis".into(),
@@ -166,7 +168,7 @@ fn le32(b: &[u8], at: usize) -> Option<u32> {
     b.get(at..at + 4).map(|x| u32::from_le_bytes([x[0], x[1], x[2], x[3]]))
 }
 
-fn fourcc(b: &[u8]) -> Option<String> {
+pub(super) fn fourcc(b: &[u8]) -> Option<String> {
     let s: String = b.iter().take_while(|c| **c != 0).map(|c| char::from(*c)).collect();
     let s = s.trim().to_string();
     (!s.is_empty() && s.chars().all(|c| c.is_ascii_graphic())).then_some(s)
