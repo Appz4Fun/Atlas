@@ -246,14 +246,26 @@ fn mpeg_audio(payload: &[u8], a: &mut AudioTrack) {
 
 /// An AC-3 sync frame: rate, and channels from acmod and the LFE flag.
 fn ac3(b: &[u8]) -> AudioTrack {
+    const CHANNELS: [u32; 8] = [2, 1, 2, 3, 3, 4, 4, 5];
     let mut a = AudioTrack { codec: "ac3".into(), ..AudioTrack::default() };
     let Some(at) = b.windows(2).position(|w| w == [0x0B, 0x77]) else { return a };
     let Some(f) = b.get(at..at + 8) else { return a };
-    a.sample_rate = [48000.0, 44100.0, 32000.0].get(usize::from(f[4] >> 6)).copied();
-    if (f[5] >> 3) > 10 {
+    let (fscod, bsid) = (f[4] >> 6, f[5] >> 3);
+    if bsid > 10 {
+        // E-AC-3 (ETSI TS 102 366 E.1.2): rate code, a second one or the block count, acmod, LFE, all in byte 4
         a.codec = "eac3".into();
+        let rate = if fscod == 3 {
+            [24000.0, 22050.0, 16000.0].get(usize::from((f[4] >> 4) & 3))
+        } else {
+            [48000.0, 44100.0, 32000.0].get(usize::from(fscod))
+        };
+        a.sample_rate = rate.copied();
+        a.channels = Some(u64::from(CHANNELS[usize::from((f[4] >> 1) & 7)] + u32::from(f[4] & 1)));
         return a;
     }
+    // bsid 9 and 10 are AC-3 at a half and a quarter of the rate
+    let shift = u32::from(bsid.saturating_sub(8));
+    a.sample_rate = [48000.0, 44100.0, 32000.0].get(usize::from(fscod)).map(|r| r / f64::from(1u32 << shift));
     let mut bits = Bits { b: &f[6..], at: 0 };
     let acmod = bits.take(3);
     if acmod & 1 != 0 && acmod != 1 {
@@ -266,7 +278,7 @@ fn ac3(b: &[u8]) -> AudioTrack {
         bits.take(2);
     }
     let lfe = bits.take(1);
-    a.channels = Some(u64::from([2u32, 1, 2, 3, 3, 4, 4, 5][acmod as usize] + lfe));
+    a.channels = Some(u64::from(CHANNELS[acmod as usize] + lfe));
     a
 }
 
@@ -436,6 +448,18 @@ mod tests {
         assert_eq!(info.video[0].display_width, Some(1024), "16:9 by MPEG-2's table");
         assert_eq!((info.audio[0].codec.as_str(), info.audio[0].sample_rate), ("mp2", Some(48000.0)));
         assert_eq!(info.audio.len(), 1);
+    }
+
+    #[test]
+    fn ac3_at_reduced_rates_and_eac3_are_read() {
+        // AC-3 bsid 9: half of 48 kHz; stereo (acmod 2), no LFE
+        let half = ac3(&[0x0B, 0x77, 0, 0, 0x04, 9 << 3, 0x40, 0x00]);
+        assert_eq!((half.codec.as_str(), half.sample_rate, half.channels), ("ac3", Some(24000.0), Some(2)));
+        // E-AC-3 bsid 16: fscod 3 with fscod2 0 is 24 kHz; acmod 7 with LFE is 5.1
+        let e = ac3(&[0x0B, 0x77, 0, 0, 0b1100_1111, 16 << 3, 0, 0]);
+        assert_eq!((e.codec.as_str(), e.sample_rate, e.channels), ("eac3", Some(24000.0), Some(6)));
+        let e48 = ac3(&[0x0B, 0x77, 0, 0, 0b0011_0100, 16 << 3, 0, 0]);
+        assert_eq!((e48.sample_rate, e48.channels), (Some(48000.0), Some(2)));
     }
 
     #[test]
