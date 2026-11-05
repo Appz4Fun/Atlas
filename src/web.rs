@@ -2756,6 +2756,7 @@ fn probe_html(
                     _ => "",
                 };
                 parts.push(format!("Dolby Vision profile {profile}{level}{layer}"));
+                parts.extend(dv_rpu_facts(v));
             }
             parts.extend(v.max_cll.filter(|n| *n > 0).map(|n| format!("MaxCLL {n} nits")));
             parts.extend(v.max_fall.filter(|n| *n > 0).map(|n| format!("MaxFALL {n} nits")));
@@ -2769,6 +2770,10 @@ fn probe_html(
             parts.extend(a.language.clone());
             if a.atmos {
                 parts.push("Atmos".into());
+            }
+            // a name that says so already
+            if a.dtsx && !a.name.as_deref().is_some_and(names_dtsx) {
+                parts.push("DTS:X".into());
             }
             if a.default {
                 parts.push("default".into());
@@ -3363,13 +3368,47 @@ fn hdr_summary(v: &crate::probe::media::VideoTrack) -> String {
     match (v.dv_profile, base) {
         // profile 5 has no fallback, whatever the container says: its colour only DV players get right
         (Some(5), _) => "DV P5".into(),
-        (Some(p), Some(base)) => format!("DV P{p} + {base}"),
-        (Some(p), None) => format!("DV P{p}"),
+        (Some(p), Some(base)) => format!("DV P{p}{} + {base}", dv_layer(v)),
+        (Some(p), None) => format!("DV P{p}{}", dv_layer(v)),
         (None, Some(base)) => base,
         // SDR only when the container says what the transfer is: MP4 and many MKVs don't, and that's not SDR
         (None, None) if v.transfer.is_some_and(|t| t != 2) => "SDR".into(),
         (None, None) => String::new(),
     }
+}
+
+/// ` FEL` or ` MEL` for profile 7 when its RPU was read, which is what decides whether a remux keeps the full
+/// enhancement layer. Empty otherwise.
+fn dv_layer(v: &crate::probe::media::VideoTrack) -> &'static str {
+    match &v.dolby_vision {
+        Some(d) if d.from_rpu && d.profile == 7 && d.el_present => {
+            if d.fel {
+                " FEL"
+            } else {
+                " MEL"
+            }
+        }
+        _ => "",
+    }
+}
+
+/// What only a read RPU says: FEL or MEL, and the content mapping version. Nothing when it wasn't read.
+fn dv_rpu_facts(v: &crate::probe::media::VideoTrack) -> Vec<String> {
+    let Some(d) = v.dolby_vision.as_ref().filter(|d| d.from_rpu) else { return Vec::new() };
+    let mut out = Vec::new();
+    if let Some(layer) = dv_layer(v).strip_prefix(' ') {
+        out.push(layer.to_string());
+    }
+    if !d.cm_version.is_empty() {
+        out.push(format!("CM {}", d.cm_version));
+    }
+    out
+}
+
+/// Whether a track's name already says DTS:X.
+fn names_dtsx(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.contains("dts:x") || lower.contains("dts-x") || lower.contains("dtsx")
 }
 
 /// What most decides how an encode looks: rate control and its value, and x265's preset when it's written.
@@ -4320,6 +4359,52 @@ mod tests {
         let media = MediaInfo { subtitles: vec![sub(Some("SDH")), sub(None)], ..Default::default() };
         let html = probe_html(&crate::probe::ProbeInfo { media: Some(media), ..Default::default() }, None, None, None);
         assert_eq!(html.matches("SDH").count(), 2, "{html}");
+    }
+
+    #[test]
+    fn dolby_vision_says_fel_or_mel_and_cm_only_from_an_rpu() {
+        use crate::probe::media::{AudioTrack, DolbyVisionInfo, MediaInfo, VideoTrack};
+        let dv = |fel: bool, cm: &str, from_rpu: bool| VideoTrack {
+            hdr: Some("HDR10".into()),
+            dv_profile: Some(7),
+            dolby_vision: Some(DolbyVisionInfo {
+                profile: 7,
+                level: Some(6),
+                rpu_present: true,
+                el_present: true,
+                fel,
+                cm_version: cm.into(),
+                from_rpu,
+            }),
+            ..VideoTrack::default()
+        };
+        assert_eq!(hdr_summary(&dv(true, "v4.0", true)), "DV P7 FEL + HDR10");
+        assert_eq!(hdr_summary(&dv(false, "v2.9", true)), "DV P7 MEL + HDR10");
+        // a dvcC box alone doesn't say which layer it is
+        assert_eq!(hdr_summary(&dv(false, "v2.9", false)), "DV P7 + HDR10");
+        assert_eq!(dv_rpu_facts(&dv(true, "v4.0", true)), ["FEL", "CM v4.0"]);
+        assert!(dv_rpu_facts(&dv(false, "v2.9", false)).is_empty());
+        let p8 = VideoTrack {
+            dv_profile: Some(8),
+            dolby_vision: Some(DolbyVisionInfo {
+                profile: 8,
+                cm_version: "v4.0".into(),
+                from_rpu: true,
+                ..Default::default()
+            }),
+            ..VideoTrack::default()
+        };
+        assert_eq!(dv_rpu_facts(&p8), ["CM v4.0"]);
+
+        let audio = |name: Option<&str>| AudioTrack {
+            codec: "A_DTS".into(),
+            dtsx: true,
+            name: name.map(str::to_string),
+            ..Default::default()
+        };
+        let media = MediaInfo { audio: vec![audio(None), audio(Some("DTS:X 7.1"))], ..Default::default() };
+        let html = probe_html(&crate::probe::ProbeInfo { media: Some(media), ..Default::default() }, None, None, None);
+        assert_eq!(html.matches("DTS:X").count(), 2, "{html}");
     }
 
     #[test]

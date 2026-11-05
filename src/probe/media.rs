@@ -722,6 +722,7 @@ fn add_track(t: Track, info: &mut MediaInfo) {
                     el_present: el,
                     fel: profile == 7 && el,
                     cm_version: "v2.9".to_string(),
+                    from_rpu: false,
                 });
             }
             info.video.push(VideoTrack {
@@ -1427,6 +1428,10 @@ pub struct DolbyVisionInfo {
     pub el_present: bool,
     pub fel: bool,
     pub cm_version: String,
+    /// Whether `fel` and `cm_version` were read from an RPU. Without one they're only defaults: a `dvcC` box or a
+    /// Matroska mapping says the profile, level and layers, not which enhancement layer or which content mapping.
+    #[serde(default)]
+    pub from_rpu: bool,
 }
 
 impl DolbyVisionInfo {
@@ -1443,6 +1448,7 @@ impl DolbyVisionInfo {
             el_present,
             fel: false,
             cm_version: "v2.9".to_string(),
+            from_rpu: false,
         })
     }
 
@@ -1673,6 +1679,7 @@ impl DolbyVisionInfo {
             el_present,
             fel: is_fel,
             cm_version,
+            from_rpu: true,
         })
     }
 

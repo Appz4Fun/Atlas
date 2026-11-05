@@ -1273,6 +1273,11 @@ fn seed_shard(conn: &Connection, enabled: StepMask, stamps: &[(u8, StepMask, i64
         crate::probe::stills::rerun_mp4(conn, now)?;
         set("pp_stills_mp4", now)?;
     }
+    // once, for Dolby Vision probes from before the probe kept whether it read an RPU: FEL or MEL, and CM version
+    if meta("pp_probe_dv_rpu")?.is_none() {
+        crate::probe::step::rerun_dv_without_rpu(conn, now)?;
+        set("pp_probe_dv_rpu", now)?;
+    }
     // once, for the probes that read a set's later volume before its first was looked for
     if meta("pp_probe_first_volume")?.is_none() {
         crate::probe::step::rerun_later_volumes(conn, now)?;
