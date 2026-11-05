@@ -464,6 +464,30 @@ impl Step for ProbeStep {
                 }
             }
         }
+        if found_nfo_password.is_none() {
+            for nzb_file in archive::select::nzb_sources_with_par2(&files, &par2_names) {
+                let Some(seg) = ctx.segments(nzb_file.id, &SegmentPick::First(1)).map_err(retry)?.into_iter().next()
+                else {
+                    continue;
+                };
+                let Got::Body(raw) = fetch_raw(ctx, &seg.message_id, &nzb_file.filename)? else { continue };
+                let article = yenc::split_article(&raw);
+                let body = yenc_decode(&article.lines).unwrap_or_else(|| article.lines.join(&b'\n'));
+                if archive::identify(&body) == archive::Format::Nzb
+                    && let Some(meta_pw) = archive::nzb::meta_password(&body)
+                    && let Some(password) =
+                        release_info::find_verified_password(std::iter::empty(), &[meta_pw], check.as_ref())
+                {
+                    crate::raw_store::put_nfo_password(&rel_name, &rel_group, &content_id, &password);
+                    found_nfo_password = Some(password.clone());
+                    writes.push(StepWrite::new(
+                        archive::store::SET_NFO_PASSWORD,
+                        vec![release_id.into(), password.into()],
+                    ));
+                    break;
+                }
+            }
+        }
 
         let mut last_lines = None;
         if let Some(file) = main_file(&files) {

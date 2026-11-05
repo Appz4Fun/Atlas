@@ -595,13 +595,21 @@ fn restore_archive(
     let wrapper_pw = encrypted
         .then(|| known_or_post_password(ctx, &posted_files, wrapper_check.as_ref()))
         .flatten();
+    let rel = ctx.release();
+    if require_password_inspected
+        && encrypted
+        && wrapper_pw.is_none()
+        && !crate::raw_store::has_nfo_password_record(&rel.name, &rel.group, content_id)
+    {
+        return Ok(None);
+    }
     if let Some(ref pw) = wrapper_pw {
+        crate::raw_store::put_nfo_password(&rel.name, &rel.group, content_id, pw);
         outcome.writes.push(StepWrite::new(
             archive_store::SET_NFO_PASSWORD,
-            vec![ctx.release().id.into(), pw.clone().into()],
+            vec![rel.id.into(), pw.clone().into()],
         ));
     }
-    let rel = ctx.release();
     let nested = crate::raw_store::get_archive_files(&rel.name, &rel.group, content_id, SOURCE_NZB);
     if nested.is_empty() {
         if require_password_inspected
@@ -1022,6 +1030,8 @@ impl Step for ListStep {
                             archive_store::SET_NFO_PASSWORD,
                             vec![rel_id.into(), pw.into()],
                         ));
+                    } else if wrapper_encrypted {
+                        crate::raw_store::put_nfo_password(&rel_name, &rel_group, &content_id, "");
                     }
                     return with_nzb(ctx, outcome, inside, wrapper_encrypted, has_inner_nzb, pw_available, &limits);
                 }
@@ -1051,6 +1061,8 @@ impl Step for ListStep {
                             archive_store::SET_NFO_PASSWORD,
                             vec![rel_id.into(), pw.into()],
                         ));
+                    } else if wrapper_encrypted {
+                        crate::raw_store::put_nfo_password(&rel_name, &rel_group, &content_id, "");
                     }
                     return with_nzb(ctx, outcome, inside, wrapper_encrypted, has_inner_nzb, pw_available, &limits);
                 }
@@ -1080,6 +1092,8 @@ impl Step for ListStep {
                             archive_store::SET_NFO_PASSWORD,
                             vec![rel_id.into(), pw.into()],
                         ));
+                    } else if wrapper_encrypted {
+                        crate::raw_store::put_nfo_password(&rel_name, &rel_group, &content_id, "");
                     }
                     return with_nzb(ctx, outcome, inside, wrapper_encrypted, has_inner_nzb, pw_available, &limits);
                 }
