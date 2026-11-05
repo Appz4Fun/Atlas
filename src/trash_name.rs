@@ -44,6 +44,9 @@ static FLAC: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\bFLAC").unwrap
 static PCM: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\bL?PCM").unwrap());
 static OPUS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\bOpus").unwrap());
 static AAC: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\bAAC").unwrap());
+/// any audio codec a name can write, to tell where one track's words end
+static ANY_AUDIO: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)TrueHD|\bDTS|\bDD|\bE-?AC-?3|\bAC-?3|\bFLAC|\bL?PCM|\bOpus|\bAAC").unwrap());
 /// `.7.1`, `5.1`, `.Atmos.5.1`, ` 2 0`: a count straight after a codec, an Atmos in between at most
 static CHANNELS_AFTER: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)^[ ._-]?(?:Atmos[ ._-])?([1-9])[ ._]([0-2])(?:[^0-9]|$)").unwrap());
@@ -313,7 +316,11 @@ fn audio(release: &str, tags: &Tags) -> String {
     } else {
         None
     };
-    let atmos = has("Atmos").then_some("Atmos");
+    let atmos = match codec {
+        Some(codec) => atmos_of(release, codec),
+        None => has("Atmos"),
+    }
+    .then_some("Atmos");
     if codec.is_none() && atmos.is_none() {
         return String::new();
     }
@@ -324,22 +331,8 @@ fn audio(release: &str, tags: &Tags) -> String {
 /// The channels of the track `codec` names: the count written right after it (`TrueHD.7.1`, `DDP5.1`,
 /// `DD.Atmos.5.1`), else the only count the name has. A name with several tracks and no count by the codec has none.
 fn channels_of(release: &str, codec: &str, tags: &Tags) -> Option<String> {
-    let token: &Regex = match codec {
-        "TrueHD" => &TRUEHD,
-        "DTS-HD MA" | "DTS-X" | "DTS" => &DTS,
-        "EAC3" => &EAC3,
-        "AC3" => &AC3,
-        "FLAC" => &FLAC,
-        "PCM" => &PCM,
-        "Opus" => &OPUS,
-        _ => &AAC,
-    };
-    for found in token.find_iter(release) {
-        // `DDP` and `DD+` are EAC3, not AC3
-        if codec == "AC3" && release[found.end()..].starts_with(['P', 'p', '+']) {
-            continue;
-        }
-        if let Some(c) = CHANNELS_AFTER.captures(&release[found.end()..]) {
+    for (_, end) in codec_spans(release, codec) {
+        if let Some(c) = CHANNELS_AFTER.captures(&release[end..]) {
             return Some(format!("{}.{}", &c[1], &c[2]));
         }
     }
@@ -357,6 +350,40 @@ fn channels_of(release: &str, codec: &str, tags: &Tags) -> Option<String> {
         [only] => Some((*only).to_string()),
         _ => None,
     }
+}
+
+/// Where a name writes `codec`, as (start, end).
+fn codec_spans<'a>(release: &'a str, codec: &str) -> impl Iterator<Item = (usize, usize)> + 'a {
+    let token: &Regex = match codec {
+        "TrueHD" => &TRUEHD,
+        "DTS-HD MA" | "DTS-X" | "DTS" => &DTS,
+        "EAC3" => &EAC3,
+        "AC3" => &AC3,
+        "FLAC" => &FLAC,
+        "PCM" => &PCM,
+        "Opus" => &OPUS,
+        _ => &AAC,
+    };
+    let ac3 = codec == "AC3";
+    token
+        .find_iter(release)
+        // `DDP` and `DD+` are EAC3, not AC3
+        .filter(move |found| !(ac3 && release[found.end()..].starts_with(['P', 'p', '+'])))
+        .map(|found| (found.start(), found.end()))
+}
+
+/// Whether the track `codec` names is the Atmos one: only TrueHD and Dolby Digital carry Atmos, and the Atmos has to
+/// be written with that track, right before it or before the next codec, not with another track of the name.
+fn atmos_of(release: &str, codec: &str) -> bool {
+    if !matches!(codec, "TrueHD" | "EAC3" | "AC3") {
+        return false;
+    }
+    codec_spans(release, codec).any(|(start, end)| {
+        let rest = &release[end..];
+        let own = &rest[..ANY_AUDIO.find(rest).map_or(rest.len(), |next| next.start())];
+        let before = release[..start].trim_end_matches([' ', '.', '_', '-']).to_ascii_lowercase();
+        own.to_ascii_lowercase().contains("atmos") || before.ends_with("atmos")
+    })
 }
 
 /// `MULTi`, or the one language a name is dubbed in: subtitles say nothing of what's heard
@@ -544,6 +571,11 @@ mod tests {
         assert_eq!(
             shown("Movie.2020.1080p.WEB-DL.DDP5.1.AAC2.0.H.264-GRP", MOVIES_HD, movie("Movie", 2020)),
             "Movie (2020) [WEB-DL-1080p][EAC3 5.1][H264]-GRP"
+        );
+        // the Atmos of another track isn't this one's
+        assert_eq!(
+            shown("Movie.2020.1080p.BluRay.DTS-HD.MA.5.1.EAC3.5.1.Atmos-GRP", MOVIES_HD, movie("Movie", 2020)),
+            "Movie (2020) [Bluray-1080p][DTS-HD MA 5.1]-GRP"
         );
         // two counts and none by the codec: none
         assert_eq!(
