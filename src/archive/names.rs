@@ -99,12 +99,14 @@ pub fn best_name<'a>(files: impl Iterator<Item = (&'a str, u64)>) -> Option<Stri
         .map(|(_, _, display)| display)
 }
 
-/// A volume's place in its set, first lowest: `.rar` before `.r00`, `.7z.001` before `.7z.026`.
-fn volume_order(name: &str) -> u32 {
+/// A volume's place in its set, first lowest: `.rar` before `.r00`, `.7z.001` before `.7z.026`, and any archive
+/// volume before a PAR2 file of the same name, soo a set listed with its recovery files is named after its data.
+fn volume_order(name: &str) -> (bool, u32) {
     use super::select::{Kind, classify};
     match classify(name) {
-        Kind::Rar(n) | Kind::SevenZip(n) | Kind::Zip(n) | Kind::Numbered(n) | Kind::Par2Vol(n) => n,
-        _ => u32::MAX,
+        Kind::Rar(n) | Kind::SevenZip(n) | Kind::Zip(n) | Kind::Numbered(n) => (false, n),
+        Kind::Par2Vol(n) => (true, n),
+        _ => (true, u32::MAX),
     }
 }
 

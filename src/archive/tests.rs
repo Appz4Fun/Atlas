@@ -115,6 +115,14 @@ fn collapse_keeps_the_first_volume_and_sums() {
     let many: Vec<InnerFile> = (0..100).map(|i| file(format!("{i}.mkv"), 1)).collect();
     assert_eq!(collapse_volumes(&many).len(), MAX_STORED);
     assert_eq!(collapse_volumes(&[file("a.mkv".into(), 1), file("a.mkv".into(), 1)]).len(), 1);
+    // a set listed with its recovery files first, as an NZB of an upload lists them: named after its data
+    let upload = [
+        file("x.par2".into(), 1),
+        file("x.vol000+01.par2".into(), 2),
+        file("x.part001.rar".into(), 100),
+        file("x.part002.rar".into(), 100),
+    ];
+    assert_eq!(collapse_volumes(&upload), [file("x.part001.rar".into(), 203)]);
 }
 
 #[test]
