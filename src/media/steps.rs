@@ -92,6 +92,11 @@ on conflict(release_id) do update set
     kind = excluded.kind, title_key = excluded.title_key, season = excluded.season, episode = excluded.episode,
     episode_last = excluded.episode_last, air_date = excluded.air_date, year = excluded.year, quality = excluded.quality";
 const DELETE: &str = "delete from media_release where release_id = ?1";
+
+/// A release named by an AlloCiné id read again into the word index, which finds it by the decoded title
+/// (`word_index::known_as`): a title with no ids writes nothing to `media_release` for its triggers to see.
+const WORD_QUEUE: &str =
+    "insert into word_queue (release_id) values (?1) on conflict (release_id) do update set n = n + 1";
 /// only while it's still this title: a rename while the lookup ran mustn't take the old title's IDs
 const FOUND: &str = "update media_release
     set tvdb_id = ?3, tvmaze_id = ?4, trakt_id = ?5, tmdb_id = ?6, imdb_id = iif(imdb_from_nfo = 1, imdb_id, ?7), tvrage_id = ?8
@@ -307,17 +312,21 @@ impl Step for MediaLookup {
             let ctx_ref = &*ctx;
             self.0.resolve_seeded(&q, key, now_secs(), &|| ctx_ref.stopping(), seed)
         };
+        let reindex = || decoded.as_ref().map(|_| StepWrite::new(WORD_QUEUE, vec![id.into()]));
         match resolved.map_err(StepError::Retry)? {
             Resolved::Found(ids) => {
-                Ok(Outcome { matched: true, writes: vec![found_write(id, key, &ids)], ..Outcome::default() })
+                let writes = std::iter::once(found_write(id, key, &ids)).chain(reindex()).collect();
+                Ok(Outcome { matched: true, writes, ..Outcome::default() })
             }
             Resolved::NotFound => {
                 // nothing asked a title with IDs in the cache, soo these are from a row deleted by hand: a wrong match
                 let conn = ctx.conn();
-                if stale_ids(conn, key).map_err(|e| StepError::Retry(e.to_string()))? {
+                // and a title decoded from an AlloCiné id: its other releases are found by it too, once fan-out
+                // queues them for the word index
+                if decoded.is_some() || stale_ids(conn, key).map_err(|e| StepError::Retry(e.to_string()))? {
                     self.0.fan_out_again(key).map_err(StepError::Retry)?;
                 }
-                Ok(Outcome::default())
+                Ok(Outcome { writes: reindex().into_iter().collect(), ..Outcome::default() })
             }
             Resolved::Later(_) if ctx.stopping() => Err(StepError::Stopped),
             Resolved::Later(t) => Ok(Outcome { wait_until: Some(t + id.rem_euclid(30)), ..Outcome::default() }),
