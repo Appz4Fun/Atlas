@@ -1295,7 +1295,9 @@ fn trak(body: &[u8], full_data: &[u8], file_start: &[u8], all_chunk_offsets: &[u
                 }
             });
             if is_ac3(&codec) {
-                stream_key = mp4_ac3_key(&chunk_offsets, &stsc_entries, stsz_box, stz2_box, all_chunk_offsets, full_data);
+                // chunk offsets count from the file's start, which a tail `moov` read apart from it doesn't hold
+                stream_key =
+                    mp4_ac3_key(&chunk_offsets, &stsc_entries, stsz_box, stz2_box, all_chunk_offsets, file_start);
             }
             for &(chunk_idx, off) in &chunk_offsets {
                 if atmos && (dtsx || !can_probe_dtsx) {
@@ -3217,6 +3219,39 @@ mod tests {
         assert_eq!(Mp4Prober::probe_tail_moov(&moov).unwrap().video[0].keyframe_key, None);
         // and a whole file reads it from itself
         assert_eq!(mp4(&[front, moov].concat()).video[0].keyframe_key, want);
+    }
+
+    #[test]
+    fn a_tail_moov_keys_its_audio_from_the_front() {
+        let frames: Vec<u8> = (1..=8).flat_map(eac3_frame).collect();
+        // ftyp (12 bytes), then mdat's header (8): the one chunk of eight samples starts at 20
+        let front = [mp4_box(b"ftyp", b"isom"), mp4_box(b"mdat", &frames)].concat();
+        let mut entry = vec![0u8; 36];
+        entry[4..8].copy_from_slice(b"ec-3");
+        let mut stsd = vec![0u8; 8];
+        stsd.extend(&entry);
+        let stco = [&[0u8; 4][..], &1u32.to_be_bytes(), &20u32.to_be_bytes()].concat();
+        let stsc = [&[0u8; 4][..], &1u32.to_be_bytes(), &1u32.to_be_bytes(), &8u32.to_be_bytes(), &1u32.to_be_bytes()]
+            .concat();
+        let stsz = [&[0u8; 4][..], &32u32.to_be_bytes(), &8u32.to_be_bytes()].concat();
+        let stbl = mp4_box(
+            b"stbl",
+            &[mp4_box(b"stsd", &stsd), mp4_box(b"stco", &stco), mp4_box(b"stsc", &stsc), mp4_box(b"stsz", &stsz)]
+                .concat(),
+        );
+        let mut hdlr = vec![0u8; 8];
+        hdlr.extend(b"soun");
+        hdlr.extend([0u8; 12]);
+        let mdia = [mp4_box(b"hdlr", &hdlr), mp4_box(b"minf", &stbl)].concat();
+        let moov = mp4_box(b"moov", &mp4_box(b"trak", &mp4_box(b"mdia", &mdia)));
+
+        let mut k = FrameKey::default();
+        k.feed(&frames);
+        let want = k.key();
+        assert!(want.is_some());
+        assert_eq!(Mp4Prober::probe_tail_moov_with(&moov, &front).unwrap().audio[0].stream_key, want);
+        assert_eq!(Mp4Prober::probe_tail_moov(&moov).unwrap().audio[0].stream_key, None);
+        assert_eq!(mp4(&[front, moov].concat()).audio[0].stream_key, want);
     }
 
     #[test]
