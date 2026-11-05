@@ -166,14 +166,14 @@ impl Mp4Video {
         }
     }
 
-    /// The keyframe nearest after `percent` of the way through the track's samples (or the last one before it, at
-    /// the very end).
+    /// The keyframe nearest after `percent` of the way through the track's running time (or the last one before it,
+    /// at the very end). By time, not by sample count: in a variable frame rate track the two part ways.
     pub fn keyframe_at(&self, percent: u8) -> Option<Sample> {
         let count = self.sizes.count();
         if count == 0 {
             return None;
         }
-        let target = (u64::from(count) * u64::from(percent.min(100)) / 100).min(u64::from(count) - 1) as u32;
+        let target = self.sample_at_time(percent).min(count - 1);
         let index = match &self.stss {
             None => target,
             Some(syncs) => {
@@ -183,6 +183,28 @@ impl Mp4Video {
             }
         };
         self.sample(index)
+    }
+
+    /// The first sample that starts at or after `percent` of the track's duration, by `stts`; by count when the
+    /// table gives no duration.
+    fn sample_at_time(&self, percent: u8) -> u32 {
+        let percent = u128::from(percent.min(100));
+        let total: u128 = self.stts.iter().map(|&(n, d)| u128::from(n) * u128::from(d)).sum();
+        if total == 0 {
+            return (u128::from(self.sizes.count()) * percent / 100) as u32;
+        }
+        let want = total * percent / 100;
+        let (mut index, mut at) = (0u128, 0u128);
+        for &(n, delta) in &self.stts {
+            let run = u128::from(n) * u128::from(delta);
+            if at + run >= want && delta > 0 {
+                // the first sample of this run that starts at or after it
+                return (index + (want - at).div_ceil(u128::from(delta))).min(u128::from(u32::MAX)) as u32;
+            }
+            at += run;
+            index += u128::from(n);
+        }
+        index.min(u128::from(u32::MAX)) as u32
     }
 
     /// Sample `index` (0-based): where it is, by its chunk, and when.
@@ -421,5 +443,21 @@ pub(crate) mod tests {
         // an entry this doesn't decode
         let other = super::tests::moov(b"mp4v", &[1], &[10], 1, 0, &[1]);
         assert!(video_track(&other[8..]).is_none());
+    }
+
+    #[test]
+    fn a_variable_frame_rate_track_is_cut_by_time() {
+        let sizes = vec![100u32; 100];
+        let syncs: Vec<u32> = (1..=100).collect();
+        let moov = moov(b"hvc1", &[1], &sizes, 1, 0, &syncs);
+        let (_, _, head) = box_head(&moov).unwrap();
+        let mut v = video_track(&moov[head..]).unwrap();
+        // 50 samples of 1 s, then 50 of 9 s: 500 s in all, soo 25% is 125 s, in the slow run
+        v.timescale = 1000;
+        v.stts = vec![(50, 1000), (50, 9000)];
+        let s = v.keyframe_at(25).unwrap();
+        assert_eq!(s.millis, 50_000 + 9_000 * 9, "the first sample at or after 125 s starts at 131 s");
+        assert_eq!(v.keyframe_at(0).unwrap().millis, 0);
+        assert_eq!(v.keyframe_at(100).unwrap().millis, 50_000 + 49 * 9_000, "the last one");
     }
 }
