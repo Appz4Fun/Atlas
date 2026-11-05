@@ -41,7 +41,133 @@ pub fn dvd(data: &[u8]) -> MediaInfo {
         }
         at += n + VTS.len();
     }
-    best.map(|(_, info)| info).unwrap_or_else(|| MediaInfo { container: "dvd-video".into(), ..MediaInfo::default() })
+    let mut info = best
+        .map(|(_, info)| info)
+        .unwrap_or_else(|| MediaInfo { container: "dvd-video".into(), ..MediaInfo::default() });
+    info.disc_id = disc_id(data);
+    info
+}
+
+/// The most IFOs libdvdread's `DVDDiscID` hashes: the manager's and nine title sets'.
+const DISC_ID_FILES: usize = 10;
+
+/// The disc's ID as libdvdread's `DVDDiscID` makes it: the MD5 of `VIDEO_TS.IFO`, then `VTS_01_0.IFO` up to the
+/// manager's count of title sets (at most nine), each file whole, with nothing between, as lowercase hex. Two rips of
+/// one disc have the same one whatever their names. An IFO's length is its own last sector, at byte 28 of both kinds;
+/// the `.BUP` copy of each, the same bytes, is passed over. The sets go in their numbers' order: a stored archive's
+/// IFOs by the `VTS_nn_0` name its entry header puts just before each, an ISO 9660 image's (bare or itself in a
+/// stored archive) by its directory records. `None` when that order can't be told, or unless every IFO it takes is
+/// whole in `data`, which for a disc of more than one title set is rare in a front: the second set's IFO comes after
+/// the first's videos.
+pub fn disc_id(data: &[u8]) -> Option<String> {
+    use md5::{Digest, Md5};
+    let vmg_at = find(data, VMG)?;
+    let vmg = whole_ifo(&data[vmg_at..])?;
+    let sets = usize::from(be16(vmg, 62)?).min(DISC_ID_FILES - 1);
+    if sets == 0 {
+        return None;
+    }
+    let mut ifos: Vec<&[u8]> = vec![vmg];
+    if let Some(base) = iso_base(data) {
+        // an ISO 9660 image, read bare or in a stored archive: each set's IFO where its directory record puts it, so
+        // a set whose IFO has the same bytes as another's still counts
+        match (1..=sets).map(|n| iso_title_set(data, base, n)).collect::<Option<Vec<_>>>() {
+            Some(sets) => ifos.extend(sets),
+            None if sets == 1 => ifos.push(whole_ifo(&data[find(data, VTS)?..])?),
+            None => return None,
+        }
+    } else if sets == 1 {
+        // the one set's IFO, or its .BUP copy, the same bytes
+        ifos.push(whole_ifo(&data[find(data, VTS)?..])?);
+    } else {
+        // a VIDEO_TS folder in a stored archive: every title set IFO in it, whole or not, with the number its entry's
+        // name gives; all must be named
+        let mut found: Vec<(Option<usize>, Option<&[u8]>)> = Vec::new();
+        let mut at = 0usize;
+        while found.len() < 2 * MAX_SETS {
+            let Some(n) = data.get(at..).and_then(|rest| find(rest, VTS)) else { break };
+            let ifo = whole_ifo(&data[at + n..]);
+            found.push((set_named_before(data, at + n), ifo));
+            at += n + ifo.map_or(VTS.len(), <[u8]>::len);
+        }
+        if found.iter().any(|(number, _)| number.is_none()) {
+            return None;
+        }
+        for want in 1..=sets {
+            ifos.push(found.iter().find(|(number, _)| *number == Some(want))?.1?);
+        }
+    }
+    let mut md5 = Md5::new();
+    for ifo in ifos {
+        md5.update(ifo);
+    }
+    let digest: [u8; 16] = md5.finalize().into();
+    Some(digest.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Where an ISO 9660 image starts in `data`: 32 KiB before its primary volume descriptor, which may be past an
+/// archive's entry header.
+fn iso_base(data: &[u8]) -> Option<usize> {
+    let at = find(data, b"\x01CD001\x01")?;
+    at.checked_sub(0x8000)
+}
+
+/// Title set `n`'s IFO in the ISO image starting at `base`, where the directory record named `VTS_nn_0.IFO` puts it:
+/// the record's extent (a little-endian sector at byte 2) and length (byte 10), its name at byte 33 after its length
+/// at byte 32. `None` unless the record is read and its extent holds the whole IFO.
+fn iso_title_set(data: &[u8], base: usize, n: usize) -> Option<&[u8]> {
+    let name = format!("VTS_{n:02}_0.IFO");
+    let mut at = 0usize;
+    for _ in 0..MAX_SETS {
+        let q = at + find(data.get(at..)?, name.as_bytes())?;
+        at = q + name.len();
+        let Some(rec) = q.checked_sub(33) else { continue };
+        let name_len = usize::from(data[q - 1]);
+        let named = name_len == 12 || (name_len == 14 && data.get(q + 12..q + 14) == Some(b";1"));
+        if !named || usize::from(data[rec]) < 33 + name_len {
+            continue;
+        }
+        let (Some(sector), Some(len)) = (le32(data, rec + 2), le32(data, rec + 10)) else { continue };
+        let Some(start) = usize::try_from(sector).ok().and_then(|s| s.checked_mul(2048)?.checked_add(base)) else {
+            continue;
+        };
+        let ifo = data.get(start..).filter(|ifo| ifo.starts_with(VTS)).and_then(whole_ifo);
+        if let Some(ifo) = ifo.filter(|ifo| u32::try_from(ifo.len()).ok() == Some(len)) {
+            return Some(ifo);
+        }
+    }
+    None
+}
+
+fn le32(b: &[u8], at: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(b.get(at..at + 4)?.try_into().ok()?))
+}
+
+/// How far before a file's bytes an archive's entry header names it: a tar header is one 512 byte block, a ZIP or RAR
+/// header a name and a few small fields.
+const NAME_REACH: usize = 1024;
+
+/// The title set number of the `VTS_nn_0.IFO` or `.BUP` named nearest before `at`, as an archive's entry header puts
+/// it, if one is named there.
+fn set_named_before(data: &[u8], at: usize) -> Option<usize> {
+    let window = &data[at.saturating_sub(NAME_REACH)..at];
+    (0..window.len().saturating_sub(11)).rev().find_map(|i| {
+        let name = &window[i..i + 12];
+        let digits = &name[4..6];
+        let fits = name[..4].eq_ignore_ascii_case(b"VTS_")
+            && digits.iter().all(u8::is_ascii_digit)
+            && name[6..9].eq_ignore_ascii_case(b"_0.")
+            && (name[9..].eq_ignore_ascii_case(b"IFO") || name[9..].eq_ignore_ascii_case(b"BUP"));
+        fits.then(|| usize::from(digits[0] - b'0') * 10 + usize::from(digits[1] - b'0'))
+    })
+}
+
+/// An IFO from its start to the end of its last sector (`vmgi_last_sector` or `vtsi_last_sector`, at byte 28), if
+/// all of it is there. An IFO is a few sectors; a length past 4 MiB is a misread.
+fn whole_ifo(ifo: &[u8]) -> Option<&[u8]> {
+    let sectors = usize::try_from(be32(ifo, 28)?).ok()?.checked_add(1)?;
+    let len = sectors.checked_mul(2048).filter(|len| *len <= 4 << 20)?;
+    ifo.get(..len)
 }
 
 /// One title set's IFO from its start.
@@ -170,6 +296,8 @@ pub(crate) mod tests {
     pub(crate) fn ifo() -> Vec<u8> {
         let mut b = vec![0u8; 3 * 2048];
         b[..12].copy_from_slice(VTS);
+        // its last sector, the third
+        b[28..32].copy_from_slice(&2u32.to_be_bytes());
         // the program chain table in sector 1
         b[0xCC..0xD0].copy_from_slice(&1u32.to_be_bytes());
         b[0x200] = 0b0101_1100;
@@ -253,6 +381,136 @@ pub(crate) mod tests {
         let info = dvd(&data);
         assert_eq!(info.audio.len(), 3, "the feature's set, not the extra's");
         assert_eq!(info.duration_secs, Some(6750.0));
+    }
+
+    /// A manager IFO of one sector for `sets` title sets.
+    fn vmg(sets: u16) -> Vec<u8> {
+        let mut b = vec![0u8; 2048];
+        b[..12].copy_from_slice(VMG);
+        b[62..64].copy_from_slice(&sets.to_be_bytes());
+        b
+    }
+
+    fn md5_hex(parts: &[&[u8]]) -> String {
+        use md5::{Digest, Md5};
+        let mut md5 = Md5::new();
+        for p in parts {
+            md5.update(p);
+        }
+        let digest: [u8; 16] = md5.finalize().into();
+        digest.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    #[test]
+    fn the_disc_id_is_the_md5_of_the_manager_and_title_set_ifos() {
+        let (vmg, vts) = (vmg(1), ifo());
+        // an ISO's order: the manager, its menu, the set's IFO, its videos, then the set's .BUP copy
+        let data = [&[0u8; 4096][..], &vmg, &[7u8; 5000], &vts, &[9u8; 3000], &vts].concat();
+        let want = md5_hex(&[&vmg, &vts]);
+        assert_eq!(disc_id(&data), Some(want.clone()));
+        assert_eq!(dvd(&data).disc_id, Some(want.clone()));
+        // a stored archive's order: each .BUP first, the same bytes
+        let folder = [&vmg[..], &vmg, &vts, &vts].concat();
+        assert_eq!(disc_id(&folder), Some(want));
+    }
+
+    #[test]
+    fn a_disc_id_wants_every_ifo_whole() {
+        let (vmg1, vts) = (vmg(1), ifo());
+        let whole = [&vmg1[..], &vts].concat();
+        assert_eq!(disc_id(&whole[..whole.len() - 1]), None, "the set's IFO is cut");
+        assert_eq!(disc_id(&vmg1), None, "no title set yet");
+        // two title sets, only the first read: no ID rather than a wrong one
+        let two = [&vmg(2)[..], &vts].concat();
+        assert_eq!(disc_id(&two), None);
+        let mut second = ifo();
+        second[0x300] = 1;
+        // an ISO 9660 image: each set's IFO where its directory record says
+        let both = iso(&vmg(2), &[&vts, &second]);
+        assert_eq!(disc_id(&both), Some(md5_hex(&[&vmg(2), &vts, &second])));
+        assert_eq!(disc_id(&[&vmg(0)[..], &vts].concat()), None, "a manager with no sets");
+        // cut anywhere: safe
+        for cut in (0..both.len()).step_by(13) {
+            let _ = disc_id(&both[..cut]);
+        }
+    }
+
+    #[test]
+    fn a_disc_id_takes_the_title_sets_in_their_numbers_order() {
+        let mut second = ifo();
+        second[0x300] = 1;
+        let want = md5_hex(&[&vmg(2), &ifo(), &second]);
+        // an archive whose entries put VTS_02 first: each entry's header names it just before its bytes
+        let entry = |name: &str, body: &[u8]| [&[0u8; 30][..], name.as_bytes(), &[0u8; 20], body].concat();
+        let archive = [
+            entry("VIDEO_TS/VIDEO_TS.IFO", &vmg(2)),
+            entry("VIDEO_TS/VTS_02_0.IFO", &second),
+            entry("VIDEO_TS/vts_01_0.bup", &ifo()),
+            entry("VIDEO_TS/VTS_01_0.IFO", &ifo()),
+        ]
+        .concat();
+        assert_eq!(disc_id(&archive), Some(want));
+        // a set missing from the archive, or its order not told by names or an ISO's layout: no ID
+        let one_missing = [entry("VIDEO_TS/VIDEO_TS.IFO", &vmg(2)), entry("VIDEO_TS/VTS_02_0.IFO", &second)].concat();
+        assert_eq!(disc_id(&one_missing), None);
+        let unnamed = [&vmg(2)[..], &second, &ifo()].concat();
+        assert_eq!(disc_id(&unnamed), None);
+    }
+
+    /// An ISO 9660 image of a manager IFO and title set IFOs, each laid out with its `.BUP` copy after it, and a
+    /// directory naming the sets' IFOs, in reverse to show that the records, not the layout, give the order.
+    fn iso(vmg: &[u8], sets: &[&[u8]]) -> Vec<u8> {
+        let mut img = vec![0u8; 0x8000];
+        let mut pvd = vec![0u8; 2048];
+        pvd[..7].copy_from_slice(b"\x01CD001\x01");
+        img.extend(pvd);
+        img.resize(20 * 2048, 0);
+        let dir_at = img.len();
+        img.extend([0u8; 2048]);
+        img[dir_at + 1000..dir_at + 1008].copy_from_slice(b"VIDEO_TS");
+        img.extend(vmg);
+        let mut records = Vec::new();
+        for (n, ifo) in sets.iter().enumerate() {
+            let sector = u32::try_from(img.len() / 2048).unwrap();
+            img.extend(*ifo);
+            img.extend([5u8; 4096]);
+            img.extend(*ifo);
+            let name = format!("VTS_{:02}_0.IFO;1", n + 1);
+            let mut rec = vec![0u8; 33];
+            rec[0] = u8::try_from(33 + name.len() + 1).unwrap();
+            rec[2..6].copy_from_slice(&sector.to_le_bytes());
+            rec[10..14].copy_from_slice(&u32::try_from(ifo.len()).unwrap().to_le_bytes());
+            rec[32] = u8::try_from(name.len()).unwrap();
+            rec.extend(name.as_bytes());
+            rec.push(0);
+            records.insert(0, rec);
+        }
+        let records = records.concat();
+        img[dir_at..dir_at + records.len()].copy_from_slice(&records);
+        img
+    }
+
+    #[test]
+    fn an_iso_s_title_sets_count_even_with_the_same_bytes_and_inside_an_archive() {
+        let vts = ifo();
+        let image = iso(&vmg(2), &[&vts, &vts]);
+        let want = md5_hex(&[&vmg(2), &vts, &vts]);
+        assert_eq!(disc_id(&image), Some(want.clone()), "two sets of the same bytes, not a set and its .BUP");
+        // the image in a stored archive, after the archive's entry header naming only the image
+        let wrapped = [&[0u8; 41][..], b"Some.Movie.DVD.iso", &[0u8; 13], &image].concat();
+        assert_eq!(disc_id(&wrapped), Some(want.clone()));
+        assert_eq!(dvd(&wrapped).disc_id, Some(want));
+        // the second set's IFO not read yet: no ID
+        let second_at = image.len() - (2 * vts.len() + 4096);
+        assert_eq!(disc_id(&image[..second_at + 100]), None);
+    }
+
+    #[test]
+    fn a_disc_id_cut_anywhere_is_safe() {
+        let both = [&vmg(2)[..], &b"VTS_01_0.IFO"[..], &ifo(), &b"VTS_02_0.IFO"[..], &ifo()].concat();
+        for cut in (0..both.len()).step_by(13) {
+            let _ = disc_id(&both[..cut]);
+        }
     }
 
     #[test]

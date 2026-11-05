@@ -912,7 +912,11 @@ fn inspect(body: &[u8], password: Option<&str>, info: &mut ProbeInfo) {
     // pick needn't be the longest
     if info.media.as_ref().is_none_or(|m| matches!(m.container.as_str(), "dvd-video" | "mpeg-ps")) {
         if super::dvd::has_title_set(body) {
-            info.media = Some(super::dvd::dvd(body));
+            // an ID worked out from an unwrapped disc image stands if the raw bytes can't give one
+            let inner_id = info.media.as_mut().and_then(|m| m.disc_id.take());
+            let mut dvd = super::dvd::dvd(body);
+            dvd.disc_id = dvd.disc_id.or(inner_id);
+            info.media = Some(dvd);
         } else if super::dvd::is_dvd(body) {
             // only the manager IFO or the disc's names so far: what was read stands, and more of the front is read
             // for a title set
