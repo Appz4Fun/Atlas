@@ -152,8 +152,12 @@ pub(crate) fn rerun_mpeg_ps(conn: &rusqlite::Connection, now: i64) -> rusqlite::
 /// The same for DVD-Video discs and folders, before `dvd` read their title sets: an ISO or IMG image, or a
 /// `VIDEO_TS` folder whose first file is an IFO or BUP.
 pub(crate) fn rerun_dvd(conn: &rusqlite::Connection, now: i64) -> rusqlite::Result<usize> {
-    rerun_unread(conn, &["iso", "img", "ifo", "bup"], now)
+    Ok(rerun_unread(conn, &["iso", "img", "ifo", "bup"], now)? + rerun_probes(conn, DVD_FOLDER_AS_VOB, now)?)
 }
+
+/// A probe row of a `VIDEO_TS` folder in an archive read from its VOB only, before its IFO was looked for.
+const DVD_FOLDER_AS_VOB: &str = "json_extract(info, '$.media.container') = 'mpeg-ps'
+     and lower(json_extract(info, '$.archive.name')) like '%video_ts%'";
 
 /// Extensions of the files a probe reads tracks from since it first ran: a saved probe of one with no media is
 /// from before.
@@ -198,7 +202,10 @@ fn stale_saved(info: &str) -> bool {
     let empty = |k: &str| p["media"][k].as_array().is_none_or(Vec::is_empty);
     let mp4_without_tracks =
         p["media"]["container"] == "mp4" && p["archive"].is_null() && empty("video") && empty("audio");
+    let dvd_folder_as_vob = p["media"]["container"] == "mpeg-ps"
+        && p["archive"]["name"].as_str().is_some_and(|n| n.to_ascii_lowercase().contains("video_ts"));
     mp4_without_tracks
+        || dvd_folder_as_vob
         || p["media"].is_null()
             && (newly_read(p["file"].as_str())
             || newly_read(p["archive"]["name"].as_str())
@@ -709,9 +716,9 @@ fn inspect(body: &[u8], info: &mut ProbeInfo) {
     let nest = nest::unwrap(body);
     info.media = media::parse(&nest.inner);
     // a DVD folder in a stored archive: the walk follows its biggest file, a VOB, but the title set's IFO, with the
-    // languages and the playing time, is beside it in what was read
-    if !nest.inner.is_empty()
-        && info.media.as_ref().is_none_or(|m| m.container != "dvd-video")
+    // languages and the playing time, is beside it in what was read; and of several title sets read, the walk's
+    // pick needn't be the longest
+    if info.media.as_ref().is_none_or(|m| matches!(m.container.as_str(), "dvd-video" | "mpeg-ps"))
         && super::dvd::has_title_set(body)
     {
         info.media = Some(super::dvd::dvd(body));
@@ -814,6 +821,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(rerun_dvd(&conn, 100).unwrap(), 1);
+        conn.execute("insert into releases (id, name, group_name) values (15, '15', 'g')", []).unwrap();
+        conn.execute("insert into pp_state (release_id, done) values (15, ?)", [mask(PROBE_STEP)]).unwrap();
+        conn.execute(
+            "insert into release_probe (release_id, info)
+             values (15, '{\"archive\":{\"name\":\"VIDEO_TS/X.VOB\"},\"media\":{\"container\":\"mpeg-ps\"}}')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(rerun_dvd(&conn, 100).unwrap(), 2, "the folder read as a VOB too, and the earlier one again");
         let state = |id: i64| -> (i64, i64) {
             conn.query_row("select done, rerun_mask from pp_state where release_id = ?", [id], |r| {
                 Ok((r.get(0)?, r.get(1)?))
@@ -824,7 +840,7 @@ mod tests {
         assert_eq!(state(2), (mask(PROBE_STEP), 0), "read");
         assert_eq!(state(3), (mask(PROBE_STEP), 0), "missing");
         let queued: i64 = conn.query_row("select count(*) from pp_queue", [], |r| r.get(0)).unwrap();
-        assert_eq!(queued, 9);
+        assert_eq!(queued, 10);
         assert_eq!(state(7), (mask(PROBE_STEP), 0), "read already");
     }
 
@@ -837,6 +853,8 @@ mod tests {
         assert!(!stale_saved(r#"{"file":"Clip.navi","media":null}"#), "not an avi");
         assert!(stale_saved(r#"{"file":"Film.mp4","media":{"container":"mp4","video":[],"audio":[]}}"#));
         assert!(!stale_saved(r#"{"file":"Film.mp4","media":{"container":"mp4","video":[{"codec":"avc1"}]}}"#));
+        assert!(stale_saved(r#"{"archive":{"name":"VIDEO_TS/VTS_01_1.VOB"},"media":{"container":"mpeg-ps"}}"#));
+        assert!(!stale_saved(r#"{"file":"Film.mpg","media":{"container":"mpeg-ps"}}"#), "a plain mpeg");
         assert!(!stale_saved(r#"{"file":"Movie.avi","media":{"container":"avi"}}"#), "read");
         assert!(!stale_saved(r#"{"file":"Movie.mkv","media":null}"#));
     }
@@ -886,6 +904,24 @@ mod tests {
         assert_eq!(media.container, "dvd-video");
         assert_eq!(media.audio.len(), 3);
         assert_eq!(media.duration_secs, Some(6750.0));
+    }
+
+    #[test]
+    fn of_several_title_sets_read_the_longest_wins_whichever_the_walk_picked() {
+        use crate::archive::testkit::{r4_file, r4_main, rar4};
+        // a bigger extras IFO of 10 minutes, then the feature's
+        let mut extra = super::super::dvd::tests::ifo();
+        extra[2048 + 0x40 + 4..2048 + 0x40 + 8].copy_from_slice(&[0x00, 0x10, 0x00, 0x40]);
+        extra[2048 + 0x200 + 4..2048 + 0x200 + 8].copy_from_slice(&[0x00, 0x00, 0x00, 0x40]);
+        extra.resize(8192, 0);
+        let body = rar4(&[
+            r4_main(0),
+            r4_file(0, b"VIDEO_TS\\VTS_01_0.IFO", &extra),
+            r4_file(0, b"VIDEO_TS\\VTS_02_0.IFO", &super::super::dvd::tests::ifo()),
+        ]);
+        let mut info = ProbeInfo::default();
+        inspect(&body, &mut info);
+        assert_eq!(info.media.expect("a dvd").duration_secs, Some(6750.0));
     }
 
     #[test]
