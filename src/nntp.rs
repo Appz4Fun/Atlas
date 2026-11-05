@@ -962,6 +962,30 @@ impl Conn {
         Ok((out, false))
     }
 
+    /// HEAD: the headers, lines ending in `\n`, and nothing of the body. None: past `max_bytes`, with the rest left
+    /// unread.
+    pub async fn head(&mut self, message_id: &str, max_bytes: usize) -> Result<Option<Vec<u8>>> {
+        let (code, message) = self.command("HEAD", Some(message_id)).await?;
+        if code != 221 {
+            return Err(NntpError::Reply { code, message });
+        }
+        let mut out = Vec::new();
+        loop {
+            let Some(mut l) = self.read_line_capped(max_bytes).await? else { return Ok(None) };
+            if l == b"." {
+                return Ok(Some(out));
+            }
+            if l.starts_with(b"..") {
+                l.remove(0);
+            }
+            out.extend_from_slice(&l);
+            out.push(b'\n');
+            if out.len() > max_bytes {
+                return Ok(None);
+            }
+        }
+    }
+
     /// Whether a server has the article, with nothing transferred.
     pub async fn stat(&mut self, message_id: &str) -> Result<()> {
         let (code, message) = self.command("STAT", Some(message_id)).await?;
@@ -1471,6 +1495,8 @@ pub enum BackgroundRead {
     RawPrefix,
     /// nothing read: an empty `Body` says a server has it
     Stat,
+    /// the headers alone, undecoded
+    Head,
 }
 
 /// how long a background body waits for room before it queues like anything else
@@ -2456,6 +2482,9 @@ impl Pool {
                             .await
                             .map(|(b, whole)| (whole, Some(b))),
                         BackgroundRead::Stat => lease.begin().stat(message_id).await.map(|()| (true, Some(Vec::new()))),
+                        BackgroundRead::Head => {
+                            lease.begin().head(message_id, max_bytes).await.map(|b| (b.is_some(), b))
+                        }
                     }
                 })
                 .await;

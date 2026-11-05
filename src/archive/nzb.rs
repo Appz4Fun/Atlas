@@ -1,6 +1,7 @@
 //! A posted NZB, read as a list: the files of the post it points to, by the names their subjects give and the
 //! article bytes the NZB counts for each. What that post holds is for the release it is, not this one.
 
+use quick_xml::escape::resolve_predefined_entity;
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::{Reader, XmlVersion};
 
@@ -24,46 +25,173 @@ fn starts_with_ignore_case(bytes: &[u8], prefix: &[u8]) -> bool {
     bytes.get(..prefix.len()).is_some_and(|b| b.eq_ignore_ascii_case(prefix))
 }
 
-/// Each `<file>` once, by its subject's file name and its segments' bytes summed. `complete` once `</nzb>` is read;
-/// a cut or broken NZB lists what came before the break. Bytes that aren't UTF-8 are read as replacement characters.
-pub fn list(body: &[u8]) -> Listing {
+/// Segments an NZB's files keep at most between them: a post with more is listed and not read whole, soo their
+/// message-ids aren't needed, and a crafted NZB of millions can't fill memory with them.
+pub const MAX_KEPT_SEGMENTS: usize = 4_096;
+
+/// One `<file>` of an NZB: the name its subject gives, and its articles: all of them counted, the first ones kept
+/// (`MAX_KEPT_SEGMENTS` across the NZB).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NzbFile {
+    pub name: String,
+    pub segments: Vec<Segment>,
+    /// its `<segment>`s, kept or not
+    pub articles: usize,
+    /// and their bytes
+    pub total_bytes: u64,
+    /// the groups its `<groups>` names, the first `MAX_GROUPS`
+    pub groups: Vec<String>,
+}
+
+/// Groups of a file kept at most.
+const MAX_GROUPS: usize = 32;
+/// The longest message-id or group name read: one longer is no real one, and is dropped rather than cut.
+const MAX_TEXT: usize = 512;
+
+impl NzbFile {
+    /// what its articles count in all
+    pub fn bytes(&self) -> u64 {
+        self.total_bytes
+    }
+
+    fn add(&mut self, segment: Segment, kept: &mut usize) {
+        self.articles += 1;
+        self.total_bytes = self.total_bytes.saturating_add(segment.bytes);
+        if *kept < MAX_KEPT_SEGMENTS {
+            *kept += 1;
+            self.segments.push(segment);
+        }
+    }
+}
+
+/// One `<segment>`: its number in the file, its article bytes and its message-id, without brackets.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Segment {
+    pub number: i64,
+    pub bytes: u64,
+    pub message_id: String,
+}
+
+/// What an NZB says: its files, `complete` once `</nzb>` is read, `damaged` when it broke off.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Parsed {
+    pub files: Vec<NzbFile>,
+    pub complete: bool,
+    pub damaged: bool,
+}
+
+/// Each `<file>` with a name, at most `MAX_ENTRIES`, and its segments. A cut or broken NZB gives what came before
+/// the break. Bytes that aren't UTF-8 are read as replacement characters.
+pub fn parse(body: &[u8]) -> Parsed {
     let text = String::from_utf8_lossy(body);
     let mut reader = Reader::from_str(&text);
-    let mut listing = Listing::default();
-    // the file being read: its name and bytes so far
-    let mut file: Option<(String, u64)> = None;
+    let mut parsed = Parsed::default();
+    let mut file: Option<NzbFile> = None;
+    // the segment being read, its message-id so far
+    let mut segment: Option<Segment> = None;
+    // a `<group>` being read, its name so far
+    let mut group: Option<String> = None;
+    // the text being read went past `MAX_TEXT`
+    let mut overlong = false;
+    let mut kept = 0usize;
     loop {
         match reader.read_event() {
             Ok(Event::Start(e)) => match e.local_name().as_ref() {
-                "file" => file = Some((file_name(&e), 0)),
-                "segment" => add_bytes(&mut file, &e),
+                "file" => file = Some(NzbFile { name: file_name(&e), ..NzbFile::default() }),
+                "segment" => {
+                    segment = Some(segment_of(&e));
+                    overlong = false;
+                }
+                "group" => {
+                    group = Some(String::new());
+                    overlong = false;
+                }
                 _ => {}
             },
-            Ok(Event::Empty(e)) if e.local_name().as_ref() == "segment" => add_bytes(&mut file, &e),
+            Ok(Event::Empty(e)) if e.local_name().as_ref() == "segment" => {
+                if let Some(f) = file.as_mut() {
+                    f.add(segment_of(&e), &mut kept);
+                }
+            }
+            Ok(Event::Text(t)) => append(text_of(&mut segment, &mut group), &t, &mut overlong),
+            Ok(Event::CData(t)) => append(text_of(&mut segment, &mut group), &t, &mut overlong),
+            Ok(Event::GeneralRef(r)) => {
+                let resolved = match r.resolve_char_ref() {
+                    Ok(Some(c)) => c.to_string(),
+                    _ => resolve_predefined_entity(&r).unwrap_or_default().to_string(),
+                };
+                append(text_of(&mut segment, &mut group), &resolved, &mut overlong);
+            }
             Ok(Event::End(e)) => match e.local_name().as_ref() {
-                "file" => {
-                    if let Some((name, bytes)) = file.take()
-                        && !name.is_empty()
-                        && listing.files.len() < MAX_ENTRIES
+                "segment" => {
+                    if let (Some(mut s), Some(f)) = (segment.take(), file.as_mut()) {
+                        // an overlong id is no id: such a file can't be read
+                        s.message_id = if overlong {
+                            String::new()
+                        } else {
+                            s.message_id.trim().trim_matches(['<', '>']).to_string()
+                        };
+                        f.add(s, &mut kept);
+                    }
+                }
+                "group" => {
+                    if let (Some(g), Some(f)) = (group.take(), file.as_mut())
+                        && !overlong
+                        && !g.trim().is_empty()
+                        && f.groups.len() < MAX_GROUPS
                     {
-                        listing.files.push(InnerFile { name, size: Some(bytes) });
+                        f.groups.push(g.trim().to_string());
+                    }
+                }
+                "file" => {
+                    if let Some(f) = file.take()
+                        && !f.name.is_empty()
+                        && parsed.files.len() < MAX_ENTRIES
+                    {
+                        parsed.files.push(f);
                     }
                 }
                 "nzb" => {
-                    listing.complete = true;
+                    parsed.complete = true;
                     break;
                 }
                 _ => {}
             },
             Ok(Event::Eof) => break,
             Err(_) => {
-                listing.damaged = true;
+                parsed.damaged = true;
                 break;
             }
             Ok(_) => {}
         }
     }
-    listing
+    parsed
+}
+
+/// What text goes to: the segment's message-id, or the group's name, being read.
+fn text_of<'a>(segment: &'a mut Option<Segment>, group: &'a mut Option<String>) -> Option<&'a mut String> {
+    segment.as_mut().map(|s| &mut s.message_id).or(group.as_mut())
+}
+
+/// `piece` onto `to`, up to `MAX_TEXT` in all; past it nothing more is kept and `overlong` says so.
+fn append(to: Option<&mut String>, piece: &str, overlong: &mut bool) {
+    let Some(to) = to else { return };
+    if *overlong || to.len() + piece.len() > MAX_TEXT {
+        *overlong = true;
+        return;
+    }
+    to.push_str(piece);
+}
+
+/// Each `<file>` once, by its subject's file name and its segments' bytes summed, as `parse` reads it.
+pub fn list(body: &[u8]) -> Listing {
+    let parsed = parse(body);
+    Listing {
+        files: parsed.files.iter().map(|f| InnerFile { name: f.name.clone(), size: Some(f.bytes()) }).collect(),
+        complete: parsed.complete,
+        damaged: parsed.damaged,
+        ..Default::default()
+    }
 }
 
 /// the name a subject gives its file, or the subject itself when no pattern reads one
@@ -73,10 +201,12 @@ fn file_name(e: &BytesStart<'_>) -> String {
     clean_name(&name).unwrap_or_default()
 }
 
-fn add_bytes(file: &mut Option<(String, u64)>, e: &BytesStart<'_>) {
-    if let Some((_, total)) = file {
-        let bytes = attribute(e, "bytes").and_then(|b| b.trim().parse::<u64>().ok()).unwrap_or(0);
-        *total = total.saturating_add(bytes);
+fn segment_of(e: &BytesStart<'_>) -> Segment {
+    let number = |key| attribute(e, key).and_then(|b| b.trim().parse::<u64>().ok());
+    Segment {
+        number: number("number").and_then(|n| i64::try_from(n).ok()).unwrap_or(0),
+        bytes: number("bytes").unwrap_or(0),
+        message_id: String::new(),
     }
 }
 
@@ -89,7 +219,8 @@ fn attribute(e: &BytesStart<'_>, key: &str) -> Option<String> {
 /// The release names an NZB's files give, as a save names a release from a file (`strip_release_suffixes`), PAR2
 /// files last, each once. At most 3.
 pub fn release_names<'a>(files: impl Iterator<Item = &'a str>) -> Vec<String> {
-    let mut files: Vec<&str> = files.collect();
+    // an NZB on the way is a hop, not where it leads
+    let mut files: Vec<&str> = files.filter(|name| super::select::classify(name) != super::select::Kind::Nzb).collect();
     files.sort_by_key(|name| name.to_ascii_lowercase().ends_with(".par2"));
     let mut names: Vec<String> = Vec::new();
     for file in files {
@@ -140,6 +271,57 @@ mod tests {
             assert!(!part.complete, "cut {at}");
             assert!(part.files.iter().zip(&whole.files).all(|(a, b)| a == b), "cut {at}");
         }
+    }
+
+    #[test]
+    fn parse_keeps_each_segments_number_bytes_and_message_id() {
+        let p = parse(NZB.as_bytes());
+        assert_eq!(p.files.len(), 2);
+        assert_eq!(
+            p.files[0].segments,
+            [
+                Segment { number: 1, bytes: 640_000, message_id: "part1of2.abc$&@powerpost.local".into() },
+                Segment { number: 2, bytes: 1000, message_id: "part2of2.abc$&@powerpost.local".into() },
+            ]
+        );
+        assert_eq!(p.files[1].segments[0].message_id, "x@y");
+        let bracketed = parse(b"<nzb><file subject=\"a.rar (1/1)\"><segments><segment bytes=\"1\" number=\"1\"> &lt;a@b&gt; </segment></segments></file></nzb>");
+        assert_eq!(bracketed.files[0].segments[0].message_id, "a@b");
+        let long = format!(
+            "<nzb><file subject=\"a.rar (1/1)\"><groups><group>a.b.c</group></groups><segments><segment bytes=\"1\" number=\"1\">{}</segment></segments></file></nzb>",
+            "x".repeat(10_000)
+        );
+        let long = parse(long.as_bytes());
+        assert_eq!(
+            (long.files[0].segments[0].message_id.as_str(), long.files[0].groups.as_slice()),
+            ("", &["a.b.c".to_string()][..])
+        );
+        let cdata = parse(b"<nzb><file subject=\"a.rar (1/1)\"><segments><segment bytes=\"1\" number=\"1\"><![CDATA[c@d]]></segment></segments></file></nzb>");
+        assert_eq!(cdata.files[0].segments[0].message_id, "c@d");
+    }
+
+    #[test]
+    fn segments_past_the_cap_are_counted_not_kept() {
+        let segments: String = (1..=MAX_KEPT_SEGMENTS + 10)
+            .map(|n| format!("<segment bytes=\"2\" number=\"{n}\">{n}@x</segment>"))
+            .collect();
+        let p = parse(
+            format!("<nzb><file subject=\"a.rar (1/1)\"><segments>{segments}</segments></file></nzb>").as_bytes(),
+        );
+        let f = &p.files[0];
+        assert_eq!(
+            (f.segments.len(), f.articles, f.bytes()),
+            (MAX_KEPT_SEGMENTS, MAX_KEPT_SEGMENTS + 10, 2 * (MAX_KEPT_SEGMENTS as u64 + 10))
+        );
+        assert!(!crate::archive::follow::small(&p.files));
+    }
+
+    #[test]
+    fn release_names_leave_nzbs_on_the_way_out() {
+        let names = release_names(
+            ["A.nzb", "B-{{pw}}.nzb", "Final.Movie.2024-GRP.part01.rar", "Final.Movie.2024-GRP.par2"].into_iter(),
+        );
+        assert_eq!(names, ["Final.Movie.2024-GRP"]);
     }
 
     #[test]

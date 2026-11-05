@@ -21,7 +21,7 @@ use super::select::{self, Head, Kind};
 use super::store::{self as archive_store, SOURCE_7Z, SOURCE_NZB, SOURCE_PAR2, SOURCE_RAR, SOURCE_ZIP};
 use super::{
     ARTICLE_CAP, Format, InnerFile, Listing, NAME_SOURCE_INNER, NAME_SOURCE_PAR2, PROBE_PREFIX, RERUN_ON_INNER_FILES,
-    identify, nzb, rar, sevenz, zip,
+    follow, identify, nzb, rar, sevenz, zip,
 };
 
 fn retry(e: impl std::fmt::Display) -> StepError {
@@ -119,6 +119,74 @@ fn nzb_stored_in(listing: &Listing, body: &[u8]) -> Option<Listing> {
         .find(|at| body.get(*at..).is_some_and(nzb::is_nzb))?;
     let inside = nzb::list(body.get(at..)?);
     (!inside.files.is_empty()).then_some(inside)
+}
+
+/// The NZB an archive of this release names inside, read whole from the release's own articles when the release is
+/// small enough to (`follow::MAX_POST_BYTES`), and followed on hop after hop. None: no NZB named, an encrypted
+/// archive, a release too big, or an article not there.
+/// `head_file`: the file whose first article told the archive; `known`: that article by its message-id, when it was
+/// read whole and not only its start.
+fn deep_nzb(
+    ctx: &mut StepCtx<'_>,
+    files: &[FileInfo],
+    listing: &Listing,
+    head_file: &FileInfo,
+    known: Option<(&str, &[u8])>,
+    mut left: follow::Budget,
+) -> Result<Option<Listing>, StepError> {
+    if listing.encrypted || !listing.files.iter().any(|f| select::classify(&f.name) == Kind::Nzb) {
+        return Ok(None);
+    }
+    let rel = ctx.release();
+    if u64::try_from(rel.size).unwrap_or(u64::MAX) > follow::MAX_POST_BYTES
+        || usize::try_from(rel.parts).unwrap_or(usize::MAX) > follow::MAX_POST_ARTICLES
+    {
+        return Ok(None);
+    }
+    let mut wholes = Vec::new();
+    for file in files {
+        if let Some(whole) = own_whole(ctx, file)? {
+            wholes.push(whole);
+        }
+    }
+    // an archive known by its bytes, not its name, is read first: no name would pick it
+    let first = match select::classify(&head_file.filename) {
+        Kind::Rar(_) | Kind::SevenZip(_) | Kind::Zip(_) | Kind::Numbered(_) => None,
+        _ => own_whole(ctx, head_file)?.map(|whole| follow::Set { files: vec![whole], headed_volumes: false }),
+    };
+    let Some(found) = follow::nzb_inside(ctx, first, &wholes, None, known, &mut left)? else {
+        return Ok(None);
+    };
+    // too big to be read as a list here: the first article's part of it still is, by the caller
+    if found.len() > follow::MAX_FOLLOWED_NZB {
+        return Ok(None);
+    }
+    let complete = nzb::parse(&found).complete;
+    Ok(Some(Listing { files: follow::follow(ctx, found, &mut left)?, complete, ..Default::default() }))
+}
+
+/// A file of this release to read whole: one article a part, the first copy. None: a part isnt indexed.
+fn own_whole(ctx: &StepCtx<'_>, file: &FileInfo) -> Result<Option<follow::Whole>, StepError> {
+    let parts = file.expected.unwrap_or(0).max(file.parts_seen);
+    if parts < 1 {
+        return Ok(None);
+    }
+    let mut ids: std::collections::BTreeMap<i64, String> = std::collections::BTreeMap::new();
+    for seg in ctx.segments(file.id, &SegmentPick::Parts((1..=parts).collect())).map_err(retry)? {
+        if let Some(part) = seg.part {
+            ids.entry(part).or_insert(seg.message_id);
+        }
+    }
+    // one article posted with no counter has no part number to pick it by
+    if parts == 1 && ids.is_empty() {
+        for seg in ctx.segments(file.id, &SegmentPick::First(1)).map_err(retry)? {
+            ids.insert(1, seg.message_id);
+        }
+    }
+    if ids.len() as i64 != parts {
+        return Ok(None);
+    }
+    Ok(Some(follow::Whole { name: file.filename.clone(), ids: ids.into_values().collect(), trusted: true }))
 }
 
 /// An archive's outcome with the list of the NZB inside it beside its own rows, in the same writes. The archive's
@@ -718,17 +786,41 @@ impl Step for ListStep {
             match identify(&body) {
                 Format::Rar4 | Format::Rar5 => {
                     let listing = rar::list(&body);
-                    let inside = nzb_stored_in(&listing, &body);
+                    let inside = deep_nzb(
+                        ctx,
+                        &files,
+                        &listing,
+                        head.file,
+                        (!head.probe).then_some((seg.message_id.as_str(), &body[..])),
+                        follow::Budget::of(limits.max_bodies_per_release),
+                    )?
+                    .or_else(|| nzb_stored_in(&listing, &body));
                     return with_nzb(ctx, finish(ctx, SOURCE_RAR, listing, &limits)?, inside, &limits);
                 }
                 Format::Zip => {
                     let listing = zip_list(ctx, &head, &body, &mut left)?;
-                    let inside = nzb_stored_in(&listing, &body);
+                    let inside = deep_nzb(
+                        ctx,
+                        &files,
+                        &listing,
+                        head.file,
+                        (!head.probe).then_some((seg.message_id.as_str(), &body[..])),
+                        follow::Budget::of(limits.max_bodies_per_release),
+                    )?
+                    .or_else(|| nzb_stored_in(&listing, &body));
                     return with_nzb(ctx, finish(ctx, SOURCE_ZIP, listing, &limits)?, inside, &limits);
                 }
                 Format::SevenZip => {
                     let listing = seven_list(ctx, &head, &seg, &body, &mut left)?;
-                    return finish(ctx, SOURCE_7Z, listing, &limits);
+                    let inside = deep_nzb(
+                        ctx,
+                        &files,
+                        &listing,
+                        head.file,
+                        (!head.probe).then_some((seg.message_id.as_str(), &body[..])),
+                        follow::Budget::of(limits.max_bodies_per_release),
+                    )?;
+                    return with_nzb(ctx, finish(ctx, SOURCE_7Z, listing, &limits)?, inside, &limits);
                 }
                 Format::Par2 => {
                     // a PAR2 under another name: without a list, it cant replace the rows of one that had
@@ -767,7 +859,10 @@ impl Step for ListStep {
         for file in select::nzb_sources(&files) {
             let Some(body) = whole_file(ctx, file, &mut left)? else { continue };
             if identify(&body) == Format::Nzb {
-                return finish(ctx, SOURCE_NZB, nzb::list(&body), &limits);
+                let complete = nzb::parse(&body).complete;
+                let mut budget = follow::Budget::of(limits.max_bodies_per_release);
+                let files = follow::follow(ctx, body, &mut budget)?;
+                return finish(ctx, SOURCE_NZB, Listing { files, complete, ..Default::default() }, &limits);
             }
         }
         let rel = ctx.release();

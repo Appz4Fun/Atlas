@@ -966,3 +966,195 @@ fn what_a_read_nzb_points_to_is_marked_and_ranked_up() {
         .unwrap();
     assert_eq!(rank, Some(2));
 }
+
+/// an NZB of `files`, each `(subject, [(segment bytes, message-id)])`
+fn an_nzb_of(files: &[(&str, &[(u64, &str)])]) -> Vec<u8> {
+    let mut out = String::from("<?xml version=\"1.0\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\">\n");
+    for (subject, segments) in files {
+        out.push_str(&format!(
+            "<file poster=\"p\" date=\"1\" subject=\"{subject}\"><groups><group>alt.binaries.test</group></groups><segments>"
+        ));
+        for (i, (bytes, id)) in segments.iter().enumerate() {
+            out.push_str(&format!("<segment bytes=\"{bytes}\" number=\"{}\">{id}</segment>", i + 1));
+        }
+        out.push_str("</segments></file>\n");
+    }
+    out.push_str("</nzb>\n");
+    out.into_bytes()
+}
+
+/// a post on the server under its own message-id, outside any release
+fn loose(number: u64, id: &str, file: &str, data: &[u8]) -> Post {
+    Post {
+        message_id: format!("<{id}>"),
+        ..post(number, &format!("\"{file}\" yEnc (1/1)"), 700_000, yenc_body(file, data))
+    }
+}
+
+#[test]
+fn a_posted_nzb_is_followed_through_a_small_post_whose_rar_holds_the_next_nzb() {
+    let mut h = fresh();
+    // the last hop: a big upload, listed and not read
+    let last =
+        an_nzb_of(&[("Final.Movie.2024.2160p-GRP.part01.rar (1/2)", &[(700_000_000, "f1@x"), (700_000_000, "f2@x")])]);
+    let rar = rar4(&[r4_main(0), r4_file(0, b"Final-{{s3cret}}.nzb", &last), r4_end()]);
+    // the first: a small post of that RAR, read whole
+    let first = an_nzb_of(&[("Hop.Post.rar (1/1)", &[(rar.len() as u64, "hop1@x")])]);
+    let s = shape("x").one("x.nzb", &first);
+    h.save(&[s.release()]);
+    let mut posts = s.posts.clone();
+    posts.push(loose(90, "hop1@x", "Hop.Post.rar", &rar));
+    let state = Server::new(posts);
+    // the listing step alone: the probe reads articles with their headers too
+    start_with(
+        &mut h,
+        spawn_server(state.clone()),
+        config(),
+        vec![Arc::new(atlas::archive::steps::ListStep::default())],
+    );
+    settled(&h, "x");
+    assert_eq!(
+        (bodies(&state), state.heads_sent.load(Ordering::SeqCst)),
+        (2, 1),
+        "the NZB, then the hop's one article after its headers, not the big upload"
+    );
+    let found: Vec<(String, i64)> = rows(&h, "x").into_iter().map(|r| (r.name, r.source)).collect();
+    assert_eq!(
+        found,
+        [
+            ("Final-{{s3cret}}.nzb".to_string(), 5),
+            ("Final.Movie.2024.2160p-GRP.part01.rar".to_string(), 5),
+            ("Hop.Post.rar".to_string(), 5)
+        ]
+    );
+}
+
+#[test]
+fn a_small_rars_nzb_is_read_whole_not_only_its_first_article() {
+    let mut h = fresh();
+    let mut files: Vec<(&str, &[u64])> = POINTED_AT.to_vec();
+    files.push(("Other.Thing.2024.mkv (1/1)", &[5_000]));
+    let rar = rar4(&[r4_main(0), r4_file(0, b"Pointed.At.nzb", &an_nzb(&files)), r4_end()]);
+    let (head, tail) = rar.split_at(rar.len() / 2);
+    let s = shape("x").add("x.rar", 1, 2, yenc_body("x.rar", head)).add("x.rar", 2, 2, yenc_body("x.rar", tail));
+    h.save(&[s.release()]);
+    let state = Server::new(s.posts.clone());
+    start_with(
+        &mut h,
+        spawn_server(state.clone()),
+        config(),
+        vec![Arc::new(atlas::archive::steps::ListStep::default())],
+    );
+    settled(&h, "x");
+    assert_eq!(
+        (bodies(&state), state.heads_sent.load(Ordering::SeqCst)),
+        (2, 0),
+        "the head, then the article after it: the release's own, no headers asked for"
+    );
+    let nzb_rows: Vec<String> = rows(&h, "x").into_iter().filter(|r| r.source == 5).map(|r| r.name).collect();
+    assert!(nzb_rows.contains(&"Other.Thing.2024.mkv".to_string()), "{nzb_rows:?}");
+}
+
+/// a posted NZB of `hop`'s files, each `(file, data)` posted under `<hopN@x>`; the server holds them all
+fn follow_through(hop: &[(&str, Vec<u8>)]) -> (Harness, Arc<Server>) {
+    let mut h = fresh();
+    let listed: Vec<(String, u64, String)> = hop
+        .iter()
+        .enumerate()
+        .map(|(i, (file, data))| (format!("{file} (1/1)"), data.len() as u64, format!("hop{i}@x")))
+        .collect();
+    let files: Vec<(&str, Vec<(u64, &str)>)> =
+        listed.iter().map(|(s, b, id)| (s.as_str(), vec![(*b, id.as_str())])).collect();
+    let files: Vec<(&str, &[(u64, &str)])> = files.iter().map(|(s, segs)| (*s, segs.as_slice())).collect();
+    let s = shape("x").one("x.nzb", &an_nzb_of(&files));
+    h.save(&[s.release()]);
+    let mut posts = s.posts.clone();
+    for (i, (file, data)) in hop.iter().enumerate() {
+        posts.push(loose(90 + i as u64, &format!("hop{i}@x"), file, data));
+    }
+    let state = Server::new(posts);
+    start_with(&mut h, spawn_server(state.clone()), config(), steps::all());
+    settled(&h, "x");
+    (h, state)
+}
+
+fn last_hop() -> Vec<u8> {
+    an_nzb_of(&[("Final.Movie.2024.2160p-GRP.part01.rar (1/2)", &[(700_000_000, "f1@x"), (700_000_000, "f2@x")])])
+}
+
+fn names_of(h: &Harness) -> Vec<String> {
+    rows(h, "x").into_iter().map(|r| r.name).collect()
+}
+
+#[test]
+fn a_split_7z_is_joined_before_it_is_unwrapped() {
+    let sz = sz_wrap(&last_hop(), &[0u8; 8]);
+    let (head, tail) = sz.split_at(sz.len() / 2);
+    let (h, _) = follow_through(&[("Hop.7z.001", head.to_vec()), ("Hop.7z.002", tail.to_vec())]);
+    assert!(names_of(&h).contains(&"Final.Movie.2024.2160p-GRP.part01.rar".to_string()), "{:?}", names_of(&h));
+}
+
+#[test]
+fn an_nzb_beside_a_bigger_file_in_an_archive_is_the_one_followed() {
+    let zip = zip_of(&[("big.bin", &vec![7u8; 50_000]), ("Next-{{pw}}.nzb", &last_hop())]);
+    let (h, _) = follow_through(&[("Hop.zip", zip)]);
+    let names = names_of(&h);
+    assert!(names.contains(&"Final.Movie.2024.2160p-GRP.part01.rar".to_string()), "{names:?}");
+    assert!(names.contains(&"Next-{{pw}}.nzb".to_string()), "{names:?}");
+}
+
+#[test]
+fn a_small_release_whose_archive_has_no_name_to_go_by_is_read_whole() {
+    let mut h = fresh();
+    let mut files: Vec<(&str, &[u64])> = POINTED_AT.to_vec();
+    files.push(("Other.Thing.2024.mkv (1/1)", &[5_000]));
+    let rar = rar4(&[r4_main(0), r4_file(0, b"Pointed.At.nzb", &an_nzb(&files)), r4_end()]);
+    let third = rar.len().div_ceil(3);
+    let mut s = shape("a3f9c2d1e4b5f6a7c8d9");
+    for (i, chunk) in rar.chunks(third).enumerate() {
+        s = s.add("a3f9c2d1e4b5f6a7c8d9", i as i64 + 1, 3, yenc_body("a3f9c2d1e4b5f6a7c8d9", chunk));
+    }
+    serve(&mut h, &s, config());
+    settled(&h, &s.name);
+    let nzb_rows: Vec<String> = rows(&h, &s.name).into_iter().filter(|r| r.source == 5).map(|r| r.name).collect();
+    assert!(nzb_rows.contains(&"Other.Thing.2024.mkv".to_string()), "{nzb_rows:?}");
+}
+
+#[test]
+fn a_next_nzb_posted_as_plain_text_is_followed() {
+    let mut h = fresh();
+    let first = an_nzb_of(&[("Next.nzb (1/1)", &[(2_000, "plain1@x")])]);
+    let s = shape("x").one("x.nzb", &first);
+    h.save(&[s.release()]);
+    let mut posts = s.posts.clone();
+    let lines: Vec<Vec<u8>> = last_hop().split(|b| *b == b'\n').map(<[u8]>::to_vec).collect();
+    posts.push(Post { message_id: "<plain1@x>".into(), ..post(91, "\"Next.nzb\" (1/1)", 2_000, lines) });
+    let state = Server::new(posts);
+    start_with(
+        &mut h,
+        spawn_server(state.clone()),
+        config(),
+        vec![Arc::new(atlas::archive::steps::ListStep::default())],
+    );
+    settled(&h, "x");
+    assert!(names_of(&h).contains(&"Final.Movie.2024.2160p-GRP.part01.rar".to_string()), "{:?}", names_of(&h));
+}
+
+#[test]
+fn following_stops_before_the_runs_body_cap_and_asks_for_nothing_past_it() {
+    let mut h = fresh();
+    let rar = rar4(&[r4_main(0), r4_file(0, b"Next.nzb", &last_hop()), r4_end()]);
+    let first = an_nzb_of(&[("Hop.Post.rar (1/1)", &[(rar.len() as u64, "cap1@x")])]);
+    let s = shape("x").one("x.nzb", &first);
+    h.save(&[s.release()]);
+    let mut posts = s.posts.clone();
+    posts.push(loose(92, "cap1@x", "Hop.Post.rar", &rar));
+    let state = Server::new(posts);
+    let mut tight = config();
+    // the NZB itself, then one request left: not enough for a hop's headers and body
+    tight.postprocess.bodies_per_release = 2;
+    start_with(&mut h, spawn_server(state.clone()), tight, vec![Arc::new(atlas::archive::steps::ListStep::default())]);
+    settled(&h, "x");
+    assert_eq!((bodies(&state), state.heads_sent.load(Ordering::SeqCst)), (1, 0));
+    assert_eq!(names_of(&h), ["Hop.Post.rar"]);
+}

@@ -79,6 +79,11 @@ impl BodyFetcher {
         *self.config.write().unwrap() = config.clone();
     }
 
+    /// `bodies_per_release`: what one release's run may fetch
+    pub(crate) fn per_release(&self) -> i64 {
+        self.config.read().unwrap().bodies_per_release
+    }
+
     pub(crate) fn stopping(&self) -> bool {
         self.stop.load(Ordering::Relaxed)
     }
