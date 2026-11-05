@@ -16,8 +16,8 @@ pub fn is_mpeg_ps(data: &[u8]) -> bool {
 pub fn mpeg_ps(data: &[u8]) -> MediaInfo {
     let mut info = MediaInfo { container: "mpeg-ps".into(), ..MediaInfo::default() };
     let data = &data[..data.len().min(MAX_WALK)];
-    // stream ids seen, with the private stream 1 substream: one track each
-    let mut seen: Vec<(u8, u8)> = Vec::new();
+    // stream ids seen, with the private stream 1 substream: one track each, and a video stream's place in `video`
+    let mut seen: Vec<(u8, u8, Option<usize>)> = Vec::new();
     let mut at = 0usize;
     while at + 4 <= data.len() {
         if data[at..at + 3] != [0, 0, 1] {
@@ -57,7 +57,8 @@ pub fn mpeg_ps(data: &[u8]) -> MediaInfo {
             break;
         }
     }
-    info.header_complete = !info.video.is_empty();
+    // a video stream named from a cut header, or one without its sequence header yet, wants more of the front
+    info.header_complete = !info.video.is_empty() && info.video.iter().all(|v| v.width.is_some());
     info
 }
 
@@ -78,21 +79,23 @@ fn pes_payload(b: &[u8]) -> Option<&[u8]> {
     b.get(at + skip..)
 }
 
-fn stream(id: u8, payload: &[u8], seen: &mut Vec<(u8, u8)>, info: &mut MediaInfo) {
+fn stream(id: u8, payload: &[u8], seen: &mut Vec<(u8, u8, Option<usize>)>, info: &mut MediaInfo) {
     let sub = if id == 0xBD { *payload.first().unwrap_or(&0) } else { 0 };
-    if seen.contains(&(id, sub)) {
-        // a stream named from a packet without its header yet gets the header from a later one
-        if let (0xE0..=0xEF, Some(v)) = (id, info.video.last_mut())
+    if let Some((_, _, place)) = seen.iter().find(|(i, s, _)| (*i, *s) == (id, sub)) {
+        // a stream named from a packet without its header yet gets the header from a later one of its own
+        if let Some(v) = place.and_then(|n| info.video.get_mut(n))
             && v.width.is_none()
         {
             video(payload, v);
         }
         return;
     }
+    let mut place = None;
     match id {
         0xE0..=0xEF => {
             let mut v = VideoTrack { codec: "mpeg2video".into(), ..VideoTrack::default() };
             video(payload, &mut v);
+            place = Some(info.video.len());
             info.video.push(v);
         }
         0xC0..=0xDF => {
@@ -110,7 +113,7 @@ fn stream(id: u8, payload: &[u8], seen: &mut Vec<(u8, u8)>, info: &mut MediaInfo
             _ => return,
         },
     }
-    seen.push((id, sub));
+    seen.push((id, sub, place));
 }
 
 /// From an MPEG-1/2 sequence header: size, aspect and frame rate; MPEG-2 when a sequence extension follows.
@@ -137,23 +140,29 @@ fn video(payload: &[u8], v: &mut VideoTrack) {
         8 => Some(60.0),
         _ => None,
     };
-    // the display aspect, as a display size of the same height
-    let aspect = match h[3] >> 4 {
-        2 => Some(4.0 / 3.0),
-        3 => Some(16.0 / 9.0),
-        4 => Some(2.21),
-        _ => None,
-    };
-    if let Some(a) = aspect
-        && height > 0
-    {
-        v.display_width = Some((height as f64 * a).round() as u64);
-        v.display_height = Some(height);
-    }
     // a sequence extension (id 1) right after says MPEG-2
     let rest = payload.get(at + 8..).unwrap_or_default();
     let mpeg2 = rest.windows(5).take(256).any(|w| w[..4] == [0, 0, 1, 0xB5] && w[4] >> 4 == 1);
     v.codec = if mpeg2 { "mpeg2video" } else { "mpeg1video" }.into();
+    // the aspect code, as a display size of the same height: MPEG-2's is the display's aspect, MPEG-1's a pixel's
+    // height over its width (ISO 11172-2 table 2-D.2)
+    let code = usize::from(h[3] >> 4);
+    let display_width = if mpeg2 {
+        [None, None, Some(4.0 / 3.0), Some(16.0 / 9.0), Some(2.21)]
+            .get(code)
+            .copied()
+            .flatten()
+            .map(|a: f64| height as f64 * a)
+    } else {
+        const PIXEL: [f64; 14] = [
+            1.0, 0.6735, 0.7031, 0.7615, 0.8055, 0.8437, 0.8935, 0.9157, 0.9815, 1.0255, 1.0695, 1.0950, 1.1575, 1.2015,
+        ];
+        code.checked_sub(1).and_then(|n| PIXEL.get(n)).map(|p| width as f64 / p)
+    };
+    if let Some(w) = display_width.filter(|_| height > 0 && width > 0) {
+        v.display_width = Some(w.round() as u64);
+        v.display_height = Some(height);
+    }
 }
 
 /// An MPEG audio frame header: layer, rate, mono or not.
@@ -338,6 +347,32 @@ mod tests {
         );
         assert_eq!(info.subtitles.len(), 1);
         assert_eq!(info.subtitles[0].codec, "dvd_subtitle");
+    }
+
+    #[test]
+    fn each_video_stream_gets_its_own_header_and_mpeg1_aspect_is_a_pixels() {
+        // E0 and E1 start without a sequence header; E0's comes later and is E0's alone
+        let mpeg1 = [0, 0, 1, 0xB3, 0x16, 0x01, 0x20, 0x83, 0xFF, 0xFF, 0xE0, 0x18];
+        let mut data = pack();
+        for p in [pes(0xE0, &[0u8; 8]), pes(0xE1, &[0u8; 8]), pes(0xE0, &mpeg1)] {
+            data.extend(p);
+        }
+        let info = mpeg_ps(&data);
+        assert_eq!(info.video[0].codec, "mpeg1video");
+        assert_eq!((info.video[0].width, info.video[0].height), (Some(352), Some(288)));
+        // code 8: a 0.9157 pixel, CCIR 601 625-line
+        assert_eq!(info.video[0].display_width, Some(384));
+        assert_eq!(info.video[1].width, None, "E1's own header hasn't come");
+        assert!(!info.header_complete, "more of the front could name E1");
+    }
+
+    #[test]
+    fn a_cut_sequence_header_wants_more_of_the_front() {
+        let mut data = pack();
+        data.extend(pes(0xE0, &[0, 0, 1, 0xB3, 0x2D]));
+        let info = mpeg_ps(&data);
+        assert_eq!(info.video.len(), 1);
+        assert!(!info.header_complete);
     }
 
     #[test]
