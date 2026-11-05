@@ -831,16 +831,19 @@ pub struct Hit {
     pub reason: String,
 }
 
-/// Frozen release `id` as a search would list it, and when it was frozen. None: it isn't frozen.
+/// Frozen release `id` as a search would list it, and when it was frozen. None: it isn't frozen, or its group is one
+/// the filters hide (as a search and a live release's page leave it out).
 pub fn get(main: &Path, id: i64) -> Result<Option<(Hit, i64)>> {
     let Some(conn) = open_read(main, crate::store::shard_of_id(id)) else { return Ok(None) };
-    conn.query_row(
-        "select f.id, coalesce(f.display_name, f.name), f.group_name, f.poster, f.posted_date, f.size, f.complete,
+    let found = conn
+        .query_row(
+            "select f.id, coalesce(f.display_name, f.name), f.group_name, f.poster, f.posted_date, f.size, f.complete,
              f.parts, f.category, f.reason, f.frozen_at from frozen_releases f where f.id = ?1",
-        [id],
-        |r| Ok((Hit { row: crate::search::release_row(r)?, category: r.get(8)?, reason: r.get(9)? }, r.get(10)?)),
-    )
-    .optional()
+            [id],
+            |r| Ok((Hit { row: crate::search::release_row(r)?, category: r.get(8)?, reason: r.get(9)? }, r.get(10)?)),
+        )
+        .optional()?;
+    Ok(found.filter(|(h, _)| !crate::filters::group_blocked(&h.row.group_name)))
 }
 
 /// What a deep search narrows frozen releases to besides its words and category: the search page's fields and its

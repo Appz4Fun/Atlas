@@ -126,6 +126,15 @@ fn a_small_complete_release_freezes_whole_and_thaws_back_as_it_was() {
     let (row, nzb_body) = nzb(&f.main, id).unwrap().unwrap();
     assert_eq!(row.name, "Small.Thing");
     assert_eq!(nzb_body, crate::nzb::render_nzb(&row, &articles));
+    assert_eq!(get(&f.main, id).unwrap().map(|(h, _)| h.row.id), Some(id), "its page");
+    // a group the filters hide now: no page for it either, as a search leaves it out
+    let blocked = "a.".repeat(300);
+    assert!(crate::filters::group_blocked(&blocked));
+    conn.execute("update frozen.frozen_releases set group_name = ?2 where id = ?1", rusqlite::params![id, blocked])
+        .unwrap();
+    assert!(get(&f.main, id).unwrap().is_none());
+    assert!(search(&f.main, "small", None, &Narrow::default(), 10).unwrap().is_empty());
+    conn.execute("update frozen.frozen_releases set group_name = ?2 where id = ?1", rusqlite::params![id, G]).unwrap();
 
     assert_eq!(thaw(&conn, id, true, NOW).unwrap(), Thawed::Restored);
     assert_eq!(count(&conn, "select count(*) from frozen.frozen_releases"), 0);
