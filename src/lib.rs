@@ -35,6 +35,7 @@ pub mod naming;
 pub mod nfo;
 pub mod nntp;
 pub mod nzb;
+pub mod nzblnk;
 pub mod par2;
 pub mod parser;
 pub mod paths;

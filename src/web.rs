@@ -410,7 +410,8 @@ impl Search {
         let sort = SortBy::from_word(&text("sort"));
         let descending = text("dir") != "asc";
         Search {
-            q: text("q"),
+            // a pasted NZBLNK searches for its header, the part that names the post
+            q: crate::nzblnk::search_text(&text("q")).unwrap_or_else(|| text("q")),
             cat: text("cat"),
             offset: offset - offset % PAGE_SIZE,
             filters,
@@ -4236,6 +4237,9 @@ mod tests {
         let s = Search::from_args(&args);
         assert_eq!((s.q.as_str(), s.cat.as_str(), s.offset), ("x", "2000", 100));
         assert_eq!(Search::from_args(&parse_query("offset=-5")).offset, 0);
+        // a pasted NZBLNK searches for its header
+        let pasted = format!("q={}", url_encode(" nzblnk:?t=Some+Film&h=Some.Film.2024&g=a.b.x "));
+        assert_eq!(Search::from_args(&parse_query(&pasted)).q, "Some.Film.2024");
         assert!(attr(r#"a"b'c<"#).find(['"', '\'', '<']).is_none());
     }
 
