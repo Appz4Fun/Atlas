@@ -831,6 +831,18 @@ pub struct Hit {
     pub reason: String,
 }
 
+/// Frozen release `id` as a search would list it, and when it was frozen. None: it isn't frozen.
+pub fn get(main: &Path, id: i64) -> Result<Option<(Hit, i64)>> {
+    let Some(conn) = open_read(main, crate::store::shard_of_id(id)) else { return Ok(None) };
+    conn.query_row(
+        "select f.id, coalesce(f.display_name, f.name), f.group_name, f.poster, f.posted_date, f.size, f.complete,
+             f.parts, f.category, f.reason, f.frozen_at from frozen_releases f where f.id = ?1",
+        [id],
+        |r| Ok((Hit { row: crate::search::release_row(r)?, category: r.get(8)?, reason: r.get(9)? }, r.get(10)?)),
+    )
+    .optional()
+}
+
 /// The newest frozen releases matching `words` (all of them when empty) in `filter`, `limit` at most over every
 /// shard, newest first.
 pub fn search(main: &Path, words: &str, filter: Option<&crate::category::CatFilter>, limit: usize) -> Result<Vec<Hit>> {
@@ -967,6 +979,25 @@ pub fn stats(main: &Path) -> Result<Vec<(usize, String, i64, i64)>> {
     Ok(out)
 }
 
+/// Thaw frozen release `id` by hand, from outside the indexer (the CLI, the web UI): kept off the rules after. The
+/// caller holds off compaction (`compact::hold_off_compaction`), soo a shard swapped in under it can't lose it.
+pub fn thaw_by_hand(main: &Path, id: i64) -> Result<Thawed> {
+    let shard = crate::store::shard_path(main, crate::store::shard_of_id(id));
+    let conn = crate::db::open_shard(&shard)?;
+    attach(&conn, &shard)?;
+    conn.execute_batch("begin immediate")?;
+    match thaw(&conn, id, true, chrono::Utc::now().timestamp()) {
+        Ok(t) => {
+            conn.execute_batch("commit")?;
+            Ok(t)
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("rollback");
+            Err(e)
+        }
+    }
+}
+
 /// `--thaw ID...`: put frozen releases back, each in one transaction on its shard alongside a running indexer.
 pub fn run_thaw(args: &[String]) -> i32 {
     let main = crate::paths::database();
@@ -985,23 +1016,7 @@ pub fn run_thaw(args: &[String]) -> i32 {
     };
     let mut code = 0;
     for id in ids {
-        let shard = crate::store::shard_path(&main, crate::store::shard_of_id(id));
-        let done = (|| -> Result<Thawed> {
-            let conn = crate::db::open_shard(&shard)?;
-            attach(&conn, &shard)?;
-            conn.execute_batch("begin immediate")?;
-            match thaw(&conn, id, true, chrono::Utc::now().timestamp()) {
-                Ok(t) => {
-                    conn.execute_batch("commit")?;
-                    Ok(t)
-                }
-                Err(e) => {
-                    let _ = conn.execute_batch("rollback");
-                    Err(e)
-                }
-            }
-        })();
-        match done {
+        match thaw_by_hand(&main, id) {
             Ok(Thawed::Restored) => println!("{id}: thawed"),
             Ok(Thawed::AlreadyLive) => println!("{id}: was live already, its frozen copy is gone"),
             Ok(Thawed::NameTaken) => {

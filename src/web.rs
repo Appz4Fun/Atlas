@@ -43,6 +43,8 @@ const COOKIE_DAYS: i64 = 30;
 /// Whether the results leave out incomplete releases: `incomplete=hide` or `incomplete=show` in a url, and the last one
 /// asked for kept in this cookie, soo it holds across visits until it's turned off again.
 const INCOMPLETE_ARG: &str = "incomplete";
+/// asks a search for frozen releases too
+const DEEP_ARG: &str = "deep";
 const INCOMPLETE_COOKIE: &str = "atlas_incomplete";
 const HIDE: &str = "hide";
 const SHOW: &str = "show";
@@ -119,17 +121,18 @@ pub fn post(
         "/logout" => Some(redirect(vec![cookie_header("", 0)])),
         "/ui/ask" if signed_in => Some(ask(body, htmx, cookie_value(cookies, INCOMPLETE_COOKIE) == Some(HIDE))),
         "/ui/settings" if signed_in => Some(save_settings(body)),
+        "/ui/thaw" if signed_in => Some(thaw_release(body)),
         "/ui/ask" if htmx => {
             Some(ApiResponse { headers: vec![("HX-Redirect".into(), "/".into())], ..html(401, String::new()) })
         }
-        "/ui/ask" | "/ui/settings" => Some(redirect(Vec::new())),
+        "/ui/ask" | "/ui/settings" | "/ui/thaw" => Some(redirect(Vec::new())),
         _ => None,
     }
 }
 
 /// The ui reads a request body only on these paths.
 pub fn takes_post(path: &str) -> bool {
-    matches!(path, "/login" | "/logout" | "/ui/ask" | "/ui/settings")
+    matches!(path, "/login" | "/logout" | "/ui/ask" | "/ui/settings" | "/ui/thaw")
 }
 
 /// Whether to hide incomplete releases, put in `args` as `incomplete=hide` when the url doesn't say but the cookie does,
@@ -268,6 +271,8 @@ struct Search {
     descending: bool,
     /// leaves out what shows as INCOMPLETE: the whole post a row stands for, as the row shows it
     hide_incomplete: bool,
+    /// frozen releases too, listed after the live ones (`frozen`)
+    deep: bool,
 }
 
 /// Up to this many results get sorted, the newest or best matching ones, unless the database orders by the column: then
@@ -413,6 +418,7 @@ impl Search {
             sort,
             descending,
             hide_incomplete: text(INCOMPLETE_ARG) == HIDE,
+            deep: matches!(text(DEEP_ARG).as_str(), "1" | "true" | "yes" | "on"),
         }
     }
 
@@ -431,6 +437,9 @@ impl Search {
         }
         if self.hide_incomplete {
             more.push(format!("{INCOMPLETE_ARG}={HIDE}"));
+        }
+        if self.deep {
+            more.push(format!("{DEEP_ARG}=1"));
         }
         for part in more {
             if !query.is_empty() {
@@ -457,6 +466,7 @@ impl Search {
                 matches!(by, SortBy::Size | SortBy::Posted | SortBy::Rating)
             },
             hide_incomplete: self.hide_incomplete,
+            deep: self.deep,
         };
         let query = attr(&flipped.query(&self.cat, 0));
         let arrow = match (current, descending) {
@@ -981,6 +991,7 @@ impl Search {
                 sort: self.sort,
                 descending: self.descending,
                 hide_incomplete: self.hide_incomplete,
+                deep: self.deep,
             };
             let query = attr(&without.query(&self.cat, 0));
             let _ = write!(
@@ -1838,7 +1849,53 @@ fn diag(level: &str, title: &str, body: &str) -> String {
 fn results_html(search: &Search) -> String {
     let body = search.body();
     let content = if body.starts_with("<tr") { table(search, &body) } else { body };
-    format!("{}{}{content}", search.filter_links(), search.summary())
+    let frozen = if search.deep { frozen_section(search) } else { String::new() };
+    format!("{}{}{content}{frozen}", search.filter_links(), search.summary())
+}
+
+/// How many frozen releases a deep search lists, after the live ones.
+const FROZEN_LISTED: usize = 200;
+
+/// A deep search's frozen releases: the newest matching ones, each to its own page (where it can be thawed).
+fn frozen_section(search: &Search) -> String {
+    let filter = parse_filter(&search.cat);
+    let hits = match crate::frozen::search(&crate::paths::database(), &search.q, filter.as_ref(), FROZEN_LISTED) {
+        Ok(hits) => hits,
+        Err(e) => {
+            eprintln!("web frozen search failed: {e}");
+            return format!(
+                "<section class=\"frozen-results\"><h2>Frozen releases</h2>{}</section>",
+                diag("caution", "frozen releases could not be read", "The error is in Atlas's log.")
+            );
+        }
+    };
+    let mut rows = String::new();
+    for h in &hits {
+        let r = &h.row;
+        let _ = write!(
+            rows,
+            "<tr><td class=\"name\"><a href=\"/ui/release?id={id}\">{name}</a> <span class=\"tag tag-ref\">FROZEN</span></td><td class=\"col-cat\">{cat}</td><td class=\"num col-size\">{size}</td><td class=\"col-posted\">{posted}</td><td class=\"col-group\">{group}</td><td><a class=\"button small\" href=\"/ui/nzb?id={id}\">NZB</a></td></tr>",
+            id = r.id,
+            name = escape(&r.name),
+            cat = escape(&h.category.and_then(label).unwrap_or_else(|| "uncategorized".to_string())),
+            size = escape(&fmt_size(r.size)),
+            posted = escape(&fmt_date(r.posted_date.as_deref())),
+            group = escape(&r.group_name),
+        );
+    }
+    let note = match hits.len() {
+        0 => "None match.".to_string(),
+        n if n >= FROZEN_LISTED => format!("The newest {n}; a narrower search finds older ones."),
+        n => format!("{n} set aside, out of the default search."),
+    };
+    let table = if hits.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<div class=\"table-wrap\"><table><thead><tr><th>Name</th><th class=\"col-cat\">Category</th><th class=\"num col-size\">Size</th><th class=\"col-posted\">Posted</th><th class=\"col-group\">Group</th><th><span class=\"sr-only\">Download</span></th></tr></thead><tbody>{rows}</tbody></table></div>"
+        )
+    };
+    format!("<section class=\"frozen-results\"><h2>Frozen releases</h2><p class=\"note dim\">{note}</p>{table}</section>")
 }
 
 /// What htmx swaps in: the whole result area for a new search, more rows for "Load more".
@@ -1885,7 +1942,7 @@ fn category_input(cat: &str, oob: &str) -> String {
 
 /// More things to search on, with the sort: part of the form, soo typing keeps them.
 fn scope_inputs(search: &Search, oob: &str) -> String {
-    let open = if search.fields.any() { " open" } else { "" };
+    let open = if search.fields.any() || search.deep { " open" } else { "" };
     let field = |name: &str, label: &str, value: &str| {
         format!(
             "<label>{label}<input class=\"scope-field\" name=\"{name}\" value=\"{}\" autocomplete=\"off\" spellcheck=\"false\"></label>",
@@ -1893,8 +1950,12 @@ fn scope_inputs(search: &Search, oob: &str) -> String {
         )
     };
     let hidden = |name: &str, value: &str| format!("<input type=\"hidden\" name=\"{name}\" value=\"{}\">", attr(value));
+    let deep = format!(
+        "<label class=\"deep-field\"><input class=\"scope-field\" type=\"checkbox\" name=\"{DEEP_ARG}\" value=\"1\"{}> Deep search: frozen releases too</label>",
+        if search.deep { " checked" } else { "" }
+    );
     format!(
-        "<details id=\"scope\" class=\"more-fields\"{open}{oob}><summary>More fields</summary><div class=\"field-grid\">{}{}{}{}{}{}{}</div>{}{}{}{}</details>",
+        "<details id=\"scope\" class=\"more-fields\"{open}{oob}><summary>More fields</summary><div class=\"field-grid\">{}{}{}{}{}{}{}</div>{}{}{}{}{}</details>",
         field("group", "Usenet group", &search.fields.group),
         field("poster", "Poster", &search.fields.poster),
         field("email", "Email", &search.fields.email),
@@ -1902,6 +1963,7 @@ fn scope_inputs(search: &Search, oob: &str) -> String {
         field("team", "Release group", &search.fields.team),
         field("crc", "CRC32", &search.fields.crc),
         field("agent", "Posted with", &search.fields.agent),
+        deep,
         hidden("filters", &search.filters.join(",")),
         hidden(INCOMPLETE_ARG, if search.hide_incomplete { HIDE } else { "" }),
         hidden("sort", search.sort.map_or("", SortBy::word)),
@@ -2024,7 +2086,7 @@ fn release_page(args: &HashMap<String, String>) -> ApiResponse {
     let id = args.get("id").and_then(|v| v.trim().parse::<i64>().ok()).unwrap_or(0);
     let release = match get_release(id) {
         Ok(Some(release)) => release,
-        Ok(None) => return release_problem(404, "note", "there is no such release", "It may have been purged."),
+        Ok(None) => return frozen_page(id),
         Err(e) => {
             eprintln!("web release {id} failed: {e}");
             return release_problem(500, "caution", "the release could not be read", "The error is in Atlas's log.");
@@ -2098,6 +2160,85 @@ fn release_page(args: &HashMap<String, String>) -> ApiResponse {
             split_groups.as_deref(),
         ),
     )
+}
+
+/// A release that isn't live: its frozen row if it has one, with its NZB and a way back into the shards.
+fn frozen_page(id: i64) -> ApiResponse {
+    let (hit, frozen_at) = match crate::frozen::get(&crate::paths::database(), id) {
+        Ok(Some(found)) => found,
+        Ok(None) => return release_problem(404, "note", "there is no such release", "It may have been purged."),
+        Err(e) => {
+            eprintln!("web frozen release {id} failed: {e}");
+            return release_problem(500, "caution", "the release could not be read", "The error is in Atlas's log.");
+        }
+    };
+    let r = &hit.row;
+    let why = match hit.reason.as_str() {
+        crate::frozen::rules::SMALL_COMPLETE => "complete and under the small rule's size",
+        "not_tv_movies" => "outside Movies, TV and Other",
+        _ => "by hand",
+    };
+    let frozen = chrono::DateTime::from_timestamp(frozen_at, 0).map(|t| t.format("%Y-%m-%d %H:%M UTC").to_string());
+    let row = |k: &str, v: &str| format!("<dt>{}</dt><dd>{}</dd>", escape(k), escape(v));
+    let facts = [
+        row("Category", &hit.category.and_then(label).unwrap_or_else(|| "uncategorized".to_string())),
+        row("Size", &fmt_size(r.size)),
+        row("Posted", &fmt_date(r.posted_date.as_deref())),
+        row("Group", &r.group_name),
+        row("Poster", r.poster.as_deref().unwrap_or("?")),
+        row("Articles", &r.parts.map_or_else(|| "?".to_string(), |p| p.to_string())),
+        row("Complete", if r.complete { "yes" } else { "no" }),
+        row("Frozen", &format!("{why}, {}", frozen.as_deref().unwrap_or("?"))),
+    ]
+    .concat();
+    let content = format!(
+        r##"{masthead}<div class="detail"><main>
+<p class="path"><a href="/">atlas::releases</a>::<b>{id}</b></p>
+<h1>{name}</h1><p><span class="tag tag-ref">FROZEN</span></p>
+<div class="actions"><a class="button primary" href="/ui/nzb?id={id}">Download NZB</a><form class="inline-form" method="post" action="/ui/thaw"><input type="hidden" name="id" value="{id}"><button class="button">Thaw</button></form></div>
+{diag}
+<div class="panel"><dl class="facts">{facts}</dl></div>
+</main></div>"##,
+        masthead = masthead(true),
+        name = escape(&r.name),
+        diag = diag(
+            "note",
+            "this release is frozen",
+            "It was set aside out of the shards: the default search, the word index and processing don't see it. Its NZB still downloads. Thawing puts it back as it was, and no rule freezes it again.",
+        ),
+    );
+    html(200, page(&format!("{} · Atlas", r.name), &content))
+}
+
+/// POST /ui/thaw: a frozen release back into its shard, then its page.
+fn thaw_release(body: &str) -> ApiResponse {
+    let args = parse_query(body);
+    let id = args.get("id").and_then(|v| v.trim().parse::<i64>().ok()).unwrap_or(0);
+    let main = crate::paths::database();
+    let done = crate::compact::hold_off_compaction(&main).and_then(|_writing| Ok(crate::frozen::thaw_by_hand(&main, id)?));
+    match done {
+        Ok(crate::frozen::Thawed::Restored | crate::frozen::Thawed::AlreadyLive) => ApiResponse {
+            status: 303,
+            content_type: None,
+            body: String::new(),
+            headers: vec![("Location".into(), format!("/ui/release?id={id}"))],
+            bytes: None,
+            failed: false,
+        },
+        Ok(crate::frozen::Thawed::NameTaken) => release_problem(
+            409,
+            "caution",
+            "a live release has this one's name in its group",
+            "It stays frozen. Its NZB still downloads from its page.",
+        ),
+        Ok(crate::frozen::Thawed::NotFrozen) => {
+            release_problem(404, "note", "there is no such frozen release", "It may have been thawed already.")
+        }
+        Err(e) => {
+            eprintln!("web thaw {id} failed: {e}");
+            release_problem(500, "caution", "the release could not be thawed", &e.to_string())
+        }
+    }
 }
 
 fn release_problem(status: u16, level: &str, title: &str, body: &str) -> ApiResponse {
@@ -3925,6 +4066,7 @@ mod tests {
             sort: None,
             descending: true,
             hide_incomplete: false,
+            deep: false,
         };
         let nav = category_nav(&search, "");
         assert_eq!(nav.matches("aria-current").count(), 1, "{nav}");
@@ -3941,6 +4083,7 @@ mod tests {
             sort: None,
             descending: true,
             hide_incomplete: false,
+            deep: false,
         };
         assert_eq!(category_nav(&unknown, "").matches("aria-current").count(), 0);
         assert!(!category_input("\"><x>", "").contains("<x>"));
@@ -3957,6 +4100,7 @@ mod tests {
             sort: None,
             descending: true,
             hide_incomplete: false,
+            deep: false,
         }
         .nothing_found();
         assert!(hd.contains("nothing is in Movies / HD yet"), "{hd}");
@@ -3970,6 +4114,7 @@ mod tests {
             sort: None,
             descending: true,
             hide_incomplete: false,
+            deep: false,
         }
         .nothing_found();
         assert!(word.contains("&lt;b&gt;") && !word.contains("<b>"), "{word}");
@@ -3987,6 +4132,7 @@ mod tests {
             sort: None,
             descending: true,
             hide_incomplete: false,
+            deep: false,
         }
         .summary();
         assert!(path.contains("atlas::releases::<b>movies</b>::<b>hd</b>"), "{path}");
@@ -4001,6 +4147,7 @@ mod tests {
                 sort: None,
                 descending: true,
                 hide_incomplete: false,
+                deep: false,
             }
             .summary()
             .contains("Best or newest matches first")
