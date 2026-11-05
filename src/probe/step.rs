@@ -164,6 +164,18 @@ pub(crate) fn rerun_bluray(conn: &rusqlite::Connection, now: i64) -> rusqlite::R
     rerun_unread(conn, &["iso", "img", "bdmv", "clpi", "mpls", "bdjo", "m2ts"], now)
 }
 
+/// Asks for the probe again on Dolby Vision video whose RPU wasn't read, or was read before the probe kept that it
+/// had been: only an RPU says whether a profile 7 enhancement layer is FEL or MEL, and which content mapping it
+/// carries. One front read a release, and only Dolby Vision ones. Once, from the stage's seed.
+pub(crate) fn rerun_dv_without_rpu(conn: &rusqlite::Connection, now: i64) -> rusqlite::Result<usize> {
+    rerun_probes(conn, DV_WITHOUT_RPU, now)
+}
+
+/// A probe row whose first video track is Dolby Vision, saved before `from_rpu` was kept. A row that has it, true
+/// or false, was probed since and isn't asked for again.
+const DV_WITHOUT_RPU: &str = "json_extract(info, '$.media.video[0].dv_profile') is not null
+     and json_type(info, '$.media.video[0].dolby_vision.from_rpu') is null";
+
 /// The same for MPEG transport streams, before `mpegts` read their program map: a capture's `.ts` or `.mts`, or a
 /// Blu-ray's `.m2ts`.
 pub(crate) fn rerun_mpeg_ts(conn: &rusqlite::Connection, now: i64) -> rusqlite::Result<usize> {
@@ -279,8 +291,12 @@ fn stale_saved(info: &str) -> bool {
         p["media"]["container"] == "mp4" && p["archive"].is_null() && empty("video") && empty("audio");
     let dvd_folder_as_vob = p["media"]["container"] == "mpeg-ps"
         && p["archive"]["name"].as_str().is_some_and(|n| n.to_ascii_lowercase().contains("video_ts"));
+    // Dolby Vision saved before `from_rpu` was kept, the same rows `DV_WITHOUT_RPU` picks
+    let dv_before_from_rpu = !p["media"]["video"][0]["dv_profile"].is_null()
+        && p["media"]["video"][0]["dolby_vision"].get("from_rpu").is_none();
     mp4_without_tracks
         || dvd_folder_as_vob
+        || dv_before_from_rpu
         || p["media"].is_null()
             && (newly_read(p["file"].as_str())
             || newly_read(p["archive"]["name"].as_str())
@@ -936,6 +952,38 @@ mod tests {
             touched_at: None,
             sealed: false,
         }
+    }
+
+    #[test]
+    fn dolby_vision_probes_without_an_rpu_are_asked_for_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        crate::db::create_db_at(&main).unwrap();
+        let conn = crate::db::open_shard(&crate::store::shard_path(&main, 0)).unwrap();
+        for (id, info) in [
+            // stored before from_rpu was kept
+            (1i64, r#"{"media":{"video":[{"dv_profile":7,"dolby_vision":{"profile":7,"fel":true}}]}}"#),
+            (2, r#"{"media":{"video":[{"dv_profile":8,"dolby_vision":{"profile":8,"from_rpu":false}}]}}"#),
+            (3, r#"{"media":{"video":[{"dv_profile":7,"dolby_vision":{"profile":7,"from_rpu":true}}]}}"#),
+            (4, r#"{"media":{"video":[{"hdr":"HDR10"}]}}"#),
+            (5, r#"{"media":null}"#),
+        ] {
+            conn.execute("insert into releases (id, name, group_name) values (?, ?, 'g')", rusqlite::params![id, id])
+                .unwrap();
+            conn.execute(
+                "insert into pp_state (release_id, done) values (?, ?)",
+                rusqlite::params![id, mask(PROBE_STEP)],
+            )
+            .unwrap();
+            conn.execute("insert into release_probe (release_id, info) values (?, ?)", rusqlite::params![id, info])
+                .unwrap();
+        }
+        // 1 has no from_rpu; 2 and 3 were probed since, whatever they found
+        assert_eq!(rerun_dv_without_rpu(&conn, 100).unwrap(), 1);
+        assert!(stale_saved(r#"{"media":{"video":[{"dv_profile":7,"dolby_vision":{"profile":7,"fel":true}}]}}"#));
+        assert!(stale_saved(r#"{"media":{"video":[{"dv_profile":7}]}}"#));
+        assert!(!stale_saved(r#"{"media":{"video":[{"dv_profile":8,"dolby_vision":{"from_rpu":false}}]}}"#));
+        assert!(!stale_saved(r#"{"media":{"video":[{"hdr":"HDR10"}]}}"#));
     }
 
     #[test]
