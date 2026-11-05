@@ -400,6 +400,8 @@ enum Standing {
     Until(i64, String),
     /// a run of it began moments ago; if cut short, it's tried again then
     Running(i64),
+    /// a net step after the one running now: the lane takes a release's steps one claim at a time
+    AfterRunning,
     /// in line; `next`: the first of the release's steps there
     Queued {
         wait: Wait,
@@ -427,6 +429,7 @@ fn standings(state: &State, pace: &Pace, waits: &Waits, now: i64) -> Vec<(&'stat
         0.0
     };
     let mut net_ahead = 0.0;
+    let mut running_seen = false;
     let mut out = Vec::new();
     for step in step_list() {
         let b = bit(step.id);
@@ -461,7 +464,13 @@ fn standings(state: &State, pace: &Pace, waits: &Waits, now: i64) -> Vec<(&'stat
                     _ => Standing::Skipped,
                 }
             } else if state.net_next_at > now && began_moments_ago(state, now) {
-                Standing::Running(state.net_next_at)
+                // the run is the release's first net step left; the rest come after it
+                if running_seen {
+                    Standing::AfterRunning
+                } else {
+                    running_seen = true;
+                    Standing::Running(state.net_next_at)
+                }
             } else if state.net_next_at > now {
                 let why = if state.net_transient > 0 {
                     format!("servers didn't answer ({} in a row)", state.net_transient)
@@ -559,7 +568,9 @@ fn render(id: i64, state: &State, pace: &Pace, rows: &[(&'static StepMeta, Stand
     let shard = store::shard_of_id(id);
     let pending: Vec<&(&StepMeta, Standing)> = rows
         .iter()
-        .filter(|(_, s)| matches!(s, Standing::Queued { .. } | Standing::Until(..) | Standing::Running(_)))
+        .filter(|(_, s)| {
+            matches!(s, Standing::Queued { .. } | Standing::Until(..) | Standing::Running(_) | Standing::AfterRunning)
+        })
         .collect();
     let mut table = String::new();
     for (step, standing) in rows {
@@ -576,6 +587,7 @@ fn render(id: i64, state: &State, pace: &Pace, rows: &[(&'static StepMeta, Stand
                 tag("tag-ref", "RUNNING"),
                 format!("probably running now · if it's cut short, tried again not before {}", escape(&clock(*retry))),
             ),
+            Standing::AfterRunning => (tag("tag-warn", "QUEUED"), "after the step running now".into()),
             Standing::Queued { wait, after, next, lane } => {
                 let chip = if *next { tag("tag-ref", "NEXT") } else { tag("tag-warn", "QUEUED") };
                 let at = if pace.running {
@@ -868,6 +880,10 @@ mod tests {
         };
         let rows = standings(&state, &pace(), &Waits::default(), 1_000);
         assert_eq!(*standing_of(&rows, "probe"), Standing::Running(1_000 + NET_CRASH_RETRY - 5));
+        let two = State { net_left: Some(bit(probe.id) | bit(step("media_lookup").id)), ..state.clone() };
+        let rows = standings(&two, &pace(), &Waits::default(), 1_000);
+        assert!(matches!(standing_of(&rows, "probe"), Standing::Running(_)));
+        assert_eq!(*standing_of(&rows, "media_lookup"), Standing::AfterRunning, "only the first runs");
         let later = State { net_next_at: 1_000 + 3_600, ..state };
         let rows = standings(&later, &pace(), &Waits::default(), 1_000);
         assert!(matches!(standing_of(&rows, "probe"), Standing::Until(_, why) if why.starts_with("a retry")));
