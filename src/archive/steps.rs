@@ -124,12 +124,14 @@ fn nzb_stored_in(listing: &Listing, body: &[u8]) -> Option<Listing> {
 /// The NZB an archive of this release names inside, read whole from the release's own articles when the release is
 /// small enough to (`follow::MAX_POST_BYTES`), and followed on hop after hop. None: no NZB named, an encrypted
 /// archive, a release too big, or an article not there.
-/// `head`: the article already read, by its message-id.
+/// `head_file`: the file whose first article told the archive; `known`: that article by its message-id, when it was
+/// read whole and not only its start.
 fn deep_nzb(
     ctx: &mut StepCtx<'_>,
     files: &[FileInfo],
     listing: &Listing,
-    head: (&str, &[u8]),
+    head_file: &FileInfo,
+    known: Option<(&str, &[u8])>,
 ) -> Result<Option<Listing>, StepError> {
     if listing.encrypted || !listing.files.iter().any(|f| select::classify(&f.name) == Kind::Nzb) {
         return Ok(None);
@@ -146,7 +148,14 @@ fn deep_nzb(
             wholes.push(whole);
         }
     }
-    let Some(found) = follow::nzb_inside(ctx, &wholes, None, Some(head))? else { return Ok(None) };
+    // an archive known by its bytes, not its name, is read first: no name would pick it
+    let first = match select::classify(&head_file.filename) {
+        Kind::Rar(_) | Kind::SevenZip(_) | Kind::Zip(_) | Kind::Numbered(_) => None,
+        _ => own_whole(ctx, head_file)?.map(|whole| follow::Set { files: vec![whole], headed_volumes: false }),
+    };
+    let Some(found) = follow::nzb_inside(ctx, first, &wholes, None, known)? else {
+        return Ok(None);
+    };
     let complete = nzb::parse(&found).complete;
     Ok(Some(Listing { files: follow::follow(ctx, found)?, complete, ..Default::default() }))
 }
@@ -772,19 +781,37 @@ impl Step for ListStep {
             match identify(&body) {
                 Format::Rar4 | Format::Rar5 => {
                     let listing = rar::list(&body);
-                    let inside = deep_nzb(ctx, &files, &listing, (&seg.message_id, &body))?
-                        .or_else(|| nzb_stored_in(&listing, &body));
+                    let inside = deep_nzb(
+                        ctx,
+                        &files,
+                        &listing,
+                        head.file,
+                        (!head.probe).then_some((seg.message_id.as_str(), &body[..])),
+                    )?
+                    .or_else(|| nzb_stored_in(&listing, &body));
                     return with_nzb(ctx, finish(ctx, SOURCE_RAR, listing, &limits)?, inside, &limits);
                 }
                 Format::Zip => {
                     let listing = zip_list(ctx, &head, &body, &mut left)?;
-                    let inside = deep_nzb(ctx, &files, &listing, (&seg.message_id, &body))?
-                        .or_else(|| nzb_stored_in(&listing, &body));
+                    let inside = deep_nzb(
+                        ctx,
+                        &files,
+                        &listing,
+                        head.file,
+                        (!head.probe).then_some((seg.message_id.as_str(), &body[..])),
+                    )?
+                    .or_else(|| nzb_stored_in(&listing, &body));
                     return with_nzb(ctx, finish(ctx, SOURCE_ZIP, listing, &limits)?, inside, &limits);
                 }
                 Format::SevenZip => {
                     let listing = seven_list(ctx, &head, &seg, &body, &mut left)?;
-                    let inside = deep_nzb(ctx, &files, &listing, (&seg.message_id, &body))?;
+                    let inside = deep_nzb(
+                        ctx,
+                        &files,
+                        &listing,
+                        head.file,
+                        (!head.probe).then_some((seg.message_id.as_str(), &body[..])),
+                    )?;
                     return with_nzb(ctx, finish(ctx, SOURCE_7Z, listing, &limits)?, inside, &limits);
                 }
                 Format::Par2 => {

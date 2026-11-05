@@ -116,12 +116,17 @@ struct Opened {
 
 /// Follows `data` down through every archive and compressed stream it starts with.
 pub fn unwrap(data: &[u8]) -> Nest<'_> {
+    unwrap_for(data, &|_| false)
+}
+
+/// `unwrap`, taking in a RAR or zip the biggest file whose name `want` says yes to, when there is one, over the biggest.
+pub fn unwrap_for<'a>(data: &'a [u8], want: &dyn Fn(&str) -> bool) -> Nest<'a> {
     let mut layers = Vec::new();
     let mut buf: Cow<'_, [u8]> = Cow::Borrowed(data);
     let (mut lo, mut hi) = (0usize, data.len());
     let mut outer_at = Some(0usize);
     let mut budget = MAX_DECODED;
-    while let Some(Opened { mut layer, view }) = open(&buf[lo..hi]) {
+    while let Some(Opened { mut layer, view }) = open(&buf[lo..hi], want) {
         // a name comes from the poster's bytes: keep what a name needs
         layer.name = layer.name.map(|n| cap_name(&n));
         if layers.len() == MAX_DEPTH {
@@ -239,10 +244,10 @@ fn decode(codec: Codec, input: &[u8], limit: usize) -> (Vec<u8>, End) {
 }
 
 /// What `data` starts with, when it's an archive or a compressed stream.
-fn open(data: &[u8]) -> Option<Opened> {
+fn open(data: &[u8], want: &dyn Fn(&str) -> bool) -> Option<Opened> {
     let layer = |format: &str| Layer { format: format.into(), ..Layer::default() };
     if data.starts_with(b"Rar!\x1a\x07") || data.starts_with(b"PK\x03\x04") {
-        return Some(from_entries(data));
+        return Some(from_entries(data, want));
     }
     if data.starts_with(b"7z\xbc\xaf\x27\x1c") {
         return Some(seven_z(data));
@@ -293,8 +298,8 @@ fn open(data: &[u8]) -> Option<Opened> {
     None
 }
 
-/// RAR and zip: the biggest file whose bytes start in what was read.
-fn from_entries(data: &[u8]) -> Opened {
+/// RAR and zip: the biggest file whose bytes start in what was read, of those `want` names if any.
+fn from_entries(data: &[u8], want: &dyn Fn(&str) -> bool) -> Opened {
     let heads = archive::entries(data);
     let format = if data.starts_with(b"PK") {
         "ZIP"
@@ -304,7 +309,9 @@ fn from_entries(data: &[u8]) -> Opened {
         "RAR4"
     };
     let reachable = heads.iter().filter(|h| !h.dir && h.data_at.is_some_and(|at| at < data.len()));
-    let Some(head) = reachable.max_by_key(|h| (h.unpacked.or(h.packed).unwrap_or(0), std::cmp::Reverse(h.data_at)))
+    let wanted = |h: &&archive::ArchiveHead| h.name.as_deref().is_some_and(want);
+    let Some(head) =
+        reachable.max_by_key(|h| (wanted(h), h.unpacked.or(h.packed).unwrap_or(0), std::cmp::Reverse(h.data_at)))
     else {
         let mut layer = Layer { format: format.into(), ..Layer::default() };
         let encrypted = heads.iter().any(|h| h.headers_encrypted);

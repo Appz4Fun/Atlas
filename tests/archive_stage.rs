@@ -1031,3 +1031,68 @@ fn a_small_rars_nzb_is_read_whole_not_only_its_first_article() {
     let nzb_rows: Vec<String> = rows(&h, "x").into_iter().filter(|r| r.source == 5).map(|r| r.name).collect();
     assert!(nzb_rows.contains(&"Other.Thing.2024.mkv".to_string()), "{nzb_rows:?}");
 }
+
+/// a posted NZB of `hop`'s files, each `(file, data)` posted under `<hopN@x>`; the server holds them all
+fn follow_through(hop: &[(&str, Vec<u8>)]) -> (Harness, Arc<Server>) {
+    let mut h = fresh();
+    let listed: Vec<(String, u64, String)> = hop
+        .iter()
+        .enumerate()
+        .map(|(i, (file, data))| (format!("{file} (1/1)"), data.len() as u64, format!("hop{i}@x")))
+        .collect();
+    let files: Vec<(&str, Vec<(u64, &str)>)> =
+        listed.iter().map(|(s, b, id)| (s.as_str(), vec![(*b, id.as_str())])).collect();
+    let files: Vec<(&str, &[(u64, &str)])> = files.iter().map(|(s, segs)| (*s, segs.as_slice())).collect();
+    let s = shape("x").one("x.nzb", &an_nzb_of(&files));
+    h.save(&[s.release()]);
+    let mut posts = s.posts.clone();
+    for (i, (file, data)) in hop.iter().enumerate() {
+        posts.push(loose(90 + i as u64, &format!("hop{i}@x"), file, data));
+    }
+    let state = Server::new(posts);
+    start_with(&mut h, spawn_server(state.clone()), config(), steps::all());
+    settled(&h, "x");
+    (h, state)
+}
+
+fn last_hop() -> Vec<u8> {
+    an_nzb_of(&[("Final.Movie.2024.2160p-GRP.part01.rar (1/2)", &[(700_000_000, "f1@x"), (700_000_000, "f2@x")])])
+}
+
+fn names_of(h: &Harness) -> Vec<String> {
+    rows(h, "x").into_iter().map(|r| r.name).collect()
+}
+
+#[test]
+fn a_split_7z_is_joined_before_it_is_unwrapped() {
+    let sz = sz_wrap(&last_hop(), &[0u8; 8]);
+    let (head, tail) = sz.split_at(sz.len() / 2);
+    let (h, _) = follow_through(&[("Hop.7z.001", head.to_vec()), ("Hop.7z.002", tail.to_vec())]);
+    assert!(names_of(&h).contains(&"Final.Movie.2024.2160p-GRP.part01.rar".to_string()), "{:?}", names_of(&h));
+}
+
+#[test]
+fn an_nzb_beside_a_bigger_file_in_an_archive_is_the_one_followed() {
+    let zip = zip_of(&[("big.bin", &vec![7u8; 50_000]), ("Next-{{pw}}.nzb", &last_hop())]);
+    let (h, _) = follow_through(&[("Hop.zip", zip)]);
+    let names = names_of(&h);
+    assert!(names.contains(&"Final.Movie.2024.2160p-GRP.part01.rar".to_string()), "{names:?}");
+    assert!(names.contains(&"Next-{{pw}}.nzb".to_string()), "{names:?}");
+}
+
+#[test]
+fn a_small_release_whose_archive_has_no_name_to_go_by_is_read_whole() {
+    let mut h = fresh();
+    let mut files: Vec<(&str, &[u64])> = POINTED_AT.to_vec();
+    files.push(("Other.Thing.2024.mkv (1/1)", &[5_000]));
+    let rar = rar4(&[r4_main(0), r4_file(0, b"Pointed.At.nzb", &an_nzb(&files)), r4_end()]);
+    let third = rar.len().div_ceil(3);
+    let mut s = shape("a3f9c2d1e4b5f6a7c8d9");
+    for (i, chunk) in rar.chunks(third).enumerate() {
+        s = s.add("a3f9c2d1e4b5f6a7c8d9", i as i64 + 1, 3, yenc_body("a3f9c2d1e4b5f6a7c8d9", chunk));
+    }
+    serve(&mut h, &s, config());
+    settled(&h, &s.name);
+    let nzb_rows: Vec<String> = rows(&h, &s.name).into_iter().filter(|r| r.source == 5).map(|r| r.name).collect();
+    assert!(nzb_rows.contains(&"Other.Thing.2024.mkv".to_string()), "{nzb_rows:?}");
+}

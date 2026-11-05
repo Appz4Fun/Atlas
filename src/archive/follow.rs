@@ -58,7 +58,7 @@ pub fn follow(ctx: &mut StepCtx<'_>, first: Vec<u8>) -> Result<Vec<InnerFile>, S
             break;
         }
         let wholes: Vec<Whole> = parsed.files.iter().map(Whole::of).collect();
-        match nzb_inside(ctx, &wholes, Some(&mut rows), None)? {
+        match nzb_inside(ctx, None, &wholes, Some(&mut rows), None)? {
             Some(next) => body = next,
             None => break,
         }
@@ -66,22 +66,29 @@ pub fn follow(ctx: &mut StepCtx<'_>, first: Vec<u8>) -> Result<Vec<InnerFile>, S
     Ok(rows)
 }
 
-/// The next NZB in these files: one posted as a file, or one an archive set of them holds, read whole. `names` takes
-/// the names inside each archive read; `known` is an article already read, by its message-id, not fetched again.
+/// The next NZB in these files: one posted as a file, or one an archive set of them holds, read whole. `first` is a
+/// set to try before the rest, as a release's own archive known by its bytes and not its name; `names` takes the names
+/// inside each archive read; `known` is an article already read, by its message-id, not fetched again. All the sets
+/// read share `MAX_POST_BYTES`, fetched and unpacked, whatever the NZB claimed.
 pub fn nzb_inside(
     ctx: &mut StepCtx<'_>,
+    first: Option<Set>,
     files: &[Whole],
     mut names: Option<&mut Vec<InnerFile>>,
     known: Option<(&str, &[u8])>,
 ) -> Result<Option<Vec<u8>>, StepError> {
-    'sets: for set in sets(files) {
+    let mut left = MAX_POST_BYTES;
+    for set in first.into_iter().chain(sets(files)) {
+        let Some(raw) = download_set(ctx, &set, known, &mut left)? else { continue };
+        if raw.len() == 1 && nzb::is_nzb(&raw[0]) {
+            return Ok(raw.into_iter().next());
+        }
+        // RAR volumes carry their own headers, each unwrapped; other split archives are one stream cut in pieces
+        let pieces: Vec<Vec<u8>> = if set.headed_volumes { raw } else { vec![raw.concat()] };
         let mut joined = Vec::new();
-        for file in &set {
-            let Some(bytes) = download(ctx, file, known)? else { continue 'sets };
-            if set.len() == 1 && nzb::is_nzb(&bytes) {
-                return Ok(Some(bytes));
-            }
-            let unwrapped = nest::unwrap(&bytes);
+        let mut found = None;
+        for piece in &pieces {
+            let unwrapped = nest::unwrap_for(piece, &|name| select::classify(name) == Kind::Nzb);
             if let Some(names) = names.as_deref_mut() {
                 for layer in &unwrapped.layers {
                     if let Some(name) = layer.name.clone().filter(|n| !names.iter().any(|f| &f.name == n)) {
@@ -89,24 +96,48 @@ pub fn nzb_inside(
                     }
                 }
             }
-            if unwrapped.layers.is_empty() || unwrapped.layers.iter().any(|l| l.encrypted) {
-                continue 'sets;
+            if unwrapped.layers.iter().any(|l| l.encrypted) {
+                break;
             }
-            // a stored file split over volumes is each volume's part of it, in order
+            if unwrapped.inner.len() as u64 > left {
+                break;
+            }
+            left -= unwrapped.inner.len() as u64;
             joined.extend_from_slice(&unwrapped.inner);
+            // stored beside a bigger file, or in a solid stream with others: its start is in the bytes all the same
+            found = found.or_else(|| nzb_start(piece).map(|at| piece[at..].to_vec()));
         }
         if nzb::is_nzb(&joined) {
             return Ok(Some(joined));
+        }
+        if let Some(at) = nzb_start(&joined) {
+            return Ok(Some(joined[at..].to_vec()));
+        }
+        if found.is_some() {
+            return Ok(found);
         }
     }
     Ok(None)
 }
 
+/// Files to read whole together, in order. `headed_volumes`: each is a RAR volume with its own headers, unwrapped
+/// on its own; otherwise they're one stream cut in pieces, joined before unwrapping.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Set {
+    pub files: Vec<Whole>,
+    pub headed_volumes: bool,
+}
+
+/// Where an NZB starts in these bytes, if one does.
+fn nzb_start(bytes: &[u8]) -> Option<usize> {
+    bytes.iter().enumerate().filter(|(_, b)| **b == b'<').map(|(at, _)| at).find(|at| nzb::is_nzb(&bytes[*at..]))
+}
+
 /// What to read for an NZB, first choice first: each NZB on its own, then archive sets with their volumes in order,
 /// then single files a stream compressor made. At most `MAX_SETS`.
-fn sets(files: &[Whole]) -> Vec<Vec<Whole>> {
-    let mut out: Vec<Vec<Whole>> = Vec::new();
-    out.extend(files.iter().filter(|f| select::classify(&f.name) == Kind::Nzb).map(|f| vec![f.clone()]));
+fn sets(files: &[Whole]) -> Vec<Set> {
+    let single = |f: &Whole| Set { files: vec![f.clone()], headed_volumes: false };
+    let mut out: Vec<Set> = files.iter().filter(|f| select::classify(&f.name) == Kind::Nzb).map(single).collect();
     // (family, set name) -> (volume, file)
     let mut archives: BTreeMap<(u8, String), Vec<(u32, &Whole)>> = BTreeMap::new();
     for f in files {
@@ -119,11 +150,11 @@ fn sets(files: &[Whole]) -> Vec<Vec<Whole>> {
         };
         archives.entry((family, strip_volume_suffix(&f.name).to_lowercase())).or_default().push((volume, f));
     }
-    for (_, mut volumes) in archives {
+    for ((family, _), mut volumes) in archives {
         volumes.sort_by(|a, b| (a.0, &a.1.name).cmp(&(b.0, &b.1.name)));
-        out.push(volumes.into_iter().map(|(_, f)| f.clone()).collect());
+        out.push(Set { files: volumes.into_iter().map(|(_, f)| f.clone()).collect(), headed_volumes: family == 0 });
     }
-    out.extend(files.iter().filter(|f| compressed(&f.name)).map(|f| vec![f.clone()]));
+    out.extend(files.iter().filter(|f| compressed(&f.name)).map(single));
     out.truncate(MAX_SETS);
     out
 }
@@ -136,28 +167,41 @@ fn compressed(name: &str) -> bool {
         .any(|ext| lower.ends_with(ext))
 }
 
-/// Every article of a file, decoded and joined, within `MAX_POST_BYTES`. None: one is gone or refused, or a budget
-/// ran out, which ends the following without failing the step.
-fn download(ctx: &mut StepCtx<'_>, file: &Whole, known: Option<(&str, &[u8])>) -> Result<Option<Vec<u8>>, StepError> {
-    let mut whole = Vec::new();
-    for id in &file.ids {
-        if let Some((_, body)) = known.filter(|(known, _)| known == id) {
-            whole.extend_from_slice(body);
-            continue;
+/// Every file of a set, each its articles decoded and joined, within what's `left` of the bytes. None: an article is
+/// gone or refused, the bytes ran out, or a budget did, which ends the following without failing the step.
+fn download_set(
+    ctx: &mut StepCtx<'_>,
+    set: &Set,
+    known: Option<(&str, &[u8])>,
+    left: &mut u64,
+) -> Result<Option<Vec<Vec<u8>>>, StepError> {
+    let mut files = Vec::with_capacity(set.files.len());
+    for file in &set.files {
+        let mut whole = Vec::new();
+        for id in &file.ids {
+            let body = match known.filter(|(known, _)| known == id) {
+                Some((_, body)) => body.to_vec(),
+                None => {
+                    let wanted =
+                        [BodyRequest { message_id: id.clone(), file: file.name.clone(), max_bytes: Some(ARTICLE_CAP) }];
+                    let got = match ctx.fetch_bodies(&wanted) {
+                        Ok(mut got) => got.pop().map(|b| b.got),
+                        Err(StepError::Stopped) => return Err(StepError::Stopped),
+                        Err(_) => return Ok(None),
+                    };
+                    let Some(Got::Body(body)) = got else { return Ok(None) };
+                    body
+                }
+            };
+            if body.len() as u64 > *left {
+                return Ok(None);
+            }
+            *left -= body.len() as u64;
+            whole.extend(body);
         }
-        let wanted = [BodyRequest { message_id: id.clone(), file: file.name.clone(), max_bytes: Some(ARTICLE_CAP) }];
-        let got = match ctx.fetch_bodies(&wanted) {
-            Ok(mut got) => got.pop().map(|b| b.got),
-            Err(StepError::Stopped) => return Err(StepError::Stopped),
-            Err(_) => return Ok(None),
-        };
-        let Some(Got::Body(body)) = got else { return Ok(None) };
-        whole.extend(body);
-        if whole.len() as u64 > MAX_POST_BYTES {
-            return Ok(None);
-        }
+        files.push(whole);
     }
-    Ok(Some(whole))
+    Ok(Some(files))
 }
 
 #[cfg(test)]
@@ -178,9 +222,21 @@ mod tests {
             whole("b.tar.gz"),
             whole("inner-{{pw}}.nzb"),
         ];
-        let names: Vec<Vec<String>> =
-            sets(&files).into_iter().map(|s| s.into_iter().map(|f| f.name).collect()).collect();
-        assert_eq!(names, [vec!["inner-{{pw}}.nzb"], vec!["a.part01.rar", "a.part02.rar"], vec!["b.tar.gz"]]);
+        let found: Vec<(Vec<String>, bool)> = sets(&files)
+            .into_iter()
+            .map(|s| (s.files.into_iter().map(|f| f.name).collect(), s.headed_volumes))
+            .collect();
+        let set = |names: &[&str], headed| (names.iter().map(|n| n.to_string()).collect::<Vec<_>>(), headed);
+        assert_eq!(
+            found,
+            [
+                set(&["inner-{{pw}}.nzb"], false),
+                set(&["a.part01.rar", "a.part02.rar"], true),
+                set(&["b.tar.gz"], false)
+            ]
+        );
+        let split = [whole("c.7z.002"), whole("c.7z.001")];
+        assert_eq!(sets(&split)[0], Set { files: vec![whole("c.7z.001"), whole("c.7z.002")], headed_volumes: false });
     }
 
     #[test]
