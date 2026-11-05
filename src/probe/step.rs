@@ -53,12 +53,33 @@ fn first_volume_key(name: &str) -> (u8, String) {
 }
 
 pub(super) fn fetch_raw(ctx: &mut StepCtx<'_>, message_id: &str, file: &str) -> Result<Got, StepError> {
-    let wanted = BodyRequest {
-        message_id: message_id.to_string(),
-        file: file.to_string(),
-        max_bytes: Some(archive::ARTICLE_CAP),
-    };
-    Ok(ctx.fetch_article(&wanted)?.got)
+    Ok(ctx.fetch_article(&capped(message_id, file))?.got)
+}
+
+/// A file's first article, or its first `ARTICLE_CAP` when it's bigger: some posters put 40 MB in an article, and
+/// a media header is in the first few hundred KB of it.
+fn fetch_head(ctx: &mut StepCtx<'_>, message_id: &str, file: &str) -> Result<Got, StepError> {
+    Ok(ctx.fetch_article_prefix(&capped(message_id, file))?.got)
+}
+
+fn capped(message_id: &str, file: &str) -> BodyRequest {
+    BodyRequest { message_id: message_id.to_string(), file: file.to_string(), max_bytes: Some(archive::ARTICLE_CAP) }
+}
+
+/// Asks for the probe again on releases whose probe found the main file's first article too big to read, before
+/// `fetch_head`: it saw only that the article was there, no yEnc header. Once, from the stage's seed.
+pub(crate) fn rerun_big_heads(conn: &rusqlite::Connection, now: i64) -> rusqlite::Result<usize> {
+    let ids: Vec<i64> = conn
+        .prepare(
+            "select release_id from release_probe
+             where json_extract(info, '$.yenc') is null and json_extract(info, '$.health.first') = 1",
+        )?
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    for id in &ids {
+        crate::postprocess::rerun_on(conn, *id, mask(PROBE_STEP), now)?;
+    }
+    Ok(ids.len())
 }
 
 /// Whether a server has it. None: this doesn't say, as when the article's too big to read, or the budget's gone.
@@ -186,7 +207,7 @@ impl Step for ProbeStep {
             let wire_bytes = first.as_ref().map_or(0, |f| f.bytes);
             let mut front = Vec::new();
             if let Some(first) = &first {
-                let got = fetch_raw(ctx, &first.message_id, &file.filename)?;
+                let got = fetch_head(ctx, &first.message_id, &file.filename)?;
                 if let Some(there) = there(&got) {
                     info.health.insert("first".into(), there);
                 }
@@ -511,6 +532,41 @@ mod tests {
             touched_at: None,
             sealed: false,
         }
+    }
+
+    #[test]
+    fn probes_that_couldnt_read_the_first_article_are_asked_for_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        crate::db::create_db_at(&main).unwrap();
+        let conn = crate::db::open_shard(&crate::store::shard_path(&main, 0)).unwrap();
+        for (id, info) in [
+            (1i64, r#"{"health":{"first":true},"yenc":null}"#),
+            (2, r#"{"health":{"first":true},"yenc":{"part":1}}"#),
+            (3, r#"{"health":{"first":false},"yenc":null}"#),
+        ] {
+            conn.execute("insert into releases (id, name, group_name) values (?, ?, 'g')", rusqlite::params![id, id])
+                .unwrap();
+            conn.execute(
+                "insert into pp_state (release_id, done) values (?, ?)",
+                rusqlite::params![id, mask(PROBE_STEP)],
+            )
+            .unwrap();
+            conn.execute("insert into release_probe (release_id, info) values (?, ?)", rusqlite::params![id, info])
+                .unwrap();
+        }
+        assert_eq!(rerun_big_heads(&conn, 100).unwrap(), 1);
+        let state = |id: i64| -> (i64, i64) {
+            conn.query_row("select done, rerun_mask from pp_state where release_id = ?", [id], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap()
+        };
+        assert_eq!(state(1), (0, mask(PROBE_STEP)), "too big: probed again, past the saved probe");
+        assert_eq!(state(2), (mask(PROBE_STEP), 0), "read");
+        assert_eq!(state(3), (mask(PROBE_STEP), 0), "missing");
+        let queued: i64 = conn.query_row("select count(*) from pp_queue", [], |r| r.get(0)).unwrap();
+        assert_eq!(queued, 1);
     }
 
     #[test]
