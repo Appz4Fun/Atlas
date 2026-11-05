@@ -32,11 +32,23 @@ pub fn has_playlist(data: &[u8]) -> bool {
 
 /// The longest playlist found, as its first clip's streams. Without one, a Blu-ray whose header is further on.
 pub fn bluray(data: &[u8]) -> MediaInfo {
-    playlists(data)
-        .take(MAX_PLAYLISTS)
-        .filter_map(|at| playlist(&data[at..]))
-        .max_by(|a, b| a.duration_secs.unwrap_or(0.0).total_cmp(&b.duration_secs.unwrap_or(0.0)))
-        .unwrap_or_else(|| MediaInfo { container: "bluray".into(), ..MediaInfo::default() })
+    let mut best: Option<MediaInfo> = None;
+    // a playlist that doesn't parse is most likely cut off: more of the front may make it the longest
+    let mut cut = false;
+    for at in playlists(data).take(MAX_PLAYLISTS) {
+        match playlist(&data[at..]) {
+            Some(p)
+                if best.as_ref().is_none_or(|b| p.duration_secs.unwrap_or(0.0) > b.duration_secs.unwrap_or(0.0)) =>
+            {
+                best = Some(p);
+            }
+            Some(_) => {}
+            None => cut = true,
+        }
+    }
+    let mut info = best.unwrap_or_else(|| MediaInfo { container: "bluray".into(), ..MediaInfo::default() });
+    info.header_complete &= !cut;
+    info
 }
 
 /// Where each playlist starts: `MPLS` and a version this reads.
@@ -268,6 +280,15 @@ pub(crate) mod tests {
         let subs: Vec<(&str, Option<&str>)> =
             info.subtitles.iter().map(|s| (s.codec.as_str(), s.language.as_deref())).collect();
         assert_eq!(subs, [("pgs", Some("eng")), ("pgs", Some("fra"))]);
+    }
+
+    #[test]
+    fn a_cut_playlist_after_a_whole_one_wants_more() {
+        let feature = mpls(2, 3_600);
+        let data = [mpls(1, 30), feature[..feature.len() - 1].to_vec()].concat();
+        let info = bluray(&data);
+        assert_eq!(info.duration_secs, Some(30.0));
+        assert!(!info.header_complete, "the feature may be whole in the next article");
     }
 
     #[test]

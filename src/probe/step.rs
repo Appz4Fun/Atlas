@@ -158,10 +158,10 @@ pub(crate) fn rerun_dvd(conn: &rusqlite::Connection, now: i64) -> rusqlite::Resu
 /// A probe row of a `VIDEO_TS` folder in an archive read from its VOB only, before its IFO was looked for.
 const DVD_FOLDER_AS_VOB: &str = "json_extract(info, '$.media.container') = 'mpeg-ps'
      and lower(json_extract(info, '$.archive.name')) like '%video_ts%'";
-/// The same for Blu-ray folders, before `bluray` read their playlists: a `BDMV` folder whose first file is one of
-/// its small ones. Disc images are asked for again by `rerun_dvd`.
+/// The same for Blu-ray discs and folders, before `bluray` read their playlists: a disc image, or a `BDMV` folder
+/// whose first file is one of its small ones. Images again too: the DVD step's rerun may have run before this.
 pub(crate) fn rerun_bluray(conn: &rusqlite::Connection, now: i64) -> rusqlite::Result<usize> {
-    rerun_unread(conn, &["bdmv", "clpi", "mpls", "bdjo", "m2ts"], now)
+    rerun_unread(conn, &["iso", "img", "bdmv", "clpi", "mpls", "bdjo", "m2ts"], now)
 }
 
 /// Extensions of the files a probe reads tracks from since it first ran: a saved probe of one with no media is
@@ -855,7 +855,7 @@ mod tests {
             [],
         )
         .unwrap();
-        assert_eq!(rerun_bluray(&conn, 100).unwrap(), 1);
+        assert_eq!(rerun_bluray(&conn, 100).unwrap(), 1, "the BDMV folder");
         let state = |id: i64| -> (i64, i64) {
             conn.query_row("select done, rerun_mask from pp_state where release_id = ?", [id], |r| {
                 Ok((r.get(0)?, r.get(1)?))
