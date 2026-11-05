@@ -86,6 +86,8 @@ struct Seen {
     sub: u8,
     place: Place,
     seq: Option<[u8; 4]>,
+    /// the end of the stream's last payload while its header isn't read: a header can straddle two packets
+    carry: Vec<u8>,
 }
 
 #[derive(Clone, Copy)]
@@ -95,41 +97,63 @@ enum Place {
     Other,
 }
 
+/// The bytes kept of a payload for the next one of its stream: more than any header this reads.
+const CARRY: usize = 64;
+
+fn tail(b: &[u8]) -> Vec<u8> {
+    b[b.len().saturating_sub(CARRY)..].to_vec()
+}
+
+/// A payload's elementary stream bytes: past the substream id, frame count and pointer of private stream 1.
+fn elementary(id: u8, payload: &[u8]) -> &[u8] {
+    if id == 0xBD { payload.get(4..).unwrap_or_default() } else { payload }
+}
+
 fn stream(id: u8, payload: &[u8], seen: &mut Vec<Seen>, info: &mut MediaInfo) {
     let sub = if id == 0xBD { *payload.first().unwrap_or(&0) } else { 0 };
+    let es = elementary(id, payload);
     if let Some(known) = seen.iter_mut().find(|k| (k.id, k.sub) == (id, sub)) {
-        // what a stream's first packet didn't hold, a later one of its own can
+        // what a stream's first packet didn't hold, a later one of its own can, with the end of the one before
         match known.place {
             Place::Video(n) => {
                 let Some(v) = info.video.get_mut(n) else { return };
                 if v.width.is_none() {
-                    known.seq = video(payload, v);
+                    known.seq = video(&[known.carry.as_slice(), es].concat(), v);
+                    known.carry = if v.width.is_none() { tail(es) } else { Vec::new() };
                 } else if let Some(h) = known.seq {
-                    match first_start_code(payload) {
+                    // the carried bytes may hold the header itself: what counts is what comes after it
+                    let joined = [known.carry.as_slice(), es].concat();
+                    let after = joined.windows(4).rposition(|w| w == [0, 0, 1, 0xB3]).map_or(0, |at| at + 4);
+                    match first_start_code(&joined[after..]) {
                         Some((0xB5, next)) if next >> 4 == 1 => {
                             v.codec = "mpeg2video".into();
                             aspect(v, h, true);
                             known.seq = None;
                         }
                         Some(_) => known.seq = None,
-                        None => {}
+                        None => known.carry = tail(es),
                     }
                 }
             }
             Place::Audio(n) => {
                 if let Some(a) = info.audio.get_mut(n).filter(|a| a.sample_rate.is_none()) {
-                    *a = audio(id, sub, payload).unwrap_or_else(|| a.clone());
+                    let joined = [known.carry.as_slice(), es].concat();
+                    *a = audio(id, sub, payload, &joined).unwrap_or_else(|| a.clone());
+                    known.carry = if a.sample_rate.is_none() { tail(es) } else { Vec::new() };
                 }
             }
             Place::Other => {}
         }
         return;
     }
-    let mut known = Seen { id, sub, place: Place::Other, seq: None };
+    let mut known = Seen { id, sub, place: Place::Other, seq: None, carry: Vec::new() };
     match id {
         0xE0..=0xEF => {
             let mut v = VideoTrack { codec: "mpeg2video".into(), ..VideoTrack::default() };
-            known.seq = video(payload, &mut v);
+            known.seq = video(es, &mut v);
+            if v.width.is_none() || known.seq.is_some() {
+                known.carry = tail(es);
+            }
             known.place = Place::Video(info.video.len());
             info.video.push(v);
         }
@@ -137,7 +161,10 @@ fn stream(id: u8, payload: &[u8], seen: &mut Vec<Seen>, info: &mut MediaInfo) {
             info.subtitles.push(SubtitleTrack { codec: "dvd_subtitle".into(), ..SubtitleTrack::default() });
         }
         _ => {
-            let Some(a) = audio(id, sub, payload) else { return };
+            let Some(a) = audio(id, sub, payload, es) else { return };
+            if a.sample_rate.is_none() {
+                known.carry = tail(es);
+            }
             known.place = Place::Audio(info.audio.len());
             info.audio.push(a);
         }
@@ -145,16 +172,17 @@ fn stream(id: u8, payload: &[u8], seen: &mut Vec<Seen>, info: &mut MediaInfo) {
     seen.push(known);
 }
 
-/// An audio stream's track from one payload: MPEG audio, or a DVD substream. None for a stream that isn't audio.
-fn audio(id: u8, sub: u8, payload: &[u8]) -> Option<AudioTrack> {
+/// An audio stream's track from its elementary bytes `es` (LPCM's from the payload's own header): MPEG audio, or a
+/// DVD substream. None for a stream that isn't audio.
+fn audio(id: u8, sub: u8, payload: &[u8], es: &[u8]) -> Option<AudioTrack> {
     Some(match (id, sub) {
         (0xC0..=0xDF, _) => {
             let mut a = AudioTrack { codec: "mp2".into(), ..AudioTrack::default() };
-            mpeg_audio(payload, &mut a);
+            mpeg_audio(es, &mut a);
             a
         }
-        (0xBD, 0x80..=0x87) => ac3(payload.get(4..).unwrap_or_default()),
-        (0xBD, 0x88..=0x8F) => dts(payload.get(4..).unwrap_or_default()),
+        (0xBD, 0x80..=0x87) => ac3(es),
+        (0xBD, 0x88..=0x8F) => dts(es),
         (0xBD, 0xA0..=0xA7) => lpcm(payload),
         _ => return None,
     })
@@ -460,6 +488,24 @@ mod tests {
         assert_eq!((e.codec.as_str(), e.sample_rate, e.channels), ("eac3", Some(24000.0), Some(6)));
         let e48 = ac3(&[0x0B, 0x77, 0, 0, 0b0011_0100, 16 << 3, 0, 0]);
         assert_eq!((e48.sample_rate, e48.channels), (Some(48000.0), Some(2)));
+    }
+
+    #[test]
+    fn a_sequence_header_cut_by_a_packet_boundary_is_joined() {
+        let seq = [0, 0, 1, 0xB3, 0x2D, 0x02, 0x40, 0x33, 0xFF, 0xFF, 0xE0, 0x18, 0, 0, 1, 0xB5, 0x14, 0x8A];
+        let mut data = pack();
+        data.extend(pes(0xE0, &[&[0x47u8; 20][..], &seq[..6]].concat()));
+        data.extend(pes(0xE0, &seq[6..]));
+        // an AC-3 sync frame cut after its sync word
+        data.extend(pes(0xBD, &[0x80, 1, 0, 1, 0x0B, 0x77]));
+        data.extend(pes(0xBD, &[0x80, 1, 0, 1, 0, 0, 0x04, 0x40, 0xE1, 0x10]));
+        let info = mpeg_ps(&data);
+        let v = &info.video[0];
+        assert_eq!(
+            (v.codec.as_str(), v.width, v.height, v.frame_rate),
+            ("mpeg2video", Some(720), Some(576), Some(25.0))
+        );
+        assert_eq!((info.audio[0].sample_rate, info.audio[0].channels), (Some(48000.0), Some(6)));
     }
 
     #[test]
