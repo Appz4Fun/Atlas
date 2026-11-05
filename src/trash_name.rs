@@ -36,6 +36,17 @@ static MULTI: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\bmulti\b|\bdu
 /// `MULTi.Subs`, `MultiSub`: many subtitles, one language heard
 static MULTI_SUBS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\bmulti[ ._-]*sub\w*").unwrap());
 static DTS_X: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\bDTS[ ._:-]?X\b").unwrap());
+static TRUEHD: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)TrueHD").unwrap());
+static DTS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\bDTS(?:[-. ]?HD(?:[-. ]?MA)?|[-. :]?X)?").unwrap());
+static EAC3: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\bDDP|\bDD\+|\bE-?AC-?3").unwrap());
+static AC3: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\bDD|\bAC-?3").unwrap());
+static FLAC: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\bFLAC").unwrap());
+static PCM: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\bL?PCM").unwrap());
+static OPUS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\bOpus").unwrap());
+static AAC: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\bAAC").unwrap());
+/// `.7.1`, `5.1`, `.Atmos.5.1`, ` 2 0`: a count straight after a codec, an Atmos in between at most
+static CHANNELS_AFTER: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)^[ ._-]?(?:Atmos[ ._-])?([1-9])[ ._]([0-2])(?:[^0-9]|$)").unwrap());
 static X26: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\bx26([45])\b").unwrap());
 static TITLE_JUNK: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"[:/\\?*"<>|]"#).unwrap());
 static SPACES: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s+").unwrap());
@@ -302,8 +313,36 @@ fn audio(release: &str, tags: &Tags) -> String {
         None
     };
     let atmos = has("Atmos").then_some("Atmos");
-    // the most channels named: a name lists its best track's with the others', in no order to go by
-    let channels = tags
+    if codec.is_none() && atmos.is_none() {
+        return String::new();
+    }
+    let channels = codec.and_then(|codec| channels_of(release, codec, tags));
+    [codec, atmos, channels.as_deref()].into_iter().flatten().collect::<Vec<_>>().join(" ")
+}
+
+/// The channels of the track `codec` names: the count written right after it (`TrueHD.7.1`, `DDP5.1`,
+/// `DD.Atmos.5.1`), else the only count the name has. A name with several tracks and no count by the codec has none.
+fn channels_of(release: &str, codec: &str, tags: &Tags) -> Option<String> {
+    let token: &Regex = match codec {
+        "TrueHD" => &TRUEHD,
+        "DTS-HD MA" | "DTS-X" | "DTS" => &DTS,
+        "EAC3" => &EAC3,
+        "AC3" => &AC3,
+        "FLAC" => &FLAC,
+        "PCM" => &PCM,
+        "Opus" => &OPUS,
+        _ => &AAC,
+    };
+    for found in token.find_iter(release) {
+        // `DDP` and `DD+` are EAC3, not AC3
+        if codec == "AC3" && release[found.end()..].starts_with(['P', 'p', '+']) {
+            continue;
+        }
+        if let Some(c) = CHANNELS_AFTER.captures(&release[found.end()..]) {
+            return Some(format!("{}.{}", &c[1], &c[2]));
+        }
+    }
+    let mut counts: Vec<&str> = tags
         .channels
         .iter()
         .map(|c| match c.as_str() {
@@ -311,14 +350,12 @@ fn audio(release: &str, tags: &Tags) -> String {
             "mono" => "1.0",
             other => other,
         })
-        .max_by(|a, b| {
-            let n = |c: &str| c.parse::<f64>().unwrap_or(0.0);
-            n(a).total_cmp(&n(b))
-        });
-    if codec.is_none() && atmos.is_none() {
-        return String::new();
+        .collect();
+    counts.dedup();
+    match counts.as_slice() {
+        [only] => Some((*only).to_string()),
+        _ => None,
     }
-    [codec, atmos, channels].into_iter().flatten().collect::<Vec<_>>().join(" ")
 }
 
 /// `MULTi`, or the one language a name is dubbed in: subtitles say nothing of what's heard
@@ -497,6 +534,20 @@ mod tests {
         assert_eq!(
             shown("Movie.2020.1080p.BluRay.TrueHD.7.1.AC3.5.1.x264-GRP", MOVIES_HD, movie("Movie", 2020)),
             "Movie (2020) [Bluray-1080p][TrueHD 7.1][x264]-GRP"
+        );
+        // the count by the codec, wherever PTT lists it
+        assert_eq!(
+            shown("Movie.2020.1080p.BluRay.REMUX.TrueHD.7.1.Atmos.AC3.5.1-GRP", MOVIES_HD, movie("Movie", 2020)),
+            "Movie (2020) [Remux-1080p][TrueHD Atmos 7.1]-GRP"
+        );
+        assert_eq!(
+            shown("Movie.2020.1080p.WEB-DL.DDP5.1.AAC2.0.H.264-GRP", MOVIES_HD, movie("Movie", 2020)),
+            "Movie (2020) [WEB-DL-1080p][EAC3 5.1][H264]-GRP"
+        );
+        // two counts and none by the codec: none
+        assert_eq!(
+            shown("Movie.2020.1080p.BluRay.TrueHD.Atmos.7.1.AC3.2.0.x264-GRP", MOVIES_HD, movie("Movie", 2020)),
+            "Movie (2020) [Bluray-1080p][TrueHD Atmos 7.1][x264]-GRP"
         );
     }
 
