@@ -1293,6 +1293,16 @@ fn seed_shard(conn: &Connection, enabled: StepMask, stamps: &[(u8, StepMask, i64
         crate::probe::step::rerun_encrypted_with_password(conn, now)?;
         set("pp_probe_encrypted_pw", now)?;
     }
+    // once, for the movie and TV probes from before the probe kept the server's body CRC: a HEAD each. The step
+    // does nothing for a release it wasn't asked about, soo it is marked seen here and starts no walk of every row
+    if meta("pp_probe_body_crc")?.is_none() {
+        let bit = crate::postprocess::step::mask(crate::probe::body_crc::BODY_CRC_STEP);
+        if seeded && enabled & bit != 0 {
+            crate::probe::body_crc::seed(conn, now)?;
+            set("pp_steps_seen", meta("pp_steps_seen")?.unwrap_or(0) | bit)?;
+        }
+        set("pp_probe_body_crc", now)?;
+    }
     let seen = meta("pp_steps_seen")?.unwrap_or(0);
     let new = if seeded { enabled & !seen } else { enabled };
     if seeded && new != 0 {

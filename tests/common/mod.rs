@@ -396,6 +396,8 @@ pub fn serve(stream: TcpStream, state: &Server, over_limit: bool) {
                     send(&mut out, b"From: tester@example.org");
                     send(&mut out, b"Newsgroups: alt.binaries.test");
                     send(&mut out, b"Xref: news alt.binaries.test:1 alt.binaries.other:2");
+                    // as a Highwinds-family server stamps what was posted through it
+                    send(&mut out, b"X-Received-Body-CRC: 3735928559");
                     send(&mut out, b".");
                 }
                 None => send(&mut out, b"430 no such article"),

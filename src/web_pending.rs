@@ -46,6 +46,8 @@ fn step_list() -> &'static [StepMeta] {
     STEPS.get_or_init(|| {
         let mut steps: Vec<StepMeta> = crate::postprocess::steps::all()
             .into_iter()
+            // a one-off backfill, run only where a seed asked it: not one of the steps a release waits for
+            .filter(|s| s.id() != crate::probe::body_crc::BODY_CRC_STEP)
             .map(|s| StepMeta {
                 id: s.id().0,
                 name: s.name(),

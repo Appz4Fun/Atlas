@@ -4,6 +4,7 @@
 pub mod archive;
 pub mod asf;
 pub mod avi;
+pub mod body_crc;
 pub mod bluray;
 pub mod codec;
 pub mod dvd;
