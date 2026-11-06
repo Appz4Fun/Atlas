@@ -1,7 +1,8 @@
 //! Inner file names from ZIP local headers and the central directory.
 #![cfg_attr(not(test), deny(clippy::indexing_slicing, clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
-use super::{Encryption, Listing, PasswordTest};
+use super::facts::{self, Twin};
+use super::{Encryption, FileFacts, Listing, PasswordTest};
 
 const LOCAL: &[u8] = b"PK\x03\x04";
 const CENTRAL: &[u8] = b"PK\x01\x02";
@@ -52,6 +53,134 @@ pub(crate) fn zip64_sizes(extra: &[u8], uncompressed: u32, compressed: u32) -> (
 
 pub use zipview::PasswordCheck;
 
+/// What a ZIP entry's extra fields say: the UTC mtime (0x5455 or NTFS 0x000a), the Unix owner's ids (0x7875), and
+/// which extras there are, by id, for the packer.
+#[derive(Default)]
+struct Extras {
+    utc: Option<i64>,
+    owner: Option<facts::Private>,
+    ids: Vec<u16>,
+}
+
+fn extras(extra: &[u8]) -> Extras {
+    let mut out = Extras::default();
+    let mut p = 0usize;
+    while let (Some(id), Some(size)) = (le16(extra, p), le16(extra, p + 2)) {
+        let Some(data) = extra.get(p + 4..p + 4 + size) else { break };
+        let id = id as u16;
+        if out.ids.len() < 8 && !out.ids.contains(&id) {
+            out.ids.push(id);
+        }
+        match id {
+            // "UT": a flags byte, then the mtime when flag 1 says so, signed seconds
+            0x5455 if data.first().is_some_and(|f| f & 1 != 0) => {
+                out.utc = out.utc.or_else(|| le32(data, 1).map(|t| i64::from(t as i32)));
+            }
+            // NTFS: 4 reserved bytes, then tagged attributes; tag 1 holds mtime, atime, ctime as FILETIMEs
+            0x000a => {
+                let mut at = 4usize;
+                while let (Some(tag), Some(len)) = (le16(data, at), le16(data, at + 2)) {
+                    if tag == 1 && len >= 8 {
+                        out.utc = out.utc.or_else(|| le64(data, at + 4).and_then(facts::filetime_secs));
+                    }
+                    at += 4 + len;
+                }
+            }
+            // Info-ZIP "ux": version 1, then the uid and gid, each a size byte and that many bytes
+            0x7875 if data.first() == Some(&1) => {
+                let id_at = |at: usize| -> Option<(u64, usize)> {
+                    let n = usize::from(*data.get(at)?);
+                    let bytes = data.get(at + 1..at + 1 + n).filter(|b| b.len() <= 8)?;
+                    let v = bytes.iter().rev().fold(0u64, |acc, b| acc << 8 | u64::from(*b));
+                    Some((v, at + 1 + n))
+                };
+                if let Some((uid, next)) = id_at(1) {
+                    let gid = id_at(next).map(|(g, _)| g);
+                    out.owner = facts::owner_text(None, None, Some(uid), gid);
+                }
+            }
+            _ => {}
+        }
+        p += 4 + size;
+    }
+    out
+}
+
+/// A method's word in the packer.
+fn method_word(method: usize) -> String {
+    match method {
+        0 => "store".into(),
+        8 => "deflate".into(),
+        9 => "deflate64".into(),
+        12 => "bzip2".into(),
+        14 => "lzma".into(),
+        93 => "zstd".into(),
+        95 => "xz".into(),
+        99 => "aes".into(),
+        m => format!("method {m}"),
+    }
+}
+
+/// How an entry was packed: who made it (the central directory only says), the version needed, the method and the
+/// extras it carries.
+fn packer(made_by: Option<usize>, needs: Option<usize>, method: usize, ids: &[u16]) -> String {
+    let mut out = String::from("ZIP");
+    if let Some(v) = made_by {
+        let (host, spec) = ((v >> 8) as u8, v & 0xff);
+        out.push_str(&format!(" · made by {} {}.{}", facts::host_word(facts::zip_host(host)), spec / 10, spec % 10));
+    }
+    if let Some(v) = needs {
+        out.push_str(&format!(" · needs {}.{}", (v & 0xff) / 10, (v & 0xff) % 10));
+    }
+    out.push_str(&format!(" · {}", method_word(method)));
+    if !ids.is_empty() {
+        let ids: Vec<String> = ids.iter().map(|id| format!("{id:04x}")).collect();
+        out.push_str(&format!(" · extras {}", ids.join(",")));
+    }
+    out
+}
+
+/// One entry's facts into the listing: its CRC unless the header leaves it to a descriptor, its UTC time, and the
+/// packer's zone from its DOS time and that UTC time; the owner, the packer and an encryption header's random bytes
+/// from the first entry that has them. `dos`: the DOS time and date words.
+#[allow(clippy::too_many_arguments)]
+fn note(
+    l: &mut Listing,
+    flags: usize,
+    method: usize,
+    crc: Option<u32>,
+    dos: (Option<usize>, Option<usize>),
+    extra: &[u8],
+    made_by: Option<usize>,
+    needs: Option<usize>,
+) -> FileFacts {
+    let x = extras(extra);
+    let wall = dos.0.zip(dos.1).and_then(|(t, d)| facts::dos_wall_secs(t as u16, d as u16));
+    match (wall, x.utc) {
+        (Some(w), Some(u)) => l.zone = l.zone.or_else(|| facts::zone_of_pair(w, u)),
+        (Some(w), None) => l.saw_local(Some(w)),
+        _ => {}
+    }
+    if l.owner.is_none() {
+        l.owner = x.owner;
+    }
+    if l.packer.is_none() {
+        l.packer = Some(packer(made_by, needs, method, &x.ids));
+    }
+    // AE-2 writes no CRC, and a descriptor's CRC comes after the data
+    let crc = crc.filter(|c| flags & 0x0008 == 0 && !(method == 99 && *c == 0));
+    let host_os = made_by.map(|v| facts::zip_host((v >> 8) as u8));
+    FileFacts { crc32: crc, mtime: x.utc, host_os }
+}
+
+/// The random bytes an encrypted entry starts with: ZipCrypto's 12-byte header or WinZip AES's salt.
+fn twin_of(check: &PasswordCheck) -> Twin {
+    match check {
+        PasswordCheck::Crypto { header, .. } => Twin::new("zipcrypto", header),
+        PasswordCheck::Aes { salt, .. } => Twin::new("zipaes", salt),
+    }
+}
+
 /// Decrypts a ZipCrypto entry starting at `data` (12-byte encryption header + payload) if `check` matches.
 pub(crate) fn decrypt_zipcrypto(password: &str, check: u8, data: &[u8]) -> Option<Vec<u8>> {
     zipview::decrypt_zipcrypto(password, check, data)
@@ -100,13 +229,19 @@ pub fn list_head(data: &[u8]) -> Listing {
             l.encrypted = true;
             l.encryption = Some(zip_encryption(method));
             if l.password_check.is_none() {
-                l.password_check = password_check(entry, flags, method, extra, 30 + n + e).map(PasswordTest::Zip);
+                let check = password_check(entry, flags, method, extra, 30 + n + e);
+                l.twin = l.twin.take().or_else(|| check.as_ref().map(twin_of));
+                l.password_check = check.map(PasswordTest::Zip);
             }
         }
         let (unp, packed) = zip64_sizes(extra, unp, packed);
         let name = name_of(name, flags);
-        if !is_directory(&name) && !l.push(&name, Some(unp)) {
-            return l;
+        if !is_directory(&name) {
+            let dos = (le16(entry, 10), le16(entry, 12));
+            let facts = note(&mut l, flags, method, le32(entry, 14), dos, extra, None, le16(entry, 4));
+            if !l.push_with(&name, Some(unp), facts) {
+                return l;
+            }
         }
         if l.files.len() >= super::MAX_ENTRIES {
             return l;
@@ -194,8 +329,14 @@ pub fn list_tail(tail: &[u8]) -> Listing {
         }
         let (unp, _) = zip64_sizes(extra, unp, packed);
         let name = name_of(name, flags);
-        if !is_directory(&name) && !l.push(&name, Some(unp)) {
-            return l;
+        if !is_directory(&name) {
+            // the directory's CRC stands even when the local header left it to a descriptor
+            let dos = (le16(entry, 12), le16(entry, 14));
+            let facts =
+                note(&mut l, flags & !0x0008, method, le32(entry, 16), dos, extra, le16(entry, 4), le16(entry, 6));
+            if !l.push_with(&name, Some(unp), facts) {
+                return l;
+            }
         }
         if l.files.len() >= super::MAX_ENTRIES {
             return l;
@@ -216,6 +357,11 @@ pub fn list(head: &[u8], tail: &[u8]) -> Listing {
     }
     from_tail.encrypted |= from_head.encrypted;
     from_tail.password_check = from_tail.password_check.or(from_head.password_check);
+    // the local headers hold what the directory doesn't: the encryption header, and often the full extras
+    from_tail.twin = from_tail.twin.or(from_head.twin);
+    from_tail.owner = from_tail.owner.or(from_head.owner);
+    from_tail.zone = from_tail.zone.or(from_head.zone);
+    from_tail.local_wall = from_tail.local_wall.or(from_head.local_wall);
     from_tail
 }
 

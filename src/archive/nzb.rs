@@ -200,7 +200,7 @@ fn append(to: Option<&mut String>, piece: &str, overlong: &mut bool) {
 pub fn list(body: &[u8]) -> Listing {
     let parsed = parse(body);
     Listing {
-        files: parsed.files.iter().map(|f| InnerFile { name: f.name.clone(), size: Some(f.bytes()) }).collect(),
+        files: parsed.files.iter().map(|f| InnerFile::new(f.name.clone(), Some(f.bytes()))).collect(),
         complete: parsed.complete,
         damaged: parsed.damaged,
         ..Default::default()
@@ -265,10 +265,8 @@ pub fn meta_password(body: &[u8]) -> Option<String> {
             Ok(Event::Start(e)) => match e.local_name().as_ref() {
                 "meta" => {
                     let ty = attribute(&e, "type").unwrap_or_default().to_ascii_lowercase();
-                    in_password_meta = ty == "password"
-                        || ty == "pwd"
-                        || ty == "x-dnzb-password"
-                        || ty.contains("password");
+                    in_password_meta =
+                        ty == "password" || ty == "pwd" || ty == "x-dnzb-password" || ty.contains("password");
                     meta_buf.clear();
                 }
                 "file" if subject_hit.is_none() => {
@@ -439,7 +437,7 @@ mod tests {
     fn a_subject_no_pattern_reads_is_the_name() {
         let nzb =
             r#"<nzb><file subject="a3f9c2d1e4b5"><segments><segment bytes="5">x@y</segment></segments></file></nzb>"#;
-        assert_eq!(list(nzb.as_bytes()).files, [InnerFile { name: "a3f9c2d1e4b5".into(), size: Some(5) }]);
+        assert_eq!(list(nzb.as_bytes()).files, [InnerFile::new("a3f9c2d1e4b5".into(), Some(5))]);
     }
 
     #[test]
