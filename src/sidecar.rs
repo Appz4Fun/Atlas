@@ -9,7 +9,7 @@
 use crate::config::Config;
 use crate::frozen::rules::{SIDECAR_BYTES, SIDECAR_FILES};
 use crate::postprocess::schema::ShardTable;
-use crate::postprocess::step::{Needs, Outcome, ReleaseInfo, Step, StepCtx, StepError, StepId, StepWrite};
+use crate::postprocess::step::{Needs, Outcome, ReleaseInfo, Reruns, Step, StepCtx, StepError, StepId, StepWrite};
 use crate::store::FileInfo;
 
 pub const SIDECAR_STEP: StepId = StepId(11);
@@ -137,6 +137,10 @@ impl Step for SidecarStep {
     }
     fn applies(&self, r: &ReleaseInfo) -> bool {
         r.size > 0 && r.size <= SIDECAR_BYTES
+    }
+    // a post that settled before all of it came is looked at again: it can turn out a sidecar, or its text whole
+    fn reruns(&self) -> Reruns {
+        Reruns { on_rename: false, on_growth: true }
     }
     fn run(&self, ctx: &mut StepCtx<'_>) -> Result<Outcome, StepError> {
         let files = ctx.files().map_err(|e| StepError::Retry(e.to_string()))?;
