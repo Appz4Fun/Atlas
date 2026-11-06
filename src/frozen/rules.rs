@@ -166,7 +166,7 @@ pub struct Backlog {
 }
 
 /// Releases one step of the walk takes at a time, between looks at the clock and the stop flag.
-const BACKLOG_CHUNK: usize = 250;
+const BACKLOG_CHUNK: usize = 50;
 
 /// One step of the walk over releases no visit is coming back to: up to `limit` releases down from where the last
 /// step stopped, newest first, queued where a rule matches (one queued already keeps its place). Goes a chunk at a

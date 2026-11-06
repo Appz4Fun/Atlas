@@ -94,10 +94,12 @@ pub async fn run(ctx: PassContext, settings: PassSettings, db: Db, stopping: imp
         if stopping() {
             return;
         }
-        if let Err(e) = round(&ctx, &settings, &db, &stopping, &stop).await
-            && !stop.load(Ordering::Relaxed)
-        {
-            eprintln!("repair: {e:#}");
+        // a stop drops the round where it is, mid read: its date searches and window reads dont look at the stop, and
+        // a stop on prod waited 208 s for them. Safe, like a dropped pass: saves run whole on the writers, no cursor
+        // moves, and a post not marked yet is read again next round
+        match crate::nntp::unless_stopped(&stop, round(&ctx, &settings, &db, &stopping, &stop)).await {
+            Some(Err(e)) if !stop.load(Ordering::Relaxed) => eprintln!("repair: {e:#}"),
+            _ => {}
         }
     }
 }
