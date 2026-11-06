@@ -51,6 +51,11 @@ impl NntpError {
         matches!(self.code(), Some(420 | 423))
     }
 
+    /// A read or the whole request took too long.
+    pub fn is_timeout(&self) -> bool {
+        matches!(self, NntpError::Io(e) if e.kind() == io::ErrorKind::TimedOut)
+    }
+
     /// The server closed the connection: nothing came back on it.
     pub fn is_closed(&self) -> bool {
         matches!(self, NntpError::Io(e) if e.kind() == io::ErrorKind::UnexpectedEof)
@@ -3065,8 +3070,38 @@ impl Pool {
             }
             // the server closed the connection before answering: once more, on another one
             Err(e) if e.is_closed() => self.xover_once(i, group, start, end).await,
+            // too wide to answer in time: in halves (see `xover_halves`)
+            Err(e) if e.is_timeout() && end.saturating_sub(start) + 1 >= 2 * MIN_CHUNK => {
+                self.xover_halves(i, group, start, end).await
+            }
             r => r,
         }
+    }
+
+    /// `start..=end` asked for as two halves, the left one first, each halved again while it times out, down to
+    /// `MIN_CHUNK`: a server that scans the whole range before it answers can take longer than the read timeout for a
+    /// wide one. On prod news.newshosting.com took 11 to 105 s to answer each 100,000 numbers of alt.binaries.mom, and
+    /// one day chunk timed out on every try. The first half that fails fails the range, soo a server that answers
+    /// nothing costs one timeout a halving.
+    fn xover_halves<'a>(
+        &'a self,
+        i: usize,
+        group: &'a str,
+        start: u64,
+        end: u64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<Overview>>> + Send + 'a>> {
+        Box::pin(async move {
+            let mid = start + (end - start) / 2;
+            let mut rows = Vec::new();
+            for (from, to) in [(start, mid), (mid + 1, end)] {
+                match self.xover_on(i, group, from, to).await {
+                    Ok(half) => rows.extend(half),
+                    Err(e) if e.is_empty_range() => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            Ok(rows)
+        })
     }
 
     async fn xover_once(&self, i: usize, group: &str, start: u64, end: u64) -> Result<Vec<Overview>> {
