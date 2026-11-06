@@ -56,14 +56,17 @@ pub const SIDECARS: ShardTable = ShardTable {
 };
 
 /// The text is kept only while the shard's texts hold less than ?10 bytes: past that, the name and UID still are, and
-/// a text kept before stays.
+/// a text kept before stays. A rerun that couldn't read anything (`unread`) leaves what an earlier read found.
 const SET: &str = "insert into sidecars
     (release_id, name, group_name, file, kind, release_name, segment_uid, text, at)
     values (?1, ?2, ?3, ?4, ?5, ?6, ?7,
         case when coalesce((select value from meta where key = 'sidecar_text_bytes'), 0) < ?10 then ?8 end, ?9)
     on conflict(release_id) do update set name = excluded.name, group_name = excluded.group_name,
-        file = excluded.file, kind = excluded.kind, release_name = excluded.release_name,
-        segment_uid = excluded.segment_uid, text = coalesce(excluded.text, sidecars.text), at = excluded.at";
+        file = case when excluded.kind = 'unread' then sidecars.file else excluded.file end,
+        kind = case when excluded.kind = 'unread' then sidecars.kind else excluded.kind end,
+        release_name = case when excluded.kind = 'unread' then sidecars.release_name else excluded.release_name end,
+        segment_uid = case when excluded.kind = 'unread' then sidecars.segment_uid else excluded.segment_uid end,
+        text = coalesce(excluded.text, sidecars.text), at = excluded.at";
 
 /// What a release name read from a sidecar is kept to: a real one is far shorter, and these rows outlive releases
 pub const MAX_NAME: usize = 255;
@@ -121,9 +124,18 @@ pub struct Read {
     pub segment_uid: Option<String>,
 }
 
-/// A sidecar file's text, as NFOs are read: UTF-8, or else code page 437. At most `MAX_TEXT` of its bytes.
+/// A sidecar file's text, as NFOs are read: UTF-8, or else code page 437, as the whole file says, then cut to at most
+/// `MAX_TEXT` bytes on a character.
 pub fn text_of(body: &[u8]) -> String {
-    crate::probe::nfo_text(body.get(..MAX_TEXT).unwrap_or(body))
+    let mut text = crate::probe::nfo_text(body);
+    if text.len() > MAX_TEXT {
+        let mut end = MAX_TEXT;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+    }
+    text
 }
 
 /// Reads a sidecar file's text.
@@ -271,6 +283,19 @@ Format                                   : Matroska
     }
 
     #[test]
+    fn a_long_utf8_text_is_still_utf8_where_it_is_cut() {
+        let mut body = "Complete name : Amélie.2001.mkv\n".as_bytes().to_vec();
+        // the cut falls inside a two-byte character
+        while body.len() < MAX_TEXT - 1 {
+            body.push(b' ');
+        }
+        body.extend("é and more".as_bytes());
+        let text = text_of(&body);
+        assert!(text.len() <= MAX_TEXT && text.starts_with("Complete name : Amélie"));
+        assert_eq!(read("mediainfo.txt", &body).release_name.as_deref(), Some("Amélie.2001"));
+    }
+
+    #[test]
     fn a_cp437_nfo_is_read_as_one() {
         let nfo = b"\xdb\xdb Some.Movie.2024.1080p.BluRay.x264-GRP \xdb\xdb\n";
         assert!(text_of(nfo).starts_with("\u{2588}\u{2588} Some.Movie"));
@@ -319,6 +344,26 @@ Format                                   : Matroska
         let kept: Option<String> =
             conn.query_row("select text from sidecars where release_id = 2", [], |r| r.get(0)).unwrap();
         assert_eq!(kept.as_deref(), Some("bbbbbbbb"), "a rerun past the total keeps the text it had");
+        // a rerun that read nothing keeps what was found
+        let unread: Vec<rusqlite::types::Value> = vec![
+            2i64.into(),
+            "n".to_string().into(),
+            "g".to_string().into(),
+            None::<String>.into(),
+            "unread".to_string().into(),
+            None::<String>.into(),
+            None::<String>.into(),
+            None::<String>.into(),
+            0i64.into(),
+            100i64.into(),
+        ];
+        conn.execute(SET, rusqlite::params_from_iter(unread)).unwrap();
+        let (kind, name): (String, Option<String>) = conn
+            .query_row("select kind, release_name from sidecars where release_id = 2", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!((kind.as_str(), name.as_deref()), ("nfo", Some("Name.2")));
         put(2, "b", 100);
         assert_eq!(total(), 5, "a rewrite gives back what it held");
         conn.execute("delete from sidecars where release_id = 1", []).unwrap();
