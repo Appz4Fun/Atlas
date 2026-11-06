@@ -5,6 +5,8 @@
 //! is saved like any other header: the missing parts join their rows by name. Nothing here is about one release.
 
 use std::collections::{BTreeMap, HashSet};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use rusqlite::{Connection, params};
@@ -78,7 +80,8 @@ impl Found {
     }
 }
 
-pub async fn run(ctx: PassContext, settings: PassSettings, db: Db, stopping: impl Fn() -> bool) {
+/// `stop` cuts a round's search of the shards short.
+pub async fn run(ctx: PassContext, settings: PassSettings, db: Db, stopping: impl Fn() -> bool, stop: Arc<AtomicBool>) {
     if let Err(e) = on_db(&db, |conn| Ok(conn.execute_batch(CREATE)?)).await {
         eprintln!("repair: {e:#}");
         return;
@@ -91,7 +94,9 @@ pub async fn run(ctx: PassContext, settings: PassSettings, db: Db, stopping: imp
         if stopping() {
             return;
         }
-        if let Err(e) = round(&ctx, &settings, &db, &stopping).await {
+        if let Err(e) = round(&ctx, &settings, &db, &stopping, &stop).await
+            && !stop.load(Ordering::Relaxed)
+        {
             eprintln!("repair: {e:#}");
         }
     }
@@ -102,9 +107,11 @@ async fn round(
     settings: &PassSettings,
     db: &Db,
     stopping: &impl Fn() -> bool,
+    stop: &Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     let now = chrono::Utc::now().timestamp();
-    let found = tokio::task::spawn_blocking(move || db::with_reader(|conn| find(conn, now))).await??;
+    let stop = stop.clone();
+    let found = tokio::task::spawn_blocking(move || reading_until(&stop, |conn| find(conn, now))).await??;
     let pool = &ctx.pool;
     let (to_read, looked) = plan(&found.posts, PER_ROUND);
     // a post with nothing to read was looked at; one with windows is marked once all of them were read, right then:
@@ -212,11 +219,37 @@ async fn mark(db: &Db, now: i64, days: Vec<(String, i64)>, tried: Vec<(i64, i64)
     .await
 }
 
+/// `f` on a reader that gives up (SQLITE_INTERRUPT) once `stop` is set: a scan of every shard's releases runs for
+/// minutes, and a stop waited for it to end. On prod the count of big releases per group, run at every start, held a
+/// stop 12 minutes.
+pub fn reading_until<T>(
+    stop: &Arc<AtomicBool>,
+    f: impl FnOnce(&Connection) -> rusqlite::Result<T>,
+) -> rusqlite::Result<T> {
+    db::with_reader(|conn| interruptible(conn, stop, f))
+}
+
+/// `f` on `conn`, interrupted once `stop` is set, the handler gone again after.
+fn interruptible<T>(
+    conn: &Connection,
+    stop: &Arc<AtomicBool>,
+    f: impl FnOnce(&Connection) -> rusqlite::Result<T>,
+) -> rusqlite::Result<T> {
+    let flag = stop.clone();
+    conn.progress_handler(10_000, Some(move || flag.load(Ordering::Relaxed)))?;
+    let out = f(conn);
+    // a reader is kept for others: without the handler
+    conn.progress_handler(10_000, None::<fn() -> bool>)?;
+    out
+}
+
 /// Counts each group's big video releases now and then, for the backfill to take those groups first
-/// (`chunks::MEDIA_GROUPS`). With one server or many: it doesn't read from any.
-pub async fn count_media_every(db: Db, stopping: impl Fn() -> bool) {
+/// (`chunks::MEDIA_GROUPS`). With one server or many: it doesn't read from any. `stop` cuts a count short.
+pub async fn count_media_every(db: Db, stopping: impl Fn() -> bool, stop: Arc<AtomicBool>) {
     while !stopping() {
-        if let Err(e) = count_media(&db).await {
+        if let Err(e) = count_media(&db, &stop).await
+            && !stop.load(Ordering::Relaxed)
+        {
             eprintln!("counting big releases per group: {e:#}");
         }
         let next = Instant::now() + COUNT_EVERY;
@@ -227,8 +260,9 @@ pub async fn count_media_every(db: Db, stopping: impl Fn() -> bool) {
 }
 
 /// Notes how many big video releases each group holds.
-async fn count_media(db: &Db) -> anyhow::Result<()> {
-    let counts = tokio::task::spawn_blocking(|| db::with_reader(media_counts)).await??;
+async fn count_media(db: &Db, stop: &Arc<AtomicBool>) -> anyhow::Result<()> {
+    let stop = stop.clone();
+    let counts = tokio::task::spawn_blocking(move || reading_until(&stop, media_counts)).await??;
     on_db(db, move |conn| Ok(crate::chunks::set_media(conn, &counts)?)).await
 }
 
@@ -433,6 +467,23 @@ fn windows_of(conn: &Connection, ids: &[i64]) -> rusqlite::Result<Vec<Window>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_scan_gives_up_once_stopping_and_the_reader_reads_on_after() {
+        let conn = Connection::open_in_memory().unwrap();
+        let long = |c: &Connection| {
+            c.query_row(
+                "with recursive n(i) as (select 1 union all select i + 1 from n where i < 5000000) select count(*) from n",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+        };
+        let stop = Arc::new(AtomicBool::new(true));
+        let e = interruptible(&conn, &stop, long).unwrap_err();
+        assert_eq!(e.sqlite_error_code(), Some(rusqlite::ErrorCode::OperationInterrupted), "{e}");
+        assert_eq!(long(&conn).unwrap(), 5_000_000, "no handler left on the connection");
+        assert_eq!(interruptible(&conn, &Arc::new(AtomicBool::new(false)), long).unwrap(), 5_000_000);
+    }
 
     fn looked(windows: usize, media: bool, size: i64) -> Looked {
         let window = Window { group: "g".into(), from: 0, to: 1 };
