@@ -238,6 +238,10 @@ impl Inner {
     pub(crate) fn new(p: &StageParams) -> Inner {
         let mut steps = p.steps.clone();
         steps.sort_by_key(|s| s.rank());
+        // every step's panics read 0 from the start, soo a dashboard has a series before the first one
+        for step in &steps {
+            crate::metrics::names::STEP_PANICS.inc(&[("step", step.name())], 0);
+        }
         let stop = Arc::new(AtomicBool::new(false));
         let stats = Arc::new(Stats::default());
         let config = p.config.postprocess.clone();
@@ -1090,8 +1094,7 @@ impl Inner {
                         a.net_next_at = Some(0);
                         a.writes.extend(std::mem::take(&mut o.writes).into_iter().map(|w| (bit, w)));
                         // requested reruns clear and re-arm any other step: this lane's come back to it, the database's through the queue
-                        let other =
-                            self.steps.iter().filter(|s| s.id() != step.id()).fold(0, |m, s| m | mask(s.id()));
+                        let other = self.steps.iter().filter(|s| s.id() != step.id()).fold(0, |m, s| m | mask(s.id()));
                         a.clear |= o.rerun & other;
                         a.net_mask |= o.rerun & other & a.net_steps;
                         if let Some(name) = o.name.take() {
@@ -1188,7 +1191,12 @@ fn apply_name(release: &mut ReleaseInfo, name: &NameChange) {
 }
 
 /// One shard's note of which steps are on, see `Inner::seed`. In the writer's transaction.
-pub(crate) fn seed_shard(conn: &Connection, enabled: StepMask, stamps: &[(u8, StepMask, i64)], now: i64) -> rusqlite::Result<()> {
+pub(crate) fn seed_shard(
+    conn: &Connection,
+    enabled: StepMask,
+    stamps: &[(u8, StepMask, i64)],
+    now: i64,
+) -> rusqlite::Result<()> {
     let meta = |key: &str| -> rusqlite::Result<Option<i64>> {
         conn.prepare_cached("select value from meta where key = ?")?.query_row([key], |r| r.get(0)).optional()
     };
