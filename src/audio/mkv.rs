@@ -23,6 +23,11 @@ const VOID: u32 = 0xEC;
 const MAX_FRAME: usize = 4 << 20;
 /// The most frames a block's lacing may say it holds: the count is one byte.
 const MAX_LACED: usize = 256;
+/// The most bytes header stripping may put back on a frame: real ones are a few bytes of a frame header.
+const MAX_STRIP: usize = 64;
+/// The most bytes of frames one read gives, the stripped headers put back included: a window's articles hold far
+/// less, and a crafted file can't make a few small laced blocks into gigabytes.
+const MAX_FRAMES_BYTES: usize = 64 << 20;
 
 /// What decoding an audio track's frames needs, from the file's header.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -178,14 +183,19 @@ fn stripped(encodings: &[u8]) -> Option<Vec<u8>> {
         if let Some((_, settings)) = children(compression).find(|(id, _)| *id == 0x4255) {
             strip.extend_from_slice(settings);
         }
+        if strip.len() > MAX_STRIP {
+            return None;
+        }
     }
     Some(strip)
 }
 
-/// One frame of a track: when it plays, in ms, and its bytes, with any stripped header put back.
+/// One frame of a track: when its block plays, in ms, its place in the block's lace (0 for the first, the one the
+/// block's time is for), and its bytes, with any stripped header put back.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Frame {
     pub millis: i64,
+    pub lace: usize,
     pub bytes: Vec<u8>,
 }
 
@@ -326,6 +336,7 @@ pub fn last_time(data: &[u8], track: &AudioTrack) -> Option<i64> {
 /// end of `data` gives the frames that are all there.
 pub fn frames(data: &[u8], track: &AudioTrack) -> Vec<Frame> {
     let mut out = Vec::new();
+    let mut held = 0usize;
     // each element is two bytes at least, soo the walk reads at most half as many elements as there are bytes;
     // cluster ids hidden in Void bodies would each start a walk to the end, and the budget keeps that linear
     let mut budget = data.len() / 2 + 4096;
@@ -354,14 +365,19 @@ pub fn frames(data: &[u8], track: &AudioTrack) -> Vec<Frame> {
             }
             let Some(laced) = block.and_then(|b| b.get(head..)).and_then(|d| unlace(flags, d)) else { continue };
             let millis = track.millis(cluster_time + i64::from(time));
-            for frame in laced {
-                if frame.len() + track.strip.len() > MAX_FRAME {
+            for (lace, frame) in laced.into_iter().enumerate() {
+                let len = frame.len() + track.strip.len();
+                if len > MAX_FRAME {
                     continue;
                 }
-                let mut bytes = Vec::with_capacity(track.strip.len() + frame.len());
+                held += len;
+                if held > MAX_FRAMES_BYTES {
+                    return out;
+                }
+                let mut bytes = Vec::with_capacity(len);
                 bytes.extend_from_slice(&track.strip);
                 bytes.extend_from_slice(frame);
-                out.push(Frame { millis, bytes });
+                out.push(Frame { millis, lace, bytes });
             }
         }
         // the walk goes on from where this cluster ended, not from inside it
@@ -445,6 +461,18 @@ pub(crate) mod tests {
         let data = cluster(10, &[simple(1, 0, 0x80, &[1, 2, 3])]);
         assert_eq!(frames(&data, &t)[0].bytes, [0xFF, 0xFB, 1, 2, 3]);
         assert_eq!(audio_track(&header(&[entry(1, 2, b"A_MPEG/L3", strip(0))])), None);
+        // a header too long to be one, put back on every frame of a long lace, would be gigabytes
+        let long = el(
+            &[0x6D, 0x80],
+            &el(&[0x62, 0x40], &el(&[0x50, 0x34], &[el(&[0x42, 0x54], &[3]), el(&[0x42, 0x55], &[0; 4096])].concat())),
+        );
+        assert_eq!(audio_track(&header(&[entry(1, 2, b"A_MPEG/L3", long)])), None);
+        let mut wide = t.clone();
+        wide.strip = vec![0; MAX_FRAME - 16];
+        let laced = simple(1, 0, 0x04, &[255; 257]);
+        let blocks: Vec<Vec<u8>> = (0..4).map(|_| laced.clone()).collect();
+        let got = frames(&cluster(0, &blocks), &wide);
+        assert!(got.iter().map(|f| f.bytes.len()).sum::<usize>() <= MAX_FRAMES_BYTES, "{} frames", got.len());
     }
 
     #[test]
@@ -464,6 +492,7 @@ pub(crate) mod tests {
             got.iter().map(|f| f.millis).collect::<Vec<_>>(),
             [1000, 1020, 1020, 1020, 1040, 1040, 1060, 1060, 1060, 2000]
         );
+        assert_eq!(got.iter().map(|f| f.lace).collect::<Vec<_>>(), [0, 0, 1, 2, 0, 1, 0, 1, 2, 0]);
         assert_eq!(first_time(&data, &track), Some(1000));
         // cut off part way through the second cluster's block: the first cluster's frames are all there
         let cut = &data[..data.len() - 2];

@@ -116,11 +116,29 @@ pub fn has_print(shard: &Connection, id: i64) -> bool {
         .unwrap_or(false)
 }
 
-/// Two releases' prints are the same sound: as many of ours as can be (two, or one when either has only one) each the
-/// same sound as one of theirs.
+/// Two releases' prints are the same sound: as many windows as can be (two, or one when either has only one) each the
+/// same sound as a different window of the other's, soo a tune heard twice in one release can't stand for two
+/// matches, and the answer is the same whichever release asks.
 pub fn prints_match(mine: &[(i64, Vec<u32>)], theirs: &[(i64, Vec<u32>)]) -> bool {
     let need = 2.min(mine.len()).min(theirs.len());
-    need > 0 && mine.iter().filter(|(_, a)| theirs.iter().any(|(_, b)| audio::same_sound(a, b))).count() >= need
+    let same: Vec<Vec<bool>> =
+        mine.iter().map(|(_, a)| theirs.iter().map(|(_, b)| audio::same_sound(a, b)).collect()).collect();
+    need > 0 && pairs(&same, 0, &mut vec![false; theirs.len()]) >= need
+}
+
+/// The most pairs of different windows, one of ours and one of theirs, that are the same sound, from our window `i`
+/// on, with `taken` of theirs used: a handful of windows a side, soo every way is tried.
+fn pairs(same: &[Vec<bool>], i: usize, taken: &mut Vec<bool>) -> usize {
+    let Some(row) = same.get(i) else { return 0 };
+    let mut best = pairs(same, i + 1, taken);
+    for (j, hit) in row.iter().enumerate() {
+        if *hit && !taken.get(j).copied().unwrap_or(true) {
+            taken[j] = true;
+            best = best.max(1 + pairs(same, i + 1, taken));
+            taken[j] = false;
+        }
+    }
+    best
 }
 
 /// The releases other than `own` with the same sound, over every shard of `conn` (the main database with the shards
@@ -307,21 +325,47 @@ fn window_bytes(
 /// The print of one window's bytes: where it starts in ms, and its items. None when the sound there doesn't decode,
 /// is too short, or is silence.
 fn window_print(data: &[u8], track: &mkv::AudioTrack, target: i64, window_ms: i64) -> Option<(i64, Vec<u32>)> {
-    let frames: Vec<mkv::Frame> =
-        mkv::frames(data, track).into_iter().filter(|f| f.millis >= target - WARMUP_MS).collect();
+    let frames = mkv::frames(data, track);
+    // decoded from the last block that starts by the warm-up: blocks are stored in time order
+    let from = frames.iter().rposition(|f| f.lace == 0 && f.millis <= target - WARMUP_MS).unwrap_or(0);
+    let frames = frames.get(from..)?;
     let refs: Vec<&[u8]> = frames.iter().map(|f| f.bytes.as_slice()).collect();
     let (rate, pcm) = decode::decode(track, &refs)?;
-    // from the first frame at the window's start, or the first after the warm-up when it landed late
-    let first = frames.iter().position(|f| f.millis >= target).filter(|i| *i > 0).unwrap_or(1.min(frames.len()));
-    let start = frames.get(first)?.millis;
+    let per_ms = f64::from(rate) / 1000.0;
+    // when each frame starts: a block's time is its first frame's, and a laced frame after it starts where the
+    // frames before it in the lace end
+    let mut at = 0.0;
+    let mut starts = Vec::with_capacity(pcm.len());
+    for (frame, samples) in frames.iter().zip(&pcm) {
+        if frame.lace == 0 {
+            at = frame.millis as f64;
+        }
+        starts.push(at);
+        at += samples.len() as f64 / per_ms;
+    }
+    // from the window's start to the sample, or from the second frame when it landed late: a decoder's first frame
+    // is not the sound yet
     let want = usize::try_from(window_ms * i64::from(rate) / 1000).ok()?;
-    let mut sound: Vec<i16> = pcm.into_iter().skip(first).flatten().collect();
+    let mut sound: Vec<i16> = Vec::with_capacity(want);
+    let mut start = None;
+    for (begin, samples) in starts.iter().zip(&pcm).skip(1) {
+        let end = begin + samples.len() as f64 / per_ms;
+        if end <= target as f64 || samples.is_empty() {
+            continue;
+        }
+        let skip = if *begin < target as f64 { ((target as f64 - begin) * per_ms) as usize } else { 0 };
+        start.get_or_insert((begin + skip as f64 / per_ms).round() as i64);
+        sound.extend_from_slice(samples.get(skip..).unwrap_or_default());
+        if sound.len() >= want {
+            break;
+        }
+    }
     sound.truncate(want);
     if (sound.len() as i64) < MIN_WINDOW_MS * i64::from(rate) / 1000 {
         return None;
     }
     let items = audio::fingerprint(&sound, rate)?;
-    audio::informative(&items).then_some((start, items))
+    audio::informative(&items).then_some((start?, items))
 }
 
 /// The windows of a release's sound, as (position, time in ms, items).
@@ -488,9 +532,41 @@ mod tests {
         let (_, c) = print_of("other.aac.mkv", other.len() / 5, 3_000).unwrap();
         let (bits, _, _) = audio::best_alignment(&a, &c).unwrap();
         assert!(!audio::same_sound(&a, &c), "another tune: {bits} bits apart");
-        assert!(!prints_match(&[(0, a.clone())], &[(0, c)]));
-        assert!(prints_match(&[(0, a.clone()), (1, a.clone())], &[(0, b.clone())]));
+        assert!(!prints_match(&[(0, a.clone())], &[(0, c.clone())]));
+        assert!(prints_match(&[(0, a.clone()), (1, a.clone())], &[(0, b.clone())]), "one window each: one is enough");
+        // the same tune twice on one side matches one window of the other only once: not two matches
+        let elsewhere = |seed| audio::fingerprint(&tune(seed, 12.0, 22_050), 22_050).unwrap();
+        let mine = [(0, a.clone()), (1, a.clone()), (2, c.clone())];
+        let theirs = [(0, b.clone()), (1, elsewhere(11)), (2, elsewhere(12))];
+        assert!(!prints_match(&mine, &theirs) && !prints_match(&theirs, &mine));
+        assert!(prints_match(&[(0, a.clone()), (1, c.clone())], &[(0, b.clone()), (1, c.clone())]));
         assert!(!prints_match(&[], &[(0, b)]));
+    }
+
+    #[test]
+    fn a_window_starts_on_time_inside_a_lace() {
+        use crate::audio::mkv::tests::{cluster, simple};
+        // PCM, four one-second frames to a fixed-laced block, a block every four seconds
+        let rate = 8_000;
+        let sound = tune(3, 16.0, rate);
+        let track = mkv::AudioTrack {
+            number: 1,
+            codec: "A_PCM/INT/LIT".into(),
+            sample_rate: Some(f64::from(rate)),
+            channels: Some(1),
+            bit_depth: Some(16),
+            timestamp_scale: 1_000_000,
+            ..Default::default()
+        };
+        let mut data = Vec::new();
+        for block in 0..4 {
+            let pcm: Vec<u8> =
+                sound[block * 4 * 8_000..(block + 1) * 4 * 8_000].iter().flat_map(|s| s.to_le_bytes()).collect();
+            data.extend(cluster(block as u64 * 4_000, &[simple(1, 0, 0x04, &[&[3u8][..], &pcm].concat())]));
+        }
+        let (at, print) = window_print(&data, &track, 3_000, 8_000).unwrap();
+        assert_eq!(at, 3_000);
+        assert_eq!(print, audio::fingerprint(&sound[3 * 8_000..11 * 8_000], rate).unwrap());
     }
 
     #[test]
