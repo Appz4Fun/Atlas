@@ -54,11 +54,15 @@ A post with a weak name, such as numbered files, has its poster and day in its k
 - The WebSocket streams and the IRC scraper. The streams carry predb.club and predb.net, which are polled. IRC needs its own login.
 - `predb.ovh`'s host no longer resolves. Its code stays in case it returns.
 
+## Per-function CPU dispatch
+
+Mac builds use `target-cpu=native` (`.cargo/config.toml`), so a binary is tuned for the Mac that built it and may not run on an older one; the release workflow builds for `apple-m1` instead. One binary that is fast on every chip would compile the hot functions more than once with `#[target_feature(enable = "...")]` (or the `multiversion` crate) and pick a version at startup with `std::arch::is_aarch64_feature_detected!`. Not done: Atlas mostly waits on the network, disk and SQLite, and nobody has measured which functions would gain. Fix: profile prod, then try it on what shows up as CPU-bound (yEnc decode, CRC32 and MD5, PAR2 hashing, subject parsing), comparing an `apple-m1` build against `native` on each.
+
 ## Tests
 
 - `tests/stop.rs` `stop_does_not_wait_for_a_stuck_request` fails now and then under heavy load, on "the slices that came back were saved": the stop can arrive before any slice is saved. It passes alone. Fix: wait for a saved slice before stopping.
 
 ## Sealed files
 
-- The sealed log dashboard (`atlas-sealed-log`) has no screenshot and no entry on the dashboards page (`grafana/index.html`). Take one once the service and Atlas have run the metrics builds for a while, with addresses and host names replaced as for the others, then publish the page.
+- The sealed log dashboard (`atlas-sealed-log`) and the backfill and realtime one (`atlas-progress`) have no screenshot and no entry on the dashboards page (`grafana/index.html`). Take them once the service and Atlas have run the metrics builds for a while, with addresses and host names replaced as for the others, then publish the page.
 - Some sealed files hold more than `SEAL_MAX_SEGMENTS`, and how they got there isn't known. They're read up to `READ_MAX_SEGMENTS`, and a late article stays a row on them. Fix, if it matters: find them with `blob::count` and leave them, or split them.

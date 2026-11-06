@@ -51,6 +51,11 @@ impl NntpError {
         matches!(self.code(), Some(420 | 423))
     }
 
+    /// A read or the whole request took too long.
+    pub fn is_timeout(&self) -> bool {
+        matches!(self, NntpError::Io(e) if e.kind() == io::ErrorKind::TimedOut)
+    }
+
     /// The server closed the connection: nothing came back on it.
     pub fn is_closed(&self) -> bool {
         matches!(self, NntpError::Io(e) if e.kind() == io::ErrorKind::UnexpectedEof)
@@ -339,6 +344,10 @@ const AUTH_REST: Duration = Duration::from_secs(30 * 60);
 /// answer a connection limit or a backend hiccup with the same 481/502 text as a bad password, and one such reply
 /// benched the server for 30 minutes.
 const AUTH_REFUSALS: usize = 2;
+/// A plain connection that takes a compressed one's place (`Pool::uncompressed`) asks again this many times, this far
+/// apart, while the provider still counts the closed one against its limit.
+const PLAIN_TRIES: usize = 5;
+const PLAIN_WAIT: Duration = Duration::from_millis(500);
 /// A server whose compressed headers couldnt be read gets compressed ones asked for again after this long, on
 /// probation: the first unreadable listing turns it off again. Compression stayed off until a restart.
 const COMPRESS_RETRY: Duration = Duration::from_secs(60 * 60);
@@ -565,7 +574,8 @@ pub struct Conn {
     pub group: Option<String>,
     /// server agreed to XFEATURE COMPRESS GZIP on this connection
     pub compressed: bool,
-    /// set when a compressed response timed out waiting for its stream end trailer
+    /// set when a compressed response timed out waiting for its stream end trailer, or the connection is a plain one
+    /// standing in for a compressed one (`Pool::uncompressed`): never kept idle
     poisoned: bool,
     /// bytes received off the socket, and the same after decompression,
     /// since the pool last collected them
@@ -2710,10 +2720,10 @@ impl Pool {
     /// for. A listing cut short costs its connection, which still has the
     /// rest of it on the wire.
     async fn ends(&self, i: usize, group: &str, start: u64, end: u64) -> Result<Ends> {
-        let r = match self.ends_once(i, group, start, end).await {
+        let r = match self.ends_once(i, group, start, end, false).await {
             Err(NntpError::Decompress(e)) => {
                 self.no_compression(i, &e);
-                self.ends_once(i, group, start, end).await
+                self.ends_once(i, group, start, end, true).await
             }
             r => r,
         };
@@ -2723,8 +2733,11 @@ impl Pool {
         }
     }
 
-    async fn ends_once(&self, i: usize, group: &str, start: u64, end: u64) -> Result<Ends> {
+    async fn ends_once(&self, i: usize, group: &str, start: u64, end: u64, plain: bool) -> Result<Ends> {
         let mut lease = self.lease_for(i, Some(group), false).await?;
+        if plain {
+            self.uncompressed(&mut lease).await?;
+        }
 
         if lease.group() != Some(group) {
             let r = lease.begin().select_group(group).await;
@@ -3037,6 +3050,35 @@ impl Pool {
         Ok(rows.iter().find(|o| plausible_post_time(&o.date).is_some_and(|t| t >= when)).map(|o| o.number))
     }
 
+    /// Swap `lease`'s connection for a plain one when it asked for compressed headers. A listing that wouldnt
+    /// inflate is asked for again uncompressed: a server whose compression works for every other group keeps it on
+    /// (`no_compression`), and an idle connection would be compressed too. The compressed one is closed, and the plain
+    /// one goes once the listing is read.
+    async fn uncompressed(&self, lease: &mut Lease) -> Result<()> {
+        if !lease.conn.as_ref().is_some_and(|c| c.compressed) {
+            return Ok(());
+        }
+        lease.collect_traffic();
+        // closed first: at the provider's connection limit the plain one takes its place, once the provider has seen
+        // the old one go, which can take it a moment
+        lease.conn = None;
+        let mut tries = 0;
+        let mut conn = loop {
+            match Conn::open(&lease.server.cfg, self.timeout, false).await {
+                Err(e) if matches!(refusal(&e), Refusal::TooMany) && tries < PLAIN_TRIES => {
+                    tries += 1;
+                    tokio::time::sleep(PLAIN_WAIT).await;
+                }
+                r => break r?,
+            }
+        };
+        conn.set_rate_limiter(self.rate_limiter.clone());
+        // used for this listing only, never kept idle: the server's other listings go on coming compressed
+        conn.poisoned = true;
+        lease.conn = Some(conn);
+        Ok(())
+    }
+
     /// Compressed listings from server `i` couldnt be read: it gets plain ones from now on
     /// when it has never delivered headers or failed `GROUP_REFUSALS` times in a row.
     fn no_compression(&self, i: usize, e: &str) {
@@ -3057,20 +3099,54 @@ impl Pool {
     }
 
     async fn xover_on(&self, i: usize, group: &str, start: u64, end: u64) -> Result<Vec<Overview>> {
-        match self.xover_once(i, group, start, end).await {
+        match self.xover_once(i, group, start, end, false).await {
             Err(NntpError::Decompress(e)) => {
-                // turn compression off for this server and redo the slice uncompressed
+                // count it against the server's compression, and redo the slice uncompressed
                 self.no_compression(i, &e);
-                self.xover_once(i, group, start, end).await
+                self.xover_once(i, group, start, end, true).await
             }
             // the server closed the connection before answering: once more, on another one
-            Err(e) if e.is_closed() => self.xover_once(i, group, start, end).await,
+            Err(e) if e.is_closed() => self.xover_once(i, group, start, end, false).await,
+            // too wide to answer in time: in halves (see `xover_halves`)
+            Err(e) if e.is_timeout() && end.saturating_sub(start) + 1 >= 2 * MIN_CHUNK => {
+                self.xover_halves(i, group, start, end).await
+            }
             r => r,
         }
     }
 
-    async fn xover_once(&self, i: usize, group: &str, start: u64, end: u64) -> Result<Vec<Overview>> {
+    /// `start..=end` asked for as two halves, the left one first, each halved again while it times out, down to
+    /// `MIN_CHUNK`: a server that scans the whole range before it answers can take longer than the read timeout for a
+    /// wide one. On prod news.newshosting.com took 11 to 105 s to answer each 100,000 numbers of alt.binaries.mom, and
+    /// one day chunk timed out on every try. The first half that fails fails the range, soo a server that answers
+    /// nothing costs one timeout a halving.
+    fn xover_halves<'a>(
+        &'a self,
+        i: usize,
+        group: &'a str,
+        start: u64,
+        end: u64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<Overview>>> + Send + 'a>> {
+        Box::pin(async move {
+            let mid = start + (end - start) / 2;
+            let mut rows = Vec::new();
+            for (from, to) in [(start, mid), (mid + 1, end)] {
+                match self.xover_on(i, group, from, to).await {
+                    Ok(half) => rows.extend(half),
+                    Err(e) if e.is_empty_range() => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            Ok(rows)
+        })
+    }
+
+    /// One XOVER of `start..=end` on server `i`; `plain`: on a connection that didnt ask for compressed headers.
+    async fn xover_once(&self, i: usize, group: &str, start: u64, end: u64, plain: bool) -> Result<Vec<Overview>> {
         let mut lease = self.lease_for(i, Some(group), false).await?;
+        if plain {
+            self.uncompressed(&mut lease).await?;
+        }
 
         if lease.group() != Some(group) {
             let r = lease.begin().select_group(group).await;

@@ -248,6 +248,122 @@ fn whatever_is_not_movies_tv_or_other_freezes_complete_or_not() {
 }
 
 #[test]
+fn a_post_of_only_what_describes_a_release_is_a_sidecar_and_freezes() {
+    let f = Fixture::new();
+    // no `[n/N]` on these subjects: as the owner's one-file NFO and mediainfo posts are
+    let loose = |name: &str, files: &[&str], bytes: i64| {
+        let mut p = post(name, files, 1, bytes);
+        p.articles.iter_mut().for_each(|a| a.file_total = None);
+        p.complete = false;
+        p
+    };
+    f.save(&[
+        loose("Some.Movie.2024.1080p.BluRay.x264-GRP", &["grp.nfo"], 6_000),
+        loose("ptbm-tourist.trap.1979.mediainfo", &["mediainfo.txt"], 4_000),
+        post("Two.Sidecars.2024-GRP", &["grp.nfo", "grp.sfv"], 1, 2_000),
+        // the first file of an upload whose subjects say 45 more are coming
+        post("First.Of.Many.2024-GRP", &["first.nfo", "a.rar", "b.rar"], 1, 2_000),
+        loose("With.Video.2024-GRP", &["x.nfo", "x.mkv"], 2_000),
+        loose("Too.Big.Text", &["huge.txt"], 5 << 20),
+        loose("Some.Film.2024-GRP-cover.jpg", &["Some.Film.2024-GRP-cover.jpg"], 700_000),
+        loose("Holiday.Pictures", &["a.jpg", "b.jpg"], 100_000),
+    ]);
+    let conn = f.writer();
+    let id = |n: &str| f.id(&conn, n);
+    // the upload's rows: one NFO here, its counter saying three files
+    conn.execute("delete from files where release_id = ?1 and filename != 'first.nfo'", [id("First.Of.Many.2024-GRP")])
+        .unwrap();
+    conn.execute("update releases set file_total = 3 where id = ?1", [id("First.Of.Many.2024-GRP")]).unwrap();
+    // a category doesn't save a sidecar from it
+    conn.execute(
+        "insert into release_category (release_id, category) values (?1, 2040)",
+        [id("Some.Movie.2024.1080p.BluRay.x264-GRP")],
+    )
+    .unwrap();
+    let reason = |n: &str| -> Option<String> {
+        rules::evaluate(&conn, id(n), NOW).unwrap();
+        conn.query_row("select reason from freeze_pending where release_id = ?1", [id(n)], |r| r.get(0)).ok()
+    };
+    for n in [
+        "Some.Movie.2024.1080p.BluRay.x264-GRP",
+        "ptbm-tourist.trap.1979.mediainfo",
+        "Two.Sidecars.2024-GRP",
+        "Some.Film.2024-GRP-cover.jpg",
+    ] {
+        assert_eq!(reason(n).as_deref(), Some(rules::SIDECAR), "{n}");
+    }
+    assert_ne!(reason("First.Of.Many.2024-GRP").as_deref(), Some(rules::SIDECAR), "more of the post is coming");
+    assert_ne!(reason("With.Video.2024-GRP").as_deref(), Some(rules::SIDECAR), "it carries data");
+    assert_ne!(reason("Too.Big.Text").as_deref(), Some(rules::SIDECAR), "past the sidecar size");
+    assert_ne!(reason("Holiday.Pictures").as_deref(), Some(rules::SIDECAR), "pictures and nothing else");
+    // off, none of them is a sidecar any more
+    SIDECAR.store(false, Relaxed);
+    let off = reason("ptbm-tourist.trap.1979.mediainfo");
+    SIDECAR.store(true, Relaxed);
+    assert_ne!(off.as_deref(), Some(rules::SIDECAR));
+}
+
+/// A release queued before the sidecar rule, as small and complete, takes the sidecar reason when the backlog walk gets
+/// to it: no visit may come back to a settled cover post.
+#[test]
+fn the_backlog_walk_gives_a_queued_release_the_reason_that_matches_it_now() {
+    let f = Fixture::new();
+    let mut cover = post("Some.Film.2024-GRP-cover.jpg", &["Some.Film.2024-GRP-cover.jpg"], 1, 700_000);
+    cover.articles.iter_mut().for_each(|a| a.file_total = None);
+    cover.complete = false;
+    f.save(&[cover, post("Small.Thing", &["a.rar", "b.rar"], 3, 1000)]);
+    let conn = f.writer();
+    let (cover, small) = (f.id(&conn, "Some.Film.2024-GRP-cover.jpg"), f.id(&conn, "Small.Thing"));
+    for id in [cover, small] {
+        conn.execute("insert into freeze_pending (release_id, reason, at) values (?1, 'small_complete', 7)", [id])
+            .unwrap();
+    }
+    // a walk finished under the rules before (as an older Atlas left it): it starts over and gets to them
+    let step = || rules::backlog_some(&conn, 10, Duration::from_secs(60), NOW).unwrap();
+    let queued = |id: i64| -> (String, i64) {
+        conn.query_row("select reason, at from freeze_pending where release_id = ?1", [id], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap()
+    };
+    step();
+    assert_eq!(meta(&conn, "freeze_backlog_below"), 0);
+    conn.execute("update freeze_pending set reason = 'small_complete', at = 7", []).unwrap();
+    assert_eq!(step(), rules::Backlog::default(), "done under these rules");
+    assert_eq!(queued(cover).0, "small_complete");
+    conn.execute("update meta set value = value - 1 where key = 'freeze_backlog_rules'", []).unwrap();
+    assert_eq!(step().queued, 1);
+    assert_eq!(queued(cover), (rules::SIDECAR.to_string(), 7), "a new name, and its place kept");
+    assert_eq!(queued(small), ("small_complete".to_string(), 7), "as it was");
+}
+
+/// A release visited again for the same reason keeps the time it was first queued; a new reason starts it over.
+#[test]
+fn a_visit_for_the_same_reason_keeps_the_queued_time() {
+    let f = Fixture::new();
+    f.save(&[post("Small.Thing", &["a.rar", "b.rar"], 3, 1000)]);
+    let conn = f.writer();
+    let id = f.id(&conn, "Small.Thing");
+    let queued = |conn: &Connection| -> (String, i64) {
+        conn.query_row("select reason, at from freeze_pending where release_id = ?1", [id], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap()
+    };
+    assert!(rules::evaluate(&conn, id, NOW).unwrap());
+    let (first, at) = queued(&conn);
+    assert_eq!(at, NOW);
+    assert!(rules::evaluate(&conn, id, NOW + 3600).unwrap());
+    assert_eq!(queued(&conn), (first.clone(), NOW), "the same reason: still queued at the first visit");
+    // grown past the small rule's size and filed outside Movies/TV/Other: another reason, the wait starts over
+    conn.execute("update releases set size = ?2 where id = ?1", rusqlite::params![id, 4_i64 << 30]).unwrap();
+    conn.execute("insert into release_category (release_id, category) values (?1, 7020)", [id]).unwrap();
+    assert!(rules::evaluate(&conn, id, NOW + 7200).unwrap());
+    assert_eq!(first, "small_complete");
+    assert_eq!(queued(&conn), ("not_tv_movies".to_string(), NOW + 7200), "a new reason starts the wait over");
+}
+
+#[test]
 fn a_database_lane_visit_queues_a_release_for_freezing() {
     let f = Fixture::new();
     f.save(&[post("Small", &["b.mkv"], 1, 10)]);
@@ -427,13 +543,36 @@ fn every_table_a_release_is_read_from_has_an_index_for_it() {
     }
 }
 
+/// With nothing waiting for the writer, ticks come four times as often as a busy writer's, one a second.
+#[test]
+fn an_idle_writer_ticks_more_often() {
+    let f = Fixture::new();
+    f.save(&[post("One", &["a.mkv"], 1, 10), post("Two", &["b.mkv"], 1, 10)]);
+    let conn = f.writer();
+    conn.execute_batch(
+        "insert into freeze_pending (release_id, reason, at) select id, 'small_complete', 1 from releases",
+    )
+    .unwrap();
+    let mut ticker = Ticker { disk: Some((Instant::now(), true)), ..Ticker::default() };
+    let first = ticker.tick_idle(&conn, NOW).unwrap().frozen;
+    assert!(first >= 1);
+    assert_eq!(ticker.tick_idle(&conn, NOW).unwrap(), Moved::default(), "not again at once");
+    std::thread::sleep(IDLE_TICK_EVERY);
+    if first < 2 {
+        assert_eq!(ticker.tick_idle(&conn, NOW).unwrap().frozen, 1, "again after a quarter second");
+    }
+    assert_eq!(count(&conn, "select count(*) from freeze_pending"), 0);
+}
+
 #[test]
 fn nothing_moves_while_the_disk_is_short() {
     let f = Fixture::new();
     f.save(&[post("Small", &["b.mkv"], 1, 10)]);
     let conn = f.writer();
-    conn.execute_batch("insert into freeze_pending (release_id, reason, at) select id, 'test', 1 from releases")
-        .unwrap();
+    conn.execute_batch(
+        "insert into freeze_pending (release_id, reason, at) select id, 'small_complete', 1 from releases",
+    )
+    .unwrap();
     let mut ticker = Ticker { disk: Some((Instant::now(), false)), ..Ticker::default() };
     assert_eq!(ticker.tick(&conn, NOW).unwrap(), Moved::default());
     let mut ticker = Ticker { disk: Some((Instant::now(), true)), ..Ticker::default() };
@@ -450,10 +589,9 @@ fn a_release_waits_its_hours_queued_before_it_moves() {
     let tick = |now: i64| Ticker { disk: Some((Instant::now(), true)), ..Ticker::default() }.tick(&conn, now).unwrap();
     let wait = WAIT_SECS.load(Relaxed);
     assert_eq!(tick(NOW + wait - 1), Moved::default(), "still in its wait");
-    // a visit that finds it matching still starts its wait again
+    // a visit that finds it matching for the same reason doesnt start its wait again
     assert!(rules::evaluate(&conn, f.id(&conn, "Fresh"), NOW + wait - 1).unwrap());
-    assert_eq!(tick(NOW + wait), Moved::default());
-    assert_eq!(tick(NOW + 2 * wait).frozen, 1);
+    assert_eq!(tick(NOW + wait).frozen, 1);
 }
 
 #[test]
@@ -626,6 +764,23 @@ fn a_tick_lets_go_while_another_connection_holds_the_lock_and_the_next_one_moves
     assert_eq!(tick().frozen, 1);
 }
 
+/// A tick moves what is ready first; the walk gets the rest of the tick, and a short step when the moves took it all.
+#[test]
+fn a_tick_moves_first_and_walks_with_what_is_left() {
+    let f = Fixture::new();
+    let names: Vec<String> = (0..300).map(|n| format!("Old.{n}")).collect();
+    f.save(&names.iter().map(|n| post(n, &["a.rar"], 1, 100)).collect::<Vec<_>>());
+    let conn = f.writer();
+    // one of them queued long ago, ready to move
+    let first = f.id(&conn, "Old.0");
+    conn.execute("insert into freeze_pending (release_id, reason, at) values (?1, 'small_complete', 1)", [first])
+        .unwrap();
+    let mut ticker = Ticker { disk: Some((Instant::now(), true)), ..Ticker::default() };
+    let moved = ticker.tick(&conn, NOW).unwrap();
+    assert_eq!(moved.frozen, 1, "the ready one moved");
+    assert!(moved.backlog > 0, "and the walk went on");
+}
+
 #[test]
 fn a_backlog_step_stops_after_a_chunk_once_its_time_is_up() {
     let f = Fixture::new();
@@ -633,7 +788,7 @@ fn a_backlog_step_stops_after_a_chunk_once_its_time_is_up() {
     f.save(&names.iter().map(|n| post(n, &["a.rar"], 1, 100)).collect::<Vec<_>>());
     let conn = f.writer();
     let step = |budget| rules::backlog_some(&conn, 1_000, budget, NOW).unwrap();
-    assert_eq!(step(Duration::ZERO), rules::Backlog { looked_at: 250, queued: 250 });
-    assert_eq!(step(Duration::from_secs(60)), rules::Backlog { looked_at: 50, queued: 50 }, "on from where it got to");
+    assert_eq!(step(Duration::ZERO), rules::Backlog { looked_at: 50, queued: 50 }, "one chunk");
+    assert_eq!(step(Duration::from_secs(60)), rules::Backlog { looked_at: 250, queued: 250 }, "on from where it got to");
     assert_eq!(meta(&conn, "freeze_backlog_below"), 0);
 }

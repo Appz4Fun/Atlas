@@ -206,6 +206,7 @@ fn run_step(step: &dyn Step, ctx: &mut StepCtx<'_>) -> Ran {
         }
         Err(panic) => {
             ctx.crcs.clear();
+            crate::metrics::names::STEP_PANICS.inc(&[("step", step.name())], 1);
             Ran::Error(StepError::Retry(panic_text(panic)))
         }
     };
@@ -237,6 +238,10 @@ impl Inner {
     pub(crate) fn new(p: &StageParams) -> Inner {
         let mut steps = p.steps.clone();
         steps.sort_by_key(|s| s.rank());
+        // every step's panics read 0 from the start, soo a dashboard has a series before the first one
+        for step in &steps {
+            crate::metrics::names::STEP_PANICS.inc(&[("step", step.name())], 0);
+        }
         let stop = Arc::new(AtomicBool::new(false));
         let stats = Arc::new(Stats::default());
         let config = p.config.postprocess.clone();
@@ -338,7 +343,11 @@ impl Inner {
 
     pub(crate) fn snapshot(&self) -> Value {
         let s = self.settings.read().unwrap();
-        self.stats.snapshot(s.config.body_fetches_per_minute, s.config.backlog_per_second, s.enabled)
+        let mut snapshot =
+            self.stats.snapshot(s.config.body_fetches_per_minute, s.config.backlog_per_second, s.enabled);
+        let claims: Vec<usize> = self.net_claimed.iter().map(|c| c.lock().unwrap().claims).collect();
+        snapshot["net_claims"] = serde_json::json!({"running": claims, "most": s.config.net_claims_per_shard});
+        snapshot
     }
 
     /// Bounded counts, per shard: an exact count at this size stalls whatever asks.
@@ -901,6 +910,11 @@ impl Inner {
     /// shard, as each slice waits for its shard's writer and one busy writer shouldn't hold up the other shards.
     pub(crate) fn rank_lane(self: Arc<Self>, db: Db, shard: usize) {
         let mut conns = Conns::new(self.main.clone());
+        if let Err(e) =
+            conns.get(shard).map_err(anyhow::Error::from).and_then(|conn| par2_from_volumes(conn, &db, shard))
+        {
+            println!("processing stage, PAR2 reruns of shard {shard}: {e}");
+        }
         while !self.stopping() {
             match conns.get(shard).map_err(anyhow::Error::from).and_then(|conn| rank_slice(conn, &db, shard)) {
                 // another slice as soon as its writer is free: the writer puts saves first either way
@@ -1085,8 +1099,7 @@ impl Inner {
                         a.net_next_at = Some(0);
                         a.writes.extend(std::mem::take(&mut o.writes).into_iter().map(|w| (bit, w)));
                         // requested reruns clear and re-arm any other step: this lane's come back to it, the database's through the queue
-                        let other =
-                            self.steps.iter().filter(|s| s.id() != step.id()).fold(0, |m, s| m | mask(s.id()));
+                        let other = self.steps.iter().filter(|s| s.id() != step.id()).fold(0, |m, s| m | mask(s.id()));
                         a.clear |= o.rerun & other;
                         a.net_mask |= o.rerun & other & a.net_steps;
                         if let Some(name) = o.name.take() {
@@ -1183,7 +1196,12 @@ fn apply_name(release: &mut ReleaseInfo, name: &NameChange) {
 }
 
 /// One shard's note of which steps are on, see `Inner::seed`. In the writer's transaction.
-fn seed_shard(conn: &Connection, enabled: StepMask, stamps: &[(u8, StepMask, i64)], now: i64) -> rusqlite::Result<()> {
+pub(crate) fn seed_shard(
+    conn: &Connection,
+    enabled: StepMask,
+    stamps: &[(u8, StepMask, i64)],
+    now: i64,
+) -> rusqlite::Result<()> {
     let meta = |key: &str| -> rusqlite::Result<Option<i64>> {
         conn.prepare_cached("select value from meta where key = ?")?.query_row([key], |r| r.get(0)).optional()
     };
@@ -1298,6 +1316,22 @@ fn seed_shard(conn: &Connection, enabled: StepMask, stamps: &[(u8, StepMask, i64
         crate::probe::step::rerun_encrypted_with_password(conn, now)?;
         set("pp_probe_encrypted_pw", now)?;
     }
+    // once, for the movies and TV saved incomplete before a whole video named as its release, or a PAR2 set naming
+    // only files there, counted over the subject counter (`store::release_complete`); and again once a whole RAR set
+    // named as its release counted too
+    if meta("pp_complete_by_files")?.is_none() || meta("pp_complete_by_rar_set")?.is_none() {
+        // through the queue: a row visited before, when its body steps waited on completeness (`BodyGate::NotYet`),
+        // has no queue row left to bring it back
+        let fixed = crate::store::recheck_movie_tv_complete(conn)?;
+        let mut queue = conn.prepare_cached(
+            "insert into pp_queue (release_id, due_at) values (?1, ?2) on conflict(release_id) do update set due_at = ?2",
+        )?;
+        for id in fixed {
+            queue.execute(params![id, now])?;
+        }
+        set("pp_complete_by_files", now)?;
+        set("pp_complete_by_rar_set", now)?;
+    }
     // once, for the movie and TV probes from before the probe kept the server's body CRC: a HEAD each. The step
     // does nothing for a release it wasn't asked about, soo it is marked seen here and starts no walk of every row
     if meta("pp_probe_body_crc")?.is_none() {
@@ -1307,6 +1341,23 @@ fn seed_shard(conn: &Connection, enabled: StepMask, stamps: &[(u8, StepMask, i64
             set("pp_steps_seen", meta("pp_steps_seen")?.unwrap_or(0) | bit)?;
         }
         set("pp_probe_body_crc", now)?;
+    }
+    // the sidecar step reads posts as they come, and its rule freezes the old ones as they are: it starts no walk of
+    // every row, which would ask the net lane about every small release there is
+    if meta("pp_sidecar_seen")?.is_none() {
+        let bit = crate::postprocess::step::mask(crate::sidecar::SIDECAR_STEP);
+        if seeded && enabled & bit != 0 {
+            set("pp_steps_seen", meta("pp_steps_seen")?.unwrap_or(0) | bit)?;
+        }
+        set("pp_sidecar_seen", now)?;
+    }
+    // and its image twin, for the same reason: new cover posts get it on their first visit
+    if meta("pp_sidecar_image_seen")?.is_none() {
+        let bit = crate::postprocess::step::mask(crate::sidecar::SIDECAR_IMAGE_STEP);
+        if seeded && enabled & bit != 0 {
+            set("pp_steps_seen", meta("pp_steps_seen")?.unwrap_or(0) | bit)?;
+        }
+        set("pp_sidecar_image_seen", now)?;
     }
     let seen = meta("pp_steps_seen")?.unwrap_or(0);
     let new = if seeded { enabled & !seen } else { enabled };
@@ -1423,6 +1474,30 @@ pub(crate) fn net_take(
         claimed.claims += 1;
     }
     Ok(ids)
+}
+
+/// Once a shard, for the incomplete movies and TV the PAR2 step read no set for from the first PAR2 file it picked
+/// (`archive::steps::par2_without_set`): the step again. Their ids are read here, as the scan is too long to hold
+/// the writer for; the reruns and the mark are written on it.
+fn par2_from_volumes(conn: &Connection, db: &Db, shard: usize) -> anyhow::Result<()> {
+    const KEY: &str = "pp_par2_from_volumes";
+    let done = conn.prepare_cached("select 1 from meta where key = ?")?.exists([KEY])?;
+    if done {
+        return Ok(());
+    }
+    let ids = crate::archive::steps::par2_without_set(conn)?;
+    let now = chrono::Utc::now().timestamp();
+    let answer = db.on_writer(
+        shard,
+        "db.stage.par2_rerun",
+        Box::new(move |tx| {
+            crate::archive::steps::rerun_par2(tx, &ids, now)?;
+            tx.prepare_cached("insert or replace into meta (key, value) values (?, ?)")?.execute(params![KEY, now])?;
+            Ok(())
+        }),
+    )?;
+    answer.recv()?.map_err(anyhow::Error::msg)?;
+    Ok(())
 }
 
 /// Releases ranked per slice, at most.

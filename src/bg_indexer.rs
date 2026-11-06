@@ -318,6 +318,8 @@ struct Scheduler {
     chunk_errors: Mutex<HashMap<(String, usize), u32>>,
     /// servers one of whose workers sweeps a split group (see `take_sweep`)
     sweeping: Mutex<HashSet<usize>>,
+    /// servers one of whose workers runs a day chunk ahead of its due groups (see `next_work`)
+    chunking: Mutex<HashSet<usize>>,
     /// groups resting after going idle or after an error
     wait_until: Mutex<HashMap<String, Instant>>,
     /// consecutive errors per group, on each server
@@ -668,7 +670,8 @@ async fn take_sweep(sched: &Scheduler, server: usize, db: &Db) -> Option<String>
 /// What a worker does next.
 enum Work {
     Group(String),
-    Chunk(crate::chunks::Claim),
+    /// a day chunk, and whether it is the server's one ahead of its due groups (`Scheduler::chunking`)
+    Chunk(crate::chunks::Claim, bool),
     Sweep(String),
 }
 
@@ -676,21 +679,32 @@ enum Work {
 /// chunks are done (see `take_sweep`) comes first, before its normal groups,
 /// soo home groups that keep every worker busy dont hold it off until what
 /// it would find ages out. One worker per server sweeps at a time, the
-/// others index their groups or take day chunks. `after_sweep`: the worker's
-/// last pick was a sweep, soo a due group of its own goes before the next.
+/// others index their groups or take day chunks; one worker per server also
+/// runs a day chunk ahead of its groups. `after_sweep`: the worker's last pick
+/// was a sweep or a day chunk ahead of its groups, soo a due group of its own
+/// goes before the next.
 async fn next_work(sched: &Scheduler, server: usize, db: &Db, after_sweep: bool) -> Option<Work> {
-    // right after a sweep a due normal group goes first, soo a worker that
-    // is alone on its server alternates instead of sweeping forever
+    // right after a sweep (or a chunk ahead of its groups) a due normal group goes
+    // first, soo a worker that is alone on its server alternates instead of sweeping forever
     if after_sweep && let Some(group) = sched.take_group(server) {
         return Some(Work::Group(group));
     }
     if let Some(group) = take_sweep(sched, server, db).await {
         return Some(Work::Sweep(group));
     }
+    // one worker a server runs day chunks ahead of its due groups: with thousands of groups a worker is never idle,
+    // and a split group's own backfill turn goes live while it is behind (`indexer::live_first`), soo on prod the
+    // groups holding the newest month never took their days and 4.8 million older ones waited behind them
+    if sched.chunking.lock().unwrap().insert(server) {
+        if let Some(chunk) = take_chunk(sched, server, db).await {
+            return Some(Work::Chunk(chunk, true));
+        }
+        sched.chunking.lock().unwrap().remove(&server);
+    }
     if let Some(group) = sched.take_group(server) {
         return Some(Work::Group(group));
     }
-    take_chunk(sched, server, db).await.map(Work::Chunk)
+    take_chunk(sched, server, db).await.map(|chunk| Work::Chunk(chunk, false))
 }
 
 /// One worker on `server`: index whichever of its groups is due next, again and again.
@@ -700,18 +714,22 @@ async fn worker(sched: Arc<Scheduler>, server: usize, db: Db) {
     let mut after_sweep = false;
     while !sched.stopping() {
         let work = next_work(&sched, server, &db, after_sweep).await;
-        after_sweep = matches!(work, Some(Work::Sweep(_)));
+        after_sweep = matches!(work, Some(Work::Sweep(_) | Work::Chunk(_, true)));
         let group = match work {
             Some(Work::Group(group)) => group,
             // help with a split group's day chunks. not marked busy, a
             // group's chunks run on several servers at once
-            Some(Work::Chunk(chunk)) => {
+            Some(Work::Chunk(chunk, ahead)) => {
                 let settings = sched.settings.read().unwrap().clone();
                 let stats = sched.stats.clone();
                 let group = chunk.group.clone();
                 let mut progress = |p: &Progress| stats.lock().unwrap().tick(p, &group);
                 let run = crate::indexer::run_chunk(&sched.ctx, &settings, &db, &chunk, server, &mut progress);
-                let Some(result) = unless_stopped(&sched.ctx.stop, run).await else { break };
+                let result = unless_stopped(&sched.ctx.stop, run).await;
+                if ahead {
+                    sched.chunking.lock().unwrap().remove(&server);
+                }
+                let Some(result) = result else { break };
                 sched.finish_chunk(chunk.group, server, result);
                 continue;
             }
@@ -750,6 +768,17 @@ async fn worker(sched: Arc<Scheduler>, server: usize, db: Db) {
         let pass = run_pass_on(&sched.ctx, &settings, &db, &group, server, &mut progress, &mut ran_on);
         let Some(result) = unless_stopped(&sched.ctx.stop, pass).await else { break };
         sched.finish(&group, ran_on, stood_in.is_some(), result);
+    }
+}
+
+/// `fut` as a task named `name`: one that ends more than a second after the stop was asked for (`since`) says so,
+/// soo a slow stop shows which task held it.
+async fn named_task(name: String, since: Arc<OnceLock<Instant>>, fut: impl std::future::Future<Output = ()>) {
+    fut.await;
+    if let Some(at) = since.get()
+        && at.elapsed() > Duration::from_secs(1)
+    {
+        println!("[STOP] {name} ended {:.1}s after the stop", at.elapsed().as_secs_f64());
     }
 }
 
@@ -915,6 +944,7 @@ async fn run_servers(
         skip: Mutex::new(HashMap::new()),
         chunk_errors: Mutex::new(HashMap::new()),
         sweeping: Mutex::new(HashSet::new()),
+        chunking: Mutex::new(HashSet::new()),
         wait_until: Mutex::new(HashMap::new()),
         errors: Mutex::new(HashMap::new()),
         failed: Mutex::new(HashMap::new()),
@@ -952,6 +982,13 @@ async fn run_servers(
 
     crate::archive::sync_inline_lookups(config);
     let mut tasks = tokio::task::JoinSet::new();
+    // when the stop was asked for: each task that ends past it says when (`named`)
+    let stopping_since: Arc<OnceLock<Instant>> = Arc::new(OnceLock::new());
+    macro_rules! named {
+        ($name:expr, $fut:expr $(,)?) => {
+            named_task($name, stopping_since.clone(), $fut)
+        };
+    }
     // before the stage: its step reads this file, and a missing one is an error it would spend attempts on
     if config.predb.enabled
         && let Err(e) = crate::predb::db::create(&paths::predb_database())
@@ -969,7 +1006,7 @@ async fn run_servers(
         });
         let _ = sched.stage.set(stage.clone());
         let s = sched.clone();
-        tasks.spawn(crate::postprocess::run(stage, move || s.stopping()));
+        tasks.spawn(named!("the stage".into(), crate::postprocess::run(stage, move || s.stopping())));
     }
     if config.predb.enabled {
         let started = crate::predb::Service::start(crate::predb::ServiceParams {
@@ -983,43 +1020,58 @@ async fn run_servers(
                 let _ = sched.predb.set(service.clone());
                 let s = sched.clone();
                 // in `tasks`: no connection of its outlives this, soo a compaction's checkpoint never meets one
-                tasks.spawn(crate::predb::run(service, move || s.stopping()));
+                tasks.spawn(named!("predb".into(), crate::predb::run(service, move || s.stopping())));
             }
             Err(e) => eprintln!("predb: {e:#}"),
         }
     }
     if config.postprocess.enabled && config.media.any_provider() {
         let s = sched.clone();
-        tasks.spawn(crate::media::run(crate::media::shared(), db.clone(), move || s.stopping()));
+        tasks
+            .spawn(named!("media".into(), crate::media::run(crate::media::shared(), db.clone(), move || s.stopping())));
     }
     for &(server, count) in &plan {
         for _ in 0..count {
-            tasks.spawn(worker(sched.clone(), server, db.clone()));
+            tasks.spawn(named!(
+                format!("a worker on {}", sched.ctx.pool.host(server)),
+                worker(sched.clone(), server, db.clone()),
+            ));
         }
     }
+    // set once stopping: the long scans of every shard (`repair::reading_until`) give up instead of holding the stop
+    let scans_stop = Arc::new(AtomicBool::new(false));
     // which groups the big releases come from, for the backfill to take first, and the live passes
     {
         let s = sched.clone();
-        tasks.spawn(crate::repair::count_media_every(db.clone(), move || s.stopping()));
-        tasks.spawn(follow_media(sched.clone(), db.clone()));
+        tasks.spawn(named!(
+            "the count of big releases".into(),
+            crate::repair::count_media_every(db.clone(), move || s.stopping(), scans_stop.clone()),
+        ));
+        tasks.spawn(named!("follow_media".into(), follow_media(sched.clone(), db.clone())));
     }
     // parts one server's listing left out, read again from another (see `repair`)
     if sched.ctx.pool.indexing_servers().len() > 1 {
         let s = sched.clone();
         let settings = settings_of(config);
-        tasks.spawn(crate::repair::run(sched.ctx.clone(), settings, db.clone(), move || s.stopping()));
+        tasks.spawn(named!(
+            "repair".into(),
+            crate::repair::run(sched.ctx.clone(), settings, db.clone(), move || s.stopping(), scans_stop.clone()),
+        ));
     }
     // once stopping, the writers do no freezing: their queues of saves drain as fast as they did before it
     let s = sched.clone();
+    let since = stopping_since.clone();
     tasks.spawn(async move {
         while !s.stopping() {
             nap(Duration::from_secs(1), || s.stopping()).await;
         }
+        let _ = since.set(Instant::now());
+        scans_stop.store(true, Ordering::Relaxed);
         crate::frozen::STOPPING.store(true, Ordering::Relaxed);
     });
-    tasks.spawn(watch_config(sched.clone(), servers));
-    tasks.spawn(report(sched.clone()));
-    tasks.spawn(compact_timer(sched.clone()));
+    tasks.spawn(named!("the config watcher".into(), watch_config(sched.clone(), servers)));
+    tasks.spawn(named!("the status report".into(), report(sched.clone())));
+    tasks.spawn(named!("the compaction timer".into(), compact_timer(sched.clone())));
 
     // the workers and the config watcher all stop on `stopping()`
     while tasks.join_next().await.is_some() {
@@ -1027,11 +1079,21 @@ async fn run_servers(
             sched.wind_down.store(true, Ordering::Relaxed);
         }
     }
+    // how long each part of a stop takes, from when it was asked for
+    let stop_log = |what: &str| {
+        if let Some(since) = stopping_since.get() {
+            println!("[STOP] {what} {:.1}s after the stop", since.elapsed().as_secs_f64());
+        }
+    };
+    stop_log("workers, the stage and the other tasks done");
 
+    // the last clone of the db waits for the writers (one may be sealing); the checkpointer goes on meanwhile
+    let _ = tokio::task::spawn_blocking(move || drop(db)).await;
+    stop_log("writers drained");
+    // its last checkpoints after the writers: with them still writing, each waited out its busy timeout
     checkpoint_stop.store(true, Ordering::Relaxed);
     let _ = tokio::task::spawn_blocking(move || checkpointer.join()).await;
-    // the last clone of the db waits for the writers (one may be sealing)
-    let _ = tokio::task::spawn_blocking(move || drop(db)).await;
+    stop_log("checkpointer done");
     sched.compact_due.load(Ordering::Relaxed)
 }
 
@@ -1365,6 +1427,7 @@ mod tests {
             skip: Default::default(),
             chunk_errors: Default::default(),
             sweeping: Default::default(),
+            chunking: Default::default(),
             wait_until: Default::default(),
             errors: Default::default(),
             failed: Default::default(),
@@ -1514,6 +1577,36 @@ mod tests {
             // one sweeper per server: the others keep to their groups
             assert!(matches!(next_work(&sched, server, &db, false).await, Some(Work::Group(_))));
             assert!(matches!(next_work(&sched, server, &db, false).await, Some(Work::Group(_))));
+        });
+    }
+
+    /// one worker a server runs a day chunk ahead of its due groups, the others keep to their groups, and that worker
+    /// takes a due group of its own next
+    #[test]
+    fn one_worker_a_server_runs_a_day_chunk_ahead_of_due_groups() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        db::create_db_at(&main).unwrap();
+        let pool = Pool::new(&[UsenetServer::new("a.test", "u", "p", 119), UsenetServer::new("b.test", "u", "p", 119)]);
+        let conn = db::open_at(&main).unwrap();
+        crate::chunks::add(&conn, "split", 20_000, 19_990).unwrap();
+        let server = pool.pick_server("split");
+        let homes: Vec<String> =
+            (0..).map(|i| format!("home{i}")).filter(|g| pool.pick_server(g) == server).take(4).collect();
+        let mut groups = homes.clone();
+        groups.push("split".into());
+        let sched = scheduler(pool, groups);
+        let db = shared_db(conn);
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let first = next_work(&sched, server, &db, false).await;
+            assert!(matches!(&first, Some(Work::Chunk(c, true)) if c.group == "split" && c.day == 20_000));
+            // the slot is taken: the next workers keep to their groups
+            assert!(matches!(next_work(&sched, server, &db, false).await, Some(Work::Group(_))));
+            // the slot given back, that worker takes a group of its own first
+            sched.chunking.lock().unwrap().remove(&server);
+            assert!(matches!(next_work(&sched, server, &db, true).await, Some(Work::Group(_))));
+            assert!(matches!(next_work(&sched, server, &db, false).await, Some(Work::Chunk(_, true))));
         });
     }
 

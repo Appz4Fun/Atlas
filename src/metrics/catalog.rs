@@ -584,11 +584,106 @@ fn read_quick(main: &Path) {
             BACKFILL_GROUPS.set(&[("state", "all")], groups as f64);
             BACKFILL_GROUPS.set(&[("state", "splitting")], splitting as f64);
         }
+        if freeze_due() {
+            read_freeze_queues(main);
+        }
+        if has_table(&conn, "groups")? {
+            report_groups(&db::group_progress(&conn)?, &crate::chunks::per_group(&conn)?);
+        }
         Ok(())
     };
     if let Err(e) = read() {
         println!("metrics: couldnt read the database totals: {e}");
     }
+}
+
+/// how often the freeze queues are counted: a count is a scan of millions of rows, about 2 s of disk a shard on prod
+const FREEZE_EVERY: Duration = Duration::from_secs(300);
+
+/// Whether the freeze queues are due a count, and if soo, the next one waits `FREEZE_EVERY`.
+fn freeze_due() -> bool {
+    static LAST: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+    let mut last = LAST.lock().unwrap();
+    if last.is_some_and(|t| t.elapsed() < FREEZE_EVERY) {
+        return false;
+    }
+    *last = Some(Instant::now());
+    true
+}
+
+/// Each shard's freeze queue: how many are queued, how many have waited `wait_hours`, and the oldest. Read only, a
+/// connection a shard; a shard that can't be read keeps its last reading.
+fn read_freeze_queues(main: &Path) {
+    let now = chrono::Utc::now().timestamp();
+    let ready = now - crate::frozen::WAIT_SECS.load(Relaxed);
+    for (i, path) in store::shard_paths(main).iter().enumerate() {
+        let shard = i.to_string();
+        let read = || -> rusqlite::Result<(i64, i64, Option<i64>)> {
+            let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+            if !has_table(&conn, "freeze_pending")? {
+                return Ok((0, 0, None));
+            }
+            conn.query_row(
+                "select count(*), (select count(*) from freeze_pending where at <= ?1), min(at) from freeze_pending",
+                [ready],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+        };
+        match read() {
+            Ok((queued, due, oldest)) => {
+                FREEZE_PENDING.set(&[("shard", &shard), ("state", "queued")], queued as f64);
+                FREEZE_PENDING.set(&[("shard", &shard), ("state", "ready")], due as f64);
+                match oldest {
+                    Some(at) => FREEZE_PENDING_OLDEST.set(&[("shard", &shard)], at as f64),
+                    None => FREEZE_PENDING_OLDEST.replace(
+                        FREEZE_PENDING_OLDEST.rows().into_iter().filter(|(k, _)| *k != label_key(&[("shard", &shard)])),
+                    ),
+                }
+            }
+            Err(e) => println!("metrics: couldnt count shard {i}'s freeze queue: {e}"),
+        }
+    }
+}
+
+/// Each group's backfill and live progress, as whole readings: a group gone from the database goes from them too.
+fn report_groups(progress: &[db::GroupProgress], chunks: &BTreeMap<String, crate::chunks::GroupChunks>) {
+    let counts: BTreeMap<String, (i64, i64)> = chunks.iter().map(|(g, c)| (g.clone(), (c.done, c.total))).collect();
+    let (mut articles, mut backfill, mut posted) = (Vec::new(), Vec::new(), Vec::new());
+    for (group, (total, covered, row)) in db::best_progress(progress, &counts) {
+        let key = |name: &str, value: &str| label_key(&[("group", &group), (name, value)]);
+        let marks = [("first", row.first), ("last", row.last)]
+            .into_iter()
+            .chain([("backfill_cursor", Some(row.backfill_cursor)), ("live_cursor", Some(row.live_cursor))]);
+        for (mark, n) in marks {
+            if let Some(n) = n {
+                articles.push((key("mark", mark), n as f64));
+            }
+        }
+        backfill.push((key("state", "total"), total as f64));
+        backfill.push((key("state", "covered"), covered as f64));
+        for (end, dated) in [("oldest", row.low), ("newest", row.high)] {
+            if let Some((_, at)) = dated {
+                posted.push((key("end", end), at as f64));
+            }
+        }
+    }
+    let (mut chunk_counts, mut days) = (Vec::new(), Vec::new());
+    for (group, c) in chunks {
+        let key = |name: &str, value: &str| label_key(&[("group", group), (name, value)]);
+        chunk_counts.push((key("state", "done"), c.done as f64));
+        chunk_counts.push((key("state", "total"), c.total as f64));
+        let day = |d: i64| (d * 86_400) as f64;
+        days.push((key("day", "oldest"), day(c.oldest_day)));
+        days.push((key("day", "newest"), day(c.newest_day)));
+        if let Some(d) = c.oldest_done_day {
+            days.push((key("day", "oldest_done"), day(d)));
+        }
+    }
+    GROUP_ARTICLE.replace(articles);
+    GROUP_BACKFILL.replace(backfill);
+    GROUP_POSTED.replace(posted);
+    GROUP_CHUNKS.replace(chunk_counts);
+    GROUP_CHUNK_DAYS.replace(days);
 }
 
 fn nap(how_long: Duration, stop: &AtomicBool) {
@@ -651,6 +746,69 @@ fn walk_forever(main: &Path, every: Duration, stop: &AtomicBool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn freeze_queues_are_counted_per_shard_with_those_past_the_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        let s0 = Connection::open(&store::shard_paths(&main)[0]).unwrap();
+        s0.execute_batch("create table freeze_pending (release_id integer primary key, reason text, at integer)")
+            .unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let wait = crate::frozen::WAIT_SECS.load(Relaxed);
+        for (id, at) in [(1, now - wait - 10), (2, now - wait - 5), (3, now)] {
+            s0.execute("insert into freeze_pending values (?1, 'not_tv_movies', ?2)", params![id, at]).unwrap();
+        }
+        read_freeze_queues(&main);
+        let rows: BTreeMap<String, f64> = FREEZE_PENDING.rows().into_iter().collect();
+        assert_eq!(rows[r#"shard="0",state="queued""#], 3.0);
+        assert_eq!(rows[r#"shard="0",state="ready""#], 2.0);
+        let oldest: BTreeMap<String, f64> = FREEZE_PENDING_OLDEST.rows().into_iter().collect();
+        assert_eq!(oldest[r#"shard="0""#], (now - wait - 10) as f64);
+        assert!(!rows.contains_key(r#"shard="1",state="queued""#), "a shard that cant be opened is left out");
+    }
+
+    #[test]
+    fn groups_report_the_row_furthest_along_and_split_groups_by_their_chunks() {
+        let row = |key: &str, live, backfill, low: Option<(i64, i64)>| db::GroupProgress {
+            key: key.into(),
+            live_cursor: live,
+            backfill_cursor: backfill,
+            first: Some(1),
+            last: Some(1000),
+            low,
+            high: Some((live, 1_790_000_000)),
+        };
+        let progress = [
+            row("a.b.one@news.x", 1000, 900, Some((901, 1_780_000_000))),
+            row("a.b.one@news.y", 1000, 500, Some((501, 1_770_000_000))),
+            row("a.b.split", 990, 990, None),
+        ];
+        let split = crate::chunks::GroupChunks {
+            done: 1,
+            total: 4,
+            oldest_day: 20_000,
+            newest_day: 20_003,
+            oldest_done_day: Some(20_003),
+        };
+        report_groups(&progress, &BTreeMap::from([("a.b.split".to_string(), split)]));
+        let rows: BTreeMap<String, f64> = GROUP_BACKFILL.rows().into_iter().collect();
+        assert_eq!(rows[r#"group="a.b.one",state="covered""#], 500.0, "news.y is further along");
+        assert_eq!(rows[r#"group="a.b.one",state="total""#], 1000.0);
+        assert_eq!(rows[r#"group="a.b.split",state="covered""#], 250.0, "one of four days");
+        let articles: BTreeMap<String, f64> = GROUP_ARTICLE.rows().into_iter().collect();
+        assert_eq!(articles[r#"group="a.b.one",mark="backfill_cursor""#], 500.0);
+        assert_eq!(articles[r#"group="a.b.split",mark="last""#], 1000.0);
+        let posted: BTreeMap<String, f64> = GROUP_POSTED.rows().into_iter().collect();
+        assert_eq!(posted[r#"group="a.b.one",end="oldest""#], 1_770_000_000.0);
+        assert!(!posted.contains_key(r#"group="a.b.split",end="oldest""#), "no dated end, no reading");
+        let days: BTreeMap<String, f64> = GROUP_CHUNK_DAYS.rows().into_iter().collect();
+        assert_eq!(days[r#"group="a.b.split",day="oldest_done""#], 20_003.0 * 86_400.0);
+
+        report_groups(&progress[..1], &BTreeMap::new());
+        assert!(GROUP_BACKFILL.rows().iter().all(|(k, _)| !k.contains("a.b.split")), "gone groups go");
+        assert!(GROUP_CHUNKS.rows().is_empty());
+    }
 
     #[test]
     fn release_group_reads_scene_names() {

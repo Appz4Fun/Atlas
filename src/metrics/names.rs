@@ -90,8 +90,12 @@ families! {
 
     // post-processing
     STEP_RUNS "atlas_step_runs_total" Counter &[], "Runs of each processing step, by result.";
+    STEP_PANICS "atlas_step_panics_total" Counter &[], "Runs of each processing step that panicked; atlas_step_runs_total counts them as retry.";
     STAGE_QUEUE "atlas_stage_queue" Gauge &[], "Releases waiting for the processing stage: due, net_wanted, failed.";
     STAGE_WALK "atlas_stage_walk" Gauge &[], "How far the backlog walks have come, in release ids: done, total.";
+    STAGE_NET_CLAIMS "atlas_stage_net_claims" Gauge &[], "Net lane claims running now, per shard.";
+    STAGE_NET_CLAIMS_LIMIT "atlas_stage_net_claims_limit" Gauge &[], "Net lane claims a shard may run at once (net_claims_per_shard).";
+    STAGE_LANE "atlas_stage_lane_total" Counter &[], "What each shard's lanes got through: net_visits, net_finished, queue_taken, walk_rows.";
     STAGE_REJECTED "atlas_stage_rejected_total" Counter &[], "Releases the stage's rules rejected, by reason.";
     STAGE_EVENTS "atlas_stage_events_total" Counter &[], "Stage events: steps_done, matched, unmatched, retries, rows_walked, errors.";
     STAGE_BODIES "atlas_stage_bodies_total" Counter &[], "Article bodies the stage has fetched.";
@@ -134,6 +138,13 @@ families! {
     DB_TOTALS "atlas_db_rows" Gauge &[], "Running totals the shards keep: releases, articles.";
     BACKFILL_CHUNKS "atlas_backfill_chunks" Gauge &[], "Backfill day chunks: done, total, done_last_hour.";
     BACKFILL_GROUPS "atlas_backfill_groups" Gauge &[], "Groups with day chunks: all, splitting.";
+    FREEZE_PENDING "atlas_freeze_pending" Gauge &[], "Releases queued to freeze per shard (queued), and of them those past wait_hours (ready). Every 5 minutes.";
+    FREEZE_PENDING_OLDEST "atlas_freeze_pending_oldest_timestamp_seconds" Gauge &[], "When each shard's longest queued release was queued.";
+    GROUP_ARTICLE "atlas_group_article_number" Gauge &[], "Each group's article numbers: the server's first and last at its last pass, and the backfill and live cursors.";
+    GROUP_BACKFILL "atlas_group_backfill_articles" Gauge &[], "Each group's article numbers on the server (total) and how many are indexed (covered); day chunks count for split groups.";
+    GROUP_POSTED "atlas_group_posted_timestamp_seconds" Gauge &[], "When the oldest and newest article indexed in each group was posted.";
+    GROUP_CHUNKS "atlas_group_backfill_chunks" Gauge &[], "Each split group's day chunks: done, total.";
+    GROUP_CHUNK_DAYS "atlas_group_backfill_day_timestamp_seconds" Gauge &[], "Each split group's day chunks: the oldest and newest day, and the oldest day done (backfill goes newest first).";
 
     // the sealed log, see `sealed_store`; calls are timed as functions sealed_log.*
     SEALED_LOG_CONNECTS "atlas_sealed_log_connects_total" Counter &[], "Connections made to the sealed log service, by result.";

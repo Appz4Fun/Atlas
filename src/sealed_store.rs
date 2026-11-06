@@ -102,8 +102,11 @@ pub fn has_places(conn: &rusqlite::Connection) -> rusqlite::Result<bool> {
 }
 
 /// One batch of `shard`'s sealed blobs past `after` moved. Returns the last file
-/// looked at, none when the shard has no more, and the bytes moved.
-pub fn offload_batch(shard: &Path, after: i64) -> anyhow::Result<(Option<i64>, u64)> {
+/// looked at, none when the shard has no more, and the bytes moved. Once `stop`
+/// is set it sends no more and takes no lock: what was appended goes unused,
+/// and the batch is moved again from `after` next time, soo a stop doesnt wait on
+/// up to `BATCH_BYTES` read back over the network and the shard's write lock.
+pub fn offload_batch(shard: &Path, after: i64, stop: &AtomicBool) -> anyhow::Result<(Option<i64>, u64)> {
     let conn = crate::db::open_at(shard)?;
     let mut stmt = conn.prepare_cached(
         "select id, blob from files
@@ -131,6 +134,9 @@ pub fn offload_batch(shard: &Path, after: i64) -> anyhow::Result<(Option<i64>, u
     metrics::function_bytes("sealed_log.append", "sent", bytes as u64);
     // in the log now, whatever happens next: a retry sends it again
     names::SEALED_LOG_OFFLOAD_BYTES.inc(&[("kind", "sent")], bytes as u64);
+    if stop.load(Ordering::Relaxed) {
+        return Ok((Some(after), 0));
+    }
     // only what comes back the same replaces anything
     let back = with_client("sealed_log.verify", |c| c.read(&places))?;
     metrics::function_bytes("sealed_log.verify", "received", bytes as u64);
@@ -141,6 +147,9 @@ pub fn offload_batch(shard: &Path, after: i64) -> anyhow::Result<(Option<i64>, u
         anyhow::ensure!(blob == value, "file {id} came back from the sealed log different");
     }
 
+    if stop.load(Ordering::Relaxed) {
+        return Ok((Some(after), 0));
+    }
     let (swapped, changed, freed) = metrics::timed("sealed_log.swap", || swap_in(&conn, &batch, &places))?;
     names::SEALED_LOG_OFFLOAD_FILES.inc(&[("result", "moved")], swapped);
     names::SEALED_LOG_OFFLOAD_FILES.inc(&[("result", "changed")], changed);
@@ -271,7 +280,7 @@ fn sweep(main: &Path, mb_per_second: u64, stop: &AtomicBool, once: bool) -> u64 
             }
             let started = Instant::now();
             set_state("moving");
-            match metrics::timed("sealed_log.offload_batch", || offload_batch(shard, after)) {
+            match metrics::timed("sealed_log.offload_batch", || offload_batch(shard, after, stop)) {
                 Ok((last, bytes)) => {
                     moved += bytes;
                     *cursor = last;
@@ -370,7 +379,7 @@ mod tests {
 
         // nowhere to send it: an error, and the blob stays
         configure("");
-        assert!(offload_batch(&shard, 0).is_err());
+        assert!(offload_batch(&shard, 0, &AtomicBool::new(false)).is_err());
         assert_eq!(read(1), big);
 
         let log = sealed_log::Log::open(&dir.join("log")).unwrap();
@@ -378,7 +387,7 @@ mod tests {
         configure(&listener.local_addr().unwrap().to_string());
         std::thread::spawn(move || sealed_log::serve(log, listener));
 
-        let (last, bytes) = offload_batch(&shard, 0).unwrap();
+        let (last, bytes) = offload_batch(&shard, 0, &AtomicBool::new(false)).unwrap();
         assert_eq!((last, bytes), (Some(1), big.len() as u64));
         assert!(blob::is_remote(&read(1)), "swapped for its place");
         assert!(read(1).len() < big.len());
@@ -399,13 +408,21 @@ mod tests {
             std::thread::sleep(Duration::from_millis(300));
             writer.execute_batch("commit").unwrap();
         });
-        assert!(offload_batch(&shard, 2).unwrap().0.is_some());
+        assert!(offload_batch(&shard, 2, &AtomicBool::new(false)).unwrap().0.is_some());
         release.join().unwrap();
         assert!(blob::is_remote(&read(3)));
         assert_eq!(blob::decode(&read(3)).unwrap(), blob::decode(&recent).unwrap());
 
+        // stopping: appended maybe, but nothing swapped and the cursor stays, then moved on the next run
+        let late = incompressible();
+        conn.execute(insert, params![5, 100, late]).unwrap();
+        assert_eq!(offload_batch(&shard, 4, &AtomicBool::new(true)).unwrap(), (Some(4), 0));
+        assert_eq!(read(5), late, "not swapped while stopping");
+        assert_eq!(offload_batch(&shard, 4, &AtomicBool::new(false)).unwrap().0, Some(5));
+        assert!(blob::is_remote(&read(5)));
+
         // the next sweep has nothing to do
-        assert_eq!(offload_batch(&shard, 0).unwrap(), (None, 0));
+        assert_eq!(offload_batch(&shard, 0, &AtomicBool::new(false)).unwrap(), (None, 0));
 
         // and what it did is on /metrics
         let out = crate::metrics::render();

@@ -22,6 +22,8 @@ const LOAD_NS: [(&str, &str); 7] = [
     ("lease_wait_ns", "connection_wait"),
     ("parse_ns", "parse"),
 ];
+/// the stage's lanes, per shard: `postprocess::stats::Lanes`
+const LANES: [&str; 4] = ["net_visits", "net_finished", "queue_taken", "walk_rows"];
 const LOAD_EVENTS: [&str; 7] = [
     "writer_batches",
     "writer_slices",
@@ -188,6 +190,18 @@ fn report_stage(stage: &Value, pool: u64) {
         for (reason, n) in rejected {
             grow(&STAGE_REJECTED, &[("reason", reason)], pool, total(n));
         }
+    }
+    for lane in LANES {
+        let Some(shards) = stage["lane_totals"][lane].as_array() else { continue };
+        for (shard, n) in shards.iter().enumerate() {
+            grow(&STAGE_LANE, &[("shard", &shard.to_string()), ("lane", lane)], pool, total(n));
+        }
+    }
+    if let Some(running) = stage["net_claims"]["running"].as_array() {
+        let rows =
+            running.iter().enumerate().map(|(shard, n)| (label_key(&[("shard", &shard.to_string())]), int(n) as f64));
+        STAGE_NET_CLAIMS.replace(rows.collect::<Vec<_>>());
+        STAGE_NET_CLAIMS_LIMIT.set(&[], int(&stage["net_claims"]["most"]) as f64);
     }
     grow(&STAGE_BODIES, &[], pool, total(&stage["bodies"]));
     grow(&STAGE_BODY_BYTES, &[], pool, total(&stage["body_bytes"]));
