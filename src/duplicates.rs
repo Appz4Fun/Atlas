@@ -1,6 +1,7 @@
-//! Other postings of the same content. A **twin** has the same posted files, proven by PAR2 hashes, soo
-//! its articles can stand in for this one's. An **alt** holds the same files packed differently, soo
-//! it's another whole download, not a source of articles.
+//! Other postings of the same content. An **xpost** is the same upload seen in another group: the very same
+//! articles, by message-id. A **twin** is another upload of the same posted files, proven by PAR2 hashes, soo its
+//! articles can stand in for this one's. An **alt** holds the same files packed differently, soo it's another whole
+//! download, not a source of articles.
 //!
 //! Each release keeps two fingerprints in its shard, and copies are found by looking them up in every
 //! shard, soo there are no clusters to keep in step: purging a release takes its row with it.
@@ -196,10 +197,50 @@ pub fn content_fingerprint<'a>(files: impl Iterator<Item = (&'a str, Option<u64>
     Some(sha.finalize().to_vec())
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// What another posting is to a release, in the order a page lists them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Copy {
+    /// the same upload in another group: the same articles under the same message-ids
+    Xpost,
+    /// another upload of the same files, cut up the same way: other message-ids, the same bytes
     Twin,
     Alt,
+}
+
+/// Whether two releases hold the same articles: a file of one starts with the very message-id a file of the other
+/// does. Message-ids are unique, soo that's one upload crossposted to both groups, not two uploads of the same bytes.
+/// A file's first message-id is that of its lowest part seen, soo a copy missing a file's first part can still tie
+/// by another file. False when either is gone or a shard hasn't got the table.
+pub fn shares_articles(conn: &Connection, a: i64, b: i64) -> bool {
+    let (sa, sb) = (store::shard_of_id(a), store::shard_of_id(b));
+    let sql = format!(
+        "select 1 from s{sb}.files where release_id = ?2 and subject_mid in
+             (select subject_mid from s{sa}.files where release_id = ?1 and subject_mid is not null)
+         limit 1"
+    );
+    conn.prepare_cached(&sql).and_then(|mut stmt| stmt.exists(rusqlite::params![a, b])).unwrap_or(false)
+}
+
+/// How many other releases with this posted fingerprint hold `id`'s very articles, over every shard and uncapped,
+/// soo it can be taken from a tally of the fingerprint.
+fn count_xposts(conn: &Connection, id: i64, posted: &[u8]) -> i64 {
+    let own = store::shard_of_id(id);
+    (0..store::SHARDS)
+        .filter_map(|s| {
+            let sql = format!(
+                "select count(*) from s{s}.release_fingerprint f where f.posted = ?1 and f.release_id != ?2
+                 and exists (select 1 from s{s}.files x where x.release_id = f.release_id and x.subject_mid in
+                     (select subject_mid from s{own}.files where release_id = ?2 and subject_mid is not null))"
+            );
+            // a shard that hasn't got the tables yet has none
+            conn.query_row(&sql, rusqlite::params![posted, id], |r| r.get::<_, i64>(0)).ok()
+        })
+        .sum()
+}
+
+/// Of these copies of `id` proven to hold the same files, an xpost when it shares articles with `id`, else a twin.
+fn same_files_kind(conn: &Connection, id: i64, other: i64) -> Copy {
+    if shares_articles(conn, id, other) { Copy::Xpost } else { Copy::Twin }
 }
 
 fn matching(conn: &Connection, column: &str, fingerprint: &[u8], id: i64) -> db::Result<Vec<i64>> {
@@ -246,7 +287,7 @@ pub fn twins_with(conn: &Connection, id: i64) -> db::Result<Vec<i64>> {
     }
 }
 
-/// The other postings of a release's content, twins first.
+/// The other postings of a release's content: xposts, then twins, then alts.
 pub fn copies_with(conn: &Connection, id: i64) -> db::Result<Vec<(Copy, ReleaseRow)>> {
     let (_, content) = fingerprints_with(conn, id)?;
     let twins = twins_with(conn, id)?;
@@ -257,16 +298,18 @@ pub fn copies_with(conn: &Connection, id: i64) -> db::Result<Vec<(Copy, ReleaseR
     let mut out = Vec::new();
     for twin in &twins {
         if let Some(release) = get_release_with(conn, *twin)? {
-            out.push((Copy::Twin, release));
+            out.push((same_files_kind(conn, id, *twin), release));
         }
     }
     for file_twin in file_twins_with(conn, id) {
         if !twins.contains(&file_twin.id)
             && let Some(release) = get_release_with(conn, file_twin.id)?
         {
-            out.push((Copy::Twin, release));
+            out.push((same_files_kind(conn, id, file_twin.id), release));
         }
     }
+    // the same upload first: it's this release, seen in another group
+    out.sort_by_key(|(kind, _)| *kind);
     let listed: HashSet<i64> = out.iter().map(|(_, r)| r.id).collect();
     for alt in alts.iter().filter(|alt| !listed.contains(alt)) {
         if let Some(release) = get_release_with(conn, *alt)? {
@@ -363,6 +406,9 @@ pub fn clusters_with(
 /// How many other copies a release has.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CopyCount {
+    /// the same upload in other groups
+    pub xposts: i64,
+    /// other uploads of the same files
     pub twins: i64,
     pub alts: i64,
 }
@@ -456,8 +502,14 @@ pub fn counts_with(conn: &Connection, ids: &[i64]) -> db::Result<HashMap<i64, Co
             _ => 0,
         };
         let alts = c.as_ref().and_then(|c| content.get(c)).map_or(0, |n| (n - 1 - same_posting).max(0));
-        if twins > 0 || alts > 0 {
-            out.insert(*id, CopyCount { twins, alts });
+        // of those with the same posted files, the ones holding this release's very articles are it, crossposted
+        let xposts = match p {
+            Some(p) if twins > 0 => count_xposts(conn, *id, p),
+            _ => 0,
+        };
+        let twins = (twins - xposts).max(0);
+        if xposts > 0 || twins > 0 || alts > 0 {
+            out.insert(*id, CopyCount { xposts, twins, alts });
         }
     }
     Ok(out)
@@ -518,6 +570,113 @@ fn is_sidecar(name: &str) -> bool {
     [".par2", ".nfo", ".sfv", ".srr", ".srs", ".txt"].iter().any(|ext| lower.ends_with(ext))
 }
 
+/// A password found on one posting, shown on another that holds the same bytes: an xpost or twin of it. The same
+/// archive bytes take the same password, soo it carries as it was found; whether it works was only ever tried on
+/// the posting it came from.
+pub struct Inherited {
+    pub hint: crate::release_info::PasswordHint,
+    /// the posting it was found on
+    pub from: i64,
+    pub from_name: String,
+}
+
+/// The most copies looked at for a password to carry over: the first ones with one of their own answer.
+const MAX_PASSWORD_SOURCES: usize = 12;
+
+/// The password a release's own names, NFO and files hint at, or else the name its PAR2 set gives its files when
+/// they were posted under another (`par2_name_password`).
+pub fn own_password_hint(
+    conn: &Connection,
+    id: i64,
+    names: Option<&crate::release_info::Names>,
+) -> Option<crate::release_info::PasswordHint> {
+    crate::release_info::password_hint_with(conn, id, names).or_else(|| par2_name_password(conn, id))
+}
+
+/// Whether two postings are proven to hold the same whole payload, not just a file of it: the same posted fingerprint
+/// (set, names, part counts and hashes), or sets that describe the very same data files, sidecars aside, by size and
+/// MD5. A file twin by an NFO alone, or by one volume of two archives, isn't, soo nothing is carried between those.
+pub fn same_payload(conn: &Connection, a: i64, b: i64) -> bool {
+    if let (Ok((Some(pa), _)), Ok((Some(pb), _))) = (fingerprints_with(conn, a), fingerprints_with(conn, b))
+        && pa == pb
+    {
+        return true;
+    }
+    let data = |id: i64| {
+        let mut files: Vec<(u64, [u8; 16])> = crate::archive::store::par2_files_with(conn, id)
+            .into_iter()
+            .filter(|f| f.bound && !is_sidecar(&f.name))
+            .map(|f| (f.size, f.md5))
+            .collect();
+        files.sort_unstable();
+        files.dedup();
+        files
+    };
+    let mine = data(a);
+    !mine.is_empty() && mine == data(b)
+}
+
+/// The password `id`'s xposts and twins carry to it: of those holding its whole payload (`same_payload`), the first
+/// with a password hint of its own.
+pub fn carried_password(conn: &Connection, id: i64, copies: &[(Copy, ReleaseRow)]) -> Option<Inherited> {
+    first_password(conn, carriers(conn, id, copies).iter().copied())
+}
+
+/// The copies of `id` a password carries to and from: xposts and twins holding its whole payload.
+pub fn carriers<'a>(conn: &Connection, id: i64, copies: &'a [(Copy, ReleaseRow)]) -> Vec<&'a ReleaseRow> {
+    copies
+        .iter()
+        .filter(|(kind, r)| matches!(kind, Copy::Xpost | Copy::Twin) && same_payload(conn, id, r.id))
+        .map(|(_, r)| r)
+        .collect()
+}
+
+/// Of these postings, every one holding the same bytes, the first with a password hint of its own.
+pub fn first_password<'a>(conn: &Connection, rows: impl IntoIterator<Item = &'a ReleaseRow>) -> Option<Inherited> {
+    rows.into_iter().take(MAX_PASSWORD_SOURCES).find_map(|r| {
+        let names = crate::release_info::names_with(conn, r.id).ok().flatten();
+        own_password_hint(conn, r.id, names.as_ref()).map(|hint| Inherited {
+            hint,
+            from: r.id,
+            from_name: r.name.clone(),
+        })
+    })
+}
+
+/// The name a release's PAR2 set gives its archive, when the volumes were posted under another: a repost that
+/// renamed the files kept the set made for the first upload, and an uploader that names an archive and its password
+/// from one random string leaves the password there. Only a generated-looking name counts (letters and digits,
+/// mixed case, 10 to 64 of them), and only one archive's volumes, every one renamed: a set of unpacked files has none.
+pub fn par2_name_password(conn: &Connection, id: i64) -> Option<crate::release_info::PasswordHint> {
+    let set = crate::archive::store::par2_files_with(conn, id);
+    let data: Vec<&crate::par2::Par2File> = set.iter().filter(|f| f.bound && !is_sidecar(&f.name)).collect();
+    // an unpacked file posted under another name has no password to give: only archive volumes are named for one
+    if !data.iter().all(|f| is_archive(&f.name)) {
+        return None;
+    }
+    let mut stems = data.iter().map(|f| volume_set(&f.name));
+    let stem = stems.next()?;
+    if !stems.all(|other| other == stem) || !looks_generated(stem) {
+        return None;
+    }
+    let s = store::shard_of_id(id);
+    let mut stmt = conn.prepare(&format!("select filename from s{s}.files where release_id = ?")).ok()?;
+    let posted: Vec<String> = stmt.query_map([id], |r| r.get(0)).ok()?.filter_map(Result::ok).collect();
+    // posted under the set's own name: nothing was renamed, soo the name says nothing more than it did
+    if posted.is_empty() || posted.iter().any(|name| volume_set(name).eq_ignore_ascii_case(stem)) {
+        return None;
+    }
+    Some(crate::release_info::PasswordHint { password: stem.to_string(), source: "the PAR2 set's file names" })
+}
+
+/// A name an uploader made up, not a title: letters and digits only, both cases.
+fn looks_generated(stem: &str) -> bool {
+    (10..=64).contains(&stem.len())
+        && stem.bytes().all(|b| b.is_ascii_alphanumeric())
+        && stem.bytes().any(|b| b.is_ascii_uppercase())
+        && stem.bytes().any(|b| b.is_ascii_lowercase())
+}
+
 /// How many data files, sidecars aside, a release's set describes.
 fn data_files_in_set(conn: &Connection, id: i64) -> usize {
     crate::archive::store::par2_files_with(conn, id).iter().filter(|f| f.bound && !is_sidecar(&f.name)).count()
@@ -543,8 +702,10 @@ pub fn file_twins_with(conn: &Connection, id: i64) -> Vec<FileTwin> {
 }
 
 /// The posted name a set's name stands for among a release's articles: the same name, or the same but for case, or,
-/// when `one_file` (the set describes one data file), the one data file of a row that posted it under a random name.
-fn posted_name<'a>(articles: &'a [ArticleRow], name: &str, one_file: bool) -> Option<&'a str> {
+/// when `one_archive` (the set's names are one archive's volumes), the volume with the same ending under the one
+/// archive name this posting used, or, when `one_file` (the set describes one data file), the one data file of a row
+/// that posted it under a random name.
+fn posted_name<'a>(articles: &'a [ArticleRow], name: &str, one_file: bool, one_archive: bool) -> Option<&'a str> {
     let names: Vec<&str> = {
         let mut seen: Vec<&str> = articles.iter().filter_map(|a| a.filename.as_deref()).collect();
         seen.sort_unstable();
@@ -557,6 +718,9 @@ fn posted_name<'a>(articles: &'a [ArticleRow], name: &str, one_file: bool) -> Op
     if let Some(found) = names.iter().copied().find(|n| n.eq_ignore_ascii_case(name)) {
         return Some(found);
     }
+    if let Some(found) = renamed_volume(&names, name).filter(|_| one_archive) {
+        return Some(found);
+    }
     if !one_file || is_sidecar(name) {
         return None;
     }
@@ -565,6 +729,47 @@ fn posted_name<'a>(articles: &'a [ArticleRow], name: &str, one_file: bool) -> Op
         [one] => Some(one),
         _ => None,
     }
+}
+
+/// The posted name of a volume a set names under another archive name: a repost that renamed every volume of one
+/// archive (`YMFF.part001.rar` posted as `oCBv.part001.rar`) and kept the set made for the first upload. Only when
+/// the posting's data files are all volumes of one archive, soo the set's name and the posted one stand for the same
+/// thing, and only the volume with the very same ending.
+fn renamed_volume<'a>(names: &[&'a str], name: &str) -> Option<&'a str> {
+    if is_sidecar(name) {
+        return None;
+    }
+    let base = crate::archive::names::base_name(name);
+    let suffix = &base[volume_set(name).len()..];
+    if !is_volume_ending(suffix) {
+        return None;
+    }
+    let mut stems = names.iter().filter(|n| !is_sidecar(n)).map(|n| volume_set(n));
+    let posted = stems.next()?;
+    if !stems.all(|stem| stem == posted) {
+        return None;
+    }
+    names
+        .iter()
+        .copied()
+        .find(|n| !is_sidecar(n) && crate::archive::names::base_name(n)[posted.len()..].eq_ignore_ascii_case(suffix))
+}
+
+/// Whether what follows an archive's name is a volume's numbered ending: `.part001.rar`, `.r00`, `.z01`, `.7z.001` or
+/// `.001`. A plain `.mkv` says nothing about which file it is.
+fn is_volume_ending(suffix: &str) -> bool {
+    static VOLUME: LazyLock<Regex> = LazyLock::new(|| {
+        #[allow(clippy::unwrap_used)]
+        Regex::new(r"(?i)^\.(part\d+\.rar|r\d{2,}|z\d{2,}|7z\.\d+|\d{3,})$").unwrap()
+    });
+    VOLUME.is_match(suffix)
+}
+
+/// Whether a set's names, sidecars aside, are all volumes of one archive.
+fn one_archive<'a>(names: impl Iterator<Item = &'a str>) -> bool {
+    let mut stems = names.filter(|n| !is_sidecar(n)).map(volume_set);
+    let Some(first) = stems.next() else { return false };
+    stems.all(|stem| stem == first)
 }
 
 /// What articles were found to hold, by message-id: `(decoded length, CRC32)` from `segment_crc`, for the two
@@ -583,8 +788,13 @@ pub fn fill_gaps_from(
     known: &KnownCrcs,
 ) -> usize {
     let mut renamed: Vec<ArticleRow> = Vec::new();
+    // a renamed repost's volumes map by their endings only when each side's names are one archive's volumes
+    let theirs_one = one_archive(names.iter().map(|(theirs, _)| theirs.as_str()));
+    let mine_one = one_archive(names.iter().map(|(_, mine)| mine.as_str()));
     for (theirs, mine) in names {
-        let (Some(from), Some(to)) = (posted_name(twin, theirs, one_file), posted_name(own, mine, one_file)) else {
+        let (Some(from), Some(to)) =
+            (posted_name(twin, theirs, one_file, theirs_one), posted_name(own, mine, one_file, mine_one))
+        else {
             continue;
         };
         let to = to.to_string();
@@ -621,14 +831,48 @@ pub fn fill_from_copies_of(conn: &Connection, id: i64, rows: &[i64], own: &mut V
         known.extend(crate::archive::store::segment_crcs_with(conn, twin.id));
         added += fill_gaps_from(own, &store::articles(conn, twin.id)?, &twin.names, twin.one_file, &known);
     }
-    let mut seen: HashSet<i64> = HashSet::new();
+    let mut seen: HashSet<i64> = rows.iter().copied().collect();
     for twin in twins_with(conn, id)? {
         if seen.insert(twin) {
             known.extend(crate::archive::store::segment_crcs_with(conn, twin));
             added += fill_gaps_checked(own, &store::articles(conn, twin)?, &known);
         }
     }
+    // a file of the same size and whole-file CRC32 in a posting no fingerprint or set hash ties to this one: a repost
+    // under other names, or a set that hashes the same bytes differently. It lends by `fill_gaps`'s rules, soo only
+    // when it was cut up the same way, and only to a file of this release that is missing parts.
+    for mine in crate::keys::named_crc_files(conn, id) {
+        let Some(posted) = posted_name(own, &mine.name, false, false).map(str::to_string) else { continue };
+        if !has_gaps(own, &posted) {
+            continue;
+        }
+        for (donor, theirs) in crate::keys::crc_donors(conn, id, mine.file, mine.md5.as_deref()) {
+            if rows.contains(&donor) {
+                continue;
+            }
+            known.extend(crate::archive::store::segment_crcs_with(conn, donor));
+            let lent = fill_gaps_from(own, &store::articles(conn, donor)?, &[(theirs, posted.clone())], false, &known);
+            if lent > 0 {
+                crate::metrics::names::NZB_FILLED_BY_CRC.inc(&[], lent as u64);
+            }
+            added += lent;
+            if !has_gaps(own, &posted) {
+                break;
+            }
+        }
+    }
     Ok(added)
+}
+
+/// Whether the file posted as `name` is missing parts among `articles`: fewer distinct parts than its subject counts.
+fn has_gaps(articles: &[ArticleRow], name: &str) -> bool {
+    let mut parts: HashSet<i64> = HashSet::new();
+    let mut total = None;
+    for a in articles.iter().filter(|a| a.filename.as_deref() == Some(name)) {
+        parts.extend(a.part);
+        total = total.or(a.total_parts);
+    }
+    total.is_some_and(|t| (parts.len() as i64) < t)
 }
 
 /// `fill_gaps_checked` with nothing known about the articles' bytes.
@@ -695,8 +939,26 @@ pub fn fill_gaps_checked(own: &mut Vec<ArticleRow>, twin: &[ArticleRow], known: 
 
 /// Whether a twin of this release can lend it articles.
 pub fn can_fill(copies: &[(Copy, ReleaseRow)]) -> bool {
-    copies.iter().any(|(kind, _)| *kind == Copy::Twin)
+    // an xpost's row can have parts this group's listing missed: the same articles, read in another group
+    copies.iter().any(|(kind, _)| matches!(kind, Copy::Twin | Copy::Xpost))
 }
+
+/// For a cluster of postings with the same files, in order, which are an xpost of one listed before them: the same
+/// upload seen in another group. The rest are each a separate upload, twins of one another.
+pub fn xposts_of_earlier(conn: &Connection, members: &[ReleaseRow]) -> Vec<bool> {
+    // every member before it, not one of each upload: two rows can tie only through a third, as each file's first
+    // message-id is the lowest part that row saw, and crossposts can miss different parts in different groups
+    (0..members.len())
+        .map(|i| {
+            members[i.saturating_sub(MAX_XPOST_WITNESSES)..i]
+                .iter()
+                .any(|earlier| shares_articles(conn, earlier.id, members[i].id))
+        })
+        .collect()
+}
+
+/// How many members before it a cluster member is checked against: a cluster is rarely more than a few uploads.
+const MAX_XPOST_WITNESSES: usize = 64;
 
 /// A release's NZB, its gaps filled from its twins: what every NZB is now, kept for the page's own link to it.
 pub fn filled_nzb(id: i64) -> db::Result<Option<String>> {
@@ -724,6 +986,15 @@ mod tests {
             bound: true,
             crc32: None,
         }
+    }
+
+    #[test]
+    fn only_a_made_up_name_is_a_password_hint() {
+        assert!(looks_generated("YMFFZeoeVI6fG4iz"));
+        assert!(looks_generated("oCBvoIlhFvS0L3k1"));
+        assert!(!looks_generated("Gone.with.the.Wind.1939"), "a title");
+        assert!(!looks_generated("abcdefghijklmnop"), "one case");
+        assert!(!looks_generated("Short1"), "too short");
     }
 
     #[test]
@@ -859,6 +1130,45 @@ mod tests {
         let nfo = vec![("Movie.2024.nfo".to_string(), "Movie.2024.nfo".to_string())];
         assert_eq!(fill_gaps_from(&mut own, &twin, &nfo, true, &KnownCrcs::new()), 0);
         assert_eq!(own.len(), 1);
+    }
+
+    #[test]
+    fn a_renamed_repost_fills_from_the_volumes_its_set_names() {
+        // the set names the first upload's volumes; this posting renamed every one of them
+        let mut own = vec![
+            article("oCBvoIlhFvS0L3k1.part001.rar", 1, 2, 100, "o1"),
+            article("oCBvoIlhFvS0L3k1.part002.rar", 1, 2, 100, "o3"),
+            article("oCBvoIlhFvS0L3k1.part002.rar", 2, 2, 100, "o4"),
+            article("oCBvoIlhFvS0L3k1.par2", 1, 1, 10, "op"),
+        ];
+        let twin = vec![
+            article("YMFFZeoeVI6fG4iz.part001.rar", 1, 2, 100, "y1"),
+            article("YMFFZeoeVI6fG4iz.part001.rar", 2, 2, 100, "y2"),
+            article("YMFFZeoeVI6fG4iz.part002.rar", 1, 2, 100, "y3"),
+        ];
+        let names: Vec<(String, String)> = ["YMFFZeoeVI6fG4iz.part001.rar", "YMFFZeoeVI6fG4iz.part002.rar"]
+            .iter()
+            .map(|n| (n.to_string(), n.to_string()))
+            .collect();
+        assert_eq!(fill_gaps_from(&mut own, &twin, &names, false, &KnownCrcs::new()), 1);
+        let borrowed = own.iter().find(|a| a.message_id == "y2").unwrap();
+        assert_eq!(borrowed.filename.as_deref(), Some("oCBvoIlhFvS0L3k1.part001.rar"), "under this posting's name");
+        // a set of two archives' volumes can't say which posted archive is which
+        let two: Vec<(String, String)> =
+            ["A.part001.rar", "B.part001.rar"].iter().map(|n| (n.to_string(), n.to_string())).collect();
+        let mut own = vec![article("P.part001.rar", 1, 2, 100, "p1")];
+        let twin = vec![article("A.part001.rar", 2, 2, 100, "a2"), article("B.part001.rar", 2, 2, 100, "b2")];
+        assert_eq!(fill_gaps_from(&mut own, &twin, &two, false, &KnownCrcs::new()), 0);
+        // a plain file's ending says nothing about which file it is
+        assert_eq!(renamed_volume(&["Other.mkv"], "Movie.mkv"), None);
+        // a posting of two archives can't say which one the set's name stands for
+        let posted = ["a.part001.rar", "b.part001.rar"];
+        assert_eq!(renamed_volume(&posted, "YMFFZeoeVI6fG4iz.part001.rar"), None);
+        // a volume with no posted counterpart, and a file that is no volume, map to nothing
+        let posted = ["oCBv.part001.rar", "oCBv.par2"];
+        assert_eq!(renamed_volume(&posted, "YMFF.part002.rar"), None);
+        assert_eq!(renamed_volume(&posted, "YMFF.part001.rar"), Some("oCBv.part001.rar"));
+        assert_eq!(renamed_volume(&posted, "YMFF.nfo"), None);
     }
 
     #[test]

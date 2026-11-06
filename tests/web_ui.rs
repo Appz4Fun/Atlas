@@ -307,14 +307,14 @@ fn the_web_ui_end_to_end() {
         let s = db::open_shard(&store::shard_path(&main, store::shard_of("alt.binaries.g2"))).unwrap();
         let id: i64 = s.query_row("select id from releases where name = ?", [name], |r| r.get(0)).unwrap();
         // one uploader, and the same first keyframe: the same video stream, posted twice
-        let info = r#"{"health":{},"crossposted_to":[],"imdb_ids":[],"sfv":{},"headers":{"Injection-Info":"news.example; posting-account=\"same-uploader\""},"media":{"container":"matroska","video":[{"codec":"V_MPEGH/ISO/HEVC","keyframe_key":"0123456789abcdef"}]}}"#;
+        let info = r#"{"health":{},"crossposted_to":[],"imdb_ids":[],"sfv":{},"headers":{"Injection-Info":"news.example; posting-account=\"same-uploader\""},"media":{"container":"matroska","video":[{"codec":"V_MPEGH/ISO/HEVC","keyframe_key":"0123456789abcdef"}],"audio":[{"codec":"A_EAC3","stream_key":"fedcba9876543210"}]}}"#;
         s.execute("insert into release_probe (release_id, info) values (?, ?)", rusqlite::params![id, info]).unwrap();
         // what the keys step writes, with the salt the pages use
         let salt = atlas::keys::salt(&db::open_with_shards(&main).unwrap());
         let k = atlas::keys::read_keys(&s, id, Some(2), salt).unwrap();
         s.execute(
-            "insert into release_keys (release_id, account, host, layout, lines, video) values (?, ?, ?, ?, ?, ?)",
-            rusqlite::params![id, k.account, k.host, k.layout, k.lines, k.video],
+            "insert into release_keys (release_id, account, host, layout, lines, video, audio) values (?, ?, ?, ?, ?, ?, ?)",
+            rusqlite::params![id, k.account, k.host, k.layout, k.lines, k.video, k.audio],
         )
         .unwrap();
         keyed.push(id);
@@ -341,6 +341,21 @@ fn the_web_ui_end_to_end() {
                 .contains(&format!("<a href=\"/ui/same?id={one}&amp;kind=video\">in 1 other release</a>")),
         "{}",
         keyed_page.body
+    );
+    assert!(
+        keyed_page.body.contains("<dt>Audio stream key</dt>")
+            && keyed_page
+                .body
+                .contains(&format!("<a href=\"/ui/same?id={one}&amp;kind=audio\">in 1 other release</a>")),
+        "{}",
+        keyed_page.body
+    );
+    let same_audio = fetch(port, &format!("/ui/same?id={one}&kind=audio"), &cookie);
+    assert!(
+        same_audio.body.contains("Same audio stream")
+            && same_audio.body.contains(&format!("<a href=\"/ui/release?id={two}\">Keyed.Two.2024-GRP</a>")),
+        "{}",
+        same_audio.body
     );
     let same_video = fetch(port, &format!("/ui/same?id={one}&kind=video"), &cookie);
     assert!(

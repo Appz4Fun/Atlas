@@ -19,7 +19,7 @@ use super::{
 pub const PROBE_STEP: StepId = StepId(4);
 
 /// The most text kept from an NFO.
-const MAX_NFO: usize = 256 * 1024;
+const MAX_NFO: usize = super::nfo_store::MAX_CHARS;
 
 #[derive(Default)]
 pub struct ProbeStep {
@@ -188,6 +188,21 @@ pub(crate) fn rerun_dv_without_keyframe_key(conn: &rusqlite::Connection, now: i6
 const DV_WITHOUT_KEYFRAME_KEY: &str = "json_extract(info, '$.media.video[0].dv_profile') is not null
      and json_type(info, '$.media.video[0].keyframe_key') is null";
 
+/// Asks for the probe again on Dolby Vision video whose first audio track is AC-3, E-AC-3 or FLAC, probed before
+/// that track's stream was keyed. One front read a release, as for the keyframe key. Once, from the stage's seed.
+pub(crate) fn rerun_dv_without_audio_key(conn: &rusqlite::Connection, now: i64) -> rusqlite::Result<usize> {
+    rerun_probes(conn, DV_WITHOUT_AUDIO_KEY, now)
+}
+
+/// The codecs `stream_key` is taken for, as Matroska and MP4 name them.
+const KEYED_AUDIO: &[&str] = &["A_AC3", "A_EAC3", "A_FLAC", "ac-3", "ec-3", "fLaC"];
+
+/// A probe row whose first video track is Dolby Vision and first audio track a keyed codec, saved before
+/// `stream_key` was kept (a probe since keeps it, null when the frames read ran out).
+const DV_WITHOUT_AUDIO_KEY: &str = "json_extract(info, '$.media.video[0].dv_profile') is not null
+     and json_extract(info, '$.media.audio[0].codec') in ('A_AC3', 'A_EAC3', 'A_FLAC', 'ac-3', 'ec-3', 'fLaC')
+     and json_type(info, '$.media.audio[0].stream_key') is null";
+
 /// The same for MPEG transport streams, before `mpegts` read their program map: a capture's `.ts` or `.mts`, or a
 /// Blu-ray's `.m2ts`.
 pub(crate) fn rerun_mpeg_ts(conn: &rusqlite::Connection, now: i64) -> rusqlite::Result<usize> {
@@ -309,8 +324,13 @@ fn stale_saved(info: &str) -> bool {
     // and before `keyframe_key` was kept, the rows `DV_WITHOUT_KEYFRAME_KEY` picks: a null one was looked for
     let dv_before_keyframe_key =
         !p["media"]["video"][0]["dv_profile"].is_null() && p["media"]["video"][0].get("keyframe_key").is_none();
+    // and before `stream_key` was kept, the rows `DV_WITHOUT_AUDIO_KEY` picks
+    let dv_before_audio_key = !p["media"]["video"][0]["dv_profile"].is_null()
+        && p["media"]["audio"][0]["codec"].as_str().is_some_and(|c| KEYED_AUDIO.contains(&c))
+        && p["media"]["audio"][0].get("stream_key").is_none();
     mp4_without_tracks
         || dvd_folder_as_vob
+        || dv_before_audio_key
         || dv_before_from_rpu
         || dv_before_keyframe_key
         || p["media"].is_null()
@@ -417,6 +437,8 @@ impl Step for ProbeStep {
                     },
                 )
         {
+            // a video probed before the probe kept the server's body CRC gets it from one HEAD
+            let backfill = super::body_crc::wants_backfill(&saved.info);
             let mut writes = Vec::new();
             if let Some(pw) = saved.nfo_password {
                 writes.push(StepWrite::new(archive::store::SET_NFO_PASSWORD, vec![release_id.into(), pw.into()]));
@@ -434,7 +456,8 @@ impl Step for ProbeStep {
             ));
             // the account, host and layout keys come from what the probe holds
             let rerun = mask(crate::keys::KEYS_STEP)
-                | if hash.is_some() { mask(super::opensubtitles::OPENSUBTITLES_STEP) } else { 0 };
+                | if hash.is_some() { mask(super::opensubtitles::OPENSUBTITLES_STEP) } else { 0 }
+                | if backfill { mask(super::body_crc::BODY_CRC_STEP) } else { 0 };
             let facts = hash.map(|h| vec![(MOVIEHASH_FACT, h)]).unwrap_or_default();
             return Ok(Outcome { matched: true, writes, facts, rerun, ..Outcome::default() });
         }
@@ -468,16 +491,31 @@ impl Step for ProbeStep {
                 || par2_names.get(&f.filename).is_some_and(|p| is_small_text(p))
                 || f.subject.as_deref().is_some_and(crate::nfo::is_nfo)
         };
+        // an NFO read before, by this probe's last run or by a step that came first, isn't fetched again
+        let mut kept = super::nfo_store::stored(ctx.conn(), release_id);
         for file in files.iter().filter(|f| is_text_or_par2_text(f)).take(3) {
-            let Some(seg) = ctx.segments(file.id, &SegmentPick::First(1)).map_err(retry)?.into_iter().next() else {
-                continue;
+            let par2_name = par2_names.get(&file.filename);
+            let eff_name = par2_name.unwrap_or(&file.filename);
+            let is_sfv = eff_name.to_ascii_lowercase().ends_with(".sfv");
+            let reused = match &kept {
+                Some(k) if !is_sfv && k.is_of(&file.filename, par2_name.map(String::as_str)) => kept.take(),
+                _ => None,
             };
-            let Got::Body(raw) = fetch_raw(ctx, &seg.message_id, &file.filename)? else { continue };
-            let article = yenc::split_article(&raw);
-            let body = yenc_decode(&article.lines).unwrap_or_else(|| article.lines.join(&b'\n'));
-            let text = nfo_text(&body);
-            let eff_name = par2_names.get(&file.filename).unwrap_or(&file.filename);
-            if eff_name.to_ascii_lowercase().ends_with(".sfv") {
+            // `from_start`: read from the file's first article, the NFO's start, soo a reader after it can use it
+            let (text, from_start) = match reused {
+                Some(k) => (k.text, true),
+                None => {
+                    let Some(seg) = ctx.segments(file.id, &SegmentPick::First(1)).map_err(retry)?.into_iter().next()
+                    else {
+                        continue;
+                    };
+                    let Got::Body(raw) = fetch_raw(ctx, &seg.message_id, &file.filename)? else { continue };
+                    let article = yenc::split_article(&raw);
+                    let body = yenc_decode(&article.lines).unwrap_or_else(|| article.lines.join(&b'\n'));
+                    (nfo_text(&body), seg.part.is_none_or(|p| p <= 1))
+                }
+            };
+            if is_sfv {
                 info.sfv = parse_sfv(&text);
             } else {
                 if found_nfo_password.is_none()
@@ -493,6 +531,16 @@ impl Step for ProbeStep {
                 if info.nfo.is_none() {
                     info.imdb_ids = imdb_ids(&text);
                     info.nfo = Some(text.chars().take(MAX_NFO).collect());
+                    // a later article's text isn't the NFO: no file, soo nothing reuses it and the next run reads
+                    // the first article once it's there
+                    if from_start {
+                        info.nfo_file = Some(file.filename.clone());
+                        // the probe's JSON holds it now: a copy a step kept goes
+                        writes.push(StepWrite::new(
+                            super::nfo_store::DROP,
+                            vec![release_id.into(), file.filename.clone().into()],
+                        ));
+                    }
                 }
             }
         }
@@ -1003,6 +1051,40 @@ mod tests {
             r#"{"media":{"video":[{"dv_profile":8,"dolby_vision":{"from_rpu":false},"keyframe_key":null}]}}"#
         ));
         assert!(!stale_saved(r#"{"media":{"video":[{"hdr":"HDR10"}]}}"#));
+    }
+
+    #[test]
+    fn dolby_vision_probes_from_before_the_audio_key_are_asked_for_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        crate::db::create_db_at(&main).unwrap();
+        let conn = crate::db::open_shard(&crate::store::shard_path(&main, 0)).unwrap();
+        for (id, info) in [
+            (1i64, r#"{"media":{"video":[{"dv_profile":8}],"audio":[{"codec":"A_EAC3"}]}}"#),
+            (2, r#"{"media":{"video":[{"dv_profile":8}],"audio":[{"codec":"A_EAC3","stream_key":null}]}}"#),
+            (3, r#"{"media":{"video":[{"dv_profile":8}],"audio":[{"codec":"A_TRUEHD"}]}}"#),
+            (4, r#"{"media":{"video":[{"codec":"V_MPEGH/ISO/HEVC"}],"audio":[{"codec":"A_AC3"}]}}"#),
+            (5, r#"{"media":{"video":[{"dv_profile":5}],"audio":[{"codec":"fLaC"}]}}"#),
+        ] {
+            conn.execute("insert into releases (id, name, group_name) values (?, ?, 'g')", rusqlite::params![id, id])
+                .unwrap();
+            conn.execute(
+                "insert into pp_state (release_id, done) values (?, ?)",
+                rusqlite::params![id, mask(PROBE_STEP)],
+            )
+            .unwrap();
+            conn.execute("insert into release_probe (release_id, info) values (?, ?)", rusqlite::params![id, info])
+                .unwrap();
+        }
+        assert_eq!(rerun_dv_without_audio_key(&conn, 100).unwrap(), 2, "1 and 5");
+        let saved = |codec: &str, v: &str| {
+            format!(
+                r#"{{"media":{{"video":[{{"dv_profile":8,"dolby_vision":{{"from_rpu":true}},"keyframe_key":null}}],"audio":[{{"codec":"{codec}"{v}}}]}}}}"#
+            )
+        };
+        assert!(stale_saved(&saved("A_AC3", "")), "a restored probe from before the key is probed again");
+        assert!(!stale_saved(&saved("A_AC3", r#","stream_key":null"#)));
+        assert!(!stale_saved(&saved("A_DTS", "")));
     }
 
     #[test]

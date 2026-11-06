@@ -96,7 +96,9 @@ class Board:
             field, links=links,
         )
 
-    def graph(self, title, targets, unit="short", w=12, h=8, description="", stacked=False, links=(), bars=False):
+    def graph(self, title, targets, unit="short", w=12, h=8, description="", stacked=False, links=(), bars=False,
+              colors=None, palette=False):
+        """`colors`: series name -> colour, for series that keep one; `palette`: the rest take the categorical order"""
         field = {"custom": {"fillOpacity": 25 if stacked or bars else 8, "lineWidth": 1, "showPoints": "never",
                             "spanNulls": False, "drawStyle": "bars" if bars else "line",
                             "stacking": {"mode": "normal" if stacked else "none", "group": "A"}}}
@@ -105,7 +107,10 @@ class Board:
             {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"], "showLegend": True,
                         "sortBy": "Max", "sortDesc": True},
              "tooltip": {"mode": "multi", "sort": "desc"}},
-            field, links=links,
+            dict(field, color={"mode": "palette-classic"}) if palette else field, links=links,
+            overrides=[{"matcher": {"id": "byName", "options": name},
+                        "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": color}}]}
+                       for name, color in (colors or {}).items()],
         )
 
     def pie(self, title, expr, legend, unit="short", w=8, h=9, description="", links=()):
@@ -125,8 +130,8 @@ class Board:
             {"min": 0, "color": {"mode": "continuous-BlYlRd"}}, links=links,
         )
 
-    def table(self, title, targets, columns, w=12, h=10, description="", sort=None, links=()):
-        """`columns`: label or `Value #A` -> (shown name, unit or None)"""
+    def table(self, title, targets, columns, w=12, h=10, description="", sort=None, links=(), cells=None, ascending=False):
+        """`columns`: label or `Value #A` -> (shown name, unit or None); `cells`: shown name -> extra field properties"""
         overrides = []
         renames = {}
         for source, (shown, unit) in columns.items():
@@ -136,6 +141,7 @@ class Board:
                 props.append({"id": "unit", "value": unit})
             if links and source == next(iter(columns)):
                 props.append({"id": "links", "value": [{"title": t, "url": u} for t, u in links]})
+            props.extend((cells or {}).get(shown, []))
             if props:
                 overrides.append({"matcher": {"id": "byName", "options": shown}, "properties": props})
         keep = {name: True for name in columns}
@@ -146,7 +152,7 @@ class Board:
         self.panel(
             "table", title, [dict(t, format="table", instant=True, range=False) for t in targets], w, h, description, None,
             {"showHeader": True, "cellHeight": "sm",
-             "sortBy": [{"displayName": sort, "desc": True}] if sort else []},
+             "sortBy": [{"displayName": sort, "desc": not ascending}] if sort else []},
             {"custom": {"filterable": True}}, overrides,
             transformations=[
                 join,
@@ -613,8 +619,182 @@ def sealed_log():
     ], w=12)
     return b
 
+# the reference palette's steps for a dark surface: categorical slots in their fixed order, and the status colours
+SERIES = ["#3987e5", "#d95926", "#199e70", "#c98500", "#d55181", "#008300", "#9085e9", "#e66767"]
+GOOD, WARNING, SERIOUS, CRITICAL = "#0ca30c", "#fab219", "#ec835a", "#d03b3b"
+MUTED = "#8e8d87"
+LINK_PROGRESS = ("Backfill and realtime", "/d/atlas-progress?${__url_time_range}")
+# a shard keeps its colour on every panel
+SHARD_COLORS = {f"shard {i}": color for i, color in enumerate(SERIES)}
 
-BOARDS = [overview, content, nntp, functions, pipeline, system, sealed_log]
+
+def one_host(board):
+    """Every atlas_ series of `board` read from the one `$host`: the same process can be scraped at two addresses."""
+    import re
+    def pin(m):
+        return f'{m.group(1)}{{host="$host",' if m.group(2) else f'{m.group(1)}{{host="$host"}}'
+    for panel in board.panels:
+        for t in panel.get("targets", []):
+            t["expr"] = re.sub(r"\b(atlas_[a-z_]+)\b(\{)?", pin, t["expr"]).replace(',}', '}')
+    return board
+
+
+def progress():
+    host = variable("host", "Atlas", 'label_values(atlas_build_info{role="indexer"}, host)', multi=False, include_all=False)
+    group = variable("group", "Group", 'label_values(atlas_group_backfill_articles{host="$host"}, group)')
+    b = Board("atlas-progress", "Atlas: Backfill and realtime",
+              "How far the backfill has come, per group and overall, and whether live indexing and processing keep up. "
+              "Article numbers count the gaps on the server too. Backfill goes newest month first, in day chunks for split groups.",
+              [host, group])
+    g = 'group=~"$group"'
+    total = f'sum(atlas_group_backfill_articles{{state="total",{g}}})'
+    covered = f'sum(atlas_group_backfill_articles{{state="covered",{g}}})'
+    left = f"({total} - {covered})"
+    # how fast what is left shrinks, over the last 6 hours: new posts add to it, so it is net of them
+    shrink = f"(-deriv({left}[6h:5m]))"
+    per_group_left = f'(atlas_group_backfill_articles{{state="total",{g}}} - ignoring(state) atlas_group_backfill_articles{{state="covered",{g}}})'
+    behind = (f'clamp_min(atlas_group_article_number{{mark="last",{g}}} - ignoring(mark) '
+              f'atlas_group_article_number{{mark="live_cursor",{g}}}, 0)')
+    since_newest = f'time() - atlas_group_posted_timestamp_seconds{{end="newest",{g}}}'
+
+    b.row("Backfill: how far along")
+    b.stat("Done", f"{covered} / {total}", "percentunit", w=4,
+           description="Article numbers indexed, out of every number between each group's first and last on its server.")
+    b.stat("Articles left", left, w=4)
+    b.stat("Shrinking by", f"{shrink} * 3600", w=4, description="Articles a hour, net of new posts, over the last 6 hours.")
+    b.stat("ETA", f"{left} / ({shrink} > 0)", "s", w=4,
+           description="Articles left at the last 6 hours' pace. No data means what is left is not shrinking.",
+           mappings=[{"type": "special", "options": {"match": "null", "result": {"text": "not shrinking", "index": 0}}}])
+    b.stat("Day chunks done", 'atlas_backfill_chunks{state="done"} / ignoring(state) atlas_backfill_chunks{state="total"}', "percentunit", w=4,
+           description="Split groups backfill a day at a time; this is the share of those days done.")
+    b.stat("Day chunks ETA", '(atlas_backfill_chunks{state="total"} - ignoring(state) atlas_backfill_chunks{state="done"}) '
+                             '/ ignoring(state) (atlas_backfill_chunks{state="done_last_hour"} > 0) * 3600', "s", w=4,
+           description="Days left at the last hour's pace.",
+           mappings=[{"type": "special", "options": {"match": "null", "result": {"text": "none done this hour", "index": 0}}}])
+    b.graph("Done", [q(f"{covered} / {total}", "done")], "percentunit", w=8, colors={"done": SERIES[0]})
+    b.graph("Articles left", [q(left, "left")], w=8, colors={"left": SERIES[0]})
+    b.graph("How far back, middle group", [
+        q(f'time() - quantile(0.5, atlas_group_posted_timestamp_seconds{{end="oldest",{g}}})', "oldest post indexed"),
+        q(f'time() - quantile(0.5, atlas_group_backfill_day_timestamp_seconds{{day="oldest_done",{g}}})', "oldest day chunk done"),
+    ], "s", w=8, colors={"oldest post indexed": SERIES[0], "oldest day chunk done": SERIES[1]},
+       description="How old the oldest indexed post is in the middle group. Climbing means backfill is reaching further back.")
+    b.table("Per group", [
+        q(f"atlas_group_backfill_articles{{state=\"covered\",{g}}} / ignoring(state) atlas_group_backfill_articles{{state=\"total\",{g}}}", "A"),
+        q(per_group_left, "B"),
+        q(f'atlas_group_article_number{{mark="first",{g}}}', "C"),
+        q(f'atlas_group_article_number{{mark="backfill_cursor",{g}}}', "D"),
+        q(f'atlas_group_article_number{{mark="live_cursor",{g}}}', "E"),
+        q(f'atlas_group_article_number{{mark="last",{g}}}', "F"),
+        q(f'atlas_group_posted_timestamp_seconds{{end="oldest",{g}}} * 1000', "G"),
+        q(f'atlas_group_backfill_chunks{{state="done",{g}}} / ignoring(state) atlas_group_backfill_chunks{{state="total",{g}}}', "H"),
+        q(f'atlas_group_backfill_day_timestamp_seconds{{day="oldest_done",{g}}} * 1000', "I"),
+        q(f"{per_group_left} / (-deriv({per_group_left}[6h:5m]) > 0)", "J"),
+    ], {"group": ("Group", None), "Value #A": ("Done", "percentunit"), "Value #B": ("Left", "short"),
+        "Value #C": ("Server first", "none"), "Value #D": ("Backfill cursor", "none"), "Value #E": ("Live cursor", "none"),
+        "Value #F": ("Server last", "none"), "Value #G": ("Oldest post", "dateTimeAsIso"),
+        "Value #H": ("Days done", "percentunit"), "Value #I": ("Oldest day done", "dateTimeAsIso"), "Value #J": ("ETA", "s")},
+        w=24, h=12, sort="Left",
+        description="Article numbers from each group's furthest-along server. Split groups count their day chunks done as that share. ETA at the last 6 hours' pace, blank when not shrinking.",
+        cells={"Done": [{"id": "custom.cellOptions", "value": {"type": "gauge", "mode": "basic"}},
+                        {"id": "min", "value": 0}, {"id": "max", "value": 1},
+                        {"id": "color", "value": {"mode": "fixed", "fixedColor": SERIES[0]}}]})
+
+    b.row("Realtime: is it keeping up")
+    lag_steps = [{"color": GOOD, "value": None}, {"color": WARNING, "value": 1800}, {"color": CRITICAL, "value": 7200}]
+    b.stat("Articles behind", f"sum({behind})", w=4,
+           description="New articles on the servers that the live cursors have not reached, as of each group's last pass.")
+    b.stat("Groups behind", f"count({behind} > 0) or vector(0)", w=4)
+    b.stat("Groups not moved in 30 min", f'count(changes(atlas_group_article_number{{mark="live_cursor",{g}}}[30m]) == 0) or vector(0)', w=4,
+           thresholds=[{"color": GOOD, "value": None}, {"color": WARNING, "value": 1}, {"color": CRITICAL, "value": 20}],
+           description="Groups whose live cursor has not moved in 30 minutes, from the database, so a restart does not hide them. "
+                       "Quiet groups land here too: nothing new to index looks the same as not indexing.")
+    b.stat("Newest post, middle group", f"quantile(0.5, {since_newest})", "s", w=4, thresholds=lag_steps,
+           description="Age of the newest indexed post in the middle group: the lag behind Usenet in time.")
+    b.stat("Caught up", "atlas_indexer_idle", w=4,
+           mappings=[{"type": "value", "options": {"0": {"text": "working", "index": 0}, "1": {"text": "every group caught up", "index": 1}}}])
+    b.stat("Indexing errors in range", "sum(increase(atlas_indexer_errors_total[$__range]))", w=4,
+           thresholds=[{"color": GOOD, "value": None}, {"color": SERIOUS, "value": 1}])
+    b.graph("Articles behind, the 8 furthest behind groups", [q(f"topk(8, {behind})", "{{group}}")], w=8, palette=True)
+    b.graph("Newest post indexed, age, the 8 oldest", [q(f"topk(8, {since_newest})", "{{group}}")], "s", w=8, palette=True)
+    b.graph("Indexed per second", [q(f"sum(rate(atlas_articles_total{{{g}}}[5m]))", "articles"),
+                                   q(f"sum(rate(atlas_releases_seen_total{{{g}}}[5m]))", "releases seen")], w=8,
+            colors={"articles": SERIES[0], "releases seen": SERIES[1]})
+    b.table("Lag per group", [
+        q(behind, "A"),
+        q(f"{since_newest}", "B"),
+        q(f"time() - atlas_group_last_indexed_timestamp_seconds{{{g}}}", "C"),
+        q(f"sum by (group) (rate(atlas_articles_total{{{g}}}[15m]))", "D"),
+    ], {"group": ("Group", None), "Value #A": ("Articles behind", "short"), "Value #B": ("Newest post age", "s"),
+        "Value #C": ("Since last indexed", "s"), "Value #D": ("Articles a second", "short")},
+        w=24, h=10, sort="Articles behind")
+
+    b.row("Queues")
+    b.graph("Headers fetched, not saved", [q('atlas_unsaved_headers{state="now"}', "waiting"), q('atlas_unsaved_headers{state="cap"}', "cap")], w=8,
+            colors={"waiting": SERIES[0], "cap": MUTED}, description="Fetching pauses at the cap.")
+    b.graph("Parse and save", [
+        q("atlas_writer_queued_slices", "slices waiting for a writer"),
+        q('atlas_function_in_progress{function="indexer.parse_slice"}', "parsing"),
+        q('atlas_function_in_progress{function="indexer.save_slice"}', "saving"),
+    ], w=8, colors={"slices waiting for a writer": SERIES[0], "parsing": SERIES[1], "saving": SERIES[2]})
+    b.graph("Processing stage queue", [q('atlas_stage_queue{state="due"}', "due"), q('atlas_stage_queue{state="net_wanted"}', "waiting on bodies"),
+                                       q('atlas_stage_queue{state="failed"}', "failed")], w=8,
+            colors={"due": SERIES[0], "waiting on bodies": SERIES[1], "failed": SERIES[2]},
+            description="Bounded counts: a big queue reads as its cap.")
+    b.graph("Steps running now", [q('topk(8, atlas_function_in_progress{function=~"step[.].*"})', "{{function}}")], w=8, palette=True)
+    b.graph("Stills", [q('atlas_function_in_progress{function="step.stills"}', "running"),
+                       q('sum(rate(atlas_step_runs_total{step="stills"}[5m])) * 60', "runs a minute")], w=8,
+            colors={"running": SERIES[0], "runs a minute": SERIES[1]})
+    b.graph("Bodies", [q('atlas_function_in_progress{function="stage.fetch_body"}', "fetching now"),
+                       q("rate(atlas_stage_bodies_total[5m]) * 60", "fetched a minute")], w=8,
+            colors={"fetching now": SERIES[0], "fetched a minute": SERIES[1]})
+
+    b.row("Net lane per shard")
+    b.stat("Claims running", "sum(atlas_stage_net_claims) / (max(atlas_stage_net_claims_limit) * count(atlas_stage_net_claims))", "percentunit", w=4,
+           description="Net claims running over every shard, out of net_claims_per_shard each.")
+    b.stat("Claims per shard limit", "atlas_stage_net_claims_limit", w=4)
+    b.graph("Claims per shard", [q("atlas_stage_net_claims", "shard {{shard}}"), q("atlas_stage_net_claims_limit", "limit")], w=16, h=8,
+            colors={**SHARD_COLORS, "limit": MUTED})
+    b.graph("Net visits a minute, per shard", [q('rate(atlas_stage_lane_total{lane="net_visits"}[5m]) * 60', "shard {{shard}}")], w=8, colors=SHARD_COLORS,
+            description="Releases the net lane ran a step of.")
+    b.graph("Finished by the net lane a minute, per shard", [q('rate(atlas_stage_lane_total{lane="net_finished"}[5m]) * 60', "shard {{shard}}")], w=8, colors=SHARD_COLORS,
+            description="Releases the net lane left with no net step to run.")
+    b.graph("Queue rows taken a minute, per shard", [q('rate(atlas_stage_lane_total{lane="queue_taken"}[5m]) * 60', "shard {{shard}}")], w=8, colors=SHARD_COLORS,
+            description="The database lane.")
+
+    b.row("Freezing")
+    b.stat("Queued to freeze", 'sum(atlas_freeze_pending{state="queued"})', w=6,
+           description="Releases the freezing rules queued to move out of the shards. Counted every 5 minutes.")
+    b.stat("Ready to move", 'sum(atlas_freeze_pending{state="ready"})', w=6,
+           description="Of those, the ones queued longer than wait_hours (12 by default), which the writers move now.")
+    b.stat("Frozen a minute", 'sum(rate(atlas_frozen_events_total{event="frozen"}[10m])) * 60', w=6)
+    b.stat("Longest queued", "time() - min(atlas_freeze_pending_oldest_timestamp_seconds)", "s", w=6,
+           description="Moves start once this passes wait_hours. A visit to a release queues it afresh.")
+    b.graph("Queued per shard", [q('atlas_freeze_pending{state="queued"}', "shard {{shard}}")], w=8, colors=SHARD_COLORS)
+    b.graph("Ready per shard", [q('atlas_freeze_pending{state="ready"}', "shard {{shard}}")], w=8, colors=SHARD_COLORS)
+    b.graph("Freezing a minute", [
+        q('sum(rate(atlas_frozen_events_total{event="frozen"}[5m])) * 60', "frozen"),
+        q('sum(rate(atlas_frozen_events_total{event="backlog_queued"}[5m])) * 60', "queued by the backlog walk"),
+        q('sum(rate(atlas_frozen_events_total{event="busy"}[5m])) * 60', "ticks the lock was busy"),
+    ], w=8, colors={"frozen": SERIES[0], "queued by the backlog walk": SERIES[1], "ticks the lock was busy": SERIES[2]})
+
+    b.row("Errors")
+    bad = [{"color": GOOD, "value": None}, {"color": CRITICAL, "value": 1}]
+    b.stat("Step panics in range", "sum(increase(atlas_step_panics_total[$__range])) or vector(0)", w=6, thresholds=bad)
+    b.stat("Step errors in range", 'sum(increase(atlas_step_runs_total{result=~"retry|permanent|transient"}[$__range])) or vector(0)', w=6,
+           thresholds=[{"color": GOOD, "value": None}, {"color": SERIOUS, "value": 1}])
+    b.stat("Function errors in range", "sum(increase(atlas_function_errors_total[$__range])) or vector(0)", w=6,
+           thresholds=[{"color": GOOD, "value": None}, {"color": SERIOUS, "value": 1}])
+    b.stat("Indexer errors in range", "sum(increase(atlas_indexer_errors_total[$__range])) or vector(0)", w=6,
+           thresholds=[{"color": GOOD, "value": None}, {"color": SERIOUS, "value": 1}])
+    b.graph("Step errors and panics, by step", [
+        q('topk(8, sum by (step) (increase(atlas_step_runs_total{result=~"retry|permanent|transient"}[5m])))', "{{step}}"),
+    ], bars=True, w=8, palette=True)
+    b.graph("Step panics, by step", [q("sum by (step) (increase(atlas_step_panics_total[5m]))", "{{step}}")], bars=True, w=8, palette=True)
+    b.graph("Function errors, the top 8", [q("topk(8, sum by (function) (increase(atlas_function_errors_total[5m])))", "{{function}}")], bars=True, w=8, palette=True)
+    return one_host(b)
+
+
+BOARDS = [overview, content, nntp, functions, pipeline, system, sealed_log, progress]
 
 
 def build():

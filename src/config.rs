@@ -389,12 +389,16 @@ pub struct FreezeConfig {
     pub small_keeps_tv_movies: bool,
     /// a release categorized outside Movies, TV and Other freezes, complete or not
     pub not_tv_movies: bool,
+    /// a post of only an NFO, mediainfo or other text, SFV or SRR files freezes: not a release of its own
+    pub sidecar: bool,
     /// releases a shard's writer moves at most a tick (a second)
     pub per_tick: i64,
     /// releases the backlog walk looks at a tick, 0 turns it off
     pub backlog_per_tick: i64,
     /// how long a tick may hold the writer, milliseconds
     pub tick_ms: i64,
+    /// how long a tick may take while the writer has nothing waiting, milliseconds; 0 for no such ticks
+    pub idle_tick_ms: i64,
     /// below this much free disk nothing is moved, GB
     pub min_free_gb: i64,
     /// how long a release waits queued and untouched before it moves, hours
@@ -408,9 +412,11 @@ impl Default for FreezeConfig {
             small_bytes: 1 << 30,
             small_keeps_tv_movies: false,
             not_tv_movies: true,
+            sidecar: true,
             per_tick: 200,
             backlog_per_tick: 2_000,
             tick_ms: 50,
+            idle_tick_ms: 200,
             min_free_gb: 100,
             wait_hours: 12,
         }
@@ -430,6 +436,7 @@ impl FreezeConfig {
         int("per_tick", &mut c.per_tick, 1);
         int("backlog_per_tick", &mut c.backlog_per_tick, 0);
         int("tick_ms", &mut c.tick_ms, 1);
+        int("idle_tick_ms", &mut c.idle_tick_ms, 0);
         int("min_free_gb", &mut c.min_free_gb, 0);
         int("wait_hours", &mut c.wait_hours, 0);
         let flag = |key: &str, slot: &mut bool| {
@@ -440,6 +447,7 @@ impl FreezeConfig {
         flag("enabled", &mut c.enabled);
         flag("small_keeps_tv_movies", &mut c.small_keeps_tv_movies);
         flag("not_tv_movies", &mut c.not_tv_movies);
+        flag("sidecar", &mut c.sidecar);
         c
     }
 }
@@ -590,6 +598,11 @@ impl SealedLogConfig {
 /// The file's `sealed_log` object, for anything that reads articles: no keyring.
 pub fn sealed_log_config() -> SealedLogConfig {
     read_file().map_or_else(SealedLogConfig::default, |v| SealedLogConfig::from_value(v.get("sealed_log")))
+}
+
+/// The file's `metrics` object, for the web ui's stats page: no keyring.
+pub fn metrics_config() -> MetricsConfig {
+    read_file().map_or_else(MetricsConfig::default, |v| MetricsConfig::from_value(v.get("metrics")))
 }
 
 /// The `metrics` object of config.toml, see the README. Off unless asked for.

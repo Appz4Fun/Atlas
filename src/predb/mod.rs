@@ -158,6 +158,14 @@ fn late_thread(shared: Arc<Shared>, stage: Arc<Stage>) {
             return;
         }
     };
+    // a statement of the late matcher (a full-text probe of a shard) is cut short once stopping: it looks at the stop
+    // only between statements, and a stop on prod waited 67 s for this thread
+    for conn in std::iter::once(&predb).chain(&shards) {
+        let shared = shared.clone();
+        if let Err(e) = conn.progress_handler(10_000, Some(move || shared.stopping())) {
+            eprintln!("predb: {e}");
+        }
+    }
     let rerun = |id: i64| stage.rerun(id, mask(PREDB_MATCH));
     while shared.nap(Duration::from_secs(1)) {
         let budget = shared.config.read().unwrap().late_per_second;

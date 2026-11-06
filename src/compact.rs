@@ -755,6 +755,8 @@ fn compact_shard(
         let cols = copied_columns(&conn, table.name)?;
         conn.execute_batch(&format!("insert into main.{0} ({cols}) select {cols} from old.{0}", table.name))?;
     }
+    // the copy's sidecar texts counted once: their insert trigger added them on top of the copied counter
+    crate::sidecar::recount(&conn)?;
     // the copy's list of releases with no category, from what it now holds, whether or not the original had one
     crate::category::uncategorized::fill(&conn)?;
     // what the word index still has to take in: the ids stay the same

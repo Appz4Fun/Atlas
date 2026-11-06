@@ -712,6 +712,11 @@ mod select_tests {
         let f = [file("a.vol003+04.par2", 1), file("a.vol000+01.par2", 9)];
         assert_eq!(par2_source(&f).unwrap().filename, "a.vol000+01.par2");
         assert!(par2_source(&[file("a.mkv", 1)]).is_none());
+        // a whole volume before a base missing an article, the release's own set before its sample's
+        let short = FileInfo { parts_seen: 1, ..file("a.par2", 2) };
+        let f = [short, file("a.vol003+04.par2", 4), file("a.vol000+01.par2", 1), file("a-sample.vol0+1.par2", 1)];
+        let order: Vec<&str> = par2_sources(&f).iter().map(|f| f.filename.as_str()).collect();
+        assert_eq!(order, ["a.vol000+01.par2", "a.vol003+04.par2", "a-sample.vol0+1.par2", "a.par2"]);
     }
 
     #[test]
@@ -952,4 +957,45 @@ mod select_tests {
         let all_names = select::par2_file_names(&conn, rel_id);
         assert!(all_names.iter().any(|n| n == "pointer-{{pw}}.nzb"));
     }
+}
+
+#[test]
+fn par2_reruns_go_to_incomplete_movies_and_tv_with_par2_files_and_no_set() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    crate::store::build_shard(&conn).unwrap();
+    let par2_done = crate::postprocess::step::mask(steps::PAR2_STEP);
+    // id, complete, category, a PAR2 file, a set read
+    for (id, complete, category, par2, set) in [
+        (1, 0, 5040, true, false),
+        (2, 1, 5040, true, false),
+        (3, 0, 7020, true, false),
+        (4, 0, 2040, false, false),
+        (5, 0, 2040, true, true),
+        (6, 0, 2040, true, false),
+    ] {
+        conn.execute("insert into releases (id, name, group_name, complete) values (?1, ?1, 'g', ?2)", [id, complete])
+            .unwrap();
+        conn.execute("insert into release_category (release_id, category) values (?1, ?2)", [id, category]).unwrap();
+        conn.execute("insert into pp_state (release_id, done) values (?1, ?2)", [id, par2_done]).unwrap();
+        let file = if par2 { "x.vol00+01.par2" } else { "x.mkv" };
+        conn.execute(
+            "insert into files (release_id, filename, seen) values (?1, ?2, x'02')",
+            rusqlite::params![id, file],
+        )
+        .unwrap();
+        if set {
+            conn.execute(
+                "insert into par2_files (release_id, file_id, set_id, md5, md5_16k, size, name) values (?1, x'01', x'01', x'00', x'00', 1, 'x.mkv')",
+                [id],
+            )
+            .unwrap();
+        }
+    }
+    let ids = steps::par2_without_set(&conn).unwrap();
+    assert_eq!(ids, [1, 6]);
+    steps::rerun_par2(&conn, &ids, 100).unwrap();
+    let done: i64 = conn.query_row("select done from pp_state where release_id = 1", [], |r| r.get(0)).unwrap();
+    assert_eq!(done & par2_done, 0, "the step is asked for again");
+    let due: i64 = conn.query_row("select due_at from pp_queue where release_id = 6", [], |r| r.get(0)).unwrap();
+    assert_eq!(due, 100);
 }
