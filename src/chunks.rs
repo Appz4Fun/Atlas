@@ -7,6 +7,20 @@ use rusqlite::{Connection, OptionalExtension, Result, params};
 /// a claim older than this is taken over (its worker died or was stopped)
 pub const CLAIM_TIMEOUT: i64 = 30 * 60;
 
+/// A chunk whose run failed rests this long before any server tries it again, doubling with each failure in a row up
+/// to `FAIL_REST_MOST`. While it rests it neither is claimed nor holds its month (see `newest_month`): on prod eight
+/// chunks of November that timed out or came back with broken compressed headers every time held all 4.8 million
+/// older chunks back, for a day.
+pub const FAIL_REST: i64 = 5 * 60;
+pub const FAIL_REST_MOST: i64 = 6 * 3600;
+
+/// SQL: chunk `c` isnt resting after a failure at unix time `now`
+fn not_resting(now: i64) -> String {
+    format!(
+        "(c.failed_at is null or c.failed_at + min({FAIL_REST} << min(c.failures - 1, 7), {FAIL_REST_MOST}) <= {now})"
+    )
+}
+
 const PENDING: i64 = 0;
 const CLAIMED: i64 = 1;
 const DONE: i64 = 2;
@@ -62,6 +76,8 @@ pub fn create(conn: &Connection) -> Result<()> {
             on backfill_chunks (grp, state, day desc, claimed_at);",
     )?;
     add_column(conn, "backfill_chunks", "done_at")?;
+    add_column(conn, "backfill_chunks", "failures")?;
+    add_column(conn, "backfill_chunks", "failed_at")?;
     add_column(conn, "backfill_deepest", "oldest_at")?;
     add_column(conn, "backfill_deepest", "runner_up_at")
 }
@@ -296,7 +312,7 @@ pub fn newest_month(conn: &Connection, groups: &[(String, i64)], now: i64) -> Re
         "with wanted (g, oldest) as (values {rows}),
               newest (day) as (
                   select (select c.day from backfill_chunks c
-                          where c.grp = w.g and c.state = {PENDING} and c.day >= w.oldest
+                          where c.grp = w.g and c.state = {PENDING} and c.day >= w.oldest and {resting}
                           order by c.day desc limit 1)
                   from wanted w
                   union all
@@ -306,7 +322,8 @@ pub fn newest_month(conn: &Connection, groups: &[(String, i64)], now: i64) -> Re
                   from wanted w
               )
          select cast(strftime('%s', max(day) * 86400, 'unixepoch', 'start of month') as integer) / 86400
-         from newest"
+         from newest",
+        resting = not_resting(now)
     );
     let mut values: Vec<rusqlite::types::Value> = Vec::with_capacity(groups.len() * 2 + 1);
     for (g, oldest) in groups {
@@ -385,7 +402,7 @@ fn claim_newest(
               candidates (grp, media, p_day, s_day) as materialized (
                   select w.g, w.media,
                          (select c.day from backfill_chunks c
-                          where c.grp = w.g and c.state = {PENDING} and c.day >= w.oldest
+                          where c.grp = w.g and c.state = {PENDING} and c.day >= w.oldest and {resting}
                           order by c.day desc limit 1),
                          (select c.day from backfill_chunks c
                           where c.grp = w.g and c.state = {CLAIMED} and c.day >= w.oldest and c.claimed_at < ?
@@ -405,7 +422,8 @@ fn claim_newest(
          where (grp, day) = (
              select grp, day from best where day is not null
              order by date(day * 86400, 'unixepoch', 'start of month') desc, media desc, day desc limit 1)
-         returning grp, day"
+         returning grp, day",
+        resting = not_resting(now)
     );
     let mut values: Vec<rusqlite::types::Value> = Vec::with_capacity(groups.len() * 3 + 4);
     for (g, oldest) in groups {
@@ -436,6 +454,20 @@ pub fn finish(conn: &Connection, claim: &Claim, now: i64) -> Result<bool> {
 }
 
 /// Return a claimed chunk to pending state. False when the claim was taken over.
+/// Give `claim` back after its run failed: it rests before it is tried again (see `FAIL_REST`). False when the
+/// claim no longer owns the chunk.
+pub fn fail(conn: &Connection, claim: &Claim, now: i64) -> Result<bool> {
+    let n = conn.execute(
+        &format!(
+            "update backfill_chunks set state = ?, server = null, claimed_at = null,
+                    failures = coalesce(failures, 0) + 1, failed_at = ?
+             where grp = ? and day = ? and state = {CLAIMED} and server = ? and claimed_at = ?"
+        ),
+        params![PENDING, now, claim.group, claim.day, claim.server, claim.claimed_at],
+    )?;
+    Ok(n > 0)
+}
+
 pub fn release(conn: &Connection, claim: &Claim) -> Result<bool> {
     let n = conn.execute(
         &format!(
@@ -615,6 +647,39 @@ pub fn split_groups(conn: &Connection) -> Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failed_chunk_rests_and_doesnt_hold_its_month() {
+        let c = Connection::open_in_memory().unwrap();
+        create(&c).unwrap();
+        // `new` has the newest month (2024-11-03), `old` only October
+        add(&c, "new", 20_030, 20_030).unwrap();
+        add(&c, "old", 20_020, 20_019).unwrap();
+        let all: Vec<(String, i64)> = ["new", "old"].iter().map(|g| (g.to_string(), i64::MIN)).collect();
+        let turn = |g: &str, host: &str, now| claim_turn(&c, (g.to_string(), i64::MIN), &all, host, now).unwrap();
+        assert!(turn("old", "a", 1000).is_none(), "November first: old waits");
+        let new = turn("new", "a", 1000).unwrap();
+        assert!(fail(&c, &new, 1000).unwrap());
+        assert!(!fail(&c, &new, 1000).unwrap(), "a claim gives it back once");
+        // resting, it neither is taken nor holds November
+        assert!(turn("new", "b", 1001).is_none());
+        let old = turn("old", "b", 1001).expect("October goes on while November rests");
+        assert_eq!(old.day, 20_020);
+        assert_eq!(claim(&c, &all, "c", 1001).unwrap().map(|k| k.day), Some(20_019), "nor does a free worker take it");
+        // after its rest it is the newest month again, and a second failure rests twice as long
+        let again = turn("new", "b", 1000 + FAIL_REST).unwrap();
+        assert!(fail(&c, &again, 1000 + FAIL_REST).unwrap());
+        assert!(turn("new", "b", 1000 + 2 * FAIL_REST).is_none());
+        assert!(turn("new", "b", 1000 + 3 * FAIL_REST).is_some());
+        // released (stopped, or a day this server lacks), it is taken again at once
+        let c2 = Connection::open_in_memory().unwrap();
+        create(&c2).unwrap();
+        add(&c2, "g", 20_030, 20_030).unwrap();
+        let g = vec![("g".to_string(), i64::MIN)];
+        let k = claim(&c2, &g, "a", 0).unwrap().unwrap();
+        assert!(release(&c2, &k).unwrap());
+        assert!(claim(&c2, &g, "b", 1).unwrap().is_some());
+    }
 
     #[test]
     fn per_group_counts_and_spans_each_groups_chunks() {

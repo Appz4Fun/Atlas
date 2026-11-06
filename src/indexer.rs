@@ -1386,6 +1386,12 @@ impl Drop for GiveBackOnDrop<'_> {
     }
 }
 
+/// Whether a day chunk that failed with `e` rests before it is tried again: not when this server lacks the day or the
+/// group, which another server takes at once.
+fn chunk_failure_rests(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<TooOld>().is_none() && e.downcast_ref::<NotCarried>().is_none()
+}
+
 /// A day chunk of `group` that only one server claims to have (its dates
 /// reach back further than any other's) came out with no article dated in
 /// that day: its dates went back further than its articles do (forged), and
@@ -1482,14 +1488,22 @@ where
     P: FnMut(&Progress) + ?Sized,
 {
     let (group, day) = (chunk.group.as_str(), chunk.day);
-    let release = || {
-        let c = chunk.clone();
-        on_db(db, move |conn| Ok(crate::chunks::release(conn, &c)?))
-    };
     // give the chunk back after `e`, and return `e`: failing to give it back
-    // is only logged (the claim goes stale and gets taken over)
+    // is only logged (the claim goes stale and gets taken over). A day this
+    // server doesnt have is the others' at once; any other failure rests the
+    // chunk (see `chunks::FAIL_REST`), so a day that fails every time doesnt
+    // hold every older one back
     let failed = async |e: anyhow::Error| {
-        if let Err(r) = release().await {
+        let c = chunk.clone();
+        let rests = chunk_failure_rests(&e);
+        let gave_back = on_db(db, move |conn| {
+            Ok(if rests {
+                crate::chunks::fail(conn, &c, chrono::Utc::now().timestamp())?
+            } else {
+                crate::chunks::release(conn, &c)?
+            })
+        });
+        if let Err(r) = gave_back.await {
             println!("[CHUNK] {group} day {day}: couldnt give the chunk back: {r:#}");
         }
         Err(e)
@@ -1653,7 +1667,9 @@ where
             Ok(saved)
         }
         Ranged { saved, .. } => {
-            release().await?;
+            // stopped part way, not failed: given back as it is
+            let c = chunk.clone();
+            on_db(db, move |conn| Ok(crate::chunks::release(conn, &c)?)).await?;
             Ok(saved)
         }
     }
