@@ -1263,3 +1263,17 @@ fn a_release_that_carries_data_is_no_sidecar() {
     settled(&h, "x");
     assert_eq!(sidecar(&h, "x"), None);
 }
+
+#[test]
+fn a_lone_cover_post_is_kept_as_a_sidecar_named_after_its_release_with_nothing_read() {
+    let mut h = fresh();
+    let name = "Some.Film.2024.1080p.WEB.H264-GRP-cover.jpg";
+    let s = shape(name).one(name, b"\xff\xd8\xff\xe0 a jpeg");
+    let state = serve(&mut h, &s, config());
+    settled(&h, name);
+    assert_eq!(bodies(&state), 0, "an image's body is never read");
+    assert_eq!(
+        sidecar(&h, name),
+        Some(("image".into(), Some("Some.Film.2024.1080p.WEB.H264-GRP".into()), None, false))
+    );
+}

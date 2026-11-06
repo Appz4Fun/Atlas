@@ -1351,6 +1351,14 @@ pub(crate) fn seed_shard(
         }
         set("pp_sidecar_seen", now)?;
     }
+    // and its image twin, for the same reason: new cover posts get it on their first visit
+    if meta("pp_sidecar_image_seen")?.is_none() {
+        let bit = crate::postprocess::step::mask(crate::sidecar::SIDECAR_IMAGE_STEP);
+        if seeded && enabled & bit != 0 {
+            set("pp_steps_seen", meta("pp_steps_seen")?.unwrap_or(0) | bit)?;
+        }
+        set("pp_sidecar_image_seen", now)?;
+    }
     let seen = meta("pp_steps_seen")?.unwrap_or(0);
     let new = if seeded { enabled & !seen } else { enabled };
     if seeded && new != 0 {

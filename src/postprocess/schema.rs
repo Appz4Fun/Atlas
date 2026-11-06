@@ -91,7 +91,13 @@ pub const NET_RANK: &str = "coalesce((select max(case
                 and not exists (select 1 from files f where f.release_id = r.id and not (
                     f.filename like '%.nfo' or f.filename like '%.txt' or f.filename like '%.sfv'
                     or f.filename like '%.srr' or f.filename like '%.srs' or f.filename like '%.md5'
-                    or f.filename like '%.sha1' or f.filename like '%.diz'))
+                    or f.filename like '%.sha1' or f.filename like '%.diz'
+                    or f.filename like '%.jpg' or f.filename like '%.jpeg' or f.filename like '%.png'
+                    or f.filename like '%.gif' or f.filename like '%.webp'))
+                and ((select count(*) from files f where f.release_id = r.id) = 1
+                    or exists (select 1 from files f where f.release_id = r.id and not (
+                        f.filename like '%.jpg' or f.filename like '%.jpeg' or f.filename like '%.png'
+                        or f.filename like '%.gif' or f.filename like '%.webp')))
                 then 5
             when exists (select 1 from files f where f.release_id = r.id and f.filename like '%.nzb')
                 or exists (select 1 from nzb_pointed p where p.release_id = r.id) then 3

@@ -16,7 +16,8 @@ pub const NOT_TV_MOVIES: &str = "not_tv_movies";
 /// the small rule's size (0: off), ?4 1 when the small rule leaves movies and TV alone, ?5 1 when the not-TV/movies
 /// rule is on, ?7 1 when the sidecar rule is on.
 /// Sidecar: a post of nothing but what describes a release and carries none of it, an NFO, a mediainfo or other text
-/// file, an SFV, an SRR (`SIDECAR_FILES`), of at most `SIDECAR_BYTES`, with no `[n/N]` promising files it hasn't got:
+/// file, an SFV, an SRR (`SIDECAR_FILES`), with cover images beside them or a lone cover image (`SIDECAR_IMAGES`), of
+/// at most `SIDECAR_BYTES`, with no `[n/N]` promising files it hasn't got:
 /// not a release of its own, whatever its category or completeness. If more of the post comes, it thaws and is one.
 /// Small: complete means every file it says it has (its subjects' `[n/N]`), each with all its parts: a release whose
 /// subjects give no file count is complete as far as it has come, and can still grow past the size, soo it stays live.
@@ -35,7 +36,13 @@ macro_rules! matching {
                 and not exists (select 1 from files f where f.release_id = r.id and not (
                     f.filename like '%.nfo' or f.filename like '%.txt' or f.filename like '%.sfv'
                     or f.filename like '%.srr' or f.filename like '%.srs' or f.filename like '%.md5'
-                    or f.filename like '%.sha1' or f.filename like '%.diz'))
+                    or f.filename like '%.sha1' or f.filename like '%.diz'
+                    or f.filename like '%.jpg' or f.filename like '%.jpeg' or f.filename like '%.png'
+                    or f.filename like '%.gif' or f.filename like '%.webp'))
+                and ((select count(*) from files f where f.release_id = r.id) = 1
+                    or exists (select 1 from files f where f.release_id = r.id and not (
+                        f.filename like '%.jpg' or f.filename like '%.jpeg' or f.filename like '%.png'
+                        or f.filename like '%.gif' or f.filename like '%.webp')))
                 then 'sidecar'
             when ?3 > 0 and r.complete = 1 and coalesce(r.file_total, 0) > 0 and r.size > 0 and r.size < ?3
                 and (?4 = 0 or c.category is null
@@ -67,6 +74,8 @@ const STILL: &str = concat!("select exists (select 1 from (", matching!(), ") wh
 /// What the sidecar rule takes at most, in bytes; and the file kinds it takes, as the rule spells them
 pub const SIDECAR_BYTES: i64 = 4 << 20;
 pub const SIDECAR_FILES: &[&str] = &["nfo", "txt", "sfv", "srr", "srs", "md5", "sha1", "diz"];
+/// and the images it takes: beside those files, or one alone, a cover or poster posted on its own
+pub const SIDECAR_IMAGES: &[&str] = &["jpg", "jpeg", "png", "gif", "webp"];
 
 /// Whether any rule is on: a visit checks nothing otherwise.
 pub fn any_on() -> bool {
@@ -121,8 +130,16 @@ const BACKLOG_RULES: &str = "freeze_backlog_rules";
 /// The rules as they are now, as one number.
 fn signature() -> i64 {
     let (small, keep_video, not_tv, sidecar) = settings();
-    small.wrapping_mul(8).wrapping_add(sidecar * 4 + keep_video * 2 + not_tv)
+    small
+        .wrapping_mul(8)
+        .wrapping_add(sidecar * 4 + keep_video * 2 + not_tv)
+        .wrapping_mul(16)
+        .wrapping_add(RULES_VERSION)
 }
+
+/// Raised when a rule takes in releases it didn't before, soo the backlog walk looks at every release again under it.
+/// 2: the sidecar rule takes cover images.
+const RULES_VERSION: i64 = 2;
 
 fn meta(conn: &Connection, key: &str) -> Result<Option<i64>> {
     conn.prepare_cached("select value from main.meta where key = ?1")?.query_row([key], |r| r.get(0)).optional()
