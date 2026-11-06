@@ -142,9 +142,11 @@ fn signature() -> i64 {
         .wrapping_add(RULES_VERSION)
 }
 
-/// Raised when a rule takes in releases it didn't before, soo the backlog walk looks at every release again under it.
+/// Raised when a rule takes in releases it didn't before, or the walk does more with what it looks at, soo the backlog
+/// walk looks at every release again under it.
 /// 2: the sidecar rule takes cover images.
-const RULES_VERSION: i64 = 2;
+/// 3: the walk gives a queued release the reason that matches it now.
+const RULES_VERSION: i64 = 3;
 
 fn meta(conn: &Connection, key: &str) -> Result<Option<i64>> {
     conn.prepare_cached("select value from main.meta where key = ?1")?.query_row([key], |r| r.get(0)).optional()
