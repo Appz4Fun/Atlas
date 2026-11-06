@@ -111,17 +111,34 @@ pub fn note_read(conn: &mut Connection, server: &str, last: u64, spots: &[Noted]
     Ok(added)
 }
 
-/// Spots to fetch: each spotter's newest first, a spotter at a time in turn (`PER_SPOTTER` deep at most).
+/// Spots to fetch. Half of `limit` goes to the oldest waiting, whoever posted them, so every spot gets its turn
+/// however many new ones come in. The rest goes to each spotter's newest, a spotter at a time in turn
+/// (`PER_SPOTTER` deep at most).
 pub fn todo(conn: &Connection, limit: usize) -> Result<Vec<String>> {
-    conn.prepare_cached(
-        "select message_id from (
-            select message_id, number,
-                row_number() over (partition by coalesce(spotter, '') order by number desc) as turn
-            from spots_seen where state = ?1
-         ) where turn <= ?2 order by turn, number desc limit ?3",
-    )?
-    .query_map(params![TODO, PER_SPOTTER, limit as i64], |r| r.get(0))?
-    .collect()
+    let oldest: Vec<String> = conn
+        .prepare_cached("select message_id from spots_seen where state = ?1 order by number limit ?2")?
+        .query_map(params![TODO, (limit / 2) as i64], |r| r.get(0))?
+        .collect::<Result<_>>()?;
+    let newest: Vec<String> = conn
+        .prepare_cached(
+            "select message_id from (
+                select message_id, number,
+                    row_number() over (partition by coalesce(spotter, '') order by number desc) as turn
+                from spots_seen where state = ?1
+             ) where turn <= ?2 order by turn, number desc limit ?3",
+        )?
+        .query_map(params![TODO, PER_SPOTTER, limit as i64], |r| r.get(0))?
+        .collect::<Result<_>>()?;
+    let mut out = oldest;
+    for id in newest {
+        if out.len() >= limit {
+            break;
+        }
+        if !out.contains(&id) {
+            out.push(id);
+        }
+    }
+    Ok(out)
 }
 
 /// Gives up on spots waiting past `TODO_DAYS` and on the oldest past `MAX_TODO`, and forgets settled ones past
@@ -238,18 +255,44 @@ pub fn tag_copy(conn: &Connection, row: &SpotRow) -> Result<Option<i64>> {
     Ok(Some(id))
 }
 
-/// Whether the release named `name` in `group` came from a spot with another NZB: then a spot of the same title
-/// and group is another upload, and must not be folded into it.
-pub fn name_taken(conn: &Connection, name: &str, group: &str, nzb_key: &str) -> Result<bool> {
-    let other: Option<String> = conn
-        .query_row(
-            "select s.nzb_key from releases r join spots s on s.release_id = r.id
-             where r.name = ? and r.group_name = ? and s.nzb_key is not ?",
-            params![name, group, nzb_key],
-            |r| r.get(0),
-        )
+/// Where a spot's release can go, by its title and group.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Placement {
+    /// no release has the name
+    Free,
+    /// the release with the name is this post: the spot's articles can join it
+    SamePost(i64),
+    /// another post has the name; folding into it would mix posts
+    Taken,
+}
+
+/// Whether the release named `name` in `group`, if there is one, is the post a spot's NZB lists: tagged with the
+/// same NZB, or holding every message-id of `sample` (the first article of each file). A release that only shares
+/// the title, spot or not, is another post: a spot can't add articles to it.
+pub fn placement(conn: &Connection, name: &str, group: &str, nzb_key: &str, sample: &[String]) -> Result<Placement> {
+    let id: Option<i64> = conn
+        .query_row("select id from releases where name = ? and group_name = ?", params![name, group], |r| r.get(0))
         .optional()?;
-    Ok(other.is_some())
+    let Some(id) = id else { return Ok(Placement::Free) };
+    let same_nzb = conn
+        .prepare_cached("select 1 from spots where release_id = ? and nzb_key = ?")?
+        .exists(params![id, nzb_key])?;
+    if same_nzb {
+        return Ok(Placement::SamePost(id));
+    }
+    if sample.is_empty() {
+        return Ok(Placement::Taken);
+    }
+    // every message-id of the release, sealed files' too, by their keyed hash
+    let key = crate::store::IdKey::of(conn)?;
+    crate::store::index_release(conn, &key, id)?;
+    let mut has = conn.prepare_cached("select 1 from release_ids where release_id = ? and id_hash = ?")?;
+    for message_id in sample {
+        if !has.exists(params![id, key.hash(&format!("<{message_id}>"))])? {
+            return Ok(Placement::Taken);
+        }
+    }
+    Ok(Placement::SamePost(id))
 }
 
 /// The release's spot row, unless it already has a newer spot (by when the spot was made): spots are fetched
@@ -305,7 +348,7 @@ mod tests {
         assert_eq!(note_read(&mut conn, "news.example", 25, &spots, 2).unwrap(), 0);
         assert_eq!(cursor(&conn, "news.example").unwrap(), Some(25));
         assert_eq!(cursor(&conn, "other").unwrap(), None);
-        assert_eq!(todo(&conn, 10).unwrap(), ["b@spot.net", "a@spot.net"]);
+        assert_eq!(todo(&conn, 10).unwrap(), ["a@spot.net", "b@spot.net"]);
     }
 
     #[test]
@@ -369,7 +412,7 @@ mod tests {
     }
 
     #[test]
-    fn an_older_copy_keeps_the_newer_spot_and_another_nzb_takes_the_name() {
+    fn an_older_copy_keeps_the_newer_spot() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("create table releases (id INTEGER PRIMARY KEY, name TEXT, group_name TEXT)").unwrap();
         conn.execute("insert into releases values (5, 'Movie (2026)', 'g')", []).unwrap();
@@ -382,15 +425,10 @@ mod tests {
             spotter_id: None,
             nzb_key: "k1".into(),
         };
-        assert!(!name_taken(&conn, "Movie (2026)", "g", "k1").unwrap());
         assert_eq!(tag(&conn, "Movie (2026)", "g", &row("new@spot.net", "Edited", 200)).unwrap(), Some(5));
         assert_eq!(tag_copy(&conn, &row("old@spot.net", "Original", 100)).unwrap(), Some(5));
         let title: String = conn.query_row("select title from spots", [], |r| r.get(0)).unwrap();
         assert_eq!(title, "Edited");
-        // the same title with another NZB is another upload; the same NZB isn't
-        assert!(name_taken(&conn, "Movie (2026)", "g", "k2").unwrap());
-        assert!(!name_taken(&conn, "Movie (2026)", "g", "k1").unwrap());
-        assert!(!name_taken(&conn, "Movie (2026)", "other", "k2").unwrap());
     }
 
     #[test]
@@ -402,10 +440,16 @@ mod tests {
         spots.push(("b1@spot.net".into(), 1, Some("B".into())));
         spots.push(("b2@spot.net".into(), 2, Some("B".into())));
         note_read(&mut conn, "s", 200, &spots, 0).unwrap();
+        // half to the oldest, whoever posted them; the rest to spotters in turn, newest first
         let first = todo(&conn, 4).unwrap();
-        assert_eq!(first, ["flood29@spot.net", "b2@spot.net", "flood28@spot.net", "b1@spot.net"]);
-        // the flooder gets PER_SPOTTER a round at most
-        assert_eq!(todo(&conn, 1000).unwrap().len(), PER_SPOTTER as usize + 2);
+        assert_eq!(first, ["b1@spot.net", "b2@spot.net", "flood29@spot.net", "flood28@spot.net"]);
+        // flooded with new keys, the oldest still get half of every round
+        let fresh: Vec<Noted> =
+            (0..50).map(|n| (format!("key{n}@spot.net"), 1000 + n, Some(format!("K{n}")))).collect();
+        note_read(&mut conn, "s", 2000, &fresh, 0).unwrap();
+        let round = todo(&conn, 10).unwrap();
+        assert_eq!(&round[..2], ["b1@spot.net", "b2@spot.net"]);
+        assert!(round[2..5].iter().all(|id| id.starts_with("flood")), "{round:?}");
     }
 
     #[test]
@@ -461,5 +505,53 @@ mod tests {
         assert_eq!(tag_release(&conn, 7, &row).unwrap(), 7);
         let n: i64 = conn.query_row("select count(*) from spots", [], |r| r.get(0)).unwrap();
         assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn a_spot_joins_a_release_only_when_it_is_the_same_post() {
+        let path = tempfile::tempdir().unwrap();
+        let shard = path.path().join("s.db");
+        crate::store::create_shard(&shard).unwrap();
+        let conn = crate::db::open_shard(&shard).unwrap();
+        let mut writer = crate::store::ShardWriter::new(0);
+        let ids = crate::store::Ids::new(&path.path().join("main.db"));
+        let main = Connection::open(path.path().join("main.db")).unwrap();
+        crate::store::create_main(&main).unwrap();
+        let article = |id: &str, file: &str| crate::parser::Article {
+            message_id: format!("<{id}>"),
+            filename: Some(file.into()),
+            release_name: Some("Title".into()),
+            part: Some(1),
+            total_parts: Some(1),
+            ..Default::default()
+        };
+        let release = crate::parser::Release {
+            name: "Title".into(),
+            group: "alt.binaries.g".into(),
+            articles: vec![article("a@x", "a.mkv"), article("b@x", "b.par2")],
+            ..Default::default()
+        };
+        let mut conn = conn;
+        writer.save(&mut conn, &ids, [std::slice::from_ref(&release)]).unwrap();
+        let sample = |l: &[&str]| l.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(placement(&conn, "Other", "alt.binaries.g", "k", &sample(&["a@x"])).unwrap(), Placement::Free);
+        let Placement::SamePost(id) =
+            placement(&conn, "Title", "alt.binaries.g", "k", &sample(&["a@x", "b@x"])).unwrap()
+        else {
+            panic!("the same post")
+        };
+        // one article it doesn't have, or nothing to tell by: another post under the same title
+        assert_eq!(
+            placement(&conn, "Title", "alt.binaries.g", "k", &sample(&["a@x", "evil@x"])).unwrap(),
+            Placement::Taken
+        );
+        assert_eq!(placement(&conn, "Title", "alt.binaries.g", "k", &[]).unwrap(), Placement::Taken);
+        // tagged with the same NZB: the same post
+        conn.execute(
+            "insert into spots (release_id, message_id, kind, title, nzb_key) values (?, 'm', 'movie', 'T', 'k')",
+            [id],
+        )
+        .unwrap();
+        assert_eq!(placement(&conn, "Title", "alt.binaries.g", "k", &[]).unwrap(), Placement::SamePost(id));
     }
 }

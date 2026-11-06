@@ -200,12 +200,15 @@ async fn fetch(pool: &Pool, db: &Db, message_id: &str, posted: &mut usize) -> Re
     if let Some(id) = on_shard(db, shard, move |conn| store::tag_copy(conn, &copy_row)).await? {
         return Ok(settled(Some(id)));
     }
-    // another upload already saved under this spot title and group: this one gets a name of its own, rather than
-    // having its articles folded into that release
+    // the title and group may already be a release: the spot's articles join it only when it is the same post
+    // (the first article of every file in it); another post under the title gets the spot a name of its own
+    let sample: Vec<String> =
+        parsed.files.iter().take(64).filter_map(|f| f.segments.first().map(|s| s.message_id.clone())).collect();
     let (check_name, check_group, key) = (release.name.clone(), group.clone(), nzb_key.clone());
-    let taken = on_shard(db, shard, move |conn| store::name_taken(conn, &check_name, &check_group, &key)).await?;
+    let placed =
+        on_shard(db, shard, move |conn| store::placement(conn, &check_name, &check_group, &key, &sample)).await?;
     let mut release = release;
-    if taken {
+    if placed == store::Placement::Taken {
         let own = format!("{} [{}]", release.name, &nzb_key[..8]);
         release::rename(&mut release, &own);
     }
