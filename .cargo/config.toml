@@ -7,3 +7,11 @@ ATLAS_HOME = { value = ".", relative = true }
 # every allocation (memory statistics) and every page cache access (one shared
 # cache group): with a writer per shard plus readers, threads queued on them
 LIBSQLITE3_FLAGS = "-USQLITE_ENABLE_MEMORY_MANAGEMENT -DSQLITE_DEFAULT_MEMSTATUS=0"
+
+# Apple Silicon builds use every instruction the building Mac has (prod is an
+# M5 and builds itself, so this is apple-m5 there). A binary built this way may
+# not run on an older chip: build for the oldest Mac that will run it instead
+# (RUSTFLAGS="-C target-cpu=apple-m1"), as the release workflow does. Linux,
+# Windows and Docker builds are untouched. Per-function dispatch: docs/TODO.md.
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "target-cpu=native"]

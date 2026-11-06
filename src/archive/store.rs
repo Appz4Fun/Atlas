@@ -155,6 +155,11 @@ pub fn par2_file_writes(
             ],
         ));
     }
+    // a whole set says which files the upload has: with each of them there and whole, so is the release, whatever
+    // its subject counter says (`store::SET_VOUCHED_COMPLETE`)
+    if inventory.complete && !inventory.files.is_empty() {
+        writes.push(StepWrite::new(crate::store::SET_VOUCHED_COMPLETE, vec![release_id.into()]));
+    }
     writes
 }
 

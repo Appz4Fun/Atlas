@@ -13,6 +13,7 @@ use crate::postprocess::schema::ShardTable;
 use crate::postprocess::step::{
     BodyRequest, Got, Needs, Outcome, ReleaseInfo, Reruns, Step, StepCtx, StepError, StepId, StepWrite,
 };
+use crate::probe::nfo_store;
 use crate::store::SegmentPick;
 
 use super::Media;
@@ -279,6 +280,16 @@ impl Step for MediaLookup {
     fn applies(&self, r: &ReleaseInfo) -> bool {
         target_of(&self.0, r).is_some_and(|(kind, p)| self.0.wants(kind, key_of(kind, &p), r.id, now_secs()))
     }
+    /// Without `wants`, which claims a title for the release that asks: the page mustn't.
+    fn skip_reason(&self, r: &ReleaseInfo) -> Option<&'static str> {
+        match target_of(&self.0, r) {
+            None => Some("no movie or TV title in its name to look up"),
+            Some((kind, p)) if self.0.looked_up(kind, key_of(kind, &p), now_secs()) => {
+                Some("its title's IDs are already known, or it was looked up lately")
+            }
+            Some(_) => None,
+        }
+    }
     fn run(&self, ctx: &mut StepCtx<'_>) -> Result<Outcome, StepError> {
         if ctx.stopping() {
             return Err(StepError::Stopped);
@@ -359,6 +370,14 @@ impl Step for MediaNfo {
     fn applies(&self, r: &ReleaseInfo) -> bool {
         target_of(&self.0, r).is_some_and(|(kind, p)| kind == Kind::Movie && !self.0.imdb_known(key_of(kind, &p)))
     }
+    fn skip_reason(&self, r: &ReleaseInfo) -> Option<&'static str> {
+        match target_of(&self.0, r) {
+            None => Some("no movie title in its name to find an IMDb id for"),
+            Some((Kind::Tv, _)) => Some("an episode: only a movie's NFO is read for its IMDb id"),
+            Some((kind, p)) if self.0.imdb_known(key_of(kind, &p)) => Some("its title's IMDb id is already known"),
+            Some(_) => None,
+        }
+    }
     fn run(&self, ctx: &mut StepCtx<'_>) -> Result<Outcome, StepError> {
         let retry = |e: rusqlite::Error| StepError::Retry(e.to_string());
         let id = ctx.release().id;
@@ -372,15 +391,28 @@ impl Step for MediaNfo {
         }
         let files = ctx.files().map_err(retry)?;
         let Some(file) = nfo_sources(&files).into_iter().next() else { return Ok(Outcome::default()) };
+        let par2_names = crate::archive::select::par2_name_map(ctx.conn(), id, &files);
+        let par2_name = par2_names.get(&file.filename).map(String::as_str);
+        // an NFO the probe or another step read is used as it was kept, not fetched again
+        if let Some(kept) = nfo_store::stored(ctx.conn(), id).filter(|k| k.is_of(&file.filename, par2_name)) {
+            let Some(imdb) = imdb_in_nfo(kept.text.as_bytes()) else { return Ok(Outcome::default()) };
+            let write = StepWrite::new(NFO_IMDB, vec![id.into(), imdb.into()]);
+            return Ok(Outcome { matched: true, writes: vec![write], ..Outcome::default() });
+        }
         let segment = ctx.segments(file.id, &SegmentPick::First(1)).map_err(retry)?.into_iter().next();
         let Some(segment) = segment.filter(|s| s.part.is_none_or(|p| p <= 1)) else { return Ok(Outcome::default()) };
         let wanted =
             [BodyRequest { message_id: segment.message_id, file: file.filename.clone(), max_bytes: Some(NFO_READ) }];
         let got = ctx.fetch_bodies(&wanted)?.into_iter().next();
         let Some(Got::Body(body)) = got.map(|b| b.got) else { return Ok(Outcome::default()) };
-        let Some(imdb) = imdb_in_nfo(&body) else { return Ok(Outcome::default()) };
-        let write = StepWrite::new(NFO_IMDB, vec![id.into(), imdb.into()]);
-        Ok(Outcome { matched: true, writes: vec![write], ..Outcome::default() })
+        // kept whole only: a read cut at `NFO_READ` isn't the NFO for the next reader
+        let mut writes: Vec<StepWrite> = (body.len() < NFO_READ)
+            .then(|| nfo_store::keep(id, &file.filename, &crate::probe::nfo_text(&body)))
+            .into_iter()
+            .collect();
+        let Some(imdb) = imdb_in_nfo(&body) else { return Ok(Outcome { writes, ..Outcome::default() }) };
+        writes.push(StepWrite::new(NFO_IMDB, vec![id.into(), imdb.into()]));
+        Ok(Outcome { matched: true, writes, ..Outcome::default() })
     }
 }
 

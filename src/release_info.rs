@@ -1412,8 +1412,10 @@ pub fn password_hint(id: i64, names: Option<&Names>) -> Option<PasswordHint> {
 
 pub fn password_hint_with(conn: &Connection, id: i64, names: Option<&Names>) -> Option<PasswordHint> {
     let hint = |password: String, source| Some(PasswordHint { password, source });
+    // every step keeps what it found in the one table, wherever it found it: the page says where it is to be seen
     if let Some(password) = crate::archive::store::nfo_password(conn, id) {
-        return hint(password, "the NFO");
+        let source = stored_password_source(conn, id, &password, names);
+        return hint(password, source);
     }
     for name in names.into_iter().flat_map(|n| [Some(&n.posted), n.display.as_ref()]).flatten() {
         if let Some(password) = find_password(name) {
@@ -1454,6 +1456,57 @@ pub fn password_hint_with(conn: &Connection, id: i64, names: Option<&Names>) -> 
     None
 }
 
+/// Where a password kept in `release_nfo_password` is written, for the page: the steps that find one by trying the
+/// words of a name, a PAR2 set or an NFO against the archive's check keep it with nothing of where it came from.
+fn stored_password_source(conn: &Connection, id: i64, password: &str, names: Option<&Names>) -> &'static str {
+    const ELSEWHERE: &str = "another copy of this post, or a posted NZB";
+    if password.is_empty() {
+        return ELSEWHERE;
+    }
+    let s = store::shard_of_id(id);
+    let in_it = |text: &str| text.contains(password);
+    let read_names = || -> Option<(String, Option<String>)> {
+        conn.query_row(&format!("select name, display_name from s{s}.releases where id = ?"), [id], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .ok()
+    };
+    let (posted, display) = match names {
+        Some(n) => (Some(n.posted.clone()), n.display.clone()),
+        None => read_names().map_or((None, None), |(p, d)| (Some(p), d)),
+    };
+    if posted.as_deref().is_some_and(in_it) {
+        return if display.is_some() { "the original article name" } else { "the release name" };
+    }
+    if display.as_deref().is_some_and(in_it) {
+        return "the release name";
+    }
+    let column = |sql: &str| -> Vec<Option<String>> {
+        conn.prepare(&sql.replace("{s}", &s.to_string()))
+            .and_then(|mut stmt| stmt.query_map([id], |r| r.get(0))?.collect())
+            .unwrap_or_default()
+    };
+    let filenames = column("select filename from s{s}.files where release_id = ? order by id limit 256");
+    if filenames.iter().flatten().any(|f| in_it(f)) {
+        return "a file name";
+    }
+    let subjects = column("select subject from s{s}.files where release_id = ? order by id limit 256");
+    if subjects.iter().flatten().any(|f| in_it(f)) {
+        return "the article subject";
+    }
+    let par2 = column("select name from s{s}.par2_files where release_id = ? limit 256");
+    if par2.iter().flatten().any(|f| in_it(f)) {
+        return "a file name in the PAR2 set";
+    }
+    if crate::archive::store::view_with(conn, id).files.iter().any(|f| in_it(&f.name)) {
+        return "a file inside";
+    }
+    if crate::probe::nfo_store::any_text(conn, id).is_some_and(|text| in_it(&text)) {
+        return "the NFO";
+    }
+    ELSEWHERE
+}
+
 /// The likeliest password `archive::PasswordHarvester` reads out of one line, if any.
 pub fn harvested_password(text: &str) -> Option<String> {
     let none = std::collections::HashMap::new();
@@ -1481,6 +1534,46 @@ mod tests {
         let hint = password_hint_with(&conn, 8, None).unwrap();
         assert_eq!((hint.password.as_str(), hint.source), ("s3cret", "a file inside"));
         assert!(password_hint_with(&conn, 16, None).is_none());
+    }
+
+    #[test]
+    fn a_kept_password_says_where_it_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("atlas.s0.db");
+        store::create_shard(&path).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute("attach database ?1 as s0", [path.to_string_lossy()]).unwrap();
+        conn.execute_batch(
+            "insert into s0.releases (id, name, group_name, display_name) values
+                 (8, 'YMFFZeoeVI6fG4iz', 'a.b.ftd', 'Gone.with.the.Wind.1939-GRP'),
+                 (16, 'Some.Post-GRP', 'a.b.test', null),
+                 (24, 'Other.Post-GRP', 'a.b.test', null),
+                 (32, 'Third.Post-GRP', 'a.b.test', null),
+                 (40, 'Fourth.Post-GRP', 'a.b.test', null),
+                 (48, 'q8w7e6r5', 'a.b.test', null);
+             insert into s0.files (id, release_id, filename, subject, seen) values
+                 (8, 8, 'YMFFZeoeVI6fG4iz.part001.rar', '[1/441] YMFFZeoeVI6fG4iz.part001.rar yEnc (1/400)', x'00'),
+                 (16, 16, 'k3m9x.part01.rar', 'k3m9x.part01.rar yEnc (1/50)', x'00'),
+                 (24, 24, 'Other.Post.part01.rar', 'Other.Post [pw x7Q2p] yEnc (1/50)', x'00'),
+                 (32, 32, 'Third.Post.part01.rar', 'Third.Post.part01.rar yEnc (1/50)', x'00'),
+                 (40, 40, 'Fourth.Post.part01.rar', 'Fourth.Post.part01.rar yEnc (1/50)', x'00'),
+                 (48, 48, 'a1b2c3.rar', 'a1b2c3.rar yEnc (1/50)', x'00');
+             insert into s0.par2_files (release_id, file_id, set_id, md5, md5_16k, size, name)
+                 values (48, x'01', x'02', x'03', x'04', 10, 'Renamed.Post-Zq9vK2.rar');
+             insert into s0.release_nfo_password (release_id, password) values
+                 (8, 'YMFFZeoeVI6fG4iz'), (16, 'k3m9x'), (24, 'x7Q2p'), (32, 'n0tH3re'), (40, 'fr0mNfo'), (48, 'Zq9vK2');
+             insert into s0.release_nfo (release_id, file, text) values (40, 'Fourth.nfo', 'Password: fr0mNfo');",
+        )
+        .unwrap();
+        let source = |id| password_hint_with(&conn, id, None).unwrap().source;
+        assert_eq!(source(8), "the original article name", "not the NFO: there is none");
+        assert_eq!(source(16), "a file name");
+        assert_eq!(source(24), "the article subject");
+        assert_eq!(source(32), "another copy of this post, or a posted NZB");
+        assert_eq!(source(40), "the NFO");
+        assert_eq!(source(48), "a file name in the PAR2 set");
+        let names = Names { posted: "YMFFZeoeVI6fG4iz".into(), display: None, obfuscated: true, source: None };
+        assert_eq!(password_hint_with(&conn, 8, Some(&names)).unwrap().source, "the release name");
     }
 
     #[test]

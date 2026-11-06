@@ -271,6 +271,16 @@ impl Media {
         })
     }
 
+    /// Whether `wants` passes this title over for what's known of it: its IDs found, or looked up lately with
+    /// every provider that asks. Claims nothing, for the release page.
+    pub fn looked_up(&self, kind: Kind, key: i64, now: i64) -> bool {
+        let enabled =
+            self.providers.read().unwrap().iter().filter(|p| p.asks(kind)).fold(0u8, |bits, p| bits | p.bit());
+        let at = u32::try_from(now).unwrap_or(u32::MAX);
+        let known = self.known.read().unwrap().get(&key).copied();
+        enabled != 0 && known.is_some_and(|k| enabled & !k.checked == 0 && (k.found || at < k.next_check))
+    }
+
     /// Should this release take its title to the net lane? One release of a title goes at a time.
     pub fn wants(&self, kind: Kind, key: i64, release_id: i64, now: i64) -> bool {
         if self.open_failed.load(Relaxed) {

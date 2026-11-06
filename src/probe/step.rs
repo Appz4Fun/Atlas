@@ -19,7 +19,7 @@ use super::{
 pub const PROBE_STEP: StepId = StepId(4);
 
 /// The most text kept from an NFO.
-const MAX_NFO: usize = 256 * 1024;
+const MAX_NFO: usize = super::nfo_store::MAX_CHARS;
 
 #[derive(Default)]
 pub struct ProbeStep {
@@ -491,16 +491,31 @@ impl Step for ProbeStep {
                 || par2_names.get(&f.filename).is_some_and(|p| is_small_text(p))
                 || f.subject.as_deref().is_some_and(crate::nfo::is_nfo)
         };
+        // an NFO read before, by this probe's last run or by a step that came first, isn't fetched again
+        let mut kept = super::nfo_store::stored(ctx.conn(), release_id);
         for file in files.iter().filter(|f| is_text_or_par2_text(f)).take(3) {
-            let Some(seg) = ctx.segments(file.id, &SegmentPick::First(1)).map_err(retry)?.into_iter().next() else {
-                continue;
+            let par2_name = par2_names.get(&file.filename);
+            let eff_name = par2_name.unwrap_or(&file.filename);
+            let is_sfv = eff_name.to_ascii_lowercase().ends_with(".sfv");
+            let reused = match &kept {
+                Some(k) if !is_sfv && k.is_of(&file.filename, par2_name.map(String::as_str)) => kept.take(),
+                _ => None,
             };
-            let Got::Body(raw) = fetch_raw(ctx, &seg.message_id, &file.filename)? else { continue };
-            let article = yenc::split_article(&raw);
-            let body = yenc_decode(&article.lines).unwrap_or_else(|| article.lines.join(&b'\n'));
-            let text = nfo_text(&body);
-            let eff_name = par2_names.get(&file.filename).unwrap_or(&file.filename);
-            if eff_name.to_ascii_lowercase().ends_with(".sfv") {
+            // `from_start`: read from the file's first article, the NFO's start, soo a reader after it can use it
+            let (text, from_start) = match reused {
+                Some(k) => (k.text, true),
+                None => {
+                    let Some(seg) = ctx.segments(file.id, &SegmentPick::First(1)).map_err(retry)?.into_iter().next()
+                    else {
+                        continue;
+                    };
+                    let Got::Body(raw) = fetch_raw(ctx, &seg.message_id, &file.filename)? else { continue };
+                    let article = yenc::split_article(&raw);
+                    let body = yenc_decode(&article.lines).unwrap_or_else(|| article.lines.join(&b'\n'));
+                    (nfo_text(&body), seg.part.is_none_or(|p| p <= 1))
+                }
+            };
+            if is_sfv {
                 info.sfv = parse_sfv(&text);
             } else {
                 if found_nfo_password.is_none()
@@ -516,6 +531,16 @@ impl Step for ProbeStep {
                 if info.nfo.is_none() {
                     info.imdb_ids = imdb_ids(&text);
                     info.nfo = Some(text.chars().take(MAX_NFO).collect());
+                    // a later article's text isn't the NFO: no file, soo nothing reuses it and the next run reads
+                    // the first article once it's there
+                    if from_start {
+                        info.nfo_file = Some(file.filename.clone());
+                        // the probe's JSON holds it now: a copy a step kept goes
+                        writes.push(StepWrite::new(
+                            super::nfo_store::DROP,
+                            vec![release_id.into(), file.filename.clone().into()],
+                        ));
+                    }
                 }
             }
         }

@@ -761,6 +761,22 @@ def progress():
     b.graph("Queue rows taken a minute, per shard", [q('rate(atlas_stage_lane_total{lane="queue_taken"}[5m]) * 60', "shard {{shard}}")], w=8, colors=SHARD_COLORS,
             description="The database lane.")
 
+    b.row("Freezing")
+    b.stat("Queued to freeze", 'sum(atlas_freeze_pending{state="queued"})', w=6,
+           description="Releases the freezing rules queued to move out of the shards. Counted every 5 minutes.")
+    b.stat("Ready to move", 'sum(atlas_freeze_pending{state="ready"})', w=6,
+           description="Of those, the ones queued longer than wait_hours (12 by default), which the writers move now.")
+    b.stat("Frozen a minute", 'sum(rate(atlas_frozen_events_total{event="frozen"}[10m])) * 60', w=6)
+    b.stat("Longest queued", "time() - min(atlas_freeze_pending_oldest_timestamp_seconds)", "s", w=6,
+           description="Moves start once this passes wait_hours. A visit to a release queues it afresh.")
+    b.graph("Queued per shard", [q('atlas_freeze_pending{state="queued"}', "shard {{shard}}")], w=8, colors=SHARD_COLORS)
+    b.graph("Ready per shard", [q('atlas_freeze_pending{state="ready"}', "shard {{shard}}")], w=8, colors=SHARD_COLORS)
+    b.graph("Freezing a minute", [
+        q('sum(rate(atlas_frozen_events_total{event="frozen"}[5m])) * 60', "frozen"),
+        q('sum(rate(atlas_frozen_events_total{event="backlog_queued"}[5m])) * 60', "queued by the backlog walk"),
+        q('sum(rate(atlas_frozen_events_total{event="busy"}[5m])) * 60', "ticks the lock was busy"),
+    ], w=8, colors={"frozen": SERIES[0], "queued by the backlog walk": SERIES[1], "ticks the lock was busy": SERIES[2]})
+
     b.row("Errors")
     bad = [{"color": GOOD, "value": None}, {"color": CRITICAL, "value": 1}]
     b.stat("Step panics in range", "sum(increase(atlas_step_panics_total[$__range])) or vector(0)", w=6, thresholds=bad)

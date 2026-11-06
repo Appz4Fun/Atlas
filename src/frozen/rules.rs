@@ -8,12 +8,17 @@ use std::time::{Duration, Instant};
 
 use rusqlite::{Connection, OptionalExtension, Result, params};
 
+pub const SIDECAR: &str = "sidecar";
 pub const SMALL_COMPLETE: &str = "small_complete";
 pub const NOT_TV_MOVIES: &str = "not_tv_movies";
 
 /// Releases ?1 to ?6 with the rule that matches each now as its reason, null when none does. ?2 now (for `QUEUE`), ?3
 /// the small rule's size (0: off), ?4 1 when the small rule leaves movies and TV alone, ?5 1 when the not-TV/movies
-/// rule is on.
+/// rule is on, ?7 1 when the sidecar rule is on.
+/// Sidecar: a post of nothing but what describes a release and carries none of it, an NFO, a mediainfo or other text
+/// file, an SFV, an SRR (`SIDECAR_FILES`), with cover images beside them or a lone cover image (`SIDECAR_IMAGES`), of
+/// at most `SIDECAR_BYTES`, with no `[n/N]` promising files it hasn't got:
+/// not a release of its own, whatever its category or completeness. If more of the post comes, it thaws and is one.
 /// Small: complete means every file it says it has (its subjects' `[n/N]`), each with all its parts: a release whose
 /// subjects give no file count is complete as far as it has come, and can still grow past the size, soo it stays live.
 /// Not TV/movies: a categorized release outside Movies (2000s), TV (5000s) and Other (8000s, where Misc and Hashed
@@ -25,6 +30,20 @@ pub const NOT_TV_MOVIES: &str = "not_tv_movies";
 macro_rules! matching {
     () => {
         "select r.id as id, case
+            when ?7 = 1 and r.size > 0 and r.size <= 4194304
+                and exists (select 1 from files f where f.release_id = r.id)
+                and coalesce(r.file_total, 0) <= (select count(*) from files f where f.release_id = r.id)
+                and not exists (select 1 from files f where f.release_id = r.id and not (
+                    f.filename like '%.nfo' or f.filename like '%.txt' or f.filename like '%.sfv'
+                    or f.filename like '%.srr' or f.filename like '%.srs' or f.filename like '%.md5'
+                    or f.filename like '%.sha1' or f.filename like '%.diz'
+                    or f.filename like '%.jpg' or f.filename like '%.jpeg' or f.filename like '%.png'
+                    or f.filename like '%.gif' or f.filename like '%.webp'))
+                and ((select count(*) from files f where f.release_id = r.id) = 1
+                    or exists (select 1 from files f where f.release_id = r.id and not (
+                        f.filename like '%.jpg' or f.filename like '%.jpeg' or f.filename like '%.png'
+                        or f.filename like '%.gif' or f.filename like '%.webp')))
+                then 'sidecar'
             when ?3 > 0 and r.complete = 1 and coalesce(r.file_total, 0) > 0 and r.size > 0 and r.size < ?3
                 and (?4 = 0 or c.category is null
                      or (c.category not between 2000 and 2999 and c.category not between 5000 and 5999))
@@ -44,42 +63,68 @@ macro_rules! matching {
     };
 }
 
+/// A release queued already keeps its place (`at`) and takes the reason that matches it now: a rule added or widened
+/// since it was queued can name it better (a cover post queued as small and complete is a sidecar). Nothing new about
+/// the release came in, so its wait doesn't start over (a visit, `evaluate`, restarts it for a new reason).
 const QUEUE: &str = concat!(
-    "insert or ignore into freeze_pending (release_id, reason, at) select id, reason, ?2 from (",
+    "insert into freeze_pending (release_id, reason, at) select id, reason, ?2 from (",
     matching!(),
-    ") where reason is not null"
+    ") where reason is not null
+    on conflict(release_id) do update set reason = excluded.reason where freeze_pending.reason is not excluded.reason"
 );
 
 const STILL: &str = concat!("select exists (select 1 from (", matching!(), ") where reason is not null)");
 
+/// What the sidecar rule takes at most, in bytes; and the file kinds it takes, as the rule spells them
+pub const SIDECAR_BYTES: i64 = 4 << 20;
+pub const SIDECAR_FILES: &[&str] = &["nfo", "txt", "sfv", "srr", "srs", "md5", "sha1", "diz"];
+/// and the images it takes: beside those files, or one alone, a cover or poster posted on its own
+pub const SIDECAR_IMAGES: &[&str] = &["jpg", "jpeg", "png", "gif", "webp"];
+
 /// Whether any rule is on: a visit checks nothing otherwise.
 pub fn any_on() -> bool {
-    super::ENABLED.load(Relaxed) && (super::SMALL_BYTES.load(Relaxed) > 0 || super::NOT_TV_MOVIES.load(Relaxed))
+    super::ENABLED.load(Relaxed)
+        && (super::SMALL_BYTES.load(Relaxed) > 0 || super::NOT_TV_MOVIES.load(Relaxed) || super::SIDECAR.load(Relaxed))
 }
 
 /// Queue release `id` for freezing if a rule matches it now, and take it off the queue if none does. In the
-/// caller's transaction, on the shard's own connection.
+/// caller's transaction, on the shard's own connection. Queued again for the same reason it keeps the time it was
+/// first queued, soo a release visited often still gets to `wait_hours`; a new reason (or a thaw, which takes it off
+/// the queue first) starts the wait over. On prod a visit re-stamped every queued release it came by, and a release
+/// visited more often than every 12 hours would never have moved.
 pub fn evaluate(conn: &Connection, id: i64, now: i64) -> Result<bool> {
+    let before: Option<(String, i64)> = conn
+        .prepare_cached("select reason, at from freeze_pending where release_id = ?1")?
+        .query_row([id], |r| Ok((r.get(0)?, r.get(1)?)))
+        .optional()?;
     conn.prepare_cached("delete from freeze_pending where release_id = ?1")?.execute([id])?;
     if !any_on() {
         return Ok(false);
     }
-    Ok(queue(conn, id, id, now)? > 0)
+    let queued = queue(conn, id, id, now)? > 0;
+    if queued && let Some((reason, at)) = before {
+        conn.prepare_cached("update freeze_pending set at = ?3 where release_id = ?1 and reason = ?2")?
+            .execute(params![id, reason, at])?;
+    }
+    Ok(queued)
 }
 
-/// The rules' settings now: the small rule's size, whether it keeps movies and TV, whether not-TV/movies is on.
-fn settings() -> (i64, i64, i64) {
+/// The rules' settings now: the small rule's size, whether it keeps movies and TV, whether not-TV/movies is on,
+/// whether the sidecar rule is.
+fn settings() -> (i64, i64, i64, i64) {
     (
         super::SMALL_BYTES.load(Relaxed),
         super::SMALL_KEEPS_TV_MOVIES.load(Relaxed) as i64,
         super::NOT_TV_MOVIES.load(Relaxed) as i64,
+        super::SIDECAR.load(Relaxed) as i64,
     )
 }
 
-/// Queue what matches among releases `lo..=hi`, leaving queued ones as they are. Returns how many it queued.
+/// Queue what matches among releases `lo..=hi`, leaving queued ones as they are unless another rule matches them now.
+/// Returns how many it queued or gave a new reason.
 fn queue(conn: &Connection, lo: i64, hi: i64, now: i64) -> Result<usize> {
-    let (small, keep_video, not_tv) = settings();
-    conn.prepare_cached(QUEUE)?.execute(params![lo, now, small, keep_video, not_tv, hi])
+    let (small, keep_video, not_tv, sidecar) = settings();
+    conn.prepare_cached(QUEUE)?.execute(params![lo, now, small, keep_video, not_tv, hi, sidecar])
 }
 
 /// meta key: the backlog has looked at every release from here up; 0 once it got to the bottom
@@ -89,9 +134,19 @@ const BACKLOG_RULES: &str = "freeze_backlog_rules";
 
 /// The rules as they are now, as one number.
 fn signature() -> i64 {
-    let (small, keep_video, not_tv) = settings();
-    small.wrapping_mul(4).wrapping_add(keep_video * 2 + not_tv)
+    let (small, keep_video, not_tv, sidecar) = settings();
+    small
+        .wrapping_mul(8)
+        .wrapping_add(sidecar * 4 + keep_video * 2 + not_tv)
+        .wrapping_mul(16)
+        .wrapping_add(RULES_VERSION)
 }
+
+/// Raised when a rule takes in releases it didn't before, or the walk does more with what it looks at, soo the backlog
+/// walk looks at every release again under it.
+/// 2: the sidecar rule takes cover images.
+/// 3: the walk gives a queued release the reason that matches it now.
+const RULES_VERSION: i64 = 3;
 
 fn meta(conn: &Connection, key: &str) -> Result<Option<i64>> {
     conn.prepare_cached("select value from main.meta where key = ?1")?.query_row([key], |r| r.get(0)).optional()
@@ -111,7 +166,7 @@ pub struct Backlog {
 }
 
 /// Releases one step of the walk takes at a time, between looks at the clock and the stop flag.
-const BACKLOG_CHUNK: usize = 250;
+const BACKLOG_CHUNK: usize = 50;
 
 /// One step of the walk over releases no visit is coming back to: up to `limit` releases down from where the last
 /// step stopped, newest first, queued where a rule matches (one queued already keeps its place). Goes a chunk at a
@@ -162,6 +217,6 @@ pub fn still(conn: &Connection, id: i64) -> Result<bool> {
     if !any_on() {
         return Ok(false);
     }
-    let (small, keep_video, not_tv) = settings();
-    conn.prepare_cached(STILL)?.query_row(params![id, 0, small, keep_video, not_tv, id], |r| r.get(0))
+    let (small, keep_video, not_tv, sidecar) = settings();
+    conn.prepare_cached(STILL)?.query_row(params![id, 0, small, keep_video, not_tv, id, sidecar], |r| r.get(0))
 }

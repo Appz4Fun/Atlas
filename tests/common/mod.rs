@@ -38,10 +38,16 @@ pub struct Server {
     /// BODY answers "430 Failed forwarding.", like a reseller whose backend didnt answer
     pub forwarding_fails: bool,
     pub xover_delay: Duration,
+    /// an XOVER over more than this many numbers waits this long before answering, like a server that scans the
+    /// whole range first
+    pub slow_over: Option<(u64, Duration)>,
     /// answer XFEATURE COMPRESS GZIP and send zlib compressed XOVER
     pub compress: bool,
     /// says yes to compression but sends junk
     pub compress_broken: bool,
+    /// sends junk only for compressed XOVERs starting in this range, like a server whose compressor breaks on some
+    /// articles of a group and not others
+    pub compress_broken_at: Option<std::ops::RangeInclusive<u64>>,
     pub compressed_sent: AtomicUsize,
     pub open: AtomicUsize,
     pub peak: AtomicUsize,
@@ -108,8 +114,10 @@ impl Server {
             body_trouble: false,
             forwarding_fails: false,
             xover_delay: Duration::ZERO,
+            slow_over: None,
             compress: false,
             compress_broken: false,
+            compress_broken_at: None,
             compressed_sent: AtomicUsize::new(0),
             open: AtomicUsize::new(0),
             peak: AtomicUsize::new(0),
@@ -305,6 +313,11 @@ pub fn serve(stream: TcpStream, state: &Server, over_limit: bool) {
                     let mut at = state.stall_at.lock().unwrap();
                     *at == Some(a) && at.take().is_some()
                 };
+                if let Some((wider, wait)) = state.slow_over
+                    && b - a + 1 > wider
+                {
+                    thread::sleep(wait);
+                }
                 if stall_here {
                     state.stalled.fetch_add(1, Ordering::SeqCst);
                     thread::sleep(state.stall);
@@ -346,7 +359,8 @@ pub fn serve(stream: TcpStream, state: &Server, over_limit: bool) {
                     continue;
                 }
 
-                if compressed && state.compress_broken {
+                let broken = state.compress_broken || state.compress_broken_at.as_ref().is_some_and(|r| r.contains(&a));
+                if compressed && broken {
                     send(&mut out, b"224 overview follows [COMPRESS=GZIP]");
                     let _ = out.write_all(&[0x78, 0x9c, 0xde, 0xad, 0xbe, 0xef, 0x00, 0x00]);
                     // and hang up, like a confused server would
