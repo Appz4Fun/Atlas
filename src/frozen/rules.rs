@@ -63,10 +63,14 @@ macro_rules! matching {
     };
 }
 
+/// A release queued already keeps its place (`at`) and takes the reason that matches it now: a rule added or widened
+/// since it was queued can name it better (a cover post queued as small and complete is a sidecar). Nothing new about
+/// the release came in, so its wait doesn't start over (a visit, `evaluate`, restarts it for a new reason).
 const QUEUE: &str = concat!(
-    "insert or ignore into freeze_pending (release_id, reason, at) select id, reason, ?2 from (",
+    "insert into freeze_pending (release_id, reason, at) select id, reason, ?2 from (",
     matching!(),
-    ") where reason is not null"
+    ") where reason is not null
+    on conflict(release_id) do update set reason = excluded.reason where freeze_pending.reason is not excluded.reason"
 );
 
 const STILL: &str = concat!("select exists (select 1 from (", matching!(), ") where reason is not null)");
@@ -116,7 +120,8 @@ fn settings() -> (i64, i64, i64, i64) {
     )
 }
 
-/// Queue what matches among releases `lo..=hi`, leaving queued ones as they are. Returns how many it queued.
+/// Queue what matches among releases `lo..=hi`, leaving queued ones as they are unless another rule matches them now.
+/// Returns how many it queued or gave a new reason.
 fn queue(conn: &Connection, lo: i64, hi: i64, now: i64) -> Result<usize> {
     let (small, keep_video, not_tv, sidecar) = settings();
     conn.prepare_cached(QUEUE)?.execute(params![lo, now, small, keep_video, not_tv, hi, sidecar])
@@ -137,9 +142,11 @@ fn signature() -> i64 {
         .wrapping_add(RULES_VERSION)
 }
 
-/// Raised when a rule takes in releases it didn't before, soo the backlog walk looks at every release again under it.
+/// Raised when a rule takes in releases it didn't before, or the walk does more with what it looks at, soo the backlog
+/// walk looks at every release again under it.
 /// 2: the sidecar rule takes cover images.
-const RULES_VERSION: i64 = 2;
+/// 3: the walk gives a queued release the reason that matches it now.
+const RULES_VERSION: i64 = 3;
 
 fn meta(conn: &Connection, key: &str) -> Result<Option<i64>> {
     conn.prepare_cached("select value from main.meta where key = ?1")?.query_row([key], |r| r.get(0)).optional()
