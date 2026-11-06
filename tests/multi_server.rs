@@ -121,10 +121,12 @@ fn one_range_that_wont_inflate_is_fetched_plain() {
         let s = Arc::get_mut(&mut state).unwrap();
         s.compress = true;
         s.compress_broken_at = Some(21..=30);
+        // the provider allows one connection: the plain one has to take the compressed one's place
+        s.max_conns = 1;
     }
     let port = spawn_server(state.clone());
 
-    let pool = BlockingPool::new(&[mock(port, "secret", 2, 1)]);
+    let pool = BlockingPool::new(&[mock(port, "secret", 1, 1)]);
     pool.connect().unwrap();
     let mut indexer = Indexer::new(pool, "backfill", db::open_at(&db_path).unwrap());
     indexer.request_size = 10;
