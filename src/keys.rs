@@ -1403,7 +1403,7 @@ mod tests {
             )
             .unwrap();
         }
-        let lookup = Lookup { keys: Keys::default(), par2_sets: Vec::new(), moviehash: None, files: vec![volume] };
+        let lookup = Lookup { files: vec![volume], ..Default::default() };
         assert_eq!(others(&conn, 1, &lookup, Kind::FileCrc, 10), vec![3, 2]);
         assert_eq!(count_others(&conn, 1, &lookup, Kind::FileCrc), 2);
         // and the other way: the PAR2 set's release finds both .rev releases
