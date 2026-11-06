@@ -42,6 +42,9 @@ pub struct Server {
     pub compress: bool,
     /// says yes to compression but sends junk
     pub compress_broken: bool,
+    /// sends junk only for compressed XOVERs starting in this range, like a server whose compressor breaks on some
+    /// articles of a group and not others
+    pub compress_broken_at: Option<std::ops::RangeInclusive<u64>>,
     pub compressed_sent: AtomicUsize,
     pub open: AtomicUsize,
     pub peak: AtomicUsize,
@@ -110,6 +113,7 @@ impl Server {
             xover_delay: Duration::ZERO,
             compress: false,
             compress_broken: false,
+            compress_broken_at: None,
             compressed_sent: AtomicUsize::new(0),
             open: AtomicUsize::new(0),
             peak: AtomicUsize::new(0),
@@ -346,7 +350,8 @@ pub fn serve(stream: TcpStream, state: &Server, over_limit: bool) {
                     continue;
                 }
 
-                if compressed && state.compress_broken {
+                let broken = state.compress_broken || state.compress_broken_at.as_ref().is_some_and(|r| r.contains(&a));
+                if compressed && broken {
                     send(&mut out, b"224 overview follows [COMPRESS=GZIP]");
                     let _ = out.write_all(&[0x78, 0x9c, 0xde, 0xad, 0xbe, 0xef, 0x00, 0x00]);
                     // and hang up, like a confused server would

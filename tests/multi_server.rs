@@ -106,6 +106,36 @@ fn broken_compression_falls_back_to_plain() {
     assert_eq!(articles, 40);
 }
 
+/// A server whose compressed listings break for one range only (on prod, ab.alt.binaries.nibnit's November days on a
+/// server that compresses every other group fine) has that slice fetched again on a plain connection at once, and
+/// keeps compression for the rest.
+#[test]
+fn one_range_that_wont_inflate_is_fetched_plain() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("atlas.db");
+    db::create_db_at(&db_path).unwrap();
+
+    let posts: Vec<Post> = (1..=40).map(|n| post(n, &format!(r#""thing{n}.bin" yEnc (1/1)"#), 10, vec![])).collect();
+    let mut state = Server::new(posts);
+    {
+        let s = Arc::get_mut(&mut state).unwrap();
+        s.compress = true;
+        s.compress_broken_at = Some(21..=30);
+    }
+    let port = spawn_server(state.clone());
+
+    let pool = BlockingPool::new(&[mock(port, "secret", 2, 1)]);
+    pool.connect().unwrap();
+    let mut indexer = Indexer::new(pool, "backfill", db::open_at(&db_path).unwrap());
+    indexer.request_size = 10;
+    index_until_idle(&mut indexer);
+
+    let conn = db::open_with_shards(&db_path).unwrap();
+    let (_, articles) = atlas::store::totals(&conn).unwrap();
+    assert_eq!(articles, 40);
+    assert_eq!(state.compressed_sent.load(Ordering::SeqCst), 3, "every other slice still comes compressed");
+}
+
 /// Name lookups spread over the servers instead of all queueing on the
 /// first one: two servers with the same articles share the BODYs.
 #[test]

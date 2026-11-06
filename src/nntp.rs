@@ -2710,10 +2710,10 @@ impl Pool {
     /// for. A listing cut short costs its connection, which still has the
     /// rest of it on the wire.
     async fn ends(&self, i: usize, group: &str, start: u64, end: u64) -> Result<Ends> {
-        let r = match self.ends_once(i, group, start, end).await {
+        let r = match self.ends_once(i, group, start, end, false).await {
             Err(NntpError::Decompress(e)) => {
                 self.no_compression(i, &e);
-                self.ends_once(i, group, start, end).await
+                self.ends_once(i, group, start, end, true).await
             }
             r => r,
         };
@@ -2723,8 +2723,11 @@ impl Pool {
         }
     }
 
-    async fn ends_once(&self, i: usize, group: &str, start: u64, end: u64) -> Result<Ends> {
+    async fn ends_once(&self, i: usize, group: &str, start: u64, end: u64, plain: bool) -> Result<Ends> {
         let mut lease = self.lease_for(i, Some(group), false).await?;
+        if plain {
+            self.uncompressed(&mut lease).await?;
+        }
 
         if lease.group() != Some(group) {
             let r = lease.begin().select_group(group).await;
@@ -3037,6 +3040,20 @@ impl Pool {
         Ok(rows.iter().find(|o| plausible_post_time(&o.date).is_some_and(|t| t >= when)).map(|o| o.number))
     }
 
+    /// Swap `lease`'s connection for a plain one when it asked for compressed headers. A listing that wouldnt
+    /// inflate is asked for again uncompressed: a server whose compression works for every other group keeps it on
+    /// (`no_compression`), and an idle connection would be compressed too. The compressed one is closed.
+    async fn uncompressed(&self, lease: &mut Lease) -> Result<()> {
+        if !lease.conn.as_ref().is_some_and(|c| c.compressed) {
+            return Ok(());
+        }
+        lease.collect_traffic();
+        let mut conn = Conn::open(&lease.server.cfg, self.timeout, false).await?;
+        conn.set_rate_limiter(self.rate_limiter.clone());
+        lease.conn = Some(conn);
+        Ok(())
+    }
+
     /// Compressed listings from server `i` couldnt be read: it gets plain ones from now on
     /// when it has never delivered headers or failed `GROUP_REFUSALS` times in a row.
     fn no_compression(&self, i: usize, e: &str) {
@@ -3057,20 +3074,24 @@ impl Pool {
     }
 
     async fn xover_on(&self, i: usize, group: &str, start: u64, end: u64) -> Result<Vec<Overview>> {
-        match self.xover_once(i, group, start, end).await {
+        match self.xover_once(i, group, start, end, false).await {
             Err(NntpError::Decompress(e)) => {
-                // turn compression off for this server and redo the slice uncompressed
+                // count it against the server's compression, and redo the slice uncompressed
                 self.no_compression(i, &e);
-                self.xover_once(i, group, start, end).await
+                self.xover_once(i, group, start, end, true).await
             }
             // the server closed the connection before answering: once more, on another one
-            Err(e) if e.is_closed() => self.xover_once(i, group, start, end).await,
+            Err(e) if e.is_closed() => self.xover_once(i, group, start, end, false).await,
             r => r,
         }
     }
 
-    async fn xover_once(&self, i: usize, group: &str, start: u64, end: u64) -> Result<Vec<Overview>> {
+    /// One XOVER of `start..=end` on server `i`; `plain`: on a connection that didnt ask for compressed headers.
+    async fn xover_once(&self, i: usize, group: &str, start: u64, end: u64, plain: bool) -> Result<Vec<Overview>> {
         let mut lease = self.lease_for(i, Some(group), false).await?;
+        if plain {
+            self.uncompressed(&mut lease).await?;
+        }
 
         if lease.group() != Some(group) {
             let r = lease.begin().select_group(group).await;
