@@ -112,7 +112,7 @@ impl Table {
     fn read(conn: &Connection, name: &str) -> rusqlite::Result<Option<Table>> {
         let mut cols = Vec::new();
         let mut key: Vec<(i64, String)> = Vec::new();
-        let mut stmt = conn.prepare(&format!("pragma table_info({name})"))?;
+        let mut stmt = conn.prepare(&format!("pragma main.table_info({name})"))?;
         let mut rows = stmt.query([])?;
         while let Some(r) = rows.next()? {
             let col: String = r.get(1)?;
@@ -327,7 +327,8 @@ fn outbox_ddl(schema: &str) -> String {
 
 /// For a compaction, which builds a shard afresh from the original attached as `old`: the original's waiting
 /// changes come along, and so do the releases the copy changed in any column (dropping copies of articles takes
-/// their bytes off a release's size, and its parts and completeness can change with them). Returns whether the original had the outbox, to put the triggers back once the copy has its
+/// their bytes off a release's size, and its parts and completeness can change with them) and the key of every
+/// copied row the copy left out. Returns whether the original had the outbox, to put the triggers back once the copy has its
 /// indexes (`sync_triggers`).
 pub fn carry_outbox(conn: &Connection) -> rusqlite::Result<bool> {
     let had: i64 = conn.query_row("select count(*) from old.sqlite_schema where name = ?1", [OUTBOX], |r| r.get(0))?;
@@ -352,6 +353,31 @@ pub fn carry_outbox(conn: &Connection) -> rusqlite::Result<bool> {
          where {changed};",
         ddl = outbox_ddl("main"),
     ))?;
+    // and every row the copy left out (a collection whose release is gone, say): the publisher deletes it
+    for t in tables(conn)? {
+        let in_old: i64 = conn.query_row(
+            "select count(*) from old.sqlite_schema where type = 'table' and name = ?1",
+            [&t.name],
+            |r| r.get(0),
+        )?;
+        if in_old == 0 {
+            continue;
+        }
+        let k1 = quote(&t.key[0]);
+        let k2 = t.key.get(1).map(|c| quote(c));
+        let same = match &k2 {
+            Some(k2) => format!("m.{k1} = o.{k1} and m.{k2} = o.{k2}"),
+            None => format!("m.{k1} = o.{k1}"),
+        };
+        conn.execute_batch(&format!(
+            "insert into main.{OUTBOX} (tbl, k1, k2)
+             select '{name}', o.{k1}, {o2} from old.{qt} o
+             where not exists (select 1 from main.{qt} m where {same});",
+            name = t.name,
+            qt = quote(&t.name),
+            o2 = k2.as_ref().map_or("null".to_string(), |k2| format!("o.{k2}")),
+        ))?;
+    }
     Ok(true)
 }
 
@@ -1172,13 +1198,18 @@ mod tests {
     fn a_compaction_carries_the_waiting_changes_and_the_releases_it_resized() {
         let conn = shard();
         sync_triggers(&conn, true).unwrap();
-        conn.execute_batch("insert into releases (id, name, size) values (8, 'a', 10), (16, 'b', 20);").unwrap();
+        conn.execute_batch(
+            "insert into releases (id, name, size) values (8, 'a', 10), (16, 'b', 20);
+             insert into collections values (-3, 99);",
+        )
+        .unwrap();
         let dir = tempfile::tempdir().unwrap();
         let copy = dir.path().join("copy.db");
         let copy_conn = Connection::open(&copy).unwrap();
         copy_conn
             .execute_batch(
                 "create table releases (id INTEGER PRIMARY KEY, name TEXT, size INTEGER, posted_date TEXT);
+                 create table collections (key INTEGER PRIMARY KEY, release_id INTEGER NOT NULL) without rowid;
                  insert into releases (id, name, size, posted_date) values (8, 'a', 7, null), (16, 'b', 20, 'x');",
             )
             .unwrap();
@@ -1195,8 +1226,15 @@ mod tests {
             .collect();
         assert_eq!(
             carried,
-            [("releases".into(), 8), ("releases".into(), 16), ("releases".into(), 8), ("releases".into(), 16)],
-            "8 for its size, 16 for another column with the size unchanged"
+            [
+                ("releases".into(), 8),
+                ("releases".into(), 16),
+                ("collections".into(), -3),
+                ("releases".into(), 8),
+                ("releases".into(), 16),
+                ("collections".into(), -3),
+            ],
+            "8 for its size, 16 for another column with the size unchanged, -3 left out of the copy"
         );
         copy_conn.execute_batch("detach database old").unwrap();
         // without one in the original, nothing to carry
