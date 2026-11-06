@@ -2122,6 +2122,38 @@ mod tests {
     }
 
     #[test]
+    fn the_other_rows_of_a_post_arent_its_twins() {
+        let (_dir, conn) = all_shards();
+        let name = "Some.Film.2007.2160p.UHD.BluRay.REMUX.DV.HDR.HEVC.Atmos-GRP";
+        let (mkv, vol) = ("Some.Film.mkv", "Some.Film.vol00+01.par2");
+        let (a, b, c, e) = ("alt.binaries.a", "alt.binaries.b", "alt.binaries.c", "alt.binaries.e");
+        // each article of the post went to one of three groups, and a separate upload of it came ten days before
+        put_row(&conn, 1, name, a, "x1@nyuu", &[(mkv, &[1, 4, 7], 8), (vol, &[1], 2)]);
+        put_row(&conn, 2, name, b, "x2@nyuu", &[(mkv, &[2, 5, 8], 8), (vol, &[2], 2)]);
+        put_row(&conn, 3, name, c, "x3@nyuu", &[(mkv, &[3, 6], 8)]);
+        put_row_at(&conn, 5, name, e, "old@else", &[(mkv, &[1, 2, 3, 4, 5, 6, 7, 8], 8)], "2026-10-24 07:36:18");
+        let id = |i: i64, g: &str| row_of(&conn, i, g).id;
+        // two rows of the post and the separate upload read the same PAR2 set: the same file, by its hashes
+        for (i, g) in [(1, a), (2, b), (5, e)] {
+            conn.execute(
+                &format!(
+                    "insert into s{}.par2_files (release_id, file_id, set_id, md5, md5_16k, size, name)
+                     values (?1, ?3, ?4, ?5, ?6, 800, ?2)",
+                    store::shard_of(g)
+                ),
+                rusqlite::params![id(i, g), mkv, [1u8; 16], [2u8; 16], [3u8; 16], [4u8; 16]],
+            )
+            .unwrap();
+        }
+        let copies = crate::duplicates::copies_with(&conn, id(1, a)).unwrap();
+        let found: Vec<(crate::duplicates::Copy, i64)> = copies.iter().map(|(kind, r)| (*kind, r.id)).collect();
+        assert_eq!(found, [(crate::duplicates::Copy::Twin, id(5, e))], "row 2 is this upload, not a twin of it");
+        assert!(crate::duplicates::can_fill(&copies), "the separate upload can still lend articles");
+        let own = crate::duplicates::copies_with(&conn, id(2, b)).unwrap();
+        assert!(own.iter().all(|(_, r)| r.id != id(1, a)), "{own:?}");
+    }
+
+    #[test]
     fn a_poster_with_two_of_the_groups_still_gets_the_whole_post() {
         let (_dir, conn) = all_shards();
         let name = "Some.Show.S01E01.2160p.WEB-DL.DV.HDR.H.265-GRP";
