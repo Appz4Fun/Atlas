@@ -4897,7 +4897,7 @@ mod tests {
         conn.execute("delete from pp_queue", []).unwrap();
         conn.execute("delete from meta where key = 'pp_complete_by_files'", []).unwrap();
         conn.execute("insert into release_category (release_id, category) values (?1, 5040)", [id]).unwrap();
-        crate::postprocess::engine::seed_shard(&conn, 0, &[], 1_000).unwrap();
+        crate::postprocess::engine::seed_shard(&conn, 0, 0, &[], 1_000).unwrap();
         assert_eq!(complete_of(&conn, episode), 1);
         let due: i64 = conn.query_row("select due_at from pp_queue where release_id = ?", [id], |r| r.get(0)).unwrap();
         assert_eq!(due, 1_000, "its gated body steps are looked at again");

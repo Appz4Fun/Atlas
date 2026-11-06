@@ -3418,12 +3418,29 @@ mod tests {
         // 4 MiB of repeated [0x0B, 0x77, 0x07, 0xFF, 0x00, 0x80] (frmsiz=2047 -> 4096-byte frame, bsid=16)
         let pattern = [0x0B, 0x77, 0x07, 0xFF, 0x00, 0x80];
         let mut payload = pattern.repeat(4 * 1024 * 1024 / pattern.len());
-        let start = std::time::Instant::now();
         assert!(!AudioBitstream::has_eac3_atmos_frame(&payload));
+        // Timed against one plain pass for the sync word over as many bytes on the same machine, the best of three
+        // runs each, not against a fixed limit that a slower machine or a debug build misses: the scan runs at about
+        // 3 such passes, and one that read each frame's 4 KiB body again from every sync word would be ~680.
+        let best = |f: &dyn Fn()| {
+            (0..3)
+                .map(|_| {
+                    let start = std::time::Instant::now();
+                    f();
+                    start.elapsed()
+                })
+                .min()
+                .unwrap()
+        };
+        let plain = best(&|| {
+            std::hint::black_box(find_subsequence(std::hint::black_box(&payload[1..]), &[0x77, 0x0B]));
+        });
+        let scan = best(&|| {
+            std::hint::black_box(AudioBitstream::has_eac3_atmos_frame(std::hint::black_box(&payload)));
+        });
         assert!(
-            start.elapsed() < std::time::Duration::from_millis(250),
-            "4 MiB repeated E-AC-3 sync word scan must complete in linear time, took {:?}",
-            start.elapsed()
+            scan < plain * 30 + std::time::Duration::from_millis(5),
+            "4 MiB repeated E-AC-3 sync word scan must stay linear: {scan:?}, a plain pass {plain:?}"
         );
         let tail = payload.len() - 16;
         // Coincidental [0x58, 0x38, 0x00, 0x00] (zero container length) must NOT report Atmos
