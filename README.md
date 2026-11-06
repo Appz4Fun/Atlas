@@ -417,7 +417,7 @@ Turn it on in `config.toml`:
 ```toml
 [shared_catalog]
 enabled = true
-url = "host=192.168.1.93 port=5434 user=atlas password=... dbname=atlas_catalog"
+url = "host=db.example port=5432 user=atlas password=... dbname=atlas_catalog"
 # batch = 5000        # changes taken from one shard's outbox at a time
 # interval_ms = 1000  # rest when every outbox is empty
 ```
