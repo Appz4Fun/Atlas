@@ -768,6 +768,9 @@ fn compact_shard(
          on conflict (release_id) do update set n = n + 1;",
     )?;
 
+    // the shared catalog's waiting changes, and what this copy changed
+    let catalog = crate::shared_catalog::carry_outbox(&conn)?;
+
     halt(stop, shard)?;
     say("building indexes and the search index");
     conn.execute_batch(
@@ -784,6 +787,9 @@ fn compact_shard(
         store::build_shard(&conn)?;
         for index in &optional_indexes {
             conn.execute_batch(index)?;
+        }
+        if catalog {
+            crate::shared_catalog::sync_triggers(&conn, true)?;
         }
     }
 
@@ -926,7 +932,11 @@ fn refuse_what_wouldnt_be_copied(conn: &Connection, shard: usize) -> Result<()> 
         .query_map([], |r| r.get(0))?
         .collect::<rusqlite::Result<_>>()?;
     for table in &tables {
-        if table == "releases" || table == "word_queue" || registered.iter().any(|t| t.name == table) {
+        if table == "releases"
+            || table == "word_queue"
+            || table == crate::shared_catalog::OUTBOX
+            || registered.iter().any(|t| t.name == table)
+        {
             continue;
         }
         let Some((_, known)) = CORE_TABLES.iter().find(|(t, _)| t == table) else {
@@ -2574,6 +2584,53 @@ mod tests {
         let late: i64 = db::open_at(&path).unwrap().query_row("select x from late", [], |r| r.get(0)).unwrap();
         assert_eq!(late, 7, "the write in the WAL came back too");
         assert!(!Path::new(&format!("{}-wal", backup.display())).exists());
+    }
+
+    #[test]
+    fn compacting_keeps_the_shared_catalog_outbox_and_its_triggers() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        db::create_db_at(&main).unwrap();
+        let group = "alt.binaries.g0";
+        let path = store::shard_path(&main, store::shard_of(group));
+        let release = Release {
+            name: "a.jpg".into(),
+            group: group.into(),
+            articles: vec![Article {
+                message_id: "<a@x>".into(),
+                subject: "\"a.jpg\" yEnc (1/1)".into(),
+                filename: Some("a.jpg".into()),
+                release_name: Some("a.jpg".into()),
+                part: Some(1),
+                total_parts: Some(1),
+                bytes: 10,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        crate::shared_catalog::sync_triggers(&db::open_at(&path).unwrap(), true).unwrap();
+        store::save(&main, &[release]).unwrap();
+        let waiting = |conn: &rusqlite::Connection| -> i64 {
+            conn.query_row("select count(*) from catalog_outbox", [], |r| r.get(0)).unwrap()
+        };
+        let before = waiting(&db::open_at(&path).unwrap());
+        assert!(before > 0);
+
+        run(&main, &|_| {}, &Default::default()).unwrap();
+
+        let conn = db::open_at(&path).unwrap();
+        assert!(waiting(&conn) >= before, "the waiting changes came along");
+        let triggers: i64 = conn
+            .query_row(
+                "select count(*) from sqlite_schema where type = 'trigger' and name like 'catalog\\_%' escape '\\'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(triggers >= 3, "and the triggers are back: {triggers}");
+        let n = waiting(&conn);
+        conn.execute("update releases set display_name = 'x'", []).unwrap();
+        assert!(waiting(&conn) > n, "a change after the compaction is recorded");
     }
 
     #[test]

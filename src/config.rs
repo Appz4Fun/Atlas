@@ -564,11 +564,19 @@ pub struct SharedCatalogConfig {
     pub batch: usize,
     /// how long the publisher rests when every outbox is empty, milliseconds
     pub interval_ms: u64,
+    /// the connection isn't encrypted: without this, only a loopback or private network address is used
+    pub allow_plaintext: bool,
 }
 
 impl Default for SharedCatalogConfig {
     fn default() -> Self {
-        SharedCatalogConfig { enabled: false, url: String::new(), batch: 5_000, interval_ms: 1_000 }
+        SharedCatalogConfig {
+            enabled: false,
+            url: String::new(),
+            batch: 5_000,
+            interval_ms: 1_000,
+            allow_plaintext: false,
+        }
     }
 }
 
@@ -587,6 +595,9 @@ impl SharedCatalogConfig {
         }
         if let Some(n) = v.get("interval_ms").and_then(as_int).and_then(|n| u64::try_from(n).ok()) {
             c.interval_ms = n.clamp(50, 60_000);
+        }
+        if let Some(b) = v.get("allow_plaintext").and_then(as_bool) {
+            c.allow_plaintext = b;
         }
         c
     }
