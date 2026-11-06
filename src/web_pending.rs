@@ -79,6 +79,7 @@ pub(crate) fn label(name: &str) -> &str {
         "media_nfo" => "IDs from the NFO",
         "opensubtitles_imdb" => "IMDb from OpenSubtitles",
         "keys" => "Duplicate keys",
+        "probe_body_crc" => "Body CRC from the server",
         other => other,
     }
 }

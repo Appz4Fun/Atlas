@@ -3,7 +3,8 @@
 //! (`metrics.indexer_port`), sampled every `SAMPLE_EVERY` while someone looks, soo rates are over the same kind of
 //! window as a `rate(...[5m])`. The net lane's per-shard rates come from the indexer's `stats.json`, which the
 //! release page's Processing panel reads too. What only the shards know (the last day by category, the latest PreDB
-//! matches) is read with indexed queries, each shard on its own thread, and kept for `STORED_TTL`.
+//! matches) is read with indexed queries, each shard on its own thread: the matches are kept for `STORED_TTL`, the
+//! day for `DAY_TTL`, and a busy shard's day is broken down from a sample (`DAY_SAMPLE`).
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt::Write as _;
@@ -30,8 +31,13 @@ const KEEP_SECS: f64 = RATE_WINDOW_SECS + 120.0;
 const IDLE_STOP: Duration = Duration::from_secs(30 * 60);
 /// Reading `/metrics` gives up after this long.
 const SCRAPE_TIMEOUT: Duration = Duration::from_secs(5);
-/// The shard numbers are read again after this long.
+/// The latest PreDB matches are read again after this long.
 const STORED_TTL: Duration = Duration::from_secs(60);
+/// The last day's breakdown, after this long: on a busy shard millions of releases were posted in a day.
+const DAY_TTL: Duration = Duration::from_secs(5 * 60);
+/// Releases per shard the breakdown looks at; past it, it looks at every nth (by id) and scales up. The total is
+/// always exact: it comes from the posted-date index alone.
+const DAY_SAMPLE: i64 = 20_000;
 /// stats.json older than this: the indexer isn't running.
 const STALE_SECS: f64 = 120.0;
 /// Latest PreDB matches listed.
@@ -315,8 +321,15 @@ struct Stored {
     at: f64,
     /// how long the reads took
     secs: f64,
-    /// by stored category; uncategorized is `UNCATEGORIZED`
+    /// by stored category, scaled up where a shard was sampled; uncategorized is `UNCATEGORIZED`
     day: BTreeMap<i64, DayRow>,
+    /// releases posted in the day, counted exactly
+    day_total: i64,
+    /// the widest sample step a shard used: 1 when every release was looked at
+    day_every: i64,
+    /// when the day was read, and how long that took
+    day_at: f64,
+    day_secs: f64,
     /// shards that couldn't answer the last day's count: no posted-date index there yet
     day_unindexed: usize,
     predb: Vec<PredbRow>,
@@ -339,24 +352,46 @@ fn has_index(conn: &Connection, index: &str) -> rusqlite::Result<bool> {
         .map(|f| f.is_some())
 }
 
-/// One shard's last day, by category. None when the shard has no index on `posted_date`: without it the count would
-/// read every release.
-fn day_of(conn: &Connection, since: &str) -> rusqlite::Result<Option<BTreeMap<i64, DayRow>>> {
+/// One shard's releases posted since a time: the exact total, and by category from every `every`th of them.
+#[derive(Debug, Default, PartialEq)]
+struct Day {
+    total: i64,
+    every: i64,
+    /// scaled up to the total
+    rows: BTreeMap<i64, DayRow>,
+}
+
+/// One shard's last day. None when the shard has no index on `posted_date`: without it the count would read every
+/// release. The total is counted off the index alone; the breakdown needs each release's row and category, soo on a
+/// busy shard it looks at one release in `every` (by id, which says nothing of category or size) and scales up.
+fn day_of(conn: &Connection, since: &str, sample: i64) -> rusqlite::Result<Option<Day>> {
     if !has_index(conn, crate::field_search::POSTED_INDEX)? {
         return Ok(None);
     }
+    let total: i64 = conn.query_row(
+        "select count(*) from releases indexed by idx_release_posted where posted_date >= ?1",
+        [since],
+        |r| r.get(0),
+    )?;
+    let sample = sample.max(1);
+    let every = ((total + sample - 1) / sample).max(1);
+    let shards = crate::store::SHARDS as i64;
     let categorized = has_table(conn, "release_category")?;
     let sql = if categorized {
-        "select c.category, count(*), coalesce(sum(r.complete = 1), 0), coalesce(sum(r.size), 0)
-         from releases r indexed by idx_release_posted left join release_category c on c.release_id = r.id
-         where r.posted_date >= ?1 group by 1"
+        format!(
+            "select c.category, count(*), coalesce(sum(r.complete = 1), 0), coalesce(sum(r.size), 0)
+             from releases r indexed by idx_release_posted left join release_category c on c.release_id = r.id
+             where r.posted_date >= ?1 and (r.id / {shards}) % ?2 = 0 group by 1"
+        )
     } else {
-        "select null, count(*), coalesce(sum(complete = 1), 0), coalesce(sum(size), 0)
-         from releases indexed by idx_release_posted where posted_date >= ?1"
+        format!(
+            "select null, count(*), coalesce(sum(complete = 1), 0), coalesce(sum(size), 0)
+             from releases indexed by idx_release_posted where posted_date >= ?1 and (id / {shards}) % ?2 = 0"
+        )
     };
-    let mut out = BTreeMap::new();
-    let mut stmt = conn.prepare(sql)?;
-    let rows = stmt.query_map([since], |r| {
+    let mut sampled = BTreeMap::new();
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params![since, every], |r| {
         Ok((r.get::<_, Option<i64>>(0)?, DayRow { count: r.get(1)?, complete: r.get(2)?, bytes: r.get(3)? }))
     })?;
     for row in rows {
@@ -364,12 +399,19 @@ fn day_of(conn: &Connection, since: &str) -> rusqlite::Result<Option<BTreeMap<i6
         if day.count == 0 {
             continue;
         }
-        let entry: &mut DayRow = out.entry(category.unwrap_or(crate::category::UNCATEGORIZED)).or_default();
+        let entry: &mut DayRow = sampled.entry(category.unwrap_or(crate::category::UNCATEGORIZED)).or_default();
         entry.count += day.count;
         entry.complete += day.complete;
         entry.bytes += day.bytes;
     }
-    Ok(Some(out))
+    let seen: i64 = sampled.values().map(|r: &DayRow| r.count).sum();
+    let scale = if seen > 0 { total as f64 / seen as f64 } else { 0.0 };
+    let up = |n: i64| (n as f64 * scale).round() as i64;
+    let rows = sampled
+        .into_iter()
+        .map(|(c, r)| (c, DayRow { count: up(r.count), complete: up(r.complete), bytes: up(r.bytes) }))
+        .collect();
+    Ok(Some(Day { total, every, rows }))
 }
 
 /// One shard's latest PreDB matches. `predb_match` is small (one row per matched release), soo it is read whole;
@@ -407,41 +449,58 @@ fn predb_of(conn: &Connection, limit: usize) -> rusqlite::Result<Vec<PredbRow>> 
     rows.collect()
 }
 
-/// One shard's last day (None: no posted-date index) and its latest PreDB matches.
-type ShardRead = (Option<BTreeMap<i64, DayRow>>, Vec<PredbRow>);
+/// One shard's last day (outer None: not asked for; inner None: no posted-date index) and its latest PreDB matches.
+type ShardRead = (Option<Option<Day>>, Vec<PredbRow>);
 
-fn read_shard(path: &Path, since: &str) -> Result<ShardRead, String> {
+fn read_shard(path: &Path, since: Option<&str>) -> Result<ShardRead, String> {
     let conn = crate::db::open_at(path).map_err(|e| e.to_string())?;
     let _ = conn.pragma_update(None, "query_only", true);
-    let day = day_of(&conn, since).map_err(|e| e.to_string())?;
+    let day = since.map(|since| day_of(&conn, since, DAY_SAMPLE)).transpose().map_err(|e| e.to_string())?;
     let predb = predb_of(&conn, PREDB_RECENT).map_err(|e| e.to_string())?;
     Ok((day, predb))
 }
 
-fn read_stored(main: &Path, at: f64) -> Stored {
+/// Reads the shards. The last day is taken from `previous` while it is younger than `DAY_TTL`.
+fn read_stored(main: &Path, at: f64, previous: Option<&Stored>) -> Stored {
     let started = Instant::now();
+    let mut stored = Stored { at, ..Default::default() };
+    let keep_day = previous.filter(|p| p.day_at > 0.0 && at - p.day_at < DAY_TTL.as_secs_f64());
+    if let Some(p) = keep_day {
+        stored.day = p.day.clone();
+        stored.day_total = p.day_total;
+        stored.day_every = p.day_every;
+        stored.day_at = p.day_at;
+        stored.day_secs = p.day_secs;
+        stored.day_unindexed = p.day_unindexed;
+    }
     let since = chrono::DateTime::from_timestamp(at as i64 - 86_400, 0)
         .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
-        .unwrap_or_default();
+        .filter(|_| keep_day.is_none());
     let paths: Vec<_> = crate::store::shard_paths(main).into_iter().filter(|p| p.exists()).collect();
     let results: Vec<_> = thread::scope(|scope| {
-        let handles: Vec<_> = paths.iter().map(|p| scope.spawn(|| read_shard(p, &since))).collect();
+        let handles: Vec<_> = paths.iter().map(|p| scope.spawn(|| read_shard(p, since.as_deref()))).collect();
         handles.into_iter().map(|h| h.join().unwrap_or_else(|_| Err("the read panicked".into()))).collect()
     });
-    let mut stored = Stored { at, ..Default::default() };
+    if since.is_some() {
+        stored.day_at = at;
+        stored.day_every = 1;
+    }
     for (path, result) in paths.iter().zip(results) {
         match result {
             Ok((day, predb)) => {
                 match day {
-                    Some(day) => {
-                        for (category, row) in day {
+                    Some(Some(day)) => {
+                        stored.day_total += day.total;
+                        stored.day_every = stored.day_every.max(day.every);
+                        for (category, row) in day.rows {
                             let entry = stored.day.entry(category).or_default();
                             entry.count += row.count;
                             entry.complete += row.complete;
                             entry.bytes += row.bytes;
                         }
                     }
-                    None => stored.day_unindexed += 1,
+                    Some(None) => stored.day_unindexed += 1,
+                    None => {}
                 }
                 stored.predb.extend(predb);
             }
@@ -455,6 +514,9 @@ fn read_stored(main: &Path, at: f64) -> Stored {
     stored.predb.sort_by(|a, b| b.matched_at.cmp(&a.matched_at).then(b.id.cmp(&a.id)));
     stored.predb.truncate(PREDB_RECENT);
     stored.secs = started.elapsed().as_secs_f64();
+    if since.is_some() {
+        stored.day_secs = stored.secs;
+    }
     stored
 }
 
@@ -469,7 +531,8 @@ fn stored() -> Arc<Stored> {
     if let Some(s) = fresh(&STORED.lock().unwrap()) {
         return s;
     }
-    let s = Arc::new(read_stored(&crate::paths::database(), now()));
+    let previous = STORED.lock().unwrap().as_ref().map(|(_, s)| s.clone());
+    let s = Arc::new(read_stored(&crate::paths::database(), now(), previous.as_deref()));
     *STORED.lock().unwrap() = Some((Instant::now(), s.clone()));
     s
 }
@@ -706,8 +769,11 @@ fn pipelines(w: &Window, stats: &Value) -> String {
     let lane = &stats["postprocess"]["lanes"];
     let sum = |key: &str| lane[key].as_array().map(|v| v.iter().filter_map(Value::as_f64).sum::<f64>());
     if let (Some(visits), Some(finished)) = (sum("net_visits"), sum("net_finished")) {
-        net.note =
-            format!("bodies a minute; {} releases visited and {} finished a minute", short(visits), short(finished));
+        net.note = format!(
+            "per minute: bodies fetched; {} releases visited and {} finished a minute",
+            short(visits),
+            short(finished)
+        );
     }
     lanes.push(net);
 
@@ -870,13 +936,23 @@ fn headline(w: &Window, stats: &Value, now: f64) -> String {
     let n = w.now.as_deref();
     let get = |name: &str| n.and_then(|n| n.sum(name));
     let with = |name: &str, key: &str, value: &str| n.and_then(|n| n.with(name, key, value));
-    let running = stats["load"]["at"].as_f64().is_some_and(|at| now - at < STALE_SECS)
-        || get("atlas_indexer_up").is_some_and(|u| u > 0.0);
+    // the indexer writes stats.json every second: a listener that still answers while that has gone quiet is
+    // a process that stopped moving
+    let wrote = stats["load"]["at"].as_f64().filter(|at| *at > 0.0);
+    let fresh = wrote.is_some_and(|at| now - at < STALE_SECS);
+    let up = get("atlas_indexer_up").is_some_and(|u| u > 0.0);
     let start = get("atlas_process_start_time_seconds");
-    let state = if running {
-        format!("{}up {}", tag("tag-ok", "RUNNING"), start.map(|s| span(now - s)).unwrap_or_default())
-    } else {
-        tag("tag-bad", "STOPPED")
+    let state = match (fresh, up, wrote) {
+        (true, _, _) => format!("{} up {}", tag("tag-ok", "RUNNING"), start.map(|s| span(now - s)).unwrap_or_default()),
+        (false, true, Some(at)) => format!(
+            "{} its metrics still answer, but it last wrote stats.json {}; the counters below aren't moving",
+            tag("tag-warn", "NOT MOVING"),
+            ago(at, now)
+        ),
+        (false, true, None) => {
+            format!("{} up {}", tag("tag-ok", "RUNNING"), start.map(|s| span(now - s)).unwrap_or_default())
+        }
+        (false, false, _) => tag("tag-bad", "STOPPED"),
     };
     let wire = w.rate_where("atlas_nntp_traffic_bytes_total", |l| label(l, "kind") == Some("wire"));
     let articles = w.rate_where("atlas_articles_total", |_| true);
@@ -1073,17 +1149,19 @@ fn day_html(s: &Stored) -> String {
         entry.0.count += row.count;
         entry.0.complete += row.complete;
         entry.0.bytes += row.bytes;
-        if *category != root {
+        if *category != root && *category != crate::category::UNCATEGORIZED {
             entry.1.push((*category, row));
         }
     }
     let mut order: Vec<_> = roots.into_iter().collect();
     order.sort_by_key(|r| std::cmp::Reverse(r.1.0.count));
+    let sampled = s.day_every > 1;
+    let about = if sampled { "≈ " } else { "" };
     let line = |label: &str, r: &DayRow, sub: bool| {
         let share = if total.count > 0 { r.count as f64 / total.count as f64 } else { 0.0 };
         let class = if sub { " class=\"sub\"" } else { "" };
         format!(
-            "<tr{class}><td class=\"name\">{}</td><td class=\"num\">{}</td><td class=\"share\">{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td></tr>",
+            "<tr{class}><td class=\"name\">{}</td><td class=\"num\">{about}{}</td><td class=\"share\">{}</td><td class=\"num\">{about}{}</td><td class=\"num\">{about}{}</td></tr>",
             escape(label),
             thousands(r.count),
             bar(share, "none", &format!("{:.1}% of the day's releases", share * 100.0)),
@@ -1093,7 +1171,11 @@ fn day_html(s: &Stored) -> String {
     };
     let mut rows = String::new();
     for (root, (sum, mut subs)) in order {
-        let name = if root == i64::MAX { "Uncategorized".to_string() } else { category_label(root) };
+        let name = if root == i64::MAX {
+            "Uncategorized".to_string()
+        } else {
+            crate::category::label(root).unwrap_or_else(|| root.to_string())
+        };
         rows.push_str(&line(&name, &sum, false));
         subs.sort_by_key(|r| std::cmp::Reverse(r.1.count));
         for (category, row) in subs {
@@ -1112,13 +1194,13 @@ fn day_html(s: &Stored) -> String {
         String::new()
     };
     let tiles = [
-        tile("Posted in the last 24 hours", &thousands(total.count), "by the usenet date of their newest articles"),
+        tile("Posted in the last 24 hours", &thousands(s.day_total), "by the usenet date of their newest articles"),
         tile(
             "Complete",
-            &thousands(total.complete),
+            &format!("{about}{}", short(total.complete as f64)),
             &percent(total.complete as f64, total.count as f64).map(|p| format!("{p:.1}%")).unwrap_or_default(),
         ),
-        tile("Size", &bytes(total.bytes as f64), ""),
+        tile("Size", &format!("{about}{}", bytes(total.bytes as f64)), ""),
     ];
     let table = if rows.is_empty() {
         String::new()
@@ -1127,7 +1209,20 @@ fn day_html(s: &Stored) -> String {
             "<div class=\"table-wrap\"><table class=\"day\"><thead><tr><th>Category</th><th class=\"num\">Releases</th><th><span class=\"sr-only\">Share</span></th><th class=\"num\">Complete</th><th class=\"num\">Size</th></tr></thead><tbody>{rows}</tbody></table></div>"
         )
     };
-    format!("<h2>Last 24 hours</h2>{unindexed}<div class=\"stat-grid\">{}</div>{table}", tiles.concat())
+    let how = if sampled {
+        format!(
+            " The count is exact; the breakdown, complete and size are scaled up from one release in {} on the busiest shard.",
+            thousands(s.day_every)
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        "<h2>Last 24 hours</h2>{unindexed}<div class=\"stat-grid\">{}</div>{table}<p class=\"sort\">Counted {} in {:.1} s, again after five minutes.{how}</p>",
+        tiles.concat(),
+        ago(s.day_at, s.at),
+        s.day_secs,
+    )
 }
 
 fn predb_html(s: &Stored, now: f64) -> String {
@@ -1165,11 +1260,10 @@ fn stored_html(s: &Stored, now: f64) -> String {
         crate::web::diag("caution", "some shards could not be read", &s.errors.join("; "))
     };
     format!(
-        "<div id=\"stats-stored\">{errors}{}{}<p class=\"sort\">Read from the shards {} in {:.1} s; read again after a minute.</p></div>",
+        "<div id=\"stats-stored\">{errors}{}{}<p class=\"sort\">PreDB matches read {}; again after a minute.</p></div>",
         day_html(s),
         predb_html(s, now),
         ago(s.at, now),
-        s.secs,
     )
 }
 
@@ -1273,8 +1367,47 @@ atlas_indexer_up 1
         assert!(out.contains("rates show once"));
         assert!(out.contains("Lanes per shard") && out.contains("<td>s1</td>"));
         assert!(out.contains("hx-trigger=\"every 30s\""));
+        let quiet = live_html(&w, None, &stats, 1000.0 + STALE_SECS + 5.0);
+        assert!(quiet.contains("NOT MOVING") && !quiet.contains("RUNNING"), "metrics answer, stats.json went quiet");
         let failed = live_html(&Window::default(), Some("connection refused"), &Value::Null, 1001.0);
         assert!(failed.contains("could not be read") && failed.contains("connection refused"));
+    }
+
+    #[test]
+    fn a_busy_shards_day_is_counted_exactly_and_broken_down_from_a_sample() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.db");
+        let conn = crate::db::create_at(&path).unwrap();
+        crate::store::build_shard(&conn).unwrap();
+        conn.execute_batch(&format!(
+            "create index {} on releases(posted_date);
+             create table if not exists release_category (release_id INTEGER PRIMARY KEY, category INTEGER NOT NULL);",
+            crate::field_search::POSTED_INDEX
+        ))
+        .unwrap();
+        // 1,000 fresh releases, a seventh of them TV and complete, and one old
+        for n in 0..1_000i64 {
+            let id = n * crate::store::SHARDS as i64;
+            conn.execute(
+                "insert into releases (id, name, group_name, posted_date, size, complete) values (?, ?, 'g', '2026-11-05 10:00:00', 10, ?)",
+                params![id, format!("r{n}"), (n % 7 == 3) as i64],
+            )
+            .unwrap();
+            if n % 7 == 3 {
+                conn.execute("insert into release_category values (?, 5040)", [id]).unwrap();
+            }
+        }
+        conn.execute("insert into releases (id, name, group_name, posted_date) values (99999992, 'old', 'g', '2026-11-01 00:00:00')", []).unwrap();
+        let day = day_of(&conn, "2026-11-04 12:00:00", 100).unwrap().unwrap();
+        assert_eq!((day.total, day.every), (1_000, 10));
+        let tv = &day.rows[&5040];
+        assert_eq!(tv.count, tv.complete);
+        assert!((100..=190).contains(&tv.count), "about a seventh: {}", tv.count);
+        let all = day_of(&conn, "2026-11-04 12:00:00", 20_000).unwrap().unwrap();
+        assert_eq!(
+            (all.every, all.rows[&5040].count, all.rows[&crate::category::UNCATEGORIZED].bytes),
+            (1, 143, 8_570)
+        );
     }
 
     #[test]
@@ -1318,11 +1451,16 @@ atlas_indexer_up 1
             )
             .unwrap();
         }
-        let s = read_stored(&main, at);
+        let s = read_stored(&main, at, None);
         assert!(s.errors.is_empty(), "{:?}", s.errors);
         assert_eq!(s.day_unindexed, shards.len() - 2, "shards without the index are left out, not scanned");
         assert_eq!(s.day[&2040], DayRow { count: 2, complete: 2, bytes: 2000 });
         assert_eq!(s.day[&crate::category::UNCATEGORIZED].count, 2);
+        assert_eq!((s.day_total, s.day_every, s.day_at), (4, 1, at));
+        // a minute later the matches are read again, the day is kept
+        let later = read_stored(&main, at + 60.0, Some(&s));
+        assert_eq!((later.day_total, later.day_at), (4, at));
+        assert_eq!(later.predb.len(), 2);
         assert_eq!(s.predb.iter().map(|r| r.id).collect::<Vec<_>>(), vec![8, 9], "newest match first");
         assert_eq!(s.predb[0].atlas_category, 2040);
         let out = stored_html(&s, at);
