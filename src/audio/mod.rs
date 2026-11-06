@@ -1,7 +1,7 @@
 //! Audio fingerprints: a few seconds of a release's sound, decoded and turned into Chromaprint's items (one 32-bit
 //! word every 1365 samples at 11025 Hz, about 0.124 s), soo two releases of the same film or episode can be found
 //! whatever codec, bit rate or container each was encoded to. Two prints are the same sound when, lined up, their
-//! items differ in fewer than 10 of 32 bits on average (Chromaprint's own threshold) over 5 seconds or more.
+//! items differ in fewer than 6 of 32 bits on average over 5 seconds or more.
 //!
 //! A print is only ever a candidate for a reader, like every key in `keys`: never a merge.
 
@@ -10,9 +10,12 @@ pub mod mkv;
 
 use rusty_chromaprint::{Configuration, Fingerprinter};
 
-/// Chromaprint's own: an aligned item differing in fewer than this many of its 32 bits, on average, is the same
-/// sound. Unrelated sound differs in about 16.
-pub const MATCH_BITS: u32 = 10;
+/// An aligned item differing in fewer than this many of its 32 bits, on average, is the same sound. Chromaprint's own
+/// matcher takes 10, at the one alignment its hash histogram picks; every offset is tried here, and the best of so
+/// many is lower by chance, soo the bar is lower too. The same sound measures 0.6 bits across AAC and FLAC and 2 at
+/// the worst offset of the item grid; a tune of the same rhythm and other notes, its best offset of all, 10; unrelated
+/// sound about 16.
+pub const MATCH_BITS: u32 = 6;
 /// The fewest items two prints must overlap by to be compared: about 5 seconds.
 pub const MIN_OVERLAP: usize = 40;
 /// The most items a print keeps: about 30 seconds.
