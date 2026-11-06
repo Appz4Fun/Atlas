@@ -39,6 +39,8 @@ pub const TABLES: &[&str] = &[
     "release_nfo_password",
     "release_opensubtitles",
     "release_stills",
+    "release_audio_print",
+    "release_audio_anchor",
     "release_cover",
     "media_release",
     "predb_match",

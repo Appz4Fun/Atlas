@@ -199,7 +199,7 @@ fn part_at<'a>(layout: &Layout<'a>, percent: u8) -> Option<(&'a FileInfo, i64)> 
 }
 
 /// Part `part` of a file, decoded, with what the yEnc header says it starts at.
-fn read(ctx: &mut StepCtx<'_>, file: &FileInfo, part: i64) -> Result<Option<(u64, Vec<u8>)>, StepError> {
+pub(super) fn read(ctx: &mut StepCtx<'_>, file: &FileInfo, part: i64) -> Result<Option<(u64, Vec<u8>)>, StepError> {
     let retry = |e: rusqlite::Error| StepError::Retry(e.to_string());
     let segs = ctx.segments(file.id, &SegmentPick::Parts(vec![part])).map_err(retry)?;
     let Some(seg) = segs.into_iter().next().filter(|s| s.part.is_none_or(|p| p == part)) else { return Ok(None) };
@@ -327,9 +327,9 @@ struct Share {
 const MAX_HELD: u64 = mp4::MAX_MOOV + 3 * mp4::MAX_SAMPLE as u64 + (16 << 20);
 
 /// Reads part `part` of a file, decoded, with what its yEnc header says it starts at (0 based).
-type Fetch<'f> = dyn FnMut(&FileInfo, i64) -> Result<Option<(u64, Vec<u8>)>, StepError> + 'f;
+pub(super) type Fetch<'f> = dyn FnMut(&FileInfo, i64) -> Result<Option<(u64, Vec<u8>)>, StepError> + 'f;
 
-struct FileBytes<'a> {
+pub(super) struct FileBytes<'a> {
     /// by volume number from the first: a volume missing from the post leaves its slot empty, soo the ones after
     /// it keep their place in the file
     volumes: Vec<Option<&'a FileInfo>>,
@@ -346,7 +346,7 @@ struct FileBytes<'a> {
 }
 
 impl<'a> FileBytes<'a> {
-    fn new(volumes: Vec<Option<&'a FileInfo>>, stored: bool) -> Self {
+    pub(super) fn new(volumes: Vec<Option<&'a FileInfo>>, stored: bool) -> Self {
         let n = volumes.len();
         FileBytes {
             volumes,
@@ -444,7 +444,7 @@ impl<'a> FileBytes<'a> {
     }
 
     /// The file's bytes `from..to`, or None when a part is missing or doesn't sit where it should.
-    fn range(&mut self, fetch: &mut Fetch<'_>, from: u64, to: u64) -> Result<Option<Vec<u8>>, StepError> {
+    pub(super) fn range(&mut self, fetch: &mut Fetch<'_>, from: u64, to: u64) -> Result<Option<Vec<u8>>, StepError> {
         let mut out = Vec::with_capacity(usize::try_from(to.saturating_sub(from)).unwrap_or(0).min(64 << 20));
         let mut x = from;
         while x < to {
@@ -507,7 +507,7 @@ fn volume_number(name: &str) -> Option<u32> {
 
 /// The volumes of a set in slots by their number from the first, a missing one leaving its slot empty. None when a
 /// name doesn't say its number, or two say the same.
-fn volume_slots<'a>(first: &str, volumes: Vec<&'a FileInfo>) -> Option<Vec<Option<&'a FileInfo>>> {
+pub(super) fn volume_slots<'a>(first: &str, volumes: Vec<&'a FileInfo>) -> Option<Vec<Option<&'a FileInfo>>> {
     let start = volume_number(first)?;
     let mut slots: Vec<Option<&FileInfo>> = Vec::new();
     for v in volumes {

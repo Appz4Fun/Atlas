@@ -112,10 +112,12 @@ pub enum Kind {
     BodyCrc,
     Video,
     Audio,
+    /// the same sound by audio fingerprint (`probe::audio_print`), kept only for releases nothing else ties
+    AudioPrint,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 10] = [
+    pub const ALL: [Kind; 11] = [
         Kind::Account,
         Kind::Host,
         Kind::Layout,
@@ -126,6 +128,7 @@ impl Kind {
         Kind::BodyCrc,
         Kind::Video,
         Kind::Audio,
+        Kind::AudioPrint,
     ];
 
     /// The word in `/ui/same?kind=`.
@@ -141,6 +144,7 @@ impl Kind {
             Kind::BodyCrc => "article",
             Kind::Video => "video",
             Kind::Audio => "audio",
+            Kind::AudioPrint => "audioprint",
         }
     }
 
@@ -161,6 +165,7 @@ impl Kind {
             Kind::BodyCrc => "Same first article, by the server's body CRC",
             Kind::Video => "Same video stream",
             Kind::Audio => "Same audio stream",
+            Kind::AudioPrint => "Same sound, by audio fingerprint",
         }
     }
 
@@ -195,6 +200,9 @@ impl Kind {
             Kind::Audio => {
                 "The same first audio track, to the bit: FLAC's MD5 of its samples, or the first eight different AC-3 or E-AC-3 frames. The same audio remuxed, whatever the video, container or group: a hybrid or another encode can keep the source's audio. A studio's logo music, encoded once and reused, can match across films, soo check the names."
             }
+            Kind::AudioPrint => {
+                "The same sound a quarter, half and three quarters of the way in, as Chromaprint hears it: often the same film or episode in another encode, codec or container. Taken only for releases no other key ties to another, from AAC, FLAC, MP3, MP2, Vorbis and PCM tracks in Matroska. A theme tune or a recap can match across episodes, soo check the names."
+            }
         }
     }
 
@@ -208,7 +216,7 @@ impl Kind {
             Kind::BodyCrc => Some("body_crc"),
             Kind::Video => Some("video"),
             Kind::Audio => Some("audio"),
-            Kind::Par2 | Kind::MovieHash | Kind::FileCrc => None,
+            Kind::Par2 | Kind::MovieHash | Kind::FileCrc | Kind::AudioPrint => None,
         }
     }
 }
@@ -240,7 +248,7 @@ impl Keys {
             Kind::BodyCrc => self.body_crc,
             Kind::Video => self.video,
             Kind::Audio => self.audio,
-            Kind::Par2 | Kind::MovieHash | Kind::FileCrc => None,
+            Kind::Par2 | Kind::MovieHash | Kind::FileCrc | Kind::AudioPrint => None,
         }
     }
 }
@@ -272,6 +280,8 @@ pub struct Lookup {
     pub par2_sets: Vec<Vec<u8>>,
     pub moviehash: Option<String>,
     pub files: Vec<FileCrc>,
+    /// it has an audio print (`probe::audio_print`), matched by its own lookup
+    pub audio_print: bool,
 }
 
 impl Lookup {
@@ -280,6 +290,7 @@ impl Lookup {
             Kind::Par2 => !self.par2_sets.is_empty(),
             Kind::MovieHash => self.moviehash.is_some(),
             Kind::FileCrc => !self.files.is_empty(),
+            Kind::AudioPrint => self.audio_print,
             _ => self.keys.get(kind).is_some(),
         }
     }
@@ -534,7 +545,8 @@ pub fn read_lookup(
         .ok()
         .and_then(|mut q| q.query_row([release_id], |r| r.get::<_, Option<String>>(0)).optional().ok().flatten())
         .flatten();
-    Ok(Lookup { keys, par2_sets, moviehash, files })
+    let audio_print = crate::probe::audio_print::has_print(shard, release_id);
+    Ok(Lookup { keys, par2_sets, moviehash, files, audio_print })
 }
 
 /// The files a release knows the size and whole-file CRC32 of: the probed main file first, then the biggest ones
@@ -765,6 +777,9 @@ fn binds(kind: Kind, values: usize) -> usize {
 /// The releases other than `own` that share `kind` with it, over every shard of `conn` (the main database with
 /// the shards attached), newest first, at most `limit`. A shard without the table yet has none.
 pub fn others(conn: &Connection, own: i64, lookup: &Lookup, kind: Kind, limit: i64) -> Vec<i64> {
+    if kind == Kind::AudioPrint {
+        return if lookup.audio_print { crate::probe::audio_print::others(conn, own, limit) } else { Vec::new() };
+    }
     let bound = values(lookup, kind);
     if bound.is_empty() || limit <= 0 {
         return Vec::new();
@@ -788,6 +803,9 @@ pub fn others(conn: &Connection, own: i64, lookup: &Lookup, kind: Kind, limit: i
 
 /// How many releases other than `own` share `kind` with it, up to `COUNT_CAP`.
 pub fn count_others(conn: &Connection, own: i64, lookup: &Lookup, kind: Kind) -> i64 {
+    if kind == Kind::AudioPrint {
+        return others(conn, own, lookup, kind, COUNT_CAP).len() as i64;
+    }
     let bound = values(lookup, kind);
     if bound.is_empty() {
         return 0;
@@ -1127,7 +1145,13 @@ mod tests {
             )
             .unwrap();
         }
-        let lookup = Lookup { keys: Keys::default(), par2_sets: vec![set], moviehash: None, files: Vec::new() };
+        let lookup = Lookup {
+            keys: Keys::default(),
+            par2_sets: vec![set],
+            moviehash: None,
+            files: Vec::new(),
+            audio_print: false,
+        };
         assert_eq!(others(&conn, 1, &lookup, Kind::Par2, 1), vec![2], "the limit counts only the shown ones");
         assert_eq!(count_others(&conn, 1, &lookup, Kind::Par2), 1);
     }
@@ -1224,7 +1248,13 @@ mod tests {
         for (_, index) in crate::archive::store::PAR2_FILES.indexes {
             conn.execute_batch(&index.replacen("exists ", "exists s0.", 1)).unwrap();
         }
-        let lookup = Lookup { keys: Keys::default(), par2_sets: Vec::new(), moviehash: None, files: vec![file] };
+        let lookup = Lookup {
+            keys: Keys::default(),
+            par2_sets: Vec::new(),
+            moviehash: None,
+            files: vec![file],
+            audio_print: false,
+        };
         assert!(lookup.has(Kind::FileCrc));
         let plan: Vec<String> = conn
             .prepare(&format!("explain query plan {}", others_sql(Kind::FileCrc, 0, 1)))
@@ -1236,7 +1266,13 @@ mod tests {
         assert!(plan.iter().any(|p| p.contains("par2_files_crc")), "the PAR2 side seeks size and CRC: {plan:?}");
         assert_eq!(others(&conn, 1, &lookup, Kind::FileCrc, 10), vec![3, 2]);
         assert_eq!(count_others(&conn, 1, &lookup, Kind::FileCrc), 2);
-        let none = Lookup { keys: Keys::default(), par2_sets: Vec::new(), moviehash: None, files: Vec::new() };
+        let none = Lookup {
+            keys: Keys::default(),
+            par2_sets: Vec::new(),
+            moviehash: None,
+            files: Vec::new(),
+            audio_print: false,
+        };
         assert!(others(&conn, 1, &none, Kind::FileCrc, 10).is_empty());
     }
 }
