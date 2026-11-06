@@ -709,14 +709,6 @@ struct Backfill {
     nearly: Vec<(String, i64, f64)>,
 }
 
-/// (article numbers on the server, how many of them are indexed)
-fn row_numbers(row: &db::GroupProgress) -> Option<(i64, i64)> {
-    let (first, last) = (row.first?, row.last?);
-    let total = (last - first + 1).max(0);
-    let covered = (row.live_cursor.min(last) - row.backfill_cursor.max(first - 1)).clamp(0, total);
-    Some((total, covered))
-}
-
 /// no usenet history goes back further than this (binary retention starts in the 2000s)
 const EARLIEST_POST: i64 = 631_152_000; // 1990-01-01
 
@@ -742,29 +734,11 @@ fn backfill(quick: &Quick) -> Backfill {
 
 fn backfill_at(quick: &Quick, now: i64) -> Backfill {
     let mut b = Backfill::default();
+    let seen: std::collections::HashSet<&str> =
+        quick.progress.iter().map(|row| row.key.split('@').next().unwrap_or(&row.key)).collect();
     // group -> (total, covered, its row)
-    let mut best: BTreeMap<String, (i64, i64, &db::GroupProgress)> = BTreeMap::new();
-    let mut seen = std::collections::HashSet::new();
-
-    for row in &quick.progress {
-        let group = row.key.split('@').next().unwrap_or(&row.key).to_string();
-        seen.insert(group.clone());
-        let Some((total, covered)) = row_numbers(row) else { continue };
-        let better = best.get(&group).is_none_or(|(t, c, _)| (covered, total) > (*c, *t));
-        if better {
-            best.insert(group, (total, covered, row));
-        }
-    }
-    b.unmeasured = seen.iter().filter(|g| !best.contains_key(*g)).count();
-
-    // a split group's cursors stand still: its day chunks say how far it is,
-    // as that share of its article numbers. once they are all done its home
-    // cursor sweeps on for what they missed, and the cursor says it again
-    for (group, (total, covered, _)) in best.iter_mut() {
-        if let Some(&(done, chunks)) = quick.group_chunks.get(group).filter(|c| c.1 > 0 && c.0 < c.1) {
-            *covered = (*total as i128 * done.clamp(0, chunks) as i128 / chunks as i128) as i64;
-        }
-    }
+    let best = db::best_progress(&quick.progress, &quick.group_chunks);
+    b.unmeasured = seen.iter().filter(|g| !best.contains_key(**g)).count();
 
     let mut rows: Vec<(String, i64, f64)> = Vec::new();
     let (mut rate_dated, mut total_dated, mut reached) = (0.0, 0i64, Vec::new());

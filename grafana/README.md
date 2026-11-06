@@ -1,6 +1,8 @@
 # Grafana dashboards
 
-Seven dashboards for Atlas's [Prometheus metrics](../README.md#metrics), exported for sharing. Six are also on the [dashboards page](https://appz4fun.github.io/Atlas/); the sealed log's has no screenshot yet.
+Eight dashboards for Atlas's [Prometheus metrics](../README.md#metrics), exported for sharing. Six are also on the [dashboards page](https://appz4fun.github.io/Atlas/); the sealed log's and the backfill and realtime one have no screenshot yet.
+
+`atlas-progress.json`, "Atlas: Backfill and realtime", answers two questions: how far the backfill has come (per group and overall: article numbers indexed against each group's first and last on its server, the oldest post and day chunk reached, the pace and an ETA), and whether live indexing keeps up (articles behind each group's last number, the age of its newest indexed post, the indexing and processing queues, net lane claims per shard, errors and panics). Its `Atlas` variable picks one scrape target, since the same process can be scraped at two addresses.
 
 To import one, go to Dashboards, then New, then Import, upload its JSON and pick your Prometheus or VictoriaMetrics data source.
 

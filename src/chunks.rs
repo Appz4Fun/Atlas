@@ -447,6 +447,48 @@ pub fn release(conn: &Connection, claim: &Claim) -> Result<bool> {
     Ok(n > 0)
 }
 
+/// One group's day chunks: how many, how many done, and the days they span.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GroupChunks {
+    pub done: i64,
+    pub total: i64,
+    /// the oldest and newest day of its chunks
+    pub oldest_day: i64,
+    pub newest_day: i64,
+    /// the oldest day done: backfill goes newest month first, soo this is how far back it has come
+    pub oldest_done_day: Option<i64>,
+}
+
+/// Every group's day chunks; none without the table.
+pub fn per_group(conn: &Connection) -> Result<std::collections::BTreeMap<String, GroupChunks>> {
+    let has: bool = conn.query_row(
+        "select exists(select 1 from sqlite_master where type = 'table' and name = 'backfill_chunks')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !has {
+        return Ok(Default::default());
+    }
+    let mut stmt = conn.prepare(
+        "select grp, coalesce(sum(state = 2), 0), count(*), min(day), max(day),
+                min(case when state = 2 then day end)
+         from backfill_chunks group by grp",
+    )?;
+    stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            GroupChunks {
+                done: r.get(1)?,
+                total: r.get(2)?,
+                oldest_day: r.get(3)?,
+                newest_day: r.get(4)?,
+                oldest_done_day: r.get(5)?,
+            },
+        ))
+    })?
+    .collect()
+}
+
 /// (done, total) chunks of a group
 pub fn progress(conn: &Connection, group: &str) -> Result<(i64, i64)> {
     conn.query_row("select coalesce(sum(state = 2), 0), count(*) from backfill_chunks where grp = ?", [group], |r| {
@@ -573,6 +615,19 @@ pub fn split_groups(conn: &Connection) -> Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn per_group_counts_and_spans_each_groups_chunks() {
+        let conn = Connection::open_in_memory().unwrap();
+        assert!(per_group(&conn).unwrap().is_empty(), "no table: nothing");
+        create(&conn).unwrap();
+        add(&conn, "g", 100, 97).unwrap();
+        let claim = claim(&conn, &[("g".to_string(), i64::MIN)], "s", 1000).unwrap().unwrap();
+        assert!(finish(&conn, &claim, 1100).unwrap());
+        let g = per_group(&conn).unwrap()["g"];
+        assert_eq!((g.done, g.total, g.oldest_day, g.newest_day), (1, 4, 97, 100));
+        assert_eq!(g.oldest_done_day, Some(claim.day));
+    }
 
     fn conn() -> Connection {
         let c = Connection::open_in_memory().unwrap();

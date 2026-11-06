@@ -60,5 +60,5 @@ A post with a weak name, such as numbered files, has its poster and day in its k
 
 ## Sealed files
 
-- The sealed log dashboard (`atlas-sealed-log`) has no screenshot and no entry on the dashboards page (`grafana/index.html`). Take one once the service and Atlas have run the metrics builds for a while, with addresses and host names replaced as for the others, then publish the page.
+- The sealed log dashboard (`atlas-sealed-log`) and the backfill and realtime one (`atlas-progress`) have no screenshot and no entry on the dashboards page (`grafana/index.html`). Take them once the service and Atlas have run the metrics builds for a while, with addresses and host names replaced as for the others, then publish the page.
 - Some sealed files hold more than `SEAL_MAX_SEGMENTS`, and how they got there isn't known. They're read up to `READ_MAX_SEGMENTS`, and a late article stays a row on them. Fix, if it matters: find them with `blob::count` and leave them, or split them.
