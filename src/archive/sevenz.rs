@@ -2,7 +2,8 @@
 //! is, and that one may be LZMA packed.
 #![cfg_attr(not(test), deny(clippy::indexing_slicing, clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
-use super::{Encryption, Listing, MAX_ENTRIES, crc32};
+use super::facts::{self, Twin};
+use super::{Encryption, FileFacts, Listing, MAX_ENTRIES, crc32};
 
 const MAX_NEXT: u64 = 16 * 1024 * 1024;
 const MAX_DECODED: usize = 16 * 1024 * 1024;
@@ -146,6 +147,8 @@ struct Streams {
     folders: Vec<Folder>,
     /// each file's size, in order, for files with a stream
     sizes: Vec<u64>,
+    /// each file's CRC32 beside its size, when the header has one
+    crcs: Vec<Option<u32>>,
 }
 
 fn folder(r: &mut Reader<'_>) -> Option<Folder> {
@@ -264,6 +267,7 @@ fn streams(r: &mut Reader<'_>) -> Option<Streams> {
     // by default a folder holds one stream
     let mut per_folder: Vec<u64> = vec![1; s.folders.len()];
     let mut listed = false;
+    let mut sub_digests: Vec<Option<u32>> = Vec::new();
     if id == 0x08 {
         id = r.byte()?;
         if id == 0x0d {
@@ -299,10 +303,21 @@ fn streams(r: &mut Reader<'_>) -> Option<Streams> {
             // every stream but a folder with one stream and a known CRC
             let count: u64 =
                 s.folders.iter().zip(&per_folder).map(|(f, n)| if *n == 1 && f.crc.is_some() { 0 } else { *n }).sum();
-            r.digests(count)?;
+            sub_digests = r.digests(count)?;
             id = r.byte()?;
         }
         id = r.byte()?;
+    }
+    // a CRC beside each size: a folder's own for a folder of one stream, else the next substream digest
+    let mut digests = sub_digests.into_iter();
+    for (f, n) in s.folders.iter().zip(&per_folder) {
+        if *n == 1 && f.crc.is_some() {
+            s.crcs.push(f.crc);
+        } else {
+            for _ in 0..*n {
+                s.crcs.push(digests.next().flatten());
+            }
+        }
     }
     if !listed {
         for (f, n) in s.folders.iter().zip(&per_folder) {
@@ -332,13 +347,34 @@ fn names(data: &[u8], count: u64) -> Option<Vec<String>> {
     Some(out)
 }
 
-fn files(r: &mut Reader<'_>, l: &mut Listing, sizes: &[u64]) -> Option<()> {
+/// A property of one value a file (`width` bytes each): all defined or a bit each, an "external" byte that must be
+/// 0, then the values. Kept for the first `MAX_ENTRIES` files.
+fn per_file(part: &mut Reader<'_>, count: u64, width: u64) -> Option<Vec<Option<u64>>> {
+    let all = part.byte()?;
+    let defined = if all == 0 { part.bits(count)? } else { vec![true; usize::try_from(count.min(part.left())).ok()?] };
+    if part.byte()? != 0 {
+        return None;
+    }
+    let mut out = Vec::new();
+    for d in defined.into_iter().take(MAX_ENTRIES) {
+        out.push(if d {
+            let bytes = part.take(width)?;
+            Some(bytes.iter().rev().fold(0u64, |acc, b| acc << 8 | u64::from(*b)))
+        } else {
+            None
+        });
+    }
+    Some(out)
+}
+
+fn files(r: &mut Reader<'_>, l: &mut Listing, sizes: &[u64], crcs: &[Option<u32>]) -> Option<()> {
     let count = r.number()?;
     // a name takes at least a byte's worth of header: more is a lie, seen before anything is allocated
     if count > r.left().saturating_mul(8) {
         return None;
     }
     let (mut empty_stream, mut empty_file, mut read): (Vec<bool>, Vec<bool>, Vec<String>) = Default::default();
+    let (mut mtimes, mut attribs): (Vec<Option<u64>>, Vec<Option<u64>>) = Default::default();
     loop {
         let ty = r.number()?;
         if ty == 0 {
@@ -360,9 +396,18 @@ fn files(r: &mut Reader<'_>, l: &mut Listing, sizes: &[u64]) -> Option<()> {
                 let limit = count.min(MAX_ENTRIES as u64 + 1);
                 read = names(rest, limit)?;
             }
+            // a property that won't read leaves the names alone
+            0x14 => mtimes = per_file(&mut part, count, 8).unwrap_or_default(),
+            0x15 => attribs = per_file(&mut part, count, 4).unwrap_or_default(),
             _ => {}
         }
     }
+    // FILETIME, UTC; an attribute with 0x8000 holds a Unix mode in its high half, soo a Unix packer
+    let facts_of = |i: usize, crc: Option<u32>| FileFacts {
+        crc32: crc,
+        mtime: mtimes.get(i).copied().flatten().and_then(facts::filetime_secs),
+        host_os: attribs.get(i).copied().flatten().filter(|a| a & 0x8000 != 0).map(|_| facts::HOST_UNIX),
+    };
     let (mut stream, mut empty) = (0usize, 0usize);
     let mut full = false;
     for (i, name) in read.iter().enumerate() {
@@ -376,15 +421,16 @@ fn files(r: &mut Reader<'_>, l: &mut Listing, sizes: &[u64]) -> Option<()> {
                 full = true;
                 break;
             }
-            l.push(name, Some(0));
+            l.push_with(name, Some(0), facts_of(i, None));
         } else {
             let size = sizes.get(stream).copied();
+            let crc = crcs.get(stream).copied().flatten();
             stream += 1;
             if l.files.len() >= MAX_ENTRIES {
                 full = true;
                 break;
             }
-            l.push(name, size);
+            l.push_with(name, size, facts_of(i, crc));
         }
     }
     if read.len() as u64 > MAX_ENTRIES as u64 || full {
@@ -412,21 +458,42 @@ fn header(r: &mut Reader<'_>, l: &mut Listing) -> Option<()> {
         streams(r)?;
         id = r.byte()?;
     }
-    let mut sizes = Vec::new();
+    let (mut sizes, mut crcs) = (Vec::new(), Vec::new());
     if id == 0x04 {
         let main = streams(r)?;
         if main.folders.iter().any(|f| f.aes) {
             l.encrypted = true;
             l.encryption = Some(Encryption::SevenZipAes256);
         }
+        note_coders(l, &main.folders);
         sizes = main.sizes;
+        crcs = main.crcs;
         id = r.byte()?;
     }
     if id == 0x05 {
-        files(r, l, &sizes)?;
+        files(r, l, &sizes, &crcs)?;
         id = r.byte()?;
     }
     (id == 0x00).then_some(())
+}
+
+/// The first folder's coders into the packer, and the AES coder's IV as the archive's twin: random for each archive,
+/// and readable with the names hidden.
+fn note_coders(l: &mut Listing, folders: &[Folder]) {
+    if let Some(first) = folders.first() {
+        let names: Vec<String> = first.coders.iter().map(|(id, props)| facts::sevenz_coder(id, props)).collect();
+        if let Some(p) = l.packer.as_mut()
+            && !names.is_empty()
+            && !p.contains(" · coders ")
+        {
+            p.push_str(&format!(" · coders {}", names.join("+")));
+        }
+    }
+    let iv =
+        folders.iter().flat_map(|f| &f.coders).find(|(id, _)| id == AES).and_then(|(_, p)| facts::sevenz_aes_iv(p));
+    if let Some(iv) = iv {
+        l.twin = Some(Twin::new("7zaes", &iv));
+    }
 }
 
 /// LZMA, with third-party code fed attacker bytes: a panic in it means a bad archive.
@@ -462,6 +529,14 @@ pub fn list(head: &[u8], tail: &[u8]) -> Listing {
 /// None: damaged.
 fn run(head: &[u8], tail: &[u8], l: &mut Listing) -> Option<()> {
     let s = start(head)?;
+    // the start header: its version, and where the header lies with its size and CRC, which no other archive has
+    // (the header's own times, sizes and CRCs go into that CRC). The AES IV takes over once the header is read.
+    l.packer = Some(format!("7z · v{}.{}", head.get(6).copied().unwrap_or(0), head.get(7).copied().unwrap_or(0)));
+    if s.size != 0
+        && let Some(bytes) = head.get(12..32)
+    {
+        l.twin = Some(Twin::new("7z", bytes));
+    }
     if s.size == 0 {
         if s.offset == 0 && s.crc == 0 {
             l.complete = true;
@@ -507,6 +582,7 @@ fn nested(head: &[u8], window: &[u8], at: u64, first: Vec<u8>, l: &mut Listing) 
             l.encrypted = true;
             l.encryption = Some(Encryption::SevenZipAes256);
             l.headers_encrypted = true;
+            note_coders(l, &encoded.folders);
             return Some(());
         }
         let folder = encoded.folders.first()?;

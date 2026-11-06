@@ -79,6 +79,8 @@ fn lookup_of(i: &MetaInputs<'_>, l: &Looked) -> crate::keys::Lookup {
             .as_ref()
             .and_then(|s| crate::keys::crc_files(s, i.release.id, i.probe).ok())
             .unwrap_or_else(|| i.probe.and_then(crate::keys::probe_file).into_iter().collect()),
+        inner_files: shard.as_ref().map(|s| crate::keys::inner_crc_files(s, i.release.id)).unwrap_or_default(),
+        archive: shard.as_ref().map(|s| crate::keys::archive_keys(s, i.release.id)).unwrap_or_default(),
     }
 }
 
@@ -413,13 +415,9 @@ fn names_panel(i: &MetaInputs<'_>, l: &Looked, compact: bool) -> Facts {
     let subject = l.main.as_ref().and_then(|m| m.subject.as_deref());
     let subject_name = l.main.as_ref().map(|m| m.filename.as_str()).filter(|n| !n.is_empty());
     let yenc_name = i.probe.and_then(|p| p.yenc.as_ref()).and_then(|y| y.name.as_deref());
-    let archive_name = i
-        .probe
-        .and_then(|p| p.archive.as_ref())
-        .and_then(|a| a.name.as_deref())
-        .or_else(|| {
-            i.inner.files.iter().find(|r| r.source != SOURCE_PAR2 && r.source != SOURCE_NZB).map(|r| r.name.as_str())
-        });
+    let archive_name = i.probe.and_then(|p| p.archive.as_ref()).and_then(|a| a.name.as_deref()).or_else(|| {
+        i.inner.files.iter().find(|r| r.source != SOURCE_PAR2 && r.source != SOURCE_NZB).map(|r| r.name.as_str())
+    });
     if !compact {
         f.add("Subject", subject);
         f.add("Subject decoded", subject.and_then(decode_encoded_words));
@@ -934,22 +932,20 @@ fn posting_tool(timing: &[FileTiming]) -> Option<String> {
 fn id_clock(timing: &[FileTiming]) -> Option<String> {
     let first = timing.iter().filter_map(|t| t.clock_first).min()?;
     let last = timing.iter().filter_map(|t| t.clock_last).max()?;
-    let fmt = |ms: i64| {
-        chrono::DateTime::from_timestamp_millis(ms).map(|d| d.format("%Y-%m-%d %H:%M:%S%.3f").to_string())
-    };
+    let fmt =
+        |ms: i64| chrono::DateTime::from_timestamp_millis(ms).map(|d| d.format("%Y-%m-%d %H:%M:%S%.3f").to_string());
     let (a, b) = (fmt(first)?, fmt(last)?);
     let secs = (last - first) / 1000;
-    let span = if secs < 60 { "within a minute".to_string() } else { fmt_skew(secs).trim_start_matches('+').to_string() };
+    let span =
+        if secs < 60 { "within a minute".to_string() } else { fmt_skew(secs).trim_start_matches('+').to_string() };
     Some(format!("{a} to {b} UTC by the ids' clock, {span}"))
 }
 
 /// "fx09.am4, key JP7, counters 546,176–546,900": the Highwinds session every article came through; more than one
 /// key means more than one connection or session posted the files.
 fn server_session(timing: &[FileTiming]) -> Option<String> {
-    let mut keys: Vec<(String, String)> = timing
-        .iter()
-        .filter_map(|t| Some((t.hw_host.clone()?, t.hw_key.clone()?)))
-        .collect();
+    let mut keys: Vec<(String, String)> =
+        timing.iter().filter_map(|t| Some((t.hw_host.clone()?, t.hw_key.clone()?))).collect();
     keys.sort_unstable();
     keys.dedup();
     let first = timing.iter().filter_map(|t| t.hw_n_first).min();
@@ -967,7 +963,10 @@ fn server_session(timing: &[FileTiming]) -> Option<String> {
             };
             Some(format!("{host}, key {key}{counters}"))
         }
-        n => Some(format!("{n} sessions: {}", keys.iter().map(|(h, k)| format!("{h} key {k}")).collect::<Vec<_>>().join(", "))),
+        n => Some(format!(
+            "{n} sessions: {}",
+            keys.iter().map(|(h, k)| format!("{h} key {k}")).collect::<Vec<_>>().join(", ")
+        )),
     }
 }
 
@@ -1542,6 +1541,8 @@ fn inside_panel(i: &MetaInputs<'_>, l: &Looked, compact: bool) -> Facts {
     if !tells.is_empty() {
         f.add("Packed by", Some(tells.join("; ")));
     }
+    // what the archive's first file header says: format, method, dictionary, host, how times are kept
+    f.add("Packer settings", i.inner.packer.clone());
     f.add("Listed from", listing_source(i.inner));
     f.add_html("Points to", points_to_html(&l.points_to));
     f.add_html("Sidecars", sidecars_html(&l.sidecars));
@@ -2163,6 +2164,18 @@ fn keys_panel(i: &MetaInputs<'_>, l: &Looked, compact: bool) -> Facts {
             .filter(|_| !same_link(l, id, Kind::MovieHash).is_empty())
             .map(|h| with_link(h.to_string(), Kind::MovieHash)),
     );
+    // an archive's own keys: how many releases share one, never its value
+    for (label, what, kind) in [
+        ("Archive file CRC", "A file inside its archive, by size and CRC32", Kind::InnerFile),
+        ("Archive twin", "The archive's own random values", Kind::ArchiveTwin),
+        ("Archive owner", "The Unix owner its archive recorded (kept as a salted key only)", Kind::Owner),
+        ("Packer zone", "Its packer's settings and clock zone (kept as a salted key only)", Kind::Zone),
+    ] {
+        let link = same_link(l, id, kind);
+        if !link.is_empty() {
+            f.add_html(label, Some(format!("{what}{link}")));
+        }
+    }
     f
 }
 
