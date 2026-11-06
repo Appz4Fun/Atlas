@@ -45,6 +45,12 @@ pub const SIDECARS: ShardTable = ShardTable {
             "sidecars_release_name",
             "create index if not exists sidecars_release_name on sidecars(release_name) where release_name is not null",
         ),
+        // a mediainfo dump's file name is often in lower case, and the release's isn't
+        (
+            "sidecars_release_name_nocase",
+            "create index if not exists sidecars_release_name_nocase on sidecars(release_name collate nocase)
+                where release_name is not null",
+        ),
         (
             "sidecars_text_at",
             "create index if not exists sidecars_text_at on sidecars(at, release_id) where text is not null",
@@ -112,9 +118,10 @@ pub fn describing(
             if out.len() >= limit {
                 return;
             }
+            let collate = if column == "release_name" { " collate nocase" } else { "" };
             let sql = format!(
                 "select release_id, name, group_name, file, kind, text from s{shard}.sidecars
-                 where {column} = ?1 and release_id != ?2 order by at desc limit ?3"
+                 where {column} = ?1{collate} and release_id != ?2 order by at desc limit ?3"
             );
             let rows = conn.prepare(&sql).and_then(|mut stmt| {
                 stmt.query_map(rusqlite::params![value, own, limit as i64], |r| {
@@ -470,9 +477,24 @@ Format                                   : Matroska
              insert into s3.sidecars values (27, 'other', 'g', 'x.nfo', 'nfo', 'Other.Film', null, 'x', 3);",
         )
         .unwrap();
-        let found = describing(&conn, 100, &["Some.Film.2024"], Some("55F84B6AA194D59703CCAB394DA26CDE"), 5);
+        conn.execute_batch(
+            "create index s3.sidecars_release_name_nocase on sidecars(release_name collate nocase) where release_name is not null",
+        )
+        .unwrap();
+        let mut stmt = conn
+            .prepare("explain query plan select release_id from s3.sidecars where release_name = ?1 collate nocase and release_id != ?2")
+            .unwrap();
+        let plan: Vec<String> =
+            stmt.query_map(rusqlite::params!["x", 0], |r| r.get::<_, String>(3)).unwrap().map(Result::unwrap).collect();
+        drop(stmt);
+        assert!(plan.join(" ").contains("sidecars_release_name_nocase"), "{plan:?}");
+        let found = describing(&conn, 100, &["some.film.2024"], Some("55F84B6AA194D59703CCAB394DA26CDE"), 5);
         let got: Vec<(&str, &str)> = found.iter().map(|f| (f.name.as_str(), f.by)).collect();
-        assert_eq!(got, [("mediainfo", "segment_uid"), ("grp.nfo", "name")], "the UID match first, and once");
+        assert_eq!(
+            got,
+            [("mediainfo", "segment_uid"), ("grp.nfo", "name")],
+            "the UID match first, and once, names in any case"
+        );
         assert!(describing(&conn, 11, &[], Some("55f84b6aa194d59703ccab394da26cde"), 5).is_empty(), "not itself");
         assert!(describing(&conn, 100, &["No.Such.Name"], None, 5).is_empty());
     }
