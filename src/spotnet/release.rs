@@ -42,7 +42,9 @@ pub fn release_of(spot: &FullSpot, nzb: &Parsed) -> Option<Release> {
         };
         let mut segments = file.segments.clone();
         segments.sort_by_key(|s| s.number);
-        let total_parts = segments.len() as i64;
+        // what the subject says the file has, when that's more than the NZB lists: a file the NZB lost the end of
+        // must not pass for whole
+        let total_parts = (segments.len() as i64).max(parsed.as_ref().map_or(0, |p| p.total_parts));
         let date = iso_date(if file.date > 0 { file.date } else { spot.created });
         let author = if file.poster.is_empty() { spot.poster.clone() } else { file.poster.clone() };
         for (n, segment) in segments.iter().enumerate() {
@@ -86,10 +88,14 @@ pub fn rename(release: &mut Release, name: &str) {
     }
 }
 
-/// What an NZB holds, whatever order it lists its files in: a SHA-256 of its message-ids, sorted, hex.
-pub fn nzb_key(nzb: &Parsed) -> String {
+/// Which NZB articles a spot points at, whatever order it lists them in: a SHA-256 of their ids, sorted, hex. Two
+/// spots with the same one share an NZB, read once.
+pub fn ids_key(ids: &[String]) -> String {
+    sha_of_sorted(ids.iter().map(String::as_str).collect())
+}
+
+fn sha_of_sorted(mut ids: Vec<&str>) -> String {
     use sha2::{Digest, Sha256};
-    let mut ids: Vec<&str> = nzb.files.iter().flat_map(|f| f.segments.iter().map(|s| s.message_id.as_str())).collect();
     ids.sort_unstable();
     let mut hash = Sha256::new();
     for id in ids {
@@ -97,6 +103,11 @@ pub fn nzb_key(nzb: &Parsed) -> String {
         hash.update(b"\n");
     }
     hash.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// What an NZB holds, whatever order it lists its files in: a SHA-256 of its message-ids, sorted, hex.
+pub fn nzb_key(nzb: &Parsed) -> String {
+    sha_of_sorted(nzb.files.iter().flat_map(|f| f.segments.iter().map(|s| s.message_id.as_str())).collect())
 }
 
 /// A group of `file`'s that may be saved, the first one.
@@ -172,6 +183,23 @@ mod tests {
             ]
         );
         assert!(r.articles.iter().all(|a| a.release_name.as_deref() == Some("Movie (2026) 1080p")));
+    }
+
+    #[test]
+    fn a_file_the_nzb_cut_short_keeps_its_subjects_total() {
+        // the subject says 3 parts, the NZB lists 2
+        let cut = NZB.replace("yEnc (1/2)", "yEnc (1/3)");
+        let r = release_of(&spot(), &parse_keeping(cut.as_bytes(), MAX_SEGMENTS)).unwrap();
+        let first = r.articles.iter().find(|a| a.filename.as_deref() == Some("Movie.2026.1080p.mkv")).unwrap();
+        assert_eq!(first.total_parts, Some(3));
+        assert!(!r.complete);
+    }
+
+    #[test]
+    fn the_ids_key_is_the_ids_in_any_order() {
+        let ids = |l: &[&str]| l.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(ids_key(&ids(&["a@x", "b@x"])), ids_key(&ids(&["b@x", "a@x"])));
+        assert_ne!(ids_key(&ids(&["a@x"])), ids_key(&ids(&["a@x", "b@x"])));
     }
 
     #[test]

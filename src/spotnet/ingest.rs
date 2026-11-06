@@ -6,12 +6,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
+use rusqlite::OptionalExtension;
 
 use crate::config::SpotsConfig;
 use crate::indexer::{Db, on_db};
 use crate::nntp::{Pool, says_absent};
 
-use super::store::{self, SAVED, SKIPPED, SpotRow};
+use super::store::{self, SAVED, SKIPPED, Settled, SpotRow};
 use super::{MAX_XML_BYTES, SPOT_GROUP, binary, full, header, release};
 
 /// Overview lines asked for in one XOVER.
@@ -22,6 +23,8 @@ const MAX_NZB_ARTICLE: usize = 4 * 1024 * 1024;
 /// spot is no real one, and nothing more is read.
 const MAX_NZB_ARTICLES: usize = 16;
 const MAX_NZB_POSTED: usize = 16 * 1024 * 1024;
+/// NZB article bytes one pass reads at most; the spots left wait for the next pass.
+const MAX_PASS_POSTED: usize = 256 * 1024 * 1024;
 
 /// What one pass did, for the log.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -73,10 +76,12 @@ pub async fn pass(pool: &Pool, db: &Db, config: &SpotsConfig, stopping: &impl Fn
             Err(e) => return Err(e.into()),
         };
         done.read += rows.len() as u64;
-        let wanted: Vec<(String, u64)> = rows
+        let wanted: Vec<store::Noted> = rows
             .iter()
-            .filter(|r| header::parse(&r.subject, &r.from).is_some_and(|h| h.signed && h.kind().is_some()))
-            .map(|r| (r.message_id.trim_matches(['<', '>']).to_string(), r.number))
+            .filter_map(|r| {
+                let h = header::parse(&r.subject, &r.from).filter(|h| h.signed && h.kind().is_some())?;
+                Some((r.message_id.trim_matches(['<', '>']).to_string(), r.number, h.spotter_id()))
+            })
             .collect();
         let key = host.clone();
         let now = chrono::Utc::now().timestamp();
@@ -84,20 +89,23 @@ pub async fn pass(pool: &Pool, db: &Db, config: &SpotsConfig, stopping: &impl Fn
         from = to + 1;
     }
 
+    let now = chrono::Utc::now().timestamp();
+    on_db(db, move |conn| Ok(store::prune(conn, now)?)).await?;
     let limit = config.per_pass;
     let todo = on_db(db, move |conn| Ok(store::todo(conn, limit)?)).await?;
+    let mut posted = 0usize;
     for message_id in todo {
-        if stopping() {
+        if stopping() || posted >= MAX_PASS_POSTED {
             break;
         }
-        let outcome = match fetch(pool, db, &message_id).await {
-            Ok(Some(release_id)) => {
-                done.saved += 1;
-                Some((SAVED, Some(release_id)))
-            }
-            Ok(None) => {
-                done.skipped += 1;
-                Some((SKIPPED, None))
+        let outcome = match fetch(pool, db, &message_id, &mut posted).await {
+            Ok(settled) => {
+                if settled.state == SAVED {
+                    done.saved += 1;
+                } else {
+                    done.skipped += 1;
+                }
+                Some(settled)
             }
             Err(e) => {
                 eprintln!("spots: {message_id}: {e:#}");
@@ -106,7 +114,7 @@ pub async fn pass(pool: &Pool, db: &Db, config: &SpotsConfig, stopping: &impl Fn
             }
         };
         let now = chrono::Utc::now().timestamp();
-        on_db(db, move |conn| Ok(store::settle(conn, &message_id, outcome, now)?)).await?;
+        on_db(db, move |conn| Ok(store::settle(conn, &message_id, outcome.as_ref(), now)?)).await?;
     }
     Ok(done)
 }
@@ -120,66 +128,109 @@ pub fn start_at(cursor: Option<u64>, low: u64, high: u64, first: u64) -> u64 {
     }
 }
 
-/// A spot fetched whole and saved. Ok(None): it isn't one to save, and never will be. Err: try again later.
-async fn fetch(pool: &Pool, db: &Db, message_id: &str) -> Result<Option<i64>> {
+/// A spot fetched whole and saved, or skipped for good. Err: try again later. `posted` counts the NZB article
+/// bytes read.
+async fn fetch(pool: &Pool, db: &Db, message_id: &str, posted: &mut usize) -> Result<Settled> {
+    let skipped = |nzb_ref: Option<String>| Settled { state: SKIPPED, nzb_ref, ..Settled::default() };
     let head = match pool.fetch_head(&format!("<{message_id}>"), MAX_XML_BYTES * 4).await {
         Ok(Some(head)) => head,
-        Ok(None) => return Ok(None),
-        Err(e) if says_absent(&e) => return Ok(None),
+        Ok(None) => return Ok(skipped(None)),
+        Err(e) if says_absent(&e) => return Ok(skipped(None)),
         Err(e) => return Err(e.into()),
     };
-    let Some(spot) = full::xml_from_headers(&head).as_deref().and_then(full::parse) else { return Ok(None) };
-    let Some(kind) = spot.kind() else { return Ok(None) };
-    if spot.nzb.is_empty() {
-        return Ok(None);
-    }
+    let Some(spot) = full::xml_from_headers(&head).as_deref().and_then(full::parse) else { return Ok(skipped(None)) };
+    let Some(kind) = spot.kind() else { return Ok(skipped(None)) };
     // an id named twice is no real spot's, and would be read twice
-    if !nzb_ids_usable(&spot.nzb) {
-        return Ok(None);
+    if spot.nzb.is_empty() || !nzb_ids_usable(&spot.nzb) {
+        return Ok(skipped(None));
     }
+    let spotter_id = header::spotter_id_of_head(&head);
+    let row = |nzb_key: String| SpotRow {
+        message_id: message_id.to_string(),
+        kind,
+        spot: spot.clone(),
+        spotter_id: spotter_id.clone(),
+        nzb_key,
+    };
+
+    // another spot pointing at the same NZB articles was settled already: no need to read them again
+    let nzb_ref = release::ids_key(&spot.nzb);
+    let r = nzb_ref.clone();
+    match on_db(db, move |conn| Ok(store::known_ref(conn, &r)?)).await? {
+        Some((SAVED, Some(id))) => return copy_of(db, id, row(String::new()), nzb_ref, None).await,
+        Some(_) => return Ok(skipped(Some(nzb_ref))),
+        None => {}
+    }
+
     let mut bodies: Vec<Vec<u8>> = Vec::with_capacity(spot.nzb.len());
     for segment in &spot.nzb {
         let left = MAX_NZB_POSTED.saturating_sub(bodies.iter().map(Vec::len).sum::<usize>());
         match pool.fetch_body_capped(&format!("<{segment}>"), MAX_NZB_ARTICLE.min(left)).await {
-            Ok(Some(body)) => bodies.push(body),
-            Ok(None) => return Ok(None),
-            Err(e) if says_absent(&e) => return Ok(None),
+            Ok(Some(body)) => {
+                *posted += body.len();
+                bodies.push(body);
+            }
+            Ok(None) => return Ok(skipped(Some(nzb_ref))),
+            Err(e) if says_absent(&e) => return Ok(skipped(Some(nzb_ref))),
             Err(e) => return Err(e.into()),
         }
     }
     let parts: Vec<&[u8]> = bodies.iter().map(Vec::as_slice).collect();
-    let Some(nzb) = binary::nzb(&parts) else { return Ok(None) };
+    let Some(nzb) = binary::nzb(&parts) else { return Ok(skipped(Some(nzb_ref))) };
     let parsed = crate::archive::nzb::parse_keeping(&nzb, release::MAX_SEGMENTS);
-    let Some(release) = release::release_of(&spot, &parsed) else { return Ok(None) };
-    if crate::filters::group_blocked(&release.group) {
-        return Ok(None);
-    }
+    let Some(release) = release::release_of(&spot, &parsed) else { return Ok(skipped(Some(nzb_ref))) };
+    let nzb_key = release::nzb_key(&parsed);
+    let settled = |release_id: Option<i64>| Settled {
+        state: if release_id.is_some() { SAVED } else { SKIPPED },
+        release_id,
+        nzb_ref: Some(nzb_ref.clone()),
+        nzb_key: Some(nzb_key.clone()),
+    };
 
+    // an edit or repost of a spot already saved (its release maybe frozen since): that release gets the newer
+    // spot, and nothing is saved
+    let k = nzb_key.clone();
+    if let Some(id) = on_db(db, move |conn| Ok(store::known_key(conn, &k)?)).await? {
+        return copy_of(db, id, row(nzb_key.clone()), nzb_ref.clone(), Some(nzb_key.clone())).await;
+    }
     let group = release.group.clone();
     let shard = crate::store::shard_of(&group);
-    let spotter_id = header::spotter_id_of_head(&head);
-    let nzb_key = release::nzb_key(&parsed);
-    let row = SpotRow { message_id: message_id.to_string(), kind, spot, spotter_id, nzb_key };
-
-    // an edit or repost of a spot already saved: tag that release with the newer spot, and save nothing
+    let row = row(nzb_key.clone());
     let copy_row = row.clone();
-    let copy = on_shard(db, shard, move |conn| store::tag_copy(conn, &copy_row)).await?;
-    if copy.is_some() {
-        return Ok(copy);
+    if let Some(id) = on_shard(db, shard, move |conn| store::tag_copy(conn, &copy_row)).await? {
+        return Ok(settled(Some(id)));
     }
     // another upload already saved under this spot title and group: this one gets a name of its own, rather than
     // having its articles folded into that release
-    let (check_name, check_group, key) = (release.name.clone(), group.clone(), row.nzb_key.clone());
+    let (check_name, check_group, key) = (release.name.clone(), group.clone(), nzb_key.clone());
     let taken = on_shard(db, shard, move |conn| store::name_taken(conn, &check_name, &check_group, &key)).await?;
     let mut release = release;
     if taken {
-        let own = format!("{} [{}]", release.name, &row.nzb_key[..8]);
+        let own = format!("{} [{}]", release.name, &nzb_key[..8]);
         release::rename(&mut release, &own);
     }
     let name = release.name.clone();
     db.save(vec![release]).await?;
     // tagged on its shard's writer after the save: the save doesn't say which id the release got
-    on_shard(db, shard, move |conn| store::tag(conn, &name, &group, &row)).await
+    let id = on_shard(db, shard, move |conn| store::tag(conn, &name, &group, &row)).await?;
+    Ok(settled(id))
+}
+
+/// A spot whose NZB an earlier spot's release `id` already has: that release gets this spot when it is live.
+async fn copy_of(db: &Db, id: i64, mut row: SpotRow, nzb_ref: String, nzb_key: Option<String>) -> Result<Settled> {
+    let shard = crate::store::shard_of_id(id);
+    if row.nzb_key.is_empty() {
+        let known = on_shard(db, shard, move |conn| {
+            conn.query_row("select nzb_key from spots where release_id = ?", [id], |r| r.get::<_, Option<String>>(0))
+                .optional()
+                .map(Option::flatten)
+        })
+        .await?;
+        row.nzb_key = known.unwrap_or_default();
+    }
+    let key = nzb_key.or_else(|| (!row.nzb_key.is_empty()).then(|| row.nzb_key.clone()));
+    on_shard(db, shard, move |conn| store::tag_release(conn, id, &row)).await?;
+    Ok(Settled { state: SAVED, release_id: Some(id), nzb_ref: Some(nzb_ref), nzb_key: key })
 }
 
 /// Runs `work` on `shard`'s writer, in its own transaction, and hands back what it returned.
