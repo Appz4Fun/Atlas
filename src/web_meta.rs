@@ -57,6 +57,7 @@ pub(crate) fn meta_html(conn: Option<&Connection>, i: &MetaInputs<'_>) -> String
     if let Some(conn) = conn {
         l.same = same_counts(conn, i, &l);
         l.points_to = nzb_targets(conn, i);
+        l.sidecars = sidecars_of(conn, i);
     }
     panels_html(i, &l)
 }
@@ -197,6 +198,8 @@ struct Looked {
     same: Vec<(crate::keys::Kind, i64)>,
     /// a posted NZB's: the names its files give, each with the releases of that name, full page only
     points_to: Vec<(String, Vec<ReleaseRow>)>,
+    /// sidecar posts (an NFO, a mediainfo dump) that describe this release, full page only
+    sidecars: Vec<crate::sidecar::Found>,
 }
 
 /// One `file_timing` row (`store::FILE_TIMING`): what the overview said about a file's articles, folded at
@@ -1541,6 +1544,7 @@ fn inside_panel(i: &MetaInputs<'_>, l: &Looked, compact: bool) -> Facts {
     }
     f.add("Listed from", listing_source(i.inner));
     f.add_html("Points to", points_to_html(&l.points_to));
+    f.add_html("Sidecars", sidecars_html(&l.sidecars));
     f.add("PAR2", repair_capacity(i.contents));
     f
 }
@@ -1569,6 +1573,43 @@ fn nzb_targets(conn: &Connection, i: &MetaInputs<'_>) -> Vec<(String, Vec<Releas
             (name, found)
         })
         .collect()
+}
+
+/// Sidecars posted on their own that describe this release: by its MKV's Segment UID, then by its names.
+fn sidecars_of(conn: &Connection, i: &MetaInputs<'_>) -> Vec<crate::sidecar::Found> {
+    let mut names: Vec<&str> = vec![i.release.name.as_str()];
+    if let Some(display) = i.names.and_then(|n| n.display.as_deref()) {
+        names.push(display);
+    }
+    let uid = i.probe.and_then(|p| p.media.as_ref()).and_then(|m| m.segment_uid.as_deref());
+    crate::sidecar::describing(conn, i.release.id, &names, uid, 5)
+}
+
+/// each sidecar: what it is, the post it came in and how it was matched, its text folded under it
+fn sidecars_html(found: &[crate::sidecar::Found]) -> Option<String> {
+    let items: Vec<String> = found
+        .iter()
+        .map(|s| {
+            let what = match s.kind.as_str() {
+                "mediainfo" => "MediaInfo",
+                "nfo" => "NFO",
+                _ => "text",
+            };
+            let by = if s.by == "segment_uid" { "same file, by its Segment UID" } else { "by name" };
+            let file = s.file.as_deref().map(|f| format!(" ({})", escape(f))).unwrap_or_default();
+            let text = s
+                .text
+                .as_deref()
+                .map(|t| format!("<details><summary>Text</summary><pre class=\"nfo\">{}</pre></details>", escape(t)))
+                .unwrap_or_default();
+            format!(
+                "{what}{file} <span class=\"dim\">posted as {} in {}, {by}</span>{text}",
+                escape(&s.name),
+                escape(&s.group)
+            )
+        })
+        .collect();
+    (!items.is_empty()).then(|| items.join("<br>"))
 }
 
 /// each name a posted NZB gives, linked to the releases of that name, or said not to be here
@@ -2681,7 +2722,30 @@ mod tests {
             timing: Vec::new(),
             same: Vec::new(),
             points_to: Vec::new(),
+            sidecars: Vec::new(),
         }
+    }
+
+    #[test]
+    fn sidecars_show_what_they_are_where_they_came_from_and_their_text_folded() {
+        let found = crate::sidecar::Found {
+            name: "mediainfo".into(),
+            group: "alt.binaries.x".into(),
+            file: Some("mediainfo.txt".into()),
+            kind: "mediainfo".into(),
+            by: "segment_uid",
+            text: Some("Complete name : <a>.mkv".into()),
+        };
+        let html = sidecars_html(&[found]).unwrap();
+        assert!(html.starts_with("MediaInfo (mediainfo.txt)"), "{html}");
+        assert!(html.contains("posted as mediainfo in alt.binaries.x, same file, by its Segment UID"), "{html}");
+        assert!(
+            html.contains(
+                "<details><summary>Text</summary><pre class=\"nfo\">Complete name : &lt;a&gt;.mkv</pre></details>"
+            ),
+            "{html}"
+        );
+        assert_eq!(sidecars_html(&[]), None);
     }
 
     #[test]
