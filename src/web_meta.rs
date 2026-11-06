@@ -79,6 +79,8 @@ fn lookup_of(i: &MetaInputs<'_>, l: &Looked) -> crate::keys::Lookup {
             .as_ref()
             .and_then(|s| crate::keys::crc_files(s, i.release.id, i.probe).ok())
             .unwrap_or_else(|| i.probe.and_then(crate::keys::probe_file).into_iter().collect()),
+        inner_files: shard.as_ref().map(|s| crate::keys::inner_crc_files(s, i.release.id)).unwrap_or_default(),
+        archive: shard.as_ref().map(|s| crate::keys::archive_keys(s, i.release.id)).unwrap_or_default(),
     }
 }
 
@@ -1539,6 +1541,8 @@ fn inside_panel(i: &MetaInputs<'_>, l: &Looked, compact: bool) -> Facts {
     if !tells.is_empty() {
         f.add("Packed by", Some(tells.join("; ")));
     }
+    // what the archive's first file header says: format, method, dictionary, host, how times are kept
+    f.add("Packer settings", i.inner.packer.clone());
     f.add("Listed from", listing_source(i.inner));
     f.add_html("Points to", points_to_html(&l.points_to));
     f.add_html("Sidecars", sidecars_html(&l.sidecars));
@@ -2175,6 +2179,18 @@ fn keys_panel(i: &MetaInputs<'_>, l: &Looked, compact: bool) -> Facts {
     // the poster's header names in order, the ones servers add left out: a tool's fingerprint, shared by everyone
     // posting with it, soo no list
     f.key("Header set", i.probe.and_then(|p| crate::probe::header_set(&p.header_order)).map(|t| key16(t.as_bytes())));
+    // an archive's own keys: how many releases share one, never its value
+    for (label, what, kind) in [
+        ("Archive file CRC", "A file inside its archive, by size and CRC32", Kind::InnerFile),
+        ("Archive twin", "The archive's own random values", Kind::ArchiveTwin),
+        ("Archive owner", "The Unix owner its archive recorded (kept as a salted key only)", Kind::Owner),
+        ("Packer zone", "Its packer's settings and clock zone (kept as a salted key only)", Kind::Zone),
+    ] {
+        let link = same_link(l, id, kind);
+        if !link.is_empty() {
+            f.add_html(label, Some(format!("{what}{link}")));
+        }
+    }
     f
 }
 
