@@ -114,7 +114,7 @@ pub fn follow_with_password(
         let meta_pw = nzb::meta_password(&body);
         let parsed = nzb::parse(&body);
         let mut rows = std::mem::take(&mut inside);
-        rows.extend(parsed.files.iter().map(|f| InnerFile { name: f.name.clone(), size: Some(f.bytes()) }));
+        rows.extend(parsed.files.iter().map(|f| InnerFile::new(f.name.clone(), Some(f.bytes()))));
         let name_pw = rows.iter().find_map(|f| crate::release_info::find_password(&f.name));
         passwords.push(meta_pw.or(name_pw));
         hops.push(rows);
@@ -173,7 +173,7 @@ pub fn nzb_inside(
             if let Some(names) = names.as_deref_mut() {
                 for layer in &unwrapped.layers {
                     if let Some(name) = layer.name.clone().filter(|n| !names.iter().any(|f| &f.name == n)) {
-                        names.push(InnerFile { name, size: layer.unpacked });
+                        names.push(InnerFile::new(name, layer.unpacked));
                     }
                 }
             }

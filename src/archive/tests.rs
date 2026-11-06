@@ -106,7 +106,7 @@ fn best_name_table() {
 
 #[test]
 fn collapse_keeps_the_first_volume_and_sums() {
-    let file = |name: String, size: u64| InnerFile { name, size: Some(size) };
+    let file = |name: String, size: u64| InnerFile::new(name, Some(size));
     let mut files: Vec<InnerFile> = (1..=100).map(|i| file(format!("x.part{i:02}.rar"), 10)).collect();
     files.push(file("x.nfo".into(), 1));
     let rows = collapse_volumes(&files);
@@ -127,7 +127,7 @@ fn collapse_keeps_the_first_volume_and_sums() {
 
 #[test]
 fn collapse_names_a_set_after_its_first_volume_in_any_order() {
-    let file = |name: &str| InnerFile { name: name.into(), size: Some(10) };
+    let file = |name: &str| InnerFile::new(name.into(), Some(10));
     let as_par2_lists = [file("Show.S01E04.7z.026"), file("Show.S01E04.7z.001"), file("Show.S01E04.7z.097")];
     let rows = collapse_volumes(&as_par2_lists);
     assert_eq!((rows[0].name.as_str(), rows[0].size), ("Show.S01E04.7z.001", Some(30)));
@@ -138,7 +138,7 @@ fn collapse_names_a_set_after_its_first_volume_in_any_order() {
 #[test]
 fn password_table() {
     let with = |names: &[&str]| Listing {
-        files: names.iter().map(|n| InnerFile { name: (*n).into(), size: None }).collect(),
+        files: names.iter().map(|n| InnerFile::new((*n).into(), None)).collect(),
         ..Default::default()
     };
     assert_eq!(Listing { encrypted: true, ..Default::default() }.password(), Password::Yes);
@@ -788,15 +788,16 @@ mod select_tests {
     fn release_161580499_password_check_and_verified_harvester() {
         // Exact password_check blob from Release 161580499 (6GTX0B5E4O2GARHV9KPW on shard 3)
         let raw_check: [u8; 25] = [
-            0x0f, 0xcc, 0xf5, 0x00, 0x61, 0xff, 0xba, 0xd4, 0x3d, 0xcf, 0x68, 0x42, 0xb1, 0x49, 0xd5, 0xf5, 0xa2,
-            0xe7, 0x82, 0x9b, 0x3a, 0xab, 0xe0, 0x37, 0xb0,
+            0x0f, 0xcc, 0xf5, 0x00, 0x61, 0xff, 0xba, 0xd4, 0x3d, 0xcf, 0x68, 0x42, 0xb1, 0x49, 0xd5, 0xf5, 0xa2, 0xe7,
+            0x82, 0x9b, 0x3a, 0xab, 0xe0, 0x37, 0xb0,
         ];
         let test = super::PasswordTest::from_bytes(&raw_check).unwrap();
         assert_eq!(test.accepts("F-UnK-NZBNF"), Some(true));
         assert_eq!(test.accepts("wrong"), Some(false));
 
         // NFO with false positives before the real password, or bare line password verified by PasswordTest
-        let noisy_nfo = "Encoding settings: cabac=1 / pass=2 / crf=18\nPasswort: keins\nTemplate {{password}}\n\nF-UnK-NZBNF\n";
+        let noisy_nfo =
+            "Encoding settings: cabac=1 / pass=2 / crf=18\nPasswort: keins\nTemplate {{password}}\n\nF-UnK-NZBNF\n";
         assert_eq!(crate::release_info::find_password("Encoding settings: pass=2"), None);
         assert_eq!(crate::release_info::find_password("Template {{password}}"), None);
         assert_eq!(crate::release_info::find_password("Passwort: keins"), None);
@@ -849,11 +850,7 @@ mod select_tests {
         body.extend_from_slice(&0u32.to_le_bytes()); // attr
         body.extend_from_slice(fname);
         body.extend_from_slice(&salt);
-        let file_blk = [
-            super::testkit::r4_block(0x74, 0x0004 | 0x0400, &body, Some(ct.len() as u32)),
-            ct,
-        ]
-        .concat();
+        let file_blk = [super::testkit::r4_block(0x74, 0x0004 | 0x0400, &body, Some(ct.len() as u32)), ct].concat();
         let r4 = super::testkit::rar4(&[super::testkit::r4_main(0), file_blk]);
         assert_eq!(crate::probe::nest::unwrap(&r4).layers[0].stop.as_deref(), Some("encrypted"));
         assert_eq!(
@@ -891,29 +888,59 @@ mod select_tests {
             [rel_id],
         )
         .unwrap();
+        conn.execute("insert into segments (file_id, local, domain, part, bytes) values (2, x'01', 1, 1, 900)", [])
+            .unwrap();
+        conn.execute("insert into segments (file_id, local, domain, part, bytes) values (3, x'02', 1, 1, 42000)", [])
+            .unwrap();
         conn.execute(
-            "insert into segments (file_id, local, domain, part, bytes) values (2, x'01', 1, 1, 900)",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "insert into segments (file_id, local, domain, part, bytes) values (3, x'02', 1, 1, 42000)",
-            [],
+            super::store::INSERT_PAR2_FILE,
+            rusqlite::params![
+                rel_id,
+                vec![1u8; 16],
+                vec![9u8; 16],
+                vec![0u8; 16],
+                vec![0u8; 16],
+                50_000_000i64,
+                "a.part01.rar",
+                None::<i64>,
+                1i64,
+                0i64,
+                1i64
+            ],
         )
         .unwrap();
         conn.execute(
             super::store::INSERT_PAR2_FILE,
-            rusqlite::params![rel_id, vec![1u8; 16], vec![9u8; 16], vec![0u8; 16], vec![0u8; 16], 50_000_000i64, "a.part01.rar", None::<i64>, 1i64, 0i64, 1i64],
+            rusqlite::params![
+                rel_id,
+                vec![2u8; 16],
+                vec![9u8; 16],
+                vec![0u8; 16],
+                vec![0u8; 16],
+                850i64,
+                "secret.nfo",
+                None::<i64>,
+                1i64,
+                0i64,
+                1i64
+            ],
         )
         .unwrap();
         conn.execute(
             super::store::INSERT_PAR2_FILE,
-            rusqlite::params![rel_id, vec![2u8; 16], vec![9u8; 16], vec![0u8; 16], vec![0u8; 16], 850i64, "secret.nfo", None::<i64>, 1i64, 0i64, 1i64],
-        )
-        .unwrap();
-        conn.execute(
-            super::store::INSERT_PAR2_FILE,
-            rusqlite::params![rel_id, vec![3u8; 16], vec![9u8; 16], vec![0u8; 16], vec![0u8; 16], 40_000i64, "pointer-{{pw}}.nzb", None::<i64>, 1i64, 0i64, 1i64],
+            rusqlite::params![
+                rel_id,
+                vec![3u8; 16],
+                vec![9u8; 16],
+                vec![0u8; 16],
+                vec![0u8; 16],
+                40_000i64,
+                "pointer-{{pw}}.nzb",
+                None::<i64>,
+                1i64,
+                0i64,
+                1i64
+            ],
         )
         .unwrap();
         let files = vec![
@@ -998,4 +1025,308 @@ fn par2_reruns_go_to_incomplete_movies_and_tv_with_par2_files_and_no_set() {
     assert_eq!(done & par2_done, 0, "the step is asked for again");
     let due: i64 = conn.query_row("select due_at from pp_queue where release_id = 6", [], |r| r.get(0)).unwrap();
     assert_eq!(due, 100);
+}
+
+// ---------------------------------------------------------------- header facts
+
+/// A RAR4 file block's fields with every fact set: unpacked size, host, CRC, DOS time, version, method, name.
+fn r4_fields_with(name: &[u8], host: u8, crc: u32, ftime: u32) -> Vec<u8> {
+    [
+        &1_000_000u32.to_le_bytes()[..],
+        &[host],
+        &crc.to_le_bytes(),
+        &ftime.to_le_bytes(),
+        &[29, 0x33],
+        &(name.len() as u16).to_le_bytes(),
+        &0x20u32.to_le_bytes(),
+        name,
+    ]
+    .concat()
+}
+
+#[test]
+fn rar4_keeps_each_files_crc_and_host_and_how_it_was_packed() {
+    // 2024-03-10 14:30:20, DOS
+    let ftime = ((2024 - 1980) << 9 | 3 << 5 | 10) << 16 | (14 << 11 | 30 << 5 | 10);
+    let whole = r4_block(0x74, 0x0020, &r4_fields_with(b"a.mkv", 3, 0x1122_3344, ftime), Some(0));
+    // split after: the CRC is only this part's
+    let split = r4_block(0x74, 0x0002, &r4_fields_with(b"b.mkv", 2, 0x5566_7788, ftime), Some(0));
+    let l = rar::list(&rar4(&[r4_main(0x0008), whole, split, r4_end()]));
+    assert_eq!(l.files.len(), 2);
+    assert_eq!(
+        (l.files[0].crc32, l.files[0].host_os, l.files[0].mtime),
+        (Some(0x1122_3344), Some(facts::HOST_UNIX), None)
+    );
+    assert_eq!((l.files[1].crc32, l.files[1].host_os), (None, Some(facts::HOST_WINDOWS)));
+    assert_eq!(l.packer.as_deref(), Some("RAR4 · unpack 2.9 · m3 · dict 128k · Unix · solid"));
+    assert_eq!(l.local_wall, Some(1_710_081_020), "the local time is kept for the zone guess only");
+    assert_eq!(l.owner, None);
+}
+
+#[test]
+fn rar4_reads_its_unix_owner_subblock_and_never_prints_it() {
+    let mut fields = r4_fields_with(b"UOW", 3, 0, 0);
+    fields.extend(b"someone\0staff");
+    let uow = r4_block(0x7a, 0, &fields, Some(0));
+    let l = rar::list(&rar4(&[r4_main(0), r4_file(0, b"a.mkv", b"x"), uow, r4_end()]));
+    let owner = l.owner.clone().expect("an owner");
+    assert!(owner.0.contains("someone") && owner.0.contains("staff"));
+    assert!(!format!("{l:?}").contains("someone"), "a listing's Debug never shows the owner");
+}
+
+#[test]
+fn rar4_hp_keeps_its_salt_as_the_archives_twin() {
+    let mut data = rar4(&[r4_main(0x0080)]);
+    data.extend([9u8; 8]);
+    data.extend([0u8; 16]);
+    let l = rar::list(&data);
+    assert!(l.headers_encrypted);
+    assert_eq!(l.twin, Some(facts::Twin::new("rar4hp", &[9; 8])));
+}
+
+/// RAR5 file fields with a CRC, a host and a compression word.
+fn r5_fields_with(name: &[u8], crc: u32, compression: u64, host: u64) -> Vec<u8> {
+    [
+        &vint(4)[..],
+        &vint(5_000_000),
+        &vint(0x20),
+        &crc.to_le_bytes(),
+        &vint(compression),
+        &vint(host),
+        &vint(name.len() as u64),
+        name,
+    ]
+    .concat()
+}
+
+fn r5_record(ty: u64, body: &[u8]) -> Vec<u8> {
+    let b = [vint(ty), body.to_vec()].concat();
+    [vint(b.len() as u64), b].concat()
+}
+
+#[test]
+fn rar5_keeps_each_files_crc_time_and_host_and_its_owner() {
+    // HTIME: Unix times with nanoseconds, mtime only
+    let htime = r5_record(3, &[&vint(0x13)[..], &1_700_000_000u32.to_le_bytes(), &5u32.to_le_bytes()].concat());
+    let owner =
+        r5_record(6, &[&vint(0x0f)[..], &vint(4), b"user", &vint(5), b"group", &vint(1000), &vint(100)].concat());
+    // stored (method 0), dictionary 2^2 * 128k, RAR 5.0
+    let compression = 2 << 10;
+    let file =
+        r5_block(2, &r5_fields_with(b"a.mkv", 0xcafe_f00d, compression, 1), &[htime, owner].concat(), Some(b"x"));
+    let l = rar::list(&rar5(&[r5_main(), file, r5_end()]));
+    let f = &l.files[0];
+    assert_eq!((f.crc32, f.mtime, f.host_os), (Some(0xcafe_f00d), Some(1_700_000_000), Some(facts::HOST_UNIX)));
+    assert_eq!(l.packer.as_deref(), Some("RAR5 · v0 · m0 · dict 512k · Unix · times unix-ns"));
+    let owner = l.owner.expect("an owner");
+    assert!(owner.0.contains("u=user:g=group:uid=1000:gid=100"));
+}
+
+#[test]
+fn a_split_rar5_file_keeps_no_crc() {
+    // header flags 0x10: the data goes on in the next volume
+    let fields = r5_fields_with(b"a.mkv", 0xcafe_f00d, 0, 0);
+    let inner = [&vint(2)[..], &vint(0x10 | 2), &vint(1), &fields].concat();
+    let body = [vint(inner.len() as u64), inner].concat();
+    let block = [&crc32(&body).to_le_bytes()[..], &body, b"x"].concat();
+    let l = rar::list(&rar5(&[r5_main(), block, r5_end()]));
+    assert_eq!(l.files[0].crc32, None);
+    assert_eq!(l.files[0].host_os, Some(facts::HOST_WINDOWS));
+}
+
+#[test]
+fn rar5_hp_keeps_its_salt_and_check_as_the_twin() {
+    let l = rar::list(&rar5(&[r5_crypt_header()]));
+    assert!(l.headers_encrypted);
+    let twin = l.twin.expect("a twin");
+    assert_eq!(twin.tag, "rar5hp");
+    assert_eq!(twin.bytes[..16], [0x53; 16]);
+    // the test header's check doesn't sum right, soo only the salt is there
+    assert!(twin.bytes.len() == 16 || twin.bytes.len() == 24);
+    // a -p file's salt and IV when the headers aren't hidden
+    let file = r5_file(2, 4, b"a.mkv", &r5_crypt_record(), b"x");
+    let l = rar::list(&rar5(&[r5_main(), file, r5_end()]));
+    assert_eq!(l.twin, Some(facts::Twin::new("rar5", &[[0x53; 16], [0x49; 16]].concat())));
+}
+
+/// A stored ZIP entry with a DOS time and the given extras, local header first, its directory entry second.
+fn zip_with(name: &[u8], data: &[u8], time: u16, date: u16, extra: &[u8], made_by: u16) -> (Vec<u8>, Vec<u8>) {
+    let crc = crc32(data);
+    let local = [
+        &b"PK\x03\x04\x14\x00\x00\x00\x00\x00"[..],
+        &time.to_le_bytes(),
+        &date.to_le_bytes(),
+        &crc.to_le_bytes(),
+        &(data.len() as u32).to_le_bytes(),
+        &(data.len() as u32).to_le_bytes(),
+        &(name.len() as u16).to_le_bytes(),
+        &(extra.len() as u16).to_le_bytes(),
+        name,
+        extra,
+        data,
+    ]
+    .concat();
+    let central = [
+        &b"PK\x01\x02"[..],
+        &made_by.to_le_bytes(),
+        &b"\x14\x00\x00\x00\x00\x00"[..],
+        &time.to_le_bytes(),
+        &date.to_le_bytes(),
+        &crc.to_le_bytes(),
+        &(data.len() as u32).to_le_bytes(),
+        &(data.len() as u32).to_le_bytes(),
+        &(name.len() as u16).to_le_bytes(),
+        &(extra.len() as u16).to_le_bytes(),
+        &[0; 10],
+        &0u32.to_le_bytes(),
+        name,
+        extra,
+    ]
+    .concat();
+    (local, central)
+}
+
+#[test]
+fn zip_gives_the_packers_zone_owner_and_host() {
+    // 14:30:20 local, 13:30:20 UTC: the packer was an hour east
+    let (time, date) = ((14 << 11 | 30 << 5 | 10) as u16, ((2024 - 1980) << 9 | 3 << 5 | 10) as u16);
+    let utc = 1_710_081_020 - 3600;
+    let ut = [&0x5455u16.to_le_bytes()[..], &5u16.to_le_bytes(), &[1], &(utc as i32).to_le_bytes()].concat();
+    let ux = [
+        &0x7875u16.to_le_bytes()[..],
+        &11u16.to_le_bytes(),
+        &[1, 4],
+        &1000u32.to_le_bytes(),
+        &[4],
+        &100u32.to_le_bytes(),
+    ]
+    .concat();
+    let (local, central) = zip_with(b"a.txt", b"hello", time, date, &[ut, ux].concat(), 3 << 8 | 30);
+    let eocd = zip_eocd(1, central.len() as u32, local.len() as u32, b"");
+    let whole = [local.clone(), central, eocd].concat();
+    let l = zip::list(&local, &whole);
+    let f = &l.files[0];
+    assert_eq!((f.crc32, f.mtime, f.host_os), (Some(crc32(b"hello")), Some(utc), Some(facts::HOST_UNIX)));
+    assert_eq!(l.zone, Some(3600));
+    assert!(l.owner.expect("an owner").0.contains("uid=1000:gid=100"));
+    assert_eq!(l.packer.as_deref(), Some("ZIP · made by Unix 3.0 · needs 2.0 · store · extras 5455,7875"));
+    // the head alone: no host, the same zone
+    let head = zip::list_head(&local);
+    assert_eq!((head.files[0].host_os, head.zone), (None, Some(3600)));
+}
+
+#[test]
+fn a_zip_without_a_utc_time_keeps_only_its_local_time_for_the_guess() {
+    let (time, date) = ((14 << 11 | 30 << 5 | 10) as u16, ((2024 - 1980) << 9 | 3 << 5 | 10) as u16);
+    let (local, _) = zip_with(b"a.txt", b"hello", time, date, &[], 0);
+    let l = zip::list_head(&local);
+    assert_eq!((l.files[0].mtime, l.zone, l.local_wall), (None, None, Some(1_710_081_020)));
+}
+
+#[test]
+fn seven_zip_keeps_crcs_times_coders_and_its_twin() {
+    let payload = b"hello";
+    // one folder, one stream, its CRC in the unpack info
+    let streams = [
+        &[0x04, 0x06, 0x00, 0x01, 0x09, 0x05, 0x00, 0x07, 0x0b, 0x01, 0x00][..],
+        SZ_COPY,
+        &[0x0c, 0x05, 0x0a, 0x01],
+        &crc32(payload).to_le_bytes(),
+        &[0x00, 0x00],
+    ]
+    .concat();
+    let name: Vec<u8> = "a.txt".encode_utf16().chain([0]).flat_map(u16::to_le_bytes).collect();
+    // 2023-11-14 22:13:20 UTC as a FILETIME
+    let ft = (1_700_000_000u64 + 11_644_473_600) * 10_000_000;
+    let files = [
+        &[0x05, 0x01, 0x11][..],
+        &sz_num(name.len() as u64 + 1),
+        &[0x00],
+        &name,
+        &[0x14, 0x0a, 0x01, 0x00],
+        &ft.to_le_bytes(),
+        &[0x15, 0x06, 0x01, 0x00],
+        &(0x8000u32 | 0o644 << 16).to_le_bytes(),
+        &[0x00],
+    ]
+    .concat();
+    let header = [&[0x01][..], &streams, &files, &[0x00]].concat();
+    let archive = sz_wrap(payload, &header);
+    let l = sevenz::list(&archive, &[]);
+    assert!(l.complete, "{l:?}");
+    let f = &l.files[0];
+    assert_eq!((f.crc32, f.mtime, f.host_os), (Some(crc32(payload)), Some(1_700_000_000), Some(facts::HOST_UNIX)));
+    assert_eq!(l.packer.as_deref(), Some("7z · v0.4 · coders Copy"));
+    assert_eq!(l.twin.as_ref().map(|t| t.tag), Some("7z"), "the start header, from article 1 alone");
+    assert_eq!(l.twin.as_ref().map(|t| &t.bytes[..]), archive.get(12..32));
+}
+
+#[test]
+fn seven_zip_aes_gives_its_iv_as_the_twin() {
+    let mut props = vec![0x40 | 19, 0x0f];
+    props.extend(1..=16u8);
+    // AES coder with properties: flags 0x24 (4-byte id, props)
+    let coder = [&[0x01, 0x24, 0x06, 0xf1, 0x07, 0x01][..], &[props.len() as u8], &props].concat();
+    let header = [&[0x01][..], &sz_main_streams(5, &[5], &coder), &sz_files(&["a.txt"], None), &[0x00]].concat();
+    let l = sevenz::list(&sz_wrap(b"xxxxx", &header), &[]);
+    assert!(l.encrypted);
+    assert_eq!(l.twin, Some(facts::Twin::new("7zaes", &(1..=16u8).collect::<Vec<_>>())));
+    assert!(l.packer.as_deref().is_some_and(|p| p.ends_with("coders AES")), "{:?}", l.packer);
+}
+
+#[test]
+fn archive_keys_salt_the_uploaders_facts_and_digest_the_twin() {
+    use crate::archive::store::ArchiveKeys;
+    let listing = Listing {
+        packer: Some("RAR5 · v0".into()),
+        twin: Some(facts::Twin::new("rar5hp", &[1; 24])),
+        owner: facts::owner_text(Some("user"), None, Some(1000), None),
+        zone: Some(3600),
+        ..Default::default()
+    };
+    let a = ArchiveKeys::of(&listing, Some(7), None);
+    let b = ArchiveKeys::of(&listing, Some(8), None);
+    assert!(a.owner_key.is_some() && a.zone_key.is_some() && a.twin_key.is_some());
+    assert_ne!(a.owner_key, b.owner_key, "another install, another salt, another key");
+    assert_eq!(a.twin_key, b.twin_key, "the twin is the archive's, not the uploader's");
+    let unsalted = ArchiveKeys::of(&listing, None, None);
+    assert_eq!((unsalted.owner_key, unsalted.zone_key), (None, None), "no salt, no uploader key");
+    // a local time only: guessed against the post's clock
+    let local = Listing { local_wall: Some(1_000_000 + 3600 - 30), ..Default::default() };
+    assert!(ArchiveKeys::of(&local, Some(7), Some(1_000_000)).zone_key.is_some());
+    assert!(ArchiveKeys::of(&local, Some(7), None).zone_key.is_none());
+}
+
+#[test]
+fn collapsed_volumes_keep_no_parts_crc() {
+    let file = |name: &str, crc| InnerFile {
+        name: name.into(),
+        size: Some(10),
+        crc32: Some(crc),
+        mtime: Some(5),
+        host_os: Some(1),
+    };
+    let rows = collapse_volumes(&[file("a.part01.rar", 1), file("a.part02.rar", 2), file("b.mkv", 3)]);
+    assert_eq!(rows.len(), 2);
+    assert_eq!((rows[0].crc32, rows[0].mtime, rows[0].host_os), (None, None, Some(1)));
+    assert_eq!(rows[1].crc32, Some(3));
+}
+
+#[test]
+fn garbage_after_a_marker_reads_without_a_panic() {
+    for seed in 0u32..200 {
+        let mut x = seed.wrapping_mul(2_654_435_761).wrapping_add(1);
+        let noise: Vec<u8> = (0..300)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                x as u8
+            })
+            .collect();
+        let _ = rar::list(&[R4_MARK, &noise].concat());
+        let _ = rar::list(&[R5_MARK, &noise].concat());
+        let _ = zip::list(&[b"PK\x03\x04".as_slice(), &noise].concat(), &noise);
+        let _ = sevenz::list(&sz_wrap(&noise, &noise), &noise);
+    }
 }
