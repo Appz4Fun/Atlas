@@ -331,7 +331,8 @@ impl Inner {
         let answers: Vec<_> = (0..SHARDS)
             .filter_map(|shard| {
                 let stamps = stamps.clone();
-                db.on_writer(shard, "db.stage.seed", Box::new(move |conn| seed_shard(conn, enabled, &stamps, now))).ok()
+                let seed = move |conn: &Connection| seed_shard(conn, shard, enabled, &stamps, now);
+                db.on_writer(shard, "db.stage.seed", Box::new(seed)).ok()
             })
             .collect();
         for answer in answers {
@@ -1198,6 +1199,7 @@ fn apply_name(release: &mut ReleaseInfo, name: &NameChange) {
 /// One shard's note of which steps are on, see `Inner::seed`. In the writer's transaction.
 pub(crate) fn seed_shard(
     conn: &Connection,
+    shard: usize,
     enabled: StepMask,
     stamps: &[(u8, StepMask, i64)],
     now: i64,
@@ -1215,6 +1217,15 @@ pub(crate) fn seed_shard(
              select ?1, t, t, ?2, ?3 from (select coalesce(max(id), -1) + 1 as t from releases)",
         )?
         .execute(params![kind, redo, now])?;
+        Ok(())
+    };
+    // a one-off seed: run once under `key`, its count of queued releases logged soo a deploy can be checked
+    let once = |key: &str, seed: &dyn Fn() -> rusqlite::Result<usize>| -> rusqlite::Result<()> {
+        if meta(key)?.is_none() {
+            let queued = seed()?;
+            eprintln!("shard {shard}: one-off seed {key} queued {queued} releases");
+            set(key, now)?;
+        }
         Ok(())
     };
     let seeded = meta("pp_walk_seeded")?.is_some();
@@ -1242,80 +1253,35 @@ pub(crate) fn seed_shard(
         set("pp_junk_queued", now)?;
     }
     // once, for the movies and TV ranked before `SMALL_VIDEO` counted: ranked again, soo they leave the 0s
-    if meta("pp_net_rank_small_video")?.is_none() {
-        rerank_small_video(conn)?;
-        set("pp_net_rank_small_video", now)?;
-    }
+    once("pp_net_rank_small_video", &|| rerank_small_video(conn))?;
     // once, for the probes from before a too big first article was read in part
-    if meta("pp_probe_big_heads")?.is_none() {
-        crate::probe::step::rerun_big_heads(conn, now)?;
-        set("pp_probe_big_heads", now)?;
-    }
+    once("pp_probe_big_heads", &|| crate::probe::step::rerun_big_heads(conn, now))?;
     // once, for the AVI files probed before their header was read
-    if meta("pp_probe_avi")?.is_none() {
-        crate::probe::step::rerun_avi(conn, now)?;
-        set("pp_probe_avi", now)?;
-    }
+    once("pp_probe_avi", &|| crate::probe::step::rerun_avi(conn, now))?;
     // once, for the WMV and ASF files probed before their header was read
-    if meta("pp_probe_asf")?.is_none() {
-        crate::probe::step::rerun_asf(conn, now)?;
-        set("pp_probe_asf", now)?;
-    }
+    once("pp_probe_asf", &|| crate::probe::step::rerun_asf(conn, now))?;
     // once, for the MPEG program streams probed before their packs were read
-    if meta("pp_probe_mpeg_ps")?.is_none() {
-        crate::probe::step::rerun_mpeg_ps(conn, now)?;
-        set("pp_probe_mpeg_ps", now)?;
-    }
+    once("pp_probe_mpeg_ps", &|| crate::probe::step::rerun_mpeg_ps(conn, now))?;
     // once, for the MP4s whose moov is at the end, probed before it was read there
-    if meta("pp_probe_mp4_tail")?.is_none() {
-        crate::probe::step::rerun_mp4_tail(conn, now)?;
-        set("pp_probe_mp4_tail", now)?;
-    }
+    once("pp_probe_mp4_tail", &|| crate::probe::step::rerun_mp4_tail(conn, now))?;
     // once, for the DVD-Video discs and folders probed before their title sets were read
-    if meta("pp_probe_dvd")?.is_none() {
-        crate::probe::step::rerun_dvd(conn, now)?;
-        set("pp_probe_dvd", now)?;
-    }
+    once("pp_probe_dvd", &|| crate::probe::step::rerun_dvd(conn, now))?;
     // once, for the MPEG transport streams probed before their program map was read
-    if meta("pp_probe_mpeg_ts")?.is_none() {
-        crate::probe::step::rerun_mpeg_ts(conn, now)?;
-        set("pp_probe_mpeg_ts", now)?;
-    }
+    once("pp_probe_mpeg_ts", &|| crate::probe::step::rerun_mpeg_ts(conn, now))?;
     // once, for the Blu-ray folders probed before their playlists were read
-    if meta("pp_probe_bluray")?.is_none() {
-        crate::probe::step::rerun_bluray(conn, now)?;
-        set("pp_probe_bluray", now)?;
-    }
+    once("pp_probe_bluray", &|| crate::probe::step::rerun_bluray(conn, now))?;
     // once, for the MP4s with HEVC or H.264 video, which had no stills before their sample tables were read
-    if meta("pp_stills_mp4")?.is_none() {
-        crate::probe::stills::rerun_mp4(conn, now)?;
-        set("pp_stills_mp4", now)?;
-    }
+    once("pp_stills_mp4", &|| crate::probe::stills::rerun_mp4(conn, now))?;
     // once, for Dolby Vision probes from before the probe kept whether it read an RPU: FEL or MEL, and CM version
-    if meta("pp_probe_dv_rpu")?.is_none() {
-        crate::probe::step::rerun_dv_without_rpu(conn, now)?;
-        set("pp_probe_dv_rpu", now)?;
-    }
+    once("pp_probe_dv_rpu", &|| crate::probe::step::rerun_dv_without_rpu(conn, now))?;
     // once, for Dolby Vision probes from before the first keyframe was keyed: the video stream key
-    if meta("pp_probe_dv_keyframe")?.is_none() {
-        crate::probe::step::rerun_dv_without_keyframe_key(conn, now)?;
-        set("pp_probe_dv_keyframe", now)?;
-    }
+    once("pp_probe_dv_keyframe", &|| crate::probe::step::rerun_dv_without_keyframe_key(conn, now))?;
     // once, for Dolby Vision probes from before the first audio track was keyed: the audio stream key
-    if meta("pp_probe_dv_audio_key")?.is_none() {
-        crate::probe::step::rerun_dv_without_audio_key(conn, now)?;
-        set("pp_probe_dv_audio_key", now)?;
-    }
+    once("pp_probe_dv_audio_key", &|| crate::probe::step::rerun_dv_without_audio_key(conn, now))?;
     // once, for the probes that read a set's later volume before its first was looked for
-    if meta("pp_probe_first_volume")?.is_none() {
-        crate::probe::step::rerun_later_volumes(conn, now)?;
-        set("pp_probe_first_volume", now)?;
-    }
+    once("pp_probe_first_volume", &|| crate::probe::step::rerun_later_volumes(conn, now))?;
     // once, for encrypted archives and probes that already have a known password in release_nfo_password
-    if meta("pp_probe_encrypted_pw")?.is_none() {
-        crate::probe::step::rerun_encrypted_with_password(conn, now)?;
-        set("pp_probe_encrypted_pw", now)?;
-    }
+    once("pp_probe_encrypted_pw", &|| crate::probe::step::rerun_encrypted_with_password(conn, now))?;
     // once, for the movies and TV saved incomplete before a whole video named as its release, or a PAR2 set naming
     // only files there, counted over the subject counter (`store::release_complete`); and again once a whole RAR set
     // named as its release counted too
@@ -1326,9 +1292,10 @@ pub(crate) fn seed_shard(
         let mut queue = conn.prepare_cached(
             "insert into pp_queue (release_id, due_at) values (?1, ?2) on conflict(release_id) do update set due_at = ?2",
         )?;
-        for id in fixed {
+        for id in &fixed {
             queue.execute(params![id, now])?;
         }
+        eprintln!("shard {shard}: one-off seed pp_complete_by_files queued {} releases", fixed.len());
         set("pp_complete_by_files", now)?;
         set("pp_complete_by_rar_set", now)?;
     }
@@ -1337,7 +1304,8 @@ pub(crate) fn seed_shard(
     if meta("pp_probe_body_crc")?.is_none() {
         let bit = crate::postprocess::step::mask(crate::probe::body_crc::BODY_CRC_STEP);
         if seeded && enabled & bit != 0 {
-            crate::probe::body_crc::seed(conn, now)?;
+            let queued = crate::probe::body_crc::seed(conn, now)?;
+            eprintln!("shard {shard}: one-off seed pp_probe_body_crc queued {queued} releases");
             set("pp_steps_seen", meta("pp_steps_seen")?.unwrap_or(0) | bit)?;
         }
         set("pp_probe_body_crc", now)?;
