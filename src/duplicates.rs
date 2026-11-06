@@ -570,6 +570,113 @@ fn is_sidecar(name: &str) -> bool {
     [".par2", ".nfo", ".sfv", ".srr", ".srs", ".txt"].iter().any(|ext| lower.ends_with(ext))
 }
 
+/// A password found on one posting, shown on another that holds the same bytes: an xpost or twin of it. The same
+/// archive bytes take the same password, soo it carries as it was found; whether it works was only ever tried on
+/// the posting it came from.
+pub struct Inherited {
+    pub hint: crate::release_info::PasswordHint,
+    /// the posting it was found on
+    pub from: i64,
+    pub from_name: String,
+}
+
+/// The most copies looked at for a password to carry over: the first ones with one of their own answer.
+const MAX_PASSWORD_SOURCES: usize = 12;
+
+/// The password a release's own names, NFO and files hint at, or else the name its PAR2 set gives its files when
+/// they were posted under another (`par2_name_password`).
+pub fn own_password_hint(
+    conn: &Connection,
+    id: i64,
+    names: Option<&crate::release_info::Names>,
+) -> Option<crate::release_info::PasswordHint> {
+    crate::release_info::password_hint_with(conn, id, names).or_else(|| par2_name_password(conn, id))
+}
+
+/// Whether two postings are proven to hold the same whole payload, not just a file of it: the same posted fingerprint
+/// (set, names, part counts and hashes), or sets that describe the very same data files, sidecars aside, by size and
+/// MD5. A file twin by an NFO alone, or by one volume of two archives, isn't, soo nothing is carried between those.
+pub fn same_payload(conn: &Connection, a: i64, b: i64) -> bool {
+    if let (Ok((Some(pa), _)), Ok((Some(pb), _))) = (fingerprints_with(conn, a), fingerprints_with(conn, b))
+        && pa == pb
+    {
+        return true;
+    }
+    let data = |id: i64| {
+        let mut files: Vec<(u64, [u8; 16])> = crate::archive::store::par2_files_with(conn, id)
+            .into_iter()
+            .filter(|f| f.bound && !is_sidecar(&f.name))
+            .map(|f| (f.size, f.md5))
+            .collect();
+        files.sort_unstable();
+        files.dedup();
+        files
+    };
+    let mine = data(a);
+    !mine.is_empty() && mine == data(b)
+}
+
+/// The password `id`'s xposts and twins carry to it: of those holding its whole payload (`same_payload`), the first
+/// with a password hint of its own.
+pub fn carried_password(conn: &Connection, id: i64, copies: &[(Copy, ReleaseRow)]) -> Option<Inherited> {
+    first_password(conn, carriers(conn, id, copies).iter().copied())
+}
+
+/// The copies of `id` a password carries to and from: xposts and twins holding its whole payload.
+pub fn carriers<'a>(conn: &Connection, id: i64, copies: &'a [(Copy, ReleaseRow)]) -> Vec<&'a ReleaseRow> {
+    copies
+        .iter()
+        .filter(|(kind, r)| matches!(kind, Copy::Xpost | Copy::Twin) && same_payload(conn, id, r.id))
+        .map(|(_, r)| r)
+        .collect()
+}
+
+/// Of these postings, every one holding the same bytes, the first with a password hint of its own.
+pub fn first_password<'a>(conn: &Connection, rows: impl IntoIterator<Item = &'a ReleaseRow>) -> Option<Inherited> {
+    rows.into_iter().take(MAX_PASSWORD_SOURCES).find_map(|r| {
+        let names = crate::release_info::names_with(conn, r.id).ok().flatten();
+        own_password_hint(conn, r.id, names.as_ref()).map(|hint| Inherited {
+            hint,
+            from: r.id,
+            from_name: r.name.clone(),
+        })
+    })
+}
+
+/// The name a release's PAR2 set gives its archive, when the volumes were posted under another: a repost that
+/// renamed the files kept the set made for the first upload, and an uploader that names an archive and its password
+/// from one random string leaves the password there. Only a generated-looking name counts (letters and digits,
+/// mixed case, 10 to 64 of them), and only one archive's volumes, every one renamed: a set of unpacked files has none.
+pub fn par2_name_password(conn: &Connection, id: i64) -> Option<crate::release_info::PasswordHint> {
+    let set = crate::archive::store::par2_files_with(conn, id);
+    let data: Vec<&crate::par2::Par2File> = set.iter().filter(|f| f.bound && !is_sidecar(&f.name)).collect();
+    // an unpacked file posted under another name has no password to give: only archive volumes are named for one
+    if !data.iter().all(|f| is_archive(&f.name)) {
+        return None;
+    }
+    let mut stems = data.iter().map(|f| volume_set(&f.name));
+    let stem = stems.next()?;
+    if !stems.all(|other| other == stem) || !looks_generated(stem) {
+        return None;
+    }
+    let s = store::shard_of_id(id);
+    let mut stmt = conn.prepare(&format!("select filename from s{s}.files where release_id = ?")).ok()?;
+    let posted: Vec<String> = stmt.query_map([id], |r| r.get(0)).ok()?.filter_map(Result::ok).collect();
+    // posted under the set's own name: nothing was renamed, soo the name says nothing more than it did
+    if posted.is_empty() || posted.iter().any(|name| volume_set(name).eq_ignore_ascii_case(stem)) {
+        return None;
+    }
+    Some(crate::release_info::PasswordHint { password: stem.to_string(), source: "the PAR2 set's file names" })
+}
+
+/// A name an uploader made up, not a title: letters and digits only, both cases.
+fn looks_generated(stem: &str) -> bool {
+    (10..=64).contains(&stem.len())
+        && stem.bytes().all(|b| b.is_ascii_alphanumeric())
+        && stem.bytes().any(|b| b.is_ascii_uppercase())
+        && stem.bytes().any(|b| b.is_ascii_lowercase())
+}
+
 /// How many data files, sidecars aside, a release's set describes.
 fn data_files_in_set(conn: &Connection, id: i64) -> usize {
     crate::archive::store::par2_files_with(conn, id).iter().filter(|f| f.bound && !is_sidecar(&f.name)).count()
@@ -828,6 +935,15 @@ mod tests {
             bound: true,
             crc32: None,
         }
+    }
+
+    #[test]
+    fn only_a_made_up_name_is_a_password_hint() {
+        assert!(looks_generated("YMFFZeoeVI6fG4iz"));
+        assert!(looks_generated("oCBvoIlhFvS0L3k1"));
+        assert!(!looks_generated("Gone.with.the.Wind.1939"), "a title");
+        assert!(!looks_generated("abcdefghijklmnop"), "one case");
+        assert!(!looks_generated("Short1"), "too short");
     }
 
     #[test]
