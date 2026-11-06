@@ -308,11 +308,13 @@ fn known_or_post_password(
 
 /// Harvests a password for an encrypted archive from the post's names/subjects, any posted `.nzb`, or any `.nfo`/`.txt`
 /// (including files identified via `par2_files` or a single-part unidentified NFO), verifying candidates against `check`.
+/// An NFO it fetches goes in `kept`, a write that keeps it for the probe and the other steps.
 fn harvest_password_from_bodies(
     ctx: &mut StepCtx<'_>,
     files: &[FileInfo],
     left: &mut usize,
     check: Option<&super::PasswordTest>,
+    kept: &mut Vec<StepWrite>,
 ) -> Result<Option<String>, StepError> {
     if let Some(pw) = known_or_post_password(ctx, files, check) {
         return Ok(Some(pw));
@@ -342,13 +344,27 @@ fn harvest_password_from_bodies(
     {
         nfo_files.push(unid);
     }
+    // an NFO read before, by the probe or another step, is used as it was kept, not fetched again
+    let mut kept_nfo = crate::probe::nfo_store::stored(ctx.conn(), rel_id);
     for nfo_file in nfo_files {
-        let Some(seg) = first_article(ctx, nfo_file)? else { continue };
-        let Some(body) = budgeted(ctx, &seg, &nfo_file.filename, left)? else { continue };
-        if identify(&body) != Format::Unknown {
-            continue;
-        }
-        let text = crate::probe::nfo_text(&body);
+        let par2_name = par2_names.get(&nfo_file.filename).map(String::as_str);
+        let reused = match &kept_nfo {
+            Some(k) if k.is_of(&nfo_file.filename, par2_name) => kept_nfo.take(),
+            _ => None,
+        };
+        let text = match reused {
+            Some(k) => k.text,
+            None => {
+                let Some(seg) = first_article(ctx, nfo_file)? else { continue };
+                let Some(body) = budgeted(ctx, &seg, &nfo_file.filename, left)? else { continue };
+                if identify(&body) != Format::Unknown {
+                    continue;
+                }
+                let text = crate::probe::nfo_text(&body);
+                kept.push(crate::probe::nfo_store::keep(rel_id, &nfo_file.filename, &text));
+                text
+            }
+        };
         if let Some(pw) = crate::release_info::find_verified_password([text.as_str()], &[], check) {
             return Ok(Some(pw));
         }
@@ -1040,6 +1056,8 @@ impl Step for ListStep {
         }
         let mut left = limits.max_bodies_per_release.max(0) as usize;
         let gap = Duration::from_secs(60) / limits.probes_per_minute.max(1) as u32;
+        // an NFO read looking for a password, kept for the probe and the other steps
+        let mut nfo_writes = Vec::new();
         for head in select::plan(&files, limits.probe_files.max(0) as usize) {
             let Some(seg) = first_article(ctx, head.file)? else { continue };
             if left == 0 {
@@ -1058,8 +1076,8 @@ impl Step for ListStep {
                     let mut listing = rar::list(&body);
                     let mut pw_found = None;
                     if listing.encrypted {
-                        pw_found =
-                            harvest_password_from_bodies(ctx, &files, &mut left, listing.password_check.as_ref())?;
+                        let check = listing.password_check.as_ref();
+                        pw_found = harvest_password_from_bodies(ctx, &files, &mut left, check, &mut nfo_writes)?;
                         if let Some(ref pw) = pw_found
                             && listing.headers_encrypted
                         {
@@ -1082,6 +1100,7 @@ impl Step for ListStep {
                     )?
                     .or_else(|| nzb_stored_in(&listing, &body, pw_found.as_deref()));
                     let mut outcome = finish(ctx, SOURCE_RAR, listing, &limits)?;
+                    outcome.writes.append(&mut nfo_writes);
                     if let Some(pw) = pw_found {
                         crate::raw_store::put_nfo_password(&rel_name, &rel_group, &content_id, &pw);
                         outcome.writes.push(StepWrite::new(
@@ -1098,7 +1117,8 @@ impl Step for ListStep {
                     let wrapper_encrypted = listing.encrypted;
                     let has_inner_nzb = listing.files.iter().any(|f| select::classify(&f.name) == Kind::Nzb);
                     let pw_found = if listing.encrypted {
-                        harvest_password_from_bodies(ctx, &files, &mut left, listing.password_check.as_ref())?
+                        let check = listing.password_check.as_ref();
+                        harvest_password_from_bodies(ctx, &files, &mut left, check, &mut nfo_writes)?
                     } else {
                         None
                     };
@@ -1113,6 +1133,7 @@ impl Step for ListStep {
                     )?
                     .or_else(|| nzb_stored_in(&listing, &body, pw_found.as_deref()));
                     let mut outcome = finish(ctx, SOURCE_ZIP, listing, &limits)?;
+                    outcome.writes.append(&mut nfo_writes);
                     if let Some(pw) = pw_found {
                         crate::raw_store::put_nfo_password(&rel_name, &rel_group, &content_id, &pw);
                         outcome.writes.push(StepWrite::new(
@@ -1129,7 +1150,8 @@ impl Step for ListStep {
                     let wrapper_encrypted = listing.encrypted;
                     let has_inner_nzb = listing.files.iter().any(|f| select::classify(&f.name) == Kind::Nzb);
                     let pw_found = if listing.encrypted {
-                        harvest_password_from_bodies(ctx, &files, &mut left, listing.password_check.as_ref())?
+                        let check = listing.password_check.as_ref();
+                        harvest_password_from_bodies(ctx, &files, &mut left, check, &mut nfo_writes)?
                     } else {
                         None
                     };
@@ -1144,6 +1166,7 @@ impl Step for ListStep {
                     )?
                     .or_else(|| nzb_stored_in(&listing, &body, pw_found.as_deref()));
                     let mut outcome = finish(ctx, SOURCE_7Z, listing, &limits)?;
+                    outcome.writes.append(&mut nfo_writes);
                     if let Some(pw) = pw_found {
                         crate::raw_store::put_nfo_password(&rel_name, &rel_group, &content_id, &pw);
                         outcome.writes.push(StepWrite::new(

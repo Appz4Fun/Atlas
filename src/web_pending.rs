@@ -397,8 +397,9 @@ enum Standing {
     Done,
     Failed,
     Off,
-    /// not run and not queued: it doesn't apply, or waits for more of the release's files
-    Skipped,
+    /// not run and not queued: it doesn't apply, or waits for more of the release's files. The step's own reason,
+    /// when it gives one
+    Skipped(Option<&'static str>),
     /// out of line until then: a retry, settling
     Until(i64, String),
     /// a run of it began moments ago; if cut short, it's tried again then
@@ -436,6 +437,7 @@ fn standings(state: &State, pace: &Pace, waits: &Waits, now: i64) -> Vec<(&'stat
     let mut out = Vec::new();
     for step in step_list() {
         let b = bit(step.id);
+        let skipped = || Standing::Skipped(state.release.as_ref().and_then(|r| step.step.skip_reason(r)));
         // a reprocess asked for it again, done or not: the walk in progress gets there in its time, another after it
         let redo = state.redo_walks.iter().find(|(redo, _)| redo & b != 0).filter(|_| enabled & b != 0);
         let standing = if let Some((_, active)) = redo {
@@ -448,7 +450,7 @@ fn standings(state: &State, pace: &Pace, waits: &Waits, now: i64) -> Vec<(&'stat
         } else if enabled & b == 0 {
             Standing::Off
         } else if !step.applies(state.release.as_ref()) {
-            Standing::Skipped
+            skipped()
         } else if step.net {
             let left = state.net_wanted && state.net_left.is_none_or(|m| m & b != 0);
             if !left {
@@ -464,7 +466,7 @@ fn standings(state: &State, pace: &Pace, waits: &Waits, now: i64) -> Vec<(&'stat
                     (None, Some(wait)) if !state.has_state => {
                         Standing::Queued { wait: *wait, after: 0.0, next: false, lane: "walk" }
                     }
-                    _ => Standing::Skipped,
+                    _ => skipped(),
                 }
             } else if state.net_next_at > now && began_moments_ago(state, now) {
                 // the run is the release's first net step left; the rest come after it
@@ -505,7 +507,7 @@ fn standings(state: &State, pace: &Pace, waits: &Waits, now: i64) -> Vec<(&'stat
                 }
                 (Some(_), Some(wait), _) => Standing::Queued { wait: *wait, after: 0.0, next: true, lane: "database" },
                 (None, _, Some(wait)) => Standing::Queued { wait: *wait, after: 0.0, next: true, lane: "walk" },
-                _ => Standing::Skipped,
+                _ => skipped(),
             }
         };
         out.push((step, standing));
@@ -582,7 +584,9 @@ fn render(id: i64, state: &State, pace: &Pace, rows: &[(&'static StepMeta, Stand
             Standing::Done => (tag("tag-ok", "DONE"), String::new()),
             Standing::Failed => (tag("tag-bad", "FAILED"), state.last_error.as_deref().map(escape).unwrap_or_default()),
             Standing::Off => (tag("", "OFF"), "turned off in the settings".into()),
-            Standing::Skipped => (tag("", "SKIPPED"), "doesn't apply, or waits for more of its files".into()),
+            Standing::Skipped(why) => {
+                (tag("", "SKIPPED"), escape(why.unwrap_or("doesn't apply, or waits for more of its files")))
+            }
             Standing::Until(at, why) => {
                 (tag("tag-warn", "WAITING"), format!("not before {} · {}", escape(&clock(*at)), escape(why)))
             }
@@ -793,8 +797,8 @@ mod tests {
         assert!(
             matches!(standing_of(&rows, "media_lookup"), Standing::Queued { next: false, after, .. } if *after > 0.0)
         );
-        assert_eq!(*standing_of(&rows, "archive_par2"), Standing::Skipped, "not in net_left");
-        assert_eq!(*standing_of(&rows, "predb_match"), Standing::Skipped, "no queue row, no walk");
+        assert_eq!(*standing_of(&rows, "archive_par2"), Standing::Skipped(None), "not in net_left");
+        assert_eq!(*standing_of(&rows, "predb_match"), Standing::Skipped(None), "no queue row, no walk");
 
         let html = render(8, &state, &pace(), &rows, 1_000);
         assert!(html.contains("2 of 15 steps still to run: Probe (tracks, codecs), Media lookup."), "{html}");

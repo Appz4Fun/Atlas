@@ -14,6 +14,7 @@ pub mod moviehash;
 pub mod mpegps;
 pub mod mpegts;
 pub mod nest;
+pub mod nfo_store;
 pub mod opensubtitles;
 pub mod step;
 pub mod stills;
@@ -153,6 +154,9 @@ pub struct ProbeInfo {
     pub layers: Vec<nest::Layer>,
     pub media: Option<media::MediaInfo>,
     pub nfo: Option<String>,
+    /// the release file `nfo` was read from
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nfo_file: Option<String>,
     pub imdb_ids: Vec<String>,
     pub sfv: BTreeMap<String, u32>,
     /// the OpenSubtitles hash of the video, or of the one inside a stored RAR set

@@ -52,6 +52,12 @@ pub trait Step: Send + Sync + 'static {
         let _ = release;
         true
     }
+    /// Why the step doesn't apply to a release, in words for the release page: None when it does, or when it
+    /// can't say. Cheap, no I/O, as `applies`.
+    fn skip_reason(&self, release: &ReleaseInfo) -> Option<&'static str> {
+        let _ = release;
+        None
+    }
     fn reruns(&self) -> Reruns {
         Reruns::default()
     }
