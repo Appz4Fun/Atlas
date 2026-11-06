@@ -371,11 +371,17 @@ fn near(word: &str, target: &str, max: usize) -> bool {
     d[a.len()][b.len()] <= max
 }
 
-/// Lets sql ask `atlas_blocked(group_name)`. Every connection has it (`db::set_up`).
-/// NULL, or anything that isnt text, isnt blocked.
+/// Lets sql ask `atlas_blocked(group_name)`, and `atlas_file_whole(seen, expected)`: whether a file's `seen` bitmap
+/// has exactly its parts (`store::is_exactly`). Every connection has them (`db::set_up`).
+/// NULL, or anything that isnt text, isnt blocked; a NULL or non-blob bitmap isnt whole.
 pub fn register_sql(conn: &Connection) -> Result<()> {
     let flags = FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC | FunctionFlags::SQLITE_INNOCUOUS;
-    conn.create_scalar_function("atlas_blocked", 1, flags, |ctx| Ok(ctx.get_raw(0).as_str().is_ok_and(group_blocked)))
+    conn.create_scalar_function("atlas_blocked", 1, flags, |ctx| Ok(ctx.get_raw(0).as_str().is_ok_and(group_blocked)))?;
+    conn.create_scalar_function("atlas_file_whole", 2, flags, |ctx| {
+        let Ok(seen) = ctx.get_raw(0).as_blob() else { return Ok(false) };
+        let Ok(expected) = ctx.get_raw(1).as_i64() else { return Ok(false) };
+        Ok(crate::store::is_exactly(seen, expected))
+    })
 }
 
 // ---------------------------------------------------------------- articles obfuscated per article
