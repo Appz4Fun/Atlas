@@ -690,6 +690,70 @@ macro_rules! limits_from_enabled {
 }
 
 /// Reads a PAR2 set's file list.
+/// The incomplete movie and TV releases the PAR2 step read no set for though they have PAR2 files: before it tried
+/// a volume when the first file it picked was missing the articles holding the list, or picked a sample's set.
+/// Through the category index, as `store::movie_tv_whole_again`. Reads every candidate's file names: a minute on a
+/// big shard, soo off its writer (`postprocess::engine::par2_from_volumes`).
+pub(crate) fn par2_without_set(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<i64>> {
+    conn.prepare(
+        "select r.id from release_category c join releases r on r.id = c.release_id
+         join pp_state p on p.release_id = r.id
+         where (c.category between 2000 and 2999 or c.category between 5000 and 5999) and r.complete = 0
+           and not exists (select 1 from par2_files x where x.release_id = r.id) and p.done & ?1 != 0
+           and exists (select 1 from files f where f.release_id = r.id and f.filename like '%.par2')",
+    )?
+    .query_map([crate::postprocess::step::mask(PAR2_STEP)], |r| r.get(0))?
+    .collect()
+}
+
+/// Asks for the PAR2 step again on these releases.
+pub(crate) fn rerun_par2(conn: &rusqlite::Connection, ids: &[i64], now: i64) -> rusqlite::Result<()> {
+    for id in ids {
+        crate::postprocess::rerun_on(conn, *id, crate::postprocess::step::mask(PAR2_STEP), now)?;
+    }
+    Ok(())
+}
+
+/// The most PAR2 files the step reads a set from before it gives up on the release.
+const PAR2_TRIES: usize = 3;
+
+/// A set's list as one PAR2 file gives it, from its first articles or its last. None: the file gave no list, its
+/// articles missing or not indexed.
+fn read_set(ctx: &mut StepCtx<'_>, file: &FileInfo) -> Result<Option<par2::Inventory>, StepError> {
+    let is_base = select::classify(&file.filename) == Kind::Par2Base;
+    // a volume can start with a recovery slice and end with the list: either end will do to start from
+    let last = |ctx: &StepCtx<'_>| -> Result<Option<SegmentRef>, StepError> {
+        Ok(ctx.segments(file.id, &SegmentPick::Last(1)).map_err(retry)?.into_iter().last())
+    };
+    let (seg, from_end) = match first_article(ctx, file)? {
+        Some(seg) => (seg, false),
+        None if !is_base => match last(ctx)? {
+            Some(seg) => (seg, true),
+            None => return Ok(None),
+        },
+        None => return Ok(None),
+    };
+    let Some(mut body) = fetch_one(ctx, &seg, &file.filename)? else { return Ok(None) };
+    let mut inventory = par2::inventory(&body);
+    if !inventory.complete {
+        // a base's next article, or a volume's other end
+        let next = if is_base {
+            ctx.segments(file.id, &SegmentPick::First(2)).map_err(retry)?.into_iter().last()
+        } else if from_end {
+            first_article(ctx, file)?
+        } else {
+            last(ctx)?
+        };
+        if let Some(next) = next.filter(|s| s.message_id != seg.message_id)
+            && let Some(more) = fetch_one(ctx, &next, &file.filename)?
+        {
+            body.extend(more);
+            inventory = par2::inventory(&body);
+        }
+    }
+    Ok((!inventory.files.is_empty()).then_some(inventory))
+}
+
 pub const PAR2_STEP: StepId = StepId(1);
 
 #[derive(Default)]
@@ -719,7 +783,10 @@ impl Step for Par2Step {
     }
     fn run(&self, ctx: &mut StepCtx<'_>) -> Result<Outcome, StepError> {
         let files = ctx.files().map_err(retry)?;
-        let Some(file) = select::par2_source(&files) else { return Ok(Outcome::default()) };
+        let sources = select::par2_sources(&files);
+        if sources.is_empty() {
+            return Ok(Outcome::default());
+        }
         let rel_id = ctx.release().id;
         let rel_name = ctx.release().name.clone();
         let rel_group = ctx.release().group.clone();
@@ -735,41 +802,32 @@ impl Step for Par2Step {
             let limits = self.limits.lock().unwrap().clone();
             return restore_par2(ctx, saved_par2, Some(meta.clone()), &limits);
         }
-        let is_base = select::classify(&file.filename) == Kind::Par2Base;
-        let Some(seg) = first_article(ctx, file)? else {
+        // every file of a set carries its list: when one is missing the articles that hold it, the next may not be.
+        // Once a file gave some of a list, only files of its own set may better it: another set (a sample's) would
+        // put its files in place of the ones found
+        let mut best: Option<(par2::Inventory, String)> = None;
+        for file in sources.into_iter().take(PAR2_TRIES) {
+            let stem = select::par2_stem(&file.filename);
+            if best.as_ref().is_some_and(|(_, set)| *set != stem) {
+                continue;
+            }
+            let Some(inventory) = read_set(ctx, file)? else { continue };
+            let complete = inventory.complete;
+            if best.as_ref().is_none_or(|(b, _)| complete || inventory.files.len() > b.files.len()) {
+                best = Some((inventory, stem));
+            }
+            if complete {
+                break;
+            }
+        }
+        let best = best.map(|(inventory, _)| inventory);
+        let Some(inventory) = best else {
             if !saved_par2.is_empty() {
                 let limits = self.limits.lock().unwrap().clone();
                 return restore_par2(ctx, saved_par2, par2_meta, &limits);
             }
             return Ok(Outcome::default());
         };
-        let Some(mut body) = fetch_one(ctx, &seg, &file.filename)? else {
-            if !saved_par2.is_empty() {
-                let limits = self.limits.lock().unwrap().clone();
-                return restore_par2(ctx, saved_par2, par2_meta, &limits);
-            }
-            return Ok(Outcome::default());
-        };
-        let mut inventory = par2::inventory(&body);
-        if !inventory.complete {
-            // a base's next article, or a volume's last: a volume can start with a recovery slice
-            let pick = if is_base { SegmentPick::First(2) } else { SegmentPick::Last(1) };
-            let next = ctx
-                .segments(file.id, &pick)
-                .map_err(retry)?
-                .into_iter()
-                .last()
-                .filter(|s| s.message_id != seg.message_id);
-            if let Some(next) = next
-                && let Some(more) = fetch_one(ctx, &next, &file.filename)?
-            {
-                body.extend(more);
-                inventory = par2::inventory(&body);
-            }
-        }
-        if inventory.files.is_empty() {
-            return Ok(Outcome::default());
-        }
         let limits = self.limits.lock().unwrap().clone();
         // one set that covers every posted file. A release can hold several sets, and one proves only its own files
         let data_files = files.iter().filter(|f| !f.filename.to_ascii_lowercase().ends_with(".par2")).count();

@@ -910,6 +910,11 @@ impl Inner {
     /// shard, as each slice waits for its shard's writer and one busy writer shouldn't hold up the other shards.
     pub(crate) fn rank_lane(self: Arc<Self>, db: Db, shard: usize) {
         let mut conns = Conns::new(self.main.clone());
+        if let Err(e) =
+            conns.get(shard).map_err(anyhow::Error::from).and_then(|conn| par2_from_volumes(conn, &db, shard))
+        {
+            println!("processing stage, PAR2 reruns of shard {shard}: {e}");
+        }
         while !self.stopping() {
             match conns.get(shard).map_err(anyhow::Error::from).and_then(|conn| rank_slice(conn, &db, shard)) {
                 // another slice as soon as its writer is free: the writer puts saves first either way
@@ -1450,6 +1455,30 @@ pub(crate) fn net_take(
         claimed.claims += 1;
     }
     Ok(ids)
+}
+
+/// Once a shard, for the incomplete movies and TV the PAR2 step read no set for from the first PAR2 file it picked
+/// (`archive::steps::par2_without_set`): the step again. Their ids are read here, as the scan is too long to hold
+/// the writer for; the reruns and the mark are written on it.
+fn par2_from_volumes(conn: &Connection, db: &Db, shard: usize) -> anyhow::Result<()> {
+    const KEY: &str = "pp_par2_from_volumes";
+    let done = conn.prepare_cached("select 1 from meta where key = ?")?.exists([KEY])?;
+    if done {
+        return Ok(());
+    }
+    let ids = crate::archive::steps::par2_without_set(conn)?;
+    let now = chrono::Utc::now().timestamp();
+    let answer = db.on_writer(
+        shard,
+        "db.stage.par2_rerun",
+        Box::new(move |tx| {
+            crate::archive::steps::rerun_par2(tx, &ids, now)?;
+            tx.prepare_cached("insert or replace into meta (key, value) values (?, ?)")?.execute(params![KEY, now])?;
+            Ok(())
+        }),
+    )?;
+    answer.recv()?.map_err(anyhow::Error::msg)?;
+    Ok(())
 }
 
 /// Releases ranked per slice, at most.

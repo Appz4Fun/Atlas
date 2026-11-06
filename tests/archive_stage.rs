@@ -180,6 +180,18 @@ fn par2_of(names: &[&str]) -> Vec<u8> {
     names.iter().flat_map(|n| par2_file_desc(n, 1000)).collect()
 }
 
+/// a whole set's list of one file: its Main packet and the file's, as `par2_file_desc` writes it
+fn whole_set_of(name: &str) -> Vec<u8> {
+    let mut main = b"PAR2\0PKT".to_vec();
+    main.extend_from_slice(&(64u64 + 12 + 16).to_le_bytes());
+    main.extend_from_slice(&[0u8; 32]);
+    main.extend_from_slice(b"PAR 2.0\0Main\0\0\0\0");
+    main.extend_from_slice(&1000u64.to_le_bytes());
+    main.extend_from_slice(&1u32.to_le_bytes());
+    main.extend_from_slice(&[7u8; 16]);
+    [main, par2_file_desc(name, 1000)].concat()
+}
+
 #[test]
 fn a_named_rar_set_reads_only_the_first_article_of_the_first_volume() {
     let mut h = fresh();
@@ -514,6 +526,60 @@ fn a_set_with_only_volumes_reads_first_and_last() {
     let state = serve(&mut h, &s, config());
     settled(&h, "x");
     assert_eq!(bodies(&state), 2);
+    assert_eq!(names(&h, "x"), ["Real.Show.S01E01.mkv"]);
+}
+
+#[test]
+fn a_volume_whose_first_article_isnt_indexed_is_read_from_its_last() {
+    let mut h = fresh();
+    let s = shape("x")
+        .dark("x.vol000+01.par2", 2, 3)
+        .add("x.vol000+01.par2", 3, 3, yenc_body("x", &whole_set_of("Real.Show.S01E01.mkv")))
+        .dark("x.mkv", 1, 3);
+    let state = serve(&mut h, &s, config());
+    settled(&h, "x");
+    assert_eq!(bodies(&state), 1);
+    assert_eq!(names(&h, "x"), ["Real.Show.S01E01.mkv"]);
+}
+
+#[test]
+fn a_volume_that_gives_no_list_moves_to_the_next() {
+    let mut h = fresh();
+    let s = shape("x")
+        .dark("x.vol000+01.par2", 1, 1)
+        .one("x.vol001+02.par2", &whole_set_of("Real.Show.S01E01.mkv"))
+        .dark("x.mkv", 1, 3);
+    let state = serve(&mut h, &s, config());
+    settled(&h, "x");
+    assert_eq!(bodies(&state), 2);
+    assert_eq!(names(&h, "x"), ["Real.Show.S01E01.mkv"]);
+}
+
+#[test]
+fn the_releases_own_set_is_read_before_its_samples() {
+    let mut h = fresh();
+    let s = shape("x")
+        .one("x-sample.vol0+1.par2", &whole_set_of("x-sample.mkv"))
+        .one("x.vol00+01.par2", &whole_set_of("Real.Show.S01E01.mkv"))
+        .dark("x.vol01+02.par2", 1, 1)
+        .dark("x.mkv", 1, 3);
+    let state = serve(&mut h, &s, config());
+    settled(&h, "x");
+    assert_eq!(bodies(&state), 1);
+    assert_eq!(names(&h, "x"), ["Real.Show.S01E01.mkv"]);
+}
+
+#[test]
+fn part_of_the_releases_own_list_beats_a_whole_sample_set() {
+    let mut h = fresh();
+    let s = shape("x")
+        .one("x.par2", &par2_of(&["Real.Show.S01E01.mkv"]))
+        .dark("x.vol00+01.par2", 1, 1)
+        .one("x-sample.vol0+1.par2", &whole_set_of("x-sample.mkv"))
+        .dark("x.mkv", 1, 3);
+    let state = serve(&mut h, &s, config());
+    settled(&h, "x");
+    assert_eq!(bodies(&state), 2, "the sample's set isn't read");
     assert_eq!(names(&h, "x"), ["Real.Show.S01E01.mkv"]);
 }
 
