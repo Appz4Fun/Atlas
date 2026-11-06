@@ -407,9 +407,10 @@ impl Step for ProbeStep {
     /// What a probe reads, a bit per version, soo a release probed before a version gets probed again. Bit 1:
     /// chapters, commentary, more than one article of a header, and the OpenSubtitles hash. Bit 2: archives inside
     /// archives, followed down. Bit 4: attachments, cover art, when it was muxed, MaxCLL and MaxFALL. Bit 8:
-    /// SegmentUID, editions, default flags and the encoder's settings.
+    /// SegmentUID, editions, default flags and the encoder's settings. Bit 32: mkvmerge's per-track statistics from
+    /// the Tags at a Matroska file's end, and a Blu-ray's `id.bdmv` disc ID.
     fn config_stamp(&self) -> u64 {
-        1 | 2 | 4 | 8
+        1 | 2 | 4 | 8 | 32
     }
     fn run(&self, ctx: &mut StepCtx<'_>) -> Result<Outcome, StepError> {
         let retry = |e: rusqlite::Error| StepError::Retry(e.to_string());
@@ -647,9 +648,10 @@ impl Step for ProbeStep {
                 read_more_front(ctx, file, total, &mut front, found_nfo_password.as_deref(), &mut info)?;
                 // more of the front can show a bigger file than the one hashed
                 if info.layers != before {
-                    info.moviehash = moviehash_of(ctx, file, &files, &front, &info, known_last)?;
+                    info.moviehash = moviehash_of(ctx, file, &files, &front, &info, known_last.clone())?;
                 }
                 read_tail_moov(ctx, file, &front, &mut info)?;
+                read_tail_tags(ctx, file, &front, known_last.as_ref(), &mut info)?;
             }
         }
 
@@ -802,6 +804,60 @@ fn read_tail_moov(
     let found = media::Mp4Prober::probe_tail_moov_with(moov, front);
     if let Some(found) = found.filter(|m| !m.video.is_empty() || !m.audio.is_empty()) {
         info.media = Some(found);
+    }
+    Ok(())
+}
+
+/// The most parts read for a Matroska file's end Tags: mkvmerge's are a few KB, but may straddle two parts.
+const TAIL_TAGS_PARTS: u64 = 2;
+
+/// A Matroska file posted whole whose Tags lie after its Clusters, as mkvmerge writes them with every track's
+/// statistics (exact bitrate, frame and byte counts): the front's SeekHead says where, and the part holding them is
+/// read, one more when they run into it. The last part, read already, isn't fetched again.
+fn read_tail_tags(
+    ctx: &mut StepCtx<'_>,
+    file: &FileInfo,
+    front: &[u8],
+    known_last: Option<&(i64, Vec<u8>)>,
+    info: &mut ProbeInfo,
+) -> Result<(), StepError> {
+    let wants = info.media.as_ref().is_some_and(|m| {
+        matches!(m.container.as_str(), "matroska" | "webm") && m.header_complete && !m.track_uids.is_empty()
+    });
+    // a bare file only, as for the moov: in an archive the Tags' place in the post would depend on the volumes
+    if !wants || info.archive.is_some() || !info.layers.is_empty() {
+        return Ok(());
+    }
+    let segment = info.segment_size.filter(|s| *s > 0);
+    let (Some(segment), Some(size)) = (segment, info.yenc.as_ref().and_then(|y| y.file_size)) else { return Ok(()) };
+    let Some(at) = media::matroska_tags_past(front).into_iter().find(|at| *at < size) else { return Ok(()) };
+    let whole = |b: &[u8]| media::element_len(b).and_then(|n| usize::try_from(n).ok()).is_some_and(|n| n <= b.len());
+    // past the first Cluster but inside what was read
+    let read = usize::try_from(at).ok().and_then(|at| front.get(at..)).filter(|b| whole(b));
+    let mut tail = Vec::new();
+    let tags = match read {
+        Some(read) => read,
+        None => {
+            let first = at / segment + 1;
+            let skip = usize::try_from(at - (first - 1) * segment).unwrap_or(usize::MAX);
+            for part in first..=size.div_ceil(segment).min(first + TAIL_TAGS_PARTS - 1) {
+                let Ok(part_no) = i64::try_from(part) else { break };
+                let body = match known_last.filter(|(p, _)| *p == part_no) {
+                    Some((_, body)) => Some(body.clone()),
+                    None => read_part(ctx, file, part_no, (part - 1) * segment)?,
+                };
+                let Some(body) = body else { break };
+                tail.extend(body);
+                if tail.get(skip..).is_some_and(whole) {
+                    break;
+                }
+            }
+            let Some(tags) = tail.get(skip..) else { return Ok(()) };
+            tags
+        }
+    };
+    if let Some(m) = info.media.as_mut() {
+        media::tail_tags(tags, m);
     }
     Ok(())
 }
@@ -996,7 +1052,11 @@ fn inspect(body: &[u8], password: Option<&str>, info: &mut ProbeInfo) {
     if info.media.as_ref().is_none_or(|m| matches!(m.container.as_str(), "bluray" | "m2ts" | "mpeg-ts"))
         && super::bluray::is_bluray(body)
     {
-        info.media = Some(super::bluray::bluray(body));
+        // as for a DVD: an ID from an unwrapped disc image stands if the raw bytes can't give one
+        let inner_id = info.media.as_mut().and_then(|m| m.disc_id.take());
+        let mut bluray = super::bluray::bluray(body);
+        bluray.disc_id = bluray.disc_id.or(inner_id);
+        info.media = Some(bluray);
     }
     info.layers = nest.layers;
 }
