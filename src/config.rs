@@ -557,6 +557,11 @@ pub fn sealed_log_config() -> SealedLogConfig {
     read_file().map_or_else(SealedLogConfig::default, |v| SealedLogConfig::from_value(v.get("sealed_log")))
 }
 
+/// The file's `metrics` object, for the web ui's stats page: no keyring.
+pub fn metrics_config() -> MetricsConfig {
+    read_file().map_or_else(MetricsConfig::default, |v| MetricsConfig::from_value(v.get("metrics")))
+}
+
 /// The `metrics` object of config.toml, see the README. Off unless asked for.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MetricsConfig {
