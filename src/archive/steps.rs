@@ -337,8 +337,6 @@ fn harvest_password_from_bodies(
         }
     }
     let mut nfo_files = select::nfo_sources_with_par2(files, &par2_names);
-    // a file only guessed to be the NFO is matched to a kept NFO by its name alone
-    let guessed = nfo_files.is_empty();
     if nfo_files.is_empty()
         && let Some(unid) = files
             .iter()
@@ -351,7 +349,7 @@ fn harvest_password_from_bodies(
     for nfo_file in nfo_files {
         let par2_name = par2_names.get(&nfo_file.filename).map(String::as_str);
         let reused = match &kept_nfo {
-            Some(k) if (k.file.is_some() || !guessed) && k.is_of(&nfo_file.filename, par2_name) => kept_nfo.take(),
+            Some(k) if k.is_of(&nfo_file.filename, par2_name) => kept_nfo.take(),
             _ => None,
         };
         let text = match reused {

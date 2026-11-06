@@ -501,8 +501,9 @@ impl Step for ProbeStep {
                 Some(k) if !is_sfv && k.is_of(&file.filename, par2_name.map(String::as_str)) => kept.take(),
                 _ => None,
             };
-            let text = match reused {
-                Some(k) => k.text,
+            // `from_start`: read from the file's first article, the NFO's start, soo a reader after it can use it
+            let (text, from_start) = match reused {
+                Some(k) => (k.text, true),
                 None => {
                     let Some(seg) = ctx.segments(file.id, &SegmentPick::First(1)).map_err(retry)?.into_iter().next()
                     else {
@@ -511,7 +512,7 @@ impl Step for ProbeStep {
                     let Got::Body(raw) = fetch_raw(ctx, &seg.message_id, &file.filename)? else { continue };
                     let article = yenc::split_article(&raw);
                     let body = yenc_decode(&article.lines).unwrap_or_else(|| article.lines.join(&b'\n'));
-                    nfo_text(&body)
+                    (nfo_text(&body), seg.part.is_none_or(|p| p <= 1))
                 }
             };
             if is_sfv {
@@ -530,12 +531,16 @@ impl Step for ProbeStep {
                 if info.nfo.is_none() {
                     info.imdb_ids = imdb_ids(&text);
                     info.nfo = Some(text.chars().take(MAX_NFO).collect());
-                    info.nfo_file = Some(file.filename.clone());
-                    // the probe's JSON holds it now: a copy a step kept goes
-                    writes.push(StepWrite::new(
-                        super::nfo_store::DROP,
-                        vec![release_id.into(), file.filename.clone().into()],
-                    ));
+                    // a later article's text isn't the NFO: no file, soo nothing reuses it and the next run reads
+                    // the first article once it's there
+                    if from_start {
+                        info.nfo_file = Some(file.filename.clone());
+                        // the probe's JSON holds it now: a copy a step kept goes
+                        writes.push(StepWrite::new(
+                            super::nfo_store::DROP,
+                            vec![release_id.into(), file.filename.clone().into()],
+                        ));
+                    }
                 }
             }
         }

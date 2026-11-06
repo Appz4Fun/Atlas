@@ -136,7 +136,7 @@ fn a_fetched_nfo_is_kept() {
     run_with(&mut h, &state, budget(600), MediaConfig::default());
     wait_for("the id", || imdb(&h, FILM) == Some(200002));
     let kept = atlas::probe::nfo_store::stored(&h.shard(), h.id_of(FILM)).expect("the NFO is kept");
-    assert_eq!(kept.file.as_deref(), Some("some.nfo"));
+    assert_eq!(kept.file, "some.nfo");
     assert!(kept.text.contains("tt0200002"));
 }
 

@@ -1,7 +1,8 @@
 //! A release's NFO, read once and kept: the probe keeps the one it read in its own JSON (`nfo`, `nfo_file`), and a
 //! step that read one before the probe did (the archive listing looking for a password, the name or IMDb step on a
 //! release the probe passed over) keeps it here. Every reader looks here first, soo an NFO's article is fetched at
-//! most once a release.
+//! most once a release. Only an NFO read from its file's first article is kept: a later article's text, read while
+//! the first wasn't indexed yet, isn't the NFO, and the first is read once it's there.
 
 use rusqlite::{Connection, OptionalExtension};
 
@@ -33,21 +34,21 @@ pub const MAX_CHARS: usize = 256 * 1024;
 /// An NFO already read for a release.
 #[derive(Clone, Debug, PartialEq)]
 pub struct StoredNfo {
-    /// the release file it was read from; None on a probe written before the probe kept it
-    pub file: Option<String>,
+    /// the release file it was read from
+    pub file: String,
     pub text: String,
 }
 
 impl StoredNfo {
-    /// Whether this is the NFO in `file`, posted under that name or with `par2_name` as its PAR2 set names it. One
-    /// kept without its file is the release's NFO, whichever file it was.
+    /// Whether this is the NFO in `file`, posted under that name or with `par2_name` as its PAR2 set names it.
     pub fn is_of(&self, file: &str, par2_name: Option<&str>) -> bool {
-        self.file.as_deref().is_none_or(|kept| kept == file || par2_name == Some(kept))
+        self.file == file || par2_name == Some(self.file.as_str())
     }
 }
 
 /// The NFO already read for a release, the probe's first, on a shard connection or one with the shard attached as
-/// `s{n}`. Any failure, such as a shard without the table yet, reads as none.
+/// `s{n}`. A probe's NFO without its file (read before it kept one, or from a later article) isn't known to be the
+/// NFO's start, soo it isn't one. Any failure, such as a shard without the table yet, reads as none.
 pub fn stored(conn: &Connection, release_id: i64) -> Option<StoredNfo> {
     from_probe(conn, release_id).or_else(|| from_table(conn, release_id))
 }
@@ -76,12 +77,24 @@ fn from_probe(conn: &Connection, release_id: i64) -> Option<StoredNfo> {
          where release_id = ?1",
         |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<String>>(1)?)),
     )?;
-    Some(StoredNfo { file, text: text? })
+    Some(StoredNfo { file: file?, text: text? })
+}
+
+/// Any NFO text read for a release, the probe's even from a later article: for the page to say what's in it.
+pub fn any_text(conn: &Connection, release_id: i64) -> Option<String> {
+    on_shard(
+        conn,
+        release_id,
+        "select json_extract(info, '$.nfo') from {schema}release_probe where release_id = ?1",
+        |r| r.get::<_, Option<String>>(0),
+    )
+    .flatten()
+    .or_else(|| from_table(conn, release_id).map(|nfo| nfo.text))
 }
 
 fn from_table(conn: &Connection, release_id: i64) -> Option<StoredNfo> {
     on_shard(conn, release_id, "select file, text from {schema}release_nfo where release_id = ?1", |r| {
-        Ok(StoredNfo { file: Some(r.get(0)?), text: r.get(1)? })
+        Ok(StoredNfo { file: r.get(0)?, text: r.get(1)? })
     })
 }
 
@@ -114,7 +127,7 @@ mod tests {
         let conn = shard();
         assert_eq!(stored(&conn, 8), None);
         apply(&conn, keep(8, "a.nfo", "kept by a step"));
-        assert_eq!(stored(&conn, 8), Some(StoredNfo { file: Some("a.nfo".into()), text: "kept by a step".into() }));
+        assert_eq!(stored(&conn, 8), Some(StoredNfo { file: "a.nfo".into(), text: "kept by a step".into() }));
         // a second reader's NFO doesn't replace the first
         apply(&conn, keep(8, "b.nfo", "another"));
         assert_eq!(stored(&conn, 8).unwrap().text, "kept by a step");
@@ -123,7 +136,7 @@ mod tests {
             [],
         )
         .unwrap();
-        assert_eq!(stored(&conn, 8), Some(StoredNfo { file: Some("a.nfo".into()), text: "from the probe".into() }));
+        assert_eq!(stored(&conn, 8), Some(StoredNfo { file: "a.nfo".into(), text: "from the probe".into() }));
         // a probe without an NFO leaves the kept one
         conn.execute("insert into release_probe (release_id, info) values (16, '{\"nfo\":null}')", []).unwrap();
         apply(&conn, keep(16, "c.nfo", "kept"));
@@ -131,13 +144,15 @@ mod tests {
     }
 
     #[test]
-    fn an_old_probes_nfo_is_any_files() {
+    fn a_probes_nfo_without_its_file_isnt_reused() {
         let conn = shard();
-        conn.execute("insert into release_probe (release_id, info) values (8, '{\"nfo\":\"old\"}')", []).unwrap();
-        let nfo = stored(&conn, 8).unwrap();
-        assert_eq!(nfo.file, None);
-        assert!(nfo.is_of("whatever.nfo", None));
-        let named = StoredNfo { file: Some("Real.nfo".into()), text: String::new() };
+        // an old probe, or one that read a later article: the step reads the NFO's start itself
+        conn.execute("insert into release_probe (release_id, info) values (8, '{\"nfo\":\"part 2\"}')", []).unwrap();
+        assert_eq!(stored(&conn, 8), None);
+        assert_eq!(any_text(&conn, 8).as_deref(), Some("part 2"), "the page still reads it");
+        apply(&conn, keep(8, "a.nfo", "the start"));
+        assert_eq!(stored(&conn, 8).unwrap().text, "the start");
+        let named = StoredNfo { file: "Real.nfo".into(), text: String::new() };
         assert!(named.is_of("Real.nfo", None));
         assert!(named.is_of("x7f3a9", Some("Real.nfo")));
         assert!(!named.is_of("Other.nfo", None));

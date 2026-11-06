@@ -1501,7 +1501,7 @@ fn stored_password_source(conn: &Connection, id: i64, password: &str, names: Opt
     if crate::archive::store::view_with(conn, id).files.iter().any(|f| in_it(&f.name)) {
         return "a file inside";
     }
-    if crate::probe::nfo_store::stored(conn, id).is_some_and(|nfo| in_it(&nfo.text)) {
+    if crate::probe::nfo_store::any_text(conn, id).is_some_and(|text| in_it(&text)) {
         return "the NFO";
     }
     ELSEWHERE

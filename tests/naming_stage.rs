@@ -324,7 +324,7 @@ fn an_nfo_is_fetched_once_and_kept() {
     assert_eq!(state.bodies_sent.load(Ordering::SeqCst), 1);
     let (id, ..) = row(&h, STAGE_GROUP, "x");
     let kept = atlas::probe::nfo_store::stored(&conn_of(&h, STAGE_GROUP), id).expect("the NFO is kept");
-    assert_eq!(kept.file.as_deref(), Some("x.nfo"));
+    assert_eq!(kept.file, "x.nfo");
     assert!(kept.text.contains("Real Name 2024 1080p"));
 }
 
