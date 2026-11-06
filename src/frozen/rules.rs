@@ -8,12 +8,16 @@ use std::time::{Duration, Instant};
 
 use rusqlite::{Connection, OptionalExtension, Result, params};
 
+pub const SIDECAR: &str = "sidecar";
 pub const SMALL_COMPLETE: &str = "small_complete";
 pub const NOT_TV_MOVIES: &str = "not_tv_movies";
 
 /// Releases ?1 to ?6 with the rule that matches each now as its reason, null when none does. ?2 now (for `QUEUE`), ?3
 /// the small rule's size (0: off), ?4 1 when the small rule leaves movies and TV alone, ?5 1 when the not-TV/movies
-/// rule is on.
+/// rule is on, ?7 1 when the sidecar rule is on.
+/// Sidecar: a post of nothing but what describes a release and carries none of it, an NFO, a mediainfo or other text
+/// file, an SFV, an SRR (`SIDECAR_FILES`), of at most `SIDECAR_BYTES`, with no `[n/N]` promising files it hasn't got:
+/// not a release of its own, whatever its category or completeness. If more of the post comes, it thaws and is one.
 /// Small: complete means every file it says it has (its subjects' `[n/N]`), each with all its parts: a release whose
 /// subjects give no file count is complete as far as it has come, and can still grow past the size, soo it stays live.
 /// Not TV/movies: a categorized release outside Movies (2000s), TV (5000s) and Other (8000s, where Misc and Hashed
@@ -25,6 +29,14 @@ pub const NOT_TV_MOVIES: &str = "not_tv_movies";
 macro_rules! matching {
     () => {
         "select r.id as id, case
+            when ?7 = 1 and r.size > 0 and r.size <= 4194304
+                and exists (select 1 from files f where f.release_id = r.id)
+                and coalesce(r.file_total, 0) <= (select count(*) from files f where f.release_id = r.id)
+                and not exists (select 1 from files f where f.release_id = r.id and not (
+                    f.filename like '%.nfo' or f.filename like '%.txt' or f.filename like '%.sfv'
+                    or f.filename like '%.srr' or f.filename like '%.srs' or f.filename like '%.md5'
+                    or f.filename like '%.sha1' or f.filename like '%.diz'))
+                then 'sidecar'
             when ?3 > 0 and r.complete = 1 and coalesce(r.file_total, 0) > 0 and r.size > 0 and r.size < ?3
                 and (?4 = 0 or c.category is null
                      or (c.category not between 2000 and 2999 and c.category not between 5000 and 5999))
@@ -52,9 +64,14 @@ const QUEUE: &str = concat!(
 
 const STILL: &str = concat!("select exists (select 1 from (", matching!(), ") where reason is not null)");
 
+/// What the sidecar rule takes at most, in bytes; and the file kinds it takes, as the rule spells them
+pub const SIDECAR_BYTES: i64 = 4 << 20;
+pub const SIDECAR_FILES: &[&str] = &["nfo", "txt", "sfv", "srr", "srs", "md5", "sha1", "diz"];
+
 /// Whether any rule is on: a visit checks nothing otherwise.
 pub fn any_on() -> bool {
-    super::ENABLED.load(Relaxed) && (super::SMALL_BYTES.load(Relaxed) > 0 || super::NOT_TV_MOVIES.load(Relaxed))
+    super::ENABLED.load(Relaxed)
+        && (super::SMALL_BYTES.load(Relaxed) > 0 || super::NOT_TV_MOVIES.load(Relaxed) || super::SIDECAR.load(Relaxed))
 }
 
 /// Queue release `id` for freezing if a rule matches it now, and take it off the queue if none does. In the
@@ -67,19 +84,21 @@ pub fn evaluate(conn: &Connection, id: i64, now: i64) -> Result<bool> {
     Ok(queue(conn, id, id, now)? > 0)
 }
 
-/// The rules' settings now: the small rule's size, whether it keeps movies and TV, whether not-TV/movies is on.
-fn settings() -> (i64, i64, i64) {
+/// The rules' settings now: the small rule's size, whether it keeps movies and TV, whether not-TV/movies is on,
+/// whether the sidecar rule is.
+fn settings() -> (i64, i64, i64, i64) {
     (
         super::SMALL_BYTES.load(Relaxed),
         super::SMALL_KEEPS_TV_MOVIES.load(Relaxed) as i64,
         super::NOT_TV_MOVIES.load(Relaxed) as i64,
+        super::SIDECAR.load(Relaxed) as i64,
     )
 }
 
 /// Queue what matches among releases `lo..=hi`, leaving queued ones as they are. Returns how many it queued.
 fn queue(conn: &Connection, lo: i64, hi: i64, now: i64) -> Result<usize> {
-    let (small, keep_video, not_tv) = settings();
-    conn.prepare_cached(QUEUE)?.execute(params![lo, now, small, keep_video, not_tv, hi])
+    let (small, keep_video, not_tv, sidecar) = settings();
+    conn.prepare_cached(QUEUE)?.execute(params![lo, now, small, keep_video, not_tv, hi, sidecar])
 }
 
 /// meta key: the backlog has looked at every release from here up; 0 once it got to the bottom
@@ -89,8 +108,8 @@ const BACKLOG_RULES: &str = "freeze_backlog_rules";
 
 /// The rules as they are now, as one number.
 fn signature() -> i64 {
-    let (small, keep_video, not_tv) = settings();
-    small.wrapping_mul(4).wrapping_add(keep_video * 2 + not_tv)
+    let (small, keep_video, not_tv, sidecar) = settings();
+    small.wrapping_mul(8).wrapping_add(sidecar * 4 + keep_video * 2 + not_tv)
 }
 
 fn meta(conn: &Connection, key: &str) -> Result<Option<i64>> {
@@ -162,6 +181,6 @@ pub fn still(conn: &Connection, id: i64) -> Result<bool> {
     if !any_on() {
         return Ok(false);
     }
-    let (small, keep_video, not_tv) = settings();
-    conn.prepare_cached(STILL)?.query_row(params![id, 0, small, keep_video, not_tv, id], |r| r.get(0))
+    let (small, keep_video, not_tv, sidecar) = settings();
+    conn.prepare_cached(STILL)?.query_row(params![id, 0, small, keep_video, not_tv, id, sidecar], |r| r.get(0))
 }

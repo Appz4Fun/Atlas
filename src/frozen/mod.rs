@@ -55,6 +55,8 @@ pub static ENABLED: AtomicBool = AtomicBool::new(true);
 pub static SMALL_BYTES: AtomicI64 = AtomicI64::new(1 << 30);
 /// `[freeze] small_keeps_tv_movies`: the small rule leaves movies and TV alone
 pub static SMALL_KEEPS_TV_MOVIES: AtomicBool = AtomicBool::new(false);
+/// `[freeze] sidecar`: a post of only an NFO, mediainfo or other text, SFV or SRR files freezes (`rules::SIDECAR`)
+pub static SIDECAR: AtomicBool = AtomicBool::new(true);
 /// `[freeze] not_tv_movies`: a release categorized outside Movies, TV and Other freezes, complete or not
 pub static NOT_TV_MOVIES: AtomicBool = AtomicBool::new(true);
 /// `[freeze] per_tick`: releases a writer moves at most a tick
@@ -86,6 +88,7 @@ pub fn configure(cfg: &crate::config::FreezeConfig) {
     ENABLED.store(cfg.enabled, Relaxed);
     SMALL_BYTES.store(cfg.small_bytes.max(0), Relaxed);
     SMALL_KEEPS_TV_MOVIES.store(cfg.small_keeps_tv_movies, Relaxed);
+    SIDECAR.store(cfg.sidecar, Relaxed);
     NOT_TV_MOVIES.store(cfg.not_tv_movies, Relaxed);
     PER_TICK.store(cfg.per_tick.max(1), Relaxed);
     BACKLOG_PER_TICK.store(cfg.backlog_per_tick.max(0), Relaxed);
