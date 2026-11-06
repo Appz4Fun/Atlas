@@ -46,6 +46,8 @@ fn step_list() -> &'static [StepMeta] {
     STEPS.get_or_init(|| {
         let mut steps: Vec<StepMeta> = crate::postprocess::steps::all()
             .into_iter()
+            // a one-off backfill, run only where a seed asked it: not one of the steps a release waits for
+            .filter(|s| s.id() != crate::probe::body_crc::BODY_CRC_STEP)
             .map(|s| StepMeta {
                 id: s.id().0,
                 name: s.name(),
@@ -60,7 +62,7 @@ fn step_list() -> &'static [StepMeta] {
 }
 
 /// What each step is for, in words.
-fn label(name: &str) -> &str {
+pub(crate) fn label(name: &str) -> &str {
     match name {
         "archive_par2" => "PAR2 read",
         "archive_list" => "Archive listing",
@@ -77,6 +79,7 @@ fn label(name: &str) -> &str {
         "media_nfo" => "IDs from the NFO",
         "opensubtitles_imdb" => "IMDb from OpenSubtitles",
         "keys" => "Duplicate keys",
+        "probe_body_crc" => "Body CRC from the server",
         other => other,
     }
 }

@@ -173,6 +173,10 @@ const ID_PARAMS: [&str; 8] = ["tvdbid", "rid", "tvrageid", "tvmazeid", "imdbid",
 /// None when the request only has ids and nothing to search by name.
 pub fn search_term(kind: &str, args: &HashMap<String, String>) -> Option<String> {
     let mut term = args.get("q").map(|q| q.trim().to_string()).unwrap_or_default();
+    // an NZBLNK in q searches for its header, the part that names the post
+    if let Some(header) = crate::nzblnk::search_text(&term) {
+        term = header;
+    }
 
     if kind == "tvsearch" {
         let num = |k: &str| args.get(k).and_then(|v| v.trim().parse::<u32>().ok());
@@ -834,6 +838,14 @@ mod tests {
         for name in ["tvdbid", "imdbid", "rid", "tvmazeid", "tmdbid", "traktid"] {
             assert!(every.contains(name), "{name}");
         }
+    }
+
+    #[test]
+    fn an_nzblnk_in_q_searches_its_header() {
+        let q = format!("t=search&q={}", crate::web::url_encode("nzblnk:?t=Some+Film&h=Some.Film.2024.2160p&g=a.b.x"));
+        assert_eq!(search_term("search", &parse_query(&q)).as_deref(), Some("Some.Film.2024.2160p"));
+        let q = format!("t=movie&q={}", crate::web::url_encode("nzblnk:?t=T"));
+        assert_eq!(search_term("movie", &parse_query(&q)).as_deref(), Some("nzblnk:?t=T"), "no h, not a link");
     }
 
     #[test]

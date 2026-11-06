@@ -206,6 +206,7 @@ fn run_step(step: &dyn Step, ctx: &mut StepCtx<'_>) -> Ran {
         }
         Err(panic) => {
             ctx.crcs.clear();
+            crate::metrics::names::STEP_PANICS.inc(&[("step", step.name())], 1);
             Ran::Error(StepError::Retry(panic_text(panic)))
         }
     };
@@ -338,7 +339,11 @@ impl Inner {
 
     pub(crate) fn snapshot(&self) -> Value {
         let s = self.settings.read().unwrap();
-        self.stats.snapshot(s.config.body_fetches_per_minute, s.config.backlog_per_second, s.enabled)
+        let mut snapshot =
+            self.stats.snapshot(s.config.body_fetches_per_minute, s.config.backlog_per_second, s.enabled);
+        let claims: Vec<usize> = self.net_claimed.iter().map(|c| c.lock().unwrap().claims).collect();
+        snapshot["net_claims"] = serde_json::json!({"running": claims, "most": s.config.net_claims_per_shard});
+        snapshot
     }
 
     /// Bounded counts, per shard: an exact count at this size stalls whatever asks.
@@ -1283,6 +1288,11 @@ pub(crate) fn seed_shard(conn: &Connection, enabled: StepMask, stamps: &[(u8, St
         crate::probe::step::rerun_dv_without_keyframe_key(conn, now)?;
         set("pp_probe_dv_keyframe", now)?;
     }
+    // once, for Dolby Vision probes from before the first audio track was keyed: the audio stream key
+    if meta("pp_probe_dv_audio_key")?.is_none() {
+        crate::probe::step::rerun_dv_without_audio_key(conn, now)?;
+        set("pp_probe_dv_audio_key", now)?;
+    }
     // once, for the probes that read a set's later volume before its first was looked for
     if meta("pp_probe_first_volume")?.is_none() {
         crate::probe::step::rerun_later_volumes(conn, now)?;
@@ -1306,6 +1316,16 @@ pub(crate) fn seed_shard(conn: &Connection, enabled: StepMask, stamps: &[(u8, St
             queue.execute(params![id, now])?;
         }
         set("pp_complete_by_files", now)?;
+    }
+    // once, for the movie and TV probes from before the probe kept the server's body CRC: a HEAD each. The step
+    // does nothing for a release it wasn't asked about, soo it is marked seen here and starts no walk of every row
+    if meta("pp_probe_body_crc")?.is_none() {
+        let bit = crate::postprocess::step::mask(crate::probe::body_crc::BODY_CRC_STEP);
+        if seeded && enabled & bit != 0 {
+            crate::probe::body_crc::seed(conn, now)?;
+            set("pp_steps_seen", meta("pp_steps_seen")?.unwrap_or(0) | bit)?;
+        }
+        set("pp_probe_body_crc", now)?;
     }
     let seen = meta("pp_steps_seen")?.unwrap_or(0);
     let new = if seeded { enabled & !seen } else { enabled };

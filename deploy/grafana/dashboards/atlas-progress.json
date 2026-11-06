@@ -1,0 +1,3984 @@
+{
+ "uid": "atlas-progress",
+ "title": "Atlas: Backfill and realtime",
+ "description": "How far the backfill has come, per group and overall, and whether live indexing and processing keep up. Article numbers count the gaps on the server too. Backfill goes newest month first, in day chunks for split groups.",
+ "tags": [
+  "atlas"
+ ],
+ "schemaVersion": 39,
+ "editable": true,
+ "graphTooltip": 1,
+ "refresh": "30s",
+ "time": {
+  "from": "now-6h",
+  "to": "now"
+ },
+ "timezone": "browser",
+ "links": [
+  {
+   "title": "Atlas",
+   "type": "dashboards",
+   "tags": [
+    "atlas"
+   ],
+   "asDropdown": false,
+   "includeVars": false,
+   "keepTime": true,
+   "icon": "external link",
+   "targetBlank": false
+  }
+ ],
+ "templating": {
+  "list": [
+   {
+    "name": "host",
+    "label": "Atlas",
+    "type": "query",
+    "datasource": {
+     "type": "prometheus",
+     "uid": "victoriametrics"
+    },
+    "refresh": 2,
+    "sort": 1,
+    "query": {
+     "query": "label_values(atlas_build_info{role=\"indexer\"}, host)",
+     "refId": "A"
+    },
+    "definition": "label_values(atlas_build_info{role=\"indexer\"}, host)",
+    "multi": false,
+    "includeAll": false,
+    "allValue": null,
+    "current": {}
+   },
+   {
+    "name": "group",
+    "label": "Group",
+    "type": "query",
+    "datasource": {
+     "type": "prometheus",
+     "uid": "victoriametrics"
+    },
+    "refresh": 2,
+    "sort": 1,
+    "query": {
+     "query": "label_values(atlas_group_backfill_articles{host=\"$host\"}, group)",
+     "refId": "A"
+    },
+    "definition": "label_values(atlas_group_backfill_articles{host=\"$host\"}, group)",
+    "multi": true,
+    "includeAll": true,
+    "allValue": ".*",
+    "current": {
+     "text": "All",
+     "value": "$__all"
+    }
+   }
+  ]
+ },
+ "annotations": {
+  "list": []
+ },
+ "panels": [
+  {
+   "id": 2,
+   "type": "row",
+   "title": "Backfill: how far along",
+   "collapsed": false,
+   "panels": [],
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 0
+   }
+  },
+  {
+   "id": 3,
+   "type": "stat",
+   "title": "Done",
+   "description": "Article numbers indexed, out of every number between each group's first and last on its server.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 4,
+    "x": 0,
+    "y": 1
+   },
+   "targets": [
+    {
+     "expr": "sum(atlas_group_backfill_articles{host=\"$host\",state=\"covered\",group=~\"$group\"}) / sum(atlas_group_backfill_articles{host=\"$host\",state=\"total\",group=~\"$group\"})",
+     "legendFormat": "__auto",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "text",
+        "value": null
+       }
+      ]
+     },
+     "unit": "percentunit"
+    },
+    "overrides": []
+   },
+   "options": {
+    "colorMode": "value",
+    "graphMode": "none",
+    "justifyMode": "auto",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "textMode": "auto"
+   },
+   "transformations": []
+  },
+  {
+   "id": 4,
+   "type": "stat",
+   "title": "Articles left",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 4,
+    "x": 4,
+    "y": 1
+   },
+   "targets": [
+    {
+     "expr": "(sum(atlas_group_backfill_articles{host=\"$host\",state=\"total\",group=~\"$group\"}) - sum(atlas_group_backfill_articles{host=\"$host\",state=\"covered\",group=~\"$group\"}))",
+     "legendFormat": "__auto",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "text",
+        "value": null
+       }
+      ]
+     },
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "options": {
+    "colorMode": "value",
+    "graphMode": "none",
+    "justifyMode": "auto",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "textMode": "auto"
+   },
+   "transformations": []
+  },
+  {
+   "id": 5,
+   "type": "stat",
+   "title": "Shrinking by",
+   "description": "Articles a hour, net of new posts, over the last 6 hours.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 4,
+    "x": 8,
+    "y": 1
+   },
+   "targets": [
+    {
+     "expr": "(-deriv((sum(atlas_group_backfill_articles{host=\"$host\",state=\"total\",group=~\"$group\"}) - sum(atlas_group_backfill_articles{host=\"$host\",state=\"covered\",group=~\"$group\"}))[6h:5m])) * 3600",
+     "legendFormat": "__auto",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "text",
+        "value": null
+       }
+      ]
+     },
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "options": {
+    "colorMode": "value",
+    "graphMode": "none",
+    "justifyMode": "auto",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "textMode": "auto"
+   },
+   "transformations": []
+  },
+  {
+   "id": 6,
+   "type": "stat",
+   "title": "ETA",
+   "description": "Articles left at the last 6 hours' pace. No data means what is left is not shrinking.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 4,
+    "x": 12,
+    "y": 1
+   },
+   "targets": [
+    {
+     "expr": "(sum(atlas_group_backfill_articles{host=\"$host\",state=\"total\",group=~\"$group\"}) - sum(atlas_group_backfill_articles{host=\"$host\",state=\"covered\",group=~\"$group\"})) / ((-deriv((sum(atlas_group_backfill_articles{host=\"$host\",state=\"total\",group=~\"$group\"}) - sum(atlas_group_backfill_articles{host=\"$host\",state=\"covered\",group=~\"$group\"}))[6h:5m])) > 0)",
+     "legendFormat": "__auto",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "text",
+        "value": null
+       }
+      ]
+     },
+     "mappings": [
+      {
+       "type": "special",
+       "options": {
+        "match": "null",
+        "result": {
+         "text": "not shrinking",
+         "index": 0
+        }
+       }
+      }
+     ],
+     "unit": "s"
+    },
+    "overrides": []
+   },
+   "options": {
+    "colorMode": "value",
+    "graphMode": "none",
+    "justifyMode": "auto",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "textMode": "auto"
+   },
+   "transformations": []
+  },
+  {
+   "id": 7,
+   "type": "stat",
+   "title": "Day chunks done",
+   "description": "Split groups backfill a day at a time; this is the share of those days done.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 4,
+    "x": 16,
+    "y": 1
+   },
+   "targets": [
+    {
+     "expr": "atlas_backfill_chunks{host=\"$host\",state=\"done\"} / ignoring(state) atlas_backfill_chunks{host=\"$host\",state=\"total\"}",
+     "legendFormat": "__auto",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "text",
+        "value": null
+       }
+      ]
+     },
+     "unit": "percentunit"
+    },
+    "overrides": []
+   },
+   "options": {
+    "colorMode": "value",
+    "graphMode": "none",
+    "justifyMode": "auto",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "textMode": "auto"
+   },
+   "transformations": []
+  },
+  {
+   "id": 8,
+   "type": "stat",
+   "title": "Day chunks ETA",
+   "description": "Days left at the last hour's pace.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 4,
+    "x": 20,
+    "y": 1
+   },
+   "targets": [
+    {
+     "expr": "(atlas_backfill_chunks{host=\"$host\",state=\"total\"} - ignoring(state) atlas_backfill_chunks{host=\"$host\",state=\"done\"}) / ignoring(state) (atlas_backfill_chunks{host=\"$host\",state=\"done_last_hour\"} > 0) * 3600",
+     "legendFormat": "__auto",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "text",
+        "value": null
+       }
+      ]
+     },
+     "mappings": [
+      {
+       "type": "special",
+       "options": {
+        "match": "null",
+        "result": {
+         "text": "none done this hour",
+         "index": 0
+        }
+       }
+      }
+     ],
+     "unit": "s"
+    },
+    "overrides": []
+   },
+   "options": {
+    "colorMode": "value",
+    "graphMode": "none",
+    "justifyMode": "auto",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "textMode": "auto"
+   },
+   "transformations": []
+  },
+  {
+   "id": 9,
+   "type": "timeseries",
+   "title": "Done",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 0,
+    "y": 5
+   },
+   "targets": [
+    {
+     "expr": "sum(atlas_group_backfill_articles{host=\"$host\",state=\"covered\",group=~\"$group\"}) / sum(atlas_group_backfill_articles{host=\"$host\",state=\"total\",group=~\"$group\"})",
+     "legendFormat": "done",
+     "editorMode": "code",
+     "instant": false,
+     "range": true,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "fillOpacity": 8,
+      "lineWidth": 1,
+      "showPoints": "never",
+      "spanNulls": false,
+      "drawStyle": "line",
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "unit": "percentunit"
+    },
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "done"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#3987e5"
+        }
+       }
+      ]
+     }
+    ]
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "bottom",
+     "calcs": [
+      "lastNotNull",
+      "max"
+     ],
+     "showLegend": true,
+     "sortBy": "Max",
+     "sortDesc": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "transformations": []
+  },
+  {
+   "id": 10,
+   "type": "timeseries",
+   "title": "Articles left",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 8,
+    "y": 5
+   },
+   "targets": [
+    {
+     "expr": "(sum(atlas_group_backfill_articles{host=\"$host\",state=\"total\",group=~\"$group\"}) - sum(atlas_group_backfill_articles{host=\"$host\",state=\"covered\",group=~\"$group\"}))",
+     "legendFormat": "left",
+     "editorMode": "code",
+     "instant": false,
+     "range": true,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "fillOpacity": 8,
+      "lineWidth": 1,
+      "showPoints": "never",
+      "spanNulls": false,
+      "drawStyle": "line",
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "unit": "short"
+    },
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "left"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#3987e5"
+        }
+       }
+      ]
+     }
+    ]
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "bottom",
+     "calcs": [
+      "lastNotNull",
+      "max"
+     ],
+     "showLegend": true,
+     "sortBy": "Max",
+     "sortDesc": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "transformations": []
+  },
+  {
+   "id": 11,
+   "type": "timeseries",
+   "title": "How far back, middle group",
+   "description": "How old the oldest indexed post is in the middle group. Climbing means backfill is reaching further back.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 16,
+    "y": 5
+   },
+   "targets": [
+    {
+     "expr": "time() - quantile(0.5, atlas_group_posted_timestamp_seconds{host=\"$host\",end=\"oldest\",group=~\"$group\"})",
+     "legendFormat": "oldest post indexed",
+     "editorMode": "code",
+     "instant": false,
+     "range": true,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    },
+    {
+     "expr": "time() - quantile(0.5, atlas_group_backfill_day_timestamp_seconds{host=\"$host\",day=\"oldest_done\",group=~\"$group\"})",
+     "legendFormat": "oldest day chunk done",
+     "editorMode": "code",
+     "instant": false,
+     "range": true,
+     "refId": "B",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "fillOpacity": 8,
+      "lineWidth": 1,
+      "showPoints": "never",
+      "spanNulls": false,
+      "drawStyle": "line",
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "unit": "s"
+    },
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "oldest post indexed"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#3987e5"
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "oldest day chunk done"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#d95926"
+        }
+       }
+      ]
+     }
+    ]
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "bottom",
+     "calcs": [
+      "lastNotNull",
+      "max"
+     ],
+     "showLegend": true,
+     "sortBy": "Max",
+     "sortDesc": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "transformations": []
+  },
+  {
+   "id": 12,
+   "type": "table",
+   "title": "Per group",
+   "description": "Article numbers from each group's furthest-along server. Split groups count their day chunks done as that share. ETA at the last 6 hours' pace, blank when not shrinking.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 12,
+    "w": 24,
+    "x": 0,
+    "y": 13
+   },
+   "targets": [
+    {
+     "expr": "atlas_group_backfill_articles{host=\"$host\",state=\"covered\",group=~\"$group\"} / ignoring(state) atlas_group_backfill_articles{host=\"$host\",state=\"total\",group=~\"$group\"}",
+     "legendFormat": "A",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "format": "table",
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    },
+    {
+     "expr": "(atlas_group_backfill_articles{host=\"$host\",state=\"total\",group=~\"$group\"} - ignoring(state) atlas_group_backfill_articles{host=\"$host\",state=\"covered\",group=~\"$group\"})",
+     "legendFormat": "B",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "format": "table",
+     "refId": "B",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    },
+    {
+     "expr": "atlas_group_article_number{host=\"$host\",mark=\"first\",group=~\"$group\"}",
+     "legendFormat": "C",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "format": "table",
+     "refId": "C",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    },
+    {
+     "expr": "atlas_group_article_number{host=\"$host\",mark=\"backfill_cursor\",group=~\"$group\"}",
+     "legendFormat": "D",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "format": "table",
+     "refId": "D",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    },
+    {
+     "expr": "atlas_group_article_number{host=\"$host\",mark=\"live_cursor\",group=~\"$group\"}",
+     "legendFormat": "E",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "format": "table",
+     "refId": "E",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    },
+    {
+     "expr": "atlas_group_article_number{host=\"$host\",mark=\"last\",group=~\"$group\"}",
+     "legendFormat": "F",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "format": "table",
+     "refId": "F",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    },
+    {
+     "expr": "atlas_group_posted_timestamp_seconds{host=\"$host\",end=\"oldest\",group=~\"$group\"} * 1000",
+     "legendFormat": "G",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "format": "table",
+     "refId": "G",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    },
+    {
+     "expr": "atlas_group_backfill_chunks{host=\"$host\",state=\"done\",group=~\"$group\"} / ignoring(state) atlas_group_backfill_chunks{host=\"$host\",state=\"total\",group=~\"$group\"}",
+     "legendFormat": "H",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "format": "table",
+     "refId": "H",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    },
+    {
+     "expr": "atlas_group_backfill_day_timestamp_seconds{host=\"$host\",day=\"oldest_done\",group=~\"$group\"} * 1000",
+     "legendFormat": "I",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "format": "table",
+     "refId": "I",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    },
+    {
+     "expr": "(atlas_group_backfill_articles{host=\"$host\",state=\"total\",group=~\"$group\"} - ignoring(state) atlas_group_backfill_articles{host=\"$host\",state=\"covered\",group=~\"$group\"}) / (-deriv((atlas_group_backfill_articles{host=\"$host\",state=\"total\",group=~\"$group\"} - ignoring(state) atlas_group_backfill_articles{host=\"$host\",state=\"covered\",group=~\"$group\"})[6h:5m]) > 0)",
+     "legendFormat": "J",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "format": "table",
+     "refId": "J",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "filterable": true
+     }
+    },
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Done"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "percentunit"
+       },
+       {
+        "id": "custom.cellOptions",
+        "value": {
+         "type": "gauge",
+         "mode": "basic"
+        }
+       },
+       {
+        "id": "min",
+        "value": 0
+       },
+       {
+        "id": "max",
+        "value": 1
+       },
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#3987e5"
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Left"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "short"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Server first"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "none"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Backfill cursor"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "none"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Live cursor"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "none"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Server last"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "none"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Oldest post"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "dateTimeAsIso"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Days done"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "percentunit"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Oldest day done"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "dateTimeAsIso"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "ETA"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "s"
+       }
+      ]
+     }
+    ]
+   },
+   "options": {
+    "showHeader": true,
+    "cellHeight": "sm",
+    "sortBy": [
+     {
+      "displayName": "Left",
+      "desc": true
+     }
+    ]
+   },
+   "transformations": [
+    {
+     "id": "joinByField",
+     "options": {
+      "byField": "group",
+      "mode": "outer"
+     }
+    },
+    {
+     "id": "filterFieldsByName",
+     "options": {
+      "include": {
+       "names": [
+        "group",
+        "Value #A",
+        "Value #B",
+        "Value #C",
+        "Value #D",
+        "Value #E",
+        "Value #F",
+        "Value #G",
+        "Value #H",
+        "Value #I",
+        "Value #J"
+       ]
+      }
+     }
+    },
+    {
+     "id": "organize",
+     "options": {
+      "renameByName": {
+       "group": "Group",
+       "Value #A": "Done",
+       "Value #B": "Left",
+       "Value #C": "Server first",
+       "Value #D": "Backfill cursor",
+       "Value #E": "Live cursor",
+       "Value #F": "Server last",
+       "Value #G": "Oldest post",
+       "Value #H": "Days done",
+       "Value #I": "Oldest day done",
+       "Value #J": "ETA"
+      },
+      "indexByName": {
+       "group": 0,
+       "Value #A": 1,
+       "Value #B": 2,
+       "Value #C": 3,
+       "Value #D": 4,
+       "Value #E": 5,
+       "Value #F": 6,
+       "Value #G": 7,
+       "Value #H": 8,
+       "Value #I": 9,
+       "Value #J": 10
+      }
+     }
+    }
+   ]
+  },
+  {
+   "id": 13,
+   "type": "row",
+   "title": "Realtime: is it keeping up",
+   "collapsed": false,
+   "panels": [],
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 25
+   }
+  },
+  {
+   "id": 14,
+   "type": "stat",
+   "title": "Articles behind",
+   "description": "New articles on the servers that the live cursors have not reached, as of each group's last pass.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 4,
+    "x": 0,
+    "y": 26
+   },
+   "targets": [
+    {
+     "expr": "sum(clamp_min(atlas_group_article_number{host=\"$host\",mark=\"last\",group=~\"$group\"} - ignoring(mark) atlas_group_article_number{host=\"$host\",mark=\"live_cursor\",group=~\"$group\"}, 0))",
+     "legendFormat": "__auto",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "text",
+        "value": null
+       }
+      ]
+     },
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "options": {
+    "colorMode": "value",
+    "graphMode": "none",
+    "justifyMode": "auto",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "textMode": "auto"
+   },
+   "transformations": []
+  },
+  {
+   "id": 15,
+   "type": "stat",
+   "title": "Groups behind",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 4,
+    "x": 4,
+    "y": 26
+   },
+   "targets": [
+    {
+     "expr": "count(clamp_min(atlas_group_article_number{host=\"$host\",mark=\"last\",group=~\"$group\"} - ignoring(mark) atlas_group_article_number{host=\"$host\",mark=\"live_cursor\",group=~\"$group\"}, 0) > 0) or vector(0)",
+     "legendFormat": "__auto",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "text",
+        "value": null
+       }
+      ]
+     },
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "options": {
+    "colorMode": "value",
+    "graphMode": "none",
+    "justifyMode": "auto",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "textMode": "auto"
+   },
+   "transformations": []
+  },
+  {
+   "id": 16,
+   "type": "stat",
+   "title": "Groups not moved in 30 min",
+   "description": "Groups whose live cursor has not moved in 30 minutes, from the database, so a restart does not hide them. Quiet groups land here too: nothing new to index looks the same as not indexing.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 4,
+    "x": 8,
+    "y": 26
+   },
+   "targets": [
+    {
+     "expr": "count(changes(atlas_group_article_number{host=\"$host\",mark=\"live_cursor\",group=~\"$group\"}[30m]) == 0) or vector(0)",
+     "legendFormat": "__auto",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "#0ca30c",
+        "value": null
+       },
+       {
+        "color": "#fab219",
+        "value": 1
+       },
+       {
+        "color": "#d03b3b",
+        "value": 20
+       }
+      ]
+     },
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "options": {
+    "colorMode": "background",
+    "graphMode": "none",
+    "justifyMode": "auto",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "textMode": "auto"
+   },
+   "transformations": []
+  },
+  {
+   "id": 17,
+   "type": "stat",
+   "title": "Newest post, middle group",
+   "description": "Age of the newest indexed post in the middle group: the lag behind Usenet in time.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 4,
+    "x": 12,
+    "y": 26
+   },
+   "targets": [
+    {
+     "expr": "quantile(0.5, time() - atlas_group_posted_timestamp_seconds{host=\"$host\",end=\"newest\",group=~\"$group\"})",
+     "legendFormat": "__auto",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "#0ca30c",
+        "value": null
+       },
+       {
+        "color": "#fab219",
+        "value": 1800
+       },
+       {
+        "color": "#d03b3b",
+        "value": 7200
+       }
+      ]
+     },
+     "unit": "s"
+    },
+    "overrides": []
+   },
+   "options": {
+    "colorMode": "background",
+    "graphMode": "none",
+    "justifyMode": "auto",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "textMode": "auto"
+   },
+   "transformations": []
+  },
+  {
+   "id": 18,
+   "type": "stat",
+   "title": "Caught up",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 4,
+    "x": 16,
+    "y": 26
+   },
+   "targets": [
+    {
+     "expr": "atlas_indexer_idle{host=\"$host\"}",
+     "legendFormat": "__auto",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "text",
+        "value": null
+       }
+      ]
+     },
+     "mappings": [
+      {
+       "type": "value",
+       "options": {
+        "0": {
+         "text": "working",
+         "index": 0
+        },
+        "1": {
+         "text": "every group caught up",
+         "index": 1
+        }
+       }
+      }
+     ],
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "options": {
+    "colorMode": "value",
+    "graphMode": "none",
+    "justifyMode": "auto",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "textMode": "auto"
+   },
+   "transformations": []
+  },
+  {
+   "id": 19,
+   "type": "stat",
+   "title": "Indexing errors in range",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 4,
+    "x": 20,
+    "y": 26
+   },
+   "targets": [
+    {
+     "expr": "sum(increase(atlas_indexer_errors_total{host=\"$host\"}[$__range]))",
+     "legendFormat": "__auto",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "#0ca30c",
+        "value": null
+       },
+       {
+        "color": "#ec835a",
+        "value": 1
+       }
+      ]
+     },
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "options": {
+    "colorMode": "background",
+    "graphMode": "none",
+    "justifyMode": "auto",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "textMode": "auto"
+   },
+   "transformations": []
+  },
+  {
+   "id": 20,
+   "type": "timeseries",
+   "title": "Articles behind, the 8 furthest behind groups",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 0,
+    "y": 30
+   },
+   "targets": [
+    {
+     "expr": "topk(8, clamp_min(atlas_group_article_number{host=\"$host\",mark=\"last\",group=~\"$group\"} - ignoring(mark) atlas_group_article_number{host=\"$host\",mark=\"live_cursor\",group=~\"$group\"}, 0))",
+     "legendFormat": "{{group}}",
+     "editorMode": "code",
+     "instant": false,
+     "range": true,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "fillOpacity": 8,
+      "lineWidth": 1,
+      "showPoints": "never",
+      "spanNulls": false,
+      "drawStyle": "line",
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "color": {
+      "mode": "palette-classic"
+     },
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "bottom",
+     "calcs": [
+      "lastNotNull",
+      "max"
+     ],
+     "showLegend": true,
+     "sortBy": "Max",
+     "sortDesc": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "transformations": []
+  },
+  {
+   "id": 21,
+   "type": "timeseries",
+   "title": "Newest post indexed, age, the 8 oldest",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 8,
+    "y": 30
+   },
+   "targets": [
+    {
+     "expr": "topk(8, time() - atlas_group_posted_timestamp_seconds{host=\"$host\",end=\"newest\",group=~\"$group\"})",
+     "legendFormat": "{{group}}",
+     "editorMode": "code",
+     "instant": false,
+     "range": true,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "fillOpacity": 8,
+      "lineWidth": 1,
+      "showPoints": "never",
+      "spanNulls": false,
+      "drawStyle": "line",
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "color": {
+      "mode": "palette-classic"
+     },
+     "unit": "s"
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "bottom",
+     "calcs": [
+      "lastNotNull",
+      "max"
+     ],
+     "showLegend": true,
+     "sortBy": "Max",
+     "sortDesc": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "transformations": []
+  },
+  {
+   "id": 22,
+   "type": "timeseries",
+   "title": "Indexed per second",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 16,
+    "y": 30
+   },
+   "targets": [
+    {
+     "expr": "sum(rate(atlas_articles_total{host=\"$host\",group=~\"$group\"}[5m]))",
+     "legendFormat": "articles",
+     "editorMode": "code",
+     "instant": false,
+     "range": true,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    },
+    {
+     "expr": "sum(rate(atlas_releases_seen_total{host=\"$host\",group=~\"$group\"}[5m]))",
+     "legendFormat": "releases seen",
+     "editorMode": "code",
+     "instant": false,
+     "range": true,
+     "refId": "B",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "fillOpacity": 8,
+      "lineWidth": 1,
+      "showPoints": "never",
+      "spanNulls": false,
+      "drawStyle": "line",
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "unit": "short"
+    },
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "articles"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#3987e5"
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "releases seen"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#d95926"
+        }
+       }
+      ]
+     }
+    ]
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "bottom",
+     "calcs": [
+      "lastNotNull",
+      "max"
+     ],
+     "showLegend": true,
+     "sortBy": "Max",
+     "sortDesc": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "transformations": []
+  },
+  {
+   "id": 23,
+   "type": "table",
+   "title": "Lag per group",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 10,
+    "w": 24,
+    "x": 0,
+    "y": 38
+   },
+   "targets": [
+    {
+     "expr": "clamp_min(atlas_group_article_number{host=\"$host\",mark=\"last\",group=~\"$group\"} - ignoring(mark) atlas_group_article_number{host=\"$host\",mark=\"live_cursor\",group=~\"$group\"}, 0)",
+     "legendFormat": "A",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "format": "table",
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    },
+    {
+     "expr": "time() - atlas_group_posted_timestamp_seconds{host=\"$host\",end=\"newest\",group=~\"$group\"}",
+     "legendFormat": "B",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "format": "table",
+     "refId": "B",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    },
+    {
+     "expr": "time() - atlas_group_last_indexed_timestamp_seconds{host=\"$host\",group=~\"$group\"}",
+     "legendFormat": "C",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "format": "table",
+     "refId": "C",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    },
+    {
+     "expr": "sum by (group) (rate(atlas_articles_total{host=\"$host\",group=~\"$group\"}[15m]))",
+     "legendFormat": "D",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "format": "table",
+     "refId": "D",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "filterable": true
+     }
+    },
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Articles behind"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "short"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Newest post age"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "s"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Since last indexed"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "s"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Articles a second"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "short"
+       }
+      ]
+     }
+    ]
+   },
+   "options": {
+    "showHeader": true,
+    "cellHeight": "sm",
+    "sortBy": [
+     {
+      "displayName": "Articles behind",
+      "desc": true
+     }
+    ]
+   },
+   "transformations": [
+    {
+     "id": "joinByField",
+     "options": {
+      "byField": "group",
+      "mode": "outer"
+     }
+    },
+    {
+     "id": "filterFieldsByName",
+     "options": {
+      "include": {
+       "names": [
+        "group",
+        "Value #A",
+        "Value #B",
+        "Value #C",
+        "Value #D"
+       ]
+      }
+     }
+    },
+    {
+     "id": "organize",
+     "options": {
+      "renameByName": {
+       "group": "Group",
+       "Value #A": "Articles behind",
+       "Value #B": "Newest post age",
+       "Value #C": "Since last indexed",
+       "Value #D": "Articles a second"
+      },
+      "indexByName": {
+       "group": 0,
+       "Value #A": 1,
+       "Value #B": 2,
+       "Value #C": 3,
+       "Value #D": 4
+      }
+     }
+    }
+   ]
+  },
+  {
+   "id": 24,
+   "type": "row",
+   "title": "Queues",
+   "collapsed": false,
+   "panels": [],
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 48
+   }
+  },
+  {
+   "id": 25,
+   "type": "timeseries",
+   "title": "Headers fetched, not saved",
+   "description": "Fetching pauses at the cap.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 0,
+    "y": 49
+   },
+   "targets": [
+    {
+     "expr": "atlas_unsaved_headers{host=\"$host\",state=\"now\"}",
+     "legendFormat": "waiting",
+     "editorMode": "code",
+     "instant": false,
+     "range": true,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    },
+    {
+     "expr": "atlas_unsaved_headers{host=\"$host\",state=\"cap\"}",
+     "legendFormat": "cap",
+     "editorMode": "code",
+     "instant": false,
+     "range": true,
+     "refId": "B",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "fillOpacity": 8,
+      "lineWidth": 1,
+      "showPoints": "never",
+      "spanNulls": false,
+      "drawStyle": "line",
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "unit": "short"
+    },
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "waiting"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#3987e5"
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "cap"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#8e8d87"
+        }
+       }
+      ]
+     }
+    ]
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "bottom",
+     "calcs": [
+      "lastNotNull",
+      "max"
+     ],
+     "showLegend": true,
+     "sortBy": "Max",
+     "sortDesc": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "transformations": []
+  },
+  {
+   "id": 26,
+   "type": "timeseries",
+   "title": "Parse and save",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 8,
+    "y": 49
+   },
+   "targets": [
+    {
+     "expr": "atlas_writer_queued_slices{host=\"$host\"}",
+     "legendFormat": "slices waiting for a writer",
+     "editorMode": "code",
+     "instant": false,
+     "range": true,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    },
+    {
+     "expr": "atlas_function_in_progress{host=\"$host\",function=\"indexer.parse_slice\"}",
+     "legendFormat": "parsing",
+     "editorMode": "code",
+     "instant": false,
+     "range": true,
+     "refId": "B",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    },
+    {
+     "expr": "atlas_function_in_progress{host=\"$host\",function=\"indexer.save_slice\"}",
+     "legendFormat": "saving",
+     "editorMode": "code",
+     "instant": false,
+     "range": true,
+     "refId": "C",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "fillOpacity": 8,
+      "lineWidth": 1,
+      "showPoints": "never",
+      "spanNulls": false,
+      "drawStyle": "line",
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "unit": "short"
+    },
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "slices waiting for a writer"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#3987e5"
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "parsing"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#d95926"
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "saving"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#199e70"
+        }
+       }
+      ]
+     }
+    ]
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "bottom",
+     "calcs": [
+      "lastNotNull",
+      "max"
+     ],
+     "showLegend": true,
+     "sortBy": "Max",
+     "sortDesc": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "transformations": []
+  },
+  {
+   "id": 27,
+   "type": "timeseries",
+   "title": "Processing stage queue",
+   "description": "Bounded counts: a big queue reads as its cap.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 16,
+    "y": 49
+   },
+   "targets": [
+    {
+     "expr": "atlas_stage_queue{host=\"$host\",state=\"due\"}",
+     "legendFormat": "due",
+     "editorMode": "code",
+     "instant": false,
+     "range": true,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    },
+    {
+     "expr": "atlas_stage_queue{host=\"$host\",state=\"net_wanted\"}",
+     "legendFormat": "waiting on bodies",
+     "editorMode": "code",
+     "instant": false,
+     "range": true,
+     "refId": "B",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    },
+    {
+     "expr": "atlas_stage_queue{host=\"$host\",state=\"failed\"}",
+     "legendFormat": "failed",
+     "editorMode": "code",
+     "instant": false,
+     "range": true,
+     "refId": "C",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "fillOpacity": 8,
+      "lineWidth": 1,
+      "showPoints": "never",
+      "spanNulls": false,
+      "drawStyle": "line",
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "unit": "short"
+    },
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "due"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#3987e5"
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "waiting on bodies"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#d95926"
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "failed"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#199e70"
+        }
+       }
+      ]
+     }
+    ]
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "bottom",
+     "calcs": [
+      "lastNotNull",
+      "max"
+     ],
+     "showLegend": true,
+     "sortBy": "Max",
+     "sortDesc": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "transformations": []
+  },
+  {
+   "id": 28,
+   "type": "timeseries",
+   "title": "Steps running now",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 0,
+    "y": 57
+   },
+   "targets": [
+    {
+     "expr": "topk(8, atlas_function_in_progress{host=\"$host\",function=~\"step[.].*\"})",
+     "legendFormat": "{{function}}",
+     "editorMode": "code",
+     "instant": false,
+     "range": true,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "fillOpacity": 8,
+      "lineWidth": 1,
+      "showPoints": "never",
+      "spanNulls": false,
+      "drawStyle": "line",
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "color": {
+      "mode": "palette-classic"
+     },
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "bottom",
+     "calcs": [
+      "lastNotNull",
+      "max"
+     ],
+     "showLegend": true,
+     "sortBy": "Max",
+     "sortDesc": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "transformations": []
+  },
+  {
+   "id": 29,
+   "type": "timeseries",
+   "title": "Stills",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 8,
+    "y": 57
+   },
+   "targets": [
+    {
+     "expr": "atlas_function_in_progress{host=\"$host\",function=\"step.stills\"}",
+     "legendFormat": "running",
+     "editorMode": "code",
+     "instant": false,
+     "range": true,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    },
+    {
+     "expr": "sum(rate(atlas_step_runs_total{host=\"$host\",step=\"stills\"}[5m])) * 60",
+     "legendFormat": "runs a minute",
+     "editorMode": "code",
+     "instant": false,
+     "range": true,
+     "refId": "B",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "fillOpacity": 8,
+      "lineWidth": 1,
+      "showPoints": "never",
+      "spanNulls": false,
+      "drawStyle": "line",
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "unit": "short"
+    },
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "running"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#3987e5"
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "runs a minute"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#d95926"
+        }
+       }
+      ]
+     }
+    ]
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "bottom",
+     "calcs": [
+      "lastNotNull",
+      "max"
+     ],
+     "showLegend": true,
+     "sortBy": "Max",
+     "sortDesc": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "transformations": []
+  },
+  {
+   "id": 30,
+   "type": "timeseries",
+   "title": "Bodies",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 16,
+    "y": 57
+   },
+   "targets": [
+    {
+     "expr": "atlas_function_in_progress{host=\"$host\",function=\"stage.fetch_body\"}",
+     "legendFormat": "fetching now",
+     "editorMode": "code",
+     "instant": false,
+     "range": true,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    },
+    {
+     "expr": "rate(atlas_stage_bodies_total{host=\"$host\"}[5m]) * 60",
+     "legendFormat": "fetched a minute",
+     "editorMode": "code",
+     "instant": false,
+     "range": true,
+     "refId": "B",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "fillOpacity": 8,
+      "lineWidth": 1,
+      "showPoints": "never",
+      "spanNulls": false,
+      "drawStyle": "line",
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "unit": "short"
+    },
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "fetching now"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#3987e5"
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "fetched a minute"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#d95926"
+        }
+       }
+      ]
+     }
+    ]
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "bottom",
+     "calcs": [
+      "lastNotNull",
+      "max"
+     ],
+     "showLegend": true,
+     "sortBy": "Max",
+     "sortDesc": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "transformations": []
+  },
+  {
+   "id": 31,
+   "type": "row",
+   "title": "Net lane per shard",
+   "collapsed": false,
+   "panels": [],
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 65
+   }
+  },
+  {
+   "id": 32,
+   "type": "stat",
+   "title": "Claims running",
+   "description": "Net claims running over every shard, out of net_claims_per_shard each.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 4,
+    "x": 0,
+    "y": 66
+   },
+   "targets": [
+    {
+     "expr": "sum(atlas_stage_net_claims{host=\"$host\"}) / (max(atlas_stage_net_claims_limit{host=\"$host\"}) * count(atlas_stage_net_claims{host=\"$host\"}))",
+     "legendFormat": "__auto",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "text",
+        "value": null
+       }
+      ]
+     },
+     "unit": "percentunit"
+    },
+    "overrides": []
+   },
+   "options": {
+    "colorMode": "value",
+    "graphMode": "none",
+    "justifyMode": "auto",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "textMode": "auto"
+   },
+   "transformations": []
+  },
+  {
+   "id": 33,
+   "type": "stat",
+   "title": "Claims per shard limit",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 4,
+    "x": 4,
+    "y": 66
+   },
+   "targets": [
+    {
+     "expr": "atlas_stage_net_claims_limit{host=\"$host\"}",
+     "legendFormat": "__auto",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "text",
+        "value": null
+       }
+      ]
+     },
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "options": {
+    "colorMode": "value",
+    "graphMode": "none",
+    "justifyMode": "auto",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "textMode": "auto"
+   },
+   "transformations": []
+  },
+  {
+   "id": 34,
+   "type": "timeseries",
+   "title": "Claims per shard",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 16,
+    "x": 8,
+    "y": 66
+   },
+   "targets": [
+    {
+     "expr": "atlas_stage_net_claims{host=\"$host\"}",
+     "legendFormat": "shard {{shard}}",
+     "editorMode": "code",
+     "instant": false,
+     "range": true,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    },
+    {
+     "expr": "atlas_stage_net_claims_limit{host=\"$host\"}",
+     "legendFormat": "limit",
+     "editorMode": "code",
+     "instant": false,
+     "range": true,
+     "refId": "B",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "fillOpacity": 8,
+      "lineWidth": 1,
+      "showPoints": "never",
+      "spanNulls": false,
+      "drawStyle": "line",
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "unit": "short"
+    },
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "shard 0"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#3987e5"
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "shard 1"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#d95926"
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "shard 2"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#199e70"
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "shard 3"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#c98500"
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "shard 4"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#d55181"
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "shard 5"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#008300"
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "shard 6"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#9085e9"
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "shard 7"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#e66767"
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "limit"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#8e8d87"
+        }
+       }
+      ]
+     }
+    ]
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "bottom",
+     "calcs": [
+      "lastNotNull",
+      "max"
+     ],
+     "showLegend": true,
+     "sortBy": "Max",
+     "sortDesc": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "transformations": []
+  },
+  {
+   "id": 35,
+   "type": "timeseries",
+   "title": "Net visits a minute, per shard",
+   "description": "Releases the net lane ran a step of.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 0,
+    "y": 74
+   },
+   "targets": [
+    {
+     "expr": "rate(atlas_stage_lane_total{host=\"$host\",lane=\"net_visits\"}[5m]) * 60",
+     "legendFormat": "shard {{shard}}",
+     "editorMode": "code",
+     "instant": false,
+     "range": true,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "fillOpacity": 8,
+      "lineWidth": 1,
+      "showPoints": "never",
+      "spanNulls": false,
+      "drawStyle": "line",
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "unit": "short"
+    },
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "shard 0"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#3987e5"
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "shard 1"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#d95926"
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "shard 2"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#199e70"
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "shard 3"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#c98500"
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "shard 4"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#d55181"
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "shard 5"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#008300"
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "shard 6"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#9085e9"
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "shard 7"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#e66767"
+        }
+       }
+      ]
+     }
+    ]
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "bottom",
+     "calcs": [
+      "lastNotNull",
+      "max"
+     ],
+     "showLegend": true,
+     "sortBy": "Max",
+     "sortDesc": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "transformations": []
+  },
+  {
+   "id": 36,
+   "type": "timeseries",
+   "title": "Finished by the net lane a minute, per shard",
+   "description": "Releases the net lane left with no net step to run.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 8,
+    "y": 74
+   },
+   "targets": [
+    {
+     "expr": "rate(atlas_stage_lane_total{host=\"$host\",lane=\"net_finished\"}[5m]) * 60",
+     "legendFormat": "shard {{shard}}",
+     "editorMode": "code",
+     "instant": false,
+     "range": true,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "fillOpacity": 8,
+      "lineWidth": 1,
+      "showPoints": "never",
+      "spanNulls": false,
+      "drawStyle": "line",
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "unit": "short"
+    },
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "shard 0"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#3987e5"
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "shard 1"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#d95926"
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "shard 2"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#199e70"
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "shard 3"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#c98500"
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "shard 4"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#d55181"
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "shard 5"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#008300"
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "shard 6"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#9085e9"
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "shard 7"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#e66767"
+        }
+       }
+      ]
+     }
+    ]
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "bottom",
+     "calcs": [
+      "lastNotNull",
+      "max"
+     ],
+     "showLegend": true,
+     "sortBy": "Max",
+     "sortDesc": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "transformations": []
+  },
+  {
+   "id": 37,
+   "type": "timeseries",
+   "title": "Queue rows taken a minute, per shard",
+   "description": "The database lane.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 16,
+    "y": 74
+   },
+   "targets": [
+    {
+     "expr": "rate(atlas_stage_lane_total{host=\"$host\",lane=\"queue_taken\"}[5m]) * 60",
+     "legendFormat": "shard {{shard}}",
+     "editorMode": "code",
+     "instant": false,
+     "range": true,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "fillOpacity": 8,
+      "lineWidth": 1,
+      "showPoints": "never",
+      "spanNulls": false,
+      "drawStyle": "line",
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "unit": "short"
+    },
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "shard 0"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#3987e5"
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "shard 1"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#d95926"
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "shard 2"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#199e70"
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "shard 3"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#c98500"
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "shard 4"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#d55181"
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "shard 5"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#008300"
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "shard 6"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#9085e9"
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "shard 7"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#e66767"
+        }
+       }
+      ]
+     }
+    ]
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "bottom",
+     "calcs": [
+      "lastNotNull",
+      "max"
+     ],
+     "showLegend": true,
+     "sortBy": "Max",
+     "sortDesc": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "transformations": []
+  },
+  {
+   "id": 38,
+   "type": "row",
+   "title": "Errors",
+   "collapsed": false,
+   "panels": [],
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 82
+   }
+  },
+  {
+   "id": 39,
+   "type": "stat",
+   "title": "Step panics in range",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 6,
+    "x": 0,
+    "y": 83
+   },
+   "targets": [
+    {
+     "expr": "sum(increase(atlas_step_panics_total{host=\"$host\"}[$__range])) or vector(0)",
+     "legendFormat": "__auto",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "#0ca30c",
+        "value": null
+       },
+       {
+        "color": "#d03b3b",
+        "value": 1
+       }
+      ]
+     },
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "options": {
+    "colorMode": "background",
+    "graphMode": "none",
+    "justifyMode": "auto",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "textMode": "auto"
+   },
+   "transformations": []
+  },
+  {
+   "id": 40,
+   "type": "stat",
+   "title": "Step errors in range",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 6,
+    "x": 6,
+    "y": 83
+   },
+   "targets": [
+    {
+     "expr": "sum(increase(atlas_step_runs_total{host=\"$host\",result=~\"retry|permanent|transient\"}[$__range])) or vector(0)",
+     "legendFormat": "__auto",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "#0ca30c",
+        "value": null
+       },
+       {
+        "color": "#ec835a",
+        "value": 1
+       }
+      ]
+     },
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "options": {
+    "colorMode": "background",
+    "graphMode": "none",
+    "justifyMode": "auto",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "textMode": "auto"
+   },
+   "transformations": []
+  },
+  {
+   "id": 41,
+   "type": "stat",
+   "title": "Function errors in range",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 6,
+    "x": 12,
+    "y": 83
+   },
+   "targets": [
+    {
+     "expr": "sum(increase(atlas_function_errors_total{host=\"$host\"}[$__range])) or vector(0)",
+     "legendFormat": "__auto",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "#0ca30c",
+        "value": null
+       },
+       {
+        "color": "#ec835a",
+        "value": 1
+       }
+      ]
+     },
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "options": {
+    "colorMode": "background",
+    "graphMode": "none",
+    "justifyMode": "auto",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "textMode": "auto"
+   },
+   "transformations": []
+  },
+  {
+   "id": 42,
+   "type": "stat",
+   "title": "Indexer errors in range",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 6,
+    "x": 18,
+    "y": 83
+   },
+   "targets": [
+    {
+     "expr": "sum(increase(atlas_indexer_errors_total{host=\"$host\"}[$__range])) or vector(0)",
+     "legendFormat": "__auto",
+     "editorMode": "code",
+     "instant": true,
+     "range": false,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "#0ca30c",
+        "value": null
+       },
+       {
+        "color": "#ec835a",
+        "value": 1
+       }
+      ]
+     },
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "options": {
+    "colorMode": "background",
+    "graphMode": "none",
+    "justifyMode": "auto",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "textMode": "auto"
+   },
+   "transformations": []
+  },
+  {
+   "id": 43,
+   "type": "timeseries",
+   "title": "Step errors and panics, by step",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 0,
+    "y": 87
+   },
+   "targets": [
+    {
+     "expr": "topk(8, sum by (step) (increase(atlas_step_runs_total{host=\"$host\",result=~\"retry|permanent|transient\"}[5m])))",
+     "legendFormat": "{{step}}",
+     "editorMode": "code",
+     "instant": false,
+     "range": true,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "fillOpacity": 25,
+      "lineWidth": 1,
+      "showPoints": "never",
+      "spanNulls": false,
+      "drawStyle": "bars",
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "color": {
+      "mode": "palette-classic"
+     },
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "bottom",
+     "calcs": [
+      "lastNotNull",
+      "max"
+     ],
+     "showLegend": true,
+     "sortBy": "Max",
+     "sortDesc": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "transformations": []
+  },
+  {
+   "id": 44,
+   "type": "timeseries",
+   "title": "Step panics, by step",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 8,
+    "y": 87
+   },
+   "targets": [
+    {
+     "expr": "sum by (step) (increase(atlas_step_panics_total{host=\"$host\"}[5m]))",
+     "legendFormat": "{{step}}",
+     "editorMode": "code",
+     "instant": false,
+     "range": true,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "fillOpacity": 25,
+      "lineWidth": 1,
+      "showPoints": "never",
+      "spanNulls": false,
+      "drawStyle": "bars",
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "color": {
+      "mode": "palette-classic"
+     },
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "bottom",
+     "calcs": [
+      "lastNotNull",
+      "max"
+     ],
+     "showLegend": true,
+     "sortBy": "Max",
+     "sortDesc": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "transformations": []
+  },
+  {
+   "id": 45,
+   "type": "timeseries",
+   "title": "Function errors, the top 8",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 16,
+    "y": 87
+   },
+   "targets": [
+    {
+     "expr": "topk(8, sum by (function) (increase(atlas_function_errors_total{host=\"$host\"}[5m])))",
+     "legendFormat": "{{function}}",
+     "editorMode": "code",
+     "instant": false,
+     "range": true,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "fillOpacity": 25,
+      "lineWidth": 1,
+      "showPoints": "never",
+      "spanNulls": false,
+      "drawStyle": "bars",
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "color": {
+      "mode": "palette-classic"
+     },
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "bottom",
+     "calcs": [
+      "lastNotNull",
+      "max"
+     ],
+     "showLegend": true,
+     "sortBy": "Max",
+     "sortDesc": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "transformations": []
+  }
+ ]
+}

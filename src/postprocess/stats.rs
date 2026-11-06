@@ -76,6 +76,12 @@ impl Lanes {
         [read(&self.net_visits), read(&self.net_finished), read(&self.queue_taken), read(&self.walk_rows)]
     }
 
+    /// What each lane got through, per shard, since the stage started.
+    pub(crate) fn totals(&self) -> Value {
+        let [net_visits, net_finished, queue_taken, walk_rows] = self.now();
+        json!({"net_visits": net_visits, "net_finished": net_finished, "queue_taken": queue_taken, "walk_rows": walk_rows})
+    }
+
     /// Per minute, per shard, over the last `RATE_WINDOW` at most, for `stats.json`. Keeps a reading at most every
     /// `READING_EVERY`, soo it can be called as often as stats.json is written.
     pub(crate) fn rates(&self, at: Instant) -> Value {
@@ -151,6 +157,7 @@ impl Stats {
             "errors": n(&self.errors),
             "enabled": enabled,
             "lanes": self.lanes.rates(Instant::now()),
+            "lane_totals": self.lanes.totals(),
         })
     }
 }

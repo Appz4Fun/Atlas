@@ -666,6 +666,38 @@ pub fn group_progress(conn: &Connection) -> Result<Vec<GroupProgress>> {
     .collect()
 }
 
+/// A row's article numbers on the server, and how many of them are indexed: everything between its cursors.
+pub fn row_numbers(row: &GroupProgress) -> Option<(i64, i64)> {
+    let (first, last) = (row.first?, row.last?);
+    let total = (last - first + 1).max(0);
+    let covered = (row.live_cursor.min(last) - row.backfill_cursor.max(first - 1)).clamp(0, total);
+    Some((total, covered))
+}
+
+/// Each group's (article numbers, of them indexed, the row they come from): of its rows (one a server), the one
+/// furthest along. A split group's cursors stand still while its day chunks (`chunks`: done, all) are indexed, soo
+/// those say how far it is, as that share of its article numbers; once they are all done its home cursor sweeps on
+/// for what they missed, and the cursor says it again. Rows with no range on the server yet are left out.
+pub fn best_progress<'a>(
+    progress: &'a [GroupProgress],
+    chunks: &std::collections::BTreeMap<String, (i64, i64)>,
+) -> std::collections::BTreeMap<String, (i64, i64, &'a GroupProgress)> {
+    let mut best: std::collections::BTreeMap<String, (i64, i64, &GroupProgress)> = Default::default();
+    for row in progress {
+        let group = row.key.split('@').next().unwrap_or(&row.key);
+        let Some((total, covered)) = row_numbers(row) else { continue };
+        if best.get(group).is_none_or(|(t, c, _)| (covered, total) > (*c, *t)) {
+            best.insert(group.to_string(), (total, covered, row));
+        }
+    }
+    for (group, (total, covered, _)) in best.iter_mut() {
+        if let Some(&(done, all)) = chunks.get(group).filter(|c| c.1 > 0 && c.0 < c.1) {
+            *covered = (*total as i128 * done.clamp(0, all) as i128 / all as i128) as i64;
+        }
+    }
+    best
+}
+
 pub fn save_group_state(conn: &Connection, group: &str, state: GroupState) -> Result<()> {
     conn.execute(
         "insert into groups(name, live_cursor, backfill_cursor) values(?, ?, ?)
