@@ -225,8 +225,22 @@ impl Step for MediaParse {
             ]
         });
         let write = StepWrite { sql: UPSERT, params: Vec::new(), late_params: Some(late) };
-        Ok(Outcome { matched: true, writes: vec![write], ..Outcome::default() })
+        let mut writes = vec![write];
+        // the title a probed file's own tags name, put on the row as it's made: a release named only after its probe
+        // ran had no row for the probe to pin them on, and the probe isn't run again for a rename
+        writes.extend(crate::probe::step::title_writes(id, saved_media(ctx.conn(), id).as_ref()));
+        Ok(Outcome { matched: true, writes, ..Outcome::default() })
     }
+}
+
+/// The media facts of the release's saved probe, when it has one that decodes.
+fn saved_media(conn: &Connection, id: i64) -> Option<crate::probe::media::MediaInfo> {
+    let info: String = conn
+        .prepare_cached("select info from release_probe where release_id = ?1")
+        .ok()?
+        .query_row([id], |r| r.get(0))
+        .ok()?;
+    serde_json::from_str::<crate::probe::ProbeInfo>(&info).ok()?.media
 }
 
 /// Whether rows of this title in this shard hold IDs. The newest few are enough: a fan-out reaches them all alike.
@@ -477,5 +491,25 @@ mod tests {
         row(Kind::Tv as i64);
         run(crate::probe::step::title_writes(1, Some(&media)));
         assert_eq!(ids(), (None, None, Some(81_189)));
+    }
+
+    #[test]
+    fn the_saved_probes_tags_reach_a_row_made_later() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("create table release_probe (release_id INTEGER PRIMARY KEY, info TEXT)").unwrap();
+        assert!(saved_media(&conn, 1).is_none(), "no probe");
+        let probe = crate::probe::ProbeInfo {
+            media: Some(crate::probe::media::MediaInfo {
+                tags: [("IMDB".to_string(), "tt0133093".to_string())].into_iter().collect(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        conn.execute("insert into release_probe values (1, ?1)", [serde_json::to_string(&probe).unwrap()]).unwrap();
+        conn.execute("insert into release_probe values (2, 'not json')", []).unwrap();
+        let media = saved_media(&conn, 1).expect("the saved media");
+        assert_eq!(media.title_ids().imdb, Some(133_093));
+        assert_eq!(crate::probe::step::title_writes(1, Some(&media)).len(), 1);
+        assert!(saved_media(&conn, 2).is_none(), "a probe that doesn't decode gives nothing");
     }
 }
