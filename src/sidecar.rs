@@ -82,6 +82,73 @@ const EVICT: &str = "update sidecars set text = null where release_id in (
 /// What a release name read from a sidecar is kept to: a real one is far shorter, and these rows outlive releases
 pub const MAX_NAME: usize = 255;
 
+/// A sidecar as the page of the release it describes shows it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Found {
+    /// the sidecar post's own name, group and the file read
+    pub name: String,
+    pub group: String,
+    pub file: Option<String>,
+    pub kind: String,
+    /// how it was matched: `segment_uid` (the same MKV, exactly) or `name`
+    pub by: &'static str,
+    pub text: Option<String>,
+}
+
+/// Sidecars that describe a release: by the Segment UID its probe read, then by its names, in every shard; at most
+/// `limit`, and never the release itself. `conn` has the shards attached as `s0`..`s7`; a shard without the table yet
+/// gives none.
+pub fn describing(
+    conn: &rusqlite::Connection,
+    own: i64,
+    names: &[&str],
+    segment_uid: Option<&str>,
+    limit: usize,
+) -> Vec<Found> {
+    let mut out: Vec<Found> = Vec::new();
+    let mut seen: Vec<(usize, i64)> = Vec::new();
+    let mut look = |column: &str, value: &str, by: &'static str| {
+        for shard in 0..crate::store::SHARDS {
+            if out.len() >= limit {
+                return;
+            }
+            let sql = format!(
+                "select release_id, name, group_name, file, kind, text from s{shard}.sidecars
+                 where {column} = ?1 and release_id != ?2 order by at desc limit ?3"
+            );
+            let rows = conn.prepare(&sql).and_then(|mut stmt| {
+                stmt.query_map(rusqlite::params![value, own, limit as i64], |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        Found {
+                            name: r.get(1)?,
+                            group: r.get(2)?,
+                            file: r.get(3)?,
+                            kind: r.get(4)?,
+                            by,
+                            text: r.get(5)?,
+                        },
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()
+            });
+            for (id, found) in rows.unwrap_or_default() {
+                if out.len() < limit && !seen.contains(&(shard, id)) {
+                    seen.push((shard, id));
+                    out.push(found);
+                }
+            }
+        }
+    };
+    if let Some(uid) = segment_uid.filter(|u| !u.is_empty()) {
+        look("segment_uid", &uid.to_ascii_lowercase(), "segment_uid");
+    }
+    for name in names.iter().filter(|n| !n.is_empty()) {
+        look("release_name", name, "name");
+    }
+    out
+}
+
 /// What the shard's sidecar texts hold now. A failed read counts as nothing: the eviction is then left to the next.
 fn text_bytes(conn: &rusqlite::Connection) -> i64 {
     conn.query_row("select value from meta where key = 'sidecar_text_bytes'", [], |r| r.get(0)).unwrap_or(0)
@@ -383,6 +450,31 @@ Format                                   : Matroska
         conn.execute("update meta set value = 999 where key = 'sidecar_text_bytes'", []).unwrap();
         recount(&conn).unwrap();
         assert_eq!(total(), 8, "counted again from the rows, as after a compaction");
+    }
+
+    #[test]
+    fn a_release_finds_the_sidecars_that_describe_it_by_segment_uid_then_name() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        for shard in 0..crate::store::SHARDS {
+            conn.execute_batch(&format!("attach ':memory:' as s{shard}")).unwrap();
+        }
+        // the table as the shard has it, without its counter's triggers
+        conn.execute_batch(
+            "create table s3.sidecars (release_id INTEGER PRIMARY KEY, name TEXT NOT NULL, group_name TEXT NOT NULL,
+                file TEXT, kind TEXT NOT NULL, release_name TEXT, segment_uid TEXT, text TEXT, at INTEGER NOT NULL)",
+        )
+        .unwrap();
+        conn.execute_batch(
+            "insert into s3.sidecars values (11, 'mediainfo', 'g', 'mediainfo.txt', 'mediainfo', 'Some.Film.2024', '55f84b6aa194d59703ccab394da26cde', 'General', 1);
+             insert into s3.sidecars values (19, 'grp.nfo', 'g', 'grp.nfo', 'nfo', 'Some.Film.2024', null, 'NFO', 2);
+             insert into s3.sidecars values (27, 'other', 'g', 'x.nfo', 'nfo', 'Other.Film', null, 'x', 3);",
+        )
+        .unwrap();
+        let found = describing(&conn, 100, &["Some.Film.2024"], Some("55F84B6AA194D59703CCAB394DA26CDE"), 5);
+        let got: Vec<(&str, &str)> = found.iter().map(|f| (f.name.as_str(), f.by)).collect();
+        assert_eq!(got, [("mediainfo", "segment_uid"), ("grp.nfo", "name")], "the UID match first, and once");
+        assert!(describing(&conn, 11, &[], Some("55f84b6aa194d59703ccab394da26cde"), 5).is_empty(), "not itself");
+        assert!(describing(&conn, 100, &["No.Such.Name"], None, 5).is_empty());
     }
 
     #[test]
