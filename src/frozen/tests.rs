@@ -303,6 +303,32 @@ fn a_post_of_only_what_describes_a_release_is_a_sidecar_and_freezes() {
     assert_ne!(off.as_deref(), Some(rules::SIDECAR));
 }
 
+/// A release queued before the sidecar rule, as small and complete, takes the sidecar reason when the backlog walk gets
+/// to it: no visit may come back to a settled cover post.
+#[test]
+fn the_backlog_walk_gives_a_queued_release_the_reason_that_matches_it_now() {
+    let f = Fixture::new();
+    let mut cover = post("Some.Film.2024-GRP-cover.jpg", &["Some.Film.2024-GRP-cover.jpg"], 1, 700_000);
+    cover.articles.iter_mut().for_each(|a| a.file_total = None);
+    cover.complete = false;
+    f.save(&[cover, post("Small.Thing", &["a.rar", "b.rar"], 3, 1000)]);
+    let conn = f.writer();
+    let (cover, small) = (f.id(&conn, "Some.Film.2024-GRP-cover.jpg"), f.id(&conn, "Small.Thing"));
+    for id in [cover, small] {
+        conn.execute("insert into freeze_pending (release_id, reason, at) values (?1, 'small_complete', 7)", [id])
+            .unwrap();
+    }
+    let queued = |id: i64| -> (String, i64) {
+        conn.query_row("select reason, at from freeze_pending where release_id = ?1", [id], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap()
+    };
+    assert_eq!(rules::backlog_some(&conn, 10, Duration::from_secs(60), NOW).unwrap().queued, 1);
+    assert_eq!(queued(cover), (rules::SIDECAR.to_string(), 7), "a new name, and its place kept");
+    assert_eq!(queued(small), ("small_complete".to_string(), 7), "as it was");
+}
+
 /// A release visited again for the same reason keeps the time it was first queued; a new reason starts it over.
 #[test]
 fn a_visit_for_the_same_reason_keeps_the_queued_time() {
@@ -514,7 +540,7 @@ fn nothing_moves_while_the_disk_is_short() {
     let f = Fixture::new();
     f.save(&[post("Small", &["b.mkv"], 1, 10)]);
     let conn = f.writer();
-    conn.execute_batch("insert into freeze_pending (release_id, reason, at) select id, 'test', 1 from releases")
+    conn.execute_batch("insert into freeze_pending (release_id, reason, at) select id, 'small_complete', 1 from releases")
         .unwrap();
     let mut ticker = Ticker { disk: Some((Instant::now(), false)), ..Ticker::default() };
     assert_eq!(ticker.tick(&conn, NOW).unwrap(), Moved::default());
