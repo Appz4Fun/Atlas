@@ -704,9 +704,10 @@ def progress():
     b.stat("Articles behind", f"sum({behind})", w=4,
            description="New articles on the servers that the live cursors have not reached, as of each group's last pass.")
     b.stat("Groups behind", f"count({behind} > 0) or vector(0)", w=4)
-    b.stat("Groups not indexed in 30 min", f"count(time() - atlas_group_last_indexed_timestamp_seconds{{{g}}} > 1800) or vector(0)", w=4,
+    b.stat("Groups not moved in 30 min", f'count(changes(atlas_group_article_number{{mark="live_cursor",{g}}}[30m]) == 0) or vector(0)', w=4,
            thresholds=[{"color": GOOD, "value": None}, {"color": WARNING, "value": 1}, {"color": CRITICAL, "value": 20}],
-           description="Quiet groups land here too: nothing new to index looks the same as not indexing.")
+           description="Groups whose live cursor has not moved in 30 minutes, from the database, so a restart does not hide them. "
+                       "Quiet groups land here too: nothing new to index looks the same as not indexing.")
     b.stat("Newest post, middle group", f"quantile(0.5, {since_newest})", "s", w=4, thresholds=lag_steps,
            description="Age of the newest indexed post in the middle group: the lag behind Usenet in time.")
     b.stat("Caught up", "atlas_indexer_idle", w=4,
@@ -748,7 +749,7 @@ def progress():
             colors={"fetching now": SERIES[0], "fetched a minute": SERIES[1]})
 
     b.row("Net lane per shard")
-    b.stat("Claims running", "sum(atlas_stage_net_claims) / (atlas_stage_net_claims_limit * count(atlas_stage_net_claims))", "percentunit", w=4,
+    b.stat("Claims running", "sum(atlas_stage_net_claims) / (max(atlas_stage_net_claims_limit) * count(atlas_stage_net_claims))", "percentunit", w=4,
            description="Net claims running over every shard, out of net_claims_per_shard each.")
     b.stat("Claims per shard limit", "atlas_stage_net_claims_limit", w=4)
     b.graph("Claims per shard", [q("atlas_stage_net_claims", "shard {{shard}}"), q("atlas_stage_net_claims_limit", "limit")], w=16, h=8,

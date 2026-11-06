@@ -1205,7 +1205,7 @@
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
       },
-      "description": "Quiet groups land here too: nothing new to index looks the same as not indexing.",
+      "description": "Groups whose live cursor has not moved in 30 minutes, from the database, so a restart does not hide them. Quiet groups land here too: nothing new to index looks the same as not indexing.",
       "fieldConfig": {
         "defaults": {
           "thresholds": {
@@ -1256,14 +1256,14 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "count(time() - atlas_group_last_indexed_timestamp_seconds{host=\"$host\",group=~\"$group\"} > 1800) or vector(0)",
+          "expr": "count(changes(atlas_group_article_number{host=\"$host\",mark=\"live_cursor\",group=~\"$group\"}[30m]) == 0) or vector(0)",
           "instant": true,
           "legendFormat": "__auto",
           "range": false,
           "refId": "A"
         }
       ],
-      "title": "Groups not indexed in 30 min",
+      "title": "Groups not moved in 30 min",
       "transformations": [],
       "type": "stat"
     },
@@ -2630,7 +2630,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "sum(atlas_stage_net_claims{host=\"$host\"}) / (atlas_stage_net_claims_limit{host=\"$host\"} * count(atlas_stage_net_claims{host=\"$host\"}))",
+          "expr": "sum(atlas_stage_net_claims{host=\"$host\"}) / (max(atlas_stage_net_claims_limit{host=\"$host\"}) * count(atlas_stage_net_claims{host=\"$host\"}))",
           "instant": true,
           "legendFormat": "__auto",
           "range": false,
