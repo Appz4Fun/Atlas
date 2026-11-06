@@ -1078,11 +1078,13 @@ pub fn movie_tv_whole_again(conn: &Connection) -> Result<Vec<i64>> {
 }
 
 /// Marks the releases `movie_tv_whole_again` finds complete, once (see `postprocess::engine::seed_shard`).
-pub fn recheck_movie_tv_complete(conn: &Connection) -> Result<usize> {
+pub fn recheck_movie_tv_complete(conn: &Connection) -> Result<Vec<i64>> {
     let mut update = conn.prepare_cached("update releases set complete = 1 where id = ?1 and complete = 0")?;
-    let mut fixed = 0;
+    let mut fixed = Vec::new();
     for id in movie_tv_whole_again(conn)? {
-        fixed += update.execute([id])?;
+        if update.execute([id])? > 0 {
+            fixed.push(id);
+        }
     }
     Ok(fixed)
 }
@@ -4752,9 +4754,26 @@ mod tests {
         conn.execute("insert into release_category (release_id, category) values (?1, 7020)", [id("Lecture.2020.mkv")])
             .unwrap();
         assert_eq!(movie_tv_whole_again(&conn).unwrap(), vec![id(episode)]);
-        assert_eq!(recheck_movie_tv_complete(&conn).unwrap(), 1);
+        assert_eq!(recheck_movie_tv_complete(&conn).unwrap(), vec![id(episode)]);
         assert_eq!(complete_of(&conn, episode), 1);
         assert_eq!(complete_of(&conn, "Lecture.2020.mkv"), 0, "not a movie or TV: left to its next save");
         assert!(movie_tv_whole_again(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_seed_queues_what_the_recheck_made_complete() {
+        let (_dir, main, conn) = fresh_shard_db();
+        let episode = "Show.S01E05.720p.HDTV.x264-G.mkv";
+        save(&main, &[counted(episode, episode, 5, 24, 2)]).unwrap();
+        let id: i64 = conn.query_row("select id from releases where name = ?", [episode], |r| r.get(0)).unwrap();
+        // saved before, and visited then: complete = 0, no queue row
+        conn.execute("update releases set complete = 0", []).unwrap();
+        conn.execute("delete from pp_queue", []).unwrap();
+        conn.execute("delete from meta where key = 'pp_complete_by_files'", []).unwrap();
+        conn.execute("insert into release_category (release_id, category) values (?1, 5040)", [id]).unwrap();
+        crate::postprocess::engine::seed_shard(&conn, 0, &[], 1_000).unwrap();
+        assert_eq!(complete_of(&conn, episode), 1);
+        let due: i64 = conn.query_row("select due_at from pp_queue where release_id = ?", [id], |r| r.get(0)).unwrap();
+        assert_eq!(due, 1_000, "its gated body steps are looked at again");
     }
 }

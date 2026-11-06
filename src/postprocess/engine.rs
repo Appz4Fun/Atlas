@@ -1183,7 +1183,7 @@ fn apply_name(release: &mut ReleaseInfo, name: &NameChange) {
 }
 
 /// One shard's note of which steps are on, see `Inner::seed`. In the writer's transaction.
-fn seed_shard(conn: &Connection, enabled: StepMask, stamps: &[(u8, StepMask, i64)], now: i64) -> rusqlite::Result<()> {
+pub(crate) fn seed_shard(conn: &Connection, enabled: StepMask, stamps: &[(u8, StepMask, i64)], now: i64) -> rusqlite::Result<()> {
     let meta = |key: &str| -> rusqlite::Result<Option<i64>> {
         conn.prepare_cached("select value from meta where key = ?")?.query_row([key], |r| r.get(0)).optional()
     };
@@ -1296,7 +1296,15 @@ fn seed_shard(conn: &Connection, enabled: StepMask, stamps: &[(u8, StepMask, i64
     // once, for the movies and TV saved incomplete before a whole video named as its release, or a PAR2 set naming
     // only files there, counted over the subject counter (`store::release_complete`)
     if meta("pp_complete_by_files")?.is_none() {
-        crate::store::recheck_movie_tv_complete(conn)?;
+        // through the queue: a row visited before, when its body steps waited on completeness (`BodyGate::NotYet`),
+        // has no queue row left to bring it back
+        let fixed = crate::store::recheck_movie_tv_complete(conn)?;
+        let mut queue = conn.prepare_cached(
+            "insert into pp_queue (release_id, due_at) values (?1, ?2) on conflict(release_id) do update set due_at = ?2",
+        )?;
+        for id in fixed {
+            queue.execute(params![id, now])?;
+        }
         set("pp_complete_by_files", now)?;
     }
     let seen = meta("pp_steps_seen")?.unwrap_or(0);
