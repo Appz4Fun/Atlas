@@ -78,6 +78,9 @@ pub fn get(path: &str, query: &str, cookies: Option<&str>, base: &str, api_key: 
         "/ui/results" => ApiResponse { headers: vec![("HX-Redirect".into(), "/".into())], ..html(401, String::new()) },
         "/ui/release" if signed_in => release_page(&args),
         "/ui/duplicates" if signed_in => duplicates_page(&args),
+        "/ui/stats" if signed_in => crate::web_stats::page(),
+        "/ui/stats/live" if signed_in => crate::web_stats::live(),
+        "/ui/stats/stored" if signed_in => crate::web_stats::stored_fragment(),
         "/ui/details" if signed_in => details_panel(&args),
         "/ui/pending" if signed_in => crate::web_pending::fragment(&args),
         "/ui/poster" if signed_in => poster(&args),
@@ -91,8 +94,10 @@ pub fn get(path: &str, query: &str, cookies: Option<&str>, base: &str, api_key: 
         "/ui/nzb" if signed_in && args.get("fill").is_some_and(|v| v == "1") => filled_nzb(&args),
         "/ui/nzb" if signed_in => get_nzb(&args),
         "/ui/details" | "/ui/pending" | "/ui/poster" | "/ui/cover" | "/ui/still" | "/ui/samefilm" | "/ui/meta"
-        | "/ui/row" => ApiResponse { headers: vec![("HX-Redirect".into(), "/".into())], ..html(401, String::new()) },
-        "/ui/nzb" | "/ui/release" | "/ui/duplicates" | "/ui/same" | "/ui/settings" => redirect(Vec::new()),
+        | "/ui/row" | "/ui/stats/live" | "/ui/stats/stored" => ApiResponse { headers: vec![("HX-Redirect".into(), "/".into())], ..html(401, String::new()) },
+        "/ui/nzb" | "/ui/release" | "/ui/duplicates" | "/ui/stats" | "/ui/same" | "/ui/settings" => {
+            redirect(Vec::new())
+        }
         _ => return None,
     })
 }
@@ -1859,7 +1864,7 @@ fn table(search: &Search, rows: &str) -> String {
 }
 
 /// A compiler-style callout, the way Oxide writes them.
-fn diag(level: &str, title: &str, body: &str) -> String {
+pub(crate) fn diag(level: &str, title: &str, body: &str) -> String {
     format!(
         "<div class=\"diag diag-{level}\" role=\"alert\"><p class=\"diag-head\"><span class=\"diag-level\">{level}:</span> {}</p><div class=\"diag-body\"><p>{}</p></div></div>",
         escape(title),
@@ -2088,7 +2093,7 @@ fn site_footer() -> String {
     )
 }
 
-fn page(title: &str, content: &str) -> String {
+pub(crate) fn page(title: &str, content: &str) -> String {
     format!(
         "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><meta name=\"color-scheme\" content=\"light dark\"><meta name=\"htmx-config\" content=\"{}\"><title>{}</title><link rel=\"icon\" href=\"/static/atlas.svg?v={v}\" type=\"image/svg+xml\"><link rel=\"stylesheet\" href=\"/static/atlas.css?v={v}\"><script src=\"/static/atlas.js?v={v}\"></script><script src=\"/static/htmx.min.js?v={v}\"></script></head><body>{content}{}</body></html>",
         attr(HTMX_CONFIG),
@@ -2098,9 +2103,9 @@ fn page(title: &str, content: &str) -> String {
     )
 }
 
-fn masthead(signed_in: bool) -> String {
+pub(crate) fn masthead(signed_in: bool) -> String {
     let tools = if signed_in {
-        "<a class=\"button\" href=\"/ui/duplicates\">Duplicates</a><a class=\"button\" href=\"/ui/settings\">Settings</a><form method=\"post\" action=\"/logout\"><button class=\"button\">Sign out</button></form>"
+        "<a class=\"button\" href=\"/ui/stats\">Stats</a><a class=\"button\" href=\"/ui/duplicates\">Duplicates</a><a class=\"button\" href=\"/ui/settings\">Settings</a><form method=\"post\" action=\"/logout\"><button class=\"button\">Sign out</button></form>"
     } else {
         ""
     };
@@ -2233,6 +2238,7 @@ fn frozen_page(id: i64) -> ApiResponse {
     let r = &hit.row;
     let why = match hit.reason.as_str() {
         crate::frozen::rules::SMALL_COMPLETE => "complete and under the small rule's size",
+        crate::frozen::rules::SIDECAR => "only an NFO, mediainfo or other text that describes a release",
         "not_tv_movies" => "outside Movies, TV and Other",
         _ => "by hand",
     };

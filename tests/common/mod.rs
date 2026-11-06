@@ -38,6 +38,9 @@ pub struct Server {
     /// BODY answers "430 Failed forwarding.", like a reseller whose backend didnt answer
     pub forwarding_fails: bool,
     pub xover_delay: Duration,
+    /// an XOVER over more than this many numbers waits this long before answering, like a server that scans the
+    /// whole range first
+    pub slow_over: Option<(u64, Duration)>,
     /// answer XFEATURE COMPRESS GZIP and send zlib compressed XOVER
     pub compress: bool,
     /// says yes to compression but sends junk
@@ -111,6 +114,7 @@ impl Server {
             body_trouble: false,
             forwarding_fails: false,
             xover_delay: Duration::ZERO,
+            slow_over: None,
             compress: false,
             compress_broken: false,
             compress_broken_at: None,
@@ -309,6 +313,11 @@ pub fn serve(stream: TcpStream, state: &Server, over_limit: bool) {
                     let mut at = state.stall_at.lock().unwrap();
                     *at == Some(a) && at.take().is_some()
                 };
+                if let Some((wider, wait)) = state.slow_over
+                    && b - a + 1 > wider
+                {
+                    thread::sleep(wait);
+                }
                 if stall_here {
                     state.stalled.fetch_add(1, Ordering::SeqCst);
                     thread::sleep(state.stall);

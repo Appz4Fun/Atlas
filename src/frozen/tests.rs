@@ -248,6 +248,54 @@ fn whatever_is_not_movies_tv_or_other_freezes_complete_or_not() {
 }
 
 #[test]
+fn a_post_of_only_what_describes_a_release_is_a_sidecar_and_freezes() {
+    let f = Fixture::new();
+    // no `[n/N]` on these subjects: as the owner's one-file NFO and mediainfo posts are
+    let loose = |name: &str, files: &[&str], bytes: i64| {
+        let mut p = post(name, files, 1, bytes);
+        p.articles.iter_mut().for_each(|a| a.file_total = None);
+        p.complete = false;
+        p
+    };
+    f.save(&[
+        loose("Some.Movie.2024.1080p.BluRay.x264-GRP", &["grp.nfo"], 6_000),
+        loose("ptbm-tourist.trap.1979.mediainfo", &["mediainfo.txt"], 4_000),
+        post("Two.Sidecars.2024-GRP", &["grp.nfo", "grp.sfv"], 1, 2_000),
+        // the first file of an upload whose subjects say 45 more are coming
+        post("First.Of.Many.2024-GRP", &["first.nfo", "a.rar", "b.rar"], 1, 2_000),
+        loose("With.Video.2024-GRP", &["x.nfo", "x.mkv"], 2_000),
+        loose("Too.Big.Text", &["huge.txt"], 5 << 20),
+    ]);
+    let conn = f.writer();
+    let id = |n: &str| f.id(&conn, n);
+    // the upload's rows: one NFO here, its counter saying three files
+    conn.execute("delete from files where release_id = ?1 and filename != 'first.nfo'", [id("First.Of.Many.2024-GRP")])
+        .unwrap();
+    conn.execute("update releases set file_total = 3 where id = ?1", [id("First.Of.Many.2024-GRP")]).unwrap();
+    // a category doesn't save a sidecar from it
+    conn.execute(
+        "insert into release_category (release_id, category) values (?1, 2040)",
+        [id("Some.Movie.2024.1080p.BluRay.x264-GRP")],
+    )
+    .unwrap();
+    let reason = |n: &str| -> Option<String> {
+        rules::evaluate(&conn, id(n), NOW).unwrap();
+        conn.query_row("select reason from freeze_pending where release_id = ?1", [id(n)], |r| r.get(0)).ok()
+    };
+    for n in ["Some.Movie.2024.1080p.BluRay.x264-GRP", "ptbm-tourist.trap.1979.mediainfo", "Two.Sidecars.2024-GRP"] {
+        assert_eq!(reason(n).as_deref(), Some(rules::SIDECAR), "{n}");
+    }
+    assert_ne!(reason("First.Of.Many.2024-GRP").as_deref(), Some(rules::SIDECAR), "more of the post is coming");
+    assert_ne!(reason("With.Video.2024-GRP").as_deref(), Some(rules::SIDECAR), "it carries data");
+    assert_ne!(reason("Too.Big.Text").as_deref(), Some(rules::SIDECAR), "past the sidecar size");
+    // off, none of them is a sidecar any more
+    SIDECAR.store(false, Relaxed);
+    let off = reason("ptbm-tourist.trap.1979.mediainfo");
+    SIDECAR.store(true, Relaxed);
+    assert_ne!(off.as_deref(), Some(rules::SIDECAR));
+}
+
+#[test]
 fn a_database_lane_visit_queues_a_release_for_freezing() {
     let f = Fixture::new();
     f.save(&[post("Small", &["b.mkv"], 1, 10)]);

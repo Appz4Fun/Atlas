@@ -1188,7 +1188,7 @@ fn apply_name(release: &mut ReleaseInfo, name: &NameChange) {
 }
 
 /// One shard's note of which steps are on, see `Inner::seed`. In the writer's transaction.
-fn seed_shard(conn: &Connection, enabled: StepMask, stamps: &[(u8, StepMask, i64)], now: i64) -> rusqlite::Result<()> {
+pub(crate) fn seed_shard(conn: &Connection, enabled: StepMask, stamps: &[(u8, StepMask, i64)], now: i64) -> rusqlite::Result<()> {
     let meta = |key: &str| -> rusqlite::Result<Option<i64>> {
         conn.prepare_cached("select value from meta where key = ?")?.query_row([key], |r| r.get(0)).optional()
     };
@@ -1302,6 +1302,20 @@ fn seed_shard(conn: &Connection, enabled: StepMask, stamps: &[(u8, StepMask, i64
     if meta("pp_probe_encrypted_pw")?.is_none() {
         crate::probe::step::rerun_encrypted_with_password(conn, now)?;
         set("pp_probe_encrypted_pw", now)?;
+    }
+    // once, for the movies and TV saved incomplete before a whole video named as its release, or a PAR2 set naming
+    // only files there, counted over the subject counter (`store::release_complete`)
+    if meta("pp_complete_by_files")?.is_none() {
+        // through the queue: a row visited before, when its body steps waited on completeness (`BodyGate::NotYet`),
+        // has no queue row left to bring it back
+        let fixed = crate::store::recheck_movie_tv_complete(conn)?;
+        let mut queue = conn.prepare_cached(
+            "insert into pp_queue (release_id, due_at) values (?1, ?2) on conflict(release_id) do update set due_at = ?2",
+        )?;
+        for id in fixed {
+            queue.execute(params![id, now])?;
+        }
+        set("pp_complete_by_files", now)?;
     }
     // once, for the movie and TV probes from before the probe kept the server's body CRC: a HEAD each. The step
     // does nothing for a release it wasn't asked about, soo it is marked seen here and starts no walk of every row

@@ -979,7 +979,114 @@ fn release_complete(conn: &Connection, release_id: i64, file_total: Option<i64>)
         }
     }
     let wanted = file_total.map(|ft| ft + i64::from(zero_indexed));
-    Ok(files > 0 && wanted.is_none_or(|w| files == w))
+    if files == 0 {
+        return Ok(false);
+    }
+    if wanted.is_none_or(|w| files == w) {
+        return Ok(true);
+    }
+    // every file it has is whole, but the counter says another number of files
+    Ok(own_whole_video(conn, release_id, files)? || vouched_by_set(conn, release_id)?)
+}
+
+/// The complete PAR2 sets read for release `?1` (`archive::store::par2_inventory`) name only files it has, and name
+/// every file of it but the PAR2 volumes and the small side files a set leaves out (`.nfo`, `.sfv`, ...). The sets
+/// hash every file of the upload, soo with all of them there and whole the release is too, whatever the subject
+/// counter says: an uploader's counter can count a file never posted (134 of "135"), or files another row got. A
+/// data file no set names may belong to a set whose volumes never came, so it says nothing.
+macro_rules! set_vouches_sql {
+    () => {
+        "exists (select 1 from par2_files where release_id = ?1 and complete = 1)
+         and not exists (select 1 from par2_files p where p.release_id = ?1 and p.complete = 1
+             and not exists (select 1 from files f where f.release_id = ?1 and f.filename = p.name))
+         and not exists (select 1 from files f where f.release_id = ?1
+             and lower(f.filename) not like '%.par2' and lower(f.filename) not like '%.nfo'
+             and lower(f.filename) not like '%.sfv' and lower(f.filename) not like '%.srr'
+             and lower(f.filename) not like '%.srs' and lower(f.filename) not like '%.txt'
+             and lower(f.filename) not like '%.jpg' and lower(f.filename) not like '%.png'
+             and lower(f.filename) not like '%.md5'
+             and not exists (select 1 from par2_files p where p.release_id = ?1 and p.complete = 1
+                 and p.name = f.filename))"
+    };
+}
+
+/// Sets release `?1` complete when every file it has is whole and its PAR2 set vouches for them (`set_vouches_sql`):
+/// the write a PAR2 step ends with, since the set is read after the articles were saved.
+pub const SET_VOUCHED_COMPLETE: &str = concat!(
+    "update releases set complete = 1 where id = ?1 and complete = 0
+     and exists (select 1 from files where release_id = ?1)
+     and not exists (select 1 from files where release_id = ?1 and not atlas_file_whole(seen, expected))
+     and ",
+    set_vouches_sql!()
+);
+
+/// Whether a complete PAR2 set of this release names only files it has (`set_vouches_sql`).
+fn vouched_by_set(conn: &Connection, release_id: i64) -> Result<bool> {
+    // a shard the postprocess tables weren't made in yet has no sets
+    let has_sets =
+        conn.prepare_cached("select 1 from sqlite_master where type = 'table' and name = 'par2_files'")?.exists([])?;
+    if !has_sets {
+        return Ok(false);
+    }
+    conn.prepare_cached(concat!("select ", set_vouches_sql!()))?.query_row([release_id], |r| r.get(0))
+}
+
+/// The extensions of a video that plays on its own.
+const VIDEO_EXTENSIONS: &[&str] =
+    &[".mkv", ".mp4", ".m4v", ".avi", ".ts", ".m2ts", ".wmv", ".mov", ".mpg", ".mpeg", ".webm"];
+
+/// Whether the one file `files` counts is a whole video the release is named after (`name` is the file's name, with
+/// or without its extension). A season posted under one counter is a row per episode, each "1 of 24 files", and
+/// each a whole episode. Not a part of a video cut in pieces (`CD1`, `Part 2`, `Disc 1`): that needs the others; nor
+/// a sample, which is whole but not what was posted.
+fn own_whole_video(conn: &Connection, release_id: i64, files: i64) -> Result<bool> {
+    static PIECE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        #[allow(clippy::unwrap_used)]
+        regex::Regex::new(r"(?i)(?:^|[^a-z0-9])(cd|dis[ck]|part|pt)[ ._-]?\d|sample").unwrap()
+    });
+    if files != 1 {
+        return Ok(false);
+    }
+    let found: Option<(Option<String>, String)> = conn
+        .prepare_cached("select r.name, f.filename from releases r join files f on f.release_id = r.id where r.id = ?")?
+        .query_row([release_id], |r| Ok((r.get(0)?, r.get(1)?)))
+        .optional()?;
+    let Some((Some(name), file)) = found else { return Ok(false) };
+    let (name, file) = (name.trim().to_lowercase(), file.trim().to_lowercase());
+    let Some(stem) = VIDEO_EXTENSIONS.iter().find_map(|ext| file.strip_suffix(ext)) else { return Ok(false) };
+    Ok(!stem.is_empty() && (name == file || name == stem) && !PIECE.is_match(&file))
+}
+
+/// The incomplete movie and TV releases that are whole after all (`release_complete`): the rows saved before a
+/// whole video named as its release, or a PAR2 set's say, counted over the subject counter. Through the category
+/// index: a shard has ~100,000 such rows among millions.
+pub fn movie_tv_whole_again(conn: &Connection) -> Result<Vec<i64>> {
+    let candidates: Vec<(i64, Option<i64>)> = conn
+        .prepare(
+            "select r.id, r.file_total from release_category c join releases r on r.id = c.release_id
+             where (c.category between 2000 and 2999 or c.category between 5000 and 5999) and r.complete = 0",
+        )?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<Result<_>>()?;
+    let mut whole = Vec::new();
+    for (id, file_total) in candidates {
+        if release_complete(conn, id, file_total)? {
+            whole.push(id);
+        }
+    }
+    Ok(whole)
+}
+
+/// Marks the releases `movie_tv_whole_again` finds complete, once (see `postprocess::engine::seed_shard`).
+pub fn recheck_movie_tv_complete(conn: &Connection) -> Result<Vec<i64>> {
+    let mut update = conn.prepare_cached("update releases set complete = 1 where id = ?1 and complete = 0")?;
+    let mut fixed = Vec::new();
+    for id in movie_tv_whole_again(conn)? {
+        if update.execute([id])? > 0 {
+            fixed.push(id);
+        }
+    }
+    Ok(fixed)
 }
 
 /// Marks `complete = 1` on existing 0-indexed `[00/N]`..`[N/N]` releases whose `N + 1` files are all complete.
@@ -4497,5 +4604,176 @@ mod tests {
         assert_eq!(repair_zero_indexed_complete(&conn).unwrap(), 1);
         let complete: i64 = conn.query_row("select complete from releases", [], |row| row.get(0)).unwrap();
         assert_eq!(complete, 1);
+    }
+
+    /// a file `[index/total]` of `name`, whole, in `parts` articles
+    fn counted(name: &str, file: &str, index: i64, total: i64, parts: i64) -> Release {
+        let mut r = in_collection(name, name, file, &format!("<{file}1@x>"), "p");
+        r.articles = (1..=parts)
+            .map(|part| Article {
+                message_id: format!("<{file}{part}@x>"),
+                author: "p".into(),
+                subject: format!("[{index:02}/{total:02}] - \"{file}\" yEnc ({part}/{parts})"),
+                filename: Some(file.into()),
+                release_name: Some(file.into()),
+                part: Some(part),
+                total_parts: Some(parts),
+                file_total: Some(total),
+                bytes: 10,
+                ..Default::default()
+            })
+            .collect();
+        r
+    }
+
+    fn complete_of(conn: &Connection, name: &str) -> i64 {
+        conn.query_row("select complete from releases where name = ?", [name], |r| r.get(0))
+            .unwrap_or_else(|_| panic!("{name} not among {:?}", rows_of(conn)))
+    }
+
+    #[test]
+    fn a_whole_video_named_as_its_release_is_complete_whatever_the_counter_says() {
+        let (_dir, main, conn) = fresh_shard_db();
+        // a season under one counter: each episode is a row of its own, "1 of 24 files"
+        let episode = "Show.S01E03.1080p.BluRay.x264-G.mkv";
+        save(&main, &[counted(episode, episode, 3, 24, 2)]).unwrap();
+        assert_eq!(complete_of(&conn, episode), 1);
+        // named without its extension
+        save(&main, &[counted("Film.2020.1080p.WEB-DL-G", "Film.2020.1080p.WEB-DL-G.mp4", 1, 2, 2)]).unwrap();
+        assert_eq!(complete_of(&conn, "Film.2020.1080p.WEB-DL-G"), 1);
+        // a piece of a video, a sample, a file of another name, an archive, one missing a part: not
+        for (name, file) in [
+            ("Film.1999.CD1.avi", "Film.1999.CD1.avi"),
+            ("Film.1999.Disc.2.mkv", "Film.1999.Disc.2.mkv"),
+            ("Film_1999_CD1.avi", "Film_1999_CD1.avi"),
+            ("Film_1999_Part_1.mkv", "Film_1999_Part_1.mkv"),
+            ("grp-film-sample.mkv", "grp-film-sample.mkv"),
+            ("Film.1999.DVDRip", "abc.mkv"),
+            ("Film.1999.part01.rar", "Film.1999.part01.rar"),
+        ] {
+            save(&main, &[counted(name, file, 1, 3, 2)]).unwrap();
+            assert_eq!(complete_of(&conn, name), 0, "{name}");
+        }
+        let mut short = counted("Other.S01E01.mkv", "Other.S01E01.mkv", 1, 24, 3);
+        short.articles.remove(1);
+        save(&main, &[short]).unwrap();
+        assert_eq!(complete_of(&conn, "Other.S01E01.mkv"), 0, "a part missing");
+        // two files of a counter of 24 are still counted as before
+        let mut two = counted("Pack.S01", "Pack.S01E01.mkv", 1, 24, 1);
+        two.articles.extend(counted("Pack.S01", "Pack.S01E02.mkv", 2, 24, 1).articles);
+        save(&main, &[two]).unwrap();
+        assert_eq!(complete_of(&conn, "Pack.S01"), 0);
+    }
+
+    /// release `name`'s PAR2 set, as the PAR2 step keeps it, naming `files`
+    fn set_of(conn: &Connection, name: &str, files: &[&str], complete: bool) -> i64 {
+        let id: i64 = conn.query_row("select id from releases where name = ?", [name], |r| r.get(0)).unwrap();
+        let inventory = crate::par2::Inventory {
+            files: files
+                .iter()
+                .enumerate()
+                .map(|(i, f)| crate::par2::Par2File {
+                    set_id: [1; 16],
+                    file_id: [i as u8; 16],
+                    md5: [0; 16],
+                    md5_16k: [0; 16],
+                    size: 10,
+                    name: (*f).into(),
+                    bound: true,
+                    crc32: None,
+                })
+                .collect(),
+            complete,
+            ..Default::default()
+        };
+        for w in crate::archive::store::par2_file_writes(id, &inventory) {
+            conn.execute(w.sql, rusqlite::params_from_iter(w.params)).unwrap();
+        }
+        id
+    }
+
+    #[test]
+    fn a_whole_par2_set_naming_only_files_there_says_the_release_is_complete() {
+        let (_dir, main, conn) = fresh_shard_db();
+        // the counter counts a file never posted: 3 of "4"
+        let name = "Show.S02E06.1080p.BluRay.REMUX-G";
+        let mut r = counted(name, "a.part1.rar", 1, 4, 2);
+        r.articles.extend(counted(name, "a.part2.rar", 2, 4, 2).articles);
+        r.articles.extend(counted(name, "a.par2", 3, 4, 1).articles);
+        save(&main, &[r]).unwrap();
+        assert_eq!(complete_of(&conn, name), 0);
+        // a set read in part says nothing
+        set_of(&conn, name, &["a.part1.rar", "a.part2.rar"], false);
+        assert_eq!(complete_of(&conn, name), 0);
+        // nor one naming a file the release hasn't
+        set_of(&conn, name, &["a.part1.rar", "a.part2.rar", "a.part3.rar"], true);
+        assert_eq!(complete_of(&conn, name), 0);
+        set_of(&conn, name, &["a.part1.rar", "a.part2.rar"], true);
+        assert_eq!(complete_of(&conn, name), 1, "the step's write marks it");
+        // a save after the set was read works it out the same way
+        let later = "Show.S02E07.1080p.BluRay.REMUX-G";
+        let mut r = counted(later, "c.part1.rar", 1, 4, 2);
+        r.articles.extend(counted(later, "c.par2", 3, 4, 1).articles);
+        save(&main, &[r]).unwrap();
+        set_of(&conn, later, &["c.part1.rar", "c.part2.rar"], true);
+        assert_eq!(complete_of(&conn, later), 0, "c.part2.rar isn't there yet");
+        save(&main, &[counted(later, "c.part2.rar", 2, 4, 2)]).unwrap();
+        assert_eq!(complete_of(&conn, later), 1);
+        // a part missing from a file the set names: not
+        let other = "Film.2001.DVDR-G";
+        let mut r = counted(other, "b.part1.rar", 1, 3, 3);
+        r.articles.remove(2);
+        r.articles.extend(counted(other, "b.par2", 2, 3, 1).articles);
+        save(&main, &[r]).unwrap();
+        set_of(&conn, other, &["b.part1.rar"], true);
+        assert_eq!(complete_of(&conn, other), 0);
+        // a data file no set names may be another set's, whose volumes never came: not; a side file it leaves out
+        // says nothing either way
+        let two_sets = "Film.2002.DVDR-G";
+        let mut r = counted(two_sets, "f.nfo", 1, 4, 1);
+        r.articles.extend(counted(two_sets, "f.part01.rar", 2, 4, 1).articles);
+        r.articles.extend(counted(two_sets, "f.par2", 3, 4, 1).articles);
+        save(&main, &[r]).unwrap();
+        set_of(&conn, two_sets, &["f.nfo"], true);
+        assert_eq!(complete_of(&conn, two_sets), 0, "f.part01.rar is in no set");
+        set_of(&conn, two_sets, &["f.part01.rar"], true);
+        assert_eq!(complete_of(&conn, two_sets), 1, "f.nfo is a side file");
+    }
+
+    #[test]
+    fn movies_and_tv_saved_before_are_worked_out_again_once() {
+        let (_dir, main, conn) = fresh_shard_db();
+        let episode = "Show.S01E04.720p.HDTV.x264-G.mkv";
+        save(&main, &[counted(episode, episode, 4, 24, 2)]).unwrap();
+        save(&main, &[counted("Lecture.2020.mkv", "Lecture.2020.mkv", 1, 3, 2)]).unwrap();
+        conn.execute("update releases set complete = 0", []).unwrap();
+        let id = |name: &str| -> i64 {
+            conn.query_row("select id from releases where name = ?", [name], |r| r.get(0)).unwrap()
+        };
+        conn.execute("insert into release_category (release_id, category) values (?1, 5040)", [id(episode)]).unwrap();
+        conn.execute("insert into release_category (release_id, category) values (?1, 7020)", [id("Lecture.2020.mkv")])
+            .unwrap();
+        assert_eq!(movie_tv_whole_again(&conn).unwrap(), vec![id(episode)]);
+        assert_eq!(recheck_movie_tv_complete(&conn).unwrap(), vec![id(episode)]);
+        assert_eq!(complete_of(&conn, episode), 1);
+        assert_eq!(complete_of(&conn, "Lecture.2020.mkv"), 0, "not a movie or TV: left to its next save");
+        assert!(movie_tv_whole_again(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_seed_queues_what_the_recheck_made_complete() {
+        let (_dir, main, conn) = fresh_shard_db();
+        let episode = "Show.S01E05.720p.HDTV.x264-G.mkv";
+        save(&main, &[counted(episode, episode, 5, 24, 2)]).unwrap();
+        let id: i64 = conn.query_row("select id from releases where name = ?", [episode], |r| r.get(0)).unwrap();
+        // saved before, and visited then: complete = 0, no queue row
+        conn.execute("update releases set complete = 0", []).unwrap();
+        conn.execute("delete from pp_queue", []).unwrap();
+        conn.execute("delete from meta where key = 'pp_complete_by_files'", []).unwrap();
+        conn.execute("insert into release_category (release_id, category) values (?1, 5040)", [id]).unwrap();
+        crate::postprocess::engine::seed_shard(&conn, 0, &[], 1_000).unwrap();
+        assert_eq!(complete_of(&conn, episode), 1);
+        let due: i64 = conn.query_row("select due_at from pp_queue where release_id = ?", [id], |r| r.get(0)).unwrap();
+        assert_eq!(due, 1_000, "its gated body steps are looked at again");
     }
 }
