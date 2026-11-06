@@ -67,9 +67,9 @@ pub static BACKLOG_PER_TICK: AtomicI64 = AtomicI64::new(2_000);
 pub static TICK_MS: AtomicI64 = AtomicI64::new(50);
 /// `[freeze] min_free_gb`, in bytes: below this much free disk nothing is moved
 pub static MIN_FREE_BYTES: AtomicI64 = AtomicI64::new(100 << 30);
-/// `[freeze] wait_hours`, in seconds: how long a release waits queued, untouched, before it moves. Every visit that
-/// still finds it matching queues it afresh, soo it moves once its steps are done and late articles and PreDB titles
-/// have had their time.
+/// `[freeze] wait_hours`, in seconds: how long a release waits queued before it moves, soo late articles and PreDB
+/// titles have their time. A visit that finds it matching for the same reason keeps the time it was queued (see
+/// `rules::evaluate`); a new reason starts the wait over.
 pub static WAIT_SECS: AtomicI64 = AtomicI64::new(12 * 3600);
 
 /// a writer ticks at most this often, soo saves keep the writer
