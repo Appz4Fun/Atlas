@@ -1158,3 +1158,40 @@ fn following_stops_before_the_runs_body_cap_and_asks_for_nothing_past_it() {
     assert_eq!((bodies(&state), state.heads_sent.load(Ordering::SeqCst)), (1, 0));
     assert_eq!(names_of(&h), ["Hop.Post.rar"]);
 }
+
+fn sidecar(h: &Harness, name: &str) -> Option<(String, Option<String>, Option<String>, bool)> {
+    h.shard()
+        .query_row(
+            "select kind, release_name, segment_uid, text is not null from sidecars where release_id = ?1",
+            [h.id_of(name)],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .ok()
+}
+
+#[test]
+fn a_sidecar_posts_text_is_read_and_kept_with_what_it_names() {
+    let mut h = fresh();
+    let info = b"General\nUnique ID : 114273598891547003088333253660066868446 (0x55F84B6AA194D59703CCAB394DA26CDE)\nComplete name : Some.Film.2024.1080p.BluRay.x264-GRP.mkv\nFormat : Matroska\n";
+    let s = shape("mediainfo").one("mediainfo.txt", info);
+    serve(&mut h, &s, config());
+    settled(&h, "mediainfo");
+    assert_eq!(
+        sidecar(&h, "mediainfo"),
+        Some((
+            "mediainfo".into(),
+            Some("Some.Film.2024.1080p.BluRay.x264-GRP".into()),
+            Some("55f84b6aa194d59703ccab394da26cde".into()),
+            true
+        ))
+    );
+}
+
+#[test]
+fn a_release_that_carries_data_is_no_sidecar() {
+    let mut h = fresh();
+    let s = shape("x").one("x.nfo", b"Release Name: Real Name 2024\n").dark("x.mkv", 1, 3);
+    serve(&mut h, &s, config());
+    settled(&h, "x");
+    assert_eq!(sidecar(&h, "x"), None);
+}

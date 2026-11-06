@@ -52,6 +52,7 @@ pub mod repair;
 pub mod sab;
 pub mod sealed_store;
 pub mod search;
+pub mod sidecar;
 pub mod sorted;
 pub mod spotnet;
 pub mod stats_dashboard;

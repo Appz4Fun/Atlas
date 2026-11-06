@@ -72,6 +72,7 @@ fn label(name: &str) -> &str {
         "stills" => "Stills",
         "naming" => "Naming",
         "nfo" => "Name from the NFO",
+        "sidecar" => "Sidecar text",
         "predb_match" => "PreDB match",
         "category" => "Category",
         "media_parse" => "Title parse",
@@ -796,7 +797,7 @@ mod tests {
         assert_eq!(*standing_of(&rows, "predb_match"), Standing::Skipped, "no queue row, no walk");
 
         let html = render(8, &state, &pace(), &rows, 1_000);
-        assert!(html.contains("2 of 15 steps still to run: Probe (tracks, codecs), Media lookup."), "{html}");
+        assert!(html.contains("2 of 16 steps still to run: Probe (tracks, codecs), Media lookup."), "{html}");
         assert!(html.contains("in about 2 h · 7,200 ahead in shard 0's net line"), "{html}");
     }
 

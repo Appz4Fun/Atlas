@@ -74,7 +74,7 @@ pub const PP_STATE: ShardTable = ShardTable {
 /// Ahead of all of them, 5: a release of at most 64 MiB (`archive::follow::MAX_POST_BYTES`) with an NZB among its
 /// files, whatever its category. It costs a few small articles, the least the net lane reads for anything, and says
 /// what a whole other post is (`archive::follow`): the owner wants the least data pulled first where it unlocks the
-/// most. A release such an NZB read in this shard points to (`nzb_pointed`) is 3 at least: the next hop.
+/// most. So is a sidecar (`frozen::rules::SIDECAR`, `sidecar`): its text is read before it freezes. A release such an NZB read in this shard points to (`nzb_pointed`) is 3 at least: the next hop.
 pub const NET_RANK: &str = "coalesce((select max(case
         when c.category is not null and c.category not between 2000 and 2999 and c.category not between 5000 and 5999
             and c.category not between 8000 and 8999 then 0
@@ -86,6 +86,12 @@ pub const NET_RANK: &str = "coalesce((select max(case
         else 0 end,
         case
             when r.size <= 67108864 and exists (select 1 from files f where f.release_id = r.id and f.filename like '%.nzb')
+                then 5
+            when r.size <= 4194304 and exists (select 1 from files f where f.release_id = r.id)
+                and not exists (select 1 from files f where f.release_id = r.id and not (
+                    f.filename like '%.nfo' or f.filename like '%.txt' or f.filename like '%.sfv'
+                    or f.filename like '%.srr' or f.filename like '%.srs' or f.filename like '%.md5'
+                    or f.filename like '%.sha1' or f.filename like '%.diz'))
                 then 5
             when exists (select 1 from files f where f.release_id = r.id and f.filename like '%.nzb')
                 or exists (select 1 from nzb_pointed p where p.release_id = r.id) then 3
@@ -121,6 +127,7 @@ pub const SHARD_TABLES: &[&ShardTable] = &[
     &PP_WALKS,
     &crate::archive::store::INNER_FILES,
     &crate::archive::store::NZB_POINTED,
+    &crate::sidecar::SIDECARS,
     &crate::archive::store::RELEASE,
     &crate::archive::store::NFO_PASSWORD,
     &crate::archive::store::PAR2_FILES,

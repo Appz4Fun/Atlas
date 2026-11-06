@@ -1313,6 +1313,15 @@ fn seed_shard(conn: &Connection, enabled: StepMask, stamps: &[(u8, StepMask, i64
         }
         set("pp_probe_body_crc", now)?;
     }
+    // the sidecar step reads posts as they come, and its rule freezes the old ones as they are: it starts no walk of
+    // every row, which would ask the net lane about every small release there is
+    if meta("pp_sidecar_seen")?.is_none() {
+        let bit = crate::postprocess::step::mask(crate::sidecar::SIDECAR_STEP);
+        if seeded && enabled & bit != 0 {
+            set("pp_steps_seen", meta("pp_steps_seen")?.unwrap_or(0) | bit)?;
+        }
+        set("pp_sidecar_seen", now)?;
+    }
     let seen = meta("pp_steps_seen")?.unwrap_or(0);
     let new = if seeded { enabled & !seen } else { enabled };
     if seeded && new != 0 {

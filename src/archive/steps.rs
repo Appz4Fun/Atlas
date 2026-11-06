@@ -72,7 +72,7 @@ fn fetch_start(ctx: &mut StepCtx<'_>, seg: &SegmentRef, file: &str) -> Result<Op
 /// A small file's every part, decoded and joined in order, within the budget: a part's repost stands in when its
 /// first copy comes to nothing. None: a part isnt indexed or none of its copies came, or the file is more than a
 /// list should be.
-fn whole_file(ctx: &mut StepCtx<'_>, file: &FileInfo, left: &mut usize) -> Result<Option<Vec<u8>>, StepError> {
+pub(crate) fn whole_file(ctx: &mut StepCtx<'_>, file: &FileInfo, left: &mut usize) -> Result<Option<Vec<u8>>, StepError> {
     let parts = file.expected.unwrap_or(0).max(file.parts_seen);
     if parts < 1 || parts as usize > *left {
         return Ok(None);
