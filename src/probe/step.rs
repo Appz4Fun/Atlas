@@ -589,8 +589,7 @@ impl Step for ProbeStep {
                         info.crossposted_to = xref_groups(xref);
                     }
                     info.yenc = yenc::parse(&article.lines);
-                    // the first article is the last too when the file is one part, which the article says itself
-                    info.quirks = yenc_quirks::Quirks::read(&article.lines, false);
+                    info.quirks = yenc_quirks::Quirks::read(&article.lines);
                     if let Some(body) = yenc_decode(&article.lines) {
                         if let Some(expected) = info.yenc.as_ref().and_then(|y| y.pcrc32) {
                             info.part_crc_ok = Some(crc32(&body) == expected);
@@ -638,7 +637,8 @@ impl Step for ProbeStep {
                     let article = yenc::split_article(&raw);
                     last_lines = yenc::parse(&article.lines);
                     last_body = yenc_decode(&article.lines);
-                    if let Some(seen) = yenc_quirks::Quirks::read(&article.lines, true) {
+                    // the tail article read is the file's last only when its own yEnc lines say soo
+                    if let Some(seen) = yenc_quirks::Quirks::read(&article.lines) {
                         info.quirks.get_or_insert_with(Default::default).add(&seen);
                     }
                 }

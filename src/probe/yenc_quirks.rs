@@ -185,9 +185,11 @@ fn has_key(keys: &str, key: &str) -> bool {
 }
 
 impl Quirks {
-    /// Reads an article's raw body lines, as `yenc::split_article` gives them. `last`: the caller knows it's the
-    /// file's last part (a part that says `part=N total=N` is taken as the last anyway). None: no `=ybegin`.
-    pub fn read(lines: &[Vec<u8>], last: bool) -> Option<Quirks> {
+    /// Reads an article's raw body lines, as `yenc::split_article` gives them. Whether it's the file's last part
+    /// comes from the article alone: `part=N total=N`, or a `=ypart end=` that is the `=ybegin size=`. An article
+    /// that is merely the last one indexed proves nothing, soo its `=yend` counts as a middle part's. None: no
+    /// `=ybegin`.
+    pub fn read(lines: &[Vec<u8>]) -> Option<Quirks> {
         let start = lines.iter().position(|l| l.starts_with(b"=ybegin "))?;
         let mut q = Quirks::default();
         let begin = String::from_utf8_lossy(lines.get(start)?);
@@ -195,8 +197,11 @@ impl Quirks {
         q.name_space = begin.contains(" name=") && begin.ends_with(' ');
         let number = |k: &str| raw_value(&begin, k).and_then(|v| v.trim().parse::<u64>().ok());
         let line_len = number("line").unwrap_or(128);
-        let is_last = last || (number("part").is_some() && number("part") == number("total"));
         let rest = lines.get(start + 1..).unwrap_or_default();
+        let ypart = rest.first().filter(|l| l.starts_with(b"=ypart ")).map(|l| String::from_utf8_lossy(l));
+        let ypart_end = ypart.as_deref().and_then(|l| raw_value(l, "end")).and_then(|v| v.trim().parse::<u64>().ok());
+        let is_last = (number("part").is_some() && number("part") == number("total"))
+            || (ypart_end.is_some() && ypart_end == number("size"));
         let mut longest_ok = true;
         let mut previous_empty = false;
         let mut data_lines: Vec<&[u8]> = Vec::new();
@@ -216,7 +221,7 @@ impl Quirks {
         let count = data_lines.len();
         for (n, line) in data_lines.into_iter().enumerate() {
             // the last data line is short, or ends the part; an over-long one is a habit only before it
-            if n + 1 < count && line.len() as u64 > line_len + 1 {
+            if n + 1 < count && line.len() as u64 > line_len.saturating_add(1) {
                 longest_ok = false;
             }
             q.escapes_of(line);
@@ -790,8 +795,8 @@ mod tests {
             false,
             "=yend size=5120 part=3 pcrc32=1234abcd crc32=00c0ffee",
         );
-        let mut q = Quirks::read(&first, false).unwrap();
-        q.add(&Quirks::read(&last, true).unwrap());
+        let mut q = Quirks::read(&first).unwrap();
+        q.add(&Quirks::read(&last).unwrap());
         q
     }
 
@@ -831,7 +836,7 @@ mod tests {
             false,
             "=yend size=5120 part=1 pcrc32=0badf00d",
         );
-        let q = Quirks::read(&first, false).unwrap();
+        let q = Quirks::read(&first).unwrap();
         assert_eq!(class(&q).as_deref(), Some("Nyuu or postie"));
         // postie leaves crc32 off the last part
         let last = article(
@@ -842,7 +847,7 @@ mod tests {
             "=yend size=5120 part=3 pcrc32=0234abcd",
         );
         let mut q = q;
-        q.add(&Quirks::read(&last, true).unwrap());
+        q.add(&Quirks::read(&last).unwrap());
         assert_eq!(lookalikes(&q), ["postie"]);
         assert_eq!(witness(&q, "Nyuu/0.4.2"), Some((false, "yEnc quirks of postie".into())));
     }
@@ -859,7 +864,7 @@ mod tests {
             true,
             "=yend size=5120 pcrc32=badf00d",
         );
-        let q = Quirks::read(&first, false).unwrap();
+        let q = Quirks::read(&first).unwrap();
         assert_eq!(q.yend, "size pcrc32");
         assert_eq!(q.padded.says(), Some(false));
         assert_eq!(q.escapes.end_space.says(), Some(false));
@@ -880,7 +885,7 @@ mod tests {
             true,
             "=yend size=5120 pcrc32=0badf00d",
         );
-        let q = Quirks::read(&first, false).unwrap();
+        let q = Quirks::read(&first).unwrap();
         assert_eq!(lookalikes(&q), ["ngPost fork (5.6+)"]);
         assert_eq!(witness(&q, "ngPost").map(|w| w.0), Some(true), "the fork is an ngPost");
     }
@@ -895,7 +900,7 @@ mod tests {
             false,
             "=yend size=5120 part=1 pcrc32=0BADF00D",
         );
-        let q = Quirks::read(&first, false).unwrap();
+        let q = Quirks::read(&first).unwrap();
         assert_eq!(q.upper.says(), Some(true));
         assert_eq!(lookalikes(&q), ["GoPostStuff"]);
         assert_eq!(witness(&q, "gopoststuff 0.2.0").map(|w| w.0), Some(true));
@@ -912,7 +917,7 @@ mod tests {
             false,
             "=yend size=5120 part=1 pcrc32=0badf00d",
         );
-        let q = Quirks::read(&first, false).unwrap();
+        let q = Quirks::read(&first).unwrap();
         assert_eq!(q.escapes.lead_dot.says(), Some(false));
         assert_eq!(lookalikes(&q), ["newsmangler"]);
     }
@@ -928,7 +933,7 @@ mod tests {
             false,
             "=yend size=5120 part=1 pcrc32=0BADF00D",
         );
-        let q = Quirks::read(&first, false).unwrap();
+        let q = Quirks::read(&first).unwrap();
         assert_eq!(q.ypart, "begin end size");
         assert_eq!(q.escapes.del.says(), Some(true));
         assert_eq!(lookalikes(&q), ["nxg-upper"]);
@@ -958,7 +963,7 @@ mod tests {
             "=yend size=5120 pcrc32=0badf00d",
         );
         first.push(Vec::new());
-        let q = Quirks::read(&first, false).unwrap();
+        let q = Quirks::read(&first).unwrap();
         assert_eq!(q.begin, "part line size name");
         assert_eq!(q.over_long.says(), Some(true));
         assert_eq!(q.blank_after_yend.says(), Some(true));
@@ -977,7 +982,7 @@ mod tests {
             false,
             "=yend size=5120 part=1 pcrc32=0BADF00D",
         );
-        let q = Quirks::read(&first, false).unwrap();
+        let q = Quirks::read(&first).unwrap();
         assert!(q.name_space);
         assert_eq!(q.escapes.mid_dot.says(), Some(true));
         assert_eq!(lookalikes(&q), ["yEnc32"]);
@@ -995,7 +1000,7 @@ mod tests {
             false,
             "=yend size=5120 part=1 pcrc32=0badf00d",
         );
-        let q = Quirks::read(&first, false).unwrap();
+        let q = Quirks::read(&first).unwrap();
         assert_eq!(q.escapes.mid_tab.says(), Some(true));
         assert_eq!(lookalikes(&q), ["newspost"]);
     }
@@ -1011,7 +1016,7 @@ mod tests {
             true,
             "=yend size=5120 part=1 pcrc32=0badf00d",
         );
-        let q = Quirks::read(&first, false).unwrap();
+        let q = Quirks::read(&first).unwrap();
         assert_eq!(lookalikes(&q), ["Rust yenc crate (pesto)"]);
     }
 
@@ -1034,7 +1039,7 @@ mod tests {
             false,
             "=yend size=5120 part=1 pcrc32=BADF00D",
         );
-        let q = Quirks::read(&first, false).unwrap();
+        let q = Quirks::read(&first).unwrap();
         assert_eq!(class(&q), None);
         assert_eq!(witness(&q, "Nyuu/0.4.2"), Some((false, "yEnc quirks (capital CRCs, unpadded CRCs)".into())));
     }
@@ -1049,9 +1054,34 @@ mod tests {
     }
 
     #[test]
+    fn only_a_part_that_says_so_is_the_last() {
+        let body = encode(&data(SIZE), &rapid);
+        // the last article indexed, but part 2 of 3: no crc32 is expected on it
+        let middle = article(
+            "=ybegin part=2 total=3 line=128 size=15360 name=a.mkv",
+            Some("=ypart begin=5121 end=10240"),
+            body.clone(),
+            false,
+            "=yend size=5120 part=2 pcrc32=0badf00d",
+        );
+        let q = Quirks::read(&middle).unwrap();
+        assert_eq!((q.yend.as_str(), q.last_yend.as_str()), ("size part pcrc32", ""));
+        assert_eq!(witness(&q, "Nyuu/0.4.2").map(|w| w.0), Some(true));
+        // no total=, but its end is the file's size
+        let tail = article(
+            "=ybegin part=3 line=128 size=15360 name=a.mkv",
+            Some("=ypart begin=10241 end=15360"),
+            body,
+            false,
+            "=yend size=5120 part=3 pcrc32=0badf00d",
+        );
+        assert_eq!(Quirks::read(&tail).unwrap().last_yend, "size part pcrc32");
+    }
+
+    #[test]
     fn malformed_lines_dont_panic() {
-        assert_eq!(Quirks::read(&[b"plain text".to_vec()], false), None);
-        assert_eq!(Quirks::read(&[], true), None);
+        assert_eq!(Quirks::read(&[b"plain text".to_vec()]), None);
+        assert_eq!(Quirks::read(&[]), None);
         let odd: Vec<Vec<u8>> = vec![
             b"=ybegin ".to_vec(),
             b"=ypart".to_vec(),
@@ -1060,7 +1090,7 @@ mod tests {
             vec![0xff, b'=', 0xff, b'='],
             b"=yend".to_vec(),
         ];
-        let q = Quirks::read(&odd, false).unwrap();
+        let q = Quirks::read(&odd).unwrap();
         assert!(q.begin.is_empty() && q.yend.is_empty());
         let _ = q.summary();
         let _ = lookalikes(&q);
@@ -1071,12 +1101,20 @@ mod tests {
             "=yend size=99999999999999999999999 pcrc32=zz crc32=123456789abc part=0".as_bytes().to_vec(),
             Vec::new(),
         ];
-        let q = Quirks::read(&junk, true).unwrap();
+        let q = Quirks::read(&junk).unwrap();
         assert!(q.upper.is_empty() && q.padded.is_empty());
         let _ = witness(&q, "Nyuu");
         let _ = q.summary();
+        // a line= at the top of the range, over two data lines
+        let huge = [
+            b"=ybegin part=1 total=2 line=18446744073709551615 size=9 name=x".to_vec(),
+            b"abc".to_vec(),
+            b"def".to_vec(),
+            b"=yend size=6 part=1 pcrc32=00000001".to_vec(),
+        ];
+        assert_eq!(Quirks::read(&huge).unwrap().over_long.says(), Some(false));
         // the =ybegin with no line= and nothing after it
-        let q = Quirks::read(&[b"=ybegin line=0 size=0 name=x".to_vec(), b"=yend size=0".to_vec()], false).unwrap();
+        let q = Quirks::read(&[b"=ybegin line=0 size=0 name=x".to_vec(), b"=yend size=0".to_vec()]).unwrap();
         assert_eq!(q.begin, "line size name");
     }
 }
