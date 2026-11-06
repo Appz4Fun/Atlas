@@ -10,7 +10,7 @@ use atlas::duplicates::{
 };
 use atlas::parser::Release;
 use atlas::{db, store};
-use common::stage::release_of;
+use common::stage::{article, release_of};
 
 fn release(main: &std::path::Path, name: &str, group: &str) -> (i64, rusqlite::Connection) {
     store::save(main, &[Release { group: group.into(), ..release_of(name, "x.bin", 2, 2) }]).unwrap();
@@ -133,6 +133,40 @@ fn copies_are_found_across_shards_and_go_with_their_release() {
     assert!(flagged[0] == first || flagged[0] == xpost);
     shard_e.execute("delete from releases where id = ?", [xpost]).unwrap();
     shard_e.execute("delete from release_fingerprint where release_id = ?", [xpost]).unwrap();
+    drop(conn);
+
+    // three groups' rows of one crosspost, each missing other parts: the first and last share no file's first
+    // message-id, but each shares one with the middle row, soo all three are one upload
+    let rows = [
+        ("Tri-A", 5usize, vec![article("f1", 1, 2, "<f1.1@x>"), article("f2", 2, 2, "<f2.2@x>")]),
+        (
+            "Tri-B",
+            6,
+            vec![article("f1", 1, 2, "<f1.1@x>"), article("f2", 1, 2, "<f2.1@x>"), article("f2", 2, 2, "<f2.2@x>")],
+        ),
+        ("Tri-C", 7, vec![article("f1", 2, 2, "<f1.2@x>"), article("f2", 1, 2, "<f2.1@x>")]),
+    ];
+    let mut tri = Vec::new();
+    for (name, s, articles) in rows {
+        store::save(&main, &[Release { group: in_shard(s).into(), articles, ..release_of(name, "f1", 0, 2) }]).unwrap();
+        let shard = db::open_shard(&store::shard_path(&main, s)).unwrap();
+        let id: i64 = shard.query_row("select id from releases where name = ?", [name], |r| r.get(0)).unwrap();
+        shard.execute(SET_POSTED, rusqlite::params![id, b"tri-posted".as_slice()]).unwrap();
+        tri.push(id);
+    }
+    let conn = db::open().unwrap();
+    assert!(!atlas::duplicates::shares_articles(&conn, tri[0], tri[2]));
+    let cluster = clusters_with(&conn, ClusterKind::Twins, 0, 10)
+        .unwrap()
+        .into_iter()
+        .find(|members| members.iter().any(|r| r.id == tri[0]))
+        .unwrap();
+    assert_eq!(cluster.iter().map(|r| r.id).collect::<Vec<_>>(), tri);
+    assert_eq!(atlas::duplicates::xposts_of_earlier(&conn, &cluster), [false, true, true], "C ties through B");
+    for (s, id) in [(5usize, tri[0]), (6, tri[1]), (7, tri[2])] {
+        let shard = db::open_shard(&store::shard_path(&main, s)).unwrap();
+        shard.execute("delete from release_fingerprint where release_id = ?", [id]).unwrap();
+    }
     drop(conn);
 
     // a purged release is no one's copy
