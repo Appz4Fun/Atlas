@@ -86,6 +86,7 @@ enabled = true
 poll_minutes = 15
 first_articles = 20000
 per_pass = 200
+concurrency = 16
 
 [category]
 enabled = true

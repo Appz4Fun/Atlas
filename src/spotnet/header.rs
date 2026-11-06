@@ -8,6 +8,9 @@ use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
 
 use super::{Kind, Subcats};
 
+/// The key id moderators' commands are posted under.
+pub const MODERATOR_KEY: i32 = 2;
+
 /// What an overview line says about a spot.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SpotHeader {
@@ -30,6 +33,17 @@ impl SpotHeader {
     /// The kind of spot this is, when it is one Atlas takes.
     pub fn kind(&self) -> Option<Kind> {
         self.subcats.kind(self.category)
+    }
+
+    /// Whether this is a moderator's command (key 2: `DISPOSE <message-id>` and the like) rather than a spot. It
+    /// has no spot XML to fetch.
+    pub fn is_moderation(&self) -> bool {
+        self.key_id == MODERATOR_KEY
+    }
+
+    /// Whether this is a spot worth fetching whole: signed, not a moderator's command, movies or TV.
+    pub fn wanted(&self) -> bool {
+        self.signed && !self.is_moderation() && self.kind().is_some()
     }
 
     /// The id Spotweb shows for the poster: from a CRC of their public key, so it names them across nicknames.
@@ -231,5 +245,15 @@ mod tests {
         assert_eq!(decode_base64("aGk").unwrap(), b"hi");
         assert_eq!(decode_base64("aGk=").unwrap(), b"hi");
         assert_eq!(decode_base64(&unprepare_base64("-s-s-s-s")).unwrap(), vec![0xff, 0xff, 0xff]);
+    }
+
+    #[test]
+    fn a_moderators_dispose_is_not_a_spot_to_fetch() {
+        let from = "Afzender <10@12a01.1.10.1793194181.LQr.mod.c2ln>";
+        let h = parse("DISPOSE hzqY4qMS5McHhOuQESoUdhzD@spot.net - Buried Alive", from).unwrap();
+        assert!(h.is_moderation());
+        assert_eq!(h.kind(), Some(Kind::Movie));
+        assert!(!h.wanted());
+        assert!(parse("Movie (2026) | tag", FROM).unwrap().wanted());
     }
 }

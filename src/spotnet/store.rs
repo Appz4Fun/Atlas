@@ -143,6 +143,11 @@ pub fn todo(conn: &Connection, limit: usize) -> Result<Vec<String>> {
     Ok(out)
 }
 
+/// Spots waiting to be fetched.
+pub fn waiting(conn: &Connection) -> Result<i64> {
+    conn.query_row("select count(*) from spots_seen where state = ?", [TODO], |r| r.get(0))
+}
+
 /// Gives up on spots waiting past `TODO_DAYS` and on the oldest past `MAX_TODO`, and forgets settled ones past
 /// `KEEP_DAYS`. Returns the rows it changed.
 pub fn prune(conn: &Connection, now: i64) -> Result<usize> {

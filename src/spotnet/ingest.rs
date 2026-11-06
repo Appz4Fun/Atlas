@@ -1,8 +1,10 @@
 //! Reads new spots from `free.pt` every `poll_minutes`: the overview first, keeping the signed movie and TV spots,
 //! then each of those whole (HEAD for its XML, BODY for its NZB in `alt.binaries.ftd`), saved as a release and
-//! tagged with its spot. About 75 spots a day pass the filter, so this is a few requests a minute at most.
+//! tagged with its spot. About 75 spots a day pass the filter. Spots are fetched `concurrency` at a time: each
+//! request queues for a connection behind indexing, so one at a time was minutes a spot on a busy indexer.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
@@ -62,7 +64,7 @@ pub async fn run(pool: Arc<Pool>, db: Db, config: SpotsConfig, stopping: impl Fn
 }
 
 /// One pass: the overview since the cursor, then up to `per_pass` spots fetched whole.
-pub async fn pass(pool: &Pool, db: &Db, config: &SpotsConfig, stopping: &impl Fn() -> bool) -> Result<Pass> {
+pub async fn pass(pool: &Arc<Pool>, db: &Db, config: &SpotsConfig, stopping: &impl Fn() -> bool) -> Result<Pass> {
     let mut done = Pass::default();
     let prefer = pool.indexing_tier().first().copied().unwrap_or(0);
     let (server, (_, low, high, _)) = pool.select_group_on(prefer, SPOT_GROUP).await?;
@@ -81,7 +83,7 @@ pub async fn pass(pool: &Pool, db: &Db, config: &SpotsConfig, stopping: &impl Fn
         let wanted: Vec<store::Noted> = rows
             .iter()
             .filter_map(|r| {
-                let h = header::parse(&r.subject, &r.from).filter(|h| h.signed && h.kind().is_some())?;
+                let h = header::parse(&r.subject, &r.from).filter(header::SpotHeader::wanted)?;
                 Some((r.message_id.trim_matches(['<', '>']).to_string(), r.number, h.spotter_id()))
             })
             .collect();
@@ -95,30 +97,53 @@ pub async fn pass(pool: &Pool, db: &Db, config: &SpotsConfig, stopping: &impl Fn
     on_db(db, move |conn| Ok(store::prune(conn, now)?)).await?;
     let limit = config.per_pass;
     let todo = on_db(db, move |conn| Ok(store::todo(conn, limit)?)).await?;
-    let mut posted = 0usize;
+    let waiting = on_db(db, |conn| Ok(store::waiting(conn)?)).await?;
+    if !todo.is_empty() {
+        println!("spots: {waiting} waiting, fetching {} ({} at a time)", todo.len(), config.concurrency);
+    }
+    let posted = Arc::new(AtomicUsize::new(0));
+    // the copy checks, the save and the tag of one spot at a time in each shard (see `fetch`)
+    let saving: Arc<Vec<tokio::sync::Mutex<()>>> =
+        Arc::new((0..crate::store::SHARDS).map(|_| tokio::sync::Mutex::new(())).collect());
+    let slots = Arc::new(tokio::sync::Semaphore::new(config.concurrency.max(1)));
+    let mut tasks = tokio::task::JoinSet::new();
     for message_id in todo {
-        if stopping() || posted >= MAX_PASS_POSTED {
+        if stopping() || posted.load(Ordering::Relaxed) >= MAX_PASS_POSTED {
             break;
         }
-        let outcome = match fetch(pool, db, &message_id, &mut posted).await {
-            Ok(settled) => {
-                if settled.state == SAVED {
-                    done.saved += 1;
-                } else {
-                    done.skipped += 1;
+        let Ok(slot) = slots.clone().acquire_owned().await else { break };
+        let (pool, db, posted, saving) = (pool.clone(), db.clone(), posted.clone(), saving.clone());
+        tasks.spawn(async move {
+            let _slot = slot;
+            let outcome = match fetch(&pool, &db, &message_id, &posted, &saving).await {
+                Ok(settled) => Some(settled),
+                Err(e) => {
+                    eprintln!("spots: {message_id}: {e:#}");
+                    None
                 }
-                Some(settled)
-            }
-            Err(e) => {
-                eprintln!("spots: {message_id}: {e:#}");
-                done.retry += 1;
-                None
-            }
-        };
-        let now = chrono::Utc::now().timestamp();
-        on_db(db, move |conn| Ok(store::settle(conn, &message_id, outcome.as_ref(), now)?)).await?;
+            };
+            let state = outcome.as_ref().map(|s| s.state);
+            let now = chrono::Utc::now().timestamp();
+            on_db(&db, move |conn| Ok(store::settle(conn, &message_id, outcome.as_ref(), now)?)).await.map(|_| state)
+        });
+        while let Some(joined) = tasks.try_join_next() {
+            count(&mut done, joined)?;
+        }
+    }
+    while let Some(joined) = tasks.join_next().await {
+        count(&mut done, joined)?;
     }
     Ok(done)
+}
+
+/// One fetched spot into the pass's counts. A settle that failed fails the pass.
+fn count(done: &mut Pass, joined: std::result::Result<Result<Option<i64>>, tokio::task::JoinError>) -> Result<()> {
+    match joined.map_err(|e| anyhow!("spot task failed: {e}"))?? {
+        Some(SAVED) => done.saved += 1,
+        Some(_) => done.skipped += 1,
+        None => done.retry += 1,
+    }
+    Ok(())
 }
 
 /// Where a pass starts reading: after the cursor, or `first` articles back from the newest on the first pass and
@@ -132,7 +157,13 @@ pub fn start_at(cursor: Option<u64>, low: u64, high: u64, first: u64) -> u64 {
 
 /// A spot fetched whole and saved, or skipped for good. Err: try again later. `posted` counts the NZB article
 /// bytes read.
-async fn fetch(pool: &Pool, db: &Db, message_id: &str, posted: &mut usize) -> Result<Settled> {
+async fn fetch(
+    pool: &Pool,
+    db: &Db,
+    message_id: &str,
+    posted: &AtomicUsize,
+    saving: &[tokio::sync::Mutex<()>],
+) -> Result<Settled> {
     let skipped = |nzb_ref: Option<String>| Settled { state: SKIPPED, nzb_ref, ..Settled::default() };
     let head = match pool.fetch_head(&format!("<{message_id}>"), MAX_XML_BYTES * 4).await {
         Ok(Some(head)) => head,
@@ -170,12 +201,12 @@ async fn fetch(pool: &Pool, db: &Db, message_id: &str, posted: &mut usize) -> Re
         let cap = MAX_NZB_ARTICLE.min(left);
         match pool.fetch_body_capped(&format!("<{segment}>"), cap).await {
             Ok(Some(body)) => {
-                *posted += body.len();
+                posted.fetch_add(body.len(), Ordering::Relaxed);
                 bodies.push(body);
             }
             // a body past the cap was read up to it (and a line more) before it was given up: that counts too
             Ok(None) => {
-                *posted += cap + CAP_OVERSHOOT;
+                posted.fetch_add(cap + CAP_OVERSHOOT, Ordering::Relaxed);
                 return Ok(skipped(Some(nzb_ref)));
             }
             Err(e) if says_absent(&e) => return Ok(skipped(Some(nzb_ref))),
@@ -194,14 +225,17 @@ async fn fetch(pool: &Pool, db: &Db, message_id: &str, posted: &mut usize) -> Re
         nzb_key: Some(nzb_key.clone()),
     };
 
+    let group = release.group.clone();
+    let shard = crate::store::shard_of(&group);
+    // one spot of a shard at a time from here: copies of one NZB, and spots of one title, go to the same group and
+    // so the same shard, and must not both pass the checks below before either is tagged
+    let _saving = saving[shard].lock().await;
     // an edit or repost of a spot already saved (its release maybe frozen since): that release gets the newer
     // spot, and nothing is saved
     let k = nzb_key.clone();
     if let Some(id) = on_db(db, move |conn| Ok(store::known_key(conn, &k)?)).await? {
         return copy_of(db, id, row(nzb_key.clone()), nzb_ref.clone(), Some(nzb_key.clone())).await;
     }
-    let group = release.group.clone();
-    let shard = crate::store::shard_of(&group);
     let row = row(nzb_key.clone());
     let copy_row = row.clone();
     if let Some(id) = on_shard(db, shard, move |conn| store::tag_copy(conn, &copy_row)).await? {
@@ -234,7 +268,11 @@ async fn fetch(pool: &Pool, db: &Db, message_id: &str, posted: &mut usize) -> Re
     let name = release.name.clone();
     db.save(vec![release]).await?;
     // tagged on its shard's writer after the save: the save doesn't say which id the release got
+    let title = row.spot.title.clone();
     let id = on_shard(db, shard, move |conn| store::tag(conn, &name, &group, &row)).await?;
+    if let Some(id) = id {
+        println!("spots: saved \"{title}\" as release {id}");
+    }
     Ok(settled(id))
 }
 
