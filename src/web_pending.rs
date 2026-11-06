@@ -62,7 +62,7 @@ fn step_list() -> &'static [StepMeta] {
 }
 
 /// What each step is for, in words.
-fn label(name: &str) -> &str {
+pub(crate) fn label(name: &str) -> &str {
     match name {
         "archive_par2" => "PAR2 read",
         "archive_list" => "Archive listing",
