@@ -699,9 +699,35 @@ pub fn run(main: &Path, config: &SharedCatalogConfig, stop: &AtomicBool) {
     }
 }
 
-/// How long the publisher keeps the shards open while it has a backlog before it lets go, soo a compaction waiting
-/// for them gets its turn.
+/// How long the publisher keeps the shards open while it has a backlog before it lets go.
 const SESSION: Duration = Duration::from_secs(60);
+
+/// A compaction in this process is about to start: the publisher lets go of the shards and stays away until it's
+/// done (`make_way_for_compaction`).
+static COMPACTION_WANTED: AtomicBool = AtomicBool::new(false);
+/// The publisher has the shards open and compaction held off.
+static HOLDING: AtomicBool = AtomicBool::new(false);
+
+/// Clears the wish to compact when dropped, once the compaction is over.
+pub struct MakingWay(());
+
+impl Drop for MakingWay {
+    fn drop(&mut self) {
+        COMPACTION_WANTED.store(false, Relaxed);
+    }
+}
+
+/// The indexer calls this before it compacts: the publisher closes its shards at the end of the batch it's on and
+/// takes them up again only after the returned guard drops. Waits up to `wait` for it to let go, so the
+/// compaction's one try at its lock isn't refused because of the publisher.
+pub fn make_way_for_compaction(wait: Duration) -> MakingWay {
+    COMPACTION_WANTED.store(true, Relaxed);
+    let until = std::time::Instant::now() + wait;
+    while HOLDING.load(Relaxed) && std::time::Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    MakingWay(())
+}
 
 /// The shards open, and the hold on compaction that keeps them from being swapped meanwhile. A compaction can't
 /// rename a shard someone has open on Windows, and on Unix an open connection would go on reading the original;
@@ -712,6 +738,13 @@ struct Session {
     open: Vec<(usize, Connection, Vec<Table>)>,
     _hold: crate::compact::WriteGuard,
     since: std::time::Instant,
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        // the connections close before the hold goes (field order); the flag says so once both are gone
+        self.open.clear();
+    }
 }
 
 fn publish(
@@ -725,8 +758,14 @@ fn publish(
     let mut ensured: BTreeMap<usize, Vec<Table>> = BTreeMap::new();
     let mut gauges_at: Option<std::time::Instant> = None;
     let mut session: Option<Session> = None;
+    let _clear = ClearHolding;
     while !stop.load(Relaxed) {
         if session.is_none() {
+            HOLDING.store(false, Relaxed);
+            if COMPACTION_WANTED.load(Relaxed) {
+                rest(stop, Duration::from_millis(config.interval_ms));
+                continue;
+            }
             let Some(hold) = crate::compact::try_hold_off_compaction(main)? else {
                 // a compaction runs: wait for it
                 rest(stop, Duration::from_millis(config.interval_ms));
@@ -743,6 +782,7 @@ fn publish(
                 open.push((*shard, conn, tables));
             }
             session = Some(Session { open, _hold: hold, since: std::time::Instant::now() });
+            HOLDING.store(true, Relaxed);
         }
         let Some(open) = session.as_ref().map(|s| &s.open) else { continue };
         let mut busy = false;
@@ -762,14 +802,24 @@ fn publish(
             }
             gauges_at = Some(std::time::Instant::now());
         }
-        if !busy || session.as_ref().is_some_and(|s| s.since.elapsed() >= SESSION) {
+        if !busy || COMPACTION_WANTED.load(Relaxed) || session.as_ref().is_some_and(|s| s.since.elapsed() >= SESSION) {
             session = None;
+            HOLDING.store(false, Relaxed);
         }
         if !busy {
             rest(stop, Duration::from_millis(config.interval_ms));
         }
     }
     Ok(())
+}
+
+/// The publisher's hold is gone however `publish` ends, an error included.
+struct ClearHolding;
+
+impl Drop for ClearHolding {
+    fn drop(&mut self) {
+        HOLDING.store(false, Relaxed);
+    }
 }
 
 fn rest(stop: &AtomicBool, d: Duration) {
@@ -1129,6 +1179,32 @@ mod tests {
         ack(&conn, first.max_seq).unwrap();
         let rest = read_batch(&conn, &t, 100, usize::MAX).unwrap();
         assert_eq!((rest.changes, rest.full), (7, false));
+    }
+
+    #[test]
+    fn a_compaction_waits_for_the_publisher_to_let_go_and_keeps_it_away_till_done() {
+        let _one = PG.lock().unwrap_or_else(|e| e.into_inner());
+        HOLDING.store(true, Relaxed);
+        let publisher = std::thread::spawn(|| {
+            // the publisher sees the wish at the end of its batch
+            while !COMPACTION_WANTED.load(Relaxed) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            std::thread::sleep(Duration::from_millis(100));
+            HOLDING.store(false, Relaxed);
+        });
+        let started = std::time::Instant::now();
+        let way = make_way_for_compaction(Duration::from_secs(10));
+        assert!(!HOLDING.load(Relaxed));
+        assert!(started.elapsed() >= Duration::from_millis(100), "it waited for the let-go");
+        assert!(COMPACTION_WANTED.load(Relaxed), "and the publisher stays away meanwhile");
+        drop(way);
+        assert!(!COMPACTION_WANTED.load(Relaxed));
+        publisher.join().unwrap();
+        // nobody holding: no wait at all
+        let started = std::time::Instant::now();
+        drop(make_way_for_compaction(Duration::from_secs(10)));
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[test]

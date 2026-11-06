@@ -1228,6 +1228,11 @@ async fn supervise(stop: Arc<AtomicBool>, stats: Arc<Mutex<Stats>>, writing: Opt
 
         if compact_due && !stopping() {
             writing = None;
+            // the shared catalog's publisher lets go of the shards first, and stays away till the compaction is done
+            let _making_way =
+                tokio::task::spawn_blocking(|| crate::shared_catalog::make_way_for_compaction(Duration::from_secs(30)))
+                    .await
+                    .ok();
             match compact(&config, &stats, &stop).await {
                 Compacted::Ran => compact_after = None,
                 Compacted::Busy => compact_after = Some(SystemTime::now() + COMPACT_RETRY),
