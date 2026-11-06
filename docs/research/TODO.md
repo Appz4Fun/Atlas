@@ -85,7 +85,8 @@ Source: [stream-metadata/FINAL-REPORT.md](stream-metadata/FINAL-REPORT.md) "Fram
 
 - [ ] Remux-proof alt key: hash of codec config + first keyframe (+ first 8 video and 16 audio payloads); script [container-metadata/tools/altkey.py](container-metadata/tools/altkey.py) matched 9 remux variants and rejected a re-encode.
 - [x] (stills keep a `phash` per frame in `release_stills` and look up close matches; check the recipe below against `src/probe/stills.rs`) Keyframe pHash at 25/50/75% (crop letterbox, equalise, match at 10 of 64 bits, 2 of 3 frames).
-- [ ] AC-3 crc2 run as a same-track key; audio fingerprint (chromaprint) only for releases nothing else linked.
+- [x] (#223) Audio fingerprint (chromaprint) only for releases nothing else linked: `probe::audio_print`, up to 12 s at 25/50/75% of the film's time, in `release_audio_print` with an anchor index, `Kind::AudioPrint` on the release page. Already there: AAC-LC, FLAC, MP3, MP2, Vorbis and PCM in Matroska, plain or stored in RAR. Not yet: AC-3, E-AC-3, DTS, TrueHD, Opus, 5.1 or HE-AAC (no pure-Rust decoder in the tree), MP4.
+- [ ] AC-3 crc2 run as a same-track key.
 
 ## 7. Release page
 
