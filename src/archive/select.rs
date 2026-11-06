@@ -145,21 +145,44 @@ pub fn plan(files: &[FileInfo], probe_files: usize) -> Vec<Head<'_>> {
     unknown.into_iter().take(probe_files).map(|f| Head { file: f, tail: f, probe: true }).collect()
 }
 
-/// Which PAR2 file to read: a base file, fewest parts first, or failing that the
-/// volume with the lowest first block.
+/// Which PAR2 file to read: the first of `par2_sources`.
 pub fn par2_source(files: &[FileInfo]) -> Option<&FileInfo> {
-    let base =
-        files.iter().filter(|f| classify(&f.filename) == Kind::Par2Base).min_by_key(|f| (parts(f), f.filename.clone()));
-    base.or_else(|| {
-        files
-            .iter()
-            .filter_map(|f| match classify(&f.filename) {
-                Kind::Par2Vol(n) => Some((n, f)),
-                _ => None,
-            })
-            .min_by_key(|(n, f)| (*n, parts(f), f.filename.clone()))
-            .map(|(_, f)| f)
-    })
+    par2_sources(files).into_iter().next()
+}
+
+/// The PAR2 files a set can be read from, best first: a volume carries the set's file list as a base file does.
+/// Whole ones before ones missing articles, the release's own set before another (a sample's, or a set of fewer
+/// files), a base before a volume, and among those the fewest parts or the lowest first block.
+pub fn par2_sources(files: &[FileInfo]) -> Vec<&FileInfo> {
+    let stem = |name: &str| {
+        let lower = name.to_ascii_lowercase();
+        let cut = lower.rfind(".vol").filter(|_| matches!(classify(name), Kind::Par2Vol(_))).or(lower.rfind(".par2"));
+        cut.map(|at| lower[..at].to_string()).unwrap_or(lower)
+    };
+    let par2: Vec<(&FileInfo, Option<u32>)> = files
+        .iter()
+        .filter_map(|f| match classify(&f.filename) {
+            Kind::Par2Base => Some((f, None)),
+            Kind::Par2Vol(n) => Some((f, Some(n))),
+            _ => None,
+        })
+        .collect();
+    let mut stems: BTreeMap<String, usize> = BTreeMap::new();
+    for (f, _) in &par2 {
+        *stems.entry(stem(&f.filename)).or_default() += 1;
+    }
+    let main =
+        stems.iter().max_by_key(|(name, n)| (**n, std::cmp::Reverse((*name).clone()))).map(|(name, _)| name.clone());
+    let mut ranked: Vec<_> = par2
+        .into_iter()
+        .map(|(f, vol)| {
+            let missing = f.expected.is_none_or(|e| f.parts_seen < e);
+            let own = main.as_deref() == Some(stem(&f.filename).as_str()) && !stem(&f.filename).contains("sample");
+            ((missing, !own, vol.is_some(), vol.unwrap_or(0), parts(f), f.filename.clone()), f)
+        })
+        .collect();
+    ranked.sort_by(|a, b| a.0.cmp(&b.0));
+    ranked.into_iter().map(|(_, f)| f).collect()
 }
 
 /// All filenames stored in `par2_files` for `release_id` (and any upload linked via `upload_link`).
