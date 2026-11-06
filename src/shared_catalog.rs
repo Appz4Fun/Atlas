@@ -306,14 +306,8 @@ pub fn sync_triggers(conn: &Connection, on: bool) -> rusqlite::Result<()> {
     let tables = tables(conn)?;
     if on {
         // a table no longer copied loses its triggers; the rest are made again
-        let old: Vec<String> = conn
-            .prepare("select name from sqlite_schema where type = 'trigger' and name like 'catalog\\_%' escape '\\'")?
-            .query_map([], |r| r.get(0))?
-            .collect::<rusqlite::Result<_>>()?;
         let mut sql = outbox_ddl("main");
-        for name in old {
-            sql.push_str(&format!("drop trigger if exists {};", quote(&name)));
-        }
+        sql.push_str(&drop_catalog_triggers(conn)?);
         for t in &tables {
             sql.push_str(&t.triggers());
         }
@@ -327,15 +321,20 @@ pub fn sync_triggers(conn: &Connection, on: bool) -> rusqlite::Result<()> {
         if present == 0 {
             return Ok(());
         }
-        let mut sql = String::new();
-        for t in &tables {
-            for kind in ["ai", "ad", "au"] {
-                sql.push_str(&format!("drop trigger if exists catalog_{}_{kind};", t.name));
-            }
-        }
+        // every catalog trigger, a retired table's too: left behind, it would write to the outbox about to go
+        let mut sql = drop_catalog_triggers(conn)?;
         sql.push_str(&format!("drop table if exists {OUTBOX};"));
         conn.execute_batch(&format!("begin; {sql} commit;"))
     }
+}
+
+/// `drop trigger` for every catalog trigger the shard has, whatever table it's on.
+fn drop_catalog_triggers(conn: &Connection) -> rusqlite::Result<String> {
+    let names: Vec<String> = conn
+        .prepare("select name from main.sqlite_schema where type = 'trigger' and name like 'catalog\\_%' escape '\\'")?
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(names.iter().map(|n| format!("drop trigger if exists {};", quote(n))).collect())
 }
 
 fn outbox_ddl(schema: &str) -> String {
@@ -1315,6 +1314,18 @@ mod tests {
         conn.execute("insert into releases (id, name) values (8, 'a')", []).unwrap();
         let waiting: i64 = conn.query_row("select count(*) from catalog_outbox", [], |r| r.get(0)).unwrap();
         assert_eq!(waiting, 1, "the copied tables still are");
+        // and turned off, a retired table's trigger goes too, before the outbox it writes to
+        conn.execute_batch(
+            "create trigger catalog_pp_queue_ai after insert on pp_queue begin
+                insert into catalog_outbox (tbl, k1) values ('pp_queue', new.release_id);
+             end;",
+        )
+        .unwrap();
+        sync_triggers(&conn, false).unwrap();
+        conn.execute("insert into pp_queue values (16, 1)", []).unwrap();
+        let left: i64 =
+            conn.query_row("select count(*) from sqlite_schema where name like 'catalog%'", [], |r| r.get(0)).unwrap();
+        assert_eq!(left, 0);
         assert_eq!(
             tables(&conn).unwrap().iter().find(|t| t.name == "par2_files").unwrap().delete_many_sql(),
             "delete from \"par2_files\" where shard = $1 and (\"release_id\", \"file_id\") in (select * from unnest($2::bigint[], $3::bytea[]))"
