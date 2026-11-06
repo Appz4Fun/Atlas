@@ -408,6 +408,24 @@ To see it:
 3. Push the dashboards with `dashboards.py push` as below and open **Atlas: Sealed log**.
 4. For numbers to paste somewhere, `python3 deploy/victoriametrics/sealed_log_report.py http://victoriametrics:8428 6h` prints throughput, latency on both ends, the disk and failures over the last 6 hours as a Markdown table. A `-` means no data: the service or Atlas wasn't running a build with metrics, or nothing moved in that window.
 
+### Shared catalog (Postgres)
+
+Atlas can keep a copy of every shard's release-level tables in one Postgres database: releases, their keys and fingerprints, PAR2 sets and upload links, categories, media and PreDB matches, postprocess state and the rest of what a lookup across groups compares. Article data (`segments`, `files`, `release_ids`, `file_timing`) stays in the shards. This is phase 1 of moving lookups across shards to one place: the shards stay what's true, and the copy only follows them. Nothing reads it yet.
+
+Turn it on in `config.toml`:
+
+```toml
+[shared_catalog]
+enabled = true
+url = "host=192.168.1.93 port=5434 user=atlas password=... dbname=atlas_catalog"
+# batch = 5000        # changes taken from one shard's outbox at a time
+# interval_ms = 1000  # rest when every outbox is empty
+```
+
+At its next start the indexer adds three triggers to each copied table in every shard, which put the key of each changed row in `catalog_outbox`. A publisher thread then sends each shard's changes as batches: the rows as they are now, upserted, and the ones gone, deleted, in one Postgres transaction, before taking them out of the outbox. It makes the Postgres tables itself, and adds columns a shard migration added. Keys that only mean something inside one shard (`collections`, `junk_collections`, `pp_walks`) are keyed by `shard` too, and every row carries the shard it came from. Turned off again, the next start drops the triggers and the outbox, so the writers pay nothing. Rows changed while it was off reach the copy only after a full refill.
+
+The publisher counts rows in `atlas_shared_catalog_rows_total`, shows each shard's waiting changes and the oldest one's age in `atlas_shared_catalog_outbox`, and failures in `atlas_shared_catalog_failures_total`. It times each batch as the function `shared_catalog.send`. If Postgres is down the outbox grows and the publisher retries with backoff; indexing goes on.
+
 PreDB titles, if you turn them on, live apart in `atlas.predb.db`. Compaction and conversion never touch it. It takes about 153 MB per million titles, and grows by under 2 MB a day.
 
 ### Converting an older database
