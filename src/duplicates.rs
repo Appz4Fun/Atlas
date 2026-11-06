@@ -631,10 +631,14 @@ pub fn same_payload(conn: &Connection, a: i64, b: i64) -> bool {
     !mine.is_empty() && mine == data(b)
 }
 
-/// The password `id`'s xposts and twins carry to it: of those holding its whole payload (`same_payload`), the first
-/// with a password hint of its own.
+/// The password that comes to `id` from elsewhere: first from the other rows of its own post (one upload, one
+/// password, though `copies_with` doesn't list them), then from its xposts and twins holding its whole payload
+/// (`same_payload`), the first with a password hint of its own.
 pub fn carried_password(conn: &Connection, id: i64, copies: &[(Copy, ReleaseRow)]) -> Option<Inherited> {
-    first_password(conn, carriers(conn, id, copies).iter().copied())
+    let mut rows: Vec<i64> = own_post_rows(conn, id).into_iter().filter(|row| *row != id).collect();
+    rows.sort_unstable();
+    let post: Vec<ReleaseRow> = rows.into_iter().filter_map(|row| get_release_with(conn, row).ok().flatten()).collect();
+    first_password(conn, post.iter()).or_else(|| first_password(conn, carriers(conn, id, copies).iter().copied()))
 }
 
 /// The copies of `id` a password carries to and from: xposts and twins holding its whole payload.

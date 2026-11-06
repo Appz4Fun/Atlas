@@ -2151,6 +2151,14 @@ mod tests {
         assert!(crate::duplicates::can_fill(&copies), "the separate upload can still lend articles");
         let own = crate::duplicates::copies_with(&conn, id(2, b)).unwrap();
         assert!(own.iter().all(|(_, r)| r.id != id(1, a)), "{own:?}");
+        // a password one row of the post has is the whole post's, though the rows aren't listed as copies
+        conn.execute(
+            &format!("insert into s{}.release_nfo_password (release_id, password) values (?1, 'x7Q2p')", store::shard_of(b)),
+            [id(2, b)],
+        )
+        .unwrap();
+        let carried = crate::duplicates::carried_password(&conn, id(1, a), &copies).expect("from row 2");
+        assert_eq!((carried.hint.password.as_str(), carried.from), ("x7Q2p", id(2, b)));
     }
 
     #[test]
