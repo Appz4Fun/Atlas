@@ -25,7 +25,9 @@ use crate::config::SharedCatalogConfig;
 use crate::metrics::names;
 use crate::store;
 
-/// Every table copied: what a lookup across groups or posts compares. Per-file article data stays in the shards.
+/// Every table copied: what a lookup across groups or posts compares. Per-file article data stays in the shards, and
+/// so do the queues that only say what's waiting (`freeze_pending`, `pp_queue`): they churn all day and nothing
+/// looks across groups in them.
 pub const TABLES: &[&str] = &[
     "releases",
     "release_category",
@@ -50,11 +52,9 @@ pub const TABLES: &[&str] = &[
     "collections",
     "junk_releases",
     "junk_collections",
-    "freeze_pending",
     "freeze_exempt",
     "nzb_pointed",
     "pp_state",
-    "pp_queue",
     "pp_walks",
     "sidecars",
 ];
@@ -196,6 +196,19 @@ impl Table {
         format!("delete from {} where {}", quote(&self.name), wh.join(" and "))
     }
 
+    /// `delete` of many rows this shard sent, their keys as arrays: `$2` (and `$3`) one per key column.
+    pub fn delete_many_sql(&self) -> String {
+        let key: Vec<String> = self.key.iter().map(|c| quote(c)).collect();
+        let types: Vec<&str> = (0..self.key.len()).map(|i| self.key_type(i).sql()).collect();
+        let arrays: Vec<String> = types.iter().enumerate().map(|(i, t)| format!("${}::{t}[]", i + 2)).collect();
+        format!(
+            "delete from {} where shard = $1 and ({}) in (select * from unnest({}))",
+            quote(&self.name),
+            key.join(", "),
+            arrays.join(", ")
+        )
+    }
+
     fn select_sql(&self) -> String {
         let cols: Vec<String> = self.cols.iter().map(|(c, _)| quote(c)).collect();
         let wh: Vec<String> = self.key.iter().enumerate().map(|(i, c)| format!("{} = ?{}", quote(c), i + 1)).collect();
@@ -292,7 +305,15 @@ pub fn tables(conn: &Connection) -> rusqlite::Result<Vec<Table>> {
 pub fn sync_triggers(conn: &Connection, on: bool) -> rusqlite::Result<()> {
     let tables = tables(conn)?;
     if on {
+        // a table no longer copied loses its triggers; the rest are made again
+        let old: Vec<String> = conn
+            .prepare("select name from sqlite_schema where type = 'trigger' and name like 'catalog\\_%' escape '\\'")?
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
         let mut sql = outbox_ddl("main");
+        for name in old {
+            sql.push_str(&format!("drop trigger if exists {};", quote(&name)));
+        }
         for t in &tables {
             sql.push_str(&t.triggers());
         }
@@ -598,18 +619,73 @@ pub fn send(
     }
     for (name, keys) in &batch.deletes {
         let Some(t) = tables.iter().find(|t| &t.name == name) else { continue };
-        let stmt = tx.prepare(&t.delete_sql())?;
-        for key in keys {
+        let sql = t.delete_many_sql();
+        for chunk in keys.chunks(DELETES_PER_STATEMENT) {
             let mut ps: Vec<Box<dyn postgres::types::ToSql + Sync + Send>> = vec![Box::new(shard_v)];
-            for (i, v) in key.iter().enumerate() {
-                ps.push(pg_value(v, t.key_type(i)));
+            for i in 0..t.key.len() {
+                ps.push(key_array(chunk.iter().map(|k| &k[i]), t.key_type(i)));
             }
             let refs: Vec<&(dyn postgres::types::ToSql + Sync)> = ps.iter().map(|p| &**p as _).collect();
-            del += tx.execute(&stmt, &refs)?;
+            del += tx.execute(sql.as_str(), &refs)?;
         }
     }
     tx.commit()?;
     Ok((up, del))
+}
+
+/// Keys one `delete` takes: they go as arrays, a parameter per key column.
+const DELETES_PER_STATEMENT: usize = 5_000;
+
+/// One key column of many rows as a Postgres array of the column's type, for `delete_many_sql`.
+fn key_array<'a>(values: impl Iterator<Item = &'a Value>, t: PgType) -> Box<dyn postgres::types::ToSql + Sync + Send> {
+    let values: Vec<&Value> = values.collect();
+    match t {
+        PgType::Int => Box::new(
+            values
+                .iter()
+                .map(|v| match v {
+                    Value::Integer(i) => Some(*i),
+                    Value::Real(f) => Some(*f as i64),
+                    Value::Text(s) => s.trim().parse::<i64>().ok(),
+                    _ => None,
+                })
+                .collect::<Vec<Option<i64>>>(),
+        ),
+        PgType::Real => Box::new(
+            values
+                .iter()
+                .map(|v| match v {
+                    Value::Integer(i) => Some(*i as f64),
+                    Value::Real(f) => Some(*f),
+                    _ => None,
+                })
+                .collect::<Vec<Option<f64>>>(),
+        ),
+        PgType::Text => Box::new(
+            values
+                .iter()
+                .map(|v| match v {
+                    Value::Text(s) => Some(s.replace('\0', "")),
+                    Value::Integer(i) => Some(i.to_string()),
+                    Value::Real(f) => Some(f.to_string()),
+                    Value::Blob(b) => Some(String::from_utf8_lossy(b).replace('\0', "")),
+                    Value::Null => None,
+                })
+                .collect::<Vec<Option<String>>>(),
+        ),
+        PgType::Bytes => Box::new(
+            values
+                .iter()
+                .map(|v| match v {
+                    Value::Blob(b) => Some(b.clone()),
+                    Value::Text(s) => Some(s.clone().into_bytes()),
+                    Value::Integer(i) => Some(i.to_string().into_bytes()),
+                    Value::Real(f) => Some(f.to_string().into_bytes()),
+                    Value::Null => None,
+                })
+                .collect::<Vec<Option<Vec<u8>>>>(),
+        ),
+    }
 }
 
 /// The first half of the advisory lock key: a shard's writes to Postgres hold the lock (this, shard) for their
@@ -672,14 +748,19 @@ pub fn start(config: &SharedCatalogConfig, stop: Arc<AtomicBool>) {
     if !on {
         return;
     }
-    let config = config.clone();
-    let _ = std::thread::Builder::new().name("shared-catalog".into()).spawn(move || run(&main, &config, &stop));
+    // a thread and a Postgres connection per shard: one shard's backlog, or a fill holding its lock, doesn't hold up
+    // the others
+    for (shard, path) in store::shard_paths(&main).into_iter().enumerate().filter(|(_, p)| p.exists()) {
+        let (main, config, stop) = (main.clone(), config.clone(), stop.clone());
+        let _ = std::thread::Builder::new()
+            .name(format!("shared-catalog-{shard}"))
+            .spawn(move || run(&main, &[(shard, path)], &config, &stop));
+    }
 }
 
-/// The publisher: a batch from each shard in turn, resting when every outbox is empty, reconnecting after a failure.
-pub fn run(main: &Path, config: &SharedCatalogConfig, stop: &AtomicBool) {
-    let shards: Vec<(usize, PathBuf)> =
-        store::shard_paths(main).into_iter().enumerate().filter(|(_, p)| p.exists()).collect();
+/// A publisher: a batch from each of `shards` in turn, resting when their outboxes are empty, reconnecting after a
+/// failure.
+pub fn run(main: &Path, shards: &[(usize, PathBuf)], config: &SharedCatalogConfig, stop: &AtomicBool) {
     let mut backoff = Duration::from_secs(1);
     while !stop.load(Relaxed) {
         let mut pg = match connect(config) {
@@ -692,7 +773,7 @@ pub fn run(main: &Path, config: &SharedCatalogConfig, stop: &AtomicBool) {
                 continue;
             }
         };
-        match publish(&mut pg, main, &shards, config, stop) {
+        match publish(&mut pg, main, shards, config, stop) {
             Ok(()) => return,
             Err(e) => {
                 names::SHARED_CATALOG_FAILURES.inc(&[("stage", "publish")], 1);
@@ -710,8 +791,24 @@ const SESSION: Duration = Duration::from_secs(60);
 /// A compaction in this process is about to start: the publisher lets go of the shards and stays away until it's
 /// done (`make_way_for_compaction`).
 static COMPACTION_WANTED: AtomicBool = AtomicBool::new(false);
-/// The publisher has the shards open and compaction held off.
-static HOLDING: AtomicBool = AtomicBool::new(false);
+/// Publisher threads that have their shard open and compaction held off.
+static HOLDING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Counts a publisher thread in `HOLDING` for as long as it lives.
+struct Held;
+
+impl Held {
+    fn new() -> Held {
+        HOLDING.fetch_add(1, Relaxed);
+        Held
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        HOLDING.fetch_sub(1, Relaxed);
+    }
+}
 
 /// Clears the wish to compact when dropped, once the compaction is over.
 pub struct MakingWay(());
@@ -728,7 +825,7 @@ impl Drop for MakingWay {
 pub fn make_way_for_compaction(wait: Duration) -> MakingWay {
     COMPACTION_WANTED.store(true, Relaxed);
     let until = std::time::Instant::now() + wait;
-    while HOLDING.load(Relaxed) && std::time::Instant::now() < until {
+    while HOLDING.load(Relaxed) > 0 && std::time::Instant::now() < until {
         std::thread::sleep(Duration::from_millis(50));
     }
     MakingWay(())
@@ -739,15 +836,16 @@ pub fn make_way_for_compaction(wait: Duration) -> MakingWay {
 /// soo the publisher opens them only while compaction is held off, and lets go when it has nothing to send or after
 /// `SESSION`.
 struct Session {
-    // dropped before the hold
+    // dropped in this order: the connections, the hold, then the count
     open: Vec<(usize, Connection, Vec<Table>)>,
     _hold: crate::compact::WriteGuard,
+    _held: Held,
     since: std::time::Instant,
 }
 
 impl Drop for Session {
     fn drop(&mut self) {
-        // the connections close before the hold goes (field order); the flag says so once both are gone
+        // the connections close before the hold goes (field order), and the count after both
         self.open.clear();
     }
 }
@@ -763,10 +861,8 @@ fn publish(
     let mut ensured: BTreeMap<usize, Vec<Table>> = BTreeMap::new();
     let mut gauges_at: Option<std::time::Instant> = None;
     let mut session: Option<Session> = None;
-    let _clear = ClearHolding;
     while !stop.load(Relaxed) {
         if session.is_none() {
-            HOLDING.store(false, Relaxed);
             if COMPACTION_WANTED.load(Relaxed) {
                 rest(stop, Duration::from_millis(config.interval_ms));
                 continue;
@@ -786,8 +882,7 @@ fn publish(
                 }
                 open.push((*shard, conn, tables));
             }
-            session = Some(Session { open, _hold: hold, since: std::time::Instant::now() });
-            HOLDING.store(true, Relaxed);
+            session = Some(Session { open, _hold: hold, _held: Held::new(), since: std::time::Instant::now() });
         }
         let Some(open) = session.as_ref().map(|s| &s.open) else { continue };
         let mut busy = false;
@@ -809,22 +904,12 @@ fn publish(
         }
         if !busy || COMPACTION_WANTED.load(Relaxed) || session.as_ref().is_some_and(|s| s.since.elapsed() >= SESSION) {
             session = None;
-            HOLDING.store(false, Relaxed);
         }
         if !busy {
             rest(stop, Duration::from_millis(config.interval_ms));
         }
     }
     Ok(())
-}
-
-/// The publisher's hold is gone however `publish` ends, an error included.
-struct ClearHolding;
-
-impl Drop for ClearHolding {
-    fn drop(&mut self) {
-        HOLDING.store(false, Relaxed);
-    }
 }
 
 fn rest(stop: &AtomicBool, d: Duration) {
@@ -1189,18 +1274,18 @@ mod tests {
     #[test]
     fn a_compaction_waits_for_the_publisher_to_let_go_and_keeps_it_away_till_done() {
         let _one = PG.lock().unwrap_or_else(|e| e.into_inner());
-        HOLDING.store(true, Relaxed);
-        let publisher = std::thread::spawn(|| {
+        let held = Held::new();
+        let publisher = std::thread::spawn(move || {
             // the publisher sees the wish at the end of its batch
             while !COMPACTION_WANTED.load(Relaxed) {
                 std::thread::sleep(Duration::from_millis(5));
             }
             std::thread::sleep(Duration::from_millis(100));
-            HOLDING.store(false, Relaxed);
+            drop(held);
         });
         let started = std::time::Instant::now();
         let way = make_way_for_compaction(Duration::from_secs(10));
-        assert!(!HOLDING.load(Relaxed));
+        assert_eq!(HOLDING.load(Relaxed), 0);
         assert!(started.elapsed() >= Duration::from_millis(100), "it waited for the let-go");
         assert!(COMPACTION_WANTED.load(Relaxed), "and the publisher stays away meanwhile");
         drop(way);
@@ -1210,6 +1295,30 @@ mod tests {
         let started = std::time::Instant::now();
         drop(make_way_for_compaction(Duration::from_secs(10)));
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn a_table_no_longer_copied_loses_its_triggers() {
+        let conn = shard();
+        conn.execute_batch(
+            "create table pp_queue (release_id INTEGER PRIMARY KEY, due_at INTEGER NOT NULL);
+             create table catalog_outbox (seq INTEGER PRIMARY KEY, tbl TEXT NOT NULL, k1, k2, at INTEGER);
+             create trigger catalog_pp_queue_ai after insert on pp_queue begin
+                insert into catalog_outbox (tbl, k1) values ('pp_queue', new.release_id);
+             end;",
+        )
+        .unwrap();
+        sync_triggers(&conn, true).unwrap();
+        conn.execute("insert into pp_queue values (8, 1)", []).unwrap();
+        let waiting: i64 = conn.query_row("select count(*) from catalog_outbox", [], |r| r.get(0)).unwrap();
+        assert_eq!(waiting, 0, "pp_queue isn't copied any more");
+        conn.execute("insert into releases (id, name) values (8, 'a')", []).unwrap();
+        let waiting: i64 = conn.query_row("select count(*) from catalog_outbox", [], |r| r.get(0)).unwrap();
+        assert_eq!(waiting, 1, "the copied tables still are");
+        assert_eq!(
+            tables(&conn).unwrap().iter().find(|t| t.name == "par2_files").unwrap().delete_many_sql(),
+            "delete from \"par2_files\" where shard = $1 and (\"release_id\", \"file_id\") in (select * from unnest($2::bigint[], $3::bytea[]))"
+        );
     }
 
     #[test]
@@ -1507,13 +1616,23 @@ mod tests {
         assert_eq!(send(&mut pg, 3, &t, &batch).unwrap(), (5, 0));
         assert_eq!(send(&mut pg, 3, &t, &batch).unwrap(), (5, 0), "sent again after a crash: same rows");
         ack(&conn, batch.max_seq).unwrap();
-        conn.execute_batch("delete from releases where id = 16; update releases set size = 9 where id = 8;").unwrap();
+        conn.execute_batch(
+            "delete from releases where id = 16; update releases set size = 9 where id = 8;
+             insert into par2_files values (8, x'01', 'b.par2');",
+        )
+        .unwrap();
         let batch = read_batch(&conn, &t, 100, BATCH_BYTES).unwrap();
-        assert_eq!(send(&mut pg, 3, &t, &batch).unwrap(), (1, 1));
+        assert_eq!(send(&mut pg, 3, &t, &batch).unwrap(), (2, 1));
+        ack(&conn, batch.max_seq).unwrap();
+        // many deletes go as one statement, a two-column blob key included
+        conn.execute_batch("delete from par2_files;").unwrap();
+        let batch = read_batch(&conn, &t, 100, BATCH_BYTES).unwrap();
+        assert_eq!(send(&mut pg, 3, &t, &batch).unwrap(), (0, 2));
+        let left: i64 = pg.query_one("select count(*) from par2_files", &[]).unwrap().get(0);
+        assert_eq!(left, 0);
         let row = pg.query_one("select shard, name, size from releases", &[]).unwrap();
         assert_eq!((row.get::<_, i16>(0), row.get::<_, String>(1), row.get::<_, i64>(2)), (3, "a".into(), 9));
-        let blob: Vec<u8> = pg.query_one("select file_id from par2_files", &[]).unwrap().get(0);
-        assert_eq!(blob, vec![0, 255]);
+
         let n: i64 = pg.query_one("select count(*) from collections where shard = 3", &[]).unwrap().get(0);
         assert_eq!(n, 1);
         // a shard migration's new column reaches Postgres
