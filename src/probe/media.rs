@@ -34,7 +34,8 @@ pub struct MediaInfo {
     pub attachments: Vec<Attachment>,
     /// tags extracted from Tags element
     pub tags: HashMap<String, String>,
-    /// a DVD's ID as libdvdread's `DVDDiscID` makes it (see `dvd::disc_id`): the same disc ripped twice has the same one
+    /// a DVD's ID as libdvdread's `DVDDiscID` makes it (see `dvd::disc_id`): the same disc ripped twice has the same one.
+    /// A Blu-ray's is its `id.bdmv` org ID and disc ID in hex (see `bluray::disc_id`).
     pub disc_id: Option<String>,
     /// cover art that was attached whole, kept apart from the JSON
     #[serde(skip)]
@@ -46,6 +47,25 @@ pub struct MediaInfo {
     /// The encoder's settings ran to their end in what was read, not to the end of the read.
     #[serde(skip)]
     pub encoder_complete: bool,
+    /// Each Matroska track's UID, its kind (1 video, 2 audio, 17 subtitles) and its place in that list: Tags name
+    /// their track by UID.
+    #[serde(skip)]
+    pub track_uids: Vec<(u64, u64, usize)>,
+}
+
+/// What mkvmerge counted on a track as it wrote the file, from its statistics tags: exact, not estimated. Two
+/// files whose tracks have the same counts were most likely muxed from the same streams.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TrackStats {
+    /// `BPS`: bits per second, over the whole track
+    pub bps: Option<u64>,
+    /// `NUMBER_OF_FRAMES`: frames, or a subtitle track's events
+    pub frames: Option<u64>,
+    /// `NUMBER_OF_BYTES`
+    pub bytes: Option<u64>,
+    /// `DURATION`, in seconds
+    pub duration_secs: Option<f64>,
 }
 
 /// The title a file's tags name: an IMDb id (`IMDB=tt0133093`), a TMDB id with its kind (`TMDB=movie/603`,
@@ -131,6 +151,9 @@ pub struct VideoTrack {
     /// Vision NAL units, which muxers add and drop), first 8 bytes as 16 hex digits. A remux of the same video
     /// stream has the same; another encode doesn't. None unless that whole frame was in what was read.
     pub keyframe_key: Option<String>,
+    /// mkvmerge's statistics tags for the track
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stats: Option<TrackStats>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -153,6 +176,9 @@ pub struct AudioTrack {
     /// of the same audio has the same in any container; another encode doesn't. None for other codecs, or when the
     /// frames read run out first.
     pub stream_key: Option<String>,
+    /// mkvmerge's statistics tags for the track
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stats: Option<TrackStats>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -165,6 +191,9 @@ pub struct SubtitleTrack {
     pub hearing_impaired: bool,
     pub commentary: bool,
     pub default: bool,
+    /// mkvmerge's statistics tags for the track
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stats: Option<TrackStats>,
 }
 
 const EBML_MAGIC: &[u8] = &[0x1a, 0x45, 0xdf, 0xa3];
@@ -311,6 +340,7 @@ fn text(b: &[u8]) -> String {
 #[derive(Default)]
 struct Track {
     number: Option<u64>,
+    uid: Option<u64>,
     kind: u64,
     codec: String,
     language: Option<String>,
@@ -361,6 +391,7 @@ fn track_entry(b: &[u8]) -> Track {
     walk(b, &mut |id, v| {
         match id {
             0xD7 => t.number = Some(uint(v)),
+            0x73C5 => t.uid = Some(uint(v)),
             0x83 => t.kind = uint(v),
             0x86 => t.codec = text(v),
             0x63A2 => t.codec_private = Some(v.to_vec()),
@@ -535,6 +566,7 @@ fn segment(body: &[u8], info: &mut MediaInfo) {
             }
             0x1941_A469 => attachments(v, info),
             0x1254_C367 if info.tags.len() < MAX_TAGS => {
+                tag_children(v, info, false);
                 walk(v, &mut |id, tag| {
                     if info.tags.len() >= MAX_TAGS {
                         return false;
@@ -754,6 +786,15 @@ fn add_track(t: Track, info: &mut MediaInfo) {
     if is_full(info) {
         return;
     }
+    let at = match t.kind {
+        1 => Some(info.video.len()),
+        2 => Some(info.audio.len()),
+        17 => Some(info.subtitles.len()),
+        _ => None,
+    };
+    if let (Some(uid), Some(at)) = (t.uid, at) {
+        info.track_uids.push((uid, t.kind, at));
+    }
     match t.kind {
         1 => {
             let mut dv_info = t.dolby_vision;
@@ -789,6 +830,7 @@ fn add_track(t: Track, info: &mut MediaInfo) {
                 dolby_vision: dv_info,
                 language: t.language,
                 keyframe_key: None,
+                stats: None,
             })
         }
         2 => info.audio.push(AudioTrack {
@@ -807,6 +849,7 @@ fn add_track(t: Track, info: &mut MediaInfo) {
             sample_rate: t.sample_rate,
             language: t.language,
             name: t.name,
+            stats: None,
         }),
         17 => info.subtitles.push(SubtitleTrack {
             forced: t.forced,
@@ -817,9 +860,212 @@ fn add_track(t: Track, info: &mut MediaInfo) {
             codec: t.codec,
             language: t.language,
             name: t.name,
+            stats: None,
         }),
         _ => {}
     }
+}
+
+// ---- Matroska Tags at the end of the file
+
+/// The Tags element's ID, as a SeekHead names it.
+const TAGS_ID: [u8; 4] = [0x12, 0x54, 0xC3, 0x67];
+
+/// The tag names mkvmerge writes per track, counted while it muxed. They go on the track, not in `tags`.
+const STATISTICS: [&str; 7] = [
+    "BPS",
+    "DURATION",
+    "NUMBER_OF_FRAMES",
+    "NUMBER_OF_BYTES",
+    "_STATISTICS_WRITING_APP",
+    "_STATISTICS_WRITING_DATE_UTC",
+    "_STATISTICS_TAGS",
+];
+
+/// An element's ID, where its body starts, and its size (None: unknown), from its first byte at `at`.
+fn head(b: &[u8], at: usize) -> Option<(u32, usize, Option<usize>)> {
+    let (id, id_len) = element_id(b.get(at..)?)?;
+    let (size, size_len) = element_size(b.get(at + id_len..)?)?;
+    let size = match size {
+        Some(s) => Some(usize::try_from(s).ok()?),
+        None => None,
+    };
+    Some((id, at + id_len + size_len, size))
+}
+
+/// The whole length of the element starting `b`: its ID, size and body. None when it can't be told.
+pub fn element_len(b: &[u8]) -> Option<u64> {
+    let (_, body_at, size) = head(b, 0)?;
+    Some(body_at as u64 + size? as u64)
+}
+
+/// Where the file's Tags are, as file offsets from its first byte, when the front's SeekHead puts them past the
+/// first Cluster, where the front isn't read: mkvmerge writes its Tags, with the statistics of every track, after
+/// the last one. Nearest first; empty when the SeekHead names none there.
+pub fn matroska_tags_past(front: &[u8]) -> Vec<u64> {
+    let mut out = Vec::new();
+    let mut at = 0usize;
+    while let Some((id, body_at, size)) = head(front, at) {
+        if id != 0x1853_8067 {
+            let Some(size) = size else { return out };
+            at = body_at.saturating_add(size);
+            continue;
+        }
+        // the segment's children, up to its first Cluster; SeekPositions count from where its body starts
+        let end = size.map_or(front.len(), |s| body_at.saturating_add(s)).min(front.len());
+        let (mut child, mut cluster) = (body_at, None);
+        while child < end {
+            let Some((id, child_at, Some(size))) = head(front, child) else { break };
+            if id == 0x1F43_B675 {
+                cluster = Some(child);
+                break;
+            }
+            if id == 0x114D_9B74 {
+                let body = front.get(child_at..child_at.saturating_add(size).min(end)).unwrap_or_default();
+                walk(body, &mut |id, seek| {
+                    if id == 0x4DBB {
+                        let (mut is_tags, mut position) = (false, None);
+                        walk(seek, &mut |id, v| {
+                            match id {
+                                0x53AB => is_tags = v == TAGS_ID,
+                                0x53AC if v.len() <= 8 => position = Some(uint(v)),
+                                _ => {}
+                            }
+                            true
+                        });
+                        if let Some(position) = position
+                            && is_tags
+                        {
+                            out.push((body_at as u64).saturating_add(position));
+                        }
+                    }
+                    true
+                });
+            }
+            child = child_at.saturating_add(size);
+        }
+        // Tags in front of the first Cluster were read with the rest of the header
+        let past = cluster.unwrap_or(front.len()) as u64;
+        out.retain(|p| *p >= past);
+        out.sort_unstable();
+        out.dedup();
+        return out;
+    }
+    out
+}
+
+/// Reads a Tags element, `tags` starting at its ID, found after the Clusters: each track's statistics go on the
+/// track, the other tags into `info.tags` as the front's do, except those that can name a person, which aren't kept.
+/// Only whole Tag elements count: a value cut off at the end of what was read would be wrong. Whether it found any.
+pub fn tail_tags(tags: &[u8], info: &mut MediaInfo) -> bool {
+    let Some((_, body_at, size)) = head(tags, 0).filter(|(id, _, _)| *id == 0x1254_C367) else { return false };
+    let end = size.map_or(tags.len(), |s| body_at.saturating_add(s)).min(tags.len());
+    tag_children(tags.get(body_at..end).unwrap_or_default(), info, true)
+}
+
+/// The most tracks one Tag is read for.
+const MAX_TAG_TARGETS: usize = 16;
+
+/// Goes through a Tags element's body: the statistics of each Tag aimed at a track go on that track, and with
+/// `keep`, the other tags go into `info.tags`. Whether a track got any.
+fn tag_children(body: &[u8], info: &mut MediaInfo, keep: bool) -> bool {
+    let mut found = false;
+    walk_sized(body, &mut |id, tag, size| {
+        // a Tag cut off at the end of what was read
+        if id != 0x7373 || size != Some(tag.len() as u64) {
+            return true;
+        }
+        let mut uids = Vec::new();
+        let mut simple = Vec::new();
+        walk_sized(tag, &mut |id, v, size| {
+            match id {
+                0x63C0 => walk(v, &mut |id, v| {
+                    if id == 0x63C5 && v.len() <= 8 && uids.len() < MAX_TAG_TARGETS {
+                        uids.push(uint(v));
+                    }
+                    true
+                }),
+                0x67C8 if size == Some(v.len() as u64) => {
+                    let (mut name, mut value) = (None, None);
+                    walk(v, &mut |id, v| {
+                        match id {
+                            0x45A3 => name = Some(text(v)),
+                            0x4487 => value = Some(text(v)),
+                            _ => {}
+                        }
+                        true
+                    });
+                    if let (Some(name), Some(value)) = (name, value)
+                        && !name.is_empty()
+                        && !value.is_empty()
+                        && simple.len() < MAX_TAGS
+                    {
+                        simple.push((name, value));
+                    }
+                }
+                _ => {}
+            }
+            true
+        });
+        for (name, value) in simple {
+            let upper = name.to_ascii_uppercase();
+            if STATISTICS.contains(&upper.as_str()) {
+                // 0 aims at every track, which says nothing of one
+                for uid in uids.iter().filter(|u| **u != 0) {
+                    found |= track_stat(info, *uid, &upper, &value);
+                }
+            } else if keep
+                && !names_a_person(&upper, &value)
+                && (info.tags.len() < MAX_TAGS || info.tags.contains_key(&name))
+            {
+                info.tags.insert(name, value);
+            }
+        }
+        true
+    });
+    found
+}
+
+/// A tag the release page never shows, as `web` has it: the encoder's or buyer's name, an e-mail address.
+fn names_a_person(upper: &str, value: &str) -> bool {
+    upper == "ENCODED_BY" || upper.starts_with("PURCHASE_") || upper.contains("EMAIL") || value.contains('@')
+}
+
+/// One statistics tag onto the track with that UID. Whether it was one of the counts kept.
+fn track_stat(info: &mut MediaInfo, uid: u64, name: &str, value: &str) -> bool {
+    let Some(&(_, kind, at)) = info.track_uids.iter().find(|(u, _, _)| *u == uid) else { return false };
+    let stats = match kind {
+        1 => info.video.get_mut(at).map(|t| &mut t.stats),
+        2 => info.audio.get_mut(at).map(|t| &mut t.stats),
+        17 => info.subtitles.get_mut(at).map(|t| &mut t.stats),
+        _ => None,
+    };
+    let Some(stats) = stats else { return false };
+    let number = || value.trim().parse::<u64>().ok();
+    let s = stats.get_or_insert_with(TrackStats::default);
+    match name {
+        "BPS" => s.bps = number(),
+        "NUMBER_OF_FRAMES" => s.frames = number(),
+        "NUMBER_OF_BYTES" => s.bytes = number(),
+        "DURATION" => s.duration_secs = clock_secs(value),
+        _ => {}
+    }
+    if *s == TrackStats::default() {
+        *stats = None;
+        return false;
+    }
+    true
+}
+
+/// `01:23:45.678000000` as seconds.
+fn clock_secs(value: &str) -> Option<f64> {
+    let mut parts = value.trim().split(':');
+    let (h, m, s) = (parts.next()?, parts.next()?, parts.next()?);
+    if parts.next().is_some() {
+        return None;
+    }
+    let (h, m, s) = (h.parse::<u64>().ok()?, m.parse::<u64>().ok()?, s.parse::<f64>().ok()?);
+    (m < 60 && (0.0..60.0).contains(&s)).then(|| (h * 3600 + m * 60) as f64 + s)
 }
 
 // ---- MP4
@@ -3694,5 +3940,167 @@ mod tests {
         assert_eq!(with(&[("TVDB2", "series/81189")]).title_ids().tvdb, Some(81_189));
         let bad = with(&[("IMDB", "tt"), ("TMDB", "person/1"), ("TVDB", "12a"), ("IMDB2", "tt1")]).title_ids();
         assert_eq!(bad, TitleIds::default());
+    }
+
+    fn simple_tag(name: &str, value: &str) -> Vec<u8> {
+        el(&[0x67, 0xC8], &[el(&[0x45, 0xA3], name.as_bytes()), el(&[0x44, 0x87], value.as_bytes())].concat())
+    }
+
+    /// A Tag aimed at the track with UID `uid` (none: the whole file) with these simple tags.
+    fn tag(uid: Option<u64>, simple: &[(&str, &str)]) -> Vec<u8> {
+        let targets = uid.map_or(Vec::new(), |u| el(&[0x63, 0xC5], &u.to_be_bytes()));
+        let mut body = el(&[0x63, 0xC0], &targets);
+        for (n, v) in simple {
+            body.extend(simple_tag(n, v));
+        }
+        el(&[0x73, 0x73], &body)
+    }
+
+    /// The statistics mkvmerge writes on a track.
+    fn statistics(bps: &str, frames: &str, bytes: &str, duration: &str) -> Vec<(&'static str, String)> {
+        vec![
+            ("BPS", bps.into()),
+            ("DURATION", duration.into()),
+            ("NUMBER_OF_FRAMES", frames.into()),
+            ("NUMBER_OF_BYTES", bytes.into()),
+            ("_STATISTICS_WRITING_APP", "mkvmerge v80.0 ('Roundabout') 64-bit".into()),
+            ("_STATISTICS_WRITING_DATE_UTC", "2024-01-02 03:04:05".into()),
+            ("_STATISTICS_TAGS", "BPS DURATION NUMBER_OF_FRAMES NUMBER_OF_BYTES".into()),
+        ]
+    }
+
+    /// An mkvmerge-style file: a SeekHead naming the Tags, a video, an audio and a subtitle track with UIDs, one
+    /// Cluster, then the Tags with each track's statistics and two file tags. With `front_tags`, the Tags come
+    /// before the Cluster instead, as Lavf writes them. The file and where its Tags start.
+    fn mkvmerge_file(front_tags: bool) -> (Vec<u8>, usize) {
+        let track = |kind: u8, uid: u64, codec: &[u8]| {
+            el(&[0xAE], &[el(&[0x83], &[kind]), el(&[0x73, 0xC5], &uid.to_be_bytes()), el(&[0x86], codec)].concat())
+        };
+        let tracks = el(
+            &[0x16, 0x54, 0xAE, 0x6B],
+            &[track(1, 0xAAAA, b"V_MPEGH/ISO/HEVC"), track(2, 0xBBBB, b"A_EAC3"), track(17, 0xCCCC, b"S_TEXT/UTF8")]
+                .concat(),
+        );
+        let info = el(&[0x15, 0x49, 0xA9, 0x66], &el(&[0x57, 0x41], b"mkvmerge v80"));
+        let cluster = el(&[0x1F, 0x43, 0xB6, 0x75], &[0; 32]);
+        let mut all = Vec::new();
+        for (uid, stats) in [
+            (0xAAAA, statistics("8123456", "172345", "7302958152", "01:59:52.432000000")),
+            (0xBBBB, statistics("640000", "224740", "575334400", "01:59:52.448000000")),
+            (0xCCCC, statistics("72", "1534", "64893", "01:56:10.120000000")),
+        ] {
+            let pairs: Vec<(&str, &str)> = stats.iter().map(|(n, v)| (*n, v.as_str())).collect();
+            all.extend(tag(Some(uid), &pairs));
+        }
+        all.extend(tag(
+            None,
+            &[("IMDB", "tt0133093"), ("ENCODED_BY", "Some Person"), ("COMMENT", "ask me@example.com")],
+        ));
+        let tags = el(&[0x12, 0x54, 0xC3, 0x67], &all);
+        // a fixed width SeekPosition, soo the SeekHead's size doesn't depend on it
+        let seek_head = |position: u32| {
+            let seek = [el(&[0x53, 0xAB], &[0x12, 0x54, 0xC3, 0x67]), el(&[0x53, 0xAC], &position.to_be_bytes())];
+            el(&[0x11, 0x4D, 0x9B, 0x74], &el(&[0x4D, 0xBB], &seek.concat()))
+        };
+        let head_len = seek_head(0).len() + info.len() + tracks.len();
+        let (position, body) = if front_tags {
+            (head_len, [seek_head(head_len as u32), info, tracks, tags, cluster].concat())
+        } else {
+            let at = head_len + cluster.len();
+            (at, [seek_head(at as u32), info, tracks, cluster, tags].concat())
+        };
+        let ebml = el(&[0x1A, 0x45, 0xDF, 0xA3], &el(&[0x42, 0x82], b"matroska"));
+        let segment = el(&[0x18, 0x53, 0x80, 0x67], &body);
+        // the segment's ID and its 2-byte size, then its body
+        let tags_at = ebml.len() + 4 + 2 + position;
+        ([ebml, segment].concat(), tags_at)
+    }
+
+    #[test]
+    fn mkvmerge_statistics_come_from_the_tags_at_the_end() {
+        let (file, tags_at) = mkvmerge_file(false);
+        assert_eq!(&file[tags_at..tags_at + 4], &[0x12, 0x54, 0xC3, 0x67]);
+        let front = &file[..tags_at];
+        let mut info = parse(front).unwrap();
+        assert!(info.header_complete);
+        assert!(info.video[0].stats.is_none(), "the front has no statistics");
+        assert_eq!(matroska_tags_past(front), [tags_at as u64]);
+        assert_eq!(matroska_tags_past(&file), [tags_at as u64], "past the first Cluster, read or not");
+        assert_eq!(element_len(&file[tags_at..]), Some((file.len() - tags_at) as u64));
+        assert!(tail_tags(&file[tags_at..], &mut info));
+        let v = info.video[0].stats.as_ref().unwrap();
+        assert_eq!((v.bps, v.frames, v.bytes), (Some(8_123_456), Some(172_345), Some(7_302_958_152)));
+        assert!((v.duration_secs.unwrap() - 7192.432).abs() < 1e-6);
+        let a = info.audio[0].stats.as_ref().unwrap();
+        assert_eq!((a.bps, a.frames, a.bytes), (Some(640_000), Some(224_740), Some(575_334_400)));
+        let s = info.subtitles[0].stats.as_ref().unwrap();
+        assert_eq!((s.bps, s.frames, s.bytes), (Some(72), Some(1534), Some(64_893)));
+        // the file's own tags join the front's, but never one that names a person, and no statistics
+        assert_eq!(info.tags.get("IMDB").map(String::as_str), Some("tt0133093"));
+        assert!(!info.tags.contains_key("ENCODED_BY") && !info.tags.contains_key("COMMENT"));
+        assert!(!info.tags.contains_key("BPS") && !info.tags.contains_key("_STATISTICS_WRITING_APP"));
+        // kept in the JSON; a track without them writes nothing new, and old JSON reads
+        let json = serde_json::to_string(&info).unwrap();
+        assert!(json.contains("\"stats\":{\"bps\":8123456,\"frames\":172345"), "{json}");
+        let back: MediaInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.video[0].stats, info.video[0].stats);
+        assert!(!serde_json::to_string(&VideoTrack::default()).unwrap().contains("stats"));
+    }
+
+    #[test]
+    fn statistics_in_front_of_the_cluster_are_read_with_the_header() {
+        let (file, tags_at) = mkvmerge_file(true);
+        let info = parse(&file).unwrap();
+        assert_eq!(info.video[0].stats.as_ref().and_then(|s| s.frames), Some(172_345));
+        assert_eq!(info.subtitles[0].stats.as_ref().and_then(|s| s.frames), Some(1534));
+        assert!(matroska_tags_past(&file).is_empty(), "nothing at the end to fetch");
+        assert!(tags_at < file.len());
+    }
+
+    #[test]
+    fn cut_or_odd_tail_tags_never_give_a_wrong_count() {
+        let (file, tags_at) = mkvmerge_file(false);
+        let front = &file[..tags_at];
+        let base = parse(front).unwrap();
+        let tail = &file[tags_at..];
+        for cut in 0..=tail.len() {
+            let mut info = base.clone();
+            tail_tags(&tail[..cut], &mut info);
+            // a count is the whole one or none at all
+            for stats in [&info.video[0].stats, &info.audio[0].stats, &info.subtitles[0].stats].into_iter().flatten() {
+                assert!(stats.bytes.is_none_or(|b| [7_302_958_152, 575_334_400, 64_893].contains(&b)), "{cut}");
+                assert!(stats.frames.is_none_or(|f| [172_345, 224_740, 1534].contains(&f)), "{cut}");
+            }
+        }
+        for cut in 0..file.len() {
+            let _ = matroska_tags_past(&file[..cut]);
+            let _ = parse(&file[..cut]);
+        }
+        // a Tag for a track that isn't there, junk values, a Tags element that isn't one
+        let mut info = base.clone();
+        let odd = el(
+            &[0x12, 0x54, 0xC3, 0x67],
+            &[
+                tag(Some(0xDEAD), &[("BPS", "1")]),
+                tag(Some(0xAAAA), &[("BPS", "fast"), ("DURATION", "99:99:99")]),
+                tag(Some(0), &[("NUMBER_OF_FRAMES", "5")]),
+            ]
+            .concat(),
+        );
+        assert!(!tail_tags(&odd, &mut info));
+        assert!(info.video[0].stats.is_none());
+        assert!(!tail_tags(&el(&[0x1F, 0x43, 0xB6, 0x75], &[0; 8]), &mut info));
+        assert!(!tail_tags(&[0xFF; 64], &mut info));
+        assert!(
+            matroska_tags_past(&[0x1A, 0x45, 0xDF, 0xA3, 0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]).is_empty()
+        );
+        // a SeekPosition far past any file still comes out, for the caller to check against the file's size
+        let huge = [0x53, 0xAC, 0x88, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
+        let seek = el(&[0x4D, 0xBB], &[el(&[0x53, 0xAB], &[0x12, 0x54, 0xC3, 0x67]).as_slice(), &huge].concat());
+        let segment = el(&[0x18, 0x53, 0x80, 0x67], &el(&[0x11, 0x4D, 0x9B, 0x74], &seek));
+        assert_eq!(matroska_tags_past(&segment), [u64::MAX]);
+        assert_eq!(clock_secs("00:00:01.5"), Some(1.5));
+        assert_eq!(clock_secs("1:60:00"), None);
+        assert_eq!(clock_secs("x"), None);
     }
 }
