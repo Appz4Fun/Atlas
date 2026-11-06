@@ -15,8 +15,15 @@
 //! with its trailing dot line), with the part's number and decoded size: the same article posted again byte for
 //! byte, under any Message-ID, poster or subject.
 //!
+//! Four come from an archive's own headers (`archive::facts`), kept by the archive step: a file inside an archive by
+//! its unpacked size and CRC32 (`archive_inner_files`), the same in a RAR, a 7z or a ZIP and against a file posted
+//! bare or described by a PAR2 set; the random values one archive carries and no other (`archive_release.twin_key`:
+//! RAR5 `-hp` salt and check, a RAR4 or RAR5 file's salt, 7z's AES IV or start header); and two salted ones, the Unix
+//! owner a packer recorded and the packer's clock zone with how it packed (`owner_key`, `zone_key`).
+//!
 //! These are candidates for a reader, never a merge: no key here groups, links or completes anything on its own.
-//! The raw posting account and host are never stored, only their salted digests.
+//! The raw posting account and host, an archive's owner and zone are never stored, only their salted digests, and the
+//! archive keys are never printed: the page shows how many releases share one, not its value.
 
 use std::sync::OnceLock;
 
@@ -112,12 +119,16 @@ pub enum Kind {
     BodyCrc,
     Video,
     Audio,
+    InnerFile,
+    ArchiveTwin,
+    Owner,
+    Zone,
     /// the same sound by audio fingerprint (`probe::audio_print`), kept only for releases nothing else ties
     AudioPrint,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 11] = [
+    pub const ALL: [Kind; 15] = [
         Kind::Account,
         Kind::Host,
         Kind::Layout,
@@ -128,6 +139,10 @@ impl Kind {
         Kind::BodyCrc,
         Kind::Video,
         Kind::Audio,
+        Kind::InnerFile,
+        Kind::ArchiveTwin,
+        Kind::Owner,
+        Kind::Zone,
         Kind::AudioPrint,
     ];
 
@@ -144,6 +159,10 @@ impl Kind {
             Kind::BodyCrc => "article",
             Kind::Video => "video",
             Kind::Audio => "audio",
+            Kind::InnerFile => "inner",
+            Kind::ArchiveTwin => "archive",
+            Kind::Owner => "owner",
+            Kind::Zone => "zone",
             Kind::AudioPrint => "audioprint",
         }
     }
@@ -165,6 +184,10 @@ impl Kind {
             Kind::BodyCrc => "Same first article, by the server's body CRC",
             Kind::Video => "Same video stream",
             Kind::Audio => "Same audio stream",
+            Kind::InnerFile => "Same file inside an archive, by unpacked size and CRC32",
+            Kind::ArchiveTwin => "Same archive, by its own random values",
+            Kind::Owner => "Same Unix owner in the archive",
+            Kind::Zone => "Same packer settings and clock zone",
             Kind::AudioPrint => "Same sound, by audio fingerprint",
         }
     }
@@ -200,6 +223,18 @@ impl Kind {
             Kind::Audio => {
                 "The same first audio track, to the bit: FLAC's MD5 of its samples, or the first eight different AC-3 or E-AC-3 frames. The same audio remuxed, whatever the video, container or group: a hybrid or another encode can keep the source's audio. A studio's logo music, encoded once and reused, can match across films, soo check the names."
             }
+            Kind::InnerFile => {
+                "A file inside one of its archives with the same unpacked size and CRC32 as a file in another release's archive, a file posted bare or one a PAR2 set describes: the same file, as a rule, whether it was put in a RAR, a 7z or a ZIP. Only files a header gives the whole CRC for count: a RAR file split over volumes doesn't. A 32-bit CRC can match by chance, soo check the size and names."
+            }
+            Kind::ArchiveTwin => {
+                "The same random values an archive is made with: a RAR5 password's salt and check, a RAR file's salt, a 7z's AES IV or its start header. The same archive, byte for byte, posted again, whatever it and its volumes are called. A new archive of the same files has new ones. The values are kept as a key only and never shown."
+            }
+            Kind::Owner => {
+                "The same Unix user and group a RAR or ZIP recorded for its files, going by a salted hash of them: the same packing account, as a rule. Shared names like root are common, soo many uploaders can share one. The names are never stored or shown."
+            }
+            Kind::Zone => {
+                "Packed with the same settings on a clock the same distance from UTC, going by a salted hash of both: from a ZIP's local and UTC times of one moment, or an archive's local time set against the post's date, which is a guess. Many uploaders share a zone and a tool, soo it's a weak hint. The zone is never stored or shown."
+            }
             Kind::AudioPrint => {
                 "The same sound a quarter, half and three quarters of the way in, as Chromaprint hears it: often the same film or episode in another encode, codec or container. Taken only for releases no other key ties to another, from AAC, FLAC, MP3, MP2, Vorbis and PCM tracks in Matroska. A theme tune or a recap can match across episodes, soo check the names."
             }
@@ -216,7 +251,18 @@ impl Kind {
             Kind::BodyCrc => Some("body_crc"),
             Kind::Video => Some("video"),
             Kind::Audio => Some("audio"),
-            Kind::Par2 | Kind::MovieHash | Kind::FileCrc | Kind::AudioPrint => None,
+            Kind::Par2 | Kind::MovieHash | Kind::FileCrc | Kind::InnerFile => None,
+            Kind::ArchiveTwin | Kind::Owner | Kind::Zone | Kind::AudioPrint => None,
+        }
+    }
+
+    /// The `archive_release` column, for the archive's own keys.
+    fn archive_column(self) -> Option<&'static str> {
+        match self {
+            Kind::ArchiveTwin => Some("twin_key"),
+            Kind::Owner => Some("owner_key"),
+            Kind::Zone => Some("zone_key"),
+            _ => None,
         }
     }
 }
@@ -248,7 +294,7 @@ impl Keys {
             Kind::BodyCrc => self.body_crc,
             Kind::Video => self.video,
             Kind::Audio => self.audio,
-            Kind::Par2 | Kind::MovieHash | Kind::FileCrc | Kind::AudioPrint => None,
+            _ => None,
         }
     }
 }
@@ -280,6 +326,10 @@ pub struct Lookup {
     pub par2_sets: Vec<Vec<u8>>,
     pub moviehash: Option<String>,
     pub files: Vec<FileCrc>,
+    /// the files inside its archives a header gives the whole CRC32 of (`archive_inner_files`)
+    pub inner_files: Vec<FileCrc>,
+    /// its archive's own keys (`archive_release`)
+    pub archive: crate::archive::store::ArchiveKeys,
     /// it has an audio print (`probe::audio_print`), matched by its own lookup
     pub audio_print: bool,
 }
@@ -290,8 +340,19 @@ impl Lookup {
             Kind::Par2 => !self.par2_sets.is_empty(),
             Kind::MovieHash => self.moviehash.is_some(),
             Kind::FileCrc => !self.files.is_empty(),
+            Kind::InnerFile => !self.inner_files.is_empty(),
+            Kind::ArchiveTwin | Kind::Owner | Kind::Zone => self.archive_key(kind).is_some(),
             Kind::AudioPrint => self.audio_print,
             _ => self.keys.get(kind).is_some(),
+        }
+    }
+
+    fn archive_key(&self, kind: Kind) -> Option<i64> {
+        match kind {
+            Kind::ArchiveTwin => self.archive.twin_key,
+            Kind::Owner => self.archive.owner_key,
+            Kind::Zone => self.archive.zone_key,
+            _ => None,
         }
     }
 }
@@ -500,6 +561,26 @@ fn salt_in(conn: &Connection, meta: &str) -> Option<i64> {
     read()
 }
 
+/// The install's salt as a step on any shard reads it: from shard 0 beside `conn`'s shard (`shard_zero`), made there
+/// when it isn't yet, and remembered by shard 0's path. None for a connection with no shard file behind it.
+pub fn step_salt(conn: &Connection) -> Option<i64> {
+    static SALTS: std::sync::Mutex<Vec<(std::path::PathBuf, i64)>> = std::sync::Mutex::new(Vec::new());
+    let zero = conn.path().and_then(shard_zero)?;
+    if let Some((_, s)) = SALTS.lock().ok()?.iter().find(|(p, _)| *p == zero) {
+        return Some(*s);
+    }
+    let shard = crate::db::open_shard(&zero).ok()?;
+    let found = salt_in(&shard, "meta")?;
+    SALTS.lock().ok()?.push((zero, found));
+    Some(found)
+}
+
+/// Which salt a salted key was made with, as a key of its own: soo a key kept outside the shards (the raw store) is
+/// only used again under the same salt.
+pub fn salt_id(salt: i64) -> i64 {
+    as_key(digest8(format!("salt:{salt}").as_bytes()))
+}
+
 /// The probe a release has, decoded. None when it has none or it doesn't decode.
 fn probe_of(shard: &Connection, release_id: i64) -> rusqlite::Result<Option<ProbeInfo>> {
     let info: Option<String> = shard
@@ -545,8 +626,51 @@ pub fn read_lookup(
         .ok()
         .and_then(|mut q| q.query_row([release_id], |r| r.get::<_, Option<String>>(0)).optional().ok().flatten())
         .flatten();
+    let inner_files = inner_crc_files(shard, release_id);
+    let archive = archive_keys(shard, release_id);
     let audio_print = crate::probe::audio_print::has_print(shard, release_id);
-    Ok(Lookup { keys, par2_sets, moviehash, files, audio_print })
+    Ok(Lookup { keys, par2_sets, moviehash, files, inner_files, archive, audio_print })
+}
+
+/// Sources of `archive_inner_files` rows read from an archive's own headers: RAR, 7z, ZIP.
+const ARCHIVE_SOURCES: &str = "(2, 3, 4)";
+
+/// The files inside a release's archives whose whole CRC32 a header gives, the biggest first, at most
+/// `CRC_FILES_CAP`, each once. Empty on a shard without the columns yet.
+pub fn inner_crc_files(shard: &Connection, release_id: i64) -> Vec<FileCrc> {
+    let sql = format!(
+        "select distinct size, crc32 from archive_inner_files
+         where release_id = ?1 and source in {ARCHIVE_SOURCES} and crc32 is not null and size >= ?2
+         order by size desc limit ?3"
+    );
+    let Ok(mut q) = shard.prepare_cached(&sql) else { return Vec::new() };
+    let Ok(rows) = q.query_map(rusqlite::params![release_id, CRC_MIN_SIZE, CRC_FILES_CAP as i64], |r| {
+        Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+    }) else {
+        return Vec::new();
+    };
+    rows.flatten().filter_map(|(size, crc)| u32::try_from(crc).ok().and_then(|c| FileCrc::new(size, c))).collect()
+}
+
+/// A release's archive keys as `archive_release` keeps them. Nothing on a shard without the columns yet.
+pub fn archive_keys(shard: &Connection, release_id: i64) -> crate::archive::store::ArchiveKeys {
+    shard
+        .prepare_cached("select packer, twin_key, owner_key, zone_key from archive_release where release_id = ?1")
+        .ok()
+        .and_then(|mut q| {
+            q.query_row([release_id], |r| {
+                Ok(crate::archive::store::ArchiveKeys {
+                    packer: r.get(0)?,
+                    twin_key: r.get(1)?,
+                    owner_key: r.get(2)?,
+                    zone_key: r.get(3)?,
+                })
+            })
+            .optional()
+            .ok()
+            .flatten()
+        })
+        .unwrap_or_default()
 }
 
 /// The files a release knows the size and whole-file CRC32 of: the probed main file first, then the biggest ones
@@ -674,10 +798,10 @@ pub fn crc_donors(conn: &Connection, own: i64, file: FileCrc, md5: Option<&[u8]>
              order by p.release_id desc limit ?4"
         );
         if let Ok(mut q) = conn.prepare_cached(&described)
-            && let Ok(rows) = q.query_map(
-                rusqlite::params![file.size, i64::from(file.crc32), own, DONORS_CAP, md5],
-                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
-            )
+            && let Ok(rows) = q
+                .query_map(rusqlite::params![file.size, i64::from(file.crc32), own, DONORS_CAP, md5], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+                })
         {
             out.extend(rows.flatten());
         }
@@ -723,20 +847,30 @@ fn stored(shard: &Connection, release_id: i64) -> rusqlite::Result<Option<Keys>>
 /// values bound from `?3` on, at most `?2`; and how many values it takes. Only releases the pages would show count:
 /// one deleted or in a blocked group (`atlas_blocked`) is left out before the limit, soo the count and the list agree.
 fn others_sql(kind: Kind, shard: usize, sets: usize) -> String {
-    if kind == Kind::FileCrc {
-        // `sets` files: their keys first (?3..), then each one's size and CRC
+    if matches!(kind, Kind::FileCrc | Kind::InnerFile) {
+        // `sets` files: their keys first (?3..), then each one's size and CRC; a file posted bare, one a PAR2 set
+        // describes and one inside an archive are the same bytes either way
         let keys: Vec<String> = (0..sets).map(|i| format!("?{}", i + 3)).collect();
         let pairs: Vec<String> =
             (0..sets).map(|i| format!("(size = ?{} and crc32 = ?{})", sets + 3 + 2 * i, sets + 4 + 2 * i)).collect();
         return format!(
             "select distinct k.release_id from (
-                 select release_id from s{shard}.release_keys where file_crc in ({})
-                 union select release_id from s{shard}.par2_files where bound = 1 and ({})
+                 select release_id from s{shard}.release_keys where file_crc in ({keys})
+                 union select release_id from s{shard}.par2_files where bound = 1 and ({pairs})
+                 union select release_id from s{shard}.archive_inner_files
+                     where source in {ARCHIVE_SOURCES} and crc32 is not null and ({pairs})
              ) k join s{shard}.releases r on r.id = k.release_id
              where k.release_id != ?1 and not atlas_blocked(r.group_name)
              order by k.release_id desc limit ?2",
-            keys.join(", "),
-            pairs.join(" or ")
+            keys = keys.join(", "),
+            pairs = pairs.join(" or ")
+        );
+    }
+    if let Some(col) = kind.archive_column() {
+        return format!(
+            "select distinct k.release_id from s{shard}.archive_release k join s{shard}.releases r on r.id = k.release_id
+             where k.{col} = ?3 and k.release_id != ?1 and not atlas_blocked(r.group_name)
+             order by k.release_id desc limit ?2"
         );
     }
     let (from, matches) = match kind.column() {
@@ -759,19 +893,24 @@ fn values(lookup: &Lookup, kind: Kind) -> Vec<rusqlite::types::Value> {
     match kind {
         Kind::Par2 => lookup.par2_sets.iter().map(|s| Value::Blob(s.clone())).collect(),
         Kind::MovieHash => lookup.moviehash.iter().map(|h| Value::Text(h.clone())).collect(),
-        Kind::FileCrc => lookup
-            .files
-            .iter()
-            .map(|f| Value::Integer(f.key()))
-            .chain(lookup.files.iter().flat_map(|f| [Value::Integer(f.size), Value::Integer(i64::from(f.crc32))]))
-            .collect(),
+        Kind::FileCrc | Kind::InnerFile => {
+            let files = if kind == Kind::FileCrc { &lookup.files } else { &lookup.inner_files };
+            files
+                .iter()
+                .map(|f| Value::Integer(f.key()))
+                .chain(files.iter().flat_map(|f| [Value::Integer(f.size), Value::Integer(i64::from(f.crc32))]))
+                .collect()
+        }
+        Kind::ArchiveTwin | Kind::Owner | Kind::Zone => {
+            lookup.archive_key(kind).map(Value::Integer).into_iter().collect()
+        }
         _ => lookup.keys.get(kind).map(Value::Integer).into_iter().collect(),
     }
 }
 
-/// What `others_sql` is told it binds: the file kind binds three values a file.
+/// What `others_sql` is told it binds: the file kinds bind three values a file.
 fn binds(kind: Kind, values: usize) -> usize {
-    if kind == Kind::FileCrc { values / 3 } else { values }
+    if matches!(kind, Kind::FileCrc | Kind::InnerFile) { values / 3 } else { values }
 }
 
 /// The releases other than `own` that share `kind` with it, over every shard of `conn` (the main database with
@@ -845,12 +984,11 @@ pub fn crc_report(conn: &Connection, main: &std::path::Path, per_shard: i64) -> 
     let mut r = CrcReport::default();
     for n in 0..store::SHARDS {
         let Ok(shard) = crate::db::open_shard(&store::shard_path(main, n)) else { continue };
-        let ids: Vec<i64> = match shard
-            .prepare("select release_id from release_probe order by release_id desc limit ?1")
-        {
-            Ok(mut q) => q.query_map([per_shard], |row| row.get(0))?.collect::<rusqlite::Result<_>>()?,
-            Err(_) => continue,
-        };
+        let ids: Vec<i64> =
+            match shard.prepare("select release_id from release_probe order by release_id desc limit ?1") {
+                Ok(mut q) => q.query_map([per_shard], |row| row.get(0))?.collect::<rusqlite::Result<_>>()?,
+                Err(_) => continue,
+            };
         for id in ids {
             let lookup = read_lookup(&shard, id, None, None)?;
             r.sampled += 1;
@@ -1145,13 +1283,7 @@ mod tests {
             )
             .unwrap();
         }
-        let lookup = Lookup {
-            keys: Keys::default(),
-            par2_sets: vec![set],
-            moviehash: None,
-            files: Vec::new(),
-            audio_print: false,
-        };
+        let lookup = Lookup { par2_sets: vec![set], ..Default::default() };
         assert_eq!(others(&conn, 1, &lookup, Kind::Par2, 1), vec![2], "the limit counts only the shown ones");
         assert_eq!(count_others(&conn, 1, &lookup, Kind::Par2), 1);
     }
@@ -1221,6 +1353,7 @@ mod tests {
         conn.execute_batch(&crate::archive::store::PAR2_FILES.create.replace("par2_files (", "s0.par2_files ("))
             .unwrap();
         conn.execute_batch(&RELEASE_KEYS.create.replace("release_keys (", "s0.release_keys (")).unwrap();
+        conn.execute_batch(INNER_FILES_FIXTURE).unwrap();
         conn.execute_batch("create table s0.releases (id integer primary key, group_name text not null)").unwrap();
         let blocked = "alt.binaries.pictures.erotica.teen";
         for (id, group) in [(1, "a.b.c"), (2, "a.b.c"), (3, "a.b.d"), (4, "a.b.c"), (5, blocked), (6, "a.b.c")] {
@@ -1248,13 +1381,7 @@ mod tests {
         for (_, index) in crate::archive::store::PAR2_FILES.indexes {
             conn.execute_batch(&index.replacen("exists ", "exists s0.", 1)).unwrap();
         }
-        let lookup = Lookup {
-            keys: Keys::default(),
-            par2_sets: Vec::new(),
-            moviehash: None,
-            files: vec![file],
-            audio_print: false,
-        };
+        let lookup = Lookup { files: vec![file], ..Default::default() };
         assert!(lookup.has(Kind::FileCrc));
         let plan: Vec<String> = conn
             .prepare(&format!("explain query plan {}", others_sql(Kind::FileCrc, 0, 1)))
@@ -1266,13 +1393,64 @@ mod tests {
         assert!(plan.iter().any(|p| p.contains("par2_files_crc")), "the PAR2 side seeks size and CRC: {plan:?}");
         assert_eq!(others(&conn, 1, &lookup, Kind::FileCrc, 10), vec![3, 2]);
         assert_eq!(count_others(&conn, 1, &lookup, Kind::FileCrc), 2);
-        let none = Lookup {
-            keys: Keys::default(),
-            par2_sets: Vec::new(),
-            moviehash: None,
-            files: Vec::new(),
-            audio_print: false,
-        };
+        let none = Lookup::default();
         assert!(others(&conn, 1, &none, Kind::FileCrc, 10).is_empty());
+
+        // 6 also holds the file inside a RAR: the file key and the inner-file key find it there, and a PAR2 or NZB
+        // list of the same size and CRC (sources 1 and 5) isn't an archive's header
+        for (id, seq, source) in [(6, 1, crate::archive::store::SOURCE_RAR), (4, 2, crate::archive::store::SOURCE_PAR2)]
+        {
+            conn.execute(
+                "insert into s0.archive_inner_files (release_id, seq, name, size, source, crc32) values (?1, ?2, 'a.mkv', ?3, ?4, ?5)",
+                rusqlite::params![id, seq, file.size, source, i64::from(file.crc32)],
+            )
+            .unwrap();
+        }
+        assert_eq!(others(&conn, 1, &lookup, Kind::FileCrc, 10), vec![6, 3, 2]);
+        let inner = Lookup { inner_files: vec![file], ..Default::default() };
+        assert!(inner.has(Kind::InnerFile) && !inner.has(Kind::FileCrc));
+        assert_eq!(others(&conn, 1, &inner, Kind::InnerFile, 10), vec![6, 3, 2], "a bare, a PAR2 and an archived copy");
+    }
+
+    /// `archive_inner_files` as a shard has it, on `s0`, without the trigger on `releases`.
+    const INNER_FILES_FIXTURE: &str = "create table s0.archive_inner_files (
+        release_id INTEGER NOT NULL, seq INTEGER NOT NULL, name TEXT NOT NULL, size INTEGER, source INTEGER NOT NULL,
+        crc32 INTEGER, mtime INTEGER, host_os INTEGER, primary key (release_id, seq)) without rowid";
+
+    #[test]
+    fn an_archives_own_keys_match_only_their_own_column() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::filters::register_sql(&conn).unwrap();
+        conn.execute("attach ':memory:' as s0", []).unwrap();
+        conn.execute_batch(
+            "create table s0.archive_release (release_id INTEGER PRIMARY KEY, password INTEGER NOT NULL,
+                packer TEXT, twin_key INTEGER, owner_key INTEGER, zone_key INTEGER);
+             create table s0.releases (id integer primary key, group_name text not null)",
+        )
+        .unwrap();
+        // 1 asks; 2 is the same archive; 3 has the same owner only; 4 the same zone only
+        for (id, twin, owner, zone) in [(1, 10, 20, 30), (2, 10, 21, 31), (3, 11, 20, 32), (4, 12, 22, 30)] {
+            conn.execute("insert into s0.releases (id, group_name) values (?1, 'a.b.c')", [id]).unwrap();
+            conn.execute(
+                "insert into s0.archive_release (release_id, password, twin_key, owner_key, zone_key) values (?1, 0, ?2, ?3, ?4)",
+                rusqlite::params![id, twin, owner, zone],
+            )
+            .unwrap();
+        }
+        let lookup = Lookup {
+            archive: crate::archive::store::ArchiveKeys {
+                packer: None,
+                twin_key: Some(10),
+                owner_key: Some(20),
+                zone_key: Some(30),
+            },
+            ..Default::default()
+        };
+        assert_eq!(others(&conn, 1, &lookup, Kind::ArchiveTwin, 10), vec![2]);
+        assert_eq!(others(&conn, 1, &lookup, Kind::Owner, 10), vec![3]);
+        assert_eq!(others(&conn, 1, &lookup, Kind::Zone, 10), vec![4]);
+        assert!(!Lookup::default().has(Kind::ArchiveTwin));
+        assert_eq!(archive_keys(&conn, 2).twin_key, Some(10), "read back from the shard's table");
+        assert_eq!(archive_keys(&conn, 99), crate::archive::store::ArchiveKeys::default());
     }
 }

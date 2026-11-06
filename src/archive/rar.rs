@@ -1,7 +1,8 @@
 //! Inner file names from RAR4 and RAR5 headers, in one article's bytes.
 #![cfg_attr(not(test), deny(clippy::indexing_slicing, clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
-use super::{Encryption, Listing, MAX_NAME_BYTES, PasswordTest, crc32};
+use super::facts::{self, Twin};
+use super::{Encryption, FileFacts, Listing, MAX_NAME_BYTES, PasswordTest, crc32};
 
 const MAX_BLOCKS: usize = 65_536;
 const MARK4: &[u8] = b"Rar!\x1a\x07\x00";
@@ -40,6 +41,7 @@ pub fn list4_with_password(data: &[u8], password: Option<&str>) -> Listing {
     let mut pos = 7usize;
     let mut encrypted_headers = false;
     let mut salt_cache = Rar4KeyCache::default();
+    let mut main_flags = 0u16;
     for _ in 0..MAX_BLOCKS {
         if encrypted_headers {
             let Some(pw) = password else { return l };
@@ -57,11 +59,13 @@ pub fn list4_with_password(data: &[u8], password: Option<&str>) -> Listing {
                 add = u64::from(low);
             }
             if ty == 0x74 {
-                let Some(high_pack) = file4(&mut l, &header, flags) else { return l };
+                let Some(high_pack) = file4(&mut l, &header, flags, main_flags) else { return l };
                 add |= high_pack << 32;
                 if l.files.len() >= super::MAX_ENTRIES {
                     return l;
                 }
+            } else if ty == 0x7a {
+                owner4(&mut l, &header, flags);
             }
             let next = (pos as u64).saturating_add(hdr_bytes as u64).saturating_add(add);
             match usize::try_from(next).ok().filter(|n| *n <= data.len()) {
@@ -90,11 +94,18 @@ pub fn list4_with_password(data: &[u8], password: Option<&str>) -> Listing {
                 return l;
             }
         }
+        if ty == 0x73 {
+            main_flags = flags;
+        }
         if ty == 0x73 && flags & 0x0080 != 0 {
             // what follows is salt and AES data
             l.encrypted = true;
             l.encryption = Some(Encryption::Rar4Aes128);
             l.headers_encrypted = true;
+            // the salt before the next block: the archive's own, and all an outsider sees of it
+            if let Some(salt) = pos.checked_add(size).and_then(|at| data.get(at..at.checked_add(8)?)) {
+                l.twin = Some(Twin::new("rar4hp", salt));
+            }
             let Some(pw) = password.filter(|pw| !pw.is_empty()) else { return l };
             let _ = pw;
             let Some(next) = pos.checked_add(size).filter(|n| *n <= data.len()) else { return l };
@@ -115,11 +126,13 @@ pub fn list4_with_password(data: &[u8], password: Option<&str>) -> Listing {
             add = u64::from(low);
         }
         if ty == 0x74 {
-            let Some(high_pack) = file4(&mut l, header, flags) else { return l };
+            let Some(high_pack) = file4(&mut l, header, flags, main_flags) else { return l };
             add |= high_pack << 32;
             if l.files.len() >= super::MAX_ENTRIES {
                 return l;
             }
+        } else if ty == 0x7a {
+            owner4(&mut l, header, flags);
         }
         let next = (pos as u64).saturating_add(size as u64).saturating_add(add);
         match usize::try_from(next).ok().filter(|n| *n <= data.len()) {
@@ -132,7 +145,7 @@ pub fn list4_with_password(data: &[u8], password: Option<&str>) -> Listing {
 }
 
 /// A file block's name and size, and the high half of its packed size. None: damaged.
-fn file4(l: &mut Listing, header: &[u8], flags: u16) -> Option<u64> {
+fn file4(l: &mut Listing, header: &[u8], flags: u16, main_flags: u16) -> Option<u64> {
     let fields = || -> Option<(u32, u32, u32, &[u8])> {
         let (unp, name_len) = (le32(header, 11)?, usize::from(le16(header, 26)?));
         let (high_pack, high_unp, name_at): (u32, u32, usize) =
@@ -150,11 +163,72 @@ fn file4(l: &mut Listing, header: &[u8], flags: u16) -> Option<u64> {
         l.encrypted = true;
         l.encryption = Some(Encryption::Rar4Aes128);
     }
+    let name_end = (if flags & 0x0100 != 0 { 40usize } else { 32 }).saturating_add(name.len());
+    // -p: a salt per file after the name, the archive's own
+    if flags & 0x0400 != 0
+        && l.twin.is_none()
+        && let Some(salt) = header.get(name_end..name_end + 8)
+    {
+        l.twin = Some(Twin::new("rar4", salt));
+    }
     if flags & 0x00e0 != 0x00e0 {
         let size = u64::from(unp) | u64::from(high_unp) << 32;
-        l.push(&name4(name, flags), Some(size));
+        let host = header.get(15).copied();
+        // a split file's CRC is its part's until the last volume
+        let crc = (flags & 0x0002 == 0).then(|| le32(header, 16)).flatten();
+        // the DOS time is the packer's own clock: never kept, only set against the post for the zone guess
+        l.saw_local(le32(header, 20).and_then(facts::dos32_wall_secs));
+        if l.packer.is_none() {
+            l.packer = Some(packer4(header, flags, main_flags));
+        }
+        let facts = FileFacts { crc32: crc, mtime: None, host_os: host.map(facts::rar4_host) };
+        l.push_with(&name4(name, flags), Some(size), facts);
     }
     Some(u64::from(high_pack))
+}
+
+/// How a RAR4 file was packed: the version needed to unpack it, its method and dictionary, the host, solid, and
+/// whether it keeps extended times.
+fn packer4(header: &[u8], flags: u16, main_flags: u16) -> String {
+    let mut out = String::from("RAR4");
+    if let Some(ver) = header.get(24) {
+        out.push_str(&format!(" · unpack {}.{}", ver / 10, ver % 10));
+    }
+    if let Some(method) = header.get(25) {
+        out.push_str(&format!(" · m{}", method.saturating_sub(0x30)));
+    }
+    out.push_str(&format!(" · dict {}", facts::dict_word(64 << 10 << ((flags & 0x00e0) >> 5))));
+    if let Some(host) = header.get(15) {
+        out.push_str(&format!(" · {}", facts::host_word(facts::rar4_host(*host))));
+    }
+    if main_flags & 0x0008 != 0 {
+        out.push_str(" · solid");
+    }
+    if main_flags & 0x0040 != 0 {
+        out.push_str(" · recovery record");
+    }
+    if flags & 0x1000 != 0 {
+        out.push_str(" · extended times");
+    }
+    out
+}
+
+/// RAR 3.x's Unix owner subblock (`UOW`): the owner's and group's names after the block's name, split by a NUL.
+fn owner4(l: &mut Listing, header: &[u8], flags: u16) {
+    if l.owner.is_some() {
+        return;
+    }
+    let name_at: usize = if flags & 0x0100 != 0 { 40 } else { 32 };
+    let Some(len) = le16(header, 26).map(usize::from) else { return };
+    if header.get(name_at..name_at + len) != Some(b"UOW".as_slice()) {
+        return;
+    }
+    let Some(data) = header.get(name_at + len..) else { return };
+    let Some(nul) = data.iter().position(|b| *b == 0) else { return };
+    let (user, group) = (data.get(..nul).unwrap_or_default(), data.get(nul + 1..).unwrap_or_default());
+    let group = group.split(|b| *b == 0).next().unwrap_or_default();
+    let text = |b: &[u8]| (!b.is_empty()).then(|| String::from_utf8_lossy(b).into_owned());
+    l.owner = facts::owner_text(text(user).as_deref(), text(group).as_deref(), None, None);
 }
 
 fn name4(raw: &[u8], flags: u16) -> String {
@@ -242,6 +316,7 @@ pub fn list5_with_password(data: &[u8], password: Option<&str>) -> Listing {
     let mut l = Listing::default();
     let mut pos = 8usize;
     let mut hdr_key: Option<[u8; 32]> = None;
+    let mut main = 0u64;
     for _ in 0..MAX_BLOCKS {
         if let Some(key) = &hdr_key {
             let (hdr_bytes, inner) = match decrypt_rar5_header(data, pos, key) {
@@ -254,7 +329,7 @@ pub fn list5_with_password(data: &[u8], password: Option<&str>) -> Listing {
                     return l;
                 }
             };
-            let Some(block) = block5(&mut l, &inner, password, &mut hdr_key) else {
+            let Some(block) = block5(&mut l, &inner, password, &mut hdr_key, &mut main) else {
                 l.damaged = true;
                 return l;
             };
@@ -293,7 +368,7 @@ pub fn list5_with_password(data: &[u8], password: Option<&str>) -> Listing {
             return l;
         }
         let Some(inner) = body.get(size_len..) else { return l };
-        let Some(block) = block5(&mut l, inner, password, &mut hdr_key) else {
+        let Some(block) = block5(&mut l, inner, password, &mut hdr_key, &mut main) else {
             l.damaged = true;
             return l;
         };
@@ -316,6 +391,7 @@ fn block5(
     inner: &[u8],
     password: Option<&str>,
     hdr_key: &mut Option<[u8; 32]>,
+    main: &mut u64,
 ) -> Option<u64> {
     let mut p = 0usize;
     let ty = vint(inner, &mut p)?;
@@ -327,6 +403,10 @@ fn block5(
         return None;
     }
     match ty {
+        1 => {
+            // the main header's flags: volume, volume number, solid, recovery record, locked
+            *main = vint(inner, &mut p)?;
+        }
         4 => {
             l.encrypted = true;
             l.encryption = Some(Encryption::Rar5Aes256);
@@ -335,6 +415,14 @@ fn block5(
             // the header's own: version, flags, kdf, salt, check
             let check = password_check(body, false);
             l.password_check = check.map(PasswordTest::Rar5).or(l.password_check);
+            // salt and check: the same in every volume of the archive, and in no other archive
+            if let Some((_, salt, _)) = crypt_kdf_salt_iv(body, false) {
+                let mut bytes = salt.to_vec();
+                if let Some(c) = check {
+                    bytes.extend(c.check);
+                }
+                l.twin = Some(Twin::new("rar5hp", &bytes));
+            }
             if hdr_key.is_none()
                 && let Some(pw) = password.filter(|pw| !pw.is_empty())
                 && let Some((kdf, salt, _)) = crypt_kdf_salt_iv(body, false)
@@ -347,14 +435,18 @@ fn block5(
             let file_flags = vint(inner, &mut p)?;
             let unpacked = vint(inner, &mut p)?;
             let _attributes = vint(inner, &mut p)?;
+            let mut mtime = None;
             if file_flags & 2 != 0 {
+                mtime = le32(inner, p).map(i64::from);
                 p = p.checked_add(4)?;
             }
+            let mut crc = None;
             if file_flags & 4 != 0 {
+                crc = le32(inner, p);
                 p = p.checked_add(4)?;
             }
-            let _compression = vint(inner, &mut p)?;
-            let _host = vint(inner, &mut p)?;
+            let compression = vint(inner, &mut p)?;
+            let host = vint(inner, &mut p)?;
             let name_len = usize::try_from(vint(inner, &mut p)?).ok()?;
             let name_end = p.checked_add(name_len)?;
             if name_end > end {
@@ -362,21 +454,137 @@ fn block5(
             }
             let name = inner.get(p..name_end)?;
             if ty == 2 {
-                if encrypted_record(inner.get(end..)?) {
+                let area = inner.get(end..)?;
+                if encrypted_record(area) {
                     l.encrypted = true;
                     l.encryption = Some(Encryption::Rar5Aes256);
-                    l.password_check =
-                        l.password_check.or_else(|| record_check(inner.get(end..)?).map(PasswordTest::Rar5));
+                    l.password_check = l.password_check.or_else(|| record_check(area).map(PasswordTest::Rar5));
+                    if l.twin.is_none()
+                        && let Some((_, salt, iv, _)) = rar5_record_params(area)
+                    {
+                        l.twin = Some(Twin::new("rar5", &[salt, iv].concat()));
+                    }
+                }
+                let extras = extras5(area);
+                if l.owner.is_none() {
+                    l.owner = extras.owner.clone();
                 }
                 if file_flags & 1 == 0 {
                     let size = (file_flags & 8 == 0).then_some(unpacked);
-                    l.push(&String::from_utf8_lossy(name), size);
+                    // a split file's CRC is its part's until the last volume (header flags 0x08, 0x10), and in an
+                    // encrypted archive it can be an HMAC of the key (the record's flag 2, which `-hp` headers
+                    // don't always show), soo none is kept there
+                    let crc = crc.filter(|_| flags & 0x18 == 0 && !l.encrypted && !hashmac_record(area));
+                    if l.packer.is_none() {
+                        l.packer = Some(packer5(compression, host, *main, file_flags, &extras));
+                    }
+                    let facts =
+                        FileFacts { crc32: crc, mtime: extras.mtime.or(mtime), host_os: Some(facts::rar5_host(host)) };
+                    l.push_with(&String::from_utf8_lossy(name), size, facts);
                 }
             }
         }
         _ => {}
     }
     Some(data)
+}
+
+/// What a RAR5 file's extra area says about it: the HTIME record's mtime and how it keeps times, and the Unix
+/// owner record.
+#[derive(Default)]
+struct Extras5 {
+    mtime: Option<i64>,
+    /// `filetime`, `unix`, `unix-ns`: how HTIME keeps times, which tells the packing OS
+    times: Option<&'static str>,
+    owner: Option<facts::Private>,
+}
+
+fn extras5(area: &[u8]) -> Extras5 {
+    let mut out = Extras5::default();
+    let mut p = 0usize;
+    while p < area.len() {
+        let Some(size) = vint(area, &mut p).and_then(|s| usize::try_from(s).ok()).filter(|s| *s > 0) else {
+            return out;
+        };
+        let Some(end) = p.checked_add(size).filter(|e| *e <= area.len()) else { return out };
+        let mut at = p;
+        match vint(area, &mut at) {
+            Some(3) => htime5(area.get(at..end).unwrap_or_default(), &mut out),
+            Some(6) => out.owner = owner5(area.get(at..end).unwrap_or_default()),
+            _ => {}
+        }
+        p = end;
+    }
+    out
+}
+
+/// HTIME: flags (1 Unix time, else FILETIME; 2 mtime, 4 ctime, 8 atime; 0x10 Unix nanoseconds), then the times.
+fn htime5(b: &[u8], out: &mut Extras5) {
+    let mut p = 0usize;
+    let Some(flags) = vint(b, &mut p) else { return };
+    let unix = flags & 1 != 0;
+    out.times = Some(match (unix, flags & 0x10 != 0) {
+        (false, _) => "filetime",
+        (true, false) => "unix",
+        (true, true) => "unix-ns",
+    });
+    if flags & 2 == 0 {
+        return;
+    }
+    out.mtime = if unix {
+        le32(b, p).map(i64::from)
+    } else {
+        b.get(p..p + 8).and_then(|t| t.try_into().ok()).map(u64::from_le_bytes).and_then(facts::filetime_secs)
+    };
+}
+
+/// The Unix owner record: flags (1 user name, 2 group name, 4 uid, 8 gid), names as a length and bytes, ids as
+/// numbers.
+fn owner5(b: &[u8]) -> Option<facts::Private> {
+    let mut p = 0usize;
+    let flags = vint(b, &mut p)?;
+    let name = |on: bool, p: &mut usize| -> Option<Option<String>> {
+        if !on {
+            return Some(None);
+        }
+        let len = usize::try_from(vint(b, p)?).ok()?;
+        let bytes = b.get(*p..p.checked_add(len)?)?;
+        *p += len;
+        Some(Some(String::from_utf8_lossy(bytes).into_owned()))
+    };
+    let user = name(flags & 1 != 0, &mut p)?;
+    let group = name(flags & 2 != 0, &mut p)?;
+    let uid = if flags & 4 != 0 { Some(vint(b, &mut p)?) } else { None };
+    let gid = if flags & 8 != 0 { Some(vint(b, &mut p)?) } else { None };
+    facts::owner_text(user.as_deref(), group.as_deref(), uid, gid)
+}
+
+/// How a RAR5 file was packed: its compression version (0 RAR 5, 1 RAR 7), method, dictionary, host, solid and
+/// recovery record from the main header, and how its times are kept.
+fn packer5(compression: u64, host: u64, main: u64, file_flags: u64, extras: &Extras5) -> String {
+    let version = compression & 0x3f;
+    let method = (compression >> 7) & 7;
+    let dict = 128u64 << 10 << ((compression >> 10) & 0x1f);
+    let mut out = format!(
+        "RAR5 · v{version} · m{method} · dict {} · {}",
+        facts::dict_word(dict),
+        facts::host_word(facts::rar5_host(host))
+    );
+    if compression & 0x40 != 0 || main & 4 != 0 {
+        out.push_str(" · solid");
+    }
+    if main & 8 != 0 {
+        out.push_str(" · recovery record");
+    }
+    if main & 0x10 != 0 {
+        out.push_str(" · locked");
+    }
+    match (extras.times, file_flags & 2 != 0) {
+        (Some(t), _) => out.push_str(&format!(" · times {t}")),
+        (None, true) => out.push_str(" · times header"),
+        (None, false) => out.push_str(" · no times"),
+    }
+    out
 }
 
 /// What RAR5 keeps to test a password: `2^kdf` rounds over `salt` have to fold down to `check`.
@@ -456,11 +664,7 @@ impl Rar5Header {
         }
 
         let rem = tail.rem_euclid(16);
-        if rem == 14 || rem == 10 {
-            EncryptionMode::HeaderEncryptedHp
-        } else {
-            EncryptionMode::None
-        }
+        if rem == 14 || rem == 10 { EncryptionMode::HeaderEncryptedHp } else { EncryptionMode::None }
     }
 
     /// Article 1 Block Type 4 inspection:
@@ -518,9 +722,7 @@ impl PasswordCheck {
     pub async fn verify_async(&self, candidate: &str) -> bool {
         let check = *self;
         let cand = candidate.to_string();
-        tokio::task::spawn_blocking(move || check.verify(&cand))
-            .await
-            .unwrap_or(false)
+        tokio::task::spawn_blocking(move || check.verify(&cand)).await.unwrap_or(false)
     }
 
     /// Stored as kdf, salt, check.
@@ -611,6 +813,24 @@ fn record_check(area: &[u8]) -> Option<PasswordCheck> {
     None
 }
 
+/// Whether a file's encryption record says its CRC32 and hash are HMACs of the key (flag 2): not the file's own.
+fn hashmac_record(area: &[u8]) -> bool {
+    let mut p = 0usize;
+    while p < area.len() {
+        let Some(size) = vint(area, &mut p).and_then(|s| usize::try_from(s).ok()).filter(|s| *s > 0) else {
+            return false;
+        };
+        let Some(end) = p.checked_add(size).filter(|e| *e <= area.len()) else { return false };
+        let mut at = p;
+        if vint(area, &mut at) == Some(1) {
+            let _version = vint(area, &mut at);
+            return vint(area, &mut at).is_none_or(|flags| flags & 2 != 0);
+        }
+        p = end;
+    }
+    false
+}
+
 /// an extra area holding a file encryption record. A record of size 0 or past the area ends the walk
 fn encrypted_record(area: &[u8]) -> bool {
     let mut p = 0usize;
@@ -691,11 +911,7 @@ fn sha256_first4(data: &[u8]) -> [u8; 4] {
 
 /// Decrypts one RAR5 `-hp` encrypted block header at `pos` (where the 16-byte IV sits).
 /// Returns `Ok(Some((16 + enc_hdr_len, inner_header_bytes)))`, `Ok(None)` on truncation, or `Err(())` on CRC/format failure.
-pub(crate) fn decrypt_rar5_header(
-    data: &[u8],
-    pos: usize,
-    key: &[u8; 32],
-) -> Result<Option<(usize, Vec<u8>)>, ()> {
+pub(crate) fn decrypt_rar5_header(data: &[u8], pos: usize, key: &[u8; 32]) -> Result<Option<(usize, Vec<u8>)>, ()> {
     let Some(first_end) = pos.checked_add(32) else { return Ok(None) };
     let (Some(iv_slice), Some(first_ct)) = (data.get(pos..pos + 16), data.get(pos + 16..first_end)) else {
         return Ok(None);
