@@ -232,11 +232,9 @@ fn rerun_unread(conn: &rusqlite::Connection, exts: &[&str], now: i64) -> rusqlit
         )?
         .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, Option<String>>(2)?)))?
         .filter_map(|row| match row {
-            Ok((id, file, inner)) => [file, inner]
-                .iter()
-                .flatten()
-                .any(|n| exts.iter().any(|e| named(n, e)))
-                .then_some(Ok(id)),
+            Ok((id, file, inner)) => {
+                [file, inner].iter().flatten().any(|n| exts.iter().any(|e| named(n, e))).then_some(Ok(id))
+            }
             Err(e) => Some(Err(e)),
         })
         .collect::<rusqlite::Result<_>>()?;
@@ -335,8 +333,8 @@ fn stale_saved(info: &str) -> bool {
         || dv_before_keyframe_key
         || p["media"].is_null()
             && (newly_read(p["file"].as_str())
-            || newly_read(p["archive"]["name"].as_str())
-            || p["file"].as_str().is_some_and(later_volume))
+                || newly_read(p["archive"]["name"].as_str())
+                || p["file"].as_str().is_some_and(later_volume))
 }
 
 /// Asks for the probe again on releases whose probe read a later volume of a set and found no media, before
@@ -407,10 +405,11 @@ impl Step for ProbeStep {
     /// What a probe reads, a bit per version, soo a release probed before a version gets probed again. Bit 1:
     /// chapters, commentary, more than one article of a header, and the OpenSubtitles hash. Bit 2: archives inside
     /// archives, followed down. Bit 4: attachments, cover art, when it was muxed, MaxCLL and MaxFALL. Bit 8:
-    /// SegmentUID, editions, default flags and the encoder's settings. Bit 32: mkvmerge's per-track statistics from
-    /// the Tags at a Matroska file's end, and a Blu-ray's `id.bdmv` disc ID.
+    /// SegmentUID, editions, default flags and the encoder's settings. Bit 16: the article's header names in order,
+    /// its Message-ID and References, and the title ids a Matroska file's tags give. Bit 32: mkvmerge's per-track
+    /// statistics from the Tags at a Matroska file's end, and a Blu-ray's `id.bdmv` disc ID.
     fn config_stamp(&self) -> u64 {
-        1 | 2 | 4 | 8 | 32
+        1 | 2 | 4 | 8 | 16 | 32
     }
     fn run(&self, ctx: &mut StepCtx<'_>) -> Result<Outcome, StepError> {
         let retry = |e: rusqlite::Error| StepError::Retry(e.to_string());
@@ -422,17 +421,14 @@ impl Step for ProbeStep {
         let stamp = self.config_stamp();
         let content_id = crate::raw_store::release_content_id(ctx.conn(), release_id).unwrap_or_default();
         let existing_db_pw = archive::store::nfo_password(ctx.conn(), release_id);
-        let known_pw = existing_db_pw
-            .clone()
-            .or_else(|| crate::raw_store::get_nfo_password(&rel_name, &rel_group, &content_id));
+        let known_pw =
+            existing_db_pw.clone().or_else(|| crate::raw_store::get_nfo_password(&rel_name, &rel_group, &content_id));
         if !crate::raw_store::is_explicit_rerun(ctx.conn(), release_id, PROBE_STEP)
             && let Some(saved) =
                 crate::raw_store::get_probe(&rel_name, &rel_group, &content_id, rel_parts, rel_complete, stamp).filter(
                     |s| {
                         let has_pw = s.nfo_password.is_some() || known_pw.is_some();
-                        s.cover
-                            .as_ref()
-                            .is_none_or(|(_, sha)| super::cover_file(sha).is_some_and(|p| p.exists()))
+                        s.cover.as_ref().is_none_or(|(_, sha)| super::cover_file(sha).is_some_and(|p| p.exists()))
                             && !stale_saved(&s.info)
                             && !(has_pw && encrypted_without_media(&s.info))
                     },
@@ -445,12 +441,12 @@ impl Step for ProbeStep {
                 writes.push(StepWrite::new(archive::store::SET_NFO_PASSWORD, vec![release_id.into(), pw.into()]));
             }
             writes.push(match saved.cover {
-                Some((mime, sha256)) => {
-                    StepWrite::new(SET_COVER, vec![release_id.into(), mime.into(), sha256.into()])
-                }
+                Some((mime, sha256)) => StepWrite::new(SET_COVER, vec![release_id.into(), mime.into(), sha256.into()]),
                 None => StepWrite::new(DROP_COVER, vec![release_id.into()]),
             });
             let hash = saved.moviehash.clone();
+            let decoded: Option<ProbeInfo> = serde_json::from_str(&saved.info).ok();
+            writes.extend(title_writes(release_id, decoded.as_ref().and_then(|i| i.media.as_ref())));
             writes.push(StepWrite::new(
                 SET_PROBE,
                 vec![release_id.into(), saved.crc32.into(), saved.agent.into(), saved.info.into(), hash.clone().into()],
@@ -480,10 +476,7 @@ impl Step for ProbeStep {
         });
         if let Some(ref pw) = found_nfo_password {
             crate::raw_store::put_nfo_password(&rel_name, &rel_group, &content_id, pw);
-            writes.push(StepWrite::new(
-                archive::store::SET_NFO_PASSWORD,
-                vec![release_id.into(), pw.clone().into()],
-            ));
+            writes.push(StepWrite::new(archive::store::SET_NFO_PASSWORD, vec![release_id.into(), pw.clone().into()]));
         }
 
         // the NFO and SFV come first, being the smallest: a budget that runs out still leaves them
@@ -586,6 +579,7 @@ impl Step for ProbeStep {
                 if let Got::Body(raw) = got {
                     let article = yenc::split_article(&raw);
                     info.headers = keep_headers(&article.headers);
+                    info.header_order = crate::probe::header_order(&article.headers);
                     if let Some(xref) = info.headers.get("Xref") {
                         info.crossposted_to = xref_groups(xref);
                     }
@@ -597,7 +591,9 @@ impl Step for ProbeStep {
                         front = body;
                         if check.is_none() {
                             check = match archive::identify(&front) {
-                                archive::Format::Rar4 | archive::Format::Rar5 => archive::rar::list(&front).password_check,
+                                archive::Format::Rar4 | archive::Format::Rar5 => {
+                                    archive::rar::list(&front).password_check
+                                }
                                 archive::Format::Zip => archive::zip::list_head(&front).password_check,
                                 _ => None,
                             };
@@ -605,7 +601,8 @@ impl Step for ProbeStep {
                         if found_nfo_password.is_none()
                             && check.is_some()
                             && let Some(ref nfo_s) = info.nfo
-                            && let Some(password) = release_info::find_verified_password([nfo_s.as_str()], &[], check.as_ref())
+                            && let Some(password) =
+                                release_info::find_verified_password([nfo_s.as_str()], &[], check.as_ref())
                         {
                             crate::raw_store::put_nfo_password(&rel_name, &rel_group, &content_id, &password);
                             found_nfo_password = Some(password.clone());
@@ -686,6 +683,7 @@ impl Step for ProbeStep {
             nfo_password: found_nfo_password.as_deref(),
             cover: saved_cover.as_ref().map(|(m, s)| (m.as_str(), s.as_str())),
         });
+        writes.extend(title_writes(release_id, info.media.as_ref()));
         writes.push(StepWrite::new(
             SET_PROBE,
             vec![release_id.into(), crc.into(), agent.into(), json.into(), hash.clone().into()],
@@ -731,6 +729,30 @@ impl Step for ProbeStep {
 /// attachments and chapters before the video, and a few MB of fonts is common.
 const FRONT_ARTICLES: i64 = 6;
 
+/// The title a file's tags name, put on its `media_release` row before any lookup by name: an IMDb id the same way
+/// an NFO's is (`imdb_from_nfo`), and a TMDB or TVDB id pinned the same way (`tmdb_from_tag`, `tvdb_from_tag`), each
+/// only when the row's kind agrees (a TMDB movie id means nothing for a show). No row yet: nothing, and the next
+/// probe of the release writes them.
+const TAG_IMDB: &str = "update media_release set imdb_id = ?2, imdb_from_nfo = 1 where release_id = ?1 and kind = 2";
+const TAG_TMDB: &str = "update media_release set tmdb_id = ?2, tmdb_from_tag = 1 where release_id = ?1 and kind = ?3";
+const TAG_TVDB: &str = "update media_release set tvdb_id = ?2, tvdb_from_tag = 1 where release_id = ?1 and kind = 1";
+
+pub(crate) fn title_writes(release_id: i64, media: Option<&media::MediaInfo>) -> Vec<StepWrite> {
+    let Some(ids) = media.map(media::MediaInfo::title_ids) else { return Vec::new() };
+    let mut out = Vec::new();
+    if let Some(imdb) = ids.imdb {
+        out.push(StepWrite::new(TAG_IMDB, vec![release_id.into(), imdb.into()]));
+    }
+    if let Some((movie, tmdb)) = ids.tmdb {
+        let kind = if movie { crate::media::title::Kind::Movie } else { crate::media::title::Kind::Tv };
+        out.push(StepWrite::new(TAG_TMDB, vec![release_id.into(), tmdb.into(), (kind as i64).into()]));
+    }
+    if let Some(tvdb) = ids.tvdb {
+        out.push(StepWrite::new(TAG_TVDB, vec![release_id.into(), tvdb.into()]));
+    }
+    out
+}
+
 /// A later step's way to the hash this run found, before it's written.
 pub const MOVIEHASH_FACT: &str = "moviehash";
 
@@ -775,12 +797,7 @@ const MAX_TAIL_MOOV: u64 = 8 << 20;
 
 /// An MP4 posted whole whose `moov` comes after its `mdat` (not made for streaming): the front has no tracks, soo
 /// the parts holding the `moov` are read, from where the `mdat` ends to the end of the file.
-fn read_tail_moov(
-    ctx: &mut StepCtx<'_>,
-    file: &FileInfo,
-    front: &[u8],
-    info: &mut ProbeInfo,
-) -> Result<(), StepError> {
+fn read_tail_moov(ctx: &mut StepCtx<'_>, file: &FileInfo, front: &[u8], info: &mut ProbeInfo) -> Result<(), StepError> {
     let wants = info.media.as_ref().is_some_and(|m| m.container == "mp4" && m.video.is_empty() && m.audio.is_empty());
     // a bare file only: in an archive the moov's place in the post would depend on the volumes
     if !wants || info.archive.is_some() || !info.layers.is_empty() {
@@ -1271,7 +1288,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(rerun_bluray(&conn, 100).unwrap(), 1, "the BDMV folder");
-                conn.execute("insert into releases (id, name, group_name) values (16, '16', 'g')", []).unwrap();
+        conn.execute("insert into releases (id, name, group_name) values (16, '16', 'g')", []).unwrap();
         conn.execute("insert into pp_state (release_id, done) values (16, ?)", [mask(PROBE_STEP)]).unwrap();
         conn.execute("insert into release_probe (release_id, info) values (16, '{\"file\":\"Match.ts\"}')", [])
             .unwrap();

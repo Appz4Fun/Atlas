@@ -18,9 +18,11 @@ pub const CHUNK: i64 = 1_000;
 
 /// `indexed by` is required: with a rowid range the planner could otherwise walk every release between two rows of the title.
 pub const UPDATE: &str = "update media_release indexed by media_release_title
-   set tvdb_id = ?4, tvmaze_id = ?5, trakt_id = ?6, tmdb_id = ?7, imdb_id = iif(imdb_from_nfo = 1, imdb_id, ?8), tvrage_id = ?9
+   set tvdb_id = iif(tvdb_from_tag = 1, tvdb_id, ?4), tvmaze_id = ?5, trakt_id = ?6,
+       tmdb_id = iif(tmdb_from_tag = 1, tmdb_id, ?7), imdb_id = iif(imdb_from_nfo = 1, imdb_id, ?8), tvrage_id = ?9
  where title_key = ?1 and release_id > ?2 and release_id <= ?3
-   and (tvdb_id is not ?4 or tvmaze_id is not ?5 or trakt_id is not ?6 or tmdb_id is not ?7
+   and ((tvdb_from_tag = 0 and tvdb_id is not ?4) or tvmaze_id is not ?5 or trakt_id is not ?6
+        or (tmdb_from_tag = 0 and tmdb_id is not ?7)
         or (imdb_from_nfo = 0 and imdb_id is not ?8) or tvrage_id is not ?9)";
 
 /// The releases of the chunk named by an AlloCiné id, read again into the word index: it finds them by the title the
