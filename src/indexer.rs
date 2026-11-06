@@ -438,7 +438,8 @@ fn writer(
     loop {
         let since_save = last_save.map_or(STAGE_QUIET, |t| t.elapsed());
         let wait = if stage.is_empty() {
-            idle
+            // a writer with nothing to do wakes for idle freezing too, and does the rest of its housekeeping every `idle`
+            if crate::frozen::idle_ticks_on() { idle.min(crate::frozen::IDLE_TICK_EVERY) } else { idle }
         } else if bank > 0.0 || since_save >= STAGE_QUIET {
             Duration::ZERO
         } else {
@@ -454,6 +455,12 @@ fn writer(
                     continue;
                 }
                 // nothing to save: files still come due as they go stale
+                Err(RecvTimeoutError::Timeout) if stage.is_empty() && last_housekeeping.elapsed() < idle => {
+                    if let Ok(conn) = &mut opened {
+                        freeze_idle(conn, &mut store);
+                    }
+                    continue;
+                }
                 Err(RecvTimeoutError::Timeout) if stage.is_empty() => {
                     if let Ok(conn) = &mut opened {
                         housekeeping(conn, &mut store, true, true);
@@ -600,6 +607,15 @@ fn stage_transaction(conn: &Connection, work: StageWork) -> rusqlite::Result<()>
 
 /// A writer's work between saves: seal some of what is due (when `seal`),
 /// and copy the WAL into the shard.
+/// Only the idle freezing of `housekeeping`, for a writer woken with nothing to do between its housekeepings.
+fn freeze_idle(conn: &mut Connection, store: &mut crate::store::ShardWriter) {
+    let span = crate::metrics::span("db.freeze");
+    if let Err(e) = store.freezer.tick_idle(conn, chrono::Utc::now().timestamp()) {
+        span.failed();
+        eprintln!("freezing in shard {} failed: {e}", store.shard);
+    }
+}
+
 /// `idle`: nothing waits for the writer, soo freezing may take longer (`frozen::Ticker::tick_idle`).
 fn housekeeping(conn: &mut Connection, store: &mut crate::store::ShardWriter, seal: bool, idle: bool) {
     use crate::profile::{LOAD, Load};

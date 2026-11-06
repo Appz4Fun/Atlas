@@ -78,7 +78,12 @@ pub static WAIT_SECS: AtomicI64 = AtomicI64::new(12 * 3600);
 /// a writer ticks at most this often, soo saves keep the writer
 const TICK_EVERY: Duration = Duration::from_secs(1);
 /// and at most this often when it has nothing waiting: a save that comes meanwhile waits `IDLE_TICK_MS` at most
-const IDLE_TICK_EVERY: Duration = Duration::from_millis(250);
+pub const IDLE_TICK_EVERY: Duration = Duration::from_millis(250);
+
+/// Whether idle ticks are on: a writer with nothing to do wakes for them (`IDLE_TICK_EVERY`).
+pub fn idle_ticks_on() -> bool {
+    ENABLED.load(Relaxed) && IDLE_TICK_MS.load(Relaxed) > 0 && !STOPPING.load(Relaxed)
+}
 /// How long a tick waits for another connection's write lock on the shard before it lets the tick go: the writer's
 /// own wait is far longer, and freezing can always come back next tick
 const TICK_BUSY: Duration = Duration::from_secs(2);
@@ -516,6 +521,27 @@ pub fn free_bytes(path: &Path) -> Option<u64> {
         .map(|d| d.available_space())
 }
 
+/// What `free_bytes` last read for the disk under the database, -1 before the first reading and -2 when it couldnt
+/// be read. Read on a thread of its own every `DISK_EVERY`: `sysinfo` lists every mount, network ones too, and on
+/// prod that took over 4 s, which a writer used to spend every minute before its tick could go on.
+static FREE: AtomicI64 = AtomicI64::new(-1);
+static DISK_WATCH: std::sync::Once = std::sync::Once::new();
+
+/// The free bytes under `path` as last read, None until there is a reading or when it couldnt be read. The first
+/// call starts the reading thread for that disk.
+fn free_now(path: &Path) -> Option<u64> {
+    DISK_WATCH.call_once(|| {
+        let path = path.to_path_buf();
+        let _ = std::thread::Builder::new().name("atlas-disk-free".into()).spawn(move || {
+            loop {
+                FREE.store(free_bytes(&path).map_or(-2, |b| b.min(i64::MAX as u64) as i64), Relaxed);
+                std::thread::sleep(DISK_EVERY);
+            }
+        });
+    });
+    u64::try_from(FREE.load(Relaxed)).ok()
+}
+
 /// A shard writer's freezing: at most a tick a second, nothing while the disk is short.
 #[derive(Default)]
 pub struct Ticker {
@@ -537,8 +563,15 @@ impl Ticker {
             return ok;
         }
         let floor = MIN_FREE_BYTES.load(Relaxed).max(0) as u64;
+        if floor > 0 && FREE.load(Relaxed) == -1 {
+            // the first reading isnt in yet: nothing moves, and the disk isnt short either
+            if let Some(p) = conn.path() {
+                free_now(Path::new(p));
+            }
+            return false;
+        }
         // a disk that can't be read is taken as full: moving makes the files bigger before ingest refills the shard
-        let ok = floor == 0 || conn.path().map(Path::new).and_then(free_bytes).is_some_and(|free| free >= floor);
+        let ok = floor == 0 || conn.path().map(Path::new).and_then(free_now).is_some_and(|free| free >= floor);
         if !ok {
             crate::metrics::names::FROZEN.inc(&[("event", "disk_short")], 1);
         }
