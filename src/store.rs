@@ -989,14 +989,24 @@ fn release_complete(conn: &Connection, release_id: i64, file_total: Option<i64>)
     Ok(own_whole_video(conn, release_id, files)? || vouched_by_set(conn, release_id)?)
 }
 
-/// A complete PAR2 set read for release `?1` (`archive::store::par2_inventory`) names only files it has. The set
-/// hashes every file of the upload, soo with all of them there and whole the release is too, whatever the subject
-/// counter says: an uploader's counter can count a file never posted (134 of "135"), or files another row got.
+/// The complete PAR2 sets read for release `?1` (`archive::store::par2_inventory`) name only files it has, and name
+/// every file of it but the PAR2 volumes and the small side files a set leaves out (`.nfo`, `.sfv`, ...). The sets
+/// hash every file of the upload, soo with all of them there and whole the release is too, whatever the subject
+/// counter says: an uploader's counter can count a file never posted (134 of "135"), or files another row got. A
+/// data file no set names may belong to a set whose volumes never came, so it says nothing.
 macro_rules! set_vouches_sql {
     () => {
         "exists (select 1 from par2_files where release_id = ?1 and complete = 1)
          and not exists (select 1 from par2_files p where p.release_id = ?1 and p.complete = 1
-             and not exists (select 1 from files f where f.release_id = ?1 and f.filename = p.name))"
+             and not exists (select 1 from files f where f.release_id = ?1 and f.filename = p.name))
+         and not exists (select 1 from files f where f.release_id = ?1
+             and lower(f.filename) not like '%.par2' and lower(f.filename) not like '%.nfo'
+             and lower(f.filename) not like '%.sfv' and lower(f.filename) not like '%.srr'
+             and lower(f.filename) not like '%.srs' and lower(f.filename) not like '%.txt'
+             and lower(f.filename) not like '%.jpg' and lower(f.filename) not like '%.png'
+             and lower(f.filename) not like '%.md5'
+             and not exists (select 1 from par2_files p where p.release_id = ?1 and p.complete = 1
+                 and p.name = f.filename))"
     };
 }
 
@@ -1032,7 +1042,7 @@ const VIDEO_EXTENSIONS: &[&str] =
 fn own_whole_video(conn: &Connection, release_id: i64, files: i64) -> Result<bool> {
     static PIECE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         #[allow(clippy::unwrap_used)]
-        regex::Regex::new(r"(?i)\b(cd|dis[ck]|part|pt)[ ._-]?\d|sample").unwrap()
+        regex::Regex::new(r"(?i)(?:^|[^a-z0-9])(cd|dis[ck]|part|pt)[ ._-]?\d|sample").unwrap()
     });
     if files != 1 {
         return Ok(false);
@@ -4633,6 +4643,8 @@ mod tests {
         for (name, file) in [
             ("Film.1999.CD1.avi", "Film.1999.CD1.avi"),
             ("Film.1999.Disc.2.mkv", "Film.1999.Disc.2.mkv"),
+            ("Film_1999_CD1.avi", "Film_1999_CD1.avi"),
+            ("Film_1999_Part_1.mkv", "Film_1999_Part_1.mkv"),
             ("grp-film-sample.mkv", "grp-film-sample.mkv"),
             ("Film.1999.DVDRip", "abc.mkv"),
             ("Film.1999.part01.rar", "Film.1999.part01.rar"),
@@ -4713,6 +4725,17 @@ mod tests {
         save(&main, &[r]).unwrap();
         set_of(&conn, other, &["b.part1.rar"], true);
         assert_eq!(complete_of(&conn, other), 0);
+        // a data file no set names may be another set's, whose volumes never came: not; a side file it leaves out
+        // says nothing either way
+        let two_sets = "Film.2002.DVDR-G";
+        let mut r = counted(two_sets, "f.nfo", 1, 4, 1);
+        r.articles.extend(counted(two_sets, "f.part01.rar", 2, 4, 1).articles);
+        r.articles.extend(counted(two_sets, "f.par2", 3, 4, 1).articles);
+        save(&main, &[r]).unwrap();
+        set_of(&conn, two_sets, &["f.nfo"], true);
+        assert_eq!(complete_of(&conn, two_sets), 0, "f.part01.rar is in no set");
+        set_of(&conn, two_sets, &["f.part01.rar"], true);
+        assert_eq!(complete_of(&conn, two_sets), 1, "f.nfo is a side file");
     }
 
     #[test]
