@@ -287,10 +287,13 @@ pub fn twins_with(conn: &Connection, id: i64) -> db::Result<Vec<i64>> {
     }
 }
 
-/// The other postings of a release's content: xposts, then twins, then alts.
+/// The other postings of a release's content: xposts, then twins, then alts. The other rows of its own post aren't
+/// among them: a post whose articles each went to one of several groups is a row per group, each holding parts no
+/// other has, and those rows share the post's files and PAR2 set the way a twin would, but they are this upload.
 pub fn copies_with(conn: &Connection, id: i64) -> db::Result<Vec<(Copy, ReleaseRow)>> {
     let (_, content) = fingerprints_with(conn, id)?;
-    let twins = twins_with(conn, id)?;
+    let own_post = own_post_rows(conn, id);
+    let twins: Vec<i64> = twins_with(conn, id)?.into_iter().filter(|twin| !own_post.contains(twin)).collect();
     let alts = match &content {
         Some(fingerprint) => matching(conn, "content", fingerprint, id)?,
         None => Vec::new(),
@@ -303,6 +306,7 @@ pub fn copies_with(conn: &Connection, id: i64) -> db::Result<Vec<(Copy, ReleaseR
     }
     for file_twin in file_twins_with(conn, id) {
         if !twins.contains(&file_twin.id)
+            && !own_post.contains(&file_twin.id)
             && let Some(release) = get_release_with(conn, file_twin.id)?
         {
             out.push((same_files_kind(conn, id, file_twin.id), release));
@@ -311,12 +315,23 @@ pub fn copies_with(conn: &Connection, id: i64) -> db::Result<Vec<(Copy, ReleaseR
     // the same upload first: it's this release, seen in another group
     out.sort_by_key(|(kind, _)| *kind);
     let listed: HashSet<i64> = out.iter().map(|(_, r)| r.id).collect();
-    for alt in alts.iter().filter(|alt| !listed.contains(alt)) {
+    for alt in alts.iter().filter(|alt| !listed.contains(alt) && !own_post.contains(alt)) {
         if let Some(release) = get_release_with(conn, *alt)? {
             out.push((Copy::Alt, release));
         }
     }
     Ok(out)
+}
+
+/// The rows of the post a release is part of, cut across groups or linked by its PAR2 set, itself among them. Empty
+/// when it's a post of its own.
+fn own_post_rows(conn: &Connection, id: i64) -> HashSet<i64> {
+    get_release_with(conn, id)
+        .ok()
+        .flatten()
+        .and_then(|release| crate::release_info::whole_post_with(conn, &release).ok().flatten())
+        .map(|post| post.ids.into_iter().chain(post.recovery).collect())
+        .unwrap_or_default()
 }
 
 pub fn copies(id: i64) -> db::Result<Vec<(Copy, ReleaseRow)>> {
@@ -616,10 +631,14 @@ pub fn same_payload(conn: &Connection, a: i64, b: i64) -> bool {
     !mine.is_empty() && mine == data(b)
 }
 
-/// The password `id`'s xposts and twins carry to it: of those holding its whole payload (`same_payload`), the first
-/// with a password hint of its own.
+/// The password that comes to `id` from elsewhere: first from the other rows of its own post (one upload, one
+/// password, though `copies_with` doesn't list them), then from its xposts and twins holding its whole payload
+/// (`same_payload`), the first with a password hint of its own.
 pub fn carried_password(conn: &Connection, id: i64, copies: &[(Copy, ReleaseRow)]) -> Option<Inherited> {
-    first_password(conn, carriers(conn, id, copies).iter().copied())
+    let mut rows: Vec<i64> = own_post_rows(conn, id).into_iter().filter(|row| *row != id).collect();
+    rows.sort_unstable();
+    let post: Vec<ReleaseRow> = rows.into_iter().filter_map(|row| get_release_with(conn, row).ok().flatten()).collect();
+    first_password(conn, post.iter()).or_else(|| first_password(conn, carriers(conn, id, copies).iter().copied()))
 }
 
 /// The copies of `id` a password carries to and from: xposts and twins holding its whole payload.
