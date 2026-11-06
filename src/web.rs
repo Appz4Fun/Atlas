@@ -2437,8 +2437,23 @@ fn release_html(
         fact("Parts", parts.to_string());
     }
     fact("Encryption", encryption_fact(inner));
-    if let Some(hint) = release_info::password_hint(r.id, names) {
-        fact("Password", password_fact(inner, &hint));
+    let conn = crate::db::open().ok();
+    // the other postings, read once: the password below and the copies further down both use them
+    let found_copies = conn.as_ref().and_then(|c| crate::duplicates::copies_with(c, r.id).ok()).unwrap_or_default();
+    let own_hint = conn.as_ref().and_then(|c| crate::duplicates::own_password_hint(c, r.id, names));
+    let inherited = match (&own_hint, conn.as_ref()) {
+        (Some(hint), _) => Some(crate::duplicates::Inherited {
+            hint: release_info::PasswordHint { password: hint.password.clone(), source: hint.source },
+            from: r.id,
+            from_name: r.name.clone(),
+        }),
+        (None, Some(c)) => crate::duplicates::first_password(c, same_bytes(&found_copies)),
+        (None, None) => None,
+    };
+    if let Some(hint) = &own_hint {
+        fact("Password", password_fact(inner, hint));
+    } else if let Some(from) = &inherited {
+        fact("Password", inherited_password_fact(from));
     }
     if contents.files > 0 {
         fact("Files", contents.files.to_string());
@@ -2477,7 +2492,6 @@ fn release_html(
     };
 
     // the probe row is decoded once: the panels below read the same one
-    let conn = crate::db::open().ok();
     let stills =
         conn.as_ref().map(|conn| stills_html(r.id, &crate::probe::stills::stills(conn, r.id))).unwrap_or_default();
     let found = conn.as_ref().and_then(|c| crate::probe::read(c, r.id)).map(|p| seven_z_first_file(p, inner, contents));
@@ -2494,7 +2508,7 @@ fn release_html(
         conn.as_ref(),
         &crate::web_meta::MetaInputs { release: r, inner, names, contents, probe: found.as_ref() },
     );
-    let copies = crate::duplicates::copies(r.id).unwrap_or_default();
+    let copies = found_copies;
     let has_twin = crate::duplicates::can_fill(&copies);
     let fill = if has_twin && contents.articles_seen < contents.articles_expected {
         format!(
@@ -2505,7 +2519,7 @@ fn release_html(
         String::new()
     };
     // the other volumes of its set aren't copies of the release, whatever the set's list makes them look like
-    let copies = if recovery.is_some() { String::new() } else { copies_html(&copies) };
+    let copies = if recovery.is_some() { String::new() } else { copies_html(&copies, inherited.as_ref()) };
     let warning = recovery.map_or(String::new(), recovery_warning);
 
     page(
@@ -2962,7 +2976,12 @@ const FULL_MEMBERS: usize = 6;
 
 /// One copy, with everything that helps to choose between copies. Scores and posters are what's already kept, soo a
 /// list never calls out: they come once someone has opened the title.
-fn copy_card(conn: &rusqlite::Connection, badge: &str, r: &ReleaseRow) -> String {
+fn copy_card(
+    conn: &rusqlite::Connection,
+    badge: &str,
+    r: &ReleaseRow,
+    inherited: Option<&crate::duplicates::Inherited>,
+) -> String {
     let parsed = release_tags::parse(&r.name);
     let media = crate::media::query::attrs_with(conn, &[r.id]).unwrap_or_default().remove(&r.id);
     let details = media
@@ -2971,7 +2990,9 @@ fn copy_card(conn: &rusqlite::Connection, badge: &str, r: &ReleaseRow) -> String
     let names = release_info::names_with(conn, r.id).unwrap_or_default();
     let contents = release_info::contents_with(conn, r.id).unwrap_or_default();
     let inner = crate::archive::store::view_with(conn, r.id);
-    let hint = release_info::password_hint_with(conn, r.id, names.as_ref());
+    let hint = crate::duplicates::own_password_hint(conn, r.id, names.as_ref());
+    // a password found on a posting of the same bytes, never this one's own
+    let inherited = inherited.filter(|from| from.from != r.id);
 
     let mut tags = badge.to_string();
     tags.push_str(&name_tags(&parsed));
@@ -3014,6 +3035,8 @@ fn copy_card(conn: &rusqlite::Connection, badge: &str, r: &ReleaseRow) -> String
     fact("Encryption", encryption_fact(&inner));
     if let Some(hint) = &hint {
         fact("Password", password_fact(&inner, hint));
+    } else if let Some(from) = inherited {
+        fact("Password", inherited_password_fact(from));
     }
     fact(
         "Video",
@@ -3065,19 +3088,27 @@ fn copy_link(badge: &str, r: &ReleaseRow) -> String {
 const COPIES_ABOUT: &str = "An xpost is this same upload seen in another group: the very same articles. A twin is a separate upload of the same posting, at another time: the same files, PAR2 set, recovery volumes and article counts under other message-ids. An alt holds the same content packed differently.";
 
 /// Other postings of this release's content.
-fn copies_html(copies: &[(crate::duplicates::Copy, ReleaseRow)]) -> String {
+fn copies_html(
+    copies: &[(crate::duplicates::Copy, ReleaseRow)],
+    inherited: Option<&crate::duplicates::Inherited>,
+) -> String {
     use crate::duplicates::Copy;
     if copies.is_empty() {
         return String::new();
     }
+    // xposts and twins hold this release's very bytes, soo its password is theirs; an alt is packed apart
+    let carried = |kind: &Copy| if matches!(kind, Copy::Xpost | Copy::Twin) { inherited } else { None };
     let badge = |kind: &Copy| match kind {
         Copy::Xpost => tag("tag-ref", "XPOST"),
         Copy::Twin => tag("tag-ok", "TWIN"),
         Copy::Alt => tag("tag-ref", "ALT"),
     };
     let Ok(conn) = crate::db::open() else { return String::new() };
-    let cards: String =
-        copies.iter().take(FULL_COPIES).map(|(kind, copy)| copy_card(&conn, &badge(kind), copy)).collect();
+    let cards: String = copies
+        .iter()
+        .take(FULL_COPIES)
+        .map(|(kind, copy)| copy_card(&conn, &badge(kind), copy, carried(kind)))
+        .collect();
     let rest: String = copies.iter().skip(FULL_COPIES).map(|(kind, copy)| copy_link(&badge(kind), copy)).collect();
     let rest = if rest.is_empty() { rest } else { format!("<ul class=\"copy-rest\">{rest}</ul>") };
     format!("<h2>Other copies</h2><div class=\"copies\">{cards}</div>{rest}<p class=\"sort\">{COPIES_ABOUT}</p>")
@@ -3131,11 +3162,16 @@ fn duplicates_page(args: &HashMap<String, String>) -> ApiResponse {
             };
             let xpost = tag("tag-ref", "XPOST");
             let badge_of = |i: usize| if xposts[i] { &xpost } else { &badge };
+            // every twin in a cluster holds the same bytes: one's password is all of theirs
+            let inherited = match kind {
+                ClusterKind::Twins => crate::duplicates::first_password(&conn, members.iter()),
+                ClusterKind::Alts => None,
+            };
             let cards: String = members
                 .iter()
                 .enumerate()
                 .take(FULL_MEMBERS)
-                .map(|(i, r)| copy_card(&conn, badge_of(i), r))
+                .map(|(i, r)| copy_card(&conn, badge_of(i), r, inherited.as_ref()))
                 .collect();
             let rest: String =
                 members.iter().enumerate().skip(FULL_MEMBERS).map(|(i, r)| copy_link(badge_of(i), r)).collect();
@@ -3554,6 +3590,23 @@ fn password_fact(inner: &crate::archive::store::InnerView, hint: &release_info::
         None => ", not tried".to_string(),
     };
     format!("<code>{}</code> found in {}{verdict}", escape(&hint.password), escape(hint.source))
+}
+
+/// A password found on a posting of the same bytes: where it was found, and no verdict, as it was never tried here.
+fn inherited_password_fact(from: &crate::duplicates::Inherited) -> String {
+    format!(
+        "<code>{}</code> inherited from <a href=\"/ui/release?id={}\">{}</a>, the same files, found there in {}",
+        escape(&from.hint.password),
+        from.from,
+        escape(&from.from_name),
+        escape(from.hint.source)
+    )
+}
+
+/// The copies that hold a release's very bytes: its xposts and twins.
+fn same_bytes(copies: &[(crate::duplicates::Copy, ReleaseRow)]) -> impl Iterator<Item = &ReleaseRow> {
+    use crate::duplicates::Copy;
+    copies.iter().filter(|(kind, _)| matches!(kind, Copy::Xpost | Copy::Twin)).map(|(_, r)| r)
 }
 
 /// How much of a release its recovery volumes can repair: exact from the PAR2 set, or else an estimate.
@@ -4243,7 +4296,7 @@ mod tests {
         let main = dir.path().join("atlas.db");
         crate::db::create_db_at(&main).unwrap();
         let conn = crate::db::open_with_shards(&main).unwrap();
-        let card = copy_card(&conn, &tag("tag-ok", "TWIN"), &release);
+        let card = copy_card(&conn, &tag("tag-ok", "TWIN"), &release, None);
         assert_eq!(card.matches("drawer-toggle").count(), 1, "{card}");
         let toggle = card.find("drawer-toggle").unwrap();
         assert!(card.find("TWIN").unwrap() < toggle && toggle < card.find("href=\"/ui/nzb?id=7\"").unwrap(), "{card}");
