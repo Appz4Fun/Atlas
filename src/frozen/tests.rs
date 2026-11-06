@@ -764,6 +764,23 @@ fn a_tick_lets_go_while_another_connection_holds_the_lock_and_the_next_one_moves
     assert_eq!(tick().frozen, 1);
 }
 
+/// A tick moves what is ready first; the walk gets the rest of the tick, and a short step when the moves took it all.
+#[test]
+fn a_tick_moves_first_and_walks_with_what_is_left() {
+    let f = Fixture::new();
+    let names: Vec<String> = (0..300).map(|n| format!("Old.{n}")).collect();
+    f.save(&names.iter().map(|n| post(n, &["a.rar"], 1, 100)).collect::<Vec<_>>());
+    let conn = f.writer();
+    // one of them queued long ago, ready to move
+    let first = f.id(&conn, "Old.0");
+    conn.execute("insert into freeze_pending (release_id, reason, at) values (?1, 'small_complete', 1)", [first])
+        .unwrap();
+    let mut ticker = Ticker { disk: Some((Instant::now(), true)), ..Ticker::default() };
+    let moved = ticker.tick(&conn, NOW).unwrap();
+    assert_eq!(moved.frozen, 1, "the ready one moved");
+    assert!(moved.backlog > 0, "and the walk went on");
+}
+
 #[test]
 fn a_backlog_step_stops_after_a_chunk_once_its_time_is_up() {
     let f = Fixture::new();
@@ -771,7 +788,7 @@ fn a_backlog_step_stops_after_a_chunk_once_its_time_is_up() {
     f.save(&names.iter().map(|n| post(n, &["a.rar"], 1, 100)).collect::<Vec<_>>());
     let conn = f.writer();
     let step = |budget| rules::backlog_some(&conn, 1_000, budget, NOW).unwrap();
-    assert_eq!(step(Duration::ZERO), rules::Backlog { looked_at: 250, queued: 250 });
-    assert_eq!(step(Duration::from_secs(60)), rules::Backlog { looked_at: 50, queued: 50 }, "on from where it got to");
+    assert_eq!(step(Duration::ZERO), rules::Backlog { looked_at: 50, queued: 50 }, "one chunk");
+    assert_eq!(step(Duration::from_secs(60)), rules::Backlog { looked_at: 250, queued: 250 }, "on from where it got to");
     assert_eq!(meta(&conn, "freeze_backlog_below"), 0);
 }
