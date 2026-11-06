@@ -676,7 +676,7 @@ impl Db {
     /// the future before the writer gets to the slice drops the slice too
     /// (its pass didnt finish, soo the cursor didnt move past it); once the
     /// writer has it, it gets saved.
-    async fn save(&self, releases: Vec<Release>) -> Result<()> {
+    pub(crate) async fn save(&self, releases: Vec<Release>) -> Result<()> {
         // a slice is one group, soo one shard
         let Some(shard) = releases.first().map(|r| crate::store::shard_of(&r.group)) else { return Ok(()) };
         let (done, saved) = tokio::sync::oneshot::channel();

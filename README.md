@@ -242,6 +242,7 @@ compress = false
 | `archive` | see below | Reading archives, PAR2 sets, and NFOs inside releases. See [Archive inspection](#archive-inspection). |
 | `naming` | see below | Giving releases with junk names better ones. See [Name fixing](#name-fixing). |
 | `predb` | see below | A catalogue of scene and P2P titles, off by default. See [PreDB](#predb). |
+| `spots` | see below | Spotnet spots of movies and TV, saved as releases tagged "spot". See [Spots](#spots). |
 | `category` | see below | How releases get a category. See [Categories](#categories). |
 | `media` | see below | TV and movie IDs, with every provider off. See [TV and movie IDs](#tv-and-movie-ids). |
 | `metrics` | see below | Prometheus metrics, off by default. See [Metrics](#metrics). |
@@ -569,6 +570,24 @@ atlas --reprocess --step predb_match --apply
 ```
 
 The first is a dry run. Stop indexing before you `--apply`. The last matches your releases to what you imported, because a bulk import skips the late path.
+
+### Spots
+
+Spotnet "spots" are signed posts in `free.pt` that describe a release (title, category, size, an IMDb link) and point to a compressed NZB posted in `alt.binaries.ftd`. While the indexer runs, it reads the spots in `free.pt` every `poll_minutes` and keeps only the signed movie and TV ones. Spots with an erotic genre are left out. Each kept spot is fetched whole, and its NZB is saved as a release under the spot's title, the way indexing would have saved the post. Search, the API, NZB downloads and post-processing then treat it like any other release. If the indexer already saved that post under the same name and group, the spot's articles go into that release instead of a second one. An edited or reposted spot with the same NZB tags the release it already made.
+
+The spot itself goes in each shard's `spots` table: its message-id, kind (movie or series), title, poster, tag, spotter id, Spotnet categories, IMDb id and an NZB key. The main database keeps what the ingest has seen (`spots_seen`) and how far it has read (`meta.spots_cursor:<server>`). Half of each pass goes to the oldest spots waiting and the rest to spotters in turn, newest first. A release with the spot's title is joined only when it holds the same articles, otherwise the spot is saved under its own name. A spot still waiting after 30 days is given up on. It reads Usenet only: no Spotweb install or database is needed. About 75 spots a day pass the filter, which comes to a HEAD and one or two small BODYs each.
+
+```toml
+[spots]
+enabled = true
+```
+
+| Key | Default | What it does |
+|---|---|---|
+| `enabled` | `true` | Read spots while indexing. |
+| `poll_minutes` | `15` | Minutes between passes. |
+| `first_articles` | `20000` | How far back the first pass reads, in `free.pt` articles. That group gets about 340 a day, so the default covers about two months. |
+| `per_pass` | `200` | Spots fetched whole in one pass at most. The rest wait for the next pass, newest first. |
 
 ### Purging and reprocessing
 

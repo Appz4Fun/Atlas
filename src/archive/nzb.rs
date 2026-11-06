@@ -41,6 +41,10 @@ pub struct NzbFile {
     pub total_bytes: u64,
     /// the groups its `<groups>` names, the first `MAX_GROUPS`
     pub groups: Vec<String>,
+    /// its `subject`, `poster` and `date` (unix seconds) attributes, as written
+    pub subject: String,
+    pub poster: String,
+    pub date: i64,
 }
 
 /// Groups of a file kept at most.
@@ -54,10 +58,10 @@ impl NzbFile {
         self.total_bytes
     }
 
-    fn add(&mut self, segment: Segment, kept: &mut usize) {
+    fn add(&mut self, segment: Segment, kept: &mut usize, max_kept: usize) {
         self.articles += 1;
         self.total_bytes = self.total_bytes.saturating_add(segment.bytes);
-        if *kept < MAX_KEPT_SEGMENTS {
+        if *kept < max_kept {
             *kept += 1;
             self.segments.push(segment);
         }
@@ -78,11 +82,19 @@ pub struct Parsed {
     pub files: Vec<NzbFile>,
     pub complete: bool,
     pub damaged: bool,
+    /// `<file>`s not in `files`: past `MAX_ENTRIES`, or with no name
+    pub left_out: usize,
 }
 
 /// Each `<file>` with a name, at most `MAX_ENTRIES`, and its segments. A cut or broken NZB gives what came before
 /// the break. Bytes that aren't UTF-8 are read as replacement characters.
 pub fn parse(body: &[u8]) -> Parsed {
+    parse_keeping(body, MAX_KEPT_SEGMENTS)
+}
+
+/// `parse`, keeping up to `max_kept` segments across the NZB rather than `MAX_KEPT_SEGMENTS`: for an NZB that is
+/// to be saved whole, such as a spot's.
+pub fn parse_keeping(body: &[u8], max_kept: usize) -> Parsed {
     let text = String::from_utf8_lossy(body);
     let mut reader = Reader::from_str(&text);
     let mut parsed = Parsed::default();
@@ -97,7 +109,7 @@ pub fn parse(body: &[u8]) -> Parsed {
     loop {
         match reader.read_event() {
             Ok(Event::Start(e)) => match e.local_name().as_ref() {
-                "file" => file = Some(NzbFile { name: file_name(&e), ..NzbFile::default() }),
+                "file" => file = Some(file_of(&e)),
                 "segment" => {
                     segment = Some(segment_of(&e));
                     overlong = false;
@@ -110,7 +122,7 @@ pub fn parse(body: &[u8]) -> Parsed {
             },
             Ok(Event::Empty(e)) if e.local_name().as_ref() == "segment" => {
                 if let Some(f) = file.as_mut() {
-                    f.add(segment_of(&e), &mut kept);
+                    f.add(segment_of(&e), &mut kept, max_kept);
                 }
             }
             Ok(Event::Text(t)) => append(text_of(&mut segment, &mut group), &t, &mut overlong),
@@ -131,7 +143,7 @@ pub fn parse(body: &[u8]) -> Parsed {
                         } else {
                             s.message_id.trim().trim_matches(['<', '>']).to_string()
                         };
-                        f.add(s, &mut kept);
+                        f.add(s, &mut kept, max_kept);
                     }
                 }
                 "group" => {
@@ -144,11 +156,12 @@ pub fn parse(body: &[u8]) -> Parsed {
                     }
                 }
                 "file" => {
-                    if let Some(f) = file.take()
-                        && !f.name.is_empty()
-                        && parsed.files.len() < MAX_ENTRIES
-                    {
-                        parsed.files.push(f);
+                    if let Some(f) = file.take() {
+                        if !f.name.is_empty() && parsed.files.len() < MAX_ENTRIES {
+                            parsed.files.push(f);
+                        } else {
+                            parsed.left_out += 1;
+                        }
                     }
                 }
                 "nzb" => {
@@ -199,6 +212,30 @@ fn file_name(e: &BytesStart<'_>) -> String {
     let subject = attribute(e, "subject").unwrap_or_default();
     let name = crate::parser::parse_subject(&subject).map_or(subject, |p| p.filename);
     clean_name(&name).unwrap_or_default()
+}
+
+/// The longest `subject` or `poster` kept, in bytes: a crafted NZB can't make every article of a release that is
+/// saved from it carry megabytes.
+pub const MAX_ATTRIBUTE: usize = 1_024;
+
+fn file_of(e: &BytesStart<'_>) -> NzbFile {
+    let bounded = |key| attribute(e, key).map(|v| cut_to(v, MAX_ATTRIBUTE)).unwrap_or_default();
+    NzbFile {
+        name: file_name(e),
+        subject: bounded("subject"),
+        poster: bounded("poster"),
+        date: attribute(e, "date").and_then(|d| d.trim().parse().ok()).unwrap_or(0),
+        ..NzbFile::default()
+    }
+}
+
+/// `s` cut to at most `max` bytes, on a character boundary.
+fn cut_to(mut s: String, max: usize) -> String {
+    if s.len() > max {
+        let at = (0..=max).rev().find(|&i| s.is_char_boundary(i)).unwrap_or(0);
+        s.truncate(at);
+    }
+    s
 }
 
 fn segment_of(e: &BytesStart<'_>) -> Segment {
@@ -296,6 +333,19 @@ pub fn release_names<'a>(files: impl Iterator<Item = &'a str>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn files_left_out_are_counted_and_attributes_are_bounded() {
+        let long = "\u{e9}".repeat(MAX_ATTRIBUTE);
+        let nzb = format!(
+            r#"<nzb><file subject="{long}" poster="p"><groups><group>a.b.c</group></groups><segments><segment number="1" bytes="1">a@x</segment></segments></file><file subject=""><segments><segment number="1" bytes="1">b@x</segment></segments></file></nzb>"#
+        );
+        let parsed = parse(nzb.as_bytes());
+        assert_eq!((parsed.files.len(), parsed.left_out), (1, 1));
+        let subject = &parsed.files[0].subject;
+        assert!(subject.len() <= MAX_ATTRIBUTE && subject.len() >= MAX_ATTRIBUTE - 1, "{}", subject.len());
+        assert_eq!(parsed.files[0].poster, "p");
+    }
 
     const NZB: &str = r#"<?xml version="1.0" encoding="utf-8" ?>
 <!DOCTYPE nzb PUBLIC "-//newzBin//DTD NZB 0.9//EN" "http://www.newzbin.com/DTD/nzb/nzb-0.9.dtd">

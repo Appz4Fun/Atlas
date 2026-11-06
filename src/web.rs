@@ -1625,6 +1625,7 @@ fn rows_html(found: &[ReleaseRow], split: HashMap<i64, release_info::SplitPost>)
     // a post spread over several groups is all its rows together, whatever one of them holds
     let single: Vec<i64> = ids.iter().copied().filter(|id| !split.contains_key(id)).collect();
     let extras = RowExtras {
+        spots: crate::spotnet::store::spots_of(&ids).unwrap_or_default(),
         recovery: release_info::recovery_only_of(&single),
         split,
         copies: crate::duplicates::counts(&ids).unwrap_or_default(),
@@ -1642,6 +1643,8 @@ struct RowExtras {
     details: HashMap<i64, crate::media::details::Details>,
     /// rows with nothing but PAR2 data in them
     recovery: HashMap<i64, release_info::RecoveryOnly>,
+    /// rows saved from a Spotnet spot
+    spots: HashMap<i64, crate::spotnet::store::Tagged>,
 }
 
 /// Columns of the results table.
@@ -1663,6 +1666,37 @@ fn size_note(size: Option<i64>, recovery: Option<&release_info::RecoveryOnly>) -
             None => format!("{bytes} of PAR2 recovery data only"),
         },
     }
+}
+
+/// Says a release came from a Spotnet spot, and whose.
+fn spot_tag(spot: &crate::spotnet::store::Tagged) -> String {
+    let by = if spot.poster.is_empty() { String::new() } else { format!(" by {}", spot.poster) };
+    let title = format!("Spotnet spot{by}: {}", spot.title);
+    format!(" <span class=\"tag tag-ok\" title=\"{}\">SPOT</span>", attr(&title))
+}
+
+/// A release page's line on its spot: the spot's title, who posted it and their spotter id, and its IMDb link.
+fn spot_fact(spot: &crate::spotnet::store::Tagged) -> String {
+    let mut out = escape(&spot.title);
+    let mut by = Vec::new();
+    if !spot.poster.is_empty() {
+        by.push(escape(&spot.poster));
+    }
+    if !spot.tag.is_empty() && spot.tag != spot.poster {
+        by.push(format!("[{}]", escape(&spot.tag)));
+    }
+    if let Some(id) = spot.spotter_id.as_deref().filter(|id| !id.is_empty()) {
+        by.push(format!("spotter {}", escape(id)));
+    }
+    if !by.is_empty() {
+        let _ = write!(out, "<br>posted by {}", by.join(" "));
+    }
+    if let Some(imdb) =
+        spot.imdb_id.as_deref().filter(|id| id.starts_with("tt") && id[2..].bytes().all(|b| b.is_ascii_digit()))
+    {
+        let _ = write!(out, "<br><a href=\"https://www.imdb.com/title/{imdb}/\" rel=\"noreferrer\">IMDb {imdb}</a>");
+    }
+    out
 }
 
 /// Says a release is an upload's rows put back together.
@@ -1808,6 +1842,9 @@ fn row(
         if count.alts > 0 {
             tags.push_str(&tag("tag-ref", &format!("{} ALT{}", count.alts, if count.alts == 1 { "" } else { "S" })));
         }
+    }
+    if let Some(spot) = extras.spots.get(&r.id) {
+        tags.push_str(&spot_tag(spot));
     }
     if let Some(post) = extras.split.get(&r.id) {
         if post.groups.len() > 1 {
@@ -2343,6 +2380,10 @@ fn release_html(
         tags.push_str(&recovery_tag(recovery));
     }
     tags.push_str(&password_tag(inner.password.as_ref()));
+    let spot = crate::spotnet::store::spots_of(&[r.id]).ok().and_then(|mut found| found.remove(&r.id));
+    if let Some(spot) = &spot {
+        tags.push_str(&spot_tag(spot));
+    }
     tags.push_str(&if r.complete { tag("tag-ok", "COMPLETE") } else { tag("tag-warn", "INCOMPLETE") });
     if names.is_some_and(|n| n.obfuscated) {
         tags.push_str(&tag("tag-warn", "OBFUSCATED"));
@@ -2468,6 +2509,9 @@ fn release_html(
     let links = media.map(|m| id_links(m.kind, &m.ids)).unwrap_or_default();
     if !links.is_empty() {
         fact("Links", links);
+    }
+    if let Some(spot) = &spot {
+        fact("Spot", spot_fact(spot));
     }
 
     let nzb_files = nzb_files_html(contents);
@@ -3956,6 +4000,28 @@ fn seven_z_first_file(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_spot_shows_as_a_tag_and_a_fact() {
+        let spot = crate::spotnet::store::Tagged {
+            title: "Movie <2026> & co".into(),
+            poster: "NUKE".into(),
+            tag: "nuke-tag".into(),
+            spotter_id: Some("lQhLVQ".into()),
+            imdb_id: Some("tt39162904".into()),
+            ..Default::default()
+        };
+        let t = super::spot_tag(&spot);
+        assert!(t.contains(">SPOT</span>") && t.contains("Spotnet spot by NUKE: Movie &lt;2026&gt; &amp; co"), "{t}");
+        let f = super::spot_fact(&spot);
+        assert!(f.starts_with("Movie &lt;2026&gt; &amp; co<br>posted by NUKE [nuke-tag] spotter lQhLVQ"), "{f}");
+        assert!(f.contains("href=\"https://www.imdb.com/title/tt39162904/\""), "{f}");
+        // an IMDb id that isn't one makes no link
+        let odd = crate::spotnet::store::Tagged { imdb_id: Some("tt12\"x".into()), ..spot.clone() };
+        assert!(!super::spot_fact(&odd).contains("imdb.com"));
+        let bare = crate::spotnet::store::Tagged { title: "T".into(), ..Default::default() };
+        assert_eq!(super::spot_fact(&bare), "T");
+    }
+
 
     fn window_of_rows(rows: Vec<ReleaseRow>) -> Window {
         Window {

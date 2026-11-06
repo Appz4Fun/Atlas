@@ -425,6 +425,26 @@ fn refusal(e: &NntpError) -> Refusal {
     }
 }
 
+/// Which bounded read `Pool::fetch_capped` makes.
+#[derive(Clone, Copy)]
+enum Capped {
+    Head,
+    Body,
+}
+
+/// Whether a reply says the server hasn't the article: 423, or a 430 that isn't a failed forward.
+pub fn says_absent(e: &NntpError) -> bool {
+    matches!(e.code(), Some(423 | 430)) && !e.failed_forwarding()
+}
+
+/// The error worth reporting after one more server failed: one that may pass (a timeout, a failed forward, a
+/// dropped connection) is kept over a server saying it hasn't the article, which another server may still have.
+fn keep_worse(kept: &mut Option<NntpError>, e: NntpError) {
+    if !(says_absent(&e) && kept.as_ref().is_some_and(|k| !says_absent(k))) {
+        *kept = Some(e);
+    }
+}
+
 /// A GROUP reply that says the server lacks the group: 411, or 500/501 from a
 /// server without GROUP. Not 403 or 430, which say it couldnt answer right now.
 pub fn carries_not(e: &NntpError) -> bool {
@@ -3098,7 +3118,7 @@ impl Pool {
         Ok(self.xover_on(i, group, start, end).await?.into_iter().map(|o| (o.number, o.message_id)).collect())
     }
 
-    async fn xover_on(&self, i: usize, group: &str, start: u64, end: u64) -> Result<Vec<Overview>> {
+    pub(crate) async fn xover_on(&self, i: usize, group: &str, start: u64, end: u64) -> Result<Vec<Overview>> {
         match self.xover_once(i, group, start, end, false).await {
             Err(NntpError::Decompress(e)) => {
                 // count it against the server's compression, and redo the slice uncompressed
@@ -3366,6 +3386,53 @@ impl Pool {
         }
 
         Err(last_err)
+    }
+
+    /// HEAD, the way `fetch_body` reads a BODY: least busy indexing server first, then the others until one has
+    /// it. None: past `max_bytes` on the server that had it. When every server fails, a failure that may pass beats
+    /// a server saying it hasn't the article (`keep_worse`), so a caller can tell "gone" from "try again".
+    pub async fn fetch_head(&self, message_id: &str, max_bytes: usize) -> Result<Option<Vec<u8>>> {
+        self.fetch_capped(message_id, max_bytes, Capped::Head).await
+    }
+
+    /// BODY with a bound, read as `body_capped` reads it (streamed, given up past `max_bytes`), from the servers in
+    /// `fetch_head`'s order and with its errors.
+    pub async fn fetch_body_capped(&self, message_id: &str, max_bytes: usize) -> Result<Option<Vec<u8>>> {
+        self.fetch_capped(message_id, max_bytes, Capped::Body).await
+    }
+
+    async fn fetch_capped(&self, message_id: &str, max_bytes: usize, read: Capped) -> Result<Option<Vec<u8>>> {
+        let mut order = self.indexing_tier();
+        order.sort_by(|&a, &b| self.busy(a).total_cmp(&self.busy(b)));
+        let rest: Vec<usize> = (0..self.servers.len()).filter(|i| !order.contains(i)).collect();
+        order.extend(rest);
+        let mut kept: Option<NntpError> = None;
+        for i in order {
+            let mut lease = match self.lease(i, false).await {
+                Ok(l) => l,
+                Err(e) => {
+                    keep_worse(&mut kept, e);
+                    continue;
+                }
+            };
+            let r = match read {
+                Capped::Head => within(self.body_deadline, "HEAD", lease.begin().head(message_id, max_bytes)).await,
+                Capped::Body => {
+                    within(self.body_deadline, "BODY", lease.begin().body_capped(message_id, max_bytes)).await
+                }
+            };
+            match lease.check(r) {
+                // a cut read leaves the rest unread: the connection can't take another request
+                Ok(None) => {
+                    lease.collect_traffic();
+                    lease.conn = None;
+                    return Ok(None);
+                }
+                Ok(found) => return Ok(found),
+                Err(e) => keep_worse(&mut kept, e),
+            }
+        }
+        Err(kept.unwrap_or_else(Self::no_servers))
     }
 
     pub async fn list_groups(&self, pattern: Option<&str>) -> Result<Vec<(String, u64)>> {
@@ -3880,6 +3947,23 @@ mod yenc_decode_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_failure_that_may_pass_beats_an_absent_article() {
+        let reply = |code, message: &str| NntpError::Reply { code, message: message.into() };
+        let mut kept = None;
+        keep_worse(&mut kept, reply(400, "busy"));
+        keep_worse(&mut kept, reply(430, "No Such Article"));
+        assert_eq!(kept.as_ref().and_then(NntpError::code), Some(400));
+        let mut kept = None;
+        keep_worse(&mut kept, reply(430, "No Such Article"));
+        keep_worse(&mut kept, reply(430, "Failed forwarding"));
+        assert!(kept.as_ref().is_some_and(|e| !says_absent(e)));
+        let mut kept = None;
+        keep_worse(&mut kept, reply(430, "No Such Article"));
+        keep_worse(&mut kept, reply(423, "no such number"));
+        assert!(kept.as_ref().is_some_and(says_absent));
+    }
+
     #[test]
     fn an_overview_with_no_size_gets_one_from_its_lines() {
         let o = |bytes, lines| Overview { bytes, lines, ..Default::default() }.into_article().bytes;
