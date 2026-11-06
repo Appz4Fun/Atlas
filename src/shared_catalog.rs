@@ -327,8 +327,8 @@ fn outbox_ddl(schema: &str) -> String {
 
 /// For a compaction, which builds a shard afresh from the original attached as `old`: the original's waiting
 /// changes come along, and so do the releases the copy changed in any column (dropping copies of articles takes
-/// their bytes off a release's size, and its parts and completeness can change with them) and the key of every
-/// copied row the copy left out. Returns whether the original had the outbox, to put the triggers back once the copy has its
+/// their bytes off a release's size, and its parts and completeness can change with them), and the key of every
+/// copied row the copy left out or added. Returns whether the original had the outbox, to put the triggers back once the copy has its
 /// indexes (`sync_triggers`).
 pub fn carry_outbox(conn: &Connection) -> rusqlite::Result<bool> {
     let had: i64 = conn.query_row("select count(*) from old.sqlite_schema where name = ?1", [OUTBOX], |r| r.get(0))?;
@@ -353,7 +353,8 @@ pub fn carry_outbox(conn: &Connection) -> rusqlite::Result<bool> {
          where {changed};",
         ddl = outbox_ddl("main"),
     ))?;
-    // and every row the copy left out (a collection whose release is gone, say): the publisher deletes it
+    // and every row the copy left out (a collection whose release is gone, say), which the publisher deletes, and
+    // every row the copy added (a release put on the uncategorized list), which it sends
     for t in tables(conn)? {
         let in_old: i64 = conn.query_row(
             "select count(*) from old.sqlite_schema where type = 'table' and name = ?1",
@@ -372,10 +373,14 @@ pub fn carry_outbox(conn: &Connection) -> rusqlite::Result<bool> {
         conn.execute_batch(&format!(
             "insert into main.{OUTBOX} (tbl, k1, k2)
              select '{name}', o.{k1}, {o2} from old.{qt} o
-             where not exists (select 1 from main.{qt} m where {same});",
+             where not exists (select 1 from main.{qt} m where {same});
+             insert into main.{OUTBOX} (tbl, k1, k2)
+             select '{name}', m.{k1}, {m2} from main.{qt} m
+             where not exists (select 1 from old.{qt} o where {same});",
             name = t.name,
             qt = quote(&t.name),
             o2 = k2.as_ref().map_or("null".to_string(), |k2| format!("o.{k2}")),
+            m2 = k2.as_ref().map_or("null".to_string(), |k2| format!("m.{k2}")),
         ))?;
     }
     Ok(true)
@@ -1286,6 +1291,8 @@ mod tests {
             .execute_batch(
                 "create table releases (id INTEGER PRIMARY KEY, name TEXT, size INTEGER, posted_date TEXT);
                  create table collections (key INTEGER PRIMARY KEY, release_id INTEGER NOT NULL) without rowid;
+                 create table nzb_pointed (release_id INTEGER PRIMARY KEY);
+                 insert into nzb_pointed values (16);
                  insert into releases (id, name, size, posted_date) values (8, 'a', 7, null), (16, 'b', 20, 'x');",
             )
             .unwrap();
@@ -1309,8 +1316,9 @@ mod tests {
                 ("releases".into(), 8),
                 ("releases".into(), 16),
                 ("collections".into(), -3),
+                ("nzb_pointed".into(), 16),
             ],
-            "8 for its size, 16 for another column with the size unchanged, -3 left out of the copy"
+            "8 for its size, 16 for another column with the size unchanged, -3 left out of the copy, 16 added to it"
         );
         copy_conn.execute_batch("detach database old").unwrap();
         // without one in the original, nothing to carry
