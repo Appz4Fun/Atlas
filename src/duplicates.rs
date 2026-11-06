@@ -1,6 +1,7 @@
-//! Other postings of the same content. A **twin** has the same posted files, proven by PAR2 hashes, soo
-//! its articles can stand in for this one's. An **alt** holds the same files packed differently, soo
-//! it's another whole download, not a source of articles.
+//! Other postings of the same content. An **xpost** is the same upload seen in another group: the very same
+//! articles, by message-id. A **twin** is another upload of the same posted files, proven by PAR2 hashes, soo its
+//! articles can stand in for this one's. An **alt** holds the same files packed differently, soo it's another whole
+//! download, not a source of articles.
 //!
 //! Each release keeps two fingerprints in its shard, and copies are found by looking them up in every
 //! shard, soo there are no clusters to keep in step: purging a release takes its row with it.
@@ -196,10 +197,50 @@ pub fn content_fingerprint<'a>(files: impl Iterator<Item = (&'a str, Option<u64>
     Some(sha.finalize().to_vec())
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// What another posting is to a release, in the order a page lists them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Copy {
+    /// the same upload in another group: the same articles under the same message-ids
+    Xpost,
+    /// another upload of the same files, cut up the same way: other message-ids, the same bytes
     Twin,
     Alt,
+}
+
+/// Whether two releases hold the same articles: a file of one starts with the very message-id a file of the other
+/// does. Message-ids are unique, soo that's one upload crossposted to both groups, not two uploads of the same bytes.
+/// A file's first message-id is that of its lowest part seen, soo a copy missing a file's first part can still tie
+/// by another file. False when either is gone or a shard hasn't got the table.
+pub fn shares_articles(conn: &Connection, a: i64, b: i64) -> bool {
+    let (sa, sb) = (store::shard_of_id(a), store::shard_of_id(b));
+    let sql = format!(
+        "select 1 from s{sb}.files where release_id = ?2 and subject_mid in
+             (select subject_mid from s{sa}.files where release_id = ?1 and subject_mid is not null)
+         limit 1"
+    );
+    conn.prepare_cached(&sql).and_then(|mut stmt| stmt.exists(rusqlite::params![a, b])).unwrap_or(false)
+}
+
+/// How many other releases with this posted fingerprint hold `id`'s very articles, over every shard and uncapped,
+/// soo it can be taken from a tally of the fingerprint.
+fn count_xposts(conn: &Connection, id: i64, posted: &[u8]) -> i64 {
+    let own = store::shard_of_id(id);
+    (0..store::SHARDS)
+        .filter_map(|s| {
+            let sql = format!(
+                "select count(*) from s{s}.release_fingerprint f where f.posted = ?1 and f.release_id != ?2
+                 and exists (select 1 from s{s}.files x where x.release_id = f.release_id and x.subject_mid in
+                     (select subject_mid from s{own}.files where release_id = ?2 and subject_mid is not null))"
+            );
+            // a shard that hasn't got the tables yet has none
+            conn.query_row(&sql, rusqlite::params![posted, id], |r| r.get::<_, i64>(0)).ok()
+        })
+        .sum()
+}
+
+/// Of these copies of `id` proven to hold the same files, an xpost when it shares articles with `id`, else a twin.
+fn same_files_kind(conn: &Connection, id: i64, other: i64) -> Copy {
+    if shares_articles(conn, id, other) { Copy::Xpost } else { Copy::Twin }
 }
 
 fn matching(conn: &Connection, column: &str, fingerprint: &[u8], id: i64) -> db::Result<Vec<i64>> {
@@ -246,7 +287,7 @@ pub fn twins_with(conn: &Connection, id: i64) -> db::Result<Vec<i64>> {
     }
 }
 
-/// The other postings of a release's content, twins first.
+/// The other postings of a release's content: xposts, then twins, then alts.
 pub fn copies_with(conn: &Connection, id: i64) -> db::Result<Vec<(Copy, ReleaseRow)>> {
     let (_, content) = fingerprints_with(conn, id)?;
     let twins = twins_with(conn, id)?;
@@ -257,16 +298,18 @@ pub fn copies_with(conn: &Connection, id: i64) -> db::Result<Vec<(Copy, ReleaseR
     let mut out = Vec::new();
     for twin in &twins {
         if let Some(release) = get_release_with(conn, *twin)? {
-            out.push((Copy::Twin, release));
+            out.push((same_files_kind(conn, id, *twin), release));
         }
     }
     for file_twin in file_twins_with(conn, id) {
         if !twins.contains(&file_twin.id)
             && let Some(release) = get_release_with(conn, file_twin.id)?
         {
-            out.push((Copy::Twin, release));
+            out.push((same_files_kind(conn, id, file_twin.id), release));
         }
     }
+    // the same upload first: it's this release, seen in another group
+    out.sort_by_key(|(kind, _)| *kind);
     let listed: HashSet<i64> = out.iter().map(|(_, r)| r.id).collect();
     for alt in alts.iter().filter(|alt| !listed.contains(alt)) {
         if let Some(release) = get_release_with(conn, *alt)? {
@@ -363,6 +406,9 @@ pub fn clusters_with(
 /// How many other copies a release has.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CopyCount {
+    /// the same upload in other groups
+    pub xposts: i64,
+    /// other uploads of the same files
     pub twins: i64,
     pub alts: i64,
 }
@@ -456,8 +502,14 @@ pub fn counts_with(conn: &Connection, ids: &[i64]) -> db::Result<HashMap<i64, Co
             _ => 0,
         };
         let alts = c.as_ref().and_then(|c| content.get(c)).map_or(0, |n| (n - 1 - same_posting).max(0));
-        if twins > 0 || alts > 0 {
-            out.insert(*id, CopyCount { twins, alts });
+        // of those with the same posted files, the ones holding this release's very articles are it, crossposted
+        let xposts = match p {
+            Some(p) if twins > 0 => count_xposts(conn, *id, p),
+            _ => 0,
+        };
+        let twins = (twins - xposts).max(0);
+        if xposts > 0 || twins > 0 || alts > 0 {
+            out.insert(*id, CopyCount { xposts, twins, alts });
         }
     }
     Ok(out)
@@ -729,8 +781,26 @@ pub fn fill_gaps_checked(own: &mut Vec<ArticleRow>, twin: &[ArticleRow], known: 
 
 /// Whether a twin of this release can lend it articles.
 pub fn can_fill(copies: &[(Copy, ReleaseRow)]) -> bool {
-    copies.iter().any(|(kind, _)| *kind == Copy::Twin)
+    // an xpost's row can have parts this group's listing missed: the same articles, read in another group
+    copies.iter().any(|(kind, _)| matches!(kind, Copy::Twin | Copy::Xpost))
 }
+
+/// For a cluster of postings with the same files, in order, which are an xpost of one listed before them: the same
+/// upload seen in another group. The rest are each a separate upload, twins of one another.
+pub fn xposts_of_earlier(conn: &Connection, members: &[ReleaseRow]) -> Vec<bool> {
+    // every member before it, not one of each upload: two rows can tie only through a third, as each file's first
+    // message-id is the lowest part that row saw, and crossposts can miss different parts in different groups
+    (0..members.len())
+        .map(|i| {
+            members[i.saturating_sub(MAX_XPOST_WITNESSES)..i]
+                .iter()
+                .any(|earlier| shares_articles(conn, earlier.id, members[i].id))
+        })
+        .collect()
+}
+
+/// How many members before it a cluster member is checked against: a cluster is rarely more than a few uploads.
+const MAX_XPOST_WITNESSES: usize = 64;
 
 /// A release's NZB, its gaps filled from its twins: what every NZB is now, kept for the page's own link to it.
 pub fn filled_nzb(id: i64) -> db::Result<Option<String>> {

@@ -1798,6 +1798,10 @@ fn row(
     }
     // a recovery volume is no copy of the others of its set, whatever the set's list makes them look like
     if let Some(count) = extras.copies.get(&r.id).filter(|_| recovery.is_none()) {
+        if count.xposts > 0 {
+            let plural = if count.xposts == 1 { "" } else { "S" };
+            tags.push_str(&tag("tag-ref", &format!("{} XPOST{plural}", count.xposts)));
+        }
         if count.twins > 0 {
             tags.push_str(&tag("tag-ok", &format!("{} TWIN{}", count.twins, if count.twins == 1 { "" } else { "S" })));
         }
@@ -3057,6 +3061,9 @@ fn copy_link(badge: &str, r: &ReleaseRow) -> String {
     )
 }
 
+/// What the kinds of copy on a release's page are.
+const COPIES_ABOUT: &str = "An xpost is this same upload seen in another group: the very same articles. A twin is a separate upload of the same posting, at another time: the same files, PAR2 set, recovery volumes and article counts under other message-ids. An alt holds the same content packed differently.";
+
 /// Other postings of this release's content.
 fn copies_html(copies: &[(crate::duplicates::Copy, ReleaseRow)]) -> String {
     use crate::duplicates::Copy;
@@ -3064,6 +3071,7 @@ fn copies_html(copies: &[(crate::duplicates::Copy, ReleaseRow)]) -> String {
         return String::new();
     }
     let badge = |kind: &Copy| match kind {
+        Copy::Xpost => tag("tag-ref", "XPOST"),
         Copy::Twin => tag("tag-ok", "TWIN"),
         Copy::Alt => tag("tag-ref", "ALT"),
     };
@@ -3072,9 +3080,7 @@ fn copies_html(copies: &[(crate::duplicates::Copy, ReleaseRow)]) -> String {
         copies.iter().take(FULL_COPIES).map(|(kind, copy)| copy_card(&conn, &badge(kind), copy)).collect();
     let rest: String = copies.iter().skip(FULL_COPIES).map(|(kind, copy)| copy_link(&badge(kind), copy)).collect();
     let rest = if rest.is_empty() { rest } else { format!("<ul class=\"copy-rest\">{rest}</ul>") };
-    format!(
-        "<h2>Other copies</h2><div class=\"copies\">{cards}</div>{rest}<p class=\"sort\">A twin is the same posting: the same files, PAR2 set, recovery volumes and article counts. An alt holds the same content packed differently.</p>"
-    )
+    format!("<h2>Other copies</h2><div class=\"copies\">{cards}</div>{rest}<p class=\"sort\">{COPIES_ABOUT}</p>")
 }
 
 /// Every cluster of copies, whichever release they're found from.
@@ -3104,7 +3110,7 @@ fn duplicates_page(args: &HashMap<String, String>) -> ApiResponse {
             twins,
             "twins",
             tag("tag-ok", "TWIN"),
-            "Twins are the same posting: the same files, PAR2 set, recovery volumes and article counts, so one can fill the other's gaps.",
+            "Twins are the same posting: the same files, PAR2 set, recovery volumes and article counts, so one can fill the other's gaps. A separate upload is a twin; the same upload seen in another group, the very same articles, is an xpost.",
         ),
         ClusterKind::Alts => (
             alts,
@@ -3118,8 +3124,21 @@ fn duplicates_page(args: &HashMap<String, String>) -> ApiResponse {
         .map(|members| {
             let title = release_tags::parse(&members[0].name).title;
             let title = if title.is_empty() { members[0].name.clone() } else { title };
-            let cards: String = members.iter().take(FULL_MEMBERS).map(|r| copy_card(&conn, &badge, r)).collect();
-            let rest: String = members.iter().skip(FULL_MEMBERS).map(|r| copy_link(&badge, r)).collect();
+            // in a twin cluster, a member that is an earlier one crossposted is that upload, not another
+            let xposts = match kind {
+                ClusterKind::Twins => crate::duplicates::xposts_of_earlier(&conn, members),
+                ClusterKind::Alts => vec![false; members.len()],
+            };
+            let xpost = tag("tag-ref", "XPOST");
+            let badge_of = |i: usize| if xposts[i] { &xpost } else { &badge };
+            let cards: String = members
+                .iter()
+                .enumerate()
+                .take(FULL_MEMBERS)
+                .map(|(i, r)| copy_card(&conn, badge_of(i), r))
+                .collect();
+            let rest: String =
+                members.iter().enumerate().skip(FULL_MEMBERS).map(|(i, r)| copy_link(badge_of(i), r)).collect();
             let rest = if rest.is_empty() { rest } else { format!("<ul class=\"copy-rest\">{rest}</ul>") };
             format!(
                 "<section class=\"cluster\"><h2>{} <span class=\"count\">{} copies</span></h2><div class=\"copies\">{cards}</div>{rest}</section>",

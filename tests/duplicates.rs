@@ -10,7 +10,7 @@ use atlas::duplicates::{
 };
 use atlas::parser::Release;
 use atlas::{db, store};
-use common::stage::release_of;
+use common::stage::{article, release_of};
 
 fn release(main: &std::path::Path, name: &str, group: &str) -> (i64, rusqlite::Connection) {
     store::save(main, &[Release { group: group.into(), ..release_of(name, "x.bin", 2, 2) }]).unwrap();
@@ -52,8 +52,8 @@ fn copies_are_found_across_shards_and_go_with_their_release() {
     assert!(copies(other).unwrap().is_empty());
 
     let tally = counts(&[first, alt, other]).unwrap();
-    assert_eq!(tally[&first], CopyCount { twins: 1, alts: 1 });
-    assert_eq!(tally[&alt], CopyCount { twins: 0, alts: 2 });
+    assert_eq!(tally[&first], CopyCount { xposts: 0, twins: 1, alts: 1 });
+    assert_eq!(tally[&alt], CopyCount { xposts: 0, twins: 0, alts: 2 });
     assert!(!tally.contains_key(&other));
     assert_eq!(later_copies(&[first, other, twin, alt]).unwrap(), [twin, alt]);
 
@@ -100,10 +100,78 @@ fn copies_are_found_across_shards_and_go_with_their_release() {
     assert!(clusters_with(&conn, ClusterKind::Twins, 1, 10).unwrap().is_empty(), "past the end");
     drop(conn);
 
+    // the first release crossposted to another group: the very same articles, the same posted files. It's that
+    // upload, an xpost, not a separate upload of it, while the repost under other message-ids stays a twin
+    let xpost_group = in_shard(4);
+    store::save(&main, &[Release { group: xpost_group.into(), ..release_of("Movie.Rar5-A", "x.bin", 2, 2) }]).unwrap();
+    let shard_e = db::open_shard(&store::shard_path(&main, 4)).unwrap();
+    let xpost: i64 =
+        shard_e.query_row("select id from releases where name = 'Movie.Rar5-A'", [], |r| r.get(0)).unwrap();
+    shard_e.execute(SET_POSTED, rusqlite::params![xpost, b"same-posted".as_slice()]).unwrap();
+    shard_e.execute(SET_CONTENT, rusqlite::params![xpost, b"same-content".as_slice()]).unwrap();
+    let conn = db::open().unwrap();
+    assert!(atlas::duplicates::shares_articles(&conn, first, xpost));
+    assert!(atlas::duplicates::shares_articles(&conn, xpost, first));
+    assert!(!atlas::duplicates::shares_articles(&conn, first, twin), "a repost has message-ids of its own");
+    let found: Vec<(Copy, i64)> = copies(first).unwrap().into_iter().map(|(kind, r)| (kind, r.id)).collect();
+    assert_eq!(found, [(Copy::Xpost, xpost), (Copy::Twin, twin), (Copy::Alt, alt)], "the same upload first");
+    let found: Vec<(Copy, i64)> = copies(twin).unwrap().into_iter().map(|(kind, r)| (kind, r.id)).collect();
+    let mut found_ids = found.clone();
+    found_ids.sort_by_key(|(_, id)| *id);
+    let mut want = vec![(Copy::Twin, first), (Copy::Twin, xpost), (Copy::Alt, alt)];
+    want.sort_by_key(|(_, id)| *id);
+    assert_eq!(found_ids, want, "to the repost, both are another upload");
+    assert!(atlas::duplicates::can_fill(&copies(xpost).unwrap()));
+    let tally = counts(&[first, twin, xpost]).unwrap();
+    assert_eq!(tally[&first], CopyCount { xposts: 1, twins: 1, alts: 1 });
+    assert_eq!(tally[&xpost], CopyCount { xposts: 1, twins: 1, alts: 1 });
+    assert_eq!(tally[&twin], CopyCount { xposts: 0, twins: 2, alts: 1 });
+    let cluster = clusters_with(&conn, ClusterKind::Twins, 0, 10).unwrap().remove(0);
+    let marks = atlas::duplicates::xposts_of_earlier(&conn, &cluster);
+    let flagged: Vec<i64> = cluster.iter().zip(&marks).filter(|(_, x)| **x).map(|(r, _)| r.id).collect();
+    assert_eq!(flagged.len(), 1, "one of the two rows of the first upload is the other crossposted");
+    assert!(flagged[0] == first || flagged[0] == xpost);
+    shard_e.execute("delete from releases where id = ?", [xpost]).unwrap();
+    shard_e.execute("delete from release_fingerprint where release_id = ?", [xpost]).unwrap();
+    drop(conn);
+
+    // three groups' rows of one crosspost, each missing other parts: the first and last share no file's first
+    // message-id, but each shares one with the middle row, soo all three are one upload
+    let rows = [
+        ("Tri-A", 5usize, vec![article("f1", 1, 2, "<f1.1@x>"), article("f2", 2, 2, "<f2.2@x>")]),
+        (
+            "Tri-B",
+            6,
+            vec![article("f1", 1, 2, "<f1.1@x>"), article("f2", 1, 2, "<f2.1@x>"), article("f2", 2, 2, "<f2.2@x>")],
+        ),
+        ("Tri-C", 7, vec![article("f1", 2, 2, "<f1.2@x>"), article("f2", 1, 2, "<f2.1@x>")]),
+    ];
+    let mut tri = Vec::new();
+    for (name, s, articles) in rows {
+        store::save(&main, &[Release { group: in_shard(s).into(), articles, ..release_of(name, "f1", 0, 2) }]).unwrap();
+        let shard = db::open_shard(&store::shard_path(&main, s)).unwrap();
+        let id: i64 = shard.query_row("select id from releases where name = ?", [name], |r| r.get(0)).unwrap();
+        shard.execute(SET_POSTED, rusqlite::params![id, b"tri-posted".as_slice()]).unwrap();
+        tri.push(id);
+    }
+    let conn = db::open().unwrap();
+    assert!(!atlas::duplicates::shares_articles(&conn, tri[0], tri[2]));
+    let cluster = clusters_with(&conn, ClusterKind::Twins, 0, 10)
+        .unwrap()
+        .into_iter()
+        .find(|members| members.iter().any(|r| r.id == tri[0]))
+        .unwrap();
+    assert_eq!(cluster.iter().map(|r| r.id).collect::<Vec<_>>(), tri);
+    assert_eq!(atlas::duplicates::xposts_of_earlier(&conn, &cluster), [false, true, true], "C ties through B");
+    for (s, id) in [(5usize, tri[0]), (6, tri[1]), (7, tri[2])] {
+        let shard = db::open_shard(&store::shard_path(&main, s)).unwrap();
+        shard.execute("delete from release_fingerprint where release_id = ?", [id]).unwrap();
+    }
+    drop(conn);
+
     // a purged release is no one's copy
     shard_b.execute("delete from releases where id = ?", [twin]).unwrap();
     let found: Vec<(Copy, i64)> = copies(first).unwrap().into_iter().map(|(kind, r)| (kind, r.id)).collect();
     assert_eq!(found, [(Copy::Alt, alt)]);
     assert_eq!(cluster_count_with(&db::open().unwrap(), ClusterKind::Twins).unwrap(), 0, "its cluster goes too");
 }
-

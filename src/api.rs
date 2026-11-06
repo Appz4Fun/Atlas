@@ -380,6 +380,7 @@ fn release_attrs(r: &crate::search::ReleaseRow, copies: Option<&crate::duplicate
     add("language", &tags.languages.join(", "));
     add("team", tags.group.as_deref().unwrap_or_default());
     if let Some(copies) = copies {
+        add("xposts", &copies.xposts.to_string());
         add("twins", &copies.twins.to_string());
         add("alts", &copies.alts.to_string());
     }
