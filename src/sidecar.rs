@@ -46,6 +46,10 @@ pub const SIDECARS: ShardTable = ShardTable {
             "create index if not exists sidecars_release_name on sidecars(release_name) where release_name is not null",
         ),
         (
+            "sidecars_text_at",
+            "create index if not exists sidecars_text_at on sidecars(at, release_id) where text is not null",
+        ),
+        (
             "sidecars_segment_uid",
             "create index if not exists sidecars_segment_uid on sidecars(segment_uid) where segment_uid is not null",
         ),
@@ -72,11 +76,16 @@ const EVICT: &str = "update sidecars set text = null where release_id in (
     select release_id from (
         select release_id, length(cast(text as blob)) as len,
             sum(length(cast(text as blob))) over (order by at, release_id rows unbounded preceding) as run
-        from sidecars where text is not null and release_id != ?1)
+        from sidecars indexed by sidecars_text_at where text is not null and release_id != ?1)
     where run - len < coalesce((select value from meta where key = 'sidecar_text_bytes'), 0) - ?2)";
 
 /// What a release name read from a sidecar is kept to: a real one is far shorter, and these rows outlive releases
 pub const MAX_NAME: usize = 255;
+
+/// What the shard's sidecar texts hold now. A failed read counts as nothing: the eviction is then left to the next.
+fn text_bytes(conn: &rusqlite::Connection) -> i64 {
+    conn.query_row("select value from meta where key = 'sidecar_text_bytes'", [], |r| r.get(0)).unwrap_or(0)
+}
 
 /// The shard's `sidecar_text_bytes` counted again from what `sidecars` holds, as after a compaction's copy.
 pub fn recount(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
@@ -226,6 +235,7 @@ impl Step for SidecarStep {
         };
         let read = body.as_deref().map(|b| read(picked.map_or("", |f| f.filename.as_str()), b));
         let text = body.as_deref().map(text_of);
+        let stored = text.as_ref().map_or(0, String::len);
         let kind = read.as_ref().map_or("unread", |r| r.kind);
         let params = vec![
             r.id.into(),
@@ -238,7 +248,11 @@ impl Step for SidecarStep {
             text.into(),
             chrono::Utc::now().timestamp().into(),
         ];
-        let writes = vec![StepWrite::new(SET, params), StepWrite::new(EVICT, vec![r.id.into(), MAX_TOTAL_TEXT.into()])];
+        let mut writes = vec![StepWrite::new(SET, params)];
+        // the oldest texts are looked at only when this one takes the shard past its total: below it, nothing scans
+        if text_bytes(ctx.conn()).saturating_add(stored as i64) > MAX_TOTAL_TEXT {
+            writes.push(StepWrite::new(EVICT, vec![r.id.into(), MAX_TOTAL_TEXT.into()]));
+        }
         Ok(Outcome { matched: body.is_some(), writes, ..Outcome::default() })
     }
 }
@@ -314,6 +328,9 @@ Format                                   : Matroska
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         conn.execute_batch("create table meta (key TEXT PRIMARY KEY, value INTEGER);").unwrap();
         conn.execute_batch(SIDECARS.create).unwrap();
+        for (_, index) in SIDECARS.indexes {
+            conn.execute_batch(index).unwrap();
+        }
         let write = |id: i64, kind: &str, text: Option<&str>, at: i64, cap: i64| {
             let p: Vec<rusqlite::types::Value> = vec![
                 id.into(),
@@ -340,6 +357,12 @@ Format                                   : Matroska
             })
             .unwrap()
         };
+        let mut stmt = conn.prepare(&format!("explain query plan {EVICT}")).unwrap();
+        let plan: Vec<String> =
+            stmt.query_map(rusqlite::params![0, 0], |r| r.get::<_, String>(3)).unwrap().map(Result::unwrap).collect();
+        drop(stmt);
+        let plan = plan.join(" | ");
+        assert!(plan.contains("sidecars_text_at") && !plan.contains("TEMP B-TREE"), "{plan}");
         put(1, "aaaa", 1);
         put(2, "bbbb", 2);
         assert_eq!(total(), 8);
