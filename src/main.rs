@@ -48,6 +48,10 @@ fn main() -> ExitCode {
         atlas::naming::unname::run(&args)
     } else if has("--sealed-log-move") {
         atlas::sealed_store::run_move()
+    } else if has("--shared-catalog-fill") {
+        atlas::shared_catalog::run_fill()
+    } else if has("--shared-catalog-check") {
+        atlas::shared_catalog::run_check(has("--prune"))
     } else if has("--search-indexes") {
         atlas::field_search::run(&args)
     } else if has("--thaw") {

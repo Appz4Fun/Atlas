@@ -202,6 +202,50 @@ impl Table {
         format!("select {} from {} where {}", cols.join(", "), quote(&self.name), wh.join(" and "))
     }
 
+    /// A page of `?1` rows in key order: the first page, or (`first` false) the rows after the key `?2` (and `?3`)
+    /// that ended the page before. Two statements, so SQLite seeks to the key instead of scanning up to it.
+    fn page_sql(&self, first: bool) -> String {
+        let cols: Vec<String> = self.cols.iter().map(|(c, _)| quote(c)).collect();
+        let key: Vec<String> = self.key.iter().map(|c| quote(c)).collect();
+        let after = match (first, key.len()) {
+            (true, _) => String::new(),
+            (false, 2) => format!(" where ({}, {}) > (?2, ?3)", key[0], key[1]),
+            (false, _) => format!(" where {} > ?2", key[0]),
+        };
+        format!("select {} from {}{after} order by {} limit ?1", cols.join(", "), quote(&self.name), key.join(", "))
+    }
+
+    /// Where a key is among the columns.
+    fn key_at(&self) -> Vec<usize> {
+        self.key.iter().map(|k| self.cols.iter().position(|(c, _)| c == k).unwrap_or(0)).collect()
+    }
+
+    /// Postgres: the next `$3` keys this shard sent after `$4` (and `$5`), in key order.
+    fn pg_keys_sql(&self, first: bool) -> String {
+        let key: Vec<String> = self.key.iter().map(|c| quote(c)).collect();
+        let after = match (first, key.len()) {
+            (true, _) => String::new(),
+            (false, 2) => format!(" and ({}, {}) > ($3, $4)", key[0], key[1]),
+            (false, _) => format!(" and {} > $3", key[0]),
+        };
+        format!(
+            "select {} from {} where shard = $1{after} order by {} limit $2",
+            key.join(", "),
+            quote(&self.name),
+            key.join(", ")
+        )
+    }
+
+    /// Postgres: `select ... for update` of one row this shard sent, by its key.
+    fn lock_sql(&self) -> String {
+        self.delete_sql().replacen("delete from", "select 1 from", 1) + " for update"
+    }
+
+    fn exists_sql(&self) -> String {
+        let wh: Vec<String> = self.key.iter().enumerate().map(|(i, c)| format!("{} = ?{}", quote(c), i + 1)).collect();
+        format!("select 1 from {} where {}", quote(&self.name), wh.join(" and "))
+    }
+
     fn triggers(&self) -> String {
         let t = &self.name;
         let k = |side: &str| -> String {
@@ -738,6 +782,262 @@ fn rest(stop: &AtomicBool, d: Duration) {
     }
 }
 
+/// Rows a fill or check reads at a time.
+const PAGE: usize = 5_000;
+
+/// Copies every row of every table of one shard to Postgres, a page at a time in key order, and returns the rows
+/// written per table. It writes rows that are there and refreshes rows Postgres has, even ones changed while the
+/// catalog was off and no trigger saw. Each page is read from the shard while holding the shard's advisory lock
+/// in Postgres (`lock_shard`), which every publisher batch holds too: a batch sent before the page is no newer than
+/// it, and a change after the read stays in the outbox until a later batch sends it. Pages stop at `PAGE` rows or
+/// `BATCH_BYTES` of them.
+pub fn fill_shard(conn: &Connection, pg: &mut postgres::Client, shard: usize) -> anyhow::Result<Vec<(String, u64)>> {
+    let tables = tables(conn)?;
+    ensure_schema(pg, &tables)?;
+    let mut out = Vec::new();
+    for t in &tables {
+        let (mut last, mut written): (Option<Vec<Value>>, u64) = (None, 0);
+        let width = t.cols.len() + 1;
+        let key_at = t.key_at();
+        loop {
+            let mut tx = pg.transaction()?;
+            lock_shard(&mut tx, shard)?;
+            let (rows, ended) = {
+                let read = conn.unchecked_transaction()?;
+                let mut stmt = read.prepare_cached(&t.page_sql(last.is_none()))?;
+                let mut rows = match last.as_deref() {
+                    None => stmt.query(params![PAGE as i64])?,
+                    Some([k1]) => stmt.query(params![PAGE as i64, k1])?,
+                    Some([k1, k2, ..]) => stmt.query(params![PAGE as i64, k1, k2])?,
+                    Some([]) => unreachable!("a key has a column"),
+                };
+                let (mut page, mut bytes, mut ended) = (Vec::new(), 0usize, true);
+                while let Some(r) = rows.next()? {
+                    let row = (0..t.cols.len()).map(|i| r.get::<_, Value>(i)).collect::<rusqlite::Result<Vec<_>>>()?;
+                    bytes += row.iter().map(value_bytes).sum::<usize>();
+                    page.push(row);
+                    if bytes >= BATCH_BYTES {
+                        ended = false;
+                        break;
+                    }
+                }
+                ended &= page.len() < PAGE;
+                drop(rows);
+                drop(stmt);
+                read.commit()?;
+                (page, ended)
+            };
+            if let Some(tail) = rows.last() {
+                last = Some(key_at.iter().map(|i| tail[*i].clone()).collect());
+            }
+            for chunk in rows.chunks(rows_per_statement(width)) {
+                let mut ps: Vec<Box<dyn postgres::types::ToSql + Sync + Send>> =
+                    Vec::with_capacity(chunk.len() * width);
+                for row in chunk {
+                    ps.push(Box::new(shard as i16));
+                    for (v, (_, ty)) in row.iter().zip(&t.cols) {
+                        ps.push(pg_value(v, *ty));
+                    }
+                }
+                let refs: Vec<&(dyn postgres::types::ToSql + Sync)> = ps.iter().map(|p| &**p as _).collect();
+                written += tx.execute(t.upsert_sql(chunk.len()).as_str(), &refs)?;
+            }
+            tx.commit()?;
+            if ended || rows.is_empty() {
+                break;
+            }
+        }
+        names::SHARED_CATALOG_ROWS.inc(&[("op", "fill")], written);
+        out.push((t.name.clone(), written));
+    }
+    Ok(out)
+}
+
+/// One table's rows in the shard and in Postgres, and the Postgres rows whose key the shard no longer has (with
+/// `prune`, the ones deleted).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Check {
+    pub table: String,
+    pub shard_rows: i64,
+    pub pg_rows: i64,
+    pub stale: u64,
+}
+
+/// Counts each table on both sides and finds the rows Postgres keeps that the shard deleted (a fill that read a
+/// row just before it was deleted puts it back after the publisher took it out). With `prune` it deletes them:
+/// safe while the indexer runs, since a key gone from the shard is gone for good or comes back through the outbox.
+pub fn check_shard(
+    conn: &Connection,
+    pg: &mut postgres::Client,
+    shard: usize,
+    prune: bool,
+) -> anyhow::Result<Vec<Check>> {
+    let tables = tables(conn)?;
+    ensure_schema(pg, &tables)?;
+    let shard_v = shard as i16;
+    let mut out = Vec::new();
+    for t in &tables {
+        let shard_rows: i64 = conn.query_row(&format!("select count(*) from {}", quote(&t.name)), [], |r| r.get(0))?;
+        let pg_rows: i64 =
+            pg.query_one(&format!("select count(*) from {} where shard = $1", quote(&t.name)), &[&shard_v])?.get(0);
+        let mut stale = 0u64;
+        let mut last: Option<Vec<Value>> = None;
+        let mut exists = conn.prepare_cached(&t.exists_sql())?;
+        let mut in_shard = |key: &[Value]| -> rusqlite::Result<bool> {
+            if key.len() == 2 { exists.exists(params![key[0], key[1]]) } else { exists.exists(params![key[0]]) }
+        };
+        let (lock, del) = (pg.prepare(&t.lock_sql())?, pg.prepare(&t.delete_sql())?);
+        loop {
+            let mut ps: Vec<Box<dyn postgres::types::ToSql + Sync + Send>> =
+                vec![Box::new(shard_v), Box::new(PAGE as i64)];
+            if let Some(k) = &last {
+                for (i, v) in k.iter().enumerate() {
+                    ps.push(pg_value(v, t.key_type(i)));
+                }
+            }
+            let refs: Vec<&(dyn postgres::types::ToSql + Sync)> = ps.iter().map(|p| &**p as _).collect();
+            let rows = pg.query(t.pg_keys_sql(last.is_none()).as_str(), &refs)?;
+            let n = rows.len();
+            for r in &rows {
+                let key: Vec<Value> = (0..t.key.len()).map(|i| pg_to_value(r, i, t.key_type(i))).collect();
+                if !in_shard(&key)? {
+                    if !prune {
+                        stale += 1;
+                    } else {
+                        // the Postgres row locked first, then the shard asked again: a publisher sending the key
+                        // back waits for this transaction, and one that sent it before the lock is seen by the
+                        // second look, soo a row put back meanwhile is never deleted
+                        let mut kps: Vec<Box<dyn postgres::types::ToSql + Sync + Send>> = vec![Box::new(shard_v)];
+                        for (i, v) in key.iter().enumerate() {
+                            kps.push(pg_value(v, t.key_type(i)));
+                        }
+                        let krefs: Vec<&(dyn postgres::types::ToSql + Sync)> = kps.iter().map(|p| &**p as _).collect();
+                        let mut tx = pg.transaction()?;
+                        if !tx.query(&lock, &krefs)?.is_empty() && !in_shard(&key)? {
+                            tx.execute(&del, &krefs)?;
+                            stale += 1;
+                        }
+                        tx.commit()?;
+                    }
+                }
+                last = Some(key);
+            }
+            if n < PAGE {
+                break;
+            }
+        }
+        out.push(Check { table: t.name.clone(), shard_rows, pg_rows, stale });
+    }
+    Ok(out)
+}
+
+/// A Postgres key column back as a SQLite value.
+fn pg_to_value(row: &postgres::Row, i: usize, t: PgType) -> Value {
+    match t {
+        PgType::Int => row.get::<_, Option<i64>>(i).map_or(Value::Null, Value::Integer),
+        PgType::Real => row.get::<_, Option<f64>>(i).map_or(Value::Null, Value::Real),
+        PgType::Text => row.get::<_, Option<String>>(i).map_or(Value::Null, Value::Text),
+        PgType::Bytes => row.get::<_, Option<Vec<u8>>>(i).map_or(Value::Null, Value::Blob),
+    }
+}
+
+/// Each shard that has the outbox: a fill or check needs the triggers in, or a change made meanwhile is lost.
+fn armed_shards() -> anyhow::Result<Vec<(usize, PathBuf)>> {
+    let main = crate::paths::database();
+    let mut out = Vec::new();
+    for (shard, path) in store::shard_paths(&main).into_iter().enumerate() {
+        if !path.exists() {
+            continue;
+        }
+        let conn = crate::db::open_shard(&path)?;
+        let armed: i64 =
+            conn.query_row("select count(*) from sqlite_schema where name = ?1", [OUTBOX], |r| r.get(0))?;
+        if armed == 0 {
+            anyhow::bail!(
+                "shard {shard} has no {OUTBOX}: turn shared_catalog on in config.toml and restart the indexer first"
+            );
+        }
+        out.push((shard, path));
+    }
+    Ok(out)
+}
+
+/// `atlas --shared-catalog-fill`: copies the rows that were there before the triggers, and refreshes the copy after
+/// a time with the catalog off. Runs beside the indexer, holding off compaction meanwhile.
+pub fn run_fill() -> i32 {
+    let config = crate::config::shared_catalog_config();
+    if !config.is_on() {
+        println!("shared_catalog isn't on in config.toml");
+        return 1;
+    }
+    let result = (|| -> anyhow::Result<()> {
+        // a compaction would swap a shard under the fill, which would go on copying the original
+        let _hold = crate::compact::hold_off_compaction(&crate::paths::database())?;
+        let shards = armed_shards()?;
+        let mut pg = connect(&config)?;
+        for (shard, path) in shards {
+            let started = std::time::Instant::now();
+            let conn = crate::db::open_shard(&path)?;
+            let added = fill_shard(&conn, &mut pg, shard)?;
+            let total: u64 = added.iter().map(|(_, n)| n).sum();
+            println!("shard {shard}: {total} rows written in {}s", started.elapsed().as_secs());
+            for (t, n) in added.iter().filter(|(_, n)| *n > 0) {
+                println!("  {t}: {n}");
+            }
+        }
+        Ok(())
+    })();
+    match result {
+        Ok(()) => 0,
+        Err(e) => {
+            println!("shared catalog fill: {e:#}");
+            1
+        }
+    }
+}
+
+/// `atlas --shared-catalog-check [--prune]`: rows per table on both sides, and the stale ones in Postgres.
+pub fn run_check(prune: bool) -> i32 {
+    let config = crate::config::shared_catalog_config();
+    if !config.is_on() {
+        println!("shared_catalog isn't on in config.toml");
+        return 1;
+    }
+    let result = (|| -> anyhow::Result<bool> {
+        // a compaction would swap a shard under the check, whose lookups would then ask the original
+        let _hold = crate::compact::hold_off_compaction(&crate::paths::database())?;
+        let shards = armed_shards()?;
+        let mut pg = connect(&config)?;
+        let mut clean = true;
+        for (shard, path) in shards {
+            let conn = crate::db::open_shard(&path)?;
+            let waiting: i64 = conn.query_row(&format!("select count(*) from {OUTBOX}"), [], |r| r.get(0))?;
+            println!("shard {shard}: {waiting} changes waiting in the outbox");
+            for c in check_shard(&conn, &mut pg, shard, prune)? {
+                let mark = if c.shard_rows == c.pg_rows && c.stale == 0 { "ok" } else { "differs" };
+                clean &= mark == "ok";
+                println!(
+                    "  {:<24} shard {:>12} postgres {:>12} stale {:>8} {}{mark}",
+                    c.table,
+                    c.shard_rows,
+                    c.pg_rows,
+                    c.stale,
+                    if prune && c.stale > 0 { "pruned, " } else { "" }
+                );
+            }
+        }
+        Ok(clean)
+    })();
+    match result {
+        Ok(true) => 0,
+        Ok(false) => 2,
+        Err(e) => {
+            println!("shared catalog check: {e:#}");
+            1
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -945,6 +1245,111 @@ mod tests {
             .unwrap();
         copy_conn.execute("attach database ?1 as old", [plain.to_string_lossy()]).unwrap();
         assert!(!carry_outbox(&copy_conn).unwrap());
+    }
+
+    #[test]
+    fn pages_walk_a_table_in_key_order_one_page_after_another() {
+        let conn = shard();
+        conn.execute_batch(
+            "insert into par2_files values (8, x'02', 'b'), (8, x'01', 'a'), (16, x'01', 'c');
+             insert into releases (id, name) values (24, 'x'), (8, 'y'), (16, 'z');",
+        )
+        .unwrap();
+        let t = tables(&conn).unwrap();
+        let par2 = t.iter().find(|t| t.name == "par2_files").unwrap();
+        let first: Vec<String> = conn
+            .prepare(&par2.page_sql(true))
+            .unwrap()
+            .query_map(params![2], |r| r.get::<_, String>(2))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(first, ["a", "b"]);
+        let next: Vec<String> = conn
+            .prepare(&par2.page_sql(false))
+            .unwrap()
+            .query_map(params![2, 8, vec![2u8]], |r| r.get::<_, String>(2))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(next, ["c"]);
+        for (t, first) in [(par2, false), (par2, true)] {
+            let plan: String = conn
+                .query_row(&format!("explain query plan {}", t.page_sql(first)), params![1, 8, vec![2u8]], |r| r.get(3))
+                .unwrap_or_default();
+            assert!(first || plan.starts_with("SEARCH"), "a later page seeks: {plan}");
+        }
+        let rel = t.iter().find(|t| t.name == "releases").unwrap();
+        assert_eq!(rel.key_at(), [0]);
+        let ids: Vec<i64> = conn
+            .prepare(&rel.page_sql(false))
+            .unwrap()
+            .query_map(params![10, 8], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(ids, [16, 24]);
+        assert_eq!(
+            par2.lock_sql(),
+            "select 1 from \"par2_files\" where shard = $1 and \"release_id\" = $2 and \"file_id\" = $3 for update"
+        );
+        assert!(par2.pg_keys_sql(false).contains("and (\"release_id\", \"file_id\") > ($3, $4)"));
+    }
+
+    /// Against a real Postgres when `ATLAS_CATALOG_TEST_URL` names an empty database to use: the fill writes every
+    /// row and refreshes stale ones, waits for a batch holding the shard's lock, and the check finds and prunes rows
+    /// the shard deleted.
+    #[test]
+    fn a_fill_writes_and_refreshes_every_row_under_the_shard_lock_and_a_check_prunes_what_the_shard_deleted() {
+        let Ok(url) = std::env::var("ATLAS_CATALOG_TEST_URL") else { return };
+        let _one = PG.lock().unwrap_or_else(|e| e.into_inner());
+        let mut pg = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+        pg.batch_execute("drop table if exists releases, collections, par2_files, nzb_pointed").unwrap();
+        let conn = shard();
+        let many: Vec<String> = (1..=12_000).map(|i| format!("({}, 'r{i}')", i * 8)).collect();
+        conn.execute_batch(&format!("insert into releases (id, name) values {};", many.join(", "))).unwrap();
+        conn.execute_batch("insert into par2_files values (8, x'01', 'a'), (8, x'02', 'b');").unwrap();
+        sync_triggers(&conn, true).unwrap();
+        let t = tables(&conn).unwrap();
+        ensure_schema(&mut pg, &t).unwrap();
+        // Postgres holds a row the shard changed while the catalog was off
+        pg.execute("insert into releases (shard, id, name) values (2, 8, 'stale')", &[]).unwrap();
+        let written = fill_shard(&conn, &mut pg, 2).unwrap();
+        assert_eq!(written.iter().find(|(n, _)| n == "releases").unwrap().1, 12_000, "three pages, 8 refreshed");
+        assert_eq!(written.iter().find(|(n, _)| n == "par2_files").unwrap().1, 2);
+        let name: String = pg.query_one("select name from releases where id = 8", &[]).unwrap().get(0);
+        assert_eq!(name, "r1", "the shard's row, not the stale copy");
+        // a fill waits for a batch in flight: the advisory lock is the publisher's too
+        let mut other = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+        let mut held = other.transaction().unwrap();
+        lock_shard(&mut held, 2).unwrap();
+        let (url2, done) = (url.clone(), Arc::new(AtomicBool::new(false)));
+        let filler = {
+            let done = done.clone();
+            std::thread::spawn(move || {
+                let conn = shard();
+                conn.execute("insert into releases (id, name) values (8, 'r1')", []).unwrap();
+                let mut pg = postgres::Client::connect(&url2, postgres::NoTls).unwrap();
+                fill_shard(&conn, &mut pg, 2).unwrap();
+                done.store(true, Relaxed);
+            })
+        };
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!done.load(Relaxed), "the fill waits for the lock");
+        held.commit().unwrap();
+        filler.join().unwrap();
+        assert!(done.load(Relaxed));
+        // a row the shard deleted that Postgres still has
+        conn.execute_batch("delete from releases where id = 16; delete from par2_files where file_id = x'02';")
+            .unwrap();
+        let checks = check_shard(&conn, &mut pg, 2, false).unwrap();
+        let rel = checks.iter().find(|c| c.table == "releases").unwrap();
+        assert_eq!((rel.shard_rows, rel.pg_rows, rel.stale), (11_999, 12_000, 1));
+        assert_eq!(checks.iter().find(|c| c.table == "par2_files").unwrap().stale, 1);
+        check_shard(&conn, &mut pg, 2, true).unwrap();
+        let after = check_shard(&conn, &mut pg, 2, false).unwrap();
+        assert!(after.iter().all(|c| c.stale == 0 && c.shard_rows == c.pg_rows), "{after:?}");
+        pg.batch_execute("drop table releases, collections, par2_files, nzb_pointed").unwrap();
     }
 
     /// Against a real Postgres when `ATLAS_CATALOG_TEST_URL` names an empty database to use: the publisher sends
