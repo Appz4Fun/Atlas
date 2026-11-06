@@ -1030,10 +1030,13 @@ async fn run_servers(
     }
     // once stopping, the writers do no freezing: their queues of saves drain as fast as they did before it
     let s = sched.clone();
+    let stopping_since = Arc::new(OnceLock::new());
+    let since = stopping_since.clone();
     tasks.spawn(async move {
         while !s.stopping() {
             nap(Duration::from_secs(1), || s.stopping()).await;
         }
+        let _ = since.set(Instant::now());
         crate::frozen::STOPPING.store(true, Ordering::Relaxed);
     });
     tasks.spawn(watch_config(sched.clone(), servers));
@@ -1046,11 +1049,20 @@ async fn run_servers(
             sched.wind_down.store(true, Ordering::Relaxed);
         }
     }
+    // how long each part of a stop takes, from when it was asked for
+    let stop_log = |what: &str| {
+        if let Some(since) = stopping_since.get() {
+            println!("[STOP] {what} {:.1}s after the stop", since.elapsed().as_secs_f64());
+        }
+    };
+    stop_log("workers, the stage and the other tasks done");
 
     checkpoint_stop.store(true, Ordering::Relaxed);
     let _ = tokio::task::spawn_blocking(move || checkpointer.join()).await;
+    stop_log("checkpointer done");
     // the last clone of the db waits for the writers (one may be sealing)
     let _ = tokio::task::spawn_blocking(move || drop(db)).await;
+    stop_log("writers drained");
     sched.compact_due.load(Ordering::Relaxed)
 }
 
