@@ -2194,6 +2194,21 @@ fn keys_panel(i: &MetaInputs<'_>, l: &Looked, compact: bool) -> Facts {
             .filter(|_| !same_link(l, id, Kind::MovieHash).is_empty())
             .map(|h| with_link(h.to_string(), Kind::MovieHash)),
     );
+    let media = i.probe.and_then(|p| p.media.as_ref());
+    f.add_html("Mux key", media.and_then(crate::keys::mux_text).map(|t| with_link(key16(t.as_bytes()), Kind::Mux)));
+    f.add_html(
+        "Encode key",
+        media.and_then(crate::keys::encode_text).map(|t| with_link(key16(t.as_bytes()), Kind::Encode)),
+    );
+    f.add_html(
+        "Thread key",
+        i.probe
+            .and_then(|p| crate::probe::thread_root(&p.headers))
+            .map(|root| with_link(key16(format!("thread:{root}").as_bytes()), Kind::Thread)),
+    );
+    // the poster's header names in order, the ones servers add left out: a tool's fingerprint, shared by everyone
+    // posting with it, soo no list
+    f.key("Header set", i.probe.and_then(|p| crate::probe::header_set(&p.header_order)).map(|t| key16(t.as_bytes())));
     // an archive's own keys: how many releases share one, never its value
     for (label, what, kind) in [
         ("Archive file CRC", "A file inside its archive, by size and CRC32", Kind::InnerFile),
