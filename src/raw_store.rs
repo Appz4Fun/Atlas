@@ -1896,12 +1896,20 @@ pub fn put_rev_volumes(name: &str, group_name: &str, content_id: &[u8], volumes:
 /// The most `raw_rev_volumes` rows kept, whatever the count of releases: what posted headers can make it hold.
 const MAX_RAW_REV_ROWS: i64 = 1_000_000;
 
-/// Drops whole saved tables, by key order, soo `room` more rows fit within `MAX_RAW_REV_ROWS`.
+/// Drops whole saved tables, by key order, until `room` more rows fit within `MAX_RAW_REV_ROWS`.
 fn prune_rev_rows(conn: &Connection, room: i64) -> rusqlite::Result<()> {
-    let rows: i64 = conn.query_row("SELECT count(*) FROM raw_rev_volumes", [], |r| r.get(0))?;
-    if rows + room > MAX_RAW_REV_ROWS {
-        // releases of at most `MAX_KEPT` rows each: enough of them to make the room, and some to spare
-        let releases = (rows + room - MAX_RAW_REV_ROWS) / crate::archive::rev::MAX_KEPT as i64 + 64;
+    prune_rev_rows_to(conn, room, MAX_RAW_REV_ROWS)
+}
+
+fn prune_rev_rows_to(conn: &Connection, room: i64, cap: i64) -> rusqlite::Result<()> {
+    loop {
+        let rows: i64 = conn.query_row("SELECT count(*) FROM raw_rev_volumes", [], |r| r.get(0))?;
+        if rows == 0 || rows + room <= cap {
+            return Ok(());
+        }
+        // a release holds at most `MAX_KEPT` rows, soo this many is the least that can make the room; counted again
+        // after, as releases of fewer rows free less
+        let releases = (rows + room - cap) / crate::archive::rev::MAX_KEPT as i64 + 64;
         conn.execute(
             "DELETE FROM raw_rev_volumes WHERE (name, group_name) IN (
                 SELECT DISTINCT name, group_name FROM raw_rev_volumes LIMIT ?1
@@ -1909,7 +1917,6 @@ fn prune_rev_rows(conn: &Connection, room: i64) -> rusqlite::Result<()> {
             params![releases],
         )?;
     }
-    Ok(())
 }
 
 /// Drops the oldest saved tables soo `room` more releases fit within `MAX_RAW_ARCHIVES_ROWS`.
@@ -3577,6 +3584,28 @@ mod tests {
         assert_eq!(rev, (0, 9 << 20, 7));
         let cid: Option<Vec<u8>> = raw.query_row("select content_id from raw_rev_volumes", [], |r| r.get(0)).unwrap();
         assert!(cid.is_some_and(|c| !c.is_empty()), "kept under the files' content id, soo a step finds it");
+    }
+
+    #[test]
+    fn the_rev_row_cap_holds_whatever_sizes_the_tables_are() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = create(&dir.path().join("atlas.raw.db")).unwrap();
+        let mut ins = conn
+            .prepare("INSERT INTO raw_rev_volumes (name, group_name, content_id, volume, size, crc32) VALUES (?1, 'g', x'01', ?2, 1, 1)")
+            .unwrap();
+        // many one-volume tables first in key order, then a few full ones
+        for i in 0..2_000 {
+            ins.execute(params![format!("a{i:05}"), 0]).unwrap();
+        }
+        for i in 0..20 {
+            for v in 0..crate::archive::rev::MAX_KEPT as i64 {
+                ins.execute(params![format!("b{i:05}"), v]).unwrap();
+            }
+        }
+        drop(ins);
+        prune_rev_rows_to(&conn, 100, 4_000).unwrap();
+        let rows: i64 = conn.query_row("SELECT count(*) FROM raw_rev_volumes", [], |r| r.get(0)).unwrap();
+        assert!(rows + 100 <= 4_000, "{rows} rows left");
     }
 
     #[test]

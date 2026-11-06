@@ -805,9 +805,10 @@ impl Step for Par2Step {
     fn run(&self, ctx: &mut StepCtx<'_>) -> Result<Outcome, StepError> {
         let files = ctx.files().map_err(retry)?;
         let explicit = crate::raw_store::is_explicit_rerun(ctx.conn(), ctx.release().id, PAR2_STEP);
-        // RAR recovery volumes repair a set as PAR2 does, and are often posted in its place
-        let rev = super::rev::read(ctx, &files, explicit)?;
         let mut outcome = self.read_par2(ctx, &files)?;
+        // RAR recovery volumes repair a set as PAR2 does, and are often posted in its place. Read after the set, soo
+        // a release's bodies go to its PAR2 list first and the .rev table gets what is left of the budget
+        let rev = super::rev::read(ctx, &files, explicit)?;
         outcome.matched |= !rev.is_empty();
         outcome.writes.extend(rev);
         Ok(outcome)
