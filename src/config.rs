@@ -596,6 +596,11 @@ impl SharedCatalogConfig {
     }
 }
 
+/// The file's `shared_catalog` object, for the fill and check commands: no keyring.
+pub fn shared_catalog_config() -> SharedCatalogConfig {
+    read_file().map_or_else(SharedCatalogConfig::default, |v| SharedCatalogConfig::from_value(v.get("shared_catalog")))
+}
+
 /// The file's `sealed_log` object, for anything that reads articles: no keyring.
 pub fn sealed_log_config() -> SealedLogConfig {
     read_file().map_or_else(SealedLogConfig::default, |v| SealedLogConfig::from_value(v.get("sealed_log")))
