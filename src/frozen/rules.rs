@@ -75,13 +75,25 @@ pub fn any_on() -> bool {
 }
 
 /// Queue release `id` for freezing if a rule matches it now, and take it off the queue if none does. In the
-/// caller's transaction, on the shard's own connection.
+/// caller's transaction, on the shard's own connection. Queued again for the same reason it keeps the time it was
+/// first queued, soo a release visited often still gets to `wait_hours`; a new reason (or a thaw, which takes it off
+/// the queue first) starts the wait over. On prod a visit re-stamped every queued release it came by, and a release
+/// visited more often than every 12 hours would never have moved.
 pub fn evaluate(conn: &Connection, id: i64, now: i64) -> Result<bool> {
+    let before: Option<(String, i64)> = conn
+        .prepare_cached("select reason, at from freeze_pending where release_id = ?1")?
+        .query_row([id], |r| Ok((r.get(0)?, r.get(1)?)))
+        .optional()?;
     conn.prepare_cached("delete from freeze_pending where release_id = ?1")?.execute([id])?;
     if !any_on() {
         return Ok(false);
     }
-    Ok(queue(conn, id, id, now)? > 0)
+    let queued = queue(conn, id, id, now)? > 0;
+    if queued && let Some((reason, at)) = before {
+        conn.prepare_cached("update freeze_pending set at = ?3 where release_id = ?1 and reason = ?2")?
+            .execute(params![id, reason, at])?;
+    }
+    Ok(queued)
 }
 
 /// The rules' settings now: the small rule's size, whether it keeps movies and TV, whether not-TV/movies is on,

@@ -295,6 +295,32 @@ fn a_post_of_only_what_describes_a_release_is_a_sidecar_and_freezes() {
     assert_ne!(off.as_deref(), Some(rules::SIDECAR));
 }
 
+/// A release visited again for the same reason keeps the time it was first queued; a new reason starts it over.
+#[test]
+fn a_visit_for_the_same_reason_keeps_the_queued_time() {
+    let f = Fixture::new();
+    f.save(&[post("Small.Thing", &["a.rar", "b.rar"], 3, 1000)]);
+    let conn = f.writer();
+    let id = f.id(&conn, "Small.Thing");
+    let queued = |conn: &Connection| -> (String, i64) {
+        conn.query_row("select reason, at from freeze_pending where release_id = ?1", [id], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap()
+    };
+    assert!(rules::evaluate(&conn, id, NOW).unwrap());
+    let (first, at) = queued(&conn);
+    assert_eq!(at, NOW);
+    assert!(rules::evaluate(&conn, id, NOW + 3600).unwrap());
+    assert_eq!(queued(&conn), (first.clone(), NOW), "the same reason: still queued at the first visit");
+    // grown past the small rule's size and filed outside Movies/TV/Other: another reason, the wait starts over
+    conn.execute("update releases set size = ?2 where id = ?1", rusqlite::params![id, 4_i64 << 30]).unwrap();
+    conn.execute("insert into release_category (release_id, category) values (?1, 7020)", [id]).unwrap();
+    assert!(rules::evaluate(&conn, id, NOW + 7200).unwrap());
+    assert_eq!(first, "small_complete");
+    assert_eq!(queued(&conn), ("not_tv_movies".to_string(), NOW + 7200), "a new reason starts the wait over");
+}
+
 #[test]
 fn a_database_lane_visit_queues_a_release_for_freezing() {
     let f = Fixture::new();
@@ -498,10 +524,9 @@ fn a_release_waits_its_hours_queued_before_it_moves() {
     let tick = |now: i64| Ticker { disk: Some((Instant::now(), true)), ..Ticker::default() }.tick(&conn, now).unwrap();
     let wait = WAIT_SECS.load(Relaxed);
     assert_eq!(tick(NOW + wait - 1), Moved::default(), "still in its wait");
-    // a visit that finds it matching still starts its wait again
+    // a visit that finds it matching for the same reason doesnt start its wait again
     assert!(rules::evaluate(&conn, f.id(&conn, "Fresh"), NOW + wait - 1).unwrap());
-    assert_eq!(tick(NOW + wait), Moved::default());
-    assert_eq!(tick(NOW + 2 * wait).frozen, 1);
+    assert_eq!(tick(NOW + wait).frozen, 1);
 }
 
 #[test]
