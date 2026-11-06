@@ -55,14 +55,38 @@ pub const SIDECARS: ShardTable = ShardTable {
     added: &[],
 };
 
-/// The text is kept only while the shard's texts hold less than ?10 bytes: past that, the name and UID still are.
+/// The text is kept only while the shard's texts hold less than ?10 bytes: past that, the name and UID still are, and
+/// a text kept before stays.
 const SET: &str = "insert into sidecars
     (release_id, name, group_name, file, kind, release_name, segment_uid, text, at)
     values (?1, ?2, ?3, ?4, ?5, ?6, ?7,
         case when coalesce((select value from meta where key = 'sidecar_text_bytes'), 0) < ?10 then ?8 end, ?9)
     on conflict(release_id) do update set name = excluded.name, group_name = excluded.group_name,
         file = excluded.file, kind = excluded.kind, release_name = excluded.release_name,
-        segment_uid = excluded.segment_uid, text = excluded.text, at = excluded.at";
+        segment_uid = excluded.segment_uid, text = coalesce(excluded.text, sidecars.text), at = excluded.at";
+
+/// What a release name read from a sidecar is kept to: a real one is far shorter, and these rows outlive releases
+pub const MAX_NAME: usize = 255;
+
+/// The shard's `sidecar_text_bytes` counted again from what `sidecars` holds, as after a compaction's copy.
+pub fn recount(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    conn.execute(
+        "insert or replace into meta (key, value)
+         select 'sidecar_text_bytes', coalesce(sum(length(cast(text as blob))), 0) from sidecars",
+        [],
+    )?;
+    Ok(())
+}
+
+/// At most `MAX_NAME` bytes of a name, cut on a character. Empty: none.
+fn capped_name(name: &str) -> Option<String> {
+    let name = name.trim();
+    let mut end = name.len().min(MAX_NAME);
+    while !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    (end > 0).then(|| name[..end].to_string())
+}
 
 /// What's kept of a sidecar's text at most
 pub const MAX_TEXT: usize = 64 * 1024;
@@ -115,10 +139,10 @@ pub fn read(file: &str, body: &[u8]) -> Read {
         let base = complete.rsplit(['/', '\\']).next().unwrap_or(&complete);
         let name = base.rsplit_once('.').map_or(base, |(stem, _)| stem).to_string();
         let segment_uid = field("Unique ID").and_then(|uid| uid_hex(&uid));
-        return Read { kind: "mediainfo", release_name: (!name.is_empty()).then_some(name), segment_uid };
+        return Read { kind: "mediainfo", release_name: capped_name(&name), segment_uid };
     }
     let nfo = file.to_ascii_lowercase().ends_with(".nfo");
-    let release_name = crate::nfo::name_candidates(text.as_bytes()).into_iter().next();
+    let release_name = crate::nfo::name_candidates(text.as_bytes()).into_iter().next().and_then(|n| capped_name(&n));
     Read { kind: if nfo { "nfo" } else { "text" }, release_name, segment_uid: None }
 }
 
@@ -231,6 +255,8 @@ Format                                   : Matroska
             Some("000000000000000000000000000000ff"),
             "the decimal when the hex won't read"
         );
+        let long = format!("Complete name : {}.mkv\n", "x".repeat(60_000));
+        assert_eq!(read("x.txt", long.as_bytes()).release_name.map(|n| n.len()), Some(MAX_NAME));
         let path = read("x.txt", b"Complete name : D:\\rips\\Some.Film.2024.mkv\n");
         assert_eq!(path.release_name.as_deref(), Some("Some.Film.2024"));
     }
@@ -285,10 +311,21 @@ Format                                   : Matroska
             })
             .unwrap();
         assert_eq!((name.as_str(), text), ("Name.3", None), "past the total: the name, not the text");
+        put(3, "dddd", 10);
+        let kept: Option<String> =
+            conn.query_row("select text from sidecars where release_id = 2", [], |r| r.get(0)).unwrap();
+        assert_eq!(kept.as_deref(), Some("bbbbbbbb"));
+        put(2, "zzzz", 10);
+        let kept: Option<String> =
+            conn.query_row("select text from sidecars where release_id = 2", [], |r| r.get(0)).unwrap();
+        assert_eq!(kept.as_deref(), Some("bbbbbbbb"), "a rerun past the total keeps the text it had");
         put(2, "b", 100);
         assert_eq!(total(), 5, "a rewrite gives back what it held");
         conn.execute("delete from sidecars where release_id = 1", []).unwrap();
         assert_eq!(total(), 1);
+        conn.execute("update meta set value = 999 where key = 'sidecar_text_bytes'", []).unwrap();
+        recount(&conn).unwrap();
+        assert_eq!(total(), 1, "counted again from the rows, as after a compaction");
     }
 
     #[test]
