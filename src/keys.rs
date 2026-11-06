@@ -15,6 +15,12 @@
 //! with its trailing dot line), with the part's number and decoded size: the same article posted again byte for
 //! byte, under any Message-ID, poster or subject.
 //!
+//! Three more come from what the probe already reads: the Matroska SegmentUID with the mux's DateUTC (the same mux,
+//! byte for byte, whatever the file is called), the encoder's settings string with the length (the same encode,
+//! remuxed or not), and the id a post's thread hangs on (its probed article's first References id, else its own
+//! Message-ID: the parts of one post its poster threaded, wherever they were indexed). And a file whose every article a
+//! step read whole gets its whole-file CRC32 folded from theirs (`gf2::crc32_combine`), for the file key.
+//!
 //! These are candidates for a reader, never a merge: no key here groups, links or completes anything on its own.
 //! The raw posting account and host are never stored, only their salted digests.
 
@@ -72,16 +78,34 @@ pub const RELEASE_KEYS: ShardTable = ShardTable {
             "release_keys_audio",
             "create index if not exists release_keys_audio on release_keys(audio) where audio is not null",
         ),
+        ("release_keys_mux", "create index if not exists release_keys_mux on release_keys(mux) where mux is not null"),
+        (
+            "release_keys_encode",
+            "create index if not exists release_keys_encode on release_keys(encode) where encode is not null",
+        ),
+        (
+            "release_keys_thread",
+            "create index if not exists release_keys_thread on release_keys(thread) where thread is not null",
+        ),
     ],
     release_key: Some("release_id"),
     // `video`: the first keyframe's key, from the probe's `keyframe_key`; `audio`: the first audio track's
     // `stream_key`
-    added: &[("file_crc", "INTEGER"), ("body_crc", "INTEGER"), ("video", "INTEGER"), ("audio", "INTEGER")],
+    // `mux`: SegmentUID and DateUTC; `encode`: the encoder's settings and the length; `thread`: the thread's root id
+    added: &[
+        ("file_crc", "INTEGER"),
+        ("body_crc", "INTEGER"),
+        ("video", "INTEGER"),
+        ("audio", "INTEGER"),
+        ("mux", "INTEGER"),
+        ("encode", "INTEGER"),
+        ("thread", "INTEGER"),
+    ],
 };
 
-const UPSERT: &str =
-    "insert or replace into release_keys (release_id, account, host, layout, lines, file_crc, body_crc, video, audio)
-    values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)";
+const UPSERT: &str = "insert or replace into release_keys
+    (release_id, account, host, layout, lines, file_crc, body_crc, video, audio, mux, encode, thread)
+    values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)";
 const DELETE: &str = "delete from release_keys where release_id = ?1";
 
 pub const KEYS_STEP: StepId = StepId(40);
@@ -112,10 +136,13 @@ pub enum Kind {
     BodyCrc,
     Video,
     Audio,
+    Mux,
+    Encode,
+    Thread,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 10] = [
+    pub const ALL: [Kind; 13] = [
         Kind::Account,
         Kind::Host,
         Kind::Layout,
@@ -126,6 +153,9 @@ impl Kind {
         Kind::BodyCrc,
         Kind::Video,
         Kind::Audio,
+        Kind::Mux,
+        Kind::Encode,
+        Kind::Thread,
     ];
 
     /// The word in `/ui/same?kind=`.
@@ -141,6 +171,9 @@ impl Kind {
             Kind::BodyCrc => "article",
             Kind::Video => "video",
             Kind::Audio => "audio",
+            Kind::Mux => "mux",
+            Kind::Encode => "encode",
+            Kind::Thread => "thread",
         }
     }
 
@@ -161,6 +194,9 @@ impl Kind {
             Kind::BodyCrc => "Same first article, by the server's body CRC",
             Kind::Video => "Same video stream",
             Kind::Audio => "Same audio stream",
+            Kind::Mux => "Same Matroska mux",
+            Kind::Encode => "Same encoder settings and length",
+            Kind::Thread => "Same post thread",
         }
     }
 
@@ -195,6 +231,15 @@ impl Kind {
             Kind::Audio => {
                 "The same first audio track, to the bit: FLAC's MD5 of its samples, or the first eight different AC-3 or E-AC-3 frames. The same audio remuxed, whatever the video, container or group: a hybrid or another encode can keep the source's audio. A studio's logo music, encoded once and reused, can match across films, soo check the names."
             }
+            Kind::Mux => {
+                "The same Matroska SegmentUID and mux date: 128 random bits mkvmerge picks for each file it writes, soo the same file, renamed, repacked or posted again. A remux of it has a new one."
+            }
+            Kind::Encode => {
+                "The same x264 or x265 settings string and the same length to the second: the same encode as a rule, in another container or remuxed with other audio. A group encodes many films with one preset, which the length tells apart, but a series' episodes can share both."
+            }
+            Kind::Thread => {
+                "Probed articles that hang on the same thread: one names the other's first article in its References, or both name a third. Parts of one post as its poster threaded it, indexed as separate releases. References is the poster's to write, soo check the names."
+            }
         }
     }
 
@@ -208,6 +253,9 @@ impl Kind {
             Kind::BodyCrc => Some("body_crc"),
             Kind::Video => Some("video"),
             Kind::Audio => Some("audio"),
+            Kind::Mux => Some("mux"),
+            Kind::Encode => Some("encode"),
+            Kind::Thread => Some("thread"),
             Kind::Par2 | Kind::MovieHash | Kind::FileCrc => None,
         }
     }
@@ -224,6 +272,9 @@ pub struct Keys {
     pub body_crc: Option<i64>,
     pub video: Option<i64>,
     pub audio: Option<i64>,
+    pub mux: Option<i64>,
+    pub encode: Option<i64>,
+    pub thread: Option<i64>,
 }
 
 impl Keys {
@@ -240,6 +291,9 @@ impl Keys {
             Kind::BodyCrc => self.body_crc,
             Kind::Video => self.video,
             Kind::Audio => self.audio,
+            Kind::Mux => self.mux,
+            Kind::Encode => self.encode,
+            Kind::Thread => self.thread,
             Kind::Par2 | Kind::MovieHash | Kind::FileCrc => None,
         }
     }
@@ -437,6 +491,19 @@ pub(crate) fn body_text(probe: &ProbeInfo) -> Option<String> {
     Some(format!("body:{crc:08x}:{}:{decoded}", y.part.unwrap_or(1)))
 }
 
+/// What the same-mux key is taken over: the Matroska SegmentUID and the mux's DateUTC, when there's a SegmentUID.
+pub(crate) fn mux_text(media: &crate::probe::media::MediaInfo) -> Option<String> {
+    let uid = media.segment_uid.as_deref().filter(|u| !u.is_empty() && u.bytes().any(|b| b != b'0'))?;
+    Some(format!("mux:{uid}:{}", media.muxed_at.map(|t| t.to_string()).unwrap_or_default()))
+}
+
+/// What the same-encode key is taken over: the encoder's settings string and the length to the second, both needed.
+pub(crate) fn encode_text(media: &crate::probe::media::MediaInfo) -> Option<String> {
+    let options = media.encoder_options.as_deref().map(str::trim).filter(|o| !o.is_empty())?;
+    let secs = media.duration_secs.filter(|d| *d >= 1.0)?.round() as i64;
+    Some(format!("encode:{}:{options}:{secs}", media.encoder.as_deref().unwrap_or("")))
+}
+
 /// The keys over what a release has: its probe and its `file_timing` rows.
 pub fn keys_of(
     probe: Option<&ProbeInfo>,
@@ -456,6 +523,10 @@ pub fn keys_of(
         keys.body_crc = body_text(p).map(|t| as_key(digest8(t.as_bytes())));
         keys.video = p.media.as_ref().and_then(video_key);
         keys.audio = p.media.as_ref().and_then(audio_key);
+        keys.mux = p.media.as_ref().and_then(mux_text).map(|t| as_key(digest8(t.as_bytes())));
+        keys.encode = p.media.as_ref().and_then(encode_text).map(|t| as_key(digest8(t.as_bytes())));
+        keys.thread =
+            crate::probe::thread_root(&p.headers).map(|id| as_key(digest8(format!("thread:{id}").as_bytes())));
     }
     keys.lines = lines_text(timing, parts).map(|t| as_key(digest8(t.as_bytes())));
     keys
@@ -513,7 +584,72 @@ fn timing_of(shard: &Connection, release_id: i64) -> rusqlite::Result<Vec<(Optio
 pub fn read_keys(shard: &Connection, release_id: i64, parts: Option<i64>, salt: Option<i64>) -> rusqlite::Result<Keys> {
     let probe = probe_of(shard, release_id)?;
     let timing = timing_of(shard, release_id)?;
-    Ok(keys_of(probe.as_ref(), &timing, parts, salt))
+    let mut keys = keys_of(probe.as_ref(), &timing, parts, salt);
+    // no trailer read for the probed file: a file every article of which was read whole stands in
+    if keys.file_crc.is_none() {
+        keys.file_crc = folded_files(shard, release_id).first().map(|f| f.key());
+    }
+    Ok(keys)
+}
+
+/// The most files of a release looked at for a fold, and the most articles a file may have to be folded.
+const FOLD_FILES: usize = 64;
+const FOLD_PARTS: i64 = 4_096;
+
+/// The files of a release every article of which a step read whole (`archive::store::SEGMENT_CRC`), with their
+/// whole-file CRC32 folded from the articles' in part order (`gf2::crc32_combine`), the biggest first. Only a file
+/// whose parts are all there, numbered 1 to its count, each read once over its decoded length, and big enough to look
+/// up. Empty on a shard without the table.
+pub fn folded_files(shard: &Connection, release_id: i64) -> Vec<FileCrc> {
+    let Ok(mut q) = shard.prepare_cached("select message_id, decoded, crc32 from segment_crc where release_id = ?1")
+    else {
+        return Vec::new();
+    };
+    let Ok(rows) =
+        q.query_map([release_id], |r| Ok((r.get::<_, String>(0)?, (r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))))
+    else {
+        return Vec::new();
+    };
+    let read: std::collections::HashMap<String, (i64, i64)> = rows.flatten().collect();
+    if read.is_empty() {
+        return Vec::new();
+    }
+    let Ok(files) = store::release_files(shard, release_id, FOLD_FILES) else { return Vec::new() };
+    let mut out = Vec::new();
+    for f in files {
+        let Some(n) = f.expected.filter(|n| (1..=FOLD_PARTS).contains(n)) else { continue };
+        if f.parts_seen < n || (read.len() as i64) < n {
+            continue;
+        }
+        let Ok(segs) = store::file_segments(shard, f.id, &store::SegmentPick::Parts((1..=n).collect())) else {
+            continue;
+        };
+        let mut by_part: std::collections::BTreeMap<i64, (i64, i64)> = std::collections::BTreeMap::new();
+        for s in &segs {
+            if let (Some(part), Some(got)) = (s.part, read.get(&s.message_id)) {
+                by_part.entry(part).or_insert(*got);
+            }
+        }
+        if by_part.len() as i64 != n || by_part.keys().next() != Some(&1) || by_part.keys().last() != Some(&n) {
+            continue;
+        }
+        let (mut crc, mut size) = (0u32, 0i64);
+        for (i, (len, part_crc)) in by_part.values().enumerate() {
+            let (Ok(len_bytes), Ok(part_crc)) = (usize::try_from(*len), u32::try_from(*part_crc)) else {
+                size = -1;
+                break;
+            };
+            crc = if i == 0 { part_crc } else { crate::gf2::crc32_combine(crc, part_crc, len_bytes) };
+            size += len;
+        }
+        if let Some(file) = (size > 0).then(|| FileCrc::new(size, crc)).flatten()
+            && !out.contains(&file)
+        {
+            out.push(file);
+        }
+    }
+    out.sort_by_key(|f| std::cmp::Reverse(f.size));
+    out
 }
 
 /// What a release can be looked up by, read from its own shard: the keys it has now, and the PAR2 sets and the
@@ -541,6 +677,11 @@ pub fn read_lookup(
 /// its PAR2 sets describe, at most `CRC_FILES_CAP`, each once. None on a shard without `par2_files` yet.
 pub fn crc_files(shard: &Connection, release_id: i64, probe: Option<&ProbeInfo>) -> rusqlite::Result<Vec<FileCrc>> {
     let mut out: Vec<FileCrc> = probe.and_then(probe_file).into_iter().collect();
+    for f in folded_files(shard, release_id) {
+        if !out.contains(&f) {
+            out.push(f);
+        }
+    }
     if let Ok(mut q) = shard.prepare_cached(
         "select distinct size, crc32 from par2_files
          where release_id = ?1 and bound = 1 and crc32 is not null and size >= ?2
@@ -662,10 +803,10 @@ pub fn crc_donors(conn: &Connection, own: i64, file: FileCrc, md5: Option<&[u8]>
              order by p.release_id desc limit ?4"
         );
         if let Ok(mut q) = conn.prepare_cached(&described)
-            && let Ok(rows) = q.query_map(
-                rusqlite::params![file.size, i64::from(file.crc32), own, DONORS_CAP, md5],
-                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
-            )
+            && let Ok(rows) = q
+                .query_map(rusqlite::params![file.size, i64::from(file.crc32), own, DONORS_CAP, md5], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+                })
         {
             out.extend(rows.flatten());
         }
@@ -690,7 +831,8 @@ pub fn par2_sets(shard: &Connection, release_id: i64) -> rusqlite::Result<Vec<Ve
 fn stored(shard: &Connection, release_id: i64) -> rusqlite::Result<Option<Keys>> {
     shard
         .prepare_cached(
-            "select account, host, layout, lines, file_crc, body_crc, video, audio from release_keys where release_id = ?1",
+            "select account, host, layout, lines, file_crc, body_crc, video, audio, mux, encode, thread
+             from release_keys where release_id = ?1",
         )?
         .query_row([release_id], |r| {
             Ok(Keys {
@@ -702,6 +844,9 @@ fn stored(shard: &Connection, release_id: i64) -> rusqlite::Result<Option<Keys>>
                 body_crc: r.get(5)?,
                 video: r.get(6)?,
                 audio: r.get(7)?,
+                mux: r.get(8)?,
+                encode: r.get(9)?,
+                thread: r.get(10)?,
             })
         })
         .optional()
@@ -827,12 +972,11 @@ pub fn crc_report(conn: &Connection, main: &std::path::Path, per_shard: i64) -> 
     let mut r = CrcReport::default();
     for n in 0..store::SHARDS {
         let Ok(shard) = crate::db::open_shard(&store::shard_path(main, n)) else { continue };
-        let ids: Vec<i64> = match shard
-            .prepare("select release_id from release_probe order by release_id desc limit ?1")
-        {
-            Ok(mut q) => q.query_map([per_shard], |row| row.get(0))?.collect::<rusqlite::Result<_>>()?,
-            Err(_) => continue,
-        };
+        let ids: Vec<i64> =
+            match shard.prepare("select release_id from release_probe order by release_id desc limit ?1") {
+                Ok(mut q) => q.query_map([per_shard], |row| row.get(0))?.collect::<rusqlite::Result<_>>()?,
+                Err(_) => continue,
+            };
         for id in ids {
             let lookup = read_lookup(&shard, id, None, None)?;
             r.sampled += 1;
@@ -949,9 +1093,9 @@ impl Step for KeysStep {
         Reruns { on_rename: false, on_growth: true }
     }
     /// Bit 1: the file and first-article keys, soo every release already keyed is keyed again: the file key comes
-    /// from probes made long before it.
+    /// from probes made long before it. Bit 2: the mux, encode and thread keys, and file CRCs folded from articles.
     fn config_stamp(&self) -> u64 {
-        1
+        1 | 2
     }
     fn run(&self, ctx: &mut StepCtx<'_>) -> Result<Outcome, StepError> {
         let retry = |e: rusqlite::Error| StepError::Retry(e.to_string());
@@ -976,6 +1120,9 @@ impl Step for KeysStep {
                     keys.body_crc.into(),
                     keys.video.into(),
                     keys.audio.into(),
+                    keys.mux.into(),
+                    keys.encode.into(),
+                    keys.thread.into(),
                 ],
             )],
         };
@@ -1127,7 +1274,7 @@ mod tests {
             )
             .unwrap();
         }
-        let lookup = Lookup { keys: Keys::default(), par2_sets: vec![set], moviehash: None, files: Vec::new() };
+        let lookup = Lookup { par2_sets: vec![set], ..Default::default() };
         assert_eq!(others(&conn, 1, &lookup, Kind::Par2, 1), vec![2], "the limit counts only the shown ones");
         assert_eq!(count_others(&conn, 1, &lookup, Kind::Par2), 1);
     }
@@ -1224,7 +1371,7 @@ mod tests {
         for (_, index) in crate::archive::store::PAR2_FILES.indexes {
             conn.execute_batch(&index.replacen("exists ", "exists s0.", 1)).unwrap();
         }
-        let lookup = Lookup { keys: Keys::default(), par2_sets: Vec::new(), moviehash: None, files: vec![file] };
+        let lookup = Lookup { files: vec![file], ..Default::default() };
         assert!(lookup.has(Kind::FileCrc));
         let plan: Vec<String> = conn
             .prepare(&format!("explain query plan {}", others_sql(Kind::FileCrc, 0, 1)))
@@ -1236,7 +1383,92 @@ mod tests {
         assert!(plan.iter().any(|p| p.contains("par2_files_crc")), "the PAR2 side seeks size and CRC: {plan:?}");
         assert_eq!(others(&conn, 1, &lookup, Kind::FileCrc, 10), vec![3, 2]);
         assert_eq!(count_others(&conn, 1, &lookup, Kind::FileCrc), 2);
-        let none = Lookup { keys: Keys::default(), par2_sets: Vec::new(), moviehash: None, files: Vec::new() };
+        let none = Lookup::default();
         assert!(others(&conn, 1, &none, Kind::FileCrc, 10).is_empty());
+    }
+
+    #[test]
+    fn the_mux_encode_and_thread_keys_need_their_parts() {
+        let mut media = crate::probe::media::MediaInfo {
+            segment_uid: Some("0102030405060708090a0b0c0d0e0f10".into()),
+            muxed_at: Some(1_700_000_000),
+            encoder: Some("x264".into()),
+            encoder_options: Some("cabac=1 ref=4 crf=18.0".into()),
+            duration_secs: Some(5400.4),
+            ..Default::default()
+        };
+        assert_eq!(mux_text(&media).as_deref(), Some("mux:0102030405060708090a0b0c0d0e0f10:1700000000"));
+        assert_eq!(encode_text(&media).as_deref(), Some("encode:x264:cabac=1 ref=4 crf=18.0:5400"));
+        let mut probe = ProbeInfo { media: Some(media.clone()), ..Default::default() };
+        probe.headers.insert("References".into(), "<root@post> <other@post>".into());
+        let keys = keys_of(Some(&probe), &[], None, None);
+        assert!(keys.mux.is_some() && keys.encode.is_some());
+        assert_eq!(keys.thread, Some(as_key(digest8(b"thread:<root@post>"))));
+        // the root's own article hangs on itself, soo it meets the parts that name it
+        let mut root = ProbeInfo::default();
+        root.headers.insert("Message-ID".into(), "<root@post>".into());
+        assert_eq!(keys_of(Some(&root), &[], None, None).thread, keys.thread);
+        media.segment_uid = Some("00000000000000000000000000000000".into());
+        media.duration_secs = None;
+        assert_eq!((mux_text(&media), encode_text(&media)), (None, None), "no UID, no length: no key");
+    }
+
+    #[test]
+    fn a_file_read_whole_folds_to_its_crc() {
+        let dir = std::env::temp_dir().join(format!("atlas-fold-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let main = dir.join("atlas.db");
+        crate::db::create_db_at(&main).unwrap();
+        let shard = crate::db::open_shard(&store::shard_path(&main, 0)).unwrap();
+        // three articles of 1 MiB, 1 MiB and 512 KiB
+        let parts: Vec<Vec<u8>> =
+            [1usize << 20, 1 << 20, 1 << 19].iter().enumerate().map(|(i, n)| vec![i as u8 + 7; *n]).collect();
+        let whole: Vec<u8> = parts.concat();
+        shard
+            .execute(
+                "insert into files (id, release_id, filename, expected, seen) values (1, 8, 'a.mkv', 3, x'0e')",
+                [],
+            )
+            .unwrap();
+        shard
+            .execute(
+                "insert into files (id, release_id, filename, expected, seen) values (2, 8, 'b.mkv', 3, x'0e')",
+                [],
+            )
+            .unwrap();
+        for (file, part) in [(1, 1), (1, 2), (1, 3), (2, 1), (2, 2), (2, 3)] {
+            shard
+                .execute(
+                    "insert into segments (file_id, local, domain, part, bytes) values (?1, ?2, 0, ?3, 1000)",
+                    rusqlite::params![file, format!("R<{file}.{part}@x>").into_bytes(), part],
+                )
+                .unwrap();
+        }
+        let ids = |file| store::file_segments(&shard, file, &store::SegmentPick::Parts(vec![1, 2, 3])).unwrap();
+        // every part of a.mkv read; b.mkv misses its last
+        for s in ids(1) {
+            let data = &parts[s.part.unwrap() as usize - 1];
+            shard
+                .execute(
+                    "insert into segment_crc (release_id, message_id, decoded, crc32) values (8, ?1, ?2, ?3)",
+                    rusqlite::params![s.message_id, data.len() as i64, i64::from(crate::archive::crc32(data))],
+                )
+                .unwrap();
+        }
+        for s in ids(2).into_iter().filter(|s| s.part != Some(3)) {
+            shard
+                .execute(
+                    "insert into segment_crc (release_id, message_id, decoded, crc32) values (8, ?1, 1, 1)",
+                    [s.message_id],
+                )
+                .unwrap();
+        }
+        let folded = folded_files(&shard, 8);
+        assert_eq!(folded, vec![FileCrc::new(whole.len() as i64, crate::archive::crc32(&whole)).unwrap()]);
+        assert_eq!(read_keys(&shard, 8, None, None).unwrap().file_crc, Some(folded[0].key()));
+        assert!(crc_files(&shard, 8, None).unwrap().contains(&folded[0]));
+        assert!(folded_files(&shard, 16).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -75,7 +75,9 @@ pub const MEDIA_RELEASE: ShardTable = ShardTable {
         ),
     ],
     release_key: Some("release_id"),
-    added: &[],
+    // a TMDB or TVDB id a file's own tags gave (`probe::media::TitleIds`): kept against what a lookup by name finds,
+    // as an NFO's IMDb id is (`imdb_from_nfo`)
+    added: &[("tmdb_from_tag", "INTEGER NOT NULL DEFAULT 0"), ("tvdb_from_tag", "INTEGER NOT NULL DEFAULT 0")],
 };
 
 /// The same title keeps IDs already on the row, soo a late article cant lose them. A new title starts clean.
@@ -83,13 +85,15 @@ const UPSERT: &str = "insert into media_release (release_id, kind, title_key, se
                            tvdb_id, tvmaze_id, trakt_id, tmdb_id, imdb_id, tvrage_id)
 values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
 on conflict(release_id) do update set
-    tvdb_id   = iif(media_release.title_key = excluded.title_key, coalesce(excluded.tvdb_id,   media_release.tvdb_id),   excluded.tvdb_id),
+    tvdb_id   = iif(media_release.title_key = excluded.title_key, iif(media_release.tvdb_from_tag = 1, media_release.tvdb_id, coalesce(excluded.tvdb_id, media_release.tvdb_id)), excluded.tvdb_id),
     tvmaze_id = iif(media_release.title_key = excluded.title_key, coalesce(excluded.tvmaze_id, media_release.tvmaze_id), excluded.tvmaze_id),
     trakt_id  = iif(media_release.title_key = excluded.title_key, coalesce(excluded.trakt_id,  media_release.trakt_id),  excluded.trakt_id),
-    tmdb_id   = iif(media_release.title_key = excluded.title_key, coalesce(excluded.tmdb_id,   media_release.tmdb_id),   excluded.tmdb_id),
+    tmdb_id   = iif(media_release.title_key = excluded.title_key, iif(media_release.tmdb_from_tag = 1, media_release.tmdb_id, coalesce(excluded.tmdb_id, media_release.tmdb_id)), excluded.tmdb_id),
     tvrage_id = iif(media_release.title_key = excluded.title_key, coalesce(excluded.tvrage_id, media_release.tvrage_id), excluded.tvrage_id),
     imdb_id   = iif(media_release.title_key = excluded.title_key, iif(media_release.imdb_from_nfo = 1, media_release.imdb_id, coalesce(excluded.imdb_id, media_release.imdb_id)), excluded.imdb_id),
     imdb_from_nfo = iif(media_release.title_key = excluded.title_key, media_release.imdb_from_nfo, 0),
+    tmdb_from_tag = iif(media_release.title_key = excluded.title_key, media_release.tmdb_from_tag, 0),
+    tvdb_from_tag = iif(media_release.title_key = excluded.title_key, media_release.tvdb_from_tag, 0),
     kind = excluded.kind, title_key = excluded.title_key, season = excluded.season, episode = excluded.episode,
     episode_last = excluded.episode_last, air_date = excluded.air_date, year = excluded.year, quality = excluded.quality";
 const DELETE: &str = "delete from media_release where release_id = ?1";
@@ -100,7 +104,8 @@ const WORD_QUEUE: &str =
     "insert into word_queue (release_id) values (?1) on conflict (release_id) do update set n = n + 1";
 /// only while it's still this title: a rename while the lookup ran mustn't take the old title's IDs
 const FOUND: &str = "update media_release
-    set tvdb_id = ?3, tvmaze_id = ?4, trakt_id = ?5, tmdb_id = ?6, imdb_id = iif(imdb_from_nfo = 1, imdb_id, ?7), tvrage_id = ?8
+    set tvdb_id = iif(tvdb_from_tag = 1, tvdb_id, ?3), tvmaze_id = ?4, trakt_id = ?5, tmdb_id = iif(tmdb_from_tag = 1, tmdb_id, ?6),
+        imdb_id = iif(imdb_from_nfo = 1, imdb_id, ?7), tvrage_id = ?8
     where release_id = ?1 and title_key = ?2";
 const NFO_IMDB: &str =
     "update media_release set imdb_id = ?2, imdb_from_nfo = 1 where release_id = ?1 and imdb_id is null";
@@ -227,9 +232,10 @@ impl Step for MediaParse {
 /// Whether rows of this title in this shard hold IDs. The newest few are enough: a fan-out reaches them all alike.
 fn stale_ids(conn: &Connection, key: i64) -> rusqlite::Result<bool> {
     conn.prepare_cached(
-        "select 1 from (select tvdb_id, tvmaze_id, trakt_id, tmdb_id, imdb_id, tvrage_id, imdb_from_nfo
+        "select 1 from (select tvdb_id, tvmaze_id, trakt_id, tmdb_id, imdb_id, tvrage_id, imdb_from_nfo, tmdb_from_tag, tvdb_from_tag
            from media_release indexed by media_release_title where title_key = ?1 order by release_id desc limit 100)
-         where tvdb_id is not null or tvmaze_id is not null or trakt_id is not null or tmdb_id is not null
+         where (tvdb_id is not null and tvdb_from_tag = 0) or tvmaze_id is not null or trakt_id is not null
+            or (tmdb_id is not null and tmdb_from_tag = 0)
             or tvrage_id is not null or (imdb_id is not null and imdb_from_nfo = 0)
          limit 1",
     )?
@@ -427,5 +433,49 @@ mod tests {
         assert_eq!(MediaParse(media.clone()).needs(), Needs::Database);
         assert_eq!(MediaLookup(media.clone()).needs(), Needs::External);
         assert_eq!(MediaNfo(media).needs(), Needs::Bodies);
+    }
+
+    #[test]
+    fn a_files_own_tags_pin_its_ids_against_a_lookup_by_name() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(MEDIA_RELEASE.create).unwrap();
+        for (col, decl) in MEDIA_RELEASE.added {
+            conn.execute_batch(&format!("alter table media_release add column {col} {decl}")).unwrap();
+        }
+        let row = |kind: i64| {
+            conn.execute(
+                "insert or replace into media_release (release_id, kind, title_key, quality) values (1, ?1, 77, 0)",
+                [kind],
+            )
+            .unwrap();
+        };
+        let run = |writes: Vec<crate::postprocess::step::StepWrite>| {
+            for w in writes {
+                conn.execute(w.sql, rusqlite::params_from_iter(w.params)).unwrap();
+            }
+        };
+        let media = crate::probe::media::MediaInfo {
+            tags: [("IMDB", "tt0133093"), ("TMDB", "movie/603"), ("TVDB", "81189")]
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            ..Default::default()
+        };
+        row(Kind::Movie as i64);
+        run(crate::probe::step::title_writes(1, Some(&media)));
+        let ids = || -> (Option<i64>, Option<i64>, Option<i64>) {
+            conn.query_row("select imdb_id, tmdb_id, tvdb_id from media_release where release_id = 1", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .unwrap()
+        };
+        assert_eq!(ids(), (Some(133_093), Some(603), None), "a TVDB id is a show's: not on a movie");
+        // the lookup by name finds another title: the tags' ids stay
+        conn.execute(FOUND, rusqlite::params![1, 77, 5, 6, 7, 999, 888, 4]).unwrap();
+        assert_eq!(ids(), (Some(133_093), Some(603), Some(5)));
+        // a show's row takes neither the movie's TMDB nor its IMDb id
+        row(Kind::Tv as i64);
+        run(crate::probe::step::title_writes(1, Some(&media)));
+        assert_eq!(ids(), (None, None, Some(81_189)));
     }
 }

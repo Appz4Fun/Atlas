@@ -48,6 +48,39 @@ pub struct MediaInfo {
     pub encoder_complete: bool,
 }
 
+/// The title a file's tags name: an IMDb id (`IMDB=tt0133093`), a TMDB id with its kind (`TMDB=movie/603`,
+/// `tv/1399`) and a TVDB id (`TVDB=81189`, or `TVDB2=series/81189` as some taggers write it). Only well-formed values.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TitleIds {
+    pub imdb: Option<i64>,
+    /// `(movie, id)`: true for a movie, false for a TV show
+    pub tmdb: Option<(bool, i64)>,
+    pub tvdb: Option<i64>,
+}
+
+impl MediaInfo {
+    /// What the tags say the title is.
+    pub fn title_ids(&self) -> TitleIds {
+        let tag = |name: &str| self.tags.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.trim());
+        let number = |v: &str| {
+            (!v.is_empty() && v.len() <= 10 && v.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| v.parse::<i64>().ok())
+                .flatten()
+                .filter(|n| *n > 0)
+        };
+        let imdb = tag("IMDB").and_then(|v| v.strip_prefix("tt")).and_then(number);
+        let tmdb = tag("TMDB").and_then(|v| v.split_once('/')).and_then(|(kind, id)| match kind {
+            "movie" => number(id).map(|n| (true, n)),
+            "tv" => number(id).map(|n| (false, n)),
+            _ => None,
+        });
+        let tvdb = tag("TVDB")
+            .and_then(number)
+            .or_else(|| tag("TVDB2").and_then(|v| v.strip_prefix("series/")).and_then(number));
+        TitleIds { imdb, tmdb, tvdb }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Attachment {
@@ -311,12 +344,7 @@ fn dv_record(b: &[u8]) -> Option<(u8, u8, bool)> {
     Some((a >> 1, (a & 1) << 5 | c >> 3, c & 0b10 != 0))
 }
 
-fn hdr_name(
-    transfer: Option<u64>,
-    mastering: bool,
-    primaries: Option<u64>,
-    bit_depth: Option<u64>,
-) -> Option<String> {
+fn hdr_name(transfer: Option<u64>, mastering: bool, primaries: Option<u64>, bit_depth: Option<u64>) -> Option<String> {
     match transfer {
         Some(16) if mastering => Some("HDR10".into()),
         Some(16) if primaries == Some(9) && bit_depth.unwrap_or(0) >= 10 => Some("HDR10".into()),
@@ -398,7 +426,9 @@ fn track_entry(b: &[u8]) -> Track {
         true
     });
 
-    if t.kind == 1 && let Some(cp) = &t.codec_private {
+    if t.kind == 1
+        && let Some(cp) = &t.codec_private
+    {
         let codec = t.codec.as_str();
         if codec.starts_with("V_MPEGH/ISO/HEVC") {
             if t.bit_depth.is_none()
@@ -727,7 +757,9 @@ fn add_track(t: Track, info: &mut MediaInfo) {
     match t.kind {
         1 => {
             let mut dv_info = t.dolby_vision;
-            if dv_info.is_none() && let Some((profile, level, el)) = t.dv {
+            if dv_info.is_none()
+                && let Some((profile, level, el)) = t.dv
+            {
                 dv_info = Some(DolbyVisionInfo {
                     profile,
                     level: Some(level),
@@ -1016,11 +1048,8 @@ fn mp4_chunk_extent(
             if sample_count > 0 && first_sample >= sample_count {
                 return Some((0, true));
             }
-            let count = if sample_count > 0 {
-                samples_in_chunk.min(sample_count - first_sample)
-            } else {
-                samples_in_chunk
-            };
+            let count =
+                if sample_count > 0 { samples_in_chunk.min(sample_count - first_sample) } else { samples_in_chunk };
             let len = count.saturating_mul(default_size);
             return Some((len.min(max_probe), len <= max_probe));
         }
@@ -1212,8 +1241,7 @@ fn trak(body: &[u8], full_data: &[u8], file_start: &[u8], all_chunk_offsets: &[u
     });
     let chunk_slice = |chunk_idx: u32, off: usize| -> Option<&[u8]> {
         let mut end = off.saturating_add(MAX_AUDIO_CHUNK_PROBE).min(full_data.len());
-        if let Some(chunk_len) =
-            mp4_chunk_byte_len(chunk_idx, &stsc_entries, stsz_box, stz2_box, MAX_AUDIO_CHUNK_PROBE)
+        if let Some(chunk_len) = mp4_chunk_byte_len(chunk_idx, &stsc_entries, stsz_box, stz2_box, MAX_AUDIO_CHUNK_PROBE)
         {
             end = end.min(off.saturating_add(chunk_len));
         }
@@ -1581,9 +1609,7 @@ fn probe_block(
     let Some(&flags) = block.get(vint_len + 2) else { return };
     let Some(payload) = block.get(vint_len + 3..) else { return };
 
-    if let Some(&(_, video_idx, nal_length_size)) =
-        video_tracks.iter().find(|&&(num, _, _)| num == track_num)
-    {
+    if let Some(&(_, video_idx, nal_length_size)) = video_tracks.iter().find(|&&(num, _, _)| num == track_num) {
         // a SimpleBlock's keyframe flag, no lacing, and all of it read
         if complete
             && flags & 0x80 != 0
@@ -1842,8 +1868,7 @@ impl DolbyVisionInfo {
             i += start_len;
         }
 
-        Self::extract_length_prefixed_rpu_nal(data, 4)
-            .or_else(|| Self::extract_length_prefixed_rpu_nal(data, 2))
+        Self::extract_length_prefixed_rpu_nal(data, 4).or_else(|| Self::extract_length_prefixed_rpu_nal(data, 2))
     }
 
     fn parse_rpu_payload(payload: &[u8]) -> Option<Self> {
@@ -1882,11 +1907,7 @@ impl DolbyVisionInfo {
         if vdr_seq_info_present {
             let _chroma_resampling_explicit_filter_flag = r.flag().ok()?;
             coefficient_data_type = r.bits(2).ok()? as u8;
-            let coefficient_log2_denom = if coefficient_data_type == 0 {
-                r.ue().ok()?
-            } else {
-                0
-            };
+            let coefficient_log2_denom = if coefficient_data_type == 0 { r.ue().ok()? } else { 0 };
             let _vdr_rpu_normalized_idc = r.bits(2).ok()?;
             bl_video_full_range_flag = r.flag().ok()?;
             if (rpu_format & 0x700) == 0 {
@@ -1965,11 +1986,7 @@ impl DolbyVisionInfo {
             cm_read = true;
         }
 
-        let cm_version = if has_cm4 {
-            "v4.0".to_string()
-        } else {
-            "v2.9".to_string()
-        };
+        let cm_version = if has_cm4 { "v4.0".to_string() } else { "v2.9".to_string() };
 
         Some(DolbyVisionInfo {
             profile,
@@ -2045,11 +2062,7 @@ impl DolbyVisionInfo {
                         if poly_order_minus1 > 1 {
                             return None;
                         }
-                        let linear_interp_flag = if poly_order_minus1 == 0 {
-                            r.flag().ok()?
-                        } else {
-                            false
-                        };
+                        let linear_interp_flag = if poly_order_minus1 == 0 { r.flag().ok()? } else { false };
                         if poly_order_minus1 == 0 && linear_interp_flag {
                             if coefficient_data_type == 0 {
                                 let _ = r.ue().ok()?;
@@ -2136,10 +2149,7 @@ impl DolbyVisionInfo {
         Some(None)
     }
 
-    fn parse_dm_ext_blocks(
-        r: &mut crate::video::bits::BitReader<'_>,
-        has_cm4: &mut bool,
-    ) -> Option<()> {
+    fn parse_dm_ext_blocks(r: &mut crate::video::bits::BitReader<'_>, has_cm4: &mut bool) -> Option<()> {
         let num_ext_blocks = r.ue().ok()?;
         if num_ext_blocks > 256 {
             return None;
@@ -2160,10 +2170,7 @@ impl DolbyVisionInfo {
         Some(())
     }
 
-    fn parse_vdr_dm_data(
-        r: &mut crate::video::bits::BitReader<'_>,
-        compressed_dm_data: bool,
-    ) -> Option<bool> {
+    fn parse_vdr_dm_data(r: &mut crate::video::bits::BitReader<'_>, compressed_dm_data: bool) -> Option<bool> {
         const DM_DATA_PAYLOAD2_MIN_BITS: usize = 56;
 
         let _affected_dm_metadata_id = r.ue().ok()?;
@@ -2299,11 +2306,7 @@ impl AvcDepth {
                 return Some(depth);
             }
         }
-        if profile == 100 {
-            Some(8)
-        } else {
-            None
-        }
+        if profile == 100 { Some(8) } else { None }
     }
 
     pub fn from_sps(nal: &[u8]) -> Option<u8> {
@@ -2542,11 +2545,7 @@ impl Mp4Prober {
     /// `probe_tail_moov`, with `front` the file's first bytes, which its sample offsets count from: the first
     /// keyframe is read from there.
     pub fn probe_tail_moov_with(data: &[u8], front: &[u8]) -> Option<MediaInfo> {
-        if is_mp4(data) || Self::has_moov_box(data) {
-            Some(mp4_with(data, front))
-        } else {
-            None
-        }
+        if is_mp4(data) || Self::has_moov_box(data) { Some(mp4_with(data, front)) } else { None }
     }
 
     fn has_moov_box(data: &[u8]) -> bool {
@@ -2638,11 +2637,7 @@ impl DiscProber {
             info.disc_type = "Blu-ray".into();
         }
 
-        if recognized || info.is_dvd || info.is_bluray {
-            Some(info)
-        } else {
-            None
-        }
+        if recognized || info.is_dvd || info.is_bluray { Some(info) } else { None }
     }
 
     pub fn dvd_disc_id(video_ts: &[u8], vts: &[u8]) -> [u8; 16] {
@@ -2671,11 +2666,7 @@ pub struct MkvMetadata;
 
 impl MkvMetadata {
     pub fn parse(data: &[u8]) -> Option<MediaInfo> {
-        if is_matroska(data) {
-            Some(matroska(data))
-        } else {
-            None
-        }
+        if is_matroska(data) { Some(matroska(data)) } else { None }
     }
 }
 
@@ -3170,12 +3161,7 @@ mod tests {
         assert_eq!(avcc[6], 0);
         assert_eq!(avcc[17], 0);
 
-        let t1 = [
-            el(&[0x83], &[1]),
-            el(&[0x86], b"V_MPEG4/ISO/AVC"),
-            el(&[0x63, 0xA2], &avcc),
-        ]
-        .concat();
+        let t1 = [el(&[0x83], &[1]), el(&[0x86], b"V_MPEG4/ISO/AVC"), el(&[0x63, 0xA2], &avcc)].concat();
         let tracks = el(&[0x16, 0x54, 0xAE, 0x6B], &el(&[0xAE], &t1));
         // a keyframe with 4-byte NAL lengths, as avcC byte 4 (0xFF) says: an IDR slice
         let frame = [0, 0, 0, 3, 0x65, 0x88, 0x84];
@@ -3329,11 +3315,8 @@ mod tests {
 
         // Cluster 1: only video block with 0x58 0x38 -> neither audio track should be marked Atmos
         let video_block = el(&[0xA3], &[0x81, 0x00, 0x00, 0x80, 0x11, 0x58, 0x38, 0x22]);
-        let seg_video_only = [
-            el(&[0x16, 0x54, 0xAE, 0x6B], &tracks),
-            el(&[0x1F, 0x43, 0xB6, 0x75], &video_block),
-        ]
-        .concat();
+        let seg_video_only =
+            [el(&[0x16, 0x54, 0xAE, 0x6B], &tracks), el(&[0x1F, 0x43, 0xB6, 0x75], &video_block)].concat();
         let mkv_video_only = [
             el(&[0x1A, 0x45, 0xDF, 0xA3], &el(&[0x42, 0x82], b"matroska")),
             el(&[0x18, 0x53, 0x80, 0x67], &seg_video_only),
@@ -3357,11 +3340,8 @@ mod tests {
         let mut audio_block_body = vec![0x83, 0x00, 0x00, 0x80]; // TrackNumber = 3
         audio_block_body.extend_from_slice(&eac3_frame);
         let cluster_with_atmos = [video_block, el(&[0xA3], &audio_block_body)].concat();
-        let seg_with_atmos = [
-            el(&[0x16, 0x54, 0xAE, 0x6B], &tracks),
-            el(&[0x1F, 0x43, 0xB6, 0x75], &cluster_with_atmos),
-        ]
-        .concat();
+        let seg_with_atmos =
+            [el(&[0x16, 0x54, 0xAE, 0x6B], &tracks), el(&[0x1F, 0x43, 0xB6, 0x75], &cluster_with_atmos)].concat();
         let mkv_with_atmos = [
             el(&[0x1A, 0x45, 0xDF, 0xA3], &el(&[0x42, 0x82], b"matroska")),
             el(&[0x18, 0x53, 0x80, 0x67], &seg_with_atmos),
@@ -3463,14 +3443,9 @@ mod tests {
         let mut hvcc = [0u8; 23];
         hvcc[0] = 1;
         hvcc[21] = 0xFC | 0x03;
-        let t1 = [
-            el(&[0xD7], &[1]),
-            el(&[0x83], &[1]),
-            el(&[0x86], b"V_MPEGH/ISO/HEVC"),
-            el(&[0x63, 0xA2], &hvcc),
-            mapping,
-        ]
-        .concat();
+        let t1 =
+            [el(&[0xD7], &[1]), el(&[0x83], &[1]), el(&[0x86], b"V_MPEGH/ISO/HEVC"), el(&[0x63, 0xA2], &hvcc), mapping]
+                .concat();
         let tracks = el(&[0xAE], &t1);
 
         // Build a SimpleBlock for Track 1 containing two 4-byte length-prefixed HEVC NAL units:
@@ -3577,10 +3552,7 @@ mod tests {
         simple_block_body.extend_from_slice(&rpu_nal);
 
         let cluster = el(&[0x1F, 0x43, 0xB6, 0x75], &el(&[0xA3], &simple_block_body));
-        let segment = el(
-            &[0x18, 0x53, 0x80, 0x67],
-            &[el(&[0x16, 0x54, 0xAE, 0x6B], &tracks), cluster].concat(),
-        );
+        let segment = el(&[0x18, 0x53, 0x80, 0x67], &[el(&[0x16, 0x54, 0xAE, 0x6B], &tracks), cluster].concat());
         let mkv = [el(&[0x1A, 0x45, 0xDF, 0xA3], &el(&[0x42, 0x82], b"matroska")), segment].concat();
 
         let info = parse(&mkv).expect("mkv with length-prefixed HEVC SimpleBlock must parse");
@@ -3640,13 +3612,8 @@ mod tests {
 
             let stbl = mp4_box(
                 b"stbl",
-                &[
-                    mp4_box(b"stsd", &stsd),
-                    mp4_box(b"stsc", &stsc),
-                    mp4_box(b"stsz", &stsz),
-                    mp4_box(b"stco", &stco),
-                ]
-                .concat(),
+                &[mp4_box(b"stsd", &stsd), mp4_box(b"stsc", &stsc), mp4_box(b"stsz", &stsz), mp4_box(b"stco", &stco)]
+                    .concat(),
             );
             let mut hdlr = vec![0u8; 8];
             hdlr.extend(b"soun");
@@ -3658,14 +3625,8 @@ mod tests {
         // Dummy placeholder so we can compute exact file offsets for mdat
         let placeholder_moov = mp4_box(b"moov", &[make_audio_trak(0), make_audio_trak(0)].concat());
         let mdat_data_start = (ftyp.len() + placeholder_moov.len() + 8) as u32;
-        let moov = mp4_box(
-            b"moov",
-            &[
-                make_audio_trak(mdat_data_start),
-                make_audio_trak(mdat_data_start + 32),
-            ]
-            .concat(),
-        );
+        let moov =
+            mp4_box(b"moov", &[make_audio_trak(mdat_data_start), make_audio_trak(mdat_data_start + 32)].concat());
         let file = [ftyp, moov, mp4_box(b"mdat", &mdat_payload)].concat();
 
         let info = parse(&file).expect("interleaved mp4 must parse");
@@ -3677,20 +3638,12 @@ mod tests {
     #[test]
     fn container_mkv_and_mp4_probe_dtsx_audio_tracks() {
         // Matroska with A_DTS audio track and SimpleBlock containing DTS:X sync word 0x02000850
-        let t_audio = [
-            el(&[0xD7], &[1]),
-            el(&[0x83], &[2]),
-            el(&[0x86], b"A_DTS"),
-        ]
-        .concat();
+        let t_audio = [el(&[0xD7], &[1]), el(&[0x83], &[2]), el(&[0x86], b"A_DTS")].concat();
         let tracks = el(&[0xAE], &t_audio);
         let mut block = vec![0x81, 0x00, 0x00, 0x80];
         block.extend_from_slice(&[0x00, 0x00, 0x02, 0x00, 0x08, 0x50, 0x00, 0x00]);
         let cluster = el(&[0x1F, 0x43, 0xB6, 0x75], &el(&[0xA3], &block));
-        let seg = el(
-            &[0x18, 0x53, 0x80, 0x67],
-            &[el(&[0x16, 0x54, 0xAE, 0x6B], &tracks), cluster].concat(),
-        );
+        let seg = el(&[0x18, 0x53, 0x80, 0x67], &[el(&[0x16, 0x54, 0xAE, 0x6B], &tracks), cluster].concat());
         let mkv = [el(&[0x1A, 0x45, 0xDF, 0xA3], &el(&[0x42, 0x82], b"matroska")), seg].concat();
 
         let mkv_probe = AudioBitstream::probe(&mkv);
@@ -3727,5 +3680,19 @@ mod tests {
         assert!(mp4_probe.has_dtsx, "MP4 dtsh chunk with DTS:X sync must set has_dtsx");
         assert_eq!(mp4_probe.format.as_deref(), Some("DTS:X"));
         assert!(AudioBitstream::probe_dtsx(&mp4));
+    }
+
+    #[test]
+    fn tags_name_the_title_only_when_well_formed() {
+        let with = |pairs: &[(&str, &str)]| MediaInfo {
+            tags: pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            ..Default::default()
+        };
+        let ids = with(&[("IMDB", "tt0133093"), ("TMDB", "movie/603"), ("TVDB", "81189")]).title_ids();
+        assert_eq!(ids, TitleIds { imdb: Some(133_093), tmdb: Some((true, 603)), tvdb: Some(81_189) });
+        assert_eq!(with(&[("tmdb", "tv/1399"), ("TVDB2", "series/81189")]).title_ids().tmdb, Some((false, 1399)));
+        assert_eq!(with(&[("TVDB2", "series/81189")]).title_ids().tvdb, Some(81_189));
+        let bad = with(&[("IMDB", "tt"), ("TMDB", "person/1"), ("TVDB", "12a"), ("IMDB2", "tt1")]).title_ids();
+        assert_eq!(bad, TitleIds::default());
     }
 }

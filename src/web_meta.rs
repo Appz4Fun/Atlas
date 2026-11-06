@@ -413,13 +413,9 @@ fn names_panel(i: &MetaInputs<'_>, l: &Looked, compact: bool) -> Facts {
     let subject = l.main.as_ref().and_then(|m| m.subject.as_deref());
     let subject_name = l.main.as_ref().map(|m| m.filename.as_str()).filter(|n| !n.is_empty());
     let yenc_name = i.probe.and_then(|p| p.yenc.as_ref()).and_then(|y| y.name.as_deref());
-    let archive_name = i
-        .probe
-        .and_then(|p| p.archive.as_ref())
-        .and_then(|a| a.name.as_deref())
-        .or_else(|| {
-            i.inner.files.iter().find(|r| r.source != SOURCE_PAR2 && r.source != SOURCE_NZB).map(|r| r.name.as_str())
-        });
+    let archive_name = i.probe.and_then(|p| p.archive.as_ref()).and_then(|a| a.name.as_deref()).or_else(|| {
+        i.inner.files.iter().find(|r| r.source != SOURCE_PAR2 && r.source != SOURCE_NZB).map(|r| r.name.as_str())
+    });
     if !compact {
         f.add("Subject", subject);
         f.add("Subject decoded", subject.and_then(decode_encoded_words));
@@ -934,22 +930,20 @@ fn posting_tool(timing: &[FileTiming]) -> Option<String> {
 fn id_clock(timing: &[FileTiming]) -> Option<String> {
     let first = timing.iter().filter_map(|t| t.clock_first).min()?;
     let last = timing.iter().filter_map(|t| t.clock_last).max()?;
-    let fmt = |ms: i64| {
-        chrono::DateTime::from_timestamp_millis(ms).map(|d| d.format("%Y-%m-%d %H:%M:%S%.3f").to_string())
-    };
+    let fmt =
+        |ms: i64| chrono::DateTime::from_timestamp_millis(ms).map(|d| d.format("%Y-%m-%d %H:%M:%S%.3f").to_string());
     let (a, b) = (fmt(first)?, fmt(last)?);
     let secs = (last - first) / 1000;
-    let span = if secs < 60 { "within a minute".to_string() } else { fmt_skew(secs).trim_start_matches('+').to_string() };
+    let span =
+        if secs < 60 { "within a minute".to_string() } else { fmt_skew(secs).trim_start_matches('+').to_string() };
     Some(format!("{a} to {b} UTC by the ids' clock, {span}"))
 }
 
 /// "fx09.am4, key JP7, counters 546,176–546,900": the Highwinds session every article came through; more than one
 /// key means more than one connection or session posted the files.
 fn server_session(timing: &[FileTiming]) -> Option<String> {
-    let mut keys: Vec<(String, String)> = timing
-        .iter()
-        .filter_map(|t| Some((t.hw_host.clone()?, t.hw_key.clone()?)))
-        .collect();
+    let mut keys: Vec<(String, String)> =
+        timing.iter().filter_map(|t| Some((t.hw_host.clone()?, t.hw_key.clone()?))).collect();
     keys.sort_unstable();
     keys.dedup();
     let first = timing.iter().filter_map(|t| t.hw_n_first).min();
@@ -967,7 +961,10 @@ fn server_session(timing: &[FileTiming]) -> Option<String> {
             };
             Some(format!("{host}, key {key}{counters}"))
         }
-        n => Some(format!("{n} sessions: {}", keys.iter().map(|(h, k)| format!("{h} key {k}")).collect::<Vec<_>>().join(", "))),
+        n => Some(format!(
+            "{n} sessions: {}",
+            keys.iter().map(|(h, k)| format!("{h} key {k}")).collect::<Vec<_>>().join(", ")
+        )),
     }
 }
 
@@ -2163,6 +2160,21 @@ fn keys_panel(i: &MetaInputs<'_>, l: &Looked, compact: bool) -> Facts {
             .filter(|_| !same_link(l, id, Kind::MovieHash).is_empty())
             .map(|h| with_link(h.to_string(), Kind::MovieHash)),
     );
+    let media = i.probe.and_then(|p| p.media.as_ref());
+    f.add_html("Mux key", media.and_then(crate::keys::mux_text).map(|t| with_link(key16(t.as_bytes()), Kind::Mux)));
+    f.add_html(
+        "Encode key",
+        media.and_then(crate::keys::encode_text).map(|t| with_link(key16(t.as_bytes()), Kind::Encode)),
+    );
+    f.add_html(
+        "Thread key",
+        i.probe
+            .and_then(|p| crate::probe::thread_root(&p.headers))
+            .map(|root| with_link(key16(format!("thread:{root}").as_bytes()), Kind::Thread)),
+    );
+    // the poster's header names in order, the ones servers add left out: a tool's fingerprint, shared by everyone
+    // posting with it, soo no list
+    f.key("Header set", i.probe.and_then(|p| crate::probe::header_set(&p.header_order)).map(|t| key16(t.as_bytes())));
     f
 }
 
