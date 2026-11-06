@@ -826,7 +826,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("atlas.s0.db");
         crate::store::create_shard(&path).unwrap();
-        let conn = rusqlite::Connection::open(&path).unwrap();
+        let conn = crate::db::open_shard(&path).unwrap();
         let mut a = file(2 << 20, 1);
         a.name = "a.mkv".into();
         a.crc32 = Some(7);
