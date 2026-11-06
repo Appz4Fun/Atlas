@@ -55,18 +55,25 @@ pub const SIDECARS: ShardTable = ShardTable {
     added: &[],
 };
 
-/// The text is kept only while the shard's texts hold less than ?10 bytes: past that, the name and UID still are, and
-/// a text kept before stays. A rerun that couldn't read anything (`unread`) leaves what an earlier read found.
+/// A rerun that couldn't read anything (`unread`) leaves what an earlier read found.
 const SET: &str = "insert into sidecars
     (release_id, name, group_name, file, kind, release_name, segment_uid, text, at)
-    values (?1, ?2, ?3, ?4, ?5, ?6, ?7,
-        case when coalesce((select value from meta where key = 'sidecar_text_bytes'), 0) < ?10 then ?8 end, ?9)
+    values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
     on conflict(release_id) do update set name = excluded.name, group_name = excluded.group_name,
         file = case when excluded.kind = 'unread' then sidecars.file else excluded.file end,
         kind = case when excluded.kind = 'unread' then sidecars.kind else excluded.kind end,
         release_name = case when excluded.kind = 'unread' then sidecars.release_name else excluded.release_name end,
         segment_uid = case when excluded.kind = 'unread' then sidecars.segment_uid else excluded.segment_uid end,
         text = coalesce(excluded.text, sidecars.text), at = excluded.at";
+
+/// After `SET` for release ?1: while the shard's texts hold more than ?2 bytes, the oldest texts but ?1's go, just
+/// enough of them; their names and UIDs stay. Soo the newest sidecars always have their text, and the total holds.
+const EVICT: &str = "update sidecars set text = null where release_id in (
+    select release_id from (
+        select release_id, length(cast(text as blob)) as len,
+            sum(length(cast(text as blob))) over (order by at, release_id rows unbounded preceding) as run
+        from sidecars where text is not null and release_id != ?1)
+    where run - len < coalesce((select value from meta where key = 'sidecar_text_bytes'), 0) - ?2)";
 
 /// What a release name read from a sidecar is kept to: a real one is far shorter, and these rows outlive releases
 pub const MAX_NAME: usize = 255;
@@ -230,9 +237,9 @@ impl Step for SidecarStep {
             read.as_ref().and_then(|r| r.segment_uid.clone()).into(),
             text.into(),
             chrono::Utc::now().timestamp().into(),
-            MAX_TOTAL_TEXT.into(),
         ];
-        Ok(Outcome { matched: body.is_some(), writes: vec![StepWrite::new(SET, params)], ..Outcome::default() })
+        let writes = vec![StepWrite::new(SET, params), StepWrite::new(EVICT, vec![r.id.into(), MAX_TOTAL_TEXT.into()])];
+        Ok(Outcome { matched: body.is_some(), writes, ..Outcome::default() })
     }
 }
 
@@ -303,74 +310,56 @@ Format                                   : Matroska
     }
 
     #[test]
-    fn sidecar_texts_stop_at_the_shards_total_but_their_names_dont() {
+    fn the_oldest_sidecar_texts_go_past_the_shards_total_and_their_names_stay() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         conn.execute_batch("create table meta (key TEXT PRIMARY KEY, value INTEGER);").unwrap();
         conn.execute_batch(SIDECARS.create).unwrap();
-        let put = |id: i64, text: &str, cap: i64| {
+        let write = |id: i64, kind: &str, text: Option<&str>, at: i64, cap: i64| {
             let p: Vec<rusqlite::types::Value> = vec![
                 id.into(),
                 "n".to_string().into(),
                 "g".to_string().into(),
                 None::<String>.into(),
-                "nfo".to_string().into(),
-                Some(format!("Name.{id}")).into(),
+                kind.to_string().into(),
+                (kind != "unread").then(|| format!("Name.{id}")).into(),
                 None::<String>.into(),
-                text.to_string().into(),
-                0i64.into(),
-                cap.into(),
+                text.map(str::to_string).into(),
+                at.into(),
             ];
             conn.execute(SET, rusqlite::params_from_iter(p)).unwrap();
+            conn.execute(EVICT, rusqlite::params![id, cap]).unwrap();
         };
+        let put = |id: i64, text: &str, at: i64| write(id, "nfo", Some(text), at, 10);
         let total = || {
             conn.query_row("select value from meta where key = 'sidecar_text_bytes'", [], |r| r.get::<_, i64>(0))
                 .unwrap()
         };
-        put(1, "aaaa", 10);
-        put(2, "bbbbbbbb", 10);
-        assert_eq!(total(), 12);
-        put(3, "cccc", 10);
-        let (name, text): (String, Option<String>) = conn
-            .query_row("select release_name, text from sidecars where release_id = 3", [], |r| {
+        let row = |id: i64| -> (String, Option<String>) {
+            conn.query_row("select release_name, text from sidecars where release_id = ?1", [id], |r| {
                 Ok((r.get(0)?, r.get(1)?))
             })
-            .unwrap();
-        assert_eq!((name.as_str(), text), ("Name.3", None), "past the total: the name, not the text");
-        put(3, "dddd", 10);
-        let kept: Option<String> =
-            conn.query_row("select text from sidecars where release_id = 2", [], |r| r.get(0)).unwrap();
-        assert_eq!(kept.as_deref(), Some("bbbbbbbb"));
-        put(2, "zzzz", 10);
-        let kept: Option<String> =
-            conn.query_row("select text from sidecars where release_id = 2", [], |r| r.get(0)).unwrap();
-        assert_eq!(kept.as_deref(), Some("bbbbbbbb"), "a rerun past the total keeps the text it had");
+            .unwrap()
+        };
+        put(1, "aaaa", 1);
+        put(2, "bbbb", 2);
+        assert_eq!(total(), 8);
+        put(3, "cccccc", 3);
+        // 14 past 10: the oldest goes, just enough
+        assert_eq!(row(1), ("Name.1".into(), None), "its name stays");
+        assert_eq!(row(2).1.as_deref(), Some("bbbb"));
+        assert_eq!(row(3).1.as_deref(), Some("cccccc"), "the newest keeps its text");
+        assert_eq!(total(), 10);
+        // the quota comes back: a new sidecar still gets its text
+        put(4, "dddddddd", 4);
+        assert_eq!(row(4).1.as_deref(), Some("dddddddd"));
+        assert!(total() <= 10);
         // a rerun that read nothing keeps what was found
-        let unread: Vec<rusqlite::types::Value> = vec![
-            2i64.into(),
-            "n".to_string().into(),
-            "g".to_string().into(),
-            None::<String>.into(),
-            "unread".to_string().into(),
-            None::<String>.into(),
-            None::<String>.into(),
-            None::<String>.into(),
-            0i64.into(),
-            100i64.into(),
-        ];
-        conn.execute(SET, rusqlite::params_from_iter(unread)).unwrap();
-        let (kind, name): (String, Option<String>) = conn
-            .query_row("select kind, release_name from sidecars where release_id = 2", [], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })
-            .unwrap();
-        assert_eq!((kind.as_str(), name.as_deref()), ("nfo", Some("Name.2")));
-        put(2, "b", 100);
-        assert_eq!(total(), 5, "a rewrite gives back what it held");
-        conn.execute("delete from sidecars where release_id = 1", []).unwrap();
-        assert_eq!(total(), 1);
+        write(4, "unread", None, 5, 10);
+        let kind: String = conn.query_row("select kind from sidecars where release_id = 4", [], |r| r.get(0)).unwrap();
+        assert_eq!((kind.as_str(), row(4)), ("nfo", ("Name.4".into(), Some("dddddddd".into()))));
         conn.execute("update meta set value = 999 where key = 'sidecar_text_bytes'", []).unwrap();
         recount(&conn).unwrap();
-        assert_eq!(total(), 1, "counted again from the rows, as after a compaction");
+        assert_eq!(total(), 8, "counted again from the rows, as after a compaction");
     }
 
     #[test]
