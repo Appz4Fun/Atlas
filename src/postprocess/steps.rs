@@ -20,6 +20,7 @@ pub fn all() -> Vec<Arc<dyn Step>> {
         Arc::new(naming::Naming),
         Arc::new(naming::NfoName),
         Arc::new(crate::sidecar::SidecarStep),
+        Arc::new(crate::sidecar::SidecarImageStep),
         Arc::new(crate::predb::step::PredbMatch),
         Arc::new(crate::category::CategoryStep::new()),
         parse,

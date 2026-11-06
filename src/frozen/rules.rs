@@ -130,8 +130,16 @@ const BACKLOG_RULES: &str = "freeze_backlog_rules";
 /// The rules as they are now, as one number.
 fn signature() -> i64 {
     let (small, keep_video, not_tv, sidecar) = settings();
-    small.wrapping_mul(8).wrapping_add(sidecar * 4 + keep_video * 2 + not_tv)
+    small
+        .wrapping_mul(8)
+        .wrapping_add(sidecar * 4 + keep_video * 2 + not_tv)
+        .wrapping_mul(16)
+        .wrapping_add(RULES_VERSION)
 }
+
+/// Raised when a rule takes in releases it didn't before, soo the backlog walk looks at every release again under it.
+/// 2: the sidecar rule takes cover images.
+const RULES_VERSION: i64 = 2;
 
 fn meta(conn: &Connection, key: &str) -> Result<Option<i64>> {
     conn.prepare_cached("select value from main.meta where key = ?1")?.query_row([key], |r| r.get(0)).optional()

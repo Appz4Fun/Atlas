@@ -13,6 +13,7 @@ use crate::postprocess::step::{Needs, Outcome, ReleaseInfo, Reruns, Step, StepCt
 use crate::store::FileInfo;
 
 pub const SIDECAR_STEP: StepId = StepId(11);
+pub const SIDECAR_IMAGE_STEP: StepId = StepId(12);
 
 pub const SIDECARS: ShardTable = ShardTable {
     name: "sidecars",
@@ -281,13 +282,14 @@ fn uid_hex(value: &str) -> Option<String> {
 }
 
 /// The text file to read first: a mediainfo dump, then an NFO, then any other text.
+/// Never an image, whatever it's called.
 fn pick(files: &[FileInfo]) -> Option<&FileInfo> {
     let lower = |f: &FileInfo| f.filename.to_ascii_lowercase();
-    files
-        .iter()
+    let text = || files.iter().filter(|f| is_sidecar_file(&f.filename));
+    text()
         .find(|f| lower(f).contains("mediainfo"))
-        .or_else(|| files.iter().find(|f| lower(f).ends_with(".nfo")))
-        .or_else(|| files.iter().find(|f| lower(f).ends_with(".txt") || lower(f).ends_with(".diz")))
+        .or_else(|| text().find(|f| lower(f).ends_with(".nfo")))
+        .or_else(|| text().find(|f| lower(f).ends_with(".txt") || lower(f).ends_with(".diz")))
 }
 
 #[derive(Default)]
@@ -322,22 +324,9 @@ impl Step for SidecarStep {
         if !is_sidecar(&files, r.file_total, r.size) {
             return Ok(Outcome::default());
         }
-        // a lone cover image: nothing to read, its post's name says what it's for
+        // a lone cover image has nothing to read: `SidecarImageStep` keeps it, as no body step runs for images
         if files.iter().all(|f| is_sidecar_image(&f.filename)) {
-            let name =
-                image_release_name(&r.name).or_else(|| files.first().and_then(|f| image_release_name(&f.filename)));
-            let params = vec![
-                r.id.into(),
-                r.name.clone().into(),
-                r.group.clone().into(),
-                files.first().map(|f| f.filename.clone()).into(),
-                "image".to_string().into(),
-                name.into(),
-                None::<String>.into(),
-                None::<String>.into(),
-                chrono::Utc::now().timestamp().into(),
-            ];
-            return Ok(Outcome { matched: true, writes: vec![StepWrite::new(SET, params)], ..Outcome::default() });
+            return Ok(Outcome::default());
         }
         let picked = pick(&files);
         let mut left = MAX_PARTS;
@@ -366,6 +355,52 @@ impl Step for SidecarStep {
             writes.push(StepWrite::new(EVICT, vec![r.id.into(), MAX_TOTAL_TEXT.into()]));
         }
         Ok(Outcome { matched: body.is_some(), writes, ..Outcome::default() })
+    }
+}
+
+/// A lone cover image posted on its own: kept as a sidecar of kind `image`, named after its post, with nothing read.
+/// A database step: the processing stage reads no image's body, and none is needed here.
+#[derive(Default)]
+pub struct SidecarImageStep;
+
+impl Step for SidecarImageStep {
+    fn id(&self) -> StepId {
+        SIDECAR_IMAGE_STEP
+    }
+    fn name(&self) -> &'static str {
+        "sidecar_image"
+    }
+    fn rank(&self) -> u16 {
+        235
+    }
+    fn needs(&self) -> Needs {
+        Needs::Database
+    }
+    fn applies(&self, r: &ReleaseInfo) -> bool {
+        r.size > 0 && r.size <= SIDECAR_BYTES
+    }
+    fn reruns(&self) -> Reruns {
+        Reruns { on_rename: false, on_growth: true }
+    }
+    fn run(&self, ctx: &mut StepCtx<'_>) -> Result<Outcome, StepError> {
+        let files = ctx.files().map_err(|e| StepError::Retry(e.to_string()))?;
+        let r = ctx.release().clone();
+        if !is_sidecar(&files, r.file_total, r.size) || !files.iter().all(|f| is_sidecar_image(&f.filename)) {
+            return Ok(Outcome::default());
+        }
+        let name = image_release_name(&r.name).or_else(|| files.first().and_then(|f| image_release_name(&f.filename)));
+        let params = vec![
+            r.id.into(),
+            r.name.clone().into(),
+            r.group.clone().into(),
+            files.first().map(|f| f.filename.clone()).into(),
+            "image".to_string().into(),
+            name.into(),
+            None::<String>.into(),
+            None::<String>.into(),
+            chrono::Utc::now().timestamp().into(),
+        ];
+        Ok(Outcome { matched: true, writes: vec![StepWrite::new(SET, params)], ..Outcome::default() })
     }
 }
 
@@ -559,6 +594,9 @@ Format                                   : Matroska
             Some("Verity.Dunkle.Geheimnisse.2026.GERMAN.DL.720P.WEB.H264-WAYNE")
         );
         assert_eq!(image_release_name("Some.Film.2024.poster.PNG").as_deref(), Some("Some.Film.2024"));
+        // the text file is read, never an image called mediainfo
+        let mixed = [file("mediainfo.png"), file("release.nfo")];
+        assert_eq!(pick(&mixed).map(|f| f.filename.as_str()), Some("release.nfo"));
         assert_eq!(
             image_release_name("Some.Film.2024").as_deref(),
             Some("Some.Film.2024"),
