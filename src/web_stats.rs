@@ -149,11 +149,13 @@ impl Scrape {
     }
 }
 
-/// The newest read, and the oldest kept inside the rate window to measure from.
+/// The newest read, the oldest kept inside the rate window to measure from, and every read in between.
 #[derive(Clone, Default)]
 struct Window {
     now: Option<Arc<Scrape>>,
     then: Option<Arc<Scrape>>,
+    /// the reads from `then` to `now`, oldest first; empty means just those two
+    chain: Vec<Arc<Scrape>>,
 }
 
 impl Window {
@@ -162,30 +164,39 @@ impl Window {
         let then = now.as_ref().and_then(|n| {
             samples.iter().find(|s| n.at - s.at <= RATE_WINDOW_SECS + 1.0 && n.at - s.at >= MIN_WINDOW_SECS).cloned()
         });
-        Window { now, then }
+        let chain = match &then {
+            Some(t) => samples.iter().filter(|s| s.at >= t.at).cloned().collect(),
+            None => Vec::new(),
+        };
+        Window { now, then, chain }
     }
 
     fn secs(&self) -> Option<f64> {
         Some(self.now.as_ref()?.at - self.then.as_ref()?.at)
     }
 
-    /// Per second, over the window, of the counter series `keep` takes. A series that went down started over with
-    /// its process, and counts from zero; one that wasn't there at the start of the window isn't counted.
+    /// Per second, over the window, of the counter series `keep` takes, added up read to read the way `rate` does:
+    /// a series that went down between two reads started over with its process and counts from zero there, and a
+    /// series counts only between reads that both have it.
     fn rate_where(&self, name: &str, keep: impl Fn(&Labels) -> bool) -> Option<f64> {
         let (now, then) = (self.now.as_ref()?, self.then.as_ref()?);
         let secs = now.at - then.at;
         if secs < MIN_WINDOW_SECS {
             return None;
         }
-        let before: HashMap<&Labels, f64> = then.rows(name).iter().map(|(l, v)| (l, *v)).collect();
+        let pair = [then.clone(), now.clone()];
+        let chain = if self.chain.len() >= 2 { self.chain.as_slice() } else { &pair[..] };
         let mut total = None;
-        for (labels, value) in now.rows(name) {
-            if !keep(labels) {
-                continue;
+        for step in chain.windows(2) {
+            let before: HashMap<&Labels, f64> = step[0].rows(name).iter().map(|(l, v)| (l, *v)).collect();
+            for (labels, value) in step[1].rows(name) {
+                if !keep(labels) {
+                    continue;
+                }
+                let Some(old) = before.get(labels) else { continue };
+                let delta = if value >= old { value - old } else { *value };
+                *total.get_or_insert(0.0) += delta;
             }
-            let Some(old) = before.get(labels) else { continue };
-            let delta = if value >= old { value - old } else { *value };
-            *total.get_or_insert(0.0) += delta;
         }
         total.map(|t| t / secs)
     }
@@ -932,7 +943,9 @@ fn lag(w: &Window, now: f64) -> String {
     format!("<h2>Realtime</h2><div class=\"stat-grid\">{}</div>{table}", tiles.concat())
 }
 
-fn headline(w: &Window, stats: &Value, now: f64) -> String {
+/// `answering`: the newest read of the metrics is recent and the last try didn't fail. A gauge kept from an older
+/// read says nothing of whether the indexer is up now.
+fn headline(w: &Window, stats: &Value, now: f64, answering: bool) -> String {
     let n = w.now.as_deref();
     let get = |name: &str| n.and_then(|n| n.sum(name));
     let with = |name: &str, key: &str, value: &str| n.and_then(|n| n.with(name, key, value));
@@ -940,7 +953,7 @@ fn headline(w: &Window, stats: &Value, now: f64) -> String {
     // a process that stopped moving
     let wrote = stats["load"]["at"].as_f64().filter(|at| *at > 0.0);
     let fresh = wrote.is_some_and(|at| now - at < STALE_SECS);
-    let up = get("atlas_indexer_up").is_some_and(|u| u > 0.0);
+    let up = answering && get("atlas_indexer_up").is_some_and(|u| u > 0.0);
     let start = get("atlas_process_start_time_seconds");
     let state = match (fresh, up, wrote) {
         (true, _, _) => format!("{} up {}", tag("tag-ok", "RUNNING"), start.map(|s| span(now - s)).unwrap_or_default()),
@@ -1093,6 +1106,8 @@ fn live_html(w: &Window, error: Option<&str>, stats: &Value, now: f64) -> String
         }
         _ => String::new(),
     };
+    let answering = error.is_none()
+        && w.now.as_ref().is_some_and(|s| now - s.at < (2 * SAMPLE_EVERY + SCRAPE_TIMEOUT).as_secs_f64());
     let measured = match (w.secs(), w.now.as_ref()) {
         (Some(secs), Some(s)) => format!("Read {}; rates over the last {}.", ago(s.at, now), span(secs)),
         (None, Some(s)) => format!("Read {}; rates show once a second read is in, within a minute.", ago(s.at, now)),
@@ -1100,7 +1115,7 @@ fn live_html(w: &Window, error: Option<&str>, stats: &Value, now: f64) -> String
     };
     format!(
         "<div id=\"stats-live\" hx-get=\"/ui/stats/live\" hx-trigger=\"every {REFRESH_SECS}s\" hx-swap=\"outerHTML\">{problem}{}{}{}{}{}{}{}<p class=\"sort\">{measured} Refreshes every {REFRESH_SECS} seconds.</p></div>",
-        headline(w, stats, now),
+        headline(w, stats, now, answering),
         pipelines(w, stats),
         net_shards(w, stats),
         lag(w, now),
@@ -1260,7 +1275,8 @@ fn stored_html(s: &Stored, now: f64) -> String {
         crate::web::diag("caution", "some shards could not be read", &s.errors.join("; "))
     };
     format!(
-        "<div id=\"stats-stored\">{errors}{}{}<p class=\"sort\">PreDB matches read {}; again after a minute.</p></div>",
+        "<div id=\"stats-stored\" hx-get=\"/ui/stats/stored\" hx-trigger=\"every {}s\" hx-swap=\"outerHTML\">{errors}{}{}<p class=\"sort\">PreDB matches read {}; again after a minute.</p></div>",
+        STORED_TTL.as_secs(),
         day_html(s),
         predb_html(s, now),
         ago(s.at, now),
@@ -1326,10 +1342,16 @@ atlas_indexer_up 1
     fn rates_count_restarts_from_zero_and_skip_new_series() {
         let then = parse("c{g=\"a\"} 100\nc{g=\"b\"} 500\n", 0.0);
         let now = parse("c{g=\"a\"} 160\nc{g=\"b\"} 30\nc{g=\"new\"} 9999\n", 60.0);
-        let w = Window { now: Some(Arc::new(now)), then: Some(Arc::new(then)) };
+        let w = Window { now: Some(Arc::new(now)), then: Some(Arc::new(then)), ..Default::default() };
         // a: +60, b restarted: 30, new: not counted
         assert_eq!(w.rate_where("c", |_| true), Some(1.5));
         assert_eq!(w.per_minute("c", |l| label(l, "g") == Some("a")), Some(60.0));
+        // a restart in the middle of the window: 1000, 1200, 20, 1100 is 200 + 20 + 1080
+        let reads: VecDeque<_> = [(0.0, 1000), (100.0, 1200), (200.0, 20), (300.0, 1100)]
+            .map(|(at, v)| Arc::new(parse(&format!("c {v}\n"), at)))
+            .into();
+        let restarted = Window::of(&reads);
+        assert_eq!(restarted.rate_where("c", |_| true), Some(1300.0 / 300.0));
         let short_window = Window { then: Some(Arc::new(parse("c 1\n", 50.0))), ..w.clone() };
         assert_eq!(short_window.rate_where("c", |_| true), None, "under MIN_WINDOW_SECS");
     }
@@ -1358,7 +1380,7 @@ atlas_indexer_up 1
 
     #[test]
     fn the_live_part_shows_pipelines_and_says_when_rates_are_coming() {
-        let w = Window { now: Some(Arc::new(parse(TEXT, 1000.0))), then: None };
+        let w = Window { now: Some(Arc::new(parse(TEXT, 1000.0))), ..Default::default() };
         let stats = serde_json::json!({"load": {"at": 1000.0}, "postprocess": {"lanes": {"window_secs": 600,
             "net_visits": [1.0, 2.0], "net_finished": [0.5, 0.5], "queue_taken": [3.0, 4.0]}}});
         let out = live_html(&w, None, &stats, 1001.0);
@@ -1367,8 +1389,15 @@ atlas_indexer_up 1
         assert!(out.contains("rates show once"));
         assert!(out.contains("Lanes per shard") && out.contains("<td>s1</td>"));
         assert!(out.contains("hx-trigger=\"every 30s\""));
-        let quiet = live_html(&w, None, &stats, 1000.0 + STALE_SECS + 5.0);
+        // stats.json went quiet: NOT MOVING while the metrics still answer, STOPPED once they don't
+        let later = 1000.0 + STALE_SECS + 5.0;
+        let fresh = Window { now: Some(Arc::new(parse(TEXT, later - 5.0))), ..Default::default() };
+        let quiet = live_html(&fresh, None, &stats, later);
         assert!(quiet.contains("NOT MOVING") && !quiet.contains("RUNNING"), "metrics answer, stats.json went quiet");
+        let gone = live_html(&fresh, Some("connection refused"), &stats, later);
+        assert!(gone.contains("STOPPED") && !gone.contains("NOT MOVING"), "the listener is gone too");
+        let old = live_html(&w, None, &stats, later);
+        assert!(old.contains("STOPPED"), "a read from minutes ago isn't an answer now");
         let failed = live_html(&Window::default(), Some("connection refused"), &Value::Null, 1001.0);
         assert!(failed.contains("could not be read") && failed.contains("connection refused"));
     }
@@ -1467,5 +1496,6 @@ atlas_indexer_up 1
         assert!(out.contains("Posted in the last 24 hours") && out.contains("Uncategorized"));
         assert!(out.contains("/ui/release?id=8") && out.contains("X264 · exact"));
         assert!(out.contains("no index on the posted date"));
+        assert!(out.contains("hx-get=\"/ui/stats/stored\" hx-trigger=\"every 60s\""), "it keeps refreshing");
     }
 }
