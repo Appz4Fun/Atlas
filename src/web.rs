@@ -2447,7 +2447,7 @@ fn release_html(
             from: r.id,
             from_name: r.name.clone(),
         }),
-        (None, Some(c)) => crate::duplicates::first_password(c, same_bytes(&found_copies)),
+        (None, Some(c)) => crate::duplicates::carried_password(c, r.id, &found_copies),
         (None, None) => None,
     };
     if let Some(hint) = &own_hint {
@@ -2519,7 +2519,12 @@ fn release_html(
         String::new()
     };
     // the other volumes of its set aren't copies of the release, whatever the set's list makes them look like
-    let copies = if recovery.is_some() { String::new() } else { copies_html(&copies, inherited.as_ref()) };
+    // a password goes only to the copies holding this release's whole payload, not a shared NFO or one volume
+    let carry_to: Vec<i64> = conn
+        .as_ref()
+        .map(|c| crate::duplicates::carriers(c, r.id, &copies).iter().map(|copy| copy.id).collect())
+        .unwrap_or_default();
+    let copies = if recovery.is_some() { String::new() } else { copies_html(&copies, inherited.as_ref(), &carry_to) };
     let warning = recovery.map_or(String::new(), recovery_warning);
 
     page(
@@ -3091,13 +3096,14 @@ const COPIES_ABOUT: &str = "An xpost is this same upload seen in another group: 
 fn copies_html(
     copies: &[(crate::duplicates::Copy, ReleaseRow)],
     inherited: Option<&crate::duplicates::Inherited>,
+    carry_to: &[i64],
 ) -> String {
     use crate::duplicates::Copy;
     if copies.is_empty() {
         return String::new();
     }
-    // xposts and twins hold this release's very bytes, soo its password is theirs; an alt is packed apart
-    let carried = |kind: &Copy| if matches!(kind, Copy::Xpost | Copy::Twin) { inherited } else { None };
+    // xposts and twins holding this release's whole payload take its password; an alt is packed apart
+    let carried = |copy: &ReleaseRow| if carry_to.contains(&copy.id) { inherited } else { None };
     let badge = |kind: &Copy| match kind {
         Copy::Xpost => tag("tag-ref", "XPOST"),
         Copy::Twin => tag("tag-ok", "TWIN"),
@@ -3107,7 +3113,7 @@ fn copies_html(
     let cards: String = copies
         .iter()
         .take(FULL_COPIES)
-        .map(|(kind, copy)| copy_card(&conn, &badge(kind), copy, carried(kind)))
+        .map(|(kind, copy)| copy_card(&conn, &badge(kind), copy, carried(copy)))
         .collect();
     let rest: String = copies.iter().skip(FULL_COPIES).map(|(kind, copy)| copy_link(&badge(kind), copy)).collect();
     let rest = if rest.is_empty() { rest } else { format!("<ul class=\"copy-rest\">{rest}</ul>") };
@@ -3601,12 +3607,6 @@ fn inherited_password_fact(from: &crate::duplicates::Inherited) -> String {
         escape(&from.from_name),
         escape(from.hint.source)
     )
-}
-
-/// The copies that hold a release's very bytes: its xposts and twins.
-fn same_bytes(copies: &[(crate::duplicates::Copy, ReleaseRow)]) -> impl Iterator<Item = &ReleaseRow> {
-    use crate::duplicates::Copy;
-    copies.iter().filter(|(kind, _)| matches!(kind, Copy::Xpost | Copy::Twin)).map(|(_, r)| r)
 }
 
 /// How much of a release its recovery volumes can repair: exact from the PAR2 set, or else an estimate.

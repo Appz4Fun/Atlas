@@ -5,7 +5,7 @@
 mod common;
 
 use atlas::archive::store::{INSERT_PAR2_FILE, SET_NFO_PASSWORD};
-use atlas::duplicates::{SET_CONTENT, SET_POSTED, first_password, own_password_hint, par2_name_password};
+use atlas::duplicates::{SET_CONTENT, SET_POSTED, first_password, own_password_hint, par2_name_password, same_payload};
 use atlas::parser::Release;
 use atlas::{db, store};
 use common::stage::release_of;
@@ -65,7 +65,74 @@ fn a_password_carries_to_xposts_and_twins_but_not_alts() {
             .unwrap();
     }
     shard_a.execute(SET_NFO_PASSWORD, rusqlite::params![first, "YMFFZeoeVI6fG4iz"]).unwrap();
+    // an NFO in a set's list, byte for byte the one another archive came with
+    let nfo = |shard: &rusqlite::Connection, id: i64| {
+        shard
+            .execute(
+                INSERT_PAR2_FILE,
+                rusqlite::params![
+                    id,
+                    vec![9u8; 16],
+                    vec![9u8; 16],
+                    vec![9u8; 16],
+                    vec![9u8; 16],
+                    4_000i64,
+                    "film.nfo",
+                    6,
+                    1,
+                    1,
+                    1
+                ],
+            )
+            .unwrap();
+    };
+    nfo(&shard_a, first);
+    // another archive that shares only that NFO: a file twin by it, but not the same bytes
+    let (stranger, shard_e) = save("Other.Film.1939", "other.film.1939.part1.rar", 4);
+    shard_e.execute(SET_POSTED, rusqlite::params![stranger, b"stranger".as_slice()]).unwrap();
+    shard_e
+        .execute(
+            INSERT_PAR2_FILE,
+            rusqlite::params![
+                stranger,
+                vec![4u8; 16],
+                vec![4u8; 16],
+                vec![4u8; 16],
+                vec![4u8; 16],
+                2_100_000i64,
+                "other.film.1939.part1.rar",
+                5,
+                1,
+                1,
+                1
+            ],
+        )
+        .unwrap();
+    nfo(&shard_e, stranger);
+    // a film posted unpacked under a title, its set naming it by a random string: no archive, soo no password
+    let (unpacked, shard_f) = save("Movie.1939", "Movie.1939.mkv", 5);
+    shard_f
+        .execute(
+            INSERT_PAR2_FILE,
+            rusqlite::params![
+                unpacked,
+                vec![5u8; 16],
+                vec![5u8; 16],
+                vec![5u8; 16],
+                vec![5u8; 16],
+                2_100_000i64,
+                "Kq3Wd8Zr5Tn2Lp7X.mkv",
+                5,
+                1,
+                1,
+                1
+            ],
+        )
+        .unwrap();
     let conn = db::open().unwrap();
+    assert!(par2_name_password(&conn, unpacked).is_none(), "an unpacked file has no password to give");
+    assert!(same_payload(&conn, first, twin), "the same set of volumes");
+    assert!(!same_payload(&conn, first, stranger), "an NFO alone isn't the archive");
 
     // the renamed repost's set still names the volumes: that name is a hint of its own
     let hint = par2_name_password(&conn, twin).unwrap();
@@ -99,6 +166,10 @@ fn a_password_carries_to_xposts_and_twins_but_not_alts() {
     );
     let alt_page = page(alt);
     assert!(!alt_page.contains("inherited from"), "an alt is packed apart: {alt_page}");
+    let stranger_page = page(stranger);
+    assert!(stranger_page.contains("TWIN"), "a file twin by the NFO: {stranger_page}");
+    // the first upload's card shows the password it found itself; none of it reaches this page's own facts
+    assert!(!stranger_page.contains("inherited from"), "it shares an NFO, not the archive: {stranger_page}");
     let first_page = page(first);
     // on the first upload's page its xpost and twin cards show the password too, the alt's card doesn't
     assert_eq!(first_page.matches("inherited from").count(), 1, "the xpost's card; the twin has its own: {first_page}");

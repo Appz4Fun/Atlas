@@ -593,6 +593,44 @@ pub fn own_password_hint(
     crate::release_info::password_hint_with(conn, id, names).or_else(|| par2_name_password(conn, id))
 }
 
+/// Whether two postings are proven to hold the same whole payload, not just a file of it: the same posted fingerprint
+/// (set, names, part counts and hashes), or sets that describe the very same data files, sidecars aside, by size and
+/// MD5. A file twin by an NFO alone, or by one volume of two archives, isn't, soo nothing is carried between those.
+pub fn same_payload(conn: &Connection, a: i64, b: i64) -> bool {
+    if let (Ok((Some(pa), _)), Ok((Some(pb), _))) = (fingerprints_with(conn, a), fingerprints_with(conn, b))
+        && pa == pb
+    {
+        return true;
+    }
+    let data = |id: i64| {
+        let mut files: Vec<(u64, [u8; 16])> = crate::archive::store::par2_files_with(conn, id)
+            .into_iter()
+            .filter(|f| f.bound && !is_sidecar(&f.name))
+            .map(|f| (f.size, f.md5))
+            .collect();
+        files.sort_unstable();
+        files.dedup();
+        files
+    };
+    let mine = data(a);
+    !mine.is_empty() && mine == data(b)
+}
+
+/// The password `id`'s xposts and twins carry to it: of those holding its whole payload (`same_payload`), the first
+/// with a password hint of its own.
+pub fn carried_password(conn: &Connection, id: i64, copies: &[(Copy, ReleaseRow)]) -> Option<Inherited> {
+    first_password(conn, carriers(conn, id, copies).iter().copied())
+}
+
+/// The copies of `id` a password carries to and from: xposts and twins holding its whole payload.
+pub fn carriers<'a>(conn: &Connection, id: i64, copies: &'a [(Copy, ReleaseRow)]) -> Vec<&'a ReleaseRow> {
+    copies
+        .iter()
+        .filter(|(kind, r)| matches!(kind, Copy::Xpost | Copy::Twin) && same_payload(conn, id, r.id))
+        .map(|(_, r)| r)
+        .collect()
+}
+
 /// Of these postings, every one holding the same bytes, the first with a password hint of its own.
 pub fn first_password<'a>(conn: &Connection, rows: impl IntoIterator<Item = &'a ReleaseRow>) -> Option<Inherited> {
     rows.into_iter().take(MAX_PASSWORD_SOURCES).find_map(|r| {
@@ -608,10 +646,15 @@ pub fn first_password<'a>(conn: &Connection, rows: impl IntoIterator<Item = &'a 
 /// The name a release's PAR2 set gives its archive, when the volumes were posted under another: a repost that
 /// renamed the files kept the set made for the first upload, and an uploader that names an archive and its password
 /// from one random string leaves the password there. Only a generated-looking name counts (letters and digits,
-/// mixed case, 10 to 64 of them), and only one archive's volumes, every one renamed.
+/// mixed case, 10 to 64 of them), and only one archive's volumes, every one renamed: a set of unpacked files has none.
 pub fn par2_name_password(conn: &Connection, id: i64) -> Option<crate::release_info::PasswordHint> {
     let set = crate::archive::store::par2_files_with(conn, id);
-    let mut stems = set.iter().filter(|f| f.bound && !is_sidecar(&f.name)).map(|f| volume_set(&f.name));
+    let data: Vec<&crate::par2::Par2File> = set.iter().filter(|f| f.bound && !is_sidecar(&f.name)).collect();
+    // an unpacked file posted under another name has no password to give: only archive volumes are named for one
+    if !data.iter().all(|f| is_archive(&f.name)) {
+        return None;
+    }
+    let mut stems = data.iter().map(|f| volume_set(&f.name));
     let stem = stems.next()?;
     if !stems.all(|other| other == stem) || !looks_generated(stem) {
         return None;
