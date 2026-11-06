@@ -621,14 +621,48 @@ pub fn fill_from_copies_of(conn: &Connection, id: i64, rows: &[i64], own: &mut V
         known.extend(crate::archive::store::segment_crcs_with(conn, twin.id));
         added += fill_gaps_from(own, &store::articles(conn, twin.id)?, &twin.names, twin.one_file, &known);
     }
-    let mut seen: HashSet<i64> = HashSet::new();
+    let mut seen: HashSet<i64> = rows.iter().copied().collect();
     for twin in twins_with(conn, id)? {
         if seen.insert(twin) {
             known.extend(crate::archive::store::segment_crcs_with(conn, twin));
             added += fill_gaps_checked(own, &store::articles(conn, twin)?, &known);
         }
     }
+    // a file of the same size and whole-file CRC32 in a posting no fingerprint or set hash ties to this one: a repost
+    // under other names, or a set that hashes the same bytes differently. It lends by `fill_gaps`'s rules, soo only
+    // when it was cut up the same way, and only to a file of this release that is missing parts.
+    for mine in crate::keys::named_crc_files(conn, id) {
+        let Some(posted) = posted_name(own, &mine.name, false).map(str::to_string) else { continue };
+        if !has_gaps(own, &posted) {
+            continue;
+        }
+        for (donor, theirs) in crate::keys::crc_donors(conn, id, mine.file, mine.md5.as_deref()) {
+            if rows.contains(&donor) {
+                continue;
+            }
+            known.extend(crate::archive::store::segment_crcs_with(conn, donor));
+            let lent = fill_gaps_from(own, &store::articles(conn, donor)?, &[(theirs, posted.clone())], false, &known);
+            if lent > 0 {
+                crate::metrics::names::NZB_FILLED_BY_CRC.inc(&[], lent as u64);
+            }
+            added += lent;
+            if !has_gaps(own, &posted) {
+                break;
+            }
+        }
+    }
     Ok(added)
+}
+
+/// Whether the file posted as `name` is missing parts among `articles`: fewer distinct parts than its subject counts.
+fn has_gaps(articles: &[ArticleRow], name: &str) -> bool {
+    let mut parts: HashSet<i64> = HashSet::new();
+    let mut total = None;
+    for a in articles.iter().filter(|a| a.filename.as_deref() == Some(name)) {
+        parts.extend(a.part);
+        total = total.or(a.total_parts);
+    }
+    total.is_some_and(|t| (parts.len() as i64) < t)
 }
 
 /// `fill_gaps_checked` with nothing known about the articles' bytes.

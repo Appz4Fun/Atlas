@@ -68,15 +68,20 @@ pub const RELEASE_KEYS: ShardTable = ShardTable {
             "release_keys_video",
             "create index if not exists release_keys_video on release_keys(video) where video is not null",
         ),
+        (
+            "release_keys_audio",
+            "create index if not exists release_keys_audio on release_keys(audio) where audio is not null",
+        ),
     ],
     release_key: Some("release_id"),
-    // `video`: the first keyframe's key, from the probe's `keyframe_key`
-    added: &[("file_crc", "INTEGER"), ("body_crc", "INTEGER"), ("video", "INTEGER")],
+    // `video`: the first keyframe's key, from the probe's `keyframe_key`; `audio`: the first audio track's
+    // `stream_key`
+    added: &[("file_crc", "INTEGER"), ("body_crc", "INTEGER"), ("video", "INTEGER"), ("audio", "INTEGER")],
 };
 
 const UPSERT: &str =
-    "insert or replace into release_keys (release_id, account, host, layout, lines, file_crc, body_crc, video)
-    values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)";
+    "insert or replace into release_keys (release_id, account, host, layout, lines, file_crc, body_crc, video, audio)
+    values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)";
 const DELETE: &str = "delete from release_keys where release_id = ?1";
 
 pub const KEYS_STEP: StepId = StepId(40);
@@ -106,10 +111,11 @@ pub enum Kind {
     FileCrc,
     BodyCrc,
     Video,
+    Audio,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 9] = [
+    pub const ALL: [Kind; 10] = [
         Kind::Account,
         Kind::Host,
         Kind::Layout,
@@ -119,6 +125,7 @@ impl Kind {
         Kind::FileCrc,
         Kind::BodyCrc,
         Kind::Video,
+        Kind::Audio,
     ];
 
     /// The word in `/ui/same?kind=`.
@@ -133,6 +140,7 @@ impl Kind {
             Kind::FileCrc => "file",
             Kind::BodyCrc => "article",
             Kind::Video => "video",
+            Kind::Audio => "audio",
         }
     }
 
@@ -152,6 +160,7 @@ impl Kind {
             Kind::FileCrc => "Same file, by size and CRC32",
             Kind::BodyCrc => "Same first article, by the server's body CRC",
             Kind::Video => "Same video stream",
+            Kind::Audio => "Same audio stream",
         }
     }
 
@@ -183,6 +192,9 @@ impl Kind {
             Kind::Video => {
                 "The same first keyframe, to the bit: the same encode or the same disc's video, remuxed, renamed or in another container, whoever posted it and in whatever group. Another encode of the same film has another."
             }
+            Kind::Audio => {
+                "The same first audio track, to the bit: FLAC's MD5 of its samples, or the first eight different AC-3 or E-AC-3 frames. The same audio remuxed, whatever the video, container or group: a hybrid or another encode can keep the source's audio. A studio's logo music, encoded once and reused, can match across films, soo check the names."
+            }
         }
     }
 
@@ -195,6 +207,7 @@ impl Kind {
             Kind::Lines => Some("lines"),
             Kind::BodyCrc => Some("body_crc"),
             Kind::Video => Some("video"),
+            Kind::Audio => Some("audio"),
             Kind::Par2 | Kind::MovieHash | Kind::FileCrc => None,
         }
     }
@@ -210,6 +223,7 @@ pub struct Keys {
     pub file_crc: Option<i64>,
     pub body_crc: Option<i64>,
     pub video: Option<i64>,
+    pub audio: Option<i64>,
 }
 
 impl Keys {
@@ -225,6 +239,7 @@ impl Keys {
             Kind::Lines => self.lines,
             Kind::BodyCrc => self.body_crc,
             Kind::Video => self.video,
+            Kind::Audio => self.audio,
             Kind::Par2 | Kind::MovieHash | Kind::FileCrc => None,
         }
     }
@@ -348,6 +363,17 @@ pub(crate) fn video_key(media: &crate::probe::media::MediaInfo) -> Option<i64> {
     (hex.len() == 16).then(|| u64::from_str_radix(hex, 16).ok()).flatten().map(|k| k as i64)
 }
 
+/// The first audio track's stream key that the probe found, as the probe keeps it.
+pub(crate) fn audio_stream_key(media: &crate::probe::media::MediaInfo) -> Option<&str> {
+    media.audio.first()?.stream_key.as_deref()
+}
+
+/// The same as the integer `release_keys` stores.
+pub(crate) fn audio_key(media: &crate::probe::media::MediaInfo) -> Option<i64> {
+    let hex = audio_stream_key(media)?;
+    (hex.len() == 16).then(|| u64::from_str_radix(hex, 16).ok()).flatten().map(|k| k as i64)
+}
+
 /// What the layout key is taken over: the codecs in track order, the chapter count and the duration to the
 /// second. None for a probe that found no tracks and no duration.
 pub(crate) fn layout_text(media: &crate::probe::media::MediaInfo) -> Option<String> {
@@ -429,6 +455,7 @@ pub fn keys_of(
         keys.file_crc = probe_file(p).map(FileCrc::key);
         keys.body_crc = body_text(p).map(|t| as_key(digest8(t.as_bytes())));
         keys.video = p.media.as_ref().and_then(video_key);
+        keys.audio = p.media.as_ref().and_then(audio_key);
     }
     keys.lines = lines_text(timing, parts).map(|t| as_key(digest8(t.as_bytes())));
     keys
@@ -535,6 +562,120 @@ pub fn crc_files(shard: &Connection, release_id: i64, probe: Option<&ProbeInfo>)
     Ok(out)
 }
 
+/// A file a release knows the whole-file CRC32 of, under a name: the one it was posted as, for the probed file, or the
+/// one its PAR2 set gives it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NamedCrc {
+    pub file: FileCrc,
+    pub name: String,
+    /// the whole-file MD5 a set of this release gives the file, when one does: a donor's set that says another MD5
+    /// for the same size and CRC is another file, a CRC32 collision or a set that lies
+    pub md5: Option<Vec<u8>>,
+}
+
+/// The most releases one file asks for donors from.
+const DONORS_CAP: i64 = 8;
+
+/// `crc_files` with names, for a release in any shard of `conn` (the main database with the shards attached).
+pub fn named_crc_files(conn: &Connection, release_id: i64) -> Vec<NamedCrc> {
+    let s = store::shard_of_id(release_id);
+    let mut out: Vec<NamedCrc> = Vec::new();
+    if let Some(probe) = probe_in(conn, release_id)
+        && let (Some(file), Some(name)) = (probe_file(&probe), probe.file.clone())
+    {
+        out.push(NamedCrc { file, name, md5: None });
+    }
+    let sql = format!(
+        "select size, crc32, name, md5 from s{s}.par2_files
+         where release_id = ?1 and bound = 1 and crc32 is not null and size >= ?2
+         order by size desc, name limit ?3"
+    );
+    if let Ok(mut q) = conn.prepare_cached(&sql)
+        && let Ok(rows) = q.query_map(rusqlite::params![release_id, CRC_MIN_SIZE, CRC_FILES_CAP as i64], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?, r.get::<_, Vec<u8>>(3)?))
+        })
+    {
+        for (size, crc, name, md5) in rows.flatten() {
+            let Some(file) = u32::try_from(crc).ok().and_then(|c| FileCrc::new(size, c)) else { continue };
+            // the probed file, when the set describes it too, takes the set's MD5
+            for probed in out.iter_mut().filter(|n| n.file == file && n.md5.is_none()) {
+                probed.md5 = Some(md5.clone());
+            }
+            if !out.iter().any(|n| n.file == file && n.name == name) {
+                out.push(NamedCrc { file, name, md5: Some(md5) });
+            }
+        }
+    }
+    out.truncate(CRC_FILES_CAP);
+    out
+}
+
+/// Whether a set of `id` gives `file` (by size and CRC) another whole-file MD5 than `md5`.
+fn md5_differs(conn: &Connection, id: i64, file: FileCrc, md5: Option<&[u8]>) -> bool {
+    let Some(md5) = md5 else { return false };
+    let s = store::shard_of_id(id);
+    let sql = format!(
+        "select 1 from s{s}.par2_files where release_id = ?1 and bound = 1 and size = ?2 and crc32 = ?3 and md5 != ?4"
+    );
+    conn.prepare_cached(&sql)
+        .and_then(|mut q| q.exists(rusqlite::params![id, file.size, i64::from(file.crc32), md5]))
+        .unwrap_or(false)
+}
+
+/// A release's probe, read through `conn` with the shards attached.
+fn probe_in(conn: &Connection, release_id: i64) -> Option<ProbeInfo> {
+    let s = store::shard_of_id(release_id);
+    let sql = format!("select info from s{s}.release_probe where release_id = ?1");
+    let info: String = conn.prepare_cached(&sql).ok()?.query_row([release_id], |r| r.get(0)).optional().ok()??;
+    serde_json::from_str(&info).ok()
+}
+
+/// The other releases that hold `file`, each with the name it has there: a probed file of the same size and CRC
+/// (under its posted name), or a file a bound PAR2 set lists with them (under the set's name). Shown releases only,
+/// newest first, at most `DONORS_CAP`.
+pub fn crc_donors(conn: &Connection, own: i64, file: FileCrc, md5: Option<&[u8]>) -> Vec<(i64, String)> {
+    let mut out: Vec<(i64, String)> = Vec::new();
+    for s in 0..store::SHARDS {
+        let probed = format!(
+            "select k.release_id from s{s}.release_keys k join s{s}.releases r on r.id = k.release_id
+             where k.file_crc = ?1 and k.release_id != ?2 and not atlas_blocked(r.group_name)
+             order by k.release_id desc limit ?3"
+        );
+        if let Ok(mut q) = conn.prepare_cached(&probed)
+            && let Ok(rows) = q.query_map(rusqlite::params![file.key(), own, DONORS_CAP], |r| r.get::<_, i64>(0))
+        {
+            for id in rows.flatten().collect::<Vec<_>>() {
+                // the key is a hash: the donor's own probe must say the same size and CRC, and name the file
+                if let Some(probe) = probe_in(conn, id)
+                    && probe_file(&probe) == Some(file)
+                    && !md5_differs(conn, id, file, md5)
+                    && let Some(name) = probe.file
+                {
+                    out.push((id, name));
+                }
+            }
+        }
+        let described = format!(
+            "select distinct p.release_id, p.name from s{s}.par2_files p join s{s}.releases r on r.id = p.release_id
+             where p.bound = 1 and p.size = ?1 and p.crc32 = ?2 and p.release_id != ?3
+               and (?5 is null or p.md5 = ?5) and not atlas_blocked(r.group_name)
+             order by p.release_id desc limit ?4"
+        );
+        if let Ok(mut q) = conn.prepare_cached(&described)
+            && let Ok(rows) = q.query_map(
+                rusqlite::params![file.size, i64::from(file.crc32), own, DONORS_CAP, md5],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+            )
+        {
+            out.extend(rows.flatten());
+        }
+    }
+    out.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    out.dedup();
+    out.truncate(DONORS_CAP as usize);
+    out
+}
+
 /// The PAR2 set ids a release's files are described by, at most `SETS_CAP`; none on a shard without the table yet.
 pub fn par2_sets(shard: &Connection, release_id: i64) -> rusqlite::Result<Vec<Vec<u8>>> {
     let Ok(mut q) = shard.prepare_cached(
@@ -549,7 +690,7 @@ pub fn par2_sets(shard: &Connection, release_id: i64) -> rusqlite::Result<Vec<Ve
 fn stored(shard: &Connection, release_id: i64) -> rusqlite::Result<Option<Keys>> {
     shard
         .prepare_cached(
-            "select account, host, layout, lines, file_crc, body_crc, video from release_keys where release_id = ?1",
+            "select account, host, layout, lines, file_crc, body_crc, video, audio from release_keys where release_id = ?1",
         )?
         .query_row([release_id], |r| {
             Ok(Keys {
@@ -560,6 +701,7 @@ fn stored(shard: &Connection, release_id: i64) -> rusqlite::Result<Option<Keys>>
                 file_crc: r.get(4)?,
                 body_crc: r.get(5)?,
                 video: r.get(6)?,
+                audio: r.get(7)?,
             })
         })
         .optional()
@@ -833,6 +975,7 @@ impl Step for KeysStep {
                     keys.file_crc.into(),
                     keys.body_crc.into(),
                     keys.video.into(),
+                    keys.audio.into(),
                 ],
             )],
         };
@@ -881,6 +1024,27 @@ mod tests {
         assert_eq!(keys_of(None, &files, None, None).lines, None);
         assert_eq!(keys_of(None, &[(None, 10), (Some(500), 5)], Some(15), None).lines, None);
         assert!(keys_of(None, &[], Some(0), None).is_empty());
+    }
+
+    #[test]
+    fn the_audio_key_is_the_first_audio_tracks() {
+        use crate::probe::media::{AudioTrack, MediaInfo};
+        let probe = |keys: &[Option<&str>]| ProbeInfo {
+            media: Some(MediaInfo {
+                audio: keys
+                    .iter()
+                    .map(|k| AudioTrack { stream_key: k.map(str::to_string), ..Default::default() })
+                    .collect(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let keys = keys_of(Some(&probe(&[Some("ba7816bf8f01cfea"), Some("0123456789abcdef")])), &[], None, None);
+        assert_eq!(keys.audio, Some(as_key(digest8(b"abc"))));
+        assert_eq!(keys_of(Some(&probe(&[None, Some("0123456789abcdef")])), &[], None, None).audio, None);
+        assert_eq!(keys_of(Some(&probe(&[])), &[], None, None).audio, None);
+        assert!(others_sql(Kind::Audio, 2, 1).contains("k.audio = ?3"));
+        assert_eq!(Kind::parse("audio"), Some(Kind::Audio));
     }
 
     #[test]
@@ -1058,8 +1222,7 @@ mod tests {
             .unwrap();
         }
         for (_, index) in crate::archive::store::PAR2_FILES.indexes {
-            conn.execute_batch(&index.replacen("exists ", "exists s0.", 1))
-                .unwrap();
+            conn.execute_batch(&index.replacen("exists ", "exists s0.", 1)).unwrap();
         }
         let lookup = Lookup { keys: Keys::default(), par2_sets: Vec::new(), moviehash: None, files: vec![file] };
         assert!(lookup.has(Kind::FileCrc));
