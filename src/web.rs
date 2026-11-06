@@ -2791,7 +2791,7 @@ fn probe_html(
         );
         dd(
             &mut tracks,
-            "DVD disc ID",
+            if m.container == "bluray" { "Blu-ray disc ID" } else { "DVD disc ID" },
             m.disc_id.as_deref().map_or(String::new(), |id| format!("<code>{}</code>", escape(id))),
         );
         dd(
@@ -2840,6 +2840,7 @@ fn probe_html(
             parts.extend(v.max_cll.filter(|n| *n > 0).map(|n| format!("MaxCLL {n} nits")));
             parts.extend(v.max_fall.filter(|n| *n > 0).map(|n| format!("MaxFALL {n} nits")));
             parts.extend(v.language.clone().filter(|l| l != "und"));
+            parts.extend(stats_facts(v.stats.as_ref(), "frames"));
             dd(&mut tracks, "Video", escape(&parts.join(", ")));
         }
         for a in &m.audio {
@@ -2862,6 +2863,7 @@ fn probe_html(
                 parts.push("commentary".into());
             }
             parts.extend(a.name.clone());
+            parts.extend(stats_facts(a.stats.as_ref(), "frames"));
             dd(&mut tracks, "Audio", escape(&parts.join(", ")));
         }
         for s in &m.subtitles {
@@ -2887,6 +2889,7 @@ fn probe_html(
                 parts.push("commentary".into());
             }
             parts.extend(s.name.clone());
+            parts.extend(stats_facts(s.stats.as_ref(), "events"));
             dd(&mut tracks, "Subtitles", escape(&parts.join(", ")));
         }
     }
@@ -2981,6 +2984,19 @@ fn probe_html(
         panel("Packing", &packed),
         panel("How it was posted", &posted),
     )
+}
+
+/// A track's counts from mkvmerge's statistics tags: its exact bitrate, frames (a subtitle track's events) and bytes.
+fn stats_facts(stats: Option<&crate::probe::media::TrackStats>, frames: &str) -> Vec<String> {
+    let Some(s) = stats else { return Vec::new() };
+    let mut out = Vec::new();
+    out.extend(s.bps.map(|bps| match bps {
+        0..1000 => format!("{bps} b/s"),
+        _ => format!("{} kb/s", thousands((bps / 1000) as i64)),
+    }));
+    out.extend(s.frames.map(|n| format!("{} {frames}", thousands(n as i64))));
+    out.extend(s.bytes.map(|n| format!("{} bytes", thousands(n as i64))));
+    out
 }
 
 /// Matroska tags that can name the person who made or bought the file: kept in the probe, never shown.
@@ -4591,6 +4607,41 @@ mod tests {
         assert!(html.find("<dt>BPS</dt>") < html.find("<dt>IMDB</dt>"), "{html}");
         let long = tag_value("COMMENT", &"x".repeat(1000));
         assert!(long.ends_with('…') && long.chars().count() == TAG_VALUE_CHARS + 1);
+    }
+
+    #[test]
+    fn mkvmerge_statistics_show_on_their_track_and_a_blu_ray_disc_id_says_so() {
+        use crate::probe::media::{AudioTrack, MediaInfo, SubtitleTrack, TrackStats, VideoTrack};
+        let stats = |bps, frames, bytes| {
+            Some(TrackStats { bps: Some(bps), frames: Some(frames), bytes: Some(bytes), ..TrackStats::default() })
+        };
+        let media = MediaInfo {
+            container: "matroska".into(),
+            video: vec![VideoTrack {
+                codec: "V_MPEGH/ISO/HEVC".into(),
+                stats: stats(8_123_456, 172_345, 7_302_958_152),
+                ..VideoTrack::default()
+            }],
+            audio: vec![AudioTrack {
+                codec: "A_EAC3".into(),
+                stats: stats(640_000, 224_740, 575_334_400),
+                ..AudioTrack::default()
+            }],
+            subtitles: vec![SubtitleTrack {
+                codec: "S_TEXT/UTF8".into(),
+                stats: stats(72, 1534, 64_893),
+                ..SubtitleTrack::default()
+            }],
+            ..Default::default()
+        };
+        let html = probe_html(&crate::probe::ProbeInfo { media: Some(media), ..Default::default() }, None, None, None);
+        assert!(html.contains("V_MPEGH/ISO/HEVC, 8,123 kb/s, 172,345 frames, 7,302,958,152 bytes"), "{html}");
+        assert!(html.contains("A_EAC3, 640 kb/s, 224,740 frames, 575,334,400 bytes"), "{html}");
+        assert!(html.contains("S_TEXT/UTF8, 72 b/s, 1,534 events, 64,893 bytes"), "{html}");
+        let disc = MediaInfo { container: "bluray".into(), disc_id: Some("00010203a0a1".into()), ..Default::default() };
+        let html = probe_html(&crate::probe::ProbeInfo { media: Some(disc), ..Default::default() }, None, None, None);
+        assert!(html.contains("<dt>Blu-ray disc ID</dt><dd><code>00010203a0a1</code></dd>"), "{html}");
+        assert!(!html.contains("DVD disc ID"), "{html}");
     }
 
     #[test]
