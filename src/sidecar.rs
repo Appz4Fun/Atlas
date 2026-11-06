@@ -7,7 +7,7 @@
 //! what's looked up when the release it describes is found.
 
 use crate::config::Config;
-use crate::frozen::rules::{SIDECAR_BYTES, SIDECAR_FILES};
+use crate::frozen::rules::{SIDECAR_BYTES, SIDECAR_FILES, SIDECAR_IMAGES};
 use crate::postprocess::schema::ShardTable;
 use crate::postprocess::step::{Needs, Outcome, ReleaseInfo, Reruns, Step, StepCtx, StepError, StepId, StepWrite};
 use crate::store::FileInfo;
@@ -194,13 +194,34 @@ pub fn is_sidecar_file(name: &str) -> bool {
         .is_some_and(|(stem, ext)| !stem.is_empty() && SIDECAR_FILES.iter().any(|e| e.eq_ignore_ascii_case(ext)))
 }
 
+/// Whether a file is a cover or poster image a sidecar may hold, by its name.
+pub fn is_sidecar_image(name: &str) -> bool {
+    name.rsplit_once('.')
+        .is_some_and(|(stem, ext)| !stem.is_empty() && SIDECAR_IMAGES.iter().any(|e| e.eq_ignore_ascii_case(ext)))
+}
+
 /// Whether these files, of a release that says it has `file_total` of them, make a sidecar: as the freeze rule has it.
+/// Images count beside the text files, or one alone: several images and nothing else are a picture post.
 pub fn is_sidecar(files: &[FileInfo], file_total: Option<i64>, size: i64) -> bool {
     !files.is_empty()
         && size > 0
         && size <= SIDECAR_BYTES
         && file_total.unwrap_or(0) <= files.len() as i64
-        && files.iter().all(|f| is_sidecar_file(&f.filename))
+        && files.iter().all(|f| is_sidecar_file(&f.filename) || is_sidecar_image(&f.filename))
+        && (files.len() == 1 || files.iter().any(|f| is_sidecar_file(&f.filename)))
+}
+
+/// The release a lone cover image is for, from its post's name: `X-cover.jpg`, `X.poster.png` and the like give `X`.
+pub fn image_release_name(name: &str) -> Option<String> {
+    let stem = name.rsplit_once('.').filter(|(_, ext)| SIDECAR_IMAGES.iter().any(|e| e.eq_ignore_ascii_case(ext)));
+    let stem = stem.map_or(name, |(stem, _)| stem);
+    let lower = stem.to_ascii_lowercase();
+    let cut = ["cover", "poster", "folder", "fanart", "front"]
+        .iter()
+        .flat_map(|word| ["-", ".", "_", " "].iter().map(move |sep| format!("{sep}{word}")))
+        .find(|suffix| lower.ends_with(suffix.as_str()))
+        .map_or(stem.len(), |suffix| stem.len() - suffix.len());
+    capped_name(&stem[..cut])
 }
 
 /// What a sidecar's text says.
@@ -300,6 +321,23 @@ impl Step for SidecarStep {
         let r = ctx.release().clone();
         if !is_sidecar(&files, r.file_total, r.size) {
             return Ok(Outcome::default());
+        }
+        // a lone cover image: nothing to read, its post's name says what it's for
+        if files.iter().all(|f| is_sidecar_image(&f.filename)) {
+            let name =
+                image_release_name(&r.name).or_else(|| files.first().and_then(|f| image_release_name(&f.filename)));
+            let params = vec![
+                r.id.into(),
+                r.name.clone().into(),
+                r.group.clone().into(),
+                files.first().map(|f| f.filename.clone()).into(),
+                "image".to_string().into(),
+                name.into(),
+                None::<String>.into(),
+                None::<String>.into(),
+                chrono::Utc::now().timestamp().into(),
+            ];
+            return Ok(Outcome { matched: true, writes: vec![StepWrite::new(SET, params)], ..Outcome::default() });
         }
         let picked = pick(&files);
         let mut left = MAX_PARTS;
@@ -497,6 +535,35 @@ Format                                   : Matroska
         );
         assert!(describing(&conn, 11, &[], Some("55f84b6aa194d59703ccab394da26cde"), 5).is_empty(), "not itself");
         assert!(describing(&conn, 100, &["No.Such.Name"], None, 5).is_empty());
+    }
+
+    #[test]
+    fn a_cover_image_is_a_sidecar_alone_or_beside_text_but_pictures_alone_are_not() {
+        let file = |name: &str| FileInfo {
+            id: 1,
+            filename: name.into(),
+            subject: None,
+            subject_part: None,
+            expected: Some(1),
+            file_total: None,
+            parts_seen: 1,
+            touched_at: None,
+            sealed: false,
+        };
+        assert!(is_sidecar(&[file("X-cover.jpg")], None, 729_538), "the boneless cover post");
+        assert!(is_sidecar(&[file("x.nfo"), file("cover.jpg"), file("poster.png")], None, 900_000));
+        assert!(!is_sidecar(&[file("a.jpg"), file("b.jpg")], None, 900_000), "a picture post");
+        assert!(!is_sidecar(&[file("X-cover.jpg")], None, 5 << 20), "past the size");
+        assert_eq!(
+            image_release_name("Verity.Dunkle.Geheimnisse.2026.GERMAN.DL.720P.WEB.H264-WAYNE-cover.jpg").as_deref(),
+            Some("Verity.Dunkle.Geheimnisse.2026.GERMAN.DL.720P.WEB.H264-WAYNE")
+        );
+        assert_eq!(image_release_name("Some.Film.2024.poster.PNG").as_deref(), Some("Some.Film.2024"));
+        assert_eq!(
+            image_release_name("Some.Film.2024").as_deref(),
+            Some("Some.Film.2024"),
+            "a post's name without its file's"
+        );
     }
 
     #[test]

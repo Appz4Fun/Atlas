@@ -1593,6 +1593,7 @@ fn sidecars_html(found: &[crate::sidecar::Found]) -> Option<String> {
             let what = match s.kind.as_str() {
                 "mediainfo" => "MediaInfo",
                 "nfo" => "NFO",
+                "image" => "Cover image",
                 _ => "text",
             };
             let by = if s.by == "segment_uid" { "same file, by its Segment UID" } else { "by name" };

@@ -2242,7 +2242,7 @@ fn frozen_page(id: i64) -> ApiResponse {
     let r = &hit.row;
     let why = match hit.reason.as_str() {
         crate::frozen::rules::SMALL_COMPLETE => "complete and under the small rule's size",
-        crate::frozen::rules::SIDECAR => "only an NFO, mediainfo or other text that describes a release",
+        crate::frozen::rules::SIDECAR => "only an NFO, mediainfo, other text or a cover image that describes a release",
         "not_tv_movies" => "outside Movies, TV and Other",
         _ => "by hand",
     };
