@@ -20,8 +20,12 @@ use crate::postprocess::step::{StepCtx, StepError, StepWrite};
 use crate::store::FileInfo;
 
 pub const SIGNATURE: &[u8; 8] = b"Rar!\x1aRev";
-/// The most data volumes kept of one set: as many files as a PAR2 read keeps.
+/// The most data volumes a header is read for: as many files as a PAR2 read keeps.
 pub const MAX_VOLUMES: usize = 4_096;
+/// The most data volumes stored for one release, the ones big enough to look up (`keys::CRC_MIN_SIZE`): a 50 MB
+/// volume set of 12 GB. One article of anyone's post can claim thousands, soo what it can make Atlas store is
+/// bounded: a header past this keeps its first ones.
+pub const MAX_KEPT: usize = 256;
 /// The `.rev` files a release's step tries, first by name first, before it gives up.
 const TRIES: usize = 2;
 
@@ -113,6 +117,12 @@ pub const DELETE_REV_VOLUMES: &str = "delete from rev_volumes where release_id =
 pub const INSERT_REV_VOLUME: &str =
     "insert or replace into rev_volumes (release_id, volume, size, crc32) values (?1, ?2, ?3, ?4)";
 
+/// The volumes worth storing: those big enough to look up by size and CRC32, at most `MAX_KEPT`.
+pub fn kept(volumes: &[Volume]) -> Vec<Volume> {
+    let min = u64::try_from(crate::keys::CRC_MIN_SIZE).unwrap_or(u64::MAX);
+    volumes.iter().filter(|v| v.size >= min).take(MAX_KEPT).copied().collect()
+}
+
 /// The writes that keep a set's data volumes in place of what the release had.
 pub fn writes(release_id: i64, volumes: &[Volume]) -> Vec<StepWrite> {
     let mut out = vec![StepWrite::new(DELETE_REV_VOLUMES, vec![release_id.into()])];
@@ -151,17 +161,18 @@ pub fn read(ctx: &mut StepCtx<'_>, files: &[FileInfo], explicit: bool) -> Result
     let (id, name, group) = (rel.id, rel.name.clone(), rel.group.clone());
     let content_id = crate::raw_store::release_content_id(ctx.conn(), id).unwrap_or_default();
     if !explicit && let Some(saved) = crate::raw_store::get_rev_volumes(&name, &group, &content_id) {
-        return Ok(writes(id, &saved));
+        return Ok(writes(id, &kept(&saved)));
     }
     for file in sources.into_iter().take(TRIES) {
         let Some(seg) = super::steps::first_article(ctx, file)? else { continue };
         let Some(body) = super::steps::fetch_one(ctx, &seg, &file.filename)? else { continue };
         let Some(header) = parse(&body) else { continue };
-        if header.volumes.is_empty() {
+        let volumes = kept(&header.volumes);
+        if volumes.is_empty() {
             continue;
         }
-        crate::raw_store::put_rev_volumes(&name, &group, &content_id, &header.volumes);
-        return Ok(writes(id, &header.volumes));
+        crate::raw_store::put_rev_volumes(&name, &group, &content_id, &volumes);
+        return Ok(writes(id, &volumes));
     }
     Ok(Vec::new())
 }
@@ -258,6 +269,21 @@ mod tests {
         assert_eq!(w.len(), 4);
         assert_eq!(w[0].sql, DELETE_REV_VOLUMES);
         assert!(w[1..].iter().all(|x| x.sql == INSERT_REV_VOLUME));
+    }
+
+    #[test]
+    fn only_volumes_worth_looking_up_are_kept_and_not_too_many() {
+        let h = parse(&header_bytes(&SET, 1, 3)).unwrap();
+        assert_eq!(kept(&h.volumes), h.volumes, "every volume of 1 MiB or more");
+        let small = [Volume { index: 0, size: 1_000, crc32: 1 }, Volume { index: 1, size: 2 << 20, crc32: 2 }];
+        assert_eq!(kept(&small), vec![small[1]]);
+        // a header claiming every volume it can: what it makes Atlas store is bounded
+        let many: Vec<(u64, u32)> = (0..MAX_VOLUMES as u32).map(|i| (50 << 20, i)).collect();
+        let h = parse(&header_bytes(&many, 1, 0)).unwrap();
+        assert_eq!(h.volumes.len(), MAX_VOLUMES);
+        let k = kept(&h.volumes);
+        assert_eq!(k.len(), MAX_KEPT);
+        assert_eq!(writes(1, &k).len(), MAX_KEPT + 1);
     }
 
     #[test]

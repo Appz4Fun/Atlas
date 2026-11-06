@@ -1862,7 +1862,7 @@ pub fn get_rev_volumes(name: &str, group_name: &str, content_id: &[u8]) -> Optio
 /// Saves a release's data volume table for `(name, group_name)` and `content_id`, in place of what was saved, within
 /// `MAX_RAW_ARCHIVES_ROWS` releases.
 pub fn put_rev_volumes(name: &str, group_name: &str, content_id: &[u8], volumes: &[crate::archive::rev::Volume]) {
-    if content_id.is_empty() || volumes.is_empty() || volumes.len() > crate::archive::rev::MAX_VOLUMES {
+    if content_id.is_empty() || volumes.is_empty() || volumes.len() > crate::archive::rev::MAX_KEPT {
         return;
     }
     let _ = with_raw_tx(|conn| {
@@ -1872,6 +1872,7 @@ pub fn put_rev_volumes(name: &str, group_name: &str, content_id: &[u8], volumes:
         if !had {
             prune_rev_volumes(conn, 1)?;
         }
+        prune_rev_rows(conn, volumes.len() as i64)?;
         conn.prepare_cached("DELETE FROM raw_rev_volumes WHERE name = ?1 AND group_name = ?2")?
             .execute(params![name, group_name])?;
         let mut ins = conn.prepare_cached(
@@ -1890,6 +1891,25 @@ pub fn put_rev_volumes(name: &str, group_name: &str, content_id: &[u8], volumes:
         }
         Ok(())
     });
+}
+
+/// The most `raw_rev_volumes` rows kept, whatever the count of releases: what posted headers can make it hold.
+const MAX_RAW_REV_ROWS: i64 = 1_000_000;
+
+/// Drops whole saved tables, by key order, soo `room` more rows fit within `MAX_RAW_REV_ROWS`.
+fn prune_rev_rows(conn: &Connection, room: i64) -> rusqlite::Result<()> {
+    let rows: i64 = conn.query_row("SELECT count(*) FROM raw_rev_volumes", [], |r| r.get(0))?;
+    if rows + room > MAX_RAW_REV_ROWS {
+        // releases of at most `MAX_KEPT` rows each: enough of them to make the room, and some to spare
+        let releases = (rows + room - MAX_RAW_REV_ROWS) / crate::archive::rev::MAX_KEPT as i64 + 64;
+        conn.execute(
+            "DELETE FROM raw_rev_volumes WHERE (name, group_name) IN (
+                SELECT DISTINCT name, group_name FROM raw_rev_volumes LIMIT ?1
+            )",
+            params![releases],
+        )?;
+    }
+    Ok(())
 }
 
 /// Drops the oldest saved tables soo `room` more releases fit within `MAX_RAW_ARCHIVES_ROWS`.
@@ -2292,6 +2312,7 @@ fn enforce_harvest_quotas(conn: &Connection) -> rusqlite::Result<()> {
         )?;
     }
     prune_rev_volumes(conn, 0)?;
+    prune_rev_rows(conn, 0)?;
     let stills_count: i64 = conn.query_row("SELECT count(*) FROM raw_stills", [], |r| r.get(0))?;
     if stills_count > MAX_RAW_STILLS_ROWS {
         conn.execute(
@@ -2749,6 +2770,7 @@ fn harvest_attached_release_tables(tx: &rusqlite::Transaction<'_>, schema: &str)
         drop(rows);
         drop(stmt);
         prune_rev_volumes(tx, 0)?;
+        prune_rev_rows(tx, 0)?;
     }
     if has_table(tx, schema, "release_nfo_password")? {
         let nfo_mask = crate::postprocess::step::mask(crate::naming::NFO);

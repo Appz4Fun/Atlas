@@ -1562,12 +1562,12 @@ fn inside_panel(i: &MetaInputs<'_>, l: &Looked, compact: bool) -> Facts {
     f
 }
 
-/// "the first .rev file names 47 data volumes by size and CRC32": what the RAR recovery volumes say of the set
-/// they repair, read from the front of the first one.
+/// "size and CRC32 of 47 data volumes, from the first .rev file": what the RAR recovery volumes say of the set they
+/// repair, read from the front of the first one (the volumes of 1 MiB or more, `archive::rev::kept`).
 fn rev_summary(volumes: i64) -> Option<String> {
     (volumes > 0).then(|| {
         format!(
-            "the first .rev file names {} data volume{} by size and CRC32",
+            "size and CRC32 of {} data volume{}, from the first .rev file",
             thousands(volumes),
             plural(volumes as usize)
         )
@@ -3433,10 +3433,10 @@ mod tests {
             "{html}"
         );
         assert!(
-            html.contains("<dt>RAR recovery</dt><dd>the first .rev file names 47 data volumes by size and CRC32</dd>"),
+            html.contains("<dt>RAR recovery</dt><dd>size and CRC32 of 47 data volumes, from the first .rev file</dd>"),
             "{html}"
         );
-        assert_eq!(rev_summary(1).as_deref(), Some("the first .rev file names 1 data volume by size and CRC32"));
+        assert_eq!(rev_summary(1).as_deref(), Some("size and CRC32 of 1 data volume, from the first .rev file"));
         assert_eq!(rev_summary(0), None);
     }
 
