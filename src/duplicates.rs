@@ -702,8 +702,10 @@ pub fn file_twins_with(conn: &Connection, id: i64) -> Vec<FileTwin> {
 }
 
 /// The posted name a set's name stands for among a release's articles: the same name, or the same but for case, or,
-/// when `one_file` (the set describes one data file), the one data file of a row that posted it under a random name.
-fn posted_name<'a>(articles: &'a [ArticleRow], name: &str, one_file: bool) -> Option<&'a str> {
+/// when `one_archive` (the set's names are one archive's volumes), the volume with the same ending under the one
+/// archive name this posting used, or, when `one_file` (the set describes one data file), the one data file of a row
+/// that posted it under a random name.
+fn posted_name<'a>(articles: &'a [ArticleRow], name: &str, one_file: bool, one_archive: bool) -> Option<&'a str> {
     let names: Vec<&str> = {
         let mut seen: Vec<&str> = articles.iter().filter_map(|a| a.filename.as_deref()).collect();
         seen.sort_unstable();
@@ -716,6 +718,9 @@ fn posted_name<'a>(articles: &'a [ArticleRow], name: &str, one_file: bool) -> Op
     if let Some(found) = names.iter().copied().find(|n| n.eq_ignore_ascii_case(name)) {
         return Some(found);
     }
+    if let Some(found) = renamed_volume(&names, name).filter(|_| one_archive) {
+        return Some(found);
+    }
     if !one_file || is_sidecar(name) {
         return None;
     }
@@ -724,6 +729,47 @@ fn posted_name<'a>(articles: &'a [ArticleRow], name: &str, one_file: bool) -> Op
         [one] => Some(one),
         _ => None,
     }
+}
+
+/// The posted name of a volume a set names under another archive name: a repost that renamed every volume of one
+/// archive (`YMFF.part001.rar` posted as `oCBv.part001.rar`) and kept the set made for the first upload. Only when
+/// the posting's data files are all volumes of one archive, soo the set's name and the posted one stand for the same
+/// thing, and only the volume with the very same ending.
+fn renamed_volume<'a>(names: &[&'a str], name: &str) -> Option<&'a str> {
+    if is_sidecar(name) {
+        return None;
+    }
+    let base = crate::archive::names::base_name(name);
+    let suffix = &base[volume_set(name).len()..];
+    if !is_volume_ending(suffix) {
+        return None;
+    }
+    let mut stems = names.iter().filter(|n| !is_sidecar(n)).map(|n| volume_set(n));
+    let posted = stems.next()?;
+    if !stems.all(|stem| stem == posted) {
+        return None;
+    }
+    names
+        .iter()
+        .copied()
+        .find(|n| !is_sidecar(n) && crate::archive::names::base_name(n)[posted.len()..].eq_ignore_ascii_case(suffix))
+}
+
+/// Whether what follows an archive's name is a volume's numbered ending: `.part001.rar`, `.r00`, `.z01`, `.7z.001` or
+/// `.001`. A plain `.mkv` says nothing about which file it is.
+fn is_volume_ending(suffix: &str) -> bool {
+    static VOLUME: LazyLock<Regex> = LazyLock::new(|| {
+        #[allow(clippy::unwrap_used)]
+        Regex::new(r"(?i)^\.(part\d+\.rar|r\d{2,}|z\d{2,}|7z\.\d+|\d{3,})$").unwrap()
+    });
+    VOLUME.is_match(suffix)
+}
+
+/// Whether a set's names, sidecars aside, are all volumes of one archive.
+fn one_archive<'a>(names: impl Iterator<Item = &'a str>) -> bool {
+    let mut stems = names.filter(|n| !is_sidecar(n)).map(volume_set);
+    let Some(first) = stems.next() else { return false };
+    stems.all(|stem| stem == first)
 }
 
 /// What articles were found to hold, by message-id: `(decoded length, CRC32)` from `segment_crc`, for the two
@@ -742,8 +788,13 @@ pub fn fill_gaps_from(
     known: &KnownCrcs,
 ) -> usize {
     let mut renamed: Vec<ArticleRow> = Vec::new();
+    // a renamed repost's volumes map by their endings only when each side's names are one archive's volumes
+    let theirs_one = one_archive(names.iter().map(|(theirs, _)| theirs.as_str()));
+    let mine_one = one_archive(names.iter().map(|(_, mine)| mine.as_str()));
     for (theirs, mine) in names {
-        let (Some(from), Some(to)) = (posted_name(twin, theirs, one_file), posted_name(own, mine, one_file)) else {
+        let (Some(from), Some(to)) =
+            (posted_name(twin, theirs, one_file, theirs_one), posted_name(own, mine, one_file, mine_one))
+        else {
             continue;
         };
         let to = to.to_string();
@@ -791,7 +842,7 @@ pub fn fill_from_copies_of(conn: &Connection, id: i64, rows: &[i64], own: &mut V
     // under other names, or a set that hashes the same bytes differently. It lends by `fill_gaps`'s rules, soo only
     // when it was cut up the same way, and only to a file of this release that is missing parts.
     for mine in crate::keys::named_crc_files(conn, id) {
-        let Some(posted) = posted_name(own, &mine.name, false).map(str::to_string) else { continue };
+        let Some(posted) = posted_name(own, &mine.name, false, false).map(str::to_string) else { continue };
         if !has_gaps(own, &posted) {
             continue;
         }
@@ -1079,6 +1130,45 @@ mod tests {
         let nfo = vec![("Movie.2024.nfo".to_string(), "Movie.2024.nfo".to_string())];
         assert_eq!(fill_gaps_from(&mut own, &twin, &nfo, true, &KnownCrcs::new()), 0);
         assert_eq!(own.len(), 1);
+    }
+
+    #[test]
+    fn a_renamed_repost_fills_from_the_volumes_its_set_names() {
+        // the set names the first upload's volumes; this posting renamed every one of them
+        let mut own = vec![
+            article("oCBvoIlhFvS0L3k1.part001.rar", 1, 2, 100, "o1"),
+            article("oCBvoIlhFvS0L3k1.part002.rar", 1, 2, 100, "o3"),
+            article("oCBvoIlhFvS0L3k1.part002.rar", 2, 2, 100, "o4"),
+            article("oCBvoIlhFvS0L3k1.par2", 1, 1, 10, "op"),
+        ];
+        let twin = vec![
+            article("YMFFZeoeVI6fG4iz.part001.rar", 1, 2, 100, "y1"),
+            article("YMFFZeoeVI6fG4iz.part001.rar", 2, 2, 100, "y2"),
+            article("YMFFZeoeVI6fG4iz.part002.rar", 1, 2, 100, "y3"),
+        ];
+        let names: Vec<(String, String)> = ["YMFFZeoeVI6fG4iz.part001.rar", "YMFFZeoeVI6fG4iz.part002.rar"]
+            .iter()
+            .map(|n| (n.to_string(), n.to_string()))
+            .collect();
+        assert_eq!(fill_gaps_from(&mut own, &twin, &names, false, &KnownCrcs::new()), 1);
+        let borrowed = own.iter().find(|a| a.message_id == "y2").unwrap();
+        assert_eq!(borrowed.filename.as_deref(), Some("oCBvoIlhFvS0L3k1.part001.rar"), "under this posting's name");
+        // a set of two archives' volumes can't say which posted archive is which
+        let two: Vec<(String, String)> =
+            ["A.part001.rar", "B.part001.rar"].iter().map(|n| (n.to_string(), n.to_string())).collect();
+        let mut own = vec![article("P.part001.rar", 1, 2, 100, "p1")];
+        let twin = vec![article("A.part001.rar", 2, 2, 100, "a2"), article("B.part001.rar", 2, 2, 100, "b2")];
+        assert_eq!(fill_gaps_from(&mut own, &twin, &two, false, &KnownCrcs::new()), 0);
+        // a plain file's ending says nothing about which file it is
+        assert_eq!(renamed_volume(&["Other.mkv"], "Movie.mkv"), None);
+        // a posting of two archives can't say which one the set's name stands for
+        let posted = ["a.part001.rar", "b.part001.rar"];
+        assert_eq!(renamed_volume(&posted, "YMFFZeoeVI6fG4iz.part001.rar"), None);
+        // a volume with no posted counterpart, and a file that is no volume, map to nothing
+        let posted = ["oCBv.part001.rar", "oCBv.par2"];
+        assert_eq!(renamed_volume(&posted, "YMFF.part002.rar"), None);
+        assert_eq!(renamed_volume(&posted, "YMFF.part001.rar"), Some("oCBv.part001.rar"));
+        assert_eq!(renamed_volume(&posted, "YMFF.nfo"), None);
     }
 
     #[test]
