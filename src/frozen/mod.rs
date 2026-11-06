@@ -522,9 +522,11 @@ pub fn free_bytes(path: &Path) -> Option<u64> {
 }
 
 /// What `free_bytes` last read for the disk under the database, -1 before the first reading and -2 when it couldnt
-/// be read. Read on a thread of its own every `DISK_EVERY`: `sysinfo` lists every mount, network ones too, and on
+/// be read. Read on a thread of its own every `FREE_EVERY`: `sysinfo` lists every mount, network ones too, and on
 /// prod that took over 4 s, which a writer used to spend every minute before its tick could go on.
 static FREE: AtomicI64 = AtomicI64::new(-1);
+/// how often the free disk is read, off the writers: a disk filling up stops the moves within this
+const FREE_EVERY: Duration = Duration::from_secs(30);
 static DISK_WATCH: std::sync::Once = std::sync::Once::new();
 
 /// The free bytes under `path` as last read, None until there is a reading or when it couldnt be read. The first
@@ -535,7 +537,7 @@ fn free_now(path: &Path) -> Option<u64> {
         let _ = std::thread::Builder::new().name("atlas-disk-free".into()).spawn(move || {
             loop {
                 FREE.store(free_bytes(&path).map_or(-2, |b| b.min(i64::MAX as u64) as i64), Relaxed);
-                std::thread::sleep(DISK_EVERY);
+                std::thread::sleep(FREE_EVERY);
             }
         });
     });
@@ -575,7 +577,7 @@ impl Ticker {
         if !ok {
             crate::metrics::names::FROZEN.inc(&[("event", "disk_short")], 1);
         }
-        self.disk = Some((Instant::now(), ok));
+        // the reading is read anew each tick (it costs an atomic load); `disk` stays for a set reading in tests
         ok
     }
 

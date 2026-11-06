@@ -609,11 +609,15 @@ fn stage_transaction(conn: &Connection, work: StageWork) -> rusqlite::Result<()>
 /// and copy the WAL into the shard.
 /// Only the idle freezing of `housekeeping`, for a writer woken with nothing to do between its housekeepings.
 fn freeze_idle(conn: &mut Connection, store: &mut crate::store::ShardWriter) {
+    let t = std::time::Instant::now();
     let span = crate::metrics::span("db.freeze");
     if let Err(e) = store.freezer.tick_idle(conn, chrono::Utc::now().timestamp()) {
         span.failed();
         eprintln!("freezing in shard {} failed: {e}", store.shard);
     }
+    drop(span);
+    // the writer's time like any other housekeeping's
+    crate::profile::Load::add_since(&crate::profile::LOAD.writer_busy_ns, t);
 }
 
 /// `idle`: nothing waits for the writer, soo freezing may take longer (`frozen::Ticker::tick_idle`).
