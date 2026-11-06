@@ -543,6 +543,27 @@ fn every_table_a_release_is_read_from_has_an_index_for_it() {
     }
 }
 
+/// With nothing waiting for the writer, ticks come four times as often as a busy writer's, one a second.
+#[test]
+fn an_idle_writer_ticks_more_often() {
+    let f = Fixture::new();
+    f.save(&[post("One", &["a.mkv"], 1, 10), post("Two", &["b.mkv"], 1, 10)]);
+    let conn = f.writer();
+    conn.execute_batch(
+        "insert into freeze_pending (release_id, reason, at) select id, 'small_complete', 1 from releases",
+    )
+    .unwrap();
+    let mut ticker = Ticker { disk: Some((Instant::now(), true)), ..Ticker::default() };
+    let first = ticker.tick_idle(&conn, NOW).unwrap().frozen;
+    assert!(first >= 1);
+    assert_eq!(ticker.tick_idle(&conn, NOW).unwrap(), Moved::default(), "not again at once");
+    std::thread::sleep(IDLE_TICK_EVERY);
+    if first < 2 {
+        assert_eq!(ticker.tick_idle(&conn, NOW).unwrap().frozen, 1, "again after a quarter second");
+    }
+    assert_eq!(count(&conn, "select count(*) from freeze_pending"), 0);
+}
+
 #[test]
 fn nothing_moves_while_the_disk_is_short() {
     let f = Fixture::new();

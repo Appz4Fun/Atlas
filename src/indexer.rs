@@ -438,7 +438,8 @@ fn writer(
     loop {
         let since_save = last_save.map_or(STAGE_QUIET, |t| t.elapsed());
         let wait = if stage.is_empty() {
-            idle
+            // a writer with nothing to do wakes for idle freezing too, and does the rest of its housekeeping every `idle`
+            if crate::frozen::idle_ticks_on() { idle.min(crate::frozen::IDLE_TICK_EVERY) } else { idle }
         } else if bank > 0.0 || since_save >= STAGE_QUIET {
             Duration::ZERO
         } else {
@@ -454,9 +455,15 @@ fn writer(
                     continue;
                 }
                 // nothing to save: files still come due as they go stale
+                Err(RecvTimeoutError::Timeout) if stage.is_empty() && last_housekeeping.elapsed() < idle => {
+                    if let Ok(conn) = &mut opened {
+                        freeze_idle(conn, &mut store);
+                    }
+                    continue;
+                }
                 Err(RecvTimeoutError::Timeout) if stage.is_empty() => {
                     if let Ok(conn) = &mut opened {
-                        housekeeping(conn, &mut store, true);
+                        housekeeping(conn, &mut store, true, true);
                     }
                     last_housekeeping = std::time::Instant::now();
                     continue;
@@ -469,7 +476,7 @@ fn writer(
                     }
                     if last_housekeeping.elapsed() >= Duration::from_secs(1) {
                         if let Ok(conn) = &mut opened {
-                            housekeeping(conn, &mut store, true);
+                            housekeeping(conn, &mut store, true, false);
                         }
                         last_housekeeping = std::time::Instant::now();
                     }
@@ -542,7 +549,9 @@ fn writer(
                     }
                 }
             }
-            housekeeping(conn, &mut store, seal);
+            // nothing came in meanwhile and no stage work waits: the writer would sit idle
+            let idle = next.is_none() && stage.is_empty() && saved;
+            housekeeping(conn, &mut store, seal, idle);
             last_housekeeping = std::time::Instant::now();
         }
     }
@@ -598,7 +607,21 @@ fn stage_transaction(conn: &Connection, work: StageWork) -> rusqlite::Result<()>
 
 /// A writer's work between saves: seal some of what is due (when `seal`),
 /// and copy the WAL into the shard.
-fn housekeeping(conn: &mut Connection, store: &mut crate::store::ShardWriter, seal: bool) {
+/// Only the idle freezing of `housekeeping`, for a writer woken with nothing to do between its housekeepings.
+fn freeze_idle(conn: &mut Connection, store: &mut crate::store::ShardWriter) {
+    let t = std::time::Instant::now();
+    let span = crate::metrics::span("db.freeze");
+    if let Err(e) = store.freezer.tick_idle(conn, chrono::Utc::now().timestamp()) {
+        span.failed();
+        eprintln!("freezing in shard {} failed: {e}", store.shard);
+    }
+    drop(span);
+    // the writer's time like any other housekeeping's
+    crate::profile::Load::add_since(&crate::profile::LOAD.writer_busy_ns, t);
+}
+
+/// `idle`: nothing waits for the writer, soo freezing may take longer (`frozen::Ticker::tick_idle`).
+fn housekeeping(conn: &mut Connection, store: &mut crate::store::ShardWriter, seal: bool, idle: bool) {
     use crate::profile::{LOAD, Load};
     use std::sync::atomic::Ordering::Relaxed;
 
@@ -615,7 +638,9 @@ fn housekeeping(conn: &mut Connection, store: &mut crate::store::ShardWriter, se
     }
     // what the freezing rules queued, a little at a time (`frozen::Ticker`)
     let span = crate::metrics::span("db.freeze");
-    if let Err(e) = store.freezer.tick(conn, chrono::Utc::now().timestamp()) {
+    let now = chrono::Utc::now().timestamp();
+    let ticked = if idle { store.freezer.tick_idle(conn, now) } else { store.freezer.tick(conn, now) };
+    if let Err(e) = ticked {
         span.failed();
         eprintln!("freezing in shard {} failed: {e}", store.shard);
     }
