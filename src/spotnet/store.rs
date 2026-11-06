@@ -267,9 +267,16 @@ pub enum Placement {
 }
 
 /// Whether the release named `name` in `group`, if there is one, is the post a spot's NZB lists: tagged with the
-/// same NZB, or holding every message-id of `sample` (the first article of each file). A release that only shares
-/// the title, spot or not, is another post: a spot can't add articles to it.
-pub fn placement(conn: &Connection, name: &str, group: &str, nzb_key: &str, sample: &[String]) -> Result<Placement> {
+/// same NZB, or already holding every article of it, each in the file of the same name. Then the spot adds nothing
+/// and just tags it. Any other release with the name, spot or not, is another post: the spot can't add articles or
+/// files to it, and gets a name of its own.
+pub fn placement(
+    conn: &Connection,
+    name: &str,
+    group: &str,
+    nzb_key: &str,
+    files: &[(String, Vec<String>)],
+) -> Result<Placement> {
     let id: Option<i64> = conn
         .query_row("select id from releases where name = ? and group_name = ?", params![name, group], |r| r.get(0))
         .optional()?;
@@ -280,16 +287,22 @@ pub fn placement(conn: &Connection, name: &str, group: &str, nzb_key: &str, samp
     if same_nzb {
         return Ok(Placement::SamePost(id));
     }
-    if sample.is_empty() {
+    if files.is_empty() {
         return Ok(Placement::Taken);
     }
-    // every message-id of the release, sealed files' too, by their keyed hash
+    // every message-id of the release, sealed files' too, by their keyed hash, with the file it's in
     let key = crate::store::IdKey::of(conn)?;
     crate::store::index_release(conn, &key, id)?;
-    let mut has = conn.prepare_cached("select 1 from release_ids where release_id = ? and id_hash = ?")?;
-    for message_id in sample {
-        if !has.exists(params![id, key.hash(&format!("<{message_id}>"))])? {
-            return Ok(Placement::Taken);
+    let mut file_of = conn.prepare_cached(
+        "select f.filename from release_ids r join files f on f.id = r.file_id where r.release_id = ? and r.id_hash = ?",
+    )?;
+    for (filename, ids) in files {
+        for message_id in ids {
+            let found: Option<String> =
+                file_of.query_row(params![id, key.hash(&format!("<{message_id}>"))], |r| r.get(0)).optional()?;
+            if found.as_deref() != Some(filename.as_str()) {
+                return Ok(Placement::Taken);
+            }
         }
     }
     Ok(Placement::SamePost(id))
@@ -512,7 +525,7 @@ mod tests {
         let path = tempfile::tempdir().unwrap();
         let shard = path.path().join("s.db");
         crate::store::create_shard(&shard).unwrap();
-        let conn = crate::db::open_shard(&shard).unwrap();
+        let mut conn = crate::db::open_shard(&shard).unwrap();
         let mut writer = crate::store::ShardWriter::new(0);
         let ids = crate::store::Ids::new(&path.path().join("main.db"));
         let main = Connection::open(path.path().join("main.db")).unwrap();
@@ -531,27 +544,22 @@ mod tests {
             articles: vec![article("a@x", "a.mkv"), article("b@x", "b.par2")],
             ..Default::default()
         };
-        let mut conn = conn;
         writer.save(&mut conn, &ids, [std::slice::from_ref(&release)]).unwrap();
-        let sample = |l: &[&str]| l.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        assert_eq!(placement(&conn, "Other", "alt.binaries.g", "k", &sample(&["a@x"])).unwrap(), Placement::Free);
-        let Placement::SamePost(id) =
-            placement(&conn, "Title", "alt.binaries.g", "k", &sample(&["a@x", "b@x"])).unwrap()
-        else {
-            panic!("the same post")
+        let files = |l: &[(&str, &str)]| -> Vec<(String, Vec<String>)> {
+            l.iter().map(|(f, id)| (f.to_string(), vec![id.to_string()])).collect()
         };
-        // one article it doesn't have, or nothing to tell by: another post under the same title
-        assert_eq!(
-            placement(&conn, "Title", "alt.binaries.g", "k", &sample(&["a@x", "evil@x"])).unwrap(),
-            Placement::Taken
-        );
-        assert_eq!(placement(&conn, "Title", "alt.binaries.g", "k", &[]).unwrap(), Placement::Taken);
+        let place = |l: &[(&str, &str)]| placement(&conn, "Title", "alt.binaries.g", "k", &files(l)).unwrap();
+        let other = placement(&conn, "Other", "alt.binaries.g", "k", &files(&[("a.mkv", "a@x")])).unwrap();
+        assert_eq!(other, Placement::Free);
+        let Placement::SamePost(id) = place(&[("a.mkv", "a@x"), ("b.par2", "b@x")]) else { panic!("the same post") };
+        // an article it doesn't have, a real article under another file's name, or nothing to tell by
+        assert_eq!(place(&[("a.mkv", "a@x"), ("evil.mkv", "evil@x")]), Placement::Taken);
+        assert_eq!(place(&[("setup.exe", "a@x")]), Placement::Taken);
+        assert_eq!(place(&[]), Placement::Taken);
         // tagged with the same NZB: the same post
-        conn.execute(
-            "insert into spots (release_id, message_id, kind, title, nzb_key) values (?, 'm', 'movie', 'T', 'k')",
-            [id],
-        )
-        .unwrap();
-        assert_eq!(placement(&conn, "Title", "alt.binaries.g", "k", &[]).unwrap(), Placement::SamePost(id));
+        let tag_it =
+            "insert into spots (release_id, message_id, kind, title, nzb_key) values (?, 'm', 'movie', 'T', 'k')";
+        conn.execute(tag_it, [id]).unwrap();
+        assert_eq!(place(&[]), Placement::SamePost(id));
     }
 }
