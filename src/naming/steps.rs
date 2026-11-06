@@ -92,6 +92,15 @@ impl Step for NfoName {
     fn applies(&self, r: &ReleaseInfo) -> bool {
         effective_source(r) <= NameSource::Nfo as i64 && judge(current_name(r)) < Grade::Good
     }
+    fn skip_reason(&self, r: &ReleaseInfo) -> Option<&'static str> {
+        if effective_source(r) > NameSource::Nfo as i64 {
+            Some("its name came from something surer than an NFO")
+        } else if judge(current_name(r)) >= Grade::Good {
+            Some("its name is already good: an NFO can't better it")
+        } else {
+            None
+        }
+    }
     fn reruns(&self) -> Reruns {
         Reruns { on_rename: false, on_growth: true }
     }
@@ -159,13 +168,29 @@ impl Step for NfoName {
         let files = ctx.files().map_err(retry)?;
         let par2_names = archive::select::par2_name_map(ctx.conn(), rel_id, &files);
         let check = archive::store::local_password_check(ctx.conn(), rel_id);
+        let mut pw_known = !writes.is_empty();
+        // an NFO the probe or another step read is used as it was kept, not fetched again
+        let mut kept = crate::probe::nfo_store::stored(ctx.conn(), rel_id);
         for file in archive::select::nfo_sources_with_par2(&files, &par2_names) {
-            let Some(seg) = first_article(ctx, file)? else { continue };
-            let Some(body) = fetch_one(ctx, &seg, &file.filename)? else { continue };
-            let decoded = crate::probe::nfo_text(&body);
-            if writes.is_empty()
+            let par2_name = par2_names.get(&file.filename).map(String::as_str);
+            let reused = match &kept {
+                Some(k) if k.is_of(&file.filename, par2_name) => kept.take(),
+                _ => None,
+            };
+            let (decoded, body) = match reused {
+                Some(k) => (k.text, None),
+                None => {
+                    let Some(seg) = first_article(ctx, file)? else { continue };
+                    let Some(body) = fetch_one(ctx, &seg, &file.filename)? else { continue };
+                    let decoded = crate::probe::nfo_text(&body);
+                    writes.push(crate::probe::nfo_store::keep(rel_id, &file.filename, &decoded));
+                    (decoded, Some(body))
+                }
+            };
+            if !pw_known
                 && let Some(password) = release_info::find_verified_password([decoded.as_str()], &[], check.as_ref())
             {
+                pw_known = true;
                 crate::raw_store::put_nfo_password(&rel_name, &rel_group, &content_id, &password);
                 if existing_db_pw.as_deref() != Some(password.as_str()) {
                     if names_hidden {
@@ -178,7 +203,8 @@ impl Step for NfoName {
                 let params = vec![rel_id.into(), password.into()];
                 writes.push(StepWrite::new(archive::store::SET_NFO_PASSWORD, params));
             }
-            let found = nfo::name_candidates(&body).into_iter().find(|n| improves(ctx.release(), n, NameSource::Nfo));
+            let bytes = body.as_deref().unwrap_or(decoded.as_bytes());
+            let found = nfo::name_candidates(bytes).into_iter().find(|n| improves(ctx.release(), n, NameSource::Nfo));
             if let Some(name) = found {
                 let change =
                     NameChange { display_name: Some(name), obfuscated: Some(false), source: NameSource::Nfo.value() };

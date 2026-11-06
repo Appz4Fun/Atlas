@@ -615,8 +615,10 @@ fn an_nfo_names_a_release_nothing_else_named() {
     let s = shape("x").one("x.nfo", b"Release Name: Real Name 2024\n").dark("x.mkv", 1, 3);
     let state = serve(&mut h, &s, config());
     settled(&h, "x");
-    assert_eq!(bodies(&state), 1);
     assert_eq!(naming(&h, "x"), (Some("Real Name 2024".into()), Some(10)));
+    // the probe, first by rank, read the NFO (an ARTICLE): the name step uses its copy, no BODY of its own
+    assert_eq!(bodies(&state), 0);
+    assert_eq!(state.articles_sent.load(Ordering::SeqCst), 2, "the NFO once, and the video's first article");
 }
 
 #[test]

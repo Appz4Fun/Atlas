@@ -308,7 +308,44 @@ fn nfo_runs_with_naming_off() {
     start(&mut h, c, steps::all(), Some(port));
     wait_for("the name", || row(&h, STAGE_GROUP, "x").2 == Some(10));
     assert_eq!(row(&h, STAGE_GROUP, "x").1.as_deref(), Some("Real Name 2024 1080p"));
+    // the probe, first by rank, read the NFO (an ARTICLE): the step names it from the probe's copy, no BODY of its own
+    assert_eq!(state.bodies_sent.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn an_nfo_is_fetched_once_and_kept() {
+    let mut h = fresh();
+    let state = nfo_shape(&h);
+    let port = spawn_server(state.clone());
+    let mut c = with_bodies();
+    c.naming = NamingConfig { enabled: false, ..Default::default() };
+    start(&mut h, c, vec![Arc::new(atlas::naming::steps::NfoName)], Some(port));
+    wait_for("the name", || row(&h, STAGE_GROUP, "x").2 == Some(10));
     assert_eq!(state.bodies_sent.load(Ordering::SeqCst), 1);
+    let (id, ..) = row(&h, STAGE_GROUP, "x");
+    let kept = atlas::probe::nfo_store::stored(&conn_of(&h, STAGE_GROUP), id).expect("the NFO is kept");
+    assert_eq!(kept.file.as_deref(), Some("x.nfo"));
+    assert!(kept.text.contains("Real Name 2024 1080p"));
+}
+
+#[test]
+fn an_nfo_the_probe_read_isnt_fetched_again() {
+    let mut h = fresh();
+    let state = nfo_shape(&h);
+    let (id, ..) = row(&h, STAGE_GROUP, "x");
+    conn_of(&h, STAGE_GROUP)
+        .execute(
+            "insert into release_probe (release_id, info) values (?1, ?2)",
+            params![id, r#"{"nfo":"Release Name: Real Name 2024 1080p\n","nfo_file":"x.nfo"}"#],
+        )
+        .unwrap();
+    let port = spawn_server(state.clone());
+    let mut c = with_bodies();
+    c.naming = NamingConfig { enabled: false, ..Default::default() };
+    start(&mut h, c, vec![Arc::new(atlas::naming::steps::NfoName)], Some(port));
+    wait_for("the name", || row(&h, STAGE_GROUP, "x").2 == Some(10));
+    assert_eq!(row(&h, STAGE_GROUP, "x").1.as_deref(), Some("Real Name 2024 1080p"));
+    assert_eq!(state.bodies_sent.load(Ordering::SeqCst), 0, "the probe's NFO is used");
 }
 
 #[test]
@@ -337,7 +374,13 @@ fn an_nfo_never_beats_a_better_source() {
         ..Default::default()
     };
     assert!(!NfoName.applies(&r));
-    assert!(NfoName.applies(&ReleaseInfo { name: "x".into(), ..Default::default() }));
+    assert_eq!(NfoName.skip_reason(&r), Some("its name came from something surer than an NFO"));
+    let good = ReleaseInfo { name: "Real.Movie.2024.1080p.WEB-DL.x264-GRP".into(), ..Default::default() };
+    assert!(!NfoName.applies(&good));
+    assert_eq!(NfoName.skip_reason(&good), Some("its name is already good: an NFO can't better it"));
+    let weak = ReleaseInfo { name: "x".into(), ..Default::default() };
+    assert!(NfoName.applies(&weak));
+    assert_eq!(NfoName.skip_reason(&weak), None);
 }
 
 #[test]

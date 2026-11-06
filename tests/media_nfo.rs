@@ -128,6 +128,36 @@ fn an_nfo_gives_the_imdb_id() {
 }
 
 #[test]
+fn a_fetched_nfo_is_kept() {
+    let mut h = fresh();
+    let r = [with_nfo(FILM)];
+    h.save(&r);
+    let state = Server::new(posts_of(&r, STATED));
+    run_with(&mut h, &state, budget(600), MediaConfig::default());
+    wait_for("the id", || imdb(&h, FILM) == Some(200002));
+    let kept = atlas::probe::nfo_store::stored(&h.shard(), h.id_of(FILM)).expect("the NFO is kept");
+    assert_eq!(kept.file.as_deref(), Some("some.nfo"));
+    assert!(kept.text.contains("tt0200002"));
+}
+
+#[test]
+fn a_kept_nfo_spends_no_body() {
+    let mut h = fresh();
+    let r = [with_nfo(FILM)];
+    h.save(&r);
+    h.shard()
+        .execute(
+            "insert into release_nfo (release_id, file, text) values (?1, 'some.nfo', ?2)",
+            rusqlite::params![h.id_of(FILM), std::str::from_utf8(STATED).unwrap()],
+        )
+        .unwrap();
+    let state = Server::new(posts_of(&r, STATED));
+    run_with(&mut h, &state, budget(600), MediaConfig::default());
+    wait_for("the id", || imdb(&h, FILM) == Some(200002));
+    assert_eq!(bodies(&state), 0, "the kept NFO is read, not fetched");
+}
+
+#[test]
 fn tv_never_fetches() {
     let name = "Some.Show.S01E02.720p.HDTV.x264-GRP";
     let mut h = fresh();
