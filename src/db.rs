@@ -230,8 +230,10 @@ pub fn checkpointer(stop: std::sync::Arc<std::sync::atomic::AtomicBool>) -> std:
             }
         }
 
-        // leave small wals behind
+        // leave small wals behind, where nothing holds them: a file still busy (a reader, or a writer still there)
+        // is left as it is, the next start checkpoints it, rather than each one waiting out the 30s busy timeout
         for (conn, _) in &conns {
+            let _ = conn.busy_timeout(Duration::ZERO);
             let _ = conn.query_row("pragma wal_checkpoint(truncate)", [], |_| Ok(()));
         }
     })

@@ -771,6 +771,17 @@ async fn worker(sched: Arc<Scheduler>, server: usize, db: Db) {
     }
 }
 
+/// `fut` as a task named `name`: one that ends more than a second after the stop was asked for (`since`) says so,
+/// soo a slow stop shows which task held it.
+async fn named_task(name: String, since: Arc<OnceLock<Instant>>, fut: impl std::future::Future<Output = ()>) {
+    fut.await;
+    if let Some(at) = since.get()
+        && at.elapsed() > Duration::from_secs(1)
+    {
+        println!("[STOP] {name} ended {:.1}s after the stop", at.elapsed().as_secs_f64());
+    }
+}
+
 /// Keeps `Scheduler::media` to what the counts say (see `repair::count_media_every`).
 async fn follow_media(sched: Arc<Scheduler>, db: Db) {
     while !sched.stopping() {
@@ -971,6 +982,13 @@ async fn run_servers(
 
     crate::archive::sync_inline_lookups(config);
     let mut tasks = tokio::task::JoinSet::new();
+    // when the stop was asked for: each task that ends past it says when (`named`)
+    let stopping_since: Arc<OnceLock<Instant>> = Arc::new(OnceLock::new());
+    macro_rules! named {
+        ($name:expr, $fut:expr $(,)?) => {
+            named_task($name, stopping_since.clone(), $fut)
+        };
+    }
     // before the stage: its step reads this file, and a missing one is an error it would spend attempts on
     if config.predb.enabled
         && let Err(e) = crate::predb::db::create(&paths::predb_database())
@@ -988,7 +1006,7 @@ async fn run_servers(
         });
         let _ = sched.stage.set(stage.clone());
         let s = sched.clone();
-        tasks.spawn(crate::postprocess::run(stage, move || s.stopping()));
+        tasks.spawn(named!("the stage".into(), crate::postprocess::run(stage, move || s.stopping())));
     }
     if config.predb.enabled {
         let started = crate::predb::Service::start(crate::predb::ServiceParams {
@@ -1002,18 +1020,22 @@ async fn run_servers(
                 let _ = sched.predb.set(service.clone());
                 let s = sched.clone();
                 // in `tasks`: no connection of its outlives this, soo a compaction's checkpoint never meets one
-                tasks.spawn(crate::predb::run(service, move || s.stopping()));
+                tasks.spawn(named!("predb".into(), crate::predb::run(service, move || s.stopping())));
             }
             Err(e) => eprintln!("predb: {e:#}"),
         }
     }
     if config.postprocess.enabled && config.media.any_provider() {
         let s = sched.clone();
-        tasks.spawn(crate::media::run(crate::media::shared(), db.clone(), move || s.stopping()));
+        tasks
+            .spawn(named!("media".into(), crate::media::run(crate::media::shared(), db.clone(), move || s.stopping())));
     }
     for &(server, count) in &plan {
         for _ in 0..count {
-            tasks.spawn(worker(sched.clone(), server, db.clone()));
+            tasks.spawn(named!(
+                format!("a worker on {}", sched.ctx.pool.host(server)),
+                worker(sched.clone(), server, db.clone()),
+            ));
         }
     }
     // set once stopping: the long scans of every shard (`repair::reading_until`) give up instead of holding the stop
@@ -1021,24 +1043,23 @@ async fn run_servers(
     // which groups the big releases come from, for the backfill to take first, and the live passes
     {
         let s = sched.clone();
-        tasks.spawn(crate::repair::count_media_every(db.clone(), move || s.stopping(), scans_stop.clone()));
-        tasks.spawn(follow_media(sched.clone(), db.clone()));
+        tasks.spawn(named!(
+            "the count of big releases".into(),
+            crate::repair::count_media_every(db.clone(), move || s.stopping(), scans_stop.clone()),
+        ));
+        tasks.spawn(named!("follow_media".into(), follow_media(sched.clone(), db.clone())));
     }
     // parts one server's listing left out, read again from another (see `repair`)
     if sched.ctx.pool.indexing_servers().len() > 1 {
         let s = sched.clone();
         let settings = settings_of(config);
-        tasks.spawn(crate::repair::run(
-            sched.ctx.clone(),
-            settings,
-            db.clone(),
-            move || s.stopping(),
-            scans_stop.clone(),
+        tasks.spawn(named!(
+            "repair".into(),
+            crate::repair::run(sched.ctx.clone(), settings, db.clone(), move || s.stopping(), scans_stop.clone()),
         ));
     }
     // once stopping, the writers do no freezing: their queues of saves drain as fast as they did before it
     let s = sched.clone();
-    let stopping_since = Arc::new(OnceLock::new());
     let since = stopping_since.clone();
     tasks.spawn(async move {
         while !s.stopping() {
@@ -1048,9 +1069,9 @@ async fn run_servers(
         scans_stop.store(true, Ordering::Relaxed);
         crate::frozen::STOPPING.store(true, Ordering::Relaxed);
     });
-    tasks.spawn(watch_config(sched.clone(), servers));
-    tasks.spawn(report(sched.clone()));
-    tasks.spawn(compact_timer(sched.clone()));
+    tasks.spawn(named!("the config watcher".into(), watch_config(sched.clone(), servers)));
+    tasks.spawn(named!("the status report".into(), report(sched.clone())));
+    tasks.spawn(named!("the compaction timer".into(), compact_timer(sched.clone())));
 
     // the workers and the config watcher all stop on `stopping()`
     while tasks.join_next().await.is_some() {
@@ -1066,12 +1087,13 @@ async fn run_servers(
     };
     stop_log("workers, the stage and the other tasks done");
 
+    // the last clone of the db waits for the writers (one may be sealing); the checkpointer goes on meanwhile
+    let _ = tokio::task::spawn_blocking(move || drop(db)).await;
+    stop_log("writers drained");
+    // its last checkpoints after the writers: with them still writing, each waited out its busy timeout
     checkpoint_stop.store(true, Ordering::Relaxed);
     let _ = tokio::task::spawn_blocking(move || checkpointer.join()).await;
     stop_log("checkpointer done");
-    // the last clone of the db waits for the writers (one may be sealing)
-    let _ = tokio::task::spawn_blocking(move || drop(db)).await;
-    stop_log("writers drained");
     sched.compact_due.load(Ordering::Relaxed)
 }
 
