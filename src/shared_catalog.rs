@@ -215,22 +215,17 @@ impl Table {
         format!("select {} from {} where {}", cols.join(", "), quote(&self.name), wh.join(" and "))
     }
 
-    /// The next `?3` rows after a key, in key order: `?1` (and `?2`) the last key of the page before, null for the
-    /// first page.
-    fn page_sql(&self) -> String {
+    /// A page of `?1` rows in key order: the first page, or (`first` false) the rows after the key `?2` (and `?3`)
+    /// that ended the page before. Two statements, so SQLite seeks to the key instead of scanning up to it.
+    fn page_sql(&self, first: bool) -> String {
         let cols: Vec<String> = self.cols.iter().map(|(c, _)| quote(c)).collect();
         let key: Vec<String> = self.key.iter().map(|c| quote(c)).collect();
-        let after = if key.len() == 2 {
-            format!("?1 is null or ({}, {}) > (?1, ?2)", key[0], key[1])
-        } else {
-            format!("?1 is null or {} > ?1", key[0])
+        let after = match (first, key.len()) {
+            (true, _) => String::new(),
+            (false, 2) => format!(" where ({}, {}) > (?2, ?3)", key[0], key[1]),
+            (false, _) => format!(" where {} > ?2", key[0]),
         };
-        format!(
-            "select {} from {} where {after} order by {} limit ?3",
-            cols.join(", "),
-            quote(&self.name),
-            key.join(", ")
-        )
+        format!("select {} from {}{after} order by {} limit ?1", cols.join(", "), quote(&self.name), key.join(", "))
     }
 
     /// Where a key is among the columns.
@@ -252,6 +247,11 @@ impl Table {
             quote(&self.name),
             key.join(", ")
         )
+    }
+
+    /// Postgres: `select ... for update` of one row this shard sent, by its key.
+    fn lock_sql(&self) -> String {
+        self.delete_sql().replacen("delete from", "select 1 from", 1) + " for update"
     }
 
     fn exists_sql(&self) -> String {
@@ -401,6 +401,8 @@ pub struct Change {
 pub struct Batch {
     pub max_seq: i64,
     pub changes: usize,
+    /// stopped at the change limit or the byte budget: more is waiting
+    pub full: bool,
     pub upserts: BTreeMap<String, Vec<Vec<Value>>>,
     pub deletes: BTreeMap<String, Vec<Vec<Value>>>,
 }
@@ -411,9 +413,14 @@ impl Batch {
     }
 }
 
-/// Reads up to `limit` changes and the rows they point at, in one read transaction so the rows are at least as new
-/// as every change read.
-pub fn read_batch(conn: &Connection, tables: &[Table], limit: usize) -> rusqlite::Result<Batch> {
+/// The most row bytes one batch holds: rows can carry long texts (an NFO keeps up to 256 Ki characters), so a
+/// backlog of them is sent in pieces rather than all at once.
+pub const BATCH_BYTES: usize = 32 << 20;
+
+/// Reads changes in order, up to `limit` of them or until the rows they point at come to `max_bytes`, and those
+/// rows, in one read transaction so the rows are at least as new as every change read. `max_seq` is the last
+/// change taken; a batch that stopped early says so in `full`.
+pub fn read_batch(conn: &Connection, tables: &[Table], limit: usize, max_bytes: usize) -> rusqlite::Result<Batch> {
     let tx = conn.unchecked_transaction()?;
     let mut changes = Vec::new();
     {
@@ -423,39 +430,53 @@ pub fn read_batch(conn: &Connection, tables: &[Table], limit: usize) -> rusqlite
             changes.push(Change { seq: r.get(0)?, tbl: r.get(1)?, k1: r.get(2)?, k2: r.get(3)? });
         }
     }
-    let mut batch = Batch { changes: changes.len(), ..Default::default() };
-    batch.max_seq = changes.last().map_or(0, |c| c.seq);
+    let mut batch = Batch { full: changes.len() >= limit, ..Default::default() };
     // each key once: the row as it is now covers every change to it
-    let mut keys: BTreeMap<&str, BTreeSet<(KeyPart, KeyPart)>> = BTreeMap::new();
+    let mut seen: BTreeSet<(String, KeyPart, KeyPart)> = BTreeSet::new();
+    let mut bytes = 0usize;
     for c in &changes {
-        keys.entry(c.tbl.as_str()).or_default().insert((KeyPart::of(&c.k1), KeyPart::of(&c.k2)));
-    }
-    for (name, set) in keys {
-        let Some(t) = tables.iter().find(|t| t.name == name) else { continue };
+        if bytes >= max_bytes {
+            batch.full = true;
+            break;
+        }
+        batch.changes += 1;
+        batch.max_seq = c.seq;
+        if !seen.insert((c.tbl.clone(), KeyPart::of(&c.k1), KeyPart::of(&c.k2))) {
+            continue;
+        }
+        let Some(t) = tables.iter().find(|t| t.name == c.tbl) else { continue };
         let mut stmt = tx.prepare_cached(&t.select_sql())?;
-        for (k1, k2) in set {
-            let (k1, k2) = (k1.value(), k2.value());
-            let found: Option<Vec<Value>> = {
-                let mut rows = if t.key.len() == 2 { stmt.query(params![k1, k2])? } else { stmt.query(params![k1])? };
-                match rows.next()? {
-                    Some(r) => Some((0..t.cols.len()).map(|i| r.get::<_, Value>(i)).collect::<rusqlite::Result<_>>()?),
-                    None => None,
+        let found: Option<Vec<Value>> = {
+            let mut rows = if t.key.len() == 2 { stmt.query(params![c.k1, c.k2])? } else { stmt.query(params![c.k1])? };
+            match rows.next()? {
+                Some(r) => Some((0..t.cols.len()).map(|i| r.get::<_, Value>(i)).collect::<rusqlite::Result<_>>()?),
+                None => None,
+            }
+        };
+        match found {
+            Some(row) => {
+                bytes += row.iter().map(value_bytes).sum::<usize>();
+                batch.upserts.entry(t.name.clone()).or_default().push(row);
+            }
+            None => {
+                let mut key = vec![c.k1.clone()];
+                if t.key.len() == 2 {
+                    key.push(c.k2.clone());
                 }
-            };
-            match found {
-                Some(row) => batch.upserts.entry(name.to_string()).or_default().push(row),
-                None => {
-                    let mut key = vec![k1];
-                    if t.key.len() == 2 {
-                        key.push(k2);
-                    }
-                    batch.deletes.entry(name.to_string()).or_default().push(key);
-                }
+                batch.deletes.entry(t.name.clone()).or_default().push(key);
             }
         }
     }
     tx.commit()?;
     Ok(batch)
+}
+
+fn value_bytes(v: &Value) -> usize {
+    match v {
+        Value::Text(s) => s.len(),
+        Value::Blob(b) => b.len(),
+        _ => 8,
+    }
 }
 
 /// An outbox key, ordered and deduplicated whatever its type.
@@ -476,16 +497,6 @@ impl KeyPart {
             Value::Real(f) => KeyPart::Real(f.to_bits()),
             Value::Text(s) => KeyPart::Text(s.clone()),
             Value::Blob(b) => KeyPart::Blob(b.clone()),
-        }
-    }
-
-    fn value(self) -> Value {
-        match self {
-            KeyPart::Null => Value::Null,
-            KeyPart::Int(i) => Value::Integer(i),
-            KeyPart::Real(b) => Value::Real(f64::from_bits(b)),
-            KeyPart::Text(s) => Value::Text(s),
-            KeyPart::Blob(b) => Value::Blob(b),
         }
     }
 }
@@ -652,31 +663,74 @@ fn publish(
     config: &SharedCatalogConfig,
     stop: &AtomicBool,
 ) -> anyhow::Result<()> {
-    let mut open = Vec::new();
+    let mut open: Vec<Open> = Vec::new();
     for (shard, path) in shards {
-        let conn = crate::db::open_shard(path)?;
-        let tables = tables(&conn)?;
-        ensure_schema(pg, &tables)?;
-        open.push((*shard, conn, tables));
+        open.push(Open::new(pg, *shard, path)?);
     }
     while !stop.load(Relaxed) {
         let mut busy = false;
-        for (shard, conn, tables) in &open {
-            let batch = read_batch(conn, tables, config.batch)?;
+        for o in &mut open {
+            // a compaction swaps the file in place: the connection would go on reading the old one
+            if o.replaced() {
+                *o = Open::new(pg, o.shard, &o.path)?;
+            }
+            let batch = read_batch(&o.conn, &o.tables, config.batch, BATCH_BYTES)?;
             if !batch.is_empty() {
-                let (up, del) = crate::metrics::timed("shared_catalog.send", || send(pg, *shard, tables, &batch))?;
-                ack(conn, batch.max_seq)?;
+                let (up, del) = crate::metrics::timed("shared_catalog.send", || send(pg, o.shard, &o.tables, &batch))?;
+                ack(&o.conn, batch.max_seq)?;
                 names::SHARED_CATALOG_ROWS.inc(&[("op", "upsert")], up);
                 names::SHARED_CATALOG_ROWS.inc(&[("op", "delete")], del);
-                busy |= batch.changes >= config.batch;
+                busy |= batch.full;
             }
-            outbox_gauges(*shard, conn);
+            outbox_gauges(o.shard, &o.conn);
         }
         if !busy {
             rest(stop, Duration::from_millis(config.interval_ms));
         }
     }
     Ok(())
+}
+
+/// A shard the publisher reads, and which file it opened.
+struct Open {
+    shard: usize,
+    path: PathBuf,
+    conn: Connection,
+    tables: Vec<Table>,
+    file: Option<FileId>,
+    opened: std::time::Instant,
+}
+
+impl Open {
+    fn new(pg: &mut postgres::Client, shard: usize, path: &Path) -> anyhow::Result<Open> {
+        let file = file_id(path);
+        let conn = crate::db::open_shard(path)?;
+        let tables = tables(&conn)?;
+        ensure_schema(pg, &tables)?;
+        Ok(Open { shard, path: path.to_path_buf(), conn, tables, file, opened: std::time::Instant::now() })
+    }
+
+    /// The path now names another file than the one open; where that can't be told, every 5 minutes.
+    fn replaced(&self) -> bool {
+        match (self.file, file_id(&self.path)) {
+            (Some(open), Some(now)) => open != now,
+            (Some(_), None) => false,
+            (None, _) => self.opened.elapsed() > Duration::from_secs(300),
+        }
+    }
+}
+
+type FileId = (u64, u64);
+
+#[cfg(unix)]
+fn file_id(path: &Path) -> Option<FileId> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()))
+}
+
+#[cfg(not(unix))]
+fn file_id(_path: &Path) -> Option<FileId> {
+    None
 }
 
 fn rest(stop: &AtomicBool, d: Duration) {
@@ -700,14 +754,19 @@ pub fn fill_shard(conn: &Connection, pg: &mut postgres::Client, shard: usize) ->
     ensure_schema(pg, &tables)?;
     let mut out = Vec::new();
     for t in &tables {
-        let (mut last, mut added) = ((Value::Null, Value::Null), 0u64);
+        let (mut last, mut added): (Option<Vec<Value>>, u64) = (None, 0);
         let width = t.cols.len() + 1;
         let key_at = t.key_at();
         loop {
             let rows: Vec<Vec<Value>> = {
                 let tx = conn.unchecked_transaction()?;
-                let mut stmt = tx.prepare_cached(&t.page_sql())?;
-                let mut rows = stmt.query(params![last.0, last.1, PAGE as i64])?;
+                let mut stmt = tx.prepare_cached(&t.page_sql(last.is_none()))?;
+                let mut rows = match last.as_deref() {
+                    None => stmt.query(params![PAGE as i64])?,
+                    Some([k1]) => stmt.query(params![PAGE as i64, k1])?,
+                    Some([k1, k2, ..]) => stmt.query(params![PAGE as i64, k1, k2])?,
+                    Some([]) => unreachable!("a key has a column"),
+                };
                 let mut page = Vec::new();
                 while let Some(r) = rows.next()? {
                     page.push((0..t.cols.len()).map(|i| r.get::<_, Value>(i)).collect::<rusqlite::Result<Vec<_>>>()?);
@@ -718,7 +777,7 @@ pub fn fill_shard(conn: &Connection, pg: &mut postgres::Client, shard: usize) ->
                 page
             };
             let Some(tail) = rows.last() else { break };
-            last = (tail[key_at[0]].clone(), key_at.get(1).map_or(Value::Null, |i| tail[*i].clone()));
+            last = Some(key_at.iter().map(|i| tail[*i].clone()).collect());
             let mut tx = pg.transaction()?;
             for chunk in rows.chunks(rows_per_statement(width)) {
                 let mut ps: Vec<Box<dyn postgres::types::ToSql + Sync + Send>> =
@@ -743,7 +802,8 @@ pub fn fill_shard(conn: &Connection, pg: &mut postgres::Client, shard: usize) ->
     Ok(out)
 }
 
-/// One table's rows in the shard and in Postgres, and the Postgres rows whose key the shard no longer has.
+/// One table's rows in the shard and in Postgres, and the Postgres rows whose key the shard no longer has (with
+/// `prune`, the ones deleted).
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Check {
     pub table: String,
@@ -772,7 +832,10 @@ pub fn check_shard(
         let mut stale = 0u64;
         let mut last: Option<Vec<Value>> = None;
         let mut exists = conn.prepare_cached(&t.exists_sql())?;
-        let del = pg.prepare(&t.delete_sql())?;
+        let mut in_shard = |key: &[Value]| -> rusqlite::Result<bool> {
+            if key.len() == 2 { exists.exists(params![key[0], key[1]]) } else { exists.exists(params![key[0]]) }
+        };
+        let (lock, del) = (pg.prepare(&t.lock_sql())?, pg.prepare(&t.delete_sql())?);
         loop {
             let mut ps: Vec<Box<dyn postgres::types::ToSql + Sync + Send>> =
                 vec![Box::new(shard_v), Box::new(PAGE as i64)];
@@ -786,20 +849,24 @@ pub fn check_shard(
             let n = rows.len();
             for r in &rows {
                 let key: Vec<Value> = (0..t.key.len()).map(|i| pg_to_value(r, i, t.key_type(i))).collect();
-                let found = if key.len() == 2 {
-                    exists.exists(params![key[0], key[1]])?
-                } else {
-                    exists.exists(params![key[0]])?
-                };
-                if !found {
-                    stale += 1;
-                    if prune {
-                        let mut dps: Vec<Box<dyn postgres::types::ToSql + Sync + Send>> = vec![Box::new(shard_v)];
+                if !in_shard(&key)? {
+                    if !prune {
+                        stale += 1;
+                    } else {
+                        // the Postgres row locked first, then the shard asked again: a publisher sending the key
+                        // back waits for this transaction, and one that sent it before the lock is seen by the
+                        // second look, soo a row put back meanwhile is never deleted
+                        let mut kps: Vec<Box<dyn postgres::types::ToSql + Sync + Send>> = vec![Box::new(shard_v)];
                         for (i, v) in key.iter().enumerate() {
-                            dps.push(pg_value(v, t.key_type(i)));
+                            kps.push(pg_value(v, t.key_type(i)));
                         }
-                        let drefs: Vec<&(dyn postgres::types::ToSql + Sync)> = dps.iter().map(|p| &**p as _).collect();
-                        pg.execute(&del, &drefs)?;
+                        let krefs: Vec<&(dyn postgres::types::ToSql + Sync)> = kps.iter().map(|p| &**p as _).collect();
+                        let mut tx = pg.transaction()?;
+                        if !tx.query(&lock, &krefs)?.is_empty() && !in_shard(&key)? {
+                            tx.execute(&del, &krefs)?;
+                            stale += 1;
+                        }
+                        tx.commit()?;
                     }
                 }
                 last = Some(key);
@@ -964,7 +1031,7 @@ mod tests {
         .unwrap();
         let outbox: i64 = conn.query_row("select count(*) from catalog_outbox", [], |r| r.get(0)).unwrap();
         assert_eq!(outbox, 9, "files is not copied");
-        let batch = read_batch(&conn, &tables(&conn).unwrap(), 100).unwrap();
+        let batch = read_batch(&conn, &tables(&conn).unwrap(), 100, BATCH_BYTES).unwrap();
         assert_eq!(batch.changes, 9);
         assert_eq!(
             batch.upserts["releases"],
@@ -975,7 +1042,7 @@ mod tests {
         assert_eq!(batch.upserts["par2_files"][0][1], Value::Blob(vec![1, 2]));
         assert_eq!(batch.upserts["collections"].len(), 1);
         assert_eq!(ack(&conn, batch.max_seq).unwrap(), 9);
-        assert!(read_batch(&conn, &tables(&conn).unwrap(), 100).unwrap().is_empty());
+        assert!(read_batch(&conn, &tables(&conn).unwrap(), 100, BATCH_BYTES).unwrap().is_empty());
     }
 
     #[test]
@@ -986,10 +1053,38 @@ mod tests {
             conn.execute("insert into releases (id, name) values (?1, 'x')", [i * 8]).unwrap();
         }
         let t = tables(&conn).unwrap();
-        let first = read_batch(&conn, &t, 3).unwrap();
+        let first = read_batch(&conn, &t, 3, BATCH_BYTES).unwrap();
         assert_eq!((first.changes, first.upserts["releases"].len()), (3, 3));
         ack(&conn, first.max_seq).unwrap();
-        assert_eq!(read_batch(&conn, &t, 3).unwrap().changes, 2);
+        assert_eq!(read_batch(&conn, &t, 3, BATCH_BYTES).unwrap().changes, 2);
+    }
+
+    #[test]
+    fn a_batch_of_long_rows_stops_at_its_byte_budget_and_the_rest_waits() {
+        let conn = shard();
+        sync_triggers(&conn, true).unwrap();
+        let long = "x".repeat(1000);
+        for i in 1..=10 {
+            conn.execute("insert into releases (id, name) values (?1, ?2)", params![i * 8, long]).unwrap();
+        }
+        let t = tables(&conn).unwrap();
+        let first = read_batch(&conn, &t, 100, 2500).unwrap();
+        assert_eq!((first.changes, first.upserts["releases"].len(), first.full), (3, 3, true));
+        ack(&conn, first.max_seq).unwrap();
+        let rest = read_batch(&conn, &t, 100, usize::MAX).unwrap();
+        assert_eq!((rest.changes, rest.full), (7, false));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_shard_swapped_in_place_is_noticed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.db");
+        std::fs::write(&path, b"a").unwrap();
+        let before = file_id(&path);
+        std::fs::write(dir.path().join("new.db"), b"b").unwrap();
+        std::fs::rename(dir.path().join("new.db"), &path).unwrap();
+        assert_ne!(before, file_id(&path));
     }
 
     #[test]
@@ -1102,23 +1197,43 @@ mod tests {
         .unwrap();
         let t = tables(&conn).unwrap();
         let par2 = t.iter().find(|t| t.name == "par2_files").unwrap();
-        let mut stmt = conn.prepare(&par2.page_sql()).unwrap();
-        let mut names = |a: Value, b: Value, n: i64| -> Vec<String> {
-            stmt.query_map(params![a, b, n], |r| r.get::<_, String>(2)).unwrap().map(|r| r.unwrap()).collect()
-        };
-        assert_eq!(names(Value::Null, Value::Null, 2), ["a", "b"]);
-        assert_eq!(names(Value::Integer(8), Value::Blob(vec![2]), 2), ["c"]);
+        let first: Vec<String> = conn
+            .prepare(&par2.page_sql(true))
+            .unwrap()
+            .query_map(params![2], |r| r.get::<_, String>(2))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(first, ["a", "b"]);
+        let next: Vec<String> = conn
+            .prepare(&par2.page_sql(false))
+            .unwrap()
+            .query_map(params![2, 8, vec![2u8]], |r| r.get::<_, String>(2))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(next, ["c"]);
+        for (t, first) in [(par2, false), (par2, true)] {
+            let plan: String = conn
+                .query_row(&format!("explain query plan {}", t.page_sql(first)), params![1, 8, vec![2u8]], |r| r.get(3))
+                .unwrap_or_default();
+            assert!(first || plan.starts_with("SEARCH"), "a later page seeks: {plan}");
+        }
         let rel = t.iter().find(|t| t.name == "releases").unwrap();
         assert_eq!(rel.key_at(), [0]);
         let ids: Vec<i64> = conn
-            .prepare(&rel.page_sql())
+            .prepare(&rel.page_sql(false))
             .unwrap()
-            .query_map(params![8, Value::Null, 10], |r| r.get(0))
+            .query_map(params![10, 8], |r| r.get(0))
             .unwrap()
             .map(|r| r.unwrap())
             .collect();
         assert_eq!(ids, [16, 24]);
         assert!(rel.insert_missing_sql(1).ends_with("on conflict (\"id\") do nothing"));
+        assert_eq!(
+            par2.lock_sql(),
+            "select 1 from \"par2_files\" where shard = $1 and \"release_id\" = $2 and \"file_id\" = $3 for update"
+        );
         assert!(par2.pg_keys_sql(false).contains("and (\"release_id\", \"file_id\") > ($3, $4)"));
     }
 
@@ -1176,12 +1291,12 @@ mod tests {
              insert into nzb_pointed values (8);",
         )
         .unwrap();
-        let batch = read_batch(&conn, &t, 100).unwrap();
+        let batch = read_batch(&conn, &t, 100, BATCH_BYTES).unwrap();
         assert_eq!(send(&mut pg, 3, &t, &batch).unwrap(), (5, 0));
         assert_eq!(send(&mut pg, 3, &t, &batch).unwrap(), (5, 0), "sent again after a crash: same rows");
         ack(&conn, batch.max_seq).unwrap();
         conn.execute_batch("delete from releases where id = 16; update releases set size = 9 where id = 8;").unwrap();
-        let batch = read_batch(&conn, &t, 100).unwrap();
+        let batch = read_batch(&conn, &t, 100, BATCH_BYTES).unwrap();
         assert_eq!(send(&mut pg, 3, &t, &batch).unwrap(), (1, 1));
         let row = pg.query_one("select shard, name, size from releases", &[]).unwrap();
         assert_eq!((row.get::<_, i16>(0), row.get::<_, String>(1), row.get::<_, i64>(2)), (3, "a".into(), 9));
