@@ -492,6 +492,7 @@ pub fn send(
 ) -> Result<(u64, u64), postgres::Error> {
     let shard_v: i16 = shard as i16;
     let mut tx = pg.transaction()?;
+    lock_shard(&mut tx, shard)?;
     let (mut up, mut del) = (0u64, 0u64);
     for (name, rows) in &batch.upserts {
         let Some(t) = tables.iter().find(|t| &t.name == name) else { continue };
@@ -526,6 +527,16 @@ pub fn send(
     Ok((up, del))
 }
 
+/// The first half of the advisory lock key: a shard's writes to Postgres hold the lock (this, shard) for their
+/// transaction, soo a fill that reads the shard while holding it can't be overtaken by an older batch.
+const LOCK_KEY: i32 = 0x4174_6c61;
+
+/// Holds the shard's advisory lock until the transaction ends.
+pub fn lock_shard(tx: &mut postgres::Transaction<'_>, shard: usize) -> Result<(), postgres::Error> {
+    tx.execute("select pg_advisory_xact_lock($1, $2)", &[&LOCK_KEY, &(shard as i32)])?;
+    Ok(())
+}
+
 /// Takes a sent batch out of the outbox.
 pub fn ack(conn: &Connection, max_seq: i64) -> rusqlite::Result<usize> {
     conn.execute(&format!("delete from {OUTBOX} where seq <= ?1"), [max_seq])
@@ -541,10 +552,18 @@ pub fn ensure_schema(pg: &mut postgres::Client, tables: &[Table]) -> Result<(), 
     Ok(())
 }
 
+/// Each shard's waiting changes and how long the oldest has waited, from the ends of the outbox only: a batch takes
+/// out a run of the oldest seqs, soo what's left is every seq from the first to the last.
 fn outbox_gauges(shard: usize, conn: &Connection) {
-    let (rows, oldest): (i64, Option<i64>) = conn
-        .query_row(&format!("select count(*), min(at) from {OUTBOX}"), [], |r| Ok((r.get(0)?, r.get(1)?)))
-        .unwrap_or((0, None));
+    let (first, last): (Option<i64>, Option<i64>) = conn
+        .query_row(&format!("select min(seq), max(seq) from {OUTBOX}"), [], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap_or((None, None));
+    let oldest: Option<i64> = first
+        .and_then(|seq| conn.query_row(&format!("select at from {OUTBOX} where seq = ?1"), [seq], |r| r.get(0)).ok());
+    let rows = match (first, last) {
+        (Some(a), Some(b)) => b - a + 1,
+        _ => 0,
+    };
     let s = shard.to_string();
     names::SHARED_CATALOG_OUTBOX.set(&[("shard", &s), ("kind", "rows")], rows as f64);
     let age = oldest.map_or(0.0, |at| (chrono::Utc::now().timestamp() - at).max(0) as f64);
@@ -588,7 +607,7 @@ pub fn run(main: &Path, config: &SharedCatalogConfig, stop: &AtomicBool) {
                 continue;
             }
         };
-        match publish(&mut pg, &shards, config, stop) {
+        match publish(&mut pg, main, &shards, config, stop) {
             Ok(()) => return,
             Err(e) => {
                 names::SHARED_CATALOG_FAILURES.inc(&[("stage", "publish")], 1);
@@ -600,80 +619,77 @@ pub fn run(main: &Path, config: &SharedCatalogConfig, stop: &AtomicBool) {
     }
 }
 
+/// How long the publisher keeps the shards open while it has a backlog before it lets go, soo a compaction waiting
+/// for them gets its turn.
+const SESSION: Duration = Duration::from_secs(60);
+
+/// The shards open, and the hold on compaction that keeps them from being swapped meanwhile. A compaction can't
+/// rename a shard someone has open on Windows, and on Unix an open connection would go on reading the original;
+/// soo the publisher opens them only while compaction is held off, and lets go when it has nothing to send or after
+/// `SESSION`.
+struct Session {
+    // dropped before the hold
+    open: Vec<(usize, Connection, Vec<Table>)>,
+    _hold: crate::compact::WriteGuard,
+    since: std::time::Instant,
+}
+
 fn publish(
     pg: &mut postgres::Client,
+    main: &Path,
     shards: &[(usize, PathBuf)],
     config: &SharedCatalogConfig,
     stop: &AtomicBool,
 ) -> anyhow::Result<()> {
-    let mut open: Vec<Open> = Vec::new();
-    for (shard, path) in shards {
-        open.push(Open::new(pg, *shard, path)?);
-    }
+    // the schema each shard last made sure of in Postgres: made again only when a shard's tables change
+    let mut ensured: BTreeMap<usize, Vec<Table>> = BTreeMap::new();
+    let mut gauges_at: Option<std::time::Instant> = None;
+    let mut session: Option<Session> = None;
     while !stop.load(Relaxed) {
-        let mut busy = false;
-        for o in &mut open {
-            // a compaction swaps the file in place: the connection would go on reading the old one
-            if o.replaced() {
-                *o = Open::new(pg, o.shard, &o.path)?;
+        if session.is_none() {
+            let Some(hold) = crate::compact::try_hold_off_compaction(main)? else {
+                // a compaction runs: wait for it
+                rest(stop, Duration::from_millis(config.interval_ms));
+                continue;
+            };
+            let mut open = Vec::new();
+            for (shard, path) in shards {
+                let conn = crate::db::open_shard(path)?;
+                let tables = tables(&conn)?;
+                if ensured.get(shard) != Some(&tables) {
+                    ensure_schema(pg, &tables)?;
+                    ensured.insert(*shard, tables.clone());
+                }
+                open.push((*shard, conn, tables));
             }
-            let batch = read_batch(&o.conn, &o.tables, config.batch, BATCH_BYTES)?;
+            session = Some(Session { open, _hold: hold, since: std::time::Instant::now() });
+        }
+        let Some(open) = session.as_ref().map(|s| &s.open) else { continue };
+        let mut busy = false;
+        for (shard, conn, tables) in open {
+            let batch = read_batch(conn, tables, config.batch, BATCH_BYTES)?;
             if !batch.is_empty() {
-                let (up, del) = crate::metrics::timed("shared_catalog.send", || send(pg, o.shard, &o.tables, &batch))?;
-                ack(&o.conn, batch.max_seq)?;
+                let (up, del) = crate::metrics::timed("shared_catalog.send", || send(pg, *shard, tables, &batch))?;
+                ack(conn, batch.max_seq)?;
                 names::SHARED_CATALOG_ROWS.inc(&[("op", "upsert")], up);
                 names::SHARED_CATALOG_ROWS.inc(&[("op", "delete")], del);
                 busy |= batch.full;
             }
-            outbox_gauges(o.shard, &o.conn);
+        }
+        if gauges_at.is_none_or(|at| at.elapsed() >= Duration::from_secs(30)) {
+            for (shard, conn, _) in open {
+                outbox_gauges(*shard, conn);
+            }
+            gauges_at = Some(std::time::Instant::now());
+        }
+        if !busy || session.as_ref().is_some_and(|s| s.since.elapsed() >= SESSION) {
+            session = None;
         }
         if !busy {
             rest(stop, Duration::from_millis(config.interval_ms));
         }
     }
     Ok(())
-}
-
-/// A shard the publisher reads, and which file it opened.
-struct Open {
-    shard: usize,
-    path: PathBuf,
-    conn: Connection,
-    tables: Vec<Table>,
-    file: Option<FileId>,
-    opened: std::time::Instant,
-}
-
-impl Open {
-    fn new(pg: &mut postgres::Client, shard: usize, path: &Path) -> anyhow::Result<Open> {
-        let file = file_id(path);
-        let conn = crate::db::open_shard(path)?;
-        let tables = tables(&conn)?;
-        ensure_schema(pg, &tables)?;
-        Ok(Open { shard, path: path.to_path_buf(), conn, tables, file, opened: std::time::Instant::now() })
-    }
-
-    /// The path now names another file than the one open; where that can't be told, every 5 minutes.
-    fn replaced(&self) -> bool {
-        match (self.file, file_id(&self.path)) {
-            (Some(open), Some(now)) => open != now,
-            (Some(_), None) => false,
-            (None, _) => self.opened.elapsed() > Duration::from_secs(300),
-        }
-    }
-}
-
-type FileId = (u64, u64);
-
-#[cfg(unix)]
-fn file_id(path: &Path) -> Option<FileId> {
-    use std::os::unix::fs::MetadataExt;
-    std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()))
-}
-
-#[cfg(not(unix))]
-fn file_id(_path: &Path) -> Option<FileId> {
-    None
 }
 
 fn rest(stop: &AtomicBool, d: Duration) {
@@ -689,6 +705,9 @@ fn rest(stop: &AtomicBool, d: Duration) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// the Postgres tests share one test database's tables
+    static PG: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn shard() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -774,18 +793,6 @@ mod tests {
         ack(&conn, first.max_seq).unwrap();
         let rest = read_batch(&conn, &t, 100, usize::MAX).unwrap();
         assert_eq!((rest.changes, rest.full), (7, false));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn a_shard_swapped_in_place_is_noticed() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("s.db");
-        std::fs::write(&path, b"a").unwrap();
-        let before = file_id(&path);
-        std::fs::write(dir.path().join("new.db"), b"b").unwrap();
-        std::fs::rename(dir.path().join("new.db"), &path).unwrap();
-        assert_ne!(before, file_id(&path));
     }
 
     #[test]
@@ -888,10 +895,60 @@ mod tests {
         assert!(!carry_outbox(&copy_conn).unwrap());
     }
 
+    /// Against a real Postgres when `ATLAS_CATALOG_TEST_URL` names an empty database to use: the publisher sends
+    /// what a real shard's triggers recorded, and waits while a compaction holds the database.
+    #[test]
+    fn the_publisher_sends_a_shards_changes_and_waits_out_a_compaction() {
+        let Ok(url) = std::env::var("ATLAS_CATALOG_TEST_URL") else { return };
+        let _one = PG.lock().unwrap_or_else(|e| e.into_inner());
+        let mut pg = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        crate::db::create_db_at(&main).unwrap();
+        let path = store::shard_path(&main, 5);
+        let conn = crate::db::open_at(&path).unwrap();
+        let names: Vec<String> = tables(&conn).unwrap().into_iter().map(|t| format!("\"{}\"", t.name)).collect();
+        pg.batch_execute(&format!("drop table if exists {}", names.join(", "))).unwrap();
+        sync_triggers(&conn, true).unwrap();
+        conn.execute("insert into releases (id, name, group_name) values (13, 'a', 'g')", []).unwrap();
+        let config = SharedCatalogConfig { enabled: true, url: url.clone(), interval_ms: 50, ..Default::default() };
+        let stop = Arc::new(AtomicBool::new(false));
+        let shards = vec![(5usize, path.clone())];
+        let queued: i64 = conn.query_row("select count(*) from catalog_outbox", [], |r| r.get(0)).unwrap();
+        assert!(queued >= 1);
+        let held = crate::compact::Lock::take(&main).unwrap();
+        let publisher = {
+            let (main, config, stop) = (main.clone(), config.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let mut pg = connect(&config).unwrap();
+                publish(&mut pg, &main, &shards, &config, &stop).unwrap();
+            })
+        };
+        std::thread::sleep(Duration::from_millis(500));
+        let waiting: i64 = conn.query_row("select count(*) from catalog_outbox", [], |r| r.get(0)).unwrap();
+        assert_eq!(waiting, queued, "nothing sent while a compaction holds the database");
+        drop(held);
+        let mut sent = 0i64;
+        for _ in 0..100 {
+            std::thread::sleep(Duration::from_millis(100));
+            sent = pg.query_one("select count(*) from releases where id = 13 and shard = 5", &[]).unwrap().get(0);
+            if sent == 1 {
+                break;
+            }
+        }
+        stop.store(true, Relaxed);
+        publisher.join().unwrap();
+        assert_eq!(sent, 1);
+        let waiting: i64 = conn.query_row("select count(*) from catalog_outbox", [], |r| r.get(0)).unwrap();
+        assert_eq!(waiting, 0);
+        pg.batch_execute(&format!("drop table if exists {}", names.join(", "))).unwrap();
+    }
+
     /// Against a real Postgres when `ATLAS_CATALOG_TEST_URL` names an empty database to use.
     #[test]
     fn a_batch_lands_in_postgres_and_lands_the_same_when_sent_twice() {
         let Ok(url) = std::env::var("ATLAS_CATALOG_TEST_URL") else { return };
+        let _one = PG.lock().unwrap_or_else(|e| e.into_inner());
         let mut pg = postgres::Client::connect(&url, postgres::NoTls).unwrap();
         pg.batch_execute("drop table if exists releases, collections, par2_files, nzb_pointed").unwrap();
         let conn = shard();
