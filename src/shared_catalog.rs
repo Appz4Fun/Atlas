@@ -305,11 +305,7 @@ pub fn tables(conn: &Connection) -> rusqlite::Result<Vec<Table>> {
 pub fn sync_triggers(conn: &Connection, on: bool) -> rusqlite::Result<()> {
     let tables = tables(conn)?;
     if on {
-        let mut sql = format!(
-            "create table if not exists {OUTBOX} (
-                seq INTEGER PRIMARY KEY, tbl TEXT NOT NULL, k1, k2, at INTEGER NOT NULL DEFAULT (unixepoch())
-             );"
-        );
+        let mut sql = outbox_ddl("main");
         for t in &tables {
             sql.push_str(&t.triggers());
         }
@@ -331,6 +327,63 @@ pub fn sync_triggers(conn: &Connection, on: bool) -> rusqlite::Result<()> {
         }
         sql.push_str(&format!("drop table if exists {OUTBOX};"));
         conn.execute_batch(&format!("begin; {sql} commit;"))
+    }
+}
+
+fn outbox_ddl(schema: &str) -> String {
+    format!(
+        "create table if not exists {schema}.{OUTBOX} (
+            seq INTEGER PRIMARY KEY, tbl TEXT NOT NULL, k1, k2, at INTEGER NOT NULL DEFAULT (unixepoch())
+         );"
+    )
+}
+
+/// For a compaction, which builds a shard afresh from the original attached as `old`: the original's waiting
+/// changes come along, and so do the releases the copy changed (dropping copies of articles takes their bytes off
+/// a release's size). Returns whether the original had the outbox, to put the triggers back once the copy has its
+/// indexes (`sync_triggers`).
+pub fn carry_outbox(conn: &Connection) -> rusqlite::Result<bool> {
+    let had: i64 = conn.query_row("select count(*) from old.sqlite_schema where name = ?1", [OUTBOX], |r| r.get(0))?;
+    if had == 0 {
+        return Ok(false);
+    }
+    conn.execute_batch(&format!(
+        "{ddl}
+         insert into main.{OUTBOX} (tbl, k1, k2, at) select tbl, k1, k2, at from old.{OUTBOX} order by seq;
+         insert into main.{OUTBOX} (tbl, k1, k2)
+         select 'releases', r.id, null from main.releases r join old.releases o on o.id = r.id
+         where r.size is not o.size;",
+        ddl = outbox_ddl("main"),
+    ))?;
+    Ok(true)
+}
+
+/// A Postgres connection. Unencrypted, so it's refused unless the host is this machine or a private network
+/// address written as a number, or `allow_plaintext` says the network is trusted.
+pub fn connect(config: &SharedCatalogConfig) -> anyhow::Result<postgres::Client> {
+    let pg: postgres::Config = config.url.parse()?;
+    if !config.allow_plaintext {
+        for host in pg.get_hosts() {
+            if let postgres::config::Host::Tcp(h) = host
+                && !private_host(h)
+            {
+                anyhow::bail!(
+                    "shared_catalog: {h} isn't a loopback or private network address; the connection isn't encrypted, set allow_plaintext = true only on a trusted network"
+                );
+            }
+        }
+    }
+    Ok(pg.connect(postgres::NoTls)?)
+}
+
+fn private_host(h: &str) -> bool {
+    if h.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    match h.trim_matches(|c| c == '[' || c == ']').parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(ip)) => ip.is_loopback() || ip.is_private() || ip.is_link_local(),
+        Ok(std::net::IpAddr::V6(ip)) => ip.is_loopback() || (ip.segments()[0] & 0xfe00) == 0xfc00,
+        Err(_) => false,
     }
 }
 
@@ -571,7 +624,7 @@ pub fn run(main: &Path, config: &SharedCatalogConfig, stop: &AtomicBool) {
         store::shard_paths(main).into_iter().enumerate().filter(|(_, p)| p.exists()).collect();
     let mut backoff = Duration::from_secs(1);
     while !stop.load(Relaxed) {
-        let mut pg = match postgres::Client::connect(&config.url, postgres::NoTls) {
+        let mut pg = match connect(config) {
             Ok(pg) => pg,
             Err(e) => {
                 names::SHARED_CATALOG_FAILURES.inc(&[("stage", "connect")], 1);
@@ -800,7 +853,7 @@ pub fn run_fill() -> i32 {
     }
     let result = (|| -> anyhow::Result<()> {
         let shards = armed_shards()?;
-        let mut pg = postgres::Client::connect(&config.url, postgres::NoTls)?;
+        let mut pg = connect(&config)?;
         for (shard, path) in shards {
             let started = std::time::Instant::now();
             let conn = crate::db::open_shard(&path)?;
@@ -831,7 +884,7 @@ pub fn run_check(prune: bool) -> i32 {
     }
     let result = (|| -> anyhow::Result<bool> {
         let shards = armed_shards()?;
-        let mut pg = postgres::Client::connect(&config.url, postgres::NoTls)?;
+        let mut pg = connect(&config)?;
         let mut clean = true;
         for (shard, path) in shards {
             let conn = crate::db::open_shard(&path)?;
@@ -980,6 +1033,63 @@ mod tests {
         assert_eq!(as_dbg(&Value::Null, PgType::Bytes), "None");
         assert_eq!(rows_per_statement(13), 500);
         assert_eq!(rows_per_statement(300), 200);
+    }
+
+    #[test]
+    fn plaintext_only_goes_to_this_machine_or_a_private_address_unless_allowed() {
+        for h in ["localhost", "127.0.0.1", "192.168.1.93", "10.0.0.2", "172.16.4.1", "::1", "[fd00::5]"] {
+            assert!(private_host(h), "{h}");
+        }
+        for h in ["db.example", "8.8.8.8", "2001:db8::1", "server"] {
+            assert!(!private_host(h), "{h}");
+        }
+        let mut c = SharedCatalogConfig {
+            enabled: true,
+            url: "host=db.example port=1 user=a dbname=b connect_timeout=1".into(),
+            ..Default::default()
+        };
+        let err = connect(&c).err().unwrap().to_string();
+        assert!(err.contains("isn't a loopback or private network address"), "{err}");
+        c.allow_plaintext = true;
+        let err = connect(&c).err().unwrap().to_string();
+        assert!(!err.contains("private network"), "allowed: it tries, and fails to reach it: {err}");
+    }
+
+    #[test]
+    fn a_compaction_carries_the_waiting_changes_and_the_releases_it_resized() {
+        let conn = shard();
+        sync_triggers(&conn, true).unwrap();
+        conn.execute_batch("insert into releases (id, name, size) values (8, 'a', 10), (16, 'b', 20);").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let copy = dir.path().join("copy.db");
+        let copy_conn = Connection::open(&copy).unwrap();
+        copy_conn
+            .execute_batch(
+                "create table releases (id INTEGER PRIMARY KEY, name TEXT, size INTEGER, posted_date TEXT);
+                 insert into releases (id, name, size) values (8, 'a', 7), (16, 'b', 20);",
+            )
+            .unwrap();
+        let orig = dir.path().join("orig.db");
+        conn.execute("vacuum into ?1", [orig.to_string_lossy()]).unwrap();
+        copy_conn.execute("attach database ?1 as old", [orig.to_string_lossy()]).unwrap();
+        assert!(carry_outbox(&copy_conn).unwrap());
+        let carried: Vec<(String, i64)> = copy_conn
+            .prepare("select tbl, k1 from catalog_outbox order by seq")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(carried, [("releases".into(), 8), ("releases".into(), 16), ("releases".into(), 8)]);
+        copy_conn.execute_batch("detach database old").unwrap();
+        // without one in the original, nothing to carry
+        let plain = dir.path().join("plain.db");
+        Connection::open(&plain)
+            .unwrap()
+            .execute_batch("create table releases (id INTEGER PRIMARY KEY, size INTEGER)")
+            .unwrap();
+        copy_conn.execute("attach database ?1 as old", [plain.to_string_lossy()]).unwrap();
+        assert!(!carry_outbox(&copy_conn).unwrap());
     }
 
     #[test]
