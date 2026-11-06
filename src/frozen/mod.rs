@@ -65,6 +65,9 @@ pub static PER_TICK: AtomicI64 = AtomicI64::new(200);
 pub static BACKLOG_PER_TICK: AtomicI64 = AtomicI64::new(2_000);
 /// `[freeze] tick_ms`: how long a tick may hold the writer
 pub static TICK_MS: AtomicI64 = AtomicI64::new(50);
+/// `[freeze] idle_tick_ms`: how long a tick may take when the writer has nothing waiting (`Ticker::tick_idle`), 0 for
+/// no such ticks
+pub static IDLE_TICK_MS: AtomicI64 = AtomicI64::new(200);
 /// `[freeze] min_free_gb`, in bytes: below this much free disk nothing is moved
 pub static MIN_FREE_BYTES: AtomicI64 = AtomicI64::new(100 << 30);
 /// `[freeze] wait_hours`, in seconds: how long a release waits queued before it moves, soo late articles and PreDB
@@ -74,6 +77,8 @@ pub static WAIT_SECS: AtomicI64 = AtomicI64::new(12 * 3600);
 
 /// a writer ticks at most this often, soo saves keep the writer
 const TICK_EVERY: Duration = Duration::from_secs(1);
+/// and at most this often when it has nothing waiting: a save that comes meanwhile waits `IDLE_TICK_MS` at most
+const IDLE_TICK_EVERY: Duration = Duration::from_millis(250);
 /// How long a tick waits for another connection's write lock on the shard before it lets the tick go: the writer's
 /// own wait is far longer, and freezing can always come back next tick
 const TICK_BUSY: Duration = Duration::from_secs(2);
@@ -93,6 +98,7 @@ pub fn configure(cfg: &crate::config::FreezeConfig) {
     PER_TICK.store(cfg.per_tick.max(1), Relaxed);
     BACKLOG_PER_TICK.store(cfg.backlog_per_tick.max(0), Relaxed);
     TICK_MS.store(cfg.tick_ms.max(1), Relaxed);
+    IDLE_TICK_MS.store(cfg.idle_tick_ms.max(0), Relaxed);
     MIN_FREE_BYTES.store(cfg.min_free_gb.max(0).saturating_mul(1 << 30), Relaxed);
     WAIT_SECS.store(cfg.wait_hours.max(0).saturating_mul(3600), Relaxed);
 }
@@ -544,16 +550,31 @@ impl Ticker {
     /// past `TICK_BUSY` lets the tick go (`Moved::busy`): what is queued stays queued, the walk keeps its place, and
     /// the next tick tries again.
     pub fn tick(&mut self, conn: &Connection, now: i64) -> Result<Moved> {
+        self.tick_for(conn, now, TICK_EVERY, TICK_MS.load(Relaxed).max(1))
+    }
+
+    /// A tick when the writer has nothing waiting: up to `IDLE_TICK_MS`, as often as `IDLE_TICK_EVERY`. On prod the
+    /// writers sat idle over a third of the time while freezing, a 50 ms tick a second, used 5% of it: 4,500 releases a
+    /// minute against a queue of 48 million, and a longer `tick_ms` would have come out of the saves.
+    pub fn tick_idle(&mut self, conn: &Connection, now: i64) -> Result<Moved> {
+        let ms = IDLE_TICK_MS.load(Relaxed);
+        if ms <= 0 {
+            return self.tick(conn, now);
+        }
+        self.tick_for(conn, now, IDLE_TICK_EVERY, ms.max(TICK_MS.load(Relaxed)))
+    }
+
+    fn tick_for(&mut self, conn: &Connection, now: i64, every: Duration, ms: i64) -> Result<Moved> {
         if !ENABLED.load(Relaxed)
             || STOPPING.load(Relaxed)
             || !self.attached(conn)
-            || self.last.is_some_and(|t| t.elapsed() < TICK_EVERY)
+            || self.last.is_some_and(|t| t.elapsed() < every)
         {
             return Ok(Moved::default());
         }
         self.last = Some(Instant::now());
         conn.busy_timeout(TICK_BUSY)?;
-        let done = self.tick_now(conn, now);
+        let done = self.tick_now(conn, now, Duration::from_millis(ms as u64));
         conn.busy_timeout(WRITER_BUSY)?;
         match done {
             Err(e) if is_busy(&e) => {
@@ -564,8 +585,7 @@ impl Ticker {
         }
     }
 
-    fn tick_now(&mut self, conn: &Connection, now: i64) -> Result<Moved> {
-        let budget = Duration::from_millis(TICK_MS.load(Relaxed).max(1) as u64);
+    fn tick_now(&mut self, conn: &Connection, now: i64, budget: Duration) -> Result<Moved> {
         // queueing takes no room: the walk goes on while the disk is short
         let walk = BACKLOG_PER_TICK.load(Relaxed).max(0) as usize;
         let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
