@@ -170,5 +170,7 @@ pub async fn run(stage: Arc<Stage>, stopping: impl Fn() -> bool + Send + 'static
         }
     }
     let stage = stage.clone();
+    let started = std::time::Instant::now();
     let _ = tokio::task::spawn_blocking(move || stage.stop_and_join()).await;
+    println!("[STOP] the stage's threads joined in {:.1}s", started.elapsed().as_secs_f64());
 }

@@ -180,6 +180,18 @@ fn par2_of(names: &[&str]) -> Vec<u8> {
     names.iter().flat_map(|n| par2_file_desc(n, 1000)).collect()
 }
 
+/// a whole set's list of one file: its Main packet and the file's, as `par2_file_desc` writes it
+fn whole_set_of(name: &str) -> Vec<u8> {
+    let mut main = b"PAR2\0PKT".to_vec();
+    main.extend_from_slice(&(64u64 + 12 + 16).to_le_bytes());
+    main.extend_from_slice(&[0u8; 32]);
+    main.extend_from_slice(b"PAR 2.0\0Main\0\0\0\0");
+    main.extend_from_slice(&1000u64.to_le_bytes());
+    main.extend_from_slice(&1u32.to_le_bytes());
+    main.extend_from_slice(&[7u8; 16]);
+    [main, par2_file_desc(name, 1000)].concat()
+}
+
 #[test]
 fn a_named_rar_set_reads_only_the_first_article_of_the_first_volume() {
     let mut h = fresh();
@@ -518,6 +530,60 @@ fn a_set_with_only_volumes_reads_first_and_last() {
 }
 
 #[test]
+fn a_volume_whose_first_article_isnt_indexed_is_read_from_its_last() {
+    let mut h = fresh();
+    let s = shape("x")
+        .dark("x.vol000+01.par2", 2, 3)
+        .add("x.vol000+01.par2", 3, 3, yenc_body("x", &whole_set_of("Real.Show.S01E01.mkv")))
+        .dark("x.mkv", 1, 3);
+    let state = serve(&mut h, &s, config());
+    settled(&h, "x");
+    assert_eq!(bodies(&state), 1);
+    assert_eq!(names(&h, "x"), ["Real.Show.S01E01.mkv"]);
+}
+
+#[test]
+fn a_volume_that_gives_no_list_moves_to_the_next() {
+    let mut h = fresh();
+    let s = shape("x")
+        .dark("x.vol000+01.par2", 1, 1)
+        .one("x.vol001+02.par2", &whole_set_of("Real.Show.S01E01.mkv"))
+        .dark("x.mkv", 1, 3);
+    let state = serve(&mut h, &s, config());
+    settled(&h, "x");
+    assert_eq!(bodies(&state), 2);
+    assert_eq!(names(&h, "x"), ["Real.Show.S01E01.mkv"]);
+}
+
+#[test]
+fn the_releases_own_set_is_read_before_its_samples() {
+    let mut h = fresh();
+    let s = shape("x")
+        .one("x-sample.vol0+1.par2", &whole_set_of("x-sample.mkv"))
+        .one("x.vol00+01.par2", &whole_set_of("Real.Show.S01E01.mkv"))
+        .dark("x.vol01+02.par2", 1, 1)
+        .dark("x.mkv", 1, 3);
+    let state = serve(&mut h, &s, config());
+    settled(&h, "x");
+    assert_eq!(bodies(&state), 1);
+    assert_eq!(names(&h, "x"), ["Real.Show.S01E01.mkv"]);
+}
+
+#[test]
+fn part_of_the_releases_own_list_beats_a_whole_sample_set() {
+    let mut h = fresh();
+    let s = shape("x")
+        .one("x.par2", &par2_of(&["Real.Show.S01E01.mkv"]))
+        .dark("x.vol00+01.par2", 1, 1)
+        .one("x-sample.vol0+1.par2", &whole_set_of("x-sample.mkv"))
+        .dark("x.mkv", 1, 3);
+    let state = serve(&mut h, &s, config());
+    settled(&h, "x");
+    assert_eq!(bodies(&state), 2, "the sample's set isn't read");
+    assert_eq!(names(&h, "x"), ["Real.Show.S01E01.mkv"]);
+}
+
+#[test]
 fn an_existing_name_is_left_alone() {
     let mut h = fresh();
     let s = shape("x").named("Keep.Me").one("x.par2", &par2_of(&["Real.Show.S01E01.mkv"])).dark("x.mkv", 1, 3);
@@ -549,8 +615,10 @@ fn an_nfo_names_a_release_nothing_else_named() {
     let s = shape("x").one("x.nfo", b"Release Name: Real Name 2024\n").dark("x.mkv", 1, 3);
     let state = serve(&mut h, &s, config());
     settled(&h, "x");
-    assert_eq!(bodies(&state), 1);
     assert_eq!(naming(&h, "x"), (Some("Real Name 2024".into()), Some(10)));
+    // the probe, first by rank, read the NFO (an ARTICLE): the name step uses its copy, no BODY of its own
+    assert_eq!(bodies(&state), 0);
+    assert_eq!(state.articles_sent.load(Ordering::SeqCst), 2, "the NFO once, and the video's first article");
 }
 
 #[test]
@@ -1157,4 +1225,55 @@ fn following_stops_before_the_runs_body_cap_and_asks_for_nothing_past_it() {
     settled(&h, "x");
     assert_eq!((bodies(&state), state.heads_sent.load(Ordering::SeqCst)), (1, 0));
     assert_eq!(names_of(&h), ["Hop.Post.rar"]);
+}
+
+fn sidecar(h: &Harness, name: &str) -> Option<(String, Option<String>, Option<String>, bool)> {
+    h.shard()
+        .query_row(
+            "select kind, release_name, segment_uid, text is not null from sidecars where release_id = ?1",
+            [h.id_of(name)],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .ok()
+}
+
+#[test]
+fn a_sidecar_posts_text_is_read_and_kept_with_what_it_names() {
+    let mut h = fresh();
+    let info = b"General\nUnique ID : 114273598891547003088333253660066868446 (0x55F84B6AA194D59703CCAB394DA26CDE)\nComplete name : Some.Film.2024.1080p.BluRay.x264-GRP.mkv\nFormat : Matroska\n";
+    let s = shape("mediainfo").one("mediainfo.txt", info);
+    serve(&mut h, &s, config());
+    settled(&h, "mediainfo");
+    assert_eq!(
+        sidecar(&h, "mediainfo"),
+        Some((
+            "mediainfo".into(),
+            Some("Some.Film.2024.1080p.BluRay.x264-GRP".into()),
+            Some("55f84b6aa194d59703ccab394da26cde".into()),
+            true
+        ))
+    );
+}
+
+#[test]
+fn a_release_that_carries_data_is_no_sidecar() {
+    let mut h = fresh();
+    let s = shape("x").one("x.nfo", b"Release Name: Real Name 2024\n").dark("x.mkv", 1, 3);
+    serve(&mut h, &s, config());
+    settled(&h, "x");
+    assert_eq!(sidecar(&h, "x"), None);
+}
+
+#[test]
+fn a_lone_cover_post_is_kept_as_a_sidecar_named_after_its_release_with_nothing_read() {
+    let mut h = fresh();
+    let name = "Some.Film.2024.1080p.WEB.H264-GRP-cover.jpg";
+    let s = shape(name).one(name, b"\xff\xd8\xff\xe0 a jpeg");
+    let state = serve(&mut h, &s, config());
+    settled(&h, name);
+    assert_eq!(bodies(&state), 0, "an image's body is never read");
+    assert_eq!(
+        sidecar(&h, name),
+        Some(("image".into(), Some("Some.Film.2024.1080p.WEB.H264-GRP".into()), None, false))
+    );
 }

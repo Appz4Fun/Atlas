@@ -38,6 +38,10 @@ jobs:
 
       - name: Build atlas
         run: cargo build --release --locked
+        # published binaries must run on any Mac, not just the runner's chip:
+        # RUSTFLAGS replaces the target-cpu=native in .cargo/config.toml
+        env:
+          RUSTFLAGS: ${{ runner.os == 'macOS' && '-C target-cpu=apple-m1' || '' }}
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
