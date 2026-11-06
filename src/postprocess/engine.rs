@@ -206,6 +206,7 @@ fn run_step(step: &dyn Step, ctx: &mut StepCtx<'_>) -> Ran {
         }
         Err(panic) => {
             ctx.crcs.clear();
+            crate::metrics::names::STEP_PANICS.inc(&[("step", step.name())], 1);
             Ran::Error(StepError::Retry(panic_text(panic)))
         }
     };
@@ -338,7 +339,11 @@ impl Inner {
 
     pub(crate) fn snapshot(&self) -> Value {
         let s = self.settings.read().unwrap();
-        self.stats.snapshot(s.config.body_fetches_per_minute, s.config.backlog_per_second, s.enabled)
+        let mut snapshot =
+            self.stats.snapshot(s.config.body_fetches_per_minute, s.config.backlog_per_second, s.enabled);
+        let claims: Vec<usize> = self.net_claimed.iter().map(|c| c.lock().unwrap().claims).collect();
+        snapshot["net_claims"] = serde_json::json!({"running": claims, "most": s.config.net_claims_per_shard});
+        snapshot
     }
 
     /// Bounded counts, per shard: an exact count at this size stalls whatever asks.
