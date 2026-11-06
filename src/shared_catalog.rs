@@ -326,20 +326,30 @@ fn outbox_ddl(schema: &str) -> String {
 }
 
 /// For a compaction, which builds a shard afresh from the original attached as `old`: the original's waiting
-/// changes come along, and so do the releases the copy changed (dropping copies of articles takes their bytes off
-/// a release's size). Returns whether the original had the outbox, to put the triggers back once the copy has its
+/// changes come along, and so do the releases the copy changed in any column (dropping copies of articles takes
+/// their bytes off a release's size, and its parts and completeness can change with them). Returns whether the original had the outbox, to put the triggers back once the copy has its
 /// indexes (`sync_triggers`).
 pub fn carry_outbox(conn: &Connection) -> rusqlite::Result<bool> {
     let had: i64 = conn.query_row("select count(*) from old.sqlite_schema where name = ?1", [OUTBOX], |r| r.get(0))?;
     if had == 0 {
         return Ok(false);
     }
+    // every column both copies have: dropping copies of articles changes size, parts and completeness, and
+    // whatever else a compaction may come to rewrite is caught too
+    let cols: Vec<String> = conn
+        .prepare(
+            "select m.name from pragma_table_info('releases', 'main') m
+             join pragma_table_info('releases', 'old') o on o.name = m.name",
+        )?
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    let changed = cols.iter().map(|c| format!("r.{0} is not o.{0}", quote(c))).collect::<Vec<_>>().join(" or ");
     conn.execute_batch(&format!(
         "{ddl}
          insert into main.{OUTBOX} (tbl, k1, k2, at) select tbl, k1, k2, at from old.{OUTBOX} order by seq;
          insert into main.{OUTBOX} (tbl, k1, k2)
          select 'releases', r.id, null from main.releases r join old.releases o on o.id = r.id
-         where r.size is not o.size;",
+         where {changed};",
         ddl = outbox_ddl("main"),
     ))?;
     Ok(true)
@@ -1169,7 +1179,7 @@ mod tests {
         copy_conn
             .execute_batch(
                 "create table releases (id INTEGER PRIMARY KEY, name TEXT, size INTEGER, posted_date TEXT);
-                 insert into releases (id, name, size) values (8, 'a', 7), (16, 'b', 20);",
+                 insert into releases (id, name, size, posted_date) values (8, 'a', 7, null), (16, 'b', 20, 'x');",
             )
             .unwrap();
         let orig = dir.path().join("orig.db");
@@ -1183,7 +1193,11 @@ mod tests {
             .unwrap()
             .map(|r| r.unwrap())
             .collect();
-        assert_eq!(carried, [("releases".into(), 8), ("releases".into(), 16), ("releases".into(), 8)]);
+        assert_eq!(
+            carried,
+            [("releases".into(), 8), ("releases".into(), 16), ("releases".into(), 8), ("releases".into(), 16)],
+            "8 for its size, 16 for another column with the size unchanged"
+        );
         copy_conn.execute_batch("detach database old").unwrap();
         // without one in the original, nothing to carry
         let plain = dir.path().join("plain.db");
