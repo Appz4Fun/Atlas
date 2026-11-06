@@ -162,6 +162,7 @@ pub struct Config {
     pub metrics: MetricsConfig,
     pub sealed_log: SealedLogConfig,
     pub freeze: FreezeConfig,
+    pub shared_catalog: SharedCatalogConfig,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -595,6 +596,65 @@ impl SealedLogConfig {
     }
 }
 
+/// The `shared_catalog` object of config.toml: a Postgres copy of every shard's release-level tables
+/// (`crate::shared_catalog`). Off unless it's enabled and has a url.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SharedCatalogConfig {
+    pub enabled: bool,
+    /// a Postgres connection string, `host=... port=... user=... password=... dbname=...` or `postgresql://...`
+    pub url: String,
+    /// changes a batch takes from one shard's outbox at most
+    pub batch: usize,
+    /// how long the publisher rests when every outbox is empty, milliseconds
+    pub interval_ms: u64,
+    /// the connection isn't encrypted: without this, only a loopback or private network address is used
+    pub allow_plaintext: bool,
+}
+
+impl Default for SharedCatalogConfig {
+    fn default() -> Self {
+        SharedCatalogConfig {
+            enabled: false,
+            url: String::new(),
+            batch: 5_000,
+            interval_ms: 1_000,
+            allow_plaintext: false,
+        }
+    }
+}
+
+impl SharedCatalogConfig {
+    fn from_value(v: Option<&Value>) -> SharedCatalogConfig {
+        let mut c = SharedCatalogConfig::default();
+        let Some(v) = v else { return c };
+        if let Some(b) = v.get("enabled").and_then(as_bool) {
+            c.enabled = b;
+        }
+        if let Some(u) = v.get("url").and_then(Value::as_str) {
+            c.url = u.to_string();
+        }
+        if let Some(n) = v.get("batch").and_then(as_int).and_then(|n| usize::try_from(n).ok()) {
+            c.batch = n.clamp(1, 100_000);
+        }
+        if let Some(n) = v.get("interval_ms").and_then(as_int).and_then(|n| u64::try_from(n).ok()) {
+            c.interval_ms = n.clamp(50, 60_000);
+        }
+        if let Some(b) = v.get("allow_plaintext").and_then(as_bool) {
+            c.allow_plaintext = b;
+        }
+        c
+    }
+
+    pub fn is_on(&self) -> bool {
+        self.enabled && !self.url.is_empty()
+    }
+}
+
+/// The file's `shared_catalog` object, for the fill and check commands: no keyring.
+pub fn shared_catalog_config() -> SharedCatalogConfig {
+    read_file().map_or_else(SharedCatalogConfig::default, |v| SharedCatalogConfig::from_value(v.get("shared_catalog")))
+}
+
 /// The file's `sealed_log` object, for anything that reads articles: no keyring.
 pub fn sealed_log_config() -> SealedLogConfig {
     read_file().map_or_else(SealedLogConfig::default, |v| SealedLogConfig::from_value(v.get("sealed_log")))
@@ -853,6 +913,7 @@ impl Default for Config {
             naming: NamingConfig::default(),
             metrics: MetricsConfig::default(),
             sealed_log: SealedLogConfig::default(),
+            shared_catalog: SharedCatalogConfig::default(),
             predb: PredbConfig::default(),
             spots: SpotsConfig::default(),
             category: CategoryConfig::default(),
@@ -1044,6 +1105,7 @@ impl Config {
             naming: NamingConfig::from_value(v.get("naming")),
             metrics: MetricsConfig::from_value(v.get("metrics")),
             sealed_log: SealedLogConfig::from_value(v.get("sealed_log")),
+            shared_catalog: SharedCatalogConfig::from_value(v.get("shared_catalog")),
             predb: PredbConfig::from_value(v.get("predb")),
             spots: SpotsConfig::from_value(v.get("spots")),
             category: CategoryConfig::from_value(v.get("category")),

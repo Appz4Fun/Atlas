@@ -49,6 +49,7 @@ zipfast = { git = "https://github.com/xbmc4lyfe/zipfast", rev = "f0274b2e7fb4b02
 zipview = { git = "https://github.com/xbmc4lyfe/zipview", rev = "a1c381b93b92d5eac51adb5e177c5394c2ca20bb" }
 tantivy = "0.27"
 quick-xml = "0.42"
+postgres = "0.19"
 
 [target.'cfg(unix)'.dependencies]
 signal-hook = "0.4"

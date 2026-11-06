@@ -1234,6 +1234,11 @@ async fn supervise(stop: Arc<AtomicBool>, stats: Arc<Mutex<Stats>>, writing: Opt
 
         if compact_due && !stopping() {
             writing = None;
+            // the shared catalog's publisher lets go of the shards first, and stays away till the compaction is done
+            let _making_way =
+                tokio::task::spawn_blocking(|| crate::shared_catalog::make_way_for_compaction(Duration::from_secs(30)))
+                    .await
+                    .ok();
             match compact(&config, &stats, &stop).await {
                 Compacted::Ran => compact_after = None,
                 Compacted::Busy => compact_after = Some(SystemTime::now() + COMPACT_RETRY),
@@ -1311,6 +1316,7 @@ pub fn run() -> i32 {
 
     crate::metrics::start(&config, crate::metrics::Role::Indexer);
     crate::sealed_store::spawn_offload(&config.sealed_log, stop.clone());
+    crate::shared_catalog::start(&config.shared_catalog, stop.clone());
     if config.metrics.enabled {
         crate::metrics::catalog::spawn(Duration::from_secs(config.metrics.catalog_every_secs), stop.clone());
     }

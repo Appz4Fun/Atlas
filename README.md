@@ -409,6 +409,27 @@ To see it:
 3. Push the dashboards with `dashboards.py push` as below and open **Atlas: Sealed log**.
 4. For numbers to paste somewhere, `python3 deploy/victoriametrics/sealed_log_report.py http://victoriametrics:8428 6h` prints throughput, latency on both ends, the disk and failures over the last 6 hours as a Markdown table. A `-` means no data: the service or Atlas wasn't running a build with metrics, or nothing moved in that window.
 
+### Shared catalog (Postgres)
+
+Atlas can keep a copy of every shard's release-level tables in one Postgres database: releases, their keys and fingerprints, PAR2 sets and upload links, categories, media and PreDB matches, postprocess state and the rest of what a lookup across groups compares. Article data (`segments`, `files`, `release_ids`, `file_timing`) stays in the shards. This is phase 1 of moving lookups across shards to one place: the shards stay what's true, and the copy only follows them. Nothing reads it yet.
+
+Turn it on in `config.toml`:
+
+```toml
+[shared_catalog]
+enabled = true
+url = "host=db.example port=5432 user=atlas password=... dbname=atlas_catalog"
+# batch = 5000        # changes taken from one shard's outbox at a time
+# interval_ms = 1000  # rest when every outbox is empty
+# allow_plaintext = false  # the connection isn't encrypted: only loopback or private addresses unless true
+```
+
+At its next start the indexer adds three triggers to each copied table in every shard, which put the key of each changed row in `catalog_outbox`. A publisher thread then sends each shard's changes as batches: the rows as they are now, upserted, and the ones gone, deleted, in one Postgres transaction, before taking them out of the outbox. It makes the Postgres tables itself, and adds columns a shard migration added. Keys that only mean something inside one shard (`collections`, `junk_collections`, `pp_walks`) are keyed by `shard` too, and every row carries the shard it came from. The connection isn't encrypted, so Atlas only connects to a loopback or private network address written as a number (127.x, 10.x, 172.16-31.x, 192.168.x, fc00::/7) unless `allow_plaintext = true`. A compaction carries the waiting changes over, adds the releases it resized, and puts the triggers back. Turned off again, the next start drops the triggers and the outbox, so the writers pay nothing. Rows that were there before the triggers, or changed while it was off, reach the copy only through a fill (`--shared-catalog-fill`, below).
+
+The triggers only see changes made after they're in. To copy the rows that were there before, or to refresh the copy after a time with the catalog off, run `atlas --shared-catalog-fill` beside the running indexer. It holds off compaction while it runs. It reads each table a page at a time in key order (5,000 rows or 32 MB), and upserts each page while holding the shard's advisory lock in Postgres, which every publisher batch also takes. So a page never goes in older than a batch already sent, and a change made after the page was read stays in the outbox for a later batch. `atlas --shared-catalog-check` then counts every table in the shard and in Postgres, also holding off compaction,, and lists the rows Postgres keeps whose key the shard no longer has. That can happen when a fill reads a row just before it's deleted. `--shared-catalog-check --prune` deletes those. It exits 0 when every table matches and 2 when one differs. Counts of busy tables can differ by what is still waiting in the outbox, which it prints first.
+
+The publisher counts rows in `atlas_shared_catalog_rows_total`, shows each shard's waiting changes and the oldest one's age in `atlas_shared_catalog_outbox`, and failures in `atlas_shared_catalog_failures_total`. It times each batch as the function `shared_catalog.send`. If Postgres is down the outbox grows and the publisher retries with backoff; indexing goes on. A backlog is sent in batches of at most `batch` changes and 32 MB of rows. The publisher keeps the shards open only while it holds off compaction, and lets go whenever it has nothing to send, after a minute, or as soon as the indexer is about to compact (which waits up to 30 s for it and keeps it away until the compaction is done), so a compaction never swaps a shard under it. Each batch holds a per-shard advisory lock in Postgres.
+
 PreDB titles, if you turn them on, live apart in `atlas.predb.db`. Compaction and conversion never touch it. It takes about 153 MB per million titles, and grows by under 2 MB a day.
 
 ### Converting an older database
