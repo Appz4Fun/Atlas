@@ -777,6 +777,20 @@ def progress():
         q('sum(rate(atlas_frozen_events_total{event="busy"}[5m])) * 60', "ticks the lock was busy"),
     ], w=8, colors={"frozen": SERIES[0], "queued by the backlog walk": SERIES[1], "ticks the lock was busy": SERIES[2]})
 
+    b.row("Shared catalog")
+    b.stat("Outbox waiting", 'sum(atlas_shared_catalog_outbox{kind="rows"})', w=6,
+           description="Changes waiting in the shards' outboxes for the publisher to send to Postgres.")
+    b.stat("Oldest waiting", 'max(atlas_shared_catalog_outbox{kind="oldest_seconds"})', "s", w=6,
+           thresholds=[{"color": GOOD, "value": None}, {"color": WARNING, "value": 900}, {"color": CRITICAL, "value": 3600}],
+           description="How long the oldest waiting change has waited, over every shard.")
+    b.stat("Upserts a minute", 'sum(rate(atlas_shared_catalog_rows_total{op="upsert"}[10m])) * 60', w=6)
+    b.stat("Deletes a minute", 'sum(rate(atlas_shared_catalog_rows_total{op="delete"}[10m])) * 60', w=6)
+    b.graph("Outbox per shard", [q('atlas_shared_catalog_outbox{kind="rows"}', "shard {{shard}}")], w=8, colors=SHARD_COLORS)
+    b.graph("Oldest waiting per shard", [q('atlas_shared_catalog_outbox{kind="oldest_seconds"}', "shard {{shard}}")], "s", w=8,
+            colors=SHARD_COLORS)
+    b.graph("Sent a minute", [q('sum by (op) (rate(atlas_shared_catalog_rows_total[5m])) * 60', "{{op}}")], w=8, palette=True,
+            description="Rows the publisher wrote to Postgres (upsert) or took out of it (delete).")
+
     b.row("Errors")
     bad = [{"color": GOOD, "value": None}, {"color": CRITICAL, "value": 1}]
     b.stat("Step panics in range", "sum(increase(atlas_step_panics_total[$__range])) or vector(0)", w=6, thresholds=bad)
