@@ -2,8 +2,9 @@
 //! stored archive. A playlist (`PLAYLIST/nnnnn.mpls`, also under `BACKUP`) begins `MPLS` and its version, and lists
 //! the clips it plays with their in and out times and, per clip, a stream number table: each video stream's codec,
 //! format and frame rate, each audio stream's codec, layout, rate and language, each subtitle stream's language.
-//! The disc's main title is the playlist that plays longest. A total function like the rest of `media`: cut off
-//! bytes give what was read before them.
+//! The disc's main title is the playlist that plays longest. Its `CERTIFICATE/id.bdmv`, when it is in what was read,
+//! gives the disc's org and disc IDs. A total function like the rest of `media`: cut off bytes give what was read
+//! before them.
 
 use super::media::{AudioTrack, MediaInfo, SubtitleTrack, VideoTrack};
 
@@ -47,7 +48,23 @@ pub fn bluray(data: &[u8]) -> MediaInfo {
     }
     let mut info = best.unwrap_or_else(|| MediaInfo { container: "bluray".into(), ..MediaInfo::default() });
     info.header_complete &= !cut;
+    info.disc_id = disc_id(data);
     info
+}
+
+/// The disc's IDs from its `CERTIFICATE/id.bdmv` (libbluray's `bdid_parse`): `BDID` and a four digit version, then at
+/// byte 40 the 4-byte org ID and at 44 the 16-byte disc ID, as they're stored, in hex, org ID first (40 digits).
+/// None without a whole one, or when both are zero, as on discs authored without them. Whether two pressings of one
+/// title share it isn't known yet: a value to show and compare, not to merge on.
+pub fn disc_id(data: &[u8]) -> Option<String> {
+    let at = data
+        .windows(8)
+        .enumerate()
+        .filter(|(_, w)| w.starts_with(b"BDID") && w.get(4..).is_some_and(|v| v.iter().all(u8::is_ascii_digit)))
+        .map(|(at, _)| at)
+        .find(|at| data.get(at + 40..at + 60).is_some_and(|ids| ids.iter().any(|b| *b != 0)))?;
+    let ids = data.get(at + 40..at + 60)?;
+    Some(ids.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 /// Where each playlist starts: `MPLS` and a version this reads.
@@ -279,6 +296,53 @@ pub(crate) mod tests {
         let subs: Vec<(&str, Option<&str>)> =
             info.subtitles.iter().map(|s| (s.codec.as_str(), s.language.as_deref())).collect();
         assert_eq!(subs, [("pgs", Some("eng")), ("pgs", Some("fra"))]);
+    }
+
+    /// An `id.bdmv` with these org and disc IDs.
+    pub(crate) fn id_bdmv(org: [u8; 4], disc: [u8; 16]) -> Vec<u8> {
+        let mut b = b"BDID0200".to_vec();
+        // where the data and the extension data start
+        b.extend(40u32.to_be_bytes());
+        b.extend(0u32.to_be_bytes());
+        b.resize(40, 0);
+        b.extend(org);
+        b.extend(disc);
+        b.resize(b.len() + 4, 0);
+        b
+    }
+
+    #[test]
+    fn the_disc_id_comes_from_id_bdmv() {
+        let disc: [u8; 16] = std::array::from_fn(|n| 0xA0 + n as u8);
+        let id = id_bdmv([0x00, 0x01, 0x02, 0x03], disc);
+        let mut data = b"Rar!\x1a\x07\x00 BDMV/index.bdmv INDX0200 ".to_vec();
+        data.extend(mpls(1, 3_600));
+        data.extend(b" CERTIFICATE/id.bdmv ");
+        data.extend(&id);
+        let want = "00010203a0a1a2a3a4a5a6a7a8a9aaabacadaeaf";
+        assert_eq!(disc_id(&data).as_deref(), Some(want));
+        let info = super::super::media::parse(&data).unwrap();
+        assert_eq!(info.disc_id.as_deref(), Some(want));
+        assert_eq!(info.duration_secs, Some(3_600.0), "the playlist still reads");
+        // the backup copy beside it says the same
+        assert_eq!(disc_id(&[data.as_slice(), &id].concat()).as_deref(), Some(want));
+    }
+
+    #[test]
+    fn no_disc_id_from_a_cut_or_empty_id_bdmv() {
+        let id = id_bdmv([1, 2, 3, 4], [9; 16]);
+        assert_eq!(disc_id(&id[..59]), None, "the disc ID is cut");
+        assert_eq!(disc_id(&id_bdmv([0; 4], [0; 16])), None, "all zero says nothing");
+        assert_eq!(disc_id(&id[..]), Some(format!("01020304{}", "09".repeat(16))));
+        // not a version
+        let mut odd = id.clone();
+        odd[4] = b'x';
+        assert_eq!(disc_id(&odd), None);
+        for cut in 0..id.len() {
+            let _ = disc_id(&id[..cut]);
+            let _ = bluray(&id[..cut]);
+        }
+        assert_eq!(bluray(&mpls(1, 60)).disc_id, None);
     }
 
     #[test]
