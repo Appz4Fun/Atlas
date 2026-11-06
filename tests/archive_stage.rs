@@ -570,6 +570,20 @@ fn the_releases_own_set_is_read_before_its_samples() {
 }
 
 #[test]
+fn part_of_the_releases_own_list_beats_a_whole_sample_set() {
+    let mut h = fresh();
+    let s = shape("x")
+        .one("x.par2", &par2_of(&["Real.Show.S01E01.mkv"]))
+        .dark("x.vol00+01.par2", 1, 1)
+        .one("x-sample.vol0+1.par2", &whole_set_of("x-sample.mkv"))
+        .dark("x.mkv", 1, 3);
+    let state = serve(&mut h, &s, config());
+    settled(&h, "x");
+    assert_eq!(bodies(&state), 2, "the sample's set isn't read");
+    assert_eq!(names(&h, "x"), ["Real.Show.S01E01.mkv"]);
+}
+
+#[test]
 fn an_existing_name_is_left_alone() {
     let mut h = fresh();
     let s = shape("x").named("Keep.Me").one("x.par2", &par2_of(&["Real.Show.S01E01.mkv"])).dark("x.mkv", 1, 3);

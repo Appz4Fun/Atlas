@@ -802,18 +802,25 @@ impl Step for Par2Step {
             let limits = self.limits.lock().unwrap().clone();
             return restore_par2(ctx, saved_par2, Some(meta.clone()), &limits);
         }
-        // every file of a set carries its list: when one is missing the articles that hold it, the next may not be
-        let mut best: Option<par2::Inventory> = None;
+        // every file of a set carries its list: when one is missing the articles that hold it, the next may not be.
+        // Once a file gave some of a list, only files of its own set may better it: another set (a sample's) would
+        // put its files in place of the ones found
+        let mut best: Option<(par2::Inventory, String)> = None;
         for file in sources.into_iter().take(PAR2_TRIES) {
+            let stem = select::par2_stem(&file.filename);
+            if best.as_ref().is_some_and(|(_, set)| *set != stem) {
+                continue;
+            }
             let Some(inventory) = read_set(ctx, file)? else { continue };
             let complete = inventory.complete;
-            if best.as_ref().is_none_or(|b| complete || inventory.files.len() > b.files.len()) {
-                best = Some(inventory);
+            if best.as_ref().is_none_or(|(b, _)| complete || inventory.files.len() > b.files.len()) {
+                best = Some((inventory, stem));
             }
             if complete {
                 break;
             }
         }
+        let best = best.map(|(inventory, _)| inventory);
         let Some(inventory) = best else {
             if !saved_par2.is_empty() {
                 let limits = self.limits.lock().unwrap().clone();

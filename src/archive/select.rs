@@ -150,15 +150,18 @@ pub fn par2_source(files: &[FileInfo]) -> Option<&FileInfo> {
     par2_sources(files).into_iter().next()
 }
 
+/// A PAR2 file's set as its name says it: the name without `.volN+M.par2` or `.par2`, lowercased.
+pub fn par2_stem(name: &str) -> String {
+    let lower = name.to_ascii_lowercase();
+    let cut = lower.rfind(".vol").filter(|_| matches!(classify(name), Kind::Par2Vol(_))).or(lower.rfind(".par2"));
+    cut.map(|at| lower[..at].to_string()).unwrap_or(lower)
+}
+
 /// The PAR2 files a set can be read from, best first: a volume carries the set's file list as a base file does.
 /// Whole ones before ones missing articles, the release's own set before another (a sample's, or a set of fewer
 /// files), a base before a volume, and among those the fewest parts or the lowest first block.
 pub fn par2_sources(files: &[FileInfo]) -> Vec<&FileInfo> {
-    let stem = |name: &str| {
-        let lower = name.to_ascii_lowercase();
-        let cut = lower.rfind(".vol").filter(|_| matches!(classify(name), Kind::Par2Vol(_))).or(lower.rfind(".par2"));
-        cut.map(|at| lower[..at].to_string()).unwrap_or(lower)
-    };
+    let stem = par2_stem;
     let par2: Vec<(&FileInfo, Option<u32>)> = files
         .iter()
         .filter_map(|f| match classify(&f.filename) {
