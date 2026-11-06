@@ -81,6 +81,12 @@ max_pages_per_poll = 3
 history_pages = 0
 late_per_second = 1
 
+[spots]
+enabled = true
+poll_minutes = 15
+first_articles = 20000
+per_pass = 200
+
 [category]
 enabled = true
 foreign = true

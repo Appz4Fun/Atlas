@@ -2,12 +2,16 @@
 //! compressed NZB for it. Spots are posted as header-only articles in `free.pt`; the spot's XML rides in its
 //! `X-XML` headers, and its NZB is a deflated blob posted in `alt.binaries.ftd`.
 //!
-//! This module only reads the formats: the overview line (`header`), the full spot XML (`full`) and the posted
-//! binaries (`binary`). It needs no database and no connection.
+//! `header`, `full` and `binary` read the formats: the overview line, the full spot XML and the posted binaries.
+//! `release` turns a spot's NZB into a release, `store` keeps the bookkeeping and the tags, and `ingest` is the
+//! indexer's task that reads new spots.
 
 pub mod binary;
 pub mod full;
 pub mod header;
+pub mod ingest;
+pub mod release;
+pub mod store;
 
 /// Where spots are posted.
 pub const SPOT_GROUP: &str = "free.pt";

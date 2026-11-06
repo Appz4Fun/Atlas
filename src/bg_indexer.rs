@@ -1049,6 +1049,12 @@ async fn run_servers(
         ));
         tasks.spawn(named!("follow_media".into(), follow_media(sched.clone(), db.clone())));
     }
+    // Spotnet spots of movies and TV, saved as releases (see `spotnet::ingest`)
+    if config.spots.enabled {
+        let s = sched.clone();
+        let (pool, spots) = (sched.ctx.pool.clone(), config.spots.clone());
+        tasks.spawn(crate::spotnet::ingest::run(pool, db.clone(), spots, move || s.stopping()));
+    }
     // parts one server's listing left out, read again from another (see `repair`)
     if sched.ctx.pool.indexing_servers().len() > 1 {
         let s = sched.clone();
