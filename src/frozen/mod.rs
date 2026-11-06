@@ -75,6 +75,8 @@ pub static MIN_FREE_BYTES: AtomicI64 = AtomicI64::new(100 << 30);
 /// `rules::evaluate`); a new reason starts the wait over.
 pub static WAIT_SECS: AtomicI64 = AtomicI64::new(12 * 3600);
 
+/// releases the backlog walk looks at in a tick whose moves took all its budget
+const WALK_AT_LEAST: usize = 25;
 /// a writer ticks at most this often, soo saves keep the writer
 const TICK_EVERY: Duration = Duration::from_secs(1);
 /// and at most this often when it has nothing waiting: a save that comes meanwhile waits `IDLE_TICK_MS` at most
@@ -620,18 +622,25 @@ impl Ticker {
         }
     }
 
+    /// Moves first, then the backlog walk with what is left of `budget`: the walk queues releases that only move 12
+    /// hours on, and while millions are ready to move it went first and took the tick. On prod, with the walk started
+    /// over (#188), a tick averaged 1.1 s, mostly walking, and moves fell from 4,500 a minute to 200.
     fn tick_now(&mut self, conn: &Connection, now: i64, budget: Duration) -> Result<Moved> {
-        // queueing takes no room: the walk goes on while the disk is short
+        let started = Instant::now();
+        let mut moved = Moved::default();
+        if self.disk_ok(conn) {
+            let limit = PER_TICK.load(Relaxed).max(1) as usize;
+            moved = freeze_some(conn, limit, budget, now.saturating_sub(WAIT_SECS.load(Relaxed)), now)?;
+        }
+        // queueing takes no room: the walk goes on while the disk is short. It gets what the moves left, and a short
+        // step of its own when they left nothing, soo it never stands still
         let walk = BACKLOG_PER_TICK.load(Relaxed).max(0) as usize;
+        let left = budget.saturating_sub(started.elapsed());
+        let (walk, walk_budget) = if left.is_zero() { (walk.min(WALK_AT_LEAST), Duration::ZERO) } else { (walk, left) };
         let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
-        let backlog = rules::backlog_some(&tx, walk, budget, now)?.queued;
+        let backlog = rules::backlog_some(&tx, walk, walk_budget, now)?.queued;
         tx.commit()?;
         crate::metrics::names::FROZEN.inc(&[("event", "backlog_queued")], backlog as u64);
-        if !self.disk_ok(conn) {
-            return Ok(Moved { backlog, ..Moved::default() });
-        }
-        let limit = PER_TICK.load(Relaxed).max(1) as usize;
-        let moved = freeze_some(conn, limit, budget, now.saturating_sub(WAIT_SECS.load(Relaxed)), now)?;
         Ok(Moved { backlog, ..moved })
     }
 }
