@@ -986,7 +986,9 @@ fn release_complete(conn: &Connection, release_id: i64, file_total: Option<i64>)
         return Ok(true);
     }
     // every file it has is whole, but the counter says another number of files
-    Ok(own_whole_video(conn, release_id, files)? || vouched_by_set(conn, release_id)?)
+    Ok(own_whole_video(conn, release_id, files)?
+        || own_whole_rar_set(conn, release_id)?
+        || vouched_by_set(conn, release_id)?)
 }
 
 /// The complete PAR2 sets read for release `?1` (`archive::store::par2_inventory`) name only files it has, and name
@@ -1029,6 +1031,83 @@ fn vouched_by_set(conn: &Connection, release_id: i64) -> Result<bool> {
         return Ok(false);
     }
     conn.prepare_cached(concat!("select ", set_vouches_sql!()))?.query_row([release_id], |r| r.get(0))
+}
+
+/// The small files posted beside an archive set that aren't part of it.
+const SIDE_EXTENSIONS: &[&str] = &[
+    ".par2", ".nfo", ".sfv", ".srr", ".srs", ".txt", ".jpg", ".jpeg", ".png", ".md5", ".srt", ".sub", ".idx", ".nzb",
+    ".url",
+];
+
+/// Whether the release's files are one RAR set, named as the release, there from its first volume to its last with
+/// no gap, beside side files only (`SIDE_EXTENSIONS`). A set's volumes are all one size but its last, soo a last one
+/// shorter than the others, which are alike, is where it ends. An episode of a season posted under one counter is a
+/// row of its own: `part01.rar` to `part11.rar` of "74 files". Not a set missing its first volume, or a volume between.
+fn own_whole_rar_set(conn: &Connection, release_id: i64) -> Result<bool> {
+    static NEW: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        #[allow(clippy::unwrap_used)]
+        regex::Regex::new(r"^(.+)\.part0*(\d{1,4})\.rar$").unwrap()
+    });
+    static OLD: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        #[allow(clippy::unwrap_used)]
+        regex::Regex::new(r"^(.+)\.(?:rar|r(\d\d)|s(\d\d))$").unwrap()
+    });
+    let Some(name) = conn
+        .prepare_cached("select name from releases where id = ?")?
+        .query_row([release_id], |r| r.get::<_, Option<String>>(0))
+        .optional()?
+        .flatten()
+    else {
+        return Ok(false);
+    };
+    let files: Vec<(String, Option<i64>)> = conn
+        .prepare_cached("select filename, expected from files where release_id = ?")?
+        .query_map([release_id], |r| Ok((r.get::<_, String>(0)?.trim().to_lowercase(), r.get(1)?)))?
+        .collect::<Result<_>>()?;
+    // the volumes by their place in the set, first 0, with each one's articles
+    let mut stem: Option<String> = None;
+    let mut new_style: Option<bool> = None;
+    let mut volumes: Vec<(i64, i64)> = Vec::new();
+    for (file, expected) in &files {
+        if SIDE_EXTENSIONS.iter().any(|ext| file.ends_with(ext)) {
+            continue;
+        }
+        let Some(expected) = *expected else { return Ok(false) };
+        let (this_stem, index, new) = if let Some(c) = NEW.captures(file) {
+            let Ok(n) = c[2].parse::<i64>() else { return Ok(false) };
+            (c[1].to_string(), n - 1, true)
+        } else if let Some(c) = OLD.captures(file) {
+            let at = |m: Option<regex::Match<'_>>| m.and_then(|m| m.as_str().parse::<i64>().ok());
+            let index = match (at(c.get(2)), at(c.get(3))) {
+                (Some(r), _) => r + 1,
+                (None, Some(s)) => s + 101,
+                (None, None) => 0,
+            };
+            (c[1].to_string(), index, false)
+        } else {
+            // a file of no set, or of another kind
+            return Ok(false);
+        };
+        if stem.get_or_insert_with(|| this_stem.clone()) != &this_stem || *new_style.get_or_insert(new) != new {
+            return Ok(false);
+        }
+        volumes.push((index, expected));
+    }
+    volumes.sort_unstable();
+    let Some(stem) = stem else { return Ok(false) };
+    let Some(((_, last), before)) = volumes.split_last() else { return Ok(false) };
+    let in_order = volumes.iter().enumerate().all(|(i, (index, _))| *index == i as i64);
+    let size = before.first().map(|(_, e)| *e);
+    let even = size.is_some_and(|size| before.iter().all(|(_, e)| *e == size) && *last < size);
+    // as the release is named, or with the post's id after it: `name [54205819]`
+    let name = name.trim().to_lowercase();
+    let named = name == stem
+        || name
+            .strip_prefix(stem.as_str())
+            .and_then(|rest| rest.strip_prefix(" ["))
+            .and_then(|rest| rest.strip_suffix(']'))
+            .is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()));
+    Ok(in_order && even && named)
 }
 
 /// The extensions of a video that plays on its own.
@@ -4663,6 +4742,52 @@ mod tests {
         two.articles.extend(counted("Pack.S01", "Pack.S01E02.mkv", 2, 24, 1).articles);
         save(&main, &[two]).unwrap();
         assert_eq!(complete_of(&conn, "Pack.S01"), 0);
+    }
+
+    /// a release `name` of these files, each `(file, parts)`, whole, under a counter of `total`
+    fn files_of(name: &str, files: &[(&str, i64)], total: i64) -> Release {
+        let mut r = counted(name, files[0].0, 1, total, files[0].1);
+        for (i, (file, parts)) in files.iter().enumerate().skip(1) {
+            r.articles.extend(counted(name, file, i as i64 + 1, total, *parts).articles);
+        }
+        r
+    }
+
+    #[test]
+    fn a_whole_rar_set_named_as_its_release_is_complete_whatever_the_counter_says() {
+        let (_dir, main, conn) = fresh_shard_db();
+        // an episode of a season under one counter: its volumes, first to last, and a subtitle
+        let episode = "Show.S01E06.1080p.WEB-DL-G";
+        let files = [
+            ("Show.S01E06.1080p.WEB-DL-G.part01.rar", 3),
+            ("Show.S01E06.1080p.WEB-DL-G.part02.rar", 3),
+            ("Show.S01E06.1080p.WEB-DL-G.part03.rar", 1),
+            ("Show.S01E06.1080p.WEB-DL-G.srt", 1),
+        ];
+        save(&main, &[files_of(episode, &files, 74)]).unwrap();
+        assert_eq!(complete_of(&conn, episode), 1);
+        // the old names, and the post's id after the release's name
+        let old = "film.2009.bluray-g [71141734]";
+        let files = [("film.2009.bluray-g.rar", 2), ("film.2009.bluray-g.r00", 2), ("film.2009.bluray-g.r01", 1)];
+        save(&main, &[files_of(old, &[files[0], files[1], files[2], ("film.2009.bluray-g.sfv", 1)], 9)]).unwrap();
+        assert_eq!(complete_of(&conn, old), 1);
+        // a gap, no first volume, a last volume no shorter, volumes of uneven size, another name, a video beside, one
+        // volume alone: not
+        for (name, files) in [
+            ("Gap.S01E01", vec![("Gap.S01E01.part01.rar", 2), ("Gap.S01E01.part03.rar", 1)]),
+            ("Late.S01E01", vec![("Late.S01E01.part02.rar", 2), ("Late.S01E01.part03.rar", 1)]),
+            ("Even.S01E01", vec![("Even.S01E01.part01.rar", 2), ("Even.S01E01.part02.rar", 2)]),
+            (
+                "Odd.S01E01",
+                vec![("Odd.S01E01.part01.rar", 3), ("Odd.S01E01.part02.rar", 2), ("Odd.S01E01.part03.rar", 1)],
+            ),
+            ("Film.2001.DVDRip", vec![("abc.part01.rar", 2), ("abc.part02.rar", 1)]),
+            ("Mix.S01E01", vec![("Mix.S01E01.part01.rar", 2), ("Mix.S01E01.part02.rar", 1), ("Mix.S01E01.mkv", 1)]),
+            ("One.S01E01", vec![("One.S01E01.part01.rar", 2)]),
+        ] {
+            save(&main, &[files_of(name, &files, 40)]).unwrap();
+            assert_eq!(complete_of(&conn, name), 0, "{name}");
+        }
     }
 
     /// release `name`'s PAR2 set, as the PAR2 step keeps it, naming `files`
