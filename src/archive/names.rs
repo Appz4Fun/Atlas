@@ -125,6 +125,9 @@ pub fn collapse_volumes(files: &[InnerFile]) -> Vec<InnerFile> {
                     (Some(a), Some(b)) => Some(a.saturating_add(b)),
                     (a, b) => a.or(b),
                 };
+                // the set's rows sum to one: no volume's CRC or time is the whole set's
+                row.crc32 = None;
+                row.mtime = None;
                 if volume_order(&file.name) < volume_order(&row.name) {
                     row.name.clone_from(&file.name);
                 }
