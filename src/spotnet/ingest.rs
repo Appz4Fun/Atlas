@@ -23,6 +23,8 @@ const MAX_NZB_ARTICLE: usize = 4 * 1024 * 1024;
 /// spot is no real one, and nothing more is read.
 const MAX_NZB_ARTICLES: usize = 16;
 const MAX_NZB_POSTED: usize = 16 * 1024 * 1024;
+/// What `body_capped` may read past its cap before it gives up: one long line.
+const CAP_OVERSHOOT: usize = 64 * 1024;
 /// NZB article bytes one pass reads at most; the spots left wait for the next pass.
 const MAX_PASS_POSTED: usize = 256 * 1024 * 1024;
 
@@ -165,12 +167,17 @@ async fn fetch(pool: &Pool, db: &Db, message_id: &str, posted: &mut usize) -> Re
     let mut bodies: Vec<Vec<u8>> = Vec::with_capacity(spot.nzb.len());
     for segment in &spot.nzb {
         let left = MAX_NZB_POSTED.saturating_sub(bodies.iter().map(Vec::len).sum::<usize>());
-        match pool.fetch_body_capped(&format!("<{segment}>"), MAX_NZB_ARTICLE.min(left)).await {
+        let cap = MAX_NZB_ARTICLE.min(left);
+        match pool.fetch_body_capped(&format!("<{segment}>"), cap).await {
             Ok(Some(body)) => {
                 *posted += body.len();
                 bodies.push(body);
             }
-            Ok(None) => return Ok(skipped(Some(nzb_ref))),
+            // a body past the cap was read up to it (and a line more) before it was given up: that counts too
+            Ok(None) => {
+                *posted += cap + CAP_OVERSHOOT;
+                return Ok(skipped(Some(nzb_ref)));
+            }
             Err(e) if says_absent(&e) => return Ok(skipped(Some(nzb_ref))),
             Err(e) => return Err(e.into()),
         }

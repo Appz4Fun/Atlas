@@ -282,7 +282,15 @@ pub fn placement(
     let id: Option<i64> = conn
         .query_row("select id from releases where name = ? and group_name = ?", params![name, group], |r| r.get(0))
         .optional()?;
-    let Some(id) = id else { return Ok(Placement::Free) };
+    let Some(id) = id else {
+        // a frozen release with the name would be thawed by the save and the spot's articles folded into it
+        // (`frozen::thaw_incoming`); its articles aren't to hand to compare, so it counts as another post
+        let frozen = crate::frozen::attached(conn)?
+            && conn
+                .prepare_cached("select 1 from frozen.frozen_releases where name = ? and group_name = ?")?
+                .exists(params![name, group])?;
+        return Ok(if frozen { Placement::Taken } else { Placement::Free });
+    };
     let same_nzb = conn
         .prepare_cached("select 1 from spots where release_id = ? and nzb_key = ?")?
         .exists(params![id, nzb_key])?;
@@ -637,5 +645,21 @@ mod tests {
         assert_eq!(found[&a].poster, "p");
         assert_eq!(found[&b].imdb_id.as_deref(), Some("tt1"));
         assert_eq!(found[&b].kind, "series");
+    }
+
+    #[test]
+    fn a_frozen_release_with_the_title_counts_as_another_post() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("create table releases (id INTEGER PRIMARY KEY, name TEXT, group_name TEXT)").unwrap();
+        conn.execute_batch(SPOTS.create).unwrap();
+        let files = vec![("a.mkv".to_string(), vec!["a@x".to_string()])];
+        assert_eq!(placement(&conn, "Title", "g", "k", &files).unwrap(), Placement::Free);
+        conn.execute("attach ':memory:' as frozen", []).unwrap();
+        conn.execute_batch("create table frozen.frozen_releases (id INTEGER PRIMARY KEY, name TEXT, group_name TEXT)")
+            .unwrap();
+        assert_eq!(placement(&conn, "Title", "g", "k", &files).unwrap(), Placement::Free);
+        conn.execute("insert into frozen.frozen_releases values (3, 'Title', 'g')", []).unwrap();
+        assert_eq!(placement(&conn, "Title", "g", "k", &files).unwrap(), Placement::Taken);
+        assert_eq!(placement(&conn, "Title", "other", "k", &files).unwrap(), Placement::Free);
     }
 }
