@@ -131,14 +131,10 @@ pub fn inventory(data: &[u8]) -> Inventory;
 ## Atlas code that still does PAR2 / CRC math itself
 
 Left as it is in the change that added `atlas::parity`, one change at a time. Each is a
-follow-up that moves its callers onto `atlas::parity`:
+follow-up that moves its callers onto `atlas::parity`. `src/gf2.rs` was the first: it is now
+only re-exports of `par_rs::gf2`, so every CRC-32 postprocess takes of a BODY runs par-rs's
+hardware path (the bench rows above are from before that change). Still to go:
 
-- `src/gf2.rs`: GF(2) CRC-32 algebra (`multmodp`, `crc32_combine`, `crc32_zeros`,
-  `crc32_unzero`, `fold_yenc_parts`, ...), the same functions and signatures as `par_rs::gf2`.
-  Its `crc32` is a bit-at-a-time loop, 51x slower than par-rs's, and `postprocess/step.rs`
-  runs it on every BODY Atlas reads: this is the migration that pays most.
-  Callers: `keys.rs`, `postprocess/step.rs`, `par2.rs`, `tests/nntp_merging.rs`,
-  `tests/nntp_adversarial_m3.rs`. Can become re-exports of `atlas::parity`.
 - `src/par2.rs`: its own PAR2 packet scanner and `Inventory` / `Par2File`. The crate's types
   have the same fields except Atlas's `creators` and the meaning of `sealed` (requests 2 and
   3), and `is_base_par2` differs (request 5). Its inventory also stops reading IFSC packets
