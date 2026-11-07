@@ -912,15 +912,10 @@ pub fn start(config: &SharedCatalogConfig, stop: Arc<AtomicBool>) {
         return;
     }
     if config.reads {
-        let config = config.clone();
-        let _ = std::thread::Builder::new().name("shared-catalog-indexes".into()).spawn(move || {
-            let built = connect(&config).map_err(|e| format!("{e:#}")).and_then(|mut pg| {
-                ensure_schema(&mut pg, &[]).and_then(|()| reader::build_indexes(&mut pg)).map_err(|e| e.to_string())
-            });
-            if let Err(e) = built {
-                eprintln!("shared catalog: read indexes: {e}");
-            }
-        });
+        let (config, stop) = (config.clone(), stop.clone());
+        let _ = std::thread::Builder::new()
+            .name("shared-catalog-indexes".into())
+            .spawn(move || reader::build_indexes_until_done(&config, &stop));
     }
     // a thread and a Postgres connection per shard: one shard's backlog, or a fill holding its lock, doesn't hold up
     // the others
@@ -1412,36 +1407,67 @@ pub mod reader {
         c.is_on() && c.reads && chrono::Utc::now().timestamp() >= RESTING_UNTIL.load(Relaxed)
     }
 
-    /// Runs `read` against the catalog. None when reads are off, the catalog is resting, or the read failed: the
-    /// caller then asks the shards.
-    pub fn with<T>(read: impl FnOnce(&mut postgres::Client) -> Result<T, postgres::Error>) -> Option<T> {
+    /// The longest a read may take before the caller gives up on it and asks the shards: Postgres cancels a
+    /// statement past it (`statement_timeout`), and a connection that stops answering is left to its own thread.
+    pub const READ_DEADLINE: Duration = Duration::from_secs(2);
+
+    /// Runs `read` against the catalog, on a thread of its own so a page waits at most `READ_DEADLINE`. None when
+    /// reads are off, the catalog is resting, or the read failed or ran out of time: the caller then asks the shards.
+    pub fn with<T: Send + 'static>(
+        read: impl FnOnce(&mut postgres::Client) -> Result<T, postgres::Error> + Send + 'static,
+    ) -> Option<T> {
         if !on() {
             return None;
         }
         let pooled = CLIENTS.lock().unwrap_or_else(|e| e.into_inner()).pop();
-        let mut client = match pooled {
-            Some(c) => c,
-            None => match connect(config()) {
-                Ok(c) => c,
-                Err(e) => {
-                    rest(&format!("connect: {e:#}"));
-                    return None;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let spawned = std::thread::Builder::new().name("shared-catalog-read".into()).spawn(move || {
+            let client = match pooled {
+                Some(c) => Ok(c),
+                None => open_reader(),
+            };
+            let answer = match client {
+                Ok(mut c) => {
+                    let result = read(&mut c).map_err(|e| format!("read: {e}"));
+                    (result.is_ok().then_some(c), result)
                 }
-            },
-        };
-        match read(&mut client) {
-            Ok(v) => {
-                let mut clients = CLIENTS.lock().unwrap_or_else(|e| e.into_inner());
-                if clients.len() < POOL {
-                    clients.push(client);
+                Err(e) => (None, Err(e)),
+            };
+            // a caller that gave up has gone: the client then just closes here
+            if let Err(std::sync::mpsc::SendError((Some(c), _))) = tx.send(answer) {
+                drop(c);
+            }
+        });
+        if spawned.is_err() {
+            return None;
+        }
+        match rx.recv_timeout(READ_DEADLINE) {
+            Ok((client, Ok(v))) => {
+                if let Some(c) = client {
+                    let mut clients = CLIENTS.lock().unwrap_or_else(|e| e.into_inner());
+                    if clients.len() < POOL {
+                        clients.push(c);
+                    }
                 }
                 Some(v)
             }
-            Err(e) => {
-                rest(&format!("read: {e}"));
+            Ok((_, Err(e))) => {
+                rest(&e);
+                None
+            }
+            Err(_) => {
+                rest(&format!("no answer in {}s", READ_DEADLINE.as_secs()));
                 None
             }
         }
+    }
+
+    /// A connection for reads: Postgres cancels a statement that runs past the deadline.
+    fn open_reader() -> Result<postgres::Client, String> {
+        let mut c = connect(config()).map_err(|e| format!("connect: {e:#}"))?;
+        c.batch_execute(&format!("set statement_timeout = {}", READ_DEADLINE.as_millis()))
+            .map_err(|e| format!("connect: {e}"))?;
+        Ok(c)
     }
 
     fn rest(why: &str) {
@@ -1456,7 +1482,7 @@ pub mod reader {
         if READY.lock().unwrap_or_else(|e| e.into_inner()).contains(&index) {
             return true;
         }
-        let valid = with(|pg| {
+        let valid = with(move |pg| {
             let row = pg.query_opt(
                 "select i.indisvalid from pg_class c join pg_index i on i.indexrelid = c.oid where c.relname = $1",
                 &[&index],
@@ -1487,12 +1513,37 @@ pub mod reader {
         Ok(())
     }
 
+    /// `build_indexes` once the publisher has made the tables, retried with backoff through a catalog that's down,
+    /// until it's done or the indexer stops.
+    pub fn build_indexes_until_done(config: &SharedCatalogConfig, stop: &AtomicBool) {
+        let mut backoff = Duration::from_secs(5);
+        while !stop.load(Relaxed) {
+            let attempt = connect(config).map_err(|e| format!("{e:#}")).and_then(|mut pg| {
+                let made: bool =
+                    pg.query_one("select to_regclass('releases') is not null", &[]).map_err(|e| e.to_string())?.get(0);
+                if !made {
+                    return Err("waiting for the publisher to make the tables".to_string());
+                }
+                build_indexes(&mut pg).map_err(|e| e.to_string())
+            });
+            match attempt {
+                Ok(()) => return,
+                Err(e) => {
+                    eprintln!("shared catalog: read indexes: {e}; trying again in {}s", backoff.as_secs());
+                    super::rest(stop, backoff);
+                    backoff = (backoff * 2).min(Duration::from_secs(300));
+                }
+            }
+        }
+    }
+
     /// Every group with a release of exactly this posted name, from the catalog: `release_info::groups_of`.
     pub fn groups_of(name: &str) -> Option<Vec<crate::release_info::GroupPosting>> {
         if !index_ready("releases_name") {
             return None;
         }
-        with(|pg| query_groups(pg, name))
+        let name = name.to_string();
+        with(move |pg| query_groups(pg, &name))
     }
 
     pub fn query_groups(
