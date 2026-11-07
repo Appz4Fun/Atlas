@@ -25,7 +25,9 @@ use crate::config::SharedCatalogConfig;
 use crate::metrics::names;
 use crate::store;
 
-/// Every table copied: what a lookup across groups or posts compares. Per-file article data stays in the shards.
+/// Every table copied: what a lookup across groups or posts compares. Per-file article data stays in the shards, and
+/// so do the queues that only say what's waiting (`freeze_pending`, `pp_queue`): they churn all day and nothing
+/// looks across groups in them.
 pub const TABLES: &[&str] = &[
     "releases",
     "release_category",
@@ -37,6 +39,8 @@ pub const TABLES: &[&str] = &[
     "release_nfo_password",
     "release_opensubtitles",
     "release_stills",
+    "release_audio_print",
+    "release_audio_anchor",
     "release_cover",
     "media_release",
     "predb_match",
@@ -50,11 +54,9 @@ pub const TABLES: &[&str] = &[
     "collections",
     "junk_releases",
     "junk_collections",
-    "freeze_pending",
     "freeze_exempt",
     "nzb_pointed",
     "pp_state",
-    "pp_queue",
     "pp_walks",
     "sidecars",
 ];
@@ -64,6 +66,60 @@ pub const TABLES: &[&str] = &[
 const SHARD_KEYED: &[&str] = &["collections", "junk_collections", "pp_walks"];
 
 pub const OUTBOX: &str = "catalog_outbox";
+
+/// The shard's `meta` key naming its outbox, made with it (`sync_triggers`).
+const EPOCH: &str = "catalog_epoch";
+
+/// The shard's outbox epoch, None while the catalog is off.
+pub fn epoch(conn: &Connection) -> rusqlite::Result<Option<i64>> {
+    use rusqlite::OptionalExtension;
+    let has_meta: i64 =
+        conn.query_row("select count(*) from main.sqlite_schema where type = 'table' and name = 'meta'", [], |r| {
+            r.get(0)
+        })?;
+    if has_meta == 0 {
+        return Ok(None);
+    }
+    conn.query_row("select value from main.meta where key = ?1", [EPOCH], |r| r.get(0)).optional()
+}
+
+/// Next to the shard, how far Postgres has taken its outbox (`epoch seq`): the shard's writer prunes up to it
+/// (`prune_acked`), soo the publisher never has to wait for the shard's write lock.
+fn cursor_path(shard: &Path) -> PathBuf {
+    let mut p = shard.as_os_str().to_owned();
+    p.push(".catalog-cursor");
+    PathBuf::from(p)
+}
+
+fn write_cursor(shard: &Path, epoch: i64, seq: i64) -> std::io::Result<()> {
+    let path = cursor_path(shard);
+    let tmp = path.with_extension("catalog-cursor.tmp");
+    std::fs::write(&tmp, format!("{epoch} {seq}\n"))?;
+    std::fs::rename(tmp, path)
+}
+
+fn read_cursor(shard: &Path) -> Option<(i64, i64)> {
+    let text = std::fs::read_to_string(cursor_path(shard)).ok()?;
+    let mut parts = text.split_whitespace().map(|p| p.parse::<i64>().ok());
+    Some((parts.next()??, parts.next()??))
+}
+
+/// The most sent changes one housekeeping tick takes out of the outbox.
+const PRUNE_PER_TICK: i64 = 50_000;
+
+/// For the shard's writer, between its transactions: takes out of the outbox what Postgres has, as far as the
+/// cursor file next to the shard says, if it's about this outbox. Nothing when the catalog is off.
+pub fn prune_acked(conn: &Connection) -> rusqlite::Result<usize> {
+    let Some(shard) = conn.path().filter(|p| !p.is_empty()).map(PathBuf::from) else { return Ok(0) };
+    let Some((epoch_sent, seq)) = read_cursor(&shard) else { return Ok(0) };
+    if epoch(conn)? != Some(epoch_sent) {
+        return Ok(0);
+    }
+    conn.execute(
+        &format!("delete from {OUTBOX} where seq in (select seq from {OUTBOX} where seq <= ?1 order by seq limit ?2)"),
+        params![seq, PRUNE_PER_TICK],
+    )
+}
 
 /// A column's Postgres type, from its declared SQLite type.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -196,6 +252,19 @@ impl Table {
         format!("delete from {} where {}", quote(&self.name), wh.join(" and "))
     }
 
+    /// `delete` of many rows this shard sent, their keys as arrays: `$2` (and `$3`) one per key column.
+    pub fn delete_many_sql(&self) -> String {
+        let key: Vec<String> = self.key.iter().map(|c| quote(c)).collect();
+        let types: Vec<&str> = (0..self.key.len()).map(|i| self.key_type(i).sql()).collect();
+        let arrays: Vec<String> = types.iter().enumerate().map(|(i, t)| format!("${}::{t}[]", i + 2)).collect();
+        format!(
+            "delete from {} where shard = $1 and ({}) in (select * from unnest({}))",
+            quote(&self.name),
+            key.join(", "),
+            arrays.join(", ")
+        )
+    }
+
     fn select_sql(&self) -> String {
         let cols: Vec<String> = self.cols.iter().map(|(c, _)| quote(c)).collect();
         let wh: Vec<String> = self.key.iter().enumerate().map(|(i, c)| format!("{} = ?{}", quote(c), i + 1)).collect();
@@ -292,7 +361,17 @@ pub fn tables(conn: &Connection) -> rusqlite::Result<Vec<Table>> {
 pub fn sync_triggers(conn: &Connection, on: bool) -> rusqlite::Result<()> {
     let tables = tables(conn)?;
     if on {
-        let mut sql = outbox_ddl("main");
+        // a table no longer copied loses its triggers; the rest are made again
+        // the triggers go first: rebuilding an old outbox renames it, which would take them along
+        let mut sql = drop_catalog_triggers(conn)?;
+        sql.push_str(&upgrade_outbox(conn)?);
+        sql.push_str(&outbox_ddl("main"));
+        // which outbox this is: its seqs start again when it's made again, soo a position saved for an earlier one
+        // means nothing
+        sql.push_str(&format!(
+            "create table if not exists meta (key TEXT PRIMARY KEY, value INTEGER);
+             insert or ignore into meta (key, value) values ('{EPOCH}', abs(random()) % 9007199254740991 + 1);"
+        ));
         for t in &tables {
             sql.push_str(&t.triggers());
         }
@@ -306,23 +385,53 @@ pub fn sync_triggers(conn: &Connection, on: bool) -> rusqlite::Result<()> {
         if present == 0 {
             return Ok(());
         }
-        let mut sql = String::new();
-        for t in &tables {
-            for kind in ["ai", "ad", "au"] {
-                sql.push_str(&format!("drop trigger if exists catalog_{}_{kind};", t.name));
-            }
-        }
-        sql.push_str(&format!("drop table if exists {OUTBOX};"));
+        // every catalog trigger, a retired table's too: left behind, it would write to the outbox about to go
+        let mut sql = drop_catalog_triggers(conn)?;
+        sql.push_str(&format!(
+            "drop table if exists {OUTBOX};
+             create table if not exists meta (key TEXT PRIMARY KEY, value INTEGER);
+             delete from meta where key = '{EPOCH}';"
+        ));
         conn.execute_batch(&format!("begin; {sql} commit;"))
     }
 }
 
+/// `drop trigger` for every catalog trigger the shard has, whatever table it's on.
+fn drop_catalog_triggers(conn: &Connection) -> rusqlite::Result<String> {
+    let names: Vec<String> = conn
+        .prepare("select name from main.sqlite_schema where type = 'trigger' and name like 'catalog\\_%' escape '\\'")?
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(names.iter().map(|n| format!("drop trigger if exists {};", quote(n))).collect())
+}
+
+/// AUTOINCREMENT: a seq is never given out twice, not even once the outbox is empty, soo a position saved in
+/// Postgres (`catalog_cursor`) always means the same changes.
 fn outbox_ddl(schema: &str) -> String {
     format!(
         "create table if not exists {schema}.{OUTBOX} (
-            seq INTEGER PRIMARY KEY, tbl TEXT NOT NULL, k1, k2, at INTEGER NOT NULL DEFAULT (unixepoch())
+            seq INTEGER PRIMARY KEY AUTOINCREMENT, tbl TEXT NOT NULL, k1, k2, at INTEGER NOT NULL DEFAULT (unixepoch())
          );"
     )
+}
+
+/// An outbox made before AUTOINCREMENT, rebuilt with it, its rows and seqs kept: run with no catalog triggers in
+/// place (a rename would carry them along to the old table).
+fn upgrade_outbox(conn: &Connection) -> rusqlite::Result<String> {
+    use rusqlite::OptionalExtension;
+    let sql: Option<String> = conn
+        .query_row("select sql from main.sqlite_schema where type = 'table' and name = ?1", [OUTBOX], |r| r.get(0))
+        .optional()?;
+    match sql {
+        Some(sql) if !sql.to_ascii_uppercase().contains("AUTOINCREMENT") => Ok(format!(
+            "alter table {OUTBOX} rename to {OUTBOX}_old;
+             {ddl}
+             insert into {OUTBOX} (seq, tbl, k1, k2, at) select seq, tbl, k1, k2, at from {OUTBOX}_old order by seq;
+             drop table {OUTBOX}_old;",
+            ddl = outbox_ddl("main"),
+        )),
+        _ => Ok(String::new()),
+    }
 }
 
 /// For a compaction, which builds a shard afresh from the original attached as `old`: the original's waiting
@@ -345,9 +454,30 @@ pub fn carry_outbox(conn: &Connection) -> rusqlite::Result<bool> {
         .query_map([], |r| r.get(0))?
         .collect::<rusqlite::Result<_>>()?;
     let changed = cols.iter().map(|c| format!("r.{0} is not o.{0}", quote(c))).collect::<Vec<_>>().join(" or ");
+    // the next seq stays past every one given out, an emptied outbox's too: the original's AUTOINCREMENT mark if
+    // it has one (an outbox from before AUTOINCREMENT, and its shard, have none), and its last row's
+    let has_sequence: i64 = conn.query_row(
+        "select count(*) from old.sqlite_schema where type = 'table' and name = 'sqlite_sequence'",
+        [],
+        |r| r.get(0),
+    )?;
+    let marked: i64 = if has_sequence > 0 {
+        conn.query_row(
+            &format!("select coalesce((select seq from old.sqlite_sequence where name = '{OUTBOX}'), 0)"),
+            [],
+            |r| r.get(0),
+        )?
+    } else {
+        0
+    };
+    let last: i64 = conn.query_row(&format!("select coalesce(max(seq), 0) from old.{OUTBOX}"), [], |r| r.get(0))?;
+    let high = marked.max(last);
     conn.execute_batch(&format!(
         "{ddl}
-         insert into main.{OUTBOX} (tbl, k1, k2, at) select tbl, k1, k2, at from old.{OUTBOX} order by seq;
+         insert into main.{OUTBOX} (seq, tbl, k1, k2, at) select seq, tbl, k1, k2, at from old.{OUTBOX} order by seq;
+         update main.sqlite_sequence set seq = max(seq, {high}) where name = '{OUTBOX}';
+         insert into main.sqlite_sequence (name, seq) select '{OUTBOX}', {high}
+         where not exists (select 1 from main.sqlite_sequence where name = '{OUTBOX}');
          insert into main.{OUTBOX} (tbl, k1, k2)
          select 'releases', r.id, null from main.releases r join old.releases o on o.id = r.id
          where {changed};",
@@ -449,11 +579,23 @@ pub const BATCH_BYTES: usize = 32 << 20;
 /// rows, in one read transaction so the rows are at least as new as every change read. `max_seq` is the last
 /// change taken; a batch that stopped early says so in `full`.
 pub fn read_batch(conn: &Connection, tables: &[Table], limit: usize, max_bytes: usize) -> rusqlite::Result<Batch> {
+    read_batch_after(conn, tables, limit, max_bytes, 0)
+}
+
+/// `read_batch` of the changes after seq `after`, the ones Postgres hasn't taken yet.
+pub fn read_batch_after(
+    conn: &Connection,
+    tables: &[Table],
+    limit: usize,
+    max_bytes: usize,
+    after: i64,
+) -> rusqlite::Result<Batch> {
     let tx = conn.unchecked_transaction()?;
     let mut changes = Vec::new();
     {
-        let mut stmt = tx.prepare_cached(&format!("select seq, tbl, k1, k2 from {OUTBOX} order by seq limit ?1"))?;
-        let mut rows = stmt.query([limit as i64])?;
+        let mut stmt =
+            tx.prepare_cached(&format!("select seq, tbl, k1, k2 from {OUTBOX} where seq > ?2 order by seq limit ?1"))?;
+        let mut rows = stmt.query(params![limit as i64, after])?;
         while let Some(r) = rows.next()? {
             changes.push(Change { seq: r.get(0)?, tbl: r.get(1)?, k1: r.get(2)?, k2: r.get(3)? });
         }
@@ -575,6 +717,18 @@ pub fn send(
     tables: &[Table],
     batch: &Batch,
 ) -> Result<(u64, u64), postgres::Error> {
+    send_with_cursor(pg, shard, tables, batch, None)
+}
+
+/// `send`, also moving the shard's position in `catalog_cursor` to the batch's last change (`epoch`, seq) in the
+/// same transaction: what's past it is what's left to send.
+pub fn send_with_cursor(
+    pg: &mut postgres::Client,
+    shard: usize,
+    tables: &[Table],
+    batch: &Batch,
+    cursor: Option<(i64, i64)>,
+) -> Result<(u64, u64), postgres::Error> {
     let shard_v: i16 = shard as i16;
     let mut tx = pg.transaction()?;
     lock_shard(&mut tx, shard)?;
@@ -598,18 +752,94 @@ pub fn send(
     }
     for (name, keys) in &batch.deletes {
         let Some(t) = tables.iter().find(|t| &t.name == name) else { continue };
-        let stmt = tx.prepare(&t.delete_sql())?;
-        for key in keys {
+        let sql = t.delete_many_sql();
+        for chunk in keys.chunks(DELETES_PER_STATEMENT) {
             let mut ps: Vec<Box<dyn postgres::types::ToSql + Sync + Send>> = vec![Box::new(shard_v)];
-            for (i, v) in key.iter().enumerate() {
-                ps.push(pg_value(v, t.key_type(i)));
+            for i in 0..t.key.len() {
+                ps.push(key_array(chunk.iter().map(|k| &k[i]), t.key_type(i)));
             }
             let refs: Vec<&(dyn postgres::types::ToSql + Sync)> = ps.iter().map(|p| &**p as _).collect();
-            del += tx.execute(&stmt, &refs)?;
+            del += tx.execute(sql.as_str(), &refs)?;
         }
+    }
+    if let Some((epoch, seq)) = cursor {
+        tx.execute(
+            "insert into catalog_cursor (shard, epoch, seq) values ($1, $2, $3) on conflict (shard) do update set
+                seq = case when catalog_cursor.epoch = excluded.epoch then greatest(catalog_cursor.seq, excluded.seq)
+                      else excluded.seq end,
+                epoch = excluded.epoch",
+            &[&shard_v, &epoch, &seq],
+        )?;
     }
     tx.commit()?;
     Ok((up, del))
+}
+
+/// Postgres's position in the shard's outbox: 0 when it has none for this epoch.
+pub fn pg_cursor(pg: &mut postgres::Client, shard: usize, epoch: Option<i64>) -> Result<i64, postgres::Error> {
+    let Some(epoch) = epoch else { return Ok(0) };
+    // a catalog nothing has written to yet has no position
+    let made: bool = pg.query_one("select to_regclass('catalog_cursor') is not null", &[])?.get(0);
+    if !made {
+        return Ok(0);
+    }
+    let row = pg.query_opt("select epoch, seq from catalog_cursor where shard = $1", &[&(shard as i16)])?;
+    Ok(row.filter(|r| r.get::<_, i64>(0) == epoch).map_or(0, |r| r.get(1)))
+}
+
+/// Keys one `delete` takes: they go as arrays, a parameter per key column.
+const DELETES_PER_STATEMENT: usize = 5_000;
+
+/// One key column of many rows as a Postgres array of the column's type, for `delete_many_sql`.
+fn key_array<'a>(values: impl Iterator<Item = &'a Value>, t: PgType) -> Box<dyn postgres::types::ToSql + Sync + Send> {
+    let values: Vec<&Value> = values.collect();
+    match t {
+        PgType::Int => Box::new(
+            values
+                .iter()
+                .map(|v| match v {
+                    Value::Integer(i) => Some(*i),
+                    Value::Real(f) => Some(*f as i64),
+                    Value::Text(s) => s.trim().parse::<i64>().ok(),
+                    _ => None,
+                })
+                .collect::<Vec<Option<i64>>>(),
+        ),
+        PgType::Real => Box::new(
+            values
+                .iter()
+                .map(|v| match v {
+                    Value::Integer(i) => Some(*i as f64),
+                    Value::Real(f) => Some(*f),
+                    _ => None,
+                })
+                .collect::<Vec<Option<f64>>>(),
+        ),
+        PgType::Text => Box::new(
+            values
+                .iter()
+                .map(|v| match v {
+                    Value::Text(s) => Some(s.replace('\0', "")),
+                    Value::Integer(i) => Some(i.to_string()),
+                    Value::Real(f) => Some(f.to_string()),
+                    Value::Blob(b) => Some(String::from_utf8_lossy(b).replace('\0', "")),
+                    Value::Null => None,
+                })
+                .collect::<Vec<Option<String>>>(),
+        ),
+        PgType::Bytes => Box::new(
+            values
+                .iter()
+                .map(|v| match v {
+                    Value::Blob(b) => Some(b.clone()),
+                    Value::Text(s) => Some(s.clone().into_bytes()),
+                    Value::Integer(i) => Some(i.to_string().into_bytes()),
+                    Value::Real(f) => Some(f.to_string().into_bytes()),
+                    Value::Null => None,
+                })
+                .collect::<Vec<Option<Vec<u8>>>>(),
+        ),
+    }
 }
 
 /// The first half of the advisory lock key: a shard's writes to Postgres hold the lock (this, shard) for their
@@ -629,6 +859,9 @@ pub fn ack(conn: &Connection, max_seq: i64) -> rusqlite::Result<usize> {
 
 /// Makes or widens every copied table in Postgres.
 pub fn ensure_schema(pg: &mut postgres::Client, tables: &[Table]) -> Result<(), postgres::Error> {
+    pg.batch_execute(
+        "create table if not exists catalog_cursor (shard smallint primary key, epoch bigint not null, seq bigint not null)",
+    )?;
     for t in tables {
         for sql in t.ddl() {
             pg.batch_execute(&sql)?;
@@ -639,9 +872,11 @@ pub fn ensure_schema(pg: &mut postgres::Client, tables: &[Table]) -> Result<(), 
 
 /// Each shard's waiting changes and how long the oldest has waited, from the ends of the outbox only: a batch takes
 /// out a run of the oldest seqs, soo what's left is every seq from the first to the last.
-fn outbox_gauges(shard: usize, conn: &Connection) {
+fn outbox_gauges(shard: usize, conn: &Connection, acked: i64) {
     let (first, last): (Option<i64>, Option<i64>) = conn
-        .query_row(&format!("select min(seq), max(seq) from {OUTBOX}"), [], |r| Ok((r.get(0)?, r.get(1)?)))
+        .query_row(&format!("select min(seq), max(seq) from {OUTBOX} where seq > ?1"), [acked], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
         .unwrap_or((None, None));
     let oldest: Option<i64> = first
         .and_then(|seq| conn.query_row(&format!("select at from {OUTBOX} where seq = ?1"), [seq], |r| r.get(0)).ok());
@@ -672,14 +907,19 @@ pub fn start(config: &SharedCatalogConfig, stop: Arc<AtomicBool>) {
     if !on {
         return;
     }
-    let config = config.clone();
-    let _ = std::thread::Builder::new().name("shared-catalog".into()).spawn(move || run(&main, &config, &stop));
+    // a thread and a Postgres connection per shard: one shard's backlog, or a fill holding its lock, doesn't hold up
+    // the others
+    for (shard, path) in store::shard_paths(&main).into_iter().enumerate().filter(|(_, p)| p.exists()) {
+        let (main, config, stop) = (main.clone(), config.clone(), stop.clone());
+        let _ = std::thread::Builder::new()
+            .name(format!("shared-catalog-{shard}"))
+            .spawn(move || run(&main, &[(shard, path)], &config, &stop));
+    }
 }
 
-/// The publisher: a batch from each shard in turn, resting when every outbox is empty, reconnecting after a failure.
-pub fn run(main: &Path, config: &SharedCatalogConfig, stop: &AtomicBool) {
-    let shards: Vec<(usize, PathBuf)> =
-        store::shard_paths(main).into_iter().enumerate().filter(|(_, p)| p.exists()).collect();
+/// A publisher: a batch from each of `shards` in turn, resting when their outboxes are empty, reconnecting after a
+/// failure.
+pub fn run(main: &Path, shards: &[(usize, PathBuf)], config: &SharedCatalogConfig, stop: &AtomicBool) {
     let mut backoff = Duration::from_secs(1);
     while !stop.load(Relaxed) {
         let mut pg = match connect(config) {
@@ -692,7 +932,7 @@ pub fn run(main: &Path, config: &SharedCatalogConfig, stop: &AtomicBool) {
                 continue;
             }
         };
-        match publish(&mut pg, main, &shards, config, stop) {
+        match publish(&mut pg, main, shards, config, stop) {
             Ok(()) => return,
             Err(e) => {
                 names::SHARED_CATALOG_FAILURES.inc(&[("stage", "publish")], 1);
@@ -710,8 +950,24 @@ const SESSION: Duration = Duration::from_secs(60);
 /// A compaction in this process is about to start: the publisher lets go of the shards and stays away until it's
 /// done (`make_way_for_compaction`).
 static COMPACTION_WANTED: AtomicBool = AtomicBool::new(false);
-/// The publisher has the shards open and compaction held off.
-static HOLDING: AtomicBool = AtomicBool::new(false);
+/// Publisher threads that have their shard open and compaction held off.
+static HOLDING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Counts a publisher thread in `HOLDING` for as long as it lives.
+struct Held;
+
+impl Held {
+    fn new() -> Held {
+        HOLDING.fetch_add(1, Relaxed);
+        Held
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        HOLDING.fetch_sub(1, Relaxed);
+    }
+}
 
 /// Clears the wish to compact when dropped, once the compaction is over.
 pub struct MakingWay(());
@@ -728,7 +984,7 @@ impl Drop for MakingWay {
 pub fn make_way_for_compaction(wait: Duration) -> MakingWay {
     COMPACTION_WANTED.store(true, Relaxed);
     let until = std::time::Instant::now() + wait;
-    while HOLDING.load(Relaxed) && std::time::Instant::now() < until {
+    while HOLDING.load(Relaxed) > 0 && std::time::Instant::now() < until {
         std::thread::sleep(Duration::from_millis(50));
     }
     MakingWay(())
@@ -739,15 +995,26 @@ pub fn make_way_for_compaction(wait: Duration) -> MakingWay {
 /// soo the publisher opens them only while compaction is held off, and lets go when it has nothing to send or after
 /// `SESSION`.
 struct Session {
-    // dropped before the hold
-    open: Vec<(usize, Connection, Vec<Table>)>,
+    // dropped in this order: the connections, the hold, then the count
+    open: Vec<Open>,
     _hold: crate::compact::WriteGuard,
+    _held: Held,
     since: std::time::Instant,
+}
+
+/// A shard open in a session: its outbox epoch and how far Postgres has taken it.
+struct Open {
+    shard: usize,
+    path: PathBuf,
+    conn: Connection,
+    tables: Vec<Table>,
+    epoch: Option<i64>,
+    acked: i64,
 }
 
 impl Drop for Session {
     fn drop(&mut self) {
-        // the connections close before the hold goes (field order); the flag says so once both are gone
+        // the connections close before the hold goes (field order), and the count after both
         self.open.clear();
     }
 }
@@ -763,10 +1030,8 @@ fn publish(
     let mut ensured: BTreeMap<usize, Vec<Table>> = BTreeMap::new();
     let mut gauges_at: Option<std::time::Instant> = None;
     let mut session: Option<Session> = None;
-    let _clear = ClearHolding;
     while !stop.load(Relaxed) {
         if session.is_none() {
-            HOLDING.store(false, Relaxed);
             if COMPACTION_WANTED.load(Relaxed) {
                 rest(stop, Duration::from_millis(config.interval_ms));
                 continue;
@@ -779,52 +1044,56 @@ fn publish(
             let mut open = Vec::new();
             for (shard, path) in shards {
                 let conn = crate::db::open_shard(path)?;
+                // its reads never wait in WAL; the one write, taking out what was sent, only tries (the shard's
+                // writer takes it out anyway, `prune_acked`)
+                conn.busy_timeout(Duration::from_millis(200))?;
                 let tables = tables(&conn)?;
                 if ensured.get(shard) != Some(&tables) {
                     ensure_schema(pg, &tables)?;
                     ensured.insert(*shard, tables.clone());
                 }
-                open.push((*shard, conn, tables));
+                let epoch = epoch(&conn)?;
+                let acked = pg_cursor(pg, *shard, epoch)?;
+                open.push(Open { shard: *shard, path: path.clone(), conn, tables, epoch, acked });
             }
-            session = Some(Session { open, _hold: hold, since: std::time::Instant::now() });
-            HOLDING.store(true, Relaxed);
+            session = Some(Session { open, _hold: hold, _held: Held::new(), since: std::time::Instant::now() });
         }
-        let Some(open) = session.as_ref().map(|s| &s.open) else { continue };
+        let Some(open) = session.as_mut().map(|s| &mut s.open) else { continue };
         let mut busy = false;
-        for (shard, conn, tables) in open {
-            let batch = read_batch(conn, tables, config.batch, BATCH_BYTES)?;
+        for o in open.iter_mut() {
+            let batch = read_batch_after(&o.conn, &o.tables, config.batch, BATCH_BYTES, o.acked)?;
             if !batch.is_empty() {
-                let (up, del) = crate::metrics::timed("shared_catalog.send", || send(pg, *shard, tables, &batch))?;
-                ack(conn, batch.max_seq)?;
+                let cursor = o.epoch.map(|e| (e, batch.max_seq));
+                let (up, del) = crate::metrics::timed("shared_catalog.send", || {
+                    send_with_cursor(pg, o.shard, &o.tables, &batch, cursor)
+                })?;
+                o.acked = batch.max_seq;
+                if let Some(e) = o.epoch {
+                    let _ = write_cursor(&o.path, e, o.acked);
+                }
+                // taken out now if the lock is free; otherwise the shard's writer does it
+                if ack(&o.conn, o.acked).is_err() {
+                    names::SHARED_CATALOG_FAILURES.inc(&[("stage", "ack_deferred")], 1);
+                }
                 names::SHARED_CATALOG_ROWS.inc(&[("op", "upsert")], up);
                 names::SHARED_CATALOG_ROWS.inc(&[("op", "delete")], del);
                 busy |= batch.full;
             }
         }
         if gauges_at.is_none_or(|at| at.elapsed() >= Duration::from_secs(30)) {
-            for (shard, conn, _) in open {
-                outbox_gauges(*shard, conn);
+            for o in open.iter() {
+                outbox_gauges(o.shard, &o.conn, o.acked);
             }
             gauges_at = Some(std::time::Instant::now());
         }
         if !busy || COMPACTION_WANTED.load(Relaxed) || session.as_ref().is_some_and(|s| s.since.elapsed() >= SESSION) {
             session = None;
-            HOLDING.store(false, Relaxed);
         }
         if !busy {
             rest(stop, Duration::from_millis(config.interval_ms));
         }
     }
     Ok(())
-}
-
-/// The publisher's hold is gone however `publish` ends, an error included.
-struct ClearHolding;
-
-impl Drop for ClearHolding {
-    fn drop(&mut self) {
-        HOLDING.store(false, Relaxed);
-    }
 }
 
 fn rest(stop: &AtomicBool, d: Duration) {
@@ -1066,7 +1335,9 @@ pub fn run_check(prune: bool) -> i32 {
         let mut clean = true;
         for (shard, path) in shards {
             let conn = crate::db::open_shard(&path)?;
-            let waiting: i64 = conn.query_row(&format!("select count(*) from {OUTBOX}"), [], |r| r.get(0))?;
+            let acked = pg_cursor(&mut pg, shard, epoch(&conn)?)?;
+            let waiting: i64 =
+                conn.query_row(&format!("select count(*) from {OUTBOX} where seq > ?1"), [acked], |r| r.get(0))?;
             println!("shard {shard}: {waiting} changes waiting in the outbox");
             for c in check_shard(&conn, &mut pg, shard, prune)? {
                 let mark = if c.shard_rows == c.pg_rows && c.stale == 0 { "ok" } else { "differs" };
@@ -1189,18 +1460,18 @@ mod tests {
     #[test]
     fn a_compaction_waits_for_the_publisher_to_let_go_and_keeps_it_away_till_done() {
         let _one = PG.lock().unwrap_or_else(|e| e.into_inner());
-        HOLDING.store(true, Relaxed);
-        let publisher = std::thread::spawn(|| {
+        let held = Held::new();
+        let publisher = std::thread::spawn(move || {
             // the publisher sees the wish at the end of its batch
             while !COMPACTION_WANTED.load(Relaxed) {
                 std::thread::sleep(Duration::from_millis(5));
             }
             std::thread::sleep(Duration::from_millis(100));
-            HOLDING.store(false, Relaxed);
+            drop(held);
         });
         let started = std::time::Instant::now();
         let way = make_way_for_compaction(Duration::from_secs(10));
-        assert!(!HOLDING.load(Relaxed));
+        assert_eq!(HOLDING.load(Relaxed), 0);
         assert!(started.elapsed() >= Duration::from_millis(100), "it waited for the let-go");
         assert!(COMPACTION_WANTED.load(Relaxed), "and the publisher stays away meanwhile");
         drop(way);
@@ -1210,6 +1481,181 @@ mod tests {
         let started = std::time::Instant::now();
         drop(make_way_for_compaction(Duration::from_secs(10)));
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn a_table_no_longer_copied_loses_its_triggers() {
+        let conn = shard();
+        conn.execute_batch(
+            "create table pp_queue (release_id INTEGER PRIMARY KEY, due_at INTEGER NOT NULL);
+             create table catalog_outbox (seq INTEGER PRIMARY KEY, tbl TEXT NOT NULL, k1, k2, at INTEGER);
+             create trigger catalog_pp_queue_ai after insert on pp_queue begin
+                insert into catalog_outbox (tbl, k1) values ('pp_queue', new.release_id);
+             end;",
+        )
+        .unwrap();
+        sync_triggers(&conn, true).unwrap();
+        conn.execute("insert into pp_queue values (8, 1)", []).unwrap();
+        let waiting: i64 = conn.query_row("select count(*) from catalog_outbox", [], |r| r.get(0)).unwrap();
+        assert_eq!(waiting, 0, "pp_queue isn't copied any more");
+        conn.execute("insert into releases (id, name) values (8, 'a')", []).unwrap();
+        let waiting: i64 = conn.query_row("select count(*) from catalog_outbox", [], |r| r.get(0)).unwrap();
+        assert_eq!(waiting, 1, "the copied tables still are");
+        // and turned off, a retired table's trigger goes too, before the outbox it writes to
+        conn.execute_batch(
+            "create trigger catalog_pp_queue_ai after insert on pp_queue begin
+                insert into catalog_outbox (tbl, k1) values ('pp_queue', new.release_id);
+             end;",
+        )
+        .unwrap();
+        sync_triggers(&conn, false).unwrap();
+        conn.execute("insert into pp_queue values (16, 1)", []).unwrap();
+        let left: i64 =
+            conn.query_row("select count(*) from sqlite_schema where name like 'catalog%'", [], |r| r.get(0)).unwrap();
+        assert_eq!(left, 0);
+        assert_eq!(
+            tables(&conn).unwrap().iter().find(|t| t.name == "par2_files").unwrap().delete_many_sql(),
+            "delete from \"par2_files\" where shard = $1 and (\"release_id\", \"file_id\") in (select * from unnest($2::bigint[], $3::bytea[]))"
+        );
+    }
+
+    #[test]
+    fn an_outbox_has_an_epoch_and_a_batch_starts_after_what_postgres_has() {
+        let conn = shard();
+        conn.execute_batch("create table meta (key TEXT PRIMARY KEY, value INTEGER);").unwrap();
+        assert_eq!(epoch(&conn).unwrap(), None);
+        sync_triggers(&conn, true).unwrap();
+        let first = epoch(&conn).unwrap().unwrap();
+        sync_triggers(&conn, true).unwrap();
+        assert_eq!(epoch(&conn).unwrap(), Some(first), "the same outbox, the same epoch");
+        for i in 1..=5 {
+            conn.execute("insert into releases (id, name) values (?1, 'x')", [i * 8]).unwrap();
+        }
+        let t = tables(&conn).unwrap();
+        let rest = read_batch_after(&conn, &t, 100, BATCH_BYTES, 3).unwrap();
+        assert_eq!((rest.changes, rest.max_seq), (2, 5), "only what's past seq 3");
+        sync_triggers(&conn, false).unwrap();
+        assert_eq!(epoch(&conn).unwrap(), None);
+        sync_triggers(&conn, true).unwrap();
+        assert_ne!(epoch(&conn).unwrap(), Some(first), "a new outbox, a new epoch");
+    }
+
+    #[test]
+    fn a_seq_is_never_given_out_twice_even_after_the_outbox_empties() {
+        let conn = shard();
+        sync_triggers(&conn, true).unwrap();
+        conn.execute("insert into releases (id, name) values (8, 'a')", []).unwrap();
+        let t = tables(&conn).unwrap();
+        let first = read_batch_after(&conn, &t, 100, BATCH_BYTES, 0).unwrap();
+        ack(&conn, first.max_seq).unwrap();
+        conn.execute("insert into releases (id, name) values (16, 'b')", []).unwrap();
+        let next = read_batch_after(&conn, &t, 100, BATCH_BYTES, first.max_seq).unwrap();
+        assert_eq!(next.changes, 1, "the change after an emptied outbox isn't skipped");
+        assert!(next.max_seq > first.max_seq);
+    }
+
+    #[test]
+    fn a_compaction_keeps_the_next_seq_past_an_emptied_outboxs() {
+        let conn = shard();
+        sync_triggers(&conn, true).unwrap();
+        for i in 1..=4 {
+            conn.execute("insert into releases (id, name) values (?1, 'x')", [i * 8]).unwrap();
+        }
+        ack(&conn, 4).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let orig = dir.path().join("orig.db");
+        conn.execute("vacuum into ?1", [orig.to_string_lossy()]).unwrap();
+        let copy = Connection::open(dir.path().join("copy.db")).unwrap();
+        copy.execute_batch(
+            "create table releases (id INTEGER PRIMARY KEY, name TEXT, size INTEGER, posted_date TEXT);",
+        )
+        .unwrap();
+        copy.execute("attach database ?1 as old", [orig.to_string_lossy()]).unwrap();
+        // the copy has the same releases: nothing changed, nothing left out
+        copy.execute_batch("insert into main.releases select * from old.releases;").unwrap();
+        assert!(carry_outbox(&copy).unwrap());
+        copy.execute_batch("detach database old").unwrap();
+        copy.execute("insert into catalog_outbox (tbl, k1) values ('releases', 8)", []).unwrap();
+        let seq: i64 = copy.query_row("select max(seq) from catalog_outbox", [], |r| r.get(0)).unwrap();
+        assert_eq!(seq, 5, "past the 4 the original gave out, though its outbox was empty");
+    }
+
+    #[test]
+    fn a_compaction_carries_an_outbox_from_before_autoincrement() {
+        let dir = tempfile::tempdir().unwrap();
+        let orig = dir.path().join("orig.db");
+        Connection::open(&orig)
+            .unwrap()
+            .execute_batch(
+                "create table releases (id INTEGER PRIMARY KEY, name TEXT);
+                 create table catalog_outbox (seq INTEGER PRIMARY KEY, tbl TEXT NOT NULL, k1, k2, at INTEGER NOT NULL DEFAULT 0);
+                 insert into catalog_outbox (seq, tbl, k1) values (6, 'releases', 8);",
+            )
+            .unwrap();
+        let copy = Connection::open(dir.path().join("copy.db")).unwrap();
+        copy.execute_batch("create table releases (id INTEGER PRIMARY KEY, name TEXT);").unwrap();
+        copy.execute("attach database ?1 as old", [orig.to_string_lossy()]).unwrap();
+        assert!(carry_outbox(&copy).unwrap(), "no sqlite_sequence in the original: still carried");
+        copy.execute_batch("detach database old").unwrap();
+        copy.execute("insert into catalog_outbox (tbl, k1) values ('releases', 16)", []).unwrap();
+        let seqs: Vec<i64> = copy
+            .prepare("select seq from catalog_outbox order by seq")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(seqs, [6, 7]);
+    }
+
+    #[test]
+    fn an_outbox_made_before_autoincrement_is_rebuilt_with_its_rows_and_seqs() {
+        let conn = shard();
+        conn.execute_batch(
+            "create table catalog_outbox (seq INTEGER PRIMARY KEY, tbl TEXT NOT NULL, k1, k2, at INTEGER NOT NULL DEFAULT (unixepoch()));
+             insert into catalog_outbox (seq, tbl, k1) values (7, 'releases', 8), (9, 'releases', 16);",
+        )
+        .unwrap();
+        sync_triggers(&conn, true).unwrap();
+        let sql: String =
+            conn.query_row("select sql from sqlite_schema where name = 'catalog_outbox'", [], |r| r.get(0)).unwrap();
+        assert!(sql.contains("AUTOINCREMENT"), "{sql}");
+        conn.execute("delete from catalog_outbox", []).unwrap();
+        conn.execute("insert into releases (id, name) values (24, 'c')", []).unwrap();
+        let seq: i64 = conn.query_row("select seq from catalog_outbox", [], |r| r.get(0)).unwrap();
+        assert_eq!(seq, 10, "past the old rows' seqs, and the triggers write to the rebuilt table");
+        sync_triggers(&conn, true).unwrap(); // again: nothing to rebuild
+    }
+
+    #[test]
+    fn the_writer_prunes_what_the_cursor_file_says_postgres_has_for_this_outbox_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("atlas.s1.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "create table meta (key TEXT PRIMARY KEY, value INTEGER);
+             create table releases (id INTEGER PRIMARY KEY, name TEXT);",
+        )
+        .unwrap();
+        sync_triggers(&conn, true).unwrap();
+        for i in 1..=5 {
+            conn.execute("insert into releases (id, name) values (?1, 'x')", [i * 8]).unwrap();
+        }
+        assert_eq!(prune_acked(&conn).unwrap(), 0, "no cursor file yet");
+        let e = epoch(&conn).unwrap().unwrap();
+        write_cursor(&path, e + 1, 4).unwrap();
+        assert_eq!(prune_acked(&conn).unwrap(), 0, "a cursor for another outbox");
+        write_cursor(&path, e, 3).unwrap();
+        assert_eq!(prune_acked(&conn).unwrap(), 3);
+        let left: Vec<i64> = conn
+            .prepare("select seq from catalog_outbox")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(left, [4, 5]);
+        assert_eq!(Connection::open_in_memory().map(|c| prune_acked(&c).unwrap()).unwrap(), 0, "no file behind it");
     }
 
     #[test]
@@ -1300,6 +1746,21 @@ mod tests {
         conn.execute("vacuum into ?1", [orig.to_string_lossy()]).unwrap();
         copy_conn.execute("attach database ?1 as old", [orig.to_string_lossy()]).unwrap();
         assert!(carry_outbox(&copy_conn).unwrap());
+        let seqs: Vec<i64> = copy_conn
+            .prepare("select seq from catalog_outbox order by seq limit 3")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        let old_seqs: Vec<i64> = conn
+            .prepare("select seq from catalog_outbox order by seq")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(seqs, old_seqs, "the waiting changes keep their seqs, soo a saved position still holds");
         let carried: Vec<(String, i64)> = copy_conn
             .prepare("select tbl, k1 from catalog_outbox order by seq")
             .unwrap()
@@ -1482,6 +1943,9 @@ mod tests {
         assert_eq!(sent, 1);
         let waiting: i64 = conn.query_row("select count(*) from catalog_outbox", [], |r| r.get(0)).unwrap();
         assert_eq!(waiting, 0);
+        let e = epoch(&conn).unwrap();
+        assert!(pg_cursor(&mut pg, 5, e).unwrap() >= queued, "Postgres has its place in the outbox");
+        assert_eq!(read_cursor(&path).map(|(epoch, _)| epoch), e, "and the writer's cursor file says so");
         pg.batch_execute(&format!("drop table if exists {}", names.join(", "))).unwrap();
     }
 
@@ -1507,13 +1971,33 @@ mod tests {
         assert_eq!(send(&mut pg, 3, &t, &batch).unwrap(), (5, 0));
         assert_eq!(send(&mut pg, 3, &t, &batch).unwrap(), (5, 0), "sent again after a crash: same rows");
         ack(&conn, batch.max_seq).unwrap();
-        conn.execute_batch("delete from releases where id = 16; update releases set size = 9 where id = 8;").unwrap();
+        conn.execute_batch(
+            "delete from releases where id = 16; update releases set size = 9 where id = 8;
+             insert into par2_files values (8, x'01', 'b.par2');",
+        )
+        .unwrap();
         let batch = read_batch(&conn, &t, 100, BATCH_BYTES).unwrap();
-        assert_eq!(send(&mut pg, 3, &t, &batch).unwrap(), (1, 1));
+        assert_eq!(send(&mut pg, 3, &t, &batch).unwrap(), (2, 1));
+        ack(&conn, batch.max_seq).unwrap();
+        // many deletes go as one statement, a two-column blob key included
+        conn.execute_batch("delete from par2_files;").unwrap();
+        let batch = read_batch(&conn, &t, 100, BATCH_BYTES).unwrap();
+        assert_eq!(send(&mut pg, 3, &t, &batch).unwrap(), (0, 2));
+        let left: i64 = pg.query_one("select count(*) from par2_files", &[]).unwrap().get(0);
+        assert_eq!(left, 0);
+        // the position moves with a batch, only forwards for the same outbox, and starts over for a new one
+        pg.batch_execute("delete from catalog_cursor where shard = 3").unwrap();
+        assert_eq!(pg_cursor(&mut pg, 3, Some(77)).unwrap(), 0);
+        send_with_cursor(&mut pg, 3, &t, &Batch::default(), Some((77, 50))).unwrap();
+        send_with_cursor(&mut pg, 3, &t, &Batch::default(), Some((77, 40))).unwrap();
+        assert_eq!(pg_cursor(&mut pg, 3, Some(77)).unwrap(), 50);
+        assert_eq!(pg_cursor(&mut pg, 3, Some(78)).unwrap(), 0, "another outbox");
+        send_with_cursor(&mut pg, 3, &t, &Batch::default(), Some((78, 5))).unwrap();
+        assert_eq!(pg_cursor(&mut pg, 3, Some(78)).unwrap(), 5);
+        assert_eq!(pg_cursor(&mut pg, 3, None).unwrap(), 0);
         let row = pg.query_one("select shard, name, size from releases", &[]).unwrap();
         assert_eq!((row.get::<_, i16>(0), row.get::<_, String>(1), row.get::<_, i64>(2)), (3, "a".into(), 9));
-        let blob: Vec<u8> = pg.query_one("select file_id from par2_files", &[]).unwrap().get(0);
-        assert_eq!(blob, vec![0, 255]);
+
         let n: i64 = pg.query_one("select count(*) from collections where shard = 3", &[]).unwrap().get(0);
         assert_eq!(n, 1);
         // a shard migration's new column reaches Postgres

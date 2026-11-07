@@ -2,11 +2,13 @@
 //! whether an archive is passworded, from the first bytes of its articles.
 
 pub mod aes;
+pub mod facts;
 pub mod follow;
 pub mod link;
 pub mod names;
 pub mod nzb;
 pub mod rar;
+pub mod rev;
 pub mod select;
 pub mod sevenz;
 pub mod steps;
@@ -164,10 +166,31 @@ impl Encryption {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct InnerFile {
     pub name: String,
     pub size: Option<u64>,
+    /// the whole file's CRC32, when the header has it for the whole file (not one volume's part of a split file)
+    pub crc32: Option<u32>,
+    /// when the file was last changed, Unix seconds UTC: only from a format that keeps UTC (RAR5, 7z, a ZIP's extra
+    /// field). A local DOS time is never kept: it gives the packer's zone away.
+    pub mtime: Option<i64>,
+    /// `facts::HOST_*`
+    pub host_os: Option<u8>,
+}
+
+impl InnerFile {
+    pub fn new(name: String, size: Option<u64>) -> InnerFile {
+        InnerFile { name, size, ..Default::default() }
+    }
+}
+
+/// What a file's header says besides its name and size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FileFacts {
+    pub crc32: Option<u32>,
+    pub mtime: Option<i64>,
+    pub host_os: Option<u8>,
 }
 
 /// What an archive's headers keep to test a password with nothing decrypted but a few bytes.
@@ -253,6 +276,17 @@ pub struct Listing {
     pub damaged: bool,
     /// 7z: the header lies before the bytes given
     pub need_more_tail: bool,
+    /// how it was packed, from the first file's header: format, method, dictionary, host, how times are kept
+    pub packer: Option<String>,
+    /// the random values this one archive carries (`facts::Twin`): kept as a key only, never shown
+    pub twin: Option<facts::Twin>,
+    /// a Unix owner record: kept as a salted key only, never stored, shown or logged
+    pub owner: Option<facts::Private>,
+    /// the packer's clock zone, from a moment its headers give both in local time and in UTC, seconds east
+    pub zone: Option<i64>,
+    /// the newest local (DOS) time in the headers, as `facts::dos_wall_secs` reads it, for a format with no UTC time
+    /// to set it against: the step sets it against the post's date (`facts::zone_against_post`). Never stored.
+    pub local_wall: Option<i64>,
 }
 
 static ARCHIVE_FILE: LazyLock<Regex> =
@@ -271,15 +305,22 @@ impl Listing {
         }
     }
 
-    /// A file for the list, unless it's full or its name is no use.
-    pub(crate) fn push(&mut self, raw: &str, size: Option<u64>) -> bool {
+    /// A file for the list, with what its header says besides, unless it's full or its name is no use.
+    pub(crate) fn push_with(&mut self, raw: &str, size: Option<u64>, facts: FileFacts) -> bool {
         if self.files.len() >= MAX_ENTRIES {
             return false;
         }
         if let Some(name) = names::clean_name(raw) {
-            self.files.push(InnerFile { name, size });
+            self.files.push(InnerFile { name, size, crc32: facts.crc32, mtime: facts.mtime, host_os: facts.host_os });
         }
         true
+    }
+
+    /// The newest local time seen, kept for the zone guess.
+    pub(crate) fn saw_local(&mut self, wall: Option<i64>) {
+        if let Some(w) = wall {
+            self.local_wall = Some(self.local_wall.map_or(w, |had| had.max(w)));
+        }
     }
 }
 
@@ -339,8 +380,7 @@ impl PasswordHarvester {
             }
         }
 
-        let mut counts: std::collections::HashMap<&str, (usize, usize)> =
-            std::collections::HashMap::new();
+        let mut counts: std::collections::HashMap<&str, (usize, usize)> = std::collections::HashMap::new();
         let mut arrival_order = 0;
         for c in &candidates {
             let trimmed = c.trim();
@@ -355,19 +395,13 @@ impl PasswordHarvester {
             entry.0 += 1;
         }
 
-        let mut ranked: Vec<(&str, usize, usize)> = counts
-            .into_iter()
-            .map(|(pw, (count, arrival))| (pw, count, arrival))
-            .collect();
+        let mut ranked: Vec<(&str, usize, usize)> =
+            counts.into_iter().map(|(pw, (count, arrival))| (pw, count, arrival)).collect();
 
         // Sort primarily by frequency descending, tie-breaking by arrival order ascending
         ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.2.cmp(&b.2)));
 
-        ranked
-            .into_iter()
-            .take(5)
-            .map(|(pw, _, _)| pw.to_string())
-            .collect()
+        ranked.into_iter().take(5).map(|(pw, _, _)| pw.to_string()).collect()
     }
 
     pub fn extract(
@@ -466,4 +500,3 @@ impl PasswordHarvester {
             || l.chars().any(|c| ('\u{2500}'..='\u{259f}').contains(&c))
     }
 }
-

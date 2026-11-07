@@ -91,6 +91,7 @@ families! {
     // post-processing
     STEP_RUNS "atlas_step_runs_total" Counter &[], "Runs of each processing step, by result.";
     STEP_PANICS "atlas_step_panics_total" Counter &[], "Runs of each processing step that panicked; atlas_step_runs_total counts them as retry.";
+    AUDIO_PRINTS "atlas_audio_prints_total" Counter &[], "Audio print step results: made, linked (another key ties the release), failed, or why none could be made: ac3, dts, truehd, opus, aac_profile, other (no pure-Rust decoder), container, packed, short, size, bit_rate, no_audio.";
     STAGE_QUEUE "atlas_stage_queue" Gauge &[], "Releases waiting for the processing stage: due, net_wanted, failed.";
     STAGE_WALK "atlas_stage_walk" Gauge &[], "How far the backlog walks have come, in release ids: done, total.";
     STAGE_NET_CLAIMS "atlas_stage_net_claims" Gauge &[], "Net lane claims running now, per shard.";

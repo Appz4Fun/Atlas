@@ -35,9 +35,15 @@ pub const INNER_FILES: ShardTable = ShardTable {
             select coalesce(sum(length(cast(name as blob)) + 32), 0) from archive_inner_files where release_id = old.id
         )) where key = 'archive_name_bytes';
     end",
-    indexes: &[],
+    indexes: &[(
+        "archive_inner_files_crc",
+        "create index if not exists archive_inner_files_crc on archive_inner_files(size, crc32)
+         where crc32 is not null",
+    )],
     release_key: Some("release_id"),
-    added: &[],
+    // what the header says besides the name: the whole file's CRC32, its UTC mtime and the host it was packed on
+    // (`facts::HOST_*`)
+    added: &[("crc32", "INTEGER"), ("mtime", "INTEGER"), ("host_os", "INTEGER")],
 };
 
 /// a row only when an archive was identified. No row: nothing known, no API attribute
@@ -47,10 +53,75 @@ pub const RELEASE: ShardTable = ShardTable {
         release_id INTEGER PRIMARY KEY,
         password   INTEGER NOT NULL
     )",
-    indexes: &[],
+    indexes: &[
+        (
+            "archive_release_twin",
+            "create index if not exists archive_release_twin on archive_release(twin_key) where twin_key is not null",
+        ),
+        (
+            "archive_release_owner",
+            "create index if not exists archive_release_owner on archive_release(owner_key) where owner_key is not null",
+        ),
+        (
+            "archive_release_zone",
+            "create index if not exists archive_release_zone on archive_release(zone_key) where zone_key is not null",
+        ),
+    ],
     release_key: Some("release_id"),
-    added: &[("encryption", "INTEGER"), ("names_hidden", "INTEGER"), ("password_check", "BLOB")],
+    // `packer`: how the first file was packed, shown. `twin_key`: a digest of the archive's own random values
+    // (`facts::Twin`). `owner_key`, `zone_key`: salted digests (`keys::salted8`) of the Unix owner and of the
+    // packer's zone, never their values. `facts`: which `FACTS` the row was read with.
+    added: &[
+        ("encryption", "INTEGER"),
+        ("names_hidden", "INTEGER"),
+        ("password_check", "BLOB"),
+        ("packer", "TEXT"),
+        ("twin_key", "INTEGER"),
+        ("owner_key", "INTEGER"),
+        ("zone_key", "INTEGER"),
+        ("facts", "INTEGER"),
+    ],
 };
+
+/// What a list is read with now: 1, each file's CRC32, time and host, the packer and the archive's keys. A list kept
+/// with less is read again (`raw_store::get_archive`).
+pub const FACTS: i64 = 1;
+
+/// What one archive's headers come to beyond its file list, as `archive_release` keeps it: the keys are digests,
+/// soo nothing here names the uploader.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ArchiveKeys {
+    pub packer: Option<String>,
+    pub twin_key: Option<i64>,
+    pub owner_key: Option<i64>,
+    pub zone_key: Option<i64>,
+}
+
+impl ArchiveKeys {
+    /// The keys over a listing. `salt`: the install's key salt; without it no salted key is made. `posted`: the post's
+    /// Date as a wall clock (`dates::naive_timestamp`), for a packer zone guessed against it.
+    pub fn of(listing: &super::Listing, salt: Option<i64>, posted: Option<i64>) -> ArchiveKeys {
+        use crate::keys::{as_key, digest8, salted8};
+        let packer = listing.packer.clone();
+        let zone = listing.zone.or_else(|| {
+            listing.local_wall.zip(posted).and_then(|(wall, at)| super::facts::zone_against_post(wall, at))
+        });
+        let salted = |text: &super::facts::Private| salt.map(|s| as_key(salted8(s, &text.0)));
+        ArchiveKeys {
+            twin_key: listing.twin.as_ref().map(|t| as_key(digest8(&t.text()))),
+            owner_key: listing.owner.as_ref().and_then(salted),
+            zone_key: zone.map(|z| super::facts::zone_text(z, packer.as_deref())).as_ref().and_then(salted),
+            packer,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        *self == ArchiveKeys::default()
+    }
+}
+
+pub const SET_KEYS: &str = "update archive_release set packer = ?2, twin_key = ?3, owner_key = ?4, zone_key = ?5,
+    facts = ?6 where release_id = ?1";
 
 /// A password an NFO named. Unverified: nothing has tried it.
 pub const NFO_PASSWORD: ShardTable = ShardTable {
@@ -73,6 +144,8 @@ pub const SET_NFO_PASSWORD: &str = "insert or replace into release_nfo_password 
 /// added this file to someone else's set. `complete`: the whole set was read.
 /// Kept soo a file is known by its hashes without reading the set again, and soo the same file in another posting, under
 /// any name and from any poster, is found by `(size, md5_16k, md5)`.
+/// `creator`: the program that made the set, from its Creator packet (`par2::creator_text`), the same on each of the
+/// set's rows; NULL when no Creator packet was read, and on rows from before it was kept.
 pub const PAR2_FILES: ShardTable = ShardTable {
     name: "par2_files",
     create: "create table if not exists par2_files (
@@ -99,13 +172,26 @@ pub const PAR2_FILES: ShardTable = ShardTable {
         ),
     ],
     release_key: Some("release_id"),
-    added: &[],
+    added: &[("creator", "TEXT")],
 };
 
 pub const DELETE_PAR2_FILES: &str = "delete from par2_files where release_id = ?1";
 pub const INSERT_PAR2_FILE: &str = "insert or replace into par2_files
     (release_id, file_id, set_id, md5, md5_16k, size, name, crc32, bound, sealed, complete)
     values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)";
+/// `?1` the release, `?2` a set id, `?3` the program that made that set
+pub const SET_PAR2_CREATOR: &str = "update par2_files set creator = ?3 where release_id = ?1 and set_id = ?2";
+
+/// The programs that made a release's PAR2 sets, each once, in `conn`'s `schema` (`main` for a shard on its own).
+/// Empty when no Creator packet was kept, or the shard has no column yet.
+pub fn par2_creators(conn: &Connection, schema: &str, release_id: i64) -> Vec<String> {
+    let sql = format!(
+        "select distinct creator from {schema}.par2_files where release_id = ?1 and creator is not null
+         order by creator limit 4"
+    );
+    let Ok(mut stmt) = conn.prepare_cached(&sql) else { return Vec::new() };
+    stmt.query_map([release_id], |r| r.get::<_, String>(0)).map(|rows| rows.flatten().collect()).unwrap_or_default()
+}
 
 /// The CRC32 of each article body a step read whole, by the article's message-id: what yEnc's `pcrc32` says, or the
 /// CRC of the decoded bytes when the trailer wasn't seen. Two articles with the same decoded length and CRC hold the
@@ -155,6 +241,12 @@ pub fn par2_file_writes(
             ],
         ));
     }
+    for (set_id, creator) in &inventory.creators {
+        writes.push(StepWrite::new(
+            SET_PAR2_CREATOR,
+            vec![release_id.into(), set_id.to_vec().into(), creator.clone().into()],
+        ));
+    }
     // a whole set says which files the upload has: with each of them there and whole, so is the release, whatever
     // its subject counter says (`store::SET_VOUCHED_COMPLETE`)
     if inventory.complete && !inventory.files.is_empty() {
@@ -167,7 +259,7 @@ pub fn par2_file_writes(
 /// it. None: the release holds no complete set, or the shard has no table yet.
 pub fn par2_inventory(conn: &Connection, schema: &str, release_id: i64) -> Option<crate::par2::Inventory> {
     let sql = format!(
-        "select file_id, set_id, md5, md5_16k, size, name, crc32, sealed, bound from {schema}.par2_files
+        "select file_id, set_id, md5, md5_16k, size, name, crc32, sealed, bound, creator from {schema}.par2_files
          where release_id = ? and complete = 1 order by name"
     );
     let mut stmt = conn.prepare_cached(&sql).ok()?;
@@ -190,13 +282,19 @@ pub fn par2_inventory(conn: &Connection, schema: &str, release_id: i64) -> Optio
                     crc32: r.get::<_, Option<i64>>(6)?.and_then(|c| u32::try_from(c).ok()),
                 },
                 r.get::<_, i64>(7)? != 0,
+                r.get::<_, Option<String>>(9)?,
             ))
         })
         .ok()?;
     for row in rows {
-        let (file, sealed) = row.ok()?;
+        let (file, sealed, creator) = row.ok()?;
         if sealed {
             inventory.sealed.push((file.set_id, file.file_id));
+        }
+        if let Some(creator) = creator
+            && inventory.creator_of(&file.set_id).is_none()
+        {
+            inventory.creators.push((file.set_id, creator));
         }
         inventory.files.push(file);
     }
@@ -383,6 +481,9 @@ pub static RANK_POINTED: std::sync::LazyLock<String> = std::sync::LazyLock::new(
 pub const DELETE_SOURCE: &str = "delete from archive_inner_files where release_id = ?1 and source = ?2";
 pub const INSERT_FILE: &str =
     "insert or replace into archive_inner_files (release_id, seq, name, size, source) values (?1, ?2, ?3, ?4, ?5)";
+/// `INSERT_FILE` with what the header says besides: the whole file's CRC32, its UTC mtime and its host
+pub const INSERT_FILE_FACTS: &str = "insert or replace into archive_inner_files
+    (release_id, seq, name, size, source, crc32, mtime, host_os) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)";
 pub const UPSERT_RELEASE: &str = "insert into archive_release (release_id, password) values (?1, ?2)
     on conflict(release_id) do update set password = excluded.password";
 pub const SET_ENCRYPTION: &str =
@@ -471,6 +572,8 @@ pub struct InnerView {
     pub names_hidden: bool,
     pub password_check: Option<super::PasswordTest>,
     pub files: Vec<InnerFileRow>,
+    /// how the first file was packed (`archive_release.packer`)
+    pub packer: Option<String>,
 }
 
 /// Any failure, such as a shard without the table yet, reads as nothing known.
@@ -510,6 +613,14 @@ pub fn view_with(conn: &Connection, release_id: i64) -> InnerView {
         names_hidden,
         password_check,
         files: rows(conn, &schema, release_id).unwrap_or_default(),
+        packer: conn
+            .query_row(
+                &format!("select packer from {schema}.archive_release where release_id = ?"),
+                [release_id],
+                |r| r.get(0),
+            )
+            .ok()
+            .flatten(),
     }
 }
 

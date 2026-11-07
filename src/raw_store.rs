@@ -7,9 +7,9 @@
 //! - Cached HTTP responses (`raw_http_cache`, Zstd-compressed) for static PreDB archive dumps
 //!   and external metadata APIs (`tmdb`, `tvdb`, `tvmaze`, `trakt`, `omdb`, `opensubtitles`).
 //! - Natural-keyed Usenet & hash enrichments (`raw_opensubtitles` by `moviehash`, `raw_probes`, `raw_covers`,
-//!   `raw_archives`, `raw_archive_inner_files`, `raw_nfo_passwords`, `raw_stills` by `(name, group_name)`, and
-//!   `raw_backfill_deepest` / `raw_group_bounds`) so shard resets never require re-querying OpenSubtitles or
-//!   re-downloading probed Usenet article bodies or video stills.
+//!   `raw_archives`, `raw_archive_inner_files`, `raw_nfo_passwords`, `raw_stills`, `raw_audio_prints` by
+//!   `(name, group_name)`, and `raw_backfill_deepest` / `raw_group_bounds`) so shard resets never require
+//!   re-querying OpenSubtitles or re-downloading probed Usenet article bodies, video stills or audio windows.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -39,6 +39,8 @@ pub const MAX_RAW_PROBES_ROWS: i64 = 250_000;
 pub const MAX_RAW_PROBES_BYTES: i64 = 512 << 20;
 /// Maximum rows kept in `raw_stills`.
 pub const MAX_RAW_STILLS_ROWS: i64 = 300_000;
+/// Maximum rows kept in `raw_audio_prints`: one a window, three windows a release, about 400 bytes each.
+pub const MAX_RAW_AUDIO_PRINTS_ROWS: i64 = 300_000;
 /// Maximum rows kept in `raw_archives` / `raw_par2`.
 pub const MAX_RAW_ARCHIVES_ROWS: i64 = 250_000;
 /// Hard ceiling on total inner-file name bytes in `raw_archive_inner_files` (256 MiB).
@@ -212,6 +214,24 @@ CREATE TABLE IF NOT EXISTS raw_par2_files (
     PRIMARY KEY (name, group_name, file_id)
 ) WITHOUT ROWID;
 
+CREATE TABLE IF NOT EXISTS raw_rev_volumes (
+    name       TEXT NOT NULL,
+    group_name TEXT NOT NULL,
+    content_id BLOB,
+    volume     INTEGER NOT NULL,
+    size       INTEGER NOT NULL,
+    crc32      INTEGER NOT NULL,
+    PRIMARY KEY (name, group_name, volume)
+) WITHOUT ROWID;
+
+CREATE TRIGGER IF NOT EXISTS raw_rev_volumes_ai AFTER INSERT ON raw_rev_volumes BEGIN
+    INSERT INTO raw_meta (key, value) VALUES ('rev_rows', 1)
+        ON CONFLICT(key) DO UPDATE SET value = value + 1;
+END;
+CREATE TRIGGER IF NOT EXISTS raw_rev_volumes_ad AFTER DELETE ON raw_rev_volumes BEGIN
+    UPDATE raw_meta SET value = max(0, value - 1) WHERE key = 'rev_rows';
+END;
+
 CREATE TABLE IF NOT EXISTS raw_archive_inner_files (
     release_name TEXT NOT NULL,
     group_name   TEXT NOT NULL,
@@ -255,6 +275,16 @@ CREATE TABLE IF NOT EXISTS raw_stills (
     PRIMARY KEY (name, group_name, position)
 ) WITHOUT ROWID;
 
+CREATE TABLE IF NOT EXISTS raw_audio_prints (
+    name       TEXT NOT NULL,
+    group_name TEXT NOT NULL,
+    position   INTEGER NOT NULL,
+    content_id BLOB,
+    at_ms      INTEGER NOT NULL,
+    items      BLOB NOT NULL,
+    PRIMARY KEY (name, group_name, position)
+) WITHOUT ROWID;
+
 CREATE TABLE IF NOT EXISTS raw_backfill_deepest (
     grp          TEXT PRIMARY KEY,
     server       TEXT NOT NULL,
@@ -279,9 +309,8 @@ pub fn path_for(main: &Path) -> PathBuf {
 }
 
 fn ensure_column(conn: &Connection, table: &str, column: &str, decl: &str) -> rusqlite::Result<()> {
-    let exists: bool = conn
-        .prepare(&format!("SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?1"))?
-        .exists([column])?;
+    let exists: bool =
+        conn.prepare(&format!("SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?1"))?.exists([column])?;
     if !exists {
         conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"), [])?;
     }
@@ -316,7 +345,23 @@ pub fn create(path: &Path) -> rusqlite::Result<Connection> {
     ensure_column(&conn, "raw_archives", "content_fp", "BLOB")?;
     ensure_column(&conn, "raw_par2", "content_id", "BLOB")?;
     ensure_column(&conn, "raw_par2", "content_fp", "BLOB")?;
+    ensure_column(&conn, "raw_par2_files", "creator", "TEXT")?;
+    // the row counter `prune_rev_rows` reads, for a file whose table filled before its triggers
+    conn.execute(
+        "INSERT OR IGNORE INTO raw_meta (key, value) SELECT 'rev_rows', count(*) FROM raw_rev_volumes
+         WHERE NOT EXISTS (SELECT 1 FROM raw_meta WHERE key = 'rev_rows')",
+        [],
+    )?;
     ensure_column(&conn, "raw_archive_inner_files", "content_id", "BLOB")?;
+    ensure_column(&conn, "raw_archive_inner_files", "crc32", "INTEGER")?;
+    ensure_column(&conn, "raw_archive_inner_files", "mtime", "INTEGER")?;
+    ensure_column(&conn, "raw_archive_inner_files", "host_os", "INTEGER")?;
+    ensure_column(&conn, "raw_archives", "packer", "TEXT")?;
+    ensure_column(&conn, "raw_archives", "twin_key", "INTEGER")?;
+    ensure_column(&conn, "raw_archives", "owner_key", "INTEGER")?;
+    ensure_column(&conn, "raw_archives", "zone_key", "INTEGER")?;
+    ensure_column(&conn, "raw_archives", "key_salt", "INTEGER")?;
+    ensure_column(&conn, "raw_archives", "facts", "INTEGER")?;
     ensure_column(&conn, "raw_nfo_passwords", "content_id", "BLOB")?;
     ensure_column(&conn, "raw_stills", "content_id", "BLOB")?;
     let seeded = raw_meta_get(&conn, "seeded")?;
@@ -438,9 +483,8 @@ fn with_raw<T>(f: impl FnOnce(&Connection) -> rusqlite::Result<T>) -> Option<T> 
     }
     #[cfg(not(test))]
     {
-        let path = SHARD_RAW_PATH
-            .with(|cell| cell.borrow().clone())
-            .unwrap_or_else(|| path_for(&crate::paths::database()));
+        let path =
+            SHARD_RAW_PATH.with(|cell| cell.borrow().clone()).unwrap_or_else(|| path_for(&crate::paths::database()));
         let mut guard = raw_slot();
         let needs_open = guard.as_ref().is_none_or(|(cached_path, _)| cached_path != &path);
         if needs_open {
@@ -484,11 +528,7 @@ pub fn canonical_cache_url(url: &str) -> String {
             !key.eq_ignore_ascii_case("api_key") && !key.eq_ignore_ascii_case("apikey")
         })
         .collect();
-    if kept.is_empty() {
-        base.to_string()
-    } else {
-        format!("{base}?{}", kept.join("&"))
-    }
+    if kept.is_empty() { base.to_string() } else { format!("{base}?{}", kept.join("&")) }
 }
 
 /// True when a media JSON response represents an empty search result that should not be cached,
@@ -599,8 +639,7 @@ pub fn put_http_cache(source: &str, url: &str, status: u16, body: &str) {
     let cache_key = format!("GET:{source}:{clean_url}");
     let now = chrono::Utc::now().timestamp();
     let _ = with_raw_tx(|conn| {
-        conn.prepare_cached("DELETE FROM raw_http_cache WHERE cache_key = ?1")?
-            .execute(params![&cache_key])?;
+        conn.prepare_cached("DELETE FROM raw_http_cache WHERE cache_key = ?1")?.execute(params![&cache_key])?;
         prune_http_cache(conn, incoming_bytes, MAX_HTTP_CACHE_ROWS, MAX_HTTP_CACHE_BYTES, now)?;
         conn.prepare_cached(
             "INSERT OR REPLACE INTO raw_http_cache (cache_key, source, url, status, body_zst, fetched_at)
@@ -702,8 +741,7 @@ pub fn record_predb_page(source_id: i64, source_key: &str, url: &str, page: u32,
         }
         if cache_forever && incoming_bytes <= MAX_HTTP_CACHE_BYTES {
             let cache_key = format!("GET:{source_key}:{clean_url}");
-            conn.prepare_cached("DELETE FROM raw_http_cache WHERE cache_key = ?1")?
-                .execute(params![&cache_key])?;
+            conn.prepare_cached("DELETE FROM raw_http_cache WHERE cache_key = ?1")?.execute(params![&cache_key])?;
             prune_http_cache(conn, incoming_bytes, MAX_HTTP_CACHE_ROWS, MAX_HTTP_CACHE_BYTES, now)?;
             conn.prepare_cached(
                 "INSERT OR REPLACE INTO raw_http_cache (cache_key, source, url, status, body_zst, fetched_at)
@@ -777,13 +815,7 @@ fn first_segment_mid_in(
     Ok(best.map(|(_, mid)| mid).unwrap_or_default())
 }
 
-fn hash_file_fields_into(
-    hasher: &mut Sha256,
-    filename: &str,
-    first_mid: &str,
-    expected: Option<i64>,
-    seen: &[u8],
-) {
+fn hash_file_fields_into(hasher: &mut Sha256, filename: &str, first_mid: &str, expected: Option<i64>, seen: &[u8]) {
     hasher.update((filename.len() as u64).to_le_bytes());
     hasher.update(filename.as_bytes());
     hasher.update((first_mid.len() as u64).to_le_bytes());
@@ -830,9 +862,7 @@ pub fn release_content_id_in(conn: &Connection, schema: &str, release_id: i64) -
         );
         let mut stmt = conn.prepare_cached(&sql).ok()?;
         let rows: Vec<FileRow> = stmt
-            .query_map([release_id], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
-            })
+            .query_map([release_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))
             .ok()?
             .collect::<rusqlite::Result<Vec<_>>>()
             .ok()?;
@@ -898,10 +928,7 @@ pub fn release_content_id_in(conn: &Connection, schema: &str, release_id: i64) -
 /// Computes the deterministic SHA-256 content identity for `release_id` in `main` (`conn`),
 /// and binds the calling thread's raw store path to the shard's sibling `atlas.raw.db` when `conn` is on disk.
 pub fn release_content_id(conn: &Connection, release_id: i64) -> Option<Vec<u8>> {
-    let shard_raw = conn
-        .path()
-        .filter(|p| !p.is_empty())
-        .and_then(|p| raw_path_from_shard(Path::new(p)));
+    let shard_raw = conn.path().filter(|p| !p.is_empty()).and_then(|p| raw_path_from_shard(Path::new(p)));
     SHARD_RAW_PATH.with(|cell| *cell.borrow_mut() = shard_raw);
     release_content_id_in(conn, "main", release_id)
 }
@@ -1031,11 +1058,15 @@ const NFO_PASSWORD_GROUP: &str = "SELECT group_name FROM raw_nfo_passwords WHERE
      ORDER BY group_name != ?2, group_name LIMIT 1";
 const STILLS_GROUP: &str = "SELECT group_name FROM raw_stills WHERE name = ?1 AND content_id = ?3
      ORDER BY group_name != ?2, group_name LIMIT 1";
+const AUDIO_PRINTS_GROUP: &str = "SELECT group_name FROM raw_audio_prints WHERE name = ?1 AND content_id = ?3
+     ORDER BY group_name != ?2, group_name LIMIT 1";
 const ARCHIVE_GROUP: &str = "SELECT group_name FROM raw_archives WHERE name = ?1 AND content_id = ?3
      ORDER BY group_name != ?2, group_name LIMIT 1";
 const PAR2_GROUP: &str = "SELECT group_name FROM raw_par2 WHERE name = ?1 AND content_id = ?3
      ORDER BY group_name != ?2, group_name LIMIT 1";
 const PAR2_FILES_GROUP: &str = "SELECT group_name FROM raw_par2_files WHERE name = ?1 AND content_id = ?3
+     ORDER BY group_name != ?2, group_name LIMIT 1";
+const REV_GROUP: &str = "SELECT group_name FROM raw_rev_volumes WHERE name = ?1 AND content_id = ?3
      ORDER BY group_name != ?2, group_name LIMIT 1";
 
 /// Looks up a previously probed release by `(name, group_name)` and `content_id` in `raw_probes`,
@@ -1380,12 +1411,101 @@ pub fn put_stills(name: &str, group_name: &str, content_id: &[u8], stills: &[Sav
     });
 }
 
+/// One window of a release's audio print (`probe::audio_print`), as kept: its position in percent, where it starts in
+/// ms, and its items as stored.
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SavedPrint {
+    pub position: u8,
+    pub at_ms: i64,
+    pub items: Vec<u8>,
+}
+
+/// Looks up previously made audio prints for `(name, group_name)` and `content_id` in `raw_audio_prints`.
+pub fn get_audio_prints(name: &str, group_name: &str, content_id: &[u8]) -> Vec<SavedPrint> {
+    if content_id.is_empty() {
+        return Vec::new();
+    }
+    with_raw(|conn| {
+        let Some(group_name) = saved_group(conn, AUDIO_PRINTS_GROUP, name, group_name, content_id)? else {
+            return Ok(Vec::new());
+        };
+        conn.prepare_cached(
+            "SELECT position, at_ms, items FROM raw_audio_prints
+             WHERE name = ?1 AND group_name = ?2 AND content_id = ?3 ORDER BY position",
+        )?
+        .query_map(params![name, group_name, content_id], |r| {
+            Ok(SavedPrint { position: r.get::<_, i64>(0)?.clamp(0, 255) as u8, at_ms: r.get(1)?, items: r.get(2)? })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()
+    })
+    .unwrap_or_default()
+}
+
+/// Persists audio prints for `(name, group_name)` and `content_id` in `raw_audio_prints`, bounded by
+/// `MAX_RAW_AUDIO_PRINTS_ROWS`.
+pub fn put_audio_prints(name: &str, group_name: &str, content_id: &[u8], prints: &[SavedPrint]) {
+    if content_id.is_empty() {
+        return;
+    }
+    let _ = with_raw_tx(|conn| {
+        conn.prepare_cached("DELETE FROM raw_audio_prints WHERE name = ?1 AND group_name = ?2")?
+            .execute(params![name, group_name])?;
+        let count: i64 = conn.query_row("SELECT count(*) FROM raw_audio_prints", [], |r| r.get(0))?;
+        if count + prints.len() as i64 > MAX_RAW_AUDIO_PRINTS_ROWS {
+            let to_drop = (count + prints.len() as i64 - MAX_RAW_AUDIO_PRINTS_ROWS).max(64);
+            conn.execute(
+                "DELETE FROM raw_audio_prints WHERE (name, group_name, position) IN (
+                    SELECT name, group_name, position FROM raw_audio_prints LIMIT ?1
+                )",
+                params![to_drop],
+            )?;
+        }
+        let mut insert = conn.prepare_cached(
+            "INSERT OR REPLACE INTO raw_audio_prints (name, group_name, position, content_id, at_ms, items)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )?;
+        for p in prints {
+            insert.execute(params![name, group_name, i64::from(p.position), content_id, p.at_ms, p.items])?;
+        }
+        Ok(())
+    });
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct SavedArchiveFile {
     pub seq: i64,
     pub name: String,
     pub size: Option<u64>,
     pub source: i64,
+    pub crc32: Option<u32>,
+    pub mtime: Option<i64>,
+    pub host_os: Option<u8>,
+}
+
+impl SavedArchiveFile {
+    /// The file as a listing has it again.
+    pub fn into_inner(self) -> crate::archive::InnerFile {
+        crate::archive::InnerFile {
+            name: self.name,
+            size: self.size,
+            crc32: self.crc32,
+            mtime: self.mtime,
+            host_os: self.host_os,
+        }
+    }
+
+    /// One `raw_archive_inner_files` row from `seq, name, size, source, crc32, mtime, host_os`.
+    fn from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<SavedArchiveFile> {
+        Ok(SavedArchiveFile {
+            seq: r.get(0)?,
+            name: r.get(1)?,
+            size: r.get::<_, Option<i64>>(2)?.and_then(|s| u64::try_from(s).ok()),
+            source: r.get(3)?,
+            crc32: r.get::<_, Option<i64>>(4)?.and_then(|c| u32::try_from(c).ok()),
+            mtime: r.get(5)?,
+            host_os: r.get::<_, Option<i64>>(6)?.and_then(|h| u8::try_from(h).ok()),
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1398,6 +1518,11 @@ pub struct SavedArchive {
     pub listing_damaged: bool,
     pub content_fp: Option<Vec<u8>>,
     pub files: Vec<SavedArchiveFile>,
+    /// the packer and the archive's keys as they were kept; the salted ones under `key_salt` (`keys::salt_id`)
+    pub keys: crate::archive::store::ArchiveKeys,
+    pub key_salt: Option<i64>,
+    /// the `archive::store::FACTS` the list was read with: 0 for one read before files kept their CRCs
+    pub facts: i64,
 }
 
 /// Looks up cached inner files for `(release_name, group_name)`, `content_id`, and `source` in `raw_archive_inner_files`.
@@ -1423,19 +1548,12 @@ pub fn get_archive_files(
         let Some(group_name) = group_name else { return Ok(Vec::new()) };
         let rows = conn
             .prepare_cached(
-                "SELECT seq, name, size, coalesce(source, ?4)
+                "SELECT seq, name, size, coalesce(source, ?4), crc32, mtime, host_os
                  FROM raw_archive_inner_files
                  WHERE release_name = ?1 AND group_name = ?2 AND content_id = ?3 AND coalesce(source, 2) = ?4
                  ORDER BY seq",
             )?
-            .query_map(params![release_name, group_name, content_id, source], |r| {
-                Ok(SavedArchiveFile {
-                    seq: r.get(0)?,
-                    name: r.get(1)?,
-                    size: r.get::<_, Option<i64>>(2)?.and_then(|s| u64::try_from(s).ok()),
-                    source: r.get(3)?,
-                })
-            })?
+            .query_map(params![release_name, group_name, content_id, source], SavedArchiveFile::from_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     })
@@ -1473,10 +1591,14 @@ pub fn get_archive(
             Option<i64>,
             Option<i64>,
             Option<Vec<u8>>,
+            crate::archive::store::ArchiveKeys,
+            Option<i64>,
+            i64,
         );
         let row: Option<RawArchiveRow> = conn
             .prepare_cached(
-                "SELECT password, encryption, names_hidden, password_check, parts, complete, listing_complete, listing_damaged, content_fp
+                "SELECT password, encryption, names_hidden, password_check, parts, complete, listing_complete, listing_damaged, content_fp,
+                        packer, twin_key, owner_key, zone_key, key_salt, coalesce(facts, 0)
                  FROM raw_archives WHERE name = ?1 AND group_name = ?2 AND content_id = ?3",
             )?
             .query_row(params![name, group_name, content_id], |r| {
@@ -1490,10 +1612,20 @@ pub fn get_archive(
                     r.get(6)?,
                     r.get(7)?,
                     r.get(8)?,
+                    crate::archive::store::ArchiveKeys {
+                        packer: r.get(9)?,
+                        twin_key: r.get(10)?,
+                        owner_key: r.get(11)?,
+                        zone_key: r.get(12)?,
+                    },
+                    r.get(13)?,
+                    r.get(14)?,
                 ))
             })
             .optional()?;
-        let Some((pw, enc, hidden, check, saved_parts, saved_complete, l_comp, l_dmg, content_fp)) = row else {
+        let Some((pw, enc, hidden, check, saved_parts, saved_complete, l_comp, l_dmg, content_fp, keys, key_salt, facts)) =
+            row
+        else {
             return Ok(None);
         };
         let password = Some(pw);
@@ -1505,19 +1637,12 @@ pub fn get_archive(
         // an archive's rows only: PAR2 (1) and posted NZB (5) lists are kept and restored on their own
         let files = conn
             .prepare_cached(
-                "SELECT seq, name, size, coalesce(source, 2)
+                "SELECT seq, name, size, coalesce(source, 2), crc32, mtime, host_os
                  FROM raw_archive_inner_files
                  WHERE release_name = ?1 AND group_name = ?2 AND content_id = ?3 AND coalesce(source, 2) NOT IN (1, 5)
                  ORDER BY seq",
             )?
-            .query_map(params![name, group_name, content_id], |r| {
-                Ok(SavedArchiveFile {
-                    seq: r.get(0)?,
-                    name: r.get(1)?,
-                    size: r.get::<_, Option<i64>>(2)?.and_then(|s| u64::try_from(s).ok()),
-                    source: r.get(3)?,
-                })
-            })?
+            .query_map(params![name, group_name, content_id], SavedArchiveFile::from_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         if files.is_empty() && !names_hidden {
             return Ok(None);
@@ -1540,6 +1665,9 @@ pub fn get_archive(
             listing_damaged,
             content_fp,
             files,
+            keys,
+            key_salt,
+            facts,
         }))
     })
     .flatten()
@@ -1561,6 +1689,11 @@ pub struct ArchiveRecord<'a> {
     pub listing_damaged: bool,
     pub content_fp: Option<&'a [u8]>,
     pub max_names_bytes: i64,
+    /// the packer and the archive's keys; the salted ones made under `key_salt` (`keys::salt_id`)
+    pub keys: crate::archive::store::ArchiveKeys,
+    pub key_salt: Option<i64>,
+    /// `archive::store::FACTS` for a list read now
+    pub facts: i64,
 }
 
 /// Persists an archive or PAR2 inspection result into `raw_archives` and `raw_archive_inner_files`,
@@ -1589,8 +1722,8 @@ pub fn put_archive(rec: &ArchiveRecord<'_>) {
             }
             let mut insert_file = conn.prepare_cached(
                 "INSERT OR REPLACE INTO raw_archive_inner_files
-                 (release_name, group_name, seq, content_id, name, size, source)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                 (release_name, group_name, seq, content_id, name, size, source, crc32, mtime, host_os)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             )?;
             for (i, row) in rec.files.iter().enumerate() {
                 let size = row.size.and_then(|s| i64::try_from(s).ok());
@@ -1602,7 +1735,10 @@ pub fn put_archive(rec: &ArchiveRecord<'_>) {
                     rec.content_id,
                     row.name,
                     size,
-                    rec.source
+                    rec.source,
+                    row.crc32.map(i64::from),
+                    row.mtime,
+                    row.host_os.map(i64::from),
                 ])?;
             }
         } else if rec.password.is_some() && !rec.names_hidden {
@@ -1622,7 +1758,8 @@ pub fn put_archive(rec: &ArchiveRecord<'_>) {
                         .prepare_cached("SELECT name, group_name FROM raw_archives LIMIT ?1")?
                         .query_map(params![to_drop], |r| Ok((r.get(0)?, r.get(1)?)))?
                         .collect::<rusqlite::Result<Vec<_>>>()?;
-                    let mut del_arch = conn.prepare_cached("DELETE FROM raw_archives WHERE name = ?1 AND group_name = ?2")?;
+                    let mut del_arch =
+                        conn.prepare_cached("DELETE FROM raw_archives WHERE name = ?1 AND group_name = ?2")?;
                     let mut del_files = conn.prepare_cached(
                         "DELETE FROM raw_archive_inner_files WHERE release_name = ?1 AND group_name = ?2",
                     )?;
@@ -1634,8 +1771,9 @@ pub fn put_archive(rec: &ArchiveRecord<'_>) {
             }
             conn.prepare_cached(
                 "INSERT OR REPLACE INTO raw_archives
-                 (name, group_name, content_id, password, encryption, names_hidden, password_check, parts, complete, listing_complete, listing_damaged, content_fp)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                 (name, group_name, content_id, password, encryption, names_hidden, password_check, parts, complete, listing_complete, listing_damaged, content_fp,
+                  packer, twin_key, owner_key, zone_key, key_salt, facts)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
             )?
             .execute(params![
                 rec.name,
@@ -1650,6 +1788,12 @@ pub fn put_archive(rec: &ArchiveRecord<'_>) {
                 i64::from(rec.listing_complete),
                 i64::from(rec.listing_damaged),
                 rec.content_fp,
+                rec.keys.packer,
+                rec.keys.twin_key,
+                rec.keys.owner_key,
+                rec.keys.zone_key,
+                rec.key_salt,
+                rec.facts,
             ])?;
         }
         Ok(())
@@ -1672,7 +1816,7 @@ fn read_par2_files_in(
     content_id: &[u8],
 ) -> rusqlite::Result<Option<crate::par2::Inventory>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT file_id, set_id, md5, md5_16k, size, file_name, crc32, bound, sealed, complete
+        "SELECT file_id, set_id, md5, md5_16k, size, file_name, crc32, bound, sealed, complete, creator
          FROM raw_par2_files
          WHERE name = ?1 AND group_name = ?2 AND content_id = ?3
          ORDER BY file_name, file_id",
@@ -1699,6 +1843,11 @@ fn read_par2_files_in(
         let bound = r.get::<_, i64>(7)? != 0;
         let sealed = r.get::<_, i64>(8)? != 0;
         let complete = r.get::<_, i64>(9)? != 0;
+        if let Some(creator) = r.get::<_, Option<String>>(10)?
+            && inv.creator_of(&set_id).is_none()
+        {
+            inv.creators.push((set_id, creator));
+        }
         if !any {
             inv.complete = complete;
             any = true;
@@ -1708,16 +1857,7 @@ fn read_par2_files_in(
         if sealed && bound {
             inv.sealed.push((set_id, file_id));
         }
-        inv.files.push(crate::par2::Par2File {
-            file_id,
-            set_id,
-            md5,
-            md5_16k,
-            size,
-            name: file_name,
-            bound,
-            crc32,
-        });
+        inv.files.push(crate::par2::Par2File { file_id, set_id, md5, md5_16k, size, name: file_name, bound, crc32 });
     }
     Ok(any.then_some(inv))
 }
@@ -1756,11 +1896,10 @@ fn upsert_par2_files_in_tx(
         .prepare_cached("SELECT EXISTS(SELECT 1 FROM raw_par2 WHERE name = ?1 AND group_name = ?2)")?
         .query_row(params![name, group_name], |r| r.get(0))?;
     if !exists_in_par2 {
-        let distinct: i64 = conn.query_row(
-            "SELECT count(*) FROM (SELECT DISTINCT name, group_name FROM raw_par2_files)",
-            [],
-            |r| r.get(0),
-        )?;
+        let distinct: i64 =
+            conn.query_row("SELECT count(*) FROM (SELECT DISTINCT name, group_name FROM raw_par2_files)", [], |r| {
+                r.get(0)
+            })?;
         if distinct >= MAX_RAW_ARCHIVES_ROWS {
             let to_drop = (distinct - MAX_RAW_ARCHIVES_ROWS + 1).max(64);
             conn.execute(
@@ -1773,8 +1912,9 @@ fn upsert_par2_files_in_tx(
     }
     let mut ins = conn.prepare_cached(
         "INSERT OR REPLACE INTO raw_par2_files
-         (name, group_name, content_id, file_id, set_id, md5, md5_16k, size, file_name, crc32, bound, sealed, complete)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+         (name, group_name, content_id, file_id, set_id, md5, md5_16k, size, file_name, crc32, bound, sealed, complete,
+          creator)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
     )?;
     for f in &inv.files {
         let sealed = inv.sealed.contains(&(f.set_id, f.file_id)) && f.bound;
@@ -1792,6 +1932,7 @@ fn upsert_par2_files_in_tx(
             i64::from(f.bound),
             i64::from(sealed),
             i64::from(inv.complete),
+            inv.creator_of(&f.set_id),
         ])?;
     }
     Ok(())
@@ -1803,6 +1944,98 @@ pub fn put_par2_files(name: &str, group_name: &str, content_id: &[u8], inv: &cra
         return;
     }
     let _ = with_raw_tx(|conn| upsert_par2_files_in_tx(conn, name, group_name, content_id, inv));
+}
+
+/// The data volume table read from a release's first `.rev` file (`archive::rev`), saved for `(name, group_name)`
+/// and `content_id`, in volume order. None when none was saved for these files.
+pub fn get_rev_volumes(name: &str, group_name: &str, content_id: &[u8]) -> Option<Vec<crate::archive::rev::Volume>> {
+    if content_id.is_empty() {
+        return None;
+    }
+    with_raw(|conn| {
+        let Some(group_name) = saved_group(conn, REV_GROUP, name, group_name, content_id)? else {
+            return Ok(None);
+        };
+        let rows = conn
+            .prepare_cached(
+                "SELECT volume, size, crc32 FROM raw_rev_volumes
+                 WHERE name = ?1 AND group_name = ?2 AND content_id = ?3 ORDER BY volume",
+            )?
+            .query_map(params![name, group_name, content_id], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let volumes: Option<Vec<_>> = rows
+            .into_iter()
+            .map(|(volume, size, crc)| {
+                Some(crate::archive::rev::Volume {
+                    index: u16::try_from(volume).ok()?,
+                    size: u64::try_from(size).ok()?,
+                    crc32: u32::try_from(crc).ok()?,
+                })
+            })
+            .collect();
+        Ok(volumes.filter(|v| !v.is_empty()))
+    })
+    .flatten()
+}
+
+/// Saves a release's data volume table for `(name, group_name)` and `content_id`, in place of what was saved, within
+/// `MAX_RAW_REV_ROWS` rows.
+pub fn put_rev_volumes(name: &str, group_name: &str, content_id: &[u8], volumes: &[crate::archive::rev::Volume]) {
+    if content_id.is_empty() || volumes.is_empty() || volumes.len() > crate::archive::rev::MAX_KEPT {
+        return;
+    }
+    let _ = with_raw_tx(|conn| {
+        let had: bool = conn
+            .prepare_cached("SELECT EXISTS(SELECT 1 FROM raw_rev_volumes WHERE name = ?1 AND group_name = ?2)")?
+            .query_row(params![name, group_name], |r| r.get(0))?;
+        prune_rev_rows(conn, if had { 0 } else { volumes.len() as i64 })?;
+        conn.prepare_cached("DELETE FROM raw_rev_volumes WHERE name = ?1 AND group_name = ?2")?
+            .execute(params![name, group_name])?;
+        let mut ins = conn.prepare_cached(
+            "INSERT OR REPLACE INTO raw_rev_volumes (name, group_name, content_id, volume, size, crc32)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )?;
+        for v in volumes {
+            ins.execute(params![
+                name,
+                group_name,
+                content_id,
+                i64::from(v.index),
+                i64::try_from(v.size).unwrap_or(i64::MAX),
+                i64::from(v.crc32)
+            ])?;
+        }
+        Ok(())
+    });
+}
+
+/// The most `raw_rev_volumes` rows kept, whatever the count of releases: what posted headers can make it hold.
+const MAX_RAW_REV_ROWS: i64 = 1_000_000;
+
+/// Drops whole saved tables, by key order, until `room` more rows fit within `MAX_RAW_REV_ROWS`. The row count is
+/// `raw_meta`'s `rev_rows`, kept by triggers, soo a save that fits reads one row and scans nothing.
+fn prune_rev_rows(conn: &Connection, room: i64) -> rusqlite::Result<()> {
+    prune_rev_rows_to(conn, room, MAX_RAW_REV_ROWS)
+}
+
+fn prune_rev_rows_to(conn: &Connection, room: i64, cap: i64) -> rusqlite::Result<()> {
+    loop {
+        let rows = raw_meta_get(conn, "rev_rows")?;
+        if rows == 0 || rows + room <= cap {
+            return Ok(());
+        }
+        // a release holds at most `MAX_KEPT` rows, soo this many is the least that can make the room; counted again
+        // after, as releases of fewer rows free less
+        let releases = (rows + room - cap) / crate::archive::rev::MAX_KEPT as i64 + 64;
+        conn.execute(
+            "DELETE FROM raw_rev_volumes WHERE (name, group_name) IN (
+                SELECT DISTINCT name, group_name FROM raw_rev_volumes LIMIT ?1
+            )",
+            params![releases],
+        )?;
+    }
 }
 
 /// Looks up cached PAR2 twin-fingerprint and repair-block metadata for `(name, group_name)` and `content_id`
@@ -1824,8 +2057,7 @@ pub fn get_par2(
             return Ok(None);
         };
         let group_name = group_name.as_str();
-        type RawPar2Row =
-            (i64, Option<Vec<u8>>, Option<i64>, Option<i64>, Option<i64>, Option<i64>, Option<Vec<u8>>);
+        type RawPar2Row = (i64, Option<Vec<u8>>, Option<i64>, Option<i64>, Option<i64>, Option<i64>, Option<Vec<u8>>);
         let row: Option<RawPar2Row> = conn
             .prepare_cached(
                 "SELECT covers_all, posted, par2_block, par2_blocks, parts, complete, content_fp
@@ -1853,13 +2085,7 @@ pub fn get_par2(
             return Ok(None);
         }
         let inventory = read_par2_files_in(conn, name, group_name, content_id)?;
-        Ok(Some(SavedPar2 {
-            covers_all: covers,
-            posted,
-            sizes: par2_block.zip(par2_blocks),
-            content_fp,
-            inventory,
-        }))
+        Ok(Some(SavedPar2 { covers_all: covers, posted, sizes: par2_block.zip(par2_blocks), content_fp, inventory }))
     })
     .flatten()
 }
@@ -1935,17 +2161,11 @@ pub fn restore_backfill_deepest(main: &Path, main_conn: &Connection) {
         return;
     }
     let Ok(raw_conn) = create(&raw_path) else { return };
-    let Ok(mut stmt) = raw_conn.prepare("SELECT grp, server, oldest_at, runner_up_at FROM raw_backfill_deepest")
-    else {
+    let Ok(mut stmt) = raw_conn.prepare("SELECT grp, server, oldest_at, runner_up_at FROM raw_backfill_deepest") else {
         return;
     };
     let Ok(rows) = stmt.query_map([], |r| {
-        Ok((
-            r.get::<_, String>(0)?,
-            r.get::<_, String>(1)?,
-            r.get::<_, Option<i64>>(2)?,
-            r.get::<_, Option<i64>>(3)?,
-        ))
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<i64>>(2)?, r.get::<_, Option<i64>>(3)?))
     }) else {
         return;
     };
@@ -1959,9 +2179,15 @@ pub fn restore_backfill_deepest(main: &Path, main_conn: &Connection) {
     }
 }
 
+/// Whether `schema.table` has `column`: a shard made before the column was added has none yet.
+fn has_column(conn: &Connection, schema: &str, table: &str, column: &str) -> rusqlite::Result<bool> {
+    let mut stmt = conn.prepare(&format!("pragma {schema}.table_info({table})"))?;
+    let names = stmt.query_map([], |r| r.get::<_, String>(1))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(names.iter().any(|n| n == column))
+}
+
 fn has_table(conn: &Connection, schema: &str, table: &str) -> rusqlite::Result<bool> {
-    conn.prepare(&format!("SELECT 1 FROM {schema}.sqlite_master WHERE type = 'table' AND name = ?1"))?
-        .exists([table])
+    conn.prepare(&format!("SELECT 1 FROM {schema}.sqlite_master WHERE type = 'table' AND name = ?1"))?.exists([table])
 }
 
 fn populate_harvest_content_ids(tx: &rusqlite::Transaction<'_>, schema: &str) -> rusqlite::Result<()> {
@@ -1982,9 +2208,11 @@ fn populate_harvest_content_ids(tx: &rusqlite::Transaction<'_>, schema: &str) ->
         "archive_release",
         "archive_inner_files",
         "par2_files",
+        "rev_volumes",
         "release_fingerprint",
         "release_nfo_password",
         "release_stills",
+        "release_audio_print",
     ] {
         if has_table(tx, schema, table)? {
             tx.execute_batch(&format!(
@@ -1993,9 +2221,8 @@ fn populate_harvest_content_ids(tx: &rusqlite::Transaction<'_>, schema: &str) ->
             ))?;
         }
     }
-    let mut insert = tx.prepare_cached(
-        "INSERT OR REPLACE INTO temp.harvest_content_ids (release_id, content_id) VALUES (?1, ?2)",
-    )?;
+    let mut insert =
+        tx.prepare_cached("INSERT OR REPLACE INTO temp.harvest_content_ids (release_id, content_id) VALUES (?1, ?2)")?;
     if has_table(tx, schema, "files")? {
         let mut stmt = tx.prepare(&format!(
             "SELECT f.release_id, f.id, f.filename, f.subject_mid, f.expected, f.seen, f.blob
@@ -2168,11 +2395,10 @@ fn enforce_harvest_quotas(conn: &Connection) -> rusqlite::Result<()> {
             del_files.execute(params![name, group])?;
         }
     }
-    let pf_distinct: i64 = conn.query_row(
-        "SELECT count(*) FROM (SELECT DISTINCT name, group_name FROM raw_par2_files)",
-        [],
-        |r| r.get(0),
-    )?;
+    let pf_distinct: i64 =
+        conn.query_row("SELECT count(*) FROM (SELECT DISTINCT name, group_name FROM raw_par2_files)", [], |r| {
+            r.get(0)
+        })?;
     if pf_distinct > MAX_RAW_ARCHIVES_ROWS {
         conn.execute(
             "DELETE FROM raw_par2_files WHERE (name, group_name) IN (
@@ -2181,6 +2407,7 @@ fn enforce_harvest_quotas(conn: &Connection) -> rusqlite::Result<()> {
             params![pf_distinct - MAX_RAW_ARCHIVES_ROWS],
         )?;
     }
+    prune_rev_rows(conn, 0)?;
     let stills_count: i64 = conn.query_row("SELECT count(*) FROM raw_stills", [], |r| r.get(0))?;
     if stills_count > MAX_RAW_STILLS_ROWS {
         conn.execute(
@@ -2188,6 +2415,15 @@ fn enforce_harvest_quotas(conn: &Connection) -> rusqlite::Result<()> {
                 SELECT name, group_name, position FROM raw_stills LIMIT ?1
             )",
             params![stills_count - MAX_RAW_STILLS_ROWS],
+        )?;
+    }
+    let prints_count: i64 = conn.query_row("SELECT count(*) FROM raw_audio_prints", [], |r| r.get(0))?;
+    if prints_count > MAX_RAW_AUDIO_PRINTS_ROWS {
+        conn.execute(
+            "DELETE FROM raw_audio_prints WHERE (name, group_name, position) IN (
+                SELECT name, group_name, position FROM raw_audio_prints LIMIT ?1
+            )",
+            params![prints_count - MAX_RAW_AUDIO_PRINTS_ROWS],
         )?;
     }
     Ok(())
@@ -2330,15 +2566,23 @@ fn harvest_attached_release_tables(tx: &rusqlite::Transaction<'_>, schema: &str)
         } else {
             "NULL".to_string()
         };
+        // the packer, the twin key and which facts the list was read with go along; the salted owner and zone keys
+        // don't, since a reset makes a new salt
+        let kept = if has_column(tx, schema, "archive_release", "facts")? {
+            "a.packer, a.twin_key, coalesce(a.facts, 0)"
+        } else {
+            "NULL, NULL, 0"
+        };
         tx.execute_batch(&format!(
             "INSERT INTO main.raw_archives
-                 (name, group_name, content_id, password, encryption, names_hidden, password_check, parts, complete, listing_complete, listing_damaged, content_fp)
+                 (name, group_name, content_id, password, encryption, names_hidden, password_check, parts, complete, listing_complete, listing_damaged, content_fp,
+                  packer, twin_key, facts)
              SELECT r.name, r.group_name,
                     CASE WHEN {list_verified} THEN hcid.content_id ELSE NULL END,
                     a.password, a.encryption, a.names_hidden, a.password_check,
                     CASE WHEN {list_verified} THEN coalesce(r.parts, 0) ELSE 0 END,
                     CASE WHEN {list_verified} THEN coalesce(r.complete, 0) ELSE 0 END,
-                    {listing_complete_expr}, 0, {content_fp_expr}
+                    {listing_complete_expr}, 0, {content_fp_expr}, {kept}
              FROM {schema}.archive_release a
              JOIN {schema}.releases r ON r.id = a.release_id
              LEFT JOIN temp.harvest_content_ids hcid ON hcid.release_id = r.id
@@ -2354,22 +2598,34 @@ fn harvest_attached_release_tables(tx: &rusqlite::Transaction<'_>, schema: &str)
                 complete = excluded.complete,
                 listing_complete = excluded.listing_complete,
                 listing_damaged = excluded.listing_damaged,
-                content_fp = excluded.content_fp
+                content_fp = excluded.content_fp,
+                packer = excluded.packer,
+                twin_key = excluded.twin_key,
+                owner_key = NULL,
+                zone_key = NULL,
+                key_salt = NULL,
+                facts = excluded.facts
              WHERE excluded.content_id IS NOT NULL;"
         ))?;
     }
     if has_inner {
+        let inner_facts = if has_column(tx, schema, "archive_inner_files", "crc32")? {
+            "f.crc32 AS crc32, f.mtime AS mtime, f.host_os AS host_os"
+        } else {
+            "NULL AS crc32, NULL AS mtime, NULL AS host_os"
+        };
         let select_inner_sql = format!(
-            "SELECT r_id, r_name, group_name, seq, cid, f_name, size, source
+            "SELECT r_id, r_name, group_name, seq, cid, f_name, size, source, crc32, mtime, host_os
              FROM (
-                 SELECT r_id, r_name, group_name, seq, cid, f_name, size, source,
+                 SELECT r_id, r_name, group_name, seq, cid, f_name, size, source, crc32, mtime, host_os,
                         SUM(length(cast(f_name as blob)) + 32) OVER (ORDER BY r_id DESC RANGE UNBOUNDED PRECEDING) AS cum_bytes,
                         COUNT(*) OVER (ORDER BY r_id DESC RANGE UNBOUNDED PRECEDING) AS cum_rows
                  FROM (
                      SELECT r.id AS r_id, r.name AS r_name, r.group_name AS group_name, f.seq AS seq,
                             CASE WHEN (CASE WHEN coalesce(f.source, 2) = 1 THEN ({par2_verified} OR {list_verified}) ELSE {list_verified} END)
                                  THEN hcid.content_id ELSE NULL END AS cid,
-                            f.name AS f_name, f.size AS size, f.source AS source
+                            f.name AS f_name, f.size AS size, f.source AS source,
+                            {inner_facts}
                      FROM {schema}.archive_inner_files f
                      JOIN {schema}.releases r ON r.id = f.release_id
                      LEFT JOIN temp.harvest_content_ids hcid ON hcid.release_id = r.id
@@ -2393,13 +2649,17 @@ fn harvest_attached_release_tables(tx: &rusqlite::Transaction<'_>, schema: &str)
                AND coalesce(source, 2) = ?3",
         )?;
         let mut upsert_inner = tx.prepare_cached(
-            "INSERT INTO main.raw_archive_inner_files (release_name, group_name, seq, content_id, name, size, source)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "INSERT INTO main.raw_archive_inner_files
+                 (release_name, group_name, seq, content_id, name, size, source, crc32, mtime, host_os)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
              ON CONFLICT(release_name, group_name, seq) DO UPDATE SET
                 content_id = excluded.content_id,
                 name = excluded.name,
                 size = excluded.size,
-                source = excluded.source
+                source = excluded.source,
+                crc32 = excluded.crc32,
+                mtime = excluded.mtime,
+                host_os = excluded.host_os
              WHERE excluded.content_id IS NOT NULL",
         )?;
         let mut check_existing_inner = tx.prepare_cached(
@@ -2407,8 +2667,7 @@ fn harvest_attached_release_tables(tx: &rusqlite::Transaction<'_>, schema: &str)
              FROM main.raw_archive_inner_files
              WHERE release_name = ?1 AND group_name = ?2 AND seq = ?3",
         )?;
-        let mut winner_rel_id: std::collections::HashMap<(String, String, i64), i64> =
-            std::collections::HashMap::new();
+        let mut winner_rel_id: std::collections::HashMap<(String, String, i64), i64> = std::collections::HashMap::new();
         while let Some(r) = rows.next()? {
             let r_id: i64 = r.get(0)?;
             let r_name: String = r.get(1)?;
@@ -2418,6 +2677,7 @@ fn harvest_attached_release_tables(tx: &rusqlite::Transaction<'_>, schema: &str)
             let f_name: String = r.get(5)?;
             let size: Option<i64> = r.get(6)?;
             let source: Option<i64> = r.get(7)?;
+            let (crc32, mtime, host_os): (Option<i64>, Option<i64>, Option<i64>) = (r.get(8)?, r.get(9)?, r.get(10)?);
             let src_key = source.unwrap_or(2);
             let key = (r_name.clone(), group_name.clone(), src_key);
             match winner_rel_id.get(&key) {
@@ -2431,9 +2691,8 @@ fn harvest_attached_release_tables(tx: &rusqlite::Transaction<'_>, schema: &str)
                 }
             }
             let row_bytes = f_name.len() as i64 + 32;
-            let existing_bytes: Option<i64> = check_existing_inner
-                .query_row(params![&r_name, &group_name, seq], |row| row.get(0))
-                .optional()?;
+            let existing_bytes: Option<i64> =
+                check_existing_inner.query_row(params![&r_name, &group_name, seq], |row| row.get(0)).optional()?;
             let net_bytes = match existing_bytes {
                 Some(old_bytes) => {
                     if cid.is_none() {
@@ -2444,7 +2703,7 @@ fn harvest_attached_release_tables(tx: &rusqlite::Transaction<'_>, schema: &str)
                 None => row_bytes,
             };
             prune_archive_inner_files(tx, net_bytes, Some((&r_name, &group_name)))?;
-            upsert_inner.execute(params![r_name, group_name, seq, cid, f_name, size, source])?;
+            upsert_inner.execute(params![r_name, group_name, seq, cid, f_name, size, source, crc32, mtime, host_os])?;
         }
         tx.execute_batch(
             "DELETE FROM main.raw_archives
@@ -2493,10 +2752,14 @@ fn harvest_attached_release_tables(tx: &rusqlite::Transaction<'_>, schema: &str)
         ))?;
     }
     if has_table(tx, schema, "par2_files")? {
+        // a shard from before the Creator string was kept has no column for it
+        let creator_col = if has_column(tx, schema, "par2_files", "creator")? { "pf.creator" } else { "NULL" };
         let select_pf_sql = format!(
-            "SELECT r_id, r_name, group_name, cid, file_id, set_id, md5, md5_16k, size, f_name, crc32, bound, sealed, complete
+            "SELECT r_id, r_name, group_name, cid, file_id, set_id, md5, md5_16k, size, f_name, crc32, bound, sealed, complete,
+                    creator
              FROM (
                  SELECT r_id, r_name, group_name, cid, file_id, set_id, md5, md5_16k, size, f_name, crc32, bound, sealed, complete,
+                        creator,
                         COUNT(*) OVER (PARTITION BY r_id) AS rel_rows,
                         COUNT(*) OVER (ORDER BY r_id DESC RANGE UNBOUNDED PRECEDING) AS cum_rows
                  FROM (
@@ -2504,7 +2767,8 @@ fn harvest_attached_release_tables(tx: &rusqlite::Transaction<'_>, schema: &str)
                             CASE WHEN ({par2_verified} OR {list_verified}) THEN hcid.content_id ELSE NULL END AS cid,
                             pf.file_id AS file_id, pf.set_id AS set_id, pf.md5 AS md5, pf.md5_16k AS md5_16k,
                             pf.size AS size, pf.name AS f_name, pf.crc32 AS crc32,
-                            coalesce(pf.bound, 1) AS bound, coalesce(pf.sealed, 0) AS sealed, coalesce(pf.complete, 0) AS complete
+                            coalesce(pf.bound, 1) AS bound, coalesce(pf.sealed, 0) AS sealed, coalesce(pf.complete, 0) AS complete,
+                            {creator_col} AS creator
                      FROM {schema}.par2_files pf
                      JOIN {schema}.releases r ON r.id = pf.release_id
                      LEFT JOIN temp.harvest_content_ids hcid ON hcid.release_id = r.id
@@ -2528,8 +2792,9 @@ fn harvest_attached_release_tables(tx: &rusqlite::Transaction<'_>, schema: &str)
         let mut clear_pf = tx.prepare_cached("DELETE FROM main.raw_par2_files WHERE name = ?1 AND group_name = ?2")?;
         let mut upsert_pf = tx.prepare_cached(
             "INSERT INTO main.raw_par2_files
-             (name, group_name, content_id, file_id, set_id, md5, md5_16k, size, file_name, crc32, bound, sealed, complete)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+             (name, group_name, content_id, file_id, set_id, md5, md5_16k, size, file_name, crc32, bound, sealed, complete,
+              creator)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
              ON CONFLICT(name, group_name, file_id) DO UPDATE SET
                 content_id = excluded.content_id,
                 set_id = excluded.set_id,
@@ -2540,11 +2805,11 @@ fn harvest_attached_release_tables(tx: &rusqlite::Transaction<'_>, schema: &str)
                 crc32 = excluded.crc32,
                 bound = excluded.bound,
                 sealed = excluded.sealed,
-                complete = excluded.complete
+                complete = excluded.complete,
+                creator = excluded.creator
              WHERE excluded.content_id IS NOT NULL",
         )?;
-        let mut winner_pf_rel: std::collections::HashMap<(String, String), i64> =
-            std::collections::HashMap::new();
+        let mut winner_pf_rel: std::collections::HashMap<(String, String), i64> = std::collections::HashMap::new();
         while let Some(r) = rows.next()? {
             let r_id: i64 = r.get(0)?;
             let r_name: String = r.get(1)?;
@@ -2570,9 +2835,10 @@ fn harvest_attached_release_tables(tx: &rusqlite::Transaction<'_>, schema: &str)
             let bound: i64 = r.get(11)?;
             let sealed: i64 = r.get(12)?;
             let complete: i64 = r.get(13)?;
+            let creator: Option<String> = r.get(14)?;
             upsert_pf.execute(params![
                 r_name, group_name, cid, file_id, set_id, md5, md5_16k, size, file_name, crc32, bound, sealed,
-                complete
+                complete, creator
             ])?;
         }
         tx.execute_batch(
@@ -2586,9 +2852,55 @@ fn harvest_attached_release_tables(tx: &rusqlite::Transaction<'_>, schema: &str)
                 );",
         )?;
     }
+    if has_table(tx, schema, "rev_volumes")? {
+        // the newest releases' tables, whole: of two releases of one name and group, the newer one's
+        let mut stmt = tx.prepare(&format!(
+            "SELECT r.id, r.name, r.group_name, hcid.content_id, rv.volume, rv.size, rv.crc32
+             FROM {schema}.rev_volumes rv
+             JOIN {schema}.releases r ON r.id = rv.release_id
+             JOIN temp.harvest_content_ids hcid ON hcid.release_id = r.id
+             WHERE r.name IS NOT NULL AND r.group_name IS NOT NULL AND {par2_verified}
+               AND r.id IN (
+                   SELECT DISTINCT release_id FROM {schema}.rev_volumes ORDER BY release_id DESC LIMIT {MAX_RAW_ARCHIVES_ROWS}
+               )
+             ORDER BY r.id DESC, rv.volume"
+        ))?;
+        let mut rows = stmt.query([])?;
+        let mut clear = tx.prepare_cached("DELETE FROM main.raw_rev_volumes WHERE name = ?1 AND group_name = ?2")?;
+        let mut insert = tx.prepare_cached(
+            "INSERT OR REPLACE INTO main.raw_rev_volumes (name, group_name, content_id, volume, size, crc32)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )?;
+        let mut winner: std::collections::HashMap<(String, String), i64> = std::collections::HashMap::new();
+        while let Some(r) = rows.next()? {
+            let id: i64 = r.get(0)?;
+            let key: (String, String) = (r.get(1)?, r.get(2)?);
+            match winner.get(&key) {
+                Some(won) if *won != id => continue,
+                Some(_) => {}
+                None => {
+                    clear.execute(params![&key.0, &key.1])?;
+                    winner.insert(key.clone(), id);
+                }
+            }
+            let cid: Vec<u8> = r.get(3)?;
+            insert.execute(params![
+                key.0,
+                key.1,
+                cid,
+                r.get::<_, i64>(4)?,
+                r.get::<_, i64>(5)?,
+                r.get::<_, i64>(6)?
+            ])?;
+        }
+        drop(rows);
+        drop(stmt);
+        prune_rev_rows(tx, 0)?;
+    }
     if has_table(tx, schema, "release_nfo_password")? {
         let nfo_mask = crate::postprocess::step::mask(crate::naming::NFO);
-        let nfo_verified = format!("({probe_verified} OR {})", verified_step_sql(schema, nfo_mask, has_pp_state, has_pp_walks));
+        let nfo_verified =
+            format!("({probe_verified} OR {})", verified_step_sql(schema, nfo_mask, has_pp_state, has_pp_walks));
         tx.execute_batch(&format!(
             "INSERT INTO main.raw_nfo_passwords (name, group_name, content_id, password)
              SELECT r.name, r.group_name,
@@ -2625,6 +2937,26 @@ fn harvest_attached_release_tables(tx: &rusqlite::Transaction<'_>, schema: &str)
                 width = excluded.width,
                 height = excluded.height,
                 phash = excluded.phash
+             WHERE excluded.content_id IS NOT NULL;"
+        ))?;
+    }
+    if has_table(tx, schema, "release_audio_print")? {
+        let prints_mask = crate::postprocess::step::mask(crate::probe::audio_print::AUDIO_PRINT_STEP);
+        let prints_verified = verified_step_sql(schema, prints_mask, has_pp_state, has_pp_walks);
+        tx.execute_batch(&format!(
+            "INSERT INTO main.raw_audio_prints (name, group_name, position, content_id, at_ms, items)
+             SELECT r.name, r.group_name, p.position,
+                    CASE WHEN {prints_verified} THEN hcid.content_id ELSE NULL END,
+                    p.at_ms, p.items
+             FROM {schema}.release_audio_print p
+             JOIN {schema}.releases r ON r.id = p.release_id
+             LEFT JOIN temp.harvest_content_ids hcid ON hcid.release_id = r.id
+             WHERE r.name IS NOT NULL AND r.group_name IS NOT NULL
+             ORDER BY r.id DESC LIMIT {MAX_RAW_AUDIO_PRINTS_ROWS}
+             ON CONFLICT(name, group_name, position) DO UPDATE SET
+                content_id = excluded.content_id,
+                at_ms = excluded.at_ms,
+                items = excluded.items
              WHERE excluded.content_id IS NOT NULL;"
         ))?;
     }
@@ -2741,14 +3073,15 @@ pub fn replay_predb_at(main: &Path, apply: bool, log: &dyn Fn(&str)) -> anyhow::
         let fetched_at: i64 = r.get(5)?;
         let spec = crate::predb::feeds::spec(&key)
             .ok_or_else(|| anyhow::anyhow!("unknown predb source '{key}' in raw_predb_log id={id}"))?;
-        let body = decompress(&zst)
-            .ok_or_else(|| anyhow::anyhow!("corrupt zstd payload in raw_predb_log id={id} ({key})"))?;
+        let body =
+            decompress(&zst).ok_or_else(|| anyhow::anyhow!("corrupt zstd payload in raw_predb_log id={id} ({key})"))?;
         let page_num = u32::try_from(page).unwrap_or(1).max(1);
         let entries = match spec.parse {
             crate::predb::feeds::Parser::Json(parse) => {
                 let val: Value = serde_json::from_str(&body)
                     .with_context(|| format!("bad JSON in raw_predb_log id={id} ({key})"))?;
-                parse(&val, page_num).map_err(|e| anyhow::anyhow!("parse error in raw_predb_log id={id} ({key}): {e:?}"))?
+                parse(&val, page_num)
+                    .map_err(|e| anyhow::anyhow!("parse error in raw_predb_log id={id} ({key}): {e:?}"))?
             }
             crate::predb::feeds::Parser::Text(parse) => {
                 parse(&body).map_err(|e| anyhow::anyhow!("parse error in raw_predb_log id={id} ({key}): {e:?}"))?
@@ -2766,16 +3099,12 @@ pub fn replay_predb_at(main: &Path, apply: bool, log: &dyn Fn(&str)) -> anyhow::
     if apply {
         log(&format!(
             "replayed {} raw predb payloads ({} entries): {} inserted, {} updated",
-            replayed_payloads,
-            parsed_entries,
-            inserted,
-            updated
+            replayed_payloads, parsed_entries, inserted, updated
         ));
     } else {
         log(&format!(
             "dry run (pass --apply to write): {} raw predb payloads yield {} parsed entries",
-            replayed_payloads,
-            parsed_entries
+            replayed_payloads, parsed_entries
         ));
     }
     Ok(())
@@ -2924,15 +3253,14 @@ mod tests {
             Some((200, r#"{"id":603}"#.to_string()))
         );
         // Expired HTTP cache entries are not served live so 24h negative retries and 30d refreshes reach upstream.
-        assert_eq!(
-            get_http_cache_with_ttl("tmdb", "https://api.themoviedb.org/3/movie/603", Some(-1)),
-            None
-        );
+        assert_eq!(get_http_cache_with_ttl("tmdb", "https://api.themoviedb.org/3/movie/603", Some(-1)), None);
 
         // Empty media search results are detected so negative lookups aren't pinned in raw_http_cache.
         assert!(is_empty_media_json(&serde_json::from_str("[]").unwrap()));
         assert!(is_empty_media_json(&serde_json::from_str(r#"{"page":1,"results":[]}"#).unwrap()));
-        assert!(is_empty_media_json(&serde_json::from_str(r#"{"Response":"False","Error":"Movie not found!"}"#).unwrap()));
+        assert!(is_empty_media_json(
+            &serde_json::from_str(r#"{"Response":"False","Error":"Movie not found!"}"#).unwrap()
+        ));
         assert!(!is_empty_media_json(&serde_json::from_str(r#"{"id":603,"title":"The Matrix"}"#).unwrap()));
 
         // Rolling PreDB feeds and live catalogues (nswdb, 3dsdb) are logged in raw_predb_log for replay,
@@ -3024,10 +3352,22 @@ mod tests {
         assert_eq!(get_stills("Some.Release-GRP", "alt.binaries.test", cid_a), stills);
         assert!(get_stills("Some.Release-GRP", "alt.binaries.test", cid_b).is_empty());
 
+        // Audio prints roundtrip (bound to content_id)
+        let prints = vec![
+            SavedPrint { position: 25, at_ms: 1_350_000, items: vec![1, 2, 3, 4] },
+            SavedPrint { position: 50, at_ms: 2_700_000, items: vec![5, 6, 7, 8] },
+        ];
+        put_audio_prints("Some.Release-GRP", "alt.binaries.test", cid_a, &prints);
+        assert_eq!(get_audio_prints("Some.Release-GRP", "alt.binaries.test", cid_a), prints);
+        assert!(get_audio_prints("Some.Release-GRP", "alt.binaries.test", cid_b).is_empty());
+
         // Archive & PAR2 inner-files roundtrip (bound to content_id and preserving full-list content_fp)
         let archive_files = vec![crate::archive::InnerFile {
             name: "Movie.2026.1080p.mkv".to_string(),
             size: Some(1_500_000_000),
+            crc32: Some(0xdead_beef),
+            mtime: Some(1_700_000_000),
+            host_os: Some(crate::archive::facts::HOST_UNIX),
         }];
         put_archive(&ArchiveRecord {
             name: "Some.Release-GRP",
@@ -3045,6 +3385,14 @@ mod tests {
             listing_damaged: false,
             content_fp: Some(&[9; 20]),
             max_names_bytes: 16 << 20,
+            keys: crate::archive::store::ArchiveKeys {
+                packer: Some("RAR5 · v0 · m0".into()),
+                twin_key: Some(7),
+                owner_key: Some(8),
+                zone_key: Some(9),
+            },
+            key_salt: Some(10),
+            facts: crate::archive::store::FACTS,
         });
         let saved_arch = get_archive("Some.Release-GRP", "alt.binaries.test", cid_a, 20, true).unwrap();
         assert_eq!(saved_arch.password, Some(crate::archive::Password::Yes.code()));
@@ -3056,6 +3404,13 @@ mod tests {
         assert_eq!(saved_arch.content_fp.as_deref(), Some(&[9; 20][..]));
         assert_eq!(saved_arch.files.len(), 1);
         assert_eq!(saved_arch.files[0].name, "Movie.2026.1080p.mkv");
+        assert_eq!(saved_arch.files[0].clone().into_inner(), archive_files[0], "the file's facts come back");
+        assert_eq!(saved_arch.keys.packer.as_deref(), Some("RAR5 · v0 · m0"));
+        assert_eq!(
+            (saved_arch.keys.twin_key, saved_arch.keys.owner_key, saved_arch.keys.zone_key),
+            (Some(7), Some(8), Some(9))
+        );
+        assert_eq!((saved_arch.key_salt, saved_arch.facts), (Some(10), crate::archive::store::FACTS));
         assert_eq!(get_archive("Some.Release-GRP", "alt.binaries.test", cid_b, 20, true), None);
 
         // Quota-dropped archive listings (max_names_bytes = 0) are treated as cache misses
@@ -3075,6 +3430,9 @@ mod tests {
             listing_damaged: false,
             content_fp: Some(&[9; 20]),
             max_names_bytes: 0,
+            keys: Default::default(),
+            key_salt: None,
+            facts: crate::archive::store::FACTS,
         });
         assert_eq!(get_archive("Quota.Dropped-GRP", "alt.binaries.test", cid_a, 20, true), None);
 
@@ -3164,13 +3522,16 @@ mod tests {
                 record_predb_page(1, "predb_club", "https://predb.club/api/v1/?page=1", 1, r#"{"state":"B"}"#);
                 record_predb_page(1, "predb_club", "https://predb.club/api/v1/?page=1", 1, r#"{"state":"C"}"#);
             }
-            let distinct_reachable: i64 = conn
-                .query_row("SELECT count(DISTINCT log_id) FROM raw_predb_events", [], |r| r.get(0))
-                .unwrap();
+            let distinct_reachable: i64 =
+                conn.query_row("SELECT count(DISTINCT log_id) FROM raw_predb_events", [], |r| r.get(0)).unwrap();
             let total_logs: i64 = conn.query_row("SELECT count(*) FROM raw_predb_log", [], |r| r.get(0)).unwrap();
-            let bounded_ev_count: i64 = conn.query_row("SELECT count(*) FROM raw_predb_events", [], |r| r.get(0)).unwrap();
+            let bounded_ev_count: i64 =
+                conn.query_row("SELECT count(*) FROM raw_predb_events", [], |r| r.get(0)).unwrap();
             assert_eq!(total_logs, 3);
-            assert_eq!(distinct_reachable, 3, "all retained raw_predb_log payloads remain reachable in raw_predb_events");
+            assert_eq!(
+                distinct_reachable, 3,
+                "all retained raw_predb_log payloads remain reachable in raw_predb_events"
+            );
             assert!(bounded_ev_count <= total_logs * 2, "raw_predb_events bounded to at most 2 events per payload");
             // Recording the same payload consecutively at MAX_PREDB_LOG_ROWS must not evict existing rows or add duplicate events
             conn.execute("UPDATE raw_meta SET value = ?1 WHERE key = 'predb_rows'", [MAX_PREDB_LOG_ROWS]).unwrap();
@@ -3178,7 +3539,10 @@ mod tests {
             let post_count: i64 = conn.query_row("SELECT count(*) FROM raw_predb_log", [], |r| r.get(0)).unwrap();
             let post_ev_count: i64 = conn.query_row("SELECT count(*) FROM raw_predb_events", [], |r| r.get(0)).unwrap();
             assert_eq!(post_count, 3, "duplicate PreDB payload must not trigger eviction");
-            assert_eq!(post_ev_count, bounded_ev_count, "consecutive identical payload on same page must not append redundant event");
+            assert_eq!(
+                post_ev_count, bounded_ev_count,
+                "consecutive identical payload on same page must not append redundant event"
+            );
 
             prune_probes(&conn, MAX_RAW_PROBES_BYTES, MAX_RAW_PROBES_ROWS, MAX_RAW_PROBES_BYTES).unwrap();
             assert_eq!(raw_meta_get(&conn, "probe_rows").unwrap(), 0);
@@ -3247,7 +3611,7 @@ mod tests {
         assert_eq!(get_stills(name, b, same), stills);
         assert!(get_stills(name, b, other).is_empty());
 
-        let files = vec![crate::archive::InnerFile { name: "Movie.mkv".into(), size: Some(9) }];
+        let files = vec![crate::archive::InnerFile::new("Movie.mkv".into(), Some(9))];
         put_archive(&ArchiveRecord {
             name,
             group_name: a,
@@ -3264,6 +3628,9 @@ mod tests {
             listing_damaged: false,
             content_fp: None,
             max_names_bytes: 16 << 20,
+            keys: Default::default(),
+            key_salt: None,
+            facts: crate::archive::store::FACTS,
         });
         assert_eq!(get_archive(name, b, same, 20, true).unwrap().files[0].name, "Movie.mkv");
         assert_eq!(get_archive_files(name, b, same, crate::archive::store::SOURCE_RAR)[0].name, "Movie.mkv");
@@ -3283,6 +3650,7 @@ mod tests {
             }],
             sealed: vec![([4; 16], [3; 16])],
             complete: true,
+            creators: vec![([4; 16], "Created by par2cmdline version 0.8.1.".into())],
             ..Default::default()
         };
         put_par2(&Par2Record {
@@ -3301,7 +3669,131 @@ mod tests {
         assert_eq!(get_par2_files(name, b, same), Some(inventory));
         assert_eq!(get_par2(name, b, other, 20, true), None);
         assert_eq!(get_par2_files(name, b, other), None);
+
+        let volumes = [
+            crate::archive::rev::Volume { index: 0, size: 50 << 20, crc32: 7 },
+            crate::archive::rev::Volume { index: 1, size: 3 << 20, crc32: 8 },
+        ];
+        put_rev_volumes(name, a, same, &volumes);
+        assert_eq!(get_rev_volumes(name, b, same).as_deref(), Some(&volumes[..]));
+        assert_eq!(get_rev_volumes(name, b, other), None);
+        // a later read replaces the whole table
+        put_rev_volumes(name, a, same, &volumes[..1]);
+        assert_eq!(get_rev_volumes(name, a, same).as_deref(), Some(&volumes[..1]));
         set_test_raw_path(None);
+    }
+
+    #[test]
+    fn a_reset_keeps_the_par2_creator_and_the_rev_table() {
+        use crate::parser::{Article, Release};
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        crate::db::create_db_at(&main).unwrap();
+        let group = "alt.binaries.t";
+        let articles = (1..=2)
+            .map(|n| Article {
+                message_id: format!("<x.{n}@news.example>"),
+                subject: format!("\"x.part1.rev\" yEnc ({n}/2)"),
+                filename: Some("x.part1.rev".into()),
+                part: Some(n),
+                total_parts: Some(2),
+                bytes: 100,
+                file_total: Some(1),
+                ..Default::default()
+            })
+            .collect();
+        crate::store::save(
+            &main,
+            &[Release {
+                name: "Rev.Set-GRP".into(),
+                group: group.into(),
+                articles,
+                complete: true,
+                ..Default::default()
+            }],
+        )
+        .unwrap();
+        let shard = Connection::open(crate::store::shard_path(&main, crate::store::shard_of(group))).unwrap();
+        let (id, parts): (i64, i64) =
+            shard.query_row("select id, parts from releases", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        let bit = crate::postprocess::step::mask(crate::archive::steps::PAR2_STEP);
+        shard
+            .execute("insert into pp_state (release_id, done, parts_seen) values (?1, ?2, ?3)", params![id, bit, parts])
+            .unwrap();
+        let inventory = crate::par2::Inventory {
+            files: vec![crate::par2::Par2File {
+                file_id: [3; 16],
+                set_id: [4; 16],
+                md5: [5; 16],
+                md5_16k: [6; 16],
+                size: 9 << 20,
+                name: "x.part1.rar".into(),
+                bound: true,
+                crc32: Some(7),
+            }],
+            complete: true,
+            creators: vec![([4; 16], "ParPar v0.4.1 x64 [https://github.com/animetosho/parpar]".into())],
+            ..Default::default()
+        };
+        let volumes = [crate::archive::rev::Volume { index: 0, size: 9 << 20, crc32: 7 }];
+        let writes = crate::archive::store::par2_file_writes(id, &inventory)
+            .into_iter()
+            .chain(crate::archive::rev::writes(id, &volumes))
+            .filter(|w| w.sql != crate::store::SET_VOUCHED_COMPLETE);
+        for w in writes {
+            shard.execute(w.sql, rusqlite::params_from_iter(w.params)).unwrap();
+        }
+        drop(shard);
+
+        harvest_from_shards(&main, &|_| {}).unwrap();
+        let raw = create(&path_for(&main)).unwrap();
+        let creator: Option<String> =
+            raw.query_row("select creator from raw_par2_files where name = 'Rev.Set-GRP'", [], |r| r.get(0)).unwrap();
+        assert_eq!(creator.as_deref(), inventory.creators.first().map(|(_, c)| c.as_str()));
+        let rev: (i64, i64, i64) = raw
+            .query_row("select volume, size, crc32 from raw_rev_volumes where name = 'Rev.Set-GRP'", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .unwrap();
+        assert_eq!(rev, (0, 9 << 20, 7));
+        let cid: Option<Vec<u8>> = raw.query_row("select content_id from raw_rev_volumes", [], |r| r.get(0)).unwrap();
+        assert!(cid.is_some_and(|c| !c.is_empty()), "kept under the files' content id, soo a step finds it");
+    }
+
+    #[test]
+    fn the_rev_row_cap_holds_whatever_sizes_the_tables_are() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = create(&dir.path().join("atlas.raw.db")).unwrap();
+        let mut ins = conn
+            .prepare("INSERT INTO raw_rev_volumes (name, group_name, content_id, volume, size, crc32) VALUES (?1, 'g', x'01', ?2, 1, 1)")
+            .unwrap();
+        // many one-volume tables first in key order, then a few full ones
+        for i in 0..2_000 {
+            ins.execute(params![format!("a{i:05}"), 0]).unwrap();
+        }
+        for i in 0..20 {
+            for v in 0..crate::archive::rev::MAX_KEPT as i64 {
+                ins.execute(params![format!("b{i:05}"), v]).unwrap();
+            }
+        }
+        drop(ins);
+        assert_eq!(raw_meta_get(&conn, "rev_rows").unwrap(), 2_000 + 20 * crate::archive::rev::MAX_KEPT as i64);
+        prune_rev_rows_to(&conn, 100, 4_000).unwrap();
+        let rows: i64 = conn.query_row("SELECT count(*) FROM raw_rev_volumes", [], |r| r.get(0)).unwrap();
+        assert!(rows + 100 <= 4_000, "{rows} rows left");
+        assert_eq!(raw_meta_get(&conn, "rev_rows").unwrap(), rows, "the triggers keep the count");
+        // a replaced row is one row still
+        conn.execute(
+            "INSERT OR REPLACE INTO raw_rev_volumes (name, group_name, content_id, volume, size, crc32) VALUES ('z', 'g', x'01', 0, 1, 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO raw_rev_volumes (name, group_name, content_id, volume, size, crc32) VALUES ('z', 'g', x'01', 0, 2, 2)",
+            [],
+        )
+        .unwrap();
+        assert_eq!(raw_meta_get(&conn, "rev_rows").unwrap(), rows + 1);
     }
 
     #[test]
@@ -3375,6 +3867,61 @@ mod tests {
     }
 
     #[test]
+    fn audio_prints_are_harvested_before_a_reset() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        crate::db::create_db_at(&main).unwrap();
+        let group = "alt.binaries.test";
+        let name = "Printed.Film.2024-GRP";
+        let articles: Vec<crate::parser::Article> = (1..=2)
+            .map(|p| crate::parser::Article {
+                message_id: format!("<p{p}@x>"),
+                subject: format!("\"f.mkv\" yEnc ({p}/2)"),
+                filename: Some("f.mkv".into()),
+                part: Some(p),
+                total_parts: Some(2),
+                bytes: 700_000,
+                ..Default::default()
+            })
+            .collect();
+        let release = crate::parser::Release {
+            name: name.into(),
+            group: group.into(),
+            size: 1_400_000,
+            articles,
+            complete: true,
+            ..Default::default()
+        };
+        crate::store::save(&main, &[release]).unwrap();
+        let shard = crate::db::open_shard(&crate::store::shard_path(&main, crate::store::shard_of(group))).unwrap();
+        let id: i64 = shard.query_row("select id from releases where name = ?1", [name], |r| r.get(0)).unwrap();
+        let parts: i64 =
+            shard.query_row("select coalesce(parts, 0) from releases where id = ?1", [id], |r| r.get(0)).unwrap();
+        let bit = crate::postprocess::step::mask(crate::probe::audio_print::AUDIO_PRINT_STEP);
+        shard
+            .execute(
+                "insert into pp_state (release_id, done, parts_seen) values (?1, ?2, ?3)",
+                rusqlite::params![id, bit, parts],
+            )
+            .unwrap();
+        shard
+            .execute(
+                "insert into release_audio_print (release_id, position, at_ms, items) values (?1, 50, 2700000, x'01020304')",
+                [id],
+            )
+            .unwrap();
+        let content_id = release_content_id(&shard, id).unwrap();
+        drop(shard);
+        set_test_raw_path(Some(path_for(&main)));
+        harvest_from_shards(&main, &|_| {}).unwrap();
+        assert_eq!(
+            get_audio_prints(name, group, &content_id),
+            vec![SavedPrint { position: 50, at_ms: 2_700_000, items: vec![1, 2, 3, 4] }]
+        );
+        set_test_raw_path(None);
+    }
+
+    #[test]
     fn reset_shards_holds_lock_recovers_or_cleans_compaction_artifacts_and_aborts_on_failure() {
         let dir = tempfile::tempdir().unwrap();
         let main = dir.path().join("atlas.db");
@@ -3420,8 +3967,7 @@ mod tests {
         assert!(!precompact_s1.exists());
         assert!(path_for(&main).exists(), "atlas.raw.db must be preserved");
         let raw_conn = create(&path_for(&main)).unwrap();
-        let bd_count: i64 =
-            raw_conn.query_row("SELECT count(*) FROM raw_backfill_deepest", [], |r| r.get(0)).unwrap();
+        let bd_count: i64 = raw_conn.query_row("SELECT count(*) FROM raw_backfill_deepest", [], |r| r.get(0)).unwrap();
         assert_eq!(bd_count, 0, "harvest must replace stale raw_backfill_deepest snapshot");
     }
 }

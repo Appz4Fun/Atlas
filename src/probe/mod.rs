@@ -3,9 +3,10 @@
 
 pub mod archive;
 pub mod asf;
+pub mod audio_print;
 pub mod avi;
-pub mod body_crc;
 pub mod bluray;
+pub mod body_crc;
 pub mod codec;
 pub mod dvd;
 pub mod lzma;
@@ -19,6 +20,7 @@ pub mod opensubtitles;
 pub mod step;
 pub mod stills;
 pub mod yenc;
+pub mod yenc_quirks;
 
 use std::collections::BTreeMap;
 
@@ -29,8 +31,8 @@ use crate::store;
 
 pub use archive::{ArchiveFormat, ArchiveHead, ArchiveStream, DecompressError};
 pub use media::{
-    AudioBitstream, AudioProbeResult, AudioTrack, AvcDepth, Chapter, DiscInfo, DiscProber, DolbyVisionInfo,
-    H265Sps, HevcDepth, MediaInfo, MediaProber, MkvMetadata, Mp4Prober, VideoTrack, VuiInfo,
+    AudioBitstream, AudioProbeResult, AudioTrack, AvcDepth, Chapter, DiscInfo, DiscProber, DolbyVisionInfo, H265Sps,
+    HevcDepth, MediaInfo, MediaProber, MkvMetadata, Mp4Prober, VideoTrack, VuiInfo,
 };
 pub use nest::{Layer, Nest, unwrap as unwrap_nested};
 pub use step::ProbeStep;
@@ -137,6 +139,9 @@ pub struct ProbeInfo {
     /// which of the release's files this is about
     pub file: Option<String>,
     pub yenc: Option<yenc::YencLines>,
+    /// how the encoder wrote its yEnc, from the first article and the last (`yenc_quirks`)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quirks: Option<yenc_quirks::Quirks>,
     /// the full file's checksum, from the last part
     pub file_crc32: Option<u32>,
     pub segment_size: Option<u64>,
@@ -147,6 +152,10 @@ pub struct ProbeInfo {
     /// first, middle and last article: whether a server still has them
     pub health: BTreeMap<String, bool>,
     pub headers: BTreeMap<String, String>,
+    /// every header name of the probed article, in the order it came, as sent: what the poster and the servers on
+    /// the way wrote, and in what order (`header_set`). Names only, no values.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub header_order: Vec<String>,
     pub crossposted_to: Vec<String>,
     pub archive: Option<archive::ArchiveHead>,
     /// every archive and compressed stream the file was followed down through, outermost first
@@ -183,7 +192,58 @@ const KEPT_HEADERS: &[&str] = &[
     "X-Complaints-To",
     BODY_CRC_HEADER,
     "X-Received-Bytes",
+    // the article's own id and the thread it answers: a post whose parts answer its first article (`thread_root`)
+    "Message-ID",
+    "References",
 ];
+
+/// Header names kept in order, at most, and how long each one may be.
+const MAX_HEADER_NAMES: usize = 48;
+const MAX_HEADER_NAME: usize = 64;
+
+/// The names of an article's headers in the order it gives them.
+pub fn header_order(headers: &[(String, String)]) -> Vec<String> {
+    headers
+        .iter()
+        .take(MAX_HEADER_NAMES)
+        .map(|(name, _)| name.chars().filter(|c| c.is_ascii_graphic()).take(MAX_HEADER_NAME).collect())
+        .collect()
+}
+
+/// What the header-set fingerprint is taken over: the names in order, case kept, the ones a server adds on the way
+/// left out (they say which server, not which poster). None with no names.
+pub fn header_set(order: &[String]) -> Option<String> {
+    const ON_THE_WAY: &[&str] = &[
+        "path",
+        "xref",
+        "lines",
+        "bytes",
+        "x-received-bytes",
+        "x-received-body-crc",
+        "injection-date",
+        "injection-info",
+        "nntp-posting-date",
+        "nntp-posting-host",
+        "x-complaints-to",
+        "x-trace",
+        "organization",
+        "x-abuse-info",
+    ];
+    let names: Vec<&str> =
+        order.iter().map(String::as_str).filter(|n| !ON_THE_WAY.contains(&n.to_ascii_lowercase().as_str())).collect();
+    (!names.is_empty()).then(|| format!("headers:{}", names.join(",")))
+}
+
+/// The id a post's thread hangs on: the first id its References name, else the article's own Message-ID. Two
+/// releases whose probed articles hang on one id are parts of one post, as their poster threaded it.
+pub fn thread_root(headers: &BTreeMap<String, String>) -> Option<String> {
+    let first_id = |v: &str| {
+        let start = v.find('<')?;
+        let end = start + v.get(start..)?.find('>')?;
+        v.get(start..=end).filter(|id| id.len() > 2).map(str::to_string)
+    };
+    headers.get("References").and_then(|r| first_id(r)).or_else(|| headers.get("Message-ID").and_then(|m| first_id(m)))
+}
 
 pub fn keep_headers(headers: &[(String, String)]) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
@@ -352,5 +412,39 @@ mod tests {
         let sfv = parse_sfv("; comment\nmovie.r00 0a1B2c3D\nbad line\n");
         assert_eq!(sfv["movie.r00"], 0x0a1b_2c3d);
         assert_eq!(sfv.len(), 1);
+    }
+
+    #[test]
+    fn header_names_keep_their_order_and_the_poster_s_make_the_set() {
+        let headers: Vec<(String, String)> =
+            ["From", "Newsgroups", "Subject", "Message-ID", "Path", "X-Newsposter", "Date", "Xref"]
+                .iter()
+                .map(|n| (n.to_string(), "v".to_string()))
+                .collect();
+        let order = header_order(&headers);
+        assert_eq!(order, ["From", "Newsgroups", "Subject", "Message-ID", "Path", "X-Newsposter", "Date", "Xref"]);
+        assert_eq!(header_set(&order).as_deref(), Some("headers:From,Newsgroups,Subject,Message-ID,X-Newsposter,Date"));
+        assert_eq!(header_set(&[]), None);
+        let many: Vec<(String, String)> = (0..100).map(|i| (format!("X-{i}\u{7}"), String::new())).collect();
+        let cut = header_order(&many);
+        assert_eq!(cut.len(), MAX_HEADER_NAMES);
+        assert_eq!(cut[0], "X-0", "control bytes dropped");
+    }
+
+    #[test]
+    fn a_thread_hangs_on_the_first_reference_or_the_article_itself() {
+        let mut h = BTreeMap::new();
+        assert_eq!(thread_root(&h), None);
+        h.insert("Message-ID".to_string(), " <self@x> ".to_string());
+        assert_eq!(thread_root(&h).as_deref(), Some("<self@x>"));
+        h.insert("References".to_string(), "<first@x> <second@x>".to_string());
+        assert_eq!(thread_root(&h).as_deref(), Some("<first@x>"));
+        h.insert("References".to_string(), "garbage <>".to_string());
+        assert_eq!(thread_root(&h).as_deref(), Some("<self@x>"), "an empty id is none");
+        let kept = keep_headers(&[("references".into(), "<a@b>".into()), ("message-id".into(), "<c@d>".into())]);
+        assert_eq!(
+            (kept.get("References").map(String::as_str), kept.get("Message-ID").map(String::as_str)),
+            (Some("<a@b>"), Some("<c@d>"))
+        );
     }
 }

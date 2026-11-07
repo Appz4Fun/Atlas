@@ -21,7 +21,7 @@ When resetting/wiping the database to test fresh shard schemas **without** havin
    ```bash
    launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.atlas.indexer.plist ~/Library/LaunchAgents/com.atlas.web.plist
    ```
-2. Run the built-in shard reset command (which automatically harvests all natural-keyed `release_opensubtitles`, `release_probe`, `release_cover`, `archive_release`, `archive_inner_files`, `par2_files`, `release_fingerprint`, `release_nfo_password`, `release_stills`, and `backfill_deepest` rows from `atlas.s0..s7.db` / `atlas.db` into `atlas.raw.db` before removing the shards):
+2. Run the built-in shard reset command (which automatically harvests all natural-keyed `release_opensubtitles`, `release_probe`, `release_cover`, `archive_release`, `archive_inner_files`, `par2_files`, `rev_volumes`, `release_fingerprint`, `release_nfo_password`, `release_stills`, `release_audio_print`, and `backfill_deepest` rows from `atlas.s0..s7.db` / `atlas.db` into `atlas.raw.db` before removing the shards):
    ```bash
    atlas --reset-shards --apply
    ```
@@ -32,7 +32,7 @@ When resetting/wiping the database to test fresh shard schemas **without** havin
 
 ### 2. Files That MUST NEVER Be Deleted During a Reset
 Always preserve these schema-independent sidecar databases and content-addressed asset directories in `~/.atlas/`:
-- **`atlas.raw.db`** (`-wal`, `-shm`): Permanent raw HTTP cache (`raw_http_cache`), raw PreDB feed log (`raw_predb_log`), and natural-keyed Usenet/hash enrichments (`raw_opensubtitles`, `raw_probes`, `raw_covers`, `raw_archives`, `raw_archive_inner_files`, `raw_par2`, `raw_par2_files`, `raw_nfo_passwords`, `raw_stills`, `raw_backfill_deepest`, `raw_group_bounds`).
+- **`atlas.raw.db`** (`-wal`, `-shm`): Permanent raw HTTP cache (`raw_http_cache`), raw PreDB feed log (`raw_predb_log`), and natural-keyed Usenet/hash enrichments (`raw_opensubtitles`, `raw_probes`, `raw_covers`, `raw_archives`, `raw_archive_inner_files`, `raw_par2`, `raw_par2_files`, `raw_rev_volumes`, `raw_nfo_passwords`, `raw_stills`, `raw_audio_prints`, `raw_backfill_deepest`, `raw_group_bounds`).
 - **`atlas.predb.db`** (`-wal`, `-shm`): Catalogue of PreDB release titles and feed cursors. On a manual reset, run:
   ```sql
   UPDATE meta SET value = 0 WHERE key = 'late_after_id';
