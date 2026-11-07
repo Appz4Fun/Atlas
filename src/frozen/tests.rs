@@ -794,3 +794,23 @@ fn a_backlog_step_stops_after_a_chunk_once_its_time_is_up() {
     assert_eq!(step(Duration::from_secs(60)), rules::Backlog { looked_at: 250, queued: 250 }, "on from where it got to");
     assert_eq!(meta(&conn, "freeze_backlog_below"), 0);
 }
+
+/// A release holding a repost (a part again under another message-id) counts the part once in `parts`, but the
+/// shard's article total has both articles: freezing takes both out, thawing puts both back.
+#[test]
+fn a_repost_freezes_and_thaws_with_every_article_it_holds() {
+    let f = Fixture::new();
+    let mut small = post("Small.Thing", &["a.rar", "b.rar"], 3, 1000);
+    small.articles.push(Article { message_id: "<a.rar.1.again@news.example>".into(), ..small.articles[0].clone() });
+    f.save(&[small, post("Other", &["c.mkv"], 1, 10)]);
+    let conn = f.writer();
+    let id = f.id(&conn, "Small.Thing");
+    assert_eq!(count(&conn, &format!("select parts from releases where id = {id}")), 6, "the repost isnt counted");
+    let (releases, total) = (meta(&conn, "releases"), meta(&conn, "articles"));
+    assert!(rules::evaluate(&conn, id, NOW).unwrap());
+    assert_eq!(freeze_all(&conn), Moved { frozen: 1, ..Moved::default() });
+    assert_eq!((meta(&conn, "releases"), meta(&conn, "articles")), (releases - 1, total - 7));
+    assert_eq!(count(&conn, "select articles from frozen.frozen_releases"), 7);
+    assert_eq!(thaw(&conn, id, true, NOW).unwrap(), Thawed::Restored);
+    assert_eq!((meta(&conn, "releases"), meta(&conn, "articles")), (releases, total));
+}
