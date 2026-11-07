@@ -25,6 +25,15 @@ fn clip(codec: &str) -> Vec<u8> {
     std::fs::read(format!("{}/tests/fixtures/{codec}/clip.mkv", env!("CARGO_MANIFEST_DIR"))).unwrap()
 }
 
+/// `clip` muxed again: the same pictures under another SegmentUID (its last byte `tag`), soo each posting is a file of
+/// its own and makes its own stills, where the same file posted twice shows the stills it already has.
+fn remuxed(clip: &[u8], tag: u8) -> Vec<u8> {
+    let mut out = clip.to_vec();
+    let at = out.windows(3).position(|w| w == [0x73, 0xa4, 0x90]).expect("a SegmentUID") + 3 + 15;
+    out[at] = tag;
+    out
+}
+
 /// The two volumes of a stored RAR4 set holding `inner` as `name`, the first with `split` bytes of it.
 fn volumes(name: &str, inner: &[u8], split: usize) -> (Vec<u8>, Vec<u8>) {
     let fields = r4_file_fields(name.as_bytes(), inner.len() as u32);
@@ -119,13 +128,14 @@ fn video_releases_get_three_stills_from_their_middles() {
     // a small release, a few hundred KB, gets stills too
     posts.extend(posts_of(next, 1, 1, &format!("{avc}.mkv"), &clip("h264"), SEGMENT as u64 + 200));
     let set = "Stored.Film.2002.1080p.BluRay.x265-GRP";
-    let (first, last) = volumes(&format!("{set}.mkv"), &inner, inner.len() / 2);
+    let (first, last) = volumes(&format!("{set}.mkv"), &remuxed(&inner, 1), inner.len() / 2);
     let next = posts.len() as u64 + 1;
     posts.extend(posts_of(next, 1, 2, &format!("{set}.rar"), &first, CLAIMED));
     let next = posts.len() as u64 + 1;
     posts.extend(posts_of(next, 2, 2, &format!("{set}.r00"), &last, CLAIMED));
     // a still whose keyframe runs on into the next volume
     let split_set = "Split.Film.2003.1080p.BluRay.x265-GRP";
+    let inner = remuxed(&inner, 2);
     let at = split_in_a_keyframe(&format!("{split_set}.mkv"), &inner);
     let (first, last) = volumes(&format!("{split_set}.mkv"), &inner, at);
     let next = posts.len() as u64 + 1;
