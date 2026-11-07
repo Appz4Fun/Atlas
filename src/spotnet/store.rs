@@ -415,16 +415,25 @@ pub fn placement(
     let mut file_of = conn.prepare_cached(
         "select f.filename from release_ids r join files f on f.id = r.file_id where r.release_id = ? and r.id_hash = ?",
     )?;
-    for (filename, ids) in files {
+    let mut placement = Placement::SamePost(id);
+    'files: for (filename, ids) in files {
         for message_id in ids {
             let found: Option<String> =
                 file_of.query_row(params![id, key.hash(&format!("<{message_id}>"))], |r| r.get(0)).optional()?;
             if found.as_deref() != Some(filename.as_str()) {
-                return Ok(Placement::Taken);
+                placement = Placement::Taken;
+                break 'files;
             }
         }
     }
-    Ok(Placement::SamePost(id))
+    drop(file_of);
+    // saves keep a release's index up only once it has a second file: one made here for a single file would go
+    // stale, and a later second file would trust it (`index_release`)
+    let many = conn.prepare_cached("select 1 from files where release_id = ? limit 1 offset 1")?.exists([id])?;
+    if !many {
+        crate::store::unindex_release(conn, id)?;
+    }
+    Ok(placement)
 }
 
 /// The release's spot row, unless it already has a newer spot (by when the spot was made): spots are fetched

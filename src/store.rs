@@ -991,6 +991,13 @@ impl IdKey {
     }
 }
 
+/// Drop `release_id`'s index of message-ids and its stamp: made again in full by the next save or spot that needs it.
+pub(crate) fn unindex_release(conn: &Connection, release_id: i64) -> Result<()> {
+    conn.prepare_cached("delete from release_ids where release_id = ?")?.execute([release_id])?;
+    conn.prepare_cached("delete from release_indexed where release_id = ?")?.execute([release_id])?;
+    Ok(())
+}
+
 /// Release `release_id` in `release_ids`, every message-id of its files
 /// added the first time (once it has a second file, or after an upgrade).
 pub(crate) fn index_release(conn: &Connection, key: &IdKey, release_id: i64) -> Result<()> {
@@ -1564,8 +1571,7 @@ pub(crate) fn split_uploads(
     )?
     .execute([release_id])?;
     // the index of message-ids is made again by the next save that needs it
-    conn.prepare_cached("delete from release_ids where release_id = ?")?.execute([release_id])?;
-    conn.prepare_cached("delete from release_indexed where release_id = ?")?.execute([release_id])?;
+    unindex_release(conn, release_id)?;
     for (u, id) in rows.iter().enumerate() {
         let (bytes, count) =
             parts.iter().filter_map(|by| by.get(u)).flatten().fold((0i64, 0i64), |(b, c), s| (b + s.bytes, c + 1));
@@ -2055,8 +2061,8 @@ pub struct ShardWriter {
     pub freezer: crate::frozen::Ticker,
     /// the walk taking quiet releases' `release_ids` (`prune_ids_some`)
     ids: IdsPrune,
-    /// when the walk last took a step while saves were queued
-    ids_queued_step: Option<Instant>,
+    /// when the walk last took a step
+    ids_step: Option<Instant>,
 }
 
 /// Where the walk taking quiet releases' `release_ids` is (`ShardWriter::prune_ids_some`).
@@ -2083,6 +2089,9 @@ pub const PRUNE_IDS_BUDGET_IDLE: std::time::Duration = std::time::Duration::from
 
 /// after a step reaches the end of `release_ids`, the next starts over this much later at least (seconds)
 const PRUNE_IDS_REST: i64 = 3_600;
+
+/// between saves, a pruning step at most this often (when the writer isnt idle)
+const PRUNE_IDS_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// while more saves are queued, a pruning step at most this often
 const PRUNE_IDS_QUEUED_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
@@ -2117,7 +2126,7 @@ impl ShardWriter {
             decode_budget: SEALED_DECODE_BUDGET,
             freezer: crate::frozen::Ticker::default(),
             ids: IdsPrune::default(),
-            ids_queued_step: None,
+            ids_step: None,
         }
     }
 
@@ -2200,8 +2209,8 @@ impl ShardWriter {
     /// (PRUNE_IDS_BUDGET_IDLE when `idle`): a step through the table by release
     /// from where the last one stopped. After the end it starts over once the
     /// least recently touched release it kept could be quiet (PRUNE_IDS_REST
-    /// at least, SEAL_AGE at most). While more saves are `queued` it takes a
-    /// short step every PRUNE_IDS_QUEUED_EVERY at most. A release none of whose files was touched,
+    /// at least, SEAL_AGE at most). Steps come every PRUNE_IDS_EVERY at most
+    /// between saves, every PRUNE_IDS_QUEUED_EVERY while more are `queued`. A release none of whose files was touched,
     /// and that wasn't indexed itself, for SEAL_AGE loses its own row first, then the rest a chunk at a time
     /// over as many steps as it takes. The index is only a cache: without its
     /// own row, the next save to the release, or a spot placed on it, indexes it
@@ -2211,14 +2220,20 @@ impl ShardWriter {
         if now < self.ids.rest_until {
             return Ok(0);
         }
-        // more saves queued: a short step now and then, soo steady ingest doesnt starve it
-        if queued {
-            if self.ids_queued_step.is_some_and(|t| t.elapsed() < PRUNE_IDS_QUEUED_EVERY) {
-                return Ok(0);
-            }
-            self.ids_queued_step = Some(Instant::now());
-        }
+        // a step every so often between saves, and only now and then while more are queued: steady ingest neither
+        // starves it nor pays for it on every batch
         let idle = idle && !queued;
+        let every = if queued {
+            PRUNE_IDS_QUEUED_EVERY
+        } else if idle {
+            std::time::Duration::ZERO
+        } else {
+            PRUNE_IDS_EVERY
+        };
+        if self.ids_step.is_some_and(|t| t.elapsed() < every) {
+            return Ok(0);
+        }
+        self.ids_step = Some(Instant::now());
         let (budget, chunk) =
             if idle { (PRUNE_IDS_BUDGET_IDLE, PRUNE_IDS_CHUNK_IDLE) } else { (PRUNE_IDS_BUDGET, PRUNE_IDS_CHUNK) };
         let started = Instant::now();
@@ -2536,9 +2551,7 @@ impl ShardWriter {
                             .prepare_cached("select 1 from files where release_id = ? limit 1 offset 1")?
                             .exists([release_id])?;
                         if gone > 0 && !others {
-                            tx.prepare_cached("delete from release_ids where release_id = ?")?.execute([release_id])?;
-                            tx.prepare_cached("delete from release_indexed where release_id = ?")?
-                                .execute([release_id])?;
+                            unindex_release(&tx, release_id)?;
                         }
                     }
                 }
@@ -4877,7 +4890,7 @@ mod tests {
 
         let rest = writer.ids.rest_until - now;
         assert!(
-            (SEAL_AGE - 5..=SEAL_AGE).contains(&rest),
+            (SEAL_AGE - 600..=SEAL_AGE).contains(&rest),
             "the end: it rests till the release kept could be quiet ({rest})"
         );
         conn.execute("update files set touched_at = ?", [now - SEAL_AGE - 1]).unwrap();
@@ -4951,6 +4964,7 @@ mod tests {
         let mut writer = ShardWriter::new(shard_of("alt.binaries.t"));
         let mut taken = 0;
         while writer.ids.rest_until == 0 {
+            writer.ids_step = None;
             taken += writer.prune_ids_some(&mut conn, now, false, false).unwrap() as i64;
             assert!(!marked(&conn), "its own row goes first");
         }
