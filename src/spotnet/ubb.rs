@@ -12,7 +12,7 @@ use crate::api::escape;
 use crate::web::attr;
 
 /// What a link carries: no referrer, no SEO credit, no window handle.
-const REL: &str = "noopener noreferrer nofollow";
+pub(crate) const REL: &str = "noopener noreferrer nofollow";
 
 /// A UBB tag: `/` when it closes, its name, and its value (`[url=..]`).
 static TAG: LazyLock<Regex> =
@@ -57,11 +57,19 @@ pub fn to_html(text: &str) -> String {
             }
             ("b" | "i" | "u" | "quote", true) => close(&mut out, &mut open, element(&name)),
             ("br", false) => out.push('\n'),
-            ("img", false) => match value.filter(|v| smiley(v)) {
-                Some(name) => {
+            ("img", false) => match value {
+                Some(name) if smiley(name) => {
                     let _ = write!(out, ":{}:", name.to_ascii_lowercase());
                 }
-                None => plain(&mut out, whole.as_str()),
+                // `[img]address[/img]`: images aren't shown; the address, as text
+                None => match find_close(text, at, &IMG_CLOSE, &IMG_OPEN) {
+                    Some((end, after)) => {
+                        plain(&mut out, text[at..end].trim());
+                        at = after;
+                    }
+                    None => plain(&mut out, whole.as_str()),
+                },
+                Some(_) => plain(&mut out, whole.as_str()),
             },
             ("url", false) => {
                 // the text up to its `[/url]`; without one before the next `[url`, `[url=..]` alone is a link named
@@ -70,7 +78,7 @@ pub fn to_html(text: &str) -> String {
                     Some((end, after)) => (&text[at..end], after),
                     None => ("", at),
                 };
-                let label = label_text(inner);
+                let (label, closes) = label_of(inner);
                 let label = label.trim();
                 let address = value.filter(|v| !v.is_empty()).unwrap_or(label);
                 if address.is_empty() && label.is_empty() {
@@ -84,29 +92,18 @@ pub fn to_html(text: &str) -> String {
                         let shown = if label.is_empty() { href } else { label };
                         let _ = write!(out, "<a href=\"{}\" rel=\"{REL}\">{}</a>", attr(href), escape(shown));
                     }
-                    // not a web link: its text, and the address it gave, as text
-                    None if label.is_empty() || label == address => out.push_str(&escape(address)),
-                    None if address.is_empty() => out.push_str(&escape(label)),
+                    // not a web link: its text, and the address it gave, as text (a web link in either still linked)
+                    None if label.is_empty() || label == address => plain(&mut out, address),
                     None => {
-                        let _ = write!(out, "{} ({})", escape(label), escape(address));
+                        plain(&mut out, label);
+                        out.push_str(" (");
+                        plain(&mut out, address);
+                        out.push(')');
                     }
                 }
-                // formatting opened before the link and closed inside it closes after it; what the label opens and
-                // closes itself stays inside it
-                let mut inside: Vec<&'static str> = Vec::new();
-                for c in TAG.captures_iter(inner) {
-                    let tag = c[2].to_ascii_lowercase();
-                    if c.get(3).is_some() || !matches!(tag.as_str(), "b" | "i" | "u" | "quote") {
-                        continue;
-                    }
-                    let tag = element(&tag);
-                    if c[1].is_empty() {
-                        inside.push(tag);
-                    } else if let Some(i) = inside.iter().rposition(|t| *t == tag) {
-                        inside.truncate(i);
-                    } else {
-                        close(&mut out, &mut open, tag);
-                    }
+                // formatting opened before the link and closed inside it closes after it
+                for tag in closes {
+                    close(&mut out, &mut open, tag);
                 }
                 at = next;
             }
@@ -132,6 +129,8 @@ pub fn to_html(text: &str) -> String {
 
 static URL_OPEN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\[url[\]=]").unwrap());
 static URL_CLOSE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\[/url\]").unwrap());
+static IMG_OPEN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\[img\]").unwrap());
+static IMG_CLOSE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\[/img\]").unwrap());
 static YOUTUBE_OPEN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\[youtube\]").unwrap());
 static YOUTUBE_CLOSE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\[/youtube\]").unwrap());
 
@@ -161,36 +160,56 @@ fn find_close(text: &str, from: usize, close: &Regex, open: &Regex) -> Option<(u
     Some((from + m.start(), from + m.end()))
 }
 
-/// A link's text: only text goes in a link, so its UBB tags are dropped, by the same rules `to_html` reads them
-/// (a smiley still shows, a tag with a value it can't take is text). Other bracketed words stay.
-fn label_text(s: &str) -> String {
+/// A link's text, and the formatting it closes that it didn't open. Only text goes in a link, so its UBB tags are
+/// read by the same rules as `to_html` reads them and dropped: a smiley still shows, `[br]` is a line break, and a
+/// tag with a value it can't take stays text. Other bracketed words stay.
+fn label_of(s: &str) -> (String, Vec<&'static str>) {
     let mut out = String::with_capacity(s.len());
+    // what the label opens itself: its closers stay inside it
+    let (mut inside, mut closes): (Vec<&'static str>, Vec<&'static str>) = (Vec::new(), Vec::new());
     let mut at = 0;
     for c in TAG.captures_iter(s) {
         let whole = c.get(0).unwrap();
         out.push_str(&s[at..whole.start()]);
         at = whole.end();
+        let closing = !c[1].is_empty();
         let name = c[2].to_ascii_lowercase();
-        match c.get(3).map(|v| v.as_str().trim()) {
-            Some(v) if name == "img" && c[1].is_empty() && smiley(v) => {
-                let _ = write!(out, ":{}:", v.to_ascii_lowercase());
+        let value = c.get(3).map(|v| v.as_str().trim());
+        if value.is_some() && (closing || !matches!(name.as_str(), "url" | "img" | "quote")) {
+            out.push_str(whole.as_str());
+            continue;
+        }
+        match (name.as_str(), closing) {
+            ("img", false) => match value {
+                Some(v) if smiley(v) => {
+                    let _ = write!(out, ":{}:", v.to_ascii_lowercase());
+                }
+                Some(_) => out.push_str(whole.as_str()),
+                None => {}
+            },
+            ("br", false) => out.push('\n'),
+            ("b" | "i" | "u" | "quote", false) => inside.push(element(&name)),
+            ("b" | "i" | "u" | "quote", true) => {
+                let tag = element(&name);
+                match inside.iter().rposition(|t| *t == tag) {
+                    Some(i) => inside.truncate(i),
+                    None => closes.push(tag),
+                }
             }
-            Some(_) if c[1].is_empty() && matches!(name.as_str(), "url" | "quote") => {}
-            Some(_) => out.push_str(whole.as_str()),
-            None => {}
+            _ => {}
         }
     }
     out.push_str(&s[at..]);
-    out
+    (out, closes)
 }
 
-/// The address, when it's an http or https one that can go in a link as it is.
-fn web_url(s: &str) -> Option<&str> {
+/// The address, when it's an http or https one, with a host, that can go in a link as it is.
+pub(crate) fn web_url(s: &str) -> Option<&str> {
     let s = s.trim();
     let lower = s.to_ascii_lowercase();
-    let scheme = lower.starts_with("https://") || lower.starts_with("http://");
+    let scheme = ["https://", "http://"].into_iter().find(|p| lower.starts_with(p))?;
     let clean = !s.chars().any(|c| c.is_whitespace() || c.is_control() || matches!(c, '"' | '<' | '>' | '`'));
-    (scheme && clean && s.len() > "http://".len()).then_some(s)
+    (clean && s.len() > scheme.len()).then_some(s)
 }
 
 fn smiley(name: &str) -> bool {
@@ -272,15 +291,32 @@ mod tests {
         // a smiley in a label shows; `[url]` with nothing to link stays text
         assert_eq!(to_html("[url=https://a.org]Thanks [img=klappen][/url]"), link("https://a.org", "Thanks :klappen:"));
         assert_eq!(to_html("click [url] here"), "click [url] here");
+        // a label's own `[quote=..]` stays in it; `[br]` in a label is a line break
+        assert_eq!(
+            to_html("[quote][url=https://a.org][quote=Bob]x[/quote][/url] more[/quote]"),
+            format!("<blockquote>{} more</blockquote>", link("https://a.org", "x"))
+        );
+        assert_eq!(to_html("[url=https://a.org]Part 1[br]Part 2[/url]"), link("https://a.org", "Part 1\nPart 2"));
     }
 
     #[test]
     fn only_web_links_are_links() {
         // not a web link: the label and the address, as text
         assert_eq!(to_html("[url=javascript:alert(1)]click[/url]"), "click (javascript:alert(1))");
-        assert_eq!(to_html("[url=https://a.org/\" onclick=x]click[/url]"), "click (https://a.org/\" onclick=x)");
+        // its clean start still linked, the rest text
+        assert_eq!(
+            to_html("[url=https://a.org/\" onclick=x]click[/url]"),
+            format!("click ({}\" onclick=x)", link("https://a.org/", "https://a.org/"))
+        );
         assert_eq!(to_html("[url]ftp://a.org/f[/url]"), "ftp://a.org/f");
         assert_eq!(to_html("[url=www.example.com]Our site[/url]"), "Our site (www.example.com)");
+        // a web link in the label or the address of one that isn't is still linked
+        assert_eq!(
+            to_html("[url=www.a.org]https://a.org[/url]"),
+            format!("{} (www.a.org)", link("https://a.org", "https://a.org"))
+        );
+        // a scheme alone is no link
+        assert_eq!(to_html("[url=https://]Download[/url]"), "Download (https://)");
         // an address with an apostrophe is linked, the apostrophe encoded so it can't end the attribute
         assert_eq!(to_html("[url=https://a.org/'x]y[/url]"), link("https://a.org/&#39;x", "y"));
     }
@@ -300,7 +336,8 @@ mod tests {
         // a stray closer keeps the lines around it
         assert_eq!(to_html("one\n[/quote]\ntwo"), "one\n\ntwo");
         assert_eq!(to_html("Thanks![img=klappen]"), "Thanks!:klappen:");
-        // an image isn't shown: its tag stays text, its address a link like any other
+        // an image isn't shown: its address is a link like any other
+        assert_eq!(to_html("[img]https://x.org/p.png[/img]"), link("https://x.org/p.png", "https://x.org/p.png"));
         assert_eq!(
             to_html("[img=https://evil/x.png]"),
             format!("[img={}]", link("https://evil/x.png", "https://evil/x.png"))

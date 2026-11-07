@@ -1729,11 +1729,12 @@ fn spot_html(d: &crate::spotnet::store::Detail, said: &SpotSaid) -> String {
     fact("Sender", sender);
     fact("Tag", escape(&spot.tag));
     let website = spot.website.trim();
-    let lower = website.to_ascii_lowercase();
-    if lower.starts_with("https://") || lower.starts_with("http://") {
-        fact("Website", format!("<a href=\"{}\" rel=\"noreferrer nofollow\">{}</a>", attr(website), escape(website)));
-    } else {
-        fact("Website", escape(website));
+    match crate::spotnet::ubb::web_url(website) {
+        Some(href) => fact(
+            "Website",
+            format!("<a href=\"{}\" rel=\"{}\">{}</a>", attr(href), crate::spotnet::ubb::REL, escape(href)),
+        ),
+        None => fact("Website", escape(website)),
     }
     if let Some(imdb) = d
         .imdb_id
@@ -1802,7 +1803,6 @@ fn spot_comments_html(comments: &[crate::spotnet::comments::Comment]) -> String 
     }
     out
 }
-
 
 /// Says a release is an upload's rows put back together.
 fn linked_tag(rows: usize) -> String {
