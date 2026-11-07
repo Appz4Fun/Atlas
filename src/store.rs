@@ -287,12 +287,19 @@ impl Ids {
     pub fn next(&self) -> Result<i64> {
         let mut range = self.range.lock().unwrap();
         if range.0 >= range.1 {
-            let conn = db::open_at(&self.main)?;
-            let end: i64 = conn.query_row(
+            let mut conn = db::open_at(&self.main)?;
+            // on the disk before any of the block is saved to a shard (whose saves are, `db::with_full_flush`):
+            // a power cut that kept a save and lost its block would hand its ids out again
+            conn.execute_batch("pragma synchronous = full; pragma fullfsync = on")?;
+            // an explicit commit: an autocommit's would happen as the RETURNING row is dropped, and a failure
+            // there (disk full, a failed sync) wouldnt reach us, the block handed out yet never reserved
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let end: i64 = tx.query_row(
                 "update meta set value = value + ? where key = 'next_seq' returning value",
                 [ID_BLOCK],
                 |r| r.get(0),
             )?;
+            tx.commit()?;
             *range = (end - ID_BLOCK, end);
         }
         let seq = range.0;
