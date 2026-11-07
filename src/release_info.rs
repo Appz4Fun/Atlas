@@ -276,8 +276,15 @@ fn contents_of(conn: &Connection, ids: &[i64], recovery: &[i64], with_bytes: Byt
     };
     let mut bytes: HashMap<String, i64> = HashMap::new();
     if read_bytes {
+        // an article posted to several of a post's groups is in each of their rows: its bytes count once
+        let mut counted: HashSet<(Option<String>, Option<i64>, String)> = HashSet::new();
         for id in ids {
             store::each_article(conn, *id, &mut |article| {
+                if ids.len() > 1
+                    && !counted.insert((article.filename.clone(), article.part, article.message_id.clone()))
+                {
+                    return Ok(());
+                }
                 *bytes.entry(article.filename.unwrap_or_default()).or_default() += article.bytes.unwrap_or(0);
                 Ok(())
             })?;
