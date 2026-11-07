@@ -7,6 +7,8 @@
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 
+use std::collections::HashSet;
+
 use rusqlite::{Connection, OptionalExtension, params};
 
 use super::walk::{self, BATCH, WalkLimits};
@@ -23,7 +25,7 @@ enum Fix {
     Fold { into: i64 },
     /// no row has the right name: it takes it, and the collections its files make read right point at it, soo the
     /// post's later articles (read right) join it
-    Rename { to: String, collections: Vec<String> },
+    Rename { to: String, collections: Vec<String>, files: Vec<(i64, String, Option<String>)> },
     /// another row has the right name, and this one holds articles it doesnt
     Leave,
 }
@@ -48,11 +50,41 @@ fn fix(conn: &Connection, id: i64, name: &str, group: &str) -> rusqlite::Result<
         .query_row(params![right, group, id], |r| r.get(0))
         .optional()?;
     let Some(other) = other else {
-        return Ok(Some(Fix::Rename { to: right, collections: right_collections(conn, id, group)? }));
+        // its files take their names read right too, or the post's later articles start other files: not when that
+        // would meet a file it has under the right name already
+        let files = right_files(conn, id)?;
+        let mut names: HashSet<&str> = HashSet::new();
+        let taken: HashSet<String> = conn
+            .prepare_cached("select filename from files where release_id = ?")?
+            .query_map([id], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        if files.iter().any(|(_, old, new, _)| (old != new && taken.contains(new)) || !names.insert(new.as_str())) {
+            return Ok(Some(Fix::Leave));
+        }
+        let files =
+            files.into_iter().filter(|(_, old, new, _)| old != new).map(|(f, _, new, subject)| (f, new, subject));
+        return Ok(Some(Fix::Rename {
+            to: right,
+            collections: right_collections(conn, id, group)?,
+            files: files.collect(),
+        }));
     };
     let mine = store::release_article_keys(conn, id)?;
     let theirs = store::release_article_keys(conn, other)?;
     Ok(Some(if mine.is_subset(&theirs) { Fix::Fold { into: other } } else { Fix::Leave }))
+}
+
+/// A file of a row: its id, its name, its name read right and its subject read right.
+type RightFile = (i64, String, String, Option<String>);
+
+/// Row `id`'s files, read right.
+fn right_files(conn: &Connection, id: i64) -> rusqlite::Result<Vec<RightFile>> {
+    conn.prepare_cached("select id, filename, subject from files where release_id = ?")?
+        .query_map([id], |r| {
+            let (file, name, subject): (i64, String, Option<String>) = (r.get(0)?, r.get(1)?, r.get(2)?);
+            Ok((file, name.clone(), undo_mojibake(name), subject.map(undo_mojibake)))
+        })?
+        .collect()
 }
 
 /// The collections row `id`'s files make of their subjects with the server's encoding undone (`Collections::of`, the
@@ -93,8 +125,13 @@ fn apply(tx: &Connection, id: i64, fix: &Fix) -> rusqlite::Result<()> {
             less.execute(params![deleted.articles, "articles"])?;
             less.execute(params![1, "releases"])?;
         }
-        Fix::Rename { to, collections } => {
+        Fix::Rename { to, collections, files } => {
             tx.prepare_cached("update releases set name = ? where id = ?")?.execute(params![to, id])?;
+            let mut file =
+                tx.prepare_cached("update files set filename = ?, subject = coalesce(?, subject) where id = ?")?;
+            for (f, name, subject) in files {
+                file.execute(params![name, subject, f])?;
+            }
             let key = store::IdKey::of(tx)?;
             let mut put = tx.prepare_cached("insert or ignore into collections (key, release_id) values (?, ?)")?;
             for c in collections {
@@ -300,7 +337,7 @@ mod tests {
         let before = articles(&conn);
         let tx = conn.transaction().unwrap();
         apply(&tx, film_twice, &Fix::Fold { into: film }).unwrap();
-        apply(&tx, cafe, &Fix::Rename { to: "Caf\u{e9}".into(), collections: Vec::new() }).unwrap();
+        apply(&tx, cafe, &Fix::Rename { to: "Caf\u{e9}".into(), collections: Vec::new(), files: Vec::new() }).unwrap();
         tx.commit().unwrap();
         let gone: i64 =
             conn.query_row("select count(*) from releases where id = ?", [film_twice], |r| r.get(0)).unwrap();
@@ -316,9 +353,9 @@ mod tests {
         let main = dir.path().join("atlas.db");
         db::create_db_at(&main).unwrap();
         let group = "alt.binaries.t";
-        let article = |id: &str, n: i64, name: &str| Article {
+        let article = |id: &str, n: i64, part: i64, name: &str| Article {
             message_id: id.into(),
-            subject: format!("[{n}/2] \"{name} Long Film Title 2020 1080p.part{n}.rar\" yEnc (1/1)"),
+            subject: format!("[{n}/2] \"{name} Long Film Title 2020 1080p.part{n}.rar\" yEnc ({part}/2)"),
             author: "poster@example.com".into(),
             date: "2026-10-26 04:18:58".into(),
             bytes: 100,
@@ -326,7 +363,7 @@ mod tests {
         };
         let releases = |articles| crate::collections::group_articles(group, articles).into_values().collect::<Vec<_>>();
         // the first file as the server encoded it twice, before overviews were read right
-        let twice = releases(vec![article("<1@x>", 1, "Caf\u{c3}\u{a9}")]);
+        let twice = releases(vec![article("<1@x>", 1, 1, "Caf\u{c3}\u{a9}")]);
         assert!(twice[0].collection.is_some());
         store::save(&main, &twice).unwrap();
         let conn = db::open_at(&store::shard_path(&main, store::shard_of(group))).unwrap();
@@ -335,8 +372,16 @@ mod tests {
         let f = fix(&conn, id, &name, group).unwrap().unwrap();
         assert!(matches!(&f, Fix::Rename { collections, .. } if collections.len() == 1), "{f:?}");
         apply(&conn, id, &f).unwrap();
-        // the second file, read right
-        store::save(&main, &releases(vec![article("<2@x>", 2, "Caf\u{e9}")])).unwrap();
+        // the rest of the first file and the second, read right
+        store::save(
+            &main,
+            &releases(vec![
+                article("<2@x>", 1, 2, "Caf\u{e9}"),
+                article("<3@x>", 2, 1, "Caf\u{e9}"),
+                article("<4@x>", 2, 2, "Caf\u{e9}"),
+            ]),
+        )
+        .unwrap();
         let rows: Vec<(i64, i64)> = conn
             .prepare("select id, (select count(*) from files where release_id = releases.id) from releases")
             .unwrap()
@@ -345,5 +390,7 @@ mod tests {
             .map(|r| r.unwrap())
             .collect();
         assert_eq!(rows, vec![(id, 2)], "one release, both files");
+        let complete: bool = conn.query_row("select complete from releases", [], |r| r.get(0)).unwrap();
+        assert!(complete, "its first file has both parts, under its name read right");
     }
 }

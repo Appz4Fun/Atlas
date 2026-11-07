@@ -30,6 +30,16 @@ fn excess(conn: &Connection, id: i64, size: i64, parts: i64) -> rusqlite::Result
     if parts <= store::seen_parts(conn, id)? {
         return Ok(None);
     }
+    // what a save past its decode budget held back is sealing's to settle (a repost among it is taken out then):
+    // left for now, a later run gets it
+    let held: bool = conn
+        .prepare_cached(
+            "select exists (select 1 from held_back h join files f on f.id = h.file_id where f.release_id = ?)",
+        )?
+        .query_row([id], |r| r.get(0))?;
+    if held {
+        return Ok(None);
+    }
     let found = store::repost_excess(conn, id)?;
     if found.count <= 0 || found.kept >= parts {
         return Ok(None);
@@ -190,5 +200,8 @@ mod tests {
         assert_eq!(excess(&conn, id, size, parts).unwrap(), None, "a row saved by this build has nothing to take out");
         // as an older save left it: the repost of the 100-byte part counted, the 10-byte one's not
         assert_eq!(excess(&conn, id, 210, 3).unwrap(), Some((110, 2)));
+        // what a save past its decode budget held back is sealing's to settle first
+        conn.execute("insert into held_back (file_id, message_id, part) select id, '<h@x>', 1 from files", []).unwrap();
+        assert_eq!(excess(&conn, id, 210, 3).unwrap(), None);
     }
 }
