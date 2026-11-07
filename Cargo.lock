@@ -231,6 +231,7 @@ dependencies = [
  "lzma-rs",
  "md-5 0.10.6",
  "nntmux-yenc",
+ "par-rs",
  "postgres",
  "quick-xml",
  "ratatui",
@@ -2324,6 +2325,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6e6eb142958d64335fb0e345c5b9ead2ecd6fc438c307e9d7d3c4fd428dbaf12"
 dependencies = [
  "libm",
+]
+
+[[package]]
+name = "par-rs"
+version = "0.2.0"
+source = "git+https://github.com/xbmc4lyfe/par-rs?branch=main#dd7b88caae4878e4b9b82d4d9886fa1e228ce8cf"
+dependencies = [
+ "crc32fast",
+ "md-5 0.10.6",
+ "memchr",
+ "regex",
+ "sha1",
+ "thiserror 2.0.21",
 ]
 
 [[package]]

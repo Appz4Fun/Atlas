@@ -1,184 +1,19 @@
-//! GF(2) polynomial linear algebra and CRC-32 folding.
+//! GF(2) polynomial algebra and CRC-32 folding, from the par-rs crate.
 //!
-//! Provides O(log n) CRC32 combination and PAR2 IFSC slice unzeroing over
-//! the Galois Field GF(2) modulo the IEEE 802.3 generator polynomial
-//! P(x) = 0xEDB88320 (bit-reflected representation).
+//! Atlas does no CRC math of its own: these are `par_rs::gf2`'s functions under the names
+//! Atlas's callers already use (`crc32` for every BODY postprocess reads, `crc32_combine` for
+//! file keys and IFSC folding, `crc32_unzero` for padded PAR2 slices). par-rs's `crc32` runs on
+//! the CPU's CRC instructions where there are some (`pclmulqdq` on x86_64, `crc32x` on AArch64)
+//! and slice-by-8 elsewhere; `examples/bench_parity.rs` measured it at ~50x the bit-at-a-time
+//! loop this module used to have.
+//!
+//! `fold_yenc_indexed_parts` takes part numbers from 0 (`part=` of a yEnc header minus one) and
+//! refuses one past `total` with `FoldError::LengthMismatch`.
 
-use std::sync::LazyLock;
-
-/// Generator polynomial for standard IEEE 802.3 CRC-32 (bit-reflected).
-pub const GF2_POLY: u32 = 0xEDB8_8320;
-
-/// Multiplicative group order for GF(2^32) with primitive polynomial P(x): 2^32 - 1.
-pub const GF2_ORDER: u64 = (1u64 << 32) - 1;
-
-/// Multiply polynomial `a(x)` by `b(x)` modulo `P(x) = 0xEDB88320` in bit-reflected representation.
-#[inline]
-pub fn multmodp(a: u32, mut b: u32) -> u32 {
-    let mut m = 1u32 << 31;
-    let mut p = 0u32;
-    loop {
-        if (a & m) != 0 {
-            p ^= b;
-            if (a & (m.wrapping_sub(1))) == 0 {
-                break;
-            }
-        }
-        m >>= 1;
-        if m == 0 {
-            break;
-        }
-        b = if (b & 1) != 0 { (b >> 1) ^ GF2_POLY } else { b >> 1 };
-    }
-    p
-}
-
-/// Table of powers x^(2^n) mod P(x) for 0 <= n < 32.
-static X2N_TABLE: LazyLock<[u32; 32]> = LazyLock::new(|| {
-    let mut table = [0u32; 32];
-    let mut p = 1u32 << 30; // x^1
-    table[0] = p;
-    for slot in table.iter_mut().skip(1) {
-        p = multmodp(p, p);
-        *slot = p;
-    }
-    table
-});
-
-/// Return x^(n * 2^k) modulo P(x).
-#[inline]
-pub fn x2nmodp(mut n: u64, mut k: u32) -> u32 {
-    let mut p = 1u32 << 31; // x^0 == 1
-    while n != 0 {
-        if (n & 1) != 0 {
-            p = multmodp(X2N_TABLE[(k & 31) as usize], p);
-        }
-        n >>= 1;
-        k = k.wrapping_add(1);
-    }
-    p
-}
-
-/// Return x^n modulo P(x) where n is in bits.
-#[inline]
-pub fn xpow(n_bits: u64) -> u32 {
-    x2nmodp(n_bits, 0)
-}
-
-/// Combine two contiguous CRC32 checksums: CRC(A || B) where len2 = |B| in bytes.
-#[inline]
-pub fn crc32_combine(crc1: u32, crc2: u32, len2: usize) -> u32 {
-    if len2 == 0 {
-        return crc1;
-    }
-    let op = x2nmodp(len2 as u64, 3);
-    multmodp(op, crc1) ^ crc2
-}
-
-/// Compute CRC32 of `len` consecutive zero bytes in O(log len) time without allocations.
-#[inline]
-pub fn crc32_zeros(len: usize) -> u32 {
-    if len == 0 {
-        0
-    } else {
-        let op = x2nmodp(len as u64, 3);
-        multmodp(op, 0xFFFF_FFFF) ^ 0xFFFF_FFFF
-    }
-}
-
-/// Unzero a zero-padded CRC32 value: given CRC(data || 0^zero_len), recover CRC(data).
-///
-/// Uses polynomial division by x^(8 * zero_len) mod P(x) via modular inverse exponentiation.
-#[inline]
-pub fn crc32_unzero(padded_crc: u32, zero_len: usize) -> u32 {
-    if zero_len == 0 {
-        return padded_crc;
-    }
-    let k = zero_len as u64;
-    let zero_crc = crc32_zeros(zero_len);
-    let inv_bits = (GF2_ORDER - ((k.wrapping_mul(8)) % GF2_ORDER)) % GF2_ORDER;
-    let inv_op = x2nmodp(inv_bits, 0);
-    multmodp(inv_op, padded_crc ^ zero_crc)
-}
-
-/// Alias for `crc32_unzero` matching SABnzbd nomenclature.
-#[inline]
-pub fn crc32_zero_unpad(padded_crc: u32, zero_len: usize) -> u32 {
-    crc32_unzero(padded_crc, zero_len)
-}
-
-/// Compute standard IEEE 802.3 32-bit CRC over bytes.
-pub fn crc32(data: &[u8]) -> u32 {
-    let mut crc = 0xFFFF_FFFFu32;
-    for &b in data {
-        let idx = ((crc ^ (b as u32)) & 0xFF) as usize;
-        let mut p = idx as u32;
-        for _ in 0..8 {
-            p = if (p & 1) != 0 { (p >> 1) ^ GF2_POLY } else { p >> 1 };
-        }
-        crc = (crc >> 8) ^ p;
-    }
-    crc ^ 0xFFFF_FFFF
-}
-
-/// Errors occurring during yEnc part folding.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum FoldError {
-    Empty,
-    MissingPart(usize),
-    CorruptPart(usize),
-    LengthMismatch,
-}
-
-impl std::fmt::Display for FoldError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            FoldError::Empty => write!(f, "No parts provided for folding"),
-            FoldError::MissingPart(i) => write!(f, "Missing part {i} in sequence"),
-            FoldError::CorruptPart(i) => write!(f, "Corrupted part {i} in sequence"),
-            FoldError::LengthMismatch => write!(f, "Part length mismatch"),
-        }
-    }
-}
-
-impl std::error::Error for FoldError {}
-
-/// Sequentially fold contiguous yEnc parts `[(pcrc32, len)]` into a whole-file CRC32.
-pub fn fold_yenc_parts(parts: &[(u32, usize)]) -> Result<u32, FoldError> {
-    if parts.is_empty() {
-        return Err(FoldError::Empty);
-    }
-    let mut acc = parts[0].0;
-    for &(crc, len) in &parts[1..] {
-        acc = crc32_combine(acc, crc, len);
-    }
-    Ok(acc)
-}
-
-/// Fold indexed yEnc parts `[(part_number, pcrc32, len)]` checking for sequence completeness out of `total`.
-pub fn fold_yenc_indexed_parts(total: usize, parts: &[(usize, u32, usize)]) -> Result<u32, FoldError> {
-    if total == 0 || parts.is_empty() {
-        return Err(FoldError::Empty);
-    }
-    let mut map = std::collections::BTreeMap::new();
-    for &(num, crc, len) in parts {
-        if let Some(&prev) = map.get(&num) {
-            if prev != (crc, len) {
-                return Err(FoldError::CorruptPart(num));
-            }
-        } else {
-            map.insert(num, (crc, len));
-        }
-    }
-    let mut ordered = Vec::with_capacity(total);
-    for i in 1..=total {
-        match map.get(&i) {
-            Some(&entry) => ordered.push(entry),
-            None => return Err(FoldError::MissingPart(i)),
-        }
-    }
-    fold_yenc_parts(&ordered)
-}
+pub use par_rs::gf2::{
+    FoldError, GF2_ORDER, GF2_POLY, crc32, crc32_combine, crc32_unzero, crc32_zero_unpad, crc32_zeros,
+    fold_yenc_indexed_parts, fold_yenc_parts, multmodp, x2nmodp, xpow,
+};
 
 #[cfg(test)]
 mod tests {
@@ -254,25 +89,40 @@ mod tests {
 
     #[test]
     fn missing_intermediate_part() {
-        let parts = vec![(1, 0x1111, 100), (2, 0x2222, 100), (4, 0x4444, 100)];
-        assert_eq!(fold_yenc_indexed_parts(4, &parts), Err(FoldError::MissingPart(3)));
+        let parts = vec![(0, 0x1111, 100), (1, 0x2222, 100), (3, 0x4444, 100)];
+        assert_eq!(fold_yenc_indexed_parts(4, &parts), Err(FoldError::MissingPart(2)));
     }
 
     #[test]
     fn conflicting_duplicate_parts_return_corrupt_part_error() {
-        let identical = vec![(1, 0x1111, 100), (1, 0x1111, 100), (2, 0x2222, 100)];
+        let identical = vec![(0, 0x1111, 100), (0, 0x1111, 100), (1, 0x2222, 100)];
         assert!(fold_yenc_indexed_parts(2, &identical).is_ok());
 
-        let conflicting_crc = vec![(1, 0x1111, 100), (1, 0x9999, 100), (2, 0x2222, 100)];
-        assert_eq!(
-            fold_yenc_indexed_parts(2, &conflicting_crc),
-            Err(FoldError::CorruptPart(1))
-        );
+        let conflicting_crc = vec![(0, 0x1111, 100), (0, 0x9999, 100), (1, 0x2222, 100)];
+        assert_eq!(fold_yenc_indexed_parts(2, &conflicting_crc), Err(FoldError::CorruptPart(0)));
 
-        let conflicting_len = vec![(1, 0x1111, 100), (2, 0x2222, 100), (2, 0x2222, 200)];
-        assert_eq!(
-            fold_yenc_indexed_parts(2, &conflicting_len),
-            Err(FoldError::CorruptPart(2))
-        );
+        let conflicting_len = vec![(0, 0x1111, 100), (1, 0x2222, 100), (1, 0x2222, 200)];
+        assert_eq!(fold_yenc_indexed_parts(2, &conflicting_len), Err(FoldError::CorruptPart(1)));
+    }
+
+    #[test]
+    fn a_part_number_past_the_total_is_refused() {
+        // yEnc numbers parts from 1; callers pass part - 1, so a 1-based list is out by one
+        let one_based = vec![(1, 0x1111, 100), (2, 0x2222, 100)];
+        assert_eq!(fold_yenc_indexed_parts(2, &one_based), Err(FoldError::LengthMismatch));
+    }
+
+    #[test]
+    fn crc32_matches_the_bitwise_reference_at_every_length() {
+        // par-rs picks a hardware kernel (pclmulqdq / crc32x) or slice-by-8; every length up to
+        // a few kernel blocks and every start offset must give the reference value
+        let data: Vec<u8> = (0..4096u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
+        for len in (0..600).chain([1023, 1024, 1025, 4095]) {
+            for start in [0usize, 1, 3, 7] {
+                let slice = &data[start..start + len.min(data.len() - start)];
+                assert_eq!(crc32(slice), raw_crc(slice), "len {len} start {start}");
+            }
+        }
+        assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
     }
 }
