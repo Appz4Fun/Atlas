@@ -2645,7 +2645,7 @@ fn release_html(
         fact("Links", links);
     }
 
-    let nzb_files = nzb_files_html(contents);
+    let nzb_files = nzb_files_html(r.id, contents);
     let (heading, listed) = inner_files_listed(inner, recovery.is_some());
     let files = if listed.is_empty() {
         String::new()
@@ -2775,11 +2775,14 @@ fn inner_files_listed(
     ("Files its posted NZB points to", inner.files.iter().collect())
 }
 
-/// The files the NZB lists, with how many of each one's articles were seen.
-fn nzb_files_html(contents: &release_info::Contents) -> String {
+/// The files the NZB lists, with how many of each one's articles were seen. With more than one, each name links an
+/// NZB of that file alone, picked by its name (`t=get&name=`), since the list is sorted by name and not in the NZB's
+/// order that `file=N` counts in.
+fn nzb_files_html(id: i64, contents: &release_info::Contents) -> String {
     if contents.list.is_empty() {
         return String::new();
     }
+    let one_by_one = contents.files > 1;
     let rows: String = contents
         .list
         .iter()
@@ -2789,9 +2792,18 @@ fn nzb_files_html(contents: &release_info::Contents) -> String {
             } else {
                 tag("tag-warn", &format!("{} MISSING", thousands(f.expected - f.seen)))
             };
+            // a file with no name is many <file>s in the NZB, none of which a name picks
+            let name = if one_by_one && !f.name.is_empty() {
+                format!(
+                    "<a href=\"/ui/nzb?id={id}&amp;name={}\" title=\"An NZB of this file alone\">{}</a>",
+                    attr(&url_encode(&f.name)),
+                    escape(&f.name)
+                )
+            } else {
+                escape(&f.name)
+            };
             format!(
-                "<tr><td class=\"name\">{}</td><td class=\"num col-size\" title=\"{} bytes\">{}</td><td class=\"num\">{} / {}</td><td class=\"col-state\">{state}</td></tr>",
-                escape(&f.name),
+                "<tr><td class=\"name\">{name}</td><td class=\"num col-size\" title=\"{} bytes\">{}</td><td class=\"num\">{} / {}</td><td class=\"col-state\">{state}</td></tr>",
                 f.bytes,
                 escape(&fmt_size(Some(f.bytes))),
                 thousands(f.seen),
@@ -2799,13 +2811,14 @@ fn nzb_files_html(contents: &release_info::Contents) -> String {
             )
         })
         .collect();
+    let hint = if one_by_one { "<p class=\"note dim\">Click a name for an NZB of that file alone.</p>" } else { "" };
     let more = if (contents.files as usize) > contents.list.len() {
         format!("<p class=\"note\">The first {} of {} files.</p>", contents.list.len(), thousands(contents.files))
     } else {
         String::new()
     };
     format!(
-        "<h2>Files in the NZB</h2><div class=\"table-wrap\"><table><thead><tr><th>Name</th><th class=\"num col-size\">Posted size</th><th class=\"num\">Articles</th><th class=\"col-state\">State</th></tr></thead><tbody>{rows}</tbody></table></div>{more}"
+        "<h2>Files in the NZB</h2>{hint}<div class=\"table-wrap\"><table><thead><tr><th>Name</th><th class=\"num col-size\">Posted size</th><th class=\"num\">Articles</th><th class=\"col-state\">State</th></tr></thead><tbody>{rows}</tbody></table></div>{more}"
     )
 }
 
@@ -4214,6 +4227,23 @@ mod tests {
     fn a_spot_shows_as_a_tag() {
         let t = super::spot_tag("NUKE", "Movie <2026> & co");
         assert!(t.contains(">SPOT</span>") && t.contains("Spotnet spot by NUKE: Movie &lt;2026&gt; &amp; co"), "{t}");
+    }
+
+    #[test]
+    fn each_file_of_a_release_links_an_nzb_of_it_alone() {
+        let file = |n: &str| crate::release_info::NzbFile { name: n.into(), bytes: 1, seen: 1, expected: 1 };
+        let mut contents = crate::release_info::Contents {
+            files: 3,
+            list: vec![file("a b&c.mkv"), file("a.par2"), file("")],
+            ..Default::default()
+        };
+        let html = super::nzb_files_html(9, &contents);
+        assert!(html.contains("<a href=\"/ui/nzb?id=9&amp;name=a%20b%26c.mkv\""), "{html}");
+        assert!(html.contains(">a b&amp;c.mkv</a>"), "{html}");
+        assert_eq!(html.matches("<a href").count(), 2, "no link for a file with no name: {html}");
+        contents.files = 1;
+        contents.list.truncate(1);
+        assert!(!super::nzb_files_html(9, &contents).contains("<a href"), "one file: the whole NZB is that file");
     }
 
     #[test]

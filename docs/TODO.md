@@ -31,7 +31,6 @@ Atlas gathers these into one release per upload (`filters::gather_per_article`).
 - **Two uploads can share a release.** The key is shape, poster, and day, so same-shaped uploads by one poster on one day merge. A downloader may then fail on that NZB. A poster that changes with nearly every article is left out of the key, which makes this likelier. Fix: split on article number gaps or post time gaps, which needs a look at real uploads.
 - **Two same-sized files with no file counter share a file row,** so one `<file>` can list a part number twice. Fix: the same as above, or number duplicates into a second file when building the NZB.
 - **They have no real name.** Nothing in the subject gives one. Fix: read a piece's yEnc `name=`, if an upload leaves it unobfuscated, or match PAR2 hashes.
-- **`t=get&file=N` isn't advertised.** It isn't in the Newznab spec, and results don't list a release's files. Fix: a files attribute on results, or a `t=files` listing.
 - **AI search still drops them** (`src/ai.rs`), since it has no use for a release it can't name.
 
 ## Uploads obfuscated per article, with no counter
