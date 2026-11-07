@@ -1,7 +1,8 @@
-//! Reads new spots from `free.pt` every `poll_minutes`: the overview first, keeping the signed movie and TV spots,
-//! then each of those whole (HEAD for its XML, BODY for its NZB in `alt.binaries.ftd`), saved as a release and
-//! tagged with its spot. About 75 spots a day pass the filter. Spots are fetched `concurrency` at a time: each
-//! request queues for a connection behind indexing, so one at a time was minutes a spot on a busy indexer.
+//! Reads new spots from `free.pt` every `poll_minutes`: the overview first, keeping the movie and TV spots whose
+//! signatures hold (`sign`), then each of those whole (HEAD for its XML, BODY for its NZB in `alt.binaries.ftd`),
+//! saved as a release and tagged with its spot. About 75 spots a day pass the filter. Spots are fetched
+//! `concurrency` at a time: each request queues for a connection behind indexing, so one at a time was minutes a
+//! spot on a busy indexer.
 //!
 //! Comments and spam reports on the spots kept (`comments`) are read by a task of their own, `run_comments`:
 //! with a backlog of spots a spot pass takes an hour, and comments read after it waited that long.
@@ -18,7 +19,7 @@ use crate::indexer::{Db, on_db};
 use crate::nntp::{Pool, says_absent};
 
 use super::store::{self, SAVED, SKIPPED, Settled, SpotRow};
-use super::{MAX_XML_BYTES, SPOT_GROUP, binary, comments, full, header, release};
+use super::{MAX_XML_BYTES, SPOT_GROUP, binary, comments, full, header, release, sign};
 
 /// Overview lines asked for in one XOVER.
 const XOVER_STEP: u64 = 5_000;
@@ -55,6 +56,13 @@ pub async fn run(pool: Arc<Pool>, db: Db, config: SpotsConfig, stopping: impl Fn
     if let Err(e) = on_db(&db, |conn| Ok(store::create_main(conn)?)).await {
         eprintln!("spots: {e:#}");
         return;
+    }
+    for shard in 0..crate::store::SHARDS {
+        match on_shard(&db, shard, store::recategorize_all).await {
+            Ok(0) => {}
+            Ok(n) => println!("spots: {n} releases of shard {shard} queued for their category, with their spot's kind"),
+            Err(e) => eprintln!("spots: queueing shard {shard}'s spot releases for their category: {e:#}"),
+        }
     }
     while !stopping() {
         match pass(&pool, &db, &config, &stopping).await {
@@ -277,6 +285,17 @@ async fn fetch(
         Err(e) if says_absent(&e) => return Ok(Some(skipped(None))),
         Err(e) => return Err(e.into()),
     };
+    // checked again here, for spots noted before the overview was checked
+    let (subject, from) = (header::header_value(&head, "Subject"), header::header_value(&head, "From"));
+    let verdict = match (subject, from) {
+        (Some(subject), Some(from)) => {
+            header::parse(&subject, &from).map(|h| sign::verify(&h.title, &from, message_id)).unwrap_or_default()
+        }
+        _ => sign::Verdict::default(),
+    };
+    if !verdict.verified {
+        return Ok(Some(skipped(None)));
+    }
     let Some(xml) = full::xml_from_headers(&head) else { return Ok(Some(skipped(None))) };
     let Some(spot) = full::parse(&xml) else { return Ok(Some(skipped(None))) };
     let Some(kind) = spot.kind() else { return Ok(Some(skipped(None))) };
@@ -284,7 +303,7 @@ async fn fetch(
     if spot.nzb.is_empty() || !nzb_ids_usable(&spot.nzb) {
         return Ok(Some(skipped(None)));
     }
-    let spotter_id = header::spotter_id_of_head(&head);
+    let spotter_id = verdict.spotter_id;
     let row = |nzb_key: String| SpotRow {
         message_id: message_id.to_string(),
         kind,
@@ -392,7 +411,7 @@ async fn fetch(
     let (check_name, check_group) = (release.name.clone(), group.clone());
     let in_use = on_shard(db, shard, move |conn| store::name_in_use(conn, &check_name, &check_group)).await?;
     let placed = if in_use {
-        // rare, and can be heavy (`index_release` of a big release): with the stage work, in its share
+        // rare, and can be heavy (reading a big release's ids): with the stage work, in its share
         let (check_name, check_group, key) = (release.name.clone(), group.clone(), nzb_key.clone());
         on_shard_queued(db, shard, move |conn| store::placement(conn, &check_name, &check_group, &key, &by_file))
             .await?
@@ -442,19 +461,53 @@ async fn read_overview(
             Err(e) => return Err(e.into()),
         };
         read += rows.len() as u64;
+        let now = chrono::Utc::now().timestamp();
+        let removals: Vec<store::Disposal> = rows.iter().filter_map(|r| removal(r, now)).collect();
         let wanted: Vec<store::Noted> = rows
             .iter()
             .filter_map(|r| {
                 let h = header::parse(&r.subject, &r.from).filter(header::SpotHeader::wanted)?;
-                Some((r.message_id.trim_matches(['<', '>']).to_string(), r.number, h.spotter_id()))
+                // a spot whose signatures don't hold is one anyone could have posted: Spotweb drops it too
+                let verdict = sign::verify(&h.title, &r.from, &r.message_id);
+                if !verdict.verified {
+                    return None;
+                }
+                Some((r.message_id.trim_matches(['<', '>']).to_string(), r.number, verdict.spotter_id))
             })
             .collect();
         let key = host.clone();
-        let now = chrono::Utc::now().timestamp();
-        noted += on_db(db, move |conn| Ok(store::note_read(conn, &key, to, &wanted, now)?)).await?;
+        // the removals first: the cursor moves with the spots
+        noted += on_db(db, move |conn| {
+            let removed = store::note_disposals(conn, &removals)?;
+            if removed > 0 {
+                println!("spots: {removed} spots or comments removed by a moderator or their spotter");
+            }
+            Ok(store::note_read(conn, &key, to, &wanted, now)?)
+        })
+        .await?;
         from = to + 1;
     }
     Ok((read, noted))
+}
+
+/// The removal an overview line is, when it's a moderator's (or a spotter's own) `DISPOSE` whose signatures hold.
+/// A spotter's own needs their key to have signed its title and message-id: it removes only their posts.
+fn removal(r: &crate::nntp::Overview, now: i64) -> Option<store::Disposal> {
+    let h = header::parse(&r.subject, &r.from)?;
+    let message_id = h.removes()?;
+    let verdict = sign::verify(&h.title, &r.from, &r.message_id);
+    if !verdict.verified {
+        return None;
+    }
+    // their key must sign both the title, which names the target, and the message-id: the header signature alone
+    // could be replayed onto another message-id, the message-id's alone onto another title
+    let spotter = match verdict.personal {
+        true if verdict.message_id_signed && verdict.title_signed => verdict.spotter_id?,
+        true => return None,
+        false => String::new(),
+    };
+    let at = crate::dates::posted_timestamp(&r.date).unwrap_or(now);
+    Some(store::Disposal { message_id, spotter, at })
 }
 
 /// What one pass read of what's said about spots, for the log.

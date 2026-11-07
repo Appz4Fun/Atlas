@@ -194,6 +194,10 @@ pub struct SubtitleTrack {
     /// mkvmerge's statistics tags for the track
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stats: Option<TrackStats>,
+    /// A digest of the track's own header (`subtitle_header_key`): an ASS script's styles and info, or a VobSub's
+    /// size and palette. The same subtitles muxed again have the same one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header_key: Option<String>,
 }
 
 const EBML_MAGIC: &[u8] = &[0x1a, 0x45, 0xdf, 0xa3];
@@ -852,6 +856,7 @@ fn add_track(t: Track, info: &mut MediaInfo) {
             stats: None,
         }),
         17 => info.subtitles.push(SubtitleTrack {
+            header_key: t.codec_private.as_deref().and_then(|cp| subtitle_header_key(&t.codec, cp)),
             forced: t.forced,
             commentary: t.commentary || says_commentary(t.name.as_deref()),
             hearing_impaired: t.hearing_impaired
@@ -1836,6 +1841,73 @@ fn flac_key(blocks: &[u8]) -> Option<String> {
         return None;
     }
     Some(hex8(&Sha256::new().chain_update(b"flac").chain_update(md5).finalize()))
+}
+
+/// Aegisub's own sections, which change each time the script is saved (scroll position, active line, audio file)
+/// and say nothing of the subtitles.
+const AEGISUB_SECTIONS: [&str; 2] = ["[aegisub project garbage]", "[aegisub extradata]"];
+/// What Aegisub 2.x saved inside `[Script Info]` before it had a section of its own for it, in lower case.
+const AEGISUB_FIELDS: [&str; 11] = [
+    "scroll position:",
+    "active line:",
+    "video file:",
+    "audio file:",
+    "audio uri:",
+    "video zoom",
+    "video aspect ratio:",
+    "video position:",
+    "last style storage:",
+    "keyframes file:",
+    "export filters:",
+];
+
+/// The subtitle header key: SHA-256 over a track's header as its CodecPrivate holds it, the first 8 bytes in hex.
+/// An ASS or SSA script's header (`[Script Info]`, the styles), Aegisub's own sections and blank lines left out and
+/// line ends made one; or a VobSub's `size:` and `palette:` lines. None for any other codec, or a header without
+/// styles or a palette.
+pub(super) fn subtitle_header_key(codec: &str, private: &[u8]) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let text = String::from_utf8_lossy(private);
+    let text = text.trim_start_matches('\u{feff}');
+    let lines = text.lines().map(str::trim_end).filter(|l| !l.trim().is_empty());
+    let (tag, kept): (&[u8], Vec<&str>) = match codec {
+        "S_TEXT/ASS" | "S_TEXT/SSA" | "S_ASS" | "S_SSA" => {
+            let mut skip = false;
+            let kept: Vec<&str> = lines
+                .filter(|l| {
+                    let t = l.trim();
+                    let lower = t.to_ascii_lowercase();
+                    if t.starts_with('[') {
+                        skip = AEGISUB_SECTIONS.contains(&lower.as_str());
+                    }
+                    !skip && !AEGISUB_FIELDS.iter().any(|f| lower.starts_with(f))
+                })
+                .collect();
+            if !kept.iter().any(|l| l.trim().to_ascii_lowercase().starts_with("style:")) {
+                return None;
+            }
+            (b"ass", kept)
+        }
+        "S_VOBSUB" => {
+            let kept: Vec<&str> = lines
+                .filter(|l| {
+                    let t = l.trim_start().to_ascii_lowercase();
+                    t.starts_with("size:") || t.starts_with("palette:")
+                })
+                .collect();
+            if !kept.iter().any(|l| l.trim_start().to_ascii_lowercase().starts_with("palette:")) {
+                return None;
+            }
+            (b"vobsub", kept)
+        }
+        _ => return None,
+    };
+    let mut h = Sha256::new().chain_update(tag);
+    for line in kept {
+        h.update(b"\n");
+        h.update(line.as_bytes());
+    }
+    Some(hex8(&h.finalize()))
 }
 
 fn hex8(digest: &[u8]) -> String {
@@ -2929,6 +3001,33 @@ mod tests {
             out.extend(*body);
         }
         out
+    }
+
+    #[test]
+    fn the_subtitle_header_key_leaves_out_what_aegisub_saves() {
+        let script = "[Script Info]\r\nTitle: x\r\nScriptType: v4.00+\r\n\r\n[V4+ Styles]\r\nFormat: Name, Fontname\r\nStyle: Default,Arial\r\n";
+        let key = subtitle_header_key("S_TEXT/ASS", script.as_bytes()).unwrap();
+        let saved = format!(
+            "{}\n[Aegisub Project Garbage]\nScroll Position: 40\nActive Line: 3\n",
+            script.replace("\r\n", "\n")
+        );
+        assert_eq!(subtitle_header_key("S_TEXT/ASS", saved.as_bytes()).as_deref(), Some(key.as_str()));
+        let restyled = script.replace("Arial", "Gandhi Sans");
+        assert_ne!(subtitle_header_key("S_TEXT/ASS", restyled.as_bytes()).as_deref(), Some(key.as_str()));
+        assert_eq!(subtitle_header_key("S_TEXT/ASS", b"[Script Info]\nTitle: x\n"), None, "no styles");
+        let old = script.replace("Title: x", "Title: x\r\nScroll Position: 12\r\nActive Line: 7\r\nVideo File: a.mkv");
+        assert_eq!(subtitle_header_key("S_TEXT/ASS", old.as_bytes()).as_deref(), Some(key.as_str()), "Aegisub 2.x");
+        let bom = format!("\u{feff}[Aegisub Project Garbage]\nActive Line: 1\n{script}");
+        assert_eq!(subtitle_header_key("S_TEXT/ASS", bom.as_bytes()).as_deref(), Some(key.as_str()), "with a BOM");
+        assert_eq!(subtitle_header_key("S_TEXT/UTF8", script.as_bytes()), None);
+        let idx = "# VobSub index file, v7\nsize: 720x480\norg: 0, 0\npalette: 000000, 828282, 828282\n";
+        let vob = subtitle_header_key("S_VOBSUB", idx.as_bytes()).unwrap();
+        assert_eq!(
+            subtitle_header_key("S_VOBSUB", idx.replace("org: 0, 0", "org: 4, 4").as_bytes()),
+            Some(vob.clone())
+        );
+        assert_ne!(subtitle_header_key("S_VOBSUB", idx.replace("720x480", "720x576").as_bytes()), Some(vob));
+        assert_eq!(subtitle_header_key("S_VOBSUB", b"size: 720x480\n"), None, "no palette");
     }
 
     #[test]

@@ -663,6 +663,56 @@ mod select_tests {
     }
 
     #[test]
+    fn an_xref_uploads_volumes_are_its_files_of_the_part_count_most_share() {
+        let f = [
+            file("u-00001", 1),
+            file("u-00003", 293),
+            file("u-00002", 293),
+            file("u-00004", 91),
+            file("u-00005", 469),
+            file("u-00006", 293),
+        ];
+        assert_eq!(
+            volumes(&f).iter().map(|f| f.filename.as_str()).collect::<Vec<_>>(),
+            ["u-00002", "u-00003", "u-00006"]
+        );
+        // no two alike: the largest
+        assert_eq!(volumes(&[file("a", 10), file("b", 30), file("c", 2)])[0].filename, "b");
+        assert!(volumes(&[file("a", 1), file("b", 2)]).is_empty());
+    }
+
+    #[test]
+    fn an_xref_uploads_guesses_go_volume_by_volume_round_by_round() {
+        let seg = |name: &str, part: i64| crate::store::SegmentRef {
+            message_id: format!("{name}-{part}"),
+            part: Some(part),
+            bytes: 1,
+        };
+        // volumes with different counts of leads: every lead is tried once, over the rounds
+        let many: Vec<FileInfo> = (0..20).map(|k| file(&format!("v{k:02}"), 293)).collect();
+        let vols: Vec<&FileInfo> = many.iter().collect();
+        let leads = |v: &FileInfo| {
+            let n = if v.filename.ends_with('3') { 12 } else { 6 };
+            Ok::<_, ()>((1..=n).map(|p| seg(&v.filename, p)).collect::<Vec<_>>())
+        };
+        let total = 18 * 6 + 2 * 12;
+        let mut tried = Vec::new();
+        let mut round = 0;
+        loop {
+            let (got, left) = super::super::steps::xref_order(&vols, round * crate::xref::HEAD_PROBES, leads).unwrap();
+            assert!(got.len() <= crate::xref::HEAD_PROBES);
+            tried.extend(got.into_iter().map(|(_, s)| s.message_id));
+            round += 1;
+            if !left {
+                break;
+            }
+        }
+        assert_eq!(tried.len(), total);
+        assert_eq!(tried.iter().collect::<std::collections::HashSet<_>>().len(), total, "none twice");
+        assert_eq!(tried[0], "v00-1");
+    }
+
+    #[test]
     fn select_plan_table() {
         let f = [file("x.part02.rar", 5), file("x.part01.rar", 5), file("x.part03.rar", 5)];
         let p = plan(&f, 2);

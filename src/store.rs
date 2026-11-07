@@ -225,7 +225,8 @@ pub fn migrate_shard(conn: &Connection) -> Result<()> {
         -- every message-id of a release with more than one file, by its keyed
         -- hash (`id_hash`), and the file it is in: one lookup tells whether
         -- another file of the release has it. A release is in it once its
-        -- (release_id, 0, 0) row is (`index_release`).
+        -- (release_id, 0, 0) row is (`index_release`); a cache, taken again for
+        -- releases gone quiet (`ShardWriter::prune_ids_some`).
         create table if not exists release_ids (
             release_id INTEGER NOT NULL,
             id_hash INTEGER NOT NULL,
@@ -242,11 +243,20 @@ pub fn migrate_shard(conn: &Connection) -> Result<()> {
     }
     let cols: Vec<String> =
         conn.prepare("pragma table_info(files)")?.query_map([], |r| r.get(1))?.collect::<Result<_>>()?;
-    for (col, kind) in [("touched_at", "INTEGER"), ("blob", "BLOB")] {
+    for (col, kind) in [("touched_at", "INTEGER"), ("blob", "BLOB"), ("blob_bytes", "INTEGER")] {
         if !cols.iter().any(|c| c == col) {
             conn.execute(&format!("alter table files add column {col} {kind}"), [])?;
         }
     }
+    // `blob_bytes` is the bytes of the articles in `blob`, kept by whatever writes the blob (`blob_bytes.rs`). A
+    // writer that changes the blob without it leaves it NULL (unknown) rather than wrong, except the move of a blob to
+    // the sealed log, which swaps the blob for its place and keeps what's in it
+    conn.execute_batch(
+        "create trigger if not exists files_blob_bytes_unknown after update of blob on files
+         when new.blob_bytes is not null and new.blob_bytes is old.blob_bytes and new.blob is not old.blob
+          and (new.blob is null or not (length(new.blob) = 21 and substr(new.blob, 1, 5) = x'FF534C4731'))
+         begin update files set blob_bytes = null where id = new.id; end;",
+    )?;
     // whether a held-back article's part was the file's already when it was saved (1). Kept, not read: a part
     // under another message-id isnt known to be a repost (different files can share a row). NULL: held back before
     let held: bool = conn.prepare("select 1 from pragma_table_info('held_back') where name = 'again'")?.exists([])?;
@@ -287,12 +297,19 @@ impl Ids {
     pub fn next(&self) -> Result<i64> {
         let mut range = self.range.lock().unwrap();
         if range.0 >= range.1 {
-            let conn = db::open_at(&self.main)?;
-            let end: i64 = conn.query_row(
+            let mut conn = db::open_at(&self.main)?;
+            // on the disk before any of the block is saved to a shard (whose saves are, `db::with_full_flush`):
+            // a power cut that kept a save and lost its block would hand its ids out again
+            conn.execute_batch("pragma synchronous = full; pragma fullfsync = on")?;
+            // an explicit commit: an autocommit's would happen as the RETURNING row is dropped, and a failure
+            // there (disk full, a failed sync) wouldnt reach us, the block handed out yet never reserved
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let end: i64 = tx.query_row(
                 "update meta set value = value + ? where key = 'next_seq' returning value",
                 [ID_BLOCK],
                 |r| r.get(0),
             )?;
+            tx.commit()?;
             *range = (end - ID_BLOCK, end);
         }
         let seq = range.0;
@@ -577,6 +594,20 @@ pub(crate) fn is_exactly(bits: &[u8], expected: i64) -> bool {
     count == expected && highest == Some(if zero_based { expected - 1 } else { expected })
 }
 
+/// When each release's `release_ids` were last made in full (`index_release`): a release indexed again without a
+/// new article (all copies) isn't quiet for the pruning walk till SEAL_AGE after
+/// (`ShardWriter::prune_ids_some`).
+pub const RELEASE_INDEXED: ShardTable = ShardTable {
+    name: "release_indexed",
+    create: "create table if not exists release_indexed (
+        release_id INTEGER PRIMARY KEY,
+        at         INTEGER NOT NULL
+    )",
+    indexes: &[],
+    release_key: Some("release_id"),
+    added: &[],
+};
+
 /// What the overview said about a file's articles, folded in as they are
 /// saved, for the Where and when, Health and Keys facts of the release page:
 /// the first and last Date (the poster's clock, zone dropped), the first and
@@ -618,6 +649,31 @@ pub const FILE_TIMING: ShardTable = ShardTable {
         ("hw_n_last", "INTEGER"),
     ],
 };
+
+/// The rows `split_uploads` made of one release, one per upload: each row's id and name and its upload's first and
+/// last Date (the poster's clock, as `file_timing` keeps them). A save sends each article of the release to the row
+/// of the upload whose window its Date is in or nearest (`route_uploads`), soo a reread of a later upload's window
+/// fills that upload's row, not the first's. The rows go with the first upload's row (`origin_id`).
+pub const UPLOAD_ROUTES: ShardTable = ShardTable {
+    name: "upload_routes",
+    create: "create table if not exists upload_routes (
+        origin_id  INTEGER NOT NULL,
+        release_id INTEGER NOT NULL,
+        name       TEXT NOT NULL,
+        first_date INTEGER,
+        last_date  INTEGER,
+        primary key (origin_id, release_id)
+    ) without rowid",
+    indexes: &[],
+    release_key: Some("origin_id"),
+    added: &[],
+};
+
+/// How far outside every upload's window an article's Date may be and still go to the nearest upload's row
+/// (`route_uploads`): half the least gap `repost_split::decide` takes between uploads, soo an article never lands
+/// in a neighbour's row, and a new upload started past it isnt taken in. Further out, it goes where the save would
+/// put it anyway. Less when two of the release's windows are nearer.
+pub(crate) const ROUTE_SLACK_SECS: i64 = 90;
 
 /// One save's articles of one file, as `file_timing` keeps them. `from_variants`
 /// counts runs of one From in arrival order, soo a poster that rotates
@@ -951,13 +1007,51 @@ impl IdKey {
     }
 }
 
+/// Every message-id of file `file_id`, sealed or not, by its keyed hash, to `each`, till it says false.
+pub(crate) fn file_id_hashes(
+    conn: &Connection,
+    key: &IdKey,
+    file_id: i64,
+    suffixes: &mut HashMap<i64, Option<String>>,
+    mut each: impl FnMut(i64) -> Result<bool>,
+) -> Result<()> {
+    // the rows first: no blob read when they answer already
+    let mut rows = conn.prepare_cached("select local, domain from segments where file_id = ?")?;
+    let mut cursor = rows.query([file_id])?;
+    // the rows are not bounded, so they stream from the cursor one at a time
+    while let Some(r) = cursor.next()? {
+        let s = crate::blob::Seg { local: r.get(0)?, domain: r.get(1)?, part: None, bytes: 0 };
+        if !each(key.hash(&seg_key(conn, suffixes, &s)?))? {
+            return Ok(());
+        }
+    }
+    // the blob is bounded by READ_MAX_SEGMENTS
+    for s in sealed_segments(conn, file_id)?.unwrap_or_default() {
+        if !each(key.hash(&seg_key(conn, suffixes, &s)?))? {
+            return Ok(());
+        }
+    }
+    Ok(())
+}
+
+/// Whether `release_id` has its index of message-ids: its own (release_id, 0, 0) row.
+pub(crate) fn is_indexed(conn: &Connection, release_id: i64) -> Result<bool> {
+    conn.prepare_cached("select 1 from release_ids where release_id = ? and id_hash = 0")?.exists([release_id])
+}
+
+/// Drop `release_id`'s index of message-ids and its stamp: made again in full by the next save or spot that needs it.
+pub(crate) fn unindex_release(conn: &Connection, release_id: i64) -> Result<()> {
+    conn.prepare_cached("delete from release_ids where release_id = ?")?.execute([release_id])?;
+    conn.prepare_cached("delete from release_indexed where release_id = ?")?.execute([release_id])?;
+    Ok(())
+}
+
 /// Release `release_id` in `release_ids`, every message-id of its files
-/// added the first time (once it has a second file, or after an upgrade).
-pub(crate) fn index_release(conn: &Connection, key: &IdKey, release_id: i64) -> Result<()> {
-    let marked =
-        conn.prepare_cached("select 1 from release_ids where release_id = ? and id_hash = 0")?.exists([release_id])?;
-    if marked {
-        return Ok(());
+/// added the first time (once it has a second file, or after an upgrade, or
+/// after the pruning walk took it). True when it was made just now.
+pub(crate) fn index_release(conn: &Connection, key: &IdKey, release_id: i64) -> Result<bool> {
+    if is_indexed(conn, release_id)? {
+        return Ok(false);
     }
     let ids: Vec<i64> = conn
         .prepare_cached("select id from files where release_id = ?")?
@@ -967,21 +1061,16 @@ pub(crate) fn index_release(conn: &Connection, key: &IdKey, release_id: i64) -> 
     for file_id in ids {
         let mut insert =
             conn.prepare_cached("insert or ignore into release_ids (release_id, id_hash, file_id) values (?, ?, ?)")?;
-        // the blob is bounded by READ_MAX_SEGMENTS; the rows are not, so they
-        // stream from the cursor one at a time
-        for s in sealed_segments(conn, file_id)?.unwrap_or_default() {
-            insert.execute(params![release_id, key.hash(&seg_key(conn, &mut suffixes, &s)?), file_id])?;
-        }
-        let mut rows = conn.prepare_cached("select local, domain from segments where file_id = ?")?;
-        let mut cursor = rows.query([file_id])?;
-        while let Some(r) = cursor.next()? {
-            let s = crate::blob::Seg { local: r.get(0)?, domain: r.get(1)?, part: None, bytes: 0 };
-            insert.execute(params![release_id, key.hash(&seg_key(conn, &mut suffixes, &s)?), file_id])?;
-        }
+        file_id_hashes(conn, key, file_id, &mut suffixes, |hash| {
+            insert.execute(params![release_id, hash, file_id])?;
+            Ok(true)
+        })?;
     }
     conn.prepare_cached("insert or ignore into release_ids (release_id, id_hash, file_id) values (?, 0, 0)")?
         .execute([release_id])?;
-    Ok(())
+    conn.prepare_cached("insert or replace into release_indexed (release_id, at) values (?, unixepoch())")?
+        .execute([release_id])?;
+    Ok(true)
 }
 
 /// a release is complete when every file has exactly its parts, and there are
@@ -1305,6 +1394,261 @@ pub(crate) fn article_totals(conn: &Connection, release_id: i64) -> Result<Optio
     Ok(Some((bytes, count)))
 }
 
+/// One stored article: its file's name, part, total (the file's `expected`), bytes and message-id (no angle brackets).
+pub(crate) type StoredArticle = (String, Option<i64>, Option<i64>, i64, String);
+
+/// Every article of release `release_id` on this shard, from its files' blobs and rows.
+pub(crate) fn release_articles(conn: &Connection, release_id: i64) -> Result<Vec<StoredArticle>> {
+    let files: Vec<(i64, String, Option<i64>)> = conn
+        .prepare_cached("select id, filename, expected from files where release_id = ?")?
+        .query_map([release_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<Result<_>>()?;
+    let mut suffixes: HashMap<i64, Option<String>> = HashMap::new();
+    let mut out = Vec::new();
+    for (file, name, expected) in files {
+        let mut segs = sealed_segments(conn, file)?.unwrap_or_default();
+        let rows: Vec<crate::blob::Seg> = conn
+            .prepare_cached("select part, bytes, domain, local from segments where file_id = ?")?
+            .query_map([file], |r| {
+                Ok(crate::blob::Seg {
+                    part: r.get(0)?,
+                    bytes: r.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                    domain: r.get(2)?,
+                    local: r.get(3)?,
+                })
+            })?
+            .collect::<Result<_>>()?;
+        segs.extend(rows);
+        for seg in segs {
+            if seg.domain != 0 && !suffixes.contains_key(&seg.domain) {
+                let suffix = conn
+                    .prepare_cached("select suffix from domains where id = ?")?
+                    .query_row([seg.domain], |r| r.get(0))
+                    .optional()?;
+                suffixes.insert(seg.domain, suffix);
+            }
+            let id = decode(&seg.local, suffixes.get(&seg.domain).and_then(|s| s.as_deref()));
+            let id = id.trim_start_matches('<').trim_end_matches('>').to_string();
+            out.push((name.clone(), seg.part, expected, seg.bytes, id));
+        }
+    }
+    Ok(out)
+}
+
+/// Release `release_id` split into one row per upload, in the caller's transaction on its shard: `upload_of` gives
+/// the upload (from 0, in time order) of each message-id (no angle brackets), as `repost_split::decide` found it.
+/// Upload 0 keeps the row, its id, name, collections and everything found for it; each later upload gets a new row
+/// named as a collision is (`name [NNNNNNNN]`), its own files (the same names, with that upload's articles sealed in
+/// a blob), size, parts and completeness, queued for post-processing. Returns the new rows' ids. None, and nothing
+/// changed: an article with no upload, a file whose articles a save held back (sealing settles them first), or an
+/// upload of a file past what one blob holds. `dates`: each message-id's Date by the poster's clock (as
+/// `file_timing` keeps them), for each upload's files' timing rows.
+pub(crate) fn split_uploads(
+    conn: &Connection,
+    ids: &Ids,
+    release_id: i64,
+    upload_of: &HashMap<String, usize>,
+    dates: &HashMap<String, i64>,
+    uploads: usize,
+) -> Result<Option<Vec<i64>>> {
+    if uploads < 2 {
+        return Ok(None);
+    }
+    let held: bool = conn
+        .prepare_cached(
+            "select exists (select 1 from held_back h join files f on f.id = h.file_id where f.release_id = ?)",
+        )?
+        .query_row([release_id], |r| r.get(0))?;
+    if held {
+        return Ok(None);
+    }
+    type FileRow = (i64, String, Option<String>, Option<i64>, Option<String>, Option<i64>, Option<i64>);
+    let files: Vec<FileRow> = conn
+        .prepare_cached(
+            "select id, filename, subject, subject_part, subject_mid, expected, file_total from files where release_id = ?",
+        )?
+        .query_map([release_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)))?
+        .collect::<Result<_>>()?;
+    let mut suffixes: HashMap<i64, Option<String>> = HashMap::new();
+    // each file's articles, by upload, and per upload its NZB entry's article (first by part, then message-id) and
+    // its first and last Date
+    let mut parts: Vec<Vec<Vec<crate::blob::Seg>>> = Vec::new();
+    type Facts = (Option<(Option<i64>, String)>, Option<(i64, i64)>);
+    let mut facts: Vec<Vec<Facts>> = Vec::new();
+    for (file, ..) in &files {
+        let mut segs = sealed_segments(conn, *file)?.unwrap_or_default();
+        let rows: Vec<crate::blob::Seg> = conn
+            .prepare_cached("select part, bytes, domain, local from segments where file_id = ?")?
+            .query_map([file], |r| {
+                Ok(crate::blob::Seg {
+                    part: r.get(0)?,
+                    bytes: r.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                    domain: r.get(2)?,
+                    local: r.get(3)?,
+                })
+            })?
+            .collect::<Result<_>>()?;
+        segs.extend(rows);
+        let mut by: Vec<Vec<crate::blob::Seg>> = vec![Vec::new(); uploads];
+        let mut seen_facts: Vec<Facts> = vec![(None, None); uploads];
+        for seg in segs {
+            if seg.domain != 0 && !suffixes.contains_key(&seg.domain) {
+                let suffix = conn
+                    .prepare_cached("select suffix from domains where id = ?")?
+                    .query_row([seg.domain], |r| r.get(0))
+                    .optional()?;
+                suffixes.insert(seg.domain, suffix);
+            }
+            let id = decode(&seg.local, suffixes.get(&seg.domain).and_then(|s| s.as_deref()));
+            let id = id.trim_start_matches('<').trim_end_matches('>');
+            let Some(u) = upload_of.get(id).copied() else { return Ok(None) };
+            let Some(slot) = by.get_mut(u) else { return Ok(None) };
+            if let Some((rep, span)) = seen_facts.get_mut(u) {
+                let mid = format!("<{id}>");
+                if rep.as_ref().is_none_or(|(p, m)| subject_key(seg.part, &mid) < subject_key(*p, m)) {
+                    *rep = Some((seg.part, mid));
+                }
+                if let Some(t) = dates.get(id).copied() {
+                    *span = Some(span.map_or((t, t), |(a, b)| (a.min(t), b.max(t))));
+                }
+            }
+            slot.push(seg);
+        }
+        if by.iter().any(|b| b.len() as i64 > SEAL_MAX_SEGMENTS) {
+            return Ok(None);
+        }
+        parts.push(by);
+        facts.push(seen_facts);
+    }
+    type ReleaseRow = (String, String, Option<String>, Option<String>, Option<String>, i64, Option<i64>);
+    let (name, group, poster, posted, display, obfuscated, file_total): ReleaseRow = conn
+        .prepare_cached(
+            "select name, group_name, poster, posted_date, display_name, is_obfuscated, file_total from releases where id = ?",
+        )?
+        .query_row([release_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)))?;
+    let seen_of = |segs: &[crate::blob::Seg]| {
+        let mut seen = Vec::new();
+        for p in segs.iter().filter_map(|s| s.part) {
+            insert_part(&mut seen, p);
+        }
+        seen
+    };
+    let mut rows = vec![release_id];
+    let mut names = vec![name.clone()];
+    let mut taken = conn.prepare_cached("select 1 from releases where name = ? and group_name = ?")?;
+    for u in 1..uploads {
+        let mut digits = (release_id.wrapping_mul(31).wrapping_add(u as i64)).rem_euclid(100_000_000);
+        let mut twin = format!("{name} [{digits:08}]");
+        while taken.exists(params![twin, group])? {
+            digits = (digits + 1) % 100_000_000;
+            twin = format!("{name} [{digits:08}]");
+        }
+        let id = global_id(ids.next()?, shard_of_id(release_id));
+        conn.prepare_cached(
+            "insert into releases (id, name, size, complete, group_name, poster, posted_date, display_name, is_obfuscated,
+             parts, file_total) values (?, ?, 0, 0, ?, ?, ?, ?, ?, 0, ?)",
+        )?
+        .execute(params![id, twin, group, poster, posted, display, obfuscated, file_total])?;
+        rows.push(id);
+        names.push(twin);
+    }
+    for (((file, filename, subject, _, _, expected, ftotal), by), file_facts) in files.iter().zip(&parts).zip(&facts) {
+        for (u, segs) in by.iter().enumerate() {
+            let blob = (!segs.is_empty()).then(|| crate::blob::encode(segs));
+            let (rep, span) = file_facts.get(u).cloned().unwrap_or((None, None));
+            let (subject_part, subject_mid) = rep.map_or((None, None), |(p, m)| (p, Some(m)));
+            let target = if u == 0 { Some(*file) } else { None };
+            if let Some(file) = target {
+                conn.prepare_cached(
+                    "update files set seen = ?, blob = ?, blob_bytes = ?, subject_part = ?, subject_mid = ? where id = ?",
+                )?
+                .execute(params![
+                    seen_of(segs),
+                    blob,
+                    blob.as_ref().map(|_| crate::blob_bytes::of_segs(segs)),
+                    subject_part,
+                    subject_mid,
+                    file
+                ])?;
+                conn.prepare_cached("delete from segments where file_id = ?")?.execute([file])?;
+                // its timing is its own upload's now: the repair rereads that window
+                conn.prepare_cached(
+                    "update file_timing set first_date = ?, last_date = ?, articles = ? where file_id = ?",
+                )?
+                .execute(params![span.map(|s| s.0), span.map(|s| s.1), segs.len() as i64, file])?;
+            } else if let Some(blob) = blob {
+                conn.prepare_cached(
+                    "insert into files (release_id, filename, subject, subject_part, subject_mid, expected, file_total,
+                     seen, touched_at, blob, blob_bytes) values (?, ?, ?, ?, ?, ?, ?, ?, unixepoch(), ?, ?)",
+                )?
+                .execute(params![
+                    rows.get(u).copied().unwrap_or(release_id),
+                    filename,
+                    subject,
+                    subject_part,
+                    subject_mid,
+                    expected,
+                    ftotal,
+                    seen_of(segs),
+                    blob,
+                    crate::blob_bytes::of_segs(segs)
+                ])?;
+                let new_file = conn.last_insert_rowid();
+                conn.prepare_cached(
+                    "insert into file_timing (file_id, release_id, first_date, last_date, articles) values (?, ?, ?, ?, ?)",
+                )?
+                .execute(params![
+                    new_file,
+                    rows.get(u).copied().unwrap_or(release_id),
+                    span.map(|s| s.0),
+                    span.map(|s| s.1),
+                    segs.len() as i64
+                ])?;
+            }
+        }
+    }
+    // a file left with nothing of upload 0's has no articles: it goes, with its timing row
+    conn.prepare_cached(
+        "delete from file_timing where file_id in (select id from files where release_id = ? and blob is null
+         and not exists (select 1 from segments where file_id = files.id))",
+    )?
+    .execute([release_id])?;
+    conn.prepare_cached(
+        "delete from files where release_id = ? and blob is null and not exists (select 1 from segments where file_id = files.id)",
+    )?
+    .execute([release_id])?;
+    // the index of message-ids is made again by the next save that needs it
+    unindex_release(conn, release_id)?;
+    for (u, id) in rows.iter().enumerate() {
+        let (bytes, count) =
+            parts.iter().filter_map(|by| by.get(u)).flatten().fold((0i64, 0i64), |(b, c), s| (b + s.bytes, c + 1));
+        conn.prepare_cached("update releases set size = ?, parts = ? where id = ?")?
+            .execute(params![bytes, count, id])?;
+        let complete = release_complete(conn, *id, file_total)?;
+        conn.prepare_cached("update releases set complete = ? where id = ?")?.execute(params![complete as i64, id])?;
+        conn.prepare_cached(
+            "insert into pp_queue (release_id, due_at) values (?1, 0)
+             on conflict(release_id) do update set due_at = min(pp_queue.due_at, excluded.due_at)",
+        )?
+        .execute([id])?;
+    }
+    // each upload's posting window, soo later saves of its articles (a reread of its window) find its row
+    let mut spans: Vec<Option<(i64, i64)>> = vec![None; uploads];
+    for (mid, u) in upload_of {
+        if let (Some(t), Some(span)) = (dates.get(mid).copied(), spans.get_mut(*u)) {
+            *span = Some(span.map_or((t, t), |(a, b)| (a.min(t), b.max(t))));
+        }
+    }
+    for ((id, row_name), span) in rows.iter().zip(&names).zip(&spans) {
+        conn.prepare_cached(
+            "insert or replace into upload_routes (origin_id, release_id, name, first_date, last_date)
+             values (?, ?, ?, ?, ?)",
+        )?
+        .execute(params![release_id, id, row_name, span.map(|s| s.0), span.map(|s| s.1)])?;
+    }
+    conn.prepare_cached("update meta set value = value + ? where key = 'releases'")?.execute([(uploads - 1) as i64])?;
+    Ok(Some(rows.split_off(1)))
+}
 /// Every article of a release on this shard, by the key sealing tells one message-id with (`seg_key`): the blobs'
 /// and the rows'. For telling whether two rows of a shard hold the same articles.
 pub(crate) fn release_article_keys(conn: &Connection, release_id: i64) -> Result<HashSet<String>> {
@@ -1432,8 +1776,11 @@ fn seal_rows(conn: &Connection, file_id: i64) -> Result<usize> {
         return Ok(0);
     }
     segs.extend(rows);
-    conn.prepare_cached("update files set blob = ? where id = ?")?
-        .execute(params![crate::blob::encode(&segs), file_id])?;
+    conn.prepare_cached("update files set blob = ?, blob_bytes = ? where id = ?")?.execute(params![
+        crate::blob::encode(&segs),
+        crate::blob_bytes::of_segs(&segs),
+        file_id
+    ])?;
     conn.prepare_cached("delete from segments where file_id = ?")?.execute([file_id])?;
     Ok(segs.len())
 }
@@ -1762,10 +2109,71 @@ pub struct ShardWriter {
     decode_budget: usize,
     /// moving what the freezing rules queued into the frozen file, between saves
     pub freezer: crate::frozen::Ticker,
+    /// the walk taking quiet releases' `release_ids` (`prune_ids_some`)
+    ids: IdsPrune,
+    /// when the walk last took a step
+    ids_step: Option<Instant>,
+    /// the release the step in hand is at, for going on past it if the step fails
+    ids_failing: Option<i64>,
+}
+
+/// Where the walk taking quiet releases' `release_ids` is (`ShardWriter::prune_ids_some`).
+#[derive(Clone, Copy, Default, Debug, PartialEq)]
+struct IdsPrune {
+    /// where the last step stopped
+    after: i64,
+    /// a quiet release whose rows are still being taken, a chunk a step
+    pruning: Option<i64>,
+    /// no step before this (unix seconds): the last one reached the end
+    rest_until: i64,
+    /// the least recently touched or indexed release this walk kept, for when the next may start
+    oldest_kept: Option<i64>,
+    /// a release a step failed at, passed over once
+    skip: Option<i64>,
 }
 
 /// files sealed per writer tick at most
 pub const SEAL_PER_TICK: usize = 2_000;
+
+/// a pruning step of `release_ids` stops after this long while saves or stage jobs wait, so the writer gets back to them
+pub const PRUNE_IDS_BUDGET: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// the same on a writer with nothing to save (a save that comes in meanwhile waits up to this, after an idle freeze tick)
+pub const PRUNE_IDS_BUDGET_IDLE: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// after a step reaches the end of `release_ids`, the next starts over this much later at least (seconds)
+const PRUNE_IDS_REST: i64 = 3_600;
+
+/// between saves, a pruning step at most this often
+const PRUNE_IDS_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// the same when nothing came in meanwhile: at most a fifth of the writer's time with PRUNE_IDS_BUDGET_IDLE
+const PRUNE_IDS_IDLE_EVERY: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// after a pruning step found the lock held elsewhere, the next waits this long (seconds)
+const PRUNE_IDS_BUSY_REST: i64 = 30;
+
+/// after a pruning step fails, the next waits this long (seconds)
+const PRUNE_IDS_FAILED_REST: i64 = 600;
+
+/// how long a pruning step on an idle writer waits for a write lock another connection holds (a save that comes
+/// meanwhile waits as long)
+const PRUNE_IDS_BUSY: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// the lock wait right after a save, or with one queued
+const PRUNE_IDS_BUSY_SAVING: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// while more saves are queued, a pruning step at most this often
+const PRUNE_IDS_QUEUED_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// releases a pruning step of `release_ids` looks at most
+const PRUNE_IDS_LOOKS: usize = 5_000;
+
+/// rows of one quiet release's `release_ids` taken at a time
+const PRUNE_IDS_CHUNK: i64 = 1_000;
+
+/// the same when nothing waits for the writer
+const PRUNE_IDS_CHUNK_IDLE: i64 = 5_000;
 
 /// a seal tick stops after this long, so the writer gets back to saving
 pub const SEAL_BUDGET: std::time::Duration = std::time::Duration::from_millis(100);
@@ -1787,6 +2195,9 @@ impl ShardWriter {
             walked_at: None,
             decode_budget: SEALED_DECODE_BUDGET,
             freezer: crate::frozen::Ticker::default(),
+            ids: IdsPrune::default(),
+            ids_step: None,
+            ids_failing: None,
         }
     }
 
@@ -1865,6 +2276,174 @@ impl ShardWriter {
         Ok(sealed)
     }
 
+    /// Whether the pruning walk has work now: not resting after a walk, nor stopping.
+    pub fn prune_ids_awake(&self, now: i64) -> bool {
+        !crate::frozen::STOPPING.load(std::sync::atomic::Ordering::Relaxed) && now >= self.ids.rest_until
+    }
+
+    /// Whether a pruning step is due (`prune_ids_some`): not while resting after a walk, nor while freezing says
+    /// the indexer is stopping, and no sooner than the interval for how busy the writer is.
+    pub fn prune_ids_due(&self, now: i64, idle: bool, queued: bool) -> bool {
+        // a step every so often between saves, and only now and then while more are queued: steady ingest neither
+        // starves it nor pays for it on every batch
+        let every = if queued {
+            PRUNE_IDS_QUEUED_EVERY
+        } else if idle {
+            PRUNE_IDS_IDLE_EVERY
+        } else {
+            PRUNE_IDS_EVERY
+        };
+        self.prune_ids_awake(now) && self.ids_step.is_none_or(|t| t.elapsed() >= every)
+    }
+
+    /// Take `release_ids` rows of quiet releases, for at most PRUNE_IDS_BUDGET
+    /// (PRUNE_IDS_BUDGET_IDLE when `idle`): a step through the table by release
+    /// from where the last one stopped. After the end it starts over once the
+    /// least recently touched release it kept could be quiet (PRUNE_IDS_REST
+    /// at least, SEAL_AGE at most). Steps come every PRUNE_IDS_EVERY at most
+    /// between saves (PRUNE_IDS_IDLE_EVERY when `idle`), every
+    /// PRUNE_IDS_QUEUED_EVERY while more are `queued`. A release with fewer than
+    /// two files loses its index whatever its age: saves dont keep it up (`others`). A release none of whose files was touched,
+    /// and that wasn't indexed itself, for SEAL_AGE loses its own row first, then the rest a chunk at a time
+    /// over as many steps as it takes. The index is only a cache: without its
+    /// own row, the next save to the release indexes it again in full
+    /// (`index_release`); a spot placed on it compares in memory, so a late article is still found in its
+    /// other files. Not for use inside a save transaction. Returns the rows taken.
+    /// Only when `prune_ids_due`; a write lock another connection holds past PRUNE_IDS_BUSY lets the step go.
+    pub fn prune_ids_some(&mut self, conn: &mut Connection, now: i64, idle: bool, queued: bool) -> Result<usize> {
+        if !self.prune_ids_due(now, idle, queued) {
+            return Ok(0);
+        }
+        self.ids_step = Some(Instant::now());
+        self.ids_failing = None;
+        // with saves about, a held lock lets the step go at once nearly
+        conn.busy_timeout(if idle && !queued { PRUNE_IDS_BUSY } else { PRUNE_IDS_BUSY_SAVING })?;
+        let done = self.prune_ids_step(conn, now, idle);
+        // put back whatever came of the step: a failure here mustnt hide the step's own
+        let restored = conn.busy_timeout(crate::db::BUSY_TIMEOUT);
+        let done = match done {
+            // the lock is held elsewhere: not again for a while, soo the writer doesnt keep waiting on it
+            Err(e) if crate::frozen::is_busy(&e) => {
+                crate::metrics::names::RELEASE_IDS.inc(&[("event", "busy"), ("shard", &self.shard.to_string())], 1);
+                self.ids.rest_until = now + PRUNE_IDS_BUSY_REST;
+                Ok(0)
+            }
+            // anything else would likely fail the same way next time: the walk rests a while, then passes over the
+            // release it failed at, and only that one
+            Err(e) => {
+                self.ids.rest_until = now + PRUNE_IDS_FAILED_REST;
+                if let Some(failed) = self.ids_failing {
+                    self.ids.skip = Some(failed);
+                }
+                Err(e)
+            }
+            done => done,
+        };
+        match (done, restored) {
+            (Err(e), _) | (Ok(_), Err(e)) => Err(e),
+            (Ok(n), Ok(())) => Ok(n),
+        }
+    }
+
+    fn prune_ids_step(&mut self, conn: &mut Connection, now: i64, idle: bool) -> Result<usize> {
+        let (budget, chunk) =
+            if idle { (PRUNE_IDS_BUDGET_IDLE, PRUNE_IDS_CHUNK_IDLE) } else { (PRUNE_IDS_BUDGET, PRUNE_IDS_CHUNK) };
+        let started = Instant::now();
+        // worked on a copy, kept only once the transaction has committed
+        let mut w = self.ids;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut taken = 0;
+        let mut quiet = 0;
+        let mut looked = 0;
+        while started.elapsed() < budget && looked < PRUNE_IDS_LOOKS {
+            if let Some(release_id) = w.pruning {
+                self.ids_failing = Some(release_id);
+                if w.skip == Some(release_id) {
+                    (w.pruning, w.skip) = (None, None);
+                    continue;
+                }
+                // a save indexed it again in full since: it's kept up once more
+                if is_indexed(&tx, release_id)? {
+                    w.pruning = None;
+                    continue;
+                }
+                // the rows are in id_hash order under the key: up to the chunk's last one, in one range
+                let last: Option<i64> = tx
+                    .prepare_cached(
+                        "select id_hash from release_ids where release_id = ? order by id_hash limit 1 offset ?",
+                    )?
+                    .query_row(params![release_id, chunk - 1], |r| r.get(0))
+                    .optional()?;
+                taken += match last {
+                    Some(last) => tx
+                        .prepare_cached("delete from release_ids where release_id = ? and id_hash <= ?")?
+                        .execute(params![release_id, last])?,
+                    None => {
+                        w.pruning = None;
+                        tx.prepare_cached("delete from release_ids where release_id = ?")?.execute([release_id])?
+                    }
+                };
+                continue;
+            }
+            looked += 1;
+            self.ids_failing = None;
+            let next: Option<i64> = tx
+                .prepare_cached("select release_id from release_ids where release_id > ? order by release_id limit 1")?
+                .query_row([w.after], |r| r.get(0))
+                .optional()?;
+            let Some(release_id) = next else {
+                // the end: start over once the oldest release kept could be quiet, PRUNE_IDS_REST at the soonest;
+                // with none kept, whatever is indexed next was indexed just then (`index_release`)
+                w.after = 0;
+                w.rest_until = w
+                    .oldest_kept
+                    .map_or(now + SEAL_AGE, |t| t + SEAL_AGE + 1)
+                    .clamp(now + PRUNE_IDS_REST, now + SEAL_AGE);
+                w.oldest_kept = None;
+                break;
+            };
+            w.after = release_id;
+            self.ids_failing = Some(release_id);
+            if w.skip == Some(release_id) {
+                w.skip = None;
+                continue;
+            }
+            // a file never touched since the upgrade counts as old, as for sealing (`due`); a release without its own
+            // row is half taken already
+            let (files, touched, indexed, own): (i64, i64, i64, bool) = tx
+                .prepare_cached(
+                    "select count(*), coalesce(max(touched_at), 0),
+                            coalesce((select at from release_indexed where release_id = ?1), 0),
+                            exists (select 1 from release_ids where release_id = ?1 and id_hash = 0)
+                     from files where release_id = ?1",
+                )?
+                .query_row([release_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+            let last = touched.max(indexed);
+            // without its own row it's half taken (a step cut short by a restart): no save trusts what's left
+            if files < 2 || last < now - SEAL_AGE || !own {
+                // its own row first: a release half taken is indexed again in full
+                let own = tx
+                    .prepare_cached("delete from release_ids where release_id = ? and id_hash = 0")?
+                    .execute([release_id])?;
+                taken += own;
+                tx.prepare_cached("delete from release_indexed where release_id = ?")?.execute([release_id])?;
+                w.pruning = Some(release_id);
+                // one half taken before a restart was counted then
+                quiet += own as u64;
+            } else {
+                w.oldest_kept = Some(w.oldest_kept.map_or(last, |o| o.min(last)));
+            }
+        }
+        // past here a failure is the step's, not a release's
+        self.ids_failing = None;
+        tx.commit()?;
+        self.ids = w;
+        let shard = self.shard.to_string();
+        crate::metrics::names::RELEASE_IDS.inc(&[("event", "pruned_releases"), ("shard", &shard)], quiet);
+        crate::metrics::names::RELEASE_IDS.inc(&[("event", "pruned_rows"), ("shard", &shard)], taken as u64);
+        Ok(taken)
+    }
+
     /// Releases of this shard's groups, in one transaction. The same release
     /// may come up in more than one batch.
     pub fn save<'a>(
@@ -1930,7 +2509,10 @@ impl ShardWriter {
             // nothing is ever saved for a blocked group, whichever path it came by
             let mut releases: Vec<Cow<'_, Release>> = Vec::new();
             let frozen = frozen_attached && crate::frozen::any(&tx)?;
+            // a release split into one row per upload: its articles go to their upload's row
+            let mut routed = tx.prepare_cached("select 1 from upload_routes limit 1")?.exists([])?;
             for release in batches.into_iter().flatten().filter(|r| !crate::filters::group_blocked(&r.group)) {
+                // a frozen first upload's row comes back, with its routes, before they are read
                 if frozen {
                     let collection = release.collection.as_deref().map(|c| key.hash(c));
                     let articles: Vec<(&str, &str)> = release
@@ -1938,9 +2520,34 @@ impl ShardWriter {
                         .iter()
                         .filter_map(|a| a.release_name.as_deref().map(|n| (n, a.author.as_str())))
                         .collect();
-                    crate::frozen::thaw_incoming(&tx, collection, &release.name, &articles, &release.group, now)?;
+                    let thawed =
+                        crate::frozen::thaw_incoming(&tx, collection, &release.name, &articles, &release.group, now)?;
+                    // a thawed row may bring the shard's first routes
+                    if thawed > 0 && !routed {
+                        routed = tx.prepare_cached("select 1 from upload_routes limit 1")?.exists([])?;
+                    }
                 }
-                releases.extend(split_old_rows(&tx, grouping_from, release)?);
+                let pieces =
+                    if routed { route_uploads(&tx, &key, release, frozen)? } else { vec![Cow::Borrowed(release)] };
+                for piece in pieces {
+                    // a later upload's row thaws by its own name
+                    let twin = piece.collection.is_none() && piece.name != release.name;
+                    if frozen && twin {
+                        let collection = piece.collection.as_deref().map(|c| key.hash(c));
+                        let articles: Vec<(&str, &str)> = piece
+                            .articles
+                            .iter()
+                            .filter_map(|a| a.release_name.as_deref().map(|n| (n, a.author.as_str())))
+                            .collect();
+                        crate::frozen::thaw_incoming(&tx, collection, &piece.name, &articles, &piece.group, now)?;
+                    }
+                    match piece {
+                        Cow::Borrowed(r) => releases.extend(split_old_rows(&tx, grouping_from, r)?),
+                        Cow::Owned(r) => releases.extend(
+                            split_old_rows(&tx, grouping_from, &r)?.into_iter().map(|c| Cow::Owned(c.into_owned())),
+                        ),
+                    }
+                }
             }
 
             for release in releases.iter().map(Cow::as_ref) {
@@ -2021,8 +2628,9 @@ impl ShardWriter {
                     let others = tx
                         .prepare_cached("select 1 from files where release_id = ? and id != ? limit 1")?
                         .exists(params![release_id, f.id])?;
-                    if others {
-                        index_release(&tx, &key, release_id)?;
+                    if others && index_release(&tx, &key, release_id)? {
+                        crate::metrics::names::RELEASE_IDS
+                            .inc(&[("event", "indexed"), ("shard", &shard.to_string())], 1);
                     }
                     let index = others.then_some((release_id, &key));
                     let before = added.len();
@@ -2069,7 +2677,7 @@ impl ShardWriter {
                             .prepare_cached("select 1 from files where release_id = ? limit 1 offset 1")?
                             .exists([release_id])?;
                         if gone > 0 && !others {
-                            tx.prepare_cached("delete from release_ids where release_id = ?")?.execute([release_id])?;
+                            unindex_release(&tx, release_id)?;
                         }
                     }
                 }
@@ -2152,6 +2760,96 @@ pub fn start_grouping(main: &Path) -> Result<()> {
         )?;
     }
     Ok(())
+}
+
+/// A release whose row `split_uploads` made one row per upload of, in pieces: each article to the row of the upload
+/// whose posting window (`upload_routes`) its Date is in, or nearest within `ROUTE_SLACK_SECS`. The first upload's
+/// articles, and any with no Date or far from every window, stay in the release as it came; another upload's go in a
+/// piece named as its row, with no collection, soo the upsert finds that row. A release of no split row comes back as
+/// it is.
+fn route_uploads<'a>(
+    tx: &Connection,
+    key: &IdKey,
+    release: &'a Release,
+    frozen: bool,
+) -> Result<Vec<Cow<'a, Release>>> {
+    let origin: Option<i64> = match release.collection.as_deref() {
+        Some(c) => tx
+            .prepare_cached("select release_id from collections where key = ?")?
+            .query_row([key.hash(c)], |r| r.get(0))
+            .optional()?,
+        None => tx
+            .prepare_cached("select id from releases where name = ? and group_name = ?")?
+            .query_row(params![release.name, release.group], |r| r.get(0))
+            .optional()?,
+    };
+    let Some(origin) = origin else { return Ok(vec![Cow::Borrowed(release)]) };
+    // each upload's row by its name now (a rename keeps the id), live or frozen (its piece thaws it by that name),
+    // and its window; a row gone since isnt routed to
+    type Route = (i64, String, i64, i64);
+    let sql = if frozen {
+        "select u.release_id, coalesce(r.name, f.name), u.first_date, u.last_date from upload_routes u
+         left join releases r on r.id = u.release_id left join frozen.frozen_releases f on f.id = u.release_id
+         where u.origin_id = ?1 and u.first_date is not null and u.last_date is not null
+         and coalesce(r.group_name, f.group_name) = ?2 order by u.first_date"
+    } else {
+        "select u.release_id, r.name, u.first_date, u.last_date from upload_routes u
+         join releases r on r.id = u.release_id
+         where u.origin_id = ?1 and u.first_date is not null and u.last_date is not null and r.group_name = ?2
+         order by u.first_date"
+    };
+    let routes: Vec<Route> = tx
+        .prepare_cached(sql)?
+        .query_map(params![origin, release.group], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+        .collect::<Result<_>>()?;
+    if routes.len() < 2 {
+        return Ok(vec![Cow::Borrowed(release)]);
+    }
+    let slack = routes.windows(2).map(|w| (w[1].2 - w[0].3) / 2).fold(ROUTE_SLACK_SECS, i64::min).max(0);
+    // each article's upload row: None, it stays
+    let route_of = |a: &Article| -> Option<usize> {
+        let t = crate::dates::naive_timestamp(&a.date)?;
+        let (i, far) = routes
+            .iter()
+            .enumerate()
+            .map(|(i, (_, _, first, last))| (i, if t < *first { first - t } else { (t - last).max(0) }))
+            .min_by_key(|(_, far)| *far)?;
+        (far <= slack && routes.get(i).is_some_and(|r| r.0 != origin)).then_some(i)
+    };
+    let routed: Vec<Option<usize>> = release.articles.iter().map(route_of).collect();
+    if routed.iter().all(Option::is_none) {
+        return Ok(vec![Cow::Borrowed(release)]);
+    }
+    let mut by_route: IndexMap<usize, Vec<Article>> = IndexMap::new();
+    let mut stay = Vec::new();
+    for (a, route) in release.articles.iter().zip(routed) {
+        match route {
+            Some(i) => by_route.entry(i).or_default().push(a.clone()),
+            None => stay.push(a.clone()),
+        }
+    }
+    let piece = |name: &str, collection: Option<String>, articles: Vec<Article>| Release {
+        name: name.to_string(),
+        size: articles.iter().map(|a| a.bytes).sum(),
+        is_obfuscated: release.is_obfuscated,
+        display_name: release.display_name.clone(),
+        complete: false,
+        group: release.group.clone(),
+        poster: release.poster.clone(),
+        date: release.date.clone(),
+        collection,
+        articles,
+    };
+    let mut pieces = Vec::new();
+    if !stay.is_empty() {
+        pieces.push(Cow::Owned(piece(&release.name, release.collection.clone(), stay)));
+    }
+    for (i, articles) in by_route {
+        if let Some((_, name, ..)) = routes.get(i) {
+            pieces.push(Cow::Owned(piece(name, None, articles)));
+        }
+    }
+    Ok(pieces)
 }
 
 /// A collection's articles that were saved, or started, under their own file
@@ -3037,6 +3735,156 @@ mod tests {
         assert_eq!(article_totals(&c, id).unwrap(), Some((4_006, 4)), "the blob and the late row");
     }
 
+    /// Two uploads of one post in one row become two rows: the first keeps the row, the second gets its own files,
+    /// each with its own articles, size, parts and completeness, both queued. Nothing changes when an article has no
+    /// upload.
+    #[test]
+    fn a_release_of_two_uploads_splits_into_two_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        db::create_db_at(&main).unwrap();
+        let art = |file: &str, part: i64, upload: u8| Article {
+            message_id: format!("<{file}.{part}.u{upload}@x>"),
+            subject: format!("\"{file}\" yEnc ({part}/2)"),
+            filename: Some(file.into()),
+            part: Some(part),
+            total_parts: Some(2),
+            bytes: 1_000 + part,
+            ..Default::default()
+        };
+        let articles = ["a.rar", "b.rar"]
+            .iter()
+            .flat_map(|f| [0u8, 1].into_iter().flat_map(move |u| (1..=2).map(move |p| art(f, p, u))))
+            .collect();
+        save(&main, &[Release { name: "Rel".into(), group: "alt.binaries.t".into(), articles, ..Default::default() }])
+            .unwrap();
+        let mut conn = db::open_at(&shard_path(&main, shard_of("alt.binaries.t"))).unwrap();
+        let id: i64 = conn.query_row("select id from releases", [], |r| r.get(0)).unwrap();
+        let a: i64 = conn.query_row("select id from files where filename = 'a.rar'", [], |r| r.get(0)).unwrap();
+        seal_file(&conn, a).unwrap();
+        let upload_of: HashMap<String, usize> = release_articles(&conn, id)
+            .unwrap()
+            .into_iter()
+            .map(|(.., mid)| {
+                let u = usize::from(mid.contains(".u1@"));
+                (mid, u)
+            })
+            .collect();
+        assert_eq!(upload_of.len(), 8);
+        let releases = |c: &Connection| -> i64 {
+            c.query_row("select value from meta where key = 'releases'", [], |r| r.get(0)).unwrap()
+        };
+        let before = releases(&conn);
+
+        let mut short = upload_of.clone();
+        short.retain(|k, _| !k.starts_with("b.rar.2.u1"));
+        let tx = conn.transaction().unwrap();
+        assert_eq!(
+            split_uploads(&tx, &Ids::new(&main), id, &short, &HashMap::new(), 2).unwrap(),
+            None,
+            "an article with no upload"
+        );
+        drop(tx);
+
+        let tx = conn.transaction().unwrap();
+        let dates: HashMap<String, i64> =
+            upload_of.iter().map(|(mid, u)| (mid.clone(), 1_000 + *u as i64 * 3_600)).collect();
+        let new = split_uploads(&tx, &Ids::new(&main), id, &upload_of, &dates, 2).unwrap().unwrap();
+        tx.commit().unwrap();
+        assert_eq!(new.len(), 1);
+        let row = |rid: i64| -> (String, i64, i64, bool) {
+            conn.query_row("select name, size, parts, complete from releases where id = ?", [rid], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })
+            .unwrap()
+        };
+        assert_eq!(row(id), ("Rel".into(), 4_006, 4, true));
+        let (twin, size, parts, complete) = row(new[0]);
+        assert!(twin.starts_with("Rel ["), "{twin}");
+        assert_eq!((size, parts, complete), (4_006, 4, true));
+        let mids = |rid: i64| -> Vec<String> {
+            let mut v: Vec<String> = release_articles(&conn, rid).unwrap().into_iter().map(|a| a.4).collect();
+            v.sort();
+            v
+        };
+        assert!(mids(id).iter().all(|m| m.contains(".u0@")) && mids(id).len() == 4);
+        assert!(mids(new[0]).iter().all(|m| m.contains(".u1@")) && mids(new[0]).len() == 4);
+        assert_eq!(releases(&conn), before + 1);
+        // each upload's files: their NZB entry's article and their timing are their own
+        let facts = |rid: i64| -> Vec<(String, Option<i64>, Option<i64>)> {
+            conn.prepare(
+                "select f.subject_mid, t.first_date, t.last_date from files f left join file_timing t on t.file_id = f.id
+                 where f.release_id = ? order by f.filename",
+            )
+            .unwrap()
+            .query_map([rid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+        };
+        let mine = facts(id);
+        assert_eq!(mine.first().map(|f| f.0.as_str()), Some("<a.rar.1.u0@x>"));
+        let theirs = facts(new[0]);
+        assert_eq!(theirs.first().cloned(), Some(("<a.rar.1.u1@x>".into(), Some(4_600), Some(4_600))));
+        assert!(theirs.iter().all(|f| f.0.contains(".u1@")));
+        let queued: i64 = conn
+            .query_row("select count(*) from pp_queue where release_id in (?, ?)", [id, new[0]], |r| r.get(0))
+            .unwrap();
+        assert_eq!(queued, 2);
+
+        // later saves: an article dated in (or just past) the second upload's window goes to its row, one in the
+        // first's or far from both stays in the first row
+        let routes: i64 =
+            conn.query_row("select count(*) from upload_routes where origin_id = ?", [id], |r| r.get(0)).unwrap();
+        assert_eq!(routes, 2);
+        let late = |mid: &str, file: &str, at: i64| Article {
+            message_id: format!("<{mid}@x>"),
+            date: chrono::DateTime::from_timestamp(at, 0).unwrap().format("%a, %d %b %Y %H:%M:%S +0000").to_string(),
+            ..art(file, 2, 0)
+        };
+        let articles = vec![
+            late("b.rar.2.reread", "b.rar", 4_600 + 60),
+            late("a.rar.2.first", "a.rar", 1_000),
+            late("a.rar.2.far", "a.rar", 100_000),
+            // past the slack after the last upload: maybe another upload starting, not this one's
+            late("b.rar.2.after", "b.rar", 4_600 + ROUTE_SLACK_SECS + 1),
+        ];
+        save(&main, &[Release { name: "Rel".into(), group: "alt.binaries.t".into(), articles, ..Default::default() }])
+            .unwrap();
+        assert!(mids(new[0]).contains(&"b.rar.2.reread@x".to_string()), "{:?}", mids(new[0]));
+        assert!(mids(id).contains(&"a.rar.2.first@x".to_string()) && mids(id).contains(&"a.rar.2.far@x".to_string()));
+        assert!(mids(id).contains(&"b.rar.2.after@x".to_string()));
+        assert_eq!((row(id).2, row(new[0]).2), (7, 5));
+        // a later upload's row renamed keeps its route; one gone is routed to no more
+        conn.execute("update releases set name = 'Rel renamed' where id = ?", [new[0]]).unwrap();
+        save(
+            &main,
+            &[Release {
+                name: "Rel".into(),
+                group: "alt.binaries.t".into(),
+                articles: vec![late("a.rar.2.renamed", "a.rar", 4_600)],
+                ..Default::default()
+            }],
+        )
+        .unwrap();
+        assert!(mids(new[0]).contains(&"a.rar.2.renamed@x".to_string()));
+        let n: i64 = conn.query_row("select count(*) from releases", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 2, "no fragment row under the old name");
+        conn.execute("delete from releases where id = ?", [new[0]]).unwrap();
+        save(
+            &main,
+            &[Release {
+                name: "Rel".into(),
+                group: "alt.binaries.t".into(),
+                articles: vec![late("a.rar.2.gone", "a.rar", 4_600)],
+                ..Default::default()
+            }],
+        )
+        .unwrap();
+        assert!(mids(id).contains(&"a.rar.2.gone@x".to_string()));
+        let n: i64 = conn.query_row("select count(*) from releases", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 1, "a gone row isnt made again");
+    }
     #[test]
     fn file_timing_folds_each_save() {
         let dir = tempfile::tempdir().unwrap();
@@ -4147,6 +4995,161 @@ mod tests {
         let indexed: i64 =
             conn.query_row("select count(*) from release_ids where file_id = ?", [id], |r| r.get(0)).unwrap();
         assert_eq!(indexed, rows + 3, "every row, and the blob's 3 ids");
+    }
+
+    /// one pruning step on an idle writer, whenever it last stepped
+    fn prune_step(writer: &mut ShardWriter, conn: &mut Connection, now: i64) -> usize {
+        writer.ids_step = None;
+        writer.prune_ids_some(conn, now, true, false).unwrap()
+    }
+
+    /// the same right after a save
+    fn prune_step_busy(writer: &mut ShardWriter, conn: &mut Connection, now: i64) -> usize {
+        writer.ids_step = None;
+        writer.prune_ids_some(conn, now, false, false).unwrap()
+    }
+
+    /// A release none of whose files was touched for SEAL_AGE loses its index;
+    /// the next save to it indexes it again, and copies across its files are
+    /// still found.
+    #[test]
+    fn quiet_releases_lose_their_index_and_get_it_back_when_saved_to() {
+        let (_dir, main) = sealed_fixture();
+        let shard = shard_path(&main, shard_of("alt.binaries.t"));
+        let mut conn = db::open_at(&shard).unwrap();
+        let count =
+            |c: &Connection| -> i64 { c.query_row("select count(*) from release_ids", [], |r| r.get(0)).unwrap() };
+        let before = count(&conn);
+        assert!(before > 0, "the fixture's two files are indexed");
+        let now = chrono::Utc::now().timestamp();
+        let mut writer = ShardWriter::new(shard_of("alt.binaries.t"));
+        assert_eq!(prune_step(&mut writer, &mut conn, now), 0, "touched just now");
+        assert_eq!(count(&conn), before);
+
+        let rest = writer.ids.rest_until - now;
+        assert!(
+            (SEAL_AGE - 600..=SEAL_AGE).contains(&rest),
+            "the end: it rests till the release kept could be quiet ({rest})"
+        );
+        conn.execute("update files set touched_at = ?", [now - SEAL_AGE - 1]).unwrap();
+        writer.ids.rest_until = 0;
+        assert_eq!(prune_step(&mut writer, &mut conn, now), 0, "indexed just now");
+        conn.execute("update release_indexed set at = ?", [now - SEAL_AGE - 1]).unwrap();
+        writer.ids.rest_until = now + 1;
+        assert_eq!(prune_step(&mut writer, &mut conn, now), 0, "resting");
+        writer.ids.rest_until = 0;
+        let mut taken = 0;
+        while writer.ids.rest_until == 0 {
+            taken += prune_step(&mut writer, &mut conn, now) as i64;
+        }
+        assert_eq!(taken, before, "every row, its own too");
+        assert_eq!(count(&conn), 0);
+        assert_eq!(writer.ids.rest_until, now + SEAL_AGE, "nothing kept: whatever comes next is new");
+
+        save(&main, &[one_file_release("c.rar", &["<a1@x>", "<b1@x>"])]).unwrap();
+        let files: i64 = conn.query_row("select count(*) from files", [], |r| r.get(0)).unwrap();
+        assert_eq!(files, 2, "no c.rar: all of it was in a.rar and b.rar");
+        assert_eq!(count(&conn), before, "indexed again in full");
+
+        // all copies: no file was touched, but the index is new, soo it stays
+        writer.ids.rest_until = 0;
+        while writer.ids.rest_until == 0 {
+            prune_step(&mut writer, &mut conn, now);
+        }
+        assert_eq!(count(&conn), before, "indexed again just now: not quiet");
+    }
+
+    /// A release down to one file loses its index whatever its age: saves dont keep a one-file release's index up.
+    #[test]
+    fn a_one_file_release_loses_its_index_however_new() {
+        let (_dir, main) = sealed_fixture();
+        let shard = shard_path(&main, shard_of("alt.binaries.t"));
+        let mut conn = db::open_at(&shard).unwrap();
+        conn.execute("delete from files where filename = 'b.rar'", []).unwrap();
+        let count =
+            |c: &Connection| -> i64 { c.query_row("select count(*) from release_ids", [], |r| r.get(0)).unwrap() };
+        assert!(count(&conn) > 0);
+        let now = chrono::Utc::now().timestamp();
+        let mut writer = ShardWriter::new(shard_of("alt.binaries.t"));
+        while writer.ids.rest_until == 0 {
+            prune_step(&mut writer, &mut conn, now);
+        }
+        assert_eq!(count(&conn), 0, "touched just now, but one file");
+        let stamps: i64 = conn.query_row("select count(*) from release_indexed", [], |r| r.get(0)).unwrap();
+        assert_eq!(stamps, 0, "its stamp too");
+    }
+
+    /// A step that finds the write lock held elsewhere lets it go, counts nothing taken, and rests a while.
+    #[test]
+    fn a_pruning_step_lets_go_of_a_held_lock_and_rests() {
+        let (_dir, main) = sealed_fixture();
+        let shard = shard_path(&main, shard_of("alt.binaries.t"));
+        let mut conn = db::open_at(&shard).unwrap();
+        let now = chrono::Utc::now().timestamp();
+        conn.execute("update files set touched_at = ?", [now - SEAL_AGE - 1]).unwrap();
+        conn.execute("update release_indexed set at = ?", [now - SEAL_AGE - 1]).unwrap();
+        let before: i64 = conn.query_row("select count(*) from release_ids", [], |r| r.get(0)).unwrap();
+        let other = db::open_at(&shard).unwrap();
+        other.execute_batch("begin immediate").unwrap();
+        let mut writer = ShardWriter::new(shard_of("alt.binaries.t"));
+        assert_eq!(prune_step_busy(&mut writer, &mut conn, now), 0, "the lock is held");
+        assert_eq!(writer.ids.rest_until, now + PRUNE_IDS_BUSY_REST);
+        other.execute_batch("rollback").unwrap();
+        let after: i64 = conn.query_row("select count(*) from release_ids", [], |r| r.get(0)).unwrap();
+        assert_eq!(after, before);
+        writer.ids.rest_until = 0;
+        assert_eq!(prune_step(&mut writer, &mut conn, now) as i64, before, "free again: all of it");
+    }
+
+    /// A big release goes a chunk at a time, its own row first; a save that
+    /// indexes it again in between stops the rest going.
+    #[test]
+    fn pruning_a_big_index_stops_when_a_save_indexes_it_again() {
+        let (_dir, main) = sealed_fixture();
+        let shard = shard_path(&main, shard_of("alt.binaries.t"));
+        let mut conn = db::open_at(&shard).unwrap();
+        let (release_id, file_id): (i64, i64) = conn
+            .query_row("select release_id, id from files where filename = 'a.rar'", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        let extra = PRUNE_IDS_CHUNK_IDLE * 2 + 7;
+        conn.execute(
+            "with recursive n(i) as (select 1 union all select i + 1 from n where i < ?)
+             insert or ignore into release_ids select ?, 1000000 + i, ? from n",
+            params![extra, release_id, file_id],
+        )
+        .unwrap();
+        let count = |c: &Connection| -> i64 {
+            c.query_row("select count(*) from release_ids where release_id = ?", [release_id], |r| r.get(0)).unwrap()
+        };
+        let marked = |c: &Connection| -> bool {
+            c.query_row("select count(*) from release_ids where release_id = ? and id_hash = 0", [release_id], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap()
+                > 0
+        };
+        let all = count(&conn);
+        let now = chrono::Utc::now().timestamp();
+
+        // a save in between touched it and indexed it again: the rest stays
+        let mut writer = ShardWriter::new(shard_of("alt.binaries.t"));
+        writer.ids.pruning = Some(release_id);
+        assert_eq!(prune_step(&mut writer, &mut conn, now), 0, "kept up again: nothing goes");
+        assert_eq!(count(&conn), all);
+        assert_eq!(writer.ids.pruning, None);
+
+        conn.execute("update files set touched_at = ?", [now - SEAL_AGE - 1]).unwrap();
+        conn.execute("update release_indexed set at = ?", [now - SEAL_AGE - 1]).unwrap();
+
+        let mut writer = ShardWriter::new(shard_of("alt.binaries.t"));
+        let mut taken = 0;
+        while writer.ids.rest_until == 0 {
+            taken += prune_step_busy(&mut writer, &mut conn, now) as i64;
+            assert!(!marked(&conn), "its own row goes first");
+        }
+        assert_eq!(taken, all);
+        assert_eq!(count(&conn), 0);
+        assert_eq!(writer.ids.pruning, None);
     }
 
     /// release Rel with one file `name` of the given message-ids

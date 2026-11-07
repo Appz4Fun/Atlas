@@ -94,11 +94,24 @@ pub const RELEASE_KEYS: ShardTable = ShardTable {
             "release_keys_thread",
             "create index if not exists release_keys_thread on release_keys(thread) where thread is not null",
         ),
+        (
+            "release_keys_subs",
+            "create index if not exists release_keys_subs on release_keys(subs) where subs is not null",
+        ),
+        (
+            "release_keys_fonts",
+            "create index if not exists release_keys_fonts on release_keys(fonts) where fonts is not null",
+        ),
+        (
+            "release_keys_chapters",
+            "create index if not exists release_keys_chapters on release_keys(chapters) where chapters is not null",
+        ),
     ],
     release_key: Some("release_id"),
     // `video`: the first keyframe's key, from the probe's `keyframe_key`; `audio`: the first audio track's
     // `stream_key`
     // `mux`: SegmentUID and DateUTC; `encode`: the encoder's settings and the length; `thread`: the thread's root id
+    // `subs`: the subtitle tracks' header keys; `fonts`: the attached fonts; `chapters`: the chapter start times
     added: &[
         ("file_crc", "INTEGER"),
         ("body_crc", "INTEGER"),
@@ -107,12 +120,16 @@ pub const RELEASE_KEYS: ShardTable = ShardTable {
         ("mux", "INTEGER"),
         ("encode", "INTEGER"),
         ("thread", "INTEGER"),
+        ("subs", "INTEGER"),
+        ("fonts", "INTEGER"),
+        ("chapters", "INTEGER"),
     ],
 };
 
 const UPSERT: &str = "insert or replace into release_keys
-    (release_id, account, host, layout, lines, file_crc, body_crc, video, audio, mux, encode, thread)
-    values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)";
+    (release_id, account, host, layout, lines, file_crc, body_crc, video, audio, mux, encode, thread, subs, fonts,
+     chapters)
+    values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)";
 const DELETE: &str = "delete from release_keys where release_id = ?1";
 
 pub const KEYS_STEP: StepId = StepId(40);
@@ -152,10 +169,16 @@ pub enum Kind {
     Zone,
     /// the same sound by audio fingerprint (`probe::audio_print`), kept only for releases nothing else ties
     AudioPrint,
+    /// the same subtitle tracks, by their headers (an ASS script's styles, a VobSub's palette)
+    Subs,
+    /// the same fonts attached, by name and size
+    Fonts,
+    /// the same chapter times
+    Chapters,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 18] = [
+    pub const ALL: [Kind; 21] = [
         Kind::Account,
         Kind::Host,
         Kind::Layout,
@@ -174,6 +197,9 @@ impl Kind {
         Kind::Owner,
         Kind::Zone,
         Kind::AudioPrint,
+        Kind::Subs,
+        Kind::Fonts,
+        Kind::Chapters,
     ];
 
     /// The word in `/ui/same?kind=`.
@@ -197,6 +223,9 @@ impl Kind {
             Kind::Owner => "owner",
             Kind::Zone => "zone",
             Kind::AudioPrint => "audioprint",
+            Kind::Subs => "subs",
+            Kind::Fonts => "fonts",
+            Kind::Chapters => "chapters",
         }
     }
 
@@ -225,6 +254,9 @@ impl Kind {
             Kind::Owner => "Same Unix owner in the archive",
             Kind::Zone => "Same packer settings and clock zone",
             Kind::AudioPrint => "Same sound, by audio fingerprint",
+            Kind::Subs => "Same subtitle headers",
+            Kind::Fonts => "Same attached fonts",
+            Kind::Chapters => "Same chapter times",
         }
     }
 
@@ -283,6 +315,15 @@ impl Kind {
             Kind::AudioPrint => {
                 "The same sound a quarter, half and three quarters of the way in, as Chromaprint hears it: often the same film or episode in another encode, codec or container. Taken only for releases no other key ties to another, from AAC, FLAC, MP3, MP2, Vorbis and PCM tracks in Matroska. A theme tune or a recap can match across episodes, soo check the names."
             }
+            Kind::Subs => {
+                "The same subtitle tracks by their own headers: an ASS script's info and styles (Aegisub's saved state left out) or a VobSub's size and palette. The same subtitles muxed again, as a rule, often by the same group or from the same source; a stock template or the default DVD palette is shared by many, soo check the names."
+            }
+            Kind::Fonts => {
+                "The same set of fonts attached, by file name and size: typesetting a group ships with its subtitles, soo the same release or the same group's work. A series shares one set across its episodes."
+            }
+            Kind::Chapters => {
+                "The same chapter start times, to the millisecond, three or more of them and not evenly spaced: chapters cut from the same disc or by the same hand. Episodes of one series rarely share them; another encode of the same disc often does."
+            }
         }
     }
 
@@ -299,6 +340,9 @@ impl Kind {
             Kind::Mux => Some("mux"),
             Kind::Encode => Some("encode"),
             Kind::Thread => Some("thread"),
+            Kind::Subs => Some("subs"),
+            Kind::Fonts => Some("fonts"),
+            Kind::Chapters => Some("chapters"),
             Kind::Par2 | Kind::MovieHash | Kind::FileCrc | Kind::InnerFile => None,
             Kind::ArchiveTwin | Kind::Owner | Kind::Zone | Kind::AudioPrint => None,
         }
@@ -329,6 +373,9 @@ pub struct Keys {
     pub mux: Option<i64>,
     pub encode: Option<i64>,
     pub thread: Option<i64>,
+    pub subs: Option<i64>,
+    pub fonts: Option<i64>,
+    pub chapters: Option<i64>,
 }
 
 impl Keys {
@@ -348,6 +395,9 @@ impl Keys {
             Kind::Mux => self.mux,
             Kind::Encode => self.encode,
             Kind::Thread => self.thread,
+            Kind::Subs => self.subs,
+            Kind::Fonts => self.fonts,
+            Kind::Chapters => self.chapters,
             _ => None,
         }
     }
@@ -576,6 +626,76 @@ pub(crate) fn encode_text(media: &crate::probe::media::MediaInfo) -> Option<Stri
     Some(format!("encode:{}:{options}:{secs}", media.encoder.as_deref().unwrap_or("")))
 }
 
+/// What the subtitle key is taken over: every subtitle track's header key (`media::subtitle_header_key`), in track
+/// order. None when no track has one.
+pub(crate) fn subs_text(media: &crate::probe::media::MediaInfo) -> Option<String> {
+    let keys: Vec<&str> = media.subtitles.iter().filter_map(|t| t.header_key.as_deref()).collect();
+    (!keys.is_empty()).then(|| format!("subs:{}", keys.join(",")))
+}
+
+/// Fewer attached fonts than this make no font key: one stock font is in thousands of unrelated files.
+const MIN_FONTS: usize = 2;
+
+/// Whether an attachment is a font, by its MIME type or its name.
+fn is_font(a: &crate::probe::media::Attachment) -> bool {
+    let mime = a.mime.as_deref().unwrap_or("").to_ascii_lowercase();
+    let name = a.name.to_ascii_lowercase();
+    mime.contains("font")
+        || mime.contains("truetype")
+        || mime.contains("opentype")
+        || [".ttf", ".otf", ".ttc", ".otc", ".woff", ".woff2"].iter().any(|e| name.ends_with(e))
+}
+
+/// What the font key is taken over: every attached font's name (lower case) and size, sorted. None for fewer than
+/// `MIN_FONTS`, or when the file's header wasn't read to its end, soo the list may be cut short.
+pub(crate) fn fonts_text(media: &crate::probe::media::MediaInfo) -> Option<String> {
+    if !media.header_complete {
+        return None;
+    }
+    let mut fonts: Vec<String> = media
+        .attachments
+        .iter()
+        .filter(|a| is_font(a))
+        .map(|a| format!("{}:{}", a.name.to_ascii_lowercase(), a.size))
+        .collect();
+    fonts.sort_unstable();
+    fonts.dedup();
+    (fonts.len() >= MIN_FONTS).then(|| format!("fonts:{}", fonts.join(",")))
+}
+
+/// Fewer chapters than this make no chapter key: a start and an end credits mark are in every other film.
+const MIN_CHAPTERS: usize = 3;
+
+/// What the chapter key is taken over: each chapter's start in milliseconds, in order. None for fewer than
+/// `MIN_CHAPTERS`, or when every gap between them is the same to the second: chapters made every few minutes by a
+/// tool, which every file of that length gets.
+pub(crate) fn chapters_text(media: &crate::probe::media::MediaInfo) -> Option<String> {
+    let starts: Vec<i64> = media
+        .chapters
+        .iter()
+        .map(|c| c.start_secs)
+        .filter(|s| s.is_finite() && *s >= 0.0)
+        .map(|s| (s * 1000.0).round() as i64)
+        .collect();
+    if starts.len() < MIN_CHAPTERS || starts.len() != media.chapters.len() {
+        return None;
+    }
+    let gaps: Vec<i64> = starts.windows(2).map(|w| w[1] - w[0]).collect();
+    let (lo, hi) = (gaps.iter().min()?, gaps.iter().max()?);
+    // two chapters at one time are an edition's leftovers, not a cut
+    if *lo <= 0 {
+        return None;
+    }
+    // the last chapter can be cut short by the film's end: even spacing is judged without it
+    let inner = &gaps[..gaps.len() - 1];
+    let even = |g: &[i64]| g.iter().max().zip(g.iter().min()).is_some_and(|(a, b)| a - b <= 1_000);
+    if hi - lo <= 1_000 || (inner.len() >= 2 && even(inner)) {
+        return None;
+    }
+    let list: Vec<String> = starts.iter().map(i64::to_string).collect();
+    Some(format!("chapters:{}", list.join(",")))
+}
+
 /// The keys over what a release has: its probe and its `file_timing` rows.
 pub fn keys_of(
     probe: Option<&ProbeInfo>,
@@ -599,6 +719,9 @@ pub fn keys_of(
         keys.encode = p.media.as_ref().and_then(encode_text).map(|t| as_key(digest8(t.as_bytes())));
         keys.thread =
             crate::probe::thread_root(&p.headers).map(|id| as_key(digest8(format!("thread:{id}").as_bytes())));
+        keys.subs = p.media.as_ref().and_then(subs_text).map(|t| as_key(digest8(t.as_bytes())));
+        keys.fonts = p.media.as_ref().and_then(fonts_text).map(|t| as_key(digest8(t.as_bytes())));
+        keys.chapters = p.media.as_ref().and_then(chapters_text).map(|t| as_key(digest8(t.as_bytes())));
     }
     keys.lines = lines_text(timing, parts).map(|t| as_key(digest8(t.as_bytes())));
     keys
@@ -997,8 +1120,8 @@ pub fn par2_sets(shard: &Connection, release_id: i64) -> rusqlite::Result<Vec<Ve
 fn stored(shard: &Connection, release_id: i64) -> rusqlite::Result<Option<Keys>> {
     shard
         .prepare_cached(
-            "select account, host, layout, lines, file_crc, body_crc, video, audio, mux, encode, thread
-             from release_keys where release_id = ?1",
+            "select account, host, layout, lines, file_crc, body_crc, video, audio, mux, encode, thread, subs, fonts,
+             chapters from release_keys where release_id = ?1",
         )?
         .query_row([release_id], |r| {
             Ok(Keys {
@@ -1013,6 +1136,9 @@ fn stored(shard: &Connection, release_id: i64) -> rusqlite::Result<Option<Keys>>
                 mux: r.get(8)?,
                 encode: r.get(9)?,
                 thread: r.get(10)?,
+                subs: r.get(11)?,
+                fonts: r.get(12)?,
+                chapters: r.get(13)?,
             })
         })
         .optional()
@@ -1282,8 +1408,9 @@ impl Step for KeysStep {
     }
     /// Bit 1: the file and first-article keys, soo every release already keyed is keyed again: the file key comes
     /// from probes made long before it. Bit 2: the mux, encode and thread keys, and file CRCs folded from articles.
+    /// Bit 4: the subtitle header, font and chapter keys.
     fn config_stamp(&self) -> u64 {
-        1 | 2
+        1 | 2 | 4
     }
     fn run(&self, ctx: &mut StepCtx<'_>) -> Result<Outcome, StepError> {
         let retry = |e: rusqlite::Error| StepError::Retry(e.to_string());
@@ -1311,6 +1438,9 @@ impl Step for KeysStep {
                     keys.mux.into(),
                     keys.encode.into(),
                     keys.thread.into(),
+                    keys.subs.into(),
+                    keys.fonts.into(),
+                    keys.chapters.into(),
                 ],
             )],
         };
@@ -1321,6 +1451,37 @@ impl Step for KeysStep {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subtitle_font_and_chapter_keys_need_enough_to_tell_releases_apart() {
+        use crate::probe::media::{Attachment, Chapter, MediaInfo, SubtitleTrack};
+        let mut m = MediaInfo { header_complete: true, ..Default::default() };
+        assert_eq!((subs_text(&m), fonts_text(&m), chapters_text(&m)), (None, None, None));
+        m.subtitles = vec![
+            SubtitleTrack { codec: "S_TEXT/UTF8".into(), ..Default::default() },
+            SubtitleTrack { codec: "S_TEXT/ASS".into(), header_key: Some("00aa".into()), ..Default::default() },
+        ];
+        assert_eq!(subs_text(&m).as_deref(), Some("subs:00aa"));
+        let font = |name: &str, size| Attachment { name: name.into(), size, ..Default::default() };
+        m.attachments = vec![font("A.ttf", 10), font("cover.jpg", 99)];
+        assert_eq!(fonts_text(&m), None, "one font is everyone's");
+        m.attachments.push(Attachment { mime: Some("application/x-font-otf".into()), ..font("b", 20) });
+        assert_eq!(fonts_text(&m).as_deref(), Some("fonts:a.ttf:10,b:20"));
+        m.attachments.reverse();
+        assert_eq!(fonts_text(&m).as_deref(), Some("fonts:a.ttf:10,b:20"), "in any order");
+        m.header_complete = false;
+        assert_eq!(fonts_text(&m), None, "a header cut short may list only some");
+        let at = |secs: &[f64]| secs.iter().map(|s| Chapter { start_secs: *s, name: None }).collect::<Vec<_>>();
+        m.chapters = at(&[0.0, 312.5]);
+        assert_eq!(chapters_text(&m), None);
+        m.chapters = at(&[0.0, 300.0, 600.0, 900.0, 1000.0]);
+        assert_eq!(chapters_text(&m), None, "every five minutes, the last cut short by the end");
+        m.chapters = at(&[0.0, 92.342, 1301.1, 2544.0]);
+        assert_eq!(chapters_text(&m).as_deref(), Some("chapters:0,92342,1301100,2544000"));
+        assert_eq!(chapters_text(&MediaInfo { chapters: at(&[0.0, 0.0, 1301.1]), ..Default::default() }), None);
+        m.chapters.push(Chapter { start_secs: f64::NAN, name: None });
+        assert_eq!(chapters_text(&m), None, "a start not read leaves the list unknown");
+    }
 
     #[test]
     fn digests_print_as_the_pages_always_printed_them() {

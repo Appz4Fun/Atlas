@@ -17,6 +17,7 @@ path = "src/main.rs"
 anyhow = "1"
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+num-bigint = "0.4"
 flate2 = "1"
 getrandom = "0.3"
 indexmap = "2"
@@ -30,6 +31,8 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rustyline = "18"
 # audio fingerprints (`audio`): Chromaprint in pure Rust, and the decoders for the codecs it covers
 rusty-chromaprint = "0.3"
+# AC-3 and E-AC-3, clean-room from ATSC A/52, no unsafe; external, behind the `ac3` feature
+filmcraft-ac3 = { version = "0.9", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 sha1 = "0.10"
@@ -68,6 +71,11 @@ keyring = { version = "3.6", features = ["windows-native"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 keyring = { version = "3.6", features = ["async-secret-service", "async-io", "crypto-rust"] }
+
+[features]
+# AC-3 and E-AC-3 audio prints through the external `filmcraft-ac3` crate; `just build-no-ac3` leaves it out
+default = ["ac3"]
+ac3 = ["dep:filmcraft-ac3"]
 
 [dev-dependencies]
 tempfile = "3"

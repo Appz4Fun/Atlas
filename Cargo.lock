@@ -223,6 +223,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "fancy-regex 0.17.0",
+ "filmcraft-ac3",
  "flate2",
  "getrandom 0.3.4",
  "hmac 0.12.1",
@@ -231,6 +232,7 @@ dependencies = [
  "lzma-rs",
  "md-5 0.10.6",
  "nntmux-yenc",
+ "num-bigint",
  "par-rs",
  "postgres",
  "quick-xml",
@@ -1132,6 +1134,15 @@ dependencies = [
  "libc",
  "thiserror 1.0.69",
  "winapi",
+]
+
+[[package]]
+name = "filmcraft-ac3"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6d17e68e57e0039be2264551c24f22b622079e43c4ec6d736626348220e98b79"
+dependencies = [
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -2330,7 +2341,7 @@ dependencies = [
 [[package]]
 name = "par-rs"
 version = "0.2.0"
-source = "git+https://github.com/xbmc4lyfe/par-rs?branch=main#56dcf7a3908cd408637e126dd18634f37f35ee3f"
+source = "git+https://github.com/xbmc4lyfe/par-rs?branch=main#7e93ac5e38029426cc5e4b9bd9a445a118e6b156"
 dependencies = [
  "crc32fast",
  "md-5 0.10.6",

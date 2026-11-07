@@ -276,19 +276,30 @@ fn contents_of(conn: &Connection, ids: &[i64], recovery: &[i64], with_bytes: Byt
     };
     let mut bytes: HashMap<String, i64> = HashMap::new();
     if read_bytes {
-        // rows sharing parts (`UnionFiles::overlap`) hold some parts more than once: each part's bytes count once
+        // rows sharing parts (`UnionFiles::overlap`) hold some parts more than once: each part's bytes count once,
+        // article by article. Otherwise each file's blob count and a sum of its rows (`blob_bytes`): no article is
+        // read. A shard the indexer hasn't given the column yet (a web process started first) is walked as before
         let mut counted: HashSet<(Option<String>, i64)> = HashSet::new();
         for id in ids {
-            store::each_article(conn, *id, &mut |article| {
-                if union.overlap
-                    && let Some(part) = article.part
-                    && !counted.insert((article.filename.clone(), part))
-                {
-                    return Ok(());
+            let fast = if union.overlap { None } else { Some(crate::blob_bytes::of_release(conn, *id)) };
+            match fast {
+                Some(Ok(files)) => {
+                    for (filename, b) in files {
+                        *bytes.entry(filename).or_default() += b;
+                    }
                 }
-                *bytes.entry(article.filename.unwrap_or_default()).or_default() += article.bytes.unwrap_or(0);
-                Ok(())
-            })?;
+                Some(Err(e)) if !e.to_string().contains("no such column") => return Err(e),
+                _ => store::each_article(conn, *id, &mut |article| {
+                    if union.overlap
+                        && let Some(part) = article.part
+                        && !counted.insert((article.filename.clone(), part))
+                    {
+                        return Ok(());
+                    }
+                    *bytes.entry(article.filename.unwrap_or_default()).or_default() += article.bytes.unwrap_or(0);
+                    Ok(())
+                })?,
+            }
         }
     }
     for file in &mut totals.list {
@@ -316,6 +327,38 @@ fn contents_of(conn: &Connection, ids: &[i64], recovery: &[i64], with_bytes: Byt
         }
     }
     Ok(totals)
+}
+
+/// Whether a release misses data that its recovery volumes can rebuild: whole once a client repairs it, as NZBGet and
+/// SABnzbd do on their own. Goes by the article counts and, once read, the PAR2 set's blocks; else by the bytes its
+/// files keep counted (`blob_bytes`). A file whose sealed blob isn't counted yet leaves the bytes unknown, and the
+/// answer no: a list of results doesn't wait on the sealed log. Data missing whole files isn't counted as missing
+/// (`Contents::repairable`), soo a post whose counter says a file is missing gets no too.
+pub fn repair_needed(conn: &Connection, id: i64) -> Result<bool> {
+    let mut c = contents_of(conn, &[id], &[], Bytes::None)?;
+    if c.data_articles_seen >= c.data_articles_expected || c.recovery_articles_seen == 0 {
+        return Ok(false);
+    }
+    // a file that never turned up isn't in the counts: what's there could cover the gaps it can see, and not it
+    if !union_files(conn, &[id])?.every_file_here() {
+        return Ok(false);
+    }
+    if verdict_needs_bytes(&c) {
+        let Some(bytes) = crate::blob_bytes::counted_of_release(conn, id)? else { return Ok(false) };
+        for (filename, size) in bytes {
+            if is_recovery_volume(&filename) {
+                c.recovery_bytes += size;
+            } else if !is_par2(&filename) {
+                c.data_bytes += size;
+            }
+        }
+    }
+    Ok(c.repairable())
+}
+
+/// The ones of `ids` that need a repair to be whole (`repair_needed`).
+pub fn repair_needed_of(conn: &Connection, ids: &[i64]) -> HashSet<i64> {
+    ids.iter().copied().filter(|id| repair_needed(conn, *id).unwrap_or(false)).collect()
 }
 
 /// A row that holds nothing but PAR2 data. A fully obfuscated upload posts every file under its own random subject and
@@ -1413,14 +1456,19 @@ impl UnionFiles {
     /// are one video named as the post beside side files (`store::one_video_named`): the counter can count a
     /// `thumbnail.jpg` that came as a row of its own.
     fn complete(&self) -> bool {
+        !self.files.is_empty()
+            && self.files.values().all(|f| f.expected.is_some_and(|want| store::is_exactly(&f.seen, want)))
+            && self.every_file_here()
+    }
+
+    /// Whether every file the post's counter says it has is here, whole or not (`complete` also wants them whole).
+    fn every_file_here(&self) -> bool {
         if self.file_totals.len() > 1 {
             return false;
         }
         let total = self.file_totals.iter().copied().flatten().next_back();
-        !self.files.is_empty()
-            && self.files.values().all(|f| f.expected.is_some_and(|want| store::is_exactly(&f.seen, want)))
-            && (total.is_none_or(|total| self.files.len() as i64 == total + i64::from(self.zero_indexed))
-                || store::one_video_named(self.names.iter().map(String::as_str), self.files.keys().map(String::as_str)))
+        total.is_none_or(|total| self.files.len() as i64 == total + i64::from(self.zero_indexed))
+            || store::one_video_named(self.names.iter().map(String::as_str), self.files.keys().map(String::as_str))
     }
 }
 
@@ -2203,6 +2251,59 @@ mod tests {
         // and where they do, the verdict changes with them, which is why they're read
         let sized = Contents { data_bytes: 90_000, recovery_bytes: 20_000, ..half.clone() };
         assert!(sized.repairable() && !half.repairable());
+    }
+
+    #[test]
+    fn a_release_missing_what_its_recovery_volumes_rebuild_needs_a_repair() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        db::create_db_at(&main).unwrap();
+        let group = "alt.binaries.a";
+        // 9 of a video's 10 parts, and `recovery` parts of a recovery volume: each article 1,000 bytes
+        let release = |name: &str, recovery: i64| -> i64 {
+            let article = |file: &str, part: i64, of: i64| crate::parser::Article {
+                message_id: format!("<{name}.{file}.{part}@x>"),
+                subject: format!("{name} \"{file}\" yEnc ({part}/{of})"),
+                author: "p <p@x>".into(),
+                filename: Some(file.into()),
+                part: Some(part),
+                total_parts: Some(of),
+                bytes: 1_000,
+                ..Default::default()
+            };
+            let video = format!("{name}.mkv");
+            let volume = format!("{name}.vol00+05.par2");
+            let mut articles: Vec<_> = (1..=9).map(|p| article(&video, p, 10)).collect();
+            articles.extend((1..=recovery).map(|p| article(&volume, p, 5)));
+            let r = crate::parser::Release { name: name.into(), group: group.into(), articles, ..Default::default() };
+            store::save(&main, &[r]).unwrap();
+            let shard = db::open_shard(&store::shard_path(&main, store::shard_of(group))).unwrap();
+            shard.query_row("select id from releases where name = ?1", [name], |r| r.get(0)).unwrap()
+        };
+        let enough = release("Film.A.2020.1080p-X", 2);
+        let short = release("Film.B.2020.1080p-X", 0);
+        let conn = db::open_with_shards(&main).unwrap();
+        assert!(repair_needed(&conn, enough).unwrap(), "1 part missing, 2 parts of recovery");
+        assert!(!repair_needed(&conn, short).unwrap(), "no recovery there");
+        assert_eq!(repair_needed_of(&conn, &[enough, short]), HashSet::from([enough]));
+        // the counter says a third file that never turned up (a RAR volume): the volumes can't be known to cover it.
+        // One video named as the release would be all of it (`store::one_video_named`)
+        let s = store::shard_of(group);
+        conn.execute(
+            &format!(
+                "update s{s}.files set file_total = 3,
+                        filename = replace(filename, '.mkv', '.part1.rar') where release_id = ?1"
+            ),
+            [enough],
+        )
+        .unwrap();
+        assert!(!repair_needed(&conn, enough).unwrap(), "a whole file missing");
+        conn.execute(&format!("update s{s}.files set file_total = 2 where release_id = ?1"), [enough]).unwrap();
+        assert!(repair_needed(&conn, enough).unwrap(), "both files the counter says");
+        // a sealed blob not counted yet: the bytes aren't known without the sealed log, soo no
+        conn.execute(&format!("update s{s}.files set blob = x'00', blob_bytes = null where release_id = ?1"), [enough])
+            .unwrap();
+        assert!(!repair_needed(&conn, enough).unwrap());
     }
 
     #[test]

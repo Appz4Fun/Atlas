@@ -2239,6 +2239,18 @@ fn keys_panel(i: &MetaInputs<'_>, l: &Looked, compact: bool) -> Facts {
         media.and_then(crate::keys::encode_text).map(|t| with_link(key16(t.as_bytes()), Kind::Encode)),
     );
     f.add_html(
+        "Subtitle header key",
+        media.and_then(crate::keys::subs_text).map(|t| with_link(key16(t.as_bytes()), Kind::Subs)),
+    );
+    f.add_html(
+        "Font set key",
+        media.and_then(crate::keys::fonts_text).map(|t| with_link(key16(t.as_bytes()), Kind::Fonts)),
+    );
+    f.add_html(
+        "Chapter times key",
+        media.and_then(crate::keys::chapters_text).map(|t| with_link(key16(t.as_bytes()), Kind::Chapters)),
+    );
+    f.add_html(
         "Thread key",
         i.probe
             .and_then(|p| crate::probe::thread_root(&p.headers))
