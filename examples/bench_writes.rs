@@ -9,7 +9,8 @@
 //! `--slice-size N` headers per slice, `--groups N` groups the slices rotate
 //! over, `--per-release N` articles per release, `--checkpoints` checkpoint the
 //! way the indexer does (with ATLAS_HOME set to the copy's folder, the copy named
-//! atlas.db). Prints headers saved per second.
+//! atlas.db). Prints headers saved per second, and on Linux the bytes written
+//! (`/proc/self/io` wchar) next to how much the database files grew by.
 
 use std::time::Instant;
 
@@ -85,11 +86,13 @@ fn main() {
         }
     }
     let ids = store::Ids::new(main);
-    let mut shards: Vec<(rusqlite::Connection, store::ShardWriter)> = (0..store::SHARDS)
+    let mut shards: Vec<(rusqlite::Connection, store::ShardWriter, db::Checkpoints)> = (0..store::SHARDS)
         .map(|i| {
             let conn = db::open_at(&store::shard_path(main, i)).unwrap();
             db::tune_for_writing(&conn).unwrap();
-            (conn, store::ShardWriter::new(i))
+            // as the indexer's writers do
+            conn.execute_batch("pragma main.synchronous = full").unwrap();
+            (conn, store::ShardWriter::new(i), db::Checkpoints::for_writer())
         })
         .collect();
 
@@ -109,15 +112,16 @@ fn main() {
     let checkpointer = checkpoints.then(|| db::checkpointer(stop.clone()));
 
     // one writer, going shard by shard; the indexer runs one per shard in parallel
+    let (written_before, size_before) = (bytes_written(), files_size(main));
     let started = Instant::now();
     for chunk in work.chunks(batch) {
-        for (shard, (conn, writer)) in shards.iter_mut().enumerate() {
+        for (shard, (conn, writer, due)) in shards.iter_mut().enumerate() {
             let mine: Vec<&[Release]> =
                 chunk.iter().filter(|s| store::shard_of(&s[0].group) == shard).map(Vec::as_slice).collect();
             if !mine.is_empty() {
                 writer.save(conn, &ids, mine).unwrap();
                 if checkpoints {
-                    db::finish_checkpoint(conn).unwrap();
+                    due.checkpoint_if_due(conn).unwrap();
                 }
             }
         }
@@ -129,4 +133,29 @@ fn main() {
     let secs = started.elapsed().as_secs_f64();
     let headers = slices as f64 * size as f64;
     println!("{slices} slices x {size} headers, {batch} per transaction: {secs:.1}s, {:.0} headers/s", headers / secs);
+    if let (Some(before), Some(after)) = (written_before, bytes_written()) {
+        let grew = files_size(main).saturating_sub(size_before);
+        let mib = |b: u64| b as f64 / (1 << 20) as f64;
+        println!(
+            "wrote {:.0} MiB, the files grew {:.0} MiB, {:.0} bytes written per header",
+            mib(after - before),
+            mib(grew),
+            (after - before) as f64 / headers
+        );
+    }
+}
+
+/// Bytes this process has written, from `/proc/self/io` (Linux only).
+fn bytes_written() -> Option<u64> {
+    let io = std::fs::read_to_string("/proc/self/io").ok()?;
+    io.lines().find_map(|l| l.strip_prefix("wchar: ")).and_then(|v| v.trim().parse().ok())
+}
+
+/// The main database's and its shards' files, without their WALs.
+fn files_size(main: &std::path::Path) -> u64 {
+    std::iter::once(main.to_path_buf())
+        .chain(store::shard_paths(main))
+        .filter_map(|p| std::fs::metadata(p).ok())
+        .map(|m| m.len())
+        .sum()
 }

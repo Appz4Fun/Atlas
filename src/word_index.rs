@@ -941,6 +941,11 @@ fn keep_up(index: &WordIndex, main: &Path) {
     loop {
         let begun = index.begin();
         let step = crate::db::open_with_shards(main).map_err(anyhow::Error::from).and_then(|conn| {
+            // its commits to the shards dont copy their WALs each time (see the constant)
+            conn.execute_batch(&format!(
+                "pragma wal_autocheckpoint = {}",
+                crate::db::OCCASIONAL_WRITER_AUTOCHECKPOINT
+            ))?;
             if index.ready() && !index.built_from(&conn)? {
                 // the database was wiped and started again: what's in the index belongs to the old one
                 index.ready.store(false, Ordering::Release);

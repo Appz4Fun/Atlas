@@ -170,7 +170,9 @@ fn set_up(conn: Connection) -> Result<Connection> {
     // releases before their articles and old dbs can hold orphans.
     conn.execute_batch("pragma foreign_keys = off")?;
     // with WAL this cant corrupt the db, a crash only loses the last commit,
-    // which the indexer redoes anyway since cursors move after the data
+    // which the indexer redoes anyway since cursors move after the data. A power
+    // cut could keep a cursor and lose the save before it, soo the shard writers
+    // commit with `synchronous = full` (indexer::writer)
     conn.execute_batch("pragma synchronous = normal")?;
     crate::filters::register_sql(&conn)?;
     Ok(conn)
@@ -179,7 +181,7 @@ fn set_up(conn: Connection) -> Result<Connection> {
 /// Tune a connection for heavy indexing writes: a big page cache, no
 /// checkpointing on commit (`checkpointer` copies the WAL into the main file on
 /// its own thread, `finish_checkpoint` lets the WAL start over), and a WAL file
-/// cut back to 256MB whenever it starts over.
+/// cut back to 1GB whenever it starts over.
 pub fn tune_for_writing(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "pragma cache_size = -1048576;
@@ -193,8 +195,133 @@ pub fn tune_for_writing(conn: &Connection) -> Result<()> {
 /// into the main file. With no write in progress it can copy everything, soo
 /// the next transaction starts the WAL over instead of growing it. Mostly
 /// quick, the background checkpointer has done the bulk of it already.
+/// The writer calls it through `Checkpoints::checkpoint_if_due`, not after every save.
 pub fn finish_checkpoint(conn: &Connection) -> Result<()> {
     conn.query_row("pragma wal_checkpoint(passive)", [], |_| Ok(()))
+}
+
+/// Frames in the WAL of `conn`'s database `schema` (main, or an attached one),
+/// and how many of them its file has already, as SQLite itself has them
+/// (`pragma wal_checkpoint(noop)` copies nothing). None for a database not in
+/// WAL mode.
+///
+/// Never read the `-wal` or `-shm` file by hand to learn this: closing any file
+/// descriptor of a file drops every fcntl lock the process holds on it, SQLite's
+/// own WAL locks included, and another process could then write the shard at
+/// the same time (#230 did that and corrupted databases).
+pub fn wal_frames(conn: &Connection, schema: &str) -> Result<Option<(i64, i64)>> {
+    let schema = schema.replace('"', "\"\"");
+    let (log, copied): (i64, i64) = conn
+        .prepare_cached(&format!("pragma \"{schema}\".wal_checkpoint(noop)"))?
+        .query_row([], |r| Ok((r.get(1)?, r.get(2)?)))?;
+    Ok((log >= 0 && copied >= 0).then_some((log, copied)))
+}
+
+/// Once this much of a shard's WAL waits to be copied, `checkpointer` copies it.
+/// A checkpoint copies each page the WAL changed once, however often it changed:
+/// pages that change in nearly every transaction (index inner pages, the meta row,
+/// FTS pages) were copied again on every save while the WAL was checkpointed after
+/// each one and twice a second (#228).
+const COPY_BYTES: i64 = 64 << 20;
+/// Once a shard's WAL holds this much, its writer copies the rest between
+/// transactions, soo the next one starts the WAL over (it stays about this big).
+const RESTART_BYTES: i64 = 256 << 20;
+/// The writer copies the rest only while this little of it waits, the
+/// background copying having done the bulk: copying 64MB would hold up the
+/// saves. Past twice `RESTART_BYTES` it copies whatever waits, soo the WAL
+/// stays bounded with no background copying (a writer without a checkpointer).
+const WRITER_COPY_BYTES: i64 = 8 << 20;
+/// `pragma wal_autocheckpoint` for a connection that writes the shards now
+/// and then while the indexer runs, such as the word index's taking from
+/// `word_queue`: SQLite's default (1000 frames, 4MB) counts the whole WAL, and
+/// a shard's WAL is bigger than that most of the time now, soo each of its
+/// commits would copy whatever waits. With this it copies only once a WAL got
+/// past where the writer starts it over (at 4KB pages), still bounding it
+/// when no indexer runs.
+pub const OCCASIONAL_WRITER_AUTOCHECKPOINT: i64 = 2 * RESTART_BYTES / 4096;
+/// Whatever waits in a WAL is copied after this long anyway, soo a quiet
+/// database doesnt keep a WAL around.
+const CHECKPOINT_AGE: Duration = Duration::from_secs(60);
+
+/// When to checkpoint a connection's databases: once enough of a WAL waits, or
+/// something waited long enough, read from SQLite with `wal_frames`. One per
+/// connection that checkpoints. A shard writer's connection has the shard's
+/// frozen file attached, and a checkpoint copies both.
+pub struct Checkpoints {
+    /// what may wait before a checkpoint, in bytes of WAL
+    due_bytes: i64,
+    /// `due_bytes` count all of the WAL rather than what waits to be copied (the writer's, which lets the WAL start
+    /// over), and then only while at most `copy_bytes` wait or the WAL got twice as big
+    whole_wal: bool,
+    copy_bytes: i64,
+    age: Duration,
+    last: Instant,
+}
+
+impl Checkpoints {
+    /// For a writer, between transactions (`finish_checkpoint`).
+    pub fn for_writer() -> Self {
+        Checkpoints::new(RESTART_BYTES, true, CHECKPOINT_AGE)
+    }
+
+    /// For the background copying (`checkpointer`).
+    pub fn for_copying() -> Self {
+        Checkpoints::new(COPY_BYTES, false, CHECKPOINT_AGE)
+    }
+
+    fn new(due_bytes: i64, whole_wal: bool, age: Duration) -> Self {
+        Checkpoints { due_bytes, whole_wal, copy_bytes: WRITER_COPY_BYTES, age, last: Instant::now() }
+    }
+
+    /// Whether any of `conn`'s databases (main and the attached ones) is due a
+    /// checkpoint. One whose WAL SQLite fails to read is (as every time before
+    /// #228); one it says isnt in WAL mode never is.
+    pub fn due(&self, conn: &Connection) -> Result<bool> {
+        let schemas: Vec<String> = conn
+            .prepare_cached("select name from pragma_database_list where name != 'temp'")?
+            .query_map([], |r| r.get(0))?
+            .collect::<Result<_>>()?;
+        for schema in schemas {
+            match self.due_one(conn, &schema) {
+                Ok(false) => {}
+                Ok(true) | Err(_) => return Ok(true),
+            }
+        }
+        Ok(false)
+    }
+
+    fn due_one(&self, conn: &Connection, schema: &str) -> Result<bool> {
+        // not in WAL mode: there is nothing to copy
+        let Some((log, copied)) = wal_frames(conn, schema)? else { return Ok(false) };
+        let waiting = log - copied;
+        if waiting <= 0 {
+            return Ok(false);
+        }
+        if self.last.elapsed() >= self.age {
+            return Ok(true);
+        }
+        let quoted = schema.replace('"', "\"\"");
+        let page_size = conn
+            .prepare_cached(&format!("pragma \"{quoted}\".page_size"))?
+            .query_row([], |r| r.get::<_, i64>(0))?
+            .max(512);
+        Ok(if self.whole_wal {
+            let (log, waiting) = (log * page_size, waiting * page_size);
+            log >= 2 * self.due_bytes || (log >= self.due_bytes && waiting <= self.copy_bytes)
+        } else {
+            waiting * page_size >= self.due_bytes
+        })
+    }
+
+    /// A passive checkpoint of `conn`'s databases when `due`. Returns whether it ran.
+    pub fn checkpoint_if_due(&mut self, conn: &Connection) -> Result<bool> {
+        if !self.due(conn)? {
+            return Ok(false);
+        }
+        finish_checkpoint(conn)?;
+        self.last = Instant::now();
+        Ok(true)
+    }
 }
 
 /// Background WAL checkpoints for a writer tuned with `tune_for_writing`.
@@ -203,7 +330,9 @@ pub fn finish_checkpoint(conn: &Connection) -> Result<()> {
 /// start over on their own (the writer keeps adding to it); the writer does
 /// that with `finish_checkpoint`. A blocking checkpoint stalls the writer for
 /// as long as it copies (20s for a 1.5GB WAL), soo it is only a last resort
-/// when the WAL got huge anyway. Runs until `stop` is set.
+/// when the WAL got huge anyway. Each database is copied once `COPY_BYTES` of
+/// its WAL wait or after `CHECKPOINT_AGE` (`Checkpoints::for_copying`), not on
+/// every look. Runs until `stop` is set.
 pub fn checkpointer(stop: std::sync::Arc<std::sync::atomic::AtomicBool>) -> std::thread::JoinHandle<()> {
     use std::sync::atomic::Ordering;
 
@@ -211,8 +340,11 @@ pub fn checkpointer(stop: std::sync::Arc<std::sync::atomic::AtomicBool>) -> std:
         // the main database and every shard
         let main = paths::database();
         let files: Vec<std::path::PathBuf> = std::iter::once(main.clone()).chain(store::shard_paths(&main)).collect();
-        let conns: Vec<(Connection, std::path::PathBuf)> =
-            files.iter().filter(|p| p.exists()).filter_map(|p| open_at(p).ok().map(|c| (c, wal_path(p)))).collect();
+        let mut conns: Vec<(Connection, std::path::PathBuf, Checkpoints)> = files
+            .iter()
+            .filter(|p| p.exists())
+            .filter_map(|p| open_at(p).ok().map(|c| (c, wal_path(p), Checkpoints::for_copying())))
+            .collect();
 
         let stopping = || stop.load(Ordering::Relaxed);
         while !stopping() {
@@ -223,16 +355,19 @@ pub fn checkpointer(stop: std::sync::Arc<std::sync::atomic::AtomicBool>) -> std:
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
-            for (conn, wal) in &conns {
-                let big = fs::metadata(wal).is_ok_and(|m| m.len() > 8 << 30);
-                let mode = if big { "truncate" } else { "passive" };
-                let _ = conn.query_row(&format!("pragma wal_checkpoint({mode})"), [], |_| Ok(()));
+            for (conn, wal, checkpoints) in &mut conns {
+                // only the file's size, from a stat: no descriptor of it is opened (see `wal_frames`)
+                if fs::metadata(&*wal).is_ok_and(|m| m.len() > 8 << 30) {
+                    let _ = conn.query_row("pragma wal_checkpoint(truncate)", [], |_| Ok(()));
+                } else {
+                    let _ = checkpoints.checkpoint_if_due(conn);
+                }
             }
         }
 
         // leave small wals behind, where nothing holds them: a file still busy (a reader, or a writer still there)
         // is left as it is, the next start checkpoints it, rather than each one waiting out the 30s busy timeout
-        for (conn, _) in &conns {
+        for (conn, _, _) in &conns {
             let _ = conn.busy_timeout(Duration::ZERO);
             let _ = conn.query_row("pragma wal_checkpoint(truncate)", [], |_| Ok(()));
         }
@@ -733,6 +868,160 @@ pub fn update_backfill_cursor(conn: &Connection, group: &str, article: i64) -> R
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    /// A WAL database at `path` tuned like a shard's writer, with a table `t` to fill.
+    fn wal_db(path: &Path) -> Connection {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch("pragma journal_mode = wal; create table if not exists t(x blob)").unwrap();
+        tune_for_writing(&conn).unwrap();
+        conn
+    }
+
+    /// `n` rows of 1000 bytes each, in one transaction
+    fn fill(conn: &Connection, n: usize) {
+        conn.execute_batch("begin").unwrap();
+        for _ in 0..n {
+            conn.execute("insert into t values (randomblob(1000))", []).unwrap();
+        }
+        conn.execute_batch("commit").unwrap();
+    }
+
+    #[test]
+    fn wal_frames_counts_what_waits_without_copying() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.db");
+        let conn = wal_db(&path);
+        fill(&conn, 200);
+        let size = fs::metadata(&path).unwrap().len();
+
+        let (log, copied) = wal_frames(&conn, "main").unwrap().unwrap();
+        assert!(log > 40, "{log}");
+        assert_eq!(copied, 0);
+        assert_eq!(fs::metadata(&path).unwrap().len(), size, "looking copies nothing into the main file");
+
+        finish_checkpoint(&conn).unwrap();
+        assert_eq!(wal_frames(&conn, "main").unwrap(), Some((log, log)));
+        // another connection sees the same WAL
+        assert_eq!(wal_frames(&Connection::open(&path).unwrap(), "main").unwrap(), Some((log, log)));
+    }
+
+    #[test]
+    fn checkpoints_wait_for_a_big_or_old_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = wal_db(&dir.path().join("a.db"));
+        let hour = Duration::from_secs(3600);
+
+        // copying: by what waits to be copied
+        let mut copying = Checkpoints::new(256 << 10, false, hour);
+        fill(&conn, 10);
+        assert!(!copying.checkpoint_if_due(&conn).unwrap(), "a small WAL waits");
+        fill(&conn, 400);
+        // a reader keeps the WAL from starting over, soo what comes next is added after what was copied
+        let reader = Connection::open(dir.path().join("a.db")).unwrap();
+        reader.execute_batch("begin").unwrap();
+        let _: i64 = reader.query_row("select count(*) from t", [], |r| r.get(0)).unwrap();
+        assert!(copying.checkpoint_if_due(&conn).unwrap(), "a big one is copied");
+        let (log, copied) = wal_frames(&conn, "main").unwrap().unwrap();
+        assert_eq!(log, copied);
+        assert!(!copying.checkpoint_if_due(&conn).unwrap(), "nothing waits");
+        fill(&conn, 10);
+        let (more, _) = wal_frames(&conn, "main").unwrap().unwrap();
+        assert!(more > log, "added to the WAL, not started over");
+        assert!(!copying.checkpoint_if_due(&conn).unwrap(), "the copied part doesnt count");
+
+        // the writer's: by all of the WAL, and only while something waits
+        let writer = Checkpoints::new(256 << 10, true, hour);
+        assert!(writer.due(&conn).unwrap(), "the WAL holds more than 256 KiB with a little waiting");
+        let mut copying_less = Checkpoints::new(256 << 10, true, hour);
+        copying_less.copy_bytes = 0;
+        assert!(!copying_less.due(&conn).unwrap(), "more waits than the writer copies: the background copying first");
+        fill(&conn, 300);
+        assert!(copying_less.due(&conn).unwrap(), "past twice as big the writer copies whatever waits");
+        reader.execute_batch("commit").unwrap();
+        finish_checkpoint(&conn).unwrap();
+        assert!(!writer.due(&conn).unwrap(), "all copied: the next transaction starts the WAL over anyway");
+        fill(&conn, 10);
+        assert!(!writer.due(&conn).unwrap(), "and it did");
+
+        // whatever waits, once it waited long enough
+        finish_checkpoint(&conn).unwrap();
+        let mut aged = Checkpoints::new(1 << 40, false, Duration::ZERO);
+        assert!(!aged.due(&conn).unwrap(), "nothing waits");
+        fill(&conn, 1);
+        assert!(aged.checkpoint_if_due(&conn).unwrap());
+    }
+
+    /// The writer's connection has the shard's frozen file attached: its WAL counts too, and one not in WAL mode
+    /// doesnt make every look due.
+    #[test]
+    fn an_attached_wal_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = wal_db(&dir.path().join("a.db"));
+        drop(wal_db(&dir.path().join("frozen.db")));
+        Connection::open(dir.path().join("plain.db")).unwrap().execute_batch("create table p(x)").unwrap();
+        conn.execute("attach database ?1 as frozen", [dir.path().join("frozen.db").to_string_lossy()]).unwrap();
+        conn.execute("attach database ?1 as plain", [dir.path().join("plain.db").to_string_lossy()]).unwrap();
+        finish_checkpoint(&conn).unwrap();
+
+        let mut checkpoints = Checkpoints::new(256 << 10, false, Duration::from_secs(3600));
+        conn.execute_batch("insert into plain.p values (1)").unwrap();
+        assert!(!checkpoints.due(&conn).unwrap());
+        conn.execute_batch("begin").unwrap();
+        for _ in 0..300 {
+            conn.execute("insert into frozen.t values (randomblob(1000))", []).unwrap();
+        }
+        conn.execute_batch("commit").unwrap();
+        assert!(checkpoints.checkpoint_if_due(&conn).unwrap(), "the frozen file's WAL is due");
+        let (log, copied) = wal_frames(&conn, "frozen").unwrap().unwrap();
+        assert_eq!(log, copied);
+        assert_eq!(wal_frames(&conn, "plain").unwrap(), None);
+    }
+
+    /// Set in the child process `checking_the_wal_keeps_the_write_lock` starts: the database it tries to write to.
+    const LOCK_PROBE: &str = "ATLAS_TEST_WAL_LOCK_PROBE";
+
+    /// Whether another process can start writing `path` right now: this test binary again, running only
+    /// `checking_the_wal_keeps_the_write_lock` with `LOCK_PROBE` set.
+    fn another_process_can_write(path: &Path) -> bool {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["db::tests::checking_the_wal_keeps_the_write_lock", "--exact", "--test-threads=1", "-q"])
+            .env(LOCK_PROBE, path)
+            .stdout(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        match status.code() {
+            Some(10) => true,
+            Some(20) => false,
+            other => panic!("the probe process ended with {other:?}"),
+        }
+    }
+
+    /// Looking at a WAL's size, and checkpointing by it, keeps every lock SQLite holds on the database: another
+    /// process still cant write while a transaction is open (#230 dropped them by closing a descriptor of the `-shm`).
+    #[test]
+    fn checking_the_wal_keeps_the_write_lock() {
+        if let Some(path) = std::env::var_os(LOCK_PROBE) {
+            let conn = Connection::open(PathBuf::from(path)).unwrap();
+            conn.busy_timeout(Duration::ZERO).unwrap();
+            let wrote = conn.execute_batch("begin immediate").is_ok();
+            std::process::exit(if wrote { 10 } else { 20 });
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.db");
+        let writer = wal_db(&path);
+        fill(&writer, 50);
+        writer.execute_batch("begin immediate; insert into t values (1)").unwrap();
+
+        let other = Connection::open(&path).unwrap();
+        let mut checkpoints = Checkpoints::new(0, false, Duration::ZERO);
+        assert!(wal_frames(&other, "main").unwrap().is_some());
+        assert!(checkpoints.checkpoint_if_due(&other).unwrap());
+        assert!(!another_process_can_write(&path), "the open transaction still holds the write lock");
+
+        writer.execute_batch("commit").unwrap();
+        assert!(another_process_can_write(&path), "and lets go of it once committed");
+    }
 
     /// Marks the connection `f` gets: true when it's one that was marked before.
     fn was_kept(main: &Path) -> bool {
