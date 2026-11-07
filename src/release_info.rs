@@ -285,10 +285,11 @@ fn contents_of(conn: &Connection, ids: &[i64], recovery: &[i64], with_bytes: Byt
                         *bytes.entry(filename).or_default() += b;
                     }
                 }
-                Err(_) => store::each_article(conn, *id, &mut |article| {
+                Err(e) if e.to_string().contains("no such column") => store::each_article(conn, *id, &mut |article| {
                     *bytes.entry(article.filename.unwrap_or_default()).or_default() += article.bytes.unwrap_or(0);
                     Ok(())
                 })?,
+                Err(e) => return Err(e),
             }
         }
     }

@@ -76,9 +76,9 @@ const FETCH_REST: Duration = Duration::from_secs(60);
 const REST: Duration = Duration::from_millis(200);
 /// How long a write waits on the shard's writer, in tries of `busy_timeout` each.
 const WRITE_TRIES: usize = 20;
-/// How long after a pass of every shard the next one starts: a blob written without its count after the first is
-/// rare (a writer this file doesn't know of).
-const PASS_EVERY: Duration = Duration::from_secs(7 * 24 * 3600);
+/// How long after a shard's pass the next one starts: a blob written without its count after the first is rare (a
+/// writer this file doesn't know of), and a pass reads through every blob left in the shard.
+const PASS_EVERY: Duration = Duration::from_secs(30 * 24 * 3600);
 
 fn cursor_path(shard: &Path) -> PathBuf {
     let mut name = shard.as_os_str().to_owned();
@@ -110,43 +110,31 @@ pub struct Batch {
 /// One batch of a shard's uncounted blobs past `after` (up to `WINDOW` ids on) counted. A blob that won't decode stays
 /// uncounted and is passed over; one in the sealed log that can't be fetched is tried again by the next batch.
 pub fn count_batch(conn: &Connection, after: i64, stop: &AtomicBool) -> Result<Batch> {
-    count_batch_with(conn, after, stop, &of_blob)
+    count_batch_with(conn, after, stop, 0, &fetch)
 }
 
-/// Whether a blob's read failed on the way to the sealed log (worth trying again), not on what came back.
-fn unreachable(e: &std::io::Error) -> bool {
-    use std::io::ErrorKind::*;
-    matches!(
-        e.kind(),
-        NotConnected
-            | ConnectionRefused
-            | ConnectionReset
-            | ConnectionAborted
-            | TimedOut
-            | BrokenPipe
-            | Interrupted
-            | WouldBlock
-            | UnexpectedEof
-            | AddrNotAvailable
-            | HostUnreachable
-            | NetworkUnreachable
-            | NetworkDown
-    )
+/// A blob in the sealed log, fetched: what it stands for.
+fn fetch(place: &[u8]) -> std::io::Result<Vec<u8>> {
+    let at = sealed_log::Locator::from_ref(place)
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "not a place in the sealed log"))?;
+    crate::sealed_store::fetch(at)
 }
 
-/// `count_batch`, each blob counted by `count`.
+/// `count_batch`, a blob in the sealed log got by `fetch`, and blobs in the shard over `skip_over` bytes (0: none)
+/// left to the sealed log's offload, which counts them as it moves them.
 fn count_batch_with(
     conn: &Connection,
     after: i64,
     stop: &AtomicBool,
-    count: &dyn Fn(&[u8]) -> std::io::Result<i64>,
+    skip_over: usize,
+    fetch: &dyn Fn(&[u8]) -> std::io::Result<Vec<u8>>,
 ) -> Result<Batch> {
     let batch: Vec<(i64, Vec<u8>)> = conn
         .prepare_cached(
             "select id, blob from files where id > ?1 and id <= ?1 + ?2 and blob is not null and blob_bytes is null
-             order by id limit ?3",
+             and (?4 = 0 or length(blob) <= ?4) order by id limit ?3",
         )?
-        .query_map(params![after, WINDOW, BATCH], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .query_map(params![after, WINDOW, BATCH, skip_over as i64], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<Result<_>>()?;
     let full = batch.len() as i64 == BATCH;
     let mut next = match batch.last() {
@@ -176,14 +164,21 @@ fn count_batch_with(
             break;
         }
         fetches += usize::from(remote);
-        match count(blob) {
-            Ok(bytes) => counted.push((*id, blob, bytes)),
-            // the sealed log out of reach: this blob again later. What it gave back that won't decode is passed over
-            Err(e) if remote && unreachable(&e) => {
-                next = id - 1;
-                fetch_failed = true;
-                break;
+        // the sealed log out of reach: this blob again later. A blob that won't decode, fetched or not, is passed over
+        let fetched = if remote {
+            match fetch(blob) {
+                Ok(raw) => Some(raw),
+                Err(_) => {
+                    next = id - 1;
+                    fetch_failed = true;
+                    break;
+                }
             }
+        } else {
+            None
+        };
+        match of_blob(fetched.as_deref().unwrap_or(blob)) {
+            Ok(bytes) => counted.push((*id, blob, bytes)),
             Err(e) => eprintln!("blob bytes: file {id} left uncounted: {e}"),
         }
     }
@@ -223,8 +218,9 @@ fn count_batch_with(
     }
 }
 
-/// Every shard's uncounted blobs counted, a batch at a time, turn about, until `stop`; again every `PASS_EVERY`.
-fn run(main: &Path, stop: &AtomicBool) {
+/// Every shard's uncounted blobs counted, a batch at a time, turn about, until `stop`; again every `PASS_EVERY`. A
+/// shard whose batch couldn't reach the sealed log waits `FETCH_REST`; the others go on.
+fn run(main: &Path, skip_over: usize, stop: &AtomicBool) {
     let shards = store::shard_paths(main);
     let nap = |d: Duration| {
         let until = Instant::now() + d;
@@ -232,11 +228,11 @@ fn run(main: &Path, stop: &AtomicBool) {
             std::thread::sleep(Duration::from_millis(200).min(d));
         }
     };
+    let mut waiting: HashMap<PathBuf, Instant> = HashMap::new();
     let mut total = 0usize;
     while !stop.load(Ordering::Relaxed) {
         let now = chrono::Utc::now().timestamp();
         let mut busy = false;
-        let mut rest = REST;
         for shard in &shards {
             if stop.load(Ordering::Relaxed) {
                 return;
@@ -246,6 +242,9 @@ fn run(main: &Path, stop: &AtomicBool) {
                 continue;
             }
             busy = true;
+            if waiting.get(shard).is_some_and(|until| Instant::now() < *until) {
+                continue;
+            }
             let after = if done_at > 0 { 0 } else { after };
             // a connection a batch, as the sealed log's offload: none is held while a compaction swaps the shard
             let batch = crate::db::open_at(shard).and_then(|conn| {
@@ -254,14 +253,14 @@ fn run(main: &Path, stop: &AtomicBool) {
                     "pragma wal_autocheckpoint = {}",
                     crate::db::OCCASIONAL_WRITER_AUTOCHECKPOINT
                 ))?;
-                count_batch(&conn, after, stop)
+                count_batch_with(&conn, after, stop, skip_over, &fetch)
             });
             match batch {
                 Ok(Batch { next: Some(next), counted, fetch_failed }) => {
                     total += counted;
                     write_cursor(shard, next, 0);
                     if fetch_failed {
-                        rest = FETCH_REST;
+                        waiting.insert(shard.clone(), Instant::now() + FETCH_REST);
                     }
                 }
                 Ok(Batch { next: None, .. }) => {
@@ -271,14 +270,16 @@ fn run(main: &Path, stop: &AtomicBool) {
                 Err(e) => eprintln!("blob bytes: {}: {e}", shard.display()),
             }
         }
-        nap(if busy { rest } else { Duration::from_secs(3600) });
+        nap(if busy { REST } else { Duration::from_secs(3600) });
     }
 }
 
-/// The pass that counts blobs from before `blob_bytes`, on a thread of its own in the indexer.
-pub fn spawn(stop: Arc<AtomicBool>) {
+/// The pass that counts blobs from before `blob_bytes`, on a thread of its own in the indexer. With the sealed log's
+/// offload on, it leaves the blobs the offload will move (and count) to it.
+pub fn spawn(config: &crate::config::SealedLogConfig, stop: Arc<AtomicBool>) {
     let main = crate::paths::database();
-    let _ = std::thread::Builder::new().name("blob-bytes".into()).spawn(move || run(&main, &stop));
+    let skip_over = if config.offload && !config.addr.is_empty() { crate::sealed_store::SMALL_BLOB } else { 0 };
+    let _ = std::thread::Builder::new().name("blob-bytes".into()).spawn(move || run(&main, skip_over, &stop));
 }
 
 #[cfg(test)]
@@ -401,17 +402,15 @@ mod tests {
             conn.query_row("select blob_bytes from files where id = ?", [id], |r| r.get::<_, Option<i64>>(0)).unwrap()
         };
         let stop = AtomicBool::new(false);
-        let decode_or = |kind: std::io::ErrorKind| {
-            move |blob: &[u8]| {
-                if crate::blob::is_remote(blob) { Err(std::io::Error::from(kind)) } else { of_blob(blob) }
-            }
-        };
+        let unreachable = |_: &[u8]| Err(std::io::Error::from(std::io::ErrorKind::NotConnected));
         // out of reach: it stops before the blob in the log, to try it again
-        let batch = count_batch_with(&conn, 0, &stop, &decode_or(std::io::ErrorKind::NotConnected)).unwrap();
+        let batch = count_batch_with(&conn, 0, &stop, 0, &unreachable).unwrap();
         assert_eq!(batch, Batch { next: Some(1), counted: 1, fetch_failed: true });
         assert_eq!((count(1), count(2), count(3)), (Some(4), None, None));
-        // what came back won't decode: passed over, and the pass goes on
-        let batch = count_batch_with(&conn, 1, &stop, &decode_or(std::io::ErrorKind::InvalidData)).unwrap();
+        // what came back is cut short and won't decode: passed over, and the pass goes on
+        let whole = local(&[1, 2, 3]);
+        let cut_short = move |_: &[u8]| Ok(whole[..whole.len() / 2].to_vec());
+        let batch = count_batch_with(&conn, 1, &stop, 0, &cut_short).unwrap();
         assert!(!batch.fetch_failed);
         assert_eq!((count(2), count(3)), (None, Some(6)));
         assert_eq!(count_batch(&conn, batch.next.unwrap(), &stop).unwrap().next, None);
@@ -455,6 +454,8 @@ mod tests {
         conn.execute("insert into files (id, release_id, filename, seen) values (4, 1, 'f4', x'00')", []).unwrap();
         conn.execute("update files set blob_bytes = 999 where id = 2", []).unwrap();
         let stop = AtomicBool::new(false);
+        // with the offload moving blobs over a byte, it leaves every one of these to it
+        assert_eq!(count_batch_with(&conn, 0, &stop, 1, &fetch).unwrap().counted, 0);
         let batch = count_batch(&conn, 0, &stop).unwrap();
         assert_eq!(batch, Batch { next: Some(3), counted: 2, fetch_failed: false });
         assert_eq!(count_batch(&conn, 3, &stop).unwrap().next, None);

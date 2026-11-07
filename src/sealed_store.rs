@@ -24,7 +24,7 @@ static ADDR: RwLock<String> = RwLock::new(String::new());
 
 /// Blobs under this size stay where they are. On a real shard the 12% of blobs
 /// past it hold 80% of the bytes, and each move costs the writers a lock.
-const SMALL_BLOB: usize = 1024;
+pub(crate) const SMALL_BLOB: usize = 1024;
 /// How many times a swap waits out the writers (`db::open_at`'s 30 seconds each)
 /// before its batch is tried again from the start.
 const SWAP_TRIES: usize = 20;
