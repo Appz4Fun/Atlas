@@ -37,10 +37,18 @@ pub struct Verdict {
     /// a key-2 command signed by a spotter's own key rather than Spotnet's moderator key: it may only remove a spot
     /// of that same spotter
     pub personal: bool,
+    /// the spotter's key signed the message-id itself. A spotter id from the header signature alone can be
+    /// replayed: that signature covers the title, header and nickname, not the message-id
+    pub message_id_signed: bool,
 }
 
 /// Checks the signatures of the spot (or moderator's command) whose overview gives `subject`, `from` and
 /// `message_id` (with or without its brackets). `title` is the title `header::parse` read from `subject`.
+///
+/// The header signature is over text Atlas has already decoded (`from_utf8_lossy`, and on the overview
+/// `undo_mojibake`), and RFC 2047 subjects aren't decoded first as Spotweb does: a non-ASCII title or nickname may
+/// not rebuild the bytes that were signed. That decides the verdict only for keys 2 to 4 (a key-7 spot needs its
+/// hashcash and message-id signature), and only the spotter id for a key-7 `From` without a user signature.
 pub fn verify(title: &str, from: &str, message_id: &str) -> Verdict {
     let no = Verdict::default();
     let message_id = format!("<{}>", message_id.trim().trim_matches(['<', '>']));
@@ -57,16 +65,21 @@ pub fn verify(title: &str, from: &str, message_id: &str) -> Verdict {
     if header_sig.is_empty() || title.is_empty() {
         return no;
     }
-    // Spotweb drops the one character before the `<` (the space) and nothing else
-    let poster = &from[..open.saturating_sub(1)];
-    let signed = format!("{title}{}{poster}", &header[..header.len() - header_sig.len() - 1]);
+    // Spotweb drops the one byte before the `<` (the space) and nothing else, and wants a nickname left
+    let poster = &from.as_bytes()[..open.saturating_sub(1)];
+    if poster.is_empty() {
+        return no;
+    }
+    let mut signed = Vec::from(title.as_bytes());
+    signed.extend_from_slice(header[..header.len() - header_sig.len() - 1].as_bytes());
+    signed.extend_from_slice(poster);
     let Some(header_sig) = decode_base64(&unprepare_base64(header_sig)) else { return no };
     let (user_key, user_sig) = match local.split_once('.') {
         Some((k, s)) => (unprepare_base64(k), Some(unprepare_base64(s))),
         None => (unprepare_base64(local), None),
     };
     let user_modulus = decode_base64(&user_key).unwrap_or_default();
-    let by_user = || !user_modulus.is_empty() && rsa_sha1(signed.as_bytes(), &header_sig, &user_modulus);
+    let by_user = || !user_modulus.is_empty() && rsa_sha1(&signed, &header_sig, &user_modulus);
 
     let mut verdict = Verdict::default();
     if key_id == SELF_SIGNED_KEY {
@@ -84,18 +97,20 @@ pub fn verify(title: &str, from: &str, message_id: &str) -> Verdict {
             }
         } else {
             let modulus = decode_base64(modulus).expect("Spotnet's keys are base64");
-            verdict.verified = rsa_sha1(signed.as_bytes(), &header_sig, &modulus);
+            verdict.verified = rsa_sha1(&signed, &header_sig, &modulus);
         }
     }
-    // a `From` with the spotter's key and signature: the message-id must be signed with that key too
+    // a `From` with the spotter's key and signature: the message-id must be signed with that key too (a key that
+    // won't decode signs nothing)
     if verdict.verified
         && let Some(user_sig) = user_sig.filter(|s| !s.is_empty())
-        && !user_modulus.is_empty()
+        && !user_key.is_empty()
     {
         let sig = decode_base64(&user_sig).unwrap_or_default();
-        verdict.verified = rsa_sha1(message_id.as_bytes(), &sig, &user_modulus);
+        verdict.verified = !user_modulus.is_empty() && rsa_sha1(message_id.as_bytes(), &sig, &user_modulus);
         if verdict.verified {
             verdict.spotter_id = spotter_id(&user_key);
+            verdict.message_id_signed = true;
         }
     }
     if !verdict.verified {
@@ -120,7 +135,8 @@ fn rsa_sha1(message: &[u8], sig: &[u8], modulus: &[u8]) -> bool {
     let n = BigUint::from_bytes_be(modulus);
     let k = n.bits().div_ceil(8) as usize;
     // the 0x00 0x01, at least 8 0xff, the 0x00, the DigestInfo and the hash
-    if k < 3 + 8 + SHA1_DIGEST_INFO.len() + 20 || sig.is_empty() || sig.len() > k {
+    // and, as OpenSSL wants, a signature exactly as long as the key
+    if k < 3 + 8 + SHA1_DIGEST_INFO.len() + 20 || sig.len() != k {
         return false;
     }
     let s = BigUint::from_bytes_be(sig);
@@ -160,7 +176,7 @@ mod tests {
     #[test]
     fn a_self_signed_spot() {
         let v = verify(SPOT_TITLE, SPOT_FROM, SPOT_ID);
-        assert!(v.verified && !v.personal);
+        assert!(v.verified && !v.personal && v.message_id_signed);
         assert_eq!(v.spotter_id, spotter_id("r2ceRUXK82cxSlhCLnbGXUVIA6-srpbJJqYqtJfXLdubdAMMD6T0G-pcPdZe619uuF"));
         assert!(v.spotter_id.is_some());
         // the message-id is what the hashcash and the spotter's signature hold
@@ -176,7 +192,7 @@ mod tests {
     #[test]
     fn a_moderators_command() {
         let v = verify(MOD_TITLE, MOD_FROM, MOD_ID);
-        assert_eq!(v, Verdict { verified: true, spotter_id: None, personal: false });
+        assert_eq!(v, Verdict { verified: true, ..Verdict::default() });
         // the signed title names the spot: another spot's id breaks it
         let other = MOD_TITLE.replace("vhcUXQS5", "vhcUXQS6");
         assert_eq!(verify(&other, MOD_FROM, MOD_ID), Verdict::default());
@@ -191,9 +207,23 @@ mod tests {
     #[test]
     fn a_spotters_own_dispose() {
         let v = verify(OWN_TITLE, OWN_FROM, OWN_ID);
-        assert!(v.verified && v.personal);
+        assert!(v.verified && v.personal && v.message_id_signed);
         assert_eq!(v.spotter_id, spotter_id("4CGr2alVHshWG91Ajiozvi3D5D1MPD8Iwh5veSiUvGdrhFl5LBcyN5jV6GwHXqZB"));
         assert!(v.spotter_id.is_some());
+    }
+
+    #[test]
+    fn odd_nicknames() {
+        // a multibyte character right before the `<`: the byte before it goes, as in Spotweb, and nothing panics
+        let tight = SPOT_FROM.replacen("Wasbeertje <", "Né<", 1);
+        assert!(verify(SPOT_TITLE, &tight, SPOT_ID).verified);
+        // no nickname left once the byte before the `<` goes
+        let bare = SPOT_FROM.replacen("Wasbeertje <", "x<", 1);
+        assert_eq!(verify(SPOT_TITLE, &bare, SPOT_ID), Verdict::default());
+        // a user key that won't decode can't have signed the message-id
+        let garbage =
+            SPOT_FROM.replacen("r2ceRUXK82cxSlhCLnbGXUVIA6-srpbJJqYqtJfXLdubdAMMD6T0G-pcPdZe619uuF", "!!!", 1);
+        assert_eq!(verify(SPOT_TITLE, &garbage, SPOT_ID), Verdict::default());
     }
 
     #[test]
@@ -209,6 +239,7 @@ mod tests {
         assert!(!rsa_sha1(b"x", &[], &modulus));
         assert!(!rsa_sha1(b"x", &[0xff; 49], &modulus));
         assert!(!rsa_sha1(b"x", &[1; 48], &modulus));
+        assert!(!rsa_sha1(b"x", &[1; 47], &modulus));
         assert!(!rsa_sha1(b"x", &[1; 8], &[0xff; 8]));
     }
 }
