@@ -1231,15 +1231,21 @@ fn last_volume_crcs(
     if listing.headers_encrypted && password.is_none() {
         return Ok(());
     }
-    let Some(seg) = first_article(ctx, head.tail)? else { return Ok(()) };
+    // an extra the listing doesn't depend on: only a stop ends the step, any other error leaves the CRC unknown
+    let Some(seg) = first_article(ctx, head.tail).or_else(optional)? else { return Ok(()) };
     *left -= 1;
-    let Some(body) = fetch_start(ctx, &seg, &head.tail.filename)? else { return Ok(()) };
+    let Some(body) = fetch_start(ctx, &seg, &head.tail.filename).or_else(optional)? else { return Ok(()) };
     if !matches!(identify(&body), Format::Rar4 | Format::Rar5) {
         return Ok(());
     }
     let last = if listing.headers_encrypted { rar::list_with_password(&body, password) } else { rar::list(&body) };
     close_split_files(listing, &last);
     Ok(())
+}
+
+/// An optional read's error as nothing read, unless it is a stop.
+fn optional<T>(e: StepError) -> Result<Option<T>, StepError> {
+    if matches!(e, StepError::Stopped) { Err(e) } else { Ok(None) }
 }
 
 /// Each file of `listing` with no CRC takes the one `last` (its set's last volume, read from its start) gives the
