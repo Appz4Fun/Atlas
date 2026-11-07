@@ -57,6 +57,13 @@ pub async fn run(pool: Arc<Pool>, db: Db, config: SpotsConfig, stopping: impl Fn
         eprintln!("spots: {e:#}");
         return;
     }
+    for shard in 0..crate::store::SHARDS {
+        match on_shard(&db, shard, store::recategorize_all).await {
+            Ok(0) => {}
+            Ok(n) => println!("spots: {n} releases of shard {shard} queued for their category, with their spot's kind"),
+            Err(e) => eprintln!("spots: queueing shard {shard}'s spot releases for their category: {e:#}"),
+        }
+    }
     while !stopping() {
         match pass(&pool, &db, &config, &stopping).await {
             Ok(p) if p.noted + p.saved + p.skipped + p.retry + p.pending > 0 => println!(

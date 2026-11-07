@@ -362,7 +362,7 @@ pub fn placement(
 /// newest first, so an older copy of a spot comes after the edit that replaced it.
 fn put(conn: &Connection, release_id: i64, row: &SpotRow) -> Result<()> {
     let spot = &row.spot;
-    conn.execute(
+    let changed = conn.execute(
         "insert into spots (release_id, message_id, kind, title, poster, tag, spotter_id, category,
             subcats, size, imdb_id, created, nzb_key, xml) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          on conflict(release_id) do update set message_id = excluded.message_id, kind = excluded.kind,
@@ -387,7 +387,33 @@ fn put(conn: &Connection, release_id: i64, row: &SpotRow) -> Result<()> {
             row.xml,
         ],
     )?;
+    // the spot's kind is a hint for the release's category (`spotnet::category`): the step looks again
+    if changed > 0 {
+        recategorize(conn, release_id)?;
+    }
     Ok(())
+}
+
+/// Queues release `id` for the category step again, on its shard's writer.
+fn recategorize(conn: &Connection, id: i64) -> Result<()> {
+    let now = chrono::Utc::now().timestamp();
+    crate::postprocess::rerun_on(conn, id, crate::postprocess::step::mask(crate::category::step::STEP), now)
+}
+
+/// Once per shard: queues every release saved from a spot before the spot's kind was a category hint for the
+/// category step again. Returns how many.
+pub fn recategorize_all(conn: &Connection) -> Result<usize> {
+    const DONE: &str = "spot_category_hint";
+    if crate::store::get_meta(conn, DONE)?.is_some() {
+        return Ok(0);
+    }
+    let ids: Vec<i64> =
+        conn.prepare("select release_id from spots")?.query_map([], |r| r.get(0))?.collect::<Result<_>>()?;
+    for id in &ids {
+        recategorize(conn, *id)?;
+    }
+    crate::store::set_meta(conn, DONE, 1)?;
+    Ok(ids.len())
 }
 
 /// What a release's spot says, for its page, its row and the API.
@@ -573,10 +599,30 @@ mod tests {
         assert_eq!(state, GAVE_UP);
     }
 
+    /// A shard's tables: tagging a release touches its row and the stage's queue (`recategorize`).
+    fn tagging_shard(conn: &Connection) {
+        conn.execute_batch("create table releases (id INTEGER PRIMARY KEY, name TEXT, group_name TEXT)").unwrap();
+        for table in [&crate::postprocess::schema::PP_STATE, &crate::postprocess::schema::PP_QUEUE] {
+            conn.execute_batch(table.create).unwrap();
+            for (column, kind) in table.added {
+                conn.execute_batch(&format!("alter table {} add column {column} {kind}", table.name)).unwrap();
+            }
+        }
+    }
+
+    fn queued(conn: &Connection) -> Vec<i64> {
+        conn.prepare("select release_id from pp_queue order by release_id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_>>()
+            .unwrap()
+    }
+
     #[test]
     fn tags_the_release_by_name_and_group_and_copies_by_nzb() {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("create table releases (id INTEGER PRIMARY KEY, name TEXT, group_name TEXT)").unwrap();
+        tagging_shard(&conn);
         conn.execute("insert into releases values (5, 'Movie (2026)', 'alt.binaries.x')", []).unwrap();
         conn.execute_batch(SPOTS.create).unwrap();
         let spot = FullSpot {
@@ -596,6 +642,8 @@ mod tests {
         assert_eq!(tag_copy(&conn, &row).unwrap(), None);
         assert_eq!(tag(&conn, "Movie (2026)", "alt.binaries.y", &row).unwrap(), None);
         assert_eq!(tag(&conn, "Movie (2026)", "alt.binaries.x", &row).unwrap(), Some(5));
+        assert_eq!(queued(&conn), [5], "the category step looks again, with the spot's kind");
+        conn.execute("delete from pp_queue", []).unwrap();
         // an edit of the spot, retitled, with the same NZB: the same release, the newer spot
         let edited = FullSpot { title: "Movie (2026) edited".into(), ..spot.clone() };
         let again = SpotRow { message_id: "m2@spot.net".into(), spot: edited, ..row.clone() };
@@ -612,14 +660,30 @@ mod tests {
             ("m2@spot.net", "Movie (2026) edited", "tt1234567", 1)
         );
         // a release that went (junk) leaves its spot row behind for the trigger, not for copies
+        assert_eq!(queued(&conn), [5]);
         conn.execute("delete from releases where id = 5", []).unwrap();
         assert_eq!(tag_copy(&conn, &row).unwrap(), None);
     }
 
     #[test]
+    fn spot_releases_are_queued_for_their_category_once() {
+        let conn = Connection::open_in_memory().unwrap();
+        tagging_shard(&conn);
+        conn.execute_batch(SPOTS.create).unwrap();
+        conn.execute_batch("create table meta (key TEXT PRIMARY KEY, value INTEGER)").unwrap();
+        conn.execute("insert into releases values (8, 'A', 'g'), (16, 'B', 'g'), (24, 'C', 'g')", []).unwrap();
+        conn.execute("insert into spots (release_id, message_id, kind, title) values (8, 'a', 'movie', 'A'), (24, 'c', 'series', 'C')", []).unwrap();
+        assert_eq!(recategorize_all(&conn).unwrap(), 2);
+        assert_eq!(queued(&conn), [8, 24]);
+        conn.execute("delete from pp_queue", []).unwrap();
+        assert_eq!(recategorize_all(&conn).unwrap(), 0, "once");
+        assert!(queued(&conn).is_empty());
+    }
+
+    #[test]
     fn an_older_copy_keeps_the_newer_spot() {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("create table releases (id INTEGER PRIMARY KEY, name TEXT, group_name TEXT)").unwrap();
+        tagging_shard(&conn);
         conn.execute("insert into releases values (5, 'Movie (2026)', 'g')", []).unwrap();
         conn.execute_batch(SPOTS.create).unwrap();
         let spot = |title: &str, created| FullSpot { title: title.into(), created, ..FullSpot::default() };
@@ -700,7 +764,7 @@ mod tests {
     #[test]
     fn a_frozen_release_keeps_its_row_when_a_copy_comes() {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("create table releases (id INTEGER PRIMARY KEY, name TEXT, group_name TEXT)").unwrap();
+        tagging_shard(&conn);
         conn.execute_batch(SPOTS.create).unwrap();
         let row = SpotRow {
             message_id: "m@spot.net".into(),
@@ -783,7 +847,7 @@ mod tests {
     #[test]
     fn a_frozen_release_with_the_title_counts_as_another_post() {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("create table releases (id INTEGER PRIMARY KEY, name TEXT, group_name TEXT)").unwrap();
+        tagging_shard(&conn);
         conn.execute_batch(SPOTS.create).unwrap();
         let files = vec![("a.mkv".to_string(), vec!["a@x".to_string()])];
         assert_eq!(placement(&conn, "Title", "g", "k", &files).unwrap(), Placement::Free);
@@ -799,7 +863,7 @@ mod tests {
     #[test]
     fn a_name_is_in_use_live_or_frozen() {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("create table releases (id INTEGER PRIMARY KEY, name TEXT, group_name TEXT)").unwrap();
+        tagging_shard(&conn);
         conn.execute("insert into releases values (1, 'Live', 'g')", []).unwrap();
         assert!(name_in_use(&conn, "Live", "g").unwrap());
         assert!(!name_in_use(&conn, "Frozen", "g").unwrap());
