@@ -836,8 +836,7 @@ fn exact_split_post(
     };
     let same: Vec<&Named> = same.iter().collect();
     let (across, shared, claimed) = across_posters(conn, release.id, &named)?;
-    // rows of the name that share parts are grouped by `across_posters` alone, whichever row asks: a poster's own
-    // rows could otherwise make a post of their own beside the one they are part of
+    // a row in a post sharing parts gets that post: its poster's own rows could otherwise make one beside it
     if shared {
         return Ok(across.map(|(post, _)| post));
     }
@@ -879,8 +878,8 @@ fn same_poster_post(conn: &Connection, rows: &[&Named]) -> Result<Option<SplitPo
 /// The most rows of one name looked at for a post whose groups each got a poster of their own.
 const ACROSS_POSTERS_ROWS: usize = 32;
 
-/// `across_posters`'s answer: the post the row asking is in, with the rows it stands for; whether any rows of the
-/// name share parts; and every row in a whole post of two rows or more, whichever.
+/// `across_posters`'s answer: the post the row asking is in, with the rows it stands for; whether that post's rows
+/// share parts; and every row in a post of two rows or more that is whole or shares parts, whichever.
 type AcrossPosters = (Option<(SplitPost, Vec<i64>)>, bool, HashSet<i64>);
 
 /// One post whose groups each got another made-up poster (Nyuu and ngPost can give every connection its own From): the
@@ -895,8 +894,13 @@ fn across_posters(conn: &Connection, anchor: i64, named: &[Named]) -> Result<Acr
         return Ok((None, false, HashSet::new()));
     }
     let one_poster = rows.iter().all(|n| n.poster == rows[0].poster);
-    // one poster's rows are `same_poster_post`'s unless some share parts, which one read of them all tells
+    // one poster's rows are `same_poster_post`'s unless some share parts, which one read of them all tells, where
+    // they could be one post at all
     if one_poster {
+        let dates: Vec<Option<f64>> = rows.iter().map(|n| n.date).collect();
+        if rows.len() > SPLIT_POST_GROUPS || !close_together(&dates) {
+            return Ok((None, false, HashSet::new()));
+        }
         let ids: Vec<i64> = rows.iter().map(|n| n.id).collect();
         if !union_files(conn, &ids)?.overlap {
             return Ok((None, false, HashSet::new()));
@@ -922,39 +926,45 @@ fn across_posters(conn: &Connection, anchor: i64, named: &[Named]) -> Result<Acr
     // the rows fall into posts, each grown from its lowest row left: the same posts whoever asks. First of rows that
     // share no part; then, of the rows in none of those that's whole, posts whose rows may share parts (`fills_gaps`):
     // a file uploaded again within the hour, each upload spread over the groups, whole only as both
+    // Of the whole posts, the one of most rows (the lowest seed among equals) takes its rows first, then again: a
+    // poster's split isn't lost to a whole pair another poster's row makes with one of its rows
     let mut whole: Vec<(Vec<i64>, UnionFiles)> = Vec::new();
     let mut taken: HashSet<i64> = HashSet::new();
-    for seed in 0..kept.len() {
-        if taken.contains(&kept[seed].0.id) {
-            continue;
+    loop {
+        let mut best: Option<(Vec<i64>, UnionFiles)> = None;
+        for seed in 0..kept.len() {
+            if taken.contains(&kept[seed].0.id) {
+                continue;
+            }
+            let (chosen, union) = grow_post(conn, &kept, seed, &taken, false)?;
+            let is_whole = chosen.len() > 1 && union.one_upload() && union.complete();
+            if is_whole && best.as_ref().is_none_or(|(b, _)| chosen.len() > b.len()) {
+                best = Some((chosen, union));
+            }
         }
-        // only a whole post takes its rows: one that isn't leaves them to the seeds after it
-        let (chosen, union) = grow_post(conn, &kept, seed, &taken, false)?;
-        if chosen.len() > 1 && union.one_upload() && union.complete() {
-            taken.extend(chosen.iter().copied());
-            whole.push((chosen, union));
-        }
+        let Some((chosen, union)) = best else { break };
+        taken.extend(chosen.iter().copied());
+        whole.push((chosen, union));
     }
     let mut taken: HashSet<i64> = whole.iter().flat_map(|(chosen, _)| chosen.iter().copied()).collect();
     let mut posts = whole;
-    let mut shared = false;
     for seed in 0..kept.len() {
         if taken.contains(&kept[seed].0.id) {
             continue;
         }
         let (chosen, union) = grow_post(conn, &kept, seed, &taken, true)?;
         taken.extend(chosen.iter().copied());
-        shared |= union.overlap;
         posts.push((chosen, union));
     }
     // one poster's rows are `same_poster_post`'s, unless they share parts
-    if one_poster && !shared {
+    if one_poster && !posts.iter().any(|(_, union)| union.overlap) {
         return Ok((None, false, HashSet::new()));
     }
-    // the rows of the whole posts: a poster's own rows that one of them is in make no post of their own
+    // the rows of the whole posts and of those sharing parts: a poster's own rows that one of them is in make no post
+    // of their own
     let claimed: HashSet<i64> = posts
         .iter()
-        .filter(|(chosen, union)| chosen.len() > 1 && union.one_upload() && union.complete())
+        .filter(|(chosen, union)| chosen.len() > 1 && union.one_upload() && (union.complete() || union.overlap))
         .flat_map(|(chosen, _)| chosen.iter().copied())
         .collect();
     for (chosen, union) in posts {
@@ -962,6 +972,8 @@ fn across_posters(conn: &Connection, anchor: i64, named: &[Named]) -> Result<Acr
         if !anchor_in {
             continue;
         }
+        // whether the post the row asking is in shares parts: then it's the answer, whatever its poster's rows say
+        let shared = union.overlap;
         if chosen.len() < 2 || !union.one_upload() {
             return Ok((None, shared, claimed));
         }
@@ -971,7 +983,7 @@ fn across_posters(conn: &Connection, anchor: i64, named: &[Named]) -> Result<Acr
             claimed,
         ));
     }
-    Ok((None, shared, claimed))
+    Ok((None, false, claimed))
 }
 
 /// The rows not `taken` that join `kept[seed]`, looked at again whenever one joins (a row can share a file only with
@@ -1363,7 +1375,7 @@ impl UnionFiles {
             let size = subject_size(f.subject.as_deref()?)?;
             let expected = f.expected.filter(|e| *e > 0)?;
             let have = store::seen_count(&f.seen).min(expected);
-            Some(sum + (i128::from(size) * i128::from(have) / i128::from(expected)) as i64)
+            sum.checked_add(i64::try_from(i128::from(size) * i128::from(have) / i128::from(expected)).ok()?)
         })
     }
 
@@ -3174,6 +3186,50 @@ mod tests {
                 assert!(post.complete, "order {x}{a}{c}");
             }
         }
+    }
+
+    #[test]
+    fn a_posters_whole_split_isnt_lost_to_a_pair_another_poster_makes_with_one_of_its_rows() {
+        let name = "Some.Film.2026.2160p.UHD.Blu-ray.Remux.HDR.HEVC.DTS-HD.MA.5.1-GRP";
+        let mkv = "Some.Film.mkv";
+        let at = "2026-11-07 05:16:17";
+        let g = groups_in_one_shard(4);
+        let (_dir, conn) = all_shards();
+        // q's row has parts 3 and 4: whole with p's first row, but p's three rows are whole on their own
+        put_row_subjects(&conn, 1, name, &g[0], "q@nyuu", &[(mkv, &[3, 4], 4)], at, 1, false);
+        put_row_subjects(&conn, 2, name, &g[1], "p@nyuu", &[(mkv, &[1, 2], 4)], at, 1, false);
+        put_row_subjects(&conn, 3, name, &g[2], "p@nyuu", &[(mkv, &[3], 4)], at, 1, false);
+        put_row_subjects(&conn, 4, name, &g[3], "p@nyuu", &[(mkv, &[4], 4)], at, 1, false);
+        let p_rows = [row_of(&conn, 2, &g[1]), row_of(&conn, 3, &g[2]), row_of(&conn, 4, &g[3])];
+        let mut ids: Vec<i64> = p_rows.iter().map(|r| r.id).collect();
+        ids.sort_unstable();
+        for row in &p_rows {
+            let post = whole_post_with(&conn, row).unwrap().unwrap();
+            assert_eq!(post.ids, ids);
+            assert!(post.complete);
+        }
+        assert_eq!(whole_post_with(&conn, &row_of(&conn, 1, &g[0])).unwrap(), None);
+    }
+
+    #[test]
+    fn a_split_post_past_the_rows_looked_at_keeps_its_answer_beside_rows_sharing_parts() {
+        let name = "Some.Film.2026.2160p.UHD.Blu-ray.Remux.HDR.HEVC.DTS-HD.MA.5.1-GRP";
+        let mkv = "Some.Film.mkv";
+        let at = "2026-11-07 05:16:17";
+        let g = groups_in_one_shard(36);
+        let (_dir, conn) = all_shards();
+        // two rows sharing parts, then whole uploads by someone else, then p's split past the rows looked at
+        put_row_subjects(&conn, 1, name, &g[0], "q@nyuu", &[(mkv, &[1, 2, 3], 4)], at, 1, true);
+        put_row_subjects(&conn, 2, name, &g[1], "r@nyuu", &[(mkv, &[2, 3, 4], 4)], at, 1, true);
+        for n in 3..=34 {
+            put_row_subjects(&conn, n, name, &g[n as usize - 1], "f@else", &[(mkv, &[1, 2, 3, 4], 4)], at, 1, false);
+        }
+        put_row_subjects(&conn, 35, name, &g[34], "p@nyuu", &[(mkv, &[1, 2], 4)], at, 1, false);
+        put_row_subjects(&conn, 36, name, &g[35], "p@nyuu", &[(mkv, &[3, 4], 4)], at, 1, false);
+        let (a, b) = (row_of(&conn, 35, &g[34]), row_of(&conn, 36, &g[35]));
+        let post = whole_post_with(&conn, &a).unwrap().expect("p's split");
+        assert_eq!(post.ids, vec![a.id, b.id]);
+        assert!(post.complete);
     }
 
     #[test]

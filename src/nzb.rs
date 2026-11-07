@@ -335,18 +335,24 @@ pub(crate) fn inventory(release: &ReleaseRow) -> crate::db::Result<(Vec<ArticleR
 /// under the first message-id: a reader keeps one segment of a number anyway, and the rest only inflate the size.
 fn merge_rows(rows: Vec<(i64, Vec<ArticleRow>)>) -> Vec<ArticleRow> {
     let mut first_row: std::collections::HashMap<(Option<String>, i64), i64> = std::collections::HashMap::new();
-    let mut shared = false;
+    let mut in_rows: std::collections::HashSet<(Option<String>, i64)> = std::collections::HashSet::new();
     for (id, articles) in &rows {
         for a in articles {
             if let Some(part) = a.part {
-                shared |= *first_row.entry((a.filename.clone(), part)).or_insert(*id) != *id;
+                let key = (a.filename.clone(), part);
+                if *first_row.entry(key.clone()).or_insert(*id) != *id {
+                    in_rows.insert(key);
+                }
             }
         }
     }
     let mut all: Vec<ArticleRow> = rows.into_iter().flat_map(|(_, articles)| articles).collect();
     all.sort_by(|a, b| (&a.filename, a.part, &a.message_id).cmp(&(&b.filename, b.part, &b.message_id)));
+    // a part more than one row holds is listed once; a row's own second article of a part stays, as before
     all.dedup_by(|a, b| {
-        a.filename == b.filename && a.part == b.part && (a.message_id == b.message_id || (shared && a.part.is_some()))
+        a.filename == b.filename
+            && a.part == b.part
+            && (a.message_id == b.message_id || a.part.is_some_and(|p| in_rows.contains(&(a.filename.clone(), p))))
     });
     all
 }
