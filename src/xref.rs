@@ -342,9 +342,17 @@ pub struct Found {
     pub ack: Ack,
 }
 
+/// Which of a poster's waiting articles a pass took: these, or every one that had come by then (`added` at most this),
+/// for a file let go whole, whose articles aren't read one by one.
+#[derive(Clone, Debug)]
+pub enum Taken {
+    Ids(Vec<String>),
+    UpTo(i64),
+}
+
 /// What a pass took as done, noted by `Store::ack` once its releases are saved.
 pub struct Ack {
-    finished: Vec<(String, Option<Place>, Vec<String>)>,
+    finished: Vec<(String, Option<Place>, Taken)>,
     widened: Vec<(String, String, Seed, i64)>,
     now: i64,
 }
@@ -438,21 +446,48 @@ impl Store {
         Ok(n)
     }
 
+    #[cfg(test)]
     fn waiting(&self) -> Result<Vec<FileSum>> {
+        Ok(self.waiting_placed()?.into_iter().map(|(f, _)| f).collect())
+    }
+
+    /// Each poster's articles waiting, and its file's place when it has one: one read for the pass, rather than one
+    /// a poster (most are one-article noise).
+    fn waiting_placed(&self) -> Result<Vec<(FileSum, Option<Place>)>> {
         let mut stmt = self.conn.prepare(
-            "select poster, count(*), min(posted), max(posted), max(added), group_concat(distinct grp)
-             from headers where done = 0 group by poster",
+            "select w.poster, w.n, w.first, w.last, w.added, w.groups,
+                    l.release, l.grp, l.file, l.files, l.parts, l.leads, l.oldest
+             from (select poster, count(*) n, min(posted) first, max(posted) last, max(added) added,
+                          group_concat(distinct grp) groups
+                   from headers where done = 0 group by poster) w
+             left join linked l on l.poster = w.poster",
         )?;
         let rows = stmt.query_map([], |r| {
             let groups: String = r.get(5)?;
-            Ok(FileSum {
-                poster: r.get(0)?,
-                n: r.get(1)?,
-                first: r.get(2)?,
-                last: r.get(3)?,
-                added: r.get(4)?,
-                groups: groups.split(',').filter_map(|g| g.parse().ok()).collect(),
-            })
+            let release: Option<String> = r.get(6)?;
+            let place = match release {
+                Some(release) => Some(Place {
+                    release,
+                    group: r.get(7)?,
+                    file: r.get(8)?,
+                    files: r.get(9)?,
+                    parts: r.get(10)?,
+                    leads: r.get(11)?,
+                    oldest: r.get(12)?,
+                }),
+                None => None,
+            };
+            Ok((
+                FileSum {
+                    poster: r.get(0)?,
+                    n: r.get(1)?,
+                    first: r.get(2)?,
+                    last: r.get(3)?,
+                    added: r.get(4)?,
+                    groups: groups.split(',').filter_map(|g| g.parse().ok()).collect(),
+                },
+                place,
+            ))
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
@@ -478,30 +513,6 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    fn place_of(&self, poster: &str) -> Result<Option<Place>> {
-        Ok(self
-            .conn
-            .query_row(
-                "select release, grp, file, files, parts, leads, oldest from linked where poster = ?1",
-                [poster],
-                |r| {
-                    Ok(Place {
-                        release: r.get(0)?,
-                        group: r.get(1)?,
-                        file: r.get(2)?,
-                        files: r.get(3)?,
-                        parts: r.get(4)?,
-                        leads: r.get(5)?,
-                        oldest: r.get(6)?,
-                    })
-                },
-            )
-            .optional()?)
-    }
-
-    /// A poster's articles waiting, in the order their parts are numbered: as they came, soo a pass saved again numbers
-    /// the same parts the same and what came since after them. Each is marked when it is the first its group got
-    /// (`Row::lead`), the likely first pieces (see `LEADS`).
     fn rows_of(&self, poster: &str) -> Result<Vec<Row>> {
         let mut stmt = self.conn.prepare_cached(
             "select message_id, posted, grp, number, bytes, lines,
@@ -527,7 +538,7 @@ impl Store {
     /// The uploads that have settled by `now`, each as a release, and the articles that came late for a file already
     /// in one, as that release. Their headers are marked done, and each file's place kept for what comes later.
     pub fn pass(&mut self, now: i64) -> Result<Vec<Release>> {
-        let found = self.pass_with(now, &mut |_, _| false)?;
+        let found = self.pass_with(now, &mut |_, _| false, &|| false)?;
         self.ack(&found.ack)?;
         Ok(found.releases)
     }
@@ -535,37 +546,50 @@ impl Store {
     /// `pass`, a file settled only once `unread(first, last)` says no group is still to be read for the time it was
     /// posted in, or once it has waited `KEEP_SECS`: an upload saved before every group was read for it would be
     /// split, as a group read later brings files of it that no article read before linked.
-    pub fn pass_with(&mut self, now: i64, unread: &mut dyn FnMut(i64, i64) -> bool) -> Result<Found> {
+    ///
+    /// `stop` is asked as it goes: once it says so, the pass gives up what it found (nothing is written until `ack`)
+    /// and comes back with nothing, soo the indexer's stop doesn't wait on it.
+    pub fn pass_with(
+        &mut self,
+        now: i64,
+        unread: &mut dyn FnMut(i64, i64) -> bool,
+        stop: &dyn Fn() -> bool,
+    ) -> Result<Found> {
+        let nothing = || Found { releases: Vec::new(), ack: Ack { finished: Vec::new(), widened: Vec::new(), now } };
         let mut waits: HashMap<String, bool> = HashMap::new();
-        for f in self.waiting()? {
-            let quiet = f.added < now - SETTLE_SECS;
-            let settled = f.added < now - KEEP_SECS || (quiet && !unread(f.first, f.last));
-            waits.insert(f.poster, !settled);
-        }
-        let settled = |f: &FileSum| !waits.get(&f.poster).copied().unwrap_or(true);
         let mut fresh = Vec::new();
         let mut late = Vec::new();
-        for f in self.waiting()? {
-            match self.place_of(&f.poster)? {
+        for (k, (f, place)) in self.waiting_placed()?.into_iter().enumerate() {
+            if k % 4096 == 0 && stop() {
+                return Ok(nothing());
+            }
+            let quiet = f.added < now - SETTLE_SECS;
+            let settled = f.added < now - KEEP_SECS || (quiet && !unread(f.first, f.last));
+            waits.insert(f.poster.clone(), !settled);
+            match place {
                 Some(place) => late.push((f, place)),
                 None => fresh.push(f),
             }
         }
+        let settled = |f: &FileSum| !waits.get(&f.poster).copied().unwrap_or(true);
 
         let mut out: HashMap<String, Release> = HashMap::new();
         // each poster done with: where its file went, and the articles of it this pass took
-        let mut finished: Vec<(String, Option<Place>, Vec<String>)> = Vec::new();
+        let mut finished: Vec<(String, Option<Place>, Taken)> = Vec::new();
 
-        for (f, place) in late {
+        for (k, (f, place)) in late.into_iter().enumerate() {
+            if k % 256 == 0 && stop() {
+                return Ok(nothing());
+            }
             if settled(&f) && place.oldest < now - KEEP_SECS {
                 // the file's first articles have left the window: one read again couldnt be told from a new one, and
                 // would be numbered as another part. Let go
-                let ids = self.rows_of(&f.poster)?.into_iter().map(|r| r.message_id).collect();
-                finished.push((f.poster, None, ids));
+                let upto = f.added;
+                finished.push((f.poster, None, Taken::UpTo(upto)));
             } else if settled(&f) {
                 let rows = self.rows_of(&f.poster)?;
                 let parts = place.parts + rows.len() as i64;
-                let ids = rows.iter().map(|r| r.message_id.clone()).collect();
+                let ids = Taken::Ids(rows.iter().map(|r| r.message_id.clone()).collect());
                 // a group that led the file before offers a new first piece only in an article it numbers lower than
                 // all it gave before: one another server's listing brought, say
                 let earliest: HashMap<i64, i64> = {
@@ -606,15 +630,18 @@ impl Store {
         }
         let seeds: Vec<Seed> = saved.iter().map(|u| u.seed.clone()).collect();
         let mut widened: Vec<(String, String, Seed, i64)> = Vec::new();
-        for (seed, files) in chain(&fresh, &seeds) {
+        for (k, (seed, files)) in chain(&fresh, &seeds).into_iter().enumerate() {
+            if k % 4096 == 0 && stop() {
+                return Ok(nothing());
+            }
             if !files.iter().all(|&i| settled(&fresh[i])) {
                 continue;
             }
             let articles: i64 = files.iter().map(|&i| fresh[i].n).sum();
             if seed.is_none() && articles < MIN_UPLOAD_ARTICLES {
+                // noise, let go whole: no need to read its articles
                 for &i in &files {
-                    let ids = self.rows_of(&fresh[i].poster)?.into_iter().map(|r| r.message_id).collect();
-                    finished.push((fresh[i].poster.clone(), None, ids));
+                    finished.push((fresh[i].poster.clone(), None, Taken::UpTo(fresh[i].added)));
                 }
                 continue;
             }
@@ -658,7 +685,7 @@ impl Store {
                     leads: String::new(),
                     oldest: rows.iter().map(|r| r.added).min().unwrap_or(now),
                 };
-                let ids = rows.iter().map(|r| r.message_id.clone()).collect();
+                let ids = Taken::Ids(rows.iter().map(|r| r.message_id.clone()).collect());
                 let leads = with_leads("", self.add_file(&mut out, &place, &fresh[i].poster, rows, parts));
                 finished.push((fresh[i].poster.clone(), Some(Place { parts, leads, ..place }), ids));
             }
@@ -695,9 +722,18 @@ impl Store {
                  values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                  on conflict(poster) do update set parts = excluded.parts, leads = excluded.leads, added = excluded.added",
             )?;
-            for (poster, place, ids) in finished {
-                for id in ids {
-                    done.execute([id])?;
+            let mut done_upto =
+                tx.prepare_cached("update headers set done = 1 where poster = ?1 and done = 0 and added <= ?2")?;
+            for (poster, place, taken) in finished {
+                match taken {
+                    Taken::Ids(ids) => {
+                        for id in ids {
+                            done.execute([id])?;
+                        }
+                    }
+                    Taken::UpTo(upto) => {
+                        done_upto.execute(params![poster, upto])?;
+                    }
                 }
                 if let Some(p) = place {
                     keep.execute(params![
@@ -868,7 +904,9 @@ pub async fn run(db: crate::indexer::Db, stopping: impl Fn() -> bool) {
                     with_store(|s| {
                         let t = now();
                         s.prune(t)?;
-                        s.pass_with(t, &mut unread)
+                        s.pass_with(t, &mut unread, &|| {
+                            crate::frozen::STOPPING.load(std::sync::atomic::Ordering::Relaxed)
+                        })
                     })
                 })
                 .await;
@@ -1087,13 +1125,16 @@ mod tests {
             store.record(["a.b.one", "a.b.two"][k as usize % 2], &[a], 1000).unwrap();
         }
         let later = 1001 + SETTLE_SECS;
-        assert!(store.pass_with(later, &mut |_, _| true).unwrap().releases.is_empty(), "a group hasnt read that day");
-        let found = store.pass_with(1001 + KEEP_SECS, &mut |_, _| true).unwrap();
+        assert!(
+            store.pass_with(later, &mut |_, _| true, &|| false).unwrap().releases.is_empty(),
+            "a group hasnt read that day"
+        );
+        let found = store.pass_with(1001 + KEEP_SECS, &mut |_, _| true, &|| false).unwrap();
         assert_eq!(found.releases.len(), 1, "not past a day");
         // not noted as saved: found again
-        assert_eq!(store.pass_with(1002 + KEEP_SECS, &mut |_, _| true).unwrap().releases.len(), 1);
+        assert_eq!(store.pass_with(1002 + KEEP_SECS, &mut |_, _| true, &|| false).unwrap().releases.len(), 1);
         store.ack(&found.ack).unwrap();
-        assert!(store.pass_with(1003 + KEEP_SECS, &mut |_, _| true).unwrap().releases.is_empty());
+        assert!(store.pass_with(1003 + KEEP_SECS, &mut |_, _| true, &|| false).unwrap().releases.is_empty());
     }
 
     #[test]
@@ -1154,11 +1195,11 @@ mod tests {
         let parts = |found: &Found| -> HashMap<String, i64> {
             found.releases.iter().flat_map(|r| &r.articles).map(|a| (a.message_id.clone(), a.part.unwrap())).collect()
         };
-        let first = parts(&store.pass_with(1001 + SETTLE_SECS, &mut |_, _| false).unwrap());
+        let first = parts(&store.pass_with(1001 + SETTLE_SECS, &mut |_, _| false, &|| false).unwrap());
         // not noted: another group's article, numbered lower, comes before the next pass
         let late = article(&format!("s{:023}", 0), "file@x.y", "2023-12-03 16:23:23", 1);
         store.record("a.b.two", &[late.clone()], 1002 + SETTLE_SECS).unwrap();
-        let again = parts(&store.pass_with(1003 + 2 * SETTLE_SECS, &mut |_, _| false).unwrap());
+        let again = parts(&store.pass_with(1003 + 2 * SETTLE_SECS, &mut |_, _| false, &|| false).unwrap());
         assert!(first.iter().all(|(id, p)| again[id] == *p), "the same numbers");
         assert_eq!(again[&late.message_id], 13, "what came since goes after");
     }
@@ -1201,5 +1242,24 @@ mod tests {
         assert_eq!(more.len(), 1);
         assert_eq!(more[0].name, first[0].name);
         assert_eq!(more[0].articles.len(), 7, "the late parts and the small file both join");
+    }
+
+    #[test]
+    fn a_stop_gives_the_pass_up_and_noise_let_go_spares_what_came_after() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&dir.path().join("atlas.xref.db")).unwrap();
+        for k in 0..20u64 {
+            let a = article(&format!("n{k:023}"), &format!("p{k}@x.y"), "2023-12-03 16:23:23", k);
+            store.record("a.b.one", &[a], 1000).unwrap();
+        }
+        let given_up = store.pass_with(1001 + SETTLE_SECS, &mut |_, _| false, &|| true).unwrap();
+        assert!(given_up.releases.is_empty() && given_up.ack.finished.is_empty(), "nothing found, nothing to note");
+        let found = store.pass_with(1001 + SETTLE_SECS, &mut |_, _| false, &|| false).unwrap();
+        assert_eq!(found.ack.finished.len(), 20, "each a file of one, let go");
+        // an article of one of them comes before the note is made: it isn't noted with them
+        let later = article(&format!("n{:023}", 99), "p3@x.y", "2023-12-03 16:23:23", 99);
+        store.record("a.b.one", &[later], 2000).unwrap();
+        store.ack(&found.ack).unwrap();
+        assert_eq!(store.waiting().unwrap().len(), 1, "the later article waits");
     }
 }
