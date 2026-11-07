@@ -109,4 +109,5 @@ follow-up that moves its callers onto `atlas::parity`:
   3), and `is_base_par2` differs (request 5). `creator_text` (drops e-mail addresses from
   Creator strings) is Atlas's privacy rule, not PAR2 math, and stays in Atlas.
 - `src/merging.rs`: `Par2Bridge` and `parse_rar5_volume_num`, a second obfuscated-name
-  resolver and RAR5 header reader; `parity::resolve` / `parity::rar5_volume` cover both.
+  resolver and RAR5 header reader (only tests call them today); `parity::resolve` /
+  `parity::rar5_volume` cover both.
