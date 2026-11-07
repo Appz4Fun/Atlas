@@ -1133,8 +1133,9 @@ fn own_whole_rar_set(conn: &Connection, release_id: i64) -> Result<bool> {
 }
 
 /// The extensions of a video that plays on its own.
-const VIDEO_EXTENSIONS: &[&str] =
-    &[".mkv", ".mp4", ".m4v", ".avi", ".ts", ".m2ts", ".wmv", ".mov", ".mpg", ".mpeg", ".webm"];
+/// `.m2ts` before `.ts`, so `film.m2ts` comes out as `film`.
+pub(crate) const VIDEO_EXTENSIONS: &[&str] =
+    &[".mkv", ".mp4", ".m4v", ".avi", ".m2ts", ".ts", ".wmv", ".mov", ".mpg", ".mpeg", ".webm"];
 
 /// Whether the release's files are one whole video named as the release, beside side files only (`one_video_named`).
 fn own_whole_video(conn: &Connection, release_id: i64) -> Result<bool> {
