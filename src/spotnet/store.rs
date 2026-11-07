@@ -428,9 +428,12 @@ pub fn placement(
             let mut wanted: std::collections::HashSet<i64> = ids.iter().map(|m| key.hash(&format!("<{m}>"))).collect();
             let mut suffixes = Default::default();
             for (file_id, _) in names.iter().filter(|(_, n)| n == filename) {
+                if wanted.is_empty() {
+                    break;
+                }
                 crate::store::file_id_hashes(conn, &key, *file_id, &mut suffixes, |h| {
                     wanted.remove(&h);
-                    Ok(())
+                    Ok(!wanted.is_empty())
                 })?;
             }
             if !wanted.is_empty() {

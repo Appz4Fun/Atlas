@@ -404,7 +404,7 @@ async fn fetch(
     let (check_name, check_group) = (release.name.clone(), group.clone());
     let in_use = on_shard(db, shard, move |conn| store::name_in_use(conn, &check_name, &check_group)).await?;
     let placed = if in_use {
-        // rare, and can be heavy (`index_release` of a big release): with the stage work, in its share
+        // rare, and can be heavy (reading a big release's ids): with the stage work, in its share
         let (check_name, check_group, key) = (release.name.clone(), group.clone(), nzb_key.clone());
         on_shard_queued(db, shard, move |conn| store::placement(conn, &check_name, &check_group, &key, &by_file))
             .await?

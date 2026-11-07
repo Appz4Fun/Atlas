@@ -991,24 +991,29 @@ impl IdKey {
     }
 }
 
-/// Every message-id of file `file_id`, sealed or not, by its keyed hash, to `each`.
+/// Every message-id of file `file_id`, sealed or not, by its keyed hash, to `each`, till it says false.
 pub(crate) fn file_id_hashes(
     conn: &Connection,
     key: &IdKey,
     file_id: i64,
     suffixes: &mut HashMap<i64, Option<String>>,
-    mut each: impl FnMut(i64) -> Result<()>,
+    mut each: impl FnMut(i64) -> Result<bool>,
 ) -> Result<()> {
-    // the blob is bounded by READ_MAX_SEGMENTS; the rows are not, so they
-    // stream from the cursor one at a time
-    for s in sealed_segments(conn, file_id)?.unwrap_or_default() {
-        each(key.hash(&seg_key(conn, suffixes, &s)?))?;
-    }
+    // the rows first: no blob read when they answer already
     let mut rows = conn.prepare_cached("select local, domain from segments where file_id = ?")?;
     let mut cursor = rows.query([file_id])?;
+    // the rows are not bounded, so they stream from the cursor one at a time
     while let Some(r) = cursor.next()? {
         let s = crate::blob::Seg { local: r.get(0)?, domain: r.get(1)?, part: None, bytes: 0 };
-        each(key.hash(&seg_key(conn, suffixes, &s)?))?;
+        if !each(key.hash(&seg_key(conn, suffixes, &s)?))? {
+            return Ok(());
+        }
+    }
+    // the blob is bounded by READ_MAX_SEGMENTS
+    for s in sealed_segments(conn, file_id)?.unwrap_or_default() {
+        if !each(key.hash(&seg_key(conn, suffixes, &s)?))? {
+            return Ok(());
+        }
     }
     Ok(())
 }
@@ -1039,7 +1044,7 @@ pub(crate) fn index_release(conn: &Connection, key: &IdKey, release_id: i64) -> 
             conn.prepare_cached("insert or ignore into release_ids (release_id, id_hash, file_id) values (?, ?, ?)")?;
         file_id_hashes(conn, key, file_id, &mut suffixes, |hash| {
             insert.execute(params![release_id, hash, file_id])?;
-            Ok(())
+            Ok(true)
         })?;
     }
     conn.prepare_cached("insert or ignore into release_ids (release_id, id_hash, file_id) values (?, 0, 0)")?
@@ -2114,7 +2119,10 @@ const PRUNE_IDS_IDLE_EVERY: std::time::Duration = std::time::Duration::from_mill
 /// after a pruning step fails, the next waits this long (seconds)
 const PRUNE_IDS_FAILED_REST: i64 = 600;
 
-/// how long a pruning step waits for a write lock another connection holds
+/// the same right after a save, or with one queued
+const PRUNE_IDS_BUSY_SAVING: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// how long a pruning step on an idle writer waits for a write lock another connection holds
 const PRUNE_IDS_BUSY: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// while more saves are queued, a pruning step at most this often
@@ -2268,7 +2276,8 @@ impl ShardWriter {
             return Ok(0);
         }
         self.ids_step = Some(Instant::now());
-        conn.busy_timeout(PRUNE_IDS_BUSY)?;
+        // with saves about, a held lock lets the step go at once nearly
+        conn.busy_timeout(if idle && !queued { PRUNE_IDS_BUSY } else { PRUNE_IDS_BUSY_SAVING })?;
         let done = self.prune_ids_step(conn, now, idle);
         conn.busy_timeout(crate::frozen::WRITER_BUSY)?;
         match done {
@@ -2353,12 +2362,14 @@ impl ShardWriter {
             let last = touched.max(indexed);
             if files < 2 || last < now - SEAL_AGE {
                 // its own row first: a release half taken is indexed again in full
-                taken += tx
+                let own = tx
                     .prepare_cached("delete from release_ids where release_id = ? and id_hash = 0")?
                     .execute([release_id])?;
+                taken += own;
                 tx.prepare_cached("delete from release_indexed where release_id = ?")?.execute([release_id])?;
                 w.pruning = Some(release_id);
-                quiet += 1;
+                // one half taken before a restart was counted then
+                quiet += own as u64;
             } else {
                 w.oldest_kept = Some(w.oldest_kept.map_or(last, |o| o.min(last)));
             }
