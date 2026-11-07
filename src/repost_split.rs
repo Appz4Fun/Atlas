@@ -188,7 +188,7 @@ const MAX_NUMBERS: u64 = 5_000_000;
 /// have seen, `k` between 2 and 20 (within 2%), over at least 50 parts. Rows whose files share part numbers for other
 /// reasons pass too; `decide` tells them apart once it has the Dates.
 pub fn looks_reposted(parts: i64, seen: i64) -> bool {
-    if seen < 50 || parts < 2 * seen {
+    if seen < 50 {
         return false;
     }
     let k = (parts as f64 / seen as f64).round();
@@ -235,14 +235,14 @@ fn list(main: &std::path::Path, sample: usize) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The release's first and last Date in UTC: `file_timing` keeps them by the poster's clock, soo one article's Date
-/// header gives the zone.
+/// The release's first and last Date in UTC, and how far the poster's clock is ahead of UTC: `file_timing` keeps
+/// Dates by the poster's clock, soo one article's Date header gives the zone.
 async fn span_utc(
     pool: &crate::nntp::Pool,
     conn: &rusqlite::Connection,
     id: i64,
     sample_id: &str,
-) -> anyhow::Result<Option<(i64, i64)>> {
+) -> anyhow::Result<Option<((i64, i64), i64)>> {
     let (first, last): (Option<i64>, Option<i64>) =
         conn.query_row("select min(first_date), max(last_date) from file_timing where release_id = ?", [id], |r| {
             Ok((r.get(0)?, r.get(1)?))
@@ -254,7 +254,7 @@ async fn span_utc(
     let offset = date
         .and_then(|d| Some(crate::dates::naive_timestamp(d.trim())? - crate::dates::posted_timestamp(d.trim())?))
         .unwrap_or(0);
-    Ok(Some((first - offset, last - offset)))
+    Ok(Some(((first - offset, last - offset), offset)))
 }
 
 /// `--split-reposts --id ID [--server HOST] [--apply]`: read the release's Dates, say what `decide` makes of them,
@@ -273,7 +273,7 @@ fn one(main: &std::path::Path, id: i64, server: Option<&str>, apply: bool) -> an
         None => pool.pool.indexing_servers().first().copied(),
     }
     .ok_or_else(|| anyhow::anyhow!("no such server"))?;
-    let Some(span) = pool.block_on(span_utc(&pool.pool, &conn, id, &sample))? else {
+    let Some((span, offset)) = pool.block_on(span_utc(&pool.pool, &conn, id, &sample))? else {
         anyhow::bail!("release {id} has no dates in file_timing")
     };
     let want: HashSet<String> = articles.iter().map(|a| a.4.clone()).collect();
@@ -321,7 +321,9 @@ fn one(main: &std::path::Path, id: i64, server: Option<&str>, apply: bool) -> an
         anyhow::bail!("release {id} changed since it was read; run it again");
     }
     let ids = crate::store::Ids::new(main);
-    match crate::store::split_uploads(&tx, &ids, id, &upload_of, windows)? {
+    // back on the poster's clock, as file_timing keeps them
+    let naive: HashMap<String, i64> = dates.iter().map(|(k, t)| (k.clone(), t + offset)).collect();
+    match crate::store::split_uploads(&tx, &ids, id, &upload_of, &naive, windows)? {
         Some(rows) => {
             tx.commit()?;
             println!("{id}: split, new rows {rows:?}");
@@ -415,6 +417,7 @@ mod tests {
     fn the_rows_worth_reading_dates_for() {
         assert!(looks_reposted(273_344, 54_669), "five uploads, one article missing");
         assert!(looks_reposted(328, 164));
+        assert!(looks_reposted(199, 100), "two uploads, one article missing");
         assert!(!looks_reposted(26, 1), "too few parts to tell");
         assert!(!looks_reposted(5_000, 3_000), "not a whole number of copies");
         assert!(!looks_reposted(54_669, 54_669), "one upload");
