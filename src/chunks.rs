@@ -8,7 +8,7 @@ use rusqlite::{Connection, OptionalExtension, Result, params};
 pub const CLAIM_TIMEOUT: i64 = 30 * 60;
 
 /// A chunk whose run failed rests this long before any server tries it again, doubling with each failure in a row up
-/// to `FAIL_REST_MOST`. While it rests it neither is claimed nor holds its month (see `newest_month`): on prod eight
+/// to `FAIL_REST_MOST`. While it rests it neither is claimed nor holds the others back (see `frontier`): on prod eight
 /// chunks of November that timed out or came back with broken compressed headers every time held all 4.8 million
 /// older chunks back, for a day.
 pub const FAIL_REST: i64 = 5 * 60;
@@ -267,15 +267,19 @@ pub fn want(conn: &Connection, group: &str, day: i64, now: i64) -> Result<bool> 
     Ok(n > 0)
 }
 
+/// Days of backfill a group may run ahead of the slowest: every group of a server reads one day before any goes more
+/// than this many days past it, soo all groups stay at about the same posting time (`frontier`). The articles of an
+/// upload spread over several groups are then read together, and linked across them (`xref`).
+pub const LOCKSTEP_DAYS: i64 = 1;
+
 /// Atomically claim the newest chunk that is pending or whose claim went
 /// stale, of `groups`: (group, oldest day the server keeps), `i64::MIN` when
-/// any day will do. A day asked for (`want`) goes first. The rest go a
-/// calendar month (UTC) at a time, newest month first: every group's days of
-/// one month are done before any group goes back into the month before it,
-/// soo the spare workers fill the recent past across all groups instead of
-/// taking one group all the way back to its oldest day first. Within a month
-/// the groups big releases come from (`media_groups`) go first, then the
-/// newest day.
+/// any day will do. A day asked for (`want`) goes first. The rest go in
+/// lockstep, newest day first: no group goes back more than `LOCKSTEP_DAYS`
+/// past the newest day any of them still has to do or is doing (`frontier`),
+/// soo a small group waits for a big one instead of racing back alone, and
+/// spare workers wait too. Within that the newest day goes first, a group big
+/// releases come from (`media_groups`) first among equals.
 pub fn claim(conn: &Connection, groups: &[(String, i64)], host: &str, now: i64) -> Result<Option<Claim>> {
     if groups.is_empty() {
         return Ok(None);
@@ -283,14 +287,17 @@ pub fn claim(conn: &Connection, groups: &[(String, i64)], host: &str, now: i64) 
     if let Some(claim) = claim_wanted(conn, groups, host, now)? {
         return Ok(Some(claim));
     }
+    let Some(frontier) = frontier(conn, groups, now)? else { return Ok(None) };
+    let floor = frontier - LOCKSTEP_DAYS;
+    let groups: Vec<(String, i64)> = groups.iter().map(|(g, oldest)| (g.clone(), (*oldest).max(floor))).collect();
     let media = media_groups(conn)?;
-    claim_newest(conn, groups, &media, host, now)
+    claim_newest(conn, &groups, &media, host, now)
 }
 
 /// The claim of a pass over split `group` on its own backfill turn: (group, oldest day the server keeps). A day asked
-/// for (`want`) of it first, else its newest day in the newest month any of `all` (likewise, `group` among them) still
-/// has to do, else none: a group whose days left are older waits until the newer months of the others are done,
-/// rather than every split group's turn going on back into its own past (see `claim`).
+/// for (`want`) of it first, else its newest day no more than `LOCKSTEP_DAYS` past the newest day any of `all`
+/// (likewise, `group` among them) still has to do or is doing, else none: a group whose days left are older waits
+/// for the others to come back to them (see `claim`).
 pub fn claim_turn(
     conn: &Connection,
     group: (String, i64),
@@ -301,14 +308,15 @@ pub fn claim_turn(
     if let Some(claim) = claim_wanted(conn, std::slice::from_ref(&group), host, now)? {
         return Ok(Some(claim));
     }
-    let Some(floor) = newest_month(conn, all, now)? else { return Ok(None) };
+    let Some(frontier) = frontier(conn, all, now)? else { return Ok(None) };
     let (g, oldest) = group;
-    claim_newest(conn, &[(g, oldest.max(floor))], &[], host, now)
+    claim_newest(conn, &[(g, oldest.max(frontier - LOCKSTEP_DAYS))], &[], host, now)
 }
 
-/// The first day of the newest month (UTC) with a day pending or claimed stale of `groups`: (group, oldest day the
-/// server keeps).
-pub fn newest_month(conn: &Connection, groups: &[(String, i64)], now: i64) -> Result<Option<i64>> {
+/// The newest day any of `groups` still has to do or is doing: (group, oldest day the server keeps). A day pending
+/// (not resting after a failure, see `FAIL_REST`) or claimed, however fresh the claim: a day being read holds the
+/// groups behind it (`claim`). None when none is left.
+pub fn frontier(conn: &Connection, groups: &[(String, i64)], now: i64) -> Result<Option<i64>> {
     if groups.is_empty() {
         return Ok(None);
     }
@@ -322,20 +330,18 @@ pub fn newest_month(conn: &Connection, groups: &[(String, i64)], now: i64) -> Re
                   from wanted w
                   union all
                   select (select c.day from backfill_chunks c
-                          where c.grp = w.g and c.state = {CLAIMED} and c.day >= w.oldest and c.claimed_at < ?
+                          where c.grp = w.g and c.state = {CLAIMED} and c.day >= w.oldest
                           order by c.day desc limit 1)
                   from wanted w
               )
-         select cast(strftime('%s', max(day) * 86400, 'unixepoch', 'start of month') as integer) / 86400
-         from newest",
+         select max(day) from newest",
         resting = not_resting(now)
     );
-    let mut values: Vec<rusqlite::types::Value> = Vec::with_capacity(groups.len() * 2 + 1);
+    let mut values: Vec<rusqlite::types::Value> = Vec::with_capacity(groups.len() * 2);
     for (g, oldest) in groups {
         values.push(g.clone().into());
         values.push((*oldest).into());
     }
-    values.push((now - CLAIM_TIMEOUT).into());
     conn.prepare(&sql)?.query_row(rusqlite::params_from_iter(values), |r| r.get(0))
 }
 
@@ -393,7 +399,7 @@ fn claim_wanted(conn: &Connection, groups: &[(String, i64)], host: &str, now: i6
 }
 
 /// The chunk `claim` takes after the days asked for: of each group its newest day pending or with a stale claim, then
-/// of those the newest month's (see `claim`), a group of `media` first, the newest day.
+/// of those the newest, a group of `media` first among equals (see `claim`).
 fn claim_newest(
     conn: &Connection,
     groups: &[(String, i64)],
@@ -426,7 +432,7 @@ fn claim_newest(
          update backfill_chunks set state = ?, server = ?, claimed_at = ?
          where (grp, day) = (
              select grp, day from best where day is not null
-             order by date(day * 86400, 'unixepoch', 'start of month') desc, media desc, day desc limit 1)
+             order by day desc, media desc limit 1)
          returning grp, day",
         resting = not_resting(now)
     );
@@ -492,7 +498,7 @@ pub struct GroupChunks {
     /// the oldest and newest day of its chunks
     pub oldest_day: i64,
     pub newest_day: i64,
-    /// the oldest day done: backfill goes newest month first, soo this is how far back it has come
+    /// the oldest day done: backfill goes newest day first, soo this is how far back it has come
     pub oldest_done_day: Option<i64>,
 }
 
@@ -654,24 +660,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_failed_chunk_rests_and_doesnt_hold_its_month() {
+    fn a_failed_chunk_rests_and_doesnt_hold_the_others() {
         let c = Connection::open_in_memory().unwrap();
         create(&c).unwrap();
-        // `new` has the newest month (2024-11-03), `old` only October
+        // `new` has the newest day (2024-11-03), `old` only October
         add(&c, "new", 20_030, 20_030).unwrap();
         add(&c, "old", 20_020, 20_019).unwrap();
         let all: Vec<(String, i64)> = ["new", "old"].iter().map(|g| (g.to_string(), i64::MIN)).collect();
         let turn = |g: &str, host: &str, now| claim_turn(&c, (g.to_string(), i64::MIN), &all, host, now).unwrap();
-        assert!(turn("old", "a", 1000).is_none(), "November first: old waits");
+        assert!(turn("old", "a", 1000).is_none(), "new's day first: old waits");
         let new = turn("new", "a", 1000).unwrap();
         assert!(fail(&c, &new, 1000).unwrap());
         assert!(!fail(&c, &new, 1000).unwrap(), "a claim gives it back once");
-        // resting, it neither is taken nor holds November
+        // resting, it neither is taken nor holds the others
         assert!(turn("new", "b", 1001).is_none());
-        let old = turn("old", "b", 1001).expect("October goes on while November rests");
+        let old = turn("old", "b", 1001).expect("old goes on while new's day rests");
         assert_eq!(old.day, 20_020);
         assert_eq!(claim(&c, &all, "c", 1001).unwrap().map(|k| k.day), Some(20_019), "nor does a free worker take it");
-        // after its rest it is the newest month again, and a second failure rests twice as long
+        // after its rest it is the newest day again, and a second failure rests twice as long
         let again = turn("new", "b", 1000 + FAIL_REST).unwrap();
         assert!(fail(&c, &again, 1000 + FAIL_REST).unwrap());
         assert!(turn("new", "b", 1000 + 2 * FAIL_REST).is_none());
@@ -772,30 +778,29 @@ mod tests {
         add(&c, "few", 20_010, 20_000).unwrap();
         let groups: Vec<(String, i64)> = ["plain", "media", "few"].iter().map(|g| (g.to_string(), 20_005)).collect();
         // ties go by group name, `media` before `plain`: start where that wouldn't show
-        assert_eq!(claim(&c, &groups, "a", 0).unwrap().unwrap().day, 20_010);
+        let first = claim(&c, &groups, "a", 0).unwrap().unwrap();
+        assert_eq!(first.day, 20_010);
+        assert!(finish(&c, &first, 0).unwrap());
         set_media(&c, &[("media".into(), 500), ("few".into(), MEDIA_MIN - 1)]).unwrap();
         let mut got = Vec::new();
         while let Some(claim) = claim(&c, &groups, "a", 0).unwrap() {
+            assert!(finish(&c, &claim, 0).unwrap());
             got.push((claim.group, claim.day));
         }
-        let media: Vec<i64> = got.iter().take_while(|(g, _)| g == "media").map(|(_, d)| *d).collect();
-        assert_eq!(media.len(), 6, "every day of `media` the server keeps, first: {got:?}");
-        assert!(media.windows(2).all(|w| w[0] > w[1]), "newest first");
-        assert!(got.iter().skip(6).all(|(g, _)| g != "media"));
+        // day by day, newest first, and of each day `media` first
+        assert!(got.windows(2).all(|w| w[0].1 >= w[1].1), "{got:?}");
+        for d in 20_005..20_010 {
+            assert_eq!(got.iter().find(|(_, day)| *day == d).map(|(g, _)| g.as_str()), Some("media"), "{got:?}");
+        }
         // noted again from scratch
         set_media(&c, &[("plain".into(), 30)]).unwrap();
         assert_eq!(media_groups(&c).unwrap(), ["plain"]);
     }
 
-    /// the month (`YYYY-MM`, UTC) of a unix day
-    fn month(day: i64) -> String {
-        chrono::DateTime::from_timestamp(day * 86_400, 0).unwrap().format("%Y-%m").to_string()
-    }
-
-    /// Spare workers fill a month of every group before any group goes back into the month before it, a group big
-    /// releases come from first within each month, rather than one group all the way back to its oldest day first.
+    /// Every group's backfill goes back day by day together: no group claims a day more than `LOCKSTEP_DAYS` past
+    /// the newest day any of them still has to do or is doing, however far back its own days go.
     #[test]
-    fn months_are_backfilled_newest_first_over_every_group() {
+    fn groups_are_backfilled_in_lockstep() {
         let c = conn();
         // `deep` (a media group) 2024-08-25..=10-24, `recent` 2024-10-04..=11-03
         add(&c, "deep", 20_020, 19_960).unwrap();
@@ -804,69 +809,70 @@ mod tests {
         let groups: Vec<(String, i64)> = ["deep", "recent"].iter().map(|g| (g.to_string(), i64::MIN)).collect();
         let mut got = Vec::new();
         while let Some(claim) = claim(&c, &groups, "a", 0).unwrap() {
+            assert!(finish(&c, &claim, 0).unwrap());
             got.push((claim.group, claim.day));
         }
         assert_eq!(got.len(), 61 + 31);
-        // runs of (group, month) in the order they were claimed
-        let mut runs: Vec<(String, String)> = Vec::new();
-        for (g, d) in &got {
-            let run = (g.clone(), month(*d));
-            if runs.last() != Some(&run) {
-                runs.push(run);
-            }
+        assert!(got.windows(2).all(|w| w[0].1 >= w[1].1), "newest day first over both: {got:?}");
+        assert_eq!(got[10], ("deep".to_string(), 20_020), "a media group first among equals");
+
+        // a day being read holds the rest: the next day goes, not one further back
+        let c = conn();
+        add(&c, "big", 20_030, 20_020).unwrap();
+        add(&c, "small", 20_030, 20_020).unwrap();
+        let groups: Vec<(String, i64)> = ["big", "small"].iter().map(|g| (g.to_string(), i64::MIN)).collect();
+        let big = claim(&c, &groups, "a", 1000).unwrap().unwrap();
+        assert_eq!((big.group.as_str(), big.day), ("big", 20_030));
+        let mut small = Vec::new();
+        while let Some(k) = claim(&c, &groups, "b", 1000).unwrap() {
+            assert!(finish(&c, &k, 1000).unwrap());
+            small.push((k.group, k.day));
         }
-        let want: Vec<(String, String)> = [
-            ("recent", "2024-11"),
-            ("deep", "2024-10"),
-            ("recent", "2024-10"),
-            ("deep", "2024-09"),
-            ("deep", "2024-08"),
-        ]
-        .iter()
-        .map(|(g, m)| (g.to_string(), m.to_string()))
-        .collect();
-        assert_eq!(runs, want, "{got:?}");
-        // newest day first within each run
-        assert!(got.windows(2).filter(|w| w[0].0 == w[1].0).all(|w| w[0].1 > w[1].1), "{got:?}");
-        // a stale claim in the newest month is taken over before an older month
+        assert!(small.iter().all(|(_, d)| *d >= 20_030 - LOCKSTEP_DAYS), "{small:?}");
+        assert_eq!(small.len(), 3, "small's 20030 and 20029, big's 20029: {small:?}");
+        // once big's day is read, the rest move on a day
+        assert!(finish(&c, &big, 1000).unwrap());
+        assert_eq!(day(claim(&c, &groups, "b", 1000)), Some(20_028));
+        // a stale claim is taken over first, and holds the rest meanwhile
         let c = conn();
         add(&c, "g", 20_030, 20_026).unwrap();
         let groups = vec![("g".to_string(), i64::MIN)];
         let first = claim(&c, &groups, "a", 1000).unwrap().unwrap();
-        assert_eq!(month(first.day), "2024-11");
-        while claim(&c, &groups, "a", 1000).unwrap().is_some_and(|c| month(c.day) == "2024-11") {}
+        assert_eq!(day(claim(&c, &groups, "a", 1000)), Some(20_029));
+        assert_eq!(claim(&c, &groups, "a", 1000).unwrap(), None, "20030 is still being read");
         let late = claim(&c, &groups, "b", 1000 + CLAIM_TIMEOUT + 1).unwrap().unwrap();
-        assert_eq!(late.day, first.day, "the stale claim of the newest month first");
+        assert_eq!(late.day, first.day, "the stale claim first");
     }
 
-    /// A split group's own backfill turn takes a day of the newest month any tracked split group has left, or a day
-    /// asked for, and otherwise nothing: one whose days left are years old waits for the newer months of the others.
+    /// A split group's own backfill turn takes a day no more than `LOCKSTEP_DAYS` past the newest any tracked split
+    /// group has left, or a day asked for, and otherwise nothing: one whose days left are years old waits for the
+    /// others to come back to them.
     #[test]
-    fn a_groups_own_turn_waits_for_the_newest_month() {
+    fn a_groups_own_turn_waits_for_the_others() {
         let c = conn();
         // `old` 2022-04-04..=13, `recent` 2024-10-30..=11-03
         add(&c, "old", 19_095, 19_086).unwrap();
         add(&c, "recent", 20_030, 20_026).unwrap();
         let all: Vec<(String, i64)> = ["old", "recent"].iter().map(|g| (g.to_string(), i64::MIN)).collect();
         let turn = |g: &str, now: i64| claim_turn(&c, (g.to_string(), i64::MIN), &all, "a", now).unwrap();
-        assert_eq!(newest_month(&c, &all, 0).unwrap().map(month), Some("2024-11".to_string()));
-        assert_eq!(turn("old", 0), None, "nothing while 2024-11 is left");
+        assert_eq!(frontier(&c, &all, 0).unwrap(), Some(20_030));
+        assert_eq!(turn("old", 0), None, "nothing while recent's days are left");
         // a day asked for goes anyway
         assert!(want(&c, "old", 19_090, 0).unwrap());
         let asked = turn("old", 0).unwrap();
         assert_eq!(asked.day, 19_090);
         assert!(finish(&c, &asked, 0).unwrap());
         assert_eq!(turn("old", 0), None);
-        // `recent` takes its november days, then its october ones once november is all claimed
-        let days: Vec<i64> = std::iter::from_fn(|| turn("recent", 0).map(|c| c.day)).collect();
+        // `recent` takes its days one by one as each is read
+        let mut days = Vec::new();
+        while let Some(k) = turn("recent", 0) {
+            assert!(finish(&c, &k, 0).unwrap());
+            days.push(k.day);
+        }
         assert_eq!(days, [20_030, 20_029, 20_028, 20_027, 20_026]);
-        // every newer day claimed, not done: `old`'s month is the newest left
+        // recent all read: `old`'s days are the newest left
         assert_eq!(turn("old", 0).map(|c| c.day), Some(19_095));
-        // a stale claim of a newer month holds `old` back again
-        assert_eq!(newest_month(&c, &all, CLAIM_TIMEOUT + 1).unwrap().map(month), Some("2024-11".to_string()));
-        assert_eq!(turn("old", CLAIM_TIMEOUT + 1), None);
-        assert_eq!(turn("recent", CLAIM_TIMEOUT + 1).map(|c| c.day), Some(20_030));
-        assert_eq!(newest_month(&c, &[], 0).unwrap(), None);
+        assert_eq!(frontier(&c, &[], 0).unwrap(), None);
     }
 
     #[test]
@@ -925,9 +931,10 @@ mod tests {
         let c = conn();
         add(&c, "g", 12, 10).unwrap();
         let groups = vec![("g".to_string(), i64::MIN)];
-        // a takes day 12, then day 11, then day 10 (the split's oldest), as the deepest
+        // a reads day 12, then day 11, then takes day 10 (the split's oldest), as the deepest
         for _ in 0..2 {
-            claim(&c, &groups, "a", 1000).unwrap().unwrap();
+            let k = claim(&c, &groups, "a", 1000).unwrap().unwrap();
+            assert!(finish(&c, &k, 1000).unwrap());
         }
         let a = claim(&c, &groups, "a", 1000).unwrap().unwrap();
         assert_eq!(a.day, 10);
@@ -946,7 +953,7 @@ mod tests {
         // a's late finish and release do nothing
         assert!(!finish(&c, &a, 2000).unwrap());
         assert!(!release(&c, &a).unwrap());
-        assert_eq!(progress(&c, "g").unwrap(), (0, 3));
+        assert_eq!(progress(&c, "g").unwrap(), (2, 3), "days 12 and 11 read");
         // and the next to claim it is not a stale claim's
         assert_eq!(day(claim(&c, &groups, "b", 1001)), Some(10));
     }
@@ -1067,8 +1074,11 @@ mod tests {
         let c = conn();
         add(&c, "g", 12, 10).unwrap();
         let from_11 = [("g".to_string(), 11)];
-        assert_eq!(day(claim(&c, &from_11, "short", 0)), Some(12));
-        assert_eq!(day(claim(&c, &from_11, "short", 0)), Some(11));
+        for d in [12, 11] {
+            let k = claim(&c, &from_11, "short", 0).unwrap().unwrap();
+            assert_eq!(k.day, d);
+            assert!(finish(&c, &k, 0).unwrap());
+        }
         assert_eq!(day(claim(&c, &from_11, "short", 0)), None, "day 10 is older than it keeps");
         assert_eq!(day(claim(&c, &[("g".to_string(), i64::MIN)], "long", 0)), Some(10));
     }

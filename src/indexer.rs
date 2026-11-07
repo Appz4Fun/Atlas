@@ -988,8 +988,8 @@ where
         )
         .await?
     {
-        // a split group's backfill is day chunks, this server takes the next one: a day asked for, or one of the
-        // newest month any tracked split group still has to do (see `chunks::claim_turn`), else none
+        // a split group's backfill is day chunks, this server takes the next one: a day asked for, or one no more than
+        // a day past the newest any tracked split group still has to do (see `chunks::claim_turn`), else none
         let host = ctx.pool.host(server);
         let wanted = (group.to_string(), ctx.states.keeps_from(group, &host));
         let (kept, running) = (ctx.states.kept_days(&host), ctx.states.groups());
