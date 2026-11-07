@@ -148,14 +148,14 @@ fn nzb_stored_in(listing: &Listing, body: &[u8], password: Option<&str>) -> Opti
 /// The NZB an archive of this release names inside, read whole from the release's own articles when the release is
 /// small enough to (`follow::MAX_POST_BYTES`), and followed on hop after hop. None: no NZB named, an encrypted
 /// archive, a release too big, or an article not there.
-/// `head_file`: the file whose first article told the archive; `known`: that article by its message-id, when it was
-/// read whole and not only its start.
+/// `head_file`: the file whose first article told the archive; `known`: articles already read whole, by their
+/// message-ids, that one among them when it was read whole and not only its start.
 fn deep_nzb(
     ctx: &mut StepCtx<'_>,
     files: &[FileInfo],
     listing: &Listing,
     head_file: &FileInfo,
-    known: Option<(&str, &[u8])>,
+    known: &[(&str, &[u8])],
     mut left: follow::Budget,
 ) -> Result<Option<(Listing, Option<String>)>, StepError> {
     if !may_follow(ctx, listing) {
@@ -213,7 +213,8 @@ fn followed(
 /// `deep_nzb` for a release whose one archive is a ZIP posted as one file: the NZB inside it read by range, its
 /// directory and that entry's articles, rather than the whole archive. The entry is the one reading it whole would
 /// take: the biggest file named as an NZB, the first of equals. None: the release isn't that, or anything stood in
-/// the way, and `deep_nzb` reads it whole as before. What's fetched and decoded comes out of `left`.
+/// the way, and `deep_nzb` reads it whole as before. What's fetched and decoded comes out of `left`; every article
+/// fetched goes into `kept`, by its message-id, for that whole read not to fetch it again.
 fn zip_nzb(
     ctx: &mut StepCtx<'_>,
     files: &[FileInfo],
@@ -221,6 +222,7 @@ fn zip_nzb(
     head_file: &FileInfo,
     posted: Option<&mut Posted>,
     left: &mut follow::Budget,
+    kept: &mut Vec<(String, Vec<u8>)>,
 ) -> Result<Option<Vec<u8>>, StepError> {
     let Some(posted) = posted else { return Ok(None) };
     if !may_follow(ctx, listing) {
@@ -238,7 +240,7 @@ fn zip_nzb(
         return Ok(None);
     }
     let found = {
-        let mut fetch = |part: i64| trusted_part(ctx, head_file, part, left);
+        let mut fetch = |part: i64| trusted_part(ctx, head_file, part, left, kept);
         posted.zip_directory(&mut fetch)?
     };
     let Some((index, _)) = found else { return Ok(None) };
@@ -253,7 +255,7 @@ fn zip_nzb(
         return Ok(None);
     }
     let read = {
-        let mut fetch = |part: i64| trusted_part(ctx, head_file, part, left);
+        let mut fetch = |part: i64| trusted_part(ctx, head_file, part, left, kept);
         posted.zip_entry(&index, entry, &mut fetch)?
     };
     let Some(bytes) = read else { return Ok(None) };
@@ -265,12 +267,14 @@ fn zip_nzb(
 }
 
 /// One article of the release's own file by its part number, decoded, counted as reading it whole counts a trusted
-/// article: one request and its bytes. None: not indexed, not there, or past what `left` allows.
+/// article: one request and its bytes. None: not indexed, not there, or past what `left` allows. What came is kept
+/// in `kept` whatever becomes of it, even a piece of another size.
 fn trusted_part(
     ctx: &mut StepCtx<'_>,
     file: &FileInfo,
     part: i64,
     left: &mut follow::Budget,
+    kept: &mut Vec<(String, Vec<u8>)>,
 ) -> Result<Option<Vec<u8>>, StepError> {
     if left.articles < 1 || ctx.bodies_left() < 1 {
         return Ok(None);
@@ -279,6 +283,7 @@ fn trusted_part(
     let segs = ctx.segments(file.id, &SegmentPick::Parts(vec![part])).map_err(retry)?;
     let Some(seg) = segs.into_iter().find(|s| s.part == Some(part)) else { return Ok(None) };
     let Some(body) = fetch_one(ctx, &seg, &file.filename)? else { return Ok(None) };
+    kept.push((seg.message_id, body.clone()));
     if body.len() as u64 > left.bytes {
         return Ok(None);
     }
@@ -1098,12 +1103,14 @@ fn budgeted(
 
 /// ZIP's directory is at its end: the article read, then its set's last. A directory longer than the last article,
 /// in a ZIP posted as one file, is read from the articles it spans, as zipview's `ZipIndex` asks for them. Also gives
-/// the file as read so far, for an entry to be read from by range, when its articles are of one size.
+/// the file as read so far, for an entry to be read from by range, when its articles are of one size. Every article
+/// fetched goes into `kept`, by its message-id, for a whole read after not to fetch it again.
 fn zip_list(
     ctx: &mut StepCtx<'_>,
     head: &Head<'_>,
     body: &[u8],
     left: &mut usize,
+    kept: &mut Vec<(String, Vec<u8>)>,
 ) -> Result<(Listing, Option<Posted>), StepError> {
     // a file posted whole, read whole: the article read is all of it
     let whole = !head.probe && head.tail.id == head.file.id && head.file.expected == Some(1);
@@ -1116,6 +1123,9 @@ fn zip_list(
     let segs = tail_articles(ctx, head.tail)?;
     let Some(last) = segs.last() else { return Ok((zip::list(body, &[]), None)) };
     let tail = budgeted(ctx, last, &head.tail.filename, left)?;
+    if let Some(tail) = &tail {
+        kept.push((last.message_id.clone(), tail.clone()));
+    }
     let listing = zip::list(body, tail.as_deref().unwrap_or(&[]));
     // by range only what was posted as one file, its first article read whole: its length is then known
     let pieces = head.file.expected.and_then(|n| u64::try_from(n).ok()).filter(|n| *n > 1);
@@ -1131,7 +1141,7 @@ fn zip_list(
     let Some(mut posted) = posted else { return Ok((listing, None)) };
     let file = head.file;
     let wider = {
-        let mut fetch = |part: i64| part_of(ctx, file, part, left);
+        let mut fetch = |part: i64| part_of(ctx, file, part, left, kept);
         posted.zip_directory(&mut fetch)?
     };
     let Some((_, tail)) = wider else { return Ok((listing, Some(posted))) };
@@ -1140,11 +1150,22 @@ fn zip_list(
     Ok((if better { wider } else { listing }, Some(posted)))
 }
 
-/// One article of a file by its part number, decoded, within the budget. None: it isn't indexed or didn't come.
-fn part_of(ctx: &mut StepCtx<'_>, file: &FileInfo, part: i64, left: &mut usize) -> Result<Option<Vec<u8>>, StepError> {
+/// One article of a file by its part number, decoded, within the budget, and kept in `kept`. None: it isn't indexed
+/// or didn't come.
+fn part_of(
+    ctx: &mut StepCtx<'_>,
+    file: &FileInfo,
+    part: i64,
+    left: &mut usize,
+    kept: &mut Vec<(String, Vec<u8>)>,
+) -> Result<Option<Vec<u8>>, StepError> {
     let segs = ctx.segments(file.id, &SegmentPick::Parts(vec![part])).map_err(retry)?;
     let Some(seg) = segs.into_iter().find(|s| s.part == Some(part)) else { return Ok(None) };
-    budgeted(ctx, &seg, &file.filename, left)
+    let body = budgeted(ctx, &seg, &file.filename, left)?;
+    if let Some(body) = &body {
+        kept.push((seg.message_id, body.clone()));
+    }
+    Ok(body)
 }
 
 /// 7z's header may be at its end, in up to its set's last two articles.
@@ -1293,7 +1314,7 @@ impl Step for ListStep {
                         &files,
                         &listing,
                         head.file,
-                        (!head.probe).then_some((seg.message_id.as_str(), &body[..])),
+                        (!head.probe).then_some((seg.message_id.as_str(), &body[..])).as_slice(),
                         follow::Budget::of(limits.max_bodies_per_release),
                     )?
                     .or_else(|| nzb_stored_in(&listing, &body, pw_found.as_deref()));
@@ -1310,7 +1331,9 @@ impl Step for ListStep {
                     return with_nzb(ctx, outcome, inside, wrapper_encrypted, has_inner_nzb, pw_available, &limits);
                 }
                 Format::Zip => {
-                    let (listing, mut posted) = zip_list(ctx, &head, &body, &mut left)?;
+                    // the articles read past the first, for a whole read not to fetch them again
+                    let mut kept: Vec<(String, Vec<u8>)> = Vec::new();
+                    let (listing, mut posted) = zip_list(ctx, &head, &body, &mut left, &mut kept)?;
                     let wrapper_encrypted = listing.encrypted;
                     let has_inner_nzb = listing.files.iter().any(|f| select::classify(&f.name) == Kind::Nzb);
                     let pw_found = if listing.encrypted {
@@ -1320,18 +1343,22 @@ impl Step for ListStep {
                         None
                     };
                     let pw_available = pw_found.is_some();
-                    let mut budget = follow::Budget::of(limits.max_bodies_per_release);
-                    let by_range = zip_nzb(ctx, &files, &listing, head.file, posted.as_mut(), &mut budget)?;
+                    let fresh = follow::Budget::of(limits.max_bodies_per_release);
+                    let mut budget = fresh;
+                    let by_range = zip_nzb(ctx, &files, &listing, head.file, posted.as_mut(), &mut budget, &mut kept)?;
                     let inside = match by_range {
                         Some(found) => followed(ctx, &listing, found, budget)?,
-                        None => deep_nzb(
-                            ctx,
-                            &files,
-                            &listing,
-                            head.file,
-                            (!head.probe).then_some((seg.message_id.as_str(), &body[..])),
-                            budget,
-                        )?,
+                        None => {
+                            // read whole, what the ranged read fetched isn't fetched again: its requests stay spent,
+                            // and its bytes are counted once, as the whole read counts every article's
+                            let mut known: Vec<(&str, &[u8])> =
+                                kept.iter().map(|(id, got)| (id.as_str(), &got[..])).collect();
+                            if !head.probe {
+                                known.push((seg.message_id.as_str(), &body[..]));
+                            }
+                            let whole = follow::Budget { articles: budget.articles, ..fresh };
+                            deep_nzb(ctx, &files, &listing, head.file, &known, whole)?
+                        }
                     }
                     .or_else(|| nzb_stored_in(&listing, &body, pw_found.as_deref()));
                     let mut outcome = finish(ctx, SOURCE_ZIP, listing, &limits)?;
@@ -1362,7 +1389,7 @@ impl Step for ListStep {
                         &files,
                         &listing,
                         head.file,
-                        (!head.probe).then_some((seg.message_id.as_str(), &body[..])),
+                        (!head.probe).then_some((seg.message_id.as_str(), &body[..])).as_slice(),
                         follow::Budget::of(limits.max_bodies_per_release),
                     )?
                     .or_else(|| nzb_stored_in(&listing, &body, pw_found.as_deref()));

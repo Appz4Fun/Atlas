@@ -314,6 +314,39 @@ fn an_nzb_in_a_small_zip_is_read_by_range_as_it_reads_whole() {
 }
 
 #[test]
+fn a_zip_whose_ranged_read_fails_is_read_whole_without_fetching_an_article_twice() {
+    const PIECE: usize = 64 << 10;
+    let big: Vec<u8> = (0..300_000u32).map(|i| (i * 7 % 251) as u8).collect();
+    let whole = zip_of(&[("big.bin", &big), ("Pointed.At.nzb", &an_nzb(POINTED_AT))]);
+    let mut h = fresh();
+    serve(&mut h, &shape("x").one("x.zip", &whole), config());
+    settled(&h, "x");
+    let read_whole = rows(&h, "x");
+    assert!(read_whole.iter().any(|r| r.source == 5), "{read_whole:?}");
+
+    // the last but one shorter than the others: the first and last say a length the file isn't, and the range read
+    // of the end stops on that piece
+    let front = whole.len() / PIECE - 1;
+    let remaining = whole.len() - front * PIECE;
+    let last = remaining / 2;
+    let short = remaining - last;
+    assert!(short < PIECE && last < short, "{short} {last}");
+    let n = front as i64 + 2;
+    let mut s = shape("x");
+    for (i, chunk) in whole[..front * PIECE].chunks(PIECE).enumerate() {
+        s = s.add("x.zip", i as i64 + 1, n, yenc_body("x.zip", chunk));
+    }
+    let (second_last, tail) = whole[front * PIECE..].split_at(short);
+    s = s.add("x.zip", n - 1, n, yenc_body("x.zip", second_last)).add("x.zip", n, n, yenc_body("x.zip", tail));
+    let mut h = fresh();
+    let state = serve(&mut h, &s, config());
+    settled(&h, "x");
+    assert_eq!(rows(&h, "x"), read_whole);
+    // each article once: the last but one the range read fetched is the whole read's, not fetched again
+    assert_eq!(bodies(&state), n as usize);
+}
+
+#[test]
 fn an_encoded_7z_reads_its_head_and_tail() {
     let mut h = fresh();
     let (head, tail) = a_7z(1_000);

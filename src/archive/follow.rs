@@ -123,7 +123,7 @@ pub fn follow_with_password(
             break;
         }
         let wholes: Vec<Whole> = parsed.files.iter().filter_map(Whole::of).collect();
-        match nzb_inside(ctx, None, &wholes, Some(&mut inside), None, left)? {
+        match nzb_inside(ctx, None, &wholes, Some(&mut inside), &[], left)? {
             Some(next) => body = next,
             None => break,
         }
@@ -141,14 +141,14 @@ pub fn follow_with_password(
 
 /// The next NZB in these files: one posted as a file, or one an archive set of them holds, read whole. `first` is a
 /// set to try before the rest, as a release's own archive known by its bytes and not its name; `names` takes the names
-/// inside each archive read; `known` is an article already read, by its message-id, not fetched again. What's fetched
+/// inside each archive read; `known` are articles already read, by their message-ids, not fetched again. What's fetched
 /// and unpacked comes out of `left`, whatever the NZB claimed.
 pub fn nzb_inside(
     ctx: &mut StepCtx<'_>,
     first: Option<Set>,
     files: &[Whole],
     mut names: Option<&mut Vec<InnerFile>>,
-    known: Option<(&str, &[u8])>,
+    known: &[(&str, &[u8])],
     left: &mut Budget,
 ) -> Result<Option<Vec<u8>>, StepError> {
     for set in first.into_iter().chain(sets(files)) {
@@ -272,14 +272,14 @@ fn compressed(name: &str) -> bool {
 fn download_set(
     ctx: &mut StepCtx<'_>,
     set: &Set,
-    known: Option<(&str, &[u8])>,
+    known: &[(&str, &[u8])],
     left: &mut Budget,
 ) -> Result<Option<Vec<Vec<u8>>>, StepError> {
     let mut files = Vec::with_capacity(set.files.len());
     for file in &set.files {
         let mut whole = Vec::new();
         for id in &file.ids {
-            let body = match known.filter(|(known, _)| known == id) {
+            let body = match known.iter().find(|(known, _)| known == id) {
                 Some((_, body)) => body.to_vec(),
                 None => {
                     // a hop's article is two requests, its headers and its body: both counted, and both must fit what
