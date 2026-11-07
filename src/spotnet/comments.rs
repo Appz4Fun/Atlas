@@ -1,10 +1,10 @@
 //! Comments on spots, and spam reports, as Spotweb reads them. A comment is an article in `free.usenet` whose
 //! message-id starts with its spot's (`<spot>.<rating>.<random>.<random>@spot.net`); its text is the article's
-//! body. A report is an article in `free.willey` whose subject is `REPORT <spot message-id> ...`. Comments and
-//! reports on spots Atlas keeps (`spots_seen`, waiting or saved) are noted, in the main database, and so are those
-//! from the last `GRACE_DAYS` on spots not seen yet: the spot overview is read by another task, and a spot posted
-//! moments before its first comment may not be in `spots_seen` yet. Those whose spot never comes are pruned. A
-//! comment's body is read once, for a kept spot only.
+//! body. A report is an article in `free.willey` whose subject is `REPORT <spot message-id> ...`. Only comments
+//! and reports on spots Atlas keeps (`spots_seen`, waiting or saved) are noted, in the main database, and a
+//! comment's body is read once. The spot overview is read by another task, so comments are read only up to when
+//! its last full read began (`store::overview_at`, `must_wait`): a comment's spot is posted before it, and so is
+//! in `spots_seen` by then if it's kept.
 
 use std::collections::HashSet;
 
@@ -27,9 +27,6 @@ pub const WAITING: i64 = 0;
 pub const READ: i64 = 1;
 /// The article is gone, too big to be a comment, or wouldn't come in `MAX_TRIES` passes.
 pub const GONE: i64 = 2;
-/// How long a comment or report on a spot not in `spots_seen` is kept, for its spot to be noted.
-pub const GRACE_DAYS: i64 = 2;
-
 /// Passes a comment's body is tried in before it's given up on (`GONE`): a pass stops at the first failure, so an
 /// outage costs each pass a try for the few comments in flight, not the whole queue.
 pub const MAX_TRIES: i64 = 20;
@@ -56,7 +53,13 @@ pub fn create(conn: &Connection) -> Result<()> {
             at INTEGER NOT NULL,
             poster TEXT
         ) without rowid;
-        create index if not exists spot_reports_spot on spot_reports(spot);",
+        create index if not exists spot_reports_spot on spot_reports(spot);
+        -- the first comment cursors were `spots_cursor:<group>:<server>`, beside the spot overview's own
+        update or ignore meta set key = 'spot_said_cursor:' || substr(key, 14)
+         where key like 'spots\\_cursor:free.usenet:%' escape '\\'
+            or key like 'spots\\_cursor:free.willey:%' escape '\\';
+        delete from meta where key like 'spots\\_cursor:free.usenet:%' escape '\\'
+            or key like 'spots\\_cursor:free.willey:%' escape '\\';",
     )
 }
 
@@ -118,10 +121,11 @@ pub fn cursor(conn: &Connection, group: &str, server: &str) -> Result<Option<u64
     read_cursor(conn, &cursor_key(group, server))
 }
 
-/// Whether a comment or report on `spot`, posted at `at`, is noted: its spot is kept (`known`), or it's recent
-/// enough that its spot may just not be noted yet (`GRACE_DAYS`).
-pub fn worth_noting(known: &HashSet<String>, spot: &str, at: i64, now: i64) -> bool {
-    known.contains(spot) || at >= now - GRACE_DAYS * 86_400
+/// Where a stretch of overview, by its articles' post dates in article order, must stop for now: the first one
+/// posted after `until` (the spot overview's last full read). Its spot may not be noted yet, so it and what follows
+/// wait for the next pass. A date more than an hour past `now` is forged or a broken clock, and holds nothing up.
+pub fn must_wait(dates: &[i64], until: i64, now: i64) -> Option<usize> {
+    dates.iter().position(|&at| at > until && at <= now + 3_600)
 }
 
 /// The spots comments and reports are kept for: waiting to be fetched, or saved as a release.
@@ -204,18 +208,14 @@ pub fn settle(conn: &mut Connection, outcomes: &[(String, Outcome)]) -> Result<(
     tx.commit()
 }
 
-/// Forgets the comments and reports of spots not kept, once past `GRACE_DAYS`: spots that came to nothing (not
-/// movies or TV after all, given up on), never came, or were forgotten since. A saved spot is kept for good
-/// (`store::prune`).
-pub fn prune(conn: &Connection, now: i64) -> Result<usize> {
+/// Forgets the comments and reports of spots no longer kept: those that came to nothing (not movies or TV after
+/// all, given up on) and those forgotten since. A saved spot is kept for good (`store::prune`).
+pub fn prune(conn: &Connection) -> Result<usize> {
     let mut n = 0;
     for table in ["spot_comments", "spot_reports"] {
         n += conn.execute(
-            &format!(
-                "delete from {table} where at < ?3
-                 and spot not in (select message_id from spots_seen where state in (?1, ?2))"
-            ),
-            params![TODO, SAVED, now - GRACE_DAYS * 86_400],
+            &format!("delete from {table} where spot not in (select message_id from spots_seen where state in (?, ?))"),
+            params![TODO, SAVED],
         )?;
     }
     Ok(n)
@@ -315,6 +315,35 @@ mod tests {
     }
 
     #[test]
+    fn comments_wait_for_the_spot_overview() {
+        let (until, now) = (1_000, 5_000);
+        // all posted before the overview's last full read
+        assert_eq!(must_wait(&[100, 900, 1_000], until, now), None);
+        // the first one after it, and what follows, waits
+        assert_eq!(must_wait(&[100, 1_200, 900], until, now), Some(1));
+        // a date far in the future holds nothing up
+        assert_eq!(must_wait(&[100, now + 7_200, 900], until, now), None);
+        assert_eq!(must_wait(&[], until, now), None);
+    }
+
+    #[test]
+    fn old_comment_cursors_move_to_their_own_keys() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "create table meta (key TEXT PRIMARY KEY, value INTEGER);
+             insert into meta values ('spots_cursor:free.usenet:news.x', 7), ('spots_cursor:free.willey:news.x', 8),
+                ('spots_cursor:news.x', 9);",
+        )
+        .unwrap();
+        create(&conn).unwrap();
+        assert_eq!(cursor(&conn, COMMENT_GROUP, "news.x").unwrap(), Some(7));
+        assert_eq!(cursor(&conn, REPORT_GROUP, "news.x").unwrap(), Some(8));
+        assert_eq!(super::super::store::cursor(&conn, "news.x").unwrap(), Some(9));
+        let left: i64 = conn.query_row("select count(*) from meta", [], |r| r.get(0)).unwrap();
+        assert_eq!(left, 3);
+    }
+
+    #[test]
     fn names_and_bodies() {
         assert_eq!(poster_name("OlliWanKenobi <key.sig@spot.net>"), "OlliWanKenobi");
         assert_eq!(poster_name("\"Some One\" <a@b>"), "Some One");
@@ -354,21 +383,6 @@ mod tests {
         assert_eq!(cursor(&conn, COMMENT_GROUP, "srv").unwrap(), Some(130));
         let report = vec![noted("r1@spot.net", "s1@spot.net", 25)];
         assert_eq!(note_read(&mut conn, REPORT_GROUP, "srv", 7, &report, true).unwrap(), 1);
-        // a comment on a spot not seen yet: noted when recent, its text not read until its spot is kept
-        let day = 86_400;
-        let known = known_spots(&conn).unwrap();
-        assert!(worth_noting(&known, "s1@spot.net", 0, 100 * day));
-        assert!(worth_noting(&known, "new@spot.net", 99 * day, 100 * day));
-        assert!(!worth_noting(&known, "new@spot.net", 97 * day, 100 * day));
-        note_read(
-            &mut conn,
-            COMMENT_GROUP,
-            "srv",
-            140,
-            &[noted("new.0.a.b@spot.net", "new@spot.net", 99 * day)],
-            false,
-        )
-        .unwrap();
         // the saved spot's comment first, though the other is newer
         assert_eq!(todo(&conn, 10).unwrap(), ["s1.8.a.b@spot.net", "s2.0.a.b@spot.net"]);
         let read = ("s1.8.a.b@spot.net".to_string(), Outcome::Read("Password in comment: hunter2".into()));
@@ -390,16 +404,13 @@ mod tests {
         let (none, no_reports) = about(&conn, 10, "other@spot.net").unwrap();
         assert!(none.is_empty() && no_reports == 0);
 
-        // past the grace, a spot that came to nothing takes its comments along, and so do one forgotten since and
-        // one never seen
-        let now = 100 * day;
-        assert_eq!(prune(&conn, now).unwrap(), 0, "the unseen spot's comment is within the grace");
+        // a spot that came to nothing takes its comments along, and so does one forgotten since
+        assert_eq!(prune(&conn).unwrap(), 0);
         let skipped = super::super::store::Settled { state: super::super::store::SKIPPED, ..Default::default() };
         super::super::store::settle(&conn, "s2@spot.net", Some(&skipped), 0).unwrap();
-        assert_eq!(prune(&conn, now).unwrap(), 1);
+        assert_eq!(prune(&conn).unwrap(), 1);
         conn.execute("delete from spots_seen where message_id = 's1@spot.net'", []).unwrap();
-        assert_eq!(prune(&conn, now).unwrap(), 2, "its comment and its report");
-        assert_eq!(prune(&conn, now + GRACE_DAYS * day).unwrap(), 1, "the spot that never came");
+        assert_eq!(prune(&conn).unwrap(), 2, "its comment and its report");
         let left: i64 = conn.query_row("select count(*) from spot_comments", [], |r| r.get(0)).unwrap();
         assert_eq!(left, 0);
     }

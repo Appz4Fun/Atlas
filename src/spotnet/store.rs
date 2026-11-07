@@ -95,9 +95,16 @@ pub fn cursor(conn: &Connection, server: &str) -> Result<Option<u64>> {
     read_cursor(conn, &cursor_key(server))
 }
 
-/// Whether the spot overview has been read on some server: its cursor is there.
-pub fn overview_read(conn: &Connection) -> Result<bool> {
-    conn.prepare_cached("select 1 from meta where key like 'spots\\_cursor:%' escape '\\'")?.exists([])
+const OVERVIEW_AT: &str = "spots_overview_at";
+
+/// When the last spot pass that read the overview to its end began: every spot posted before then that passed the
+/// filter is in `spots_seen`. None before the first. Comments are read up to it (`comments`).
+pub fn overview_at(conn: &Connection) -> Result<Option<i64>> {
+    conn.query_row("select value from meta where key = ?", [OVERVIEW_AT], |r| r.get(0)).optional()
+}
+
+pub fn set_overview_at(conn: &Connection, at: i64) -> Result<()> {
+    write_cursor(conn, OVERVIEW_AT, at.max(0) as u64)
 }
 
 /// A group's cursor in `meta`: the last article read, by its numbers on the server the key names.
@@ -551,16 +558,14 @@ mod tests {
     fn reading_the_overview_moves_the_cursor_with_the_spots() {
         let mut conn = main_db();
         assert_eq!(cursor(&conn, "news.example").unwrap(), None);
-        assert!(!overview_read(&conn).unwrap());
-        // a comment group's cursor isn't the spot overview's
-        write_cursor(&conn, "spot_said_cursor:free.usenet:news.example", 5).unwrap();
-        assert!(!overview_read(&conn).unwrap());
+        assert_eq!(overview_at(&conn).unwrap(), None);
+        set_overview_at(&conn, 1_700_000_000).unwrap();
+        assert_eq!(overview_at(&conn).unwrap(), Some(1_700_000_000));
         let spots = vec![("a@spot.net".to_string(), 10, None), ("b@spot.net".to_string(), 12, None)];
         assert_eq!(note_read(&mut conn, "news.example", 20, &spots, 1).unwrap(), 2);
         // read again: nothing new, the cursor still moves
         assert_eq!(note_read(&mut conn, "news.example", 25, &spots, 2).unwrap(), 0);
         assert_eq!(cursor(&conn, "news.example").unwrap(), Some(25));
-        assert!(overview_read(&conn).unwrap());
         assert_eq!(cursor(&conn, "other").unwrap(), None);
         assert_eq!(todo(&conn, 10).unwrap(), ["a@spot.net", "b@spot.net"]);
     }
