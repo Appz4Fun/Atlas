@@ -170,7 +170,9 @@ fn set_up(conn: Connection) -> Result<Connection> {
     // releases before their articles and old dbs can hold orphans.
     conn.execute_batch("pragma foreign_keys = off")?;
     // with WAL this cant corrupt the db, a crash only loses the last commit,
-    // which the indexer redoes anyway since cursors move after the data
+    // which the indexer redoes anyway since cursors move after the data. A power
+    // cut could keep a cursor and lose the save before it, soo the shard writers
+    // commit with `synchronous = full` (indexer::writer)
     conn.execute_batch("pragma synchronous = normal")?;
     crate::filters::register_sql(&conn)?;
     Ok(conn)
@@ -179,7 +181,7 @@ fn set_up(conn: Connection) -> Result<Connection> {
 /// Tune a connection for heavy indexing writes: a big page cache, no
 /// checkpointing on commit (`checkpointer` copies the WAL into the main file on
 /// its own thread, `finish_checkpoint` lets the WAL start over), and a WAL file
-/// cut back to 256MB whenever it starts over.
+/// cut back to 1GB whenever it starts over.
 pub fn tune_for_writing(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "pragma cache_size = -1048576;
@@ -193,7 +195,7 @@ pub fn tune_for_writing(conn: &Connection) -> Result<()> {
 /// into the main file. With no write in progress it can copy everything, soo
 /// the next transaction starts the WAL over instead of growing it. Mostly
 /// quick, the background checkpointer has done the bulk of it already.
-/// The writer calls it through `Checkpoints::finish_if_due`, not after every save.
+/// The writer calls it through `Checkpoints::checkpoint_if_due`, not after every save.
 pub fn finish_checkpoint(conn: &Connection) -> Result<()> {
     conn.query_row("pragma wal_checkpoint(passive)", [], |_| Ok(()))
 }
@@ -209,8 +211,9 @@ pub fn finish_checkpoint(conn: &Connection) -> Result<()> {
 /// the same time (#230 did that and corrupted databases).
 pub fn wal_frames(conn: &Connection, schema: &str) -> Result<Option<(i64, i64)>> {
     let schema = schema.replace('"', "\"\"");
-    let (log, copied): (i64, i64) =
-        conn.query_row(&format!("pragma \"{schema}\".wal_checkpoint(noop)"), [], |r| Ok((r.get(1)?, r.get(2)?)))?;
+    let (log, copied): (i64, i64) = conn
+        .prepare_cached(&format!("pragma \"{schema}\".wal_checkpoint(noop)"))?
+        .query_row([], |r| Ok((r.get(1)?, r.get(2)?)))?;
     Ok((log >= 0 && copied >= 0).then_some((log, copied)))
 }
 
@@ -223,6 +226,19 @@ const COPY_BYTES: i64 = 64 << 20;
 /// Once a shard's WAL holds this much, its writer copies the rest between
 /// transactions, soo the next one starts the WAL over (it stays about this big).
 const RESTART_BYTES: i64 = 256 << 20;
+/// The writer copies the rest only while this little of it waits, the
+/// background copying having done the bulk: copying 64MB would hold up the
+/// saves. Past twice `RESTART_BYTES` it copies whatever waits, soo the WAL
+/// stays bounded with no background copying (a writer without a checkpointer).
+const WRITER_COPY_BYTES: i64 = 8 << 20;
+/// `pragma wal_autocheckpoint` for a connection that writes the shards now
+/// and then while the indexer runs, such as the word index's taking from
+/// `word_queue`: SQLite's default (1000 frames, 4MB) counts the whole WAL, and
+/// a shard's WAL is bigger than that most of the time now, soo each of its
+/// commits would copy whatever waits. With this it copies only once a WAL got
+/// past where the writer starts it over (at 4KB pages), still bounding it
+/// when no indexer runs.
+pub const OCCASIONAL_WRITER_AUTOCHECKPOINT: i64 = 2 * RESTART_BYTES / 4096;
 /// Whatever waits in a WAL is copied after this long anyway, soo a quiet
 /// database doesnt keep a WAL around.
 const CHECKPOINT_AGE: Duration = Duration::from_secs(60);
@@ -234,8 +250,10 @@ const CHECKPOINT_AGE: Duration = Duration::from_secs(60);
 pub struct Checkpoints {
     /// what may wait before a checkpoint, in bytes of WAL
     due_bytes: i64,
-    /// `due_bytes` count all of the WAL rather than what waits to be copied (the writer's, which lets the WAL start over)
+    /// `due_bytes` count all of the WAL rather than what waits to be copied (the writer's, which lets the WAL start
+    /// over), and then only while at most `copy_bytes` wait or the WAL got twice as big
     whole_wal: bool,
+    copy_bytes: i64,
     age: Duration,
     last: Instant,
 }
@@ -252,12 +270,12 @@ impl Checkpoints {
     }
 
     fn new(due_bytes: i64, whole_wal: bool, age: Duration) -> Self {
-        Checkpoints { due_bytes, whole_wal, age, last: Instant::now() }
+        Checkpoints { due_bytes, whole_wal, copy_bytes: WRITER_COPY_BYTES, age, last: Instant::now() }
     }
 
     /// Whether any of `conn`'s databases (main and the attached ones) is due a
-    /// checkpoint. When SQLite cant tell how big a WAL is, it is (as every
-    /// time before #228).
+    /// checkpoint. One whose WAL SQLite fails to read is (as every time before
+    /// #228); one it says isnt in WAL mode never is.
     pub fn due(&self, conn: &Connection) -> Result<bool> {
         let schemas: Vec<String> = conn
             .prepare_cached("select name from pragma_database_list where name != 'temp'")?
@@ -279,10 +297,20 @@ impl Checkpoints {
         if waiting <= 0 {
             return Ok(false);
         }
+        if self.last.elapsed() >= self.age {
+            return Ok(true);
+        }
         let quoted = schema.replace('"', "\"\"");
-        let page_size: i64 = conn.query_row(&format!("pragma \"{quoted}\".page_size"), [], |r| r.get(0))?;
-        let counted = if self.whole_wal { log } else { waiting };
-        Ok(counted * page_size.max(512) >= self.due_bytes || self.last.elapsed() >= self.age)
+        let page_size = conn
+            .prepare_cached(&format!("pragma \"{quoted}\".page_size"))?
+            .query_row([], |r| r.get::<_, i64>(0))?
+            .max(512);
+        Ok(if self.whole_wal {
+            let (log, waiting) = (log * page_size, waiting * page_size);
+            log >= 2 * self.due_bytes || (log >= self.due_bytes && waiting <= self.copy_bytes)
+        } else {
+            waiting * page_size >= self.due_bytes
+        })
     }
 
     /// A passive checkpoint of `conn`'s databases when `due`. Returns whether it ran.
@@ -290,8 +318,8 @@ impl Checkpoints {
         if !self.due(conn)? {
             return Ok(false);
         }
-        self.last = Instant::now();
         finish_checkpoint(conn)?;
+        self.last = Instant::now();
         Ok(true)
     }
 }
@@ -904,6 +932,11 @@ mod tests {
         // the writer's: by all of the WAL, and only while something waits
         let writer = Checkpoints::new(256 << 10, true, hour);
         assert!(writer.due(&conn).unwrap(), "the WAL holds more than 256 KiB with a little waiting");
+        let mut copying_less = Checkpoints::new(256 << 10, true, hour);
+        copying_less.copy_bytes = 0;
+        assert!(!copying_less.due(&conn).unwrap(), "more waits than the writer copies: the background copying first");
+        fill(&conn, 300);
+        assert!(copying_less.due(&conn).unwrap(), "past twice as big the writer copies whatever waits");
         reader.execute_batch("commit").unwrap();
         finish_checkpoint(&conn).unwrap();
         assert!(!writer.due(&conn).unwrap(), "all copied: the next transaction starts the WAL over anyway");

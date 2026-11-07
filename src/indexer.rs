@@ -429,6 +429,13 @@ fn writer(
     use std::sync::mpsc::{RecvTimeoutError, TryRecvError};
 
     let mut opened = db::open_shard(path).and_then(|conn| db::tune_for_writing(&conn).map(|_| conn));
+    // each save on disk when committed: the WAL is no longer checkpointed (and soo synced) after every save (#228),
+    // and the group cursors in atlas.db, which move once a save is committed, mustnt reach the disk before it
+    if let Ok(conn) = &opened
+        && let Err(e) = conn.execute_batch("pragma main.synchronous = full")
+    {
+        eprintln!("couldnt make the saves in {} synchronous: {e}", path.display());
+    }
     // the frozen file, which only this writer has: without it nothing freezes and nothing thaws here
     if let Ok(conn) = &opened
         && let Err(e) = crate::frozen::attach(conn, path)

@@ -90,6 +90,8 @@ fn main() {
         .map(|i| {
             let conn = db::open_at(&store::shard_path(main, i)).unwrap();
             db::tune_for_writing(&conn).unwrap();
+            // as the indexer's writers do
+            conn.execute_batch("pragma main.synchronous = full").unwrap();
             (conn, store::ShardWriter::new(i), db::Checkpoints::for_writer())
         })
         .collect();
