@@ -32,6 +32,8 @@ const CAP_OVERSHOOT: usize = 64 * 1024;
 const DECODING: usize = 4;
 /// NZB article bytes one pass reads at most; the spots left wait for the next pass.
 const MAX_PASS_POSTED: usize = 256 * 1024 * 1024;
+/// Spots saved before their XML was kept, read again per pass (a HEAD each, a few KB).
+const XML_BACKFILL: usize = 50;
 
 /// What one pass did, for the log.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -100,6 +102,11 @@ pub async fn pass(pool: &Arc<Pool>, db: &Db, config: &SpotsConfig, stopping: &im
 
     let now = chrono::Utc::now().timestamp();
     on_db(db, move |conn| Ok(store::prune(conn, now)?)).await?;
+    match backfill_xml(pool, db, stopping).await {
+        Ok(0) => {}
+        Ok(n) => println!("spots: read the XML of {n} spots saved before it was kept"),
+        Err(e) => eprintln!("spots: reading saved spots' XML: {e:#}"),
+    }
     let limit = config.per_pass;
     let todo = on_db(db, move |conn| Ok(store::todo(conn, limit)?)).await?;
     if todo.is_empty() {
@@ -263,9 +270,8 @@ async fn fetch(
         Err(e) if says_absent(&e) => return Ok(Some(skipped(None))),
         Err(e) => return Err(e.into()),
     };
-    let Some(spot) = full::xml_from_headers(&head).as_deref().and_then(full::parse) else {
-        return Ok(Some(skipped(None)));
-    };
+    let Some(xml) = full::xml_from_headers(&head) else { return Ok(Some(skipped(None))) };
+    let Some(spot) = full::parse(&xml) else { return Ok(Some(skipped(None))) };
     let Some(kind) = spot.kind() else { return Ok(Some(skipped(None))) };
     // an id named twice is no real spot's, and would be read twice
     if spot.nzb.is_empty() || !nzb_ids_usable(&spot.nzb) {
@@ -278,6 +284,7 @@ async fn fetch(
         spot: spot.clone(),
         spotter_id: spotter_id.clone(),
         nzb_key,
+        xml: xml.clone(),
     };
 
     // another spot pointing at the same NZB articles was settled already: no need to read them again
@@ -403,6 +410,45 @@ async fn fetch(
         println!("spots: saved \"{title}\" as release {id}");
     }
     Ok(Some(settled(id)))
+}
+
+/// Reads again the XML of up to `XML_BACKFILL` spots saved before it was kept, so their release pages get the
+/// description and the rest. A spot whose article is gone, or whose XML won't read, gets an empty one and isn't
+/// asked for again. Returns how many were filled.
+async fn backfill_xml(pool: &Pool, db: &Db, stopping: &impl Fn() -> bool) -> Result<usize> {
+    let mut filled = 0;
+    let mut left = XML_BACKFILL;
+    for shard in 0..crate::store::SHARDS {
+        if left == 0 || stopping() {
+            break;
+        }
+        let limit = left;
+        let missing = on_shard(db, shard, move |conn| store::missing_xml(conn, limit)).await?;
+        left -= missing.len();
+        for (release_id, message_id) in missing {
+            if stopping() {
+                return Ok(filled);
+            }
+            let head = timed("spots.head", pool.fetch_head(&format!("<{message_id}>"), MAX_XML_BYTES * 4)).await;
+            let xml = match head {
+                Ok(Some(head)) => full::xml_from_headers(&head).filter(|x| full::parse(x).is_some()),
+                Ok(None) => None,
+                Err(e) if says_absent(&e) => None,
+                // try again next pass
+                Err(e) => {
+                    eprintln!("spots: {message_id}: {e:#}");
+                    continue;
+                }
+            };
+            let xml = xml.unwrap_or_default();
+            let whole = !xml.is_empty();
+            let set = on_shard(db, shard, move |conn| store::set_xml(conn, release_id, &message_id, &xml)).await?;
+            if set && whole {
+                filled += 1;
+            }
+        }
+    }
+    Ok(filled)
 }
 
 /// A spot whose NZB an earlier spot's release `id` already has: that release gets this spot when it is live.

@@ -1,6 +1,7 @@
 //! Where spots are kept. The main database has the ingest's bookkeeping: each spot seen in `free.pt` that may be
 //! worth fetching, and how far the overview has been read. Each shard has `spots`, the spot a release came from:
-//! its tag, and what the spot says that a release row doesn't (IMDb id, spotter, Spotnet categories).
+//! its tag, what the spot says that a release row doesn't (IMDb id, spotter, Spotnet categories), and the spot's
+//! XML whole, for the release page (its description, website, cover image and newsreader).
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -69,14 +70,16 @@ pub const SPOTS: ShardTable = ShardTable {
         size INTEGER,
         imdb_id TEXT,
         created INTEGER,
-        nzb_key TEXT
+        nzb_key TEXT,
+        xml TEXT
     )",
     indexes: &[
         ("spots_message_id", "create index if not exists spots_message_id on spots(message_id)"),
         ("spots_nzb_key", "create index if not exists spots_nzb_key on spots(nzb_key)"),
     ],
     release_key: Some("release_id"),
-    added: &[],
+    // NULL: saved before the XML was kept, to be read again (`missing_xml`); empty: read again and gone
+    added: &[("xml", "TEXT")],
 };
 
 fn cursor_key(server: &str) -> String {
@@ -224,6 +227,8 @@ pub struct SpotRow {
     pub spotter_id: Option<String>,
     /// what the spot's NZB holds (`release::nzb_key`): an edited or reposted spot has the same one
     pub nzb_key: String,
+    /// the spot's XML as its headers carry it (`full::xml_from_headers`)
+    pub xml: String,
 }
 
 /// Tags the release named `name` in `group` with its spot, in its shard. Returns its id, or None when the save left
@@ -343,11 +348,11 @@ fn put(conn: &Connection, release_id: i64, row: &SpotRow) -> Result<()> {
     let spot = &row.spot;
     conn.execute(
         "insert into spots (release_id, message_id, kind, title, poster, tag, spotter_id, category,
-            subcats, size, imdb_id, created, nzb_key) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            subcats, size, imdb_id, created, nzb_key, xml) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          on conflict(release_id) do update set message_id = excluded.message_id, kind = excluded.kind,
             title = excluded.title, poster = excluded.poster, tag = excluded.tag, spotter_id = excluded.spotter_id,
             category = excluded.category, subcats = excluded.subcats, size = excluded.size,
-            imdb_id = excluded.imdb_id, created = excluded.created, nzb_key = excluded.nzb_key
+            imdb_id = excluded.imdb_id, created = excluded.created, nzb_key = excluded.nzb_key, xml = excluded.xml
          where coalesce(excluded.created, 0) >= coalesce(spots.created, 0)",
         params![
             release_id,
@@ -363,6 +368,7 @@ fn put(conn: &Connection, release_id: i64, row: &SpotRow) -> Result<()> {
             spot.imdb_id(),
             spot.created,
             row.nzb_key,
+            row.xml,
         ],
     )?;
     Ok(())
@@ -423,6 +429,76 @@ pub fn spots_of_with(conn: &Connection, ids: &[i64]) -> Result<HashMap<i64, Tagg
         }
     }
     Ok(out)
+}
+
+/// Everything a release's spot row keeps, for the release page.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Detail {
+    pub message_id: String,
+    pub kind: String,
+    pub spotter_id: Option<String>,
+    /// what the spot says, from its XML when that was kept, else from the row's columns (no description then)
+    pub spot: FullSpot,
+    /// whether the spot's XML was kept: without it, the description, website, image and newsreader are unknown
+    pub whole: bool,
+    /// the XML was read again for a spot saved before it was kept, and the article was gone or wouldn't read
+    pub gone: bool,
+}
+
+/// Release `id`'s spot, from its shard, when it has one.
+pub fn detail_of(id: i64) -> Result<Option<Detail>> {
+    crate::db::with_reader(|conn| detail_of_with(conn, id))
+}
+
+pub fn detail_of_with(conn: &Connection, id: i64) -> Result<Option<Detail>> {
+    let sql = format!(
+        "select message_id, kind, spotter_id, title, coalesce(poster, ''), coalesce(tag, ''), category,
+            coalesce(subcats, ''), size, imdb_id, created, xml
+         from s{}.spots where release_id = ?",
+        crate::store::shard_of_id(id)
+    );
+    let row = conn
+        .query_row(&sql, [id], |r| {
+            let columns = FullSpot {
+                title: r.get(3)?,
+                poster: r.get(4)?,
+                tag: r.get(5)?,
+                category: r.get::<_, Option<i32>>(6)?.unwrap_or(0),
+                subcats: super::header::subcats(&r.get::<_, String>(7)?),
+                size: r.get::<_, Option<i64>>(8)?.and_then(|n| u64::try_from(n).ok()).unwrap_or(0),
+                // the row keeps the id, not the link: the link the page shows is IMDb's
+                website: r
+                    .get::<_, Option<String>>(9)?
+                    .map(|id| format!("https://www.imdb.com/title/{id}/"))
+                    .unwrap_or_default(),
+                created: r.get::<_, Option<i64>>(10)?.unwrap_or(0),
+                ..FullSpot::default()
+            };
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, columns, r.get::<_, Option<String>>(11)?))
+        })
+        .optional()?;
+    Ok(row.map(|(message_id, kind, spotter_id, columns, xml)| {
+        let parsed = xml.as_deref().filter(|x| !x.is_empty()).and_then(super::full::parse);
+        let gone = parsed.is_none() && xml.is_some();
+        Detail { message_id, kind, spotter_id, whole: parsed.is_some(), gone, spot: parsed.unwrap_or(columns) }
+    }))
+}
+
+/// Spots of this shard saved before their XML was kept: (release id, spot message-id), at most `limit`.
+pub fn missing_xml(conn: &Connection, limit: usize) -> Result<Vec<(i64, String)>> {
+    conn.prepare_cached("select release_id, message_id from spots where xml is null order by release_id desc limit ?")?
+        .query_map([limit as i64], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect()
+}
+
+/// The XML read again for a spot `missing_xml` listed, empty when the article is gone. Kept only while the row is
+/// still that spot's: a newer spot that came meanwhile brought its own.
+pub fn set_xml(conn: &Connection, release_id: i64, message_id: &str, xml: &str) -> Result<bool> {
+    let n = conn.execute(
+        "update spots set xml = ? where release_id = ? and message_id = ? and xml is null",
+        params![xml, release_id, message_id],
+    )?;
+    Ok(n > 0)
 }
 
 #[cfg(test)]
@@ -486,6 +562,7 @@ mod tests {
             spot: spot.clone(),
             spotter_id: Some("abc".into()),
             nzb_key: "k1".into(),
+            xml: String::new(),
         };
         assert_eq!(tag_copy(&conn, &row).unwrap(), None);
         assert_eq!(tag(&conn, "Movie (2026)", "alt.binaries.y", &row).unwrap(), None);
@@ -523,6 +600,7 @@ mod tests {
             spot: spot(title, created),
             spotter_id: None,
             nzb_key: "k1".into(),
+            xml: String::new(),
         };
         assert_eq!(tag(&conn, "Movie (2026)", "g", &row("new@spot.net", "Edited", 200)).unwrap(), Some(5));
         assert_eq!(tag_copy(&conn, &row("old@spot.net", "Original", 100)).unwrap(), Some(5));
@@ -595,6 +673,7 @@ mod tests {
             spot: FullSpot { title: "T".into(), ..FullSpot::default() },
             spotter_id: None,
             nzb_key: "k".into(),
+            xml: String::new(),
         };
         // not live (frozen): nothing written, the id still answered
         assert_eq!(tag_release(&conn, 7, &row).unwrap(), 7);
@@ -695,5 +774,54 @@ mod tests {
         conn.execute("insert into frozen.frozen_releases values (2, 'Frozen', 'g')", []).unwrap();
         assert!(name_in_use(&conn, "Frozen", "g").unwrap());
         assert!(!name_in_use(&conn, "Frozen", "other").unwrap());
+    }
+    #[test]
+    fn the_page_reads_the_spot_whole_or_from_its_columns() {
+        let conn = Connection::open_in_memory().unwrap();
+        let id = crate::store::global_id(4, 2);
+        conn.execute("attach ':memory:' as s2", []).unwrap();
+        conn.execute_batch(&SPOTS.create.replace("exists spots", "exists s2.spots")).unwrap();
+        assert_eq!(detail_of_with(&conn, id).unwrap(), None);
+        // saved before the XML was kept: what the columns say
+        conn.execute(
+            "insert into s2.spots (release_id, message_id, kind, title, poster, category, subcats, size, imdb_id, created)
+             values (?, 'm@spot.net', 'movie', 'Old', 'p', 0, 'a9|d5|z0|', 42, 'tt1234567', 100)",
+            [id],
+        )
+        .unwrap();
+        let d = detail_of_with(&conn, id).unwrap().unwrap();
+        assert!(!d.whole && !d.gone);
+        assert_eq!((d.spot.title.as_str(), d.spot.size, d.spot.created), ("Old", 42, 100));
+        assert_eq!(d.spot.subcats.spotweb(), "a9|d5|z0|");
+        assert_eq!(d.spot.imdb_id().as_deref(), Some("tt1234567"));
+        assert_eq!(d.spot.description, "");
+        // read again: the XML wins, description and all
+        let shard = Connection::open_in_memory().unwrap();
+        shard.execute_batch(SPOTS.create).unwrap();
+        shard
+            .execute(
+                "insert into spots (release_id, message_id, kind, title) values (?, 'm@spot.net', 'movie', 'Old')",
+                [id],
+            )
+            .unwrap();
+        assert_eq!(missing_xml(&shard, 10).unwrap(), [(id, "m@spot.net".to_string())]);
+        let xml = "<Spotnet><Posting><Title>New</Title><Description>Line one[br]pw: hunter2</Description></Posting><Extra><Newsreader>SpotPost 2</Newsreader></Extra></Spotnet>";
+        // another spot's XML doesn't land on this row
+        assert!(!set_xml(&shard, id, "other@spot.net", xml).unwrap());
+        assert!(set_xml(&shard, id, "m@spot.net", xml).unwrap());
+        assert!(!set_xml(&shard, id, "m@spot.net", "").unwrap(), "only once");
+        assert!(missing_xml(&shard, 10).unwrap().is_empty());
+        shard.execute("attach ':memory:' as s2", []).unwrap();
+        shard.execute_batch(&SPOTS.create.replace("exists spots", "exists s2.spots")).unwrap();
+        shard.execute("insert into s2.spots select * from main.spots", []).unwrap();
+        let d = detail_of_with(&shard, id).unwrap().unwrap();
+        assert!(d.whole);
+        assert_eq!(d.spot.title, "New");
+        assert_eq!(d.spot.description, "Line one\npw: hunter2");
+        assert_eq!(d.spot.newsreader, "SpotPost 2");
+        // read again and gone: the columns, not tried again
+        shard.execute("update s2.spots set xml = ''", []).unwrap();
+        let d = detail_of_with(&shard, id).unwrap().unwrap();
+        assert!(!d.whole && d.gone);
     }
 }

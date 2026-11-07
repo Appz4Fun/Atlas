@@ -3,13 +3,14 @@
 //! `X-XML` headers, and its NZB is a deflated blob posted in `alt.binaries.ftd`.
 //!
 //! `header`, `full` and `binary` read the formats: the overview line, the full spot XML and the posted binaries.
-//! `release` turns a spot's NZB into a release, `store` keeps the bookkeeping and the tags, and `ingest` is the
-//! indexer's task that reads new spots.
+//! `release` turns a spot's NZB into a release, `store` keeps the bookkeeping and the tags, `ingest` is the
+//! indexer's task that reads new spots, and `names` says what a spot's subcategories mean.
 
 pub mod binary;
 pub mod full;
 pub mod header;
 pub mod ingest;
+pub mod names;
 pub mod release;
 pub mod store;
 
