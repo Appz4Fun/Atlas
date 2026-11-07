@@ -145,6 +145,19 @@ pub fn plan(files: &[FileInfo], probe_files: usize) -> Vec<Head<'_>> {
     unknown.into_iter().take(probe_files).map(|f| Head { file: f, tail: f, probe: true }).collect()
 }
 
+/// The volumes of an upload linked from its headers (`xref`), whose names say nothing: the files of the part count most
+/// of them share (the larger on a tie), of at least `PROBE_MIN_PARTS`, in name order, which is the order they went up.
+pub fn volumes(files: &[FileInfo]) -> Vec<&FileInfo> {
+    let mut counts: BTreeMap<i64, usize> = BTreeMap::new();
+    for f in files.iter().filter(|f| parts(f) >= PROBE_MIN_PARTS) {
+        *counts.entry(parts(f)).or_default() += 1;
+    }
+    let Some((&size, _)) = counts.iter().max_by_key(|&(&p, &n)| (n, p)) else { return Vec::new() };
+    let mut volumes: Vec<&FileInfo> = files.iter().filter(|f| parts(f) == size).collect();
+    volumes.sort_by(|a, b| a.filename.cmp(&b.filename));
+    volumes
+}
+
 /// Which PAR2 file to read: the first of `par2_sources`.
 pub fn par2_source(files: &[FileInfo]) -> Option<&FileInfo> {
     par2_sources(files).into_iter().next()
