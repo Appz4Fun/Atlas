@@ -2,9 +2,9 @@
 //! message-id starts with its spot's (`<spot>.<rating>.<random>.<random>@spot.net`); its text is the article's
 //! body. A report is an article in `free.willey` whose subject is `REPORT <spot message-id> ...`. Only comments
 //! and reports on spots Atlas keeps (`spots_seen`, waiting or saved) are noted, in the main database, and a
-//! comment's body is read once. The spot overview is read by another task, so comments are read only up to when
-//! its last full read began (`store::overview_at`, `must_wait`): a comment's spot is posted before it, and so is
-//! in `spots_seen` by then if it's kept.
+//! comment's body is read once. The spot overview is read by another task, so a group is read only up to the
+//! article that was its newest when the spot overview's last full read began (`limit`, `set_limit`): a comment
+//! reaches the server after its spot, so by then the spot is in `spots_seen` if it's kept.
 
 use std::collections::HashSet;
 
@@ -121,11 +121,18 @@ pub fn cursor(conn: &Connection, group: &str, server: &str) -> Result<Option<u64
     read_cursor(conn, &cursor_key(group, server))
 }
 
-/// Where a stretch of overview, by its articles' post dates in article order, must stop for now: the first one
-/// posted after `until` (the spot overview's last full read). Its spot may not be noted yet, so it and what follows
-/// wait for the next pass. A date more than an hour past `now` is forged or a broken clock, and holds nothing up.
-pub fn must_wait(dates: &[i64], until: i64, now: i64) -> Option<usize> {
-    dates.iter().position(|&at| at > until && at <= now + 3_600)
+fn limit_key(group: &str, server: &str) -> String {
+    format!("spot_said_limit:{group}:{server}")
+}
+
+/// The article of `group` on `server` that was its newest when the spot overview's last full read began: the group
+/// is read up to it. None before the first such read.
+pub fn limit(conn: &Connection, group: &str, server: &str) -> Result<Option<u64>> {
+    read_cursor(conn, &limit_key(group, server))
+}
+
+pub fn set_limit(conn: &Connection, group: &str, server: &str, high: u64) -> Result<()> {
+    write_cursor(conn, &limit_key(group, server), high)
 }
 
 /// The spots comments and reports are kept for: waiting to be fetched, or saved as a release.
@@ -315,15 +322,14 @@ mod tests {
     }
 
     #[test]
-    fn comments_wait_for_the_spot_overview() {
-        let (until, now) = (1_000, 5_000);
-        // all posted before the overview's last full read
-        assert_eq!(must_wait(&[100, 900, 1_000], until, now), None);
-        // the first one after it, and what follows, waits
-        assert_eq!(must_wait(&[100, 1_200, 900], until, now), Some(1));
-        // a date far in the future holds nothing up
-        assert_eq!(must_wait(&[100, now + 7_200, 900], until, now), None);
-        assert_eq!(must_wait(&[], until, now), None);
+    fn a_group_is_read_up_to_its_limit() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("create table meta (key TEXT PRIMARY KEY, value INTEGER)").unwrap();
+        assert_eq!(limit(&conn, COMMENT_GROUP, "news.x").unwrap(), None);
+        set_limit(&conn, COMMENT_GROUP, "news.x", 22_152_162).unwrap();
+        assert_eq!(limit(&conn, COMMENT_GROUP, "news.x").unwrap(), Some(22_152_162));
+        assert_eq!(limit(&conn, REPORT_GROUP, "news.x").unwrap(), None);
+        assert_eq!(cursor(&conn, COMMENT_GROUP, "news.x").unwrap(), None, "a limit isn't a cursor");
     }
 
     #[test]
