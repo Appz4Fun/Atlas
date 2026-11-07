@@ -58,6 +58,142 @@ fn is_xml_char(c: char) -> bool {
     matches!(c, '\t' | '\n' | '\r' | '\u{20}'..='\u{D7FF}' | '\u{E000}'..='\u{FFFD}' | '\u{10000}'..='\u{10FFFF}')
 }
 
+/// A file of an NZB whose segment numbers don't run exactly 1..=total.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileGap {
+    pub filename: Option<String>,
+    /// the most parts any of its articles says the file has; None: none says
+    pub total: Option<i64>,
+    /// how many distinct numbers in 1..=total it has
+    pub have: i64,
+    /// the first numbers it lacks, `GAP_LIST` at most
+    pub missing: Vec<i64>,
+    /// articles with no number, or one outside 1..=total
+    pub stray: i64,
+}
+
+/// how many missing numbers a gap names
+const GAP_LIST: usize = 16;
+
+/// The files of `articles` (grouped as `render_nzb_in` groups them) whose numbers aren't exactly 1..=total.
+/// Empty: every file is whole. These are the same articles an NZB is rendered from, so a release is only whole
+/// by what its NZB lists, not by what was counted when its articles were saved.
+pub fn gaps(articles: &[ArticleRow]) -> Vec<FileGap> {
+    let mut out = Vec::new();
+    for file_articles in files(articles) {
+        let filename = file_articles[0].filename.as_deref();
+        let total = file_articles.iter().filter_map(|a| a.total_parts).max();
+        let limit = total.unwrap_or(0).clamp(0, crate::parser::MAX_PARTS);
+        let zero_based = file_articles.iter().any(|a| a.part == Some(0));
+        let mut parts = std::collections::BTreeSet::new();
+        let mut stray = 0;
+        for a in &file_articles {
+            let in_range = if zero_based {
+                (0..limit).contains(&a.part.unwrap_or(-1))
+            } else {
+                (1..=limit).contains(&a.part.unwrap_or(-1))
+            };
+            match a.part {
+                Some(p) if in_range => {
+                    parts.insert(p);
+                }
+                _ => stray += 1,
+            }
+        }
+        let have = parts.len() as i64;
+        if total.is_some() && have == limit && limit > 0 && stray == 0 {
+            continue;
+        }
+        let missing: Vec<i64> = if zero_based {
+            (0..limit).filter(|p| !parts.contains(p)).take(GAP_LIST).collect()
+        } else {
+            (1..=limit).filter(|p| !parts.contains(p)).take(GAP_LIST).collect()
+        };
+        out.push(FileGap { filename: filename.map(str::to_string), total, have, missing, stray });
+    }
+    out
+}
+
+/// The <file>s of an NZB, in order: one per filename, and one per article that has no filename.
+fn files(articles: &[ArticleRow]) -> Vec<Vec<&ArticleRow>> {
+    let mut by_filename: IndexMap<String, Vec<&ArticleRow>> = IndexMap::new();
+    for (index, a) in articles.iter().enumerate() {
+        let key = a.filename.clone().unwrap_or_else(|| format!("\0{index}"));
+        by_filename.entry(key).or_default().push(a);
+    }
+    by_filename.into_values().collect()
+}
+
+/// The articles of the `file`th (1-based) <file> the whole NZB lists.
+fn nth_file(articles: &[ArticleRow], file: usize) -> Option<Vec<ArticleRow>> {
+    let at = file.checked_sub(1)?;
+    files(articles).into_iter().nth(at).map(|f| f.into_iter().cloned().collect())
+}
+
+/// Whether `articles` make a whole release: some articles, and every file numbered exactly 1..=total.
+pub fn articles_complete(articles: &[ArticleRow]) -> bool {
+    !articles.is_empty() && gaps(articles).is_empty()
+}
+
+/// One line for a gap, for the NZB's head and the log.
+fn describe(g: &FileGap) -> String {
+    let total = g.total.map_or_else(|| "?".into(), |t| t.to_string());
+    let missing: Vec<String> = g.missing.iter().map(i64::to_string).collect();
+    let more = if (g.total.unwrap_or(0) - g.have) as usize > g.missing.len() { ",..." } else { "" };
+    format!(
+        "{}: {} of {total} parts, missing {}{more}{}",
+        g.filename.as_deref().unwrap_or(""),
+        g.have,
+        if missing.is_empty() { "-".into() } else { missing.join(",") },
+        if g.stray > 0 { format!(", {} unnumbered or out of range", g.stray) } else { String::new() },
+    )
+}
+
+/// An NZB and what it lacks: `gaps` is empty for a whole release.
+#[derive(Clone, Debug)]
+pub struct NzbBuild {
+    pub xml: String,
+    pub gaps: Vec<FileGap>,
+}
+
+impl NzbBuild {
+    pub fn complete(&self) -> bool {
+        self.gaps.is_empty()
+    }
+}
+
+/// Render the NZB and check it: a file missing parts is named in the head (`<meta type="x-atlas-incomplete">`),
+/// so an NZB short of segments is never passed off as whole.
+pub(crate) fn render_checked(release: &ReleaseRow, articles: &[ArticleRow], groups: &[String]) -> NzbBuild {
+    let gaps = gaps(articles);
+    let mut xml = render_nzb_in(release, articles, groups);
+    if !gaps.is_empty() {
+        let mut meta = String::new();
+        for g in &gaps {
+            let _ = writeln!(meta, "    <meta type=\"x-atlas-incomplete\">{}</meta>", escape_text(&describe(g)));
+        }
+        xml = xml.replacen("  </head>", &format!("{meta}  </head>"), 1);
+    }
+    NzbBuild { xml, gaps }
+}
+
+/// Count and log an NZB built with gaps. One for a release flagged complete means the flag and the articles disagree.
+fn note_gaps(release: &ReleaseRow, built: &NzbBuild) {
+    if built.complete() {
+        return;
+    }
+    let flag = if release.complete { "complete" } else { "incomplete" };
+    crate::metrics::names::NZB_GAPS.inc(&[("flag", flag)], 1);
+    if release.complete {
+        let first = built.gaps.first().map(describe).unwrap_or_default();
+        eprintln!(
+            "nzb for release {} is flagged complete but {} file(s) miss parts (first: {first})",
+            release.id,
+            built.gaps.len()
+        );
+    }
+}
+
 pub fn render_nzb(release: &ReleaseRow, articles: &[ArticleRow]) -> String {
     render_nzb_in(release, articles, std::slice::from_ref(&release.group_name))
 }
@@ -72,13 +208,10 @@ pub(crate) fn render_nzb_in(release: &ReleaseRow, articles: &[ArticleRow], group
     x.push_str("<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\">\n");
     let _ = writeln!(x, "  <head>\n    <meta type=\"category\">{}</meta>\n  </head>", escape_text(&release.group_name));
 
-    // one <file> per physical file, articles are already sorted filename then part
-    let mut by_filename: IndexMap<Option<&str>, Vec<&ArticleRow>> = IndexMap::new();
-    for a in articles {
-        by_filename.entry(a.filename.as_deref()).or_default().push(a);
-    }
-
-    for file_articles in by_filename.values() {
+    // one <file> per physical file, articles are already sorted filename then part.
+    // Articles without a filename are separate physical files: merging them would
+    // make unrelated obfuscated posts look like one incomplete/complete file.
+    for file_articles in &files(articles) {
         let first = file_articles[0];
         let _ = writeln!(
             x,
@@ -113,6 +246,11 @@ pub(crate) fn render_nzb_in(release: &ReleaseRow, articles: &[ArticleRow], group
 }
 
 pub fn build_nzb(release_id: i64) -> Result<Option<String>> {
+    Ok(build_nzb_checked(release_id)?.map(|b| b.xml))
+}
+
+/// `build_nzb` with the gaps it found: the release is complete only when they are none.
+pub fn build_nzb_checked(release_id: i64) -> Result<Option<NzbBuild>> {
     crate::metrics::timed("nzb.build", || whole_nzb(release_id))
 }
 
@@ -163,7 +301,7 @@ fn filled_inventory(release: &ReleaseRow) -> Result<(Vec<ArticleRow>, Vec<String
     Ok((articles, groups))
 }
 
-fn whole_nzb(release_id: i64) -> Result<Option<String>> {
+fn whole_nzb(release_id: i64) -> Result<Option<NzbBuild>> {
     let Some(release) = get_release(release_id)? else { return Ok(None) };
     let (articles, groups) = filled_inventory(&release)?;
 
@@ -171,21 +309,29 @@ fn whole_nzb(release_id: i64) -> Result<Option<String>> {
         return Ok(None);
     }
 
-    Ok(Some(render_nzb_in(&release, &articles, &groups)))
+    let built = render_checked(&release, &articles, &groups);
+    note_gaps(&release, &built);
+    Ok(Some(built))
 }
 
 /// One file of a release as its own NZB: `file` counts from 1, in the order the release's whole NZB lists them.
 pub fn build_nzb_file(release_id: i64, file: usize) -> Result<Option<String>> {
+    Ok(build_nzb_file_checked(release_id, file)?.map(|b| b.xml))
+}
+
+/// `build_nzb_file` with the gaps it found.
+pub fn build_nzb_file_checked(release_id: i64, file: usize) -> Result<Option<NzbBuild>> {
     crate::metrics::timed("nzb.build_file", || one_file_nzb(release_id, file))
 }
 
-fn one_file_nzb(release_id: i64, file: usize) -> Result<Option<String>> {
+fn one_file_nzb(release_id: i64, file: usize) -> Result<Option<NzbBuild>> {
     let Some(release) = get_release(release_id)? else { return Ok(None) };
     let (articles, groups) = filled_inventory(&release)?;
-    // sorted by filename, soo each file's articles are one run
-    let mut runs = articles.chunk_by(|a, b| a.filename == b.filename);
-    let Some(one) = file.checked_sub(1).and_then(|at| runs.nth(at)) else { return Ok(None) };
-    Ok(Some(render_nzb_in(&release, one, &groups)))
+    // the same files, in the same order, as the whole NZB
+    let Some(one) = nth_file(&articles, file) else { return Ok(None) };
+    let built = render_checked(&release, &one, &groups);
+    note_gaps(&release, &built);
+    Ok(Some(built))
 }
 
 /// Write the nzb for a release, into `output_dir` or the current dir.
@@ -195,10 +341,14 @@ pub fn generate_nzb(release_id: i64, output_dir: Option<&Path>) -> Result<PathBu
         anyhow!("release not found")
     })?;
 
-    let Some(content) = build_nzb(release_id)? else {
+    let Some(built) = build_nzb_checked(release_id)? else {
         ui::error("No articles found");
         return Err(anyhow!("no articles found"));
     };
+    for g in &built.gaps {
+        ui::warn(&format!("incomplete: {}", describe(g)));
+    }
+    let content = built.xml;
 
     let filename = nzb_filename(&release.name, Some(release.id));
     let target = match output_dir {
@@ -281,5 +431,120 @@ mod tests {
         assert!(xml.contains("subject=\"&quot;a.rar&quot; yEnc (1/2)\""));
         assert!(xml.contains("<meta type=\"category\">alt.binaries.test</meta>"));
         assert!(xml.starts_with("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<!DOCTYPE nzb"));
+    }
+
+    fn part(file: &str, part: i64, total: i64) -> ArticleRow {
+        ArticleRow {
+            message_id: format!("<{file}.{part}@x>"),
+            filename: Some(file.into()),
+            part: Some(part),
+            total_parts: Some(total),
+            bytes: Some(700_000),
+            subject: Some(format!("\"{file}\" yEnc ({part}/{total})")),
+            poster: None,
+            posted_date: None,
+        }
+    }
+
+    fn release() -> ReleaseRow {
+        ReleaseRow {
+            id: 8,
+            name: "Rel".into(),
+            group_name: "alt.binaries.test".into(),
+            complete: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_file_missing_a_part_is_not_complete() {
+        let articles = [part("a.mkv", 1, 4), part("a.mkv", 2, 4), part("a.mkv", 4, 4)];
+        assert!(!articles_complete(&articles));
+        let gaps = gaps(&articles);
+        assert_eq!(gaps.len(), 1);
+        assert_eq!(gaps[0].missing, [3]);
+        assert_eq!((gaps[0].have, gaps[0].total), (3, Some(4)));
+    }
+
+    #[test]
+    fn a_whole_file_is_complete() {
+        let articles: Vec<_> = (1..=5).map(|p| part("a.mkv", p, 5)).chain([part("a.par2", 1, 1)]).collect();
+        assert!(articles_complete(&articles));
+        let built = render_checked(&release(), &articles, &["alt.binaries.test".into()]);
+        assert!(built.complete());
+        assert!(!built.xml.contains("x-atlas-incomplete"));
+    }
+
+    #[test]
+    fn the_nzb_build_names_the_gap() {
+        let articles = [part("a.mkv", 1, 4), part("a.mkv", 2, 4), part("a.mkv", 4, 4), part("b.par2", 1, 1)];
+        let built = render_checked(&release(), &articles, &["alt.binaries.test".into()]);
+        assert!(!built.complete());
+        assert_eq!(built.gaps.len(), 1, "only a.mkv lacks a part");
+        assert!(
+            built.xml.contains("<meta type=\"x-atlas-incomplete\">a.mkv: 3 of 4 parts, missing 3</meta>\n  </head>"),
+            "{}",
+            built.xml
+        );
+        // the segments it has are still all listed
+        assert_eq!(built.xml.matches("<segment ").count(), 4);
+    }
+
+    #[test]
+    fn a_lone_late_segment_is_a_gap_not_a_file() {
+        // one article: segment 17 of an obfuscated file
+        let gaps = gaps(&[part("x", 17, 40)]);
+        assert_eq!(gaps[0].have, 1);
+        assert_eq!(gaps[0].missing.len(), GAP_LIST);
+        assert!(describe(&gaps[0]).ends_with(",..."));
+    }
+
+    #[test]
+    fn unnumbered_or_out_of_range_parts_are_gaps() {
+        let mut none = part("a", 1, 1);
+        none.part = None;
+        assert!(!articles_complete(&[part("a", 1, 2), part("a", 2, 2), part("a", 3, 2)]));
+        assert!(!articles_complete(&[none]));
+        let mut untotalled = part("a", 1, 1);
+        untotalled.total_parts = None;
+        assert!(!articles_complete(&[untotalled]));
+        assert!(!articles_complete(&[]));
+    }
+
+    #[test]
+    fn zero_based_parts_are_complete() {
+        let articles: Vec<_> = (0..4).map(|p| part("a.mkv", p, 4)).collect();
+        assert!(articles_complete(&articles));
+        assert!(render_checked(&release(), &articles, &["alt.binaries.test".into()]).complete());
+    }
+
+    #[test]
+    fn unnamed_articles_are_not_merged() {
+        let mut first = part("a", 1, 1);
+        first.filename = None;
+        let mut second = part("b", 1, 1);
+        second.filename = None;
+        let xml = render_nzb(&release(), &[first, second]);
+        assert_eq!(xml.matches("<file ").count(), 2);
+    }
+
+    #[test]
+    fn file_n_is_the_nth_file_of_the_whole_nzb() {
+        let mut first = part("x", 1, 1);
+        first.filename = None;
+        first.message_id = "first@x".into();
+        let mut second = part("y", 1, 1);
+        second.filename = None;
+        second.message_id = "second@x".into();
+        let third = part("c.mkv", 1, 1);
+        let articles = vec![first, second, third];
+        let whole = render_nzb(&release(), &articles);
+        assert_eq!(whole.matches("<file ").count(), 3);
+        let ids = |f: usize| nth_file(&articles, f).unwrap().into_iter().map(|a| a.message_id).collect::<Vec<_>>();
+        assert_eq!(ids(1), vec!["first@x"]);
+        assert_eq!(ids(2), vec!["second@x"]);
+        assert_eq!(ids(3), vec![articles[2].message_id.clone()]);
+        assert!(nth_file(&articles, 4).is_none());
+        assert!(nth_file(&articles, 0).is_none());
     }
 }
