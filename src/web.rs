@@ -79,6 +79,7 @@ pub fn get(path: &str, query: &str, cookies: Option<&str>, base: &str, api_key: 
         "/" | "" if signed_in => remembered(html(200, search_page(&args, base))),
         "/" | "" => html(200, login_page(base, false)),
         "/ui/results" if signed_in => remembered(results(&args)),
+        "/ui/total" if signed_in => html(200, exact_total(&args)),
         "/ui/results" => ApiResponse { headers: vec![("HX-Redirect".into(), "/".into())], ..html(401, String::new()) },
         "/ui/release" if signed_in => release_page(&args),
         "/ui/duplicates" if signed_in => duplicates_page(&args),
@@ -97,8 +98,8 @@ pub fn get(path: &str, query: &str, cookies: Option<&str>, base: &str, api_key: 
         "/ui/settings" if signed_in => html(200, settings_page(None)),
         "/ui/nzb" if signed_in && args.get("fill").is_some_and(|v| v == "1") => filled_nzb(&args),
         "/ui/nzb" if signed_in => get_nzb(&args),
-        "/ui/details" | "/ui/pending" | "/ui/poster" | "/ui/cover" | "/ui/still" | "/ui/samefilm" | "/ui/meta"
-        | "/ui/row" | "/ui/stats/live" | "/ui/stats/stored" => {
+        "/ui/total" | "/ui/details" | "/ui/pending" | "/ui/poster" | "/ui/cover" | "/ui/still" | "/ui/samefilm"
+        | "/ui/meta" | "/ui/row" | "/ui/stats/live" | "/ui/stats/stored" => {
             ApiResponse { headers: vec![("HX-Redirect".into(), "/".into())], ..html(401, String::new()) }
         }
         "/ui/nzb" | "/ui/release" | "/ui/duplicates" | "/ui/stats" | "/ui/same" | "/ui/settings" => {
@@ -950,7 +951,7 @@ impl Search {
         let by = self.sort;
         let mut at_least = self.offset + PAGE_SIZE + 1;
         // a rating chip stopped the window growing with more of the search behind it
-        let mut rated_stop = None;
+        let rated_stop;
         let (rows, more) = loop {
             let window = match window_of(self, at_least) {
                 Ok(window) => window,
@@ -1095,9 +1096,12 @@ impl Search {
             && self.min_score.is_none()
             && let Ok(window) = window_of(self, 0)
         {
-            window.total.get_or_init(|| self.total()).clone()
+            match lock(&window.counted).get(&None).copied() {
+                Some(n) => exact_html(n),
+                None => window.total.get_or_init(|| self.total(true)).clone(),
+            }
         } else {
-            self.total()
+            self.total(true)
         };
         format!(
             "<div class=\"summary\"><span class=\"path\">{path}</span>{total}<span class=\"sort\">{}</span></div>{}",
@@ -1110,7 +1114,10 @@ impl Search {
     /// word index counts words, categories and tags, and the database counts fields. What the page leaves out of what
     /// was counted makes the count a most: copies and incomplete releases, which only the rows themselves tell, and tags
     /// when the database counted.
-    fn total(&self) -> String {
+    /// `lazy`: a count small enough for one window says so, and the page asks `/ui/total` for the rows' own count once
+    /// it's shown (`exact_total`), which leaves out what the count can't: folded rows, incomplete and unrated ones. Only
+    /// for a search paged from its window: one paged a page at a time folds differently.
+    fn total(&self, lazy: bool) -> String {
         let filter = parse_filter(&self.cat);
         let mut left_out = Vec::new();
         let counted = match self.counted_by_index() {
@@ -1135,7 +1142,10 @@ impl Search {
         if self.min_score.is_some() {
             left_out.push("releases rated lower or not rated");
         }
-        match counted {
+        // only a search paged from its window, whose rows the count then matches; an "at least" count may be all
+        // there is too: the window says
+        let small = self.sorts_from_a_window() && matches!(&counted, Ok(t) if t.count > 0 && t.count <= SORT_WINDOW);
+        let html = match counted {
             Ok(total) if left_out.is_empty() => {
                 format!("<strong class=\"total\" title=\"{ROWS_FOLDED}\">{}</strong>", escape(&total.describe()))
             }
@@ -1150,6 +1160,18 @@ impl Search {
                 eprintln!("web count failed: {e}");
                 String::new()
             }
+        };
+        if lazy && small && !html.is_empty() {
+            let query = attr(&self.query(&self.cat, 0));
+            html.replacen(
+                "<strong class=\"total\"",
+                &format!(
+                    "<strong class=\"total\" hx-get=\"/ui/total?{query}\" hx-trigger=\"load\" hx-swap=\"outerHTML\""
+                ),
+                1,
+            )
+        } else {
+            html
         }
     }
 
@@ -1177,6 +1199,8 @@ fn list_of(items: &[&str]) -> String {
 
 /// How old a window can get before a click on it starts a new one. The click still gets the old one straight away.
 const WINDOW_FRESH: Duration = Duration::from_secs(60);
+/// How long a count waits for its window's background fill; past it the count it had stands.
+const COUNT_WAITS_FOR_FILL: Duration = Duration::from_secs(2);
 /// How often the windows nobody has clicked lately are made again, soo the first click of the day finds one.
 const WINDOW_IDLE_FRESH: Duration = Duration::from_secs(15 * 60);
 /// What counts as lately.
@@ -1228,6 +1252,8 @@ struct Window {
     /// bumped, under `shown`, each time rows are kept: a size order read from older sizes isn't kept
     shown_gen: std::sync::atomic::AtomicU64,
     filled: AtomicBool,
+    /// `shown_count`'s answers, by rating chip (the only thing searches sharing a window differ in that it counts)
+    counted: Mutex<HashMap<Option<i64>, usize>>,
     /// how many results it was read with
     asked: i64,
     /// the search had that many, soo it may have more: a sort over a whole category reads a bigger window when a page
@@ -1254,6 +1280,7 @@ impl Window {
             sized: AtomicBool::new(false),
             shown_gen: std::sync::atomic::AtomicU64::new(0),
             filled: AtomicBool::new(false),
+            counted: Mutex::new(HashMap::new()),
         })
     }
 
@@ -1515,6 +1542,55 @@ impl Window {
                 }
             });
         }
+    }
+
+    /// How many rows the search shows from this window once its background fill has rendered them all: those not
+    /// folded into another (incomplete ones among them) nor left out by a rating chip. None: the fill hasn't
+    /// finished, and the count it had stands; the next page asks again.
+    fn shown_count(&self, search: &Search) -> Option<usize> {
+        if let Some(n) = lock(&self.counted).get(&search.min_score) {
+            return Some(*n);
+        }
+        // the fill renders the first `SORT_WINDOW` rows: a window grown past them isn't all rendered
+        if self.rows.len() > SORT_WINDOW as usize {
+            return None;
+        }
+        // the background fill renders them all: waited for, soo they aren't rendered twice
+        let started = Instant::now();
+        while !self.filled.load(Ordering::Acquire) && started.elapsed() < COUNT_WAITS_FOR_FILL {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // waiting its turn behind other windows' fills: not rendered here, on a request's thread
+        if !self.filled.load(Ordering::Acquire) {
+            return None;
+        }
+        if search.min_score.is_some() {
+            // scored as `page` scores them: the row shown, else another row of its post
+            let unscored: Vec<(i64, Vec<i64>)> = lock(&self.shown)
+                .iter()
+                .filter(|(_, row)| !row.folded && row.score.is_none())
+                .map(|(place, row)| {
+                    (*place, std::iter::once(row.brings.unwrap_or(*place)).chain(row.post.iter().copied()).collect())
+                })
+                .collect();
+            let scores = kept_scores(&unscored.iter().flat_map(|(_, ids)| ids.iter().copied()).collect::<Vec<_>>());
+            let mut shown = lock(&self.shown);
+            for (place, ids) in unscored {
+                if let Some(row) = shown.get_mut(&place) {
+                    row.score = Some(ids.iter().find_map(|id| scores.get(id).copied()));
+                }
+            }
+        }
+        // what `page` passes over: folded rows (incomplete ones among them) and rows a chip leaves out
+        let n = {
+            let shown = lock(&self.shown);
+            self.rows
+                .iter()
+                .filter(|r| shown.get(&r.id).is_some_and(|row| !row.folded && !search.scored_out(row.score.flatten())))
+                .count()
+        };
+        lock(&self.counted).insert(search.min_score, n);
+        Some(n)
     }
 
     /// Renders every row and works out every order, soo no click has any of it left to do.
@@ -2329,6 +2405,38 @@ fn results(args: &HashMap<String, String>) -> ApiResponse {
         return html(200, search.body());
     }
     first_page(&search, &ask_note("", " hx-swap-oob=\"true\""))
+}
+
+/// A count from the rows themselves.
+fn exact_html(n: usize) -> String {
+    format!(
+        "<strong class=\"total\" title=\"{}\">{}</strong>",
+        attr(&format!("Counted from the rows themselves. {ROWS_FOLDED}")),
+        escape(&field_search::Total { count: n as i64, exact: true }.describe())
+    )
+}
+
+/// The count over a results page, from the rows themselves when the search pages from one window that holds every
+/// match: what a page leaves out (a post's other rows, incomplete and unrated releases) isn't counted, soo it's the
+/// rows paging shows.
+/// A search with more than one window holds keeps the count it had.
+fn exact_total(args: &HashMap<String, String>) -> String {
+    let search = Search { offset: 0, ..Search::from_args(args) };
+    // other searches page a page at a time, folding as they go: no window count matches them
+    if !search.sorts_from_a_window() {
+        return search.total(false);
+    }
+    match window_of(&search, 0) {
+        Ok(window) if !window.more_in_db => match window.shown_count(&search) {
+            Some(n) => exact_html(n),
+            None => search.total(false),
+        },
+        Ok(_) => search.total(false),
+        Err(e) => {
+            eprintln!("web exact count failed: {e}");
+            search.total(false)
+        }
+    }
 }
 
 /// A new search's results, with the sidebar and the form following it. `more` goes in too, for out of band swaps.
@@ -4551,6 +4659,7 @@ mod tests {
             sized: AtomicBool::new(false),
             shown_gen: std::sync::atomic::AtomicU64::new(0),
             filled: AtomicBool::new(false),
+            counted: Mutex::new(HashMap::new()),
             asked: SORT_WINDOW,
             more_in_db: false,
         }
@@ -5444,6 +5553,35 @@ mod tests {
         assert!(Arc::ptr_eq(&slot_of(&sorted(""), false), &slot_of(&sorted("&rated=70"), false)), "one window");
         let inputs = scope_inputs(&rated("q=x&rated=80"), "");
         assert!(inputs.contains("name=\"rated\" value=\"80\""), "a new search keeps the chip: {inputs}");
+    }
+
+    #[test]
+    fn a_window_counts_the_rows_a_search_shows() {
+        let row = |id: i64| ReleaseRow { id, size: Some(id), ..Default::default() };
+        let w = window_of_rows(vec![row(1), row(2), row(3), row(4)]);
+        w.filled.store(true, Ordering::Release);
+        let shows = |brings, folded, score| ShownRow {
+            html: "<tr></tr>".into(),
+            size: Some(1),
+            folded,
+            brings,
+            score: Some(score),
+            post: Vec::new(),
+        };
+        // 2 is folded into another row; 3 shows post 9
+        w.publish(vec![
+            (1, shows(None, false, None)),
+            (2, shows(None, true, None)),
+            (3, shows(Some(9), false, Some(70))),
+            (4, shows(None, false, Some(50))),
+        ]);
+        let search = |q: &str| Search::from_args(&parse_query(q));
+        assert_eq!(w.shown_count(&search("q=x")), Some(3), "a folded row isn't counted");
+        assert_eq!(w.shown_count(&search("q=x&rated=60")), Some(1), "nor one a chip leaves out");
+        w.publish(vec![(1, shows(None, true, None))]);
+        assert_eq!(w.shown_count(&search("q=x")), Some(3), "kept per window and chip");
+        let unfilled = window_of_rows(vec![row(1)]);
+        assert_eq!(unfilled.shown_count(&search("q=x")), None, "not counted before the fill; waits, then gives up");
     }
 
     #[test]
