@@ -11,7 +11,7 @@ use tiny_http::{Header, Request, Response, Server};
 use crate::config::{Config, get_api_key};
 use crate::dates::pub_date;
 use crate::db;
-use crate::nzb::{build_nzb, build_nzb_file, nzb_filename};
+use crate::nzb::{build_nzb_checked, build_nzb_file_checked, nzb_filename};
 use crate::search::{all_releases, get_release, newest_in_categories, search_all_releases, search_in_categories};
 use crate::ui;
 
@@ -493,7 +493,7 @@ pub(crate) fn get_nzb(args: &HashMap<String, String>) -> ApiResponse {
             return ApiResponse::not_found();
         }
         return match crate::frozen::nzb(&crate::paths::database(), release_id) {
-            Ok(Some((release, content))) => nzb_response(&release, release_id, content),
+            Ok(Some((release, built))) => nzb_response(&release, release_id, built.xml, &built.gaps),
             Ok(None) => ApiResponse::not_found(),
             Err(e) => {
                 eprintln!("api frozen nzb failed: {e}");
@@ -504,24 +504,34 @@ pub(crate) fn get_nzb(args: &HashMap<String, String>) -> ApiResponse {
 
     // `file` isnt in the Newznab spec: one file of the release, and one that isnt there is a miss
     let built = match args.get("file") {
-        Some(file) => file.trim().parse().ok().map_or(Ok(None), |file| build_nzb_file(release_id, file)),
-        None => build_nzb(release_id),
+        Some(file) => file.trim().parse().ok().map_or(Ok(None), |file| build_nzb_file_checked(release_id, file)),
+        None => build_nzb_checked(release_id),
     };
-    let Ok(Some(content)) = built else {
+    let Ok(Some(built)) = built else {
         return ApiResponse::not_found();
     };
 
-    nzb_response(&release, release_id, content)
+    nzb_response(&release, release_id, built.xml, &built.gaps)
 }
 
-fn nzb_response(release: &crate::search::ReleaseRow, release_id: i64, content: String) -> ApiResponse {
+fn nzb_response(
+    release: &crate::search::ReleaseRow,
+    release_id: i64,
+    content: String,
+    gaps: &[crate::nzb::FileGap],
+) -> ApiResponse {
     let filename = nzb_filename(&release.name, Some(release_id)).replace(['"', '\\'], "_");
+    let mut headers = vec![("Content-Disposition".into(), format!("attachment; filename=\"{filename}\""))];
+    // not in the Newznab spec: a client can tell an NZB short of segments without parsing it
+    if !gaps.is_empty() {
+        headers.push(("X-Atlas-Incomplete".into(), gaps.len().to_string()));
+    }
 
     ApiResponse {
         status: 200,
         content_type: Some("application/x-nzb"),
         body: content,
-        headers: vec![("Content-Disposition".into(), format!("attachment; filename=\"{filename}\""))],
+        headers,
         bytes: None,
         failed: false,
     }
