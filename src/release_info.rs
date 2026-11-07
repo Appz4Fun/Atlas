@@ -209,6 +209,17 @@ pub fn contents_counts_with(conn: &Connection, id: i64) -> Result<Contents> {
     contents_of(conn, &[id], &[], false)
 }
 
+/// What a summary of a release (a copy's card) needs: its counts, and its bytes only where a repair verdict rests on
+/// them, recovery volumes whose PAR2 set hasn't been read (`Contents::repairable`, `repair_per_mille`). Otherwise the
+/// counts alone give the same verdicts.
+pub fn contents_summary_with(conn: &Connection, id: i64) -> Result<Contents> {
+    let counts = contents_counts_with(conn, id)?;
+    if counts.recovery_articles_expected > 0 && counts.exact_repair_per_mille().is_none() {
+        return contents_with(conn, id);
+    }
+    Ok(counts)
+}
+
 /// `recovery`: rows whose files are all recovery volumes, whatever they're called.
 fn contents_of(conn: &Connection, ids: &[i64], recovery: &[i64], with_bytes: bool) -> Result<Contents> {
     let mut totals = Contents::default();
@@ -1937,6 +1948,12 @@ mod tests {
             );
             assert_eq!(counts.missing_per_mille(), full.missing_per_mille());
             assert_eq!((counts.data_bytes, counts.recovery_bytes), (0, 0), "no articles read for bytes");
+            // a summary reads the bytes only where the repair verdict needs them: recovery volumes, no PAR2 set read
+            let summary = contents_summary_with(&conn, id).unwrap();
+            let needs_bytes = full.recovery_articles_expected > 0 && full.exact_repair_per_mille().is_none();
+            assert_eq!(summary.recovery_bytes, if needs_bytes { full.recovery_bytes } else { 0 }, "release {id}");
+            assert_eq!(summary.repairable(), full.repairable(), "the same verdict, release {id}");
+            assert_eq!(summary.exact_repair_per_mille(), full.exact_repair_per_mille());
         }
     }
 

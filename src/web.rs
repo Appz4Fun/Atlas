@@ -3213,8 +3213,9 @@ fn copy_card(
         .as_ref()
         .and_then(|m| crate::media::details::kept_for(std::iter::once((r.id, m.kind, &m.ids))).remove(&r.id));
     let names = release_info::names_with(conn, r.id).unwrap_or_default();
-    // its counts only: the card shows no bytes, and reading every article of each copy is most of a page's time
-    let contents = release_info::contents_counts_with(conn, r.id).unwrap_or_default();
+    // its counts, and its bytes only where the repair verdict needs them: reading every article of each copy was most
+    // of a page's time
+    let contents = release_info::contents_summary_with(conn, r.id).unwrap_or_default();
     let inner = crate::archive::store::view_with(conn, r.id);
     let hint = crate::duplicates::own_password_hint(conn, r.id, names.as_ref());
     // a password found on a posting of the same bytes, never this one's own
