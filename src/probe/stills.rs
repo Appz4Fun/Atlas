@@ -97,7 +97,7 @@ pub fn stills(conn: &rusqlite::Connection, release_id: i64) -> Vec<(u8, Option<i
 /// file, never a sample or an extra, soo a release that shares one has the same pictures at the same places.
 const SAME_FILE: [keys::Kind; 2] = [keys::Kind::Mux, keys::Kind::MovieHash];
 
-/// Releases looked at per key for one that has stills: the newest first.
+/// Releases with every still hashed looked at per key and shard, newest first, for one whose files are on disk.
 const SAME_FILE_CANDIDATES: i64 = 16;
 
 /// What a release's video file can be found by: its mux key and its OpenSubtitles hash, read from its probe in
@@ -129,15 +129,49 @@ fn has_all_stills(conn: &rusqlite::Connection, release_id: i64) -> bool {
     kept.len() == POSITIONS.len() && kept.iter().all(|(h, hashed)| *hashed && still_file(h).is_some_and(|f| f.exists()))
 }
 
+/// The releases other than `?1` in shard `shard` whose probed file has the `kind` key `?3`, that the pages would show
+/// and that have every still hashed, newest first, at most `?2`: those without stills are left out in SQL, soo any
+/// number of releases that borrow can't hide the one they borrow from.
+fn with_stills_sql(kind: keys::Kind, shard: usize) -> String {
+    let (from, matches) = match kind {
+        keys::Kind::Mux => (format!("s{shard}.release_keys k"), "k.mux = ?3"),
+        _ => (format!("s{shard}.release_probe k"), "k.moviehash = ?3"),
+    };
+    format!(
+        "select k.release_id from {from} join s{shard}.releases r on r.id = k.release_id
+         where {matches} and k.release_id != ?1 and not atlas_blocked(r.group_name)
+           and (select count(*) from s{shard}.release_stills s
+                where s.release_id = k.release_id and s.phash is not null) = {}
+         order by k.release_id desc limit ?2",
+        POSITIONS.len()
+    )
+}
+
 /// Another release carrying the same video file (`SAME_FILE`) that already has its stills, and the key that ties
 /// them, over every shard of `conn`. The stills are read from it, by its id: none are made or kept twice.
 pub fn same_file_stills(conn: &rusqlite::Connection, own: i64, lookup: &keys::Lookup) -> Option<(i64, keys::Kind)> {
-    SAME_FILE.into_iter().filter(|k| lookup.has(*k)).find_map(|kind| {
-        keys::others(conn, own, lookup, kind, SAME_FILE_CANDIDATES)
-            .into_iter()
-            .find(|other| has_all_stills(conn, *other))
-            .map(|other| (other, kind))
-    })
+    for kind in SAME_FILE {
+        let value: Option<rusqlite::types::Value> = match kind {
+            keys::Kind::Mux => lookup.keys.mux.map(Into::into),
+            _ => lookup.moviehash.clone().map(Into::into),
+        };
+        let Some(value) = value else { continue };
+        let mut found: Vec<i64> = Vec::new();
+        for shard in 0..store::SHARDS {
+            // a shard without the tables yet has none
+            let Ok(mut q) = conn.prepare_cached(&with_stills_sql(kind, shard)) else { continue };
+            let Ok(rows) = q.query_map(rusqlite::params![own, SAME_FILE_CANDIDATES, value], |r| r.get::<_, i64>(0))
+            else {
+                continue;
+            };
+            found.extend(rows.filter_map(Result::ok));
+        }
+        found.sort_unstable_by(|a, b| b.cmp(a));
+        if let Some(other) = found.into_iter().find(|other| has_all_stills(conn, *other)) {
+            return Some((other, kind));
+        }
+    }
+    None
 }
 
 /// Whose stills a release shows, with the shards attached to `conn`: its own, else those of a release with the same
@@ -1251,6 +1285,25 @@ mod tests {
         assert_eq!(shown_stills(&conn, 16), Some((16, None)), "its own, even short");
         assert_eq!(shown_stills(&conn, 24), Some((0, Some(keys::Kind::MovieHash))));
         assert_eq!(shown_stills(&conn, 32), None);
+        // twenty newer releases of the same file that borrow (and so have none) don't hide the one they borrow from
+        for n in 1..=20 {
+            release(&conn, 32 + 8 * n, Some("ab12"), None, &[]);
+        }
+        assert_eq!(shown_stills(&conn, 8), Some((0, Some(keys::Kind::Mux))));
+        assert_eq!(shown_stills(&conn, 32 + 8 * 20), Some((0, Some(keys::Kind::Mux))));
+        // nor does a lender whose JPEGs were trimmed from the folder count
+        let gone: String = conn
+            .query_row("select sha256 from s0.release_stills where release_id = 0 and position = 50", [], |r| r.get(0))
+            .unwrap();
+        conn.execute(
+            "update s0.release_stills set sha256 = ?1 where release_id = 0 and position = 50",
+            [gone.replace(&gone[..1], if &gone[..1] == "0" { "1" } else { "0" })],
+        )
+        .unwrap();
+        assert_eq!(shown_stills(&conn, 8), None);
+        conn.execute("update s0.release_stills set sha256 = ?1 where release_id = 0 and position = 50", [&gone])
+            .unwrap();
+        assert_eq!(shown_stills(&conn, 8), Some((0, Some(keys::Kind::Mux))));
         // a release in a blocked group lends nothing
         conn.execute("update s0.releases set group_name = 'alt.binaries.pictures.erotica.teen' where id = 0", [])
             .unwrap();
