@@ -12,8 +12,11 @@ pub const MIN_GAP_SECS: i64 = 180;
 pub const MIN_GAP_TIMES_MEDIAN: i64 = 20;
 /// Each upload holds at least this share of the release's distinct (file, part) pairs, per mille.
 pub const MIN_COVER_PER_MILLE: usize = 900;
-/// The copies of a part differ in size by at most this, per mille of the largest (headers differ, bodies dont).
+/// The copies of a part differ in size by at most this, per mille of the largest, or `MAX_BYTES_SPREAD`, whichever is
+/// more: headers differ, bodies dont. Measured on five uploads of one post: up to 5,766 bytes on 740 KB articles
+/// (0.78%), 273 bytes on a 5 KB last article.
 pub const MAX_BYTES_SPREAD_PER_MILLE: i64 = 10;
+pub const MAX_BYTES_SPREAD: i64 = 8_192;
 
 /// One stored article: its file and part, the part total its subject gave, its size and its Date (unix seconds).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -119,7 +122,8 @@ pub fn decide(copies: &[Copy]) -> Verdict {
         let parts: Vec<&Copy> = idx.iter().filter_map(|i| copies.get(*i)).collect();
         let totals: HashSet<Option<i64>> = parts.iter().map(|c| c.total).collect();
         let (lo, hi) = parts.iter().fold((i64::MAX, i64::MIN), |(lo, hi), c| (lo.min(c.bytes), hi.max(c.bytes)));
-        if totals.len() > 1 || (hi - lo).saturating_mul(1000) > hi.saturating_mul(MAX_BYTES_SPREAD_PER_MILLE) {
+        let slack = MAX_BYTES_SPREAD.max(hi.saturating_mul(MAX_BYTES_SPREAD_PER_MILLE) / 1000);
+        if totals.len() > 1 || hi - lo > slack {
             return Verdict::Keep(Keep::Different);
         }
     }
@@ -211,6 +215,22 @@ mod tests {
         for (i, u) in uploads.iter().enumerate() {
             assert_eq!(*u, i / 400, "article {i} is in its own upload");
         }
+    }
+
+    /// Headers differ between uploads: 5,766 bytes on a 740 KB article, 273 on a 5 KB last one (measured).
+    #[test]
+    fn header_noise_on_small_and_large_articles_is_the_same_part() {
+        let mut copies = post(1, 50, &[0, 3_600]);
+        for c in copies.iter_mut() {
+            let second = c.date.is_some_and(|d| d >= 3_600);
+            match (c.part, second) {
+                (Some(50), false) => c.bytes = 5_246,
+                (Some(50), true) => c.bytes = 5_246 - 273,
+                (_, true) => c.bytes = 740_000 - 5_766,
+                _ => c.bytes = 740_000,
+            }
+        }
+        assert!(matches!(decide(&copies), Verdict::Split { windows: 2, .. }), "{:?}", decide(&copies));
     }
 
     /// Topaz: two uploads six days apart.
