@@ -73,15 +73,24 @@ pub async fn run(pool: Arc<Pool>, db: Db, config: SpotsConfig, stopping: impl Fn
 /// Its tables are made with the main database's (`store::create_main`).
 pub async fn run_comments(pool: Arc<Pool>, db: Db, config: SpotsConfig, stopping: impl Fn() -> bool + Send + 'static) {
     while !stopping() {
-        match said(&pool, &db, &config, &stopping).await {
-            Ok(s) if s != Said::default() => println!(
-                "spots: {} new comments, {} new spam reports, read {} comments' text ({} gone, {} to retry)",
-                s.comments, s.reports, s.read, s.gone, s.retry
-            ),
-            Ok(_) => {}
-            Err(e) => eprintln!("spots: comments: {e:#}"),
+        let more = match said(&pool, &db, &config, &stopping).await {
+            Ok(s) => {
+                if s != Said::default() {
+                    println!(
+                        "spots: {} new comments, {} new spam reports, read {} comments' text ({} gone, {} to retry)",
+                        s.comments, s.reports, s.read, s.gone, s.retry
+                    );
+                }
+                s.more
+            }
+            Err(e) => {
+                eprintln!("spots: comments: {e:#}");
+                false
+            }
+        };
+        if !more {
+            crate::bg_indexer::nap(poll(&config), &stopping).await;
         }
-        crate::bg_indexer::nap(poll(&config), &stopping).await;
     }
 }
 
@@ -453,6 +462,8 @@ struct Said {
     read: usize,
     gone: usize,
     retry: usize,
+    /// the texts stopped at the pass's time, with more waiting: the next pass comes without a nap
+    more: bool,
 }
 
 /// The comments and spam reports posted since the last pass, then up to `comments_per_pass` texts of comments on
@@ -460,6 +471,9 @@ struct Said {
 /// skipped, and the texts are read whatever came of the groups. The first failed read ends the texts for this pass.
 async fn said(pool: &Arc<Pool>, db: &Db, config: &SpotsConfig, stopping: &impl Fn() -> bool) -> Result<Said> {
     let mut done = Said::default();
+    // these tables are this task's: pruned here too, whether or not the spot pass gets that far
+    let now = chrono::Utc::now().timestamp();
+    on_db(db, move |conn| Ok(comments::prune(conn, now)?)).await?;
     for (group, reports) in [(comments::COMMENT_GROUP, false), (comments::REPORT_GROUP, true)] {
         match read_group(pool, db, group, reports, config.comment_days, stopping).await {
             Ok(n) if reports => done.reports = n,
@@ -478,7 +492,11 @@ async fn said(pool: &Arc<Pool>, db: &Db, config: &SpotsConfig, stopping: &impl F
     // no longer than a poll: the groups are read again at the next pass, whatever texts are left
     let started = std::time::Instant::now();
     for message_id in todo {
-        if stopping() || failed.load(Ordering::Relaxed) || started.elapsed() >= poll(config) {
+        if stopping() || failed.load(Ordering::Relaxed) {
+            break;
+        }
+        if started.elapsed() >= poll(config) {
+            done.more = true;
             break;
         }
         let slot = slots.clone().acquire_owned().await.expect("the pass's semaphore is never closed");

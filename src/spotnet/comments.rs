@@ -67,16 +67,9 @@ pub fn create(conn: &Connection) -> Result<()> {
     )?;
     // tables made by #243, before `seen`
     for table in ["spot_comments", "spot_reports"] {
-        let has: bool =
-            conn.prepare(&format!("select 1 from pragma_table_info('{table}') where name = 'seen'"))?.exists([])?;
-        if !has {
-            conn.execute_batch(&format!("alter table {table} add column seen INTEGER NOT NULL DEFAULT 0"))?;
-        }
+        crate::chunks::add_column_as(conn, table, "seen", "INTEGER NOT NULL DEFAULT 0")?;
     }
-    conn.execute_batch(
-        "create index if not exists spot_comments_seen on spot_comments(seen);
-        create index if not exists spot_reports_seen on spot_reports(seen);",
-    )
+    Ok(())
 }
 
 /// Whether a spot message-id is a Spotnet one: `...@spot.net`. Comments and reports name their spots that way;
@@ -444,7 +437,7 @@ mod tests {
         assert_eq!(prune(&conn, now).unwrap(), 1);
         conn.execute("delete from spots_seen where message_id = 's1@spot.net'", []).unwrap();
         assert_eq!(prune(&conn, now).unwrap(), 2, "its comment and its report");
-        // the one noted on day 10 isn't past `UNKEPT_DAYS` until a day later, whatever its spot does
+        // the one noted on day 10 is past `UNKEPT_DAYS` a second later, whatever its spot did
         conn.execute("delete from spots_seen where message_id = 's3@spot.net'", []).unwrap();
         assert_eq!(prune(&conn, now).unwrap(), 0);
         assert_eq!(prune(&conn, now + 1).unwrap(), 1);
