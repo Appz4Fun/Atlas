@@ -54,7 +54,12 @@ The Rust version replaces the original Python version. It keeps the same menus, 
 | Web UI & Newznab API | [`tiny_http`](https://github.com/tiny-http/tiny-http) + embedded [`htmx`](https://htmx.org) and Oxide CSS |
 | Compression & archives | [`zstd`](https://github.com/gyscos/zstd-rs), [`flate2`](https://github.com/rust-lang/flate2-rs), [`lzma-rs`](https://github.com/gendx/lzma-rs), and native RAR/7z/ZIP/PPMd/bzip2/lz4 decoders |
 | yEnc decoding | [`nntmux-yenc`](https://github.com/xbmc4lyfe/newznab-tmux) shared with `newznab-tmux` |
+| Audio fingerprints | [`rusty-chromaprint`](https://github.com/darksv/rusty-chromaprint) and [`symphonia`](https://github.com/pdeljanov/Symphonia), plus the external [`filmcraft-ac3`](https://crates.io/crates/filmcraft-ac3) for AC-3 and E-AC-3 (optional, see below) |
 | System stats | [`sysinfo`](https://github.com/GuillaumeGomez/sysinfo) |
+
+### External dependency: `filmcraft-ac3`
+
+AC-3 and E-AC-3 audio prints use [`filmcraft-ac3`](https://crates.io/crates/filmcraft-ac3), a pure-Rust decoder (MIT or Apache-2.0) from outside the project. It is on by default through the `ac3` Cargo feature. To build without it, run `just build-no-ac3` or `cargo build --release --no-default-features`; AC-3 and E-AC-3 tracks then get no audio print.
 
 rustup installs the pinned toolchain the first time you build, and the `just` recipes always use it, even when another Rust installation, such as Homebrew's, comes first on your `PATH`.
 
@@ -1052,6 +1057,7 @@ Common tasks are [just](https://github.com/casey/just) recipes. Run `just` to li
 | `just format` | Runs `cargo fmt`. CI runs `just format-check` and `just lint`. |
 | `just lint` | Runs `cargo clippy` with warnings treated as errors. |
 | `just build`, `just build-release` | Optimized build in `target/release/atlas`. |
+| `just build-no-ac3` | Optimized build without the external `filmcraft-ac3` decoder. |
 | `just build-debug` | Debug build in `target/debug/atlas`. |
 | `just build-remote`, `just build-remote-release` | Optimized build on another machine over SSH, copied back to `target/remote/release/atlas`. |
 | `just build-remote-debug` | The same, as a debug build. |
