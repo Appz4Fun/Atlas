@@ -197,14 +197,7 @@ pub fn tune_for_writing(conn: &Connection) -> Result<()> {
 /// quick, the background checkpointer has done the bulk of it already.
 /// The writer calls it through `Checkpoints::checkpoint_if_due`, not after every save.
 pub fn finish_checkpoint(conn: &Connection) -> Result<()> {
-    passive_checkpoint(conn).map(|_| ())
-}
-
-/// A passive checkpoint of every database of `conn`; false when it was busy:
-/// some database's WAL was being checkpointed elsewhere (the others were still
-/// copied), which isnt an error to SQLite.
-fn passive_checkpoint(conn: &Connection) -> Result<bool> {
-    conn.query_row("pragma wal_checkpoint(passive)", [], |r| r.get::<_, i64>(0)).map(|busy| busy == 0)
+    conn.query_row("pragma wal_checkpoint(passive)", [], |_| Ok(()))
 }
 
 /// Frames in the WAL of `conn`'s database `schema` (main, or an attached one),
@@ -284,17 +277,16 @@ impl Checkpoints {
     /// checkpoint. One whose WAL SQLite fails to read is (as every time before
     /// #228); one it says isnt in WAL mode never is.
     pub fn due(&self, conn: &Connection) -> Result<bool> {
+        Ok(!self.due_schemas(conn)?.is_empty())
+    }
+
+    /// Those of `conn`'s databases that are due (see `due`).
+    fn due_schemas(&self, conn: &Connection) -> Result<Vec<String>> {
         let schemas: Vec<String> = conn
             .prepare_cached("select name from pragma_database_list where name != 'temp'")?
             .query_map([], |r| r.get(0))?
             .collect::<Result<_>>()?;
-        for schema in schemas {
-            match self.due_one(conn, &schema) {
-                Ok(false) => {}
-                Ok(true) | Err(_) => return Ok(true),
-            }
-        }
-        Ok(false)
+        Ok(schemas.into_iter().filter(|schema| self.due_one(conn, schema).unwrap_or(true)).collect())
     }
 
     fn due_one(&self, conn: &Connection, schema: &str) -> Result<bool> {
@@ -322,13 +314,23 @@ impl Checkpoints {
         })
     }
 
-    /// A passive checkpoint of `conn`'s databases when `due`. Returns whether it ran.
+    /// A passive checkpoint of each of `conn`'s databases that is `due`, and only
+    /// those: one over all of them would copy all of the shard's WAL whenever the
+    /// frozen file came due, past `copy_bytes`. Returns whether any ran.
     pub fn checkpoint_if_due(&mut self, conn: &Connection) -> Result<bool> {
-        if !self.due(conn)? {
+        let due = self.due_schemas(conn)?;
+        if due.is_empty() {
             return Ok(false);
         }
-        // a checkpoint that was busy copied nothing: the age rule asks again next time
-        if passive_checkpoint(conn)? {
+        let mut copied = true;
+        for schema in &due {
+            let quoted = schema.replace('"', "\"\"");
+            let busy: i64 =
+                conn.query_row(&format!("pragma \"{quoted}\".wal_checkpoint(passive)"), [], |r| r.get(0))?;
+            // busy: checkpointed elsewhere just then, and copied nothing here. The age rule asks again next time
+            copied &= busy == 0;
+        }
+        if copied {
             self.last = Instant::now();
         }
         Ok(true)
@@ -1002,6 +1004,13 @@ mod tests {
         let mut writer = Checkpoints::new(1 << 40, true, Duration::ZERO);
         writer.copy_bytes = 0;
         assert!(writer.due(&conn).unwrap());
+        // and only the frozen file: what waits in the shard's own WAL stays for the background copying
+        fill(&conn, 10);
+        assert!(writer.checkpoint_if_due(&conn).unwrap());
+        let (log, copied) = wal_frames(&conn, "frozen").unwrap().unwrap();
+        assert_eq!(log, copied);
+        let (log, copied) = wal_frames(&conn, "main").unwrap().unwrap();
+        assert!(copied < log, "{copied} of {log}");
     }
 
     /// Set in the child process `checking_the_wal_keeps_the_write_lock` starts: the database it tries to write to.
