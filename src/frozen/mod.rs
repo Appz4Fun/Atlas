@@ -1061,7 +1061,7 @@ const SCRATCH: &str = "
         bytes INTEGER, primary key (file_id, local, domain)) without rowid;";
 
 /// A frozen release and its NZB, built from its frozen row without thawing it. None: no such frozen release.
-pub fn nzb(main: &Path, id: i64) -> anyhow::Result<Option<(ReleaseRow, String)>> {
+pub fn nzb(main: &Path, id: i64) -> anyhow::Result<Option<(ReleaseRow, crate::nzb::NzbBuild)>> {
     let Some(p) = read_payload(main, id)? else { return Ok(None) };
     let s = format!("s{}", crate::store::shard_of_id(id));
     let conn = Connection::open_in_memory()?;
@@ -1073,8 +1073,10 @@ pub fn nzb(main: &Path, id: i64) -> anyhow::Result<Option<(ReleaseRow, String)>>
     if articles.is_empty() {
         return Ok(None);
     }
-    let body = crate::nzb::render_nzb_in(&release, &articles, std::slice::from_ref(&release.group_name));
-    Ok(Some((release, body)))
+    // checked like a live release's: freezing keeps incomplete releases too
+    let built = crate::nzb::render_checked(&release, &articles, std::slice::from_ref(&release.group_name), true);
+    crate::nzb::note_gaps(&release, &built);
+    Ok(Some((release, built)))
 }
 
 /// Shard `shard`'s frozen releases back in a shard of their own (`atlas.s3.unfrozen.db`, made afresh), for what reads

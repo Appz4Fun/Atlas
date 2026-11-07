@@ -493,7 +493,7 @@ pub(crate) fn get_nzb(args: &HashMap<String, String>) -> ApiResponse {
             return ApiResponse::not_found();
         }
         return match crate::frozen::nzb(&crate::paths::database(), release_id) {
-            Ok(Some((release, content))) => nzb_response(&release, release_id, content, None),
+            Ok(Some((release, built))) => nzb_response(&release, release_id, built.xml, &built.gaps),
             Ok(None) => ApiResponse::not_found(),
             Err(e) => {
                 eprintln!("api frozen nzb failed: {e}");
@@ -511,19 +511,19 @@ pub(crate) fn get_nzb(args: &HashMap<String, String>) -> ApiResponse {
         return ApiResponse::not_found();
     };
 
-    nzb_response(&release, release_id, built.xml, Some(&built.gaps))
+    nzb_response(&release, release_id, built.xml, &built.gaps)
 }
 
 fn nzb_response(
     release: &crate::search::ReleaseRow,
     release_id: i64,
     content: String,
-    gaps: Option<&[crate::nzb::FileGap]>,
+    gaps: &[crate::nzb::FileGap],
 ) -> ApiResponse {
     let filename = nzb_filename(&release.name, Some(release_id)).replace(['"', '\\'], "_");
     let mut headers = vec![("Content-Disposition".into(), format!("attachment; filename=\"{filename}\""))];
     // not in the Newznab spec: a client can tell an NZB short of segments without parsing it
-    if let Some(gaps) = gaps.filter(|gaps| !gaps.is_empty()) {
+    if !gaps.is_empty() {
         headers.push(("X-Atlas-Incomplete".into(), gaps.len().to_string()));
     }
 

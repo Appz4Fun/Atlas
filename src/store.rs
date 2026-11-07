@@ -552,14 +552,16 @@ pub(crate) fn insert_part(bits: &mut Vec<u8>, part: i64) {
     bits[byte] |= 1 << bit;
 }
 
-/// exactly parts 1..=expected, nothing else
+/// exactly parts 1..=expected, or exactly 0..expected for a file numbered from 0, nothing else
+/// (as `parser::is_complete` and `nzb::gaps` count them)
 pub(crate) fn is_exactly(bits: &[u8], expected: i64) -> bool {
-    if expected <= 0 || bits.first().is_some_and(|b| b & 1 == 1) {
+    if expected <= 0 {
         return false;
     }
+    let zero_based = bits.first().is_some_and(|b| b & 1 == 1);
     let count: i64 = bits.iter().map(|b| i64::from(b.count_ones())).sum();
     let highest = bits.iter().rposition(|b| *b != 0).map(|i| i as i64 * 8 + 7 - i64::from(bits[i].leading_zeros()));
-    count == expected && highest == Some(expected)
+    count == expected && highest == Some(if zero_based { expected - 1 } else { expected })
 }
 
 /// What the overview said about a file's articles, folded in as they are
@@ -2846,6 +2848,12 @@ mod tests {
         insert_part(&mut zero, 0);
         insert_part(&mut zero, 1);
         assert!(!is_exactly(&zero, 1), "a part 0 doesnt belong");
+        assert!(is_exactly(&zero, 2), "0 and 1 are a whole file numbered from 0");
+        insert_part(&mut zero, 3);
+        assert!(!is_exactly(&zero, 3), "part 2 missing");
+        assert!(!is_exactly(&zero, 4), "part 2 missing, counted from 0");
+        insert_part(&mut zero, 2);
+        assert!(is_exactly(&zero, 4));
         let mut huge = Vec::new();
         insert_part(&mut huge, 5_000_000_000);
         assert!(huge.is_empty());

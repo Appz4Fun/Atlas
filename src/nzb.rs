@@ -58,9 +58,12 @@ fn is_xml_char(c: char) -> bool {
     matches!(c, '\t' | '\n' | '\r' | '\u{20}'..='\u{D7FF}' | '\u{E000}'..='\u{FFFD}' | '\u{10000}'..='\u{10FFFF}')
 }
 
-/// A file of an NZB whose segment numbers don't run exactly 1..=total.
+/// A file of an NZB whose segment numbers don't run exactly 1..=total, or (`files`) the files an NZB lacks.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileGap {
+    /// true: not one file but the whole NZB, short of files its `[n/N]` counter names; `total`, `have` and
+    /// `missing` then count files, not parts
+    pub files: bool,
     pub filename: Option<String>,
     /// the most parts any of its articles says the file has; None: none says
     pub total: Option<i64>,
@@ -109,9 +112,40 @@ pub fn gaps(articles: &[ArticleRow]) -> Vec<FileGap> {
         } else {
             (1..=limit).filter(|p| !parts.contains(p)).take(GAP_LIST).collect()
         };
-        out.push(FileGap { filename: filename.map(str::to_string), total, have, missing, stray });
+        out.push(FileGap { files: false, filename: filename.map(str::to_string), total, have, missing, stray });
     }
     out
+}
+
+/// The files `articles` lack by their subjects' `[n/N]` file counter: None when it lists as many as the counter
+/// says (or more, or no counter says). A file's counter is the one all its articles carry; one that changes from
+/// article to article numbers parts, not files (`parser` reads such bracket counters as part numbers). With more
+/// than one total among the files the counters disagree, and say nothing, as in `parser::is_complete`.
+pub fn missing_files(articles: &[ArticleRow]) -> Option<FileGap> {
+    let files = files(articles);
+    let counters: Vec<(i64, i64)> = files
+        .iter()
+        .filter_map(|f| {
+            let mut each = f.iter().map(|a| a.subject.as_deref().and_then(crate::parser::file_counter));
+            let first = each.next()??;
+            each.all(|c| c == Some(first)).then_some(first)
+        })
+        .collect();
+    let totals: std::collections::BTreeSet<i64> = counters.iter().map(|&(_, total)| total).collect();
+    let [total] = totals.into_iter().collect::<Vec<_>>()[..] else { return None };
+    if !(1..=crate::parser::MAX_PARTS).contains(&total) {
+        return None;
+    }
+    let zero_based = counters.iter().any(|&(index, _)| index == 0);
+    let wanted = total + i64::from(zero_based);
+    let have = files.len() as i64;
+    if have >= wanted {
+        return None;
+    }
+    let present: std::collections::BTreeSet<i64> = counters.iter().map(|&(index, _)| index).collect();
+    let first = i64::from(!zero_based);
+    let missing = (first..=total).filter(|i| !present.contains(i)).take(GAP_LIST).collect();
+    Some(FileGap { files: true, filename: None, total: Some(wanted), have, missing, stray: 0 })
 }
 
 /// The <file>s of an NZB, in order: one per filename, and one per article that has no filename.
@@ -140,6 +174,10 @@ fn describe(g: &FileGap) -> String {
     let total = g.total.map_or_else(|| "?".into(), |t| t.to_string());
     let missing: Vec<String> = g.missing.iter().map(i64::to_string).collect();
     let more = if (g.total.unwrap_or(0) - g.have) as usize > g.missing.len() { ",..." } else { "" };
+    if g.files {
+        let missing = if missing.is_empty() { "-".into() } else { missing.join(",") };
+        return format!("{} of {total} files, missing file {missing}{more}", g.have);
+    }
     format!(
         "{}: {} of {total} parts, missing {}{more}{}",
         g.filename.as_deref().unwrap_or(""),
@@ -163,9 +201,20 @@ impl NzbBuild {
 }
 
 /// Render the NZB and check it: a file missing parts is named in the head (`<meta type="x-atlas-incomplete">`),
-/// so an NZB short of segments is never passed off as whole.
-pub(crate) fn render_checked(release: &ReleaseRow, articles: &[ArticleRow], groups: &[String]) -> NzbBuild {
-    let gaps = gaps(articles);
+/// so an NZB short of segments is never passed off as whole. `whole`: these are all the release's files, soo
+/// files its file counter names and the NZB lacks are a gap too (not for one file of it, `?file=N`). A release
+/// whose saving found it complete with fewer files (a PAR2 set or its own whole video vouching for it, when the
+/// counter counted a file never posted) keeps that verdict on files.
+pub(crate) fn render_checked(
+    release: &ReleaseRow,
+    articles: &[ArticleRow],
+    groups: &[String],
+    whole: bool,
+) -> NzbBuild {
+    let mut gaps = gaps(articles);
+    if whole && !release.complete {
+        gaps.extend(missing_files(articles));
+    }
     let mut xml = render_nzb_in(release, articles, groups);
     if !gaps.is_empty() {
         let mut meta = String::new();
@@ -178,7 +227,7 @@ pub(crate) fn render_checked(release: &ReleaseRow, articles: &[ArticleRow], grou
 }
 
 /// Count and log an NZB built with gaps. One for a release flagged complete means the flag and the articles disagree.
-fn note_gaps(release: &ReleaseRow, built: &NzbBuild) {
+pub(crate) fn note_gaps(release: &ReleaseRow, built: &NzbBuild) {
     if built.complete() {
         return;
     }
@@ -309,7 +358,7 @@ fn whole_nzb(release_id: i64) -> Result<Option<NzbBuild>> {
         return Ok(None);
     }
 
-    let built = render_checked(&release, &articles, &groups);
+    let built = render_checked(&release, &articles, &groups, true);
     note_gaps(&release, &built);
     Ok(Some(built))
 }
@@ -329,7 +378,7 @@ fn one_file_nzb(release_id: i64, file: usize) -> Result<Option<NzbBuild>> {
     let (articles, groups) = filled_inventory(&release)?;
     // the same files, in the same order, as the whole NZB
     let Some(one) = nth_file(&articles, file) else { return Ok(None) };
-    let built = render_checked(&release, &one, &groups);
+    let built = render_checked(&release, &one, &groups, false);
     note_gaps(&release, &built);
     Ok(Some(built))
 }
@@ -470,7 +519,7 @@ mod tests {
     fn a_whole_file_is_complete() {
         let articles: Vec<_> = (1..=5).map(|p| part("a.mkv", p, 5)).chain([part("a.par2", 1, 1)]).collect();
         assert!(articles_complete(&articles));
-        let built = render_checked(&release(), &articles, &["alt.binaries.test".into()]);
+        let built = render_checked(&release(), &articles, &["alt.binaries.test".into()], true);
         assert!(built.complete());
         assert!(!built.xml.contains("x-atlas-incomplete"));
     }
@@ -478,7 +527,7 @@ mod tests {
     #[test]
     fn the_nzb_build_names_the_gap() {
         let articles = [part("a.mkv", 1, 4), part("a.mkv", 2, 4), part("a.mkv", 4, 4), part("b.par2", 1, 1)];
-        let built = render_checked(&release(), &articles, &["alt.binaries.test".into()]);
+        let built = render_checked(&release(), &articles, &["alt.binaries.test".into()], true);
         assert!(!built.complete());
         assert_eq!(built.gaps.len(), 1, "only a.mkv lacks a part");
         assert!(
@@ -511,11 +560,69 @@ mod tests {
         assert!(!articles_complete(&[]));
     }
 
+    fn counted(file: &str, index: i64, of: i64, part_no: i64, total: i64) -> ArticleRow {
+        let mut a = part(file, part_no, total);
+        a.subject = Some(format!("[{index}/{of}] \"{file}\" yEnc ({part_no}/{total})"));
+        a
+    }
+
+    #[test]
+    fn a_file_the_counter_names_and_the_nzb_lacks_is_a_gap() {
+        // [1/2] is whole, [2/2] never came
+        let articles = [counted("a.mkv", 1, 2, 1, 1)];
+        assert!(articles_complete(&articles), "every file it has is whole");
+        let gap = missing_files(&articles).expect("file 2 is missing");
+        assert!(gap.files);
+        assert_eq!((gap.have, gap.total, gap.missing.clone()), (1, Some(2), vec![2]));
+        assert_eq!(describe(&gap), "1 of 2 files, missing file 2");
+        let incomplete = ReleaseRow { complete: false, ..release() };
+        let built = render_checked(&incomplete, &articles, &["alt.binaries.test".into()], true);
+        assert!(!built.complete());
+        assert!(
+            built.xml.contains("<meta type=\"x-atlas-incomplete\">1 of 2 files, missing file 2</meta>"),
+            "{}",
+            built.xml
+        );
+        // one file of it, `?file=1`, is whole
+        assert!(render_checked(&incomplete, &articles, &["alt.binaries.test".into()], false).complete());
+        // saving found it whole with fewer files (vouched by a PAR2 set): that verdict stands
+        assert!(render_checked(&release(), &articles, &["alt.binaries.test".into()], true).complete());
+    }
+
+    #[test]
+    fn file_counters_that_agree_with_the_nzb_are_no_gap() {
+        let articles = [counted("a.mkv", 1, 2, 1, 2), counted("a.mkv", 1, 2, 2, 2), counted("a.par2", 2, 2, 1, 1)];
+        assert_eq!(missing_files(&articles), None);
+        // counted from 0: [0/2] is a third file
+        let articles = [counted("a.nfo", 0, 2, 1, 1), counted("a.mkv", 1, 2, 1, 1), counted("a.par2", 2, 2, 1, 1)];
+        assert_eq!(missing_files(&articles), None);
+        // without a [0/2] nothing says it counts from 0
+        assert_eq!(missing_files(&articles[1..]), None);
+        let gap = missing_files(&articles[..2]).expect("file 2 is missing");
+        assert_eq!(gap.missing, [2]);
+    }
+
+    #[test]
+    fn a_bracket_counter_that_numbers_parts_is_not_a_file_counter() {
+        // one file posted as single-article bracketed parts: [1/3]..[3/3], each (1/1), read as parts 1..3
+        let articles: Vec<_> = (1..=3)
+            .map(|p| {
+                let mut a = counted("x", p, 3, p, 3);
+                a.subject = Some(format!("x [{p}/3] yEnc (1/1)"));
+                a
+            })
+            .collect();
+        assert!(articles_complete(&articles));
+        assert_eq!(missing_files(&articles), None);
+        // and counters that disagree say nothing
+        assert_eq!(missing_files(&[counted("a", 1, 3, 1, 1), counted("b", 2, 4, 1, 1)]), None);
+    }
+
     #[test]
     fn zero_based_parts_are_complete() {
         let articles: Vec<_> = (0..4).map(|p| part("a.mkv", p, 4)).collect();
         assert!(articles_complete(&articles));
-        assert!(render_checked(&release(), &articles, &["alt.binaries.test".into()]).complete());
+        assert!(render_checked(&release(), &articles, &["alt.binaries.test".into()], true).complete());
     }
 
     #[test]

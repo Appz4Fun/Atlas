@@ -104,6 +104,12 @@ pub fn is_obfuscated(name: &str) -> bool {
     crate::naming::obfuscation::is_obfuscated(name)
 }
 
+/// A subject's `[index/total]` file counter.
+pub fn file_counter(subject: &str) -> Option<(i64, i64)> {
+    let c = FILE_COUNT_RE.captures(subject.trim())?;
+    Some((c[1].parse().ok()?, c[2].parse().ok()?))
+}
+
 /// Whether a subject carries a 0-indexed `[0/N]` or `[00/N]` file counter.
 pub fn has_zero_file_index(subject: &str) -> bool {
     FILE_COUNT_RE.captures(subject.trim()).and_then(|c| c[1].parse::<i64>().ok()).is_some_and(|idx| idx == 0)
