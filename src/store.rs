@@ -1246,7 +1246,7 @@ pub(crate) fn repost_excess(conn: &Connection, release_id: i64) -> Result<Excess
         let mut segs = sealed_segments(conn, file)?.unwrap_or_default();
         let mut rows =
             conn.prepare_cached("select part, bytes, domain, local from segments where file_id = ? limit ?")?;
-        let rows = rows.query_map(params![file, READ_MAX_SEGMENTS], |r| {
+        let rows = rows.query_map(params![file, READ_MAX_SEGMENTS + 1], |r| {
             Ok(crate::blob::Seg {
                 part: r.get(0)?,
                 bytes: r.get::<_, Option<i64>>(1)?.unwrap_or(0),
@@ -1262,6 +1262,11 @@ pub(crate) fn repost_excess(conn: &Connection, release_id: i64) -> Result<Excess
             held.insert(seg_key(conn, &mut suffixes, seg)?);
         }
         let rows: Vec<crate::blob::Seg> = rows.collect::<Result<_>>()?;
+        // more than a read takes: what it comes to isnt known
+        if rows.len() as i64 > READ_MAX_SEGMENTS {
+            out.truncated = true;
+            return Ok(out);
+        }
         for row in rows {
             if held.contains(&seg_key(conn, &mut suffixes, &row)?) {
                 // counted in `parts` till sealing drops it: the recount leaves it for sealing
@@ -1307,6 +1312,8 @@ pub(crate) struct Excess {
     /// of a part stands for it)
     pub kept_bytes: i64,
     pub kept: i64,
+    /// a file with more rows than one read takes (`READ_MAX_SEGMENTS`): the rest is not known
+    pub truncated: bool,
 }
 
 /// Every article of a release on this shard, by the key sealing tells one message-id with (`seg_key`): the blobs'
@@ -3092,7 +3099,14 @@ mod tests {
         let id: i64 = c.query_row("select id from releases where name = 'Rel'", [], |r| r.get(0)).unwrap();
         assert_eq!(
             repost_excess(&c, id).unwrap(),
-            Excess { bytes: 1_001 + 1_002 + 1_001 + 1_002, count: 4, unseen: 0, kept_bytes: 2_003, kept: 2 }
+            Excess {
+                bytes: 1_001 + 1_002 + 1_001 + 1_002,
+                count: 4,
+                unseen: 0,
+                kept_bytes: 2_003,
+                kept: 2,
+                truncated: false
+            }
         );
         assert_eq!(seen_parts(&c, id).unwrap(), 2);
     }

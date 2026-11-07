@@ -49,6 +49,15 @@ fn fix(conn: &Connection, id: i64, name: &str, group: &str) -> rusqlite::Result<
         .prepare_cached("select id from releases where name = ? and group_name = ? and id != ?")?
         .query_row(params![right, group, id], |r| r.get(0))
         .optional()?;
+    // a frozen release may have the right name: it would be taken from it, and it couldnt come back
+    if crate::frozen::attached(conn)? {
+        let frozen: bool = conn
+            .prepare_cached("select exists (select 1 from frozen.frozen_releases where name = ? and group_name = ?)")?
+            .query_row(params![right, group], |r| r.get(0))?;
+        if frozen && other.is_none() {
+            return Ok(Some(Fix::Leave));
+        }
+    }
     let Some(other) = other else {
         // its files take their names read right too, or the post's later articles start other files: not when that
         // would meet a file it has under the right name already
@@ -164,6 +173,10 @@ fn dry_run(main: &Path, sample: usize) -> anyhow::Result<()> {
     let (mut counts, mut shown) = (Counts::default(), Vec::new());
     for path in store::shard_paths(main) {
         let conn = walk::open_for_reading(&path)?;
+        let frozen = crate::frozen::path(&path);
+        if frozen.exists() {
+            conn.execute("attach database ?1 as frozen", [format!("file:{}?mode=ro", frozen.display())])?;
+        }
         let mut after = i64::MIN;
         loop {
             let rows = batch(&conn, after)?;
@@ -201,6 +214,7 @@ fn apply_shard(
     let mut conn = db::open_shard(path)?;
     store::migrate_shard(&conn)?;
     db::tune_for_writing(&conn)?;
+    crate::frozen::attach(&conn, path)?;
     let mut walk = walk::Walk {
         conn: &mut conn,
         path,
@@ -330,6 +344,18 @@ mod tests {
         ));
         assert_eq!(fix(&conn, plain, "Caf\u{e9} plain", "alt.binaries.t").unwrap(), None);
         assert_eq!(fix(&conn, film, "Film\u{2122}", "alt.binaries.t").unwrap(), None);
+
+        // a frozen release with the right name keeps it
+        let shard = store::shard_path(&main, store::shard_of("alt.binaries.t"));
+        crate::frozen::attach(&conn, &shard).unwrap();
+        conn.execute(
+            "insert into frozen.frozen_releases (id, name, group_name, reason, frozen_at, payload)
+             values (99, 'Caf\u{e9}', 'alt.binaries.t', 'small_complete', 0, x'00')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(fix(&conn, cafe, "Caf\u{c3}\u{a9}", "alt.binaries.t").unwrap(), Some(Fix::Leave));
+        conn.execute("delete from frozen.frozen_releases", []).unwrap();
 
         let articles = |c: &Connection| -> i64 {
             c.query_row("select value from meta where key = 'articles'", [], |r| r.get(0)).unwrap()

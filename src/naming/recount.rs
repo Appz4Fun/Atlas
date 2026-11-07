@@ -41,7 +41,7 @@ fn excess(conn: &Connection, id: i64, size: i64, parts: i64) -> rusqlite::Result
         return Ok(None);
     }
     let found = store::repost_excess(conn, id)?;
-    if found.count <= 0 || found.kept >= parts {
+    if found.truncated || found.count <= 0 || found.kept >= parts {
         return Ok(None);
     }
     Ok(Some((size.min(found.kept_bytes), found.kept)))
