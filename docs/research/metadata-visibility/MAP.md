@@ -246,7 +246,7 @@ Naming (Database, rank 200) picks a display name by evidence priority (`NameSour
 
 ## 4. Visibility matrix
 
-> **Audit, 2026-11-07, against `main` at `b11d3e7`.** The status column below is from 2026-11-02, and much of it has changed since. Every item marked N1 (render only) is now on the release page:
+> **Audit, 2026-11-07, against `main` at `b11d3e7`.** The status column below is from 2026-11-02, and much of it has changed since. Every item marked N1 (render only) whose status was not already **shown** is now on the release page. Items already marked shown that list N1 leftovers (27, 151, 183, 191, 243, 244) weren't rechecked here:
 >
 > | Items (by #) | Release page label |
 > |---|---|
@@ -254,7 +254,7 @@ Naming (Database, rank 200) picks a display name by evidence priority (`NameSour
 > | 15, 23, 77, 124, 125, 149 Message-IDs | Headers fragment: Message-ID; Ids look like, Id timestamp, Id clock; Parts fragment: first and last id with its grammar |
 > | 72 date quirks; 73 From shape; 78 encoded words | Date style, From shape, From variants; Subject decoded |
 > | 81 backbone from Path | Injected at (hops, backbone) |
-> | 87, 89, 90, 91, 93 yEnc part, begin, end, size, pcrc32 | First part CRC, Segment set, yEnc control lines |
+> | 87, 89, 90, 91, 93 yEnc part, begin, end, size, pcrc32 | yEnc control lines (part, begin and end, =yend size), First part CRC |
 > | 103 filename mismatch; 238 repack tells | Obfuscation, Tells |
 > | 113 first-article file key; 164 tail bytes | First-id key, Tail bytes |
 > | 148 segment bytes and numbers; 152 reposted parts | Parts fragment: part map, smallest and largest article, Reposted |
@@ -262,8 +262,8 @@ Naming (Database, rank 200) picks a display name by evidence priority (`NameSour
 > | 159 inner size; 194 volume scheme; 186 NFO width | Unpacks to, Volumes, NFO shape |
 > | 166 NZBLNK; 169 posting tool | NZBLNK; Posting tool, yEnc quirks |
 > | 170 PAR2 Main slice size | PAR2 (slice size and blocks) |
-> | 210, 223 RAR5 salt and password checks | Password check (shown as a verdict; the salt itself goes into `archive_release.twin_key` as a digest, by design never shown) |
-> | 130, 135, 136 posting rate, timing, arrivals | Posting rate, Late articles, Last arrival (from `file_timing`, which arrived after this map) |
+> | 210, 223 RAR5 salt and password checks | Password check (prints the RAR5 KDF, salt and check value, the zip AES salt and verifier, or the ZipCrypto check byte, in hex; the verdict is the separate Password fact) |
+> | 130, 135, 136, 153 posting rate, timing, arrivals, file tiling | Posting rate, Late articles, Last arrival, File order (from `file_timing`, which arrived after this map) |
 >
 > Items 4 and 8 are group and server facts, not release facts, and items 83 and 119 aren't display items. Everything else still open needs storage, a re-probe or new fetches (N2 to N6). Those items are tracked in [../TODO.md](../TODO.md) sections 1 to 6.
 
