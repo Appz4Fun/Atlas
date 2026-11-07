@@ -117,6 +117,7 @@ families! {
     RELEASE_SIZE "atlas_release_size_bytes" Histogram SIZES, "Size of releases as they are categorized, per root category.";
     JUNK_REMOVED "atlas_junk_releases_removed_total" Counter &[], "Releases deleted as junk (a program in them, or PC), by reason.";
     FROZEN "atlas_frozen_events_total" Counter &[], "Freezing, by event: frozen, backlog_queued, thawed, name_taken, too_big, thaw_failed, disk_short, busy (another connection held the lock: the tick tries again next time).";
+    RELEASE_IDS "atlas_release_ids_events_total" Counter &[], "The message-id index of multi-file releases, by event: indexed (a release's index made in full: its second file, or a late article after the index was pruned; rolled back saves count too), pruned_releases and pruned_rows (taken from releases gone quiet or down to one file), busy (a pruning step let go of a lock another connection held), per shard.";
 
     // predb
     PREDB_LOOKUPS "atlas_predb_lookups_total" Counter &[], "PreDB lookups, by result.";

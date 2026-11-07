@@ -461,6 +461,8 @@ struct Listed {
     rows: Vec<crate::search::ReleaseRow>,
     posts: Vec<Option<crate::release_info::SplitPost>>,
     complete: Vec<bool>,
+    /// of the complete ones, those whole only once a client repairs them from their PAR2 volumes
+    repair: Vec<bool>,
     /// rows the search gave, listed or not: none means nothing matched at all
     read: usize,
 }
@@ -471,23 +473,31 @@ impl Listed {
             .iter()
             .map(|r| conn.and_then(|conn| crate::release_info::whole_post_with(conn, r).ok().flatten()))
             .collect();
-        let complete = rows.iter().zip(&posts).map(|(r, post)| listed_complete(conn, r, post.as_ref())).collect();
-        Listed { read: rows.len(), rows, posts, complete }
+        let (complete, repair) =
+            rows.iter().zip(&posts).map(|(r, post)| listed_complete(conn, r, post.as_ref())).unzip();
+        Listed { read: rows.len(), rows, posts, complete, repair }
     }
 }
 
 /// Whether a row is whole the way the web page shows it (`web::Search::fold_split_post`): all of its post when it's
 /// part of one, else its own flag, or its files by the counter rule of now when the flag was saved by an older one.
+/// Or whole once repaired: a row missing data its PAR2 volumes can rebuild (`release_info::repair_needed`) is listed,
+/// with that said (the second answer), as a client repairs it on its own.
 fn listed_complete(
     conn: Option<&rusqlite::Connection>,
     r: &crate::search::ReleaseRow,
     post: Option<&crate::release_info::SplitPost>,
-) -> bool {
+) -> (bool, bool) {
     match post {
-        Some(post) => post.complete,
+        Some(post) => (post.complete, false),
+        None if r.complete
+            || conn.is_some_and(|conn| crate::release_info::single_post_complete(conn, r.id).unwrap_or(false)) =>
+        {
+            (true, false)
+        }
         None => {
-            r.complete
-                || conn.is_some_and(|conn| crate::release_info::single_post_complete(conn, r.id).unwrap_or(false))
+            let repair = conn.is_some_and(|conn| crate::release_info::repair_needed(conn, r.id).unwrap_or(false));
+            (repair, repair)
         }
     }
 }
@@ -521,7 +531,9 @@ fn page<E>(
         let read = rows.len() as i64;
         listed.read += rows.len();
         let batch = Listed::of(conn, rows);
-        for ((r, post), complete) in batch.rows.into_iter().zip(batch.posts).zip(batch.complete) {
+        for (((r, post), complete), repair) in
+            batch.rows.into_iter().zip(batch.posts).zip(batch.complete).zip(batch.repair)
+        {
             if listed.rows.len() as i64 >= limit {
                 break;
             }
@@ -532,6 +544,7 @@ fn page<E>(
                 listed.rows.push(r);
                 listed.posts.push(post);
                 listed.complete.push(true);
+                listed.repair.push(repair);
             }
         }
         at += read;
@@ -569,7 +582,7 @@ fn rss_listed(
     media: &HashMap<i64, crate::media::query::MediaAttrs>,
     on: &crate::media::query::IdParams,
 ) -> ApiResponse {
-    let Listed { rows: releases, posts: wholes, complete, .. } = listed;
+    let Listed { rows: releases, posts: wholes, complete, repair, .. } = listed;
     let releases = &releases[..];
     let ids: Vec<i64> = releases.iter().map(|r| r.id).collect();
     let copies = crate::duplicates::counts(&ids).unwrap_or_default();
@@ -580,15 +593,19 @@ fn rss_listed(
         .iter()
         .zip(wholes)
         .zip(complete)
+        .zip(repair)
         .zip(keep)
         .filter(|(_, keep)| *keep)
-        .map(|(((r, whole), complete), _)| {
+        .map(|((((r, whole), complete), repair), _)| {
             let nzb_url = format!("{base}/api?t=get&id={}&apikey={api_key}", r.id);
             // listed only with `incomplete=1` (`wants_incomplete`): said soo, not passed off as whole
-            let incomplete = if complete {
-                ""
-            } else {
+            // and one whole once repaired from its PAR2 volumes says that: a client that won't repair can skip it
+            let incomplete = if !complete {
                 "<newznab:attr name=\"complete\" value=\"0\"/>"
+            } else if repair {
+                "<newznab:attr name=\"repair\" value=\"1\"/>"
+            } else {
+                ""
             };
             let size = whole.map_or(r.size.unwrap_or(0), |post| post.size);
             let password = passwords
@@ -1206,7 +1223,8 @@ mod tests {
     #[test]
     fn rss_flags_an_incomplete_release() {
         let rows = rows_every(2, 2);
-        let listed = Listed { rows, posts: vec![None, None], complete: vec![false, true], read: 2 };
+        let listed =
+            Listed { rows, posts: vec![None, None], complete: vec![false, true], repair: vec![false, false], read: 2 };
         let body = rss_listed(
             "http://x",
             "k",
@@ -1221,5 +1239,32 @@ mod tests {
         assert_eq!(body.matches(r#"<newznab:attr name="complete" value="0"/>"#).count(), 1, "{body}");
         let first = body.split("<item>").nth(1).unwrap();
         assert!(first.contains("<title>r1</title>") && first.contains(r#"name="complete" value="0""#), "{first}");
+    }
+
+    /// one whole once repaired from its PAR2 volumes is listed as complete, and says it needs the repair
+    #[test]
+    fn rss_flags_a_release_that_needs_a_repair() {
+        let listed = Listed {
+            rows: rows_every(2, 2),
+            posts: vec![None, None],
+            complete: vec![true, true],
+            repair: vec![true, false],
+            read: 2,
+        };
+        let body = rss_listed(
+            "http://x",
+            "k",
+            0,
+            listed,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &Default::default(),
+        )
+        .body;
+        assert!(!body.contains(r#"name="complete""#), "{body}");
+        let items: Vec<&str> = body.split("<item>").skip(1).collect();
+        assert!(items[0].contains(r#"<newznab:attr name="repair" value="1"/>"#), "{}", items[0]);
+        assert!(!items[1].contains(r#"name="repair""#), "{}", items[1]);
     }
 }
