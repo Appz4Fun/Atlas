@@ -28,6 +28,7 @@ pub fn all() -> Vec<Arc<dyn Step>> {
         nfo,
         Arc::new(crate::probe::opensubtitles::OpenSubtitlesImdb),
         Arc::new(crate::keys::KeysStep::default()),
+        Arc::new(crate::probe::audio_print::AudioPrintStep),
     ]
 }
 

@@ -28,11 +28,14 @@ fancy-regex = "0.17"
 rusqlite = { version = "0.40", features = ["bundled", "functions", "hooks"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustyline = "18"
+# audio fingerprints (`audio`): Chromaprint in pure Rust, and the decoders for the codecs it covers
+rusty-chromaprint = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 sha1 = "0.10"
 hmac = "0.12"
 sha2 = "0.10"
+symphonia = { version = "0.6", default-features = false, features = ["aac", "flac", "mp2", "mp3", "vorbis"] }
 sysinfo = { version = "0.39", default-features = false, features = ["system", "disk"] }
 tiny_http = "0.12"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "sync"] }
