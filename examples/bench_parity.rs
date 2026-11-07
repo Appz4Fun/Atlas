@@ -1,5 +1,6 @@
-//! Atlas's own PAR2 / CRC code against par-rs (`atlas::parity`), call for call, on the same
-//! inputs. Each row checks the two agree, then prints the best of `BENCH_RUNS` timings.
+//! Atlas's own PAR2 code (`atlas::par2`) against par-rs (`atlas::parity`), call for call, on the
+//! same inputs. Each row checks the two agree, then prints the best of `BENCH_RUNS` timings.
+//! `atlas::gf2` is par-rs itself, so its CRC rows are gone; only par-rs's crc32 rate is printed.
 //!
 //!     cargo run --release --locked --example bench_parity
 //!
@@ -50,41 +51,12 @@ fn main() {
     let mib = env("BENCH_MIB", 64);
     println!("best of {runs}; last column = how many times faster par-rs is\n");
 
-    // CRC-32 of article bodies (postprocess keeps one per BODY it reads).
+    // CRC-32 of article bodies (postprocess keeps one per BODY it reads). `atlas::gf2` is par-rs
+    // now, so this row has nothing to compare against: it prints par-rs's own rate. The old
+    // bit-at-a-time loop ran at 484 MiB/s on the same machine (docs/PARITY_REQUESTS.md).
     let buf = data(mib << 20, 1);
-    assert_eq!(atlas::gf2::crc32(&buf), parity::crc32(&buf));
-    let a = best(runs, || atlas::gf2::crc32(&buf));
     let p = best(runs, || parity::crc32(&buf));
-    row(&format!("crc32 of {mib} MiB"), "MiB/s", mib as f64, a, p);
-
-    let article = data(716_800, 2);
-    let n = 200;
-    let a = best(runs, || (0..n).fold(0u32, |x, _| x ^ atlas::gf2::crc32(black_box(&article))));
-    let p = best(runs, || (0..n).fold(0u32, |x, _| x ^ parity::crc32(black_box(&article))));
-    row("crc32 of 700 KiB articles", "art/s", n as f64, a, p);
-
-    // Whole-file CRC folded from article CRCs (keys.rs, archive store).
-    let file = data(64 << 20, 3);
-    let parts: Vec<(u32, usize)> = file.chunks(716_800).map(|c| (parity::crc32(c), c.len())).collect();
-    assert_eq!(atlas::gf2::fold_yenc_parts(&parts).unwrap(), parity::file_crc(&parts).unwrap());
-    let reps = 2_000;
-    let a = best(runs, || (0..reps).fold(0u32, |x, _| x ^ atlas::gf2::fold_yenc_parts(black_box(&parts)).unwrap()));
-    let p = best(runs, || (0..reps).fold(0u32, |x, _| x ^ parity::file_crc(black_box(&parts)).unwrap()));
-    row(&format!("fold {} article CRCs into a file CRC", parts.len()), "file/s", reps as f64, a, p);
-
-    let lens: Vec<usize> = (0..100_000).map(|i| 1 + (i * 7919) % 2_000_000).collect();
-    let crcs: Vec<u32> = (0..100_000u32).map(|i| i.wrapping_mul(0x9E37_79B9)).collect();
-    let combine = |f: fn(u32, u32, usize) -> u32| lens.iter().zip(&crcs).fold(0u32, |acc, (&l, &c)| f(acc, c, l));
-    assert_eq!(combine(atlas::gf2::crc32_combine), combine(parity::crc32_combine));
-    let a = best(runs, || combine(atlas::gf2::crc32_combine));
-    let p = best(runs, || combine(parity::crc32_combine));
-    row("crc32_combine", "Mop/s", 0.1, a, p);
-
-    let unzero = |f: fn(u32, usize) -> u32| lens.iter().zip(&crcs).fold(0u32, |acc, (&l, &c)| acc ^ f(c, l));
-    assert_eq!(unzero(atlas::gf2::crc32_unzero), unzero(parity::crc32_unzero));
-    let a = best(runs, || unzero(atlas::gf2::crc32_unzero));
-    let p = best(runs, || unzero(parity::crc32_unzero));
-    row("crc32_unzero", "Mop/s", 0.1, a, p);
+    println!("{:<44} par-rs {:>10.1} MiB/s", format!("crc32 of {mib} MiB"), mib as f64 / p.as_secs_f64());
 
     // Reading a PAR2 index: a big release (200 RAR volumes) and a small one.
     let opts = |slice_size| SetOptions {
