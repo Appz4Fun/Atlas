@@ -11,6 +11,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use super::walk::{self, BATCH, WalkLimits};
 use crate::nntp::undo_mojibake;
+use crate::parser::Article;
 use crate::{db, store};
 
 const CURSOR: &str = "undo_mojibake_after";
@@ -20,8 +21,9 @@ const CURSOR: &str = "undo_mojibake_after";
 enum Fix {
     /// its articles are all in this row, under the right name: it goes
     Fold { into: i64 },
-    /// no row has the right name: it takes it
-    Rename { to: String },
+    /// no row has the right name: it takes it, and the collections its files make read right point at it, soo the
+    /// post's later articles (read right) join it
+    Rename { to: String, collections: Vec<String> },
     /// another row has the right name, and this one holds articles it doesnt
     Leave,
 }
@@ -45,10 +47,40 @@ fn fix(conn: &Connection, id: i64, name: &str, group: &str) -> rusqlite::Result<
         .prepare_cached("select id from releases where name = ? and group_name = ? and id != ?")?
         .query_row(params![right, group, id], |r| r.get(0))
         .optional()?;
-    let Some(other) = other else { return Ok(Some(Fix::Rename { to: right })) };
+    let Some(other) = other else {
+        return Ok(Some(Fix::Rename { to: right, collections: right_collections(conn, id, group)? }));
+    };
     let mine = store::release_article_keys(conn, id)?;
     let theirs = store::release_article_keys(conn, other)?;
     Ok(Some(if mine.is_subset(&theirs) { Fix::Fold { into: other } } else { Fix::Leave }))
+}
+
+/// The collections row `id`'s files make of their subjects with the server's encoding undone (`Collections::of`, the
+/// row's poster and day standing in for each article's).
+fn right_collections(conn: &Connection, id: i64, group: &str) -> rusqlite::Result<Vec<String>> {
+    let (poster, date): (Option<String>, Option<String>) = conn
+        .prepare_cached("select poster, posted_date from releases where id = ?")?
+        .query_row([id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    let author = undo_mojibake(poster.unwrap_or_default());
+    let date = date.unwrap_or_default();
+    let articles: Vec<Article> = conn
+        .prepare_cached("select distinct subject from files where release_id = ? and subject is not null")?
+        .query_map([id], |r| r.get::<_, String>(0))?
+        .map(|subject| {
+            Ok(Article {
+                message_id: "<recollect@atlas>".into(),
+                subject: undo_mojibake(subject?),
+                author: author.clone(),
+                date: date.clone(),
+                ..Default::default()
+            })
+        })
+        .collect::<rusqlite::Result<_>>()?;
+    let mut out: Vec<String> =
+        crate::collections::group_articles(group, articles).into_values().filter_map(|r| r.collection).collect();
+    out.sort();
+    out.dedup();
+    Ok(out)
 }
 
 fn apply(tx: &Connection, id: i64, fix: &Fix) -> rusqlite::Result<()> {
@@ -61,8 +93,13 @@ fn apply(tx: &Connection, id: i64, fix: &Fix) -> rusqlite::Result<()> {
             less.execute(params![deleted.articles, "articles"])?;
             less.execute(params![1, "releases"])?;
         }
-        Fix::Rename { to } => {
+        Fix::Rename { to, collections } => {
             tx.prepare_cached("update releases set name = ? where id = ?")?.execute(params![to, id])?;
+            let key = store::IdKey::of(tx)?;
+            let mut put = tx.prepare_cached("insert or ignore into collections (key, release_id) values (?, ?)")?;
+            for c in collections {
+                put.execute(params![key.hash(c), id])?;
+            }
         }
         Fix::Leave => {}
     }
@@ -198,7 +235,7 @@ pub fn run(args: &[String]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parser::{Article, Release};
+    use crate::parser::Release;
 
     fn art(id: &str, file: &str, part: i64) -> Article {
         Article {
@@ -250,10 +287,10 @@ mod tests {
             Some(Fix::Fold { into: film })
         );
         assert_eq!(fix(&conn, show_twice, "Show\u{e2}\u{201e}\u{a2}", "alt.binaries.t").unwrap(), Some(Fix::Leave));
-        assert_eq!(
+        assert!(matches!(
             fix(&conn, cafe, "Caf\u{c3}\u{a9}", "alt.binaries.t").unwrap(),
-            Some(Fix::Rename { to: "Caf\u{e9}".into() })
-        );
+            Some(Fix::Rename { to, .. }) if to == "Caf\u{e9}"
+        ));
         assert_eq!(fix(&conn, plain, "Caf\u{e9} plain", "alt.binaries.t").unwrap(), None);
         assert_eq!(fix(&conn, film, "Film\u{2122}", "alt.binaries.t").unwrap(), None);
 
@@ -263,12 +300,50 @@ mod tests {
         let before = articles(&conn);
         let tx = conn.transaction().unwrap();
         apply(&tx, film_twice, &Fix::Fold { into: film }).unwrap();
-        apply(&tx, cafe, &Fix::Rename { to: "Caf\u{e9}".into() }).unwrap();
+        apply(&tx, cafe, &Fix::Rename { to: "Caf\u{e9}".into(), collections: Vec::new() }).unwrap();
         tx.commit().unwrap();
         let gone: i64 =
             conn.query_row("select count(*) from releases where id = ?", [film_twice], |r| r.get(0)).unwrap();
         assert_eq!(gone, 0);
         assert_eq!(articles(&conn), before - 2, "its two articles came off the shard's count");
         assert_eq!(id(&conn, "Caf\u{e9}"), cafe);
+    }
+
+    /// A renamed row of a post still coming in: the post's later articles, read right, find it by their collection.
+    #[test]
+    fn a_renamed_row_takes_the_rest_of_its_post() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        db::create_db_at(&main).unwrap();
+        let group = "alt.binaries.t";
+        let article = |id: &str, n: i64, name: &str| Article {
+            message_id: id.into(),
+            subject: format!("[{n}/2] \"{name} Long Film Title 2020 1080p.part{n}.rar\" yEnc (1/1)"),
+            author: "poster@example.com".into(),
+            date: "2026-10-26 04:18:58".into(),
+            bytes: 100,
+            ..Default::default()
+        };
+        let releases = |articles| crate::collections::group_articles(group, articles).into_values().collect::<Vec<_>>();
+        // the first file as the server encoded it twice, before overviews were read right
+        let twice = releases(vec![article("<1@x>", 1, "Caf\u{c3}\u{a9}")]);
+        assert!(twice[0].collection.is_some());
+        store::save(&main, &twice).unwrap();
+        let conn = db::open_at(&store::shard_path(&main, store::shard_of(group))).unwrap();
+        let (id, name): (i64, String) =
+            conn.query_row("select id, name from releases", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        let f = fix(&conn, id, &name, group).unwrap().unwrap();
+        assert!(matches!(&f, Fix::Rename { collections, .. } if collections.len() == 1), "{f:?}");
+        apply(&conn, id, &f).unwrap();
+        // the second file, read right
+        store::save(&main, &releases(vec![article("<2@x>", 2, "Caf\u{e9}")])).unwrap();
+        let rows: Vec<(i64, i64)> = conn
+            .prepare("select id, (select count(*) from files where release_id = releases.id) from releases")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(rows, vec![(id, 2)], "one release, both files");
     }
 }

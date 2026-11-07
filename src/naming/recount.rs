@@ -13,30 +13,28 @@ use crate::{db, store};
 
 const CURSOR: &str = "recount_reposts_after";
 
-/// A batch of `(id, parts)` past `after`: every row comes back, soo the walk goes on past rows with nothing to do.
-fn batch(conn: &Connection, after: i64) -> rusqlite::Result<Vec<(i64, i64)>> {
-    conn.prepare_cached("select id, parts from releases where id > ? order by id limit ?")?
-        .query_map(params![after, BATCH], |r| Ok((r.get(0)?, r.get::<_, Option<i64>>(1)?.unwrap_or(0))))?
+/// A batch of `(id, (size, parts))` past `after`: every row comes back, soo the walk goes on past rows with nothing
+/// to do.
+fn batch(conn: &Connection, after: i64) -> rusqlite::Result<Vec<(i64, (i64, i64))>> {
+    conn.prepare_cached("select id, size, parts from releases where id > ? order by id limit ?")?
+        .query_map(params![after, BATCH], |r| {
+            Ok((r.get(0)?, (r.get::<_, Option<i64>>(1)?.unwrap_or(0), r.get::<_, Option<i64>>(2)?.unwrap_or(0))))
+        })?
         .collect()
 }
 
-/// What a row's reposts added, when it has any: `(bytes, articles)`. Never more than `parts` is past the parts its
-/// files have seen and its articles without a part number: a repost saved after this build came in wasnt counted,
-/// and isnt taken out again (the bytes in proportion, the reposts of one row being copies of the same articles).
-fn excess(conn: &Connection, id: i64, parts: i64) -> rusqlite::Result<Option<(i64, i64)>> {
-    let seen = store::seen_parts(conn, id)?;
-    if parts <= seen {
+/// A row's `size` and `parts` counting each part once, when its reposts were counted: `(size, parts)`. Worked out
+/// from what it holds, not by taking the reposts off, as a repost saved after this build came in wasnt counted and
+/// copies of different parts differ in size. Never more than the row has now.
+fn excess(conn: &Connection, id: i64, size: i64, parts: i64) -> rusqlite::Result<Option<(i64, i64)>> {
+    if parts <= store::seen_parts(conn, id)? {
         return Ok(None);
     }
     let found = store::repost_excess(conn, id)?;
-    let over = parts - seen - found.unseen;
-    if found.count <= 0 || over <= 0 {
+    if found.count <= 0 || found.kept >= parts {
         return Ok(None);
     }
-    let take = found.count.min(over);
-    let bytes =
-        i64::try_from(i128::from(found.bytes) * i128::from(take) / i128::from(found.count)).unwrap_or(found.bytes);
-    Ok(Some((bytes, take)))
+    Ok(Some((size.min(found.kept_bytes), found.kept)))
 }
 
 fn dry_run(main: &Path, sample: usize) -> anyhow::Result<()> {
@@ -48,8 +46,9 @@ fn dry_run(main: &Path, sample: usize) -> anyhow::Result<()> {
             let ids = batch(&conn, after)?;
             let Some((last, _)) = ids.last() else { break };
             after = *last;
-            for (id, parts) in ids {
-                if let Some((b, n)) = excess(&conn, id, parts)? {
+            for (id, (size, parts)) in ids {
+                if let Some((new_size, new_parts)) = excess(&conn, id, size, parts)? {
+                    let (b, n) = (size - new_size, parts - new_parts);
                     rows += 1;
                     bytes += b;
                     articles += n;
@@ -90,16 +89,16 @@ fn apply_shard(
         label: "recount",
         shard_commits: 0,
     };
-    let write = |tx: &Connection, ids: &[(i64, i64)]| -> rusqlite::Result<()> {
+    let write = |tx: &Connection, ids: &[(i64, (i64, i64))]| -> rusqlite::Result<()> {
         // the reposted articles stay, and so does the shard's count of articles: only the release's size and parts
-        let mut update = tx.prepare_cached("update releases set size = size - ?, parts = parts - ? where id = ?")?;
+        let mut update = tx.prepare_cached("update releases set size = ?, parts = ? where id = ?")?;
         // postprocessing's growth mark comes down with it, or the next real part would read as no growth
         let mut mark =
             tx.prepare_cached("update pp_state set parts_seen = max(parts_seen - ?, 0) where release_id = ?")?;
-        for (id, parts) in ids {
-            if let Some((bytes, count)) = excess(tx, *id, *parts)? {
-                update.execute(params![bytes, count, id])?;
-                mark.execute(params![count, id])?;
+        for (id, (size, parts)) in ids {
+            if let Some((new_size, new_parts)) = excess(tx, *id, *size, *parts)? {
+                update.execute(params![new_size, new_parts, id])?;
+                mark.execute(params![parts - new_parts, id])?;
                 fixed.fetch_add(1, Relaxed);
             }
         }
@@ -158,36 +157,38 @@ mod tests {
     use super::*;
     use crate::parser::{Article, Release};
 
-    /// Of a row's reposts, only as many as its `parts` is past what its files have seen come out: one an older save
-    /// counted, not the one a save of this build left uncounted.
+    /// A row comes to one article a part, whichever of its reposts an older save counted and a save of this build
+    /// didnt, and whatever size its parts are.
     #[test]
-    fn only_the_reposts_a_save_counted_come_out() {
+    fn a_row_comes_to_one_article_a_part() {
         let dir = tempfile::tempdir().unwrap();
         let main = dir.path().join("atlas.db");
         db::create_db_at(&main).unwrap();
-        let art = |copy: u8| Article {
-            message_id: format!("<p1c{copy}@x>"),
-            subject: "\"a.rar\" yEnc (1/1)".into(),
+        let art = |part: i64, copy: u8| Article {
+            message_id: format!("<p{part}c{copy}@x>"),
+            subject: format!("\"a.rar\" yEnc ({part}/2)"),
             filename: Some("a.rar".into()),
-            part: Some(1),
-            total_parts: Some(1),
-            bytes: 1_000,
+            part: Some(part),
+            total_parts: Some(2),
+            bytes: if part == 1 { 100 } else { 10 },
             ..Default::default()
         };
         let rel = Release {
             name: "Rel".into(),
             group: "alt.binaries.t".into(),
-            articles: vec![art(0), art(1), art(2)],
+            articles: vec![art(1, 0), art(2, 0), art(1, 1), art(2, 1)],
             ..Default::default()
         };
         store::save(&main, &[rel]).unwrap();
         let conn = db::open_at(&store::shard_path(&main, store::shard_of("alt.binaries.t"))).unwrap();
-        let (id, parts): (i64, i64) = conn
-            .query_row("select id, parts from releases where name = 'Rel'", [], |r| Ok((r.get(0)?, r.get(1)?)))
+        let (id, size, parts): (i64, i64, i64) = conn
+            .query_row("select id, size, parts from releases where name = 'Rel'", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
             .unwrap();
-        assert_eq!(parts, 1);
-        assert_eq!(excess(&conn, id, parts).unwrap(), None, "a row saved by this build has nothing to take out");
-        // as an older save left it: one of the two reposts counted
-        assert_eq!(excess(&conn, id, parts + 1).unwrap(), Some((1_000, 1)));
+        assert_eq!((size, parts), (110, 2));
+        assert_eq!(excess(&conn, id, size, parts).unwrap(), None, "a row saved by this build has nothing to take out");
+        // as an older save left it: the repost of the 100-byte part counted, the 10-byte one's not
+        assert_eq!(excess(&conn, id, 210, 3).unwrap(), Some((110, 2)));
     }
 }
