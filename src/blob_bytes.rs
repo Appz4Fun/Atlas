@@ -276,6 +276,67 @@ fn count_batch_with(
     }
 }
 
+/// The uncounted blobs of one release's files counted, on its shard's connection, fetching from the sealed log one at
+/// a time. What it counted, and the blobs it couldn't (a fetch or decode that failed: they stay uncounted).
+pub fn count_release(conn: &Connection, release_id: i64, stop: &AtomicBool) -> Result<(usize, usize)> {
+    count_release_with(conn, release_id, stop, &fetch)
+}
+
+fn count_release_with(
+    conn: &Connection,
+    release_id: i64,
+    stop: &AtomicBool,
+    fetch: &dyn Fn(&[u8]) -> std::io::Result<Vec<u8>>,
+) -> Result<(usize, usize)> {
+    let blobs: Vec<(i64, Vec<u8>)> = conn
+        .prepare_cached("select id, blob from files where release_id = ?1 and blob is not null and blob_bytes is null")?
+        .query_map([release_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<Result<_>>()?;
+    let (mut counted, mut failed) = (Vec::new(), 0usize);
+    for (id, blob) in &blobs {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        let raw = if crate::blob::is_remote(blob) { fetch(blob).ok() } else { Some(blob.clone()) };
+        match raw.as_deref().map(of_blob) {
+            Some(Ok(bytes)) => counted.push((*id, blob, bytes)),
+            _ => failed += 1,
+        }
+    }
+    if counted.is_empty() {
+        return Ok((0, failed));
+    }
+    let mut tries = 0;
+    loop {
+        match conn.execute_batch("begin immediate") {
+            Ok(()) => break,
+            Err(rusqlite::Error::SqliteFailure(e, _))
+                if e.code == rusqlite::ErrorCode::DatabaseBusy && tries + 1 < WRITE_TRIES =>
+            {
+                tries += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    let written = (|| {
+        // only a blob that's still the one counted gets the count
+        let mut set =
+            conn.prepare_cached("update files set blob_bytes = ? where id = ? and blob = ? and blob_bytes is null")?;
+        let mut n = 0;
+        for (id, blob, bytes) in &counted {
+            n += set.execute(params![bytes, id, blob])?;
+        }
+        Ok(n)
+    })();
+    match written {
+        Ok(n) => conn.execute_batch("commit").map(|()| (n, failed)),
+        Err(e) => {
+            let _ = conn.execute_batch("rollback");
+            Err(e)
+        }
+    }
+}
+
 /// Every shard's uncounted blobs counted, a batch at a time, turn about, until `stop`; again every `PASS_EVERY`. A
 /// shard whose batch couldn't reach the sealed log waits `FETCH_REST`; the others go on.
 fn run(main: &Path, skip_over: usize, stop: &AtomicBool) {
@@ -382,6 +443,50 @@ mod tests {
         store::create_shard(&path).unwrap();
         let conn = crate::db::open_at(&path).unwrap();
         (dir, conn)
+    }
+
+    #[test]
+    fn a_releases_uncounted_blobs_are_counted_fetching_what_is_in_the_sealed_log() {
+        let (_dir, conn) = shard();
+        let place = |n: u8| {
+            let mut place = sealed_log::REF_TAG.to_vec();
+            place.resize(sealed_log::REF_BYTES, n);
+            place
+        };
+        let local = crate::blob::encode(&segs(&[10, 20]));
+        conn.execute("insert into files (id, release_id, filename, seen, blob) values (1, 9, 'a', x'06', ?)", [&local])
+            .unwrap();
+        conn.execute(
+            "insert into files (id, release_id, filename, seen, blob) values (2, 9, 'b', x'02', ?)",
+            [place(7)],
+        )
+        .unwrap();
+        conn.execute(
+            "insert into files (id, release_id, filename, seen, blob) values (3, 9, 'c', x'02', ?)",
+            [place(8)],
+        )
+        .unwrap();
+        conn.execute("insert into files (id, release_id, filename, seen, blob) values (4, 5, 'd', x'02', ?)", [&local])
+            .unwrap();
+        // the log gives back the first place and not the second
+        let fetch = |p: &[u8]| {
+            if p.ends_with(&[7]) {
+                Ok(crate::blob::encode(&segs(&[40])))
+            } else {
+                Err(std::io::Error::new(std::io::ErrorKind::NotFound, "gone"))
+            }
+        };
+        let stop = AtomicBool::new(false);
+        assert_eq!(count_release_with(&conn, 9, &stop, &fetch).unwrap(), (2, 1));
+        let counts: Vec<Option<i64>> = conn
+            .prepare("select blob_bytes from files order by id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_>>()
+            .unwrap();
+        assert_eq!(counts, [Some(30), Some(40), None, None], "another release's file left alone");
+        assert_eq!(count_release_with(&conn, 9, &stop, &fetch).unwrap(), (0, 1), "a run again counts nothing twice");
     }
 
     #[test]
