@@ -3125,7 +3125,7 @@ pub fn run_replay_predb(args: &[String]) -> i32 {
 /// and compaction/conversion scratch files while keeping `atlas.raw.db`, `atlas.predb.db`,
 /// `atlas.media.db`, `atlas.details.db`, `posters/`, `covers/`, and `stills/`.
 pub fn reset_shards_at(main: &Path, log: &dyn Fn(&str)) -> anyhow::Result<()> {
-    let _exclusive = crate::compact::Lock::take(main)?;
+    let _exclusive = crate::compact::Lock::take_unchecked(main)?;
     if (!main.try_exists()? || crate::convert::is_empty_interloper(main))
         && let Some(msg) = crate::convert::recover_cut_swap(main)?
     {

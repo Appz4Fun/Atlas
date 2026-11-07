@@ -230,6 +230,10 @@ pub fn run_move() -> i32 {
         println!("stop the indexer first: it competes for the same locks, and it moves these anyway");
         return 1;
     }
+    if let Err(e) = crate::merge_shards::refuse_if_merging(&crate::paths::database()) {
+        println!("{e:#}");
+        return 1;
+    }
     configure(&config.addr);
     let main = crate::paths::database();
     let started = Instant::now();

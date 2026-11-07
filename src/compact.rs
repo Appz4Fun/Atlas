@@ -174,7 +174,15 @@ impl Drop for WriteGuard {
 pub(crate) struct Lock(std::fs::File);
 
 impl Lock {
+    /// The lock, refused while a shard merge is half done (`merge_shards::MERGING`): what takes it writes to shards.
     pub(crate) fn take(main: &Path) -> Result<Lock> {
+        crate::merge_shards::refuse_if_merging(main)?;
+        Lock::take_unchecked(main)
+    }
+
+    /// The lock whatever a merge left: for the merge itself, and for what removes the shards whole (wipe, reset) or
+    /// sets a database up (conversion), which goes through `db::create_db_at`'s own check after.
+    pub(crate) fn take_unchecked(main: &Path) -> Result<Lock> {
         let file = open_lock(main)?;
         match file.try_lock() {
             Ok(()) => Ok(Lock(file)),

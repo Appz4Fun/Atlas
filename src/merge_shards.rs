@@ -244,13 +244,23 @@ fn merge_one(
         let known: Option<i64> =
             conn.query_row("select done from merge_shards where shard = ?1", [shard], |r| r.get(0)).optional()?;
         if known.is_none() {
-            // past the target's files and every other source's moved range, copied yet or not
-            let file_offset: i64 = conn.query_row(
+            // past the target's files (and rows a purge left of files gone), and every other source's moved range,
+            // copied yet or not
+            let mut file_offset: i64 = conn.query_row(
                 "select max(coalesce((select max(id) from main.files), 0),
                             coalesce((select max(file_offset + coalesce(max_file, 0)) from merge_shards), 0))",
                 [],
                 |r| r.get(0),
             )?;
+            for t in FILE_KEYED.into_iter().filter(|t| *t != "release_ids") {
+                let there: bool =
+                    conn.prepare("select 1 from main.sqlite_master where type = 'table' and name = ?1")?.exists([t])?;
+                if there {
+                    let m: i64 =
+                        conn.query_row(&format!("select coalesce(max(file_id), 0) from main.{t}"), [], |r| r.get(0))?;
+                    file_offset = file_offset.max(m);
+                }
+            }
             let meta = |key: &str| -> Result<Option<i64>> {
                 Ok(conn.query_row("select value from src.meta where key = ?1", [key], |r| r.get(0)).optional()?)
             };
@@ -791,7 +801,7 @@ pub fn run(args: &[String]) -> i32 {
         println!("not enough free space: free some first");
         return 1;
     }
-    let _lock = match crate::compact::Lock::take(&main) {
+    let _lock = match crate::compact::Lock::take_unchecked(&main) {
         Ok(lock) => lock,
         Err(e) => {
             println!("couldnt take the database lock: {e:#}");
@@ -803,9 +813,13 @@ pub fn run(args: &[String]) -> i32 {
         return 1;
     }
     // no indexer starts until `finish`, even when this run stops half way
-    if let Err(e) = crate::db::open_at(&main)
-        .and_then(|c| Ok(c.execute("insert or replace into meta (key, value) values (?1, 1)", [MERGING])?))
-    {
+    if let Err(e) = crate::db::open_at(&main).and_then(|c| {
+        // on disk before any shard is deleted
+        c.execute_batch("pragma synchronous = full;")?;
+        c.execute("insert or replace into meta (key, value) values (?1, 1)", [MERGING])?;
+        c.query_row("pragma wal_checkpoint(truncate)", [], |_| Ok(()))?;
+        Ok(())
+    }) {
         println!("couldnt mark the merge as started: {e:#}");
         return 1;
     }
@@ -1015,6 +1029,7 @@ mod tests {
         let e = crate::db::create_db_at(&main).unwrap_err();
         assert!(format!("{e:#}").contains("merge"), "{e:#}");
         assert!(crate::compact::try_hold_off_compaction(&main).is_err(), "nor any other writer");
+        assert!(crate::compact::Lock::take(&main).is_err(), "nor purge, the walks or a compaction");
         // the run stopped before finishing: finishing again is safe
         finish(&main, &target).unwrap();
         let next = |m: &Connection| store::get_meta(m, "next_seq").unwrap().unwrap();

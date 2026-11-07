@@ -136,7 +136,7 @@ fn mark_copied(conn: &Connection) -> Result<()> {
 /// holds it (two at once would write the same shards and `atlas.new.db`).
 /// None when there was nothing to convert.
 pub fn run_alone(main: &Path, progress: &dyn Fn(&str)) -> Result<Option<(i64, i64)>> {
-    let _alone = crate::compact::Lock::take(main).map_err(|e| match e.downcast_ref::<crate::compact::Busy>() {
+    let _alone = crate::compact::Lock::take_unchecked(main).map_err(|e| match e.downcast_ref::<crate::compact::Busy>() {
         Some(_) => anyhow!("the database is in use (indexing, a compaction or another conversion); try again later"),
         None => e,
     })?;
