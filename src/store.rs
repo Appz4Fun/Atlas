@@ -288,6 +288,9 @@ impl Ids {
         let mut range = self.range.lock().unwrap();
         if range.0 >= range.1 {
             let conn = db::open_at(&self.main)?;
+            // on the disk before any of the block is saved to a shard (whose saves are, `db::with_full_flush`):
+            // a power cut that kept a save and lost its block would hand its ids out again
+            conn.execute_batch("pragma synchronous = full; pragma fullfsync = on")?;
             let end: i64 = conn.query_row(
                 "update meta set value = value + ? where key = 'next_seq' returning value",
                 [ID_BLOCK],

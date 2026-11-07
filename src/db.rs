@@ -193,7 +193,10 @@ fn set_up(conn: Connection) -> Result<Connection> {
 pub fn with_full_flush<T>(conn: &mut Connection, save: impl FnOnce(&mut Connection) -> T) -> Result<T> {
     conn.execute_batch("pragma fullfsync = on")?;
     let saved = save(conn);
-    conn.execute_batch("pragma fullfsync = off")?;
+    // the save is committed (or not) by now: failing here would only have it fetched and saved again
+    if let Err(e) = conn.execute_batch("pragma fullfsync = off") {
+        eprintln!("couldnt turn fullfsync off again after a save: {e}");
+    }
     Ok(saved)
 }
 
