@@ -1352,8 +1352,8 @@ impl Step for ListStep {
             }
             left -= 1;
             let body = if xref {
-                // each guess is noted as tried once fetched, soo a run cut short (deadline, stop) goes on from there;
-                // a refusal is the run's body budget spent: the rest wait for a run with a fresh one
+                // each guess is noted as tried once fetched, soo a run cut short (deadline, stop) goes on from there; a
+                // refusal is the run's body budget spent: the rest wait for a run with a fresh one
                 self.wait_for_slot(ctx, gap)?;
                 let wanted = BodyRequest {
                     message_id: seg.message_id.clone(),
@@ -1368,7 +1368,12 @@ impl Step for ListStep {
                     Got::Body(body) => Some(body),
                     Got::Missing | Got::TooBig => None,
                 };
-                if let Some(before) = xref_tried {
+                // a guess that is no archive's start is noted as tried; one that is stays first in line until its list
+                // is read, soo a run cut short reading the rest of it starts there again
+                let is_start = got.as_deref().is_some_and(|b| {
+                    matches!(identify(b), Format::Rar4 | Format::Rar5 | Format::Zip | Format::SevenZip)
+                });
+                if !is_start && let Some(before) = xref_tried {
                     crate::xref::tried_through(&rel_name, before + k as i64 + 1);
                 }
                 got
