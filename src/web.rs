@@ -767,9 +767,10 @@ impl Search {
                 sort_rows(&mut found, sort, self.descending, &categories, &scores);
             }
             // the whole window is here: filtered before it's cut into pages, soo no page comes out empty
+            // (only rows with a title of their own: one without may be a post's file, judged once folded, below)
             if self.min_score.is_some() {
-                let scores = kept_scores(&found.iter().map(|r| r.id).collect::<Vec<_>>());
-                found.retain(|r| !self.rated_out(r.id, &scores));
+                let titled = titled_scores(&found.iter().map(|r| r.id).collect::<Vec<_>>());
+                found.retain(|r| !titled.get(&r.id).is_some_and(|score| self.scored_out(*score)));
             }
             let start = usize::try_from(self.offset).unwrap_or(0).min(found.len());
             let end = (start + PAGE_SIZE as usize).min(found.len());
@@ -806,7 +807,7 @@ impl Search {
             .filter(|r| !self.hides(r))
             .collect();
         if self.min_score.is_some() {
-            let scores = kept_scores(&found.iter().map(|r| r.id).collect::<Vec<_>>());
+            let scores = post_scores(&found, &split);
             found.retain(|r| !self.rated_out(r.id, &scores));
         }
         if found.is_empty() && (self.hide_incomplete || self.min_score.is_some()) {
@@ -1294,15 +1295,7 @@ impl Window {
     /// Only the scores already kept: fetching them for a whole search would use up the providers' limits.
     /// `titled`, read once per window.
     fn titled(&self) -> &HashMap<i64, Option<i64>> {
-        self.titled.get_or_init(|| {
-            let media = crate::media::query::attrs_of(&self.ids()).unwrap_or_default();
-            let scores: HashMap<i64, i64> =
-                crate::media::details::kept_for(media.iter().map(|(id, m)| (*id, m.kind, &m.ids)))
-                    .into_iter()
-                    .filter_map(|(id, d)| Some((id, score_value(&d)?)))
-                    .collect();
-            media.keys().map(|id| (*id, scores.get(id).copied())).collect()
-        })
+        self.titled.get_or_init(|| titled_scores(&self.ids()))
     }
 
     fn scores(&self) -> &HashMap<i64, i64> {
@@ -1383,7 +1376,7 @@ impl Window {
             }
         }
         // by the row each place shows, which for a post brought in isn't the window's own row; only for a chip
-        let scores = search.min_score.map(|_| kept_scores(&kept.iter().map(|r| r.id).collect::<Vec<_>>()));
+        let scores = search.min_score.map(|_| post_scores(&kept, &split));
         for ((place, r), html) in places.into_iter().zip(&kept).zip(rows_html(&kept, split)) {
             let brings = (r.id != place).then_some(r.id);
             let score = scores.as_ref().map(|scores| scores.get(&r.id).copied());
@@ -1978,6 +1971,34 @@ fn password_tag(password: Option<&Password>) -> String {
 /// The score to sort by, out of 100, the same one a result shows.
 fn score_value(d: &crate::media::details::Details) -> Option<i64> {
     d.imdb_score.or(d.tmdb_score).or(d.trakt_score)
+}
+
+/// Of these releases, those with a title (a media row), each with the best score kept for it, if any.
+fn titled_scores(ids: &[i64]) -> HashMap<i64, Option<i64>> {
+    let media = crate::media::query::attrs_of(ids).unwrap_or_default();
+    let scores: HashMap<i64, i64> = crate::media::details::kept_for(media.iter().map(|(id, m)| (*id, m.kind, &m.ids)))
+        .into_iter()
+        .filter_map(|(id, d)| Some((id, score_value(&d)?)))
+        .collect();
+    media.keys().map(|id| (*id, scores.get(id).copied())).collect()
+}
+
+/// `kept_scores` for rows as they show: a post spread over rows whose own row has no title takes one of its other
+/// rows', as `rows_html` takes their title to show.
+fn post_scores(rows: &[ReleaseRow], split: &HashMap<i64, release_info::SplitPost>) -> HashMap<i64, i64> {
+    let mut ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
+    for r in rows {
+        ids.extend(split.get(&r.id).map_or(&[][..], |p| &p.ids[..]));
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    let scores = kept_scores(&ids);
+    rows.iter()
+        .filter_map(|r| {
+            let own = std::iter::once(r.id).chain(split.get(&r.id).map_or(&[][..], |p| &p.ids[..]).iter().copied());
+            own.filter_map(|id| scores.get(&id).copied()).next().map(|s| (r.id, s))
+        })
+        .collect()
 }
 
 /// The best kept score of each of these releases that has one, with nothing fetched: fetching for a whole search
