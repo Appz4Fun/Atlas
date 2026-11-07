@@ -629,8 +629,38 @@ struct Named {
     poster: Option<String>,
 }
 
+/// `julianday` of a posted date, as SQLite reads it: rows from the catalog get the same dates the shards' SQL gives.
+fn julian(conn: &Connection, posted: Option<&str>) -> Result<Option<f64>> {
+    let Some(posted) = posted else { return Ok(None) };
+    conn.prepare_cached("select julianday(?1)")?.query_row([posted], |r| r.get(0))
+}
+
+/// The catalog's rows of a name as the shards' lookup gives them: blocked groups out, then each shard's first 64 by
+/// group name (the order of its (name, group) index).
+fn named_from_catalog(conn: &Connection, rows: Vec<crate::shared_catalog::reader::NamedRow>) -> Result<Vec<Named>> {
+    let mut rows: Vec<_> = rows.into_iter().filter(|r| !crate::filters::group_blocked(&r.group)).collect();
+    rows.sort_by(|a, b| (a.shard, a.group.as_bytes()).cmp(&(b.shard, b.group.as_bytes())));
+    let mut out = Vec::new();
+    let mut taken: HashMap<i16, usize> = HashMap::new();
+    for r in rows {
+        let n = taken.entry(r.shard).or_insert(0);
+        if *n >= 64 {
+            continue;
+        }
+        *n += 1;
+        let date = julian(conn, r.posted.as_deref())?;
+        out.push(Named { id: r.id, group: r.group, bytes: r.bytes, date, poster: r.poster });
+    }
+    Ok(out)
+}
+
 fn exact_split_post(conn: &Connection, posted: &str, release: &crate::search::ReleaseRow) -> Result<Option<SplitPost>> {
     let named_rows = |sql: fn(usize) -> String, poster: Option<&Option<String>>| -> Result<Vec<Named>> {
+        if let Some(rows) = crate::shared_catalog::reader::named(posted, poster.cloned()) {
+            crate::metrics::names::SHARED_CATALOG_READS.inc(&[("lookup", "split_post"), ("source", "catalog")], 1);
+            return named_from_catalog(conn, rows);
+        }
+        crate::metrics::names::SHARED_CATALOG_READS.inc(&[("lookup", "split_post"), ("source", "shards")], 1);
         let mut out = Vec::new();
         for s in 0..store::SHARDS {
             let mut stmt = conn.prepare_cached(&sql(s))?;
@@ -810,6 +840,28 @@ fn split_stem_post(conn: &Connection, posted: &str, release: &crate::search::Rel
     let dot_lo = format!("{stem}.");
     let dot_hi = format!("{stem}/");
     let mut all = Vec::new();
+    if let Some(rows) = crate::shared_catalog::reader::stem_rows(&stem) {
+        crate::metrics::names::SHARED_CATALOG_READS.inc(&[("lookup", "split_stem"), ("source", "catalog")], 1);
+        // as the shards' lookup: blocked groups out, and a stem one shard holds more than LINKED_ROWS rows of is no
+        // post
+        let mut per_shard: HashMap<i16, usize> = HashMap::new();
+        for r in rows.into_iter().filter(|r| !crate::filters::group_blocked(&r.group)) {
+            let n = per_shard.entry(r.shard).or_insert(0);
+            *n += 1;
+            if *n > LINKED_ROWS {
+                return Ok(None);
+            }
+            if post_stem(&r.name).eq_ignore_ascii_case(&stem) {
+                let date = julian(conn, r.posted.as_deref())?;
+                all.push(StemCandidate { id: r.id, group: r.group, bytes: r.bytes, date });
+                if all.len() > LINKED_ROWS {
+                    return Ok(None);
+                }
+            }
+        }
+        return stem_post_of(conn, all, release, &stem);
+    }
+    crate::metrics::names::SHARED_CATALOG_READS.inc(&[("lookup", "split_stem"), ("source", "shards")], 1);
     for s in 0..store::SHARDS {
         let mut stmt = conn.prepare_cached(&split_stem_sql(s))?;
         let rows = stmt.query_map(rusqlite::params![stem, dot_lo, dot_hi], |r| {
@@ -836,6 +888,16 @@ fn split_stem_post(conn: &Connection, posted: &str, release: &crate::search::Rel
             }
         }
     }
+    stem_post_of(conn, all, release, &stem)
+}
+
+/// The post a stem's candidates make with this release, if any.
+fn stem_post_of(
+    conn: &Connection,
+    all: Vec<StemCandidate>,
+    release: &crate::search::ReleaseRow,
+    stem: &str,
+) -> Result<Option<SplitPost>> {
     if all.len() < 2 {
         return Ok(None);
     }
@@ -847,7 +909,7 @@ fn split_stem_post(conn: &Connection, posted: &str, release: &crate::search::Rel
     let Some(linked) = linked_stem_candidates(conn, release.id, &close)? else {
         return Ok(None);
     };
-    try_stem_subset(conn, &stem, &linked)
+    try_stem_subset(conn, stem, &linked)
 }
 
 fn candidate_lead(conn: &Connection, id: i64) -> Result<Option<i64>> {
@@ -1544,6 +1606,34 @@ pub fn harvested_password(text: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn catalog_rows_of_a_name_come_out_as_the_shards_give_them() {
+        use crate::shared_catalog::reader::NamedRow;
+        let conn = Connection::open_in_memory().unwrap();
+        let row = |id: i64, shard: i16, group: String| NamedRow {
+            id,
+            shard,
+            name: "Post".into(),
+            group,
+            bytes: 10,
+            posted: Some("2026-11-07 12:00:00".into()),
+            poster: Some("p@x".into()),
+        };
+        // shard 1 has 70 rows (in no order), shard 2 one, and one group the shards' sql would leave out
+        let mut rows: Vec<NamedRow> = (0..70).rev().map(|i| row(100 + i, 1, format!("a.b.g{i:03}"))).collect();
+        rows.push(row(500, 2, "a.b.other".into()));
+        rows.push(row(600, 2, "x".repeat(1_000)));
+        let named = named_from_catalog(&conn, rows).unwrap();
+        let shard1: Vec<&str> = named.iter().filter(|n| n.id < 500).map(|n| n.group.as_str()).collect();
+        assert_eq!(shard1.len(), 64, "the first 64 of the shard");
+        assert_eq!((shard1[0], shard1[63]), ("a.b.g000", "a.b.g063"), "by group name, as the (name, group) index");
+        assert!(named.iter().any(|n| n.id == 500));
+        assert!(!named.iter().any(|n| n.id == 600), "a blocked group is left out");
+        let date = named[0].date.unwrap();
+        assert!((date - 2_461_352.0).abs() < 1.0, "julianday as SQLite reads it: {date}");
+        assert_eq!(julian(&conn, None).unwrap(), None);
+    }
 
     #[test]
     fn a_password_in_a_name_inside_is_a_hint() {
