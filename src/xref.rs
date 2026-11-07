@@ -583,7 +583,27 @@ impl Store {
             }
         }
 
-        let saved = self.saved(now)?;
+        // the groups and posting times late articles came with widen their upload, before this pass's new files are
+        // matched to it
+        let mut saved = self.saved(now)?;
+        let mut grown: BTreeSet<usize> = BTreeSet::new();
+        for (poster, place, _) in &finished {
+            let Some(place) = place else { continue };
+            let Some(j) = saved.iter().position(|u| u.release == place.release) else { continue };
+            let mut stmt = self
+                .conn
+                .prepare_cached("select grp, min(posted), max(posted) from headers where poster = ?1 group by grp")?;
+            for row in
+                stmt.query_map([poster], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)))?
+            {
+                let (g, first, last) = row?;
+                let seed = &mut saved[j].seed;
+                seed.groups.insert(g);
+                seed.first = seed.first.min(first);
+                seed.last = seed.last.max(last);
+            }
+            grown.insert(j);
+        }
         let seeds: Vec<Seed> = saved.iter().map(|u| u.seed.clone()).collect();
         let mut widened: Vec<(String, String, Seed, i64)> = Vec::new();
         for (seed, files) in chain(&fresh, &seeds) {
@@ -644,30 +664,11 @@ impl Store {
             }
             widened.push((release, group, span, count));
         }
-        // the groups late articles were read in widen their upload too
-        for (poster, place, _) in &finished {
-            let Some(place) = place else { continue };
-            if let Some(u) = saved.iter().find(|u| u.release == place.release) {
-                let mut seed = u.seed.clone();
-                let mut stmt = self.conn.prepare_cached(
-                    "select grp, min(posted), max(posted) from headers where poster = ?1 group by grp",
-                )?;
-                for row in
-                    stmt.query_map([poster], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)))?
-                {
-                    let (g, first, last) = row?;
-                    seed.groups.insert(g);
-                    seed.first = seed.first.min(first);
-                    seed.last = seed.last.max(last);
-                }
-                match widened.iter_mut().find(|(r, _, _, _)| *r == u.release) {
-                    Some((_, _, s, _)) => {
-                        s.groups.extend(seed.groups);
-                        s.first = s.first.min(seed.first);
-                        s.last = s.last.max(seed.last);
-                    }
-                    None => widened.push((u.release.clone(), u.group.clone(), seed, u.files)),
-                }
+        // uploads late articles grew and no file of this pass joined
+        for j in grown {
+            let u = &saved[j];
+            if !widened.iter().any(|(r, _, _, _)| *r == u.release) {
+                widened.push((u.release.clone(), u.group.clone(), u.seed.clone(), u.files));
             }
         }
 
@@ -1178,5 +1179,27 @@ mod tests {
         assert_eq!(store.record("a.b.one", &[again], t).unwrap(), 1);
         assert!(store.pass(t + 1 + SETTLE_SECS).unwrap().is_empty());
         assert!(store.waiting().unwrap().is_empty(), "noted, not saved");
+    }
+
+    #[test]
+    fn late_parts_widen_their_upload_before_new_files_are_matched() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&dir.path().join("atlas.xref.db")).unwrap();
+        let put = |store: &mut Store, poster: &str, tag: &str, count: u64, second: u32, group: &str, added: i64| {
+            for k in 0..count {
+                let a = article(&format!("{poster}{tag}{k:08}"), poster, &format!("2023-12-03 16:23:{second:02}"), k);
+                store.record(group, &[a], added).unwrap();
+            }
+        };
+        put(&mut store, "rar1@x.y", "a", 12, 1, "a.b.one", 1000);
+        let first = store.pass(1001 + SETTLE_SECS).unwrap();
+        assert_eq!(first.len(), 1);
+        // a.b.two read later: rar1's parts posted up to second 10, and a small file at second 14
+        put(&mut store, "rar1@x.y", "b", 3, 10, "a.b.two", 5000);
+        put(&mut store, "vol@x.y", "b", 4, 14, "a.b.two", 5000);
+        let more = store.pass(5001 + SETTLE_SECS).unwrap();
+        assert_eq!(more.len(), 1);
+        assert_eq!(more[0].name, first[0].name);
+        assert_eq!(more[0].articles.len(), 7, "the late parts and the small file both join");
     }
 }
