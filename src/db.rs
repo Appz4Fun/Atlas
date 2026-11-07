@@ -180,7 +180,7 @@ fn set_up(conn: Connection) -> Result<Connection> {
 
 /// Tune a connection for heavy indexing writes: a big page cache, no
 /// checkpointing on commit (`checkpointer` copies the WAL into the main file on
-/// its own thread, `finish_checkpoint` lets the WAL start over), and a WAL file
+/// its own thread, the writer's `Checkpoints::for_writer` lets the WAL start over), and a WAL file
 /// cut back to 1GB whenever it starts over.
 pub fn tune_for_writing(conn: &Connection) -> Result<()> {
     conn.execute_batch(
@@ -191,12 +191,12 @@ pub fn tune_for_writing(conn: &Connection) -> Result<()> {
     )
 }
 
-/// For the writer, between transactions: copy what `checkpointer` hasnt yet
-/// into the main file. With no write in progress it can copy everything, soo
-/// the next transaction starts the WAL over instead of growing it. Mostly
-/// quick, the background checkpointer has done the bulk of it already.
-/// The writer calls it through `Checkpoints::checkpoint_if_due`, not after every save.
-pub fn finish_checkpoint(conn: &Connection) -> Result<()> {
+/// A passive checkpoint of every database of `conn`, for the tests. The writer
+/// uses `Checkpoints::checkpoint_if_due`, which checkpoints only the databases
+/// that are due: one over all of them would copy the shard's whole WAL whenever
+/// its frozen file came due.
+#[cfg(test)]
+fn finish_checkpoint(conn: &Connection) -> Result<()> {
     conn.query_row("pragma wal_checkpoint(passive)", [], |_| Ok(()))
 }
 
@@ -246,7 +246,7 @@ const CHECKPOINT_AGE: Duration = Duration::from_secs(60);
 /// When to checkpoint a connection's databases: once enough of a WAL waits, or
 /// something waited long enough, read from SQLite with `wal_frames`. One per
 /// connection that checkpoints. A shard writer's connection has the shard's
-/// frozen file attached, and a checkpoint copies both.
+/// frozen file attached, and each database is checkpointed when it is due.
 pub struct Checkpoints {
     /// what may wait before a checkpoint, in bytes of WAL
     due_bytes: i64,
@@ -259,7 +259,8 @@ pub struct Checkpoints {
 }
 
 impl Checkpoints {
-    /// For a writer, between transactions (`finish_checkpoint`).
+    /// For a writer, between transactions: with no write in progress it can copy
+    /// all that waits, soo the next transaction starts the WAL over.
     pub fn for_writer() -> Self {
         Checkpoints::new(RESTART_BYTES, true, CHECKPOINT_AGE)
     }
@@ -341,7 +342,7 @@ impl Checkpoints {
 /// Passive checkpoints never block readers or the writer, soo copying the WAL
 /// into the main file happens alongside the writes. They never let the WAL
 /// start over on their own (the writer keeps adding to it); the writer does
-/// that with `finish_checkpoint`. A blocking checkpoint stalls the writer for
+/// that between transactions (`Checkpoints::for_writer`). A blocking checkpoint stalls the writer for
 /// as long as it copies (20s for a 1.5GB WAL), soo it is only a last resort
 /// when the WAL got huge anyway. Each database is copied once `COPY_BYTES` of
 /// its WAL wait or after `CHECKPOINT_AGE` (`Checkpoints::for_copying`), not on
