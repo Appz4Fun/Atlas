@@ -1096,7 +1096,10 @@ impl Search {
             && self.min_score.is_none()
             && let Ok(window) = window_of(self, 0)
         {
-            window.total.get_or_init(|| self.total(true)).clone()
+            match lock(&window.counted).get(&None).copied() {
+                Some(n) => exact_html(n),
+                None => window.total.get_or_init(|| self.total(true)).clone(),
+            }
         } else {
             self.total(true)
         };
@@ -1138,8 +1141,9 @@ impl Search {
         if self.min_score.is_some() {
             left_out.push("releases rated lower or not rated");
         }
-        // an "at least" count may be all there is too: the window says
-        let small = matches!(&counted, Ok(t) if t.count > 0 && t.count <= SORT_WINDOW);
+        // only a search paged from its window, whose rows the count then matches; an "at least" count may be all
+        // there is too: the window says
+        let small = self.sorts_from_a_window() && matches!(&counted, Ok(t) if t.count > 0 && t.count <= SORT_WINDOW);
         let html = match counted {
             Ok(total) if left_out.is_empty() => {
                 format!("<strong class=\"total\" title=\"{ROWS_FOLDED}\">{}</strong>", escape(&total.describe()))
@@ -1194,6 +1198,8 @@ fn list_of(items: &[&str]) -> String {
 
 /// How old a window can get before a click on it starts a new one. The click still gets the old one straight away.
 const WINDOW_FRESH: Duration = Duration::from_secs(60);
+/// How long a count waits for its window's background fill before rendering what's left itself.
+const COUNT_WAITS_FOR_FILL: Duration = Duration::from_secs(5);
 /// How often the windows nobody has clicked lately are made again, soo the first click of the day finds one.
 const WINDOW_IDLE_FRESH: Duration = Duration::from_secs(15 * 60);
 /// What counts as lately.
@@ -1245,6 +1251,8 @@ struct Window {
     /// bumped, under `shown`, each time rows are kept: a size order read from older sizes isn't kept
     shown_gen: std::sync::atomic::AtomicU64,
     filled: AtomicBool,
+    /// `shown_count`'s answers, by rating chip (the only thing searches sharing a window differ in that it counts)
+    counted: Mutex<HashMap<Option<i64>, usize>>,
     /// how many results it was read with
     asked: i64,
     /// the search had that many, soo it may have more: a sort over a whole category reads a bigger window when a page
@@ -1271,6 +1279,7 @@ impl Window {
             sized: AtomicBool::new(false),
             shown_gen: std::sync::atomic::AtomicU64::new(0),
             filled: AtomicBool::new(false),
+            counted: Mutex::new(HashMap::new()),
         })
     }
 
@@ -1537,21 +1546,22 @@ impl Window {
     /// How many rows the search shows from this window, all of it rendered first: those not folded into another,
     /// hidden as incomplete, or left out by a rating chip, less the later copies when copies are hidden.
     fn shown_count(&self, search: &Search) -> usize {
+        if let Some(n) = lock(&self.counted).get(&search.min_score) {
+            return *n;
+        }
+        // the background fill renders them all: waited for, soo they aren't rendered twice
+        let started = Instant::now();
+        while !self.filled.load(Ordering::Acquire) && started.elapsed() < COUNT_WAITS_FOR_FILL {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // a fill that didn't run (another had the turn) or didn't finish: what's left, here
         let missing: Vec<ReleaseRow> = {
             let shown = lock(&self.shown);
             self.rows.iter().filter(|r| !shown.contains_key(&r.id)).cloned().collect()
         };
-        let slices: Vec<&[ReleaseRow]> = missing.chunks(PAGE_SIZE as usize).collect();
-        let next = std::sync::atomic::AtomicUsize::new(0);
-        std::thread::scope(|scope| {
-            for _ in 0..FILL_THREADS {
-                scope.spawn(|| {
-                    while let Some(slice) = slices.get(next.fetch_add(1, Ordering::Relaxed)) {
-                        self.render(search, slice);
-                    }
-                });
-            }
-        });
+        for slice in missing.chunks(PAGE_SIZE as usize) {
+            self.render(search, slice);
+        }
         if search.min_score.is_some() {
             // scored as `page` scores them: the row shown, else another row of its post
             let unscored: Vec<(i64, Vec<i64>)> = lock(&self.shown)
@@ -1569,22 +1579,16 @@ impl Window {
                 }
             }
         }
-        // in the search's own order, which "Hide copies" goes by
-        let ids: Vec<i64> = {
+        // what `page` passes over: folded rows (incomplete ones among them) and rows a chip leaves out
+        let n = {
             let shown = lock(&self.shown);
             self.rows
                 .iter()
-                .filter_map(|r| {
-                    let row = shown.get(&r.id)?;
-                    (!row.folded && !search.scored_out(row.score.flatten())).then_some(row.brings.unwrap_or(r.id))
-                })
-                .collect()
+                .filter(|r| shown.get(&r.id).is_some_and(|row| !row.folded && !search.scored_out(row.score.flatten())))
+                .count()
         };
-        if search.filters.contains(&HIDE_COPIES) {
-            let later = crate::duplicates::later_copies(&ids).unwrap_or_default();
-            return ids.len() - later.len().min(ids.len());
-        }
-        ids.len()
+        lock(&self.counted).insert(search.min_score, n);
+        n
     }
 
     /// Renders every row and works out every order, soo no click has any of it left to do.
@@ -2401,20 +2405,27 @@ fn results(args: &HashMap<String, String>) -> ApiResponse {
     first_page(&search, &ask_note("", " hx-swap-oob=\"true\""))
 }
 
-/// The count over a results page, from the rows themselves when one window holds every match: what a page leaves out
-/// (a post's other rows, copies, incomplete and unrated releases) isn't counted, soo it's the rows paging would show.
+/// A count from the rows themselves.
+fn exact_html(n: usize) -> String {
+    format!(
+        "<strong class=\"total\" title=\"{}\">{}</strong>",
+        attr(&format!("Counted from the rows themselves. {ROWS_FOLDED}")),
+        escape(&field_search::Total { count: n as i64, exact: true }.describe())
+    )
+}
+
+/// The count over a results page, from the rows themselves when the search pages from one window that holds every
+/// match: what a page leaves out (a post's other rows, incomplete and unrated releases) isn't counted, soo it's the
+/// rows paging shows.
 /// A search with more than one window holds keeps the count it had.
 fn exact_total(args: &HashMap<String, String>) -> String {
     let search = Search { offset: 0, ..Search::from_args(args) };
+    // other searches page a page at a time, folding as they go: no window count matches them
+    if !search.sorts_from_a_window() {
+        return search.total(false);
+    }
     match window_of(&search, 0) {
-        Ok(window) if !window.more_in_db => {
-            let n = window.shown_count(&search);
-            format!(
-                "<strong class=\"total\" title=\"{}\">{}</strong>",
-                attr(&format!("Counted from the rows themselves. {ROWS_FOLDED}")),
-                escape(&field_search::Total { count: n as i64, exact: true }.describe())
-            )
-        }
+        Ok(window) if !window.more_in_db => exact_html(window.shown_count(&search)),
         Ok(_) => search.total(false),
         Err(e) => {
             eprintln!("web exact count failed: {e}");
@@ -4643,6 +4654,7 @@ mod tests {
             sized: AtomicBool::new(false),
             shown_gen: std::sync::atomic::AtomicU64::new(0),
             filled: AtomicBool::new(false),
+            counted: Mutex::new(HashMap::new()),
             asked: SORT_WINDOW,
             more_in_db: false,
         }
@@ -5542,6 +5554,7 @@ mod tests {
     fn a_window_counts_the_rows_a_search_shows() {
         let row = |id: i64| ReleaseRow { id, size: Some(id), ..Default::default() };
         let w = window_of_rows(vec![row(1), row(2), row(3), row(4)]);
+        w.filled.store(true, Ordering::Release);
         let shows = |brings, folded, score| ShownRow {
             html: "<tr></tr>".into(),
             size: Some(1),
@@ -5560,6 +5573,8 @@ mod tests {
         let search = |q: &str| Search::from_args(&parse_query(q));
         assert_eq!(w.shown_count(&search("q=x")), 3, "a folded row isn't counted");
         assert_eq!(w.shown_count(&search("q=x&rated=60")), 1, "nor one a chip leaves out");
+        w.publish(vec![(1, shows(None, true, None))]);
+        assert_eq!(w.shown_count(&search("q=x")), 3, "kept per window and chip");
     }
 
     #[test]
