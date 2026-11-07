@@ -36,6 +36,8 @@ create table if not exists merge_shards (
     key0          INTEGER,
     key1          INTEGER,
     max_release   INTEGER,
+    max_file      INTEGER,
+    grouping_from INTEGER,
     done          INTEGER NOT NULL DEFAULT 0
 );
 create table if not exists merge_progress (
@@ -136,6 +138,8 @@ pub fn merge(
         }
         let started = Instant::now();
         let conn = crate::db::open_at(target).with_context(|| format!("opening {}", target.display()))?;
+        // every commit on disk before a source is deleted: there is nothing to copy again from after that
+        conn.execute_batch("pragma synchronous = full;")?;
         conn.execute_batch(SCHEMA)?;
         add_column(&conn, "files", "domain_base", "INTEGER")?;
         park_triggers(&conn)?;
@@ -146,20 +150,25 @@ pub fn merge(
             let frozen_target = crate::frozen::path(target);
             crate::frozen::create(&frozen_target)?;
             let frozen = crate::db::open_at(&frozen_target)?;
+            frozen.execute_batch("pragma synchronous = full;")?;
             frozen.execute_batch(FROZEN_SCHEMA)?;
             let keys = keys_of(&conn, source.shard)?;
             if merge_frozen(&frozen, source.shard, &frozen_src, keys, &mut budget, log)?.is_none() {
                 return Ok(merged);
             }
+            frozen.query_row("pragma wal_checkpoint(truncate)", [], |_| Ok(()))?;
         }
         conn.execute("update merge_shards set done = 1 where shard = ?1", [source.shard as i64])?;
+        conn.query_row("pragma wal_checkpoint(truncate)", [], |_| Ok(()))?;
         merged.shards.push(source.shard);
         merged.rows += rows;
         log(&format!("shard {}: {rows} rows in {:.0} s", source.shard, started.elapsed().as_secs_f64()));
         drop(conn);
         if delete {
-            remove_family(&source.path)?;
+            // the frozen file first: the shard's own file is what a run looks for to go on
             remove_family(&frozen_src)?;
+            remove_family(&source.path)?;
+            sync_dir(&source.path);
             log(&format!("shard {}: removed {}", source.shard, source.path.display()));
         }
     }
@@ -231,15 +240,31 @@ fn merge_one(
         let known: Option<i64> =
             conn.query_row("select done from merge_shards where shard = ?1", [shard], |r| r.get(0)).optional()?;
         if known.is_none() {
-            let file_offset: i64 = conn.query_row("select coalesce(max(id), 0) from main.files", [], |r| r.get(0))?;
+            // past the target's files and every other source's moved range, copied yet or not
+            let file_offset: i64 = conn.query_row(
+                "select max(coalesce((select max(id) from main.files), 0),
+                            coalesce((select max(file_offset + coalesce(max_file, 0)) from merge_shards), 0))",
+                [],
+                |r| r.get(0),
+            )?;
             let meta = |key: &str| -> Result<Option<i64>> {
                 Ok(conn.query_row("select value from src.meta where key = ?1", [key], |r| r.get(0)).optional()?)
             };
             let max_release: i64 = conn.query_row("select coalesce(max(id), 0) from src.releases", [], |r| r.get(0))?;
+            let max_file: i64 = conn.query_row("select coalesce(max(id), 0) from src.files", [], |r| r.get(0))?;
             conn.execute(
-                "insert into merge_shards (shard, file_offset, domain_offset, key0, key1, max_release)
-                 values (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![shard, file_offset, shard << 32, meta("id_key0")?, meta("id_key1")?, max_release],
+                "insert into merge_shards (shard, file_offset, domain_offset, key0, key1, max_release, max_file, grouping_from)
+                 values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    shard,
+                    file_offset,
+                    shard << 32,
+                    meta("id_key0")?,
+                    meta("id_key1")?,
+                    max_release,
+                    max_file,
+                    meta("grouping_from")?
+                ],
             )?;
         }
         let (file_offset, domain_offset, key0, key1): (i64, i64, i64, i64) = conn.query_row(
@@ -275,7 +300,18 @@ struct Moves {
 
 fn attach(conn: &Connection, path: &Path) -> Result<()> {
     let _ = conn.execute("detach database src", []);
-    let uri = format!("file:{}?mode=ro", path.display());
+    let encoded: String = path
+        .display()
+        .to_string()
+        .chars()
+        .map(|c| match c {
+            '%' => "%25".to_string(),
+            '?' => "%3f".to_string(),
+            '#' => "%23".to_string(),
+            c => c.to_string(),
+        })
+        .collect();
+    let uri = format!("file:{encoded}?mode=ro");
     conn.execute("attach database ?1 as src", [uri]).with_context(|| format!("attaching {}", path.display()))?;
     Ok(())
 }
@@ -300,7 +336,7 @@ fn leads_an_index(conn: &Connection, schema: &str, table: &str, column: &str) ->
         return Ok(true);
     }
     let indexes: Vec<String> = conn
-        .prepare("select name from pragma_index_list(?1, ?2)")?
+        .prepare("select name from pragma_index_list(?1, ?2) where partial = 0")?
         .query_map([table, schema], |r| r.get(0))?
         .collect::<rusqlite::Result<_>>()?;
     for index in indexes {
@@ -325,6 +361,8 @@ struct Copy {
     cols: Vec<String>,
     exprs: Vec<String>,
     key: Option<String>,
+    /// rows of the source left out (and out of its count)
+    filter: Option<String>,
 }
 
 fn plan(conn: &Connection, table: &str, m: &Moves) -> Result<Copy> {
@@ -337,24 +375,28 @@ fn plan(conn: &Connection, table: &str, m: &Moves) -> Result<Copy> {
             cols: vec!["id".into(), "suffix".into()],
             exprs: vec![format!("id + {}", m.domain_offset), "suffix".into()],
             key: Some("id".into()),
+            filter: None,
         },
         "collections" => Copy {
             into: "legacy_collections".into(),
             cols: ["key0", "key1", "key", "release_id"].map(String::from).to_vec(),
             exprs: vec![lit(m.key0), lit(m.key1), "key".into(), "release_id".into()],
             key: Some("key".into()),
+            filter: None,
         },
         "junk_collections" => Copy {
             into: "legacy_junk_collections".into(),
             cols: ["key0", "key1", "key"].map(String::from).to_vec(),
             exprs: vec![lit(m.key0), lit(m.key1), "key".into()],
             key: Some("key".into()),
+            filter: None,
         },
         "frozen_collections" => Copy {
             into: "legacy_frozen_collections".into(),
             cols: ["key0", "key1", "key", "release_id"].map(String::from).to_vec(),
             exprs: vec![lit(m.key0), lit(m.key1), "key".into(), "release_id".into()],
             key: Some("key".into()),
+            filter: None,
         },
         _ => {
             let target_cols = columns(conn, "main", table)?;
@@ -383,6 +425,8 @@ fn plan(conn: &Connection, table: &str, m: &Moves) -> Result<Copy> {
                     ("files", "domain_base") => continue,
                     // 0 is a message-id stored whole, no domain
                     ("segments", "domain") => format!("case when {q} = 0 then 0 else {q} + {} end", m.domain_offset),
+                    // a release's own row in `release_ids` has file 0, no file
+                    ("release_ids", "file_id") => format!("case when {q} = 0 then 0 else {q} + {} end", m.file_offset),
                     (t, "file_id") if FILE_KEYED.contains(&t) => format!("{q} + {}", m.file_offset),
                     _ => q.clone(),
                 };
@@ -393,18 +437,38 @@ fn plan(conn: &Connection, table: &str, m: &Moves) -> Result<Copy> {
                 cols.push("domain_base".into());
                 exprs.push(lit(m.domain_offset));
             }
-            let key = if table == "files" || table == "releases" || table == "catalog_outbox" {
-                Some(if table == "catalog_outbox" { "seq" } else { "id" }.to_string())
-            } else if FILE_KEYED.contains(&table) {
-                Some("file_id".into())
-            } else if has("release_id") {
-                Some("release_id".into())
-            } else if has("id") {
-                Some("id".into())
-            } else {
-                None
-            };
-            Copy { into: table.to_string(), cols, exprs, key }
+            // the keys a range could go by, best first: the first that leads an index is taken (`plan` below)
+            let mut keys: Vec<String> = Vec::new();
+            if table == "catalog_outbox" {
+                keys.push("seq".into());
+            } else if table == "files" || table == "releases" {
+                keys.push("id".into());
+            }
+            if FILE_KEYED.contains(&table) {
+                keys.push("file_id".into());
+            }
+            if has("release_id") {
+                keys.push("release_id".into());
+            }
+            if has("id") {
+                keys.push("id".into());
+            }
+            let mut key = None;
+            for k in keys {
+                if leads_an_index(conn, "src", table, &k)? {
+                    key = Some(k);
+                    break;
+                }
+            }
+            // the outbox's rows for tables keyed by the shard would go out under shard 0 with another shard's keys
+            let copy = Copy { into: table.to_string(), cols, exprs, key, filter: None };
+            if table == "catalog_outbox" {
+                return Ok(Copy {
+                    filter: Some("tbl not in ('collections', 'junk_collections', 'pp_walks')".into()),
+                    ..copy
+                });
+            }
+            return Ok(copy);
         }
     };
     let key = match copy.key {
@@ -436,22 +500,29 @@ fn copy_table(
     }
     let plan = plan(conn, table, m)?;
     let src = format!("src.{}", quote(table));
+    let filter = plan.filter.as_deref().unwrap_or("1");
     let insert = format!(
-        "insert into main.{} ({}) select {} from {src}",
+        "insert into main.{} ({}) select {} from {src} where ({filter})",
         quote(&plan.into),
         plan.cols.join(", "),
         plan.exprs.join(", ")
     );
+    let counted = format!("select count(*) from {src} where ({filter})");
     let (mut upto, mut copied) = progress.map_or((None, 0), |(u, c, _)| (u, c));
     match &plan.key {
         None => {
             if !spend(budget) {
                 return Ok(None);
             }
+            // copied, counted and noted done in one transaction: a crash leaves it all to do again, never half
             let tx = conn.unchecked_transaction()?;
             copied = tx.execute(&insert, [])? as i64;
+            let count: i64 = tx.query_row(&counted, [], |r| r.get(0))?;
+            if count != copied {
+                bail!("shard {shard}, {table}: {copied} rows copied but the source has {count}");
+            }
             tx.execute(
-                "insert or replace into merge_progress (shard, tbl, upto, copied, done) values (?1, ?2, null, ?3, 0)",
+                "insert or replace into merge_progress (shard, tbl, upto, copied, done) values (?1, ?2, null, ?3, 1)",
                 params![shard, table, copied],
             )?;
             tx.commit()?;
@@ -465,7 +536,7 @@ fn copy_table(
                 let mut start: i128 = upto.map_or(lo as i128, |u| u as i128 + 1);
                 // the range a transaction takes, fitted to `BATCH_ROWS` as it goes
                 let mut width: i128 = BATCH_ROWS as i128;
-                let ranged = format!("{insert} where {k} >= ?1 and {k} <= ?2");
+                let ranged = format!("{insert} and {k} >= ?1 and {k} <= ?2");
                 while start <= hi as i128 {
                     if !spend(budget) {
                         return Ok(None);
@@ -486,14 +557,14 @@ fn copy_table(
                     let _ = conn.query_row("pragma main.wal_checkpoint(truncate)", [], |_| Ok(()));
                 }
             }
+            let _ = upto;
+            let count: i64 = conn.query_row(&counted, [], |r| r.get(0))?;
+            if count != copied {
+                bail!("shard {shard}, {table}: {copied} rows copied but the source has {count}");
+            }
+            conn.execute("update merge_progress set done = 1 where shard = ?1 and tbl = ?2", params![shard, table])?;
         }
     }
-    let _ = upto;
-    let count: i64 = conn.query_row(&format!("select count(*) from {src}"), [], |r| r.get(0))?;
-    if count != copied {
-        bail!("shard {shard}, {table}: {copied} rows copied but the source has {count}");
-    }
-    conn.execute("update merge_progress set done = 1 where shard = ?1 and tbl = ?2", params![shard, table])?;
     log(&format!("shard {shard}: {table} {copied} rows"));
     Ok(Some(copied))
 }
@@ -527,6 +598,12 @@ fn merge_meta(conn: &Connection, shard: i64) -> Result<()> {
             [key],
         )?;
     }
+    // the shard's uncategorized list is filled once (`uncategorized_listed`): one source not filled leaves it to do
+    tx.execute(
+        "update main.meta set value = 0 where key = 'uncategorized_listed'
+         and coalesce((select value from src.meta where key = 'uncategorized_listed'), 0) != 1",
+        [],
+    )?;
     tx.execute(
         "insert or replace into merge_progress (shard, tbl, upto, copied, done) values (?1, 'meta', null, 1, 1)",
         [shard],
@@ -571,6 +648,15 @@ fn add_column(conn: &Connection, table: &str, column: &str, kind: &str) -> Resul
     Ok(())
 }
 
+/// The directory of `path` flushed, soo a deletion in it holds after a power cut.
+fn sync_dir(path: &Path) {
+    if let Some(dir) = path.parent()
+        && let Ok(d) = std::fs::File::open(dir)
+    {
+        let _ = d.sync_all();
+    }
+}
+
 /// A database file and everything beside it that belongs to it.
 fn remove_family(base: &Path) -> Result<()> {
     for suffix in ["", "-wal", "-shm", "-journal", ".sealed-log-cursor", ".catalog-cursor"] {
@@ -584,13 +670,38 @@ fn remove_family(base: &Path) -> Result<()> {
     Ok(())
 }
 
-/// After the last source: the id counter past every release id, as one shard numbers them (`seq` is the id).
+/// Set in `atlas.db` from a merge's start to its `finish`: no indexer may start in between, as it would write to
+/// shards half merged (`db::create_db_at` refuses).
+pub const MERGING: &str = "merging_shards";
+
+/// Whether a merge started on `main` hasn't finished.
+pub fn in_progress(main: &Connection) -> bool {
+    crate::store::get_meta(main, MERGING).ok().flatten().is_some_and(|v| v != 0)
+}
+
+/// After the last source: the triggers back, the id counter past every id handed out (live, frozen, a source's
+/// highest, and what the eight-shard numbering would hand out next), as one shard numbers them (`seq` is the id),
+/// and the merge marked finished. Safe to run again.
 pub fn finish(main: &Path, target: &Path) -> Result<()> {
     let conn = crate::db::open_at(target)?;
-    let max: i64 = conn.query_row("select coalesce(max(id), 0) from releases", [], |r| r.get(0))?;
-    crate::store::set_next_seq(&crate::db::open_at(main)?, max + 1)?;
+    conn.execute_batch(SCHEMA)?;
+    let mut highest: i64 = conn.query_row(
+        "select max(coalesce((select max(id) from releases), 0), coalesce((select max(max_release) from merge_shards), 0))",
+        [],
+        |r| r.get(0),
+    )?;
+    let frozen = crate::frozen::path(target);
+    if frozen.exists() {
+        let f = crate::db::open_at(&frozen)?;
+        highest = highest.max(f.query_row("select coalesce(max(id), 0) from frozen_releases", [], |r| r.get(0))?);
+    }
+    let main_conn = crate::db::open_at(main)?;
+    let next = crate::store::get_meta(&main_conn, "next_seq")?.unwrap_or(0);
+    highest = highest.max(next.saturating_mul(LEGACY_SHARDS as i64));
+    crate::store::set_next_seq(&main_conn, highest + 1)?;
     restore_triggers(&conn)?;
     crate::sidecar::recount(&conn)?;
+    main_conn.execute("insert or replace into meta (key, value) values (?1, 0)", [MERGING])?;
     Ok(())
 }
 
@@ -605,11 +716,26 @@ pub fn run(args: &[String]) -> i32 {
     let target = legacy_shard_path(&main, 0);
     let todo = sources(&main);
     if todo.is_empty() {
+        // the last source went but its run stopped before `finish`
+        let unfinished = crate::db::open_at(&main).map(|c| in_progress(&c)).unwrap_or(false);
+        if unfinished && apply {
+            return match finish(&main, &target) {
+                Ok(()) => {
+                    println!("finished the merge that stopped after its last shard");
+                    0
+                }
+                Err(e) => {
+                    println!("couldnt finish: {e:#}");
+                    1
+                }
+            };
+        }
         println!("nothing to merge: {} is the only shard", target.display());
         return 0;
     }
     let free = crate::frozen::free_bytes(&main).unwrap_or(0);
-    let biggest = todo.iter().filter_map(|s| std::fs::metadata(&s.path).ok()).map(|m| m.len()).max().unwrap_or(0);
+    let size = |p: &Path| std::fs::metadata(p).map_or(0, |m| m.len());
+    let biggest = todo.iter().map(|s| size(&s.path) + size(&crate::frozen::path(&s.path))).max().unwrap_or(0);
     println!("merging {} shards into {}, smallest first:", todo.len(), target.display());
     for s in &todo {
         let size = std::fs::metadata(&s.path).map_or(0, |m| m.len());
@@ -637,6 +763,13 @@ pub fn run(args: &[String]) -> i32 {
     };
     if let Err(e) = crate::compact::refuse_unresolved_backups(&main) {
         println!("{e:#}");
+        return 1;
+    }
+    // no indexer starts until `finish`, even when this run stops half way
+    if let Err(e) = crate::db::open_at(&main)
+        .and_then(|c| Ok(c.execute("insert or replace into meta (key, value) values (?1, 1)", [MERGING])?))
+    {
+        println!("couldnt mark the merge as started: {e:#}");
         return 1;
     }
     let result = merge(&target, &todo, true, None, &|m| println!("{m}")).and_then(|m| {
@@ -750,6 +883,14 @@ mod tests {
         let todo = sources(&main);
         assert_eq!(todo.len(), LEGACY_SHARDS - 1);
         let target = legacy_shard_path(&main, 0);
+        let markers: i64 = (0..LEGACY_SHARDS)
+            .map(|s| {
+                count(
+                    &crate::db::open_at(&legacy_shard_path(&main, s)).unwrap(),
+                    "select count(*) from release_ids where file_id = 0",
+                )
+            })
+            .sum();
         let merged = merge(&target, &todo, true, None, &|_| {}).unwrap();
         assert_eq!(merged.shards.len(), LEGACY_SHARDS - 1);
         finish(&main, &target).unwrap();
@@ -792,6 +933,8 @@ mod tests {
         assert_eq!(count(&c, "select count(distinct key0) from legacy_collections"), LEGACY_SHARDS as i64 - 1);
         assert_eq!(count(&c, "select count(*) from merge_shards where done = 1 and key0 is not null"), 7);
         assert_eq!(count(&c, "select value from meta where key = 'releases'"), 16);
+        // a release's own row in release_ids keeps file 0
+        assert_eq!(count(&c, "select count(*) from release_ids where file_id = 0"), markers);
         // ids go on past every release
         let max = count(&c, "select max(id) from releases");
         assert!(store::get_meta(&crate::db::open_at(&main).unwrap(), "next_seq").unwrap().unwrap() > max);
@@ -828,5 +971,28 @@ mod tests {
         let e = merge(&legacy_shard_path(&main, 0), &s1_only, true, None, &|_| {}).unwrap_err();
         assert!(format!("{e:#}").contains("mystery"), "{e:#}");
         assert!(s1.exists(), "left as it was");
+    }
+
+    #[test]
+    fn no_indexer_starts_on_a_merge_half_done_and_a_rerun_finishes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        fixture(&main);
+        let m = crate::db::open_at(&main).unwrap();
+        m.execute("insert or replace into meta (key, value) values (?1, 1)", [MERGING]).unwrap();
+        let target = legacy_shard_path(&main, 0);
+        merge(&target, &sources(&main), true, None, &|_| {}).unwrap();
+        let e = crate::db::create_db_at(&main).unwrap_err();
+        assert!(format!("{e:#}").contains("merge"), "{e:#}");
+        // the run stopped before finishing: finishing again is safe
+        finish(&main, &target).unwrap();
+        finish(&main, &target).unwrap();
+        // past the merge guard (the eight-shard layout's own check of its files is the next PR's)
+        if let Err(e) = crate::db::create_db_at(&main) {
+            assert!(!format!("{e:#}").contains("merge is in progress"), "{e:#}");
+        }
+        let c = crate::db::open_at(&target).unwrap();
+        assert_eq!(count(&c, "select count(*) from merge_triggers"), 0, "triggers back");
+        assert!(count(&c, "select count(*) from sqlite_master where type = 'trigger'") > 1);
     }
 }
