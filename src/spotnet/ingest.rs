@@ -27,6 +27,9 @@ const MAX_NZB_ARTICLES: usize = 16;
 const MAX_NZB_POSTED: usize = 16 * 1024 * 1024;
 /// What `body_capped` may read past its cap before it gives up: one long line.
 const CAP_OVERSHOOT: usize = 64 * 1024;
+/// Spots decoded and on their way to being saved at once. Each save waits behind indexing's on its shard's writer
+/// (seconds to minutes on a busy indexer), so one at a time was the pass's pace.
+const DECODING: usize = 4;
 /// NZB article bytes one pass reads at most; the spots left wait for the next pass.
 const MAX_PASS_POSTED: usize = 256 * 1024 * 1024;
 
@@ -163,9 +166,12 @@ struct Shared {
     /// NZB article bytes the pass may still read: each BODY reserves the most it can take first, and gives back
     /// what it didn't read
     budget: AtomicUsize,
-    /// one spot at a time from inflating its NZB to tagging its release: decoding is the memory a spot takes (an
-    /// NZB of up to 64 MB, up to 300,000 articles), and the copy checks, save and tag must not interleave
-    decoding: tokio::sync::Mutex<()>,
+    /// `DECODING` spots at a time from inflating their NZB to tagging their release: decoding is the memory a spot
+    /// takes (an NZB of up to 64 MB, up to 300,000 articles), held until its save is done
+    decoding: tokio::sync::Semaphore,
+    /// one spot of a shard at a time through the copy checks, save and tag: spots of one title go to the same group,
+    /// and so the same shard (copies of one NZB in other shards are kept apart by `claims`)
+    saving: Vec<tokio::sync::Mutex<()>>,
     /// NZB keys (and NZB article sets, `ref:`) of spots being read, saved or tagged in this pass whose outcome isn't
     /// in spots_seen yet
     claims: std::sync::Mutex<std::collections::HashSet<String>>,
@@ -177,7 +183,8 @@ impl Shared {
     fn new(budget: usize) -> Shared {
         Shared {
             budget: AtomicUsize::new(budget),
-            decoding: Default::default(),
+            decoding: tokio::sync::Semaphore::new(DECODING),
+            saving: (0..crate::store::SHARDS).map(|_| Default::default()).collect(),
             claims: Default::default(),
             stopping: Default::default(),
         }
@@ -248,7 +255,9 @@ async fn fetch(
     if shared.stopping.load(Ordering::Relaxed) {
         return Ok(None);
     }
-    let head = match pool.fetch_head(&format!("<{message_id}>"), MAX_XML_BYTES * 4).await {
+    // each step timed (`atlas_function_duration_seconds{function="spots.*"}`), to see where a slow pass waits
+    let head = timed("spots.head", pool.fetch_head(&format!("<{message_id}>"), MAX_XML_BYTES * 4)).await;
+    let head = match head {
         Ok(Some(head)) => head,
         Ok(None) => return Ok(Some(skipped(None))),
         Err(e) if says_absent(&e) => return Ok(Some(skipped(None))),
@@ -293,7 +302,7 @@ async fn fetch(
         if shared.stopping.load(Ordering::Relaxed) || !shared.reserve(most) {
             return Ok(None);
         }
-        match pool.fetch_body_capped(&format!("<{segment}>"), cap).await {
+        match timed("spots.body", pool.fetch_body_capped(&format!("<{segment}>"), cap)).await {
             Ok(Some(body)) => {
                 shared.give_back(most.saturating_sub(body.len()));
                 bodies.push(body);
@@ -309,13 +318,18 @@ async fn fetch(
             }
         }
     }
-    // one spot at a time from here (`Shared::decoding`)
-    let _decoding = shared.decoding.lock().await;
+    // `DECODING` spots at a time from here (`Shared::decoding`)
+    let span = crate::metrics::span("spots.wait_turn");
+    let _decoding = shared.decoding.acquire().await.expect("the pass's semaphore is never closed");
+    drop(span);
     let parts: Vec<&[u8]> = bodies.iter().map(Vec::as_slice).collect();
     let Some(nzb) = binary::nzb(&parts) else { return Ok(Some(skipped(Some(nzb_ref)))) };
     let parsed = crate::archive::nzb::parse_keeping(&nzb, release::MAX_SEGMENTS);
     let Some(release) = release::release_of(&spot, &parsed) else { return Ok(Some(skipped(Some(nzb_ref)))) };
     let nzb_key = release::nzb_key(&parsed);
+    // the release and its key are all that's needed from here: the rest of what was decoded goes now, not after the save
+    drop(parts);
+    drop((parsed, nzb, bodies));
     let settled = |release_id: Option<i64>| Settled {
         state: if release_id.is_some() { SAVED } else { SKIPPED },
         release_id,
@@ -332,6 +346,12 @@ async fn fetch(
     }
     let Some(claimed) = shared.claim(&nzb_key) else { return Ok(None) };
     claims.push(claimed);
+    let span = crate::metrics::span("spots.wait_shard");
+    let _saving = shared.saving[shard].lock().await;
+    drop(span);
+    if shared.stopping.load(Ordering::Relaxed) {
+        return Ok(None);
+    }
     // an edit or repost of a spot already saved (its release maybe frozen since): that release gets the newer
     // spot, and nothing is saved
     let k = nzb_key.clone();
@@ -355,9 +375,16 @@ async fn fetch(
             _ => by_file.push((file, vec![id])),
         }
     }
-    let (check_name, check_group, key) = (release.name.clone(), group.clone(), nzb_key.clone());
-    let placed =
-        on_shard(db, shard, move |conn| store::placement(conn, &check_name, &check_group, &key, &by_file)).await?;
+    let (check_name, check_group) = (release.name.clone(), group.clone());
+    let in_use = on_shard(db, shard, move |conn| store::name_in_use(conn, &check_name, &check_group)).await?;
+    let placed = if in_use {
+        // rare, and can be heavy (`index_release` of a big release): with the stage work, in its share
+        let (check_name, check_group, key) = (release.name.clone(), group.clone(), nzb_key.clone());
+        on_shard_queued(db, shard, move |conn| store::placement(conn, &check_name, &check_group, &key, &by_file))
+            .await?
+    } else {
+        store::Placement::Free
+    };
     if let store::Placement::SamePost(id) = placed {
         on_shard(db, crate::store::shard_of_id(id), move |conn| store::tag_release(conn, id, &row)).await?;
         return Ok(Some(settled(Some(id))));
@@ -368,7 +395,7 @@ async fn fetch(
         release::rename(&mut release, &own);
     }
     let name = release.name.clone();
-    db.save(vec![release]).await?;
+    timed("spots.save", db.save(vec![release])).await?;
     // tagged on its shard's writer after the save: the save doesn't say which id the release got
     let title = row.spot.title.clone();
     let id = on_shard(db, shard, move |conn| store::tag(conn, &name, &group, &row)).await?;
@@ -395,29 +422,69 @@ async fn copy_of(db: &Db, id: i64, mut row: SpotRow, nzb_ref: String, nzb_key: O
     Ok(Settled { state: SAVED, release_id: Some(id), nzb_ref: Some(nzb_ref), nzb_key: key })
 }
 
-/// Runs `work` on `shard`'s writer, in its own transaction, and hands back what it returned.
+/// Runs `work` on `shard`'s writer, in its own transaction, and hands back what it returned. On the writer's lane
+/// for small jobs someone waits on (`Db::on_writer_first`): behind the processing stage's queued work, one of these
+/// waited many minutes on prod.
 async fn on_shard<T: Send + 'static>(
     db: &Db,
     shard: usize,
     work: impl FnOnce(&rusqlite::Connection) -> rusqlite::Result<T> + Send + 'static,
 ) -> Result<T> {
+    on_writer(db, shard, true, work).await
+}
+
+/// `on_shard` for a job that can be heavy: queued with the stage work, in its share of the writer's time.
+async fn on_shard_queued<T: Send + 'static>(
+    db: &Db,
+    shard: usize,
+    work: impl FnOnce(&rusqlite::Connection) -> rusqlite::Result<T> + Send + 'static,
+) -> Result<T> {
+    on_writer(db, shard, false, work).await
+}
+
+async fn on_writer<T: Send + 'static>(
+    db: &Db,
+    shard: usize,
+    first: bool,
+    work: impl FnOnce(&rusqlite::Connection) -> rusqlite::Result<T> + Send + 'static,
+) -> Result<T> {
     let out = Arc::new(std::sync::Mutex::new(None));
     let into = out.clone();
-    let answer = db.on_writer(
-        shard,
-        "db.stage.spots",
-        Box::new(move |conn| {
-            *into.lock().unwrap() = Some(work(conn)?);
-            Ok(())
-        }),
-    )?;
-    tokio::task::spawn_blocking(move || answer.recv())
+    let job: crate::indexer::StageWork = Box::new(move |conn| {
+        *into.lock().unwrap() = Some(work(conn)?);
+        Ok(())
+    });
+    let db = db.clone();
+    // the queued kind blocks while the writer's queue is full: off the runtime's threads, like the wait for the answer
+    let answered = timed("spots.writer", async move {
+        tokio::task::spawn_blocking(move || {
+            let answer = if first {
+                db.on_writer_first(shard, "db.stage.spots", job)
+            } else {
+                db.on_writer(shard, "db.stage.spots", job)
+            }?;
+            answer.recv().map_err(|_| anyhow!("db writer stopped"))?.map_err(|e| anyhow!("spots: {e}"))
+        })
         .await
         .map_err(|e| anyhow!("spot task failed: {e}"))?
-        .map_err(|_| anyhow!("db writer stopped"))?
-        .map_err(|e| anyhow!("spots: {e}"))?;
+    })
+    .await;
+    answered?;
     let value = out.lock().unwrap().take();
     value.ok_or_else(|| anyhow!("spots: the writer gave no answer"))
+}
+
+/// `fut`, timed as `function` in `atlas_function_duration_seconds`, and counted as failed when it errs.
+async fn timed<T, E>(
+    function: &'static str,
+    fut: impl std::future::Future<Output = std::result::Result<T, E>>,
+) -> std::result::Result<T, E> {
+    let span = crate::metrics::span(function);
+    let result = fut.await;
+    if result.is_err() {
+        span.failed();
+    }
+    result
 }
 
 /// Whether a spot's NZB articles can be read: at most `MAX_NZB_ARTICLES` of them, each named once.

@@ -785,6 +785,7 @@ A search by an ID that's on (see [TV and movie IDs](#tv-and-movie-ids)) returns 
 | `cat` | searches | A comma list of categories. A parent includes its subs, so `5000` includes `5040`. `-1` or text that isn't a number means no filter, and an id that doesn't exist matches nothing. See [Categories](#categories). |
 | `limit` | searches | Maximum results. The default and the maximum are both `100`. |
 | `offset` | searches | Result offset for paging. |
+| `incomplete` | searches | Not in the Newznab spec. Searches list only complete releases (every file the post names, each with all its parts), as the web UI's "Hide incomplete" does, and read on past incomplete ones to fill a page (up to 10 pages' worth, so a page can come out short when more follow). `incomplete=1` lists the others too, each with `<newznab:attr name="complete" value="0"/>`. |
 | `id` | `get` | Release ID from a result's `<guid>`. |
 
 ### Examples
