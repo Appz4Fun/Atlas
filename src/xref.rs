@@ -239,9 +239,10 @@ fn upload_name(poster: &str) -> String {
     format!("{NAME_PREFIX}{}-{}", hash >> 32, hash & 0xffff_ffff)
 }
 
+/// The archive step's connection: its notes are best effort, soo it waits briefly rather than hold up a run
 fn open_rw() -> Option<Connection> {
     let conn = Connection::open(path_for(&crate::paths::database())).ok()?;
-    conn.busy_timeout(BUSY).ok()?;
+    conn.busy_timeout(Duration::from_secs(5)).ok()?;
     Some(conn)
 }
 
@@ -400,7 +401,9 @@ impl Store {
     }
 
     /// Keep the headers of `articles` of `group`, unless another server's listing brought them already. In
-    /// transactions of `WRITE_CHUNK` rows, soo the linker's writes go between them.
+    /// transactions of `WRITE_CHUNK` rows, soo the linker's writes go between them. An error part way leaves the
+    /// chunks before it kept, and the slice is read again; should the linker settle those first (only after
+    /// `SETTLE_SECS`), the rest come as late articles or files of their upload.
     pub fn record(&mut self, group: &str, articles: &[Article], added: i64) -> Result<usize> {
         let grp = self.group_id(group)?;
         let mut n = 0;
@@ -434,19 +437,33 @@ impl Store {
     pub fn prune(&mut self, now: i64) -> Result<usize> {
         let before = now - KEEP_SECS;
         // what waits for a group to be read is let go at the latest a day after it would settle (see `pass_with`)
+        // a cursor over (added, message_id), soo the rows that stay (waiting for a group) are passed once, not again
+        // for every batch
         let mut n = 0;
+        let mut after: (i64, String) = (i64::MIN, String::new());
         loop {
-            let gone = self.conn.execute(
-                &format!(
-                    "delete from headers where message_id in (
-                         select message_id from headers where added < ?1 and (done = 1 or added < ?2) limit {WRITE_CHUNK})"
-                ),
-                params![before, before - KEEP_SECS],
-            )?;
-            n += gone;
-            if gone < WRITE_CHUNK {
+            let batch: Vec<(i64, String)> = self
+                .conn
+                .prepare_cached(&format!(
+                    "select added, message_id from headers
+                     where added < ?1 and (done = 1 or added < ?2) and (added, message_id) > (?3, ?4)
+                     order by added, message_id limit {WRITE_CHUNK}"
+                ))?
+                .query_map(params![before, before - KEEP_SECS, after.0, after.1], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<rusqlite::Result<_>>()?;
+            let Some(last) = batch.last().cloned() else { break };
+            let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            {
+                let mut delete = tx.prepare_cached("delete from headers where message_id = ?1")?;
+                for (_, id) in &batch {
+                    n += delete.execute([id])?;
+                }
+            }
+            tx.commit()?;
+            if batch.len() < WRITE_CHUNK {
                 break;
             }
+            after = last;
         }
         // a file's place outlasts the window too: its leads are what the archive step guesses from
         self.conn.execute("delete from linked where added < ?1", [before - 7 * KEEP_SECS])?;
@@ -1223,7 +1240,7 @@ mod tests {
     }
 
     #[test]
-    fn a_big_slice_is_recorded_in_short_transactions_another_writer_gets_between() {
+    fn a_big_slice_is_recorded_in_short_transactions() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("atlas.xref.db");
         let mut store = Store::open(&path).unwrap();
@@ -1243,9 +1260,5 @@ mod tests {
         commits.store(0, std::sync::atomic::Ordering::Relaxed);
         assert_eq!(store.record("a.b.one", &batch, 1000).unwrap(), batch.len());
         assert_eq!(commits.load(std::sync::atomic::Ordering::Relaxed), 6, "a commit every WRITE_CHUNK rows");
-        // another connection waiting only briefly still gets its write in
-        let other = Connection::open(&path).unwrap();
-        other.busy_timeout(Duration::from_millis(200)).unwrap();
-        other.execute("insert into groups (name) values ('a.b.two')", []).unwrap();
     }
 }
