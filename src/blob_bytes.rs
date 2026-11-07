@@ -64,6 +64,29 @@ pub fn of_release(conn: &Connection, release_id: i64) -> Result<HashMap<String, 
     Ok(out)
 }
 
+/// `of_release` without decoding anything: None when a file's sealed blob isn't counted yet, soo a caller that can't
+/// wait on the sealed log (a list of results) goes without.
+pub fn counted_of_release(conn: &Connection, release_id: i64) -> Result<Option<HashMap<String, i64>>> {
+    let s = store::shard_of_id(release_id);
+    let mut stmt = conn.prepare_cached(&format!(
+        "select f.filename, f.blob is not null, f.blob_bytes,
+                (select coalesce(sum(g.bytes), 0) from s{s}.segments g where g.file_id = f.id)
+         from s{s}.files f where f.release_id = ?"
+    ))?;
+    let files: Vec<(String, bool, Option<i64>, i64)> =
+        stmt.query_map([release_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<Result<_>>()?;
+    let mut out: HashMap<String, i64> = HashMap::new();
+    for (filename, has_blob, counted, rows) in files {
+        let sealed = match (has_blob, counted) {
+            (false, _) => 0,
+            (true, Some(bytes)) => bytes,
+            (true, None) => return Ok(None),
+        };
+        *out.entry(filename).or_default() += sealed + rows;
+    }
+    Ok(Some(out))
+}
+
 /// Blobs counted in one batch, and so the most decoded between two looks at `stop`.
 const BATCH: i64 = 256;
 /// The most ids one batch looks through, soo a read where few are uncounted stays short.

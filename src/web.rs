@@ -905,9 +905,11 @@ impl Search {
         split: &mut HashMap<i64, release_info::SplitPost>,
     ) -> Option<i64> {
         let Some(post) = conn.and_then(|conn| release_info::whole_post_with(conn, r).ok().flatten()) else {
+            // whole by its files, or once repaired from its PAR2 volumes (`rows_html` tags that one)
             if !r.complete
                 && let Some(conn) = conn
-                && release_info::single_post_complete(conn, r.id).unwrap_or(false)
+                && (release_info::single_post_complete(conn, r.id).unwrap_or(false)
+                    || release_info::repair_needed(conn, r.id).unwrap_or(false))
             {
                 r.complete = true;
             }
@@ -1860,6 +1862,8 @@ fn rows_html(found: &[ReleaseRow], split: HashMap<i64, release_info::SplitPost>)
     let extras = RowExtras {
         spots: crate::spotnet::store::spots_of(&ids).unwrap_or_default(),
         recovery: release_info::recovery_only_of(&single),
+        repair: crate::db::open()
+            .map_or_else(|_| HashSet::new(), |conn| release_info::repair_needed_of(&conn, &single)),
         split,
         copies: crate::duplicates::counts(&ids).unwrap_or_default(),
         details: crate::media::details::kept_for(media.iter().map(|(id, m)| (*id, m.kind, &m.ids))),
@@ -1878,10 +1882,17 @@ struct RowExtras {
     recovery: HashMap<i64, release_info::RecoveryOnly>,
     /// rows saved from a Spotnet spot
     spots: HashMap<i64, crate::spotnet::store::Tagged>,
+    /// rows whole only once repaired from their PAR2 volumes
+    repair: HashSet<i64>,
 }
 
 /// Columns of the results table.
 pub(crate) const COLUMNS: usize = 6;
+
+/// A release whole only once repaired: some of its data is missing, and its PAR2 volumes can rebuild it.
+fn repair_tag() -> String {
+    " <span class=\"tag tag-warn\" title=\"Some data is missing. Its PAR2 recovery volumes can rebuild it: the download needs a repair, which NZBGet and SABnzbd do on their own.\">NEEDS REPAIR</span>".to_string()
+}
 
 pub(crate) fn tag(class: &str, text: &str) -> String {
     format!(" <span class=\"tag {class}\">{}</span>", escape(text))
@@ -2248,6 +2259,8 @@ fn row(
     tags.push_str(&password_tag(passwords.get(&r.id)));
     if !r.complete {
         tags.push_str(&tag("tag-warn", "INCOMPLETE"));
+    } else if extras.repair.contains(&r.id) {
+        tags.push_str(&repair_tag());
     }
     tags.push_str(&crate::web_meta::drawer_trigger(r.id));
     let meta = [category.as_str(), size.as_str(), posted.as_str()]
@@ -2825,7 +2838,16 @@ fn release_html(
             None => tags.push_str(&spot_tag(&spot.spot.poster, &spot.spot.title)),
         }
     }
-    tags.push_str(&if r.complete { tag("tag-ok", "COMPLETE") } else { tag("tag-warn", "INCOMPLETE") });
+    // missing data its PAR2 volumes can rebuild: listed as whole, as a client repairs it, and said soo
+    let repair = !r.complete
+        && split_groups.is_none()
+        && recovery.is_none()
+        && contents.data_articles_seen < contents.data_articles_expected
+        && contents.repairable();
+    tags.push_str(&if r.complete || repair { tag("tag-ok", "COMPLETE") } else { tag("tag-warn", "INCOMPLETE") });
+    if repair {
+        tags.push_str(&repair_tag());
+    }
     if names.is_some_and(|n| n.obfuscated) {
         tags.push_str(&tag("tag-warn", "OBFUSCATED"));
     }
