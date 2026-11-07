@@ -2111,6 +2111,9 @@ const PRUNE_IDS_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
 /// the same when nothing came in meanwhile: at most a fifth of the writer's time with PRUNE_IDS_BUDGET_IDLE
 const PRUNE_IDS_IDLE_EVERY: std::time::Duration = std::time::Duration::from_millis(250);
 
+/// after a pruning step fails, the next waits this long (seconds)
+const PRUNE_IDS_FAILED_REST: i64 = 600;
+
 /// how long a pruning step waits for a write lock another connection holds
 const PRUNE_IDS_BUSY: std::time::Duration = std::time::Duration::from_secs(2);
 
@@ -2269,6 +2272,11 @@ impl ShardWriter {
             Err(e) if crate::frozen::is_busy(&e) => {
                 crate::metrics::names::RELEASE_IDS.inc(&[("event", "busy"), ("shard", &self.shard.to_string())], 1);
                 Ok(0)
+            }
+            // anything else would likely fail the same way next time: the walk rests a while
+            Err(e) => {
+                self.ids.rest_until = now + PRUNE_IDS_FAILED_REST;
+                Err(e)
             }
             done => done,
         }
