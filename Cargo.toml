@@ -31,6 +31,8 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rustyline = "18"
 # audio fingerprints (`audio`): Chromaprint in pure Rust, and the decoders for the codecs it covers
 rusty-chromaprint = "0.3"
+# AC-3 and E-AC-3, clean-room from ATSC A/52, no unsafe
+filmcraft-ac3 = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 sha1 = "0.10"
