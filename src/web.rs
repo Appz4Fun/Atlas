@@ -1675,27 +1675,94 @@ fn spot_tag(spot: &crate::spotnet::store::Tagged) -> String {
     format!(" <span class=\"tag tag-ok\" title=\"{}\">SPOT</span>", attr(&title))
 }
 
-/// A release page's line on its spot: the spot's title, who posted it and their spotter id, and its IMDb link.
-fn spot_fact(spot: &crate::spotnet::store::Tagged) -> String {
-    let mut out = escape(&spot.title);
-    let mut by = Vec::new();
-    if !spot.poster.is_empty() {
-        by.push(escape(&spot.poster));
-    }
-    if !spot.tag.is_empty() && spot.tag != spot.poster {
-        by.push(format!("[{}]", escape(&spot.tag)));
-    }
-    if let Some(id) = spot.spotter_id.as_deref().filter(|id| !id.is_empty()) {
-        by.push(format!("spotter {}", escape(id)));
-    }
-    if !by.is_empty() {
-        let _ = write!(out, "<br>posted by {}", by.join(" "));
-    }
-    if let Some(imdb) =
-        spot.imdb_id.as_deref().filter(|id| id.starts_with("tt") && id[2..].bytes().all(|b| b.is_ascii_digit()))
+/// A release page's section on its spot: everything the spot says, as Spotweb's spot page shows it, then its
+/// description. A spot saved before its XML was kept shows what its row has until the XML is read again.
+fn spot_html(d: &crate::spotnet::store::Detail) -> String {
+    use crate::spotnet::names;
+    let spot = &d.spot;
+    let mut facts = String::new();
+    let mut fact = |name: &str, value: String| {
+        if !value.is_empty() {
+            let _ = write!(facts, "<dt>{name}</dt><dd>{value}</dd>");
+        }
+    };
+    fact("Title", escape(&spot.title));
+    let subcats = &spot.subcats;
+    for (letter, list) in
+        [('z', &subcats.z), ('a', &subcats.a), ('b', &subcats.b), ('c', &subcats.c), ('d', &subcats.d)]
     {
-        let _ = write!(out, "<br><a href=\"https://www.imdb.com/title/{imdb}/\" rel=\"noreferrer\">IMDb {imdb}</a>");
+        let Some(label) = names::letter_label(letter) else { continue };
+        let named: Vec<String> = list
+            .iter()
+            .map(|&n| names::name(letter, n).map_or_else(|| format!("{letter}{n}"), str::to_string))
+            .collect();
+        fact(label, escape(&named.join(", ")));
     }
+    if spot.created > 0 {
+        fact(
+            "Posted",
+            chrono::DateTime::from_timestamp(spot.created, 0)
+                .map_or(String::new(), |t| t.format("%Y-%m-%d %H:%M UTC").to_string()),
+        );
+    }
+    if spot.size > 0 {
+        fact("Size", format!("{} · {} bytes", escape(&fmt_size(Some(spot.size as i64))), thousands(spot.size as i64)));
+    }
+    let mut sender = escape(&spot.poster);
+    if let Some(id) = d.spotter_id.as_deref().filter(|id| !id.is_empty()) {
+        let _ = write!(sender, "{}spotter {}", if sender.is_empty() { "" } else { " · " }, escape(id));
+    }
+    fact("Sender", sender);
+    fact("Tag", escape(&spot.tag));
+    let website = spot.website.trim();
+    let lower = website.to_ascii_lowercase();
+    if lower.starts_with("https://") || lower.starts_with("http://") {
+        fact("Website", format!("<a href=\"{}\" rel=\"noreferrer nofollow\">{}</a>", attr(website), escape(website)));
+    } else {
+        fact("Website", escape(website));
+    }
+    if let Some(imdb) = spot.imdb_id() {
+        fact("IMDb", format!("<a href=\"https://www.imdb.com/title/{imdb}/\" rel=\"noreferrer\">{imdb}</a>"));
+    }
+    if !spot.image.is_empty() {
+        let size = spot.image_size.map_or(String::new(), |(w, h)| format!("{w} × {h}, "));
+        let n = spot.image.len();
+        fact("Cover image", format!("{size}{n} article{}", if n == 1 { "" } else { "s" }));
+    }
+    fact("Spotted with", escape(&spot.newsreader));
+    fact("Message-ID", format!("<code>{}</code>", escape(&d.message_id)));
+    if d.whole && spot.key > 0 {
+        fact("Key", spot.key.to_string());
+    }
+    let description = if d.gone {
+        "<p class=\"note\">No description: this spot was saved before Atlas kept it, and its article could no longer be read.</p>".to_string()
+    } else if !d.whole {
+        "<p class=\"note\">The description isn't here yet: this spot was saved before Atlas kept it, and the indexer reads it again on its next spot pass.</p>".to_string()
+    } else if spot.description.trim().is_empty() {
+        "<p class=\"note\">The spot has no description.</p>".to_string()
+    } else {
+        format!("<div class=\"panel spot-desc\">{}</div>", spot_description(&spot.description))
+    };
+    format!("<h2>Spot</h2><div class=\"panel\"><dl class=\"facts\">{facts}</dl></div><h3>Description</h3>{description}")
+}
+
+/// A spot's description as HTML: escaped, its line breaks kept, the simple bold, italic and underline tags it may
+/// use dropped, and its web links made links.
+fn spot_description(text: &str) -> String {
+    static FORMATTING: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)\[/?(?:b|i|u)\]").unwrap());
+    static LINK: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r#"(?i)\bhttps?://[^\s<>"'\[\]]+"#).unwrap());
+    let text = FORMATTING.replace_all(text.trim(), "");
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0;
+    for m in LINK.find_iter(&text) {
+        out.push_str(&escape(&text[at..m.start()]));
+        let url = m.as_str().trim_end_matches(['.', ',', ')', ';', ':', '!', '?']);
+        let _ = write!(out, "<a href=\"{}\" rel=\"noreferrer nofollow\">{}</a>", attr(url), escape(url));
+        at = m.start() + url.len();
+    }
+    out.push_str(&escape(&text[at..]));
     out
 }
 
@@ -2510,9 +2577,6 @@ fn release_html(
     if !links.is_empty() {
         fact("Links", links);
     }
-    if let Some(spot) = &spot {
-        fact("Spot", spot_fact(spot));
-    }
 
     let nzb_files = nzb_files_html(contents);
     let files = if inner.files.is_empty() {
@@ -2570,6 +2634,11 @@ fn release_html(
         .unwrap_or_default();
     let copies = if recovery.is_some() { String::new() } else { copies_html(&copies, inherited.as_ref(), &carry_to) };
     let warning = recovery.map_or(String::new(), recovery_warning);
+    let spot = if spot.is_some() {
+        crate::spotnet::store::detail_of(r.id).ok().flatten().map_or(String::new(), |d| spot_html(&d))
+    } else {
+        String::new()
+    };
 
     page(
         &format!("{shown} · Atlas"),
@@ -2581,6 +2650,7 @@ fn release_html(
 {warning}<div id="title-details" hx-get="/ui/details?id={id}" hx-trigger="load" hx-swap="outerHTML"></div>
 <div class="panel"><dl class="facts">{facts}</dl></div>
 <div id="pending" hx-get="/ui/pending?id={id}" hx-trigger="load" hx-swap="outerHTML"></div>
+{spot}
 {stills}
 {copies}
 {meta}
@@ -4017,27 +4087,68 @@ fn seven_z_first_file(
 #[cfg(test)]
 mod tests {
     #[test]
-    fn a_spot_shows_as_a_tag_and_a_fact() {
+    fn a_spot_shows_as_a_tag() {
         let spot = crate::spotnet::store::Tagged {
             title: "Movie <2026> & co".into(),
             poster: "NUKE".into(),
-            tag: "nuke-tag".into(),
-            spotter_id: Some("lQhLVQ".into()),
-            imdb_id: Some("tt39162904".into()),
             ..Default::default()
         };
         let t = super::spot_tag(&spot);
         assert!(t.contains(">SPOT</span>") && t.contains("Spotnet spot by NUKE: Movie &lt;2026&gt; &amp; co"), "{t}");
-        let f = super::spot_fact(&spot);
-        assert!(f.starts_with("Movie &lt;2026&gt; &amp; co<br>posted by NUKE [nuke-tag] spotter lQhLVQ"), "{f}");
-        assert!(f.contains("href=\"https://www.imdb.com/title/tt39162904/\""), "{f}");
-        // an IMDb id that isn't one makes no link
-        let odd = crate::spotnet::store::Tagged { imdb_id: Some("tt12\"x".into()), ..spot.clone() };
-        assert!(!super::spot_fact(&odd).contains("imdb.com"));
-        let bare = crate::spotnet::store::Tagged { title: "T".into(), ..Default::default() };
-        assert_eq!(super::spot_fact(&bare), "T");
     }
 
+    #[test]
+    fn a_spot_section_shows_everything_the_spot_says() {
+        let xml = r#"<Spotnet><Posting><Key>7</Key><Created>1657355034</Created><Poster>NUKE &lt;x&gt;</Poster><Tag>nuke-tag</Tag><Title>Movie &lt;2026&gt; &amp; co</Title><Description>[b]Great[/b] film[br]Password: s3cr&lt;et[br]More at https://example.org/page?a=1&amp;b=2. Bye</Description><Website>https://www.imdb.com/title/tt39162904/</Website><Image Width="477" Height="643"><Segment>img@spot.net</Segment></Image><Size>77594442517</Size><Category>01<Sub>01a15</Sub><Sub>01b11</Sub><Sub>01c04</Sub><Sub>01d05</Sub><Sub>01d20</Sub><Sub>01z00</Sub></Category><NZB><Segment>n@spot.net</Segment></NZB></Posting><Extra><Newsreader>Spotnet 1.9.0.8</Newsreader></Extra></Spotnet>"#;
+        let d = crate::spotnet::store::Detail {
+            message_id: "m<1>@spot.net".into(),
+            kind: "movie".into(),
+            spotter_id: Some("lQhLVQ".into()),
+            spot: crate::spotnet::full::parse(xml).unwrap(),
+            whole: true,
+            gone: false,
+        };
+        let h = super::spot_html(&d);
+        for want in [
+            "<dt>Title</dt><dd>Movie &lt;2026&gt; &amp; co</dd>",
+            "<dt>Type</dt><dd>Movie</dd>",
+            "<dt>Format</dt><dd>UHD</dd>",
+            "<dt>Source</dt><dd>WEB-DL</dd>",
+            "<dt>Language</dt><dd>English subtitles (builtin)</dd>",
+            "<dt>Genre</dt><dd>Crime, Thriller</dd>",
+            "<dt>Posted</dt><dd>2022-07-09 08:23 UTC</dd>",
+            "<dt>Size</dt><dd>72.3 GB · 77,594,442,517 bytes</dd>",
+            "<dt>Sender</dt><dd>NUKE &lt;x&gt; · spotter lQhLVQ</dd>",
+            "<dt>Tag</dt><dd>nuke-tag</dd>",
+            "<dt>Website</dt><dd><a href=\"https://www.imdb.com/title/tt39162904/\"",
+            "<dt>IMDb</dt><dd><a href=\"https://www.imdb.com/title/tt39162904/\"",
+            "<dt>Cover image</dt><dd>477 × 643, 1 article</dd>",
+            "<dt>Spotted with</dt><dd>Spotnet 1.9.0.8</dd>",
+            "<dt>Message-ID</dt><dd><code>m&lt;1&gt;@spot.net</code></dd>",
+            "<dt>Key</dt><dd>7</dd>",
+            // the description whole, escaped, a password the poster wrote included, its link made a link
+            "Great film\nPassword: s3cr&lt;et\nMore at <a href=\"https://example.org/page?a=1&amp;b=2\" rel=\"noreferrer nofollow\">https://example.org/page?a=1&amp;b=2</a>. Bye",
+        ] {
+            assert!(h.contains(want), "missing {want:?} in {h}");
+        }
+        assert!(!h.contains("[b]"), "{h}");
+        // a website that isn't a web link is shown, not linked
+        let mut odd = d.clone();
+        odd.spot.website = "javascript:alert(1)".into();
+        let h = super::spot_html(&odd);
+        assert!(h.contains("<dt>Website</dt><dd>javascript:alert(1)</dd>"), "{h}");
+        // saved before the XML was kept: what the row has, and a note on the description
+        let bare = crate::spotnet::store::Detail {
+            message_id: "m@spot.net".into(),
+            spot: crate::spotnet::full::FullSpot { title: "T".into(), ..Default::default() },
+            ..Default::default()
+        };
+        let h = super::spot_html(&bare);
+        assert!(h.contains("<dt>Title</dt><dd>T</dd>") && h.contains("saved before Atlas kept it"), "{h}");
+        assert!(!h.contains("<dt>Key</dt>") && !h.contains("<dt>Sender</dt>"), "{h}");
+        let gone = crate::spotnet::store::Detail { gone: true, ..bare };
+        assert!(super::spot_html(&gone).contains("could no longer be read"));
+    }
 
     fn window_of_rows(rows: Vec<ReleaseRow>) -> Window {
         Window {
