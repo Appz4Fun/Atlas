@@ -1505,6 +1505,46 @@ struct Server {
     headers: AtomicU64,
     wire: AtomicU64,
     text: AtomicU64,
+    /// how well it has served background bodies lately, see `Health`
+    health: Mutex<Health>,
+}
+
+/// A server's rolling health for background bodies, 0 (all failing) to 1 (all answering). Each answer moves it
+/// `HEALTH_STEP` of the way to 1 (a body, or a plain "not here": the server worked) or to 0 (a timeout, a failed
+/// connect, a broken connection, "failed forwarding"). Between answers it drifts back toward `HEALTH_NEUTRAL`, soo a
+/// server that was bad an hour ago isnt held to it, nor one good an hour ago trusted on that alone.
+#[derive(Clone, Copy, Debug)]
+struct Health {
+    score: f64,
+    at: Instant,
+}
+
+/// how far one answer moves a server's health: about the last ten answers count most
+const HEALTH_STEP: f64 = 0.1;
+/// where a server's health starts, and drifts back to
+const HEALTH_NEUTRAL: f64 = 0.5;
+/// how long it takes a server's health to drift most (63%) of the way back to neutral
+const HEALTH_DRIFT: Duration = Duration::from_secs(30 * 60);
+/// how much a server's poor health counts against it when a background body picks a server: a score of 0 counts as
+/// being this many times fully busy
+const HEALTH_WEIGHT: f64 = 1.0;
+
+impl Health {
+    fn new(now: Instant) -> Health {
+        Health { score: HEALTH_NEUTRAL, at: now }
+    }
+
+    fn now(&self, now: Instant) -> f64 {
+        let gone = now.saturating_duration_since(self.at).as_secs_f64() / HEALTH_DRIFT.as_secs_f64();
+        HEALTH_NEUTRAL + (self.score - HEALTH_NEUTRAL) * (-gone).exp()
+    }
+
+    fn record(&mut self, worked: bool, now: Instant) {
+        let score = self.now(now);
+        let toward = if worked { 1.0 } else { 0.0 };
+        self.score = score + (toward - score) * HEALTH_STEP;
+        self.at = now;
+    }
 }
 
 /// A body read for background work, see `Pool::background_body`.
@@ -1662,6 +1702,8 @@ pub struct ServerStat {
     pub headers: u64,
     pub wire_bytes: u64,
     pub text_bytes: u64,
+    /// how well it has served background bodies lately, 0 to 1 (see `Health`)
+    pub health: f64,
 }
 
 /// an article number and when it was posted (unix seconds)
@@ -1949,6 +1991,7 @@ impl Pool {
                         headers: AtomicU64::new(0),
                         wire: AtomicU64::new(0),
                         text: AtomicU64::new(0),
+                        health: Mutex::new(Health::new(Instant::now())),
                     })
                 })
                 .collect(),
@@ -2467,17 +2510,33 @@ impl Pool {
         read: BackgroundRead,
     ) -> Result<BackgroundBody> {
         let mut left = self.indexing_tier();
-        left.sort_by(|&a, &b| self.busy(a).total_cmp(&self.busy(b)));
+        left.sort_by(|&a, &b| self.background_rank(a).total_cmp(&self.background_rank(b)));
         let others: Vec<usize> = (0..self.servers.len()).filter(|i| !left.contains(i)).collect();
         left.extend(others);
+        // a fallback server is asked once every other one said it hasnt the article
+        let fallback = |i: usize| self.servers[i].cfg.is_fallback();
+        left.sort_by_key(|&i| fallback(i));
         if left.is_empty() {
             return Err(Self::no_servers());
         }
         let start = Instant::now();
         let mut unreachable = None;
+        // a fallback server that couldnt be asked: an error only when no other server could be either
+        let mut fallback_unreachable = None;
+        let mut answered = false;
         while !left.is_empty() {
             let mut no_room = Vec::new();
             for i in left.drain(..) {
+                // resting after a failure, a fallback server isnt waited for: it wouldnt be asked before the rest ends
+                if fallback(i) && self.is_down(i) {
+                    fallback_unreachable = Some(NntpError::Io(io::Error::new(
+                        io::ErrorKind::ConnectionRefused,
+                        format!("{} failed recently, skipping it", self.servers[i].cfg.host),
+                    )));
+                    continue;
+                }
+                // a server resting after a failure was counted then, not each time it's passed over
+                let resting = self.is_down(i);
                 let lease = if start.elapsed() >= self.body_patience {
                     self.lease(i, false).await.map(Some)
                 } else {
@@ -2490,7 +2549,14 @@ impl Pool {
                         continue;
                     }
                     Err(e) => {
-                        unreachable = Some(e);
+                        if !resting {
+                            self.served(i, false);
+                        }
+                        if fallback(i) {
+                            fallback_unreachable = Some(e)
+                        } else {
+                            unreachable = Some(e)
+                        }
                         continue;
                     }
                 };
@@ -2520,6 +2586,7 @@ impl Pool {
                 .await;
                 match r {
                     Ok((whole, Some(body))) => {
+                        self.served(i, true);
                         if whole {
                             lease.check::<()>(Ok(()))?;
                         }
@@ -2528,14 +2595,22 @@ impl Pool {
                         return Ok(BackgroundBody::Body(body));
                     }
                     // the rest is unread: the lease stays busy, soo the connection is thrown away
-                    Ok((_, None)) => return Ok(BackgroundBody::TooBig),
+                    Ok((_, None)) => {
+                        self.served(i, true);
+                        return Ok(BackgroundBody::TooBig);
+                    }
                     Err(e) => match lease.check::<()>(Err(e)) {
-                        // couldnt ask: if no server has it, it isnt Missing yet, and it's read again later
-                        Err(e) if e.failed_forwarding() => unreachable = Some(e),
+                        // couldnt ask, or anything else that says nothing about the article: if no server has it, it
+                        // isnt Missing yet, and it's read again later; unless only a fallback server couldnt be asked
+                        Err(e) if e.failed_forwarding() || !matches!(e, NntpError::Reply { code: 423 | 430, .. }) => {
+                            self.served(i, false);
+                            if fallback(i) { fallback_unreachable = Some(e) } else { unreachable = Some(e) }
+                        }
                         // this server doesnt have it
-                        Err(NntpError::Reply { code: 423 | 430, .. }) | Ok(()) => {}
-                        // anything else says nothing about the article
-                        Err(e) => unreachable = Some(e),
+                        Err(_) | Ok(()) => {
+                            self.served(i, true);
+                            answered = true;
+                        }
                     },
                 }
             }
@@ -2544,9 +2619,11 @@ impl Pool {
                 tokio::time::sleep(Duration::from_millis(250)).await;
             }
         }
-        match unreachable {
-            Some(e) => Err(e),
-            None => Ok(BackgroundBody::Missing),
+        match (unreachable, fallback_unreachable) {
+            (Some(e), _) => Err(e),
+            // only a fallback server couldnt be asked, and none other could either
+            (None, Some(e)) if !answered => Err(e),
+            _ => Ok(BackgroundBody::Missing),
         }
     }
 
@@ -3218,6 +3295,7 @@ impl Pool {
                     headers: s.headers.load(Ordering::Relaxed),
                     wire_bytes: s.wire.load(Ordering::Relaxed),
                     text_bytes: s.text.load(Ordering::Relaxed),
+                    health: self.health(i),
                 }
             })
             .collect()
@@ -3352,6 +3430,20 @@ impl Pool {
     }
 
     /// How busy server `i` is: requests on it and waiting for it, per connection.
+    /// a server's health now, see `Health`
+    pub fn health(&self, i: usize) -> f64 {
+        self.servers[i].health.lock().unwrap().now(Instant::now())
+    }
+
+    fn served(&self, i: usize, worked: bool) {
+        self.servers[i].health.lock().unwrap().record(worked, Instant::now());
+    }
+
+    /// what a background body picks its server by, lowest first: how busy it is, and how poorly it has served
+    fn background_rank(&self, i: usize) -> f64 {
+        self.busy(i) + (1.0 - self.health(i)) * HEALTH_WEIGHT
+    }
+
     fn busy(&self, i: usize) -> f64 {
         let s = &self.servers[i];
         let limit = s.limit.load(Ordering::Relaxed).max(1);
@@ -3947,6 +4039,28 @@ mod yenc_decode_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn health_rises_with_answers_falls_with_failures_and_drifts_back() {
+        let t0 = Instant::now();
+        let mut h = Health::new(t0);
+        assert_eq!(h.now(t0), HEALTH_NEUTRAL);
+        for _ in 0..20 {
+            h.record(true, t0);
+        }
+        assert!(h.now(t0) > 0.9, "{}", h.now(t0));
+        for _ in 0..20 {
+            h.record(false, t0);
+        }
+        assert!(h.now(t0) < 0.15, "{}", h.now(t0));
+        // left alone for hours, it's about neutral again
+        let later = t0 + HEALTH_DRIFT * 6;
+        assert!((h.now(later) - HEALTH_NEUTRAL).abs() < 0.01, "{}", h.now(later));
+        // one answer moves it a tenth of the way
+        let mut h = Health::new(t0);
+        h.record(false, t0);
+        assert!((h.now(t0) - 0.45).abs() < 1e-9);
+    }
+
     #[test]
     fn a_failure_that_may_pass_beats_an_absent_article() {
         let reply = |code, message: &str| NntpError::Reply { code, message: message.into() };

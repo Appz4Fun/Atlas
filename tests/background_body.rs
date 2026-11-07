@@ -218,3 +218,74 @@ fn a_server_in_trouble_is_an_error_not_missing() {
     let pool = Pool::new(&[mock(port, "secret", 2, 1)]);
     assert!(rt.block_on(pool.background_body("<msg1@mock>", MIB)).is_err());
 }
+
+/// a port nothing listens on
+fn dead_port() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.local_addr().unwrap().port()
+}
+
+fn without_bodies() -> u16 {
+    let mut state = Server::new(vec![post(1, r#""a.bin" yEnc (1/1)"#, 10, vec![])]);
+    Arc::get_mut(&mut state).unwrap().bodies = false;
+    spawn_server(state)
+}
+
+/// A fallback server that can't be reached doesn't keep an article the others don't have from being missing, neither
+/// the first time nor while it rests; alone, it's still an error.
+#[test]
+fn a_fallback_server_that_cant_be_reached_leaves_an_article_missing() {
+    let rt = runtime();
+    let (port, dead) = (without_bodies(), dead_port());
+    let mut fallback = mock(dead, "secret", 2, 1);
+    fallback.fallback = Some(true);
+    let pool = Pool::new(&[fallback.clone(), mock(port, "secret", 2, 2)]);
+    for _ in 0..2 {
+        let start = std::time::Instant::now();
+        assert_eq!(rt.block_on(pool.background_body("<msg1@mock>", MIB)).unwrap(), BackgroundBody::Missing);
+        assert!(start.elapsed() < Duration::from_secs(5), "not waited for: {:?}", start.elapsed());
+    }
+    let alone = Pool::new(&[fallback]);
+    assert!(rt.block_on(alone.background_body("<msg1@mock>", MIB)).is_err());
+}
+
+/// A fallback server is asked after every other one, whatever its priority or how idle it is.
+#[test]
+fn a_fallback_server_is_asked_last() {
+    let rt = runtime();
+    let servers: Vec<Arc<Server>> =
+        (0..2).map(|_| Server::new(vec![post(1, r#""a.bin" yEnc (1/1)"#, 10, vec![b"hello".to_vec()])])).collect();
+    let ports: Vec<u16> = servers.iter().map(|s| spawn_server(s.clone())).collect();
+    let mut fallback = mock(ports[0], "secret", 2, 1);
+    fallback.fallback = Some(true);
+    let pool = Pool::new(&[fallback, mock(ports[1], "secret", 2, 2)]);
+    for _ in 0..3 {
+        assert!(matches!(rt.block_on(pool.background_body("<msg1@mock>", MIB)).unwrap(), BackgroundBody::Body(_)));
+    }
+    assert_eq!(servers[0].bodies_sent.load(Ordering::SeqCst), 0);
+    assert_eq!(servers[1].bodies_sent.load(Ordering::SeqCst), 3);
+}
+
+/// A server that times out loses health and is asked after a healthy one the next time; one that answers gains it.
+#[test]
+fn a_server_that_times_out_is_asked_after_a_healthy_one() {
+    let rt = runtime();
+    let servers: Vec<Arc<Server>> = (0..2)
+        .map(|i| {
+            let mut s = Server::new(vec![post(1, r#""a.bin" yEnc (1/1)"#, 10, vec![b"hello".to_vec()])]);
+            if i == 0 {
+                Arc::get_mut(&mut s).unwrap().body_delay = Duration::from_millis(1500);
+            }
+            s
+        })
+        .collect();
+    let ports: Vec<u16> = servers.iter().map(|s| spawn_server(s.clone())).collect();
+    let pool = Pool::new(&[mock(ports[0], "secret", 2, 1), mock(ports[1], "secret", 2, 1)])
+        .with_deadlines(Duration::from_secs(5), Duration::from_millis(200));
+    assert!(matches!(rt.block_on(pool.background_body("<msg1@mock>", MIB)).unwrap(), BackgroundBody::Body(_)));
+    assert!(pool.health(0) < 0.5 && pool.health(1) > 0.5, "{} {}", pool.health(0), pool.health(1));
+    let start = std::time::Instant::now();
+    assert!(matches!(rt.block_on(pool.background_body("<msg1@mock>", MIB)).unwrap(), BackgroundBody::Body(_)));
+    assert!(start.elapsed() < Duration::from_millis(150), "the slow one wasnt asked first: {:?}", start.elapsed());
+    assert_eq!(servers[1].bodies_sent.load(Ordering::SeqCst), 2);
+}
