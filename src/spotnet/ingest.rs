@@ -15,7 +15,7 @@ use crate::indexer::{Db, on_db};
 use crate::nntp::{Pool, says_absent};
 
 use super::store::{self, SAVED, SKIPPED, Settled, SpotRow};
-use super::{MAX_XML_BYTES, SPOT_GROUP, binary, full, header, release};
+use super::{MAX_XML_BYTES, SPOT_GROUP, binary, comments, full, header, release};
 
 /// Overview lines asked for in one XOVER.
 const XOVER_STEP: u64 = 5_000;
@@ -101,7 +101,17 @@ pub async fn pass(pool: &Arc<Pool>, db: &Db, config: &SpotsConfig, stopping: &im
     }
 
     let now = chrono::Utc::now().timestamp();
-    on_db(db, move |conn| Ok(store::prune(conn, now)?)).await?;
+    on_db(db, move |conn| Ok(store::prune(conn, now)? + comments::prune(conn)?)).await?;
+    if config.comments {
+        match said(pool, db, config, stopping).await {
+            Ok(s) if s != Said::default() => println!(
+                "spots: {} new comments, {} new spam reports, read {} comments' text ({} gone, {} to retry)",
+                s.comments, s.reports, s.read, s.gone, s.retry
+            ),
+            Ok(_) => {}
+            Err(e) => eprintln!("spots: comments: {e:#}"),
+        }
+    }
     match backfill_xml(pool, db, stopping).await {
         Ok(0) => {}
         Ok(n) => println!("spots: read the XML of {n} spots saved before it was kept"),
@@ -410,6 +420,136 @@ async fn fetch(
         println!("spots: saved \"{title}\" as release {id}");
     }
     Ok(Some(settled(id)))
+}
+
+/// What one pass read of what's said about spots, for the log.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Said {
+    comments: usize,
+    reports: usize,
+    read: usize,
+    gone: usize,
+    retry: usize,
+}
+
+/// The comments and spam reports posted since the last pass on the spots kept, then up to `comments_per_pass`
+/// comments' text (a BODY each, a few hundred bytes).
+async fn said(pool: &Arc<Pool>, db: &Db, config: &SpotsConfig, stopping: &impl Fn() -> bool) -> Result<Said> {
+    let mut done = Said::default();
+    let known = Arc::new(on_db(db, |conn| Ok(comments::known_spots(conn)?)).await?);
+    if known.is_empty() {
+        return Ok(done);
+    }
+    done.comments = read_group(pool, db, comments::COMMENT_GROUP, false, config.comment_days, &known, stopping).await?;
+    done.reports = read_group(pool, db, comments::REPORT_GROUP, true, config.comment_days, &known, stopping).await?;
+
+    let limit = config.comments_per_pass;
+    let todo = on_db(db, move |conn| Ok(comments::todo(conn, limit)?)).await?;
+    let slots = Arc::new(tokio::sync::Semaphore::new(config.concurrency));
+    let mut tasks = tokio::task::JoinSet::new();
+    let tally =
+        |done: &mut Said, joined: std::result::Result<Result<Option<bool>>, tokio::task::JoinError>| match joined
+            .map_err(|e| anyhow!("comment task failed: {e}"))
+            .and_then(|r| r)
+        {
+            Ok(Some(true)) => done.read += 1,
+            Ok(Some(false)) => done.gone += 1,
+            Ok(None) => done.retry += 1,
+            Err(e) => {
+                eprintln!("spots: comments: {e:#}");
+                done.retry += 1;
+            }
+        };
+    for message_id in todo {
+        if stopping() {
+            break;
+        }
+        let slot = slots.clone().acquire_owned().await.expect("the pass's semaphore is never closed");
+        let (pool, db) = (pool.clone(), db.clone());
+        tasks.spawn(async move {
+            let _slot = slot;
+            let id = format!("<{message_id}>");
+            let outcome = match timed("spots.comment", pool.fetch_body_capped(&id, comments::MAX_BODY * 4)).await {
+                Ok(Some(raw)) => Some(Some(comments::body_text(&raw))),
+                // too big to be a comment
+                Ok(None) => Some(None),
+                Err(e) if says_absent(&e) => Some(None),
+                Err(e) => {
+                    eprintln!("spots: comment {message_id}: {e:#}");
+                    None
+                }
+            };
+            let state = outcome.as_ref().map(Option::is_some);
+            on_db(&db, move |conn| Ok(comments::settle(conn, &message_id, outcome.as_ref().map(|o| o.as_deref()))?))
+                .await?;
+            Ok(state)
+        });
+        while let Some(joined) = tasks.try_join_next() {
+            tally(&mut done, joined);
+        }
+    }
+    while let Some(joined) = tasks.join_next().await {
+        tally(&mut done, joined);
+    }
+    Ok(done)
+}
+
+/// Reads `group`'s overview since its cursor (`days` back on the first pass) and notes the comments, or with
+/// `reports` the spam reports, on the spots in `known`. Returns how many were new.
+async fn read_group(
+    pool: &Arc<Pool>,
+    db: &Db,
+    group: &'static str,
+    reports: bool,
+    days: u32,
+    known: &Arc<std::collections::HashSet<String>>,
+    stopping: &impl Fn() -> bool,
+) -> Result<usize> {
+    let prefer = pool.indexing_tier().first().copied().unwrap_or(0);
+    let (server, (_, low, high, _)) = pool.select_group_on(prefer, group).await?;
+    let host = pool.host(server);
+    let key = host.clone();
+    let cursor = on_db(db, move |conn| Ok(comments::cursor(conn, group, &key)?)).await?;
+    let mut from = match cursor {
+        Some(c) if c <= high => c + 1,
+        // the first pass, or the server renumbered: from `days` ago
+        _ => {
+            let when = chrono::Utc::now().timestamp() - i64::from(days) * 86_400;
+            pool.article_at(server, group, low.max(1), high, when).await?
+        }
+    };
+    let mut added = 0;
+    while from <= high && !stopping() {
+        let to = high.min(from + XOVER_STEP - 1);
+        let rows = match pool.xover_on(server, group, from, to).await {
+            Ok(rows) => rows,
+            Err(e) if e.is_empty_range() => Vec::new(),
+            Err(e) => return Err(e.into()),
+        };
+        let now = chrono::Utc::now().timestamp();
+        let found: Vec<comments::Noted> = rows
+            .iter()
+            .filter_map(|r| {
+                let (spot, rating) = if reports {
+                    (comments::report_ref(&r.subject, &r.references)?, 0)
+                } else {
+                    comments::comment_ref(&r.message_id)?
+                };
+                known.contains(&spot).then(|| comments::Noted {
+                    message_id: r.message_id.trim().trim_matches(['<', '>']).to_string(),
+                    spot,
+                    at: crate::dates::posted_timestamp(&r.date).unwrap_or(now),
+                    rating,
+                    poster: comments::poster_name(&r.from),
+                    spotter_id: header::spotter_id_of_from(&r.from),
+                })
+            })
+            .collect();
+        let key = host.clone();
+        added += on_db(db, move |conn| Ok(comments::note_read(conn, group, &key, to, &found, reports)?)).await?;
+        from = to + 1;
+    }
+    Ok(added)
 }
 
 /// Reads again the XML of up to `XML_BACKFILL` spots saved before it was kept, so their release pages get the

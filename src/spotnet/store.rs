@@ -50,7 +50,8 @@ pub fn create_main(conn: &Connection) -> Result<()> {
         create index if not exists spots_seen_todo on spots_seen(state, number);
         create index if not exists spots_seen_ref on spots_seen(nzb_ref) where nzb_ref is not null;
         create index if not exists spots_seen_key on spots_seen(nzb_key) where nzb_key is not null;",
-    )
+    )?;
+    super::comments::create(conn)
 }
 
 /// The spot a release came from, in its shard: made on open, gone with its release, carried by compaction and

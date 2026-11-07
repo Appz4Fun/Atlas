@@ -601,6 +601,10 @@ Spotnet "spots" are signed posts in `free.pt` that describe a release (title, ca
 
 The spot itself goes in each shard's `spots` table: its message-id, kind (movie or series), title, poster, tag, spotter id, Spotnet categories, IMDb id and an NZB key. The main database keeps what the ingest has seen (`spots_seen`) and how far it has read (`meta.spots_cursor:<server>`). Half of each pass goes to the oldest spots waiting and the rest to spotters in turn, newest first. A release with the spot's title is joined only when it holds the same articles, otherwise the spot is saved under its own name. A spot still waiting after 30 days is given up on. It reads Usenet only: no Spotweb install or database is needed. About 75 spots a day pass the filter, which comes to a HEAD and one or two small BODYs each.
 
+The row also keeps the spot's XML whole, so the release page can show everything the spot says, the way Spotweb's spot page does: type, format, source, language and genre by name, when it was posted, size, sender and spotter id, tag, website, IMDb link, cover image, newsreader and the full description. A password the poster wrote in the description shows as written. Atlas never guesses or checks passwords.
+
+With `comments` on, each pass also reads the comments in `free.usenet` and the spam reports in `free.willey` on the spots it keeps. A comment's message-id starts with its spot's and may carry a 1 to 10 rating. A report names its spot in its subject. Both go in the main database (`spot_comments`, `spot_reports`), with a cursor per group and server. A comment's text is one small BODY, read once. The first pass reads `comment_days` back. `free.usenet` gets about 2,000 comments a day across all spots, so 90 days is about 140,000 overview lines, read once. The release page lists the comments oldest first, with who wrote each, when, and its rating. It also shows the mean rating and the number of spam reports.
+
 ```toml
 [spots]
 enabled = true
@@ -612,7 +616,10 @@ enabled = true
 | `poll_minutes` | `15` | Minutes between passes. |
 | `first_articles` | `20000` | How far back the first pass reads, in `free.pt` articles. That group gets about 340 a day, so the default covers about two months. |
 | `per_pass` | `200` | Spots fetched whole in one pass at most. The rest wait for the next pass, newest first. |
-| `concurrency` | `16` | Spots fetched at once. Each request queues for a connection behind indexing, so on a busy indexer one at a time takes minutes a spot. |
+| `concurrency` | `16` | Spots fetched at once, and comments read at once. Each request queues for a connection behind indexing, so on a busy indexer one at a time takes minutes a spot. |
+| `comments` | `true` | Read the comments and spam reports on the spots kept. |
+| `comment_days` | `90` | How far back the first pass reads comments and reports, in days. |
+| `comments_per_pass` | `2000` | Comments whose text is read in one pass at most. The rest wait for the next pass, those on saved spots first, newest first. |
 
 ### Purging and reprocessing
 

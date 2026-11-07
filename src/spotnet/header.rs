@@ -125,6 +125,12 @@ pub fn subcats(list: &str) -> Subcats {
 pub fn spotter_id_of_head(head: &[u8]) -> Option<String> {
     let text = String::from_utf8_lossy(head);
     let from = text.lines().find_map(|l| l.get(..5).filter(|p| p.eq_ignore_ascii_case("from:")).map(|_| &l[5..]))?;
+    spotter_id_of_from(from)
+}
+
+/// The spotter id a Spotnet `From` value carries: its address is the poster's public key, `.`, the signature.
+/// Comments are posted the same way as spots.
+pub fn spotter_id_of_from(from: &str) -> Option<String> {
     let address = &from[from.find('<')? + 1..];
     let local = &address[..address.find('@')?];
     spotter_id(local.split('.').next()?)

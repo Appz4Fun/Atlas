@@ -533,13 +533,28 @@ pub struct SpotsConfig {
     pub first_articles: u64,
     /// spots fetched whole in one pass at most; the rest wait for the next
     pub per_pass: usize,
-    /// spots fetched at once
+    /// spots fetched at once, and comments read at once
     pub concurrency: usize,
+    /// read the comments (`free.usenet`) and spam reports (`free.willey`) on the spots kept
+    pub comments: bool,
+    /// how far back the first pass reads comments and reports, in days
+    pub comment_days: u32,
+    /// comments whose text is read in one pass at most; the rest wait for the next
+    pub comments_per_pass: usize,
 }
 
 impl Default for SpotsConfig {
     fn default() -> Self {
-        SpotsConfig { enabled: true, poll_minutes: 15, first_articles: 20_000, per_pass: 200, concurrency: 16 }
+        SpotsConfig {
+            enabled: true,
+            poll_minutes: 15,
+            first_articles: 20_000,
+            per_pass: 200,
+            concurrency: 16,
+            comments: true,
+            comment_days: 90,
+            comments_per_pass: 2_000,
+        }
     }
 }
 
@@ -562,6 +577,15 @@ impl SpotsConfig {
         }
         if let Some(n) = int("concurrency", 1, 64) {
             c.concurrency = n as usize;
+        }
+        if let Some(b) = v.get("comments").and_then(as_bool) {
+            c.comments = b;
+        }
+        if let Some(n) = int("comment_days", 1, 3_650) {
+            c.comment_days = n as u32;
+        }
+        if let Some(n) = int("comments_per_pass", 1, 100_000) {
+            c.comments_per_pass = n as usize;
         }
         c
     }
@@ -1638,12 +1662,22 @@ mod tests {
     fn spots_keys_parse() {
         assert_eq!(Config::from_value(&json!({})).spots, SpotsConfig::default());
         let c = Config::from_value(
-            &json!({"spots": {"enabled": false, "poll_minutes": 0, "first_articles": 500, "per_pass": 20, "concurrency": 99}}),
+            &json!({"spots": {"enabled": false, "poll_minutes": 0, "first_articles": 500, "per_pass": 20, "concurrency": 99,
+                "comments": false, "comment_days": 0, "comments_per_pass": 50}}),
         )
         .spots;
         assert_eq!(
             c,
-            SpotsConfig { enabled: false, poll_minutes: 1, first_articles: 500, per_pass: 20, concurrency: 64 }
+            SpotsConfig {
+                enabled: false,
+                poll_minutes: 1,
+                first_articles: 500,
+                per_pass: 20,
+                concurrency: 64,
+                comments: false,
+                comment_days: 1,
+                comments_per_pass: 50,
+            }
         );
         assert_eq!(Config::from_value(&json!({"spots": "no"})).spots, SpotsConfig::default());
     }
