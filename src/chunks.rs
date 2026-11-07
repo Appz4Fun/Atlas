@@ -84,12 +84,17 @@ pub fn create(conn: &Connection) -> Result<()> {
 
 /// Give `table` the INTEGER column `column` if a table made before it lacks it.
 fn add_column(conn: &Connection, table: &str, column: &str) -> Result<()> {
+    add_column_as(conn, table, column, "INTEGER")
+}
+
+/// Adds `column` of `kind` to `table` when it's missing.
+pub(crate) fn add_column_as(conn: &Connection, table: &str, column: &str, kind: &str) -> Result<()> {
     let has =
         || conn.prepare(&format!("select 1 from pragma_table_info('{table}') where name = '{column}'"))?.exists([]);
     if has()? {
         return Ok(());
     }
-    match conn.execute_batch(&format!("alter table {table} add column {column} INTEGER")) {
+    match conn.execute_batch(&format!("alter table {table} add column {column} {kind}")) {
         // the indexer and the menu can both add it at once
         Err(_) if has()? => Ok(()),
         r => r,

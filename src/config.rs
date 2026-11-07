@@ -545,11 +545,11 @@ pub struct SpotsConfig {
     pub first_articles: u64,
     /// spots fetched whole in one pass at most; the rest wait for the next
     pub per_pass: usize,
-    /// spots fetched at once, and comments read at once
+    /// spots fetched at once; comments' texts are read at a quarter of it
     pub concurrency: usize,
     /// read the comments (`free.usenet`) and spam reports (`free.willey`) on the spots kept
     pub comments: bool,
-    /// how far back the first pass reads comments and reports, in days
+    /// how far back the first pass reads comments and reports, in days: about as far as `first_articles` reads spots
     pub comment_days: u32,
     /// comments whose text is read in one pass at most; the rest wait for the next
     pub comments_per_pass: usize,
@@ -564,7 +564,7 @@ impl Default for SpotsConfig {
             per_pass: 200,
             concurrency: 16,
             comments: true,
-            comment_days: 90,
+            comment_days: 60,
             comments_per_pass: 2_000,
         }
     }

@@ -2,6 +2,9 @@
 //! then each of those whole (HEAD for its XML, BODY for its NZB in `alt.binaries.ftd`), saved as a release and
 //! tagged with its spot. About 75 spots a day pass the filter. Spots are fetched `concurrency` at a time: each
 //! request queues for a connection behind indexing, so one at a time was minutes a spot on a busy indexer.
+//!
+//! Comments and spam reports on the spots kept (`comments`) are read by a task of their own, `run_comments`:
+//! with a backlog of spots a spot pass takes an hour, and comments read after it waited that long.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -47,13 +50,12 @@ pub struct Pass {
     pub pending: usize,
 }
 
-/// Runs passes until `stopping`.
+/// Runs spot passes until `stopping`.
 pub async fn run(pool: Arc<Pool>, db: Db, config: SpotsConfig, stopping: impl Fn() -> bool + Send + 'static) {
     if let Err(e) = on_db(&db, |conn| Ok(store::create_main(conn)?)).await {
         eprintln!("spots: {e:#}");
         return;
     }
-    let every = Duration::from_secs(u64::from(config.poll_minutes) * 60);
     while !stopping() {
         match pass(&pool, &db, &config, &stopping).await {
             Ok(p) if p.noted + p.saved + p.skipped + p.retry + p.pending > 0 => println!(
@@ -63,56 +65,50 @@ pub async fn run(pool: Arc<Pool>, db: Db, config: SpotsConfig, stopping: impl Fn
             Ok(_) => {}
             Err(e) => eprintln!("spots: {e:#}"),
         }
-        // after the pass's spots: what's said about them can wait, new releases' tags shouldn't
-        if config.comments && !stopping() {
-            match said(&pool, &db, &config, &stopping).await {
-                Ok(s) if s != Said::default() => println!(
-                    "spots: {} new comments, {} new spam reports, read {} comments' text ({} gone, {} to retry)",
-                    s.comments, s.reports, s.read, s.gone, s.retry
-                ),
-                Ok(_) => {}
-                Err(e) => eprintln!("spots: comments: {e:#}"),
+        crate::bg_indexer::nap(poll(&config), &stopping).await;
+    }
+}
+
+/// Runs comment passes until `stopping`, beside the spots' (`run`) and never behind them.
+/// Its tables are made with the main database's (`store::create_main`).
+pub async fn run_comments(pool: Arc<Pool>, db: Db, config: SpotsConfig, stopping: impl Fn() -> bool + Send + 'static) {
+    while !stopping() {
+        let more = match said(&pool, &db, &config, &stopping).await {
+            Ok(s) => {
+                if s != Said::default() {
+                    println!(
+                        "spots: {} new comments, {} new spam reports, read {} comments' text ({} gone, {} to retry)",
+                        s.comments, s.reports, s.read, s.gone, s.retry
+                    );
+                }
+                s.more
             }
-        }
-        let started = std::time::Instant::now();
-        while !stopping() && started.elapsed() < every {
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            Err(e) => {
+                eprintln!("spots: comments: {e:#}");
+                false
+            }
+        };
+        if !more {
+            crate::bg_indexer::nap(poll(&config), &stopping).await;
         }
     }
+}
+
+/// The time between passes.
+fn poll(config: &SpotsConfig) -> Duration {
+    Duration::from_secs(u64::from(config.poll_minutes) * 60)
 }
 
 /// One pass: the overview since the cursor, then up to `per_pass` spots fetched whole.
 pub async fn pass(pool: &Arc<Pool>, db: &Db, config: &SpotsConfig, stopping: &impl Fn() -> bool) -> Result<Pass> {
     let mut done = Pass::default();
-    let prefer = pool.indexing_tier().first().copied().unwrap_or(0);
-    let (server, (_, low, high, _)) = pool.select_group_on(prefer, SPOT_GROUP).await?;
-    let host = pool.host(server);
-    let key = host.clone();
-    let cursor = on_db(db, move |conn| Ok(store::cursor(conn, &key)?)).await?;
-    let mut from = start_at(cursor, low, high, config.first_articles);
-    while from <= high && !stopping() {
-        let to = high.min(from + XOVER_STEP - 1);
-        let rows = match pool.xover_on(server, SPOT_GROUP, from, to).await {
-            Ok(rows) => rows,
-            Err(e) if e.is_empty_range() => Vec::new(),
-            Err(e) => return Err(e.into()),
-        };
-        done.read += rows.len() as u64;
-        let wanted: Vec<store::Noted> = rows
-            .iter()
-            .filter_map(|r| {
-                let h = header::parse(&r.subject, &r.from).filter(header::SpotHeader::wanted)?;
-                Some((r.message_id.trim_matches(['<', '>']).to_string(), r.number, h.spotter_id()))
-            })
-            .collect();
-        let key = host.clone();
-        let now = chrono::Utc::now().timestamp();
-        done.noted += on_db(db, move |conn| Ok(store::note_read(conn, &key, to, &wanted, now)?)).await?;
-        from = to + 1;
-    }
+    (done.read, done.noted) = read_overview(pool, db, config, stopping).await?;
 
     let now = chrono::Utc::now().timestamp();
-    on_db(db, move |conn| Ok(store::prune(conn, now)? + comments::prune(conn)?)).await?;
+    // the comment task prunes its own tables when it runs
+    let comments_off = !config.comments;
+    on_db(db, move |conn| Ok(store::prune(conn, now)? + if comments_off { comments::prune(conn, now)? } else { 0 }))
+        .await?;
     match backfill_xml(pool, db, stopping).await {
         Ok(0) => {}
         Ok(n) => println!("spots: read the XML of {n} spots saved before it was kept"),
@@ -423,6 +419,44 @@ async fn fetch(
     Ok(Some(settled(id)))
 }
 
+/// Reads the `free.pt` overview since its cursor and notes the spots worth fetching. Returns the overview lines read
+/// and the spots noted.
+async fn read_overview(
+    pool: &Arc<Pool>,
+    db: &Db,
+    config: &SpotsConfig,
+    stopping: &impl Fn() -> bool,
+) -> Result<(u64, usize)> {
+    let (mut read, mut noted) = (0, 0);
+    let prefer = pool.indexing_tier().first().copied().unwrap_or(0);
+    let (server, (_, low, high, _)) = pool.select_group_on(prefer, SPOT_GROUP).await?;
+    let host = pool.host(server);
+    let key = host.clone();
+    let cursor = on_db(db, move |conn| Ok(store::cursor(conn, &key)?)).await?;
+    let mut from = start_at(cursor, low, high, config.first_articles);
+    while from <= high && !stopping() {
+        let to = high.min(from + XOVER_STEP - 1);
+        let rows = match pool.xover_on(server, SPOT_GROUP, from, to).await {
+            Ok(rows) => rows,
+            Err(e) if e.is_empty_range() => Vec::new(),
+            Err(e) => return Err(e.into()),
+        };
+        read += rows.len() as u64;
+        let wanted: Vec<store::Noted> = rows
+            .iter()
+            .filter_map(|r| {
+                let h = header::parse(&r.subject, &r.from).filter(header::SpotHeader::wanted)?;
+                Some((r.message_id.trim_matches(['<', '>']).to_string(), r.number, h.spotter_id()))
+            })
+            .collect();
+        let key = host.clone();
+        let now = chrono::Utc::now().timestamp();
+        noted += on_db(db, move |conn| Ok(store::note_read(conn, &key, to, &wanted, now)?)).await?;
+        from = to + 1;
+    }
+    Ok((read, noted))
+}
+
 /// What one pass read of what's said about spots, for the log.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Said {
@@ -431,19 +465,22 @@ struct Said {
     read: usize,
     gone: usize,
     retry: usize,
+    /// the texts stopped at the pass's time, with more waiting: the next pass comes without a nap
+    more: bool,
 }
 
-/// The comments and spam reports posted since the last pass on the spots kept, then up to `comments_per_pass`
-/// comments' text (a BODY each, a few hundred bytes). A group that can't be read is logged and skipped, and the
-/// texts are read whatever came of the groups. The first failed read ends the texts for this pass.
+/// The comments and spam reports posted since the last pass, then up to `comments_per_pass` texts of comments on
+/// kept spots (a BODY each, a few hundred bytes), for a poll at most. A group that can't be read is logged and
+/// skipped, and the texts are read whatever came of the groups. The first failed read ends the texts for this pass.
 async fn said(pool: &Arc<Pool>, db: &Db, config: &SpotsConfig, stopping: &impl Fn() -> bool) -> Result<Said> {
     let mut done = Said::default();
-    let known = Arc::new(on_db(db, |conn| Ok(comments::known_spots(conn)?)).await?);
-    if known.is_empty() {
-        return Ok(done);
+    // these tables are this task's to prune; a failed prune doesn't hold up the rest
+    let now = chrono::Utc::now().timestamp();
+    if let Err(e) = on_db(db, move |conn| Ok(comments::prune(conn, now)?)).await {
+        eprintln!("spots: comments: prune: {e:#}");
     }
     for (group, reports) in [(comments::COMMENT_GROUP, false), (comments::REPORT_GROUP, true)] {
-        match read_group(pool, db, group, reports, config.comment_days, &known, stopping).await {
+        match read_group(pool, db, group, reports, config.comment_days, stopping).await {
             Ok(n) if reports => done.reports = n,
             Ok(n) => done.comments = n,
             Err(e) => eprintln!("spots: {group}: {e:#}"),
@@ -453,11 +490,18 @@ async fn said(pool: &Arc<Pool>, db: &Db, config: &SpotsConfig, stopping: &impl F
     let limit = config.comments_per_pass;
     let todo = on_db(db, move |conn| Ok(comments::todo(conn, limit)?)).await?;
     let failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let slots = Arc::new(tokio::sync::Semaphore::new(config.concurrency));
+    // a quarter of the spots' share: texts can wait, spots' saves shouldn't
+    let slots = Arc::new(tokio::sync::Semaphore::new((config.concurrency / 4).max(1)));
     let mut tasks = tokio::task::JoinSet::new();
     let mut outcomes: Vec<(String, comments::Outcome)> = Vec::new();
+    // no longer than a poll: the groups are read again at the next pass, whatever texts are left
+    let started = std::time::Instant::now();
     for message_id in todo {
         if stopping() || failed.load(Ordering::Relaxed) {
+            break;
+        }
+        if started.elapsed() >= poll(config) {
+            done.more = true;
             break;
         }
         let slot = slots.clone().acquire_owned().await.expect("the pass's semaphore is never closed");
@@ -510,15 +554,15 @@ async fn settle_comments(db: &Db, outcomes: Vec<(String, comments::Outcome)>, do
     on_db(db, move |conn| Ok(comments::settle(conn, &outcomes)?)).await
 }
 
-/// Reads `group`'s overview since its cursor (`days` back on the first pass) and notes the comments, or with
-/// `reports` the spam reports, on the spots in `known`. Returns how many were new.
+/// Reads `group`'s overview since its cursor (`days` back on the first pass) and notes every comment, or with
+/// `reports` every spam report, on any spot: whether its spot is kept is settled later (`comments::todo`,
+/// `comments::prune`). Returns how many were new.
 async fn read_group(
     pool: &Arc<Pool>,
     db: &Db,
     group: &'static str,
     reports: bool,
     days: u32,
-    known: &Arc<std::collections::HashSet<String>>,
     stopping: &impl Fn() -> bool,
 ) -> Result<usize> {
     let prefer = pool.indexing_tier().first().copied().unwrap_or(0);
@@ -531,7 +575,19 @@ async fn read_group(
         // the first pass, or the server renumbered: from `days` ago
         _ => {
             let when = chrono::Utc::now().timestamp() - i64::from(days) * 86_400;
-            pool.article_at(server, group, low.max(1), high, when).await?
+            let from = pool.article_at(server, group, low.max(1), high, when).await?;
+            println!(
+                "spots: reading {group} on {host} from article {from} ({days} days back), {} to go",
+                (high + 1).saturating_sub(from)
+            );
+            if from > high {
+                // nothing that recent: the cursor still goes to the end, so the next pass doesn't search again
+                let key = host.clone();
+                let now = chrono::Utc::now().timestamp();
+                on_db(db, move |conn| Ok(comments::note_read(conn, group, &key, high, &[], reports, now)?)).await?;
+                return Ok(0);
+            }
+            from
         }
     };
     let mut added = 0;
@@ -551,7 +607,7 @@ async fn read_group(
                 } else {
                     comments::comment_ref(&r.message_id)?
                 };
-                known.contains(&spot).then(|| comments::Noted {
+                Some(comments::Noted {
                     message_id: r.message_id.trim().trim_matches(['<', '>']).to_string(),
                     spot,
                     at: crate::dates::posted_timestamp(&r.date).unwrap_or(now),
@@ -562,7 +618,7 @@ async fn read_group(
             })
             .collect();
         let key = host.clone();
-        added += on_db(db, move |conn| Ok(comments::note_read(conn, group, &key, to, &found, reports)?)).await?;
+        added += on_db(db, move |conn| Ok(comments::note_read(conn, group, &key, to, &found, reports, now)?)).await?;
         from = to + 1;
     }
     Ok(added)
