@@ -154,9 +154,13 @@ impl BodyFetcher {
         };
         // the run's deadline holds for the whole read: a slow server's timeouts are per read
         let span = crate::metrics::span("stage.fetch_body");
+        let asked = Instant::now();
+        // when a fetch slot came: past the deadline, whether it was waited for or the servers took the time
+        let mut slot_at = None;
         let fetched = self.handle.block_on(unless_stopped(&self.stop, async {
             tokio::time::timeout(left, async {
                 let _permit = self.in_flight.acquire().await.expect("semaphore closed");
+                slot_at = Some(Instant::now());
                 self.pool.background_read(&request.message_id, max_bytes, read).await
             })
             .await
@@ -166,7 +170,7 @@ impl BodyFetcher {
         }
         drop(span);
         let fetched = match fetched {
-            Some(Err(_elapsed)) => return Err(StepError::Transient("a body took past the run's deadline".into())),
+            Some(Err(_elapsed)) => return Err(StepError::Transient(past_deadline(*used, asked, slot_at))),
             Some(Ok(result)) => Some(result),
             None => None,
         };
@@ -185,9 +189,30 @@ impl BodyFetcher {
     }
 }
 
+/// A body past the run's deadline: which of the run's bodies it was, and its time waiting for a fetch slot and at the
+/// servers (a lease, then the read), soo a run of many bodies is told from one starved of slots or connections.
+fn past_deadline(body: i64, asked: Instant, slot_at: Option<Instant>) -> String {
+    let now = Instant::now();
+    let slot = slot_at.unwrap_or(now).saturating_duration_since(asked).as_secs();
+    let servers = slot_at.map_or(0, |at| now.saturating_duration_since(at).as_secs());
+    format!(
+        "a body took past the run's deadline: body {body} of the run, {slot} s waiting for a fetch slot, {servers} s at the servers"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_body_past_the_deadline_says_where_its_time_went() {
+        let asked = Instant::now() - Duration::from_secs(50);
+        let waited = past_deadline(7, asked, Some(asked + Duration::from_secs(30)));
+        assert!(waited.starts_with("a body took past the run's deadline: body 7 of the run, 30 s waiting"), "{waited}");
+        assert!(waited.ends_with(", 20 s at the servers"), "{waited}");
+        let starved = past_deadline(1, asked, None);
+        assert!(starved.ends_with("body 1 of the run, 50 s waiting for a fetch slot, 0 s at the servers"), "{starved}");
+    }
 
     #[test]
     fn a_bucket_refills_by_the_clock() {

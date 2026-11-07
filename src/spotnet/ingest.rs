@@ -15,7 +15,7 @@ use crate::indexer::{Db, on_db};
 use crate::nntp::{Pool, says_absent};
 
 use super::store::{self, SAVED, SKIPPED, Settled, SpotRow};
-use super::{MAX_XML_BYTES, SPOT_GROUP, binary, full, header, release};
+use super::{MAX_XML_BYTES, SPOT_GROUP, binary, comments, full, header, release};
 
 /// Overview lines asked for in one XOVER.
 const XOVER_STEP: u64 = 5_000;
@@ -32,6 +32,8 @@ const CAP_OVERSHOOT: usize = 64 * 1024;
 const DECODING: usize = 4;
 /// NZB article bytes one pass reads at most; the spots left wait for the next pass.
 const MAX_PASS_POSTED: usize = 256 * 1024 * 1024;
+/// Spots saved before their XML was kept, read again per pass (a HEAD each, a few KB).
+const XML_BACKFILL: usize = 50;
 
 /// What one pass did, for the log.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -60,6 +62,17 @@ pub async fn run(pool: Arc<Pool>, db: Db, config: SpotsConfig, stopping: impl Fn
             ),
             Ok(_) => {}
             Err(e) => eprintln!("spots: {e:#}"),
+        }
+        // after the pass's spots: what's said about them can wait, new releases' tags shouldn't
+        if config.comments && !stopping() {
+            match said(&pool, &db, &config, &stopping).await {
+                Ok(s) if s != Said::default() => println!(
+                    "spots: {} new comments, {} new spam reports, read {} comments' text ({} gone, {} to retry)",
+                    s.comments, s.reports, s.read, s.gone, s.retry
+                ),
+                Ok(_) => {}
+                Err(e) => eprintln!("spots: comments: {e:#}"),
+            }
         }
         let started = std::time::Instant::now();
         while !stopping() && started.elapsed() < every {
@@ -99,7 +112,12 @@ pub async fn pass(pool: &Arc<Pool>, db: &Db, config: &SpotsConfig, stopping: &im
     }
 
     let now = chrono::Utc::now().timestamp();
-    on_db(db, move |conn| Ok(store::prune(conn, now)?)).await?;
+    on_db(db, move |conn| Ok(store::prune(conn, now)? + comments::prune(conn)?)).await?;
+    match backfill_xml(pool, db, stopping).await {
+        Ok(0) => {}
+        Ok(n) => println!("spots: read the XML of {n} spots saved before it was kept"),
+        Err(e) => eprintln!("spots: reading saved spots' XML: {e:#}"),
+    }
     let limit = config.per_pass;
     let todo = on_db(db, move |conn| Ok(store::todo(conn, limit)?)).await?;
     if todo.is_empty() {
@@ -263,9 +281,8 @@ async fn fetch(
         Err(e) if says_absent(&e) => return Ok(Some(skipped(None))),
         Err(e) => return Err(e.into()),
     };
-    let Some(spot) = full::xml_from_headers(&head).as_deref().and_then(full::parse) else {
-        return Ok(Some(skipped(None)));
-    };
+    let Some(xml) = full::xml_from_headers(&head) else { return Ok(Some(skipped(None))) };
+    let Some(spot) = full::parse(&xml) else { return Ok(Some(skipped(None))) };
     let Some(kind) = spot.kind() else { return Ok(Some(skipped(None))) };
     // an id named twice is no real spot's, and would be read twice
     if spot.nzb.is_empty() || !nzb_ids_usable(&spot.nzb) {
@@ -278,6 +295,7 @@ async fn fetch(
         spot: spot.clone(),
         spotter_id: spotter_id.clone(),
         nzb_key,
+        xml: xml.clone(),
     };
 
     // another spot pointing at the same NZB articles was settled already: no need to read them again
@@ -403,6 +421,192 @@ async fn fetch(
         println!("spots: saved \"{title}\" as release {id}");
     }
     Ok(Some(settled(id)))
+}
+
+/// What one pass read of what's said about spots, for the log.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Said {
+    comments: usize,
+    reports: usize,
+    read: usize,
+    gone: usize,
+    retry: usize,
+}
+
+/// The comments and spam reports posted since the last pass on the spots kept, then up to `comments_per_pass`
+/// comments' text (a BODY each, a few hundred bytes). A group that can't be read is logged and skipped, and the
+/// texts are read whatever came of the groups. The first failed read ends the texts for this pass.
+async fn said(pool: &Arc<Pool>, db: &Db, config: &SpotsConfig, stopping: &impl Fn() -> bool) -> Result<Said> {
+    let mut done = Said::default();
+    let known = Arc::new(on_db(db, |conn| Ok(comments::known_spots(conn)?)).await?);
+    if known.is_empty() {
+        return Ok(done);
+    }
+    for (group, reports) in [(comments::COMMENT_GROUP, false), (comments::REPORT_GROUP, true)] {
+        match read_group(pool, db, group, reports, config.comment_days, &known, stopping).await {
+            Ok(n) if reports => done.reports = n,
+            Ok(n) => done.comments = n,
+            Err(e) => eprintln!("spots: {group}: {e:#}"),
+        }
+    }
+
+    let limit = config.comments_per_pass;
+    let todo = on_db(db, move |conn| Ok(comments::todo(conn, limit)?)).await?;
+    let failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let slots = Arc::new(tokio::sync::Semaphore::new(config.concurrency));
+    let mut tasks = tokio::task::JoinSet::new();
+    let mut outcomes: Vec<(String, comments::Outcome)> = Vec::new();
+    for message_id in todo {
+        if stopping() || failed.load(Ordering::Relaxed) {
+            break;
+        }
+        let slot = slots.clone().acquire_owned().await.expect("the pass's semaphore is never closed");
+        let (pool, failed) = (pool.clone(), failed.clone());
+        tasks.spawn(async move {
+            let _slot = slot;
+            let id = format!("<{message_id}>");
+            let outcome = match timed("spots.comment", pool.fetch_body_capped(&id, comments::MAX_BODY)).await {
+                Ok(Some(raw)) => comments::Outcome::Read(comments::body_text(&raw)),
+                // too big to be a comment
+                Ok(None) => comments::Outcome::Gone,
+                Err(e) if says_absent(&e) => comments::Outcome::Gone,
+                Err(e) => {
+                    eprintln!("spots: comment {message_id}: {e:#}");
+                    failed.store(true, Ordering::Relaxed);
+                    comments::Outcome::Failed
+                }
+            };
+            (message_id, outcome)
+        });
+        while let Some(joined) = tasks.try_join_next() {
+            outcomes.extend(joined.map_err(|e| eprintln!("spots: comment task failed: {e}")).ok());
+        }
+        if outcomes.len() >= SETTLE_BATCH {
+            settle_comments(db, std::mem::take(&mut outcomes), &mut done).await?;
+        }
+    }
+    while let Some(joined) = tasks.join_next().await {
+        outcomes.extend(joined.map_err(|e| eprintln!("spots: comment task failed: {e}")).ok());
+    }
+    settle_comments(db, outcomes, &mut done).await?;
+    Ok(done)
+}
+
+/// Comments' texts read before they're written, together.
+const SETTLE_BATCH: usize = 200;
+
+/// What came of reading these comments' texts, in one transaction, counted into `done`.
+async fn settle_comments(db: &Db, outcomes: Vec<(String, comments::Outcome)>, done: &mut Said) -> Result<()> {
+    if outcomes.is_empty() {
+        return Ok(());
+    }
+    for (_, outcome) in &outcomes {
+        match outcome {
+            comments::Outcome::Read(_) => done.read += 1,
+            comments::Outcome::Gone => done.gone += 1,
+            comments::Outcome::Failed => done.retry += 1,
+        }
+    }
+    on_db(db, move |conn| Ok(comments::settle(conn, &outcomes)?)).await
+}
+
+/// Reads `group`'s overview since its cursor (`days` back on the first pass) and notes the comments, or with
+/// `reports` the spam reports, on the spots in `known`. Returns how many were new.
+async fn read_group(
+    pool: &Arc<Pool>,
+    db: &Db,
+    group: &'static str,
+    reports: bool,
+    days: u32,
+    known: &Arc<std::collections::HashSet<String>>,
+    stopping: &impl Fn() -> bool,
+) -> Result<usize> {
+    let prefer = pool.indexing_tier().first().copied().unwrap_or(0);
+    let (server, (_, low, high, _)) = pool.select_group_on(prefer, group).await?;
+    let host = pool.host(server);
+    let key = host.clone();
+    let cursor = on_db(db, move |conn| Ok(comments::cursor(conn, group, &key)?)).await?;
+    let mut from = match cursor {
+        Some(c) if c <= high => (c + 1).max(low),
+        // the first pass, or the server renumbered: from `days` ago
+        _ => {
+            let when = chrono::Utc::now().timestamp() - i64::from(days) * 86_400;
+            pool.article_at(server, group, low.max(1), high, when).await?
+        }
+    };
+    let mut added = 0;
+    while from <= high && !stopping() {
+        let to = high.min(from + XOVER_STEP - 1);
+        let rows = match pool.xover_on(server, group, from, to).await {
+            Ok(rows) => rows,
+            Err(e) if e.is_empty_range() => Vec::new(),
+            Err(e) => return Err(e.into()),
+        };
+        let now = chrono::Utc::now().timestamp();
+        let found: Vec<comments::Noted> = rows
+            .iter()
+            .filter_map(|r| {
+                let (spot, rating) = if reports {
+                    (comments::report_ref(&r.subject, &r.references)?, 0)
+                } else {
+                    comments::comment_ref(&r.message_id)?
+                };
+                known.contains(&spot).then(|| comments::Noted {
+                    message_id: r.message_id.trim().trim_matches(['<', '>']).to_string(),
+                    spot,
+                    at: crate::dates::posted_timestamp(&r.date).unwrap_or(now),
+                    rating,
+                    poster: comments::poster_name(&r.from),
+                    spotter_id: header::spotter_id_of_from(&r.from),
+                })
+            })
+            .collect();
+        let key = host.clone();
+        added += on_db(db, move |conn| Ok(comments::note_read(conn, group, &key, to, &found, reports)?)).await?;
+        from = to + 1;
+    }
+    Ok(added)
+}
+
+/// Reads again the XML of up to `XML_BACKFILL` spots saved before it was kept, so their release pages get the
+/// description and the rest. A spot whose article is gone, or whose XML won't read, gets an empty one and isn't
+/// asked for again. The first other error ends it for this pass; spots are taken in no order (`missing_xml`), so
+/// one that keeps failing doesn't keep the rest waiting. Returns how many were filled.
+async fn backfill_xml(pool: &Pool, db: &Db, stopping: &impl Fn() -> bool) -> Result<usize> {
+    let mut filled = 0;
+    let mut left = XML_BACKFILL;
+    for shard in 0..crate::store::SHARDS {
+        if left == 0 || stopping() {
+            break;
+        }
+        let limit = left;
+        let missing = on_shard(db, shard, move |conn| store::missing_xml(conn, limit)).await?;
+        left -= missing.len();
+        for (release_id, message_id) in missing {
+            if stopping() {
+                return Ok(filled);
+            }
+            let head = timed("spots.head", pool.fetch_head(&format!("<{message_id}>"), MAX_XML_BYTES * 4)).await;
+            let xml = match head {
+                Ok(Some(head)) => full::xml_from_headers(&head).filter(|x| full::parse(x).is_some()),
+                Ok(None) => None,
+                Err(e) if says_absent(&e) => None,
+                // the servers aren't answering: the rest wait for the next pass, rather than each waiting out the
+                // deadline in turn ahead of the pass's new spots
+                Err(e) => {
+                    eprintln!("spots: {message_id}: {e:#}");
+                    return Ok(filled);
+                }
+            };
+            let xml = xml.unwrap_or_default();
+            let whole = !xml.is_empty();
+            let set = on_shard(db, shard, move |conn| store::set_xml(conn, release_id, &message_id, &xml)).await?;
+            if set && whole {
+                filled += 1;
+            }
+        }
+    }
+    Ok(filled)
 }
 
 /// A spot whose NZB an earlier spot's release `id` already has: that release gets this spot when it is live.
