@@ -47,6 +47,9 @@ sealed-log = { path = "sealed-log" }
 nntmux-yenc = { git = "https://github.com/xbmc4lyfe/newznab-tmux", rev = "8dade08ca0372e046af2bd9d3040e23a47379bd4" }
 zipfast = { git = "https://github.com/xbmc4lyfe/zipfast", rev = "f0274b2e7fb4b024b25afdfa31878fd135e12849" }
 zipview = { git = "https://github.com/xbmc4lyfe/zipview", rev = "a1c381b93b92d5eac51adb5e177c5394c2ca20bb" }
+# PAR2 parsing and GF(2) CRC algebra; atlas::parity wraps it. Only the parsing/algebra side is used, so
+# "parallel" (rayon) and "mmap" (memmap2) stay off until Atlas calls repair.
+par-rs = { git = "https://github.com/xbmc4lyfe/par-rs", branch = "main", default-features = false }
 tantivy = "0.27"
 quick-xml = "0.42"
 postgres = "0.19"
