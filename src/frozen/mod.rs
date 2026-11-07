@@ -90,7 +90,7 @@ pub fn idle_ticks_on() -> bool {
 /// own wait is far longer, and freezing can always come back next tick
 const TICK_BUSY: Duration = Duration::from_secs(2);
 /// what the writer's connection waits otherwise (`db::open_shard`)
-pub(crate) const WRITER_BUSY: Duration = Duration::from_secs(30);
+const WRITER_BUSY: Duration = Duration::from_secs(30);
 /// The indexer is stopping: writers do no freezing, soo their queues of saves drain as fast as they did before it.
 pub static STOPPING: AtomicBool = AtomicBool::new(false);
 /// how long a free disk reading is trusted

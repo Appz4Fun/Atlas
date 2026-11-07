@@ -2292,7 +2292,7 @@ impl ShardWriter {
         conn.busy_timeout(if idle && !queued { PRUNE_IDS_BUSY } else { PRUNE_IDS_BUSY_SAVING })?;
         let done = self.prune_ids_step(conn, now, idle);
         // put back whatever came of the step: a failure here mustnt hide the step's own
-        let restored = conn.busy_timeout(crate::frozen::WRITER_BUSY);
+        let restored = conn.busy_timeout(crate::db::BUSY_TIMEOUT);
         let done = match done {
             // the lock is held elsewhere: not again for a while, soo the writer doesnt keep waiting on it
             Err(e) if crate::frozen::is_busy(&e) => {
@@ -2304,7 +2304,9 @@ impl ShardWriter {
             // release it failed at, and only that one
             Err(e) => {
                 self.ids.rest_until = now + PRUNE_IDS_FAILED_REST;
-                self.ids.skip = self.ids_failing;
+                if let Some(failed) = self.ids_failing {
+                    self.ids.skip = Some(failed);
+                }
                 Err(e)
             }
             done => done,
@@ -2356,6 +2358,7 @@ impl ShardWriter {
                 continue;
             }
             looked += 1;
+            self.ids_failing = None;
             let next: Option<i64> = tx
                 .prepare_cached("select release_id from release_ids where release_id > ? order by release_id limit 1")?
                 .query_row([w.after], |r| r.get(0))
@@ -2379,16 +2382,17 @@ impl ShardWriter {
             }
             // a file never touched since the upgrade counts as old, as for sealing (`due`); a release without its own
             // row is half taken already
-            let (files, touched, indexed): (i64, i64, i64) = tx
+            let (files, touched, indexed, own): (i64, i64, i64, bool) = tx
                 .prepare_cached(
                     "select count(*), coalesce(max(touched_at), 0),
-                            coalesce((select at from release_indexed where release_id = ?1), 0)
+                            coalesce((select at from release_indexed where release_id = ?1), 0),
+                            exists (select 1 from release_ids where release_id = ?1 and id_hash = 0)
                      from files where release_id = ?1",
                 )?
-                .query_row([release_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+                .query_row([release_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
             let last = touched.max(indexed);
             // without its own row it's half taken (a step cut short by a restart): no save trusts what's left
-            if files < 2 || last < now - SEAL_AGE || !is_indexed(&tx, release_id)? {
+            if files < 2 || last < now - SEAL_AGE || !own {
                 // its own row first: a release half taken is indexed again in full
                 let own = tx
                     .prepare_cached("delete from release_ids where release_id = ? and id_hash = 0")?
@@ -2402,6 +2406,8 @@ impl ShardWriter {
                 w.oldest_kept = Some(w.oldest_kept.map_or(last, |o| o.min(last)));
             }
         }
+        // past here a failure is the step's, not a release's
+        self.ids_failing = None;
         tx.commit()?;
         self.ids = w;
         let shard = self.shard.to_string();
