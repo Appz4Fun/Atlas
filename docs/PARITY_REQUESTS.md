@@ -5,7 +5,22 @@ have yet. `atlas::parity` (`src/parity.rs`) calls the crate and never re-impleme
 CRC math, so when something is missing it is written here, with the exact signature wanted,
 instead of being worked around in Atlas.
 
-Checked against par-rs `main` at `dd7b88ca`.
+Checked against par-rs `main` at `42d1ea52`. Requests 1-6 below were met at par-rs `8afce2e`
+(its reply: `docs/PARITY_REQUESTS_RESPONSE.md`); this file keeps them as the record of what was asked
+and how it was answered. Nothing is open.
+
+## Answered (par-rs `8afce2e`, 2026-11-07)
+
+| # | asked | par-rs |
+|---|---|---|
+| 1 | `Inventory.set_id: Option<[u8; 16]>` | added as written: the primary set (first `Main`, else first `FileDesc`) |
+| 2 | `MainInfo.body_hashes_to_set_id: bool` | added as written, for `Main` and `PkdMain` |
+| 3 | `CreatorInfo.set_id: Option<[u8; 16]>` | added as written; `None` from `CreatorInfo::parse` |
+| 4 | `gf2::ifsc_interval_crcs(slice_crcs, block_size, file_size, grid_size)` | added as written; `parity::ifsc_intervals` compares both sides and names the intervals that differ |
+| 5 | `is_base_par2` ends the name right after `.par2` | the table in §5 is now par-rs's test; `atlas::par2::is_base_par2` delegates to it |
+| 6 | speed | `is_base_par2` 5 → 52 M subjects/s (one allocation-free pass); `inventory` 658 → 2,365 /s on the 200-file index (optimistic single pass, metadata MD5s in one 16-lane batch, resynchronising scanner as the fallback, result identical by test); recovery volume 282 → 1,029 MiB/s; article folding 71 k → 548 k /s (`gf2::Crc32Shift`, a per-block-size operator table). Metadata MD5s are still checked, which is the whole of what remains against Atlas's unchecked scanner on a 2-file index. |
+
+Below, the requests as they were made.
 
 ## 1. The primary set id on `Inventory`
 
@@ -136,8 +151,9 @@ only re-exports of `par_rs::gf2`, so every CRC-32 postprocess takes of a BODY ru
 hardware path (the bench rows above are from before that change). Still to go:
 
 - `src/par2.rs`: its own PAR2 packet scanner and `Inventory` / `Par2File`. The crate's types
-  have the same fields except Atlas's `creators` and the meaning of `sealed` (requests 2 and
-  3), and `is_base_par2` differs (request 5). Its inventory also stops reading IFSC packets
+  have the same fields except Atlas's `creators` and the meaning of `sealed`; par-rs now carries
+  what both need (`CreatorInfo::set_id`, `MainInfo::body_hashes_to_set_id`), and
+  `is_base_par2` already delegates to par-rs. Its inventory also stops reading IFSC packets
   after 16,384 slices in total (`MAX_TOTAL_IFSC_SLICES`), so files of a big set lose their
   whole-file CRC: in the benchmark's 200-file, 19,600-slice set Atlas folds a CRC for 167
   files and par-rs for all 200. A 50 GB remux with 1 MiB slices has about 50,000 slices. `creator_text` (drops e-mail addresses from

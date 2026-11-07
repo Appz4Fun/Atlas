@@ -18,11 +18,14 @@
 //! - packets: [`inspect`] ([`Par2Inspection`]: Main, FileDesc, IFSC, recovery slices,
 //!   Creator, comments, unknown packets, resyncs over garbage), [`creator`];
 //! - the files a set describes: [`inventory`], [`inventory_of`], kept in `libpar2` order
-//!   (file id as a little-endian u128) for presenting and comparing sets;
+//!   (file id as a little-endian u128) for presenting and comparing sets; `Inventory::set_id`
+//!   names the primary set, `MainInfo::body_hashes_to_set_id` says a Main's file list is the one
+//!   its set id was made from, `CreatorInfo::set_id` ties a creator to its set;
 //! - obfuscated names: [`resolve`], [`real_names`], [`rar5_volume`];
 //! - CRC algebra on yEnc/NZB metadata without bodies: [`file_crc`], [`file_crc_indexed`],
-//!   [`file_crc_from_ifsc`], [`articles_agree_with_ifsc`] and the re-exported `crc32_*`,
-//!   [`lcm_grid`], [`compute_interval_crcs`];
+//!   [`file_crc_from_ifsc`], [`articles_agree_with_ifsc`], [`ifsc_intervals`] (which stretch of a
+//!   file disagrees with its set) and the re-exported `crc32_*`, [`lcm_grid`],
+//!   [`compute_interval_crcs`], [`ifsc_interval_crcs`], [`Crc32Shift`];
 //! - slice verification of bytes Atlas does have: [`verifier`], [`usable_recovery`] and
 //!   [`SetVerifier`]'s `verify_file` / `verify_files` / `sliding_search` / `assess`.
 #![cfg_attr(not(test), deny(clippy::indexing_slicing, clippy::unwrap_used, clippy::expect_used, clippy::panic))]
@@ -31,8 +34,8 @@ use std::collections::BTreeSet;
 
 pub use par_rs::bridge::{BridgeReport, Candidate, Par2Bridge, RAR5_SIGNATURE, Resolution, ResolveMethod};
 pub use par_rs::gf2::{
-    FoldError, compute_interval_crcs, crc32, crc32_combine, crc32_uncombine_prefix, crc32_uncombine_suffix,
-    crc32_unzero, crc32_zeros, lcm_grid,
+    Crc32Shift, FoldError, compute_interval_crcs, crc32, crc32_combine, crc32_uncombine_prefix,
+    crc32_uncombine_suffix, crc32_unzero, crc32_zeros, fold_ifsc_crcs_with, ifsc_interval_crcs, lcm_grid,
 };
 pub use par_rs::inspect::{
     CommentInfo, CreatorInfo, CreatorTool, FileDescInfo, IfscInfo, MainInfo, PacketInfo, PacketKind, Par2FileName,
@@ -161,6 +164,32 @@ pub fn articles_agree_with_ifsc(
     let from_articles = file_crc(articles).ok()?;
     let from_ifsc = file_crc_from_ifsc(slice_crcs, block_size, file_size)?;
     Some(from_articles == from_ifsc)
+}
+
+/// Where a file's articles and its IFSC slice CRCs disagree: both sides folded onto the grid
+/// every article and slice boundary falls on (`lcm_grid(&[article_size, block_size])`), compared
+/// interval by interval. `Some(indices)` of the intervals that differ (empty: they agree
+/// everywhere); `None` when either side cannot be put on that grid (an article straddling a grid
+/// boundary, a slice count that doesn't fit `file_size`, a zero size) or the articles' lengths
+/// don't add up to `file_size`.
+pub fn ifsc_intervals(
+    articles: &[(u32, u64)],
+    article_size: u64,
+    slice_crcs: &[u32],
+    block_size: u64,
+    file_size: u64,
+) -> Option<Vec<usize>> {
+    let posted = articles.iter().try_fold(0u64, |sum, &(_, len)| sum.checked_add(len))?;
+    if posted != file_size {
+        return None;
+    }
+    let grid = lcm_grid(&[article_size, block_size])?;
+    let from_articles = compute_interval_crcs(articles, grid)?;
+    let from_ifsc = ifsc_interval_crcs(slice_crcs, block_size, file_size, grid)?;
+    if from_articles.len() != from_ifsc.len() {
+        return None;
+    }
+    Some(from_articles.iter().zip(&from_ifsc).enumerate().filter(|(_, (a, b))| a != b).map(|(i, _)| i).collect())
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -387,3 +387,77 @@ fn every_prefix_is_data_not_a_panic() {
         }
     }
 }
+
+#[test]
+fn set_ids_main_body_hash_and_creator_set() {
+    // PARITY_REQUESTS.md §1-3: the primary set id on the inventory, whether a Main's body hashes
+    // to its set id, and the set a Creator packet belongs to.
+    let (a, b, set) = two_file_set(2048);
+    assert!(!a.is_empty() && !b.is_empty());
+    let insp = parity::inspect(&set.index);
+    let main = &insp.main[0];
+    assert!(main.body_hashes_to_set_id, "a set made by build_set lists exactly the files its id was made from");
+    let inv = parity::inventory(&set.index);
+    assert_eq!(inv.set_id, Some(main.set_id));
+    assert_eq!(inv.set_id.map(|s| s.to_vec()), Some(set.set_id.0.to_vec()));
+    assert_eq!(insp.creators.len(), 1);
+    assert_eq!(insp.creators[0].set_id, Some(main.set_id));
+    assert_eq!(parity::creator(b"ParPar v0.4.6").set_id, None);
+    assert_eq!(parity::inventory(b"").set_id, None);
+    // Two sets in one buffer: creators and set ids stay apart.
+    let other = build_set("other", &[("a.rar", &a)], &opts(1024, 1, VolumeScheme::Single)).unwrap();
+    let mut joined = set.index.clone();
+    joined.extend_from_slice(&other.index);
+    let insp2 = parity::inspect(&joined);
+    assert_eq!(insp2.creators.len(), 2);
+    assert_ne!(insp2.creators[0].set_id, insp2.creators[1].set_id);
+    assert_eq!(parity::inventory_of(&insp2).set_id, Some(main.set_id), "the first Main's set is primary");
+}
+
+#[test]
+fn ifsc_crcs_on_the_article_grid_localise_damage() {
+    // PARITY_REQUESTS.md §4: a file posted in 7000-byte articles, protected with 1000-byte slices.
+    let file = data(10 * 7000 * 2 + 4321, 77);
+    let (art, bs) = (7000u64, 1000u64);
+    let grid = parity::lcm_grid(&[art, bs]).unwrap();
+    assert_eq!(grid, 7000);
+    let articles: Vec<(u32, u64)> = file.chunks(art as usize).map(|c| (parity::crc32(c), c.len() as u64)).collect();
+    let mut padded = file.clone();
+    padded.resize(file.len().div_ceil(bs as usize) * bs as usize, 0);
+    let slices: Vec<u32> = padded.chunks(bs as usize).map(parity::crc32).collect();
+    let from_ifsc = parity::ifsc_interval_crcs(&slices, bs, file.len() as u64, grid).unwrap();
+    assert_eq!(from_ifsc, file.chunks(grid as usize).map(parity::crc32).collect::<Vec<_>>());
+    assert_eq!(parity::ifsc_intervals(&articles, art, &slices, bs, file.len() as u64), Some(vec![]));
+    let mut bad = articles.clone();
+    bad[3].0 ^= 1;
+    bad[20].0 ^= 0x80;
+    assert_eq!(parity::ifsc_intervals(&bad, art, &slices, bs, file.len() as u64), Some(vec![3, 20]));
+    // Sizes that do not add up, or a slice count that does not fit, say nothing.
+    assert_eq!(parity::ifsc_intervals(&articles, art, &slices, bs, file.len() as u64 + 1), None);
+    assert_eq!(parity::ifsc_intervals(&articles, art, &slices[1..], bs, file.len() as u64), None);
+    assert_eq!(parity::ifsc_interval_crcs(&slices, bs, file.len() as u64, 1500), None, "grid must be a multiple of the block size");
+    // The shared operator folds the same as the plain call.
+    let shift = parity::Crc32Shift::new(bs);
+    assert_eq!(parity::fold_ifsc_crcs_with(&shift, &slices, file.len() as u64), Some(parity::crc32(&file)));
+}
+
+#[test]
+fn base_par2_names_end_right_after_par2() {
+    // PARITY_REQUESTS.md §5, the table as written, through both doors.
+    for (subject, want) in [
+        (r#""a.par2" yEnc"#, true),
+        ("a.par2.rar", false),
+        ("a.par2-1", false),
+        ("(a.par2)", true),
+        ("[a.par2]", true),
+        (r#""a.vol00+01.par2" and "b.par2""#, true),
+        ("a.vol00+01.par2", false),
+        (r#"[1/9] - "abc.par2" yEnc (1/1)"#, true),
+        ("abc.par2", true),
+        (r#""abc.vol00+01.par2" yEnc (1/1)"#, false),
+        (r#""abc.rar" yEnc (1/1)"#, false),
+    ] {
+        assert_eq!(parity::is_base_par2(subject), want, "{subject:?}");
+        assert_eq!(atlas::par2::is_base_par2(subject), want, "{subject:?} via atlas::par2");
+    }
+}
