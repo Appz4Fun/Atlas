@@ -1115,7 +1115,8 @@ impl Search {
     /// was counted makes the count a most: copies and incomplete releases, which only the rows themselves tell, and tags
     /// when the database counted.
     /// `lazy`: a count small enough for one window says so, and the page asks `/ui/total` for the rows' own count once
-    /// it's shown (`exact_total`), which leaves out what the count can't: folded rows, copies, incomplete and unrated ones.
+    /// it's shown (`exact_total`), which leaves out what the count can't: folded rows, incomplete and unrated ones. Only
+    /// for a search paged from its window: one paged a page at a time folds differently.
     fn total(&self, lazy: bool) -> String {
         let filter = parse_filter(&self.cat);
         let mut left_out = Vec::new();
@@ -1543,24 +1544,21 @@ impl Window {
         }
     }
 
-    /// How many rows the search shows from this window, all of it rendered first: those not folded into another,
-    /// hidden as incomplete, or left out by a rating chip, less the later copies when copies are hidden.
-    fn shown_count(&self, search: &Search) -> usize {
+    /// How many rows the search shows from this window once its background fill has rendered them all: those not
+    /// folded into another (incomplete ones among them) nor left out by a rating chip. None: the fill hasn't
+    /// finished, and the count it had stands; the next page asks again.
+    fn shown_count(&self, search: &Search) -> Option<usize> {
         if let Some(n) = lock(&self.counted).get(&search.min_score) {
-            return *n;
+            return Some(*n);
         }
         // the background fill renders them all: waited for, soo they aren't rendered twice
         let started = Instant::now();
         while !self.filled.load(Ordering::Acquire) && started.elapsed() < COUNT_WAITS_FOR_FILL {
             std::thread::sleep(Duration::from_millis(20));
         }
-        // a fill that didn't run (another had the turn) or didn't finish: what's left, here
-        let missing: Vec<ReleaseRow> = {
-            let shown = lock(&self.shown);
-            self.rows.iter().filter(|r| !shown.contains_key(&r.id)).cloned().collect()
-        };
-        for slice in missing.chunks(PAGE_SIZE as usize) {
-            self.render(search, slice);
+        // waiting its turn behind other windows' fills: not rendered here, on a request's thread
+        if !self.filled.load(Ordering::Acquire) {
+            return None;
         }
         if search.min_score.is_some() {
             // scored as `page` scores them: the row shown, else another row of its post
@@ -1588,7 +1586,7 @@ impl Window {
                 .count()
         };
         lock(&self.counted).insert(search.min_score, n);
-        n
+        Some(n)
     }
 
     /// Renders every row and works out every order, soo no click has any of it left to do.
@@ -2425,7 +2423,10 @@ fn exact_total(args: &HashMap<String, String>) -> String {
         return search.total(false);
     }
     match window_of(&search, 0) {
-        Ok(window) if !window.more_in_db => exact_html(window.shown_count(&search)),
+        Ok(window) if !window.more_in_db => match window.shown_count(&search) {
+            Some(n) => exact_html(n),
+            None => search.total(false),
+        },
         Ok(_) => search.total(false),
         Err(e) => {
             eprintln!("web exact count failed: {e}");
@@ -5571,10 +5572,12 @@ mod tests {
             (4, shows(None, false, Some(50))),
         ]);
         let search = |q: &str| Search::from_args(&parse_query(q));
-        assert_eq!(w.shown_count(&search("q=x")), 3, "a folded row isn't counted");
-        assert_eq!(w.shown_count(&search("q=x&rated=60")), 1, "nor one a chip leaves out");
+        assert_eq!(w.shown_count(&search("q=x")), Some(3), "a folded row isn't counted");
+        assert_eq!(w.shown_count(&search("q=x&rated=60")), Some(1), "nor one a chip leaves out");
         w.publish(vec![(1, shows(None, true, None))]);
-        assert_eq!(w.shown_count(&search("q=x")), 3, "kept per window and chip");
+        assert_eq!(w.shown_count(&search("q=x")), Some(3), "kept per window and chip");
+        let unfilled = window_of_rows(vec![row(1)]);
+        assert_eq!(unfilled.shown_count(&search("q=x")), None, "not counted before the fill; waits, then gives up");
     }
 
     #[test]
