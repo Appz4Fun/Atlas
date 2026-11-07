@@ -1054,6 +1054,12 @@ async fn run_servers(
         let s = sched.clone();
         let (pool, spots) = (sched.ctx.pool.clone(), config.spots.clone());
         tasks.spawn(crate::spotnet::ingest::run(pool, db.clone(), spots, move || s.stopping()));
+        // what's said about the spots kept, in a task of its own so a long spot pass doesn't hold it back
+        if config.spots.comments {
+            let s = sched.clone();
+            let (pool, spots) = (sched.ctx.pool.clone(), config.spots.clone());
+            tasks.spawn(crate::spotnet::ingest::run_comments(pool, db.clone(), spots, move || s.stopping()));
+        }
     }
     // parts one server's listing left out, read again from another (see `repair`)
     if sched.ctx.pool.indexing_servers().len() > 1 {

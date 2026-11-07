@@ -334,6 +334,9 @@ mod tests {
         assert_eq!(note_read(&mut conn, COMMENT_GROUP, "srv", 120, &found, false).unwrap(), 0);
         assert_eq!(cursor(&conn, COMMENT_GROUP, "srv").unwrap(), Some(120));
         assert_eq!(cursor(&conn, REPORT_GROUP, "srv").unwrap(), None);
+        // nothing new: the cursor still moves
+        assert_eq!(note_read(&mut conn, COMMENT_GROUP, "srv", 130, &[], false).unwrap(), 0);
+        assert_eq!(cursor(&conn, COMMENT_GROUP, "srv").unwrap(), Some(130));
         let report = vec![noted("r1@spot.net", "s1@spot.net", 25)];
         assert_eq!(note_read(&mut conn, REPORT_GROUP, "srv", 7, &report, true).unwrap(), 1);
         // the saved spot's comment first, though the other is newer

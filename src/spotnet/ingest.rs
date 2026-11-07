@@ -2,6 +2,9 @@
 //! then each of those whole (HEAD for its XML, BODY for its NZB in `alt.binaries.ftd`), saved as a release and
 //! tagged with its spot. About 75 spots a day pass the filter. Spots are fetched `concurrency` at a time: each
 //! request queues for a connection behind indexing, so one at a time was minutes a spot on a busy indexer.
+//!
+//! Comments and spam reports on the spots kept (`comments`) are read by a task of their own, `run_comments`:
+//! with a backlog of spots a spot pass takes an hour, and comments read after it waited that long.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -47,13 +50,12 @@ pub struct Pass {
     pub pending: usize,
 }
 
-/// Runs passes until `stopping`.
+/// Runs spot passes until `stopping`.
 pub async fn run(pool: Arc<Pool>, db: Db, config: SpotsConfig, stopping: impl Fn() -> bool + Send + 'static) {
     if let Err(e) = on_db(&db, |conn| Ok(store::create_main(conn)?)).await {
         eprintln!("spots: {e:#}");
         return;
     }
-    let every = Duration::from_secs(u64::from(config.poll_minutes) * 60);
     while !stopping() {
         match pass(&pool, &db, &config, &stopping).await {
             Ok(p) if p.noted + p.saved + p.skipped + p.retry + p.pending > 0 => println!(
@@ -63,21 +65,35 @@ pub async fn run(pool: Arc<Pool>, db: Db, config: SpotsConfig, stopping: impl Fn
             Ok(_) => {}
             Err(e) => eprintln!("spots: {e:#}"),
         }
-        // after the pass's spots: what's said about them can wait, new releases' tags shouldn't
-        if config.comments && !stopping() {
-            match said(&pool, &db, &config, &stopping).await {
-                Ok(s) if s != Said::default() => println!(
-                    "spots: {} new comments, {} new spam reports, read {} comments' text ({} gone, {} to retry)",
-                    s.comments, s.reports, s.read, s.gone, s.retry
-                ),
-                Ok(_) => {}
-                Err(e) => eprintln!("spots: comments: {e:#}"),
-            }
+        wait_a_pass(&config, &stopping).await;
+    }
+}
+
+/// Runs comment passes until `stopping`, beside the spots' (`run`) and never behind them.
+pub async fn run_comments(pool: Arc<Pool>, db: Db, config: SpotsConfig, stopping: impl Fn() -> bool + Send + 'static) {
+    if let Err(e) = on_db(&db, |conn| Ok(store::create_main(conn)?)).await {
+        eprintln!("spots: comments: {e:#}");
+        return;
+    }
+    while !stopping() {
+        match said(&pool, &db, &config, &stopping).await {
+            Ok(s) if s != Said::default() => println!(
+                "spots: {} new comments, {} new spam reports, read {} comments' text ({} gone, {} to retry)",
+                s.comments, s.reports, s.read, s.gone, s.retry
+            ),
+            Ok(_) => {}
+            Err(e) => eprintln!("spots: comments: {e:#}"),
         }
-        let started = std::time::Instant::now();
-        while !stopping() && started.elapsed() < every {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        }
+        wait_a_pass(&config, &stopping).await;
+    }
+}
+
+/// Waits out `poll_minutes`, or until `stopping`.
+async fn wait_a_pass(config: &SpotsConfig, stopping: &impl Fn() -> bool) {
+    let every = Duration::from_secs(u64::from(config.poll_minutes) * 60);
+    let started = std::time::Instant::now();
+    while !stopping() && started.elapsed() < every {
+        tokio::time::sleep(Duration::from_secs(1)).await;
     }
 }
 
@@ -531,9 +547,20 @@ async fn read_group(
         // the first pass, or the server renumbered: from `days` ago
         _ => {
             let when = chrono::Utc::now().timestamp() - i64::from(days) * 86_400;
-            pool.article_at(server, group, low.max(1), high, when).await?
+            let from = pool.article_at(server, group, low.max(1), high, when).await?;
+            println!(
+                "spots: reading {group} on {host} from article {from} ({days} days back), {} to go",
+                (high + 1).saturating_sub(from)
+            );
+            from
         }
     };
+    if from > high {
+        // nothing to read: the cursor still moves, so the next pass doesn't look for its start again
+        let key = host.clone();
+        on_db(db, move |conn| Ok(comments::note_read(conn, group, &key, high, &[], reports)?)).await?;
+        return Ok(0);
+    }
     let mut added = 0;
     while from <= high && !stopping() {
         let to = high.min(from + XOVER_STEP - 1);
