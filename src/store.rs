@@ -991,6 +991,28 @@ impl IdKey {
     }
 }
 
+/// Every message-id of file `file_id`, sealed or not, by its keyed hash, to `each`.
+pub(crate) fn file_id_hashes(
+    conn: &Connection,
+    key: &IdKey,
+    file_id: i64,
+    suffixes: &mut HashMap<i64, Option<String>>,
+    mut each: impl FnMut(i64) -> Result<()>,
+) -> Result<()> {
+    // the blob is bounded by READ_MAX_SEGMENTS; the rows are not, so they
+    // stream from the cursor one at a time
+    for s in sealed_segments(conn, file_id)?.unwrap_or_default() {
+        each(key.hash(&seg_key(conn, suffixes, &s)?))?;
+    }
+    let mut rows = conn.prepare_cached("select local, domain from segments where file_id = ?")?;
+    let mut cursor = rows.query([file_id])?;
+    while let Some(r) = cursor.next()? {
+        let s = crate::blob::Seg { local: r.get(0)?, domain: r.get(1)?, part: None, bytes: 0 };
+        each(key.hash(&seg_key(conn, suffixes, &s)?))?;
+    }
+    Ok(())
+}
+
 /// Drop `release_id`'s index of message-ids and its stamp: made again in full by the next save or spot that needs it.
 pub(crate) fn unindex_release(conn: &Connection, release_id: i64) -> Result<()> {
     conn.prepare_cached("delete from release_ids where release_id = ?")?.execute([release_id])?;
@@ -1015,17 +1037,10 @@ pub(crate) fn index_release(conn: &Connection, key: &IdKey, release_id: i64) -> 
     for file_id in ids {
         let mut insert =
             conn.prepare_cached("insert or ignore into release_ids (release_id, id_hash, file_id) values (?, ?, ?)")?;
-        // the blob is bounded by READ_MAX_SEGMENTS; the rows are not, so they
-        // stream from the cursor one at a time
-        for s in sealed_segments(conn, file_id)?.unwrap_or_default() {
-            insert.execute(params![release_id, key.hash(&seg_key(conn, &mut suffixes, &s)?), file_id])?;
-        }
-        let mut rows = conn.prepare_cached("select local, domain from segments where file_id = ?")?;
-        let mut cursor = rows.query([file_id])?;
-        while let Some(r) = cursor.next()? {
-            let s = crate::blob::Seg { local: r.get(0)?, domain: r.get(1)?, part: None, bytes: 0 };
-            insert.execute(params![release_id, key.hash(&seg_key(conn, &mut suffixes, &s)?), file_id])?;
-        }
+        file_id_hashes(conn, key, file_id, &mut suffixes, |hash| {
+            insert.execute(params![release_id, hash, file_id])?;
+            Ok(())
+        })?;
     }
     conn.prepare_cached("insert or ignore into release_ids (release_id, id_hash, file_id) values (?, 0, 0)")?
         .execute([release_id])?;
@@ -2084,7 +2099,7 @@ pub const SEAL_PER_TICK: usize = 2_000;
 /// a pruning step of `release_ids` stops after this long while saves or stage jobs wait, so the writer gets back to them
 pub const PRUNE_IDS_BUDGET: std::time::Duration = std::time::Duration::from_millis(10);
 
-/// the same when nothing waits for the writer (a save that comes in meanwhile waits up to this)
+/// the same on a writer with nothing to save (a save that comes in meanwhile waits up to this, after an idle freeze tick)
 pub const PRUNE_IDS_BUDGET_IDLE: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// after a step reaches the end of `release_ids`, the next starts over this much later at least (seconds)
@@ -4898,6 +4913,18 @@ mod tests {
         assert_eq!(indexed, rows + 3, "every row, and the blob's 3 ids");
     }
 
+    /// one pruning step on an idle writer, whenever it last stepped
+    fn prune_step(writer: &mut ShardWriter, conn: &mut Connection, now: i64) -> usize {
+        writer.ids_step = None;
+        writer.prune_ids_some(conn, now, true, false).unwrap()
+    }
+
+    /// the same right after a save
+    fn prune_step_busy(writer: &mut ShardWriter, conn: &mut Connection, now: i64) -> usize {
+        writer.ids_step = None;
+        writer.prune_ids_some(conn, now, false, false).unwrap()
+    }
+
     /// A release none of whose files was touched for SEAL_AGE loses its index;
     /// the next save to it indexes it again, and copies across its files are
     /// still found.
@@ -4912,15 +4939,7 @@ mod tests {
         assert!(before > 0, "the fixture's two files are indexed");
         let now = chrono::Utc::now().timestamp();
         let mut writer = ShardWriter::new(shard_of("alt.binaries.t"));
-        assert_eq!(
-            {
-                writer.ids_step = None;
-                writer.prune_ids_some(&mut conn, now, true, false)
-            }
-            .unwrap(),
-            0,
-            "touched just now"
-        );
+        assert_eq!(prune_step(&mut writer, &mut conn, now), 0, "touched just now");
         assert_eq!(count(&conn), before);
 
         let rest = writer.ids.rest_until - now;
@@ -4930,34 +4949,14 @@ mod tests {
         );
         conn.execute("update files set touched_at = ?", [now - SEAL_AGE - 1]).unwrap();
         writer.ids.rest_until = 0;
-        assert_eq!(
-            {
-                writer.ids_step = None;
-                writer.prune_ids_some(&mut conn, now, true, false)
-            }
-            .unwrap(),
-            0,
-            "indexed just now"
-        );
+        assert_eq!(prune_step(&mut writer, &mut conn, now), 0, "indexed just now");
         conn.execute("update release_indexed set at = ?", [now - SEAL_AGE - 1]).unwrap();
         writer.ids.rest_until = now + 1;
-        assert_eq!(
-            {
-                writer.ids_step = None;
-                writer.prune_ids_some(&mut conn, now, true, false)
-            }
-            .unwrap(),
-            0,
-            "resting"
-        );
+        assert_eq!(prune_step(&mut writer, &mut conn, now), 0, "resting");
         writer.ids.rest_until = 0;
         let mut taken = 0;
         while writer.ids.rest_until == 0 {
-            taken += {
-                writer.ids_step = None;
-                writer.prune_ids_some(&mut conn, now, true, false)
-            }
-            .unwrap() as i64;
+            taken += prune_step(&mut writer, &mut conn, now) as i64;
         }
         assert_eq!(taken, before, "every row, its own too");
         assert_eq!(count(&conn), 0);
@@ -4971,11 +4970,7 @@ mod tests {
         // all copies: no file was touched, but the index is new, soo it stays
         writer.ids.rest_until = 0;
         while writer.ids.rest_until == 0 {
-            {
-                writer.ids_step = None;
-                writer.prune_ids_some(&mut conn, now, true, false)
-            }
-            .unwrap();
+            prune_step(&mut writer, &mut conn, now);
         }
         assert_eq!(count(&conn), before, "indexed again just now: not quiet");
     }
@@ -4993,11 +4988,7 @@ mod tests {
         let now = chrono::Utc::now().timestamp();
         let mut writer = ShardWriter::new(shard_of("alt.binaries.t"));
         while writer.ids.rest_until == 0 {
-            {
-                writer.ids_step = None;
-                writer.prune_ids_some(&mut conn, now, true, false)
-            }
-            .unwrap();
+            prune_step(&mut writer, &mut conn, now);
         }
         assert_eq!(count(&conn), 0, "touched just now, but one file");
         let stamps: i64 = conn.query_row("select count(*) from release_indexed", [], |r| r.get(0)).unwrap();
@@ -5037,15 +5028,7 @@ mod tests {
         // a save in between touched it and indexed it again: the rest stays
         let mut writer = ShardWriter::new(shard_of("alt.binaries.t"));
         writer.ids.pruning = Some(release_id);
-        assert_eq!(
-            {
-                writer.ids_step = None;
-                writer.prune_ids_some(&mut conn, now, true, false)
-            }
-            .unwrap(),
-            0,
-            "kept up again: nothing goes"
-        );
+        assert_eq!(prune_step(&mut writer, &mut conn, now), 0, "kept up again: nothing goes");
         assert_eq!(count(&conn), all);
         assert_eq!(writer.ids.pruning, None);
 
@@ -5055,8 +5038,7 @@ mod tests {
         let mut writer = ShardWriter::new(shard_of("alt.binaries.t"));
         let mut taken = 0;
         while writer.ids.rest_until == 0 {
-            writer.ids_step = None;
-            taken += writer.prune_ids_some(&mut conn, now, false, false).unwrap() as i64;
+            taken += prune_step_busy(&mut writer, &mut conn, now) as i64;
             assert!(!marked(&conn), "its own row goes first");
         }
         assert_eq!(taken, all);

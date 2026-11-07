@@ -490,7 +490,7 @@ fn writer(
                 }
                 Err(RecvTimeoutError::Timeout) if stage.is_empty() => {
                     if let Ok(conn) = &mut opened {
-                        housekeeping(conn, &mut store, &mut checkpoints, true, true, false);
+                        housekeeping(conn, &mut store, &mut checkpoints, true, true, false, true);
                     }
                     last_housekeeping = std::time::Instant::now();
                     continue;
@@ -503,7 +503,7 @@ fn writer(
                     }
                     if last_housekeeping.elapsed() >= Duration::from_secs(1) {
                         if let Ok(conn) = &mut opened {
-                            housekeeping(conn, &mut store, &mut checkpoints, true, false, false);
+                            housekeeping(conn, &mut store, &mut checkpoints, true, false, false, false);
                         }
                         last_housekeeping = std::time::Instant::now();
                     }
@@ -581,7 +581,7 @@ fn writer(
             }
             // nothing came in meanwhile and no stage work waits: the writer would sit idle
             let idle = next.is_none() && stage.is_empty() && saved;
-            housekeeping(conn, &mut store, &mut checkpoints, seal, idle, next.is_some());
+            housekeeping(conn, &mut store, &mut checkpoints, seal, idle, next.is_some(), false);
             last_housekeeping = std::time::Instant::now();
         }
     }
@@ -681,7 +681,7 @@ fn prune_ids(conn: &mut Connection, store: &mut crate::store::ShardWriter, idle:
 /// A writer's work between saves: seal some of what is due (when `seal`),
 /// and copy the WAL into the shard once `checkpoints` says it is due.
 /// `idle`: nothing waits for the writer, soo freezing may take longer (`frozen::Ticker::tick_idle`).
-/// `queued`: another save is waiting already.
+/// `queued`: another save is waiting already. `nothing_to_save`: the writer woke with nothing to do.
 fn housekeeping(
     conn: &mut Connection,
     store: &mut crate::store::ShardWriter,
@@ -689,6 +689,7 @@ fn housekeeping(
     seal: bool,
     idle: bool,
     queued: bool,
+    nothing_to_save: bool,
 ) {
     use crate::profile::{LOAD, Load};
     use std::sync::atomic::Ordering::Relaxed;
@@ -715,8 +716,9 @@ fn housekeeping(
     drop(span);
     // the index of quiet releases' message-ids, a cache that is made again when needed (`ShardWriter::prune_ids_some`);
     // with more saves queued only a short step now and then
-    // (the bigger idle steps are for a writer with nothing to save, `freeze_idle`: a save may come any moment here)
-    prune_ids(conn, store, false, queued);
+    // the bigger idle steps only on a writer with nothing to save (here or in `freeze_idle`): after a save another
+    // may come any moment
+    prune_ids(conn, store, nothing_to_save, queued);
     // the shared catalog's sent changes, as far as Postgres has them (`shared_catalog::prune_acked`)
     let span = crate::metrics::span("db.catalog_prune");
     if crate::shared_catalog::prune_acked(conn).is_err() {
