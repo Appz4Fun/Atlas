@@ -2355,10 +2355,8 @@ fn release_page(args: &HashMap<String, String>) -> ApiResponse {
         && let Ok(Some(post)) = release_info::whole_post_from_catalog(&conn, &release)
     {
         // a split post's contents that can't be read are the release's own, as before
-        contents = Some(
-            release_info::contents_of_split(&conn, &post)
-                .unwrap_or_else(|_| release_info::contents(id).unwrap_or_default()),
-        );
+        let post_contents = release_info::contents_of_split(&conn, &post)
+            .unwrap_or_else(|_| release_info::contents(id).unwrap_or_default());
         split_groups = release_info::groups_of_ids(&conn, &post.ids).ok();
         if post.lead.is_none() || !crate::parser::is_obfuscated(&release.name) {
             release.name = release_info::post_stem(&release.name);
@@ -2368,7 +2366,8 @@ fn release_page(args: &HashMap<String, String>) -> ApiResponse {
         }
         release.size = Some(post.size);
         release.complete = post.complete;
-        release.parts = contents.as_ref().map(|c| c.articles_seen);
+        release.parts = Some(post_contents.articles_seen);
+        contents = Some(post_contents);
         whole_post = true;
         if category.unwrap_or(UNCATEGORIZED) == UNCATEGORIZED {
             let cats = crate::category::categories_of(&post.ids).unwrap_or_default();
