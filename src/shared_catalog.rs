@@ -1376,7 +1376,8 @@ pub fn run_check(prune: bool) -> i32 {
 
 /// Phase 2: lookups across shards read the catalog, one at a time, behind `shared_catalog.reads`. Every reader falls
 /// back to the shards when the catalog can't answer: reads off, its index not built yet, or Postgres failing (then the
-/// catalog is left alone for `BACKOFF`, so a catalog that's down costs a page one connect timeout, not one per lookup).
+/// catalog is left alone for `BACKOFF`, so a catalog that's down costs a page at most `READ_DEADLINE`, once, not on
+/// every lookup).
 pub mod reader {
     use super::*;
     use std::sync::atomic::AtomicI64;
@@ -1414,24 +1415,35 @@ pub mod reader {
     /// Runs `read` against the catalog, on a thread of its own so a page waits at most `READ_DEADLINE`. None when
     /// reads are off, the catalog is resting, or the read failed or ran out of time: the caller then asks the shards.
     pub fn with<T: Send + 'static>(
-        read: impl FnOnce(&mut postgres::Client) -> Result<T, postgres::Error> + Send + 'static,
+        read: impl Fn(&mut postgres::Client) -> Result<T, postgres::Error> + Send + 'static,
     ) -> Option<T> {
         if !on() {
             return None;
         }
-        let pooled = CLIENTS.lock().unwrap_or_else(|e| e.into_inner()).pop();
+        let pooled = {
+            let mut clients = CLIENTS.lock().unwrap_or_else(|e| e.into_inner());
+            // one Postgres closed while it sat in the pool (a restart, an idle timeout) is no use
+            clients.retain(|c| !c.is_closed());
+            clients.pop()
+        };
         let (tx, rx) = std::sync::mpsc::channel();
         let spawned = std::thread::Builder::new().name("shared-catalog-read".into()).spawn(move || {
-            let client = match pooled {
-                Some(c) => Ok(c),
-                None => open_reader(),
-            };
-            let answer = match client {
-                Ok(mut c) => {
-                    let result = read(&mut c).map_err(|e| format!("read: {e}"));
-                    (result.is_ok().then_some(c), result)
-                }
+            let fresh = |read: &dyn Fn(&mut postgres::Client) -> Result<T, postgres::Error>| match open_reader() {
+                Ok(mut c) => match read(&mut c) {
+                    Ok(v) => (Some(c), Ok(v)),
+                    Err(e) => (None, Err(format!("read: {e}"))),
+                },
                 Err(e) => (None, Err(e)),
+            };
+            let answer = match pooled {
+                Some(mut c) => match read(&mut c) {
+                    Ok(v) => (Some(c), Ok(v)),
+                    // a pooled connection Postgres had closed (a restart, an idle timeout): one fresh try before
+                    // the catalog rests
+                    Err(_) if c.is_closed() => fresh(&read),
+                    Err(e) => (None, Err(format!("read: {e}"))),
+                },
+                None => fresh(&read),
             };
             // a caller that gave up has gone: the client then just closes here
             if let Err(std::sync::mpsc::SendError((Some(c), _))) = tx.send(answer) {
@@ -1455,8 +1467,12 @@ pub mod reader {
                 rest(&e);
                 None
             }
-            Err(_) => {
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 rest(&format!("no answer in {}s", READ_DEADLINE.as_secs()));
+                None
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                rest("the read failed without an answer (it panicked)");
                 None
             }
         }
@@ -1478,37 +1494,52 @@ pub mod reader {
 
     /// Whether `index` is built and valid, asked once per process until it is.
     pub fn index_ready(index: &'static str) -> bool {
-        static READY: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
-        if READY.lock().unwrap_or_else(|e| e.into_inner()).contains(&index) {
-            return true;
+        /// a valid index is asked about again after this, a missing or invalid one after `BACKOFF`
+        const RECHECK: Duration = Duration::from_secs(300);
+        static SEEN: Mutex<Vec<(&'static str, bool, std::time::Instant)>> = Mutex::new(Vec::new());
+        {
+            let seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((_, ready, at)) = seen.iter().find(|(name, _, _)| *name == index) {
+                let fresh = if *ready { RECHECK } else { BACKOFF };
+                if at.elapsed() < fresh {
+                    return *ready;
+                }
+            }
         }
-        let valid = with(move |pg| {
-            let row = pg.query_opt(
-                "select i.indisvalid from pg_class c join pg_index i on i.indexrelid = c.oid where c.relname = $1",
-                &[&index],
-            )?;
-            Ok(row.is_some_and(|r| r.get::<_, bool>(0)))
-        });
-        if valid == Some(true) {
-            READY.lock().unwrap_or_else(|e| e.into_inner()).push(index);
-        }
-        valid == Some(true)
+        let Some(ready) = with(move |pg| index_valid(pg, index)) else { return false };
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        seen.retain(|(name, _, _)| *name != index);
+        seen.push((index, ready, std::time::Instant::now()));
+        ready
+    }
+
+    /// The index on the search path by that name exists and is valid. `to_regclass` names one relation whatever
+    /// other schemas hold.
+    fn index_valid(pg: &mut postgres::Client, index: &str) -> Result<bool, postgres::Error> {
+        let row = pg.query_opt("select indisvalid from pg_index where indexrelid = to_regclass($1)", &[&index])?;
+        Ok(row.is_some_and(|r| r.get::<_, bool>(0)))
     }
 
     /// Builds the readers' indexes without blocking writes (CONCURRENTLY), dropping one a build left invalid first.
     /// The indexer runs this in the background when reads are on.
-    pub fn build_indexes(pg: &mut postgres::Client) -> Result<(), postgres::Error> {
+    /// An index still being built is invalid too, and is left to finish: `Err` tells the caller to try later.
+    pub fn build_indexes(pg: &mut postgres::Client) -> Result<(), String> {
         for (name, create) in INDEXES {
-            let invalid = pg
-                .query_opt(
-                    "select 1 from pg_class c join pg_index i on i.indexrelid = c.oid where c.relname = $1 and not i.indisvalid",
-                    &[name],
-                )?
+            let building = pg
+                .query_opt("select 1 from pg_stat_progress_create_index where index_relid = to_regclass($1)", &[name])
+                .map_err(|e| e.to_string())?
                 .is_some();
-            if invalid {
-                pg.batch_execute(&format!("drop index concurrently if exists {name}"))?;
+            if building {
+                return Err(format!("{name} is still being built"));
             }
-            pg.batch_execute(create)?;
+            let exists = pg
+                .query_opt("select 1 from pg_index where indexrelid = to_regclass($1)", &[name])
+                .map_err(|e| e.to_string())?
+                .is_some();
+            if exists && !index_valid(pg, name).map_err(|e| e.to_string())? {
+                pg.batch_execute(&format!("drop index concurrently if exists {name}")).map_err(|e| e.to_string())?;
+            }
+            pg.batch_execute(create).map_err(|e| e.to_string())?;
         }
         Ok(())
     }
@@ -1524,7 +1555,7 @@ pub mod reader {
                 if !made {
                     return Err("waiting for the publisher to make the tables".to_string());
                 }
-                build_indexes(&mut pg).map_err(|e| e.to_string())
+                build_indexes(&mut pg)
             });
             match attempt {
                 Ok(()) => return,
@@ -1550,8 +1581,12 @@ pub mod reader {
         pg: &mut postgres::Client,
         name: &str,
     ) -> Result<Vec<crate::release_info::GroupPosting>, postgres::Error> {
+        // what the shard path reads: each shard's first 64 by group name, the order of its (name, group) index
         let rows = pg.query(
-            "select coalesce(group_name, ''), coalesce(parts, 0), id from releases where name = $1 limit 512",
+            "select coalesce(group_name, ''), coalesce(parts, 0), id from (
+                select group_name, parts, id, row_number() over (partition by shard order by group_name) as n
+                from releases where name = $1
+             ) r where n <= 64",
             &[&name],
         )?;
         Ok(rows
@@ -2167,6 +2202,10 @@ mod tests {
         fill_shard(&conn, &mut pg, 0).unwrap();
         reader::build_indexes(&mut pg).unwrap();
         reader::build_indexes(&mut pg).unwrap(); // again: nothing to do
+        // one an interrupted build left invalid is dropped and built again
+        pg.batch_execute("update pg_index set indisvalid = false where indexrelid = to_regclass('releases_name')")
+            .unwrap();
+        reader::build_indexes(&mut pg).unwrap();
         let valid: bool = pg
             .query_one(
                 "select i.indisvalid from pg_class c join pg_index i on i.indexrelid = c.oid where c.relname = 'releases_name'",

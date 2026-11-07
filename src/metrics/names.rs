@@ -161,7 +161,7 @@ families! {
     SHARED_CATALOG_ROWS "atlas_shared_catalog_rows_total" Counter &[], "Rows the shared catalog publisher wrote to Postgres (upsert) or took out of it (delete).";
     SHARED_CATALOG_OUTBOX "atlas_shared_catalog_outbox" Gauge &[], "Changes waiting in each shard's outbox (rows), and how long the oldest has waited (oldest_seconds).";
     SHARED_CATALOG_READS "atlas_shared_catalog_reads_total" Counter &[], "Lookups across shards, by lookup and where the answer came from: the catalog, or the shards (catalog reads off, not ready, or failed).";
-    SHARED_CATALOG_FAILURES "atlas_shared_catalog_failures_total" Counter &[], "Times the shared catalog publisher failed, by stage (connect, publish), before it retried.";
+    SHARED_CATALOG_FAILURES "atlas_shared_catalog_failures_total" Counter &[], "Times the shared catalog failed, by stage: the publisher's connect and publish (it retries), ack_deferred (sent rows left for the writer to prune), and read (a lookup fell back to the shards).";
 
     // the catalog scan, see `catalog`
     CATALOG_RELEASES "atlas_catalog_releases" Gauge &[], "Releases in the catalog, by state.";
