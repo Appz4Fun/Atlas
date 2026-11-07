@@ -199,11 +199,38 @@ pub fn contents(id: i64) -> Result<Contents> {
 }
 
 pub fn contents_with(conn: &Connection, id: i64) -> Result<Contents> {
-    contents_of(conn, &[id], &[])
+    contents_of(conn, &[id], &[], Bytes::All)
 }
 
-/// `recovery`: rows whose files are all recovery volumes, whatever they're called.
-fn contents_of(conn: &Connection, ids: &[i64], recovery: &[i64]) -> Result<Contents> {
+/// Which bytes `contents_of` adds up: reading them means reading every article, for a big post its whole sealed log.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Bytes {
+    All,
+    None,
+    /// only where a repair verdict rests on them (`verdict_needs_bytes`)
+    ForVerdict,
+}
+
+/// Whether a repair verdict needs the bytes: data to repair and recovery volumes, but no PAR2 set read to count
+/// blocks with (`Contents::repairable` and `repair_per_mille` then go by sizes). Without data, or without recovery,
+/// or with the set read, the counts alone give the same verdict.
+fn verdict_needs_bytes(c: &Contents) -> bool {
+    c.data_articles_expected > 0 && c.recovery_articles_expected > 0 && c.exact_repair_per_mille().is_none()
+}
+
+/// `contents_with` without the bytes: the files, PAR2 volumes and article counts come from each file's row. The bytes
+/// (`data_bytes`, `recovery_bytes`, each listed file's) stay 0.
+pub fn contents_counts_with(conn: &Connection, id: i64) -> Result<Contents> {
+    contents_of(conn, &[id], &[], Bytes::None)
+}
+
+/// What a summary of a release (a copy's card) needs: its counts, and its bytes only where a repair verdict rests on
+/// them (`verdict_needs_bytes`), soo every verdict is the one the full contents give.
+pub fn contents_summary_with(conn: &Connection, id: i64) -> Result<Contents> {
+    contents_of(conn, &[id], &[], Bytes::ForVerdict)
+}
+
+fn contents_of(conn: &Connection, ids: &[i64], recovery: &[i64], with_bytes: Bytes) -> Result<Contents> {
     let mut totals = Contents::default();
     let union = union_files(conn, ids)?;
     let mut volumes: BTreeSet<String> = BTreeSet::new();
@@ -238,12 +265,23 @@ fn contents_of(conn: &Connection, ids: &[i64], recovery: &[i64]) -> Result<Conte
             totals.recovery_blocks += recovery_blocks(filename);
         }
     }
+    if let Some((block, blocks)) = ids.iter().find_map(|id| crate::duplicates::par2_sizes(conn, *id)) {
+        totals.par2_block = Some(block);
+        totals.par2_blocks = Some(blocks);
+    }
+    let read_bytes = match with_bytes {
+        Bytes::All => true,
+        Bytes::None => false,
+        Bytes::ForVerdict => verdict_needs_bytes(&totals),
+    };
     let mut bytes: HashMap<String, i64> = HashMap::new();
-    for id in ids {
-        store::each_article(conn, *id, &mut |article| {
-            *bytes.entry(article.filename.unwrap_or_default()).or_default() += article.bytes.unwrap_or(0);
-            Ok(())
-        })?;
+    if read_bytes {
+        for id in ids {
+            store::each_article(conn, *id, &mut |article| {
+                *bytes.entry(article.filename.unwrap_or_default()).or_default() += article.bytes.unwrap_or(0);
+                Ok(())
+            })?;
+        }
     }
     for file in &mut totals.list {
         file.bytes = bytes.get(&file.name).copied().unwrap_or(0);
@@ -268,10 +306,6 @@ fn contents_of(conn: &Connection, ids: &[i64], recovery: &[i64]) -> Result<Conte
         } else if !is_par2(&filename) {
             totals.data_bytes += size;
         }
-    }
-    if let Some((block, blocks)) = ids.iter().find_map(|id| crate::duplicates::par2_sizes(conn, *id)) {
-        totals.par2_block = Some(block);
-        totals.par2_blocks = Some(blocks);
     }
     Ok(totals)
 }
@@ -1297,7 +1331,7 @@ fn union_files(conn: &Connection, ids: &[i64]) -> Result<UnionFiles> {
 
 /// What's in the whole post: each file once, whichever groups have its parts.
 pub fn contents_of_split(conn: &Connection, post: &SplitPost) -> Result<Contents> {
-    contents_of(conn, &post.ids, &post.recovery)
+    contents_of(conn, &post.ids, &post.recovery, Bytes::All)
 }
 
 /// A From header, split up.
@@ -1909,6 +1943,52 @@ mod tests {
         // a set that looks for two files, with one found, isn't all there
         conn.execute_batch("update s0.upload_link set wanted = 2 where release_id = 24").unwrap();
         assert!(!linked_post_with(&conn, 16).unwrap().unwrap().complete);
+    }
+
+    #[test]
+    fn a_releases_counts_without_its_bytes_are_the_same_counts() {
+        let (_dir, conn) = linked_shard();
+        for id in [8, 16, 24] {
+            let full = contents_with(&conn, id).unwrap();
+            let counts = contents_counts_with(&conn, id).unwrap();
+            assert_eq!(
+                (
+                    counts.files,
+                    counts.par2_files,
+                    counts.recovery_volumes,
+                    counts.articles_seen,
+                    counts.articles_expected
+                ),
+                (full.files, full.par2_files, full.recovery_volumes, full.articles_seen, full.articles_expected),
+                "release {id}"
+            );
+            assert_eq!(counts.missing_per_mille(), full.missing_per_mille());
+            assert_eq!((counts.data_bytes, counts.recovery_bytes), (0, 0), "no articles read for bytes");
+            let summary = contents_summary_with(&conn, id).unwrap();
+            assert_eq!(summary.repairable(), full.repairable(), "the same verdict, release {id}");
+            assert_eq!(summary.exact_repair_per_mille(), full.exact_repair_per_mille());
+        }
+    }
+
+    #[test]
+    fn a_summary_reads_bytes_only_where_the_repair_verdict_rests_on_them() {
+        let half = Contents {
+            data_articles_expected: 100,
+            data_articles_seen: 90,
+            recovery_articles_expected: 20,
+            recovery_articles_seen: 20,
+            recovery_blocks: 10,
+            ..Default::default()
+        };
+        assert!(verdict_needs_bytes(&half), "data, recovery and no PAR2 set: sizes decide");
+        assert!(!verdict_needs_bytes(&Contents { recovery_articles_expected: 0, ..half.clone() }), "no recovery");
+        assert!(!verdict_needs_bytes(&Contents { data_articles_expected: 0, ..half.clone() }), "recovery only");
+        let with_set = Contents { par2_block: Some(1_000), par2_blocks: Some(100), ..half.clone() };
+        assert!(with_set.exact_repair_per_mille().is_some());
+        assert!(!verdict_needs_bytes(&with_set), "the set read: blocks decide");
+        // and where they do, the verdict changes with them, which is why they're read
+        let sized = Contents { data_bytes: 90_000, recovery_bytes: 20_000, ..half.clone() };
+        assert!(sized.repairable() && !half.repairable());
     }
 
     #[test]
