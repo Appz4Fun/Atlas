@@ -2101,6 +2101,8 @@ struct IdsPrune {
     rest_until: i64,
     /// the least recently touched or indexed release this walk kept, for when the next may start
     oldest_kept: Option<i64>,
+    /// a release a step failed at, passed over once
+    skip: Option<i64>,
 }
 
 /// files sealed per writer tick at most
@@ -2120,6 +2122,9 @@ const PRUNE_IDS_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// the same when nothing came in meanwhile: at most a fifth of the writer's time with PRUNE_IDS_BUDGET_IDLE
 const PRUNE_IDS_IDLE_EVERY: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// after a pruning step found the lock held elsewhere, the next waits this long (seconds)
+const PRUNE_IDS_BUSY_REST: i64 = 30;
 
 /// after a pruning step fails, the next waits this long (seconds)
 const PRUNE_IDS_FAILED_REST: i64 = 600;
@@ -2289,27 +2294,25 @@ impl ShardWriter {
         // put back whatever came of the step: a failure here mustnt hide the step's own
         let restored = conn.busy_timeout(crate::frozen::WRITER_BUSY);
         let done = match done {
+            // the lock is held elsewhere: not again for a while, soo the writer doesnt keep waiting on it
             Err(e) if crate::frozen::is_busy(&e) => {
                 crate::metrics::names::RELEASE_IDS.inc(&[("event", "busy"), ("shard", &self.shard.to_string())], 1);
+                self.ids.rest_until = now + PRUNE_IDS_BUSY_REST;
                 Ok(0)
             }
-            // anything else would likely fail the same way next time: the walk rests a while, then goes on past the
-            // release it failed at
+            // anything else would likely fail the same way next time: the walk rests a while, then passes over the
+            // release it failed at, and only that one
             Err(e) => {
                 self.ids.rest_until = now + PRUNE_IDS_FAILED_REST;
-                if let Some(failed) = self.ids_failing {
-                    self.ids.after = self.ids.after.max(failed);
-                    // only the release it failed at is given up; one being taken stays in hand otherwise
-                    if self.ids.pruning == Some(failed) {
-                        self.ids.pruning = None;
-                    }
-                }
+                self.ids.skip = self.ids_failing;
                 Err(e)
             }
             done => done,
         };
-        restored?;
-        done
+        match (done, restored) {
+            (Err(e), _) | (Ok(_), Err(e)) => Err(e),
+            (Ok(n), Ok(())) => Ok(n),
+        }
     }
 
     fn prune_ids_step(&mut self, conn: &mut Connection, now: i64, idle: bool) -> Result<usize> {
@@ -2325,6 +2328,10 @@ impl ShardWriter {
         while started.elapsed() < budget && looked < PRUNE_IDS_LOOKS {
             if let Some(release_id) = w.pruning {
                 self.ids_failing = Some(release_id);
+                if w.skip == Some(release_id) {
+                    (w.pruning, w.skip) = (None, None);
+                    continue;
+                }
                 // a save indexed it again in full since: it's kept up once more
                 if is_indexed(&tx, release_id)? {
                     w.pruning = None;
@@ -2366,6 +2373,10 @@ impl ShardWriter {
             };
             w.after = release_id;
             self.ids_failing = Some(release_id);
+            if w.skip == Some(release_id) {
+                w.skip = None;
+                continue;
+            }
             // a file never touched since the upgrade counts as old, as for sealing (`due`); a release without its own
             // row is half taken already
             let (files, touched, indexed): (i64, i64, i64) = tx
@@ -5032,6 +5043,28 @@ mod tests {
         assert_eq!(count(&conn), 0, "touched just now, but one file");
         let stamps: i64 = conn.query_row("select count(*) from release_indexed", [], |r| r.get(0)).unwrap();
         assert_eq!(stamps, 0, "its stamp too");
+    }
+
+    /// A step that finds the write lock held elsewhere lets it go, counts nothing taken, and rests a while.
+    #[test]
+    fn a_pruning_step_lets_go_of_a_held_lock_and_rests() {
+        let (_dir, main) = sealed_fixture();
+        let shard = shard_path(&main, shard_of("alt.binaries.t"));
+        let mut conn = db::open_at(&shard).unwrap();
+        let now = chrono::Utc::now().timestamp();
+        conn.execute("update files set touched_at = ?", [now - SEAL_AGE - 1]).unwrap();
+        conn.execute("update release_indexed set at = ?", [now - SEAL_AGE - 1]).unwrap();
+        let before: i64 = conn.query_row("select count(*) from release_ids", [], |r| r.get(0)).unwrap();
+        let other = db::open_at(&shard).unwrap();
+        other.execute_batch("begin immediate").unwrap();
+        let mut writer = ShardWriter::new(shard_of("alt.binaries.t"));
+        assert_eq!(prune_step_busy(&mut writer, &mut conn, now), 0, "the lock is held");
+        assert_eq!(writer.ids.rest_until, now + PRUNE_IDS_BUSY_REST);
+        other.execute_batch("rollback").unwrap();
+        let after: i64 = conn.query_row("select count(*) from release_ids", [], |r| r.get(0)).unwrap();
+        assert_eq!(after, before);
+        writer.ids.rest_until = 0;
+        assert_eq!(prune_step(&mut writer, &mut conn, now) as i64, before, "free again: all of it");
     }
 
     /// A big release goes a chunk at a time, its own row first; a save that
