@@ -6,6 +6,7 @@
 use sha2::Digest;
 
 use crate::config::Config;
+use crate::keys;
 use crate::postprocess::schema::ShardTable;
 use crate::postprocess::step::{Got, Needs, Outcome, Reruns, Step, StepCtx, StepError, StepId, StepWrite, mask};
 use crate::store::{self, FileInfo, SegmentPick};
@@ -89,6 +90,64 @@ pub fn stills(conn: &rusqlite::Connection, release_id: i64) -> Vec<(u8, Option<i
     q.query_map([release_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
         .map(|rows| rows.filter_map(Result::ok).collect())
         .unwrap_or_default()
+}
+
+/// The keys that name the video file itself, whichever release carries it: the Matroska SegmentUID with the mux's
+/// DateUTC, and the OpenSubtitles hash (the size with the first and last 64 KiB). Both come from the probed main
+/// file, never a sample or an extra, soo a release that shares one has the same pictures at the same places.
+const SAME_FILE: [keys::Kind; 2] = [keys::Kind::Mux, keys::Kind::MovieHash];
+
+/// Releases looked at per key for one that has stills: the newest first.
+const SAME_FILE_CANDIDATES: i64 = 16;
+
+/// What a release's video file can be found by: its mux key and its OpenSubtitles hash, read from its probe in
+/// `schema` (`main` on a shard opened alone, `sN` with the shards attached). Empty when it has no probe.
+pub fn file_lookup(conn: &rusqlite::Connection, schema: &str, release_id: i64) -> keys::Lookup {
+    let row: Option<(String, Option<String>)> = conn
+        .prepare_cached(&format!("select info, moviehash from {schema}.release_probe where release_id = ?1"))
+        .and_then(|mut q| q.query_row([release_id], |r| Ok((r.get(0)?, r.get(1)?))))
+        .ok();
+    let Some((info, moviehash)) = row else { return keys::Lookup::default() };
+    let mux = serde_json::from_str::<ProbeInfo>(&info)
+        .ok()
+        .and_then(|p| p.media.as_ref().and_then(keys::mux_text))
+        .map(|t| keys::as_key(keys::digest8(t.as_bytes())));
+    keys::Lookup {
+        keys: keys::Keys { mux, ..keys::Keys::default() },
+        moviehash: moviehash.filter(|h| !h.is_empty()),
+        ..keys::Lookup::default()
+    }
+}
+
+/// Whether a release has every still, each hashed and still on disk, read with the shards attached to `conn`.
+fn has_all_stills(conn: &rusqlite::Connection, release_id: i64) -> bool {
+    let s = store::shard_of_id(release_id);
+    let kept: Vec<(String, bool)> = conn
+        .prepare_cached(&format!("select sha256, phash is not null from s{s}.release_stills where release_id = ?1"))
+        .and_then(|mut q| q.query_map([release_id], |r| Ok((r.get(0)?, r.get(1)?)))?.collect())
+        .unwrap_or_default();
+    kept.len() == POSITIONS.len() && kept.iter().all(|(h, hashed)| *hashed && still_file(h).is_some_and(|f| f.exists()))
+}
+
+/// Another release carrying the same video file (`SAME_FILE`) that already has its stills, and the key that ties
+/// them, over every shard of `conn`. The stills are read from it, by its id: none are made or kept twice.
+pub fn same_file_stills(conn: &rusqlite::Connection, own: i64, lookup: &keys::Lookup) -> Option<(i64, keys::Kind)> {
+    SAME_FILE.into_iter().filter(|k| lookup.has(*k)).find_map(|kind| {
+        keys::others(conn, own, lookup, kind, SAME_FILE_CANDIDATES)
+            .into_iter()
+            .find(|other| has_all_stills(conn, *other))
+            .map(|other| (other, kind))
+    })
+}
+
+/// Whose stills a release shows, with the shards attached to `conn`: its own, else those of a release with the same
+/// video file, with the key that ties them. None: no stills to show.
+pub fn shown_stills(conn: &rusqlite::Connection, release_id: i64) -> Option<(i64, Option<keys::Kind>)> {
+    if !stills(conn, release_id).is_empty() {
+        return Some((release_id, None));
+    }
+    let lookup = file_lookup(conn, &format!("s{}", store::shard_of_id(release_id)), release_id);
+    same_file_stills(conn, release_id, &lookup).map(|(other, kind)| (other, Some(kind)))
 }
 
 /// The most releases listed as the same film.
@@ -729,6 +788,27 @@ impl Step for StillsStep {
         {
             return Ok(Outcome::default());
         }
+        // the same video file in another release that already has its stills: they are shown from there, soo nothing
+        // is read from the server or kept a second time
+        if !crate::raw_store::is_explicit_rerun(ctx.conn(), release_id, STILLS_STEP) {
+            let lookup = file_lookup(ctx.conn(), "main", release_id);
+            if SAME_FILE.iter().any(|k| lookup.has(*k)) {
+                let main = ctx
+                    .conn()
+                    .path()
+                    .and_then(super::audio_print::main_of)
+                    .ok_or_else(|| StepError::Retry("no main database".into()))?;
+                let all = crate::db::open_with_shards(&main).map_err(retry)?;
+                if let Some((_, kind)) = same_file_stills(&all, release_id, &lookup) {
+                    crate::metrics::names::STILLS_SHARED.inc(&[("key", kind.word())], 1);
+                    return Ok(Outcome {
+                        matched: true,
+                        writes: vec![StepWrite::new(DROP_STILLS, vec![release_id.into()])],
+                        ..Outcome::default()
+                    });
+                }
+            }
+        }
         let files = ctx.files().map_err(retry)?;
         let Some(first) = main_file(&files) else { return Ok(Outcome::default()) };
         let found = if matroska {
@@ -1106,5 +1186,74 @@ mod tests {
         let film = numbered(1, "film.mp4", parts.len());
         let (stills, _) = mp4_stills(&[(film, parts)], false);
         assert_eq!(stills.iter().map(|s| s.0).collect::<Vec<_>>(), [50]);
+    }
+
+    /// The main database in memory with shard 0 attached: releases, keys, probes and stills.
+    fn shards() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::filters::register_sql(&conn).unwrap();
+        conn.execute("attach ':memory:' as s0", []).unwrap();
+        conn.execute_batch("create table s0.releases (id integer primary key, group_name text not null)").unwrap();
+        for table in [&keys::RELEASE_KEYS, &super::super::PROBE, &STILLS] {
+            conn.execute_batch(&table.create.replacen("exists ", "exists s0.", 1)).unwrap();
+            for (column, kind) in table.added {
+                let _ = conn.execute_batch(&format!("alter table s0.{} add column {column} {kind}", table.name));
+            }
+        }
+        conn
+    }
+
+    /// A release in shard 0, probed with `media` (a Matroska SegmentUID, or none) and `moviehash`, with stills at
+    /// `positions`, each kept on disk.
+    fn release(conn: &rusqlite::Connection, id: i64, uid: Option<&str>, moviehash: Option<&str>, positions: &[u8]) {
+        conn.execute("insert into s0.releases (id, group_name) values (?1, 'a.b.c')", [id]).unwrap();
+        let media = uid.map(|u| crate::probe::MediaInfo {
+            container: "matroska".into(),
+            segment_uid: Some(u.into()),
+            muxed_at: Some(1_700_000_000),
+            ..Default::default()
+        });
+        let info = ProbeInfo { media, ..Default::default() };
+        conn.execute(
+            "insert into s0.release_probe (release_id, info, moviehash) values (?1, ?2, ?3)",
+            rusqlite::params![id, serde_json::to_string(&info).unwrap(), moviehash],
+        )
+        .unwrap();
+        let mux = file_lookup(conn, "s0", id).keys.mux;
+        conn.execute("insert into s0.release_keys (release_id, mux) values (?1, ?2)", rusqlite::params![id, mux])
+            .unwrap();
+        for &p in positions {
+            let sha = keep(format!("still {id} {p}").as_bytes()).unwrap();
+            conn.execute(
+                "insert into s0.release_stills (release_id, position, at_ms, sha256, width, height, phash)
+                 values (?1, ?2, 0, ?3, 960, 540, 1)",
+                rusqlite::params![id, p, sha],
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn a_release_with_the_same_video_file_shows_the_stills_already_made() {
+        let conn = shards();
+        // 0 has its stills; 8 is the same mux packed in a 7z, with none; 16 the same mux with only two
+        release(&conn, 0, Some("ab12"), Some("1d9da161e916b2fd"), &POSITIONS);
+        release(&conn, 8, Some("ab12"), None, &[]);
+        release(&conn, 16, Some("ab12"), None, &[25, 50]);
+        // 24 has only the OpenSubtitles hash of 0's file; 32 another file altogether
+        release(&conn, 24, None, Some("1d9da161e916b2fd"), &[]);
+        release(&conn, 32, Some("ffff"), Some("0000000000000001"), &[]);
+
+        assert_eq!(file_lookup(&conn, "s0", 8).keys.mux, file_lookup(&conn, "s0", 0).keys.mux);
+        assert!(file_lookup(&conn, "s0", 99).keys.mux.is_none(), "no probe, nothing to look by");
+        assert_eq!(shown_stills(&conn, 0), Some((0, None)), "its own first");
+        assert_eq!(shown_stills(&conn, 8), Some((0, Some(keys::Kind::Mux))));
+        assert_eq!(shown_stills(&conn, 16), Some((16, None)), "its own, even short");
+        assert_eq!(shown_stills(&conn, 24), Some((0, Some(keys::Kind::MovieHash))));
+        assert_eq!(shown_stills(&conn, 32), None);
+        // a release in a blocked group lends nothing
+        conn.execute("update s0.releases set group_name = 'alt.binaries.pictures.erotica.teen' where id = 0", [])
+            .unwrap();
+        assert_eq!(shown_stills(&conn, 8), None);
     }
 }
