@@ -222,6 +222,14 @@ CREATE TABLE IF NOT EXISTS raw_rev_volumes (
     PRIMARY KEY (name, group_name, volume)
 ) WITHOUT ROWID;
 
+CREATE TRIGGER IF NOT EXISTS raw_rev_volumes_ai AFTER INSERT ON raw_rev_volumes BEGIN
+    INSERT INTO raw_meta (key, value) VALUES ('rev_rows', 1)
+        ON CONFLICT(key) DO UPDATE SET value = value + 1;
+END;
+CREATE TRIGGER IF NOT EXISTS raw_rev_volumes_ad AFTER DELETE ON raw_rev_volumes BEGIN
+    UPDATE raw_meta SET value = max(0, value - 1) WHERE key = 'rev_rows';
+END;
+
 CREATE TABLE IF NOT EXISTS raw_archive_inner_files (
     release_name TEXT NOT NULL,
     group_name   TEXT NOT NULL,
@@ -326,6 +334,12 @@ pub fn create(path: &Path) -> rusqlite::Result<Connection> {
     ensure_column(&conn, "raw_par2", "content_id", "BLOB")?;
     ensure_column(&conn, "raw_par2", "content_fp", "BLOB")?;
     ensure_column(&conn, "raw_par2_files", "creator", "TEXT")?;
+    // the row counter `prune_rev_rows` reads, for a file whose table filled before its triggers
+    conn.execute(
+        "INSERT OR IGNORE INTO raw_meta (key, value) SELECT 'rev_rows', count(*) FROM raw_rev_volumes
+         WHERE NOT EXISTS (SELECT 1 FROM raw_meta WHERE key = 'rev_rows')",
+        [],
+    )?;
     ensure_column(&conn, "raw_archive_inner_files", "content_id", "BLOB")?;
     ensure_column(&conn, "raw_archive_inner_files", "crc32", "INTEGER")?;
     ensure_column(&conn, "raw_archive_inner_files", "mtime", "INTEGER")?;
@@ -1893,7 +1907,7 @@ pub fn get_rev_volumes(name: &str, group_name: &str, content_id: &[u8]) -> Optio
 }
 
 /// Saves a release's data volume table for `(name, group_name)` and `content_id`, in place of what was saved, within
-/// `MAX_RAW_ARCHIVES_ROWS` releases.
+/// `MAX_RAW_REV_ROWS` rows.
 pub fn put_rev_volumes(name: &str, group_name: &str, content_id: &[u8], volumes: &[crate::archive::rev::Volume]) {
     if content_id.is_empty() || volumes.is_empty() || volumes.len() > crate::archive::rev::MAX_KEPT {
         return;
@@ -1902,10 +1916,7 @@ pub fn put_rev_volumes(name: &str, group_name: &str, content_id: &[u8], volumes:
         let had: bool = conn
             .prepare_cached("SELECT EXISTS(SELECT 1 FROM raw_rev_volumes WHERE name = ?1 AND group_name = ?2)")?
             .query_row(params![name, group_name], |r| r.get(0))?;
-        if !had {
-            prune_rev_volumes(conn, 1)?;
-        }
-        prune_rev_rows(conn, volumes.len() as i64)?;
+        prune_rev_rows(conn, if had { 0 } else { volumes.len() as i64 })?;
         conn.prepare_cached("DELETE FROM raw_rev_volumes WHERE name = ?1 AND group_name = ?2")?
             .execute(params![name, group_name])?;
         let mut ins = conn.prepare_cached(
@@ -1929,14 +1940,15 @@ pub fn put_rev_volumes(name: &str, group_name: &str, content_id: &[u8], volumes:
 /// The most `raw_rev_volumes` rows kept, whatever the count of releases: what posted headers can make it hold.
 const MAX_RAW_REV_ROWS: i64 = 1_000_000;
 
-/// Drops whole saved tables, by key order, until `room` more rows fit within `MAX_RAW_REV_ROWS`.
+/// Drops whole saved tables, by key order, until `room` more rows fit within `MAX_RAW_REV_ROWS`. The row count is
+/// `raw_meta`'s `rev_rows`, kept by triggers, soo a save that fits reads one row and scans nothing.
 fn prune_rev_rows(conn: &Connection, room: i64) -> rusqlite::Result<()> {
     prune_rev_rows_to(conn, room, MAX_RAW_REV_ROWS)
 }
 
 fn prune_rev_rows_to(conn: &Connection, room: i64, cap: i64) -> rusqlite::Result<()> {
     loop {
-        let rows: i64 = conn.query_row("SELECT count(*) FROM raw_rev_volumes", [], |r| r.get(0))?;
+        let rows = raw_meta_get(conn, "rev_rows")?;
         if rows == 0 || rows + room <= cap {
             return Ok(());
         }
@@ -1950,24 +1962,6 @@ fn prune_rev_rows_to(conn: &Connection, room: i64, cap: i64) -> rusqlite::Result
             params![releases],
         )?;
     }
-}
-
-/// Drops the oldest saved tables soo `room` more releases fit within `MAX_RAW_ARCHIVES_ROWS`.
-fn prune_rev_volumes(conn: &Connection, room: i64) -> rusqlite::Result<()> {
-    let distinct: i64 =
-        conn.query_row("SELECT count(*) FROM (SELECT DISTINCT name, group_name FROM raw_rev_volumes)", [], |r| {
-            r.get(0)
-        })?;
-    if distinct + room > MAX_RAW_ARCHIVES_ROWS {
-        let to_drop = (distinct + room - MAX_RAW_ARCHIVES_ROWS).max(if room > 0 { 64 } else { 0 });
-        conn.execute(
-            "DELETE FROM raw_rev_volumes WHERE (name, group_name) IN (
-                SELECT DISTINCT name, group_name FROM raw_rev_volumes LIMIT ?1
-            )",
-            params![to_drop],
-        )?;
-    }
-    Ok(())
 }
 
 /// Looks up cached PAR2 twin-fingerprint and repair-block metadata for `(name, group_name)` and `content_id`
@@ -2338,7 +2332,6 @@ fn enforce_harvest_quotas(conn: &Connection) -> rusqlite::Result<()> {
             params![pf_distinct - MAX_RAW_ARCHIVES_ROWS],
         )?;
     }
-    prune_rev_volumes(conn, 0)?;
     prune_rev_rows(conn, 0)?;
     let stills_count: i64 = conn.query_row("SELECT count(*) FROM raw_stills", [], |r| r.get(0))?;
     if stills_count > MAX_RAW_STILLS_ROWS {
@@ -2818,7 +2811,6 @@ fn harvest_attached_release_tables(tx: &rusqlite::Transaction<'_>, schema: &str)
         }
         drop(rows);
         drop(stmt);
-        prune_rev_volumes(tx, 0)?;
         prune_rev_rows(tx, 0)?;
     }
     if has_table(tx, schema, "release_nfo_password")? {
@@ -3672,9 +3664,23 @@ mod tests {
             }
         }
         drop(ins);
+        assert_eq!(raw_meta_get(&conn, "rev_rows").unwrap(), 2_000 + 20 * crate::archive::rev::MAX_KEPT as i64);
         prune_rev_rows_to(&conn, 100, 4_000).unwrap();
         let rows: i64 = conn.query_row("SELECT count(*) FROM raw_rev_volumes", [], |r| r.get(0)).unwrap();
         assert!(rows + 100 <= 4_000, "{rows} rows left");
+        assert_eq!(raw_meta_get(&conn, "rev_rows").unwrap(), rows, "the triggers keep the count");
+        // a replaced row is one row still
+        conn.execute(
+            "INSERT OR REPLACE INTO raw_rev_volumes (name, group_name, content_id, volume, size, crc32) VALUES ('z', 'g', x'01', 0, 1, 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO raw_rev_volumes (name, group_name, content_id, volume, size, crc32) VALUES ('z', 'g', x'01', 0, 2, 2)",
+            [],
+        )
+        .unwrap();
+        assert_eq!(raw_meta_get(&conn, "rev_rows").unwrap(), rows + 1);
     }
 
     #[test]
