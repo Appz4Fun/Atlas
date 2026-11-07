@@ -656,7 +656,11 @@ fn named_from_catalog(conn: &Connection, rows: Vec<crate::shared_catalog::reader
 
 fn exact_split_post(conn: &Connection, posted: &str, release: &crate::search::ReleaseRow) -> Result<Option<SplitPost>> {
     let named_rows = |sql: fn(usize) -> String, poster: Option<&Option<String>>| -> Result<Vec<Named>> {
-        if let Some(rows) = crate::shared_catalog::reader::named(posted, poster.cloned()) {
+        // the catalog's answer only if it has the release asked about: one a few seconds behind the shards could
+        // otherwise hand over an older post of the same name in its place
+        if let Some(rows) = crate::shared_catalog::reader::named(posted, poster.cloned())
+            && rows.iter().any(|r| r.id == release.id)
+        {
             crate::metrics::names::SHARED_CATALOG_READS.inc(&[("lookup", "split_post"), ("source", "catalog")], 1);
             return named_from_catalog(conn, rows);
         }
@@ -840,7 +844,10 @@ fn split_stem_post(conn: &Connection, posted: &str, release: &crate::search::Rel
     let dot_lo = format!("{stem}.");
     let dot_hi = format!("{stem}/");
     let mut all = Vec::new();
-    if let Some(rows) = crate::shared_catalog::reader::stem_rows(&stem) {
+    // as for a name: the catalog's rows only if they have the release asked about
+    if let Some(rows) = crate::shared_catalog::reader::stem_rows(&stem)
+        && rows.iter().any(|r| r.id == release.id)
+    {
         crate::metrics::names::SHARED_CATALOG_READS.inc(&[("lookup", "split_stem"), ("source", "catalog")], 1);
         // as the shards' lookup: blocked groups out, and a stem one shard holds more than LINKED_ROWS rows of is no
         // post
