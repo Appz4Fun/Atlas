@@ -663,6 +663,50 @@ mod select_tests {
     }
 
     #[test]
+    fn an_xref_uploads_volumes_are_its_files_of_the_part_count_most_share() {
+        let f = [
+            file("u-00001", 1),
+            file("u-00003", 293),
+            file("u-00002", 293),
+            file("u-00004", 91),
+            file("u-00005", 469),
+            file("u-00006", 293),
+        ];
+        assert_eq!(
+            volumes(&f).iter().map(|f| f.filename.as_str()).collect::<Vec<_>>(),
+            ["u-00002", "u-00003", "u-00006"]
+        );
+        // no two alike: the largest
+        assert_eq!(volumes(&[file("a", 10), file("b", 30), file("c", 2)])[0].filename, "b");
+        assert!(volumes(&[file("a", 1), file("b", 2)]).is_empty());
+    }
+
+    #[test]
+    fn an_xref_uploads_guesses_go_volume_by_volume_from_the_hours_one() {
+        let f = [file("v1", 293), file("v2", 293), file("v3", 293)];
+        let vols: Vec<&FileInfo> = f.iter().collect();
+        let seg = |name: &str, part: i64| crate::store::SegmentRef {
+            message_id: format!("{name}-{part}"),
+            part: Some(part),
+            bytes: 1,
+        };
+        let got = super::super::steps::xref_order(&vols, 4, |v| {
+            Ok::<_, ()>((1..=crate::xref::LEADS as i64).map(|p| seg(&v.filename, p)).collect())
+        })
+        .unwrap();
+        assert_eq!(got.len(), (3 * crate::xref::LEADS).min(crate::xref::HEAD_PROBES));
+        assert_eq!(got[0].1.message_id, "v2-1", "4 wraps to the second volume");
+        assert_eq!(got[crate::xref::LEADS].1.message_id, "v3-1");
+        let many: Vec<FileInfo> = (0..20).map(|k| file(&format!("v{k:02}"), 293)).collect();
+        let vols: Vec<&FileInfo> = many.iter().collect();
+        let got = super::super::steps::xref_order(&vols, 0, |v| {
+            Ok::<_, ()>((1..=crate::xref::LEADS as i64).map(|p| seg(&v.filename, p)).collect())
+        })
+        .unwrap();
+        assert_eq!(got.len(), crate::xref::HEAD_PROBES, "capped");
+    }
+
+    #[test]
     fn select_plan_table() {
         let f = [file("x.part02.rar", 5), file("x.part01.rar", 5), file("x.part03.rar", 5)];
         let p = plan(&f, 2);

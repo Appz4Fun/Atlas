@@ -51,6 +51,37 @@ pub(crate) fn tail_articles(ctx: &StepCtx<'_>, file: &FileInfo) -> Result<Vec<Se
     Ok(if last_is_there { segs } else { Vec::new() })
 }
 
+/// The articles to try as the first piece of an upload linked from its headers (`xref`), and their volumes: up to
+/// `xref::LEADS` of each volume, volume by volume, `xref::HEAD_PROBES` in all. Which volume goes first moves on by the
+/// hour, soo a run that found no first piece is followed by one that tries other volumes.
+fn xref_heads<'a>(ctx: &StepCtx<'_>, files: &'a [FileInfo]) -> Result<Vec<(Head<'a>, SegmentRef)>, StepError> {
+    let volumes = select::volumes(files);
+    let start = usize::try_from(chrono::Utc::now().timestamp() / 3600).unwrap_or(0);
+    Ok(xref_order(&volumes, start, |f| ctx.segments(f.id, &SegmentPick::First(crate::xref::LEADS)).map_err(retry))?
+        .into_iter()
+        .map(|(f, seg)| (Head { file: f, tail: f, probe: true }, seg))
+        .collect())
+}
+
+/// `volumes` from the one at `start` (wrapping), each with what `leads` gives of it, `xref::HEAD_PROBES` in all.
+pub(super) fn xref_order<'a, E>(
+    volumes: &[&'a FileInfo],
+    start: usize,
+    mut leads: impl FnMut(&FileInfo) -> Result<Vec<SegmentRef>, E>,
+) -> Result<Vec<(&'a FileInfo, SegmentRef)>, E> {
+    let mut out = Vec::new();
+    for k in 0..volumes.len() {
+        let f = volumes[(start + k) % volumes.len()];
+        for seg in leads(f)? {
+            if out.len() >= crate::xref::HEAD_PROBES {
+                return Ok(out);
+            }
+            out.push((f, seg));
+        }
+    }
+    Ok(out)
+}
+
 /// One whole article, within every budget. None: skip this candidate.
 pub(crate) fn fetch_one(ctx: &mut StepCtx<'_>, seg: &SegmentRef, file: &str) -> Result<Option<Vec<u8>>, StepError> {
     let wanted =
@@ -1277,8 +1308,23 @@ impl Step for ListStep {
         let gap = Duration::from_secs(60) / limits.probes_per_minute.max(1) as u32;
         // an NFO read looking for a password, kept for the probe and the other steps
         let mut nfo_writes = Vec::new();
-        for head in select::plan(&files, limits.probe_files.max(0) as usize) {
-            let Some(seg) = first_article(ctx, head.file)? else { continue };
+        // an upload linked from its headers (`xref`) has its parts in a guessed order: its volumes' likely first pieces
+        // are each tried, and only an archive's start is taken
+        let xref = crate::xref::is_upload(&rel_name);
+        let heads: Vec<(Head<'_>, Option<SegmentRef>)> = if xref {
+            left = left.max(crate::xref::HEAD_PROBES);
+            xref_heads(ctx, &files)?.into_iter().map(|(h, s)| (h, Some(s))).collect()
+        } else {
+            select::plan(&files, limits.probe_files.max(0) as usize).into_iter().map(|h| (h, None)).collect()
+        };
+        for (head, picked) in heads {
+            let seg = match picked {
+                Some(seg) => seg,
+                None => {
+                    let Some(seg) = first_article(ctx, head.file)? else { continue };
+                    seg
+                }
+            };
             if left == 0 {
                 break;
             }
@@ -1290,7 +1336,11 @@ impl Step for ListStep {
                 fetch_one(ctx, &seg, &head.file.filename)?
             };
             let Some(body) = body else { continue };
-            match identify(&body) {
+            let format = identify(&body);
+            if xref && !matches!(format, Format::Rar4 | Format::Rar5 | Format::Zip | Format::SevenZip) {
+                continue;
+            }
+            match format {
                 Format::Rar4 | Format::Rar5 => {
                     let mut listing = rar::list(&body);
                     let mut pw_found = None;
