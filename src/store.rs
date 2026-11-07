@@ -619,6 +619,29 @@ pub const FILE_TIMING: ShardTable = ShardTable {
     ],
 };
 
+/// The rows `split_uploads` made of one release, one per upload: each row's id and name and its upload's first and
+/// last Date (the poster's clock, as `file_timing` keeps them). A save sends each article of the release to the row
+/// of the upload whose window its Date is in or nearest (`route_uploads`), soo a reread of a later upload's window
+/// fills that upload's row, not the first's. The rows go with the first upload's row (`origin_id`).
+pub const UPLOAD_ROUTES: ShardTable = ShardTable {
+    name: "upload_routes",
+    create: "create table if not exists upload_routes (
+        origin_id  INTEGER NOT NULL,
+        release_id INTEGER NOT NULL,
+        name       TEXT NOT NULL,
+        first_date INTEGER,
+        last_date  INTEGER,
+        primary key (origin_id, release_id)
+    ) without rowid",
+    indexes: &[],
+    release_key: Some("origin_id"),
+    added: &[],
+};
+
+/// How far outside every upload's window an article's Date may be and still go to the nearest upload's row
+/// (`route_uploads`): further out, it is another posting, and goes where the save would put it anyway.
+pub(crate) const ROUTE_SLACK_SECS: i64 = 600;
+
 /// One save's articles of one file, as `file_timing` keeps them. `from_variants`
 /// counts runs of one From in arrival order, soo a poster that rotates
 /// identities counts high and a steady one stays at 1; `from_hash` is the From
@@ -1445,6 +1468,7 @@ pub(crate) fn split_uploads(
         seen
     };
     let mut rows = vec![release_id];
+    let mut names = vec![name.clone()];
     let mut taken = conn.prepare_cached("select 1 from releases where name = ? and group_name = ?")?;
     for u in 1..uploads {
         let mut digits = (release_id.wrapping_mul(31).wrapping_add(u as i64)).rem_euclid(100_000_000);
@@ -1460,6 +1484,7 @@ pub(crate) fn split_uploads(
         )?
         .execute(params![id, twin, group, poster, posted, display, obfuscated, file_total])?;
         rows.push(id);
+        names.push(twin);
     }
     for (((file, filename, subject, _, _, expected, ftotal), by), file_facts) in files.iter().zip(&parts).zip(&facts) {
         for (u, segs) in by.iter().enumerate() {
@@ -1527,6 +1552,20 @@ pub(crate) fn split_uploads(
              on conflict(release_id) do update set due_at = min(pp_queue.due_at, excluded.due_at)",
         )?
         .execute([id])?;
+    }
+    // each upload's posting window, soo later saves of its articles (a reread of its window) find its row
+    let mut spans: Vec<Option<(i64, i64)>> = vec![None; uploads];
+    for (mid, u) in upload_of {
+        if let (Some(t), Some(span)) = (dates.get(mid).copied(), spans.get_mut(*u)) {
+            *span = Some(span.map_or((t, t), |(a, b)| (a.min(t), b.max(t))));
+        }
+    }
+    for ((id, row_name), span) in rows.iter().zip(&names).zip(&spans) {
+        conn.prepare_cached(
+            "insert or replace into upload_routes (origin_id, release_id, name, first_date, last_date)
+             values (?, ?, ?, ?, ?)",
+        )?
+        .execute(params![release_id, id, row_name, span.map(|s| s.0), span.map(|s| s.1)])?;
     }
     conn.prepare_cached("update meta set value = value + ? where key = 'releases'")?.execute([(uploads - 1) as i64])?;
     Ok(Some(rows.split_off(1)))
@@ -2156,17 +2195,27 @@ impl ShardWriter {
             // nothing is ever saved for a blocked group, whichever path it came by
             let mut releases: Vec<Cow<'_, Release>> = Vec::new();
             let frozen = frozen_attached && crate::frozen::any(&tx)?;
+            // a release split into one row per upload: its articles go to their upload's row
+            let routed = tx.prepare_cached("select 1 from upload_routes limit 1")?.exists([])?;
             for release in batches.into_iter().flatten().filter(|r| !crate::filters::group_blocked(&r.group)) {
-                if frozen {
-                    let collection = release.collection.as_deref().map(|c| key.hash(c));
-                    let articles: Vec<(&str, &str)> = release
-                        .articles
-                        .iter()
-                        .filter_map(|a| a.release_name.as_deref().map(|n| (n, a.author.as_str())))
-                        .collect();
-                    crate::frozen::thaw_incoming(&tx, collection, &release.name, &articles, &release.group, now)?;
+                let pieces = if routed { route_uploads(&tx, &key, release)? } else { vec![Cow::Borrowed(release)] };
+                for piece in pieces {
+                    if frozen {
+                        let collection = piece.collection.as_deref().map(|c| key.hash(c));
+                        let articles: Vec<(&str, &str)> = piece
+                            .articles
+                            .iter()
+                            .filter_map(|a| a.release_name.as_deref().map(|n| (n, a.author.as_str())))
+                            .collect();
+                        crate::frozen::thaw_incoming(&tx, collection, &piece.name, &articles, &piece.group, now)?;
+                    }
+                    match piece {
+                        Cow::Borrowed(r) => releases.extend(split_old_rows(&tx, grouping_from, r)?),
+                        Cow::Owned(r) => releases.extend(
+                            split_old_rows(&tx, grouping_from, &r)?.into_iter().map(|c| Cow::Owned(c.into_owned())),
+                        ),
+                    }
                 }
-                releases.extend(split_old_rows(&tx, grouping_from, release)?);
             }
 
             for release in releases.iter().map(Cow::as_ref) {
@@ -2378,6 +2427,79 @@ pub fn start_grouping(main: &Path) -> Result<()> {
         )?;
     }
     Ok(())
+}
+
+/// A release whose row `split_uploads` made one row per upload of, in pieces: each article to the row of the upload
+/// whose posting window (`upload_routes`) its Date is in, or nearest within `ROUTE_SLACK_SECS`. The first upload's
+/// articles, and any with no Date or far from every window, stay in the release as it came; another upload's go in a
+/// piece named as its row, with no collection, soo the upsert finds that row. A release of no split row comes back as
+/// it is.
+fn route_uploads<'a>(tx: &Connection, key: &IdKey, release: &'a Release) -> Result<Vec<Cow<'a, Release>>> {
+    let origin: Option<i64> = match release.collection.as_deref() {
+        Some(c) => tx
+            .prepare_cached("select release_id from collections where key = ?")?
+            .query_row([key.hash(c)], |r| r.get(0))
+            .optional()?,
+        None => tx
+            .prepare_cached("select id from releases where name = ? and group_name = ?")?
+            .query_row(params![release.name, release.group], |r| r.get(0))
+            .optional()?,
+    };
+    let Some(origin) = origin else { return Ok(vec![Cow::Borrowed(release)]) };
+    type Route = (i64, String, Option<i64>, Option<i64>);
+    let routes: Vec<Route> = tx
+        .prepare_cached("select release_id, name, first_date, last_date from upload_routes where origin_id = ?")?
+        .query_map([origin], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+        .collect::<Result<_>>()?;
+    if routes.len() < 2 {
+        return Ok(vec![Cow::Borrowed(release)]);
+    }
+    // each article's upload row: None, it stays
+    let route_of = |a: &Article| -> Option<usize> {
+        let t = crate::dates::naive_timestamp(&a.date)?;
+        let (i, far) = routes
+            .iter()
+            .enumerate()
+            .filter_map(|(i, (_, _, first, last))| {
+                let (first, last) = ((*first)?, (*last)?);
+                Some((i, if t < first { first - t } else { t.saturating_sub(last).max(0) }))
+            })
+            .min_by_key(|(_, far)| *far)?;
+        (far <= ROUTE_SLACK_SECS && routes.get(i).is_some_and(|r| r.0 != origin)).then_some(i)
+    };
+    let mut by_route: IndexMap<usize, Vec<Article>> = IndexMap::new();
+    let mut stay = Vec::new();
+    for a in &release.articles {
+        match route_of(a) {
+            Some(i) => by_route.entry(i).or_default().push(a.clone()),
+            None => stay.push(a.clone()),
+        }
+    }
+    if by_route.is_empty() {
+        return Ok(vec![Cow::Borrowed(release)]);
+    }
+    let piece = |name: &str, collection: Option<String>, articles: Vec<Article>| Release {
+        name: name.to_string(),
+        size: articles.iter().map(|a| a.bytes).sum(),
+        is_obfuscated: release.is_obfuscated,
+        display_name: release.display_name.clone(),
+        complete: false,
+        group: release.group.clone(),
+        poster: release.poster.clone(),
+        date: release.date.clone(),
+        collection,
+        articles,
+    };
+    let mut pieces = Vec::new();
+    if !stay.is_empty() {
+        pieces.push(Cow::Owned(piece(&release.name, release.collection.clone(), stay)));
+    }
+    for (i, articles) in by_route {
+        if let Some((_, name, ..)) = routes.get(i) {
+            pieces.push(Cow::Owned(piece(name, None, articles)));
+        }
+    }
+    Ok(pieces)
 }
 
 /// A collection's articles that were saved, or started, under their own file
@@ -3359,6 +3481,27 @@ mod tests {
             .query_row("select count(*) from pp_queue where release_id in (?, ?)", [id, new[0]], |r| r.get(0))
             .unwrap();
         assert_eq!(queued, 2);
+
+        // later saves: an article dated in (or just past) the second upload's window goes to its row, one in the
+        // first's or far from both stays in the first row
+        let routes: i64 =
+            conn.query_row("select count(*) from upload_routes where origin_id = ?", [id], |r| r.get(0)).unwrap();
+        assert_eq!(routes, 2);
+        let late = |mid: &str, file: &str, at: i64| Article {
+            message_id: format!("<{mid}@x>"),
+            date: chrono::DateTime::from_timestamp(at, 0).unwrap().format("%a, %d %b %Y %H:%M:%S +0000").to_string(),
+            ..art(file, 2, 0)
+        };
+        let articles = vec![
+            late("b.rar.2.reread", "b.rar", 4_600 + 120),
+            late("a.rar.2.first", "a.rar", 1_000),
+            late("a.rar.2.far", "a.rar", 100_000),
+        ];
+        save(&main, &[Release { name: "Rel".into(), group: "alt.binaries.t".into(), articles, ..Default::default() }])
+            .unwrap();
+        assert!(mids(new[0]).contains(&"b.rar.2.reread@x".to_string()), "{:?}", mids(new[0]));
+        assert!(mids(id).contains(&"a.rar.2.first@x".to_string()) && mids(id).contains(&"a.rar.2.far@x".to_string()));
+        assert_eq!((row(id).2, row(new[0]).2), (6, 5));
     }
     #[test]
     fn file_timing_folds_each_save() {
