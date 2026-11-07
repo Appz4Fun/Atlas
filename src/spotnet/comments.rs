@@ -63,7 +63,9 @@ pub fn create(conn: &Connection) -> Result<()> {
          where key like 'spots\\_cursor:free.usenet:%' escape '\\'
             or key like 'spots\\_cursor:free.willey:%' escape '\\';
         delete from meta where key like 'spots\\_cursor:free.usenet:%' escape '\\'
-            or key like 'spots\\_cursor:free.willey:%' escape '\\';",
+            or key like 'spots\\_cursor:free.willey:%' escape '\\';
+        drop index if exists spot_comments_seen;
+        drop index if exists spot_reports_seen;",
     )?;
     // tables made by #243, before `seen`
     for table in ["spot_comments", "spot_reports"] {

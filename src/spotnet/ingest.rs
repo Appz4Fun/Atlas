@@ -105,7 +105,10 @@ pub async fn pass(pool: &Arc<Pool>, db: &Db, config: &SpotsConfig, stopping: &im
     (done.read, done.noted) = read_overview(pool, db, config, stopping).await?;
 
     let now = chrono::Utc::now().timestamp();
-    on_db(db, move |conn| Ok(store::prune(conn, now)? + comments::prune(conn, now)?)).await?;
+    // the comment task prunes its own tables when it runs
+    let comments_off = !config.comments;
+    on_db(db, move |conn| Ok(store::prune(conn, now)? + if comments_off { comments::prune(conn, now)? } else { 0 }))
+        .await?;
     match backfill_xml(pool, db, stopping).await {
         Ok(0) => {}
         Ok(n) => println!("spots: read the XML of {n} spots saved before it was kept"),
@@ -471,9 +474,11 @@ struct Said {
 /// skipped, and the texts are read whatever came of the groups. The first failed read ends the texts for this pass.
 async fn said(pool: &Arc<Pool>, db: &Db, config: &SpotsConfig, stopping: &impl Fn() -> bool) -> Result<Said> {
     let mut done = Said::default();
-    // these tables are this task's: pruned here too, whether or not the spot pass gets that far
+    // these tables are this task's to prune; a failed prune doesn't hold up the rest
     let now = chrono::Utc::now().timestamp();
-    on_db(db, move |conn| Ok(comments::prune(conn, now)?)).await?;
+    if let Err(e) = on_db(db, move |conn| Ok(comments::prune(conn, now)?)).await {
+        eprintln!("spots: comments: prune: {e:#}");
+    }
     for (group, reports) in [(comments::COMMENT_GROUP, false), (comments::REPORT_GROUP, true)] {
         match read_group(pool, db, group, reports, config.comment_days, stopping).await {
             Ok(n) if reports => done.reports = n,
