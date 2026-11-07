@@ -36,8 +36,7 @@ const PASS_EVERY: Duration = Duration::from_secs(60);
 /// what the name of every upload saved here starts with (`is_upload`)
 pub const NAME_PREFIX: &str = "xref-upload-";
 /// a volume's articles the archive step tries as its first piece: the first a group got of it, in each group. Piece
-/// order isn't in the headers, and on the Wheel of Time upload the first piece was the first its group got in 8 of 40
-/// volumes
+/// order isn't in the headers, but the first piece goes up first, soo it is most likely the lowest numbered in its group
 pub const LEADS: usize = 6;
 /// the most first-piece guesses the archive step makes for one upload, over its volumes in turn
 pub const HEAD_PROBES: usize = 40;
