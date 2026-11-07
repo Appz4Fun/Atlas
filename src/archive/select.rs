@@ -260,12 +260,15 @@ pub fn par2_name_map(
         return out;
     };
     let is_par2 = |name: &str| matches!(classify(name), Kind::Par2Base | Kind::Par2Vol(_));
-    let mut unmatched_par2: Vec<(String, u64)> = rows.flatten().filter(|(name, _)| !is_par2(name)).collect();
+    let mut unmatched_par2: Vec<(String, u64)> =
+        rows.flatten().filter(|(name, _)| !is_par2(name)).collect();
     if unmatched_par2.is_empty() {
         return out;
     }
-    let mut unmatched_files: Vec<&FileInfo> =
-        files.iter().filter(|f| !is_par2(&f.filename) && !out.contains_key(&f.filename)).collect();
+    let mut unmatched_files: Vec<&FileInfo> = files
+        .iter()
+        .filter(|f| !is_par2(&f.filename) && !out.contains_key(&f.filename))
+        .collect();
     unmatched_files.retain(|f| {
         if let Some(pos) = unmatched_par2.iter().position(|(name, _)| name.eq_ignore_ascii_case(&f.filename)) {
             let (par2_name, _) = unmatched_par2.remove(pos);
@@ -284,14 +287,16 @@ pub fn par2_name_map(
     if let Ok(mut wstmt) = conn.prepare_cached(
         "select id, coalesce((select sum(bytes) from segments where file_id = files.id), 0), blob
          from files where release_id = ?1",
-    ) && let Ok(wrows) = wstmt
-        .query_map([release_id], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, Option<Vec<u8>>>(2)?)))
-    {
+    ) && let Ok(wrows) = wstmt.query_map([release_id], |r| {
+        Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, Option<Vec<u8>>>(2)?))
+    }) {
         for (fid, seg_bytes, blob) in wrows.flatten() {
             let bytes = if seg_bytes > 0 {
                 seg_bytes as u64
             } else if let Some(b) = blob.filter(|b| !crate::blob::is_remote(b)) {
-                crate::blob::decode(&b).map(|segs| segs.iter().map(|s| s.bytes.max(0) as u64).sum()).unwrap_or(0)
+                crate::blob::decode(&b)
+                    .map(|segs| segs.iter().map(|s| s.bytes.max(0) as u64).sum())
+                    .unwrap_or(0)
             } else {
                 0
             };
@@ -381,7 +386,8 @@ pub fn nzb_sources_with_par2<'a>(
     let mut found: Vec<&FileInfo> = files
         .iter()
         .filter(|f| {
-            classify(&f.filename) == Kind::Nzb || par2_names.get(&f.filename).is_some_and(|p| classify(p) == Kind::Nzb)
+            classify(&f.filename) == Kind::Nzb
+                || par2_names.get(&f.filename).is_some_and(|p| classify(p) == Kind::Nzb)
         })
         .filter(|f| (1..=super::nzb::MAX_NZB_PARTS).contains(&parts(f)) && f.parts_seen >= parts(f))
         .collect();

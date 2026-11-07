@@ -68,7 +68,11 @@ enum View {
     /// decoded from `from` on
     Decode { from: usize, codec: Codec },
     /// decrypted (and, when compressed, decoded) from `from` on
-    Decrypted { from: usize, out: Vec<u8>, capped: bool },
+    Decrypted {
+        from: usize,
+        out: Vec<u8>,
+        capped: bool,
+    },
     /// not reached: the reason why
     Stop(&'static str),
 }
@@ -156,9 +160,13 @@ pub fn unwrap_for_with_password<'a>(
     let mut outer_at = Some(0usize);
     let mut budget = max_decoded;
     let mut rar4_cache = crate::archive::rar::Rar4KeyCache::default();
-    while let Some(Opened { mut layer, view }) =
-        open(&buf[lo..hi], want, if layers.len() >= MAX_DEPTH { None } else { password }, budget, &mut rar4_cache)
-    {
+    while let Some(Opened { mut layer, view }) = open(
+        &buf[lo..hi],
+        want,
+        if layers.len() >= MAX_DEPTH { None } else { password },
+        budget,
+        &mut rar4_cache,
+    ) {
         // a name comes from the poster's bytes: keep what a name needs
         layer.name = layer.name.map(|n| cap_name(&n));
         if layers.len() == MAX_DEPTH {
@@ -580,9 +588,10 @@ fn decrypt_entry(
                         "deflate64" => (Codec::Deflate64, dec.as_slice()),
                         "bzip2" => (Codec::Bzip2, dec.as_slice()),
                         "zstd" => (Codec::Zstd, dec.as_slice()),
-                        "ppmd" => {
-                            (Codec::PpmdZip { size: head.unpacked, packed: Some(dec.len() as u64) }, dec.as_slice())
-                        }
+                        "ppmd" => (
+                            Codec::PpmdZip { size: head.unpacked, packed: Some(dec.len() as u64) },
+                            dec.as_slice(),
+                        ),
                         "lzma" => {
                             let (skip, props) = zip_lzma(&dec).ok_or("damaged")?;
                             (Codec::Lzma { props, size: head.unpacked }, dec.get(skip..).ok_or("damaged")?)

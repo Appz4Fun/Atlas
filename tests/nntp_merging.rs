@@ -3,8 +3,9 @@
 
 use atlas::gf2::{crc32, crc32_combine, crc32_unzero, fold_yenc_parts};
 use atlas::merging::{
-    ArticleHead, CandidateFileRun, Deobfuscator, InterReleaseDeduplication, IntraReleaseGrouping, IntraReleaseVeto,
-    JoinOptions, MergeResult, Par2Bridge, ReleaseAssembler, ReleaseCandidate, ReleasePartition, VetoDsu,
+    ArticleHead, CandidateFileRun, Deobfuscator, InterReleaseDeduplication,
+    IntraReleaseGrouping, IntraReleaseVeto, JoinOptions, MergeResult, Par2Bridge,
+    ReleaseAssembler, ReleaseCandidate, ReleasePartition, VetoDsu,
 };
 use md5::Digest;
 
@@ -58,7 +59,11 @@ fn make_file_desc_packet(
     make_par2_packet(set_id, b"PAR 2.0\0FileDesc", &body)
 }
 
-fn make_ifsc_packet(set_id: [u8; 16], file_id: [u8; 16], slices: &[([u8; 16], u32)]) -> Vec<u8> {
+fn make_ifsc_packet(
+    set_id: [u8; 16],
+    file_id: [u8; 16],
+    slices: &[([u8; 16], u32)],
+) -> Vec<u8> {
     let mut body = Vec::new();
     body.extend_from_slice(&file_id);
     for (md5, crc) in slices {
@@ -162,7 +167,11 @@ fn tc_t1_f11_2_50_file_batman_knightfall_reassembly() {
     }
 
     let joined = ReleaseAssembler::join_runs(&runs, None);
-    assert_eq!(joined.len(), 1, "Batman Knightfall: all 50 sprayed files must reassemble into 1 unified release");
+    assert_eq!(
+        joined.len(),
+        1,
+        "Batman Knightfall: all 50 sprayed files must reassemble into 1 unified release"
+    );
     assert_eq!(joined[0].runs.len(), 50);
     assert_eq!(joined[0].total_size, 50 * 50_000_000);
 }
@@ -359,7 +368,10 @@ fn tc_t1_f12_1_standard_two_part_crc32_combination() {
 fn tc_t1_f12_2_multi_part_yenc_pcrc32_folding() {
     let data: Vec<u8> = (0..500_000).map(|i| (i * 37 % 256) as u8).collect();
     let part_size = 50_000;
-    let parts: Vec<(u32, usize)> = data.chunks(part_size).map(|chunk| (crc32(chunk), chunk.len())).collect();
+    let parts: Vec<(u32, usize)> = data
+        .chunks(part_size)
+        .map(|chunk| (crc32(chunk), chunk.len()))
+        .collect();
 
     let folded = fold_yenc_parts(&parts).expect("folding must succeed");
     let expected_whole = crc32(&data);
@@ -402,7 +414,10 @@ fn tc_t1_f12_5_whole_file_cross_verification() {
 
     // Stream 1: yEnc articles of 716,800 B
     let yenc_slice = 716_800;
-    let yenc_parts: Vec<(u32, usize)> = data.chunks(yenc_slice).map(|c| (crc32(c), c.len())).collect();
+    let yenc_parts: Vec<(u32, usize)> = data
+        .chunks(yenc_slice)
+        .map(|c| (crc32(c), c.len()))
+        .collect();
     let yenc_folded = fold_yenc_parts(&yenc_parts).unwrap();
 
     // Stream 2: PAR2 slices of 393,216 B
@@ -418,8 +433,11 @@ fn tc_t1_f12_5_whole_file_cross_verification() {
     // Fold PAR2 IFSC slices with last slice unpadded
     let mut ifsc_folded = 0u32;
     for (i, &(padded_crc, actual_len, pad_len)) in par2_slices.iter().enumerate() {
-        let slice_crc =
-            if i + 1 == par2_slices.len() && pad_len > 0 { crc32_unzero(padded_crc, pad_len) } else { padded_crc };
+        let slice_crc = if i + 1 == par2_slices.len() && pad_len > 0 {
+            crc32_unzero(padded_crc, pad_len)
+        } else {
+            padded_crc
+        };
         ifsc_folded = crc32_combine(ifsc_folded, slice_crc, actual_len);
     }
 
@@ -569,7 +587,10 @@ fn tc_t1_f13_2_16kb_md5_tie_breaker_on_equal_sizes() {
             is_obfuscated: true,
         });
 
-        heads.push(ArticleHead { file_index: (i - 1) as usize, payload: head_payload });
+        heads.push(ArticleHead {
+            file_index: (i - 1) as usize,
+            payload: head_payload,
+        });
     }
 
     let main = make_main_packet(set_id, 250_000, &file_ids);
@@ -597,8 +618,7 @@ fn tc_t1_f13_3_single_par2_body_fetch_efficiency() {
         let file_id = [(i % 256) as u8; 16];
         file_ids.push(file_id);
         let size = 10_000_000 + (i as u64) * 10_000;
-        let desc =
-            make_file_desc_packet(set_id, file_id, [i as u8; 16], [i as u8; 16], size, &format!("Vol.{:03}.rar", i));
+        let desc = make_file_desc_packet(set_id, file_id, [i as u8; 16], [i as u8; 16], size, &format!("Vol.{:03}.rar", i));
         par2_data.extend_from_slice(&desc);
 
         runs.push(CandidateFileRun {
@@ -966,7 +986,10 @@ fn tc_t1_f15_4_twin_release_graph_partitioning() {
         yenc_part_size: Some(750_000),
     };
 
-    assert_eq!(InterReleaseDeduplication::partition_releases(&rel1, &rel2), ReleasePartition::Twin);
+    assert_eq!(
+        InterReleaseDeduplication::partition_releases(&rel1, &rel2),
+        ReleasePartition::Twin
+    );
 }
 
 #[test]
@@ -995,5 +1018,8 @@ fn tc_t1_f15_5_alt_release_graph_partitioning() {
         yenc_part_size: Some(750_000),
     };
 
-    assert_eq!(InterReleaseDeduplication::partition_releases(&rel1, &rel2), ReleasePartition::Alt);
+    assert_eq!(
+        InterReleaseDeduplication::partition_releases(&rel1, &rel2),
+        ReleasePartition::Alt
+    );
 }

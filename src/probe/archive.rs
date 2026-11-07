@@ -136,7 +136,8 @@ fn rar4(
     while out.len() < max {
         if encrypted_headers {
             let Some(pw) = password.filter(|pw| !pw.is_empty()) else { break };
-            let Some((hdr_bytes, hdr, block_salt)) = crate::archive::rar::decrypt_rar4_header(data, at, pw, salt_cache)
+            let Some((hdr_bytes, hdr, block_salt)) =
+                crate::archive::rar::decrypt_rar4_header(data, at, pw, salt_cache)
             else {
                 break;
             };
@@ -253,7 +254,9 @@ fn rar4_file(
     let high = if flags & 0x0100 != 0 { 8 } else { 0 };
     let name_end = 32 + high + name_len;
     // within this header, and no longer than a name needs
-    head.name = hdr.get(32 + high..name_end.min(size)).map(|n| name_of(n.split(|b| *b == 0).next().unwrap_or(n)));
+    head.name = hdr
+        .get(32 + high..name_end.min(size))
+        .map(|n| name_of(n.split(|b| *b == 0).next().unwrap_or(n)));
     head.encrypted = flags & 0x0004 != 0 || headers_encrypted;
     head.headers_encrypted = headers_encrypted;
     if flags & 0x0400 != 0 {
@@ -531,7 +534,11 @@ pub enum DecompressError {
 pub struct ArchiveStream;
 
 impl ArchiveStream {
-    pub fn decompress(format: ArchiveFormat, input: &[u8], limit: usize) -> Result<Vec<u8>, DecompressError> {
+    pub fn decompress(
+        format: ArchiveFormat,
+        input: &[u8],
+        limit: usize,
+    ) -> Result<Vec<u8>, DecompressError> {
         let max_allowed = limit.min(crate::probe::nest::MAX_DECODED);
         let max_ratio_limit = input.len().saturating_mul(crate::probe::nest::MAX_RATIO);
         let effective_limit = max_allowed.min(max_ratio_limit);
@@ -586,7 +593,8 @@ impl ArchiveStream {
                 Ok(buf)
             }
             ArchiveFormat::Rar5 => {
-                let (buf, end) = crate::probe::codec::rar5::rar5(input, false, None, effective_limit.saturating_add(1));
+                let (buf, end) =
+                    crate::probe::codec::rar5::rar5(input, false, None, effective_limit.saturating_add(1));
                 if end == crate::probe::lzma::End::Limit || buf.len() > effective_limit {
                     return Err(limit_err);
                 }

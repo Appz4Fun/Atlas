@@ -46,9 +46,15 @@ fn test_steady_state_rate_enforcement() {
         let elapsed = started.elapsed();
 
         // Must take at least 180ms (accounting for scheduling granularity)
-        assert!(elapsed >= Duration::from_millis(180), "rate limiter did not throttle: elapsed {elapsed:?}");
+        assert!(
+            elapsed >= Duration::from_millis(180),
+            "rate limiter did not throttle: elapsed {elapsed:?}"
+        );
         // And should not exceed 400ms
-        assert!(elapsed < Duration::from_millis(400), "rate limiter took excessively long: elapsed {elapsed:?}");
+        assert!(
+            elapsed < Duration::from_millis(400),
+            "rate limiter took excessively long: elapsed {elapsed:?}"
+        );
     });
 }
 
@@ -63,7 +69,10 @@ fn test_burst_allowance_verification() {
         let t0 = Instant::now();
         limiter.acquire(burst as usize).await;
         let burst_elapsed = t0.elapsed();
-        assert!(burst_elapsed < Duration::from_millis(20), "burst acquire stalled: {burst_elapsed:?}");
+        assert!(
+            burst_elapsed < Duration::from_millis(20),
+            "burst acquire stalled: {burst_elapsed:?}"
+        );
 
         // Subsequent immediate acquire of 1 MB must delay by approx 1MB / 93.75MB/s ~= 10.6ms
         let t1 = Instant::now();
@@ -140,7 +149,10 @@ fn test_rate_limiter_reset_and_refill() {
 
         // In 100ms at 93,750,000 B/s: expected refill = 9,375,000 bytes (+- 15%)
         let tokens = limiter.available_tokens();
-        assert!((7_500_000..=10_000_000).contains(&tokens), "refill did not match expected rate: got {tokens}");
+        assert!(
+            (7_500_000..=10_000_000).contains(&tokens),
+            "refill did not match expected rate: got {tokens}"
+        );
     });
 }
 
@@ -158,8 +170,14 @@ fn test_deadlock_avoidance_oversized_acquisition() {
         let elapsed = started.elapsed();
 
         // 12MB - 4MB burst = 8MB deficit at 100MB/s => ~80ms
-        assert!(elapsed < Duration::from_secs(2), "deadlock occurred on oversized acquisition: {elapsed:?}");
-        assert!(elapsed >= Duration::from_millis(60), "expected throttling on oversized acquisition: {elapsed:?}");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "deadlock occurred on oversized acquisition: {elapsed:?}"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(60),
+            "expected throttling on oversized acquisition: {elapsed:?}"
+        );
     });
 }
 
@@ -211,7 +229,10 @@ fn test_channel_capacity_bound_backpressure() {
 
         // Producer must pause and cannot send all 2048 items while consumer has not read
         let sent_so_far = items_sent.load(Ordering::Relaxed);
-        assert!(sent_so_far <= 1025, "producer exceeded bounded channel buffer: sent {sent_so_far}");
+        assert!(
+            sent_so_far <= 1025,
+            "producer exceeded bounded channel buffer: sent {sent_so_far}"
+        );
         assert!(!finished.load(Ordering::Relaxed));
 
         // Now drain 500 items
@@ -221,7 +242,10 @@ fn test_channel_capacity_bound_backpressure() {
 
         tokio::time::sleep(Duration::from_millis(50)).await;
         let sent_after_drain = items_sent.load(Ordering::Relaxed);
-        assert!(sent_after_drain > sent_so_far, "producer did not resume after downstream drain");
+        assert!(
+            sent_after_drain > sent_so_far,
+            "producer did not resume after downstream drain"
+        );
 
         // Drain remaining
         while rx.recv().await.is_some() {
@@ -252,7 +276,10 @@ fn test_adversarial_burst_edge_case_20mb() {
             elapsed_single >= Duration::from_millis(90),
             "20 MB burst was not throttled properly: {elapsed_single:?}"
         );
-        assert!(elapsed_single < Duration::from_millis(300), "20 MB burst deadlocked or lagged: {elapsed_single:?}");
+        assert!(
+            elapsed_single < Duration::from_millis(300),
+            "20 MB burst deadlocked or lagged: {elapsed_single:?}"
+        );
 
         // Part 2: Concurrent burst: two tasks simultaneously request 20 MB each (total 40 MB)
         // Reset bucket to full burst capacity
@@ -298,7 +325,10 @@ fn test_adversarial_microsecond_precision_fractional_accumulation() {
         }
         let elapsed = t0.elapsed();
         // 50,000 acquires should execute in under 300 ms without lock thrashing or deadlocks
-        assert!(elapsed < Duration::from_millis(300), "rapid 1-byte acquisitions were excessively slow: {elapsed:?}");
+        assert!(
+            elapsed < Duration::from_millis(300),
+            "rapid 1-byte acquisitions were excessively slow: {elapsed:?}"
+        );
 
         // Sub-test B: Microsecond fractional nanosecond accumulation without token loss
         limiter.set_tokens(0);
@@ -346,7 +376,10 @@ fn test_adversarial_high_concurrency_100_tasks() {
                 b_count.fetch_add(bytes_per_task as u64, Ordering::Relaxed);
                 c_count.fetch_add(1, Ordering::Relaxed);
                 let duration = start_task.elapsed();
-                assert!(duration < Duration::from_secs(3), "task {task_id} suffered starvation: {duration:?}");
+                assert!(
+                    duration < Duration::from_secs(3),
+                    "task {task_id} suffered starvation: {duration:?}"
+                );
             }));
         }
 
@@ -359,8 +392,14 @@ fn test_adversarial_high_concurrency_100_tasks() {
         assert_eq!(total_bytes.load(Ordering::Relaxed), 6_400_000);
 
         // 6.4 MB at 93.75 MB/s => theoretical duration 68.26 ms
-        assert!(elapsed >= Duration::from_millis(55), "concurrency violated rate limit: elapsed {elapsed:?}");
-        assert!(elapsed < Duration::from_millis(500), "concurrency deadlocked or lagged: elapsed {elapsed:?}");
+        assert!(
+            elapsed >= Duration::from_millis(55),
+            "concurrency violated rate limit: elapsed {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "concurrency deadlocked or lagged: elapsed {elapsed:?}"
+        );
     });
 }
 
@@ -413,10 +452,14 @@ fn test_adversarial_loopback_wire_benchmark_750mbit_bounds() {
         );
 
         // Target: [712.5, 750.0] Mbit/s (95% to 100% of 750 Mbit/s)
-        assert!(throughput_mbps <= 750.01, "rate limiter exceeded 750 Mbit/s ceiling: {throughput_mbps:.2} Mbit/s");
+        assert!(
+            throughput_mbps <= 750.01,
+            "rate limiter exceeded 750 Mbit/s ceiling: {throughput_mbps:.2} Mbit/s"
+        );
         assert!(
             throughput_mbps >= 712.5,
             "rate limiter underperformed 712.5 Mbit/s bound: {throughput_mbps:.2} Mbit/s"
         );
     });
 }
+

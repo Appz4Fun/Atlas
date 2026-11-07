@@ -12,10 +12,10 @@
 //! - TC-T2-F28-3: Git Branch & Tag Name Scrubbing
 //! - TC-T2-F28-4: Working Tree & Staged Changes Privacy Audit
 
-use regex::Regex;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
+use regex::Regex;
 
 /// Dynamic builder for barred first name to avoid static string detection in test source.
 fn forbidden_first_name() -> String {
@@ -47,7 +47,10 @@ fn barred_home_regex() -> Regex {
 
 /// Executes a git command in the repository root and returns stdout as a String.
 fn run_git(args: &[&str]) -> Result<String, String> {
-    let output = Command::new("git").args(args).output().map_err(|e| format!("failed to execute git {args:?}: {e}"))?;
+    let output = Command::new("git")
+        .args(args)
+        .output()
+        .map_err(|e| format!("failed to execute git {args:?}: {e}"))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -85,9 +88,18 @@ fn test_tc_t1_f28_1_repository_git_log_cleanliness() {
     let home_re = barred_home_regex();
 
     for line in log_messages.lines() {
-        assert!(!name_re.is_match(line), "Privacy violation: barred personal name found in commit message: {line}");
-        assert!(!path_re.is_match(line), "Privacy violation: barred host path found in commit message: {line}");
-        assert!(!home_re.is_match(line), "Privacy violation: barred home path found in commit message: {line}");
+        assert!(
+            !name_re.is_match(line),
+            "Privacy violation: barred personal name found in commit message: {line}"
+        );
+        assert!(
+            !path_re.is_match(line),
+            "Privacy violation: barred host path found in commit message: {line}"
+        );
+        assert!(
+            !home_re.is_match(line),
+            "Privacy violation: barred home path found in commit message: {line}"
+        );
     }
 }
 
@@ -97,8 +109,8 @@ fn test_tc_t1_f28_1_repository_git_log_cleanliness() {
 #[test]
 fn test_tc_t1_f28_2_commit_author_and_email_compliance() {
     let Some(range) = pr_commit_range() else {
-        let head_author =
-            run_git(&["log", "-n", "1", "HEAD", "--format=%an <%ae>"]).expect("git log HEAD author failed");
+        let head_author = run_git(&["log", "-n", "1", "HEAD", "--format=%an <%ae>"])
+            .expect("git log HEAD author failed");
         let name_re = barred_name_regex();
         for line in head_author.lines().filter(|l| !l.trim().is_empty()) {
             assert!(!name_re.is_match(line), "Barred personal name in HEAD author: {line}");
@@ -107,7 +119,8 @@ fn test_tc_t1_f28_2_commit_author_and_email_compliance() {
         return;
     };
 
-    let authors = run_git(&["log", range, "--format=%an <%ae>"]).expect("git log authors failed");
+    let authors = run_git(&["log", range, "--format=%an <%ae>"])
+        .expect("git log authors failed");
 
     let expected_author = "xbmc4lyfe <273732874+xbmc4lyfe@users.noreply.github.com>";
     let lines: Vec<&str> = authors.lines().filter(|l| !l.trim().is_empty()).collect();
@@ -141,9 +154,18 @@ fn test_tc_t1_f28_3_commit_diffs_privacy() {
     for line in diff_output.lines() {
         // Only inspect added lines
         if line.starts_with('+') && !line.starts_with("+++") {
-            assert!(!name_re.is_match(line), "Privacy violation: barred name introduced in diff: {line}");
-            assert!(!path_re.is_match(line), "Privacy violation: barred host path introduced in diff: {line}");
-            assert!(!home_re.is_match(line), "Privacy violation: barred home path introduced in diff: {line}");
+            assert!(
+                !name_re.is_match(line),
+                "Privacy violation: barred name introduced in diff: {line}"
+            );
+            assert!(
+                !path_re.is_match(line),
+                "Privacy violation: barred host path introduced in diff: {line}"
+            );
+            assert!(
+                !home_re.is_match(line),
+                "Privacy violation: barred home path introduced in diff: {line}"
+            );
         }
     }
 }
@@ -157,18 +179,24 @@ fn test_tc_t1_f28_4_commit_signatures_verified() {
         return;
     };
 
-    let has_allowed_signers =
-        run_git(&["config", "--get", "gpg.ssh.allowedSignersFile"]).ok().is_some_and(|p| Path::new(p.trim()).exists());
+    let has_allowed_signers = run_git(&["config", "--get", "gpg.ssh.allowedSignersFile"])
+        .ok()
+        .is_some_and(|p| Path::new(p.trim()).exists());
 
     if has_allowed_signers {
-        let sig_output = run_git(&["log", range, "--show-signature"]).expect("git log show-signature failed");
+        let sig_output = run_git(&["log", range, "--show-signature"])
+            .expect("git log show-signature failed");
 
         assert!(
-            sig_output
-                .contains("Good \"git\" signature for 273732874+xbmc4lyfe@users.noreply.github.com with ED25519 key"),
+            sig_output.contains(
+                "Good \"git\" signature for 273732874+xbmc4lyfe@users.noreply.github.com with ED25519 key"
+            ),
             "Missing or invalid OpenSSH signature in commit history: {sig_output}"
         );
-        assert!(!sig_output.contains("BAD signature"), "Commit signature verification reported BAD signature!");
+        assert!(
+            !sig_output.contains("BAD signature"),
+            "Commit signature verification reported BAD signature!"
+        );
     } else {
         let shas = run_git(&["rev-list", range]).expect("git rev-list failed");
         for sha in shas.lines().filter(|s| !s.trim().is_empty()) {
@@ -288,15 +316,22 @@ fn test_tc_t2_f28_2_base64_path_leak_detection() {
 /// Verifies that the active feature branch and all tags contain zero forbidden names.
 #[test]
 fn test_tc_t2_f28_3_branch_and_tag_name_scrubbing() {
-    let current_branch = run_git(&["branch", "--show-current"]).expect("git branch --show-current failed");
+    let current_branch = run_git(&["branch", "--show-current"])
+        .expect("git branch --show-current failed");
 
     let tags = run_git(&["tag"]).unwrap_or_default();
 
     let name_re = barred_name_regex();
-    assert!(!name_re.is_match(&current_branch), "Branch name contains barred pattern: {current_branch}");
+    assert!(
+        !name_re.is_match(&current_branch),
+        "Branch name contains barred pattern: {current_branch}"
+    );
 
     for tag in tags.lines() {
-        assert!(!name_re.is_match(tag), "Tag name contains barred pattern: {tag}");
+        assert!(
+            !name_re.is_match(tag),
+            "Tag name contains barred pattern: {tag}"
+        );
     }
 }
 
@@ -314,9 +349,18 @@ fn test_tc_t2_f28_4_working_tree_and_staged_privacy() {
     for diff in [&diff_worktree, &diff_staged] {
         for line in diff.lines() {
             if line.starts_with('+') && !line.starts_with("+++") {
-                assert!(!name_re.is_match(line), "Privacy violation in working tree: {line}");
-                assert!(!path_re.is_match(line), "Privacy violation in working tree: {line}");
-                assert!(!home_re.is_match(line), "Privacy violation in working tree: {line}");
+                assert!(
+                    !name_re.is_match(line),
+                    "Privacy violation in working tree: {line}"
+                );
+                assert!(
+                    !path_re.is_match(line),
+                    "Privacy violation in working tree: {line}"
+                );
+                assert!(
+                    !home_re.is_match(line),
+                    "Privacy violation in working tree: {line}"
+                );
             }
         }
     }

@@ -415,9 +415,8 @@ impl PasswordHarvester {
 
     fn harvest_subject(subject: &str, out: &mut Vec<String>) {
         static RE_BRACES: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\{\{([^}]+)\}\}").unwrap());
-        static RE_BRACKETS: LazyLock<Regex> = LazyLock::new(|| {
-            Regex::new(r"(?i)\[(?:pw|pwd|pass|password|passwurd|passwd|passwort)[:=]\s*([^\]]+)\]").unwrap()
-        });
+        static RE_BRACKETS: LazyLock<Regex> =
+            LazyLock::new(|| Regex::new(r"(?i)\[(?:pw|pwd|pass|password|passwurd|passwd|passwort)[:=]\s*([^\]]+)\]").unwrap());
         static RE_PASS: LazyLock<Regex> = LazyLock::new(|| {
             Regex::new(r"(?i)\b(?:password|passwurd|passwd|passwort|passwoord|pasword|pswd|pass|pw|pwd|mot\s+de\s+passe|mdp|wachtwoord|kennwort)\b[\s._-]*(?:is\s*)?[:=]\s*([^\s\[\]\x22']{1,128})").unwrap()
         });

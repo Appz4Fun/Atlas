@@ -791,11 +791,7 @@ fn a_backlog_step_stops_after_a_chunk_once_its_time_is_up() {
     let conn = f.writer();
     let step = |budget| rules::backlog_some(&conn, 1_000, budget, NOW).unwrap();
     assert_eq!(step(Duration::ZERO), rules::Backlog { looked_at: 50, queued: 50 }, "one chunk");
-    assert_eq!(
-        step(Duration::from_secs(60)),
-        rules::Backlog { looked_at: 250, queued: 250 },
-        "on from where it got to"
-    );
+    assert_eq!(step(Duration::from_secs(60)), rules::Backlog { looked_at: 250, queued: 250 }, "on from where it got to");
     assert_eq!(meta(&conn, "freeze_backlog_below"), 0);
 }
 

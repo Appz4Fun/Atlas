@@ -1064,7 +1064,12 @@ impl Config {
         let mut seen = std::collections::HashSet::new();
         let mut duplicates = Vec::new();
         for s in &self.servers {
-            let id = (s.host.trim().to_ascii_lowercase(), s.port, s.username.trim().to_string(), s.key.clone());
+            let id = (
+                s.host.trim().to_ascii_lowercase(),
+                s.port,
+                s.username.trim().to_string(),
+                s.key.clone(),
+            );
             if !seen.insert(id) {
                 let label = format!("{}:{}", s.host.trim(), s.port);
                 if !duplicates.contains(&label) {
@@ -1081,7 +1086,12 @@ impl Config {
         let before = self.servers.len();
         let mut seen = std::collections::HashSet::new();
         self.servers.retain(|s| {
-            seen.insert((s.host.trim().to_ascii_lowercase(), s.port, s.username.trim().to_string(), s.key.clone()))
+            seen.insert((
+                s.host.trim().to_ascii_lowercase(),
+                s.port,
+                s.username.trim().to_string(),
+                s.key.clone(),
+            ))
         });
         before - self.servers.len()
     }
@@ -1790,10 +1800,7 @@ mod tests {
     fn archive_defaults_when_absent() {
         let c = ArchiveConfig::from_value(None);
         assert!(c.enabled);
-        assert_eq!(
-            (c.max_bodies_per_release, c.probe_files, c.probes_per_minute, c.max_names_mb),
-            (16, 8, 600, 16_384)
-        );
+        assert_eq!((c.max_bodies_per_release, c.probe_files, c.probes_per_minute, c.max_names_mb), (16, 8, 600, 16_384));
     }
 
     #[test]

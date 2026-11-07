@@ -11,8 +11,8 @@
 use std::io::Write;
 
 use atlas::probe::{
-    ArchiveFormat, ArchiveStream, AudioBitstream, DecompressError, DolbyVisionInfo, H265Sps, MkvMetadata, Mp4Prober,
-    unwrap_nested,
+    ArchiveFormat, ArchiveStream, AudioBitstream, DecompressError, DolbyVisionInfo,
+    H265Sps, MkvMetadata, Mp4Prober, unwrap_nested,
 };
 use flate2::Compression;
 use flate2::write::DeflateEncoder;
@@ -115,78 +115,78 @@ fn build_dovi_rpu_rbsp(
     v40_blocks: &[(u8, &[u8])],
 ) -> Vec<u8> {
     let mut w = BitWriter::new();
-    w.write_bits(0x19, 8); // rpu_nal_prefix = 25 (0x19)
-    w.write_bits(2, 6); // rpu_type = 2
-    w.write_bits(18, 11); // rpu_format = 18 (rpu_format & 0x700 == 0)
+    w.write_bits(0x19, 8);               // rpu_nal_prefix = 25 (0x19)
+    w.write_bits(2, 6);                  // rpu_type = 2
+    w.write_bits(18, 11);                // rpu_format = 18 (rpu_format & 0x700 == 0)
     w.write_bits(rpu_profile as u32, 4); // vdr_rpu_profile
-    w.write_bits(rpu_level as u32, 4); // vdr_rpu_level
-    w.write_flag(true); // vdr_seq_info_present_flag
-    w.write_flag(false); // chroma_resampling_explicit_filter_flag
-    w.write_bits(0, 2); // coefficient_data_type = 0
-    w.write_ue(0); // coefficient_log2_denom = 0
-    w.write_bits(1, 2); // vdr_rpu_normalized_idc = 1
-    w.write_flag(rpu_profile == 0); // bl_video_full_range_flag
+    w.write_bits(rpu_level as u32, 4);   // vdr_rpu_level
+    w.write_flag(true);                  // vdr_seq_info_present_flag
+    w.write_flag(false);                 // chroma_resampling_explicit_filter_flag
+    w.write_bits(0, 2);                  // coefficient_data_type = 0
+    w.write_ue(0);                       // coefficient_log2_denom = 0
+    w.write_bits(1, 2);                  // vdr_rpu_normalized_idc = 1
+    w.write_flag(rpu_profile == 0);      // bl_video_full_range_flag
     // rpu_format & 0x700 == 0:
-    w.write_ue(2); // bl_bit_depth_minus8 = 2 (10-bit)
-    w.write_ue(2); // el_bit_depth_minus8 = 2 (10-bit)
-    w.write_ue(bit_depth_minus8); // vdr_bit_depth_minus8
-    w.write_flag(false); // spatial_resampling_filter_flag
-    w.write_bits(0, 3); // reserved_zero_3bits = 0 (uncompressed VdrDmData)
-    w.write_flag(el_spatial); // el_spatial_resampling_filter_flag
-    w.write_flag(disable_residual); // disable_residual_flag
+    w.write_ue(2);                       // bl_bit_depth_minus8 = 2 (10-bit)
+    w.write_ue(2);                       // el_bit_depth_minus8 = 2 (10-bit)
+    w.write_ue(bit_depth_minus8);        // vdr_bit_depth_minus8
+    w.write_flag(false);                 // spatial_resampling_filter_flag
+    w.write_bits(0, 3);                  // reserved_zero_3bits = 0 (uncompressed VdrDmData)
+    w.write_flag(el_spatial);            // el_spatial_resampling_filter_flag
+    w.write_flag(disable_residual);      // disable_residual_flag
 
     let has_dm = !v29_blocks.is_empty() || !v40_blocks.is_empty();
-    w.write_flag(has_dm); // vdr_dm_metadata_present_flag
-    w.write_flag(false); // use_prev_vdr_rpu_flag = false
+    w.write_flag(has_dm);                // vdr_dm_metadata_present_flag
+    w.write_flag(false);                 // use_prev_vdr_rpu_flag = false
 
     // RpuDataMapping
-    w.write_ue(0); // vdr_rpu_id
-    w.write_ue(0); // mapping_color_space
-    w.write_ue(0); // mapping_chroma_format_idc
+    w.write_ue(0);                       // vdr_rpu_id
+    w.write_ue(0);                       // mapping_color_space
+    w.write_ue(0);                       // mapping_chroma_format_idc
     for _ in 0..3 {
-        w.write_ue(0); // num_pivots_minus2 = 0 (2 pivots)
-        w.write_bits(0, 10); // pivot[0] = 0
-        w.write_bits(1023, 10); // pivot[1] = 1023
+        w.write_ue(0);                   // num_pivots_minus2 = 0 (2 pivots)
+        w.write_bits(0, 10);             // pivot[0] = 0
+        w.write_bits(1023, 10);          // pivot[1] = 1023
     }
     if !disable_residual {
-        w.write_bits(0, 3); // nlq_method_idc = 0 (LinearDeadzone)
-        w.write_bits(0, 10); // nlq_pred_pivot_value[0] = 0
-        w.write_bits(1023, 10); // nlq_pred_pivot_value[1] = 1023
+        w.write_bits(0, 3);              // nlq_method_idc = 0 (LinearDeadzone)
+        w.write_bits(0, 10);             // nlq_pred_pivot_value[0] = 0
+        w.write_bits(1023, 10);          // nlq_pred_pivot_value[1] = 1023
     }
-    w.write_ue(0); // num_x_partitions_minus1
-    w.write_ue(0); // num_y_partitions_minus1
+    w.write_ue(0);                       // num_x_partitions_minus1
+    w.write_ue(0);                       // num_y_partitions_minus1
     for _ in 0..3 {
-        w.write_ue(0); // mapping_idc = 0 (Polynomial)
-        w.write_ue(0); // poly_order_minus1 = 0
-        w.write_flag(false); // linear_interp_flag = false
-        w.write_ue(0); // poly_coef_int[0] = 0 (se(0) -> ue(0))
-        w.write_ue(1); // poly_coef_int[1] = 1 (se(1) -> ue(1))
+        w.write_ue(0);                   // mapping_idc = 0 (Polynomial)
+        w.write_ue(0);                   // poly_order_minus1 = 0
+        w.write_flag(false);             // linear_interp_flag = false
+        w.write_ue(0);                   // poly_coef_int[0] = 0 (se(0) -> ue(0))
+        w.write_ue(1);                   // poly_coef_int[1] = 1 (se(1) -> ue(1))
     }
 
     // RpuDataNlq
     if !disable_residual {
         for _ in 0..3 {
             if is_mel_nlq {
-                w.write_bits(0, 10); // nlq_offset = 0
-                w.write_ue(1); // vdr_in_max_int = 1
-                w.write_ue(0); // linear_deadzone_slope_int = 0
-                w.write_ue(0); // linear_deadzone_threshold_int = 0
+                w.write_bits(0, 10);     // nlq_offset = 0
+                w.write_ue(1);           // vdr_in_max_int = 1
+                w.write_ue(0);           // linear_deadzone_slope_int = 0
+                w.write_ue(0);           // linear_deadzone_threshold_int = 0
             } else {
-                w.write_bits(512, 10); // nlq_offset = 512 (non-MEL -> FEL)
-                w.write_ue(1); // vdr_in_max_int = 1
-                w.write_ue(1); // linear_deadzone_slope_int = 1
-                w.write_ue(1); // linear_deadzone_threshold_int = 1
+                w.write_bits(512, 10);   // nlq_offset = 512 (non-MEL -> FEL)
+                w.write_ue(1);           // vdr_in_max_int = 1
+                w.write_ue(1);           // linear_deadzone_slope_int = 1
+                w.write_ue(1);           // linear_deadzone_threshold_int = 1
             }
         }
     }
 
     // VdrDmData
     if has_dm {
-        w.write_ue(0); // affected_dm_metadata_id
-        w.write_ue(0); // current_dm_metadata_id
-        w.write_ue(0); // scene_refresh_flag
+        w.write_ue(0);                   // affected_dm_metadata_id
+        w.write_ue(0);                   // current_dm_metadata_id
+        w.write_ue(0);                   // scene_refresh_flag
         for _ in 0..509 {
-            w.write_bit(0); // uncompressed 509-bit VdrDmData fixed matrix/signal header
+            w.write_bit(0);              // uncompressed 509-bit VdrDmData fixed matrix/signal header
         }
         w.write_ue(v29_blocks.len() as u32);
         w.byte_align();
@@ -324,7 +324,16 @@ fn test_dovi_rpu_cm_v29_vs_v40() {
     // CM v2.9: contains Level 1, Level 2, and Level 6 blocks whose interior payload bytes
     // include [3, 8, 9, 10, 11, 254], but no CM v4.0 extension block levels.
     let noisy_l2_payload = [3u8, 8, 9, 10, 11, 254, 1, 2, 4, 5, 6];
-    let rbsp_v29 = build_dovi_rpu_rbsp(0, 4, 2, false, true, false, &[(1, &l1_payload), (2, &noisy_l2_payload)], &[]);
+    let rbsp_v29 = build_dovi_rpu_rbsp(
+        0,
+        4,
+        2,
+        false,
+        true,
+        false,
+        &[(1, &l1_payload), (2, &noisy_l2_payload)],
+        &[],
+    );
     let mut nal_v29 = vec![0x7C, 0x01];
     nal_v29.extend_from_slice(&rbsp_v29);
     let info_v29 = DolbyVisionInfo::parse_rpu(&nal_v29).expect("must parse CM v2.9 RPU");
@@ -383,7 +392,10 @@ fn test_mkv_chapters_hidden_edition_filtering_complex() {
 
     fn make_chapter(name: &str, start_ns: u64, hidden: bool) -> Vec<u8> {
         let display = [ebml_elem(&[0x85], name.as_bytes()), ebml_elem(&[0x43, 0x7C], b"eng")].concat();
-        let mut body = vec![ebml_elem(&[0x91], &start_ns.to_be_bytes()), ebml_elem(&[0x80], &display)];
+        let mut body = vec![
+            ebml_elem(&[0x91], &start_ns.to_be_bytes()),
+            ebml_elem(&[0x80], &display),
+        ];
         if hidden {
             body.push(ebml_elem(&[0x98], &[1]));
         }
@@ -434,9 +446,12 @@ fn test_mkv_chapters_hidden_edition_filtering_complex() {
     );
 
     let info = ebml_elem(&[0x7B, 0xA9], b"Chapter Stress Release");
-    let segment =
-        [ebml_elem(&[0x15, 0x49, 0xA9, 0x66], &info), chapters_elem, ebml_elem(&[0x1F, 0x43, 0xB6, 0x75], &[0; 16])]
-            .concat();
+    let segment = [
+        ebml_elem(&[0x15, 0x49, 0xA9, 0x66], &info),
+        chapters_elem,
+        ebml_elem(&[0x1F, 0x43, 0xB6, 0x75], &[0; 16]),
+    ]
+    .concat();
     let mkv_bytes = [
         ebml_elem(&[0x1A, 0x45, 0xDF, 0xA3], &ebml_elem(&[0x42, 0x82], b"matroska")),
         ebml_elem(&[0x18, 0x53, 0x80, 0x67], &segment),
@@ -457,9 +472,11 @@ fn test_mkv_chapters_hidden_edition_filtering_complex() {
 
 #[test]
 fn test_mkv_chapters_all_hidden_yields_empty() {
-    let ed_hidden =
-        [ebml_elem(&[0x45, 0xBD], &[1]), ebml_elem(&[0xB6], &[ebml_elem(&[0x91], &0u64.to_be_bytes())].concat())]
-            .concat();
+    let ed_hidden = [
+        ebml_elem(&[0x45, 0xBD], &[1]),
+        ebml_elem(&[0xB6], &[ebml_elem(&[0x91], &0u64.to_be_bytes())].concat()),
+    ]
+    .concat();
     let chapters_elem = ebml_elem(&[0x10, 0x43, 0xA7, 0x70], &ebml_elem(&[0x45, 0xB9], &ed_hidden));
 
     let segment = [
@@ -481,16 +498,16 @@ fn test_mkv_chapters_all_hidden_yields_empty() {
 #[test]
 fn test_mkv_segment_uid_exactness_and_malformed() {
     // Valid 16-byte SegmentUID
-    let valid_uid: [u8; 16] =
-        [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99];
+    let valid_uid: [u8; 16] = [
+        0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99,
+    ];
     let info_valid = [ebml_elem(&[0x7B, 0xA9], b"UID"), ebml_elem(&[0x73, 0xA4], &valid_uid)].concat();
     let mkv_valid = [
         ebml_elem(&[0x1A, 0x45, 0xDF, 0xA3], &ebml_elem(&[0x42, 0x82], b"matroska")),
-        ebml_elem(
-            &[0x18, 0x53, 0x80, 0x67],
-            &[ebml_elem(&[0x15, 0x49, 0xA9, 0x66], &info_valid), ebml_elem(&[0x1F, 0x43, 0xB6, 0x75], &[0; 16])]
-                .concat(),
-        ),
+        ebml_elem(&[0x18, 0x53, 0x80, 0x67], &[
+            ebml_elem(&[0x15, 0x49, 0xA9, 0x66], &info_valid),
+            ebml_elem(&[0x1F, 0x43, 0xB6, 0x75], &[0; 16]),
+        ].concat()),
     ]
     .concat();
     let meta_valid = MkvMetadata::parse(&mkv_valid).unwrap();
@@ -505,11 +522,10 @@ fn test_mkv_segment_uid_exactness_and_malformed() {
     let info_trunc = [ebml_elem(&[0x7B, 0xA9], b"UID"), ebml_elem(&[0x73, 0xA4], &trunc_uid)].concat();
     let mkv_trunc = [
         ebml_elem(&[0x1A, 0x45, 0xDF, 0xA3], &ebml_elem(&[0x42, 0x82], b"matroska")),
-        ebml_elem(
-            &[0x18, 0x53, 0x80, 0x67],
-            &[ebml_elem(&[0x15, 0x49, 0xA9, 0x66], &info_trunc), ebml_elem(&[0x1F, 0x43, 0xB6, 0x75], &[0; 16])]
-                .concat(),
-        ),
+        ebml_elem(&[0x18, 0x53, 0x80, 0x67], &[
+            ebml_elem(&[0x15, 0x49, 0xA9, 0x66], &info_trunc),
+            ebml_elem(&[0x1F, 0x43, 0xB6, 0x75], &[0; 16]),
+        ].concat()),
     ]
     .concat();
     let meta_trunc = MkvMetadata::parse(&mkv_trunc).unwrap();
@@ -521,7 +537,7 @@ fn test_sps_vui_colour_space_recovery_modes() {
     let build_hevc_sps = |primaries: u8, transfer: u8, matrix: u8| -> Vec<u8> {
         vec![
             0x42, 0x01, // NAL header (type 33 = SPS_NUT)
-            0x01, // vps_id=0, max_sub_layers_minus1=0, temporal_id_nesting_flag=1
+            0x01,       // vps_id=0, max_sub_layers_minus1=0, temporal_id_nesting_flag=1
             0x02, 0x20, 0x40, 0x08, 0x01, 0xB0, 0x01, 0x01, 0x01, 0x01, 0x01, 0x99, // Main 10, Level 5.1
             0x22, 0x12, 0x24, 0xDA, 0x7A, 0xAC, 0x22, 0xB5, // SPS fields up to colour_description_present_flag=1
             primaries, transfer, matrix, 0x80,
@@ -695,8 +711,8 @@ fn test_archive_prefix_decompression_valid_stream() {
     encoder.write_all(payload).unwrap();
     let compressed = encoder.finish().unwrap();
 
-    let decompressed =
-        ArchiveStream::decompress(ArchiveFormat::Zip, &compressed, 1024).expect("normal decompression must succeed");
+    let decompressed = ArchiveStream::decompress(ArchiveFormat::Zip, &compressed, 1024)
+        .expect("normal decompression must succeed");
     assert_eq!(decompressed, payload);
 }
 

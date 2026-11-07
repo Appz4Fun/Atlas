@@ -179,11 +179,19 @@ impl TokenBucket {
     /// If `rate_bytes_per_sec` is 0, the limiter is unconstrained (no throttling).
     /// Non-zero rate limiters normalize a 0-byte burst capacity to 1 byte so `acquire` never stalls.
     pub fn new(rate_bytes_per_sec: u64, burst_bytes: u64) -> Self {
-        let burst_bytes = if rate_bytes_per_sec > 0 { burst_bytes.max(1) } else { burst_bytes };
+        let burst_bytes = if rate_bytes_per_sec > 0 {
+            burst_bytes.max(1)
+        } else {
+            burst_bytes
+        };
         Self {
             rate_bytes_per_sec,
             burst_bytes,
-            state: Mutex::new(BucketState { tokens: burst_bytes, nanos_remainder: 0, last_update: Instant::now() }),
+            state: Mutex::new(BucketState {
+                tokens: burst_bytes,
+                nanos_remainder: 0,
+                last_update: Instant::now(),
+            }),
             waiters: Semaphore::new(1),
         }
     }
@@ -2114,7 +2122,13 @@ impl Pool {
             let permit = budget.permits.clone().acquire_many_owned(global_n as u32).await.expect("semaphore closed");
             let now = budget.now.fetch_add(global_n, Ordering::Relaxed) + global_n;
             budget.peak.fetch_max(now, Ordering::Relaxed);
-            Unsaved { permit, budget, shard_info: Some((sb, shard_permit)), over: 0, _slot: None }
+            Unsaved {
+                permit,
+                budget,
+                shard_info: Some((sb, shard_permit)),
+                over: 0,
+                _slot: None,
+            }
         } else {
             self.reserve_unsaved(numbers).await
         }
@@ -3729,10 +3743,13 @@ fn tls_config() -> Arc<rustls::ClientConfig> {
 fn parse_overview(line: &[u8]) -> Option<Overview> {
     let mut fields = line.split(|b| *b == b'\t');
     let number = std::str::from_utf8(fields.next()?).ok()?.trim().parse().ok()?;
-    let str_field =
-        |raw: Option<&[u8]>| -> String { raw.map(|f| String::from_utf8_lossy(f).into_owned()).unwrap_or_default() };
+    let str_field = |raw: Option<&[u8]>| -> String {
+        raw.map(|f| String::from_utf8_lossy(f).into_owned()).unwrap_or_default()
+    };
     let int_field = |raw: Option<&[u8]>| -> i64 {
-        raw.and_then(|f| std::str::from_utf8(f).ok()).and_then(|v| v.trim().parse::<i64>().ok()).unwrap_or(0)
+        raw.and_then(|f| std::str::from_utf8(f).ok())
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            .unwrap_or(0)
     };
     // some servers keep their overview as UTF-8 read as cp1252 and written out again: the same article's subject
     // from them and from the rest would name two releases
@@ -3743,9 +3760,22 @@ fn parse_overview(line: &[u8]) -> Option<Overview> {
     let references = str_field(fields.next());
     let bytes = int_field(fields.next());
     let lines = int_field(fields.next());
-    let xref_groups = fields.next().map(|f| String::from_utf8_lossy(f)).and_then(|f| xref_groups(&f));
+    let xref_groups = fields
+        .next()
+        .map(|f| String::from_utf8_lossy(f))
+        .and_then(|f| xref_groups(&f));
 
-    Some(Overview { number, subject, from, date, message_id, references, bytes, lines, xref_groups })
+    Some(Overview {
+        number,
+        subject,
+        from,
+        date,
+        message_id,
+        references,
+        bytes,
+        lines,
+        xref_groups,
+    })
 }
 
 /// cp1252's 0x80..=0x9F as a decoder makes them chars. The five it leaves out come through as U+0081 and the like,
@@ -4688,7 +4718,11 @@ mod tests {
 
     #[test]
     fn token_bucket_concurrent_simulated_tasks() {
-        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().unwrap();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .unwrap();
         rt.block_on(async {
             let bucket = Arc::new(TokenBucket::new(20_000_000, 2_000_000));
             let mut handles = Vec::new();
@@ -4711,7 +4745,8 @@ mod tests {
         run(async {
             let (client, mut server) = tokio::io::duplex(1 << 16);
             let limiter = Arc::new(TokenBucket::new(100_000, 10_000));
-            let mut conn = Conn::over(Box::new(client), Duration::from_secs(5)).with_rate_limiter(limiter.clone());
+            let mut conn = Conn::over(Box::new(client), Duration::from_secs(5))
+                .with_rate_limiter(limiter.clone());
 
             tokio::spawn(async move {
                 server.write_all(&vec![b'A'; 5_000]).await.unwrap();
@@ -4794,8 +4829,8 @@ mod tests {
 
     #[test]
     fn highwinds_xzver_hang_guard_and_xzver_deflate_overview_decode() {
-        use flate2::Compression;
         use flate2::write::DeflateEncoder;
+        use flate2::Compression;
         use std::io::Write;
 
         assert!(is_highwinds_xzver_hang_host("news.eweka.nl:563"));
@@ -4872,7 +4907,11 @@ mod tests {
                 let mut cmd = String::new();
                 reader.read_line(&mut cmd).await.unwrap();
                 assert_eq!(cmd, "DATE\r\n");
-                reader.get_mut().write_all(b"111 20261103032044\r\n").await.unwrap();
+                reader
+                    .get_mut()
+                    .write_all(b"111 20261103032044\r\n")
+                    .await
+                    .unwrap();
             });
 
             let dt = conn.server_date_utc().await.unwrap();

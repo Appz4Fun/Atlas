@@ -35,7 +35,9 @@ fn run_async<F: std::future::Future>(f: F) -> F::Output {
 /// Spawns a high-throughput mock NNTP server on loopback TCP that can serve
 /// multi-gigabit unthrottled byte streams to concurrent connections.
 async fn spawn_mock_nntp_server(total_bytes_per_conn: usize) -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("failed to bind loopback TCP listener");
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("failed to bind loopback TCP listener");
     let port = listener.local_addr().expect("failed to get local addr").port();
 
     tokio::spawn(async move {
@@ -117,7 +119,10 @@ fn test_tc_t1_f26_1_high_speed_loopback_transfer_750mbit_bounds() {
         );
 
         // Ceiling verification: must never exceed 750 Mbit/s (with 0.01 tolerance for floating point)
-        assert!(throughput_mbps <= 750.01, "rate limiter exceeded 750 Mbit/s ceiling: {throughput_mbps:.2} Mbit/s");
+        assert!(
+            throughput_mbps <= 750.01,
+            "rate limiter exceeded 750 Mbit/s ceiling: {throughput_mbps:.2} Mbit/s"
+        );
 
         // Lower bound verification: must achieve at least 95% of line rate (712.5 Mbit/s)
         assert!(
@@ -199,7 +204,11 @@ fn test_tc_t1_f26_3_jitter_and_window_stability() {
         }
 
         let mean: f64 = window_durations.iter().sum::<f64>() / (window_count as f64);
-        let variance: f64 = window_durations.iter().map(|&d| (d - mean).powi(2)).sum::<f64>() / (window_count as f64);
+        let variance: f64 = window_durations
+            .iter()
+            .map(|&d| (d - mean).powi(2))
+            .sum::<f64>()
+            / (window_count as f64);
         let std_dev = variance.sqrt();
         let cv = std_dev / mean;
 
@@ -208,7 +217,10 @@ fn test_tc_t1_f26_3_jitter_and_window_stability() {
         );
 
         // Coefficient of variation must be < 0.05 (5% jitter)
-        assert!(cv < 0.05, "rate limiter pacing jitter exceeded 5% coefficient of variation: CV = {cv:.4}");
+        assert!(
+            cv < 0.05,
+            "rate limiter pacing jitter exceeded 5% coefficient of variation: CV = {cv:.4}"
+        );
     });
 }
 
@@ -352,7 +364,11 @@ fn test_tc_t1_f26_5_zero_dropped_packets_multi_connection_loopback() {
         }
 
         assert_eq!(error_count.load(Ordering::Relaxed), 0, "socket errors encountered");
-        assert_eq!(success_count.load(Ordering::Relaxed), concurrency, "not all connections finished successfully");
+        assert_eq!(
+            success_count.load(Ordering::Relaxed),
+            concurrency,
+            "not all connections finished successfully"
+        );
     });
 }
 
@@ -424,7 +440,10 @@ fn test_tc_t2_f26_2_high_concurrency_contention_100_tasks() {
                 lim.acquire(bytes_per_task).await;
                 c.fetch_add(1, Ordering::Relaxed);
                 let wait = task_start.elapsed();
-                assert!(wait < Duration::from_secs(3), "task {task_id} suffered starvation: {wait:?}");
+                assert!(
+                    wait < Duration::from_secs(3),
+                    "task {task_id} suffered starvation: {wait:?}"
+                );
             }));
         }
 
@@ -436,8 +455,14 @@ fn test_tc_t2_f26_2_high_concurrency_contention_100_tasks() {
         assert_eq!(completed.load(Ordering::Relaxed), task_count);
 
         // Theoretical minimum duration: 6 MB / 93.75 MB/s = 64 ms
-        assert!(elapsed >= Duration::from_millis(50), "contention violated rate limit: {elapsed:?}");
-        assert!(elapsed < Duration::from_millis(500), "contention deadlocked or lagged: {elapsed:?}");
+        assert!(
+            elapsed >= Duration::from_millis(50),
+            "contention violated rate limit: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "contention deadlocked or lagged: {elapsed:?}"
+        );
     });
 }
 
@@ -468,8 +493,14 @@ fn test_tc_t2_f26_3_dynamic_rate_reconfiguration() {
         println!("TC-T2-F26-3: 750 Mbit/s duration {d_750:?}, 375 Mbit/s duration {d_375:?}");
 
         // Half rate should take approximately 2x the time (+- 20%)
-        assert!(d_375 > d_750, "reconfigured rate did not reduce throughput: d_375={d_375:?}, d_750={d_750:?}");
-        assert!(d_375 >= Duration::from_millis(80), "375 Mbit/s executed too fast: {d_375:?}");
+        assert!(
+            d_375 > d_750,
+            "reconfigured rate did not reduce throughput: d_375={d_375:?}, d_750={d_750:?}"
+        );
+        assert!(
+            d_375 >= Duration::from_millis(80),
+            "375 Mbit/s executed too fast: {d_375:?}"
+        );
     });
 }
 
@@ -484,15 +515,24 @@ fn test_tc_t2_f26_4_clock_step_clamp_to_burst_capacity() {
         // Exhaust tokens
         limiter.set_tokens(0);
         let initial_tokens = limiter.available_tokens();
-        assert!(initial_tokens <= 100_000, "expected ~0 tokens after set_tokens(0), got {initial_tokens}");
+        assert!(
+            initial_tokens <= 100_000,
+            "expected ~0 tokens after set_tokens(0), got {initial_tokens}"
+        );
 
         // Simulate a long idle interval (or clock jump)
         tokio::time::sleep(Duration::from_millis(150)).await;
 
         // In 150ms at 93.75 MB/s, refill would be ~14 MB, but must be clamped to burst_cap (5 MB)
         let tokens = limiter.available_tokens();
-        assert!(tokens <= burst_cap, "token bucket exceeded burst capacity: {tokens} > {burst_cap}");
-        assert!(tokens >= burst_cap - 100_000, "token bucket did not fill to burst capacity: {tokens}");
+        assert!(
+            tokens <= burst_cap,
+            "token bucket exceeded burst capacity: {tokens} > {burst_cap}"
+        );
+        assert!(
+            tokens >= burst_cap - 100_000,
+            "token bucket did not fill to burst capacity: {tokens}"
+        );
     });
 }
 

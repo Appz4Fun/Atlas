@@ -4,7 +4,9 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
-use atlas::archive::{EncryptionMode, PasswordCheck, PasswordHarvester, Rar5Header, Rar5PswCheck};
+use atlas::archive::{
+    EncryptionMode, PasswordCheck, PasswordHarvester, Rar5Header, Rar5PswCheck,
+};
 
 // ============================================================================
 // Feature 16: Two-Stage RAR5 -hp Detection (Candidate Heuristic + Article 1)
@@ -57,7 +59,10 @@ fn tc_t1_f16_4_rar5_tail_unencrypted_mod16_none() {
 fn tc_t1_f16_5_rar5_indeterminate_incomplete_archive() {
     // All volumes equal nominal size (missing final tail volume)
     let incomplete = vec![50_000_000, 50_000_000, 50_000_000];
-    assert_eq!(Rar5Header::detect_encryption(&incomplete), EncryptionMode::IndeterminateIncomplete);
+    assert_eq!(
+        Rar5Header::detect_encryption(&incomplete),
+        EncryptionMode::IndeterminateIncomplete
+    );
     assert!(!Rar5Header::detect_encryption(&incomplete).is_encrypted());
 }
 
@@ -136,7 +141,10 @@ fn tc_t1_f17_3_anti_dos_hard_cap_kdf_count_rejection() {
         None,
         "kdf > 16 must be rejected without performing derivation"
     );
-    assert!(!dos_check.verify("candidate_password"), "verify must return false for rejected DoS archive");
+    assert!(
+        !dos_check.verify("candidate_password"),
+        "verify must return false for rejected DoS archive"
+    );
 
     // KDF count 24 (2^24 rounds = ~16.7M iterations) must also be instantly rejected
     let extreme_dos = PasswordCheck::new(24, [0u8; 16], [0u8; 8]);
@@ -162,8 +170,7 @@ fn tc_t1_f18_1_harvest_subject_tags() {
 
 #[test]
 fn tc_t1_f18_2_harvest_nfo_document() {
-    let nfo =
-        "Release Notes\n----------------\nPassword: secret_nfo_password\nPwd = backup_pwd\nPasswort: german_pwd\n";
+    let nfo = "Release Notes\n----------------\nPassword: secret_nfo_password\nPwd = backup_pwd\nPasswort: german_pwd\n";
     let extracted = PasswordHarvester::extract_candidates("", Some(nfo), &HashMap::new());
     assert!(extracted.contains(&"secret_nfo_password".to_string()));
     assert!(extracted.contains(&"backup_pwd".to_string()));
@@ -224,7 +231,10 @@ fn tc_t3_03_integrated_password_attack_resistance() {
     let dos = PasswordCheck::new(20, [1u8; 16], [2u8; 8]);
     let start = Instant::now();
     assert!(!dos.verify("candidate"));
-    assert!(start.elapsed().as_millis() < 5, "DoS rejection must be instant (< 5 ms)");
+    assert!(
+        start.elapsed().as_millis() < 5,
+        "DoS rejection must be instant (< 5 ms)"
+    );
 
     // Heuristic with mixed empty/negative inputs
     assert_eq!(Rar5Header::detect_encryption(&[]), EncryptionMode::None);

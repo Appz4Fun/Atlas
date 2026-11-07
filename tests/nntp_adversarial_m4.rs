@@ -100,7 +100,10 @@ fn test_adversarial_tokio_thread_starvation_prevention() {
         running.store(false, Ordering::SeqCst);
         let _ = ticker_handle.await;
 
-        println!("verify_async took {:?}, ticks during verify: {}", elapsed, ticks_during_verify);
+        println!(
+            "verify_async took {:?}, ticks during verify: {}",
+            elapsed, ticks_during_verify
+        );
 
         // If verify_async starved the async thread, ticks_during_verify would be 0 or 1.
         // Because it offloaded to spawn_blocking, the current_thread runtime continued ticking.
@@ -146,12 +149,24 @@ fn test_adversarial_rar5_hp_modulo_heuristics() {
     }
 
     // Incomplete archive: tail volume equals nominal volume
-    assert_eq!(Rar5Header::detect_encryption(&[nominal, nominal, nominal]), EncryptionMode::IndeterminateIncomplete);
+    assert_eq!(
+        Rar5Header::detect_encryption(&[nominal, nominal, nominal]),
+        EncryptionMode::IndeterminateIncomplete
+    );
 
     // Single volume archive: tail is the only volume
-    assert_eq!(Rar5Header::detect_encryption(&[25_000_014]), EncryptionMode::CandidateHp);
-    assert_eq!(Rar5Header::detect_encryption(&[25_000_010]), EncryptionMode::CandidateHp);
-    assert_eq!(Rar5Header::detect_encryption(&[25_000_005]), EncryptionMode::None);
+    assert_eq!(
+        Rar5Header::detect_encryption(&[25_000_014]),
+        EncryptionMode::CandidateHp
+    );
+    assert_eq!(
+        Rar5Header::detect_encryption(&[25_000_010]),
+        EncryptionMode::CandidateHp
+    );
+    assert_eq!(
+        Rar5Header::detect_encryption(&[25_000_005]),
+        EncryptionMode::None
+    );
 
     // Edge cases: empty, zero, negative
     assert_eq!(Rar5Header::detect_encryption(&[]), EncryptionMode::None);
@@ -216,7 +231,10 @@ fn test_adversarial_article1_block4_inspection() {
     let block4 = build_rar5_block(4, &[0x00, 0x01, 0x0f]);
     let mut article1_hp = mark5.to_vec();
     article1_hp.extend_from_slice(&block4);
-    assert!(Rar5Header::verify_article1(&article1_hp), "Block Type 4 must confirm -hp encryption");
+    assert!(
+        Rar5Header::verify_article1(&article1_hp),
+        "Block Type 4 must confirm -hp encryption"
+    );
 
     // 2. Block Type 1 (Main Archive Header - unencrypted false positive)
     let block1 = build_rar5_block(1, &[0x00, 0x00]);
@@ -231,14 +249,20 @@ fn test_adversarial_article1_block4_inspection() {
     let block2 = build_rar5_block(2, &[0x00, 0x00]);
     let mut article1_file = mark5.to_vec();
     article1_file.extend_from_slice(&block2);
-    assert!(!Rar5Header::verify_article1(&article1_file), "Block Type 2 must return false");
+    assert!(
+        !Rar5Header::verify_article1(&article1_file),
+        "Block Type 2 must return false"
+    );
 
     // 4. Corrupted CRC in header block
     let mut corrupted_crc = article1_hp.clone();
     if corrupted_crc.len() > 10 {
         corrupted_crc[8] ^= 0xff;
     }
-    assert!(!Rar5Header::verify_article1(&corrupted_crc), "Corrupted CRC must be rejected");
+    assert!(
+        !Rar5Header::verify_article1(&corrupted_crc),
+        "Corrupted CRC must be rejected"
+    );
 
     // 5. Truncated inputs
     assert!(!Rar5Header::verify_article1(b""));

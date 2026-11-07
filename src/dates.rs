@@ -243,6 +243,9 @@ mod tests {
         // Every provider in the 2026-11-03 probe emitted 2-digit Date years on 13-68% of overview rows.
         assert_eq!(to_iso_date("03 Nov 26 03:20:32 GMT"), "2026-11-03 03:20:32");
         assert_eq!(to_iso_date("Tue, 03 Nov 26 03:20:33 +0000"), "2026-11-03 03:20:33");
-        assert_eq!(naive_timestamp("03 Nov 26 03:20:32 GMT"), naive_timestamp("Tue, 03 Nov 2026 03:20:32 +0000"));
+        assert_eq!(
+            naive_timestamp("03 Nov 26 03:20:32 GMT"),
+            naive_timestamp("Tue, 03 Nov 2026 03:20:32 +0000")
+        );
     }
 }
