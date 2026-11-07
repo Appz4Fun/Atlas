@@ -200,8 +200,9 @@ pub fn finish_checkpoint(conn: &Connection) -> Result<()> {
     passive_checkpoint(conn).map(|_| ())
 }
 
-/// A passive checkpoint of every database of `conn`; false when it was busy
-/// (another connection was checkpointing), which isnt an error to SQLite.
+/// A passive checkpoint of every database of `conn`; false when it was busy:
+/// some database's WAL was being checkpointed elsewhere (the others were still
+/// copied), which isnt an error to SQLite.
 fn passive_checkpoint(conn: &Connection) -> Result<bool> {
     conn.query_row("pragma wal_checkpoint(passive)", [], |r| r.get::<_, i64>(0)).map(|busy| busy == 0)
 }
@@ -310,9 +311,12 @@ impl Checkpoints {
             .max(512);
         let aged = self.last.elapsed() >= self.age;
         Ok(if self.whole_wal {
-            // the writer copies a little at most, also when its age comes: the background copying does the bulk
+            // the writer copies a little at most, also when its age comes: the background copying does the bulk. Not
+            // soo for an attached database (the frozen file), which the background copying may not have (one made
+            // after it started): its age copies whatever waits
             let (log, waiting) = (log * page_size, waiting * page_size);
-            log >= 2 * self.due_bytes || ((aged || log >= self.due_bytes) && waiting <= self.copy_bytes)
+            let little = waiting <= self.copy_bytes || schema != "main";
+            log >= 2 * self.due_bytes || ((aged || log >= self.due_bytes) && little)
         } else {
             aged || waiting * page_size >= self.due_bytes
         })
@@ -344,9 +348,11 @@ pub fn checkpointer(stop: std::sync::Arc<std::sync::atomic::AtomicBool>) -> std:
     use std::sync::atomic::Ordering;
 
     std::thread::spawn(move || {
-        // the main database and every shard
+        // the main database, every shard and the shards' frozen files (which their writers have attached)
         let main = paths::database();
-        let files: Vec<std::path::PathBuf> = std::iter::once(main.clone()).chain(store::shard_paths(&main)).collect();
+        let shards = store::shard_paths(&main);
+        let frozen = shards.iter().map(|s| crate::frozen::path(s)).collect::<Vec<_>>();
+        let files: Vec<std::path::PathBuf> = std::iter::once(main.clone()).chain(shards).chain(frozen).collect();
         let mut conns: Vec<(Connection, std::path::PathBuf, Checkpoints)> = files
             .iter()
             .filter(|p| p.exists())
@@ -986,6 +992,16 @@ mod tests {
         let (log, copied) = wal_frames(&conn, "frozen").unwrap().unwrap();
         assert_eq!(log, copied);
         assert_eq!(wal_frames(&conn, "plain").unwrap(), None);
+
+        // the writer's age copies the frozen file however much of it waits: the background copying may not have it
+        conn.execute_batch("begin").unwrap();
+        for _ in 0..300 {
+            conn.execute("insert into frozen.t values (randomblob(1000))", []).unwrap();
+        }
+        conn.execute_batch("commit").unwrap();
+        let mut writer = Checkpoints::new(1 << 40, true, Duration::ZERO);
+        writer.copy_bytes = 0;
+        assert!(writer.due(&conn).unwrap());
     }
 
     /// Set in the child process `checking_the_wal_keeps_the_write_lock` starts: the database it tries to write to.

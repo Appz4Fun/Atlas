@@ -291,11 +291,15 @@ impl Ids {
             // on disk before any save uses the block: the shards' saves are synced at commit, and atlas.db's WAL
             // only once checkpointed, up to a minute on (#228). A power cut must not hand out the same ids again
             conn.execute_batch("pragma main.synchronous = full")?;
-            let end: i64 = conn.query_row(
+            // committed by hand: on its own the update commits when its statement is reset, and a failed commit there
+            // goes unseen (rusqlite drops the error), handing out a block that was rolled back
+            let tx = conn.unchecked_transaction()?;
+            let end: i64 = tx.query_row(
                 "update meta set value = value + ? where key = 'next_seq' returning value",
                 [ID_BLOCK],
                 |r| r.get(0),
             )?;
+            tx.commit()?;
             *range = (end - ID_BLOCK, end);
         }
         let seq = range.0;
