@@ -61,6 +61,7 @@ families! {
     NNTP_WAITING "atlas_nntp_waiting_requests" Gauge &[], "Requests waiting for a free connection, per server.";
     NNTP_SERVER_STATE "atlas_nntp_server_state" Gauge &[], "1 for the state each server is in now.";
     NNTP_SERVER_INDEXING "atlas_nntp_server_indexing" Gauge &[], "1 when a server is used for indexing.";
+    NNTP_SERVER_HEALTH "atlas_nntp_server_health" Gauge &[], "How well each server has served background bodies lately: 0 all failing to 1 all answering, drifting back to 0.5 between answers.";
     NNTP_CONNECTS "atlas_nntp_connects_total" Counter &[], "Connection attempts per server, by result.";
     NNTP_COMMANDS "atlas_nntp_commands_total" Counter &[], "NNTP commands per server, by command and result.";
     NNTP_COMMAND_SECONDS "atlas_nntp_command_duration_seconds" Histogram SECONDS, "How long NNTP commands take, per server.";

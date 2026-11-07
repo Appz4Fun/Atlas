@@ -54,6 +54,9 @@ pub struct UsenetServer {
     /// accounts on the same host and port, see `nntp::server_keys`. Only
     /// for a second account on a provider that numbers articles differently
     pub key: Option<String>,
+    /// a server of poor uptime kept for the articles it alone sometimes has: a background body asks it last, and its
+    /// being down or failing never stops an article the others don't have from being missing. Default off
+    pub fallback: Option<bool>,
 }
 
 impl UsenetServer {
@@ -69,6 +72,7 @@ impl UsenetServer {
             compress: None,
             index: None,
             key: None,
+            fallback: None,
         }
     }
 
@@ -82,6 +86,10 @@ impl UsenetServer {
 
     pub fn indexes(&self) -> bool {
         self.index.unwrap_or(true)
+    }
+
+    pub fn is_fallback(&self) -> bool {
+        self.fallback.unwrap_or(false)
     }
 
     fn from_value(v: &Value) -> Option<UsenetServer> {
@@ -103,6 +111,7 @@ impl UsenetServer {
             compress: v.get("compress").and_then(as_bool),
             index: v.get("index").and_then(as_bool),
             key: v.get("key").and_then(Value::as_str).map(str::trim).filter(|k| !k.is_empty()).map(String::from),
+            fallback: v.get("fallback").and_then(as_bool),
         })
     }
 
@@ -127,6 +136,9 @@ impl UsenetServer {
         }
         if let Some(k) = &self.key {
             m.insert("key".into(), json!(k));
+        }
+        if let Some(f) = self.fallback {
+            m.insert("fallback".into(), json!(f));
         }
         Value::Object(m)
     }
@@ -1996,6 +2008,16 @@ mod tests {
         assert!(!cfg.servers[1].indexes());
         assert!(cfg.servers[0].to_value(true).get("index").is_none());
         assert!(cfg.servers[1].to_value(true)["index"] == false);
+    }
+
+    #[test]
+    fn fallback_flag_round_trips() {
+        let v = json!({"usenet_servers": [{"host": "a", "password": "p"}, {"host": "b", "password": "p", "fallback": true}]});
+        let cfg = Config::from_value(&v);
+        assert!(!cfg.servers[0].is_fallback());
+        assert!(cfg.servers[1].is_fallback());
+        assert!(cfg.servers[0].to_value(true).get("fallback").is_none());
+        assert!(cfg.servers[1].to_value(true)["fallback"] == true);
     }
 
     #[test]

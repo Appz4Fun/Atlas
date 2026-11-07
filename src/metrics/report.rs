@@ -79,6 +79,9 @@ struct ServerTotals<'a> {
     headers: u64,
     wire: u64,
     text: u64,
+    /// the accounts' health, summed, to be averaged
+    health: f64,
+    accounts: u32,
 }
 
 pub fn report_servers(servers: &[ServerStat]) {
@@ -93,6 +96,8 @@ pub fn report_servers(servers: &[ServerStat]) {
         t.waiting += s.waiting;
         t.states.push(s.state);
         t.indexing |= s.indexing;
+        t.health += s.health;
+        t.accounts += 1;
         t.headers += s.headers;
         t.wire += s.wire_bytes;
         t.text += s.text_bytes;
@@ -100,6 +105,7 @@ pub fn report_servers(servers: &[ServerStat]) {
 
     // whole readings: a server gone from the config goes from the gauges too
     let (mut connections, mut waiting, mut states, mut indexing) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let mut health = Vec::new();
     for (server, t) in &totals {
         let server = *server;
         let labelled = |state: &str| label_key(&[("server", server), ("state", state)]);
@@ -113,6 +119,7 @@ pub fn report_servers(servers: &[ServerStat]) {
             states.push((labelled(state), f64::from(t.states.contains(&state))));
         }
         indexing.push((label_key(&[("server", server)]), f64::from(t.indexing)));
+        health.push((label_key(&[("server", server)]), t.health / f64::from(t.accounts.max(1))));
         grow(&NNTP_HEADERS, &[("server", server)], t.pool, t.headers);
         grow(&NNTP_TRAFFIC, &[("server", server), ("kind", "wire")], t.pool, t.wire);
         grow(&NNTP_TRAFFIC, &[("server", server), ("kind", "text")], t.pool, t.text);
@@ -124,6 +131,7 @@ pub fn report_servers(servers: &[ServerStat]) {
     NNTP_WAITING.replace(waiting);
     NNTP_SERVER_STATE.replace(states);
     NNTP_SERVER_INDEXING.replace(indexing);
+    NNTP_SERVER_HEALTH.replace(health);
 }
 
 /// The errors counted, when the status round that reports them isnt running.
