@@ -40,6 +40,9 @@ pub struct Verdict {
     /// the spotter's key signed the message-id itself. A spotter id from the header signature alone can be
     /// replayed: that signature covers the title, header and nickname, not the message-id
     pub message_id_signed: bool,
+    /// the header signature (over the title, header and nickname) holds: under Spotnet's key, or for a key-7 spot
+    /// or a spotter's own command under the spotter's key
+    pub title_signed: bool,
 }
 
 /// Checks the signatures of the spot (or moderator's command) whose overview gives `subject`, `from` and
@@ -87,6 +90,7 @@ pub fn verify(title: &str, from: &str, message_id: &str) -> Verdict {
         verdict.verified = hashcash(&message_id);
         if verdict.verified && by_user() {
             verdict.spotter_id = spotter_id(&user_key);
+            verdict.title_signed = true;
         }
     } else if let Some((_, modulus)) = SPOTNET_KEYS.iter().find(|(k, _)| *k == key_id) {
         if key_id == 2 && user_key.len() > PERSONAL_KEY_LEN {
@@ -94,10 +98,12 @@ pub fn verify(title: &str, from: &str, message_id: &str) -> Verdict {
             verdict.verified = hashcash(&message_id);
             if verdict.verified && by_user() {
                 verdict.spotter_id = spotter_id(&user_key);
+                verdict.title_signed = true;
             }
         } else {
             let modulus = decode_base64(modulus).expect("Spotnet's keys are base64");
             verdict.verified = rsa_sha1(&signed, &header_sig, &modulus);
+            verdict.title_signed = verdict.verified;
         }
     }
     // a `From` with the spotter's key and signature: the message-id must be signed with that key too (a key that
@@ -192,7 +198,7 @@ mod tests {
     #[test]
     fn a_moderators_command() {
         let v = verify(MOD_TITLE, MOD_FROM, MOD_ID);
-        assert_eq!(v, Verdict { verified: true, ..Verdict::default() });
+        assert_eq!(v, Verdict { verified: true, title_signed: true, ..Verdict::default() });
         // the signed title names the spot: another spot's id breaks it
         let other = MOD_TITLE.replace("vhcUXQS5", "vhcUXQS6");
         assert_eq!(verify(&other, MOD_FROM, MOD_ID), Verdict::default());
@@ -207,7 +213,11 @@ mod tests {
     #[test]
     fn a_spotters_own_dispose() {
         let v = verify(OWN_TITLE, OWN_FROM, OWN_ID);
-        assert!(v.verified && v.personal && v.message_id_signed);
+        assert!(v.verified && v.personal && v.message_id_signed && v.title_signed);
+        // another target in the title: the spotter's header signature no longer holds
+        let other = OWN_TITLE.replace("x9FBYiqq", "x9FBYiqr");
+        let v = verify(&other, OWN_FROM, OWN_ID);
+        assert!(v.verified && v.message_id_signed && !v.title_signed);
         assert_eq!(v.spotter_id, spotter_id("4CGr2alVHshWG91Ajiozvi3D5D1MPD8Iwh5veSiUvGdrhFl5LBcyN5jV6GwHXqZB"));
         assert!(v.spotter_id.is_some());
     }

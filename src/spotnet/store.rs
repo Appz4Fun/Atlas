@@ -152,7 +152,8 @@ pub const OWN_DISPOSAL_SECS: i64 = 5 * 86_400;
 /// `spotter`), aliasing the disposal `d`. `created` is the column with when the spot was made, when the row has
 /// one: a spotter's own removal holds only `OWN_DISPOSAL_SECS` after it.
 pub(crate) fn disposed_sql(d: &str, s: &str, spotter: &str, created: Option<&str>) -> String {
-    let made = created.map_or(format!("{d}.at"), |c| format!("coalesce({s}.{c}, {d}.at)"));
+    // 0: the spot's XML had no date, so not known, as NULL
+    let made = created.map_or(format!("{d}.at"), |c| format!("coalesce(nullif({s}.{c}, 0), {d}.at)"));
     format!(
         "exists (select 1 from main.spot_disposals {d} where {d}.message_id = {s}.message_id
             and ({d}.spotter = '' or ({d}.spotter = {s}.{spotter} and {d}.at - {made} <= {OWN_DISPOSAL_SECS})))"
@@ -241,12 +242,13 @@ pub fn prune(conn: &Connection, now: i64) -> Result<usize> {
         "delete from spots_seen where state not in (?1, ?2) and at < ?3",
         params![TODO, SAVED, now - KEEP_DAYS * day],
     )?;
-    // a removal is kept as long as what it removes may be: a saved spot or a comment, kept for good
+    // a removal is kept as long as what it removes may be: a spot waiting, or a saved spot or a comment (kept for
+    // good)
     n += conn.execute(
         "delete from spot_disposals where at < ?1
-            and message_id not in (select message_id from spots_seen where state = ?2)
+            and message_id not in (select message_id from spots_seen where state in (?2, ?3))
             and message_id not in (select message_id from spot_comments)",
-        params![now - KEEP_DAYS * day, SAVED],
+        params![now - KEEP_DAYS * day, SAVED, TODO],
     )?;
     Ok(n)
 }
@@ -932,10 +934,16 @@ mod tests {
         assert_eq!(removed(2), None);
         assert_eq!(removed(4), None);
 
-        // removals of nothing kept go after `KEEP_DAYS`; one of a saved spot stays
+        // removals of nothing kept go after `KEEP_DAYS`; one of a saved spot or a spot still waiting stays
         let saved = Settled { state: SAVED, release_id: Some(ids[0]), ..Default::default() };
         settle(&conn, "mod@spot.net", Some(&saved), 0).unwrap();
-        prune(&conn, KEEP_DAYS * day + 11).unwrap();
+        let skipped = Settled { state: SKIPPED, ..Default::default() };
+        settle(&conn, "forged@spot.net", Some(&skipped), 0).unwrap();
+        // an old removal of a spot just noted (an overview read far back) stays while the spot waits
+        let now = KEEP_DAYS * day + 11;
+        note_disposals(&mut conn, &[d("fresh@spot.net", "", 5)]).unwrap();
+        note_read(&mut conn, "s", 6, &[("fresh@spot.net".to_string(), 6, None)], now).unwrap();
+        prune(&conn, now).unwrap();
         let kept: Vec<String> = conn
             .prepare("select message_id from spot_disposals order by message_id")
             .unwrap()
@@ -943,7 +951,8 @@ mod tests {
             .unwrap()
             .collect::<Result<_>>()
             .unwrap();
-        assert_eq!(kept, ["late@spot.net", "mod@spot.net"]);
+        assert_eq!(kept, ["fresh@spot.net", "late@spot.net", "mod@spot.net"]);
+        assert!(todo(&conn, 10).unwrap().is_empty(), "{:?}", todo(&conn, 10));
     }
 
     #[test]

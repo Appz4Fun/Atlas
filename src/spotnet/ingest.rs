@@ -484,7 +484,7 @@ async fn read_overview(
 }
 
 /// The removal an overview line is, when it's a moderator's (or a spotter's own) `DISPOSE` whose signatures hold.
-/// A spotter's own needs their key to have signed its message-id: it removes only their posts.
+/// A spotter's own needs their key to have signed its title and message-id: it removes only their posts.
 fn removal(r: &crate::nntp::Overview, now: i64) -> Option<store::Disposal> {
     let h = header::parse(&r.subject, &r.from)?;
     let message_id = h.removes()?;
@@ -492,9 +492,10 @@ fn removal(r: &crate::nntp::Overview, now: i64) -> Option<store::Disposal> {
     if !verdict.verified {
         return None;
     }
-    // a spotter id from the header signature alone could be replayed onto another message-id
+    // their key must sign both the title, which names the target, and the message-id: the header signature alone
+    // could be replayed onto another message-id, the message-id's alone onto another title
     let spotter = match verdict.personal {
-        true if verdict.message_id_signed => verdict.spotter_id?,
+        true if verdict.message_id_signed && verdict.title_signed => verdict.spotter_id?,
         true => return None,
         false => String::new(),
     };
