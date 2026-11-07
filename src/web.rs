@@ -2684,8 +2684,15 @@ fn release_html(
     };
 
     // the probe row is decoded once: the panels below read the same one
-    let stills =
-        conn.as_ref().map(|conn| stills_html(r.id, &crate::probe::stills::stills(conn, r.id))).unwrap_or_default();
+    // its own stills, or those of a release with the same video file: shown from there, never made or kept twice
+    let stills = conn
+        .as_ref()
+        .and_then(|conn| {
+            let (shown, kind) = crate::probe::stills::shown_stills(conn, r.id)?;
+            let from = kind.map(|k| (shown, k));
+            Some(stills_html(shown, &crate::probe::stills::stills(conn, shown), from))
+        })
+        .unwrap_or_default();
     let found = conn.as_ref().and_then(|c| crate::probe::read(c, r.id)).map(|p| seven_z_first_file(p, inner, contents));
     let probe = match (conn.as_ref(), found.as_ref()) {
         (Some(c), Some(found)) => probe_html(
@@ -3551,8 +3558,9 @@ fn details_html(d: &crate::media::details::Details, file_secs: Option<f64>) -> S
     )
 }
 
-/// Stills from the video, in order: each a link to the full size JPEG, with where in the film it's from.
-fn stills_html(id: i64, stills: &[(u8, Option<i64>, u32, u32)]) -> String {
+/// Stills from the video, in order: each a link to the full size JPEG, with where in the film it's from. `id` is the
+/// release they were made for; `from` says so when that's another release with the same video file, and by which key.
+fn stills_html(id: i64, stills: &[(u8, Option<i64>, u32, u32)], from: Option<(i64, crate::keys::Kind)>) -> String {
     if stills.is_empty() {
         return String::new();
     }
@@ -3567,8 +3575,19 @@ fn stills_html(id: i64, stills: &[(u8, Option<i64>, u32, u32)]) -> String {
         })
         .collect();
     // the releases showing the same pictures, looked up after the page is up: it reads every shard
+    let note = from
+        .map(|(other, kind)| {
+            let why = match kind {
+                crate::keys::Kind::Mux => "the same Matroska mux (SegmentUID and date)",
+                _ => "the same OpenSubtitles hash",
+            };
+            format!(
+                "<p class=\"sort\">The same video file as <a href=\"/ui/release?id={other}\">release {other}</a> ({why}): its stills are shown here.</p>"
+            )
+        })
+        .unwrap_or_default();
     format!(
-        "<h2>Stills</h2><div class=\"stills\">{figures}</div><div id=\"same-film\" hx-get=\"/ui/samefilm?id={id}\" hx-trigger=\"load\" hx-swap=\"outerHTML\"></div>"
+        "<h2>Stills</h2>{note}<div class=\"stills\">{figures}</div><div id=\"same-film\" hx-get=\"/ui/samefilm?id={id}\" hx-trigger=\"load\" hx-swap=\"outerHTML\"></div>"
     )
 }
 
@@ -4511,10 +4530,14 @@ mod tests {
         let other = ReleaseRow { id: 9, name: "<A>.Film".into(), size: Some(1 << 30), ..Default::default() };
         let html = same_film_html(&[other]);
         assert!(html.contains("/ui/release?id=9") && html.contains("&lt;A&gt;.Film"), "{html}");
-        assert_eq!(stills_html(7, &[]), "");
-        let html = stills_html(7, &[(25, Some(1_834_500), 960, 540), (50, None, 960, 540)]);
+        assert_eq!(stills_html(7, &[], None), "");
+        let html = stills_html(7, &[(25, Some(1_834_500), 960, 540), (50, None, 960, 540)], None);
         assert!(html.contains("<img src=\"/ui/still?id=7&amp;at=25\" width=\"960\" height=\"540\""), "{html}");
         assert!(html.contains("<figcaption>25% · 30:34</figcaption>") && html.contains("<figcaption>50%</figcaption>"));
+        assert!(!html.contains("same video file"), "{html}");
+        let shared = stills_html(9, &[(25, None, 960, 540)], Some((9, crate::keys::Kind::Mux)));
+        assert!(shared.contains("/ui/still?id=9&amp;at=25") && shared.contains("/ui/release?id=9"), "{shared}");
+        assert!(shared.contains("SegmentUID"), "{shared}");
         assert_eq!(clock(3_725_000), "1:02:05");
     }
 

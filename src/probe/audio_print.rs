@@ -194,7 +194,7 @@ pub fn linked_by(conn: &Connection, own: i64, lookup: &keys::Lookup) -> Option<K
 }
 
 /// The main database beside a shard's file (`atlas.s3.db` gives `atlas.db`): `store::shard_path`'s names.
-fn main_of(shard: &str) -> Option<PathBuf> {
+pub(crate) fn main_of(shard: &str) -> Option<PathBuf> {
     let path = Path::new(shard);
     let stem = path.file_name()?.to_str()?.strip_suffix(".db")?;
     let (base, n) = stem.rsplit_once(".s")?;

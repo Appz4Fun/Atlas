@@ -1247,7 +1247,8 @@ fn sealed_segments(conn: &Connection, file_id: i64) -> Result<Option<Vec<crate::
 }
 
 /// What a release on this shard holds: the bytes and the count of every article, its blobs' and rows', as saves count
-/// them into `releases.size` and `parts`. None: a file with more than one read takes (`READ_MAX_SEGMENTS`).
+/// them into `releases.size` and `parts`. None: a file with more rows than one read takes (`READ_MAX_SEGMENTS`); an
+/// error for a blob that wont decode or is past that cap.
 pub(crate) fn article_totals(conn: &Connection, release_id: i64) -> Result<Option<(i64, i64)>> {
     let files: Vec<i64> = conn
         .prepare_cached("select id from files where release_id = ?")?

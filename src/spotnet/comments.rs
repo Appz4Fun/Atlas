@@ -1,10 +1,10 @@
 //! Comments on spots, and spam reports, as Spotweb reads them. A comment is an article in `free.usenet` whose
 //! message-id starts with its spot's (`<spot>.<rating>.<random>.<random>@spot.net`); its text is the article's
-//! body. A report is an article in `free.willey` whose subject is `REPORT <spot message-id> ...`. Only comments and
-//! reports on spots Atlas keeps (`spots_seen`, waiting or saved) are noted, in the main database, and a comment's
-//! body is read once.
-
-use std::collections::HashSet;
+//! body. A report is an article in `free.willey` whose subject is `REPORT <spot message-id> ...`. Every comment
+//! and report is noted (its header only, from the overview), in the main database, whether or not its spot is in
+//! `spots_seen` yet: the spot overview is read by another task, and articles don't reach a server in the order they
+//! were posted. A comment's body is read once its spot is kept (waiting or saved). Those whose spot isn't kept
+//! `UNKEPT_DAYS` after they were noted are pruned.
 
 use rusqlite::{Connection, Result, params};
 
@@ -25,6 +25,10 @@ pub const WAITING: i64 = 0;
 pub const READ: i64 = 1;
 /// The article is gone, too big to be a comment, or wouldn't come in `MAX_TRIES` passes.
 pub const GONE: i64 = 2;
+/// Days a comment or report on a spot not kept stays, for its spot to be noted: the spot overview reads behind the
+/// group by an overview pass at most, so a day would do.
+pub const UNKEPT_DAYS: i64 = 7;
+
 /// Passes a comment's body is tried in before it's given up on (`GONE`): a pass stops at the first failure, so an
 /// outage costs each pass a try for the few comments in flight, not the whole queue.
 pub const MAX_TRIES: i64 = 20;
@@ -41,7 +45,8 @@ pub fn create(conn: &Connection) -> Result<()> {
             spotter_id TEXT,
             state INTEGER NOT NULL DEFAULT 0,
             tries INTEGER NOT NULL DEFAULT 0,
-            body TEXT
+            body TEXT,
+            seen INTEGER NOT NULL DEFAULT 0
         ) without rowid;
         create index if not exists spot_comments_spot on spot_comments(spot);
         create index if not exists spot_comments_waiting on spot_comments(at) where state = 0;
@@ -49,10 +54,30 @@ pub fn create(conn: &Connection) -> Result<()> {
             message_id TEXT PRIMARY KEY,
             spot TEXT NOT NULL,
             at INTEGER NOT NULL,
-            poster TEXT
+            poster TEXT,
+            seen INTEGER NOT NULL DEFAULT 0
         ) without rowid;
-        create index if not exists spot_reports_spot on spot_reports(spot);",
-    )
+        create index if not exists spot_reports_spot on spot_reports(spot);
+        -- the first comment cursors were `spots_cursor:<group>:<server>`, beside the spot overview's own
+        update or ignore meta set key = 'spot_said_cursor:' || substr(key, 14)
+         where key like 'spots\\_cursor:free.usenet:%' escape '\\'
+            or key like 'spots\\_cursor:free.willey:%' escape '\\';
+        delete from meta where key like 'spots\\_cursor:free.usenet:%' escape '\\'
+            or key like 'spots\\_cursor:free.willey:%' escape '\\';
+        drop index if exists spot_comments_seen;
+        drop index if exists spot_reports_seen;",
+    )?;
+    // tables made by #243, before `seen`
+    for table in ["spot_comments", "spot_reports"] {
+        crate::chunks::add_column_as(conn, table, "seen", "INTEGER NOT NULL DEFAULT 0")?;
+    }
+    Ok(())
+}
+
+/// Whether a spot message-id is a Spotnet one: `...@spot.net`. Comments and reports name their spots that way;
+/// anything else in the groups is no comment or report.
+fn spotnet_id(id: &str) -> bool {
+    super::valid_message_id(id) && id.rsplit_once('@').is_some_and(|(_, d)| d.eq_ignore_ascii_case("spot.net"))
 }
 
 /// The spot a comment is on and the rating it gives (0 for none, else 1 to 10), from its message-id, as Spotweb
@@ -65,7 +90,7 @@ pub fn comment_ref(message_id: &str) -> Option<(String, u8)> {
         return None;
     }
     let spot = format!("{}@{domain}", parts[0]);
-    if !super::valid_message_id(&spot) {
+    if !spotnet_id(&spot) {
         return None;
     }
     // older comments have no rating, or a word where it goes
@@ -84,7 +109,7 @@ pub fn report_ref(subject: &str, references: &str) -> Option<String> {
             Some(&rest[..rest.find('>')?])
         })
         .or_else(|| references.split_whitespace().last().map(|r| r.trim_matches(['<', '>'])))?;
-    super::valid_message_id(named).then(|| named.to_string())
+    spotnet_id(named).then(|| named.to_string())
 }
 
 /// The name a `From` value gives, before its address.
@@ -105,7 +130,7 @@ pub struct Noted {
 }
 
 fn cursor_key(group: &str, server: &str) -> String {
-    format!("spots_cursor:{group}:{server}")
+    format!("spot_said_cursor:{group}:{server}")
 }
 
 /// The last article of `group` read on `server`, by its numbers there.
@@ -113,15 +138,8 @@ pub fn cursor(conn: &Connection, group: &str, server: &str) -> Result<Option<u64
     read_cursor(conn, &cursor_key(group, server))
 }
 
-/// The spots comments and reports are kept for: waiting to be fetched, or saved as a release.
-pub fn known_spots(conn: &Connection) -> Result<HashSet<String>> {
-    conn.prepare_cached("select message_id from spots_seen where state in (?, ?)")?
-        .query_map(params![TODO, SAVED], |r| r.get(0))?
-        .collect()
-}
-
-/// Notes the comments (or, with `reports`, the reports) of one stretch of `group`, and that it was read up to
-/// `last`, together. Returns how many were new.
+/// Notes the comments (or, with `reports`, the reports) of one stretch of `group`, seen `now`, and that it was read
+/// up to `last`, together. Returns how many were new.
 pub fn note_read(
     conn: &mut Connection,
     group: &str,
@@ -129,21 +147,23 @@ pub fn note_read(
     last: u64,
     found: &[Noted],
     reports: bool,
+    now: i64,
 ) -> Result<usize> {
     let tx = conn.transaction()?;
     let mut added = 0;
     {
-        let mut report =
-            tx.prepare_cached("insert or ignore into spot_reports (message_id, spot, at, poster) values (?, ?, ?, ?)")?;
+        let mut report = tx.prepare_cached(
+            "insert or ignore into spot_reports (message_id, spot, at, poster, seen) values (?, ?, ?, ?, ?)",
+        )?;
         let mut comment = tx.prepare_cached(
-            "insert or ignore into spot_comments (message_id, spot, at, rating, poster, spotter_id)
-             values (?, ?, ?, ?, ?, ?)",
+            "insert or ignore into spot_comments (message_id, spot, at, rating, poster, spotter_id, seen)
+             values (?, ?, ?, ?, ?, ?, ?)",
         )?;
         for n in found {
             added += if reports {
-                report.execute(params![n.message_id, n.spot, n.at, n.poster])?
+                report.execute(params![n.message_id, n.spot, n.at, n.poster, now])?
             } else {
-                comment.execute(params![n.message_id, n.spot, n.at, n.rating, n.poster, n.spotter_id])?
+                comment.execute(params![n.message_id, n.spot, n.at, n.rating, n.poster, n.spotter_id, now])?
             };
         }
         write_cursor(&tx, &cursor_key(group, server), last)?;
@@ -152,13 +172,13 @@ pub fn note_read(
     Ok(added)
 }
 
-/// Comments waiting for their body, those on saved spots first, newest first.
+/// Comments on kept spots waiting for their body, those on saved spots first, newest first.
 pub fn todo(conn: &Connection, limit: usize) -> Result<Vec<String>> {
     conn.prepare_cached(
-        "select c.message_id from spot_comments c left join spots_seen s on s.message_id = c.spot
-         where c.state = 0 order by coalesce(s.state = ?1, 0) desc, c.at desc limit ?2",
+        "select c.message_id from spot_comments c join spots_seen s on s.message_id = c.spot
+         where c.state = 0 and s.state in (?1, ?2) order by s.state = ?2 desc, c.at desc limit ?3",
     )?
-    .query_map(params![SAVED, limit as i64], |r| r.get(0))?
+    .query_map(params![TODO, SAVED, limit as i64], |r| r.get(0))?
     .collect()
 }
 
@@ -193,14 +213,17 @@ pub fn settle(conn: &mut Connection, outcomes: &[(String, Outcome)]) -> Result<(
     tx.commit()
 }
 
-/// Forgets the comments and reports of spots no longer kept: those that came to nothing (not movies or TV after
-/// all, given up on) and those forgotten since. A saved spot is kept for good (`store::prune`).
-pub fn prune(conn: &Connection) -> Result<usize> {
+/// Forgets the comments and reports of spots not kept (never noted, came to nothing, forgotten since) once they
+/// were noted `UNKEPT_DAYS` ago. A saved spot is kept for good (`store::prune`).
+pub fn prune(conn: &Connection, now: i64) -> Result<usize> {
     let mut n = 0;
     for table in ["spot_comments", "spot_reports"] {
         n += conn.execute(
-            &format!("delete from {table} where spot not in (select message_id from spots_seen where state in (?, ?))"),
-            params![TODO, SAVED],
+            &format!(
+                "delete from {table} where seen < ?3
+                 and spot not in (select message_id from spots_seen where state in (?1, ?2))"
+            ),
+            params![TODO, SAVED, now - UNKEPT_DAYS * 86_400],
         )?;
     }
     Ok(n)
@@ -282,8 +305,9 @@ mod tests {
         assert_eq!(comment_ref("abc.x.y@spot.net"), Some(("abc@spot.net".into(), 0)));
         assert_eq!(comment_ref("abc.zz.x.y@spot.net"), Some(("abc@spot.net".into(), 0)));
         assert_eq!(comment_ref("abc.11.x.y@spot.net"), Some(("abc@spot.net".into(), 0)));
-        // not a comment's
+        // not a comment's: no dot, another domain
         assert_eq!(comment_ref("abc@spot.net"), None);
+        assert_eq!(comment_ref("abc.def@news.host"), None);
         assert_eq!(comment_ref("no-at-sign.1.2.3"), None);
         assert_eq!(comment_ref(".1.2.3@spot.net"), None);
     }
@@ -297,6 +321,45 @@ mod tests {
         assert_eq!(report_ref("Spam", "<a@spot.net> <b@spot.net>"), Some("b@spot.net".into()));
         assert_eq!(report_ref("REPORT nothing", ""), None);
         assert_eq!(report_ref("REPORT <bad id@x>", ""), None);
+        assert_eq!(report_ref("REPORT <a@news.host>", ""), None);
+    }
+
+    #[test]
+    fn tables_and_cursors_from_before_are_brought_up_to_date() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "create table meta (key TEXT PRIMARY KEY, value INTEGER);
+             insert into meta values ('spots_cursor:free.usenet:news.x', 7), ('spots_cursor:free.willey:news.x', 8),
+                ('spots_cursor:news.x', 9);",
+        )
+        .unwrap();
+        create(&conn).unwrap();
+        assert_eq!(cursor(&conn, COMMENT_GROUP, "news.x").unwrap(), Some(7));
+        assert_eq!(cursor(&conn, REPORT_GROUP, "news.x").unwrap(), Some(8));
+        assert_eq!(super::super::store::cursor(&conn, "news.x").unwrap(), Some(9));
+        let left: i64 = conn.query_row("select count(*) from meta", [], |r| r.get(0)).unwrap();
+        assert_eq!(left, 3);
+        // tables made before `seen` get it
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "create table meta (key TEXT PRIMARY KEY, value INTEGER);
+             create table spot_comments (message_id TEXT PRIMARY KEY, spot TEXT NOT NULL, at INTEGER NOT NULL,
+                rating INTEGER NOT NULL DEFAULT 0, poster TEXT, spotter_id TEXT, state INTEGER NOT NULL DEFAULT 0,
+                tries INTEGER NOT NULL DEFAULT 0, body TEXT) without rowid;
+             create table spot_reports (message_id TEXT PRIMARY KEY, spot TEXT NOT NULL, at INTEGER NOT NULL,
+                poster TEXT) without rowid;",
+        )
+        .unwrap();
+        create(&conn).unwrap();
+        create(&conn).unwrap();
+        for table in ["spot_comments", "spot_reports"] {
+            let has: bool = conn
+                .prepare(&format!("select 1 from pragma_table_info('{table}') where name = 'seen'"))
+                .unwrap()
+                .exists([])
+                .unwrap();
+            assert!(has, "{table}");
+        }
     }
 
     #[test]
@@ -320,7 +383,6 @@ mod tests {
         super::super::store::note_read(&mut conn, "srv", 2, &spots, 0).unwrap();
         let saved = super::super::store::Settled { state: SAVED, release_id: Some(9), ..Default::default() };
         super::super::store::settle(&conn, "s1@spot.net", Some(&saved), 0).unwrap();
-        assert_eq!(known_spots(&conn).unwrap(), ["s1@spot.net".to_string(), "s2@spot.net".to_string()].into());
         let noted = |id: &str, spot: &str, at| Noted {
             message_id: id.into(),
             spot: spot.into(),
@@ -330,12 +392,19 @@ mod tests {
             spotter_id: None,
         };
         let found = vec![noted("s1.8.a.b@spot.net", "s1@spot.net", 20), noted("s2.0.a.b@spot.net", "s2@spot.net", 30)];
-        assert_eq!(note_read(&mut conn, COMMENT_GROUP, "srv", 100, &found, false).unwrap(), 2);
-        assert_eq!(note_read(&mut conn, COMMENT_GROUP, "srv", 120, &found, false).unwrap(), 0);
+        assert_eq!(note_read(&mut conn, COMMENT_GROUP, "srv", 100, &found, false, 0).unwrap(), 2);
+        assert_eq!(note_read(&mut conn, COMMENT_GROUP, "srv", 120, &found, false, 0).unwrap(), 0);
         assert_eq!(cursor(&conn, COMMENT_GROUP, "srv").unwrap(), Some(120));
         assert_eq!(cursor(&conn, REPORT_GROUP, "srv").unwrap(), None);
+        // nothing new: the cursor still moves
+        assert_eq!(note_read(&mut conn, COMMENT_GROUP, "srv", 130, &[], false, 0).unwrap(), 0);
+        assert_eq!(cursor(&conn, COMMENT_GROUP, "srv").unwrap(), Some(130));
         let report = vec![noted("r1@spot.net", "s1@spot.net", 25)];
-        assert_eq!(note_read(&mut conn, REPORT_GROUP, "srv", 7, &report, true).unwrap(), 1);
+        assert_eq!(note_read(&mut conn, REPORT_GROUP, "srv", 7, &report, true, 0).unwrap(), 1);
+        // a comment on a spot not noted yet (it reached the server first): kept, its text not read for now
+        let day = 86_400;
+        let early = vec![noted("s3.0.a.b@spot.net", "s3@spot.net", 40)];
+        note_read(&mut conn, COMMENT_GROUP, "srv", 140, &early, false, 10 * day).unwrap();
         // the saved spot's comment first, though the other is newer
         assert_eq!(todo(&conn, 10).unwrap(), ["s1.8.a.b@spot.net", "s2.0.a.b@spot.net"]);
         let read = ("s1.8.a.b@spot.net".to_string(), Outcome::Read("Password in comment: hunter2".into()));
@@ -357,13 +426,23 @@ mod tests {
         let (none, no_reports) = about(&conn, 10, "other@spot.net").unwrap();
         assert!(none.is_empty() && no_reports == 0);
 
-        // a spot that came to nothing takes its comments along, and so does one forgotten since
-        assert_eq!(prune(&conn).unwrap(), 0);
+        // its spot comes: its text is next
+        super::super::store::note_read(&mut conn, "srv", 3, &[("s3@spot.net".to_string(), 3, None)], 0).unwrap();
+        assert_eq!(todo(&conn, 10).unwrap(), ["s3.0.a.b@spot.net"]);
+
+        // `UNKEPT_DAYS` after they were noted, the comments of spots not kept go: one that came to nothing, one
+        // forgotten since. A kept spot's stay
+        let now = 10 * day + UNKEPT_DAYS * day;
+        assert_eq!(prune(&conn, now).unwrap(), 0);
         let skipped = super::super::store::Settled { state: super::super::store::SKIPPED, ..Default::default() };
         super::super::store::settle(&conn, "s2@spot.net", Some(&skipped), 0).unwrap();
-        assert_eq!(prune(&conn).unwrap(), 1);
+        assert_eq!(prune(&conn, now).unwrap(), 1);
         conn.execute("delete from spots_seen where message_id = 's1@spot.net'", []).unwrap();
-        assert_eq!(prune(&conn).unwrap(), 2, "its comment and its report");
+        assert_eq!(prune(&conn, now).unwrap(), 2, "its comment and its report");
+        // the one noted on day 10 is past `UNKEPT_DAYS` a second later, whatever its spot did
+        conn.execute("delete from spots_seen where message_id = 's3@spot.net'", []).unwrap();
+        assert_eq!(prune(&conn, now).unwrap(), 0);
+        assert_eq!(prune(&conn, now + 1).unwrap(), 1);
         let left: i64 = conn.query_row("select count(*) from spot_comments", [], |r| r.get(0)).unwrap();
         assert_eq!(left, 0);
     }
