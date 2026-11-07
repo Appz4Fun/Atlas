@@ -332,6 +332,9 @@ const MAX_BATCH: usize = 32;
 pub struct Db {
     conn: Arc<Mutex<Connection>>,
     saves: Vec<std::sync::mpsc::SyncSender<WriterJob>>,
+    /// each shard writer's lane for small jobs someone waits on (`on_writer_first`): read between saves, ahead of
+    /// both the saves and the stage work queued in `saves`
+    firsts: Vec<std::sync::mpsc::Sender<StageJob>>,
     /// last field: dropping the final clone closes the queues above, then waits
     /// for the writer threads to finish what they were doing
     _writers: Arc<Writers>,
@@ -366,6 +369,8 @@ pub(crate) struct StageJob {
 enum WriterJob {
     Save(SaveJob),
     Stage(StageJob),
+    /// a job came in on the writer's `firsts` lane: wakes a writer waiting for work
+    Wake,
 }
 
 /// time a writer spends on stage work after each save, and with no save waiting
@@ -391,18 +396,22 @@ pub fn shared_db(conn: Connection) -> Db {
 fn shared_db_idling(conn: Connection, every: Duration) -> Db {
     let main = conn.path().map(std::path::PathBuf::from).unwrap_or_else(crate::paths::database);
     let ids = Arc::new(crate::store::Ids::new(&main));
-    let (saves, writers): (Vec<_>, Vec<_>) = (0..crate::store::SHARDS)
-        .map(|shard| {
-            let (saves, jobs) = std::sync::mpsc::sync_channel(4096);
-            let (path, ids) = (crate::store::shard_path(&main, shard), ids.clone());
-            let handle = std::thread::Builder::new()
-                .name(format!("atlas-db-writer-{shard}"))
-                .spawn(move || writer(shard, &path, &ids, jobs, every))
-                .expect("couldnt start a db writer");
-            (saves, handle)
-        })
-        .unzip();
-    Db { conn: Arc::new(Mutex::new(conn)), saves, _writers: Arc::new(Writers(writers)) }
+    let mut saves = Vec::new();
+    let mut firsts = Vec::new();
+    let mut writers = Vec::new();
+    for shard in 0..crate::store::SHARDS {
+        let (save, jobs) = std::sync::mpsc::sync_channel(4096);
+        let (first, first_jobs) = std::sync::mpsc::channel();
+        let (path, ids) = (crate::store::shard_path(&main, shard), ids.clone());
+        let handle = std::thread::Builder::new()
+            .name(format!("atlas-db-writer-{shard}"))
+            .spawn(move || writer(shard, &path, &ids, jobs, first_jobs, every))
+            .expect("couldnt start a db writer");
+        saves.push(save);
+        firsts.push(first);
+        writers.push(handle);
+    }
+    Db { conn: Arc::new(Mutex::new(conn)), saves, firsts, _writers: Arc::new(Writers(writers)) }
 }
 
 /// A shard's writer: saves what comes in, and between saves (or after
@@ -412,6 +421,7 @@ fn writer(
     path: &std::path::Path,
     ids: &crate::store::Ids,
     jobs: std::sync::mpsc::Receiver<WriterJob>,
+    first_jobs: std::sync::mpsc::Receiver<StageJob>,
     idle: Duration,
 ) {
     use crate::profile::{LOAD, Load};
@@ -434,10 +444,17 @@ fn writer(
     // stage time owed while saves come in (see `STAGE_SHARE`), and when the last save was
     let mut bank = 0.0f64;
     let mut last_save: Option<std::time::Instant> = None;
+    // jobs from the `firsts` lane waiting to run: a few at a time between saves (`STAGE_BUDGET_BUSY`), outside stage
+    // work's share
+    let mut firsts: std::collections::VecDeque<StageJob> = Default::default();
 
     loop {
+        run_firsts(&mut opened, path, &first_jobs, &mut firsts);
         let since_save = last_save.map_or(STAGE_QUIET, |t| t.elapsed());
-        let wait = if stage.is_empty() {
+        let wait = if !firsts.is_empty() {
+            // the firsts lane has jobs left over from its last turn
+            Duration::ZERO
+        } else if stage.is_empty() {
             // a writer with nothing to do wakes for idle freezing too, and does the rest of its housekeeping every `idle`
             if crate::frozen::idle_ticks_on() { idle.min(crate::frozen::IDLE_TICK_EVERY) } else { idle }
         } else if bank > 0.0 || since_save >= STAGE_QUIET {
@@ -454,6 +471,7 @@ fn writer(
                     stage.push_back(job);
                     continue;
                 }
+                Ok(WriterJob::Wake) => continue,
                 // nothing to save: files still come due as they go stale
                 Err(RecvTimeoutError::Timeout) if stage.is_empty() && last_housekeeping.elapsed() < idle => {
                     if let Ok(conn) = &mut opened {
@@ -490,6 +508,7 @@ fn writer(
             match jobs.try_recv() {
                 Ok(WriterJob::Save(job)) => batch.push(job),
                 Ok(WriterJob::Stage(job)) => stage.push_back(job),
+                Ok(WriterJob::Wake) => {}
                 Err(_) => break,
             }
         }
@@ -525,6 +544,7 @@ fn writer(
         }
         bank = (bank + t.elapsed().as_secs_f64() * STAGE_SHARE).min(STAGE_BANK);
         last_save = Some(std::time::Instant::now());
+        run_firsts(&mut opened, path, &first_jobs, &mut firsts);
         if bank > 0.0 {
             bank -= run_stage_jobs(&mut opened, path, &mut stage, Some(STAGE_BUDGET_BUSY));
         }
@@ -542,6 +562,7 @@ fn writer(
                         break;
                     }
                     Ok(WriterJob::Stage(job)) => stage.push_back(job),
+                    Ok(WriterJob::Wake) => {}
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
                         seal = false;
@@ -556,7 +577,23 @@ fn writer(
         }
     }
     // stopping: whoever queued these is told
+    firsts.extend(first_jobs.try_iter());
+    run_stage_jobs(&mut opened, path, &mut firsts, None);
     run_stage_jobs(&mut opened, path, &mut stage, None);
+}
+
+/// The `firsts` lane's jobs, in the order they came, for at most `STAGE_BUDGET_BUSY`; the rest wait for the next turn,
+/// which comes between saves or when the writer next looks for work.
+fn run_firsts(
+    opened: &mut rusqlite::Result<Connection>,
+    path: &std::path::Path,
+    lane: &std::sync::mpsc::Receiver<StageJob>,
+    firsts: &mut std::collections::VecDeque<StageJob>,
+) {
+    firsts.extend(lane.try_iter());
+    if !firsts.is_empty() {
+        run_stage_jobs(opened, path, firsts, Some(STAGE_BUDGET_BUSY));
+    }
 }
 
 /// Stage jobs, each in one transaction, for at most `budget` (None: all of them). Returns the seconds they took.
@@ -675,6 +712,23 @@ impl Db {
         self.saves[shard]
             .send(WriterJob::Stage(StageJob { kind, work, done }))
             .map_err(|_| anyhow!("db writer stopped"))?;
+        Ok(answer)
+    }
+
+    /// `on_writer` for a small job someone waits on. It comes in on the writer's own lane, so it waits neither behind
+    /// the saves queued before it nor behind the stage work: the writer runs such jobs between saves, a few at a time
+    /// (`STAGE_BUDGET_BUSY`), outside stage work's share. Never blocks. Behind a backlog of processing work an
+    /// ordinary job waited minutes on prod.
+    pub(crate) fn on_writer_first(
+        &self,
+        shard: usize,
+        kind: &'static str,
+        work: StageWork,
+    ) -> Result<std::sync::mpsc::Receiver<std::result::Result<(), String>>> {
+        let (done, answer) = std::sync::mpsc::sync_channel(1);
+        self.firsts[shard].send(StageJob { kind, work, done }).map_err(|_| anyhow!("db writer stopped"))?;
+        // a writer waiting for work wakes; a full queue means it's busy, and looks at the lane between saves anyway
+        let _ = self.saves[shard].try_send(WriterJob::Wake);
         Ok(answer)
     }
 
@@ -2943,6 +2997,57 @@ mod tests {
         let conn = db::open_at(&main).unwrap();
         let shard = crate::store::shard_path(&main, 0);
         (dir, shared_db(conn), shard)
+    }
+
+    #[test]
+    fn a_job_on_the_firsts_lane_runs_ahead_of_queued_stage_work() {
+        let (_dir, db, _shard) = stage_db();
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let job = |name: &'static str, slow: bool| -> StageWork {
+            let order = order.clone();
+            Box::new(move |_| {
+                if slow {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                order.lock().unwrap().push(name);
+                Ok(())
+            })
+        };
+        // 30 jobs of 20 ms, three times the writer's idle stage budget, then one on the firsts lane
+        let mut answers: Vec<_> =
+            (0..30).map(|_| db.on_writer(0, "db.stage.test", job("queued", true)).unwrap()).collect();
+        answers.push(db.on_writer_first(0, "db.stage.test", job("first", false)).unwrap());
+        for answer in answers {
+            answer.recv_timeout(Duration::from_secs(10)).unwrap().unwrap();
+        }
+        let order = order.lock().unwrap();
+        let at = order.iter().position(|n| *n == "first").unwrap();
+        assert!(at < 20, "ran {at}th: {order:?}");
+    }
+
+    #[test]
+    fn jobs_on_the_firsts_lane_run_in_order_and_before_the_writer_stops() {
+        let (_dir, db, _shard) = stage_db();
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let answers: Vec<_> = (0..20)
+            .map(|n| {
+                let order = order.clone();
+                db.on_writer_first(
+                    0,
+                    "db.stage.test",
+                    Box::new(move |_| {
+                        order.lock().unwrap().push(n);
+                        Ok(())
+                    }),
+                )
+                .unwrap()
+            })
+            .collect();
+        drop(db);
+        for answer in answers {
+            answer.recv().unwrap().unwrap();
+        }
+        assert_eq!(*order.lock().unwrap(), (0..20).collect::<Vec<_>>());
     }
 
     #[test]

@@ -273,6 +273,20 @@ pub enum Placement {
     Taken,
 }
 
+/// Whether a release, live or frozen, has the name `name` in `group`: only then does `placement` have work to do.
+pub fn name_in_use(conn: &Connection, name: &str, group: &str) -> Result<bool> {
+    let live = conn
+        .prepare_cached("select 1 from releases where name = ? and group_name = ?")?
+        .exists(params![name, group])?;
+    if live {
+        return Ok(true);
+    }
+    Ok(crate::frozen::attached(conn)?
+        && conn
+            .prepare_cached("select 1 from frozen.frozen_releases where name = ? and group_name = ?")?
+            .exists(params![name, group])?)
+}
+
 /// Whether the release named `name` in `group`, if there is one, is the post a spot's NZB lists: tagged with the
 /// same NZB, or already holding every article of it, each in the file of the same name. Then the spot adds nothing
 /// and just tags it. Any other release with the name, spot or not, is another post: the spot can't add articles or
@@ -666,5 +680,20 @@ mod tests {
         conn.execute("insert into frozen.frozen_releases values (3, 'Title', 'g')", []).unwrap();
         assert_eq!(placement(&conn, "Title", "g", "k", &files).unwrap(), Placement::Taken);
         assert_eq!(placement(&conn, "Title", "other", "k", &files).unwrap(), Placement::Free);
+    }
+
+    #[test]
+    fn a_name_is_in_use_live_or_frozen() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("create table releases (id INTEGER PRIMARY KEY, name TEXT, group_name TEXT)").unwrap();
+        conn.execute("insert into releases values (1, 'Live', 'g')", []).unwrap();
+        assert!(name_in_use(&conn, "Live", "g").unwrap());
+        assert!(!name_in_use(&conn, "Frozen", "g").unwrap());
+        conn.execute("attach ':memory:' as frozen", []).unwrap();
+        conn.execute_batch("create table frozen.frozen_releases (id INTEGER PRIMARY KEY, name TEXT, group_name TEXT)")
+            .unwrap();
+        conn.execute("insert into frozen.frozen_releases values (2, 'Frozen', 'g')", []).unwrap();
+        assert!(name_in_use(&conn, "Frozen", "g").unwrap());
+        assert!(!name_in_use(&conn, "Frozen", "other").unwrap());
     }
 }
