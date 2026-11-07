@@ -246,7 +246,7 @@ Naming (Database, rank 200) picks a display name by evidence priority (`NameSour
 
 ## 4. Visibility matrix
 
-> **Audit, 2026-11-07, against `main` at `b11d3e7`.** The status column below is from 2026-11-02, and much of it has changed since. Every item marked N1 (render only) whose status was not already **shown** is now on the release page. Items already marked shown that list N1 leftovers (27, 151, 183, 191, 243, 244) weren't rechecked here:
+> **Audit, 2026-11-07, against `main` at `b11d3e7`.** The status column below is from 2026-11-02, and much of it has changed since. Every item marked N1 (render only) whose status was not already **shown** is now on the release page. Items already marked shown that list N1 leftovers weren't rechecked here (e.g. 27, 151, 183, 191, 243, 244; the matrix lists more):
 >
 > | Items (by #) | Release page label |
 > |---|---|
