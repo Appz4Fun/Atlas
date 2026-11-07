@@ -93,44 +93,7 @@ fn poll(config: &SpotsConfig) -> Duration {
 /// One pass: the overview since the cursor, then up to `per_pass` spots fetched whole.
 pub async fn pass(pool: &Arc<Pool>, db: &Db, config: &SpotsConfig, stopping: &impl Fn() -> bool) -> Result<Pass> {
     let mut done = Pass::default();
-    let prefer = pool.indexing_tier().first().copied().unwrap_or(0);
-    // the comment groups' newest articles before the spot group's: their spots are at or below its newest
-    let limits = if config.comments { comment_limits(pool).await } else { Vec::new() };
-    let (server, (_, low, high, _)) = pool.select_group_on(prefer, SPOT_GROUP).await?;
-    let host = pool.host(server);
-    let key = host.clone();
-    let cursor = on_db(db, move |conn| Ok(store::cursor(conn, &key)?)).await?;
-    let mut from = start_at(cursor, low, high, config.first_articles);
-    while from <= high && !stopping() {
-        let to = high.min(from + XOVER_STEP - 1);
-        let rows = match pool.xover_on(server, SPOT_GROUP, from, to).await {
-            Ok(rows) => rows,
-            Err(e) if e.is_empty_range() => Vec::new(),
-            Err(e) => return Err(e.into()),
-        };
-        done.read += rows.len() as u64;
-        let wanted: Vec<store::Noted> = rows
-            .iter()
-            .filter_map(|r| {
-                let h = header::parse(&r.subject, &r.from).filter(header::SpotHeader::wanted)?;
-                Some((r.message_id.trim_matches(['<', '>']).to_string(), r.number, h.spotter_id()))
-            })
-            .collect();
-        let key = host.clone();
-        let now = chrono::Utc::now().timestamp();
-        done.noted += on_db(db, move |conn| Ok(store::note_read(conn, &key, to, &wanted, now)?)).await?;
-        from = to + 1;
-    }
-    if from > high && !limits.is_empty() {
-        // read to its end: the comments up to those articles can be read
-        on_db(db, move |conn| {
-            for (group, host, high) in &limits {
-                comments::set_limit(conn, group, host, *high)?;
-            }
-            Ok(())
-        })
-        .await?;
-    }
+    (done.read, done.noted) = read_overview(pool, db, config, stopping).await?;
 
     let now = chrono::Utc::now().timestamp();
     on_db(db, move |conn| Ok(store::prune(conn, now)? + comments::prune(conn)?)).await?;
@@ -444,6 +407,59 @@ async fn fetch(
     Ok(Some(settled(id)))
 }
 
+/// One spot overview read at a time: both tasks read it (`pass`, `said`), and one cursor moves for both.
+static OVERVIEW: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Reads the `free.pt` overview since its cursor and notes the spots worth fetching. With `comments` on, once it has
+/// read to its end it sets the comment groups' limits: their newest articles, asked for before the spot group's,
+/// so the spots of every comment up to them are noted. Returns the overview lines read and the spots noted.
+async fn read_overview(
+    pool: &Arc<Pool>,
+    db: &Db,
+    config: &SpotsConfig,
+    stopping: &impl Fn() -> bool,
+) -> Result<(u64, usize)> {
+    let _one = OVERVIEW.lock().await;
+    let (mut read, mut noted) = (0, 0);
+    let prefer = pool.indexing_tier().first().copied().unwrap_or(0);
+    let limits = if config.comments { comment_limits(pool).await } else { Vec::new() };
+    let (server, (_, low, high, _)) = pool.select_group_on(prefer, SPOT_GROUP).await?;
+    let host = pool.host(server);
+    let key = host.clone();
+    let cursor = on_db(db, move |conn| Ok(store::cursor(conn, &key)?)).await?;
+    let mut from = start_at(cursor, low, high, config.first_articles);
+    while from <= high && !stopping() {
+        let to = high.min(from + XOVER_STEP - 1);
+        let rows = match pool.xover_on(server, SPOT_GROUP, from, to).await {
+            Ok(rows) => rows,
+            Err(e) if e.is_empty_range() => Vec::new(),
+            Err(e) => return Err(e.into()),
+        };
+        read += rows.len() as u64;
+        let wanted: Vec<store::Noted> = rows
+            .iter()
+            .filter_map(|r| {
+                let h = header::parse(&r.subject, &r.from).filter(header::SpotHeader::wanted)?;
+                Some((r.message_id.trim_matches(['<', '>']).to_string(), r.number, h.spotter_id()))
+            })
+            .collect();
+        let key = host.clone();
+        let now = chrono::Utc::now().timestamp();
+        noted += on_db(db, move |conn| Ok(store::note_read(conn, &key, to, &wanted, now)?)).await?;
+        from = to + 1;
+    }
+    if from > high && !limits.is_empty() {
+        on_db(db, move |conn| {
+            for (group, host, high) in &limits {
+                comments::set_limit(conn, group, host, *high)?;
+            }
+            Ok(())
+        })
+        .await?;
+    }
+    Ok((read, noted))
+}
+
 /// The comment groups' newest articles, by server, as the comment task finds the groups (`read_group`). A group
 /// that can't be had is left out, and waits.
 async fn comment_limits(pool: &Arc<Pool>) -> Vec<(&'static str, String, u64)> {
@@ -473,6 +489,10 @@ struct Said {
 /// texts are read whatever came of the groups. The first failed read ends the texts for this pass.
 async fn said(pool: &Arc<Pool>, db: &Db, config: &SpotsConfig, stopping: &impl Fn() -> bool) -> Result<Said> {
     let mut done = Said::default();
+    // the spot overview first, for the comment groups' limits: a long spot pass's fetches don't hold them back
+    if let Err(e) = read_overview(pool, db, config, stopping).await {
+        eprintln!("spots: comments: the spot overview: {e:#}");
+    }
     for (group, reports) in [(comments::COMMENT_GROUP, false), (comments::REPORT_GROUP, true)] {
         match read_group(pool, db, group, reports, config.comment_days, stopping).await {
             Ok(n) if reports => done.reports = n,
@@ -557,17 +577,14 @@ async fn read_group(
     let (server, (_, low, high, _)) = pool.select_group_on(prefer, group).await?;
     let host = pool.host(server);
     let key = host.clone();
-    // the limit before the spots kept: every spot of a comment up to it is in spots_seen by the time it was set
-    let (cursor, limit, known) = on_db(db, move |conn| {
-        let (cursor, limit) = (comments::cursor(conn, group, &key)?, comments::limit(conn, group, &key)?);
-        Ok((cursor, limit, comments::known_spots(conn)?))
-    })
-    .await?;
+    let (cursor, limit) =
+        on_db(db, move |conn| Ok((comments::cursor(conn, group, &key)?, comments::limit(conn, group, &key)?))).await?;
     // up to what was newest when the spot overview's last full read began: past it, a comment's spot may not be
-    // noted yet. No limit yet (or one for another server): wait for the next spot pass
-    let Some(limit) = limit else { return Ok(0) };
+    // noted yet. No limit yet, one for another server, or one from before the server renumbered (past its newest):
+    // wait for the next full read of the overview
+    let Some(limit) = limit.filter(|l| *l <= high) else { return Ok(0) };
     let newest = high;
-    let high = high.min(limit);
+    let high = limit;
     let mut from = match cursor {
         Some(c) if c <= newest => (c + 1).max(low),
         // the first pass, or the server renumbered: from `days` ago
@@ -587,6 +604,11 @@ async fn read_group(
             from
         }
     };
+    if from > high {
+        return Ok(0);
+    }
+    // read after the limit: every spot of a comment up to it was in spots_seen when it was set
+    let known = on_db(db, |conn| Ok(comments::known_spots(conn)?)).await?;
     let mut added = 0;
     while from <= high && !stopping() {
         let to = high.min(from + XOVER_STEP - 1);

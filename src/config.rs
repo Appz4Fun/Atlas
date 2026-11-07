@@ -533,7 +533,7 @@ pub struct SpotsConfig {
     pub first_articles: u64,
     /// spots fetched whole in one pass at most; the rest wait for the next
     pub per_pass: usize,
-    /// spots fetched at once, and comments read at once
+    /// spots fetched at once; comments' texts are read at a quarter of it
     pub concurrency: usize,
     /// read the comments (`free.usenet`) and spam reports (`free.willey`) on the spots kept
     pub comments: bool,
