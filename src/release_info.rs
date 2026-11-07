@@ -987,15 +987,33 @@ fn across_posters(conn: &Connection, anchor: i64, named: &[Named]) -> Result<Acr
     let sharing =
         rest.iter().enumerate().any(|(n, a)| rest[n + 1..].iter().any(|b| kept[*a].1.shares_parts(&kept[*b].1)));
     if sharing {
-        posts.retain(|(c, u)| whole(c, u));
-        let mut taken = in_whole;
-        for seed in rest {
-            if taken.contains(&kept[seed].0.id) {
+        // only a whole post sharing parts is kept: the rows of one that isn't keep the answers they had
+        let mut taken = in_whole.clone();
+        let mut sharing_whole: Vec<(Vec<i64>, UnionFiles)> = Vec::new();
+        for seed in &rest {
+            if taken.contains(&kept[*seed].0.id) {
                 continue;
             }
-            let (chosen, union) = grow_post(conn, &kept, seed, &taken, true)?;
+            let (chosen, union) = grow_post(conn, &kept, *seed, &taken, true)?;
             taken.extend(chosen.iter().copied());
-            posts.push((chosen, union));
+            if union.overlap && whole(&chosen, &union) {
+                sharing_whole.push((chosen, union));
+            }
+        }
+        if !sharing_whole.is_empty() {
+            // the whole posts, and the rest of the rows grown again as before rows could share parts
+            posts.retain(|(c, u)| whole(c, u));
+            let mut taken: HashSet<i64> =
+                in_whole.into_iter().chain(sharing_whole.iter().flat_map(|(c, _)| c.iter().copied())).collect();
+            posts.extend(sharing_whole);
+            for seed in rest {
+                if taken.contains(&kept[seed].0.id) {
+                    continue;
+                }
+                let (chosen, union) = grow_post(conn, &kept, seed, &taken, false)?;
+                taken.extend(chosen.iter().copied());
+                posts.push((chosen, union));
+            }
         }
     }
     // one poster's rows are `same_poster_post`'s, unless they share parts
@@ -3138,11 +3156,9 @@ mod tests {
         put_row_subjects(&conn, 2, name, b, "whole@else", &[(mkv, &[1, 2, 3, 4], 4)], at, 1, true);
         put_row_subjects(&conn, 3, name, c, "x3@nyuu", &[(mkv, &[2, 3], 4)], at, 1, true);
         assert_eq!(whole_post_with(&conn, &row_of(&conn, 2, b)).unwrap(), None, "the whole upload is alone");
-        for (i, g) in [(1, a), (3, c)] {
-            let post = whole_post_with(&conn, &row_of(&conn, i, g)).unwrap().unwrap_or_else(|| panic!("row {i}"));
-            assert_eq!(post.ids.len(), 2, "row {i}: the two pieces, without the whole upload");
-            assert!(!post.complete, "row {i}: part 4 is only in the whole upload");
-        }
+        // and the two pieces, still a part short together, make no post either
+        assert_eq!(whole_post_with(&conn, &row_of(&conn, 1, a)).unwrap(), None);
+        assert_eq!(whole_post_with(&conn, &row_of(&conn, 3, c)).unwrap(), None);
     }
 
     #[test]
@@ -3183,13 +3199,6 @@ mod tests {
         assert_eq!(post.ids.len(), 2);
         assert!(post.complete);
         assert_eq!(post.size, 4 * 716_800, "the file once, not 600 bytes of rows");
-        // a part gone: its share of the file's size goes too
-        let (_dir2, conn2) = all_shards();
-        put_row_subjects(&conn2, 1, name, a, "x1@nyuu", &[(mkv, &[1, 2], 4)], at, 1, true);
-        put_row_subjects(&conn2, 2, name, b, "x2@nyuu", &[(mkv, &[2, 3], 4)], at, 1, true);
-        let post = whole_post_with(&conn2, &row_of(&conn2, 1, a)).unwrap().unwrap();
-        assert!(!post.complete);
-        assert_eq!(post.size, 3 * 716_800);
     }
 
     #[test]
@@ -3358,6 +3367,30 @@ mod tests {
                 assert!(!p.ids.contains(&rows[3].id), "row {} has the copy in another post", row.id);
             }
         }
+    }
+
+    #[test]
+    fn rows_sharing_parts_make_no_post_unless_its_whole() {
+        let (_dir, conn) = all_shards();
+        let name = "Some.Film.2026.2160p.UHD.Blu-ray.Remux.HDR.HEVC.DTS-HD.MA.5.1-GRP";
+        let (mkv, vol) = ("Some.Film.mkv", "Some.Film.vol00+01.par2");
+        let (a, b) = ("alt.binaries.a", "alt.binaries.b");
+        let at = "2026-11-07 05:16:17";
+        // together still a part short: each row keeps its answer of its own (a repair verdict, for one)
+        put_row_subjects(
+            &conn,
+            1,
+            name,
+            a,
+            "x1@nyuu",
+            &[(mkv, &[1, 2, 3, 4, 5, 6], 8), (vol, &[1, 2], 2)],
+            at,
+            2,
+            true,
+        );
+        put_row_subjects(&conn, 2, name, b, "x2@nyuu", &[(mkv, &[6, 7], 8)], at, 2, true);
+        assert_eq!(whole_post_with(&conn, &row_of(&conn, 1, a)).unwrap(), None);
+        assert_eq!(whole_post_with(&conn, &row_of(&conn, 2, b)).unwrap(), None);
     }
 
     #[test]
