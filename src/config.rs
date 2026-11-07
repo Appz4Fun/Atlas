@@ -533,11 +533,13 @@ pub struct SpotsConfig {
     pub first_articles: u64,
     /// spots fetched whole in one pass at most; the rest wait for the next
     pub per_pass: usize,
+    /// spots fetched at once
+    pub concurrency: usize,
 }
 
 impl Default for SpotsConfig {
     fn default() -> Self {
-        SpotsConfig { enabled: true, poll_minutes: 15, first_articles: 20_000, per_pass: 200 }
+        SpotsConfig { enabled: true, poll_minutes: 15, first_articles: 20_000, per_pass: 200, concurrency: 16 }
     }
 }
 
@@ -557,6 +559,9 @@ impl SpotsConfig {
         }
         if let Some(n) = int("per_pass", 1, 10_000) {
             c.per_pass = n as usize;
+        }
+        if let Some(n) = int("concurrency", 1, 64) {
+            c.concurrency = n as usize;
         }
         c
     }
@@ -1633,10 +1638,13 @@ mod tests {
     fn spots_keys_parse() {
         assert_eq!(Config::from_value(&json!({})).spots, SpotsConfig::default());
         let c = Config::from_value(
-            &json!({"spots": {"enabled": false, "poll_minutes": 0, "first_articles": 500, "per_pass": 20}}),
+            &json!({"spots": {"enabled": false, "poll_minutes": 0, "first_articles": 500, "per_pass": 20, "concurrency": 99}}),
         )
         .spots;
-        assert_eq!(c, SpotsConfig { enabled: false, poll_minutes: 1, first_articles: 500, per_pass: 20 });
+        assert_eq!(
+            c,
+            SpotsConfig { enabled: false, poll_minutes: 1, first_articles: 500, per_pass: 20, concurrency: 64 }
+        );
         assert_eq!(Config::from_value(&json!({"spots": "no"})).spots, SpotsConfig::default());
     }
 

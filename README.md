@@ -612,6 +612,7 @@ enabled = true
 | `poll_minutes` | `15` | Minutes between passes. |
 | `first_articles` | `20000` | How far back the first pass reads, in `free.pt` articles. That group gets about 340 a day, so the default covers about two months. |
 | `per_pass` | `200` | Spots fetched whole in one pass at most. The rest wait for the next pass, newest first. |
+| `concurrency` | `16` | Spots fetched at once. Each request queues for a connection behind indexing, so on a busy indexer one at a time takes minutes a spot. |
 
 ### Purging and reprocessing
 
