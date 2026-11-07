@@ -454,6 +454,8 @@ async fn read_overview(
             Err(e) => return Err(e.into()),
         };
         read += rows.len() as u64;
+        let now = chrono::Utc::now().timestamp();
+        let removals: Vec<store::Disposal> = rows.iter().filter_map(|r| removal(r, now)).collect();
         let wanted: Vec<store::Noted> = rows
             .iter()
             .filter_map(|r| {
@@ -467,11 +469,37 @@ async fn read_overview(
             })
             .collect();
         let key = host.clone();
-        let now = chrono::Utc::now().timestamp();
-        noted += on_db(db, move |conn| Ok(store::note_read(conn, &key, to, &wanted, now)?)).await?;
+        // the removals first: the cursor moves with the spots
+        noted += on_db(db, move |conn| {
+            let removed = store::note_disposals(conn, &removals)?;
+            if removed > 0 {
+                println!("spots: {removed} spots or comments removed by a moderator or their spotter");
+            }
+            Ok(store::note_read(conn, &key, to, &wanted, now)?)
+        })
+        .await?;
         from = to + 1;
     }
     Ok((read, noted))
+}
+
+/// The removal an overview line is, when it's a moderator's (or a spotter's own) `DISPOSE` whose signatures hold.
+/// A spotter's own needs their key to have signed its message-id: it removes only their posts.
+fn removal(r: &crate::nntp::Overview, now: i64) -> Option<store::Disposal> {
+    let h = header::parse(&r.subject, &r.from)?;
+    let message_id = h.removes()?;
+    let verdict = sign::verify(&h.title, &r.from, &r.message_id);
+    if !verdict.verified {
+        return None;
+    }
+    // a spotter id from the header signature alone could be replayed onto another message-id
+    let spotter = match verdict.personal {
+        true if verdict.message_id_signed => verdict.spotter_id?,
+        true => return None,
+        false => String::new(),
+    };
+    let at = crate::dates::posted_timestamp(&r.date).unwrap_or(now);
+    Some(store::Disposal { message_id, spotter, at })
 }
 
 /// What one pass read of what's said about spots, for the log.

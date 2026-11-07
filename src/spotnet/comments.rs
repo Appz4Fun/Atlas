@@ -254,14 +254,15 @@ pub struct Comment {
     pub body: String,
 }
 
-/// What's been said about release `release_id`'s spot: its comments, oldest first, and how many spam reports it
-/// has. `spot` is the message-id its row has; the spots of the same NZB that tagged it before count too.
+/// What's been said about release `release_id`'s spot: its comments, oldest first (but those removed by a
+/// moderator or their poster), and how many spam reports it has. `spot` is the message-id its row has; the spots of the same NZB that tagged it before count too.
 pub fn about(conn: &Connection, release_id: i64, spot: &str) -> Result<(Vec<Comment>, i64)> {
     let spots = "select ?2 union select message_id from main.spots_seen where release_id = ?1 and state = ?3";
     let comments = conn
         .prepare_cached(&format!(
             "select at, rating, coalesce(poster, ''), spotter_id, state, coalesce(body, '')
-             from main.spot_comments where spot in ({spots}) order by at, message_id"
+             from main.spot_comments c where spot in ({spots}) and not {} order by at, message_id",
+            super::store::disposed_sql("d", "c", "spotter_id", None)
         ))?
         .query_map(params![release_id, spot, SAVED], |r| {
             Ok(Comment {
