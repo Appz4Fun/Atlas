@@ -90,7 +90,7 @@ pub fn idle_ticks_on() -> bool {
 /// own wait is far longer, and freezing can always come back next tick
 const TICK_BUSY: Duration = Duration::from_secs(2);
 /// what the writer's connection waits otherwise (`db::open_shard`)
-const WRITER_BUSY: Duration = Duration::from_secs(30);
+pub(crate) const WRITER_BUSY: Duration = Duration::from_secs(30);
 /// The indexer is stopping: writers do no freezing, soo their queues of saves drain as fast as they did before it.
 pub static STOPPING: AtomicBool = AtomicBool::new(false);
 /// how long a free disk reading is trusted
@@ -661,7 +661,7 @@ impl Ticker {
 }
 
 /// Whether `e` is another connection holding the lock: worth trying again, not a failure.
-fn is_busy(e: &rusqlite::Error) -> bool {
+pub(crate) fn is_busy(e: &rusqlite::Error) -> bool {
     matches!(e.sqlite_error_code(), Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked))
 }
 
