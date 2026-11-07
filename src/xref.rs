@@ -75,7 +75,7 @@ create index if not exists linked_added on linked(added);
 create index if not exists linked_release on linked(release, file);
 -- each upload saved: its release, the groups its articles have been read in so far, when its files were posted, and
 -- how many it has, soo files read later in other groups join it; `probed` how many rounds of first-piece guesses the
--- archive step has tried (`probe_round`)
+-- archive step has tried (`tried`)
 create table if not exists uploads (
     release TEXT PRIMARY KEY,
     probed  INTEGER NOT NULL DEFAULT 0,
@@ -237,25 +237,22 @@ fn open_rw() -> Option<Connection> {
     Some(conn)
 }
 
-/// How many rounds of first-piece guesses the archive step has finished for the upload `release`
-/// (`uploads.probed`), each `HEAD_PROBES` guesses on from the last. None when not known (pruned, or in tests): the
-/// first round, once.
-pub fn probe_round(release: &str) -> Option<i64> {
+/// How many of the upload `release`'s first-piece guesses the archive step has tried (`uploads.probed`), in the order
+/// `archive::steps::xref_order` gives them. None when not known (pruned, or in tests): the first ones, once.
+pub fn tried(release: &str) -> Option<i64> {
     if cfg!(test) {
         return None;
     }
     open_rw()?.query_row("select probed from uploads where release = ?1", [release], |r| r.get(0)).optional().ok()?
 }
 
-/// Round `round` of the upload `release` was tried through: the next run takes the guesses after it. Noted only once a
-/// round has been tried, soo a run cut short tries the same round again.
-pub fn probed(release: &str, round: i64) {
+/// The first `count` guesses of the upload `release` were tried: a later run takes the ones after.
+pub fn tried_through(release: &str, count: i64) {
     if cfg!(test) {
         return;
     }
     if let Some(conn) = open_rw() {
-        let _ = conn
-            .execute("update uploads set probed = ?2 + 1 where release = ?1 and probed = ?2", params![release, round]);
+        let _ = conn.execute("update uploads set probed = max(probed, ?2) where release = ?1", params![release, count]);
     }
 }
 
@@ -419,7 +416,8 @@ impl Store {
             "delete from headers where added < ?1 and (done = 1 or added < ?2)",
             params![before, before - KEEP_SECS],
         )?;
-        self.conn.execute("delete from linked where added < ?1", [before])?;
+        // a file's place outlasts the window too: its leads are what the archive step guesses from
+        self.conn.execute("delete from linked where added < ?1", [before - 7 * KEEP_SECS])?;
         // an upload outlasts the linking window by a week: the archive step may still be taking its rounds
         self.conn.execute("delete from uploads where added < ?1", [before - 7 * KEEP_SECS])?;
         Ok(n)
@@ -620,12 +618,23 @@ impl Store {
             let Some(place) = place else { continue };
             if let Some(u) = saved.iter().find(|u| u.release == place.release) {
                 let mut seed = u.seed.clone();
-                let mut stmt = self.conn.prepare_cached("select distinct grp from headers where poster = ?1")?;
-                for g in stmt.query_map([poster], |r| r.get::<_, i64>(0))? {
-                    seed.groups.insert(g?);
+                let mut stmt = self.conn.prepare_cached(
+                    "select grp, min(posted), max(posted) from headers where poster = ?1 group by grp",
+                )?;
+                for row in
+                    stmt.query_map([poster], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)))?
+                {
+                    let (g, first, last) = row?;
+                    seed.groups.insert(g);
+                    seed.first = seed.first.min(first);
+                    seed.last = seed.last.max(last);
                 }
                 match widened.iter_mut().find(|(r, _, _, _)| *r == u.release) {
-                    Some((_, _, s, _)) => s.groups.extend(seed.groups),
+                    Some((_, _, s, _)) => {
+                        s.groups.extend(seed.groups);
+                        s.first = s.first.min(seed.first);
+                        s.last = s.last.max(seed.last);
+                    }
                     None => widened.push((u.release.clone(), u.group.clone(), seed, u.files)),
                 }
             }

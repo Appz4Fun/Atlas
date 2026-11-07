@@ -53,25 +53,23 @@ pub(crate) fn tail_articles(ctx: &StepCtx<'_>, file: &FileInfo) -> Result<Vec<Se
 
 /// The articles to try as the first piece of an upload linked from its headers (`xref`), and their volumes: the parts
 /// that were the first a group got of each volume (`xref::leads`, else its first `xref::LEADS`), volume by volume, the
-/// `xref::HEAD_PROBES` after the rounds tried before (`xref::probe_round`). Also the round, to note once tried
-/// (`xref::probed`), and when to look again if none of these is one and guesses are left.
+/// `xref::HEAD_PROBES` after the ones tried before (`xref::tried`). Also how many were tried before, and whether any
+/// are left after these, when the upload is known.
 #[allow(clippy::type_complexity)]
 fn xref_heads<'a>(
     ctx: &StepCtx<'_>,
     files: &'a [FileInfo],
-) -> Result<(Vec<(Head<'a>, SegmentRef)>, Option<i64>, Option<i64>), StepError> {
+) -> Result<(Vec<(Head<'a>, SegmentRef)>, Option<i64>, bool), StepError> {
     let volumes = select::volumes(files);
     let name = ctx.release().name.clone();
-    let round = crate::xref::probe_round(&name);
-    let skip = round.unwrap_or(0).max(0) as usize * crate::xref::HEAD_PROBES;
-    let (heads, left) = xref_order(&volumes, skip, |f| {
+    let tried = crate::xref::tried(&name);
+    let (heads, left) = xref_order(&volumes, tried.unwrap_or(0).max(0) as usize, |f| {
         let leads = crate::xref::file_of(&f.filename).map(|k| crate::xref::leads(&name, k)).unwrap_or_default();
         let pick = if leads.is_empty() { SegmentPick::First(crate::xref::LEADS) } else { SegmentPick::Parts(leads) };
         ctx.segments(f.id, &pick).map_err(retry)
     })?;
     let heads = heads.into_iter().map(|(f, seg)| (Head { file: f, tail: f, probe: true }, seg)).collect();
-    let again = (round.is_some() && left).then(|| chrono::Utc::now().timestamp() + 3600);
-    Ok((heads, round, again))
+    Ok((heads, tried, left))
 }
 
 /// Of `volumes`, each with what `leads` gives of it in turn, the `xref::HEAD_PROBES` after the first `skip`, and
@@ -1329,17 +1327,19 @@ impl Step for ListStep {
         let xref = crate::xref::is_upload(&rel_name);
         // with no first piece among this run's guesses, when the next run tries the next volumes
         let mut xref_again = None;
-        let mut xref_round = None;
+        // how many of the upload's guesses were tried before this run, and whether more are left after this run's
+        let mut xref_tried = None;
+        let mut xref_left = false;
         let heads: Vec<(Head<'_>, Option<SegmentRef>)> = if xref {
             left = left.max(crate::xref::HEAD_PROBES);
-            let (heads, round, again) = xref_heads(ctx, &files)?;
-            xref_round = round;
-            xref_again = again;
+            let (heads, tried, left) = xref_heads(ctx, &files)?;
+            xref_tried = tried;
+            xref_left = left;
             heads.into_iter().map(|(h, s)| (h, Some(s))).collect()
         } else {
             select::plan(&files, limits.probe_files.max(0) as usize).into_iter().map(|h| (h, None)).collect()
         };
-        for (head, picked) in heads {
+        for (k, (head, picked)) in heads.into_iter().enumerate() {
             let seg = match picked {
                 Some(seg) => seg,
                 None => {
@@ -1351,7 +1351,28 @@ impl Step for ListStep {
                 break;
             }
             left -= 1;
-            let body = if head.probe {
+            let body = if xref {
+                // each guess is noted as tried once fetched, soo a run cut short (deadline, stop) goes on from there;
+                // a refusal is the run's body budget spent: the rest wait for a run with a fresh one
+                self.wait_for_slot(ctx, gap)?;
+                let wanted = BodyRequest {
+                    message_id: seg.message_id.clone(),
+                    file: head.file.filename.clone(),
+                    max_bytes: Some(PROBE_PREFIX),
+                };
+                let got = match ctx.fetch_prefix(&wanted)?.got {
+                    Got::Refused(_) => {
+                        xref_again = Some(chrono::Utc::now().timestamp() + 300);
+                        break;
+                    }
+                    Got::Body(body) => Some(body),
+                    Got::Missing | Got::TooBig => None,
+                };
+                if let Some(before) = xref_tried {
+                    crate::xref::tried_through(&rel_name, before + k as i64 + 1);
+                }
+                got
+            } else if head.probe {
                 self.wait_for_slot(ctx, gap)?;
                 fetch_start(ctx, &seg, &head.file.filename)?
             } else {
@@ -1561,9 +1582,9 @@ impl Step for ListStep {
                 return Ok(outcome);
             }
         }
-        // this round's guesses were all tried: the next run goes on from them
-        if let Some(round) = xref_round {
-            crate::xref::probed(&rel_name, round);
+        // guesses left after this run's: an hour on, the next ones
+        if xref_again.is_none() && xref_tried.is_some() && xref_left {
+            xref_again = Some(chrono::Utc::now().timestamp() + 3600);
         }
         Ok(Outcome { wait_until: xref_again, ..Default::default() })
     }
