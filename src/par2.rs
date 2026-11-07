@@ -1,24 +1,20 @@
 //! Pull real filenames out of a base .par2 file (deobfuscation).
 #![cfg_attr(not(test), deny(clippy::indexing_slicing, clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
-use std::sync::LazyLock;
-
 use md5::Digest;
-use regex::Regex;
 
 use crate::archive::names::{best_name, clean_name};
-
-#[allow(clippy::unwrap_used)]
-static BASE_PAR2_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"(?i)\.par2(?:["\s]|$)"#).unwrap());
-#[allow(clippy::unwrap_used)]
-static VOL_PAR2_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\.vol\d+[+-]\d+\.par2").unwrap());
 
 const MAGIC: &[u8; 8] = b"PAR2\0PKT";
 const FILE_DESC: &[u8; 16] = b"PAR 2.0\0FileDesc";
 const HEADER_LEN: usize = 64;
 
+/// Does a subject name a base `.par2` index (not a `.volNNN+MM.par2` volume)? `par_rs`'s rule,
+/// as asked for in `docs/PARITY_REQUESTS.md` §5: the name ends right after `.par2` (end of
+/// subject, whitespace, a quote or a closing bracket follows), so `a.par2.rar` is not one and
+/// `"a.par2"`, `(a.par2)` are. One allocation-free pass per subject.
 pub fn is_base_par2(subject: &str) -> bool {
-    BASE_PAR2_RE.is_match(subject) && !VOL_PAR2_RE.is_match(subject)
+    crate::parity::is_base_par2(subject)
 }
 
 /// the most files, unicode names and Main ids a read keeps
