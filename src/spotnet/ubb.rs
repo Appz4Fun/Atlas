@@ -47,7 +47,7 @@ pub fn to_html(text: &str) -> String {
                 let tag = element(&name);
                 let _ = write!(out, "<{tag}>");
                 if let Some(by) = value.filter(|v| !v.is_empty()) {
-                    let _ = write!(out, "<cite>{}</cite>\n", escape(by));
+                    let _ = writeln!(out, "<cite>{}</cite>", escape(by));
                 }
                 open.push(tag);
             }
