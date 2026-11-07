@@ -669,7 +669,7 @@ impl Step for ProbeStep {
                 media.cover = own_cover;
                 info.media = Some(media);
                 info.media_from = Some(twin.release_id);
-                info.media_whole = Some(stamp);
+                info.media_whole = Some(whole_mark(stamp));
                 // a set's hash takes its last volume's first article: the lender's, of the same file, saves it
                 set_hash = twin.moviehash;
             }
@@ -692,11 +692,8 @@ impl Step for ProbeStep {
                 }
                 read_tail_moov(ctx, file, &front, &mut info)?;
                 let tags_read = read_tail_tags(ctx, file, &front, known_last.as_ref(), &mut info)?;
-                if encoder_read
-                    && tags_read
-                    && info.media.as_ref().is_some_and(|m| m.header_complete && first_frame_read(m))
-                {
-                    info.media_whole = Some(stamp);
+                if media_read_whole(encoder_read, tags_read, info.media.as_ref()) {
+                    info.media_whole = Some(whole_mark(stamp));
                 }
             }
         }
@@ -775,6 +772,15 @@ impl Step for ProbeStep {
     }
 }
 
+/// The rules a probe meets to mark its media whole (`media_whole`), kept with the config stamp above its 32 bits:
+/// raised whenever they get stricter, soo a probe marked under looser ones never lends.
+const MEDIA_WHOLE_RULES: u64 = 1;
+
+/// What `media_whole` holds for a probe run under config `stamp`.
+fn whole_mark(stamp: u64) -> u64 {
+    stamp | MEDIA_WHOLE_RULES << 32
+}
+
 /// Releases looked at per shard, newest first, for one whose probe already read the same mux.
 const SAME_MUX_CANDIDATES: i64 = 16;
 
@@ -796,11 +802,14 @@ fn same_mux_of(ctx: &StepCtx<'_>, release_id: i64, info: &ProbeInfo, stamp: u64)
     same_mux_media(&all, release_id, info, &mux, stamp)
 }
 
-/// The size of the video file a probe is about: the archive's first file unpacked, else the file as posted.
+/// The size of the video file a probe read its media from: the innermost file the layers were followed down to (an
+/// archive's first entry may be an NFO, a nested set's an inner volume), else the file as posted. None when a layer
+/// stopped short or doesn't say.
 fn content_size(p: &ProbeInfo) -> Option<u64> {
-    match &p.archive {
-        Some(a) => a.unpacked,
-        None if p.layers.is_empty() => p.yenc.as_ref().and_then(|y| y.file_size),
+    match p.layers.last() {
+        Some(_) if p.layers.iter().any(|l| l.stop.is_some()) => None,
+        Some(inner) => inner.unpacked,
+        None if p.archive.is_none() => p.yenc.as_ref().and_then(|y| y.file_size),
         None => None,
     }
 }
@@ -869,8 +878,9 @@ pub(crate) fn same_mux_media(
     stamp: u64,
 ) -> Option<SameMux> {
     let key = crate::keys::as_key(crate::keys::digest8(mux.as_bytes()));
-    // JSON keeps the stamp as a number, which SQLite reads back as a 64-bit integer
-    let stamp_i64 = stamp as i64;
+    // JSON keeps the mark as a number, which SQLite reads back as a 64-bit integer
+    let mark = whole_mark(stamp);
+    let mark_i64 = i64::try_from(mark).ok()?;
     let mine = info.media.as_ref()?;
     let bare = info.archive.is_none() && info.layers.is_empty();
     type Row = (i64, String, Option<String>, Option<String>, Option<String>);
@@ -878,7 +888,7 @@ pub(crate) fn same_mux_media(
     for shard in 0..crate::store::SHARDS {
         // a shard without the tables yet has none
         let Ok(mut q) = conn.prepare_cached(&same_mux_sql(shard)) else { continue };
-        let Ok(rows) = q.query_map(rusqlite::params![own, SAME_MUX_CANDIDATES, key, stamp_i64], |r| {
+        let Ok(rows) = q.query_map(rusqlite::params![own, SAME_MUX_CANDIDATES, key, mark_i64], |r| {
             Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
         }) else {
             continue;
@@ -902,7 +912,7 @@ pub(crate) fn same_mux_media(
                 .filter(|h| !h.is_empty())
                 .zip(info.moviehash.as_deref())
                 .is_some_and(|(a, b)| a != b);
-        if other.media_whole != Some(stamp)
+        if other.media_whole != Some(mark)
             || (bare && packed)
             || size.is_none()
             || content_size(&other) != size
@@ -988,6 +998,12 @@ fn read_more_front(
         return Ok(info.media.as_ref().is_some_and(|m| !wants_encoder(m) || m.encoder.is_none()));
     }
     Ok(false)
+}
+
+/// Whether a probe's own reads of its media ran to their end: the encoder's settings looked for to theirs, a bare
+/// Matroska file's end Tags read whole, the header complete and the first frame's keys there.
+fn media_read_whole(encoder_read: bool, tags_read: bool, media: Option<&media::MediaInfo>) -> bool {
+    encoder_read && tags_read && media.is_some_and(|m| m.header_complete && first_frame_read(m))
 }
 
 /// Whether the keys taken over the first frame are there: an AVC or HEVC track's keyframe key (and with it, a Dolby
@@ -1359,7 +1375,7 @@ mod tests {
         ProbeInfo {
             yenc: Some(super::super::yenc::YencLines { file_size: Some(SIZE), ..Default::default() }),
             media: Some(media),
-            media_whole: Some(STAMP),
+            media_whole: Some(whole_mark(STAMP)),
             ..Default::default()
         }
     }
@@ -1370,10 +1386,10 @@ mod tests {
         ProbeInfo { media_whole: None, ..whole_bare(media) }
     }
 
-    /// The same, with the file the first one in a RAR set, `SIZE` bytes unpacked.
+    /// The same, with the file inside a RAR set whose first entry is a small NFO: `SIZE` bytes unpacked.
     fn packed(mut p: ProbeInfo) -> ProbeInfo {
-        p.yenc = None;
-        p.archive = Some(super::super::ArchiveHead { unpacked: Some(SIZE), ..Default::default() });
+        p.archive = Some(super::super::ArchiveHead { unpacked: Some(4_000), ..Default::default() });
+        p.layers = vec![nest::Layer { format: "RAR5".into(), unpacked: Some(SIZE), ..Default::default() }];
         p
     }
 
@@ -1407,6 +1423,18 @@ mod tests {
         assert_eq!(same_mux_media(&conn, 0, &first, &mux, STAMP).map(|t| t.release_id), None, "never itself");
         // a probe read under another config stamp lends nothing
         assert_eq!(same_mux_media(&conn, 99, &first, &mux, STAMP | 128).map(|t| t.release_id), None);
+        // nor one marked whole under looser rules than these, with the bare stamp
+        conn.execute(
+            "update s0.release_probe set info = json_set(info, '$.media_whole', ?1) where release_id = 0",
+            [STAMP as i64],
+        )
+        .unwrap();
+        assert_eq!(same_mux_media(&conn, 99, &first, &mux, STAMP).map(|t| t.release_id), None);
+        conn.execute(
+            "update s0.release_probe set info = json_set(info, '$.media_whole', ?1) where release_id = 0",
+            [whole_mark(STAMP) as i64],
+        )
+        .unwrap();
 
         // the same mux key on a file whose header was changed in place (mkvpropedit), or that is another size
         let mut renamed = front.clone();
@@ -1459,10 +1487,20 @@ mod tests {
         probed(&conn, 32, "a.b.c", &packed(whole_bare(whole.clone())), None);
         assert_eq!(lender(&conn, &first), Some(0));
         assert_eq!(lender(&conn, &packed(first.clone())), Some(32));
-        // nor does a packed file whose size can't be read borrow
+        // the size compared is the file the media came from, not the archive's first entry
+        let mut other_inner = packed(first.clone());
+        other_inner.layers[0].unpacked = Some(SIZE - 1);
+        assert_eq!(lender(&conn, &other_inner), None, "another file inside the same-looking set");
+        // nor does a packed file whose size can't be read, or whose layers stopped short, borrow
         let mut unsized_ = packed(first.clone());
-        unsized_.archive.as_mut().unwrap().unpacked = None;
+        unsized_.layers[0].unpacked = None;
         assert_eq!(lender(&conn, &unsized_), None);
+        let mut stopped = packed(first.clone());
+        stopped.layers[0].stop = Some("encrypted".into());
+        assert_eq!(lender(&conn, &stopped), None);
+        let mut listed_only = packed(first.clone());
+        listed_only.layers.clear();
+        assert_eq!(lender(&conn, &listed_only), None, "an archive with no layer followed");
 
         // a lender whose media names an attached cover it no longer keeps isn't used: the cover would be lost
         let mut with_cover = whole.clone();
@@ -1490,7 +1528,7 @@ mod tests {
         // what a borrower keeps round-trips through its JSON
         let borrowed = ProbeInfo { media_from: Some(0), ..whole_bare(whole) };
         let back: ProbeInfo = serde_json::from_str(&serde_json::to_string(&borrowed).unwrap()).unwrap();
-        assert_eq!((back.media_from, back.media_whole), (Some(0), Some(STAMP)));
+        assert_eq!((back.media_from, back.media_whole), (Some(0), Some(whole_mark(STAMP))));
         // no mux key in the first article, nothing to look by
         assert!(crate::keys::mux_text(&mkv("", 1, 1)).is_none());
     }
@@ -1507,6 +1545,17 @@ mod tests {
         assert!(first_frame_read(&m), "no key is taken over DTS");
         m.video[0] = media::VideoTrack { codec: "V_MPEG2".into(), ..Default::default() };
         assert!(first_frame_read(&m), "nor over MPEG-2 video");
+
+        // the whole of what marks a probe's media whole
+        let mut keyed = mkv("ab12", 1, 1);
+        keyed.video[0].keyframe_key = Some("k".into());
+        keyed.audio[0].stream_key = Some("s".into());
+        assert!(!media_read_whole(true, true, Some(&keyed)), "header not complete");
+        keyed.header_complete = true;
+        assert!(media_read_whole(true, true, Some(&keyed)));
+        assert!(!media_read_whole(false, true, Some(&keyed)), "encoder settings not looked for to their end");
+        assert!(!media_read_whole(true, false, Some(&keyed)), "end Tags cut off");
+        assert!(!media_read_whole(true, true, None), "no media");
     }
 
     #[test]
