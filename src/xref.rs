@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use chrono::DateTime;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use crate::parser::{Article, Release, Shape, Unparsable, is_complete, parse_subject, unparsable_shape};
 
@@ -31,6 +31,10 @@ pub const SETTLE_SECS: i64 = 15 * 60;
 pub const GAP_SECS: i64 = 5;
 /// an upload of fewer articles is noise: a random poster for each article makes uploads of one
 pub const MIN_UPLOAD_ARTICLES: i64 = 10;
+/// how long a connection waits for another's write: the recorder, the linker and the archive step share the file
+const BUSY: Duration = Duration::from_secs(120);
+/// rows one write transaction takes at most, soo no writer holds the file for long
+const WRITE_CHUNK: usize = 2000;
 /// how often the linker runs
 const PASS_EVERY: Duration = Duration::from_secs(60);
 /// what the name of every upload saved here starts with (`is_upload`)
@@ -237,7 +241,7 @@ fn upload_name(poster: &str) -> String {
 
 fn open_rw() -> Option<Connection> {
     let conn = Connection::open(path_for(&crate::paths::database())).ok()?;
-    conn.busy_timeout(Duration::from_secs(30)).ok()?;
+    conn.busy_timeout(BUSY).ok()?;
     Some(conn)
 }
 
@@ -365,7 +369,7 @@ pub struct Store {
 impl Store {
     pub fn open(path: &Path) -> Result<Store> {
         let conn = Connection::open(path)?;
-        conn.busy_timeout(Duration::from_secs(30))?;
+        conn.busy_timeout(BUSY)?;
         conn.execute_batch("pragma journal_mode = wal; pragma synchronous = normal;")?;
         conn.execute_batch(SCHEMA)?;
         let groups = {
@@ -395,31 +399,34 @@ impl Store {
         Ok(name)
     }
 
-    /// Keep the headers of `articles` of `group`, unless another server's listing brought them already.
+    /// Keep the headers of `articles` of `group`, unless another server's listing brought them already. In
+    /// transactions of `WRITE_CHUNK` rows, soo the linker's writes go between them.
     pub fn record(&mut self, group: &str, articles: &[Article], added: i64) -> Result<usize> {
         let grp = self.group_id(group)?;
-        let tx = self.conn.transaction()?;
         let mut n = 0;
-        {
-            let mut insert = tx.prepare_cached(
-                "insert or ignore into headers (message_id, poster, posted, grp, number, bytes, lines, added)
-                 values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            )?;
-            for a in articles {
-                let Some(posted) = crate::dates::naive_timestamp(&a.date) else { continue };
-                n += insert.execute(params![
-                    a.message_id,
-                    a.author,
-                    posted,
-                    grp,
-                    a.number as i64,
-                    a.bytes,
-                    a.lines,
-                    added
-                ])?;
+        for chunk in articles.chunks(WRITE_CHUNK) {
+            let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            {
+                let mut insert = tx.prepare_cached(
+                    "insert or ignore into headers (message_id, poster, posted, grp, number, bytes, lines, added)
+                     values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                )?;
+                for a in chunk {
+                    let Some(posted) = crate::dates::naive_timestamp(&a.date) else { continue };
+                    n += insert.execute(params![
+                        a.message_id,
+                        a.author,
+                        posted,
+                        grp,
+                        a.number as i64,
+                        a.bytes,
+                        a.lines,
+                        added
+                    ])?;
+                }
             }
+            tx.commit()?;
         }
-        tx.commit()?;
         Ok(n)
     }
 
@@ -427,10 +434,20 @@ impl Store {
     pub fn prune(&mut self, now: i64) -> Result<usize> {
         let before = now - KEEP_SECS;
         // what waits for a group to be read is let go at the latest a day after it would settle (see `pass_with`)
-        let n = self.conn.execute(
-            "delete from headers where added < ?1 and (done = 1 or added < ?2)",
-            params![before, before - KEEP_SECS],
-        )?;
+        let mut n = 0;
+        loop {
+            let gone = self.conn.execute(
+                &format!(
+                    "delete from headers where message_id in (
+                         select message_id from headers where added < ?1 and (done = 1 or added < ?2) limit {WRITE_CHUNK})"
+                ),
+                params![before, before - KEEP_SECS],
+            )?;
+            n += gone;
+            if gone < WRITE_CHUNK {
+                break;
+            }
+        }
         // a file's place outlasts the window too: its leads are what the archive step guesses from
         self.conn.execute("delete from linked where added < ?1", [before - 7 * KEEP_SECS])?;
         // an upload outlasts the linking window by a week: the archive step may still be taking its rounds
@@ -687,24 +704,34 @@ impl Store {
     /// Articles that came for a file since aren't in it, soo they wait for the next.
     pub fn ack(&mut self, ack: &Ack) -> Result<()> {
         let Ack { finished, widened, now } = ack;
-        let tx = self.conn.transaction()?;
-        {
-            let mut done = tx.prepare_cached("update headers set done = 1 where message_id = ?1")?;
-            let mut keep = tx.prepare_cached(
-                "insert into linked (poster, release, grp, file, files, parts, leads, oldest, added)
-                 values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-                 on conflict(poster) do update set parts = excluded.parts, leads = excluded.leads, added = excluded.added",
-            )?;
-            for (poster, place, ids) in finished {
+        // in transactions of about `WRITE_CHUNK` rows: a stop half way leaves some posters noted, and the rest are
+        // found again and saved again under the same numbers
+        let mut rows = 0;
+        let mut tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for (poster, place, ids) in finished {
+            {
+                let mut done = tx.prepare_cached("update headers set done = 1 where message_id = ?1")?;
                 for id in ids {
                     done.execute([id])?;
                 }
                 if let Some(p) = place {
-                    keep.execute(params![
-                        poster, p.release, p.group, p.file, p.files, p.parts, p.leads, p.oldest, now
-                    ])?;
+                    tx.prepare_cached(
+                        "insert into linked (poster, release, grp, file, files, parts, leads, oldest, added)
+                         values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                         on conflict(poster) do update set parts = excluded.parts, leads = excluded.leads,
+                             added = excluded.added",
+                    )?
+                    .execute(params![poster, p.release, p.group, p.file, p.files, p.parts, p.leads, p.oldest, now])?;
                 }
             }
+            rows += ids.len() + 1;
+            if rows >= WRITE_CHUNK {
+                tx.commit()?;
+                tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                rows = 0;
+            }
+        }
+        {
             let mut upload = tx.prepare_cached(
                 "insert into uploads (release, grp, groups, first, last, files, added)
                  values (?1, ?2, ?3, ?4, ?5, ?6, ?7)
@@ -1201,5 +1228,32 @@ mod tests {
         assert_eq!(more.len(), 1);
         assert_eq!(more[0].name, first[0].name);
         assert_eq!(more[0].articles.len(), 7, "the late parts and the small file both join");
+    }
+
+    #[test]
+    fn the_recorder_and_the_linker_write_side_by_side() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("atlas.xref.db");
+        let mut linker = Store::open(&path).unwrap();
+        let recorder = std::thread::spawn({
+            let path = path.clone();
+            move || {
+                let mut store = Store::open(&path).unwrap();
+                for round in 0..5 {
+                    let batch: Vec<Article> = (0..20_000u64)
+                        .map(|k| {
+                            article(&format!("x{round}{k:022}"), &format!("p{}@x.y", k % 50), "2023-12-03 16:23:23", k)
+                        })
+                        .collect();
+                    store.record("a.b.one", &batch, 1000).unwrap();
+                }
+            }
+        });
+        for t in 0..20 {
+            let found = linker.pass_with(1001 + SETTLE_SECS + t, &mut |_, _| false).unwrap();
+            linker.ack(&found.ack).unwrap();
+            linker.prune(1001 + SETTLE_SECS + t).unwrap();
+        }
+        recorder.join().unwrap();
     }
 }
