@@ -647,7 +647,7 @@ impl Step for ProbeStep {
             derive(&mut info, wire_bytes, file.expected, last_lines.as_ref());
             let known_last = last_part(&info, last_lines.as_ref(), last_body);
             // the file's own OpenSubtitles hash, over its size and first and last 64 KiB: a lender's must agree with
-            // it (`same_mux_media`), which catches a header or end Tags rewritten in place
+            // it (`same_mux_media`), which catches a header, or end Tags in the last 64 KiB, rewritten in place
             info.moviehash = moviehash_of(ctx, file, &files, &front, &info, known_last.clone())?;
             // the same mux already read whole by another release's probe: its media is taken, and nothing more of
             // this file is read for it (an explicit rerun reads its own)
@@ -899,6 +899,7 @@ pub(crate) fn same_mux_media(
         let other: ProbeInfo = serde_json::from_str(&json).ok()?;
         let packed = other.archive.is_some() || !other.layers.is_empty();
         let size = content_size(info);
+        let crc_same = !packed && bare && other.file_crc32.zip(info.file_crc32).is_some_and(|(a, b)| a == b);
         let crc_differs = !packed && bare && other.file_crc32.zip(info.file_crc32).is_some_and(|(a, b)| a != b);
         // the OpenSubtitles hash, over the size and first and last 64 KiB, the same on both: none on either side
         // (a missing last article, a compressed set) and nothing ties the ends of the two files
@@ -916,6 +917,11 @@ pub(crate) fn same_mux_media(
         let media = other.media?;
         if crate::keys::mux_text(&media).as_deref() != Some(mux) || media.video.is_empty() || !same_header(mine, &media)
         {
+            return None;
+        }
+        // the title ids the lender's tags name (front or end, which can't be told apart) go on this release's row:
+        // ones this first article doesn't show are taken only from a file the whole CRC32 proves the same
+        if media.title_ids() != mine.title_ids() && !crc_same {
             return None;
         }
         let cover = mime.zip(sha256).filter(|(_, sha)| super::cover_file(sha).is_some_and(|f| f.exists()));
@@ -995,7 +1001,12 @@ fn read_more_front(
 /// Whether a probe's own reads of its media ran to their end: the encoder's settings looked for to theirs, a bare
 /// Matroska file's end Tags read whole, the header complete and the first frame's keys there.
 fn media_read_whole(encoder_read: bool, tags_read: bool, media: Option<&media::MediaInfo>) -> bool {
-    encoder_read && tags_read && media.is_some_and(|m| m.header_complete && first_frame_read(m))
+    // only Matroska is lent (by its mux key); an MP4's tail moov read says nothing of its end
+    encoder_read
+        && tags_read
+        && media.is_some_and(|m| {
+            matches!(m.container.as_str(), "matroska" | "webm") && m.header_complete && first_frame_read(m)
+        })
 }
 
 /// Whether the keys taken over the first frame are there: an AVC or HEVC track's keyframe key (and with it, a Dolby
@@ -1474,6 +1485,21 @@ mod tests {
             .unwrap();
         assert_eq!(lender(&conn, &other_crc), None, "another CRC32");
         assert_eq!(lender(&conn, &first), Some(0), "no CRC32 of its own to compare");
+        // title ids in the lender's tags that this first article doesn't show need the whole CRC32 to agree
+        conn.execute(
+            "update s0.release_probe set info = json_set(info, '$.media.tags.IMDB', 'tt0133093') where release_id = 0",
+            [],
+        )
+        .unwrap();
+        assert_eq!(lender(&conn, &first), None, "an IMDb id only the lender names");
+        let mut same_crc = first.clone();
+        same_crc.file_crc32 = Some(2);
+        assert_eq!(lender(&conn, &same_crc), Some(0), "the same file by its CRC32");
+        conn.execute(
+            "update s0.release_probe set info = json_remove(info, '$.media.tags.IMDB') where release_id = 0",
+            [],
+        )
+        .unwrap();
         // a first article that shows more audio than the saved probe read
         let mut more = front.clone();
         more.audio.push(media::AudioTrack { codec: "A_EAC3".into(), ..Default::default() });
@@ -1577,6 +1603,8 @@ mod tests {
         assert!(!media_read_whole(false, true, Some(&keyed)), "encoder settings not looked for to their end");
         assert!(!media_read_whole(true, false, Some(&keyed)), "end Tags cut off");
         assert!(!media_read_whole(true, true, None), "no media");
+        keyed.container = "mp4".into();
+        assert!(!media_read_whole(true, true, Some(&keyed)), "only Matroska is lent");
     }
 
     #[test]
