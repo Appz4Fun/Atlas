@@ -414,8 +414,11 @@ impl PasswordHarvester {
 
     fn harvest_subject(subject: &str, out: &mut Vec<String>) {
         static RE_BRACES: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\{\{([^}]+)\}\}").unwrap());
-        static RE_BRACKETS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\[pw:\s*([^\]]+)\]").unwrap());
-        static RE_PASS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\bpass(?:word)?[:=]\s*(\S+)").unwrap());
+        static RE_BRACKETS: LazyLock<Regex> =
+            LazyLock::new(|| Regex::new(r"(?i)\[(?:pw|pwd|pass|password|passwurd|passwd|passwort)[:=]\s*([^\]]+)\]").unwrap());
+        static RE_PASS: LazyLock<Regex> = LazyLock::new(|| {
+            Regex::new(r"(?i)\b(?:password|passwurd|passwd|passwort|passwoord|pasword|pswd|pass|pw|pwd|mot\s+de\s+passe|mdp|wachtwoord|kennwort)\b[\s._-]*(?:is\s*)?[:=]\s*([^\s\[\]\x22']{1,128})").unwrap()
+        });
 
         for cap in RE_BRACES.captures_iter(subject) {
             if let Some(m) = cap.get(1) {
@@ -436,14 +439,14 @@ impl PasswordHarvester {
                 continue;
             }
             if let Some(m) = cap.get(1) {
-                out.push(m.as_str().to_string());
+                out.push(m.as_str().trim_matches(['.', ',']).to_string());
             }
         }
     }
 
     fn harvest_nfo(nfo: &str, out: &mut Vec<String>) {
         static RE_NFO: LazyLock<Regex> = LazyLock::new(|| {
-            Regex::new(r"(?i)\b(?:password|passwd|pwd|pass|passwort|pw|mot\s+de\s+passe|mdp|wachtwoord)\b[\s._-]*(?:is\s*)?[:=]\s*([^\r\n]+)").unwrap()
+            Regex::new(r"(?i)\b(?:password|passwurd|passwd|pwd|pass|passwort|passwoord|pasword|pswd|pw|mot\s+de\s+passe|mdp|wachtwoord|kennwort)\b[\s._-]*(?:is\s*)?[:=]\s*([^\r\n]+)").unwrap()
         });
 
         for cap in RE_NFO.captures_iter(nfo) {

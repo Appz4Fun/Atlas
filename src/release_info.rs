@@ -1219,7 +1219,7 @@ pub fn looks_made_up(email: &str) -> bool {
 
 static PASSWORD: LazyLock<Regex> = LazyLock::new(|| {
     #[allow(clippy::unwrap_used)]
-    Regex::new(r"(?i)\{\{([^{}\s]{1,128})\}\}|\b(?:password|passwd|passwort|pass|pw|pwd|mot\s+de\s+passe|mdp|wachtwoord)\b[\s._-]*(?:is\s*)?[:=]\s*([^\s\[\]\x22']{1,128})").unwrap()
+    Regex::new(r"(?i)\{\{([^{}\s]{1,128})\}\}|\b(?:password|passwurd|passwd|passwort|passwoord|pasword|pswd|pass|pw|pwd|mot\s+de\s+passe|mdp|wachtwoord|kennwort)\b[\s._-]*(?:is\s*)?[:=]\s*([^\s\[\]\x22']{1,128})").unwrap()
 });
 
 /// Whether a matched token is a known non-password placeholder, negative word, or MediaInfo artifact.
@@ -1380,16 +1380,22 @@ pub fn find_verified_password<'a>(
                         || matches!(c, '*' | '#' | '=' | '-' | '|' | ':' | '~')
                 })
                 .trim();
-            if line.is_empty() || line.len() > 80 {
+            if line.is_empty() {
                 continue;
             }
-            if !line.contains(char::is_whitespace) && (3..=64).contains(&line.len()) {
+            if line.len() <= 80 && !line.contains(char::is_whitespace) && (3..=64).contains(&line.len()) {
                 push_uniq(&mut broad, line);
             }
-            if let Some((_, rhs)) = line.split_once(':').or_else(|| line.split_once('=')) {
-                let val = rhs.trim().trim_matches(['"', '\'', '.', ',']);
+            for (idx, _) in line.match_indices([':', '=']) {
+                let rhs = line[idx + 1..].trim();
+                let val = rhs.trim_matches(['"', '\'', '.', ',']);
                 if !val.contains(char::is_whitespace) && (3..=64).contains(&val.len()) {
                     push_uniq(&mut broad, val);
+                } else if let Some(first) = val.split_whitespace().next() {
+                    let tok = first.trim_matches(['"', '\'', '.', ',', ';', ')', ']']);
+                    if (3..=64).contains(&tok.len()) {
+                        push_uniq(&mut broad, tok);
+                    }
                 }
             }
         }
@@ -1446,21 +1452,31 @@ pub fn password_hint_with(conn: &Connection, id: i64, names: Option<&Names>) -> 
             return hint(password, "the subject");
         }
     }
+    let inner = crate::archive::store::view_with(conn, id);
     // a name inside: an archive holding `Name-{{secret}}.nzb`, the password for what that NZB points to
-    for row in crate::archive::store::view_with(conn, id).files {
+    for row in &inner.files {
         if let Some(password) = find_password(&row.name) {
             return hint(password, "a file inside");
         }
     }
     // the harvester's other spellings: `{{pass}}`, `[pw: x]`, `pass=x`, in the names and every subject
-    let texts = names
+    let texts: Vec<String> = names
         .into_iter()
         .flat_map(|n| [Some(n.posted.clone()), n.display.clone()])
         .flatten()
-        .chain(files.into_iter().filter_map(|(_, subject)| subject));
-    for text in texts {
-        if let Some(password) = harvested_password(&text) {
+        .chain(files.into_iter().filter_map(|(_, subject)| subject))
+        .collect();
+    for text in &texts {
+        if let Some(password) = harvested_password(text) {
             return hint(password, "the subject");
+        }
+    }
+    if let Some(check) = inner.password_check.as_ref() {
+        let nfo = crate::probe::nfo_store::any_text(conn, id);
+        let all_texts = texts.iter().map(String::as_str).chain(nfo.as_deref());
+        if let Some(password) = find_verified_password(all_texts, &[], Some(check)) {
+            let source = stored_password_source(conn, id, &password, names);
+            return hint(password, source);
         }
     }
     None
@@ -2013,6 +2029,13 @@ mod tests {
         assert_eq!(find_password("Some.Movie.2024.{{s3cret!}}.rar").as_deref(), Some("s3cret!"));
         assert_eq!(find_password("Password: hunter2").as_deref(), Some("hunter2"));
         assert_eq!(find_password("Password: hunter2.").as_deref(), Some("hunter2"), "the end of a sentence");
+        assert_eq!(
+            find_password(
+                r#"Various pictures - Part 19 - RAR Passwurd: variouspics [003/371] "VariousPics-Part19.part001.rar" yEnc (0001/1093)"#
+            )
+            .as_deref(),
+            Some("variouspics")
+        );
         assert_eq!(find_password("Movie.{{.secret,}}.rar").as_deref(), Some(".secret,"), "the braces say where");
         assert_eq!(find_password("PW=abc123, enjoy").as_deref(), Some("abc123"));
         assert_eq!(find_password("password is: abc").as_deref(), Some("abc"));
