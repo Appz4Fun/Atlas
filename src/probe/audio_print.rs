@@ -184,12 +184,16 @@ pub fn others(conn: &Connection, own: i64, limit: i64) -> Vec<i64> {
     found
 }
 
-/// The first key that already ties a release to another one, other than who posted it and its own print: a print
-/// is only made when there's none. `conn` has every shard attached.
+/// Kinds too common to say a print is needless: a stock subtitle header (ffmpeg's or HandBrake's ASS for a converted
+/// SRT) or a series' fonts ties releases that are not the same film.
+const TOO_COMMON: [Kind; 2] = [Kind::Subs, Kind::Fonts];
+
+/// The first key that already ties a release to another one, other than who posted it, the too common ones and its
+/// own print: a print is only made when there's none. `conn` has every shard attached.
 pub fn linked_by(conn: &Connection, own: i64, lookup: &keys::Lookup) -> Option<Kind> {
     Kind::ALL
         .into_iter()
-        .filter(|k| *k != Kind::AudioPrint && !WHO_POSTED.contains(k) && lookup.has(*k))
+        .filter(|k| *k != Kind::AudioPrint && !WHO_POSTED.contains(k) && !TOO_COMMON.contains(k) && lookup.has(*k))
         .find(|k| !keys::others(conn, own, lookup, *k, 1).is_empty())
 }
 

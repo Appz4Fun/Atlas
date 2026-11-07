@@ -1846,6 +1846,20 @@ fn flac_key(blocks: &[u8]) -> Option<String> {
 /// Aegisub's own sections, which change each time the script is saved (scroll position, active line, audio file)
 /// and say nothing of the subtitles.
 const AEGISUB_SECTIONS: [&str; 2] = ["[aegisub project garbage]", "[aegisub extradata]"];
+/// What Aegisub 2.x saved inside `[Script Info]` before it had a section of its own for it, in lower case.
+const AEGISUB_FIELDS: [&str; 11] = [
+    "scroll position:",
+    "active line:",
+    "video file:",
+    "audio file:",
+    "audio uri:",
+    "video zoom",
+    "video aspect ratio:",
+    "video position:",
+    "last style storage:",
+    "keyframes file:",
+    "export filters:",
+];
 
 /// The subtitle header key: SHA-256 over a track's header as its CodecPrivate holds it, the first 8 bytes in hex.
 /// An ASS or SSA script's header (`[Script Info]`, the styles), Aegisub's own sections and blank lines left out and
@@ -1854,6 +1868,7 @@ const AEGISUB_SECTIONS: [&str; 2] = ["[aegisub project garbage]", "[aegisub extr
 pub(super) fn subtitle_header_key(codec: &str, private: &[u8]) -> Option<String> {
     use sha2::{Digest, Sha256};
     let text = String::from_utf8_lossy(private);
+    let text = text.trim_start_matches('\u{feff}');
     let lines = text.lines().map(str::trim_end).filter(|l| !l.trim().is_empty());
     let (tag, kept): (&[u8], Vec<&str>) = match codec {
         "S_TEXT/ASS" | "S_TEXT/SSA" | "S_ASS" | "S_SSA" => {
@@ -1861,10 +1876,11 @@ pub(super) fn subtitle_header_key(codec: &str, private: &[u8]) -> Option<String>
             let kept: Vec<&str> = lines
                 .filter(|l| {
                     let t = l.trim();
+                    let lower = t.to_ascii_lowercase();
                     if t.starts_with('[') {
-                        skip = AEGISUB_SECTIONS.contains(&t.to_ascii_lowercase().as_str());
+                        skip = AEGISUB_SECTIONS.contains(&lower.as_str());
                     }
-                    !skip
+                    !skip && !AEGISUB_FIELDS.iter().any(|f| lower.starts_with(f))
                 })
                 .collect();
             if !kept.iter().any(|l| l.trim().to_ascii_lowercase().starts_with("style:")) {
@@ -2999,6 +3015,10 @@ mod tests {
         let restyled = script.replace("Arial", "Gandhi Sans");
         assert_ne!(subtitle_header_key("S_TEXT/ASS", restyled.as_bytes()).as_deref(), Some(key.as_str()));
         assert_eq!(subtitle_header_key("S_TEXT/ASS", b"[Script Info]\nTitle: x\n"), None, "no styles");
+        let old = script.replace("Title: x", "Title: x\r\nScroll Position: 12\r\nActive Line: 7\r\nVideo File: a.mkv");
+        assert_eq!(subtitle_header_key("S_TEXT/ASS", old.as_bytes()).as_deref(), Some(key.as_str()), "Aegisub 2.x");
+        let bom = format!("\u{feff}[Aegisub Project Garbage]\nActive Line: 1\n{script}");
+        assert_eq!(subtitle_header_key("S_TEXT/ASS", bom.as_bytes()).as_deref(), Some(key.as_str()), "with a BOM");
         assert_eq!(subtitle_header_key("S_TEXT/UTF8", script.as_bytes()), None);
         let idx = "# VobSub index file, v7\nsize: 720x480\norg: 0, 0\npalette: 000000, 828282, 828282\n";
         let vob = subtitle_header_key("S_VOBSUB", idx.as_bytes()).unwrap();

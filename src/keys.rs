@@ -682,6 +682,10 @@ pub(crate) fn chapters_text(media: &crate::probe::media::MediaInfo) -> Option<St
     }
     let gaps: Vec<i64> = starts.windows(2).map(|w| w[1] - w[0]).collect();
     let (lo, hi) = (gaps.iter().min()?, gaps.iter().max()?);
+    // two chapters at one time are an edition's leftovers, not a cut
+    if *lo <= 0 {
+        return None;
+    }
     // the last chapter can be cut short by the film's end: even spacing is judged without it
     let inner = &gaps[..gaps.len() - 1];
     let even = |g: &[i64]| g.iter().max().zip(g.iter().min()).is_some_and(|(a, b)| a - b <= 1_000);
@@ -1474,6 +1478,7 @@ mod tests {
         assert_eq!(chapters_text(&m), None, "every five minutes, the last cut short by the end");
         m.chapters = at(&[0.0, 92.342, 1301.1, 2544.0]);
         assert_eq!(chapters_text(&m).as_deref(), Some("chapters:0,92342,1301100,2544000"));
+        assert_eq!(chapters_text(&MediaInfo { chapters: at(&[0.0, 0.0, 1301.1]), ..Default::default() }), None);
         m.chapters.push(Chapter { start_secs: f64::NAN, name: None });
         assert_eq!(chapters_text(&m), None, "a start not read leaves the list unknown");
     }
