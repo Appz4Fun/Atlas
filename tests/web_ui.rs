@@ -370,6 +370,59 @@ fn the_web_ui_end_to_end() {
     assert_eq!(fetch(port, "/ui/same?id=999999999&kind=account", &cookie).status(), 404);
     assert_eq!(fetch(port, &format!("/ui/same?id={one}&kind=account"), "").status(), 303);
 
+    // the same sound, by audio print: the line shows only on a page with another release that matches
+    let tone = |seed: u32, from: f64| -> Vec<i16> {
+        (0..12 * 44_100)
+            .map(|i| {
+                let t = from + f64::from(i) / 44_100.0;
+                let step = ((t * 3.0) as u32).wrapping_mul(2_654_435_761).wrapping_add(seed) % 24;
+                let f = 110.0 * 2f64.powf(f64::from(step) / 12.0);
+                ((2.0 * std::f64::consts::PI * f * t).sin() * 0.4 * 32767.0) as i16
+            })
+            .collect()
+    };
+    let mut printed = Vec::new();
+    for (name, seed) in [("Printed.One.2024-GRP", 7), ("Printed.Two.2024-GRP", 7), ("Printed.Lone.2024-GRP", 99)] {
+        store::save(&main, &[Release { group: "alt.binaries.g2".into(), ..release_of(name, "p.bin", 2, 2) }]).unwrap();
+        let s = db::open_shard(&store::shard_path(&main, store::shard_of("alt.binaries.g2"))).unwrap();
+        let id: i64 = s.query_row("select id from releases where name = ?", [name], |r| r.get(0)).unwrap();
+        for (position, at) in [(25, 100.0), (50, 200.0)] {
+            let items = atlas::audio::fingerprint(&tone(seed, at), 44_100).unwrap();
+            s.execute(
+                "insert into release_audio_print (release_id, position, at_ms, items) values (?, ?, ?, ?)",
+                rusqlite::params![id, position, (at * 1000.0) as i64, atlas::audio::to_blob(&items)],
+            )
+            .unwrap();
+            for a in atlas::audio::anchors(&items) {
+                s.execute(
+                    "insert or ignore into release_audio_anchor (release_id, anchor) values (?, ?)",
+                    rusqlite::params![id, a],
+                )
+                .unwrap();
+            }
+        }
+        printed.push(id);
+    }
+    let printed_page = fetch(port, &format!("/ui/release?id={}", printed[0]), &cookie);
+    assert!(
+        printed_page.body.contains(&format!(
+            "<dt>Audio fingerprint</dt><dd>Chromaprint · <a href=\"/ui/same?id={}&amp;kind=audioprint\">in 1 other release</a></dd>",
+            printed[0]
+        )),
+        "{}",
+        printed_page.body
+    );
+    let same_sound = fetch(port, &format!("/ui/same?id={}&kind=audioprint", printed[0]), &cookie);
+    assert!(
+        same_sound.body.contains("Same sound, by audio fingerprint")
+            && same_sound.body.contains(&format!("<a href=\"/ui/release?id={}\">Printed.Two.2024-GRP</a>", printed[1]))
+            && !same_sound.body.contains("Printed.Lone"),
+        "{}",
+        same_sound.body
+    );
+    let lone = fetch(port, &format!("/ui/release?id={}", printed[2]), &cookie);
+    assert!(!lone.body.contains("Audio fingerprint"), "no match, no line: {}", lone.body);
+
     // one post spread over two groups: one row, whole, and an NZB with all of it
     let posted = |name: &str, group: &str, one: Article, date: &str| {
         let size = one.bytes;

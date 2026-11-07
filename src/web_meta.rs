@@ -82,6 +82,7 @@ fn lookup_of(i: &MetaInputs<'_>, l: &Looked) -> crate::keys::Lookup {
             .unwrap_or_else(|| i.probe.and_then(crate::keys::probe_file).into_iter().collect()),
         inner_files: shard.as_ref().map(|s| crate::keys::inner_crc_files(s, i.release.id)).unwrap_or_default(),
         archive: shard.as_ref().map(|s| crate::keys::archive_keys(s, i.release.id)).unwrap_or_default(),
+        audio_print: shard.as_ref().is_some_and(|s| crate::probe::audio_print::has_print(s, i.release.id)),
     }
 }
 
@@ -2219,6 +2220,10 @@ fn keys_panel(i: &MetaInputs<'_>, l: &Looked, compact: bool) -> Facts {
     );
     if !same_link(l, id, Kind::Par2).is_empty() {
         f.add_html("PAR2 set", Some(format!("PAR2 recovery set{}", same_link(l, id, Kind::Par2))));
+    }
+    // kept only for releases nothing else ties, and shown only when another release has the same sound
+    if !same_link(l, id, Kind::AudioPrint).is_empty() {
+        f.add_html("Audio fingerprint", Some(format!("Chromaprint{}", same_link(l, id, Kind::AudioPrint))));
     }
     f.add_html(
         "OpenSubtitles hash",

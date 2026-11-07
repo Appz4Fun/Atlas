@@ -3,6 +3,7 @@
 
 pub mod archive;
 pub mod asf;
+pub mod audio_print;
 pub mod avi;
 pub mod bluray;
 pub mod body_crc;

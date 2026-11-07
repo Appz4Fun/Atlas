@@ -82,6 +82,7 @@ pub(crate) fn label(name: &str) -> &str {
         "opensubtitles_imdb" => "IMDb from OpenSubtitles",
         "keys" => "Duplicate keys",
         "probe_body_crc" => "Body CRC from the server",
+        "audio_print" => "Audio fingerprint",
         other => other,
     }
 }
@@ -803,7 +804,7 @@ mod tests {
         assert_eq!(*standing_of(&rows, "predb_match"), Standing::Skipped(None), "no queue row, no walk");
 
         let html = render(8, &state, &pace(), &rows, 1_000);
-        assert!(html.contains("2 of 17 steps still to run: Probe (tracks, codecs), Media lookup."), "{html}");
+        assert!(html.contains("2 of 18 steps still to run: Probe (tracks, codecs), Media lookup."), "{html}");
         assert!(html.contains("in about 2 h · 7,200 ahead in shard 0's net line"), "{html}");
     }
 

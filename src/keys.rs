@@ -150,10 +150,12 @@ pub enum Kind {
     ArchiveTwin,
     Owner,
     Zone,
+    /// the same sound by audio fingerprint (`probe::audio_print`), kept only for releases nothing else ties
+    AudioPrint,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 17] = [
+    pub const ALL: [Kind; 18] = [
         Kind::Account,
         Kind::Host,
         Kind::Layout,
@@ -171,6 +173,7 @@ impl Kind {
         Kind::ArchiveTwin,
         Kind::Owner,
         Kind::Zone,
+        Kind::AudioPrint,
     ];
 
     /// The word in `/ui/same?kind=`.
@@ -193,6 +196,7 @@ impl Kind {
             Kind::ArchiveTwin => "archive",
             Kind::Owner => "owner",
             Kind::Zone => "zone",
+            Kind::AudioPrint => "audioprint",
         }
     }
 
@@ -220,6 +224,7 @@ impl Kind {
             Kind::ArchiveTwin => "Same archive, by its own random values",
             Kind::Owner => "Same Unix owner in the archive",
             Kind::Zone => "Same packer settings and clock zone",
+            Kind::AudioPrint => "Same sound, by audio fingerprint",
         }
     }
 
@@ -275,6 +280,9 @@ impl Kind {
             Kind::Zone => {
                 "Packed with the same settings on a clock the same distance from UTC, going by a salted hash of both: from a ZIP's local and UTC times of one moment, or an archive's local time set against the post's date, which is a guess. Many uploaders share a zone and a tool, soo it's a weak hint. The zone is never stored or shown."
             }
+            Kind::AudioPrint => {
+                "The same sound a quarter, half and three quarters of the way in, as Chromaprint hears it: often the same film or episode in another encode, codec or container. Taken only for releases no other key ties to another, from AAC, FLAC, MP3, MP2, Vorbis and PCM tracks in Matroska. A theme tune or a recap can match across episodes, soo check the names."
+            }
         }
     }
 
@@ -292,7 +300,7 @@ impl Kind {
             Kind::Encode => Some("encode"),
             Kind::Thread => Some("thread"),
             Kind::Par2 | Kind::MovieHash | Kind::FileCrc | Kind::InnerFile => None,
-            Kind::ArchiveTwin | Kind::Owner | Kind::Zone => None,
+            Kind::ArchiveTwin | Kind::Owner | Kind::Zone | Kind::AudioPrint => None,
         }
     }
 
@@ -376,6 +384,8 @@ pub struct Lookup {
     pub inner_files: Vec<FileCrc>,
     /// its archive's own keys (`archive_release`)
     pub archive: crate::archive::store::ArchiveKeys,
+    /// it has an audio print (`probe::audio_print`), matched by its own lookup
+    pub audio_print: bool,
 }
 
 impl Lookup {
@@ -386,6 +396,7 @@ impl Lookup {
             Kind::FileCrc => !self.files.is_empty(),
             Kind::InnerFile => !self.inner_files.is_empty(),
             Kind::ArchiveTwin | Kind::Owner | Kind::Zone => self.archive_key(kind).is_some(),
+            Kind::AudioPrint => self.audio_print,
             _ => self.keys.get(kind).is_some(),
         }
     }
@@ -753,7 +764,8 @@ pub fn read_lookup(
         .flatten();
     let inner_files = inner_crc_files(shard, release_id);
     let archive = archive_keys(shard, release_id);
-    Ok(Lookup { keys, par2_sets, moviehash, files, inner_files, archive })
+    let audio_print = crate::probe::audio_print::has_print(shard, release_id);
+    Ok(Lookup { keys, par2_sets, moviehash, files, inner_files, archive, audio_print })
 }
 
 /// Sources of `archive_inner_files` rows read from an archive's own headers: RAR, 7z, ZIP.
@@ -1080,6 +1092,9 @@ fn binds(kind: Kind, values: usize) -> usize {
 /// The releases other than `own` that share `kind` with it, over every shard of `conn` (the main database with
 /// the shards attached), newest first, at most `limit`. A shard without the table yet has none.
 pub fn others(conn: &Connection, own: i64, lookup: &Lookup, kind: Kind, limit: i64) -> Vec<i64> {
+    if kind == Kind::AudioPrint {
+        return if lookup.audio_print { crate::probe::audio_print::others(conn, own, limit) } else { Vec::new() };
+    }
     let bound = values(lookup, kind);
     if bound.is_empty() || limit <= 0 {
         return Vec::new();
@@ -1103,6 +1118,9 @@ pub fn others(conn: &Connection, own: i64, lookup: &Lookup, kind: Kind, limit: i
 
 /// How many releases other than `own` share `kind` with it, up to `COUNT_CAP`.
 pub fn count_others(conn: &Connection, own: i64, lookup: &Lookup, kind: Kind) -> i64 {
+    if kind == Kind::AudioPrint {
+        return others(conn, own, lookup, kind, COUNT_CAP).len() as i64;
+    }
     let bound = values(lookup, kind);
     if bound.is_empty() {
         return 0;
