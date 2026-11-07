@@ -246,6 +246,27 @@ Naming (Database, rank 200) picks a display name by evidence priority (`NameSour
 
 ## 4. Visibility matrix
 
+> **Audit, 2026-11-07, against `main` at `b11d3e7`.** The status column below is from 2026-11-02, and much of it has changed since. Every item marked N1 (render only) is now on the release page:
+>
+> | Items (by #) | Release page label |
+> |---|---|
+> | 12, 24, 146 Subject; 122 subject template | Subject, Subject decoded, Subject skeleton; Parts fragment: each file's subject |
+> | 15, 23, 77, 124, 125, 149 Message-IDs | Headers fragment: Message-ID; Ids look like, Id timestamp, Id clock; Parts fragment: first and last id with its grammar |
+> | 72 date quirks; 73 From shape; 78 encoded words | Date style, From shape, From variants; Subject decoded |
+> | 81 backbone from Path | Injected at (hops, backbone) |
+> | 87, 89, 90, 91, 93 yEnc part, begin, end, size, pcrc32 | First part CRC, Segment set, yEnc control lines |
+> | 103 filename mismatch; 238 repack tells | Obfuscation, Tells |
+> | 113 first-article file key; 164 tail bytes | First-id key, Tail bytes |
+> | 148 segment bytes and numbers; 152 reposted parts | Parts fragment: part map, smallest and largest article, Reposted |
+> | 155 collection key | Collection key (recomputed) |
+> | 159 inner size; 194 volume scheme; 186 NFO width | Unpacks to, Volumes, NFO shape |
+> | 166 NZBLNK; 169 posting tool | NZBLNK; Posting tool, yEnc quirks |
+> | 170 PAR2 Main slice size | PAR2 (slice size and blocks) |
+> | 210, 223 RAR5 salt and password checks | Password check (shown as a verdict; the salt itself goes into `archive_release.twin_key` as a digest, by design never shown) |
+> | 130, 135, 136 posting rate, timing, arrivals | Posting rate, Late articles, Last arrival (from `file_timing`, which arrived after this map) |
+>
+> Items 4 and 8 are group and server facts, not release facts, and items 83 and 119 aren't display items. Everything else still open needs storage, a re-probe or new fetches (N2 to N6). Those items are tracked in [../TODO.md](../TODO.md) sections 1 to 6.
+
 Every YAML item of the catalog (293) plus one row for the posting-tool table (catalog L639-665), in catalog order with the catalog's own ids and line numbers. Layer = the catalog block the item sits in.
 
 Legend for the last column: **N0** nothing (already on the page for every release that has the data); **N1** render only (read what the shards or the probe JSON already hold; no backfill); **N2** store then render (a Needs::Database step or walk: 118M releases at backlog_per_second 2000 over 8 shards is about 16.4 h, src/postprocess/engine.rs:421, README.md:405 counts; about 12 GB of WAL per flag column, README.md:512); **N3** new fetch then store then render, riding on the articles the probe or archive steps already read (a ProbeInfo field or KEPT_HEADERS name plus a config_stamp bit; backfill = re-probe of every probed release: about 15M body-gate releases, README.md:405 gives 78 days at 300 bodies a minute and 4 days at 6,000, so 17-70 days at the default 600 and about 174 days at probes_per_minute 60); **N4** new articles beyond today's probe set (volume tails, mid-file, first cluster): new releases only, the backlog is out of reach (35 GB per 1,000 releases for volume tails, catalog L1208); **N5** an XOVER column that is already on the wire but dropped: store for new ingest only, no backfill (sealed blob v1 keeps part, bytes, domain, local only, src/blob.rs:13-18, and expired articles cannot be re-listed); **N6** a new NNTP command or external service; **NA** not a per-release fact (server, group, tool, downloader or prior-art note).

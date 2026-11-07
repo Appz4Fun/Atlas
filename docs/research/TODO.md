@@ -97,7 +97,7 @@ Source: [stream-metadata/FINAL-REPORT.md](stream-metadata/FINAL-REPORT.md) "Fram
 
 Source: [metadata-visibility/MAP.md](metadata-visibility/MAP.md) section 4 (visibility matrix). #65 and #67 built most of it.
 
-- [ ] Recheck the matrix against `main` and list which catalog fields are still `not_collected` or `stored_not_shown`.
+- [x] Recheck the matrix against `main` (2026-11-07, at `b11d3e7`): every item the matrix marks N1 (render only) is on the page now, through the fact panels and lazy fragments in `src/web_meta.rs` and the file list in `src/web.rs`. The list, with each item's label, is in the audit note at the top of [MAP.md](metadata-visibility/MAP.md) section 4. What the matrix still lists needs more than rendering: a stored column or walk (N2), a re-probe (N3), more articles (N4), XOVER columns kept at ingest (N5) or new NNTP commands (N6). Those items are under sections 1 to 6 above, not here.
 
 ## 8. Open questions to settle with real data
 
