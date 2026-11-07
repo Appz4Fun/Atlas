@@ -199,11 +199,18 @@ pub fn contents(id: i64) -> Result<Contents> {
 }
 
 pub fn contents_with(conn: &Connection, id: i64) -> Result<Contents> {
-    contents_of(conn, &[id], &[])
+    contents_of(conn, &[id], &[], true)
+}
+
+/// `contents_with` without the bytes: the files, PAR2 volumes and article counts come from each file's row, and
+/// only the bytes need every article read, which for a big post means its whole sealed log. For a summary such as
+/// a copy's card; the bytes (`data_bytes`, `recovery_bytes`, each listed file's) stay 0.
+pub fn contents_counts_with(conn: &Connection, id: i64) -> Result<Contents> {
+    contents_of(conn, &[id], &[], false)
 }
 
 /// `recovery`: rows whose files are all recovery volumes, whatever they're called.
-fn contents_of(conn: &Connection, ids: &[i64], recovery: &[i64]) -> Result<Contents> {
+fn contents_of(conn: &Connection, ids: &[i64], recovery: &[i64], with_bytes: bool) -> Result<Contents> {
     let mut totals = Contents::default();
     let union = union_files(conn, ids)?;
     let mut volumes: BTreeSet<String> = BTreeSet::new();
@@ -239,7 +246,7 @@ fn contents_of(conn: &Connection, ids: &[i64], recovery: &[i64]) -> Result<Conte
         }
     }
     let mut bytes: HashMap<String, i64> = HashMap::new();
-    for id in ids {
+    for id in ids.iter().filter(|_| with_bytes) {
         store::each_article(conn, *id, &mut |article| {
             *bytes.entry(article.filename.unwrap_or_default()).or_default() += article.bytes.unwrap_or(0);
             Ok(())
@@ -1297,7 +1304,7 @@ fn union_files(conn: &Connection, ids: &[i64]) -> Result<UnionFiles> {
 
 /// What's in the whole post: each file once, whichever groups have its parts.
 pub fn contents_of_split(conn: &Connection, post: &SplitPost) -> Result<Contents> {
-    contents_of(conn, &post.ids, &post.recovery)
+    contents_of(conn, &post.ids, &post.recovery, true)
 }
 
 /// A From header, split up.
@@ -1909,6 +1916,28 @@ mod tests {
         // a set that looks for two files, with one found, isn't all there
         conn.execute_batch("update s0.upload_link set wanted = 2 where release_id = 24").unwrap();
         assert!(!linked_post_with(&conn, 16).unwrap().unwrap().complete);
+    }
+
+    #[test]
+    fn a_releases_counts_without_its_bytes_are_the_same_counts() {
+        let (_dir, conn) = linked_shard();
+        for id in [8, 16, 24] {
+            let full = contents_with(&conn, id).unwrap();
+            let counts = contents_counts_with(&conn, id).unwrap();
+            assert_eq!(
+                (
+                    counts.files,
+                    counts.par2_files,
+                    counts.recovery_volumes,
+                    counts.articles_seen,
+                    counts.articles_expected
+                ),
+                (full.files, full.par2_files, full.recovery_volumes, full.articles_seen, full.articles_expected),
+                "release {id}"
+            );
+            assert_eq!(counts.missing_per_mille(), full.missing_per_mille());
+            assert_eq!((counts.data_bytes, counts.recovery_bytes), (0, 0), "no articles read for bytes");
+        }
     }
 
     #[test]

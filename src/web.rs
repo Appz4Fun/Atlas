@@ -94,7 +94,9 @@ pub fn get(path: &str, query: &str, cookies: Option<&str>, base: &str, api_key: 
         "/ui/nzb" if signed_in && args.get("fill").is_some_and(|v| v == "1") => filled_nzb(&args),
         "/ui/nzb" if signed_in => get_nzb(&args),
         "/ui/details" | "/ui/pending" | "/ui/poster" | "/ui/cover" | "/ui/still" | "/ui/samefilm" | "/ui/meta"
-        | "/ui/row" | "/ui/stats/live" | "/ui/stats/stored" => ApiResponse { headers: vec![("HX-Redirect".into(), "/".into())], ..html(401, String::new()) },
+        | "/ui/row" | "/ui/stats/live" | "/ui/stats/stored" => {
+            ApiResponse { headers: vec![("HX-Redirect".into(), "/".into())], ..html(401, String::new()) }
+        }
         "/ui/nzb" | "/ui/release" | "/ui/duplicates" | "/ui/stats" | "/ui/same" | "/ui/settings" => {
             redirect(Vec::new())
         }
@@ -2342,7 +2344,9 @@ fn release_page(args: &HashMap<String, String>) -> ApiResponse {
     let mut inner = crate::archive::store::view(id);
     let mut media = crate::media::query::attrs_of(&ids).unwrap_or_default().remove(&id);
     let mut names = release_info::names(id).unwrap_or_default();
-    let mut contents = release_info::contents(id).unwrap_or_default();
+    // the post's contents if it's a split or linked post, else the release's own: each reads every article of its
+    // rows, soo it's read once, for what's shown
+    let mut contents = None;
     let mut release = release;
     let mut whole_post = false;
     let mut split_groups = None;
@@ -2350,7 +2354,11 @@ fn release_page(args: &HashMap<String, String>) -> ApiResponse {
     if let Ok(conn) = crate::db::open()
         && let Ok(Some(post)) = release_info::whole_post_from_catalog(&conn, &release)
     {
-        contents = release_info::contents_of_split(&conn, &post).unwrap_or(contents);
+        // a split post's contents that can't be read are the release's own, as before
+        contents = Some(
+            release_info::contents_of_split(&conn, &post)
+                .unwrap_or_else(|_| release_info::contents(id).unwrap_or_default()),
+        );
         split_groups = release_info::groups_of_ids(&conn, &post.ids).ok();
         if post.lead.is_none() || !crate::parser::is_obfuscated(&release.name) {
             release.name = release_info::post_stem(&release.name);
@@ -2360,7 +2368,7 @@ fn release_page(args: &HashMap<String, String>) -> ApiResponse {
         }
         release.size = Some(post.size);
         release.complete = post.complete;
-        release.parts = Some(contents.articles_seen);
+        release.parts = contents.as_ref().map(|c| c.articles_seen);
         whole_post = true;
         if category.unwrap_or(UNCATEGORIZED) == UNCATEGORIZED {
             let cats = crate::category::categories_of(&post.ids).unwrap_or_default();
@@ -2389,6 +2397,7 @@ fn release_page(args: &HashMap<String, String>) -> ApiResponse {
     {
         release.complete = true;
     }
+    let contents = contents.unwrap_or_else(|| release_info::contents(id).unwrap_or_default());
     let recovery = (!whole_post)
         .then(|| crate::db::open().ok().and_then(|conn| release_info::recovery_only_with(&conn, id).ok().flatten()))
         .flatten();
@@ -3204,7 +3213,8 @@ fn copy_card(
         .as_ref()
         .and_then(|m| crate::media::details::kept_for(std::iter::once((r.id, m.kind, &m.ids))).remove(&r.id));
     let names = release_info::names_with(conn, r.id).unwrap_or_default();
-    let contents = release_info::contents_with(conn, r.id).unwrap_or_default();
+    // its counts only: the card shows no bytes, and reading every article of each copy is most of a page's time
+    let contents = release_info::contents_counts_with(conn, r.id).unwrap_or_default();
     let inner = crate::archive::store::view_with(conn, r.id);
     let hint = crate::duplicates::own_password_hint(conn, r.id, names.as_ref());
     // a password found on a posting of the same bytes, never this one's own
