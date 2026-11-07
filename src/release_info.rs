@@ -850,7 +850,7 @@ fn exact_split_post(
         {
             Ok(Some(across))
         }
-        // a poster's own rows can't be a post where one of them is in another post: every row gets that one's answer
+        // a poster's own rows can't be a post where one of them is in another, whole post: every row gets its answer
         (Some(one), across) if one.ids.iter().any(|id| claimed.contains(id)) => Ok(across.map(|(post, _)| post)),
         (Some(one), _) => Ok(Some(one)),
         (None, across) => Ok(across.map(|(post, _)| post)),
@@ -880,7 +880,7 @@ fn same_poster_post(conn: &Connection, rows: &[&Named]) -> Result<Option<SplitPo
 const ACROSS_POSTERS_ROWS: usize = 32;
 
 /// `across_posters`'s answer: the post the row asking is in, with the rows it stands for; whether any rows of the
-/// name share parts; and every row in a post of two rows or more, whichever.
+/// name share parts; and every row in a whole post of two rows or more, whichever.
 type AcrossPosters = (Option<(SplitPost, Vec<i64>)>, bool, HashSet<i64>);
 
 /// One post whose groups each got another made-up poster (Nyuu and ngPost can give every connection its own From): the
@@ -895,6 +895,13 @@ fn across_posters(conn: &Connection, anchor: i64, named: &[Named]) -> Result<Acr
         return Ok((None, false, HashSet::new()));
     }
     let one_poster = rows.iter().all(|n| n.poster == rows[0].poster);
+    // one poster's rows are `same_poster_post`'s unless some share parts, which one read of them all tells
+    if one_poster {
+        let ids: Vec<i64> = rows.iter().map(|n| n.id).collect();
+        if !union_files(conn, &ids)?.overlap {
+            return Ok((None, false, HashSet::new()));
+        }
+    }
     rows.sort_by_key(|n| n.id);
     rows.truncate(ACROSS_POSTERS_ROWS);
     // each row alone, to tell a crosspost from a part
@@ -921,9 +928,10 @@ fn across_posters(conn: &Connection, anchor: i64, named: &[Named]) -> Result<Acr
         if taken.contains(&kept[seed].0.id) {
             continue;
         }
+        // only a whole post takes its rows: one that isn't leaves them to the seeds after it
         let (chosen, union) = grow_post(conn, &kept, seed, &taken, false)?;
-        taken.extend(chosen.iter().copied());
         if chosen.len() > 1 && union.one_upload() && union.complete() {
+            taken.extend(chosen.iter().copied());
             whole.push((chosen, union));
         }
     }
@@ -943,8 +951,12 @@ fn across_posters(conn: &Connection, anchor: i64, named: &[Named]) -> Result<Acr
     if one_poster && !shared {
         return Ok((None, false, HashSet::new()));
     }
-    let claimed: HashSet<i64> =
-        posts.iter().filter(|(chosen, _)| chosen.len() > 1).flat_map(|(c, _)| c.iter().copied()).collect();
+    // the rows of the whole posts: a poster's own rows that one of them is in make no post of their own
+    let claimed: HashSet<i64> = posts
+        .iter()
+        .filter(|(chosen, union)| chosen.len() > 1 && union.one_upload() && union.complete())
+        .flat_map(|(chosen, _)| chosen.iter().copied())
+        .collect();
     for (chosen, union) in posts {
         let anchor_in = chosen.contains(&anchor) || copies.iter().any(|(n, of)| n.id == anchor && chosen.contains(of));
         if !anchor_in {
@@ -3138,6 +3150,29 @@ mod tests {
                 assert!(post.complete, "order {pa}{pb}{rc}");
             }
             assert_eq!(whole_post_with(&conn, &c).unwrap(), None, "order {pa}{pb}{rc}");
+        }
+    }
+
+    #[test]
+    fn a_split_post_stays_whole_beside_another_posters_part_with_a_lower_id() {
+        let name = "Some.Film.2026.2160p.UHD.Blu-ray.Remux.HDR.HEVC.DTS-HD.MA.5.1-GRP";
+        let mkv = "Some.Film.mkv";
+        let at = "2026-11-07 05:16:17";
+        let g = groups_in_one_shard(3);
+        // subjects without a size: P's two rows are the whole post; Q's row has one of its parts, whatever the ids
+        for (x, a, c) in [(1, 2, 3), (2, 1, 3), (3, 1, 2)] {
+            let (_dir, conn) = all_shards();
+            put_row_subjects(&conn, x, name, &g[0], "q@nyuu", &[(mkv, &[3], 4)], at, 1, false);
+            put_row_subjects(&conn, a, name, &g[1], "p@nyuu", &[(mkv, &[1, 2], 4)], at, 1, false);
+            put_row_subjects(&conn, c, name, &g[2], "p@nyuu", &[(mkv, &[3, 4], 4)], at, 1, false);
+            let (ra, rc) = (row_of(&conn, a, &g[1]), row_of(&conn, c, &g[2]));
+            let mut both = vec![ra.id, rc.id];
+            both.sort_unstable();
+            for row in [&ra, &rc] {
+                let post = whole_post_with(&conn, row).unwrap().unwrap_or_else(|| panic!("order {x}{a}{c}"));
+                assert_eq!(post.ids, both, "order {x}{a}{c}");
+                assert!(post.complete, "order {x}{a}{c}");
+            }
         }
     }
 
