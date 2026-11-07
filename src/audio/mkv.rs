@@ -28,6 +28,9 @@ const MAX_STRIP: usize = 64;
 /// The most bytes of frames one read gives, the stripped headers put back included: a window's articles hold far
 /// less, and a crafted file can't make a few small laced blocks into gigabytes.
 const MAX_FRAMES_BYTES: usize = 64 << 20;
+/// The most frames one read gives: a minute of AAC at 48 kHz is under 3,000, and a crafted lace of empty frames
+/// would otherwise make millions of tiny ones.
+const MAX_FRAMES: usize = 65_536;
 
 /// What decoding an audio track's frames needs, from the file's header.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -367,11 +370,12 @@ pub fn frames(data: &[u8], track: &AudioTrack) -> Vec<Frame> {
             let millis = track.millis(cluster_time + i64::from(time));
             for (lace, frame) in laced.into_iter().enumerate() {
                 let len = frame.len() + track.strip.len();
-                if len > MAX_FRAME {
+                if len == 0 || len > MAX_FRAME {
                     continue;
                 }
-                held += len;
-                if held > MAX_FRAMES_BYTES {
+                // each frame is charged what it holds and what keeping it costs
+                held += len + std::mem::size_of::<Frame>();
+                if held > MAX_FRAMES_BYTES || out.len() >= MAX_FRAMES {
                     return out;
                 }
                 let mut bytes = Vec::with_capacity(len);
@@ -473,6 +477,14 @@ pub(crate) mod tests {
         let blocks: Vec<Vec<u8>> = (0..4).map(|_| laced.clone()).collect();
         let got = frames(&cluster(0, &blocks), &wide);
         assert!(got.iter().map(|f| f.bytes.len()).sum::<usize>() <= MAX_FRAMES_BYTES, "{} frames", got.len());
+        // nor do empty or one-byte frames, laced 256 to a block, run to millions
+        let plain = AudioTrack { number: 1, timestamp_scale: 1_000_000, ..Default::default() };
+        let empty = simple(1, 0, 0x04, &[255]);
+        let tiny = simple(1, 0, 0x04, &[[255u8].as_slice(), &[7; 256]].concat());
+        let clusters: Vec<u8> = (0..400).flat_map(|i| cluster(i, &[empty.clone(), tiny.clone()])).collect();
+        let got = frames(&clusters, &plain);
+        assert_eq!(got.len(), MAX_FRAMES, "empty frames are dropped and the rest capped");
+        assert!(got.iter().all(|f| !f.bytes.is_empty()));
     }
 
     #[test]
