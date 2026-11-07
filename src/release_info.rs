@@ -276,10 +276,19 @@ fn contents_of(conn: &Connection, ids: &[i64], recovery: &[i64], with_bytes: Byt
     };
     let mut bytes: HashMap<String, i64> = HashMap::new();
     if read_bytes {
-        // each file's blob count and a sum of its rows (`blob_bytes`): no article is read
+        // each file's blob count and a sum of its rows (`blob_bytes`): no article is read. A shard the indexer
+        // hasn't given the column yet (a web process started first) is walked article by article, as before
         for id in ids {
-            for (filename, b) in crate::blob_bytes::of_release(conn, *id)? {
-                *bytes.entry(filename).or_default() += b;
+            match crate::blob_bytes::of_release(conn, *id) {
+                Ok(files) => {
+                    for (filename, b) in files {
+                        *bytes.entry(filename).or_default() += b;
+                    }
+                }
+                Err(_) => store::each_article(conn, *id, &mut |article| {
+                    *bytes.entry(article.filename.unwrap_or_default()).or_default() += article.bytes.unwrap_or(0);
+                    Ok(())
+                })?,
             }
         }
     }

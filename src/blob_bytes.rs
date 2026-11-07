@@ -31,6 +31,9 @@ pub fn of_blob(blob: &[u8]) -> std::io::Result<i64> {
 /// `store::each_article` would add them up. Files of one name add up, as there. A blob not counted yet is decoded.
 pub fn of_release(conn: &Connection, release_id: i64) -> Result<HashMap<String, i64>> {
     let s = store::shard_of_id(release_id);
+    // the rows, the counts and an uncounted blob from one snapshot: a blob sealed in between would hold rows counted
+    // already. A caller already in a transaction has one
+    let _snapshot = if conn.is_autocommit() { Some(conn.unchecked_transaction()?) } else { None };
     let mut stmt = conn.prepare_cached(&format!(
         "select f.id, f.filename, f.blob is not null, f.blob_bytes,
                 (select coalesce(sum(g.bytes), 0) from s{s}.segments g where g.file_id = f.id)
@@ -61,8 +64,14 @@ pub fn of_release(conn: &Connection, release_id: i64) -> Result<HashMap<String, 
     Ok(out)
 }
 
-/// Blobs counted in one batch, and so the most decoded (and fetched) between two looks at `stop`.
+/// Blobs counted in one batch, and so the most decoded between two looks at `stop`.
 const BATCH: i64 = 256;
+/// The most ids one batch looks through, soo a read where few are uncounted stays short.
+const WINDOW: i64 = 50_000;
+/// The most blobs one batch fetches back from the sealed log, soo the pass takes little from NZB fetches there.
+const FETCHES: usize = 32;
+/// The rest after a batch that couldn't fetch from the sealed log: it tries the same blob again then.
+const FETCH_REST: Duration = Duration::from_secs(60);
 /// A rest after each batch, soo the pass takes little from the indexer's writes and the sealed log.
 const REST: Duration = Duration::from_millis(200);
 /// How long a write waits on the shard's writer, in tries of `busy_timeout` each.
@@ -88,23 +97,61 @@ fn write_cursor(shard: &Path, after: i64, done_at: i64) {
     let _ = std::fs::write(cursor_path(shard), format!("{after} {done_at}"));
 }
 
-/// One batch of a shard's uncounted blobs past `after` counted. Returns the last file looked at (None: the shard has
-/// no more) and how many were counted. A blob that won't decode or fetch stays uncounted, read as before.
-pub fn count_batch(conn: &Connection, after: i64, stop: &AtomicBool) -> Result<(Option<i64>, usize)> {
+/// What one batch did.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Batch {
+    /// where the next batch starts; None: the shard has no more
+    pub next: Option<i64>,
+    pub counted: usize,
+    /// a blob in the sealed log couldn't be fetched: the next batch starts at it
+    pub fetch_failed: bool,
+}
+
+/// One batch of a shard's uncounted blobs past `after` (up to `WINDOW` ids on) counted. A blob that won't decode stays
+/// uncounted and is passed over; one in the sealed log that can't be fetched is tried again by the next batch.
+pub fn count_batch(conn: &Connection, after: i64, stop: &AtomicBool) -> Result<Batch> {
     let batch: Vec<(i64, Vec<u8>)> = conn
         .prepare_cached(
-            "select id, blob from files where id > ? and blob is not null and blob_bytes is null order by id limit ?",
+            "select id, blob from files where id > ?1 and id <= ?1 + ?2 and blob is not null and blob_bytes is null
+             order by id limit ?3",
         )?
-        .query_map(params![after, BATCH], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .query_map(params![after, WINDOW, BATCH], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<Result<_>>()?;
-    let Some(last) = batch.last().map(|b| b.0) else { return Ok((None, 0)) };
+    let full = batch.len() as i64 == BATCH;
+    let mut next = match batch.last() {
+        Some((id, _)) if full => *id,
+        // none uncounted left in the window: on past it, or done past the last file
+        _ => {
+            let last: Option<i64> = conn.query_row("select max(id) from files", [], |r| r.get(0))?;
+            if last.is_none_or(|last| after + WINDOW >= last) {
+                if batch.is_empty() {
+                    return Ok(Batch { next: None, counted: 0, fetch_failed: false });
+                }
+                batch.last().map_or(after, |b| b.0)
+            } else {
+                after + WINDOW
+            }
+        }
+    };
     let mut counted: Vec<(i64, &[u8], i64)> = Vec::new();
+    let (mut fetches, mut fetch_failed) = (0usize, false);
     for (id, blob) in &batch {
         if stop.load(Ordering::Relaxed) {
-            return Ok((Some(after), 0));
+            return Ok(Batch { next: Some(after), counted: 0, fetch_failed: false });
         }
+        let remote = crate::blob::is_remote(blob);
+        if remote && fetches == FETCHES {
+            next = id - 1;
+            break;
+        }
+        fetches += usize::from(remote);
         match of_blob(blob) {
             Ok(bytes) => counted.push((*id, blob, bytes)),
+            Err(_) if remote => {
+                next = id - 1;
+                fetch_failed = true;
+                break;
+            }
             Err(e) => eprintln!("blob bytes: file {id} left uncounted: {e}"),
         }
     }
@@ -113,7 +160,9 @@ pub fn count_batch(conn: &Connection, after: i64, stop: &AtomicBool) -> Result<(
         match conn.execute_batch("begin immediate") {
             Ok(()) => break,
             Err(rusqlite::Error::SqliteFailure(e, _))
-                if e.code == rusqlite::ErrorCode::DatabaseBusy && tries + 1 < WRITE_TRIES =>
+                if e.code == rusqlite::ErrorCode::DatabaseBusy
+                    && tries + 1 < WRITE_TRIES
+                    && !stop.load(Ordering::Relaxed) =>
             {
                 tries += 1;
             }
@@ -131,7 +180,7 @@ pub fn count_batch(conn: &Connection, after: i64, stop: &AtomicBool) -> Result<(
         Ok(n)
     })();
     match written {
-        Ok(n) => conn.execute_batch("commit").map(|()| (Some(last), n)),
+        Ok(n) => conn.execute_batch("commit").map(|()| Batch { next: Some(next), counted: n, fetch_failed }),
         Err(e) => {
             let _ = conn.execute_batch("rollback");
             Err(e)
@@ -148,12 +197,12 @@ fn run(main: &Path, stop: &AtomicBool) {
             std::thread::sleep(Duration::from_millis(200).min(d));
         }
     };
-    let mut conns: Vec<Option<Connection>> = shards.iter().map(|_| None).collect();
     let mut total = 0usize;
     while !stop.load(Ordering::Relaxed) {
         let now = chrono::Utc::now().timestamp();
         let mut busy = false;
-        for (shard, conn) in shards.iter().zip(conns.iter_mut()) {
+        let mut rest = REST;
+        for shard in &shards {
             if stop.load(Ordering::Relaxed) {
                 return;
             }
@@ -162,33 +211,25 @@ fn run(main: &Path, stop: &AtomicBool) {
                 continue;
             }
             busy = true;
-            if conn.is_none() {
-                match crate::db::open_at(shard) {
-                    Ok(c) => *conn = Some(c),
-                    Err(e) => {
-                        eprintln!("blob bytes: {} not opened: {e}", shard.display());
-                        continue;
+            let after = if done_at > 0 { 0 } else { after };
+            // a connection a batch, as the sealed log's offload: none is held while a compaction swaps the shard
+            let batch = crate::db::open_at(shard).and_then(|conn| count_batch(&conn, after, stop));
+            match batch {
+                Ok(Batch { next: Some(next), counted, fetch_failed }) => {
+                    total += counted;
+                    write_cursor(shard, next, 0);
+                    if fetch_failed {
+                        rest = FETCH_REST;
                     }
                 }
-            }
-            let Some(c) = conn.as_ref() else { continue };
-            let after = if done_at > 0 { 0 } else { after };
-            match count_batch(c, after, stop) {
-                Ok((Some(last), n)) => {
-                    total += n;
-                    write_cursor(shard, last, 0);
-                }
-                Ok((None, _)) => {
+                Ok(Batch { next: None, .. }) => {
                     println!("blob bytes: {} done, {total} blobs counted so far", shard.display());
                     write_cursor(shard, 0, now);
                 }
                 Err(e) => eprintln!("blob bytes: {}: {e}", shard.display()),
             }
-            nap(REST);
         }
-        if !busy {
-            nap(Duration::from_secs(3600));
-        }
+        nap(if busy { rest } else { Duration::from_secs(3600) });
     }
 }
 
@@ -247,6 +288,9 @@ mod tests {
         place.resize(sealed_log::REF_BYTES, 7);
         conn.execute("update files set blob = ? where id = 1", [&place]).unwrap();
         assert_eq!(count().unwrap(), Some(5));
+        // no blob at all: no count
+        conn.execute("update files set blob = null where id = 1", []).unwrap();
+        assert_eq!(count().unwrap(), None);
     }
 
     #[test]
@@ -299,6 +343,58 @@ mod tests {
     }
 
     #[test]
+    fn a_blob_the_sealed_log_cant_give_back_is_tried_again() {
+        let (_dir, conn) = shard();
+        crate::sealed_store::configure("");
+        let mut place = sealed_log::REF_TAG.to_vec();
+        place.resize(sealed_log::REF_BYTES, 7);
+        conn.execute(
+            "insert into files (id, release_id, filename, seen, blob) values (1, 1, 'a', x'00', ?)",
+            [crate::blob::encode(&segs(&[4]))],
+        )
+        .unwrap();
+        conn.execute("insert into files (id, release_id, filename, seen, blob) values (2, 1, 'b', x'00', ?)", [&place])
+            .unwrap();
+        conn.execute(
+            "insert into files (id, release_id, filename, seen, blob) values (3, 1, 'c', x'00', ?)",
+            [crate::blob::encode(&segs(&[6]))],
+        )
+        .unwrap();
+        let batch = count_batch(&conn, 0, &AtomicBool::new(false)).unwrap();
+        assert_eq!(batch, Batch { next: Some(1), counted: 1, fetch_failed: true }, "stops before the one in the log");
+        // a blob changed between its read and the write keeps no count
+        conn.execute("update files set blob = ? where id = 3", [crate::blob::encode(&segs(&[60]))]).unwrap();
+        let count = |id: i64| {
+            conn.query_row("select blob_bytes from files where id = ?", [id], |r| r.get::<_, Option<i64>>(0)).unwrap()
+        };
+        assert_eq!((count(1), count(2), count(3)), (Some(4), None, None));
+    }
+
+    #[test]
+    fn a_pass_looks_through_a_window_of_ids_at_a_time() {
+        let (_dir, conn) = shard();
+        for id in [5, WINDOW + 10, 3 * WINDOW] {
+            conn.execute(
+                "insert into files (id, release_id, filename, seen, blob) values (?, 1, ?, x'00', ?)",
+                params![id, format!("f{id}"), crate::blob::encode(&segs(&[1]))],
+            )
+            .unwrap();
+        }
+        let stop = AtomicBool::new(false);
+        let mut after = 0;
+        let mut steps = 0;
+        while let Batch { next: Some(next), .. } = count_batch(&conn, after, &stop).unwrap() {
+            assert!(next > after || steps > 0 && next >= after, "it moves on");
+            after = next;
+            steps += 1;
+            assert!(steps < 10);
+        }
+        let uncounted: i64 =
+            conn.query_row("select count(*) from files where blob_bytes is null", [], |r| r.get(0)).unwrap();
+        assert_eq!(uncounted, 0);
+    }
+
+    #[test]
     fn a_pass_counts_the_blobs_from_before_and_only_those() {
         let (_dir, conn) = shard();
         for (id, sizes) in [(1, vec![1, 2]), (2, vec![10]), (3, vec![100, 200, 300])] {
@@ -312,9 +408,9 @@ mod tests {
         conn.execute("insert into files (id, release_id, filename, seen) values (4, 1, 'f4', x'00')", []).unwrap();
         conn.execute("update files set blob_bytes = 999 where id = 2", []).unwrap();
         let stop = AtomicBool::new(false);
-        let (last, n) = count_batch(&conn, 0, &stop).unwrap();
-        assert_eq!((last, n), (Some(3), 2));
-        assert_eq!(count_batch(&conn, 3, &stop).unwrap(), (None, 0));
+        let batch = count_batch(&conn, 0, &stop).unwrap();
+        assert_eq!(batch, Batch { next: Some(3), counted: 2, fetch_failed: false });
+        assert_eq!(count_batch(&conn, 3, &stop).unwrap().next, None);
         let counts: Vec<Option<i64>> = conn
             .prepare("select blob_bytes from files order by id")
             .unwrap()

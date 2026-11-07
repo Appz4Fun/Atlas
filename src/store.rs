@@ -253,7 +253,7 @@ pub fn migrate_shard(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "create trigger if not exists files_blob_bytes_unknown after update of blob on files
          when new.blob is not old.blob and new.blob_bytes is old.blob_bytes and new.blob_bytes is not null
-          and not (length(new.blob) = 21 and substr(new.blob, 1, 5) = x'FF534C4731')
+          and (new.blob is null or not (length(new.blob) = 21 and substr(new.blob, 1, 5) = x'FF534C4731'))
          begin update files set blob_bytes = null where id = new.id; end;",
     )?;
     // whether a held-back article's part was the file's already when it was saved (1). Kept, not read: a part

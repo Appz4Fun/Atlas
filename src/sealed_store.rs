@@ -109,17 +109,20 @@ pub fn has_places(conn: &rusqlite::Connection) -> rusqlite::Result<bool> {
 pub fn offload_batch(shard: &Path, after: i64, stop: &AtomicBool) -> anyhow::Result<(Option<i64>, u64)> {
     let conn = crate::db::open_at(shard)?;
     let mut stmt = conn.prepare_cached(
-        "select id, blob from files
+        "select id, blob, blob_bytes is null from files
          where id > ? and blob is not null and length(blob) > ? and coalesce(touched_at, 0) < ?
          order by id limit ?",
     )?;
     let settled = chrono::Utc::now().timestamp() - SETTLE_SECS;
     let mut rows = stmt.query(params![after, SMALL_BLOB as i64, settled, BATCH_FILES as i64])?;
     let mut batch: Vec<(i64, Vec<u8>)> = Vec::new();
+    // what a blob from before `blob_bytes` holds, counted here before any lock (`blob_bytes.rs`)
+    let mut counts: Vec<Option<i64>> = Vec::new();
     let mut bytes = 0usize;
     while let Some(r) = rows.next()? {
         let blob: Vec<u8> = r.get(1)?;
         bytes += blob.len();
+        counts.push(if r.get::<_, bool>(2)? { crate::blob_bytes::of_blob(&blob).ok() } else { None });
         batch.push((r.get(0)?, blob));
         if bytes >= BATCH_BYTES {
             break;
@@ -150,7 +153,7 @@ pub fn offload_batch(shard: &Path, after: i64, stop: &AtomicBool) -> anyhow::Res
     if stop.load(Ordering::Relaxed) {
         return Ok((Some(after), 0));
     }
-    let (swapped, changed, freed) = metrics::timed("sealed_log.swap", || swap_in(&conn, &batch, &places))?;
+    let (swapped, changed, freed) = metrics::timed("sealed_log.swap", || swap_in(&conn, &batch, &counts, &places))?;
     names::SEALED_LOG_OFFLOAD_FILES.inc(&[("result", "moved")], swapped);
     names::SEALED_LOG_OFFLOAD_FILES.inc(&[("result", "changed")], changed);
     names::SEALED_LOG_OFFLOAD_BYTES.inc(&[("kind", "freed")], freed);
@@ -163,6 +166,7 @@ pub fn offload_batch(shard: &Path, after: i64, stop: &AtomicBool) -> anyhow::Res
 fn swap_in(
     conn: &rusqlite::Connection,
     batch: &[(i64, Vec<u8>)],
+    counts: &[Option<i64>],
     places: &[Locator],
 ) -> rusqlite::Result<(u64, u64, u64)> {
     let mut tries = 0;
@@ -185,8 +189,7 @@ fn swap_in(
         let mut swap = conn.prepare_cached(
             "update files set blob = ?, blob_bytes = coalesce(blob_bytes, ?) where id = ? and blob = ?",
         )?;
-        for ((id, blob), at) in batch.iter().zip(places) {
-            let bytes = crate::blob_bytes::of_blob(blob).ok();
+        for (((id, blob), at), bytes) in batch.iter().zip(places).zip(counts) {
             if swap.execute(params![at.to_ref(), bytes, id, blob])? > 0 {
                 swapped += 1;
                 freed += (blob.len() - sealed_log::REF_BYTES) as u64;
