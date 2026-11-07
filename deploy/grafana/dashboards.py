@@ -785,7 +785,7 @@ def progress():
         q('sum(rate(atlas_release_ids_events_total{event="indexed"}[5m])) * 60', "indexed"),
         q('sum(rate(atlas_release_ids_events_total{event="pruned_releases"}[5m])) * 60', "pruned"),
     ], w=12, colors={"indexed": SERIES[0], "pruned": SERIES[1]},
-            description="Indexed counts every full index: a release's second file, and a pruned release that got a late article or spot. A rise in indexed with pruning on means rebuilds.")
+            description="Indexed counts every full index: a release's second file, and a pruned release that got a late article. A rise in indexed with pruning on means rebuilds.")
 
     b.row("Shared catalog")
     b.stat("Outbox waiting", 'sum(atlas_shared_catalog_outbox{kind="rows"})', w=6,

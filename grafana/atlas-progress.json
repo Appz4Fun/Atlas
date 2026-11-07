@@ -4431,7 +4431,7 @@
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
       },
-      "description": "Indexed counts every full index: a release's second file, and a pruned release that got a late article or spot. A rise in indexed with pruning on means rebuilds.",
+      "description": "Indexed counts every full index: a release's second file, and a pruned release that got a late article. A rise in indexed with pruning on means rebuilds.",
       "fieldConfig": {
         "defaults": {
           "custom": {

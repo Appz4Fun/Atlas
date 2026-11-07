@@ -579,7 +579,7 @@ pub(crate) fn is_exactly(bits: &[u8], expected: i64) -> bool {
 }
 
 /// When each release's `release_ids` were last made in full (`index_release`): a release indexed again without a
-/// new article (all copies, a spot placed on it) isn't quiet for the pruning walk till SEAL_AGE after
+/// new article (all copies) isn't quiet for the pruning walk till SEAL_AGE after
 /// (`ShardWriter::prune_ids_some`).
 pub const RELEASE_INDEXED: ShardTable = ShardTable {
     name: "release_indexed",
@@ -2229,6 +2229,11 @@ impl ShardWriter {
         Ok(sealed)
     }
 
+    /// Whether the pruning walk has work now: not resting after a walk, nor stopping.
+    pub fn prune_ids_awake(&self, now: i64) -> bool {
+        !crate::frozen::STOPPING.load(std::sync::atomic::Ordering::Relaxed) && now >= self.ids.rest_until
+    }
+
     /// Whether a pruning step is due (`prune_ids_some`): not while resting after a walk, nor while freezing says
     /// the indexer is stopping, and no sooner than the interval for how busy the writer is.
     pub fn prune_ids_due(&self, now: i64, idle: bool, queued: bool) -> bool {
@@ -2241,9 +2246,7 @@ impl ShardWriter {
         } else {
             PRUNE_IDS_EVERY
         };
-        !crate::frozen::STOPPING.load(std::sync::atomic::Ordering::Relaxed)
-            && now >= self.ids.rest_until
-            && self.ids_step.is_none_or(|t| t.elapsed() >= every)
+        self.prune_ids_awake(now) && self.ids_step.is_none_or(|t| t.elapsed() >= every)
     }
 
     /// Take `release_ids` rows of quiet releases, for at most PRUNE_IDS_BUDGET
@@ -2256,8 +2259,8 @@ impl ShardWriter {
     /// two files loses its index whatever its age: saves dont keep it up (`others`). A release none of whose files was touched,
     /// and that wasn't indexed itself, for SEAL_AGE loses its own row first, then the rest a chunk at a time
     /// over as many steps as it takes. The index is only a cache: without its
-    /// own row, the next save to the release, or a spot placed on it, indexes it
-    /// again in full (`index_release`), so a late article is still found in its
+    /// own row, the next save to the release indexes it again in full
+    /// (`index_release`); a spot placed on it compares in memory, so a late article is still found in its
     /// other files. Not for use inside a save transaction. Returns the rows taken.
     /// Only when `prune_ids_due`; a write lock another connection holds past PRUNE_IDS_BUSY lets the step go.
     pub fn prune_ids_some(&mut self, conn: &mut Connection, now: i64, idle: bool, queued: bool) -> Result<usize> {

@@ -414,29 +414,30 @@ pub fn placement(
         .prepare_cached("select id, filename from files where release_id = ?")?
         .query_map([id], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<Result<_>>()?;
-    // a spot naming a file the release doesn't have is another post: nothing to read
-    if !files.iter().all(|(filename, _)| names.iter().any(|(_, n)| n == filename)) {
+    // a spot naming a file the release doesn't have (with articles to tell by) is another post: nothing to read
+    if !files.iter().all(|(filename, ids)| ids.is_empty() || names.iter().any(|(_, n)| n == filename)) {
         return Ok(Placement::Taken);
     }
-    let indexed =
-        conn.prepare_cached("select 1 from release_ids where release_id = ? and id_hash = 0")?.exists([id])?;
+    // a one-file release's index isn't kept up by saves: one made before is not to be trusted
+    let indexed = names.len() > 1
+        && conn.prepare_cached("select 1 from release_ids where release_id = ? and id_hash = 0")?.exists([id])?;
     if !indexed {
-        // no index kept (one file, or pruned once quiet): the release's ids hashed here, without making one that
-        // saves wouldnt keep up or that would only be pruned again
-        let mut file_of = std::collections::HashMap::new();
-        let mut suffixes = Default::default();
-        for (file_id, name) in &names {
-            if files.iter().any(|(filename, _)| filename == name) {
+        // no index kept (one file, or pruned once quiet): each named file's ids streamed past the spot's own, without
+        // making an index that saves wouldnt keep up or that would only be pruned again
+        for (filename, ids) in files.iter().filter(|(_, ids)| !ids.is_empty()) {
+            let mut wanted: std::collections::HashSet<i64> = ids.iter().map(|m| key.hash(&format!("<{m}>"))).collect();
+            let mut suffixes = Default::default();
+            for (file_id, _) in names.iter().filter(|(_, n)| n == filename) {
                 crate::store::file_id_hashes(conn, &key, *file_id, &mut suffixes, |h| {
-                    file_of.insert(h, name.as_str());
+                    wanted.remove(&h);
                     Ok(())
                 })?;
             }
+            if !wanted.is_empty() {
+                return Ok(Placement::Taken);
+            }
         }
-        let same = files.iter().all(|(filename, ids)| {
-            ids.iter().all(|m| file_of.get(&key.hash(&format!("<{m}>"))) == Some(&filename.as_str()))
-        });
-        return Ok(if same { Placement::SamePost(id) } else { Placement::Taken });
+        return Ok(Placement::SamePost(id));
     }
     // every message-id of the release, sealed files' too, by their keyed hash, with the file it's in
     let mut file_of = conn.prepare_cached(

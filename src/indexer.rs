@@ -465,7 +465,9 @@ fn writer(
             Duration::ZERO
         } else if stage.is_empty() {
             // a writer with nothing to do wakes for idle freezing too, and does the rest of its housekeeping every `idle`
-            if crate::frozen::idle_ticks_on() { idle.min(crate::frozen::IDLE_TICK_EVERY) } else { idle }
+            // (and for pruning the message-id index while its walk isnt resting)
+            let pruning = store.prune_ids_awake(chrono::Utc::now().timestamp());
+            if crate::frozen::idle_ticks_on() || pruning { idle.min(crate::frozen::IDLE_TICK_EVERY) } else { idle }
         } else if bank > 0.0 || since_save >= STAGE_QUIET {
             Duration::ZERO
         } else {
