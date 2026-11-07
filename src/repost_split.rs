@@ -248,12 +248,16 @@ async fn span_utc(
             Ok((r.get(0)?, r.get(1)?))
         })?;
     let (Some(first), Some(last)) = (first, last) else { return Ok(None) };
-    let head = pool.fetch_head(&format!("<{sample_id}>"), 64 << 10).await?.unwrap_or_default();
+    let Some(head) = pool.fetch_head(&format!("<{sample_id}>"), 64 << 10).await? else {
+        anyhow::bail!("no HEAD for <{sample_id}>: the poster's zone is unknown");
+    };
     let text = String::from_utf8_lossy(&head);
     let date = text.lines().find_map(|l| l.strip_prefix("Date:").or_else(|| l.strip_prefix("date:")));
-    let offset = date
-        .and_then(|d| Some(crate::dates::naive_timestamp(d.trim())? - crate::dates::posted_timestamp(d.trim())?))
-        .unwrap_or(0);
+    let Some(offset) =
+        date.and_then(|d| Some(crate::dates::naive_timestamp(d.trim())? - crate::dates::posted_timestamp(d.trim())?))
+    else {
+        anyhow::bail!("<{sample_id}> has no Date this can read: the poster's zone is unknown");
+    };
     Ok(Some(((first - offset, last - offset), offset)))
 }
 
@@ -317,7 +321,8 @@ fn one(main: &std::path::Path, id: i64, server: Option<&str>, apply: bool) -> an
     let upload_of: HashMap<String, usize> = articles.iter().map(|a| a.4.clone()).zip(uploads.iter().copied()).collect();
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     // the release as it was read: a save in between would have made the plan stale
-    if crate::store::release_articles(&tx, id)?.len() != articles.len() {
+    let now: HashSet<String> = crate::store::release_articles(&tx, id)?.into_iter().map(|a| a.4).collect();
+    if now != want || now.len() != articles.len() {
         anyhow::bail!("release {id} changed since it was read; run it again");
     }
     let ids = crate::store::Ids::new(main);
