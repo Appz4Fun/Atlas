@@ -1714,7 +1714,7 @@ type Dated = (u64, i64);
 /// A Date header as unix seconds when it could be true: from 2000 on and not
 /// later than a little past now. Posters set their own Dates, soo a date search
 /// passes over the others as undated rather than be thrown off by them.
-fn plausible_post_time(date: &str) -> Option<i64> {
+pub(crate) fn plausible_post_time(date: &str) -> Option<i64> {
     /// 2000-01-01, and the slack for clocks running ahead
     const EARLIEST: i64 = 946_684_800;
     const AHEAD: i64 = 2 * 86_400;
