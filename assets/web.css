@@ -281,7 +281,8 @@ code.key { padding: 1px 5px; font: .82rem var(--font-mono); background: var(--su
 tr.drawer-row code.key, .drawer-card code.key { background: var(--surface); }
 
 .spot-desc { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.45; }
-.spot-desc blockquote { margin: 6px 0; padding: 4px 10px; border-left: 3px solid var(--line); white-space: pre-wrap; }
+.spot-desc blockquote { margin: 6px 0; padding: 4px 10px; border-left: 3px solid var(--line); }
+.spot-desc blockquote cite { font-style: normal; font-weight: 600; }
 .spot-comment { margin-bottom: 10px; }
 .spot-comment p.dim { margin: 0 0 6px; font-size: .85rem; }
 .nfo { padding: 14px; overflow-x: auto; font: .72rem/1.15 var(--font-mono); background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); }
