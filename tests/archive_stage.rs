@@ -249,6 +249,103 @@ fn a_one_article_zip_is_one_body() {
     assert_eq!(rows(&h, "x").len(), 2);
 }
 
+/// a ZIP posted as one file in articles of `piece` bytes, each its own yEnc part
+fn posted_in_pieces(mut s: Shape, file: &str, data: &[u8], piece: usize) -> Shape {
+    let pieces = data.len().div_ceil(piece) as i64;
+    for (i, chunk) in data.chunks(piece).enumerate() {
+        s = s.add(file, i as i64 + 1, pieces, yenc_body(file, chunk));
+    }
+    s
+}
+
+/// a ZIP of a 300 KB sample and 2,000 episodes: its directory is about 140 KB, longer than one article
+fn a_zip_of_many() -> Vec<u8> {
+    let names: Vec<String> =
+        (0..2_000).map(|i| format!("Some.Show.S{:02}E{:03}.1080p.WEB.mkv", i / 100, i % 100)).collect();
+    let sample = vec![9u8; 300_000];
+    let mut files: Vec<(&str, &[u8])> = vec![("Some.Show.Sample.mkv", &sample)];
+    files.extend(names.iter().map(|n| (n.as_str(), &b"x"[..])));
+    zip_of(&files)
+}
+
+#[test]
+fn a_zip_directory_longer_than_its_last_article_is_read_from_the_articles_it_spans() {
+    const PIECE: usize = 64 << 10;
+    let whole = a_zip_of_many();
+    let mut h = fresh();
+    let s = shape("x").one("x.zip", &whole);
+    serve(&mut h, &s, config());
+    settled(&h, "x");
+    let all = rows(&h, "x");
+    // the directory's first entry, which the last article alone doesn't hold
+    assert!(all.iter().any(|r| r.name == "Some.Show.S00E000.1080p.WEB.mkv"), "{all:?}");
+
+    let mut h = fresh();
+    let s = posted_in_pieces(shape("x"), "x.zip", &whole, PIECE);
+    let state = serve(&mut h, &s, config());
+    settled(&h, "x");
+    assert_eq!(rows(&h, "x"), all);
+    // the first and last articles, then the ones from where the directory (or zipview's read of the end) starts up
+    // to the last; none holding only the files before it
+    let directory = whole.len() - 22 - whole.windows(4).position(|w| w == b"PK\x01\x02").unwrap();
+    let from = (whole.len() - (directory + 22).max(65_557 + 76)) / PIECE + 1;
+    let pieces = whole.len().div_ceil(PIECE);
+    assert!(from > 4, "{from}");
+    assert_eq!(bodies(&state), 2 + (pieces - from), "{pieces} articles, from {from}");
+}
+
+#[test]
+fn an_nzb_in_a_small_zip_is_read_by_range_as_it_reads_whole() {
+    const PIECE: usize = 64 << 10;
+    let big: Vec<u8> = (0..300_000u32).map(|i| (i * 7 % 251) as u8).collect();
+    let whole = zip_of(&[("big.bin", &big), ("Pointed.At.nzb", &an_nzb(POINTED_AT))]);
+    let mut h = fresh();
+    serve(&mut h, &shape("x").one("x.zip", &whole), config());
+    settled(&h, "x");
+    let read_whole = rows(&h, "x");
+    assert!(read_whole.iter().any(|r| r.source == 5), "{read_whole:?}");
+
+    let mut h = fresh();
+    let state = serve(&mut h, &posted_in_pieces(shape("x"), "x.zip", &whole, PIECE), config());
+    settled(&h, "x");
+    assert_eq!(rows(&h, "x"), read_whole);
+    // the first and last, and the last but one that zipview's read of the end reaches: none of big.bin's others
+    assert_eq!(bodies(&state), 3, "of {}", whole.len().div_ceil(PIECE));
+}
+
+#[test]
+fn a_zip_whose_ranged_read_fails_is_read_whole_without_fetching_an_article_twice() {
+    const PIECE: usize = 64 << 10;
+    let big: Vec<u8> = (0..300_000u32).map(|i| (i * 7 % 251) as u8).collect();
+    let whole = zip_of(&[("big.bin", &big), ("Pointed.At.nzb", &an_nzb(POINTED_AT))]);
+    let mut h = fresh();
+    serve(&mut h, &shape("x").one("x.zip", &whole), config());
+    settled(&h, "x");
+    let read_whole = rows(&h, "x");
+    assert!(read_whole.iter().any(|r| r.source == 5), "{read_whole:?}");
+
+    // the last but one shorter than the others: the first and last say a length the file isn't, and the range read
+    // of the end stops on that piece
+    let front = whole.len() / PIECE - 1;
+    let remaining = whole.len() - front * PIECE;
+    let last = remaining / 2;
+    let short = remaining - last;
+    assert!(short < PIECE && last < short, "{short} {last}");
+    let n = front as i64 + 2;
+    let mut s = shape("x");
+    for (i, chunk) in whole[..front * PIECE].chunks(PIECE).enumerate() {
+        s = s.add("x.zip", i as i64 + 1, n, yenc_body("x.zip", chunk));
+    }
+    let (second_last, tail) = whole[front * PIECE..].split_at(short);
+    s = s.add("x.zip", n - 1, n, yenc_body("x.zip", second_last)).add("x.zip", n, n, yenc_body("x.zip", tail));
+    let mut h = fresh();
+    let state = serve(&mut h, &s, config());
+    settled(&h, "x");
+    assert_eq!(rows(&h, "x"), read_whole);
+    // each article once: the last but one the range read fetched is the whole read's, not fetched again
+    assert_eq!(bodies(&state), n as usize);
+}
+
 #[test]
 fn an_encoded_7z_reads_its_head_and_tail() {
     let mut h = fresh();
