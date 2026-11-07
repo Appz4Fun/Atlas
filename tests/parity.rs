@@ -440,6 +440,13 @@ fn ifsc_crcs_on_the_article_grid_localise_damage() {
         None,
         "grid must be a multiple of the block size"
     );
+    // Indices are grid intervals, not articles: 3500-byte articles on a 7000-byte grid put two
+    // articles in each interval, so damage in article 7 is interval 3.
+    let half: Vec<(u32, u64)> = file.chunks(3500).map(|c| (parity::crc32(c), c.len() as u64)).collect();
+    assert_eq!(parity::ifsc_intervals(&half, 3500, &slices, bs, file.len() as u64), Some(vec![]));
+    let mut bad_half = half.clone();
+    bad_half[7].0 ^= 1;
+    assert_eq!(parity::ifsc_intervals(&bad_half, 3500, &slices, bs, file.len() as u64), Some(vec![3]));
     // An article straddling a grid boundary cannot be placed; an empty file agrees everywhere.
     let short: Vec<(u32, u64)> = file.chunks(3000).map(|c| (parity::crc32(c), c.len() as u64)).collect();
     assert_eq!(parity::ifsc_intervals(&short, art, &slices, bs, file.len() as u64), None);
@@ -473,6 +480,14 @@ fn base_par2_names_end_right_after_par2() {
         ("Marillion - Live From Cadogan Hall 2011 (DVD 1).par2", true),
         ("Show (2026).vol000+01.par2", false),
         ("Show (2026).par2.rar", false),
+        // Any `White_Space` character ends the name, as it did for the old `\\s` regex: a no-break
+        // space from a header read as Latin-1, an ideographic space, an ASCII vertical tab.
+        // Letters and zero-width characters do not.
+        ("a.par2\u{a0}yEnc", true),
+        ("a.par2\u{3000}yEnc", true),
+        ("a.par2\u{b}yEnc", true),
+        ("a.par2\u{e9}", false),
+        ("a.par2\u{200b}x", false),
     ] {
         assert_eq!(parity::is_base_par2(subject), want, "{subject:?}");
         assert_eq!(atlas::par2::is_base_par2(subject), want, "{subject:?} via atlas::par2");
@@ -482,8 +497,11 @@ fn base_par2_names_end_right_after_par2() {
 #[test]
 fn base_par2_agrees_with_the_old_regexes_on_the_naming_corpus() {
     // The rule atlas::par2 used before delegating to par-rs, as an oracle over every real
-    // subject in the naming corpus. The two rules differ only on shapes the request asked to
-    // change (`(a.par2)`, `a.par2>`, a name both volume and base); none occur in the corpus.
+    // subject in the naming corpus. The rules differ where the request asked them to (`(a.par2)`
+    // and `[a.par2]` are par2 files now) and in what may follow `.par2` (any closing delimiter
+    // `' > ] )` ends the name, not only `"` and whitespace; a name that is both a volume and a
+    // base counts). None of those shapes occur in the corpus, and `\u{a0}` after `.par2` is
+    // accepted by both (pinned above), so the two agree on every line.
     let base = regex::Regex::new(r#"(?i)\.par2(?:["\s]|$)"#).unwrap();
     let vol = regex::Regex::new(r"(?i)\.vol\d+[+-]\d+\.par2").unwrap();
     let corpus = include_str!("fixtures/naming_samples.tsv");
