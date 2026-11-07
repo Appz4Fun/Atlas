@@ -77,14 +77,19 @@ pub fn why_not(id: &str) -> Option<&'static str> {
     })
 }
 
+/// The most sound one decode keeps, whatever it is asked for: a few small frames of a codec that packs silence
+/// tightly can stand for hours of samples.
+const MAX_MS: i64 = 60_000;
+
 /// The sound of `frames`, one channel: its sample rate, and for each frame the samples it decoded to (none for a
-/// frame that didn't decode). None when the track can't be decoded at all. A frame that makes a decoder panic ends the
-/// decode there, never the caller.
-pub fn decode(track: &AudioTrack, frames: &[&[u8]]) -> Option<(u32, Vec<Vec<i16>>)> {
+/// frame that didn't decode), stopping once `max_ms` of sound is kept (at most `MAX_MS`). None when the track can't
+/// be decoded at all. A frame that makes a decoder panic ends the decode there, never the caller.
+pub fn decode(track: &AudioTrack, frames: &[&[u8]], max_ms: i64) -> Option<(u32, Vec<Vec<i16>>)> {
     let codec = codec(&track.codec)?;
+    let max_ms = max_ms.clamp(0, MAX_MS);
     std::panic::catch_unwind(|| match codec {
-        Codec::PcmLe | Codec::PcmBe | Codec::PcmFloat => pcm(track, codec, frames),
-        _ => with_symphonia(track, codec, frames),
+        Codec::PcmLe | Codec::PcmBe | Codec::PcmFloat => pcm(track, codec, frames, max_ms),
+        _ => with_symphonia(track, codec, frames, max_ms),
     })
     .ok()
     .flatten()
@@ -101,7 +106,7 @@ fn aac_config(track: &AudioTrack) -> Option<Vec<u8>> {
     Some(bits.to_be_bytes().to_vec())
 }
 
-fn with_symphonia(track: &AudioTrack, codec: Codec, frames: &[&[u8]]) -> Option<(u32, Vec<Vec<i16>>)> {
+fn with_symphonia(track: &AudioTrack, codec: Codec, frames: &[&[u8]], max_ms: i64) -> Option<(u32, Vec<Vec<i16>>)> {
     let mut params = AudioCodecParameters::new();
     match codec {
         Codec::Aac => {
@@ -143,6 +148,7 @@ fn with_symphonia(track: &AudioTrack, codec: Codec, frames: &[&[u8]]) -> Option<
     let mut rate = None;
     let mut out = Vec::with_capacity(frames.len());
     let mut planes: Vec<Vec<f32>> = Vec::new();
+    let mut kept = 0u64;
     for (i, frame) in frames.iter().enumerate() {
         let packet = Packet::new(0, Timestamp::new(i as i64), Duration::new(1), frame.to_vec());
         let Ok(decoded) = decoder.decode(&packet) else {
@@ -154,10 +160,21 @@ fn with_symphonia(track: &AudioTrack, codec: Codec, frames: &[&[u8]]) -> Option<
         if *rate.get_or_insert(this) != this {
             break;
         }
+        // enough: the frames after it are not decoded, nor their samples kept
+        if kept >= samples_in(max_ms, this) {
+            break;
+        }
         decoded.copy_to_vecs_planar::<f32>(&mut planes);
-        out.push(mix(&planes));
+        let mono = mix(&planes);
+        kept += mono.len() as u64;
+        out.push(mono);
     }
     Some((rate?, out))
+}
+
+/// How many samples `ms` of sound at `rate` is.
+fn samples_in(ms: i64, rate: u32) -> u64 {
+    u64::try_from(ms).unwrap_or(0) * u64::from(rate) / 1000
 }
 
 /// Planes of samples, mixed down to one channel.
@@ -173,7 +190,7 @@ fn mix(planes: &[Vec<f32>]) -> Vec<i16> {
 }
 
 /// Plain PCM: each frame is whole sample frames of every channel, interleaved.
-fn pcm(track: &AudioTrack, codec: Codec, frames: &[&[u8]]) -> Option<(u32, Vec<Vec<i16>>)> {
+fn pcm(track: &AudioTrack, codec: Codec, frames: &[&[u8]], max_ms: i64) -> Option<(u32, Vec<Vec<i16>>)> {
     let rate = track.sample_rate.filter(|r| (1000.0..=768_000.0).contains(r))? as u32;
     let channels = usize::try_from(track.channels.unwrap_or(1)).ok().filter(|c| (1..=32).contains(c))?;
     let bits = track.bit_depth.unwrap_or(16);
@@ -198,18 +215,23 @@ fn pcm(track: &AudioTrack, codec: Codec, frames: &[&[u8]]) -> Option<(u32, Vec<V
             }
         }
     };
-    let out = frames
-        .iter()
-        .map(|frame| {
-            frame
-                .chunks_exact(width * channels)
-                .map(|s| {
-                    let sum: f32 = s.chunks_exact(width).map(sample).filter(|v| v.is_finite()).sum();
-                    ((sum / channels as f32).clamp(-1.0, 1.0) * 32767.0).round() as i16
-                })
-                .collect()
-        })
-        .collect();
+    let limit = samples_in(max_ms, rate);
+    let mut kept = 0u64;
+    let mut out = Vec::with_capacity(frames.len());
+    for frame in frames {
+        if kept >= limit {
+            break;
+        }
+        let mono: Vec<i16> = frame
+            .chunks_exact(width * channels)
+            .map(|s| {
+                let sum: f32 = s.chunks_exact(width).map(sample).filter(|v| v.is_finite()).sum();
+                ((sum / channels as f32).clamp(-1.0, 1.0) * 32767.0).round() as i16
+            })
+            .collect();
+        kept += mono.len() as u64;
+        out.push(mono);
+    }
     Some((rate, out))
 }
 
@@ -254,7 +276,7 @@ mod tests {
         assert_eq!(why_not("A_AAC/MPEG4/LC/SBR"), Some("aac_profile"));
         assert_eq!(why_not("a_aac"), Some("aac_profile"), "codec ids are case sensitive");
         assert_eq!(why_not("ac-3"), Some("other"));
-        assert!(decode(&track("A_AC3", &[]), &[&[0x0B, 0x77]]).is_none());
+        assert!(decode(&track("A_AC3", &[]), &[&[0x0B, 0x77]], 60_000).is_none());
     }
 
     #[test]
@@ -278,9 +300,9 @@ mod tests {
             let t = track(codec, &private);
             let frames: Vec<Vec<u8>> = (0..40).map(|i| noise(1 + i * 37 % 1500, i as u64 + 7)).collect();
             let refs: Vec<&[u8]> = frames.iter().map(Vec::as_slice).collect();
-            let _ = decode(&t, &refs);
-            let _ = decode(&t, &[]);
-            let _ = decode(&t, &[&[]]);
+            let _ = decode(&t, &refs, 60_000);
+            let _ = decode(&t, &[], 60_000);
+            let _ = decode(&t, &[&[]], 60_000);
         }
     }
 
@@ -288,14 +310,25 @@ mod tests {
     fn pcm_is_mixed_down() {
         // two channels of 16-bit little-endian: (1000, 3000) mixes to 2000
         let frame: Vec<u8> = [1000i16, 3000, -1000, -3000].iter().flat_map(|s| s.to_le_bytes()).collect();
-        let (rate, out) = decode(&track("A_PCM/INT/LIT", &[]), &[&frame]).unwrap();
+        let (rate, out) = decode(&track("A_PCM/INT/LIT", &[]), &[&frame], 60_000).unwrap();
         assert_eq!((rate, out), (48_000, vec![vec![2000, -2000]]));
         let frame: Vec<u8> = [1000i16, 3000].iter().flat_map(|s| s.to_be_bytes()).collect();
-        assert_eq!(decode(&track("A_PCM/INT/BIG", &[]), &[&frame]).unwrap().1, vec![vec![2000]]);
+        assert_eq!(decode(&track("A_PCM/INT/BIG", &[]), &[&frame], 60_000).unwrap().1, vec![vec![2000]]);
         let mut t = track("A_PCM/FLOAT/IEEE", &[]);
         t.bit_depth = Some(32);
         let frame: Vec<u8> = [0.5f32, 0.0].iter().flat_map(|s| s.to_le_bytes()).collect();
-        assert_eq!(decode(&t, &[&frame]).unwrap().1, vec![vec![8192]]);
+        assert_eq!(decode(&t, &[&frame], 60_000).unwrap().1, vec![vec![8192]]);
+    }
+
+    #[test]
+    fn a_decode_stops_once_it_has_enough() {
+        // 48 kHz stereo 16-bit: a frame of 4800 sample pairs is 100 ms
+        let frame = vec![0u8; 4800 * 4];
+        let frames: Vec<&[u8]> = (0..1000).map(|_| frame.as_slice()).collect();
+        let (_, out) = decode(&track("A_PCM/INT/LIT", &[]), &frames, 1_000).unwrap();
+        assert_eq!(out.len(), 10, "a second of sound, then no more");
+        let (_, out) = decode(&track("A_PCM/INT/LIT", &[]), &frames, i64::MAX).unwrap();
+        assert_eq!(out.len(), 600, "never more than a minute");
     }
 
     #[test]

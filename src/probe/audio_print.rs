@@ -330,7 +330,9 @@ fn window_print(data: &[u8], track: &mkv::AudioTrack, target: i64, window_ms: i6
     let from = frames.iter().rposition(|f| f.lace == 0 && f.millis <= target - WARMUP_MS).unwrap_or(0);
     let frames = frames.get(from..)?;
     let refs: Vec<&[u8]> = frames.iter().map(|f| f.bytes.as_slice()).collect();
-    let (rate, pcm) = decode::decode(track, &refs)?;
+    // no more sound than the window needs from where the decode starts
+    let lead = target.saturating_sub(frames.first()?.millis).max(0);
+    let (rate, pcm) = decode::decode(track, &refs, lead.saturating_add(window_ms).saturating_add(1_000))?;
     let per_ms = f64::from(rate) / 1000.0;
     // when each frame starts: a block's time is its first frame's, and a laced frame after it starts where the
     // frames before it in the lace end
