@@ -572,6 +572,17 @@ mod tests {
     }
 
     #[test]
+    fn vorbis_in_matroska_decodes_from_its_xiph_laced_headers() {
+        // CodecPrivate is the packet count, the Xiph lengths and the three headers, as Matroska stores them
+        let file = fixture("tune.vorbis.mkv");
+        assert_eq!(mkv::audio_track(&file).unwrap().private.first(), Some(&2));
+        let (_, v) = print_of("tune.vorbis.mkv", file.len() / 5, 3_000).unwrap();
+        let aac = fixture("tune.aac.mkv");
+        let (_, a) = print_of("tune.aac.mkv", aac.len() / 5, 3_000).unwrap();
+        assert!(audio::same_sound(&a, &v), "{:?}", audio::best_alignment(&a, &v));
+    }
+
+    #[test]
     fn a_window_starts_on_time_inside_a_lace() {
         use crate::audio::mkv::tests::{cluster, simple};
         // PCM, four one-second frames to a fixed-laced block, a block every four seconds
