@@ -126,6 +126,57 @@ pub fn decide(copies: &[Copy]) -> Verdict {
     Verdict::Split { windows, uploads }
 }
 
+/// Overview lines read at once, while looking for a release's articles.
+const DATE_CHUNK: u64 = 20_000;
+/// How much earlier and later than the release's first and last Date the search for its articles starts and ends:
+/// post dates are only roughly in order.
+const DATE_MARGIN_SECS: i64 = 600;
+
+/// The Date of each of `ids` (message-ids, with or without their angle brackets) on server `i`, read from its
+/// overview of `group` between `from` and `to` (unix seconds, the release's first and last Date): `article_at` finds
+/// the article numbers there, then the range is read `DATE_CHUNK` at a time. Article numbers are the server's own, soo
+/// one server is asked for both. None when the range holds more than `max_numbers` articles. An id not found is left
+/// out (the server has expired it, or numbered it outside the range).
+pub async fn dates_on(
+    pool: &crate::nntp::Pool,
+    i: usize,
+    group: &str,
+    (from, to): (i64, i64),
+    ids: &HashSet<String>,
+    max_numbers: u64,
+) -> crate::nntp::Result<Option<HashMap<String, i64>>> {
+    let bare = |id: &str| id.trim().trim_start_matches('<').trim_end_matches('>').to_string();
+    let wanted: HashSet<String> = ids.iter().map(|id| bare(id)).collect();
+    let (_, low, high, _) = pool.group_on(i, group).await?;
+    let start = pool.article_at(i, group, low, high, from.saturating_sub(DATE_MARGIN_SECS)).await?;
+    let end = pool.article_at(i, group, low, high, to.saturating_add(DATE_MARGIN_SECS)).await?.min(high);
+    if end < start {
+        return Ok(Some(HashMap::new()));
+    }
+    if end - start + 1 > max_numbers {
+        return Ok(None);
+    }
+    let mut out = HashMap::new();
+    let mut at = start;
+    while at <= end && out.len() < wanted.len() {
+        let last = at.saturating_add(DATE_CHUNK - 1).min(end);
+        let rows = match pool.xover_on(i, group, at, last).await {
+            Err(e) if e.is_empty_range() => Vec::new(),
+            r => r?,
+        };
+        for o in rows {
+            let id = bare(&o.message_id);
+            if wanted.contains(&id)
+                && let Some(t) = crate::nntp::plausible_post_time(&o.date)
+            {
+                out.insert(id, t);
+            }
+        }
+        at = last.saturating_add(1);
+    }
+    Ok(Some(out))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
