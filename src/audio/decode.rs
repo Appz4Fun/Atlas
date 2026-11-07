@@ -1,6 +1,6 @@
-//! Matroska audio frames to sound: decoded by symphonia (pure Rust) for AAC-LC, FLAC, MP3, MP2 and Vorbis, by hand
-//! for plain PCM, and mixed down to one channel. AC-3, E-AC-3, DTS, TrueHD and Opus have no pure-Rust decoder Atlas
-//! may use, soo their tracks get no fingerprint.
+//! Matroska audio frames to sound: decoded by symphonia (pure Rust) for AAC-LC, FLAC, MP3, MP2 and Vorbis, by
+//! filmcraft-ac3 (pure Rust) for AC-3 and E-AC-3, by hand for plain PCM, and mixed down to one channel. DTS, TrueHD
+//! and Opus have no pure-Rust decoder Atlas uses yet, soo their tracks get no fingerprint.
 
 use symphonia::core::audio::{Channels, Position};
 use symphonia::core::codecs::audio::well_known::{
@@ -24,6 +24,9 @@ enum Codec {
     PcmLe,
     PcmBe,
     PcmFloat,
+    /// AC-3 and E-AC-3 syncframes, one or more to a block
+    #[cfg_attr(not(feature = "ac3"), allow(dead_code))]
+    Ac3,
 }
 
 /// The Matroska codec ids decoded here.
@@ -50,6 +53,8 @@ fn codec(id: &str) -> Option<Codec> {
         "A_PCM/INT/LIT" => Codec::PcmLe,
         "A_PCM/INT/BIG" => Codec::PcmBe,
         "A_PCM/FLOAT/IEEE" => Codec::PcmFloat,
+        #[cfg(feature = "ac3")]
+        "A_AC3" | "A_EAC3" => Codec::Ac3,
         _ => return None,
     })
 }
@@ -57,7 +62,7 @@ fn codec(id: &str) -> Option<Codec> {
 /// Why a track of codec `id` (the Matroska codec id, as the probe keeps it) can't be fingerprinted, in a word or
 /// two; None when it can.
 pub fn why_not(id: &str) -> Option<&'static str> {
-    if READ.contains(&id) {
+    if READ.contains(&id) || cfg!(feature = "ac3") && matches!(id, "A_AC3" | "A_EAC3") {
         return None;
     }
     let upper = id.to_ascii_uppercase();
@@ -89,6 +94,10 @@ pub fn decode(track: &AudioTrack, frames: &[&[u8]], max_ms: i64) -> Option<(u32,
     let max_ms = max_ms.clamp(0, MAX_MS);
     std::panic::catch_unwind(|| match codec {
         Codec::PcmLe | Codec::PcmBe | Codec::PcmFloat => pcm(track, codec, frames, max_ms),
+        #[cfg(feature = "ac3")]
+        Codec::Ac3 => ac3(frames, max_ms),
+        #[cfg(not(feature = "ac3"))]
+        Codec::Ac3 => None,
         _ => with_symphonia(track, codec, frames, max_ms),
     })
     .ok()
@@ -131,7 +140,7 @@ fn with_symphonia(track: &AudioTrack, codec: Codec, frames: &[&[u8]], max_ms: i6
         Codec::Vorbis => {
             params.for_codec(CODEC_ID_VORBIS).with_extra_data(track.private.clone().into_boxed_slice());
         }
-        Codec::PcmLe | Codec::PcmBe | Codec::PcmFloat => return None,
+        Codec::PcmLe | Codec::PcmBe | Codec::PcmFloat | Codec::Ac3 => return None,
     }
     if let Some(rate) = track.sample_rate.filter(|r| (1000.0..=768_000.0).contains(r)) {
         params.with_sample_rate(rate as u32);
@@ -170,6 +179,88 @@ fn with_symphonia(track: &AudioTrack, codec: Codec, frames: &[&[u8]], max_ms: i6
         out.push(mono);
     }
     Some((rate?, out))
+}
+
+#[cfg(feature = "ac3")]
+/// AC-3 and E-AC-3: each block holds whole syncframes, E-AC-3's dependent substreams among them (they decode to no
+/// channels and add nothing). A block's samples are those of all its syncframes in turn, up to any bytes after them
+/// that don't start one; a block with a syncframe that doesn't decode keeps none, as another codec's frame that
+/// doesn't decode.
+fn ac3(frames: &[&[u8]], max_ms: i64) -> Option<(u32, Vec<Vec<i16>>)> {
+    let mut decoder = filmcraft_ac3::Decoder::new();
+    let mut rate = None;
+    let mut out = Vec::with_capacity(frames.len());
+    let mut kept = 0u64;
+    'blocks: for frame in frames {
+        if rate.is_some_and(|r| kept >= samples_in(max_ms, r)) {
+            break;
+        }
+        let mut mono = Vec::new();
+        let mut rest = *frame;
+        // a block that holds no syncframe at all skips sound: the overlap carried over it is wrong now
+        if !rest.starts_with(&[0x0B, 0x77]) {
+            decoder.reset();
+        }
+        // padding after the last syncframe is no syncframe: what was decoded before it stands
+        while rest.starts_with(&[0x0B, 0x77]) {
+            let Some((header, syncframe)) = filmcraft_ac3::parse_header(rest)
+                .ok()
+                .and_then(|h| rest.get(..h.frame_bytes).filter(|_| h.frame_bytes > 0).map(|f| (h, f)))
+            else {
+                // a syncframe skipped, as one that doesn't decode: the overlap carried from before it is wrong
+                decoder.reset();
+                mono.clear();
+                break;
+            };
+            rest = &rest[header.frame_bytes..];
+            let Ok(decoded) = decoder.decode(syncframe) else {
+                decoder.reset();
+                mono.clear();
+                break;
+            };
+            if decoded.channels.is_empty() {
+                continue;
+            }
+            // a stream that changes its rate part way is not one sound any more
+            if *rate.get_or_insert(header.sample_rate) != header.sample_rate {
+                break 'blocks;
+            }
+            mono.extend(downmix(&decoded.channels, header.acmod, header.lfeon));
+        }
+        kept += mono.len() as u64;
+        out.push(mono);
+    }
+    Some((rate?, out))
+}
+
+#[cfg(feature = "ac3")]
+/// AC-3 channels (WAV order: the front ones, LFE, then the surrounds) mixed down to one at the level a stereo
+/// downmix averaged to mono has, as `mix` hears a stereo track: Lo = L + 0.707 C + 0.707 Ls (a lone surround at
+/// 0.707 in both), Ro alike, and (Lo + Ro) / 2; LFE left out. Soo a 5.1 AC-3 track and a stereo AAC encode of it
+/// print alike, dialogue in the centre at the same level against the music.
+fn downmix(channels: &[Vec<f32>], acmod: u8, lfeon: bool) -> Vec<i16> {
+    const C: f32 = std::f32::consts::FRAC_1_SQRT_2;
+    // by acmod (Table 5.8), in WAV order before and after the LFE: 1+1, C, L R, L R C, L R | S, L R C | S,
+    // L R | Ls Rs, L R C | Ls Rs
+    let (fronts, surrounds): (&[f32], &[f32]) = match acmod {
+        0 => (&[0.5, 0.5], &[]),
+        1 => (&[1.0], &[]),
+        2 => (&[0.5, 0.5], &[]),
+        3 => (&[0.5, 0.5, C], &[]),
+        4 => (&[0.5, 0.5], &[C]),
+        5 => (&[0.5, 0.5, C], &[C]),
+        6 => (&[0.5, 0.5], &[C / 2.0, C / 2.0]),
+        _ => (&[0.5, 0.5, C], &[C / 2.0, C / 2.0]),
+    };
+    let lfe: &[f32] = if lfeon { &[0.0] } else { &[] };
+    let weights: Vec<f32> = fronts.iter().chain(lfe).chain(surrounds).copied().collect();
+    let Some(len) = channels.iter().map(Vec::len).min() else { return Vec::new() };
+    (0..len)
+        .map(|i| {
+            let sum: f32 = channels.iter().zip(&weights).map(|(c, w)| c[i] * w).filter(|v| v.is_finite()).sum();
+            (sum.clamp(-1.0, 1.0) * 32767.0).round() as i16
+        })
+        .collect()
 }
 
 /// How many samples `ms` of sound at `rate` is.
@@ -268,15 +359,18 @@ mod tests {
     fn codecs_without_a_decoder_say_why() {
         assert_eq!(why_not("A_AAC"), None);
         assert_eq!(why_not("A_FLAC"), None);
-        assert_eq!(why_not("A_AC3"), Some("ac3"));
-        assert_eq!(why_not("A_EAC3"), Some("ac3"));
+        let ac3 = if cfg!(feature = "ac3") { None } else { Some("ac3") };
+        assert_eq!(why_not("A_AC3"), ac3);
+        assert_eq!(why_not("A_EAC3"), ac3);
+        assert_eq!(why_not("A_AC3/BSID9"), Some("ac3"));
         assert_eq!(why_not("A_DTS/MA"), Some("dts"));
         assert_eq!(why_not("A_TRUEHD"), Some("truehd"));
         assert_eq!(why_not("A_OPUS"), Some("opus"));
         assert_eq!(why_not("A_AAC/MPEG4/LC/SBR"), Some("aac_profile"));
         assert_eq!(why_not("a_aac"), Some("aac_profile"), "codec ids are case sensitive");
         assert_eq!(why_not("ac-3"), Some("other"));
-        assert!(decode(&track("A_AC3", &[]), &[&[0x0B, 0x77]], 60_000).is_none());
+        assert!(decode(&track("A_DTS", &[]), &[&[0x7F, 0xFE]], 60_000).is_none());
+        assert!(decode(&track("A_AC3", &[]), &[&[0x0B, 0x77]], 60_000).is_none(), "no syncframe, no rate");
     }
 
     #[test]
@@ -296,6 +390,8 @@ mod tests {
             ("A_PCM/INT/LIT", Vec::new()),
             ("A_PCM/INT/BIG", Vec::new()),
             ("A_PCM/FLOAT/IEEE", Vec::new()),
+            ("A_AC3", Vec::new()),
+            ("A_EAC3", Vec::new()),
         ] {
             let t = track(codec, &private);
             let frames: Vec<Vec<u8>> = (0..40).map(|i| noise(1 + i * 37 % 1500, i as u64 + 7)).collect();
@@ -329,6 +425,24 @@ mod tests {
         assert_eq!(out.len(), 10, "a second of sound, then no more");
         let (_, out) = decode(&track("A_PCM/INT/LIT", &[]), &frames, i64::MAX).unwrap();
         assert_eq!(out.len(), 600, "never more than a minute");
+    }
+
+    #[cfg(feature = "ac3")]
+    #[test]
+    fn ac3_downmix_leaves_out_the_lfe() {
+        let ch = |v: f32| vec![v; 4];
+        let level = |v: f32| (v * 32767.0).round() as i16;
+        let c = std::f32::consts::FRAC_1_SQRT_2;
+        // 3/2 with LFE: L R C LFE Ls Rs. The LFE adds nothing, the centre counts as a stereo downmix's mono does
+        let six = [ch(0.0), ch(0.0), ch(0.5), ch(1.0), ch(0.0), ch(0.0)];
+        assert_eq!(downmix(&six, 7, true), vec![level(0.5 * c); 4]);
+        let surround = [ch(0.0), ch(0.0), ch(0.0), ch(0.0), ch(0.5), ch(0.5)];
+        assert_eq!(downmix(&surround, 7, true), vec![level(0.5 * c); 4]);
+        // 2/1 without LFE: L R S
+        assert_eq!(downmix(&[ch(0.4), ch(0.4), ch(0.5)], 4, false), vec![level(0.4 + 0.5 * c); 4]);
+        // stereo is a plain average, mono itself
+        assert_eq!(downmix(&[ch(0.5), ch(-0.5)], 2, false), vec![0; 4]);
+        assert_eq!(downmix(&[ch(0.5)], 1, false), vec![16384; 4]);
     }
 
     #[test]
