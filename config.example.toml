@@ -90,6 +90,8 @@ concurrency = 16
 comments = true
 comment_days = 60
 comments_per_pass = 2000
+# spotters known for spam and fakes, read once a day; "" for none
+blacklist_url = "https://spotlist.store/spotnet/blacklist.xml"
 
 [category]
 enabled = true

@@ -19,7 +19,7 @@ use crate::indexer::{Db, on_db};
 use crate::nntp::{Pool, says_absent};
 
 use super::store::{self, SAVED, SKIPPED, Settled, SpotRow};
-use super::{MAX_XML_BYTES, SPOT_GROUP, binary, comments, full, header, release, sign};
+use super::{MAX_XML_BYTES, SPOT_GROUP, binary, blacklist, comments, full, header, release, sign};
 
 /// Overview lines asked for in one XOVER.
 const XOVER_STEP: u64 = 5_000;
@@ -117,6 +117,16 @@ pub async fn pass(pool: &Arc<Pool>, db: &Db, config: &SpotsConfig, stopping: &im
     let comments_off = !config.comments;
     on_db(db, move |conn| Ok(store::prune(conn, now)? + if comments_off { comments::prune(conn, now)? } else { 0 }))
         .await?;
+    if config.blacklist_url.is_empty() {
+        // turned off: the list kept goes too, so it no longer removes anything
+        match on_db(db, |conn| Ok(blacklist::clear(conn)?)).await {
+            Ok(0) => {}
+            Ok(n) => println!("spots: the blacklist is off, {n} spotters taken off it"),
+            Err(e) => eprintln!("spots: blacklist: {e:#}"),
+        }
+    } else {
+        refresh_blacklist(db, &config.blacklist_url, now).await;
+    }
     match backfill_xml(pool, db, stopping).await {
         Ok(0) => {}
         Ok(n) => println!("spots: read the XML of {n} spots saved before it was kept"),
@@ -175,6 +185,34 @@ pub async fn pass(pool: &Arc<Pool>, db: &Db, config: &SpotsConfig, stopping: &im
         }
     }
     Ok(done)
+}
+
+/// Reads the blacklist again when it's a day old. A failed read is logged, the list kept stays, and it's tried
+/// again a day later.
+async fn refresh_blacklist(db: &Db, url: &str, now: i64) {
+    match on_db(db, move |conn| Ok(blacklist::due(conn, now)?)).await {
+        Ok(true) => {}
+        Ok(false) => return,
+        Err(e) => return eprintln!("spots: blacklist: {e:#}"),
+    }
+    let u = url.to_string();
+    let read = tokio::task::spawn_blocking(move || blacklist::fetch(&u).map(|xml| blacklist::parse(&xml)))
+        .await
+        .map_err(|e| anyhow!("{e}"))
+        .and_then(|r| r);
+    let done = match read {
+        Ok(spotters) => on_db(db, move |conn| blacklist::replace(conn, &spotters, now)).await,
+        Err(e) => Err(e),
+    };
+    match done {
+        Ok(n) => println!("spots: the blacklist names {n} spotters"),
+        Err(e) => {
+            eprintln!("spots: blacklist {url}: {e:#}");
+            if let Err(e) = on_db(db, move |conn| Ok(blacklist::tried(conn, now)?)).await {
+                eprintln!("spots: blacklist: {e:#}");
+            }
+        }
+    }
 }
 
 /// What a spot task came to: settled (`SAVED`, `SKIPPED`, or None for one more try), or left for a later pass.
