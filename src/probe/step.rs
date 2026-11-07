@@ -13,7 +13,7 @@ use crate::store::{FileInfo, SegmentPick};
 
 use super::{
     DROP_COVER, ProbeInfo, SET_COVER, SET_PROBE, agent_of, derive, imdb_ids, keep_headers, media, moviehash, nest,
-    nfo_text, parse_sfv, xref_groups, yenc,
+    nfo_text, parse_sfv, xref_groups, yenc, yenc_quirks,
 };
 
 pub const PROBE_STEP: StepId = StepId(4);
@@ -407,9 +407,10 @@ impl Step for ProbeStep {
     /// archives, followed down. Bit 4: attachments, cover art, when it was muxed, MaxCLL and MaxFALL. Bit 8:
     /// SegmentUID, editions, default flags and the encoder's settings. Bit 16: the article's header names in order,
     /// its Message-ID and References, and the title ids a Matroska file's tags give. Bit 32: mkvmerge's per-track
-    /// statistics from the Tags at a Matroska file's end, and a Blu-ray's `id.bdmv` disc ID.
+    /// statistics from the Tags at a Matroska file's end, and a Blu-ray's `id.bdmv` disc ID. Bit 64: the yEnc
+    /// encoder's quirks.
     fn config_stamp(&self) -> u64 {
-        1 | 2 | 4 | 8 | 16 | 32
+        1 | 2 | 4 | 8 | 16 | 32 | 64
     }
     fn run(&self, ctx: &mut StepCtx<'_>) -> Result<Outcome, StepError> {
         let retry = |e: rusqlite::Error| StepError::Retry(e.to_string());
@@ -584,6 +585,7 @@ impl Step for ProbeStep {
                         info.crossposted_to = xref_groups(xref);
                     }
                     info.yenc = yenc::parse(&article.lines);
+                    info.quirks = yenc_quirks::Quirks::read(&article.lines);
                     if let Some(body) = yenc_decode(&article.lines) {
                         if let Some(expected) = info.yenc.as_ref().and_then(|y| y.pcrc32) {
                             info.part_crc_ok = Some(crc32(&body) == expected);
@@ -634,6 +636,10 @@ impl Step for ProbeStep {
                     let article = yenc::split_article(&raw);
                     last_lines = yenc::parse(&article.lines);
                     last_body = yenc_decode(&article.lines);
+                    // the tail article read is the file's last only when its own yEnc lines say soo
+                    if let Some(seen) = yenc_quirks::Quirks::read(&article.lines) {
+                        info.quirks.get_or_insert_with(Default::default).add(&seen);
+                    }
                 }
             }
             derive(&mut info, wire_bytes, file.expected, last_lines.as_ref());
