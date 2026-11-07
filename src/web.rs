@@ -839,7 +839,9 @@ impl Search {
             }
             // nor does one the rating chips leave out
             if self.min_score.is_some() {
-                let scores = kept_scores(&before.iter().map(|r| r.id).collect::<Vec<_>>());
+                let posts: HashMap<i64, release_info::SplitPost> =
+                    before.iter().filter_map(|r| Some((r.id, post_of(r)?))).collect();
+                let scores = post_scores(&before, &posts);
                 before.retain(|r| !self.rated_out(r.id, &scores));
             }
             let ids: Vec<i64> = before.iter().filter(|r| tagged(r)).chain(found.iter()).map(|r| r.id).collect();
@@ -947,6 +949,8 @@ impl Search {
     fn body_from_window(&self) -> String {
         let by = self.sort;
         let mut at_least = self.offset + PAGE_SIZE + 1;
+        // a rating chip stopped the window growing with more of the search behind it
+        let mut rated_stop = false;
         let (rows, more) = loop {
             let window = match window_of(self, at_least) {
                 Ok(window) => window,
@@ -955,6 +959,7 @@ impl Search {
             let (rows, more) = window.page(self, by);
             // short of a page past the end of what was read: folded rows or filters left too few, soo read further
             if more || !window.can_grow(self) {
+                rated_stop = self.min_score.is_some() && window.more_in_db && window.asked >= GROW_WITH_RATING;
                 break (rows, more);
             }
             at_least = window.asked.saturating_mul(2);
@@ -962,6 +967,12 @@ impl Search {
         if rows.is_empty() {
             return if self.offset == 0 {
                 self.nothing_found()
+            } else if rated_stop {
+                format!(
+                    "<tr><td colspan=\"{COLUMNS}\" class=\"note dim\">A rating chip looks through the first {} results. \
+                     Narrow the search to see further.</td></tr>",
+                    thousands(GROW_WITH_RATING)
+                )
             } else if self.offset + PAGE_SIZE >= MAX_WINDOW {
                 format!(
                     "<tr><td colspan=\"{COLUMNS}\" class=\"note dim\">Paging stops {} results in. Narrow the search to \
@@ -1011,7 +1022,7 @@ impl Search {
             let all = attr(&Search { offset: 0, min_score: None, ..self.clone() }.query(&self.cat, 0));
             let _ = write!(
                 hint,
-                "Only releases rated that high are shown, by the scores kept so far. <a href=\"/?{all}\" hx-get=\"/ui/results?{all}\" hx-target=\"#results\">Show every rating</a>. "
+                "Only releases rated that high are shown, by the scores kept so far, from the first {GROW_WITH_RATING} results. <a href=\"/?{all}\" hx-get=\"/ui/results?{all}\" hx-target=\"#results\">Show every rating</a>. "
             );
         }
         if !self.q.is_empty() {
@@ -1192,6 +1203,8 @@ struct ShownRow {
     /// the best kept score of the row it shows (`score_value`), for the rating chips: None until a page with a chip
     /// looks it up, soo searches without one never read scores
     score: Option<Option<i64>>,
+    /// the other rows of the post it shows, whose title it takes when its own row has none (`post_scores`)
+    post: Vec<i64>,
 }
 
 /// The first `SORT_WINDOW` results of one search, whatever the sort, kept in memory: choosing a column only puts these
@@ -1270,6 +1283,7 @@ impl Window {
                 folded: row.folded,
                 brings: row.brings,
                 score: row.score,
+                post: row.post.clone(),
             };
             shown.insert(place, carried);
             if let Some(listed) = row.brings.filter(|_| !row.folded) {
@@ -1277,7 +1291,14 @@ impl Window {
                 if places.contains(&listed) {
                     shown.insert(
                         listed,
-                        ShownRow { html: String::new(), size: row.size, folded: true, brings: None, score: None },
+                        ShownRow {
+                            html: String::new(),
+                            size: row.size,
+                            folded: true,
+                            brings: None,
+                            score: None,
+                            post: Vec::new(),
+                        },
                     );
                 }
             }
@@ -1347,8 +1368,14 @@ impl Window {
         let mut kept = Vec::with_capacity(rows.len());
         let mut split = HashMap::new();
         let mut done = Vec::with_capacity(rows.len());
-        let left_out =
-            |r: &ReleaseRow| ShownRow { html: String::new(), size: r.size, folded: true, brings: None, score: None };
+        let left_out = |r: &ReleaseRow| ShownRow {
+            html: String::new(),
+            size: r.size,
+            folded: true,
+            brings: None,
+            score: None,
+            post: Vec::new(),
+        };
         for r in rows {
             let place = r.id;
             let mut r = r.clone();
@@ -1377,10 +1404,12 @@ impl Window {
         }
         // by the row each place shows, which for a post brought in isn't the window's own row; only for a chip
         let scores = search.min_score.map(|_| post_scores(&kept, &split));
-        for ((place, r), html) in places.into_iter().zip(&kept).zip(rows_html(&kept, split)) {
+        let posts: Vec<Vec<i64>> =
+            kept.iter().map(|r| split.get(&r.id).map_or_else(Vec::new, |p| p.ids.clone())).collect();
+        for (((place, r), html), post) in places.into_iter().zip(&kept).zip(rows_html(&kept, split)).zip(posts) {
             let brings = (r.id != place).then_some(r.id);
             let score = scores.as_ref().map(|scores| scores.get(&r.id).copied());
-            done.push((place, ShownRow { html, size: r.size, folded: false, brings, score }));
+            done.push((place, ShownRow { html, size: r.size, folded: false, brings, score, post }));
         }
         self.publish(done);
     }
@@ -1440,7 +1469,11 @@ impl Window {
                     match shown.get(&r.id) {
                         Some(row) if row.folded => continue,
                         Some(row) if search.min_score.is_some() && row.score.is_none() => {
-                            unscored.push((r.id, row.brings.unwrap_or(r.id)));
+                            let shows = row.brings.unwrap_or(r.id);
+                            unscored.push((
+                                r.id,
+                                std::iter::once(shows).chain(row.post.iter().copied()).collect::<Vec<_>>(),
+                            ));
                         }
                         Some(row) if search.scored_out(row.score.flatten()) => continue,
                         Some(row) => {
@@ -1460,11 +1493,12 @@ impl Window {
                 }
             }
             if !unscored.is_empty() {
-                let scores = kept_scores(&unscored.iter().map(|(_, id)| *id).collect::<Vec<_>>());
+                // as `post_scores`: the row it shows, else another row of its post
+                let scores = kept_scores(&unscored.iter().flat_map(|(_, ids)| ids.iter().copied()).collect::<Vec<_>>());
                 let mut shown = lock(&self.shown);
-                for (place, id) in unscored {
+                for (place, ids) in unscored {
                     if let Some(row) = shown.get_mut(&place) {
-                        row.score = Some(scores.get(&id).copied());
+                        row.score = Some(ids.iter().find_map(|id| scores.get(id).copied()));
                     }
                 }
                 continue;
@@ -4489,7 +4523,7 @@ mod tests {
     }
 
     fn shown(html: &str, size: i64, folded: bool) -> ShownRow {
-        ShownRow { html: html.into(), size: Some(size), folded, brings: None, score: None }
+        ShownRow { html: html.into(), size: Some(size), folded, brings: None, score: None, post: Vec::new() }
     }
 
     #[test]
@@ -5317,7 +5351,17 @@ mod tests {
         let old = window_of_rows(vec![row(1), row(2)]);
         old.publish(vec![
             (1, shown("<tr>1</tr>", 1, false)),
-            (2, ShownRow { html: "<tr>9</tr>".into(), size: Some(20), folded: false, brings: Some(9), score: None }),
+            (
+                2,
+                ShownRow {
+                    html: "<tr>9</tr>".into(),
+                    size: Some(20),
+                    folded: false,
+                    brings: Some(9),
+                    score: None,
+                    post: Vec::new(),
+                },
+            ),
         ]);
         let grown = window_of_rows(vec![row(1), row(2), row(9), row(3)]);
         grown.carry_from(&old);
@@ -5334,8 +5378,14 @@ mod tests {
         let w = window_of_rows(vec![row(1), row(2), row(3), row(4)]);
         // 4 has a title of its own rated lower: left out with nothing rendered
         let _ = w.titled.set([(4, Some(50))].into_iter().collect());
-        let scored =
-            |html: &str, brings, score| ShownRow { html: html.into(), size: Some(1), folded: false, brings, score };
+        let scored = |html: &str, brings, score| ShownRow {
+            html: html.into(),
+            size: Some(1),
+            folded: false,
+            brings,
+            score,
+            post: Vec::new(),
+        };
         // place 2 shows post 9, which is rated; place 1's own row isn't
         w.publish(vec![
             (1, scored("<tr>1</tr>", None, Some(None))),
