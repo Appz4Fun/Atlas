@@ -471,10 +471,11 @@ fn block5(
                 }
                 if file_flags & 1 == 0 {
                     let size = (file_flags & 8 == 0).then_some(unpacked);
-                    // a split file's CRC is its part's until the last volume (header flags 0x08, 0x10), and in an
+                    // a split file's CRC is its part's in every volume it goes on from (header flag 0x10, as unrar
+                    // checks it against the packed part); the last volume's (0x08 alone) is the whole file's. In an
                     // encrypted archive it can be an HMAC of the key (the record's flag 2, which `-hp` headers
                     // don't always show), soo none is kept there
-                    let crc = crc.filter(|_| flags & 0x18 == 0 && !l.encrypted && !hashmac_record(area));
+                    let crc = crc.filter(|_| flags & 0x10 == 0 && !l.encrypted && !hashmac_record(area));
                     if l.packer.is_none() {
                         l.packer = Some(packer5(compression, host, *main, file_flags, &extras));
                     }
