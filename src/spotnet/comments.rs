@@ -6,26 +6,28 @@
 
 use std::collections::HashSet;
 
-use rusqlite::{Connection, OptionalExtension, Result, params};
+use rusqlite::{Connection, Result, params};
 
-use super::store::{GAVE_UP, SAVED, SKIPPED, TODO};
+use super::store::{SAVED, TODO, read_cursor, write_cursor};
 
 /// Where comments are posted.
 pub const COMMENT_GROUP: &str = "free.usenet";
 /// Where spam reports are posted.
 pub const REPORT_GROUP: &str = "free.willey";
 
-/// A comment's body is kept up to this many bytes, as in Spotweb: past it, it's an NZB posted by mistake.
+/// The longest comment body read: a longer one is no comment but an NZB or the like posted by mistake, and is
+/// left out (`GONE`).
 pub const MAX_BODY: usize = 10 * 1024;
 
 /// Waiting for its body.
 pub const WAITING: i64 = 0;
 /// Body read.
 pub const READ: i64 = 1;
-/// The article is gone, or too big to be a comment.
+/// The article is gone, too big to be a comment, or wouldn't come in `MAX_TRIES` passes.
 pub const GONE: i64 = 2;
-/// Tries a comment's body gets before it's given up on (`GONE`).
-pub const MAX_TRIES: i64 = 5;
+/// Passes a comment's body is tried in before it's given up on (`GONE`): a pass stops at the first failure, so an
+/// outage costs each pass a try for the few comments in flight, not the whole queue.
+pub const MAX_TRIES: i64 = 20;
 
 /// The main database's tables, if missing.
 pub fn create(conn: &Connection) -> Result<()> {
@@ -108,9 +110,7 @@ fn cursor_key(group: &str, server: &str) -> String {
 
 /// The last article of `group` read on `server`, by its numbers there.
 pub fn cursor(conn: &Connection, group: &str, server: &str) -> Result<Option<u64>> {
-    let v: Option<i64> =
-        conn.query_row("select value from meta where key = ?", [cursor_key(group, server)], |r| r.get(0)).optional()?;
-    Ok(v.and_then(|v| u64::try_from(v).ok()))
+    read_cursor(conn, &cursor_key(group, server))
 }
 
 /// The spots comments and reports are kept for: waiting to be fetched, or saved as a release.
@@ -146,10 +146,7 @@ pub fn note_read(
                 comment.execute(params![n.message_id, n.spot, n.at, n.rating, n.poster, n.spotter_id])?
             };
         }
-        tx.execute(
-            "insert into meta (key, value) values (?, ?) on conflict(key) do update set value = excluded.value",
-            params![cursor_key(group, server), last as i64],
-        )?;
+        write_cursor(&tx, &cursor_key(group, server), last)?;
     }
     tx.commit()?;
     Ok(added)
@@ -159,47 +156,58 @@ pub fn note_read(
 pub fn todo(conn: &Connection, limit: usize) -> Result<Vec<String>> {
     conn.prepare_cached(
         "select c.message_id from spot_comments c left join spots_seen s on s.message_id = c.spot
-         where c.state = ?1 order by coalesce(s.state = ?2, 0) desc, c.at desc limit ?3",
+         where c.state = 0 order by coalesce(s.state = ?1, 0) desc, c.at desc limit ?2",
     )?
-    .query_map(params![WAITING, SAVED, limit as i64], |r| r.get(0))?
+    .query_map(params![SAVED, limit as i64], |r| r.get(0))?
     .collect()
 }
 
-/// What came of reading a comment's body: `Some(Some(text))` read, `Some(None)` gone, None one more try (gone
-/// after `MAX_TRIES`).
-pub fn settle(conn: &Connection, message_id: &str, outcome: Option<Option<&str>>) -> Result<()> {
-    match outcome {
-        Some(Some(body)) => conn.execute(
-            "update spot_comments set state = ?, body = ? where message_id = ?",
-            params![READ, body, message_id],
-        )?,
-        Some(None) => {
-            conn.execute("update spot_comments set state = ? where message_id = ?", params![GONE, message_id])?
-        }
-        None => conn.execute(
+/// What came of reading a comment's body.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Outcome {
+    Read(String),
+    Gone,
+    /// one more try (gone after `MAX_TRIES`)
+    Failed,
+}
+
+/// What came of reading these comments' bodies, in one transaction.
+pub fn settle(conn: &mut Connection, outcomes: &[(String, Outcome)]) -> Result<()> {
+    let tx = conn.transaction()?;
+    {
+        let mut read = tx.prepare_cached("update spot_comments set state = ?, body = ? where message_id = ?")?;
+        let mut gone = tx.prepare_cached("update spot_comments set state = ? where message_id = ?")?;
+        let mut failed = tx.prepare_cached(
             "update spot_comments set tries = tries + 1,
                 state = case when tries + 1 >= ? then ? else state end
              where message_id = ?",
-            params![MAX_TRIES, GONE, message_id],
-        )?,
-    };
-    Ok(())
+        )?;
+        for (message_id, outcome) in outcomes {
+            match outcome {
+                Outcome::Read(body) => read.execute(params![READ, body, message_id])?,
+                Outcome::Gone => gone.execute(params![GONE, message_id])?,
+                Outcome::Failed => failed.execute(params![MAX_TRIES, GONE, message_id])?,
+            };
+        }
+    }
+    tx.commit()
 }
 
-/// Forgets the comments and reports of spots that came to nothing (not movies or TV after all, given up on).
+/// Forgets the comments and reports of spots no longer kept: those that came to nothing (not movies or TV after
+/// all, given up on) and those forgotten since. A saved spot is kept for good (`store::prune`).
 pub fn prune(conn: &Connection) -> Result<usize> {
     let mut n = 0;
     for table in ["spot_comments", "spot_reports"] {
         n += conn.execute(
-            &format!("delete from {table} where spot in (select message_id from spots_seen where state in (?, ?))"),
-            params![SKIPPED, GAVE_UP],
+            &format!("delete from {table} where spot not in (select message_id from spots_seen where state in (?, ?))"),
+            params![TODO, SAVED],
         )?;
     }
     Ok(n)
 }
 
 /// A comment's body as text: UTF-8, or Latin-1 as older clients wrote it, its line ends as `\n`, cut at
-/// `MAX_BODY`.
+/// `MAX_BODY` (the read is capped there; this is for one that isn't).
 pub fn body_text(raw: &[u8]) -> String {
     let cut = raw.len() > MAX_BODY;
     let raw = &raw[..raw.len().min(MAX_BODY)];
@@ -330,10 +338,14 @@ mod tests {
         assert_eq!(note_read(&mut conn, REPORT_GROUP, "srv", 7, &report, true).unwrap(), 1);
         // the saved spot's comment first, though the other is newer
         assert_eq!(todo(&conn, 10).unwrap(), ["s1.8.a.b@spot.net", "s2.0.a.b@spot.net"]);
-        settle(&conn, "s1.8.a.b@spot.net", Some(Some("Password in comment: hunter2"))).unwrap();
-        for _ in 0..MAX_TRIES {
-            settle(&conn, "s2.0.a.b@spot.net", None).unwrap();
+        let read = ("s1.8.a.b@spot.net".to_string(), Outcome::Read("Password in comment: hunter2".into()));
+        let failed = ("s2.0.a.b@spot.net".to_string(), Outcome::Failed);
+        settle(&mut conn, &[read, failed.clone()]).unwrap();
+        for _ in 1..MAX_TRIES - 1 {
+            settle(&mut conn, std::slice::from_ref(&failed)).unwrap();
         }
+        assert_eq!(todo(&conn, 10).unwrap(), ["s2.0.a.b@spot.net"], "tried, not given up on yet");
+        settle(&mut conn, &[failed]).unwrap();
         assert!(todo(&conn, 10).unwrap().is_empty());
 
         // the release page: its spot's comments and reports, and those of an earlier spot of the same NZB
@@ -345,16 +357,14 @@ mod tests {
         let (none, no_reports) = about(&conn, 10, "other@spot.net").unwrap();
         assert!(none.is_empty() && no_reports == 0);
 
-        // a spot that came to nothing takes its comments along
-        super::super::store::settle(
-            &conn,
-            "s2@spot.net",
-            Some(&super::super::store::Settled { state: SKIPPED, ..Default::default() }),
-            0,
-        )
-        .unwrap();
+        // a spot that came to nothing takes its comments along, and so does one forgotten since
+        assert_eq!(prune(&conn).unwrap(), 0);
+        let skipped = super::super::store::Settled { state: super::super::store::SKIPPED, ..Default::default() };
+        super::super::store::settle(&conn, "s2@spot.net", Some(&skipped), 0).unwrap();
         assert_eq!(prune(&conn).unwrap(), 1);
+        conn.execute("delete from spots_seen where message_id = 's1@spot.net'", []).unwrap();
+        assert_eq!(prune(&conn).unwrap(), 2, "its comment and its report");
         let left: i64 = conn.query_row("select count(*) from spot_comments", [], |r| r.get(0)).unwrap();
-        assert_eq!(left, 1);
+        assert_eq!(left, 0);
     }
 }

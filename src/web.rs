@@ -1793,7 +1793,7 @@ fn spot_comments_html(comments: &[crate::spotnet::comments::Comment]) -> String 
         let text = match c.state {
             READ if c.body.is_empty() => "<p class=\"note\">An empty comment.</p>".to_string(),
             READ => format!("<div class=\"spot-desc\">{}</div>", spot_text(&c.body)),
-            GONE => "<p class=\"note\">Its text couldn't be read: the article is gone.</p>".to_string(),
+            GONE => "<p class=\"note\">Its text couldn't be read: the article is gone, too big to be a comment, or the servers kept failing.</p>".to_string(),
             _ => "<p class=\"note\">Its text is read on the indexer's next spot pass.</p>".to_string(),
         };
         let _ = write!(out, "<div class=\"panel spot-comment\"><p class=\"dim\">{}</p>{text}</div>", by.join(" · "));
@@ -1826,16 +1826,17 @@ fn spot_text(text: &str) -> String {
     static SMILEY: std::sync::LazyLock<regex::Regex> =
         std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)\[img=([a-z0-9_-]{1,32})\]").unwrap());
     let text = FORMATTING.replace_all(text.trim(), "");
-    let text = SMILEY.replace_all(&text, ":$1:");
+    // smileys outside links only: a `[` ends a link, and `:x:` would carry it on
+    let plain = |s: &str| SMILEY.replace_all(&escape(s), ":$1:").into_owned();
     let mut out = String::with_capacity(text.len());
     let mut at = 0;
     for m in LINK.find_iter(&text) {
-        out.push_str(&escape(&text[at..m.start()]));
+        out.push_str(&plain(&text[at..m.start()]));
         let url = link_end(m.as_str());
         let _ = write!(out, "<a href=\"{}\" rel=\"noreferrer nofollow\">{}</a>", attr(url), escape(url));
         at = m.start() + url.len();
     }
-    out.push_str(&escape(&text[at..]));
+    out.push_str(&plain(&text[at..]));
     out
 }
 
@@ -4192,7 +4193,7 @@ mod tests {
                     poster: "Olli <W>".into(),
                     spotter_id: Some("ab1".into()),
                     state: READ,
-                    body: "Thanks![img=klappen]\nWachtwoord: s3cret <b> https://example.org/x_(1)".into(),
+                    body: "Thanks![img=klappen]\nWachtwoord: s3cret <b> https://example.org/x_(1)[img=buigen]".into(),
                 },
                 Comment { at: 1_787_089_272, rating: 6, poster: "Penny".into(), state: GONE, ..Default::default() },
                 Comment { at: 1_787_091_828, poster: "Vector".into(), state: WAITING, ..Default::default() },
@@ -4222,7 +4223,7 @@ mod tests {
             "<h3>Comments (3)</h3>",
             "<p class=\"dim\">Olli &lt;W&gt; · spotter ab1 · 2026-08-18 20:53 UTC · rated 8 / 10</p>",
             // a password a commenter wrote, shown as written
-            "Thanks!:klappen:\nWachtwoord: s3cret &lt;b&gt; <a href=\"https://example.org/x_(1)\"",
+            "Thanks!:klappen:\nWachtwoord: s3cret &lt;b&gt; <a href=\"https://example.org/x_(1)\" rel=\"noreferrer nofollow\">https://example.org/x_(1)</a>:buigen:",
             "<p class=\"dim\">Penny · 2026-08-18 21:41 UTC · rated 6 / 10</p><p class=\"note\">Its text couldn't be read",
             "<p class=\"dim\">Vector · 2026-08-18 22:23 UTC</p><p class=\"note\">Its text is read on the indexer's next",
             // the description whole, escaped, a password the poster wrote included, its link made a link

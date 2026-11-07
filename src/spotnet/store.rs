@@ -28,8 +28,8 @@ pub const MAX_TRIES: i64 = 5;
 pub const PER_SPOTTER: i64 = 10;
 /// Spots waiting at most; past it the oldest are given up on. About two months of movie and TV spots.
 pub const MAX_TODO: i64 = 20_000;
-/// A spot still waiting after this long is given up on, and a settled one is forgotten (its `free.pt` article is
-/// long behind the cursor, and the release keeps its tag).
+/// A spot still waiting after this long is given up on, and one that came to nothing is forgotten (its `free.pt`
+/// article is long behind the cursor). A saved one stays: its comments hang off it (`comments`).
 pub const TODO_DAYS: i64 = 30;
 pub const KEEP_DAYS: i64 = 180;
 
@@ -49,7 +49,8 @@ pub fn create_main(conn: &Connection) -> Result<()> {
         ) without rowid;
         create index if not exists spots_seen_todo on spots_seen(state, number);
         create index if not exists spots_seen_ref on spots_seen(nzb_ref) where nzb_ref is not null;
-        create index if not exists spots_seen_key on spots_seen(nzb_key) where nzb_key is not null;",
+        create index if not exists spots_seen_key on spots_seen(nzb_key) where nzb_key is not null;
+        create index if not exists spots_seen_release on spots_seen(release_id) where release_id is not null;",
     )?;
     super::comments::create(conn)
 }
@@ -91,9 +92,21 @@ fn cursor_key(server: &str) -> String {
 
 /// The last `free.pt` article read on `server`, by its numbers there.
 pub fn cursor(conn: &Connection, server: &str) -> Result<Option<u64>> {
-    let v: Option<i64> =
-        conn.query_row("select value from meta where key = ?", [cursor_key(server)], |r| r.get(0)).optional()?;
+    read_cursor(conn, &cursor_key(server))
+}
+
+/// A group's cursor in `meta`: the last article read, by its numbers on the server the key names.
+pub(super) fn read_cursor(conn: &Connection, key: &str) -> Result<Option<u64>> {
+    let v: Option<i64> = conn.query_row("select value from meta where key = ?", [key], |r| r.get(0)).optional()?;
     Ok(v.and_then(|v| u64::try_from(v).ok()))
+}
+
+pub(super) fn write_cursor(conn: &Connection, key: &str, last: u64) -> Result<()> {
+    conn.execute(
+        "insert into meta (key, value) values (?, ?) on conflict(key) do update set value = excluded.value",
+        params![key, last as i64],
+    )?;
+    Ok(())
 }
 
 /// A spot the overview lists: its message-id, article number and spotter id.
@@ -110,10 +123,7 @@ pub fn note_read(conn: &mut Connection, server: &str, last: u64, spots: &[Noted]
         for (id, number, spotter) in spots {
             added += insert.execute(params![id, *number as i64, now, spotter])?;
         }
-        tx.execute(
-            "insert into meta (key, value) values (?, ?) on conflict(key) do update set value = excluded.value",
-            params![cursor_key(server), last as i64],
-        )?;
+        write_cursor(&tx, &cursor_key(server), last)?;
     }
     tx.commit()?;
     Ok(added)
@@ -154,8 +164,8 @@ pub fn waiting(conn: &Connection) -> Result<i64> {
     conn.query_row("select count(*) from spots_seen where state = ?", [TODO], |r| r.get(0))
 }
 
-/// Gives up on spots waiting past `TODO_DAYS` and on the oldest past `MAX_TODO`, and forgets settled ones past
-/// `KEEP_DAYS`. Returns the rows it changed.
+/// Gives up on spots waiting past `TODO_DAYS` and on the oldest past `MAX_TODO`, and forgets the ones that came to
+/// nothing past `KEEP_DAYS`. Saved ones stay. Returns the rows it changed.
 pub fn prune(conn: &Connection, now: i64) -> Result<usize> {
     let day = 86_400;
     let mut n = conn.execute(
@@ -167,7 +177,10 @@ pub fn prune(conn: &Connection, now: i64) -> Result<usize> {
             (select message_id from spots_seen where state = ?2 order by number desc limit ?3)",
         params![GAVE_UP, TODO, MAX_TODO],
     )?;
-    n += conn.execute("delete from spots_seen where state != ?1 and at < ?2", params![TODO, now - KEEP_DAYS * day])?;
+    n += conn.execute(
+        "delete from spots_seen where state not in (?1, ?2) and at < ?3",
+        params![TODO, SAVED, now - KEEP_DAYS * day],
+    )?;
     Ok(n)
 }
 
@@ -654,11 +667,17 @@ mod tests {
         conn.execute("update spots_seen set at = ? where message_id = 'new@spot.net'", [TODO_DAYS * day]).unwrap();
         assert_eq!(prune(&conn, TODO_DAYS * day + 1).unwrap(), 1);
         assert_eq!(todo(&conn, 10).unwrap(), ["new@spot.net"]);
-        // a settled row past KEEP_DAYS goes
+        // past KEEP_DAYS, a spot that came to nothing goes and a saved one stays
         settle(&conn, "new@spot.net", Some(&Settled { state: SAVED, ..Settled::default() }), 0).unwrap();
         prune(&conn, KEEP_DAYS * day + 1).unwrap();
-        let left: i64 = conn.query_row("select count(*) from spots_seen", [], |r| r.get(0)).unwrap();
-        assert_eq!(left, 0);
+        let left: Vec<String> = conn
+            .prepare("select message_id from spots_seen")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(left, ["new@spot.net"]);
     }
 
     #[test]
