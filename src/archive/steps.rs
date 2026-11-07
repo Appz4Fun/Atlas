@@ -52,15 +52,22 @@ pub(crate) fn tail_articles(ctx: &StepCtx<'_>, file: &FileInfo) -> Result<Vec<Se
 }
 
 /// The articles to try as the first piece of an upload linked from its headers (`xref`), and their volumes: up to
-/// `xref::LEADS` of each volume, volume by volume, `xref::HEAD_PROBES` in all. Which volume goes first moves on by the
-/// hour, soo a run that found no first piece is followed by one that tries other volumes.
-fn xref_heads<'a>(ctx: &StepCtx<'_>, files: &'a [FileInfo]) -> Result<Vec<(Head<'a>, SegmentRef)>, StepError> {
+/// `xref::LEADS` of each volume, volume by volume, `xref::HEAD_PROBES` in all, and when to try the next volumes if
+/// none of these is one. Each hour since the upload was saved takes the volumes after the last hour's
+/// (`xref::guess_round`), until every volume has had its turn.
+fn xref_heads<'a>(
+    ctx: &StepCtx<'_>,
+    files: &'a [FileInfo],
+) -> Result<(Vec<(Head<'a>, SegmentRef)>, Option<i64>), StepError> {
     let volumes = select::volumes(files);
-    let start = usize::try_from(chrono::Utc::now().timestamp() / 3600).unwrap_or(0);
-    Ok(xref_order(&volumes, start, |f| ctx.segments(f.id, &SegmentPick::First(crate::xref::LEADS)).map_err(retry))?
-        .into_iter()
-        .map(|(f, seg)| (Head { file: f, tail: f, probe: true }, seg))
-        .collect())
+    let now = chrono::Utc::now().timestamp();
+    let (start, again) = crate::xref::guess_round(crate::xref::saved_at(&ctx.release().name), volumes.len(), now);
+    let heads =
+        xref_order(&volumes, start, |f| ctx.segments(f.id, &SegmentPick::First(crate::xref::LEADS)).map_err(retry))?
+            .into_iter()
+            .map(|(f, seg)| (Head { file: f, tail: f, probe: true }, seg))
+            .collect();
+    Ok((heads, again))
 }
 
 /// `volumes` from the one at `start` (wrapping), each with what `leads` gives of it, `xref::HEAD_PROBES` in all.
@@ -1311,9 +1318,13 @@ impl Step for ListStep {
         // an upload linked from its headers (`xref`) has its parts in a guessed order: its volumes' likely first pieces
         // are each tried, and only an archive's start is taken
         let xref = crate::xref::is_upload(&rel_name);
+        // with no first piece among this run's guesses, when the next run tries the next volumes
+        let mut xref_again = None;
         let heads: Vec<(Head<'_>, Option<SegmentRef>)> = if xref {
             left = left.max(crate::xref::HEAD_PROBES);
-            xref_heads(ctx, &files)?.into_iter().map(|(h, s)| (h, Some(s))).collect()
+            let (heads, again) = xref_heads(ctx, &files)?;
+            xref_again = again;
+            heads.into_iter().map(|(h, s)| (h, Some(s))).collect()
         } else {
             select::plan(&files, limits.probe_files.max(0) as usize).into_iter().map(|h| (h, None)).collect()
         };
@@ -1539,6 +1550,6 @@ impl Step for ListStep {
                 return Ok(outcome);
             }
         }
-        Ok(Outcome::default())
+        Ok(Outcome { wait_until: xref_again, ..Default::default() })
     }
 }

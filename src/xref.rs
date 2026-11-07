@@ -72,9 +72,10 @@ create table if not exists linked (
 ) without rowid;
 create index if not exists linked_added on linked(added);
 -- each upload saved: its release, the groups its articles have been read in so far, when its files were posted, and
--- how many it has, soo files read later in other groups join it
+-- how many it has, soo files read later in other groups join it; `saved` when it was first saved (`guess_round`)
 create table if not exists uploads (
     release TEXT PRIMARY KEY,
+    saved   INTEGER NOT NULL,
     grp     TEXT NOT NULL,
     groups  TEXT NOT NULL,
     first   INTEGER NOT NULL,
@@ -227,6 +228,32 @@ fn upload_name(poster: &str) -> String {
     format!("{NAME_PREFIX}{}-{}", hash >> 32, hash & 0xffff_ffff)
 }
 
+/// When the upload `release` was first saved, from the store the indexer writes. None when it isn't kept (any more), or
+/// in tests.
+pub fn saved_at(release: &str) -> Option<i64> {
+    if cfg!(test) {
+        return None;
+    }
+    let conn = Connection::open_with_flags(
+        path_for(&crate::paths::database()),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()?;
+    conn.query_row("select saved from uploads where release = ?1", [release], |r| r.get(0)).optional().ok()?
+}
+
+/// Which of an upload's `volumes` the archive step starts its first-piece guesses at by `now`, and when to look again
+/// if they find none: each hour since it was `saved` takes the next `HEAD_PROBES / LEADS` volumes, until every volume
+/// has had a turn. Not known when it was saved: the first volumes, once.
+pub fn guess_round(saved: Option<i64>, volumes: usize, now: i64) -> (usize, Option<i64>) {
+    let per_round = (HEAD_PROBES / LEADS).max(1);
+    let rounds = volumes.div_ceil(per_round) as i64;
+    let Some(saved) = saved else { return (0, None) };
+    let round = (now - saved).max(0) / 3600;
+    let again = (round + 1 < rounds).then_some(saved + (round + 1) * 3600);
+    (round as usize * per_round, again)
+}
+
 /// Whether `name` is that of an upload this linked, whose files are named for their place and whose parts are in a
 /// guessed order.
 pub fn is_upload(name: &str) -> bool {
@@ -259,6 +286,19 @@ struct Place {
     file: i64,
     files: i64,
     parts: i64,
+}
+
+/// What a pass found: its releases to save, then `Store::ack`.
+pub struct Found {
+    pub releases: Vec<Release>,
+    pub ack: Ack,
+}
+
+/// What a pass took as done, noted by `Store::ack` once its releases are saved.
+pub struct Ack {
+    finished: Vec<(String, Option<Place>, Vec<String>)>,
+    widened: Vec<(String, String, Seed, i64)>,
+    now: i64,
 }
 
 /// An upload saved before.
@@ -415,13 +455,15 @@ impl Store {
     /// The uploads that have settled by `now`, each as a release, and the articles that came late for a file already
     /// in one, as that release. Their headers are marked done, and each file's place kept for what comes later.
     pub fn pass(&mut self, now: i64) -> Result<Vec<Release>> {
-        self.pass_with(now, &mut |_, _| false)
+        let found = self.pass_with(now, &mut |_, _| false)?;
+        self.ack(found.ack)?;
+        Ok(found.releases)
     }
 
     /// `pass`, a file settled only once `unread(first, last)` says no group is still to be read for the time it was
     /// posted in, or once it has waited `KEEP_SECS`: an upload saved before every group was read for it would be
     /// split, as a group read later brings files of it that no article read before linked.
-    pub fn pass_with(&mut self, now: i64, unread: &mut dyn FnMut(i64, i64) -> bool) -> Result<Vec<Release>> {
+    pub fn pass_with(&mut self, now: i64, unread: &mut dyn FnMut(i64, i64) -> bool) -> Result<Found> {
         let mut waits: HashMap<String, bool> = HashMap::new();
         for f in self.waiting()? {
             let quiet = f.added < now - SETTLE_SECS;
@@ -439,14 +481,16 @@ impl Store {
         }
 
         let mut out: HashMap<String, Release> = HashMap::new();
-        let mut finished: Vec<(String, Option<Place>)> = Vec::new();
+        // each poster done with: where its file went, and the articles of it this pass took
+        let mut finished: Vec<(String, Option<Place>, Vec<String>)> = Vec::new();
 
         for (f, place) in late {
             if settled(&f) {
                 let rows = self.rows_of(&f.poster)?;
                 let parts = place.parts + rows.len() as i64;
+                let ids = rows.iter().map(|r| r.message_id.clone()).collect();
                 self.add_file(&mut out, &place, &f.poster, rows, parts);
-                finished.push((f.poster, Some(Place { parts, ..place })));
+                finished.push((f.poster, Some(Place { parts, ..place }), ids));
             }
         }
 
@@ -459,7 +503,10 @@ impl Store {
             }
             let articles: i64 = files.iter().map(|&i| fresh[i].n).sum();
             if seed.is_none() && articles < MIN_UPLOAD_ARTICLES {
-                finished.extend(files.iter().map(|&i| (fresh[i].poster.clone(), None)));
+                for &i in &files {
+                    let ids = self.rows_of(&fresh[i].poster)?.into_iter().map(|r| r.message_id).collect();
+                    finished.push((fresh[i].poster.clone(), None, ids));
+                }
                 continue;
             }
             let mut by_group: HashMap<i64, usize> = HashMap::new();
@@ -500,13 +547,14 @@ impl Store {
                     files: count,
                     parts: 0,
                 };
+                let ids = rows.iter().map(|r| r.message_id.clone()).collect();
                 self.add_file(&mut out, &place, &fresh[i].poster, rows, parts);
-                finished.push((fresh[i].poster.clone(), Some(Place { parts, ..place })));
+                finished.push((fresh[i].poster.clone(), Some(Place { parts, ..place }), ids));
             }
             widened.push((release, group, span, count));
         }
         // the groups late articles were read in widen their upload too
-        for (poster, place) in &finished {
+        for (poster, place, _) in &finished {
             let Some(place) = place else { continue };
             if widened.iter().any(|(r, _, _, _)| *r == place.release) {
                 continue;
@@ -524,22 +572,39 @@ impl Store {
             }
         }
 
+        let mut releases: Vec<Release> = out.into_values().collect();
+        for r in &mut releases {
+            r.complete = is_complete(&r.articles);
+            if let Some(first) = r.articles.first() {
+                r.poster = first.author.clone();
+                r.date = first.date.clone();
+            }
+        }
+        Ok(Found { releases, ack: Ack { finished, widened, now } })
+    }
+
+    /// Note what `ack`'s pass took as done, once its releases are saved: until then the next pass finds them again.
+    /// Articles that came for a file since aren't in it, soo they wait for the next.
+    pub fn ack(&mut self, ack: Ack) -> Result<()> {
+        let Ack { finished, widened, now } = ack;
         let tx = self.conn.transaction()?;
         {
-            let mut done = tx.prepare_cached("update headers set done = 1 where poster = ?1 and done = 0")?;
+            let mut done = tx.prepare_cached("update headers set done = 1 where message_id = ?1")?;
             let mut keep = tx.prepare_cached(
                 "insert into linked (poster, release, grp, file, files, parts, added) values (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                  on conflict(poster) do update set parts = excluded.parts, added = excluded.added",
             )?;
-            for (poster, place) in &finished {
-                done.execute([poster])?;
+            for (poster, place, ids) in &finished {
+                for id in ids {
+                    done.execute([id])?;
+                }
                 if let Some(p) = place {
                     keep.execute(params![poster, p.release, p.group, p.file, p.files, p.parts, now])?;
                 }
             }
             let mut upload = tx.prepare_cached(
-                "insert into uploads (release, grp, groups, first, last, files, added)
-                 values (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                "insert into uploads (release, grp, groups, first, last, files, added, saved)
+                 values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
                  on conflict(release) do update set groups = excluded.groups, first = excluded.first,
                      last = excluded.last, files = excluded.files, added = excluded.added",
             )?;
@@ -549,16 +614,7 @@ impl Store {
             }
         }
         tx.commit()?;
-
-        let mut releases: Vec<Release> = out.into_values().collect();
-        for r in &mut releases {
-            r.complete = is_complete(&r.articles);
-            if let Some(first) = r.articles.first() {
-                r.poster = first.author.clone();
-                r.date = first.date.clone();
-            }
-        }
-        Ok(releases)
+        Ok(())
     }
 
     /// `rows` of one poster as a file of `place`'s release, parts numbered on from the ones it has, of `parts` in all.
@@ -599,15 +655,31 @@ impl Store {
 /// The store the indexer writes to, opened on first use. In tests only one a test opened.
 static STORE: Mutex<Option<Store>> = Mutex::new(None);
 
+/// Headers a slice brought while a pass held the store, kept here instead of making the slice wait: (group, its
+/// articles, when they came). Whoever next holds the store writes them first.
+static QUEUED: Mutex<Vec<(String, Vec<Article>, i64)>> = Mutex::new(Vec::new());
+
 fn with_store<T>(f: impl FnOnce(&mut Store) -> Result<T>) -> Result<Option<T>> {
-    let mut store = STORE.lock().unwrap_or_else(|e| e.into_inner());
+    let store = STORE.lock().unwrap_or_else(|e| e.into_inner());
+    in_store(store, f)
+}
+
+fn in_store<T>(
+    mut store: std::sync::MutexGuard<'_, Option<Store>>,
+    f: impl FnOnce(&mut Store) -> Result<T>,
+) -> Result<Option<T>> {
     if store.is_none() {
         if cfg!(test) {
             return Ok(None);
         }
         *store = Some(Store::open(&path_for(&crate::paths::database()))?);
     }
-    f(store.as_mut().expect("opened above")).map(Some)
+    let s = store.as_mut().expect("opened above");
+    let queued = std::mem::take(&mut *QUEUED.lock().unwrap_or_else(|e| e.into_inner()));
+    for (group, articles, added) in queued {
+        s.record(&group, &articles, added)?;
+    }
+    f(s).map(Some)
 }
 
 /// Whether `article` is one this keeps: no subject rule reads it, its subject is one random token or its own
@@ -630,8 +702,18 @@ pub fn hold(group: &str, articles: Vec<Article>) -> Vec<Article> {
         unparsable.note(a);
     }
     crate::collections::count_unparsable(group, &unparsable);
-    if let Err(e) = with_store(|s| s.record(group, &held, now())) {
-        eprintln!("xref: couldnt keep {} headers of {group}: {e:#}", held.len());
+    let store = match STORE.try_lock() {
+        Ok(store) => store,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        // a pass holds it: the slice goes on, and its headers are written after
+        Err(std::sync::TryLockError::WouldBlock) => {
+            QUEUED.lock().unwrap_or_else(|e| e.into_inner()).push((group.to_string(), held, now()));
+            return kept;
+        }
+    };
+    let count = held.len();
+    if let Err(e) = in_store(store, |s| s.record(group, &held, now())) {
+        eprintln!("xref: couldnt keep {count} headers of {group}: {e:#}");
     }
     kept
 }
@@ -675,8 +757,8 @@ pub async fn run(db: crate::indexer::Db, stopping: impl Fn() -> bool) {
             })
         })
         .await;
-        let releases = match found {
-            Ok(Ok(Some(releases))) => releases,
+        let Found { releases, ack } = match found {
+            Ok(Ok(Some(found))) => found,
             Ok(Ok(None)) => continue,
             Ok(Err(e)) => {
                 eprintln!("xref: {e:#}");
@@ -687,13 +769,28 @@ pub async fn run(db: crate::indexer::Db, stopping: impl Fn() -> bool) {
                 continue;
             }
         };
-        if releases.is_empty() {
+        let (count, articles) = (releases.len(), releases.iter().map(|r| r.articles.len()).sum::<usize>());
+        // a save goes to one shard's writer, soo each shard's releases go apart
+        let mut by_shard: HashMap<usize, Vec<Release>> = HashMap::new();
+        for r in releases {
+            by_shard.entry(crate::store::shard_of(&r.group)).or_default().push(r);
+        }
+        let mut saved = true;
+        for (_, releases) in by_shard {
+            if let Err(e) = db.save(releases).await {
+                eprintln!("xref: couldnt save uploads: {e:#}");
+                saved = false;
+            }
+        }
+        // what wasnt saved is found again next pass; saving what was saved again changes nothing
+        if !saved {
             continue;
         }
-        let (count, articles) = (releases.len(), releases.iter().map(|r| r.articles.len()).sum::<usize>());
-        match db.save(releases).await {
-            Ok(()) => println!("xref: saved {count} uploads, {articles} articles"),
-            Err(e) => eprintln!("xref: couldnt save {count} uploads: {e:#}"),
+        match tokio::task::spawn_blocking(move || with_store(|s| s.ack(ack))).await {
+            Ok(Ok(_)) if count > 0 => println!("xref: saved {count} uploads, {articles} articles"),
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => eprintln!("xref: couldnt note what was saved: {e:#}"),
+            Err(e) => eprintln!("xref: noting what was saved failed: {e}"),
         }
     }
 }
@@ -866,8 +963,13 @@ mod tests {
             store.record(["a.b.one", "a.b.two"][k as usize % 2], &[a], 1000).unwrap();
         }
         let later = 1001 + SETTLE_SECS;
-        assert!(store.pass_with(later, &mut |_, _| true).unwrap().is_empty(), "a group hasnt read that day");
-        assert_eq!(store.pass_with(1001 + KEEP_SECS, &mut |_, _| true).unwrap().len(), 1, "not past a day");
+        assert!(store.pass_with(later, &mut |_, _| true).unwrap().releases.is_empty(), "a group hasnt read that day");
+        let found = store.pass_with(1001 + KEEP_SECS, &mut |_, _| true).unwrap();
+        assert_eq!(found.releases.len(), 1, "not past a day");
+        // not noted as saved: found again
+        assert_eq!(store.pass_with(1002 + KEEP_SECS, &mut |_, _| true).unwrap().releases.len(), 1);
+        store.ack(found.ack).unwrap();
+        assert!(store.pass_with(1003 + KEEP_SECS, &mut |_, _| true).unwrap().releases.is_empty());
     }
 
     #[test]
@@ -899,5 +1001,16 @@ mod tests {
         assert_eq!(vol.len(), 4);
         assert!(vol.iter().all(|a| a.file_index == Some(3) && a.file_total == Some(3)), "its third file");
         assert!(more.iter().any(|r| r.name != first[0].name && r.articles.len() == 12), "{more:?}");
+    }
+
+    #[test]
+    fn each_hour_the_first_piece_guesses_take_the_next_volumes() {
+        let per = HEAD_PROBES / LEADS;
+        assert_eq!(guess_round(None, 40, 0), (0, None), "not known when saved: once");
+        assert_eq!(guess_round(Some(0), 40, 10), (0, Some(3600)));
+        assert_eq!(guess_round(Some(0), 40, 3600), (per, Some(7200)));
+        let last = 40usize.div_ceil(per) as i64 - 1;
+        assert_eq!(guess_round(Some(0), 40, last * 3600), (last as usize * per, None), "every volume has had a turn");
+        assert_eq!(guess_round(Some(0), 3, 0), (0, None), "one turn does them all");
     }
 }
