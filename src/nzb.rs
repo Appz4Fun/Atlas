@@ -423,7 +423,8 @@ fn files_named(articles: &[ArticleRow], name: &str) -> Vec<ArticleRow> {
         .into_iter()
         .filter(|file| {
             file.first().and_then(|a| a.filename.as_deref()).is_some_and(|f| {
-                f == name || f.strip_prefix(&apart).is_some_and(|id| id.bytes().all(|b| b.is_ascii_digit()))
+                f == name
+                    || f.strip_prefix(&apart).is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
             })
         })
         .flatten()
@@ -519,7 +520,12 @@ mod tests {
         assert!(files_named(&articles, "c.nfo").is_empty());
         assert_eq!(files_named(&articles, "b.mkv").len(), 2);
         // a linked upload's second row of the same name, kept apart in the NZB, comes along
-        let linked = [art(Some("v.par2"), 1, 1), art(Some("v.par2 #42"), 1, 1), art(Some("v.par2 #x"), 1, 1)];
+        let linked = [
+            art(Some("v.par2"), 1, 1),
+            art(Some("v.par2 #42"), 1, 1),
+            art(Some("v.par2 #x"), 1, 1),
+            art(Some("v.par2 #"), 1, 1),
+        ];
         assert_eq!(files_named(&linked, "v.par2").len(), 2);
     }
 
