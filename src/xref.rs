@@ -81,6 +81,8 @@ create index if not exists linked_release on linked(release, file);
 create table if not exists uploads (
     release TEXT PRIMARY KEY,
     probed  INTEGER NOT NULL DEFAULT 0,
+    -- bumped each time the upload grows, which starts its guesses over: a run that began before can't note progress
+    gen     INTEGER NOT NULL DEFAULT 0,
     grp     TEXT NOT NULL,
     groups  TEXT NOT NULL,
     first   INTEGER NOT NULL,
@@ -240,21 +242,29 @@ fn open_rw() -> Option<Connection> {
 }
 
 /// How many of the upload `release`'s first-piece guesses the archive step has tried (`uploads.probed`), in the order
-/// `archive::steps::xref_order` gives them. None when not known (pruned, or in tests): the first ones, once.
-pub fn tried(release: &str) -> Option<i64> {
+/// `archive::steps::xref_order` gives them, and the generation of its guesses that count is of. None when not known
+/// (pruned, or in tests): the first ones, once.
+pub fn tried(release: &str) -> Option<(i64, i64)> {
     if cfg!(test) {
         return None;
     }
-    open_rw()?.query_row("select probed from uploads where release = ?1", [release], |r| r.get(0)).optional().ok()?
+    open_rw()?
+        .query_row("select probed, gen from uploads where release = ?1", [release], |r| Ok((r.get(0)?, r.get(1)?)))
+        .optional()
+        .ok()?
 }
 
-/// The first `count` guesses of the upload `release` were tried: a later run takes the ones after.
-pub fn tried_through(release: &str, count: i64) {
+/// The first `count` guesses of generation `generation` of the upload `release` were tried: a later run takes the ones after.
+/// Nothing when the upload has grown since, and its guesses started over.
+pub fn tried_through(release: &str, generation: i64, count: i64) {
     if cfg!(test) {
         return;
     }
     if let Some(conn) = open_rw() {
-        let _ = conn.execute("update uploads set probed = max(probed, ?2) where release = ?1", params![release, count]);
+        let _ = conn.execute(
+            "update uploads set probed = max(probed, ?3) where release = ?1 and gen = ?2",
+            params![release, generation, count],
+        );
     }
 }
 
@@ -698,7 +708,7 @@ impl Store {
                 "insert into uploads (release, grp, groups, first, last, files, added)
                  values (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                  on conflict(release) do update set groups = excluded.groups, first = excluded.first,
-                     last = excluded.last, files = excluded.files, added = excluded.added, probed = 0",
+                     last = excluded.last, files = excluded.files, added = excluded.added, probed = 0, gen = gen + 1",
             )?;
             for (release, group, span, files) in widened {
                 let groups = span.groups.iter().map(i64::to_string).collect::<Vec<_>>().join(",");

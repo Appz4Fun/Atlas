@@ -53,17 +53,17 @@ pub(crate) fn tail_articles(ctx: &StepCtx<'_>, file: &FileInfo) -> Result<Vec<Se
 
 /// The articles to try as the first piece of an upload linked from its headers (`xref`), and their volumes: the parts
 /// that were the first a group got of each volume (`xref::leads`, else its first `xref::LEADS`), volume by volume, the
-/// `xref::HEAD_PROBES` after the ones tried before (`xref::tried`). Also how many were tried before, and whether any
-/// are left after these, when the upload is known.
+/// `xref::HEAD_PROBES` after the ones tried before (`xref::tried`). Also how many were tried before and of which
+/// generation, and whether any are left after these, when the upload is known.
 #[allow(clippy::type_complexity)]
 fn xref_heads<'a>(
     ctx: &StepCtx<'_>,
     files: &'a [FileInfo],
-) -> Result<(Vec<(Head<'a>, SegmentRef)>, Option<i64>, bool), StepError> {
+) -> Result<(Vec<(Head<'a>, SegmentRef)>, Option<(i64, i64)>, bool), StepError> {
     let volumes = select::volumes(files);
     let name = ctx.release().name.clone();
     let tried = crate::xref::tried(&name);
-    let (heads, left) = xref_order(&volumes, tried.unwrap_or(0).max(0) as usize, |f| {
+    let (heads, left) = xref_order(&volumes, tried.map_or(0, |(n, _)| n.max(0) as usize), |f| {
         let leads = crate::xref::file_of(&f.filename).map(|k| crate::xref::leads(&name, k)).unwrap_or_default();
         let pick = if leads.is_empty() { SegmentPick::First(crate::xref::LEADS) } else { SegmentPick::Parts(leads) };
         ctx.segments(f.id, &pick).map_err(retry)
@@ -1373,8 +1373,8 @@ impl Step for ListStep {
                 let is_start = got.as_deref().is_some_and(|b| {
                     matches!(identify(b), Format::Rar4 | Format::Rar5 | Format::Zip | Format::SevenZip)
                 });
-                if !is_start && let Some(before) = xref_tried {
-                    crate::xref::tried_through(&rel_name, before + k as i64 + 1);
+                if !is_start && let Some((before, generation)) = xref_tried {
+                    crate::xref::tried_through(&rel_name, generation, before + k as i64 + 1);
                 }
                 got
             } else if head.probe {
