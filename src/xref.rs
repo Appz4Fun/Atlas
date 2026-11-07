@@ -13,7 +13,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -481,14 +481,15 @@ impl Store {
             .optional()?)
     }
 
-    /// A poster's articles waiting, in the order their parts are numbered: the first each group got, group by group,
-    /// then each group's second, and on. A file's first piece is most often among the first (see `LEADS`).
+    /// A poster's articles waiting, in the order their parts are numbered: as they came, soo a pass saved again numbers
+    /// the same parts the same and what came since after them. Each is marked when it is the first its group got
+    /// (`Row::lead`), the likely first pieces (see `LEADS`).
     fn rows_of(&self, poster: &str) -> Result<Vec<Row>> {
         let mut stmt = self.conn.prepare_cached(
             "select message_id, posted, grp, number, bytes, lines,
                     row_number() over (partition by grp order by number, message_id) as rank
              from headers where poster = ?1 and done = 0
-             order by rank, grp",
+             order by added, grp, number, message_id",
         )?;
         let rows = stmt.query_map([poster], |r| {
             Ok(Row {
@@ -508,7 +509,7 @@ impl Store {
     /// in one, as that release. Their headers are marked done, and each file's place kept for what comes later.
     pub fn pass(&mut self, now: i64) -> Result<Vec<Release>> {
         let found = self.pass_with(now, &mut |_, _| false)?;
-        self.ack(found.ack)?;
+        self.ack(&found.ack)?;
         Ok(found.releases)
     }
 
@@ -643,7 +644,7 @@ impl Store {
 
     /// Note what `ack`'s pass took as done, once its releases are saved: until then the next pass finds them again.
     /// Articles that came for a file since aren't in it, soo they wait for the next.
-    pub fn ack(&mut self, ack: Ack) -> Result<()> {
+    pub fn ack(&mut self, ack: &Ack) -> Result<()> {
         let Ack { finished, widened, now } = ack;
         let tx = self.conn.transaction()?;
         {
@@ -653,7 +654,7 @@ impl Store {
                  values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                  on conflict(poster) do update set parts = excluded.parts, leads = excluded.leads, added = excluded.added",
             )?;
-            for (poster, place, ids) in &finished {
+            for (poster, place, ids) in finished {
                 for id in ids {
                     done.execute([id])?;
                 }
@@ -665,9 +666,9 @@ impl Store {
                 "insert into uploads (release, grp, groups, first, last, files, added)
                  values (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                  on conflict(release) do update set groups = excluded.groups, first = excluded.first,
-                     last = excluded.last, files = excluded.files, added = excluded.added",
+                     last = excluded.last, files = excluded.files, added = excluded.added, probed = 0",
             )?;
-            for (release, group, span, files) in &widened {
+            for (release, group, span, files) in widened {
                 let groups = span.groups.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
                 upload.execute(params![release, group, groups, span.first, span.last, files, now])?;
             }
@@ -798,6 +799,9 @@ fn unread_days(main: &Connection, days: &mut HashMap<i64, bool>, first: i64, las
 
 /// Every `PASS_EVERY`, drop the headers past the window, then save what has settled.
 pub async fn run(db: crate::indexer::Db, stopping: impl Fn() -> bool) {
+    // a pass whose releases or note didnt all go through: tried again as it was, before any new pass, soo a retry
+    // saves the same parts under the same numbers
+    let mut pending: Option<Arc<Found>> = None;
     while !stopping() {
         let mut slept = Duration::ZERO;
         while slept < PASS_EVERY && !stopping() {
@@ -807,38 +811,43 @@ pub async fn run(db: crate::indexer::Db, stopping: impl Fn() -> bool) {
         if stopping() {
             break;
         }
-        let found = tokio::task::spawn_blocking(|| {
-            let main = Connection::open_with_flags(
-                crate::paths::database(),
-                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-            )?;
-            main.busy_timeout(Duration::from_secs(30))?;
-            let mut days: HashMap<i64, bool> = HashMap::new();
-            let mut unread = |first: i64, last: i64| unread_days(&main, &mut days, first, last);
-            with_store(|s| {
-                let t = now();
-                s.prune(t)?;
-                s.pass_with(t, &mut unread)
-            })
-        })
-        .await;
-        let Found { releases, ack } = match found {
-            Ok(Ok(Some(found))) => found,
-            Ok(Ok(None)) => continue,
-            Ok(Err(e)) => {
-                eprintln!("xref: {e:#}");
-                continue;
-            }
-            Err(e) => {
-                eprintln!("xref: the pass failed: {e}");
-                continue;
+        let found = match pending.take() {
+            Some(found) => found,
+            None => {
+                let found = tokio::task::spawn_blocking(|| {
+                    let main = Connection::open_with_flags(
+                        crate::paths::database(),
+                        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+                    )?;
+                    main.busy_timeout(Duration::from_secs(30))?;
+                    let mut days: HashMap<i64, bool> = HashMap::new();
+                    let mut unread = |first: i64, last: i64| unread_days(&main, &mut days, first, last);
+                    with_store(|s| {
+                        let t = now();
+                        s.prune(t)?;
+                        s.pass_with(t, &mut unread)
+                    })
+                })
+                .await;
+                match found {
+                    Ok(Ok(Some(found))) => Arc::new(found),
+                    Ok(Ok(None)) => continue,
+                    Ok(Err(e)) => {
+                        eprintln!("xref: {e:#}");
+                        continue;
+                    }
+                    Err(e) => {
+                        eprintln!("xref: the pass failed: {e}");
+                        continue;
+                    }
+                }
             }
         };
-        let (count, articles) = (releases.len(), releases.iter().map(|r| r.articles.len()).sum::<usize>());
-        // a save goes to one shard's writer, soo each shard's releases go apart
+        let (count, articles) = (found.releases.len(), found.releases.iter().map(|r| r.articles.len()).sum::<usize>());
+        // a save goes to one shard's writer, soo each shard's releases go apart; saving one again changes nothing
         let mut by_shard: HashMap<usize, Vec<Release>> = HashMap::new();
-        for r in releases {
-            by_shard.entry(crate::store::shard_of(&r.group)).or_default().push(r);
+        for r in &found.releases {
+            by_shard.entry(crate::store::shard_of(&r.group)).or_default().push(r.clone());
         }
         let mut saved = true;
         for (_, releases) in by_shard {
@@ -847,15 +856,22 @@ pub async fn run(db: crate::indexer::Db, stopping: impl Fn() -> bool) {
                 saved = false;
             }
         }
-        // what wasnt saved is found again next pass; saving what was saved again changes nothing
         if !saved {
+            pending = Some(found);
             continue;
         }
-        match tokio::task::spawn_blocking(move || with_store(|s| s.ack(ack))).await {
+        let noting = found.clone();
+        match tokio::task::spawn_blocking(move || with_store(|s| s.ack(&noting.ack))).await {
             Ok(Ok(_)) if count > 0 => println!("xref: saved {count} uploads, {articles} articles"),
             Ok(Ok(_)) => {}
-            Ok(Err(e)) => eprintln!("xref: couldnt note what was saved: {e:#}"),
-            Err(e) => eprintln!("xref: noting what was saved failed: {e}"),
+            Ok(Err(e)) => {
+                eprintln!("xref: couldnt note what was saved: {e:#}");
+                pending = Some(found);
+            }
+            Err(e) => {
+                eprintln!("xref: noting what was saved failed: {e}");
+                pending = Some(found);
+            }
         }
     }
 }
@@ -1033,7 +1049,7 @@ mod tests {
         assert_eq!(found.releases.len(), 1, "not past a day");
         // not noted as saved: found again
         assert_eq!(store.pass_with(1002 + KEEP_SECS, &mut |_, _| true).unwrap().releases.len(), 1);
-        store.ack(found.ack).unwrap();
+        store.ack(&found.ack).unwrap();
         assert!(store.pass_with(1003 + KEEP_SECS, &mut |_, _| true).unwrap().releases.is_empty());
     }
 
@@ -1075,5 +1091,25 @@ mod tests {
         assert_eq!(file_of("xref-upload-1-2-00007"), Some(7));
         assert_eq!(with_leads("1,2", vec![9]), "1,2,9");
         assert_eq!(with_leads("", vec![1, 3]), "1,3");
+    }
+
+    #[test]
+    fn a_pass_found_again_numbers_its_parts_the_same() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&dir.path().join("atlas.xref.db")).unwrap();
+        for k in 0..12u64 {
+            let a = article(&format!("r{k:023}"), "file@x.y", "2023-12-03 16:23:23", 100 + k);
+            store.record("a.b.one", &[a], 1000).unwrap();
+        }
+        let parts = |found: &Found| -> HashMap<String, i64> {
+            found.releases.iter().flat_map(|r| &r.articles).map(|a| (a.message_id.clone(), a.part.unwrap())).collect()
+        };
+        let first = parts(&store.pass_with(1001 + SETTLE_SECS, &mut |_, _| false).unwrap());
+        // not noted: another group's article, numbered lower, comes before the next pass
+        let late = article(&format!("s{:023}", 0), "file@x.y", "2023-12-03 16:23:23", 1);
+        store.record("a.b.two", &[late.clone()], 1002 + SETTLE_SECS).unwrap();
+        let again = parts(&store.pass_with(1003 + 2 * SETTLE_SECS, &mut |_, _| false).unwrap());
+        assert!(first.iter().all(|(id, p)| again[id] == *p), "the same numbers");
+        assert_eq!(again[&late.message_id], 13, "what came since goes after");
     }
 }
