@@ -9,6 +9,7 @@
 //! spot's signatures.
 
 pub mod binary;
+pub mod blacklist;
 pub mod category;
 pub mod comments;
 pub mod full;

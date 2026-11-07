@@ -58,6 +58,7 @@ pub fn create_main(conn: &Connection) -> Result<()> {
             PRIMARY KEY (message_id, spotter)
         ) without rowid;",
     )?;
+    super::blacklist::create(conn)?;
     super::comments::create(conn)
 }
 
@@ -148,15 +149,17 @@ pub struct Disposal {
 /// How long after a spot its spotter's own removal of it holds, as in Spotweb: five days.
 pub const OWN_DISPOSAL_SECS: i64 = 5 * 86_400;
 
-/// SQL for whether a disposal removes the row `s` (with its spot's `message_id`, and its spotter id in column
-/// `spotter`), aliasing the disposal `d`. `created` is the column with when the spot was made, when the row has
-/// one: a spotter's own removal holds only `OWN_DISPOSAL_SECS` after it.
+/// SQL for whether the row `s` (with its spot's `message_id`, and its spotter id in column `spotter`) was removed:
+/// by a disposal, aliased `d`, or because its spotter is on the blacklist (`blacklist`). `created` is the column
+/// with when the spot was made, when the row has one: a spotter's own removal holds only `OWN_DISPOSAL_SECS` after
+/// it.
 pub(crate) fn disposed_sql(d: &str, s: &str, spotter: &str, created: Option<&str>) -> String {
     // 0: the spot's XML had no date, so not known, as NULL
     let made = created.map_or(format!("{d}.at"), |c| format!("coalesce(nullif({s}.{c}, 0), {d}.at)"));
     format!(
-        "exists (select 1 from main.spot_disposals {d} where {d}.message_id = {s}.message_id
-            and ({d}.spotter = '' or ({d}.spotter = {s}.{spotter} and {d}.at - {made} <= {OWN_DISPOSAL_SECS})))"
+        "(exists (select 1 from main.spot_disposals {d} where {d}.message_id = {s}.message_id
+            and ({d}.spotter = '' or ({d}.spotter = {s}.{spotter} and {d}.at - {made} <= {OWN_DISPOSAL_SECS})))
+          or exists (select 1 from main.spot_blacklist {d}_b where {d}_b.spotter = {s}.{spotter}))"
     )
 }
 
@@ -597,15 +600,25 @@ pub struct Detail {
     /// categories, size, when it was made)
     pub spot: FullSpot,
     pub xml: Xml,
-    /// when the spot was removed, and whether by a Spotnet moderator (else by its spotter)
+    /// when the spot was removed, and by whom
     pub removed: Option<Removed>,
 }
 
 /// A spot's removal, for its release page.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Removed {
+    /// when the removal was posted; 0 for the blacklist, which says no when
     pub at: i64,
-    pub by_moderator: bool,
+    pub by: RemovedBy,
+}
+
+/// Who took a spot back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RemovedBy {
+    Moderator,
+    Spotter,
+    /// its spotter is on the Spotnet blacklist
+    Blacklist,
 }
 
 /// Release `id`'s spot, from its shard, when it has one.
@@ -652,19 +665,29 @@ pub fn detail_of_with(conn: &Connection, id: i64) -> Result<Option<Detail>> {
 }
 
 /// The removal of spot `message_id`, posted by `spotter_id` and made at `created` (0: not known), when there is
-/// one that holds (`disposed_sql`): a moderator's first.
+/// one that holds (`disposed_sql`): a moderator's first, then the spotter's own, then the blacklist.
 fn removal(conn: &Connection, message_id: &str, spotter_id: Option<&str>, created: i64) -> Result<Option<Removed>> {
-    conn.query_row(
-        &format!(
-            "select at, spotter = '' from main.spot_disposals
+    let posted = conn
+        .query_row(
+            &format!(
+                "select at, spotter = '' from main.spot_disposals
              where message_id = ?1
                 and (spotter = '' or (spotter = ?2 and at - coalesce(nullif(?3, 0), at) <= {OWN_DISPOSAL_SECS}))
              order by spotter = '' desc, at limit 1"
-        ),
-        params![message_id, spotter_id, created],
-        |r| Ok(Removed { at: r.get(0)?, by_moderator: r.get(1)? }),
-    )
-    .optional()
+            ),
+            params![message_id, spotter_id, created],
+            |r| {
+                let by = if r.get(1)? { RemovedBy::Moderator } else { RemovedBy::Spotter };
+                Ok(Removed { at: r.get(0)?, by })
+            },
+        )
+        .optional()?;
+    if posted.is_some() {
+        return Ok(posted);
+    }
+    let listed =
+        conn.query_row("select 1 from main.spot_blacklist where spotter = ?", [spotter_id], |_| Ok(())).optional()?;
+    Ok(listed.map(|()| Removed { at: 0, by: RemovedBy::Blacklist }))
 }
 
 /// Spots of this shard saved before their XML was kept: (release id, spot message-id), at most `limit`, in no
@@ -1067,10 +1090,17 @@ mod tests {
         left.sort();
         assert_eq!(left, ["forged@spot.net", "kept@spot.net", "late@spot.net"], "removed past five days of the spot");
         let removed = |n: usize| detail_of_with(&conn, ids[n]).unwrap().unwrap().removed;
-        assert_eq!(removed(0), Some(Removed { at: 10, by_moderator: true }));
-        assert_eq!(removed(1), Some(Removed { at: 10, by_moderator: false }));
+        assert_eq!(removed(0), Some(Removed { at: 10, by: RemovedBy::Moderator }));
+        assert_eq!(removed(1), Some(Removed { at: 10, by: RemovedBy::Spotter }));
         assert_eq!(removed(2), None);
         assert_eq!(removed(4), None);
+
+        // a blacklisted spotter: their saved spot loses its tag, and their waiting one isn't fetched
+        conn.execute("insert into spot_blacklist (spotter) values ('ddd')", []).unwrap();
+        assert_eq!(removed(3), Some(Removed { at: 0, by: RemovedBy::Blacklist }));
+        assert!(!spots_of_with(&conn, &ids).unwrap().contains_key(&ids[3]));
+        assert_eq!(todo(&conn, 10).unwrap(), ["forged@spot.net"]);
+        conn.execute("delete from spot_blacklist", []).unwrap();
 
         // removals of nothing kept go after `KEEP_DAYS`; one of a saved spot or a spot still waiting stays
         let saved = Settled { state: SAVED, release_id: Some(ids[0]), ..Default::default() };
