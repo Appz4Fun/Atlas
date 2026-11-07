@@ -853,7 +853,8 @@ fn same_poster_post(conn: &Connection, rows: &[&Named]) -> Result<Option<SplitPo
     groups.sort_unstable();
     groups.dedup();
     let files = union_files(conn, &ids)?;
-    if !files.one_upload() {
+    // rows sharing parts join only as `across_posters` grows a post, row by row, each adding what the rest lack
+    if !files.one_upload() || files.overlap {
         return Ok(None);
     }
     Ok(Some(SplitPost { ids, groups, size, complete: files.complete(), lead: None, recovery: Vec::new() }))
@@ -1160,6 +1161,14 @@ struct UnionFile {
     subject: Option<String>,
 }
 
+/// Whether a file's subject (less its part number) ends with the file's size in bytes, as yEnc posters write it:
+/// `"Film.mkv" yEnc (/21040) 88246893816`. The name, the article count and the byte count then all say it's one file.
+fn subject_has_size(subject: &str) -> bool {
+    let Some(close) = subject.rfind(')') else { return false };
+    let tail = subject[close + 1..].trim();
+    !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit())
+}
+
 /// Each file across these releases, by name, and what says whether they're one upload.
 #[derive(Default)]
 struct UnionFiles {
@@ -1168,8 +1177,11 @@ struct UnionFiles {
     file_totals: BTreeSet<Option<i64>>,
     /// each release's filenames
     rows: Vec<BTreeSet<String>>,
-    /// two releases have a file they don't agree on, or a part of it both have
+    /// two releases have a file they don't agree on, or a part of it both have under a subject without the file's size
     conflict: bool,
+    /// two releases have a part of a file both agree on, its subject carrying the file's size: a post whose poster
+    /// sent each article to some of its groups, soo a part can be in more than one row
+    overlap: bool,
     /// whether any file carries a 0-indexed `[0/N]` or `[00/N]` counter
     zero_indexed: bool,
     /// each release's name
@@ -1177,8 +1189,9 @@ struct UnionFiles {
 }
 
 impl UnionFiles {
-    /// Whether the releases can be parts of one upload. Each article went to one group, soo no part is in two of them,
-    /// they say the same of every file they share, and each shares one with the rest.
+    /// Whether the releases can be parts of one upload. They say the same of every file they share, each shares one
+    /// with the rest, and no part is in two of them unless its subject names the file by its size (`overlap`: the poster
+    /// sent the article to more than one of the groups).
     fn one_upload(&self) -> bool {
         let mut totals = self.file_totals.iter();
         let total_fits = match (totals.next(), totals.next()) {
@@ -1191,7 +1204,7 @@ impl UnionFiles {
     }
 
     fn one_stem_upload(&self, stem: &str) -> bool {
-        if self.conflict || self.files.is_empty() || self.file_totals.contains(&None) {
+        if self.conflict || self.overlap || self.files.is_empty() || self.file_totals.contains(&None) {
             return false;
         }
         if !self.files.keys().all(|f| post_stem(f).eq_ignore_ascii_case(stem)) {
@@ -1217,8 +1230,10 @@ impl UnionFiles {
             })
     }
 
-    /// Whether `other` only adds what this lacks: every file both have is the same file under the same subject, no part
-    /// is in both, and they say the same of how many files the post has.
+    /// Whether `other` only adds what this lacks: every file both have is the same file under the same subject, and
+    /// they say the same of how many files the post has. No part is in both, except under a subject that carries the
+    /// file's size, from a row that isn't whole on its own, and where it still adds a part this lacks: a poster can
+    /// send each article to some of the post's groups, soo its rows share parts, but a whole upload is its own post.
     fn fills_gaps(&self, other: &UnionFiles) -> bool {
         if other.conflict || self.conflict {
             return false;
@@ -1227,16 +1242,26 @@ impl UnionFiles {
         if totals.next().is_some() && totals.next().is_some() {
             return false;
         }
-        other.files.iter().all(|(name, o)| match self.files.get(name) {
-            None => true,
-            Some(f) => {
-                f.expected.is_some()
-                    && f.expected == o.expected
-                    && f.subject.is_some()
-                    && f.subject == o.subject
-                    && f.seen.iter().zip(&o.seen).all(|(a, b)| a & b == 0)
+        let mut shared = false;
+        let mut adds = false;
+        let agrees = other.files.iter().all(|(name, o)| match self.files.get(name) {
+            None => {
+                adds = true;
+                true
             }
-        })
+            Some(f) => {
+                let same =
+                    f.expected.is_some() && f.expected == o.expected && f.subject.is_some() && f.subject == o.subject;
+                let both = f.seen.iter().zip(&o.seen).any(|(a, b)| a & b != 0);
+                adds |= o.seen.iter().enumerate().any(|(at, b)| b & !f.seen.get(at).copied().unwrap_or(0) != 0);
+                if both {
+                    shared = true;
+                    return same && f.subject.as_deref().is_some_and(subject_has_size);
+                }
+                same
+            }
+        });
+        agrees && (!shared || (adds && !other.complete_by_files()))
     }
 
     fn linked(&self) -> bool {
@@ -1354,13 +1379,23 @@ fn union_files(conn: &Connection, ids: &[i64]) -> Result<UnionFiles> {
                 }
                 Entry::Occupied(mut file) => {
                     let file = file.get_mut();
-                    union.conflict |=
+                    let disagree =
                         expected.is_none() || file.expected != expected || subject.is_none() || file.subject != subject;
+                    union.conflict |= disagree;
+                    // the same part of one file in two rows is the same article only where the subject names the
+                    // file by its size as well: without it, two files of a name can't be told apart
+                    let sized = !disagree && subject.as_deref().is_some_and(subject_has_size);
                     if file.seen.len() < seen.len() {
                         file.seen.resize(seen.len(), 0);
                     }
                     for (slot, bits) in file.seen.iter_mut().zip(seen) {
-                        union.conflict |= *slot & bits != 0;
+                        if *slot & bits != 0 {
+                            if sized {
+                                union.overlap = true;
+                            } else {
+                                union.conflict = true;
+                            }
+                        }
                         *slot |= bits;
                     }
                 }
@@ -2433,6 +2468,22 @@ mod tests {
         posted: &str,
         total: i64,
     ) {
+        put_row_subjects(conn, id, name, group, poster, files, posted, total, false);
+    }
+
+    /// `put_row_counted`, each subject ending with its file's size in bytes when `sized`, as yEnc posters write it.
+    #[allow(clippy::too_many_arguments)]
+    fn put_row_subjects(
+        conn: &Connection,
+        id: i64,
+        name: &str,
+        group: &str,
+        poster: &str,
+        files: &[(&str, &[i64], i64)],
+        posted: &str,
+        total: i64,
+        sized: bool,
+    ) {
         let s = store::shard_of(group);
         let id = store::global_id(id, s);
         conn.execute(
@@ -2468,9 +2519,10 @@ mod tests {
                     file,
                     // the post's counter: the film first, its volumes second, whichever row has them
                     format!(
-                        "[{}/{total}] - \"{file}\" yEnc ({}/{of})",
+                        "[{}/{total}] - \"{file}\" yEnc ({}/{of}){}",
                         if file.ends_with(".mkv") { 1 } else { 2 },
-                        parts[0]
+                        parts[0],
+                        if sized { format!(" {}", of * 716_800) } else { String::new() }
                     ),
                     of,
                     bits,
@@ -2763,6 +2815,99 @@ mod tests {
         );
         let post = whole_post_with(&conn, &row_of(&conn, 2, b)).unwrap().unwrap();
         assert_eq!(post.ids.len(), 4);
+    }
+
+    #[test]
+    fn a_post_whose_articles_went_to_several_of_its_groups_is_one_post() {
+        let (_dir, conn) = all_shards();
+        let name = "Some.Film.2026.2160p.UHD.Blu-ray.Remux.HDR.HEVC.DTS-HD.MA.5.1-GRP";
+        let (mkv, vol) = ("Some.Film.mkv", "Some.Film.vol00+01.par2");
+        let (a, b, c, d) = ("alt.binaries.a", "alt.binaries.b", "alt.binaries.c", "alt.binaries.d");
+        let at = "2026-11-07 05:16:17";
+        // most articles went to two of the four groups: the rows share parts, none is whole, and each has one of its own
+        // row, group, poster, the film's parts, the volume's parts
+        type Row<'a> = (i64, &'a str, &'a str, &'a [i64], &'a [i64]);
+        let rows: [Row; 4] = [
+            (1, a, "x1@nyuu", &[1, 2, 5], &[1]),
+            (2, b, "x2@nyuu", &[2, 3, 6], &[2]),
+            (3, c, "x3@nyuu", &[3, 4, 7], &[1]),
+            (4, d, "x1@nyuu", &[4, 1, 8], &[2]),
+        ];
+        for (i, g, poster, film, volume) in rows {
+            put_row_subjects(&conn, i, name, g, poster, &[(mkv, film, 8), (vol, volume, 2)], at, 2, true);
+        }
+        for (i, g, ..) in rows {
+            let row = row_of(&conn, i, g);
+            let post = whole_post_with(&conn, &row).unwrap().unwrap_or_else(|| panic!("row {i}"));
+            assert_eq!(post.ids.len(), 4, "row {i}");
+            assert!(post.complete, "row {i}");
+            assert!(!single_post_complete(&conn, row.id).unwrap(), "row {i} alone isn't whole");
+        }
+    }
+
+    #[test]
+    fn rows_sharing_parts_without_the_files_size_stay_apart() {
+        let (_dir, conn) = all_shards();
+        let name = "Some.Film.2026.2160p.UHD.Blu-ray.Remux.HDR.HEVC.DTS-HD.MA.5.1-GRP";
+        let mkv = "Some.Film.mkv";
+        let (a, b) = ("alt.binaries.a", "alt.binaries.b");
+        let at = "2026-11-07 05:16:17";
+        // the same rows as a post whose articles went to two groups, but the subjects don't say how big the file is
+        put_row_subjects(&conn, 1, name, a, "x1@nyuu", &[(mkv, &[1, 2, 3], 4)], at, 1, false);
+        put_row_subjects(&conn, 2, name, b, "x2@nyuu", &[(mkv, &[3, 4], 4)], at, 1, false);
+        assert_eq!(whole_post_with(&conn, &row_of(&conn, 1, a)).unwrap(), None);
+        assert_eq!(whole_post_with(&conn, &row_of(&conn, 2, b)).unwrap(), None);
+    }
+
+    #[test]
+    fn a_whole_upload_sharing_parts_with_a_row_stays_its_own_post() {
+        let (_dir, conn) = all_shards();
+        let name = "Some.Film.2026.2160p.UHD.Blu-ray.Remux.HDR.HEVC.DTS-HD.MA.5.1-GRP";
+        let mkv = "Some.Film.mkv";
+        let (a, b, c) = ("alt.binaries.a", "alt.binaries.b", "alt.binaries.c");
+        let at = "2026-11-07 05:16:17";
+        // a whole upload of the same file, and a row that has parts of it, either one first
+        put_row_subjects(&conn, 1, name, a, "x1@nyuu", &[(mkv, &[1, 3], 4)], at, 1, true);
+        put_row_subjects(&conn, 2, name, b, "whole@else", &[(mkv, &[1, 2, 3, 4], 4)], at, 1, true);
+        put_row_subjects(&conn, 3, name, c, "x3@nyuu", &[(mkv, &[2, 3], 4)], at, 1, true);
+        assert_eq!(whole_post_with(&conn, &row_of(&conn, 2, b)).unwrap(), None, "the whole upload is alone");
+        for (i, g) in [(1, a), (3, c)] {
+            let post = whole_post_with(&conn, &row_of(&conn, i, g)).unwrap().unwrap_or_else(|| panic!("row {i}"));
+            assert_eq!(post.ids.len(), 2, "row {i}: the two pieces, without the whole upload");
+            assert!(!post.complete, "row {i}: part 4 is only in the whole upload");
+        }
+    }
+
+    #[test]
+    fn rows_sharing_parts_get_one_answer_whichever_asks() {
+        let (_dir, conn) = all_shards();
+        let name = "Some.Film.2026.2160p.UHD.Blu-ray.Remux.HDR.HEVC.DTS-HD.MA.5.1-GRP";
+        let mkv = "Some.Film.mkv";
+        let (a, b, c) = ("alt.binaries.a", "alt.binaries.b", "alt.binaries.c");
+        let at = "2026-11-07 05:16:17";
+        put_row_subjects(&conn, 1, name, a, "x1@nyuu", &[(mkv, &[1, 2], 4)], at, 1, true);
+        put_row_subjects(&conn, 2, name, b, "x2@nyuu", &[(mkv, &[3, 4], 4)], at, 1, true);
+        // parts the other two have between them: it joins only if it's looked at before the post is whole
+        put_row_subjects(&conn, 3, name, c, "x3@nyuu", &[(mkv, &[2, 3], 4)], at, 1, true);
+        let rows = [row_of(&conn, 1, a), row_of(&conn, 2, b), row_of(&conn, 3, c)];
+        let answers: Vec<Option<SplitPost>> = rows.iter().map(|r| whole_post_with(&conn, r).unwrap()).collect();
+        let post = answers.iter().flatten().next().expect("a post").clone();
+        assert!(post.complete);
+        assert!(post.ids.contains(&rows[0].id) && post.ids.contains(&rows[1].id));
+        for (row, answer) in rows.iter().zip(&answers) {
+            match answer {
+                Some(p) => assert_eq!(p.ids, post.ids, "row {}", row.id),
+                None => assert!(!post.ids.contains(&row.id), "row {} is in the post but got no answer", row.id),
+            }
+        }
+    }
+
+    #[test]
+    fn a_subject_has_the_files_size_only_as_its_last_number() {
+        assert!(subject_has_size(r#"[10/11] - "Film.mkv" yEnc (/21040) 88246893816"#));
+        assert!(!subject_has_size(r#"[10/11] - "Film.mkv" yEnc (/21040)"#));
+        assert!(!subject_has_size(r#"[10/11] - "Film.mkv" yEnc (/21040) 88 MB"#));
+        assert!(!subject_has_size("Film.mkv 88246893816"));
     }
 
     #[test]
