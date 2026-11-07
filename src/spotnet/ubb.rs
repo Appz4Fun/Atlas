@@ -14,6 +14,9 @@ use crate::web::attr;
 /// What a link carries: no referrer, no SEO credit, no window handle.
 pub(crate) const REL: &str = "noopener noreferrer nofollow";
 
+/// Formatting tags open at once at most.
+const MAX_OPEN: usize = 16;
+
 /// A UBB tag: `/` when it closes, its name, and its value (`[url=..]`).
 static TAG: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\[(/?)(b|i|u|br|url|quote|youtube|img)(?:=([^\]\r\n]{0,2048}))?\]").unwrap());
@@ -47,6 +50,8 @@ pub fn to_html(text: &str) -> String {
             at += usize::from(text[at..].starts_with('\n'));
         }
         match (name.as_str(), closing) {
+            // no deeper than `MAX_OPEN`: past it an opener is dropped, so closing stays cheap however many are posted
+            ("b" | "i" | "u" | "quote", false) if open.len() >= MAX_OPEN => {}
             ("b" | "i" | "u" | "quote", false) => {
                 let tag = element(&name);
                 let _ = write!(out, "<{tag}>");
@@ -327,6 +332,10 @@ mod tests {
         // closed in order, an unmatched closer dropped, an unclosed one closed at the end
         assert_eq!(to_html("[b][i]x[/b] y[/i]"), "<b><i>x</i></b> y");
         assert_eq!(to_html("[b]open"), "<b>open</b>");
+        // nested past `MAX_OPEN`: the extra openers are dropped, the output stays balanced
+        let deep = to_html(&"[b]".repeat(1_000));
+        assert_eq!(deep.matches("<b>").count(), MAX_OPEN);
+        assert_eq!(deep.matches("</b>").count(), MAX_OPEN);
         assert_eq!(to_html("[quote]Said [b]this[/b][/quote] ok"), "<blockquote>Said <b>this</b></blockquote> ok");
         assert_eq!(to_html("a[br]b"), "a\nb");
         // a value only where a tag takes one; a quote's author shown; the line breaks around a quote's tags dropped
