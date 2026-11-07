@@ -29,6 +29,10 @@ pub struct FullSpot {
     pub nzb: Vec<String>,
     /// the articles of the cover image, in order
     pub image: Vec<String>,
+    /// the cover image's width and height, as the spot gives them
+    pub image_size: Option<(u32, u32)>,
+    /// the client the spot was posted with (`<Extra><Newsreader>`)
+    pub newsreader: String,
 }
 
 impl FullSpot {
@@ -111,12 +115,25 @@ pub fn parse(xml: &str) -> Option<FullSpot> {
         title,
         poster: text(posting, "Poster"),
         tag: text(posting, "Tag"),
-        description: text(posting, "Description").replace("[br]", "\n"),
+        description: prose(posting, "Description").replace("[br]", "\n"),
         website: text(posting, "Website"),
         size: text(posting, "Size").trim().parse().unwrap_or(0),
         nzb: segments(element(posting, "NZB")),
         image: segments(element(posting, "Image")),
+        image_size: image_size(posting),
+        newsreader: element(&xml, "Extra").map(|extra| prose(extra, "Newsreader")).unwrap_or_default(),
     })
+}
+
+/// The `Width` and `Height` of the spot's `<Image>`, when both are numbers above zero.
+fn image_size(posting: &str) -> Option<(u32, u32)> {
+    static TAG: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)<Image\b([^>]*)>").unwrap());
+    static WIDTH: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"(?i)\bWidth\s*=\s*["']?(\d{1,6})"#).unwrap());
+    static HEIGHT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"(?i)\bHeight\s*=\s*["']?(\d{1,6})"#).unwrap());
+    let attrs = TAG.captures(posting)?.get(1)?.as_str();
+    let w: u32 = WIDTH.captures(attrs)?[1].parse().ok()?;
+    let h: u32 = HEIGHT.captures(attrs)?[1].parse().ok()?;
+    (w > 0 && h > 0).then_some((w, h))
 }
 
 /// The inside of the first `<name>` (or `<name attr=..>`) element, up to its first closing tag.
@@ -141,7 +158,12 @@ fn element<'a>(xml: &'a str, name: &str) -> Option<&'a str> {
 
 /// An element's text, CDATA unwrapped and entities decoded, trimmed; empty when it isn't there.
 fn text(xml: &str, name: &str) -> String {
-    element(xml, name).map(unescape).unwrap_or_default().trim().to_string()
+    element(xml, name).map(|raw| unescape(raw, false)).unwrap_or_default().trim().to_string()
+}
+
+/// `text` for prose only shown, never made a name of (the description): HTML's named entities decoded too.
+fn prose(xml: &str, name: &str) -> String {
+    element(xml, name).map(|raw| unescape(raw, true)).unwrap_or_default().trim().to_string()
 }
 
 /// The text before an element's first child: `<Category>01<Sub>...` is `01`.
@@ -149,14 +171,20 @@ fn leading_text(inside: &str) -> &str {
     inside.split('<').next().unwrap_or_default()
 }
 
-fn unescape(raw: &str) -> String {
+fn unescape(raw: &str, all_named: bool) -> String {
     let raw = raw.trim();
     let raw = raw.strip_prefix("<![CDATA[").and_then(|r| r.strip_suffix("]]>")).unwrap_or(raw);
-    decode_entities(raw)
+    decode(raw, all_named)
 }
 
 /// `&amp;`, `&#39;`, `&#x27;` and the few named HTML entities spot titles use; anything else stays as written.
+/// Titles become release names, so this stays narrow: an `&shy;` decoded would hide inside a name.
 pub fn decode_entities(s: &str) -> String {
+    decode(s, false)
+}
+
+/// `decode_entities`, and with `all_named` the named HTML entities a description uses too (`named`).
+fn decode(s: &str, all_named: bool) -> String {
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
     while let Some(at) = rest.find('&') {
@@ -176,12 +204,13 @@ pub fn decode_entities(s: &str) -> String {
             "quot" => Some('"'),
             "apos" => Some('\''),
             "nbsp" => Some(' '),
-            _ => name
-                .strip_prefix("#x")
-                .or_else(|| name.strip_prefix("#X"))
-                .and_then(|h| u32::from_str_radix(h, 16).ok())
-                .or_else(|| name.strip_prefix('#').and_then(|d| d.parse().ok()))
-                .and_then(char::from_u32),
+            _ => named(name).filter(|_| all_named).or_else(|| {
+                name.strip_prefix("#x")
+                    .or_else(|| name.strip_prefix("#X"))
+                    .and_then(|h| u32::from_str_radix(h, 16).ok())
+                    .or_else(|| name.strip_prefix('#').and_then(|d| d.parse().ok()))
+                    .and_then(char::from_u32)
+            }),
         };
         match decoded {
             Some(c) => {
@@ -198,6 +227,37 @@ pub fn decode_entities(s: &str) -> String {
     out
 }
 
+/// The named HTML entities spot texts use beyond the XML five: Latin-1's (`&euml;` in a Dutch description, from
+/// `&nbsp;` U+00A0 to `&yuml;` U+00FF, in order) and a few common typographic ones.
+fn named(name: &str) -> Option<char> {
+    const LATIN1: [&str; 96] = [
+        "nbsp", "iexcl", "cent", "pound", "curren", "yen", "brvbar", "sect", "uml", "copy", "ordf", "laquo", "not",
+        "shy", "reg", "macr", "deg", "plusmn", "sup2", "sup3", "acute", "micro", "para", "middot", "cedil", "sup1",
+        "ordm", "raquo", "frac14", "frac12", "frac34", "iquest", "Agrave", "Aacute", "Acirc", "Atilde", "Auml",
+        "Aring", "AElig", "Ccedil", "Egrave", "Eacute", "Ecirc", "Euml", "Igrave", "Iacute", "Icirc", "Iuml", "ETH",
+        "Ntilde", "Ograve", "Oacute", "Ocirc", "Otilde", "Ouml", "times", "Oslash", "Ugrave", "Uacute", "Ucirc",
+        "Uuml", "Yacute", "THORN", "szlig", "agrave", "aacute", "acirc", "atilde", "auml", "aring", "aelig", "ccedil",
+        "egrave", "eacute", "ecirc", "euml", "igrave", "iacute", "icirc", "iuml", "eth", "ntilde", "ograve", "oacute",
+        "ocirc", "otilde", "ouml", "divide", "oslash", "ugrave", "uacute", "ucirc", "uuml", "yacute", "thorn", "yuml",
+    ];
+    if let Some(at) = LATIN1.iter().position(|n| *n == name) {
+        return char::from_u32(0xA0 + at as u32);
+    }
+    Some(match name {
+        "euro" => '€',
+        "hellip" => '…',
+        "ndash" => '–',
+        "mdash" => '—',
+        "lsquo" => '‘',
+        "rsquo" => '’',
+        "ldquo" => '“',
+        "rdquo" => '”',
+        "bull" => '•',
+        "trade" => '™',
+        _ => return None,
+    })
+}
+
 /// The `<Segment>` message-ids inside an element, in order. One invalid id voids the list, as in Spotweb: a list
 /// with a hole can't be put back together.
 fn segments(inside: Option<&str>) -> Vec<String> {
@@ -205,7 +265,7 @@ fn segments(inside: Option<&str>) -> Vec<String> {
     let Some(inside) = inside else { return Vec::new() };
     let mut out = Vec::new();
     for c in SEGMENT.captures_iter(inside) {
-        let id = unescape(&c[1]);
+        let id = unescape(&c[1], false);
         if !valid_message_id(&id) {
             return Vec::new();
         }
@@ -236,6 +296,8 @@ mod tests {
         assert_eq!(s.size, 77_594_442_517);
         assert_eq!(s.nzb, ["YBUZv8CCBsIFzvJYg7Xea@spot.net", "LgnjXJp8ZP0GTvJYghyt3@spot.net"]);
         assert_eq!(s.image, ["6TqeS1oEOnoFjvJYgYjY6@spot.net"]);
+        assert_eq!(s.image_size, Some((477, 643)));
+        assert_eq!(s.newsreader, "Spotnet 1.9.0.8");
         assert_eq!(s.imdb_id().as_deref(), Some("tt0072285"));
     }
 
@@ -248,6 +310,9 @@ mod tests {
         assert_eq!(s.category, 0);
         assert_eq!(s.kind(), Some(Kind::Series));
         assert_eq!(s.nzb, ["abc@spot.net"]);
+        // no image, no Extra
+        assert_eq!(s.image_size, None);
+        assert_eq!(s.newsreader, "");
     }
 
     #[test]
@@ -275,6 +340,12 @@ mod tests {
     #[test]
     fn entities() {
         assert_eq!(decode_entities("a &amp; b &#39;c&#x27; &bogus; & d"), "a & b 'c' &bogus; & d");
+        // titles keep the rest as written; descriptions decode them
+        assert_eq!(decode_entities("Movie&shy;Name &eacute;"), "Movie&shy;Name &eacute;");
+        assert_eq!(
+            decode("economie&euml;n &eacute;&Eacute; &yuml;&copy; &euro;5 &hellip;", true),
+            "economieën éÉ ÿ© €5 …"
+        );
         // a bare & before multibyte text, where the look-ahead ends inside a character
         assert_eq!(decode_entities("&amp; caf\u{e9}\u{e9}\u{e9}\u{e9}"), "& caf\u{e9}\u{e9}\u{e9}\u{e9}");
         assert_eq!(decode_entities("& \u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}"), "& \u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}");
