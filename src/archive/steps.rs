@@ -52,44 +52,50 @@ pub(crate) fn tail_articles(ctx: &StepCtx<'_>, file: &FileInfo) -> Result<Vec<Se
 }
 
 /// The articles to try as the first piece of an upload linked from its headers (`xref`), and their volumes: the parts
-/// that were the first a group got of each volume (`xref::leads`, else its first `xref::LEADS`), volume by volume,
-/// `xref::HEAD_PROBES` in all, and when to look again for the next volumes if none of these is one. Each run takes the
-/// next round of volumes (`xref::take_round`) until every volume has had its turn.
+/// that were the first a group got of each volume (`xref::leads`, else its first `xref::LEADS`), volume by volume, the
+/// `xref::HEAD_PROBES` after the rounds tried before (`xref::probe_round`). Also the round, to note once tried
+/// (`xref::probed`), and when to look again if none of these is one and guesses are left.
+#[allow(clippy::type_complexity)]
 fn xref_heads<'a>(
     ctx: &StepCtx<'_>,
     files: &'a [FileInfo],
-) -> Result<(Vec<(Head<'a>, SegmentRef)>, Option<i64>), StepError> {
+) -> Result<(Vec<(Head<'a>, SegmentRef)>, Option<i64>, Option<i64>), StepError> {
     let volumes = select::volumes(files);
     let name = ctx.release().name.clone();
-    let (start, more) = crate::xref::take_round(&name, volumes.len());
-    let heads = xref_order(&volumes, start, |f| {
+    let round = crate::xref::probe_round(&name);
+    let skip = round.unwrap_or(0).max(0) as usize * crate::xref::HEAD_PROBES;
+    let (heads, left) = xref_order(&volumes, skip, |f| {
         let leads = crate::xref::file_of(&f.filename).map(|k| crate::xref::leads(&name, k)).unwrap_or_default();
         let pick = if leads.is_empty() { SegmentPick::First(crate::xref::LEADS) } else { SegmentPick::Parts(leads) };
         ctx.segments(f.id, &pick).map_err(retry)
-    })?
-    .into_iter()
-    .map(|(f, seg)| (Head { file: f, tail: f, probe: true }, seg))
-    .collect();
-    Ok((heads, more.then(|| chrono::Utc::now().timestamp() + 3600)))
+    })?;
+    let heads = heads.into_iter().map(|(f, seg)| (Head { file: f, tail: f, probe: true }, seg)).collect();
+    let again = (round.is_some() && left).then(|| chrono::Utc::now().timestamp() + 3600);
+    Ok((heads, round, again))
 }
 
-/// `volumes` from the one at `start` (wrapping), each with what `leads` gives of it, `xref::HEAD_PROBES` in all.
+/// Of `volumes`, each with what `leads` gives of it in turn, the `xref::HEAD_PROBES` after the first `skip`, and
+/// whether any are left after those.
 pub(super) fn xref_order<'a, E>(
     volumes: &[&'a FileInfo],
-    start: usize,
+    skip: usize,
     mut leads: impl FnMut(&FileInfo) -> Result<Vec<SegmentRef>, E>,
-) -> Result<Vec<(&'a FileInfo, SegmentRef)>, E> {
+) -> Result<(Vec<(&'a FileInfo, SegmentRef)>, bool), E> {
     let mut out = Vec::new();
-    for k in 0..volumes.len() {
-        let f = volumes[(start + k) % volumes.len()];
+    let mut seen = 0;
+    for &f in volumes {
         for seg in leads(f)? {
+            seen += 1;
+            if seen <= skip {
+                continue;
+            }
             if out.len() >= crate::xref::HEAD_PROBES {
-                return Ok(out);
+                return Ok((out, true));
             }
             out.push((f, seg));
         }
     }
-    Ok(out)
+    Ok((out, false))
 }
 
 /// One whole article, within every budget. None: skip this candidate.
@@ -1323,9 +1329,11 @@ impl Step for ListStep {
         let xref = crate::xref::is_upload(&rel_name);
         // with no first piece among this run's guesses, when the next run tries the next volumes
         let mut xref_again = None;
+        let mut xref_round = None;
         let heads: Vec<(Head<'_>, Option<SegmentRef>)> = if xref {
             left = left.max(crate::xref::HEAD_PROBES);
-            let (heads, again) = xref_heads(ctx, &files)?;
+            let (heads, round, again) = xref_heads(ctx, &files)?;
+            xref_round = round;
             xref_again = again;
             heads.into_iter().map(|(h, s)| (h, Some(s))).collect()
         } else {
@@ -1552,6 +1560,10 @@ impl Step for ListStep {
                 }
                 return Ok(outcome);
             }
+        }
+        // this round's guesses were all tried: the next run goes on from them
+        if let Some(round) = xref_round {
+            crate::xref::probed(&rel_name, round);
         }
         Ok(Outcome { wait_until: xref_again, ..Default::default() })
     }

@@ -75,7 +75,7 @@ create index if not exists linked_added on linked(added);
 create index if not exists linked_release on linked(release, file);
 -- each upload saved: its release, the groups its articles have been read in so far, when its files were posted, and
 -- how many it has, soo files read later in other groups join it; `probed` how many rounds of first-piece guesses the
--- archive step has taken (`take_round`)
+-- archive step has tried (`probe_round`)
 create table if not exists uploads (
     release TEXT PRIMARY KEY,
     probed  INTEGER NOT NULL DEFAULT 0,
@@ -231,34 +231,32 @@ fn upload_name(poster: &str) -> String {
     format!("{NAME_PREFIX}{}-{}", hash >> 32, hash & 0xffff_ffff)
 }
 
-/// The round of first-piece guesses the archive step takes now for the upload `release` of `volumes` volumes: where its
-/// guesses start, and whether volumes are left for another round. Each call is a round (`uploads.probed`), soo every
-/// volume has its turn however late or often the step runs. Not known (pruned, or in tests): the first volumes, once.
-pub fn take_round(release: &str, volumes: usize) -> (usize, bool) {
-    if cfg!(test) {
-        return round_window(0, volumes);
-    }
-    let round = Connection::open(path_for(&crate::paths::database())).ok().and_then(|conn| {
-        conn.busy_timeout(Duration::from_secs(30)).ok()?;
-        conn.query_row(
-            "update uploads set probed = probed + 1 where release = ?1 returning probed - 1",
-            [release],
-            |r| r.get::<_, i64>(0),
-        )
-        .optional()
-        .ok()?
-    });
-    match round {
-        Some(round) => round_window(round.max(0) as usize, volumes),
-        None => (round_window(0, volumes).0, false),
-    }
+fn open_rw() -> Option<Connection> {
+    let conn = Connection::open(path_for(&crate::paths::database())).ok()?;
+    conn.busy_timeout(Duration::from_secs(30)).ok()?;
+    Some(conn)
 }
 
-/// Where round `round` of an upload's first-piece guesses starts among its `volumes`, `HEAD_PROBES / LEADS` volumes a
-/// round, and whether volumes are left after it.
-pub fn round_window(round: usize, volumes: usize) -> (usize, bool) {
-    let per_round = (HEAD_PROBES / LEADS).max(1);
-    (round * per_round, (round + 1) * per_round < volumes)
+/// How many rounds of first-piece guesses the archive step has finished for the upload `release`
+/// (`uploads.probed`), each `HEAD_PROBES` guesses on from the last. None when not known (pruned, or in tests): the
+/// first round, once.
+pub fn probe_round(release: &str) -> Option<i64> {
+    if cfg!(test) {
+        return None;
+    }
+    open_rw()?.query_row("select probed from uploads where release = ?1", [release], |r| r.get(0)).optional().ok()?
+}
+
+/// Round `round` of the upload `release` was tried through: the next run takes the guesses after it. Noted only once a
+/// round has been tried, soo a run cut short tries the same round again.
+pub fn probed(release: &str, round: i64) {
+    if cfg!(test) {
+        return;
+    }
+    if let Some(conn) = open_rw() {
+        let _ = conn
+            .execute("update uploads set probed = ?2 + 1 where release = ?1 and probed = ?2", params![release, round]);
+    }
 }
 
 /// The parts of file `file` of the upload `release` that were the first a group got of it, in the order they were
@@ -375,8 +373,14 @@ impl Store {
         Ok(id)
     }
 
-    fn group_name(&self, id: i64) -> String {
-        self.groups.iter().find(|(_, v)| **v == id).map(|(k, _)| k.clone()).unwrap_or_default()
+    /// The name of group `id`, from the database when another connection (the recorder) added it since.
+    fn group_name(&mut self, id: i64) -> Result<String> {
+        if let Some((name, _)) = self.groups.iter().find(|(_, v)| **v == id) {
+            return Ok(name.clone());
+        }
+        let name: String = self.conn.query_row("select name from groups where id = ?1", [id], |r| r.get(0))?;
+        self.groups.insert(name.clone(), id);
+        Ok(name)
     }
 
     /// Keep the headers of `articles` of `group`, unless another server's listing brought them already.
@@ -537,6 +541,14 @@ impl Store {
                 let rows = self.rows_of(&f.poster)?;
                 let parts = place.parts + rows.len() as i64;
                 let ids = rows.iter().map(|r| r.message_id.clone()).collect();
+                // a group that led the file before has no new first piece to offer
+                let led: BTreeSet<i64> = {
+                    let mut stmt =
+                        self.conn.prepare_cached("select distinct grp from headers where poster = ?1 and done = 1")?;
+                    stmt.query_map([&f.poster], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?
+                };
+                let rows: Vec<Row> =
+                    rows.into_iter().map(|r| Row { lead: r.lead && !led.contains(&r.grp), ..r }).collect();
                 let leads = with_leads(&place.leads, self.add_file(&mut out, &place, &f.poster, rows, parts));
                 finished.push((f.poster, Some(Place { parts, leads, ..place }), ids));
             }
@@ -582,7 +594,7 @@ impl Store {
                 None => {
                     // the release lives in the group most of its articles were posted to
                     let home = by_group.iter().max_by_key(|&(g, n)| (*n, std::cmp::Reverse(*g))).map_or(0, |(g, _)| *g);
-                    (upload_name(&fresh[files[0]].poster), self.group_name(home), 0)
+                    (upload_name(&fresh[files[0]].poster), self.group_name(home)?, 0)
                 }
             };
             let count = before + files.len() as i64;
@@ -605,9 +617,6 @@ impl Store {
         // the groups late articles were read in widen their upload too
         for (poster, place, _) in &finished {
             let Some(place) = place else { continue };
-            if widened.iter().any(|(r, _, _, _)| *r == place.release) {
-                continue;
-            }
             if let Some(u) = saved.iter().find(|u| u.release == place.release) {
                 let mut seed = u.seed.clone();
                 let mut stmt = self.conn.prepare_cached("select distinct grp from headers where poster = ?1")?;
@@ -757,21 +766,21 @@ pub fn keeps(article: &Article) -> bool {
 }
 
 /// A slice's articles of `group` without the ones obfuscated per article, whose headers go to the store. They're
-/// counted as unparsable still (`atlas_articles_unparsable_total`), as no subject rule reads them.
-pub fn hold(group: &str, articles: Vec<Article>) -> Vec<Article> {
+/// counted as unparsable still (`atlas_articles_unparsable_total`), as no subject rule reads them. An error when the
+/// headers couldnt be kept: the slice must not count as read.
+pub fn hold(group: &str, articles: Vec<Article>) -> Result<Vec<Article>> {
     let (held, kept): (Vec<Article>, Vec<Article>) = articles.into_iter().partition(keeps);
     if held.is_empty() {
-        return kept;
+        return Ok(kept);
     }
+    in_store(&RECORDER, |s| s.record(group, &held, now()))
+        .map_err(|e| e.context(format!("xref: keeping {} headers of {group}", held.len())))?;
     let mut unparsable = Unparsable::default();
     for a in &held {
         unparsable.note(a);
     }
     crate::collections::count_unparsable(group, &unparsable);
-    if let Err(e) = in_store(&RECORDER, |s| s.record(group, &held, now())) {
-        eprintln!("xref: couldnt keep {} headers of {group}: {e:#}", held.len());
-    }
-    kept
+    Ok(kept)
 }
 
 /// Whether a group still has to read (back) any day from a day before `first` to a day after `last`, the poster's wall
@@ -1062,13 +1071,7 @@ mod tests {
     }
 
     #[test]
-    fn each_round_the_first_piece_guesses_take_the_next_volumes() {
-        let per = HEAD_PROBES / LEADS;
-        assert_eq!(round_window(0, 40), (0, true));
-        assert_eq!(round_window(1, 40), (per, true));
-        let last = 40usize.div_ceil(per) - 1;
-        assert_eq!(round_window(last, 40), (last * per, false), "every volume has had a turn");
-        assert_eq!(round_window(0, 3), (0, false), "one round does them all");
+    fn leads_lists_join_on() {
         assert_eq!(file_of("xref-upload-1-2-00007"), Some(7));
         assert_eq!(with_leads("1,2", vec![9]), "1,2,9");
         assert_eq!(with_leads("", vec![1, 3]), "1,3");

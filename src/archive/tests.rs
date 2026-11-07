@@ -682,28 +682,34 @@ mod select_tests {
     }
 
     #[test]
-    fn an_xref_uploads_guesses_go_volume_by_volume_from_the_rounds_one() {
-        let f = [file("v1", 293), file("v2", 293), file("v3", 293)];
-        let vols: Vec<&FileInfo> = f.iter().collect();
+    fn an_xref_uploads_guesses_go_volume_by_volume_round_by_round() {
         let seg = |name: &str, part: i64| crate::store::SegmentRef {
             message_id: format!("{name}-{part}"),
             part: Some(part),
             bytes: 1,
         };
-        let got = super::super::steps::xref_order(&vols, 4, |v| {
-            Ok::<_, ()>((1..=crate::xref::LEADS as i64).map(|p| seg(&v.filename, p)).collect())
-        })
-        .unwrap();
-        assert_eq!(got.len(), (3 * crate::xref::LEADS).min(crate::xref::HEAD_PROBES));
-        assert_eq!(got[0].1.message_id, "v2-1", "4 wraps to the second volume");
-        assert_eq!(got[crate::xref::LEADS].1.message_id, "v3-1");
+        // volumes with different counts of leads: every lead is tried once, over the rounds
         let many: Vec<FileInfo> = (0..20).map(|k| file(&format!("v{k:02}"), 293)).collect();
         let vols: Vec<&FileInfo> = many.iter().collect();
-        let got = super::super::steps::xref_order(&vols, 0, |v| {
-            Ok::<_, ()>((1..=crate::xref::LEADS as i64).map(|p| seg(&v.filename, p)).collect())
-        })
-        .unwrap();
-        assert_eq!(got.len(), crate::xref::HEAD_PROBES, "capped");
+        let leads = |v: &FileInfo| {
+            let n = if v.filename.ends_with('3') { 12 } else { 6 };
+            Ok::<_, ()>((1..=n).map(|p| seg(&v.filename, p)).collect::<Vec<_>>())
+        };
+        let total = 18 * 6 + 2 * 12;
+        let mut tried = Vec::new();
+        let mut round = 0;
+        loop {
+            let (got, left) = super::super::steps::xref_order(&vols, round * crate::xref::HEAD_PROBES, leads).unwrap();
+            assert!(got.len() <= crate::xref::HEAD_PROBES);
+            tried.extend(got.into_iter().map(|(_, s)| s.message_id));
+            round += 1;
+            if !left {
+                break;
+            }
+        }
+        assert_eq!(tried.len(), total);
+        assert_eq!(tried.iter().collect::<std::collections::HashSet<_>>().len(), total, "none twice");
+        assert_eq!(tried[0], "v00-1");
     }
 
     #[test]
