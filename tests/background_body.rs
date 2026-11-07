@@ -289,3 +289,24 @@ fn a_server_that_times_out_is_asked_after_a_healthy_one() {
     assert!(start.elapsed() < Duration::from_millis(150), "the slow one wasnt asked first: {:?}", start.elapsed());
     assert_eq!(servers[1].bodies_sent.load(Ordering::SeqCst), 2);
 }
+
+/// While a regular server has no room for a body, an idle fallback server isn't asked in its place: the body waits
+/// for the regular one.
+#[test]
+fn a_fallback_server_waits_while_a_regular_one_has_no_room() {
+    let rt = runtime();
+    let regular = stalling(1, Duration::from_secs(1), yenc_body("a.bin", b"hello"));
+    let spare = Server::new(vec![post(1, r#""a.bin" yEnc (1/1)"#, 10, vec![b"hello".to_vec()])]);
+    let mut fallback = mock(spawn_server(spare.clone()), "secret", 2, 1);
+    fallback.fallback = Some(true);
+    fallback.index = Some(false);
+    let pool = Arc::new(Pool::new(&[mock(spawn_server(regular.clone()), "secret", 1, 1), fallback]));
+    {
+        let pool = pool.clone();
+        rt.spawn(async move { pool.fetch_headers(GROUP, 1, 2).await });
+    }
+    common::stage::wait_for("the regular one stalled", || regular.stalled.load(Ordering::SeqCst) == 1);
+    assert!(matches!(rt.block_on(pool.background_body("<msg1@mock>", MIB)).unwrap(), BackgroundBody::Body(_)));
+    assert_eq!(spare.bodies_sent.load(Ordering::SeqCst), 0, "the fallback was asked first");
+    assert_eq!(regular.bodies_sent.load(Ordering::SeqCst), 1);
+}

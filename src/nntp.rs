@@ -2527,6 +2527,11 @@ impl Pool {
         while !left.is_empty() {
             let mut no_room = Vec::new();
             for i in left.drain(..) {
+                // a fallback server waits while any other server waits for room: it's asked only once they've answered
+                if fallback(i) && no_room.iter().any(|&j| !fallback(j)) {
+                    no_room.push(i);
+                    continue;
+                }
                 // resting after a failure, a fallback server isnt waited for: it wouldnt be asked before the rest ends
                 if fallback(i) && self.is_down(i) {
                     fallback_unreachable = Some(NntpError::Io(io::Error::new(
