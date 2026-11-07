@@ -56,6 +56,12 @@ fn transient_wait(in_a_row: i64, release_id: i64) -> i64 {
     if in_a_row <= TRANSIENT_FREE { 300 } else { backoff(in_a_row - TRANSIENT_FREE, release_id) }
 }
 
+/// What `pp_state.last_error` keeps of a step's error: which step, then what went wrong, soo errors can be told apart
+/// by step where several share a release.
+fn step_error(step: &str, error: &str) -> String {
+    format!("{step}: {error}")
+}
+
 /// seconds until an attempt's retry, and a little per release soo they dont bunch
 fn backoff(attempt: i64, release_id: i64) -> i64 {
     let shift = (attempt.max(1) - 1).min(16) as u32;
@@ -766,17 +772,17 @@ impl Inner {
                         a.db_attempts = Some(attempt);
                         soonest(now + backoff(attempt, row.info.id));
                     }
-                    a.error = Some(e);
+                    a.error = Some(step_error(step.name(), &e));
                     failure = true;
                 }
                 Ran::Error(StepError::Permanent(e)) => {
                     a.set_failed |= bit;
                     failed |= bit;
-                    a.error = Some(e);
+                    a.error = Some(step_error(step.name(), &e));
                 }
                 Ran::Error(StepError::Transient(e)) => {
                     soonest(now + 300);
-                    a.error = Some(e);
+                    a.error = Some(step_error(step.name(), &e));
                 }
                 Ran::Error(StepError::OutOfBudget) => soonest(now + 60),
             }
@@ -1128,21 +1134,21 @@ impl Inner {
                         a.net_transient = Some(0);
                         a.net_next_at = Some(now + backoff(attempt, id));
                     }
-                    a.error = Some(e);
+                    a.error = Some(step_error(step.name(), &e));
                 }
                 Ran::Error(StepError::Permanent(e)) => {
                     a.set_failed |= bit;
                     a.net_attempts = Some(0);
                     a.net_transient = Some(0);
                     a.net_next_at = Some(0);
-                    a.error = Some(e);
+                    a.error = Some(step_error(step.name(), &e));
                 }
                 Ran::Error(StepError::Transient(e)) => {
                     let in_a_row = row.net_transient + 1;
                     a.net_attempts = Some(attempts_before);
                     a.net_transient = Some(in_a_row);
                     a.net_next_at = Some(now + transient_wait(in_a_row, id));
-                    a.error = Some(e);
+                    a.error = Some(step_error(step.name(), &e));
                     self.pause_net_after_trouble(now);
                 }
                 Ran::Error(StepError::OutOfBudget) => {
