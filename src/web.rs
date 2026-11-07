@@ -43,6 +43,10 @@ const COOKIE_DAYS: i64 = 30;
 /// Whether the results leave out incomplete releases: `incomplete=hide` or `incomplete=show` in a url, and the last one
 /// asked for kept in this cookie, soo it holds across visits until it's turned off again.
 const INCOMPLETE_ARG: &str = "incomplete";
+/// The least score a search keeps, out of 100: `rated=70` is 7 out of 10 and up.
+const RATED_ARG: &str = "rated";
+/// The scores the rating chips offer.
+const RATED: [i64; 3] = [60, 70, 80];
 /// asks a search for frozen releases too
 const DEEP_ARG: &str = "deep";
 const INCOMPLETE_COOKIE: &str = "atlas_incomplete";
@@ -280,6 +284,8 @@ struct Search {
     hide_incomplete: bool,
     /// frozen releases too, listed after the live ones (`frozen`)
     deep: bool,
+    /// leaves out releases whose best kept score (`score_value`, out of 100) is below this, and those with none kept
+    min_score: Option<i64>,
 }
 
 /// Up to this many results get sorted, the newest or best matching ones, unless the database orders by the column: then
@@ -427,6 +433,7 @@ impl Search {
             descending,
             hide_incomplete: text(INCOMPLETE_ARG) == HIDE,
             deep: matches!(text(DEEP_ARG).as_str(), "1" | "true" | "yes" | "on"),
+            min_score: text(RATED_ARG).parse().ok().filter(|n| RATED.contains(n)),
         }
     }
 
@@ -448,6 +455,9 @@ impl Search {
         }
         if self.deep {
             more.push(format!("{DEEP_ARG}=1"));
+        }
+        if let Some(min) = self.min_score {
+            more.push(format!("{RATED_ARG}={min}"));
         }
         for part in more {
             if !query.is_empty() {
@@ -475,6 +485,7 @@ impl Search {
             },
             hide_incomplete: self.hide_incomplete,
             deep: self.deep,
+            min_score: self.min_score,
         };
         let query = attr(&flipped.query(&self.cat, 0));
         let arrow = match (current, descending) {
@@ -643,6 +654,7 @@ impl Search {
             );
         }
         out.push_str(&self.incomplete_link());
+        out.push_str(&self.rated_links());
         out.push_str(&self.sort_link(SortBy::Rating, "Best rated"));
         out.push_str("</div>");
         out
@@ -669,6 +681,25 @@ impl Search {
         format!(
             "<a class=\"chip\" href=\"/?{query}\" hx-get=\"/ui/results?{query}\" hx-target=\"#results\" hx-sync=\"#search:replace\" hx-indicator=\"#busy\" title=\"Leave out releases missing parts. Kept on until you turn it off.\"{pressed}>Hide incomplete</a>"
         )
+    }
+
+    /// The chips that keep only releases rated that high, by the best score kept for their title. The one that's on
+    /// turns it off again.
+    fn rated_links(&self) -> String {
+        RATED
+            .iter()
+            .map(|&min| {
+                let on = self.min_score == Some(min);
+                let toggled = Search { offset: 0, min_score: (!on).then_some(min), ..self.clone() };
+                let query = attr(&toggled.query(&self.cat, 0));
+                let pressed = if on { " aria-current=\"true\"" } else { "" };
+                format!(
+                    "<a class=\"chip\" href=\"/?{query}\" hx-get=\"/ui/results?{query}\" hx-target=\"#results\" hx-sync=\"#search:replace\" hx-indicator=\"#busy\" title=\"Only releases whose title scores {} out of 10 or more on IMDb, else TMDB or Trakt. Unrated ones are left out.\"{pressed}>Rated {}+</a>",
+                    min / 10,
+                    min / 10
+                )
+            })
+            .collect()
     }
 
     /// The table rows, or a full-width diagnostic when the first page has none.
@@ -719,15 +750,7 @@ impl Search {
                 let ids: Vec<i64> = found.iter().map(|r| r.id).collect();
                 let categories = crate::category::categories_of(&ids).unwrap_or_default();
                 // only the scores already kept: fetching them for a whole search would use up the providers' limits
-                let scores: HashMap<i64, i64> = if sort == SortBy::Rating {
-                    let media = crate::media::query::attrs_of(&ids).unwrap_or_default();
-                    crate::media::details::kept_for(media.iter().map(|(id, m)| (*id, m.kind, &m.ids)))
-                        .into_iter()
-                        .filter_map(|(id, d)| Some((id, score_value(&d)?)))
-                        .collect()
-                } else {
-                    HashMap::new()
-                };
+                let scores: HashMap<i64, i64> = if sort == SortBy::Rating { kept_scores(&ids) } else { HashMap::new() };
                 // by the size it shows: all of a post spread over several groups
                 if sort == SortBy::Size
                     && let Ok(conn) = crate::db::open()
@@ -774,10 +797,15 @@ impl Search {
             })
             .filter(|r| !self.hides(r))
             .collect();
-        if found.is_empty() && self.hide_incomplete {
+        if self.min_score.is_some() {
+            let scores = kept_scores(&found.iter().map(|r| r.id).collect::<Vec<_>>());
+            found.retain(|r| !self.rated_out(r.id, &scores));
+        }
+        if found.is_empty() && (self.hide_incomplete || self.min_score.is_some()) {
             // every row of this page was incomplete: there may be complete ones further on
+            let what = if self.hide_incomplete { "complete" } else { "rated that high" };
             let note = format!(
-                "<tr><td colspan=\"{COLUMNS}\" class=\"note dim\">Nothing complete in these {PAGE_SIZE}.</td></tr>"
+                "<tr><td colspan=\"{COLUMNS}\" class=\"note dim\">Nothing {what} in these {PAGE_SIZE}.</td></tr>"
             );
             return if page_was_full { note + &self.load_more() } else { note };
         }
@@ -837,6 +865,11 @@ impl Search {
         self.hide_incomplete && !r.complete
     }
 
+    /// Whether a release is left out for its score: below the least asked for, or none kept.
+    fn rated_out(&self, id: i64, scores: &HashMap<i64, i64>) -> bool {
+        self.min_score.is_some_and(|min| scores.get(&id).is_none_or(|s| *s < min))
+    }
+
     /// Makes a row of a post say what all of the post comes to. When another row stands for it, that row's id: the
     /// row is left out for it.
     fn fold_split_post(
@@ -884,7 +917,8 @@ impl Search {
     /// Hiding incomplete releases goes by the whole post each row stands for, which only rendering a row works out,
     /// soo those pages come from a window too, in the search's own order when there's no sort.
     fn sorts_from_a_window(&self) -> bool {
-        (self.sort.is_some() || self.hide_incomplete) && !self.filters.contains(&HIDE_COPIES)
+        (self.sort.is_some() || self.hide_incomplete || self.min_score.is_some())
+            && !self.filters.contains(&HIDE_COPIES)
     }
 
     fn body_from_window(&self) -> String {
@@ -988,6 +1022,10 @@ impl Search {
             None => "Best or newest matches first".to_string(),
         };
         let sort = if self.hide_incomplete { format!("{sort}, incomplete hidden") } else { sort };
+        let sort = match self.min_score {
+            Some(min) => format!("{sort}, rated {}+ only", min / 10),
+            None => sort,
+        };
         let mut scope = String::new();
         for (name, value) in self.fields.chosen() {
             let without = Search {
@@ -1000,6 +1038,7 @@ impl Search {
                 descending: self.descending,
                 hide_incomplete: self.hide_incomplete,
                 deep: self.deep,
+                min_score: self.min_score,
             };
             let query = attr(&without.query(&self.cat, 0));
             let _ = write!(
@@ -1048,6 +1087,9 @@ impl Search {
         }
         if self.hide_incomplete {
             left_out.push("incomplete releases");
+        }
+        if self.min_score.is_some() {
+            left_out.push("releases rated lower or not rated");
         }
         match counted {
             Ok(total) if left_out.is_empty() => {
@@ -1204,13 +1246,7 @@ impl Window {
 
     /// Only the scores already kept: fetching them for a whole search would use up the providers' limits.
     fn scores(&self) -> &HashMap<i64, i64> {
-        self.scores.get_or_init(|| {
-            let media = crate::media::query::attrs_of(&self.ids()).unwrap_or_default();
-            crate::media::details::kept_for(media.iter().map(|(id, m)| (*id, m.kind, &m.ids)))
-                .into_iter()
-                .filter_map(|(id, d)| Some((id, score_value(&d)?)))
-                .collect()
-        })
+        self.scores.get_or_init(|| kept_scores(&self.ids()))
     }
 
     fn order(&self, by: SortBy, descending: bool) -> Order {
@@ -1335,6 +1371,9 @@ impl Window {
                 let mut passed = 0;
                 for &place in order.iter() {
                     let r = &self.rows[place];
+                    if search.rated_out(r.id, self.scores()) {
+                        continue;
+                    }
                     match shown.get(&r.id) {
                         Some(row) if row.folded => continue,
                         Some(row) => {
@@ -1851,6 +1890,16 @@ fn password_tag(password: Option<&Password>) -> String {
 /// The score to sort by, out of 100, the same one a result shows.
 fn score_value(d: &crate::media::details::Details) -> Option<i64> {
     d.imdb_score.or(d.tmdb_score).or(d.trakt_score)
+}
+
+/// The best kept score of each of these releases that has one, with nothing fetched: fetching for a whole search
+/// would use up the providers' limits. The details backfill (`media.details_per_minute`) fills them in ahead.
+fn kept_scores(ids: &[i64]) -> HashMap<i64, i64> {
+    let media = crate::media::query::attrs_of(ids).unwrap_or_default();
+    crate::media::details::kept_for(media.iter().map(|(id, m)| (*id, m.kind, &m.ids)))
+        .into_iter()
+        .filter_map(|(id, d)| Some((id, score_value(&d)?)))
+        .collect()
 }
 
 /// The one score a result has room for.
@@ -4717,6 +4766,7 @@ mod tests {
             sort: None,
             descending: true,
             hide_incomplete: false,
+            min_score: None,
             deep: false,
         };
         let nav = category_nav(&search, "");
@@ -4734,6 +4784,7 @@ mod tests {
             sort: None,
             descending: true,
             hide_incomplete: false,
+            min_score: None,
             deep: false,
         };
         assert_eq!(category_nav(&unknown, "").matches("aria-current").count(), 0);
@@ -4751,6 +4802,7 @@ mod tests {
             sort: None,
             descending: true,
             hide_incomplete: false,
+            min_score: None,
             deep: false,
         }
         .nothing_found();
@@ -4765,6 +4817,7 @@ mod tests {
             sort: None,
             descending: true,
             hide_incomplete: false,
+            min_score: None,
             deep: false,
         }
         .nothing_found();
@@ -4783,6 +4836,7 @@ mod tests {
             sort: None,
             descending: true,
             hide_incomplete: false,
+            min_score: None,
             deep: false,
         }
         .summary();
@@ -4798,6 +4852,7 @@ mod tests {
                 sort: None,
                 descending: true,
                 hide_incomplete: false,
+                min_score: None,
                 deep: false,
             }
             .summary()
@@ -5189,6 +5244,25 @@ mod tests {
         let mut args = parse_query("incomplete=show");
         assert_eq!(incomplete_choice(&mut args, None), None);
         assert!(!Search::from_args(&args).hide_incomplete);
+    }
+
+    #[test]
+    fn a_rating_chip_keeps_only_releases_rated_that_high() {
+        let s = Search::from_args(&parse_query("q=film&rated=70"));
+        assert_eq!(s.min_score, Some(70));
+        assert!(s.query(&s.cat, 0).contains("rated=70"), "it stays in the url");
+        assert!(s.sorts_from_a_window(), "pages come from a window, filtered as they're read");
+        assert_eq!(Search::from_args(&parse_query("rated=75")).min_score, None, "only the chips' scores");
+        assert_eq!(Search::from_args(&parse_query("rated=x")).min_score, None);
+        let scores: HashMap<i64, i64> = [(1, 82), (2, 70), (3, 69)].into_iter().collect();
+        let out: Vec<i64> = (1..=4).filter(|id| s.rated_out(*id, &scores)).collect();
+        assert_eq!(out, [3, 4], "below 7, and no score kept");
+        let chips = s.rated_links();
+        assert!(chips.contains("aria-current=\"true\">Rated 7+</a>"), "{chips}");
+        assert!(!chips.contains("rated=70\" hx-get"), "the chip that's on turns it off: {chips}");
+        assert!(chips.contains("rated=80"), "{chips}");
+        let off = Search::from_args(&parse_query("q=film"));
+        assert!(!off.rated_out(4, &scores), "no chip, nothing left out");
     }
 
     #[test]
