@@ -44,8 +44,15 @@ const SAME_IDS_LOOK: u64 = 50;
 /// a window bigger than this is a busy group's hours, not a post's minutes
 const MAX_ARTICLES: u64 = 3_000_000;
 
+/// rows of each shard an older sweep reads through per round, newest id first: past `DAYS` the reads go on, in what
+/// the recent posts leave of a round, through posts nobody looked at, the backfill's mostly
+const OLDER_SCAN: i64 = 50_000;
+/// of them, the posts looked at per shard per round
+const OLDER_CANDIDATES: i64 = 100;
+
 const CREATE: &str =
-    "create table if not exists repair_tried (release_id INTEGER PRIMARY KEY, at INTEGER NOT NULL, permille INTEGER)";
+    "create table if not exists repair_tried (release_id INTEGER PRIMARY KEY, at INTEGER NOT NULL, permille INTEGER);
+     create table if not exists repair_older (shard INTEGER PRIMARY KEY, before INTEGER)";
 
 /// One group's window to read again, for the rows of one post.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -68,10 +75,32 @@ pub struct Looked {
     pub size: i64,
 }
 
-/// What a round found, post by post.
+/// What a round found, post by post: the recent ones first, by worth, then each shard's older ones, newest first.
 #[derive(Debug, Default)]
 pub struct Found {
     pub posts: Vec<Looked>,
+    pub older: Vec<Older>,
+}
+
+/// A shard's older sweep this round: its posts (`posts[first..first + keys.len()]`), each found by the row in `keys`,
+/// and where the sweep goes on once all of them are done (`None`: from the newest row again, the shard swept).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Older {
+    pub shard: usize,
+    pub first: usize,
+    pub keys: Vec<i64>,
+    pub end: Option<i64>,
+}
+
+impl Older {
+    /// Where the sweep goes on, given the posts a round read or looked at: past every post up to the first it left for
+    /// later, that one found again next round.
+    fn next(&self, done: &HashSet<usize>) -> Option<i64> {
+        match (0..self.keys.len()).find(|j| !done.contains(&(self.first + j))) {
+            Some(j) => Some(self.keys[j] + 1),
+            None => self.end,
+        }
+    }
 }
 
 impl Found {
@@ -127,7 +156,12 @@ async fn round(
         })
         .collect();
     let days: Vec<(String, i64)> = found.posts.iter().flat_map(|p| p.days.iter().cloned()).collect();
-    mark(db, now, days, tried).await?;
+    // an older sweep moves past a post to read only once it was read: a round cut short finds it again
+    let sweeps = |done: &HashSet<usize>| -> Vec<(usize, Option<i64>)> {
+        found.older.iter().map(|o| (o.shard, o.next(done))).collect()
+    };
+    let mut done: HashSet<usize> = looked.iter().copied().collect();
+    mark(db, now, days, tried, sweeps(&done)).await?;
     for post in to_read.iter().map(|&i| &posts[i]) {
         if stopping() {
             break;
@@ -188,7 +222,11 @@ async fn round(
                 }
             }
         }
-        mark(db, now, Vec::new(), post.ids.iter().map(|id| (*id, post.permille)).collect()).await?;
+        mark(db, now, Vec::new(), post.ids.iter().map(|id| (*id, post.permille)).collect(), Vec::new()).await?;
+    }
+    if !stopping() {
+        done.extend(to_read.iter().copied());
+        mark(db, now, Vec::new(), Vec::new(), sweeps(&done)).await?;
     }
     Ok(())
 }
@@ -200,9 +238,15 @@ async fn whole(ids: &[i64]) -> bool {
     matches!(whole.await, Ok(Ok(true)))
 }
 
-/// Asks for `days` of their groups' backfill first, and marks the releases in `tried` as looked at (with the share
-/// their post had).
-async fn mark(db: &Db, now: i64, days: Vec<(String, i64)>, tried: Vec<(i64, i64)>) -> anyhow::Result<()> {
+/// Asks for `days` of their groups' backfill first, marks the releases in `tried` as looked at (with the share their
+/// post had), and moves each shard's older sweep on to where `older` says.
+async fn mark(
+    db: &Db,
+    now: i64,
+    days: Vec<(String, i64)>,
+    tried: Vec<(i64, i64)>,
+    older: Vec<(usize, Option<i64>)>,
+) -> anyhow::Result<()> {
     on_db(db, move |conn| {
         let tx = conn.transaction()?;
         for (group, day) in &days {
@@ -213,6 +257,10 @@ async fn mark(db: &Db, now: i64, days: Vec<(String, i64)>, tried: Vec<(i64, i64)
                 .prepare_cached("insert or replace into repair_tried (release_id, at, permille) values (?1, ?2, ?3)")?;
             for (id, permille) in &tried {
                 mark.execute(params![id, now, permille])?;
+            }
+            let mut sweep = tx.prepare_cached("insert or replace into repair_older (shard, before) values (?1, ?2)")?;
+            for (shard, before) in &older {
+                sweep.execute(params![*shard as i64, before])?;
             }
         }
         tx.commit()?;
@@ -389,44 +437,97 @@ pub fn find(conn: &Connection, now: i64) -> rusqlite::Result<Found> {
                and not exists (select 1 from main.repair_tried t where t.release_id = r.id)
              order by r.id desc limit ?4"
         );
-        let rows: Vec<ReleaseRow> = conn
-            .prepare(&sql)?
-            .query_map(params![MIN_ROW_BYTES, now - DAYS * 86_400, now - SETTLED_SECS, CANDIDATES], |r| {
-                Ok(ReleaseRow {
-                    id: r.get(0)?,
-                    name: r.get(1)?,
-                    group_name: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
-                    poster: r.get(3)?,
-                    posted_date: r.get(4)?,
-                    size: r.get(5)?,
-                    complete: r.get::<_, i64>(6)? != 0,
-                    parts: r.get(7)?,
-                })
-            })?
-            .collect::<rusqlite::Result<_>>()?;
+        let rows =
+            release_rows(conn, &sql, params![MIN_ROW_BYTES, now - DAYS * 86_400, now - SETTLED_SECS, CANDIDATES])?;
         for row in rows {
             if seen.contains(&row.id) {
                 continue;
             }
-            let (ids, size) = match crate::release_info::whole_post_with(conn, &row) {
-                Ok(Some(post)) => (post.ids, post.size),
-                _ => (vec![row.id], row.size.unwrap_or(0)),
-            };
-            seen.extend(ids.iter().copied());
-            let permille = crate::release_info::permille_of(conn, &ids).unwrap_or(0);
-            let worth = size >= MIN_BYTES && (MIN_PERMILLE..1000).contains(&permille);
-            let windows = if worth { windows_of(conn, &ids)? } else { Vec::new() };
-            // further from whole, what's missing is more likely in days of its groups the backfill hasn't read
-            let days = if size >= MIN_BYTES && permille < MIN_PERMILLE {
-                days_of(&windows_of(conn, &ids)?)
-            } else {
-                Vec::new()
-            };
-            found.posts.push(Looked { ids, permille, windows, days, media: is_media(&row.name), size });
+            found.posts.push(look(conn, &row, true, &mut seen)?);
         }
     }
     by_worth(&mut found.posts);
+    for s in 0..store::SHARDS {
+        let first = found.posts.len();
+        let (rows, end) = older_rows(conn, s, now)?;
+        let mut keys = Vec::new();
+        for row in rows {
+            if seen.contains(&row.id) {
+                continue;
+            }
+            keys.push(row.id);
+            found.posts.push(look(conn, &row, false, &mut seen)?);
+        }
+        found.older.push(Older { shard: s, first, keys, end });
+    }
     Ok(found)
+}
+
+/// `row`'s post, with what it wants read. `days`: and the days of its groups' backfill to take first, when it's
+/// further from whole (an older post's days aren't asked for: they are what the backfill reads anyway, in its order).
+fn look(conn: &Connection, row: &ReleaseRow, days: bool, seen: &mut HashSet<i64>) -> rusqlite::Result<Looked> {
+    let (ids, size) = match crate::release_info::whole_post_with(conn, row) {
+        Ok(Some(post)) => (post.ids, post.size),
+        _ => (vec![row.id], row.size.unwrap_or(0)),
+    };
+    seen.extend(ids.iter().copied());
+    let permille = crate::release_info::permille_of(conn, &ids).unwrap_or(0);
+    let worth = size >= MIN_BYTES && (MIN_PERMILLE..1000).contains(&permille);
+    let windows = if worth { windows_of(conn, &ids)? } else { Vec::new() };
+    // further from whole, what's missing is more likely in days of its groups the backfill hasn't read
+    let days = if days && size >= MIN_BYTES && permille < MIN_PERMILLE {
+        days_of(&windows_of(conn, &ids)?)
+    } else {
+        Vec::new()
+    };
+    Ok(Looked { ids, permille, windows, days, media: is_media(&row.name), size })
+}
+
+/// The release rows `sql` selects, its columns those of `find`'s query.
+fn release_rows(conn: &Connection, sql: &str, params: impl rusqlite::Params) -> rusqlite::Result<Vec<ReleaseRow>> {
+    conn.prepare(sql)?
+        .query_map(params, |r| {
+            Ok(ReleaseRow {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                group_name: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                poster: r.get(3)?,
+                posted_date: r.get(4)?,
+                size: r.get(5)?,
+                complete: r.get::<_, i64>(6)? != 0,
+                parts: r.get(7)?,
+            })
+        })?
+        .collect()
+}
+
+/// Shard `s`'s older sweep this round: the rows, newest first, of the next `OLDER_SCAN` below where it got to, that
+/// were posted before `DAYS` and are worth a look like `find`'s (at most `OLDER_CANDIDATES`), and where it goes on
+/// once they are done: below the last of them when that many came, else below the rows read, or from the newest
+/// again (`None`) when none were left.
+fn older_rows(conn: &Connection, s: usize, now: i64) -> rusqlite::Result<(Vec<ReleaseRow>, Option<i64>)> {
+    let before: i64 = conn
+        .query_row("select before from main.repair_older where shard = ?1", [s as i64], |r| r.get::<_, Option<i64>>(0))
+        .ok()
+        .flatten()
+        .unwrap_or(i64::MAX);
+    let window = format!("select id from s{s}.releases where id < ?1 order by id desc limit {OLDER_SCAN}");
+    let lowest: Option<i64> = conn.query_row(&format!("select min(id) from ({window})"), [before], |r| r.get(0))?;
+    let Some(lowest) = lowest else { return Ok((Vec::new(), None)) };
+    let sql = format!(
+        "select r.id, coalesce(r.display_name, r.name), r.group_name, r.poster, r.posted_date, r.size, r.complete,
+                r.parts
+         from s{s}.releases r
+         where r.id in ({window}) and r.complete = 0 and r.size >= ?2 and r.posted_date < datetime(?3, 'unixepoch')
+           and not exists (select 1 from main.repair_tried t where t.release_id = r.id)
+         order by r.id desc limit ?4"
+    );
+    let rows = release_rows(conn, &sql, params![before, MIN_ROW_BYTES, now - DAYS * 86_400, OLDER_CANDIDATES])?;
+    let end = match rows.last() {
+        Some(last) if rows.len() as i64 == OLDER_CANDIDATES => last.id,
+        _ => lowest,
+    };
+    Ok((rows, Some(end)))
 }
 
 /// The days the whole post spans, from its first article in any group to its last, in each of its groups. None for
@@ -500,6 +601,77 @@ mod tests {
         assert_eq!(plan(&posts, 5), (vec![0, 2], vec![1, 4]));
         // one bigger than the share on its own still goes
         assert_eq!(plan(&[looked(8, true, 1), looked(1, true, 1)], 5), (vec![0], vec![]));
+    }
+
+    #[test]
+    fn an_older_sweep_goes_on_past_what_a_round_did_and_finds_the_first_it_left_again() {
+        let o = Older { shard: 3, first: 4, keys: vec![90, 70, 50], end: Some(40) };
+        let done = |v: &[usize]| v.iter().copied().collect::<HashSet<usize>>();
+        assert_eq!(o.next(&done(&[0, 1, 4, 5, 6])), Some(40), "all three done");
+        assert_eq!(o.next(&done(&[4, 6])), Some(71), "the second left for later: found again");
+        assert_eq!(o.next(&done(&[])), Some(91));
+        let swept = Older { shard: 3, first: 0, keys: vec![], end: None };
+        assert_eq!(swept.next(&done(&[])), None, "nothing left: from the newest again");
+    }
+
+    #[test]
+    fn an_older_sweep_reads_old_incomplete_rows_below_where_it_got_to() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        db::create_db_at(&main).unwrap();
+        let group = "alt.binaries.a";
+        let s = store::shard_of(group);
+        let now = 2_000_000_000;
+        let old = "2033-01-01 00:00:00"; // a year before now
+        let recent = "2033-05-18 00:00:00"; // a few hours before
+        let release = |name: &str, posted: &str, size: i64, complete: bool| -> i64 {
+            let article = crate::parser::Article {
+                message_id: format!("<{name}@x>"),
+                subject: format!("\"{name}\" yEnc (1/2)"),
+                author: "p <p@x>".into(),
+                filename: Some(format!("{name}.mkv")),
+                part: Some(1),
+                total_parts: Some(2),
+                bytes: 10,
+                ..Default::default()
+            };
+            let r = crate::parser::Release {
+                name: name.into(),
+                group: group.into(),
+                articles: vec![article],
+                ..Default::default()
+            };
+            store::save(&main, &[r]).unwrap();
+            let shard = db::open_shard(&store::shard_path(&main, s)).unwrap();
+            shard
+                .execute(
+                    "update releases set size = ?2, posted_date = ?3, complete = ?4 where name = ?1",
+                    rusqlite::params![name, size, posted, complete],
+                )
+                .unwrap();
+            shard.query_row("select id from releases where name = ?1", [name], |r| r.get(0)).unwrap()
+        };
+        let a = release("Old.Film.A.2020.1080p-X", old, 2 << 30, false);
+        let _small = release("Old.Small.2020-X", old, 1 << 20, false);
+        let _whole = release("Old.Whole.2020.1080p-X", old, 2 << 30, true);
+        let b = release("Old.Film.B.2021.1080p-X", old, 2 << 30, false);
+        let _new = release("New.Film.2026.1080p-X", recent, 2 << 30, false);
+        let tried = release("Old.Tried.2019.1080p-X", old, 2 << 30, false);
+        let conn = db::open_with_shards(&main).unwrap();
+        conn.execute_batch(CREATE).unwrap();
+        conn.execute("insert into repair_tried (release_id, at, permille) values (?1, 0, 0)", [tried]).unwrap();
+        let ids = |rows: &[ReleaseRow]| rows.iter().map(|r| r.id).collect::<Vec<_>>();
+        let (rows, end) = older_rows(&conn, s, now).unwrap();
+        assert_eq!(ids(&rows), [b, a], "old, big enough, incomplete and not tried, newest first");
+        let lowest: i64 = conn.query_row(&format!("select min(id) from s{s}.releases"), [], |r| r.get(0)).unwrap();
+        assert_eq!(end, Some(lowest), "fewer than a round's worth: on below every row read");
+        conn.execute("insert into repair_older (shard, before) values (?1, ?2)", rusqlite::params![s as i64, b])
+            .unwrap();
+        assert_eq!(ids(&older_rows(&conn, s, now).unwrap().0), [a], "below where it got to");
+        conn.execute("update repair_older set before = ?1", [lowest]).unwrap();
+        assert_eq!(older_rows(&conn, s, now).unwrap(), (vec![], None), "swept: from the newest again");
+        conn.execute("update repair_older set before = null", []).unwrap();
+        assert_eq!(ids(&older_rows(&conn, s, now).unwrap().0), [b, a]);
     }
 
     #[test]
