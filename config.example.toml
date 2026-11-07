@@ -87,6 +87,9 @@ poll_minutes = 15
 first_articles = 20000
 per_pass = 200
 concurrency = 16
+comments = true
+comment_days = 90
+comments_per_pass = 2000
 
 [category]
 enabled = true

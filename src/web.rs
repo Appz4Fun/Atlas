@@ -1675,9 +1675,17 @@ fn spot_tag(poster: &str, spot_title: &str) -> String {
     format!(" <span class=\"tag tag-ok\" title=\"{}\">SPOT</span>", attr(&title))
 }
 
+/// What's been said about a spot: its comments, oldest first, and how many spam reports it has.
+#[derive(Clone, Debug, Default)]
+struct SpotSaid {
+    comments: Vec<crate::spotnet::comments::Comment>,
+    reports: i64,
+}
+
 /// A release page's section on its spot: everything the spot says, as Spotweb's spot page shows it, then its
-/// description. A spot saved before its XML was kept shows what its row has until the XML is read again.
-fn spot_html(d: &crate::spotnet::store::Detail) -> String {
+/// description and its comments. A spot saved before its XML was kept shows what its row has until the XML is read
+/// again.
+fn spot_html(d: &crate::spotnet::store::Detail, said: &SpotSaid) -> String {
     use crate::spotnet::names;
     use crate::spotnet::store::Xml;
     let spot = &d.spot;
@@ -1742,6 +1750,13 @@ fn spot_html(d: &crate::spotnet::store::Detail) -> String {
     if d.xml == Xml::Kept && spot.key > 0 {
         fact("Key", spot.key.to_string());
     }
+    let ratings: Vec<u32> = said.comments.iter().map(|c| u32::from(c.rating)).filter(|r| *r > 0).collect();
+    if !ratings.is_empty() {
+        let mean = f64::from(ratings.iter().sum::<u32>()) / ratings.len() as f64;
+        let n = ratings.len();
+        fact("Rating", format!("{mean:.1} / 10 from {n} comment{}", if n == 1 { "" } else { "s" }));
+    }
+    fact("Spam reports", said.reports.to_string());
     let description = if d.xml == Xml::Gone {
         "<p class=\"note\">No description: this spot was saved before Atlas kept it, and its article could no longer be read.</p>".to_string()
     } else if d.xml == Xml::Pending {
@@ -1749,9 +1764,41 @@ fn spot_html(d: &crate::spotnet::store::Detail) -> String {
     } else if spot.description.trim().is_empty() {
         "<p class=\"note\">The spot has no description.</p>".to_string()
     } else {
-        format!("<div class=\"panel spot-desc\">{}</div>", spot_description(&spot.description))
+        format!("<div class=\"panel spot-desc\">{}</div>", spot_text(&spot.description))
     };
-    format!("<h2>Spot</h2><div class=\"panel\"><dl class=\"facts\">{facts}</dl></div><h3>Description</h3>{description}")
+    format!(
+        "<h2>Spot</h2><div class=\"panel\"><dl class=\"facts\">{facts}</dl></div><h3>Description</h3>{description}{}",
+        spot_comments_html(&said.comments)
+    )
+}
+
+/// A spot's comments, oldest first: who wrote each (and their spotter id), when, the rating it gives, and its text.
+fn spot_comments_html(comments: &[crate::spotnet::comments::Comment]) -> String {
+    use crate::spotnet::comments::{GONE, READ};
+    if comments.is_empty() {
+        return "<h3>Comments</h3><p class=\"note\">No comments on this spot yet.</p>".to_string();
+    }
+    let mut out = format!("<h3>Comments ({})</h3>", comments.len());
+    for c in comments {
+        let mut by = vec![if c.poster.is_empty() { "?".to_string() } else { escape(&c.poster) }];
+        if let Some(id) = c.spotter_id.as_deref().filter(|id| !id.is_empty()) {
+            by.push(format!("spotter {}", escape(id)));
+        }
+        if let Some(t) = chrono::DateTime::from_timestamp(c.at, 0) {
+            by.push(t.format("%Y-%m-%d %H:%M UTC").to_string());
+        }
+        if c.rating > 0 {
+            by.push(format!("rated {} / 10", c.rating));
+        }
+        let text = match c.state {
+            READ if c.body.is_empty() => "<p class=\"note\">An empty comment.</p>".to_string(),
+            READ => format!("<div class=\"spot-desc\">{}</div>", spot_text(&c.body)),
+            GONE => "<p class=\"note\">Its text couldn't be read: the article is gone, too big to be a comment, or the servers kept failing.</p>".to_string(),
+            _ => "<p class=\"note\">Its text is read on the indexer's next spot pass.</p>".to_string(),
+        };
+        let _ = write!(out, "<div class=\"panel spot-comment\"><p class=\"dim\">{}</p>{text}</div>", by.join(" · "));
+    }
+    out
 }
 
 /// A link found in text without what's more likely the sentence's: trailing punctuation, and a closing parenthesis
@@ -1769,23 +1816,27 @@ fn link_end(found: &str) -> &str {
     }
 }
 
-/// A spot's description as HTML: escaped, its line breaks kept, the simple bold, italic and underline tags it may
-/// use dropped, and its web links made links.
-fn spot_description(text: &str) -> String {
+/// A spot's description, or a comment, as HTML: escaped, its line breaks kept, the simple bold, italic and
+/// underline tags it may use dropped, a smiley (`[img=klappen]`) written `:klappen:`, and its web links made links.
+fn spot_text(text: &str) -> String {
     static FORMATTING: std::sync::LazyLock<regex::Regex> =
         std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)\[/?(?:b|i|u)\]").unwrap());
     static LINK: std::sync::LazyLock<regex::Regex> =
         std::sync::LazyLock::new(|| regex::Regex::new(r#"(?i)\bhttps?://[^\s<>"'\[\]]+"#).unwrap());
+    static SMILEY: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)\[img=([a-z0-9_-]{1,32})\]").unwrap());
     let text = FORMATTING.replace_all(text.trim(), "");
+    // smileys outside links only: a `[` ends a link, and `:x:` would carry it on
+    let plain = |s: &str| SMILEY.replace_all(&escape(s), ":$1:").into_owned();
     let mut out = String::with_capacity(text.len());
     let mut at = 0;
     for m in LINK.find_iter(&text) {
-        out.push_str(&escape(&text[at..m.start()]));
+        out.push_str(&plain(&text[at..m.start()]));
         let url = link_end(m.as_str());
         let _ = write!(out, "<a href=\"{}\" rel=\"noreferrer nofollow\">{}</a>", attr(url), escape(url));
         at = m.start() + url.len();
     }
-    out.push_str(&escape(&text[at..]));
+    out.push_str(&plain(&text[at..]));
     out
 }
 
@@ -2660,7 +2711,15 @@ fn release_html(
         .unwrap_or_default();
     let copies = if recovery.is_some() { String::new() } else { copies_html(&copies, inherited.as_ref(), &carry_to) };
     let warning = recovery.map_or(String::new(), recovery_warning);
-    let spot = spot.as_ref().map_or(String::new(), spot_html);
+    let spot = spot.as_ref().map_or(String::new(), |d| {
+        let said = crate::db::with_reader(|c| crate::spotnet::comments::about(c, r.id, &d.message_id))
+            .map(|(comments, reports)| SpotSaid { comments, reports })
+            .unwrap_or_else(|e| {
+                eprintln!("web release {}: its spot's comments: {e}", r.id);
+                SpotSaid::default()
+            });
+        spot_html(d, &said)
+    });
 
     page(
         &format!("{shown} · Atlas"),
@@ -4125,7 +4184,23 @@ mod tests {
             spot,
             xml: crate::spotnet::store::Xml::Kept,
         };
-        let h = super::spot_html(&d);
+        use crate::spotnet::comments::{Comment, GONE, READ, WAITING};
+        let said = super::SpotSaid {
+            comments: vec![
+                Comment {
+                    at: 1_787_086_436,
+                    rating: 8,
+                    poster: "Olli <W>".into(),
+                    spotter_id: Some("ab1".into()),
+                    state: READ,
+                    body: "Thanks![img=klappen]\nWachtwoord: s3cret <b> https://example.org/x_(1)[img=buigen]".into(),
+                },
+                Comment { at: 1_787_089_272, rating: 6, poster: "Penny".into(), state: GONE, ..Default::default() },
+                Comment { at: 1_787_091_828, poster: "Vector".into(), state: WAITING, ..Default::default() },
+            ],
+            reports: 2,
+        };
+        let h = super::spot_html(&d, &said);
         for want in [
             "<dt>Title</dt><dd>Movie &lt;2026&gt; &amp; co</dd>",
             "<dt>Type</dt><dd>Movie</dd>",
@@ -4143,6 +4218,14 @@ mod tests {
             "<dt>Spotted with</dt><dd>Spotnet 1.9.0.8</dd>",
             "<dt>Message-ID</dt><dd><code>m&lt;1&gt;@spot.net</code></dd>",
             "<dt>Key</dt><dd>7</dd>",
+            "<dt>Rating</dt><dd>7.0 / 10 from 2 comments</dd>",
+            "<dt>Spam reports</dt><dd>2</dd>",
+            "<h3>Comments (3)</h3>",
+            "<p class=\"dim\">Olli &lt;W&gt; · spotter ab1 · 2026-08-18 20:53 UTC · rated 8 / 10</p>",
+            // a password a commenter wrote, shown as written
+            "Thanks!:klappen:\nWachtwoord: s3cret &lt;b&gt; <a href=\"https://example.org/x_(1)\" rel=\"noreferrer nofollow\">https://example.org/x_(1)</a>:buigen:",
+            "<p class=\"dim\">Penny · 2026-08-18 21:41 UTC · rated 6 / 10</p><p class=\"note\">Its text couldn't be read",
+            "<p class=\"dim\">Vector · 2026-08-18 22:23 UTC</p><p class=\"note\">Its text is read on the indexer's next",
             // the description whole, escaped, a password the poster wrote included, its link made a link
             "Great film\nPassword: s3cr&lt;et\nMore at <a href=\"https://example.org/page?a=1&amp;b=2\" rel=\"noreferrer nofollow\">https://example.org/page?a=1&amp;b=2</a>. Bye",
         ] {
@@ -4159,7 +4242,7 @@ mod tests {
         // a website that isn't a web link is shown, not linked
         let mut odd = d.clone();
         odd.spot.website = "javascript:alert(1)".into();
-        let h = super::spot_html(&odd);
+        let h = super::spot_html(&odd, &said);
         assert!(h.contains("<dt>Website</dt><dd>javascript:alert(1)</dd>"), "{h}");
         // saved before the XML was kept: what the row has, and a note on the description
         let bare = crate::spotnet::store::Detail {
@@ -4167,11 +4250,13 @@ mod tests {
             spot: crate::spotnet::full::FullSpot { title: "T".into(), ..Default::default() },
             ..Default::default()
         };
-        let h = super::spot_html(&bare);
+        let h = super::spot_html(&bare, &super::SpotSaid::default());
         assert!(h.contains("<dt>Title</dt><dd>T</dd>") && h.contains("saved before Atlas kept it"), "{h}");
+        assert!(h.contains("<dt>Spam reports</dt><dd>0</dd>") && h.contains("No comments on this spot yet"), "{h}");
+        assert!(!h.contains("<dt>Rating</dt>"), "{h}");
         assert!(!h.contains("<dt>Key</dt>") && !h.contains("<dt>Sender</dt>"), "{h}");
         let gone = crate::spotnet::store::Detail { xml: crate::spotnet::store::Xml::Gone, ..bare };
-        assert!(super::spot_html(&gone).contains("could no longer be read"));
+        assert!(super::spot_html(&gone, &super::SpotSaid::default()).contains("could no longer be read"));
     }
 
     fn window_of_rows(rows: Vec<ReleaseRow>) -> Window {
