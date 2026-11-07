@@ -165,7 +165,7 @@ pub fn open_shard(path: &Path) -> Result<Connection> {
 }
 
 /// How long a connection waits on a lock someone else holds (`set_up`).
-const BUSY_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const BUSY_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn set_up(conn: Connection) -> Result<Connection> {
     conn.busy_timeout(BUSY_TIMEOUT)?;

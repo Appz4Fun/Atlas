@@ -409,9 +409,39 @@ pub fn placement(
     if files.is_empty() {
         return Ok(Placement::Taken);
     }
-    // every message-id of the release, sealed files' too, by their keyed hash, with the file it's in
     let key = crate::store::IdKey::of(conn)?;
-    crate::store::index_release(conn, &key, id)?;
+    let names: Vec<(i64, String)> = conn
+        .prepare_cached("select id, filename from files where release_id = ?")?
+        .query_map([id], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<Result<_>>()?;
+    // a spot naming a file the release doesn't have (with articles to tell by) is another post: nothing to read
+    if !files.iter().all(|(filename, ids)| ids.is_empty() || names.iter().any(|(_, n)| n == filename)) {
+        return Ok(Placement::Taken);
+    }
+    // a one-file release's index isn't kept up by saves: one made before is not to be trusted
+    let indexed = names.len() > 1 && crate::store::is_indexed(conn, id)?;
+    if !indexed {
+        // no index kept (one file, or pruned once quiet): each named file's ids streamed past the spot's own, without
+        // making an index that saves wouldnt keep up or that would only be pruned again
+        let mut suffixes = Default::default();
+        for (filename, ids) in files.iter().filter(|(_, ids)| !ids.is_empty()) {
+            let mut wanted: std::collections::HashSet<i64> = ids.iter().map(|m| key.hash(&format!("<{m}>"))).collect();
+            for (file_id, _) in names.iter().filter(|(_, n)| n == filename) {
+                if wanted.is_empty() {
+                    break;
+                }
+                crate::store::file_id_hashes(conn, &key, *file_id, &mut suffixes, |h| {
+                    wanted.remove(&h);
+                    Ok(!wanted.is_empty())
+                })?;
+            }
+            if !wanted.is_empty() {
+                return Ok(Placement::Taken);
+            }
+        }
+        return Ok(Placement::SamePost(id));
+    }
+    // every message-id of the release, sealed files' too, by their keyed hash, with the file it's in
     let mut file_of = conn.prepare_cached(
         "select f.filename from release_ids r join files f on f.id = r.file_id where r.release_id = ? and r.id_hash = ?",
     )?;
@@ -919,11 +949,55 @@ mod tests {
         assert_eq!(place(&[("a.mkv", "a@x"), ("evil.mkv", "evil@x")]), Placement::Taken);
         assert_eq!(place(&[("setup.exe", "a@x")]), Placement::Taken);
         assert_eq!(place(&[]), Placement::Taken);
+        // with its index pruned: the same answers, and none made again
+        conn.execute("delete from release_ids", []).unwrap();
+        assert_eq!(place(&[("a.mkv", "a@x"), ("b.par2", "b@x")]), Placement::SamePost(id));
+        assert_eq!(place(&[("b.par2", "a@x")]), Placement::Taken, "a real article under another file's name");
+        assert_eq!(place(&[("a.mkv", "a@x"), ("evil.mkv", "evil@x")]), Placement::Taken);
+        let indexed: i64 = conn.query_row("select count(*) from release_ids", [], |r| r.get(0)).unwrap();
+        assert_eq!(indexed, 0);
         // tagged with the same NZB: the same post
         let tag_it =
             "insert into spots (release_id, message_id, kind, title, nzb_key) values (?, 'm', 'movie', 'T', 'k')";
         conn.execute(tag_it, [id]).unwrap();
         assert_eq!(place(&[]), Placement::SamePost(id));
+    }
+
+    /// A spot checked against a one-file release compares its ids there and then, and leaves no index behind: saves
+    /// dont keep a one-file release's index up.
+    #[test]
+    fn a_spot_on_a_one_file_release_leaves_no_index() {
+        let path = tempfile::tempdir().unwrap();
+        let shard = path.path().join("s.db");
+        crate::store::create_shard(&shard).unwrap();
+        let mut conn = crate::db::open_shard(&shard).unwrap();
+        let mut writer = crate::store::ShardWriter::new(0);
+        let ids = crate::store::Ids::new(&path.path().join("main.db"));
+        let main = Connection::open(path.path().join("main.db")).unwrap();
+        crate::store::create_main(&main).unwrap();
+        let release = crate::parser::Release {
+            name: "Title".into(),
+            group: "alt.binaries.g".into(),
+            articles: vec![crate::parser::Article {
+                message_id: "<a@x>".into(),
+                filename: Some("a.mkv".into()),
+                release_name: Some("Title".into()),
+                part: Some(1),
+                total_parts: Some(1),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        writer.save(&mut conn, &ids, [std::slice::from_ref(&release)]).unwrap();
+        let files = |f: &str, id: &str| vec![(f.to_string(), vec![id.to_string()])];
+        assert!(matches!(
+            placement(&conn, "Title", "alt.binaries.g", "k", &files("a.mkv", "a@x")).unwrap(),
+            Placement::SamePost(_)
+        ));
+        assert_eq!(placement(&conn, "Title", "alt.binaries.g", "k", &files("b.mkv", "a@x")).unwrap(), Placement::Taken);
+        assert_eq!(placement(&conn, "Title", "alt.binaries.g", "k", &files("a.mkv", "z@x")).unwrap(), Placement::Taken);
+        let indexed: i64 = conn.query_row("select count(*) from release_ids", [], |r| r.get(0)).unwrap();
+        assert_eq!(indexed, 0);
     }
 
     #[test]

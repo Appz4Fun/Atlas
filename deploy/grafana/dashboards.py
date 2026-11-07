@@ -777,6 +777,16 @@ def progress():
         q('sum(rate(atlas_frozen_events_total{event="busy"}[5m])) * 60', "ticks the lock was busy"),
     ], w=8, colors={"frozen": SERIES[0], "queued by the backlog walk": SERIES[1], "ticks the lock was busy": SERIES[2]})
 
+    b.row("Message-id index")
+    b.graph("Index rows pruned a minute, per shard", [q('rate(atlas_release_ids_events_total{event="pruned_rows"}[5m]) * 60', "shard {{shard}}")],
+            w=12, colors=SHARD_COLORS,
+            description="release_ids rows taken from releases quiet for 3 days. The space goes to each shard's free pages and is reused.")
+    b.graph("Releases indexed and pruned a minute", [
+        q('sum(rate(atlas_release_ids_events_total{event="indexed"}[5m])) * 60', "indexed"),
+        q('sum(rate(atlas_release_ids_events_total{event="pruned_releases"}[5m])) * 60', "pruned"),
+    ], w=12, colors={"indexed": SERIES[0], "pruned": SERIES[1]},
+            description="Indexed counts every full index: a release's second file, and a pruned release that got a late article. A rise in indexed with pruning on means rebuilds.")
+
     b.row("Shared catalog")
     b.stat("Outbox waiting", 'sum(atlas_shared_catalog_outbox{kind="rows"})', w=6,
            description="Changes waiting in the shards' outboxes for the publisher to send to Postgres.")
