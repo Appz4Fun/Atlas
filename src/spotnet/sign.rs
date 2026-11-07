@@ -71,7 +71,7 @@ pub fn verify(title: &str, from: &str, message_id: &str) -> Verdict {
         return no;
     }
     let mut signed = Vec::from(title.as_bytes());
-    signed.extend_from_slice(header[..header.len() - header_sig.len() - 1].as_bytes());
+    signed.extend_from_slice(&header.as_bytes()[..header.len() - header_sig.len() - 1]);
     signed.extend_from_slice(poster);
     let Some(header_sig) = decode_base64(&unprepare_base64(header_sig)) else { return no };
     let (user_key, user_sig) = match local.split_once('.') {
