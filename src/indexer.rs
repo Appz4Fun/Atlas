@@ -653,7 +653,8 @@ fn stage_transaction(conn: &Connection, work: StageWork) -> rusqlite::Result<()>
     }
 }
 
-/// Only the idle freezing of `housekeeping`, for a writer woken with nothing to do between its housekeepings.
+/// The idle freezing and pruning steps of `housekeeping`, for a writer woken with nothing to do between its
+/// housekeepings.
 fn freeze_idle(conn: &mut Connection, store: &mut crate::store::ShardWriter) {
     let t = std::time::Instant::now();
     // (this wake may be the pruning walk's alone, with freezing's idle ticks off)

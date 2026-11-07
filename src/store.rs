@@ -2129,11 +2129,12 @@ const PRUNE_IDS_BUSY_REST: i64 = 30;
 /// after a pruning step fails, the next waits this long (seconds)
 const PRUNE_IDS_FAILED_REST: i64 = 600;
 
-/// the same right after a save, or with one queued
-const PRUNE_IDS_BUSY_SAVING: std::time::Duration = std::time::Duration::from_millis(20);
+/// how long a pruning step on an idle writer waits for a write lock another connection holds (a save that comes
+/// meanwhile waits as long)
+const PRUNE_IDS_BUSY: std::time::Duration = std::time::Duration::from_millis(200);
 
-/// how long a pruning step on an idle writer waits for a write lock another connection holds
-const PRUNE_IDS_BUSY: std::time::Duration = std::time::Duration::from_secs(2);
+/// the lock wait right after a save, or with one queued
+const PRUNE_IDS_BUSY_SAVING: std::time::Duration = std::time::Duration::from_millis(20);
 
 /// while more saves are queued, a pruning step at most this often
 const PRUNE_IDS_QUEUED_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
