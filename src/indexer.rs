@@ -645,6 +645,12 @@ fn housekeeping(conn: &mut Connection, store: &mut crate::store::ShardWriter, se
         eprintln!("freezing in shard {} failed: {e}", store.shard);
     }
     drop(span);
+    // the shared catalog's sent changes, as far as Postgres has them (`shared_catalog::prune_acked`)
+    let span = crate::metrics::span("db.catalog_prune");
+    if crate::shared_catalog::prune_acked(conn).is_err() {
+        span.failed();
+    }
+    drop(span);
     let checkpointing = std::time::Instant::now();
     let span = crate::metrics::span("db.checkpoint");
     if db::finish_checkpoint(conn).is_err() {

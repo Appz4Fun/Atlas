@@ -144,6 +144,8 @@ pub const SET_NFO_PASSWORD: &str = "insert or replace into release_nfo_password 
 /// added this file to someone else's set. `complete`: the whole set was read.
 /// Kept soo a file is known by its hashes without reading the set again, and soo the same file in another posting, under
 /// any name and from any poster, is found by `(size, md5_16k, md5)`.
+/// `creator`: the program that made the set, from its Creator packet (`par2::creator_text`), the same on each of the
+/// set's rows; NULL when no Creator packet was read, and on rows from before it was kept.
 pub const PAR2_FILES: ShardTable = ShardTable {
     name: "par2_files",
     create: "create table if not exists par2_files (
@@ -170,13 +172,26 @@ pub const PAR2_FILES: ShardTable = ShardTable {
         ),
     ],
     release_key: Some("release_id"),
-    added: &[],
+    added: &[("creator", "TEXT")],
 };
 
 pub const DELETE_PAR2_FILES: &str = "delete from par2_files where release_id = ?1";
 pub const INSERT_PAR2_FILE: &str = "insert or replace into par2_files
     (release_id, file_id, set_id, md5, md5_16k, size, name, crc32, bound, sealed, complete)
     values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)";
+/// `?1` the release, `?2` a set id, `?3` the program that made that set
+pub const SET_PAR2_CREATOR: &str = "update par2_files set creator = ?3 where release_id = ?1 and set_id = ?2";
+
+/// The programs that made a release's PAR2 sets, each once, in `conn`'s `schema` (`main` for a shard on its own).
+/// Empty when no Creator packet was kept, or the shard has no column yet.
+pub fn par2_creators(conn: &Connection, schema: &str, release_id: i64) -> Vec<String> {
+    let sql = format!(
+        "select distinct creator from {schema}.par2_files where release_id = ?1 and creator is not null
+         order by creator limit 4"
+    );
+    let Ok(mut stmt) = conn.prepare_cached(&sql) else { return Vec::new() };
+    stmt.query_map([release_id], |r| r.get::<_, String>(0)).map(|rows| rows.flatten().collect()).unwrap_or_default()
+}
 
 /// The CRC32 of each article body a step read whole, by the article's message-id: what yEnc's `pcrc32` says, or the
 /// CRC of the decoded bytes when the trailer wasn't seen. Two articles with the same decoded length and CRC hold the
@@ -226,6 +241,12 @@ pub fn par2_file_writes(
             ],
         ));
     }
+    for (set_id, creator) in &inventory.creators {
+        writes.push(StepWrite::new(
+            SET_PAR2_CREATOR,
+            vec![release_id.into(), set_id.to_vec().into(), creator.clone().into()],
+        ));
+    }
     // a whole set says which files the upload has: with each of them there and whole, so is the release, whatever
     // its subject counter says (`store::SET_VOUCHED_COMPLETE`)
     if inventory.complete && !inventory.files.is_empty() {
@@ -238,7 +259,7 @@ pub fn par2_file_writes(
 /// it. None: the release holds no complete set, or the shard has no table yet.
 pub fn par2_inventory(conn: &Connection, schema: &str, release_id: i64) -> Option<crate::par2::Inventory> {
     let sql = format!(
-        "select file_id, set_id, md5, md5_16k, size, name, crc32, sealed, bound from {schema}.par2_files
+        "select file_id, set_id, md5, md5_16k, size, name, crc32, sealed, bound, creator from {schema}.par2_files
          where release_id = ? and complete = 1 order by name"
     );
     let mut stmt = conn.prepare_cached(&sql).ok()?;
@@ -261,13 +282,19 @@ pub fn par2_inventory(conn: &Connection, schema: &str, release_id: i64) -> Optio
                     crc32: r.get::<_, Option<i64>>(6)?.and_then(|c| u32::try_from(c).ok()),
                 },
                 r.get::<_, i64>(7)? != 0,
+                r.get::<_, Option<String>>(9)?,
             ))
         })
         .ok()?;
     for row in rows {
-        let (file, sealed) = row.ok()?;
+        let (file, sealed, creator) = row.ok()?;
         if sealed {
             inventory.sealed.push((file.set_id, file.file_id));
+        }
+        if let Some(creator) = creator
+            && inventory.creator_of(&file.set_id).is_none()
+        {
+            inventory.creators.push((file.set_id, creator));
         }
         inventory.files.push(file);
     }

@@ -842,6 +842,7 @@ mod tests {
             complete: true,
             truncated: false,
             sealed: vec![(a.set_id, a.file_id)],
+            creators: vec![(a.set_id, "ParPar v0.4.1 x64 [https://github.com/animetosho/parpar]".into())],
         };
         for w in super::super::store::par2_file_writes(8, &inventory) {
             write(&conn, w.sql, w.params);
@@ -849,6 +850,7 @@ mod tests {
         let back = super::super::store::par2_inventory(&conn, "main", 8).expect("read back");
         assert_eq!(back.files, vec![a.clone(), b, c]);
         assert_eq!(back.sealed, vec![(a.set_id, a.file_id)]);
+        assert_eq!(back.creators, inventory.creators, "the set's Creator string reads back with it");
         assert!(back.complete);
         assert!(!back.files[2].bound, "what failed validation when parsed still fails it read back");
         assert_eq!(wanted(&back.files).len(), 2, "c names nothing");

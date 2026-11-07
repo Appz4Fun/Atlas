@@ -8,6 +8,7 @@ pub mod link;
 pub mod names;
 pub mod nzb;
 pub mod rar;
+pub mod rev;
 pub mod select;
 pub mod sevenz;
 pub mod steps;
