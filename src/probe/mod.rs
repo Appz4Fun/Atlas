@@ -20,6 +20,7 @@ pub mod opensubtitles;
 pub mod step;
 pub mod stills;
 pub mod yenc;
+pub mod yenc_quirks;
 
 use std::collections::BTreeMap;
 
@@ -138,6 +139,9 @@ pub struct ProbeInfo {
     /// which of the release's files this is about
     pub file: Option<String>,
     pub yenc: Option<yenc::YencLines>,
+    /// how the encoder wrote its yEnc, from the first article and the last (`yenc_quirks`)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quirks: Option<yenc_quirks::Quirks>,
     /// the full file's checksum, from the last part
     pub file_crc32: Option<u32>,
     pub segment_size: Option<u64>,
