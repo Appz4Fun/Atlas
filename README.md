@@ -69,7 +69,7 @@ rustup installs the pinned toolchain the first time you build, and the `just` re
 - **TV and movie IDs.** Atlas stores each release's title, season, and episode, and answers searches by TVDB, IMDb, TMDB, TVMaze, and Trakt ID once you turn on a provider. Fetches posters, backdrops, cast, runtimes, and IMDb/Rotten Tomatoes/Metacritic/TMDB/Trakt scores.
 - **Group posts into releases.** Atlas parses subjects into releases, merges cross-group posts and PAR2-linked obfuscated multi-file uploads, marks incomplete sets, and recovers the real names of obfuscated posts from their PAR2, archive, or NFO files and 30+ PreDB feeds.
 - **Deep article & container probes.** Without downloading the release, Atlas inspects yEnc headers, RAR4/RAR5/7z/ZIP archives (up to 10 nested compressed layers), MKV/MP4 video/audio/subtitle streams, HDR10/HLG/Dolby Vision profiles, x264/x265 encoder settings, chapters, cover art, H.264/HEVC video stills, and OpenSubtitles hashes.
-- **Serve a Newznab API** for Prowlarr, NZBHydra2, Sonarr, and Radarr: `search`, `tvsearch`, `movie`, `music`, `book`, `caps`, and `get`, which downloads an NZB (or a single file with `file=N`), its gaps filled from any twin of the same bytes.
+- **Serve a Newznab API** for Prowlarr, NZBHydra2, Sonarr, and Radarr: `search`, `tvsearch`, `movie`, `music`, `book`, `caps`, and `get`, which downloads an NZB (or a single file with `file=N`, listed by `t=files`), its gaps filled from any twin of the same bytes.
 - **Search from the terminal** in one group or all groups, or use **AI search**, which turns a request like `find me 4k hdr movies` into groups and keywords with a local [Ollama](https://ollama.com) model.
 - **Watch progress** on the live dashboard, dig into CPU, memory, backfill, content, post-processing, and per-server numbers on the 6-page terminal stats dashboard, or scrape Prometheus metrics with the 7 included Grafana dashboards.
 - **Keep everything local** in an 8-shard SQLite database with zstd-sealed article blobs and an FTS5 full-text index.
@@ -780,7 +780,8 @@ Atlas provides a Newznab-compatible API, the protocol that Prowlarr, NZBHydra2, 
 | `movie` | Movie search by `q`. It takes IDs when a provider is on. | Yes |
 | `music`, `audio` | Music search by `q`. | Yes |
 | `book` | Book search by `q`. | Yes |
-| `get` | The NZB for a release, by `id`. Add `file=N` for one of its files alone, counting from 1 in the order the whole NZB lists them. | Yes |
+| `get` | The NZB for a release, by `id`. Add `file=N` for one of its files alone, counting from 1 in the order the whole NZB lists them. Or `name=` with a file's name, as the release page links each file. | Yes |
+| `files` | Not in the Newznab spec. The files a release's NZB lists, by `id`: `<file n="N" name="..." size="..." articles="..."/>` each, where `n` is the `file=N` that `get` takes. A file whose articles carry no name has no `name`. Frozen releases have no list. | Yes |
 
 A search by an ID that's on (see [TV and movie IDs](#tv-and-movie-ids)) returns the releases with that ID, and when it finds nothing a `q` next to it searches by name. An ID that's off counts as not given: alone it returns an empty result rather than an error, and next to `q` it searches by `q`.
 

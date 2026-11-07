@@ -1770,9 +1770,26 @@ fn spot_html(d: &crate::spotnet::store::Detail, said: &SpotSaid) -> String {
         format!("<div class=\"panel spot-desc\">{}</div>", crate::spotnet::ubb::to_html(&spot.description))
     };
     format!(
-        "<h2>Spot</h2><div class=\"panel\"><dl class=\"facts\">{facts}</dl></div><h3>Description</h3>{description}{}",
+        "<h2>Spot</h2>{}<div class=\"panel\"><dl class=\"facts\">{facts}</dl></div><h3>Description</h3>{description}{}",
+        d.removed.map_or(String::new(), spot_removed),
         spot_comments_html(&said.comments)
     )
+}
+
+/// Says a spot was taken back: the release stays, but the spot no longer vouches for it.
+fn spot_removed(removed: crate::spotnet::store::Removed) -> String {
+    let when =
+        chrono::DateTime::from_timestamp(removed.at, 0).map_or(String::new(), |t| t.format(" on %Y-%m-%d").to_string());
+    let body = if removed.by_moderator {
+        format!(
+            "A Spotnet moderator removed this spot{when}, which they do for fakes, spam and spots in the wrong category. The release is still here, but the spot no longer vouches for what it is."
+        )
+    } else {
+        format!(
+            "Its spotter removed this spot{when}, which they do when they repost it or it was wrong. The release is still here, but the spot no longer vouches for what it is."
+        )
+    };
+    diag("caution", "this spot was removed", &body)
 }
 
 /// A spot's comments, oldest first: who wrote each (and their spotter id), when, the rating it gives, and its text.
@@ -2496,7 +2513,10 @@ fn release_html(
         None
     });
     if let Some(spot) = &spot {
-        tags.push_str(&spot_tag(&spot.spot.poster, &spot.spot.title));
+        match spot.removed {
+            Some(_) => tags.push_str(&tag("tag-warn", "SPOT REMOVED")),
+            None => tags.push_str(&spot_tag(&spot.spot.poster, &spot.spot.title)),
+        }
     }
     tags.push_str(&if r.complete { tag("tag-ok", "COMPLETE") } else { tag("tag-warn", "INCOMPLETE") });
     if names.is_some_and(|n| n.obfuscated) {
@@ -2625,7 +2645,7 @@ fn release_html(
         fact("Links", links);
     }
 
-    let nzb_files = nzb_files_html(contents);
+    let nzb_files = nzb_files_html(r.id, contents);
     let (heading, listed) = inner_files_listed(inner, recovery.is_some());
     let files = if listed.is_empty() {
         String::new()
@@ -2755,11 +2775,14 @@ fn inner_files_listed(
     ("Files its posted NZB points to", inner.files.iter().collect())
 }
 
-/// The files the NZB lists, with how many of each one's articles were seen.
-fn nzb_files_html(contents: &release_info::Contents) -> String {
+/// The files the NZB lists, with how many of each one's articles were seen. With more than one, each name links an
+/// NZB of that file alone, picked by its name (`t=get&name=`), since the list is sorted by name and not in the NZB's
+/// order that `file=N` counts in.
+fn nzb_files_html(id: i64, contents: &release_info::Contents) -> String {
     if contents.list.is_empty() {
         return String::new();
     }
+    let one_by_one = contents.files > 1;
     let rows: String = contents
         .list
         .iter()
@@ -2769,9 +2792,18 @@ fn nzb_files_html(contents: &release_info::Contents) -> String {
             } else {
                 tag("tag-warn", &format!("{} MISSING", thousands(f.expected - f.seen)))
             };
+            // a file with no name is many <file>s in the NZB, none of which a name picks
+            let name = if one_by_one && !f.name.is_empty() {
+                format!(
+                    "<a href=\"/ui/nzb?id={id}&amp;name={}\" title=\"An NZB of this file alone\">{}</a>",
+                    attr(&url_encode(&f.name)),
+                    escape(&f.name)
+                )
+            } else {
+                escape(&f.name)
+            };
             format!(
-                "<tr><td class=\"name\">{}</td><td class=\"num col-size\" title=\"{} bytes\">{}</td><td class=\"num\">{} / {}</td><td class=\"col-state\">{state}</td></tr>",
-                escape(&f.name),
+                "<tr><td class=\"name\">{name}</td><td class=\"num col-size\" title=\"{} bytes\">{}</td><td class=\"num\">{} / {}</td><td class=\"col-state\">{state}</td></tr>",
                 f.bytes,
                 escape(&fmt_size(Some(f.bytes))),
                 thousands(f.seen),
@@ -2779,13 +2811,14 @@ fn nzb_files_html(contents: &release_info::Contents) -> String {
             )
         })
         .collect();
+    let hint = if one_by_one { "<p class=\"note dim\">Click a name for an NZB of that file alone.</p>" } else { "" };
     let more = if (contents.files as usize) > contents.list.len() {
         format!("<p class=\"note\">The first {} of {} files.</p>", contents.list.len(), thousands(contents.files))
     } else {
         String::new()
     };
     format!(
-        "<h2>Files in the NZB</h2><div class=\"table-wrap\"><table><thead><tr><th>Name</th><th class=\"num col-size\">Posted size</th><th class=\"num\">Articles</th><th class=\"col-state\">State</th></tr></thead><tbody>{rows}</tbody></table></div>{more}"
+        "<h2>Files in the NZB</h2>{hint}<div class=\"table-wrap\"><table><thead><tr><th>Name</th><th class=\"num col-size\">Posted size</th><th class=\"num\">Articles</th><th class=\"col-state\">State</th></tr></thead><tbody>{rows}</tbody></table></div>{more}"
     )
 }
 
@@ -4197,6 +4230,23 @@ mod tests {
     }
 
     #[test]
+    fn each_file_of_a_release_links_an_nzb_of_it_alone() {
+        let file = |n: &str| crate::release_info::NzbFile { name: n.into(), bytes: 1, seen: 1, expected: 1 };
+        let mut contents = crate::release_info::Contents {
+            files: 3,
+            list: vec![file("a b&c.mkv"), file("a.par2"), file("")],
+            ..Default::default()
+        };
+        let html = super::nzb_files_html(9, &contents);
+        assert!(html.contains("<a href=\"/ui/nzb?id=9&amp;name=a%20b%26c.mkv\""), "{html}");
+        assert!(html.contains(">a b&amp;c.mkv</a>"), "{html}");
+        assert_eq!(html.matches("<a href").count(), 2, "no link for a file with no name: {html}");
+        contents.files = 1;
+        contents.list.truncate(1);
+        assert!(!super::nzb_files_html(9, &contents).contains("<a href"), "one file: the whole NZB is that file");
+    }
+
+    #[test]
     fn a_spot_section_shows_everything_the_spot_says() {
         let xml = r#"<Spotnet><Posting><Key>7</Key><Created>1657355034</Created><Poster>NUKE &lt;x&gt;</Poster><Tag>nuke-tag</Tag><Title>Movie &lt;2026&gt; &amp; co</Title><Description>[b]Great[/b] film[br]Password: s3cr&lt;et[br]More at https://example.org/page?a=1&amp;b=2. Bye</Description><Website>https://www.imdb.com/title/tt39162904/</Website><Image Width="477" Height="643"><Segment>img@spot.net</Segment></Image><Size>77594442517</Size><Category>01<Sub>01a15</Sub><Sub>01b11</Sub><Sub>01c04</Sub><Sub>01d05</Sub><Sub>01d20</Sub><Sub>01z00</Sub></Category><NZB><Segment>n@spot.net</Segment></NZB></Posting><Extra><Newsreader>Spotnet 1.9.0.8</Newsreader></Extra></Spotnet>"#;
         let spot = crate::spotnet::full::parse(xml).unwrap();
@@ -4206,6 +4256,7 @@ mod tests {
             imdb_id: spot.imdb_id(),
             spot,
             xml: crate::spotnet::store::Xml::Kept,
+            removed: None,
         };
         use crate::spotnet::comments::{Comment, GONE, READ, WAITING};
         let said = super::SpotSaid {
@@ -4271,6 +4322,18 @@ mod tests {
         assert!(h.contains("<dt>Spam reports</dt><dd>0</dd>") && h.contains("No comments on this spot yet"), "{h}");
         assert!(!h.contains("<dt>Rating</dt>"), "{h}");
         assert!(!h.contains("<dt>Key</dt>") && !h.contains("<dt>Sender</dt>"), "{h}");
+        let removed = crate::spotnet::store::Detail {
+            removed: Some(crate::spotnet::store::Removed { at: 1_793_000_000, by_moderator: true }),
+            ..bare.clone()
+        };
+        let h = super::spot_html(&removed, &super::SpotSaid::default());
+        assert!(h.contains("A Spotnet moderator removed this spot on 2026-10-26"), "{h}");
+        let own = crate::spotnet::store::Detail {
+            removed: Some(crate::spotnet::store::Removed { at: 1_793_000_000, by_moderator: false }),
+            ..bare.clone()
+        };
+        assert!(super::spot_html(&own, &super::SpotSaid::default()).contains("Its spotter removed this spot"));
+        assert!(!super::spot_html(&bare, &super::SpotSaid::default()).contains("removed"));
         let gone = crate::spotnet::store::Detail { xml: crate::spotnet::store::Xml::Gone, ..bare };
         assert!(super::spot_html(&gone, &super::SpotSaid::default()).contains("could no longer be read"));
     }
