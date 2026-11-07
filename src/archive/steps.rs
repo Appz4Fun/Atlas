@@ -839,9 +839,28 @@ impl Step for Par2Step {
     fn reruns(&self) -> Reruns {
         Reruns { on_rename: false, on_growth: true }
     }
+    /// Bit 1: the set's Creator string (`par2_files.creator`), and each RAR data volume's size and CRC32 from the
+    /// first `.rev` file (`archive::rev`), soo a release read before either was kept is read again.
+    fn config_stamp(&self) -> u64 {
+        1
+    }
     fn run(&self, ctx: &mut StepCtx<'_>) -> Result<Outcome, StepError> {
         let files = ctx.files().map_err(retry)?;
-        let sources = select::par2_sources(&files);
+        let explicit = crate::raw_store::is_explicit_rerun(ctx.conn(), ctx.release().id, PAR2_STEP);
+        let mut outcome = self.read_par2(ctx, &files)?;
+        // RAR recovery volumes repair a set as PAR2 does, and are often posted in its place. Read after the set, soo
+        // a release's bodies go to its PAR2 list first and the .rev table gets what is left of the budget
+        let rev = super::rev::read(ctx, &files, explicit)?;
+        outcome.matched |= !rev.is_empty();
+        outcome.writes.extend(rev);
+        Ok(outcome)
+    }
+}
+
+impl Par2Step {
+    /// The set's list, as the step read it before it read `.rev` files too.
+    fn read_par2(&self, ctx: &mut StepCtx<'_>, files: &[FileInfo]) -> Result<Outcome, StepError> {
+        let sources = select::par2_sources(files);
         if sources.is_empty() {
             return Ok(Outcome::default());
         }

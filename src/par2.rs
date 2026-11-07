@@ -26,6 +26,9 @@ const MAX_FILES: usize = 4_096;
 const MAIN: &[u8; 16] = b"PAR 2.0\0Main\0\0\0\0";
 const UNICODE: &[u8; 16] = b"PAR 2.0\0UniFileN";
 const IFSC: &[u8; 16] = b"PAR 2.0\0IFSC\0\0\0\0";
+const CREATOR: &[u8; 16] = b"PAR 2.0\0Creator\0";
+/// The most bytes of a Creator string kept: ParPar's, URL and all, is under 60.
+pub const CREATOR_MAX: usize = 128;
 
 /// A file a PAR2 set describes.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -56,6 +59,54 @@ pub struct Inventory {
     /// (set id, file id) from each Main packet whose body hashes to its set id: a set whose list of files can't have
     /// been added to without changing its id
     pub sealed: Vec<([u8; 16], [u8; 16])>,
+    /// (set id, the program that made the set) from each set's first Creator packet, as `creator_text` keeps it:
+    /// "ParPar v0.4.1 x64 [https://github.com/animetosho/parpar]", "Created by par2cmdline version 0.8.1."
+    pub creators: Vec<([u8; 16], String)>,
+}
+
+impl Inventory {
+    /// The program that made `set_id`'s set, when its Creator packet was read.
+    pub fn creator_of(&self, set_id: &[u8; 16]) -> Option<&str> {
+        self.creators.iter().find(|(set, _)| set == set_id).map(|(_, c)| c.as_str())
+    }
+}
+
+/// A Creator packet's body as Atlas keeps it: the text up to its NUL padding, printable ASCII only (anything else
+/// a space), an e-mail address left out wherever it is (a URL's `user@` too), runs of spaces as one, at most
+/// `CREATOR_MAX` bytes. The spec asks for the client's name and a contact, a URL or an e-mail: the URL names the
+/// tool, the e-mail may name a person, soo it is never kept. None: no letter left, as in garbage.
+pub fn creator_text(body: &[u8]) -> Option<String> {
+    let cut = body.iter().position(|b| *b == 0).unwrap_or(body.len());
+    // enough to hold any real one with room for an address to be cut out of
+    let raw = body.get(..cut.min(CREATOR_MAX * 8)).unwrap_or(&[]);
+    let text: String = raw.iter().map(|b| if b.is_ascii_graphic() { *b as char } else { ' ' }).collect();
+    let mut kept: Vec<String> = Vec::new();
+    for word in text.split_whitespace() {
+        let word = match word.find("://") {
+            // a URL keeps its host and path, not who logs in to it
+            Some(at) => {
+                let (scheme, rest) = word.split_at(at + 3);
+                let host_end = rest.find(['/', '?', '#', ']', ')', '>']).unwrap_or(rest.len());
+                match rest.get(..host_end).and_then(|host| host.rfind('@')) {
+                    Some(user_end) => format!("{scheme}{}", rest.get(user_end + 1..).unwrap_or("")),
+                    None => word.to_string(),
+                }
+            }
+            None if word.contains('@') => continue,
+            None => word.to_string(),
+        };
+        // what an address was wrapped in, left empty
+        if word.chars().all(|c| matches!(c, '<' | '>' | '(' | ')' | '[' | ']' | ',' | ';' | ':')) {
+            continue;
+        }
+        kept.push(word);
+    }
+    let mut out = kept.join(" ");
+    if out.len() > CREATOR_MAX {
+        out.truncate(CREATOR_MAX);
+        out.truncate(out.trim_end().len());
+    }
+    out.bytes().any(|b| b.is_ascii_alphabetic()).then_some(out)
 }
 
 fn id_at(b: &[u8], at: usize) -> Option<[u8; 16]> {
@@ -159,6 +210,13 @@ pub fn inventory(data: &[u8]) -> Inventory {
                 && let Some(name) = clean_name(&name)
             {
                 unicode.push((set_id, file_id, name));
+            }
+        } else if &kind == CREATOR {
+            if inv.creators.len() < MAX_FILES
+                && inv.creator_of(&set_id).is_none()
+                && let Some(text) = creator_text(body)
+            {
+                inv.creators.push((set_id, text));
             }
         } else if &kind == IFSC {
             if ifsc_slices.len() >= MAX_FILES {
@@ -483,6 +541,66 @@ mod tests {
             let part: Vec<String> = inventory(&data[..cut]).files.into_iter().map(|f| f.name).collect();
             assert!(full.starts_with(&part), "cut {cut}");
         }
+    }
+
+    /// a Creator packet's body as a writer pads it: to a multiple of 4 with NULs
+    fn creator(set: u8, text: &[u8]) -> Vec<u8> {
+        let mut body = text.to_vec();
+        while !body.len().is_multiple_of(4) {
+            body.push(0);
+        }
+        packet(set, CREATOR, &body)
+    }
+
+    #[test]
+    fn the_creator_is_kept_per_set() {
+        let parpar = b"ParPar v0.4.1 x64 [https://github.com/animetosho/parpar]";
+        let data = [
+            desc(1, 1, "a.mkv", 1),
+            creator(1, parpar),
+            // a volume repeats it, and a second packet in the same set doesn't replace the first
+            creator(1, b"Created by par2cmdline version 0.8.1."),
+            creator(2, b"Created by par2cmdline version 0.8.1."),
+        ]
+        .concat();
+        let inv = inventory(&data);
+        assert_eq!(inv.creator_of(&[1; 16]), Some(std::str::from_utf8(parpar).unwrap()));
+        assert_eq!(inv.creator_of(&[2; 16]), Some("Created by par2cmdline version 0.8.1."));
+        assert_eq!(inv.creator_of(&[3; 16]), None);
+        assert_eq!(inv.creators.len(), 2);
+    }
+
+    #[test]
+    fn a_creator_keeps_its_url_and_drops_any_address() {
+        assert_eq!(creator_text(b"QuickPar 0.9\0\0\0").as_deref(), Some("QuickPar 0.9"));
+        assert_eq!(
+            creator_text(b"SomeTool 1.2 someone@example.com https://tool.example/").as_deref(),
+            Some("SomeTool 1.2 https://tool.example/"),
+            "the address goes, the URL stays"
+        );
+        assert_eq!(creator_text(b"Tool <user@example.org>").as_deref(), Some("Tool"));
+        assert_eq!(creator_text(b"Tool mailto:user@example.org").as_deref(), Some("Tool"));
+        assert_eq!(
+            creator_text(b"Tool [https://user:pw@host.example/x]").as_deref(),
+            Some("Tool [https://host.example/x]"),
+            "a URL keeps no login"
+        );
+        assert_eq!(creator_text(b"Tool\tv1\r\n").as_deref(), Some("Tool v1"));
+    }
+
+    #[test]
+    fn a_garbage_or_long_creator_is_cut_down() {
+        assert_eq!(creator_text(&[0xff, 0xfe, 0x01, 0x02, 0x80]), None, "no letter, no creator");
+        assert_eq!(creator_text(b""), None);
+        assert_eq!(creator_text(b"\0ParPar"), None, "nothing before the padding");
+        assert_eq!(creator_text(b"Par\xffPar\x07v1").as_deref(), Some("Par Par v1"), "only printable ASCII");
+        let long = creator_text(&[b'x'; 10_000]).unwrap();
+        assert_eq!(long.len(), CREATOR_MAX);
+        let words = creator_text(&b"ab ".repeat(100)).unwrap();
+        assert!(words.len() <= CREATOR_MAX && !words.ends_with(' '), "{words:?}");
+        // a packet of garbage leaves the set's files alone
+        let inv = inventory(&[desc(1, 1, "a.mkv", 1), packet(1, CREATOR, &[0x90; 8])].concat());
+        assert_eq!((inv.files.len(), inv.creators.len()), (1, 0));
     }
 
     #[test]

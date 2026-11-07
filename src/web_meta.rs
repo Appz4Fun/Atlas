@@ -203,6 +203,10 @@ struct Looked {
     points_to: Vec<(String, Vec<ReleaseRow>)>,
     /// sidecar posts (an NFO, a mediainfo dump) that describe this release, full page only
     sidecars: Vec<crate::sidecar::Found>,
+    /// the programs that made the release's PAR2 sets, from their Creator packets (`par2::creator_text`)
+    par2_creators: Vec<String>,
+    /// how many RAR data volumes the first `.rev` file named, by size and CRC32 (`archive::rev`)
+    rev_volumes: i64,
 }
 
 /// One `file_timing` row (`store::FILE_TIMING`): what the overview said about a file's articles, folded at
@@ -298,6 +302,10 @@ fn look(conn: Option<&Connection>, release_id: i64) -> Looked {
             .ok();
         l.id_key = store::IdKey::of(&s).ok();
         l.timing = read_timing(&s, release_id).unwrap_or_default();
+        l.par2_creators = crate::archive::store::par2_creators(&s, "main", release_id);
+        l.rev_volumes = s
+            .query_row("select count(*) from rev_volumes where release_id = ?", [release_id], |r| r.get(0))
+            .unwrap_or(0);
     }
     l.salt = salt(conn);
     l
@@ -1454,6 +1462,9 @@ const TOOL_DEFAULTS: &[ToolDefaults] = &[
 /// Whether the article's shape matches the stated tool's defaults: article size, line length, id grammar, and the
 /// quirks of its yEnc (`yenc_quirks::witness`). None when the tool is not one with known defaults, or nothing can be
 /// compared.
+/// The PAR2 set's Creator string is no witness here: Nyuu makes no PAR2 itself, and ngPost runs whatever par2
+/// program it is set up with (`docs/research/archive-metadata`, "Posting-tool defaults"), soo a ParPar or par2cmdline
+/// set is no tool's default to agree or disagree with. The Inside panel shows it on its own ("PAR2 made by").
 fn tool_verdict(
     agent: Option<&str>,
     segment_size: Option<u64>,
@@ -1580,7 +1591,21 @@ fn inside_panel(i: &MetaInputs<'_>, l: &Looked, compact: bool) -> Facts {
     f.add_html("Points to", points_to_html(&l.points_to));
     f.add_html("Sidecars", sidecars_html(&l.sidecars));
     f.add("PAR2", repair_capacity(i.contents));
+    f.add("PAR2 made by", (!l.par2_creators.is_empty()).then(|| l.par2_creators.join("; ")));
+    f.add("RAR recovery", rev_summary(l.rev_volumes));
     f
+}
+
+/// "size and CRC32 of 47 data volumes, from the first .rev file": what the RAR recovery volumes say of the set they
+/// repair, read from the front of the first one (the volumes of 1 MiB or more, `archive::rev::kept`).
+fn rev_summary(volumes: i64) -> Option<String> {
+    (volumes > 0).then(|| {
+        format!(
+            "size and CRC32 of {} data volume{}, from the first .rev file",
+            thousands(volumes),
+            plural(volumes as usize)
+        )
+    })
 }
 
 /// The names of the files a posted NZB lists, as a save would name their release, PAR2 files last. At most 3.
@@ -2175,9 +2200,14 @@ fn keys_panel(i: &MetaInputs<'_>, l: &Looked, compact: bool) -> Facts {
                 )
             })
             .or_else(|| {
-                // no probed file, but a PAR2-described one another release has too
+                // no probed file, but one its PAR2 set or .rev header describes that another release has too
                 let link = same_link(l, id, Kind::FileCrc);
-                (!link.is_empty()).then(|| format!("A file its PAR2 set describes{link}"))
+                let by = match (l.rev_volumes > 0, !l.par2_creators.is_empty() || i.contents.par2_files > 0) {
+                    (true, false) => "A RAR volume its .rev header describes",
+                    (true, true) => "A file its PAR2 set or .rev header describes",
+                    _ => "A file its PAR2 set describes",
+                };
+                (!link.is_empty()).then(|| format!("{by}{link}"))
             }),
     );
     f.add_html(
@@ -2812,6 +2842,8 @@ mod tests {
             same: Vec::new(),
             points_to: Vec::new(),
             sidecars: Vec::new(),
+            par2_creators: Vec::new(),
+            rev_volumes: 0,
         }
     }
 
@@ -3519,6 +3551,29 @@ mod tests {
         assert_eq!(archive_volumes(&volumes(47)), 47);
         assert_eq!(archive_volumes(&[file("x.7z.001", 1), file("x.7z.002", 1), file("x.par2", 1)]), 2);
         assert!(html.contains("<dt>Packed by</dt><dd>stored, not compressed (m0)</dd>"), "{html}");
+    }
+
+    #[test]
+    fn inside_names_the_par2_maker_and_the_rev_table() {
+        let f = Fixture::new();
+        let mut l = looked(volumes(47));
+        let html = inside_panel(&f.inputs(), &l, false).html;
+        assert!(!html.contains("PAR2 made by") && !html.contains("RAR recovery"), "nothing kept, nothing shown");
+        l.par2_creators = vec!["ParPar v0.4.1 x64 [https://github.com/animetosho/parpar]".into(), "<b>&".into()];
+        l.rev_volumes = 47;
+        let html = inside_panel(&f.inputs(), &l, false).html;
+        assert!(
+            html.contains(
+                "<dt>PAR2 made by</dt><dd>ParPar v0.4.1 x64 [https://github.com/animetosho/parpar]; &lt;b&gt;&amp;</dd>"
+            ),
+            "{html}"
+        );
+        assert!(
+            html.contains("<dt>RAR recovery</dt><dd>size and CRC32 of 47 data volumes, from the first .rev file</dd>"),
+            "{html}"
+        );
+        assert_eq!(rev_summary(1).as_deref(), Some("size and CRC32 of 1 data volume, from the first .rev file"));
+        assert_eq!(rev_summary(0), None);
     }
 
     #[test]

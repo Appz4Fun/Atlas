@@ -243,7 +243,7 @@ impl Kind {
                 "The same OpenSubtitles hash over the main file's first and last 64 KB and its size: the same file, as a rule."
             }
             Kind::FileCrc => {
-                "A file of the same size and whole-file CRC32, from the yEnc trailer of a probed post or from a PAR2 set's file list: the same bytes, as a rule, whatever the file is called or how it was cut into articles. A 32-bit CRC can match by chance, soo check the size and names."
+                "A file of the same size and whole-file CRC32, from the yEnc trailer of a probed post, a PAR2 set's file list or a RAR recovery volume's list of the volumes it repairs: the same bytes, as a rule, whatever the file is called or how it was cut into articles. A 32-bit CRC can match by chance, soo check the size and names."
             }
             Kind::BodyCrc => {
                 "The main file's first article as the server received it: the same CRC32 over the posted body (yEnc name and cut included), the same part number and size. The same post made again, under any poster, subject or Message-ID. Kept for releases probed since Atlas began keeping the header."
@@ -798,7 +798,8 @@ pub fn archive_keys(shard: &Connection, release_id: i64) -> crate::archive::stor
 }
 
 /// The files a release knows the size and whole-file CRC32 of: the probed main file first, then the biggest ones
-/// its PAR2 sets describe, at most `CRC_FILES_CAP`, each once. None on a shard without `par2_files` yet.
+/// its PAR2 sets describe, then the RAR data volumes its first `.rev` file names (`archive::rev`), at most
+/// `CRC_FILES_CAP`, each once. None from a table the shard doesn't have yet.
 pub fn crc_files(shard: &Connection, release_id: i64, probe: Option<&ProbeInfo>) -> rusqlite::Result<Vec<FileCrc>> {
     let mut out: Vec<FileCrc> = probe.and_then(probe_file).into_iter().collect();
     for f in folded_files(shard, release_id) {
@@ -823,7 +824,36 @@ pub fn crc_files(shard: &Connection, release_id: i64, probe: Option<&ProbeInfo>)
             }
         }
     }
+    out.extend(rev_files(shard, release_id, CRC_FILES_CAP.saturating_sub(out.len()), &out)?);
     out.truncate(CRC_FILES_CAP);
+    Ok(out)
+}
+
+/// Up to `room` of the RAR data volumes a release's `.rev` header names, biggest first, none of them in `have`.
+fn rev_files(shard: &Connection, release_id: i64, room: usize, have: &[FileCrc]) -> rusqlite::Result<Vec<FileCrc>> {
+    let mut out = Vec::new();
+    if room == 0 {
+        return Ok(out);
+    }
+    let Ok(mut q) = shard.prepare_cached(
+        "select distinct size, crc32 from rev_volumes where release_id = ?1 and size >= ?2
+         order by size desc, crc32 limit ?3",
+    ) else {
+        return Ok(out);
+    };
+    let wanted = (room + have.len()) as i64;
+    for row in q.query_map(rusqlite::params![release_id, CRC_MIN_SIZE, wanted], |r| {
+        Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+    })? {
+        let (size, crc) = row?;
+        if let Some(f) = u32::try_from(crc).ok().and_then(|c| FileCrc::new(size, c))
+            && !have.contains(&f)
+            && !out.contains(&f)
+            && out.len() < room
+        {
+            out.push(f);
+        }
+    }
     Ok(out)
 }
 
@@ -990,6 +1020,7 @@ fn others_sql(kind: Kind, shard: usize, sets: usize) -> String {
             "select distinct k.release_id from (
                  select release_id from s{shard}.release_keys where file_crc in ({keys})
                  union select release_id from s{shard}.par2_files where bound = 1 and ({pairs})
+                 union select release_id from s{shard}.rev_volumes where {pairs}
                  union select release_id from s{shard}.archive_inner_files
                      where source in {ARCHIVE_SOURCES} and crc32 is not null and ({pairs})
              ) k join s{shard}.releases r on r.id = k.release_id
@@ -1476,6 +1507,66 @@ mod tests {
     }
 
     #[test]
+    fn a_rev_volume_finds_the_same_rar_volume_by_size_and_crc() {
+        let volume = FileCrc::new(50 << 20, 0xdead_beef).unwrap();
+        // the release's own shard: what it can be looked up by
+        let shard = Connection::open_in_memory().unwrap();
+        shard.execute_batch(crate::archive::store::PAR2_FILES.create).unwrap();
+        shard.execute_batch(crate::archive::rev::REV_VOLUMES.create).unwrap();
+        let header = crate::archive::rev::header_bytes(&[(50 << 20, 0xdead_beef), (1_000, 0x1111_1111)], 1, 2);
+        let h = crate::archive::rev::parse(&header).unwrap();
+        for w in crate::archive::rev::writes(1, &h.volumes) {
+            shard.execute(w.sql, params_from_iter(w.params)).unwrap();
+        }
+        assert_eq!(crc_files(&shard, 1, None).unwrap(), vec![volume], "the small volume is left out");
+
+        // every shard: who else has it
+        let conn = Connection::open_in_memory().unwrap();
+        crate::filters::register_sql(&conn).unwrap();
+        conn.execute("attach ':memory:' as s0", []).unwrap();
+        conn.execute_batch(&crate::archive::store::PAR2_FILES.create.replace("par2_files (", "s0.par2_files ("))
+            .unwrap();
+        conn.execute_batch(&RELEASE_KEYS.create.replace("release_keys (", "s0.release_keys (")).unwrap();
+        conn.execute_batch(INNER_FILES_FIXTURE).unwrap();
+        conn.execute_batch(&crate::archive::rev::REV_VOLUMES.create.replace("rev_volumes (", "s0.rev_volumes ("))
+            .unwrap();
+        for (_, index) in crate::archive::rev::REV_VOLUMES.indexes {
+            conn.execute_batch(&index.replacen("exists ", "exists s0.", 1)).unwrap();
+        }
+        conn.execute_batch("create table s0.releases (id integer primary key, group_name text not null)").unwrap();
+        for id in 1..=4 {
+            conn.execute("insert into s0.releases (id, group_name) values (?1, 'a.b.c')", [id]).unwrap();
+        }
+        // 1 asks; 2's PAR2 set lists the volume; 3's .rev names it too; 4's .rev names it at another size
+        conn.execute(
+            "insert into s0.par2_files (release_id, file_id, set_id, md5, md5_16k, size, name, crc32, bound)
+             values (2, x'01', x'02', x'', x'', ?1, 'x.part01.rar', ?2, 1)",
+            rusqlite::params![volume.size, i64::from(volume.crc32)],
+        )
+        .unwrap();
+        for (id, size) in [(1, volume.size), (3, volume.size), (4, volume.size + 1)] {
+            conn.execute(
+                "insert into s0.rev_volumes (release_id, volume, size, crc32) values (?1, 0, ?2, ?3)",
+                rusqlite::params![id, size, i64::from(volume.crc32)],
+            )
+            .unwrap();
+        }
+        let lookup = Lookup { files: vec![volume], ..Default::default() };
+        assert_eq!(others(&conn, 1, &lookup, Kind::FileCrc, 10), vec![3, 2]);
+        assert_eq!(count_others(&conn, 1, &lookup, Kind::FileCrc), 2);
+        // and the other way: the PAR2 set's release finds both .rev releases
+        assert_eq!(others(&conn, 2, &lookup, Kind::FileCrc, 10), vec![3, 1]);
+        let plan: Vec<String> = conn
+            .prepare(&format!("explain query plan {}", others_sql(Kind::FileCrc, 0, 1)))
+            .unwrap()
+            .query_map(rusqlite::params![1, 10, volume.key(), volume.size, i64::from(volume.crc32)], |r| r.get(3))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(plan.iter().any(|p| p.contains("rev_volumes_crc")), "the .rev side seeks size and CRC: {plan:?}");
+    }
+
+    #[test]
     fn a_file_matches_by_its_key_or_a_par2_file_list() {
         let conn = Connection::open_in_memory().unwrap();
         crate::filters::register_sql(&conn).unwrap();
@@ -1483,6 +1574,8 @@ mod tests {
         conn.execute_batch(&crate::archive::store::PAR2_FILES.create.replace("par2_files (", "s0.par2_files ("))
             .unwrap();
         conn.execute_batch(&RELEASE_KEYS.create.replace("release_keys (", "s0.release_keys (")).unwrap();
+        conn.execute_batch(&crate::archive::rev::REV_VOLUMES.create.replace("rev_volumes (", "s0.rev_volumes ("))
+            .unwrap();
         conn.execute_batch(INNER_FILES_FIXTURE).unwrap();
         conn.execute_batch("create table s0.releases (id integer primary key, group_name text not null)").unwrap();
         let blocked = "alt.binaries.pictures.erotica.teen";
