@@ -556,14 +556,18 @@ impl Store {
                 let rows = self.rows_of(&f.poster)?;
                 let parts = place.parts + rows.len() as i64;
                 let ids = rows.iter().map(|r| r.message_id.clone()).collect();
-                // a group that led the file before has no new first piece to offer
-                let led: BTreeSet<i64> = {
-                    let mut stmt =
-                        self.conn.prepare_cached("select distinct grp from headers where poster = ?1 and done = 1")?;
-                    stmt.query_map([&f.poster], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?
+                // a group that led the file before offers a new first piece only in an article it numbers lower than
+                // all it gave before: one another server's listing brought, say
+                let earliest: HashMap<i64, i64> = {
+                    let mut stmt = self.conn.prepare_cached(
+                        "select grp, min(number) from headers where poster = ?1 and done = 1 group by grp",
+                    )?;
+                    stmt.query_map([&f.poster], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?
                 };
-                let rows: Vec<Row> =
-                    rows.into_iter().map(|r| Row { lead: r.lead && !led.contains(&r.grp), ..r }).collect();
+                let rows: Vec<Row> = rows
+                    .into_iter()
+                    .map(|r| Row { lead: r.lead && earliest.get(&r.grp).is_none_or(|&n| r.number < n), ..r })
+                    .collect();
                 let leads = with_leads(&place.leads, self.add_file(&mut out, &place, &f.poster, rows, parts));
                 finished.push((f.poster, Some(Place { parts, leads, ..place }), ids));
             }
@@ -1108,6 +1112,13 @@ mod tests {
         assert_eq!(joined.articles.len(), 7);
         // a.b.two's first article of rar2 is a likely first piece too, though numbered after a.b.one's
         assert_eq!(store.place_of("rar2@x.y").unwrap().unwrap().leads, "1,9");
+        // a.b.one again, from a listing that has an article numbered below all it gave before: a lead too
+        let lower = article(&format!("rar2@x.ya.b.one{:010}", 99), "rar2@x.y", "2023-12-03 16:23:24", 0);
+        let higher = article(&format!("rar2@x.ya.b.one{:010}", 98), "rar2@x.y", "2023-12-03 16:23:24", 9_999);
+        store.record("a.b.one", &[higher], 8200).unwrap();
+        store.record("a.b.one", &[lower], 8200).unwrap();
+        store.pass(8201 + SETTLE_SECS).unwrap();
+        assert_eq!(store.place_of("rar2@x.y").unwrap().unwrap().leads, "1,9,12");
         let vol: Vec<_> = joined.articles.iter().filter(|a| a.author == "vol@x.y").collect();
         assert_eq!(vol.len(), 4);
         assert!(vol.iter().all(|a| a.file_index == Some(3) && a.file_total == Some(3)), "its third file");
