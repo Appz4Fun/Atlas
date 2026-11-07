@@ -4235,13 +4235,6 @@ mod tests {
             assert!(h.contains(want), "missing {want:?} in {h}");
         }
         assert!(!h.contains("[b]"), "{h}");
-        // a link's own parentheses stay; the sentence's don't
-        assert_eq!(
-            crate::spotnet::ubb::link_end("https://en.wikipedia.org/wiki/Heat_(1995_film)"),
-            "https://en.wikipedia.org/wiki/Heat_(1995_film)"
-        );
-        assert_eq!(crate::spotnet::ubb::link_end("https://x.org/a)."), "https://x.org/a");
-        assert_eq!(crate::spotnet::ubb::link_end("https://x.org/a_(b))"), "https://x.org/a_(b)");
         // a website that isn't a web link is shown, not linked
         let mut odd = d.clone();
         odd.spot.website = "javascript:alert(1)".into();

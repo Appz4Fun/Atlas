@@ -14,10 +14,12 @@ use crate::web::attr;
 /// What a link carries: no referrer, no SEO credit, no window handle.
 const REL: &str = "noopener noreferrer nofollow";
 
+/// A UBB tag: `/` when it closes, its name, and its value (`[url=..]`).
+static TAG: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\[(/?)(b|i|u|br|url|quote|youtube|img)(?:=([^\]\r\n]{0,2048}))?\]").unwrap());
+
 /// The text as HTML: escaped, its line breaks kept (`[br]` as one), its UBB rendered.
 pub fn to_html(text: &str) -> String {
-    static TAG: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"(?i)\[(/?)(b|i|u|br|url|quote|youtube|img)(?:=([^\]\r\n]{0,2048}))?\]").unwrap());
     let text = text.trim();
     let mut out = String::with_capacity(text.len() + 64);
     // the formatting tags open, innermost last: closed in order, unmatched closers dropped, the rest closed at the end
@@ -35,11 +37,13 @@ pub fn to_html(text: &str) -> String {
             continue;
         }
         let before = &text[at..whole.start()];
-        // a quote's tags on lines of their own: the line breaks around them are the box's, not the text's
-        let before = if name == "quote" { before.strip_suffix('\n').unwrap_or(before) } else { before };
+        // a quote's tags on lines of their own (one that opens or closes a box): the line breaks around them are the
+        // box's, not the text's
+        let boxed = name == "quote" && (!closing || open.contains(&"blockquote"));
+        let before = if boxed { before.strip_suffix('\n').unwrap_or(before) } else { before };
         plain(&mut out, before);
         at = whole.end();
-        if name == "quote" {
+        if boxed {
             at += usize::from(text[at..].starts_with('\n'));
         }
         match (name.as_str(), closing) {
@@ -66,9 +70,15 @@ pub fn to_html(text: &str) -> String {
                     Some((end, after)) => (&text[at..end], after),
                     None => ("", at),
                 };
-                let label = strip_tags(inner);
+                let label = label_text(inner);
                 let label = label.trim();
                 let address = value.filter(|v| !v.is_empty()).unwrap_or(label);
+                if address.is_empty() && label.is_empty() {
+                    // `[url]` with nothing to link: the tag, as text
+                    plain(&mut out, whole.as_str());
+                    at = next;
+                    continue;
+                }
                 match web_url(address) {
                     Some(href) => {
                         let shown = if label.is_empty() { href } else { label };
@@ -81,10 +91,21 @@ pub fn to_html(text: &str) -> String {
                         let _ = write!(out, "{} ({})", escape(label), escape(address));
                     }
                 }
-                // formatting closed inside the link closes after it
+                // formatting opened before the link and closed inside it closes after it; what the label opens and
+                // closes itself stays inside it
+                let mut inside: Vec<&'static str> = Vec::new();
                 for c in TAG.captures_iter(inner) {
-                    if !c[1].is_empty() && matches!(c[2].to_ascii_lowercase().as_str(), "b" | "i" | "u" | "quote") {
-                        close(&mut out, &mut open, element(&c[2].to_ascii_lowercase()));
+                    let tag = c[2].to_ascii_lowercase();
+                    if c.get(3).is_some() || !matches!(tag.as_str(), "b" | "i" | "u" | "quote") {
+                        continue;
+                    }
+                    let tag = element(&tag);
+                    if c[1].is_empty() {
+                        inside.push(tag);
+                    } else if let Some(i) = inside.iter().rposition(|t| *t == tag) {
+                        inside.truncate(i);
+                    } else {
+                        close(&mut out, &mut open, tag);
                     }
                 }
                 at = next;
@@ -133,20 +154,34 @@ fn close(out: &mut String, open: &mut Vec<&'static str>, tag: &'static str) {
     }
 }
 
-/// Where the closer (`close`) after `from` starts and ends, unless another opener (`open`) comes first.
+/// Where the closer (`close`) after `from` starts and ends, looked for only up to the next opener (`open`).
 fn find_close(text: &str, from: usize, close: &Regex, open: &Regex) -> Option<(usize, usize)> {
-    let m = close.find_at(text, from)?;
-    if open.find_at(text, from).is_some_and(|o| o.start() < m.start()) {
-        return None;
-    }
-    Some((m.start(), m.end()))
+    let until = open.find_at(text, from).map_or(text.len(), |o| o.start());
+    let m = close.find(&text[from..until])?;
+    Some((from + m.start(), from + m.end()))
 }
 
-/// A link's text without the UBB tags inside it: only text goes in a link. Other bracketed words stay.
-fn strip_tags(s: &str) -> String {
-    static KNOWN: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"(?i)\[/?(?:b|i|u|br|url|quote|youtube|img)(?:=[^\]]*)?\]").unwrap());
-    KNOWN.replace_all(s, "").into_owned()
+/// A link's text: only text goes in a link, so its UBB tags are dropped, by the same rules `to_html` reads them
+/// (a smiley still shows, a tag with a value it can't take is text). Other bracketed words stay.
+fn label_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut at = 0;
+    for c in TAG.captures_iter(s) {
+        let whole = c.get(0).unwrap();
+        out.push_str(&s[at..whole.start()]);
+        at = whole.end();
+        let name = c[2].to_ascii_lowercase();
+        match c.get(3).map(|v| v.as_str().trim()) {
+            Some(v) if name == "img" && c[1].is_empty() && smiley(v) => {
+                let _ = write!(out, ":{}:", v.to_ascii_lowercase());
+            }
+            Some(_) if c[1].is_empty() && matches!(name.as_str(), "url" | "quote") => {}
+            Some(_) => out.push_str(whole.as_str()),
+            None => {}
+        }
+    }
+    out.push_str(&s[at..]);
+    out
 }
 
 /// The address, when it's an http or https one that can go in a link as it is.
@@ -181,7 +216,7 @@ fn plain(out: &mut String, text: &str) {
 
 /// A link found in text without what's more likely the sentence's: trailing punctuation, and a closing parenthesis
 /// that has no opening one in the link (`(see https://x.org/a)`), while `https://x.org/Heat_(1995)` keeps its own.
-pub fn link_end(found: &str) -> &str {
+fn link_end(found: &str) -> &str {
     let mut url = found;
     loop {
         let trimmed = url.trim_end_matches(['.', ',', ';', ':', '!', '?', '\'', '"']);
@@ -225,25 +260,28 @@ mod tests {
                 link("https://b.org", "https://b.org")
             )
         );
-        // formatting closed inside a link closes after it
+        // formatting opened before a link and closed inside it closes after it; the label's own stays in it
         assert_eq!(
             to_html("[b][url=https://a.org]x[/b][/url] rest"),
             format!("<b>{}</b> rest", link("https://a.org", "x"))
         );
+        assert_eq!(
+            to_html("[b]bold [url=https://a.org][b]x[/b][/url] still[/b] not"),
+            format!("<b>bold {} still</b> not", link("https://a.org", "x"))
+        );
+        // a smiley in a label shows; `[url]` with nothing to link stays text
+        assert_eq!(to_html("[url=https://a.org]Thanks [img=klappen][/url]"), link("https://a.org", "Thanks :klappen:"));
+        assert_eq!(to_html("click [url] here"), "click [url] here");
     }
 
     #[test]
     fn only_web_links_are_links() {
         // not a web link: the label and the address, as text
         assert_eq!(to_html("[url=javascript:alert(1)]click[/url]"), "click (javascript:alert(1))");
-        assert_eq!(
-            to_html("[url=https://a.org/\" onclick=x]click[/url]"),
-            "click (https://a.org/&quot; onclick=x)".replace("&quot;", "\"")
-        );
+        assert_eq!(to_html("[url=https://a.org/\" onclick=x]click[/url]"), "click (https://a.org/\" onclick=x)");
         assert_eq!(to_html("[url]ftp://a.org/f[/url]"), "ftp://a.org/f");
         assert_eq!(to_html("[url=www.example.com]Our site[/url]"), "Our site (www.example.com)");
-        // an address with an attribute-breaking quote mark of its own is left as text
-        assert!(!to_html("[url=https://a.org/'x]y[/url]").contains("href=\"https://a.org/'x"));
+        // an address with an apostrophe is linked, the apostrophe encoded so it can't end the attribute
         assert_eq!(to_html("[url=https://a.org/'x]y[/url]"), link("https://a.org/&#39;x", "y"));
     }
 
@@ -259,6 +297,8 @@ mod tests {
         assert_eq!(to_html("[b=x]y"), "[b=x]y");
         assert_eq!(to_html("[quote=Olli <x>]hi[/quote]"), "<blockquote><cite>Olli &lt;x&gt;</cite>\nhi</blockquote>");
         assert_eq!(to_html("a\n[quote]\nhello\n[/quote]\nreply"), "a<blockquote>hello</blockquote>reply");
+        // a stray closer keeps the lines around it
+        assert_eq!(to_html("one\n[/quote]\ntwo"), "one\n\ntwo");
         assert_eq!(to_html("Thanks![img=klappen]"), "Thanks!:klappen:");
         // an image isn't shown: its tag stays text, its address a link like any other
         assert_eq!(
