@@ -584,12 +584,6 @@ pub fn gather_per_article(group: &str, articles: Vec<Article>) -> (Vec<Article>,
     (kept, uploads.into_values().collect(), count)
 }
 
-/// The file row `gather_per_article` puts every same-sized file of an upload without a file counter in
-/// (`per-article.p{total}`): its files share part numbers, soo a part it already has isnt a repost.
-pub(crate) fn shared_file_row(filename: &str) -> bool {
-    filename.strip_prefix("per-article.p").is_some_and(|t| !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit()))
-}
-
 /// Stable, in decimal: a run of hex would read as a random name, and leave search.
 fn per_article_name(key: &str) -> String {
     let hash = key.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3));

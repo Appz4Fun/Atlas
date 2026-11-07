@@ -1,7 +1,7 @@
-//! `atlas --recount-reposts`: size and parts of rows saved before a repost was counted once. An uploader that posts
-//! the same file again under other message-ids (five times over, every article the same) made one release of them
-//! all, and each copy of a part was added to its size and parts: a 40 GB post read 200 GB. Saves now count a part
-//! once (`store::repost_excess` tells what they didnt). A dry run unless `--apply`.
+//! `atlas --recount-articles --since UNIX_TIME`: size and parts of rows saved while a build counted a part saved again
+//! under another message-id once (26f0497, #242). Different files can share a file row, soo such a part isnt known to
+//! be a repost, and those saves left size and parts short. Every row with a file saved since `--since` gets them back
+//! as the sum and count of every article it holds, what saves count. A dry run unless `--apply`.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
@@ -11,7 +11,7 @@ use rusqlite::{Connection, params};
 use super::walk::{self, BATCH, WalkLimits};
 use crate::{db, store};
 
-const CURSOR: &str = "recount_reposts_after";
+const CURSOR: &str = "recount_articles_after";
 
 /// A batch of `(id, (size, parts))` past `after`: every row comes back, soo the walk goes on past rows with nothing
 /// to do.
@@ -23,31 +23,18 @@ fn batch(conn: &Connection, after: i64) -> rusqlite::Result<Vec<(i64, (i64, i64)
         .collect()
 }
 
-/// A row's `size` and `parts` counting each part once, when its reposts were counted: `(size, parts)`. Worked out
-/// from what it holds, not by taking the reposts off, as a repost saved after this build came in wasnt counted and
-/// copies of different parts differ in size. Never more than the row has now.
-fn excess(conn: &Connection, id: i64, size: i64, parts: i64) -> rusqlite::Result<Option<(i64, i64)>> {
-    if parts <= store::seen_parts(conn, id)? {
+/// What a row saved since `since` should have: `(size, parts)`, when that's not what it has.
+fn short(conn: &Connection, id: i64, size: i64, parts: i64, since: i64) -> rusqlite::Result<Option<(i64, i64)>> {
+    let saved: bool = conn
+        .prepare_cached("select exists (select 1 from files where release_id = ? and touched_at >= ?)")?
+        .query_row(params![id, since], |r| r.get(0))?;
+    if !saved {
         return Ok(None);
     }
-    // what a save past its decode budget held back is sealing's to settle (a repost among it is taken out then):
-    // left for now, a later run gets it
-    let held: bool = conn
-        .prepare_cached(
-            "select exists (select 1 from held_back h join files f on f.id = h.file_id where f.release_id = ?)",
-        )?
-        .query_row([id], |r| r.get(0))?;
-    if held {
-        return Ok(None);
-    }
-    let found = store::repost_excess(conn, id)?;
-    if found.truncated || found.count <= 0 || found.kept >= parts {
-        return Ok(None);
-    }
-    Ok(Some((size.min(found.kept_bytes), found.kept)))
+    Ok(store::article_totals(conn, id)?.filter(|t| *t != (size, parts)))
 }
 
-fn dry_run(main: &Path, sample: usize) -> anyhow::Result<()> {
+fn dry_run(main: &Path, since: i64, sample: usize) -> anyhow::Result<()> {
     let (mut rows, mut bytes, mut articles, mut shown) = (0u64, 0i64, 0i64, Vec::new());
     for path in store::shard_paths(main) {
         let conn = walk::open_for_reading(&path)?;
@@ -57,28 +44,28 @@ fn dry_run(main: &Path, sample: usize) -> anyhow::Result<()> {
             let Some((last, _)) = ids.last() else { break };
             after = *last;
             for (id, (size, parts)) in ids {
-                if let Some((new_size, new_parts)) = excess(&conn, id, size, parts)? {
-                    let (b, n) = (size - new_size, parts - new_parts);
+                if let Some((s, p)) = short(&conn, id, size, parts, since)? {
                     rows += 1;
-                    bytes += b;
-                    articles += n;
+                    bytes += s - size;
+                    articles += p - parts;
                     if shown.len() < sample {
-                        shown.push((id, b, n));
+                        shown.push(format!("{id}: size {size} -> {s}, parts {parts} -> {p}"));
                     }
                 }
             }
         }
     }
-    println!("{rows} rows would lose {articles} reposted articles, {bytes} bytes in all");
-    for (id, b, n) in shown {
-        println!("  {id}: {n} articles, {b} bytes");
+    println!("{rows} rows would change by {articles} articles and {bytes} bytes in all");
+    for line in shown {
+        println!("  {line}");
     }
-    println!("a dry run: nothing was changed. --apply takes them out of size and parts");
+    println!("a dry run: nothing was changed. --apply sets them");
     Ok(())
 }
 
 fn apply_shard(
     path: &Path,
+    since: i64,
     limits: &WalkLimits,
     stop: &AtomicBool,
     commits: &AtomicU64,
@@ -100,27 +87,45 @@ fn apply_shard(
         shard_commits: 0,
     };
     let write = |tx: &Connection, ids: &[(i64, (i64, i64))]| -> rusqlite::Result<()> {
-        // the reposted articles stay, and so does the shard's count of articles: only the release's size and parts
         let mut update = tx.prepare_cached("update releases set size = ?, parts = ? where id = ?")?;
-        // postprocessing's growth mark comes down with it, or the next real part would read as no growth
-        let mut mark =
-            tx.prepare_cached("update pp_state set parts_seen = max(parts_seen - ?, 0) where release_id = ?")?;
         for (id, (size, parts)) in ids {
-            if let Some((new_size, new_parts)) = excess(tx, *id, *size, *parts)? {
-                update.execute(params![new_size, new_parts, id])?;
-                mark.execute(params![parts - new_parts, id])?;
+            if let Some((s, p)) = short(tx, *id, *size, *parts, since)? {
+                update.execute(params![s, p, id])?;
                 fixed.fetch_add(1, Relaxed);
             }
         }
         Ok(())
     };
     while walk.step(batch, write)? {}
-    walk::finish_shard(&conn, "key = 'recount_reposts_after'")
+    walk::finish_shard(&conn, "key = 'recount_articles_after'")
 }
 
-/// `atlas --recount-reposts [--sample N] [--apply]`. Exit 0 on success, 1 when refused or failed.
+/// `--since UNIX_TIME` out of the arguments, and the rest for `walk::parse`.
+fn since(args: &[String]) -> Result<(i64, Vec<String>), String> {
+    let mut rest = Vec::new();
+    let mut since = None;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a == "--since" {
+            let v = it.next().ok_or("--since needs a unix time")?;
+            since = Some(v.parse::<i64>().map_err(|_| format!("--since needs a unix time, not {v}"))?);
+        } else {
+            rest.push(a.clone());
+        }
+    }
+    Ok((since.ok_or("--since UNIX_TIME is needed: rows with a file saved since then are recounted")?, rest))
+}
+
+/// `atlas --recount-articles --since UNIX_TIME [--sample N] [--apply]`. Exit 0 on success, 1 when refused or failed.
 pub fn run(args: &[String]) -> i32 {
-    let o = match walk::parse(args, "--recount-reposts") {
+    let (since, rest) = match since(args) {
+        Ok(x) => x,
+        Err(e) => {
+            println!("{e}");
+            return 1;
+        }
+    };
+    let o = match walk::parse(&rest, "--recount-articles") {
         Ok(o) => o,
         Err(e) => {
             println!("{e}");
@@ -133,7 +138,7 @@ pub fn run(args: &[String]) -> i32 {
             println!("{e}");
             return 1;
         }
-        return match dry_run(&main, o.sample) {
+        return match dry_run(&main, since, o.sample) {
             Ok(()) => 0,
             Err(e) => {
                 println!("{e:#}");
@@ -151,7 +156,7 @@ pub fn run(args: &[String]) -> i32 {
     let limits = walk::limits("ATLAS_RECOUNT");
     let stop = walk::stop_flag();
     let (commits, rows, fixed) = (AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0));
-    let result = walk::each_shard(&main, |path| apply_shard(path, &limits, &stop, &commits, &rows, &fixed));
+    let result = walk::each_shard(&main, |path| apply_shard(path, since, &limits, &stop, &commits, &rows, &fixed));
     println!("{} rows recounted", fixed.load(Relaxed));
     match result {
         Ok(()) => 0,
@@ -167,41 +172,36 @@ mod tests {
     use super::*;
     use crate::parser::{Article, Release};
 
-    /// A row comes to one article a part, whichever of its reposts an older save counted and a save of this build
-    /// didnt, and whatever size its parts are.
+    /// A row a short-counting save left gets the sum and count of what it holds; one saved before `--since`, or
+    /// already right, is left.
     #[test]
-    fn a_row_comes_to_one_article_a_part() {
+    fn a_row_saved_since_gets_every_article_counted() {
         let dir = tempfile::tempdir().unwrap();
         let main = dir.path().join("atlas.db");
         db::create_db_at(&main).unwrap();
-        let art = |part: i64, copy: u8| Article {
-            message_id: format!("<p{part}c{copy}@x>"),
-            subject: format!("\"a.rar\" yEnc ({part}/2)"),
+        let art = |copy: u8| Article {
+            message_id: format!("<p1c{copy}@x>"),
+            subject: "\"a.rar\" yEnc (1/1)".into(),
             filename: Some("a.rar".into()),
-            part: Some(part),
-            total_parts: Some(2),
-            bytes: if part == 1 { 100 } else { 10 },
+            part: Some(1),
+            total_parts: Some(1),
+            bytes: 100,
             ..Default::default()
         };
         let rel = Release {
             name: "Rel".into(),
             group: "alt.binaries.t".into(),
-            articles: vec![art(1, 0), art(2, 0), art(1, 1), art(2, 1)],
+            articles: vec![art(0), art(1), art(2)],
             ..Default::default()
         };
         store::save(&main, &[rel]).unwrap();
         let conn = db::open_at(&store::shard_path(&main, store::shard_of("alt.binaries.t"))).unwrap();
-        let (id, size, parts): (i64, i64, i64) = conn
-            .query_row("select id, size, parts from releases where name = 'Rel'", [], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-            })
-            .unwrap();
-        assert_eq!((size, parts), (110, 2));
-        assert_eq!(excess(&conn, id, size, parts).unwrap(), None, "a row saved by this build has nothing to take out");
-        // as an older save left it: the repost of the 100-byte part counted, the 10-byte one's not
-        assert_eq!(excess(&conn, id, 210, 3).unwrap(), Some((110, 2)));
-        // what a save past its decode budget held back is sealing's to settle first
-        conn.execute("insert into held_back (file_id, message_id, part) select id, '<h@x>', 1 from files", []).unwrap();
-        assert_eq!(excess(&conn, id, 210, 3).unwrap(), None);
+        let id: i64 = conn.query_row("select id from releases", [], |r| r.get(0)).unwrap();
+        assert_eq!(short(&conn, id, 300, 3, 0).unwrap(), None, "already right");
+        // as the short-counting build left it
+        assert_eq!(short(&conn, id, 100, 1, 0).unwrap(), Some((300, 3)));
+        assert_eq!(short(&conn, id, 100, 1, i64::MAX).unwrap(), None, "not saved since");
+        assert!(since(&["--recount-articles".into()]).is_err());
+        assert_eq!(since(&["--since".into(), "5".into(), "--apply".into()]).unwrap(), (5, vec!["--apply".into()]));
     }
 }

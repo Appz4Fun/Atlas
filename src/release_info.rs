@@ -276,18 +276,9 @@ fn contents_of(conn: &Connection, ids: &[i64], recovery: &[i64], with_bytes: Byt
     };
     let mut bytes: HashMap<String, i64> = HashMap::new();
     if read_bytes {
-        // a part posted again under another message-id (a repost of the same file) is one part's bytes, not two
-        let mut parts: std::collections::HashSet<(String, i64)> = std::collections::HashSet::new();
         for id in ids {
             store::each_article(conn, *id, &mut |article| {
-                let name = article.filename.unwrap_or_default();
-                if let Some(part) = article.part
-                    && !crate::filters::shared_file_row(&name)
-                    && !parts.insert((name.clone(), part))
-                {
-                    return Ok(());
-                }
-                *bytes.entry(name).or_default() += article.bytes.unwrap_or(0);
+                *bytes.entry(article.filename.unwrap_or_default()).or_default() += article.bytes.unwrap_or(0);
                 Ok(())
             })?;
         }
