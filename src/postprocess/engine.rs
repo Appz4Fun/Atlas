@@ -1290,8 +1290,12 @@ pub(crate) fn seed_shard(
     once("pp_probe_encrypted_pw", &|| crate::probe::step::rerun_encrypted_with_password(conn, now))?;
     // once, for the movies and TV saved incomplete before a whole video named as its release, or a PAR2 set naming
     // only files there, counted over the subject counter (`store::release_complete`); and again once a whole RAR set
-    // named as its release counted too
-    if meta("pp_complete_by_files")?.is_none() || meta("pp_complete_by_rar_set")?.is_none() {
+    // named as its release counted too, and once more for a whole video beside its PAR2 set and side files (a post's
+    // `thumbnail.jpg` that came as a row of its own)
+    if meta("pp_complete_by_files")?.is_none()
+        || meta("pp_complete_by_rar_set")?.is_none()
+        || meta("pp_complete_by_video_side_files")?.is_none()
+    {
         // through the queue: a row visited before, when its body steps waited on completeness (`BodyGate::NotYet`),
         // has no queue row left to bring it back
         let fixed = crate::store::recheck_movie_tv_complete(conn)?;
@@ -1304,6 +1308,7 @@ pub(crate) fn seed_shard(
         eprintln!("shard {shard}: one-off seed pp_complete_by_files queued {} releases", fixed.len());
         set("pp_complete_by_files", now)?;
         set("pp_complete_by_rar_set", now)?;
+        set("pp_complete_by_video_side_files", now)?;
     }
     // once, for the movie and TV probes from before the probe kept the server's body CRC: a HEAD each. The step
     // does nothing for a release it wasn't asked about, soo it is marked seen here and starts no walk of every row
