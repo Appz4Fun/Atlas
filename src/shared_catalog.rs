@@ -1574,7 +1574,8 @@ pub mod reader {
     /// The most rows of one name, or one stem, a split-post lookup takes from the catalog; past it the shards answer,
     /// as they would have stopped early too.
     pub const NAMED_CAP: i64 = 4_096;
-    pub const STEM_CAP: i64 = 16_384;
+    /// a stem's rows past which some shard would hold more than its 1,024 anyway (`release_info::LINKED_ROWS`)
+    pub const STEM_CAP: i64 = 8_200;
 
     /// A release row as a split-post lookup needs it, with its shard: `posted` is the text `julianday` reads.
     #[derive(Clone, Debug, PartialEq, Eq)]
