@@ -143,7 +143,9 @@ impl BodyFetcher {
         if let Some(why) = self.refusal(release, &request.file, *used) {
             return Ok(Got::Refused(why));
         }
+        let token_at = Instant::now();
         self.wait_for_token(deadline)?;
+        let token_wait = token_at.elapsed();
         let Some(left) = deadline.checked_duration_since(Instant::now()).filter(|d| !d.is_zero()) else {
             return Err(StepError::OutOfBudget);
         };
@@ -152,25 +154,22 @@ impl BodyFetcher {
             let cap = self.config.read().unwrap().body_max_bytes as usize;
             request.max_bytes.map_or(cap, |m| m.min(cap))
         };
-        // the run's deadline holds for the whole read: a slow server's timeouts are per read
+        // a fetch slot is waited for until the run's deadline; with one, the body takes what its servers take, each
+        // server its own time limit and retries (`Pool::background_read`), and the run's deadline doesnt cut it short
         let span = crate::metrics::span("stage.fetch_body");
         let asked = Instant::now();
-        // when a fetch slot came: past the deadline, whether it was waited for or the servers took the time
-        let mut slot_at = None;
         let fetched = self.handle.block_on(unless_stopped(&self.stop, async {
-            tokio::time::timeout(left, async {
-                let _permit = self.in_flight.acquire().await.expect("semaphore closed");
-                slot_at = Some(Instant::now());
-                self.pool.background_read(&request.message_id, max_bytes, read).await
-            })
-            .await
+            let _permit = tokio::time::timeout(left, self.in_flight.acquire()).await?.expect("semaphore closed");
+            Ok(self.pool.background_read(&request.message_id, max_bytes, read).await)
         }));
         if matches!(fetched, Some(Ok(Err(_))) | Some(Err(_))) {
             span.failed();
         }
         drop(span);
         let fetched = match fetched {
-            Some(Err(_elapsed)) => return Err(StepError::Transient(past_deadline(*used, asked, slot_at))),
+            Some(Err(tokio::time::error::Elapsed { .. })) => {
+                return Err(StepError::Transient(no_slot(*used, asked, left, token_wait)));
+            }
             Some(Ok(result)) => Some(result),
             None => None,
         };
@@ -189,14 +188,16 @@ impl BodyFetcher {
     }
 }
 
-/// A body past the run's deadline: which of the run's bodies it was, and its time waiting for a fetch slot and at the
-/// servers (a lease, then the read), soo a run of many bodies is told from one starved of slots or connections.
-fn past_deadline(body: i64, asked: Instant, slot_at: Option<Instant>) -> String {
-    let now = Instant::now();
-    let slot = slot_at.unwrap_or(now).saturating_duration_since(asked).as_secs();
-    let servers = slot_at.map_or(0, |at| now.saturating_duration_since(at).as_secs());
+/// A body that got no fetch slot before the run's deadline: which of the run's bodies it was, how long before the
+/// deadline it was asked, after how long waiting for a token of the budget, and how long it waited for a slot, soo a
+/// run starved of slots is told from one whose time went before its body was asked (the budget, or the step's work).
+fn no_slot(body: i64, asked: Instant, left: Duration, token_wait: Duration) -> String {
+    let waited = Instant::now().saturating_duration_since(asked).as_secs_f64();
     format!(
-        "a body took past the run's deadline: body {body} of the run, {slot} s waiting for a fetch slot, {servers} s at the servers"
+        "no fetch slot before the run's deadline: body {body} of the run, asked {:.1} s before it after {:.1} s waiting \
+         for a token, {waited:.1} s waiting for a slot",
+        left.as_secs_f64(),
+        token_wait.as_secs_f64()
     )
 }
 
@@ -205,13 +206,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_body_past_the_deadline_says_where_its_time_went() {
+    fn a_body_without_a_slot_says_where_its_time_went() {
         let asked = Instant::now() - Duration::from_secs(50);
-        let waited = past_deadline(7, asked, Some(asked + Duration::from_secs(30)));
-        assert!(waited.starts_with("a body took past the run's deadline: body 7 of the run, 30 s waiting"), "{waited}");
-        assert!(waited.ends_with(", 20 s at the servers"), "{waited}");
-        let starved = past_deadline(1, asked, None);
-        assert!(starved.ends_with("body 1 of the run, 50 s waiting for a fetch slot, 0 s at the servers"), "{starved}");
+        let said = no_slot(7, asked, Duration::from_millis(50_040), Duration::from_millis(1_200));
+        let start = "no fetch slot before the run's deadline: body 7 of the run, asked 50.0 s before it after 1.2 s";
+        assert!(said.starts_with(start), "{said}");
+        assert!(said.contains(" waiting for a token, 50.0"), "{said}");
+        let late = no_slot(1, Instant::now(), Duration::from_millis(300), Duration::ZERO);
+        assert!(
+            late.ends_with("asked 0.3 s before it after 0.0 s waiting for a token, 0.0 s waiting for a slot"),
+            "{late}"
+        );
     }
 
     #[test]
@@ -252,20 +257,29 @@ mod tests {
     }
 
     #[test]
-    fn a_body_stops_at_the_runs_deadline() {
+    fn a_body_takes_its_servers_time_not_the_runs_deadline() {
         // a server that takes the connection and says nothing
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
-        let f = fetcher(port, &runtime);
+        let mut f = fetcher(port, &runtime);
+        let pool = Pool::new(&[{
+            let mut s = crate::config::UsenetServer::new("127.0.0.1", "u", "p", port);
+            s.ssl = Some(false);
+            s
+        }])
+        .with_timeout(Duration::from_millis(800));
+        f.pool = Arc::new(pool);
         let release = ReleaseInfo { group: "alt.binaries.t".into(), size: 10, ..Default::default() };
         let ask = BodyRequest { message_id: "<a@x>".into(), file: "a.bin".into(), max_bytes: None };
         let mut used = 0;
         let start = Instant::now();
         let got = f.fetch(&release, &ask, &mut used, start + Duration::from_millis(300), BackgroundRead::Capped);
         assert!(matches!(got, Err(StepError::Transient(_))), "{got:?}");
+        // the server's own time limit ended it, past the run's deadline
+        assert!(start.elapsed() >= Duration::from_millis(700), "{:?}", start.elapsed());
         assert!(start.elapsed() < Duration::from_secs(5), "{:?}", start.elapsed());
-        // nothing is started once it has passed
+        // nothing is started once the run's deadline has passed
         let got = f.fetch(&release, &ask, &mut used, Instant::now(), BackgroundRead::Capped);
         assert!(matches!(got, Err(StepError::OutOfBudget)), "{got:?}");
         drop(listener);

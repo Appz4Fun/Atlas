@@ -323,6 +323,8 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 /// later, a body tries the next server).
 const XOVER_DEADLINE: Duration = Duration::from_secs(300);
 const BODY_DEADLINE: Duration = Duration::from_secs(60);
+/// tries of a background body on one server past its first, after a timeout or a failure
+pub const BODY_RETRIES: usize = 2;
 
 /// The error for a command that ran past its deadline.
 fn past_deadline(command: &str, deadline: Duration) -> NntpError {
@@ -1801,6 +1803,8 @@ pub struct Pool {
     /// `XOVER_DEADLINE` and `BODY_DEADLINE`, shorter in tests
     xover_deadline: Duration,
     body_deadline: Duration,
+    /// tries of a background body on one server past its first, after a timeout or a failure (not after "not here")
+    body_retries: usize,
     rate_limiter: Arc<TokenBucket>,
 }
 
@@ -2007,6 +2011,7 @@ impl Pool {
             body_patience: BODY_PATIENCE,
             xover_deadline: XOVER_DEADLINE,
             body_deadline: BODY_DEADLINE,
+            body_retries: BODY_RETRIES,
             unsaved: UnsavedBudget::new(crate::config::DEFAULT_MAX_UNSAVED_HEADERS as usize),
             rate_limiter: Arc::new(TokenBucket::new(0, 0)),
         }
@@ -2054,6 +2059,14 @@ impl Pool {
     }
 
     /// how long one XOVER and one BODY may take in all (`XOVER_DEADLINE`, `BODY_DEADLINE`)
+    /// A background body's time limit on each server it asks, and how many times more it asks a server that timed
+    /// out or failed (`postprocess.body_timeout_secs`, `postprocess.body_retries`).
+    pub fn with_body_tries(mut self, timeout: Duration, retries: usize) -> Self {
+        self.body_deadline = timeout;
+        self.body_retries = retries;
+        self
+    }
+
     pub fn with_deadlines(mut self, xover: Duration, body: Duration) -> Self {
         self.xover_deadline = xover;
         self.body_deadline = body;
@@ -2520,12 +2533,21 @@ impl Pool {
             return Err(Self::no_servers());
         }
         let start = Instant::now();
-        let mut unreachable = None;
-        // a fallback server that couldnt be asked: an error only when no other server could be either
-        let mut fallback_unreachable = None;
+        // each server's last failure, if its last try failed: cleared when a later try of it says "not here"
+        let mut failed: Vec<Option<NntpError>> = (0..self.servers.len()).map(|_| None).collect();
+        // tries each server has had, each with its own `body_deadline`: one, and `body_retries` more after a failure
+        let mut tries = vec![0usize; self.servers.len()];
         let mut answered = false;
         while !left.is_empty() {
             let mut no_room = Vec::new();
+            // a failed try is tried again after the other servers, while its server isnt resting
+            let mut again = |i: usize, e: NntpError, failed: &mut Vec<Option<NntpError>>, no_room: &mut Vec<usize>| {
+                tries[i] += 1;
+                if tries[i] <= self.body_retries && !self.is_down(i) {
+                    no_room.push(i);
+                }
+                failed[i] = Some(e);
+            };
             for i in left.drain(..) {
                 // a fallback server waits while any other server waits for room: it's asked only once they've answered
                 if fallback(i) && no_room.iter().any(|&j| !fallback(j)) {
@@ -2534,7 +2556,7 @@ impl Pool {
                 }
                 // resting after a failure, a fallback server isnt waited for: it wouldnt be asked before the rest ends
                 if fallback(i) && self.is_down(i) {
-                    fallback_unreachable = Some(NntpError::Io(io::Error::new(
+                    failed[i] = Some(NntpError::Io(io::Error::new(
                         io::ErrorKind::ConnectionRefused,
                         format!("{} failed recently, skipping it", self.servers[i].cfg.host),
                     )));
@@ -2557,11 +2579,7 @@ impl Pool {
                         if !resting {
                             self.served(i, false);
                         }
-                        if fallback(i) {
-                            fallback_unreachable = Some(e)
-                        } else {
-                            unreachable = Some(e)
-                        }
+                        again(i, e, &mut failed, &mut no_room);
                         continue;
                     }
                 };
@@ -2609,11 +2627,12 @@ impl Pool {
                         // isnt Missing yet, and it's read again later; unless only a fallback server couldnt be asked
                         Err(e) if e.failed_forwarding() || !matches!(e, NntpError::Reply { code: 423 | 430, .. }) => {
                             self.served(i, false);
-                            if fallback(i) { fallback_unreachable = Some(e) } else { unreachable = Some(e) }
+                            again(i, e, &mut failed, &mut no_room);
                         }
                         // this server doesnt have it
                         Err(_) | Ok(()) => {
                             self.served(i, true);
+                            failed[i] = None;
                             answered = true;
                         }
                     },
@@ -2624,10 +2643,12 @@ impl Pool {
                 tokio::time::sleep(Duration::from_millis(250)).await;
             }
         }
-        match (unreachable, fallback_unreachable) {
-            (Some(e), _) => Err(e),
+        let (fallbacks, trusted): (Vec<_>, Vec<_>) =
+            failed.into_iter().enumerate().filter_map(|(i, e)| e.map(|e| (i, e))).partition(|(i, _)| fallback(*i));
+        match (trusted.into_iter().next(), fallbacks.into_iter().next()) {
+            (Some((_, e)), _) => Err(e),
             // only a fallback server couldnt be asked, and none other could either
-            (None, Some(e)) if !answered => Err(e),
+            (None, Some((_, e))) if !answered => Err(e),
             _ => Ok(BackgroundBody::Missing),
         }
     }

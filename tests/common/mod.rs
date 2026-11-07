@@ -35,6 +35,8 @@ pub struct Server {
     pub bodies: bool,
     /// BODY answers 502, like a provider in trouble
     pub body_trouble: bool,
+    /// BODY requests answered "502 try later" before the server answers them as usual
+    pub body_troubles_left: AtomicUsize,
     /// BODY answers "430 Failed forwarding.", like a reseller whose backend didnt answer
     pub forwarding_fails: bool,
     pub xover_delay: Duration,
@@ -112,6 +114,7 @@ impl Server {
             password: "secret",
             bodies: true,
             body_trouble: false,
+            body_troubles_left: AtomicUsize::new(0),
             forwarding_fails: false,
             xover_delay: Duration::ZERO,
             slow_over: None,
@@ -436,7 +439,15 @@ pub fn serve(stream: TcpStream, state: &Server, over_limit: bool) {
                 }
                 None => send(&mut out, b"430 no such article"),
             },
-            "BODY" if state.body_trouble => send(&mut out, b"502 try later"),
+            "BODY"
+                if state.body_trouble
+                    || state
+                        .body_troubles_left
+                        .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                        .is_ok() =>
+            {
+                send(&mut out, b"502 try later")
+            }
             "BODY" if state.forwarding_fails => send(&mut out, b"430 Failed forwarding."),
             "BODY" => {
                 // the lock goes before the reply, not at the end of the match

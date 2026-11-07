@@ -310,3 +310,46 @@ fn a_fallback_server_waits_while_a_regular_one_has_no_room() {
     assert_eq!(spare.bodies_sent.load(Ordering::SeqCst), 0, "the fallback was asked first");
     assert_eq!(regular.bodies_sent.load(Ordering::SeqCst), 1);
 }
+
+fn troubled(times: usize) -> Arc<Server> {
+    let s = Server::new(vec![post(1, r#""a.bin" yEnc (1/1)"#, 10, vec![b"hello".to_vec()])]);
+    s.body_troubles_left.store(times, Ordering::SeqCst);
+    s
+}
+
+/// A server that fails a body is asked again, up to `body_retries` more times, and its body comes back.
+#[test]
+fn a_server_that_fails_a_body_is_asked_again() {
+    let rt = runtime();
+    let state = troubled(2);
+    let pool = Pool::new(&[mock(spawn_server(state.clone()), "secret", 2, 1)]);
+    assert!(matches!(rt.block_on(pool.background_body("<msg1@mock>", MIB)).unwrap(), BackgroundBody::Body(_)));
+    assert_eq!(state.body_troubles_left.load(Ordering::SeqCst), 0);
+}
+
+/// Past its retries a failing server is an error, after one try and as many more as `body_retries` says.
+#[test]
+fn a_server_failing_every_try_is_an_error_after_its_retries() {
+    let rt = runtime();
+    let state = troubled(10);
+    let pool = Pool::new(&[mock(spawn_server(state.clone()), "secret", 2, 1)]);
+    assert!(rt.block_on(pool.background_body("<msg1@mock>", MIB)).is_err());
+    assert_eq!(state.body_troubles_left.load(Ordering::SeqCst), 10 - 1 - atlas::nntp::BODY_RETRIES);
+
+    let state = troubled(10);
+    let pool =
+        Pool::new(&[mock(spawn_server(state.clone()), "secret", 2, 1)]).with_body_tries(Duration::from_secs(5), 0);
+    assert!(rt.block_on(pool.background_body("<msg1@mock>", MIB)).is_err());
+    assert_eq!(state.body_troubles_left.load(Ordering::SeqCst), 9);
+}
+
+/// A server that failed once and then says it hasn't the article leaves it missing: its last answer stands.
+#[test]
+fn a_retry_that_says_not_here_leaves_the_article_missing() {
+    let rt = runtime();
+    let mut s = Server::new(vec![post(1, r#""a.bin" yEnc (1/1)"#, 10, vec![])]);
+    Arc::get_mut(&mut s).unwrap().bodies = false;
+    s.body_troubles_left.store(1, Ordering::SeqCst);
+    let pool = Pool::new(&[mock(spawn_server(s), "secret", 2, 1)]);
+    assert_eq!(rt.block_on(pool.background_body("<msg1@mock>", MIB)).unwrap(), BackgroundBody::Missing);
+}
