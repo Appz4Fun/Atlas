@@ -1199,8 +1199,8 @@ fn list_of(items: &[&str]) -> String {
 
 /// How old a window can get before a click on it starts a new one. The click still gets the old one straight away.
 const WINDOW_FRESH: Duration = Duration::from_secs(60);
-/// How long a count waits for its window's background fill before rendering what's left itself.
-const COUNT_WAITS_FOR_FILL: Duration = Duration::from_secs(5);
+/// How long a count waits for its window's background fill; past it the count it had stands.
+const COUNT_WAITS_FOR_FILL: Duration = Duration::from_secs(2);
 /// How often the windows nobody has clicked lately are made again, soo the first click of the day finds one.
 const WINDOW_IDLE_FRESH: Duration = Duration::from_secs(15 * 60);
 /// What counts as lately.
@@ -1550,6 +1550,10 @@ impl Window {
     fn shown_count(&self, search: &Search) -> Option<usize> {
         if let Some(n) = lock(&self.counted).get(&search.min_score) {
             return Some(*n);
+        }
+        // the fill renders the first `SORT_WINDOW` rows: a window grown past them isn't all rendered
+        if self.rows.len() > SORT_WINDOW as usize {
+            return None;
         }
         // the background fill renders them all: waited for, soo they aren't rendered twice
         let started = Instant::now();
