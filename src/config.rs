@@ -609,6 +609,9 @@ pub struct SharedCatalogConfig {
     pub interval_ms: u64,
     /// the connection isn't encrypted: without this, only a loopback or private network address is used
     pub allow_plaintext: bool,
+    /// lookups across shards read the catalog instead of every shard, falling back to the shards when it can't
+    /// answer (`shared_catalog::reader`)
+    pub reads: bool,
 }
 
 impl Default for SharedCatalogConfig {
@@ -619,6 +622,7 @@ impl Default for SharedCatalogConfig {
             batch: 5_000,
             interval_ms: 1_000,
             allow_plaintext: false,
+            reads: false,
         }
     }
 }
@@ -641,6 +645,9 @@ impl SharedCatalogConfig {
         }
         if let Some(b) = v.get("allow_plaintext").and_then(as_bool) {
             c.allow_plaintext = b;
+        }
+        if let Some(b) = v.get("reads").and_then(as_bool) {
+            c.reads = b;
         }
         c
     }

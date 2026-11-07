@@ -345,7 +345,18 @@ pub struct GroupPosting {
 
 /// Every group with a release of exactly this posted name.
 pub fn groups_of(name: &str) -> Result<Vec<GroupPosting>> {
+    if let Some(mut out) = crate::shared_catalog::reader::groups_of(name) {
+        crate::metrics::names::SHARED_CATALOG_READS.inc(&[("lookup", "groups_of"), ("source", "catalog")], 1);
+        sort_groups(&mut out);
+        return Ok(out);
+    }
+    crate::metrics::names::SHARED_CATALOG_READS.inc(&[("lookup", "groups_of"), ("source", "shards")], 1);
     groups_of_with(&db::open()?, name)
+}
+
+/// Most articles first, then by name.
+fn sort_groups(out: &mut [GroupPosting]) {
+    out.sort_by(|a, b| b.articles.cmp(&a.articles).then_with(|| a.group.cmp(&b.group)));
 }
 
 pub fn groups_of_with(conn: &Connection, name: &str) -> Result<Vec<GroupPosting>> {
@@ -365,7 +376,7 @@ pub fn groups_of_with(conn: &Connection, name: &str) -> Result<Vec<GroupPosting>
             out.push(row?);
         }
     }
-    out.sort_by(|a, b| b.articles.cmp(&a.articles).then_with(|| a.group.cmp(&b.group)));
+    sort_groups(&mut out);
     Ok(out)
 }
 
@@ -1254,8 +1265,7 @@ pub fn is_false_positive_password(found: &str) -> bool {
         return true;
     }
     !f.is_empty()
-        && f.bytes()
-            .all(|b| matches!(b, b'-' | b'=' | b'*' | b'_' | b'.' | b':' | b'/' | b'\\' | b'|' | b'+' | b'~'))
+        && f.bytes().all(|b| matches!(b, b'-' | b'=' | b'*' | b'_' | b'.' | b':' | b'/' | b'\\' | b'|' | b'+' | b'~'))
 }
 
 /// All candidate passwords matched by [`PASSWORD`] in `text`, in order of appearance.
@@ -2153,7 +2163,10 @@ mod tests {
         assert!(own.iter().all(|(_, r)| r.id != id(1, a)), "{own:?}");
         // a password one row of the post has is the whole post's, though the rows aren't listed as copies
         conn.execute(
-            &format!("insert into s{}.release_nfo_password (release_id, password) values (?1, 'x7Q2p')", store::shard_of(b)),
+            &format!(
+                "insert into s{}.release_nfo_password (release_id, password) values (?1, 'x7Q2p')",
+                store::shard_of(b)
+            ),
             [id(2, b)],
         )
         .unwrap();
