@@ -704,34 +704,26 @@ impl Store {
     /// Articles that came for a file since aren't in it, soo they wait for the next.
     pub fn ack(&mut self, ack: &Ack) -> Result<()> {
         let Ack { finished, widened, now } = ack;
-        // in transactions of about `WRITE_CHUNK` rows: a stop half way leaves some posters noted, and the rest are
-        // found again and saved again under the same numbers
-        let mut rows = 0;
-        let mut tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        for (poster, place, ids) in finished {
-            {
-                let mut done = tx.prepare_cached("update headers set done = 1 where message_id = ?1")?;
+        // one transaction, whatever its size: a note half made would leave an upload's last files to be found again
+        // as an upload of their own. It is key updates only, quick next to the recorder's chunks
+        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        {
+            let mut done = tx.prepare_cached("update headers set done = 1 where message_id = ?1")?;
+            let mut keep = tx.prepare_cached(
+                "insert into linked (poster, release, grp, file, files, parts, leads, oldest, added)
+                 values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 on conflict(poster) do update set parts = excluded.parts, leads = excluded.leads, added = excluded.added",
+            )?;
+            for (poster, place, ids) in finished {
                 for id in ids {
                     done.execute([id])?;
                 }
                 if let Some(p) = place {
-                    tx.prepare_cached(
-                        "insert into linked (poster, release, grp, file, files, parts, leads, oldest, added)
-                         values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-                         on conflict(poster) do update set parts = excluded.parts, leads = excluded.leads,
-                             added = excluded.added",
-                    )?
-                    .execute(params![poster, p.release, p.group, p.file, p.files, p.parts, p.leads, p.oldest, now])?;
+                    keep.execute(params![
+                        poster, p.release, p.group, p.file, p.files, p.parts, p.leads, p.oldest, now
+                    ])?;
                 }
             }
-            rows += ids.len() + 1;
-            if rows >= WRITE_CHUNK {
-                tx.commit()?;
-                tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-                rows = 0;
-            }
-        }
-        {
             let mut upload = tx.prepare_cached(
                 "insert into uploads (release, grp, groups, first, last, files, added)
                  values (?1, ?2, ?3, ?4, ?5, ?6, ?7)
@@ -1231,29 +1223,29 @@ mod tests {
     }
 
     #[test]
-    fn the_recorder_and_the_linker_write_side_by_side() {
+    fn a_big_slice_is_recorded_in_short_transactions_another_writer_gets_between() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("atlas.xref.db");
-        let mut linker = Store::open(&path).unwrap();
-        let recorder = std::thread::spawn({
-            let path = path.clone();
-            move || {
-                let mut store = Store::open(&path).unwrap();
-                for round in 0..5 {
-                    let batch: Vec<Article> = (0..20_000u64)
-                        .map(|k| {
-                            article(&format!("x{round}{k:022}"), &format!("p{}@x.y", k % 50), "2023-12-03 16:23:23", k)
-                        })
-                        .collect();
-                    store.record("a.b.one", &batch, 1000).unwrap();
-                }
-            }
-        });
-        for t in 0..20 {
-            let found = linker.pass_with(1001 + SETTLE_SECS + t, &mut |_, _| false).unwrap();
-            linker.ack(&found.ack).unwrap();
-            linker.prune(1001 + SETTLE_SECS + t).unwrap();
-        }
-        recorder.join().unwrap();
+        let mut store = Store::open(&path).unwrap();
+        let commits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = commits.clone();
+        store
+            .conn
+            .commit_hook(Some(move || {
+                seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                false
+            }))
+            .unwrap();
+        let batch: Vec<Article> = (0..(WRITE_CHUNK * 5 + 1) as u64)
+            .map(|k| article(&format!("y{k:023}"), &format!("p{}@x.y", k % 7), "2023-12-03 16:23:23", k))
+            .collect();
+        store.group_id("a.b.one").unwrap();
+        commits.store(0, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(store.record("a.b.one", &batch, 1000).unwrap(), batch.len());
+        assert_eq!(commits.load(std::sync::atomic::Ordering::Relaxed), 6, "a commit every WRITE_CHUNK rows");
+        // another connection waiting only briefly still gets its write in
+        let other = Connection::open(&path).unwrap();
+        other.busy_timeout(Duration::from_millis(200)).unwrap();
+        other.execute("insert into groups (name) values ('a.b.two')", []).unwrap();
     }
 }
