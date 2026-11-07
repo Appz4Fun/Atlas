@@ -125,7 +125,8 @@ fn a_small_complete_release_freezes_whole_and_thaws_back_as_it_was() {
     assert!(search(&f.main, "nothing", None, &Narrow::default(), 10).unwrap().is_empty());
     let (row, nzb_body) = nzb(&f.main, id).unwrap().unwrap();
     assert_eq!(row.name, "Small.Thing");
-    assert_eq!(nzb_body, crate::nzb::render_nzb(&row, &articles));
+    assert!(nzb_body.complete(), "{:?}", nzb_body.gaps);
+    assert_eq!(nzb_body.xml, crate::nzb::render_nzb(&row, &articles));
     assert_eq!(get(&f.main, id).unwrap().map(|(h, _)| h.row.id), Some(id), "its page");
     // a group the filters hide now: no page for it either, as a search leaves it out
     let blocked = "a.".repeat(300);
@@ -470,7 +471,8 @@ fn a_sealed_file_thaws_with_its_message_ids_whatever_the_domains_ids_are_now() {
     // the domain went and ids moved on, as a compaction can leave them
     conn.execute_batch("delete from domains; insert into domains (suffix) values ('@one>'), ('@two>');").unwrap();
     let (row, nzb_text) = nzb(&f.main, id).unwrap().unwrap();
-    assert_eq!(nzb_text, crate::nzb::render_nzb(&row, &articles));
+    assert!(nzb_text.complete(), "{:?}", nzb_text.gaps);
+    assert_eq!(nzb_text.xml, crate::nzb::render_nzb(&row, &articles));
     assert_eq!(thaw(&conn, id, false, NOW).unwrap(), Thawed::Restored);
     assert_eq!(live_articles(&f.main, id), articles);
 }

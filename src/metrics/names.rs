@@ -103,6 +103,7 @@ families! {
     STAGE_BODY_BYTES "atlas_stage_body_bytes_total" Counter &[], "Bytes of the bodies the stage has fetched.";
     NZB_FILLED "atlas_nzb_filled_articles_total" Counter &[], "Articles NZBs took from twins and file twins to fill gaps.";
     NZB_FILLED_BY_CRC "atlas_nzb_filled_by_crc_articles_total" Counter &[], "Of those, articles lent by a posting holding a file of the same size and whole-file CRC32.";
+    NZB_GAPS "atlas_nzb_gaps_total" Counter &[], "NZBs built with a file missing parts, by the release's complete flag.";
 
     // names
     NAMES_APPLIED "atlas_names_applied_total" Counter &[], "Names written onto releases, by source.";

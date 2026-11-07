@@ -317,9 +317,11 @@ pub fn is_complete(articles: &[Article]) -> bool {
         };
 
         // python compared {a.part} (which can hold None) to range(1, n+1)
+        let zero_based = file_articles.iter().any(|a| a.part == Some(0));
         let mut parts: BTreeSet<Option<i64>> = BTreeSet::new();
         parts.extend(file_articles.iter().map(|a| a.part));
-        let wanted: BTreeSet<Option<i64>> = (1..=expected).map(Some).collect();
+        let wanted: BTreeSet<Option<i64>> =
+            if zero_based { (0..expected).map(Some).collect() } else { (1..=expected).map(Some).collect() };
 
         if parts != wanted {
             return false;
@@ -521,5 +523,24 @@ mod tests {
         assert_eq!(strip_release_suffixes("Example.Show.S01.part1.rar"), "Example.Show.S01");
         assert_eq!(strip_release_suffixes("Example.Show.S02.vol000-001.par2"), "Example.Show.S02");
         assert_eq!(strip_release_suffixes("Example.Show.S01.7z.001"), "Example.Show.S01");
+    }
+
+    #[test]
+    fn zero_based_parts_set_the_complete_flag() {
+        let file = |parts: &[i64]| -> Vec<Article> {
+            parts
+                .iter()
+                .map(|&p| Article {
+                    filename: Some("a.bin".into()),
+                    part: Some(p),
+                    total_parts: Some(4),
+                    ..Default::default()
+                })
+                .collect()
+        };
+        assert!(is_complete(&file(&[0, 1, 2, 3])));
+        assert!(!is_complete(&file(&[0, 1, 3])));
+        assert!(is_complete(&file(&[1, 2, 3, 4])));
+        assert!(!is_complete(&file(&[1, 2, 4])));
     }
 }
