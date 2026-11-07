@@ -519,7 +519,11 @@ pub fn carry_outbox(conn: &Connection) -> rusqlite::Result<bool> {
 /// A Postgres connection. Unencrypted, so it's refused unless the host is this machine or a private network
 /// address written as a number, or `allow_plaintext` says the network is trusted.
 pub fn connect(config: &SharedCatalogConfig) -> anyhow::Result<postgres::Client> {
-    let pg: postgres::Config = config.url.parse()?;
+    let mut pg: postgres::Config = config.url.parse()?;
+    // a catalog that's down shouldn't hold a page for long: a url can still set its own
+    if pg.get_connect_timeout().is_none() {
+        pg.connect_timeout(Duration::from_secs(3));
+    }
     if !config.allow_plaintext {
         for host in pg.get_hosts() {
             if let postgres::config::Host::Tcp(h) = host
@@ -906,6 +910,17 @@ pub fn start(config: &SharedCatalogConfig, stop: Arc<AtomicBool>) {
     }
     if !on {
         return;
+    }
+    if config.reads {
+        let config = config.clone();
+        let _ = std::thread::Builder::new().name("shared-catalog-indexes".into()).spawn(move || {
+            let built = connect(&config).map_err(|e| format!("{e:#}")).and_then(|mut pg| {
+                ensure_schema(&mut pg, &[]).and_then(|()| reader::build_indexes(&mut pg)).map_err(|e| e.to_string())
+            });
+            if let Err(e) = built {
+                eprintln!("shared catalog: read indexes: {e}");
+            }
+        });
     }
     // a thread and a Postgres connection per shard: one shard's backlog, or a fill holding its lock, doesn't hold up
     // the others
@@ -1361,6 +1376,137 @@ pub fn run_check(prune: bool) -> i32 {
             println!("shared catalog check: {e:#}");
             1
         }
+    }
+}
+
+/// Phase 2: lookups across shards read the catalog, one at a time, behind `shared_catalog.reads`. Every reader falls
+/// back to the shards when the catalog can't answer: reads off, its index not built yet, or Postgres failing (then the
+/// catalog is left alone for `BACKOFF`, so a catalog that's down costs a page one connect timeout, not one per lookup).
+pub mod reader {
+    use super::*;
+    use std::sync::atomic::AtomicI64;
+    use std::sync::{Mutex, OnceLock};
+
+    /// How long the catalog is left alone after it failed a read.
+    const BACKOFF: Duration = Duration::from_secs(30);
+    /// Connections kept for reads; more readers at once each open their own and close it after.
+    const POOL: usize = 8;
+
+    /// The indexes the readers use, built by the indexer when reads are on (`build_indexes`), and only used once
+    /// valid: until then a lookup would scan a table of a hundred million rows.
+    pub const INDEXES: &[(&str, &str)] =
+        &[("releases_name", "create index concurrently if not exists releases_name on releases (name)")];
+
+    fn config() -> &'static SharedCatalogConfig {
+        static CONFIG: OnceLock<SharedCatalogConfig> = OnceLock::new();
+        CONFIG.get_or_init(crate::config::shared_catalog_config)
+    }
+
+    static CLIENTS: Mutex<Vec<postgres::Client>> = Mutex::new(Vec::new());
+    /// unix seconds until which the catalog isn't asked
+    static RESTING_UNTIL: AtomicI64 = AtomicI64::new(0);
+
+    /// Reads are on in the config and the catalog isn't resting after a failure.
+    pub fn on() -> bool {
+        let c = config();
+        c.is_on() && c.reads && chrono::Utc::now().timestamp() >= RESTING_UNTIL.load(Relaxed)
+    }
+
+    /// Runs `read` against the catalog. None when reads are off, the catalog is resting, or the read failed: the
+    /// caller then asks the shards.
+    pub fn with<T>(read: impl FnOnce(&mut postgres::Client) -> Result<T, postgres::Error>) -> Option<T> {
+        if !on() {
+            return None;
+        }
+        let pooled = CLIENTS.lock().unwrap_or_else(|e| e.into_inner()).pop();
+        let mut client = match pooled {
+            Some(c) => c,
+            None => match connect(config()) {
+                Ok(c) => c,
+                Err(e) => {
+                    rest(&format!("connect: {e:#}"));
+                    return None;
+                }
+            },
+        };
+        match read(&mut client) {
+            Ok(v) => {
+                let mut clients = CLIENTS.lock().unwrap_or_else(|e| e.into_inner());
+                if clients.len() < POOL {
+                    clients.push(client);
+                }
+                Some(v)
+            }
+            Err(e) => {
+                rest(&format!("read: {e}"));
+                None
+            }
+        }
+    }
+
+    fn rest(why: &str) {
+        names::SHARED_CATALOG_FAILURES.inc(&[("stage", "read")], 1);
+        RESTING_UNTIL.store(chrono::Utc::now().timestamp() + BACKOFF.as_secs() as i64, Relaxed);
+        eprintln!("shared catalog: {why}; reading the shards for {}s", BACKOFF.as_secs());
+    }
+
+    /// Whether `index` is built and valid, asked once per process until it is.
+    pub fn index_ready(index: &'static str) -> bool {
+        static READY: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+        if READY.lock().unwrap_or_else(|e| e.into_inner()).contains(&index) {
+            return true;
+        }
+        let valid = with(|pg| {
+            let row = pg.query_opt(
+                "select i.indisvalid from pg_class c join pg_index i on i.indexrelid = c.oid where c.relname = $1",
+                &[&index],
+            )?;
+            Ok(row.is_some_and(|r| r.get::<_, bool>(0)))
+        });
+        if valid == Some(true) {
+            READY.lock().unwrap_or_else(|e| e.into_inner()).push(index);
+        }
+        valid == Some(true)
+    }
+
+    /// Builds the readers' indexes without blocking writes (CONCURRENTLY), dropping one a build left invalid first.
+    /// The indexer runs this in the background when reads are on.
+    pub fn build_indexes(pg: &mut postgres::Client) -> Result<(), postgres::Error> {
+        for (name, create) in INDEXES {
+            let invalid = pg
+                .query_opt(
+                    "select 1 from pg_class c join pg_index i on i.indexrelid = c.oid where c.relname = $1 and not i.indisvalid",
+                    &[name],
+                )?
+                .is_some();
+            if invalid {
+                pg.batch_execute(&format!("drop index concurrently if exists {name}"))?;
+            }
+            pg.batch_execute(create)?;
+        }
+        Ok(())
+    }
+
+    /// Every group with a release of exactly this posted name, from the catalog: `release_info::groups_of`.
+    pub fn groups_of(name: &str) -> Option<Vec<crate::release_info::GroupPosting>> {
+        if !index_ready("releases_name") {
+            return None;
+        }
+        with(|pg| query_groups(pg, name))
+    }
+
+    pub fn query_groups(
+        pg: &mut postgres::Client,
+        name: &str,
+    ) -> Result<Vec<crate::release_info::GroupPosting>, postgres::Error> {
+        let rows = pg.query(
+            "select coalesce(group_name, ''), coalesce(parts, 0), id from releases where name = $1 limit 512",
+            &[&name],
+        )?;
+        Ok(rows
+            .iter()
+            .map(|r| crate::release_info::GroupPosting { group: r.get(0), articles: r.get(1), id: r.get(2) })
+            .collect())
     }
 }
 
@@ -1947,6 +2093,46 @@ mod tests {
         assert!(pg_cursor(&mut pg, 5, e).unwrap() >= queued, "Postgres has its place in the outbox");
         assert_eq!(read_cursor(&path).map(|(epoch, _)| epoch), e, "and the writer's cursor file says so");
         pg.batch_execute(&format!("drop table if exists {}", names.join(", "))).unwrap();
+    }
+
+    /// Against a real Postgres when `ATLAS_CATALOG_TEST_URL` names an empty database to use: the read index builds
+    /// (again over one a build left invalid) and the group lookup answers from it.
+    #[test]
+    fn the_group_lookup_reads_the_catalog_through_its_index() {
+        let Ok(url) = std::env::var("ATLAS_CATALOG_TEST_URL") else { return };
+        let _one = PG.lock().unwrap_or_else(|e| e.into_inner());
+        let mut pg = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+        pg.batch_execute("drop table if exists releases, collections, par2_files, nzb_pointed").unwrap();
+        let conn = shard();
+        conn.execute_batch(
+            "alter table releases add column group_name TEXT;
+             alter table releases add column parts INTEGER;
+             insert into releases (id, name, group_name, parts) values
+                (8, 'Same.Name', 'a.b.one', 10), (13, 'Same.Name', 'a.b.two', 20), (16, 'Other', 'a.b.one', 5);",
+        )
+        .unwrap();
+        let t = tables(&conn).unwrap();
+        ensure_schema(&mut pg, &t).unwrap();
+        fill_shard(&conn, &mut pg, 0).unwrap();
+        reader::build_indexes(&mut pg).unwrap();
+        reader::build_indexes(&mut pg).unwrap(); // again: nothing to do
+        let valid: bool = pg
+            .query_one(
+                "select i.indisvalid from pg_class c join pg_index i on i.indexrelid = c.oid where c.relname = 'releases_name'",
+                &[],
+            )
+            .unwrap()
+            .get(0);
+        assert!(valid);
+        let mut found: Vec<(String, i64, i64)> = reader::query_groups(&mut pg, "Same.Name")
+            .unwrap()
+            .into_iter()
+            .map(|g| (g.group, g.articles, g.id))
+            .collect();
+        found.sort();
+        assert_eq!(found, [("a.b.one".into(), 10, 8), ("a.b.two".into(), 20, 13)]);
+        assert!(reader::query_groups(&mut pg, "Nothing").unwrap().is_empty());
+        pg.batch_execute("drop table releases, collections, par2_files, nzb_pointed").unwrap();
     }
 
     /// Against a real Postgres when `ATLAS_CATALOG_TEST_URL` names an empty database to use.
