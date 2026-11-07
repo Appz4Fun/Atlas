@@ -236,7 +236,7 @@ fn backoff(errors: u32) -> Duration {
 }
 
 /// sleep up to `d`, waking early once `done` says so
-async fn nap(d: Duration, done: impl Fn() -> bool) {
+pub(crate) async fn nap(d: Duration, done: impl Fn() -> bool) {
     let deadline = Instant::now() + d;
     while !done() && Instant::now() < deadline {
         tokio::time::sleep((deadline - Instant::now()).min(Duration::from_millis(250))).await;
@@ -1058,7 +1058,10 @@ async fn run_servers(
         if config.spots.comments {
             let s = sched.clone();
             let (pool, spots) = (sched.ctx.pool.clone(), config.spots.clone());
-            tasks.spawn(crate::spotnet::ingest::run_comments(pool, db.clone(), spots, move || s.stopping()));
+            tasks.spawn(named!(
+                "spot comments".into(),
+                crate::spotnet::ingest::run_comments(pool, db.clone(), spots, move || s.stopping())
+            ));
         }
     }
     // parts one server's listing left out, read again from another (see `repair`)
