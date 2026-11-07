@@ -2772,7 +2772,8 @@ fn nzb_files_html(id: i64, contents: &release_info::Contents) -> String {
             } else {
                 tag("tag-warn", &format!("{} MISSING", thousands(f.expected - f.seen)))
             };
-            let name = if one_by_one {
+            // a file with no name is many <file>s in the NZB, none of which a name picks
+            let name = if one_by_one && !f.name.is_empty() {
                 format!(
                     "<a href=\"/ui/nzb?id={id}&amp;name={}\" title=\"An NZB of this file alone\">{}</a>",
                     attr(&url_encode(&f.name)),
@@ -4212,13 +4213,14 @@ mod tests {
     fn each_file_of_a_release_links_an_nzb_of_it_alone() {
         let file = |n: &str| crate::release_info::NzbFile { name: n.into(), bytes: 1, seen: 1, expected: 1 };
         let mut contents = crate::release_info::Contents {
-            files: 2,
-            list: vec![file("a b&c.mkv"), file("a.par2")],
+            files: 3,
+            list: vec![file("a b&c.mkv"), file("a.par2"), file("")],
             ..Default::default()
         };
         let html = super::nzb_files_html(9, &contents);
         assert!(html.contains("<a href=\"/ui/nzb?id=9&amp;name=a%20b%26c.mkv\""), "{html}");
         assert!(html.contains(">a b&amp;c.mkv</a>"), "{html}");
+        assert_eq!(html.matches("<a href").count(), 2, "no link for a file with no name: {html}");
         contents.files = 1;
         contents.list.truncate(1);
         assert!(!super::nzb_files_html(9, &contents).contains("<a href"), "one file: the whole NZB is that file");

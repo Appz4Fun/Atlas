@@ -415,9 +415,20 @@ pub fn file_list(release_id: i64) -> Result<Option<Vec<ListedFile>>> {
     })
 }
 
-/// Where the file named `name` is in the whole NZB of `articles`, from 1.
-fn file_named(articles: &[ArticleRow], name: &str) -> Option<usize> {
-    listed(articles).into_iter().find(|f| f.name.as_deref() == Some(name)).map(|f| f.n)
+/// The articles of every file named `name` in the whole NZB of `articles`: the one file, or, in an upload linked by
+/// its PAR2 set, each row's file of that name, which the NZB keeps apart as `name #id` and a release page lists as one.
+fn files_named(articles: &[ArticleRow], name: &str) -> Vec<ArticleRow> {
+    let apart = format!("{name} #");
+    files(articles)
+        .into_iter()
+        .filter(|file| {
+            file.first().and_then(|a| a.filename.as_deref()).is_some_and(|f| {
+                f == name || f.strip_prefix(&apart).is_some_and(|id| id.bytes().all(|b| b.is_ascii_digit()))
+            })
+        })
+        .flatten()
+        .cloned()
+        .collect()
 }
 
 /// One file of a release as its own NZB, picked by its name: a release page links each file this way, since its
@@ -426,8 +437,10 @@ pub fn build_nzb_named_checked(release_id: i64, name: &str) -> Result<Option<Nzb
     crate::metrics::timed("nzb.build_file", || {
         let Some(release) = get_release(release_id)? else { return Ok(None) };
         let (articles, groups) = filled_inventory(&release)?;
-        let Some(n) = file_named(&articles, name) else { return Ok(None) };
-        let Some(one) = nth_file(&articles, n) else { return Ok(None) };
+        let one = files_named(&articles, name);
+        if name.is_empty() || one.is_empty() {
+            return Ok(None);
+        }
         let built = render_checked(&release, &one, &groups, false);
         note_gaps(&release, &built);
         Ok(Some(built))
@@ -502,9 +515,12 @@ mod tests {
                 ListedFile { n: 3, name: None, bytes: 7, articles: 1 },
             ]
         );
-        assert_eq!(file_named(&articles, "a.par2"), Some(2));
-        assert_eq!(file_named(&articles, "c.nfo"), None);
-        assert_eq!(nth_file(&articles, file_named(&articles, "b.mkv").unwrap()).unwrap().len(), 2);
+        assert_eq!(files_named(&articles, "a.par2").len(), 1);
+        assert!(files_named(&articles, "c.nfo").is_empty());
+        assert_eq!(files_named(&articles, "b.mkv").len(), 2);
+        // a linked upload's second row of the same name, kept apart in the NZB, comes along
+        let linked = [art(Some("v.par2"), 1, 1), art(Some("v.par2 #42"), 1, 1), art(Some("v.par2 #x"), 1, 1)];
+        assert_eq!(files_named(&linked, "v.par2").len(), 2);
     }
 
     #[test]

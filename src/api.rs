@@ -679,7 +679,8 @@ fn files_xml(release_id: i64, files: &[crate::nzb::ListedFile]) -> String {
     let mut out =
         format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<files id=\"{release_id}\" count=\"{}\">\n", files.len());
     for f in files {
-        let name = f.name.as_deref().map(|n| format!(" name=\"{}\"", escape(n))).unwrap_or_default();
+        let name =
+            f.name.as_deref().map(|n| format!(" name=\"{}\"", escape(n).replace('"', "&quot;"))).unwrap_or_default();
         let _ = writeln!(out, "  <file n=\"{}\"{name} size=\"{}\" articles=\"{}\"/>", f.n, f.bytes, f.articles);
     }
     out.push_str("</files>\n");
@@ -923,12 +924,15 @@ mod tests {
         let xml = files_xml(
             7,
             &[
-                ListedFile { n: 1, name: Some("a&b <1>.mkv".into()), bytes: 15, articles: 2 },
+                ListedFile { n: 1, name: Some("a&b <1> \" n=\"9.mkv".into()), bytes: 15, articles: 2 },
                 ListedFile { n: 2, name: None, bytes: 3, articles: 1 },
             ],
         );
         assert!(xml.contains("<files id=\"7\" count=\"2\">"), "{xml}");
-        assert!(xml.contains("<file n=\"1\" name=\"a&amp;b &lt;1&gt;.mkv\" size=\"15\" articles=\"2\"/>"), "{xml}");
+        assert!(
+            xml.contains("<file n=\"1\" name=\"a&amp;b &lt;1&gt; &quot; n=&quot;9.mkv\" size=\"15\" articles=\"2\"/>"),
+            "{xml}"
+        );
         assert!(xml.contains("<file n=\"2\" size=\"3\" articles=\"1\"/>"), "{xml}");
         assert_eq!(handle("/api", "t=files&id=1", "http://x", "key").status, 401, "it needs the key");
     }
