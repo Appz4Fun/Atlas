@@ -1,6 +1,7 @@
 //! Newznab compatible api for prowlarr / sonarr / radarr.
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::io::Read;
 use std::sync::{Arc, Mutex, Once};
 use std::thread::{self, JoinHandle};
@@ -150,6 +151,7 @@ pub fn handle(path: &str, query: &str, base: &str, api_key: &str) -> ApiResponse
 
     match t {
         Some("get") => get_nzb(&args),
+        Some("files") => files_list(&args),
         Some(kind @ ("search" | "tvsearch" | "movie" | "music" | "audio" | "book")) => {
             let on = crate::media::query::cached_id_params();
             if let Some(ids) = crate::media::query::from_args(kind, &args, &on) {
@@ -632,7 +634,7 @@ pub(crate) fn get_nzb(args: &HashMap<String, String>) -> ApiResponse {
 
     let Ok(Some(release)) = get_release(release_id) else {
         // a frozen release's NZB is built from its frozen row, left frozen (only the whole of it)
-        if args.contains_key("file") {
+        if args.contains_key("file") || args.contains_key("name") {
             return ApiResponse::not_found();
         }
         return match crate::frozen::nzb(&crate::paths::database(), release_id) {
@@ -646,15 +648,42 @@ pub(crate) fn get_nzb(args: &HashMap<String, String>) -> ApiResponse {
     };
 
     // `file` isnt in the Newznab spec: one file of the release, and one that isnt there is a miss
-    let built = match args.get("file") {
-        Some(file) => file.trim().parse().ok().map_or(Ok(None), |file| build_nzb_file_checked(release_id, file)),
-        None => build_nzb_checked(release_id),
+    // `name`, neither: one file by its name, as a release page links it
+    let built = match (args.get("file"), args.get("name")) {
+        (Some(file), _) => file.trim().parse().ok().map_or(Ok(None), |file| build_nzb_file_checked(release_id, file)),
+        (None, Some(name)) => crate::nzb::build_nzb_named_checked(release_id, name),
+        (None, None) => build_nzb_checked(release_id),
     };
     let Ok(Some(built)) = built else {
         return ApiResponse::not_found();
     };
 
     nzb_response(&release, release_id, built.xml, &built.gaps)
+}
+
+/// `t=files`, not in the Newznab spec: the files a release's NZB lists, each with the `file=N` that `t=get` takes for
+/// it alone. Frozen releases have no list: their NZB comes whole only.
+fn files_list(args: &HashMap<String, String>) -> ApiResponse {
+    let release_id = args.get("id").and_then(|v| v.trim().parse::<i64>().ok()).unwrap_or(0);
+    match crate::nzb::file_list(release_id) {
+        Ok(Some(files)) => ApiResponse::xml(200, files_xml(release_id, &files)),
+        Ok(None) => ApiResponse::error(300, "No such item"),
+        Err(e) => {
+            eprintln!("api files failed: {e}");
+            ApiResponse::error(900, "Couldn't read the release's files")
+        }
+    }
+}
+
+fn files_xml(release_id: i64, files: &[crate::nzb::ListedFile]) -> String {
+    let mut out =
+        format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<files id=\"{release_id}\" count=\"{}\">\n", files.len());
+    for f in files {
+        let name = f.name.as_deref().map(|n| format!(" name=\"{}\"", escape(n))).unwrap_or_default();
+        let _ = writeln!(out, "  <file n=\"{}\"{name} size=\"{}\" articles=\"{}\"/>", f.n, f.bytes, f.articles);
+    }
+    out.push_str("</files>\n");
+    out
 }
 
 fn nzb_response(
@@ -694,6 +723,7 @@ fn endpoint_of(path: &str, query: &str) -> Endpoint {
     match parse_query(query).get("t").map(String::as_str) {
         Some("caps") => named("caps", "api.caps"),
         Some("get") => named("get", "api.get"),
+        Some("files") => named("files", "api.files"),
         Some("search") => named("search", "api.search"),
         Some("tvsearch") => named("tvsearch", "api.tvsearch"),
         Some("movie") => named("movie", "api.movie"),
@@ -885,6 +915,22 @@ mod tests {
         assert_eq!(a["q"], "the matrix reloaded");
         assert_eq!(a["apikey"], "a+b");
         assert_eq!(a["bad"], "%zz");
+    }
+
+    #[test]
+    fn files_lists_each_files_number_and_escapes_names() {
+        use crate::nzb::ListedFile;
+        let xml = files_xml(
+            7,
+            &[
+                ListedFile { n: 1, name: Some("a&b <1>.mkv".into()), bytes: 15, articles: 2 },
+                ListedFile { n: 2, name: None, bytes: 3, articles: 1 },
+            ],
+        );
+        assert!(xml.contains("<files id=\"7\" count=\"2\">"), "{xml}");
+        assert!(xml.contains("<file n=\"1\" name=\"a&amp;b &lt;1&gt;.mkv\" size=\"15\" articles=\"2\"/>"), "{xml}");
+        assert!(xml.contains("<file n=\"2\" size=\"3\" articles=\"1\"/>"), "{xml}");
+        assert_eq!(handle("/api", "t=files&id=1", "http://x", "key").status, 401, "it needs the key");
     }
 
     #[test]
