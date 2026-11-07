@@ -89,6 +89,9 @@ fn incomplete_releases_are_left_out_of_the_api_unless_asked_for() {
     assert_eq!(titles(&query("t=search&limit=1")), ["Whole.Film.2020-GRP"]);
     assert_eq!(titles(&query("t=search&q=Film")), ["Whole.Film.2020-GRP"]);
     assert!(titles(&query("t=search&q=Gappy")).is_empty());
+    // with the frozen releases too
+    assert_eq!(titles(&query("t=search&deep=1")), ["Whole.Film.2020-GRP"]);
+    assert_eq!(titles(&query("t=search&deep=1&incomplete=1")).len(), 4);
 
     // asked for, the others are listed too, each saying it isn't whole
     let all = query("t=search&incomplete=1");

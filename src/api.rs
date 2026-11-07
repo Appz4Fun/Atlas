@@ -229,7 +229,9 @@ fn id_search(
     });
     match found {
         Ok((listed, _)) if listed.rows.is_empty() => {
-            if args.get("q").is_some_and(|q| !q.trim().is_empty())
+            // by name only when the ID matched nothing, not when all it matched is incomplete
+            if listed.read == 0
+                && args.get("q").is_some_and(|q| !q.trim().is_empty())
                 && let Some(term) = search_term(kind, args)
             {
                 return search(&term, args, base, api_key);
@@ -346,9 +348,19 @@ fn search(q: &str, args: &HashMap<String, String>, base: &str, api_key: &str) ->
     // frozen releases only when asked for: `deep` isnt in the Newznab spec
     let deep = args.get("deep").is_some_and(|v| matches!(v.trim(), "1" | "true" | "yes"));
     let conn = crate::db::open().ok();
-    let found = page(conn.as_ref(), offset, limit, wants_incomplete(args), |at, n| {
+    let all = wants_incomplete(args);
+    // a deep search reads live and frozen from the top each time: once, as far as the page can read, then sliced
+    let mut deep_window: Option<(Vec<crate::search::ReleaseRow>, HashMap<i64, i64>)> = None;
+    let found = page(conn.as_ref(), offset, limit, all, |at, n| {
         if deep {
-            deep_releases(q, filter.as_ref(), at, n)
+            if deep_window.is_none() {
+                let reach = if all { limit } else { limit * COMPLETE_SCAN_PAGES };
+                deep_window = Some(deep_releases(q, filter.as_ref(), offset, reach)?);
+            }
+            let (rows, categories) = deep_window.as_ref().map_or((&[][..], None), |(r, c)| (&r[..], Some(c)));
+            let from = usize::try_from(at - offset).unwrap_or(0).min(rows.len());
+            let to = from.saturating_add(usize::try_from(n).unwrap_or(0)).min(rows.len());
+            Ok((rows[from..to].to_vec(), categories.cloned().unwrap_or_default()))
         } else {
             find_releases(q, filter.as_ref(), at, n).map(|r| (r, HashMap::new())).map_err(anyhow::Error::from)
         }
@@ -441,18 +453,24 @@ fn wants_incomplete(args: &HashMap<String, String>) -> bool {
 }
 
 /// Rows to list, each with all of the post it's part of (`release_info::whole_post_with`): what its NZB holds.
+/// And whether each is whole (`listed_complete`), worked out once for the filter and the feed.
+#[derive(Default)]
 struct Listed {
     rows: Vec<crate::search::ReleaseRow>,
     posts: Vec<Option<crate::release_info::SplitPost>>,
+    complete: Vec<bool>,
+    /// rows the search gave, listed or not: none means nothing matched at all
+    read: usize,
 }
 
 impl Listed {
     fn of(conn: Option<&rusqlite::Connection>, rows: Vec<crate::search::ReleaseRow>) -> Listed {
-        let posts = rows
+        let posts: Vec<Option<crate::release_info::SplitPost>> = rows
             .iter()
             .map(|r| conn.and_then(|conn| crate::release_info::whole_post_with(conn, r).ok().flatten()))
             .collect();
-        Listed { rows, posts }
+        let complete = rows.iter().zip(&posts).map(|(r, post)| listed_complete(conn, r, post.as_ref())).collect();
+        Listed { read: rows.len(), rows, posts, complete }
     }
 }
 
@@ -472,14 +490,16 @@ fn listed_complete(
     }
 }
 
-/// The most pages of rows one page of complete ones reads through: past it the page comes out short.
+/// The most pages of rows one page of complete ones reads through: past it the page comes out short, even though
+/// more may follow (more than this many pages of incomplete rows in a row).
 const COMPLETE_SCAN_PAGES: i64 = 10;
 
 /// A page of `limit` rows from `offset`, read through `fetch(offset, limit)` (rows, and categories of frozen ones).
 /// With `all` that's every row; else only complete ones (`listed_complete`), and the rows past the page are read on,
-/// a page at a time, until `limit` are found, `fetch` runs dry or `COMPLETE_SCAN_PAGES` pages were read: a page
-/// short of `limit` tells a client there's no more (`total`), and during a backfill most new rows aren't complete
-/// yet. The next page, at `offset + limit`, can list again a row this one read on to; a client drops it by its guid.
+/// a page at a time, until `limit` are found, `fetch` runs dry or `COMPLETE_SCAN_PAGES` pages were read. Clients
+/// take a page short of `limit` for the last one, and during a backfill most new rows aren't complete yet, soo a
+/// page fills from further on where it can. The next page, at `offset + limit`, can list again a row this one read
+/// on to; a client drops it by its guid.
 fn page<E>(
     conn: Option<&rusqlite::Connection>,
     offset: i64,
@@ -491,23 +511,25 @@ fn page<E>(
         let (rows, categories) = fetch(offset, limit)?;
         return Ok((Listed::of(conn, rows), categories));
     }
-    let mut listed = Listed { rows: Vec::new(), posts: Vec::new() };
+    let mut listed = Listed::default();
     let mut categories = HashMap::new();
     let mut at = offset;
     for _ in 0..COMPLETE_SCAN_PAGES {
         let (rows, found) = fetch(at, limit)?;
         let read = rows.len() as i64;
+        listed.read += rows.len();
         let batch = Listed::of(conn, rows);
-        for (r, post) in batch.rows.into_iter().zip(batch.posts) {
+        for ((r, post), complete) in batch.rows.into_iter().zip(batch.posts).zip(batch.complete) {
             if listed.rows.len() as i64 >= limit {
                 break;
             }
-            if listed_complete(conn, &r, post.as_ref()) {
+            if complete {
                 if let Some(c) = found.get(&r.id) {
                     categories.insert(r.id, *c);
                 }
                 listed.rows.push(r);
                 listed.posts.push(post);
+                listed.complete.push(true);
             }
         }
         at += read;
@@ -545,23 +567,23 @@ fn rss_listed(
     media: &HashMap<i64, crate::media::query::MediaAttrs>,
     on: &crate::media::query::IdParams,
 ) -> ApiResponse {
-    let Listed { rows: releases, posts: wholes } = listed;
+    let Listed { rows: releases, posts: wholes, complete, .. } = listed;
     let releases = &releases[..];
     let ids: Vec<i64> = releases.iter().map(|r| r.id).collect();
     let copies = crate::duplicates::counts(&ids).unwrap_or_default();
     let spots = crate::spotnet::store::spots_of(&ids).unwrap_or_default();
     // what the NZB holds: all of a post cut across groups, or of an upload linked by its PAR2 set
-    let conn = crate::db::open().ok();
     let keep = one_item_per_post(releases, &wholes);
     let items: String = releases
         .iter()
         .zip(wholes)
+        .zip(complete)
         .zip(keep)
         .filter(|(_, keep)| *keep)
-        .map(|((r, whole), _)| {
+        .map(|(((r, whole), complete), _)| {
             let nzb_url = format!("{base}/api?t=get&id={}&apikey={api_key}", r.id);
             // listed only with `incomplete=1` (`wants_incomplete`): said soo, not passed off as whole
-            let incomplete = if listed_complete(conn.as_ref(), r, whole.as_ref()) {
+            let incomplete = if complete {
                 ""
             } else {
                 "<newznab:attr name=\"complete\" value=\"0\"/>"
@@ -1087,6 +1109,7 @@ mod tests {
         assert_eq!(listed.rows.iter().map(|r| r.id).collect::<Vec<_>>(), [3, 6, 9, 12, 15]);
         assert_eq!(listed.posts.len(), 5);
         assert_eq!(asked, [0, 5, 10], "read on till five were found, no further");
+        assert_eq!(listed.read, 15);
 
         // `incomplete=1`: the page as it comes, complete or not
         let (listed, _) = page::<()>(None, 5, 5, true, |at, n| Ok((slice(&rows, at, n), HashMap::new()))).unwrap();
@@ -1107,6 +1130,7 @@ mod tests {
         })
         .unwrap();
         assert!(listed.rows.is_empty());
+        assert_eq!(listed.read, 1000, "rows matched, none whole: an ID search doesn't fall back to a name");
         assert_eq!(asked, COMPLETE_SCAN_PAGES);
     }
 
@@ -1132,7 +1156,7 @@ mod tests {
     #[test]
     fn rss_flags_an_incomplete_release() {
         let rows = rows_every(2, 2);
-        let listed = Listed { rows, posts: vec![None, None] };
+        let listed = Listed { rows, posts: vec![None, None], complete: vec![false, true], read: 2 };
         let body = rss_listed(
             "http://x",
             "k",
