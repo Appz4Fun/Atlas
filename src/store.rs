@@ -218,6 +218,7 @@ pub fn migrate_shard(conn: &Connection) -> Result<()> {
             part INTEGER,
             total_parts INTEGER,
             file_total INTEGER,
+            again INTEGER,
             primary key (file_id, message_id)
         ) without rowid;
 
@@ -245,6 +246,12 @@ pub fn migrate_shard(conn: &Connection) -> Result<()> {
         if !cols.iter().any(|c| c == col) {
             conn.execute(&format!("alter table files add column {col} {kind}"), [])?;
         }
+    }
+    // whether a held-back article's part was the file's already when it was saved (1): a repost, if sealing finds
+    // it isnt a copy. NULL: held back before this was kept
+    let held: bool = conn.prepare("select 1 from pragma_table_info('held_back') where name = 'again'")?.exists([])?;
+    if !held {
+        conn.execute("alter table held_back add column again INTEGER", [])?;
     }
     crate::postprocess::schema::migrate(conn)?;
     crate::category::uncategorized::migrate(conn)?;
@@ -894,10 +901,18 @@ pub(crate) fn add_segment(
         .execute(params![f.id, local, domain, a.part, a.bytes])?;
     if added > 0 && f.sealed && sealed.guessed {
         conn.prepare_cached(
-            "insert or replace into held_back (file_id, message_id, subject, part, total_parts, file_total)
-             values (?, ?, ?, ?, ?, ?)",
+            "insert or replace into held_back (file_id, message_id, subject, part, total_parts, file_total, again)
+             values (?, ?, ?, ?, ?, ?, ?)",
         )?
-        .execute(params![f.id, a.message_id, a.subject, a.part, a.total_parts, a.file_total])?;
+        .execute(params![
+            f.id,
+            a.message_id,
+            a.subject,
+            a.part,
+            a.total_parts,
+            a.file_total,
+            a.part.is_some_and(|p| has_part(&f.seen, p)) as i64
+        ])?;
     }
     if added > 0
         && let (Some((release_id, _)), Some(hash)) = (index, hash)
@@ -1420,6 +1435,14 @@ fn seal_rows(conn: &Connection, file_id: i64) -> Result<usize> {
     // the rest's is folded into the file now it's known to be new
     let mut held: HashMap<String, Article> =
         held_back(conn, file_id, -1)?.into_iter().map(|a| (a.message_id.clone(), a)).collect();
+    // whether each was a repost when saved, its part the file's already (None: held back before that was kept)
+    let was_again: HashMap<String, Option<bool>> = if held.is_empty() {
+        HashMap::new()
+    } else {
+        conn.prepare_cached("select message_id, again from held_back where file_id = ?")?
+            .query_map([file_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<i64>>(1)?.map(|v| v != 0))))?
+            .collect::<Result<_>>()?
+    };
     let mut news = Vec::new();
     // what was counted of them that is a repost after all (a part the file already has under another message-id):
     // a save past its decode budget couldnt tell, and counted it
@@ -1434,12 +1457,13 @@ fn seal_rows(conn: &Connection, file_id: i64) -> Result<usize> {
         for p in segs.iter().filter_map(|s| s.part) {
             insert_part(&mut have, p);
         }
-        // against the blob and the other held-back rows only: a row a save could tell was a repost wasnt counted,
-        // soo the held-back first of a part stays counted whatever order the rows come in
+        // what the save saw: the part the file's already, or not. Held back before that was kept: against the blob
+        // and the other held-back rows (a row a save could tell was a repost wasnt counted)
         for r in &rows {
             if let Some(a) = held.remove(&key(r)?) {
+                let saw = was_again.get(&a.message_id).copied().flatten();
                 news.push(a);
-                let again = r.part.is_some_and(|p| has_part(&have, p));
+                let again = saw.unwrap_or_else(|| r.part.is_some_and(|p| has_part(&have, p)));
                 if again && !shared {
                     repost_bytes += r.bytes;
                     reposts += 1;
@@ -4025,6 +4049,22 @@ mod tests {
         assert_eq!(totals(&conn), (before.0 + 104, before.1 + 1));
         seal_file(&conn, a).unwrap();
         assert_eq!(totals(&conn), (before.0 + 104, before.1 + 1), "part 4 counted once, whichever row sorts first");
+
+        // the other way round: a new part a save could tell (counted), then a copy held back (counted): one goes
+        let part5 = |id: &str| Article {
+            message_id: id.into(),
+            subject: "\"a.rar\" yEnc (5/5)".into(),
+            filename: Some("a.rar".into()),
+            part: Some(5),
+            total_parts: Some(5),
+            bytes: 105,
+            ..Default::default()
+        };
+        sure.save(&mut conn, &Ids::new(&main), [std::slice::from_ref(&one(part5("<a5@x>")))]).unwrap();
+        writer.save(&mut conn, &Ids::new(&main), [std::slice::from_ref(&one(part5("<z5.again@x>")))]).unwrap();
+        assert_eq!(totals(&conn), (before.0 + 104 + 210, before.1 + 3), "both counted for now");
+        seal_file(&conn, a).unwrap();
+        assert_eq!(totals(&conn), (before.0 + 104 + 105, before.1 + 2), "the held-back copy goes");
     }
 
     /// A genuinely new article a save past its decode budget keeps as a row
