@@ -2609,7 +2609,11 @@ fn inner_files_listed(
     }
     let read: Vec<_> = inner.files.iter().filter(|f| f.source != SOURCE_PAR2 && f.source != SOURCE_NZB).collect();
     if !read.is_empty() {
-        return ("Files inside the archives", read);
+        // what the PAR2 set names besides archives (an NFO, a sample) is posted beside them: still shown
+        let beside = inner.files.iter().filter(|f| {
+            f.source == SOURCE_PAR2 && !crate::duplicates::lists_archives(std::iter::once(f.name.as_str()))
+        });
+        return ("Files inside the archives", read.into_iter().chain(beside).collect());
     }
     let par2: Vec<_> = inner.files.iter().filter(|f| f.source == SOURCE_PAR2).collect();
     if !par2.is_empty() {
@@ -4127,10 +4131,14 @@ mod tests {
             names(super::inner_files_listed(&volumes, false)),
             ("Archive volumes its PAR2 set protects", vec!["Film.part001.rar".into(), "Film.nfo".into()])
         );
-        let both = view(vec![row(0, "Film.part001.rar", SOURCE_PAR2), row(1, "Film/BDMV/index.bdmv", SOURCE_RAR)]);
+        let both = view(vec![
+            row(0, "Film.part001.rar", SOURCE_PAR2),
+            row(1, "Film.nfo", SOURCE_PAR2),
+            row(2, "Film/BDMV/index.bdmv", SOURCE_RAR),
+        ]);
         assert_eq!(
             names(super::inner_files_listed(&both, false)),
-            ("Files inside the archives", vec!["Film/BDMV/index.bdmv".into()])
+            ("Files inside the archives", vec!["Film/BDMV/index.bdmv".into(), "Film.nfo".into()])
         );
         let plain = view(vec![row(0, "Film.mkv", SOURCE_PAR2)]);
         assert_eq!(super::inner_files_listed(&plain, false).0, "Files its PAR2 set protects");

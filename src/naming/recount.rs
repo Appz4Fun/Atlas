@@ -20,13 +20,21 @@ fn batch(conn: &Connection, after: i64) -> rusqlite::Result<Vec<(i64, i64)>> {
         .collect()
 }
 
-/// What a row's reposts added, when it has any: `(bytes, articles)`.
+/// What a row's reposts added, when it has any: `(bytes, articles)`. Never more than `parts` is past the parts its
+/// files have seen: a repost saved after this build came in wasnt counted, and isnt taken out again (the bytes in
+/// proportion, the reposts of one row being copies of the same articles).
 fn excess(conn: &Connection, id: i64, parts: i64) -> rusqlite::Result<Option<(i64, i64)>> {
-    if parts <= store::seen_parts(conn, id)? {
+    let over = parts - store::seen_parts(conn, id)?;
+    if over <= 0 {
         return Ok(None);
     }
     let (bytes, count) = store::repost_excess(conn, id)?;
-    Ok((count > 0).then_some((bytes, count)))
+    if count <= 0 {
+        return Ok(None);
+    }
+    let take = count.min(over);
+    let bytes = i64::try_from(i128::from(bytes) * i128::from(take) / i128::from(count)).unwrap_or(bytes);
+    Ok(Some((bytes, take)))
 }
 
 fn dry_run(main: &Path, sample: usize) -> anyhow::Result<()> {
@@ -136,5 +144,44 @@ pub fn run(args: &[String]) -> i32 {
             println!("{e:#}");
             1
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parser::{Article, Release};
+
+    /// Of a row's reposts, only as many as its `parts` is past what its files have seen come out: one an older save
+    /// counted, not the one a save of this build left uncounted.
+    #[test]
+    fn only_the_reposts_a_save_counted_come_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        db::create_db_at(&main).unwrap();
+        let art = |copy: u8| Article {
+            message_id: format!("<p1c{copy}@x>"),
+            subject: "\"a.rar\" yEnc (1/1)".into(),
+            filename: Some("a.rar".into()),
+            part: Some(1),
+            total_parts: Some(1),
+            bytes: 1_000,
+            ..Default::default()
+        };
+        let rel = Release {
+            name: "Rel".into(),
+            group: "alt.binaries.t".into(),
+            articles: vec![art(0), art(1), art(2)],
+            ..Default::default()
+        };
+        store::save(&main, &[rel]).unwrap();
+        let conn = db::open_at(&store::shard_path(&main, store::shard_of("alt.binaries.t"))).unwrap();
+        let (id, parts): (i64, i64) = conn
+            .query_row("select id, parts from releases where name = 'Rel'", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert_eq!(parts, 1);
+        assert_eq!(excess(&conn, id, parts).unwrap(), None, "a row saved by this build has nothing to take out");
+        // as an older save left it: one of the two reposts counted
+        assert_eq!(excess(&conn, id, parts + 1).unwrap(), Some((1_000, 1)));
     }
 }

@@ -222,13 +222,17 @@ fn clean(base: &str, group: &str, release_name: &str, regexes: &[Regex]) -> (Str
         // some of upstream's regexes take a recovery volume's tag into the name: `\.vol\d+\+\d+\.par2"` then
         // another quote never matches, and the lazy name runs on to `.vol015+016`. Every volume would be a post
         // of its own, apart from the files it repairs
-        Some(name) => (VOLUME_TAIL.replace(&name, "").into_owned(), true),
+        Some(name) => match VOLUME_TAIL.replace(&name, "") {
+            cut if !cut.is_empty() => (cut.into_owned(), true),
+            _ => (name, true),
+        },
         None => (clean_generic(base, group, release_name), false),
     }
 }
 
-/// a PAR2 recovery volume's tag at the end of what a group regex took: `.vol015+016`, `.vol00-01`
-static VOLUME_TAIL: LazyLock<Regex> = LazyLock::new(|| insensitive(r"\.vol\d+[+-]\d+$"));
+/// a PAR2 recovery volume's tag at the end of what a group regex took: `.vol015+016` (a `+`, not a range like
+/// `Series.Vol1-3`)
+static VOLUME_TAIL: LazyLock<Regex> = LazyLock::new(|| insensitive(r"\.vol\d+\+\d+$"));
 
 /// letters and digits in a cleaned name, a `yEnc` left in it not counted
 fn name_strength(clean: &str) -> usize {

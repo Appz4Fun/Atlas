@@ -1253,11 +1253,16 @@ pub(crate) fn repost_excess(conn: &Connection, release_id: i64) -> Result<(i64, 
                 local: r.get(3)?,
             })
         })?;
-        // a row that is the blob's own article again (kept past a save's decode budget) is sealing's to drop
-        let held: HashSet<(i64, Vec<u8>)> = segs.iter().map(|s| (s.domain, s.local.clone())).collect();
+        // a row that is the blob's own article again (kept past a save's decode budget) is sealing's to drop, by
+        // the same key sealing tells it with (one message-id stored whole, packed or as text)
+        let mut suffixes: HashMap<i64, Option<String>> = HashMap::new();
+        let mut held: HashSet<String> = HashSet::new();
+        for seg in &segs {
+            held.insert(seg_key(conn, &mut suffixes, seg)?);
+        }
+        let rows: Vec<crate::blob::Seg> = rows.collect::<Result<_>>()?;
         for row in rows {
-            let row = row?;
-            if !held.contains(&(row.domain, row.local.clone())) {
+            if !held.contains(&seg_key(conn, &mut suffixes, &row)?) {
                 segs.push(row);
             }
         }
@@ -1273,6 +1278,37 @@ pub(crate) fn repost_excess(conn: &Connection, release_id: i64) -> Result<(i64, 
         }
     }
     Ok((bytes, count))
+}
+
+/// Every article of a release on this shard, by the key sealing tells one message-id with (`seg_key`): the blobs'
+/// and the rows'. For telling whether two rows of a shard hold the same articles.
+pub(crate) fn release_article_keys(conn: &Connection, release_id: i64) -> Result<HashSet<String>> {
+    let files: Vec<i64> = conn
+        .prepare_cached("select id from files where release_id = ?")?
+        .query_map([release_id], |r| r.get(0))?
+        .collect::<Result<_>>()?;
+    let mut suffixes: HashMap<i64, Option<String>> = HashMap::new();
+    let mut keys = HashSet::new();
+    for file in files {
+        for seg in sealed_segments(conn, file)?.unwrap_or_default() {
+            keys.insert(seg_key(conn, &mut suffixes, &seg)?);
+        }
+        let rows: Vec<crate::blob::Seg> = conn
+            .prepare_cached("select part, bytes, domain, local from segments where file_id = ?")?
+            .query_map([file], |r| {
+                Ok(crate::blob::Seg {
+                    part: r.get(0)?,
+                    bytes: r.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                    domain: r.get(2)?,
+                    local: r.get(3)?,
+                })
+            })?
+            .collect::<Result<_>>()?;
+        for seg in rows {
+            keys.insert(seg_key(conn, &mut suffixes, &seg)?);
+        }
+    }
+    Ok(keys)
 }
 
 /// The parts a release's files have seen, all files together: fewer than its `parts` is the one way it can hold a
