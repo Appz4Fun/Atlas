@@ -41,6 +41,20 @@ impl SpotHeader {
         self.key_id == MODERATOR_KEY
     }
 
+    /// The spot (or comment) a key-2 command removes: `DISPOSE <message-id> - <title>`, or `DELETE` or `REMOVE`.
+    pub fn removes(&self) -> Option<String> {
+        if !self.is_moderation() {
+            return None;
+        }
+        let mut words = self.title.split_whitespace();
+        let command = words.next()?;
+        if !["dispose", "delete", "remove"].iter().any(|c| command.eq_ignore_ascii_case(c)) {
+            return None;
+        }
+        let id = words.next()?.trim_matches(['<', '>']);
+        super::valid_message_id(id).then(|| id.to_string())
+    }
+
     /// Whether this is a spot worth fetching whole: signed, not a moderator's command, movies or TV.
     pub fn wanted(&self) -> bool {
         self.signed && !self.is_moderation() && self.kind().is_some()
@@ -278,6 +292,11 @@ mod tests {
         assert!(h.is_moderation());
         assert_eq!(h.kind(), Some(Kind::Movie));
         assert!(!h.wanted());
+        assert_eq!(h.removes().as_deref(), Some("hzqY4qMS5McHhOuQESoUdhzD@spot.net"));
         assert!(parse("Movie (2026) | tag", FROM).unwrap().wanted());
+        assert_eq!(parse("DISPOSE a@spot.net", FROM).unwrap().removes(), None);
+        assert_eq!(parse("remove <a@spot.net>", from).unwrap().removes().as_deref(), Some("a@spot.net"));
+        assert_eq!(parse("Hello a@spot.net", from).unwrap().removes(), None);
+        assert_eq!(parse("DISPOSE nothing", from).unwrap().removes(), None);
     }
 }
